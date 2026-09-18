@@ -136,11 +136,15 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
 ```bash
 pacman -S --noconfirm --needed mingw-w64-x86_64-clang mingw-w64-x86_64-lld \
                                mingw-w64-x86_64-compiler-rt nasm xorriso
-# 还需要 Python 3 + Pillow（字体子集化 / 图标生成）
-
-# ① 先准备字体：仓库**不含**第三方字体（版权原因），需要自备这三个文件
-#    Fonts/bahnschrift.ttf、Fonts/ChaparralPro-Regular.ttf、Fonts/simhei.ttf
-#    或者把 _otf2ttf.py / _subset_fonts.py / _subsetsimhei.py 改成开源字体（Noto Sans / 思源黑体）
+# 还需要 Python 3 + fontTools + Pillow（字体子集化 / 图标生成）：pip install fonttools pillow
+#
+# ① 先下载**开源字体**到 Fonts-open/（仓库不含字体源文件：约 19 MB，见 .gitignore；说明见
+#    docs/字体许可说明.md）：三套字体 + 三份 OFL 许可全文，都是 SIL OFL 1.1
+#      curl -LO https://raw.githubusercontent.com/notofonts/notofonts.github.io/a775299f3e6cb5077e26d2819737927c5e5e477c/fonts/NotoSans/hinted/ttf/NotoSans-Regular.ttf
+#      curl -LO https://raw.githubusercontent.com/notofonts/notofonts.github.io/a775299f3e6cb5077e26d2819737927c5e5e477c/fonts/NotoSerif/hinted/ttf/NotoSerif-Regular.ttf
+#      curl -LO "https://raw.githubusercontent.com/google/fonts/b346dc3e18bed8b4ca602e00537eb35d76ed5025/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf"
+#      # 三份许可全文（OFL-NotoSans.txt / OFL-NotoSerif.txt / OFL-NotoSansSC.txt）同目录，链接见该文档
+#    对应关系：NotoSans-Regular(界面正文/face0) / NotoSerif-Regular(衬线标题/face1) / NotoSansSC(中文/face2)
 
 # ② 构建：产出 vimtu64-64.iso（三合一安装盘）
 bash build64.sh
@@ -318,18 +322,21 @@ docs/screenshots/       自动抓取的桌面截图（desktop64.png）
 |---|---|---|
 | `tools/i686-elf/` | 849 MB | 打包的第三方交叉编译器（README 里给安装方式即可） |
 | `legacy32/` | 770 MB | 已退役的 32 位工程，建议将来单独立仓作"移植参考" |
-| `Fonts/` | 684 MB | 第三方字体，**版权原因不能公开** |
+| `Fonts/` | 684 MB | 开发机上的 Windows 字体副本，**构建已不再使用**（只留着做历史对照） |
+| `Fonts-open/` | 19 MB | 构建真正用的**开源字体**（Noto Sans / Noto Serif / Noto Sans SC，SIL OFL）——下载地址见第五节与 [docs/字体许可说明.md](docs/字体许可说明.md) |
 | `build64/` + `build/` | 80 MB | 构建产物 |
-| `vimtu64-64.iso` / `.img` | 22 MB | 构建产物（且 ISO 内嵌商业字体子集，见下） |
+| `vimtu64-64.iso` / `.img` | 22 MB | 构建产物（内嵌的字体子集是 OFL 开源字体，可分发；Release 附件里有） |
 | `target-*.img` / `*.log` | ~64 MB | 验收测试残留 |
 
-**发布二进制（ISO/IMG）之前的硬约束**：安装镜像里嵌着 `bahnschrift` / `ChaparralPro` / `simhei` 的字体子集，
-**不能公开分发**。要先做两步：① 把 `_otf2ttf.py` / `_subset_fonts.py` / `_subsetsimhei.py` 指向开源字体
-（Noto Sans / 思源黑体，SIL OFL）；② 重建并重跑一次验收（`py -3 tests/status_report.py --full`）——
-之后才可以把 ISO 作为 Release 附件发出去。
+**发布二进制（ISO/IMG）的字体问题已解决**：安装镜像里内嵌的三套字体子集已经从
+`bahnschrift` / `ChaparralPro` / `simhei`（Windows 商业字体，不可再分发）换成
+**Noto Sans / Noto Serif / Noto Sans SC**（SIL OFL 1.1，可自由再分发）：
+`_otf2ttf.py` / `_subset_fonts.py` / `_subsetsimhei.py` 已指向 `Fonts-open/`，输出文件名
+（`build/font_bahnschrift.ttf` / `font_chaparral.ttf` / `font_simhei.ttf`）与内核里的 objcopy 符号名保持不变。
+许可与派生说明见 [docs/字体许可说明.md](docs/字体许可说明.md)。**因此 ISO/IMG 可以直接公开分发。**
 
 **版本与发布**：标签 `v0.1.0-beta.1`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.1.0-beta.1>
-（预发布 / 源码版，无二进制附件）。
+（预发布；**安装盘已附上**：`vimtu64-64.iso` 三合一安装盘 + `vimtu64-64.img` 裸盘介质）。
 
 ```bash
 # 日常：改完代码这样提交推送（★ 不要用网页拖拽上传 —— 那会绕过 .gitignore）
@@ -346,6 +353,10 @@ git push
 
 本项目以 **GNU General Public License v3.0** 发布（全文见 [LICENSE](LICENSE)）：你可以自由使用、修改、分发，
 但衍生的分发物必须以同样的许可开源，且不提供任何担保。安装程序的许可页写的就是这一条。
+
+**安装镜像内嵌的字体子集**（`Noto Sans` / `Noto Serif` / `Noto Sans SC` 的字形子集）不在 GPL-3.0 范围内：
+它们是各自许可（**SIL Open Font License 1.1**）下的派生物，随附版权与许可声明见
+[docs/字体许可说明.md](docs/字体许可说明.md)（含字体版本、来源 URL 与许可全文要点）。
 
 ## 十二、免责声明
 

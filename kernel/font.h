@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 void font_init();                    // 解析嵌入 TTF（无堆分配）
-void font_select(int face);          // 0=bahnschrift(正文), 1=chaparral(标题), 2=simhei(中文)
+void font_select(int face);          // 0=Noto Sans(正文), 1=Noto Serif(标题), 2=Noto Sans SC(中文)
 int  font_face_count();              // 3
 int  font_line_height();             // 行高（像素）
 int  font_glyph_advance(char c);     // ASCII 字符推进宽度（像素）

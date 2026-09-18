@@ -1,7 +1,8 @@
 // font.cpp - TrueType 字体子系统（最小实现，三字体 + UTF-8/CJK）
-// 嵌入字体：build/font_bahnschrift.ttf（bahnschrift，sans，GUI 正文）
-//           build/font_chaparral.ttf（ChaparralPro，serif，标题）
-//           build/font_simhei.ttf（simhei 黑体，简体中文）
+// 嵌入字体（构建期子集化，全部是 SIL OFL 1.1 开源字体，见 docs/字体许可说明.md）：
+//           build/font_bahnschrift.ttf（Noto Sans，sans，GUI 正文）
+//           build/font_chaparral.ttf（Noto Serif，serif，标题）
+//           build/font_simhei.ttf（Noto Sans SC 黑体，简体中文）
 // 特性：cmap format 4（BMP）、hmtx 推进宽度、简单字形扫描线光栅化、
 //       ASCII 固定缓存 + CJK LRU 缓存、UTF-8 文本解码。
 // 中文（CJK）后续：cmap format 12 + 扩展码点。
@@ -58,7 +59,7 @@ struct FontFace {
     uint32_t lru_tick;
 };
 
-static FontFace g_face[3];            // [0]=bahnschrift, [1]=chaparral, [2]=simhei
+static FontFace g_face[3];            // [0]=Noto Sans, [1]=Noto Serif, [2]=Noto Sans SC（中文）
 static FontFace* cur = &g_face[0];
 
 // 当前字形扁平化边表（渲染临时区，单线程，可共享）
@@ -459,7 +460,7 @@ int font_glyph_advance(char c) {
 }
 
 // 按 Unicode 码点推进宽度（非 ASCII 按码点查 cmap）
-// 中文（CJK）若当前字体无字形则自动使用 simhei（g_face[2]）
+// 中文（CJK）若当前字体无字形则自动使用中文字体面（g_face[2]）
 static FontFace* font_resolve_cp(uint32_t cp) {
     FontFace* fc = cur;
     if (fc != &g_face[2] && cp >= 0x4E00 && cp <= 0x9FFF) {
@@ -536,7 +537,7 @@ bool font_draw_glyph(int x, int y, char c, uint32_t fg) {
     return true;
 }
 
-// 按 Unicode 码点绘制（CJK 走 LRU 缓存；当前字体无字形时自动用 simhei）
+// 按 Unicode 码点绘制（CJK 走 LRU 缓存；当前字体无字形时自动用中文字体面）
 bool font_draw_glyph_cp(int x, int y, uint32_t cp, uint32_t fg) {
     if (cp < FONT_CACHE_N) return font_draw_glyph(x, y, (char)cp, fg);
     FontFace* fc = font_resolve_cp(cp);

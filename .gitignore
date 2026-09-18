@@ -15,17 +15,23 @@ tools/i686-elf/
 tools/nasm/
 tools/__pycache__/
 
-# ==================== 第三方字体（版权原因，绝对不能公开）====================
-# Fonts/ 是 Windows 字体副本（684 MB），其中构建真正用到的是：
-#   bahnschrift.ttf、ChaparralPro-Regular.ttf、simhei.ttf
-# 公开仓库时请让使用者自备（或把三个 _*.py 改成开源字体如 Noto / 思源黑体）
-Fonts/
+# ==================== 字体（第三方的都不进仓）====================
+# Fonts/ 是 Windows 字体副本（684 MB，商业字体，**构建已不再使用**，保留只为历史对照）
+# ★ 必须写 /Fonts/ 而不是 Fonts/：Windows 上 git 默认忽略大小写，写成 Fonts/ 会连
+#   docs/fonts/（License 全文，必须进仓）一起排掉 —— 本次实测踩到的坑。
+/Fonts/
+# Fonts-open/ 是构建真正使用的开源字体（SIL OFL，约 19 MB 的源文件）：
+#   NotoSans-Regular.ttf / NotoSerif-Regular.ttf / NotoSansSC[wght].ttf / OFL-*.txt
+# 源字体太大没必要进仓 —— 下载地址与许可见 README 第五节 与 docs/字体许可说明.md
+/Fonts-open/
 
 # ==================== 已退役的 32 位工程（770 MB）====================
 # 若想公开，建议单独建一个仓库作为"移植参考"
 legacy32/
 
+
 # ==================== 构建产物 ====================
+
 build64/
 build/
 *.elf
