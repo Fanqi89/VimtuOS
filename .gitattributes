@@ -1,0 +1,45 @@
+# VimtuOS / Vimtu64 —— 行尾与二进制处理
+#
+# 为什么需要这个文件：
+#   本项目的构建脚本（build64.sh / build_uefi.sh）是在 MSYS2 的 bash 里跑的，
+#   而 Windows 版 git 默认 core.autocrlf=true，克隆到 Windows 上会把文本文件
+#   检出成 CRLF —— bash 遇到 `#!/bin/bash\r` 会直接报
+#   "$'\r': command not found"。所以这里把**所有文本文件统一钉成 LF**。
+#
+# 生效方式：对新克隆自动生效；在已有工作区里执行一次
+#   git add --renormalize .
+# 即可把已跟踪文件按本文件规则重新规范化。
+
+# 默认：自动识别文本，仓库内外统一 LF
+* text=auto eol=lf
+
+# 明确二进制（禁止任何行尾转换 / 合并冲突处理）
+*.png    binary
+*.jpg    binary
+*.ico    binary
+*.ttf    binary
+*.otf    binary
+*.fon    binary
+*.bin    binary
+*.img    binary
+*.iso    binary
+*.efi    binary
+*.o      binary
+*.a      binary
+*.obj    binary
+*.elf    binary
+
+# 汇编 / C / C++ / 脚本 / 文档：显式声明为文本（可读 diff）
+*.asm    text eol=lf
+*.inc    text eol=lf
+*.c      text eol=lf
+*.h      text eol=lf
+*.cpp    text eol=lf
+*.sh     text eol=lf
+*.py     text eol=lf
+*.md     text eol=lf
+*.ld     text eol=lf
+*.txt    text eol=lf
+
+# 少让 git 在 diff 里把大块生成文件当成变化源
+logo/*.png  -diff
