@@ -1,0 +1,54 @@
+# VimtuOS / Vimtu64 —— 开源用 .gitignore
+#
+# 原则：只提交自己写的源码与文档（约 1.7 MB）。
+#       打包的第三方工具链、第三方字体、构建产物、验收残留全部排除。
+#
+# ★★ 踩坑记录：**.gitignore 不支持行尾注释**！
+#    写成 `tools/i686-elf/   # 849 MB` 时，整行（含 # 与后面的字）都会被当成
+#    一个匹配不到的图案 —— 结果是"看起来排除了，其实一个都没排除"。
+#    所以本文件里所有注释都单独占一行。验证方法：git ls-files --others --exclude-standard
+
+# ==================== 第三方工具链（打包进来的，不进仓）====================
+# i686-elf 交叉编译器 849 MB：改为在 README 里给下载/构建方式
+tools/i686-elf/
+# nasm 二进制 2.6 MB：MSYS2 里 pacman -S nasm 即可
+tools/nasm/
+tools/__pycache__/
+
+# ==================== 第三方字体（版权原因，绝对不能公开）====================
+# Fonts/ 是 Windows 字体副本（684 MB），其中构建真正用到的是：
+#   bahnschrift.ttf、ChaparralPro-Regular.ttf、simhei.ttf
+# 公开仓库时请让使用者自备（或把三个 _*.py 改成开源字体如 Noto / 思源黑体）
+Fonts/
+
+# ==================== 已退役的 32 位工程（770 MB）====================
+# 若想公开，建议单独建一个仓库作为"移植参考"
+legacy32/
+
+# ==================== 构建产物 ====================
+build64/
+build/
+*.elf
+*.o
+vimtu64-64.iso
+vimtu64-64.img
+# 资源中间产物（根目录 _*.py 生成）
+build/*.ttf
+build/*.bin
+
+# ==================== 验收测试残留与日志 ====================
+# 每次验收各 16 MB
+target-*.img
+*-serial.log
+*_serial.log
+installed_boot.log
+
+# ==================== 会话 / 编辑器杂项 ====================
+.pisession/
+.pi/
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

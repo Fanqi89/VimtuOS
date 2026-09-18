@@ -1,0 +1,799 @@
+// syscall64.cpp - Vimtu64 系统调用：int 0x80（自有 ABI）+ syscall 指令（Linux x86_64 ABI）
+//
+// ============================ 安全模型（两条路径共用，别省）============================
+//   所有来自用户态的指针参数都必须先过 user64_range_ok64()：要求整段落在用户窗口
+//   （4GiB..4GiB+1MiB）内、且四级页表都是 present + U/S（已映射的用户页）。越界/未映射
+//   一律返回错误并打 [SYSCALL] deny nr=<n> arg=<ptr>。**绝不能**让用户传一个内核地址就把
+//   内核内存读出去：ring0 读内核地址是合法的，唯一的闸门就是这里的范围校验。
+//   write 另加一条：单次 len 上限（演示/日志用途，别用它搬大块数据）。
+//
+// ============================ Linux x86_64 系统调用号映射表 ============================
+//   ★ 这是 syscall 指令路径（int_no = SYSCALL64_INSM_FRAME_MARK64）专用的号段，与
+//     int 0x80 的自有号段完全隔离：同一个数字在两条路径上含义不同（例如 1 都表示 write，
+//     但 2 在 int 0x80 是 exit、在 Linux 是 open）。
+//
+//   号  名称               实现（这一列就是真实状态，能做到的都真做）
+//   ---- ----------------- ------------------------------------------------------------------
+//   0    read              真：fd=0（stdin）返回 0 = EOF（本内核没有键盘输入流，如实返回）；
+//                           fd>=3 从 open 时缓存的 512B 文件窗口里按 offset 拷给用户；
+//                           其它 fd → -EBADF。buf 过范围校验。
+//   1    write             真：fd=1 → 串口 + 屏幕；fd=2 → 只串口；len 上限 4096；越界 -EFAULT。
+//   2    open              真：vfs64_stat 探存在性 → 分配 fd（3..6）→ 返回 fd；不存在 -ENOENT。
+//                           （只读语义；flags/mode 忽略，见下）
+//   3    close             真：释放 fd 槽 → 0；fd 非法 → -EBADF。
+//   4    stat              **未实现 → -ENOSYS**（没有按路径 stat 的用户 ABI 需求）
+//   5    fstat             真：fd 0/1/2 → 字符设备的最小三字段（st_mode=0020000|0666、st_size=0、
+//                           st_nlink=1）；fd>=3 → 文件大小 + st_mode=0100000|0444。填 144B struct stat。
+//   8    lseek             真：fd>=3 调整缓存窗口 offset（SEEK_SET/CUR/END）→ 新 offset；
+//                           fd 0..2 → -ESPIPE；
+//   9    mmap              真：用户窗口内的 bump 分配器（USER64_MMAP_VA64 起），页 P|U|W|NX，
+//                           返回页对齐地址；PROT/MAP_FIXED 只看 MAP_FIXED 的地址提示；空间不足 -ENOMEM。
+//   10   mprotect          真：逐页改叶子权限（PROT_READ→可读、WRITE→可写、EXEC→清 NX），
+//                           范围/页非法 → -EINVAL。
+//   11   munmap            真：逐页解除映射并 page_free_64 回收物理页 → 0；范围非法 → -EINVAL。
+//   12   brk               真：固定 64KiB 可写区（USER64_BRK_VA64，首次调用时整块映射 P|U|W|NX），
+//                           addr=0 → 返回当前 brk；区间外 → 返回旧 brk（Linux 同语义）。
+//   13   rt_sigaction      **本内核没有信号投递路径**：不读用户 struct、立刻返回 0。
+//                           这是内核里唯一两个"接受但不实施"的号，已在此注明（不是假成功：
+//                           内核侧没有任何东西可以谎报，用户程序的信号只是永远不会来）。
+//   14   rt_sigprocmask    同 13。
+//   16   ioctl             真（最小）：fd∈{0,1,2} 且请求 = TIOCGWINSZ(0x5413) → 写回 25x80 的
+//                           struct winsize 并返回 0；TIOCSWINSZ(0x5414) → 忽略并返回 0；
+//                           其它请求 → -ENOTTY（Linux 对非 tty 的同一行为）。
+//   20   writev            真：fd∈{1,2}，最多 8 个 iovec，逐个写；iovcnt 超限 -EINVAL。
+//   39   getpid            真：任务 id（无调度器时 0）。
+//   60   exit              真：把控制权交回内核（帧改写 + 入口走 user64_resume_tramp64）。
+//   63   uname             真：写一份静态 struct utsname（6 x 65B）。
+//   79   getcwd            真：把 "/" 写进用户 buf（len>=2）并返回 buf 指针（Linux 语义）。
+//   102  getuid            真：0（本内核没有用户概念）
+//   104  getgid            真：0
+//   158  arch_prctl        真（部分）：ARCH_SET_FS(0x1002) 把值存进内核变量并返回 0；
+//                           ARCH_GET_FS(0x1003) 写回用户指针（过范围校验）；其它 → -EINVAL。
+//                           ★ 不做 wrmsr IA32_FS_BASE：真 TLS 需要 per-CPU/swapgs 那套地基，
+//                             现在改了只会让内核侧的 FS 基址也一起变。见文件末"已知边界"。
+//   218  set_tid_address   真（最小）：返回 0（没有 clear_child_tid 的唤醒路径）。
+//   228  clock_gettime     真：用 g_ticks64（250Hz PIT）造近似值：tv_sec=t/250、
+//                           tv_nsec=(t%250)*4000000；clockid 0..3；其它 → -EINVAL。
+//   231  exit_group        同 60（本内核是单线程演示模型，直接当 exit）。
+//   257  openat            open 的现代入口：dirfd 忽略（只支持 AT_FDCWD）；相对路径要求以 '/' 开头。
+//
+//   其它所有号：**-ENOSYS(-38)** 并且同一个号只打一次 `[SYSCALL] enosys nr=<n>`（防刷屏）。
+//   已实现号里做不到的分支一律返回**具体负 errno**（-EBADF/-EFAULT/-EINVAL/-ENOMEM/...），
+//   绝不返回 0 假装成功。
+//
+// ============================ 打点策略 ============================
+//   int 0x80（旧路径，行为不变）：只对 write(1)/exit(2) 打 [SYSCALL] nr=...
+//   syscall 指令（新路径）：**每个调用都打**
+//     `[SYSCALL] insn nr=<n> rdi=<hex> rsi=<hex> rdx=<hex> ret=<hex>`
+//     理由：这条路径目前只有演示程序在用（启动期个位数调用），全量打点给出的证据链最完整
+//     （"哪个号真的进来了、返回了什么"一目了然），也便于自动验收 grep。代价是刷屏风险：
+//     将来若有程序在循环里调 getpid，要么改成"只打 write/exit/失败"，要么加节流。
+//   deny / enosys 两条路径共用。
+//
+// ============================ 已知边界（别把没做的说成做了）============================
+//   * 地址空间是**共享**的：mmap/brk/mprotect/munmap 都在同一个用户窗口里，没有独立地址
+//     空间、没有 fork/execve、没有进程隔离；execve 需要"换掉当前映像"的能力，本阶段没有。
+//   * glibc/发行版二进制**没有验证过**：它们依赖的东西（TLS/FS.base 真生效、信号、vDSO、
+//     futex、clone/线程、/proc、多个 PT_LOAD 的 RELRO 段保护、IFUNC 重定位…）大多不在这里。
+//     这里验证的是"自有静态 ELF64（ld.lld -static -nostdlib）能 load → ring3 → syscall → exit"。
+//   * 用户态没有 swapgs/per-CPU gs：SYSCALL 入口**不能**用 gs 取内核数据结构，所以内核栈顶
+//     只能靠内核内存里的镜像变量（见 syscall_entry64.asm 的说明）。ring3 里 gs 基址仍是内核的
+//     （用户程序不该依赖它）。
+#include "syscall64.h"
+#include "usermode64.h"     // user64_range_ok64 / user64_exit_to_kernel64 / 用户窗口常量
+#include "vfs64.h"          // Linux open/read 走真实文件系统
+#include "mem_64.h"         // PAGE_SIZE_64 / page_free_64 / PTE_*
+#include "debug64.h"
+#include "fb.h"             // 屏幕输出（fb_draw_text / fb_flip_region）
+
+// task64.cpp 提供（安装程序内核不链接它 -> weak 引用后按"没有调度器"处理）
+extern "C" void     task_sleep_ms64(uint32_t ms) __attribute__((weak));
+extern "C" uint32_t task_current_id_64() __attribute__((weak));
+
+static const uint64_t SYSCALL64_WRITE_MAX = 1024;    // int 0x80 write 单次上限（见文件头说明）
+static const uint64_t LX64_WRITE_MAX      = 4096;    // Linux write 单次上限
+static const int64_t  LX64_ENOENT = 2;
+static const int64_t  LX64_EBADF  = 9;
+static const int64_t  LX64_ENOMEM = 12;
+static const int64_t  LX64_EFAULT = 14;
+static const int64_t  LX64_EINVAL = 22;
+static const int64_t  LX64_EMFILE = 24;
+static const int64_t  LX64_ENOTTY = 25;
+static const int64_t  LX64_ESPIPE = 29;
+static const int64_t  LX64_ENOSYS = 38;
+
+// ==================== syscall 指令路径的跨模块变量 ====================
+// ==================== syscall 指令路径的跨模块变量 ====================
+// ★ syscall 指令入口**专用内核栈**（16KiB，静态 .bss，不进镜像）。
+//   为什么不用 TSS.rsp0：TSS.rsp0 是"ring3 -> ring0 的中断/异常"切栈用的栈顶，中断帧压在
+//   [rsp0-0xD0, rsp0)。SYSCALL 不换栈，入口若也用同一个 rsp0，两者就会**共用同一段内存**
+//   ——中断帧与 syscall 帧的 rip/cs/rflags/rsp/ss 槽地址完全重合，任何时序重叠都会让后写的
+//   帧覆盖先写的那个（rip/cs 槽首当其冲）。专用栈把这条耦合彻底断开：
+//   SYSCALL 入口 -> 分发（全程 IF=0，不可能嵌套）-> sysret；TSS.rsp0 只留给中断。
+//   （代价：多 16KiB .bss；好处：syscall 路径和调度/中断路径再无共享内存。）
+static uint8_t g_syscall64_stack64[16 * 1024] __attribute__((aligned(16)));
+// 内核栈顶（入口汇编 mov rsp, [g_syscall64_kstack64] 用）。初值 = 专用栈顶；运行期不再改。
+extern "C" uint64_t g_syscall64_kstack64 =
+    (uint64_t)(uintptr_t)(g_syscall64_stack64 + sizeof(g_syscall64_stack64));
+// 1 = 本帧已走 exit，入口别 sysret（见 syscall_entry64.asm 的出口 B）
+extern "C" uint64_t g_syscall64_exit_to_kernel64 = 0;
+
+// ==================== 打点 ====================
+static void syscall64_log64(uint64_t nr, uint64_t rdi, uint64_t rsi, uint64_t rdx, int64_t ret) {
+    dbg64_line_begin64();
+    dbg64_str("[SYSCALL] nr=");
+    dbg64_dec(nr);
+    dbg64_str(" rdi=");
+    dbg64_hex64(rdi);
+    dbg64_str(" rsi=");
+    dbg64_hex64(rsi);
+    dbg64_str(" rdx=");
+    dbg64_hex64(rdx);
+    dbg64_str(" ret=");
+    dbg64_hex64((uint64_t)ret);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// syscall 指令路径的打点：格式与上面不同（多一个 insn 标记），自动验收靠它区分两条路径。
+static void syscall64_log_insn64(uint64_t nr, uint64_t rdi, uint64_t rsi, uint64_t rdx, int64_t ret) {
+    dbg64_line_begin64();
+    dbg64_str("[SYSCALL] insn nr=");
+    dbg64_dec(nr);
+    dbg64_str(" rdi=");
+    dbg64_hex64(rdi);
+    dbg64_str(" rsi=");
+    dbg64_hex64(rsi);
+    dbg64_str(" rdx=");
+    dbg64_hex64(rdx);
+    dbg64_str(" ret=");
+    dbg64_hex64((uint64_t)ret);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+static void syscall64_deny64(uint64_t nr, uint64_t arg) {
+    dbg64_line_begin64();
+    dbg64_str("[SYSCALL] deny nr=");
+    dbg64_dec(nr);
+    dbg64_str(" arg=");
+    dbg64_hex64(arg);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// 未实现的号：每个号只打一次（防刷屏），返回值仍然是 -ENOSYS。
+static void syscall64_enosys_once64(uint64_t nr) {
+    static uint8_t seen[512];
+    if (nr < sizeof(seen)) {
+        if (seen[nr]) return;
+        seen[nr] = 1;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[SYSCALL] enosys nr=");
+    dbg64_dec(nr);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// ==================== 屏幕输出（write 用）====================
+// 串口走 dbg64_putc（同时写 debugcon），屏幕走 8x8 内置字体 + 局部提交。
+// 只画一行（覆盖上一次的内容）：用户态日志很短，够证明"输出到了屏幕"。
+static void syscall64_screen_puts64(const char* s, uint64_t n) {
+    if (fb_width() <= 0) return;                     // 还没建帧缓冲（理论上不会）
+    static char line[100];
+    uint32_t k = 0;
+    for (uint64_t i = 0; i < n && k < sizeof(line) - 1; i++) {
+        char c = s[i];
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        line[k++] = c;
+    }
+    if (k == 0) return;
+    line[k] = 0;
+    const int x = 8, y = 8;
+    fb_draw_text(x, y, line, 0xFFFFFFFFu, 0xFF000000u, 1);   // 白字黑底
+    fb_flip_region(x, y, (int)k * 8 + 2, 10);
+}
+
+// ==================== 入口 1）int 0x80：write(fd, buf, len) ====================
+static int64_t syscall64_write64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_t len) {
+    if (fd != 1) { syscall64_deny64(nr, fd); return -1; }            // 只支持 stdout
+    if (len == 0 || len > SYSCALL64_WRITE_MAX) { syscall64_deny64(nr, len); return -1; }
+    if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -1; }
+
+    const char* p = (const char*)(uintptr_t)buf;                     // 已校验：是用户页，ring0 可读
+    for (uint64_t i = 0; i < len; i++) dbg64_putc(p[i]);
+    syscall64_screen_puts64(p, len);
+    return (int64_t)len;
+}
+
+// ==================== 入口 1）int 0x80：sleep_ms(ms) ====================
+static int64_t syscall64_sleep64(uint32_t ms) {
+    if (ms == 0) return 0;
+    if (task_sleep_ms64) { task_sleep_ms64(ms); return 0; }
+    // 没有调度器（安装程序内核）：退化为按 tick 忙等，别死自旋
+    const uint64_t until = g_ticks64 + ms_to_ticks64(ms);
+    uint64_t guard = 0;
+    while (g_ticks64 < until && ++guard < 2000000000ULL) __asm__ volatile("hlt");
+    return 0;
+}
+
+// ==================================================================================
+// 入口 2）syscall 指令：Linux x86_64 号段（映射表见文件头）
+// ==================================================================================
+
+static void lx64_wr32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static void lx64_wr64(uint8_t* p, uint64_t v) {
+    lx64_wr32(p, (uint32_t)v);
+    lx64_wr32(p + 4, (uint32_t)(v >> 32));
+}
+// 拷到用户态（调用方保证已过 user64_range_ok64）
+static void lx64_copy_to_user64(uint64_t uva, const void* src, uint64_t n) {
+    const uint8_t* s = (const uint8_t*)src;
+    uint8_t* d = (uint8_t*)(uintptr_t)uva;
+    for (uint64_t i = 0; i < n; i++) d[i] = s[i];
+}
+// 从用户态拷一个 NUL 结尾的短字符串（逐字节校验：一旦跨出已映射的用户页立刻拒绝）。
+// 返回 0 = 成功（out 已 NUL 结尾）；-1 = 越界 / 超长 / 没有 NUL。
+static int lx64_user_str64(uint64_t uva, char* out, uint32_t cap) {
+    if (cap == 0) return -1;
+    for (uint32_t i = 0; i + 1u < cap; i++) {
+        if (!user64_range_ok64(uva + i, 1)) return -1;
+        const char c = *(const char*)(uintptr_t)(uva + i);
+        out[i] = c;
+        if (c == 0) return 0;
+    }
+    out[cap - 1u] = 0;
+    return -1;
+}
+
+// ---- fd 表：3..6 是 vfs64 里的真实文件（只读；缓存前 512B）----
+static const int      LX64_FD_TABLE   = 4;      // fd 3,4,5,6
+static const uint32_t LX64_FD_CACHE   = 512;    // 每个 fd 的读缓存上限（见文件头"已知边界"）
+static const uint32_t LX64_PATH_MAX   = 32;     // VFS64_NAME_MAX(27) + "/" + NUL
+struct LxFd64 {
+    uint8_t  used;
+    char     path[LX64_PATH_MAX];
+    uint32_t size;      // 文件实际大小
+    uint32_t off;       // 读游标
+    uint32_t cached;    // buf 里已缓存的字节数（<= LX64_FD_CACHE）
+    uint8_t  buf[LX64_FD_CACHE];
+};
+static LxFd64 g_lx_fd64[4];
+
+static int lx64_fd_slot64(uint64_t fd) {          // fd -> 槽下标；-1 = 非法/未打开
+    if (fd < 3 || fd >= 3u + (uint64_t)LX64_FD_TABLE) return -1;
+    const uint64_t i = fd - 3u;
+    if (!g_lx_fd64[i].used) return -1;
+    return (int)i;
+}
+static int lx64_fd_alloc64() {                    // 找空槽；-1 = 表满
+    for (int i = 0; i < LX64_FD_TABLE; i++) if (!g_lx_fd64[i].used) return i;
+    return -1;
+}
+// 首次读时把文件（最多 LX64_FD_CACHE 字节）读进缓存
+static int lx64_fd_load64(int slot) {
+    LxFd64* e = &g_lx_fd64[slot];
+    if (e->cached) return 0;
+    const int n = vfs64_read(e->path, e->buf, (int)LX64_FD_CACHE);
+    if (n < 0) return -1;
+    e->cached = (uint32_t)n;
+    return 0;
+}
+
+// ---- 0）read ----
+static int64_t lx64_read64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_t len) {
+    if (len == 0) return 0;
+    if (fd == 0) return 0;                                  // stdin：没有输入流 -> 立刻 EOF（如实）
+    const int slot = lx64_fd_slot64(fd);
+    if (slot < 0) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (len > LX64_FD_CACHE) len = LX64_FD_CACHE;
+    if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
+    LxFd64* e = &g_lx_fd64[slot];
+    if (lx64_fd_load64(slot) != 0) return -LX64_EBADF;
+    if (e->off >= e->cached) return 0;                      // EOF
+    uint64_t n = e->cached - e->off;
+    if (n > len) n = len;
+    lx64_copy_to_user64(buf, e->buf + e->off, n);
+    e->off += (uint32_t)n;
+    return (int64_t)n;
+}
+
+// ---- 1）write ----
+static int64_t lx64_write64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_t len) {
+    if (fd != 1 && fd != 2) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (len == 0) return 0;
+    if (len > LX64_WRITE_MAX) { syscall64_deny64(nr, len); return -LX64_EINVAL; }
+    if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
+    const char* p = (const char*)(uintptr_t)buf;
+    for (uint64_t i = 0; i < len; i++) dbg64_putc(p[i]);
+    if (fd == 1) syscall64_screen_puts64(p, len);
+    return (int64_t)len;
+}
+
+// ---- 2 / 257）open / openat ----
+static int64_t lx64_open64(uint64_t nr, uint64_t path_va) {
+    char path[LX64_PATH_MAX];
+    if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(nr, path_va); return -LX64_EFAULT; }
+    if (path[0] != '/') { syscall64_deny64(nr, path_va); return -LX64_EINVAL; }   // 阶段一只支持单层绝对路径
+    uint32_t type = 0, size = 0;
+    if (vfs64_stat(path, &type, &size) != 0 || type != VFS64_TYPE_FILE) return -LX64_ENOENT;
+    const int slot = lx64_fd_alloc64();
+    if (slot < 0) return -LX64_EMFILE;
+    LxFd64* e = &g_lx_fd64[slot];
+    e->used = 1;
+    e->size = size;
+    e->off = 0;
+    e->cached = 0;
+    for (uint32_t i = 0; i < LX64_PATH_MAX; i++) e->path[i] = path[i];
+    return (int64_t)(3 + slot);
+}
+
+// ---- 3）close ----
+static int64_t lx64_close64(uint64_t nr, uint64_t fd) {
+    const int slot = lx64_fd_slot64(fd);
+    if (slot < 0) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    g_lx_fd64[slot].used = 0;
+    g_lx_fd64[slot].cached = 0;
+    g_lx_fd64[slot].off = 0;
+    return 0;
+}
+
+// ---- 5）fstat（x86_64 的 struct stat = 144 字节，字段偏移见 Linux asm/stat.h）----
+static const uint32_t LX64_S_IFCHR = 0020000u;
+static const uint32_t LX64_S_IFREG = 0100000u;
+static void lx64_fill_stat64(uint8_t* st, uint32_t mode, uint64_t size) {
+    for (uint32_t i = 0; i < 144; i++) st[i] = 0;
+    lx64_wr64(st + 0,  1);                          // st_dev
+    lx64_wr64(st + 8,  1);                          // st_ino
+    lx64_wr64(st + 16, 1);                          // st_nlink
+    lx64_wr32(st + 24, mode);                       // st_mode
+    lx64_wr32(st + 28, 0);                          // st_uid
+    lx64_wr32(st + 32, 0);                          // st_gid
+    lx64_wr64(st + 48, size);                       // st_size
+    lx64_wr64(st + 56, 4096);                       // st_blksize
+    lx64_wr64(st + 64, (size + 511) / 512);         // st_blocks
+}
+static int64_t lx64_fstat64(uint64_t nr, uint64_t fd, uint64_t st_va) {
+    if (!user64_range_ok64(st_va, 144)) { syscall64_deny64(nr, st_va); return -LX64_EFAULT; }
+    uint8_t st[144];
+    const int slot = lx64_fd_slot64(fd);
+    if (fd <= 2) {
+        lx64_fill_stat64(st, LX64_S_IFCHR | 0666u, 0);      // 标准流：最小三字段（mode/nlink/size）
+    } else if (slot >= 0) {
+        lx64_fill_stat64(st, LX64_S_IFREG | 0444u, g_lx_fd64[slot].size);
+    } else {
+        syscall64_deny64(nr, fd);
+        return -LX64_EBADF;
+    }
+    lx64_copy_to_user64(st_va, st, 144);
+    return 0;
+}
+
+// ---- 8）lseek ----
+static int64_t lx64_lseek64(uint64_t nr, uint64_t fd, int64_t off, uint64_t whence) {
+    const int slot = lx64_fd_slot64(fd);
+    if (slot < 0) { syscall64_deny64(nr, fd); return -LX64_ESPIPE; }
+    LxFd64* e = &g_lx_fd64[slot];
+    int64_t base = 0;
+    if (whence == 0) base = 0;                                        // SEEK_SET
+    else if (whence == 1) base = (int64_t)e->off;                     // SEEK_CUR
+    else if (whence == 2) base = (int64_t)(e->cached ? e->cached : e->size);   // SEEK_END（缓存窗口内）
+    else return -LX64_EINVAL;
+    const int64_t nv = base + off;
+    if (nv < 0 || nv > (int64_t)e->size) return -LX64_EINVAL;
+    e->off = (uint32_t)nv;
+    return nv;
+}
+
+// ---- 9）mmap：用户窗口内的 bump 分配器 ----
+static uint64_t g_lx_mmap_next64 = 0;
+static int64_t lx64_mmap64(uint64_t len, uint64_t flags, uint64_t addr) {
+    if (len == 0) return -LX64_EINVAL;
+    uint64_t n = (len + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
+    if (g_lx_mmap_next64 == 0) g_lx_mmap_next64 = USER64_MMAP_VA64;
+    uint64_t va;
+    if (flags & 0x10u) {                                       // MAP_FIXED：按调用方给的地址
+        va = addr & ~((uint64_t)PAGE_SIZE_64 - 1);
+    } else {
+        va = (g_lx_mmap_next64 + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
+    }
+    if (va < USER64_MMAP_VA64 || va > USER64_CODE_VA64 + USER64_WINDOW_BYTES64) return -LX64_ENOMEM;
+    if (n > (USER64_CODE_VA64 + USER64_WINDOW_BYTES64) - va) return -LX64_ENOMEM;
+    for (uint64_t a = va; a < va + n; a += PAGE_SIZE_64) {
+        uint64_t phys = 0;
+        if (!user64_map_page64(a, PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64, 1, &phys)) return -LX64_ENOMEM;
+    }
+    user64_paging_sync64();
+    if (va + n > g_lx_mmap_next64) g_lx_mmap_next64 = va + n;
+    return (int64_t)va;
+}
+
+// ---- 10）mprotect：逐页改叶子权限（PROT_READ=1 / WRITE=2 / EXEC=4）----
+static int64_t lx64_mprotect64(uint64_t addr, uint64_t len, uint64_t prot) {
+    if (len == 0) return 0;
+    const uint64_t n = (len + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
+    if (addr < USER64_CODE_VA64 || addr > USER64_CODE_VA64 + USER64_WINDOW_BYTES64) return -LX64_EINVAL;
+    if (n > (USER64_CODE_VA64 + USER64_WINDOW_BYTES64) - addr) return -LX64_EINVAL;
+    const uint64_t flags = PTE_USER_64
+                         | ((prot & 2u) ? PTE_WRITE_64 : 0u)
+                         | ((prot & 4u) ? 0u : PTE_NX_64);
+    for (uint64_t a = addr; a < addr + n; a += PAGE_SIZE_64) {
+        if (!user64_remap_flags64(a, flags)) return -LX64_EINVAL;
+    }
+    user64_paging_sync64();
+    return 0;
+}
+
+// ---- 11）munmap：逐页解除映射 + 回收物理页 ----
+static int64_t lx64_munmap64(uint64_t addr, uint64_t len) {
+    if (len == 0) return 0;
+    const uint64_t n = (len + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
+    if (addr < USER64_CODE_VA64 || addr > USER64_CODE_VA64 + USER64_WINDOW_BYTES64) return -LX64_EINVAL;
+    if (n > (USER64_CODE_VA64 + USER64_WINDOW_BYTES64) - addr) return -LX64_EINVAL;
+    for (uint64_t a = addr; a < addr + n; a += PAGE_SIZE_64) {
+        const uint64_t phys = user64_unmap_page64(a);
+        if (!phys) return -LX64_EINVAL;                       // 未映射：Linux 也返回 -EINVAL
+        page_free_64((void*)(uintptr_t)phys);
+    }
+    user64_paging_sync64();
+    return 0;
+}
+
+// ---- 12）brk：固定 64KiB 可写区，首次调用时整块映射 ----
+static uint64_t g_lx_brk64 = 0;
+static int64_t lx64_brk64(uint64_t addr) {
+    if (g_lx_brk64 == 0) {
+        for (uint64_t a = USER64_BRK_VA64; a < USER64_BRK_VA64 + USER64_BRK_BYTES64; a += PAGE_SIZE_64) {
+            uint64_t phys = 0;
+            if (!user64_map_page64(a, PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64, 1, &phys)) return -LX64_ENOMEM;
+        }
+        user64_paging_sync64();
+        g_lx_brk64 = USER64_BRK_VA64;
+    }
+    if (addr == 0) return (int64_t)g_lx_brk64;                                  // brk(0)：问当前 brk
+    if (addr < USER64_BRK_VA64 || addr > USER64_BRK_VA64 + USER64_BRK_BYTES64) {
+        return (int64_t)g_lx_brk64;                                            // 失败：返回旧 brk（Linux 同）
+    }
+    g_lx_brk64 = addr;
+    return (int64_t)addr;
+}
+
+// ---- 16）ioctl（最小但真：TIOCGWINSZ 写回 25x80）----
+struct LxWinsize64 { uint16_t row, col, xpixel, ypixel; };
+static int64_t lx64_ioctl64(uint64_t nr, uint64_t fd, uint64_t req, uint64_t arg) {
+    if (fd > 2) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (req == 0x5413u) {                                          // TIOCGWINSZ
+        if (!user64_range_ok64(arg, sizeof(LxWinsize64))) { syscall64_deny64(nr, arg); return -LX64_EFAULT; }
+        LxWinsize64 ws;
+        ws.row = 25; ws.col = 80; ws.xpixel = 640; ws.ypixel = 200;  // 终端是 8x8 字体字符网格
+        lx64_copy_to_user64(arg, &ws, sizeof(ws));
+        return 0;
+    }
+    if (req == 0x5414u) return 0;                                  // TIOCSWINSZ：忽略（我们改不了分辨率）
+    return -LX64_ENOTTY;                                           // 其它请求：与 Linux 对非 tty 一致
+}
+
+// ---- 20）writev ----
+static int64_t lx64_writev64(uint64_t nr, uint64_t fd, uint64_t iov_va, uint64_t iovcnt) {
+    if (fd != 1 && fd != 2) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (iovcnt == 0) return 0;
+    if (iovcnt > 8) { syscall64_deny64(nr, iovcnt); return -LX64_EINVAL; }
+    if (!user64_range_ok64(iov_va, iovcnt * 16)) { syscall64_deny64(nr, iov_va); return -LX64_EFAULT; }
+    int64_t total = 0;
+    for (uint64_t i = 0; i < iovcnt; i++) {
+        const uint8_t* e = (const uint8_t*)(uintptr_t)(iov_va + i * 16);
+        uint64_t base = 0, len = 0;
+        for (int k = 0; k < 8; k++) { base |= (uint64_t)e[k] << (8 * k); len |= (uint64_t)e[8 + k] << (8 * k); }
+        if (len == 0) continue;
+        const int64_t r = lx64_write64(nr, fd, base, len);
+        if (r < 0) return r;
+        total += r;
+    }
+    return total;
+}
+
+// ---- 63）uname ----
+static int64_t lx64_uname64(uint64_t nr, uint64_t buf) {
+    if (!user64_range_ok64(buf, 390)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }   // 6 x 65
+    static const char* const F[6] = { "VimtuOS", "vimtu64", "0.1.0-vimtu64",
+                                      "#1 ring3+syscall", "x86_64", "(none)" };
+    uint8_t out[390];
+    for (uint32_t i = 0; i < 390; i++) out[i] = 0;
+    for (uint32_t f = 0; f < 6; f++) {
+        uint32_t k = 0;
+        while (F[f][k] && k < 64) { out[f * 65u + k] = (uint8_t)F[f][k]; k++; }
+    }
+    lx64_copy_to_user64(buf, out, 390);
+    return 0;
+}
+
+// ---- 79）getcwd：把 "/" 写进用户 buf，返回 buf 指针（Linux 语义）----
+static int64_t lx64_getcwd64(uint64_t nr, uint64_t buf, uint64_t size) {
+    if (size < 2) return -LX64_EINVAL;
+    const uint64_t n = (size < 64) ? size : 64;
+    if (!user64_range_ok64(buf, n)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
+    uint8_t* d = (uint8_t*)(uintptr_t)buf;
+    d[0] = '/';
+    d[1] = 0;
+    return (int64_t)buf;
+}
+
+// ---- 228）clock_gettime：用 PIT tick 造近似值 ----
+static int64_t lx64_clock_gettime64(uint64_t nr, uint64_t clockid, uint64_t ts_va) {
+    if (clockid > 3) return -LX64_EINVAL;                       // CLOCK_REALTIME/MONOTONIC/PROCESS_CPUTIME/THREAD
+    if (!user64_range_ok64(ts_va, 16)) { syscall64_deny64(nr, ts_va); return -LX64_EFAULT; }
+    const uint64_t t = g_ticks64;
+    uint8_t ts[16];
+    lx64_wr64(ts + 0, t / PIT_HZ_64);                           // tv_sec
+    lx64_wr64(ts + 8, (t % PIT_HZ_64) * (1000000000ULL / PIT_HZ_64));  // tv_nsec（250Hz -> 4ms 粒度）
+    lx64_copy_to_user64(ts_va, ts, 16);
+    return 0;
+}
+
+// ---- 158）arch_prctl：只做 FS.base 的"存起来"（不 wrmsr，见文件头"已知边界"）----
+static uint64_t g_lx_fs_base64 = 0;
+static int64_t lx64_arch_prctl64(uint64_t nr, uint64_t code, uint64_t arg) {
+    if (code == 0x1002u) { g_lx_fs_base64 = arg; return 0; }    // ARCH_SET_FS
+    if (code == 0x1003u) {                                      // ARCH_GET_FS
+        if (!user64_range_ok64(arg, 8)) { syscall64_deny64(nr, arg); return -LX64_EFAULT; }
+        lx64_copy_to_user64(arg, &g_lx_fs_base64, 8);
+        return 0;
+    }
+    return -LX64_EINVAL;                                        // SET_GS/GET_GS 等：本内核没有
+}
+
+// ---- Linux 号段分发 ----
+// 返回：>= 0 正常返回；< 0 = -errno。exit 走特例（设置 g_syscall64_exit_to_kernel64）。
+static int64_t syscall64_linux64(pt_regs64* r) {
+    const uint64_t nr = r->rax;
+    const uint64_t a1 = r->rdi, a2 = r->rsi, a3 = r->rdx;
+    const uint64_t a4 = r->r10, a5 = r->r8, a6 = r->r9;
+
+    switch (nr) {
+    case 0:   return lx64_read64(nr, a1, a2, a3);
+    case 1:   return lx64_write64(nr, a1, a2, a3);
+    case 2:   return lx64_open64(nr, a1);
+    case 3:   return lx64_close64(nr, a1);
+    case 5:   return lx64_fstat64(nr, a1, a2);
+    case 8:   return lx64_lseek64(nr, a1, (int64_t)a2, a3);
+    case 9:   return lx64_mmap64(a2, a4, a1);
+    case 10:  return lx64_mprotect64(a1, a2, a3);
+    case 11:  return lx64_munmap64(a1, a2);
+    case 12:  return lx64_brk64(a1);
+    case 13:  return 0;                               // rt_sigaction：无信号机制，见文件头表
+    case 14:  return 0;                               // rt_sigprocmask：同上
+    case 16:  return lx64_ioctl64(nr, a1, a2, a3);
+    case 20:  return lx64_writev64(nr, a1, a2, a3);
+    case 39:  return task_current_id_64 ? (int64_t)task_current_id_64() : 0;
+    case 63:  return lx64_uname64(nr, a1);
+    case 79:  return lx64_getcwd64(nr, a1, a2);
+    case 102: return 0;                               // getuid
+    case 104: return 0;                               // getgid
+    case 158: return lx64_arch_prctl64(nr, a1, a2);
+    case 218: return 0;                               // set_tid_address（没有 clear_child_tid 唤醒）
+    case 228: return lx64_clock_gettime64(nr, a1, a2);
+    case 257: return lx64_open64(nr, a2);             // openat(dirfd, path, flags, mode)：dirfd 忽略
+    case 6:                                   // lstat / 4: stat —— 本阶段没有按路径 stat 的用户 ABI 需求
+    case 4:
+        break;
+    default:
+        break;
+    }
+    (void)a5; (void)a6;
+    syscall64_enosys_once64(nr);
+    return -LX64_ENOSYS;
+}
+
+// ==================== 分发（两条路径共用一个入口）====================
+extern "C" void syscall64_dispatch64(pt_regs64* r) {
+    // syscall 指令路径：int_no = SYSCALL64_INSM_FRAME_MARK64（见 syscall_entry64.asm）
+    if (r->int_no == SYSCALL64_INSM_FRAME_MARK64) {
+        const uint64_t nr = r->rax;
+        const uint64_t a1 = r->rdi, a2 = r->rsi, a3 = r->rdx;
+        int64_t ret;
+        if (nr == 60 || nr == 231) {                       // exit / exit_group
+            syscall64_log_insn64(nr, a1, a2, a3, 0);
+            if (user64_exit_to_kernel64(r, a1)) {
+                g_syscall64_exit_to_kernel64 = 1;          // 入口看到它就 jmp ring0 蹦床（别 sysret）
+                return;
+            }
+            ret = 0;                                       // 不在 ring3：当普通调用返回 0
+        } else {
+            ret = syscall64_linux64(r);
+            syscall64_log_insn64(nr, a1, a2, a3, ret);
+        }
+        // ---- 出口前自检：sysret 只能回"用户窗口内的地址 + CS=0x2B/SS=0x23" ----
+        // 帧一旦被谁改坏（本模块踩过：syscall 帧与中断帧共用栈顶导致 rip/cs 槽被覆盖），
+        // 直接 sysret 会在**用户的 CS/RSP 上下文里**抛 #GP，非常难查。这里改成：发现异常就
+        // 不 sysret，改走内核蹦床（user64_resume_tramp64）回 ring0，并留下证据。
+        if ((r->rip < USER64_CODE_VA64 || r->rip >= USER64_CODE_VA64 + USER64_WINDOW_BYTES64) ||
+            r->cs != SEL64_UCODE || r->ss != SEL64_UDATA) {
+            dbg64_line_begin64();
+            dbg64_str("[SYSCALL] insn frame bad rip=");
+            dbg64_hex64(r->rip);
+            dbg64_str(" cs=");
+            dbg64_hex64(r->cs);
+            dbg64_str(" ss=");
+            dbg64_hex64(r->ss);
+            dbg64_str(" -> kernel trampoline\n");
+            dbg64_line_end64();
+            r->rax = (uint64_t)ret;
+            if (user64_exit_to_kernel64(r, 0)) { g_syscall64_exit_to_kernel64 = 1; return; }
+            return;                                        // 实在回不去：保持原样（不该发生）
+        }
+        r->rax = (uint64_t)ret;
+        return;
+    }
+
+    // int 0x80 路径（Vimtu64 自有 ABI）：行为与引入 syscall 指令之前完全一致
+    const uint64_t nr = r->rax;
+    const uint64_t a1 = r->rdi, a2 = r->rsi, a3 = r->rdx;
+    int64_t ret = -1;
+
+    switch (nr) {
+    case 1:                                                     // write(fd, buf, len)
+        ret = syscall64_write64(nr, a1, a2, a3);
+        syscall64_log64(nr, a1, a2, a3, ret);
+        break;
+
+    case 2:                                                     // exit(code)
+        syscall64_log64(nr, a1, a2, a3, 0);
+        if (user64_exit_to_kernel64(r, a1)) return;             // 帧已改写：不回用户态
+        ret = -1;                                               // 不在 ring3：当普通调用处理
+        break;
+
+    case 3:                                                     // getpid()
+        ret = task_current_id_64 ? (int64_t)task_current_id_64() : 0;
+        break;
+
+    case 4:                                                     // ticks()
+        ret = (int64_t)g_ticks64;
+        break;
+
+    case 5:                                                     // sleep_ms(ms)
+        ret = syscall64_sleep64((uint32_t)a1);
+        break;
+
+    case 6: case 7: case 8:                                     // open/read/close：未实现
+        ret = -1;                                               // 需要挂载卷，见 syscall64.h 说明
+        break;
+
+    default:
+        ret = -1;
+        break;
+    }
+
+    r->rax = (uint64_t)ret;
+}
+
+// ==================== MSR：打开 syscall/sysret ====================
+static inline uint64_t sc64_rdmsr(uint32_t msr) {
+    uint32_t lo = 0, hi = 0;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void sc64_wrmsr(uint32_t msr, uint64_t v) {
+    __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+}
+
+#define MSR64_EFER   0xC0000080u
+#define MSR64_STAR   0xC0000081u
+#define MSR64_LSTAR  0xC0000082u
+#define MSR64_FMASK  0xC0000084u
+
+// FMASK：入口自动清掉 RFLAGS 的这些位。0x700 = TF(0x100) | IF(0x200) | DF(0x400)。
+//   IF -> 入口先关中断（入口自己决定何时开；本实现全程关，sysret 时用 r11 恢复用户 IF）
+//   DF -> 保证入口汇编里的字符串/内存操作方向是"向上"（本入口只有 push/pop，防御性）
+static const uint32_t SC64_FMASK64 = 0x700u;
+// STAR[63:48] = 0x1B -> sysret 的 CS = 0x2B、SS = 0x23；[47:32] = 0x08 -> syscall 的 CS = 0x08、SS = 0x10
+static const uint64_t SC64_STAR64  = ((uint64_t)0x1B << 48) | ((uint64_t)0x08 << 32);
+
+// 打开 EFER.SCE + 写 STAR/LSTAR/FMASK。幂等，可重复调用（自检里也调一次，保证测的是配置后的现场）。
+static void syscall64_init_msr64() {
+    uint64_t efer = sc64_rdmsr(MSR64_EFER);
+    if (!(efer & 1u)) {
+        sc64_wrmsr(MSR64_EFER, efer | 1u);                      // EFER.SCE = bit0
+    }
+    sc64_wrmsr(MSR64_STAR,  SC64_STAR64);
+    sc64_wrmsr(MSR64_LSTAR, (uint64_t)(uintptr_t)syscall64_insn_entry64);
+    sc64_wrmsr(MSR64_FMASK, SC64_FMASK64);
+
+    // 留证（自动验收 grep；回读 MSR 确认真的写进去了）
+    dbg64_line_begin64();
+    dbg64_str("[SYSCALL] msr init EFER.SCE=");
+    dbg64_dec(sc64_rdmsr(MSR64_EFER) & 1u);
+    dbg64_str(" star=");
+    dbg64_hex64(sc64_rdmsr(MSR64_STAR));
+    dbg64_str(" lstar=");
+    dbg64_hex64(sc64_rdmsr(MSR64_LSTAR));
+    dbg64_str(" fmask=");
+    dbg64_hex64(sc64_rdmsr(MSR64_FMASK));
+    dbg64_nl();
+    dbg64_line_end64();
+    dbg64_line_begin64();
+    dbg64_str("[SYSCALL] syscall insn entry ready (rustar: STAR=0x1B<<48|0x08<<32 -> CS=0x2B SS=0x23)\n");
+    dbg64_line_end64();
+}
+
+// ==================== 自检 ====================
+// 位含义：bit0 ABI/用户窗口常量自洽、bit1 GDT 现场（选择子/段类型）、bit2 范围校验负例、
+//         bit3 syscall 指令路径的 MSR 现场（EFER.SCE / STAR / LSTAR / FMASK / 帧标记）
+int syscall64_selftest64() {
+    int fail = 0;
+
+    // ---- bit0：ABI 常量 ----
+    if (USER64_CODE_VA64 < 0x100000000ULL) fail |= 1;                       // 用户窗口必须在 4GiB 以上
+    if (USER64_STACK_VA64 < USER64_CODE_VA64) fail |= 1;
+    if (USER64_STACK_VA64 + USER64_STACK_BYTES64 > USER64_CODE_VA64 + USER64_WINDOW_BYTES64) fail |= 1;
+    if (SEL64_UCODE != 0x2B || SEL64_UDATA != 0x23) fail |= 1;
+    // Linux 路径的固定区必须都落在窗口内、且互不重叠（改常量时这里会先报）
+    if (USER64_BRK_VA64 <= USER64_STACK_VA64 + USER64_STACK_BYTES64) fail |= 1;
+    if (USER64_BRK_VA64 + USER64_BRK_BYTES64 > USER64_MMAP_VA64) fail |= 1;
+    if (USER64_MMAP_VA64 < USER64_BRK_VA64 + USER64_BRK_BYTES64) fail |= 1;
+    if (USER64_MMAP_VA64 + USER64_MMAP_MIN_BYTES64 > USER64_CODE_VA64 + USER64_WINDOW_BYTES64) fail |= 1;
+
+    // ---- bit1：GDT 现场（access 字节 = 原始描述符 bits 40..47；gran = bits 48..55）----
+    // ★ 屏蔽 CPU 会自己置的位：段被加载时置"访问位 A"（type bit0），ltr 把 TSS 类型
+    //   从 0x9（可用）置成 0xB（忙）。屏蔽后才是描述符的静态编码。
+    if (((gdt_entry_raw64(1) >> 40) & 0xFE) != 0x9A) fail |= 2;             // 内核代码（未变）
+    if (((gdt_entry_raw64(2) >> 40) & 0xFE) != 0x92) fail |= 2;             // 内核数据（未变）
+    if (((gdt_entry_raw64(4) >> 40) & 0xFE) != 0xF2) fail |= 2;             // 用户数据 DPL=3
+    if (((gdt_entry_raw64(5) >> 40) & 0xFE) != 0xFA) fail |= 2;             // 用户代码 DPL=3
+    if (((gdt_entry_raw64(5) >> 48) & 0x20) != 0x20) fail |= 2;             // 用户代码 L=1
+    if (((gdt_entry_raw64(6) >> 40) & 0xFD) != 0x89) fail |= 2;             // TSS 在 index 6
+
+    // ---- bit2：范围校验必须拒绝内核地址/窗口外/溢出（安全闸门的最关键用例）----
+    if (user64_range_ok64(0x100000, 16)) fail |= 4;                                 // 内核镜像
+    if (user64_range_ok64(0xFFFFFFFF80100000ULL, 16)) fail |= 4;                    // 内核高半区
+    if (user64_range_ok64(USER64_CODE_VA64 - 1, 2)) fail |= 4;                      // 窗口下界前
+    if (user64_range_ok64(USER64_CODE_VA64 + USER64_WINDOW_BYTES64, 8)) fail |= 4;  // 窗口上界外
+    if (user64_range_ok64(USER64_CODE_VA64 + USER64_WINDOW_BYTES64 - 1, 4096)) fail |= 4;  // 跨上界
+    if (user64_range_ok64(USER64_CODE_VA64, 0)) fail |= 4;                          // len=0
+    if (user64_range_ok64(0xFFFFFFFFFFFFFFFFULL, 4096)) fail |= 4;                  // 溢出
+
+    // ---- bit3：syscall 指令路径的 MSR 现场（配一次再看，保证测的是配置后的值）----
+    syscall64_init_msr64();
+    {
+        if (!(sc64_rdmsr(MSR64_EFER) & 1u)) fail |= 8;                              // EFER.SCE
+        if (sc64_rdmsr(MSR64_STAR) != SC64_STAR64) fail |= 8;                       // STAR 全 64 位比对
+        if (sc64_rdmsr(MSR64_LSTAR) != (uint64_t)(uintptr_t)syscall64_insn_entry64) fail |= 8;
+        if (sc64_rdmsr(MSR64_FMASK) != (uint64_t)SC64_FMASK64) fail |= 8;
+        if ((SC64_STAR64 >> 48) != 0x1Bu) fail |= 8;                                // sysret CS/SS 的来源
+        if (SEL64_UCODE != (uint16_t)(((SC64_STAR64 >> 48) + 16) & 0xFFFF)) fail |= 8;
+        if (SEL64_UDATA != (uint16_t)(((SC64_STAR64 >> 48) + 8) & 0xFFFF)) fail |= 8;
+        if (SYSCALL64_INSM_FRAME_MARK64 == 0x80ULL) fail |= 8;                      // 必须与 int 0x80 区分
+        if (g_syscall64_kstack64 == 0) fail |= 8;                                   // 入口换栈用的栈顶
+    }
+
+    return fail;
+}
+
+// ==================== 初始化 ====================
+void syscall64_init64() {
+    // 1) int 0x80 门：idt_build() 里已经装成 0xEE（DPL=3 中断门）；这里再显式装一次并留证，
+    //    让"ring3 能 int 0x80"这件事不依赖任何构建顺序。
+    idt_set_gate64(128, (uint64_t)(uintptr_t)isr128_64, SEL64_KCODE, 0xEE, 0);
+    dbg64_line_begin64();
+    dbg64_str("[SYSCALL] int 0x80 gate installed (dpl=3, abi: rax=nr rdi/rsi/rdx=args ret=rax)\n");
+    dbg64_line_end64();
+
+    // 2) syscall 指令路径：EFER.SCE + STAR/LSTAR/FMASK（Linux 程序唯一会用的入口）
+    syscall64_init_msr64();
+
+    // 3) 自检（含 MSR 现场）
+    const int st = syscall64_selftest64();
+    if (st == 0) {
+        dbg64_line_begin64();
+        dbg64_str("[SYSCALL] selftest PASS\n");
+        dbg64_line_end64();
+    } else {
+        dbg64_line_begin64();
+        dbg64_str("[SYSCALL] selftest FAIL mask=");
+        dbg64_dec((uint64_t)st);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+}
