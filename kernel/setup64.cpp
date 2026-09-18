@@ -407,10 +407,10 @@ static void draw_license_page() {
     page_header("适用的通知与许可条款");
     ui_text(80, 160, "请阅读许可条款。若接受，请勾选下方的选项。", C_TEXT);
     fb_draw_rect(80, 210, fb_width() - 160, 300, C_DIM);
-    ui_text(110, 240, "VimtuOS 许可条款：本系统为自研操作系统，仅供学习与测试使用；", C_DIM);
-    ui_text(110, 274, "安装程序会把系统文件写入你选择的硬盘分区，并创建启动所需的", C_DIM);
-    ui_text(110, 308, "分区表、引导分区与主分区。继续操作前请确认目标硬盘上没有需", C_DIM);
-    ui_text(110, 342, "要保留的数据 —— 所选分区上的内容会被覆盖。", C_DIM);
+    ui_text(110, 240, "VimtuOS 以 GNU GPL-3.0 许可发布（全文见仓库 LICENSE）；", C_DIM);
+    ui_text(110, 274, "安装即表示你接受该许可条款。本项目仅供学习与测试使用，", C_DIM);
+    ui_text(110, 308, "请勿用于存放重要数据的机器。安装程序会把系统文件写入你", C_DIM);
+    ui_text(110, 342, "选择的硬盘分区 —— 所选分区上的内容会被覆盖。", C_DIM);
     ui_text(110, 400, "（与 Windows 10 安装程序一致，本安装程序不要求输入产品密钥）", C_DIM);
     ui_text(80, 540, g_st.license_ok ? "[X] 我接受许可条款" : "[  ] 我接受许可条款", C_TEXT);
     push_button(fb_width() - 240, fb_height() - 92, 180, 56, "下一步", 1, true, g_st.license_ok);

@@ -7,7 +7,7 @@
 全部是本工程自己的 C++ / 汇编代码。
 它自带一张"三合一"安装盘（BIOS 光盘 / U 盘 / UEFI），安装界面与步骤照 Windows 10 做（去掉了输入产品密钥那一步）。
 
-> 版本 **0.1.0** · 目标平台 x86_64（长模式）· 许可：**待定（见文末「开源前要做的事」）**
+> 版本 **0.1.0** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
 > 状态（权威判据：`python tests/status_report.py`）：**完成 27 / 部分 0 / 未做 1（共 28 项能力）**，
 > 唯一未做项是 **Rust 参与实现（可选要求，本机未装 Rust 工具链）**。
 > 全量验收（`--full` + 5 个扩展脚本）：**20 个脚本 / 540 条断言全部 PASS**（2026-09-19 实测）。
@@ -137,6 +137,12 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
 pacman -S --noconfirm --needed mingw-w64-x86_64-clang mingw-w64-x86_64-lld \
                                mingw-w64-x86_64-compiler-rt nasm xorriso
 # 还需要 Python 3 + Pillow（字体子集化 / 图标生成）
+
+# ① 先准备字体：仓库**不含**第三方字体（版权原因），需要自备这三个文件
+#    Fonts/bahnschrift.ttf、Fonts/ChaparralPro-Regular.ttf、Fonts/simhei.ttf
+#    或者把 _otf2ttf.py / _subset_fonts.py / _subsetsimhei.py 改成开源字体（Noto Sans / 思源黑体）
+
+# ② 构建：产出 vimtu64-64.iso（三合一安装盘）
 bash build64.sh
 ```
 
@@ -302,74 +308,46 @@ docs/                   架构、安装、UEFI、桌面栈、应用层与系统�
 docs/screenshots/       自动抓取的桌面截图（desktop64.png）
 ```
 
-## 十、开源前要做的事（给仓库主人的清单）
+## 十、开源与发布状态
 
-当前目录已经 `git init` 过（**还没有任何提交**，`.gitignore` 已就位），工作区约 2.4 GB；
-真正要发布的源码只有 **约 1.9 MB**。建议：
+**本仓库已开源：<https://github.com/Fanqi89/VimtuOS>** —— 只发**源码**（181 个文件 / 约 1.9 MB），许可 **GPL-3.0**。
+
+**没有进仓的东西**（都在 `.gitignore` 里，按体积排序）：
+
+| 未发布 | 体积 | 原因 |
+|---|---|---|
+| `tools/i686-elf/` | 849 MB | 打包的第三方交叉编译器（README 里给安装方式即可） |
+| `legacy32/` | 770 MB | 已退役的 32 位工程，建议将来单独立仓作"移植参考" |
+| `Fonts/` | 684 MB | 第三方字体，**版权原因不能公开** |
+| `build64/` + `build/` | 80 MB | 构建产物 |
+| `vimtu64-64.iso` / `.img` | 22 MB | 构建产物（且 ISO 内嵌商业字体子集，见下） |
+| `target-*.img` / `*.log` | ~64 MB | 验收测试残留 |
+
+**发布二进制（ISO/IMG）之前的硬约束**：安装镜像里嵌着 `bahnschrift` / `ChaparralPro` / `simhei` 的字体子集，
+**不能公开分发**。要先做两步：① 把 `_otf2ttf.py` / `_subset_fonts.py` / `_subsetsimhei.py` 指向开源字体
+（Noto Sans / 思源黑体，SIL OFL）；② 重建并重跑一次验收（`py -3 tests/status_report.py --full`）——
+之后才可以把 ISO 作为 Release 附件发出去。
+
+**版本与发布**：标签 `v0.1.0-beta.1`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.1.0-beta.1>
+（预发布 / 源码版，无二进制附件）。
 
 ```bash
-# ① .gitignore（关键：别把 849MB 的交叉编译器和构建产物提交上去）
-#    ⚠️ .gitignore **不支持行尾注释**：写成 `tools/i686-elf/   # 849 MB` 时，
-#       整行（含 # 和后面的字）会被当成一个匹配不到的图案 —— 看起来排除了，其实一个都没排除。
-#       所以注释一律单独占一行（仓库里的 .gitignore 就是这么写的）。
-cat > .gitignore <<'EOF'
-# ==================== 第三方工具链（打包进来的，不进仓）====================
-# i686-elf 交叉编译器 849 MB：改为在 README 里给下载/构建方式
-tools/i686-elf/
-# nasm 二进制 2.6 MB：MSYS2 里 pacman -S nasm 即可
-tools/nasm/
-tools/__pycache__/
-
-# ==================== 第三方字体（版权原因，绝对不能公开）====================
-# Fonts/ 是 Windows 字体副本（684 MB），构建真正用到的是：
-#   bahnschrift.ttf、ChaparralPro-Regular.ttf、simhei.ttf
-# 公开仓库时请让使用者自备（或把三个 _*.py 改成开源字体如 Noto / 思源黑体）
-Fonts/
-
-# ==================== 已退役的 32 位工程（770 MB）====================
-# 若想公开，建议单独建一个仓库作为“移植参考”
-legacy32/
-
-# ==================== 构建产物 ====================
-build64/
-build/
-*.elf
-*.o
-vimtu64-64.iso
-vimtu64-64.img
-# 资源中间产物（根目录 _*.py 生成）
-build/*.ttf
-build/*.bin
-
-# ==================== 验收测试残留与日志 ====================
-# 每次验收后 16 MB
-target-*.img
-*-serial.log
-*_serial.log
-installed_boot.log
-
-# ==================== 会话 / 编辑器杂项 ====================
-.pisession/
-.pi/
-__pycache__/
-*.pyc
-.vscode/
-.idea/
-Thumbs.db
-desktop.ini
-EOF
-git add .
-git status --short          # 核对：不该出现 Fonts/、tools/i686-elf/、legacy32/、build64/
+# 日常：改完代码这样提交推送（★ 不要用网页拖拽上传 —— 那会绕过 .gitignore）
+git status --short          # 先看会提交什么
+git add -A
+git commit -m "说明这次改了什么"
+git push
 ```
 
-② **LICENSE（需要你决定）**：MIT（最宽松）／ Apache-2.0（含专利授权）／ GPLv3（传染性）。
-   注意：安装程序许可页现在写的是「仅供学习与测试使用」，选定许可证后建议同步改那句话。
-③ **README 的截图**：`docs/screenshots/desktop64.png` 由 `py -3 tests/screenshot64.py` 生成，已随仓库更新。
-④ **子模块或说明**：`legacy32/`（32 位老工程）与 `tools/i686-elf/`（交叉编译器）建议不进主仓，
-   前者可另立仓库作为"移植参考"，后者在 `README` 里给下载/构建方法；`Fonts/` 因为版权原因同样不进仓。
-⑤ 可选：把 `docs/项目状态总览.md` 作为"项目状态"页，`python tests/status_report.py --full` 作为 CI 入口。
+⚠️ 踩坑：`.gitignore` **不支持行尾注释** —— 写成 `tools/i686-elf/   # 849 MB` 时，整行（含 `#` 与后面的字）
+会被当成一个匹配不到的图案，看起来排除了其实一个都没排除。注释一律单独占一行（仓库里的 `.gitignore` 就是这么写的）。
 
-## 十一、免责声明
+## 十一、许可（GPL-3.0）
+
+本项目以 **GNU General Public License v3.0** 发布（全文见 [LICENSE](LICENSE)）：你可以自由使用、修改、分发，
+但衍生的分发物必须以同样的许可开源，且不提供任何担保。安装程序的许可页写的就是这一条。
+
+## 十二、免责声明
 
 本项目是**学习与实验性质**的自研操作系统：不保证稳定性与数据安全，**不要**在存有重要数据的机器上安装。
 VMware/QEMU 等虚拟机是推荐的试用方式。安装程序会**真实写入**你所选磁盘的分区表与扇区。
