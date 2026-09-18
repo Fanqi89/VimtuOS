@@ -1,0 +1,446 @@
+// kernel64.cpp - Vimtu64 纯 64 位（长模式）内核入口与 M0 自检
+//
+// 与 kernel/kernel.cpp 的关系：
+//   kernel.cpp 是 32 位内核的入口（32 位构建专用，内含 32 位内联汇编与 32 位中断帧假设）。
+//   本文件是 **64 位构建专用入口**，从零开始验证长模式引导链，不引用任何 32 位专用代码。
+//   两者分别由 build.sh（32 位）与 build64.sh（64 位）编译，互不影响：
+//   32 位构建不会看到这个文件，64 位构建也不编译 kernel.cpp。
+//
+// 阶段目标（M0）：证明"BIOS -> loader -> 长模式 -> 64 位 C++ 代码"这段链路成立，
+//   并且能正确读到 loader 写的 BootInfo（VBE 模式、LFB 地址、E820 表）。
+//   本阶段不建立 IDT、不开中断、不跑 GUI —— 那些是 M1 的工作，必须建立在 M0 全绿之上。
+//
+// 自动断言（由 tests/boot64_assert.py 读串口日志判定）：
+//   [LM64] ENTERED LONG MODE   长模式成立
+//   [LM64] BOOTINFO OK
+//   [LM64] LFB ...             图形模式参数可读
+#include "fb.h"
+#include "font.h"
+#include "input.h"
+// ---- 硬件清单 / ACPI 平台表 / VimtuFS2 文件系统：两份内核都链接（只读探测 + 内存假盘自检）----
+#include "hwinfo64.h"   // CPUID + PCI 只读枚举
+#include "acpi64.h"     // RSDP -> RSDT/XSDT -> FADT/MADT 只读解析
+#include "edid64.h"     // 显示器 EDID（引导层已落在 0x7600）只读解析：厂商/名字/首选时序/刷新率
+#include "vfs64.h"      // 真文件系统 VimtuFS2（安装程序格式化分区要用）
+#include "ata64.h"      // ATA：IRQ14 中断驱动等待（超时回退 PIO 轮询），系统内核也要初始化
+#ifndef VIMTU_INSTALLER_MEDIA
+#include "store64.h"    // 设置持久化 store：只有系统内核链接它（安装程序不链 store64.cpp）
+#endif
+#ifdef VIMTU_INSTALLER_MEDIA
+#include "setup64.h"          // 只有安装介质的内核需要安装界面
+#endif
+
+#ifndef VIMTU_INSTALLER_MEDIA
+#include "gui64.h"      // 64 位桌面外壳（只有"系统内核"链接它；安装程序内核走向导）
+#endif
+#include "task64.h"     // 调度器（同样只进系统内核：安装程序内核不链它）
+#ifndef VIMTU_INSTALLER_MEDIA
+#include "usermode64.h" // 用户态（ring3）：建用户页 + 进/出 ring3（只在系统内核路径里调用）
+#include "syscall64.h"  // int 0x80 系统调用分发（两份内核都链接实现，安装程序不调用）
+#include "app64.h"      // VAP64 可安装应用：安装器 + 启动器（只进系统内核，见 os_boot_path）
+#include "elf64.h"      // ELF64 加载器（自有静态 ELF64 程序 + syscall 指令路径；只进系统内核）
+#include "net64.h"      // 网络：e1000 驱动 + ARP/ICMP（只进系统内核；启动链里跑一次探测）
+#include "usb64.h"      // USB 主机：UHCI + HID 引导键盘（只进系统内核；按键注入 PS/2 同一队列）
+#include "apic64.h"    // LAPIC + IOAPIC 接管中断路由（只进系统内核；拿不到就留在 PIC）
+#include "smp64.h"     // SMP：启动 AP（INIT-SIPI-SIPI + 低端跳板；只进系统内核）
+// 用户态演示程序 blob：user/demo64.asm -> nasm 平铺二进制 -> objcopy 嵌入（见 build64.sh）。
+// 符号名由 objcopy 按输入路径生成：_binary_build64_user_demo64_bin_start/_end。
+extern "C" const uint8_t _binary_build64_user_demo64_bin_start[];
+extern "C" const uint8_t _binary_build64_user_demo64_bin_end[];
+#endif
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "../bootinfo.h"
+#include "debug64.h"
+#include "memlayout64.h"
+
+// ---- 平台层（64 位）：PIC/PIT/IDT/TSS/RTC，实现在 kernel/x86_64.cpp ----
+#include "x86_64.h"
+// ---- 图形栈与输入（与 32 位共用同一份源文件：只依赖 port.h / fb.h 等纯 IO 接口）----
+#include "fb.h"
+#include "font.h"
+#include "input.h"
+// linker64.ld 提供
+// ---- 64 位内存管理：物理页池 + 内核堆 + 编译器辅助例程（kernel/mem64.cpp）----
+#include "mem_64.h"
+extern "C" char __bss_start[];
+extern "C" char __bss_end[];
+
+static void bss_clear_64() {
+    volatile uint64_t* p = (volatile uint64_t*)__bss_start;
+    volatile uint64_t* e = (volatile uint64_t*)__bss_end;
+    // ★ 进度打点：搬高半区之后，VMware EFI 下曾在"清 BSS"阶段复位（OVMF 正常）。
+    //   BSS 有 36MB（含 fb 的 33MB 后备缓冲），每 8MB 打一个点，
+    //   这样能区分"清到哪一片出问题"和"一开始就崩"。
+    while (p < e) {
+        *p++ = 0;
+        if (((uint64_t)(uintptr_t)p & 0x7FFFFFULL) == 0) dbg64_putc('.');
+    }
+    dbg64_str(" |");
+}
+
+// 停机（IDT 尚未建立，只能 hlt + 空转）
+[[noreturn]] static void halt_forever(const char* reason) {
+    dbg64_str("[LM64] HALT: ");
+    dbg64_str(reason);
+    dbg64_nl();
+    for (;;) { __asm__ volatile("cli; hlt"); }
+}
+
+static void dump_e820(const BootInfo* bi) {
+    if (bi->mem_entries == 0 || bi->mem_map_addr == 0) {
+        dbg64_str("[LM64] E820 NONE");
+        dbg64_nl();
+        return;
+    }
+    const E820Entry* e = (const E820Entry*)(uintptr_t)bi->mem_map_addr;
+    uint32_t n = bi->mem_entries;
+    if (n > 64) n = 64;
+
+    uint64_t usable = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t base = ((uint64_t)e[i].base_high << 32) | e[i].base_low;
+        uint64_t len  = ((uint64_t)e[i].len_high  << 32) | e[i].len_low;
+        if (e[i].type == 1) {
+            // 只累计 1MB 以上的可用区（低端 640KB 保留给引导链/BIOS 数据）
+            uint64_t top = base + len;
+            uint64_t lo = base > 0x100000 ? base : 0x100000;
+            if (top > lo) usable += (top - lo);
+        }
+        if (i < 8) {
+            dbg64_str("[LM64] E820[");
+            dbg64_dec(i);
+            dbg64_str("] base=");
+            dbg64_hex64(base);
+            dbg64_str(" len=");
+            dbg64_hex64(len);
+            dbg64_str(" type=");
+            dbg64_dec(e[i].type);
+            dbg64_str(" size_kb=");
+            dbg64_dec(len / 1024);
+            dbg64_nl();
+        }
+    }
+    dbg64_str("[LM64] E820 usable_above_1M_kb=");
+    dbg64_dec(usable / 1024);
+    dbg64_nl();
+}
+
+static uint64_t read_rsp64() { uint64_t v; __asm__ volatile("mov %%rsp, %0" : "=r"(v)); return v; }
+static uint64_t read_cs64()  { uint64_t v; __asm__ volatile("mov %%cs, %0"  : "=r"(v)); return v & 0xFFFF; }
+
+// ==================== 已安装系统的启动路径 ====================
+// 走到这里说明运行的不是安装介质，而是装到硬盘上的系统。64 位的桌面栈已经就位：
+// 外壳在 kernel/gui64.cpp，应用在 calc64/mines64/terminal64/settings64/taskmgr64.cpp。
+//   注意：串口那两行 "[OS] booted from installed disk" 与 "[OS] ready (idle)" 是自动验收
+//   （tests/install_flow_test.py、tests/vmware_install_test.py）依赖的断言，勿删。
+//   安装程序内核不带桌面（gui64.cpp 不进它的链接），所以整段用 #ifndef 包起来。
+#ifndef VIMTU_INSTALLER_MEDIA
+[[noreturn]] static void os_boot_path(const BootInfo* bi) {
+    dbg64_str("[OS] booted from installed disk (system kernel, no installer)");
+    dbg64_nl();
+    // ---- 中断路由：优先 LAPIC + IOAPIC 接管（APIC）；拿不到就留在 8259 PIC。
+    // 位置理由（为什么放在 os_boot_path 的第一件事）：
+    //   1) 它在 kmain64 的 M0 门（"[LM64] PIT IRQ OK"）之后 —— 先证明 8259 路径本身是通的，
+    //      再切换；万一 APIC 有 bug，串口日志能区分"本来就不通"和"切换切坏了"。
+    //   2) 它在 ata64_init64()/task_start64() 之前 —— 键盘、鼠标、ATA 的 IRQ 注册与自检
+    //      全部发生在 APIC 已接管之后，这些设备自己的 selftest 就顺带验收了 IOAPIC 路由
+    //      （[ATA64] irq14 selftest PASS 要求 IRQ14 真的到达）。
+    //   3) 只在系统内核调用：apic64.cpp 不进安装介质的链接（build64.sh），安装链保持纯 PIC。
+    // 拿不到 ACPI/LAPIC/IOAPIC 或自检失败时，apic64_init64() 内部**自动保持/退回 PIC**
+    // 并打印 unavailable 行，系统照常启动、桌面照常起来（硬要求）。
+    (void)apic64_init64();
+    // ---- SMP：启动 AP（多核第一阶段：只要求"AP 真的起来并且不捣乱"）----
+    // 位置：apic64_init64() **之后**（ICR/LAPIC 已经可用、EOI 走 LAPIC）、task_start64()
+    //       **之前**（调度器仍是单核；AP 起来后只 cli+hlt 停住，不参与调度）。
+    // 只在 APIC 模式下做：还在 PIC 回退模式时直接跳过并说明（PIC 没有 ICR，也没有 SIPI）。
+    // 只在系统内核调用：smp64.cpp/smp64.o/ap_trampoline64.o 都不进安装介质的链接。
+    // 任何前置条件不满足（拿不到 MADT 的 APIC ID、跳板页没映射、自检失败…）都会在
+    // smp64_init64() 内部优雅跳过 —— 绝不挂在启动里、绝不变砖。
+    if (g_irq_mode64 == IRQ_MODE64_APIC) {
+        (void)smp64_init64();
+    } else {
+        dbg64_line_begin64();
+        dbg64_str("[SMP] skipped (irq mode = pic)");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    // ---- ATA：注册/打开 IRQ14，之后读写走中断驱动等待 + 超时回退轮询（只读自检不写盘）----
+    ata64_init64();
+    // 调度器上线：任务 0 = 本流程（桌面消息循环），另建 kheart/kwork/ksum 三个内核线程。
+    // 必须放在 gui64_run 之前 —— 之后不再返回。
+    task_start64();
+    // ---- 用户态（ring3）+ int 0x80：启动期跑一次真实用户程序（M3 起点）----
+    // 位置有讲究：必须在 task_start64() 之后（调度器在线：TSS.rsp0 由它维护，用户程序
+    // 也能被 PIT 抢占），且在 gui64_run() 之前（那之后不再返回）；跑完必须还能进桌面。
+    // 安装程序内核不跑这段（整段在 #ifndef VIMTU_INSTALLER_MEDIA 里）。
+    syscall64_init64();                     // 装/确认 int 0x80 门（DPL=3）+ 自检
+    (void)user64_selftest64();              // 用户页/帧/选择子自检 -> [USER64] selftest PASS
+    {
+        const uint64_t blob_sz = (uint64_t)(_binary_build64_user_demo64_bin_end -
+                                            _binary_build64_user_demo64_bin_start);
+        (void)user64_run_blob64(_binary_build64_user_demo64_bin_start, (uint32_t)blob_sz, "demo64");
+    }
+    // ---- 用户态演示跑完，接着跑"从文件系统装出来"的应用（下面这段）----
+    // ---- 可安装应用（VAP64）：挂载 VimtuFS2 -> 自检 -> 幂等安装内嵌 hello.vap -> 从盘上读出来跑一次 ----
+    // 挂载参数 (drive, LBA) 的依据：
+    //   drive = 0：primary master，与 store64_init64(0)/task 路径用的是同一块系统盘；
+    //   LBA   = kernel/part64.h 定义的主分区起始 —— PART_MAIN_LBA = PART_BOOT_LBA(9) + PART_BOOT_SECS(8000)
+    //           = 8009。安装引擎 part_create_standard()/part_install_step() 写进目标盘 MBR 的第 2 个
+    //           分区项（type 0x07）起点就是这个值 —— 也就是说 kernel/memlayout64.h 的 store 裸盘
+    //           保留区（ML64_STORE_LBA = 8009）与主分区起点**完全重叠**。所以下面的 store 初始化
+    //           必须排在挂载之后：它先探测这个卷，优先把槽放进文件系统（/store.a、/store.b），
+    //           没有卷才降级到裸盘槽区并打 WARN（见 kernel/store64.cpp 的载体说明）。
+    //   app64_main_part_lba64() 先按同一条规则读 MBR 找 0x07 项（真盘换了布局也能跟上），
+    //   读不到才退回上述常量。挂载失败/读不到时优雅降级：只打原因，install/launch 不跑、不崩，
+    //   桌面起来后终端里仍可手动 `run`（VFS 若随后可用则命令可再试）。
+    {
+        const int app_drive = 0;
+        const uint32_t app_lba = app64_main_part_lba64(app_drive);
+        if (vfs64_mount(app_drive, app_lba) == 0) {
+            (void)app64_selftest64();
+            (void)app64_install_builtin64(app_drive, app_lba);   // 幂等：已装过则 skipped (exists)
+            (void)app64_launch64("/hello.vap");                  // 从文件系统读出 -> 校验 VAP64 -> ring3
+            // ---- ELF64：自有静态 ELF64 程序（用 syscall 指令与内核通信）----
+            // 与上面 VAP64 同一条套路：幂等把内嵌 hello.elf 装成 /hello.elf，再从盘上 vfs64_read
+            // 读出来 -> elf64.cpp 解析/装载 -> ring3 里跑 -> exit 回 ring0 -> 回收页。
+            (void)elf64_selftest64();                            // 合法映像/坏样本自检（坏样本带 selftest 前缀）
+            (void)elf64_install_builtin64(app_drive, app_lba);   // 幂等：已装过则 skipped (exists)
+            (void)elf64_run64("/hello.elf");
+        } else {
+            dbg64_str("[APP64] boot: vfs64 mount failed -> install/launch skipped (terminal 'run' can retry)\n");
+        }
+    }
+    // ---- 设置持久化 store：**必须放在 VFS 挂载之后** ----
+    // 槽优先放在文件系统里（VimtuFS2 的 /store.a、/store.b，各 16KB = 一个槽）；
+    // store64_init64 先探"卷挂没挂"（vfs64_stat("/")），挂上了就走 VFS 载体。放在挂载之前的话
+    // 它探不到卷，只能降级到裸盘槽区 LBA 8009..8072（ML64_STORE_LBA，正好是主分区起点，
+    // 会把 VimtuFS2 超级块/inode 覆盖掉）——那是本模块只留给"无卷"的兜底路径。
+    // 这里只 init + 自检 + dump —— **不要 flush**：flush 会写盘且不可重入，启动早期不做。
+    // 0 = primary master，与上面 app64/vfs64 挂载用的是同一块系统盘。
+    store64_init64(0);
+    {
+        const int sst = store64_selftest64();
+        if (sst) {
+            dbg64_str("[STORE64] selftest FAIL mask=");
+            dbg64_dec((uint64_t)sst);
+            dbg64_nl();
+        }
+    }
+    store64_dump64();
+    // ---- 网络：e1000（轮询收发）+ ARP/ICMP 一次性探测 ----
+    // 位置：store 之后、gui64_run 之前（那之后不再返回）；安装程序内核不链本模块（见 build64.sh）。
+    // 说明：桌面消息循环没有全局 tick 钩子（不改 gui64.cpp 的实现结构），所以 net64_poll64()
+    //   的定时轮询没挂进 gui64_run；桌面起来后收包靠终端 `ping` 命令内部的有界 poll 循环。
+    //   无网卡/ARP/ICMP 超时只打 no link 行并返回负值，系统照常启动、自检不算失败。
+    (void)net64_init64();
+    // ---- USB 主机（UHCI）：枚举 HID 引导键盘（只做引导键盘；EHCI/xHCI 未做）----
+    // 位置：net64 之后、gui64_run 之前（那之后不再返回）；找不到主控/没插设备/枚举失败都
+    //   只打点并返回负值，系统照常启动、桌面照常工作（自检按 skipped 处理，不算失败）。
+    // 运行期轮询由 kusb 内核线程负责（见 kernel/task64.cpp），不占用这里的执行流。
+    (void)usb64_init64();
+    gui64_run(bi);          // 不返回：进入桌面消息循环
+}
+#endif
+
+extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
+    (void)arg0; (void)arg1;
+
+    // 1) 串口先就绪，保证后面每条日志都能看到
+    dbg64_serial_init();
+
+    // 2) 确认我们真的在 64 位长模式下（读 IA32_EFER，LMA 位必须为 1）
+    uint32_t efer_lo, efer_hi;
+    __asm__ volatile("rdmsr" : "=a"(efer_lo), "=d"(efer_hi) : "c"(0xC0000080));
+    dbg64_str("[LM64] ENTERED LONG MODE efer=");
+    dbg64_hex64(((uint64_t)efer_hi << 32) | efer_lo);
+    dbg64_nl();
+    if (!(efer_lo & (1u << 10))) {   // EFER.LMA
+        halt_forever("EFER.LMA not set (not in long mode)");
+    }
+
+    // 3) 清 .bss（CPU 复位不清 RAM，硬重启后必须自己清）
+    dbg64_str("[LM64] bss ");
+    dbg64_hex64((uint64_t)(uintptr_t)__bss_start);
+    dbg64_str("..");
+    dbg64_hex64((uint64_t)(uintptr_t)__bss_end);
+    dbg64_nl();
+    bss_clear_64();
+    dbg64_str("[LM64] BSS CLEARED");
+    dbg64_nl();
+
+    // 4) 读 BootInfo（loader 写在 0x1000）
+    BootInfo* bi = (BootInfo*)(uintptr_t)BOOT_INFO_ADDR;
+    if (bi->magic != BOOT_INFO_MAGIC) {
+        dbg64_str("[LM64] BOOTINFO BAD magic=");
+        dbg64_hex64(bi->magic);
+        dbg64_nl();
+        halt_forever("bad bootinfo magic");
+    }
+    dbg64_str("[LM64] BOOTINFO OK magic=");
+    dbg64_hex64(bi->magic);
+    dbg64_nl();
+
+    // 5) 图形模式参数（M1 的 fb 模块要靠它建帧缓冲）
+    dbg64_str("[LM64] LFB addr=");
+    dbg64_hex64(bi->lfb_addr);
+    dbg64_str(" size=");
+    dbg64_dec(bi->width); dbg64_str("x"); dbg64_dec(bi->height);
+    dbg64_str(" bpp="); dbg64_dec(bi->bpp);
+    dbg64_str(" pitch="); dbg64_dec(bi->pitch);
+    dbg64_str(" mode=0x"); dbg64_hex64(bi->mode_num);
+    dbg64_str(" modes="); dbg64_dec(bi->mode_count);
+    dbg64_str(" edid="); dbg64_dec(bi->edid_ok);
+    dbg64_nl();
+
+    // 6) 内存地图
+    dump_e820(bi);
+
+
+    // 6b) 64 位内存管理：页池 + 内核堆。
+    //     位置讲究：必须在 E820 之后（页池上界来自 E820）、在任何 kmalloc_64 之前。
+    //     布局避让三处固定占用（内核 .bss 到 ~36.4MB、安装载荷 64~68MB、内核栈 0x7C000），
+    //     详见 kernel/mem64.cpp 顶部注释。自检失败会打印失败掩码，供自动验收定位。
+    mem_init_64(bi);
+    {
+        const int mst = mem_selftest_64();
+        if (mst != 0) {
+            dbg64_str("[MEM64] selftest FAILED mask=");
+            dbg64_dec((uint64_t)mst);
+            dbg64_nl();
+        }
+    }
+    // 6c-0) 硬件清单 / ACPI 平台表 / 文件系统自检（两份内核都跑得到）：
+    //   hwinfo64：CPUID + PCI 枚举，只往 0xCF8/0xCFC 读设备配置，不写任何设备寄存器；
+    //   acpi64  ：只读固件放好的 RSDP/RSDT/XSDT 表，不切 ACPI 模式、不接管中断；
+    //   vfs64   ：自检在 64 扇区内**内存假盘**上跑（格式化/写/读/删），对真盘只做只读探测，不写盘。
+    //   edid64  ：只读引导层已经读进 0x7600 的 EDID（BootInfo.edid_ok 说了算），
+    //             不碰 fb 状态、不写 0x3DA/CRTC —— 设置页/任务管理器的刷新率来自这里。
+    //             ★ 两份内核都跑（安装介质也打这两行日志，便于同一份验收脚本核对）。
+    hwinfo_init64();  (void)hwinfo_selftest64();
+    acpi_init64();    (void)acpi_selftest64();
+    edid64_init64();  (void)edid64_selftest64();   // 只读：EDID 解析 + 自检（合成样本离线自证）
+    (void)vfs64_selftest64();
+    // 6c) 任务系统：把当前执行流登记为任务 0（内核主流程 -> 最终进入桌面消息循环）。
+    //     必须在 mem_init_64 之后（任务栈来自内核堆），且在进入桌面之前。
+    //     ★ 安装程序内核不链接 task64.cpp，所以整段用宏包起来。
+#ifndef VIMTU_INSTALLER_MEDIA
+    task_init64();
+#endif
+
+    // 7) 64 位能力自检：指针宽度、RIP 相对寻址、CR3 可读
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    dbg64_str("[LM64] ptr_bits=");
+    dbg64_dec(sizeof(void*) * 8);
+    dbg64_str(" cr3=");
+    dbg64_hex64(cr3);
+    dbg64_str(" cr4=");
+    {
+        uint64_t cr4; __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+        dbg64_hex64(cr4);
+    }
+    dbg64_nl();
+
+    // 8) 内核镜像规模（用于核对 loader 的 KERNEL_SECTORS 是否够）
+    // ★ 用**虚拟**基址算镜像大小：内核已搬高半区（链接在 0xFFFFFFFF80000000），
+    //   而 __bss_end 是高半区地址；用物理基址 ML64_KERNEL_BASE 会得到天文数字。
+    uint64_t kb = ((uint64_t)(uintptr_t)__bss_end - ML64_KERNEL_VA_BASE + 1023) / 1024;
+    dbg64_str("[LM64] kernel_image_kb=");
+    dbg64_dec(kb);
+    dbg64_str(" limit_kb=");
+    dbg64_dec(ML64_KERNEL_MAX_BYTES / 1024);
+    dbg64_nl();
+
+
+    // 9) 平台层：PIC 重映射 + TSS + IDT + PIT，开中断实测时钟
+    //    这是 M1 的第一块地基 —— 中断不走通，后面的任务系统/GUI 都无从谈起。
+    dbg64_str("[LM64] x86_init64 ...");
+    dbg64_nl();
+    x86_init64();
+    __asm__ volatile("sti");            // 开中断（IDT 已就绪）
+
+    dbg64_str("[LM64] pre-sti rsp=");
+    dbg64_hex64(read_rsp64());
+    dbg64_str(" cs=");
+    dbg64_hex64(read_cs64());
+    dbg64_str(" ticks0=");
+    dbg64_dec((uint64_t)g_ticks64);
+    dbg64_nl();
+
+    // 用 hlt 等 12 个 tick（约 48ms）：能等到就说明 PIT 中断真的进来了。
+    // 带一个防死循环计数器：中断没到就打印 TIMEOUT 而不是永远卡住（便于自动验收定位）。
+    uint64_t t0 = g_ticks64;
+    uint64_t loop_guard = 0;
+    while (g_ticks64 < t0 + 12) {
+        if (++loop_guard > 2000000000ULL) {
+            dbg64_str("[LM64] PIT IRQ TIMEOUT ticks=");
+            dbg64_dec((uint64_t)g_ticks64);
+            dbg64_str(" guard=");
+            dbg64_dec(loop_guard);
+            dbg64_nl();
+            break;
+        }
+        __asm__ volatile("hlt");
+    }
+    uint64_t t1 = g_ticks64;
+    dbg64_str("[LM64] PIT IRQ OK ticks=");
+    dbg64_dec(t1 - t0);
+    dbg64_str(" irq_total=");
+    dbg64_dec(g_irq_total64);
+    dbg64_str(" rtc=");
+    {
+        int hh = 0, mm = 0, ss = 0;
+        rtc_get_time64(&hh, &mm, &ss);
+        dbg64_dec(hh); dbg64_str(":"); dbg64_dec(mm); dbg64_str(":"); dbg64_dec(ss);
+    }
+    dbg64_nl();
+    dbg64_str("[LM64] M0 PASS");
+    dbg64_nl();
+
+    // ==================== 图形栈 + 输入（安装程序的前置条件）====================
+    // 安装程序只需要 framebuffer + TrueType 字体 + 键鼠三样；完整的桌面 GUI
+    // （gui.cpp / task.cpp / mem.cpp）等 M1 收尾时再接，避免一次引入太多变量。
+    fb_init(bi);
+    dbg64_str("[G64] fb render=");
+    dbg64_dec((uint64_t)fb_width()); dbg64_str("x"); dbg64_dec((uint64_t)fb_height());
+    dbg64_str(" phys=");
+    dbg64_dec((uint64_t)fb_phys_width()); dbg64_str("x"); dbg64_dec((uint64_t)fb_phys_height());
+    dbg64_str(" zoom="); dbg64_dec((uint64_t)fb_get_zoom());
+    dbg64_nl();
+
+    font_init();
+    dbg64_str("[G64] font faces=");
+    dbg64_dec((uint64_t)font_face_count());
+    dbg64_str(" line_h=");
+    dbg64_dec((uint64_t)font_line_height());
+    dbg64_nl();
+
+    // ★ 踩坑记录（M2：安装程序按键全乱："回车"变成 Esc）：
+    //   这段初始化曾经被复制成两份。第二次 kbd_init() 读 8042 命令字节时，
+    //   缓冲里还留着 mouse_init() 发 F6/F4 得到的 ACK(0xFA)，于是命令字节被
+    //   当成 0xFA|0x01 = 0xFB 写回去：bit6（扫描码集 2 -> 集 1 翻译）被清掉，
+    //   键盘从此送来集 2 码，而解码表是集 1 -> 按键全乱。
+    //   现在只初始化一次，且 input.cpp 里读写命令字节都会先排空缓冲 + 强制 bit6=1。
+    kbd_init();
+    mouse_init();
+    pic_unmask64(1);                 // IRQ1：键盘
+    pic_unmask64(12);                // IRQ12：鼠标（自动级联开放 IRQ2）
+    dbg64_str("[G64] input ready (kbd irq1 + mouse irq12)");
+    dbg64_nl();
+
+#ifdef VIMTU_INSTALLER_MEDIA
+    // ==================== 安装介质：进入安装程序（不返回）====================
+    // 流程：语言 → 现在安装 → 许可 → 安装类型 → 磁盘与分区 → 安装进度 → 完成/自动重启。
+    dbg64_str("[G64] entering setup wizard");
+    dbg64_nl();
+    setup64_run(bi);
+#else
+    // ==================== 已安装的系统：系统启动路径 ====================
+    // 走到这里说明运行的不是安装介质，而是装到硬盘上的系统（安装程序写进硬盘的
+    // 那份内核不带 VIMTU_INSTALLER_MEDIA 宏）。
+    os_boot_path(bi);
+#endif
+}

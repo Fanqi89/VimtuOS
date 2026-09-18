@@ -1,0 +1,31 @@
+375:static void tm_log_app(const char* what) {
+398:    dbg64_dec((uint64_t)(r ? r->id : 0));
+400:    dbg64_dec((uint64_t)(r ? r->slot : 0));
+402:    dbg64_str((r && r->name[0]) ? r->name : "?");
+417:    return w && w->app_id == APP_ID_TMGR && w->draw == tm_draw;
+470:        tm_log_app("closed");
+494:    tm_log_app("closed");
+560:        r->slot = (uint32_t)i;
+561:        r->id = in.id;
+562:        r->state = (uint8_t)in.state;
+563:        r->is_current = (uint8_t)in.is_current;
+564:        r->ticks = in.ticks;
+565:        r->switches = in.switches;
+566:        r->cpu_permille = 0;
+570:            r->cpu_permille = (uint32_t)pm;
+572:        tm_strlcpy(r->name, in.name, (int)sizeof(r->name));
+796:                     T("no per-CPU accounting: task64 scheduler not linked",
+920:                     T("2 MB (PTE_2MB) and 1 GB (PTE_1GB) mapping APIs available",
+1245:    tm_stpcpy(name, r->is_current ? "*" : "");
+1246:    tm_stpcat(name, r->name);
+1250:    tm_utoa64(nb, (uint64_t)r->id);
+1254:    tm_text_clip(X + state_x, ty, tm_task_state_text(r->state), TM_COL_TEXT_DIM,
+1258:    tm_utoa64(nb, r->ticks);
+1262:    tm_utoa64(nb, r->switches);
+1267:                 tm_cpu_heat((int)(r->cpu_permille / 10u)));
+1268:    tm_pct1_str(nb, r->cpu_permille);
+2040:void app_tmgr_reset64() {
+2041:    tm_log_app("reset");
+2056:void app_tmgr_open64() {
+2059:    int inst = gui64_app_windows(APP_ID_TMGR);
+2151:    tm_log_app("opened");
