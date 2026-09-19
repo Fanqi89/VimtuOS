@@ -393,3 +393,4 @@ Everything was validated on **QEMU and VMware, BIOS and UEFI — not on bare met
 Quality-wise, every change is verified by **20 test scripts / 540 assertions** that check serial logs, screen
 pixels (QEMU screendumps) and raw disk bytes. Kernel + bootloader + ring3 samples ≈ **31.6k lines** of
 self-written Python tooling (ISO9660/GPT/FAT16/VAP64 packing, font subsetting, PE/FAT diagnostics).
+test 
