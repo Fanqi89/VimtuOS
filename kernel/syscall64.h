@@ -53,13 +53,19 @@ extern "C" void syscall64_dispatch64(pt_regs64* r);
 // kernel/syscall_entry64.asm 的 %define FRAME_MARK。
 #define SYSCALL64_INSM_FRAME_MARK64 0x180ULL
 
+
 // LSTAR 的目标（kernel/syscall_entry64.asm）。syscall64_init_msr64() 把它写进 LSTAR。
 extern "C" void syscall64_insn_entry64();
-
-// 内核栈顶（= TSS.rsp0 的镜像）。SYSCALL 不换栈，入口靠这个值切栈；
-// 由 kernel/usermode64.cpp 在每次进 ring3 前（与 tss_set_rsp0 同一处）更新。
-extern "C" uint64_t g_syscall64_kstack64;
 
 // 入口出口开关：1 = 本帧的 exit 已把控制权交回内核（放行时不要 sysretq，走 ring0 蹦床）。
 // 由分发器的 exit 分支置位，入口汇编读它。
 extern "C" uint64_t g_syscall64_exit_to_kernel64;
+// 内核栈顶（**当前任务**的 SYSCALL 入口专用栈）。SYSCALL 不换栈，入口靠这个值切栈。
+// 批次 C 起它是**每任务一份**的：
+//   * 有调度器时由 task64.cpp 的 task_apply_ctx64() 在每次任务切换时更新
+//     （= 该任务内核栈顶下方 4KB；见 task64.cpp 里"为什么不能共用一块"的说明）；
+//   * 任务 0 / 没有调度器（安装介质内核）时等于下面那个静态专用栈顶，值不变。
+// usermode64.cpp 每次进 ring3 前也会把它对齐一次（与 tss_set_rsp0 同一处）。
+extern "C" uint64_t g_syscall64_kstack64;
+// 静态专用栈顶（.bss 里那块 16KiB；任务 0 与无调度器场景用它）—— task64/ usermode64 用它兜底
+uint64_t syscall64_static_kstack_top64();

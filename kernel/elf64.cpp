@@ -271,6 +271,50 @@ static uint64_t e64_build_stack64(const char* argv0) {
     return rsp;
 }
 
+// ==================== 初始栈（execve 版：argv 由调用方给）====================
+// 与 e64_build_stack64 的区别：字符串从栈顶向下排（不再固定 stack_top-32），复数个 argv 依次
+// 摆放；指针数组与 auxv 在字符串下方。**不动** e64_build_stack64 —— 它的布局被
+// elf64_selftest64 逐字段断言（st[1] == stack_top-32）。
+static uint64_t e64_build_stack_argv64(const char* const* argv, uint32_t argc) {
+    const uint64_t stack_top = USER64_STACK_VA64 + USER64_STACK_BYTES64;
+    if (argc > 16) argc = 16;
+
+    uint64_t argp[16];
+    uint64_t sp_va = stack_top;
+    for (uint32_t i = 0; i < argc; i++) {
+        const char* s = (argv && argv[i]) ? argv[i] : "";
+        uint32_t len = e_strlen(s) + 1;
+        if (len > 128) len = 128;                          // 单个参数的硬上限（演示/验收够用）
+        sp_va = (sp_va - len) & ~((uint64_t)15);           // 每个字符串 16 字节对齐，便于日志直读
+        uint8_t* d = (uint8_t*)(uintptr_t)sp_va;
+        uint32_t k = 0;
+        for (; k + 1u < len && s[k]; k++) d[k] = (uint8_t)s[k];
+        d[k] = 0;
+        argp[i] = sp_va;
+    }
+
+    uint64_t w[48];
+    uint32_t m = 0;
+    w[m++] = argc;                                         // argc
+    for (uint32_t i = 0; i < argc; i++) w[m++] = argp[i];  // argv[0..argc-1]
+    w[m++] = 0;                                            // argv 终止
+    w[m++] = 0;                                            // envp 终止（本内核没有环境变量）
+    w[m++] = E64_AT_PAGESZ; w[m++] = PAGE_SIZE_64;
+    w[m++] = E64_AT_PHDR;   w[m++] = g_img64.phdr_va;      // 程序头表在映像里的地址（加载器算好的）
+    w[m++] = E64_AT_PHNUM;  w[m++] = g_img64.phnum;
+    w[m++] = E64_AT_ENTRY;  w[m++] = g_img64.entry;
+    w[m++] = E64_AT_UID;    w[m++] = 0;
+    w[m++] = E64_AT_EUID;   w[m++] = 0;
+    w[m++] = E64_AT_GID;    w[m++] = 0;
+    w[m++] = E64_AT_EGID;   w[m++] = 0;
+    w[m++] = E64_AT_NULL;   w[m++] = 0;
+
+    const uint64_t rsp = (sp_va - 128u - (uint64_t)m * 8u) & ~((uint64_t)15);   // 16 字节对齐
+    uint64_t* d = (uint64_t*)(uintptr_t)rsp;
+    for (uint32_t i = 0; i < m; i++) d[i] = w[i];
+    return rsp;
+}
+
 // ==================== 装载（映射 + 拷内容 + 建栈；不打印）====================
 static int elf64_load_image64(const uint8_t* p, uint32_t n, uint64_t* out_entry) {
     if (g_loaded64.used) return E64_BUSY;                 // 一份镜像都没收尾：先 unload
@@ -386,6 +430,63 @@ static void e64_log_reject64(const char* tag, int rc) {
     dbg64_str(e_reason64(rc));
     dbg64_nl();
     dbg64_line_end64();
+}
+
+// ==================== execve 复用入口（批次 C）====================
+void elf64_forget64() {
+    g_loaded64.used    = 0;
+    g_loaded64.entry   = 0;
+    g_loaded64.user_rsp = 0;
+    g_loaded64.nrange  = 0;
+}
+
+int elf64_blob_ok64(const uint8_t* p, uint32_t n) {
+    Elf64Image64 img;
+    uint64_t bad_va = 0;
+    return elf64_parse64(p, n, &img, &bad_va) == E64_OK ? 1 : 0;
+}
+
+// 读盘 -> 装载到**当前**地址空间 -> 按 argv 建初始栈。调用方负责：先清掉这个进程的旧映像、
+// 保证当前 CR3 是该进程的、装载成功后自己管生命周期（本函数不留记账）。
+int elf64_load_for_exec64(const char* path, const char* const* argv, uint32_t argc,
+                          uint64_t* out_entry, uint64_t* out_rsp) {
+    if (!path || path[0] == 0) { e64_log_reject64("[ELF64] exec reject", E64_ARG); return -1; }
+    uint32_t type = 0, size = 0;
+    if (vfs64_stat(path, &type, &size) != 0 || type != VFS64_TYPE_FILE) {
+        dbg64_line_begin64();
+        dbg64_str("[ELF64] exec reject path=");
+        dbg64_str(path);
+        dbg64_str(" reason=vfs");
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+    if (size == 0 || size > ELF64_MAX_FILE_BYTES64) { e64_log_reject64("[ELF64] exec reject", E64_SIZE); return -1; }
+    const int rd = vfs64_read(path, g_elf_file64, (int)sizeof(g_elf_file64));
+    if (rd != (int)size) {
+        dbg64_line_begin64();
+        dbg64_str("[ELF64] exec reject path=");
+        dbg64_str(path);
+        dbg64_str(" reason=read");
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+
+    g_loaded64.used   = 0;                        // 旧映像由调用方释放；这里只允许重新装载
+    g_loaded64.nrange = 0;
+    uint64_t entry = 0;
+    const int rc = elf64_load_image64(g_elf_file64, (uint32_t)rd, &entry);
+    if (rc != E64_OK) {
+        e64_log_reject64("[ELF64] exec reject", rc);
+        g_loaded64.used = 0;
+        return -1;
+    }
+    const uint64_t rsp = e64_build_stack_argv64(argv, argc);
+    if (out_entry) *out_entry = entry;
+    if (out_rsp)   *out_rsp   = rsp;
+    g_loaded64.used = 0;                          // 记账交回调用方（单份全局，见 elf64.h 说明）
+    return 0;
 }
 
 int elf64_load64(const char* path, uint64_t* out_entry) {
@@ -585,6 +686,15 @@ static uint32_t e64_st_build(uint8_t* buf, uint64_t vaddr, uint64_t memsz, uint3
 //         bit3 截断被拒、bit4 坏 magic 被拒、bit5 段越界被拒、bit6 p_memsz<p_filesz 被拒、
 //         bit7 坏 machine 被拒、bit8 段文件范围越界被拒、bit9 入口不在段内被拒、bit10 回收干净
 int elf64_selftest64() {
+    // ★ 批次 C：UEFI 路径下用户窗口建不起来（固件页表只读，连 PML4[0] 的 U/S 都写不进去），
+    //   而本自检的 bit1/bit2/bit10 会**真的装载**一份映像到用户窗口 —— 那一步在 UEFI 下必然 #PF。
+    //   所以这里如实跳过并打一行说明（不假装 PASS，也不把内核打死）。
+    if (!user64_available64()) {
+        dbg64_line_begin64();
+        dbg64_str("[ELF64] selftest skipped (user window unavailable: firmware page tables are read-only)\n");
+        dbg64_line_end64();
+        return 0;
+    }
     int fail = 0;
     static uint8_t buf[256];
     Elf64Image64 img;

@@ -58,3 +58,19 @@ int  elf64_is_elf64(const uint8_t* p, uint32_t n);
 
 // 自检（位掩码，0 = 全过）：合法 ELF 的解析/装载/权限位/初始栈 + 若干坏样本必须被拒。
 int  elf64_selftest64();
+
+// ==================== execve 复用（批次 C：进程换映像）====================
+// 为什么单独开一个入口（而不是直接调 elf64_load64）：execve 有三处不同：
+//   1) 装载目标是**当前进程已经在用的**地址空间（自己的 CR3 已经装载）——调用方先把旧映像
+//      整个用户区释放掉，然后调本函数；所以这里不再检查 g_loaded64.used（那份记账是单份的）；
+//   2) 初始栈要按调用方给的 argv 建（elf64_load64 固定 argc=1 且字符串位置被自检断言钉住，
+//      所以另写一份布局，见 elf64.cpp 的 e64_build_stack_argv64）；
+//   3) 装载完成后**不**保留"已装载"记账（调用方用自己的进程记账管理生命周期）。
+// 成功返回 0，*out_entry / *out_rsp 有效（映像留在窗口里，调用方负责把它跑起来/回收）；
+// 失败返回 -1（已打印 `[ELF64] exec reject ...`，**不改**任何调用方状态）。
+int elf64_load_for_exec64(const char* path, const char* const* argv, uint32_t argc,
+                          uint64_t* out_entry, uint64_t* out_rsp);
+// 清掉"已装载"记账（多进程/execve 场景：那份记账是全局单份的，跨进程只对同一 VA 布局有意义）
+void elf64_forget64();
+// 一段内存里的映像是否可解析（proc64 内置 /proc64.elf 的自检用；1 = 可解析）
+int elf64_blob_ok64(const uint8_t* p, uint32_t n);

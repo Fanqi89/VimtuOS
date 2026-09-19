@@ -41,9 +41,22 @@ int user64_selftest64();
 // 返回 0 = 完整跑完（含收尾回收）；-1 = 参数/内存失败。
 int user64_run_blob64(const void* blob, uint32_t size, const char* name);
 
+// 用户窗口是否可用（批次 C：UEFI 下固件页表只读 -> 连 U/S 都写不进去 -> 必须如实返回 0）：
+// 1 = 可用（BIOS 路径）；0 = 不可用（UEFI 路径，ring3 演示必须跳过，见 usermode64.cpp 的说明）。
+int user64_available64();
 // 从**指定入口/用户 rsp** 进 ring3 并等它回来（不映射/不回收任何页：ELF64 加载器自己
-// 把段和栈准备好再调这里）。返回用户 exit 的退出码；-1 = 参数非法或已经有人在 ring3。
+// 把段和栈准备好再调这里）。返回用户 exit 的退出码；-1 = 参数非法或本任务已在 ring3。
 int user64_enter_at64(uint64_t entry, uint64_t user_rsp, const char* name);
+
+// 从一份**现成的用户帧**进 ring3（批次 C：fork 出的子进程用）。
+// 为什么需要它：fork 的子进程必须从"父进程 syscall 的下一条指令"继续、且寄存器状态与父
+// 完全相同（只有 rax=0）—— 那就不能用 user64_enter_at64（它只给 entry/rsp、其余清零）。
+// frame 必须来自一次真实的 ring3 系统调用帧（cs=0x2B / ss=0x23）。返回用户 exit 的退出码。
+int user64_enter_frame64(const pt_regs64* frame, const char* name);
+
+// ★ 多进程（批次 C）后"用户窗口"是**每进程私有**的（见 kernel/proc64.h）：
+//   usermode64.cpp 里的页级原语（user64_map_page64 等）操作的都是**当前 CR3** 指向的那份
+//   地址空间 —— 所以调用它们之前必须先 proc64_switch_to64(该进程) / 或让调度器切好 CR3。
 
 // ==================== 给 syscall64 用 ====================
 // 用户态指针安全校验：va..va+len 必须完全落在**用户窗口内、且已映射为用户页**。

@@ -44,6 +44,10 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
  -fno-asynchronous-unwind-tables -fno-unwind-tables \
  -mno-red-zone -mcmodel=kernel -mno-sse -mno-sse2 -mno-mmx -mno-avx \
  -Wall -Wextra -std=c++17 -O2"
+# ★ 一次性实测钩子（默认空，不影响任何既有构建）：
+#   批次 C 要实测"UEFI（固件页表）下运行期 mov cr3 到底行不行"，那次构建需要
+#   -DPROC64_UEFI_CR3_EXPERIMENT=1。用法：VIMTU_EXTRA_CXXFLAGS=-DPROC64_UEFI_CR3_EXPERIMENT=1 bash build64.sh
+CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
 CXXFLAGS_INSTALLER="$CXXFLAGS -DVIMTU_INSTALLER_MEDIA=1 -DVIMTU_PAYLOAD_LBA=$PAYLOAD_LBA -DVIMTU_KBD_TRACE=1"
 
 # 两套源文件清单：
@@ -61,12 +65,12 @@ SRCS_DESKTOP="kernel/gui64.cpp kernel/calc64.cpp kernel/mines64.cpp \
 #   sysstate64 = 运行状态机 + 模块注册表 + 健康 + ring log（terminal 的 state/health/syslog）
 #   config64   = 类型化配置 KV，落在 store64（VimtuFS2 的 /store.a|b，真落盘）
 #   session64  = 会话/应用内容策略（关窗清状态、退出保存、启动恢复）
-#   panic64    = 蓝屏（BSOD）+ 看门狗（gui64 帧心跳）
 SRCS_SYS="kernel/sysstate64.cpp kernel/config64.cpp kernel/session64.cpp kernel/panic64.cpp"
+# ★ 批次 C：kernel/proc64.cpp（进程/地址空间）只进系统内核 —— 它依赖 task64/elf64/vfs64。
+SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/proc64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp"
 # elf64.cpp = ELF64 加载器：**只进系统内核**（安装介质不需要它；它内嵌的 hello.elf 是系统程序）
 # apic64.cpp = LAPIC + IOAPIC 接管中断路由：**只进系统内核**（安装链保持纯 8259 PIC，
 #   避免影响安装介质内核的字节级断言；x86_64.cpp 对它的 EOI/掩码分派用 weak 引用，不链也不报错）
-SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp"
 
 echo "==> 清理 $BUILD"
 rm -rf "$BUILD"
@@ -141,6 +145,16 @@ echo "==> 可安装应用示例（VAP64：nasm -> tools/make_vap.py -> objcopy �
 # user/hello64.asm 是 ring3 程序；tools/make_vap.py 给它加 32B VAP64 头（含代码段 CRC32）；
 # objcopy 把整个 .vap 嵌进内核，app64.cpp 启动时把它装进 VimtuFS2 的 /hello.vap，再从盘上读出来跑。
 # 符号名由 objcopy 按输入路径生成：_binary_build64_hello_vap_start/_end（从仓库根执行才稳定）。
+
+echo "==> 多进程演示程序（批次 C：fork/execve/wait4/kill；只嵌进系统内核）"
+# user/proc64.asm 是 ring3 程序，用 syscall 指令；链接脚本复用 user/hello_elf64.ld
+# （把映像钉在用户窗口 4GiB 起、低于 USER64_STACK_VA64 —— elf64.cpp 会拒绝越界的 PT_LOAD）。
+# proc64.cpp 幂等把它装成 VimtuFS2 的 /proc64.elf，再由 proc64_demo64() 以 init 进程跑起来。
+# 符号名由 objcopy 按输入路径生成：_binary_build64_proc64_elf_start/_end。
+$NASM -f elf64 user/proc64.asm -o "$BUILD/proc64.o"
+$LD -m elf_x86_64 -T user/hello_elf64.ld -o "$BUILD/proc64.elf" "$BUILD/proc64.o"
+$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/proc64.elf" "$BUILD/proc64_elf.o"
+cp "$BUILD/proc64_elf.o" "$BUILD/os/"
 $NASM -f bin user/hello64.asm -o "$BUILD/hello64.bin"
 "$PY" tools/make_vap.py "$BUILD/hello64.bin" "$BUILD/hello.vap" hello
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/hello.vap" "$BUILD/hello_vap64.o"
@@ -182,9 +196,10 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o \
     "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
+    "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
+    "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o \
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
-    "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/hello_elf64_elf.o \
     "$BUILD/os"/hello_vap64.o \
     "$BUILD/os"/user_demo64.o "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o
 $OBJCOPY -O binary "$BUILD/kernel64_os.elf" "$BUILD/kernel64_os.bin"

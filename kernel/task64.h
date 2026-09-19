@@ -84,11 +84,43 @@ int         task_selftest64();                            // 位掩码自检，0
 //   task_yield64() 完成（不能在中断里动内核堆，见文件头约束 3）。
 int task_kill64(uint32_t id);
 
+// ==================== 每进程地址空间（批次 C：进程级 CR3 / FS 基址）====================
+// 为什么在这里、为什么只有这几个函数（最小改动的理由）：
+//   任务的"上下文"除了中断帧之外还多了两样**全局**的东西要在切换时装载：
+//     * CR3（页表根）：每进程私有用户窗口的入口；
+//     * IA32_FS_BASE(0xC0000100)：glibc 的 arch_prctl(ARCH_SET_FS) 写的就是这个 MSR，
+//       它是**全局**的 —— 进程切换时必须保存/恢复，否则进程间互相泄漏 TLS。
+//   调度器不需要知道 Proc64 的内部布局：proc64.cpp 在建进程时用 task_bind_proc64()
+//   把"切到这个任务前要装载的三个数值"交给任务表：
+//     cr3（0 = 用内核地址空间）、fs_base、syscall 专用栈顶（= 每任务内核栈顶下方 4KB，
+//     见 kernel/syscall_entry64.asm：SYSCALL 不换栈，入口靠它切栈）。
+//   装载点与 TSS.rsp0 完全同一处（task_apply_ctx64）：schedule64 / task_exit64 / task_start64。
+int  task_bind_proc64(uint32_t task_id, void* proc, uint64_t cr3, uint64_t fs_base);
+void task_update_mm64(uint32_t task_id, uint64_t cr3, uint64_t fs_base);
+void* task_proc_of_current64();
+// ★ 必须是 extern "C"：usermode64.cpp 用**弱引用**取它（安装介质内核不链 task64.cpp），
+//   弱符号按 C 名解析；若这里用 C++ 名字（_Z20task_slot_current64v），弱引用就永远解析不到、
+//   静默变成 0 —— 症状是"所有任务都被当成槽位 0"，多进程下 in_ring3 位图张冠李戴。
+extern "C" int task_slot_current64();             // 当前任务槽位；-1 = 没有调度器/未登记
+int  task_slot_of_id64(uint32_t id);              // 任务 id -> 槽位；-1 = 找不到
+// 当前任务的 syscall 入口专用栈顶（没有调度器时 = 静态专用栈，见 syscall64.cpp）
+extern "C" uint64_t task_syscall_stack_top64();
+// 两个装载原语：与调度器共用同一份"值相同就跳过"的缓存，避免出现两套缓存各自漂移
+void     task64_load_cr364(uint64_t cr3);
+void     task64_load_fs_base64(uint64_t v);
+uint64_t task64_kernel_cr364();                   // 内核地址空间（task_init64 时读到的 CR3）
 // ---- 任务退出压力路径（kstress，只进系统内核；安装介质内核没有这些符号）----
 // 系统内核启动时自动跑一小轮（反复创建/退出短命任务，压"创建→退出→回收"这条路），
 // 串口打点见 kernel/task64.cpp 的 kstress 段（子任务整体安静，只在最后打一行）：
 //   [TASK64] stress spawn=<n> done=<n> reap=<n> live=<n> count=<n> fail=<mask> PASS|FAIL
 //   fail bit4 = 任务表占用槽位数与 g_task_count 不一致（回收路径被抢占过就会不一致）。
+// 临时把**当前任务**的地址空间换成 cr3（cr3 = 0 表示恢复"内核地址空间"）。
+// 为什么需要：proc64 装载/释放进程映像时要求"这段时间里 CR3 一直是该进程的"，但任务
+// 可能被 PIT 抢占（任务 0 的 mm_cr3 本来是 0 = 内核地址空间，一被抢占再切回来就变回内核
+// CR3 了 —— 症状是"映像被装进了共享窗口，进程自己的地址空间是空的"）。改 TCB 里的值
+// 之后，调度器每次切回本任务都会把它恢复成 cr3，装载因此对抢占是安全的。
+// ★ 调用方负责在结束后再调一次 task_set_current_mm64(0, 0) 恢复内核地址空间。
+void task_set_current_mm64(uint64_t cr3, uint64_t fs_base);
 // 自检脚本：tests/sched_stress_test.py。这里只提供"改轮数"（0 = 不改）；不跑。
 #ifndef VIMTU_INSTALLER_MEDIA
 void task_stress_set_rounds64(uint32_t n);

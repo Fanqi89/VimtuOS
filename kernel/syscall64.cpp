@@ -12,50 +12,73 @@
 //     int 0x80 的自有号段完全隔离：同一个数字在两条路径上含义不同（例如 1 都表示 write，
 //     但 2 在 int 0x80 是 exit、在 Linux 是 open）。
 //
-//   号  名称               实现（这一列就是真实状态，能做到的都真做）
+//   号  名称               实现状态（★ 批次 C 之后；"真" / "部分" / "-ENOSYS"）
 //   ---- ----------------- ------------------------------------------------------------------
-//   0    read              真：fd=0（stdin）返回 0 = EOF（本内核没有键盘输入流，如实返回）；
-//                           fd>=3 从 open 时缓存的 512B 文件窗口里按 offset 拷给用户；
-//                           其它 fd → -EBADF。buf 过范围校验。
+//   0    read              真：fd=0（stdin）返回 0 = EOF（没有键盘输入流，如实）；fd>=3 从 open 缓存
+//                           的 512B 窗口按 offset 拷给用户；其它 fd → -EBADF。
 //   1    write             真：fd=1 → 串口 + 屏幕；fd=2 → 只串口；len 上限 4096；越界 -EFAULT。
 //   2    open              真：vfs64_stat 探存在性 → 分配 fd（3..6）→ 返回 fd；不存在 -ENOENT。
-//                           （只读语义；flags/mode 忽略，见下）
 //   3    close             真：释放 fd 槽 → 0；fd 非法 → -EBADF。
-//   4    stat              **未实现 → -ENOSYS**（没有按路径 stat 的用户 ABI 需求）
-//   5    fstat             真：fd 0/1/2 → 字符设备的最小三字段（st_mode=0020000|0666、st_size=0、
-//                           st_nlink=1）；fd>=3 → 文件大小 + st_mode=0100000|0444。填 144B struct stat。
-//   8    lseek             真：fd>=3 调整缓存窗口 offset（SEEK_SET/CUR/END）→ 新 offset；
-//                           fd 0..2 → -ESPIPE；
-//   9    mmap              真：用户窗口内的 bump 分配器（USER64_MMAP_VA64 起），页 P|U|W|NX，
-//                           返回页对齐地址；PROT/MAP_FIXED 只看 MAP_FIXED 的地址提示；空间不足 -ENOMEM。
-//   10   mprotect          真：逐页改叶子权限（PROT_READ→可读、WRITE→可写、EXEC→清 NX），
-//                           范围/页非法 → -EINVAL。
-//   11   munmap            真：逐页解除映射并 page_free_64 回收物理页 → 0；范围非法 → -EINVAL。
-//   12   brk               真：固定 64KiB 可写区（USER64_BRK_VA64，首次调用时整块映射 P|U|W|NX），
-//                           addr=0 → 返回当前 brk；区间外 → 返回旧 brk（Linux 同语义）。
-//   13   rt_sigaction      **本内核没有信号投递路径**：不读用户 struct、立刻返回 0。
-//                           这是内核里唯一两个"接受但不实施"的号，已在此注明（不是假成功：
-//                           内核侧没有任何东西可以谎报，用户程序的信号只是永远不会来）。
-//   14   rt_sigprocmask    同 13。
-//   16   ioctl             真（最小）：fd∈{0,1,2} 且请求 = TIOCGWINSZ(0x5413) → 写回 25x80 的
-//                           struct winsize 并返回 0；TIOCSWINSZ(0x5414) → 忽略并返回 0；
-//                           其它请求 → -ENOTTY（Linux 对非 tty 的同一行为）。
-//   20   writev            真：fd∈{1,2}，最多 8 个 iovec，逐个写；iovcnt 超限 -EINVAL。
-//   39   getpid            真：任务 id（无调度器时 0）。
-//   60   exit              真：把控制权交回内核（帧改写 + 入口走 user64_resume_tramp64）。
+//   4    stat              真（最小）：按路径走 vfs64_stat，填 144B struct stat；不存在 -ENOENT。
+//   5    fstat             真：fd 0/1/2 → 字符设备最小三字段；fd>=3 → 文件大小 + 只读 mode。
+//   6    lstat             **部分**：与 stat 同一实现（本文件系统没有符号链接，所以等价）。
+//   8    lseek             真：fd>=3 调整缓存窗口 offset；fd 0..2 → -ESPIPE。
+//   9    mmap              真（批次 C 起**每进程**）：进程内 bump 分配器（USER64_MMAP_VA64 起），
+//                           页 P|U|W|NX；MAP_FIXED 按调用方地址；空间不足 -ENOMEM（已映射的页回滚）。
+//                           没有进程上下文（任务 0 / 共享模式）时退回原来的共享窗口实现。
+//   10   mprotect          真（每进程）：逐页改叶子权限（PROT_READ/WRITE/EXEC → 清 NX）。
+//   11   munmap            真（每进程）：逐页解除映射 + page_free_64 回收 → 0；范围非法 -EINVAL。
+//   12   brk               真（每进程）：首次调用映射 64KiB 可写区，之后按进程维护 brk 端点。
+//   13   rt_sigaction      **只记录不投递**：只在**有进程上下文**时读用户 struct 的 handler 存进
+//                           进程（无进程时直接返回 0）：内核没有任何信号投递路径（没有用户栈信号帧、
+//                           没有 rt_sigreturn、没有 vDSO/restorer）。**不假装投递**。
+//   14   rt_sigprocmask    **只记录不投递**：记录屏蔽字；语义同上。
+//   15   rt_sigreturn      **-ENOSYS**：没有信号帧可恢复。
+//   16   ioctl             真（最小）：TIOCGWINSZ → 25x80 struct winsize；TIOCSWINSZ 忽略返回 0；
+//                           其它 → -ENOTTY（与 Linux 对非 tty 一致）。
+//   20   writev            真：fd∈{1,2}，最多 8 个 iovec；iovcnt 超限 -EINVAL。
+//   21   access            真（最小）：存在性检查（本内核没有权限模型 → mode 忽略，如实注明）。
+//   22   pipe / pipe2      **-ENOSYS**：没有管道对象/fd 对（需要真设备层与 fd 继承；见"离 glibc 还差什么"）。
+//   24   sched_yield       真：task_yield64() 让出到下一个 tick；没有调度器时直接返回 0。
+//   32   dup               部分：只对"真实文件 fd"（3..6）复制（路径/游标/缓存）；其它 → -EBADF。
+//   33   dup2              部分：目标 fd>=3 时覆盖；目标 <=2（重定向标准流）→ -ENOSYS。
+//   34   pause             **部分**：本内核不投递信号 -> 有界等待 1 秒后返回 -EINTR（绝不死等）。
+//   35   nanosleep         真：走调度器睡眠（有界 60 秒上限，防挂死）。
+//   37   alarm             **只记录不投递**：记进程的 alarm 秒数，返回上一次的值（不投 SIGALRM）。
+//   39   getpid            真：**进程 pid**（批次 C 起；没有进程上下文时退回任务 id）。
+//   56   clone             **部分**：只支持 flags=0 / SIGCHLD(17) 的 fork 语义；CLONE_VM|THREAD 等 → -ENOSYS。
+//   57   fork              真：**整页物理复制**（不做 COW，取舍见 kernel/proc64.h 第 5 条）；
+//                           子进程从父的 syscall 下一条指令继续、rax=0；父进程 rax=子 pid。
+//   58   vfork             **等同 fork**（没有"共享地址空间直到 execve"的优化语义，如实注明）。
+//   59   execve            真（静态 ELF）：释放旧映像 → 复用 elf64 装载 → 重建初始栈/auxv →
+//                           改写帧直接回到新入口。argv 过 user64_range_ok64；envp 恒为空。
+//                           ★ 装载失败会按退出码 127 终止进程（Linux 会保留旧映像继续跑，见 proc64.cpp）。
+//   61   wait4             真：阻塞轮询（task_sleep64 + 有界 5 秒超时）；status = (code & 0xFF) << 8；
+//                           支持 pid>0 与 -1（任一子）；WNOHANG(1) 支持。
+//   62   kill              部分：SIGKILL(9)/SIGTERM(15) → 立即终止（TERM 记退出码 143）；
+//                           其它信号"记录但不投递"；不允许自杀（-EINVAL，如实）。
 //   63   uname             真：写一份静态 struct utsname（6 x 65B）。
-//   79   getcwd            真：把 "/" 写进用户 buf（len>=2）并返回 buf 指针（Linux 语义）。
-//   102  getuid            真：0（本内核没有用户概念）
+//   74   fsync             **部分**：走到 0（本内核的 fd 只有只读缓存，没有脏数据要刷）。
+//   79   getcwd            真：把 "/" 写进用户 buf（len>=2）并返回 buf 指针。
+//   82   rename            **-ENOSYS**（vfs64 没有 rename 原语）。
+//   83   mkdir             真（走 vfs64，真写盘）；单飞行者：并发调用返回 -EBUSY。
+//   84   rmdir             **-ENOSYS**（vfs64 没有删目录原语）。
+//   87   unlink            真（走 vfs64，真写盘）；单飞行者同上。
+//   89   readlink          **部分**：只对 "/proc/self/exe" 返回当前进程的映像路径；其它 -ENOENT。
+//   96   gettimeofday      真：用 g_ticks64（250Hz PIT）造近似值（tv_usec 4ms 粒度）；tz 恒 0。
+//   97   getrlimit         部分：本内核没有 per-process 配额 → 返回 RLIM_INFINITY（STACK/NOFILE 给常量）。
+//   102  getuid            真：0（没有用户/权限模型，如实）
 //   104  getgid            真：0
-//   158  arch_prctl        真（部分）：ARCH_SET_FS(0x1002) 把值存进内核变量并返回 0；
-//                           ARCH_GET_FS(0x1003) 写回用户指针（过范围校验）；其它 → -EINVAL。
-//                           ★ 不做 wrmsr IA32_FS_BASE：真 TLS 需要 per-CPU/swapgs 那套地基，
-//                             现在改了只会让内核侧的 FS 基址也一起变。见文件末"已知边界"。
-//   218  set_tid_address   真（最小）：返回 0（没有 clear_child_tid 的唤醒路径）。
-//   228  clock_gettime     真：用 g_ticks64（250Hz PIT）造近似值：tv_sec=t/250、
-//                           tv_nsec=(t%250)*4000000；clockid 0..3；其它 → -EINVAL。
-//   231  exit_group        同 60（本内核是单线程演示模型，直接当 exit）。
+//   110  getppid           真：**进程 ppid**（没有进程上下文时 0）。
+//   158  arch_prctl        **真（批次 C 起写 MSR）**：ARCH_SET_FS 真写 IA32_FS_BASE(0xC0000100)
+//                           并记进进程（任务切换时保存/恢复）；非规范地址 -EINVAL；
+//                           GET_FS 写回用户指针；SET_GS/GET_GS 等 → -EINVAL。
+//   160  setrlimit         **-EPERM**：没有配额可改（不假装成功）。
+//   218  set_tid_address   真（最小）：返回 0（没有 clear_child_tid 唤醒路径）。
+//   228  clock_gettime     真：PIT tick 造近似值；clockid 0..3；其它 → -EINVAL。
+//   231  exit_group        真：**结束整个进程**（本内核 1 进程 1 任务，等价于 exit 的进程级语义）。
 //   257  openat            open 的现代入口：dirfd 忽略（只支持 AT_FDCWD）；相对路径要求以 '/' 开头。
+//   318  getrandom         真（**非密码学安全**）：ticks + TSC + xorshift 伪随机，单次上限 256 字节。
 //
 //   其它所有号：**-ENOSYS(-38)** 并且同一个号只打一次 `[SYSCALL] enosys nr=<n>`（防刷屏）。
 //   已实现号里做不到的分支一律返回**具体负 errno**（-EBADF/-EFAULT/-EINVAL/-ENOMEM/...），
@@ -71,37 +94,79 @@
 //   deny / enosys 两条路径共用。
 //
 // ============================ 已知边界（别把没做的说成做了）============================
-//   * 地址空间是**共享**的：mmap/brk/mprotect/munmap 都在同一个用户窗口里，没有独立地址
-//     空间、没有 fork/execve、没有进程隔离；execve 需要"换掉当前映像"的能力，本阶段没有。
-//   * glibc/发行版二进制**没有验证过**：它们依赖的东西（TLS/FS.base 真生效、信号、vDSO、
-//     futex、clone/线程、/proc、多个 PT_LOAD 的 RELRO 段保护、IFUNC 重定位…）大多不在这里。
-//     这里验证的是"自有静态 ELF64（ld.lld -static -nostdlib）能 load → ring3 → syscall → exit"。
+//   * 地址空间：**批次 C 起每进程私有**（BIOS 路径，见 kernel/proc64.h）：fork 整页复制、
+//     execve 换映像、wait4/kill 都有真语义。但在 **UEFI（固件页表）** 下运行期 mov cr3 不可用
+//     （VMware EFI 下已知会立刻复位），于是自动进"共享地址空间模式"：fork/vfork/clone/execve/wait4
+//     一律 -ENOSYS、brk/mmap 退回共享窗口、启动期多进程演示跳过 —— 串口打印
+//     `[PROC64] cr3 isolation OFF ...` 如实标注，**绝不假装隔离成立**。
+//   * 信号：**只记录不投递**（rt_sigaction/rt_sigprocmask 只记录；kill 只有 KILL/TERM 的立即终止）。
+//   * glibc/发行版二进制**没有验证过**：PT_INTERP+动态链接器、完整 TLS/vDSO、真 futex、
+//     clone/线程、socket/网络 ABI、/proc 与 pty、uid/gid 权限模型大多不在这里。
+//     这里验证的是"自有静态 ELF64（ld.lld -static -nostdlib）能 load → ring3 → fork/execve/wait4 → exit"。
+//     差距清单见 docs/应用层与系统调用说明.md 的"离 glibc 还差什么"。
 //   * 用户态没有 swapgs/per-CPU gs：SYSCALL 入口**不能**用 gs 取内核数据结构，所以内核栈顶
-//     只能靠内核内存里的镜像变量（见 syscall_entry64.asm 的说明）。ring3 里 gs 基址仍是内核的
-//     （用户程序不该依赖它）。
+//     只能靠内核内存里的镜像变量（见 syscall_entry64.asm；批次 C 起它是每任务一份的）。
 #include "syscall64.h"
 #include "usermode64.h"     // user64_range_ok64 / user64_exit_to_kernel64 / 用户窗口常量
 #include "vfs64.h"          // Linux open/read 走真实文件系统
+
+// ---- 批次 C：proc64（进程/地址空间）的**弱引用** ----
+// proc64.cpp 只在系统内核里链接（安装介质内核没有进程/地址空间、没有 task64/elf64）。
+// 所以这里全部按弱引用声明：安装内核里这些符号是 0，调用点必须**先判空**——
+// 判空失败就按"这个功能不存在"处理（-ENOSYS 或退回共享实现），绝不假装成功。
+int  proc64_isolate64()                      __attribute__((weak));
+int  proc64_current_pid64()                  __attribute__((weak));
+int  proc64_current_ppid64()                 __attribute__((weak));
+int  proc64_exe_path64(char*, uint32_t)      __attribute__((weak));
+uint64_t proc64_brk64(uint64_t)              __attribute__((weak));
+int64_t  proc64_mmap64(uint64_t, uint64_t, uint64_t)      __attribute__((weak));
+int64_t  proc64_munmap64(uint64_t, uint64_t)              __attribute__((weak));
+int64_t  proc64_mprotect64(uint64_t, uint64_t, uint64_t)  __attribute__((weak));
+int64_t  proc64_fork64(pt_regs64*)                        __attribute__((weak));
+int64_t  proc64_execve64(pt_regs64*, const char*, const char* const*, uint32_t) __attribute__((weak));
+int64_t  proc64_wait4(int, int*, uint32_t)                __attribute__((weak));
+int64_t  proc64_kill64(int, int)                          __attribute__((weak));
+int64_t  proc64_set_fs_base64(uint64_t)                   __attribute__((weak));
+uint64_t proc64_get_fs_base64()                           __attribute__((weak));
+int  proc64_record_sigaction64(int, uint64_t)             __attribute__((weak));
+int  proc64_record_sigmask64(uint64_t)                    __attribute__((weak));
+int  proc64_alarm_set64(int)                              __attribute__((weak));
+static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
 #include "mem_64.h"         // PAGE_SIZE_64 / page_free_64 / PTE_*
 #include "debug64.h"
 #include "fb.h"             // 屏幕输出（fb_draw_text / fb_flip_region）
+#include "proc64.h"         // 批次 C：进程/地址空间（fork/execve/wait4/kill/每进程 brk&mmap/FS 基址）
 
 // task64.cpp 提供（安装程序内核不链接它 -> weak 引用后按"没有调度器"处理）
 extern "C" void     task_sleep_ms64(uint32_t ms) __attribute__((weak));
 extern "C" uint32_t task_current_id_64() __attribute__((weak));
+extern "C" void     task_yield64() __attribute__((weak));
 
 static const uint64_t SYSCALL64_WRITE_MAX = 1024;    // int 0x80 write 单次上限（见文件头说明）
 static const uint64_t LX64_WRITE_MAX      = 4096;    // Linux write 单次上限
+static const int64_t  LX64_EPERM  = 1;
 static const int64_t  LX64_ENOENT = 2;
+static const int64_t  LX64_ESRCH  = 3;
+static const int64_t  LX64_EINTR  = 4;
 static const int64_t  LX64_EBADF  = 9;
+static const int64_t  LX64_ECHILD = 10;
+static const int64_t  LX64_EAGAIN = 11;
 static const int64_t  LX64_ENOMEM = 12;
+static const int64_t  LX64_EACCES = 13;
 static const int64_t  LX64_EFAULT = 14;
+static const int64_t  LX64_EBUSY  = 16;
 static const int64_t  LX64_EINVAL = 22;
 static const int64_t  LX64_EMFILE = 24;
 static const int64_t  LX64_ENOTTY = 25;
 static const int64_t  LX64_ESPIPE = 29;
 static const int64_t  LX64_ENOSYS = 38;
+static const int64_t  LX64_ENOTEMPTY = 39;
 
+// 批次 C：有"当前进程"（且隔离模式开着）时，brk/mmap/mprotect/munmap 走每进程实现；
+// 否则退回原来的共享窗口实现（UEFI/固件页表 -> 共享地址空间模式，行为与批次 B 完全一致）。
+static inline bool lx64_per_proc_mm64() {
+    return lx64_have_proc64() && proc64_current_pid64() > 0;
+}
 // ==================== syscall 指令路径的跨模块变量 ====================
 // ==================== syscall 指令路径的跨模块变量 ====================
 // ★ syscall 指令入口**专用内核栈**（16KiB，静态 .bss，不进镜像）。
@@ -112,9 +177,17 @@ static const int64_t  LX64_ENOSYS = 38;
 //   SYSCALL 入口 -> 分发（全程 IF=0，不可能嵌套）-> sysret；TSS.rsp0 只留给中断。
 //   （代价：多 16KiB .bss；好处：syscall 路径和调度/中断路径再无共享内存。）
 static uint8_t g_syscall64_stack64[16 * 1024] __attribute__((aligned(16)));
-// 内核栈顶（入口汇编 mov rsp, [g_syscall64_kstack64] 用）。初值 = 专用栈顶；运行期不再改。
+// 内核栈顶（入口汇编 mov rsp, [g_syscall64_kstack64] 用）。
+// ★ 批次 C：它是**每任务一份**的（有调度器时由 task64.cpp 的 task_apply_ctx64 在切换时更新；
+//   任务 0 / 没有调度器时保持初值 = 下面那块静态专用栈顶）。
 extern "C" uint64_t g_syscall64_kstack64 =
     (uint64_t)(uintptr_t)(g_syscall64_stack64 + sizeof(g_syscall64_stack64));
+// 静态专用栈顶（任务 0 / 没有调度器时用）：task64.cpp 与 usermode64.cpp 都靠它兜底。
+// 为什么保留它而不是彻底删掉这块 .bss：安装介质内核不链接 task64.cpp（没有任务表），
+// 那里的 syscall 指令路径仍然需要一个确定的切栈目标。
+uint64_t syscall64_static_kstack_top64() {
+    return (uint64_t)(uintptr_t)(g_syscall64_stack64 + sizeof(g_syscall64_stack64));
+}
 // 1 = 本帧已走 exit，入口别 sysret（见 syscall_entry64.asm 的出口 B）
 extern "C" uint64_t g_syscall64_exit_to_kernel64 = 0;
 
@@ -340,9 +413,9 @@ static int64_t lx64_close64(uint64_t nr, uint64_t fd) {
     g_lx_fd64[slot].off = 0;
     return 0;
 }
-
-// ---- 5）fstat（x86_64 的 struct stat = 144 字节，字段偏移见 Linux asm/stat.h）----
+// ---- 5）fstat / 4）stat / 6）lstat（x86_64 的 struct stat = 144 字节，字段偏移见 Linux asm/stat.h）----
 static const uint32_t LX64_S_IFCHR = 0020000u;
+static const uint32_t LX64_S_IFDIR = 0040000u;
 static const uint32_t LX64_S_IFREG = 0100000u;
 static void lx64_fill_stat64(uint8_t* st, uint32_t mode, uint64_t size) {
     for (uint32_t i = 0; i < 144; i++) st[i] = 0;
@@ -533,20 +606,343 @@ static int64_t lx64_clock_gettime64(uint64_t nr, uint64_t clockid, uint64_t ts_v
     return 0;
 }
 
-// ---- 158）arch_prctl：只做 FS.base 的"存起来"（不 wrmsr，见文件头"已知边界"）----
+// ==================================================================================
+// 批次 C 新增/改写的号（Linux x86_64 号段）：进程、每进程内存、以及一批能实现的补充号
+// 每一条的实现状态都在文件头的大表里如实标注（真实现 / 部分 / -ENOSYS）。
+// ==================================================================================
+
+// ---- 12）brk / 9）mmap / 10）mprotect / 11）munmap：每进程（有进程时）----
+// 为什么保留旧的共享实现：UEFI（固件页表）下没有每进程地址空间 -> 进程建不出来，
+// brk/mmap 仍然只能落在引导期那个共享窗口里，行为与批次 B 完全一致（这是"降级但不装"）。
+static int64_t lx64_brk_disp64(uint64_t addr) {
+    if (lx64_per_proc_mm64()) return (int64_t)proc64_brk64(addr);
+    return lx64_brk64(addr);
+}
+static int64_t lx64_mmap_disp64(uint64_t len, uint64_t flags, uint64_t addr) {
+    if (lx64_per_proc_mm64()) return proc64_mmap64(len, flags, addr);
+    return lx64_mmap64(len, flags, addr);
+}
+static int64_t lx64_mprotect_disp64(uint64_t addr, uint64_t len, uint64_t prot) {
+    if (lx64_per_proc_mm64()) return proc64_mprotect64(addr, len, prot);
+    return lx64_mprotect64(addr, len, prot);
+}
+static int64_t lx64_munmap_disp64(uint64_t addr, uint64_t len) {
+    if (lx64_per_proc_mm64()) return proc64_munmap64(addr, len);
+    return lx64_munmap64(addr, len);
+}
+
+// ---- 39）getpid / 110）getppid：有进程时返回**进程 pid**（Linux 语义），否则退回任务 id ----
+static int64_t lx64_getpid64() {
+    if (!lx64_have_proc64()) return task_current_id_64 ? (int64_t)task_current_id_64() : 0;
+    const int pid = proc64_current_pid64();
+    if (pid > 0) return (int64_t)pid;
+    return task_current_id_64 ? (int64_t)task_current_id_64() : 0;
+}
+static int64_t lx64_getppid64() {
+    return lx64_have_proc64() ? (int64_t)proc64_current_ppid64() : 0;
+}
+// ---- 57/58/56）fork / vfork / clone ----
+// vfork 在 Linux 里是"共享地址空间直到 execve"的优化；本内核没有 COW，也没必要为演示程序
+// 保留那个语义，所以 vfork **等同 fork**（如实注释，不假装）。
+// clone：只支持 flags=0（或只带 SIGCHLD(17) 的 fork 语义），其余（CLONE_VM/CLONE_THREAD/…）-> -ENOSYS。
+static int64_t lx64_fork64(uint64_t nr, pt_regs64* r) {
+    if (!lx64_have_proc64()) { syscall64_enosys_once64(nr); return -LX64_ENOSYS; }
+    return proc64_fork64(r);
+}
+static int64_t lx64_clone64(uint64_t nr, pt_regs64* r, uint64_t flags) {
+    if (flags != 0 && flags != 17u) return -LX64_ENOSYS;
+    return lx64_fork64(nr, r);
+}
+
+// ---- 59）execve ----
+// argv/envp 都是**用户态指针**：先过 user64_range_ok64 校验、再逐级拷进内核缓冲，
+// 然后才允许释放旧映像（顺序不能反：拷完才丢地址空间，否则读 argv 时页已经没了）。
+static const uint32_t LX64_EXEC_ARGV_MAX   = 8;
+static const uint32_t LX64_EXEC_ARGV_BYTES = 96;
+static int64_t lx64_execve64(pt_regs64* r, uint64_t path_va, uint64_t argv_va, uint64_t envp_va) {
+    if (!lx64_have_proc64()) { syscall64_enosys_once64(59); return -LX64_ENOSYS; }   // 安装内核没有进程
+    (void)envp_va;                                       // 本内核没有环境变量（如实：enviroment 恒为空）
+    char path[LX64_PATH_MAX];
+    if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(59, path_va); return -LX64_EFAULT; }
+    if (path[0] != '/') { syscall64_deny64(59, path_va); return -LX64_EINVAL; }
+
+    static char argv_buf[LX64_EXEC_ARGV_MAX][LX64_EXEC_ARGV_BYTES];
+    const char* argv[LX64_EXEC_ARGV_MAX + 1];
+    uint32_t argc = 0;
+    if (argv_va) {
+        for (; argc < LX64_EXEC_ARGV_MAX; argc++) {
+            if (!user64_range_ok64(argv_va + (uint64_t)argc * 8, 8)) { syscall64_deny64(59, argv_va); return -LX64_EFAULT; }
+            const uint64_t p = *(const uint64_t*)(uintptr_t)(argv_va + (uint64_t)argc * 8);
+            if (p == 0) break;
+            if (lx64_user_str64(p, argv_buf[argc], LX64_EXEC_ARGV_BYTES) != 0) { syscall64_deny64(59, p); return -LX64_EFAULT; }
+            argv[argc] = argv_buf[argc];
+        }
+    }
+    argv[argc] = nullptr;
+    return proc64_execve64(r, path, argv, argc);
+}
+
+// ---- 61）wait4 ----
+static int64_t lx64_wait4_64(uint64_t pid, uint64_t status_va, uint64_t options) {
+    if (!lx64_have_proc64()) { syscall64_enosys_once64(61); return -LX64_ENOSYS; }
+    if (status_va && !user64_range_ok64(status_va, 4)) { syscall64_deny64(61, status_va); return -LX64_EFAULT; }
+    int status = 0;
+    const int64_t rc = proc64_wait4((int)(int32_t)pid, &status, (uint32_t)options);
+    if (rc > 0 && status_va) {
+        uint8_t b[4];
+        lx64_wr32(b, (uint32_t)status);
+        lx64_copy_to_user64(status_va, b, 4);
+    }
+    return rc;
+}
+// ---- 62）kill ----
+static int64_t lx64_kill_wrap64(uint64_t pid, uint64_t sig) {
+    if (!lx64_have_proc64()) { syscall64_enosys_once64(62); return -LX64_ENOSYS; }
+    return proc64_kill64((int)(int32_t)pid, (int)(int32_t)sig);
+}
+
+// ---- 13/14/15）信号：只记录不投递 ----
+// 想清楚再写：本内核没有"用户栈上构造信号帧 + rt_sigreturn 恢复"这套机制，
+// 也没有 vDSO/restorer。所以 rt_sigaction/rt_sigprocmask **只记录**（handler 地址、屏蔽字），
+// kill 也不投递（除 KILL/TERM 的立即终止语义，见 proc64_kill64）；
+// rt_sigreturn 永远 -ENOSYS（框架会先拦 sigreturn，不会走到分发器，但这里仍如实返回）。
+// 安装介质内核没链 proc64.cpp（lx64_have_proc64() == false）：那就只做参数校验、不记录。
+static int64_t lx64_rt_sigaction64(uint64_t sig, uint64_t act_va, uint64_t old_va, uint64_t sigsetsize) {
+    // struct sigaction { handler; flags(8B); restorer(8B); mask(8B) } = 32 字节（本内核只读 handler）
+    if (act_va && user64_range_ok64(act_va, 32)) {
+        const uint64_t handler = *(const uint64_t*)(uintptr_t)act_va;
+        if (lx64_have_proc64()) (void)proc64_record_sigaction64((int)sig, handler);
+    } else if (act_va) {
+        syscall64_deny64(13, act_va);
+        return -LX64_EFAULT;
+    }
+    if (old_va && user64_range_ok64(old_va, 32)) {
+        uint8_t z[32];
+        for (uint32_t i = 0; i < 32; i++) z[i] = 0;
+        lx64_copy_to_user64(old_va, z, 32);
+    }
+    (void)sigsetsize;
+    return 0;
+}
+static int64_t lx64_rt_sigprocmask64(uint64_t how, uint64_t set_va, uint64_t old_va, uint64_t sigsetsize) {
+    (void)how;
+    uint64_t mask = 0;
+    if (set_va) {
+        if (!user64_range_ok64(set_va, 8)) { syscall64_deny64(14, set_va); return -LX64_EFAULT; }
+        mask = *(const uint64_t*)(uintptr_t)set_va;
+        if (lx64_have_proc64()) (void)proc64_record_sigmask64(mask);
+    }
+    if (old_va) {
+        if (!user64_range_ok64(old_va, 8)) { syscall64_deny64(14, old_va); return -LX64_EFAULT; }
+        uint8_t b[8];
+        lx64_wr64(b, mask);
+        lx64_copy_to_user64(old_va, b, 8);
+    }
+    (void)sigsetsize;
+    return 0;
+}
+
+// ---- 4/6）stat / lstat：按路径的最小实现（走 vfs64；不区分符号链接 —— 本文件系统没有）----
+static int64_t lx64_stat_path64(uint64_t nr, uint64_t path_va, uint64_t st_va) {
+    char path[LX64_PATH_MAX];
+    if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(nr, path_va); return -LX64_EFAULT; }
+    if (!user64_range_ok64(st_va, 144)) { syscall64_deny64(nr, st_va); return -LX64_EFAULT; }
+    uint32_t type = 0, size = 0;
+    if (vfs64_stat(path, &type, &size) != 0) return -LX64_ENOENT;
+    uint8_t st[144];
+    if (type == VFS64_TYPE_DIR) lx64_fill_stat64(st, LX64_S_IFDIR | 0755u, size);
+    else                       lx64_fill_stat64(st, LX64_S_IFREG | 0444u, size);
+    lx64_copy_to_user64(st_va, st, 144);
+    return 0;
+}
+// ---- 21）access ----
+static int64_t lx64_access64(uint64_t nr, uint64_t path_va, uint64_t mode) {
+    char path[LX64_PATH_MAX];
+    (void)mode;                                          // 本内核没有权限模型（uid/gid 恒 0）
+    if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(nr, path_va); return -LX64_EFAULT; }
+    uint32_t type = 0, size = 0;
+    if (vfs64_stat(path, &type, &size) != 0) return -LX64_ENOENT;
+    return 0;
+}
+// ---- 89）readlink：只对 /proc/self/exe 给出真实值（当前进程的映像路径）----
+static int64_t lx64_readlink64(uint64_t nr, uint64_t path_va, uint64_t buf_va, uint64_t size) {
+    char path[LX64_PATH_MAX];
+    if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(nr, path_va); return -LX64_EFAULT; }
+    if (size == 0) return -LX64_EINVAL;
+    char exe[PROC64_PATH_MAX];
+    const int have = lx64_have_proc64() ? proc64_exe_path64(exe, (uint32_t)sizeof(exe)) : 0;
+    if (have == 0 && !(path[0] == '/' && path[1] == 'p' && path[2] == 'r' && path[3] == 'o' &&
+                       path[4] == 'c' && path[5] == '/' && path[6] == 's' && path[7] == 'e' &&
+                       path[8] == 'l' && path[9] == 'f' && path[10] == '/' && path[11] == 'e' &&
+                       path[12] == 'x' && path[13] == 'e' && path[14] == 0)) {
+        return -LX64_ENOENT;                              // 只有 /proc/self/exe 有值（其它如实拒绝）
+    }
+    uint32_t n = 0;
+    while (exe[n] && n + 1u < (uint32_t)size) n++;
+    if (!user64_range_ok64(buf_va, n)) { syscall64_deny64(nr, buf_va); return -LX64_EFAULT; }
+    lx64_copy_to_user64(buf_va, exe, n);                  // readlink 不补 NUL（Linux 语义）
+    return (int64_t)n;
+}
+// ---- 83）mkdir / 87）unlink：真写盘（走 vfs64）----
+// 为什么要临时开中断：ATA 的等待是"IRQ14 中断驱动 + 超时回退 PIO 轮询"，全程关中断会走慢路径。
+// 为什么现在开中断是安全的：批次 C 起 syscall 入口用的是**每任务**自己的内核栈
+// （见 task64.cpp），中断帧压在同一个栈的更高处，不会覆盖 syscall 帧；再用一个 busy 标志
+// 把"VFS 变更"变成单飞行者（另一个进程同时来会拿到 -EBUSY，而不是交错写坏卷）。
+static volatile int g_lx_vfs_busy64 = 0;
+static int64_t lx64_fs_mutate64(uint64_t nr, uint64_t path_va, int is_mkdir) {
+    char path[LX64_PATH_MAX];
+    if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(nr, path_va); return -LX64_EFAULT; }
+    if (path[0] != '/') return -LX64_EINVAL;
+    if (g_lx_vfs_busy64) return -LX64_EBUSY;
+    g_lx_vfs_busy64 = 1;
+    __asm__ volatile("sti" ::: "memory");
+    const int rc = is_mkdir ? vfs64_mkdir(path) : vfs64_unlink(path);
+    __asm__ volatile("cli" ::: "memory");
+    g_lx_vfs_busy64 = 0;
+    return rc == 0 ? 0 : -LX64_ENOENT;
+}
+
+// ---- 24）sched_yield / 35）nanosleep / 34）pause / 37）alarm ----
+static int64_t lx64_nanosleep64(uint64_t nr, uint64_t req_va, uint64_t rem_va) {
+    (void)rem_va;
+    if (!user64_range_ok64(req_va, 16)) { syscall64_deny64(nr, req_va); return -LX64_EFAULT; }
+    const uint8_t* p = (const uint8_t*)(uintptr_t)req_va;
+    uint64_t sec = 0, nsec = 0;
+    for (int i = 0; i < 8; i++) { sec |= (uint64_t)p[i] << (8 * i); nsec |= (uint64_t)p[8 + i] << (8 * i); }
+    uint64_t ms = sec * 1000u + nsec / 1000000u;
+    if (ms > 60000u) ms = 60000u;                        // 有界：最多 60 秒（防挂死）
+    if (ms == 0 && nsec > 0) ms = 1;
+    if (ms) {
+        if (task_sleep_ms64) task_sleep_ms64((uint32_t)ms);
+        else {
+            const uint64_t until = g_ticks64 + ms_to_ticks64((uint32_t)ms);
+            uint64_t guard = 0;
+            while (g_ticks64 < until && ++guard < 2000000000ULL) __asm__ volatile("hlt");
+        }
+    }
+    return 0;
+}
+static int64_t lx64_pause64() {
+    // pause(2) 在 Linux 上是"睡到收到信号"。本内核不投递信号，所以永远等不到 ——
+    // 有界等待 1 秒后如实返回 -EINTR（"被信号打断"），绝不死等。
+    if (task_sleep_ms64) task_sleep_ms64(1000);
+    return -LX64_EINTR;
+}
+static int64_t lx64_alarm64(uint64_t sec) {
+    const int prev = lx64_have_proc64() ? proc64_alarm_set64((int)sec) : 0;
+    return prev < 0 ? 0 : (int64_t)prev;                 // 只记录，不投递 SIGALRM
+}
+
+// ---- 96）gettimeofday / 97）getrlimit / 160）setrlimit / 318）getrandom ----
+static int64_t lx64_gettimeofday64(uint64_t nr, uint64_t tv_va, uint64_t tz_va) {
+    if (!user64_range_ok64(tv_va, 16)) { syscall64_deny64(nr, tv_va); return -LX64_EFAULT; }
+    const uint64_t t = g_ticks64;
+    uint8_t b[16];
+    lx64_wr64(b + 0, t / PIT_HZ_64);                                  // tv_sec
+    lx64_wr64(b + 8, (t % PIT_HZ_64) * (1000000ULL / PIT_HZ_64));     // tv_usec
+    lx64_copy_to_user64(tv_va, b, 16);
+    if (tz_va) {
+        if (!user64_range_ok64(tz_va, 8)) { syscall64_deny64(nr, tz_va); return -LX64_EFAULT; }
+        uint8_t z[8];
+        for (uint32_t i = 0; i < 8; i++) z[i] = 0;
+        lx64_copy_to_user64(tz_va, z, 8);
+    }
+    return 0;
+}
+// rlimit：本内核没有配额（堆/页池是全局的、没有 per-process 记账）。如实给出"无限/常量"，
+// 而不是假装有配额。setrlimit 只接受"不大于当前值"的请求，其余 -EPERM（Linux 对硬限制也是 -EPERM）。
+static int64_t lx64_getrlimit64(uint64_t nr, uint64_t res, uint64_t rlim_va) {
+    if (!user64_range_ok64(rlim_va, 16)) { syscall64_deny64(nr, rlim_va); return -LX64_EFAULT; }
+    uint64_t cur = 0xFFFFFFFFFFFFFFFFULL, max = 0xFFFFFFFFFFFFFFFFULL;   // RLIM_INFINITY
+    if (res == 3) { cur = max = 8 * 1024 * 1024; }                       // RLIMIT_STACK = 8MiB（常量声明）
+    if (res == 7) { cur = max = 8; }                                     // RLIMIT_NOFILE = 8（0..2 + 4 文件 + 2 pipe 预留）
+    uint8_t b[16];
+    lx64_wr64(b + 0, cur);
+    lx64_wr64(b + 8, max);
+    lx64_copy_to_user64(rlim_va, b, 16);
+    return 0;
+}
+static int64_t lx64_setrlimit64(uint64_t nr, uint64_t res, uint64_t rlim_va) {
+    if (!user64_range_ok64(rlim_va, 16)) { syscall64_deny64(nr, rlim_va); return -LX64_EFAULT; }
+    (void)res;
+    return -LX64_EPERM;                                  // 没有配额可改：如实拒绝（不死循环、不假装成功）
+}
+// getrandom：没有硬件 RNG 可用，用 ticks + TSC + 一个 xorshift 自增状态造"够用的伪随机"。
+// 如实标注：**不是密码学安全随机**（只需满足"每次不同、分布还行"这一类用户态用法）。
+static uint64_t g_lx_rng64 = 0x243F6A8885A308D3ULL;
+static uint64_t lx64_rng_next64() {
+    uint64_t x = g_lx_rng64;
+    uint32_t lo = 0, hi = 0;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    x ^= ((uint64_t)hi << 32) | lo;
+    x ^= g_ticks64 * 0x9E3779B97F4A7C15ULL;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    g_lx_rng64 = x;
+    return x;
+}
+static int64_t lx64_getrandom64(uint64_t nr, uint64_t buf, uint64_t len, uint64_t flags) {
+    (void)flags;
+    if (len == 0) return 0;
+    if (len > 256) len = 256;                            // 有界（单次最多 256 字节，够 glibc 初始化用）
+    if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
+    uint8_t tmp[256];
+    for (uint64_t i = 0; i < len; i++) {
+        if ((i & 7u) == 0) { const uint64_t r = lx64_rng_next64(); for (uint32_t k = 0; k < 8; k++) tmp[i + k < len ? i + k : i] = (uint8_t)(r >> (8 * k)); }
+    }
+    lx64_copy_to_user64(buf, tmp, len);
+    return (int64_t)len;
+}
+
+// ---- 32/33）dup / dup2 / 74）fsync：只对"真实文件 fd"（3..6）有意义 ----
+static int64_t lx64_dup64(uint64_t fd) {
+    const int slot = lx64_fd_slot64(fd);
+    if (slot < 0) return -LX64_EBADF;
+    const int ns = lx64_fd_alloc64();
+    if (ns < 0) return -LX64_EMFILE;
+    g_lx_fd64[ns] = g_lx_fd64[slot];                     // 复制路径/游标/缓存（独立游标：如实标注非共享）
+    return (int64_t)(3 + ns);
+}
+static int64_t lx64_dup2_64(uint64_t oldfd, uint64_t newfd) {
+    const int os = lx64_fd_slot64(oldfd);
+    if (os < 0) return -LX64_EBADF;
+    if (newfd == oldfd) return (int64_t)newfd;
+    if (newfd <= 2) return -LX64_ENOSYS;                 // 重定向 stdin/stdout/stderr 需要真设备层：如实 -ENOSYS
+    if (newfd >= 3u + (uint64_t)LX64_FD_TABLE) return -LX64_EBADF;
+    g_lx_fd64[newfd - 3u] = g_lx_fd64[os];
+    return (int64_t)newfd;
+}
+static int64_t lx64_fsync64(uint64_t fd) {
+    if (fd <= 2) return 0;                               // 标准流是虚拟的：无脏页
+    const int slot = lx64_fd_slot64(fd);
+    if (slot < 0) return -LX64_EBADF;
+    return 0;                                            // 本内核的 fd 只有"只读缓存"，没有写路径 -> 无脏数据
+}
+// ★ 批次 C 起不再只是"存进内核变量"：glibc 的 TLS 完全依赖 FS.base 真的生效
+//   （__thread / errno / stack canary 都从 FS 取）。写入策略：
+//     * 记进进程结构（proc64）—— 进程切换时由 task_apply_ctx64 保存/恢复这个 MSR；
+//     * 立刻写 MSR（当前任务正在跑，立刻生效）；非规范地址返回 -EINVAL（wrmsr 会 #GP）。
+//   没有进程上下文时（例如任务 0 里的 int 0x80）退回按值记录，仍然返回 0 并如实说明。
 static uint64_t g_lx_fs_base64 = 0;
 static int64_t lx64_arch_prctl64(uint64_t nr, uint64_t code, uint64_t arg) {
-    if (code == 0x1002u) { g_lx_fs_base64 = arg; return 0; }    // ARCH_SET_FS
-    if (code == 0x1003u) {                                      // ARCH_GET_FS
-        if (!user64_range_ok64(arg, 8)) { syscall64_deny64(nr, arg); return -LX64_EFAULT; }
-        lx64_copy_to_user64(arg, &g_lx_fs_base64, 8);
+    if (code == 0x1002u) {                                          // ARCH_SET_FS
+        if (lx64_have_proc64() && proc64_current_pid64() > 0) return proc64_set_fs_base64(arg);
+        g_lx_fs_base64 = arg;
         return 0;
     }
-    return -LX64_EINVAL;                                        // SET_GS/GET_GS 等：本内核没有
+    if (code == 0x1003u) {                                          // ARCH_GET_FS
+        if (!user64_range_ok64(arg, 8)) { syscall64_deny64(nr, arg); return -LX64_EFAULT; }
+        const uint64_t v = (lx64_have_proc64() && proc64_current_pid64() > 0) ? proc64_get_fs_base64() : g_lx_fs_base64;
+        lx64_copy_to_user64(arg, &v, 8);
+        return 0;
+    }
+    return -LX64_EINVAL;                                            // SET_GS/GET_GS 等：本内核没有
 }
 
 // ---- Linux 号段分发 ----
-// 返回：>= 0 正常返回；< 0 = -errno。exit 走特例（设置 g_syscall64_exit_to_kernel64）。
+// 返回：>= 0 正常返回；< 0 = -errno。exit/execve 走特例：
+//   exit   -> 改写帧把控制权交回内核（入口看 g_syscall64_exit_to_kernel64）
+//   execve -> 成功时帧已被改写成"回到新入口"，这里直接返回（调用方立刻返回，让 sysret 落地）
+// 每个号的状态见文件头大表（真实现 / 部分 / -ENOSYS），未列出的号一律 -ENOSYS 且只打一次日志。
 static int64_t syscall64_linux64(pt_regs64* r) {
     const uint64_t nr = r->rax;
     const uint64_t a1 = r->rdi, a2 = r->rsi, a3 = r->rdx;
@@ -557,28 +953,53 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 1:   return lx64_write64(nr, a1, a2, a3);
     case 2:   return lx64_open64(nr, a1);
     case 3:   return lx64_close64(nr, a1);
+    case 4:   return lx64_stat_path64(nr, a1, a2);                 // stat：按路径（最小实现）
     case 5:   return lx64_fstat64(nr, a1, a2);
+    case 6:   return lx64_stat_path64(nr, a1, a2);                 // lstat：同上（无符号链接）
     case 8:   return lx64_lseek64(nr, a1, (int64_t)a2, a3);
-    case 9:   return lx64_mmap64(a2, a4, a1);
-    case 10:  return lx64_mprotect64(a1, a2, a3);
-    case 11:  return lx64_munmap64(a1, a2);
-    case 12:  return lx64_brk64(a1);
-    case 13:  return 0;                               // rt_sigaction：无信号机制，见文件头表
-    case 14:  return 0;                               // rt_sigprocmask：同上
+    case 9:   return lx64_mmap_disp64(a2, a4, a1);                 // arch 无关：len/prot/flags/...
+    case 10:  return lx64_mprotect_disp64(a1, a2, a3);
+    case 11:  return lx64_munmap_disp64(a1, a2);
+    case 12:  return lx64_brk_disp64(a1);
+    case 13:  return lx64_rt_sigaction64(a1, a2, a3, a4);          // 只记录不投递
+    case 14:  return lx64_rt_sigprocmask64(a1, a2, a3, a4);        // 只记录不投递
+    case 15:  break;                                               // rt_sigreturn：没有信号帧可恢复 -> -ENOSYS
     case 16:  return lx64_ioctl64(nr, a1, a2, a3);
     case 20:  return lx64_writev64(nr, a1, a2, a3);
-    case 39:  return task_current_id_64 ? (int64_t)task_current_id_64() : 0;
+    case 21:  return lx64_access64(nr, a1, a2);
+    case 22:  break;                                               // pipe/pipe2：没有管道对象 -> -ENOSYS（见文件头表）
+    case 24:  if (task_yield64) task_yield64(); return 0;           // sched_yield：真让出
+    case 32:  return lx64_dup64(a1);
+    case 33:  return lx64_dup2_64(a1, a2);
+    case 34:  return lx64_pause64();                                // 有界等待后 -EINTR（如实）
+    case 35:  return lx64_nanosleep64(nr, a1, a2);
+    case 37:  return lx64_alarm64(a1);                              // 只记录，不投递 SIGALRM
+    case 39:  return lx64_getpid64();
+    case 56:  return lx64_clone64(nr, r, a1);                        // 只支持 flags=0/SIGCHLD
+    case 57:  return lx64_fork64(nr, r);
+    case 58:  return lx64_fork64(nr, r);                             // vfork：等同 fork（如实，见函数注释）
+    case 59:  return lx64_execve64(r, a1, a2, a3);
+    case 61:  return lx64_wait4_64(a1, a2, a3);
+    case 62:  return lx64_kill_wrap64(a1, a2);
     case 63:  return lx64_uname64(nr, a1);
+    case 74:  return lx64_fsync64(a1);
     case 79:  return lx64_getcwd64(nr, a1, a2);
-    case 102: return 0;                               // getuid
-    case 104: return 0;                               // getgid
-    case 158: return lx64_arch_prctl64(nr, a1, a2);
-    case 218: return 0;                               // set_tid_address（没有 clear_child_tid 唤醒）
+    case 82:  break;                                                // rename：vfs64 没有 rename -> -ENOSYS
+    case 83:  return lx64_fs_mutate64(nr, a1, 1);                    // mkdir：真写盘
+    case 84:  break;                                                // rmdir：vfs64 没有删目录 -> -ENOSYS
+    case 87:  return lx64_fs_mutate64(nr, a1, 0);                    // unlink：真写盘
+    case 89:  return lx64_readlink64(nr, a1, a2, a3);                // 只对 /proc/self/exe 有值
+    case 96:  return lx64_gettimeofday64(nr, a1, a2);
+    case 97:  return lx64_getrlimit64(nr, a1, a2);
+    case 102: return 0;                                             // getuid（没有权限模型：如实 0）
+    case 104: return 0;                                             // getgid
+    case 110: return lx64_getppid64();
+    case 158: return lx64_arch_prctl64(nr, a1, a2);                  // FS.base：真写 MSR
+    case 160: return lx64_setrlimit64(nr, a1, a2);
+    case 218: return 0;                                             // set_tid_address（没有 clear_child_tid 唤醒）
     case 228: return lx64_clock_gettime64(nr, a1, a2);
-    case 257: return lx64_open64(nr, a2);             // openat(dirfd, path, flags, mode)：dirfd 忽略
-    case 6:                                   // lstat / 4: stat —— 本阶段没有按路径 stat 的用户 ABI 需求
-    case 4:
-        break;
+    case 257: return lx64_open64(nr, a2);                           // openat(dirfd, path, flags, mode)
+    case 318: return lx64_getrandom64(nr, a1, a2, a3);               // 伪随机（非密码学安全，如实标注）
     default:
         break;
     }
@@ -624,6 +1045,12 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
             if (user64_exit_to_kernel64(r, 0)) { g_syscall64_exit_to_kernel64 = 1; return; }
             return;                                        // 实在回不去：保持原样（不该发生）
         }
+        // ★ 每次正常返回前都必须**重新**清掉出口开关：它是全局量，而本任务的系统调用
+        //   可能在 wait4/nanosleep 里被挂起（让别的任务跑），别的任务那会儿走 exit 会把这个
+        //   全局置 1；等本任务回来时若不再清一次，入口汇编就会误判"本帧已 exit"并 jmp 到
+        //   ring0 蹦床（实测症状：父进程 wait4 返回后整机停住 —— 蹦床按 ctx 复位栈、ret 进
+        //   已释放的内核栈）。
+        g_syscall64_exit_to_kernel64 = 0;
         r->rax = (uint64_t)ret;
         return;
     }

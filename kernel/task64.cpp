@@ -21,6 +21,7 @@
 #include "debug64.h"
 #include "mem_64.h"
 #include "usb64.h"      // USB 主机（UHCI）：kusb 内核线程只调 usb64_poll64()
+#include "syscall64.h"  // g_syscall64_kstack64：SYSCALL 入口专用栈顶（每任务一份，见 task_apply_ctx64）
 
 // ==================== 任务表 ====================
 struct Task64 {
@@ -37,6 +38,10 @@ struct Task64 {
     uint32_t slice_left;
     uint32_t started;
     uint32_t quiet;          // 1 = 压力子任务（create/exit/reap 都不打日志，见 kstress 段）
+    void*    proc;           // 拥有本任务的进程（0 = 纯内核线程；批次 C 新增）
+    uint64_t mm_cr3;         // 切到这个任务时要装载的 CR3（0 = 内核地址空间；proc64 算好）
+    uint64_t mm_fs_base;     // IA32_FS_BASE（TLS）：进程私有的 FS 基址（0 = 内核默认）
+    uint64_t syscall_kstack; // SYSCALL 入口专用栈顶（= stack_top - 4KB；任务 0 / 无则 0）
     char     name[TASK64_NAME_MAX];
 };
 
@@ -94,9 +99,51 @@ static volatile uint64_t g_work_iters  = 0;
 //   entry64.asm 把引导栈顶设为 0x7C000（向下生长），0x80000 在其上方 16KB，
 //   所以从 0x80000 向下使用的这块栈不会碰到引导流程正在用的栈。
 static const uint64_t TASK64_TASK0_RSP0 = 0x80000;
+// 新任务的**内核 C 栈预留**（见 task_build_frame）：顶部留给 ring3 中断帧（0xD0）与
+// SYSCALL 专用栈（0x1000），C 执行栈从 stack_top - 0x2000 起（16KB 栈里剩 8KB 给 C）。
+static const uint64_t TASK64_ENTRY_RSP_RESERVE = 0x2000;
 
 static inline uint64_t task_rsp0_of(const Task64* t) {
     return t->stack_top ? t->stack_top : TASK64_TASK0_RSP0;
+}
+
+// ==================== 每进程地址空间的装载（与 TSS.rsp0 同一处）====================
+// 为什么必须在这里：CR3 与 IA32_FS_BASE 都是**全局**的 CPU 状态；只有"切任务的那三处"
+// （schedule64 / task_exit64 / task_start64）能保证"下一个任务跑起来之前"它们已装载好。
+// proc64 只把值算好交进来（task_bind_proc64），本文件不认识 Proc64 结构 ——
+// 因此既有任务语义 / 打点 / 回收竞态修复一行都不用动。
+static uint64_t g_task64_kernel_cr364 = 0;   // 内核地址空间（task_init64 时读到的 CR3）
+static uint64_t g_task64_cr3_active64 = 0;   // 当前装在 CR3 里的值（"相同就跳过"的缓存）
+static uint64_t g_task64_fs_active64  = 0;   // 当前 IA32_FS_BASE（同一份缓存）
+
+static inline uint64_t t64_rd_cr364() {
+    uint64_t v; __asm__ volatile("mov %%cr3, %0" : "=r"(v)); return v;
+}
+void task64_load_cr364(uint64_t cr3) {
+    if ((cr3 & ~0xFFFULL) == (g_task64_cr3_active64 & ~0xFFFULL)) return;   // 同一个地址空间：不切
+    // 切 CR3 会自动刷新非全局 TLB 项 + 分页结构缓存（用户页 PTE 都没打 PTE_GLOBAL），
+    // 所以这里**不**额外 invlpg 全表（那会连内核自己的 TLB 一起冲掉，代价更大）。
+    __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    g_task64_cr3_active64 = cr3;
+}
+void task64_load_fs_base64(uint64_t v) {
+    if (v == g_task64_fs_active64) return;
+    // IA32_FS_BASE(0xC0000100)：glibc 的 arch_prctl(ARCH_SET_FS) 写的就是它。
+    __asm__ volatile("wrmsr" : : "c"(0xC0000100u), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+    g_task64_fs_active64 = v;
+}
+uint64_t task64_kernel_cr364() { return g_task64_kernel_cr364; }
+
+// 切换前的统一装载：rsp0 / syscall 栈顶 / CR3 / FS 基址（互不依赖，顺序无关）
+static void task_apply_ctx64(Task64* n) {
+    tss_set_rsp0(task_rsp0_of(n));
+    if (n->syscall_kstack) {
+        g_syscall64_kstack64 = n->syscall_kstack;               // SYSCALL 入口的切栈目标
+    } else {
+        g_syscall64_kstack64 = syscall64_static_kstack_top64();  // 任务 0 / 无调度器：静态专用栈
+    }
+    task64_load_cr364(n->mm_cr3 ? n->mm_cr3 : g_task64_kernel_cr364);
+    task64_load_fs_base64(n->proc ? n->mm_fs_base : 0);
 }
 
 // ==================== 小工具 ====================
@@ -208,7 +255,14 @@ static uint64_t task_build_frame(uint64_t stack_top) {
     f->rip    = (uint64_t)(uintptr_t)task_trampoline64;
     f->cs     = 0x08;                                          // 内核代码段（与 GDT/IDT 一致）
     f->rflags = 0x202;                                         // IF=1：新任务一跑起来就允许中断
-    f->rsp    = stack_top;                                     // 同特权级 iretq 不弹 rsp，占位即可
+    // ★ 任务的**内核 C 栈从 stack_top - TASK64_ENTRY_RSP_RESERVE 开始**（不是 stack_top）：
+    //   rsp0 = stack_top，ring3 的中断帧压在 [stack_top-0xD0, stack_top)；若入口函数直接用
+    //   stack_top 向下，它的栈帧就会和中断帧**重叠**（本模块踩过：proc64 的子进程从 ring3
+    //   回来时 ret 到 0x3 —— 栈顶那几个字被中断帧覆盖了）。留 8KB：
+    //     顶部 0x0000..0x0D0  ring3 中断帧（rsp0 = stack_top）
+    //         0x1000        SYSCALL 入口专用栈顶（帧在它下方 0xD0 内，见 task_create_ex64）
+    //         0x2000 起      任务自己的内核 C 执行栈（向下生长）
+    f->rsp    = stack_top - TASK64_ENTRY_RSP_RESERVE;          // 同特权级 iretq 不弹 rsp，这里给出真正的起点
     f->ss     = 0x10;
     return base;
 }
@@ -295,7 +349,7 @@ extern "C" void schedule64(pt_regs64* r) {
     Task64* c = &g_tasks[g_cur];
     c->frame = (uint64_t)(uintptr_t)r;      // ★ 先存帧：这是"回到被打断现场"的唯一凭据
     c->ticks++;
-
+    c->ticks++;
     task_wake_scan();
     for (int i = 0; i < TASK64_MAX; i++) {
         if (i != g_cur && g_tasks[i].state == TASK64_DEAD) task_queue_reap(i);
@@ -317,7 +371,7 @@ extern "C" void schedule64(pt_regs64* r) {
     n->switches++;
     n->slice_left = TASK64_SLICE_TICKS;
     g_switch_total++;
-    tss_set_rsp0(task_rsp0_of(n));          // ★ 切过去之前先修好 rsp0（ring3 回来靠它）
+    task_apply_ctx64(n);                    // ★ rsp0 + syscall 栈顶 + CR3（每进程地址空间）+ FS 基址
     task_frame_guard64("sched", n, next);    // ★ 同上：目标帧不自洽就停下报告，不 iretq
     task_switch_iret64(n->frame);           // 不返回
 }
@@ -358,13 +412,19 @@ void task_init64() {
     // 任务 0 = 当前执行流（内核主流程，最终进入桌面消息循环），栈就是引导期内核栈。
     t->stack_base = 0;
     t->stack_top  = 0;
+    // 任务 0 **没有**进程（mm_cr3 = 0 -> 用内核地址空间；mm_fs_base 不生效），
+    // 它的 syscall 入口用 syscall64.cpp 的静态专用栈（syscall_kstack = 0）。
+    // 为什么必须先记下内核地址空间：后面每个进程任务切走时都要切回它
+    // （否则会停在某个已释放的进程 PML4 上 —— 那是立刻 #PF/复位级的错误）。
+    g_task64_kernel_cr364 = t64_rd_cr364();
+    g_task64_cr3_active64 = g_task64_kernel_cr364;
 
     g_cur        = 0;
     g_task_count = 1;
 
     // 任务 0 的 rsp0（它用引导期栈，stack_top==0 -> 用 TASK64_TASK0_RSP0）。
-    // 这一步保证"调度器上线后第一次进 ring3"时 rsp0 就是对的，不必等一次任务切换。
-    tss_set_rsp0(TASK64_TASK0_RSP0);
+    // 这一步保证"调度器上线后第一次进 ring3"时 rsp0 / syscall 栈顶就是对的，不必等一次任务切换。
+    task_apply_ctx64(t);
 
     dbg64_line_begin64();
     dbg64_str("[TASK64] init idle=kmain max=");
@@ -413,6 +473,13 @@ static int task_create_ex64(const char* name, void (*entry)(void*), void* arg, u
     t->stack_top -= 8;                       // ★ 进入函数时 rsp % 16 == 8（System V ABI）
     t->entry      = entry;
     t->arg        = arg;
+    // ★ SYSCALL 入口专用栈（每任务一份）：SYSCALL 不换栈，入口汇编要自己切到"内核栈"，
+    //   而 ring3 中断用的是 TSS.rsp0（= stack_top，帧压在 [stack_top-0xD0, stack_top)）。
+    //   两者若共用同一个栈顶，syscall 帧与中断帧的 rip/cs/rsp 槽会**完全重叠**（既有模块
+    //   为此单独开过一个全局专用栈）。多进程后每个任务都可能阻塞在系统调用里，全局共用
+    //   会让 A 的 syscall 帧被 B 的 syscall 覆盖 —— 所以改成每任务在**自己内核栈顶下方 4KB**
+    //   开一块：向上给 ring3 中断帧留 4KB（够 0xD0 的帧），向下是任务自己的内核栈。
+    t->syscall_kstack = t->stack_top - 0x1000;
     t->quiet      = quiet;                   // 1 = 压力子任务：create/exit/reap 都不打日志
     // ★ 发布顺序（真缺陷）：state = READY 是"这个槽可以被调度"的唯一开关，必须**最后**设。
     //   原来它写在这里（frame 之前），中间那几行若被 PIT 打断，pick_next_in 就会选中一个
@@ -666,7 +733,7 @@ void task_start64() {
 #endif
 
     g_sched_on = true;
-    tss_set_rsp0(task_kstack_top_current64());   // 抢占打开前先把 rsp0 对上当前任务（任务 0 -> 0x80000）
+    task_apply_ctx64(&g_tasks[g_cur < 0 ? 0 : g_cur]);   // 抢占打开前先把当前任务的上下文装好（任务 0 -> 0x80000）
     dbg64_line_begin64();
     dbg64_str("[TASK64] scheduler up tasks=");
     dbg64_dec((uint64_t)g_task_count);
@@ -742,7 +809,7 @@ void task_sleep64(uint32_t ms) {
     n->switches++;
     n->slice_left = TASK64_SLICE_TICKS;
     g_switch_total++;
-    tss_set_rsp0(task_rsp0_of(n));           // ★ 同上：交给下一个任务前修好 rsp0
+    task_apply_ctx64(n);                     // ★ 同上：交给下一个任务前把上下文全部装载好
     task_frame_guard64("exit", n, next);     // ★ 切走前校验目标帧（垃圾帧 -> 停下报告，绝不 iretq）
     task_switch_iret64(n->frame);            // 不返回
     for (;;) __asm__ volatile("cli; hlt");   // 不可达
@@ -775,6 +842,57 @@ int task_count64() { return (int)g_task_count; }
 uint64_t task_switch_total64() { return g_switch_total; }
 uint64_t task_heartbeats64()    { return g_heart_beats; }
 uint64_t task_work_iters64()    { return g_work_iters; }
+
+// ==================== 批次 C：进程 / 地址空间相关的访问器 ====================
+// 说明：本文件不认识 Proc64（proc64.cpp 的私有结构），只保存 proc64 交进来的三个数值。
+// 这样做的好处是"调度器切换"这条最敏感的路径上不引入任何跨模块调用/分配/日志。
+void* task_proc_of_current64() {
+    if (g_cur < 0) return nullptr;
+    return g_tasks[g_cur].proc;
+}
+extern "C" int task_slot_current64() { return g_cur; }
+int task_slot_of_id64(uint32_t id) {
+    for (int i = 0; i < TASK64_MAX; i++) {
+        if (g_tasks[i].state != TASK64_FREE && g_tasks[i].id == id) return i;
+    }
+    return -1;
+}
+// 把一个任务绑定到进程的地址空间。必须在任务被调度到之前调用（proc64 在 fork 里
+// 是在关中断的系统调用上下文里做的，PIT 进不来，不存在"先跑起来再绑定"的窗口）。
+int task_bind_proc64(uint32_t task_id, void* proc, uint64_t cr3, uint64_t fs_base) {
+    const int slot = task_slot_of_id64(task_id);
+    if (slot < 0) return -1;
+    g_tasks[slot].proc        = proc;
+    g_tasks[slot].mm_cr3      = cr3;
+    g_tasks[slot].mm_fs_base  = fs_base;
+    return 0;
+}
+// 只改地址空间参数（arch_prctl(ARCH_SET_FS) 之后要立刻生效；CR3 在 execve 后不变）
+void task_update_mm64(uint32_t task_id, uint64_t cr3, uint64_t fs_base) {
+    const int slot = task_slot_of_id64(task_id);
+    if (slot < 0) return;
+    if (cr3) g_tasks[slot].mm_cr3 = cr3;
+    g_tasks[slot].mm_fs_base = fs_base;
+}
+// 临时把当前任务的地址空间换成 cr3（0 = 恢复内核地址空间）；见 task64.h 的说明。
+void task_set_current_mm64(uint64_t cr3, uint64_t fs_base) {
+    if (g_cur < 0) return;
+    g_tasks[g_cur].mm_cr3 = cr3;
+    g_tasks[g_cur].mm_fs_base = fs_base;
+    task64_load_cr364(cr3 ? cr3 : g_task64_kernel_cr364);
+    task64_load_fs_base64(g_tasks[g_cur].proc ? fs_base : 0);
+}
+// 给 usermode64.cpp 用：进 ring3 之前要把 SYSCALL 入口的切栈目标指到当前任务的专用栈
+extern "C" uint64_t task_syscall_stack_top64() {
+    if (g_cur < 0) return syscall64_static_kstack_top64();
+    const Task64* t = &g_tasks[g_cur];
+    return t->syscall_kstack ? t->syscall_kstack : syscall64_static_kstack_top64();
+}
+// 给 proc64.cpp 用：当前进程对应的任务 id（进程里有 1 个任务时就是它）
+uint32_t task_current_id64_via_slot64() {
+    if (g_cur < 0) return 0xFFFFFFFFu;
+    return g_tasks[g_cur].id;
+}
 
 int task_info64(int idx, Task64Info* out) {
     if (!out || idx < 0 || idx >= TASK64_MAX) return 0;

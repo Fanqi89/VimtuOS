@@ -39,28 +39,86 @@
 //   [USER64] selftest PASS / [USER64] selftest FAIL mask=<n>
 #include "usermode64.h"
 #include "debug64.h"
+#include "memlayout64.h"    // ML64_PML4_PHYS（判断"引导期页表是不是我们自己的"）
 #include "mem_64.h"       // page_alloc_64 / page_free_64 / PTE_* / PAGE_SIZE_64
+#include "syscall64.h"  // g_syscall64_kstack64：SYSCALL 入口的切栈目标（每任务一份，见 u64_set_kernel_stack64）
+// 页表助手（自己走表）里的 CR3 读法；u64_rd_cr364 在下面定义，这里先用一个前置声明式的小函数。
+static inline uint64_t u64_rd_cr364();
 
-// ==================== 与汇编桥共享的保存区 ====================
+
+// ==================== 用户窗口是否可用（批次 C：UEFI 下必须如实说"不可用"）====================
+// 为什么需要这个判断（实测驱动，不是保守起见）：
+//   用户窗口要能用，必须往**引导期页表的顶层**写东西（给 PML4[0]/PDPTE/PDE/PTE 打开 U/S —— 见
+//   u64_walk64）。BIOS 路径（boot/loader64.asm）那张 PML4（物理 0x40000）是我们自己建的、可写；
+//   UEFI 路径（boot/efi/uefi64.c）**不换 CR3**，内核跑在固件当前活动的 PML4 上，而 EDK2 把
+//   自己的页表页标成**只读** —— 于是任何"顺手把顶层项打开 U/S"的写入都会立刻 #PF
+//   （实测：err=0000000000000003、cr2=0x1F801000，正是固件 PML4 那一页）。
+// 结论：UEFI 下**这个用户窗口根本建立不起来**，所以这里如实返回 0，由调用方（os_boot_path /
+//   proc64）打一行说明并跳过 ring3 演示，绝不假装成功、更不装作隔离成立。
+//   （真正的修法是引导期就把固件页表克隆到自己的页面上再切 CR3 —— 但 VMware EFI 下 mov cr3
+//    会立刻复位，见 boot/efi/uefi64.c 的说明；那是引导期的事，本批次不做。）
+static int g_user64_avail64 = -1;                 // -1 = 还没判过
+int user64_available64() {
+    if (g_user64_avail64 >= 0) return g_user64_avail64;
+    const uint64_t cr3 = u64_rd_cr364();
+    g_user64_avail64 = (cr3 == (uint64_t)ML64_PML4_PHYS) ? 1 : 0;
+    dbg64_line_begin64();
+    if (g_user64_avail64) {
+        dbg64_str("[USER64] user window available (boot paging is ours, cr3=0x");
+        dbg64_hex64(cr3);
+        dbg64_str(")");
+    } else {
+        dbg64_str("[USER64] user window NOT available (boot paging is firmware-owned, cr3=0x");
+        dbg64_hex64(cr3);
+        dbg64_str("): firmware page tables are read-only -> ring3 demos skipped (UEFI path)");
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+    return g_user64_avail64;
+}
+// ==================== 与汇编桥共享的保存区（批次 C：**每任务一份**）====================
+// 为什么改成每任务一份（真缺陷级的设计约束）：
+//   原来 g_user64_k_rsp64 / g_user64_k_rbx64 ... 是**单份全局**的，前提是"同时只有一个用户
+//   程序在 ring3"。多进程后：任务 A 进 ring3 被 PIT 抢占 -> 任务 B 也进 ring3（覆盖这批全局）
+//   -> B 先退出（蹦床复位到 B 的 rsp，没问题）-> 之后 A 退出时蹦床会复位到 **B 的** rsp，
+//   也就是从 A 的"退出"跳到 B 的调用栈上继续跑 —— 直接踩烂内核。所以：
+//     * 每个任务槽位一份 User64Ctx64（rsp + callee-saved）；
+//     * 汇编只认一个指针 g_user64_ctxp64（进 ring3 前由 C 侧按"当前任务槽位"设好，
+//       exit 的时候由 user64_exit_to_kernel64 再设一次 —— 同一任务，所以两者必然一致）；
+//     * in_ring3 也变成按槽位的位图（多进程时"我这一帧该不该改写"只能问自己）。
 // extern "C"：汇编块按名字引用（见下面 user64_enter64/user64_resume_tramp64）。
-extern "C" uint64_t g_user64_k_rsp64    = 0;   // 进 ring3 前的内核 rsp（[rsp] = 返回地址）
-extern "C" uint64_t g_user64_k_rbx64    = 0;
-extern "C" uint64_t g_user64_k_rbp64    = 0;
-extern "C" uint64_t g_user64_k_r12_64   = 0;
-extern "C" uint64_t g_user64_k_r13_64   = 0;
-extern "C" uint64_t g_user64_k_r14_64   = 0;
-extern "C" uint64_t g_user64_k_r15_64   = 0;
-extern "C" uint64_t g_user64_exit_code64 = 0;  // 用户 exit(code) 的 code，由蹦床写进 rax
-// 是否正处在"用户程序跑在 ring3"的状态（exit 只在这种状态下才改写帧回内核）
-static bool g_user64_in_ring3 = false;
+static const int U64_CTX_MAX = 20;                 // >= TASK64_MAX(16)，留几个兜底槽
+struct User64Ctx64 { uint64_t rsp, rbx, rbp, r12, r13, r14, r15; };
+static User64Ctx64 g_user64_ctx64[U64_CTX_MAX];
+extern "C" uint64_t g_user64_ctxp64 = (uint64_t)(uintptr_t)&g_user64_ctx64[0];  // 当前任务的保存区
+extern "C" uint64_t g_user64_exit_code64 = 0;  // 最近一次用户 exit(code) 的 code（蹦床写进 rax）
+// 是否正处在"用户程序跑在 ring3"的状态：按槽位位图（exit 只对**本任务**这种状态才改写帧）
+static uint32_t g_user64_in_ring3_mask64 = 0;
 
-// 进 ring3 用的用户帧（静态：task_switch_iret64 只读它，用完即弃）
+// 进 ring3 用的用户帧（静态：task_switch_iret64 只读它，且进入时 IF=0、立刻被 iretq 消费，
+// 所以多任务共用一块也安全 —— 见下面 user64_enter64 的 cli 说明）。
 static pt_regs64 g_user64_frame64;
 
 extern "C" uint64_t user64_enter64(uint64_t next_frame);   // 不返回：exit 后从 call 之后继续
 extern "C" void     user64_resume_tramp64();               // 由被改写的 syscall 帧 iretq 落到这里
-// task64.cpp 提供（安装程序内核不链它 -> weak 引用）
+// task64.cpp 提供（安装程序内核不链它 -> weak 引用，见下面对每个引用的判空）
 extern "C" uint64_t task_kstack_top_current64() __attribute__((weak));
+extern "C" uint64_t task_syscall_stack_top64()  __attribute__((weak));
+extern "C" int      task_slot_current64()       __attribute__((weak));
+
+// 当前任务槽位（0 = 任务 0 / 没有调度器）。多进程的"每任务一份"就靠它。
+static int u64_ctx_slot64() {
+    if (!task_slot_current64) return 0;
+    const int s = task_slot_current64();
+    return (s >= 0 && s < U64_CTX_MAX) ? s : 0;
+}
+// 把汇编用的保存区指针指向当前任务那一份（进 ring3 前 / exit 改写帧前各一次）
+static void u64_ctx_bind64() { g_user64_ctxp64 = (uint64_t)(uintptr_t)&g_user64_ctx64[u64_ctx_slot64()]; }
+static inline void u64_in_ring3_set64(int on) {
+    const uint32_t bit = 1u << u64_ctx_slot64();
+    if (on) g_user64_in_ring3_mask64 |= bit; else g_user64_in_ring3_mask64 &= ~bit;
+}
+static inline bool u64_in_ring3_get64() { return (g_user64_in_ring3_mask64 >> u64_ctx_slot64()) & 1u; }
 
 // ==================== 进出 ring3 的汇编桥 ====================
 // 只能写在文件作用域的 asm 块里：这两段是"半个函数"的跳转目标，C++ 表达不出来。
@@ -72,13 +130,14 @@ __asm__(
 ".type user64_enter64,@function\n"
 "user64_enter64:\n"
 "    cli\n"                                     // 保存期间不能被 PIT 抢占（下面写同一批全局）
-"    movq %rsp, g_user64_k_rsp64(%rip)\n"
-"    movq %rbx, g_user64_k_rbx64(%rip)\n"
-"    movq %rbp, g_user64_k_rbp64(%rip)\n"
-"    movq %r12, g_user64_k_r12_64(%rip)\n"
-"    movq %r13, g_user64_k_r13_64(%rip)\n"
-"    movq %r14, g_user64_k_r14_64(%rip)\n"
-"    movq %r15, g_user64_k_r15_64(%rip)\n"
+"    movq g_user64_ctxp64(%rip), %rax\n"          // ★ 每任务一份的保存区（C 侧已按槽位设好）
+"    movq %rbx, 8(%rax)\n"
+"    movq %rbp, 16(%rax)\n"
+"    movq %r12, 24(%rax)\n"
+"    movq %r13, 32(%rax)\n"
+"    movq %r14, 40(%rax)\n"
+"    movq %r15, 48(%rax)\n"
+"    movq %rsp, 0(%rax)\n"                      // rsp 最后写（rax 被上面用掉；帧里的 rax 另行弹出）
 "    jmp task_switch_iret64\n"                  // 不返回：按 rdi 指向的帧 iretq（可切到 ring3）
 ".size user64_enter64, .-user64_enter64\n"
 ".globl user64_resume_tramp64\n"
@@ -87,14 +146,15 @@ __asm__(
 "    cli\n"
 "    movw $0x10, %ax\n"
 "    movw %ax, %ss\n"                            // 恢复内核 SS（长模式下基址无意义，只为与 entry64 一致）
-"    movq g_user64_k_rsp64(%rip), %rsp\n"        // ★ 复位到进 ring3 前的内核栈
-"    movq g_user64_k_rbx64(%rip), %rbx\n"
-"    movq g_user64_k_rbp64(%rip), %rbp\n"
-"    movq g_user64_k_r12_64(%rip), %r12\n"
-"    movq g_user64_k_r13_64(%rip), %r13\n"
-"    movq g_user64_k_r14_64(%rip), %r14\n"
-"    movq g_user64_k_r15_64(%rip), %r15\n"
-"    movq g_user64_exit_code64(%rip), %rax\n"    // 返回值 = 退出码
+"    movq g_user64_ctxp64(%rip), %rax\n"          // ★ 同一份保存区（exit 前 C 侧刚设过；IF=0 期间不会被换）
+"    movq 0(%rax), %rsp\n"                       // ★ 复位到进 ring3 前的内核栈
+"    movq 8(%rax), %rbx\n"
+"    movq 16(%rax), %rbp\n"
+"    movq 24(%rax), %r12\n"
+"    movq 32(%rax), %r13\n"
+"    movq 40(%rax), %r14\n"
+"    movq 48(%rax), %r15\n"
+"    movq g_user64_exit_code64(%rip), %rax\n"    // 返回值 = 退出码（C 侧同时用返回值，见 enter_at64）
 "    sti\n"                                      // 栈已复位，可以开中断
 "    ret\n"                                      // [rsp] = user64_enter64 的返回地址
 ".size user64_resume_tramp64, .-user64_resume_tramp64\n"
@@ -206,7 +266,10 @@ int user64_remap_flags64(uint64_t va, uint64_t leaf_flags) {
 uint64_t user64_unmap_page64(uint64_t va) {
     uint64_t* pte = u64_walk64(va, 0);
     if (!pte || !(*pte & PTE_PRESENT_64)) return 0;
-    const uint64_t phys = *pte & ~0xFFFULL;
+    // ★ 只取物理地址位（bit12..51）：不能用 ~0xFFFULL —— 它会留下 bit63(NX)，
+    //   于是调用方拿到一个"非规范地址"再去 page_free_64，等于把野指针交给页池
+    //   （栈/mmap/brk 页都带 NX，这条路径每次都会踩）。
+    const uint64_t phys = *pte & 0x000FFFFFFFFFF000ULL;
     *pte = 0;
     u64_invlpg64(va);
     return phys;
@@ -214,13 +277,19 @@ uint64_t user64_unmap_page64(uint64_t va) {
 
 void user64_paging_sync64() { u64_flush_tlb64(); }
 
-// ---- 进 ring3 前的内核栈顶：TSS.rsp0 只给"ring3 -> ring0 的中断/异常"用 ----
-// （syscall 指令入口有自己的**专用栈**，见 syscall64.cpp —— 两者不能共用：中断帧和
-//   syscall 帧会压在同一段内存上，互相覆盖 rip/cs 槽）
+// ---- 进 ring3 前的内核栈：TSS.rsp0（ring3 中断/异常）与 SYSCALL 入口栈 ----
+// 两者不能共用同一块内存：中断帧压在 [rsp0-0xD0, rsp0)，而 SYSCALL 入口也自己压 0xD0 的帧，
+// 一旦共用就会互相覆盖 rip/cs/rsp 槽（既有模块为此开过一个全局专用栈）。
+// 批次 C 起每个任务都有**自己**的 syscall 栈（= 自己内核栈顶下方 4KB，见 task64.cpp），
+// 因为多进程下每个任务都可能阻塞在系统调用里（例如父进程在 wait4 里等子进程）。
 static void u64_set_kernel_stack64() {
     uint64_t rsp0 = 0x80000;                                             // 兜底：与 tss_init64/task64 任务 0 一致
     if (task_kstack_top_current64) rsp0 = task_kstack_top_current64();
     tss_set_rsp0(rsp0);
+    if (task_syscall_stack_top64) {
+        const uint64_t sk = task_syscall_stack_top64();
+        if (sk) g_syscall64_kstack64 = sk;                                // SYSCALL 入口的切栈目标
+    }
 }
 
 static bool u64_map64(uint64_t va, uint64_t phys, uint64_t leaf_flags) {
@@ -305,8 +374,12 @@ int user64_range_ok64(uint64_t va, uint64_t len) {
 }
 
 // ==================== exit(2)：改写当前系统调用帧回内核 ====================
+// ★ 批次 C：改成**按任务槽位**判"我是不是在 ring3"，并把汇编蹦床用的保存区指针
+//   重新指向**当前任务**那一份 —— exit 与进入永远是同一个任务，所以指针必然一致；
+//   多进程时这一步是把"退出回到哪个任务的调用点"钉死的唯一依据（见文件头说明）。
 int user64_exit_to_kernel64(pt_regs64* r, uint64_t code) {
-    if (!r || !g_user64_in_ring3) return 0;                 // 不在 ring3：按普通返回处理
+    if (!r || !u64_in_ring3_get64()) return 0;              // 本任务不在 ring3：按普通返回处理
+    u64_ctx_bind64();                                       // 蹦床读的就是它（IF=0，期间不会被换走）
     g_user64_exit_code64 = code;
     r->rip    = (uint64_t)(uintptr_t)user64_resume_tramp64; // 内核蹦床
     r->cs     = SEL64_KCODE;                                // 0x08：同特权级 iretq（只弹 3 个字）
@@ -410,10 +483,14 @@ int user64_run_blob64(const void* blob, uint32_t size, const char* name) {
     dbg64_line_end64();
 
     g_user64_exit_code64 = 0;
-    g_user64_in_ring3 = true;
+    u64_ctx_bind64();                       // ★ 保存区指向**本任务**那一份（多进程关键）
+    u64_in_ring3_set64(1);
     // ★ 从这里进入 ring3；用户程序 exit(2) 时由被改写的 syscall 帧回到下面这行之后。
-    (void)user64_enter64((uint64_t)(uintptr_t)&g_user64_frame64);
-    g_user64_in_ring3 = false;
+    //   返回值 = 用户 exit 的退出码（汇编蹦床把 code 放在 rax 里返回）——不读全局量，
+    //   因为 sti 之后本任务可能被抢占、另一个进程的 exit 会覆盖全局量。
+    const uint64_t u64_rc = user64_enter64((uint64_t)(uintptr_t)&g_user64_frame64);
+    (void)u64_rc;
+    u64_in_ring3_set64(0);
 
     // ---- 收尾：清叶子 PTE（对应 VA 不会再被访问）+ 释放用户数据页 ----
     // 中间页表页（PDPTE/PD/PT）**保留不回收**：一是它们只有 8~12KB、且是"用户窗口"的
@@ -442,23 +519,28 @@ int user64_run_blob64(const void* blob, uint32_t size, const char* name) {
 // （kernel/elf64.cpp）自己在用户窗口里建好，本函数只负责"把 TSS.rsp0/内核栈切好、抬栈
 // iretq 进 ring3、exit 后回到这里"。所以它返回的是**用户 exit 的退出码**（不是 0/-1）。
 int user64_enter_at64(uint64_t entry, uint64_t user_rsp, const char* name) {
-    if (g_user64_in_ring3) {                                  // 单线程模型：同时只能有一个用户程序
+    // ★ 批次 C：不再用"全局 busy"判断（多进程下允许多个用户任务同时处在 ring3，
+    //   各自被 PIT 抢占）。真正的互斥单位是**任务**：同一个任务不可能两次进 ring3
+    //   （进 ring3 后只能通过 exit 回来，中途没有"再次进入"的路径），所以这里只做
+    //   "本任务是否已经在 ring3"的自检。
+    if (u64_in_ring3_get64()) {
         dbg64_line_begin64();
-        dbg64_str("[USER64] enter FAILED (busy)\\n");
+        dbg64_str("[USER64] enter FAILED (this task already in ring3)");
+        dbg64_nl();
         dbg64_line_end64();
         return -1;
     }
     const uint64_t base = USER64_CODE_VA64, limit = base + USER64_WINDOW_BYTES64;
     if (entry < base || entry >= limit) {                     // 入口必须在用户窗口内
-        dbg64_line_begin64(); dbg64_str("[USER64] enter FAILED (entry outside window)\\n"); dbg64_line_end64();
+        dbg64_line_begin64(); dbg64_str("[USER64] enter FAILED (entry outside window)"); dbg64_nl(); dbg64_line_end64();
         return -1;
     }
     if (user_rsp <= base || user_rsp > limit) {
-        dbg64_line_begin64(); dbg64_str("[USER64] enter FAILED (rsp outside window)\\n"); dbg64_line_end64();
+        dbg64_line_begin64(); dbg64_str("[USER64] enter FAILED (rsp outside window)"); dbg64_nl(); dbg64_line_end64();
         return -1;
     }
     if (!u64_page_is_user64(entry & ~0xFFFULL)) {             // 入口那一页必须已映射为用户页
-        dbg64_line_begin64(); dbg64_str("[USER64] enter FAILED (entry page not mapped user)\\n"); dbg64_line_end64();
+        dbg64_line_begin64(); dbg64_str("[USER64] enter FAILED (entry page not mapped user)"); dbg64_nl(); dbg64_line_end64();
         return -1;
     }
 
@@ -477,17 +559,91 @@ int user64_enter_at64(uint64_t entry, uint64_t user_rsp, const char* name) {
     dbg64_line_end64();
 
     g_user64_exit_code64 = 0;
-    g_user64_in_ring3 = true;
+    u64_ctx_bind64();                       // ★ 保存区指向本任务那一份
+    u64_in_ring3_set64(1);
     // ★ 进入 ring3；exit（int 0x80 或 syscall 指令）后由内核蹦床回到下面这行之后。
-    (void)user64_enter64((uint64_t)(uintptr_t)&g_user64_frame64);
-    g_user64_in_ring3 = false;
+    const uint64_t rc = user64_enter64((uint64_t)(uintptr_t)&g_user64_frame64);
+    u64_in_ring3_set64(0);
+
+    const uint32_t code = (uint32_t)(rc & 0xFF);
+    dbg64_line_begin64();
+    dbg64_str("[USER64] back to kernel (ring0) exit_code=");
+    dbg64_dec((uint64_t)code);
+    dbg64_nl();
+    dbg64_line_end64();
+    return (int)code;
+}
+
+// ==================== 从一份"现成的用户帧"进 ring3（批次 C：fork 的子进程／execve）====================
+// 与 user64_enter_at64 的区别：入口/栈/GPR 全部来自调用方给的帧（fork 复制的是**父进程的
+// syscall 帧** —— 父子除了 rax 之外寄存器完全相同，这正是 Linux fork 的语义），
+// 本函数只做安全校验 + 抬栈 iretq。返回用户 exit 的退出码。
+int user64_enter_frame64(const pt_regs64* frame, const char* name) {
+    // 每一处失败都留一个原因码（多进程后"进不去 ring3"必须能一眼定位到是哪一条校验）
+    uint32_t why = 0;
+    if (!frame) why = 1;
+    else if (u64_in_ring3_get64()) why = 2;
+    else if (frame->cs != SEL64_UCODE || frame->ss != SEL64_UDATA) why = 3;
+    else if (frame->rip < USER64_CODE_VA64 || frame->rip >= USER64_CODE_VA64 + USER64_WINDOW_BYTES64) why = 4;
+    else if (frame->rsp <= USER64_CODE_VA64 || frame->rsp > USER64_CODE_VA64 + USER64_WINDOW_BYTES64) why = 5;
+    else if (!u64_page_is_user64(frame->rip & ~0xFFFULL)) why = 6;
+    else if (!u64_page_is_user64((frame->rsp - 1) & ~0xFFFULL)) why = 7;
+    if (why) {
+        dbg64_line_begin64();
+        dbg64_str("[USER64] enter FAILED (frame) reason=");
+        dbg64_dec((uint64_t)why);
+        dbg64_str(" name=");
+        dbg64_str(name ? name : "?");
+        dbg64_str(" cr3=0x");
+        dbg64_hex64(u64_rd_cr364());
+        if (frame) {
+            dbg64_str(" rip=0x");
+            dbg64_hex64(frame->rip);
+            dbg64_str(" rsp=0x");
+            dbg64_hex64(frame->rsp);
+            dbg64_str(" cs=0x");
+            dbg64_hex64(frame->cs);
+            dbg64_str(" ss=0x");
+            dbg64_hex64(frame->ss);
+        }
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+
+    // 帧原样拷进静态缓冲：iretq 立刻消费它（IF=0 且不返回），多任务共用也安全。
+    g_user64_frame64 = *frame;
+    g_user64_frame64.gs = SEL64_UDATA; g_user64_frame64.fs = SEL64_UDATA;
+    g_user64_frame64.es = SEL64_UDATA; g_user64_frame64.ds = SEL64_UDATA;  // 占位：出口跳过
+    if ((g_user64_frame64.rflags & 0x202ULL) != 0x202ULL) g_user64_frame64.rflags = 0x202;
+
+    u64_enable_nxe64();
+    u64_set_kernel_stack64();
+
+    dbg64_line_begin64();
+    dbg64_str("[USER64] enter ring3 entry=");
+    dbg64_hex64(g_user64_frame64.rip);
+    dbg64_str(" rsp=");
+    dbg64_hex64(g_user64_frame64.rsp);
+    dbg64_str(" name=");
+    dbg64_str(name ? name : "?");
+    dbg64_str(" frame=1");
+    dbg64_nl();
+    dbg64_line_end64();
+
+    g_user64_exit_code64 = 0;
+    u64_ctx_bind64();
+    u64_in_ring3_set64(1);
+    const uint64_t rc = user64_enter64((uint64_t)(uintptr_t)&g_user64_frame64);
+    u64_in_ring3_set64(0);
 
     dbg64_line_begin64();
     dbg64_str("[USER64] back to kernel (ring0) exit_code=");
-    dbg64_dec(g_user64_exit_code64);
+    dbg64_dec(rc & 0xFFULL);
+    dbg64_str(" frame=1");
     dbg64_nl();
     dbg64_line_end64();
-    return (int)g_user64_exit_code64;
+    return (int)(rc & 0xFFULL);
 }
 
 // ==================== 自检 ====================

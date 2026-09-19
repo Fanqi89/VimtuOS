@@ -785,6 +785,7 @@ TESTS = [
     ("apic64_test.py", "APIC 启用：LAPIC+IOAPIC 接管中断 + 降级（PIT/键鼠/ATA 功能证据）"),
     ("smp64_test.py", "SMP：启动 AP（-smp 2/4）+ 单核/无 ACPI 降级（AP 自己打在线行）"),
     ("sched_stress_test.py", "调度器压力：创建→运行→退出→回收 200 轮 + 待切换帧校验（kstress）"),
+    ("proc64_test.py", "进程/地址空间：每进程 CR3 + fork/execve/wait4/kill（BIOS 隔离 + UEFI 如实降级）"),
     ("usb64_test.py", "USB 主机：UHCI + HID 引导键盘（sendkey -> 桌面响应）+ 两种降级"),
 ]
 

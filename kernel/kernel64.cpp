@@ -40,6 +40,7 @@
 #include "app64.h"      // VAP64 可安装应用：安装器 + 启动器（只进系统内核，见 os_boot_path）
 #include "elf64.h"      // ELF64 加载器（自有静态 ELF64 程序 + syscall 指令路径；只进系统内核）
 #include "net64.h"      // 网络：e1000 驱动 + ARP/ICMP（只进系统内核；启动链里跑一次探测）
+#include "proc64.h"      // 进程/地址空间（批次 C：每进程 CR3 + fork/execve/wait4；只进系统内核）
 #include "usb64.h"      // USB 主机：UHCI + HID 引导键盘（只进系统内核；按键注入 PS/2 同一队列）
 #include "apic64.h"    // LAPIC + IOAPIC 接管中断路由（只进系统内核；拿不到就留在 PIC）
 #include "smp64.h"     // SMP：启动 AP（INIT-SIPI-SIPI + 低端跳板；只进系统内核）
@@ -180,13 +181,21 @@ static uint64_t read_cs64()  { uint64_t v; __asm__ volatile("mov %%cs, %0"  : "=
     // ---- 用户态（ring3）+ int 0x80：启动期跑一次真实用户程序（M3 起点）----
     // 位置有讲究：必须在 task_start64() 之后（调度器在线：TSS.rsp0 由它维护，用户程序
     // 也能被 PIT 抢占），且在 gui64_run() 之前（那之后不再返回）；跑完必须还能进桌面。
-    // 安装程序内核不跑这段（整段在 #ifndef VIMTU_INSTALLER_MEDIA 里）。
     syscall64_init64();                     // 装/确认 int 0x80 门（DPL=3）+ 自检
-    (void)user64_selftest64();              // 用户页/帧/选择子自检 -> [USER64] selftest PASS
-    {
-        const uint64_t blob_sz = (uint64_t)(_binary_build64_user_demo64_bin_end -
-                                            _binary_build64_user_demo64_bin_start);
-        (void)user64_run_blob64(_binary_build64_user_demo64_bin_start, (uint32_t)blob_sz, "demo64");
+    // ★ 批次 C：先问"用户窗口到底能不能用" —— UEFI 路径下引导期页表属于固件且只读，
+    //   用户窗口（要往 PML4[0]/PDPTE 里打开 U/S）根本建不起来（实测那一写就是 #PF err=3、
+    //   cr2=固件 PML4）。所以那种情况下**整段 ring3 演示跳过**并只打一行说明，绝不假装成功。
+    if (user64_available64()) {
+        (void)user64_selftest64();              // 用户页/帧/选择子自检 -> [USER64] selftest PASS
+        {
+            const uint64_t blob_sz = (uint64_t)(_binary_build64_user_demo64_bin_end -
+                                                _binary_build64_user_demo64_bin_start);
+            (void)user64_run_blob64(_binary_build64_user_demo64_bin_start, (uint32_t)blob_sz, "demo64");
+        }
+    } else {
+        dbg64_line_begin64();
+        dbg64_str("[USER64] ring3 demos skipped (user window unavailable on this boot path)\n");
+        dbg64_line_end64();
     }
     // ---- 用户态演示跑完，接着跑"从文件系统装出来"的应用（下面这段）----
     // ---- 可安装应用（VAP64）：挂载 VimtuFS2 -> 自检 -> 幂等安装内嵌 hello.vap -> 从盘上读出来跑一次 ----
@@ -207,13 +216,34 @@ static uint64_t read_cs64()  { uint64_t v; __asm__ volatile("mov %%cs, %0"  : "=
         if (vfs64_mount(app_drive, app_lba) == 0) {
             (void)app64_selftest64();
             (void)app64_install_builtin64(app_drive, app_lba);   // 幂等：已装过则 skipped (exists)
-            (void)app64_launch64("/hello.vap");                  // 从文件系统读出 -> 校验 VAP64 -> ring3
-            // ---- ELF64：自有静态 ELF64 程序（用 syscall 指令与内核通信）----
-            // 与上面 VAP64 同一条套路：幂等把内嵌 hello.elf 装成 /hello.elf，再从盘上 vfs64_read
-            // 读出来 -> elf64.cpp 解析/装载 -> ring3 里跑 -> exit 回 ring0 -> 回收页。
             (void)elf64_selftest64();                            // 合法映像/坏样本自检（坏样本带 selftest 前缀）
             (void)elf64_install_builtin64(app_drive, app_lba);   // 幂等：已装过则 skipped (exists)
-            (void)elf64_run64("/hello.elf");
+            // ---- ring3 相关的一切都必须在"用户窗口可用"时才跑 ----
+            // UEFI 路径下用户窗口建不起来（固件页表只读），VAP64/ELF64 启动器与多进程演示
+            // 都会在第一次映射用户页时失败；所以这里统一跳过并留一行说明（os_boot_path 上面
+            // 已经把 demo64 也一起跳过了）。安装/自检这两步只碰 VFS，照常做。
+            if (user64_available64()) {
+                (void)app64_launch64("/hello.vap");              // 从文件系统读出 -> 校验 VAP64 -> ring3
+                (void)elf64_run64("/hello.elf");
+                // ---- 批次 C：多进程演示（进程级地址空间 + fork/execve/wait4/kill）----
+                // 位置：在既有 ring3 演示之后、gui64_run 之前（那之后不再返回）；跑完必须还能进桌面。
+                // 顺序有讲究：
+                //   1) proc64_init64()：探测"引导期页表是不是我们自己的" -> 决定隔离模式（串口打点）；
+                //   2) proc64_selftest64()：进程表/地址空间布局自检（PML4[511] 共享 + PDPT[4] 私有）；
+                //   3) 幂等把内嵌 /proc64.elf 装进 VimtuFS2（供 fork 出的子进程 execve 自己）；
+                //   4) proc64_demo64()：建 init 进程（自己的 CR3 + 自己的任务）跑完整演示，
+                //      内核这侧只做有界等待 + 收尾。UEFI（固件页表）下会打一行诚实跳过。
+                proc64_init64();
+                (void)proc64_selftest64();
+                (void)proc64_install_builtin64(app_drive, app_lba);
+                (void)proc64_demo64("/proc64.elf");
+            } else {
+                proc64_init64();                                 // 仍然打点：mode=shared（如实）
+                (void)proc64_demo64("/proc64.elf");              // 只打一行 "demo skipped (shared address space mode)"
+                dbg64_line_begin64();
+                dbg64_str("[APP64] ring3 launches skipped (user window unavailable on this boot path)\n");
+                dbg64_line_end64();
+            }
         } else {
             dbg64_str("[APP64] boot: vfs64 mount failed -> install/launch skipped (terminal 'run' can retry)\n");
         }
