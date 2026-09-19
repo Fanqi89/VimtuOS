@@ -40,15 +40,16 @@
 //   [UI]  term layout client=WxH cols=N rows=M   布局变化（开窗时也打一行）
 //   [TERM] cmd <名字> ok|fail            每条命令执行打一行（本轮起固定带 ok/fail —— 新增的真命令
 //                                        用它做是否真的实现过的判据；旧格式只有失败才带 fail）
-//   [TERM] unsupported <名字>: <原因>     未支持命令的说明（现在只剩 update / preload 两条）
+//   [TERM] unsupported <名字>: <原因>     未支持命令的说明（**现在没有命令走这条路了**：最后两条
+//                                        update / preload 在本轮接真；函数保留但无调用者 -> 已删）
 //   [TASK] ps rows=N switches=M          ps/tasks/task/top 打点（任务表真实行数 + 累计切换次数）
 //   [TASK] kill id=N ok                  kill <id> 成功（终端的 kill 只走 task_kill64 真路径）
 //   [APP64] run cmd path=<p> rc=<n>      run <name> 的命令打点（走 app64_launch64 真路径）
 //   [STORE64] cmd <dump|get|set|flush> ...  store 命令打点（走 kernel/store64.cpp 真路径）
 //
-// 【Shell 命令】32 位能实现、且 64 位有对应子系统的**全部**实现；仍未移植的只有 2 条
-//   （update / preload，属于后续批次），它们的提示里有"尚未支持"字样。
-//   本轮刚接真的：hw/hwinfo（hwinfo64 的 CPU/PCI）、lspci/pci（PCI 设备表）、disk/ata（ATA IDENTIFY
+// 【Shell 命令】32 位能实现、且 64 位有对应子系统的**全部**实现；**没有"尚未支持"的命令了**
+//   （批次 A 后半把最后两条桩 update / preload 接成真实现；终端新增 proc 命令管理 proc64 真进程）。
+//   此前的批次已接真：hw/hwinfo（hwinfo64 的 CPU/PCI）、lspci/pci（PCI 设备表）、disk/ata（ATA IDENTIFY
 //   型号/容量 + VimtuFS2 卷几何）、user/userprog（ring3 现状，arg=run 时跑一次用户程序）、
 //   cfg/config（config64 类型化配置 + 落盘位置）、syslog/state/health（sysstate64 状态机/模块/健康/ring log）、
 //   session（session64 会话策略）、restart --soft（优雅停止 + 硬复位链）、panic/bsod（受控蓝屏）。
@@ -80,7 +81,10 @@
 #include "session64.h"   // session：会话/应用内容策略的真实现
 #include "sysstate64.h"  // syslog/state/health：状态机 + 模块表 + 健康 + ring log
 #include "panic64.h"     // panic/bsod：受控蓝屏；ping 期间的看门狗停表
-#include <stdint.h>
+// ---- 批次 A 后半：最后两条"未移植"桩接真 + proc64 真进程 ----
+#include "preload64.h"   // preload：字形/图标预热统计（启动期已跑一轮）
+#include "update64.h"    // update：标记文件 -> 应用 -> store/重启（边界见 update64.h）
+#include "proc64.h"      // proc：proc64 进程表（list / run / kill）
 
 // ==================== 常量 ====================
 #define TERM_MAX_INST    4          // 多开上限（照 32 位；第 5 次只激活最新的）
@@ -264,15 +268,6 @@ static void term_log_cmd(const char* name, bool ok) {
     dbg64_str("[TERM] cmd ");
     dbg64_str((name && name[0]) ? name : "?");
     dbg64_str(ok ? " ok" : " fail");
-    dbg64_nl();
-}
-
-// 未支持命令的日志：<名字> + 具体原因（用英文串，ASCII，方便自动验收 grep）
-static void term_log_unsupported(const char* name, const char* reason) {
-    dbg64_str("[TERM] unsupported ");
-    dbg64_str(name ? name : "?");
-    dbg64_str(": ");
-    dbg64_str(reason ? reason : "subsystem not ported to 64-bit");
     dbg64_nl();
 }
 
@@ -750,9 +745,15 @@ static const char* HELP_EN =
     "  session               session policy (VOLATILE/PERSIST + per-app keep flags, persisted via config64)\n"
     "  disk, hw, lspci       ATA IDENTIFY (model/capacity) + VimtuFS2 volume; CPU/PCI; PCI device list\n"
     "  user [run]            ring3 status (window/VA/gates/on-disk programs); 'user run' launches /hello.vap\n"
-    "  panic <code>, bsod    controlled BSOD: blue screen + serial stop code, halts after 6s (no auto reboot)\n"
-    "Not ported yet (prints a reason):\n"
-    "  update preload\n";
+    "  panic <code>, bsod    controlled BSOD: blue screen + serial stop code, halts after 6s (no auto reboot)\\n"
+    "  update status         update subsystem: version / applied (store) / pending marker + done file\\n"
+    "  update pending <ver>  stage /update.pending (marker text ver=<ver>); applied at next boot\\n"
+    "  update apply          apply the marker now (store + /update.done) then soft-restart; NOT a real upgrade package\\n"
+    "  preload [run]         glyph prewarm + icon pre-scale stats (rdtsc64 first-paint before/after); run = again\\n"
+    "  proc list             proc64 process table (pid/ppid/state/tasks/CR3/name) - real processes with per-process CR3\\n"
+    "  proc run NAME|/PATH   create + start a real proc64 process (built-in: spin -> long-lived /spin.elf)\\n"
+    "  proc kill PID [SIG]   signal a proc64 process (default SIGKILL=9; the task manager process page uses this)\\n"
+    "No 'not supported' commands remain: update/preload were the last two and are real now.\\n";
 
 static const char* HELP_ZH =
     "VimtuOS 64 位 Shell 命令：\n"
@@ -794,19 +795,14 @@ static const char* HELP_ZH =
     "  disk, hw, lspci       ATA IDENTIFY（型号/容量）+ VimtuFS2 卷；CPU/PCI；PCI 设备列表\n"
     "  user [run]            ring3 现状（用户窗口/VA/门/盘上程序）；user run 直接跑 /hello.vap\n"
     "  panic <code>, bsod    受控蓝屏：蓝底白字屏 + 串口停止码，停留 6 秒后停住（不自动重启）\n"
-    "未支持（会说明原因）：\n"
-    "  update preload\n";
-
-// 未支持命令 / 未知命令：打印一行明确说明（不静默失败）
-static bool shell_unsupported(TerminalState* ts, const char* what, const char* en, const char* zh) {
-    ts_puts(ts, what);
-    ts_puts(ts, ": ");
-    ts_puts(ts, gui64_tr(en, zh));
-    ts_putc(ts, (uint32_t)'\n');
-    term_log_unsupported(what, en);
-    return false;
-}
-
+    "  update status         更新子系统：当前版本 / 已应用（store）/ 标记文件与完成文件\\n"
+    "  update pending <ver>  写入 /update.pending（标记文本 ver=<ver>），下次启动时应用\\n"
+    "  update apply          立即应用标记（store + /update.done）并软重启；**不是真正的升级包**\\n"
+    "  preload [run]         字形预热 + 图标预缩放统计（rdtsc64 实测首帧前后 cycles）；run = 再跑一轮\\n"
+    "  proc list             proc64 进程表（pid/ppid/状态/线程数/CR3/名字）—— 每进程独立 CR3 的真进程\\n"
+    "  proc run 名字|/路径   创建并启动一个真 proc64 进程（内置：spin -> 长命 /spin.elf）\\n"
+    "  proc kill PID [SIG]   给 proc64 进程发信号（默认 SIGKILL=9；任务管理器进程页回车走的就是它）\\n"
+    "没有\"未支持\"命令了：最后两条 update / preload 已接真。\\n";
 // ---------- 命令实现 ----------
 static void cmd_help(TerminalState* ts) {
     ts_puts(ts, gui64_lang_zh() ? HELP_ZH : HELP_EN);
@@ -907,7 +903,9 @@ static void task_log_ps(int rows) {
 }
 
 // ps / tasks / task / top：真实任务表一次快照（空槽跳过；没有任务数据就如实写"无任务数据"）
-static void cmd_ps(TerminalState* ts) {
+// arg = "diag" 时额外调用 task64_diag64()（逐槽一行 + 汇总，见 task64.cpp；串口打点
+//   [TASK64] diag slot=... 供人工/脚本核验新增的任务统计 API）。
+static void cmd_ps(TerminalState* ts, const char* arg) {
     ts_puts(ts, gui64_tr("kernel task table (scheduler task64, tick=4ms):\n",
                          "内核任务表（调度器 task64，tick=4ms）：\n"));
     ts_puts(ts, "  id  name            state          ticks  switches\n");
@@ -951,6 +949,11 @@ static void cmd_ps(TerminalState* ts) {
     ts_puts(ts, " switches=");
     ts_put_u64(ts, task_switch_total64());
     ts_putc(ts, (uint32_t)'\n');
+    if (arg && st_eq(arg, "diag")) {
+        ts_puts(ts, gui64_tr("task64 diag: one line per slot on the serial log ([TASK64] diag slot=...)\n",
+                             "task64 诊断：串口每槽一行（[TASK64] diag slot=...）\n"));
+        task64_diag64();
+    }
 }
 
 static void cmd_date(TerminalState* ts) {
@@ -1422,7 +1425,7 @@ static bool cmd_ping(TerminalState* ts, const char* arg) {
 }
 
 // ==================== 本轮接真的命令（hw / lspci / disk / user / cfg / syslog / state / health / session / panic）====================
-// 这些命令原来都是 shell_unsupported 的"尚未支持"桩；现在走各子系统的真 API，输出全是实测值。
+// 这些命令原来都是"尚未支持"的桩；现在走各子系统的真 API，输出全是实测值。
 
 // 屏幕上打 0x + 定长十六进制（digits = 4/8/16）
 static void ts_put_hex(TerminalState* ts, uint64_t v, int digits) {
@@ -1878,6 +1881,341 @@ static void cmd_panic(TerminalState* ts, const char* code) {
     panic64_controlled64(c, 6000);
 }
 
+// ==================== 批次 A 后半：最后两条桩接真（preload / update）+ proc64 真进程 ====================
+
+// ---------- preload：字形/图标预热统计（真值来自 kernel/preload64.cpp；启动期已跑一轮） ----------
+static bool cmd_preload(TerminalState* ts, const char* sub) {
+    if (sub && sub[0] && st_eq(sub, "run")) {
+        const int n = preload64_run64();               // 再跑一轮：第二轮 glyphs_new=0 = 缓存幂等
+        ts_puts(ts, "preload run: new_glyphs=");
+        ts_put_u64(ts, (uint64_t)(n < 0 ? -n : n));
+        ts_putc(ts, (uint32_t)'\n');
+        return true;
+    }
+    char rep[256];
+    preload64_report64(rep, (int)sizeof(rep));
+    ts_puts(ts, "preload (glyph prewarm + icon pre-scale; measured with rdtsc64):\n  ");
+    ts_puts(ts, rep);
+    ts_puts(ts, "\n  first_paint_* = the same real draw (sample text + one desktop icon) before/after prewarm\n");
+    dbg64_line_begin64();
+    dbg64_str("[PRELOAD64] cmd report ");
+    dbg64_str(rep);
+    dbg64_nl();
+    dbg64_line_end64();
+    return true;
+}
+
+// ---------- update：标记文件 -> 应用 -> store/ring log/重启（边界见 kernel/update64.h） ----------
+static bool cmd_update(TerminalState* ts, const char* sub, const char* arg1) {
+    if (!sub || !sub[0] || st_eq(sub, "status")) {
+        char rep[256];
+        update64_report64(rep, (int)sizeof(rep));
+        ts_puts(ts, "update status: ");
+        ts_puts(ts, rep);
+        ts_putc(ts, (uint32_t)'\n');
+        ts_puts(ts, gui64_tr(
+            "  boundary: marker->apply->restart loop only; NOT a real upgrade package (no kernel replacement/diff/signature)\n",
+            "  边界：只是\"标记 -> 应用 -> 重启\"的机制闭环，不是真正的升级包（没有内核替换/差分/签名）\n"));
+        dbg64_line_begin64();
+        dbg64_str("[UPDATE64] cmd status ");
+        dbg64_str(rep);
+        dbg64_nl();
+        dbg64_line_end64();
+        return true;
+    }
+
+    if (st_eq(sub, "pending")) {
+        if (!arg1 || !arg1[0]) {
+            ts_puts(ts, "update pending: usage: update pending <ver>   (e.g. update pending 0.2.0)\n");
+            return false;
+        }
+        const int rc = update64_write_pending64(arg1);
+        if (rc != 0) {
+            ts_puts(ts, "update pending: failed (bad version string or no writable volume; see serial log)\n");
+            return false;
+        }
+        ts_puts(ts, "[UPDATE64] cmd pending ver=");
+        ts_puts(ts, arg1);
+        ts_puts(ts, " path=");
+        ts_puts(ts, update64_pending_path64());
+        ts_puts(ts, " (applies at next boot / on 'update apply')\n");
+        return true;
+    }
+
+    if (st_eq(sub, "apply")) {
+        char pend[96];
+        if (!update64_pending_exists64(pend, (int)sizeof(pend))) {
+            ts_puts(ts, "update apply: no pending marker (/update.pending absent)\n");
+            return true;
+        }
+        ts_puts(ts, "update apply: applying ");
+        ts_puts(ts, update64_pending_path64());
+        ts_puts(ts, " ...\n");
+        if (update64_apply64() != 1) {
+            ts_puts(ts, "update apply: pending marker invalid (kept; see serial log)\n");
+            return false;
+        }
+        ts_puts(ts, "update apply: applied (store + /update.done), restarting to finish ...\n");
+        dbg64_line_begin64();
+        dbg64_str("[UPDATE64] cmd apply -> soft restart\n");
+        dbg64_line_end64();
+        gui64_flip_window(ts->win);
+        sysstate64_soft_restart64();
+    }
+
+    ts_puts(ts, "update: unknown subcommand: ");
+    ts_puts(ts, sub);
+    ts_puts(ts, "\n  try: update status | update pending <ver> | update apply\n");
+    return false;
+}
+
+// ---------- proc：proc64 真进程（list / run / kill）；`proc run spin` 用内嵌的 spin64.elf ----------
+// 为什么终端需要这条命令：启动期多进程演示跑完进程就走了，桌面起来时进程表为空；任务管理器
+//   进程页要显示"真进程"、且要能 kill，需要一个运行期可创建的**长命**进程（spin64.elf 永不退出）。
+extern "C" const uint8_t _binary_build64_spin64_elf_start[];
+extern "C" const uint8_t _binary_build64_spin64_elf_end[];
+
+static int term_install_spin64() {
+    uint32_t t = 0, sz = 0;
+    if (vfs64_stat("/spin.elf", &t, &sz) == 0) return 0;      // 幂等：已装过就跳过
+    const int len = (int)(_binary_build64_spin64_elf_end - _binary_build64_spin64_elf_start);
+    if (len <= 0) return -1;
+    const int rc = vfs64_write("/spin.elf", _binary_build64_spin64_elf_start, len);
+    if (rc < 0) return -1;
+    dbg64_line_begin64();
+    dbg64_str("[TERM] proc install /spin.elf bytes=");
+    dbg64_dec((uint64_t)len);
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+
+// 为什么需要（真缺陷现场，见本文件的 retry 逻辑）：usermode64.cpp 的 in_ring3 位是**按任务槽位**
+//   的位图；一个 ring3 进程被 kill（SIGTERM/SIGKILL）时它不会从 user64_enter_frame64 正常返回，
+//   那一槽的位就永远留着 —— 下一个任务复用该槽时 [USER64] enter FAILED reason=2。
+//   本批次允许改的文件不含 usermode64.cpp，所以这里用"占住脏槽再重试"的方式绕过（并在报告里如实
+//   列出该缺陷与建议修法：回收任务时清掉该任务的 in_ring3 位）。
+static void term_spinpad_entry(void* arg) {
+    (void)arg;
+    for (;;) task_yield64();
+}
+
+// pid 当前的状态（-1 = 进程表里没有/已收尸；否则 Proc64State 值）
+static int term_proc_state64(int pid) {
+    for (int i = 0; i < PROC64_MAX; i++) {
+        Proc64Info in;
+        if (proc64_info64(i, &in) == 0) continue;
+        if ((int)in.pid == pid) return (int)in.state;
+    }
+    return -1;
+}
+
+// pid 对应的任务 id（0 = 没有这个进程/没有任务）——"任务是否活过第一次调度"靠它查任务表
+static uint32_t term_proc_task_id64(int pid) {
+    for (int i = 0; i < PROC64_MAX; i++) {
+        Proc64Info in;
+        if (proc64_info64(i, &in) == 0) continue;
+        if ((int)in.pid == pid) return in.task_id;
+    }
+    return 0;
+}
+
+// 任务 id 当前的状态（-1 = 任务表里找不到 = 已被回收）；值 = Task64State
+static int term_task_state64(uint32_t task_id) {
+    if (task_id == 0) return -1;
+    for (int i = 0; i < TASK64_MAX; i++) {
+        Task64Info in;
+        if (task_info64(i, &in) == 0) continue;
+        if (in.id == task_id) return (int)in.state;
+    }
+    return -1;
+}
+
+
+static const char* term_proc_state_text(uint32_t st) {
+    switch (st) {
+        case PROC64_READY:   return "ready";
+        case PROC64_RUNNING: return "running";
+        case PROC64_SLEEP:   return "sleep";
+        case PROC64_EXITED:  return "exited";
+        default:             return "unknown";
+    }
+}
+
+static bool cmd_proc(TerminalState* ts, const char* sub, const char* arg1, const char* arg2) {
+    if (!sub || !sub[0] || st_eq(sub, "list") || st_eq(sub, "ps")) {
+        ts_puts(ts, gui64_tr("proc64 process table (per-process CR3):\n",
+                             "proc64 进程表（每进程独立 CR3）：\n"));
+        ts_puts(ts, "  pid  ppid state     tasks  cr3               name\n");
+        int rows = 0;
+        for (int i = 0; i < PROC64_MAX; i++) {
+            Proc64Info in;
+            if (proc64_info64(i, &in) == 0) continue;
+            ts_puts(ts, "  ");
+            ts_put_u64_right(ts, (uint64_t)in.pid, 3);
+            ts_puts(ts, "  ");
+            ts_put_u64_right(ts, (uint64_t)in.ppid, 3);
+            ts_puts(ts, "  ");
+            ts_puts_pad(ts, term_proc_state_text(in.state), 8);
+            ts_put_u64_right(ts, (uint64_t)task64_proc_threads64(in.task_id), 5);
+            ts_puts(ts, "  ");
+            ts_put_hex(ts, in.cr3, 16);
+            ts_puts(ts, "  ");
+            ts_puts(ts, in.name);
+            ts_puts(ts, "\n");
+            rows++;
+        }
+        if (rows == 0) ts_puts(ts, gui64_tr("  no process data (use 'proc run spin')\n",
+                                            "  无进程数据（可敲 proc run spin）\n"));
+        dbg64_line_begin64();
+        dbg64_str("[PROC64] cmd list rows=");
+        dbg64_dec((uint64_t)rows);
+        dbg64_str(" total=");
+        dbg64_dec((uint64_t)proc64_count64());
+        dbg64_nl();
+        dbg64_line_end64();
+        return true;
+    }
+
+    if (st_eq(sub, "run")) {
+        if (!arg1 || !arg1[0]) {
+            ts_puts(ts, "proc run: usage: proc run <name|/path>   (built-in: spin -> /spin.elf)\n");
+            return false;
+        }
+        char path[PROC64_PATH_MAX];
+        int pl = 0;
+        const char* nm = arg1;
+        if (st_eq(arg1, "spin") || st_eq(arg1, "/spin.elf")) {
+            if (term_install_spin64() != 0) {
+                ts_puts(ts, "proc run: cannot install /spin.elf (no VimtuFS2 volume?)\n");
+                return false;
+            }
+            nm = "spin";
+            const char* p = "/spin.elf";
+            for (int i = 0; p[i] && pl < (int)sizeof(path) - 1; i++) path[pl++] = p[i];
+        } else {
+            if (arg1[0] != '/') path[pl++] = '/';
+            for (int i = 0; arg1[i] && pl < (int)sizeof(path) - 1; i++) path[pl++] = arg1[i];
+        }
+        path[pl] = 0;
+        char name[PROC64_NAME_MAX];
+        int nn = 0;
+        for (int i = 0; nm[i] && nm[i] != '/' && nn < PROC64_NAME_MAX - 1; i++) name[nn++] = nm[i];
+        name[nn] = 0;
+        if (nn == 0) { name[0] = 'p'; name[1] = 0; }
+
+        // 创建 + 启动；对内置长命程序（spin）加"脏槽位重试"（见 term_spinpad_entry 的说明）：
+        //   spin 正常会一直活着；若它复用了被 kill 的 ring3 进程遗留的**脏槽**，任务会在
+        //   user64_enter_frame64 上 reason=2 失败并立刻退出（任务变 DEAD/被回收、进程 EXITED）。
+        // 成功判据 = **任务的状态**已越过"第一次被调度"——RUNNING/SLEEP 说明它已经进了 ring3；
+        //   只看进程 state 不行（nanosleep 不会把进程 state 置成 SLEEP，一直显示 RUNNING），
+        //   只看"没死"也不行（可能还是 READY，下一秒才失败）。
+        // 整个等待过程暂停 GUI 看门狗（最多 4 轮 × ~400ms），否则 task 0 被占住会触发
+        //   watchdog fire（实测踩过：panic WATCHDOG_TIMEOUT）。
+        const bool expect_alive = st_eq(arg1, "spin") || st_eq(arg1, "/spin.elf");
+        int pid = -1;
+        if (expect_alive) panic64_watchdog_pause64();
+        for (int attempt = 0; attempt < 4; attempt++) {
+            if (attempt > 0) {
+                const int pad = task_create64("spinpad", term_spinpad_entry, nullptr);
+                dbg64_line_begin64();
+                dbg64_str("[TERM] proc retry attempt=");
+                dbg64_dec((uint64_t)attempt);
+                dbg64_str(" pad_id=");
+                dbg64_dec((uint64_t)(pad < 0 ? 0 : pad));
+                dbg64_str(" (occupy stale in_ring3 slot)\n");
+                dbg64_line_end64();
+            }
+            pid = proc64_create64(name, 0);
+            if (pid < 0) {
+                if (expect_alive) panic64_watchdog_unpause64();
+                ts_puts(ts, gui64_tr("proc run: create failed (shared address space mode / no slot / no pages)\n",
+                                     "proc run: 建进程失败（共享地址空间模式 / 槽满 / 页不足）\n"));
+                return false;
+            }
+            const int rc = proc64_start_elf64(pid, path);
+            if (rc != 0) {
+                proc64_destroy64(pid);
+                if (expect_alive) panic64_watchdog_unpause64();
+                ts_puts(ts, "proc run: start failed (see serial log)\n");
+                return false;
+            }
+            if (!expect_alive) break;                 // 普通程序可能秒退：不做存活检查
+            const uint32_t tid = term_proc_task_id64(pid);
+            int reached = 0;
+            for (int k = 0; k < 40; k++) {            // 最多 40 × 10ms = 400ms
+                task_sleep64(10);
+                const int pst = term_proc_state64(pid);
+                const int tst = term_task_state64(tid);
+                if (pst < 0 || pst == PROC64_EXITED) break;                 // 进程已退出：失败
+                if (tst < 0 || tst == TASK64_DEAD) break;                   // 任务已死：入口失败
+                if (tst == TASK64_RUNNING || tst == TASK64_SLEEP) {
+                    // 越过第一次调度后再确认一次（排除"刚好采样在失败入口的微秒窗口里"）
+                    task_sleep64(5);
+                    const int pst2 = term_proc_state64(pid);
+                    const int tst2 = term_task_state64(tid);
+                    if (pst2 == PROC64_EXITED || tst2 < 0 || tst2 == TASK64_DEAD) break;
+                    reached = 1;
+                    break;
+                }
+                // READY：还没被调度到，继续等
+            }
+            if (reached) break;                       // 成功：任务已经真的跑在 ring3 里
+            dbg64_line_begin64();
+            dbg64_str("[TERM] proc run spin died early pid=");
+            dbg64_dec((uint64_t)pid);
+            dbg64_str(" tid=");
+            dbg64_dec((uint64_t)tid);
+            dbg64_str(" -> retry\n");
+            dbg64_line_end64();
+            proc64_destroy64(pid);                    // 收尸：让下一轮拿干净槽
+            pid = -1;
+        }
+        if (expect_alive) panic64_watchdog_unpause64();
+        if (pid < 0) {
+            ts_puts(ts, "proc run: process keeps dying early (see [USER64] enter FAILED in serial log)\n");
+            return false;
+        }
+        ts_puts(ts, "[TERM] proc run path=");
+        ts_puts(ts, path);
+        ts_puts(ts, " pid=");
+        ts_put_u64(ts, (uint64_t)pid);
+        ts_puts(ts, " (real proc64 process: own CR3 + own task)\n");
+        dbg64_line_begin64();
+        dbg64_str("[TERM] proc run path=");
+        dbg64_str(path);
+        dbg64_str(" pid=");
+        dbg64_dec((uint64_t)pid);
+        dbg64_str(" rc=0\n");
+        dbg64_line_end64();
+        return true;
+    }
+
+    if (st_eq(sub, "kill")) {
+        const int pid = parse_dec(arg1 ? arg1 : "");
+        int sig = parse_dec(arg2 ? arg2 : "");
+        if (sig < 0) sig = 9;
+        if (pid < 0) {
+            ts_puts(ts, "proc kill: usage: proc kill <pid> [sig]   (pid from 'proc list')\n");
+            return false;
+        }
+        const int64_t rc = proc64_kill64(pid, sig);
+        ts_puts(ts, "[PROC64] cmd kill pid=");
+        ts_put_u64(ts, (uint64_t)pid);
+        ts_puts(ts, " sig=");
+        ts_put_u64(ts, (uint64_t)sig);
+        ts_puts(ts, " rc=");
+        ts_put_i64(ts, rc);
+        ts_putc(ts, (uint32_t)'\n');
+        return rc == 0;
+    }
+
+    ts_puts(ts, "proc: unknown subcommand: ");
+    ts_puts(ts, sub);
+    ts_puts(ts, "\n  try: proc list | proc run <name|/path> | proc kill <pid> [sig]\n");
+    return false;
+}
+
 static void cmd_about(TerminalState* ts) {
     ts_puts(ts,
         "VimtuOS 0.1.0 (VimtuOS 64-bit)\n"
@@ -1891,11 +2229,13 @@ static void cmd_about(TerminalState* ts) {
     ts_puts(ts, gui64_tr("  - sysstate64: state machine + module registry + health + 64-line ring log (syslog)\n"
                          "  - config64/session64: typed config + session policy, persisted to VimtuFS2 /store.a|b\n"
                          "  - panic64: blue screen (panic/bsod) + watchdog on the gui64 frame heartbeat\n"
-                         "  - still not ported: 'update', 'preload' (kept as honest stubs)\n",
+                         "  - batch A2: task64 stats/critical/slice/force-remove+diag, preload64 (glyph+icon prewarm),\n"
+                         "    update64 (marker->apply->restart loop; NOT a real upgrade package), proc64 process page in the task manager\n",
                          "  - sysstate64：状态机 + 模块注册表 + 健康报告 + 64 条 ring log（syslog）\n"
                          "  - config64/session64：类型化配置 + 会话策略，持久化在 VimtuFS2 的 /store.a|b\n"
                          "  - panic64：蓝屏（panic/bsod）+ 看门狗（心跳源 = gui64 帧）\n"
-                         "  - 仍未移植：update、preload（保留为如实桩）\n"));
+                         "  - 批次 A 后半：task64 统计/关键任务/时间片/强制移除+诊断、preload64（字形+图标预热）、\n"
+                         "    update64（标记->应用->重启闭环；不是真正的升级包）、任务管理器进程页接 proc64 真进程\n"));
 }
 
 static void cmd_clear(TerminalState* ts) {
@@ -1928,7 +2268,7 @@ static void shell_exec(TerminalState* ts, const char* line) {
     } else if (st_eq(g_cmd, "mem") || st_eq(g_cmd, "meminfo")) {
         cmd_mem(ts);
     } else if (st_eq(g_cmd, "ps")) {
-        cmd_ps(ts);
+        cmd_ps(ts, g_arg1);
     } else if (st_eq(g_cmd, "date")) {
         cmd_date(ts);
     } else if (st_eq(g_cmd, "time")) {
@@ -2069,7 +2409,7 @@ static void shell_exec(TerminalState* ts, const char* line) {
             ok = (rc == 0);
         }
     } else if (st_eq(g_cmd, "task") || st_eq(g_cmd, "tasks") || st_eq(g_cmd, "top")) {
-        cmd_ps(ts);          // 与 ps 同一份真实快照（top 不做全屏刷新，只打一次）
+        cmd_ps(ts, g_arg1);  // 与 ps 同一份真实快照（top 不做全屏刷新，只打一次）
     } else if (st_eq(g_cmd, "syslog")) {
         // 真：sysstate64 的 ring log（固定 64 条循环日志）
         cmd_syslog(ts);
@@ -2083,10 +2423,8 @@ static void shell_exec(TerminalState* ts, const char* line) {
         // 真：会话策略（session64；keep 与策略落在 config64/store64）
         ok = cmd_session(ts, g_arg1, g_arg2, args2);
     } else if (st_eq(g_cmd, "update")) {
-        // ★ 仍未移植（后续批次）：如实说明，不静默失败
-        ok = shell_unsupported(ts, g_cmd,
-                               "not supported yet (update/persistence subsystem not ported to 64-bit)",
-                               "尚未支持（更新/持久化子系统未移植到 64 位）");
+        // 真：update 子系统（kernel/update64.cpp）—— status / pending <ver> / apply
+        ok = cmd_update(ts, g_arg1, g_arg2);
     } else if (st_eq(g_cmd, "store")) {
         // 真：设置持久化 store（kernel/store64.cpp）。载体优先 VimtuFS2 的 /store.a、/store.b，
         // 没有可用卷时才退回裸盘槽区（那条路会打重叠 WARN）。
@@ -2107,10 +2445,11 @@ static void shell_exec(TerminalState* ts, const char* line) {
         // 真：ring3 现状（用户窗口地址/页映射/盘上的 ring3 程序）；`user run` 直接跑一次用户程序
         ok = cmd_user(ts, g_arg1);
     } else if (st_eq(g_cmd, "preload")) {
-        // ★ 仍未移植（后续批次）：如实说明
-        ok = shell_unsupported(ts, g_cmd,
-                               "not supported yet (preload subsystem not ported to 64-bit)",
-                               "尚未支持（预加载子系统未移植到 64 位）");
+        // 真：预热统计（kernel/preload64.cpp；启动期已跑过，`preload run` 可再跑一轮验证幂等）
+        ok = cmd_preload(ts, g_arg1);
+    } else if (st_eq(g_cmd, "proc")) {
+        // 真：proc64 进程表（list / run / kill）；`proc run spin` 跑内嵌的长命程序 /spin.elf
+        ok = cmd_proc(ts, g_arg1, g_arg2, args2);
     } else if (st_eq(g_cmd, "bsod") || st_eq(g_cmd, "panic")) {
         // 真：受控蓝屏（kernel/panic64.cpp）。先打命令日志，再进 BSOD（不返回）
         term_log_cmd(g_cmd, true);

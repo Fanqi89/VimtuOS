@@ -83,7 +83,32 @@ int         task_selftest64();                            // 位掩码自检，0
 //   实现只把目标置为 DEAD 并挂进待回收队列：真正的 kfree 由某个任务的
 //   task_yield64() 完成（不能在中断里动内核堆，见文件头约束 3）。
 int task_kill64(uint32_t id);
-
+// ==================== 任务统计 / 关键任务（批次 A 后半：从 32 位 task.cpp 搬语义）====================
+// 与 32 位 kernel/task.cpp 的对应关系：
+//   task64_cpu_permille64      <- task_sample_cpu + task_cpu_pct（口径见 task64.cpp 的注释）
+//   task64_find_by_name64      <- task_find_by_name（64 位返回**任务 id**，不是槽位下标：
+//                                 64 位的 id 才是对外句柄 —— task_kill64/task_info64 都吃 id）
+//   task64_mark_critical64     <- task_mark_critical（关键任务在 task_kill64 里被拒绝并打点）
+//   task64_set_slice64         <- task_set_slice（每任务时间片；默认值仍是 TASK64_SLICE_TICKS）
+//   task64_force_remove64      <- task_force_remove（硬清理；护栏更严：idle/当前/已 DEAD 一律拒绝）
+//   task64_diag64              <- 32 位 task_diag_log 的逐槽版本（一行一个槽，供终端/测试读）
+//
+// CPU 千分比口径（★ 与 32 位的差别必须说明）：
+//   采样窗口 = 1 秒（PIT_HZ_64 个 tick），懒采样（第一次查询时若窗口已过就重算）。
+//   分子 = 该任务 ticks 增量 / 2 —— 调度器**每个 tick 给当前任务记 2**（既有记账，
+//         见 schedule64 的 c->ticks++ 两次），所以除以 2 才是"真实 tick 数"；
+//   分母 = 系统 tick 增量（g_ticks64，250Hz）。
+//   满载单任务读到 1000‰（单核）；所有任务之和可以超过 1000‰（含内核线程），不做归一化。
+uint32_t task64_cpu_permille64(uint32_t id);            // 千分比（0..1000）；无此 id 返回 0
+int  task64_set_slice64(uint32_t id, uint32_t ticks);   // 每任务时间片（1..100 tick）；0 / -1
+int  task64_find_by_name64(const char* name);           // 返回任务 id（只扫非 FREE 槽）；-1 = 找不到
+int  task64_force_remove64(uint32_t id);                // 强制摘除+回收；见实现里的返回码注释
+int  task64_mark_critical64(uint32_t id, int critical); // 0 = 已设置；-1 = 无此 id
+void task64_diag64();                                   // 打印任务表诊断（一行一个槽 + 汇总）
+// 进程（proc64）视角的两个只读统计：以"该进程主任务绑定的 proc 指针"为键。
+//   用途 = 任务管理器进程页的线程数 / CPU‰；没有 proc 的内核线程返回 0。
+int      task64_proc_threads64(uint32_t main_task_id);        // 任务表里绑定到同一进程的任务数
+uint32_t task64_proc_cpu_permille64(uint32_t main_task_id);   // 这些任务的 CPU‰ 之和（截断 1000）
 // ==================== 每进程地址空间（批次 C：进程级 CR3 / FS 基址）====================
 // 为什么在这里、为什么只有这几个函数（最小改动的理由）：
 //   任务的"上下文"除了中断帧之外还多了两样**全局**的东西要在切换时装载：

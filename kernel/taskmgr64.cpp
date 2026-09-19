@@ -17,10 +17,11 @@
 //       - 启动页：启动项与 store64 持久化的接线未做（store64 模块本体已可用）→ 三个启动项
 //               固定显示"已启用"，不提供假开关；提示行说明"只在本会话生效 / 需要接线"。
 //       - 性能页硬件详情：只显示内核自己实测得到的计数器（hwinfo64.cpp 的 CPU/PCI 详情未接进本页）。
-//   * "进程页"的行 = **内核任务表**（task64 调度器的 TCB），不是窗口列表：
-//       任务/状态/tick/切换数/CPU‰ ：task_info64() / task_count64() / task_switch_total64()
-//       CPU% 口径     ：该任务 ticks / 系统 tick 总数（g_ticks64）× 100（一位小数，见提示行）
-//       结束任务      ：task_kill64(id)（idle 与当前任务不可终止，规则在调度器里）
+//   * "进程页"的行 = **真进程**（proc64 进程表，每进程独立 CR3），不是窗口列表：
+//       pid/ppid/名字/状态/CR3 ：proc64_info64()（PROC64_MAX 个槽，空槽跳过；cr3 是进程页表根）
+//       线程数 / CPU‰          ：task64_proc_threads64() / task64_proc_cpu_permille64()
+//                                （以该进程主任务绑定的 proc 指针为键统计任务表；tick=4ms）
+//       结束进程               ：proc64_kill64(pid, SIGKILL=9)（规则在 proc64.cpp：idle/当前进程不可杀）
 //     窗口仍然只用于状态栏的窗口计数与性能页（窗口不是进程）。
 //
 // 多实例：每实例状态在 Window::userdata（kmalloc_64 + MEM_OWNER_TMGR_64 记账）。
@@ -54,8 +55,9 @@
 #include "font.h"
 #include "input.h"
 #include "x86_64.h"
-#include "task64.h"     // 任务表快照（Task64Info / TASK64_*）
-#include "debug64.h"
+#include "task64.h"     // 任务表快照 + 进程视角统计（task64_proc_threads64 / _cpu_permille64）
+#include "proc64.h"     // 进程表快照（Proc64Info / PROC64_MAX / proc64_kill64）—— 进程页的真数据源
+#include "debug64.h"     // 串口打点（[UI] tmgr / [APP] tmgr 行）
 #include "edid64.h"     // 显示器 EDID（刷新率来自这里；只读，不改 fb 状态）
 #include "config64.h"   // 本轮接线：启动页的开关 = config64 的 startup.*（落到 store64 持久化）
 
@@ -124,6 +126,8 @@ struct TmState {
     uint32_t refresh_tick;         // 250ms 刷新节流
     uint32_t sample_sec;           // 上次 1Hz 曲线采样的秒数
     uint32_t last_log_tick;        // 诊断日志节流
+    uint32_t proc_log_tick;        // 进程页行日志节流（[UI] tmgr proc rows / row 两类行）
+    int      proc_rows_logged;     // 上次行日志里的行数（变行数时立即补一条）
     uint32_t curve[TM_CURVE_N];    // CPU 忙占比曲线（1Hz）
     uint32_t curve_mem[TM_CURVE_N];// 页池占用率曲线（1Hz）
     int      curve_n;
@@ -140,17 +144,19 @@ static TmSlot   g_slots[TM_MAX_INST + 2];
 static Window*  g_last_win = nullptr;     // 最近打开/激活的实例（使用前必须自检）
 static bool     g_log_once = false;       // 诊断日志：首次立即打一条
 
-// 进程页行表（数据源 = 内核任务表 task64；静态临时缓冲：内核单线程，
+// 进程页行表（数据源 = proc64 进程表；静态临时缓冲：内核单线程，
 // 同一时刻只有一个窗口在 draw/click，无需加锁）
 struct TmRow {
-    uint32_t id;                 // Task64Info.id（task_kill64 的目标）
-    uint32_t slot;               // 任务表槽位下标（诊断日志用）
-    uint8_t  state;              // Task64State：READY/RUNNING/SLEEP/DEAD
-    uint8_t  is_current;         // Task64Info.is_current
-    uint32_t cpu_permille;       // CPU‰ = ticks*1000 / 系统 tick（显示时取一位小数）
-    uint64_t ticks;              // 累计运行 tick（4ms/tick）
-    uint64_t switches;           // 被切入次数
-    char     name[TASK64_NAME_MAX];   // 任务名（ASCII）
+    uint32_t id;                 // 进程 pid（proc64_kill64 的目标）
+    uint32_t ppid;               // 父进程 pid
+    uint32_t slot;               // 进程表槽位下标（诊断日志用）
+    uint8_t  state;              // Proc64State：READY/RUNNING/SLEEP/EXITED
+    uint8_t  is_current;         // Proc64Info.is_current
+    uint32_t threads;            // 该进程的任务数（task64_proc_threads64 真值）
+    uint32_t cpu_permille;       // CPU‰（task64_proc_cpu_permille64，1 秒采样窗口）
+    uint64_t cr3;                // 进程页表根（hex 显示）
+    uint64_t pages;              // 用户页数（Proc64Info.pages）
+    char     name[PROC64_NAME_MAX];   // 进程名（ASCII）
 };
 static TmRow g_rows[TM_MAX_ROWS];
 static int   g_row_n = 0;   // 最近一次构造的行数（诊断用，绘制/点击都靠它对齐）
@@ -374,44 +380,56 @@ static void tm_mouse_client(Window* w, int* cx, int* cy) {
 }
 
 // ---------------- 日志（自动验收靠这些行） ----------------
+// ★ 全部走行锁：本文件的绘制/点击里可能被 PIT 抢占，别的任务（如 task64 的回收日志，
+//   它自己是带锁的）会把一行从中间插断 —— 实测被插断过 "[UI] tmgr page proc" 与
+//   "[UI] tmgr kill proc ... rc=0"，导致验收脚本假失败。行锁是 begin/end 配对的（可重入）。
 static void tm_log_app(const char* what) {
+    dbg64_line_begin64();
     dbg64_str("[APP] tmgr ");
     dbg64_str(what);
     dbg64_nl();
+    dbg64_line_end64();
 }
 
 static void tm_log_page(const char* key) {
+    dbg64_line_begin64();
     dbg64_str("[UI] tmgr page ");
     dbg64_str(key);
     dbg64_nl();
+    dbg64_line_end64();
 }
 
 static void tm_log_layout(int cw, int ch) {
+    dbg64_line_begin64();
     dbg64_str("[UI] tmgr layout client=");
     dbg64_dec((uint64_t)cw);
     dbg64_str("x");
     dbg64_dec((uint64_t)ch);
     dbg64_nl();
+    dbg64_line_end64();
 }
 
-// 结束任务（进程页 = 内核任务，所以打 id/slot/名字 + 调度器返回码）
-static void tm_log_kill_task(const TmRow* r, int rc) {
-    dbg64_str("[UI] tmgr kill task=");
+// 结束进程（进程页 = proc64 真进程，所以打 pid/名字 + proc64_kill64 返回码）
+static void tm_log_kill_proc(const TmRow* r, int64_t rc) {
+    dbg64_line_begin64();
+    dbg64_str("[UI] tmgr kill proc pid=");
     dbg64_dec((uint64_t)(r ? r->id : 0));
-    dbg64_str(" slot=");
-    dbg64_dec((uint64_t)(r ? r->slot : 0));
     dbg64_str(" name=");
     dbg64_str((r && r->name[0]) ? r->name : "?");
-    dbg64_str(" rc=");
-    dbg64_dec((uint64_t)(rc == 0 ? 0 : 1));
+    dbg64_str(" sig=9 rc=");
+    if (rc < 0) dbg64_putc('-');
+    dbg64_dec((uint64_t)(rc < 0 ? -rc : rc));
     dbg64_nl();
+    dbg64_line_end64();
 }
 
 static void tm_log_str(const char* tag, const char* body) {
+    dbg64_line_begin64();
     dbg64_str("[UI] tmgr ");
     dbg64_str(tag);
     if (body) dbg64_str(body);
     dbg64_nl();
+    dbg64_line_end64();
 }
 
 // ---------------- 实例状态访问 / 回收 ----------------
@@ -521,13 +539,13 @@ static void tm_clear_notice(TmState* st) {
 }
 
 // ---------------- 真实数据读取 ----------------
-// 任务状态文案：与 task64.h 的 Task64State 一一对应（真值，不猜）
-static const char* tm_task_state_text(uint8_t state) {
+// 进程状态文案：与 proc64.h 的 Proc64State 一一对应（真值，不猜）
+static const char* tm_proc_state_text(uint8_t state) {
     switch (state) {
-        case TASK64_READY:   return T("Ready", "就绪");
-        case TASK64_RUNNING: return T("Running", "运行");
-        case TASK64_SLEEP:   return T("Sleeping", "睡眠");
-        case TASK64_DEAD:    return T("Dead", "已结束");
+        case PROC64_READY:   return T("Ready", "就绪");
+        case PROC64_RUNNING: return T("Running", "运行");
+        case PROC64_SLEEP:   return T("Sleeping", "睡眠");
+        case PROC64_EXITED:  return T("Exited", "已退出");
         default:             return T("Unknown", "未知");
     }
 }
@@ -551,26 +569,23 @@ static int tm_heap_used_pct() {
     return (int)pct;
 }
 
-// 进程页行表：每行 = 一个**真实任务**（内核任务表槽位 0..TASK64_MAX-1，空槽按 task_info64()==0 跳过）
+// 进程页行表：每行 = 一个**真实进程**（proc64 进程表槽位 0..PROC64_MAX-1，空槽按 proc64_info64()==0 跳过）
+// 线程数 / CPU‰ 走 task64 的进程视角统计（以该进程主任务绑定的 proc 指针为键）。
 static int tm_build_rows(int max) {
     int n = 0;
-    const uint64_t sys_ticks = (uint64_t)g_ticks64;   // 系统 tick 总数（CPU% 的分母）
-    for (int i = 0; i < TASK64_MAX && n < max && n < TM_MAX_ROWS; i++) {
-        Task64Info in;
-        if (task_info64(i, &in) == 0) continue;       // 空槽：跳过，不造行
+    for (int i = 0; i < PROC64_MAX && n < max && n < TM_MAX_ROWS; i++) {
+        Proc64Info in;
+        if (proc64_info64(i, &in) == 0) continue;     // 空槽：跳过，不造行
         TmRow* r = &g_rows[n];
         r->slot = (uint32_t)i;
-        r->id = in.id;
+        r->id = in.pid;
+        r->ppid = in.ppid;
         r->state = (uint8_t)in.state;
         r->is_current = (uint8_t)in.is_current;
-        r->ticks = in.ticks;
-        r->switches = in.switches;
-        r->cpu_permille = 0;
-        if (sys_ticks > 0) {
-            uint64_t pm = (in.ticks * 1000ull) / sys_ticks;   // 千分数：一位小数由 tm_pct1_str 出
-            if (pm > 1000ull) pm = 1000ull;                   // 单个任务不会超过 100.0%
-            r->cpu_permille = (uint32_t)pm;
-        }
+        r->cr3 = in.cr3;
+        r->pages = in.pages;
+        r->threads = (uint32_t)task64_proc_threads64(in.task_id);
+        r->cpu_permille = task64_proc_cpu_permille64(in.task_id);
         tm_strlcpy(r->name, in.name, (int)sizeof(r->name));
         n++;
     }
@@ -812,8 +827,8 @@ static int tm_fields_cpu(TmState* st, TmField* out, int max) {
     }
     if (n < max) {
         tm_field_set(&out[n], T("Note", "说明"),
-                     T("no per-CPU accounting: task64 scheduler not linked",
-                       "无按 CPU 核的统计：task64 调度器未编入本内核"));
+                     T("per-task CPU accounting comes from task64 ticks; the process page uses the proc64 table",
+                       "按任务的 CPU 统计来自 task64 的 tick 累计；进程页的数据源是 proc64 进程表"));
         n++;
     }
     return n;
@@ -1195,7 +1210,7 @@ static void tm_draw_status(Window* w, TmState* st) {
 
     char buf[128];
     char nb[16];
-    tm_stpcpy(buf, T("Processes: ", "进程数: "));
+    tm_stpcpy(buf, T("Windows: ", "窗口数: "));
     tm_itoa(nb, gui64_window_count());
     tm_stpcat(buf, nb);
     tm_stpcat(buf, "    CPU: ");
@@ -1259,29 +1274,38 @@ static void tm_draw_row(Window* w, const TmRow* r, int row_i, int row_y, bool se
     int ty = Y + row_y + (TM_ROW_H - font_line_height()) / 2;
     char nb[24];
 
-    // 任务名（"*" = 当前任务，提示行有说明）
-    char name[TASK64_NAME_MAX + 2];              // 名字 + "*" 前缀 + 结尾
+    // 进程名（"*" = 当前进程，提示行有说明）
+    char name[PROC64_NAME_MAX + 2];              // 名字 + "*" 前缀 + 结尾
     tm_stpcpy(name, r->is_current ? "*" : "");
     tm_stpcat(name, r->name);
     tm_text_clip(X + tm_col_name_x(), ty, name, TM_COL_TEXT, id_right - tm_col_name_x() - 6);
 
-    // id（右对齐）
+    // pid（右对齐）
     tm_utoa64(nb, (uint64_t)r->id);
     tm_text_right(X + id_right, ty, nb, TM_COL_TEXT_DIM);
 
-    // 状态（就绪/运行/睡眠/已结束，值来自 Task64Info.state）
-    tm_text_clip(X + state_x, ty, tm_task_state_text(r->state), TM_COL_TEXT_DIM,
-                 tm_col_ticks_x(w) - state_x - 6);
+    // 状态 + ppid（值来自 Proc64Info；状态文案一一对应 Proc64State）
+    {
+        char sb[48];
+        tm_stpcpy(sb, tm_proc_state_text(r->state));
+        tm_stpcat(sb, " ppid=");
+        tm_utoa64(nb, (uint64_t)r->ppid);
+        tm_stpcat(sb, nb);
+        tm_text_clip(X + state_x, ty, sb, TM_COL_TEXT_DIM, tm_col_ticks_x(w) - state_x - 6);
+    }
 
-    // 累计运行 tick（右对齐；4ms/tick）
-    tm_utoa64(nb, r->ticks);
-    tm_text_right(X + ticks_right, ty, nb, TM_COL_TEXT);
+    // CR3（右对齐；进程页表根，hex —— `proc list` 里同一列）
+    {
+        char hb[24];
+        tm_hex_str(hb, r->cr3);
+        tm_text_right(X + ticks_right, ty, hb, TM_COL_TEXT);
+    }
 
-    // 被切入次数（右对齐）
-    tm_utoa64(nb, r->switches);
+    // 线程数（右对齐；= 该进程在任务表里的任务数，4ms/tick 的调度器真值）
+    tm_utoa64(nb, (uint64_t)r->threads);
     tm_text_right(X + sw_right, ty, nb, TM_COL_TEXT);
 
-    // CPU%：热力单元格；口径 = 任务 ticks / 系统 tick（g_ticks64），见提示行
+    // CPU%：热力单元格；口径 = 该进程全部任务的 CPU 时间 / 系统 tick（1 秒采样窗口），见提示行
     fb_fill_rect(X + cpu_x, Y + row_y + 2, cpu_w, TM_ROW_H - 4,
                  tm_cpu_heat((int)(r->cpu_permille / 10u)));
     tm_pct1_str(nb, r->cpu_permille);
@@ -1307,11 +1331,50 @@ static void tm_rows_scroll_fix(Window* w, TmState* st, int n) {
 static void tm_draw_proc(Window* w, TmState* st) {
     int X = w->client_x, Y = w->client_y;
     int cw = w->client_w;
-    int n = tm_build_rows(TM_MAX_ROWS);          // 行数据源 = 内核任务表（task64）
-    int total = task_count64();                  // 真实任务数（含 idle）
+    int n = tm_build_rows(TM_MAX_ROWS);          // 行数据源 = proc64 进程表（每进程独立 CR3）
+    int total = proc64_count64();                // 真实进程数（proc64 自己的计数）
     if (n > 0 && st->sel_row >= n) st->sel_row = n - 1;
     if (n == 0) st->sel_row = -1;
     tm_rows_scroll_fix(w, st, n);
+
+    // 新增打点（自动验收 grep）：[UI] tmgr proc rows=N + 每行内容；2 秒节流，行数变化立即补一条。
+    {
+        const uint32_t now = ticks64();
+        if (st->proc_rows_logged != n ||
+            (uint32_t)(now - st->proc_log_tick) >= ms_to_ticks64(TM_LOG_MS)) {
+            st->proc_rows_logged = n;
+            st->proc_log_tick = now;
+            dbg64_line_begin64();
+            dbg64_str("[UI] tmgr proc rows=");
+            dbg64_dec((uint64_t)n);
+            dbg64_str(" total=");
+            dbg64_dec((uint64_t)total);
+            dbg64_nl();
+            dbg64_line_end64();
+            for (int i = 0; i < n; i++) {
+                const TmRow* r = &g_rows[i];
+                dbg64_line_begin64();
+                dbg64_str("[UI] tmgr proc row pid=");
+                dbg64_dec((uint64_t)r->id);
+                dbg64_str(" ppid=");
+                dbg64_dec((uint64_t)r->ppid);
+                dbg64_str(" name=");
+                dbg64_str(r->name);
+                dbg64_str(" state=");
+                dbg64_dec((uint64_t)r->state);
+                dbg64_str(" cr3=0x");
+                dbg64_hex64(r->cr3);
+                dbg64_str(" threads=");
+                dbg64_dec((uint64_t)r->threads);
+                dbg64_str(" cpu_permille=");
+                dbg64_dec((uint64_t)r->cpu_permille);
+                dbg64_str(" pages=");
+                dbg64_dec(r->pages);
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+        }
+    }
 
     // 列头（列几何与行共用 tm_col_*，窗口缩放时两边一起变）
     int id_right = tm_col_id_right(w);
@@ -1324,13 +1387,13 @@ static void tm_draw_proc(Window* w, TmState* st) {
     if (TM_CONTENT_Y + TM_COL_HDR_H <= tm_status_y(w)) {
         fb_fill_rect(X, Y + TM_CONTENT_Y, cw, TM_COL_HDR_H, TM_COL_HDRBG);
         int hy = Y + TM_CONTENT_Y + (TM_COL_HDR_H - font_line_height()) / 2;
-        tm_text_clip(X + tm_col_name_x(), hy, T("Task", "任务"), TM_COL_TEXT_DIM,
+        tm_text_clip(X + tm_col_name_x(), hy, T("Process", "进程"), TM_COL_TEXT_DIM,
                      id_right - tm_col_name_x() - 6);
-        tm_text_right(X + id_right, hy, "ID", TM_COL_TEXT_DIM);
-        tm_text_clip(X + state_x, hy, T("Status", "状态"), TM_COL_TEXT_DIM,
+        tm_text_right(X + id_right, hy, "PID", TM_COL_TEXT_DIM);
+        tm_text_clip(X + state_x, hy, T("Status / PPID", "状态/父进程"), TM_COL_TEXT_DIM,
                      ticks_x - state_x - 6);
-        tm_text_right(X + ticks_right, hy, T("Ticks", "tick"), TM_COL_TEXT_DIM);
-        tm_text_right(X + sw_right, hy, T("Sw", "切换"), TM_COL_TEXT_DIM);
+        tm_text_right(X + ticks_right, hy, T("CR3", "CR3"), TM_COL_TEXT_DIM);
+        tm_text_right(X + sw_right, hy, T("Thr", "线程"), TM_COL_TEXT_DIM);
         {
             const char* hl = "CPU%";
             int tw = tm_text_w(hl);
@@ -1344,16 +1407,16 @@ static void tm_draw_proc(Window* w, TmState* st) {
     int mcx = 0, mcy = 0;
     tm_mouse_client(w, &mcx, &mcy);
     int top = tm_list_top(), bot = tm_list_bot(w);
-    // 底部提示带（数据来源 + CPU% 口径）：窗口够高就预留，保证口径写在进程页上
+    // 底部提示带（数据来源 + CPU/CR3 口径）：窗口够高就预留，保证口径写在进程页上
     const int note_h = 34;
     int rows_bot = bot;
     if (bot - top >= TM_GRP_HDR_H + 3 * TM_ROW_H + note_h) rows_bot = bot - note_h;
 
-    // 分组标题（行 = 内核任务；数量是 task_count64() 真值）
+    // 分组标题（行 = proc64 真进程；数量是 proc64_count64() 真值）
     int y = top;
     if (y + TM_GRP_HDR_H <= rows_bot) {
         char hdr[48];
-        tm_count_label(hdr, T("Tasks", "任务"), total);
+        tm_count_label(hdr, T("Processes", "进程"), total);
         fb_fill_rect(X + 4, Y + y, cw - 8, TM_GRP_HDR_H, 0xFFFAFAFA);
         tm_draw_triangle(X + 14, Y + y + 10, 0xFF505050);
         tm_text_clip(X + 28, Y + y + (TM_GRP_HDR_H - font_line_height()) / 2, hdr, TM_COL_TEXT, cw - 40);
@@ -1361,10 +1424,11 @@ static void tm_draw_proc(Window* w, TmState* st) {
     }
 
     if (n == 0) {
-        // 任务表为空：如实写一行"无任务数据"，绝不造假行
+        // 进程表为空：如实写一行"无进程数据"，绝不造假行
         if (y + TM_ROW_H <= rows_bot) {
             tm_text_clip(X + tm_col_name_x(), Y + y + (TM_ROW_H - font_line_height()) / 2,
-                         T("No task data", "无任务数据"), TM_COL_TEXT_DIM,
+                         T("No process data (terminal: 'proc run spin')",
+                           "无进程数据（终端可敲 proc run spin）"), TM_COL_TEXT_DIM,
                          cw - tm_col_name_x() - 12);
             y += TM_ROW_H;
         }
@@ -1378,21 +1442,22 @@ static void tm_draw_proc(Window* w, TmState* st) {
         }
     }
 
-    // 提示行：数据来源与 CPU% 口径（如实写，和列头一起构成列的口径说明）
+    // 提示行：数据来源与口径（如实写，和列头一起构成列的口径说明）
     if (rows_bot < bot) {
         int ly = rows_bot + 4;
         tm_text_clip(X + 16, Y + ly,
-                     T("Source: kernel task table (scheduler task64); tick=4ms",
-                       "任务来源：内核任务表（调度器 task64）；tick=4ms"),
+                     T("Source: proc64 process table (per-process CR3); kernel tasks are in terminal 'ps'",
+                       "来源：proc64 进程表（每进程独立 CR3）；内核任务表见终端 ps"),
                      TM_COL_TEXT_DIM, cw - 32);
         tm_text_clip(X + 16, Y + ly + 16,
-                     T("CPU% = task ticks / system ticks (g_ticks64); * = current task",
-                       "CPU% = 累计运行 tick / 系统 tick（g_ticks64）；* = 当前任务"),
+                     T("CPU% = process task ticks / system ticks (1s window); Enter = kill(SIGKILL); * = current",
+                       "CPU% = 该进程任务时间/系统 tick（1 秒窗口）；回车 = kill(SIGKILL)；* = 当前进程"),
                      TM_COL_TEXT_DIM, cw - 32);
     }
 
-    tm_draw_main_button(w, T("End task", "结束任务"), st->sel_row >= 0 && st->sel_row < n);
+    tm_draw_main_button(w, T("End process", "结束进程"), st->sel_row >= 0 && st->sel_row < n);
 }
+
 
 // ---------------- 性能页 ----------------
 // 曲线：有计数器才画数据；没有计数器（磁盘）只画网格并如实写"无计数器"。
@@ -1763,6 +1828,7 @@ static void tm_draw(Window* w) {
     if (!g_log_once || (uint32_t)(now - st->last_log_tick) >= ms_to_ticks64(TM_LOG_MS)) {
         g_log_once = true;
         st->last_log_tick = now;
+        dbg64_line_begin64();
         dbg64_str("[UI] tmgr rows=");
         dbg64_dec((uint64_t)gui64_window_count());
         dbg64_str(" cpu=");
@@ -1776,7 +1842,13 @@ static void tm_draw(Window* w) {
         dbg64_dec((uint64_t)task_count64());
         dbg64_str(" switches=");
         dbg64_dec(task_switch_total64());
+        // 行锁现场（诊断用）：正常情况下 lock=1 depth=1（本行自己持有）
+        dbg64_str(" ll=");
+        dbg64_dec((uint64_t)(uint32_t)g_dbg64_line_lock);
+        dbg64_str("/");
+        dbg64_dec((uint64_t)(uint32_t)g_dbg64_line_depth);
         dbg64_nl();
+        dbg64_line_end64();
     }
 }
 
@@ -1820,23 +1892,34 @@ static void tm_menu_action(Window* w, TmState* st, int idx) {
     tm_dirty_client(w);
 }
 
-// ---------------- 结束任务 ----------------
-// 进程页的行 = 内核任务（task64 任务表），所以"结束任务"= task_kill64()：
-// 可终止性由调度器裁决（idle 与当前任务不可终止；已结束/无此 id 返回 -1）。
+// ---------------- 结束进程 ----------------
+// 进程页的行 = proc64 真进程，所以"结束进程"= proc64_kill64(pid, SIGKILL=9)：
+// 可终止性由 proc64 裁决（idle/当前进程不可杀；无此 pid 返回负错误码）。成功/失败都打点。
 static void tm_kill_selected(Window* w, TmState* st) {
-    int n_rows = tm_build_rows(TM_MAX_ROWS);     // 刷新行表（任务可能在两次操作间变化了）
+    int n_rows = tm_build_rows(TM_MAX_ROWS);     // 刷新行表（进程可能在两次操作间变化了）
     if (st->sel_row < 0 || st->sel_row >= n_rows) {
-        tm_notice(st, T("Select a task row first.", "请先选择一个任务行"), false);
+        tm_notice(st, T("Select a process row first.", "请先选择一个进程行"), false);
         tm_dirty_client(w);
         return;
     }
     TmRow row = g_rows[st->sel_row];             // 拷贝：后面还会重建行表
-    int rc = task_kill64(row.id);
-    tm_log_kill_task(&row, rc);
+    // 现场打点：kill 一定在 GUI 任务（kmain，task id 0）上下文里执行；如果这里出现别的
+    //   task/proc，就是"当前进程判定"出了问题（proc64_kill64 会拒绝 kill self）。
+    dbg64_line_begin64();
+    dbg64_str("[UI] tmgr kill ctx task=");
+    dbg64_dec((uint64_t)task_current_id64());
+    dbg64_str(" proc=0x");
+    dbg64_hex64((uint64_t)(uintptr_t)task_proc_of_current64());
+    dbg64_str(" target=");
+    dbg64_dec((uint64_t)row.id);
+    dbg64_nl();
+    dbg64_line_end64();
+    const int64_t rc = proc64_kill64((int)row.id, 9);   // SIGKILL
+    tm_log_kill_proc(&row, rc);
 
-    if (rc == 0) tm_notice2(st, T("Task ended: ", "已结束任务: "), row.name, false);
-    else         tm_notice2(st, T("Cannot end task (idle/current/dead): ",
-                                  "无法结束任务（idle/当前/已结束）: "), row.name, true);
+    if (rc == 0) tm_notice2(st, T("Process killed (SIGKILL): ", "已终止进程（SIGKILL）: "), row.name, false);
+    else         tm_notice2(st, T("Cannot kill process (idle/current/absent): ",
+                                  "无法终止进程（idle/当前/不存在）: "), row.name, true);
 
     int m = tm_build_rows(TM_MAX_ROWS);
     if (m == 0) st->sel_row = -1;
@@ -2138,6 +2221,8 @@ void app_tmgr_open64() {
     st->refresh_tick = ticks64();
     st->sample_sec = 0xFFFFFFFFu;                   // 首帧立即采样一次
     st->last_log_tick = 0;
+    st->proc_log_tick = 0;                          // 进程页行日志：首帧 proc_rows_logged(-1)!=0 会立即打
+    st->proc_rows_logged = -1;
     st->curve_n = 0;
     st->layout_w = -1;
     st->layout_h = -1;

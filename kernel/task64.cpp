@@ -38,6 +38,9 @@ struct Task64 {
     uint32_t slice_left;
     uint32_t started;
     uint32_t quiet;          // 1 = 压力子任务（create/exit/reap 都不打日志，见 kstress 段）
+    // 批次 A 后半：每任务时间片 + 关键任务标志（32 位 task.cpp 的 slice_ticks / critical）
+    uint32_t slice_ticks;    // 本任务的时间片（tick）；默认 TASK64_SLICE_TICKS，task64_set_slice64 可改
+    uint32_t critical;       // 1 = 关键任务：task_kill64 拒绝（打点 reason=critical）
     void*    proc;           // 拥有本任务的进程（0 = 纯内核线程；批次 C 新增）
     uint64_t mm_cr3;         // 切到这个任务时要装载的 CR3（0 = 内核地址空间；proc64 算好）
     uint64_t mm_fs_base;     // IA32_FS_BASE（TLS）：进程私有的 FS 基址（0 = 内核默认）
@@ -369,7 +372,7 @@ extern "C" void schedule64(pt_regs64* r) {
     g_cur = next;
     n->state = TASK64_RUNNING;
     n->switches++;
-    n->slice_left = TASK64_SLICE_TICKS;
+    n->slice_left = n->slice_ticks ? n->slice_ticks : TASK64_SLICE_TICKS;   // 每任务时间片（set_slice 可改）
     g_switch_total++;
     task_apply_ctx64(n);                    // ★ rsp0 + syscall 栈顶 + CR3（每进程地址空间）+ FS 基址
     task_frame_guard64("sched", n, next);    // ★ 同上：目标帧不自洽就停下报告，不 iretq
@@ -408,6 +411,8 @@ void task_init64() {
     t->state      = TASK64_RUNNING;
     t->slice_left = TASK64_SLICE_TICKS;
     t->started    = 1;
+    t->slice_ticks = TASK64_SLICE_TICKS;
+    t->critical    = 1;                     // idle（任务 0）不可杀：既由 id==0 护栏，也标成关键任务
     tz_strcpy_n(t->name, "kmain", TASK64_NAME_MAX);
     // 任务 0 = 当前执行流（内核主流程，最终进入桌面消息循环），栈就是引导期内核栈。
     t->stack_base = 0;
@@ -487,6 +492,8 @@ static int task_create_ex64(const char* name, void (*entry)(void*), void* arg, u
     //   弹 cs/ss -> iretq 上 #GP、err 是个不像错误码的选择子（与上游那次偶发 panic 同型）。
     //   改成"部件都装好了再挂牌"：tz_memset 之后 state=FREE，直到下面最后一行才 READY。
     t->slice_left = TASK64_SLICE_TICKS;
+    t->slice_ticks = TASK64_SLICE_TICKS;     // 每任务时间片（task64_set_slice64 可改）
+    t->critical    = 0;                      // 普通任务：可被 task_kill64 终止
     t->id         = (uint32_t)g_next_id++;
     tz_strcpy_n(t->name, name ? name : "task", TASK64_NAME_MAX);
     t->frame      = task_build_frame(t->stack_top);
@@ -709,6 +716,52 @@ static void kstress_entry(void* arg) {
 void task_stress_set_rounds64(uint32_t n) { if (n) g_stress_target = n; }
 #endif
 
+// 批次 A 后半：新增 API 的启动自检（都在抢占打开之前；只做可逆/只读操作，失败就打 FAIL）。
+// 用到的操作都有明确护栏，不会影响随后要跑的内置线程：
+//   * find_by_name：真名（kwork）必须找到、假名必须 -1；
+//   * mark_critical + task_kill64：关键任务必须被**拒绝**（-2），然后撤销标记；
+//   * set_slice：设 3 再设回默认 2；
+//   * force_remove：建一个临时线程（只让出 CPU）后强杀，必须成功且名字随之消失；
+//   * force_remove(idle) / 不存在的 id：必须被护栏拒绝；
+//   * diag：打印任务表诊断（一行一个槽 + 汇总），供串口/终端核验。
+static void task64_force_dummy_entry(void* arg) {
+    (void)arg;
+    for (;;) task_yield64();
+}
+
+static int task64_api_selftest64() {
+    int fail = 0;
+    const int kid = task64_find_by_name64("kwork");
+    if (kid <= 0) fail |= 1;
+    if (task64_find_by_name64("no-such-task-64") != -1) fail |= 1;
+    if (kid > 0) {
+        if (task64_mark_critical64((uint32_t)kid, 1) != 0) fail |= 2;
+        if (task_kill64((uint32_t)kid) != -2) fail |= 4;          // 关键任务拒绝（-2）
+        if (task64_mark_critical64((uint32_t)kid, 0) != 0) fail |= 8;
+        if (task64_set_slice64((uint32_t)kid, 3) != 0) fail |= 16;
+        if (task64_set_slice64((uint32_t)kid, TASK64_SLICE_TICKS) != 0) fail |= 16;
+    }
+    if (task64_force_remove64(0) != -1) fail |= 32;               // idle 护栏
+    if (task64_force_remove64(0xFFFFFFFFu) != -1) fail |= 32;     // 不存在的 id
+    const int tmp = task_create64("kforce", task64_force_dummy_entry, nullptr);
+    if (tmp <= 0) {
+        fail |= 64;
+    } else {
+        const uint32_t tid = (uint32_t)tmp;
+        if (task64_force_remove64(tid) != 0) fail |= 64;
+        if (task64_find_by_name64("kforce") != -1) fail |= 64;
+    }
+    if (task64_proc_threads64(0xFFFFFFFFu) != 0) fail |= 128;     // 无此任务的进程视角统计
+    if (task64_proc_cpu_permille64(0xFFFFFFFFu) != 0) fail |= 128;
+    task64_diag64();                                              // 诊断输出（真实槽位快照）
+
+    dbg64_line_begin64();
+    dbg64_str(fail == 0 ? "[TASK64] api selftest PASS\n" : "[TASK64] api selftest FAIL mask=");
+    if (fail) { dbg64_dec((uint64_t)fail); dbg64_nl(); }
+    dbg64_line_end64();
+    return fail;
+}
+
 void task_start64() {
     if (g_sched_on) return;
 
@@ -731,6 +784,9 @@ void task_start64() {
     // （init 之前 usb64_poll64() 会因为 !g_ready 直接返回，不会碰到半初始化状态）。
     task_create64("kusb", kusb_entry, nullptr);
 #endif
+    // 批次 A 后半：新增 API 的启动自检（抢占打开之前做，临时线程 kforce 会被立刻强杀回收）
+    (void)task64_api_selftest64();
+
 
     g_sched_on = true;
     task_apply_ctx64(&g_tasks[g_cur < 0 ? 0 : g_cur]);   // 抢占打开前先把当前任务的上下文装好（任务 0 -> 0x80000）
@@ -807,7 +863,7 @@ void task_sleep64(uint32_t ms) {
     g_cur = next;
     n->state = TASK64_RUNNING;
     n->switches++;
-    n->slice_left = TASK64_SLICE_TICKS;
+    n->slice_left = n->slice_ticks ? n->slice_ticks : TASK64_SLICE_TICKS;   // 同上：每任务时间片
     g_switch_total++;
     task_apply_ctx64(n);                     // ★ 同上：交给下一个任务前把上下文全部装载好
     task_frame_guard64("exit", n, next);     // ★ 切走前校验目标帧（垃圾帧 -> 停下报告，绝不 iretq）
@@ -975,6 +1031,17 @@ int task_kill64(uint32_t id) {
         if (t->state == TASK64_FREE || t->id != id) continue;
         if (i == g_cur) return -1;                // 不能杀当前正在跑的任务
         if (t->state == TASK64_DEAD) return -1;   // 已经在死队列里
+        // 关键任务（task64_mark_critical64 / idle）：拒绝并打点（32 位 task_kill_by_id 的语义）
+        if (t->critical) {
+            dbg64_line_begin64();
+            dbg64_str("[TASK64] kill denied reason=critical id=");
+            dbg64_dec(t->id);
+            dbg64_str(" name=");
+            dbg64_str(t->name);
+            dbg64_nl();
+            dbg64_line_end64();
+            return -2;
+        }
 
         dbg64_line_begin64();
         dbg64_str("[TASK64] kill id=");
@@ -992,4 +1059,203 @@ int task_kill64(uint32_t id) {
         return 0;
     }
     return -1;
+}
+
+// ==================== 批次 A 后半：任务统计 / 关键任务 / 强制移除 / 诊断 ====================
+// CPU 千分比的采样状态（口径见 task64.h 的说明）：
+//   窗口 = PIT_HZ_64 个系统 tick；g_cpu_snap 记录每个槽上一次采样时的 ticks。
+static uint32_t g_cpu_permille[TASK64_MAX];
+static uint64_t g_cpu_snap   [TASK64_MAX];
+static uint64_t g_cpu_last_tick = 0;
+
+// 懒采样：窗口到了才重算（调用点在任意上下文；只读写本文件的静态数组，无分配/无日志）
+static void task64_cpu_sample64() {
+    const uint64_t now = g_ticks64;
+    const uint64_t dt  = now - g_cpu_last_tick;
+    if (dt == 0) return;
+    for (int i = 0; i < TASK64_MAX; i++) {
+        const uint64_t cur = g_tasks[i].ticks;
+        // 槽被回收/复用会清零 ticks：回绕时按 0 处理，绝不产生天文数字
+        const uint64_t d = (cur >= g_cpu_snap[i]) ? (cur - g_cpu_snap[i]) : 0;
+        g_cpu_snap[i] = cur;
+        // 分子 /2：调度器每 tick 给当前任务记 2（既有记账，见 schedule64 的两次 c->ticks++）
+        uint64_t pm = (d / 2ULL) * 1000ULL / dt;
+        if (pm > 1000ULL) pm = 1000ULL;
+        g_cpu_permille[i] = (uint32_t)pm;
+    }
+    g_cpu_last_tick = now;
+}
+
+uint32_t task64_cpu_permille64(uint32_t id) {
+    const int slot = task_slot_of_id64(id);
+    if (slot < 0) return 0;
+    if ((uint64_t)(g_ticks64 - g_cpu_last_tick) >= (uint64_t)PIT_HZ_64) task64_cpu_sample64();
+    return g_cpu_permille[slot];
+}
+
+// 名字比较（与 task_find_by_name 同口径：完整相等）
+static bool task64_name_eq(const char* a, const char* b) {
+    if (!a || !b) return false;
+    while (*a && *b && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+int task64_find_by_name64(const char* name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < TASK64_MAX; i++) {
+        if (g_tasks[i].state == TASK64_FREE) continue;
+        if (task64_name_eq(g_tasks[i].name, name)) return (int)g_tasks[i].id;
+    }
+    return -1;
+}
+
+int task64_mark_critical64(uint32_t id, int critical) {
+    const int slot = task_slot_of_id64(id);
+    if (slot < 0) return -1;
+    g_tasks[slot].critical = critical ? 1u : 0u;
+    dbg64_line_begin64();
+    dbg64_str("[TASK64] critical id=");
+    dbg64_dec(g_tasks[slot].id);
+    dbg64_str(" name=");
+    dbg64_str(g_tasks[slot].name);
+    dbg64_str(" on=");
+    dbg64_dec((uint64_t)g_tasks[slot].critical);
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+
+int task64_set_slice64(uint32_t id, uint32_t ticks) {
+    const int slot = task_slot_of_id64(id);
+    if (slot < 0) return -1;
+    if (ticks < 1u) ticks = 1u;
+    if (ticks > 100u) ticks = 100u;              // 与 32 位 task_set_slice 同上限
+    g_tasks[slot].slice_ticks = ticks;
+    g_tasks[slot].slice_left  = ticks;           // 立刻生效（32 位也重置 ticks_left）
+    dbg64_line_begin64();
+    dbg64_str("[TASK64] slice id=");
+    dbg64_dec(g_tasks[slot].id);
+    dbg64_str(" name=");
+    dbg64_str(g_tasks[slot].name);
+    dbg64_str(" ticks=");
+    dbg64_dec((uint64_t)ticks);
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+
+int task64_proc_threads64(uint32_t main_task_id) {
+    const int slot = task_slot_of_id64(main_task_id);
+    if (slot < 0) return 0;
+    void* pr = g_tasks[slot].proc;
+    if (!pr) return 0;
+    int n = 0;
+    for (int i = 0; i < TASK64_MAX; i++) {
+        // 只统计**活着**的同进程任务：FREE 是空槽；DEAD 是已退出、只是还没被回收的槽
+        //   （它的 proc 指针可能指向已被复用的 Proc64 结构 —— 计进去会把线程数/CPU‰ 算大）。
+        if (g_tasks[i].state == TASK64_FREE || g_tasks[i].state == TASK64_DEAD) continue;
+        if (g_tasks[i].proc == pr) n++;
+    }
+    return n;
+}
+
+// 强制摘除 + 立即回收（只在任务上下文调用；32 位 task_force_remove 的 64 位版）。
+// 护栏（比 32 位更严，原因见文件头的回收竞态说明）：
+//   id == 0（idle / 桌面线程）        -> -1
+//   找不到槽位                        -> -1
+//   目标是当前任务                    -> -2（杀掉正在跑的自己没有意义，还会破坏调度器状态）
+//   目标已 DEAD                       -> -3（回收路径会处理它，不能再动）
+// 实现：整个"判状态 -> kfree -> 清零 -> 计数"在关中断里一步完成（与 task_drain_reap 同源的
+//   竞态修复口径）；g_reap_slot 里可能残留的同一槽会在回收时看到 state=FREE 而跳过。
+int task64_force_remove64(uint32_t id) {
+    if (id == 0) return -1;
+    const int slot = task_slot_of_id64(id);
+    if (slot < 0) return -1;
+
+    const uint64_t if_save = dbg64_irq_save64();
+    Task64* t = &g_tasks[slot];
+    if (slot == g_cur) { dbg64_irq_restore64(if_save); return -2; }
+    if (t->state == TASK64_DEAD) { dbg64_irq_restore64(if_save); return -3; }
+
+    const uint32_t tid = t->id;
+    char nm[TASK64_NAME_MAX];
+    tz_strcpy_n(nm, t->name, TASK64_NAME_MAX);
+    if (t->stack_base) kfree_64((void*)(uintptr_t)t->stack_base);
+    tz_memset(t, 0, sizeof(Task64));
+    t->state = TASK64_FREE;
+    if (g_task_count > 0) g_task_count--;
+    dbg64_irq_restore64(if_save);
+
+    dbg64_line_begin64();
+    dbg64_str("[TASK64] force-remove id=");
+    dbg64_dec((uint64_t)tid);
+    dbg64_str(" name=");
+    dbg64_str(nm);
+    dbg64_str(" slot=");
+    dbg64_dec((uint64_t)slot);
+    dbg64_str(" state=FREE\n");
+    dbg64_line_end64();
+    return 0;
+}
+
+void task64_diag64() {
+    uint64_t live = 0;
+    for (int i = 0; i < TASK64_MAX; i++) {
+        Task64* t = &g_tasks[i];
+        if (t->state == TASK64_FREE) continue;
+        live++;
+        dbg64_line_begin64();
+        dbg64_str("[TASK64] diag slot=");
+        dbg64_dec((uint64_t)i);
+        dbg64_str(" id=");
+        dbg64_dec(t->id);
+        dbg64_str(" name=");
+        dbg64_str(t->name);
+        dbg64_str(" state=");
+        dbg64_dec((uint64_t)t->state);
+        dbg64_str(" ticks=");
+        dbg64_dec(t->ticks);
+        dbg64_str(" switches=");
+        dbg64_dec(t->switches);
+        dbg64_str(" proc=0x");
+        dbg64_hex64((uint64_t)(uintptr_t)t->proc);
+        dbg64_str(" critical=");
+        dbg64_dec((uint64_t)t->critical);
+        dbg64_str(" slice=");
+        dbg64_dec((uint64_t)t->slice_ticks);
+        dbg64_str(" cpu_permille=");
+        dbg64_dec((uint64_t)g_cpu_permille[i]);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    dbg64_line_begin64();
+    dbg64_str("[TASK64] diag tasks=");
+    dbg64_dec(live);
+    dbg64_str(" cur=");
+    dbg64_dec((uint64_t)(g_cur < 0 ? 0 : g_cur));
+    dbg64_str(" switches_total=");
+    dbg64_dec(g_switch_total);
+    dbg64_str(" kernel_cr3=0x");
+    dbg64_hex64(g_task64_kernel_cr364);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+uint32_t task64_proc_cpu_permille64(uint32_t main_task_id) {
+    const int slot = task_slot_of_id64(main_task_id);
+    if (slot < 0) return 0;
+    void* pr = g_tasks[slot].proc;
+    if (!pr) return 0;
+    // 先按窗口采样一次（懒采样只在需要时重算），再直接读结果，保证同一快照口径
+    if ((uint64_t)(g_ticks64 - g_cpu_last_tick) >= (uint64_t)PIT_HZ_64) task64_cpu_sample64();
+    uint32_t sum = 0;
+    for (int i = 0; i < TASK64_MAX; i++) {
+        // 与 task64_proc_threads64 同一口径：DEAD（已退出未回收）不算，避免把已复用的
+        //   Proc64 结构地址上的旧任务算进本进程。
+        if (g_tasks[i].state == TASK64_FREE || g_tasks[i].state == TASK64_DEAD) continue;
+        if (g_tasks[i].proc != pr) continue;
+        sum += g_cpu_permille[i];
+    }
+    if (sum > 1000u) sum = 1000u;
+    return sum;
 }

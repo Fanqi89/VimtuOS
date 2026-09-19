@@ -61,11 +61,13 @@ SRCS_INSTALLER="$SRCS_CORE kernel/ata64.cpp kernel/part64.cpp kernel/setup64.cpp
 #   注意：这几个文件依赖 kernel/gui64.cpp 提供的外壳实现，任何新增应用都要同时加进这里。
 SRCS_DESKTOP="kernel/gui64.cpp kernel/calc64.cpp kernel/mines64.cpp \
  kernel/terminal64.cpp kernel/settings64.cpp kernel/taskmgr64.cpp"
-# 本轮新增的四个子系统：**只进系统内核**（安装介质不链它们；只有系统内核有 gui64/store64/app64）
+# 这四个子系统 + 批次 A 后半的两个：**只进系统内核**（安装介质不链它们；只有系统内核有 gui64/store64/app64）
 #   sysstate64 = 运行状态机 + 模块注册表 + 健康 + ring log（terminal 的 state/health/syslog）
 #   config64   = 类型化配置 KV，落在 store64（VimtuFS2 的 /store.a|b，真落盘）
 #   session64  = 会话/应用内容策略（关窗清状态、退出保存、启动恢复）
-SRCS_SYS="kernel/sysstate64.cpp kernel/config64.cpp kernel/session64.cpp kernel/panic64.cpp"
+#   preload64  = 字形预光栅化 + 图标预缩放（batch A 后半；gui64 的图标缓存 + font 的 prewarm 原语）
+#   update64   = 标记文件 -> 应用动作 -> store/ring log/自动重启（不是真"升级包"，见 update64.h）
+SRCS_SYS="kernel/sysstate64.cpp kernel/config64.cpp kernel/session64.cpp kernel/panic64.cpp kernel/preload64.cpp kernel/update64.cpp"
 # ★ 批次 C：kernel/proc64.cpp（进程/地址空间）只进系统内核 —— 它依赖 task64/elf64/vfs64。
 SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/proc64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp"
 # elf64.cpp = ELF64 加载器：**只进系统内核**（安装介质不需要它；它内嵌的 hello.elf 是系统程序）
@@ -171,6 +173,14 @@ $LD -m elf_x86_64 -T user/hello_elf64.ld -o "$BUILD/hello.elf" "$BUILD/hello_elf
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/hello.elf" "$BUILD/hello_elf64_elf.o"
 cp "$BUILD/hello_elf64_elf.o" "$BUILD/os/"
 
+echo "==> spin64：长命用户程序（终端 proc run 用；任务管理器进程页 / proc64 kill 的验证目标）"
+# user/spin64.asm 打印 pid 后每 1 秒 nanosleep，永不退出；只嵌进**系统内核**（终端在系统内核里）。
+# 符号名：_binary_build64_spin64_elf_start/_end（terminal64.cpp 的 `proc run spin` 用它装到 /spin.elf）。
+$NASM -f elf64 user/spin64.asm -o "$BUILD/spin64.o"
+$LD -m elf_x86_64 -T user/hello_elf64.ld -o "$BUILD/spin64.elf" "$BUILD/spin64.o"
+$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/spin64.elf" "$BUILD/spin64_elf.o"
+cp "$BUILD/spin64_elf.o" "$BUILD/os/"
+
 echo "==> AP 跳板（SMP：nasm 平铺二进制 -> objcopy 嵌入**系统内核**）"
 # kernel/ap_trampoline64.asm 由 BSP 原字节拷到物理 0x8000，再由 SIPI（向量 0x08）拉起 AP：
 #   nasm -f bin 直接出平铺二进制（按 [org 0x8000] 汇编，**不是**位置无关，见文件顶部说明）
@@ -195,9 +205,10 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
     "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o \
     "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
+    "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
-    "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o \
+    "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o \
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD/os"/hello_vap64.o \

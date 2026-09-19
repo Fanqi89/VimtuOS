@@ -12,8 +12,9 @@
   4) panic64：受控 BSOD（终端 `panic <code>` -> 蓝底白字屏 + 串口 [PANIC64] stop=<code> + 6 秒后停住）
      与看门狗（[WD64] watchdog armed；正常运行 60 秒不许出现 watchdog fire）。
 
-另外断言：原来那批"尚未支持"桩命令（cfg/syslog/state/health/session/disk/hw/lspci/user/panic/restart --soft）
-现在都没有"尚未支持"/"not supported yet" 字样，且各自有真输出（[TERM] cmd <name> ok + 具体打点）。
+另外断言：原来的"尚未支持"桩命令（cfg/syslog/state/health/session/disk/hw/lspci/user/panic/restart --soft，
+以及批次 A 后半接真的 update/preload）现在都没有"尚未支持"/"not supported yet" 字样，且各自有真输出
+（[TERM] cmd <name> ok + 具体打点；update 打 [UPDATE64] cmd status，preload 打 [PRELOAD64] cmd report）。
 
 夹具：与 tests/store64_test.py 同一套 —— build64/system.img 的字节 + 标准 MBR + Python 复刻的
 VimtuFS2 空卷（@LBA 8009）。只有"有卷"时才可能拿到 carrier=vfs 的 config64（这是正常安装盘的形态）。
@@ -570,11 +571,13 @@ def main():
               "not supported yet (panic/bsod" not in logc and
               "not supported yet (sysstate" not in logc and
               "not supported yet (restart state machine" not in logc)
-        print("  --- 仍然未移植的两条（update / preload）必须如实报'尚未支持' ---")
-        check("update 仍是如实桩（[TERM] unsupported update: + 说明原因）",
-              run_cmd(vm, mon, "update", "[TERM] unsupported update:"))
-        check("preload 仍是如实桩（[TERM] unsupported preload:）",
-              run_cmd(vm, mon, "preload", "[TERM] unsupported preload:"))
+        # ★ 批次 A 后半：update / preload 不再是桩 —— 这两条原来的"必须如实报尚未支持"断言已过时，
+        #   改成断言真实现的打点（update64 / preload64 的真实串口输出）。
+        print("  --- 最后两条桩已接真（update / preload）---")
+        check("update 真实现：update status 打 [UPDATE64] cmd status（版本/applied/pending/done）",
+              run_cmd(vm, mon, "update", "[UPDATE64] cmd status version="))
+        check("preload 真实现：preload 打 [PRELOAD64] cmd report（字形/图标/首帧实测）",
+              run_cmd(vm, mon, "preload", "[PRELOAD64] cmd report glyphs_new="))
 
         print("  --- config64 写盘：cfg set demo=1 -> store flush -> cfg save ---")
         check("cfg set demo=1（cfg set KEY=VALUE 形态）",

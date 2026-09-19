@@ -49,6 +49,9 @@
 #include "session64.h"   // 会话/应用内容策略（关窗清状态、退出保存、启动恢复）
 #include "sysstate64.h"  // 运行状态机 + 模块注册表 + 健康报告 + ring log
 #include "panic64.h"     // 蓝屏（BSOD）+ 看门狗（gui64 帧心跳）
+// ---- 批次 A 后半的两个子系统（同样只进系统内核；os_boot_path 里注册 + 跑）----
+#include "preload64.h"   // 字形/图标预热（进桌面之前跑一轮，带 rdtsc64 实测证据）
+#include "update64.h"    // update 子系统（标记 -> 应用 -> store/重启；不是真"升级包"，见其头文件）
 // 用户态演示程序 blob：user/demo64.asm -> nasm 平铺二进制 -> objcopy 嵌入（见 build64.sh）。
 // 符号名由 objcopy 按输入路径生成：_binary_build64_user_demo64_bin_start/_end。
 extern "C" const uint8_t _binary_build64_user_demo64_bin_start[];
@@ -276,6 +279,11 @@ static uint64_t read_cs64()  { uint64_t v; __asm__ volatile("mov %%cs, %0"  : "=
     session64_init64();
     sysstate64_begin64();
     sys64_register_builtin64();
+    // ★ 批次 A 后半：preload64 / update64 也要进模块表 —— 必须在 sysstate64_start64() **之前**
+    //   注册（这样 STARTING 阶段会复核它们；注册在 STARTING 之后的话模块状态会停在 STOPPED/健康 DOWN）。
+    //   它们的 init 钩子只做"模块已编入"的只读复核，真正的预热/检查在下面（gui64_run 之前）。
+    preload64_init64();
+    update64_init64();
     (void)sysstate64_start64();
     panic64_init64();
     // ---- 网络：e1000（轮询收发）+ ARP/ICMP 一次性探测 ----
@@ -289,6 +297,11 @@ static uint64_t read_cs64()  { uint64_t v; __asm__ volatile("mov %%cs, %0"  : "=
     //   只打点并返回负值，系统照常启动、桌面照常工作（自检按 skipped 处理，不算失败）。
     // 运行期轮询由 kusb 内核线程负责（见 kernel/task64.cpp），不占用这里的执行流。
     (void)usb64_init64();
+    // ---- 批次 A 后半：update 标记检查 + preload 预热（都在进桌面之前）----
+    // 顺序：update 先查（有 pending 会应用 -> store/ring log -> /update.done -> 自动软重启，不返回）；
+    //       没有 pending 就照常往下走，然后 preload 预热字形/图标（打点带 rdtsc64 实测证据）。
+    (void)update64_check64();
+    (void)preload64_run64();
     gui64_run(bi);          // 不返回：进入桌面消息循环
 }
 #endif

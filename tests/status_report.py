@@ -787,6 +787,8 @@ TESTS = [
     ("sched_stress_test.py", "调度器压力：创建→运行→退出→回收 200 轮 + 待切换帧校验（kstress）"),
     ("proc64_test.py", "进程/地址空间：每进程 CR3 + fork/execve/wait4/kill（BIOS 隔离 + UEFI 如实降级）"),
     ("usb64_test.py", "USB 主机：UHCI + HID 引导键盘（sendkey -> 桌面响应）+ 两种降级"),
+    ("preload_update_test.py", "预加载 + 更新：字形/图标预热实测 + update 标记->应用->store/done->重启闭环"),
+    ("tmgr_proc_test.py", "任务管理器进程页 = proc64 真进程：真进程行 + kill(SIGKILL) 端到端（键盘注入）"),
 ]
 
 def run_tests():

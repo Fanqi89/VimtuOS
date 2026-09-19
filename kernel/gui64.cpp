@@ -516,9 +516,6 @@ static void blit_rgba(int x, int y, int dw, int dh, const uint8_t* src, int sw, 
         }
     }
 }
-static void draw_icon_rgba(int x, int y, int size, const uint8_t* src, int src_w) {
-    blit_rgba(x, y, size, size, src, src_w, src_w, 255);
-}
 
 // ==================== 开机 logo（淡入）====================
 // 桌面首帧之前跑：黑底 + 屏幕居中 logo（240x150 RGBA，logo/logo.png）；
@@ -553,6 +550,102 @@ static const char* icon_name(int kind) {
     if (kind == 0) return gui64_tr("My Computer", "我的电脑");
     if (kind == 1) return gui64_tr("Recycle Bin", "回收站");
     return gui64_tr("Terminal", "终端");
+}
+
+// ==================== 桌面图标预缩放缓存（preload64 预热用） ====================
+// 背景：draw_icons()/draw_taskbar() 原来**每帧**对 128x128 源图做最近邻缩放（桌面图标 3 张 +
+//   开始图标 1 张）；preload64 在进桌面之前把缩小后的位图算好放进缓存，绘制时只做 alpha 混合。
+// 缓存与 blit_rgba 的采样公式完全一致（sx = i*sw/dw，sy = j*sh/dh），所以**像素结果逐点相同**，
+//   只是把"缩放"从每帧挪到启动期一次（32 位 preload.cpp 的 gui_preload_icons 同一思路）。
+static uint8_t g_icon48_cache[3][ICON_W * ICON_W * 4];
+static uint8_t g_icon48_ok[3];
+static uint8_t g_start24_cache[START_ICON_DISP * START_ICON_DISP * 4];
+static bool    g_start24_ok = false;
+
+// 最近邻预缩放（RGBA 原样拷贝 alpha；公式与 blit_rgba 相同）
+static void scale_rgba64(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh) {
+    for (int j = 0; j < dh; j++) {
+        const int sy = j * sh / dh;
+        for (int i = 0; i < dw; i++) {
+            const int sx = i * sw / dw;
+            const uint8_t* p = src + (((size_t)sy * (size_t)sw) + (size_t)sx) * 4;
+            uint8_t* q = dst + (((size_t)j * (size_t)dw) + (size_t)i) * 4;
+            q[0] = p[0]; q[1] = p[1]; q[2] = p[2]; q[3] = p[3];
+        }
+    }
+}
+
+// 预缩放后的位图直接混合上屏（步长 = dw，不再缩放；混合公式与 blit_rgba 相同）
+static void blit_rgba_scaled(int x, int y, int dw, int dh, const uint8_t* src) {
+    for (int j = 0; j < dh; j++) {
+        for (int i = 0; i < dw; i++) {
+            const uint8_t* p = src + (((size_t)j * (size_t)dw) + (size_t)i) * 4;
+            int a = p[3];
+            if (a == 0) continue;
+            const int px = x + i, py = y + j;
+            // 边界用 fb_width/fb_height（= 渲染缓冲的真实尺寸；gui64_run 里 g_screen_* 就等于它们）。
+            // 为什么不用 g_screen_*：preload64 在 gui64_run **之前**跑，那时 g_screen_w=0，
+            // 用它会一像素都不画，预热前后的测量就都不成立。
+            if (px < 0 || py < 0 || px >= fb_width() || py >= fb_height()) continue;
+            uint32_t out;
+            if (a >= 252) {
+                out = 0xFF000000u | ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
+            } else {
+                const uint32_t bg = fb_get_pixel(px, py);
+                const uint32_t r = ((uint32_t)p[0] * (uint32_t)a + ((bg >> 16) & 0xFF) * (uint32_t)(255 - a)) / 255;
+                const uint32_t g = ((uint32_t)p[1] * (uint32_t)a + ((bg >> 8) & 0xFF) * (uint32_t)(255 - a)) / 255;
+                const uint32_t b = ((uint32_t)p[2] * (uint32_t)a + (bg & 0xFF) * (uint32_t)(255 - a)) / 255;
+                out = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+            fb_putpixel(px, py, out);
+        }
+    }
+}
+
+// 预缩放：3 个桌面图标（128x128 -> ICON_W）与开始图标（64x64 -> START_ICON_DISP）。
+// 返回建好的缓存位图数（4 = 全部成功；资源缺失时如实返回较小的数）。
+int gui64_preload_icons64() {
+    int n = 0;
+    for (int k = 0; k < 3; k++) {
+        const uint8_t* src = icon_src(k);
+        if (!src) continue;
+        scale_rgba64(src, ICON_SRC_W, ICON_SRC_W, g_icon48_cache[k], ICON_W, ICON_W);
+        g_icon48_ok[k] = 1;
+        n++;
+    }
+    if (_binary_icon_start_bin_start) {
+        scale_rgba64(_binary_icon_start_bin_start, START_ICON_SRC, START_ICON_SRC,
+                     g_start24_cache, START_ICON_DISP, START_ICON_DISP);
+        g_start24_ok = true;
+        n++;
+    }
+    return n;
+}
+
+int gui64_icon_cache_count64() {
+    int n = 0;
+    for (int k = 0; k < 3; k++) if (g_icon48_ok[k]) n++;
+    if (g_start24_ok) n++;
+    return n;
+}
+
+// 画桌面图标（kind 0..2）：有缓存只做混合；没缓存（进桌面之前）按旧路径的等价工作量做
+// "缩放进临时位图 + 混合"（采样公式与 blit_rgba 完全相同，像素逐点一致）。
+void gui64_draw_icon_kind64(int x, int y, int kind) {
+    if (x < 0 || y < 0 || kind < 0 || kind > 2) return;
+    if (g_icon48_ok[kind]) { blit_rgba_scaled(x, y, ICON_W, ICON_W, g_icon48_cache[kind]); return; }
+    static uint8_t scratch[3][ICON_W * ICON_W * 4];
+    scale_rgba64(icon_src(kind), ICON_SRC_W, ICON_SRC_W, scratch[kind], ICON_W, ICON_W);
+    blit_rgba_scaled(x, y, ICON_W, ICON_W, scratch[kind]);
+}
+
+void gui64_draw_start_icon64(int x, int y) {
+    if (x < 0 || y < 0) return;
+    if (g_start24_ok) { blit_rgba_scaled(x, y, START_ICON_DISP, START_ICON_DISP, g_start24_cache); return; }
+    static uint8_t scratch[START_ICON_DISP * START_ICON_DISP * 4];
+    scale_rgba64(_binary_icon_start_bin_start, START_ICON_SRC, START_ICON_SRC,
+                 scratch, START_ICON_DISP, START_ICON_DISP);
+    blit_rgba_scaled(x, y, START_ICON_DISP, START_ICON_DISP, scratch);
 }
 
 // 选择框与图标格（图标 + 名字标签）是否相交（移植 32 位的 icon_intersects_sel）
@@ -650,7 +743,7 @@ static void draw_icons(void) {
         const DeskIcon& ic = g_icons[i];
         if (g_icon_sel == i)
             fb_fill_rect(ic.x - 4, ic.y - 4, ICON_W + 8, ICON_W + 20, C_ICON_SEL);
-        draw_icon_rgba(ic.x, ic.y, ICON_W, icon_src(ic.kind), ICON_SRC_W);
+        gui64_draw_icon_kind64(ic.x, ic.y, ic.kind);   // 缓存命中走预缩放位图，否则退回逐帧缩放
         const char* nm = icon_name(ic.kind);
         const int tw = text_w(nm);
         int tx = ic.x + (ICON_W - tw) / 2;
@@ -717,8 +810,7 @@ static void draw_taskbar(void) {
     const int y = g_screen_h - TASKBAR_H;
     fb_fill_rect(0, y, g_screen_w, TASKBAR_H, C_TASKBAR);
     // 开始按钮：logo/kaisi.png（64x64 RGBA）缩放到 24x24（点击区仍是 mx<34，见 handle_mouse_press）
-    blit_rgba(6, y + (TASKBAR_H - START_ICON_DISP) / 2, START_ICON_DISP, START_ICON_DISP,
-              _binary_icon_start_bin_start, START_ICON_SRC, START_ICON_SRC, 255);
+    gui64_draw_start_icon64(6, y + (TASKBAR_H - START_ICON_DISP) / 2);
     if (!g_start_icon_logged) {
         g_start_icon_logged = true;
         dbg64_str("[UI] start icon blit size=");

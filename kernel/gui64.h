@@ -126,6 +126,11 @@ void        gui64_set_lang_zh(bool zh);      // 设置页切换中/英
 
 uint32_t    gui64_fps();                     // 外壳实测帧率（性能页/系统监视器用）
 uint8_t     gui64_cpu_busy_pct();            // 外壳忙占比（性能页用）
+// --- 桌面图标预缩放缓存（preload64 在进桌面之前调用；draw 路径自动使用缓存）---
+int  gui64_preload_icons64();                     // 预缩放 3 桌面图标(48) + 开始图标(24)；返回缓存位图数
+int  gui64_icon_cache_count64();                  // 当前缓存位图数（0..4）
+void gui64_draw_icon_kind64(int x, int y, int kind);   // 桌面图标 kind 0..2（有缓存则只做混合）
+void gui64_draw_start_icon64(int x, int y);            // 开始按钮图标（24x24）
 // --- 重启 / 关机（外壳实现，终端/开始菜单都调）---
 void    sys_reboot64();
 void    sys_shutdown64();
