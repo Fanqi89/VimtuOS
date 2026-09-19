@@ -14,6 +14,8 @@
 #include "font.h"
 #include "input.h"
 #include "ata64.h"
+#include "ahci64.h"      // ★ item 5a：AHCI64_MAX_DEVS（磁盘表按统一驱动器号扩张到 8+N）
+#include "hwui64.h"      // ★ item 5a：找不到任何磁盘时，把屏幕硬件检查报告直接画在向导里
 #include "part64.h"
 #include "x86_64.h"
 #include "debug64.h"
@@ -127,7 +129,10 @@ struct ListRow {
     char text[96];
 };
 
-static DiskEntry g_disks[4];
+// ★ item 5a：磁盘表按**统一驱动器号**索引（0..3 = PATA，8.. = AHCI 盘，4..7 是保留空洞），
+//   所以数组要覆盖到最大驱动器号 8+AHCI64_MAX_DEVS-1；下标 = 驱动器号，不重排。
+static const int kDiskSlots = ATA64_AHCI_BASE + AHCI64_MAX_DEVS;
+static DiskEntry g_disks[kDiskSlots];
 static ListRow   g_rows[24];
 // 安装介质本身占据的那块 ATA 盘（U 盘 / hybrid ISO；-1 = 介质不是块盘或尚未判定）。
 // 用途：① 在列表里把它标出来；② 默认选中行与"自动选分区"都跳过它，
@@ -267,41 +272,54 @@ static void probe_disk(int idx) {
     }
 }
 
+// 枚举所有可枚举的磁盘（PATA 0..3 + AHCI 8..）—— **槽位接口**：每个槽给出一个驱动器号，
+// 顺序就是"驱动器号从小到大"，界面上的行顺序也随之稳定（8 号盘排在 0..3 之后）。
+// 注意：g_disks[] 以**驱动器号**为下标，所以这里要跳过 4..7 的保留空洞。
 static void enumerate_disks() {
-    for (int i = 0; i < 4; i++) {
+    const int slots = ata64_drive_count64();
+    for (int s = 0; s < slots; s++) {
+        const int d = ata64_slot_to_drive64(s);
+        if (d < 0 || d >= kDiskSlots) continue;
         DiskInfo di;
-        g_disks[i].probed = false;
-        if (ata64_identify(i, &di) && di.present) {
-            g_disks[i].present = true;
-            g_disks[i].atapi = di.atapi;
-            g_disks[i].sectors = (uint32_t)di.sectors;
-            for (int k = 0; k < 41; k++) g_disks[i].model[k] = di.model[k];
-            if (!di.atapi) probe_disk(i);
+        g_disks[d].probed = false;
+        if (ata64_identify(d, &di) && di.present) {
+            g_disks[d].present = true;
+            g_disks[d].atapi = di.atapi;
+            g_disks[d].sectors = (uint32_t)di.sectors;
+            for (int k = 0; k < 41; k++) g_disks[d].model[k] = di.model[k];
+            if (!di.atapi) probe_disk(d);
         } else {
-            g_disks[i].present = false;
+            g_disks[d].present = false;
         }
     }
     // 串口打一份枚举结果，便于自动验收核对
-    for (int i = 0; i < 4; i++) {
-        if (!g_disks[i].present) continue;
+    for (int s = 0; s < slots; s++) {
+        const int d = ata64_slot_to_drive64(s);
+        if (d < 0 || d >= kDiskSlots) continue;
+        if (!g_disks[d].present) continue;
         dbg64_str("[DISK] ");
-        dbg64_dec(i);
+        dbg64_dec(d);
         dbg64_str(" model=");
-        dbg64_str(g_disks[i].model);
-        dbg64_str(g_disks[i].atapi ? " (ATAPI)" : "");
+        dbg64_str(g_disks[d].model);
+        dbg64_str(g_disks[d].atapi ? " (ATAPI)" : "");
         dbg64_str(" sectors=");
-        dbg64_dec(g_disks[i].sectors);
-        dbg64_str(g_disks[i].has_gpt ? " GPT" : (g_disks[i].has_mbr ? " MBR" : " no-table"));
+        dbg64_dec(g_disks[d].sectors);
+        dbg64_str(g_disks[d].has_gpt ? " GPT" : (g_disks[d].has_mbr ? " MBR" : " no-table"));
         dbg64_str(" parts=");
-        dbg64_dec(g_disks[i].part_count);
+        dbg64_dec(g_disks[d].part_count);
+        dbg64_str(d >= ATA64_AHCI_BASE ? " bus=AHCI" : " bus=PATA");
         dbg64_nl();
     }
 }
 
 // 把磁盘/分区摊平成可滚动的行列表
+// ★ item 5a：同样按**槽位**遍历（PATA 0..3 + AHCI 8..），并标出总线类型，便于真机排障。
 static void build_rows() {
     g_row_count = 0;
-    for (int d = 0; d < 4; d++) {
+    const int slots = ata64_drive_count64();
+    for (int s = 0; s < slots; s++) {
+        const int d = ata64_slot_to_drive64(s);
+        if (d < 0 || d >= kDiskSlots) continue;
         if (!g_disks[d].present || g_disks[d].atapi) continue;
         if (g_row_count >= 24) break;
         ListRow& r = g_rows[g_row_count++];
@@ -309,6 +327,7 @@ static void build_rows() {
         char* p = r.text;
         str_append(p, "驱动器 ", 20);
         str_append_u64(p, (uint64_t)d, 4);
+        str_append(p, d >= ATA64_AHCI_BASE ? "  AHCI" : "  PATA", 8);
         str_append(p, "  ", 4);
         str_append(p, g_disks[d].model, 41);
         str_append(p, "  ", 4);
@@ -434,7 +453,24 @@ static void draw_disk_page() {
     fb_draw_rect(list_x, list_y, list_w, list_h, C_DIM);
 
     if (g_row_count == 0) {
-        ui_text(list_x + 24, list_y + 24, "没有检测到可用硬盘。请连接硬盘后点击\"刷新\"。", C_TEXT);
+        // ★ item 5a：找不到任何可用磁盘时，**直接把屏幕硬件检查报告画在这里** ——
+        //   真机上没有串口，让用户面对一个空白列表发呆是没法排查的（报告里有存储/输入/显示区块，
+        //   一眼就能看出"是没接盘 / 是 NVMe 不支持 / 是 SATA 没在 AHCI 模式"）。
+        //   报告不放在这里时（有盘）不画，以免干扰正常流程与既有像素断言。
+        ui_text(list_x + 24, list_y + 10, "没有检测到可用硬盘（no usable disk）。请检查接线/BIOS 的 SATA 模式后点击\"刷新\"。", C_TEXT);
+        {
+            // 只打一次日志（每帧重绘都会走到这里，不能刷屏）
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                dbg64_line_begin64();
+                dbg64_str("[HWUI] report drawn in setup wizard (no usable disk)");
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+        }
+        const int ry = list_y + 44;
+        hwui64_draw64(list_x + 6, ry, list_w - 12, list_h - 50, 0);
     }
     const int row_h = 34;
     for (int i = 0; i < g_row_count; i++) {
@@ -693,7 +729,7 @@ static bool       g_reboot_armed = false;
 
 // 从行里取出"目标磁盘的总扇区数"
 static uint32_t row_disk_sectors(int drive) {
-    return (drive >= 0 && drive < 4) ? g_disks[drive].sectors : 0;
+    return (drive >= 0 && drive < kDiskSlots) ? g_disks[drive].sectors : 0;   // ★ 含 AHCI 盘（8..）
 }
 
 // 取出该行对应的分区信息（MBR 里的第 part 项，1-based）

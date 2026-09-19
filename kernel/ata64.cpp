@@ -7,6 +7,7 @@
 //   * 每个扇区等一次 DRQ，再搬 256 个字；读/写命令收尾都等一次"完成中断"
 //   * 写盘用 0x30 (WRITE SECTORS) + 每个扇区等 DRQ 后写 256 个字，最后等 BSY/DRQ 清零
 #include "ata64.h"
+#include "ahci64.h"     // ★ item 5a：驱动器号 ≥ ATA64_AHCI_BASE 时把识别/读写分派到 AHCI(SATA)
 #include "port.h"
 #include "debug64.h"
 #include "x86_64.h"      // pic_unmask64 / g_ticks64：IRQ14 等待与超时计时
@@ -186,13 +187,29 @@ static bool ata_wait_done_irq(int drive) {
     return false;
 }
 
+// ---------------- 枚举接口（统一驱动器号，见 ata64.h）----------------
+// 上层（setup64 / part64）用它枚举，不要自己写 for (d=0; d<4; d++)：
+//   槽 0..3 -> 驱动器号 0..3（PATA）；槽 4.. -> 驱动器号 8,9,...（AHCI 盘）
+int ata64_drive_count64() { return 4 + ahci64_count64(); }
+
+int ata64_slot_to_drive64(int slot) {
+    if (slot < 0) return -1;
+    if (slot < 4) return slot;
+    const int n = ahci64_count64();
+    const int i = slot - 4;
+    if (i >= n) return -1;                      // 越界（槽数比实际盘多时）
+    return ATA64_AHCI_BASE + i;
+}
+
 // ---------------- IDENTIFY ----------------
+// 分派：驱动器号 ≥ ATA64_AHCI_BASE 走 AHCI（ahci64_info64 复用同一份 DiskInfo）。
 bool ata64_identify(int drive, DiskInfo* out) {
     out->present = false;
     out->atapi = false;
     out->sectors = 0;
     out->model[0] = 0;
-
+    if (drive >= ATA64_AHCI_BASE) return ahci64_info64(drive - ATA64_AHCI_BASE, out);
+    if (drive < 0 || drive > 3) return false;   // 4..7 保留空洞：不映射任何设备
     const uint16_t io = base_port(drive);
     outb((uint16_t)(io + 6), drive_select(drive));
     ata_delay(drive);
@@ -247,6 +264,9 @@ bool ata64_identify(int drive, DiskInfo* out) {
 
 // ---------------- READ ----------------
 bool ata64_read(int drive, uint32_t lba, uint32_t count, void* buf) {
+    // ★ item 5a 分派：驱动器号 ≥ ATA64_AHCI_BASE -> AHCI(SATA) DMA 读（LBA48）
+    if (drive >= ATA64_AHCI_BASE) return ahci64_read64(drive - ATA64_AHCI_BASE, lba, count, buf);
+    if (drive < 0 || drive > 3) return false;   // 4..7 保留空洞
     if (count == 0) return true;
     const uint16_t io = base_port(drive);
     // ★ 踩坑记录：必须**先选盘再等状态**。状态寄存器反映的是"当前选中的驱动器"，
@@ -289,6 +309,9 @@ bool ata64_read(int drive, uint32_t lba, uint32_t count, void* buf) {
 
 // ---------------- WRITE ----------------
 bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf) {
+    // ★ item 5a 分派：驱动器号 ≥ ATA64_AHCI_BASE -> AHCI(SATA) DMA 写（LBA48）
+    if (drive >= ATA64_AHCI_BASE) return ahci64_write64(drive - ATA64_AHCI_BASE, lba, count, buf);
+    if (drive < 0 || drive > 3) return false;   // 4..7 保留空洞
     if (count == 0) return true;
     const uint16_t io = base_port(drive);
     // 同 ata64_read：先选盘再等状态
@@ -630,13 +653,21 @@ void ata64_atapi_diag(int drive) {
     dbg64_nl();
 }
 
-// ==================== IRQ14 初始化 + 自检 ====================
+// ==================== 初始化（PATA IRQ14 + AHCI）+ 自检 ====================
 // 为什么放驱动里做：安装程序用 ATA，系统内核的 VFS/store 也用 ATA；两份内核的启动
 // 路径各调用一次 ata64_init64()（kernel64.cpp 的 os_boot_path / setup64.cpp 的 setup64_run）。
 //
 // 设备控制寄存器（0x3F6/0x376）bit1 = nIEN：0 = 允许设备拉中断线。引导层只读过它、
 // 没写过，这里显式清 0，保证 IRQ14 一定会被拉起来。
+//
+// ★ item 5a：这里同时把 AHCI(SATA) 拉起来（ahci64_init64 幂等；没有控制器只打
+//   "[AHCI64] not found" 就返回，PATA 路径完全不受影响）。**顺序有讲究**：
+//   AHCI 先初始化 —— 上层的磁盘枚举（setup64 的 enumerate_disks / part64 的形状探测）
+//   靠 ata64_drive_count64() = 4 + ahci64_count64() 决定要枚举几个槽，枚举必须看到
+//   最终结果，不能"先枚举完再发现还有 SATA 盘"。
 void ata64_init64() {
+    ahci64_init64();                                    // 幂等：没有控制器 -> not found（优雅降级）
+    (void)ahci64_selftest64();                          // 只读：每块 AHCI 盘读 LBA0（没盘/没控制器 -> skipped）
     if (g_ata64_irq_enabled) return;                    // 幂等
     outb(ctrl_port(0), 0x00);                           // 主通道：nIEN=0
     outb(ctrl_port(2), 0x00);                           // 从通道同样放开（IRQ15 未挂入口，仅取一致）

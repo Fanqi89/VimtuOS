@@ -180,8 +180,13 @@ bool part_format_partition(int drive, const PartInfo& p, int index) {
 }
 
 // ---------------- 安装：整盘复制 ----------------
+// ★ item 5a：枚举改成"槽位"接口（PATA 0..3 + AHCI 8..），不再写死 0..3 ——
+//   否则 SATA 盘上的安装介质/目标盘会被漏掉。驱动号语义见 kernel/ata64.h。
 int part_find_payload_drive(uint32_t payload_lba, uint32_t* out_sectors) {
-    for (int d = 0; d < 4; d++) {
+    const int slots = ata64_drive_count64();
+    for (int s = 0; s < slots; s++) {
+        const int d = ata64_slot_to_drive64(s);
+        if (d < 0) continue;
         DiskInfo di;
         if (!ata64_identify(d, &di) || !di.present || di.atapi) continue;
         if (!ata64_read_sector(d, payload_lba, g_sec)) continue;
@@ -203,7 +208,10 @@ int part_find_payload_drive(uint32_t payload_lba, uint32_t* out_sectors) {
 static const uint32_t ISO_PVD_LBA512 = 16u * 4u;      // 16 个 2048B 扇区 = 64 个 512B 扇区
 
 int part_find_iso_medium_drive(void) {
-    for (int d = 0; d < 4; d++) {
+    const int slots = ata64_drive_count64();          // ★ item 5a：含 AHCI 盘（U 盘挂 SATA 时也要认出来）
+    for (int s = 0; s < slots; s++) {
+        const int d = ata64_slot_to_drive64(s);
+        if (d < 0) continue;
         DiskInfo di;
         if (!ata64_identify(d, &di) || !di.present || di.atapi) continue;
         if (di.sectors < ISO_PVD_LBA512 + 1) continue;

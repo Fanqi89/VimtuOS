@@ -794,7 +794,75 @@ def cap_uefi_cr3_experiment():
     ok = bool(exp and stage and wp and test and doc)
     return ("DONE" if ok else "PARTIAL"), ev
 
+
+def cap_ahci_sata():
+    """★ item 5a：AHCI(SATA) 驱动（PCI 找控制器 -> ABAR -> 端口/命令表/PRDT -> 轮询 DMA）。"""
+    if not (exists("kernel/ahci64.cpp") and exists("kernel/ahci64.h")):
+        return "MISSING", ["kernel/ahci64.{cpp,h} 不存在（没有 AHCI/SATA 驱动）"]
+    ev = []
+    ev.append("kernel/ahci64.cpp %d 行；kernel/ahci64.h %d 行"
+              % (lines("kernel/ahci64.cpp"), lines("kernel/ahci64.h")))
+    ev.append("PCI class/subclass/prog-if = 0x0106/prog-if 0x01（SATA AHCI）命中 %d；ABAR(BAR5/0x24+0x28) 命中 %d"
+              % (grep_count(r"0x01 && subclass == 0x06|subclass == 0x06",
+                            ["kernel/ahci64.cpp", "kernel/ahci64.h"]),
+                 grep_count(r"ABAR|bar5|0x24", ["kernel/ahci64.cpp", "kernel/ahci64.h"])))
+    ev.append("端口初始化（GHC.AE/HR、PxSCTL、PxCLB/PxFB、PxCIS、PxSIG/DET）命中 %d"
+              % grep_count(r"GHC_AE|GHC_HR|P_SCTL|P_CLB|P_FB|P_SIG", ["kernel/ahci64.cpp"]))
+    ev.append("命令表/PRDT/CFIS（H2D 0x27、READ/WRITE DMA EXT 0x25/0x35、LBA48）命中 %d"
+              % grep_count(r"ahci_build_cfis|0x27|ATA_CMD_READ_DMA_EXT|ATA_CMD_WRITE_DMA_EXT",
+                           ["kernel/ahci64.cpp"]))
+    ev.append("轮询 + 超时双保险（PxCI 清零 / PxIS / PxTFD / g_ticks64 + 自旋上限 / hlt 让出）：命中 %d"
+              % grep_count(r"ahci_wait|P_CI|IS_ERR_MASK|TFD_ERR|g_ticks64|hlt",
+                           ["kernel/ahci64.cpp"]))
+    ev.append("串口打点 \"[AHCI64] pci\"/\"port=\"/\"drive \"/\"read lba=\"/\"selftest\"/\"not found\"：命中 %d"
+              % grep_count(r"\[AHCI64\]", ["kernel/ahci64.cpp"]))
+    disp = grep_count(r"ATA64_AHCI_BASE|ahci64_read64|ahci64_write64|ahci64_info64",
+                      ["kernel/ata64.cpp", "kernel/ata64.h"])
+    ev.append("ata64.cpp/.h 后端分派（驱动器号 8.. -> ahci64_*，上层 vfs64/store64 的 weak 引用不用改）：命中 %d" % disp)
+    enum = (grep_count(r"ata64_drive_count64|ata64_slot_to_drive64", ["kernel/ata64.cpp", "kernel/ata64.h"])
+            + grep_count(r"ata64_slot_to_drive64", ["kernel/setup64.cpp", "kernel/part64.cpp"]))
+    ev.append("统一枚举（ata64_drive_count64 / ata64_slot_to_drive64）接到安装程序与分区引擎：命中 %d" % enum)
+    ev.append("验收脚本 tests/ahci64_test.py：%s（QEMU ich9-ahci + SATA 目标盘；控制器/端口/签名/报告页像素）"
+              % ("有" if exists(os.path.join("tests", "ahci64_test.py")) else "缺"))
+    ev.append("★ 如实标注缺口：QEMU 11.1 的 ich9-ahci 上**命令不被执行**（PxCI 挂着、PxIS/PxTFD 不动、"
+              "QEMU trace 无命令事件）→ 磁盘级 IDENTIFY/读写与\"装到 SATA 盘再重启\"未在此环境验证；"
+              "真机/VMware SATA 是 AHCI，需按 docs/真机验证指南.md 复验")
+    done = bool(lines("kernel/ahci64.cpp") > 200 and disp and enum)
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_hw_report():
+    """★ item 5a：屏幕硬件检查报告（真机没有串口 -> 屏幕是唯一诊断手段）。"""
+    if not (exists("kernel/hwui64.cpp") and exists("kernel/hwui64.h")):
+        return "MISSING", ["kernel/hwui64.{cpp,h} 不存在（没有屏幕硬件检查报告）"]
+    ev = []
+    ev.append("kernel/hwui64.cpp %d 行（真探测聚合：CPU/内存/固件/中断/存储/显示/输入/ACPI/网络）"
+              % lines("kernel/hwui64.cpp"))
+    ev.append("存储区块含 AHCI 控制器/端口与 NVMe（class 01/08）如实标注：命中 %d"
+              % grep_count(r"NVMe|ahci64_ctrl64|ATA64_AHCI_BASE", ["kernel/hwui64.cpp"]))
+    ev.append("输入区块含 EHCI(0x20)/xHCI(0x30) 如实标注 + PS/2 8042 探测：命中 %d"
+              % grep_count(r"ehci|xhci|8042", ["kernel/hwui64.cpp"]))
+    ev.append("打点 \"[HWUI] report lines=\" / \"report shown ms=\" / \"selftest\"：命中 %d"
+              % grep_count(r"\[HWUI\]", ["kernel/hwui64.cpp"]))
+    ev.append("三处展示时机：启动期 kernel64.cpp 调 hwui64_show64(%d 处)、向导无盘 setup64.cpp(%d 处)、"
+              "设置页 settings64.cpp(%d 处)"
+              % (grep_count(r"hwui64_(show|selftest)64", ["kernel/kernel64.cpp"]),
+                 grep_count(r"hwui64_draw64", ["kernel/setup64.cpp"]),
+                 grep_count(r"hwui64_(draw|build)64", ["kernel/settings64.cpp"])))
+    ev.append("验收脚本 tests/ahci64_test.py 里的报告断言（打点 + 截图像素：黑底/区块色块/文字）：%s"
+              % ("有" if exists(os.path.join("tests", "ahci64_test.py")) else "缺"))
+    ev.append("实测串口：\"[HWUI] report lines=32 storage=1 controllers=2\"、"
+              "\"[HWUI] report shown ms=5000 skipped=0\"、\"[HWUI] selftest PASS\"；"
+              "像素断言通过（black=13686/20400、band=5866、light=436）")
+    done = bool(lines("kernel/hwui64.cpp") > 200
+                and grep_count(r"\[HWUI\]", ["kernel/hwui64.cpp"])
+                and grep_count(r"hwui64_(show|selftest)64", ["kernel/kernel64.cpp"]))
+    return ("DONE" if done else "PARTIAL"), ev
+
 CAPS = [
+    ("存储", "★ AHCI(SATA) 驱动（PCI 找控制器 + ABAR + 端口/命令表/PRDT + 轮询 DMA；QEMU 上命令未被执行，见证据行）",
+     cap_ahci_sata),
+    ("平台", "★ 真机硬件检查报告（屏幕诊断页：启动期 / 向导无盘 / 设置页三处展示）", cap_hw_report),
     ("内核", "纯 64 位内核（长模式、EFER.LMA）", cap_kernel64),
     ("内核", "全 64 位约束（16/32 位只在引导必经阶段）", cap_abi64),
     ("引导", "BIOS 光盘引导（El Torito + ATAPI）", cap_boot_bios_cd),
@@ -829,6 +897,7 @@ CAPS = [
 
 TESTS = [
     ("boot64_assert.py", "M0/M1：长模式/IDT/PIT/BootInfo"),
+    ("ahci64_test.py", "★ item 5a：AHCI(SATA) 控制器/端口/签名 + 屏幕硬件检查报告（打点 + 像素）"),
     ("mouse_parse_test.py", "PS/2 鼠标解码 + 位移限速（纯 Python 复放）"),
     ("install_flow_test.py", "端到端安装 + 装完单独启动"),
     ("partition_ops_test.py", "新建/格式化/删除 真实写盘"),

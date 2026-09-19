@@ -1,3 +1,6 @@
+#pragma once
+#include <stdint.h>
+
 // ata64.h - Vimtu64 精简 ATA PIO 驱动（安装程序专用）
 //
 // 为什么不直接用 32 位的 kernel/ata.cpp：
@@ -5,11 +8,25 @@
 //   而安装程序需要的是"枚举所有磁盘 + 读写任意 LBA"这种更小、更硬的需求。
 //   这里独立实现，避免把安装程序绑到桌面系统的模块图上。
 //
-// 支持：主/从 4 个驱动器（primary/secondary × master/slave），LBA28 PIO 读写。
-// 限制：只支持 LBA28（≤128GB），不做 DMA；等 DRQ/完成默认由 IRQ14 中断唤醒，
-//   超时 / 从通道（IRQ15 未接） / 调用点 IF=0 时自动回退 PIO 轮询（见 ata64_init64 注释）。
-#pragma once
-#include <stdint.h>
+// 支持：PATA 4 个驱动器（primary/secondary × master/slave，LBA28 PIO）**+ AHCI(SATA)**。
+// 限制：PATA 侧只支持 LBA28（≤128GB）、不做 DMA；AHCI 侧走 DMA + LBA48（见 kernel/ahci64.h），
+//   两者都默认由中断/轮询等待，超时/从通道/调用点 IF=0 时自动回退 PIO 轮询（见 ata64_init64 注释）。
+//
+// ==================== 统一驱动器号（item 5a：AHCI 接入后**保持语义一致**）====================
+//   0..3          = PATA（0=primary master / 1=primary slave / 2=secondary master / 3=secondary slave）
+//   8..(8+N-1)    = AHCI 上第 1..N 块 **ATA 盘**（N = ahci64_count64()；AHCI 端口按端口号升序编号）
+//   4..7          = 保留空洞（不映射任何设备）—— 旧代码里的"0..3 循环"必须改成下面的槽位接口
+// 上层（setup64 / part64 / vfs64 / store64）拿到的驱动器号就是上面这套编号，读写/识别全部由
+// 本文件的 ata64_* 内部**分派**：≥ ATA64_AHCI_BASE 转 ahci64_*，其余走 PATA。
+// 为什么要留空洞而不是紧接着 4 号：AHCI 盘的编号一旦与 PATA 混在一起，将来加第三类控制器
+// （NVMe 之类）就会漂；留一段固定基址，编号=接口类型，分区表/安装逻辑里写下的号永远可解释。
+static const int ATA64_AHCI_BASE = 8;
+
+// 枚举接口（**新代码用它，不要自己写 for (d=0; d<4; d++)**）：
+//   ata64_drive_count64()   = 4 + AHCI 盘数（即"有几个可枚举的槽"）
+//   ata64_slot_to_drive64(i)= 第 i 个槽的驱动器号（0,1,2,3,8,9,...；i 越界返回 -1）
+int ata64_drive_count64();
+int ata64_slot_to_drive64(int slot);
 
 struct DiskInfo {
     bool     present;
@@ -18,13 +35,14 @@ struct DiskInfo {
     uint64_t sectors;        // 总扇区数（512B/扇区）
 };
 
-// drive: 0=primary master, 1=primary slave, 2=secondary master, 3=secondary slave
+// drive: 0=primary master, 1=primary slave, 2=secondary master, 3=secondary slave,
+//        8..=AHCI 盘（见上面的统一驱动器号说明）；in 4..7 是保留空洞，调用必失败。
 bool ata64_identify(int drive, DiskInfo* out);
 
-// 读写（LBA28）：count ≤ 255。返回 false 表示出错。
+// 读写：PATA 侧 LBA28、count ≤ 255；AHCI 侧 LBA48、count ≤ 65536（按 128 扇区分块）。
+// 驱动器号分派同上：≥ ATA64_AHCI_BASE 走 ahci64_read64/write64。返回 false 表示出错。
 bool ata64_read (int drive, uint32_t lba, uint32_t count, void* buf);
 bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf);
-
 
 // ---------------- ATAPI（光驱）：PACKET 命令 + PIO 读 ----------------
 // 为什么需要它：64 位安装介质的正确形态是 **ISO**（光盘/U 盘/虚拟机光驱），

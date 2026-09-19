@@ -67,6 +67,7 @@ extern "C" const uint8_t _binary_build64_user_demo64_bin_end[];
 #include "debug64.h"
 #include "memlayout64.h"
 
+#include "hwui64.h"      // ★ item 5a：屏幕硬件检查报告（**两份内核都编**：安装介质与系统内核共用）
 // ---- 平台层（64 位）：PIC/PIT/IDT/TSS/RTC，实现在 kernel/x86_64.cpp ----
 #include "x86_64.h"
 // ---- 图形栈与输入（与 32 位共用同一份源文件：只依赖 port.h / fb.h 等纯 IO 接口）----
@@ -660,6 +661,18 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     pic_unmask64(12);                // IRQ12：鼠标（自动级联开放 IRQ2）
     dbg64_str("[G64] input ready (kbd irq1 + mouse irq12)");
     dbg64_nl();
+
+    // ==================== 屏幕硬件检查报告（真机可用性套件 item 5a）====================
+    // 为什么放在这里：图形 + 字体 + 键鼠都已经就绪（fb_init/font_init/kbd_init/mouse_init 在上面），
+    // 而安装程序/桌面还没开始跑 —— 真机上没有串口，这是用户唯一能在"还没进系统"时看到的诊断画面。
+    // 位置的三点理由：
+    //   1) 必须在输入就绪之后（任意键跳过要能收到键；kbd_drain 会清掉进页前的按键）；
+    //   2) 必须在 setup64_run()/os_boot_path() 之前（那之后不再返回）；
+    //   3) 报告内部会确保 ahci64_init64()/display64_init64() 已跑（都是幂等只读探测），
+    //      这样"存储/显示"区块在安装程序枚举磁盘之前就有真值。
+    // 展示时长 5 秒（规格要求"约 5 秒"），任意键提前结束；打点见 hwui64_show64。
+    (void)hwui64_selftest64();
+    (void)hwui64_show64(5000);
 
 #ifdef VIMTU_INSTALLER_MEDIA
     // ==================== 安装介质：进入安装程序（不返回）====================

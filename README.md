@@ -37,6 +37,7 @@
 | **USB 主机 + HID 键盘** | `usb64.cpp`：UHCI + 控制/中断传输 + HID 引导键盘，按键经 `kbd_inject_scancode()` 注入 PS/2 **同一条队列** —— 桌面零改动即可响应（实测 USB 键盘按键真的打开了终端） |
 | **ATA 中断** | `ata64.cpp` 接上 IRQ14（中断唤醒替代 PIO 轮询），超时 / 从通道 / IF=0 自动回退轮询并只告警一次；实测 `irq14 selftest reads=2 irqs=1 polled=0` |
 | **桌面外壳与自带应用** | 窗口 z 序 / 拖拽缩放 / 任务栏 / 开始菜单 / 脏矩形 + **扫雷、计算器、终端、设置、任务管理器、我的电脑、系统监视器、关于** |
+| **AHCI(SATA) + 屏幕硬件检查报告（item 5a）** | `ahci64.cpp`：PCI 找 class 01/06/prog-if 01 → BAR5(ABAR，含 64 位高位) → 逐端口 PxCLB/PxFB + PxCMD(FRE→ST) → PxSSTS/PxSIG 判设备 → 非队列 DMA 命令表（CFIS H2D `0x27` + READ/WRITE DMA EXT `0x25/0x35`，LBA48）+ PRDT + PxCI 轮询（`g_ticks64`/自旋双超时、hlt 让出）。**统一驱动器号**：`0..3`=PATA、`8..`=AHCI 盘，`ata64.cpp` 内部按号分派 → 安装程序/分区引擎/VFS/store 的 weak 引用**都不用改**。`hwui64.cpp`：**真机没有串口时的唯一诊断画面** —— 把 CPU/内存/固件与地址空间/中断与 SMP/**存储（PATA 通道 + AHCI 控制器与端口 + NVMe 标"不支持"）**/显示（fb+EDID）/输入（PS/2 8042 + UHCI HID；EHCI/xHCI 标"不支持"）/ACPI/网络逐条画在黑底分区块页面上；三处展示：① 启动期约 5 秒（任意键跳过）② 安装程序找不到磁盘时直接画在向导里 ③ 桌面 设置 → **硬件检查**页。指南见 `docs/真机验证指南.md` |
 | **内核自检** | 启动即跑内存、图形、调度器、VFS、store、syscall、ring3、ELF64/VAP64、APIC/SMP、USB、EDID 等自检，结果打到串口供自动验收断言 |
 
 ## 二、它**不能**做什么（诚实边界，重要）
@@ -52,6 +53,7 @@
 | ⚠️ **USB 只有 UHCI + HID 引导键盘** | 没有 EHCI(USB 2.0) / xHCI(USB 3.x)，没有 USB 鼠标、U 盘、集线器；只认直接插在根端口上的键盘；不接中断（由 `kusb` 线程轮询） |
 | ⚠️ **AP 只是停着** | SMP 能启动 AP 并让它报在线，但**没有多核调度**（调度器仍单核、IRQ0 只在 BSP）、没有 IPI、没有 per-CPU 数据/GDT/TSS，AP 自己的 LAPIC/中断不参与 |
 | ⚠️ **ACPI/APIC 覆盖有限** | 只解析 RSDP/RSDT/XSDT/FADT/MADT/HPET/MCFG；关机仍走 ACPI 端口 0x604 + 8042 回退链；x2APIC 未适配；固件页表没映射 LAPIC/IOAPIC 的机器会留在 PIC |
+| ⚠️ **AHCI 只在 QEMU 上验证到"识别"层** | item 5a 的 AHCI 驱动能识别控制器/端口/磁盘签名（`[AHCI64] pci …`、`port=0 det=3 sig=0x101`），但 **QEMU 11.1 的 `ich9-ahci` 上写 `PxCI` 后 HBA 不执行命令**（PxCI 挂着、PxIS/PxTFD 不动、trace 无命令事件）→ 磁盘级 IDENTIFY/读写与"装到 SATA 盘再重启"**未在模拟器上跑通**；真机/VMware SATA 需按指南复验。另外**引导层仍只走 PATA PIO**：SATA 盘上的系统只能在该盘被固件映射成 IDE 兼容模式时启动 |
 | ⚠️ **只在虚拟机验证** | QEMU + VMware Workstation 双验证（BIOS 与 UEFI 都跑），**未在真机裸机验证**；UEFI 路径未做签名，测试时 `secureBoot=FALSE` |
 | ⚠️ **磁盘仍是 PIO 搬运** | 有了 IRQ14 中断唤醒，但没有 DMA/Bus-Master，读写期间 CPU 仍要逐扇区搬 |
 | ⚠️ **没有声音** | 无音频驱动 |

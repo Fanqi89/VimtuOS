@@ -54,6 +54,7 @@
 #include "config64.h"    // 本轮接线：语言/缩放/会话策略都落在这里（-> store64 持久化）
 #include "session64.h"   // 本轮接线：会话页 = session64 的真策略与 keep 开关
 // ---- 批次 B：设备规格页的真实数据源（全部只读快照；取不到就写原因）----
+#include "hwui64.h"      // ★ item 5a：硬件检查页（报告正文/绘制与启动期那一页共用）
 #include "display64.h"   // 运行期显示层（0x3DA 实测刷新率 / 模式清单 / EDID 对比）
 #include "hwinfo64.h"    // CPU 型号/家族/核数/hypervisor + PCI + 磁盘型号/容量
 #include "net64.h"       // e1000 状态 + 收发计数
@@ -73,7 +74,8 @@
 #define PG_SYSTEM  1
 #define PG_SESSION 2
 #define PG_ABOUT   3
-#define PG_COUNT   4
+#define PG_HWCHECK 4            // ★ item 5a：硬件检查页（报告正文与启动期那一页同一份）
+#define PG_COUNT   5
 
 #define DROP_NONE 0
 #define DROP_RES  1
@@ -125,6 +127,7 @@ static bool     g_close_logged = false;           // "[APP] settings closed" 只
 static bool     g_hz_logged = false;              // 显示页刷新率来源只在首次出值时打一行（自动验收 grep）
 static bool     g_specs_logged = false;           // 批次 B：设备规格页首次绘制的 [UI] settings specs 行
 static bool     g_measure_logged = false;         // 批次 B：显示页首次绘制的实测刷新率来源行
+static bool     g_hwui_logged = false;            // item 5a：硬件检查页首次绘制的 [UI] settings hwui 行
 
 // ==================== 迷你字符串工具（无 libc） ====================
 // 缺 API 的自建替代 #1：内核没有 snprintf/strcat，这里做一个定长追加缓冲。
@@ -1055,6 +1058,34 @@ static void draw_session(const Lay* L, int x0, int y0) {
     }
 }
 
+// ==================== 页面：硬件检查（item 5a）====================
+// 为什么用设置页而不是 gui64 里的独立窗口：设置应用已经是开始菜单里注册好的应用
+// （session64 的 app 表 + gui64 的菜单项都不用动），风险最低；报告正文与绘制函数复用
+// hwui64_*（与启动期那一页、安装程序无盘提示是**同一份内容**，不会出现两套说辞）。
+static void draw_hwcheck(const Lay* L, int x0, int y0) {
+    bool zh = gui64_lang_zh();
+    draw_page_title(L, x0, y0, zh ? "硬件检查" : "Hardware check");
+    const int px = x0 + L->cx0;
+    const int py = y0 + L->y_hdr - 6;
+    const int pw = L->cw - L->cx0 - 20;
+    const int ph = L->ch - (py - y0) - 46;
+    const int n = hwui64_build64();
+    (void)hwui64_draw64(px, py, pw, ph, 0);
+    if (!g_hwui_logged) {                    // 只打一次（每帧重绘都会走到这里）
+        g_hwui_logged = true;
+        dbg64_line_begin64();
+        dbg64_str("[UI] settings hwui lines=");
+        dbg64_dec((uint64_t)n);
+        dbg64_str(" storage=");
+        dbg64_dec((uint64_t)hwui64_storage_count64());
+        dbg64_str(" controllers=");
+        dbg64_dec((uint64_t)hwui64_controller_count64());
+        dbg64_str(" page=hwcheck");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+}
+
 // ==================== 页面：关于 ====================
 static void draw_about(const Lay* L, int x0, int y0) {
     bool zh = gui64_lang_zh();
@@ -1129,9 +1160,9 @@ static void draw_about(const Lay* L, int x0, int y0) {
 }
 
 // ==================== 导航栏 + 语言切换 ====================
-static const char* kNavZh[PG_COUNT] = { "显示", "系统", "会话", "关于" };
-static const char* kNavEn[PG_COUNT] = { "Display", "System", "Session", "About" };
-static const char* kPageName[PG_COUNT] = { "display", "system", "session", "about" };
+static const char* kNavZh[PG_COUNT] = { "显示", "系统", "会话", "关于", "硬件检查" };
+static const char* kNavEn[PG_COUNT] = { "Display", "System", "Session", "About", "Hardware" };
+static const char* kPageName[PG_COUNT] = { "display", "system", "session", "about", "hwcheck" };
 
 static void draw_nav(const Lay* L, int x0, int y0) {
     bool zh = gui64_lang_zh();
@@ -1191,6 +1222,7 @@ static void set_draw(Window* w) {
         case PG_DISPLAY: draw_display(w, &L, x0, y0); break;
         case PG_SYSTEM:  draw_system(&L, x0, y0);     break;
         case PG_SESSION: draw_session(&L, x0, y0);    break;
+        case PG_HWCHECK: draw_hwcheck(&L, x0, y0);    break;   // ★ item 5a：硬件检查页（报告正文复用 hwui64）
         default:         draw_about(&L, x0, y0);      break;
     }
 
@@ -1411,7 +1443,7 @@ static void set_key(Window* w, char c) {
         gui64_invalidate();
         return;
     }
-    if (cc >= '0' && cc <= '3') {
+    if (cc >= '0' && cc <= '4') {                  // 0..4 = 页码（含 item 5a 的"硬件检查"页）
         g_page = cc - '0';
         dbg64_str("[UI] settings page=");
         dbg64_dec((uint64_t)g_page);
