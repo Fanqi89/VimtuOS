@@ -51,6 +51,8 @@
 #include "debug64.h"
 #include "x86_64.h"
 #include "edid64.h"      // 显示器 EDID 解析结果（刷新率/名字/尺寸）：只读，不改 fb 状态
+#include "config64.h"    // 本轮接线：语言/缩放/会话策略都落在这里（-> store64 持久化）
+#include "session64.h"   // 本轮接线：会话页 = session64 的真策略与 keep 开关
 
 // ==================== 常量 ====================
 #define SET_W      700          // 窗口整体尺寸（含标题栏/边框；与 32 位 SET_W/SET_H 一致）
@@ -405,6 +407,14 @@ static void apply_zoom(Window* w, int idx) {
     g_zoom_sel = zoom_sel_from_actual();
 
     log_dec("[UI] settings zoom ", (uint64_t)got);
+    // 本轮接线：缩放写进 config64（-> store64 /store.a|b，3 秒内自动落盘），下次启动沿用
+    cfg64_set_zoom64(got);
+    dbg64_line_begin64();
+    dbg64_str("[CONF64] set key=display.zoom value=");
+    dbg64_dec((uint64_t)got);
+    dbg64_str(" type=int (persisted via store64)");
+    dbg64_nl();
+    dbg64_line_end64();
 
     Buf b; b_init(&b);
     if (got == want) {
@@ -416,7 +426,6 @@ static void apply_zoom(Window* w, int idx) {
     msg_set(b.b, (got == want) ? C_OK : C_WARN);
     after_geom_change(w);
 }
-
 // 语言切换：调外壳，本页文案/导航/标题立即跟随
 static void lang_set(bool zh) {
     gui64_set_lang_zh(zh);
@@ -821,32 +830,38 @@ static void draw_session(const Lay* L, int x0, int y0) {
     bool zh = gui64_lang_zh();
     draw_page_title(L, x0, y0, zh ? "会话 / 应用" : "Session / Apps");
     ui_text(x0 + L->cx0, y0 + L->y_hdr,
-            zh ? "已注册应用（数字 = 当前打开实例数，实测）"
-               : "Registered apps (number = open instances, measured)",
+            zh ? "应用（数字 = 打开实例数；[x] = 关窗/停止时保留状态，点行可切换）"
+               : "Apps (number = open instances; [x] = keep state on close/stop; click a row to toggle)",
             C_ACCENT);
 
     int lx = x0 + L->cx0;
     int y = y0 + L->y_rows;
     const int pitch = 24;
+    static int g_sess_rows[APP_N];      // 每行的 y（命中共用，免得两处几何漂移）
     for (int i = 0; i < APP_N; i++) {
-        int n = gui64_app_windows(kApps[i].id);
+        g_sess_rows[i] = y;
+        const int n = gui64_app_windows(kApps[i].id);
+        const bool keep = session64_app_ok64(kApps[i].id) ? session64_app_keep64(kApps[i].id) : true;
         Buf b; b_init(&b);
+        b_str(&b, keep ? "[x] " : "[ ] ");
         b_str(&b, zh ? kApps[i].zh : kApps[i].en);
         b_str(&b, "   ");
         b_u64(&b, (uint64_t)(n < 0 ? 0 : n));
         b_str(&b, zh ? " 个实例" : " instance(s)");
-        ui_text(lx, y, b.b, C_TEXT);
+        ui_text(lx, y, b.b, keep ? C_TEXT : C_DIM);
         y += pitch;
     }
 
     ui_text(x0 + L->cx0, y0 + L->y_note,
-            zh ? "关闭即清状态：窗口一关，该应用状态即释放（本内核无 on_close 持久化）。"
-               : "State is dropped when a window closes (no persistence in this kernel).",
+            zh ? "策略（真持久化：落 store64 的 /store.a|b，3 秒内自动落盘）"
+               : "Policy (really persisted: store64 /store.a|b, autosaved within 3s)",
             C_DIM);
-    ui_text(x0 + L->cx0, y0 + L->y_note2,
-            zh ? "如实标注：本页设置未接 store64 持久化，不落盘，硬重启后回默认值。"
-               : "Honest note: this page is not wired to store64 persistence; settings never hit disk.",
-            C_WARN);
+    // 策略切换按钮：画在 y_note2 那一行（点击 = 切换 VOLATILE/PERSIST）
+    const bool persist = (session64_mode64() == SESS64_PERSIST);
+    draw_button(x0 + L->cx0, y0 + L->y_note2, 320, 26,
+                persist ? (zh ? "策略：保存（PERSIST）—— 点击切换" : "Policy: PERSIST (click to switch)")
+                        : (zh ? "策略：不保存（VOLATILE）—— 点击切换" : "Policy: VOLATILE (click to switch)"),
+                persist, true);
 
     draw_button(x0 + L->cx0, y0 + L->y_act, 260, 30,
                 zh ? "关闭全部应用窗口（清状态）" : "Close all app windows",
@@ -854,8 +869,8 @@ static void draw_session(const Lay* L, int x0, int y0) {
 
     if (y0 + L->y_foot + font_line_height() <= y0 + L->ch - 4) {
         ui_text(lx, y0 + L->y_foot,
-                zh ? "说明：本页不做真正的持久化（未接 store64 持久化），只提供真实的\"关窗清状态\"。"
-                   : "This page performs no real persistence (not wired to store64).",
+                zh ? "VOLATILE：关窗即清该应用状态；PERSIST：不清状态，且下次启动按会话列表恢复应用。"
+                   : "VOLATILE: closing a window drops that app's state. PERSIST: state kept and apps reopened at boot.",
                 C_FAINT);
     }
 }
@@ -1095,20 +1110,48 @@ static void set_click(Window* w, int cx, int cy) {
         }
     }
 
-    // ---- 会话页动作按钮 ----
+    // ---- 会话页：策略切换 / 应用 keep 开关 / 关闭全部应用 ----
     if (g_page == PG_SESSION) {
+        // 策略切换按钮（画在 y_note2 那一行）
+        if (hit(L.cx0, L.y_note2, 320, 26, cx, cy)) {
+            const bool persist = (session64_mode64() == SESS64_PERSIST);
+            session64_set_mode64(persist ? SESS64_VOLATILE : SESS64_PERSIST);
+            dbg64_str("[UI] settings session policy=");
+            dbg64_str(session64_mode_name64(session64_mode64()));
+            dbg64_nl();
+            msg_set(gui64_lang_zh()
+                        ? (persist ? "策略已切为 VOLATILE（关窗即清状态）"
+                                   : "策略已切为 PERSIST（保留状态，下次启动恢复应用）")
+                        : (persist ? "policy = VOLATILE (state dropped on close)"
+                                   : "policy = PERSIST (state kept, apps reopened at boot)"),
+                    C_OK);
+            gui64_invalidate();
+            return;
+        }
+        // 应用行：点一下切换该应用的 keep 开关
+        for (int i = 0; i < APP_N; i++) {
+            const int ry = L.y_rows + i * 24;
+            if (cy >= ry - 2 && cy < ry + 22 && cx >= L.cx0 - 2 && cx < L.cx0 + 420) {
+                const bool keep = session64_app_keep64(kApps[i].id);
+                session64_set_app_keep64(kApps[i].id, !keep);
+                msg_set(gui64_lang_zh() ? "已切换该应用的保留状态（写入 config64/store64）"
+                                        : "keep flag toggled (written to config64/store64)", C_OK);
+                gui64_invalidate();
+                return;
+            }
+        }
         if (hit(L.cx0, L.y_act, 260, 30, cx, cy)) {
             int n = 0;
             static const int ids[] = { APP_ID_CALC, APP_ID_MINES, APP_ID_TERM, APP_ID_TMGR,
                                        APP_ID_MONITOR, APP_ID_MYPC, APP_ID_RECYCLE, APP_ID_ABOUT };
             for (int i = 0; i < (int)(sizeof(ids) / sizeof(ids[0])); i++) {
-                n += gui64_close_app(ids[i]);      // 真动作：外星窗口关掉 = 状态被清
+                n += gui64_close_app(ids[i]);      // 真动作：窗口关掉 -> session64 按策略清状态
             }
             dbg64_str("[UI] settings session close-apps n=");
             dbg64_dec((uint64_t)n);
             dbg64_nl();
-            msg_set(gui64_lang_zh() ? "已关闭其它应用窗口（状态已清）"
-                                    : "other app windows closed (state cleared)", C_OK);
+            msg_set(gui64_lang_zh() ? "已关闭其它应用窗口（VOLATILE 下状态已清）"
+                                    : "other app windows closed (state cleared under VOLATILE)", C_OK);
             gui64_invalidate();
             return;
         }

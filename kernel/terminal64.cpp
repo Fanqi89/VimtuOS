@@ -38,18 +38,24 @@
 //   [APP] term reset                    会话重置（清屏/清状态）
 //   [APP] term closed                   关窗
 //   [UI]  term layout client=WxH cols=N rows=M   布局变化（开窗时也打一行）
-//   [TERM] cmd <名字>                   每条命令执行打一行；失败时改为 [TERM] cmd <名字> fail
-//   [TERM] unsupported <名字>: <原因>     未支持命令的说明（同时会打 cmd ... fail）
+//   [TERM] cmd <名字> ok|fail            每条命令执行打一行（本轮起固定带 ok/fail —— 新增的真命令
+//                                        用它做是否真的实现过的判据；旧格式只有失败才带 fail）
+//   [TERM] unsupported <名字>: <原因>     未支持命令的说明（现在只剩 update / preload 两条）
 //   [TASK] ps rows=N switches=M          ps/tasks/task/top 打点（任务表真实行数 + 累计切换次数）
 //   [TASK] kill id=N ok                  kill <id> 成功（终端的 kill 只走 task_kill64 真路径）
 //   [APP64] run cmd path=<p> rc=<n>      run <name> 的命令打点（走 app64_launch64 真路径）
 //   [STORE64] cmd <dump|get|set|flush> ...  store 命令打点（走 kernel/store64.cpp 真路径）
 //
-// 【Shell 命令】32 位能实现、且 64 位有对应子系统的全部实现；依赖未移植子系统的如实提示"未支持"，
-//   不静默失败（cfg/syslog/state/health/session/update/disk/hw/lspci/user/preload/bsod）。
+// 【Shell 命令】32 位能实现、且 64 位有对应子系统的**全部**实现；仍未移植的只有 2 条
+//   （update / preload，属于后续批次），它们的提示里有"尚未支持"字样。
+//   本轮刚接真的：hw/hwinfo（hwinfo64 的 CPU/PCI）、lspci/pci（PCI 设备表）、disk/ata（ATA IDENTIFY
+//   型号/容量 + VimtuFS2 卷几何）、user/userprog（ring3 现状，arg=run 时跑一次用户程序）、
+//   cfg/config（config64 类型化配置 + 落盘位置）、syslog/state/health（sysstate64 状态机/模块/健康/ring log）、
+//   session（session64 会话策略）、restart --soft（优雅停止 + 硬复位链）、panic/bsod（受控蓝屏）。
 //   任务相关命令（ps/tasks/task/top/kill <id>）走内核任务表（kernel/task64.h 的对外 API），
 //   没有任何假数据：任务数为 0 时如实打印"无任务数据"。
-//   文件系统：本文件内实现的最小 ramfs（16 个文件 × 512 字节，静态数组，RAM only，重启即丢）。
+//   文件系统：本文件内仍有一个最小 ramfs（16 个文件 × 512 字节，RAM only）供 echo >/cat/ls 用；
+//   **真文件系统**是 VimtuFS2（kernel/vfs64.cpp，磁盘上的 /store.a|b、/hello.vap、/hello.elf 都在它上面）。
 //
 // 【约束】只允许整数运算（内核 -mno-sse，无 float/double）；不 include 标准头（无 STL/libc/printf），
 //   数字格式化 / 字符串比较 / UTF-8 解码全部是下面的 static 工具。
@@ -65,6 +71,15 @@
 #include "elf64.h"     // ELF64 加载器（elfrun <path>；run 也会按文件头自动分派到它）
 #include "store64.h"   // 设置持久化 store（store dump|get|set|flush：VFS 文件 /store.a、/store.b）
 #include "net64.h"     // 网络（e1000 + ARP/ICMP）：ping 命令走它的真路径
+// ---- 本轮接线（终端命令的真实现）----
+#include "hwinfo64.h"    // hw/hwinfo + lspci：CPU/PCI 真实枚举结果
+#include "ata64.h"       // disk/ata：ATA IDENTIFY（型号/容量；读取自带超时保护）
+#include "vfs64.h"       // disk：卷状态；user：盘上的 ring3 程序
+#include "usermode64.h"  // user/userprog：ring3 用户窗口地址与页映射查询
+#include "config64.h"    // cfg/config：类型化配置 + 存储位置（落在 store64 上）
+#include "session64.h"   // session：会话/应用内容策略的真实现
+#include "sysstate64.h"  // syslog/state/health：状态机 + 模块表 + 健康 + ring log
+#include "panic64.h"     // panic/bsod：受控蓝屏；ping 期间的看门狗停表
 #include <stdint.h>
 
 // ==================== 常量 ====================
@@ -248,7 +263,7 @@ static uint32_t utf8_next(const char* s, int* adv) {
 static void term_log_cmd(const char* name, bool ok) {
     dbg64_str("[TERM] cmd ");
     dbg64_str((name && name[0]) ? name : "?");
-    if (!ok) dbg64_str(" fail");
+    dbg64_str(ok ? " ok" : " fail");
     dbg64_nl();
 }
 
@@ -718,16 +733,26 @@ static const char* HELP_EN =
     "  lang [zh|en]          switch Chinese / English\n"
     "  clear                 clear screen\n"
     "  about                 about VimtuOS\n"
-    "  reboot / restart      restart (restart --soft is not ported)\n"
+    "  reboot                hard restart (8042 -> 0xCF9 -> triple fault)\n"
+    "  restart --soft        graceful restart: stop modules + flush session/config, then hard reset\n"
     "  shutdown              power off\n"
-    "  set KEY VALUE         settings (only lang)\n"
+    "  set KEY VALUE         setting via config64 (lang / theme / mouse.sens / ... persisted to /store.a|b)\n"
     "  store dump            persistent store: keys/slot/gen/carrier + every key=value (screen + serial)\n"
     "  store get KEY         print KEY=VALUE from the store (or (nil) if absent)\n"
     "  store set KEY VALUE   change the store in memory (run 'store flush' to persist)\n"
     "  store flush           persist to VimtuFS2 /store.a|/store.b (raw-disk fallback if no volume)\n"
     "  ping <ip>             ARP + ICMP echo x3 via e1000/net64 (e.g. ping 10.0.2.2); serial: [NET64] cmd ping\n"
+    "  cfg                   config64: type (int/str/bool) + value + default/store source + carrier/slot/gen\n"
+    "  cfg get KEY           one config key; cfg set KEY VALUE (or KEY=VALUE); cfg save; cfg reset\n"
+    "  syslog                sysstate64 ring log (fixed 64-line circular log) + [SYS64] syslog lines=N\n"
+    "  state                 system state machine (BOOT/STARTING/RUNNING/STOPPING/STOPPED) + module table\n"
+    "  health                per-module health report ([SYS64] health ok modules=N failed=0)\n"
+    "  session               session policy (VOLATILE/PERSIST + per-app keep flags, persisted via config64)\n"
+    "  disk, hw, lspci       ATA IDENTIFY (model/capacity) + VimtuFS2 volume; CPU/PCI; PCI device list\n"
+    "  user [run]            ring3 status (window/VA/gates/on-disk programs); 'user run' launches /hello.vap\n"
+    "  panic <code>, bsod    controlled BSOD: blue screen + serial stop code, halts after 6s (no auto reboot)\n"
     "Not ported yet (prints a reason):\n"
-    "  cfg syslog state health session update disk hw lspci user preload bsod\n";
+    "  update preload\n";
 
 static const char* HELP_ZH =
     "VimtuOS 64 位 Shell 命令：\n"
@@ -751,16 +776,26 @@ static const char* HELP_ZH =
     "  lang [zh|en]          中英切换\n"
     "  clear                 清屏\n"
     "  about                 关于 VimtuOS\n"
-    "  reboot / restart      重启（restart --soft 未支持）\n"
+    "  reboot                硬重启（8042 -> 0xCF9 -> 三重故障）\n"
+    "  restart --soft        软重启：优雅停止（停模块 + 会话/配置落盘 flush）后走原有硬复位链\n"
     "  shutdown              关机\n"
-    "  set KEY VALUE         设置（仅 lang）\n"
+    "  set KEY VALUE         经 config64 改设置（lang / theme / mouse.sens ... 落到 /store.a|b）\n"
     "  store dump            设置持久化 store：键数/活动槽/世代号/载体 + 每条 key=value（屏幕 + 串口）\n"
     "  store get KEY         读设置：打印 KEY=VALUE（没有该键打印 (nil)）\n"
     "  store set KEY VALUE   改内存里的设置（要落盘请再敲 store flush）\n"
     "  store flush           落盘到 VimtuFS2 的 /store.a、/store.b（没有卷时才退回裸盘槽区）\n"
     "  ping <ip>             经 e1000/net64 发 ARP + 3 次 ICMP echo（例如 ping 10.0.2.2）；串口打 [NET64] cmd ping\n"
+    "  cfg                   config64 配置：类型（int/str/bool）+ 值 + 来源（默认/store）+ 载体/槽/世代号\n"
+    "  cfg get KEY           单键查询；cfg set KEY VALUE（或 KEY=VALUE）；cfg save；cfg reset\n"
+    "  syslog                sysstate64 的 ring log（固定 64 条循环日志）+ 串口打 [SYS64] syslog lines=N\n"
+    "  state                 运行状态机（BOOT/STARTING/RUNNING/STOPPING/STOPPED）+ 模块表\n"
+    "  health                各模块健康报告（串口打 [SYS64] health ok modules=N failed=0）\n"
+    "  session               会话策略（VOLATILE/PERSIST + 每应用 keep 开关，走 config64 持久化）\n"
+    "  disk, hw, lspci       ATA IDENTIFY（型号/容量）+ VimtuFS2 卷；CPU/PCI；PCI 设备列表\n"
+    "  user [run]            ring3 现状（用户窗口/VA/门/盘上程序）；user run 直接跑 /hello.vap\n"
+    "  panic <code>, bsod    受控蓝屏：蓝底白字屏 + 串口停止码，停留 6 秒后停住（不自动重启）\n"
     "未支持（会说明原因）：\n"
-    "  cfg syslog state health session update disk hw lspci user preload bsod\n";
+    "  update preload\n";
 
 // 未支持命令 / 未知命令：打印一行明确说明（不静默失败）
 static bool shell_unsupported(TerminalState* ts, const char* what, const char* en, const char* zh) {
@@ -1139,18 +1174,21 @@ static bool cmd_lang(TerminalState* ts, const char* arg) {
 
 static bool cmd_set(TerminalState* ts, const char* key, const char* val) {
     if (!key || !key[0] || !val || !val[0]) {
-        ts_puts(ts, "set: usage: set KEY VALUE  (only: lang 0|1|zh|en)\n");
+        ts_puts(ts, "set: usage: set KEY VALUE   (e.g. set lang zh | set theme dark | set mouse.sens 2500)\n");
         return false;
     }
     if (st_eq(key, "lang")) {
         return cmd_lang(ts, val);
     }
-    ts_puts(ts, "set: unknown key '");
-    ts_puts(ts, key);
-    ts_puts(ts, "'\n");
-    ts_puts(ts, gui64_tr("  set: only 'lang' is available (config/zoom are owned by the shell settings page)\n",
-                         "  set: 目前只支持 lang（config/缩放由外壳的设置页管理，未移植进终端）\n"));
-    return false;
+    // 本轮起：其它键走 config64 的类型化配置（-> store64 持久化）；`cfg set` 是同一条路。
+    const int rc = config64_set_auto64(key, val);
+    if (rc != 0) {
+        ts_puts(ts, "set: failed (bad key/value; see serial log)\n");
+        return false;
+    }
+    ts_puts(ts, "set "); ts_puts(ts, key); ts_puts(ts, "="); ts_puts(ts, val);
+    ts_puts(ts, "  (config64 -> store64; 'store flush' or the 3s autosave writes it)\n");
+    return true;
 }
 
 // ---------- store：设置持久化（真命令，走 kernel/store64.cpp）----------
@@ -1348,6 +1386,8 @@ static bool cmd_ping(TerminalState* ts, const char* arg) {
                              "ping: net64 未就绪（没有 e1000 链路或启动探测失败；见串口日志）\n"));
     }
 
+    // 看门狗停表：一次 ping 最坏是 ARP 2s + 3×ICMP 2s = 8s，会超过 5s 心跳阈值（不是 bug，是长操作）。
+    panic64_watchdog_pause64();
     int replies = 0;
     int sent = 0;
     for (uint16_t seq = 1; seq <= 3 && up; seq++) {
@@ -1377,7 +1417,465 @@ static bool cmd_ping(TerminalState* ts, const char* arg) {
     dbg64_dec((uint64_t)lost);
     dbg64_nl();
     dbg64_line_end64();
+    panic64_watchdog_unpause64();
     return replies > 0;
+}
+
+// ==================== 本轮接真的命令（hw / lspci / disk / user / cfg / syslog / state / health / session / panic）====================
+// 这些命令原来都是 shell_unsupported 的"尚未支持"桩；现在走各子系统的真 API，输出全是实测值。
+
+// 屏幕上打 0x + 定长十六进制（digits = 4/8/16）
+static void ts_put_hex(TerminalState* ts, uint64_t v, int digits) {
+    static const char* H = "0123456789ABCDEF";
+    char t[20];
+    if (digits <= 0 || digits > 16) digits = 16;
+    for (int i = 0; i < digits; i++) t[i] = H[(v >> ((digits - 1 - i) * 4)) & 0xF];
+    t[digits] = 0;
+    ts_puts(ts, "0x");
+    ts_puts(ts, t);
+}
+
+// ---------- hw / hwinfo：硬件清单（hwinfo64 的 CPUID + PCI 枚举结果）----------
+static void cmd_hw(TerminalState* ts) {
+    const HwInfo64* hw = hw_info64();
+    if (hw->magic != HW64_INFO_MAGIC) {
+        ts_puts(ts, "hw: hwinfo64 not initialized (no CPUID/PCI data)\n");
+        return;
+    }
+    ts_puts(ts, "CPU (CPUID, kernel/hwinfo64.cpp):\n");
+    ts_puts(ts, "  vendor : "); ts_puts(ts, hw->cpu.vendor[0] ? hw->cpu.vendor : "none"); ts_putc(ts, (uint32_t)'\n');
+    ts_puts(ts, "  brand  : "); ts_puts(ts, hw->cpu.brand[0] ? hw->cpu.brand : "none"); ts_putc(ts, (uint32_t)'\n');
+    ts_puts(ts, "  family="); ts_put_u64(ts, hw->cpu.family);
+    ts_puts(ts, " model="); ts_put_u64(ts, hw->cpu.model);
+    ts_puts(ts, " stepping="); ts_put_u64(ts, hw->cpu.stepping);
+    ts_puts(ts, " cores="); ts_put_u64(ts, hw->cpu.cores);
+    ts_putc(ts, (uint32_t)'\n');
+    ts_puts(ts, "  hypervisor: ");
+    ts_puts(ts, hw->cpu.hypervisor[0] ? hw->cpu.hypervisor : "none");
+    ts_putc(ts, (uint32_t)'\n');
+    ts_puts(ts, "  features: lm="); ts_put_u64(ts, hw->cpu.lm ? 1 : 0);
+    ts_puts(ts, " pae="); ts_put_u64(ts, hw->cpu.pae ? 1 : 0);
+    ts_puts(ts, " nx="); ts_put_u64(ts, hw->cpu.nx ? 1 : 0);
+    ts_puts(ts, " sse2="); ts_put_u64(ts, hw->cpu.sse2 ? 1 : 0);
+    ts_puts(ts, " avx="); ts_put_u64(ts, hw->cpu.avx ? 1 : 0);
+    ts_puts(ts, " vmx="); ts_put_u64(ts, hw->cpu.vmx ? 1 : 0);
+    ts_puts(ts, " smep="); ts_put_u64(ts, hw->cpu.smep ? 1 : 0);
+    ts_puts(ts, " smp="); ts_put_u64(ts, hw->cpu.smp ? 1 : 0);
+    ts_putc(ts, (uint32_t)'\n');
+    ts_puts(ts, "PCI (read-only config space enumeration):\n");
+    ts_puts(ts, "  devices="); ts_put_u64(ts, hw->pci.count);
+    ts_puts(ts, " scanned="); ts_put_u64(ts, hw->pci.scanned);
+    ts_puts(ts, " bus_max="); ts_put_u64(ts, hw->pci.bus_max);
+    ts_puts(ts, " ide="); ts_put_u64(ts, hw->pci.ide);
+    ts_puts(ts, " storage="); ts_put_u64(ts, hw->pci.storage);
+    ts_puts(ts, " net="); ts_put_u64(ts, hw->pci.net);
+    ts_puts(ts, " vga="); ts_put_u64(ts, hw->pci.vga);
+    ts_putc(ts, (uint32_t)'\n');
+    ts_puts(ts, "Source: [HW64] serial lines carry the same data\n");
+    dbg64_line_begin64();
+    dbg64_str("[TERM] hw cpu=");
+    dbg64_str(hw->cpu.vendor[0] ? hw->cpu.vendor : "none");
+    dbg64_str(" cores=");
+    dbg64_dec((uint64_t)hw->cpu.cores);
+    dbg64_str(" pci=");
+    dbg64_dec((uint64_t)hw->pci.scanned);
+    dbg64_str(" listed=");
+    dbg64_dec((uint64_t)hw->pci.count);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// ---------- lspci / pci：PCI 设备列表（真实枚举表，表容量 HW64_PCI_MAX = 32）----------
+static void cmd_lspci(TerminalState* ts) {
+    const HwInfo64* hw = hw_info64();
+    if (hw->magic != HW64_INFO_MAGIC) {
+        ts_puts(ts, "lspci: hwinfo64 not initialized (no PCI data)\n");
+        return;
+    }
+    ts_puts(ts, "PCI devices (bus:dev.fn  vendor:device  class:subclass  rev):\n");
+    for (uint32_t i = 0; i < hw->pci.count; i++) {
+        const HwPciDev64* d = &hw->pci.devs[i];
+        ts_puts(ts, "  ");
+        ts_put_u64(ts, d->bus); ts_putc(ts, (uint32_t)':');
+        ts_put_u64(ts, d->dev); ts_putc(ts, (uint32_t)'.');
+        ts_put_u64(ts, d->fn);
+        ts_puts(ts, "  ");
+        ts_put_hex(ts, d->vendor, 4); ts_putc(ts, (uint32_t)':');
+        ts_put_hex(ts, d->device, 4);
+        ts_puts(ts, "  class ");
+        ts_put_u64(ts, d->class_code); ts_putc(ts, (uint32_t)':');
+        ts_put_u64(ts, d->subclass);
+        ts_puts(ts, " rev ");
+        ts_put_u64(ts, d->rev);
+        ts_putc(ts, (uint32_t)'\n');
+    }
+    ts_puts(ts, "  scanned="); ts_put_u64(ts, hw->pci.scanned);
+    ts_puts(ts, " listed="); ts_put_u64(ts, hw->pci.count);
+    ts_puts(ts, "  (class counts: ide=");
+    ts_put_u64(ts, hw->pci.ide);
+    ts_puts(ts, " storage="); ts_put_u64(ts, hw->pci.storage);
+    ts_puts(ts, " net="); ts_put_u64(ts, hw->pci.net);
+    ts_puts(ts, " vga="); ts_put_u64(ts, hw->pci.vga);
+    ts_puts(ts, ")\n");
+    dbg64_line_begin64();
+    dbg64_str("[TERM] lspci scanned=");
+    dbg64_dec((uint64_t)hw->pci.scanned);
+    dbg64_str(" listed=");
+    dbg64_dec((uint64_t)hw->pci.count);
+    dbg64_str(" ide=");
+    dbg64_dec((uint64_t)hw->pci.ide);
+    dbg64_str(" storage=");
+    dbg64_dec((uint64_t)hw->pci.storage);
+    dbg64_str(" net=");
+    dbg64_dec((uint64_t)hw->pci.net);
+    dbg64_str(" vga=");
+    dbg64_dec((uint64_t)hw->pci.vga);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// ---------- disk / ata：ATA IDENTIFY（型号/容量）+ VimtuFS2 卷几何 ----------
+static bool cmd_disk(TerminalState* ts) {
+    ts_puts(ts, "ATA devices (IDENTIFY via kernel/ata64.cpp; PIO with IRQ14 wait + polling fallback):\n");
+    int present_n = 0;
+    for (int d = 0; d < 4; d++) {
+        DiskInfo di;
+        if (!ata64_identify(d, &di) || !di.present) {
+            ts_puts(ts, "  ata"); ts_put_u64(ts, (uint64_t)d); ts_puts(ts, ": none\n");
+            continue;
+        }
+        present_n++;
+        ts_puts(ts, "  ata"); ts_put_u64(ts, (uint64_t)d);
+        ts_puts(ts, (d == 0) ? " (primary master)" : (d == 1 ? " (primary slave)"
+                        : (d == 2 ? " (secondary master)" : " (secondary slave)")));
+        ts_puts(ts, ": ");
+        ts_puts(ts, di.atapi ? "[ATAPI] " : "[ATA] ");
+        ts_puts(ts, di.model[0] ? di.model : "(no model string)");
+        ts_puts(ts, "  sectors=");
+        ts_put_u64(ts, di.sectors);
+        ts_puts(ts, " (");
+        ts_put_u64(ts, di.sectors / 2048);
+        ts_puts(ts, " MB)\n");
+    }
+    Fs64Info fs;
+    const int rc = sysstate64_fsinfo64(&fs);
+    if (rc == 0) {
+        ts_puts(ts, "VimtuFS2 volume @ LBA ");
+        ts_put_u64(ts, fs.pb_lba);
+        ts_puts(ts, ":\n  blocks=");
+        ts_put_u64(ts, fs.total_blocks);
+        ts_puts(ts, "  free=");
+        ts_put_u64(ts, fs.free_blocks);
+        ts_puts(ts, "  inodes=");
+        ts_put_u64(ts, fs.inodes);
+        ts_puts(ts, "  files=");
+        ts_put_u64(ts, fs.files);
+        ts_puts(ts, "  used=");
+        ts_put_u64(ts, fs.used_bytes);
+        ts_puts(ts, " B\n");
+    } else {
+        ts_puts(ts, "VimtuFS2 volume: none (no partition table / mount failed) at LBA ");
+        ts_put_u64(ts, fs.pb_lba);
+        ts_putc(ts, (uint32_t)'\n');
+    }
+    dbg64_line_begin64();
+    dbg64_str("[TERM] disk ata_present=");
+    dbg64_dec((uint64_t)present_n);
+    dbg64_str(" vfs=");
+    dbg64_dec((uint64_t)(rc == 0 ? 1 : 0));
+    if (rc == 0) {
+        dbg64_str(" blocks=");
+        dbg64_dec((uint64_t)fs.total_blocks);
+        dbg64_str(" free=");
+        dbg64_dec((uint64_t)fs.free_blocks);
+        dbg64_str(" files=");
+        dbg64_dec((uint64_t)fs.files);
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+    return true;    // 探测跑到了就算成功；"没有卷"是如实结果（不是命令失败）
+}
+
+// ---------- user / userprog：ring3 用户态现状（arg = "run" 时跑一次用户程序）----------
+static bool cmd_user(TerminalState* ts, const char* arg) {
+    ts_puts(ts, "ring3 user mode (kernel/usermode64.cpp + syscall64.cpp):\n");
+    ts_puts(ts, "  user window : 4GiB .. 4GiB+1MiB\n");
+    ts_puts(ts, "  code entry  : "); ts_put_hex(ts, USER64_CODE_VA64, 16); ts_putc(ts, (uint32_t)'\n');
+    ts_puts(ts, "  user stack  : "); ts_put_hex(ts, USER64_STACK_VA64, 16);
+    ts_puts(ts, "  (16KiB)\n");
+    ts_puts(ts, "  brk region  : "); ts_put_hex(ts, USER64_BRK_VA64, 16);
+    ts_puts(ts, "  (64KiB)\n");
+    ts_puts(ts, "  mmap region : "); ts_put_hex(ts, USER64_MMAP_VA64, 16); ts_putc(ts, (uint32_t)'\n');
+    ts_puts(ts, "  code page mapped right now: ");
+    ts_puts(ts, user64_page_is_user_ok64(USER64_CODE_VA64) ? "yes\n" : "no (no user program running)\n");
+    ts_puts(ts, "  gates: int 0x80 (own ABI) + syscall insn (Linux ABI); both self-tested at boot\n");
+    uint32_t ty = 0, sz = 0;
+    ts_puts(ts, "  on-disk programs (VimtuFS2):\n");
+    if (vfs64_stat("/hello.vap", &ty, &sz) == 0) {
+        ts_puts(ts, "    /hello.vap  "); ts_put_u64(ts, sz);
+        ts_puts(ts, " B (VAP64, int 0x80 ABI)\n");
+    } else {
+        ts_puts(ts, "    /hello.vap  (not installed)\n");
+    }
+    if (vfs64_stat("/hello.elf", &ty, &sz) == 0) {
+        ts_puts(ts, "    /hello.elf  "); ts_put_u64(ts, sz);
+        ts_puts(ts, " B (ELF64, syscall ABI)\n");
+    } else {
+        ts_puts(ts, "    /hello.elf  (not installed)\n");
+    }
+    bool ran = false;
+    int rc = 0;
+    if (arg && st_eq(arg, "run")) {
+        ts_puts(ts, "  running user program: /hello.vap ...\n");
+        gui64_flip_window(ts->win);
+        rc = app64_run_any64("/hello.vap");
+        ran = true;
+        ts_puts(ts, "  run rc=");
+        ts_put_i64(ts, (int64_t)rc);
+        ts_putc(ts, (uint32_t)'\n');
+    } else {
+        ts_puts(ts, "  (use 'user run' to launch /hello.vap in ring3)\n");
+    }
+    dbg64_line_begin64();
+    dbg64_str("[TERM] user ring3 mapped=");
+    dbg64_dec((uint64_t)(user64_page_is_user_ok64(USER64_CODE_VA64) ? 1 : 0));
+    dbg64_str(" ran=");
+    dbg64_dec(ran ? 1 : 0);
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)(rc < 0 ? -rc : rc));
+    dbg64_nl();
+    dbg64_line_end64();
+    return true;
+}
+
+// ---------- cfg / config：config64 的配置 + 存储位置 ----------
+// 支持：cfg | cfg get KEY | cfg set KEY VALUE | cfg set KEY=VALUE | cfg save | cfg reset
+static bool cmd_cfg(TerminalState* ts, const char* sub, const char* arg1, const char* rest) {
+    static char cbuf[2048];
+    if (!sub || !sub[0]) {
+        config64_format64(cbuf, (int)sizeof(cbuf));
+        ts_puts(ts, cbuf);
+        ts_puts(ts, "storage: store64 carrier=");
+        ts_puts(ts, config64_carrier64());
+        ts_puts(ts, " slot=");
+        ts_puts(ts, config64_slot64());
+        ts_puts(ts, " keys=");
+        ts_put_u64(ts, (uint64_t)store64_key_count64());
+        ts_puts(ts, " gen=");
+        ts_put_u64(ts, store64_generation64());
+        ts_puts(ts, " pending=");
+        ts_put_u64(ts, (uint64_t)config64_pending64());
+        ts_putc(ts, (uint32_t)'\n');
+        ts_puts(ts, "  carrier=vfs means the values really live in VimtuFS2 /store.a|/store.b\n");
+        dbg64_line_begin64();
+        dbg64_str("[CONF64] cmd dump keys=");
+        dbg64_dec((uint64_t)config64_count64());
+        dbg64_str(" carrier=");
+        dbg64_str(config64_carrier64());
+        dbg64_str(" pending=");
+        dbg64_dec((uint64_t)config64_pending64());
+        dbg64_nl();
+        dbg64_line_end64();
+        return true;
+    }
+    if (st_eq(sub, "get")) {
+        if (!arg1 || !arg1[0]) {
+            ts_puts(ts, "cfg get: usage: cfg get <key>\n");
+            return false;
+        }
+        char k[CFG64_KEY_MAX], v[CFG64_STR_MAX];
+        int type = 0, from = 0;
+        const int n = config64_count64();
+        for (int i = 0; i < n; i++) {
+            if (config64_entry64(i, k, (int)sizeof(k), v, (int)sizeof(v), &type, &from) != 0) break;
+            if (!st_eq(k, arg1)) continue;
+            ts_puts(ts, k); ts_puts(ts, " = "); ts_puts(ts, v);
+            ts_puts(ts, "  ["); ts_puts(ts, config64_type_name64(type));
+            ts_puts(ts, from ? ",store]" : ",default]");
+            ts_putc(ts, (uint32_t)'\n');
+            dbg64_line_begin64();
+            dbg64_str("[CONF64] cmd get key=");
+            dbg64_str(arg1);
+            dbg64_str(" value=");
+            dbg64_str(v);
+            dbg64_str(" from=");
+            dbg64_str(from ? "store" : "default");
+            dbg64_nl();
+            dbg64_line_end64();
+            return true;
+        }
+        ts_puts(ts, "cfg get: no such key: "); ts_puts(ts, arg1); ts_putc(ts, (uint32_t)'\n');
+        dbg64_line_begin64();
+        dbg64_str("[CONF64] cmd get key=");
+        dbg64_str(arg1);
+        dbg64_str(" value=(nil)");
+        dbg64_nl();
+        dbg64_line_end64();
+        return true;
+    }
+    if (st_eq(sub, "set")) {
+        // 两种写法都收：`cfg set KEY VALUE` 与 `cfg set KEY=VALUE`
+        char key[CFG64_KEY_MAX];
+        char val[CFG64_STR_MAX];
+        int kn = 0, vn = 0;
+        const char* s = arg1 ? arg1 : "";
+        while (s[kn] && s[kn] != '=' && kn < (int)sizeof(key) - 1) { key[kn] = s[kn]; kn++; }
+        key[kn] = 0;
+        if (s[kn] == '=') {
+            const char* p = s + kn + 1;
+            while (*p && vn < (int)sizeof(val) - 1) val[vn++] = *p++;
+        } else {
+            const char* p = rest ? rest : "";
+            while (*p == ' ') p++;
+            while (*p && vn < (int)sizeof(val) - 1) val[vn++] = *p++;
+        }
+        val[vn] = 0;
+        if (!key[0] || !val[0]) {
+            ts_puts(ts, "cfg set: usage: cfg set <key> <value>   (or: cfg set <key>=<value>)\n");
+            return false;
+        }
+        const int rc = config64_set_auto64(key, val);
+        if (rc != 0) {
+            ts_puts(ts, "cfg set: failed (bad key/value; see serial log)\n");
+            return false;
+        }
+        ts_puts(ts, "set "); ts_puts(ts, key); ts_puts(ts, "="); ts_puts(ts, val);
+        ts_puts(ts, "  (in memory; 'store flush' or the 3s autosave writes /store.a|b)\n");
+        return true;
+    }
+    if (st_eq(sub, "save") || st_eq(sub, "flush")) {
+        const int rc = config64_flush64();
+        if (rc != 0) { ts_puts(ts, "cfg save: failed (see serial log)\n"); return false; }
+        ts_puts(ts, "cfg save: ok via "); ts_puts(ts, config64_carrier64());
+        ts_puts(ts, " slot="); ts_puts(ts, config64_slot64()); ts_putc(ts, (uint32_t)'\n');
+        return true;
+    }
+    if (st_eq(sub, "reset")) {
+        config64_factory_reset64();
+        const int rc = config64_flush64();
+        ts_puts(ts, "cfg reset: defaults restored and flushed (rc=");
+        ts_put_i64(ts, (int64_t)rc);
+        ts_puts(ts, ")\n");
+        return true;
+    }
+    ts_puts(ts, "cfg: unknown subcommand: "); ts_puts(ts, sub);
+    ts_puts(ts, "\n  try: cfg | cfg get <key> | cfg set <key> <value> | cfg save | cfg reset\n");
+    return false;
+}
+
+// ---------- syslog：sysstate64 的 ring log（固定条数循环日志）----------
+static void cmd_syslog(TerminalState* ts) {
+    const int n = sysstate64_dump_syslog64(24);   // 串口：syslog 行数 + 最近 24 行
+    ts_puts(ts, "syslog: lines=");
+    ts_put_u64(ts, (uint64_t)n);
+    ts_puts(ts, " (ring cap ");
+    ts_put_u64(ts, (uint64_t)SYS64_LOG_RING);
+    ts_puts(ts, ", newest first)\n");
+    int shown = 0;
+    for (int i = 0; i < n && shown < 24; i++, shown++) {
+        ts_puts(ts, "  ");
+        ts_puts(ts, sys64_log_line64(i));
+        ts_putc(ts, (uint32_t)'\n');
+    }
+    if (n > 24) ts_puts(ts, "  ... (older lines are in the serial log)\n");
+}
+
+// ---------- state：状态机 + 模块表 ----------
+static void cmd_state(TerminalState* ts) {
+    static char sbuf[2048];
+    sysstate64_report64(sbuf, (int)sizeof(sbuf));
+    ts_puts(ts, sbuf);
+    ts_puts(ts, "[SYS64] state=");
+    ts_puts(ts, sysstate64_state_text64());
+    ts_puts(ts, " gen=");
+    ts_put_u64(ts, (uint64_t)sysstate64_generation64());
+    ts_puts(ts, " modules=");
+    ts_put_u64(ts, (uint64_t)sysstate64_module_count64());
+    ts_putc(ts, (uint32_t)'\n');
+}
+
+// ---------- health：健康报告（真值；串口同时打 [SYS64] health ...）----------
+static void cmd_health(TerminalState* ts) {
+    static char hbuf[512];
+    (void)sysstate64_health_report64(1, hbuf, (int)sizeof(hbuf));
+    ts_puts(ts, hbuf);
+    ts_puts(ts, "  per-module (state / health):\n");
+    const int n = sysstate64_module_count64();
+    for (int i = 0; i < n; i++) {
+        const int mh = sysstate64_module_health64(i);
+        ts_puts(ts, "    ");
+        ts_puts_pad(ts, sysstate64_module_name64(i), 12);
+        ts_puts(ts, " ");
+        ts_puts_pad(ts, sysstate64_module_state_text64(sysstate64_module_state64(i)), 9);
+        ts_puts(ts, " ");
+        ts_puts(ts, mh == SYS64_MODH_UP ? "UP" : (mh == SYS64_MODH_DEGRADED ? "DEGRADED"
+                       : (mh == SYS64_MODH_UNKNOWN ? "unknown" : "DOWN")));
+        ts_putc(ts, (uint32_t)'\n');
+    }
+}
+
+// ---------- session：会话 / 应用内容策略 ----------
+// 支持：session | session persist | session volatile | session keep <app_id> on|off
+static bool cmd_session(TerminalState* ts, const char* sub, const char* arg1, const char* rest) {
+    static char rbuf[1536];
+    if (sub && sub[0] && st_eq(sub, "persist")) {
+        session64_set_mode64(SESS64_PERSIST);
+        ts_puts(ts, "session policy = PERSIST (closing/stopping keeps app state; next boot reopens the saved list)\n");
+        return true;
+    }
+    if (sub && sub[0] && st_eq(sub, "volatile")) {
+        session64_set_mode64(SESS64_VOLATILE);
+        ts_puts(ts, "session policy = VOLATILE (default: closing a window drops that app's state)\n");
+        return true;
+    }
+    if (sub && sub[0] && st_eq(sub, "keep")) {
+        const int id = parse_dec(arg1 ? arg1 : "");
+        if (id < 0 || !session64_app_ok64(id)) {
+            ts_puts(ts, "session keep: usage: session keep <app_id> on|off   (ids come from 'session')\n");
+            return false;
+        }
+        const bool on = (rest && (st_eq(rest, "on") || st_eq(rest, "1") || st_eq(rest, "true")));
+        session64_set_app_keep64(id, on);
+        ts_puts(ts, "session keep "); ts_puts(ts, session64_app_name64(id));
+        ts_puts(ts, on ? " = on\n" : " = off\n");
+        return true;
+    }
+    if (sub && sub[0]) {
+        ts_puts(ts, "session: unknown subcommand: "); ts_puts(ts, sub);
+        ts_puts(ts, "\n  try: session | session persist | session volatile | session keep <app_id> on|off\n");
+        return false;
+    }
+    session64_report64(rbuf, (int)sizeof(rbuf));
+    ts_puts(ts, rbuf);
+    ts_puts(ts, "SESS64 policy=");
+    ts_puts(ts, session64_mode_name64(session64_mode64()));
+    ts_puts(ts, " apps=");
+    ts_put_u64(ts, (uint64_t)session64_app_count64());
+    ts_puts(ts, " open=");
+    ts_put_u64(ts, (uint64_t)session64_open_count64());
+    ts_puts(ts, " resets=");
+    ts_put_u64(ts, (uint64_t)session64_reset_count64());
+    ts_putc(ts, (uint32_t)'\n');
+    return true;
+}
+
+// ---------- panic / bsod：受控蓝屏（画屏 + 串口现场 + 停留 6 秒后停住，不自动重启）----------
+static void cmd_panic(TerminalState* ts, const char* code) {
+    char c[28];
+    int n = 0;
+    const char* src = (code && code[0]) ? code : "USER_DEMO";
+    for (int i = 0; src[i] && i < 27; i++) {
+        char ch = src[i];
+        if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_') c[n++] = ch;
+    }
+    c[n] = 0;
+    if (n == 0) { const char* d = "USER_DEMO"; for (int i = 0; d[i]; i++) c[n++] = d[i]; c[n] = 0; }
+    ts_puts(ts, "entering controlled BSOD: stop=");
+    ts_puts(ts, c);
+    ts_puts(ts, "  hold=6s then halt (power cycle required; no auto reboot)\n");
+    gui64_flip_window(ts->win);
+    panic64_controlled64(c, 6000);
 }
 
 static void cmd_about(TerminalState* ts) {
@@ -1388,11 +1886,16 @@ static void cmd_about(TerminalState* ts) {
         "  - drivers: PS/2 keyboard + mouse, VBE LFB framebuffer, TrueType fonts\n"
         "  - desktop shell: windows, apps, taskbar, dirty-rect flips\n"
         "  - scheduler: kernel tasks (task64), used by ps/tasks/kill and the task manager\n"
-        "  - terminal: character grid + built-in shell + 16x512B ramfs (RAM only)\n");
-    ts_puts(ts, gui64_tr("  - settings store: VimtuFS2 /store.a|/store.b, driven by the terminal 'store' commands\n"
-                         "  - not ported yet: terminal vfs file commands, sysstate, session, PCI\n",
-                         "  - 设置持久化 store：VimtuFS2 的 /store.a、/store.b（终端 store 命令）\n"
-                         "  - 未移植：终端 VFS 文件命令、重启状态机、会话策略、PCI 枚举\n"));
+        "  - terminal: character grid + built-in shell + 16x512B ramfs (RAM only; VimtuFS2 is on disk)\n"
+        "  - real filesystem: VimtuFS2 (vfs64), settings persisted by store64 in /store.a|/store.b\n");
+    ts_puts(ts, gui64_tr("  - sysstate64: state machine + module registry + health + 64-line ring log (syslog)\n"
+                         "  - config64/session64: typed config + session policy, persisted to VimtuFS2 /store.a|b\n"
+                         "  - panic64: blue screen (panic/bsod) + watchdog on the gui64 frame heartbeat\n"
+                         "  - still not ported: 'update', 'preload' (kept as honest stubs)\n",
+                         "  - sysstate64：状态机 + 模块注册表 + 健康报告 + 64 条 ring log（syslog）\n"
+                         "  - config64/session64：类型化配置 + 会话策略，持久化在 VimtuFS2 的 /store.a|b\n"
+                         "  - panic64：蓝屏（panic/bsod）+ 看门狗（心跳源 = gui64 帧）\n"
+                         "  - 仍未移植：update、preload（保留为如实桩）\n"));
 }
 
 static void cmd_clear(TerminalState* ts) {
@@ -1460,10 +1963,13 @@ static void shell_exec(TerminalState* ts, const char* line) {
         cmd_clear(ts);
     } else if (st_eq(g_cmd, "reboot") || st_eq(g_cmd, "restart")) {
         if (st_eq(g_cmd, "restart") && st_eq(g_arg1, "--soft")) {
-            // 软重启状态机未移植：如实说明（落到函数末尾统一打 [TERM] cmd restart fail）
-            ok = shell_unsupported(ts, "restart --soft",
-                                   "not supported yet (restart state machine not ported to 64-bit; use reboot)",
-                                   "尚未支持（重启状态机未移植到 64 位；请用 reboot 硬重启）");
+            // 真：软重启 = 优雅停止（逆序停模块 + 会话快照/配置落盘 flush）-> 原有硬复位链。
+            // sysstate64_soft_restart64() 不返回（最后进 sys_reboot64），所以先打日志。
+            term_log_cmd(g_cmd, true);
+            logged = true;
+            ts_puts(ts, "restart --soft: graceful stop (modules + session + config flush) -> hard reset chain\n");
+            gui64_flip_window(ts->win);
+            sysstate64_soft_restart64();
         } else {
             term_log_cmd(g_cmd, true);     // 先打日志：sys_reboot64 之后不一定还会返回
             logged = true;
@@ -1478,9 +1984,8 @@ static void shell_exec(TerminalState* ts, const char* line) {
         gui64_flip_window(ts->win);
         sys_shutdown64();
     } else if (st_eq(g_cmd, "cfg") || st_eq(g_cmd, "config")) {
-        ok = shell_unsupported(ts, g_cmd,
-                               "not supported yet (store/config persistence not ported to 64-bit)",
-                               "尚未支持（store 配置持久化未移植到 64 位）");
+        // 真：config64（类型化 KV，落在 store64 上）。cfg | get K | set K V | set K=V | save | reset
+        ok = cmd_cfg(ts, g_arg1, g_arg2, args2);
     } else if (st_eq(g_cmd, "kill")) {
         // 真：终止一个内核任务（idle 与当前任务不可终止；规则在 task64.cpp 里）
         int tid = parse_dec(g_arg1);
@@ -1566,23 +2071,19 @@ static void shell_exec(TerminalState* ts, const char* line) {
     } else if (st_eq(g_cmd, "task") || st_eq(g_cmd, "tasks") || st_eq(g_cmd, "top")) {
         cmd_ps(ts);          // 与 ps 同一份真实快照（top 不做全屏刷新，只打一次）
     } else if (st_eq(g_cmd, "syslog")) {
-    } else if (st_eq(g_cmd, "syslog")) {
-        ok = shell_unsupported(ts, g_cmd,
-                               "not supported yet (sysstate state-machine log not ported to 64-bit)",
-                               "尚未支持（sysstate 状态机日志未移植到 64 位）");
+        // 真：sysstate64 的 ring log（固定 64 条循环日志）
+        cmd_syslog(ts);
     } else if (st_eq(g_cmd, "state")) {
-        ok = shell_unsupported(ts, g_cmd,
-                               "not supported yet (restart state machine not ported to 64-bit)",
-                               "尚未支持（重启状态机未移植到 64 位）");
+        // 真：运行状态机 + 模块表（sysstate64）
+        cmd_state(ts);
     } else if (st_eq(g_cmd, "health")) {
-        ok = shell_unsupported(ts, g_cmd,
-                               "not supported yet (sysstate health report not ported to 64-bit)",
-                               "尚未支持（sysstate 健康报告未移植到 64 位）");
+        // 真：健康报告（各模块的 state/health 都是实测）
+        cmd_health(ts);
     } else if (st_eq(g_cmd, "session")) {
-        ok = shell_unsupported(ts, g_cmd,
-                               "not supported yet (session/app-content policy not ported to 64-bit)",
-                               "尚未支持（会话/应用内容策略未移植到 64 位）");
+        // 真：会话策略（session64；keep 与策略落在 config64/store64）
+        ok = cmd_session(ts, g_arg1, g_arg2, args2);
     } else if (st_eq(g_cmd, "update")) {
+        // ★ 仍未移植（后续批次）：如实说明，不静默失败
         ok = shell_unsupported(ts, g_cmd,
                                "not supported yet (update/persistence subsystem not ported to 64-bit)",
                                "尚未支持（更新/持久化子系统未移植到 64 位）");
@@ -1594,29 +2095,27 @@ static void shell_exec(TerminalState* ts, const char* line) {
         // 真：e1000 + ARP/ICMP（kernel/net64.cpp）。屏幕 + 串口都打 [NET64] cmd ping 行。
         ok = cmd_ping(ts, g_arg1);
     } else if (st_eq(g_cmd, "disk") || st_eq(g_cmd, "ata")) {
-        ok = shell_unsupported(ts, g_cmd,
-                               "not supported yet (ATA driver is installer-only in 64-bit, not in the desktop build)",
-                               "尚未支持（ATA 驱动只在 64 位安装程序里，未纳入桌面构建）");
+        // 真：ATA IDENTIFY（型号/容量；ata64 的读取自带 IRQ14 等待 + 超时回退轮询）+ VimtuFS2 卷几何
+        ok = cmd_disk(ts);
     } else if (st_eq(g_cmd, "hw") || st_eq(g_cmd, "hwinfo")) {
-        ok = shell_unsupported(ts, g_cmd,
-                               "not supported yet (hwinfo/hardware probe not ported to 64-bit)",
-                               "尚未支持（硬件探测 hwinfo 未移植到 64 位）");
+        // 真：hwinfo64 的 CPUID + PCI 枚举结果
+        cmd_hw(ts);
     } else if (st_eq(g_cmd, "lspci") || st_eq(g_cmd, "pci")) {
-        ok = shell_unsupported(ts, g_cmd,
-                               "not supported yet (PCI enumeration not ported to 64-bit)",
-                               "尚未支持（PCI 枚举未移植到 64 位）");
+        // 真：PCI 设备表（hwinfo64 的只读枚举）
+        cmd_lspci(ts);
     } else if (st_eq(g_cmd, "user") || st_eq(g_cmd, "userprog")) {
-        ok = shell_unsupported(ts, g_cmd,
-                               "not supported yet (ring3 user programs not ported to 64-bit)",
-                               "尚未支持（用户态 ring3 程序未移植到 64 位）");
+        // 真：ring3 现状（用户窗口地址/页映射/盘上的 ring3 程序）；`user run` 直接跑一次用户程序
+        ok = cmd_user(ts, g_arg1);
     } else if (st_eq(g_cmd, "preload")) {
+        // ★ 仍未移植（后续批次）：如实说明
         ok = shell_unsupported(ts, g_cmd,
                                "not supported yet (preload subsystem not ported to 64-bit)",
                                "尚未支持（预加载子系统未移植到 64 位）");
     } else if (st_eq(g_cmd, "bsod") || st_eq(g_cmd, "panic")) {
-        ok = shell_unsupported(ts, g_cmd,
-                               "not supported yet (panic/bsod not ported to 64-bit)",
-                               "尚未支持（panic/bsod 未移植到 64 位）");
+        // 真：受控蓝屏（kernel/panic64.cpp）。先打命令日志，再进 BSOD（不返回）
+        term_log_cmd(g_cmd, true);
+        logged = true;
+        cmd_panic(ts, g_arg1);
     } else {
         ts_puts(ts, gui64_tr("command not found: ", "未找到命令："));
         ts_puts(ts, g_cmd);

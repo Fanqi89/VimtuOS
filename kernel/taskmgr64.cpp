@@ -57,6 +57,7 @@
 #include "task64.h"     // 任务表快照（Task64Info / TASK64_*）
 #include "debug64.h"
 #include "edid64.h"     // 显示器 EDID（刷新率来自这里；只读，不改 fb 状态）
+#include "config64.h"   // 本轮接线：启动页的开关 = config64 的 startup.*（落到 store64 持久化）
 
 // linker64.ld 提供：内核映像末地址（.bss 之后，已 4KB 对齐）
 extern "C" char __bss_end[];
@@ -1653,25 +1654,25 @@ static void tm_draw_startup(Window* w, TmState* st) {
         int ty = Y + ry + (rowh - font_line_height()) / 2;
         tm_text_clip(X + name_x, ty, nb, TM_COL_TEXT, pub_x - name_x - 6);
         tm_text_clip(X + pub_x, ty, "VimtuOS", TM_COL_TEXT_DIM, sts_x - pub_x - 6);
-        const char* sts = T("Enabled (fixed)", "已启用（固定）");
-        tm_text_clip(X + sts_x, ty, sts, TM_COL_TEXT, sw_x - sts_x - 6);
-        // 固定启用：开关置灰并标 "-"（没有 store，不给假开关）
-        tm_draw_switch(X + sw_x, Y + ry + 5, true, true);
-        tm_text(X + sw_x + 54, ty, "-", TM_COL_TEXT_DIM);
+        // 本轮接线：启动项状态来自 config64（startup.<key>），开关是**真开关**（点击即改 + 落盘）
+        const bool on = cfg64_startup64(tm_startup_key(i)) ? true : false;
+        const char* sts = on ? T("Enabled", "已启用") : T("Disabled", "已禁用");
+        tm_text_clip(X + sts_x, ty, sts, on ? TM_COL_TEXT : TM_COL_TEXT_DIM, sw_x - sts_x - 6);
+        tm_draw_switch(X + sw_x, Y + ry + 5, on, false);
     }
 
-    // 如实标注：启动项与 store64 持久化的接线未做（store64 本体已可用）
+    // 说明（本轮已接线，文案必须与事实一致）
     if (last_bot + 18 <= bot) {
         int ly = last_bot + 6;
-        const char* note1 = T("Startup items are fixed enabled: not wired to store64 persistence,",
-                              "启动项固定为已启用：未接 store64 持久化，");
-        const char* note2 = T("so switches would only take effect for this session. No fake toggle is shown.",
-                              "开关只在本会话生效，因此这里不提供假开关。");
+        const char* note1 = T("Startup items come from config64 (keys startup.*) and are persisted by store64",
+                              "启动项来自 config64 的 startup.*，由 store64 真落盘（VimtuFS2 的 /store.a|b），");
+        const char* note2 = T("into VimtuFS2 /store.a|b. Click a row to toggle; 'cfg save' flushes immediately.",
+                              "点一行即切换；要立刻落盘可敲 cfg save（否则 3 秒内自动落盘）。");
         tm_text_clip(X + 16, Y + ly, note1, TM_COL_TEXT_DIM, cw - 32);
         tm_text_clip(X + 16, Y + ly + 16, note2, TM_COL_TEXT_DIM, cw - 32);
     }
 
-    const char* label = T("Fixed", "固定");
+    const char* label = T("Config", "配置");
     tm_draw_main_button(w, label, false);
 }
 
@@ -1982,10 +1983,15 @@ static void tm_click_startup(Window* w, int cx, int cy) {
         if (ry + 30 > bot) break;
         if (cy < ry || cy >= ry + 30) continue;
         st->sel_row = i;
-        // 固定启用：点击只提示原因（没有 store，切换只在本会话生效）
-        tm_notice(st, T("Fixed startup item: not wired to store64, so no working toggle",
-                        "启动项固定启用：未接 store64，因此不提供能生效的开关"), false);
-        tm_log_str("startup fixed item=", tm_startup_key(i));
+        // 本轮接线：真开关 —— 改 config64 的 startup.<key>（落到 store64；3 秒内自动落盘）
+        const char* key = tm_startup_key(i);
+        const bool on = cfg64_startup64(key) ? true : false;
+        cfg64_set_startup64(key, !on ? 1 : 0);
+        tm_notice(st, (!on ? T("Startup item enabled (config64 saved; applies at next boot)",
+                               "启动项已启用（写入 config64，下次启动生效）")
+                          : T("Startup item disabled (config64 saved)",
+                              "启动项已禁用（已写入 config64）")), true);
+        tm_log_str("startup toggle ", key);
         tm_dirty_client(w);
         return;
     }

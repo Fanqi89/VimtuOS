@@ -57,10 +57,16 @@ SRCS_INSTALLER="$SRCS_CORE kernel/ata64.cpp kernel/part64.cpp kernel/setup64.cpp
 #   注意：这几个文件依赖 kernel/gui64.cpp 提供的外壳实现，任何新增应用都要同时加进这里。
 SRCS_DESKTOP="kernel/gui64.cpp kernel/calc64.cpp kernel/mines64.cpp \
  kernel/terminal64.cpp kernel/settings64.cpp kernel/taskmgr64.cpp"
+# 本轮新增的四个子系统：**只进系统内核**（安装介质不链它们；只有系统内核有 gui64/store64/app64）
+#   sysstate64 = 运行状态机 + 模块注册表 + 健康 + ring log（terminal 的 state/health/syslog）
+#   config64   = 类型化配置 KV，落在 store64（VimtuFS2 的 /store.a|b，真落盘）
+#   session64  = 会话/应用内容策略（关窗清状态、退出保存、启动恢复）
+#   panic64    = 蓝屏（BSOD）+ 看门狗（gui64 帧心跳）
+SRCS_SYS="kernel/sysstate64.cpp kernel/config64.cpp kernel/session64.cpp kernel/panic64.cpp"
 # elf64.cpp = ELF64 加载器：**只进系统内核**（安装介质不需要它；它内嵌的 hello.elf 是系统程序）
 # apic64.cpp = LAPIC + IOAPIC 接管中断路由：**只进系统内核**（安装链保持纯 8259 PIC，
 #   避免影响安装介质内核的字节级断言；x86_64.cpp 对它的 EOI/掩码分派用 weak 引用，不链也不报错）
-SRCS_OS="$SRCS_CORE $SRCS_DESKTOP kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp"
+SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp"
 
 echo "==> 清理 $BUILD"
 rm -rf "$BUILD"
@@ -174,6 +180,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o \
     "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
     "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o \
+    "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \

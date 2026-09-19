@@ -298,6 +298,9 @@ extern "C" void schedule64(pt_regs64* r);       // 弱默认实现见文件末�
 // int 0x80 系统调用分发器（kernel/syscall64.cpp）。weak：未链接时 int 0x80 退化为
 // 返回 -1，而不是链接失败（见下面 isr_handler64 的 no==128 分支）。
 extern "C" void syscall64_dispatch64(pt_regs64* r) __attribute__((weak));
+// 蓝屏入口（kernel/panic64.cpp，本轮接线）：CPU 异常时把现场交过去画 BSOD。
+// weak：panic64.cpp 只进系统内核，安装程序内核里没有它 —— 那时保持"打点 + 停机"的老行为。
+extern "C" void panic64_cpu_exception64(uint64_t int_no, void* frame) __attribute__((weak));
 
 extern "C" void isr_handler64(pt_regs64* r) {
     const uint64_t no = r->int_no;
@@ -348,6 +351,9 @@ extern "C" void isr_handler64(pt_regs64* r) {
         dbg64_str(" cr2=");
         { uint64_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2)); dbg64_hex64(cr2); }
         dbg64_nl();
+        // ---- 接到本轮的蓝屏实现（kernel/panic64.cpp）：真实 CPU 异常也画 BSOD 屏 ----
+        // 原打点（[PANIC] cpu exception ...）在上面照旧保留，只是不再直接停机。
+        if (panic64_cpu_exception64) panic64_cpu_exception64(no, (void*)r);
         for (;;) __asm__ volatile("cli; hlt");
     }
 }

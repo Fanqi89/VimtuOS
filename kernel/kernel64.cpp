@@ -43,6 +43,11 @@
 #include "usb64.h"      // USB 主机：UHCI + HID 引导键盘（只进系统内核；按键注入 PS/2 同一队列）
 #include "apic64.h"    // LAPIC + IOAPIC 接管中断路由（只进系统内核；拿不到就留在 PIC）
 #include "smp64.h"     // SMP：启动 AP（INIT-SIPI-SIPI + 低端跳板；只进系统内核）
+// ---- 本轮移植的四个子系统（都只进系统内核，见 build64.sh 的 SRCS_OS）----
+#include "config64.h"    // 系统配置：类型化 KV，落在 store64 上（真落盘）
+#include "session64.h"   // 会话/应用内容策略（关窗清状态、退出保存、启动恢复）
+#include "sysstate64.h"  // 运行状态机 + 模块注册表 + 健康报告 + ring log
+#include "panic64.h"     // 蓝屏（BSOD）+ 看门狗（gui64 帧心跳）
 // 用户态演示程序 blob：user/demo64.asm -> nasm 平铺二进制 -> objcopy 嵌入（见 build64.sh）。
 // 符号名由 objcopy 按输入路径生成：_binary_build64_user_demo64_bin_start/_end。
 extern "C" const uint8_t _binary_build64_user_demo64_bin_start[];
@@ -230,6 +235,19 @@ static uint64_t read_cs64()  { uint64_t v; __asm__ volatile("mov %%cs, %0"  : "=
         }
     }
     store64_dump64();
+    // ---- 系统配置 / 会话策略 / 状态机 / 看门狗（本轮移植：config64 + session64 + sysstate64 + panic64）----
+    // 顺序有讲究：
+    //   1) config64_init64()：**必须在 store64_init64() 之后**（它读 store64 里 "cfg." 前缀的键）；
+    //   2) session64_init64()：读会话策略（config64）并登记应用表；
+    //   3) sysstate64：BOOT -> 注册模块（模块的 init 钩子只做**只读复核**，不重做上面的初始化）
+    //      -> STARTING；RUNNING 由 gui64 的桌面首帧推进（见 kernel/gui64.cpp 主循环）；
+    //   4) panic64_init64()：建看门狗任务（需要 task_start64() 已经跑过），桌面首帧时武装。
+    config64_init64();
+    session64_init64();
+    sysstate64_begin64();
+    sys64_register_builtin64();
+    (void)sysstate64_start64();
+    panic64_init64();
     // ---- 网络：e1000（轮询收发）+ ARP/ICMP 一次性探测 ----
     // 位置：store 之后、gui64_run 之前（那之后不再返回）；安装程序内核不链本模块（见 build64.sh）。
     // 说明：桌面消息循环没有全局 tick 钩子（不改 gui64.cpp 的实现结构），所以 net64_poll64()

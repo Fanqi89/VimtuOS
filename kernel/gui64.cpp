@@ -29,6 +29,11 @@
 #include "mem_64.h"
 #include "x86_64.h"
 #include "port.h"
+// ---- 本轮接线：config64（配置）/ session64（会话策略）/ sysstate64（状态机+ring log）/ panic64（看门狗）----
+#include "config64.h"
+#include "session64.h"
+#include "sysstate64.h"
+#include "panic64.h"
 #include "../bootinfo.h"
 
 // ==================== 资源符号（build64.sh 用 objcopy 生成）====================
@@ -114,11 +119,38 @@ static bool g_icon_drag_moved = false;
 static bool g_selbox_active = false;
 static int  g_sel_x0 = 0, g_sel_y0 = 0, g_sel_x1 = 0, g_sel_y1 = 0;
 static bool g_start_icon_logged = false;
+// 外壳自检期间（gui64_selftest 建/销临时窗口、来回切语言）不触发会话/配置钩子：
+// 那些临时窗口不是真实应用实例，自检的语言切换也不该写进持久化配置。
+static bool g_in_selftest = false;
 static bool g_title_btn_logged = false;
 static int  sel_box_x() { return g_sel_x0 < g_sel_x1 ? g_sel_x0 : g_sel_x1; }
 static int  sel_box_y() { return g_sel_y0 < g_sel_y1 ? g_sel_y0 : g_sel_y1; }
 static int  sel_box_w() { return g_sel_x0 < g_sel_x1 ? g_sel_x1 - g_sel_x0 : g_sel_x0 - g_sel_x1; }
 static int  sel_box_h() { return g_sel_y0 < g_sel_y1 ? g_sel_y1 - g_sel_y0 : g_sel_y0 - g_sel_y1; }
+
+// ==================== 配置接线状态（config64 读到外壳里的值）====================
+static bool g_text_mirror = false;      // ui.text_mirror：外壳 TrueType 文本水平镜像
+static int  g_mouse_sens = 1700;        // mouse.sens（千分比）：1700 = 驱动基线（默认不变）
+static bool g_mouse_sens_off = false;   // sens != 1700 才启用缩放（默认路径零行为变化）
+static int  g_sens_base_x = -1, g_sens_base_y = -1;   // 上一次看到的驱动位置
+static int  g_sens_rem_x = 0, g_sens_rem_y = 0;       // 缩放余数（避免整数除法丢位移）
+
+// 鼠标灵敏度：把驱动**本帧位移**按 sens/1700 缩放后写回驱动（绝对值写回，驱动的内部累加器不受影响）。
+// sens == 1700 时整个函数直接返回 —— 默认行为与改动前完全一致（既有鼠标验收不受影响）。
+static void mouse_apply_sensitivity() {
+    if (!g_mouse_sens_off) return;
+    const int rx = mouse_get_x(), ry = mouse_get_y();
+    if (g_sens_base_x < 0) { g_sens_base_x = rx; g_sens_base_y = ry; return; }
+    const int dx = rx - g_sens_base_x, dy = ry - g_sens_base_y;
+    if (!dx && !dy) return;
+    g_sens_base_x = rx; g_sens_base_y = ry;
+    g_sens_rem_x += dx * g_mouse_sens;
+    g_sens_rem_y += dy * g_mouse_sens;
+    const int sx = g_sens_rem_x / 1700, sy = g_sens_rem_y / 1700;
+    g_sens_rem_x -= sx * 1700;
+    g_sens_rem_y -= sy * 1700;
+    if (sx || sy) mouse_set_pos(rx - dx + sx, ry - dy + sy);
+}
 
 // 帧率/忙占比统计
 static uint32_t g_frames = 0;
@@ -250,12 +282,15 @@ Window* gui64_create_window(const char* title, int x, int y, int w, int h,
     z_push_front(win);
     gui64_set_active(win);
     dirty_add(win->x, win->y, win->w, win->h);
+    if (!g_in_selftest)                        // 自检的临时窗口不算应用实例
+        session64_app_opened64(app_id);        // 会话策略：清掉"待清理"标志（关掉又立刻打开的场景）
     return win;
 }
 
 void gui64_destroy_window(Window* w) {
     int i = win_index(w);
     if (i < 0 || !g_used[i]) return;
+    const int w_app = (int)w->app_id;         // 销毁后 app_id 会留在槽里，但语义上属于"已关"
     dirty_add(w->x, w->y, w->w, w->h);
     if (w->on_close) w->on_close(w);          // 应用在这里释放 userdata（外壳绝不代劳）
     z_unlink(w);
@@ -265,6 +300,9 @@ void gui64_destroy_window(Window* w) {
     w->userdata = nullptr;
     w->visible = false;
     g_used[i] = false;
+    // 会话策略（session64）：关窗后是否清该应用的内容状态。这里只登记，真正的 reset 在
+    // gui64 主循环的 session64_tick64() 里执行 —— 那是唯一"没有窗口销毁在栈上"的安全点。
+    if (!g_in_selftest) session64_app_closed64(w_app);
     if (g_drag_w == w) { g_drag_w = nullptr; g_drag = DRAG_NONE; }
     // 焦点交给最上面的窗口
     Window* top = g_z;
@@ -381,11 +419,21 @@ int gui64_close_app(int app_id) {
 }
 bool        gui64_lang_zh() { return g_lang_zh; }
 void        gui64_set_lang_zh(bool zh) {
+    // 界面语言是 config64 的 ui.lang（-> store64 持久化）：这样"设置页切语言 -> 重启后还是该语言"成立。
+    // 自检（gui64_selftest 会来回切语言）只改内存，不写持久化配置 —— 否则每次启动都会写盘。
+    if (g_in_selftest) { g_lang_zh = zh; return; }
+    cfg64_set_lang_zh64(zh ? 1 : 0);
     if (g_lang_zh == zh) return;
     g_lang_zh = zh;
     gui64_invalidate();
     dbg64_str(zh ? "[UI] lang zh" : "[UI] lang en");
     dbg64_nl();
+    dbg64_line_begin64();
+    dbg64_str("[CONF64] set key=ui.lang value=");
+    dbg64_dec(zh ? 1 : 0);
+    dbg64_str(" type=int (persisted via store64)");
+    dbg64_nl();
+    dbg64_line_end64();
 }
 const char* gui64_tr(const char* en, const char* zh) { return g_lang_zh ? zh : en; }
 uint32_t    gui64_fps() { return g_fps; }
@@ -396,6 +444,9 @@ uint8_t     gui64_cpu_busy_pct() { return g_busy_pct; }
 static void power_anim_screen(const char* txt, const char* log_tag);
 // ==================== 重启 / 关机（照抄 32 位回退链）====================
 void sys_reboot64() {
+    // 优雅停止：状态机 STOPPING -> 逆序停模块（含关窗）-> 会话快照 + 配置落盘 flush（store64）。
+    // 看门狗在这里被挂起（sysstate64_stop_all64 内部调 panic64_watchdog_suspend64）。
+    (void)sysstate64_stop_all64("reboot");
     power_anim_screen(gui64_tr("Restarting...", "正在重启..."), "[UI] reboot anim start");
     dbg64_str("[RESET] sys_reboot64: 8042 pulse");
     dbg64_nl();
@@ -419,6 +470,7 @@ void sys_reboot64() {
 }
 
 void sys_shutdown64() {
+    (void)sysstate64_stop_all64("shutdown");
     power_anim_screen(gui64_tr("Shutting down...", "正在关机..."), "[UI] shutdown anim start");
     dbg64_str("[SHUTDOWN] sys_shutdown64: ACPI 0x604");
     dbg64_nl();
@@ -513,9 +565,28 @@ static bool icon_hits_sel(int i, int x0, int y0, int x1, int y1) {
 }
 
 // ==================== 外壳文字 ====================
+// 在 [x,x+w) × [y,y+h) 里做**水平镜像**（读回像素再反着写回；putpixel 尊重裁剪，不会画到客户区外）。
+// 用途：config64 的 ui.text_mirror = 1 时，外壳画的所有文本都镜像（32 位里有这个键，本轮把它真正接上）。
+static void mirror_rect_h(int x, int y, int w, int h) {
+    if (w <= 1) return;
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w / 2; i++) {
+            const int xa = x + i, xb = x + w - 1 - i;
+            const uint32_t a = fb_get_pixel(xa, y + j);
+            const uint32_t b = fb_get_pixel(xb, y + j);
+            fb_putpixel(xa, y + j, b);
+            fb_putpixel(xb, y + j, a);
+        }
+    }
+}
 static void text_ttf(int x, int y, const char* s, uint32_t fg) {
     font_select(2);                 // simhei 子集：ASCII + 常用汉字，混排不出豆腐块
     font_draw_text(x, y, s, fg);
+    if (g_text_mirror) {            // ui.text_mirror（config64 -> store64 持久化）
+        const int w = font_text_width(s);
+        const int h = font_line_height();
+        if (w > 1 && h > 0) mirror_rect_h(x, y, w, h);
+    }
 }
 static int text_w(const char* s) { font_select(2); return font_text_width(s); }
 
@@ -887,26 +958,70 @@ static void mypc_draw(Window* w) {
     int y = w->client_y + 10;
     text_ttf(x, y, gui64_tr("Devices and drives", "设备和驱动器"), rgb(0, 60, 120));
     y += 26;
-    // 磁盘（本内核没有 ATA 驱动，展示的是真实布局常量，不编造容量）
+    // 磁盘：真实存在的信息 —— 内核区/设置区布局常量 + VimtuFS2 卷的**总块/空闲块/文件数**
+    // （卷数据由 sysstate64_fsinfo64() 读超级块 + 块位图 + vfs64_ls 得到，只探一次并缓存。
+    //  上一轮这里写的是"尚未有文件系统驱动（store/VFS 未移植到 64 位）"——那句已经过时，删掉。）
     fb_fill_rect(x, y, w->client_w - 24, 54, rgb(255, 255, 255));
     fb_draw_rect(x, y, w->client_w - 24, 54, rgb(180, 180, 180));
     text_ttf(x + 10, y + 8, gui64_tr("Local Disk (C:)", "本地磁盘 (C:)"), rgb(20, 20, 20));
     {
-        char buf[96]; int n = 0;
+        char buf[112]; int n = 0;
         const char* s = "LBA 9..8008 kernel, 8009..8072 settings";
-        for (int i = 0; s[i] && n < 90; i++) buf[n++] = s[i];
+        for (int i = 0; s[i] && n < 110; i++) buf[n++] = s[i];
         buf[n] = 0;
         text_ttf(x + 10, y + 30, buf, rgb(90, 90, 90));
     }
-    y += 64;
-    fb_fill_rect(x, y, w->client_w - 24, 54, rgb(255, 255, 255));
-    fb_draw_rect(x, y, w->client_w - 24, 54, rgb(180, 180, 180));
-    text_ttf(x + 10, y + 8, gui64_tr("Install media (D:)", "安装介质 (D:)"), rgb(20, 20, 20));
-    text_ttf(x + 10, y + 30, gui64_tr("payload at LBA 8192 (installer kernel only)",
-                                     "载荷在 LBA 8192（仅安装程序内核可读）"), rgb(90, 90, 90));
-    y += 66;
-    text_ttf(x, y, gui64_tr("No filesystem driver yet (store/VFS not ported to 64-bit).",
-                            "尚未有文件系统驱动（store/VFS 未移植到 64 位）。"), rgb(150, 60, 60));
+    y += 60;
+    fb_fill_rect(x, y, w->client_w - 24, 76, rgb(255, 255, 255));
+    fb_draw_rect(x, y, w->client_w - 24, 76, rgb(180, 180, 180));
+    text_ttf(x + 10, y + 8, gui64_tr("VimtuFS2 volume", "VimtuFS2 卷"), rgb(20, 20, 20));
+    {
+        Fs64Info fs;
+        const int rc = sysstate64_fsinfo64(&fs);
+        const int lh = 18;
+        char b2[112];
+        int p = 0;
+        if (rc == 0) {
+            // 两行：总块/空闲块 / 文件数/已用字节
+            const char* l1 = gui64_tr("blocks=", "总块数=");
+            for (int i = 0; l1[i] && p < 110; i++) b2[p++] = l1[i];
+            { char rev[12]; int m = 0; uint32_t v = fs.total_blocks;
+              if (!v) rev[m++] = '0';
+              while (v) { rev[m++] = (char)('0' + v % 10); v /= 10; }
+              while (m > 0 && p < 110) b2[p++] = rev[--m]; }
+            const char* mid = gui64_tr("  free=", "  空闲=");
+            for (int i = 0; mid[i] && p < 110; i++) b2[p++] = mid[i];
+            { char rev[12]; int m = 0; uint32_t v = fs.free_blocks;
+              if (!v) rev[m++] = '0';
+              while (v) { rev[m++] = (char)('0' + v % 10); v /= 10; }
+              while (m > 0 && p < 110) b2[p++] = rev[--m]; }
+            b2[p] = 0;
+            text_ttf(x + 10, y + 8 + lh, b2, rgb(60, 60, 60));
+            p = 0;
+            const char* l2 = gui64_tr("files=", "文件数=");
+            for (int i = 0; l2[i] && p < 110; i++) b2[p++] = l2[i];
+            { char rev[12]; int m = 0; uint32_t v = fs.files;
+              if (!v) rev[m++] = '0';
+              while (v) { rev[m++] = (char)('0' + v % 10); v /= 10; }
+              while (m > 0 && p < 110) b2[p++] = rev[--m]; }
+            const char* mid2 = gui64_tr("  used=", "  已用=");
+            for (int i = 0; mid2[i] && p < 110; i++) b2[p++] = mid2[i];
+            { char rev[12]; int m = 0; uint32_t v = fs.used_bytes / 1024;
+              if (!v) rev[m++] = '0';
+              while (v) { rev[m++] = (char)('0' + v % 10); v /= 10; }
+              while (m > 0 && p < 110) b2[p++] = rev[--m]; }
+            for (int i = 0; i < 2 && p < 110; i++) b2[p++] = "KB"[i];
+            b2[p] = 0;
+            text_ttf(x + 10, y + 8 + lh * 2, b2, rgb(60, 60, 60));
+        } else {
+            text_ttf(x + 10, y + 8 + lh,
+                     gui64_tr("no VimtuFS2 volume (unpartitioned disk)",
+                              "没有 VimtuFS2 卷（磁盘未分区）"), rgb(150, 60, 60));
+        }
+    }
+    y += 86;
+    text_ttf(x, y, gui64_tr("Install media (D:): payload at LBA 8192",
+                            "安装介质 (D:)：载荷在 LBA 8192"), rgb(90, 90, 90));
 }
 void app_mypc_open64() {
     if (gui64_window_alive(g_mypc_win)) { gui64_set_active(g_mypc_win); return; }
@@ -1130,6 +1245,7 @@ static void handle_mouse_press(int mx, int my, int button) {
 }
 
 static void handle_mouse(void) {
+    mouse_apply_sensitivity();               // mouse.sens != 1700 时才动（默认路径零变化）
     const int mx = mouse_get_x(), my = mouse_get_y();
     const int btn = (int)mouse_get_buttons();
     const bool rel_left = (g_prev_btn & 1) && !(btn & 1);   // 左键释放（边沿）
@@ -1223,6 +1339,19 @@ static void handle_mouse(void) {
                 dbg64_str(" y=");
                 dbg64_dec((uint64_t)g_icons[i].y);
                 dbg64_nl();
+                // 拖动结束：把新位置写进 config64（-> store64；3 秒内自动落盘，也可 `store flush`）。
+                // 这是上一轮"图标位置只在内存里、重启就回默认"的补齐。
+                cfg64_set_icon64(i, g_icons[i].x, g_icons[i].y);
+                dbg64_line_begin64();
+                dbg64_str("[CONF64] icon ");
+                dbg64_dec((uint64_t)i);
+                dbg64_str(" moved to ");
+                dbg64_dec((uint64_t)g_icons[i].x);
+                dbg64_str(",");
+                dbg64_dec((uint64_t)g_icons[i].y);
+                dbg64_str(" (persisted via config64/store64)");
+                dbg64_nl();
+                dbg64_line_end64();
             }
             dirty_add(g_icons[i].x - 6, g_icons[i].y - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
             g_icon_drag_idx = -1;
@@ -1375,6 +1504,16 @@ int gui64_selftest() {
 // ==================== 主循环 ====================
 [[noreturn]] void gui64_run(const BootInfo* bi) {
     (void)bi;
+    // ---- 先读系统配置（config64 -> store64 持久化；默认表见 kernel/config64.cpp）----
+    // 必须在算屏幕尺寸之前读：display.zoom 会改变**渲染分辨率**（fb_width/fb_height）。
+    {
+        const int z = cfg64_zoom64();
+        if (z != fb_get_zoom()) fb_set_zoom(z);
+        g_lang_zh    = cfg64_lang_zh64() ? true : false;
+        g_text_mirror = cfg64_text_mirror64() ? true : false;
+        g_mouse_sens  = cfg64_mouse_sens64();
+        g_mouse_sens_off = (g_mouse_sens != 1700);
+    }
     g_screen_w = fb_width();
     g_screen_h = fb_height();
     mouse_set_bounds(g_screen_w, g_screen_h);
@@ -1384,9 +1523,50 @@ int gui64_selftest() {
     g_icon_drag_idx = -1;
     g_icon_drag_moved = false;
     g_selbox_active = false;
-    g_icons[0] = DeskIcon{0, 24,  24};
-    g_icons[1] = DeskIcon{1, 24,  24 + ICON_CELL_H};
-    g_icons[2] = DeskIcon{2, 24,  24 + ICON_CELL_H * 2};
+    // 桌面图标位置：**从 config64 读**（上一轮只存在内存里，重启就回默认位置）
+    for (int i = 0; i < 3; i++) {
+        int ix = cfg64_icon_x64(i), iy = cfg64_icon_y64(i);
+        if (ix < 2) ix = 2;
+        if (iy < 2) iy = 2;
+        if (ix > g_screen_w - ICON_CELL_W - 2) ix = g_screen_w - ICON_CELL_W - 2;
+        if (iy > g_screen_h - TASKBAR_H - ICON_CELL_H) iy = g_screen_h - TASKBAR_H - ICON_CELL_H;
+        g_icons[i] = DeskIcon{i, ix, iy};
+    }
+    {
+        dbg64_line_begin64();
+        dbg64_str("[CONF64] apply lang=");
+        dbg64_str(g_lang_zh ? "zh" : "en");
+        dbg64_str(" zoom=");
+        dbg64_dec((uint64_t)fb_get_zoom());
+        dbg64_str(" mirror=");
+        dbg64_dec(g_text_mirror ? 1 : 0);
+        dbg64_str(" sens=");
+        dbg64_dec((uint64_t)g_mouse_sens);
+        dbg64_str(" icon0=");
+        dbg64_dec((uint64_t)g_icons[0].x); dbg64_str(","); dbg64_dec((uint64_t)g_icons[0].y);
+        dbg64_str(" icon1=");
+        dbg64_dec((uint64_t)g_icons[1].x); dbg64_str(","); dbg64_dec((uint64_t)g_icons[1].y);
+        dbg64_str(" icon2=");
+        dbg64_dec((uint64_t)g_icons[2].x); dbg64_str(","); dbg64_dec((uint64_t)g_icons[2].y);
+        dbg64_str(" startup=t");
+        dbg64_dec((uint64_t)cfg64_startup64("terminal"));
+        dbg64_str(",m");
+        dbg64_dec((uint64_t)cfg64_startup64("monitor"));
+        dbg64_str(",d");
+        dbg64_dec((uint64_t)cfg64_startup64("desktop"));
+        dbg64_str(",h");
+        dbg64_dec((uint64_t)cfg64_startup64("health"));
+        dbg64_nl();
+        dbg64_line_end64();
+        if (g_mouse_sens_off) {
+            dbg64_line_begin64();
+            dbg64_str("[CONF64] mouse sens=");
+            dbg64_dec((uint64_t)g_mouse_sens);
+            dbg64_str("permille applied (baseline 1700 = driver default)");
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
 
     dbg64_str("[GUI64] desktop init ");
     dbg64_dec((uint64_t)g_screen_w);
@@ -1401,7 +1581,9 @@ int gui64_selftest() {
     // ---- 开机 logo：桌面首帧之前先放一段黑底 + 居中 logo 的淡入（~12 帧 ≈ 200ms）----
     boot_logo_fade_in();
 
+    g_in_selftest = true;          // 自检里的临时窗口 / 语言来回切 不触发会话与配置钩子
     const int st = gui64_selftest();
+    g_in_selftest = false;
     if (st != 0) {
         dbg64_str("[GUI64] selftest FAILED mask=");
         dbg64_dec((uint64_t)st);
@@ -1423,6 +1605,13 @@ int gui64_selftest() {
     dbg64_nl();
     dbg64_str("[OS] ready (idle)");
     dbg64_nl();
+    // ---- 启动项（config64 的 startup.*）+ 会话恢复（session64 的策略）----
+    // 放在 "[GUI64] ready" 之后：既有验收看到的启动顺序不变，多出来的只有"按配置自动开窗"。
+    if (cfg64_startup64("terminal")) app_term_open64();
+    if (cfg64_startup64("monitor")) app_monitor_open64();
+    if (cfg64_startup64("health")) (void)sysstate64_health_report64(1, nullptr, 0);
+    (void)session64_restore64();
+    gui64_invalidate();
 
     uint32_t next_frame = ticks64();
     uint32_t next_tick = ticks64();
@@ -1431,6 +1620,14 @@ int gui64_selftest() {
 
     for (;;) {
         const uint32_t now = ticks64();
+        // ---- 看门狗心跳（gui64 帧/tick 就是它的心跳源）+ 状态机推进 + 会话/配置推进 ----
+        panic64_watchdog_kick64();
+        if (sysstate64_tick64()) {
+            // 本帧刚进入 RUNNING（桌面首帧）：健康报告已在 tick 里打过；这里武装看门狗
+            panic64_watchdog_arm64();
+        }
+        session64_tick64();          // 关窗后的"清状态"延迟落到这里（避免在销毁路径里递归销毁）
+        (void)config64_tick64();     // 配置改动后的延迟落盘（3 秒去抖）
         handle_mouse();
         handle_keyboard();
 
