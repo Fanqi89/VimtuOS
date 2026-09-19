@@ -35,6 +35,8 @@
 extern "C" const uint8_t _binary_icon_mycomputer_bin_start[];
 extern "C" const uint8_t _binary_icon_recyclebin_bin_start[];
 extern "C" const uint8_t _binary_icon_terminal_bin_start[];
+extern "C" const uint8_t _binary_icon_start_bin_start[];   // 64x64 RGBA（logo/kaisi.png）
+extern "C" const uint8_t _binary_logo_rgba_bin_start[];    // 240x150 RGBA（logo/logo.png）
 
 #define ICON_SRC_W 128          // 图标源图尺寸（RGBA，见 _make_icons.py）
 
@@ -50,6 +52,11 @@ extern "C" const uint8_t _binary_icon_terminal_bin_start[];
 #define ICON_CELL_H  84
 #define MAX_WINS     16
 #define MENU_ITEMS   10
+#define CLOCK_W      260        // 任务栏右侧时钟（年月日 + 时间）占位宽度
+#define LOGO_W       240        // 开机/关机画面用的 logo 嵌入尺寸（logo/logo.png，见 _make_logo.py）
+#define LOGO_H       150
+#define START_ICON_SRC   64     // 开始按钮图标源尺寸（logo/kaisi.png，见 _make_start_icon.py）
+#define START_ICON_DISP  24     // 开始按钮实际绘制尺寸（任务栏高 32，上下留 4px）
 
 // ==================== 配色（Win10 风格）====================
 #define C_DESKTOP    rgb(0, 84, 158)
@@ -67,6 +74,12 @@ extern "C" const uint8_t _binary_icon_terminal_bin_start[];
 #define C_MENU_TXT   rgb(240, 240, 240)
 #define C_ICON_TXT   rgb(255, 255, 255)
 #define C_ICON_SEL   rgb(0, 120, 215)
+// 标题栏三按钮（必须肉眼可区分）
+#define C_BTN_BG      rgb(64, 64, 64)
+#define C_BTN_BG_HOV  rgb(96, 96, 96)
+#define C_BTN_CLOSE   rgb(180, 52, 52)
+#define C_BTN_CLOSE_H rgb(232, 17, 35)
+#define C_BTN_GLYPH   rgb(255, 255, 255)
 
 // ==================== 状态 ====================
 static Window   g_wins[MAX_WINS];
@@ -93,6 +106,19 @@ struct DeskIcon { int kind; int x, y; };     // kind: 0=我的电脑 1=回收站
 static DeskIcon g_icons[3];
 static int  g_icon_sel = -1;
 static uint32_t g_icon_last_tick = 0;
+// 桌面图标拖动（>5px 才算拖动）与空白处选择框的状态（移植自 legacy32/kernel/gui.cpp）
+static int  g_icon_drag_idx = -1;              // 正在拖动的图标（-1=无）
+static int  g_icon_press_x = 0, g_icon_press_y = 0;            // 按下位置
+static int  g_icon_press_icon_x = 0, g_icon_press_icon_y = 0;  // 按下时的图标位置
+static bool g_icon_drag_moved = false;
+static bool g_selbox_active = false;
+static int  g_sel_x0 = 0, g_sel_y0 = 0, g_sel_x1 = 0, g_sel_y1 = 0;
+static bool g_start_icon_logged = false;
+static bool g_title_btn_logged = false;
+static int  sel_box_x() { return g_sel_x0 < g_sel_x1 ? g_sel_x0 : g_sel_x1; }
+static int  sel_box_y() { return g_sel_y0 < g_sel_y1 ? g_sel_y0 : g_sel_y1; }
+static int  sel_box_w() { return g_sel_x0 < g_sel_x1 ? g_sel_x1 - g_sel_x0 : g_sel_x0 - g_sel_x1; }
+static int  sel_box_h() { return g_sel_y0 < g_sel_y1 ? g_sel_y1 - g_sel_y0 : g_sel_y0 - g_sel_y1; }
 
 // 帧率/忙占比统计
 static uint32_t g_frames = 0;
@@ -129,6 +155,18 @@ static void dirty_add(int x, int y, int w, int h) {
 }
 void gui64_dirty(int x, int y, int w, int h) { dirty_add(x, y, w, h); }
 void gui64_invalidate() { dirty_add(0, 0, g_screen_w, g_screen_h); }
+
+// hover 高亮用：把 (x,y) 处窗口的标题栏三按钮区域标脏（光标移入/移出都要重画）
+static void dirty_title_buttons_at(int x, int y) {
+    for (Window* w = g_z; w; w = w->next) {
+        if (!w->visible || w->minimized) continue;
+        const int bx = w->x + w->w - BORDER - BTN_W * 3;
+        if (x >= bx - 2 && x < bx + BTN_W * 3 + 4 && y >= w->y && y < w->y + TITLE_H + BORDER) {
+            dirty_add(bx - 2, w->y, BTN_W * 3 + 8, TITLE_H + BORDER);
+            return;
+        }
+    }
+}
 
 // ==================== 窗口内部工具 ====================
 static int win_index(Window* w) {
@@ -353,8 +391,12 @@ const char* gui64_tr(const char* en, const char* zh) { return g_lang_zh ? zh : e
 uint32_t    gui64_fps() { return g_fps; }
 uint8_t     gui64_cpu_busy_pct() { return g_busy_pct; }
 
+
+// 关机/重启画面（实现放在后面的"绘制区"：要用那里的 blit_rgba/text_ttf/text_w）
+static void power_anim_screen(const char* txt, const char* log_tag);
 // ==================== 重启 / 关机（照抄 32 位回退链）====================
 void sys_reboot64() {
+    power_anim_screen(gui64_tr("Restarting...", "正在重启..."), "[UI] reboot anim start");
     dbg64_str("[RESET] sys_reboot64: 8042 pulse");
     dbg64_nl();
     while (inb(0x64) & 1) (void)inb(0x60);     // 排空
@@ -377,6 +419,7 @@ void sys_reboot64() {
 }
 
 void sys_shutdown64() {
+    power_anim_screen(gui64_tr("Shutting down...", "正在关机..."), "[UI] shutdown anim start");
     dbg64_str("[SHUTDOWN] sys_shutdown64: ACPI 0x604");
     dbg64_nl();
     outw(0x604, 0x2000);                        // QEMU/VMware 的 ACPI 断电
@@ -391,16 +434,20 @@ void sys_shutdown64() {
 }
 
 // ==================== 图标绘制 ====================
-// 把 128x128 RGBA 源图最近邻缩放到 size×size，并**与后备缓冲现有像素做 alpha 混合**
-// （驱动自带的 fb_blit_rgba 是"对黑底混合"，直接铺在蓝色桌面上会发暗，所以这里自己混）
-static void draw_icon_rgba(int x, int y, int size, const uint8_t* src, int src_w) {
-    for (int j = 0; j < size; j++) {
-        const int sy = j * src_w / size;
-        for (int i = 0; i < size; i++) {
-            const int sx = i * src_w / size;
-            const uint8_t* p = src + ((size_t)sy * src_w + sx) * 4;
-            const uint32_t a = p[3];
-            if (a == 0) continue;
+// 把任意尺寸 RGBA 源图最近邻缩放到 dw×dh，并**与后备缓冲现有像素做 alpha 混合**
+// （驱动自带的 fb_blit_rgba 是"对黑底混合"，直接铺在蓝色桌面上会发暗，所以这里自己混）。
+// a_scale：0..255 的整体不透明度乘数（开机 logo 淡入用；255 = 原样）。
+static void blit_rgba(int x, int y, int dw, int dh, const uint8_t* src, int sw, int sh, int a_scale) {
+    if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return;
+    for (int j = 0; j < dh; j++) {
+        const int sy = j * sh / dh;
+        for (int i = 0; i < dw; i++) {
+            const int sx = i * sw / dw;
+            const uint8_t* p = src + (((size_t)sy * (size_t)sw) + (size_t)sx) * 4;
+            int a = p[3];
+            if (a == 0 || a_scale <= 0) continue;
+            if (a_scale < 255) a = a * a_scale / 255;
+            if (a <= 0) continue;
             const int px = x + i, py = y + j;
             if (px < 0 || py < 0 || px >= g_screen_w || py >= g_screen_h) continue;
             uint32_t out;
@@ -408,14 +455,41 @@ static void draw_icon_rgba(int x, int y, int size, const uint8_t* src, int src_w
                 out = 0xFF000000u | ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
             } else {
                 const uint32_t bg = fb_get_pixel(px, py);
-                const uint32_t r = ((uint32_t)p[0] * a + ((bg >> 16) & 0xFF) * (255 - a)) / 255;
-                const uint32_t g = ((uint32_t)p[1] * a + ((bg >> 8) & 0xFF) * (255 - a)) / 255;
-                const uint32_t b = ((uint32_t)p[2] * a + (bg & 0xFF) * (255 - a)) / 255;
+                const uint32_t r = ((uint32_t)p[0] * (uint32_t)a + ((bg >> 16) & 0xFF) * (uint32_t)(255 - a)) / 255;
+                const uint32_t g = ((uint32_t)p[1] * (uint32_t)a + ((bg >> 8) & 0xFF) * (uint32_t)(255 - a)) / 255;
+                const uint32_t b = ((uint32_t)p[2] * (uint32_t)a + (bg & 0xFF) * (uint32_t)(255 - a)) / 255;
                 out = 0xFF000000u | (r << 16) | (g << 8) | b;
             }
             fb_putpixel(px, py, out);
         }
     }
+}
+static void draw_icon_rgba(int x, int y, int size, const uint8_t* src, int src_w) {
+    blit_rgba(x, y, size, size, src, src_w, src_w, 255);
+}
+
+// ==================== 开机 logo（淡入）====================
+// 桌面首帧之前跑：黑底 + 屏幕居中 logo（240x150 RGBA，logo/logo.png）；
+// 12 帧逐帧提高不透明度，帧间用 ticks64() 节流到 ~60Hz，每帧只提交 logo 那块小矩形。
+static void boot_logo_fade_in(void) {
+    const int x0 = (g_screen_w - LOGO_W) / 2;
+    const int y0 = (g_screen_h - LOGO_H) / 2;
+    const int frames = 12;
+    fb_clear(rgb(0, 0, 0));
+    fb_flip();
+    uint32_t next = ticks64();
+    for (int f = 1; f <= frames; f++) {
+        int guard = 0;   // 护栏：万一 PIT 停摆也不至于死在等待里
+        while ((int32_t)(ticks64() - next) < 0 && ++guard < 2000000) __asm__ volatile("pause");
+        next += PIT_HZ_64 / 60;
+        blit_rgba(x0, y0, LOGO_W, LOGO_H, _binary_logo_rgba_bin_start, LOGO_W, LOGO_H,
+                  f * 255 / frames);
+        fb_flip_region(x0, y0, LOGO_W, LOGO_H);
+    }
+    dbg64_str("[UI] boot logo show frames=");
+    dbg64_dec((uint64_t)frames);
+    dbg64_str(" fade=ok");
+    dbg64_nl();
 }
 
 static const uint8_t* icon_src(int kind) {
@@ -429,12 +503,72 @@ static const char* icon_name(int kind) {
     return gui64_tr("Terminal", "终端");
 }
 
+// 选择框与图标格（图标 + 名字标签）是否相交（移植 32 位的 icon_intersects_sel）
+static bool icon_hits_sel(int i, int x0, int y0, int x1, int y1) {
+    if (x0 > x1) { const int t = x0; x0 = x1; x1 = t; }
+    if (y0 > y1) { const int t = y0; y0 = y1; y1 = t; }
+    const int ix0 = g_icons[i].x - 6, iy0 = g_icons[i].y - 6;
+    const int ix1 = ix0 + ICON_CELL_W, iy1 = iy0 + ICON_CELL_H;
+    return !(ix1 < x0 || ix0 > x1 || iy1 < y0 || iy0 > y1);
+}
+
 // ==================== 外壳文字 ====================
 static void text_ttf(int x, int y, const char* s, uint32_t fg) {
     font_select(2);                 // simhei 子集：ASCII + 常用汉字，混排不出豆腐块
     font_draw_text(x, y, s, fg);
 }
 static int text_w(const char* s) { font_select(2); return font_text_width(s); }
+
+// 小工具：字符串比较/复制（内核里没有 libc）
+static bool str_eq64(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+static void str_copy64(char* dst, const char* src, int cap) {
+    int i = 0;
+    for (; src[i] && i < cap - 1; i++) dst[i] = src[i];
+    dst[i] = 0;
+}
+static char g_clock_log[40] = {0};   // 上一次打点的时钟文本（变化时才打，避免每秒刷屏以外的噪声）
+
+// ==================== 关机 / 重启画面 ====================
+// 黑底 + 居中 logo + 一行提示 + 进度条动画，停留约 1 秒，再走复位/断电链。
+// 每帧只提交进度条那条小矩形（不整屏拷贝），用 ticks64() 计时。
+static void power_anim_screen(const char* txt, const char* log_tag) {
+    dbg64_str(log_tag);
+    dbg64_nl();
+    const int x0 = (g_screen_w - LOGO_W) / 2;
+    const int y0 = (g_screen_h - LOGO_H) / 2 - 20;
+    const int pw = 360, ph = 12;
+    const int px = (g_screen_w - pw) / 2;
+    const int py = y0 + LOGO_H + 56;
+    fb_clear(rgb(0, 0, 0));
+    blit_rgba(x0, y0, LOGO_W, LOGO_H, _binary_logo_rgba_bin_start, LOGO_W, LOGO_H, 255);
+    const int tw = text_w(txt);
+    text_ttf((g_screen_w - tw) / 2, y0 + LOGO_H + 22, txt, rgb(240, 240, 240));
+    fb_draw_rect(px - 1, py - 1, pw + 2, ph + 2, rgb(120, 120, 120));
+    fb_flip();
+    const uint32_t t0 = ticks64();
+    uint32_t next = t0;
+    int frames = 0;
+    while ((int32_t)(ticks64() - t0) < (int32_t)PIT_HZ_64 && frames < 240) {   // ~1s
+        const uint32_t now = ticks64();
+        if ((int32_t)(now - next) >= 0) {
+            next += PIT_HZ_64 / 60;
+            int pct = frames * 100 / 60;
+            if (pct > 100) pct = 100;
+            const int fill = pw * pct / 100;
+            fb_fill_rect(px, py, pw, ph, rgb(32, 32, 32));
+            if (fill > 0) fb_fill_rect(px, py, fill, ph, rgb(0, 120, 215));
+            fb_flip_region(px - 1, py - 1, pw + 2, ph + 2);
+            frames++;
+        }
+        __asm__ volatile("pause");
+    }
+    dbg64_str("[UI] power anim frames=");
+    dbg64_dec((uint64_t)frames);
+    dbg64_nl();
+}
 
 // ==================== 中间层绘制 ====================
 static void draw_desktop_bg(int x0, int y0, int x1, int y1) {
@@ -456,13 +590,36 @@ static void draw_icons(void) {
     }
 }
 static void draw_title_buttons(Window* w) {
-    const int by = w->y + BORDER + 7;
+    // 三个按钮必须**肉眼可区分**：最小化=短横线、最大化=方框、关闭=红底 ✕；hover 高亮。
+    // 几何与 handle_mouse_press 的点击判定一致（bx = 窗口右缘 - 3*BTN_W，点击 y ∈ [w->y+2, w->y+24)）。
     const int bx = w->x + w->w - BORDER - BTN_W * 3;
+    const int by = w->y + BORDER + 4;
     for (int b = 0; b < 3; b++) {
-        const int x = bx + b * BTN_W;
-        uint32_t col = C_TITLE_ACT;
-        if (b == 2) col = C_BTN_HOVER;
-        fb_fill_rect(x, by, BTN_W - 2, 10, col);
+        const int x = bx + b * BTN_W + 3;
+        const int bw = BTN_W - 6, bh = 16;
+        const bool hov = (g_cur_x >= bx + b * BTN_W) && (g_cur_x < bx + (b + 1) * BTN_W) &&
+                         (g_cur_y >= w->y + BORDER + 1) && (g_cur_y < w->y + TITLE_H);
+        uint32_t bg;
+        if (b == 2) bg = hov ? C_BTN_CLOSE_H : C_BTN_CLOSE;
+        else        bg = hov ? C_BTN_BG_HOV : C_BTN_BG;
+        fb_fill_rect(x, by, bw, bh, bg);
+        const int cx = x + bw / 2;
+        const int cy = by + bh / 2;
+        if (b == 0) {                       // 最小化：底部短横线
+            fb_fill_rect(cx - 5, cy + 2, 11, 2, C_BTN_GLYPH);
+        } else if (b == 1) {                // 最大化：空心方框
+            fb_draw_rect(cx - 5, cy - 5, 11, 11, C_BTN_GLYPH);
+        } else {                            // 关闭：✕
+            for (int i = -4; i <= 4; i++) {
+                fb_putpixel(cx + i, cy + i, C_BTN_GLYPH);
+                fb_putpixel(cx - i, cy + i, C_BTN_GLYPH);
+            }
+        }
+    }
+    if (!g_title_btn_logged) {
+        g_title_btn_logged = true;
+        dbg64_str("[UI] title btn min/max/close draw ok");
+        dbg64_nl();
     }
 }
 static void draw_window(Window* w) {
@@ -488,34 +645,60 @@ static void draw_window(Window* w) {
 static void draw_taskbar(void) {
     const int y = g_screen_h - TASKBAR_H;
     fb_fill_rect(0, y, g_screen_w, TASKBAR_H, C_TASKBAR);
-    // 开始按钮（Windows 旗子：四个方块）
-    fb_fill_rect(6,  y + 7, 8, 8, rgb(0, 120, 215));
-    fb_fill_rect(16, y + 7, 8, 8, rgb(120, 200, 80));
-    fb_fill_rect(6,  y + 17, 8, 8, rgb(230, 180, 40));
-    fb_fill_rect(16, y + 17, 8, 8, rgb(220, 80, 60));
+    // 开始按钮：logo/kaisi.png（64x64 RGBA）缩放到 24x24（点击区仍是 mx<34，见 handle_mouse_press）
+    blit_rgba(6, y + (TASKBAR_H - START_ICON_DISP) / 2, START_ICON_DISP, START_ICON_DISP,
+              _binary_icon_start_bin_start, START_ICON_SRC, START_ICON_SRC, 255);
+    if (!g_start_icon_logged) {
+        g_start_icon_logged = true;
+        dbg64_str("[UI] start icon blit size=");
+        dbg64_dec((uint64_t)START_ICON_DISP);
+        dbg64_nl();
+    }
     // 窗口按钮
     int bx = 34;
     for (Window* w = g_z; w; w = w->next) {
         if (!w->visible) continue;
         const int bw = text_w(w->title) + 16;
-        if (bx + bw > g_screen_w - 90) break;
+        if (bx + bw > g_screen_w - CLOCK_W) break;
         fb_fill_rect(bx, y + 3, bw, TASKBAR_H - 6, w->active ? C_TASK_ACT : C_TASK_BTN);
         text_ttf(bx + 8, y + 8, w->title, C_TITLE_TXT);
         bx += bw + 4;
     }
-    // 时钟（右对齐）
-    int hh = 0, mm = 0, ss = 0;
+    // 时钟（右对齐）：日期 + 时间，如 "2026-09-19 12:11:35"（必须含年月日）
+    int hh = 0, mm = 0, ss = 0, yy = 0, mo = 0, dd = 0, wd = 0;
     rtc_get_time64(&hh, &mm, &ss);
-    char buf[16];
+    rtc_get_date64(&yy, &mo, &dd, &wd);
+    char buf[40];
     int n = 0;
-    buf[n++] = (char)('0' + (hh / 10) % 10); buf[n++] = (char)('0' + hh % 10);
+    buf[n++] = (char)('0' + (yy / 1000) % 10);
+    buf[n++] = (char)('0' + (yy / 100) % 10);
+    buf[n++] = (char)('0' + (yy / 10) % 10);
+    buf[n++] = (char)('0' + yy % 10);
+    buf[n++] = '-';
+    buf[n++] = (char)('0' + (mo / 10) % 10);
+    buf[n++] = (char)('0' + mo % 10);
+    buf[n++] = '-';
+    buf[n++] = (char)('0' + (dd / 10) % 10);
+    buf[n++] = (char)('0' + dd % 10);
+    buf[n++] = ' ';
+    buf[n++] = (char)('0' + (hh / 10) % 10);
+    buf[n++] = (char)('0' + hh % 10);
     buf[n++] = ':';
-    buf[n++] = (char)('0' + (mm / 10) % 10); buf[n++] = (char)('0' + mm % 10);
+    buf[n++] = (char)('0' + (mm / 10) % 10);
+    buf[n++] = (char)('0' + mm % 10);
     buf[n++] = ':';
-    buf[n++] = (char)('0' + (ss / 10) % 10); buf[n++] = (char)('0' + ss % 10);
+    buf[n++] = (char)('0' + (ss / 10) % 10);
+    buf[n++] = (char)('0' + ss % 10);
     buf[n] = 0;
     const int tw = text_w(buf);
-    text_ttf(g_screen_w - tw - 10, y + 8, buf, C_TITLE_TXT);
+    text_ttf(g_screen_w - tw - 10, y + (TASKBAR_H - 14) / 2, buf, C_TITLE_TXT);
+    // 时钟文本打点：只在文本变化（每秒）时打一行，便于自动验收 grep 年月日
+    if (!str_eq64(buf, g_clock_log)) {
+        str_copy64(g_clock_log, buf, (int)sizeof(g_clock_log));
+        dbg64_str("[UI] clock text=");
+        dbg64_str(buf);
+        dbg64_nl();
+    }
 }
 
 // 开始菜单条目（与 32 位同名同序）
@@ -575,6 +758,15 @@ static void render(void) {
     fb_set_clip(x0, y0, dw, dh);
     draw_desktop_bg(x0, y0, x1, y1);
     draw_icons();
+    // 鼠标左键选择框（Win10 风格半透明矩形：桌面层、窗口之下）
+    if (g_selbox_active) {
+        const int sbx = sel_box_x(), sby = sel_box_y();
+        const int sbw = sel_box_w(), sbh = sel_box_h();
+        if (sbw > 0 && sbh > 0) {
+            fb_fill_rect_alpha(sbx, sby, sbw, sbh, rgb(0, 128, 255), 40);
+            fb_draw_rect(sbx, sby, sbw, sbh, rgb(64, 160, 255));
+        }
+    }
     // 窗口从底到顶画：先把 z 序反转
     Window* stack[MAX_WINS];
     int n = 0;
@@ -902,39 +1094,51 @@ static void handle_mouse_press(int mx, int my, int button) {
         press_in_client(w, mx, my, button);
         return;
     }
-    // 4) 桌面图标
+    // 4) 桌面图标（按下 = 选中 + 记录拖动基准；松开时区分 单击/双击/拖动）
     for (int i = 0; i < 3; i++) {
         const DeskIcon& ic = g_icons[i];
         if (mx >= ic.x - 4 && mx < ic.x + ICON_W + 4 && my >= ic.y - 4 && my < ic.y + ICON_W + 18) {
-            const uint32_t now = ticks64();
-            const bool dbl = (g_icon_sel == i) && (now - g_icon_last_tick <= ms_to_ticks64(500));
             g_icon_sel = i;
-            g_icon_last_tick = now;
-            dbg64_str(dbl ? "[UI] desktop icon open kind=" : "[UI] desktop icon select kind=");
+            g_icon_drag_idx = i;
+            g_icon_drag_moved = false;
+            g_icon_press_x = mx;
+            g_icon_press_y = my;
+            g_icon_press_icon_x = ic.x;
+            g_icon_press_icon_y = ic.y;
+            g_selbox_active = false;
+            dbg64_str("[UI] desktop icon select kind=");
             dbg64_dec((uint64_t)i);
             dbg64_nl();
-            if (dbl) {
-                if (i == 0) app_mypc_open64();
-                else if (i == 1) app_recycle_open64();
-                else app_term_open64();
-                g_icon_sel = -1;
-            }
-            dirty_add(0, 0, 260, ICON_CELL_H + 40);
+            dirty_add(ic.x - 6, ic.y - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
             return;
         }
     }
-    // 5) 空白处：取消选择 / 关闭菜单
-    g_icon_sel = -1;
+    // 5) 桌面空白：取消选择；左键开始拉 Win10 风格选择框（桌面层、窗口之下）
+    if (g_icon_sel >= 0) {
+        const DeskIcon& old = g_icons[g_icon_sel];
+        dirty_add(old.x - 6, old.y - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
+        g_icon_sel = -1;
+    }
+    if (button == 0) {
+        g_selbox_active = true;
+        g_sel_x0 = mx; g_sel_y0 = my;
+        g_sel_x1 = mx; g_sel_y1 = my;
+    } else {
+        g_selbox_active = false;
+    }
     dirty_add(0, 0, g_screen_w, g_screen_h);
 }
 
 static void handle_mouse(void) {
     const int mx = mouse_get_x(), my = mouse_get_y();
     const int btn = (int)mouse_get_buttons();
-    // 光标移动 -> 新旧两块脏区
+    const bool rel_left = (g_prev_btn & 1) && !(btn & 1);   // 左键释放（边沿）
+    // 光标移动 -> 新旧两块脏区（标题栏三按钮要跟着重画：hover 高亮）
     if (mx != g_cur_x || my != g_cur_y) {
         dirty_add(g_prev_cur_x, g_prev_cur_y, 12, 20);
         dirty_add(g_cur_x, g_cur_y, 12, 20);
+        dirty_title_buttons_at(g_cur_x, g_cur_y);
+        dirty_title_buttons_at(mx, my);
         g_prev_cur_x = g_cur_x; g_prev_cur_y = g_cur_y;
         g_cur_x = mx; g_cur_y = my;
         dirty_add(mx, my, 12, 20);
@@ -943,7 +1147,109 @@ static void handle_mouse(void) {
     if (mouse_button_pressed(0)) { mouse_consume_pressed(0); handle_mouse_press(mx, my, 0); }
     if (mouse_button_pressed(1)) { mouse_consume_pressed(1); handle_mouse_press(mx, my, 1); }
     if (mouse_button_pressed(2)) { mouse_consume_pressed(2); handle_mouse_press(mx, my, 2); }
-    // 拖拽
+
+    // 桌面图标拖动：位移 >5px（dx²+dy²>25）才算拖动，从而区分单击/双击/拖动（移植自 32 位）
+    if ((btn & 1) && g_icon_drag_idx >= 0) {
+        const int dx = mx - g_icon_press_x, dy = my - g_icon_press_y;
+        if (!g_icon_drag_moved && dx * dx + dy * dy > 25) {
+            g_icon_drag_moved = true;
+            dbg64_str("[UI] icon drag idx=");
+            dbg64_dec((uint64_t)g_icon_drag_idx);
+            dbg64_str(" x=");
+            dbg64_dec((uint64_t)g_icons[g_icon_drag_idx].x);
+            dbg64_str(" y=");
+            dbg64_dec((uint64_t)g_icons[g_icon_drag_idx].y);
+            dbg64_nl();
+        }
+        if (g_icon_drag_moved) {
+            DeskIcon& ic = g_icons[g_icon_drag_idx];
+            int nx = g_icon_press_icon_x + dx;
+            int ny = g_icon_press_icon_y + dy;
+            if (nx < 2) nx = 2;
+            if (nx > g_screen_w - ICON_CELL_W - 2) nx = g_screen_w - ICON_CELL_W - 2;
+            if (ny < 2) ny = 2;
+            if (ny > g_screen_h - TASKBAR_H - ICON_CELL_H) ny = g_screen_h - TASKBAR_H - ICON_CELL_H;
+            if (nx != ic.x || ny != ic.y) {
+                dirty_add(ic.x - 6, ic.y - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
+                ic.x = nx; ic.y = ny;
+                dirty_add(ic.x - 6, ic.y - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
+            }
+        }
+    }
+    // 空白处选择框：拖动更新矩形 + 实时选中框内图标（复用 g_icon_sel / C_ICON_SEL 绘制）
+    if ((btn & 1) && g_selbox_active) {
+        if (mx != g_sel_x1 || my != g_sel_y1) {
+            dirty_add(sel_box_x() - 2, sel_box_y() - 2, sel_box_w() + 4, sel_box_h() + 4);
+            g_sel_x1 = mx; g_sel_y1 = my;
+            int sel = -1;
+            for (int i = 0; i < 3; i++)
+                if (icon_hits_sel(i, g_sel_x0, g_sel_y0, g_sel_x1, g_sel_y1)) sel = i;
+            if (sel != g_icon_sel) {
+                if (g_icon_sel >= 0)
+                    dirty_add(g_icons[g_icon_sel].x - 6, g_icons[g_icon_sel].y - 6,
+                              ICON_CELL_W + 12, ICON_CELL_H + 12);
+                g_icon_sel = sel;
+                if (g_icon_sel >= 0)
+                    dirty_add(g_icons[g_icon_sel].x - 6, g_icons[g_icon_sel].y - 6,
+                              ICON_CELL_W + 12, ICON_CELL_H + 12);
+            }
+            dirty_add(sel_box_x() - 2, sel_box_y() - 2, sel_box_w() + 4, sel_box_h() + 4);
+        }
+    }
+    // 左键释放：结束图标拖动/选择框；位移未超阈值 = 单击（累计双击打开应用，不变）
+    if (rel_left) {
+        if (g_icon_drag_idx >= 0) {
+            const int i = g_icon_drag_idx;
+            if (!g_icon_drag_moved) {
+                const uint32_t now = ticks64();
+                const bool dbl = (g_icon_sel == i) && (now - g_icon_last_tick <= ms_to_ticks64(500));
+                if (dbl) {
+                    dbg64_str("[UI] desktop icon open kind=");
+                    dbg64_dec((uint64_t)i);
+                    dbg64_nl();
+                    if (i == 0) app_mypc_open64();
+                    else if (i == 1) app_recycle_open64();
+                    else app_term_open64();
+                    g_icon_sel = -1;
+                    g_icon_last_tick = 0;
+                } else {
+                    g_icon_last_tick = now;
+                }
+            } else {
+                dbg64_str("[UI] icon drag idx=");
+                dbg64_dec((uint64_t)i);
+                dbg64_str(" x=");
+                dbg64_dec((uint64_t)g_icons[i].x);
+                dbg64_str(" y=");
+                dbg64_dec((uint64_t)g_icons[i].y);
+                dbg64_nl();
+            }
+            dirty_add(g_icons[i].x - 6, g_icons[i].y - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
+            g_icon_drag_idx = -1;
+            g_icon_drag_moved = false;
+        }
+        if (g_selbox_active) {
+            const int x0 = sel_box_x(), y0 = sel_box_y();
+            const int bw = sel_box_w(), bh = sel_box_h();
+            int sel = 0;
+            for (int i = 0; i < 3; i++)
+                if (icon_hits_sel(i, g_sel_x0, g_sel_y0, g_sel_x1, g_sel_y1)) sel++;
+            dbg64_str("[UI] selbox x0=");
+            dbg64_dec((uint64_t)x0);
+            dbg64_str(" y0=");
+            dbg64_dec((uint64_t)y0);
+            dbg64_str(" x1=");
+            dbg64_dec((uint64_t)(x0 + bw));
+            dbg64_str(" y1=");
+            dbg64_dec((uint64_t)(y0 + bh));
+            dbg64_str(" sel=");
+            dbg64_dec((uint64_t)sel);
+            dbg64_nl();
+            g_selbox_active = false;
+            dirty_add(x0 - 2, y0 - 2, bw + 4, bh + 4);
+        }
+    }
+    // 拖拽窗口（保持原有语义：只有窗口拖动走这里）
     if (g_drag != DRAG_NONE && g_drag_w && gui64_window_alive(g_drag_w)) {
         if (btn & 1) {
             Window* w = g_drag_w;
@@ -1075,6 +1381,9 @@ int gui64_selftest() {
     for (int i = 0; i < MAX_WINS; i++) g_used[i] = false;
     g_z = nullptr;
     g_icon_sel = -1;
+    g_icon_drag_idx = -1;
+    g_icon_drag_moved = false;
+    g_selbox_active = false;
     g_icons[0] = DeskIcon{0, 24,  24};
     g_icons[1] = DeskIcon{1, 24,  24 + ICON_CELL_H};
     g_icons[2] = DeskIcon{2, 24,  24 + ICON_CELL_H * 2};
@@ -1088,6 +1397,9 @@ int gui64_selftest() {
     dbg64_str(" title_h=");
     dbg64_dec((uint64_t)TITLE_H);
     dbg64_nl();
+
+    // ---- 开机 logo：桌面首帧之前先放一段黑底 + 居中 logo 的淡入（~12 帧 ≈ 200ms）----
+    boot_logo_fade_in();
 
     const int st = gui64_selftest();
     if (st != 0) {
@@ -1137,7 +1449,7 @@ int gui64_selftest() {
             // 时钟/监视器每秒重画一次
             if ((int32_t)(now - next_tick) >= 0) {
                 next_tick = now + PIT_HZ_64;
-                dirty_add(g_screen_w - 90, g_screen_h - TASKBAR_H, 90, TASKBAR_H);
+                dirty_add(g_screen_w - CLOCK_W, g_screen_h - TASKBAR_H, CLOCK_W, TASKBAR_H);
                 if (gui64_window_alive(g_mon_win)) gui64_invalidate_window(g_mon_win);
                 if (gui64_window_alive(g_mypc_win)) gui64_invalidate_window(g_mypc_win);
                 if (gui64_window_alive(g_about_win)) gui64_invalidate_window(g_about_win);
