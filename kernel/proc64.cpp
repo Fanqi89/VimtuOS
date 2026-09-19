@@ -25,10 +25,15 @@
 #include "elf64.h"          // execve 复用装载逻辑（elf64_load_for_exec64 / elf64_forget64）
 #include "vfs64.h"          // /proc64.elf 的安装与读取
 #include "syscall64.h"      // SYSCALL64_INSM_FRAME_MARK64（execve 改帧时保持入口标记）
+#include "fd64.h"           // 批次 D：每进程 fd 表（fdtab）+ 引用计数对象（fork/execve/退出都要用）
 #include "memlayout64.h"    // ML64_PML4_PHYS（引导期页表自证用）
 #include "mem_64.h"         // page_alloc_64 / page_free_64 / PTE_*
 #include "debug64.h"
 
+// 内嵌的 /pipe64.elf（批次 D：ring3 pipe 演示 —— fork 后父子各持一端通信）
+extern "C" const uint8_t _binary_build64_pipe64_elf_start[];
+extern "C" const uint8_t _binary_build64_pipe64_elf_end[];
+static const char PROC64_PIPE_PATH64[] = "/pipe64.elf";
 // 内嵌的 /proc64.elf（build64.sh：nasm -f elf64 -> ld.lld -static -> objcopy -I binary 嵌进系统内核）。
 extern "C" const uint8_t _binary_build64_proc64_elf_start[];
 extern "C" const uint8_t _binary_build64_proc64_elf_end[];
@@ -50,6 +55,7 @@ static const int64_t P64_ENOSYS  = 38;
 static const uint32_t PROC64_FORK_MAX_PAGES    = 256;   // fork 整页复制的页数上限（≈1MiB）
 static const int      PROC64_WAIT_TIMEOUT_SEC  = 5;     // wait4 有界等待（防挂死）
 static const int      PROC64_DEMO_TIMEOUT_SEC  = 12;    // 启动期演示的有界等待
+static const int      PROC64_PIPE_TIMEOUT_SEC  = 12;    // pipe 演示的有界等待（同一口径）
 static const int      PROC64_SIG_MAX           = 32;    // 记录型信号表（只记录不投递）
 
 // ==================== 进程表 ====================
@@ -74,6 +80,7 @@ struct Proc64 {
     uint64_t frame;             // 用户现场（pt_regs64，仅 fork 出的子进程/启动映像用）
     uint64_t entry;             // 最近一次装载的入口（readlink /proc/self/exe 相关日志用）
     uint64_t sighand[PROC64_SIG_MAX];   // rt_sigaction 记录（只记录不投递）
+    FdTable64* fdtab;                   // ★ 批次 D：每进程 fd 表（fd64.h；池由 fd64.cpp 管）
     uint32_t sigmask_lo, sigmask_hi;    // rt_sigprocmask 记录
     char     name[PROC64_NAME_MAX];
     char     exe[PROC64_PATH_MAX];
@@ -83,6 +90,11 @@ static Proc64   g_procs[PROC64_MAX];
 static int      g_proc_count   = 0;
 static int32_t  g_next_pid64   = 1;
 
+
+// fd64 通过弱符号问"当前进程的 fd 表"（没有进程上下文 -> nullptr -> 内核表兜底）。
+// 定义放在 p64_current64 之后（它在下面"进程查找"一节里）。
+static Proc64* p64_current64();
+extern "C" FdTable64* proc64_fdtab_of_current64();
 // 引导期状态（proc64_init64 探测一次）
 static uint64_t g_boot_cr364   = 0;      // 内核地址空间（引导期页表根）
 static int      g_isolate64    = 0;      // 1 = 每进程 CR3 生效；0 = 共享地址空间模式
@@ -139,6 +151,12 @@ static Proc64* p64_current64() {
     if (q < &g_procs[0] || q >= &g_procs[PROC64_MAX]) return nullptr;   // 防御：不是我们的表
     if (q->state == PROC64_FREE) return nullptr;
     return q;
+}
+
+// fd64 的弱引用目标（fd64.cpp 在安装介质内核里也要编，所以那边是 weak 声明 + 判空）
+extern "C" FdTable64* proc64_fdtab_of_current64() {
+    Proc64* p = p64_current64();
+    return p ? p->fdtab : nullptr;
 }
 static int p64_free_slot64() {
     for (int i = 0; i < PROC64_MAX; i++) if (g_procs[i].state == PROC64_FREE) return i;
@@ -285,9 +303,17 @@ void proc64_init64() {
         why = 3;
     }
 #if defined(PROC64_UEFI_CR3_EXPERIMENT) && (PROC64_UEFI_CR3_EXPERIMENT == 1)
-    // ★ 一次性实测开关（默认关闭、不随构建产物发布）：强制在"固件页表"下也启用每进程 CR3，
-    //   用来在 UEFI（OVMF / VMware EFI）里实测"运行期 mov cr3 到底行不行"。
-    if (!own) { own = 1; why = 0xE0; }
+    // ★ 实验构建：**不在这里**强行打开隔离（批次 C 的那个占位行为已废弃 —— 它会让"固件页表 +
+    //   每进程 CR3"直接上电，复位/失败都看不出是哪一步）。改成：先如实保持 shared，由
+    //   proc64_uefi_cr3_experiment_start64() 在**桌面起来之后**按 A -> B 顺序实测，
+    //   实测通过（mov cr3 存活 + 真进 ring3）才把 g_isolate64 打开。见本文件末尾的实验段。
+    if (!own) {
+        dbg64_line_begin64();
+        dbg64_str("[PROC64] uefi cr3 experiment armed (mode stays shared until A/B are verified; check=");
+        dbg64_dec(why);
+        dbg64_str(")\n");
+        dbg64_line_end64();
+    }
 #endif
     g_isolate64 = own;
 
@@ -373,7 +399,16 @@ int proc64_create64(const char* name, int ppid) {
     if (slot < 0) { p64_log2("[PROC64] create FAILED reason=no-slot name=", name); return -1; }
     Proc64* p = &g_procs[slot];
     p64_zero(p, (uint32_t)sizeof(Proc64));
+    // ★ 批次 D：先拿一张 fd 表（池满 = 建不了进程；16 进程 + 内核表 < FD64_TABLE_MAX=20，正常不会）
+    p->fdtab = fd64_table_alloc64();
+    if (!p->fdtab) {
+        p64_zero(p, (uint32_t)sizeof(Proc64));
+        p64_log2("[PROC64] create FAILED reason=fd-table name=", name);
+        return -1;
+    }
     if (p64_build_as64(p) != 0) {
+        fd64_table_close_all64(p->fdtab);
+        fd64_table_free64(p->fdtab);
         p64_zero(p, (uint32_t)sizeof(Proc64));
         p64_log2("[PROC64] create FAILED reason=pagetable name=", name);
         return -1;
@@ -410,6 +445,11 @@ void proc64_destroy64(int pid) {
         if (p->task_id) task_kill64(p->task_id);
     }
     if (p64_cr3_is64(p)) proc64_switch_to_kernel64();   // ★ 只在"正在用它的地址空间"时才切走
+    if (p->fdtab) {                                     // ★ 批次 D：关掉这张表里的所有 fd（引用 -1）
+        fd64_table_close_all64(p->fdtab);
+        fd64_table_free64(p->fdtab);
+        p->fdtab = nullptr;
+    }
     if (p->pdpt_phys || p->pml4_phys) {
         p64_release_area64(p);
         if (p->pdpt_phys) page_free_64((void*)(uintptr_t)p->pdpt_phys);
@@ -442,6 +482,13 @@ static void p64_exit64(Proc64* p, uint32_t code, uint32_t sig) {
     p64_release_area64(p);
     if (p->pdpt_phys) { page_free_64((void*)(uintptr_t)p->pdpt_phys); p->pdpt_phys = 0; }
     if (p->pml4_phys) { page_free_64((void*)(uintptr_t)p->pml4_phys); p->pml4_phys = 0; }
+    // ★ 批次 D：fd 表随进程退出一起收（close_all = 每个 fd 引用计数 -1；fork 出来的兄弟进程
+    //   若还共享着同一个 OpenFile64/pipe，对象会活下来 —— 这就是 POSIX 的语义）
+    if (p->fdtab) {
+        fd64_table_close_all64(p->fdtab);
+        fd64_table_free64(p->fdtab);
+        p->fdtab = nullptr;
+    }
     p->cr3       = 0;
     p->exit_code = code & 0xFFu;
     p->term_sig  = sig;
@@ -623,6 +670,16 @@ int64_t proc64_fork64(pt_regs64* r) {
     Proc64* c = p64_find64(cpid);
     if (!c) return -P64_ENOMEM;
 
+    // ★ 批次 D：继承父进程整张 fd 表（逐槽共享同一个 OpenFile64 -> 父子共享偏移/pipe 端）。
+    //   放在复制用户区之前：失败了才轮到 p64_exit64 去回收（它会 close_all 这张表）。
+    const uint32_t fds = fd64_table_used64(par->fdtab);
+    if (fd64_table_clone64(c->fdtab, par->fdtab) != 0) {
+        p64_exit64(c, 1, 0);
+        proc64_destroy64(cpid);
+        p64_log2("[PROC64] fork FAILED reason=fd-table parent-name=", par->name);
+        return -P64_ENOMEM;
+    }
+
     uint32_t pages = 0;
     if (p64_copy_user_area64(par, c, &pages) != 0) {
         p64_exit64(c, 1, 0);                            // 复用退出路径把半成品清干净
@@ -672,6 +729,9 @@ int64_t proc64_fork64(pt_regs64* r) {
     dbg64_hex64(c->cr3);
     dbg64_str(" pages=");
     dbg64_dec((uint64_t)pages);
+    dbg64_str(" fds=");
+    dbg64_dec((uint64_t)fds);
+    dbg64_str(" fds_shared=1");
     dbg64_nl();
     dbg64_line_end64();
     return (int64_t)c->pid;
@@ -692,6 +752,8 @@ int64_t proc64_execve64(pt_regs64* r, const char* path, const char* const* argv,
     const uint32_t old_pages = p64_count_pages64(p);
     p64_release_area64(p);
     elf64_forget64();
+    // ★ 批次 D：execve **默认保留**所有 fd（Linux 语义；本内核没有实现 O_CLOEXEC，如实注明）
+    const uint32_t fds_kept = fd64_table_used64(p->fdtab);
 
     uint64_t entry = 0, rsp = 0;
     if (elf64_load_for_exec64(path, argv, argc, &entry, &rsp) != 0) {
@@ -737,6 +799,8 @@ int64_t proc64_execve64(pt_regs64* r, const char* path, const char* const* argv,
     dbg64_dec((uint64_t)argc);
     dbg64_str(" old_pages=");
     dbg64_dec((uint64_t)old_pages);
+    dbg64_str(" fds_kept=");
+    dbg64_dec((uint64_t)fds_kept);
     dbg64_nl();
     dbg64_line_end64();
     return 0;
@@ -1003,6 +1067,83 @@ int proc64_install_builtin64(int drive, uint32_t part_lba) {
     dbg64_dec(bytes);
     dbg64_nl();
     dbg64_line_end64();
+    // 不在这里 return：接着装 /pipe64.elf（下面那段）
+    // ★ 批次 D：顺手把 ring3 pipe 演示程序（/pipe64.elf）也幂等装进去 —— 同一套"blob 校验 +
+    //   幂等跳过 + 真写盘"的路径，避免再写一份几乎相同的函数。
+    {
+        const uint32_t pbytes = (uint32_t)(_binary_build64_pipe64_elf_end - _binary_build64_pipe64_elf_start);
+        if (pbytes < 64 || !elf64_blob_ok64(_binary_build64_pipe64_elf_start, pbytes)) {
+            p64_log2("[PROC64] install FAILED reason=blob path=/pipe64.elf", "");
+            return -1;
+        }
+        if (vfs64_stat(PROC64_PIPE_PATH64, &t, &sz) == 0) {
+            dbg64_line_begin64();
+            dbg64_str("[PROC64] install skipped (exists) /pipe64.elf size=");
+            dbg64_dec(sz);
+            dbg64_nl();
+            dbg64_line_end64();
+        } else {
+            const int w2 = vfs64_write(PROC64_PIPE_PATH64, _binary_build64_pipe64_elf_start, (int)pbytes);
+            if (w2 != (int)pbytes) { p64_log2("[PROC64] install FAILED reason=", "write(/pipe64.elf)"); return -1; }
+            dbg64_line_begin64();
+            dbg64_str("[PROC64] install ok path=/pipe64.elf bytes=");
+            dbg64_dec(pbytes);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
+    return 0;
+}
+
+// ==================== 批次 D：ring3 pipe 演示（fork 后父子各持一端通信）====================
+// 复杂度同样在用户程序（user/pipe64.asm）：pipe(22) -> fork(57) -> 子进程写写端 / 父进程读读端
+//   -> 父进程打印收到的内容 -> wait4(61) -> exit(60)。内核这侧只做：建进程 + 有界等待 + 打点。
+// 为什么值得单开一个演示而不是塞进 /proc64.elf：proc64_test 断言了那次 fork 的 pages=8（映像 4 页
+//   + 栈 4 页），往它里面加代码会挪动页数 —— 新程序不动既有证据。
+int proc64_pipe_demo64(const char* path) {
+    if (!g_isolate64) {
+        dbg64_line_begin64();
+        dbg64_str("[PROC64] pipe-demo skipped (shared address space mode: no fork)\n");
+        dbg64_line_end64();
+        return 0;
+    }
+    const char* p = (path && path[0] == '/') ? path : PROC64_PIPE_PATH64;
+    uint32_t t = 0, sz = 0;
+    if (vfs64_stat(p, &t, &sz) != 0) {
+        p64_log2("[PROC64] pipe-demo skipped (no elf on vfs) path=", p);
+        return 0;
+    }
+    const int pid = proc64_create64("pipedemo", 0);
+    if (pid < 0) { p64_log2("[PROC64] pipe-demo skipped (create failed) path=", p); return 0; }
+    if (proc64_start_elf64(pid, p) != 0) {
+        proc64_destroy64(pid);
+        p64_log2("[PROC64] pipe-demo skipped (start failed) path=", p);
+        return 0;
+    }
+    const uint64_t t0 = g_ticks64;
+    Proc64* ip = p64_find64(pid);
+    while (ip && ip->state != PROC64_EXITED &&
+           (g_ticks64 - t0) < (uint64_t)PIT_HZ_64 * (uint64_t)PROC64_PIPE_TIMEOUT_SEC) {
+        task_sleep64(2);
+    }
+    const int exited = (ip && ip->state == PROC64_EXITED) ? 1 : 0;
+    const uint32_t code = ip ? ip->exit_code : 0;
+    if (!exited) {
+        p64_log31("[PROC64] pipe-demo TIMEOUT pid=", (uint64_t)pid, " (still running)");
+        (void)proc64_kill64(pid, 9);
+    }
+    if (p64_find64(pid)) proc64_destroy64(pid);
+    dbg64_line_begin64();
+    dbg64_str("[PROC64] pipe-demo done pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_str(" exited=");
+    dbg64_dec((uint64_t)exited);
+    dbg64_str(" code=");
+    dbg64_dec((uint64_t)code);
+    dbg64_str(" ticks=");
+    dbg64_dec(g_ticks64 - t0);
+    dbg64_nl();
+    dbg64_line_end64();
     return 0;
 }
 
@@ -1145,3 +1286,216 @@ int proc64_selftest64() {
     }
     return fail;
 }
+
+// ==================== UEFI 运行期 CR3 实验（编译期开关，默认关）====================
+// 做什么（完整做法/现象/结论见 docs/UEFI地址空间实验报告.md）：
+//   背景：UEFI 路径下内核跑在**固件当前活动的 PML4** 上（EDK2 把页表页标成只读），所以现在
+//   UEFI 一律降级成"共享地址空间模式"。这份代码只在 -DPROC64_UEFI_CR3_EXPERIMENT=1 的构建里
+//   存在，用来实测两件事：能不能把用户窗口**就地**挂进固件 PML4；运行期 `mov cr3` 到底行不行。
+//   方案 A（就地挂载）：临时清 CR0.WP -> 在固件 PML4[0] 的 PDPT[4] 挂自建 PD -> 恢复 WP ->
+//     开 WP-kludge（usermode64）+ 覆盖 user64_available64 -> 试进 ring3。
+//   方案 B（自带 PML4）：新建 PML4/PDPT，复制固件的 512 项 + 0..4GB 的 PDPTE，PDPT[4] 给用户
+//     窗口留空 -> 打 stage=cr3（在 mov cr3 **之前**，复位时这就是最后一行）-> mov cr3 ->
+//     活了就打 stage=enter -> 试进 ring3。成功则把隔离模式真的打开（g_isolate64 = 1）。
+//   两个方案都做（规格要求），按顺序各打点，最后一行给 result=A|B|none mode=isolated|shared。
+#if defined(PROC64_UEFI_CR3_EXPERIMENT) && (PROC64_UEFI_CR3_EXPERIMENT == 1)
+extern "C" uint64_t g_user64_exit_code64;      // usermode64.cpp：最近一次 ring3 exit 的 code
+
+// ring3 探针（int 0x80 自有 ABI）：write(1, msg, len) + exit(2, 0) + jmp $。
+// 字符串放在用户代码页偏移 0x40（同页内，页映射已经覆盖）。
+static const char P64_EXP_MSG64[] = "PROC64-UEFI-EXP-RING3\n";
+static uint32_t p64_exp_build_blob64(uint8_t* out) {
+    const uint32_t slen = (uint32_t)(sizeof(P64_EXP_MSG64) - 1);
+    const uint64_t sva  = USER64_CODE_VA64 + 0x40;
+    uint32_t n = 0;
+    out[n++] = 0xB8; out[n++] = 0x01; out[n++] = 0x00; out[n++] = 0x00; out[n++] = 0x00;  // mov eax,1
+    out[n++] = 0xBF; out[n++] = 0x01; out[n++] = 0x00; out[n++] = 0x00; out[n++] = 0x00;  // mov edi,1
+    out[n++] = 0x48; out[n++] = 0xBE;                                                    // movabs rsi,str
+    for (int i = 0; i < 8; i++) out[n++] = (uint8_t)(sva >> (8 * i));
+    out[n++] = 0xBA;                                                                     // mov edx,len
+    for (int i = 0; i < 4; i++) out[n++] = (uint8_t)(slen >> (8 * i));
+    out[n++] = 0xCD; out[n++] = 0x80;                                                    // int 0x80
+    out[n++] = 0xB8; out[n++] = 0x02; out[n++] = 0x00; out[n++] = 0x00; out[n++] = 0x00;  // mov eax,2
+    out[n++] = 0x31; out[n++] = 0xFF;                                                     // xor edi,edi
+    out[n++] = 0xCD; out[n++] = 0x80;                                                     // int 0x80
+    out[n++] = 0xEB; out[n++] = 0xFE;                                                     // jmp $
+    while (n < 0x40) out[n++] = 0x00;
+    for (uint32_t i = 0; i <= slen; i++) out[n++] = (uint8_t)P64_EXP_MSG64[i];
+    return n;
+}
+// 试进 ring3：返回 0 = 真的跑完且退出码 0；非 0 = 失败（值就是原始退出码/错误）
+static int p64_exp_try_ring364(const char* tag) {
+    uint8_t blob[128];
+    const uint32_t n = p64_exp_build_blob64(blob);
+    g_user64_exit_code64 = 0xFFFFFFFFULL;         // 区分"没跑到 exit"（0xFF..FF 会原样出现）
+    if (user64_run_blob64(blob, n, tag) != 0) return 1;
+    return (int)(g_user64_exit_code64 & 0xFFULL);
+}
+static void p64_exp_stage64(const char* tag, const char* stage, uint64_t err) {
+    dbg64_line_begin64();
+    dbg64_str("[PROC64] uefi exp ");
+    dbg64_str(tag);
+    dbg64_str(" stage=");
+    dbg64_str(stage);
+    dbg64_str(" err=");
+    dbg64_hex64(err);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+// 临时关 CR0.WP（写固件只读页表页的唯一手法；与 boot/efi/uefi64.c 同款）
+static inline uint64_t p64_wp_off64() {
+    uint64_t c0; __asm__ volatile("mov %%cr0, %0" : "=r"(c0));
+    const uint64_t off = c0 & ~0x10000ULL;
+    __asm__ volatile("mov %0, %%cr0" ::"r"(off) : "memory");
+    return c0;
+}
+
+static int g_uefi_exp_a_ok64 = 0;     // 方案 A 是否已经成功（B 回滚时要把 WP-kludge 恢复成它的状态）
+static inline void p64_wp_on64(uint64_t c0) { __asm__ volatile("mov %0, %%cr0" ::"r"(c0) : "memory"); }
+
+// ---- 方案 A：就地挂载（不换 CR3）----
+static int p64_uefi_exp_a64() {
+    const uint64_t cr3 = p64_rd_cr364();
+    uint64_t* pml4 = p64_phys64(p64_page64(cr3));
+    const uint64_t e0 = pml4[0];
+    if (!(e0 & PTE_PRESENT_64) || (e0 & 0x80ULL)) { p64_exp_stage64("A", "map", 1); return 1; }
+    uint64_t* pdpt = p64_phys64(p64_page64(e0));
+    void* pd = page_alloc_64();
+    if (!pd) { p64_exp_stage64("A", "map", 2); return 1; }
+    p64_zero(pd, PAGE_SIZE_64);
+    const uint64_t c0 = p64_wp_off64();
+    pml4[0]  = e0 | PTE_WRITE_64 | PTE_USER_64;                    // 顶层打开 U/S + RW
+    pdpt[4]  = (uint64_t)(uintptr_t)pd | PTE_PRESENT_64 | PTE_WRITE_64 | PTE_USER_64;  // 用户窗口
+    p64_wp_on64(c0);
+    // 读回校验：写入真的落地了（读不会 #PF，所以这一步失败是可判定的）
+    if (!(pml4[0] & PTE_USER_64) || p64_page64(pdpt[4]) != (uint64_t)(uintptr_t)pd) {
+        p64_exp_stage64("A", "map", 3);
+        // 只有"确实没挂上"才回收这个 PD 页：挂上了却读回不一致的话，页表里还指着它，
+        // 回收会留下悬空项（后面 user64_map_page64 复用同一物理页 -> 页表被踩烂）。
+        if (p64_page64(pdpt[4]) != (uint64_t)(uintptr_t)pd) page_free_64(pd);
+        return 1;
+    }
+    p64_exp_stage64("A", "map", 0);
+
+    user64_set_wp_kludge64(1);                                     // 允许挂 PDPTE/PD/PTE（只在本实验里）
+    user64_force_available64(1);
+    p64_exp_stage64("A", "enter", 0);
+    const int rc = p64_exp_try_ring364("cr3expA");
+    if (rc == 0) { p64_exp_stage64("A", "ok", 0); g_uefi_exp_a_ok64 = 1; return 0; }
+    p64_exp_stage64("A", "fail", (uint64_t)(uint32_t)rc);
+    return 1;
+}
+
+// ---- 方案 B：自带 PML4 + mov cr3（实验的核心）----
+static int p64_uefi_exp_b64() {
+    const uint64_t fw_cr3 = p64_rd_cr364();
+    const uint64_t* fw = p64_phys64(p64_page64(fw_cr3));
+    void* pml4p = page_alloc_64();
+    void* pdptp = pml4p ? page_alloc_64() : nullptr;
+    if (!pml4p || !pdptp) {
+        if (pml4p) page_free_64(pml4p);
+        if (pdptp) page_free_64(pdptp);
+        p64_exp_stage64("B", "build", 1);
+        return 1;
+    }
+    p64_zero(pml4p, PAGE_SIZE_64);
+    p64_zero(pdptp, PAGE_SIZE_64);
+    uint64_t* pml4 = p64_phys64((uint64_t)(uintptr_t)pml4p);
+    uint64_t* pdpt = p64_phys64((uint64_t)(uintptr_t)pdptp);
+    for (int i = 0; i < 512; i++) pml4[i] = fw[i];                 // 内核高半区 + 固件留下的映射
+    const uint64_t e0 = fw[0];
+    if (!(e0 & PTE_PRESENT_64) || (e0 & 0x80ULL)) {
+        page_free_64(pdptp); page_free_64(pml4p);
+        p64_exp_stage64("B", "build", 2);
+        return 1;
+    }
+    const uint64_t* fw_pdpt = p64_phys64(p64_page64(e0));
+    for (int i = 0; i < 512; i++) pdpt[i] = fw_pdpt[i];            // 前 4GB 恒等映射照抄
+    pdpt[4] = 0;                                                   // 用户窗口私有（按需分配）
+    pml4[0] = (uint64_t)(uintptr_t)pdptp | (e0 & 0xFFFULL) | PTE_WRITE_64 | PTE_USER_64;
+    if (pml4[0] != ((uint64_t)(uintptr_t)pdptp | (e0 & 0xFFFULL) | PTE_WRITE_64 | PTE_USER_64)) {
+        page_free_64(pdptp); page_free_64(pml4p);
+        p64_exp_stage64("B", "build", 3);
+        return 1;
+    }
+    p64_exp_stage64("B", "build", 0);
+
+    const uint64_t new_cr3 = (uint64_t)(uintptr_t)pml4p;
+    p64_exp_stage64("B", "cr3", 0);                                // ★ mov cr3 之前：VMware 若复位，这行是最后一行
+    __asm__ volatile("mov %0, %%cr3" ::"r"(new_cr3) : "memory");
+    uint64_t got = 0;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(got));
+    if (p64_page64(got) != new_cr3) {                              // 读回不一致：单 CPU 上不该发生
+        __asm__ volatile("mov %0, %%cr3" ::"r"(fw_cr3) : "memory");
+        page_free_64(pdptp); page_free_64(pml4p);
+        p64_exp_stage64("B", "fail", 4);
+        return 1;
+    }
+    p64_exp_stage64("B", "enter", 0);                              // ★ 能打这行 = 运行期 mov cr3 存活
+    user64_set_wp_kludge64(0);                                     // 自带 PML4 都是我们的页：不需要 WP 手法
+    user64_force_available64(1);
+    const int rc = p64_exp_try_ring364("cr3expB");
+    if (rc == 0) {
+        p64_exp_stage64("B", "ok", 0);
+        g_isolate64  = 1;                                          // ★ 实验成功：隔离模式真的打开
+        g_boot_cr364 = new_cr3;                                    // 后续进程从这份 PML4 克隆内核映射
+        dbg64_line_begin64();
+        dbg64_str("[PROC64] cr3 isolation ON (uefi experiment B verified: per-process cr3 works here)\n");
+        dbg64_line_end64();
+        return 0;
+    }
+    p64_exp_stage64("B", "fail", (uint64_t)(uint32_t)rc);
+    // 回滚：回到固件 PML4（ring3 没跑起来，别把这个任务留在半成品地址空间里）
+    __asm__ volatile("mov %0, %%cr3" ::"r"(fw_cr3) : "memory");
+    page_free_64(pdptp);
+    page_free_64(pml4p);
+    // WP-kludge 恢复成"方案 A 的状态"：A 成功过就还要靠它写共享窗口的页表
+    user64_set_wp_kludge64(g_uefi_exp_a_ok64 ? 1 : 0);
+    user64_force_available64(g_uefi_exp_a_ok64 ? 1 : 0);
+    return 1;
+}
+
+static int g_uefi_exp_state64 = 0;    // 0 = 没跑过 1 = 跑过（幂等）
+static void p64_uefi_exp_run64() {
+    if (g_uefi_exp_state64) return;
+    g_uefi_exp_state64 = 1;
+    const int a = p64_uefi_exp_a64();
+    const int b = p64_uefi_exp_b64();
+    dbg64_line_begin64();
+    dbg64_str("[PROC64] uefi exp result=");
+    dbg64_str((b == 0) ? "B" : (a == 0 ? "A" : "none"));
+    dbg64_str(" mode=");
+    dbg64_str(g_isolate64 ? "isolated" : "shared");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+// 延迟任务入口：先睡 5 秒 —— 保证 [GUI64] ready 已经打出来（实验即使触发 VMware 复位，
+// 串口里也已经留下"桌面起来了"这条证据，测试因此能区分"实验失败"与"系统本身起不来"）。
+static void p64_uefi_exp_task64(void*) {
+    task_sleep64(5000);
+    dbg64_line_begin64();
+    dbg64_str("[PROC64] uefi exp begin (A: attach into firmware PML4, B: own PML4 + mov cr3)\n");
+    dbg64_line_end64();
+    p64_uefi_exp_run64();
+}
+int proc64_uefi_cr3_experiment_start64() {
+    if (g_uefi_exp_state64) return 0;
+    if (g_isolate64) {                                             // BIOS 路径：本来就隔离，不用实验
+        dbg64_line_begin64();
+        dbg64_str("[PROC64] uefi exp skipped (boot paging is ours: isolation already on)\n");
+        dbg64_line_end64();
+        g_uefi_exp_state64 = 1;
+        return 0;
+    }
+    const int tid = task_create64("cr3exp", p64_uefi_exp_task64, nullptr);
+    dbg64_line_begin64();
+    if (tid < 0) dbg64_str("[PROC64] uefi exp FAILED (task create)\n");
+    else {
+        dbg64_str("[PROC64] uefi exp task started id=");
+        dbg64_dec((uint64_t)tid);
+        dbg64_str(" (runs 5s after boot, after GUI ready)\n");
+    }
+    dbg64_line_end64();
+    return (tid < 0) ? -1 : 0;
+}
+#endif  // PROC64_UEFI_CR3_EXPERIMENT

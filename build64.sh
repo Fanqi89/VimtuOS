@@ -157,6 +157,15 @@ $NASM -f elf64 user/proc64.asm -o "$BUILD/proc64.o"
 $LD -m elf_x86_64 -T user/hello_elf64.ld -o "$BUILD/proc64.elf" "$BUILD/proc64.o"
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/proc64.elf" "$BUILD/proc64_elf.o"
 cp "$BUILD/proc64_elf.o" "$BUILD/os/"
+echo "==> pipe64：ring3 管道演示（批次 D：fork 后父子各持一端；只嵌**系统内核**）"
+# user/pipe64.asm 用 syscall 指令走 Linux ABI：pipe(22)/fork(57)/read(0)/write(1)/close(3)/
+# nanosleep(35)/wait4(61)/exit(60)。proc64.cpp 幂等把它装成 /pipe64.elf，再由
+# proc64_pipe_demo64() 当成一个真进程跑起来（fork 后子写父读）。
+# 符号名由 objcopy 按输入路径生成：_binary_build64_pipe64_elf_start/_end。
+$NASM -f elf64 user/pipe64.asm -o "$BUILD/pipe64.o"
+$LD -m elf_x86_64 -T user/hello_elf64.ld -o "$BUILD/pipe64.elf" "$BUILD/pipe64.o"
+$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/pipe64.elf" "$BUILD/pipe64_elf.o"
+cp "$BUILD/pipe64_elf.o" "$BUILD/os/"
 $NASM -f bin user/hello64.asm -o "$BUILD/hello64.bin"
 "$PY" tools/make_vap.py "$BUILD/hello64.bin" "$BUILD/hello.vap" hello
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/hello.vap" "$BUILD/hello_vap64.o"
@@ -217,7 +226,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
-    "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o \
+    "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o \
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD/os"/hello_vap64.o \

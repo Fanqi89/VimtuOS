@@ -39,10 +39,14 @@
 //                           其它 → -ENOTTY（与 Linux 对非 tty 一致）。
 //   20   writev            真：fd∈{1,2}，最多 8 个 iovec；iovcnt 超限 -EINVAL。
 //   21   access            真（最小）：存在性检查（本内核没有权限模型 → mode 忽略，如实注明）。
-//   22   pipe / pipe2      **-ENOSYS**：没有管道对象/fd 对（需要真设备层与 fd 继承；见"离 glibc 还差什么"）。
+//   22   pipe / pipe2      **真实现（批次 D）**：fd64 的 64 B 环形缓冲 + 读端/写端两个 fd（写进
+//                           用户给的 int[2]）。**没有阻塞语义**：写满短写（无空间 -EAGAIN）、
+//                           读空且写端开着 -EAGAIN、写端全关读 0（EOF）。fork 后父子各持一端可通信。
 //   24   sched_yield       真：task_yield64() 让出到下一个 tick；没有调度器时直接返回 0。
-//   32   dup               部分：只对 fd>=3 复制（fd64_dup64，路径/游标独立复制）；其它 → -EBADF。
-//   33   dup2              部分：目标 fd>=3 时覆盖；目标 <=2（重定向标准流）→ -ENOSYS。
+//   32   dup               真（批次 D 修正语义）：fd64_dup64 —— 新旧 fd 指向**同一个打开文件对象**
+//                           （共享偏移游标），引用计数 +1；fd<3 → -EBADF。
+//   33   dup2              真（批次 D 修正语义）：目标 fd>=3 时先关旧目标再共享同一个对象；
+//                           目标 <=2（重定向标准流）仍 -ENOSYS（没有真设备层）。
 //   34   pause             **部分**：本内核不投递信号 -> 有界等待 1 秒后返回 -EINTR（绝不死等）。
 //   35   nanosleep         真：走调度器睡眠（有界 60 秒上限，防挂死）。
 //   37   alarm             **只记录不投递**：记进程的 alarm 秒数，返回上一次的值（不投 SIGALRM）。
@@ -101,10 +105,12 @@
 //     一律 -ENOSYS、brk/mmap 退回共享窗口、启动期多进程演示跳过 —— 串口打印
 //     `[PROC64] cr3 isolation OFF ...` 如实标注，**绝不假装隔离成立**。
 //   * 信号：**只记录不投递**（rt_sigaction/rt_sigprocmask 只记录；kill 只有 KILL/TERM 的立即终止）。
-//   * 文件 fd（批次 B 起）：open/read/write/close/lseek/fstat/dup 全部走 kernel/fd64.cpp 的 **FD 层**
-//     （32 项，全局一张表、不按进程隔离）。底层是 vfs64（VimtuFS2 单层目录）：路径只有 "/name"、
-//     单文件 <= 67584B、没有权限/硬链接/子目录树；写是"整体覆盖 + 立刻落盘"（不做脏页缓存）。
-//     终端文件命令与 ring3 看到的是同一张表 —— 这是如实标注的边界，细节见 kernel/fd64.h。
+//   * 文件 fd（批次 D 起**每进程一张 fd 表**）：进程结构挂 FdTable64（fd64.h），fork 逐槽共享
+//     打开文件对象（共享偏移）、execve 默认保留 fd、close 只是引用计数 -1；没有进程上下文
+//     （终端/桌面 = 任务 0、安装介质内核）时退回**内核表**。底层是 vfs64（VimtuFS2 单层目录）：
+//     路径只有 "/name"、单文件 <= 67584B、没有权限/子目录树；写是"整文件覆盖 + 立刻落盘"。
+//     O_APPEND 真实现；pipe(22) 真实现（64B 环形缓冲、无阻塞语义）。边界详见 kernel/fd64.h 与
+//     docs/应用层与系统调用说明.md 的 fd 语义表。
 //   * glibc/发行版二进制**没有验证过**：PT_INTERP+动态链接器、完整 TLS/vDSO、真 futex、
 //     clone/线程、socket/网络 ABI、/proc 与 pty、uid/gid 权限模型大多不在这里。
 //     这里验证的是"自有静态 ELF64（ld.lld -static -nostdlib）能 load → ring3 → fork/execve/wait4 → exit"。
@@ -856,7 +862,11 @@ static int64_t lx64_getrandom64(uint64_t nr, uint64_t buf, uint64_t len, uint64_
     return (int64_t)len;
 }
 
-// ---- 32/33）dup / dup2 / 74）fsync：只对"真实文件 fd"（>= 3）有意义，全部走 fd64 ----
+// ---- 32/33）dup / dup2 / 74）fsync：只对"真实文件/pipe fd"（>= 3）有意义，全部走 fd64 ----
+// ★ 批次 D 语义修正：dup/dup2 返回的新 fd 与旧的**指向同一个打开文件对象**（共享偏移游标、
+//   共享目录游标），引用计数 +1；这正是 Linux 的行为（旧实现是"独立游标复制"，已改对）。
+//   目标 fd <= 2（重定向标准流）仍然 -ENOSYS：标准流是 syscall64 自己认的虚拟流，没有对象。
+// 33）dup2 与 32）dup 共用下面这一条路径（newfd >= 3 = 指定槽位，newfd < 0 = 自动分配）
 static int64_t lx64_dup64(uint64_t fd) {
     const int nf = fd64_dup64((int)fd, -1);              // -1 = 自动分配新槽
     return (int64_t)nf;
@@ -891,6 +901,25 @@ static int64_t lx64_arch_prctl64(uint64_t nr, uint64_t code, uint64_t arg) {
     return -LX64_EINVAL;                                            // SET_GS/GET_GS 等：本内核没有
 }
 
+// ---- 22）pipe / pipe2 ----（批次 D：fd64 的真管道对象；pipe2 的 flags 忽略并如实注明）
+// 语义：64 字节环形缓冲 + 读端/写端两个 fd（fd64_pipe64）。**没有阻塞**（没有等待队列/
+//   唤醒原语）：写满 -> 短写；完全没有空间 -> -EAGAIN；读空且写端还开着 -> -EAGAIN；
+//   写端全关 -> 读返回 0（EOF）。fork 之后父子各自持有一端（fd 表逐槽共享同一个对象）。
+// fds_va 必须能放下两个 int32（8 字节）且落在已映射的用户页里。
+static int64_t lx64_pipe64(uint64_t nr, uint64_t fds_va) {
+    if (!user64_range_ok64(fds_va, 8)) { syscall64_deny64(nr, fds_va); return -LX64_EFAULT; }
+    int rf = -1, wf = -1;
+    const int rc = fd64_pipe64(&rf, &wf);
+    if (rc < 0) return (int64_t)rc;                        // fd64 的负错误码 = -errno
+    int32_t out[2];
+    out[0] = (int32_t)rf;
+    out[1] = (int32_t)wf;
+    lx64_copy_to_user64(fds_va, out, 8);
+    return 0;
+}
+
+
+
 // ---- Linux 号段分发 ----
 // 返回：>= 0 正常返回；< 0 = -errno。exit/execve 走特例：
 //   exit   -> 改写帧把控制权交回内核（入口看 g_syscall64_exit_to_kernel64）
@@ -920,7 +949,7 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 16:  return lx64_ioctl64(nr, a1, a2, a3);
     case 20:  return lx64_writev64(nr, a1, a2, a3);
     case 21:  return lx64_access64(nr, a1, a2);
-    case 22:  break;                                               // pipe/pipe2：没有管道对象 -> -ENOSYS（见文件头表）
+    case 22:  return lx64_pipe64(nr, a1);                          // pipe(int[2])：fd64 真管道（批次 D）
     case 24:  if (task_yield64) task_yield64(); return 0;           // sched_yield：真让出
     case 32:  return lx64_dup64(a1);
     case 33:  return lx64_dup2_64(a1, a2);

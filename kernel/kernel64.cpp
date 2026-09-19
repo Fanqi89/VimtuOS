@@ -391,6 +391,10 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
                 (void)proc64_selftest64();
                 (void)proc64_install_builtin64(app_drive, app_lba);
                 (void)proc64_demo64("/proc64.elf");
+                // ---- 批次 D：ring3 pipe 演示（fork 后父子各持一端通信）----
+                // 为什么单开一个程序：proc64_test 断言了上面那次 fork 的 pages=8，往 /proc64.elf 里
+                // 加代码会挪动页数。这里跑的 /pipe64.elf 只做 pipe(22) + fork(57) + 读/写 + wait4(61)。
+                (void)proc64_pipe_demo64("/pipe64.elf");
                 // ---- 批次 B：缺陷回归 —— kill 掉 ring3 进程后复用同一任务槽，必须还能进 ring3 ----
                 // 位置在 proc64 演示之后、gui64_run 之前（跑完必须还能进桌面）；只走 BIOS 路径
                 // （UEFI 下用户窗口不可用，上面这一整块已经被 user64_available64() 挡在外面）。
@@ -460,6 +464,13 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
     //       没有 pending 就照常往下走，然后 preload 预热字形/图标（打点带 rdtsc64 实测证据）。
     (void)update64_check64();
     (void)preload64_run64();
+    // ---- UEFI 运行期 CR3 实验（编译期开关，默认关；见 docs/UEFI地址空间实验报告.md）----
+    // 位置：gui64_run 之前建一个**延迟 5 秒**的内核任务 —— 它跑的时候 [GUI64] ready 已经打出来了，
+    //   所以即使 VMware EFI 下 mov cr3 真的触发复位，"桌面起来了"这条证据也已经留在串口里。
+    // 默认构建（没有 -DPROC64_UEFI_CR3_EXPERIMENT=1）这两行不编进去，行为与之前完全一致。
+#if defined(PROC64_UEFI_CR3_EXPERIMENT) && (PROC64_UEFI_CR3_EXPERIMENT == 1)
+    (void)proc64_uefi_cr3_experiment_start64();
+#endif
     gui64_run(bi);          // 不返回：进入桌面消息循环
 }
 #endif

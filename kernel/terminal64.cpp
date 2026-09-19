@@ -2484,8 +2484,20 @@ static void shell_exec(TerminalState* ts, const char* line) {
     } else if (st_eq(g_cmd, "df")) {
         // 真：VimtuFS2 卷几何（总块/空闲块/已用）+ 实时文件统计
         ok = cmd_df(ts);
+    } else if (st_eq(g_cmd, "fdtest")) {
+        // 批次 D：FD 语义演示（独立游标 / dup 共享游标 / O_APPEND / pipe 环回）。
+        // 实现在 fd64.cpp（fd64_demo64），这里只负责跑 + 一行命令级打点（自动验收 grep）。
+        const int fdmask = fd64_demo64();
+        ok = (fdmask == 0);
+        ts_puts(ts, "FD semantics demo (kernel table): independent cursors + dup-shared offset + ");
+        ts_puts(ts, "O_APPEND + pipe ring-back -> see serial ([FD64] demo ...)\n");
+        ts_puts(ts, "  table=");
+        ts_put_u64(ts, (uint64_t)FD64_MAX);
+        ts_puts(ts, "  per-process=1  fd_test_mask=");
+        ts_put_u64(ts, (uint64_t)fdmask);
+        ts_putc(ts, (uint32_t)'\n');
     } else if (st_eq(g_cmd, "fd")) {
-        // 真：FD 层现状（fd 表 / 每槽 path+游标）；也打 [FD64] dump 行
+        // 真：FD 层现状（当前表的 fd 槽 / refs / 游标）；也打 [FD64] dump 行
         fd64_dump64();
         ts_puts(ts, "FD layer dump written to serial ([FD64] dump ...); table=");
         ts_put_u64(ts, (uint64_t)FD64_MAX);

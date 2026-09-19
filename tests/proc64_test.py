@@ -99,6 +99,9 @@ MUST = [
     ("[PROC64] reap pid=",                            "wait4 之后进程记录被回收（目标进程消失）"),
     ("[PROC64] demo done",                            "启动期多进程演示收尾"),
     ("exited=1 code=0",                               "init 正常退出（exit 0）"),
+    ("[PROC64] install ok path=/pipe64.elf",          "批次 D：ring3 pipe 演示程序幂等装进 VimtuFS2"),
+    ("[PROC64] pipe-demo done",                       "批次 D：pipe 演示（fork 后父子各持一端）收尾"),
+    ("[FD64] pipe read n=18 data=PIPE-OK-FROM-CHILD", "批次 D：子写父读的管道环回数据"),
     ("proc64: demo done exit(0)",                     "用户程序自己打印的收尾行"),
     ("[GUI64] ready",                                 "跑完进程演示后桌面照常起来"),
 ]

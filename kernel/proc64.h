@@ -56,6 +56,9 @@
 //   [PROC64] kill pid=<n> sig=<n>
 //   [PROC64] exit pid=<n> code=<n> cr3_released=1
 //   [PROC64] selftest PASS / [PROC64] selftest FAIL mask=<n>
+//   [PROC64] uefi exp A stage=<map|enter|ok|fail> err=<hex>        （实验构建专用，见下）
+//   [PROC64] uefi exp B stage=<build|cr3|enter|ok|fail> err=<hex>  （实验构建专用）
+//   [PROC64] uefi exp result=A|B|none mode=isolated|shared         （实验构建专用）
 #pragma once
 #include <stdint.h>
 #include "x86_64.h"     // pt_regs64（fork/execve 要直接改帧）
@@ -160,5 +163,24 @@ int   proc64_alarm_set64(int sec);            // 只记录（无投递）；返�
 // 内嵌 /proc64.elf 的幂等安装（与 elf64_install_builtin64 同一套路；VFS 没挂载就返回 -1）
 int   proc64_install_builtin64(int drive, uint32_t part_lba);
 // 启动期多进程演示（父子打印 pid / execve / wait4 / kill）。返回 0 = 跑完（含跳过/失败，只打点）。
+
+// ==================== 每进程 fd 表（批次 D）====================
+// Proc64 上挂一张 fd64 的 FdTable64（指针，池由 fd64.cpp 管）：
+//   * proc64_create64 分配、fork 时 fd64_table_clone64 **逐槽共享**（引用计数 +1，父子共享偏移）、
+//     execve 默认**保留**（没有 O_CLOEXEC）、退出/回收时 close_all + 归还表；
+//   * 没有进程上下文（任务 0 桌面/终端、安装介质内核）时 fd64 回退到内核表；
+//   * 语义表与边界见 docs/应用层与系统调用说明.md（fd 章节）：dup 共享对象、O_APPEND、pipe。
+// pipe 演示：建一个进程跑 /pipe64.elf（fork 后父子各持一端通信）。隔离模式关闭时只打一行跳过。
+int proc64_pipe_demo64(const char* path);
+
+// ==================== UEFI 运行期 CR3 实验（编译期开关，默认关）====================
+// 只在 -DPROC64_UEFI_CR3_EXPERIMENT=1 的构建里存在（默认构建不编、行为不变）：
+//   方案 A：临时清 CR0.WP -> 往**固件活动 PML4** 里挂用户窗口 -> 恢复 WP -> 试进 ring3；
+//   方案 B：自带一份 PML4（复制固件的内核映射 + 用户窗口）-> mov cr3 -> 试进 ring3。
+// start 版建一个**延迟任务**（保证 [GUI64] ready 已经打出来，实验即使触发复位也留有桌面证据）。
+// 结论与两条固件路径的实测现象见 docs/UEFI地址空间实验报告.md。
+#if defined(PROC64_UEFI_CR3_EXPERIMENT) && (PROC64_UEFI_CR3_EXPERIMENT == 1)
+int proc64_uefi_cr3_experiment_start64();
+#endif
 // 位置：os_boot_path 里"现有 ring3 演示之后、gui64_run 之前"。隔离模式关闭时只打一行跳过。
 int   proc64_demo64(const char* path);

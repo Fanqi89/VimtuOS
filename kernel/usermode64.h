@@ -78,6 +78,17 @@ int user64_exit_to_kernel64(pt_regs64* r, uint64_t code);
 //   [USER64] slot release slot=<n> in_ring3=1 -> cleared
 // 安装介质内核不链 task64.cpp，所以只有系统内核会调它；本函数本身两份内核都编得进去。
 extern "C" void user64_slot_release64(int slot);
+
+// ==================== UEFI CR3 实验的辅助接口（编译期开关，默认关）====================
+// 见 kernel/proc64.cpp 的 proc64_uefi_cr3_experiment64() 与 docs/UEFI地址空间实验报告.md。
+// 只有 -DPROC64_UEFI_CR3_EXPERIMENT=1 的构建里这两个函数才存在（默认构建里调用点也不编进去）。
+#if defined(PROC64_UEFI_CR3_EXPERIMENT) && (PROC64_UEFI_CR3_EXPERIMENT == 1)
+// 1 = 允许 u64_walk64 写"固件只读"的页表页（每次写临时清 CR0.WP，写完立刻恢复）。
+// ★ 只在实验路径里开、用完立刻关（窗口越短越好，理由见 usermode64.cpp 的说明）。
+void user64_set_wp_kludge64(int on);
+// 覆盖 user64_available64() 的缓存判定（把用户窗口手工挂好之后由 proc64 置 1）。
+void user64_force_available64(int on);
+#endif
 // ==================== 给 syscall64 / elf64 用的页级原语 ====================
 // 为什么导出这几个（而不是让加载器自己走页表）：页表走法（大页判断、中间层补 U/S、
 // CR3 重载）与"用户窗口"的定义都在 usermode64.cpp 里，重复实现两份迟早会漂。

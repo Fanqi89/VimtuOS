@@ -803,6 +803,8 @@ TESTS = [
     ("tmgr_proc_test.py", "任务管理器进程页 = proc64 真进程：真进程行 + kill(SIGKILL) 端到端（键盘注入）"),
     ("display_runtime_test.py", "运行期显示层：模式清单 + 0x3DA 实测/如实降级 + EDID 对比 + DDC 未实现说明"),
     ("fs_term_test.py", "终端真文件系统：write/ls/df/ring3 读 + 冷启动第二遍 cat 跨重启读回 + rm"),
+    ("fd64_test.py", "批次 D FD 语义：每进程 fd 表 + dup 共享游标 + fork 继承 + O_APPEND + pipe 环回"),
+    ("uefi_cr3_experiment_test.py", "批次 D UEFI 运行期 CR3 实验：方案 A/B 两方案 + QEMU/OVMF 与 VMware EFI 实测"),
 ]
 
 def run_tests():

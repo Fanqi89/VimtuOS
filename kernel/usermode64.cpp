@@ -76,6 +76,17 @@ int user64_available64() {
     dbg64_line_end64();
     return g_user64_avail64;
 }
+#if defined(PROC64_UEFI_CR3_EXPERIMENT) && (PROC64_UEFI_CR3_EXPERIMENT == 1)
+// 实验路径专用：proc64 手工把用户窗口挂进"固件活动 PML4"（或用自带 PML4 切过去）之后，
+// 由它覆盖上面那条缓存判定 —— 否则启动早期已经判过 0，后面再修好也不会被重新采纳。
+void user64_force_available64(int on) {
+    if (on) g_user64_avail64 = 1;
+    dbg64_line_begin64();
+    dbg64_str("[USER64] available overridden by UEFI cr3 experiment -> ");
+    dbg64_str(on ? "1 (user window usable)\n" : "0\n");
+    dbg64_line_end64();
+}
+#endif
 // ==================== 与汇编桥共享的保存区（批次 C：**每任务一份**）====================
 // 为什么改成每任务一份（真缺陷级的设计约束）：
 //   原来 g_user64_k_rsp64 / g_user64_k_rbx64 ... 是**单份全局**的，前提是"同时只有一个用户
@@ -209,6 +220,30 @@ static inline void u64_zero_page64(void* p) {
     for (uint32_t i = 0; i < PAGE_SIZE_64; i++) b[i] = 0;
 }
 
+// ==================== UEFI CR3 实验：允许写"固件只读"页表页（编译期开关，默认关）====================
+// 背景：UEFI 路径下内核跑在**固件当前活动的 PML4** 上，EDK2 把页表页标成只读 —— 任何
+//   "顺手把顶层项打开 U/S"的写都会 #PF err=3（cr2 = 固件 PML4）。引导期挂高半区映射时用的
+//   手法是**临时清 CR0.WP**（见 boot/efi/uefi64.c）。这里把同一手法做成可开关的页表写包装：
+//   开启（user64_set_wp_kludge64(1)）后，u64_walk64 的每一次页表写都包在
+//   "保存 CR0 -> WP=0 -> 写 -> 恢复 CR0" 里；关闭时是**零开销**的空操作（默认构建就是它）。
+// ★ 安全说明（必须写进文档）：WP=0 的窗口里 ring0 写任何只读页都不会 #PF，所以窗口要尽量短
+//   （只有一条 8 字节的页表项写），且只在**实验路径**里开、用完立刻关。
+#if defined(PROC64_UEFI_CR3_EXPERIMENT) && (PROC64_UEFI_CR3_EXPERIMENT == 1)
+static int g_u64_wp_kludge64 = 0;
+void user64_set_wp_kludge64(int on) { g_u64_wp_kludge64 = on ? 1 : 0; }
+static inline uint64_t u64_cr0_get64() { uint64_t v; __asm__ volatile("mov %%cr0, %0" : "=r"(v)); return v; }
+static inline void u64_cr0_set64(uint64_t v) { __asm__ volatile("mov %0, %%cr0" ::"r"(v) : "memory"); }
+static inline uint64_t u64_wp_enter64() {
+    const uint64_t c0 = u64_cr0_get64();
+    if (g_u64_wp_kludge64) u64_cr0_set64(c0 & ~0x10000ULL);      // CR0.WP = 0
+    return c0;
+}
+static inline void u64_wp_leave64(uint64_t c0) { if (g_u64_wp_kludge64) u64_cr0_set64(c0); }
+#else
+static inline uint64_t u64_wp_enter64() { return 0; }
+static inline void u64_wp_leave64(uint64_t) {}
+#endif
+
 // 走到 va 的叶子 PTE。alloc=1 时按需分配缺失的 PD/PT（页表页**不回收**，见 run_blob 收尾说明）。
 // 返回 nullptr：PML4 项不存在 / 撞上大页 / 需要分配但页池空了。
 static uint64_t* u64_walk64(uint64_t va, int alloc) {
@@ -217,35 +252,49 @@ static uint64_t* u64_walk64(uint64_t va, int alloc) {
                    i2 = (va >> 21) & 0x1FF, i1 = (va >> 12) & 0x1FF;
 
     uint64_t e = pml4[i4];
-    if (!(e & PTE_PRESENT_64)) return nullptr;
+    if (!(e & PTE_PRESENT_64)) return nullptr;      // 顶层项必须存在（实验路径由 proc64 先挂好）
     // ★ 顶层打开 U/S：低 4GB 的 PDPTE 仍是 U/S=0，所以不扩大 ring3 的可达范围
     if ((e & (PTE_WRITE_64 | PTE_USER_64)) != (PTE_WRITE_64 | PTE_USER_64)) {
+        const uint64_t c0 = u64_wp_enter64();
         pml4[i4] = e | PTE_WRITE_64 | PTE_USER_64;
+        u64_wp_leave64(c0);
         u64_flush_tlb64();
     }
     uint64_t* pdpt = u64_tbl64(pml4[i4] & ~0xFFFULL);
     e = pdpt[i3];
     if (e & PTE_PRESENT_64) {
         if (e & U64_PS) return nullptr;                  // 1GiB 大页：用户窗口不该出现
-        if ((e & (PTE_WRITE_64 | PTE_USER_64)) != (PTE_WRITE_64 | PTE_USER_64)) pdpt[i3] = e | PTE_WRITE_64 | PTE_USER_64;
+        if ((e & (PTE_WRITE_64 | PTE_USER_64)) != (PTE_WRITE_64 | PTE_USER_64)) {
+            const uint64_t c0 = u64_wp_enter64();
+            pdpt[i3] = e | PTE_WRITE_64 | PTE_USER_64;
+            u64_wp_leave64(c0);
+        }
     } else {
         if (!alloc) return nullptr;
         void* np = page_alloc_64();
         if (!np) return nullptr;
         u64_zero_page64(np);
+        const uint64_t c0 = u64_wp_enter64();
         pdpt[i3] = (uint64_t)(uintptr_t)np | U64_TBL_FLAGS;
+        u64_wp_leave64(c0);
     }
     uint64_t* pd = u64_tbl64(pdpt[i3] & ~0xFFFULL);
     e = pd[i2];
     if (e & PTE_PRESENT_64) {
         if (e & U64_PS) return nullptr;                  // 2MB 大页：同上
-        if ((e & (PTE_WRITE_64 | PTE_USER_64)) != (PTE_WRITE_64 | PTE_USER_64)) pd[i2] = e | PTE_WRITE_64 | PTE_USER_64;
+        if ((e & (PTE_WRITE_64 | PTE_USER_64)) != (PTE_WRITE_64 | PTE_USER_64)) {
+            const uint64_t c0 = u64_wp_enter64();
+            pd[i2] = e | PTE_WRITE_64 | PTE_USER_64;
+            u64_wp_leave64(c0);
+        }
     } else {
         if (!alloc) return nullptr;
         void* np = page_alloc_64();
         if (!np) return nullptr;
         u64_zero_page64(np);
+        const uint64_t c0 = u64_wp_enter64();
         pd[i2] = (uint64_t)(uintptr_t)np | U64_TBL_FLAGS;
+        u64_wp_leave64(c0);
     }
     uint64_t* pt = u64_tbl64(pd[i2] & ~0xFFFULL);
     return &pt[i1];

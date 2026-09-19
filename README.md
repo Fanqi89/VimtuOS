@@ -43,9 +43,10 @@
 
 | 边界 | 现状 |
 |---|---|
-| ⚠️ **用户态独立地址空间** | 批次 C 起：proc64 每进程独立 CR3 + fork/execve/wait4/kill（BIOS 路径）；UEFI（固件页表）下如实降级为共享地址空间模式（`[PROC64] cr3 isolation OFF`） |
+| ⚠️ **用户态独立地址空间** | 批次 C 起：proc64 每进程独立 CR3 + fork/execve/wait4/kill（BIOS 路径）；UEFI（固件页表）下默认仍如实降级为共享地址空间模式（`[PROC64] cr3 isolation OFF`）。**批次 D 实测**：在固件 PML4 上就地挂用户窗口（清 CR0.WP 手法）与自带 PML4 + 运行期 `mov cr3` **两条路径都在 QEMU+OVMF 与 VMware EFI 下成功**（`[PROC64] uefi exp result=B mode=isolated`），但默认构建不编这段实验（宏 `PROC64_UEFI_CR3_EXPERIMENT`），见 `docs/UEFI地址空间实验报告.md` |
+| ⚠️ **fd 语义（批次 D）** | **每进程 fd 表**（32 槽/张；`Proc64` 持有，终端/桌面用内核表）；fd → 引用计数的 `OpenFile64`（**共享偏移游标**）：`dup/dup2` 共享同一对象、`fork` 逐槽继承、`execve` 默认保留（**无 `O_CLOEXEC`**）、`close` 只是 refs-1；`O_APPEND` 真实现；**`pipe(22)` 真实现**（64 B 环形缓冲、非阻塞：写满短写/读空 `-EAGAIN`），`user/pipe64.asm` 是 fork 后父子各持一端的环回证据 |
 | ⚠️ **ELF64 只验证过自有静态程序** | 用 `ld.lld -static -nostdlib` 链接的自己的 ELF64 能 load → ring3 → `syscall` → exit；**glibc / 发行版二进制没有验证过**（缺 vDSO、TLS(FS.base) 的完整语义、信号投递、futex、动态链接与重定位） |
-| ⚠️ **VFS 是单层路径** | VimtuFS2 只支持 `/name`（无目录树、无 `.`/`..`、无删除目录）；文件名 ≤27B；最多 256 个 inode；单文件 ≤67584B。批次 B 起终端 `ls/cat/write/touch/rm/mkdir/df` 走 `kernel/fd64.cpp` 的 **FD 层（32 项 fd 表）直连 VimtuFS2**，ring3 的 `open/read/write/close` 也接同一层；旧的 16×512B RAM-only ramfs 已删除 |
+| ⚠️ **VFS 是单层路径** | VimtuFS2 只支持 `/name`（无目录树、无 `.`/`..`、无删除目录）；文件名 ≤27B；最多 256 个 inode；单文件 ≤67584B。终端 `ls/cat/write/touch/rm/mkdir/df` 与 ring3 的 `open/read/write/close` 都走 `kernel/fd64.cpp` 的 FD 层直连 VimtuFS2（旧的 16×512B RAM-only ramfs 已删除）；终端新增 `fdtest`（独立游标/dup 共享/O_APPEND/pipe/fork 继承一键演示） |
 | ⚠️ **设置页接线范围** | 显示/会话分区已接 `config64`/`session64`（真落 store64，跨重启保留）；系统/关于页是只读实测值（设备规格来自 hwinfo64/display64/net64/usb64） |
 | ⚠️ **没有 TCP/IP / DHCP / DNS** | 网络只有 IPv4 + ARP + ICMP echo（e1000 轮询收发，无中断收包）；UDP/TCP、路由、DHCP、DNS 都没有；只适配 e1000，VMware 的 vmxnet3 未适配 |
 | ⚠️ **USB 只有 UHCI + HID 引导键盘** | 没有 EHCI(USB 2.0) / xHCI(USB 3.x)，没有 USB 鼠标、U 盘、集线器；只认直接插在根端口上的键盘；不接中断（由 `kusb` 线程轮询） |
@@ -58,7 +59,8 @@
 
 **一句话定位**：*现在的 VimtuOS 是「有现代引导 + 现代安装体验 + 64 位桌面 + 真调度器 + 真文件系统 +
 ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的桌面，也能把自己写的 VAP64 / ELF64 程序
-装进自己的文件系统并在 ring3 里运行 —— 但它还不能跑 glibc 级的第三方程序，也没有独立地址空间。*
+ 装进自己的文件系统并在 ring3 里运行 —— 但它还不能跑 glibc 级的第三方程序；独立地址空间只在 BIOS 路径生效
+（UEFI 路径默认是共享窗口，运行期 CR3 实验已在两条固件路径上验证可行但默认不编）。*
 
 ## 三、技术亮点（值得一看的地方）
 
@@ -211,7 +213,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 
 ## 六、工程质量（这个项目最值得说的部分）
 
-* **26 个断言脚本全部 PASS**（2026-09-19 实测；上一批 752 条断言保持全过 + 本批次新增 69 条）。`--full` 覆盖 20 个脚本 / **562 条断言**：
+* **28 个断言脚本全部 PASS**（2026-09-19 实测；上一批的断言保持全过 + 本批次新增 51 条）。`--full` 覆盖 22 个脚本 / **613 条断言**：
 
   | 脚本 | 断言 | 脚本 | 断言 |
   |---|---|---|---|
@@ -222,13 +224,14 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
   | screen64_probe.py | 5 | sched_stress_test.py | 18 |
   | iso64_install_test.py | 18 | usb64_test.py | 51 |
   | iso64_usb_test.py | 22 | vmware_install_test.py | 21 |
-  | uefi64_install_test.py | 21 | proc64_test.py | 64 |
+  | uefi64_install_test.py | 21 | proc64_test.py | 67 |
   | preload_update_test.py | 40 | tmgr_proc_test.py | 39 |
   | display_runtime_test.py | 19 | fs_term_test.py | 32 |
-  | **小计** | **562** | | |
+  | **fd64_test.py（批次 D 新增）** | **34** | **uefi_cr3_experiment_test.py（批次 D 新增）** | **14** |
+  | **小计** | **613** | | |
 
   另有专项脚本：`elf64_test` 56、`store64_test` 46、`app64_test` 31、`display64_test` 22、`user64_test` 17
-  （以及 sysstate64_test / ui_extra64_test 等，条数随实现增长）。
+  （以及 sysstate64_test / ui_extra64_test / screenshot64 等，条数随实现增长）。
 * **三类证据**：
   * **串口级**：每步都打标记（`[LM64]` / `[G64]` / `[SETUP]` / `[PART]` / `[TASK64]` / `[VFS64]` /
     `[STORE64]` / `[SYSCALL]` / `[USER64]` / `[APP64]` / `[ELF64]` / `[APIC]` / `[SMP]` / `[NET64]` /
@@ -308,8 +311,8 @@ kernel/                 64 位内核 + 桌面 + 应用  69 文件 / 27,599 行
   mem64.cpp x86_64.cpp fb.cpp font.cpp input.cpp ata64.cpp part64.cpp setup64.cpp ...
 tools/                  自写打包/诊断工具（Python，6 脚本 / 1,092 行；根目录另有 6 个 _*.py 资源脚本）
   make_vap.py           VAP64 应用打包器（与 kernel/app64.h 逐字段一致）
-tests/                  验收脚本（32 个 .py，其中 26 个是断言脚本，≥821 断言）
-user/                   ring3 示例程序（5 文件 / 620 行；含 filedemo64.asm 文件读写演示）
+tests/                  验收脚本（34 个 .py，其中 28 个是断言脚本）
+user/                   ring3 示例程序（6 文件；filedemo64.asm 文件读写、proc64.asm 多进程、pipe64.asm 管道）
   hello64.asm           VAP64 示例（int 0x80 自有 ABI）
   hello_elf64.asm/.ld   ELF64 示例（syscall 指令 Linux 号段 + 用户窗口链接脚本）
 docs/                   架构、安装、UEFI、桌面栈、应用层与系统调用、状态总览等中文文档
@@ -388,14 +391,21 @@ a **self-defined app format (VAP64)** plus an **ELF64 loader** (both install int
 **e1000 network stack (ARP/ICMP)** and a **UHCI USB host with HID boot keyboard**.
 
 Honest boundaries: user address spaces are **per-process** on the BIOS path (proc64: own CR3 +
-fork/execve/wait4/kill) and degrade to a shared window on UEFI firmware tables; the ELF64 loader is only
+fork/execve/wait4/kill) and degrade to a shared window on UEFI firmware tables — a runtime CR3
+experiment (A: attach the user window into the firmware PML4 with a short CR0.WP window; B: own PML4 +
+`mov cr3`) **succeeded on both QEMU/OVMF and VMware EFI** in an opt-in build, but it is off by default
+(see `docs/UEFI地址空间实验报告.md`); the ELF64 loader is only
 verified with **our own static binaries** (glibc/distro binaries are untested: no vDSO, signals, futex or
 dynamic linking); VFS is **single-level** (`/name`, ≤27B names, ≤67584B files) and the terminal's file
-commands (`ls/cat/write/touch/rm/mkdir/df`) now use the real VimtuFS2 through the fd64 layer (ring3
-`open/read/write/close` share it); there is no TCP/IP (ARP +
+commands (`ls/cat/write/touch/rm/mkdir/df`) use the real VimtuFS2 through the fd64 layer (ring3
+`open/read/write/close` share it). Since batch D the fd layer is **per-process** with
+reference-counted open-file objects: `dup`/`dup2` share one object (shared offset), `fork` inherits the
+whole table, `execve` keeps fds (no `O_CLOEXEC` yet), `O_APPEND` is real and `pipe(22)` works
+(64-byte ring buffer, non-blocking). There is no TCP/IP stack and
+
 Everything was validated on **QEMU and VMware, BIOS and UEFI — not on bare metal**.
 
-Quality-wise, every change is verified by **26 assertion scripts (≥821 assertions)** that check serial logs, screen
-pixels (QEMU screendumps) and raw disk bytes. Kernel + bootloader + ring3 samples ≈ **31.6k lines** of
-self-written Python tooling (ISO9660/GPT/FAT16/VAP64 packing, font subsetting, PE/FAT diagnostics).
-test 
+Quality-wise, every change is verified by **28 assertion scripts** (22 of them in
+`tests/status_report.py --full`) that check serial logs, screen pixels (QEMU screendumps) and raw disk bytes.
+Tooling adds ~3k lines of self-written Python (ISO9660/GPT/FAT16/VAP64 packing, font subsetting, PE/FAT diagnostics).
+
