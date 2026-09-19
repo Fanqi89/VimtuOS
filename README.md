@@ -53,7 +53,8 @@
 | ⚠️ **USB 只有 UHCI + HID 引导键盘** | 没有 EHCI(USB 2.0) / xHCI(USB 3.x)，没有 USB 鼠标、U 盘、集线器；只认直接插在根端口上的键盘；不接中断（由 `kusb` 线程轮询） |
 | ⚠️ **AP 只是停着** | SMP 能启动 AP 并让它报在线，但**没有多核调度**（调度器仍单核、IRQ0 只在 BSP）、没有 IPI、没有 per-CPU 数据/GDT/TSS，AP 自己的 LAPIC/中断不参与 |
 | ⚠️ **ACPI/APIC 覆盖有限** | 只解析 RSDP/RSDT/XSDT/FADT/MADT/HPET/MCFG；关机仍走 ACPI 端口 0x604 + 8042 回退链；x2APIC 未适配；固件页表没映射 LAPIC/IOAPIC 的机器会留在 PIC |
-| ⚠️ **AHCI 只在 QEMU 上验证到"识别"层** | item 5a 的 AHCI 驱动能识别控制器/端口/磁盘签名（`[AHCI64] pci …`、`port=0 det=3 sig=0x101`），但 **QEMU 11.1 的 `ich9-ahci` 上写 `PxCI` 后 HBA 不执行命令**（PxCI 挂着、PxIS/PxTFD 不动、trace 无命令事件）→ 磁盘级 IDENTIFY/读写与"装到 SATA 盘再重启"**未在模拟器上跑通**；真机/VMware SATA 需按指南复验。另外**引导层仍只走 PATA PIO**：SATA 盘上的系统只能在该盘被固件映射成 IDE 兼容模式时启动 |
+| ✅ **SATA/AHCI 盘可直启（引导层已改 BIOS INT 13h）** | 引导层（`boot/loader64.asm`）的**磁盘启动路径**读内核不再用自写 PATA PIO，改走 **BIOS INT 13h 扩展读（AH=0x42 + DAP）**：驱动器号用固件传进来的 `DL`，分块 64 扇区（32KB、不跨 64KB 边界）读进低内存暂存区 `0x20000`，每批再进一次保护模式搬到 `0x100000`；失败复位磁盘重试 3 次后打 `[LM] int13 read FAILED ah=… lba=… retry=…` 并停机（不静默失败）。**BIOS 不需要把 SATA 设成 IDE 兼容模式** —— QEMU 上"只把装好的盘挂 `ich9-ahci` 启动"已进桌面（`tests/disk_boot_test.py`：`[LM] disk boot via INT 13h dl=0x80` → `[OS] booted from installed disk` → `[GUI64] ready`）；真机仍待复验。磁盘级 IDENTIFY/读写也已在 `--strict-dma` 档 PASS（item 5b 修好命令头布局） |
+| ⚠️ **没有 INT 13h 扩展读的老固件起不来** | 磁盘路径**没有 PIO 回退**（自写 PIO 在 AHCI 机器上读不到盘，已整段删除）：只有支持 EDD 扩展读（AH=0x42）的固件能启动，1998 年后的固件基本都有；更老的机器也跑不动本系统的 64 位长模式 |
 | ⚠️ **只在虚拟机验证** | QEMU + VMware Workstation 双验证（BIOS 与 UEFI 都跑），**未在真机裸机验证**；UEFI 路径未做签名，测试时 `secureBoot=FALSE` |
 | ⚠️ **磁盘仍是 PIO 搬运** | 有了 IRQ14 中断唤醒，但没有 DMA/Bus-Master，读写期间 CPU 仍要逐扇区搬 |
 | ⚠️ **没有声音** | 无音频驱动 |
@@ -85,7 +86,8 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
    U 盘/裸盘   hybrid_mbr.asm（自搬 0x0600）→ boot.asm（512B MBR）→ loader64.asm
    UEFI        BOOTX64.EFI（自研 PE 桩）→ UEFI64.BIN（平铺长模式引导器）
    loader64 / UEFI64 负责：E820 / VBE(EDID→0x7600) / RSDP(→0x7800) → 读内核到物理 0x100000
-                            → 建页表（恒等 + 高半区直映）→ 进长模式 → 跳内核入口
+                            （磁盘启动 = BIOS INT 13h 扩展读 AH=0x42；光盘 = ATAPI；U 盘 hybrid = 桩先搬好）
+                             → 建页表（恒等 + 高半区直映）→ 进长模式 → 跳内核入口
 
 ② 内核层（kernel/，69 文件 / 27,599 行）
    入口与基础设施

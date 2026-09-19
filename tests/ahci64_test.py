@@ -210,7 +210,48 @@ def main():
             if "[HWUI] report lines=" in log:
                 got_report = True
                 break
-        shot_ok = mon.shot(args.shot, wait=2.0) if got_report else False
+        # ★ 抓报告页那一帧：**有界重试**。
+        #   为什么需要重试（2026-09 实测）：报告页是 TTF 逐行画进后备缓冲再 fb_flip() 一次性
+        #   提交到 LFB 的，TCG 下"画 + 4MB 翻转"要 ~0.1s 左右；而这里是在串口出现
+        #   "[HWUI] report lines=" 之后**立刻**抓帧（该行是在 report 构建时打的，早于绘制），
+        #   于是偶尔会抓到"全黑（还没画）"或"画到一半"的帧 —— 这是抓帧竞态，不是系统问题。
+        #   解法：抓到 band 色块为止最多重试 4 次（间隔 0.7s、每次抓帧 ~0.4s，全程仍在
+        #   5 秒展示窗口内），**断言阈值一个字都没放松**；真的 4 次都没抓到就如实 FAIL，
+        #   并把最后一帧留在 --shot 路径上供人看。引导层改 INT 13h 后启动更快，这个竞态更容易
+        #   命中，所以在这里显式处理（原先只是靠"旧 loader 的串口输出更慢"侥幸躲过）。
+        shot_ok = False
+        if got_report:
+            for attempt in range(4):
+                if attempt:
+                    time.sleep(0.7)
+                shot_ok = mon.shot(args.shot, wait=0.4)
+                if not (shot_ok and os.path.exists(args.shot)):
+                    shot_ok = False
+                    continue
+                try:
+                    w0, h0, px0 = read_ppm(args.shot)
+                except Exception:
+                    shot_ok = False
+                    continue
+                # 判据与第 5) 节的断言**完全一致**（不能只看 band：画到一半的帧 band 已经过线，
+                # 但文字还没画上去 -> light 会不达标，那时要继续重抓）
+                band0 = light0 = 0
+                for y in range(90, 700, 6):
+                    for x in range(40, 1240, 6):
+                        c = sample(px0, w0, x, y)
+                        if abs(c[0] - 0) <= 6 and abs(c[1] - 48) <= 8 and abs(c[2] - 96) <= 8:
+                            band0 += 1
+                        if c[0] > 190 and c[1] > 190 and c[2] > 190:
+                            light0 += 1
+                if band0 > 150 and light0 > 300:
+                    break                       # 报告页画完了 -> 用原来的阈值断言
+                # 不是（完整的）报告页：把这一帧留作证据再重抓；最后一帧保持在工作文件名上，
+                # 这样真的 4 次都没抓到，第 5) 节的断言会如实 FAIL 并留下那一帧供人看
+                if attempt < 3:
+                    try:
+                        os.replace(args.shot, args.shot + ".retry%d.ppm" % attempt)
+                    except OSError:
+                        pass
 
         # 等安装向导把磁盘枚举完（这时 AHCI 相关打点都出齐了）
         for _ in range(240):
@@ -357,8 +398,10 @@ def main():
               "; ".join([l for l in log.splitlines() if "[INSTALL]" in l])[:240])
 
         # (b) 把装好的盘单独启一次：必须走"系统启动路径"并进桌面。
-        #     注：**引导器（boot/loader64.asm）自带的是 PATA PIO 读取**，所以这里按 IDE 盘挂载来验
-        #     "装好的系统盘能进桌面"；直接挂到 AHCI 上启动需要 AHCI 版 loader（本批不改 loader）。
+        #     注：引导器（boot/loader64.asm）的磁盘读盘路径现在走 **BIOS INT 13h 扩展读**，
+        #     所以这里按 IDE 盘挂载只是"最保守"的一种挂法（同时验证 IDE 兼容模式没被搞坏）。
+        #     ★ 真正考"纯 AHCI 机器能不能启动"的是 tests/disk_boot_test.py：它把装好的盘
+        #       **只挂在 ich9-ahci 上**启动（没有 IDE 兼容盘），断言 [LM] disk boot via INT 13h。
         boot_log = os.path.join(ROOT, "ahci_installed_boot.log")
         if os.path.exists(boot_log):
             os.remove(boot_log)
@@ -388,6 +431,10 @@ def main():
                     bproc.wait(timeout=10)
                 except Exception:
                     pass
+        # ★ 新增：装好的盘也必须由 BIOS INT 13h 把内核读进去（引导层已不再走 PATA PIO）
+        check("装好的盘由 BIOS INT 13h 读内核（[LM] disk boot via INT 13h dl=0x..）",
+              "[LM] disk boot via INT 13h dl=0x" in booted,
+              (re.search(r"\[LM\][^\r\n]*", booted).group(0) if "[LM]" in booted else "缺 [LM] 行"))
         check("从装好的盘启动走系统路径（[OS] booted from installed disk）",
               "[OS] booted from installed disk" in booted,
               (re.search(r"\[OS\][^\r\n]*", booted).group(0) if "[OS]" in booted else "缺"))

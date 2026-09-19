@@ -5,29 +5,40 @@
 ;   2) E820 收集内存地图 -> 0x2000
 ;   3) VBE 探测并设置图形模式（按显示器 EDID/模式表自适应）+ 读 EDID
 ;   4) BootInfo -> 0x1000
+;   5) 读内核。三条路（由 0x0F00 的介质描述符区分，参见 boot/cdiso.asm）：
+;        * 无描述符 = **磁盘启动**（装好的系统盘 / 裸盘安装介质）
+;          -> BIOS INT 13h 扩展读（AH=0x42 + DAP）：分块读进低内存暂存区 0x20000，
+;             每批（≤13 块 × 32KB）进一次保护模式搬到 0x100000（见 int13_load_kernel）。
+;          ★ 这是"SATA=AHCI 的机器也能启动已安装系统"的关键：固件负责认盘/读盘，
+;            我们不再碰 IDE 兼容端口（旧版的 PATA PIO 只认那些端口，AHCI 下读不到内核）。
+;        * kind=1 = 光盘启动 -> 进长模式后用 ATAPI(PACKET) 读（见 loader64_atapi.inc）
+;        * kind=2 = RAM 源（hybrid ISO / U 盘）-> 引导桩 cdiso.asm 已用 INT 13h 搬好内核/载荷
 ;
 ; 保护模式阶段（此后不再返回实模式，也再不用任何 BIOS 中断）:
-;   5) 用自带的 ATA PIO (LBA28) 驱动，把内核从 LBA 9 起
-;      **直接读进 0x100000**（每块 128 扇区 = 64KB）
 ;   6) 远跳 0x08:0x100000 进入内核
 ;
-; 为什么改成"进 PM 一次不返回 + 自己读盘"（旧写法是"BIOS 读盘 + 每 pass 进出 PM 拷贝"）:
-;   实测在 VMware 上，只要自己做过一次"进/出保护模式"的往返，它的 BIOS 之后的中断服务
-;   （INT 13h 读盘、INT 10h VBE）就会**永久挂住**；还原 GDTR、复位 FS/GS、重新开中断
-;   全都无效，连一次只拷 0 字节的往返也足以触发。SeaBIOS 不依赖这些状态，
-;   所以旧写法在 QEMU 上一直正常 —— 这是它长期没被发现的原因。
-;   现在 BIOS 只在实模式阶段用（E820/VBE/EDID），进 PM 后不再调用任何 BIOS 中断，
-;   两个虚拟机上都成立。
+; 为什么"BIOS 读盘"曾经被换掉，现在又换回来（两次都是实测驱动）:
+;   旧写法是"每 pass 进出保护模式拷贝"，实测在 VMware 上，只要做过一次"进/出保护模式"的往返，
+;   它的 BIOS 之后的中断服务（INT 13h 读盘、INT 10h VBE）就会**永久挂住**（还原 GDTR、
+;   复位 FS/GS、重新开中断都无效，连一次只拷 0 字节的往返也足以触发）。SeaBIOS 不依赖这些
+;   状态，所以旧写法在 QEMU 上一直正常。当时于是改成"自带 PATA PIO 读盘、全程不碰 BIOS"。
+;   但 PIO 在 SATA=AHCI 的真机上根本读不到盘（装完系统起不来），所以本版本改回来：
+;   **内核整块读完之前不进保护模式、进保护模式之后不再调 BIOS** —— 两个雷都避开。
+;   （顺序细节见 int13_load_kernel 的注释。）
 ;
 ; loader 加载在 0x9000（避开 SeaBIOS trampoline 区 0x8000-0x9000），
 ; 整个 loader 必须 < 0x7000 字节，否则 16 位远跳偏移会越界。
+; 体积上限：loader64.bin ≤ 4096 字节（build64.sh 会检查）。
 ;
 ; 实模式内存布局:
-;   0x0600  DAP（仅 disk_error 诊断打印用，现在已不再用 BIOS 读盘）
+;   0x0500  A20 别名测试用（先存后恢复，别动别人的内存）
+;   0x0600  DAP（boot/boot.asm 也用同一位置；loader 进长模式前用它给 BIOS 传读盘参数）
+;   0x0F00  介质描述符（由引导桩 cdiso.asm 写；"VMMD" + kind + drive + …）
 ;   0x1000  BootInfo
 ;   0x2000  E820 内存条目 (最多 64 * 20B)
-;   ★ 内核已搬高半区：引导层建立 **VA = 0xFFFFFFFF80000000 + PA** 的线性直映
-;     （覆盖 PA 0..1GB，复用下面的 PD0），内核装载在 PA 0x100000 -> 链接在
+;   0x20000..0x87FFF  INT 13h 暂存区（416KB：磁盘启动时 BIOS 只能写低内存，见 int13_load_kernel）
+;   0x0600  hybrid MBR（boot/hybrid_mbr.asm）把自己搬到这里再工作；loader 不用它
+;   （loader 给 BIOS 传读盘参数用的 DAP 在 loader 自己的数据区里，见下面的 dap:）
 ;     0xFFFFFFFF80100000（见 kernel/linker64.ld 与 kernel/memlayout64.h）。
 ;   0x7600  EDID 缓冲 (128B)
 ;   0x7800  RSDP 传递槽 (8B)：BIOS 路径显式写 0 = 内核走 legacy 扫描（见 memlayout64.h）
@@ -76,8 +87,18 @@
     pop eax
 %endmacro
 
-KERNEL_SECTORS equ 8000             ; Vimtu64 64-bit kernel area (4MB)+字体+logo+图标 总扇区数（4000*512 = 2,048,000 B ≤ 2.048MB）
-                                    ; PM 的 ATA 驱动按 128 扇区一块读，默认读满这个数
+KERNEL_SECTORS equ 8000             ; 内核区总扇区数（4MB）。与 build64.sh 的 KERNEL_SECTORS、
+                                    ; kernel/memlayout64.h 三方一致，启动时**读满**这个数
+KERNEL_LBA     equ 9                ; 内核起始 LBA（= build64.sh 的 KERNEL_LBA；LBA 布局不许改）
+
+; ---- INT 13h 磁盘读的暂存区分块（见 int13_load_kernel 的长注释）----
+STAGE_PHYS     equ 0x20000          ; 暂存区物理地址（低内存，实模式可达；loader 在 0x9000，
+                                    ; RM 栈顶 0x7BFF，都在它下面）
+STAGE_SEG0     equ STAGE_PHYS / 16  ; 段:偏移 = 0x2000:0x0000（0x2000 × 16 = 0x20000）
+CHUNK_SECS     equ 64               ; 单次读 64 扇区 = 32KB（≤ 127 扇区上限，且不跨 64KB 边界）
+CHUNKS_MAX     equ 13               ; 每批最多 13 块 = 416KB（暂存区 0x20000..0x87FFF；
+                                    ; 再往上是 PM 阶段的栈 0x90000，别踩）
+SEG_STEP       equ 0x800            ; 暂存窗口段步进 = 32KB / 16
 
 [bits 16]
 [org 0x9000]
@@ -121,14 +142,31 @@ start:
     mov si, msg_l_bootinfo
     call dbg_str
 
-    ; ---- 3. 读内核：进保护模式一次，用 loader 自带的 ATA PIO 驱动直接读进 0x100000 ----
-    ; 为什么不再用 "BIOS INT 13h 读盘 + 多 pass 保护模式拷贝"：
-    ;   实测在 VMware 上，只要"进/出保护模式"往返一次，它的 BIOS 之后的中断服务
-    ;   （INT 13h 读盘、INT 10h VBE）就会永久挂住；还原 GDTR、复位 FS/GS、重新开中断
-    ;   全都无效，连一次只拷 0 字节的往返也足以触发。QEMU 的 SeaBIOS 不依赖这些状态，
-    ;   所以旧写法在 QEMU 上一直正常 —— 这正是它长期没被发现的原因。
-    ;   现在改成：BIOS 只负责 E820 / VBE / EDID（上面都已完成），此后进保护模式不再返回，
-    ;   内核由我们自己的 ATA PIO 直接读入 0x100000，全程不再调用任何 BIOS 中断。
+    ; ---- 3. 读内核（三条路，由 0x0F00 的介质描述符区分；见 boot/cdiso.asm）----
+    ;   a) 无描述符 = **磁盘启动**（装好的系统盘 / 裸盘安装介质）：走 BIOS INT 13h 扩展读，
+    ;      在这里（还在实模式时）就把内核读进 0x100000。这条路的失败会自己打 [LM] 点并停机。
+    ;      ★ 为什么在这一步用 BIOS：PIO 只认 IDE 兼容端口的盘，SATA=AHCI 的机器上读不到内核；
+    ;        而 BIOS 认识所有自己能引导的盘（SATA/AHCI、固件映射过的 NVMe、USB）。
+    ;   b) kind=1 = 光盘启动：内核在光盘上，交给 64 位阶段的 ATAPI(PACKET) 读（CD 不是磁盘，
+    ;      INT 13h 的软盘/硬盘读法对 2048B 扇区不适用）。
+    ;   c) kind=2 = RAM 源（hybrid ISO / U 盘）：引导桩 cdiso.asm 已经用 INT 13h 把内核与
+    ;      载荷搬进内存了，这里什么都不用做。
+    ;     ★ VMware 的 BIOS 在"进/出保护模式往返"之后就挂住（INT 13h/INT 10h 全废，实测）；
+    ;       int13_load_kernel 内部为了搬高内存会做保护模式往返，但它把内核整块读完才返回，
+    ;       返回后我们只进保护模式不再回头 —— 所以"BIOS 调用"与"保护模式往返"不交错踩雷。
+    mov eax, [0x0F00]
+    cmp eax, 0x444D4D56             ; 'VMMD' 小端
+    jne .disk_boot                  ; 没有描述符 -> 磁盘启动
+    cmp byte [0x0F04], 1
+    jne .kernel_ready_rm            ; kind=2：桩已经把内核搬好了
+    mov si, msg_lm_cd               ; kind=1：光盘 -> 打点后由 ATAPI 读
+    call dbg_str
+    jmp .kernel_ready_rm
+.disk_boot:
+    call int13_load_kernel          ; 失败时内部打 [LM] int13 read FAILED 并停机
+.kernel_ready_rm:
+    ; L:ata —— 既有验收脚本（tests/boot64_assert.py 的 must_debugcon）依赖这个标记。
+    ; 语义已随本次改动变为"读内核阶段结束、准备切长模式"（读盘本身已由 BIOS INT 13h / ATAPI 完成）。
     mov si, msg_l_ata
     call dbg_str
     cli
@@ -253,86 +291,26 @@ detect_memory:
     ret
 
 vbe_probe:
-    mov si, msg_d_begin
-    call dbg_str
-    ; 请求 VBE 2.0 控制器信息
+    ; 请求 VBE 2.0 控制器信息（原来这里把 AX 返回值同时打给屏幕和串口，已随体积预算删掉：
+    ;   失败路径由 msg_vbe_err + best_mode 打点，成功路径由后面的 [LM] / [LM64] 打点覆盖）
     mov di, 0x7000
     mov dword [di], 'VBE2'
     mov ax, 0x4F00
     int 0x10
-    push ax
-    mov si, msg_dbg1
-    call print_string
-    pop ax
-    call print_hex16
-    push ax
-    mov si, msg_d_ax
-    call dbg_str
-    pop ax
-    call dbg_hex16
-    call dbg_nl
     cmp ax, 0x004F
     jne .fail
     cmp dword [0x7000], 'VESA'
     jne .fail
-    mov si, msg_d_sigok
-    call dbg_str
-    call dbg_nl
     call read_edid                  ; 读显示器 EDID（供模式自适应）
     ; 模式列表指针 (offset:segment) 位于偏移 14
     mov ax, [0x7000 + 14]
     mov bx, [0x7000 + 16]
     mov es, bx
     mov di, ax
-    ; 调试: 打印列表指针
-    push ax
-    push bx
-    mov si, msg_dbg2
-    call print_string
-    pop bx
-    mov ax, bx
-    call print_hex16
-    mov si, msg_colon
-    call print_string
-    pop ax
-    call print_hex16
-    mov si, msg_nl
-    call print_string
-    ; 打印前 4 个模式号
-    push di
-    mov cx, 0
-.dbg_modes:
-    cmp cx, 4
-    jge .dbg_done
-    push cx
-    mov si, msg_dbg3
-    call print_string
-    pop cx
-    push cx
-    mov ax, [es:di]
-    call print_hex16
-    pop cx
-    push cx
-    mov si, msg_space
-    call print_string
-    pop cx
-    add di, 2
-    inc cx
-    jmp .dbg_modes
-.dbg_done:
-    pop di
-    mov si, msg_nl
-    call print_string
-    mov si, msg_d_list
-    call dbg_str
-    ; 打印列表指针（已存在 best 数据区临时用）
-    push di
-    mov ax, [0x7000 + 16]
-    call dbg_hex16
-    mov ax, [0x7000 + 14]
-    call dbg_hex16
-    call dbg_nl
-    pop di
+    ; ★ 体积预算：这里原来有一大段"列表指针 + 前 4 个模式号 + LIST seg,off="的调试打印
+    ;   （还有配套的 msg_dbg2/msg_dbg3/msg_colon/msg_space/msg_nl/msg_d_list 字符串）。
+    ;   loader64.bin 有 4096 字节硬上限，而模式是否可用已经由内核的
+    ;   [LM64] LFB addr=… 与 [DISP64] 模式清单如实打出，所以整段删掉。
     mov word [best_mode], 0
     mov word [ml_count], 0         ; 已收集的可用模式数
     mov word [best_score], 0       ; score 均为正数，0 表示未选
@@ -340,14 +318,7 @@ vbe_probe:
     mov cx, [es:di]
     cmp cx, 0xFFFF
     je .done
-    push cx
-    mov si, msg_d_mode
-    call dbg_str
-    pop cx
-    push cx
-    mov ax, cx                     ; dbg_hex16 打印 ax
-    call dbg_hex16
-    pop cx
+    ; （原来这里把模式号打给串口，已删）
     push es
     push di
     push cx
@@ -358,34 +329,17 @@ vbe_probe:
     mov ax, 0x4F01
     int 0x10
     pop cx
-    push cx
-    push ax
-    mov si, msg_d_ret
-    call dbg_str
-    pop ax
-    call dbg_hex16
-    pop cx
+    ; （原来这里把 int 10h 的返回码打给串口，已删）
     cmp ax, 0x004F
     jne .next_mode
     ; 模式属性
-    mov ax, [0x7200]
-    push ax
-    mov si, msg_d_attr
-    call dbg_str
-    pop ax
-    call dbg_hex16
+    mov ax, [0x7200]                ; 模式属性（原来这里还把它打给串口，已随体积预算删掉）
     test ax, 0x0001
     jz .next_mode
     test ax, 0x0080            ; 需要 LFB
     jz .next_mode
-    mov si, msg_d_ok
-    call dbg_str
-    mov ax, [0x7200 + 0x12]
-    call dbg_hex16
-    mov ax, [0x7200 + 0x14]
-    call dbg_hex16
-    mov al, [0x7200 + 0x1A]
-    call dbg_hex16
+    ; （这里原来打印 " ok(W H bpp" 三个十六进制 —— 已删；同样的值 427 行起就写进
+    ;   m_width/m_height/m_bpp 并参与评分，内核启动后会打真实画面参数）
     mov ax, [0x7200 + 0x12]
     mov [m_width], ax
     mov ax, [0x7200 + 0x14]
@@ -439,11 +393,8 @@ vbe_probe:
     add di, 2
     jmp .mode_loop
 .done:
-    mov si, msg_d_best
-    call dbg_str
-    mov ax, [best_mode]
-    call dbg_hex16
-    call dbg_nl
+    ; （原来这里打印 "BEST=xxxx" —— 体积预算下删掉：模式选择结果由内核的
+    ;   [LM64] LFB addr=… / [DISP64] 模式清单打，屏幕上的串口打点已经够定位问题）
     cmp word [best_mode], 0
     je .fail
     ; 设置模式 (启用 LFB)
@@ -662,24 +613,196 @@ write_bootinfo:
     mov [0x102A], ax               ; EDID 有效标志
     ret
 
-disk_error:
-    ; 重要：此时已处于图形模式，int 0x10 文本输出会挂起（本文件前面已有此教训），
-    ; 所以错误必须走 dbg_str（0x402 debugcon + COM1 串口双出口），否则表现为"静默死机"。
-    ; 同时打印失败时的读盘参数，便于定位是哪一次读取出问题。
-    mov si, msg_disk_err
+; ============================================================================
+; BIOS INT 13h 扩展读（AH=0x42 + DAP）：磁盘启动路径把内核读进 0x100000
+; ============================================================================
+; 为什么不再用自己的 PATA PIO（旧版本的写法，代码已删）：
+;   PIO 只认 IDE 兼容端口（0x1F0/0x170）后面挂着的盘。现代主板 SATA 默认工作在 AHCI
+;   模式，那些端口后面什么都没有 —— 于是"在 SATA 盘上装完系统，重启就起不来"。
+;   改走 BIOS INT 13h 之后，**凡是固件能看见并能引导的盘**（SATA/AHCI、固件映射过的
+;   NVMe、USB、老 PATA）都能读：控制器/端口细节交给固件，我们只给一个 DAP。
+;
+; 实模式的两条硬限制（决定了下面"分块 + 保护模式搬运"的写法）：
+;   1) DAP 的目标是 16 位 段:偏移（物理 = 段×16 + 偏移，20 位寻址，最大 0x10FFEF），
+;      **写不到 0x100000 以上的高内存**：0x100000 / 16 = 0x10000 已经放不进 16 位段寄存器。
+;      （0x04000000 同理，载荷那条路在 cdiso.asm 里也是这么绕的。）
+;      所以先把数据读进低内存暂存区，再自己搬到高内存 —— 暂存区的换算就是
+;      物理 0x20000 = 段:偏移 0x2000:0x0000（0x2000 × 16 = 0x20000）。
+;   2) 每次读的缓冲区**不能跨 64KB 边界**（BIOS 用段式拷贝/DMA，跨界会撕数据），
+;      且多数实现要求 count ≤ 127 扇区（127 × 512 = 65024 < 64KB）。
+;      这里固定每块 64 扇区 = 32KB，暂存窗口按 32KB 递增（段步进 0x800）、偏移恒为 0：
+;      每块正好落在某个 64KB 对齐窗口的一半里，**永不跨界**。
+;
+; 搬运为什么必须进保护模式：实模式段:偏移到不了 0x100000（见上），32 位寻址必须 PE=1。
+;   所以每读完一批就进一次保护模式、用 GDT 里的 4GB 平坦数据段（0x10）做一次
+;   a32 rep movsd 搬到高内存，再回实模式继续读 —— 与 boot/cdiso.asm 的 copy_chunk_high
+;   同一套路（那条路已在 QEMU 上跑通）。
+;   ★ 顺序很关键：**一旦进过保护模式就不要再调 BIOS**（VMware 的 BIOS 在保护模式往返后
+;     会挂住，见本文件开头）。所以这里把内核整块读完才进保护模式进长模式，之后永不回头；
+;     批次内的"读 → 搬 → 再读"是"读在前、搬在后"，每次 BIOS 调用前刚回到实模式。
+;
+; 失败处理：每块重试 3 次（每次先复位磁盘 AH=0x00），仍失败 -> 打 [LM] 串口点并停机。
+;   **绝不静默失败**：这条路上没有屏幕输出（图形模式已开），串口/debugcon 是唯一出口。
+; ============================================================================
+int13_load_kernel:
+    ; ---- 驱动器号：用 BIOS 传进来的 DL（boot/boot.asm 存进 BOOT_DRIVE 透传过来）----
+    ;   不猜 0x80：BIOS 的盘号与内核的驱动器号没有固定映射，而 DL 就是固件刚刚用来引导
+    ;   我们的那块盘的号 —— 这是唯一可靠的来源。若 DL 不是硬盘号（< 0x80：软盘/CD 号），
+    ;   说明固件没给我们可用的磁盘号，回退 0x80 并在打点里注明 (fallback)。
+    mov si, msg_lm_i13
     call dbg_str
-    mov ax, word [dap_lba]          ; LBA 低 16 位
-    call dbg_hex16
-    mov ax, word [dap_lba + 2]      ; LBA 高 16 位
-    call dbg_hex16
-    mov ax, word [dap_count]        ; 本次请求扇区数
-    call dbg_hex16
-    mov ax, word [dap_seg]          ; 目标段
-    call dbg_hex16
+    mov al, [BOOT_DRIVE]
+    test al, 0x80
+    jnz .dl_ok
+    mov al, 0x80
+    mov [BOOT_DRIVE], al
+    call dbg_hex8
+    mov si, msg_dl_fb
+    call dbg_str
     call dbg_nl
+    jmp .dl_done
+.dl_ok:
+    call dbg_hex8
+    call dbg_nl
+.dl_done:
+    ; ---- 起点：LBA 9（KERNEL_LBA）、目标物理 0x100000、共 8000 扇区（KERNEL_SECTORS）----
+    mov dword [l13_lba], KERNEL_LBA
+    mov dword [l13_dst], 0x00100000
+    mov word [l13_left], KERNEL_SECTORS
+.batch:
+    mov word [l13_n], 0             ; 本批从暂存区头开始
+    mov word [l13_seg], STAGE_SEG0
+.chunk:
+    mov ax, [l13_left]
+    test ax, ax
+    jz .flush                       ; 没有剩余 -> 收工
+    mov bx, CHUNK_SECS              ; 本块扇区数（尾部可能更少）
+    cmp ax, bx
+    jae .cnt_ok
+    mov bx, ax
+.cnt_ok:
+    mov [dap_count], bx             ; DAP.count（≤ 64）
+    mov ax, [l13_seg]
+    mov [dap_seg], ax               ; DAP.段（0x2000 + n*0x800 -> 物理 0x20000 + n*32KB）
+    mov word [dap_off], 0           ; DAP.偏移（恒 0）
+    mov eax, [l13_lba]
+    mov [dap_lba], eax              ; DAP.LBA（32 位；高位在数据区里恒 0）
+    mov byte [l13_retry], 3
+.retry:
+    mov dl, [BOOT_DRIVE]            ; BIOS 约定：DL = 驱动器号
+    mov si, dap                     ; BIOS 约定：DS:SI = DAP
+    mov ah, 0x42                    ; 扩展读（LBA + DAP）
+    int 0x13
+    call rm_flat                    ; BIOS 可能踩坏段寄存器（不改 FLAGS，可在 jc 前调用）
+    jc .fail
+    ; ---- 打点：只打整个加载的首尾各一条（4000 次读全打会刷屏，且拖慢 TCG）----
+    mov ax, [l13_left]
+    cmp ax, [dap_count]             ; 剩余 == 本次读：这次就是最后一块
+    je .log
+    cmp dword [l13_lba], KERNEL_LBA ; 第一块
+    jne .adv
+.log:
+    mov si, msg_i13_ok
+    call dbg_str
+    mov ax, word [dap_lba]
+    call dbg_hex16                  ; LBA（9..8009，16 位足够；已按低 16 位打印）
+    mov si, msg_i13_cnt
+    call dbg_str
+    mov ax, [dap_count]
+    call dbg_hex16
+    mov si, msg_i13_tail
+    call dbg_str
+    call dbg_nl
+.adv:
+    movzx eax, word [dap_count]
+    add [l13_lba], eax              ; LBA += 本次扇区数
+    mov ax, [dap_count]
+    sub [l13_left], ax              ; 剩余 -= 本次扇区数
+    add word [l13_seg], SEG_STEP    ; 下一个 32KB 暂存窗口
+    inc word [l13_n]
+    cmp word [l13_n], CHUNKS_MAX
+    jb .chunk                       ; 暂存区还没满 -> 继续读
+.flush:
+    ; ---- 本批读完：一次保护模式拷贝把暂存区搬到高内存（暂存区永远从 0x20000 起）----
+    movzx eax, word [l13_n]
+    test eax, eax
+    jz .done                        ; 没有新数据（剩余为 0）-> 收工
+    shl eax, 15                     ; 字节数 = n * 32KB
+    push eax
+    mov ecx, eax
+    mov edi, [l13_dst]
+    call copy_stage_high
+    pop eax
+    add [l13_dst], eax              ; 目标前进
+    cmp word [l13_left], 0
+    jnz .batch
+.done:
+    ret
+.fail:
+    ; CF=1：AH = BIOS 错误码（已经先存下来，后面的调用不会污染它）
+    mov [l13_ah], ah
+    mov si, msg_i13_fail
+    call dbg_str
+    mov al, [l13_ah]
+    call dbg_hex8
+    mov si, msg_i13_lba
+    call dbg_str
+    mov ax, word [dap_lba]
+    call dbg_hex16
+    mov si, msg_i13_retry
+    call dbg_str
+    mov al, [l13_retry]
+    call dbg_hex8
+    call dbg_nl
+    dec byte [l13_retry]
+    jz .dead
+    xor ah, ah                      ; AH=0x00 复位磁盘（有些 BIOS 失败后不先复位就不认下一次读）
+    mov dl, [BOOT_DRIVE]
+    int 0x13
+    call rm_flat
+    jmp .retry
+.dead:
+    mov si, msg_i13_dead
+    call dbg_str
     cli
     hlt
     jmp $
+
+; ---- DS/ES 拉回实模式 0 段（BIOS 调用可能踩坏段寄存器）----
+; ★ 全程用 mov（**不用 xor**）：本函数必须在 `jc` 之前调用，不能改 FLAGS（CF/ZF 都要留着）
+rm_flat:
+    push ax
+    mov ax, 0
+    mov ds, ax
+    mov es, ax
+    pop ax
+    ret
+
+; ---- 暂存区（低内存）-> 高内存的搬运：保护模式里做 32 位拷贝 ----
+; 入：ecx = 字节数（32KB 的整数倍）、edi = 目标物理地址（0x100000；载荷路径另算）
+; 段缓存说明：进 PE 时**不**远跳，CS 缓存仍是实模式的 16 位代码段，所以下面依然是 16 位
+;   代码（配上 32 位操作数/地址前缀）—— 与 boot/cdiso.asm 的 copy_chunk_high 完全同路。
+copy_stage_high:
+    cli
+    lgdt [gdt_descriptor]
+    mov eax, cr0
+    or eax, 1                       ; PE=1
+    mov cr0, eax
+    jmp short $+2
+    mov ax, 0x10                    ; 4GB 平坦数据段（gdt_data：G=1 / D=1 / limit=0xFFFFF）
+    mov ds, ax
+    mov es, ax
+    mov esi, STAGE_PHYS             ; 源：0x20000（= 段:偏移 0x2000:0x0000）
+    shr ecx, 2                      ; 按 dword 搬（字节数一定是 4 的倍数：32KB 的整数倍）
+    a32 rep movsd
+    mov eax, cr0
+    and al, 0xFE                    ; PE=0（回实模式）
+    mov cr0, eax
+    xor ax, ax                      ; 回实模式后段缓存会按选择子重建 -> 显式拉回 0 段
+    mov ds, ax
+    mov es, ax
+    sti
+    ret
 
 vbe_error:
     mov si, msg_vbe_err
@@ -792,6 +915,31 @@ dbg_hex16:
     popa
     ret
 
+; 打印 al 的低 8 位为**两位**十六进制（dbg_hex16 是 4 位 + 一个只进 debugcon 的空格，
+; 对 "dl=0x80" / "ah=0xC4" / "retry=03" 这种字段不合适：串口那侧空格不落地，会粘在一起）
+dbg_hex8:
+    push ax
+    mov ah, al
+    shr al, 4
+    call .n
+    mov al, ah
+    and al, 0x0F
+    call .n
+    pop ax
+    ret
+.n:
+    cmp al, 10
+    jb .d
+    add al, 'A' - 10
+    jmp .o
+.d:
+    add al, '0'
+.o:
+    mov dx, 0x402
+    out dx, al
+    SPUTC16
+    ret
+
 dbg_nl:
     pusha
     mov al, 0x0D
@@ -826,19 +974,23 @@ print_hex16:
     ret
 
 ; ================= 数据 =================
+; ---- 磁盘地址包（DAP，INT 13h AH=0x42 用）----
+;   size=0x10 / count / offset:segment / LBA 低 32 位 / LBA 高 32 位
+;   count 每次读前由 int13_load_kernel 填（≤ 64 扇区 = 32KB：既满足"单次 ≤ 127 扇区"，
+;   又保证只落在一个 64KB 对齐窗口里的一半，绝不跨 64KB 边界 —— 见那边的注释）
 align 4
 dap:
     db 0x10
     db 0
 dap_count:
-    dw 127
+    dw CHUNK_SECS
 dap_off:
     dw 0
 dap_seg:
-    dw 0
+    dw STAGE_SEG0
 dap_lba:
-    dd 9
-    dd 0
+    dd KERNEL_LBA                   ; 起始 LBA（= build64.sh 的 KERNEL_LBA / memlayout64.h 一致）
+    dd 0                            ; LBA 高 32 位（内核在 9..8009，恒 0）
 
 align 4
 gdt_start:
@@ -870,11 +1022,14 @@ gdt_descriptor:
     dw gdt_end - gdt_start - 1
     dd gdt_start
 
-BOOT_DRIVE: db 0
-ata_lba:   dd 9             ; 保护模式 ATA 读：当前 LBA
-ata_dst:   dd 0x100000      ; 当前目标物理地址
-ata_left:  dd 0             ; 还差多少扇区
-ata_chunk: dd 0             ; 本块读多少扇区
+BOOT_DRIVE: db 0                ; BIOS 传进来的 DL（boot/boot.asm 保存后透传）—— 磁盘启动读盘用
+l13_lba:   dd KERNEL_LBA        ; INT 13h 读内核：当前 LBA（32 位足够：9..8009）
+l13_dst:   dd 0x00100000        ; 目标物理地址（高内存；实模式写不到，见 int13_load_kernel）
+l13_left:  dw KERNEL_SECTORS    ; 还差多少扇区（8000 < 65536，16 位够）
+l13_n:     dw 0                 ; 本批已读进暂存区的块数（每块 64 扇区 = 32KB）
+l13_seg:   dw STAGE_SEG0        ; 本块暂存窗口的段值（0x2000 + n*0x800 = 物理 0x20000 + n*32KB）
+l13_retry: db 3                 ; 本块剩余重试次数
+l13_ah:    db 0                 ; 失败时 BIOS 返回的 AH 错误码（打点用）
 mem_count: dd 0
 best_mode: dw 0
 best_score: dw 0
@@ -897,9 +1052,7 @@ msg_mem:       db "E820 entries: ", 0
 msg_entries:   db 0x0D, 0x0A, 0
 msg_vbe_ok:    db "VBE mode: 0x", 0
 msg_mode_done: db 0x0D, 0x0A, 0
-msg_kernel_ok: db "Kernel loaded, jumping to protected mode...", 0x0D, 0x0A, 0
 msg_vbe_err:   db "VBE error! best_mode=0x", 0
-msg_disk_err:  db "Kernel disk read error!", 0x0D, 0x0A, 0
 msg_l_bootinfo: db "L:bootinfo", 13, 10, 0
 msg_l_ata:      db "L:ata", 13, 10, 0
 msg_edid_ok:    db "L:edid ok", 13, 10, 0
@@ -918,24 +1071,24 @@ cpuid_edx:      dd 0
 cpuid_maxleaf:  dd 0
 msg_a20_on:     db "A20=on", 13, 10, 0
 msg_a20_off:    db "A20=OFF", 13, 10, 0
-msg_dbg1:      db "VBE probe AX=0x", 0
-msg_dbg2:      db "Mode list seg:off=", 0
-msg_dbg3:      db "mode=0x", 0
-msg_colon:     db ":", 0
-msg_space:     db " ", 0
-msg_nl:        db 0x0D, 0x0A, 0
-msg_d_begin:   db "[VBE]", 0
-msg_d_ax:      db "AX=", 0
-msg_d_sigok:   db "SIG=OK", 0
-msg_d_list:    db "LIST seg,off=", 0
-msg_d_mode:    db "M=", 0
-msg_d_ret:     db " ret=", 0
-msg_d_attr:    db " attr=", 0
-msg_d_ok:      db " ok(", 0
-msg_d_score:   db ") sc=", 0
-msg_d_sc2:     db " sc2=", 0
-msg_d_bpp2:    db " bpp=", 0
-msg_d_best:    db "BEST=", 0
+; （VBE 模式枚举的调试字符串全部删除 —— 与之配套的打印点在 vbe_probe 里已随
+;   4096 字节体积预算去掉。原来这里是：msg_dbg1/msg_dbg2/msg_dbg3/msg_colon/msg_space/
+;   msg_nl/msg_d_begin/msg_d_ax/msg_d_sigok/msg_d_list/msg_d_mode/msg_d_ret/msg_d_attr/
+;   msg_d_ok/msg_d_score/msg_d_sc2/msg_d_bpp2/msg_d_best。）
+
+; ---- INT 13h 磁盘引导路径的打点（[LM] 前缀，与光盘路径的 [LM] cd boot via ATAPI 区分）----
+; 体积预算：loader 有 4096 字节硬上限，所以把这些字符串拆成可复用的片段
+;   （" lba=" / " count=" 两条打点共用），数字一律由 dbg_hex8 / dbg_hex16 打。
+msg_lm_i13:    db "[LM] disk boot via INT 13h dl=0x", 0
+msg_lm_cd:     db "[LM] cd boot via ATAPI", 13, 10, 0
+msg_dl_fb:     db " (fallback)", 0
+msg_i13_ok:    db "[LM] int13 read lba=", 0
+msg_i13_cnt:   db " count=", 0
+msg_i13_tail:  db " ok", 13, 10, 0
+msg_i13_fail:  db "[LM] int13 read FAILED ah=0x", 0
+msg_i13_lba:   db " lba=", 0
+msg_i13_retry: db " retry=", 0
+msg_i13_dead:  db "[LM] int13 read FAILED: kernel not loaded, halted", 13, 10, 0
 
 
 ; ============================================================================
@@ -1205,12 +1358,13 @@ lm64_in64:
     ; ---- 介质描述符（0x0F00，由引导桩 boot/cdiso.asm 写入）决定内核从哪读 ----
     ;   布局："VMMD" + kind(1) + drive(1) + rsv(2) + kernel_lba(4) + payload_lba(4)
     ;          + payload_secs(4) + image_bytes(4)
-    ;     kind = 1 光盘（用 ATAPI 从光盘读内核）
-    ;     kind = 2 RAM（引导桩已经把内核与载荷搬进内存，这里直接进内核）
-    ;     没有描述符 = 老路径：从硬盘 LBA 9 读（安装介质是裸盘/U 盘时）
+    ;     kind = 1 光盘（用 ATAPI 从光盘读内核；实模式阶段已打 "[LM] cd boot via ATAPI"）
+    ;     kind = 2 RAM（引导桩已经用 INT 13h 把内核与载荷搬进内存，这里直接进内核）
+    ;     没有描述符 = **磁盘启动**（装好的系统盘 / 裸盘安装介质）：内核在实模式阶段已经由
+    ;       BIOS INT 13h 扩展读送进 0x100000（见 int13_load_kernel），这里只管进内核。
     mov eax, dword [0x0F00]
     cmp eax, 0x444D4D56             ; 'VMMD' 小端
-    jne .from_disk
+    jne .kernel_ready               ; 磁盘启动：INT 13h 已经把内核读好了
     movzx ecx, byte [0x0F04]
     cmp ecx, 1
     je .from_cd
@@ -1260,18 +1414,11 @@ lm64_in64:
                                     ;   "0x000007F5 + 偏移" 那片低内存 → 拷过去全是 0/垃圾，
                                     ;   表现为"安装报告写了 8073 扇区，但目标盘内容区全 0"。
                                     ;   （搬高半区时误删过，靠对比目标盘字节才发现）
-    ; 光盘路径：内核已经由上面的 atapi64_read 读进 0x100000，载荷也读好了，
-    ; 直接进 .kernel_ready（**不要**再走磁盘那条 ATA 读取）。
+    ; 光盘路径：内核已经由上面的 atapi64_read 读进 0x100000，载荷也读好了，直接进 .kernel_ready。
+    ; （磁盘启动那条路的内核读取**不在这里**：实模式阶段已经用 BIOS INT 13h 扩展读完成，
+    ;   见 int13_load_kernel。）
     jmp .kernel_ready
-.from_disk:
-    ; 老路径：安装介质是裸盘 / U 盘时（没有介质描述符），内核在硬盘 LBA 9
-    mov rsi, msg_medium_disk
-    call dbg64_puts
-    mov rdi, 0x100000               ; 目标
-    mov rsi, 9                      ; 起始 LBA
-    mov ebx, KERNEL_SECTORS         ; 扇区数（build64.sh 与 memlayout64.h 一致：8000）
-    call ata64_read_lba28
-    jc lm64_fatal64
+.kernel_ready:
 .kernel_ready:
     mov al, 'K'
     call dbg64_putc
@@ -1372,164 +1519,19 @@ dbg64_puts:
     pop rax
     ret
 
-; 约 400ns 延时：连读 4 次交替状态寄存器
-ata64_delay:
-    push rax
-    push rdx
-    mov dx, 0x3F6
-    in al, dx
-    in al, dx
-    in al, dx
-    in al, dx
-    pop rdx
-    pop rax
-    ret
-
-; 等 BSY=0；CF=0 成功 / CF=1 超时
-ata64_wait_bsy:
-    push rax
-    push rcx
-    push rdx
-    mov ecx, 0x2000000
-.w:
-    mov dx, 0x1F7
-    in al, dx
-    test al, 0x80
-    jz .ok
-    loop .w
-    pop rdx
-    pop rcx
-    pop rax
-    stc
-    ret
-.ok:
-    pop rdx
-    pop rcx
-    pop rax
-    clc
-    ret
-
-; 等 DRQ=1（或 ERR）；CF=0 成功 / CF=1 失败
-ata64_wait_drq:
-    push rax
-    push rcx
-    push rdx
-    mov ecx, 0x4000000
-.w:
-    mov dx, 0x1F7
-    in al, dx
-    test al, 0x01                   ; ERR
-    jnz .fail
-    test al, 0x08                   ; DRQ
-    jnz .ok
-    loop .w
-.fail:
-    pop rdx
-    pop rcx
-    pop rax
-    stc
-    ret
-.ok:
-    pop rdx
-    pop rcx
-    pop rax
-    clc
-    ret
-
 ; ---------------------------------------------------------------------------
-; 64 位 ATA PIO 读盘（主通道 0x1F0，LBA28，轮询）
-;   rdi = 目标物理地址, rsi = 起始 LBA, rbx = 扇区数
-;   CF=0 成功 / CF=1 失败
-; 端口序列与 kernel/ata64.cpp 一致（主盘选择字节必须是 0xE0 = LBA 模式）。
+; （原 64 位 ATA PIO 读盘整段已删除：ata64_delay / ata64_wait_bsy /
+;   ata64_wait_drq / ata64_read_lba28）
+;
+; 磁盘启动路径改走 BIOS INT 13h 扩展读：见 16 位阶段的 int13_load_kernel。
+; 原因（真机可用性）：PIO 只认 IDE 兼容端口（0x1F0/0x170）后面挂着的盘。现代主板 SATA 默认
+;   工作在 AHCI 模式，那些端口后面什么都没有 —— 用 PIO 读内核就等于"装完系统重启起不来"。
+;   交给固件读之后，凡是 BIOS 能引导的盘（SATA/AHCI、固件映射过的 NVMe、USB、老 PATA）
+;   都能启动，控制器细节由固件负责。
+; 光盘路径不受影响：ATAPI(PACKET) 在 loader64_atapi.inc 里，光盘不是磁盘，也不需要 BIOS。
+; ★ 这里**没有** PIO 回退：本版本只支持"BIOS 提供 INT 13h 扩展读(AH=0x42)"的机器
+;   （1998 年后的固件基本都有；那之前的老机器也跑不了本系统的 64 位长模式）。
 ; ---------------------------------------------------------------------------
-ata64_read_lba28:
-    push rax
-    push rbx
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-
-.chunk:
-    test rbx, rbx
-    jz .done
-    mov r10, rbx
-    cmp r10, 128
-    jbe .cnt_ok
-    mov r10, 128                    ; 每块最多 128 扇区（LBA28 计数寄存器 8 位）
-.cnt_ok:
-    call ata64_wait_bsy
-    jc .fail
-
-    mov rax, rsi
-    shr rax, 24
-    and al, 0x0F
-    or al, 0xE0                     ; ★ LBA 模式（0xE0），不能写成 0xA0（CHS 会被 ABRT）
-    mov dx, 0x1F6
-    out dx, al
-    call ata64_delay
-
-    mov dx, 0x1F1                  ; 特性
-    xor al, al
-    out dx, al
-    mov rax, r10                   ; 扇区数
-    mov dx, 0x1F2
-    out dx, al
-    mov rax, rsi                   ; LBA[7:0]
-    mov dx, 0x1F3
-    out dx, al
-    mov rax, rsi
-    shr rax, 8                     ; LBA[15:8]
-    mov dx, 0x1F4
-    out dx, al
-    mov rax, rsi
-    shr rax, 16                    ; LBA[23:16]
-    mov dx, 0x1F5
-    out dx, al
-
-    mov dx, 0x1F7
-    mov al, 0x20                   ; READ SECTORS
-    out dx, al
-
-.sector:
-    call ata64_wait_drq
-    jc .fail
-    mov dx, 0x1F0
-    mov r9d, 256
-.word:
-    in ax, dx
-    mov [rdi], ax
-    add rdi, 2
-    dec r9d
-    jnz .word
-    inc rsi
-    dec rbx
-    jz .done
-    dec r10
-    jnz .sector
-    mov al, '.'
-    call dbg64_putc                ; 每块一个点（进度可见）
-    jmp .chunk
-
-.done:
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    clc
-    ret
-
-.fail:
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    stc
-    ret
 
 %include "loader64_atapi.inc"
 ; ---------------------------------------------------------------------------

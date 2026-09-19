@@ -26,8 +26,9 @@ start:
     mov dl, [BOOT_DRIVE]
     int 0x13
     jc disk_error
-
-    ; 跳转 loader
+    ; 跳转 loader（DL 必须带着：loader64 的磁盘读盘路径要用 BIOS 传进来的盘号，
+    ;   它不再自己去猜 0x80 —— 猜错就会去读另一块盘）。int 13h 一般会保留 DL，但这里显式再装一次。
+    mov dl, [BOOT_DRIVE]
     jmp 0x0000:0x9000
 
 disk_error:

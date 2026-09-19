@@ -1,6 +1,11 @@
 ; loader64_atapi.inc - 64 位 ATAPI（光驱）PIO 读，供 boot/loader64.asm 的 64 位阶段 %include
 ;
-; 为什么需要：
+; 适用范围：**只用于光盘路径**（介质描述符 kind=1，loader64 打 "[LM] cd boot via ATAPI"）。
+;   磁盘路径（装好的系统盘 / 裸盘介质，无描述符）不在这里 —— 那条路的内核读取在实模式阶段
+;   由 BIOS INT 13h 扩展读完成（见 loader64.asm 的 int13_load_kernel），因为 PIO 在
+;   SATA=AHCI 的机器上读不到盘。
+;
+; 为什么光盘还用 ATAPI（而不是 BIOS）：
 ;   ISO 形态的安装介质是光盘 —— 光盘不认识 READ SECTORS(LBA28)，必须用 SCSI 风格的
 ;   PACKET 命令（12 字节 CDB），而且扇区是 2048 字节。
 ;   另一个关键是：这里**不借 BIOS**。loader 进保护模式后不再调用任何 BIOS 中断
@@ -262,4 +267,3 @@ atapi_cdb:  db 0x28, 0x00, 0, 0, 0, 0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00
 
 msg_medium_cd:   db "L:media=cd", 13, 10, 0
 msg_medium_ram:  db "L:media=ram", 13, 10, 0
-msg_medium_disk: db "L:media=disk", 13, 10, 0

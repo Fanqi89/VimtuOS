@@ -51,7 +51,10 @@ STAGES = {
         "must_debugcon": [
             "L:edid ok",                    # 实模式阶段：VBE + EDID 探测成功
             "L:bootinfo",                   # loader 写好 BootInfo（boot.bin 已执行）
-            "L:ata",                        # 开始用 ATA PIO 读内核
+            "L:ata",                        # 读内核阶段结束（读盘已由 BIOS INT 13h / ATAPI 完成）
+            # ★ 新增：磁盘引导（裸盘/硬盘）路径必须由 BIOS INT 13h 扩展读内核
+            #   （旧版是自写 PATA PIO —— 在 SATA=AHCI 的机器上读不到盘，装完系统起不来）
+            "[LM] disk boot via INT 13h dl=0x",
             "L:lm64",                       # 准备切长模式
         ],
         # "HALT:" 不算失败：正常跑完会停在 HALT 提示上（见 must_serial 的 M0 PASS）

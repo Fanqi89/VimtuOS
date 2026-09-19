@@ -228,6 +228,9 @@ def main():
 
     print("=== 3) 串口日志断言（每一步都真的写盘）===")
     check("新建分区：写入引导分区 + 主分区", "[PART] 新建分区表 OK" in log)
+    # ★ 新增：裸盘/硬盘介质走的是 BIOS INT 13h 扩展读内核（不是自写 PATA PIO）
+    check("引导层走 BIOS INT 13h 读内核（裸盘介质）",
+          "[LM] disk boot via INT 13h dl=0x" in log and "[LM] int13 read lba=" in log)
     check("安装开始：找到介质载荷", "[INSTALL] 开始安装" in log)
     check("安装完成：写出扇区数", "[INSTALL] 完成：已写" in log)
     check("界面侧确认安装完成", "[SETUP] 安装完成" in log)
@@ -298,6 +301,9 @@ def main():
         boot = ""
 
     check("装好的系统进入长模式", "[LM64] ENTERED LONG MODE" in boot)
+    # ★ 新增：装好的系统盘走的是 BIOS INT 13h 扩展读内核（引导层不再用 PATA PIO）
+    check("装好的系统走 BIOS INT 13h 读内核",
+          "[LM] disk boot via INT 13h dl=0x" in boot and "[LM] int13 read lba=" in boot)
     check("装好的系统走的是系统启动路径", "[OS] booted from installed disk" in boot)
     check("装好的系统就绪", "[OS] ready (idle)" in boot)
     check("装好的系统**没有**再进安装程序", "[SETUP]" not in boot and "entering setup wizard" not in boot)

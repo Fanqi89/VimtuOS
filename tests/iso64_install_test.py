@@ -212,6 +212,10 @@ def main():
     check("El Torito 引导桩启动", "I:boot dl=" in log and "I:cd mode" in log)
     check("引导桩读 loader64 并跳转", "I:jump loader64" in log)
     check("loader64 识别出光盘介质", "L:media=cd" in log)
+    # ★ 新增：引导层要明确打点说明"这条路径是光盘 ATAPI"（与磁盘路径的
+    #   "[LM] disk boot via INT 13h dl=0x.." 区分开）
+    check("loader64 明确打点走了光盘 ATAPI 路径", "[LM] cd boot via ATAPI" in log)
+    check("光盘路径没有误入磁盘 INT 13h 分支", "[LM] disk boot via INT 13h" not in log)
     check("ATAPI 读内核成功（出现 K 标记）", "[LM64] ENTERED LONG MODE" in log)
     check("安装程序读到介质描述符（loader 已转成 RAM 源）",
           "[SETUP] 介质描述符 OK kind=2" in log)

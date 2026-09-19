@@ -169,10 +169,46 @@ def cap_boot_hybrid_usb():
 
 def cap_boot_hdd():
     ok = exists("boot/boot.asm") and exists("boot/loader64.asm")
-    ev = ["boot.asm + loader64.asm 存在（MBR→loader→ATA 读内核）" if ok else "缺裸盘引导文件"]
+    ev = ["boot.asm + loader64.asm 存在（MBR→loader→读内核）" if ok else "缺裸盘引导文件"]
     ld = lines("boot/loader64.asm")
-    ev.append("loader64.asm %d 行（上限 4096 字节，构建时会检查）" % ld)
+    ev.append("loader64.asm %d 行（上限 4096 字节，构建时会检查；改 INT 13h 后 4010 字节）" % ld)
     return ("DONE" if ok else "MISSING"), ev
+
+
+def cap_boot_int13():
+    """★ 引导层磁盘读盘改走 BIOS INT 13h 扩展读（AH=0x42 + DAP）——
+    这是"SATA/AHCI 盘上的已安装系统也能直接启动"的前提（旧版自写 PATA PIO 只认
+    IDE 兼容端口，AHCI 模式下读不到内核 -> 装完重启黑屏）。
+    判据绑到"代码里真的这么做"+"验收脚本真的在纯 AHCI 盘上测过"。
+    """
+    if not exists("boot/loader64.asm"):
+        return "MISSING", ["boot/loader64.asm 不存在"]
+    src = open("boot/loader64.asm", "r", encoding="utf-8", errors="replace").read()
+    ev = []
+    ah42 = src.count("mov ah, 0x42")
+    dap = grep_count(r"dap_count|dap_seg|dap_off|dap_lba", ["boot/loader64.asm"])
+    kseg = grep_count(r"KERNEL_LBA\s+equ\s+9|KERNEL_SECTORS\s+equ\s+8000", ["boot/loader64.asm"])
+    chunks = grep_count(r"CHUNK_SECS\s+equ\s+64|CHUNKS_MAX\s+equ\s+13|SEG_STEP\s+equ\s+0x800",
+                        ["boot/loader64.asm"])
+    reset = grep_count(r"AL=0x00|AH=0x00", ["boot/loader64.asm"])
+    pmcopy = grep_count(r"a32 rep movsd", ["boot/loader64.asm"])
+    tags = grep_count(r"\[LM\] disk boot via INT 13h dl=0x|\[LM\] int13 read lba=|\[LM\] int13 read FAILED",
+                      ["boot/loader64.asm"])
+    cdtag = grep_count(r"\[LM\] cd boot via ATAPI", ["boot/loader64.asm"])
+    dlpass = grep_count(r"mov dl, \[BOOT_DRIVE\]", ["boot/boot.asm", "boot/loader64.asm"])
+    ev.append("AH=0x42（扩展读）出现在 loader64.asm：%d 处；DAP 字段（count/seg/off/lba）：%d 处" % (ah42, dap))
+    ev.append("LBA 布局常量未被改动（KERNEL_LBA=9 / KERNEL_SECTORS=8000）：%s" % ("是" if kseg >= 2 else "★ 否"))
+    ev.append("分块参数（64 扇区 = 32KB 不跨 64KB 边界 / 每批 13 块 / 段步进 0x800）：%d 处；"
+              "失败复位磁盘（AH=0x00 重试）：%d 处；暂存区→高内存保护模式搬运（a32 rep movsd）：%d 处"
+              % (chunks, reset, pmcopy))
+    ev.append("磁盘/光盘/失败三类 [LM] 打点：disk=%d、cd=%d、FAILED=%d（FAILED 必须存在：不许静默失败）"
+              % (tags, cdtag, grep_count(r"\[LM\] int13 read FAILED", ["boot/loader64.asm"])))
+    ev.append("驱动器号来自固件 DL（不是猜 0x80）：boot.asm 显式透传 + loader 读取 = %d 处" % dlpass)
+    ev.append("实测：tests/disk_boot_test.py —— 先用 AHCI 装到 SATA 盘，再**只挂 AHCI** 启动 -> "
+              "\"[LM] disk boot via INT 13h dl=0x80\" / \"[OS] booted from installed disk\" / \"[GUI64] ready\"；"
+              "截断盘的失败路径 -> \"[LM] int13 read FAILED ah=0x0C …\" 后停机")
+    ok = (ah42 >= 1 and dap >= 4 and kseg >= 2 and chunks >= 3 and pmcopy >= 1 and tags >= 3 and dlpass >= 1)
+    return ("DONE" if ok else "PARTIAL"), ev
 
 
 def cap_boot_uefi():
@@ -867,7 +903,8 @@ CAPS = [
     ("内核", "全 64 位约束（16/32 位只在引导必经阶段）", cap_abi64),
     ("引导", "BIOS 光盘引导（El Torito + ATAPI）", cap_boot_bios_cd),
     ("引导", "U 盘 hybrid 引导（ISO 第 0 扇区 MBR）", cap_boot_hybrid_usb),
-    ("引导", "裸盘/硬盘引导（MBR → loader64 → ATA）", cap_boot_hdd),
+    ("引导", "裸盘/硬盘引导（MBR → loader64 → BIOS INT 13h 读内核）", cap_boot_hdd),
+    ("引导", "★ 引导层 INT 13h 读盘（SATA/AHCI、任意 BIOS 可见盘可直启；失败打点停机）", cap_boot_int13),
     ("引导", "UEFI 引导（两段式 PE + 平铺长模式）", cap_boot_uefi),
     ("存储", "现代分区表 GPT", cap_gpt_part),
     ("安装", "Win10 风格安装界面（步骤齐全、无密钥）", cap_installer_ui),
@@ -899,7 +936,9 @@ TESTS = [
     ("boot64_assert.py", "M0/M1：长模式/IDT/PIT/BootInfo"),
     ("ahci64_test.py", "★ item 5a：AHCI(SATA) 控制器/端口/签名 + 屏幕硬件检查报告（打点 + 像素）"),
     ("mouse_parse_test.py", "PS/2 鼠标解码 + 位移限速（纯 Python 复放）"),
-    ("install_flow_test.py", "端到端安装 + 装完单独启动"),
+    ("ahci64_test.py", "★ item 5a：AHCI(SATA) 控制器/端口/签名 + 屏幕硬件检查报告（打点 + 像素）"),
+    ("disk_boot_test.py", "★ 引导层改 BIOS INT 13h 读盘：只挂 AHCI 的装好盘直启进桌面 + 截断盘失败路径打点停机"),
+    ("install_flow_test.py", "端到端安装 + 装完单独启动（引导层走 BIOS INT 13h）"),
     ("partition_ops_test.py", "新建/格式化/删除 真实写盘"),
     ("screen64_probe.py", "安装界面像素验收"),
     ("iso64_install_test.py", "ISO 光盘引导端到端"),

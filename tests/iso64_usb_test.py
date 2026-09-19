@@ -261,6 +261,10 @@ def main():
     check("走的是硬盘分支（unreal mode）", "I:hdd mode (USB/disk)" in log)
     check("桩读 loader64 并跳转", "I:jump loader64" in log)
     check("loader64 认出 RAM 介质（桩已搬好内核/载荷）", "L:media=ram" in log)
+    # ★ 新增：RAM 源（描述符 kind=2）下 loader 不该再自己去读盘 ——
+    #   磁盘 INT 13h 分支与光盘 ATAPI 分支都不该被走到
+    check("RAM 源没有误入磁盘 INT 13h 分支", "[LM] disk boot via INT 13h" not in log)
+    check("RAM 源没有误入光盘 ATAPI 分支", "[LM] cd boot via ATAPI" not in log)
     check("进入长模式（K 标记）", "[LM64] ENTERED LONG MODE" in log)
     check("安装程序读到介质描述符 kind=2", "[SETUP] 介质描述符 OK kind=2" in log)
     check("载荷走 RAM 源（不再读介质）", "[INSTALL] 介质源 kind=2" in log)
