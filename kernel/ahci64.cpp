@@ -36,6 +36,25 @@
 //   G) 命令表必须 128 字节对齐，PRDT 从表内偏移 0x80 起；PRDT 的 DBC 字段是"字节数-1"。
 //   H) CFIS 是 20 字节的 H2D Register FIS：命令头 CFL 写 5（dwords），flags.C=1 才更新命令寄存器。
 //   I) 每块盘一份命令列表/FIS/命令表（不共用）：共用时一旦两个端口并发就会互相踩。
+//   J) ★★ **命令头布局写错 = 命令永远不执行**（item 5b 定位到的硬缺口根因，寄存器证据齐全）：
+//       AHCI 命令头 32B 的正确布局 ——
+//         DW0 bits[4:0]=CFL(5) bit5=A bit6=W bit7=P bit8=R bit9=B bits[12:11]=PMP
+//             **bits[31:16] = PRDTL（PRDT 项数）**；
+//         DW1 = PRDBC（HBA 完成后回填，软件必须写 0）；
+//         DW2/DW3 = CTBA/CTBAU（命令表物理地址，128B 对齐）；DW4..DW7 保留。
+//       旧代码把 PRDTL 写到 DW1、把 CTBA 写到 DW3/DW4（DW2 留 0），于是 HBA 读出的命令表
+//       地址 = `0x08010500_00000000`（拿 DW2 当低 32 位、DW3 当高 32 位）→ DMA 映射失败 →
+//       **整条命令被静默丢掉**：PxCI 一直挂着、PxIS/PxTFD 一动不动、`-trace ahci_*` 里连一个
+//       命令事件都没有（现场：`ci=0x1 is=0x0 tfd=0x130`，端口 SIG/DET 都正常）。
+//       定位手段（可复现）：`-trace enable=ahci_*,handle_cmd_*`（★ 那些"命令被跳过"的
+//       事件名是 `handle_cmd_*`，只开 `ahci_*` 会把它们全部滤掉！）+ 反汇编
+//       `qemu-system-x86_64.exe`（AHCI 读命令表地址的代码就是 `mov 0x8(%rax),%rdx` 后
+//       dma map 0x80 字节再查 FIS type==0x27）+ 用 gdb 附到 QEMU 进程核对 AHCIDevice 里
+//       `lst`/`cmd`/`cmd_issue` 的真值（当时三个都是"该有的值"，所以问题只能在命令头里）。
+//   K) ★ PRDT 项（16B）的字段偏移：+0x00 DBA、+0x04 DBAU、+0x08 **保留**、+0x0C DBC
+//       （bits[21:0] = 字节数-1，bit31 = I）。DBC 写到 +0x08 是错的（那是保留 DWORD）：
+//       QEMU 在 ahci_populate_sglist 里读的是 `lea 0xc(%rax),%rcx` + `and $0x3fffff,%edx`，
+//       写错位置等于 DMA 长度 0，命令即使被受理也搬不动数据。
 #include "ahci64.h"
 #include "debug64.h"
 #include "hwinfo64.h"      // 识别结果填进 hwinfo64 的磁盘表（任务管理器/设置页读它）
@@ -277,6 +296,63 @@ static void ahci_build_cfis(uint8_t* cfis, uint8_t cmd, uint64_t lba, uint32_t c
     cfis[15] = 0;                           // control
 }
 
+// ---- 诊断打点：端口寄存器快照（启动前后 / 发命令前后各一份）----
+// 为什么留着：PxCI 挂着不动时，这 5 个寄存器就是"命令到底有没有进 HBA"的唯一旁证
+//（cmd 里有 ST/FRE，tfd 里有 BSY/DRQ/ERR/DF，ssts 里有 DET/IPM，is 里有 DHRS，
+//  serr 里有接口错误）—— 排 AHCI 问题基本全靠这一行 + trace。见踩坑 J/K。
+static void ahci_dump_regs64(const char* tag, uint8_t p) {
+    dbg64_line_begin64();
+    dbg64_str("[AHCI64] regs("); dbg64_str(tag); dbg64_str(") port="); dbg64_dec(p);
+    dbg64_str(" cmd=0x");  dbg64_hex64(prd(p, P_CMD));
+    dbg64_str(" tfd=0x");  dbg64_hex64(prd(p, P_TFD));
+    dbg64_str(" ssts=0x"); dbg64_hex64(prd(p, P_SSTS));
+    dbg64_str(" is=0x");   dbg64_hex64(prd(p, P_IS));
+    dbg64_str(" serr=0x"); dbg64_hex64(prd(p, P_SERR));
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// ---- 诊断打点：命令头 DW0..DW7 + PRDT 逐项（只打第一条命令，避免刷屏）----
+// 这条打点就是这次定位"命令不执行"的关键：把 DW0..DW7 摆出来才能看出
+// PRDTL 有没有放进 DW0 的 bits[31:16]、CTBA 有没有放进 DW2/DW3。
+static void ahci_dump_hdr64(uint8_t p, const volatile uint32_t* hdr, const uint8_t* ct, int nprd) {
+    dbg64_line_begin64();
+    dbg64_str("[AHCI64] hdr port="); dbg64_dec(p);
+    dbg64_str(" cfl=");   dbg64_dec(hdr[0] & 0x1Fu);
+    dbg64_str(" a=");     dbg64_dec((hdr[0] >> 5) & 1u);
+    dbg64_str(" w=");     dbg64_dec((hdr[0] >> 6) & 1u);
+    dbg64_str(" p=");     dbg64_dec((hdr[0] >> 7) & 1u);
+    dbg64_str(" r=");     dbg64_dec((hdr[0] >> 8) & 1u);      // R（Device Reset）必须是 0
+    dbg64_str(" b=");     dbg64_dec((hdr[0] >> 9) & 1u);
+    dbg64_str(" pmp=");   dbg64_dec((hdr[0] >> 11) & 0xFu);
+    dbg64_str(" prdtl="); dbg64_dec(hdr[0] >> 16);            // 规范：PRDTL 在 DW0 的 bits[31:16]
+    dbg64_str(" dw0=0x"); dbg64_hex64(hdr[0]);
+    dbg64_str(" dw1=0x"); dbg64_hex64(hdr[1]);                // PRDBC（HBA 回填，软件写 0）
+    dbg64_str(" dw2=0x"); dbg64_hex64(hdr[2]);                // CTBA 低 32 位
+    dbg64_str(" dw3=0x"); dbg64_hex64(hdr[3]);                // CTBAU
+    dbg64_str(" ctba=0x");
+    dbg64_hex64((uint64_t)hdr[2] | ((uint64_t)hdr[3] << 32));
+    dbg64_nl();
+    dbg64_line_end64();
+
+    for (int i = 0; i < nprd; i++) {
+        const uint8_t* pe = ct + 0x80 + i * 16;
+        const uint64_t dba   = *(const volatile uint64_t*)(const void*)pe;
+        const uint32_t dbcdw = *(const volatile uint32_t*)(const void*)(pe + 12);
+        dbg64_line_begin64();
+        dbg64_str("[AHCI64] prdt"); dbg64_dec((uint64_t)i);
+        dbg64_str(" dba=0x");  dbg64_hex64(dba);
+        dbg64_str(" dbc=0x");  dbg64_hex64(dbcdw & 0x3FFFFFu);
+        dbg64_str(" bytes=");  dbg64_dec((uint64_t)(dbcdw & 0x3FFFFFu) + 1u);
+        dbg64_str(" i=");      dbg64_dec((dbcdw >> 31) & 1u);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+}
+
+// 命令头/PRDT/寄存器诊断只打一次（第一条命令），之后不再刷屏
+static uint8_t g_hdr_dumped = 0;
+
 // 下发一条命令并轮询完成。返回 true = 成功（PxCI 清零 + 无错误位）。
 static bool ahci_cmd(int di, uint8_t cmd, uint64_t lba, uint32_t count,
                      const Ahci64Prd* prds, int nprd, bool write, bool atapi_cmd) {
@@ -287,30 +363,45 @@ static bool ahci_cmd(int di, uint8_t cmd, uint64_t lba, uint32_t count,
     if (!(prd(p, P_CMD) & CMD_ST)) return false;
     // 上一条命令必须已经结束（PxCI slot0 清零）；给 10 tick 的宽限
     if (!ahci_wait(p, P_CI, 1u, 0u, 10)) return false;
-
+    const bool dump_first = (g_hdr_dumped == 0);                 // 只给第一条命令做逐字段打点
     // ---- 命令表（CFIS/ACMD/PRDT）----
     uint8_t* ct = d.ct;
     ahci_build_cfis(ct, cmd, lba, count);
     for (int i = 0x40; i < 0x80; i++) ct[i] = 0;                 // ACMD（本驱动不用 PACKET 命令）
     for (int i = 0; i < nprd; i++) {
         uint8_t* pe = ct + 0x80 + i * 16;
-        *(volatile uint64_t*)(void*)pe       = prds[i].pa;       // DBA
-        *(volatile uint32_t*)(void*)(pe + 8) = (prds[i].bytes - 1u) & 0x3FFFFFu;  // DBC = 字节数-1
-        *(volatile uint32_t*)(void*)(pe + 12) = 0;               // 保留
+        // PRDT 项（16B）：+0x00 DBA、+0x04 DBAU、+0x08 **保留**、+0x0C DBC（bits[21:0] = 字节数-1，
+        // bit31 = I）。★ 踩坑 K：DBC 在 **+0x0C**，**不是** +0x08（+0x08 是保留 DWORD）。
+        *(volatile uint64_t*)(void*)pe       = prds[i].pa;       // DBA / DBAU
+        *(volatile uint32_t*)(void*)(pe + 8) = 0;                // 保留（写 0）
+        *(volatile uint32_t*)(void*)(pe + 12) =
+              ((prds[i].bytes - 1u) & 0x3FFFFFu)                 // DBC = 字节数 - 1
+            | ((i == nprd - 1) ? 0x80000000u : 0u);              // 末项 I=1（完成中断；本驱动不用中断）
     }
 
     // ---- 命令头（命令列表 slot 0，32 字节）----
+    // ★ 踩坑 J（AHCI 命令头的正确布局，写错这里 HBA 会**静默丢弃**整条命令）：
+    //   DW0 bits[4:0]=CFL(5) bit5=A bit6=W bit7=P bit8=R bit9=B bits[12:11]=PMP
+    //       并且 **bits[31:16] = PRDTL（PRDT 项数）**；
+    //   DW1 = PRDBC（HBA 完成后回填，软件写 0）；
+    //   DW2/DW3 = CTBA/CTBAU（命令表物理地址，128B 对齐）；DW4..DW7 = 保留。
     const uint64_t ct_pa = (uint64_t)(uintptr_t)ct;
     volatile uint32_t* hdr = (volatile uint32_t*)(void*)d.cl;
     hdr[0] = (5u & 0x1Fu)                                        // CFL = 5 dwords（20B 的 H2D FIS）
            | (atapi_cmd ? (1u << 5) : 0u)                        // A（ATAPI 命令；IDENTIFY PACKET DEVICE 不是）
-           | (write ? (1u << 6) : 0u);                           // W
-    hdr[1] = (uint32_t)nprd & 0xFFFFu;                            // PRDTL
-    hdr[2] = 0;                                                   // PRDBC（HBA 回填）
-    hdr[3] = (uint32_t)(ct_pa & 0xFFFFFFFFu);                     // CTBA（128B 对齐由分配保证）
-    hdr[4] = (uint32_t)(ct_pa >> 32);
-    hdr[5] = 0; hdr[6] = 0; hdr[7] = 0;
+           | (write ? (1u << 6) : 0u)                            // W
+           | ((uint32_t)nprd << 16);                             // PRDTL（DW0 的 bits[31:16]，**不是** DW1）
+    hdr[1] = 0;                                                   // PRDBC（HBA 回填）
+    hdr[2] = (uint32_t)(ct_pa & 0xFFFFFFFFu);                     // CTBA（DW2；128B 对齐由分配保证）
+    hdr[3] = (uint32_t)(ct_pa >> 32);                             // CTBAU（DW3）
+    hdr[4] = 0; hdr[5] = 0; hdr[6] = 0; hdr[7] = 0;
     __asm__ volatile("" ::: "memory");
+
+    // ---- 诊断：命令头/PRDT 逐字段 + 发命令前的端口寄存器快照（自检/真机排障用，只第一条命令）----
+    if (dump_first) {
+        ahci_dump_hdr64(p, hdr, ct, nprd);
+        ahci_dump_regs64("pre", p);
+    }
 
     // ---- 清状态位、发命令 ----
     // 只清 DHRS 一位（见踩坑 C：**不要**写 0xFFFFFFFF）。
@@ -320,6 +411,10 @@ static bool ahci_cmd(int di, uint8_t cmd, uint64_t lba, uint32_t count,
     const bool done = ahci_wait(p, P_CI, 1u, 0u, AHCI64_CMD_TICKS);
     const uint32_t is  = prd(p, P_IS);
     const uint32_t tfd = prd(p, P_TFD);
+    if (dump_first) {                                            // 发命令后的寄存器快照（含 DHRS 完成位）
+        ahci_dump_regs64("post", p);
+        g_hdr_dumped = 1;
+    }
     prw(p, P_IS, IS_DHRS);                                        // 收尾：别把完成位留给下一条
 
     if (!done) {

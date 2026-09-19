@@ -14,11 +14,14 @@
      + 安装程序枚举到这块 SATA 盘：[DISK] 8 ... bus=AHCI
      + 全程无 PANIC / TRIPLE FAULT / FAILED mask=
   3) `--strict-dma`：额外要求"AHCI DMA 通路可用"的证据
-        [AHCI64] selftest PASS + [AHCI64] drive 8 model=... sectors=...
-     ★ 这一档在 QEMU 11.1 的 ich9-ahci 上**目前是 FAIL**（见文件末尾"已知缺口"）：
-       控制器/端口/签名都识别到了，但写 PxCI 之后 HBA 不执行命令
-       （PxCI 挂着、PxIS/PxTFD 不动、QEMU trace 里连一个命令事件都没有）。
-       真机/VMware 的 SATA 是 AHCI，需要在那里复验 —— docs/真机验证指南.md 有步骤。
+       [AHCI64] selftest PASS + [AHCI64] drive 8 model=... sectors=...
+       + [AHCI64] read lba=0 count=1 ok（命令真的被 HBA 执行并搬了数据）
+       + [AHCI64] port=0 det=3 sig=0x...101 kind=ata
+     ★ item 5b 起这一档在 QEMU 11.1 的 ich9-ahci 上是 **PASS**（此前 FAIL 的根因是
+       命令头布局写错：PRDTL 应在 DW0 的 bits[31:16]、CTBA/CTBAU 应在 DW2/DW3；
+       旧代码把 CTBA 放 DW3 → HBA 读出的命令表地址错 → 命令被**静默丢弃**。
+       详见 kernel/ahci64.cpp 顶部"实测踩坑记录" J/K 两条）。
+     真机/VMware 的 SATA 也是 AHCI，建议在那里复验 —— docs/真机验证指南.md 有步骤。
 
 退出码：0 全部通过 / 1 有断言失败 / 2 环境问题
 """
@@ -98,6 +101,10 @@ class Monitor:
             time.sleep(0.3)
         return False
 
+    def key(self, name, wait=1.2):
+        """注入一个按键（sendkey），wait = 注入后等多久（给向导重绘留时间）。"""
+        self.send("sendkey %s" % name, wait=wait)
+
 
 def read_ppm(path):
     """读 P6 PPM（QEMU screendump 输出），返回 (w, h, pixels)。"""
@@ -135,7 +142,9 @@ def main():
     ap.add_argument("--target", default=os.path.join(ROOT, "target-ahci.png.img"))
     ap.add_argument("--shot", default=os.path.join(ROOT, "ahci_report.ppm"))
     ap.add_argument("--strict-dma", action="store_true",
-                    help="额外要求 AHCI DMA 通路证据（QEMU 11.1 ich9-ahci 上目前会 FAIL，见文件顶部说明）")
+                    help="额外要求 AHCI DMA 通路证据（selftest PASS / drive 8 / read lba=0 ok / kind=ata）")
+    ap.add_argument("--sata-install", action="store_true",
+                    help="额外在 SATA 盘上走完整安装流程，再把装好的盘启一次进桌面（[OS]/[GUI64]）")
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
 
@@ -209,6 +218,27 @@ def main():
             log = read_log()
             if "[SETUP] 磁盘枚举完成" in log or "磁盘枚举完成" in log:
                 break
+
+        # ---- 可选：在**这块 SATA 盘**上跑完整安装流程（复用 install_flow_test 的按键序列）----
+        # 行布局（介质=驱动器 0 PATA、目标=驱动器 8 AHCI）：
+        #   row0 驱动器 0 标题 / row1 未分配空间(0) / row2 驱动器 8 AHCI 标题 / row3 未分配空间(8)
+        # ★ 向导的默认光标**已经**落在"非安装介质盘"的第一行（setup64.cpp:921），也就是 8 号盘，
+        #   所以不要再按方向键（按下去反而会飘到介质盘上）——直接 n 新建分区 + ret 开装。
+        if args.sata_install:
+            print("=== 2b) 在 SATA 盘上走完整安装流程（AHCI 写盘）===")
+            for key, what in (("ret", "语言 -> 现在安装"),
+                              ("ret", "现在安装 -> 许可"),
+                              ("ret", "许可 -> 安装类型"),
+                              ("ret", "安装类型 -> 磁盘与分区"),
+                              ("n", "在 8 号盘（AHCI，默认光标所在）上新建引导+主分区"),
+                              ("ret", "选中分区 -> 安装系统")):
+                print("     sendkey %-5s (%s)" % (key, what))
+                mon.key(key, wait=1.2)
+            for _ in range(240):                    # 最多 60s 等安装完成（每帧 128 扇区）
+                time.sleep(0.25)
+                if "[SETUP] 安装完成" in read_log() or "安装完成" in read_log():
+                    break
+            time.sleep(2.0)
         log = read_log()
     finally:
         if proc.poll() is None:
@@ -284,11 +314,87 @@ def main():
         check("安装程序看得见 SATA 盘（[DISK] 8 … bus=AHCI）",
               re.search(r"\[DISK\] 8 .*bus=AHCI", log) is not None,
               "; ".join([l for l in log.splitlines() if "[DISK]" in l])[:200])
+        # 型号里允许带空格（QEMU 的盘就叫 "QEMU HARDDISK"），所以用 .+? 而不是 \S+
         check("识别到 SATA 盘（[AHCI64] drive 8 model=… sectors=…）",
-              re.search(r"\[AHCI64\] drive 8 model=\S+ sectors=\d+", log) is not None,
+              re.search(r"\[AHCI64\] drive 8 model=.+? sectors=\d+", log) is not None,
               (re.search(r"\[AHCI64\] (drive 8|cmd timeout|selftest skipped)[^\r\n]*", log).group(0)
                if re.search(r"\[AHCI64\] (drive 8|cmd timeout|selftest skipped)", log) else "缺"))
+        check("SATA 盘上真的搬过数据（[AHCI64] read lba=0 count=1 ok）",
+              "[AHCI64] read lba=0 count=1 ok" in log,
+              (re.search(r"\[AHCI64\] (read|write) lba=[^\r\n]*", log).group(0)
+               if re.search(r"\[AHCI64\] (read|write) lba=", log) else "缺（命令没被执行/没搬数据）"))
+        check("端口摘要里 kind=ata（签名 + IDENTIFY 都过）",
+              re.search(r"\[AHCI64\] port=0 det=3 sig=0x0*101 kind=ata", log) is not None,
+              (re.search(r"\[AHCI64\] port=0[^\r\n]*", log).group(0)
+               if re.search(r"\[AHCI64\] port=0", log) else "缺"))
 
+    # ==== 8) 可选：SATA 盘上的完整安装 + 重启进桌面 ====
+    if args.sata_install:
+        print("=== 8) SATA 盘安装结果 + 重启进桌面 ===")
+        # (a) 目标镜像里必须有：MBR 签名 + 引导分区 + loader + 系统内核（和 install_flow_test 同一口径）
+        mbr_ok = load_ok = kernel_ok = False
+        try:
+            with open(args.target, "rb") as f:
+                sec = f.read(512)
+                mbr_ok = len(sec) == 512 and sec[510] == 0x55 and sec[511] == 0xAA and sec[446 + 4] != 0
+                f.seek(512)
+                load_ok = f.read(16) != b"\0" * 16
+                f.seek(9 * 512)
+                kernel_ok = f.read(2) == b"MZ" or f.read(1) != b""
+        except OSError:
+            pass
+        check("SATA 盘装好了：MBR 55AA + 分区表项非空", mbr_ok,
+              "target=%s" % args.target)
+        check("SATA 盘 LBA1 起有 loader", load_ok)
+        check("SATA 盘 LBA9 起有系统内容（内核）", kernel_ok)
+        check("安装过程在 8 号盘上建了分区（[PART] … drive=8）",
+              re.search(r"\[PART\][^\r\n]*drive=8", log) is not None,
+              "; ".join([l for l in log.splitlines() if "[PART]" in l])[:240])
+        check("安装真的走 AHCI 写盘（[AHCI64] write lba=… ok）",
+              "[AHCI64] write lba=" in log,
+              "; ".join([l for l in log.splitlines() if "[AHCI64] write" in l])[:240])
+        check("安装完成打点（[SETUP] 安装完成）", "安装完成" in log,
+              "; ".join([l for l in log.splitlines() if "[INSTALL]" in l])[:240])
+
+        # (b) 把装好的盘单独启一次：必须走"系统启动路径"并进桌面。
+        #     注：**引导器（boot/loader64.asm）自带的是 PATA PIO 读取**，所以这里按 IDE 盘挂载来验
+        #     "装好的系统盘能进桌面"；直接挂到 AHCI 上启动需要 AHCI 版 loader（本批不改 loader）。
+        boot_log = os.path.join(ROOT, "ahci_installed_boot.log")
+        if os.path.exists(boot_log):
+            os.remove(boot_log)
+        boot_args = [
+            qemu, "-name", "VimtuOS-ahci-installed",
+            "-drive", "format=raw,file=%s,index=0,media=disk" % q(args.target),
+            "-boot", "order=c", "-m", "512", "-vga", "std", "-display", "none",
+            "-serial", "file:%s" % q(boot_log),
+            "-no-reboot",
+        ]
+        bproc = subprocess.Popen(boot_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        booted = ""
+        try:
+            for _ in range(240):                    # 最多 60s 等进桌面
+                time.sleep(0.25)
+                try:
+                    with open(boot_log, "r", encoding="utf-8", errors="replace") as f:
+                        booted = f.read()
+                except FileNotFoundError:
+                    booted = ""
+                if "[GUI64] ready" in booted:
+                    break
+        finally:
+            if bproc.poll() is None:
+                bproc.kill()
+                try:
+                    bproc.wait(timeout=10)
+                except Exception:
+                    pass
+        check("从装好的盘启动走系统路径（[OS] booted from installed disk）",
+              "[OS] booted from installed disk" in booted,
+              (re.search(r"\[OS\][^\r\n]*", booted).group(0) if "[OS]" in booted else "缺"))
+        check("进到桌面（[GUI64] ready）", "[GUI64] ready" in booted,
+              (re.search(r"\[GUI64\][^\r\n]*", booted).group(0) if "[GUI64]" in booted else "缺"))
+        check("重启后不再跑安装程序（无 [SETUP] 向导打点）",
+              "[SETUP] 磁盘枚举完成" not in booted)
     tail = [l for l in log.splitlines() if l.strip() and ("AHCI64" in l or "HWUI" in l or "DISK" in l)][-14:]
     print("--- 串口尾部（AHCI64/HWUI/DISK）---")
     for l in tail:
