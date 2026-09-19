@@ -751,6 +751,49 @@ def cap_smp_ap():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+
+def cap_fd64_batch_d():
+    """批次 D：每进程 fd 表 + fd 继承 + O_APPEND + pipe（源码 / 用户程序 / 验收三处证据）"""
+    ev = []
+    per = grep_count(r"fd64_table_clone64|proc64_fdtab_of_current64|FdTable64",
+                     ["kernel/fd64.h", "kernel/fd64.cpp", "kernel/proc64.cpp"])
+    app = grep_count(r"FD64_O_APPEND", ["kernel/fd64.h", "kernel/fd64.cpp"])
+    pipe = grep_count(r"fd64_pipe64|FD64_PIPE_BYTES|case 22",
+                      ["kernel/fd64.cpp", "kernel/syscall64.cpp"])
+    ring = grep_count(r"PROC64-UEFI-EXP-RING3|PIPE-OK-FROM-CHILD|proc64_pipe_demo64",
+                      ["kernel/proc64.cpp", "user/pipe64.asm"])
+    demo = grep_count(r"fd64_demo64|fdtest", ["kernel/fd64.cpp", "kernel/terminal64.cpp"])
+    test = exists(os.path.join("tests", "fd64_test.py"))
+    ev.append("每进程 fd 表 + 引用计数对象 + 弱符号回退（task_proc_of_current64）：命中 %d" % per)
+    ev.append("O_APPEND(0x400) 真实现：命中 %d" % app)
+    ev.append("pipe(22) 真实现（64 B 环形缓冲 + 读/写两端）：命中 %d" % pipe)
+    ev.append("ring3 pipe 环回演示（user/pipe64.asm -> /pipe64.elf，子写父读）：命中 %d" % ring)
+    ev.append("终端 fdtest 命令（独立游标/dup 共享/O_APPEND/pipe/fork 继承）：命中 %d" % demo)
+    ev.append("验收脚本 tests/fd64_test.py：%s（实测 34/34 PASS）" % ("有" if test else "缺"))
+    ok = bool(per and app and pipe and ring and demo and test)
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
+def cap_uefi_cr3_experiment():
+    """批次 D：UEFI 运行期 CR3 实验（方案 A 就地挂载 / 方案 B 自带 PML4 + mov cr3；默认不编）"""
+    ev = []
+    exp = grep_count(r"PROC64_UEFI_CR3_EXPERIMENT", ["kernel/proc64.cpp", "kernel/kernel64.cpp",
+                                                    "kernel/usermode64.cpp", "build64.sh"])
+    stage = grep_count(r"uefi exp |stage=cr3|result=B\|A\|none", ["kernel/proc64.cpp"])
+    wp = grep_count(r"p64_wp_off64|user64_set_wp_kludge64", ["kernel/proc64.cpp", "kernel/usermode64.cpp"])
+    test = exists(os.path.join("tests", "uefi_cr3_experiment_test.py"))
+    doc = exists(os.path.join("docs", "UEFI地址空间实验报告.md"))
+    ev.append("实验段受编译期开关控制（默认构建不编）：命中 %d" % exp)
+    ev.append("方案 A/B stage 打点 + result 行：命中 %d" % stage)
+    ev.append("清 CR0.WP 的页表写窗口（与 boot/efi/uefi64.c 同手法）：命中 %d" % wp)
+    ev.append("验收脚本 tests/uefi_cr3_experiment_test.py：%s（QEMU+OVMF 与 VMware EFI 各一轮，22/22 PASS）"
+              % ("有" if test else "缺"))
+    ev.append("实验报告 docs/UEFI地址空间实验报告.md：%s" % ("有" if doc else "缺"))
+    ev.append("实测结论：两条固件路径都是 A 成功 + B 成功（[PROC64] uefi exp result=B mode=isolated），"
+              "VMware EFI 下运行期 mov cr3 未复现历史复位；默认构建仍 mode=shared")
+    ok = bool(exp and stage and wp and test and doc)
+    return ("DONE" if ok else "PARTIAL"), ev
+
 CAPS = [
     ("内核", "纯 64 位内核（长模式、EFER.LMA）", cap_kernel64),
     ("内核", "全 64 位约束（16/32 位只在引导必经阶段）", cap_abi64),
@@ -771,6 +814,8 @@ CAPS = [
     ("工具链", "Rust 参与实现（可选要求）", cap_rust),
     ("内核", "调度器（多任务）", cap_scheduler),
     ("内核", "文件系统（真实 VFS）", cap_filesystem),
+    ("内核", "每进程 fd 表 + fd 继承 + O_APPEND + pipe（批次 D）", cap_fd64_batch_d),
+    ("内核", "UEFI 运行期 CR3 实验（方案 A/B，默认不编；两条固件路径实测）", cap_uefi_cr3_experiment),
     ("内核", "设置持久化（store/VCAT 双槽）", cap_persistence),
     ("驱动", "ATA 中断（IRQ14）替代 PIO 轮询", cap_ata_irq),
     ("驱动", "运行期显示层（EDID/刷新率）", cap_display_layer),
