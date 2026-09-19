@@ -342,11 +342,14 @@ static void hwui_storage_lines(const HwPci& pci, int* out_disks, int* out_ctrl) 
 int hwui64_build64() {
     if (g_built) return g_line_count;
 
-    // 依赖项初始化（都幂等、都只读探测）：
-    //   ahci64_init64：报告要显示 AHCI 控制器/端口/盘（真机上没有这一步就只剩"没盘"）
-    //   display64_init64：刷新率/模式数（也是 [DISP64] 打点的来源；安装介质内核同样受益）
+    // 依赖项初始化（幂等、只读探测）：
+    //   ahci64_init64：报告要显示 AHCI 控制器/端口/盘（真机上没有这一步就只剩“没盘”）。
+    //   display64 的**探测不在这里跑**：它的 init 与打点由各自的启动路径
+    //     （kernel64.cpp 的 os_boot_path）统一调用，这里只**读**已探测结果；
+    //     没跑过就如实写 not-probed / 模式数用 BootInfo。
+    //     （踩坑：早先在这里调 display64_init64() 会让 [DISP64] mode list i=.. 打两遍，
+    //      display_runtime_test 的“逐条与汇总一致”断言就会挂。）
     ahci64_init64();
-    display64_init64();
 
     HwPci pci;
     hwui_pci_scan(&pci);
