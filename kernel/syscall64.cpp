@@ -14,15 +14,16 @@
 //
 //   号  名称               实现状态（★ 批次 C 之后；"真" / "部分" / "-ENOSYS"）
 //   ---- ----------------- ------------------------------------------------------------------
-//   0    read              真：fd=0（stdin）返回 0 = EOF（没有键盘输入流，如实）；fd>=3 从 open 缓存
-//                           的 512B 窗口按 offset 拷给用户；其它 fd → -EBADF。
-//   1    write             真：fd=1 → 串口 + 屏幕；fd=2 → 只串口；len 上限 4096；越界 -EFAULT。
-//   2    open              真：vfs64_stat 探存在性 → 分配 fd（3..6）→ 返回 fd；不存在 -ENOENT。
-//   3    close             真：释放 fd 槽 → 0；fd 非法 → -EBADF。
+//   0    read              真：fd=0（stdin）返回 0 = EOF（没有键盘输入流，如实）；fd>=3 走 kernel/fd64.cpp
+//                           的 FD 层（读整文件 + 按游标切片，单次最多 4096B）；其它 fd → -EBADF。
+//   1    write             真：fd=1 → 串口 + 屏幕；fd=2 → 只串口；fd>=3 → 真文件（fd64，写到游标处并
+//                           立刻整体落盘）；len 上限 4096；越界 -EFAULT。
+//   2    open              真：走 fd64（单层路径 /name；O_CREAT|O_TRUNC 支持）；不存在 -ENOENT。
+//   3    close             真：fd64_close64 释放 fd 槽 → 0；fd 非法/标准流 → -EBADF。
 //   4    stat              真（最小）：按路径走 vfs64_stat，填 144B struct stat；不存在 -ENOENT。
-//   5    fstat             真：fd 0/1/2 → 字符设备最小三字段；fd>=3 → 文件大小 + 只读 mode。
+//   5    fstat             真：fd 0/1/2 → 字符设备最小三字段；fd>=3 → fd64_stat64（文件大小/目录 mode）。
 //   6    lstat             **部分**：与 stat 同一实现（本文件系统没有符号链接，所以等价）。
-//   8    lseek             真：fd>=3 调整缓存窗口 offset；fd 0..2 → -ESPIPE。
+//   8    lseek             真：fd>=3 → fd64_lseek64（SET/CUR/END，游标 0..67584）；fd 0..2 → -ESPIPE。
 //   9    mmap              真（批次 C 起**每进程**）：进程内 bump 分配器（USER64_MMAP_VA64 起），
 //                           页 P|U|W|NX；MAP_FIXED 按调用方地址；空间不足 -ENOMEM（已映射的页回滚）。
 //                           没有进程上下文（任务 0 / 共享模式）时退回原来的共享窗口实现。
@@ -40,7 +41,7 @@
 //   21   access            真（最小）：存在性检查（本内核没有权限模型 → mode 忽略，如实注明）。
 //   22   pipe / pipe2      **-ENOSYS**：没有管道对象/fd 对（需要真设备层与 fd 继承；见"离 glibc 还差什么"）。
 //   24   sched_yield       真：task_yield64() 让出到下一个 tick；没有调度器时直接返回 0。
-//   32   dup               部分：只对"真实文件 fd"（3..6）复制（路径/游标/缓存）；其它 → -EBADF。
+//   32   dup               部分：只对 fd>=3 复制（fd64_dup64，路径/游标独立复制）；其它 → -EBADF。
 //   33   dup2              部分：目标 fd>=3 时覆盖；目标 <=2（重定向标准流）→ -ENOSYS。
 //   34   pause             **部分**：本内核不投递信号 -> 有界等待 1 秒后返回 -EINTR（绝不死等）。
 //   35   nanosleep         真：走调度器睡眠（有界 60 秒上限，防挂死）。
@@ -100,6 +101,10 @@
 //     一律 -ENOSYS、brk/mmap 退回共享窗口、启动期多进程演示跳过 —— 串口打印
 //     `[PROC64] cr3 isolation OFF ...` 如实标注，**绝不假装隔离成立**。
 //   * 信号：**只记录不投递**（rt_sigaction/rt_sigprocmask 只记录；kill 只有 KILL/TERM 的立即终止）。
+//   * 文件 fd（批次 B 起）：open/read/write/close/lseek/fstat/dup 全部走 kernel/fd64.cpp 的 **FD 层**
+//     （32 项，全局一张表、不按进程隔离）。底层是 vfs64（VimtuFS2 单层目录）：路径只有 "/name"、
+//     单文件 <= 67584B、没有权限/硬链接/子目录树；写是"整体覆盖 + 立刻落盘"（不做脏页缓存）。
+//     终端文件命令与 ring3 看到的是同一张表 —— 这是如实标注的边界，细节见 kernel/fd64.h。
 //   * glibc/发行版二进制**没有验证过**：PT_INTERP+动态链接器、完整 TLS/vDSO、真 futex、
 //     clone/线程、socket/网络 ABI、/proc 与 pty、uid/gid 权限模型大多不在这里。
 //     这里验证的是"自有静态 ELF64（ld.lld -static -nostdlib）能 load → ring3 → fork/execve/wait4 → exit"。
@@ -109,6 +114,7 @@
 #include "syscall64.h"
 #include "usermode64.h"     // user64_range_ok64 / user64_exit_to_kernel64 / 用户窗口常量
 #include "vfs64.h"          // Linux open/read 走真实文件系统
+#include "fd64.h"           // 批次 B：FD 层（open/read/write/close/lseek/fstat/dup 的公共底座）
 
 // ---- 批次 C：proc64（进程/地址空间）的**弱引用** ----
 // proc64.cpp 只在系统内核里链接（安装介质内核没有进程/地址空间、没有 task64/elf64）。
@@ -322,95 +328,62 @@ static int lx64_user_str64(uint64_t uva, char* out, uint32_t cap) {
     return -1;
 }
 
-// ---- fd 表：3..6 是 vfs64 里的真实文件（只读；缓存前 512B）----
-static const int      LX64_FD_TABLE   = 4;      // fd 3,4,5,6
-static const uint32_t LX64_FD_CACHE   = 512;    // 每个 fd 的读缓存上限（见文件头"已知边界"）
-static const uint32_t LX64_PATH_MAX   = 32;     // VFS64_NAME_MAX(27) + "/" + NUL
-struct LxFd64 {
-    uint8_t  used;
-    char     path[LX64_PATH_MAX];
-    uint32_t size;      // 文件实际大小
-    uint32_t off;       // 读游标
-    uint32_t cached;    // buf 里已缓存的字节数（<= LX64_FD_CACHE）
-    uint8_t  buf[LX64_FD_CACHE];
-};
-static LxFd64 g_lx_fd64[4];
-
-static int lx64_fd_slot64(uint64_t fd) {          // fd -> 槽下标；-1 = 非法/未打开
-    if (fd < 3 || fd >= 3u + (uint64_t)LX64_FD_TABLE) return -1;
-    const uint64_t i = fd - 3u;
-    if (!g_lx_fd64[i].used) return -1;
-    return (int)i;
-}
-static int lx64_fd_alloc64() {                    // 找空槽；-1 = 表满
-    for (int i = 0; i < LX64_FD_TABLE; i++) if (!g_lx_fd64[i].used) return i;
-    return -1;
-}
-// 首次读时把文件（最多 LX64_FD_CACHE 字节）读进缓存
-static int lx64_fd_load64(int slot) {
-    LxFd64* e = &g_lx_fd64[slot];
-    if (e->cached) return 0;
-    const int n = vfs64_read(e->path, e->buf, (int)LX64_FD_CACHE);
-    if (n < 0) return -1;
-    e->cached = (uint32_t)n;
-    return 0;
-}
-
-// ---- 0）read ----
+// ---- fd 表：交给 kernel/fd64.cpp 的 FD 层（32 项；路径单层、单文件 <= 67584 B）----
+// 本轮把这里原来那份"只读、缓存前 512B、只有 4 项"的内联小表整个删掉：
+//   * open/read/close/lseek/fstat/dup/fsync 全部转调 fd64_*；
+//   * 终端文件命令与 ring3 系统调用因此看到**同一张表**（如实边界见 fd64.h）；
+//   * 读不到 offset 原语的限制由 fd64 内部处理（它读整文件到自己的缓冲再切片）。
+static const uint32_t LX64_PATH_MAX = 32;       // VFS64_NAME_MAX(27) + "/" + NUL
+static const uint32_t LX64_READ_MAX = 4096;     // 单次 read 上限（fd64 内部读整文件，这里只限制拷贝量）
+// ring3 read 的内核 bounce（syscall 路径全程 IF=0：单 CPU 上不会被别的任务穿插）
+static uint8_t g_lx_readbuf64[LX64_READ_MAX];
+// ---- 0）read ----（fd >= 3 走 fd64；stdin 没有输入流 -> 立刻 EOF，如实）
 static int64_t lx64_read64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_t len) {
     if (len == 0) return 0;
     if (fd == 0) return 0;                                  // stdin：没有输入流 -> 立刻 EOF（如实）
-    const int slot = lx64_fd_slot64(fd);
-    if (slot < 0) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
-    if (len > LX64_FD_CACHE) len = LX64_FD_CACHE;
+    if (fd < 3) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
-    LxFd64* e = &g_lx_fd64[slot];
-    if (lx64_fd_load64(slot) != 0) return -LX64_EBADF;
-    if (e->off >= e->cached) return 0;                      // EOF
-    uint64_t n = e->cached - e->off;
-    if (n > len) n = len;
-    lx64_copy_to_user64(buf, e->buf + e->off, n);
-    e->off += (uint32_t)n;
+    if (len > LX64_READ_MAX) len = LX64_READ_MAX;
+    const int n = fd64_read64((int)fd, g_lx_readbuf64, (int)len);
+    if (n < 0) return (int64_t)n;                           // fd64 的负错误码 = -errno（同一口径）
+    if (n > 0) lx64_copy_to_user64(buf, g_lx_readbuf64, (uint64_t)n);
     return (int64_t)n;
 }
 
-// ---- 1）write ----
+// ---- 1）write ----（fd 1/2 = 串口/屏幕；fd >= 3 = 真文件，走 fd64）
 static int64_t lx64_write64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_t len) {
-    if (fd != 1 && fd != 2) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (fd == 1 || fd == 2) {
+        if (len == 0) return 0;
+        if (len > LX64_WRITE_MAX) { syscall64_deny64(nr, len); return -LX64_EINVAL; }
+        if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
+        const char* p = (const char*)(uintptr_t)buf;
+        for (uint64_t i = 0; i < len; i++) dbg64_putc(p[i]);
+        if (fd == 1) syscall64_screen_puts64(p, len);
+        return (int64_t)len;
+    }
+    if (fd < 3) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     if (len == 0) return 0;
     if (len > LX64_WRITE_MAX) { syscall64_deny64(nr, len); return -LX64_EINVAL; }
     if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
-    const char* p = (const char*)(uintptr_t)buf;
-    for (uint64_t i = 0; i < len; i++) dbg64_putc(p[i]);
-    if (fd == 1) syscall64_screen_puts64(p, len);
-    return (int64_t)len;
+    // 用户指针已经过范围校验、且当前 CR3 就是该进程的地址空间：fd64 直接按内核指针读它是安全的
+    const int n = fd64_write64((int)fd, (const void*)(uintptr_t)buf, (int)len);
+    return (int64_t)n;
 }
 
-// ---- 2 / 257）open / openat ----
-static int64_t lx64_open64(uint64_t nr, uint64_t path_va) {
+
+// ---- 2 / 257）open / openat ----（走 fd64；flags 按 Linux 子集原样映射，dirfd 仍然忽略）
+static int64_t lx64_open64(uint64_t nr, uint64_t path_va, uint64_t flags) {
     char path[LX64_PATH_MAX];
     if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(nr, path_va); return -LX64_EFAULT; }
     if (path[0] != '/') { syscall64_deny64(nr, path_va); return -LX64_EINVAL; }   // 阶段一只支持单层绝对路径
-    uint32_t type = 0, size = 0;
-    if (vfs64_stat(path, &type, &size) != 0 || type != VFS64_TYPE_FILE) return -LX64_ENOENT;
-    const int slot = lx64_fd_alloc64();
-    if (slot < 0) return -LX64_EMFILE;
-    LxFd64* e = &g_lx_fd64[slot];
-    e->used = 1;
-    e->size = size;
-    e->off = 0;
-    e->cached = 0;
-    for (uint32_t i = 0; i < LX64_PATH_MAX; i++) e->path[i] = path[i];
-    return (int64_t)(3 + slot);
+    const int fd = fd64_open64(path, (uint32_t)flags);
+    return (fd < 0) ? (int64_t)fd : (int64_t)fd;             // fd64 的负错误码 = -errno（同一口径）
 }
 
-// ---- 3）close ----
+// ---- 3）close ----（标准流没有内核对象：与旧行为一致 -> -EBADF）
 static int64_t lx64_close64(uint64_t nr, uint64_t fd) {
-    const int slot = lx64_fd_slot64(fd);
-    if (slot < 0) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
-    g_lx_fd64[slot].used = 0;
-    g_lx_fd64[slot].cached = 0;
-    g_lx_fd64[slot].off = 0;
+    const int r = fd64_close64((int)fd);
+    if (r != 0) { syscall64_deny64(nr, fd); return r; }
     return 0;
 }
 // ---- 5）fstat / 4）stat / 6）lstat（x86_64 的 struct stat = 144 字节，字段偏移见 Linux asm/stat.h）----
@@ -432,33 +405,23 @@ static void lx64_fill_stat64(uint8_t* st, uint32_t mode, uint64_t size) {
 static int64_t lx64_fstat64(uint64_t nr, uint64_t fd, uint64_t st_va) {
     if (!user64_range_ok64(st_va, 144)) { syscall64_deny64(nr, st_va); return -LX64_EFAULT; }
     uint8_t st[144];
-    const int slot = lx64_fd_slot64(fd);
     if (fd <= 2) {
         lx64_fill_stat64(st, LX64_S_IFCHR | 0666u, 0);      // 标准流：最小三字段（mode/nlink/size）
-    } else if (slot >= 0) {
-        lx64_fill_stat64(st, LX64_S_IFREG | 0444u, g_lx_fd64[slot].size);
     } else {
-        syscall64_deny64(nr, fd);
-        return -LX64_EBADF;
+        uint32_t ty = 0, sz = 0;
+        const int r = fd64_stat64((int)fd, &ty, &sz);
+        if (r != 0) { syscall64_deny64(nr, fd); return r; }
+        lx64_fill_stat64(st, (ty == VFS64_TYPE_DIR) ? (LX64_S_IFDIR | 0755u) : (LX64_S_IFREG | 0444u), sz);
     }
     lx64_copy_to_user64(st_va, st, 144);
     return 0;
 }
 
-// ---- 8）lseek ----
+// ---- 8）lseek ----（fd >= 3 走 fd64；标准流 -> -ESPIPE）
 static int64_t lx64_lseek64(uint64_t nr, uint64_t fd, int64_t off, uint64_t whence) {
-    const int slot = lx64_fd_slot64(fd);
-    if (slot < 0) { syscall64_deny64(nr, fd); return -LX64_ESPIPE; }
-    LxFd64* e = &g_lx_fd64[slot];
-    int64_t base = 0;
-    if (whence == 0) base = 0;                                        // SEEK_SET
-    else if (whence == 1) base = (int64_t)e->off;                     // SEEK_CUR
-    else if (whence == 2) base = (int64_t)(e->cached ? e->cached : e->size);   // SEEK_END（缓存窗口内）
-    else return -LX64_EINVAL;
-    const int64_t nv = base + off;
-    if (nv < 0 || nv > (int64_t)e->size) return -LX64_EINVAL;
-    e->off = (uint32_t)nv;
-    return nv;
+    const int64_t r = fd64_lseek64((int)fd, off, (int)whence);
+    if (r < 0) { syscall64_deny64(nr, fd); return r; }
+    return r;
 }
 
 // ---- 9）mmap：用户窗口内的 bump 分配器 ----
@@ -893,29 +856,19 @@ static int64_t lx64_getrandom64(uint64_t nr, uint64_t buf, uint64_t len, uint64_
     return (int64_t)len;
 }
 
-// ---- 32/33）dup / dup2 / 74）fsync：只对"真实文件 fd"（3..6）有意义 ----
+// ---- 32/33）dup / dup2 / 74）fsync：只对"真实文件 fd"（>= 3）有意义，全部走 fd64 ----
 static int64_t lx64_dup64(uint64_t fd) {
-    const int slot = lx64_fd_slot64(fd);
-    if (slot < 0) return -LX64_EBADF;
-    const int ns = lx64_fd_alloc64();
-    if (ns < 0) return -LX64_EMFILE;
-    g_lx_fd64[ns] = g_lx_fd64[slot];                     // 复制路径/游标/缓存（独立游标：如实标注非共享）
-    return (int64_t)(3 + ns);
+    const int nf = fd64_dup64((int)fd, -1);              // -1 = 自动分配新槽
+    return (int64_t)nf;
 }
 static int64_t lx64_dup2_64(uint64_t oldfd, uint64_t newfd) {
-    const int os = lx64_fd_slot64(oldfd);
-    if (os < 0) return -LX64_EBADF;
-    if (newfd == oldfd) return (int64_t)newfd;
     if (newfd <= 2) return -LX64_ENOSYS;                 // 重定向 stdin/stdout/stderr 需要真设备层：如实 -ENOSYS
-    if (newfd >= 3u + (uint64_t)LX64_FD_TABLE) return -LX64_EBADF;
-    g_lx_fd64[newfd - 3u] = g_lx_fd64[os];
-    return (int64_t)newfd;
+    const int nf = fd64_dup64((int)oldfd, (int)newfd);
+    return (int64_t)nf;
 }
 static int64_t lx64_fsync64(uint64_t fd) {
     if (fd <= 2) return 0;                               // 标准流是虚拟的：无脏页
-    const int slot = lx64_fd_slot64(fd);
-    if (slot < 0) return -LX64_EBADF;
-    return 0;                                            // 本内核的 fd 只有"只读缓存"，没有写路径 -> 无脏数据
+    return (int64_t)fd64_fsync64((int)fd);               // 写路径即时落盘 -> 无脏页
 }
 // ★ 批次 C 起不再只是"存进内核变量"：glibc 的 TLS 完全依赖 FS.base 真的生效
 //   （__thread / errno / stack canary 都从 FS 取）。写入策略：
@@ -951,7 +904,7 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     switch (nr) {
     case 0:   return lx64_read64(nr, a1, a2, a3);
     case 1:   return lx64_write64(nr, a1, a2, a3);
-    case 2:   return lx64_open64(nr, a1);
+    case 2:   return lx64_open64(nr, a1, a2);                       // open(path, flags, mode)
     case 3:   return lx64_close64(nr, a1);
     case 4:   return lx64_stat_path64(nr, a1, a2);                 // stat：按路径（最小实现）
     case 5:   return lx64_fstat64(nr, a1, a2);
@@ -998,7 +951,7 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 160: return lx64_setrlimit64(nr, a1, a2);
     case 218: return 0;                                             // set_tid_address（没有 clear_child_tid 唤醒）
     case 228: return lx64_clock_gettime64(nr, a1, a2);
-    case 257: return lx64_open64(nr, a2);                           // openat(dirfd, path, flags, mode)
+    case 257: return lx64_open64(nr, a2, a3);                       // openat(dirfd, path, flags, mode)
     case 318: return lx64_getrandom64(nr, a1, a2, a3);               // 伪随机（非密码学安全，如实标注）
     default:
         break;
@@ -1084,8 +1037,28 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
         ret = syscall64_sleep64((uint32_t)a1);
         break;
 
-    case 6: case 7: case 8:                                     // open/read/close：未实现
-        ret = -1;                                               // 需要挂载卷，见 syscall64.h 说明
+    case 6: {                                                   // open(path)：本轮接真 FD 层（只读）
+        char path[LX64_PATH_MAX];
+        if (lx64_user_str64(a1, path, LX64_PATH_MAX) != 0) { ret = -1; break; }
+        const int f = fd64_open64(path, 0);
+        ret = (f < 0) ? -1 : (int64_t)f;
+        break;
+    }
+
+    case 7: {                                                   // read(fd, buf, len)
+        if (a1 < 3 || a3 == 0) { ret = (a1 < 3) ? -1 : 0; break; }
+        uint64_t len = a3;
+        if (len > LX64_READ_MAX) len = LX64_READ_MAX;
+        if (!user64_range_ok64(a2, len)) { ret = -1; break; }
+        const int n = fd64_read64((int)a1, g_lx_readbuf64, (int)len);
+        if (n < 0) { ret = -1; break; }
+        if (n > 0) lx64_copy_to_user64(a2, g_lx_readbuf64, (uint64_t)n);
+        ret = n;
+        break;
+    }
+
+    case 8:                                                     // close(fd)
+        ret = (fd64_close64((int)a1) == 0) ? 0 : -1;
         break;
 
     default:

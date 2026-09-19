@@ -104,6 +104,11 @@ int  task64_set_slice64(uint32_t id, uint32_t ticks);   // 每任务时间片（
 int  task64_find_by_name64(const char* name);           // 返回任务 id（只扫非 FREE 槽）；-1 = 找不到
 int  task64_force_remove64(uint32_t id);                // 强制摘除+回收；见实现里的返回码注释
 int  task64_mark_critical64(uint32_t id, int critical); // 0 = 已设置；-1 = 无此 id
+// 批次 B：把某任务标成"安静"（create/exit/reap 都不打日志），语义 = task_create64 内部 quiet 参数。
+// 唯一用途 = "ring3 槽位复用"回归自检（kernel64.cpp）：它要连续 4 轮建/杀 ring3 进程，若照常打
+//   [TASK64] reap 行，会打破 sched_stress_test 的既有断言"[TASK64] reap 行 <= 4"（那条断言在核验
+//   压力路径的安静性，不该被回归自检影响）。返回 0 = 已设置；-1 = 无此 id。
+int  task64_set_quiet64(uint32_t id, int quiet);
 void task64_diag64();                                   // 打印任务表诊断（一行一个槽 + 汇总）
 // 进程（proc64）视角的两个只读统计：以"该进程主任务绑定的 proc 指针"为键。
 //   用途 = 任务管理器进程页的线程数 / CPU‰；没有 proc 的内核线程返回 0。

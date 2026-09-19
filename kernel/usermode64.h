@@ -67,7 +67,17 @@ int user64_range_ok64(uint64_t va, uint64_t len);
 // 让 isr64_common 的出口 iretq 落到内核蹦床（见 usermode64.cpp 顶部说明）。
 // 返回 1 = 已改写（不会正常返回用户态）；0 = 当前不在 ring3（调用方按普通返回处理）。
 int user64_exit_to_kernel64(pt_regs64* r, uint64_t code);
-
+// ==================== 给 task64 用：任务槽位回收（批次 B 的缺陷根治）====================
+// 清掉**某个任务槽**的 ring3 状态：in_ring3 位 + 每任务保存区 g_user64_ctx64[slot]。
+// 为什么必须由回收/强杀路径调用（真缺陷，不是补丁）：ring3 进程被 kill（SIGKILL/SIGTERM）时
+//   不会从 user64_enter64 正常返回，"进 ring3 后清位"那三行根本没机会执行 —— 该槽的位就
+//   永远留着；复用该槽的新任务会在 user64_enter_frame64 的自检上失败（reason=2），症状是
+//   [USER64] enter FAILED reason=2。所以 task64 的 task_kill64 / task_drain_reap /
+//   task_exit64 / task64_force_remove64 都要调它（见 kernel/task64.cpp 的调用点）。
+// 打点：只在**确实清掉了脏位**时打一行，别的任务回收不打（避免刷屏）：
+//   [USER64] slot release slot=<n> in_ring3=1 -> cleared
+// 安装介质内核不链 task64.cpp，所以只有系统内核会调它；本函数本身两份内核都编得进去。
+extern "C" void user64_slot_release64(int slot);
 // ==================== 给 syscall64 / elf64 用的页级原语 ====================
 // 为什么导出这几个（而不是让加载器自己走页表）：页表走法（大页判断、中间层补 U/S、
 // CR3 重载）与"用户窗口"的定义都在 usermode64.cpp 里，重复实现两份迟早会漂。

@@ -55,8 +55,10 @@
 //   session（session64 会话策略）、restart --soft（优雅停止 + 硬复位链）、panic/bsod（受控蓝屏）。
 //   任务相关命令（ps/tasks/task/top/kill <id>）走内核任务表（kernel/task64.h 的对外 API），
 //   没有任何假数据：任务数为 0 时如实打印"无任务数据"。
-//   文件系统：本文件内仍有一个最小 ramfs（16 个文件 × 512 字节，RAM only）供 echo >/cat/ls 用；
-//   **真文件系统**是 VimtuFS2（kernel/vfs64.cpp，磁盘上的 /store.a|b、/hello.vap、/hello.elf 都在它上面）。
+//   文件系统：**真的文件系统**是 VimtuFS2（kernel/vfs64.cpp，磁盘上的 /store.a|b、/hello.vap、
+//   /hello.elf 都在它上面）。批次 B 起：ls/cat/write/touch/rm/mkdir/df/echo > 全部走 kernel/fd64.cpp
+//   的 FD 层（单层路径 "/name"、单文件 <= 67584 B、无子目录树、无权限；rm 不能删目录），
+//   原来那份 16x512B 的 RAM-only ramfs 已删除。
 //
 // 【约束】只允许整数运算（内核 -mno-sse，无 float/double）；不 include 标准头（无 STL/libc/printf），
 //   数字格式化 / 字符串比较 / UTF-8 解码全部是下面的 static 工具。
@@ -74,8 +76,11 @@
 #include "net64.h"     // 网络（e1000 + ARP/ICMP）：ping 命令走它的真路径
 // ---- 本轮接线（终端命令的真实现）----
 #include "hwinfo64.h"    // hw/hwinfo + lspci：CPU/PCI 真实枚举结果
+#include "edid64.h"      // display edid：引导期 EDID（0x7600）解析结果
 #include "ata64.h"       // disk/ata：ATA IDENTIFY（型号/容量；读取自带超时保护）
 #include "vfs64.h"       // disk：卷状态；user：盘上的 ring3 程序
+#include "fd64.h"        // 文件命令的 FD 层（32 项；单层路径 /name、单文件 <=67584B）
+#include "display64.h"   // display [modes|hz|edid]：模式清单 + 0x3DA 实测刷新率 + EDID 对比
 #include "usermode64.h"  // user/userprog：ring3 用户窗口地址与页映射查询
 #include "config64.h"    // cfg/config：类型化配置 + 存储位置（落在 store64 上）
 #include "session64.h"   // session：会话/应用内容策略的真实现
@@ -111,10 +116,9 @@
 #define TERM_CUR     rgb(0x00, 0xC0, 0x00)
 #define TERM_CURFG   rgb(0x00, 0x00, 0x00)
 
-// 终端内的最小 ramfs（64 位还没有真实文件系统：32 位的 vfs.cpp 未移植）
-#define RAMFS_FILES     16
-#define RAMFS_NAME_MAX  32
-#define RAMFS_DATA_MAX  512
+// 批次 B：终端文件命令**不再用 ramfs** —— 全部走 kernel/fd64.cpp 的 FD 层（底层 VimtuFS2）。
+// 限制（帮助里也如实写）：单层路径 "/name"、单文件 <= 67584 B、无子目录树、无权限；
+// rm 只能删文件（vfs64 没有删目录原语）；写文件是整体覆盖 + 立刻落盘。
 
 // ==================== 终端实例状态 ====================
 // 每窗口一份：一次 kmalloc = 结构 + 内容缓冲（cells 指向结构之后）
@@ -149,19 +153,10 @@ static char g_num[32];                 // 数字格式化
 static char g_cmd[64];                 // 命令解析：命令名
 static char g_arg1[128];               // 第 1 个参数
 static char g_arg2[192];               // 第 2 个参数
-static char g_pathbuf[RAMFS_NAME_MAX]; // 文件名（规范化后）
+static char g_pathbuf[FD64_PATH_MAX];  // 文件路径（规范化后的 "/name"）
 static char g_store_k[32];             // store 命令：key 缓冲（key 最长 31B + NUL）
 static char g_store_v[256];            // store 命令：value 缓冲（value 最长 255B + NUL）
 
-// ==================== 最小 ramfs ====================
-struct RamFile {
-    bool used;
-    char name[RAMFS_NAME_MAX];
-    int  size;
-    char data[RAMFS_DATA_MAX + 1];       // 末尾恒有 NUL，便于整串打印
-};
-static RamFile g_fs[RAMFS_FILES];
-static bool g_fs_ready = false;
 
 // ==================== 小工具（无 libc，全部自己写） ====================
 static bool is_ws(char c) { return c == ' ' || c == '\t'; }
@@ -547,109 +542,6 @@ static void ts_puts_pad(TerminalState* ts, const char* s, int width) {
     while (n < width) { ts_putc(ts, (uint32_t)' '); n++; }
 }
 
-// ==================== ramfs 实现（最小，RAM only） ====================
-// 平铺命名空间：去掉前导 '/'，只取第一个 token（"a.txt" == "/a.txt"）
-static void ramfs_norm(const char* in, char* out, int max) {
-    // 先把结果取到临时缓冲，再写 out：这样 in == out（自别名，例如 rm 里对 g_pathbuf 再规范化一次）
-    // 也安全 —— 旧写法先写 out[0] = 0，会把输入串自己清掉，导致 rm/touch 找不到文件。
-    char tmp[RAMFS_NAME_MAX];
-    int t = 0;
-    if (in) {
-        while (*in == '/' || is_ws(*in)) in++;
-        while (*in && !is_ws(*in) && t < RAMFS_NAME_MAX - 1) tmp[t++] = *in++;
-    }
-    tmp[t] = 0;
-    int o = 0;
-    if (out && max > 0) {
-        while (o < t && o < max - 1) { out[o] = tmp[o]; o++; }
-        out[o] = 0;
-    }
-}
-
-static int ramfs_find(const char* name) {
-    for (int i = 0; i < RAMFS_FILES; i++) {
-        if (g_fs[i].used && st_eq(g_fs[i].name, name)) return i;
-    }
-    return -1;
-}
-
-static int ramfs_used_files() {
-    int n = 0;
-    for (int i = 0; i < RAMFS_FILES; i++) if (g_fs[i].used) n++;
-    return n;
-}
-
-static int ramfs_used_bytes() {
-    int n = 0;
-    for (int i = 0; i < RAMFS_FILES; i++) if (g_fs[i].used) n += g_fs[i].size;
-    return n;
-}
-
-// 0 = ok；-1 = 没有空槽；-2 = 名字为空
-static int ramfs_write(const char* raw_name, const char* text, int len) {
-    ramfs_norm(raw_name, g_pathbuf, RAMFS_NAME_MAX);
-    if (!g_pathbuf[0]) return -2;
-    int idx = ramfs_find(g_pathbuf);
-    if (idx < 0) {
-        for (int i = 0; i < RAMFS_FILES; i++) {
-            if (!g_fs[i].used) { idx = i; g_fs[i].used = true; g_fs[i].name[0] = 0; break; }
-        }
-        if (idx < 0) return -1;
-        for (int i = 0; i < RAMFS_NAME_MAX; i++) g_fs[idx].name[i] = g_pathbuf[i];
-    }
-    if (len < 0) len = 0;
-    if (len > RAMFS_DATA_MAX) len = RAMFS_DATA_MAX;      // 上限 512 字节：按容量截断
-    for (int i = 0; i < len; i++) g_fs[idx].data[i] = text[i];
-    g_fs[idx].data[len] = 0;                             // 末尾 NUL（打印时整串用）
-    g_fs[idx].size = len;
-    return 0;
-}
-
-static int ramfs_create(const char* raw_name) {
-    ramfs_norm(raw_name, g_pathbuf, RAMFS_NAME_MAX);
-    if (!g_pathbuf[0]) return -2;
-    if (ramfs_find(g_pathbuf) >= 0) return 1;          // 已存在
-    for (int i = 0; i < RAMFS_FILES; i++) {
-        if (g_fs[i].used) continue;
-        g_fs[i].used = true;
-        for (int k = 0; k < RAMFS_NAME_MAX; k++) g_fs[i].name[k] = g_pathbuf[k];
-        g_fs[i].size = 0;
-        g_fs[i].data[0] = 0;
-        return 0;
-    }
-    return -1;                                          // 无空槽
-}
-
-// 0 = ok；-1 = 不存在
-static int ramfs_remove(const char* raw_name) {
-    ramfs_norm(raw_name, g_pathbuf, RAMFS_NAME_MAX);
-    if (!g_pathbuf[0]) return -1;
-    int idx = ramfs_find(g_pathbuf);
-    if (idx < 0) return -1;
-    g_fs[idx].used = false;
-    g_fs[idx].name[0] = 0;
-    g_fs[idx].size = 0;
-    g_fs[idx].data[0] = 0;
-    return 0;
-}
-
-// 首次使用时建两个说明文件（让 ls / cat 立刻有内容可看）
-static void ramfs_init_once() {
-    if (g_fs_ready) return;
-    g_fs_ready = true;
-    for (int i = 0; i < RAMFS_FILES; i++) {
-        g_fs[i].used = false;
-        g_fs[i].name[0] = 0;
-        g_fs[i].size = 0;
-        g_fs[i].data[0] = 0;
-    }
-    const char* readme =
-        "Vimtu64 ramfs: 16 slots x 512 bytes, RAM only (lost on reboot).\n"
-        "Try: ls / cat readme.txt / write a.txt hello / echo hi > a.txt\n";
-    ramfs_write("readme.txt", readme, st_len(readme));
-    const char* hello = "hello from VimtuOS 64-bit\n";
-    ramfs_write("hello.txt", hello, st_len(hello));
-}
 
 // ==================== 绘制 ====================
 // 一格：ASCII 走内建位图字体（自带底色），非 ASCII 走 TrueType（只有前景色，底色靠预填）
@@ -713,18 +605,20 @@ static const char* HELP_EN =
     "  mem, meminfo          memory (page pool / heap / owner)\n"
     "  ps, tasks, top        kernel task table (scheduler task64) + window counts\n"
     "  kill TASKID           terminate a kernel task (ids come from ps)\n"
-    "  run NAME|/PATH        load an app from VimtuFS2 and run it in ring3 (magic decides:\\n"
-    "                        VAP64 -> int 0x80 path, ELF64 -> syscall path; e.g. run hello.elf)\\n"
-    "  elfrun NAME|/PATH     force the ELF64 loader (syscall insn ABI), e.g. elfrun hello.elf\\n"
-    "  echo TEXT             print text (echo TEXT > FILE writes a file)\n"
-    "  write FILE TEXT       write file (<=512 bytes)\n"
-    "  cat FILE / ls         read file / list files\n"
-    "  touch FILE / rm FILE  create empty file / delete file\n"
+    "  run NAME|/PATH        load an app from VimtuFS2 and run it in ring3 (magic decides:\n"
+    "                        VAP64 -> int 0x80 path, ELF64 -> syscall path; e.g. run hello.elf)\n"
+    "  elfrun NAME|/PATH     force the ELF64 loader (syscall insn ABI), e.g. elfrun hello.elf\n"
+    "  echo TEXT             print text (echo TEXT > FILE writes a real file)\n"
+    "  write FILE TEXT       write a real file (overwrite; single file <= 67584 B; single-level /name)\n"
+    "  cat FILE / ls, dir    read file / list the VimtuFS2 root with sizes (real disk, not ramfs)\n"
+    "  touch FILE / rm FILE  create empty file / delete file (rm cannot delete directories)\n"
+    "  mkdir DIR / df        create a root directory / volume blocks & free (512B blocks, VimtuFS2)\n"
     "  date / time           RTC date / time\n"
     "  uptime                time since boot (ticks/250)\n"
     "  irq                   total interrupt count\n"
     "  perf                  GUI fps / busy% / irq / heap\n"
-    "  disp                  display info (real resolution / zoom)\n"
+    "  display [modes|hz|edid] runtime display layer: boot mode list (0x7400) / measured 0x3DA refresh\n"
+    "                        vs EDID preferred timing / EDID identity; 'disp' = the same summary\n"
     "  lang [zh|en]          switch Chinese / English\n"
     "  clear                 clear screen\n"
     "  about                 about VimtuOS\n"
@@ -745,15 +639,15 @@ static const char* HELP_EN =
     "  session               session policy (VOLATILE/PERSIST + per-app keep flags, persisted via config64)\n"
     "  disk, hw, lspci       ATA IDENTIFY (model/capacity) + VimtuFS2 volume; CPU/PCI; PCI device list\n"
     "  user [run]            ring3 status (window/VA/gates/on-disk programs); 'user run' launches /hello.vap\n"
-    "  panic <code>, bsod    controlled BSOD: blue screen + serial stop code, halts after 6s (no auto reboot)\\n"
-    "  update status         update subsystem: version / applied (store) / pending marker + done file\\n"
-    "  update pending <ver>  stage /update.pending (marker text ver=<ver>); applied at next boot\\n"
-    "  update apply          apply the marker now (store + /update.done) then soft-restart; NOT a real upgrade package\\n"
-    "  preload [run]         glyph prewarm + icon pre-scale stats (rdtsc64 first-paint before/after); run = again\\n"
-    "  proc list             proc64 process table (pid/ppid/state/tasks/CR3/name) - real processes with per-process CR3\\n"
-    "  proc run NAME|/PATH   create + start a real proc64 process (built-in: spin -> long-lived /spin.elf)\\n"
-    "  proc kill PID [SIG]   signal a proc64 process (default SIGKILL=9; the task manager process page uses this)\\n"
-    "No 'not supported' commands remain: update/preload were the last two and are real now.\\n";
+    "  panic <code>, bsod    controlled BSOD: blue screen + serial stop code, halts after 6s (no auto reboot)\n"
+    "  update status         update subsystem: version / applied (store) / pending marker + done file\n"
+    "  update pending <ver>  stage /update.pending (marker text ver=<ver>); applied at next boot\n"
+    "  update apply          apply the marker now (store + /update.done) then soft-restart; NOT a real upgrade package\n"
+    "  preload [run]         glyph prewarm + icon pre-scale stats (rdtsc64 first-paint before/after); run = again\n"
+    "  proc list             proc64 process table (pid/ppid/state/tasks/CR3/name) - real processes with per-process CR3\n"
+    "  proc run NAME|/PATH   create + start a real proc64 process (built-in: spin -> long-lived /spin.elf)\n"
+    "  proc kill PID [SIG]   signal a proc64 process (default SIGKILL=9; the task manager process page uses this)\n"
+    "No 'not supported' commands remain: update/preload were the last two and are real now.\n";
 
 static const char* HELP_ZH =
     "VimtuOS 64 位 Shell 命令：\n"
@@ -762,18 +656,20 @@ static const char* HELP_ZH =
     "  mem, meminfo          内存（页池 / 堆 / 归属）\n"
     "  ps, tasks, top        内核任务表（调度器 task64）+ 窗口计数\n"
     "  kill TASKID           终止一个内核任务（id 从 ps 拿）\n"
-    "  run 名字|/路径        从 VimtuFS2 加载应用并在 ring3 里运行（按文件头魔数自动分派：\\n"
-    "                        VAP64 走 int 0x80、ELF64 走 syscall 指令；例如 run hello.elf）\\n"
-    "  elfrun 名字|/路径     强制走 ELF64 加载器（syscall 指令 ABI），例如 elfrun hello.elf\\n"
-    "  echo TEXT             回显（echo TEXT > FILE 写文件）\n"
-    "  write FILE TEXT       写文件（≤512 字节）\n"
-    "  cat FILE / ls         读文件 / 列文件\n"
-    "  touch FILE / rm FILE  建空文件 / 删文件\n"
+    "  run 名字|/路径        从 VimtuFS2 加载应用并在 ring3 里运行（按文件头魔数自动分派：\n"
+    "                        VAP64 走 int 0x80、ELF64 走 syscall 指令；例如 run hello.elf）\n"
+    "  elfrun 名字|/路径     强制走 ELF64 加载器（syscall 指令 ABI），例如 elfrun hello.elf\n"
+    "  echo TEXT             回显（echo TEXT > FILE 写**真文件**）\n"
+    "  write FILE TEXT       写**真文件**（整体覆盖；单文件 ≤67584 B；单层路径 /name）\n"
+    "  cat FILE / ls, dir    读文件 / 列 VimtuFS2 根目录（带大小；磁盘上的真文件，不再是 ramfs）\n"
+    "  touch FILE / rm FILE  建空文件 / 删文件（rm 不能删目录）\n"
+    "  mkdir DIR / df        建根目录 / 卷的块数与空闲块（512B 块，VimtuFS2）\n"
     "  date / time           RTC 日期 / 时间\n"
     "  uptime                开机时长（ticks/250）\n"
     "  irq                   中断总数\n"
     "  perf                  GUI 帧率 / 忙占比 / 中断 / 堆\n"
-    "  disp                  显示信息（真实分辨率 / 缩放）\n"
+    "  display [modes|hz|edid] 运行期显示层：引导模式清单（0x7400）/ 0x3DA 实测刷新率与 EDID 对比 /\n"
+    "                        EDID 身份与首选时序；disp 等同于摘要\n"
     "  lang [zh|en]          中英切换\n"
     "  clear                 清屏\n"
     "  about                 关于 VimtuOS\n"
@@ -795,14 +691,14 @@ static const char* HELP_ZH =
     "  disk, hw, lspci       ATA IDENTIFY（型号/容量）+ VimtuFS2 卷；CPU/PCI；PCI 设备列表\n"
     "  user [run]            ring3 现状（用户窗口/VA/门/盘上程序）；user run 直接跑 /hello.vap\n"
     "  panic <code>, bsod    受控蓝屏：蓝底白字屏 + 串口停止码，停留 6 秒后停住（不自动重启）\n"
-    "  update status         更新子系统：当前版本 / 已应用（store）/ 标记文件与完成文件\\n"
-    "  update pending <ver>  写入 /update.pending（标记文本 ver=<ver>），下次启动时应用\\n"
-    "  update apply          立即应用标记（store + /update.done）并软重启；**不是真正的升级包**\\n"
-    "  preload [run]         字形预热 + 图标预缩放统计（rdtsc64 实测首帧前后 cycles）；run = 再跑一轮\\n"
-    "  proc list             proc64 进程表（pid/ppid/状态/线程数/CR3/名字）—— 每进程独立 CR3 的真进程\\n"
-    "  proc run 名字|/路径   创建并启动一个真 proc64 进程（内置：spin -> 长命 /spin.elf）\\n"
-    "  proc kill PID [SIG]   给 proc64 进程发信号（默认 SIGKILL=9；任务管理器进程页回车走的就是它）\\n"
-    "没有\"未支持\"命令了：最后两条 update / preload 已接真。\\n";
+    "  update status         更新子系统：当前版本 / 已应用（store）/ 标记文件与完成文件\n"
+    "  update pending <ver>  写入 /update.pending（标记文本 ver=<ver>），下次启动时应用\n"
+    "  update apply          立即应用标记（store + /update.done）并软重启；**不是真正的升级包**\n"
+    "  preload [run]         字形预热 + 图标预缩放统计（rdtsc64 实测首帧前后 cycles）；run = 再跑一轮\n"
+    "  proc list             proc64 进程表（pid/ppid/状态/线程数/CR3/名字）—— 每进程独立 CR3 的真进程\n"
+    "  proc run 名字|/路径   创建并启动一个真 proc64 进程（内置：spin -> 长命 /spin.elf）\n"
+    "  proc kill PID [SIG]   给 proc64 进程发信号（默认 SIGKILL=9；任务管理器进程页回车走的就是它）\n"
+    "没有\"未支持\"命令了：最后两条 update / preload 已接真。\n";
 // ---------- 命令实现 ----------
 static void cmd_help(TerminalState* ts) {
     ts_puts(ts, gui64_lang_zh() ? HELP_ZH : HELP_EN);
@@ -1018,106 +914,322 @@ static void cmd_perf(TerminalState* ts) {
     ts_puts(ts, " KB\n");
 }
 
-static void cmd_disp(TerminalState* ts) {
-    ts_puts(ts, "display: ");
-    ts_put_u64(ts, (uint64_t)fb_width());
-    ts_puts(ts, "x");
-    ts_put_u64(ts, (uint64_t)fb_height());
-    ts_puts(ts, " (physical ");
-    ts_put_u64(ts, (uint64_t)fb_phys_width());
-    ts_puts(ts, "x");
-    ts_put_u64(ts, (uint64_t)fb_phys_height());
-    ts_puts(ts, "), zoom ");
-    ts_put_u64(ts, (uint64_t)fb_get_zoom());
-    ts_puts(ts, "%\n");
-    ts_puts(ts, "desktop area: ");
-    ts_put_u64(ts, (uint64_t)gui64_screen_w());
-    ts_puts(ts, "x");
-    ts_put_u64(ts, (uint64_t)gui64_screen_h());
-    ts_puts(ts, ", taskbar ");
-    ts_put_u64(ts, (uint64_t)gui64_taskbar_h());
-    ts_puts(ts, " px, bpp 32\n");
-}
+// 前置声明：ts_put_hex 的实现在本文件后面（display modes 要按 4 位十六进制打印模式号）
+static void ts_put_hex(TerminalState* ts, uint64_t v, int digits);
 
-static void cmd_ls(TerminalState* ts) {
-    ramfs_init_once();
-    ts_puts(ts, "ramfs: ");
-    ts_put_u64(ts, (uint64_t)ramfs_used_files());
-    ts_puts(ts, "/");
-    ts_put_u64(ts, (uint64_t)RAMFS_FILES);
-    ts_puts(ts, " files, ");
-    ts_put_u64(ts, (uint64_t)ramfs_used_bytes());
-    ts_puts(ts, "/");
-    ts_put_u64(ts, (uint64_t)(RAMFS_FILES * RAMFS_DATA_MAX));
-    ts_puts(ts, " bytes used\n");
-    for (int i = 0; i < RAMFS_FILES; i++) {
-        if (!g_fs[i].used) continue;
-        ts_puts(ts, "  ");
-        ts_puts_pad(ts, g_fs[i].name, 20);
-        ts_put_u64(ts, (uint64_t)g_fs[i].size);
-        ts_puts(ts, " B\n");
-    }
-}
+// ==================== display / disp：运行期显示层（kernel/display64.cpp）====================
+// display           摘要（实测刷新率 + 来源 + 模式清单条数 + EDID 对比）
+// display modes     引导期 loader 放在物理 0x7400 的可用模式清单（<=16 条，真值）
+// display hz        刷新率三条来源分别是什么：0x3DA 实测 / CRTC 推算 / EDID 首选时序
+// display edid      EDID 显示器身份与首选时序（引导期读进 0x7600 的那 128B）
+// 说明：运行期 DDC 再探测**没做**（见 display64.h），这里显示的就是引导期 EDID + 启动时实测。
+static bool cmd_display(TerminalState* ts, const char* sub) {
+    const Disp64Info* di = display64_info64();
+    char hz[16];
 
-// cat：0 = ok
-static bool cmd_cat(TerminalState* ts, const char* name) {
-    if (!name || !name[0]) {
-        ts_puts(ts, "cat: usage: cat FILE\n");
-        return false;
+    if (!sub || !sub[0]) {
+        display64_report64();                                   // 串口同一份结论（自动验收 grep）
+        ts_puts(ts, "display: render ");
+        ts_put_u64(ts, (uint64_t)fb_width()); ts_puts(ts, "x"); ts_put_u64(ts, (uint64_t)fb_height());
+        ts_puts(ts, "  physical ");
+        ts_put_u64(ts, (uint64_t)fb_phys_width()); ts_puts(ts, "x"); ts_put_u64(ts, (uint64_t)fb_phys_height());
+        ts_puts(ts, "  zoom ");
+        ts_put_u64(ts, (uint64_t)fb_get_zoom()); ts_puts(ts, "%\n");
+        ts_puts(ts, "  refresh: ");
+        if (di->refresh_x10 > 0) {
+            display64_refresh_str64(hz, (int)sizeof(hz));
+            ts_puts(ts, hz); ts_puts(ts, " Hz (source=");
+            ts_puts(ts, display64_src_name64(di->src));
+            ts_puts(ts, ")");
+        } else {
+            ts_puts(ts, "unknown (0x3DA not measurable; no EDID preferred timing)");
+        }
+        ts_puts(ts, "\n  mode list: ");
+        ts_put_u64(ts, (uint64_t)di->mode_count);
+        ts_puts(ts, " entries (use 'display modes')\n");
+        ts_puts(ts, "  desktop area: ");
+        ts_put_u64(ts, (uint64_t)gui64_screen_w()); ts_puts(ts, "x"); ts_put_u64(ts, (uint64_t)gui64_screen_h());
+        ts_puts(ts, ", taskbar ");
+        ts_put_u64(ts, (uint64_t)gui64_taskbar_h());
+        ts_puts(ts, " px, bpp 32\n");
+        ts_puts(ts, "  DDC runtime re-probe: not implemented (boot-time EDID only; see display64.h)\n");
+        dbg64_line_begin64();
+        dbg64_str("[TERM] cmd display modes=");
+        dbg64_dec((uint64_t)di->mode_count);
+        dbg64_str(" hz=");
+        if (di->refresh_x10 > 0) { display64_refresh_str64(hz, (int)sizeof(hz)); dbg64_str(hz); }
+        else                     dbg64_str("unknown");
+        dbg64_str(" src=");
+        dbg64_str(display64_src_name64(di->src));
+        dbg64_nl();
+        dbg64_line_end64();
+        return true;
     }
-    ramfs_init_once();
-    ramfs_norm(name, g_pathbuf, RAMFS_NAME_MAX);
-    int idx = ramfs_find(g_pathbuf);
-    if (idx < 0) {
-        ts_puts(ts, "cat: no such file: ");
-        ts_puts(ts, g_pathbuf);
+
+    if (st_eq(sub, "modes")) {
+        ts_puts(ts, "startup VBE mode list (boot loader probe at physical 0x7400):\n");
+        int n = display64_mode_count64();
+        for (int i = 0; i < n; i++) {
+            const Disp64Mode* m = display64_mode_at64(i);
+            if (!m) break;
+            ts_puts(ts, "  mode=0x");
+            ts_put_hex(ts, m->mode, 4);
+            ts_puts(ts, "  ");
+            ts_put_u64(ts, (uint64_t)m->width); ts_puts(ts, "x"); ts_put_u64(ts, (uint64_t)m->height);
+            ts_puts(ts, "x"); ts_put_u64(ts, (uint64_t)m->bpp);
+            if (m->mode == di->mode_num) ts_puts(ts, "   <- current");
+            ts_putc(ts, (uint32_t)'\n');
+        }
+        if (n == 0) ts_puts(ts, "  (no mode table from boot loader on this boot path)\n");
+        ts_puts(ts, "  (switch is still Bochs VBE DISPI via the settings page; this list is read-only)\n");
+        dbg64_line_begin64();
+        dbg64_str("[TERM] cmd display modes=");
+        dbg64_dec((uint64_t)n);
+        dbg64_nl();
+        dbg64_line_end64();
+        return true;
+    }
+
+    if (st_eq(sub, "hz")) {
+        ts_puts(ts, "refresh rate sources (measured first, then reported):\n");
+        ts_puts(ts, "  0x3DA vretrace measured : ");
+        if (di->vga_x10 > 0) {
+            ts_put_u64(ts, (uint64_t)(di->vga_x10 / 10)); ts_putc(ts, (uint32_t)'.');
+            ts_put_u64(ts, (uint64_t)(di->vga_x10 % 10)); ts_puts(ts, " Hz");
+        } else {
+            ts_puts(ts, "not measurable (samples=");
+            ts_put_u64(ts, (uint64_t)di->vga_samples);
+            ts_puts(ts, " edges=");
+            ts_put_u64(ts, (uint64_t)di->vga_edges);
+            ts_puts(ts, ")");
+        }
         ts_putc(ts, (uint32_t)'\n');
+        ts_puts(ts, "  CRTC timing (fallback)  : ");
+        if (di->crtc_x10 > 0) {
+            ts_put_u64(ts, (uint64_t)(di->crtc_x10 / 10)); ts_putc(ts, (uint32_t)'.');
+            ts_put_u64(ts, (uint64_t)(di->crtc_x10 % 10)); ts_puts(ts, " Hz");
+        } else {
+            ts_puts(ts, "not usable (CRTC not programmed for this mode)");
+        }
+        ts_putc(ts, (uint32_t)'\n');
+        ts_puts(ts, "  EDID preferred timing   : ");
+        if (di->edid_x10 > 0) {
+            edid64_refresh_str64(hz, (int)sizeof(hz));
+            ts_puts(ts, hz); ts_puts(ts, " Hz");
+        } else {
+            ts_puts(ts, "no EDID from firmware");
+        }
+        ts_putc(ts, (uint32_t)'\n');
+        ts_puts(ts, "  adopted                 : ");
+        if (di->refresh_x10 > 0) {
+            display64_refresh_str64(hz, (int)sizeof(hz));
+            ts_puts(ts, hz); ts_puts(ts, " Hz (src=");
+            ts_puts(ts, display64_src_name64(di->src)); ts_puts(ts, ")");
+        } else {
+            ts_puts(ts, "unknown");
+        }
+        ts_puts(ts, "  measured/EDID match=");
+        ts_put_u64(ts, (uint64_t)di->edid_match);
+        ts_putc(ts, (uint32_t)'\n');
+        dbg64_line_begin64();
+        dbg64_str("[TERM] cmd display hz src=");
+        dbg64_str(display64_src_name64(di->src));
+        dbg64_str(" vga=");
+        dbg64_dec((uint64_t)di->vga_x10);
+        dbg64_str(" edid=");
+        dbg64_dec((uint64_t)di->edid_x10);
+        dbg64_str(" match=");
+        dbg64_dec((uint64_t)di->edid_match);
+        dbg64_nl();
+        dbg64_line_end64();
+        return true;
+    }
+
+    if (st_eq(sub, "edid")) {
+        const Edid64* ed = edid64_get();
+        if (!ed->valid) {
+            ts_puts(ts, "EDID: none from firmware (refresh rate / monitor name unknown)\n");
+        } else {
+            ts_puts(ts, "EDID (first 128-byte block at physical 0x7600):\n  monitor ");
+            ts_puts(ts, ed->name);
+            ts_puts(ts, "  mfg="); ts_puts(ts, ed->mfg);
+            ts_puts(ts, "  ver=");
+            ts_put_u64(ts, (uint64_t)ed->version_major); ts_putc(ts, (uint32_t)'.');
+            ts_put_u64(ts, (uint64_t)ed->version_minor);
+            ts_puts(ts, "  size=");
+            ts_put_u64(ts, (uint64_t)ed->size_cm_w); ts_puts(ts, "x");
+            ts_put_u64(ts, (uint64_t)ed->size_cm_h); ts_puts(ts, "cm");
+            ts_puts(ts, "  ext=");
+            ts_put_u64(ts, (uint64_t)ed->ext_count);
+            ts_putc(ts, (uint32_t)'\n');
+            ts_puts(ts, "  preferred timing: ");
+            ts_put_u64(ts, (uint64_t)ed->h_active); ts_puts(ts, "x"); ts_put_u64(ts, (uint64_t)ed->v_active);
+            ts_puts(ts, " @ ");
+            edid64_refresh_str64(hz, (int)sizeof(hz));
+            ts_puts(ts, hz); ts_puts(ts, " Hz  pclk=");
+            ts_put_u64(ts, (uint64_t)ed->pclk_khz); ts_puts(ts, " kHz\n");
+            ts_puts(ts, "  (extended blocks and runtime DDC re-probe are NOT implemented - see display64.h)\n");
+        }
+        dbg64_line_begin64();
+        dbg64_str("[TERM] cmd display edid present=");
+        dbg64_dec((uint64_t)(ed->valid ? 1 : 0));
+        dbg64_nl();
+        dbg64_line_end64();
+        return true;
+    }
+
+    ts_puts(ts, "display: usage: display [modes|hz|edid]\n");
+    return false;
+}
+
+// ==================== 文件命令（批次 B：全部走 kernel/fd64.cpp 的 FD 层 -> VimtuFS2）====================
+// 限制（help 里也如实写）：单层路径 "/name"、单文件 <= 67584 B、无子目录树、无权限；
+// rm 只能删文件（vfs64 没有删目录原语）；mkdir 的父目录固定为根；写文件是整体覆盖 + 立刻落盘。
+
+// ls / dir：列 VimtuFS2 根目录 + 大小（目录句柄走 fd64_opendir/readdir，真路径）
+static void cmd_ls(TerminalState* ts) {
+    // 只用目录句柄列一次（fd64 内部把这次扫描缓存进句柄；不再额外做一次 vfs64_ls +
+    // 每个条目一次 stat —— 那在真机上是秒级 I/O，会把 GUI 看门狗饿到）。
+    const int dfd = fd64_opendir64("/");
+    if (dfd < 3) {
+        ts_puts(ts, "ls: no VimtuFS2 volume (see 'disk' for volume state)\n");
+        dbg64_line_begin64();
+        dbg64_str("[TERM] cmd ls entries=0 (no volume)\n");
+        dbg64_line_end64();
+        return;
+    }
+    ts_puts(ts, "VimtuFS2 / (FD layer, single-level path):\n");
+    int rows = 0;
+    uint64_t bytes = 0;
+    for (;;) {
+        char nm[FD64_NAME_MAX];
+        uint32_t ty = 0, sz = 0;
+        const int r = fd64_readdir64(dfd, nm, (int)sizeof(nm), &ty, &sz);
+        if (r <= 0) break;
+        ts_puts(ts, "  ");
+        ts_puts_pad(ts, nm, 20);
+        ts_put_u64(ts, (uint64_t)sz);
+        ts_puts(ts, ty == VFS64_TYPE_DIR ? " B  <DIR>\n" : " B\n");
+        bytes += sz;
+        rows++;
+    }
+    (void)fd64_close64(dfd);
+    ts_puts(ts, "  total: ");
+    ts_put_u64(ts, (uint64_t)rows);
+    ts_puts(ts, " entries, ");
+    ts_put_u64(ts, bytes);
+    ts_puts(ts, " bytes\\n");
+    dbg64_line_begin64();
+    dbg64_str("[TERM] cmd ls entries=");
+    dbg64_dec((uint64_t)rows);
+    dbg64_str(" bytes=");
+    dbg64_dec(bytes);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// cat FILE：真读（FD 层 -> vfs64 -> 磁盘）
+static bool cmd_cat(TerminalState* ts, const char* name) {
+    if (!name || !name[0]) { ts_puts(ts, "cat: usage: cat FILE\n"); return false; }
+    if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
+        ts_puts(ts, "cat: bad path (single-level /name only)\n");
         return false;
     }
-    ts_puts(ts, g_fs[idx].data);
+    const int fd = fd64_open64(g_pathbuf, FD64_O_RDONLY);
+    if (fd < 3) {
+        ts_puts(ts, "cat: cannot open ");
+        ts_puts(ts, g_pathbuf);
+        ts_puts(ts, " (missing / is a directory / no volume)\n");
+        return false;
+    }
+    static char cbuf[512];
+    int total = 0;
+    for (;;) {
+        const int r = fd64_read64(fd, cbuf, (int)sizeof(cbuf) - 1);
+        if (r <= 0) break;
+        cbuf[r] = 0;
+        ts_puts(ts, cbuf);
+        total += r;
+        if (total >= (int)FD64_FILE_MAX) break;                 // 防御：单文件上限
+    }
+    (void)fd64_close64(fd);
+    ts_putc(ts, (uint32_t)'\n');
+    dbg64_line_begin64();
+    dbg64_str("[TERM] cmd cat bytes=");
+    dbg64_dec((uint64_t)total);
+    dbg64_nl();
+    dbg64_line_end64();
+    return true;
+}
+
+// write FILE TEXT（整体覆盖；单文件上限 67584 B，超了 fd64 会如实拒绝）
+static bool cmd_write(TerminalState* ts, const char* name, const char* text) {
+    if (!name || !name[0] || !text) {
+        ts_puts(ts, "write: usage: write FILE TEXT\n");
+        return false;
+    }
+    if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
+        ts_puts(ts, "write: bad path (single-level /name only)\n");
+        return false;
+    }
+    const int len = st_len(text);
+    if (len > (int)FD64_FILE_MAX) {
+        ts_puts(ts, "write: too large (single file limit 67584 B)\n");
+        return false;
+    }
+    const int fd = fd64_open64(g_pathbuf, FD64_O_WRONLY | FD64_O_CREAT | FD64_O_TRUNC);
+    if (fd < 3) { ts_puts(ts, "write: cannot open (no volume / bad path)\n"); return false; }
+    const int w = fd64_write64(fd, text, len);
+    (void)fd64_close64(fd);
+    if (w < 0) { ts_puts(ts, "write: failed (no space / single file limit 67584 B)\n"); return false; }
+    ts_puts(ts, "written ");
+    ts_put_u64(ts, (uint64_t)w);
+    ts_puts(ts, " bytes to ");
+    ts_puts(ts, g_pathbuf);
     ts_putc(ts, (uint32_t)'\n');
     return true;
 }
 
-// write FILE TEXT
-static bool cmd_write(TerminalState* ts, const char* name, const char* text) {
-    if (!name || !name[0] || !text || !text[0]) {
-        ts_puts(ts, "write: usage: write FILE TEXT\n");
+// touch FILE：不存在就建空文件（真落盘）
+static bool cmd_touch(TerminalState* ts, const char* name) {
+    if (!name || !name[0]) { ts_puts(ts, "touch: usage: touch FILE\n"); return false; }
+    if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
+        ts_puts(ts, "touch: bad path (single-level /name only)\n");
         return false;
     }
-    ramfs_init_once();
-    int len = st_len(text);
-    int rc = ramfs_write(name, text, len);
-    if (rc == -2) { ts_puts(ts, "write: empty file name\n"); return false; }
-    if (rc == -1) { ts_puts(ts, "write: no free slot (16 files max)\n"); return false; }
-    ts_puts(ts, "written to ");
+    uint32_t ty = 0, sz = 0;
+    const bool exists = (vfs64_stat(g_pathbuf, &ty, &sz) == 0);
+    const int fd = fd64_open64(g_pathbuf, FD64_O_WRONLY | FD64_O_CREAT);
+    if (fd < 3) { ts_puts(ts, "touch: failed (no volume / bad path)\n"); return false; }
+    (void)fd64_close64(fd);
+    ts_puts(ts, exists ? "ok, exists " : "ok, created ");
     ts_puts(ts, g_pathbuf);
-    ts_puts(ts, " (");
-    ts_put_u64(ts, (uint64_t)(ramfs_find(g_pathbuf) >= 0 ? g_fs[ramfs_find(g_pathbuf)].size : 0));
-    ts_puts(ts, " bytes");
-    if (len > RAMFS_DATA_MAX) ts_puts(ts, ", truncated");
-    ts_puts(ts, ")\n");
+    ts_putc(ts, (uint32_t)'\n');
     return true;
 }
 
-static bool cmd_touch(TerminalState* ts, const char* name) {
-    if (!name || !name[0]) { ts_puts(ts, "touch: usage: touch FILE\n"); return false; }
-    ramfs_init_once();
-    int rc = ramfs_create(name);
-    if (rc == 0) { ts_puts(ts, "ok, created "); ts_puts(ts, g_pathbuf); ts_putc(ts, (uint32_t)'\n'); return true; }
-    if (rc == 1) { ts_puts(ts, "ok, exists "); ts_puts(ts, g_pathbuf); ts_putc(ts, (uint32_t)'\n'); return true; }
-    ts_puts(ts, "touch: error (no free slot)\n");
-    return false;
-}
-
+// rm / del FILE：真删（vfs64_unlink；目录会被拒绝并如实说明）
 static bool cmd_rm(TerminalState* ts, const char* name) {
     if (!name || !name[0]) { ts_puts(ts, "rm: usage: rm FILE\n"); return false; }
-    ramfs_init_once();
-    ramfs_norm(name, g_pathbuf, RAMFS_NAME_MAX);
-    if (ramfs_remove(g_pathbuf) != 0) {
+    if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
+        ts_puts(ts, "rm: bad path (single-level /name only)\n");
+        return false;
+    }
+    uint32_t ty = 0, sz = 0;
+    if (vfs64_stat(g_pathbuf, &ty, &sz) != 0) {
         ts_puts(ts, "rm: no such file: ");
         ts_puts(ts, g_pathbuf);
         ts_putc(ts, (uint32_t)'\n');
+        return false;
+    }
+    if (ty == VFS64_TYPE_DIR) {
+        ts_puts(ts, "rm: ");
+        ts_puts(ts, g_pathbuf);
+        ts_puts(ts, " is a directory (vfs64 has no rmdir: deleting directories is not supported)\n");
+        return false;
+    }
+    if (vfs64_unlink(g_pathbuf) != 0) {
+        ts_puts(ts, "rm: failed (see serial log for the VFS64 reason)\n");
         return false;
     }
     ts_puts(ts, "removed ");
@@ -1126,7 +1238,78 @@ static bool cmd_rm(TerminalState* ts, const char* name) {
     return true;
 }
 
-// echo TEXT | echo TEXT > FILE
+// mkdir DIR：vfs64_mkdir（阶段一：父目录固定为根，单层）
+static bool cmd_mkdir(TerminalState* ts, const char* name) {
+    if (!name || !name[0]) { ts_puts(ts, "mkdir: usage: mkdir DIR\n"); return false; }
+    if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
+        ts_puts(ts, "mkdir: bad path (single-level /name only)\n");
+        return false;
+    }
+    uint32_t ty = 0, sz = 0;
+    if (vfs64_stat(g_pathbuf, &ty, &sz) == 0) {
+        if (ty == VFS64_TYPE_DIR) { ts_puts(ts, "mkdir: exists "); ts_puts(ts, g_pathbuf); ts_putc(ts, (uint32_t)'\n'); return true; }
+        ts_puts(ts, "mkdir: path exists and is a file\n");
+        return false;
+    }
+    if (vfs64_mkdir(g_pathbuf) != 0) { ts_puts(ts, "mkdir: failed (see serial log)\n"); return false; }
+    ts_puts(ts, "created directory ");
+    ts_puts(ts, g_pathbuf);
+    ts_putc(ts, (uint32_t)'\n');
+    return true;
+}
+
+// df：卷总块/空闲块（sysstate64 的只读探测快照）+ 实时文件统计（vfs64_ls）
+static bool cmd_df(TerminalState* ts) {
+    Fs64Info fs;
+    const int rc = sysstate64_fsinfo64(&fs);
+    char names[FD64_MAX][FD64_NAME_MAX];
+    uint32_t sizes[FD64_MAX];
+    const int n = vfs64_ls("/", names, (int)FD64_MAX, sizes);
+    uint64_t live_files = (n > 0) ? (uint64_t)n : 0;
+    uint64_t live_bytes = 0;
+    for (int i = 0; i < n; i++) live_bytes += sizes[i];
+    if (rc != 0 || !fs.ok) {
+        ts_puts(ts, "df: no VimtuFS2 volume (no partition table / mount failed)\n");
+        return true;
+    }
+    const uint64_t used = (uint64_t)fs.total_blocks - (uint64_t)fs.free_blocks;
+    ts_puts(ts, "Filesystem   1K-blocks      Used Available Use%  Files\n");
+    ts_puts(ts, "VimtuFS2      ");
+    ts_put_u64(ts, (uint64_t)fs.total_blocks / 2);          // 1K 块 = 2 个 512B 块
+    ts_puts(ts, "  ");
+    ts_put_u64(ts, used / 2);
+    ts_puts(ts, "  ");
+    ts_put_u64(ts, (uint64_t)fs.free_blocks / 2);
+    ts_puts(ts, "  ");
+    ts_put_u64(ts, fs.total_blocks ? (used * 100u / (uint64_t)fs.total_blocks) : 0);
+    ts_puts(ts, "%  ");
+    ts_put_u64(ts, live_files);
+    ts_putc(ts, (uint32_t)'\n');
+    ts_puts(ts, "  blocks: total=");
+    ts_put_u64(ts, (uint64_t)fs.total_blocks);
+    ts_puts(ts, " (512B) free=");
+    ts_put_u64(ts, (uint64_t)fs.free_blocks);
+    ts_puts(ts, " used=");
+    ts_put_u64(ts, used);
+    ts_puts(ts, "   files=");
+    ts_put_u64(ts, live_files);
+    ts_puts(ts, " bytes=");
+    ts_put_u64(ts, live_bytes);
+    ts_putc(ts, (uint32_t)'\n');
+    ts_puts(ts, "  (block bitmap = first-probe snapshot at boot; file list/bytes are live; single-level FS)\n");
+    dbg64_line_begin64();
+    dbg64_str("[TERM] cmd df blocks=");
+    dbg64_dec((uint64_t)fs.total_blocks);
+    dbg64_str(" free=");
+    dbg64_dec((uint64_t)fs.free_blocks);
+    dbg64_str(" files=");
+    dbg64_dec(live_files);
+    dbg64_nl();
+    dbg64_line_end64();
+    return true;
+}
+
+// echo TEXT | echo TEXT > FILE（重定向走 FD 层，真落盘）
 static bool cmd_echo(TerminalState* ts, const char* args) {
     int gt = -1;
     for (int i = 0; args && args[i]; i++) if (args[i] == '>') { gt = i; break; }
@@ -1142,16 +1325,10 @@ static bool cmd_echo(TerminalState* ts, const char* args) {
     for (int i = 0; i < end && t < TERM_CMD_MAX - 1; i++) text[t++] = args[i];
     text[t] = 0;
     const char* fp = skip_ws(args + gt + 1);
-    char path[RAMFS_NAME_MAX];
+    char path[FD64_PATH_MAX];
     grab_token(fp, path, (int)sizeof(path));
     if (!path[0]) { ts_puts(ts, "echo: usage: echo TEXT > FILE\n"); return false; }
-    ramfs_init_once();
-    int rc = ramfs_write(path, text, t);
-    if (rc != 0) { ts_puts(ts, "error: cannot write file\n"); return false; }
-    ts_puts(ts, "written to ");
-    ts_puts(ts, g_pathbuf);
-    ts_putc(ts, (uint32_t)'\n');
-    return true;
+    return cmd_write(ts, path, text);
 }
 
 static bool cmd_lang(TerminalState* ts, const char* arg) {
@@ -1974,30 +2151,41 @@ static bool cmd_update(TerminalState* ts, const char* sub, const char* arg1) {
 //   进程页要显示"真进程"、且要能 kill，需要一个运行期可创建的**长命**进程（spin64.elf 永不退出）。
 extern "C" const uint8_t _binary_build64_spin64_elf_start[];
 extern "C" const uint8_t _binary_build64_spin64_elf_end[];
+extern "C" const uint8_t _binary_build64_filedemo64_elf_start[];
+extern "C" const uint8_t _binary_build64_filedemo64_elf_end[];
 
-static int term_install_spin64() {
+// 内嵌程序 -> VimtuFS2（幂等：已装过就跳过）。两个：长命 spin（proc run）与
+// filedemo（ring3 读文件演示：open "/t.txt" + read + write；见 user/filedemo64.asm）。
+static int term_install_blob64(const char* path, const uint8_t* start, const uint8_t* end, const char* tag) {
     uint32_t t = 0, sz = 0;
-    if (vfs64_stat("/spin.elf", &t, &sz) == 0) return 0;      // 幂等：已装过就跳过
-    const int len = (int)(_binary_build64_spin64_elf_end - _binary_build64_spin64_elf_start);
+    if (vfs64_stat(path, &t, &sz) == 0) return 0;              // 幂等：已装过就跳过
+    const int len = (int)(end - start);
     if (len <= 0) return -1;
-    const int rc = vfs64_write("/spin.elf", _binary_build64_spin64_elf_start, len);
+    const int rc = vfs64_write(path, start, len);
     if (rc < 0) return -1;
     dbg64_line_begin64();
-    dbg64_str("[TERM] proc install /spin.elf bytes=");
+    dbg64_str("[TERM] install ");
+    dbg64_str(path);
+    dbg64_str(" bytes=");
     dbg64_dec((uint64_t)len);
-    dbg64_nl();
+    dbg64_str(" (");
+    dbg64_str(tag);
+    dbg64_str(")\n");
     dbg64_line_end64();
     return 0;
 }
-
-// 为什么需要（真缺陷现场，见本文件的 retry 逻辑）：usermode64.cpp 的 in_ring3 位是**按任务槽位**
-//   的位图；一个 ring3 进程被 kill（SIGTERM/SIGKILL）时它不会从 user64_enter_frame64 正常返回，
-//   那一槽的位就永远留着 —— 下一个任务复用该槽时 [USER64] enter FAILED reason=2。
-//   本批次允许改的文件不含 usermode64.cpp，所以这里用"占住脏槽再重试"的方式绕过（并在报告里如实
-//   列出该缺陷与建议修法：回收任务时清掉该任务的 in_ring3 位）。
-static void term_spinpad_entry(void* arg) {
-    (void)arg;
-    for (;;) task_yield64();
+static int term_install_spin64() {
+    return term_install_blob64("/spin.elf", _binary_build64_spin64_elf_start,
+                               _binary_build64_spin64_elf_end, "long-lived proc target");
+}
+static int term_install_filedemo64() {
+    return term_install_blob64("/filedemo.elf", _binary_build64_filedemo64_elf_start,
+                               _binary_build64_filedemo64_elf_end, "ring3 file demo");
+}
+// 开终端时幂等安装内嵌程序（`run filedemo` / `proc run spin` 因此总是可用；没有卷时静默失败）
+static void term_install_builtins64() {
+    (void)term_install_spin64();
+    (void)term_install_filedemo64();
 }
 
 // pid 当前的状态（-1 = 进程表里没有/已收尸；否则 Proc64State 值）
@@ -2104,43 +2292,31 @@ static bool cmd_proc(TerminalState* ts, const char* sub, const char* arg1, const
         name[nn] = 0;
         if (nn == 0) { name[0] = 'p'; name[1] = 0; }
 
-        // 创建 + 启动；对内置长命程序（spin）加"脏槽位重试"（见 term_spinpad_entry 的说明）：
-        //   spin 正常会一直活着；若它复用了被 kill 的 ring3 进程遗留的**脏槽**，任务会在
-        //   user64_enter_frame64 上 reason=2 失败并立刻退出（任务变 DEAD/被回收、进程 EXITED）。
-        // 成功判据 = **任务的状态**已越过"第一次被调度"——RUNNING/SLEEP 说明它已经进了 ring3；
-        //   只看进程 state 不行（nanosleep 不会把进程 state 置成 SLEEP，一直显示 RUNNING），
-        //   只看"没死"也不行（可能还是 READY，下一秒才失败）。
-        // 整个等待过程暂停 GUI 看门狗（最多 4 轮 × ~400ms），否则 task 0 被占住会触发
-        //   watchdog fire（实测踩过：panic WATCHDOG_TIMEOUT）。
+        // 创建 + 启动。批次 B 起**没有**"脏槽位重试"了：in_ring3 位由 task64 的
+        //   kill/reap/exit/force-remove 路径清（见 usermode64.h 的 user64_slot_release64），
+        //   所以复用一个被 kill 的 ring3 进程的任务槽也能一次进 ring3（kernel64.cpp 里有
+        //   启动期回归自检：4 轮 kill+run 同一槽全过）。
+        // 成功判据（对内置长命程序 spin）= **任务状态**已越过"第一次被调度"：RUNNING/SLEEP
+        //   说明它已经进了 ring3。只看进程 state 不行（nanosleep 不把进程 state 置成 SLEEP），
+        //   只看"没死"也不行（可能还是 READY，下一秒才失败）。等待期间暂停 GUI 看门狗
+        //   （最多 ~400ms），否则 task 0 被占住会触发 watchdog fire（实测踩过）。
         const bool expect_alive = st_eq(arg1, "spin") || st_eq(arg1, "/spin.elf");
-        int pid = -1;
         if (expect_alive) panic64_watchdog_pause64();
-        for (int attempt = 0; attempt < 4; attempt++) {
-            if (attempt > 0) {
-                const int pad = task_create64("spinpad", term_spinpad_entry, nullptr);
-                dbg64_line_begin64();
-                dbg64_str("[TERM] proc retry attempt=");
-                dbg64_dec((uint64_t)attempt);
-                dbg64_str(" pad_id=");
-                dbg64_dec((uint64_t)(pad < 0 ? 0 : pad));
-                dbg64_str(" (occupy stale in_ring3 slot)\n");
-                dbg64_line_end64();
-            }
-            pid = proc64_create64(name, 0);
-            if (pid < 0) {
-                if (expect_alive) panic64_watchdog_unpause64();
-                ts_puts(ts, gui64_tr("proc run: create failed (shared address space mode / no slot / no pages)\n",
-                                     "proc run: 建进程失败（共享地址空间模式 / 槽满 / 页不足）\n"));
-                return false;
-            }
-            const int rc = proc64_start_elf64(pid, path);
-            if (rc != 0) {
-                proc64_destroy64(pid);
-                if (expect_alive) panic64_watchdog_unpause64();
-                ts_puts(ts, "proc run: start failed (see serial log)\n");
-                return false;
-            }
-            if (!expect_alive) break;                 // 普通程序可能秒退：不做存活检查
+        const int pid = proc64_create64(name, 0);
+        if (pid < 0) {
+            if (expect_alive) panic64_watchdog_unpause64();
+            ts_puts(ts, gui64_tr("proc run: create failed (shared address space mode / no slot / no pages)\n",
+                                 "proc run: 建进程失败（共享地址空间模式 / 槽满 / 页不足）\n"));
+            return false;
+        }
+        const int rc = proc64_start_elf64(pid, path);
+        if (rc != 0) {
+            proc64_destroy64(pid);
+            if (expect_alive) panic64_watchdog_unpause64();
+            ts_puts(ts, "proc run: start failed (see serial log)\n");
+            return false;
+        }
+        if (expect_alive) {
             const uint32_t tid = term_proc_task_id64(pid);
             int reached = 0;
             for (int k = 0; k < 40; k++) {            // 最多 40 × 10ms = 400ms
@@ -2160,16 +2336,18 @@ static bool cmd_proc(TerminalState* ts, const char* sub, const char* arg1, const
                 }
                 // READY：还没被调度到，继续等
             }
-            if (reached) break;                       // 成功：任务已经真的跑在 ring3 里
-            dbg64_line_begin64();
-            dbg64_str("[TERM] proc run spin died early pid=");
-            dbg64_dec((uint64_t)pid);
-            dbg64_str(" tid=");
-            dbg64_dec((uint64_t)tid);
-            dbg64_str(" -> retry\n");
-            dbg64_line_end64();
-            proc64_destroy64(pid);                    // 收尸：让下一轮拿干净槽
-            pid = -1;
+            panic64_watchdog_unpause64();
+            if (!reached) {
+                dbg64_line_begin64();
+                dbg64_str("[TERM] proc run spin died early pid=");
+                dbg64_dec((uint64_t)pid);
+                dbg64_str(" tid=");
+                dbg64_dec((uint64_t)tid);
+                dbg64_str("\n");
+                dbg64_line_end64();
+                ts_puts(ts, "proc run: process died before entering ring3 (see serial log)\n");
+                return false;
+            }
         }
         if (expect_alive) panic64_watchdog_unpause64();
         if (pid < 0) {
@@ -2224,18 +2402,25 @@ static void cmd_about(TerminalState* ts) {
         "  - drivers: PS/2 keyboard + mouse, VBE LFB framebuffer, TrueType fonts\n"
         "  - desktop shell: windows, apps, taskbar, dirty-rect flips\n"
         "  - scheduler: kernel tasks (task64), used by ps/tasks/kill and the task manager\n"
-        "  - terminal: character grid + built-in shell + 16x512B ramfs (RAM only; VimtuFS2 is on disk)\n"
-        "  - real filesystem: VimtuFS2 (vfs64), settings persisted by store64 in /store.a|/store.b\n");
+        "  - terminal: character grid + built-in shell; files are REAL now (kernel/fd64.cpp -> VimtuFS2)\n"
+        "  - real filesystem: VimtuFS2 (vfs64); /spin.elf + /filedemo.elf installed on terminal open;\n"
+        "    settings persisted by store64 in /store.a|/store.b\n");
     ts_puts(ts, gui64_tr("  - sysstate64: state machine + module registry + health + 64-line ring log (syslog)\n"
                          "  - config64/session64: typed config + session policy, persisted to VimtuFS2 /store.a|b\n"
                          "  - panic64: blue screen (panic/bsod) + watchdog on the gui64 frame heartbeat\n"
                          "  - batch A2: task64 stats/critical/slice/force-remove+diag, preload64 (glyph+icon prewarm),\n"
-                         "    update64 (marker->apply->restart loop; NOT a real upgrade package), proc64 process page in the task manager\n",
+                         "    update64 (marker->apply->restart loop; NOT a real upgrade package), proc64 process page in the task manager\\n"
+                         "  - batch B: runtime display layer (boot mode list + measured 0x3DA refresh vs EDID preferred),\\n"
+                         "    display/hz/edid command, hwinfo wired into task manager + settings, terminal files on the real\\n"
+                         "    VimtuFS2 via kernel/fd64 (ring3 open/read/close too), GPU item in the perf page, in_ring3 slot fix\\n",
                          "  - sysstate64：状态机 + 模块注册表 + 健康报告 + 64 条 ring log（syslog）\n"
                          "  - config64/session64：类型化配置 + 会话策略，持久化在 VimtuFS2 的 /store.a|b\n"
                          "  - panic64：蓝屏（panic/bsod）+ 看门狗（心跳源 = gui64 帧）\n"
                          "  - 批次 A 后半：task64 统计/关键任务/时间片/强制移除+诊断、preload64（字形+图标预热）、\n"
-                         "    update64（标记->应用->重启闭环；不是真正的升级包）、任务管理器进程页接 proc64 真进程\n"));
+                         "    update64（标记->应用->重启闭环；不是真正的升级包）、任务管理器进程页接 proc64 真进程\\n"
+                         "  - 批次 B：运行期显示层（引导模式清单 + 0x3DA 实测刷新率与 EDID 首选时序对比）、display/hz/edid 命令、\\n"
+                         "    hwinfo 接进任务管理器与设置页、终端文件命令走真 VimtuFS2（fd64；ring3 open/read/close 同源）、\\n"
+                         "    性能页补\\\"显卡\\\"项、in_ring3 槽位 kill 后复用的缺陷根治\\n"));
 }
 
 static void cmd_clear(TerminalState* ts) {
@@ -2280,7 +2465,7 @@ static void shell_exec(TerminalState* ts, const char* line) {
     } else if (st_eq(g_cmd, "perf")) {
         cmd_perf(ts);
     } else if (st_eq(g_cmd, "disp") || st_eq(g_cmd, "display")) {
-        cmd_disp(ts);
+        ok = cmd_display(ts, g_arg1);
     } else if (st_eq(g_cmd, "ls") || st_eq(g_cmd, "dir")) {
         cmd_ls(ts);
     } else if (st_eq(g_cmd, "cat")) {
@@ -2293,6 +2478,20 @@ static void shell_exec(TerminalState* ts, const char* line) {
         ok = cmd_rm(ts, g_arg1);
     } else if (st_eq(g_cmd, "echo")) {
         ok = cmd_echo(ts, args);
+    } else if (st_eq(g_cmd, "mkdir") || st_eq(g_cmd, "md")) {
+        // 真：vfs64_mkdir（阶段一：父目录固定为根，单层）
+        ok = cmd_mkdir(ts, g_arg1);
+    } else if (st_eq(g_cmd, "df")) {
+        // 真：VimtuFS2 卷几何（总块/空闲块/已用）+ 实时文件统计
+        ok = cmd_df(ts);
+    } else if (st_eq(g_cmd, "fd")) {
+        // 真：FD 层现状（fd 表 / 每槽 path+游标）；也打 [FD64] dump 行
+        fd64_dump64();
+        ts_puts(ts, "FD layer dump written to serial ([FD64] dump ...); table=");
+        ts_put_u64(ts, (uint64_t)FD64_MAX);
+        ts_puts(ts, "  file_max=");
+        ts_put_u64(ts, (uint64_t)FD64_FILE_MAX);
+        ts_putc(ts, (uint32_t)'\n');
     } else if (st_eq(g_cmd, "lang") || st_eq(g_cmd, "language")) {
         ok = cmd_lang(ts, g_arg1);
     } else if (st_eq(g_cmd, "set")) {
@@ -2558,7 +2757,7 @@ static void term_init_once() {
     g_next_inst = 1;
     for (int i = 0; i < TERM_PEND_MAX; i++) { g_pend[i] = nullptr; g_pend_tick[i] = 0; }
     g_pend_n = 0;
-    ramfs_init_once();
+    term_install_builtins64();      // /spin.elf + /filedemo.elf（幂等；终端文件命令现在走真 FS）
 }
 
 // 入口：开终端（每次调用都新建窗口 = 多开；已有 4 个时只激活最近的实例）

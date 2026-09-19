@@ -241,6 +241,67 @@ def main():
                   ("[PROC64] exit pid=%s code=137 cr3_released=1" % pid) in log)
         else:
             check("[PROC64] kill 行", "[PROC64] kill pid=" in log)
+        # ---- 4b) 批次 B（新增断言）：性能页"显卡"项 + 硬件详情真值 ----
+        print("--- 批次 B：性能页显卡项与硬件详情 ---")
+        for _attempt in range(3):
+            mon.key("right", wait=1.2)                       # 标签页右移：进程 -> 性能
+            if "[UI] tmgr page perf" in slog(serial):
+                break
+        check("切到性能页（[UI] tmgr page perf）", "[UI] tmgr page perf" in slog(serial))
+        log = wait_for(serial, "[UI] tmgr perf sel=cpu", 10, proc)
+        check("性能页打点 [UI] tmgr perf sel=cpu gpu=... hw=...", "[UI] tmgr perf sel=cpu gpu=" in log)
+        for _ in range(3):                                    # CPU -> 内存 -> 磁盘 -> 显卡
+            mon.key("down", wait=0.7)
+        log = wait_for(serial, "[UI] tmgr perf sel=gpu", 10, proc)
+        rx_gpu = re.compile(
+            r"\[UI\] tmgr perf sel=gpu gpu=(\S+) (\d+)x(\d+)@32bpp zoom=(\d+)% refresh=(\S+) "
+            r"src=(\S+) edid_match=([01]) hw=cpu=(\S+) cores=(\d+) hyp=(\S+) ram_mb=(\d+) "
+            r"page_pool_kb=(\d+) page_free_kb=(\d+) disk=(.+?) disk_mb=(\d+) net=(\S+)"
+            r"(?: mac=([0-9a-fA-F:]+))? tx=(\d+) rx=(\d+) usb=(.+?) usb_ports=(\d+) usb_devs=(\d+) "
+            r"apic=(\S+) acpi_cpus=(\d+) smp_online=(\d+) page_size=(\d+)")
+        mg = rx_gpu.search(log)
+        check("显卡项真值 [UI] tmgr perf sel=gpu gpu=.. hw=..", bool(mg),
+              mg.group(0) if mg else "（缺 sel=gpu 行）")
+        if mg:
+            check("显卡项内容 = 帧缓冲指标（gpu=framebuffer WxH@32bpp zoom）",
+                  mg.group(1) == "framebuffer" and int(mg.group(2)) >= 320 and int(mg.group(3)) >= 200,
+                  "gpu=%s %sx%s zoom=%s%%" % (mg.group(1), mg.group(2), mg.group(3), mg.group(4)))
+            check("hw= 里 CPU 型号/核数/虚拟化是真值", len(mg.group(8)) >= 3 and int(mg.group(9)) >= 1,
+                  "cpu=%s cores=%s hyp=%s" % (mg.group(8), mg.group(9), mg.group(10)))
+            check("hw= 里内存总量/页池 > 0", int(mg.group(11)) > 0 and int(mg.group(12)) > 0,
+                  "ram_mb=%s page_pool_kb=%s" % (mg.group(11), mg.group(12)))
+            check("hw= 里磁盘型号/容量是真值（IDENTIFY -> hwinfo64）",
+                  mg.group(14) != "none" and int(mg.group(15)) > 0,
+                  "disk=%s disk_mb=%s" % (mg.group(14).strip(), mg.group(15)))
+            check("hw= 里 APIC/SMP 状态与页大小是真值",
+                  mg.group(23) in ("APIC", "PIC") and int(mg.group(24)) >= 1
+                  and int(mg.group(26)) == 4096,
+                  "apic=%s acpi_cpus=%s smp_online=%s page_size=%s"
+                  % (mg.group(23), mg.group(24), mg.group(25), mg.group(26)))
+        # ---- 4c) 批次 B（新增断言）：设置页"设备规格"含 RAM / 磁盘 / VGA 真值 ----
+        print("--- 批次 B：设置页设备规格 ---")
+        for _attempt in range(3):
+            mon.key("meta_l", wait=0.9)
+            mon.key("6", wait=2.5)                            # 开始菜单第 6 项 = 设置
+            if "[APP] settings opened" in slog(serial):
+                break
+        check("设置应用能打开（[APP] settings opened）", "[APP] settings opened" in slog(serial))
+        mon.key("1", wait=1.5)                                # 页序 1 = 系统（设备规格）
+        log = wait_for(serial, "[UI] settings specs ram=", 12, proc)
+        rx_spec = re.compile(
+            r"\[UI\] settings specs ram=(\d+)MB cpu=(\S+) cores=(\d+) disk=(.+?) "
+            r"vga=framebuffer (\d+)x(\d+)@32bpp refresh=(\S+)Hz src=(\S+) net=(\S+) usb=(.+?) "
+            r"apic=(\S+) acpi_cpus=(\d+) smp_online=(\d+)")
+        ms = rx_spec.search(log)
+        check("设备规格打点 [UI] settings specs ram=.. disk=.. vga=..", bool(ms),
+              ms.group(0) if ms else "（缺 specs 行）")
+        if ms:
+            check("规格页 RAM 总量 > 0", int(ms.group(1)) > 0, "ram_mb=%s" % ms.group(1))
+            check("规格页磁盘型号是真值（不是空/未移植文案）",
+                  ms.group(4).strip() not in ("", "none"), "disk=%s" % ms.group(4).strip())
+            check("规格页 VGA = 帧缓冲分辨率（真值）",
+                  int(ms.group(5)) >= 320 and int(ms.group(6)) >= 200,
+                  "vga=%sx%s refresh=%sHz src=%s" % (ms.group(5), ms.group(6), ms.group(7), ms.group(8)))
 
         # ---- 4) 禁止出现 ----
         print("--- 禁止出现 ---")

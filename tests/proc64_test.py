@@ -447,6 +447,22 @@ def main():
         check("三步顺序正确（kill -> exit -> reap）", 0 <= idx_k < idx_e < idx_r)
     else:
         check("解析到 [PROC64] kill pid=.. sig=15", False)
+    # ---- 批次 B（新增断言）：in_ring3 清位缺陷根治的回归证据 ----
+    # 内核启动期跑 4 轮"建 ring3 进程(/spin.elf) -> 真进 ring3 -> kill(9) -> 收尸 -> 复用同一槽"，
+    # 每轮打 round=.. slot=.. enter=ok；杀掉的进程当时在 ring3 里（spin 永不退出），
+    # 所以这正是会留下脏 in_ring3 位的场景。
+    print("--- 批次 B：kill 后同槽复用再进 ring3（in_ring3 清位缺陷回归）---")
+    reuse = re.findall(r"\[USER64\] slotreuse round=(\d+) slot=(\d+) pid=(\d+) enter=ok", log)
+    check("slotreuse 循环 >= 4 轮（kill + 同槽再进 ring3）", len(reuse) >= 4,
+          "rounds=%d" % len(reuse))
+    reuse_slots = sorted(set(int(r[1]) for r in reuse))
+    check("4 轮必须复用同一个任务槽（不动槽就是没复用到）",
+          len(reuse) >= 4 and len(reuse_slots) == 1, "slots=%s" % reuse_slots)
+    check("内核自证 [USER64] slotreuse PASS rounds=4",
+          "[USER64] slotreuse PASS rounds=4" in log)
+    check("清位钩子真的触发过（[USER64] slot release slot=.. in_ring3=1 -> cleared）",
+          re.search(r"\[USER64\] slot release slot=\d+ in_ring3=1 -> cleared", log) is not None)
+    check("没有任何 [USER64] enter FAILED（缺陷已根治）", "[USER64] enter FAILED" not in log)
 
     print("--- 禁止出现 ---")
     for needle in FORBIDDEN:

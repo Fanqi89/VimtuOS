@@ -74,6 +74,9 @@ def main():
                     help="要打开的**菜单序号**（逗号分隔）：1终端 2我的电脑 3系统监视器 4计算器 5扫雷 6设置 7任务管理器 8关于（别选 0重启/9关机）")
     ap.add_argument("--no-apps", action="store_true")
     ap.add_argument("--port", type=int, default=5599)
+    ap.add_argument("--keys", default="",
+                    help="打开应用后再注入的 QEMU sendkey 名（逗号分隔），例如 'right,down,down,down' "
+                         "把任务管理器切到性能页并把选中项移到\"显卡\"；'1' 把设置页切到\"系统（设备规格）\"")
     args = ap.parse_args()
 
     if not os.path.exists(args.img):
@@ -136,6 +139,15 @@ def main():
                 print("[shot] 已打开菜单序号 %d（按键 %s）" % (idx, digit))
             time.sleep(1.5)
 
+        # 可选的页面导航键（批次 B）：例如 tmgr 性能页 -> 显卡项，或设置页 -> 系统（设备规格）
+        if args.keys.strip():
+            for k in args.keys.split(","):
+                k = k.strip()
+                if not k:
+                    continue
+                mon_send(args.port, "sendkey %s" % k, wait=0.9)
+                print("[shot] 注入按键 %s" % k)
+            time.sleep(1.2)
         # 把鼠标挪到画面中间偏下，避免光标压在窗口标题上
         mon_send(args.port, "mouse_move 200 120", wait=0.8)
         time.sleep(0.8)

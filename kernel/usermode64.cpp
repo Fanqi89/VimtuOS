@@ -120,6 +120,33 @@ static inline void u64_in_ring3_set64(int on) {
 }
 static inline bool u64_in_ring3_get64() { return (g_user64_in_ring3_mask64 >> u64_ctx_slot64()) & 1u; }
 
+// ==================== 槽位回收（给 task64 的回收/强杀路径调用）====================
+// 缺陷与修法见 usermode64.h 的同名声明。三条不可少的动作：
+//   1) 清 in_ring3 位（不这么做，复用该槽的新任务就是 reason=2 进不去）；
+//   2) 清每任务保存区（rsp/callee-saved）—— 死任务永远不会再读它，但留着脏数据没有意义，
+//      也会让"槽位到底干净不干净"这件事无从核对；
+//   3) 如果汇编指针 g_user64_ctxp64 正好指着这一槽，就把它挪回 0 号槽（防御：任何后续
+//      误用都指向一块静态内存，而不是某个已被 memset 的任务状态）。
+// 调用时机关中断（task_drain_reap 的临界区）/ 单 CPU：位图与保存区的读改写不会被并发穿插。
+extern "C" void user64_slot_release64(int slot) {
+    if (slot < 0 || slot >= U64_CTX_MAX) return;
+    const uint32_t bit = 1u << slot;
+    const bool was_in_ring3 = (g_user64_in_ring3_mask64 & bit) != 0;
+    g_user64_in_ring3_mask64 &= ~bit;
+    uint64_t* w = (uint64_t*)&g_user64_ctx64[slot];
+    for (uint32_t i = 0; i < (uint32_t)(sizeof(User64Ctx64) / sizeof(uint64_t)); i++) w[i] = 0;
+    if (g_user64_ctxp64 == (uint64_t)(uintptr_t)&g_user64_ctx64[slot]) {
+        g_user64_ctxp64 = (uint64_t)(uintptr_t)&g_user64_ctx64[0];
+    }
+    if (was_in_ring3) {                         // 只有真的清掉脏位才打点（正常退出/普通任务不打）
+        dbg64_line_begin64();
+        dbg64_str("[USER64] slot release slot=");
+        dbg64_dec((uint64_t)slot);
+        dbg64_str(" in_ring3=1 -> cleared\n");
+        dbg64_line_end64();
+    }
+}
+
 // ==================== 进出 ring3 的汇编桥 ====================
 // 只能写在文件作用域的 asm 块里：这两段是"半个函数"的跳转目标，C++ 表达不出来。
 //   user64_enter64(rdi = 目标帧)：保存内核继续点（rsp + callee-saved）后跳 task_switch_iret64。

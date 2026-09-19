@@ -23,6 +23,19 @@
 #include "usb64.h"      // USB 主机（UHCI）：kusb 内核线程只调 usb64_poll64()
 #include "syscall64.h"  // g_syscall64_kstack64：SYSCALL 入口专用栈顶（每任务一份，见 task_apply_ctx64）
 
+// ==================== ring3 槽位状态清理钩子（批次 B：缺陷根治）====================
+// usermode64.cpp 的 in_ring3 是**按任务槽位**的位图；ring3 进程被 kill 时不会从
+// user64_enter64 正常返回，位就永远留在那个槽上 -> 复用该槽的新任务进 ring3 会失败
+// （[USER64] enter FAILED reason=2）。所以任务被强杀/退出/回收时，必须把该槽的
+// ring3 状态清干净（位 + 每任务保存区），这就是本文件四处调用点的唯一目的：
+//   task_kill64（标记 DEAD）/ task_drain_reap（真正回收）/ task_exit64（自杀）/ task64_force_remove64。
+// 用 weak 引用：安装介质内核不链 task64.cpp（这条无所谓），而反过来 task64.cpp 单独链接
+// 做单元测试时也不该被硬依赖卡住；判空后调用即可。
+extern "C" void user64_slot_release64(int slot) __attribute__((weak));
+static inline void task64_release_ring3_slot64(int slot) {
+    if (user64_slot_release64) user64_slot_release64(slot);
+}
+
 // ==================== 任务表 ====================
 struct Task64 {
     uint64_t frame;          // 保存的中断帧指针（0 = 未启动/已死）
@@ -313,6 +326,9 @@ static void task_drain_reap() {
         const int slot = g_reap_slot[i];
         Task64* t = &g_tasks[slot];
         if (t->state == TASK64_DEAD && slot != g_cur) {
+            // ★ 批次 B：先把该槽的 ring3 状态清干净，再回收 TCB（缺陷根治，见文件首的说明）。
+            //   必须在 tz_memset 之前、在同一个关中断临界区里做。
+            task64_release_ring3_slot64(slot);
 #ifndef VIMTU_INSTALLER_MEDIA
             if (t->quiet) stress_reap_pad64();   // 压力放大镜：只对压力子任务、且只在可被中断时放大
 #endif
@@ -849,7 +865,7 @@ void task_sleep64(uint32_t ms) {
     (void)if_hold;
     c->state = TASK64_DEAD;
     c->frame = 0;                            // 死任务不再需要帧
-
+    task64_release_ring3_slot64(me);         // ★ 批次 B：自杀路径也清 ring3 槽位状态（见文件首说明）
     int next = pick_next_in(g_tasks, me, TASK64_MAX);
     if (next < 0) next = 0;                  // 没有别的就绪任务：回 idle（任务 0）
     if (next == me) {
@@ -1055,6 +1071,7 @@ int task_kill64(uint32_t id) {
 
         t->state = TASK64_DEAD;
         t->frame = 0;
+        task64_release_ring3_slot64(i);      // ★ 批次 B：被杀的 ring3 进程不会正常返回 -> 在这里清位
         task_queue_reap(i);
         return 0;
     }
@@ -1125,6 +1142,13 @@ int task64_mark_critical64(uint32_t id, int critical) {
     return 0;
 }
 
+// 批次 B：安静开关（只改字段，不打点 —— 打点就会把 reap/create 日志带回来，见 task64.h 的说明）。
+int task64_set_quiet64(uint32_t id, int quiet) {
+    const int slot = task_slot_of_id64(id);
+    if (slot < 0) return -1;
+    g_tasks[slot].quiet = quiet ? 1u : 0u;
+    return 0;
+}
 int task64_set_slice64(uint32_t id, uint32_t ticks) {
     const int slot = task_slot_of_id64(id);
     if (slot < 0) return -1;
@@ -1180,6 +1204,7 @@ int task64_force_remove64(uint32_t id) {
     const uint32_t tid = t->id;
     char nm[TASK64_NAME_MAX];
     tz_strcpy_n(nm, t->name, TASK64_NAME_MAX);
+    task64_release_ring3_slot64(slot);            // ★ 批次 B：强制移除也清 ring3 槽位状态
     if (t->stack_base) kfree_64((void*)(uintptr_t)t->stack_base);
     tz_memset(t, 0, sizeof(Task64));
     t->state = TASK64_FREE;

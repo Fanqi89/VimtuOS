@@ -53,6 +53,15 @@
 #include "edid64.h"      // 显示器 EDID 解析结果（刷新率/名字/尺寸）：只读，不改 fb 状态
 #include "config64.h"    // 本轮接线：语言/缩放/会话策略都落在这里（-> store64 持久化）
 #include "session64.h"   // 本轮接线：会话页 = session64 的真策略与 keep 开关
+// ---- 批次 B：设备规格页的真实数据源（全部只读快照；取不到就写原因）----
+#include "display64.h"   // 运行期显示层（0x3DA 实测刷新率 / 模式清单 / EDID 对比）
+#include "hwinfo64.h"    // CPU 型号/家族/核数/hypervisor + PCI + 磁盘型号/容量
+#include "net64.h"       // e1000 状态 + 收发计数
+#include "e1000_64.h"    // e1000_mac64：网卡 MAC
+#include "usb64.h"       // UHCI 控制器/HID 计数
+#include "acpi64.h"      // MADT CPU 数
+#include "smp64.h"       // SMP 在线 CPU 数
+#include "apic64.h"      // IRQ_MODE64_*：中断路由模式
 
 // ==================== 常量 ====================
 #define SET_W      700          // 窗口整体尺寸（含标题栏/边框；与 32 位 SET_W/SET_H 一致）
@@ -114,6 +123,8 @@ static uint32_t g_msg_col = C_DIM;
 static int      g_prev_cw = -1, g_prev_ch = -1;   // 布局日志去重（每帧打会刷屏）
 static bool     g_close_logged = false;           // "[APP] settings closed" 只打一次
 static bool     g_hz_logged = false;              // 显示页刷新率来源只在首次出值时打一行（自动验收 grep）
+static bool     g_specs_logged = false;           // 批次 B：设备规格页首次绘制的 [UI] settings specs 行
+static bool     g_measure_logged = false;         // 批次 B：显示页首次绘制的实测刷新率来源行
 
 // ==================== 迷你字符串工具（无 libc） ====================
 // 缺 API 的自建替代 #1：内核没有 snprintf/strcat，这里做一个定长追加缓冲。
@@ -617,6 +628,29 @@ static void draw_display(Window* w, const Lay* L, int x0, int y0) {
                 logln("[UI] settings display hz=unknown source=none (no EDID from firmware)");
             }
         }
+        // 批次 B：同一处再打一条**实测**来源行（0x3DA / CRTC；不可测时如实写 n/a）。
+        // 上面的 hz= 行保持原格式不动（display64_test.py 的既有断言），这条是新证据。
+        if (!g_measure_logged) {
+            g_measure_logged = true;
+            const Disp64Info* di = display64_info64();
+            dbg64_line_begin64();
+            dbg64_str("[UI] settings display measure=");
+            if (di->vga_x10 > 0) {
+                char rb[16];
+                display64_refresh_str64(rb, (int)sizeof(rb));
+                dbg64_str(rb);
+                dbg64_str("Hz source=vga 0x3da samples=");
+                dbg64_dec((uint64_t)di->vga_samples);
+            } else {
+                dbg64_str("n/a source=none samples=");
+                dbg64_dec((uint64_t)di->vga_samples);
+                dbg64_str(" edges=");
+                dbg64_dec((uint64_t)di->vga_edges);
+                dbg64_str(" (0x3DA not measurable on this platform; EDID used)");
+            }
+            dbg64_nl();
+            dbg64_line_end64();
+        }
     }
 
     // 3) 缩放：真设置（fb_set_zoom）
@@ -808,9 +842,155 @@ static void draw_system(const Lay* L, int x0, int y0) {
         draw_row(lx, lxv, y, zh ? "镜像总量" : "Image size", b.b);
         y += pitch;
     }
+    // ---- 批次 B：真实设备规格（hwinfo64 / display64 / net64 / usb64 / acpi64 / smp64）----
+    // 全部只读快照；每项注明来源，取不到写原因。行数超出客户区就停（窗口可自由缩放）。
+    {
+        const int y_max = y0 + L->ch - 4;
+        const HwInfo64* hw = hw_info64();
+        const Disp64Info* di = display64_info64();
+        const bool hw_ok = (hw->magic == HW64_INFO_MAGIC);
+        {
+            Buf b; b_init(&b);
+            b_str(&b, (hw_ok && hw->cpu.vendor[0]) ? hw->cpu.vendor : "unknown");
+            b_str(&b, "  ");
+            b_str(&b, (hw_ok && hw->cpu.brand[0]) ? hw->cpu.brand : "unknown");
+            if (y + pitch <= y_max) { draw_row(lx, lxv, y, zh ? "CPU 厂商/型号" : "CPU vendor/brand", b.b); y += pitch; }
+        }
+        {
+            Buf b; b_init(&b);
+            b_str(&b, zh ? "家族 " : "family "); b_u64(&b, hw_ok ? hw->cpu.family : 0);
+            b_str(&b, zh ? " 型号 " : " model ");  b_u64(&b, hw_ok ? hw->cpu.model : 0);
+            b_str(&b, zh ? " 步进 " : " step ");   b_u64(&b, hw_ok ? hw->cpu.stepping : 0);
+            b_str(&b, zh ? " 逻辑核 " : " logical cores "); b_u64(&b, hw_ok ? (hw->cpu.cores ? hw->cpu.cores : 1) : 1);
+            b_str(&b, zh ? " 虚拟化 " : " hypervisor ");
+            b_str(&b, (hw_ok && hw->cpu.hypervisor[0]) ? hw->cpu.hypervisor : "none");
+            if (y + pitch <= y_max) { draw_row(lx, lxv, y, zh ? "CPU 规格" : "CPU details", b.b); y += pitch; }
+        }
+        {
+            Buf b; b_init(&b);
+            b_str(&b, (g_irq_mode64 == IRQ_MODE64_APIC) ? "APIC(LAPIC+IOAPIC)" : "8259 PIC");
+            b_str(&b, zh ? "  ACPI CPU 数 " : "  ACPI cpus ");
+            b_u64(&b, (uint64_t)acpi_cpu_count64());
+            b_str(&b, zh ? "  SMP 在线 " : "  SMP online ");
+            b_u64(&b, (uint64_t)smp64_online_cpu_count64());
+            if (y + pitch <= y_max) { draw_row(lx, lxv, y, zh ? "中断/多核" : "IRQ / SMP", b.b); y += pitch; }
+        }
+        {
+            // 磁盘：ata64 的 IDENTIFY 结果经 hwinfo_set_disk64 填进 hwinfo64（真值）
+            Buf b; b_init(&b);
+            const char* dm = nullptr;
+            uint64_t dsec = 0;
+            int dcount = 0;
+            if (hw_ok) {
+                for (uint32_t i = 0; i < HW64_DISK_MAX; i++) {
+                    if (!hw->disks[i].present) continue;
+                    dcount++;
+                    if (!dm) { dm = hw->disks[i].model[0] ? hw->disks[i].model : "(no model)"; dsec = hw->disks[i].sectors_512; }
+                }
+            }
+            if (dm) {
+                b_str(&b, dm); b_str(&b, "  ");
+                b_u64(&b, dsec / 2048u); b_str(&b, zh ? " MB（LBA28 PIO）" : " MB (LBA28 PIO)");
+                if (dcount > 1) { b_str(&b, zh ? "  +" : "  +"); b_u64(&b, (uint64_t)(dcount - 1)); b_str(&b, zh ? " 块盘" : " more"); }
+            } else {
+                b_str(&b, zh ? "无（IDENTIFY 没报告 ATA 盘）" : "none (IDENTIFY reported no ATA disk)");
+            }
+            if (y + pitch <= y_max) { draw_row(lx, lxv, y, zh ? "磁盘（IDENTIFY）" : "Disk (IDENTIFY)", b.b); y += pitch; }
+        }
+        {
+            // 显示适配器：帧缓冲指标 + 实测/EDID 刷新率（无 GPU 驱动，如实）
+            Buf b; b_init(&b);
+            b_str(&b, zh ? "帧缓冲 " : "framebuffer ");
+            b_int(&b, fb_phys_width()); b_str(&b, "x"); b_int(&b, fb_phys_height());
+            b_str(&b, "@32bpp  zoom "); b_int(&b, fb_get_zoom()); b_ch(&b, '%');
+            b_str(&b, zh ? "  刷新 " : "  refresh ");
+            if (di->refresh_x10 > 0) {
+                char rb[16];
+                display64_refresh_str64(rb, (int)sizeof(rb));
+                b_str(&b, rb); b_str(&b, "Hz("); b_str(&b, display64_src_name64(di->src)); b_str(&b, ")");
+            } else {
+                b_str(&b, zh ? "未知" : "unknown");
+            }
+            if (y + pitch <= y_max) { draw_row(lx, lxv, y, zh ? "显示适配器 (VGA)" : "Display adapter (VGA)", b.b); y += pitch; }
+        }
+        {
+            Buf b; b_init(&b);
+            const uint8_t* mac = e1000_mac64();
+            b_str(&b, "e1000 "); b_str(&b, net64_state_str64());
+            if (mac) {
+                static const char* const HD = "0123456789abcdef";
+                b_str(&b, "  MAC ");
+                for (int i = 0; i < 6; i++) {
+                    char mm[4];
+                    mm[0] = HD[mac[i] >> 4]; mm[1] = HD[mac[i] & 0xF];
+                    mm[2] = (i == 5) ? 0 : ':'; mm[3] = 0;
+                    b_str(&b, mm);
+                }
+            } else {
+                b_str(&b, zh ? "  MAC 无" : "  MAC none");
+            }
+            b_str(&b, zh ? "  发送 " : "  tx "); b_u64(&b, net64_tx_frames64());
+            b_str(&b, zh ? "  接收 " : "  rx "); b_u64(&b, net64_rx_frames64());
+            if (y + pitch <= y_max) { draw_row(lx, lxv, y, zh ? "网络 (e1000)" : "Network (e1000)", b.b); y += pitch; }
+        }
+        {
+            Buf b; b_init(&b);
+            b_str(&b, "UHCI "); b_str(&b, usb64_state_str64());
+            b_str(&b, zh ? "  端口 " : "  ports "); b_u64(&b, (uint64_t)usb64_ports64());
+            b_str(&b, zh ? "  设备 " : "  devs ");  b_u64(&b, (uint64_t)usb64_devices64());
+            b_str(&b, "  HID "); b_u64(&b, usb64_hid_reports64());
+            b_str(&b, zh ? "  按键 " : "  keys "); b_u64(&b, usb64_key_events64());
+            if (y + pitch <= y_max) { draw_row(lx, lxv, y, zh ? "USB 主机" : "USB host", b.b); y += pitch; }
+        }
+        // 自动验收打点（只打一次）：[UI] settings specs ram=... disk=... vga=...
+        if (!g_specs_logged) {
+            g_specs_logged = true;
+            const char* dm = "none";
+            if (hw_ok) {
+                for (uint32_t i = 0; i < HW64_DISK_MAX; i++) {
+                    if (hw->disks[i].present) { dm = hw->disks[i].model[0] ? hw->disks[i].model : "(no model)"; break; }
+                }
+            }
+            dbg64_line_begin64();
+            dbg64_str("[UI] settings specs ram=");
+            dbg64_dec(mem_total_ram_64() / (1024ull * 1024ull));
+            dbg64_str("MB cpu=");
+            dbg64_str((hw_ok && hw->cpu.vendor[0]) ? hw->cpu.vendor : "unknown");
+            dbg64_str(" cores=");
+            dbg64_dec((uint64_t)(hw_ok ? (hw->cpu.cores ? hw->cpu.cores : 1) : 1));
+            dbg64_str(" disk=");
+            dbg64_str(dm);
+            dbg64_str(" vga=framebuffer ");
+            dbg64_dec((uint64_t)fb_phys_width());
+            dbg64_str("x");
+            dbg64_dec((uint64_t)fb_phys_height());
+            dbg64_str("@32bpp refresh=");
+            if (di->refresh_x10 > 0) {
+                char rb[16];
+                display64_refresh_str64(rb, (int)sizeof(rb));
+                dbg64_str(rb);
+            } else {
+                dbg64_str("unknown");
+            }
+            dbg64_str("Hz src=");
+            dbg64_str(display64_src_name64(di->src));
+            dbg64_str(" net=");
+            dbg64_str(net64_state_str64());
+            dbg64_str(" usb=");
+            dbg64_str(usb64_state_str64());
+            dbg64_str(" apic=");
+            dbg64_str((g_irq_mode64 == IRQ_MODE64_APIC) ? "APIC" : "PIC");
+            dbg64_str(" acpi_cpus=");
+            dbg64_dec((uint64_t)acpi_cpu_count64());
+            dbg64_str(" smp_online=");
+            dbg64_dec((uint64_t)smp64_online_cpu_count64());
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
     if (y + font_line_height() <= y0 + L->ch - 4) {
-        ui_text(lx, y, zh ? "数据来源：E820 / fb 驱动 / 堆统计，全部为实测"
-                          : "Sources: E820, fb driver, heap stats (all measured)",
+        ui_text(lx, y, zh ? "数据来源：E820 / fb 驱动 / 堆统计 / hwinfo64 / display64 / net64 / usb64，全部为实测"
+                          : "Sources: E820, fb, heap, hwinfo64, display64, net64, usb64 (all measured)",
                 C_FAINT);
     }
 }
@@ -1340,5 +1520,7 @@ void app_settings_reset64() {
     g_prev_cw = -1;
     g_prev_ch = -1;
     g_hz_logged = false;
+    g_specs_logged = false;                         // 批次 B：规格/实测行也随会话重置重打
+    g_measure_logged = false;
     logln("[APP] settings reset");
 }

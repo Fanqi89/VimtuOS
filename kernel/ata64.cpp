@@ -10,6 +10,7 @@
 #include "port.h"
 #include "debug64.h"
 #include "x86_64.h"      // pic_unmask64 / g_ticks64：IRQ14 等待与超时计时
+#include "hwinfo64.h"    // ★ 批次 B：IDENTIFY 成功后把型号/容量填进 hwinfo64 的磁盘表
 
 // ---------------- 端口基址 ----------------
 static inline uint16_t base_port(int drive) {
@@ -232,6 +233,14 @@ bool ata64_identify(int drive, DiskInfo* out) {
     if (out->sectors == 0) {
         // 老盘用 word 57/58（CHS）；这里不换算，直接视为未知
         out->sectors = 0;
+    }
+    // ★ 批次 B：IDENTIFY 的**最终结果**填进 hwinfo64（任务管理器性能页/设置页的磁盘型号与容量
+    //   就是从那里读的）。两点如实口径：
+    //     * sectors==0（没给 LBA28 容量）时不填 —— 宁可不显示，也不写"0 容量"；
+    //     * lba48 传 0：本驱动的读写路径只用 LBA28（见 ata64.h 的限制），不假装支持 LBA48。
+    //   超时保护不在这里加：本函数每一步都走 ata_wait_ready/ata_wait_drq 的有界等待（带超时回退）。
+    if (out->sectors > 0 && drive >= 0 && drive < (int)HW64_DISK_MAX) {
+        hwinfo_set_disk64(drive, out->model, (uint64_t)out->sectors, 0);
     }
     return true;
 }

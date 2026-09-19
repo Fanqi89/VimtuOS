@@ -10,7 +10,8 @@
 > 版本 **0.1.0** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
 > 状态（权威判据：`python tests/status_report.py`）：**完成 27 / 部分 0 / 未做 1（共 28 项能力）**，
 > 唯一未做项是 **Rust 参与实现（可选要求，本机未装 Rust 工具链）**。
-> 全量验收（`--full` + 5 个扩展脚本）：**20 个脚本 / 540 条断言全部 PASS**（2026-09-19 实测）。
+> 全量验收（`--full` + 专项/扩展脚本）：**26 个断言脚本全部 PASS**（2026-09-19 实测；上一批 752 条断言保持全过，
+> 本批次另加 display_runtime 19 + fs_term 32 + proc64 +5 + tmgr_proc +13 = **69 条新断言**）。
 
 ---
 
@@ -42,10 +43,10 @@
 
 | 边界 | 现状 |
 |---|---|
-| ⚠️ **用户态没有独立地址空间** | 所有用户程序共用 4GiB..4GiB+1MiB 的**同一个窗口**；没有 fork / execve / clone，进程之间没有隔离（mmap/brk/mprotect/munmap 都是在这一个窗口里做 bump 分配） |
-| ⚠️ **ELF64 只验证过自有静态程序** | 用 `ld.lld -static -nostdlib` 链接的自己的 ELF64 能 load → ring3 → `syscall` → exit；**glibc / 发行版二进制没有验证过**（缺 execve/fork/clone、vDSO、TLS(FS.base) 真生效、信号投递、futex、动态链接与重定位） |
-| ⚠️ **VFS 是单层路径** | VimtuFS2 只支持 `/name`（无目录树、无 `.`/`..`、无删除目录）；文件名 ≤27B；最多 256 个 inode；单文件 ≤67584B。**终端里的 `ls/cat/write/touch/rm` 仍是内核内最小 ramfs（16 文件 × 512B，RAM only），没接 VimtuFS2**；真文件系统目前由应用安装/加载与 store 使用 |
-| ⚠️ **设置页 UI 还没接 store** | `store64` 本体可用（终端 `store dump\|get\|set\|flush` 真落盘、跨重启保留），但设置页/启动项**没接线**，页面里如实写着"本页设置不落盘" |
+| ⚠️ **用户态独立地址空间** | 批次 C 起：proc64 每进程独立 CR3 + fork/execve/wait4/kill（BIOS 路径）；UEFI（固件页表）下如实降级为共享地址空间模式（`[PROC64] cr3 isolation OFF`） |
+| ⚠️ **ELF64 只验证过自有静态程序** | 用 `ld.lld -static -nostdlib` 链接的自己的 ELF64 能 load → ring3 → `syscall` → exit；**glibc / 发行版二进制没有验证过**（缺 vDSO、TLS(FS.base) 的完整语义、信号投递、futex、动态链接与重定位） |
+| ⚠️ **VFS 是单层路径** | VimtuFS2 只支持 `/name`（无目录树、无 `.`/`..`、无删除目录）；文件名 ≤27B；最多 256 个 inode；单文件 ≤67584B。批次 B 起终端 `ls/cat/write/touch/rm/mkdir/df` 走 `kernel/fd64.cpp` 的 **FD 层（32 项 fd 表）直连 VimtuFS2**，ring3 的 `open/read/write/close` 也接同一层；旧的 16×512B RAM-only ramfs 已删除 |
+| ⚠️ **设置页接线范围** | 显示/会话分区已接 `config64`/`session64`（真落 store64，跨重启保留）；系统/关于页是只读实测值（设备规格来自 hwinfo64/display64/net64/usb64） |
 | ⚠️ **没有 TCP/IP / DHCP / DNS** | 网络只有 IPv4 + ARP + ICMP echo（e1000 轮询收发，无中断收包）；UDP/TCP、路由、DHCP、DNS 都没有；只适配 e1000，VMware 的 vmxnet3 未适配 |
 | ⚠️ **USB 只有 UHCI + HID 引导键盘** | 没有 EHCI(USB 2.0) / xHCI(USB 3.x)，没有 USB 鼠标、U 盘、集线器；只认直接插在根端口上的键盘；不接中断（由 `kusb` 线程轮询） |
 | ⚠️ **AP 只是停着** | SMP 能启动 AP 并让它报在线，但**没有多核调度**（调度器仍单核、IRQ0 只在 BSP）、没有 IPI、没有 per-CPU 数据/GDT/TSS，AP 自己的 LAPIC/中断不参与 |
@@ -70,7 +71,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
 7. **一切自写工具链**：没有 mkfs.fat、没有 mtools —— FAT16 卷、ISO9660 解析与打包、GPT、LBA 回填、PE 摊平、字体子集化（3 套 TTF）、图标生成、VAP64 打包，全是本仓库的 Python 脚本。
 8. **APIC / ACPI / SMP 都带"宁可不启用也不变砖"的回退**：拿不到 ACPI 就留 8259、启动 AP 全程有界超时、每个自检失败都整体回滚，降级路径都有串口证据。
 9. **脏矩形重绘 + 光标不 save-under**：鼠标移动只重绘约 **0.03% 的屏幕像素**（自动验收会断言这个数字），这是从"整屏重绘导致鼠标包读慢、位移被聚合放大"的实测故障里换来的设计。
-10. **每次改动都跑自动验收**：**20 个验收脚本 / 540 条断言**，全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
+10. **每次改动都跑自动验收**：**26 个验收脚本**（≥821 条断言），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
 
 ## 四、系统架构
 
@@ -126,7 +127,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
 ⑤ 构建与验证
    build64.sh     唯一构建脚本（clang/lld/nasm/xorriso/Python）
    tools/*.py     自写打包/诊断：make_iso64 / make_esp / make_flat / make_vap / pe_info / fat_check
-   tests/*.py     20 个验收脚本（540 断言）：串口断言 + screendump 像素断言 + 目标盘字节断言
+   tests/*.py     26 个断言脚本（≥821 断言）：串口断言 + screendump 像素断言 + 目标盘字节断言
 ```
 
 ## 五、快速开始
@@ -210,7 +211,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 
 ## 六、工程质量（这个项目最值得说的部分）
 
-* **20 个验收脚本 / 540 条断言，全部 PASS**（2026-09-19 实测）。`--full` 覆盖 15 个脚本 / **368 条断言**：
+* **26 个断言脚本全部 PASS**（2026-09-19 实测；上一批 752 条断言保持全过 + 本批次新增 69 条）。`--full` 覆盖 20 个脚本 / **562 条断言**：
 
   | 脚本 | 断言 | 脚本 | 断言 |
   |---|---|---|---|
@@ -221,10 +222,13 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
   | screen64_probe.py | 5 | sched_stress_test.py | 18 |
   | iso64_install_test.py | 18 | usb64_test.py | 51 |
   | iso64_usb_test.py | 22 | vmware_install_test.py | 21 |
-  | uefi64_install_test.py | 21 | **小计** | **368** |
+  | uefi64_install_test.py | 21 | proc64_test.py | 64 |
+  | preload_update_test.py | 40 | tmgr_proc_test.py | 39 |
+  | display_runtime_test.py | 19 | fs_term_test.py | 32 |
+  | **小计** | **562** | | |
 
-  另有 5 个专项脚本 / **172 条断言**：`elf64_test` 56、`store64_test` 46、`app64_test` 31、
-  `display64_test` 22、`user64_test` 17。
+  另有专项脚本：`elf64_test` 56、`store64_test` 46、`app64_test` 31、`display64_test` 22、`user64_test` 17
+  （以及 sysstate64_test / ui_extra64_test 等，条数随实现增长）。
 * **三类证据**：
   * **串口级**：每步都打标记（`[LM64]` / `[G64]` / `[SETUP]` / `[PART]` / `[TASK64]` / `[VFS64]` /
     `[STORE64]` / `[SYSCALL]` / `[USER64]` / `[APP64]` / `[ELF64]` / `[APIC]` / `[SMP]` / `[NET64]` /
@@ -265,9 +269,9 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 
 | 顺序 | 目标 | 现状 | 做完能带来什么 |
 |---|---|---|---|
-| ① | **独立地址空间 + fork/execve** | 所有用户程序共用一个 4GiB 窗口 | 真进程隔离；`syscall` 号段的 execve/fork/clone 才有意义 |
+| ① | ~~**独立地址空间 + fork/execve**~~ | 批次 C 已完成（每进程 CR3 + fork/execve/wait4/kill；UEFI 固件页表下如实降级为共享模式） | —— |
 | ② | **glibc 级兼容** | 只验证过自有静态 ELF64 | TLS(FS.base) 真生效、信号投递、vDSO、futex、动态链接与重定位；毕业考试是"静态 busybox 起 shell" |
-| ③ | **VFS 补齐** | 单层路径、无目录树/无 rmdir、单文件 ≤67584B、终端文件命令还是 ramfs | 多级目录 + 目录删除 + 终端接真文件系统 |
+| ③ | **VFS 补齐** | 单层路径、无目录树/无 rmdir、单文件 ≤67584B（终端已接真文件系统；还缺宿主机拷文件的工具） | 多级目录 + 目录删除 + 宿主编排工具 |
 | ④ | **TCP/IP** | 只有 IPv4/ARP/ICMP、静态地址、无中断收包 | DHCP/DNS/UDP/TCP；vmware vmxnet3 适配 |
 | ⑤ | **EHCI / xHCI / USB 存储 / 集线器 / 鼠标** | 只有 UHCI + 根端口 HID 引导键盘 | U 盘、鼠标、带 hub 的真机 |
 | ⑥ | **多核调度** | AP 起来后只是 `cli; hlt`；无 IPI、无 per-CPU 数据 | 真 SMP：AP 参与调度与中断；x2APIC |
@@ -304,8 +308,8 @@ kernel/                 64 位内核 + 桌面 + 应用  69 文件 / 27,599 行
   mem64.cpp x86_64.cpp fb.cpp font.cpp input.cpp ata64.cpp part64.cpp setup64.cpp ...
 tools/                  自写打包/诊断工具（Python，6 脚本 / 1,092 行；根目录另有 6 个 _*.py 资源脚本）
   make_vap.py           VAP64 应用打包器（与 kernel/app64.h 逐字段一致）
-tests/                  验收脚本（24 个 .py，其中 20 个是断言脚本 / 540 断言）
-user/                   ring3 示例程序（4 文件 / 459 行）
+tests/                  验收脚本（32 个 .py，其中 26 个是断言脚本，≥821 断言）
+user/                   ring3 示例程序（5 文件 / 620 行；含 filedemo64.asm 文件读写演示）
   hello64.asm           VAP64 示例（int 0x80 自有 ABI）
   hello_elf64.asm/.ld   ELF64 示例（syscall 指令 Linux 号段 + 用户窗口链接脚本）
 docs/                   架构、安装、UEFI、桌面栈、应用层与系统调用、状态总览等中文文档
@@ -383,14 +387,15 @@ a **self-defined app format (VAP64)** plus an **ELF64 loader** (both install int
 **ACPI parsing + LAPIC/IOAPIC takeover + SMP AP bring-up**, an **EDID runtime display layer**, an
 **e1000 network stack (ARP/ICMP)** and a **UHCI USB host with HID boot keyboard**.
 
-Honest boundaries: user programs share **one 4GiB window** — no independent address spaces, no
-fork/execve; the ELF64 loader is only verified with **our own static binaries** (glibc/distro binaries are
-untested: no vDSO, TLS, signals, futex or dynamic linking); VFS is **single-level** (`/name`, ≤27B names,
-≤67584B files) and the terminal's own file commands still use an in-kernel ramfs; there is no TCP/IP (ARP +
-ICMP only), no EHCI/xHCI/USB storage/hub, and the APs only spin in `cli; hlt` (no multi-core scheduling).
+Honest boundaries: user address spaces are **per-process** on the BIOS path (proc64: own CR3 +
+fork/execve/wait4/kill) and degrade to a shared window on UEFI firmware tables; the ELF64 loader is only
+verified with **our own static binaries** (glibc/distro binaries are untested: no vDSO, signals, futex or
+dynamic linking); VFS is **single-level** (`/name`, ≤27B names, ≤67584B files) and the terminal's file
+commands (`ls/cat/write/touch/rm/mkdir/df`) now use the real VimtuFS2 through the fd64 layer (ring3
+`open/read/write/close` share it); there is no TCP/IP (ARP +
 Everything was validated on **QEMU and VMware, BIOS and UEFI — not on bare metal**.
 
-Quality-wise, every change is verified by **20 test scripts / 540 assertions** that check serial logs, screen
+Quality-wise, every change is verified by **26 assertion scripts (≥821 assertions)** that check serial logs, screen
 pixels (QEMU screendumps) and raw disk bytes. Kernel + bootloader + ring3 samples ≈ **31.6k lines** of
 self-written Python tooling (ISO9660/GPT/FAT16/VAP64 packing, font subsetting, PE/FAT diagnostics).
 test 

@@ -36,6 +36,8 @@
 #include "task64.h"     // 调度器（同样只进系统内核：安装程序内核不链它）
 #ifndef VIMTU_INSTALLER_MEDIA
 #include "usermode64.h" // 用户态（ring3）：建用户页 + 进/出 ring3（只在系统内核路径里调用）
+#include "display64.h"  // 运行期显示层：模式清单 + 0x3DA 实测刷新率 + EDID 对比（只进系统内核）
+#include "fd64.h"       // 小 FD 层（终端文件命令 + ring3 open/read/close 的公共底座）
 #include "syscall64.h"  // int 0x80 系统调用分发（两份内核都链接实现，安装程序不调用）
 #include "app64.h"      // VAP64 可安装应用：安装器 + 启动器（只进系统内核，见 os_boot_path）
 #include "elf64.h"      // ELF64 加载器（自有静态 ELF64 程序 + syscall 指令路径；只进系统内核）
@@ -146,6 +148,149 @@ static uint64_t read_cs64()  { uint64_t v; __asm__ volatile("mov %%cs, %0"  : "=
 //   注意：串口那两行 "[OS] booted from installed disk" 与 "[OS] ready (idle)" 是自动验收
 //   （tests/install_flow_test.py、tests/vmware_install_test.py）依赖的断言，勿删。
 //   安装程序内核不带桌面（gui64.cpp 不进它的链接），所以整段用 #ifndef 包起来。
+// ==================== 批次 B：ring3 槽位复用回归（缺陷根治的现场证明）====================
+// 缺陷：usermode64.cpp 的 in_ring3 是**按任务槽位**的位图；ring3 进程被 kill（SIGKILL/SIGTERM）
+//   时不会从 user64_enter64 正常返回，那一槽的位永远留着 —— 复用该槽的新任务进 ring3 会失败
+//   （[USER64] enter FAILED reason=2）。本批次在 task64 的 kill/reap/exit/force-remove 路径清位。
+// 这个自检就是回归证明：连续 rounds 轮"建 ring3 进程 -> 确认真进 ring3 -> kill(9) -> 收尸 ->
+//   等任务槽回收 -> 下一轮必须复用**同一个槽**并再次成功进 ring3"。
+// 为什么用 /spin.elf：它永不退出（nanosleep 死循环），所以 kill 时**必然**处在 ring3 里 ——
+//   这正是会留下脏位的那个场景（普通会自己退出的程序走的是"正常返回 -> 自己清位"那条路）。
+// 打点（自动验收 grep）：
+//   [USER64] slotreuse round=<n> slot=<s> pid=<p> enter=ok
+//   [USER64] slotreuse PASS rounds=<n> slot=<s>      /  FAIL round=<n> reason=<k>
+#ifndef VIMTU_INSTALLER_MEDIA
+extern "C" const uint8_t _binary_build64_spin64_elf_start[];
+extern "C" const uint8_t _binary_build64_spin64_elf_end[];
+
+// 任务表快照查询（-1 = 该任务已不在表里 = 槽已回收）
+static int k64_task_state_of64(uint32_t id) {
+    for (int i = 0; i < TASK64_MAX; i++) {
+        Task64Info in;
+        if (task_info64(i, &in) == 0) continue;
+        if (in.id == id) return (int)in.state;
+    }
+    return -1;
+}
+static int k64_proc_state_of64(int pid) {
+    for (int i = 0; i < PROC64_MAX; i++) {
+        Proc64Info in;
+        if (proc64_info64(i, &in) == 0) continue;
+        if ((int)in.pid == pid) return (int)in.state;
+    }
+    return -1;
+}
+static uint32_t k64_proc_task_id64(int pid) {
+    for (int i = 0; i < PROC64_MAX; i++) {
+        Proc64Info in;
+        if (proc64_info64(i, &in) == 0) continue;
+        if ((int)in.pid == pid) return in.task_id;
+    }
+    return 0;
+}
+
+static void ring3_slot_reuse_demo64(const char* path, int rounds) {
+    // 幂等安装内嵌 /spin.elf（与终端 `proc run spin` 用的是同一个 blob）
+    uint32_t ty = 0, sz = 0;
+    if (vfs64_stat(path, &ty, &sz) != 0) {
+        const int len = (int)(_binary_build64_spin64_elf_end - _binary_build64_spin64_elf_start);
+        if (len <= 0 || vfs64_write(path, _binary_build64_spin64_elf_start, len) < 0) {
+            dbg64_line_begin64();
+            dbg64_str("[USER64] slotreuse skipped (cannot install /spin.elf)\n");
+            dbg64_line_end64();
+            return;
+        }
+    }
+
+    int slot_expect = -1;
+    int same_slot   = 1;
+    for (int r = 1; r <= rounds; r++) {
+        int reason = 0;
+        const int pid = proc64_create64("slotchk", 0);
+        if (pid < 0) { reason = 1; }                              // 建进程失败
+        if (reason == 0 && proc64_start_elf64(pid, path) != 0) {  // 装载/建任务失败
+            proc64_destroy64(pid);
+            reason = 2;
+        }
+        uint32_t tid = 0;
+        int slot = -1;
+        if (reason == 0) {
+            tid  = k64_proc_task_id64(pid);
+            slot = task_slot_of_id64(tid);
+            if (slot < 0) reason = 3;                             // 拿不到槽位
+        }
+        if (reason == 0) {
+            // 有界等待"真的进了 ring3"：任务被调度过（RUNNING/SLEEP）且进程没有秒退。
+            // 失败模式（reason=2 进不去 ring3）会让进程立刻 EXITED、任务变 DEAD —— 这里必现。
+            task64_set_quiet64(tid, 1);                           // 回归自检的任务安静（原因见 task64.h）
+            int reached = 0;
+            for (int k = 0; k < 120; k++) {                       // 120 × 5ms = 600ms 上限
+                task_sleep64(5);
+                if (k64_proc_state_of64(pid) == (int)PROC64_EXITED) break;
+                const int ts = k64_task_state_of64(tid);
+                if (ts < 0 || ts == TASK64_DEAD) break;
+                if (ts == TASK64_RUNNING || ts == TASK64_SLEEP) { reached = 1; break; }
+            }
+            if (!reached) {
+                reason = 4;                                       // 没被调度起来（或已死）
+            } else {
+                // 再确认一次"稳定活着"（排除刚好采样在失败入口的微秒窗口里）
+                task_sleep64(20);
+                const int ts2 = k64_task_state_of64(tid);
+                const int ps2 = k64_proc_state_of64(pid);
+                if (ts2 < 0 || ts2 == TASK64_DEAD || ps2 == (int)PROC64_EXITED) reason = 5;
+            }
+        }
+
+        if (reason != 0) {
+            if (pid > 0) { (void)proc64_kill64(pid, 9); if (proc64_find64(pid)) proc64_destroy64(pid); }
+            dbg64_line_begin64();
+            dbg64_str("[USER64] slotreuse FAIL round=");
+            dbg64_dec((uint64_t)r);
+            dbg64_str(" reason=");
+            dbg64_dec((uint64_t)reason);
+            dbg64_nl();
+            dbg64_line_end64();
+            return;
+        }
+
+        if (slot_expect < 0) slot_expect = slot;
+        else if (slot != slot_expect) same_slot = 0;
+        dbg64_line_begin64();
+        dbg64_str("[USER64] slotreuse round=");
+        dbg64_dec((uint64_t)r);
+        dbg64_str(" slot=");
+        dbg64_dec((uint64_t)slot);
+        dbg64_str(" pid=");
+        dbg64_dec((uint64_t)pid);
+        dbg64_str(" enter=ok\n");
+        dbg64_line_end64();
+
+        // 真 kill（SIGKILL=9）：进程变 EXITED、任务变 DEAD 并挂进回收队列。
+        // 目标进程此刻在 ring3（spin 的 nanosleep 循环里）—— 正是会留下脏位的场景。
+        (void)proc64_kill64(pid, 9);
+        if (proc64_find64(pid)) proc64_destroy64(pid);
+        // 有界等待任务槽真回收（下一轮才会复用它）；task_sleep64 内部会 task_yield64 -> task_drain_reap。
+        for (int k = 0; k < 100; k++) {                            // 100 × 5ms = 500ms 上限
+            task_sleep64(5);
+            if (k64_task_state_of64(tid) < 0) break;               // 槽已 FREE（任务表里查不到）
+        }
+    }
+
+    dbg64_line_begin64();
+    if (same_slot) {
+        dbg64_str("[USER64] slotreuse PASS rounds=");
+        dbg64_dec((uint64_t)rounds);
+        dbg64_str(" slot=");
+        dbg64_dec((uint64_t)(slot_expect < 0 ? 0 : slot_expect));
+        dbg64_str("\n");
+    } else {
+        dbg64_str("[USER64] slotreuse FAIL reason=6 (slot not reused)\n");
+    }
+    dbg64_line_end64();
+}
+#endif
+
 #ifndef VIMTU_INSTALLER_MEDIA
 [[noreturn]] static void os_boot_path(const BootInfo* bi) {
     dbg64_str("[OS] booted from installed disk (system kernel, no installer)");
@@ -178,6 +323,12 @@ static uint64_t read_cs64()  { uint64_t v; __asm__ volatile("mov %%cs, %0"  : "=
     }
     // ---- ATA：注册/打开 IRQ14，之后读写走中断驱动等待 + 超时回退轮询（只读自检不写盘）----
     ata64_init64();
+    // ---- 运行期显示层：模式清单（0x7400）+ 0x3DA 实测刷新率 + 与 EDID 首选时序对比 + 自检 ----
+    // 位置：fb_init() 已经在 kmain 里跑过（本函数只读 fb 的物理分辨率兜底），g_ticks64 已在走；
+    // 放在 task_start64() 之前 —— 探测本身不需要调度器，跑完再上线。
+    // 边界：运行期 DDC 再探测**不做**（理由见 display64.h），打点里如实写 skipped。
+    display64_init64();
+    (void)display64_selftest64();
     // 调度器上线：任务 0 = 本流程（桌面消息循环），另建 kheart/kwork/ksum 三个内核线程。
     // 必须放在 gui64_run 之前 —— 之后不再返回。
     task_start64();
@@ -240,6 +391,10 @@ static uint64_t read_cs64()  { uint64_t v; __asm__ volatile("mov %%cs, %0"  : "=
                 (void)proc64_selftest64();
                 (void)proc64_install_builtin64(app_drive, app_lba);
                 (void)proc64_demo64("/proc64.elf");
+                // ---- 批次 B：缺陷回归 —— kill 掉 ring3 进程后复用同一任务槽，必须还能进 ring3 ----
+                // 位置在 proc64 演示之后、gui64_run 之前（跑完必须还能进桌面）；只走 BIOS 路径
+                // （UEFI 下用户窗口不可用，上面这一整块已经被 user64_available64() 挡在外面）。
+                ring3_slot_reuse_demo64("/spin.elf", 4);
             } else {
                 proc64_init64();                                 // 仍然打点：mode=shared（如实）
                 (void)proc64_demo64("/proc64.elf");              // 只打一行 "demo skipped (shared address space mode)"
@@ -247,6 +402,9 @@ static uint64_t read_cs64()  { uint64_t v; __asm__ volatile("mov %%cs, %0"  : "=
                 dbg64_str("[APP64] ring3 launches skipped (user window unavailable on this boot path)\n");
                 dbg64_line_end64();
             }
+            // ---- 批次 B：FD 层自检（路径规范化 + 目录句柄）；终端文件命令与 ring3
+            //      open/read/close 都走这一层（kernel/fd64.cpp）。放在 VFS 挂载成功之后。----
+            (void)fd64_selftest64();
         } else {
             dbg64_str("[APP64] boot: vfs64 mount failed -> install/launch skipped (terminal 'run' can retry)\n");
         }

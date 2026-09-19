@@ -12,11 +12,14 @@
 //       时钟     ：ticks64() / g_irq_total64 / PIT_HZ_64 / rtc_get_time64()
 //       内存布局 ：memlayout64.h（ML64_*）+ linker64.ld 的 __bss_end（映像尺寸）
 //   * 32 位里有、64 位没有的模块**一律不引用**，对应的列/面板如实标注"未移植/未包含"：
-//       - 磁盘：性能页"磁盘"项只写原因，不编造数字（ata64.cpp 其实已编进系统内核，
-//               缺的是按窗口采样的磁盘吞吐统计）。
 //       - 启动页：启动项与 store64 持久化的接线未做（store64 模块本体已可用）→ 三个启动项
 //               固定显示"已启用"，不提供假开关；提示行说明"只在本会话生效 / 需要接线"。
-//       - 性能页硬件详情：只显示内核自己实测得到的计数器（hwinfo64.cpp 的 CPU/PCI 详情未接进本页）。
+//       - 磁盘：批次 B 起真接线 —— ata64 的 IDENTIFY 结果由 hwinfo_set_disk64 填进 hwinfo64，
+//               本页读的是型号 + 容量（没有扇区/吞吐计数器，如实写明）。
+//       - 性能页硬件详情（批次 B 接线）：CPU 型号/家族/核数/hypervisor、APIC/SMP 状态、
+//               内存总量/页池、磁盘型号与容量、显示适配器（帧缓冲指标 + 实测刷新率）、
+//               网络（e1000 MAC/收发）、USB（UHCI/HID 计数）—— 全部只读快照，取不到写原因。
+//       - 性能页第 4 项"显卡"：**没有 GPU 驱动**，只报帧缓冲指标（分辨率/缩放/刷新率/后备缓冲）。
 //   * "进程页"的行 = **真进程**（proc64 进程表，每进程独立 CR3），不是窗口列表：
 //       pid/ppid/名字/状态/CR3 ：proc64_info64()（PROC64_MAX 个槽，空槽跳过；cr3 是进程页表根）
 //       线程数 / CPU‰          ：task64_proc_threads64() / task64_proc_cpu_permille64()
@@ -60,6 +63,15 @@
 #include "debug64.h"     // 串口打点（[UI] tmgr / [APP] tmgr 行）
 #include "edid64.h"     // 显示器 EDID（刷新率来自这里；只读，不改 fb 状态）
 #include "config64.h"   // 本轮接线：启动页的开关 = config64 的 startup.*（落到 store64 持久化）
+// ---- 批次 B：性能页的硬件详情接线（全部只读快照；取不到就写原因）----
+#include "hwinfo64.h"   // CPU 型号/家族/核数/hypervisor + PCI 设备 + 磁盘型号/容量
+#include "display64.h"  // 运行期显示层（模式清单 + 0x3DA 实测刷新率 + EDID 对比）
+#include "net64.h"      // e1000 状态 + 收发计数（性能页"网络"）
+#include "e1000_64.h"   // e1000_mac64：网卡 MAC
+#include "usb64.h"      // UHCI 控制器/HID 计数（性能页"USB"）
+#include "apic64.h"     // IRQ_MODE64_*：中断路由模式（APIC/PIC）
+#include "acpi64.h"     // MADT 的 CPU 数（APIC/SMP 状态）
+#include "smp64.h"      // SMP 在线 CPU 数
 
 // linker64.ld 提供：内核映像末地址（.bss 之后，已 4KB 对齐）
 extern "C" char __bss_end[];
@@ -79,7 +91,7 @@ extern "C" char __bss_end[];
 #define TM_MENU_ITEMS 4
 #define TM_DD_ITEM_H  24
 #define TM_DD_PAD     4
-#define TM_PERF_ITEMS 3       // 性能页左列表：CPU / 内存 / 磁盘
+#define TM_PERF_ITEMS 4       // 性能页左列表：CPU / 内存 / 磁盘 / 显卡（显卡 = 帧缓冲指标，无 GPU 驱动）
 #define TM_MAX_ROWS   40      // 进程页一次最多构造的行数
 #define TM_MAX_FIELDS 24      // 字段面板（标签+值）行数上限
 #define TM_CURVE_N    60      // 曲线保留最近 60 个采样点（1Hz）
@@ -117,7 +129,8 @@ static const uint32_t TM_COL_OFF       = 0xFFBFBFBF;
 struct TmState {
     uint8_t  page;                 // 0=进程 1=性能 2=启动 3=详细信息
     int      sel_row;              // 进程页 = g_rows 下标（-1 未选）；启动页 = 0..2
-    uint8_t  perf_sel;             // 性能页左列表选中项：0=CPU 1=内存 2=磁盘
+    uint8_t  perf_sel;             // 性能页左列表选中项：0=CPU 1=内存 2=磁盘 3=显卡
+    uint8_t  perf_logged_sel;      // 已打过 [UI] tmgr perf 行的选中项（0xFF = 还没打过）
     int      scroll;               // 进程页首行下标
     uint8_t  menu_open;            // "文件"下拉是否展开
     uint8_t  menu_sel;             // 下拉键盘选中项
@@ -783,20 +796,29 @@ static int tm_fields_cpu(TmState* st, TmField* out, int max) {
     if (n < max) { tm_field_num(&out[n], T("IRQ total", "中断总数"), (uint64_t)g_irq_total64, ""); n++; }
     if (n < max) { tm_field_num(&out[n], T("Shell CPU", "外壳忙占比"), (uint64_t)gui64_cpu_busy_pct(), "%"); n++; }
     if (n < max) { tm_field_num(&out[n], T("FPS", "帧率"), (uint64_t)gui64_fps(), ""); n++; }
-    // 刷新率：有 EDID 就显示首选时序的真值（来源写明），没有就如实写"未知（无 EDID）"——
-    // 沿用本页其它项的写法：拿不到就写原因，绝不编数字。
+    // 刷新率（批次 B 起优先**实测**）：display64 的采用值（0x3DA 实测 > CRTC 推算 > EDID）；
+    // 没有实测又没有 EDID 就如实写原因，绝不编数字。
     if (n < max) {
-        const Edid64* ed = edid64_get();
-        if (ed->valid && ed->refresh_x10) {
-            char rb[16];
-            edid64_refresh_str64(rb, (int)sizeof(rb));
-            char vb[40];
-            tm_strlcpy(vb, rb, (int)sizeof(vb));
-            tm_stpcat(vb, " Hz");
-            tm_field_set(&out[n], T("Refresh rate", "刷新率"), vb);
+        const Disp64Info* di = display64_info64();
+        char rb[20];
+        if (di->refresh_x10 > 0) {
+            display64_refresh_str64(rb, (int)sizeof(rb));
+            tm_strlcpy(b, rb, (int)sizeof(b));
+            tm_stpcat(b, T(" Hz  (src=", " Hz（来源="));
+            tm_stpcat(b, display64_src_name64(di->src));
+            tm_stpcat(b, T(")", "）"));
+            tm_field_set(&out[n], T("Refresh rate", "刷新率"), b);
         } else {
-            tm_field_set(&out[n], T("Refresh rate", "刷新率"),
-                         T("unknown (no EDID from firmware)", "未知（固件没给 EDID）"));
+            const Edid64* ed = edid64_get();
+            if (ed->valid && ed->refresh_x10) {
+                edid64_refresh_str64(rb, (int)sizeof(rb));
+                tm_strlcpy(b, rb, (int)sizeof(b));
+                tm_stpcat(b, " Hz (EDID)");
+                tm_field_set(&out[n], T("Refresh rate", "刷新率"), b);
+            } else {
+                tm_field_set(&out[n], T("Refresh rate", "刷新率"),
+                             T("unknown (0x3DA not measurable; no EDID)", "未知（0x3DA 不可测、也没有 EDID）"));
+            }
         }
         n++;
     }
@@ -812,6 +834,51 @@ static int tm_fields_cpu(TmState* st, TmField* out, int max) {
         }
         if (n < max) { tm_field_num(&out[n], T("Window CPU sum", "窗口 CPU 合计"), sum, "%"); n++; }
         if (n < max) { tm_field_num(&out[n], T("Windows", "窗口数"), (uint64_t)wc, ""); n++; }
+    }
+    // ---- 批次 B：CPU 身份与 APIC/SMP 状态（hwinfo64 / acpi64 / smp64 / apic64 只读快照）----
+    {
+        const HwInfo64* hw = hw_info64();
+        if (n < max) {
+            const char* vend = (hw->magic == HW64_INFO_MAGIC && hw->cpu.vendor[0]) ? hw->cpu.vendor : "unknown";
+            tm_field_set(&out[n], T("CPU vendor", "CPU 厂商"), vend);
+            n++;
+        }
+        if (n < max) {
+            const char* brand = (hw->magic == HW64_INFO_MAGIC && hw->cpu.brand[0]) ? hw->cpu.brand : "unknown";
+            tm_field_set(&out[n], T("CPU brand", "CPU 型号"), brand);
+            n++;
+        }
+        if (n < max) {
+            char fb[48];
+            tm_strlcpy(fb, T("family=", "家族="), (int)sizeof(fb));
+            { char nb[16]; tm_utoa64(nb, hw->magic == HW64_INFO_MAGIC ? hw->cpu.family : 0); tm_stpcat(fb, nb); }
+            tm_stpcat(fb, T(" model=", " 型号="));
+            { char nb[16]; tm_utoa64(nb, hw->magic == HW64_INFO_MAGIC ? hw->cpu.model : 0); tm_stpcat(fb, nb); }
+            tm_stpcat(fb, T(" stepping=", " 步进="));
+            { char nb[16]; tm_utoa64(nb, hw->magic == HW64_INFO_MAGIC ? hw->cpu.stepping : 0); tm_stpcat(fb, nb); }
+            tm_field_set(&out[n], T("CPU family/model", "CPU 家族/型号"), fb);
+            n++;
+        }
+        if (n < max) {
+            char cb[48];
+            tm_strlcpy(cb, T("logical cores=", "逻辑核数="), (int)sizeof(cb));
+            { char nb[16]; tm_utoa64(nb, hw->magic == HW64_INFO_MAGIC ? (hw->cpu.cores ? hw->cpu.cores : 1) : 1); tm_stpcat(cb, nb); }
+            tm_stpcat(cb, T("  hypervisor=", " 虚拟化平台="));
+            tm_stpcat(cb, (hw->magic == HW64_INFO_MAGIC && hw->cpu.hypervisor[0]) ? hw->cpu.hypervisor : "none");
+            tm_field_set(&out[n], T("CPU cores/hypervisor", "CPU 核数/虚拟化"), cb);
+            n++;
+        }
+        if (n < max) {
+            char ab[64];
+            tm_strlcpy(ab, T("irq route=", "中断路由="), (int)sizeof(ab));
+            tm_stpcat(ab, (g_irq_mode64 == IRQ_MODE64_APIC) ? "APIC(LAPIC+IOAPIC)" : "8259 PIC");
+            tm_stpcat(ab, T("  ACPI cpus=", "  ACPI CPU 数="));
+            { char nb[16]; tm_utoa64(nb, (uint64_t)acpi_cpu_count64()); tm_stpcat(ab, nb); }
+            tm_stpcat(ab, T("  SMP online=", "  SMP 在线="));
+            { char nb[16]; tm_utoa64(nb, (uint64_t)smp64_online_cpu_count64()); tm_stpcat(ab, nb); }
+            tm_field_set(&out[n], T("APIC/SMP", "APIC/SMP 状态"), ab);
+            n++;
+        }
     }
     if (n < max) {
         tm_itoa(b, st ? st->curve_n : 0);
@@ -871,25 +938,52 @@ static int tm_fields_mem(TmField* out, int max) {
     return n;
 }
 
-// 磁盘：本内核没有 ATA 驱动（ata64.cpp 只编进安装程序内核）→ 只写原因，不编造数字
+// 磁盘（批次 B 重写）：**ata64 已经在系统内核里**，IDENTIFY 的结果由 ata64 填进 hwinfo64
+// 的磁盘表（hwinfo_set_disk64）。本页读的就是那份真值：型号 + 容量；没有盘就如实写"无"。
 static int tm_fields_disk(TmField* out, int max) {
     int n = 0;
     char b[64];
+    const HwInfo64* hw = hw_info64();
+    const bool have = (hw->magic == HW64_INFO_MAGIC);
+    int disks = 0;
+    if (have) {
+        for (uint32_t i = 0; i < HW64_DISK_MAX; i++) if (hw->disks[i].present) disks++;
+    }
     if (n < max) {
-        tm_field_set(&out[n], T("Status", "状态"),
-                     T("driver not included in this kernel", "驱动未包含在本内核"));
+        tm_field_set(&out[n], T("Driver", "驱动"),
+                     T("ata64 (PIO, IRQ14 wait + polling fallback) is in this kernel",
+                       "ata64（PIO，IRQ14 等待 + 超时回退轮询）已在本内核里"));
         n++;
     }
     if (n < max) {
-        tm_field_set(&out[n], T("Reason", "原因"),
-                     T("ata64.cpp is built into the installer kernel only (VMTU_INSTALLER_MEDIA)",
-                       "ata64.cpp 只编进安装程序内核（VMTU_INSTALLER_MEDIA）"));
+        tm_field_num(&out[n], T("Disks (IDENTIFY)", "磁盘数（IDENTIFY）"), (uint64_t)disks, "");
+        n++;
+    }
+    for (uint32_t i = 0; i < HW64_DISK_MAX && n < max; i++) {
+        if (!have || !hw->disks[i].present) continue;
+        const uint64_t sectors = hw->disks[i].sectors_512;
+        char lb[32];
+        tm_strlcpy(lb, T("Disk ", "磁盘 "), (int)sizeof(lb));
+        { char nb[16]; tm_utoa64(nb, (uint64_t)i); tm_stpcat(lb, nb); }
+        char vb[64];
+        tm_strlcpy(vb, hw->disks[i].model[0] ? hw->disks[i].model : "(no model string)", (int)sizeof(vb));
+        tm_stpcat(vb, "  ");
+        tm_bytes_str(b, sectors * 512ull);
+        tm_stpcat(vb, b);
+        tm_stpcat(vb, T("  (LBA28 PIO; LBA48 flag not claimed)", "（LBA28 PIO；不声称 LBA48）"));
+        tm_field_set(&out[n], lb, vb);
         n++;
     }
     if (n < max) {
-        tm_field_set(&out[n], T("Counters", "计数器"),
-                     T("none: no sector/throughput counters without the driver",
-                       "无：没有驱动就没有扇区/吞吐计数器"));
+        if (disks == 0) {
+            tm_field_set(&out[n], T("Status", "状态"),
+                         T("no ATA disk reported by IDENTIFY (or hwinfo not initialized)",
+                           "IDENTIFY 没有报告任何 ATA 盘（或 hwinfo 未初始化）"));
+        } else {
+            tm_field_set(&out[n], T("Source", "数据来源"),
+                         T("ata64 IDENTIFY -> hwinfo_set_disk64 -> hwinfo64 disk table",
+                           "ata64 IDENTIFY -> hwinfo_set_disk64 -> hwinfo64 磁盘表"));
+        }
         n++;
     }
     if (n < max) {
@@ -910,6 +1004,148 @@ static int tm_fields_disk(TmField* out, int max) {
         tm_utoa64(nb, (uint64_t)ML64_STORE_SECTORS); tm_stpcat(b, nb);
         tm_stpcat(b, T(" sectors reserved for store fallback slots", " 扇区是 store 兜底槽区"));
         tm_field_set(&out[n], T("Persistence", "持久化"), b);
+        n++;
+    }
+    if (n < max) {
+        tm_field_set(&out[n], T("Note", "说明"),
+                     T("no sector/throughput counters in this driver (honest: only IDENTIFY + PIO transfers)",
+                       "本驱动没有扇区/吞吐计数器（如实：只有 IDENTIFY + PIO 传输）"));
+        n++;
+    }
+    return n;
+}
+
+// 显卡（批次 B 新增，32 位性能页的第 4 项）：**只报帧缓冲指标** + VGA PCI 设备 + 网络/USB/APIC-SMP。
+// 为什么网络/USB 挂在这里：性能页只有 4 个左列表项（CPU/内存/磁盘/显卡），而"适配器/外设"这一档
+//   最贴近"显卡"项；每一项都注明数据来源，取不到就写原因。绝不假装有 GPU 驱动。
+static int tm_fields_gpu(TmField* out, int max) {
+    int n = 0;
+    char b[72];
+    const Disp64Info* di = display64_info64();
+    const HwInfo64* hw = hw_info64();
+
+    if (n < max) {
+        tm_field_set(&out[n], T("Adapter", "显示适配器"),
+                     T("VimtuOS framebuffer (VBE LFB)  -  no GPU driver",
+                       "VimtuOS 帧缓冲（VBE LFB）——没有 GPU 驱动"));
+        n++;
+    }
+    if (n < max) {
+        tm_strlcpy(b, T("physical ", "物理 "), (int)sizeof(b));
+        char nb[16];
+        tm_utoa64(nb, (uint64_t)fb_phys_width()); tm_stpcat(b, nb);
+        tm_stpcat(b, "x");
+        tm_utoa64(nb, (uint64_t)fb_phys_height()); tm_stpcat(b, nb);
+        tm_stpcat(b, " @32bpp pitch=");
+        tm_utoa64(nb, (uint64_t)(di->pitch > 0 ? di->pitch : fb_phys_width() * 4)); tm_stpcat(b, nb);
+        tm_field_set(&out[n], T("Framebuffer mode", "帧缓冲模式"), b);
+        n++;
+    }
+    if (n < max) {
+        tm_strlcpy(b, T("render ", "渲染 "), (int)sizeof(b));
+        char nb[16];
+        tm_utoa64(nb, (uint64_t)fb_width()); tm_stpcat(b, nb);
+        tm_stpcat(b, "x");
+        tm_utoa64(nb, (uint64_t)fb_height()); tm_stpcat(b, nb);
+        tm_stpcat(b, T("  zoom=", "  缩放="));
+        tm_utoa64(nb, (uint64_t)fb_get_zoom()); tm_stpcat(b, nb);
+        tm_stpcat(b, "%");
+        tm_field_set(&out[n], T("Render mode", "渲染模式"), b);
+        n++;
+    }
+    if (n < max) {
+        if (di->refresh_x10 > 0) {
+            char rb[16];
+            display64_refresh_str64(rb, (int)sizeof(rb));
+            tm_strlcpy(b, rb, (int)sizeof(b));
+            tm_stpcat(b, T(" Hz  (src=", " Hz（来源="));
+            tm_stpcat(b, display64_src_name64(di->src));
+            if (di->edid_x10 > 0) {
+                tm_stpcat(b, T(", EDID match=", "，EDID 对比="));
+                char nb[8];
+                tm_utoa64(nb, (uint64_t)di->edid_match);
+                tm_stpcat(b, nb);
+            }
+            tm_stpcat(b, ")");
+            tm_field_set(&out[n], T("Refresh rate", "刷新率"), b);
+        } else {
+            tm_field_set(&out[n], T("Refresh rate", "刷新率"),
+                         T("unknown (0x3DA not measurable here; no EDID)",
+                           "未知（本平台 0x3DA 不可测；也没有 EDID）"));
+        }
+        n++;
+    }
+    if (n < max) {
+        tm_field_num(&out[n], T("Back buffer", "后备缓冲"),
+                     (uint64_t)fb_phys_width() * (uint64_t)fb_phys_height() * 4ull, " B");
+        n++;
+    }
+    if (n < max) {
+        int vga = 0;
+        uint16_t vdv = 0, vdd = 0;
+        if (hw->magic == HW64_INFO_MAGIC) {
+            vga = (int)hw->pci.vga;
+            for (uint32_t i = 0; i < hw->pci.count && i < HW64_PCI_MAX; i++) {
+                if (hw->pci.devs[i].class_code == 0x03) { vdv = hw->pci.devs[i].vendor; vdd = hw->pci.devs[i].device; break; }
+            }
+        }
+        tm_strlcpy(b, T("PCI display ctrl=", "PCI 显示控制器="), (int)sizeof(b));
+        { char nb[16]; tm_utoa64(nb, (uint64_t)vga); tm_stpcat(b, nb); }
+        if (vga > 0) {
+            const int l0 = tm_stpcat(b, "  first=");
+            tm_hex_str(b + l0, ((uint32_t)vdv << 16) | vdd);
+        } else {
+            tm_stpcat(b, T("  (none enumerated)", "（未枚举到）"));
+        }
+        tm_field_set(&out[n], T("PCI VGA", "PCI 显卡"), b);
+        n++;
+    }
+    if (n < max) {
+        const uint8_t* mac = e1000_mac64();
+        tm_strlcpy(b, T("e1000 ", "e1000 "), (int)sizeof(b));
+        tm_stpcat(b, net64_state_str64());
+        if (mac) {
+            tm_stpcat(b, T("  MAC=", "  MAC="));
+            static const char* hd = "0123456789abcdef";
+            for (int i = 0; i < 6; i++) { char mm[4]; mm[0] = hd[mac[i] >> 4]; mm[1] = hd[mac[i] & 0xF]; mm[2] = (i == 5) ? 0 : ':'; mm[3] = 0; tm_stpcat(b, mm); }
+        } else {
+            tm_stpcat(b, T("  MAC=none", "  MAC=无"));
+        }
+        tm_stpcat(b, T(" tx=", " 发送="));
+        { char nb[24]; tm_utoa64(nb, net64_tx_frames64()); tm_stpcat(b, nb); }
+        tm_stpcat(b, T(" rx=", " 接收="));
+        { char nb[24]; tm_utoa64(nb, net64_rx_frames64()); tm_stpcat(b, nb); }
+        tm_field_set(&out[n], T("Network", "网络"), b);
+        n++;
+    }
+    if (n < max) {
+        tm_strlcpy(b, T("UHCI ", "UHCI "), (int)sizeof(b));
+        tm_stpcat(b, usb64_state_str64());
+        tm_stpcat(b, T("  ports=", "  端口="));
+        { char nb[16]; tm_utoa64(nb, (uint64_t)usb64_ports64()); tm_stpcat(b, nb); }
+        tm_stpcat(b, T(" devs=", " 设备="));
+        { char nb[16]; tm_utoa64(nb, (uint64_t)usb64_devices64()); tm_stpcat(b, nb); }
+        tm_stpcat(b, T(" HID reports=", " HID 报告="));
+        { char nb[24]; tm_utoa64(nb, usb64_hid_reports64()); tm_stpcat(b, nb); }
+        tm_stpcat(b, T(" key events=", " 按键事件="));
+        { char nb[24]; tm_utoa64(nb, usb64_key_events64()); tm_stpcat(b, nb); }
+        tm_field_set(&out[n], T("USB host", "USB 主机"), b);
+        n++;
+    }
+    if (n < max) {
+        tm_strlcpy(b, T("APIC/SMP ", "APIC/SMP "), (int)sizeof(b));
+        tm_stpcat(b, (g_irq_mode64 == IRQ_MODE64_APIC) ? "APIC" : "PIC");
+        tm_stpcat(b, T("  ACPI cpus=", "  ACPI CPU 数="));
+        { char nb[16]; tm_utoa64(nb, (uint64_t)acpi_cpu_count64()); tm_stpcat(b, nb); }
+        tm_stpcat(b, T("  online=", "  在线="));
+        { char nb[16]; tm_utoa64(nb, (uint64_t)smp64_online_cpu_count64()); tm_stpcat(b, nb); }
+        tm_field_set(&out[n], T("CPU topology", "CPU 拓扑"), b);
+        n++;
+    }
+    if (n < max) {
+        tm_field_set(&out[n], T("Note", "说明"),
+                     T("no GPU driver: framebuffer metrics only (no 2D/3D acceleration, no VRAM size)",
+                       "无 GPU 驱动：只报帧缓冲指标（没有 2D/3D 加速，也不报显存大小）"));
         n++;
     }
     return n;
@@ -1609,24 +1845,108 @@ static void tm_draw_fields(Window* w, const TmField* f, int n, int top, int bot,
     }
 }
 
+// 批次 B：性能页的硬件详情打点（自动验收 grep： [UI] tmgr perf gpu=... hw=...）
+// 只在"选中项变化"时打一行（每次 draw 都打会刷屏；选择变化由键盘/点击驱动）。
+static void tm_log_perf_hw64(TmState* st, int sel) {
+    (void)st;
+    const HwInfo64* hw = hw_info64();
+    const Disp64Info* di = display64_info64();
+    const uint8_t* mac = e1000_mac64();
+    dbg64_line_begin64();
+    dbg64_str("[UI] tmgr perf sel=");
+    dbg64_str(sel == 0 ? "cpu" : (sel == 1 ? "memory" : (sel == 2 ? "disk" : "gpu")));
+    dbg64_str(" gpu=framebuffer ");
+    dbg64_dec((uint64_t)fb_phys_width()); dbg64_str("x"); dbg64_dec((uint64_t)fb_phys_height());
+    dbg64_str("@32bpp zoom="); dbg64_dec((uint64_t)fb_get_zoom()); dbg64_str("% refresh=");
+    if (di->refresh_x10 > 0) {
+        char rb[16];
+        display64_refresh_str64(rb, (int)sizeof(rb));
+        dbg64_str(rb);
+    } else {
+        dbg64_str("unknown");
+    }
+    dbg64_str(" src="); dbg64_str(display64_src_name64(di->src));
+    dbg64_str(" edid_match="); dbg64_dec((uint64_t)di->edid_match);
+    dbg64_str(" hw=cpu=");
+    dbg64_str((hw->magic == HW64_INFO_MAGIC && hw->cpu.vendor[0]) ? hw->cpu.vendor : "unknown");
+    dbg64_str(" cores=");
+    dbg64_dec((uint64_t)(hw->magic == HW64_INFO_MAGIC ? (hw->cpu.cores ? hw->cpu.cores : 1) : 1));
+    dbg64_str(" hyp=");
+    dbg64_str((hw->magic == HW64_INFO_MAGIC && hw->cpu.hypervisor[0]) ? hw->cpu.hypervisor : "none");
+    dbg64_str(" ram_mb=");
+    dbg64_dec(mem_total_ram_64() / (1024ull * 1024ull));
+    dbg64_str(" page_pool_kb=");
+    {
+        uint64_t pt = 0, pf = 0, hk = 0;
+        mem_info_64(&pt, &pf, &hk);
+        dbg64_dec(pt);
+        dbg64_str(" page_free_kb=");
+        dbg64_dec(pf);
+    }
+    dbg64_str(" disk=");
+    {
+        const char* dm = "none";
+        uint64_t dsec = 0;
+        if (hw->magic == HW64_INFO_MAGIC) {
+            for (uint32_t i = 0; i < HW64_DISK_MAX; i++) {
+                if (!hw->disks[i].present) continue;
+                dm = hw->disks[i].model[0] ? hw->disks[i].model : "(no model)";
+                dsec = hw->disks[i].sectors_512;
+                break;
+            }
+        }
+        dbg64_str(dm);
+        dbg64_str(" disk_mb=");
+        dbg64_dec(dsec / 2048u);
+    }
+    dbg64_str(" net=");
+    dbg64_str(net64_state_str64());
+    if (mac) {
+        static const char* const HD = "0123456789abcdef";
+        dbg64_str(" mac=");
+        for (int i = 0; i < 6; i++) {
+            char mm[4];
+            mm[0] = HD[mac[i] >> 4]; mm[1] = HD[mac[i] & 0xF];
+            mm[2] = (i == 5) ? 0 : ':'; mm[3] = 0;
+            dbg64_str(mm);
+        }
+    }
+    dbg64_str(" tx="); dbg64_dec(net64_tx_frames64());
+    dbg64_str(" rx="); dbg64_dec(net64_rx_frames64());
+    dbg64_str(" usb="); dbg64_str(usb64_state_str64());
+    dbg64_str(" usb_ports="); dbg64_dec((uint64_t)usb64_ports64());
+    dbg64_str(" usb_devs="); dbg64_dec((uint64_t)usb64_devices64());
+    dbg64_str(" apic="); dbg64_str((g_irq_mode64 == IRQ_MODE64_APIC) ? "APIC" : "PIC");
+    dbg64_str(" acpi_cpus="); dbg64_dec((uint64_t)acpi_cpu_count64());
+    dbg64_str(" smp_online="); dbg64_dec((uint64_t)smp64_online_cpu_count64());
+    dbg64_str(" page_size="); dbg64_dec((uint64_t)PAGE_SIZE_64);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
 static void tm_draw_perf(Window* w, TmState* st) {
     int X = w->client_x, Y = w->client_y;
     int cw = w->client_w;
 
     int sel = (int)st->perf_sel;
     if (sel < 0 || sel >= TM_PERF_ITEMS) sel = 0;
+    if (st->perf_logged_sel != (uint8_t)sel) {   // 批次 B：选中项变化 -> 打一行硬件详情（验收 grep）
+        st->perf_logged_sel = (uint8_t)sel;
+        tm_log_perf_hw64(st, sel);
+    }
     int nf = 0;
     if (sel == 0)      nf = tm_fields_cpu(st, g_fields, TM_MAX_FIELDS);
     else if (sel == 1) nf = tm_fields_mem(g_fields, TM_MAX_FIELDS);
-    else               nf = tm_fields_disk(g_fields, TM_MAX_FIELDS);
+    else if (sel == 2) nf = tm_fields_disk(g_fields, TM_MAX_FIELDS);
+    else               nf = tm_fields_gpu(g_fields, TM_MAX_FIELDS);
 
     TmPerfLayout L;
     tm_perf_layout(w, nf, &L);
     if (L.bot - L.top < 20) return;
 
-    // 1) 左侧列表（CPU / 内存 / 磁盘）：选中项高亮 + 左侧强调条
-    static const char* const label_en[TM_PERF_ITEMS] = { "CPU", "Memory", "Disk" };
-    static const char* const label_zh[TM_PERF_ITEMS] = { "CPU", "内存", "磁盘" };
+    // 1) 左侧列表（CPU / 内存 / 磁盘 / 显卡）：选中项高亮 + 左侧强调条
+    static const char* const label_en[TM_PERF_ITEMS] = { "CPU", "Memory", "Disk", "GPU" };
+    static const char* const label_zh[TM_PERF_ITEMS] = { "CPU", "内存", "磁盘", "显卡" };
     if (L.list_w > 0) {
         int lw = L.list_w;
         if (8 + lw > L.gx - 8) lw = L.gx - 16;
@@ -1641,7 +1961,7 @@ static void tm_draw_perf(Window* w, TmState* st) {
         }
     }
 
-    // 2) 曲线（磁盘没有使用率计数器 -> 只画框写原因）
+    // 2) 曲线（磁盘/显卡没有使用率计数器 -> 只画框并写"无计数器"，绝不画假曲线）
     if (L.gh >= TM_GH_MIN) {                       // 布局保证 gh >= 列表高，否则曲线不画
         const uint32_t* curve = nullptr;
         int cn = 0, cur = -1;
@@ -2048,7 +2368,8 @@ static void tm_click_perf(Window* w, int cx, int cy) {
             if ((int)st->perf_sel != i) {
                 st->perf_sel = (uint8_t)i;
                 tm_clear_notice(st);
-                tm_log_str("perf item=", (i == 0) ? "cpu" : (i == 1 ? "memory" : "disk"));
+                static const char* const kPerfKey[TM_PERF_ITEMS] = { "cpu", "memory", "disk", "gpu" };
+                tm_log_str("perf item=", kPerfKey[i]);
             }
             tm_dirty_client(w);
             return;
@@ -2215,6 +2536,7 @@ void app_tmgr_open64() {
     st->page = 0;
     st->sel_row = -1;                               // 未选中：先选一行再操作
     st->perf_sel = 0;
+    st->perf_logged_sel = 0xFF;                     // 批次 B：首帧画性能页时补一条 [UI] tmgr perf 行
     st->scroll = 0;
     st->menu_open = 0;
     st->menu_sel = 0;

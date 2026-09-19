@@ -503,11 +503,23 @@ def cap_display_layer():
                  grep_count(r"edid64_get", ["kernel/taskmgr64.cpp"])))
     tst = exists("tests/display64_test.py")
     ev.append("自动验收 tests/display64_test.py：%s" % ("有" if tst else "缺"))
-    ev.append('实测串口："[EDID64] present=1 ver=1.4 mfg=RHT name=QEMU Monitor size=32x20cm"'
-              '、"[EDID64] preferred pclk=107300 Vactive=800 Hactive=1280 refresh=75.0Hz"、'
-              '"[EDID64] selftest PASS"（与 "[G64] fb render=1280x800 phys=1280x800" 一致）')
+    # 批次 B：运行期显示层 display64.*（模式清单 + 0x3DA 实测 + 与 EDID 对比）与它的新验收脚本
+    d64 = exists("kernel/display64.cpp") and exists("kernel/display64.h")
+    ev.append("kernel/display64.cpp/.h：%s；0x3DA 读取命中 %d，模式清单命中 %d，DDC 如实跳过打点 %d"
+              % ("有" if d64 else "缺",
+                 grep_count(r"0x3DA", ["kernel/display64.cpp"]),
+                 grep_count(r"mode list", ["kernel/display64.cpp"]),
+                 grep_count(r"ddc runtime re-probe skipped", ["kernel/display64.cpp"])))
+    ev.append("自动验收 tests/display_runtime_test.py：%s；kernel64.cpp 调 display64_init64()：%d"
+              % ("有" if exists("tests/display_runtime_test.py") else "缺",
+                 grep_count(r"display64_init64\(", ["kernel/kernel64.cpp"])))
+    ev.append("实测串口：\"[EDID64] present=1 ver=1.4 mfg=RHT name=QEMU Monitor size=32x20cm\"、"
+              "\"[EDID64] preferred pclk=107300 Vactive=800 Hactive=1280 refresh=75.0Hz\"、"
+              "\"[EDID64] selftest PASS\"（与 \"[G64] fb render=1280x800 phys=1280x800\" 一致）；"
+              "\"[DISP64] init modes=16 cur=1280x800@75.0 src=edid\"（QEMU 的 0x3DA 每次读都翻转 -> "
+              "如实降级 vga measure=n/a，采用 EDID）")
     ev.append("（边界：只解析第一块 EDID；扩展块/CEA-861 时序表不解析；刷新率只读，"
-              "仍无 0x3DA/CRTC 回扫与刷新率控制）")
+              "仍无刷新率控制；运行期 DDC 再探测未做（i2c bit-bang 风险，display64.h 有说明））")
     done = bool(parse and ver and tst
                 and grep_count(r"edid64_init64\(", ["kernel/kernel64.cpp"])
                 and grep_count(r"edid64_get", ["kernel/settings64.cpp"]))
@@ -789,6 +801,8 @@ TESTS = [
     ("usb64_test.py", "USB 主机：UHCI + HID 引导键盘（sendkey -> 桌面响应）+ 两种降级"),
     ("preload_update_test.py", "预加载 + 更新：字形/图标预热实测 + update 标记->应用->store/done->重启闭环"),
     ("tmgr_proc_test.py", "任务管理器进程页 = proc64 真进程：真进程行 + kill(SIGKILL) 端到端（键盘注入）"),
+    ("display_runtime_test.py", "运行期显示层：模式清单 + 0x3DA 实测/如实降级 + EDID 对比 + DDC 未实现说明"),
+    ("fs_term_test.py", "终端真文件系统：write/ls/df/ring3 读 + 冷启动第二遍 cat 跨重启读回 + rm"),
 ]
 
 def run_tests():
