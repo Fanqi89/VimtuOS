@@ -2,7 +2,7 @@
 #include "part64.h"
 #include "ata64.h"
 #include "vfs64.h"      // 格式化：主数据分区写真正的 VimtuFS2（不再是占位超级块）
-#include "fat64.h"      // ESP：安装完成时在目标盘写 FAT16 卷（EFI/BOOT/BOOTX64.EFI 等）
+#include "fat64.h"      // ESP：安装完成时在目标盘写 FAT32 卷（EFI/BOOT/BOOTX64.EFI 等）
 #include "memlayout64.h" // ML64_KERNEL_LBA / ML64_KERNEL_SECTORS：KERNEL64.BIN 的来源区
 #include "debug64.h"
 
@@ -94,9 +94,10 @@ static void set_signature(uint8_t* sec512) {
 }
 
 // ==================== ESP 几何（盘尾、GPT 备份表之前）====================
-// 目标盘最小尺寸 = 主分区起点 8009 + 主分区至少 8MB + ESP 5MB + 备份 GPT 33 扇区。
+// 目标盘最小尺寸 = 主分区起点 8009 + 主分区至少 8MB（16384）+ ESP 48MB（98304）+ 备份 GPT 33
+//                 = 122730 扇区 ≈ 59.9MiB（ESP 必须放得下**真 FAT32**：簇数 >= 65525）。
 // 不满足（例如 16MB 的回归目标盘）就**不建 ESP**，只写老的 MBR 布局 ——
-// 那种盘本来也放不下 ESP 里的三个文件（内核 4MB + 引导器）。
+// 那种盘本来也放不下 ESP 里的文件（4MB 内核块 + 引导器），而且 FAT32 的卷下限就 ~33.5MB。
 bool part_esp_geometry64(uint32_t disk_sectors, uint32_t* out_start, uint32_t* out_sectors,
                          uint32_t* out_main_sectors) {
     const uint32_t need = PART_MAIN_LBA + PART_ESP_MIN_MAIN_SECS + PART_ESP_SECTORS + PART_GPT_BACKUP_SECTORS;
@@ -208,7 +209,7 @@ bool part_delete_entry(int drive, int index) {
 
 bool part_format_partition(int drive, const PartInfo& p, int index) {
     if (!p.used || p.sectors == 0) return false;
-    // ★ 保护 ESP：EFI 系统分区（盘尾那个 0xEF 项）里是 FAT16 引导卷，
+    // ★ 保护 ESP：EFI 系统分区（盘尾那个 0xEF 项）里是 FAT32 引导卷，
     //   抹掉它 UEFI 就再也起不来该盘。P1（LBA 9 起的"引导分区"，也是 0xEF 类型）
     //   保持可格式化 —— 老行为/既有测试都依赖它。
     if (p.type == 0xEF && p.start > PART_BOOT_LBA + PART_BOOT_SECS - 1) {
@@ -338,7 +339,7 @@ static bool part_write_backup_gpt64(int drive, uint32_t disk_sectors, uint32_t e
     return true;
 }
 
-// ESP：格式化 FAT16 + 写 EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN
+// ESP：格式化 **FAT32** + 写 EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN
 // KERNEL64.BIN 的内容 = 目标盘 LBA 9..8008 的 4MB 内核区（**从目标盘自己读**）：
 //   安装程序内核装不下这份 4MB 副本（内核区上限 4MB），而载荷已经把系统内核拷到了那里。
 static int part_install_esp64(int drive, uint32_t esp_start, uint32_t esp_sectors) {
@@ -355,6 +356,8 @@ static int part_install_esp64(int drive, uint32_t esp_start, uint32_t esp_sector
     dbg64_dec(esp_start);
     dbg64_str(" sectors=");
     dbg64_dec(esp_sectors);
+    dbg64_str(" fs=FAT32 clusters=");
+    dbg64_dec(fat64_last_clusters64());
     dbg64_str(" fat_ok=1");
     dbg64_nl();
 
@@ -539,7 +542,7 @@ int part_install_step(InstallJob* job) {
         dbg64_str(" 扇区，分区表已更新");
         dbg64_nl();
         // ★ 目标盘 UEFI 可启动的最后一块拼图：
-        //   1) ESP（FAT16）：EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN
+        //   1) ESP（FAT32，48MB）：EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN
         //      （KERNEL64.BIN 直接读目标盘 LBA 9..8008 —— 载荷已经把系统内核拷到那里）
         //   2) 混合 MBR（0xEF 引导区 + 0x07 主分区 + 0xEF ESP）+ 盘尾备份 GPT
         uint32_t esp_start = 0, esp_sectors = 0, esp_main_secs = 0;

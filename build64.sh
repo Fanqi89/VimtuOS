@@ -13,7 +13,7 @@
 #   LBA 9..8008      : kernel*.bin     （最多 4MB）
 #   LBA 8009..8072   : 设置持久化保留区（64 扇区）
 #   ---- 以上 8073 扇区就是"一份完整的系统磁盘映像"（system.img 的内容）----
-#   ★ 安装程序把这个映像写到目标盘后，还会在目标盘**盘尾**再建一个 5MB 的 FAT16 ESP
+#   ★ 安装程序把这个映像写到目标盘后，还会在目标盘**盘尾**再建一个 48MB 的 FAT32 ESP
 #     （EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN）与盘尾备份 GPT ——
 #     这样"装好的盘"在 UEFI 与 BIOS 下都能启动（见 kernel/fat64.cpp、kernel/part64.cpp）。
 #     KERNEL64.BIN 的字节**直接读目标盘 LBA 9..8008**（不内嵌进安装程序内核，省它的 4MB 预算）。
@@ -98,7 +98,7 @@ echo "==> 编译 UEFI 引导（两段式：极小 PE 桩 + 平铺长模式引导
 bash build_uefi.sh "$BUILD"
 
 echo "==> 内嵌 UEFI 引导字节（安装完成时写进目标盘 ESP；只进**安装程序**内核）"
-# 目的：安装程序在目标盘上建 ESP 时，要把 BOOTX64.EFI / UEFI64.BIN 原样写进 FAT16 卷。
+# 目的：安装程序在目标盘上建 ESP 时，要把 BOOTX64.EFI / UEFI64.BIN 原样写进 FAT32 卷。
 # 符号名由 objcopy 按输入路径生成（从仓库根执行才稳定）：_binary_build64_BOOTX64_EFI_start 等。
 # ★ 系统内核不需要这两个字节（装好的盘上 ESP 不再变动），别把它链进系统内核省体积。
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/BOOTX64.EFI" "$BUILD/bootx64_efi.o"
@@ -289,7 +289,7 @@ dd if="$BUILD/system.img"      of="$IMG" seek="$((PAYLOAD_LBA + 1))" conv=notrun
 echo "Image  OK. $IMG = $(stat -c%s "$IMG") bytes"
 echo "          载荷：LBA $PAYLOAD_LBA(头) + $((PAYLOAD_LBA + 1))..$((PAYLOAD_LBA + SYS_SECTORS))（$SYS_SECTORS 扇区）"
 
-echo "==> 生成 UEFI 的 ESP 镜像（FAT16，含 BOOTX64.EFI + 内核 + 载荷）"
+echo "==> 生成 UEFI 的 ESP 镜像（FAT32 48MB，含 BOOTX64.EFI + 内核 + 载荷）"
 "$PY" tools/make_esp.py "$BUILD/esp.img" "$BUILD/BOOTX64.EFI" "$BUILD/kernel64.bin" "$BUILD/system.img" "$BUILD/UEFI64.BIN"
 
 echo "==> 生成 64 位安装 ISO（vimtu64-64.iso：BIOS 光盘 + U 盘 hybrid + UEFI 三种引导）"

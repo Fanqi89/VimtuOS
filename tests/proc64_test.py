@@ -248,7 +248,9 @@ def prepare_fixture():
 #           + 主分区（VimtuFS2）。OVMF 从 ESP 里的 BOOTX64.EFI 起，跑的是**系统内核**。
 # ---------------------------------------------------------------------------
 ESP_LBA = 2048
-ESP_SECTORS = 14336        # 7MB
+ESP_SECTORS = 14336        # ⚠ 旧 FAT16 夹具常量（7MB）；现在 make_esp.py 出的是 48MB 真 FAT32，
+                           #   凡是要建 MBR 分区夹具的地方都改用**镜像实际字节数**（见
+                           #   prepare_uefi_fixture / uefi_cr3_experiment_test.make_fixture）
 
 def _ovmf_vars():
 
@@ -289,19 +291,23 @@ def prepare_uefi_fixture():
         return None
     with open(esp, "rb") as f:
         esp_bytes = f.read()
-    total = ESP_LBA + max(ESP_SECTORS, (len(esp_bytes) + SECTOR - 1) // SECTOR) + 8192
+    # ★ make_esp.py 现在生成 48MB 的**真 FAT32** ESP（FAT32 的簇数硬下限 65525 决定的），
+    #   分区大小必须按镜像**实际字节数**写，否则 MBR 里的 0xEF 项比卷小 —— 固件只看到
+    #   分区那一截，卷尾的簇读不到（ESP_SECTORS 只是旧的 FAT16 常量，这里不再用它）。
+    esp_sectors = (len(esp_bytes) + SECTOR - 1) // SECTOR
+    total = ESP_LBA + esp_sectors + 8192
     total = ((total + 2047) // 2048) * 2048
     buf = bytearray(total * SECTOR)
     # ESP
     buf[ESP_LBA * SECTOR:ESP_LBA * SECTOR + len(esp_bytes)] = esp_bytes
     # 主分区（VimtuFS2）
-    main_sectors = total - (ESP_LBA + ESP_SECTORS) - 1
-    main_lba = ESP_LBA + ESP_SECTORS
+    main_sectors = total - (ESP_LBA + esp_sectors) - 1
+    main_lba = ESP_LBA + esp_sectors
     if main_sectors < 4096:
         return None
     _vimtufs2_format(buf, main_lba, main_sectors)
     # MBR：P1 = ESP(0xEF)，P2 = 主分区(0x07)
-    buf[446:462] = _mbr_entry(True, 0xEF, ESP_LBA, ESP_SECTORS)
+    buf[446:462] = _mbr_entry(True, 0xEF, ESP_LBA, esp_sectors)
     buf[462:478] = _mbr_entry(False, 0x07, main_lba, main_sectors)
     buf[510], buf[511] = 0x55, 0xAA
     with open(UEFI_IMG, "wb") as f:

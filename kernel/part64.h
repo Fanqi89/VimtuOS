@@ -7,7 +7,7 @@
 //       P3 EFI 系统分区（type 0xEF）    盘尾、GPT 备份表之前（只有"够大的盘"才有）
 //   * 删除 / 格式化指定分区
 //   * 把安装介质上的载荷（system.img）整盘复制到目标硬盘，并汇报真实进度
-//   * 复制完成后写 **GPT（盘尾备份头 + 项数组）+ 混合 MBR + FAT16 ESP**
+//   * 复制完成后写 **GPT（盘尾备份头 + 项数组）+ 混合 MBR + FAT32 ESP**
 //     （EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN），让装好的盘 UEFI/BIOS 双启动
 //
 // 为什么主 GPT 头不在 LBA 1：引导链是"MBR + 固定 LBA"（boot.bin 读 LBA 1..8 的 loader，
@@ -27,9 +27,16 @@ static const uint32_t PART_MAIN_MIN_SECS = 1024; // 主分区至少留 512KB，�
 //   为什么 ESP 在**盘尾**：引导链三处硬约定占住了盘头 ——
 //     LBA 0 MBR、LBA 1..8 loader（**主 GPT 头必须放 LBA 1，与 loader 冲突，所以只写盘尾的
 //     备份 GPT**，EDK2 在主头无效时会用备份头，见 part64.cpp 的说明）、LBA 9..8008 内核。
-//   为什么需要"主分区至少 8MB"：ESP 要在主分区**之外**（不与 VimtuFS2 重叠），
-//     小盘（例如 16MB 的回归目标盘）放不下 -> 只写 MBR（老布局，BIOS-only）。
-static const uint32_t PART_ESP_SECTORS       = 10240;   // ESP 大小 = 5MB
+//   ESP 尺寸 = **48MB**（98304 扇区）：FAT32 有**簇数硬下限 65525**（少于这个数就应被当作
+//     FAT16），SPC=1/512B 扇区时数据区至少 65525 扇区（32MB），加上 32 个保留扇区与两份
+//     32 位 FAT，最小合法卷 ≈ 33.5MB。这里取 48MB 留余量（解出 96736 簇）；
+//     ESP 里只放 3 个文件（4MB 内核块 + 30KB 引导器；构建期那份还含 8MB 载荷），
+//     48MB 的卷完全装得下。
+//   为什么目标盘要 >= ~60MB：ESP 要在主分区**之外**（不与 VimtuFS2 重叠），
+//     最小盘 = 8009（引导区起点）+ 16384（主分区至少 8MB）+ 98304（ESP）+ 33（备份 GPT）
+//            = 122730 扇区 ≈ 59.9MiB。更小的盘（例如 16MB 的回归目标盘）放不下 ESP
+//     -> 只写老 MBR 布局（BIOS-only），串口打 "[INSTALL] esp skipped (disk too small)"。
+static const uint32_t PART_ESP_SECTORS       = 98304;   // ESP 大小 = 48MB（真 FAT32 的容量下限 ~33.5MB）
 static const uint32_t PART_ESP_MIN_MAIN_SECS = 16384;   // 建 ESP 时主分区至少保留 8MB
 static const uint32_t PART_GPT_BACKUP_SECTORS = 33;     // 盘尾备份 GPT：32 扇区项数组 + 1 扇区头
 static const uint32_t PART_GPT_ENTRIES = 128;           // GPT 分区项数组项数

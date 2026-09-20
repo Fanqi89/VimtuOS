@@ -4,7 +4,7 @@
 
 和 tests/vmware_install_test.py（BIOS）的区别：这份跑的是 UEFI 路径 —— 全 64 位：
     VMware EFI 固件（本身就是长模式）
-      → 从 ISO 的 El Torito(platform 0xEF) 读 FAT16 的 ESP 附加分区
+      → 从 ISO 的 El Torito(platform 0xEF) 读 FAT32 的 ESP 附加分区（48MB 真 FAT32）
       → 执行 EFI/BOOT/BOOTX64.EFI（我们自研的 PE32+，不用 gnu-efi）
       → 它用 GOP 拿帧缓冲参数、用 SimpleFileSystem 读 KERNEL64.BIN / SYSTEM.IMG 到内存
       → 写 BootInfo(0x1000) / E820(0x2000) / 介质描述符(0x0F00, kind=2)
@@ -168,7 +168,7 @@ def main():
     #   反而报"UEFI 引导标记缺失"）。所以引导阶段的日志在 wait_for 通过后立刻存下来。
     log = boot_snapshot if boot_snapshot else read_text(SERIAL)
     check("自研 BOOTX64.EFI 启动（U: 前缀标记）", "U:==== Vimtu64 UEFI" in log)
-    check("挂载 ESP（FAT16）并读出内核",
+    check("挂载 ESP（FAT32，48MB 真 FAT32 卷）并读出内核",
           "U:loaded KERNEL64.BIN" in log and "U:high half check ok" in log)
     check("从 ESP 读出内核", "U:loaded KERNEL64.BIN" in log)
     check("从 ESP 读出载荷", "U:loaded SYSTEM.IMG" in log)

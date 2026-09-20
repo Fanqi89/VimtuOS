@@ -12,8 +12,8 @@
 三种引导路径（同一个 ISO）：
   1) BIOS 光盘：El Torito no-emul，引导镜像 = CDISO.BIN（我们自己写的桩）
   2) BIOS U 盘 ：ISO 第 0 扇区 = 自研 hybrid MBR（boot/hybrid_mbr.asm），把 CDISO.BIN 读进 0x7C00
-  3) UEFI      ：El Torito no-emul（platform 0xEF）+ 一张 GPT + FAT16 的 ESP 附加分区
-                 ESP 内含 EFI/BOOT/BOOTX64.EFI（自研 PE32+）+ KERNEL64.BIN + SYSTEM.IMG
+  3) UEFI      ：El Torito no-emul（platform 0xEF）+ 一张 GPT + FAT32 的 ESP 附加分区（48MB）
+                ESP 内含 EFI/BOOT/BOOTX64.EFI（自研 PE32+）+ UEFI64.BIN + KERNEL64.BIN + SYSTEM.IMG
 
 为什么要回填 LBA：ISO9660 里文件落在哪个 LBA 只有 xorriso 生成之后才知道，而引导桩/MBR
 必须知道。生成后解析 ISO9660 目录拿到 LBA，再改 ISO 字节里对应的补丁点
@@ -42,7 +42,7 @@ KERNEL_CD_BYTES = 8000 * 512          # loader 固定读 4MB（KERNEL_SECTORS �
 PAYLOAD_SECTORS = 8073                # 系统镜像扇区数（512B 单位）
 BOOT_LOAD_SECTORS = 4                 # El Torito 引导镜像占几个 512B 扇区（桩 1536B → 3，取 4）
 
-ESP_IMG = os.path.join(BUILD, "esp.img")     # tools/make_esp.py 生成的 FAT16 ESP
+ESP_IMG = os.path.join(BUILD, "esp.img")     # tools/make_esp.py 生成的 FAT32 ESP（48MB）
 ESP_PARTNO = 2                               # GPT 里第 2 分区 = ESP
 
 
@@ -123,6 +123,13 @@ def find_esp_from_eltorito(img):
 
     返回 (512B 单位的 LBA, 扇区数) 或 None。这是"ESP 在 ISO 里落在哪"的权威来源：
     xorriso 的 -append_partition 会把它附加在镜像末尾，并把 El Torito 的 UEFI 项指过去。
+
+    ★ 扇区数可能是 0：El Torito 节条目里的 Sector Count 只有 **16 位**（512B 单位
+      -> 最多 32MB）。我们的 ESP 是 48MB 的真 FAT32（FAT32 要求簇数 >= 65525，
+      SPC=1 时数据区就 >= 32MB，卷下限约 33.5MB），塞不进这个 16 位字段，
+      xorriso 于是写 0 —— 按 El Torito 规范 0 表示"整张引导映像"。
+      调用方遇到 0 必须改用 **真实镜像字节数**（见 main：这么算出来的分区大小才是对的，
+      否则 MBR/GPT 的 ESP 项会写成 0 扇区）。
     """
     d = img[17 * 2048: 18 * 2048]
     if d[0] != 0 or d[1:6] != b"CD001" or d[6] != 1:
@@ -138,6 +145,34 @@ def find_esp_from_eltorito(img):
             return lba2048 * 4, nsec
         off += 32
     return None
+
+
+def patch_eltorito_sector_count(img, value):
+    """把 UEFI El Torito 项（platform 0xEF）的 Sector Count 改成非 0 值（原地改 ISO 字节）。
+
+    为什么必须改：该字段只有 **16 位**（512B 单位 -> 上限 65535 = 32MB），而我们的 ESP 是
+    48MB 的真 FAT32（FAT32 要求簇数 >= 65525，SPC=1 时数据区就 >= 32MB）。xorriso 遇到
+    装不下的镜像会写 0；实测 EDK2/OVMF 的 CD 引导路径把 0 当成"没有引导映像"：
+        BdsDxe: failed to load Boot0001 "UEFI QEMU DVD-ROM ...": Not Found
+    然后掉进 UEFI Shell —— 光盘的 UEFI 引导整个失效。写成 0xFFFF（字段能表达的最大值，
+    32MB 窗口）后 OVMF 正常从 ESP 起我们的 BOOTX64.EFI（实测到安装向导第一屏）。
+    ESP 里的全部文件都在前 ~8.3MB 内，32MB 的窗口足够；**ESP 的真实大小写在 GPT/MBR 里**
+    （98304 扇区），磁盘形态（U 盘/硬盘）走的是那条路，不受这个 16 位字段限制。
+    """
+    d = img[17 * 2048: 18 * 2048]
+    if d[0] != 0 or d[1:6] != b"CD001" or d[6] != 1:
+        return 0
+    cat = struct.unpack_from("<I", d, 71)[0] * 2048
+    off = 64
+    for _ in range(4):
+        hdr = img[cat + off: cat + off + 32]
+        if hdr[0] in (0x90, 0x91):
+            struct.pack_into("<H", img, cat + off + 32 + 6, value)
+            print("    补丁 El Torito(0xEF) Sector Count = %d（字段 16 位，写不下 48MB 的 ESP）"
+                  % value)
+            return 1
+        off += 32
+    return 0
 
 
 def write_gpt(img, esp_lba512, esp_sectors):
@@ -348,10 +383,20 @@ def main():
             if not found:
                 print("    警告：El Torito 里没有 UEFI 项 —— 不写 GPT/ESP 分区表项")
             else:
-                esp_lba, esp_sectors = found
-                print("  ESP：LBA %d..%d（%d 扇区 = %.1f MB）"
+                esp_lba, nsec = found
+                # ★ 48MB 的 FAT32 ESP 塞不进 El Torito 的 16 位 Sector Count（上限 32MB），
+                #   xorriso 会写 0（规范语义："整张引导映像"）；分区表（MBR/GPT）里必须写
+                #   **真实大小**，否则 0xEF 项会是 0 扇区 -> 固件看不到 ESP。
+                esp_sectors = nsec if nsec else (esp_bytes + 511) // 512
+                print("  ESP：LBA %d..%d（%d 扇区 = %.1f MB）%s"
                       % (esp_lba, esp_lba + esp_sectors - 1, esp_sectors,
-                         esp_sectors * 512 / 1048576.0))
+                         esp_sectors * 512 / 1048576.0,
+                         "" if nsec else "（El Torito 字段为 0：>32MB 装不下 16 位 Sector Count，"
+                                         "按真实镜像字节数写 MBR/GPT）"))
+                if nsec == 0:
+                    # ★ 关键：El Torito 的 Sector Count 为 0 时 EDK2/OVMF 认为"没有引导映像"，
+                    #   光盘的 UEFI 引导会失效（实测掉进 UEFI Shell）。补成字段能表达的最大值。
+                    patch_eltorito_sector_count(img, 0xFFFF)
 
         # 第 0 扇区 = hybrid MBR（BIOS U 盘/硬盘引导；光盘引导走 El Torito，与此扇区无关）
         mbr = build_hybrid_mbr(os.path.join(BUILD, "hybrid_mbr.bin"),

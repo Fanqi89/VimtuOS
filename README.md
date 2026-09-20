@@ -20,7 +20,7 @@
 | 能力 | 说明 |
 |---|---|
 | **四种引导方式 + 装好的盘双固件** | BIOS 光盘（El Torito）、U 盘 / 硬盘（hybrid MBR）、裸盘（MBR→loader→ATA）、**UEFI 自动引导**（自研 PE 桩 + 平铺长模式引导器）。QEMU 与 VMware、BIOS 与 UEFI 四种组合全部实测通过；**"ISO 当 U 盘"形态在 OVMF（UEFI）与 SeaBIOS（BIOS）下也都进安装向导**（`tests/usb_boot_both_fw_test.py` 四档）；装好的盘在 UEFI 与 BIOS 下都能启动（`tests/esp_install_test.py`） |
-| **现代磁盘结构（安装盘 + 目标盘都有）** | 自写 GPT（工具链的 xorriso 不生 GPT）与 MBR 双兼容；FAT16 ESP 也是自写的（这台机器没有 mkfs.fat/mtools）。**安装时会往目标盘写混合 MBR + 盘尾 GPT + 5MB FAT16 ESP**（内核实现在 `kernel/fat64.{h,cpp}`，卷参数与构建期 `tools/make_esp.py` 对齐），ESP 里放 `EFI/BOOT/BOOTX64.EFI` + `UEFI64.BIN` + `KERNEL64.BIN` |
+| **现代磁盘结构（安装盘 + 目标盘都有）** | 自写 GPT（工具链的 xorriso 不生 GPT）与 MBR 双兼容；**FAT32 ESP 也是自写的**（这台机器没有 mkfs.fat/mtools）：48MB 卷、簇数 96736（真 FAT32 的硬下限是 65525 簇）、FSInfo + 备份引导扇区齐全。**安装时会往目标盘写混合 MBR + 盘尾 GPT + 48MB FAT32 ESP**（内核实现在 `kernel/fat64.{h,cpp}`，卷参数与构建期 `tools/make_esp.py` 逐条对齐），ESP 里放 `EFI/BOOT/BOOTX64.EFI` + `UEFI64.BIN` + `KERNEL64.BIN` |
 | **Win10 同款安装程序** | 语言 → 现在安装 → 许可条款 → 安装类型 → **磁盘与分区（新建/删除/格式化，真实写盘）** → 复制与真实百分比进度 → 完成并**自动重启**；**无产品密钥步骤** |
 | **装完就是一台独立系统** | 开机直接进桌面：桌面图标、任务栏、开始菜单（10 项）、窗口拖拽/缩放/最大化/最小化、脏矩形重绘 |
 | **调度器（多任务）** | `task64.cpp`：16 个任务槽、每任务 16KB 内核栈、8ms 时间片轮转、IRQ0 抢占、睡眠/退出/回收、`task_kill64`；启动即 `[TASK64] scheduler up tasks=N`、`kheart` 心跳持续增长；任务管理器"进程"页与终端 `ps/kill` 读的是**真实任务表** |
@@ -55,7 +55,7 @@
 | ⚠️ **ACPI/APIC 覆盖有限** | 只解析 RSDP/RSDT/XSDT/FADT/MADT/HPET/MCFG；关机仍走 ACPI 端口 0x604 + 8042 回退链；x2APIC 未适配；固件页表没映射 LAPIC/IOAPIC 的机器会留在 PIC |
 | ✅ **SATA/AHCI 盘可直启（引导层已改 BIOS INT 13h）** | 引导层（`boot/loader64.asm`）的**磁盘启动路径**读内核不再用自写 PATA PIO，改走 **BIOS INT 13h 扩展读（AH=0x42 + DAP）**：驱动器号用固件传进来的 `DL`，分块 64 扇区（32KB、不跨 64KB 边界）读进低内存暂存区 `0x20000`，每批再进一次保护模式搬到 `0x100000`；失败复位磁盘重试 3 次后打 `[LM] int13 read FAILED ah=… lba=… retry=…` 并停机（不静默失败）。**BIOS 不需要把 SATA 设成 IDE 兼容模式** —— QEMU 上"只把装好的盘挂 `ich9-ahci` 启动"已进桌面（`tests/disk_boot_test.py`：`[LM] disk boot via INT 13h dl=0x80` → `[OS] booted from installed disk` → `[GUI64] ready`）；真机仍待复验。磁盘级 IDENTIFY/读写也已在 `--strict-dma` 档 PASS（item 5b 修好命令头布局） |
 | ⚠️ **没有 INT 13h 扩展读的老固件起不来** | 磁盘路径**没有 PIO 回退**（自写 PIO 在 AHCI 机器上读不到盘，已整段删除）：只有支持 EDD 扩展读（AH=0x42）的固件能启动，1998 年后的固件基本都有；更老的机器也跑不动本系统的 64 位长模式 |
-| ⚠️ **安装建 ESP 需要目标盘 ≥ ~17MB** | ESP=5MB + 主分区至少 8MB + 盘尾 GPT 33 扇区 + 引导区 8009 扇区。更小的盘（含 16MB 回归目标盘）只写老 MBR 布局（BIOS-only），串口打 `[INSTALL] esp skipped (disk too small)`。另外装好的盘只写**盘尾备份 GPT**（主 GPT 头的位置被 loader64.bin 占着）—— 依赖固件"主头无效时用备份头"（EDK2 已实测） |
+| ⚠️ **安装建 ESP 需要目标盘 ≥ ~60MB** | ESP=48MB（真 FAT32：簇数必须 ≥ 65525，512B 扇区 + SPC=1 时卷下限就 ~33.5MB）+ 主分区至少 8MB + 盘尾 GPT 33 扇区 + 引导区 8009 扇区 = 122730 扇区 ≈ 59.9MiB。更小的盘（含 16MB 回归目标盘）只写老 MBR 布局（BIOS-only），串口打 `[INSTALL] esp skipped (disk too small)`。另外装好的盘只写**盘尾备份 GPT**（主 GPT 头的位置被 loader64.bin 占着）—— 依赖固件"主头无效时用备份头"（EDK2 已实测） |
 | ⚠️ **只在虚拟机验证** | QEMU + VMware Workstation 双验证（BIOS 与 UEFI 都跑），**未在真机裸机验证**；UEFI 路径未做签名，测试时 `secureBoot=FALSE` |
 | ⚠️ **磁盘仍是 PIO 搬运** | 有了 IRQ14 中断唤醒，但没有 DMA/Bus-Master，读写期间 CPU 仍要逐扇区搬 |
 | ⚠️ **没有声音** | 无音频驱动 |
@@ -74,7 +74,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
 4. **两套系统调用入口并存**：自有 `int 0x80`（rax/rdi/rsi/rdx）与 Linux 号段的 `syscall` 指令（STAR/LSTAR/FMASK + 专用 16KB syscall 内核栈，和 TSS.rsp0 的耦合被显式切断）；号段语义互不干扰，帧标记分流。
 5. **两种应用格式、两条完整链路**：自有 VAP64（32B 头 + 名字 + CRC32，`tools/make_vap.py` 打包）走 `int 0x80`；ELF64 走 `syscall` 指令 —— 从盘上读出来（VimtuFS2）到 ring3 跑完再回收，全程有串口证据。
 6. **自研 UEFI 引导（不用 gnu-efi）**：自造 PE32+ 桩（2.5KB）+ 平铺长模式引导器（36KB，链接到 72MB，绕过 EDK2 的 PE 校验）；**RSDP 经固定槽 0x7800 从固件配置表传给内核**。
-7. **一切自写工具链**：没有 mkfs.fat、没有 mtools —— FAT16 卷、ISO9660 解析与打包、GPT、LBA 回填、PE 摊平、字体子集化（3 套 TTF）、图标生成、VAP64 打包，全是本仓库的 Python 脚本。
+7. **一切自写工具链**：没有 mkfs.fat、没有 mtools —— FAT32 卷、ISO9660 解析与打包、GPT、LBA 回填、PE 摊平、字体子集化（3 套 TTF）、图标生成、VAP64 打包，全是本仓库的 Python 脚本。
 8. **APIC / ACPI / SMP 都带"宁可不启用也不变砖"的回退**：拿不到 ACPI 就留 8259、启动 AP 全程有界超时、每个自检失败都整体回滚，降级路径都有串口证据。
 9. **每次改动都跑自动验收**：**31 个验收脚本**（≥850 条断言，本轮新增 `tests/usb_boot_both_fw_test.py` 与 `tests/esp_install_test.py`），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
 
@@ -105,7 +105,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
    存储与持久化
      ata64.cpp         ATA PIO + ATAPI(PACKET) + IRQ14 中断唤醒（超时回退轮询）
      part64.cpp        分区表（MBR/混合 MBR/盘尾 GPT）/ 新建 / 删除 / 格式化（VimtuFS2）/ 安装引擎 + ESP 安装
-     fat64.cpp         最小 FAT16 写入器（安装时在目标盘建 ESP；卷参数与 tools/make_esp.py 对齐）
+     fat64.cpp         最小 FAT32 写入器（安装时在目标盘建 ESP；卷参数与 tools/make_esp.py 逐条对齐）
      vfs64.cpp         VimtuFS2：超级块+CRC32 / 空闲位图 / 64B inode / 读写 mkdir unlink stat dump
      store64.cpp       设置持久化：/store.a、/store.b 双槽 + 世代号 + 双 CRC32（裸盘槽仅降级+WARN）
      app64.cpp         VAP64 安装器 / 校验 / 启动器 + 按魔数自动分派
@@ -163,12 +163,12 @@ bash build64.sh
 
 | 文件 | 大小 | 说明 |
 |---|---|---|
-| `vimtu64-64.iso` | 14.9 MB | **三合一安装盘**：BIOS 光盘 + 可写 U 盘 + UEFI |
+| `vimtu64-64.iso` | 56.2 MB | **三合一安装盘**：BIOS 光盘 + 可写 U 盘 + UEFI |
 | `vimtu64-64.img` | 8.3 MB | 安装介质裸盘（把一个 8MB 镜像直接当硬盘用） |
-| `build64/kernel64.bin` | 1.66 MB | 安装程序内核 |
+| `build64/kernel64.bin` | 1.87 MB | 安装程序内核 |
 | `build64/kernel64_os.bin` | 2.01 MB | 装进硬盘的系统内核（调度器/VFS/store/ring3/网络/USB 都在这里） |
 | `build64/BOOTX64.EFI` / `UEFI64.BIN` | 2.5 KB / 36 KB | UEFI 两段式引导 |
-| `build64/esp.img` | 6 MB | 手写 FAT16 ESP |
+| `build64/esp.img` | 48 MB | 手写 FAT32 ESP（96736 簇，>= 65525） |
 
 ### 2) 五分钟演示（推荐顺序，都是已实测的功能）
 
@@ -259,7 +259,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | M0 | BIOS → loader → 长模式 → 64 位 C++ + BootInfo/E820/VBE | ✅ |
 | M1 | IDT/TSS/PIC/PIT/RTC、帧缓冲、TrueType、PS/2 键鼠 | ✅ |
 | M2 | Win10 同款安装程序 + 真实分区操作 + 进度 + 自动重启 | ✅ |
-| M3 | 光盘（ATAPI）、U 盘 hybrid、GPT、手写 FAT16 ESP | ✅ |
+| M3 | 光盘（ATAPI）、U 盘 hybrid、GPT、手写 FAT32 ESP（48MB，簇数 >= 65525） | ✅ |
 | M4 | **32 位工程整体退役**，纯 64 位单构建线 | ✅ |
 | M5 | 桌面栈移植：内存管理 + 外壳 + 5 个应用 | ✅ |
 | M6 | **UEFI 自动引导打通**（PE 基址 5GB / ESP 名为 FAT16 实为 FAT12 / 进内核 CS 未换） | ✅ |
@@ -338,7 +338,7 @@ docs/screenshots/       自动抓取的桌面截图（desktop64.png）
 | `Fonts/` | 684 MB | 开发机上的 Windows 字体副本，**构建已不再使用**（只留着做历史对照） |
 | `Fonts-open/` | 19 MB | 构建真正用的**开源字体**（Noto Sans / Noto Serif / Noto Sans SC，SIL OFL）——下载地址见第五节与 [docs/字体许可说明.md](docs/字体许可说明.md) |
 | `build64/` + `build/` | 80 MB | 构建产物 |
-| `vimtu64-64.iso` / `.img` | 22 MB | 构建产物（内嵌的字体子集是 OFL 开源字体，可分发；Release 附件里有） |
+| `vimtu64-64.iso` / `.img` | 8 MB / 56 MB | 构建产物（内嵌的字体子集是 OFL 开源字体，可分发；Release 附件里有） |
 | `target-*.img` / `*.log` | ~64 MB | 验收测试残留 |
 
 **发布二进制（ISO/IMG）的字体问题已解决**：安装镜像里内嵌的三套字体子集已经从
@@ -413,5 +413,5 @@ Everything was validated on **QEMU and VMware, BIOS and UEFI — not on bare met
 
 Quality-wise, every change is verified by **28 assertion scripts** (22 of them in
 `tests/status_report.py --full`) that check serial logs, screen pixels (QEMU screendumps) and raw disk bytes.
-Tooling adds ~3k lines of self-written Python (ISO9660/GPT/FAT16/VAP64 packing, font subsetting, PE/FAT diagnostics).
+Tooling adds ~3k lines of self-written Python (ISO9660/GPT/FAT32/VAP64 packing, font subsetting, PE/FAT diagnostics).
 

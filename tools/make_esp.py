@@ -1,101 +1,122 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""tools/make_esp.py - 生成 FAT16 的 EFI 系统分区（ESP）镜像
+"""tools/make_esp.py - 生成 **FAT32** 的 EFI 系统分区（ESP）镜像
 
 为什么自己写：这台机器上没有 mkfs.fat / mtools（MSYS2 里没装），而本项目本来就在
-tools/make_iso64.py 里自己解析 ISO9660 —— 那就顺手把 FAT16 也自己写掉，不引入新依赖。
+tools/make_iso64.py 里自己解析 ISO9660 —— 那就顺手把 FAT32 也自己写掉，不引入新依赖。
 
-ESP 里放三个文件（都是 8.3 短名，不需要 LFN）：
+ESP 里放这些文件（都是 8.3 短名，不需要 LFN）：
     EFI/BOOT/BOOTX64.EFI   自研 UEFI 引导程序（PE32+）
     KERNEL64.BIN           安装程序内核（UEFI 引导程序会读进 0x100000）
     SYSTEM.IMG             系统镜像载荷（读进 0x04000000）
+    UEFI64.BIN             平铺长模式引导器（UEFI 引导程序读进 0x800000）
 
-布局（标准 FAT16，512B 扇区 / 2KB 簇）：
-    扇区 0          ：引导扇区（BPB + 0x55AA；EFI 不需要它可引导，但要合法）
-    扇区 1..FATsz   ：FAT1
-    然后 FAT2
-    然后根目录（512 项 = 32 扇区）
-    然后数据区
+布局（标准 FAT32，512B 扇区 / 1 扇区每簇）：
+    扇区 0            ：引导扇区（FAT32 BPB + 0x55AA；EFI 不执行它的代码，但字段必须自洽）
+    扇区 1            ：FSInfo（0x41615252 / 0x61417272 / 0xAA550000 签名 + free/next-free）
+    扇区 6            ：备份引导扇区（BPB_BkBootSec = 6，逐字节等于扇区 0）
+    扇区 7            ：FSInfo 的备份（规范建议 6..8 是备份区）
+    扇区 32..32+FATsz*2-1 ：FAT1 + FAT2（32 位项；FAT[0]=0x0FFFFFF8 / FAT[1]=0x0FFFFFFF）
+    然后是数据区：**根目录也是一个簇链，起始簇 = 2**，子目录同样从数据区分配
+
+★★ 关键规范约束（这才是"真 FAT32"，不是把类型字符串改掉就算）：
+    Microsoft FAT 规范按**簇数**判定类型：
+        < 4085         -> FAT12
+        4085..65524    -> FAT16
+        >= 65525       -> FAT32
+    而 EDK2（OVMF / VMware EFI）的 FAT 驱动**按簇数**决定用 12/16/32 位读 FAT 表：
+    簇数不到 65525 却自称 FAT32 的卷，会被按 FAT16 解析 -> 32 位 FAT 项被砍成 16 位，
+    簇链立刻变成垃圾 -> 读文件返回 EFI_VOLUME_CORRUPTED。
+    这跟当初"名为 FAT16、簇数却落在 FAT12 区间"的坑是镜像关系，所以这里同样加**硬断言**：
+        cluster_count >= 65525
+    违反就报错退出（构建期），内核侧 fat64_selftest64 / fat64_format64 同样拒绝。
+
+    512B 扇区 + SPC=1 时，65525 个簇就是 65525 个数据扇区（= 32.0MB）；再加上
+    32 个保留扇区 + 2 份 FAT（每簇 4 字节 -> 约 0.75MB）+ 根目录簇，
+    合法 FAT32 卷的下限约 33.5MB。本脚本直接取 **48MB**（98304 扇区）留余量：
+    解出 96736 簇（>= 65525，余量约 48%），而 ESP 里的全部载荷（内核 4MB + 载荷 4.1MB
+    + 引导器）只要 ~16 万个 512B 扇区中的 ~16300 个簇。
 
 用法：
-    python tools/make_esp.py <输出.img> <BOOTX64.EFI> <KERNEL64.BIN> <SYSTEM.IMG>
+    python tools/make_esp.py <输出.img> <BOOTX64.EFI> <KERNEL64.BIN> <SYSTEM.IMG> [UEFI64.BIN]
 """
-import os
 import struct
 import sys
 
 SECTOR = 512
-# ★ 每簇扇区数必须是 1：卷要"真的是 FAT16"。
-#   规范（Microsoft FAT）用**簇数**判定类型：< 4085 应为 FAT12，4085..65524 才是 FAT16。
-#   6MB 的 ESP 用 2KB 簇只有 3057 簇 —— 名字叫 FAT16、簇数却落在 FAT12 区间，
-#   而 EDK2 的 FAT 驱动**按簇数**决定用 12 位还是 16 位读 FAT 表：
-#   它把我们的 16 位 FAT 当 12 位解析，簇链立刻变成垃圾 → 读文件返回 EFI_VOLUME_CORRUPTED。
-#   症状极具迷惑性（我们踩过）：
-#     · 目录能列、文件能打开、**单簇文件能读**（2048 字节的 BOOTX64.EFI 恰好 1 簇，
-#       读完不需要查 FAT 项 → 手动 load 一直"成功"）
-#     · **多簇文件必挂**（UEFI64.BIN 28KB 要查 FAT 链 → 固件报损坏 → 桩 return 3）
-#   改成 SPC=1 后同样 6MB 卷有 12157 簇，落进 FAT16 合法区间，且 ESP 体积不变。
-SPC = 1                     # 每簇 1 扇区 = 512B（簇数 12157，真 FAT16）
-RESERVED = 1
+SPC = 1                     # 每簇 1 扇区 = 512B
+RESERVED = 32               # ★ FAT32 规范要求保留扇区 >= 32（0=BS, 1=FSInfo, 6=备份 BS）
 NUM_FATS = 2
-ROOT_ENTRIES = 512
-ROOT_SECTORS = (ROOT_ENTRIES * 32 + SECTOR - 1) // SECTOR      # 32 扇区
+ROOT_CLUSTER = 2            # ★ FAT32 的根目录是**簇链**（FAT12/16 才是固定区），从簇 2 开始
+FSINFO_SECTOR = 1
+BACKUP_BOOT_SECTOR = 6
 MEDIA = 0xF8
 VOL_LABEL = b"VIMTU64ESP "  # 11 字节卷标
 OEM = b"VIMTU64 "
+FS_TYPE = b"FAT32   "
+CLUSTER_MIN = 65525         # ★ FAT32 合法簇数下界（< 65525 就是 FAT16）
+ESP_MIN_SECTORS = 98304     # 48MB：>= 33.5MB 的 FAT32 下限，留余量
+FSINFO_LEAD = 0x41615252    # 'RRaA'
+FSINFO_STRUC = 0x61417272   # 'rrAa'
+FSINFO_TRAIL = 0xAA550000   # 尾签名（最后 2 字节再写 0x55AA）
 
 
-def _fat16_geometry(total_sectors):
-    """解出 FAT16 的 FAT 大小（簇数依赖 FAT 大小，迭代一次即可收敛）。"""
+def _fat32_geometry(total_sectors):
+    """解出 FAT32 的 FAT 大小（簇数依赖 FAT 大小，迭代一次即可收敛）。
+
+    与 kernel/fat64.cpp 的 geometry() 同一算法，两个实现必须给出同样的数字，
+    否则"构建期写的卷"和"安装时写的卷"会不一样（这是本项目踩过的坑）。
+    """
     fatsz = 1
     while True:
-        data_sectors = total_sectors - RESERVED - NUM_FATS * fatsz - ROOT_SECTORS
+        data_sectors = total_sectors - RESERVED - NUM_FATS * fatsz     # FAT32 没有固定根目录区
         clusters = data_sectors // SPC
-        need = ((clusters + 2) * 2 + SECTOR - 1) // SECTOR          # 每簇一个 u16
+        need = ((clusters + 2) * 4 + SECTOR - 1) // SECTOR             # 每簇一个 u32
         if need <= fatsz:
             return fatsz, clusters, data_sectors
         fatsz = need
+        if fatsz > 4096:
+            raise SystemExit("make_esp.py 错误：FAT 表 > 4096 扇区（卷大得不像 FAT32 了）")
 
 
 class EspImage:
     def __init__(self, files):
         # files: [(8.3 名, 属性, 数据, [父目录路径])]；目录本身也作为条目加入
-        # 需要的簇数 = 2 个目录（EFI、EFI/BOOT，各 1 簇）+ 每个文件 ceil(size / 簇字节)
-        # （空文件也占 1 簇，与 build() 里的 max(1, ...) 一致）
-        need_clusters = 2 + sum(max(1, (len(d) + SPC * SECTOR - 1) // (SPC * SECTOR))
-                                for (_, _, d, _) in files)
+        # 需要的簇数 = **根目录 1 簇** + 2 个目录（EFI、EFI/BOOT，各 1 簇）
+        #              + 每个文件 ceil(size / 簇字节)（空文件也占 1 簇）
+        need_clusters = 1 + 2 + sum(max(1, (len(d) + SPC * SECTOR - 1) // (SPC * SECTOR))
+                                    for (_, _, d, _) in files)
         need_sectors = need_clusters * SPC
-        # 先按"一次就够"的估算取一个 1MB 步长的漂亮大小
-        total = RESERVED + ROOT_SECTORS + need_sectors + 64
-        total = ((total + 2047) // 2048) * 2048
-        # ★ 容量必须用**解出来的几何**核对（真根因之修，见下面 build/alloc_chain 的注释）：
-        #   FAT 表自身占 NUM_FATS * FATsz 个扇区，而 FATsz 随簇数增长（每簇 2 字节）。
-        #   旧版本只按"固定 64 扇区余量"估算，2.06MB 内核那种载荷会算出"够用"其实不够：
-        #   total = 12288 扇区时 FATsz = 49 -> 数据区只剩 12157 簇，而文件+目录要 12178 簇，
-        #   alloc_chain 在 self.fat[c] 上直接 IndexError。
-        #   这里改成"按解出的 data_sectors 核对，不够就按 1MB 步长长大"，收敛很快（≤ 1 次）。
+        total = ESP_MIN_SECTORS
+        # 容量必须用**解出来的几何**核对（FAT 表自身也占扇区，且随簇数增长）：
+        #   载荷再大就按 1MB 步长长大，直到数据区装得下全部文件+目录。
         while True:
-            fatsz, clusters, data_sectors = _fat16_geometry(total)
+            fatsz, clusters, data_sectors = _fat32_geometry(total)
             if data_sectors >= need_sectors:
                 break
             total += 2048
         self.total_sectors = total
         self.fatsz, self.clusters, self.data_sectors = fatsz, clusters, data_sectors
         self.need_clusters = need_clusters
-        # 硬断言（见文件顶部 SPC 的说明）：卷必须落在 FAT16 的合法簇数区间，
-        # 否则固件会按 FAT12 解析本卷，多簇文件读取必然 EFI_VOLUME_CORRUPTED。
-        # 有这条断言，"名字叫 FAT16、实际该按 FAT12 读"这类错就不可能静默复活。
-        if not (4085 <= self.clusters < 65525):
+        # ★ 硬断言（见文件顶部说明）：簇数 >= 65525 才是真 FAT32。
+        #   没有这条断言，"名叫 FAT32、实际该按 FAT16 读"这类错就会静默复活，
+        #   症状是"目录能列、单簇文件能读、多簇文件报 EFI_VOLUME_CORRUPTED"。
+        if self.clusters < CLUSTER_MIN:
             raise SystemExit(
-                "make_esp.py 错误：簇数 %d 不在 FAT16 合法区间 [4085, 65525)。\n"
-                "  固件（EDK2）会按 FAT12 解析本卷 -> 多簇文件读取报 EFI_VOLUME_CORRUPTED。\n"
-                "  修法：调小 SPC（每簇扇区数）或调大 total_sectors。" % self.clusters)
-        self.data_start = RESERVED + NUM_FATS * self.fatsz + ROOT_SECTORS
+                "make_esp.py 错误：簇数 %d < %d，这不是真 FAT32（会被固件按 FAT16 解析）。\n"
+                "  SPC=1/512B 扇区时，数据区至少需要 65525 个扇区（32MB），\n"
+                "  加上保留扇区与两份 32 位 FAT 表，合法下限约 33.5MB；本脚本取 %d 扇区（%.1fMB）。\n"
+                "  修法：调大 ESP_MIN_SECTORS（别调小）。"
+                % (self.clusters, CLUSTER_MIN, ESP_MIN_SECTORS, ESP_MIN_SECTORS * SECTOR / 1048576.0))
+        # 数据区起点：FAT32 没有固定根目录区，目录/文件全在数据区（根目录 = 簇 2）
+        self.data_start = RESERVED + NUM_FATS * self.fatsz
         self.image = bytearray(self.total_sectors * SECTOR)
         self.fat = [0] * (self.clusters + 2)
-        self.fat[0] = 0xFFF8
-        self.fat[1] = 0xFFFF
-        self.next_cluster = 2
+        self.fat[0] = 0x0FFFFFF8          # 0x0FFFFFFF | media（FAT32 只用低 28 位）
+        self.fat[1] = 0x0FFFFFFF
+        self.next_cluster = ROOT_CLUSTER
+        root = self.alloc_chain(1)        # 根目录占簇 2（单簇 512B = 16 个目录项，够用）
+        assert root == ROOT_CLUSTER, root
         self.files = files
         self.written = []          # (名字, attr, 起始簇, 大小, 父目录)
         self.dirs = {}             # 目录路径 -> 起始簇
@@ -110,7 +131,7 @@ class EspImage:
                 "make_esp.py 错误：数据区容量不足。\n"
                 "  需要 %d 簇（本次还要 %d 簇，已用 %d），卷只有 %d 簇"
                 "（总 %d 扇区 / FATsz %d / 数据区 %d 扇区）。\n"
-                "  修法：给更大载荷时 __init__ 会自动长大 total_sectors；若仍不足请看 SPC/ROOT_ENTRIES。"
+                "  修法：给更大载荷时 __init__ 会自动长大 total_sectors；若仍不足请看 SPC。"
                 % (self.next_cluster - 2 + n_clusters, n_clusters,
                    self.next_cluster - 2, self.clusters,
                    self.total_sectors, self.fatsz, self.data_sectors))
@@ -118,15 +139,17 @@ class EspImage:
         for i in range(n_clusters):
             c = self.next_cluster
             self.next_cluster += 1
-            self.fat[c] = (c + 1) if i + 1 < n_clusters else 0xFFFF
+            self.fat[c] = (c + 1) if i + 1 < n_clusters else 0x0FFFFFFF
         return start
 
     def write_data(self, start_cluster, data):
-        off = self.data_start * SECTOR + (start_cluster - 2) * SPC * SECTOR
+        off = self.data_start * SECTOR + (start_cluster - ROOT_CLUSTER) * SPC * SECTOR
         self.image[off:off + len(data)] = data
 
     @staticmethod
     def _entry(name, attr, cluster, size):
+        """一个 32 字节目录项。★ FAT32 的起始簇是 **32 位**：
+        低 16 位在偏移 26（DIR_FstClusLO），高 16 位在偏移 20（DIR_FstClusHI）。"""
         n = name.encode("ascii") if isinstance(name, str) else name
         e = bytearray(32)
         # 8.3：主名 8 + 扩展名 3（空格填充）
@@ -138,12 +161,13 @@ class EspImage:
         e[8:11] = ext[:3].ljust(3, b" ")
         e[11] = attr
         e[12] = 0
-        struct.pack_into("<H", e, 26, cluster & 0xFFFF)          # 起始簇低 16 位
+        struct.pack_into("<H", e, 20, (cluster >> 16) & 0xFFFF)   # 起始簇高 16 位
+        struct.pack_into("<H", e, 26, cluster & 0xFFFF)           # 起始簇低 16 位
         struct.pack_into("<I", e, 28, size)
         return bytes(e)
 
     def build(self):
-        # 1) 目录：EFI（根下）、EFI/BOOT（EFI 下）
+        # 1) 目录：EFI（根下）、EFI/BOOT（EFI 下）—— 都是数据区的簇，走簇链
         efi_cluster = self.alloc_chain(1)
         boot_cluster = self.alloc_chain(1)
         self.dirs["EFI"] = efi_cluster
@@ -157,7 +181,14 @@ class EspImage:
             self.written.append((name, attr, c, len(data), parent))
 
         def dir_block(self_cluster, parent_cluster, entries):
-            """一个目录的数据块：前两项固定是 "." 和 ".."，然后是普通条目。"""
+            """一个目录的数据块：前两项固定是 "." 和 ".."，然后是普通条目。
+
+            ★ 头两项是 FAT 规范的硬要求：固件/Shell 靠它们解析路径。缺了会出现
+            "目录能列、但按路径打不开文件"（实测症状：根目录文件能 load，
+            EFI\\BOOT\\BOOTX64.EFI 一律 "Not Found"）。
+            ★ ".." 的簇号：父目录是根目录时写 0（FAT 惯例："0 = 根"；FAT12/16 的根
+            没有簇号，FAT32 这样写同样被 EDK2 接受），否则写父目录的真实簇号。
+            """
             buf = bytearray(SPC * SECTOR)
             dot = bytearray(self._entry(".", 0x10, self_cluster, 0))
             dot[0:11] = b".          "
@@ -171,8 +202,8 @@ class EspImage:
                 off += 32
             return bytes(buf)
 
-        # 3) 根目录（FAT16 固定区）
-        root_off = (RESERVED + NUM_FATS * self.fatsz) * SECTOR
+        # 3) 根目录（FAT32：**数据区的簇链**，起始簇 = 2）
+        root_off = self.data_start * SECTOR + (ROOT_CLUSTER - ROOT_CLUSTER) * SPC * SECTOR
         idx = 0
         self.image[root_off:root_off + 32] = self._entry("EFI", 0x10, efi_cluster, 0)
         idx = 1
@@ -183,7 +214,7 @@ class EspImage:
             idx += 1
 
         # 4) EFI/ 目录：BOOT 子目录（+ "." / ".."）
-        efi_off = self.data_start * SECTOR + (efi_cluster - 2) * SPC * SECTOR
+        efi_off = self.data_start * SECTOR + (efi_cluster - ROOT_CLUSTER) * SPC * SECTOR
         efi_entries = [self._entry("BOOT", 0x10, boot_cluster, 0)]
         for (name, attr, c, size, parent) in self.written:
             if parent == "EFI":
@@ -191,46 +222,67 @@ class EspImage:
         self.image[efi_off:efi_off + SPC * SECTOR] = dir_block(efi_cluster, 0, efi_entries)
 
         # 5) EFI/BOOT 目录：BOOTX64.EFI（+ "." / ".."）
-        # ★ 头两项 "." / ".." 是 FAT 规范的硬要求：固件/Shell 靠它们解析路径。
-        #   缺了它们会出现"目录能列、但按路径打不开文件"——实测症状就是根目录的文件能 load，
-        #   而 EFI\BOOT\BOOTX64.EFI 一律 "Not Found"，连 CD 的 UEFI 引导都起不来。
-        bt_off = self.data_start * SECTOR + (boot_cluster - 2) * SPC * SECTOR
+        bt_off = self.data_start * SECTOR + (boot_cluster - ROOT_CLUSTER) * SPC * SECTOR
         boot_entries = [self._entry(name, attr, c, size)
                         for (name, attr, c, size, parent) in self.written if parent == "EFI/BOOT"]
         self.image[bt_off:bt_off + SPC * SECTOR] = dir_block(boot_cluster, efi_cluster, boot_entries)
 
-        # 6) FAT 表（两份）
+        # 6) FAT 表（两份；32 位项）
         fat_bytes = bytearray(self.fatsz * SECTOR)
         for i, v in enumerate(self.fat):
-            struct.pack_into("<H", fat_bytes, i * 2, v)
+            struct.pack_into("<I", fat_bytes, i * 4, v & 0x0FFFFFFF)
         for k in range(NUM_FATS):
             off = (RESERVED + k * self.fatsz) * SECTOR
             self.image[off:off + len(fat_bytes)] = fat_bytes
 
-        # 7) 引导扇区（BPB；EFI 不看它的代码段，但字段必须自洽）
+        # 7) FSInfo 扇区（+ 备份）：free / next-free 都是真实值
+        allocated = self.next_cluster - ROOT_CLUSTER
+        free = self.clusters - allocated
+        next_free = self.next_cluster if self.next_cluster <= self.clusters + 1 else 0xFFFFFFFF
+        fi = bytearray(SECTOR)
+        struct.pack_into("<I", fi, 0, FSINFO_LEAD)
+        struct.pack_into("<I", fi, 484, FSINFO_STRUC)
+        struct.pack_into("<I", fi, 488, free)
+        struct.pack_into("<I", fi, 492, next_free)
+        struct.pack_into("<I", fi, 508, FSINFO_TRAIL)
+        fi[510] = 0x55
+        fi[511] = 0xAA
+        self.image[FSINFO_SECTOR * SECTOR:(FSINFO_SECTOR + 1) * SECTOR] = fi
+        self.image[(FSINFO_SECTOR + BACKUP_BOOT_SECTOR) * SECTOR
+                   :(FSINFO_SECTOR + BACKUP_BOOT_SECTOR + 1) * SECTOR] = fi
+
+        # 8) 引导扇区（FAT32 BPB；EFI 不看它的代码段，但字段必须自洽）
         bs = bytearray(SECTOR)
-        bs[0:3] = b"\xEB\x3C\x90"
+        bs[0:3] = b"\xEB\x58\x90"
         bs[3:11] = OEM
         struct.pack_into("<H", bs, 11, SECTOR)                 # 每扇区字节
         bs[13] = SPC                                           # 每簇扇区
-        struct.pack_into("<H", bs, 14, RESERVED)               # 保留扇区
+        struct.pack_into("<H", bs, 14, RESERVED)               # 保留扇区（FAT32 必须 >= 32）
         bs[16] = NUM_FATS
-        struct.pack_into("<H", bs, 17, ROOT_ENTRIES)
-        struct.pack_into("<H", bs, 19, self.total_sectors if self.total_sectors < 0x10000 else 0)
+        struct.pack_into("<H", bs, 17, 0)                      # ★ FAT32：根目录项数必须为 0
+        struct.pack_into("<H", bs, 19, 0)                      # ★ FAT32：TotSec16 必须为 0
         bs[21] = MEDIA
-        struct.pack_into("<H", bs, 22, self.fatsz)
+        struct.pack_into("<H", bs, 22, 0)                      # ★ FAT32：FATSz16 必须为 0
         struct.pack_into("<H", bs, 24, 32)                     # 每道扇区
         struct.pack_into("<H", bs, 26, 64)                     # 磁头
         struct.pack_into("<I", bs, 28, 0)                      # 隐藏扇区
-        struct.pack_into("<I", bs, 32, self.total_sectors if self.total_sectors >= 0x10000 else 0)
-        bs[36] = 0x80                                          # 驱动器号
-        bs[38] = 0x29                                          # 扩展引导签名
-        struct.pack_into("<I", bs, 39, 0x56494D54)             # 卷序号 'VIMT'
-        bs[43:54] = VOL_LABEL
-        bs[54:62] = b"FAT16   "
+        struct.pack_into("<I", bs, 32, self.total_sectors)     # 总扇区（32 位）
+        struct.pack_into("<I", bs, 36, self.fatsz)             # ★ BPB_FATSz32
+        struct.pack_into("<H", bs, 40, 0)                      # ExtFlags：0 = 两份 FAT 互为镜像
+        struct.pack_into("<H", bs, 42, 0)                      # FSVer 0.0
+        struct.pack_into("<I", bs, 44, ROOT_CLUSTER)           # ★ BPB_RootClus = 2
+        struct.pack_into("<H", bs, 48, FSINFO_SECTOR)          # ★ BPB_FSInfo = 1
+        struct.pack_into("<H", bs, 50, BACKUP_BOOT_SECTOR)     # ★ BPB_BkBootSec = 6
+        bs[64] = 0x80                                          # 驱动器号
+        bs[66] = 0x29                                          # 扩展引导签名
+        struct.pack_into("<I", bs, 67, 0x56494D54)             # 卷序号 'VIMT'
+        bs[71:82] = VOL_LABEL
+        bs[82:90] = FS_TYPE
         bs[510] = 0x55
         bs[511] = 0xAA
         self.image[0:SECTOR] = bs
+        # ★ 备份引导扇区（6 号扇区必须逐字节等于 0 号扇区：固件/修复工具会拿它兜底）
+        self.image[BACKUP_BOOT_SECTOR * SECTOR:(BACKUP_BOOT_SECTOR + 1) * SECTOR] = bytes(bs)
         return bytes(self.image)
 
 
@@ -257,8 +309,10 @@ def main():
     img = esp.build()
     with open(out, "wb") as f:
         f.write(img)
-    print("ESP 镜像: %s = %d 字节（FAT16, %d 簇, 每簇 %d 字节；文件+目录需要 %d 簇）"
-          % (out, len(img), esp.clusters, SPC * SECTOR, esp.need_clusters))
+    print("ESP 镜像: %s = %d 字节（FAT32, %d 簇 >= %d, 每簇 %d 字节, FATsz=%d, 根簇=%d；"
+          "文件+目录需要 %d 簇）"
+          % (out, len(img), esp.clusters, CLUSTER_MIN, SPC * SECTOR, esp.fatsz,
+             ROOT_CLUSTER, esp.need_clusters))
     print("  内含: EFI/BOOT/BOOTX64.EFI=%d B  KERNEL64.BIN=%d B  SYSTEM.IMG=%d B"
           % (len(data_efi), len(data_k), len(data_p)))
     return 0

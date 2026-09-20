@@ -12,8 +12,10 @@
        * 盘尾**备份 GPT**："EFI PART" + 头 CRC 正确 + 项数组 CRC 正确 +
          项1 主分区（基本数据 GUID）+ 项2 ESP（C12A7328-… GUID）
          （LBA 1 是 loader64.bin，主 GPT 头按规范应在那里 —— 冲突，所以只有备份头）
-       * ESP 里的 FAT16 卷：BPB 自洽（SPC=1、簇数落 FAT16 区间、两份 FAT 一致）、
-         目录结构 EFI/BOOT/、"." / ".." 齐备（复用 tools/fat_check.py 做规范体检）
+       * ESP 里的 FAT32 卷：BPB 自洽（FATSz16=0 / FATSz32 / RootClus=2 / FSInfo=1 /
+         BkBootSec=6、簇数 >= 65525、两份 FAT 逐字节一致、FSInfo 三个签名与 free/next-free）、
+         根目录簇链（从簇 2 开始）、目录结构 EFI/BOOT/、"." / ".." 齐备
+         （复用 tools/fat_check.py 做规范体检）
        * ESP 里三个文件与本地构建产物**逐字节一致**：
          EFI/BOOT/BOOTX64.EFI == build64/BOOTX64.EFI
          UEFI64.BIN           == build64/UEFI64.BIN
@@ -47,10 +49,11 @@ UEFI64 = os.path.join(BUILD, "UEFI64.BIN")
 LOADER = os.path.join(BUILD, "loader64.bin")
 
 SECTOR = 512
-TARGET_SECTORS = 131072          # 64MB（要放得下 4MB 引导区 + 8MB+ 主分区 + 5MB ESP）
+TARGET_SECTORS = 131072          # 64MB（要放得下 4MB 引导区 + 主分区 8MB 起 + 48MB FAT32 ESP
+                                #  + 盘尾备份 GPT；真 FAT32 的簇数硬下限让最小目标盘 ~60MB）
 PART_BOOT_LBA, PART_BOOT_SECS = 9, 8000
 PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS        # 8009
-ESP_SECTORS_EXPECT = 10240                            # kernel/part64.h 的 PART_ESP_SECTORS
+ESP_SECTORS_EXPECT = 98304                            # kernel/part64.h 的 PART_ESP_SECTORS（48MB）
 GPT_BACKUP = 33
 GPT_TYPE_ESP = bytes.fromhex("28732ac1" "1ff8" "d211" "ba4b" "00a0c93ec93b")
 GPT_TYPE_BASIC = bytes.fromhex("a2a0d0eb" "e5b9" "3344" "87c0" "68b6b72699c7")
@@ -172,7 +175,7 @@ def boot_disk(qemu, img, serial, tag, ovmf=None, timeout=300):
 
 
 # ---------------------------------------------------------------------------
-# 宿主侧解析：MBR / 盘尾备份 GPT / FAT16 卷（独立于内核实现，用于交叉验证）
+# 宿主侧解析：MBR / 盘尾备份 GPT / FAT32 卷（独立于内核实现，用于交叉验证）
 # ---------------------------------------------------------------------------
 def u16(b, o):
     return struct.unpack_from("<H", b, o)[0]
@@ -229,8 +232,11 @@ def parse_gpt_backup(disk):
             "ent_size": ent_size, "parts": parts, "total": total}, ""
 
 
-class Fat16:
-    """宿主侧 FAT16 只读解析器。"""
+class Fat32:
+    """宿主侧 FAT32 只读解析器（独立于内核实现，用于交叉验证）：
+    根目录是**簇链**（BPB_RootClus，通常 2）、FAT 项 32 位（只用低 28 位）、
+    目录项的起始簇是 32 位（低 16 位 @26 + 高 16 位 @20）、FSInfo 在保留扇区里。
+    """
 
     def __init__(self, b):
         self.b = b
@@ -239,13 +245,33 @@ class Fat16:
         self.rsvd = u16(b, 14)
         self.nfats = b[16]
         self.root_ent = u16(b, 17)
-        self.fatsz = u16(b, 22)
+        self.fatsz16 = u16(b, 22)
         self.tot = u16(b, 19) or u32(b, 32)
-        self.root_sec = (self.root_ent * 32 + self.bytes_per_sec - 1) // self.bytes_per_sec
-        self.data_start = self.rsvd + self.nfats * self.fatsz + self.root_sec
+        self.fatsz = u32(b, 36)          # BPB_FATSz32
+        self.ext_flags = u16(b, 40)
+        self.fs_ver = u16(b, 42)
+        self.root_clus = u32(b, 44)      # BPB_RootClus
+        self.fsinfo_sec = u16(b, 48)     # BPB_FSInfo
+        self.bkboot = u16(b, 50)         # BPB_BkBootSec
+        self.drvnum = b[64]
+        self.bootsig = b[66]
+        self.volid = u32(b, 67)
+        self.label = b[71:82].decode("latin-1").rstrip("\x00 ")
+        self.fstype = b[82:90].decode("latin-1").rstrip("\x00 ")
+        self.data_start = self.rsvd + self.nfats * self.fatsz      # FAT32 没有固定根目录区
         self.cluster_bytes = self.bytes_per_sec * self.spc
         self.clusters = (self.tot - self.data_start) // self.spc
         self.fat_off = self.rsvd * self.bytes_per_sec
+
+    def fat_entry(self, c):
+        return u32(self.b, self.fat_off + c * 4) & 0x0FFFFFFF
+
+    def fsinfo(self):
+        off = self.fsinfo_sec * self.bytes_per_sec
+        s = self.b[off:off + self.bytes_per_sec]
+        return {"lead": u32(s, 0), "struc": u32(s, 484), "trail": u32(s, 508),
+                "free": u32(s, 488), "next": u32(s, 492),
+                "sig55": s[510] == 0x55 and s[511] == 0xAA, "raw": s}
 
     def entry_at(self, off):
         e = self.b[off:off + 32]
@@ -254,27 +280,46 @@ class Fat16:
         base = e[0:8].decode("latin-1").rstrip()
         ext = e[8:11].decode("latin-1").rstrip()
         name = base + ("." + ext if ext else "")
-        return {"name": name, "attr": e[11], "cluster": u16(e, 26), "size": u32(e, 28)}
+        cluster = (u32(e, 20) & 0xFFFF0000) | u16(e, 26)          # ★ 32 位簇号
+        return {"name": name, "attr": e[11], "cluster": cluster, "size": u32(e, 28),
+                "clus_hi": u16(e, 20), "clus_lo": u16(e, 26)}
+
+    def chain(self, c, guard=300000):
+        out = []
+        while 2 <= c <= self.clusters + 1 and guard > 0:
+            out.append(c)
+            c = self.fat_entry(c)
+            guard -= 1
+        return out
+
+    def dir_bytes(self, cluster):
+        data = bytearray()
+        for c in self.chain(cluster):
+            off = (self.data_start + (c - 2) * self.spc) * self.bytes_per_sec
+            data += self.b[off:off + self.cluster_bytes]
+        return bytes(data)
 
     def list_dir(self, cluster):
         out = []
-        if cluster == 0:
-            base = (self.rsvd + self.nfats * self.fatsz) * self.bytes_per_sec
-            n = self.root_ent
-        else:
-            base = (self.data_start + (cluster - 2) * self.spc) * self.bytes_per_sec
-            n = self.cluster_bytes // 32
-        for i in range(n):
-            if self.b[base + i * 32] == 0:
+        data = self.dir_bytes(cluster)
+        for i in range(len(data) // 32):
+            if data[i * 32] == 0:
                 break
-            e = self.entry_at(base + i * 32)
-            if e is None or e["name"] in (".", ".."):
+
+            raw = data[i * 32:i * 32 + 32]
+            if raw[0] == 0xE5 or raw[11] == 0x0F:
                 continue
-            out.append(e)
+            base = raw[0:8].decode("latin-1").rstrip()
+            ext = raw[8:11].decode("latin-1").rstrip()
+            name = base + ("." + ext if ext else "")
+            out.append({"name": name, "attr": raw[11],
+                        "cluster": (u32(raw, 20) & 0xFFFF0000) | u16(raw, 26),
+                        "size": u32(raw, 28), "clus_hi": u16(raw, 20), "clus_lo": u16(raw, 26)})
+
         return out
 
     def find(self, path_parts):
-        cur = 0
+        cur = self.root_clus
         found = None
         for want in path_parts:
             found = None
@@ -286,14 +331,6 @@ class Fat16:
                 return None
             cur = found["cluster"]
         return found
-
-    def chain(self, c, guard=100000):
-        out = []
-        while 2 <= c < 0xFFF8 and guard > 0:
-            out.append(c)
-            c = u16(self.b, self.fat_off + c * 2)
-            guard -= 1
-        return out
 
     def read_file(self, entry):
         data = bytearray()
@@ -344,11 +381,11 @@ def main():
         print("     串口日志：%s" % serial)
 
     print("=== 3) 安装动作 + 打点断言 ===")
-    check("FAT16 写入器自检 PASS", "[FAT64] selftest PASS" in log)
+    check("FAT32 写入器自检 PASS", "[FAT64] selftest PASS" in log)
     check("新建分区表 OK（含 ESP 项）", "[PART] 新建分区表 OK" in log and "esp=" in log,
           [l for l in log.splitlines() if "[PART] 新建分区表" in l][:1])
-    check("ESP 格式化（[INSTALL] esp: … fat_ok=1）",
-          "[INSTALL] esp: lba=" in log and "fat_ok=1" in log,
+    check("ESP 格式化（[INSTALL] esp: … fs=FAT32 … fat_ok=1）",
+          "[INSTALL] esp: lba=" in log and "fs=FAT32" in log and "fat_ok=1" in log,
           [l for l in log.splitlines() if "[INSTALL] esp:" in l][:1])
     check("ESP 三文件写入打点（BOOTX64.EFI/UEFI64.BIN/KERNEL64.BIN 字节数）",
           "[INSTALL] esp files: BOOTX64.EFI=" in log and "UEFI64.BIN=" in log
@@ -402,19 +439,50 @@ def main():
 
     esp_start, esp_sectors = mbr[2]["start"], mbr[2]["sectors"]
     esp = disk[esp_start * SECTOR: (esp_start + esp_sectors) * SECTOR]
-    fat = Fat16(esp)
-    check("ESP BPB：512B 扇区 / SPC=1 / 2 份 FAT / 512 项根目录",
-          fat.bytes_per_sec == 512 and fat.spc == 1 and fat.nfats == 2 and fat.root_ent == 512,
-          "bps=%d spc=%d nfats=%d root=%d" % (fat.bytes_per_sec, fat.spc, fat.nfats, fat.root_ent))
-    check("ESP 是真 FAT16（簇数 %d 落在 [4085, 65525)）" % fat.clusters,
-          4085 <= fat.clusters < 65525)
-    check("FAT[0]=0xFFF8 / FAT[1]=0xFFFF / 两份 FAT 逐字节一致",
-          u16(esp, fat.fat_off) == 0xFFF8 and u16(esp, fat.fat_off + 2) == 0xFFFF
+    fat = Fat32(esp)
+    check("ESP BPB：512B 扇区 / SPC=1 / 2 份 FAT / FATSz16=0 / RootEntCnt=0",
+          fat.bytes_per_sec == 512 and fat.spc == 1 and fat.nfats == 2
+          and fat.fatsz16 == 0 and fat.root_ent == 0 and fat.fatsz != 0,
+          "bps=%d spc=%d nfats=%d root=%d fatsz16=%d fatsz32=%d"
+          % (fat.bytes_per_sec, fat.spc, fat.nfats, fat.root_ent, fat.fatsz16, fat.fatsz))
+    check("ESP BPB：类型串 %r / 卷标 %r / 卷序号 0x%08X / 扩展引导签名 0x%02X"
+          % (fat.fstype, fat.label, fat.volid, fat.bootsig),
+          fat.fstype == "FAT32" and fat.label == "VIMTU64ESP"
+          and fat.volid == 0x56494D54 and fat.bootsig == 0x29 and fat.drvnum == 0x80)
+    check("★ ESP 是真 FAT32（簇数 %d >= 65525；少于这个数固件会按 FAT16 读）" % fat.clusters,
+          fat.clusters >= 65525)
+    check("ESP 根目录是簇链：RootClus=%d / FSInfo=%d / BkBootSec=%d"
+          % (fat.root_clus, fat.fsinfo_sec, fat.bkboot),
+          fat.root_clus == 2 and fat.fsinfo_sec == 1 and fat.bkboot == 6
+          and fat.fat_entry(fat.root_clus) >= 0x0FFFFFF8)
+    check("FAT[0]=0x0FFFFFF8 / FAT[1]=0x0FFFFFFF / 两份 FAT 逐字节一致",
+          fat.fat_entry(0) == 0x0FFFFFF8 and fat.fat_entry(1) == 0x0FFFFFFF
           and esp[fat.fat_off:fat.fat_off + fat.fatsz * 512]
           == esp[fat.fat_off + fat.fatsz * 512:fat.fat_off + 2 * fat.fatsz * 512])
+    fi = fat.fsinfo()
+    check("FSInfo（扇区 %d）：0x41615252/0x61417272/0xAA550000 + free=%d next=%d"
+          % (fat.fsinfo_sec, fi["free"], fi["next"]),
+          fi["lead"] == 0x41615252 and fi["struc"] == 0x61417272
+          and fi["trail"] == 0xAA550000 and fi["sig55"]
+          and 0 < fi["free"] <= fat.clusters and 2 <= fi["next"] <= fat.clusters + 1)
+    bkb = esp[fat.bkboot * 512:(fat.bkboot + 1) * 512]
+    check("备份引导扇区（扇区 %d）逐字节等于 0 号扇区" % fat.bkboot, bkb == esp[0:512])
+    root_ents = [e["name"] for e in fat.list_dir(fat.root_clus)]
+    check("根目录簇（簇 %d）条目：%s" % (fat.root_clus, root_ents),
+          "EFI" in root_ents and "UEFI64.BIN" in root_ents and "KERNEL64.BIN" in root_ents)
+    efi_dir_ents = [e["name"] for e in fat.list_dir(fat.find(["EFI"])["cluster"])]
+    check("EFI/ 目录含 \".\" / \"..\" / BOOT（FAT 规范硬要求）",
+          "." in efi_dir_ents and ".." in efi_dir_ents and "BOOT" in efi_dir_ents,
+          "%s" % efi_dir_ents)
+    boot_dir_ents = [e["name"] for e in fat.list_dir(fat.find(["EFI", "BOOT"])["cluster"])]
+    check("EFI/BOOT/ 目录含 \".\" / \"..\" / BOOTX64.EFI",
+          "." in boot_dir_ents and ".." in boot_dir_ents and "BOOTX64.EFI" in boot_dir_ents,
+          "%s" % boot_dir_ents)
     efi = fat.find(["EFI", "BOOT", "BOOTX64.EFI"])
-    check("目录结构 EFI/BOOT/BOOTX64.EFI 存在（普通文件属性 0x20）",
-          efi is not None and (efi["attr"] & 0x20) and not (efi["attr"] & 0x10),
+    check("目录结构 EFI/BOOT/BOOTX64.EFI 存在（普通文件属性 0x20；32 位簇号 高=%d 低=%d）"
+          % (efi["clus_hi"], efi["clus_lo"]) if efi else "EFI/BOOT/BOOTX64.EFI 缺失",
+          efi is not None and (efi["attr"] & 0x20) and not (efi["attr"] & 0x10)
+          and efi["cluster"] == ((efi["clus_hi"] << 16) | efi["clus_lo"]),
           "%s" % (efi,))
 
     print("--- tools/fat_check.py 规范体检（把 ESP 分区字节单独导出）---")
@@ -424,11 +492,20 @@ def main():
             f.write(esp)
         r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "fat_check.py"), esp_img],
                            capture_output=True, timeout=120)
+        # fat_check.py 现在强制按 UTF-8 写 stdout；稳妥起见两种编码都试一遍
         out = r.stdout.decode("utf-8", "replace")
+        if "\u6ca1\u53d1\u73b0\u660e\u663e\u95ee\u9898" not in out:
+            try:
+                out = r.stdout.decode("gbk", "replace")
+            except Exception:
+                pass
         for line in out.splitlines():
-            if any(k in line for k in ("簇数", "数据区", "根目录", "结论", "FAT[0]", "FAT[1]",
-                                       "两个 FAT", "没发现", "★", "[ 0]", "[ 1]", "[ 2]")):
+            if any(k in line for k in ("文件系统", "簇数", "数据区", "根目录", "结论", "FAT[0]", "FAT[1]",
+                                       "两个 FAT", "FSInfo", "备份引导", "没发现", "★", "[文件]", "[目录]")):
                 print("   | " + line.strip()[:150])
+        check("fat_check.py：识别为 FAT32 且列出三个文件",
+              r.returncode == 0 and "文件系统=FAT32 簇数=" in out
+              and "BOOTX64.EFI" in out and "KERNEL64.BIN" in out and "UEFI64.BIN" in out)
         check("fat_check.py：没发现明显问题", r.returncode == 0 and "没发现明显问题" in out)
 
     print("--- ESP 三文件与本地构建产物逐字节比对 ---")

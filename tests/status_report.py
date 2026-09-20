@@ -94,7 +94,9 @@ def iso_check(what):
         seg = b[0x8800:0x8800 + 64]
         return b"EL TORITO SPECIFICATION" in seg, "LBA17 引导记录=%r" % seg[:32]
     if what == "esp_fat":
-        # ESP 起点：从 MBR 0xEF 分区项取 LBA，再检查 FAT BPB 的 "FAT" 标识
+        # ESP 起点：从 MBR 0xEF 分区项取 LBA，再按 FAT 规范识别类型。
+        # ★ FAT32：类型串在偏移 82（"FAT32   "），FATSz32 @36、RootClus @44、FSInfo @48、
+        #   BkBootSec @50；FAT16/FAT12 的类型串才在偏移 54。
         mbr = b[:512]
         lba = None
         for i in range(4):
@@ -105,9 +107,21 @@ def iso_check(what):
             return False, "MBR 里没有 0xEF 分区"
         off = lba * 512
         bpb = b[off:off + 512]
-        fstype = bpb[54:62].decode("latin-1").strip("\x00 ")
-        ok = b"FAT" in bpb[54:62] or b"FAT" in bpb[82:90]
-        return ok, "ESP@LBA %d 文件系统=%r 类型字节=%r" % (lba, fstype, bpb[54:62])
+        fatsz16 = struct.unpack("<H", bpb[22:24])[0]
+        root_ent = struct.unpack("<H", bpb[17:19])[0]
+        is_fat32 = (fatsz16 == 0 and root_ent == 0)
+        fstype = (bpb[82:90] if is_fat32 else bpb[54:62]).decode("latin-1").strip("\x00 ")
+        clusters = 0
+        if is_fat32:
+            fatsz32 = struct.unpack("<I", bpb[36:40])[0]
+            rsvd = struct.unpack("<H", bpb[14:16])[0]
+            tot = struct.unpack("<I", bpb[32:36])[0]
+            spc = bpb[13]
+            if fatsz32 and spc:
+                clusters = (tot - rsvd - bpb[16] * fatsz32) // spc
+        ok = ("FAT32" in fstype.upper() and is_fat32 and clusters >= 65525)
+        return ok, ("ESP@LBA %d 文件系统=%r 类型字节=%r FATSz32=%d 簇数=%d"
+                    % (lba, fstype, bpb[82:90], struct.unpack("<I", bpb[36:40])[0], clusters))
     return False, "未知检查"
 
 
@@ -216,8 +230,9 @@ def cap_boot_uefi():
 
     本项从 PARTIAL 转 DONE 的过程（三个真根因，都有实测证据，见 docs/UEFI引导说明.md §5）：
       ① PE 首选基址 0x140000000（5GB）-> 固件按它分配失败就放弃加载 -> build_uefi.sh 必须 -base:0x0
-      ② FAT 卷"名为 FAT16、簇数却属 FAT12 区间"-> 固件按 12 位读 16 位 FAT，
-         单簇文件能读、多簇文件报 EFI_VOLUME_CORRUPTED -> make_esp.py 必须 SPC=1
+      ② FAT 卷的**类型必须与簇数一致**：FAT32 要求簇数 >= 65525（SPC=1 时数据区 >= 32MB）。
+         簇数不够却自称 FAT32/或反之，固件会按另一种位宽读 FAT 表 -> 簇链变垃圾 ->
+         多簇文件报 EFI_VOLUME_CORRUPTED（当年\"名为 FAT16、簇数却属 FAT12 区间\"踩过一次）
       ③ 进内核时 CS 仍是固件的 0x38（近跳不改 CS）-> 第一次中断返回 iretq 就 #GP
          -> jump64.asm 必须远跳（push CS/RIP + retfq）
     另外两个"环境差异"也记录在案：桩/引导器的文件名必须 UTF-16；VMware EFI 下不能切 CR3。
@@ -229,11 +244,12 @@ def cap_boot_uefi():
           "ISO 内 FAT 分区（ESP）：%s（%s）" % ("有" if esp else "无", why1),
           "ISO 有 GPT：%s（%s）" % ("有" if gpt else "无", why2)]
     base0 = grep_count(r"-base:0x0", ["build_uefi.sh"])
-    spc1 = grep_count(r"SPC = 1\b", ["tools/make_esp.py"])   # 不加 ^ 锚点：grep 没开多行模式
+    spc1 = grep_count(r"clusters < CLUSTER_MIN|SPC = 1\b", ["tools/make_esp.py"])   # 类型串/簇数硬断言都在
     farj = grep_count(r"retfq", ["boot/efi/jump64.asm"])
     u16n = grep_count(r"static const u16 g_name", ["boot/efi/stub.c"])
     ev.append("① PE 基址 0（build_uefi.sh -base:0x0）：%s" % ("是" if base0 else "★ 缺"))
-    ev.append("② ESP 是真 FAT16（make_esp.py SPC=1）：%s" % ("是" if spc1 else "★ 缺"))
+    ev.append("② ESP 是真 FAT32（make_esp.py 簇数 >= 65525 硬断言 + SPC=1 + 类型串 FAT32   ）：%s"
+              % ("是" if spc1 else "★ 缺"))
     ev.append("③ 进内核用远跳换 CS（jump64.asm retfq）：%s" % ("是" if farj else "★ 缺"))
     ev.append("文件名按 UTF-16 传给 Open（stub.c g_name）：%s" % ("是" if u16n else "否"))
     ev.append("实测：OVMF 与 VMware EFI 双通过 —— tests/uefi64_install_test.py PASS（22 项）")
@@ -254,14 +270,14 @@ def cap_boot_uefi():
 
 def cap_gpt_part():
     """现代分区表：ISO 里的 GPT（构建期，tools/make_iso64.py）**与**
-    安装时在目标盘写的 GPT + FAT16 ESP（kernel/part64.cpp + kernel/fat64.cpp）。
+    安装时在目标盘写的 GPT + FAT32 ESP（48MB；kernel/part64.cpp + kernel/fat64.cpp）。
 
     为什么安装侧是关键：装好的盘以前只有 MBR + 固定 LBA 引导区，UEFI 固件在盘上
     找不到任何 FAT 卷 -> UEFI 机器装完起不来。现在安装收尾会写
       · 混合 MBR：P1 0xEF 引导区(活动,9+8000) + P2 0x07 主分区 + P3 0xEF ESP(盘尾)
       · 盘尾备份 GPT（主 GPT 头按规范应在 LBA 1 —— 那里是 loader64.bin，冲突；
         EDK2 在主头无效时用备份头，OVMF 实测）
-      · ESP(FAT16, SPC=1)：EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN
+      · ESP(FAT32, 48MB, SPC=1)：EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN
     """
     n = grep_count(r"EFI PART|GPT|gpt", ["tools/make_iso64.py", "kernel/part64.cpp"])
     ev = ["GPT 相关命中 %d 处（tools/make_iso64.py + kernel/part64.cpp）" % n]
@@ -274,10 +290,12 @@ def cap_gpt_part():
               % ("有" if fat else "★ 缺", esp, p3, gptw))
     if fat:
         spc1 = grep_count(r"FAT64_SPC\s*=\s*1", ["kernel/fat64.h"])
-        ev.append("内核实现在真 FAT16 区间（FAT64_SPC=1 + 簇数断言 [4085,65525)）：%d 处"
-                  % spc1)
+        cmin = grep_count(r"FAT64_CLUSTER_MIN\s*=\s*65525", ["kernel/fat64.h"])
+        ev.append("内核实现在真 FAT32（FAT64_SPC=1 + FAT64_CLUSTER_MIN=65525 簇数硬断言）：SPC %d 处 / 硬断言 %d 处"
+                  % (spc1, cmin))
         ev.append("字节级验收：tests/esp_install_test.py（64MB AHCI 盘走完整安装 -> "
-                  "MBR/备份 GPT(CRC)/FAT16 卷(tools/fat_check.py 体检)/三文件与构建产物逐字节一致"
+                  "MBR/备份 GPT(CRC)/FAT32 卷(tools/fat_check.py 体检 + 簇数 >= 65525)/"
+                  "三文件与构建产物逐字节一致"
                   " -> UEFI(OVMF) 与 BIOS 都从这块盘进桌面）")
     ok = (exists("tools/make_iso64.py") and n > 0 and fat and esp >= 1 and p3 >= 1 and gptw >= 1)
     return ("DONE" if ok else "PARTIAL"), ev
@@ -982,7 +1000,7 @@ TESTS = [
     ("vmware_install_test.py", "VMware(BIOS) 端到端真实安装 + 目标盘字节验收"),
     ("uefi64_install_test.py", "VMware EFI(UEFI) 端到端安装 + 目标盘字节验收"),
     ("usb_boot_both_fw_test.py", "U 盘形态（ISO 当磁盘/usb-storage）× 双固件（OVMF/SeaBIOS）进安装向导"),
-    ("esp_install_test.py", "安装时建 ESP+GPT（FAT16 三文件字节级）→ 装好的盘 UEFI/BIOS 双启动进桌面"),
+    ("esp_install_test.py", "安装时建 ESP+GPT（FAT32 48MB，簇数 >= 65525；三文件字节级）→ 装好的盘 UEFI/BIOS 双启动进桌面"),
     ("desktop64_test.py", "64 位桌面栈：外壳 + 8 应用 + 像素 + 脏矩形"),
     ("net64_test.py", "网络端到端：e1000 + ARP/ICMP（用户模式网络）"),
     ("apic64_test.py", "APIC 启用：LAPIC+IOAPIC 接管中断 + 降级（PIT/键鼠/ATA 功能证据）"),

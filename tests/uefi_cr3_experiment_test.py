@@ -83,16 +83,19 @@ def make_fixture():
         return None
     with open(esp, "rb") as f:
         esp_bytes = f.read()
-    total = p64.ESP_LBA + max(p64.ESP_SECTORS, (len(esp_bytes) + p64.SECTOR - 1) // p64.SECTOR) + 8192
+    # make_esp.py 现在生成 48MB 的**真 FAT32** ESP：分区大小按镜像实际字节数写
+    # （p64.ESP_SECTORS 是旧的 FAT16 常量，写小了固件只看到分区那一截）
+    esp_sectors = (len(esp_bytes) + p64.SECTOR - 1) // p64.SECTOR
+    total = p64.ESP_LBA + esp_sectors + 8192
     total = ((total + 2047) // 2048) * 2048
     buf = bytearray(total * p64.SECTOR)
     buf[p64.ESP_LBA * p64.SECTOR:p64.ESP_LBA * p64.SECTOR + len(esp_bytes)] = esp_bytes
-    main_lba = p64.ESP_LBA + p64.ESP_SECTORS
+    main_lba = p64.ESP_LBA + esp_sectors
     main_sectors = total - main_lba - 1
     if main_sectors < 4096:
         return None
     p64._vimtufs2_format(buf, main_lba, main_sectors)
-    buf[446:462] = p64._mbr_entry(True, 0xEF, p64.ESP_LBA, p64.ESP_SECTORS)
+    buf[446:462] = p64._mbr_entry(True, 0xEF, p64.ESP_LBA, esp_sectors)
     buf[462:478] = p64._mbr_entry(False, 0x07, main_lba, main_sectors)
     buf[510], buf[511] = 0x55, 0xAA
     with open(FIXTURE_EXP, "wb") as f:

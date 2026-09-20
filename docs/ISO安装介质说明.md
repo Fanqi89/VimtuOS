@@ -6,7 +6,7 @@ M2 原来的安装介质是一张**裸盘镜像**（`vimtu64-64.img`，适合写
 ## 1. 一条命令构建
 
 ```bash
-bash build64.sh          # 顺带生成 vimtu64-64.iso（约 8.6MB）
+bash build64.sh          # 顺带生成 vimtu64-64.iso（约 56.2MB，附 48MB FAT32 ESP）
 ```
 
 产物：

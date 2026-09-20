@@ -94,5 +94,6 @@ Get-Content "C:\Users\fanqi\Desktop\新建文件夹\v64-install-test\serial-inst
 那份配置跑的是**32 位** VimtuOS（3MB vmdk）。要装 64 位版有两个前提：
 
 1. `guestOS` 改成 64 位类型（见坑 1）
-2. 磁盘容量要够：安装介质 16266 扇区（7.9MB）、目标盘建议 ≥ 16MB；
+2. 磁盘容量要够：安装介质 16266 扇区（7.9MB）、目标盘建议 ≥ 64MB（装好的盘要建 48MB 的 FAT32 ESP；
+   16MB 这类小盘只写老 MBR 布局（BIOS-only），会打 `[INSTALL] esp skipped (disk too small)`）；
    也可以直接用本目录生成的 `installer.vmdk` / `target.vmdk` 挂上去
