@@ -1,8 +1,9 @@
 # UEFI 引导说明（自研 BOOTX64.EFI，不用 gnu-efi）
 
-> 状态（截至本次）：**引导程序本体已完成并在固件里验证可加载**；ISO 的 UEFI 双模式结构
-> （El Torito 0xEF 项 + GPT + FAT16 ESP）已完成；**固件自动引导这一步尚未打通**（手动执行
-> 引导程序可以加载成功，见下文"已验证"与"卡点"）。
+> 状态（本次更新）：**引导程序本体、ISO 三合一结构、自动引导全部完成并实测通过**。
+> 本次新增：① "ISO 当 U 盘"形态 × UEFI/BIOS **双固件四档**实测（`tests/usb_boot_both_fw_test.py`）；
+> ② **安装时在目标盘写混合 MBR + 盘尾 GPT + FAT16 ESP**（`kernel/fat64.{h,cpp}` + `kernel/part64.cpp`），
+> 装好的盘在 UEFI 与 BIOS 下都能启动（`tests/esp_install_test.py`）。详见 §7/§8。
 
 ## 1. 设计：两段式，全 64 位
 
@@ -101,4 +102,56 @@ python tests/uefi64_install_test.py
 #   load FS0:\EFI\BOOT\BOOTX64.EFI / EFI\BOOT\BOOTX64.EFI
 ```
 `tests/uefi64_install_test.py` 的验收项（串口 `U:` 标记、无 BIOS 桩标记、装入目标盘逐字节）
-在自动引导打通后即可全绿。
+在自动引导打通后全绿（22 项）。
+
+## 7. U 盘形态 × 双固件（本次实测）
+
+`tests/usb_boot_both_fw_test.py` 把同一个 `vimtu64-64.iso` 当**磁盘/U 盘**引导，四档全绿：
+
+| # | 形态 | 固件 | 关键打点 |
+|---|---|---|---|
+| A | ISO 挂 `usb-storage`（UHCI + `bootindex=1`） | UEFI（OVMF） | `S12345J` → `U:====` → `U:loaded KERNEL64.BIN/SYSTEM.IMG` → `[LM64] ENTERED LONG MODE` → `[SETUP] 磁盘枚举完成` |
+| B | ISO 当 IDE 盘 | UEFI（OVMF） | 同 A（固件不支持 USB 启动时的等价形态） |
+| C | ISO 挂 `usb-storage` | BIOS（SeaBIOS） | `I:boot dl=` → `I:hdd mode (USB/disk)` → `I:jump loader64` → `L:media=ram` → 向导第一屏 |
+| D | ISO 当 IDE 盘 | BIOS（SeaBIOS） | 同 C |
+
+结论：**"U 盘形态 + UEFI"原生就通**（ISO 里的 El Torito 0xEF 项 + GPT + ESP 三者任一都能让
+OVMF 找到 `EFI/BOOT/BOOTX64.EFI`），BIOS 侧走 hybrid MBR → cdiso 桩 → INT 13h 搬内核/载荷。
+脚本末尾还有"安装介质 sha256 未变"的断言（真 U 盘/光驱是只读的）。
+
+## 8. 安装时在目标盘写 GPT + ESP（装好的盘也是 UEFI 可启动）
+
+这是本次补齐的最后一环 —— 以前**只有 ISO 有 ESP，装到硬盘上的系统没有**，于是 UEFI 机器
+装完重启后固件在盘上找不到任何 FAT 卷。现在安装收尾（`kernel/part64.cpp` + `kernel/fat64.{h,cpp}`）：
+
+1. 在盘尾格式化 **5MB FAT16 ESP**（与 `tools/make_esp.py` 完全相同的卷参数：512B 扇区、
+   `SPC=1`、1 保留扇区、2 份 FAT、512 项根目录、簇数硬断言 `[4085, 65525)`）；
+2. 写 `EFI/BOOT/BOOTX64.EFI`（内嵌 PE 桩字节）+ `UEFI64.BIN`（内嵌平铺引导器）+
+   `KERNEL64.BIN`（**直接读目标盘 LBA 9..8008 的 4MB 系统内核区**）；
+3. 写**混合 MBR**（`0xEF` 引导区活动 9+8000 / `0x07` 主分区 / `0xEF` ESP）与**盘尾备份 GPT**
+   （项1 主分区 / 项2 ESP，`C12A7328-…`；头与项数组 CRC 都按规范算）。
+
+为什么只写**备份** GPT：主 GPT 头的规范位置是 **LBA 1**，而那里是 `loader64.bin`
+（`boot/boot.asm` 从 LBA 1 读 8 扇区）——两者不可兼得。UEFI 规范要求主头无效时使用备份头，
+EDK2 实测如此；`tests/esp_install_test.py` 还断言 UEFI 从这块盘启动**之后** LBA 1..8 的
+loader 字节没被固件改写（没有"GPT 修复式回写"把引导链踩坏）。
+
+`UEFI64.BIN` 侧的小改动（`boot/efi/uefi64.c`）：`SYSTEM.IMG`（安装载荷）改成**可选** ——
+装好的盘上没有它，此时跳过并写介质描述符 `kind=0`；`KERNEL64.BIN` 仍是**必须**（它就是这次要跑的内核）。
+安装介质路径完全不变（ISO 的 ESP 里三个文件齐全）。
+
+实测（`tests/esp_install_test.py`，64MB 目标盘挂 AHCI）：
+
+```
+[INSTALL] esp: lba=120799 sectors=10240 fat_ok=1
+[INSTALL] esp files: BOOTX64.EFI=2560B UEFI64.BIN=36864B KERNEL64.BIN=4096000B
+[INSTALL] gpt written (main + esp), pmbr ok main=8009+112790 esp=120799+10240 backup_hdr_lba=131071
+UEFI(OVMF)：U:==== → U:loaded KERNEL64.BIN → U:missing SYSTEM.IMG (optional, skipped)
+            → [OS] booted from installed disk → [GUI64] ready
+BIOS      ：[LM] disk boot via INT 13h dl=0x80 → [OS] booted from installed disk → [GUI64] ready
+```
+
+限制（如实）：① 目标盘 < ~17MB（8009 + 8MB 主分区 + 5MB ESP + 33 扇区 GPT 备份）时不建 ESP，
+只写老 MBR 布局并在串口打 `[INSTALL] esp skipped (disk too small)`；
+② 内嵌 FAT16 写入器只支持"根目录 + 2 层子目录 + 连续簇链 + 8.3 短名 + 只新建"；
+③ 只有 `BOOTX64.EFI`（**32 位 UEFI 固件不支持**）；④ Secure Boot 必须关闭（无签名）。

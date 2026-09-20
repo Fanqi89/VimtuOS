@@ -18,8 +18,8 @@
 #include "hwui64.h"      // ★ item 5a：找不到任何磁盘时，把屏幕硬件检查报告直接画在向导里
 #include "part64.h"
 #include "x86_64.h"
+#include "fat64.h"      // ★ ESP：安装时在目标盘写 FAT16 卷（自检也在安装程序启动时跑一次）
 #include "debug64.h"
-
 // ==================== 调色板（对齐 Win10 安装程序）====================
 static const uint32_t C_BG      = 0xFF00549E;   // 深蓝背景 rgb(0,84,158)
 static const uint32_t C_BAR     = 0xFF003E78;   // 顶部标题条 rgb(0,62,120)
@@ -232,11 +232,18 @@ static void probe_disk(int idx) {
             p.start = rd32(e + 8);
             p.sectors = rd32(e + 12);
             char* dp = p.label;
-            str_append(dp, "主分区 (MBR 类型 0x", 20);
             static const char* H = "0123456789ABCDEF";
             char hex[3] = {H[(type >> 4) & 0xF], H[type & 0xF], 0};
-            str_append(dp, hex, 3);
-            str_append(dp, ")", 2);
+            if (type == 0xEF && p.start > PART_BOOT_LBA + PART_BOOT_SECS - 1) {
+                // ★ 安装器在盘尾建的 ESP：0xEF 项 + 真 FAT16 卷（UEFI 靠 GPT/它找到引导器）
+                str_append(dp, "EFI 系统分区 (MBR 类型 0x", 40);
+                str_append(dp, hex, 3);
+                str_append(dp, ")", 2);
+            } else {
+                str_append(dp, "主分区 (MBR 类型 0x", 20);
+                str_append(dp, hex, 3);
+                str_append(dp, ")", 2);
+            }
         }
         dk.has_mbr = true;
     }
@@ -853,7 +860,10 @@ static void progress_tick() {
 [[noreturn]] void setup64_run(const BootInfo* bi) {
     (void)bi;
     dbg64_str("[SETUP] 安装程序启动");
-    dbg64_nl();
+
+    // ---- FAT16 写入器自检（ESP 用）：内存卷上做完整往返，坏参数必须被拒 ----
+    // 位置理由：在任何真盘 I/O 之前跑（自检只碰内存卷），结果打一行 [FAT64] selftest 供验收。
+    (void)fat64_selftest64();
 
     // ---- ATA：注册/打开 IRQ14（安装程序全程在用 ATA），读写走中断驱动等待 + 超时回退轮询 ----
     ata64_init64();

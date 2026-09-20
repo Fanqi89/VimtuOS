@@ -237,15 +237,51 @@ def cap_boot_uefi():
     ev.append("③ 进内核用远跳换 CS（jump64.asm retfq）：%s" % ("是" if farj else "★ 缺"))
     ev.append("文件名按 UTF-16 传给 Open（stub.c g_name）：%s" % ("是" if u16n else "否"))
     ev.append("实测：OVMF 与 VMware EFI 双通过 —— tests/uefi64_install_test.py PASS（22 项）")
-    done = ok and esp and gpt and base0 and spc1 and farj
+    # ★ 本轮补齐：\"ISO 当 U 盘\"形态 × UEFI 的组合（OVMF + usb-storage 三档控制器）实测
+    usbt = exists("tests/usb_boot_both_fw_test.py")
+    espinst = exists("tests/esp_install_test.py")
+    esc = grep_count(r"part_write_backup_gpt64|part_install_esp64", ["kernel/part64.cpp"])
+    fat = exists("kernel/fat64.cpp") and exists("kernel/fat64.h")
+    ev.append("U 盘形态 × 双固件实测脚本：tests/usb_boot_both_fw_test.py：%s；"
+              "'安装时建 ESP+GTP' 实现（kernel/fat64.*）：%s（part64.cpp 命中 %d 处）"
+              % ("有" if usbt else "★ 缺", "有" if fat else "★ 缺", esc))
+    ev.append("实测：U 盘形态 × UEFI（OVMF + usb-storage UHCI/EHCI/xHCI）与 × BIOS（SeaBIOS USB MSC）"
+              "都进安装向导第一屏；装好的盘在 UEFI/BIOS 下都进桌面 —— tests/usb_boot_both_fw_test.py、"
+              "tests/esp_install_test.py（%s）" % ("都在" if (usbt and espinst) else "缺脚本"))
+    done = ok and esp and gpt and base0 and spc1 and farj and usbt and fat
     return ("DONE" if done else "PARTIAL"), ev
 
 
 def cap_gpt_part():
+    """现代分区表：ISO 里的 GPT（构建期，tools/make_iso64.py）**与**
+    安装时在目标盘写的 GPT + FAT16 ESP（kernel/part64.cpp + kernel/fat64.cpp）。
+
+    为什么安装侧是关键：装好的盘以前只有 MBR + 固定 LBA 引导区，UEFI 固件在盘上
+    找不到任何 FAT 卷 -> UEFI 机器装完起不来。现在安装收尾会写
+      · 混合 MBR：P1 0xEF 引导区(活动,9+8000) + P2 0x07 主分区 + P3 0xEF ESP(盘尾)
+      · 盘尾备份 GPT（主 GPT 头按规范应在 LBA 1 —— 那里是 loader64.bin，冲突；
+        EDK2 在主头无效时用备份头，OVMF 实测）
+      · ESP(FAT16, SPC=1)：EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN
+    """
     n = grep_count(r"EFI PART|GPT|gpt", ["tools/make_iso64.py", "kernel/part64.cpp"])
     ev = ["GPT 相关命中 %d 处（tools/make_iso64.py + kernel/part64.cpp）" % n]
-    ok = exists("tools/make_iso64.py") and n > 0
-    return ("DONE" if ok else "MISSING"), ev
+    fat = exists("kernel/fat64.cpp") and exists("kernel/fat64.h")
+    esp = grep_count(r"PART_ESP_SECTORS|esp_geometry", ["kernel/part64.h", "kernel/part64.cpp"])
+    p3 = grep_count(r"set_entry\(sec512, 2, 0xEF", ["kernel/part64.cpp"])
+    gptw = grep_count(r"part_write_backup_gpt64", ["kernel/part64.cpp"])
+    ev.append("安装时建 ESP（kernel/fat64.*）：%s；ESP 几何常量/函数命中 %d 处；"
+              "混合 MBR 第 3 项 0xEF：%d 处；盘尾备份 GPT 写入：%d 处"
+              % ("有" if fat else "★ 缺", esp, p3, gptw))
+    if fat:
+        spc1 = grep_count(r"FAT64_SPC\s*=\s*1", ["kernel/fat64.h"])
+        ev.append("内核实现在真 FAT16 区间（FAT64_SPC=1 + 簇数断言 [4085,65525)）：%d 处"
+                  % spc1)
+        ev.append("字节级验收：tests/esp_install_test.py（64MB AHCI 盘走完整安装 -> "
+                  "MBR/备份 GPT(CRC)/FAT16 卷(tools/fat_check.py 体检)/三文件与构建产物逐字节一致"
+                  " -> UEFI(OVMF) 与 BIOS 都从这块盘进桌面）")
+    ok = (exists("tools/make_iso64.py") and n > 0 and fat and esp >= 1 and p3 >= 1 and gptw >= 1)
+    return ("DONE" if ok else "PARTIAL"), ev
+
 
 
 def cap_installer_ui():
@@ -945,6 +981,8 @@ TESTS = [
     ("iso64_usb_test.py", "U 盘 hybrid 端到端"),
     ("vmware_install_test.py", "VMware(BIOS) 端到端真实安装 + 目标盘字节验收"),
     ("uefi64_install_test.py", "VMware EFI(UEFI) 端到端安装 + 目标盘字节验收"),
+    ("usb_boot_both_fw_test.py", "U 盘形态（ISO 当磁盘/usb-storage）× 双固件（OVMF/SeaBIOS）进安装向导"),
+    ("esp_install_test.py", "安装时建 ESP+GPT（FAT16 三文件字节级）→ 装好的盘 UEFI/BIOS 双启动进桌面"),
     ("desktop64_test.py", "64 位桌面栈：外壳 + 8 应用 + 像素 + 脏矩形"),
     ("net64_test.py", "网络端到端：e1000 + ARP/ICMP（用户模式网络）"),
     ("apic64_test.py", "APIC 启用：LAPIC+IOAPIC 接管中断 + 降级（PIT/键鼠/ATA 功能证据）"),

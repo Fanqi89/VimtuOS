@@ -19,8 +19,8 @@
 
 | 能力 | 说明 |
 |---|---|
-| **四种引导方式** | BIOS 光盘（El Torito）、U 盘 / 硬盘（hybrid MBR）、裸盘（MBR→loader→ATA）、**UEFI 自动引导**（自研 PE 桩 + 平铺长模式引导器）。QEMU 与 VMware、BIOS 与 UEFI 四种组合全部实测通过 |
-| **现代磁盘结构** | 自写 GPT（工具链的 xorriso 不生 GPT）与 MBR 双兼容；FAT16 ESP 也是自写的（这台机器没有 mkfs.fat/mtools） |
+| **四种引导方式 + 装好的盘双固件** | BIOS 光盘（El Torito）、U 盘 / 硬盘（hybrid MBR）、裸盘（MBR→loader→ATA）、**UEFI 自动引导**（自研 PE 桩 + 平铺长模式引导器）。QEMU 与 VMware、BIOS 与 UEFI 四种组合全部实测通过；**"ISO 当 U 盘"形态在 OVMF（UEFI）与 SeaBIOS（BIOS）下也都进安装向导**（`tests/usb_boot_both_fw_test.py` 四档）；装好的盘在 UEFI 与 BIOS 下都能启动（`tests/esp_install_test.py`） |
+| **现代磁盘结构（安装盘 + 目标盘都有）** | 自写 GPT（工具链的 xorriso 不生 GPT）与 MBR 双兼容；FAT16 ESP 也是自写的（这台机器没有 mkfs.fat/mtools）。**安装时会往目标盘写混合 MBR + 盘尾 GPT + 5MB FAT16 ESP**（内核实现在 `kernel/fat64.{h,cpp}`，卷参数与构建期 `tools/make_esp.py` 对齐），ESP 里放 `EFI/BOOT/BOOTX64.EFI` + `UEFI64.BIN` + `KERNEL64.BIN` |
 | **Win10 同款安装程序** | 语言 → 现在安装 → 许可条款 → 安装类型 → **磁盘与分区（新建/删除/格式化，真实写盘）** → 复制与真实百分比进度 → 完成并**自动重启**；**无产品密钥步骤** |
 | **装完就是一台独立系统** | 开机直接进桌面：桌面图标、任务栏、开始菜单（10 项）、窗口拖拽/缩放/最大化/最小化、脏矩形重绘 |
 | **调度器（多任务）** | `task64.cpp`：16 个任务槽、每任务 16KB 内核栈、8ms 时间片轮转、IRQ0 抢占、睡眠/退出/回收、`task_kill64`；启动即 `[TASK64] scheduler up tasks=N`、`kheart` 心跳持续增长；任务管理器"进程"页与终端 `ps/kill` 读的是**真实任务表** |
@@ -55,6 +55,7 @@
 | ⚠️ **ACPI/APIC 覆盖有限** | 只解析 RSDP/RSDT/XSDT/FADT/MADT/HPET/MCFG；关机仍走 ACPI 端口 0x604 + 8042 回退链；x2APIC 未适配；固件页表没映射 LAPIC/IOAPIC 的机器会留在 PIC |
 | ✅ **SATA/AHCI 盘可直启（引导层已改 BIOS INT 13h）** | 引导层（`boot/loader64.asm`）的**磁盘启动路径**读内核不再用自写 PATA PIO，改走 **BIOS INT 13h 扩展读（AH=0x42 + DAP）**：驱动器号用固件传进来的 `DL`，分块 64 扇区（32KB、不跨 64KB 边界）读进低内存暂存区 `0x20000`，每批再进一次保护模式搬到 `0x100000`；失败复位磁盘重试 3 次后打 `[LM] int13 read FAILED ah=… lba=… retry=…` 并停机（不静默失败）。**BIOS 不需要把 SATA 设成 IDE 兼容模式** —— QEMU 上"只把装好的盘挂 `ich9-ahci` 启动"已进桌面（`tests/disk_boot_test.py`：`[LM] disk boot via INT 13h dl=0x80` → `[OS] booted from installed disk` → `[GUI64] ready`）；真机仍待复验。磁盘级 IDENTIFY/读写也已在 `--strict-dma` 档 PASS（item 5b 修好命令头布局） |
 | ⚠️ **没有 INT 13h 扩展读的老固件起不来** | 磁盘路径**没有 PIO 回退**（自写 PIO 在 AHCI 机器上读不到盘，已整段删除）：只有支持 EDD 扩展读（AH=0x42）的固件能启动，1998 年后的固件基本都有；更老的机器也跑不动本系统的 64 位长模式 |
+| ⚠️ **安装建 ESP 需要目标盘 ≥ ~17MB** | ESP=5MB + 主分区至少 8MB + 盘尾 GPT 33 扇区 + 引导区 8009 扇区。更小的盘（含 16MB 回归目标盘）只写老 MBR 布局（BIOS-only），串口打 `[INSTALL] esp skipped (disk too small)`。另外装好的盘只写**盘尾备份 GPT**（主 GPT 头的位置被 loader64.bin 占着）—— 依赖固件"主头无效时用备份头"（EDK2 已实测） |
 | ⚠️ **只在虚拟机验证** | QEMU + VMware Workstation 双验证（BIOS 与 UEFI 都跑），**未在真机裸机验证**；UEFI 路径未做签名，测试时 `secureBoot=FALSE` |
 | ⚠️ **磁盘仍是 PIO 搬运** | 有了 IRQ14 中断唤醒，但没有 DMA/Bus-Master，读写期间 CPU 仍要逐扇区搬 |
 | ⚠️ **没有声音** | 无音频驱动 |
@@ -75,21 +76,21 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
 6. **自研 UEFI 引导（不用 gnu-efi）**：自造 PE32+ 桩（2.5KB）+ 平铺长模式引导器（36KB，链接到 72MB，绕过 EDK2 的 PE 校验）；**RSDP 经固定槽 0x7800 从固件配置表传给内核**。
 7. **一切自写工具链**：没有 mkfs.fat、没有 mtools —— FAT16 卷、ISO9660 解析与打包、GPT、LBA 回填、PE 摊平、字体子集化（3 套 TTF）、图标生成、VAP64 打包，全是本仓库的 Python 脚本。
 8. **APIC / ACPI / SMP 都带"宁可不启用也不变砖"的回退**：拿不到 ACPI 就留 8259、启动 AP 全程有界超时、每个自检失败都整体回滚，降级路径都有串口证据。
-9. **脏矩形重绘 + 光标不 save-under**：鼠标移动只重绘约 **0.03% 的屏幕像素**（自动验收会断言这个数字），这是从"整屏重绘导致鼠标包读慢、位移被聚合放大"的实测故障里换来的设计。
-10. **每次改动都跑自动验收**：**26 个验收脚本**（≥821 条断言），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
+9. **每次改动都跑自动验收**：**31 个验收脚本**（≥850 条断言，本轮新增 `tests/usb_boot_both_fw_test.py` 与 `tests/esp_install_test.py`），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
 
 ## 四、系统架构
 
 ```
-① 引导层（boot/，12 文件 / 3,575 行）
+① 引导层（boot/，13 文件 / 3,655 行）
    BIOS 光盘   El Torito → cdiso.asm（引导桩 + 介质描述符 @0x0F00）→ loader64.asm
    U 盘/裸盘   hybrid_mbr.asm（自搬 0x0600）→ boot.asm（512B MBR）→ loader64.asm
    UEFI        BOOTX64.EFI（自研 PE 桩）→ UEFI64.BIN（平铺长模式引导器）
+                   └─ 从 ESP 读 KERNEL64.BIN → 0x100000（安装盘上还有 SYSTEM.IMG → 0x04000000）
    loader64 / UEFI64 负责：E820 / VBE(EDID→0x7600) / RSDP(→0x7800) → 读内核到物理 0x100000
-                            （磁盘启动 = BIOS INT 13h 扩展读 AH=0x42；光盘 = ATAPI；U 盘 hybrid = 桩先搬好）
+   （磁盘启动 = BIOS INT 13h 扩展读 AH=0x42；光盘 = ATAPI；U 盘 hybrid = 桩先搬好）
                              → 建页表（恒等 + 高半区直映）→ 进长模式 → 跳内核入口
 
-② 内核层（kernel/，69 文件 / 27,599 行）
+② 内核层（kernel/，71 文件 / 27,900 行）
    入口与基础设施
      kernel64.cpp      入口 / 自检 / 安装程序或系统两条启动路径 / 各子系统初始化顺序
      x86_64.cpp        GDT(8 项含用户段+TSS) / IDT / TSS / PIC / PIT(250Hz) / RTC
@@ -103,7 +104,8 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
      syscall64.cpp + syscall_entry64.asm    int 0x80 自有 ABI + syscall 指令 Linux 号段（MSR 配置）
    存储与持久化
      ata64.cpp         ATA PIO + ATAPI(PACKET) + IRQ14 中断唤醒（超时回退轮询）
-     part64.cpp        分区表（MBR/GPT）/ 新建 / 删除 / 格式化（格式化写 VimtuFS2）/ 安装引擎
+     part64.cpp        分区表（MBR/混合 MBR/盘尾 GPT）/ 新建 / 删除 / 格式化（VimtuFS2）/ 安装引擎 + ESP 安装
+     fat64.cpp         最小 FAT16 写入器（安装时在目标盘建 ESP；卷参数与 tools/make_esp.py 对齐）
      vfs64.cpp         VimtuFS2：超级块+CRC32 / 空闲位图 / 64B inode / 读写 mkdir unlink stat dump
      store64.cpp       设置持久化：/store.a、/store.b 双槽 + 世代号 + 双 CRC32（裸盘槽仅降级+WARN）
      app64.cpp         VAP64 安装器 / 校验 / 启动器 + 按魔数自动分派

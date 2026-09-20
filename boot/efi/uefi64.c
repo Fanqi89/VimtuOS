@@ -6,6 +6,8 @@
 //
 // 它做的事（与 BIOS 路径的引导桩 + loader64 等价）：
 //   1) 从 ESP 读 KERNEL64.BIN（4MB 区）→ 0x100000，SYSTEM.IMG（载荷）→ 0x04000000
+//      （SYSTEM.IMG 是**安装介质**才有的：装好的盘上它不存在，此时跳过并如实打点 ——
+//       系统内核不用载荷；安装介质上它必须在，否则安装程序拿不到载荷）
 //   2) GOP 取线性帧缓冲参数 → 写 BootInfo（0x1000）
 //   3) UEFI 内存映射 → E820 风格表（0x2000）
 //   4) 写"介质描述符"（0x0F00，kind=2 = 载荷已在内存）
@@ -99,9 +101,9 @@ static int guid_eq16(const u8* mem, const u8* ref16) {
 static u8 g_map_buf[8192] __attribute__((aligned(8)));
 
 extern void efi_enter_kernel(u64 entry, u64 cr3) __attribute__((noreturn));
-
-// 把文件读满 want 字节到物理地址 dst（读不到的尾部清零）
-static int load_file(EFI_FILE_PROTOCOL* root, const char* path, u64 dst, u64 want_bytes) {
+// 把文件读满 want 字节到物理地址 dst（读不到的尾部清零）。
+// required=1：打不开/读失败就当错误（返回 0 且打点）；required=0：文件不存在属正常（返回 0，打一行提示）。
+static int load_file(EFI_FILE_PROTOCOL* root, const char* path, u64 dst, u64 want_bytes, int required) {
     // ★ 文件名必须是 UTF-16（CHAR16）！EFI_FILE_PROTOCOL::Open 的 FileName 参数是 CHAR16*，
     //   早先这里直接传 ASCII 的 char[]，固件按 UTF-16 解释成乱码 -> EFI_NOT_FOUND
     //   （串口上表现为 "U:open fail KERNEL64.BIN"）。桩 boot/efi/stub.c 里踩过同一个坑，
@@ -113,7 +115,11 @@ static int load_file(EFI_FILE_PROTOCOL* root, const char* path, u64 dst, u64 wan
     EFI_FILE_PROTOCOL* f = 0;
     EFI_STATUS s = ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*, EFI_FILE_PROTOCOL**, const u16*, u64, u64))root->Open)(
         root, &f, nm, 1 /*READ*/, 0);
-    if (EFI_ERROR(s) || !f) { ser_str("U:open fail "); ser_str(path); ser_str("\n"); return 0; }
+    if (EFI_ERROR(s) || !f) {
+        if (required) { ser_str("U:open fail "); ser_str(path); ser_str("\n"); }
+        else          { ser_str("U:missing "); ser_str(path); ser_str(" (optional, skipped)\n"); }
+        return 0;
+    }
     u64 off = 0;
     while (off < want_bytes) {
         u64 chunk = want_bytes - off;
@@ -136,8 +142,10 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
     ser_str("\nU:==== Vimtu64 UEFI 引导（自研 BOOTX64.EFI + 平铺长模式引导器）====\n");
     EFI_BOOT_SERVICES* bs = st->BootServices;
 
-    if (!load_file(root, "KERNEL64.BIN", HIGH_KERNEL, KERNEL_BYTES)) return 1;
-    if (!load_file(root, "SYSTEM.IMG", HIGH_PAYLOAD, PAYLOAD_BYTES)) return 1;
+    // KERNEL64.BIN 必须有（它是"这次要跑的内核"：安装介质上=安装程序内核，装好的盘上=系统内核）；
+    // SYSTEM.IMG（安装载荷）只有安装介质才有 —— 装好的盘上没有它，此时跳过（系统内核不用载荷）。
+    if (!load_file(root, "KERNEL64.BIN", HIGH_KERNEL, KERNEL_BYTES, 1)) return 1;
+    const int have_payload = load_file(root, "SYSTEM.IMG", HIGH_PAYLOAD, PAYLOAD_BYTES, 0);
 
     // GOP
     EFI_GRAPHICS_OUTPUT_PROTOCOL* gop = 0;
@@ -195,15 +203,20 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
         ser_str("U:e820 entries="); ser_dec(out); ser_str("\n");
     }
 
-    // 介质描述符（kind=2）
+    // 介质描述符（kind=2 = 载荷已在内存；装好的盘上没有载荷 -> kind=0 = "无载荷"，
+    // 内核的 part_read_medium_desc 只认 CD/RAM，读到 0 就当没有描述符，行为与 BIOS 裸盘路径一致）
     {
         u8* md = (u8*)MEDIUM_DESC_ADDR;
         mem_zero(md, 32);
         *(u32*)(md + 0)  = 0x444D4D56;            // 'VMMD'
-        md[4] = 2;
-        *(u32*)(md + 8)  = (u32)HIGH_KERNEL;
-        *(u32*)(md + 12) = (u32)HIGH_PAYLOAD;
-        *(u32*)(md + 16) = (u32)(PAYLOAD_BYTES / 512);
+        md[4] = have_payload ? 2 : 0;
+        if (have_payload) {
+            *(u32*)(md + 8)  = (u32)HIGH_KERNEL;
+            *(u32*)(md + 12) = (u32)HIGH_PAYLOAD;
+            *(u32*)(md + 16) = (u32)(PAYLOAD_BYTES / 512);
+        } else {
+            ser_str("U:medium desc kind=0 (no payload: installed disk)\n");
+        }
     }
     ser_str("U:bootinfo lfb="); ser_hex(bi->lfb_addr);
     ser_str(" res="); ser_dec(bi->width); ser_str("x"); ser_dec(bi->height);

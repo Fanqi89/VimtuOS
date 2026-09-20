@@ -13,6 +13,10 @@
 #   LBA 9..8008      : kernel*.bin     （最多 4MB）
 #   LBA 8009..8072   : 设置持久化保留区（64 扇区）
 #   ---- 以上 8073 扇区就是"一份完整的系统磁盘映像"（system.img 的内容）----
+#   ★ 安装程序把这个映像写到目标盘后，还会在目标盘**盘尾**再建一个 5MB 的 FAT16 ESP
+#     （EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN）与盘尾备份 GPT ——
+#     这样"装好的盘"在 UEFI 与 BIOS 下都能启动（见 kernel/fat64.cpp、kernel/part64.cpp）。
+#     KERNEL64.BIN 的字节**直接读目标盘 LBA 9..8008**（不内嵌进安装程序内核，省它的 4MB 预算）。
 #   LBA 8192         : 载荷头（magic "VIMTUPAY" + 载荷扇区数 + 载荷 LBA）
 #   LBA 8193..16265  : 载荷本体（system.img 的副本）
 set -e
@@ -59,7 +63,7 @@ CXXFLAGS_INSTALLER="$CXXFLAGS -DVIMTU_INSTALLER_MEDIA=1 -DVIMTU_PAYLOAD_LBA=$PAY
 #     两份内核都要：安装程序要能看见 SATA 盘，系统内核的 VFS/store 也要能（驱动器号 8.. 分派），
 #     而硬件检查报告在安装介质与装好的系统里都是"没有串口时唯一的诊断画面"。
 SRCS_CORE="kernel/kernel64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp kernel/input.cpp kernel/mem64.cpp kernel/hwinfo64.cpp kernel/acpi64.cpp kernel/edid64.cpp kernel/display64.cpp kernel/fd64.cpp kernel/usermode64.cpp kernel/syscall64.cpp kernel/ahci64.cpp kernel/hwui64.cpp"
-SRCS_INSTALLER="$SRCS_CORE kernel/ata64.cpp kernel/part64.cpp kernel/setup64.cpp kernel/vfs64.cpp"
+SRCS_INSTALLER="$SRCS_CORE kernel/ata64.cpp kernel/part64.cpp kernel/setup64.cpp kernel/vfs64.cpp kernel/fat64.cpp"
 # 桌面外壳 + 应用：**只编进系统内核**（安装介质走向导，不带桌面，省 4MB 内核区空间）
 #   注意：这几个文件依赖 kernel/gui64.cpp 提供的外壳实现，任何新增应用都要同时加进这里。
 SRCS_DESKTOP="kernel/gui64.cpp kernel/calc64.cpp kernel/mines64.cpp \
@@ -93,6 +97,13 @@ echo "==> 编译 UEFI 引导（两段式：极小 PE 桩 + 平铺长模式引导
 #   UEFI64.BIN   = 我们的引导逻辑，平铺长模式二进制（链接在 0x800000，绕过所有 PE 校验）
 bash build_uefi.sh "$BUILD"
 
+echo "==> 内嵌 UEFI 引导字节（安装完成时写进目标盘 ESP；只进**安装程序**内核）"
+# 目的：安装程序在目标盘上建 ESP 时，要把 BOOTX64.EFI / UEFI64.BIN 原样写进 FAT16 卷。
+# 符号名由 objcopy 按输入路径生成（从仓库根执行才稳定）：_binary_build64_BOOTX64_EFI_start 等。
+# ★ 系统内核不需要这两个字节（装好的盘上 ESP 不再变动），别把它链进系统内核省体积。
+$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/BOOTX64.EFI" "$BUILD/bootx64_efi.o"
+$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/UEFI64.BIN" "$BUILD/uefi64_bin.o"
+echo "    内嵌：BOOTX64.EFI=$(stat -c%s "$BUILD/BOOTX64.EFI") B  UEFI64.BIN=$(stat -c%s "$BUILD/UEFI64.BIN") B"
 echo "==> 编译内核汇编"
 $NASM -f elf64 kernel/entry64.asm    -o "$BUILD/entry64.o"
 $NASM -f elf64 kernel/isr_stubs64.asm -o "$BUILD/isr_stubs64.o"
@@ -121,7 +132,7 @@ for src in $SRCS_OS; do
 done
 # --- 安装介质内核（跑安装程序）---
 echo "    [安装程序内核]"
-for src in $SRCS_CORE kernel/ata64.cpp kernel/part64.cpp kernel/setup64.cpp kernel/vfs64.cpp; do
+for src in $SRCS_CORE kernel/ata64.cpp kernel/part64.cpp kernel/setup64.cpp kernel/vfs64.cpp kernel/fat64.cpp; do
     base="$(basename "${src%.cpp}")"
     $CXX -c "$src" -o "$BUILD/$base.o" $CXXFLAGS_INSTALLER
     echo "      $src -> $BUILD/$base.o"
@@ -215,6 +226,8 @@ echo "    AP 跳板 = $(stat -c%s "$BUILD/ap_trampoline64.bin") 字节（按 0x8
 echo "==> 链接两个内核"
 $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel64.o "$BUILD"/x86_64.o \
     "$BUILD"/fb.o "$BUILD"/font.o "$BUILD"/input.o "$BUILD"/mem64.o "$BUILD"/ata64.o "$BUILD"/part64.o "$BUILD"/setup64.o \
+    "$BUILD"/fat64.o \
+    "$BUILD"/bootx64_efi.o "$BUILD"/uefi64_bin.o \
     "$BUILD"/hwinfo64.o "$BUILD"/acpi64.o "$BUILD"/edid64.o "$BUILD"/vfs64.o "$BUILD"/fd64.o "$BUILD"/usermode64.o "$BUILD"/syscall64.o \
     "$BUILD"/ahci64.o "$BUILD"/hwui64.o \
     "$BUILD"/display64.o \

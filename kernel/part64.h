@@ -3,13 +3,17 @@
 // 职责：
 //   * 把"标准布局"写进目标硬盘的主引导记录（MBR 分区表）：
 //       P1 引导分区（type 0xEF，活动）  LBA 9 .. 8008      ← 放 loader + 内核
-//       P2 主分区  （type 0x07）        LBA 8009 .. 磁盘末尾
+//       P2 主分区  （type 0x07）        LBA 8009 .. ESP 之前（无 ESP 时到盘尾）
+//       P3 EFI 系统分区（type 0xEF）    盘尾、GPT 备份表之前（只有"够大的盘"才有）
 //   * 删除 / 格式化指定分区
 //   * 把安装介质上的载荷（system.img）整盘复制到目标硬盘，并汇报真实进度
+//   * 复制完成后写 **GPT（盘尾备份头 + 项数组）+ 混合 MBR + FAT16 ESP**
+//     （EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN），让装好的盘 UEFI/BIOS 双启动
 //
-// 为什么用 MBR 而不是 GPT：当前引导链是"MBR + 固定 LBA"（loader 读 LBA 9 起的内核），
-// 而 GPT 头必须放在 LBA 1 —— 那正好是 loader 的位置，两者冲突。等 M3 把引导改成
-// 从 ESP 分区里读文件（UEFI）之后，再切换成 GPT + FAT32 ESP。
+// 为什么主 GPT 头不在 LBA 1：引导链是"MBR + 固定 LBA"（boot.bin 读 LBA 1..8 的 loader，
+//   loader 读 LBA 9 起的内核），**LBA 1 被 loader 占着**。所以只写盘尾的备份 GPT：
+//   UEFI 规范要求"主头无效时应使用备份头"，EDK2（OVMF / VMware EFI 都是它）实测在
+//   主头不是 "EFI PART" 时会回退到备份头 —— tests/esp_install_test.py 用 OVMF 实测验证。
 #pragma once
 #include <stdint.h>
 
@@ -19,6 +23,20 @@ static const uint32_t PART_BOOT_SECS = 8000;     // 引导分区扇区数（load
 static const uint32_t PART_MAIN_LBA  = PART_BOOT_LBA + PART_BOOT_SECS;   // 8009
 static const uint32_t PART_MAIN_MIN_SECS = 1024; // 主分区至少留 512KB，否则视为"磁盘太小"
 
+// ★ ESP / GPT（安装完成时写：让**装好的盘**在 UEFI 固件下也能启动）
+//   为什么 ESP 在**盘尾**：引导链三处硬约定占住了盘头 ——
+//     LBA 0 MBR、LBA 1..8 loader（**主 GPT 头必须放 LBA 1，与 loader 冲突，所以只写盘尾的
+//     备份 GPT**，EDK2 在主头无效时会用备份头，见 part64.cpp 的说明）、LBA 9..8008 内核。
+//   为什么需要"主分区至少 8MB"：ESP 要在主分区**之外**（不与 VimtuFS2 重叠），
+//     小盘（例如 16MB 的回归目标盘）放不下 -> 只写 MBR（老布局，BIOS-only）。
+static const uint32_t PART_ESP_SECTORS       = 10240;   // ESP 大小 = 5MB
+static const uint32_t PART_ESP_MIN_MAIN_SECS = 16384;   // 建 ESP 时主分区至少保留 8MB
+static const uint32_t PART_GPT_BACKUP_SECTORS = 33;     // 盘尾备份 GPT：32 扇区项数组 + 1 扇区头
+static const uint32_t PART_GPT_ENTRIES = 128;           // GPT 分区项数组项数
+
+// ESP 几何（盘尾、GPT 备份表之前）。返回 false = 目标盘太小，不建 ESP。
+bool part_esp_geometry64(uint32_t disk_sectors, uint32_t* out_start, uint32_t* out_sectors,
+                         uint32_t* out_main_sectors);
 // 一个分区项（从 MBR 里读出来的）
 struct PartInfo {
     bool     used;
