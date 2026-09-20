@@ -57,7 +57,7 @@
 //   没有任何假数据：任务数为 0 时如实打印"无任务数据"。
 //   文件系统：**真的文件系统**是 VimtuFS2（kernel/vfs64.cpp，磁盘上的 /store.a|b、/hello.vap、
 //   /hello.elf 都在它上面）。批次 B 起：ls/cat/write/touch/rm/mkdir/df/echo > 全部走 kernel/fd64.cpp
-//   的 FD 层（单层路径 "/name"、单文件 <= 67584 B、无子目录树、无权限；rm 不能删目录），
+//   的 FD 层（**多级路径** "/dir/sub/name"、单文件 <= 67584 B、无权限；rm 不能删目录），
 //   原来那份 16x512B 的 RAM-only ramfs 已删除。
 //
 // 【约束】只允许整数运算（内核 -mno-sse，无 float/double）；不 include 标准头（无 STL/libc/printf），
@@ -79,7 +79,7 @@
 #include "edid64.h"      // display edid：引导期 EDID（0x7600）解析结果
 #include "ata64.h"       // disk/ata：ATA IDENTIFY（型号/容量；读取自带超时保护）
 #include "vfs64.h"       // disk：卷状态；user：盘上的 ring3 程序
-#include "fd64.h"        // 文件命令的 FD 层（32 项；单层路径 /name、单文件 <=67584B）
+#include "fd64.h"        // 文件命令的 FD 层（32 项；多级路径 /dir/sub/name、单文件 <=67584B）
 #include "display64.h"   // display [modes|hz|edid]：模式清单 + 0x3DA 实测刷新率 + EDID 对比
 #include "usermode64.h"  // user/userprog：ring3 用户窗口地址与页映射查询
 #include "config64.h"    // cfg/config：类型化配置 + 存储位置（落在 store64 上）
@@ -117,8 +117,9 @@
 #define TERM_CURFG   rgb(0x00, 0x00, 0x00)
 
 // 批次 B：终端文件命令**不再用 ramfs** —— 全部走 kernel/fd64.cpp 的 FD 层（底层 VimtuFS2）。
-// 限制（帮助里也如实写）：单层路径 "/name"、单文件 <= 67584 B、无子目录树、无权限；
-// rm 只能删文件（vfs64 没有删目录原语）；写文件是整体覆盖 + 立刻落盘。
+// 限制（帮助里也如实写）：**路径是多级的**（"/dir/sub/name"，v3 目录树起；单段 ≤31B、整条 ≤128B、≤16 层）、
+// 单文件 <= 67584 B（本轮**没有**提高上限：v3 只加了目录树，没加二级间接块）、无权限；
+// rm 只能删文件（删空目录用 rmdir 原语，终端暂未暴露）；写文件是整体覆盖 + 立刻落盘。
 
 // ==================== 终端实例状态 ====================
 // 每窗口一份：一次 kmalloc = 结构 + 内容缓冲（cells 指向结构之后）
@@ -609,10 +610,10 @@ static const char* HELP_EN =
     "                        VAP64 -> int 0x80 path, ELF64 -> syscall path; e.g. run hello.elf)\n"
     "  elfrun NAME|/PATH     force the ELF64 loader (syscall insn ABI), e.g. elfrun hello.elf\n"
     "  echo TEXT             print text (echo TEXT > FILE writes a real file)\n"
-    "  write FILE TEXT       write a real file (overwrite; single file <= 67584 B; single-level /name)\n"
-    "  cat FILE / ls, dir    read file / list the VimtuFS2 root with sizes (real disk, not ramfs)\n"
-    "  touch FILE / rm FILE  create empty file / delete file (rm cannot delete directories)\n"
-    "  mkdir DIR / df        create a root directory / volume blocks & free (512B blocks, VimtuFS2)\n"
+    "  write FILE TEXT       write a real file (overwrite; single file <= 67584 B; multi-level /dir/name)\\n"
+    "  cat FILE / ls, dir    read file / list a directory with sizes (real disk, not ramfs; ls = volume root)\\n"
+    "  touch FILE / rm FILE  create empty file / delete file (rm cannot delete directories)\\n"
+    "  mkdir DIR / df        create a directory (multi-level, parent must exist) / volume blocks & free (512B blocks)\\n"
     "  date / time           RTC date / time\n"
     "  uptime                time since boot (ticks/250)\n"
     "  irq                   total interrupt count\n"
@@ -660,10 +661,10 @@ static const char* HELP_ZH =
     "                        VAP64 走 int 0x80、ELF64 走 syscall 指令；例如 run hello.elf）\n"
     "  elfrun 名字|/路径     强制走 ELF64 加载器（syscall 指令 ABI），例如 elfrun hello.elf\n"
     "  echo TEXT             回显（echo TEXT > FILE 写**真文件**）\n"
-    "  write FILE TEXT       写**真文件**（整体覆盖；单文件 ≤67584 B；单层路径 /name）\n"
-    "  cat FILE / ls, dir    读文件 / 列 VimtuFS2 根目录（带大小；磁盘上的真文件，不再是 ramfs）\n"
-    "  touch FILE / rm FILE  建空文件 / 删文件（rm 不能删目录）\n"
-    "  mkdir DIR / df        建根目录 / 卷的块数与空闲块（512B 块，VimtuFS2）\n"
+    "  write FILE TEXT       写**真文件**（整体覆盖；单文件 ≤67584 B；路径支持多级 /dir/sub/name）\\n"
+    "  cat FILE / ls, dir    读文件 / 列目录（带大小；磁盘上的真文件，不再是 ramfs；ls 列的是卷根目录）\\n"
+    "  touch FILE / rm FILE  建空文件 / 删文件（rm 不能删目录）\\n"
+    "  mkdir DIR / df        建目录（**多级**，父目录必须已存在）/ 卷的块数与空闲块（512B 块，VimtuFS2）\\n"
     "  date / time           RTC 日期 / 时间\n"
     "  uptime                开机时长（ticks/250）\n"
     "  irq                   中断总数\n"
@@ -1083,7 +1084,7 @@ static bool cmd_display(TerminalState* ts, const char* sub) {
 }
 
 // ==================== 文件命令（批次 B：全部走 kernel/fd64.cpp 的 FD 层 -> VimtuFS2）====================
-// 限制（help 里也如实写）：单层路径 "/name"、单文件 <= 67584 B、无子目录树、无权限；
+// 限制（help 里也如实写）：**路径是多级的**（v3 目录树；单段 ≤31B、整条 ≤128B、≤16 层）、单文件 <= 67584 B、无权限；
 // rm 只能删文件（vfs64 没有删目录原语）；mkdir 的父目录固定为根；写文件是整体覆盖 + 立刻落盘。
 
 // ls / dir：列 VimtuFS2 根目录 + 大小（目录句柄走 fd64_opendir/readdir，真路径）
@@ -1098,7 +1099,7 @@ static void cmd_ls(TerminalState* ts) {
         dbg64_line_end64();
         return;
     }
-    ts_puts(ts, "VimtuFS2 / (FD layer, single-level path):\n");
+    ts_puts(ts, "VimtuFS2 / (FD layer, multi-level paths; this lists the volume root):\n");
     int rows = 0;
     uint64_t bytes = 0;
     for (;;) {
@@ -1132,7 +1133,7 @@ static void cmd_ls(TerminalState* ts) {
 static bool cmd_cat(TerminalState* ts, const char* name) {
     if (!name || !name[0]) { ts_puts(ts, "cat: usage: cat FILE\n"); return false; }
     if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
-        ts_puts(ts, "cat: bad path (single-level /name only)\n");
+        ts_puts(ts, "cat: bad path (multi-level /dir/sub/name, <=128 B, <=16 segments)\n");
         return false;
     }
     const int fd = fd64_open64(g_pathbuf, FD64_O_RDONLY);
@@ -1169,7 +1170,7 @@ static bool cmd_write(TerminalState* ts, const char* name, const char* text) {
         return false;
     }
     if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
-        ts_puts(ts, "write: bad path (single-level /name only)\n");
+        ts_puts(ts, "write: bad path (multi-level /dir/sub/name, <=128 B, <=16 segments)\n");
         return false;
     }
     const int len = st_len(text);
@@ -1194,7 +1195,7 @@ static bool cmd_write(TerminalState* ts, const char* name, const char* text) {
 static bool cmd_touch(TerminalState* ts, const char* name) {
     if (!name || !name[0]) { ts_puts(ts, "touch: usage: touch FILE\n"); return false; }
     if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
-        ts_puts(ts, "touch: bad path (single-level /name only)\n");
+        ts_puts(ts, "touch: bad path (multi-level /dir/sub/name, <=128 B, <=16 segments)\n");
         return false;
     }
     uint32_t ty = 0, sz = 0;
@@ -1212,7 +1213,7 @@ static bool cmd_touch(TerminalState* ts, const char* name) {
 static bool cmd_rm(TerminalState* ts, const char* name) {
     if (!name || !name[0]) { ts_puts(ts, "rm: usage: rm FILE\n"); return false; }
     if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
-        ts_puts(ts, "rm: bad path (single-level /name only)\n");
+        ts_puts(ts, "rm: bad path (multi-level /dir/sub/name, <=128 B, <=16 segments)\n");
         return false;
     }
     uint32_t ty = 0, sz = 0;
@@ -1242,7 +1243,7 @@ static bool cmd_rm(TerminalState* ts, const char* name) {
 static bool cmd_mkdir(TerminalState* ts, const char* name) {
     if (!name || !name[0]) { ts_puts(ts, "mkdir: usage: mkdir DIR\n"); return false; }
     if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
-        ts_puts(ts, "mkdir: bad path (single-level /name only)\n");
+        ts_puts(ts, "mkdir: bad path (multi-level /dir/sub/name, parent must exist)\n");
         return false;
     }
     uint32_t ty = 0, sz = 0;
@@ -1296,7 +1297,7 @@ static bool cmd_df(TerminalState* ts) {
     ts_puts(ts, " bytes=");
     ts_put_u64(ts, live_bytes);
     ts_putc(ts, (uint32_t)'\n');
-    ts_puts(ts, "  (block bitmap = first-probe snapshot at boot; file list/bytes are live; single-level FS)\n");
+    ts_puts(ts, "  (block bitmap = first-probe snapshot at boot; file list/bytes are live; VimtuFS2 v3 directory tree)\n");
     dbg64_line_begin64();
     dbg64_str("[TERM] cmd df blocks=");
     dbg64_dec((uint64_t)fs.total_blocks);

@@ -34,7 +34,7 @@
 #include "session64.h"
 #include "sysstate64.h"
 #include "panic64.h"
-#include "../bootinfo.h"
+#include "explorer64.h"   // 我的电脑/文件资源管理器（本轮：外壳只做钩子，实现全在 explorer64.cpp）
 
 // ==================== 资源符号（build64.sh 用 objcopy 生成）====================
 extern "C" const uint8_t _binary_icon_mycomputer_bin_start[];
@@ -1044,85 +1044,12 @@ void app_monitor_reset64() {
     dbg64_nl();
 }
 
-static Window* g_mypc_win = nullptr;
-static void mypc_draw(Window* w) {
-    const int x = w->client_x + 12;
-    int y = w->client_y + 10;
-    text_ttf(x, y, gui64_tr("Devices and drives", "设备和驱动器"), rgb(0, 60, 120));
-    y += 26;
-    // 磁盘：真实存在的信息 —— 内核区/设置区布局常量 + VimtuFS2 卷的**总块/空闲块/文件数**
-    // （卷数据由 sysstate64_fsinfo64() 读超级块 + 块位图 + vfs64_ls 得到，只探一次并缓存。
-    //  上一轮这里写的是"尚未有文件系统驱动（store/VFS 未移植到 64 位）"——那句已经过时，删掉。）
-    fb_fill_rect(x, y, w->client_w - 24, 54, rgb(255, 255, 255));
-    fb_draw_rect(x, y, w->client_w - 24, 54, rgb(180, 180, 180));
-    text_ttf(x + 10, y + 8, gui64_tr("Local Disk (C:)", "本地磁盘 (C:)"), rgb(20, 20, 20));
-    {
-        char buf[112]; int n = 0;
-        const char* s = "LBA 9..8008 kernel, 8009..8072 settings";
-        for (int i = 0; s[i] && n < 110; i++) buf[n++] = s[i];
-        buf[n] = 0;
-        text_ttf(x + 10, y + 30, buf, rgb(90, 90, 90));
-    }
-    y += 60;
-    fb_fill_rect(x, y, w->client_w - 24, 76, rgb(255, 255, 255));
-    fb_draw_rect(x, y, w->client_w - 24, 76, rgb(180, 180, 180));
-    text_ttf(x + 10, y + 8, gui64_tr("VimtuFS2 volume", "VimtuFS2 卷"), rgb(20, 20, 20));
-    {
-        Fs64Info fs;
-        const int rc = sysstate64_fsinfo64(&fs);
-        const int lh = 18;
-        char b2[112];
-        int p = 0;
-        if (rc == 0) {
-            // 两行：总块/空闲块 / 文件数/已用字节
-            const char* l1 = gui64_tr("blocks=", "总块数=");
-            for (int i = 0; l1[i] && p < 110; i++) b2[p++] = l1[i];
-            { char rev[12]; int m = 0; uint32_t v = fs.total_blocks;
-              if (!v) rev[m++] = '0';
-              while (v) { rev[m++] = (char)('0' + v % 10); v /= 10; }
-              while (m > 0 && p < 110) b2[p++] = rev[--m]; }
-            const char* mid = gui64_tr("  free=", "  空闲=");
-            for (int i = 0; mid[i] && p < 110; i++) b2[p++] = mid[i];
-            { char rev[12]; int m = 0; uint32_t v = fs.free_blocks;
-              if (!v) rev[m++] = '0';
-              while (v) { rev[m++] = (char)('0' + v % 10); v /= 10; }
-              while (m > 0 && p < 110) b2[p++] = rev[--m]; }
-            b2[p] = 0;
-            text_ttf(x + 10, y + 8 + lh, b2, rgb(60, 60, 60));
-            p = 0;
-            const char* l2 = gui64_tr("files=", "文件数=");
-            for (int i = 0; l2[i] && p < 110; i++) b2[p++] = l2[i];
-            { char rev[12]; int m = 0; uint32_t v = fs.files;
-              if (!v) rev[m++] = '0';
-              while (v) { rev[m++] = (char)('0' + v % 10); v /= 10; }
-              while (m > 0 && p < 110) b2[p++] = rev[--m]; }
-            const char* mid2 = gui64_tr("  used=", "  已用=");
-            for (int i = 0; mid2[i] && p < 110; i++) b2[p++] = mid2[i];
-            { char rev[12]; int m = 0; uint32_t v = fs.used_bytes / 1024;
-              if (!v) rev[m++] = '0';
-              while (v) { rev[m++] = (char)('0' + v % 10); v /= 10; }
-              while (m > 0 && p < 110) b2[p++] = rev[--m]; }
-            for (int i = 0; i < 2 && p < 110; i++) b2[p++] = "KB"[i];
-            b2[p] = 0;
-            text_ttf(x + 10, y + 8 + lh * 2, b2, rgb(60, 60, 60));
-        } else {
-            text_ttf(x + 10, y + 8 + lh,
-                     gui64_tr("no VimtuFS2 volume (unpartitioned disk)",
-                              "没有 VimtuFS2 卷（磁盘未分区）"), rgb(150, 60, 60));
-        }
-    }
-    y += 86;
-    text_ttf(x, y, gui64_tr("Install media (D:): payload at LBA 8192",
-                            "安装介质 (D:)：载荷在 LBA 8192"), rgb(90, 90, 90));
-}
-void app_mypc_open64() {
-    if (gui64_window_alive(g_mypc_win)) { gui64_set_active(g_mypc_win); return; }
-    g_mypc_win = gui64_create_window(gui64_tr("My Computer", "我的电脑"),
-                                     120, 80, 380, 300, mypc_draw, nullptr, nullptr, APP_ID_MYPC);
-    if (g_mypc_win) gui64_set_min_size(g_mypc_win, 320, 260);
-    dbg64_str("[APP] mypc opened");
-    dbg64_nl();
-}
+// ==================== 我的电脑 / 文件资源管理器（转调 kernel/explorer64.cpp）====================
+// 本轮把 32 位风格的"静态统计页"换成了真正的 Win10 风格文件管理器（此电脑 + 盘内导航）。
+// 外壳这里只保留**钩子**：窗口本身、导航状态机、绘制与交互都在 kernel/explorer64.cpp，
+// 理由见 kernel/explorer64.h 顶部（避免把 gui64.cpp 撑成第二个 32 位 gui.cpp）。
+// 注意："[APP] mypc opened" / "[APP] mypc closed" 这两行由 explorer64 打印（历史断言依赖）。
+void app_mypc_open64() { explorer64_open64(); }
 
 static Window* g_about_win = nullptr;
 static void about_draw(Window* w) {
@@ -1740,7 +1667,7 @@ int gui64_selftest() {
                 next_tick = now + PIT_HZ_64;
                 dirty_add(g_screen_w - CLOCK_W, g_screen_h - TASKBAR_H, CLOCK_W, TASKBAR_H);
                 if (gui64_window_alive(g_mon_win)) gui64_invalidate_window(g_mon_win);
-                if (gui64_window_alive(g_mypc_win)) gui64_invalidate_window(g_mypc_win);
+                if (explorer64_window64()) gui64_invalidate_window(explorer64_window64());
                 if (gui64_window_alive(g_about_win)) gui64_invalidate_window(g_about_win);
             }
             if (g_dirty_any || g_first_frame) { g_first_frame = false; render(); }

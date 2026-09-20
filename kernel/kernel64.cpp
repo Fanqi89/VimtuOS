@@ -55,6 +55,8 @@
 // ---- 批次 A 后半的两个子系统（同样只进系统内核；os_boot_path 里注册 + 跑）----
 #include "preload64.h"   // 字形/图标预热（进桌面之前跑一轮，带 rdtsc64 实测证据）
 #include "update64.h"    // update 子系统（标记 -> 应用 -> store/重启；不是真"升级包"，见其头文件）
+// ---- 文件资源管理器 / 此电脑（只进系统内核；外壳 gui64 的 app_mypc_open64 转调它）----
+#include "explorer64.h"  // "此电脑"+盘内浏览：纯逻辑自检在启动期跑一次（[EXPL] selftest PASS）
 // 用户态演示程序 blob：user/demo64.asm -> nasm 平铺二进制 -> objcopy 嵌入（见 build64.sh）。
 // 符号名由 objcopy 按输入路径生成：_binary_build64_user_demo64_bin_start/_end。
 extern "C" const uint8_t _binary_build64_user_demo64_bin_start[];
@@ -381,6 +383,7 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
             drive64_dump64();
             (void)drive64_selftest64();
             (void)vfs64_tree_dump64("/", 32, 4);
+            (void)explorer64_selftest64();                       // 文件管理器纯逻辑自检（单位换算/路径/滚动/历史栈）
             (void)app64_selftest64();
             (void)app64_install_builtin64(app_drive, app_lba);   // 幂等：已装过则 skipped (exists)
             (void)elf64_selftest64();                            // 合法映像/坏样本自检（坏样本带 selftest 前缀）

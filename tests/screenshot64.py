@@ -13,6 +13,11 @@
     python tests/screenshot64.py --apps 5,4            # 只开扫雷(5)和计算器(4)
     python tests/screenshot64.py --out X.png
     python tests/screenshot64.py --no-apps             # 只抓纯净桌面
+    python tests/screenshot64.py --page thispc|drive|details
+        # ★ 本轮新增：抓"文件资源管理器"三种页面（此电脑 / 盘内图标视图 / 详细信息四列）。
+        #   这三张图必须有一块**带 VimtuFS2 卷的已装系统盘**才好看，所以 --page 模式下默认用
+        #   tests/fs_tree_test.py 的 Python 侧 v3 卷夹具造一块 16MB 小系统盘（--img 显式给出时除外）；
+        #   导航用键盘（Win+2 开窗 -> 下 -> 回车进 C: -> Tab 切视图），不依赖鼠标注入。
 
 菜单序号（与 kernel/gui64.cpp 一致）：1终端 2我的电脑 3系统监视器 4计算器 5扫雷 6设置 7任务管理器 8关于
 """
@@ -66,6 +71,89 @@ def mon_send(port, cmd, wait=0.6):
         s.close()
 
 
+def shot_page(qemu, tmp, args):
+    """--page 模式：抓「文件资源管理器」的三种页面（此电脑 / 盘内图标 / 详细信息四列）。
+
+    需要一块**带 VimtuFS2 卷的已装系统盘**才好看：默认用 tests/fs_tree_test.py 的 Python 侧
+    v3 卷夹具现造一块 16MB 小系统盘（用户显式给了 --img 时就用用户的）。
+    导航复用 tests/explorer64_test.py 里已验证过的鼠标模型（park -> 精确位移 -> 单击/双击）：
+    键盘只负责开窗（Win+2），进盘与切视图都走真实鼠标点击。
+    """
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(ROOT, "tests"))
+    need_fixture = os.path.abspath(args.img) == os.path.abspath(os.path.join(ROOT, "build64", "system.img"))
+    img = args.img
+    if need_fixture:
+        try:
+            import fs_tree_test as fst
+        except Exception as e:
+            sys.stderr.write("--page 需要 tests/fs_tree_test.py 的卷夹具：%s\n" % e)
+            return 2
+        img = os.path.join(tmp, "small_system.img")
+        if fst.make_small_system_disk(img) is None:
+            sys.stderr.write("--page：造小系统盘失败（build64/system.img 缺失或过大）\n")
+            return 2
+        print("[shot] --page 模式：用 Python 造的 16MB 小系统盘（含 VimtuFS2 v3 卷）")
+
+    try:
+        import explorer64_test as E
+    except Exception as e:
+        sys.stderr.write("--page 需要 tests/explorer64_test.py 的鼠标工具：%s\n" % e)
+        return 2
+
+    serial = os.path.join(tmp, "page_serial.log")
+    ppm = os.path.join(tmp, "page.ppm")
+    port = args.port
+    vm = E.Vm(qemu, img, port, serial, "Vimtu64-shot-page")
+    mon = E.Monitor(port)
+    try:
+        if not vm.wait_log("[GUI64] ready", 120):
+            sys.stderr.write("--page：桌面没起来（等 [GUI64] ready 超时）\n")
+            return 1
+        print("[shot] 桌面就绪 -> 页面 %s" % args.page)
+        mon.key("meta_l", wait=1.0)
+        mon.key("2", wait=2.5)                       # 菜单序号 1 = 我的电脑 / 文件资源管理器
+        if not vm.wait_log("[UI] explorer thispc", 25):
+            sys.stderr.write("--page：文件资源管理器没有打开\n")
+            return 1
+        time.sleep(1.0)
+        E.SAFE_POINT = (E.sx(E.CONTENT_X + E.CONTENT_W - 40), E.sy(E.CONTENT_Y + E.CONTENT_H - 40))
+        E.ensure_window_on_top(vm, mon)
+        if args.page in ("drive", "details"):
+            tx, ty = E.card_center(1)                # 第 0 张是不可浏览的 ESP，第 1 张 = C:
+            E.aim_click(vm, mon, tx, ty, "card:1")   # 双击进入盘根
+            time.sleep(1.5)
+        if args.page == "details":
+            for _ in range(4):
+                if E.last_view(vm) == "details":
+                    break
+                E.aim_single_click(vm, mon, E.sx(176), E.sy(13), "btn:view")
+                time.sleep(2.0)
+            print("[shot] 视图 = %s" % (E.last_view(vm) or "?"))
+        mon.send("mouse_move 300 150", wait=0.8)     # 光标挪开，别压住窗口内容
+        time.sleep(1.0)
+        if os.path.exists(ppm):
+            os.remove(ppm)
+        mon.shot(ppm, wait=3.0)
+        if not os.path.exists(ppm):
+            sys.stderr.write("--page：没拿到 screendump\n")
+            return 1
+        out_dir = os.path.dirname(os.path.abspath(args.out))
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            from PIL import Image   # noqa
+            Image.open(ppm).save(args.out)
+            print("[shot] 已保存 PNG：%s（%d 字节）" % (args.out, os.path.getsize(args.out)))
+        except Exception as e:
+            kept = os.path.join(out_dir, os.path.basename(args.out) + ".ppm")
+            with open(ppm, "rb") as a, open(kept, "wb") as b:
+                b.write(a.read())
+            print("[shot] 没有 Pillow（%s），已保留 PPM：%s" % (e, kept))
+        return 0
+    finally:
+        vm.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--img", default=os.path.join(ROOT, "build64", "system.img"))
@@ -77,6 +165,9 @@ def main():
     ap.add_argument("--keys", default="",
                     help="打开应用后再注入的 QEMU sendkey 名（逗号分隔），例如 'right,down,down,down' "
                          "把任务管理器切到性能页并把选中项移到\"显卡\"；'1' 把设置页切到\"系统（设备规格）\"")
+    ap.add_argument("--page", default="",
+                    help="抓文件资源管理器页面：thispc（此电脑）/ drive（盘内图标视图）/ details（详细信息四列）；"
+                         "该模式下默认自己造一块带 VimtuFS2 卷的小系统盘")
     args = ap.parse_args()
 
     if not os.path.exists(args.img):
@@ -88,6 +179,8 @@ def main():
         return 2
 
     tmp = tempfile.mkdtemp(prefix="vimtu64_shot_")
+    if args.page:
+        return shot_page(qemu, tmp, args)
     serial = os.path.join(tmp, "serial.log")
     ppm = os.path.join(tmp, "desktop.ppm")
 

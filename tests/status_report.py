@@ -1062,6 +1062,42 @@ def cap_hw_report():
                 and grep_count(r"hwui64_(show|selftest)64", ["kernel/kernel64.cpp"]))
     return ("DONE" if done else "PARTIAL"), ev
 
+def cap_explorer_ui():
+    """★ 文件资源管理器 / 此电脑（UI 与交互：导航窗格 / 面包屑 / 双视图 / 容量条 / 双击运行）。"""
+    if not (exists("kernel/explorer64.cpp") and exists("kernel/explorer64.h")):
+        return "MISSING", ["kernel/explorer64.cpp/.h 不存在（没有文件管理器 UI）"]
+    n = lines("kernel/explorer64.cpp")
+    api = grep_count(r"explorer64_open64|explorer64_reset64|explorer64_window64|explorer64_selftest64",
+                     ["kernel/explorer64.cpp", "kernel/explorer64.h"])
+    log = grep_count(r"\[UI\] explorer (thispc|drive|card|nav|enter|run|preview|back|up|view|click)",
+                     ["kernel/explorer64.cpp"])
+    bar = grep_count(r"C_EXP_BAR_FILL|C_EXP_BAR_BG|fmt_kb64", ["kernel/explorer64.cpp"])
+    views = grep_count(r"EXP_DET_ROW|EXP_ICON_CELL|g_view", ["kernel/explorer64.cpp"])
+    hook = grep_count(r"app_mypc_open64\(\) \{ explorer64_open64", ["kernel/gui64.cpp"])
+    boot = grep_count(r"explorer64_selftest64\(\)", ["kernel/kernel64.cpp"])
+    bld = grep_count(r"explorer64\.cpp", ["build64.sh"])
+    test = exists("tests/explorer64_test.py")
+    shots = (exists("docs/screenshots/explorer_thispc64.png") and
+             exists("docs/screenshots/explorer_drive64.png") and
+             exists("docs/screenshots/explorer_details64.png"))
+    ev = ["explorer64.cpp %d 行（单窗口导航：此电脑页 + 盘内图标/详细信息双视图；导航窗格 + 面包屑 + 历史栈）" % n,
+          "外壳钩子（gui64 的 app_mypc_open64 只转调 explorer64）：命中 %d" % hook,
+          "启动期自检 explorer64_selftest64（单位换算/路径/滚动钳制/历史栈）：命中 %d" % boot,
+          "build64.sh 链接 explorer64.cpp：命中 %d" % bld,
+          "驱动器卡片：容量条（灰底 + 蓝填充）+ KB->GB/MB 一位小数换算：命中 %d" % bar,
+          "两种视图（图标格 / 详细信息四列：名称/修改日期/类型/大小）：命中 %d" % views,
+          "打点（[UI] explorer thispc|drive|card|nav|enter|run|preview|back|up|view|click）：命中 %d" % log,
+          "实测串口：\"[UI] explorer thispc drives=2 browsable=1\"、\"[UI] explorer drive letter=C: fs=VimtuFS2 "
+          "total_kb=12379 free_kb=12273\"、\"[UI] explorer nav path=/apps/demo items=1 view=icons\"、"
+          "\"[UI] explorer run name=hello.elf kind=elf rc=0\" + \"[ELF64] launch ok rc=0 path=/hello.elf\"、"
+          "\"[EXPL] selftest PASS\"",
+          "端到端脚本 tests/explorer64_test.py：%s（像素 + 串口 + QEMU 鼠标注入：双击 C:/目录/ELF64、"
+          "上级/后退/面包屑、查看切四列、状态栏计数与 vfs64_list64 一致）" % ("存在" if test else "缺失"),
+          "截图 docs/screenshots/explorer_{thispc,drive,details}64.png：%s" % ("三张齐" if shots else "缺")]
+    done = api and log and bar and views and hook and boot and bld and test
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 CAPS = [
     ("存储", "★ AHCI(SATA) 驱动（PCI 找控制器 + ABAR + 端口/命令表/PRDT + 轮询 DMA；QEMU 上命令未被执行，见证据行）",
      cap_ahci_sata),
@@ -1093,6 +1129,8 @@ CAPS = [
     ("内核", "文件系统（真实 VFS）", cap_filesystem),
     ("内核", "★ VimtuFS2 目录树 v3（多级路径 + inode 时间戳 + 类型判定；v2 旧卷仍可挂载）", cap_fs_tree),
     ("存储", "★ 盘符与驱动器枚举（C: = 系统卷 + D:/E:… 盘符表；ESP/未知不占字母但列出）", cap_drive_layer),
+    ("应用", "★ 文件资源管理器 / 此电脑（UI：导航窗格 + 面包屑 + 图标/详细信息双视图 + 容量条 + 双击运行）",
+     cap_explorer_ui),
     ("内核", "设置持久化（store/VCAT 双槽）", cap_persistence),
     ("驱动", "ATA 中断（IRQ14）替代 PIO 轮询", cap_ata_irq),
     ("驱动", "运行期显示层（EDID/刷新率）", cap_display_layer),
@@ -1136,6 +1174,7 @@ TESTS = [
     ("uefi_cr3_experiment_test.py", "批次 D UEFI 运行期 CR3 实验：方案 A/B 两方案 + QEMU/OVMF 与 VMware EFI 实测"),
     ("fs_tree_test.py", "★ VimtuFS2 v3 目录树 + 盘符层：安装->格式化(v3)->多级 mkdir->子目录写文件->冷启动 stat/mtime/遍历/删除；"
                         "C:/D: 盘符表 + ESP skip + drive64 容量与 df 一致"),
+    ("explorer64_test.py", "★ 文件资源管理器 / 此电脑（UI）：容量条/四列像素 + 鼠标双击进盘/进目录/跑 ELF64 + 面包屑/上级/后退 + 状态栏计数"),
 ]
 
 

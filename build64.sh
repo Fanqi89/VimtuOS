@@ -67,7 +67,7 @@ SRCS_CORE="kernel/kernel64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp k
 SRCS_INSTALLER="$SRCS_CORE kernel/ata64.cpp kernel/part64.cpp kernel/setup64.cpp kernel/vfs64.cpp kernel/fat64.cpp"
 # 桌面外壳 + 应用：**只编进系统内核**（安装介质走向导，不带桌面，省 4MB 内核区空间）
 #   注意：这几个文件依赖 kernel/gui64.cpp 提供的外壳实现，任何新增应用都要同时加进这里。
-SRCS_DESKTOP="kernel/gui64.cpp kernel/calc64.cpp kernel/mines64.cpp \
+SRCS_DESKTOP="kernel/gui64.cpp kernel/explorer64.cpp kernel/calc64.cpp kernel/mines64.cpp \
  kernel/terminal64.cpp kernel/settings64.cpp kernel/taskmgr64.cpp"
 # 这四个子系统 + 批次 A 后半的两个：**只进系统内核**（安装介质不链它们；只有系统内核有 gui64/store64/app64）
 #   sysstate64 = 运行状态机 + 模块注册表 + 健康 + ring log（terminal 的 state/health/syslog）
@@ -241,7 +241,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o \
     "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
     "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
-    "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o \
+    "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o "$BUILD/os"/explorer64.o \
     "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
