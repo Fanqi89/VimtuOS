@@ -16,9 +16,9 @@
 //   * **pipe(22)** 真实现：64 字节环形缓冲 + 两个 fd（读端/写端）。**没有阻塞语义**：
 //     写满返回短写（一点空间都没有 -> -EAGAIN）；读空且写端还开着 -> -EAGAIN，
 //     写端全关 -> 0（EOF）。fork 后父子各持一端即可通信。
-//   * 底层只有 vfs64（VimtuFS2 单层目录）：路径形如 "/name"（也接受 "name"），大小写敏感，
-//     单文件 <= 67584 B（FD64_FILE_MAX = VFS64_MAX_FILE_BYTES），没有子目录树、没有权限、
-//     不能删目录。这些限制在终端 help / 文档里如实写清。
+//   * 底层只有 vfs64（VimtuFS2）：路径形如 "/dir/sub/name"（也接受 "name" = 从根开始），
+//     大小写敏感、**支持多级路径**（v3 起；'.'/'..' 交给 vfs64 解析）、单文件 <= 67584 B
+//     （FD64_FILE_MAX = VFS64_MAX_FILE_BYTES），没有权限、不能删非空目录。
 //   * 读：vfs64 没有 read-at-offset 原语，所以每次读把整个文件读进**一块全局读缓冲**
 //     （FD64_FILE_MAX），再按游标拷贝请求的片段；读/写期间关中断。
 //   * 写：vfs64_write 是"整体覆盖"语义 —— 本层每次写做一次**整文件 read-modify-write**，
@@ -48,8 +48,8 @@
 #define FD64_OPEN_MAX   64u          // OpenFile64 对象池（引用计数，不按进程复制）
 #define FD64_PIPE_MAX   8u           // pipe 对象池（每条 64 B 环形缓冲）
 #define FD64_PIPE_BYTES 64u          // ★ pipe 容量（固定；没有阻塞语义，见文件头）
-#define FD64_PATH_MAX   32u          // 路径缓冲：VFS64_NAME_MAX(27) + '/' + 2 兜底
-#define FD64_NAME_MAX   32u          // 目录项名字缓冲（与 vfs64_ls 的 [][32] 对齐）
+#define FD64_PATH_MAX   64u          // 路径缓冲：支持多级路径（"/apps/demo/file.txt" 这种）
+#define FD64_NAME_MAX   32u          // 目录项名字缓冲（与 vfs64_ls 的 [][32] 对齐；v3 名字上限 31）
 #define FD64_FILE_MAX   67584u       // 单文件上限（= VFS64_MAX_FILE_BYTES）
 
 // open 标志（Linux 的一个子集；不认识的高位一律忽略）
@@ -80,8 +80,9 @@
 #define FD64_EPERM   1
 #define FD64_EAGAIN  11
 
-// 路径规范化：接受 "/name" 与 "name"（等价）；拒绝空串、'/'-only、多级路径、含空白/控制字符。
-// 成功返回 0 并把规范形式（含 '/' 前缀）写进 out；失败返回负错误码。单层路径限制就在这里把关。
+// 路径规范化：接受 "/dir/sub/name" 与 "dir/sub/name"（相对路径 = 从根开始）；折叠连续的 '/'、
+// 去掉结尾 '/'、去前导空白；".." **原样保留**（父目录语义由 vfs64 负责）；拒绝空串、'/'、控制字符、超长。
+// 成功返回 0 并把规范形式（含 '/' 前缀）写进 out；失败返回负错误码。
 int fd64_norm_path64(const char* in, char* out, int cap);
 
 // ==================== fd 表（每进程一张；有内核表兜底）====================

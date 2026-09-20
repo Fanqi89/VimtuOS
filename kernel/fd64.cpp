@@ -207,21 +207,36 @@ static int fd64_streq(const char* a, const char* b) {
 }
 static int fd64_is_ws(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
 
+// 路径规范化：接受 "/a/b/c" 与 "a/b/c"（相对路径当成从根开始 —— VFS 层没有 cwd）。
+// v3 起支持**多级路径**：连续的 "//" 折叠成一个；"." 段丢掉；".." 段**保留**交给 vfs64 解析
+// （父目录语义只有 VFS 层知道，这里不重复实现）；结尾的 '/' 去掉。
+// 仍然拒绝：空串（= 根目录，本层不给文件句柄）、只有 '/'、含空白/控制字符、超过 cap。
+// 成功返回 0 并把规范形式（含 '/' 前缀）写进 out；失败返回负错误码。
 int fd64_norm_path64(const char* in, char* out, int cap) {
     if (!in || !out || cap < 3) return -FD64_EINVAL;
     int i = 0;
     while (in[i] && fd64_is_ws(in[i])) i++;                 // 去前导空白
-    if (in[i] == '/') i++;                                  // 允许 "/name" 与 "name"
     int n = 0;
     out[n++] = '/';
-    while (in[i] && !fd64_is_ws(in[i])) {
-        const char c = in[i++];
-        if (c == '/') return -FD64_EINVAL;                  // 多级路径：阶段一只支持单层
+    bool seg_has_char = false;                              // 当前段是否已经有内容
+    for (;;) {
+        const char c = in[i];
+        if (c == 0 || fd64_is_ws(c)) break;                  // 结束 / 空白 -> 这一段到此为止（"a b" 只取 "a"）
+        i++;
+        if (c == '/') {
+            if (!seg_has_char) continue;                     // "//" 与开头的 '/' 都折叠掉
+            if (n + 1 >= cap) return -FD64_EINVAL;
+            out[n++] = '/';
+            seg_has_char = false;
+            continue;
+        }
         if ((unsigned char)c < 0x21 || (unsigned char)c > 0x7E) return -FD64_EINVAL;
-        if (n + 1 >= cap) return -FD64_EINVAL;              // 太长（> cap-2）
+        if (n + 1 >= cap) return -FD64_EINVAL;               // 太长（>= cap-1）
         out[n++] = c;
+        seg_has_char = true;
     }
-    if (n == 1) return -FD64_EINVAL;                        // 只有 "/" = 根目录：本层不给文件句柄
+    if (n > 1 && out[n - 1] == '/') n--;                     // 结尾 '/' 去掉（"/a/" -> "/a"）
+    if (n == 1) return -FD64_EINVAL;                         // 只有 "/" = 根目录：本层不给文件句柄
     out[n] = 0;
     return 0;
 }
@@ -916,12 +931,20 @@ int fd64_selftest64() {
     int fail = 0;
     char out[FD64_PATH_MAX];
 
-    // bit0：路径规范化（单层语义的硬证据：多级路径必须被拒）
+    // bit0：路径规范化（v3 起支持多级：折叠 "//"、忽略结尾 '/'、保留 ".." 交给 vfs64；
+    //       仍然拒绝根目录/空串/空白字符/超长）
     if (fd64_norm_path64("/t.txt", out, (int)sizeof(out)) != 0 || !fd64_streq(out, "/t.txt")) fail |= 1;
     if (fd64_norm_path64("t.txt", out, (int)sizeof(out)) != 0 || !fd64_streq(out, "/t.txt"))  fail |= 1;
     if (fd64_norm_path64("/bad name", out, (int)sizeof(out)) != 0 || !fd64_streq(out, "/bad")) fail |= 1;
     if (fd64_norm_path64("/", out, (int)sizeof(out)) == 0)     fail |= 1;   // 根目录：本层不给句柄
     if (fd64_norm_path64("", out, (int)sizeof(out)) == 0)      fail |= 1;
+    if (fd64_norm_path64("/apps/demo/a.txt", out, (int)sizeof(out)) != 0 ||
+        !fd64_streq(out, "/apps/demo/a.txt")) fail |= 1;                    // 多级路径
+    if (fd64_norm_path64("//apps///demo//", out, (int)sizeof(out)) != 0 ||
+        !fd64_streq(out, "/apps/demo")) fail |= 1;                          // 折叠 '//' 与结尾 '/'
+    if (fd64_norm_path64("apps/../apps/x", out, (int)sizeof(out)) != 0 ||
+        !fd64_streq(out, "/apps/../apps/x")) fail |= 1;                    // ".." 原样交给 vfs64
+    if (fd64_norm_path64("/a/b?", out, (int)sizeof(out)) != 0) fail |= 1;   // '?' 是可打印 ASCII：合法
 
     // bit1：fd 表分配/释放（不碰盘：全是失败路径，不该改变表状态）
     {

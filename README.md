@@ -8,10 +8,10 @@
 它自带一张"三合一"安装盘（BIOS 光盘 / U 盘 / UEFI），安装界面与步骤照 Windows 10 做（去掉了输入产品密钥那一步）。
 
 > 版本 **0.1.0** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
-> 状态（权威判据：`python tests/status_report.py`）：**完成 27 / 部分 0 / 未做 1（共 28 项能力）**，
+> 状态（权威判据：`python tests/status_report.py`）：**完成 36 / 部分 0 / 未做 1（共 37 项能力）**，
 > 唯一未做项是 **Rust 参与实现（可选要求，本机未装 Rust 工具链）**。
-> 全量验收（`--full` + 专项/扩展脚本）：**26 个断言脚本全部 PASS**（2026-09-19 实测；上一批 752 条断言保持全过，
-> 本批次另加 display_runtime 19 + fs_term 32 + proc64 +5 + tmgr_proc +13 = **69 条新断言**）。
+> 全量验收（`--full` + 专项/扩展脚本）：**27 个断言脚本全部 PASS**（本批次实测；上一批 752 条断言保持全过，
+> 本批次另加 fs_tree（VimtuFS2 v3 目录树 + 盘符层）**84 条新断言**、vfs64/fd64 自检新增 4 个位掩码）。
 
 ---
 
@@ -24,7 +24,8 @@
 | **Win10 同款安装程序** | 语言 → 现在安装 → 许可条款 → 安装类型 → **磁盘与分区（新建/删除/格式化，真实写盘）** → 复制与真实百分比进度 → 完成并**自动重启**；**无产品密钥步骤** |
 | **装完就是一台独立系统** | 开机直接进桌面：桌面图标、任务栏、开始菜单（10 项）、窗口拖拽/缩放/最大化/最小化、脏矩形重绘 |
 | **调度器（多任务）** | `task64.cpp`：16 个任务槽、每任务 16KB 内核栈、8ms 时间片轮转、IRQ0 抢占、睡眠/退出/回收、`task_kill64`；启动即 `[TASK64] scheduler up tasks=N`、`kheart` 心跳持续增长；任务管理器"进程"页与终端 `ps/kill` 读的是**真实任务表** |
-| **真实文件系统 VimtuFS2** | `vfs64.cpp`：超级块（magic `VIMTUFS2` + CRC32）、空闲位图、64B inode、直接块×4 + 一级间接块 → 单文件 ≤67584B；format / mount / ls / read / write / mkdir / unlink / stat / dump，分区格式化路径已改调它 |
+| **真实文件系统 VimtuFS2（v3 目录树）** | `vfs64.cpp`：超级块（magic `VIMTUFS2` + CRC32）、空闲位图、**128B inode**（直接块×4 + 一级间接块 → 单文件 ≤67584B）、**多级路径**（`/dir/sub/file`，`.`/`..` 语义齐全）、inode **mtime**（RTC 打包 u32）与**类型判定**（目录/VAP64/ELF64/文本/二进制存进 inode 的 `kind` 字段）；`vfs64_format/mount/stat64/list64/opendir+readdir/closedir/mkdir64/create64/write64/read64/unlink64/rmdir64/tree_dump64` + 兼容旧 API；**v2 旧卷仍可挂载**（按单层语义工作），新格式化一律产出 v3 |
+| **盘符与驱动器枚举（"此电脑"的数据来源）** | `drive64.cpp`：枚举 PATA/AHCI(SATA)/NVMe 每块盘 → 读 MBR 分区 → 识别文件系统（VimtuFS2 超级块只读校验 / FAT32 BPB 指纹）→ 盘符表：**系统分区 = `C:`**（依据：vfs64 当前真正挂载的卷，兜底 drive 0 的 MBR `0x07` 项），其余可浏览的 VimtuFS2 卷依次 **`D:`/`E:`…**；**ESP/未知文件系统不占字母但仍列出**（`skip reason=esp|no-fs`）；每项给显示名/总容量/可用/文件系统/是否可浏览。打点 `[DRV64] scan\|letter=\|skip\|selftest`；**FAT 只识别不浏览**（本内核只有 FAT32 写入器） |
 | **设置持久化 store** | `store64.cpp`：A/B 双槽（VimtuFS2 里的 `/store.a`、`/store.b`）+ 世代号 + 头部/payload 双 CRC32 + "先数据后头部"的提交点；实测跨重启保留（第二遍启动 `keys=1` 里仍有 `theme=dark`）；终端 `store dump\|get\|set\|flush` |
 | **ring3 用户态** | `usermode64.cpp`：GDT 8 项（内核 0x08/0x10、用户 0x23/0x2B、TSS 0x30）；用户窗口在 4GiB（代码页 R/X、栈页 R/W/NX）；TSS.rsp0 随任务切换维护 |
 | **两套系统调用入口** | `int 0x80`（自有 ABI：rax/rdi/rsi/rdx）与 **`syscall` 指令**（MSR EFER.SCE / STAR=0x1B<<48\|0x08<<32 / LSTAR / FMASK，Linux x86_64 号段）双入口并存，帧标记分流；用户指针一律先过 `user64_range_ok64` 范围校验 |
@@ -48,7 +49,7 @@
 | ⚠️ **用户态独立地址空间** | 批次 C 起：proc64 每进程独立 CR3 + fork/execve/wait4/kill（BIOS 路径）；UEFI（固件页表）下默认仍如实降级为共享地址空间模式（`[PROC64] cr3 isolation OFF`）。**批次 D 实测**：在固件 PML4 上就地挂用户窗口（清 CR0.WP 手法）与自带 PML4 + 运行期 `mov cr3` **两条路径都在 QEMU+OVMF 与 VMware EFI 下成功**（`[PROC64] uefi exp result=B mode=isolated`），但默认构建不编这段实验（宏 `PROC64_UEFI_CR3_EXPERIMENT`），见 `docs/UEFI地址空间实验报告.md` |
 | ⚠️ **fd 语义（批次 D）** | **每进程 fd 表**（32 槽/张；`Proc64` 持有，终端/桌面用内核表）；fd → 引用计数的 `OpenFile64`（**共享偏移游标**）：`dup/dup2` 共享同一对象、`fork` 逐槽继承、`execve` 默认保留（**无 `O_CLOEXEC`**）、`close` 只是 refs-1；`O_APPEND` 真实现；**`pipe(22)` 真实现**（64 B 环形缓冲、非阻塞：写满短写/读空 `-EAGAIN`），`user/pipe64.asm` 是 fork 后父子各持一端的环回证据 |
 | ⚠️ **ELF64 只验证过自有静态程序** | 用 `ld.lld -static -nostdlib` 链接的自己的 ELF64 能 load → ring3 → `syscall` → exit；**glibc / 发行版二进制没有验证过**（缺 vDSO、TLS(FS.base) 的完整语义、信号投递、futex、动态链接与重定位） |
-| ⚠️ **VFS 是单层路径** | VimtuFS2 只支持 `/name`（无目录树、无 `.`/`..`、无删除目录）；文件名 ≤27B；最多 256 个 inode；单文件 ≤67584B。终端 `ls/cat/write/touch/rm/mkdir/df` 与 ring3 的 `open/read/write/close` 都走 `kernel/fd64.cpp` 的 FD 层直连 VimtuFS2（旧的 16×512B RAM-only ramfs 已删除）；终端新增 `fdtest`（独立游标/dup 共享/O_APPEND/pipe/fork 继承一键演示） |
+| ⚠️ **VFS 的限制（v3 目录树已落地，仍有边界）** | 支持多级路径 `/dir/sub/file`（`.`/`..`、大小写敏感）；**名字 ≤31B**、**inode 总数 ≤512**、**路径 ≤128B / 16 段**、**目录深度 16**；目录删除只支持 `rmdir` **空目录**（非空必须先清空）；**单文件仍 ≤67584B**（v3 没加二级间接块）；无权限/属主、无硬链接/符号链接、无稀疏文件。v2 旧卷仍能挂载（按单层语义）。终端 `ls/cat/write/touch/rm/mkdir/df` 与 ring3 的 `open/read/write/close` 都走 `kernel/fd64.cpp` 的 FD 层直连 VimtuFS2（终端命令的多级路径也已支持；终端里的提示文案仍写着"single-level"，下一批随文件管理器一起改）。终端另有 `fdtest`（独立游标/dup 共享/O_APPEND/pipe/fork 继承一键演示） |
 | ⚠️ **设置页接线范围** | 显示/会话分区已接 `config64`/`session64`（真落 store64，跨重启保留）；系统/关于页是只读实测值（设备规格来自 hwinfo64/display64/net64/usb64） |
 | ⚠️ **没有 TCP/IP / DHCP / DNS** | 网络只有 IPv4 + ARP + ICMP echo（e1000 轮询收发，无中断收包）；UDP/TCP、路由、DHCP、DNS 都没有；只适配 e1000，VMware 的 vmxnet3 未适配 |
 | ⚠️ **USB 只有 UHCI + HID 引导键盘** | 没有 EHCI(USB 2.0) / xHCI(USB 3.x)，没有 USB 鼠标、U 盘、集线器；只认直接插在根端口上的键盘；不接中断（由 `kusb` 线程轮询） |
@@ -108,7 +109,8 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
      ata64.cpp         ATA PIO + ATAPI(PACKET) + IRQ14 中断唤醒（超时回退轮询）
      part64.cpp        分区表（MBR/混合 MBR/盘尾 GPT）/ 新建 / 删除 / 格式化（VimtuFS2）/ 安装引擎 + ESP 安装
      fat64.cpp         最小 FAT32 写入器（安装时在目标盘建 ESP；卷参数与 tools/make_esp.py 逐条对齐）
-     vfs64.cpp         VimtuFS2：超级块+CRC32 / 空闲位图 / 64B inode / 读写 mkdir unlink stat dump
+     vfs64.cpp         VimtuFS2 v3：超级块+CRC32 / 空闲位图 / 128B inode + mtime/kind / 多级路径 / 目录树遍历 / v2 兼容
+     drive64.cpp       盘符与驱动器枚举：所有盘 -> MBR 分区 -> fs 识别 -> C:/D:/E: 盘符表（只读）
      store64.cpp       设置持久化：/store.a、/store.b 双槽 + 世代号 + 双 CRC32（裸盘槽仅降级+WARN）
      app64.cpp         VAP64 安装器 / 校验 / 启动器 + 按魔数自动分派
      elf64.cpp         ELF64 加载器：PT_LOAD 映射、p_flags 权限、SysV 初始栈/auxv、装载回收
@@ -137,7 +139,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
 ⑤ 构建与验证
    build64.sh     唯一构建脚本（clang/lld/nasm/xorriso/Python）
    tools/*.py     自写打包/诊断：make_iso64 / make_esp / make_flat / make_vap / pe_info / fat_check
-   tests/*.py     26 个断言脚本（≥821 断言）：串口断言 + screendump 像素断言 + 目标盘字节断言
+   tests/*.py     27 个断言脚本（≥905 断言）：串口断言 + screendump 像素断言 + 目标盘字节断言
 ```
 
 ## 五、快速开始
@@ -287,7 +289,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 |---|---|---|---|
 | ① | ~~**独立地址空间 + fork/execve**~~ | 批次 C 已完成（每进程 CR3 + fork/execve/wait4/kill；UEFI 固件页表下如实降级为共享模式） | —— |
 | ② | **glibc 级兼容** | 只验证过自有静态 ELF64 | TLS(FS.base) 真生效、信号投递、vDSO、futex、动态链接与重定位；毕业考试是"静态 busybox 起 shell" |
-| ③ | **VFS 补齐** | 单层路径、无目录树/无 rmdir、单文件 ≤67584B（终端已接真文件系统；还缺宿主机拷文件的工具） | 多级目录 + 目录删除 + 宿主编排工具 |
+| ③ | **VFS 补齐** | ~~单层路径~~（v3 已支持多级目录树 + 空目录删除 + mtime/类型判定）；仍缺：单文件 >67584B（需二级间接块）、权限/属主、宿主机拷文件工具、FAT 浏览、文件管理器 UI（下一批） | 文件管理器 UI + FAT 只读浏览 + 更大单文件 |
 | ④ | **TCP/IP** | 只有 IPv4/ARP/ICMP、静态地址、无中断收包 | DHCP/DNS/UDP/TCP；vmware vmxnet3 适配 |
 | ⑤ | **EHCI / xHCI / USB 存储 / 集线器 / 鼠标** | 只有 UHCI + 根端口 HID 引导键盘 | U 盘、鼠标、带 hub 的真机 |
 | ⑥ | **多核调度** | AP 起来后只是 `cli; hlt`；无 IPI、无 per-CPU 数据 | 真 SMP：AP 参与调度与中断；x2APIC |
@@ -412,7 +414,8 @@ experiment (A: attach the user window into the firmware PML4 with a short CR0.WP
 `mov cr3`) **succeeded on both QEMU/OVMF and VMware EFI** in an opt-in build, but it is off by default
 (see `docs/UEFI地址空间实验报告.md`); the ELF64 loader is only
 verified with **our own static binaries** (glibc/distro binaries are untested: no vDSO, signals, futex or
-dynamic linking); VFS is **single-level** (`/name`, ≤27B names, ≤67584B files) and the terminal's file
+dynamic linking); VFS v3 has a **directory tree** (`/dir/sub/file`, `.`/`..`; names ≤31B, ≤512 inodes, files
+still ≤67584B, empty-directory `rmdir` only; v2 volumes still mount) and the terminal's file
 commands (`ls/cat/write/touch/rm/mkdir/df`) use the real VimtuFS2 through the fd64 layer (ring3
 `open/read/write/close` share it). Since batch D the fd layer is **per-process** with
 reference-counted open-file objects: `dup`/`dup2` share one object (shared offset), `fork` inherits the

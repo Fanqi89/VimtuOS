@@ -21,7 +21,8 @@
 #include "hwinfo64.h"   // CPUID + PCI 只读枚举
 #include "acpi64.h"     // RSDP -> RSDT/XSDT -> FADT/MADT 只读解析
 #include "edid64.h"     // 显示器 EDID（引导层已落在 0x7600）只读解析：厂商/名字/首选时序/刷新率
-#include "vfs64.h"      // 真文件系统 VimtuFS2（安装程序格式化分区要用）
+#include "vfs64.h"      // 真文件系统 VimtuFS2（v3 目录树；安装程序格式化分区要用）
+#include "drive64.h"    // 盘符/驱动器枚举层（C: = 系统卷；只读扫描，见 os_boot_path）
 #include "ata64.h"      // ATA：IRQ14 中断驱动等待（超时回退 PIO 轮询），系统内核也要初始化
 #ifndef VIMTU_INSTALLER_MEDIA
 #include "store64.h"    // 设置持久化 store：只有系统内核链接它（安装程序不链 store64.cpp）
@@ -369,6 +370,17 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
         const int app_drive = 0;
         const uint32_t app_lba = app64_main_part_lba64(app_drive);
         if (vfs64_mount(app_drive, app_lba) == 0) {
+            // ---- 盘符/驱动器枚举 + 目录树打印（"此电脑"的数据来源；只读，不写盘）----
+            // 位置讲究：必须在**挂载成功之后** —— C: 的判定依据就是"当前真正挂载的那个卷"
+            // （见 kernel/drive64.h 的盘符规则）；再早调用只能退化成"按 MBR 0x07 猜"。
+            //   drive64_scan64     ：枚举所有 PATA/AHCI/NVMe 盘 -> MBR 分区 -> 文件系统识别
+            //   drive64_dump64     ：打印盘符表（自动验收 grep）
+            //   drive64_selftest64 ：盘符唯一/容量自洽/幂等（[DRV64] selftest PASS）
+            //   vfs64_tree_dump64  ：有界打印目录树（多级路径 + 类型/大小/mtime 的实测证据）
+            (void)drive64_scan64();
+            drive64_dump64();
+            (void)drive64_selftest64();
+            (void)vfs64_tree_dump64("/", 32, 4);
             (void)app64_selftest64();
             (void)app64_install_builtin64(app_drive, app_lba);   // 幂等：已装过则 skipped (exists)
             (void)elf64_selftest64();                            // 合法映像/坏样本自检（坏样本带 selftest 前缀）

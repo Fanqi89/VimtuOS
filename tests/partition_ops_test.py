@@ -235,22 +235,23 @@ def main():
           p1_deep == b"\xA5" * 512, "首字节=0x%02X" % p1_deep[0])
 
     p2 = read_at(args.target, PART_MAIN_LBA, 512)
-    # 注意：格式化现在写的是**真文件系统 VimtuFS2** 的超级块（不再是占位串 "VIMTUFS1"）。
+    # 注意：格式化写的是**真文件系统 VimtuFS2** 的超级块（不再是占位串 "VIMTUFS1"）。
     # 字段偏移见 kernel/vfs64.cpp 的 VFS_O_*：8=版本、12=扇区大小、16=块大小、20=总块数、
     # 24=根 inode、28/32=位图起点/块数、36/40/44=inode 起点/个数/大小、48/52=数据区起点/块数、
     # 60=CRC32([0,60))、510=0x55AA。下面期望的几何数字按 vfs64_format 的规则算：
-    # 24759 块 -> 位图 ceil(24759/4096)=7 块；inode min(24759/64,256)=256 个=32 块；
-    # 数据区 = 24759 - (1+7+32) = 24719 块。
+    # ★ v3（目录树版）：inode 128B/个（每块 4 个）——
+    #   24759 块 -> 位图 ceil(24759/4096)=7 块；inode min(24759/64,512)=386 个=ceil(386/4)=97 块；
+    #   数据区 = 24759 - (1+7+97) = 24654 块。
     check("P2 首扇区 = VimtuFS2 真超级块 magic VIMTUFS2", p2[:8] == b"VIMTUFS2", "%r" % p2[:8])
     gf = struct.unpack_from("<13I", p2, 8)
-    check("VimtuFS2 超级块版本 = 2 且扇区/块 = 512B、inode = 64B",
-          gf[0] == 2 and gf[1] == 512 and gf[2] == 512 and gf[9] == 64,
+    check("VimtuFS2 超级块版本 = 3（v3 目录树）且扇区/块 = 512B、inode = 128B",
+          gf[0] == 3 and gf[1] == 512 and gf[2] == 512 and gf[9] == 128,
           "version=%d sector=%d block=%d inode=%d" % (gf[0], gf[1], gf[2], gf[9]))
     check("VimtuFS2 超级块记录总块数 = 24759",
           gf[3] == TARGET_SECTORS - PART_MAIN_LBA, "total=%d" % gf[3])
-    check("VimtuFS2 超级块几何自洽（根 inode 0 / 位图 7 块 / inode 256 个 32 块 / 数据区 24719 块）",
-          gf[4] == 0 and gf[5] == 1 and gf[6] == 7 and gf[7] == 8 and gf[8] == 256 and
-          gf[10] == 40 and gf[11] == 24719,
+    check("VimtuFS2 超级块几何自洽（根 inode 0 / 位图 7 块 / inode 386 个 97 块 / 数据区 24654 块）",
+          gf[4] == 0 and gf[5] == 1 and gf[6] == 7 and gf[7] == 8 and gf[8] == 386 and
+          gf[10] == 105 and gf[11] == 24654,
           "root=%d bitmap=%d@%d inodes=%d@%d data=%d@%d" %
           (gf[4], gf[6], gf[5], gf[8], gf[7], gf[11], gf[10]))
     check("VimtuFS2 超级块 CRC32([0,60)) 正确",

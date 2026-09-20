@@ -503,6 +503,66 @@ def cap_filesystem():
           "实测串口：\"[VFS64] selftest PASS\"、\"format ok blocks=24759 root=8017\""]
     done = mag and fmt and part
     return ("DONE" if done else "PARTIAL"), ev
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_fs_tree():
+    """VimtuFS2 v3 目录树：多级路径 + inode 时间戳 + 类型判定（旧 v2 卷仍可挂载）。"""
+    if not (exists("kernel/vfs64.cpp") and exists("kernel/vfs64.h")):
+        return "MISSING", ["kernel/vfs64.cpp/.h 不存在（无 VFS 实现）"]
+    n = lines("kernel/vfs64.cpp")
+    ver = grep_count(r"VFS64_VERSION\s+3u", ["kernel/vfs64.h"])
+    v2 = grep_count(r"VFS64_VERSION_V2|VFS_LAY_V2", ["kernel/vfs64.h", "kernel/vfs64.cpp"])
+    tree = grep_count(r"path_resolve|vfs64_mkdir64|vfs64_rmdir64|vfs64_tree_dump64",
+                      ["kernel/vfs64.cpp"])
+    iter64 = grep_count(r"vfs64_opendir64|vfs64_readdir64|vfs64_list64", ["kernel/vfs64.cpp"])
+    mtime = grep_count(r"vfs64_pack_time64|VFS_I3_MTIME|vfs64_now64", ["kernel/vfs64.cpp"])
+    kind = grep_count(r"vfs64_kind_of_data64|VFS64_KIND_ELF|VFS64_KIND_VAP", ["kernel/vfs64.cpp"])
+    boot = grep_count(r"vfs64_tree_dump64\(", ["kernel/kernel64.cpp"])
+    test = exists("tests/fs_tree_test.py")
+    ev = ["vfs64.cpp %d 行（v3：多级路径解析 + 目录树遍历 + 时间戳/类型判定；v2 旧卷仍可挂载）" % n,
+          "卷版本 v3（VFS64_VERSION 3u）：命中 %d；v2 兼容布局（VFS_LAY_V2）：命中 %d" % (ver, v2),
+          "多级路径/建目录/删空目录/目录树打印：命中 %d" % tree,
+          "游标式遍历（opendir/readdir/closedir + 路径版 list 分页）：命中 %d" % iter64,
+          "mtime 打包/解包（(年-2000)<<26|月<<22|日<<17|时<<12|分<<6|秒）：命中 %d" % mtime,
+          "类型判定（VAP64/ELF64/文本/二进制，写盘时存进 inode.kind）：命中 %d" % kind,
+          "启动期打印目录树 vfs64_tree_dump64()（kernel64.cpp）：命中 %d" % boot,
+          "实测串口：\"[VFS64] selftest PASS\"（bit8 多级目录树 / bit9 路径语义 / bit10 mtime+类型 / "
+          "bit11 代际几何+重挂载）、\"[VFS64] format ok blocks=24759 version=3 inode=128 root=8017\"",
+          "端到端脚本 tests/fs_tree_test.py：%s（多级 mkdir -> 子目录写文件 -> 冷启动 stat/mtime/遍历 -> 删除）"
+          % ("存在" if test else "缺失")]
+    done = ver and tree and iter64 and mtime and kind and boot and test
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_drive_layer():
+    """盘符/驱动器枚举层：C: = 系统卷，其余 VimtuFS2 卷 D:/E:…；ESP/未知不占字母但列出。"""
+    if not (exists("kernel/drive64.cpp") and exists("kernel/drive64.h")):
+        return "MISSING", ["kernel/drive64.cpp/.h 不存在（无盘符层）"]
+    n = lines("kernel/drive64.cpp")
+    api = grep_count(r"drive64_scan64|drive64_count64|drive64_info64|drive64_by_letter64",
+                     ["kernel/drive64.cpp", "kernel/drive64.h"])
+    disks = grep_count(r"ata64_drive_count64|ata64_slot_to_drive64", ["kernel/drive64.cpp"])
+    mbr = grep_count(r"528|446 \+ i \* 16|0x55", ["kernel/drive64.cpp"])
+    fsid = grep_count(r"vfs64_probe_volume64|fs_fat_probe|FAT32", ["kernel/drive64.cpp"])
+    letter = grep_count(r"letter=|reason=|\[DRV64\]", ["kernel/drive64.cpp"])
+    sysv = grep_count(r"vfs64_mounted_volume64|VFS64 mount|0x07", ["kernel/drive64.cpp"])
+    boot = grep_count(r"drive64_(scan|dump|selftest)64\(", ["kernel/kernel64.cpp"])
+    bld = grep_count(r"drive64\.cpp", ["build64.sh"])
+    ev = ["drive64.cpp %d 行（枚举 PATA/AHCI/NVMe 盘 -> MBR 分区 -> 文件系统识别 -> 盘符表）" % n,
+          "API（scan/count/info/by_letter）：命中 %d" % api,
+          "统一驱动器号枚举（ata64_drive_count64/slot_to_drive64，含 SATA/NVMe）：命中 %d" % disks,
+          "MBR 解析（4 个分区项 + 55AA 签名）：命中 %d" % mbr,
+          "文件系统识别（VimtuFS2 超级块只读校验 / FAT32 BPB 指纹）：命中 %d" % fsid,
+          "打点（[DRV64] letter=/skip/reason=）：命中 %d" % letter,
+          "C: 判定依据（当前挂载卷 + MBR 0x07 兜底）：命中 %d" % sysv,
+          "启动期枚举+打印+自检（kernel64.cpp os_boot_path，挂载之后）：命中 %d" % boot,
+          "build64.sh 链接 drive64.cpp：命中 %d" % bld,
+          "实测串口：\"[DRV64] scan disks=2 parts=4 fs=3\"、\"[DRV64] letter=C: disk=0 part=2 "
+          "fs=VimtuFS2 total_kb=77899 free_kb=77815\"、\"[DRV64] skip lba=163807 type=0xEF reason=esp\"、"
+          "\"[DRV64] selftest PASS\""]
+    done = api and disks and fsid and letter and sysv and boot and bld
+    return ("DONE" if done else "PARTIAL"), ev
 
 
 def cap_persistence():
@@ -1030,6 +1090,9 @@ CAPS = [
     ("内核", "文件系统（真实 VFS）", cap_filesystem),
     ("内核", "每进程 fd 表 + fd 继承 + O_APPEND + pipe（批次 D）", cap_fd64_batch_d),
     ("内核", "UEFI 运行期 CR3 实验（方案 A/B，默认不编；两条固件路径实测）", cap_uefi_cr3_experiment),
+    ("内核", "文件系统（真实 VFS）", cap_filesystem),
+    ("内核", "★ VimtuFS2 目录树 v3（多级路径 + inode 时间戳 + 类型判定；v2 旧卷仍可挂载）", cap_fs_tree),
+    ("存储", "★ 盘符与驱动器枚举（C: = 系统卷 + D:/E:… 盘符表；ESP/未知不占字母但列出）", cap_drive_layer),
     ("内核", "设置持久化（store/VCAT 双槽）", cap_persistence),
     ("驱动", "ATA 中断（IRQ14）替代 PIO 轮询", cap_ata_irq),
     ("驱动", "运行期显示层（EDID/刷新率）", cap_display_layer),
@@ -1071,7 +1134,10 @@ TESTS = [
     ("fs_term_test.py", "终端真文件系统：write/ls/df/ring3 读 + 冷启动第二遍 cat 跨重启读回 + rm"),
     ("fd64_test.py", "批次 D FD 语义：每进程 fd 表 + dup 共享游标 + fork 继承 + O_APPEND + pipe 环回"),
     ("uefi_cr3_experiment_test.py", "批次 D UEFI 运行期 CR3 实验：方案 A/B 两方案 + QEMU/OVMF 与 VMware EFI 实测"),
+    ("fs_tree_test.py", "★ VimtuFS2 v3 目录树 + 盘符层：安装->格式化(v3)->多级 mkdir->子目录写文件->冷启动 stat/mtime/遍历/删除；"
+                        "C:/D: 盘符表 + ESP skip + drive64 容量与 df 一致"),
 ]
+
 
 def run_tests():
     results = []
