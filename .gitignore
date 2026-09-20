@@ -48,6 +48,13 @@ target-*.img
 *-serial.log
 *_serial.log
 installed_boot.log
+# item 6 起新增的验收残留（同一条原则：测试跑完的日志/截图不进仓）
+nvme64_uefi.log
+nvme64_bios.log
+ahci_installed_boot.log
+esp_installed_*.log
+usb_bothfw_*.log
+*.ppm
 
 # ==================== 会话 / 编辑器杂项 ====================
 .pisession/

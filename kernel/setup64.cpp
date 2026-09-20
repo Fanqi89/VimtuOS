@@ -129,9 +129,13 @@ struct ListRow {
     char text[96];
 };
 
-// ★ item 5a：磁盘表按**统一驱动器号**索引（0..3 = PATA，8.. = AHCI 盘，4..7 是保留空洞），
-//   所以数组要覆盖到最大驱动器号 8+AHCI64_MAX_DEVS-1；下标 = 驱动器号，不重排。
-static const int kDiskSlots = ATA64_AHCI_BASE + AHCI64_MAX_DEVS;
+// ★ item 5a / item 6：磁盘表按**统一驱动器号**索引（0..3 = PATA，8..15 = AHCI 盘，
+//   16.. = NVMe 命名空间，4..7 是保留空洞），所以数组要覆盖到最大驱动器号
+//   ATA64_MAX_DRIVE64 - 1（= ATA64_NVME_BASE + NVME64_MAX_NS - 1）；下标 = 驱动器号，不重排。
+//   ★ item 6 的**最小必要改动**：原来只覆盖到 ATA64_AHCI_BASE + AHCI64_MAX_DEVS - 1（= 15），
+//     而 NVMe 命名空间的驱动器号从 16 起 —— 数组不够就会被下面 `d >= kDiskSlots` 静默跳过
+//     （表现：向导里看不到 NVMe 盘 = 装不进去）。编号方案本身没变，只是数组跟着编号方案变大。
+static const int kDiskSlots = ATA64_MAX_DRIVE64;
 static DiskEntry g_disks[kDiskSlots];
 static ListRow   g_rows[24];
 // 安装介质本身占据的那块 ATA 盘（U 盘 / hybrid ISO；-1 = 介质不是块盘或尚未判定）。
@@ -315,7 +319,7 @@ static void enumerate_disks() {
         dbg64_str(g_disks[d].has_gpt ? " GPT" : (g_disks[d].has_mbr ? " MBR" : " no-table"));
         dbg64_str(" parts=");
         dbg64_dec(g_disks[d].part_count);
-        dbg64_str(d >= ATA64_AHCI_BASE ? " bus=AHCI" : " bus=PATA");
+        dbg64_str(d >= ATA64_NVME_BASE ? " bus=NVMe" : (d >= ATA64_AHCI_BASE ? " bus=AHCI" : " bus=PATA"));
         dbg64_nl();
     }
 }
@@ -335,7 +339,7 @@ static void build_rows() {
         char* p = r.text;
         str_append(p, "驱动器 ", 20);
         str_append_u64(p, (uint64_t)d, 4);
-        str_append(p, d >= ATA64_AHCI_BASE ? "  AHCI" : "  PATA", 8);
+        str_append(p, d >= ATA64_NVME_BASE ? "  NVMe" : (d >= ATA64_AHCI_BASE ? "  AHCI" : "  PATA"), 8);
         str_append(p, "  ", 4);
         str_append(p, g_disks[d].model, 41);
         str_append(p, "  ", 4);

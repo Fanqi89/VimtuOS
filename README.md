@@ -37,7 +37,8 @@
 | **USB 主机 + HID 键盘** | `usb64.cpp`：UHCI + 控制/中断传输 + HID 引导键盘，按键经 `kbd_inject_scancode()` 注入 PS/2 **同一条队列** —— 桌面零改动即可响应（实测 USB 键盘按键真的打开了终端） |
 | **ATA 中断** | `ata64.cpp` 接上 IRQ14（中断唤醒替代 PIO 轮询），超时 / 从通道 / IF=0 自动回退轮询并只告警一次；实测 `irq14 selftest reads=2 irqs=1 polled=0` |
 | **桌面外壳与自带应用** | 窗口 z 序 / 拖拽缩放 / 任务栏 / 开始菜单 / 脏矩形 + **扫雷、计算器、终端、设置、任务管理器、我的电脑、系统监视器、关于** |
-| **AHCI(SATA) + 屏幕硬件检查报告（item 5a）** | `ahci64.cpp`：PCI 找 class 01/06/prog-if 01 → BAR5(ABAR，含 64 位高位) → 逐端口 PxCLB/PxFB + PxCMD(FRE→ST) → PxSSTS/PxSIG 判设备 → 非队列 DMA 命令表（CFIS H2D `0x27` + READ/WRITE DMA EXT `0x25/0x35`，LBA48）+ PRDT + PxCI 轮询（`g_ticks64`/自旋双超时、hlt 让出）。**统一驱动器号**：`0..3`=PATA、`8..`=AHCI 盘，`ata64.cpp` 内部按号分派 → 安装程序/分区引擎/VFS/store 的 weak 引用**都不用改**。`hwui64.cpp`：**真机没有串口时的唯一诊断画面** —— 把 CPU/内存/固件与地址空间/中断与 SMP/**存储（PATA 通道 + AHCI 控制器与端口 + NVMe 标"不支持"）**/显示（fb+EDID）/输入（PS/2 8042 + UHCI HID；EHCI/xHCI 标"不支持"）/ACPI/网络逐条画在黑底分区块页面上；三处展示：① 启动期约 5 秒（任意键跳过）② 安装程序找不到磁盘时直接画在向导里 ③ 桌面 设置 → **硬件检查**页。指南见 `docs/真机验证指南.md` |
+| **AHCI(SATA) + 屏幕硬件检查报告（item 5a）** | `ahci64.cpp`：PCI 找 class 01/06/prog-if 01 → BAR5(ABAR，含 64 位高位) → 逐端口 PxCLB/PxFB + PxCMD(FRE→ST) → PxSSTS/PxSIG 判设备 → 非队列 DMA 命令表（CFIS H2D `0x27` + READ/WRITE DMA EXT `0x25/0x35`，LBA48）+ PRDT + PxCI 轮询（`g_ticks64`/自旋双超时、hlt 让出）。**统一驱动器号**：`0..3`=PATA、`8..`=AHCI 盘，`ata64.cpp` 内部按号分派 → 安装程序/分区引擎/VFS/store 的 weak 引用**都不用改**。`hwui64.cpp`：**真机没有串口时的唯一诊断画面** —— 把 CPU/内存/固件与地址空间/中断与 SMP/**存储（PATA 通道 + AHCI 控制器与端口 + NVMe 控制器/命名空间/容量）**/显示（fb+EDID）/输入（PS/2 8042 + UHCI HID；EHCI/xHCI 标"不支持"）/ACPI/网络逐条画在黑底分区块页面上；三处展示：① 启动期约 5 秒（任意键跳过）② 安装程序找不到磁盘时直接画在向导里 ③ 桌面 设置 → **硬件检查**页。指南见 `docs/真机验证指南.md` |
+| **NVMe 驱动：能装到 NVMe 盘、UEFI 从这块盘启动（item 6）** | `kernel/nvme64.{h,cpp}`：PCI 找 class `0x01`/subclass `0x08`/prog-if `0x02`（= `0x010802`）→ **BAR0（64 位 MMIO，高 32 位也处理）** → 控制器使能（`CSTS.RDY=0` → `INTMS=0xFFFFFFFF` **全程轮询** → `AQA`/`ASQ`/`ACQ` → `CC`：CSS=0/MPS=0/IOSQES=6/IOCQES=4/EN=1 → `CSTS.RDY=1`）→ Admin 队列（Identify Controller / Identify Namespace(NSID 1，`NSZE`+`LBAF`) / Create I/O CQ+SQ，QD=8）→ I/O 轮询（Read/Write、`NLB` 0-based、**PRP1 + PRP2（两页直接指针 / 三页以上 PRP 列表）**、SQ tail / CQ head 门铃、CQ **phase 位**、`g_ticks64`+自旋双超时）。**驱动器号 `16..`**：`ata64.cpp` 内部按号分派，`ata64_drive_count64()`/`slot_to_drive64()` 把命名空间算进枚举 → 向导里直接能选、能分区、能装。单条命令 ≤ 128 扇区（64KB，内部分块）。QEMU 实测：**识别 → 装到 NVMe 盘（`[PART] … drive=16`、ESP FAT32 fat_ok=1）→ UEFI(OVMF) 从这块盘启动进桌面**（`U:loaded KERNEL64.BIN` → `[OS] booted from installed disk` → `[GUI64] ready`，`tests/nvme64_test.py`）；SeaBIOS 也能从 NVMe 启（真机 BIOS 是否认 NVMe 取决于固件，**推荐 UEFI**）。边界：单控制器/单队列/单命名空间/只支持 512B 逻辑块 |
 | **内核自检** | 启动即跑内存、图形、调度器、VFS、store、syscall、ring3、ELF64/VAP64、APIC/SMP、USB、EDID 等自检，结果打到串口供自动验收断言 |
 
 ## 二、它**不能**做什么（诚实边界，重要）
@@ -54,6 +55,7 @@
 | ⚠️ **AP 只是停着** | SMP 能启动 AP 并让它报在线，但**没有多核调度**（调度器仍单核、IRQ0 只在 BSP）、没有 IPI、没有 per-CPU 数据/GDT/TSS，AP 自己的 LAPIC/中断不参与 |
 | ⚠️ **ACPI/APIC 覆盖有限** | 只解析 RSDP/RSDT/XSDT/FADT/MADT/HPET/MCFG；关机仍走 ACPI 端口 0x604 + 8042 回退链；x2APIC 未适配；固件页表没映射 LAPIC/IOAPIC 的机器会留在 PIC |
 | ✅ **SATA/AHCI 盘可直启（引导层已改 BIOS INT 13h）** | 引导层（`boot/loader64.asm`）的**磁盘启动路径**读内核不再用自写 PATA PIO，改走 **BIOS INT 13h 扩展读（AH=0x42 + DAP）**：驱动器号用固件传进来的 `DL`，分块 64 扇区（32KB、不跨 64KB 边界）读进低内存暂存区 `0x20000`，每批再进一次保护模式搬到 `0x100000`；失败复位磁盘重试 3 次后打 `[LM] int13 read FAILED ah=… lba=… retry=…` 并停机（不静默失败）。**BIOS 不需要把 SATA 设成 IDE 兼容模式** —— QEMU 上"只把装好的盘挂 `ich9-ahci` 启动"已进桌面（`tests/disk_boot_test.py`：`[LM] disk boot via INT 13h dl=0x80` → `[OS] booted from installed disk` → `[GUI64] ready`）；真机仍待复验。磁盘级 IDENTIFY/读写也已在 `--strict-dma` 档 PASS（item 5b 修好命令头布局） |
+| ✅ **NVMe 盘现在能装、也能启动（item 6 起）** | 内核侧 `kernel/nvme64.{h,cpp}`：**驱动器号 `16..`** 的命名空间可以直接当安装目标盘（`[PART] … drive=16` → ESP/FAT32/GPT 全流程），**UEFI（OVMF）从这块装好的盘启动进桌面已实测**。仍有的边界：单控制器 / 单队列对（QD=8）/ 单命名空间（NSID 1）/ 全程轮询（无中断/无 MSI-X）/ 只支持 **512B 逻辑块**（4KB 逻辑块的盘如实打点并**不给驱动器号**）/ 单条命令 ≤ 64KB。**BIOS 从 NVMe 启动取决于固件**（BIOS 的 INT 13h 盘号来自固件自己的驱动表；QEMU 11.1 的 SeaBIOS 实测支持，但不少真机 BIOS 不认 NVMe）→ **推荐 UEFI 引导**。真机 NVMe 未测 |
 | ⚠️ **没有 INT 13h 扩展读的老固件起不来** | 磁盘路径**没有 PIO 回退**（自写 PIO 在 AHCI 机器上读不到盘，已整段删除）：只有支持 EDD 扩展读（AH=0x42）的固件能启动，1998 年后的固件基本都有；更老的机器也跑不动本系统的 64 位长模式 |
 | ⚠️ **安装建 ESP 需要目标盘 ≥ ~60MB** | ESP=48MB（真 FAT32：簇数必须 ≥ 65525，512B 扇区 + SPC=1 时卷下限就 ~33.5MB）+ 主分区至少 8MB + 盘尾 GPT 33 扇区 + 引导区 8009 扇区 = 122730 扇区 ≈ 59.9MiB。更小的盘（含 16MB 回归目标盘）只写老 MBR 布局（BIOS-only），串口打 `[INSTALL] esp skipped (disk too small)`。另外装好的盘只写**盘尾备份 GPT**（主 GPT 头的位置被 loader64.bin 占着）—— 依赖固件"主头无效时用备份头"（EDK2 已实测） |
 | ⚠️ **只在虚拟机验证** | QEMU + VMware Workstation 双验证（BIOS 与 UEFI 都跑），**未在真机裸机验证**；UEFI 路径未做签名，测试时 `secureBoot=FALSE` |
@@ -165,8 +167,8 @@ bash build64.sh
 |---|---|---|
 | `vimtu64-64.iso` | 56.2 MB | **三合一安装盘**：BIOS 光盘 + 可写 U 盘 + UEFI |
 | `vimtu64-64.img` | 8.3 MB | 安装介质裸盘（把一个 8MB 镜像直接当硬盘用） |
-| `build64/kernel64.bin` | 1.87 MB | 安装程序内核 |
-| `build64/kernel64_os.bin` | 2.01 MB | 装进硬盘的系统内核（调度器/VFS/store/ring3/网络/USB 都在这里） |
+| `build64/kernel64.bin` | 1.89 MB | 安装程序内核（1,980,680 B；含 ATA/AHCI/**NVMe** 驱动、分区/安装引擎、FAT32 ESP 写入器） |
+| `build64/kernel64_os.bin` | 2.50 MB | 装进硬盘的系统内核（2,618,728 B；调度器/VFS/store/ring3/网络/USB/AHCI/**NVMe** 都在这里） |
 | `build64/BOOTX64.EFI` / `UEFI64.BIN` | 2.5 KB / 36 KB | UEFI 两段式引导 |
 | `build64/esp.img` | 48 MB | 手写 FAT32 ESP（96736 簇，>= 65525） |
 
@@ -238,6 +240,10 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 
   另有专项脚本：`elf64_test` 56、`store64_test` 46、`app64_test` 31、`display64_test` 22、`user64_test` 17
   （以及 sysstate64_test / ui_extra64_test / screenshot64 等，条数随实现增长）。
+  **item 6 新增 `tests/nvme64_test.py`（38 条断言，全 PASS）**：NVMe 控制器/命名空间/队列打点 +
+  只读自检 + **完整装到 NVMe 盘**（`[PART] … drive=16` / ESP FAT32 / GPT）+ 目标盘与 **ESP 三文件逐字节** +
+  **UEFI(OVMF) 从这块盘启动进桌面** + BIOS(SeaBIOS) 如实测（能起来就断言、起不来就如实 SKIP 并说明
+  "BIOS 从 NVMe 启动取决于固件"）。
 * **三类证据**：
   * **串口级**：每步都打标记（`[LM64]` / `[G64]` / `[SETUP]` / `[PART]` / `[TASK64]` / `[VFS64]` /
     `[STORE64]` / `[SYSCALL]` / `[USER64]` / `[APP64]` / `[ELF64]` / `[APIC]` / `[SMP]` / `[NET64]` /
@@ -271,6 +277,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | M12 | **VAP64 应用格式与加载器 + ELF64 加载器**（自有静态程序可从盘上装、可在 ring3 跑） | ✅ |
 | M13 | **ACPI 解析 + APIC 接管 + SMP 启动 AP**（均有优雅降级） | ✅ |
 | M14 | **网络（e1000 + ARP/ICMP）与 USB 主机（UHCI + HID 键盘）** | ✅ |
+| M15 | **NVMe 驱动（item 6）**：PCI `0x010802` + BAR0(64 位 MMIO) + admin/I-O 队列 + 轮询 PRP 读写 → **驱动器号 `16..`**（上层零改动）→ 可装到 NVMe 盘、**UEFI 从这块盘启动进桌面** | ✅ |
 
 ## 八、路线图（未完成的部分）
 
@@ -300,7 +307,7 @@ boot/                   引导层（16 位实模式 + 长模式入口，物理�
   cdiso.asm             光盘引导桩（与 U 盘硬盘分支共用）
   hybrid_mbr.asm        写进 ISO 第 0 扇区的 hybrid MBR
   efi/                  UEFI：stub.c(PE 桩) + uefi64.c(平铺引导器) + jump64.asm + efi.h
-kernel/                 64 位内核 + 桌面 + 应用  69 文件 / 27,599 行
+kernel/                 64 位内核 + 桌面 + 应用  94 文件 / 41,779 行（kernel/*.cpp|*.h|*.asm）
   kernel64.cpp          入口 / 自检 / 两条启动路径 / 子系统初始化顺序
   task64.*              调度器（任务表 / 时间片 / 抢占 / 回收 / kstress）
   vfs64.*               VimtuFS2 文件系统
@@ -314,10 +321,13 @@ kernel/                 64 位内核 + 桌面 + 应用  69 文件 / 27,599 行
   usb64.*               UHCI + HID 引导键盘
   ap_trampoline64.asm   AP 跳板（234B，按物理 0x8000 汇编）
   gui64.* calc64.cpp mines64.cpp terminal64.cpp settings64.cpp taskmgr64.cpp
-  mem64.cpp x86_64.cpp fb.cpp font.cpp input.cpp ata64.cpp part64.cpp setup64.cpp ...
+  ata64.* part64.cpp setup64.cpp                磁盘层：PATA + 分区/安装引擎 + 向导
+  ahci64.* nvme64.*                             AHCI(SATA) 与 NVMe 驱动（统一驱动器号 8..15 / 16..）
+  mem64.cpp x86_64.cpp fb.cpp font.cpp input.cpp ...
 tools/                  自写打包/诊断工具（Python，6 脚本 / 1,092 行；根目录另有 6 个 _*.py 资源脚本）
   make_vap.py           VAP64 应用打包器（与 kernel/app64.h 逐字段一致）
-tests/                  验收脚本（34 个 .py，其中 28 个是断言脚本）
+tests/                  验收脚本（38 个 .py：32 个 `*_test.py` + `boot64_assert.py` / `screen64_probe.py` /
+                        `status_report.py` 等；新增 `nvme64_test.py`）
 user/                   ring3 示例程序（6 文件；filedemo64.asm 文件读写、proc64.asm 多进程、pipe64.asm 管道）
   hello64.asm           VAP64 示例（int 0x80 自有 ABI）
   hello_elf64.asm/.ld   ELF64 示例（syscall 指令 Linux 号段 + 用户窗口链接脚本）

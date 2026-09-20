@@ -2,16 +2,17 @@
 //
 // 实现要点：
 //   * 全部内容来自**真探测**：hwinfo64（CPUID/PCI/磁盘）、mem64（E820/页池/堆）、
-//     ata64+ahci64（PATA/SATA 盘）、acpi64（RSDP）+ 本文件自己做的**只读** ACPI 根表遍历、
+//     ata64+ahci64+nvme64（PATA/SATA/NVMe 盘）、acpi64（RSDP）+ 本文件自己做的**只读** ACPI 根表遍历、
 //     fb/bootinfo（分辨率/位深/模式数）、edid64/display64（EDID/刷新率）、usb64/net64（弱引用，
 //     安装介质内核里没编进去 -> 如实写"本内核未编入"）、本文件自己做的只读 PCI 扫描
-//     （NVMe class 01/08、EHCI class 0C/03 prog-if 20、xHCI prog-if 30）。
+//     （NVMe class 01/08 的控制器/命名空间、EHCI class 0C/03 prog-if 20、xHCI prog-if 30）。
 //   * 报告正文缓存在本文件的静态行缓冲里（无堆分配），绘制函数只读它。
 //   * 只画屏幕、只读端口/MMIO/PCI 配置空间；**不写任何设备寄存器**（ahci64_init64 例外：
 //     那是驱动初始化本身，见 ahci64.cpp 顶部说明）。
 #include "hwui64.h"
 #include "ahci64.h"
 #include "ata64.h"
+#include "nvme64.h"        // ★ item 6：NVMe 控制器/命名空间摘要（真实状态，不再写"不支持"）
 #include "acpi64.h"
 #include "apic64.h"          // IRQ_MODE64_*（常量；不需要链接 apic64.cpp）
 #include "../bootinfo.h"     // BootInfo / BOOT_INFO_ADDR（引导层写在物理 0x1000）
@@ -236,8 +237,10 @@ static void hwui_acpi_walk(HwAcpi* o) {
 }
 
 // ==================== 报告构建 ====================
+// ==================== 报告构建 ====================
 static void hwui_storage_lines(const HwPci& pci, int* out_disks, int* out_ctrl) {
-    // 读一遍 PATA（0..3，不需要 ata64_init64：识别走状态轮询）与 AHCI（ahci64 已初始化）。
+    // 读一遍 PATA（0..3，不需要 ata64_init64：识别走状态轮询）、AHCI（ahci64 已初始化）与
+    // NVMe（nvme64 已初始化；报告页可能比驱动先跑，nvme64_ctrl64() 内部会幂等初始化一次）。
     struct Row { int drive; int bus; int port; char model[41]; uint64_t sectors; int atapi; };
     static Row rows[16];
     int n = 0;
@@ -284,9 +287,26 @@ static void hwui_storage_lines(const HwPci& pci, int* out_disks, int* out_ctrl) 
     for (int i = 0; i < n; i++) {
         if (rows[i].bus == 1 && !rows[i].atapi) rows[i].drive = ATA64_AHCI_BASE + local++;
     }
+    // ★ item 6：NVMe 命名空间（驱动器号 = ATA64_NVME_BASE + 序号；型号 = 控制器型号）。
+    //   这里显示的是**真实状态**：能不能用看 nvme64 有没有真初始化成功，
+    //   不再写"本系统不支持 NVMe"。
+    const Nvme64CtrlInfo* nv = nvme64_ctrl64();
+    int nvme_ns = 0;
+    if (nv->found) {
+        for (int i = 0; i < nv->ns_count && i < NVME64_MAX_NS; i++) {
+            nvme_ns++;
+            if (n < 16) {
+                rows[n].drive = ATA64_NVME_BASE + i;
+                rows[n].bus = 2; rows[n].port = -1;
+                rows[n].sectors = nv->ns_sectors[i]; rows[n].atapi = 0;
+                for (int k = 0; k < 41; k++) rows[n].model[k] = nv->model[k];
+                n++;
+            }
+        }
+    }
 
-    *out_disks = pata_drives + ahci_devs + pci.nvme;
-    *out_ctrl  = pata_ch + (ah->found ? 1 : 0) + pci.nvme;
+    *out_disks = pata_drives + ahci_devs + nvme_ns;
+    *out_ctrl  = pata_ch + (ah->found ? 1 : 0) + (nv->found ? 1 : 0);
 
     newsec("存储 / Storage");
     {
@@ -294,7 +314,7 @@ static void hwui_storage_lines(const HwPci& pci, int* out_disks, int* out_ctrl) 
         l.s("  控制器 controllers="); l.u((uint64_t)*out_ctrl);
         l.s("（PATA="); l.u((uint64_t)pata_ch);
         l.s(" AHCI="); l.u(ah->found ? 1 : 0);
-        l.s(" NVMe="); l.u((uint64_t)pci.nvme);
+        l.s(" NVMe="); l.u(nv->found ? 1 : 0);
         l.s("）  设备 storage="); l.u((uint64_t)*out_disks);
     }
     if (ah->found) {
@@ -307,6 +327,21 @@ static void hwui_storage_lines(const HwPci& pci, int* out_disks, int* out_ctrl) 
         HwLine l = newline();
         l.s("  AHCI 控制器：未找到（没有任何 class 01/06 prog-if 01 的控制器）");
     }
+    // ★ item 6：NVMe 控制器真实状态（PCI 位置 / BAR0 / 队列深度 / 命名空间数 / 型号）
+    if (nv->found) {
+        HwLine l = newline();
+        l.s("  NVMe 控制器 "); l.u(nv->bus); l.s(":"); l.u(nv->dev); l.s("."); l.u(nv->fn);
+        l.s("  bar0=0x"); l.h16(nv->bar0);
+        l.s("  qd="); l.u((uint64_t)nv->qd);
+        l.s("  命名空间="); l.u((uint64_t)nv->ns_count);
+        l.s("  ");
+        l.s(nv->model[0] ? nv->model : "(no model)");
+    } else {
+        HwLine l = newline();
+        l.s(pci.nvme > 0
+            ? "  NVMe：有 class 01/08 控制器但本系统没初始化成功（看串口 [NVME64] 行）"
+            : "  NVMe：未检测到（没有 class 01/08 prog-if 02 的控制器）");
+    }
     int listed = 0;
     for (int i = 0; i < n; i++) {
         if (listed >= 8) {
@@ -315,7 +350,7 @@ static void hwui_storage_lines(const HwPci& pci, int* out_disks, int* out_ctrl) 
             break;
         }
         HwLine l = newline();
-        l.s(rows[i].bus == 0 ? "  PATA " : "  AHCI ");
+        l.s(rows[i].bus == 2 ? "  NVMe " : (rows[i].bus == 1 ? "  AHCI " : "  PATA "));
         if (rows[i].drive >= 0) { l.s("drive"); l.u((uint64_t)rows[i].drive); } else { l.s("no-drive"); }
         if (rows[i].bus == 1) { l.s(" port"); l.u((uint64_t)rows[i].port); }
         l.s("  ");
@@ -327,15 +362,7 @@ static void hwui_storage_lines(const HwPci& pci, int* out_disks, int* out_ctrl) 
     }
     if (n == 0) {
         HwLine l = newline();
-        l.s("  未检测到任何 ATA/SATA 盘（查接线；BIOS 的 SATA 模式见真机验证指南）");
-    }
-    if (pci.nvme > 0) {
-        HwLine l = newline();
-        l.s("  NVMe：检测到 "); l.u((uint64_t)pci.nvme);
-        l.s(" 个控制器（class 01/08）-> 本系统**不支持 NVMe**，请用 AHCI(SATA)/IDE");
-    } else {
-        HwLine l = newline();
-        l.s("  NVMe：未检测到");
+        l.s("  未检测到任何 ATA/SATA/NVMe 盘（查接线；BIOS 的 SATA 模式见真机验证指南）");
     }
 }
 
@@ -558,7 +585,8 @@ int hwui64_build64() {
     }
     {
         HwLine l = newline();
-        l.s("  边界：NVMe / USB 存储 / EHCI-xHCI 键鼠 / USB hub / Secure Boot 签名 均**不支持**");
+        l.s("  边界（如实）：USB 存储 / EHCI-xHCI 键鼠 / USB hub / Secure Boot 签名 均**不支持**；");
+        l.s("NVMe 支持 = 单控制器/单队列/轮询/512B LBA");
     }
 
     g_line_count = g_li;

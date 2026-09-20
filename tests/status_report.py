@@ -921,6 +921,59 @@ def cap_ahci_sata():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_nvme_driver():
+    """★ item 6：最小 NVMe 驱动（轮询式）+ 接入磁盘层（驱动器号 16..）：能装到 NVMe 盘、
+    UEFI 能从这块盘启动进桌面。"""
+    if not (exists("kernel/nvme64.cpp") and exists("kernel/nvme64.h")):
+        return "MISSING", ["kernel/nvme64.{cpp,h} 不存在（没有 NVMe 驱动）"]
+    ev = []
+    ev.append("kernel/nvme64.cpp %d 行；kernel/nvme64.h %d 行"
+              % (lines("kernel/nvme64.cpp"), lines("kernel/nvme64.h")))
+    cls = grep_count(r"cc >> 24|cc >> 16|cc >> 8", ["kernel/nvme64.cpp"])
+    cc = grep_count(r"NVME_CC|NVME_CSTS|NVME_AQA|NVME_ASQ|NVME_ACQ|6u << 16|4u << 20",
+                    ["kernel/nvme64.cpp"])
+    ev.append("PCI class 0x01 / subclass 0x08 / prog-if 0x02（class_code 0x010802）匹配：命中 %d；"
+              "BAR0 64 位 MMIO（0x10 + 高 32 位 0x14）：命中 %d"
+              % (cls, grep_count(r"bar0_lo|0x14|bar0_hi", ["kernel/nvme64.cpp"])))
+    ev.append("控制器初始化（CSTS.RDY -> INTMS 全屏蔽 -> AQA -> ASQ/ACQ -> CC：CSS/MPS/IOSQES/IOCQES/EN）"
+              "：命中 %d" % cc)
+    ev.append("Admin 队列（Identify Controller CNS=0x01 / Identify Namespace CNS=0x00 / Create I/O CQ+SQ）：命中 %d"
+              % grep_count(r"NVME_CNS_CTRL|NVME_CNS_NS|NVME_OP_IDENTIFY|NVME_OP_CREATE_CQ|NVME_OP_CREATE_SQ",
+                           ["kernel/nvme64.cpp"]))
+    ev.append("I/O（Read 0x02 / Write 0x01、NLB 0-based、PRP1 + PRP2 直接指针/PRP 列表、"
+              "SQ tail/CQ head 门铃、CQ phase 位轮询、g_ticks64 + 自旋双超时）：命中 %d"
+              % grep_count(r"NVME_OP_WRITE|NVME_OP_READ|cmd\[12\]|nvme_doorbell|0x00010000u|"
+                           r"nvme_timeout_log|NVME64_SPIN_GUARD", ["kernel/nvme64.cpp"]))
+    ev.append("串口打点 [NVME64] pci / cc=…rdy=1 / ctrl model= / nsid=1 / queue sq= / read/write lba= / "
+              "timeout stage= / selftest / not found：命中 %d"
+              % grep_count(r"\[NVME64\]", ["kernel/nvme64.cpp"]))
+    disp = grep_count(r"ATA64_NVME_BASE|nvme64_read64|nvme64_write64|nvme64_info64|nvme64_count64",
+                      ["kernel/ata64.cpp", "kernel/ata64.h"])
+    ev.append("ata64.cpp/.h 后端分派（驱动器号 16.. -> nvme64_*，上层 vfs64/store64 的 weak 引用不用改）："
+              "命中 %d" % disp)
+    ev.append("枚举接口把 NVMe 命名空间算进槽位（ata64_drive_count64 / slot_to_drive64）+ "
+              "安装程序磁盘表覆盖到 ATA64_MAX_DRIVE64：命中 %d"
+              % (grep_count(r"nvme64_count64|ATA64_NVME_BASE", ["kernel/ata64.cpp"])
+                 + grep_count(r"ATA64_MAX_DRIVE64", ["kernel/setup64.cpp"])))
+    ev.append("报告页显示真实状态（不再写\"不支持\"）：hwui64.cpp 里的 NVMe 行命中 %d"
+              % grep_count(r"NVME64_MAX_NS|nvme64_ctrl64|NVMe 控制器", ["kernel/hwui64.cpp"]))
+    ev.append("验收脚本 tests/nvme64_test.py：%s（QEMU NVMe 盘：识别 -> 完整安装 -> "
+              "UEFI(OVMF) 从该盘启动进桌面 + BIOS 如实测）"
+              % ("有" if exists(os.path.join("tests", "nvme64_test.py")) else "缺"))
+    ev.append("实测串口：[NVME64] pci 0:4.0 bar0=0x… cap=0x… vs=0x…、[NVME64] cc=0x460001 csts=0x1 rdy=1、"
+              "[NVME64] ctrl model=QEMU NVMe Ctrl sn=deadbeef、[NVME64] nsid=1 lba_bytes=512 sectors=131072、"
+              "[NVME64] queue sq=0x… cq=0x… qd=8、[DISK] 16 … bus=NVMe、[PART] 新建分区表 OK drive=16、"
+              "[NVME64] write lba=0 count=1 ok、[NVME64] selftest PASS；UEFI 从 NVMe 盘："
+              "U:loaded KERNEL64.BIN -> [OS] booted from installed disk -> [GUI64] ready")
+    ev.append("边界（如实）：单控制器/单 I/O 队列对（QD=8）/单命名空间 NSID=1/全程轮询（无中断/MSI-X）/"
+              "只支持 512B 逻辑块/单条命令 ≤ 128 扇区（64KB）；BIOS 从 NVMe 启动取决于固件"
+              "（QEMU 11.1 的 SeaBIOS 实测支持，真机需按 docs/真机验证指南.md 复验）")
+    done = bool(lines("kernel/nvme64.cpp") > 400 and disp
+                and grep_count(r"\[NVME64\]", ["kernel/nvme64.cpp"])
+                and exists(os.path.join("tests", "nvme64_test.py")))
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 def cap_hw_report():
     """★ item 5a：屏幕硬件检查报告（真机没有串口 -> 屏幕是唯一诊断手段）。"""
     if not (exists("kernel/hwui64.cpp") and exists("kernel/hwui64.h")):
@@ -941,7 +994,7 @@ def cap_hw_report():
                  grep_count(r"hwui64_(draw|build)64", ["kernel/settings64.cpp"])))
     ev.append("验收脚本 tests/ahci64_test.py 里的报告断言（打点 + 截图像素：黑底/区块色块/文字）：%s"
               % ("有" if exists(os.path.join("tests", "ahci64_test.py")) else "缺"))
-    ev.append("实测串口：\"[HWUI] report lines=32 storage=1 controllers=2\"、"
+    ev.append("实测串口：\"[HWUI] report lines=34 storage=3 controllers=3\"、"
               "\"[HWUI] report shown ms=5000 skipped=0\"、\"[HWUI] selftest PASS\"；"
               "像素断言通过（black=13686/20400、band=5866、light=436）")
     done = bool(lines("kernel/hwui64.cpp") > 200
@@ -952,6 +1005,8 @@ def cap_hw_report():
 CAPS = [
     ("存储", "★ AHCI(SATA) 驱动（PCI 找控制器 + ABAR + 端口/命令表/PRDT + 轮询 DMA；QEMU 上命令未被执行，见证据行）",
      cap_ahci_sata),
+    ("存储", "★ NVMe 驱动（PCI 0x010802 → BAR0/64 位 MMIO → admin/I-O 队列 → 轮询 PRP 读写；"
+             "可装到 NVMe 盘、UEFI 能从此盘启动）", cap_nvme_driver),
     ("平台", "★ 真机硬件检查报告（屏幕诊断页：启动期 / 向导无盘 / 设置页三处展示）", cap_hw_report),
     ("内核", "纯 64 位内核（长模式、EFER.LMA）", cap_kernel64),
     ("内核", "全 64 位约束（16/32 位只在引导必经阶段）", cap_abi64),
@@ -991,6 +1046,8 @@ TESTS = [
     ("ahci64_test.py", "★ item 5a：AHCI(SATA) 控制器/端口/签名 + 屏幕硬件检查报告（打点 + 像素）"),
     ("mouse_parse_test.py", "PS/2 鼠标解码 + 位移限速（纯 Python 复放）"),
     ("ahci64_test.py", "★ item 5a：AHCI(SATA) 控制器/端口/签名 + 屏幕硬件检查报告（打点 + 像素）"),
+    ("nvme64_test.py", "★ item 6：NVMe 驱动（识别/自检/打点）+ 完整安装到 NVMe 盘（drive=16/ESP FAT32/GPT）"
+                       " + UEFI(OVMF) 从该盘启动进桌面 + BIOS 如实测"),
     ("disk_boot_test.py", "★ 引导层改 BIOS INT 13h 读盘：只挂 AHCI 的装好盘直启进桌面 + 截断盘失败路径打点停机"),
     ("install_flow_test.py", "端到端安装 + 装完单独启动（引导层走 BIOS INT 13h）"),
     ("partition_ops_test.py", "新建/格式化/删除 真实写盘"),
