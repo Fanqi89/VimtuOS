@@ -22,6 +22,13 @@
          KERNEL64.BIN         == build64/kernel64_os.bin（补零到 4MB 内核区）
   4) **UEFI（OVMF）从这块装好的盘启动** -> "[OS] booted from installed disk" + "[GUI64] ready"
   5) **BIOS（SeaBIOS）从同一块盘启动** -> 同样进系统（这就是"新老设备都能启动"的直接证据）
+  6) **小盘 PATA 回归（128MB PATA 目标盘）**：同样走完安装，断言
+     "[INSTALL] esp: … clusters=96736 fat_ok=1"、无 "[FAT64] FAIL fat-write"、无
+     "irq14 timeout -> fallback"、FSInfo 有效、三个文件与构建产物逐字节一致、
+     fat_check.py 通过，并且装好的这块 PATA 盘在 UEFI 下能启动到桌面。
+     （背景：批次 K 后实测 128MB PATA 盘上写 ESP 必失败 —— fat64 的 FAT 表一次写 768
+     扇区，被 PATA 8 位扇区计数寄存器截成 0(=256)，设备提前结束命令；修复见
+     kernel/ata64.cpp 的"PATA PIO 分块"总说明。这条断言就是防它回归。）
 
 用法：python tests/esp_install_test.py [--qemu ...] [--target ...] [--keep]
 退出码：0 全部通过 / 1 有断言失败 / 2 环境问题
@@ -55,6 +62,10 @@ PART_BOOT_LBA, PART_BOOT_SECS = 9, 8000
 PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS        # 8009
 ESP_SECTORS_EXPECT = 98304                            # kernel/part64.h 的 PART_ESP_SECTORS（48MB）
 GPT_BACKUP = 33
+PATA_TARGET_SECTORS = 262144     # 128MB（小盘 PATA 回归：同样放 4MB 引导区 + 48MB ESP）
+PATA_ESP_START_EXPECT = PATA_TARGET_SECTORS - GPT_BACKUP - ESP_SECTORS_EXPECT   # 163807
+PATA_FATSZ_EXPECT = 768          # 98304 扇区的 FAT32 卷：FATSz32 = 768（PATA 8 位计数的受害者）
+PATA_CLUSTERS_EXPECT = 96736
 GPT_TYPE_ESP = bytes.fromhex("28732ac1" "1ff8" "d211" "ba4b" "00a0c93ec93b")
 GPT_TYPE_BASIC = bytes.fromhex("a2a0d0eb" "e5b9" "3344" "87c0" "68b6b72699c7")
 
@@ -98,16 +109,24 @@ class Monitor:
             s.close()
 
 
-def run_install(qemu, target, serial, port, dwell=1.2):
-    """ISO 当 IDE 盘 + 目标盘挂 AHCI：注入按键走完安装。返回 (日志, 是否自动重启)。"""
+def run_install(qemu, target, serial, port, dwell=1.2, bus="ahci"):
+    """ISO 当 IDE 主盘 + 目标盘（bus=ahci 挂 8 号 AHCI 盘 / bus=pata 挂 1 号 IDE 盘）：
+    注入按键走完安装。返回 (日志, 是否自动重启)。"""
     if os.path.exists(serial):
         os.remove(serial)
     args = [
         qemu, "-name", "VimtuOS-esp-install",
         "-drive", "format=raw,file=%s,index=0,media=disk" % q(MEDIUM),
-        "-device", "ich9-ahci,id=ahci",
-        "-drive", "file=%s,if=none,id=d0,format=raw" % q(target),
-        "-device", "ide-hd,drive=d0,bus=ahci.0",
+    ]
+    if bus == "pata":
+        # 小盘 PATA 回归：目标盘 = IDE 从盘（驱动器号 1）。向导的"默认目标行"逻辑
+        # （跳过安装介质盘）与 AHCI 场景一致，所以按键序列不用改。
+        args += ["-drive", "file=%s,index=1,media=disk,format=raw" % q(target)]
+    else:
+        args += ["-device", "ich9-ahci,id=ahci",
+                 "-drive", "file=%s,if=none,id=d0,format=raw" % q(target),
+                 "-device", "ide-hd,drive=d0,bus=ahci.0"]
+    args += [
         "-boot", "order=c", "-m", "512", "-vga", "std", "-display", "none",
         "-serial", "file:%s" % q(serial),
         "-monitor", "telnet:127.0.0.1:%d,server,nowait" % port,
@@ -557,6 +576,98 @@ def main():
           "[OS] booted from installed disk" in bios_log)
     check("★ [GUI64] ready（BIOS 进桌面）", "[GUI64] ready" in bios_log)
     check("BIOS 启动无 PANIC/三重故障", not any(x in bios_log for x in FORBIDDEN))
+
+    # ------------------------------------------------------------------
+    # 7) ★ 小盘 PATA 回归（批次 K 后补）：128MB PATA 目标盘上 ESP 必须写得进去。
+    #    根因与修复见 kernel/ata64.cpp 的"PATA PIO 分块"总说明：
+    #    fat64 的 write_fats 一条命令交 768 个扇区，PATA 8 位扇区计数寄存器把
+    #    768&0xFF=0 当成 256，设备搬完 256 个扇区就结束命令 -> 主机死等 DRQ ->
+    #    `[FAT64] FAIL fat-write`。修复 = PATA PIO 按 ≤128 扇区分块 + 每块重试。
+    # ------------------------------------------------------------------
+    print("=== 7) ★ 小盘 PATA 回归：128MB PATA 目标盘（%d 扇区）===" % PATA_TARGET_SECTORS)
+    pata_target = os.path.join(ROOT, "target-esp-pata.img")
+    pata_serial = os.path.join(ROOT, "esp_pata_serial.log")
+    with open(pata_target, "wb") as f:
+        f.write(b"\0" * (PATA_TARGET_SECTORS * SECTOR))
+    plog, preboot = run_install(qemu, pata_target, pata_serial, args.port + 1, bus="pata")
+
+    check("128MB PATA：FAT32 写入器自检 PASS", "[FAT64] selftest PASS" in plog)
+    check("★ 128MB PATA：ESP 格式化成功（lba=%d sectors=%d clusters=%d fat_ok=1）"
+          % (PATA_ESP_START_EXPECT, ESP_SECTORS_EXPECT, PATA_CLUSTERS_EXPECT),
+          "[INSTALL] esp: lba=%d" % PATA_ESP_START_EXPECT in plog
+          and "sectors=%d" % ESP_SECTORS_EXPECT in plog and "fs=FAT32" in plog
+          and "clusters=%d" % PATA_CLUSTERS_EXPECT in plog and "fat_ok=1" in plog,
+          [l for l in plog.splitlines() if "[INSTALL] esp:" in l][:1])
+    check("128MB PATA：没有 FAT/文件写入失败打点（历史缺陷的直接回归点）",
+          "FAIL fat-write" not in plog and "FAIL file: data write" not in plog
+          and "FAIL fsinfo" not in plog)
+    check("128MB PATA：写路径没有 irq14 超时回退（8 位计数不再被截断）",
+          "irq14 timeout" not in plog)
+    check("128MB PATA：ESP 三文件写入打点（BOOTX64.EFI/UEFI64.BIN/KERNEL64.BIN）",
+          "[INSTALL] esp files: BOOTX64.EFI=" in plog and "UEFI64.BIN=" in plog
+          and "KERNEL64.BIN=" in plog,
+          [l for l in plog.splitlines() if "[INSTALL] esp files:" in l][:1])
+    check("128MB PATA：安装完成并自动重启", "[INSTALL] 完成：已写" in plog and preboot)
+    check("128MB PATA：无 PANIC / 三重故障", not any(x in plog for x in FORBIDDEN))
+
+    with open(pata_target, "rb") as f:
+        pdisk = f.read()
+    pmbr = mbr_entries(pdisk[0:SECTOR])
+    check("128MB PATA：MBR 55AA + P3 = ESP 0xEF（%d 扇区，盘尾）" % ESP_SECTORS_EXPECT,
+          pdisk[510] == 0x55 and pdisk[511] == 0xAA and pmbr[2]["type"] == 0xEF
+          and pmbr[2]["start"] == PATA_ESP_START_EXPECT
+          and pmbr[2]["sectors"] == ESP_SECTORS_EXPECT
+          and pmbr[2]["start"] + pmbr[2]["sectors"] == PATA_TARGET_SECTORS - GPT_BACKUP,
+          "%s" % (pmbr[2],))
+    pgpt, perr = parse_gpt_backup(pdisk)
+    check("128MB PATA：盘尾备份 GPT（头/项数组 CRC 正确）", pgpt is not None, perr)
+    pstart, psecs = pmbr[2]["start"], pmbr[2]["sectors"]
+    pesp = pdisk[pstart * SECTOR:(pstart + psecs) * SECTOR]
+    pfat = Fat32(pesp)
+    check("128MB PATA：ESP 是真 FAT32（簇数 %d >= 65525；FATSz32=%d）"
+          % (pfat.clusters, PATA_FATSZ_EXPECT),
+          pfat.clusters == PATA_CLUSTERS_EXPECT and pfat.fatsz == PATA_FATSZ_EXPECT)
+    check("128MB PATA：BPB 自洽（FATSz16=0 / RootClus=2 / FSInfo=1 / BkBootSec=6）",
+          pfat.fatsz16 == 0 and pfat.root_clus == 2 and pfat.fsinfo_sec == 1
+          and pfat.bkboot == 6)
+    check("128MB PATA：两份 FAT 逐字节一致",
+          pesp[pfat.fat_off:pfat.fat_off + pfat.fatsz * 512]
+          == pesp[pfat.fat_off + pfat.fatsz * 512:pfat.fat_off + 2 * pfat.fatsz * 512])
+    pfi = pfat.fsinfo()
+    check("★ 128MB PATA：FSInfo 有效（0x41615252/0x61417272/0xAA550000 + free=%d next=%d）"
+          % (pfi["free"], pfi["next"]),
+          pfi["lead"] == 0x41615252 and pfi["struc"] == 0x61417272
+          and pfi["trail"] == 0xAA550000 and pfi["sig55"]
+          and 0 < pfi["free"] <= pfat.clusters and 2 <= pfi["next"] <= pfat.clusters + 1)
+    check("128MB PATA：备份引导扇区逐字节等于 0 号扇区",
+          pesp[pfat.bkboot * 512:(pfat.bkboot + 1) * 512] == pesp[0:512])
+    pefi = pfat.find(["EFI", "BOOT", "BOOTX64.EFI"])
+    pu = pfat.find(["UEFI64.BIN"])
+    pk = pfat.find(["KERNEL64.BIN"])
+    check("★ 128MB PATA：ESP 三个文件与构建产物逐字节一致",
+          pefi is not None and pu is not None and pk is not None
+          and pfat.read_file(pefi)[0] == stub_ref
+          and pfat.read_file(pu)[0] == uefi_ref
+          and pfat.read_file(pk)[0] == kregion)
+    with tempfile.TemporaryDirectory(prefix="vimtu_pata_esp_") as td:
+        pimg = os.path.join(td, "esp.img")
+        with open(pimg, "wb") as f:
+            f.write(pesp)
+        pr = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "fat_check.py"), pimg],
+                            capture_output=True, timeout=120)
+        pout = pr.stdout.decode("utf-8", "replace")
+        if "\u6ca1\u53d1\u73b0\u660e\u663e\u95ee\u9898" not in pout:
+            pout = pr.stdout.decode("gbk", "replace")
+        check("128MB PATA：fat_check.py 规范体检（FAT32 + 三个文件 + 没发现明显问题）",
+              pr.returncode == 0 and "文件系统=FAT32 簇数=" in pout
+              and "BOOTX64.EFI" in pout and "KERNEL64.BIN" in pout and "UEFI64.BIN" in pout
+              and "没发现明显问题" in pout)
+    puefi = boot_disk(qemu, pata_target, os.path.join(ROOT, "esp_pata_uefi.log"),
+                      "esp-pata-uefi", ovmf=ovmf)
+    check("★ 128MB PATA：装好的盘 UEFI（OVMF）能启动到桌面",
+          "U:loaded KERNEL64.BIN" in puefi and "[OS] booted from installed disk" in puefi
+          and "[GUI64] ready" in puefi)
+    check("128MB PATA：UEFI 启动无 PANIC/三重故障", not any(x in puefi for x in FORBIDDEN))
 
     print("=== ESP/双固件 RESULT: %s ===" % ("PASS" if ok else "FAIL"))
     if not ok:

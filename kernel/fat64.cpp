@@ -173,7 +173,12 @@ static bool write_fsinfo(void) {
     return true;
 }
 
-// 把两份 FAT 表都写出去（每次分配后调用；48MB 卷 = 756 扇区/份）
+// 把两份 FAT 表都写出去（每次分配后调用；48MB 卷 = 768 扇区/份）。
+// ★ 这里**故意**一次交出整个 FAT（最多 FAT64_MAX_FAT_SECTORS = 2048 扇区）：ATA 的 8 位
+//   扇区计数寄存器装不下 >255 的计数，分块由 ata64_write 内部统一做（≤128 扇区/命令 +
+//   每块重试）。历史上的真缺陷就是"这里一次要 768 个扇区、PATA 路径把 768 截成 0(=256)"
+//   -> 设备只搬 256 个扇区就结束命令、主机死等 DRQ -> `[FAT64] FAIL fat-write`；
+//   修复在驱动层（见 kernel/ata64.cpp 的 PATA PIO 分块总说明），本函数语义不变。
 static bool write_fats(void) {
     const uint32_t bytes = g_fatsz * FAT64_SECTOR;
     if (bytes > sizeof(g_fat)) { log_fail("fat-size"); return false; }

@@ -270,14 +270,26 @@ bool ata64_identify(int drive, DiskInfo* out) {
     return true;
 }
 
-// ---------------- READ ----------------
-bool ata64_read(int drive, uint32_t lba, uint32_t count, void* buf) {
-    // ★ 分派：驱动器号 16.. -> NVMe 命名空间读（内部按 128 扇区分块）；
-    //          8..15 -> AHCI(SATA) DMA 读（LBA48）
-    if (drive >= ATA64_NVME_BASE) return nvme64_read64(drive - ATA64_NVME_BASE, lba, count, buf);
-    if (drive >= ATA64_AHCI_BASE) return ahci64_read64(drive - ATA64_AHCI_BASE, lba, count, buf);
-    if (drive < 0 || drive > 3) return false;   // 4..7 保留空洞
-    if (count == 0) return true;
+// ==================== PATA PIO 分块（单条命令 ≤128 扇区）+ 每块重试 ====================
+// ★ 为什么必须有这一层（批次 K 之后补的真缺陷，已在 128MB/64MB PATA 目标盘上复现）：
+//   PATA 的扇区计数寄存器（io+2，0x1F2/0x172）只有 **8 位**：0..255，其中 0 表示 256。
+//   fat64 写 48MB ESP 时 write_fats 一条命令要写 g_fatsz = 768 个扇区：768 & 0xFF = 0
+//   -> 设备按"256 个扇区"执行，搬完就结束命令；主机却还在等第 257 个扇区的 DRQ ——
+//   先撞 IRQ14 的 160ms 超时回退轮询，再轮询 200 万次后放弃。实测症状：
+//   `[FAT64] FAIL fat-write` + `[ATA64] irq14 timeout -> fallback to polling`；
+//   128MB 与 64MB PATA 目标盘**都**必失败，而 AHCI 目标盘全容量都正常（ahci64 内部
+//   本来就按 128 扇区分块、CFIS 的计数字段是 16 位）→ 根因在**接口**，不在容量。
+//   修法：把"一条 PATA 命令"封成 *_once（≤128 扇区），对外仍是 count 不限的接口：
+//   自动分块 + 每块最多 ATA64_PIO_RETRY 次重试。128 扇区 = 64KB，与 ahci64 的分块、
+//   part64 安装载荷的块大小一致（安装器在 PATA 盘上实测走通的正是这条 128 扇区路径）。
+//   为什么这样不会再失败：每条命令的计数值都落在 8 位寄存器可表示的范围（1..128），
+//   设备与主机的"还剩多少个扇区"始终一致；偶发失败也只重发当前这一块，语义不变。
+static const uint32_t ATA64_PIO_MAX_SECTORS = 128;
+static const int      ATA64_PIO_RETRY       = 3;
+
+// ---------------- READ（单条 PATA PIO 命令；count 1..128）----------------
+// ★ 不变量：本函数只允许 1..128 —— 由 ata64_read 的分块循环保证（见上面的总说明）。
+static bool ata_pio_read_once(int drive, uint32_t lba, uint32_t count, void* buf) {
     const uint16_t io = base_port(drive);
     // ★ 踩坑记录：必须**先选盘再等状态**。状态寄存器反映的是"当前选中的驱动器"，
     //   而前一次操作（枚举循环/另一个驱动器的命令）会把别的驱动器留在选中状态：
@@ -317,13 +329,31 @@ bool ata64_read(int drive, uint32_t lba, uint32_t count, void* buf) {
     return true;
 }
 
-// ---------------- WRITE ----------------
-bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf) {
-    // ★ 分派同 ata64_read：16.. -> NVMe、8..15 -> AHCI(SATA) DMA 写
-    if (drive >= ATA64_NVME_BASE) return nvme64_write64(drive - ATA64_NVME_BASE, lba, count, buf);
-    if (drive >= ATA64_AHCI_BASE) return ahci64_write64(drive - ATA64_AHCI_BASE, lba, count, buf);
+// READ 对外入口：分派 + 分块 + 每块重试（语义与改动前一致；>128 扇区不再被 8 位寄存器截断）
+bool ata64_read(int drive, uint32_t lba, uint32_t count, void* buf) {
+    // ★ 分派：驱动器号 16.. -> NVMe 命名空间读（内部按 128 扇区分块）；
+    //          8..15 -> AHCI(SATA) DMA 读（LBA48）
+    if (drive >= ATA64_NVME_BASE) return nvme64_read64(drive - ATA64_NVME_BASE, lba, count, buf);
+    if (drive >= ATA64_AHCI_BASE) return ahci64_read64(drive - ATA64_AHCI_BASE, lba, count, buf);
     if (drive < 0 || drive > 3) return false;   // 4..7 保留空洞
     if (count == 0) return true;
+    uint8_t* p = (uint8_t*)buf;
+    for (uint32_t done = 0; done < count; ) {
+        uint32_t n = count - done;
+        if (n > ATA64_PIO_MAX_SECTORS) n = ATA64_PIO_MAX_SECTORS;
+        bool ok = false;
+        for (int t = 0; t < ATA64_PIO_RETRY && !ok; t++) {
+            ok = ata_pio_read_once(drive, lba + done, n, p + (uint32_t)done * 512u);
+        }
+        if (!ok) return false;
+        done += n;
+    }
+    return true;
+}
+
+// ---------------- WRITE（单条 PATA PIO 命令；count 1..128）----------------
+// ★ 不变量：本函数只允许 1..128 —— 由 ata64_write 的分块循环保证（见上面的总说明）。
+static bool ata_pio_write_once(int drive, uint32_t lba, uint32_t count, const void* buf) {
     const uint16_t io = base_port(drive);
     // 同 ata64_read：先选盘再等状态
     outb((uint16_t)(io + 6), (uint8_t)(drive_select(drive) | ((lba >> 24) & 0x0F)));
@@ -346,6 +376,27 @@ bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf) {
     }
     // 等写完成（BSY=0 且 DRQ=0）
     if (!ata_wait_done_irq(drive)) return false;   // 中断唤醒；超时自动回退轮询
+    return true;
+}
+
+// WRITE 对外入口：分派 + 分块 + 每块重试（语义与改动前一致；>128 扇区不再被 8 位寄存器截断）
+bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf) {
+    // ★ 分派同 ata64_read：16.. -> NVMe、8..15 -> AHCI(SATA) DMA 写
+    if (drive >= ATA64_NVME_BASE) return nvme64_write64(drive - ATA64_NVME_BASE, lba, count, buf);
+    if (drive >= ATA64_AHCI_BASE) return ahci64_write64(drive - ATA64_AHCI_BASE, lba, count, buf);
+    if (drive < 0 || drive > 3) return false;   // 4..7 保留空洞
+    if (count == 0) return true;
+    const uint8_t* p = (const uint8_t*)buf;
+    for (uint32_t done = 0; done < count; ) {
+        uint32_t n = count - done;
+        if (n > ATA64_PIO_MAX_SECTORS) n = ATA64_PIO_MAX_SECTORS;
+        bool ok = false;
+        for (int t = 0; t < ATA64_PIO_RETRY && !ok; t++) {
+            ok = ata_pio_write_once(drive, lba + done, n, p + (uint32_t)done * 512u);
+        }
+        if (!ok) return false;
+        done += n;
+    }
     return true;
 }
 

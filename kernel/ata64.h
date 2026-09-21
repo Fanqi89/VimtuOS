@@ -45,9 +45,10 @@ struct DiskInfo {
 //        8..=AHCI 盘、16..=NVMe 命名空间（见上面的统一驱动器号说明）；4..7 是保留空洞，调用必失败。
 bool ata64_identify(int drive, DiskInfo* out);
 
-// 读写：PATA 侧 LBA28、count ≤ 255；AHCI 侧 LBA48、count ≤ 65536（按 128 扇区分块）；
-// NVMe 侧 count 任意（内部按 128 扇区 = 64KB 分块）。驱动器号分派：
-// ≥ ATA64_NVME_BASE 走 nvme64_*，≥ ATA64_AHCI_BASE 走 ahci64_*。返回 false 表示出错。
+// 读写：PATA 侧 LBA28、count **任意**（内部按 ≤128 扇区分块 + 每块最多 3 次重试 —— ATA 的
+//   扇区计数寄存器只有 8 位，一条命令 >255 个扇区会被设备静默截断；见 ata64.cpp 的总说明）；
+//   AHCI 侧 LBA48、count ≤ 65536（按 128 扇区分块）；NVMe 侧 count 任意（按 128 扇区分块）。
+//   驱动器号分派：≥ ATA64_NVME_BASE 走 nvme64_*，≥ ATA64_AHCI_BASE 走 ahci64_*。返回 false 表示出错。
 bool ata64_read (int drive, uint32_t lba, uint32_t count, void* buf);
 bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf);
 

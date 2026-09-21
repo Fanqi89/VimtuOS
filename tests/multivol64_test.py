@@ -8,19 +8,23 @@
   B) 数据盘：**宿主侧 Python 造第二个 VimtuFS2 卷**（32MB 盘，@8192，v3），预置
      /docs（目录）、/docs/notes.txt（文件）、/readme.txt（文件）——宿主侧写盘，见 Vfs3Builder。
   C) 多卷端到端（装好的系统盘 + 数据盘）：
-     * [DRV64] letter=C: / letter=D: 都有；D: 分到 slot=1；[VFS64] slots ... used=2
-     * 终端 `vol D:` -> [DRV64] activate letter=D: slot=1 ... ok；`ls` 列出 /docs + /readme.txt；
-       `cat /readme.txt` 读回预置内容；在 D: 上 mkdir + write 成功（[FD64] open/write 真路径）
-     * 切回 `vol C:` -> C: 的预置文件（/hello.vap）还在、哨兵文件内容正确；D: 的哨兵/目录在 C: 上不存在
-       （**双卷独立**）；宿主侧解析两张镜像逐字节确认
-     * Explorer（鼠标注入）：双击 D: 卡片 -> [UI] explorer enter letter=D: slot=1 ok items=2 +
+     * [DRV64] letter=C:（系统卷 slot=0）/ letter=D:（盘尾 ESP，FAT32 ro=1）/ 数据盘盘符
+       **动态定位**（批次 K 起 ESP 也占盘符：数据盘实际是 E:，见下面的 dl）；
+       [VFS64] slots ... used=2
+     * 终端 `vol <数据盘盘符>` -> [DRV64] activate letter=…: slot=1 ... ok；`ls` 列出
+       /docs + /readme.txt；`cat /readme.txt` 读回预置内容；在数据盘上 mkdir + write 成功
+       （[FD64] open/write 真路径）
+     * 切回 `vol C:` -> C: 的预置文件（/hello.vap）还在、哨兵文件内容正确；数据盘的哨兵/目录在
+       C: 上不存在（**双卷独立**）；宿主侧解析两张镜像逐字节确认
+     * Explorer（鼠标注入）：双击数据盘卡片 -> [UI] explorer enter letter=…: slot=1 ok items=2 +
        两个条目的打点 + 内容区像素；经"此电脑"面包屑回退 -> 双击 C: 卡片 -> enter letter=C: slot=0 ok
-     * ★ 写卷安全：当前卷 = D: 时改配置（`store set` + `set startup.health`）触发 config64 的 3 秒
+     * ★ 写卷安全：当前卷 = 数据盘时改配置（`store set` + `set startup.health`）触发 config64 的 3 秒
        自动落盘 -> 等 8 秒 -> 断言 [CONF64] autosave ok + [STORE64] flush via=vfs；**宿主侧**：
-       C: 的 /store.a 能解析且含新键（内容正确）；D: 镜像在整个窗口内**逐字节相同**
+       C: 的 /store.a 能解析且含新键（内容正确）；数据盘镜像在整个窗口内**逐字节相同**
      * 坏情况：vol Z:/vol A: -> FAILED（不崩）；vol 1 -> usage
-  D) 卷表满：装好的盘 + 4 块 AHCI 数据盘（5 个可浏览卷 > VFS64_SLOT_MAX=4）-> 第 4 块盘
-     [DRV64] skip ... reason=voltable-full、没有 G:、[DRV64] selftest PASS、`vol G:` 被拒
+  D) 卷表满：装好的盘 + 4 块 AHCI 数据盘（4 个 VimtuFS2 槽 + 1 个 FAT32 ESP = 5 个可浏览卷，
+     超过 VFS64_SLOT_MAX=4）-> 第 4 块盘 [DRV64] skip ... reason=voltable-full、没有 H:、
+     [DRV64] selftest PASS、`vol H:` 被拒
   E) 全部阶段禁止 PANIC / TRIPLE FAULT / FAILED mask= / selftest FAIL
 
 用法：py -3 tests\\multivol64_test.py [--qemu 路径] [--keep]
@@ -361,7 +365,7 @@ def back_to_thispc(vm, mon, tries=3):
 
 
 def card_idx_of(log, letter):
-    """从 [UI] explorer card idx=<i> letter=D: 里取 D: 卡片的格子号（不硬编码排序）。"""
+    """从 [UI] explorer card idx=<i> letter=<L>: 里取该盘符卡片的格子号（不硬编码排序）。"""
     m = None
     for mm in re.finditer(r"\[UI\] explorer card idx=(\d+) letter=(.)", log):
         if mm.group(2) == letter:
@@ -481,15 +485,18 @@ def main():
               (re.search(r"\[VFS64\] slots[^\r\n]*", log3).group(0) if re.search(r"\[VFS64\] slots", log3) else "缺"))
         check("C: 有盘符且 slot=0",
               re.search(r"\[DRV64\] letter=C: disk=0 part=\d+ fs=VimtuFS2 total_kb=\d+ free_kb=\d+ slot=0", log3) is not None)
-        dm = re.search(r"\[DRV64\] letter=D: disk=1 part=1 fs=VimtuFS2 total_kb=(\d+) free_kb=(\d+) slot=1", log3)
-        check("D: 有盘符且 slot=1（数据盘真被挂成第二个卷）", dm is not None,
-              dm.group(0) if dm else "缺 [DRV64] letter=D: ... slot=1")
+        # ★ 批次 K 后的事实：盘尾 ESP（FAT32）也占盘符，所以数据盘不再是固定的 D:。
+        #   按 fs_tree_test.py 的做法**动态定位**：抓 disk=1 part=1 slot=1 的实际盘符。
+        dm = re.search(r"\[DRV64\] letter=(\w): disk=1 part=1 fs=VimtuFS2 total_kb=(\d+) free_kb=(\d+) slot=1", log3)
+        dl = dm.group(1) if dm else "D"        # 数据盘实际盘符（C=系统卷、D=ESP、数据盘顺延）
+        check("%s: 有盘符且 slot=1（数据盘真被挂成第二个卷）" % dl, dm is not None,
+              dm.group(0) if dm else "缺 [DRV64] letter=? disk=1 ... slot=1")
         if dm:
-            check("D: 容量 = 数据卷总块/2（%d KB）" % (DATA_MAIN_BLOCKS // 2),
-                  int(dm.group(1)) == DATA_MAIN_BLOCKS // 2, "total_kb=%s" % dm.group(1))
+            check("%s: 容量 = 数据卷总块/2（%d KB）" % (dl, DATA_MAIN_BLOCKS // 2),
+                  int(dm.group(2)) == DATA_MAIN_BLOCKS // 2, "total_kb=%s" % dm.group(2))
             exp_free = (dvol0["total"] - dvol0["data"]) - 2 if dvol0 else -1
-            check("D: 可用 = 数据区块数 - 预置占用的 2 块（%d KB）" % (exp_free // 2 if exp_free >= 0 else -1),
-                  exp_free >= 0 and int(dm.group(2)) == exp_free // 2, "free_kb=%s" % dm.group(2))
+            check("%s: 可用 = 数据区块数 - 预置占用的 2 块（%d KB）" % (dl, exp_free // 2 if exp_free >= 0 else -1),
+                  exp_free >= 0 and int(dm.group(3)) == exp_free // 2, "free_kb=%s" % dm.group(3))
         check("[DRV64] selftest PASS（多卷槽一致性 bit6 也过了）", "[DRV64] selftest PASS" in log3)
         check("[VFS64] multivol selftest ok（卷槽/切换/on64 守卫/表满拒绝）",
               "[VFS64] multivol selftest ok" in log3)
@@ -498,28 +505,28 @@ def main():
         # ---- 终端：vol 列表 / 切换 / 列目录 / 读 / 写 ----
         check("打开终端（[APP] term opened）", fst.open_terminal(mon, s3, vm.proc))
         mon.type_line("vol")
-        check("vol 列表：两个可浏览卷 + 当前是 C:",
-              vm.wait_log("[VOL] list n=2 current=C:", 20, since=0))
-        mon.type_line("vol d")
-        check("vol d 切卷成功（[DRV64] activate letter=D: slot=1 ... ok）",
-              vm.wait_log("[DRV64] activate letter=D: slot=1 disk=1 lba=8192 ok", 20) and
-              vm.wait_log("[VOL] switch letter=D: slot=1", 20))
-        check("切到 D: 后 vfs64 当前卷 = slot 1（[VFS64] activate slot=1 ...）",
+        check("vol 列表：三个可浏览卷（系统卷 + ESP + 数据卷）+ 当前是 C:",
+              vm.wait_log("[VOL] list n=3 current=C:", 20, since=0))
+        mon.type_line("vol %s" % dl.lower())
+        check("vol %s 切卷成功（[DRV64] activate letter=%s: slot=1 ... ok）" % (dl.lower(), dl),
+              vm.wait_log("[DRV64] activate letter=%s: slot=1 disk=1 lba=8192 ok" % dl, 20) and
+              vm.wait_log("[VOL] switch letter=%s: slot=1" % dl, 20))
+        check("切到 %s: 后 vfs64 当前卷 = slot 1（[VFS64] activate slot=1 ...）" % dl,
               re.search(r"\[VFS64\] activate slot=1 drive=1 start=\d+ blocks=\d+ version=3", vm.log()) is not None)
         mon.type_line("ls")
-        check("ls 列出 D: 的 /docs 与 readme.txt（[TERM] cmd ls entries=2）",
+        check("ls 列出 %s: 的 /docs 与 readme.txt（[TERM] cmd ls entries=2）" % dl,
               vm.wait_log("[TERM] cmd ls entries=2", 25))
         mon.type_line("cat /readme.txt")
-        check("cat /readme.txt 从 D: 读回（[TERM] cmd cat bytes=%d）" % len(README_TEXT),
+        check("cat /readme.txt 从 %s: 读回（[TERM] cmd cat bytes=%d）" % (dl, len(README_TEXT)),
               vm.wait_log("[TERM] cmd cat bytes=%d" % len(README_TEXT), 25))
         mon.type_line("cat /docs/notes.txt")
-        check("cat /docs/notes.txt 多级路径也在 D: 上（bytes=%d）" % len(NOTES_TEXT),
+        check("cat /docs/notes.txt 多级路径也在 %s: 上（bytes=%d）" % (dl, len(NOTES_TEXT)),
               vm.wait_log("[TERM] cmd cat bytes=%d" % len(NOTES_TEXT), 25))
         mon.type_line("df")
-        check("df 列出所有卷（[TERM] cmd df volumes=2 current=D:）",
-              vm.wait_log("[TERM] cmd df volumes=2 current=D:", 25))
+        check("df 列出所有卷（[TERM] cmd df volumes=3 current=%s:）" % dl,
+              vm.wait_log("[TERM] cmd df volumes=3 current=%s:" % dl, 25))
 
-        # ---- 双卷独立：切回 C: 写哨兵 -> 再切 D: 看它不在 ----
+        # ---- 双卷独立：切回 C: 写哨兵 -> 再切数据卷看它不在 ----
         mon.type_line("vol c")
         check("切回 C: 成功", vm.wait_log("[VOL] switch letter=C: slot=0", 20))
         before_w9 = len(re.findall(r"\[FD64\] write fd=\d+ n=9 total=9", vm.log()))
@@ -528,36 +535,36 @@ def main():
               wait_count(vm, r"\[FD64\] write fd=\d+ n=9 total=9", before_w9 + 1, 25))
         mon.type_line("cat /csentinel.txt")
         check("C: 哨兵读回 9 字节", vm.wait_log("[TERM] cmd cat bytes=9", 25))
-        mon.type_line("vol d")
-        check("再切到 D:（current=D:）", vm.wait_log("[VOL] switch letter=D: slot=1", 20))
+        mon.type_line("vol %s" % dl.lower())
+        check("再切到 %s:（current=%s:）" % (dl, dl), vm.wait_log("[VOL] switch letter=%s: slot=1" % dl, 20))
         before_f = len(re.findall(r"\[FD64\] open FAILED path=/csentinel\.txt", vm.log()))
         mon.type_line("cat /csentinel.txt")
-        check("D: 上看不到 C: 的哨兵（[FD64] open FAILED path=/csentinel.txt rc=2）",
+        check("%s: 上看不到 C: 的哨兵（[FD64] open FAILED path=/csentinel.txt rc=2）" % dl,
               wait_count(vm, r"\[FD64\] open FAILED path=/csentinel\.txt rc=2", before_f + 1, 25))
         mon.type_line("vol c")
         check("再切回 C:（双向切换）", vm.wait_log("[VOL] switch letter=C: slot=0", 20))
         before_f = len(re.findall(r"\[FD64\] open FAILED path=/readme\.txt", vm.log()))
         mon.type_line("cat /readme.txt")
-        check("C: 上没有 D: 的 readme.txt（双卷独立：[FD64] open FAILED path=/readme.txt）",
+        check("C: 上没有数据卷的 readme.txt（双卷独立：[FD64] open FAILED path=/readme.txt）",
               wait_count(vm, r"\[FD64\] open FAILED path=/readme\.txt rc=2", before_f + 1, 25))
         mon.type_line("vol")
 
         # ---- Explorer 端到端（鼠标注入）----
         exp.SAFE_POINT = (exp.sx(exp.CONTENT_X + exp.CONTENT_W - 40),
                           exp.sy(exp.CONTENT_Y + exp.CONTENT_H - 40))
-        # 先切回 C:，证明"Explorer 双击 D: 卡片"自己就能切卷（而不是靠终端）
+        # 先切回 C:，证明"Explorer 双击数据卷卡片"自己就能切卷（而不是靠终端）
         mon.type_line("vol c")
         time.sleep(1.0)
         mon.key("meta_l", wait=0.9)
         mon.key("2", wait=2.5)                      # 开始菜单第 2 项 = 文件资源管理器
         check("文件管理器打开（[APP] mypc opened）", vm.wait_log("[APP] mypc opened", 25))
         logx = vm.log()
-        di = card_idx_of(logx, "D")
-        check("此电脑页有 D: 卡片（[UI] explorer card ... letter=D:）", di >= 0, "card idx=%d" % di)
+        di = card_idx_of(logx, dl)
+        check("此电脑页有 %s: 卡片（[UI] explorer card ... letter=%s:）" % (dl, dl), di >= 0, "card idx=%d" % di)
         if di >= 0:
-            entered = explorer_dclick_card(vm, mon, "D", "[UI] explorer enter letter=D:")
-            check("双击 D: 卡片 -> 进入数据卷（enter letter=D: slot=1 ok items=2）",
-                  entered and vm.wait_log("[UI] explorer enter letter=D: slot=1 ok items=2", 25))
+            entered = explorer_dclick_card(vm, mon, dl, "[UI] explorer enter letter=%s:" % dl)
+            check("双击 %s: 卡片 -> 进入数据卷（enter letter=%s: slot=1 ok items=2）" % (dl, dl),
+                  entered and vm.wait_log("[UI] explorer enter letter=%s: slot=1 ok items=2" % dl, 25))
             logx2 = vm.log()
             check("内容区列出 /docs（[UI] explorer item idx=0 name=docs type=dir）",
                   re.search(r"\[UI\] explorer item idx=0 name=docs type=dir", logx2) is not None)
@@ -577,7 +584,7 @@ def main():
                                    exp.sy(exp.CONTENT_Y + 4),
                                    exp.sx(exp.CONTENT_X + 2 * exp.ICON_CELL_W - 4),
                                    exp.sy(exp.CONTENT_Y + exp.ICON_CELL_H - 4), 200)
-                check("像素：D: 根目录前两个图标格（同一行两列）有内容（深色像素 > 80）", n0 > 80 and n1 > 80,
+                check("像素：%s: 根目录前两个图标格（同一行两列）有内容（深色像素 > 80）" % dl, n0 > 80 and n1 > 80,
                       "cell0=%d cell1=%d" % (n0, n1))
             else:
                 check("像素：截屏成功（screendump）", False, "screendump 超时")
@@ -608,31 +615,31 @@ def main():
         check("vol 1 参数非法 -> usage（[VOL] usage bad-arg，不崩）",
               vm.wait_log("[VOL] usage bad-arg", 20) and vm.wait_log("[TERM] cmd vol fail", 20))
 
-        # ---- 在 D: 上真写文件（放在 explorer 之后：这样 explorer 看到的是预置的 2 条目）----
-        mon.type_line("vol d")
-        check("切到 D: 准备写盘", vm.wait_log("[VOL] switch letter=D: slot=1", 20))
+        # ---- 在数据卷上真写文件（放在 explorer 之后：这样 explorer 看到的是预置的 2 条目）----
+        mon.type_line("vol %s" % dl.lower())
+        check("切到 %s: 准备写盘" % dl, vm.wait_log("[VOL] switch letter=%s: slot=1" % dl, 20))
         mon.type_line("mkdir /dtest")
-        check("在 D: 上 mkdir 成功（[TERM] cmd mkdir ok）", vm.wait_log("[TERM] cmd mkdir ok", 20))
+        check("在 %s: 上 mkdir 成功（[TERM] cmd mkdir ok）" % dl, vm.wait_log("[TERM] cmd mkdir ok", 20))
         before_w9 = len(re.findall(r"\[FD64\] write fd=\d+ n=9 total=9", vm.log()))
         mon.type_line("write /dtest/a.txt d-side-ok")
-        check("在 D: 上 write 成功（FD 层真路径：[FD64] write n=9 total=9 + [TERM] cmd write ok）",
+        check("在 %s: 上 write 成功（FD 层真路径：[FD64] write n=9 total=9 + [TERM] cmd write ok）" % dl,
               wait_count(vm, r"\[FD64\] write fd=\d+ n=9 total=9", before_w9 + 1, 25) and
               vm.wait_log("[TERM] cmd write ok", 20))
         mon.type_line("cat /dtest/a.txt")
-        check("D: 上写入的文件能读回 9 字节", vm.wait_log("[TERM] cmd cat bytes=9", 25))
+        check("%s: 上写入的文件能读回 9 字节" % dl, vm.wait_log("[TERM] cmd cat bytes=9", 25))
         before_ls3 = len(re.findall(r"\[TERM\] cmd ls entries=3", vm.log()))
         mon.type_line("ls")
         check("ls 现在列出 3 个条目（docs + readme.txt + dtest：guest 写盘真的进了这卷的目录）",
               wait_count(vm, r"\[TERM\] cmd ls entries=3", before_ls3 + 1, 25))
 
-        # ---- ★ 写卷安全：当前卷 = D: 时自动落盘，只能写 C: ----
-        mon.type_line("vol d")
-        check("写卷安全测试前：当前卷 = D:", vm.wait_log("[VOL] switch letter=D: slot=1", 20))
+        # ---- ★ 写卷安全：当前卷 = 数据卷时自动落盘，只能写 C: ----
+        mon.type_line("vol %s" % dl.lower())
+        check("写卷安全测试前：当前卷 = %s:" % dl, vm.wait_log("[VOL] switch letter=%s: slot=1" % dl, 20))
         mon.type_line("store set mvprobe d-browse")
         mon.type_line("set startup.health 1")
         check("已改配置（触发 3 秒自动落盘）：[CONF64] set key=startup.health",
               vm.wait_log("[CONF64] set key=startup.health", 20))
-        # 基线：等 D: 镜像在宿主侧稳定（两次读一致），再等 8 秒看它有没有被动过
+        # 基线：等数据卷镜像在宿主侧稳定（两次读一致），再等 8 秒看它有没有被动过
         base = None
         for _ in range(6):
             a = read_file(data1)
@@ -641,21 +648,21 @@ def main():
             if a == b:
                 base = a
                 break
-        check("D: 镜像基线可稳定读取（两读一致）", base is not None)
+        check("%s: 镜像基线可稳定读取（两读一致）" % dl, base is not None)
         time.sleep(8.0)                              # >= 5 秒：config64 的 3 秒自动落盘一定跑过
         after = read_file(data1)
         autosave = vm.wait_log("[CONF64] autosave ok keys=", 20)
-        check("浏览 D: 期间 config64 自动落盘真的跑了（[CONF64] autosave ok keys=）", autosave)
-        # autosave 出现的位置必须在"切到 D:"之后，且中间没有切回 C: 的激活行
+        check("浏览 %s: 期间 config64 自动落盘真的跑了（[CONF64] autosave ok keys=）" % dl, autosave)
+        # autosave 出现的位置必须在"切到数据卷"之后，且中间没有切回 C: 的激活行
         l3 = vm.log()
-        off_d = l3.rfind("[VOL] switch letter=D: slot=1")
+        off_d = l3.rfind("[VOL] switch letter=%s: slot=1" % dl)
         off_auto = l3.rfind("[CONF64] autosave ok keys=")
         between = l3[off_d:off_auto] if (off_d >= 0 and off_auto > off_d) else ""
-        check("★ 自动落盘发生时当前卷仍是 D:（期间没有 [VFS64] activate slot=0）",
+        check("★ 自动落盘发生时当前卷仍是 %s:（期间没有 [VFS64] activate slot=0）" % dl,
               off_d >= 0 and off_auto > off_d and "[VFS64] activate slot=0" not in between)
         check("落盘走 VFS 载体（[STORE64] flush via=vfs -> slot=）",
               re.search(r"\[STORE64\] flush via=vfs -> slot=[AB]", vm.log()) is not None)
-        check("★ D: 卷在自动落盘窗口内**逐字节未变**（size + bytes）",
+        check("★ 数据卷在自动落盘窗口内**逐字节未变**（size + bytes）",
               base is not None and len(after) == len(base) and after == base,
               "size %s -> %s" % (len(base) if base is not None else "?", len(after)))
         # C: 的 /store.a 内容正确（宿主侧解析槽 + 新键）
@@ -677,22 +684,22 @@ def main():
                 keys.update(sb["keys"])
             check("★ C: 的 store 里有本次自动落盘写下的键（cfg.startup.health=1）",
                   keys.get("cfg.startup.health") == "1", "keys=%d" % len(keys))
-            check("★ store set 的 mvprobe=d-browse 也落在 C: 上（不是 D:）",
+            check("★ store set 的 mvprobe=d-browse 也落在 C: 上（不是数据卷）",
                   keys.get("mvprobe") == "d-browse", "mvprobe=%r" % keys.get("mvprobe"))
-        # D: 上不能出现 store 文件（写错卷的直接证据）
+        # 数据卷上不能出现 store 文件（写错卷的直接证据）
         d1buf = read_file(data1)
         d1vol = vfs3_vol(d1buf, DATA_PART_LBA)
         dnames = sorted(x["name"] for x in vfs3_list(d1buf, d1vol)) if d1vol else []
-        check("★ D: 卷上没有 /store.a、/store.b（落盘没写错卷）",
+        check("★ 数据卷上没有 /store.a、/store.b（落盘没写错卷）",
               "store.a" not in dnames and "store.b" not in dnames, "names=%s" % dnames)
-        # D: 上我们写的 /dtest/a.txt 内容正确（宿主侧）
+        # 数据卷上我们写的 /dtest/a.txt 内容正确（宿主侧）
         dt = vfs3_find(d1buf, d1vol, "dtest")
         if dt is not None:
             at = vfs3_find(d1buf, d1vol, "a.txt", dt["idx"])
-            check("宿主侧：D: 的 /dtest/a.txt 内容 = D-SIDE-OK（guest 写盘真的落到数据盘）",
+            check("宿主侧：数据卷的 /dtest/a.txt 内容 = D-SIDE-OK（guest 写盘真的落到数据盘）",
                   at is not None and vfs3_read(d1buf, d1vol, at["idx"]) == SENTINEL_D)
         else:
-            check("宿主侧：D: 有 /dtest 目录", False, "names=%s" % dnames)
+            check("宿主侧：数据卷有 /dtest 目录", False, "names=%s" % dnames)
         # C: 的哨兵内容正确（宿主侧）
         sc = vfs3_find(cbuf, cvol, "csentinel.txt") if cvol else None
         check("宿主侧：C: 的 /csentinel.txt 内容 = C-SIDE-OK",
@@ -718,27 +725,29 @@ def main():
         log4 = vm.log()
         check("卷槽表 4 个槽全满（used=4 system=0 current=0）",
               re.search(r"\[VFS64\] slots n=4 used=4 system=0 current=0", log4) is not None)
-        check("C:/D:/E:/F: 四个盘符都在",
-              all(re.search(r"\[DRV64\] letter=%s:" % L, log4) is not None for L in "CDEF"),
-              "letters=" + ",".join(L for L in "CDEFG" if re.search(r"\[DRV64\] letter=%s:" % L, log4)))
-        check("G: 没有分到盘符（卷表满如实拒绝）", re.search(r"\[DRV64\] letter=G:", log4) is None)
+        # ★ 批次 K 后的事实：盘尾 ESP（FAT32）也占一个盘符，所以三个数据卷是 E:/F:/G:。
+        check("C:/D:/E:/F:/G: 五个盘符都在（系统卷 + ESP + 三个数据卷）",
+              all(re.search(r"\[DRV64\] letter=%s:" % L, log4) is not None for L in "CDEFG"),
+              "letters=" + ",".join(L for L in "CDEFGH" if re.search(r"\[DRV64\] letter=%s:" % L, log4)))
+        check("H: 没有分到盘符（卷表满如实拒绝）", re.search(r"\[DRV64\] letter=H:", log4) is None)
         check("第 4 块数据盘被拒并打点（skip ... type=VimtuFS2 reason=voltable-full）",
               re.search(r"\[DRV64\] skip lba=\d+ type=VimtuFS2 reason=voltable-full", log4) is not None,
               (re.search(r"\[DRV64\] skip[^\r\n]*voltable-full[^\r\n]*", log4).group(0)
                if re.search(r"voltable-full", log4) else "缺"))
         check("[DRV64] selftest PASS（槽一致 + 表满也不算失败）", "[DRV64] selftest PASS" in log4)
-        check("D:/E:/F: 都能激活（三个数据卷各占一个槽）",
-              all(re.search(r"\[DRV64\] activate letter=%s: slot=\d+ disk=\d+ lba=8192 ok" % L, log4)
-                  for L in "CDE") or True)
+        check("E:/F:/G: 三个数据卷各占一个槽（slot=1/2/3，盘符由启动扫描分配）",
+              all(re.search(r"\[DRV64\] letter=%s: disk=\d+ part=\d+ fs=VimtuFS2 total_kb=\d+ free_kb=\d+ slot=%d" % (L, i), log4) is not None
+                  for i, L in enumerate("EFG", 1)))
         check("打开终端", fst.open_terminal(mon, s4, vm.proc))
         mon.type_line("vol")
-        check("vol 列表：4 个可浏览卷（[VOL] list n=4）", vm.wait_log("[VOL] list n=4", 25))
+        check("vol 列表：5 个可浏览卷（[VOL] list n=5）", vm.wait_log("[VOL] list n=5", 25))
+        mon.type_line("vol h")
+        check("vol h 被拒（no-letter：第 4 块数据盘没进卷表）",
+              vm.wait_log("[DRV64] activate letter=H: FAILED reason=no-letter", 20))
         mon.type_line("vol g")
-        check("vol g 被拒（no-letter）", vm.wait_log("[DRV64] activate letter=G: FAILED reason=no-letter", 20))
-        mon.type_line("vol f")
-        check("vol f 可以切（第 3 个数据卷）", vm.wait_log("[VOL] switch letter=F: slot=3", 20))
+        check("vol g 可以切（第 3 个数据卷）", vm.wait_log("[VOL] switch letter=G: slot=3", 20))
         mon.type_line("ls")
-        check("F: 上 ls 正常（不给盘符的空卷不在表里，但已挂载的卷可用）",
+        check("G: 上 ls 正常（不给盘符的空卷不在表里，但已挂载的卷可用）",
               vm.wait_log("[TERM] cmd ls entries=", 25))
         log4 = vm.log()
         forbid("阶段4", log4)
@@ -754,6 +763,6 @@ def main():
 
 # 备注（踩过的坑）：QEMU monitor 的 `sendkey` 只认小写字母键名（"a".."z"），`sendkey D` 不是
 # 合法键名 —— 它一个键都不发（大写要用 "shift-a"）。本脚本注入的文本因此全部小写：
-# `vol d` / `store set mvprobe d-browse` / 文件内容 "d-side-ok"；盘符的大小写由内核 cmd_vol 负责。
+# `vol e` / `store set mvprobe d-browse` / 文件内容 "d-side-ok"；盘符的大小写由内核 cmd_vol 负责。
 if __name__ == "__main__":
     sys.exit(main())
