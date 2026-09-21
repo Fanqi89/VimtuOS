@@ -231,8 +231,11 @@ static char g_props_path[VFS64_PATH_MAX] = {0};
 static int  g_box_active = 0;
 static int  g_box_x0 = 0, g_box_y0 = 0, g_box_x1 = 0, g_box_y1 = 0;
 
-// 复制缓冲（单文件上限 67584 B；与 fd64 的读缓冲同规格，粘贴时"先读整个文件再整体写"）
-static uint8_t g_copy_buf[VFS64_MAX_FILE_BYTES];
+// 复制缓冲（**分块**复制用的 64 KiB 主缓冲；单文件上限已经是 8 MiB，不可能再"整文件读进内存"）
+// ★ 批次 M：粘贴 = 逐块 fs64_read_range64(源) -> fs64_write_at64(目标)，缓冲区由这里给；
+//   复制大文件不再占大内存，而且**不会静默截断**（源变大/读失败都如实计入 skipped 并打点）。
+#define EXP_COPY_CHUNK 65536u
+static uint8_t g_copy_buf[EXP_COPY_CHUNK];
 
 // ==================== 小工具（内核里没有 libc）====================
 static void e_strcpy(char* dst, const char* src, int cap) {
@@ -380,6 +383,10 @@ static void fmt_bytes64(uint64_t b, char* out, int cap) {
         e_strcpy(out, t, cap); e_strcat(out, " B", cap);
     }
 }
+
+// ★ 批次 M：导出给终端 bigtest（见 explorer64.h）—— 就是上面 fmt_bytes64 的本体，UI 各处用的同一份
+void explorer64_fmt_bytes64(uint64_t bytes, char* out, int cap) { fmt_bytes64(bytes, out, cap); }
+
 // "YYYY-MM-DD HH:MM"（mtime = 0 时给空串：v2 卷/未知）
 static void fmt_mtime64(uint32_t packed, char* out, int cap) {
     if (packed == 0) { if (cap > 0) out[0] = 0; return; }
@@ -1128,16 +1135,17 @@ static void exp_open_item(int i);
 
 // ★ 批次 J：剪贴板/复制粘贴那一节里 exp_ctx_activate 也要用它。
 // ==================== ★ 批次 J：复制 / 剪切 / 粘贴（内核内剪贴板）====================
-// 模型（写清楚，免得后来人猜）：
-//   * 剪贴板 = 最多 8 条 (统一卷号, 完整路径) + 操作（复制/剪切）。**不是**文件内容快照 —— 粘贴时现读现写，
-//     所以源被删掉后粘贴会失败（如实报 skipped）。
-//   * 空格检查：写前用 fs64_free64 估目标卷的空闲块（含间接块 + 1 块余量）；不够就**整条跳过，不写一半**。
-//   * 单文件上限 67584 B（VFS64_MAX_FILE_BYTES）：超过的源会被拒绝（skipped），不是截断复制。
-//   * 目录递归复制：深度 ≤ EXP_COPY_DEPTH(4)、整棵 ≤ EXP_COPY_ITEMS(96) 条；超限的条目计入 skipped。
-//   * 跨卷（C: ↔ D: ↔ FAT32 只读卷）：源用 fs64_read64(源卷) 读、目标用 fs64_write64(目标卷) 写 ——
+//   * 空间检查：写前用 fs64_free64 估目标卷的空闲块（`vfs64_blocks_for_bytes64(size)` = 数据块 +
+//     一级/二级间接块 + 子块，再 +1 块余量）；不够就**整条跳过，不写一半**。
+//   * 单文件上限 **8 MiB**（VFS64_MAX_FILE_BYTES，v2 旧卷 67584 B，由 vfs64 按卷布局把关）：
+//     超过的源会被拒绝（skipped，打点 size=too-large），**不是**截断复制。
+//   * ★ 批次 M：文件内容**分块复制**（每块 EXP_COPY_CHUNK = 64 KiB，缓冲区由本文件给）——
+//     源用 fs64_read_range64(源卷) 按偏移读、目标用 fs64_write_at64(目标卷) 按偏移写；
+//     大文件不再需要"整文件读进内存"，也不会静默截断（短读/写失败一律如实报 skipped 并打点）。
+//   * 跨卷（C: ↔ D: ↔ FAT32 只读卷）：源用 fs64_*_on64(源卷) 读、目标按界面盘符写 ——
 //     与"当前卷"无关。**只读卷（FAT32）可以做源**（复制出来），但目标侧 fs64 会直接 -FS64_EROFS。
 //   * 剪切 = 复制成功后删源（**先全部复制成功再删**；某一条失败就保留它的源，绝不半删）。
-// 拼路径 + 在同目录里挑一个不撞名的名字（撞了就按 " (2)"、" (3)"… 追加；见 suffix_name_pure）
+// 拼路径 + 在同目录里挑一个不撞名的名字（撞了就按 "(2)"、"(3)"… 追加；见 suffix_name_pure）
 static int exp_unique_name(char* out, int cap, int vol, const char* dir, const char* name) {
     char cand[VFS64_NAME_MAX + 1];
     e_strcpy(cand, name, (int)sizeof(cand));
@@ -1151,22 +1159,33 @@ static int exp_unique_name(char* out, int cap, int vol, const char* dir, const c
     }
     return -1;                                  // 32 次都撞名：如实放弃
 }
-static int exp_copy_file(int svol, const char* sp, int dvol, const char* dp, int* why) {
+// ★ 批次 M：本函数导出去（explorer64.h 的 explorer64_copy_file64），终端 `bigtest copy` 用它做跨卷大文件验收
+int explorer64_copy_file64(int svol, const char* sp, int dvol, const char* dp, int* why) {
     if (why) *why = 0;
     Fs64Stat64 si;
     if (fs64_stat64(svol, sp, &si) != 0) { if (why) *why = 1; return -1; }               // 源没了
     if (si.type != VFS64_TYPE_FILE) { if (why) *why = 2; return -1; }
+    // 上限：8 MiB（v2 旧卷的 inode 根本存不下 >67584 B，vfs64 自己会拒 —— 这里只是形式化的一道闸）
     if (si.size > VFS64_MAX_FILE_BYTES) { if (why) *why = 3; return -1; }                // 超过单文件上限
     if (fs64_is_readonly64(dvol)) { if (why) *why = 6; return -1; }                      // ★ 目标只读（FAT32）
     uint32_t fb = 0, fby = 0;
     if (fs64_free64(dvol, &fb, &fby, nullptr) != 0) { if (why) *why = 4; return -1; }
-    // 需要的数据块 + 间接块（> 4 个直接块时才要间接块）+ 1 块余量
-    const uint32_t data_blocks = (si.size + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
-    const uint32_t need = data_blocks + ((data_blocks > VFS64_DIRECT_BLOCKS) ? 1u : 0u) + 1u;
+    // 需要的数据块 + 间接块（一级/二级/子块）+ 1 块余量（vfs64_blocks_for_bytes64 就是这条口径）
+    const uint32_t need = vfs64_blocks_for_bytes64(si.size) + 1u;
     if (fb < need) { if (why) *why = 5; return -1; }                                     // 空间不足
-    const int n = fs64_read64(svol, sp, g_copy_buf, (int)sizeof(g_copy_buf));
-    if (n < 0 || (uint32_t)n != si.size) { if (why) *why = 1; return -1; }
-    if (fs64_write64(dvol, dp, g_copy_buf, n) != n) { if (why) *why = 4; return -1; }
+    if (fs64_create64(dvol, dp) != 0) {                                                  // 目标：先建空文件
+        Fs64Stat64 di;
+        if (fs64_stat64(dvol, dp, &di) != 0 || di.type != VFS64_TYPE_FILE) { if (why) *why = 4; return -1; }
+    }
+    uint32_t off = 0;
+    while (off < si.size) {
+        uint32_t want = si.size - off;
+        if (want > (uint32_t)sizeof(g_copy_buf)) want = (uint32_t)sizeof(g_copy_buf);
+        uint32_t got = 0;
+        if (fs64_read_range64(svol, sp, off, g_copy_buf, want, &got) != 0 || got == 0) { if (why) *why = 1; return -1; }
+        if (fs64_write_at64(dvol, dp, off, g_copy_buf, got) != 0) { if (why) *why = 4; return -1; }
+        off += got;
+    }
     return 0;
 }
 // 递归复制一棵目录树（有界；budget 是"还剩多少条目可复制"的共享计数器）
@@ -1194,7 +1213,7 @@ static int exp_copy_tree(int svol, const char* sp, int dvol, const char* dp,
             if (ents[i].type == VFS64_TYPE_DIR) {
                 if (exp_copy_tree(svol, csrc, dvol, cdst, depth + 1, budget, skipped) != 0) return -1;
             } else {
-                if (exp_copy_file(svol, csrc, dvol, cdst, nullptr) != 0) { (*skipped)++; return -1; }
+                if (explorer64_copy_file64(svol, csrc, dvol, cdst, nullptr) != 0) { (*skipped)++; return -1; }
             }
         }
         if (got < (int)EXP_COPY_LIST) break;
@@ -1262,7 +1281,7 @@ static void exp_paste() {
             skipped += sub_skip;
         } else {
             int why = 0;
-            rc = exp_copy_file(g_clip[i].vol, g_clip[i].path, dvol, dp, &why);
+            rc = explorer64_copy_file64(g_clip[i].vol, g_clip[i].path, dvol, dp, &why);
             if (rc != 0) skipped++;
         }
         if (rc == 0) {

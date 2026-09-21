@@ -64,13 +64,25 @@
 //   [UI] explorer props name=<..> kind=<..> size=<..> mtime=<..> vol=<C:|D:>   （属性面板）
 //   其它：工具栏第 2 组按钮的点击打点复用上面的 [UI] explorer click ... hit=btn:<mkdir|copy|cut|paste|rename|del>。
 //   [EXPL] selftest PASS / [EXPL] selftest FAIL mask=<n>
+
+
 #pragma once
 #include <stdint.h>
 
 struct Window;
 // 打开文件管理器窗口（已存在则激活并刷新）。打印 "[APP] mypc opened"（历史断言依赖，勿改）。
 // 打开发管理器窗口（已存在则激活并刷新）。打印 "[APP] mypc opened"（历史断言依赖，勿改）。
+
+// ★ 批次 M：把"复制单个文件"这一步单独暴露出来（**就是粘贴走的那段代码**：空间预检 + 分块
+//   read_range/write_at + 只读卷拒绝），供终端 `bigtest copy` 做跨卷大文件复制的自动验收。
+//   svol/dvol = 统一卷号（fs64），可跨卷；返回 0 = 成功，-1 = 失败（原因写 why_out，可为 nullptr：
+//   1 源不可读 / 2 源不是文件 / 3 超过单文件上限 / 4 目标写失败 / 5 目标空间不足 / 6 目标只读）。
+int explorer64_copy_file64(int svol, const char* sp, int dvol, const char* dp, int* why_out);
 void explorer64_open64();
+// ★ 批次 M：把"字节 -> 人读单位"换算（图标视图 / 详细视图 / 属性面板用的**同一个函数**）导出，
+//   供终端 bigtest 做"文件管理器里的大小显示"自动验收（1 MiB -> "1.0 MB"，8 MiB -> "8.0 MB"）。
+//   规则：< 1024 -> "N B"；< 1 MiB -> "N.N KB"；>= 1 MiB -> "N.N MB"（一位小数）。
+void explorer64_fmt_bytes64(uint64_t bytes, char* out, int cap);
 
 // 关闭窗口（会话策略/自检用）。
 void explorer64_reset64();

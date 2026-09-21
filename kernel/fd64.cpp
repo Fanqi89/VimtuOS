@@ -75,9 +75,8 @@ static OpenFile64  g_files[FD64_OPEN_MAX];
 static Pipe64      g_pipes[FD64_PIPE_MAX];
 static DirCache64  g_dirc[FD64_DIRC_MAX];
 
-// 全局读缓冲 / 写暂存：理由见 fd64.h（vfs64 没有 read-at-offset 与部分写原语）
-static uint8_t  g_fd64_rbuf[FD64_FILE_MAX];
-static uint8_t  g_fd64_wbuf[FD64_FILE_MAX];
+// ★ 批次 M：这里**不再有全局读写缓冲**（曾经是两块 8MiB 级缓冲）—— 读直接读进调用方的缓冲，
+//   写直接走 vfs64_write_at64 的部分写（缓冲区由调用方给），所以 8 MiB 的文件也能用小缓冲分块读写。
 
 FdTable64* fd64_kernel_table64() {
     // 内核表 = 池里第一张（is_kernel 标记，永不释放）
@@ -195,11 +194,6 @@ void fd64_table_close_all64(FdTable64* t) {
 static void fd64_zero(void* p, uint32_t n) {
     uint8_t* d = (uint8_t*)p;
     for (uint32_t i = 0; i < n; i++) d[i] = 0;
-}
-static void fd64_copy(void* dst, const void* src, uint32_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    const uint8_t* s = (const uint8_t*)src;
-    for (uint32_t i = 0; i < n; i++) d[i] = s[i];
 }
 static int fd64_streq(const char* a, const char* b) {
     if (!a || !b) return 0;
@@ -515,13 +509,16 @@ int fd64_read64(int fd, void* buf, int len) {
     const uint64_t if_save = dbg64_irq_save64();
     fd64_refresh64(of);
     if (of->off >= of->size) { dbg64_irq_restore64(if_save); return 0; }   // EOF
-    const int n = fs64_read64(of->vol, of->path, g_fd64_rbuf, (int)FD64_FILE_MAX);
-    if (n < 0) { dbg64_irq_restore64(if_save); return -FD64_ENOENT; }
-    const uint32_t avail = ((uint32_t)n > of->size) ? of->size : (uint32_t)n;
-    if (of->off >= avail) { dbg64_irq_restore64(if_save); return 0; }
-    uint32_t got = avail - of->off;
-    if ((uint32_t)len < got) got = (uint32_t)len;
-    fd64_copy(buf, g_fd64_rbuf + of->off, got);
+    uint32_t want = of->size - of->off;
+    if ((uint32_t)len < want) want = (uint32_t)len;
+    // ★ 批次 M：直接把 [off, off+want) 读进**调用方的缓冲**（fs64/vfs64 内部按块分包，
+    //   支持二级间接块的大文件；内核不再需要一块整文件缓冲）。
+    uint32_t got = 0;
+    if (fs64_read_range64(of->vol, of->path, of->off, buf, want, &got) != 0) {
+        dbg64_irq_restore64(if_save);
+        return -FD64_ENOENT;
+    }
+    if (got > want) got = want;                       // 防御：分派层不该超量
     of->off += got;
     dbg64_irq_restore64(if_save);
 
@@ -551,31 +548,24 @@ int fd64_write64(int fd, const void* buf, int len) {
     const uint64_t if_save = dbg64_irq_save64();
     fd64_refresh64(of);
     if (of->append) of->off = of->size;                        // ★ O_APPEND：每次写都定位到末尾
+    if (of->off > FD64_FILE_MAX || (uint32_t)len > (FD64_FILE_MAX - of->off)) {
+        dbg64_irq_restore64(if_save);
+        return -FD64_EFBIG;                                    // 超出单文件上限：路径层也会拒（双保险）
+    }
+    // ★ 批次 M：**部分写**（保留原有字节；seek 过末尾的洞由 vfs64_write_at64 补零）；
+    //   不再"整文件 read-modify-write"——所以写 1 字节的代价与文件大小无关。
+    const int wn = fs64_write_at64(of->vol, of->path, of->off, buf, (uint32_t)len);
+    if (wn != 0) {
+        dbg64_irq_restore64(if_save);
+        if (wn == -FS64_EROFS) return -FD64_EROFS;              // 只读卷（防御：打开时已拦）
+        // vfs64 的失败码只有 -1（超上限 / 空间不足 / 写盘失败）：超上限在**上面**已经拦掉（-EFBIG），
+        // 走到这里就是空间不足或写盘失败 —— 如实报 -ENOSPC（不假装写成功）。
+        return -FD64_ENOSPC;
+    }
     const uint32_t end = of->off + (uint32_t)len;
-    if (end > FD64_FILE_MAX) { dbg64_irq_restore64(if_save); return -FD64_EFBIG; }
-
-    // 整文件 read-modify-write（每次写都读一遍：多个 fd/多个进程同时写时语义才正确）
-    uint32_t sz = 0;
-    {
-        const int n = fs64_read64(of->vol, of->path, g_fd64_wbuf, (int)FD64_FILE_MAX);
-        sz = (n > 0) ? (uint32_t)n : 0;
-        if (sz > FD64_FILE_MAX) sz = FD64_FILE_MAX;
-    }
-    if (of->append) of->off = sz;                              // 以**磁盘上的当前末尾**为准
-    if (of->off + (uint32_t)len > FD64_FILE_MAX) { dbg64_irq_restore64(if_save); return -FD64_EFBIG; }
-    if (of->off > sz) {                                        // 空洞补零（seek 过末尾再写）
-        for (uint32_t i = sz; i < of->off && i < FD64_FILE_MAX; i++) g_fd64_wbuf[i] = 0;
-        sz = of->off;
-    }
-    fd64_copy(g_fd64_wbuf + of->off, buf, (uint32_t)len);
-    const uint32_t end2 = of->off + (uint32_t)len;
-    if (end2 > sz) sz = end2;
-    const int wn = fs64_write64(of->vol, of->path, g_fd64_wbuf, (int)sz);
-    of->size = sz;
-    of->off  = end2;                                           // 写后游标 = 末尾（O_APPEND 亦然）
+    if (end > of->size) of->size = end;
+    of->off = end;                                             // 写后游标 = 末尾（O_APPEND 亦然）
     dbg64_irq_restore64(if_save);
-    if (wn == -FS64_EROFS) return -FD64_EROFS;                // 只读卷（防御：打开时已拦）
-    if (wn < 0) return -FD64_ENOSPC;
 
     dbg64_line_begin64();
     dbg64_str("[FD64] write fd=");
@@ -584,6 +574,8 @@ int fd64_write64(int fd, const void* buf, int len) {
     dbg64_dec((uint64_t)len);
     dbg64_str(" total=");
     dbg64_dec((uint64_t)of->size);
+    dbg64_str(" off=");
+    dbg64_dec((uint64_t)of->off);
     if (of->append) dbg64_str(" append");
     dbg64_nl();
     dbg64_line_end64();
@@ -601,7 +593,7 @@ int fd64_lseek64(int fd, int64_t off, int whence) {
     else if (whence == FD64_SEEK_CUR) base = (int64_t)of->off;
     else if (whence == FD64_SEEK_END) base = (int64_t)of->size;
     else return -FD64_EINVAL;
-    const int64_t nv = base + off;
+    const int64_t nv = base + off;                              // ★ 64 位算术（不回绕）
     if (nv < 0 || nv > (int64_t)FD64_FILE_MAX) return -FD64_EINVAL;
     of->off = (uint32_t)nv;
     return (int)nv;

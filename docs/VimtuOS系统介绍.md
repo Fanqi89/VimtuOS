@@ -60,7 +60,7 @@ VimtuOS 0.1.0 x86_64 (VimtuOS 64-bit)
 | **真实分区操作** | 新建、删除、格式化都是**真写盘**；格式化现在写的是 **VimtuFS2** 卷 | `partition_ops_test`（18 项，字节级比对） |
 | **装完就是一台独立系统** | 自动重启后从硬盘 MBR 启动，直接进桌面（不再需要安装介质） | `install_flow_test` 的第二阶段（装完单独启动） |
 | **调度器（多任务）** | 16 个任务槽、每任务 16KB 内核栈、8ms 时间片轮转、IRQ0 抢占、睡眠/退出/回收、`task_kill64`、kstress 压力路径 | `sched_stress_test`（18 项）+ 串口 `[TASK64] scheduler up tasks=N` / `kheart beat=N` |
-| **真实文件系统** | **VimtuFS2**：超级块（magic + CRC32）、空闲位图、64B inode、直接块×4 + 一级间接块（单文件 ≤67584B）；format / mount / ls / read / write / mkdir / unlink / stat / dump | `[VFS64] selftest PASS` / `format ok` / `mount ok`；`store64_test` 在真实卷上读写 |
+| **真实文件系统** | **VimtuFS2**：超级块（magic + CRC32）、空闲位图、**128B inode**、直接块×4 + 一级间接块 + **二级间接块**（**单文件 ≤8 MiB**，批次 M）；format / mount / ls / read / write / mkdir / unlink / stat / dump | `[VFS64] selftest PASS` / `format ok` / `mount ok`；`store64_test` 在真实卷上读写 |
 | **设置持久化（store）** | A/B 双槽（`/store.a`、`/store.b`）+ 世代号 + 头部/payload 双 CRC32 + "先数据后头部"的提交点；终端 `store dump\|get\|set\|flush` | `store64_test`（46 项）实测**跨重启**仍有 `theme=dark` |
 | **ring3 用户态** | GDT 8 项（内核 0x08/0x10、用户 0x23/0x2B、TSS 0x30）；用户窗口在 4GiB（代码页 R/X、栈页 R/W/NX）；进出 ring3 与回收 | `user64_test`（17 项）+ `[USER64] selftest PASS` |
 | **两套系统调用入口** | `int 0x80`（自有 ABI rax/rdi/rsi/rdx）与 `syscall` 指令（STAR/LSTAR/FMASK，Linux x86_64 号段）并存；用户指针一律先过范围校验 | `elf64_test`（56 项）+ `[SYSCALL] selftest PASS` / `[SYSCALL] insn nr=...` |
@@ -83,7 +83,7 @@ VimtuOS 0.1.0 x86_64 (VimtuOS 64-bit)
 |---|---|
 | ⚠️ **用户态没有独立地址空间** | 所有用户程序共用 **4GiB..4GiB+1MiB 的同一个窗口**；没有 fork / execve / clone，进程之间没有隔离；mmap / brk / mprotect / munmap 都是在这一个窗口里做 bump 分配 |
 | ⚠️ **ELF64 只验证过自有静态程序** | 自己的 `ld.lld -static -nostdlib` 程序能 load → ring3 → `syscall` → exit；**glibc / 发行版二进制没有验证过**（缺 execve/fork/clone、vDSO、TLS(FS.base) 真生效、信号投递、futex、动态链接与重定位） |
-| ⚠️ **VFS 是单层路径** | 只支持 `/name`（无目录树、无 `.`/`..`、无删除目录）；文件名 ≤27B；最多 256 个 inode；单文件 ≤67584B。**终端里的 `ls/cat/write/touch/rm` 仍是内核内最小 ramfs（16 文件 × 512B，RAM only）**，没接 VimtuFS2 |
+| ⚠️ **VFS 是单层路径** | 只支持 `/name`（无目录树、无 `.`/`..`、无删除目录）；文件名 ≤31B（v3）；最多 512 个 inode；单文件 ≤8 MiB（批次 M；v2 旧卷仍 67584B）。终端 `ls/cat/write/touch/rm` 走 `kernel/fd64.cpp` 直连 VimtuFS2（批次 B 起；批次 M 起单文件上限 8 MiB）|
 | ⚠️ **设置页 UI 还没接 store** | store 本体可用（终端命令真落盘、跨重启保留），但设置页/启动项没接线，页面里如实写着"本页设置不落盘" |
 | ⚠️ **没有 TCP/IP / DHCP / DNS** | 网络只有 IPv4 + ARP + ICMP echo（e1000 轮询收发，无中断收包）；UDP/TCP、路由、DHCP、DNS 都没有；只适配 e1000，VMware 的 vmxnet3 未适配 |
 | ⚠️ **USB 只有 UHCI + HID 引导键盘** | 没有 EHCI(USB 2.0) / xHCI(USB 3.x)，没有 USB 鼠标、U 盘、集线器；只认直接插在根端口上的键盘；不接中断（由 `kusb` 线程轮询） |
@@ -268,7 +268,7 @@ VimtuOS 0.1.0 x86_64 (VimtuOS 64-bit)
 ### 6.8 文件系统与持久化
 
 * **VimtuFS2 v3**（`vfs64.cpp`）：块 0 超级块（`VIMTUFS2` + CRC32 + 几何重算校验）、空闲位图、**128B inode**、数据区；
-  inode 里直接放名字（≤31B）+ `parent/mtime/nlink/kind`，4 个直接块 + 1 个一级间接块 → 单文件 ≤67584B；
+  inode 里直接放名字（≤31B）+ `parent/mtime/nlink/kind`，4 个直接块 + 1 个一级间接块 + **1 个二级间接块（128×128 块）** → 单文件 ≤**8 MiB**（批次 M）；
 * **真正的目录树**：多级路径 `/dir/sub/file`、`.`/`..`（根的父目录还是根，POSIX）、目录 = `parent` 相同的 inode 集合
   （目录没有数据块）；v2 旧卷照常挂载（按单层语义），新格式化一律 v3；
 * **★ 多卷（本批次）**：`vfs64` 有 **4 个卷槽**（每槽独立几何），系统卷固定 0 号槽 = `C:`，盘符层把其余可浏览卷挂到
@@ -418,7 +418,7 @@ python tests/user64_test.py tests/display64_test.py tests/app64_test.py tests/st
 |---|---|
 | 工具链 | **[未做]** Rust 参与实现（可选要求，本机未装工具链） |
 | 应用层 | **[边界]** 无独立地址空间 / 无 fork / execve；glibc 与发行版二进制未验证（无 TLS/vDSO/信号/futex/动态链接） |
-| 文件系统 | **[边界]** 多级路径/v3 目录树/多卷（4 槽）已落地；**没有递归删除非空目录**、**没有跨目录移动**、单文件 ≤67584B、无权限/属主/回收站；`rmdir`/`rename` 没接进 syscall 号段（内核有原语，文件管理器直接用） |
+| 文件系统 | **[边界]** 多级路径/v3 目录树/多卷（4 槽）已落地；**没有递归删除非空目录**、**没有跨目录移动**、单文件 ≤8 MiB（批次 M）、无权限/属主/回收站；`rmdir`/`rename` 没接进 syscall 号段（内核有原语，文件管理器直接用） |
 | 网络 / USB | **[边界]** 无 DHCP/DNS/UDP/TCP；只有 UHCI + 根端口 HID 键盘，无 EHCI/xHCI/鼠标/存储/hub |
 | 多核 | **[边界]** AP 起来后 `cli; hlt`，无多核调度 / IPI / per-CPU 数据 |
 | 真机 | **[边界]** 只在 QEMU + VMware 验证，未上真机；无音频 |

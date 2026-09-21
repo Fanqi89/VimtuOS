@@ -554,6 +554,43 @@ def cap_fs_tree():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_fs_bigfile():
+    """★ 批次 M：VimtuFS2 **大文件**（二级间接块）—— 单文件上限 8 MiB 与上层对齐。
+
+    判据（全部绑到"代码里真的这么做" + 新的端到端脚本）：
+      * vfs64.h 的上限常量 = 16384 块 = 8 MiB；inode 偏移 71 是二级间接块指针（唯一改动点）；
+      * 读写路径有按偏移的 read_at / write_at / write_stream（不再"整文件一把梭"）；
+      * fd64 不再有整文件缓冲（旧的两块 8MiB 级缓冲已删），explorer 的粘贴是分块复制；
+      * tests/bigfile64_test.py：1 MiB / 8 MiB 写读 CRC、上限 +1 被拒、回收回基线、跨卷复制、宿主侧块链核对。
+    """
+    need = ["kernel/vfs64.cpp", "kernel/vfs64.h", "kernel/fd64.cpp", "kernel/explorer64.cpp",
+            "kernel/terminal64.cpp", "tests/bigfile64_test.py"]
+    for f in need:
+        if not exists(f):
+            return "MISSING", ["缺文件：%s" % f]
+    lim = grep_count(r"VFS64_MAX_FILE_BYTES\s+\(VFS64_MAX_FILE_BLOCKS \* VFS64_BLOCK_BYTES\)",
+                     ["kernel/vfs64.h"])
+    blocks = grep_count(r"VFS64_MAX_FILE_BLOCKS\s+16384u", ["kernel/vfs64.h"])
+    dind = grep_count(r"VFS_I3_DIND\s+=\s+71", ["kernel/vfs64.cpp"])
+    l2 = grep_count(r"VFS64_DIND_CHILDREN|VFS64_L2_FIRST_BLOCK", ["kernel/vfs64.h", "kernel/vfs64.cpp"])
+    ra = grep_count(r"vfs64_read_at64|vfs64_write_at64|vfs64_write_stream64", ["kernel/vfs64.cpp"])
+    norwbuf = 0 if grep_count(r"g_fd64_rbuf|g_fd64_wbuf", ["kernel/fd64.cpp"]) else 1
+    chunk = grep_count(r"fs64_write_at64|fs64_read_range64", ["kernel/explorer64.cpp"])
+    test = exists("tests/bigfile64_test.py")
+    ev = ["单文件上限 = VFS64_MAX_FILE_BLOCKS(16384 块) x 512B = **8 MiB（8388608 B）**；"
+          "  vfs64.h 的上限表达式（VFS64_MAX_FILE_BYTES = 块数 x 512）：命中 %d" % lim,
+          "inode 偏移 71 = 二级间接块指针（VFS_I3_DIND）：命中 %d；二级间接常量（128 子块）：命中 %d" % (dind, l2),
+          "按偏移读写原语（read_at64 / write_at64 / write_stream64）：命中 %d" % ra,
+          "fd64 已无整文件读写缓冲（g_fd64_rbuf/g_fd64_wbuf 命中 0）：%s" % ("是" if norwbuf else "否"),
+          "explorer 粘贴分块复制（fs64_read_range64 + fs64_write_at64）：命中 %d" % chunk,
+          "端到端脚本 tests/bigfile64_test.py：%s（1 MiB / 8 MiB 写读 CRC + 上限 +1 被拒 + 回收回基线 + "
+          "跨卷复制 + 宿主侧解析 raw 镜像核对二级间接块链）" % ("存在" if test else "缺失"),
+          "实测串口：[VFS64] bigfile ok ... ind=1 dind=1（自检）/ [BIG64] write path=/big8.bin bytes=8388096 "
+          "+ [BIG64] over ... rc=27 + [BIG64] recycle ... delta=0 + [BIG64] copy ... rc=0"]
+    done = lim and blocks and dind and l2 and ra and norwbuf and chunk and test
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 def cap_multivol():
     """★ 多卷挂载 / 按盘符切换：vfs64 卷槽表（至少 4 槽）+ 按槽写系统卷。
 
@@ -1225,6 +1262,7 @@ CAPS = [
     ("内核", "UEFI 运行期 CR3 实验（方案 A/B，默认不编；两条固件路径实测）", cap_uefi_cr3_experiment),
     ("内核", "文件系统（真实 VFS）", cap_filesystem),
     ("内核", "★ VimtuFS2 目录树 v3（多级路径 + inode 时间戳 + 类型判定；v2 旧卷仍可挂载）", cap_fs_tree),
+    ("内核", "★ VimtuFS2 大文件（二级间接块，单文件上限 8 MiB）", cap_fs_bigfile),
     ("存储", "★ 盘符与驱动器枚举（C: = 系统卷 + D:/E:… 盘符表；ESP/未知不占字母但列出）", cap_drive_layer),
     ("存储", "★ 多卷挂载 / 盘符切换（vfs64 卷槽表 + drive64 按字母激活 + 系统组件固定写系统卷）",
      cap_multivol),
@@ -1278,6 +1316,8 @@ TESTS = [
     ("uefi_cr3_experiment_test.py", "批次 D UEFI 运行期 CR3 实验：方案 A/B 两方案 + QEMU/OVMF 与 VMware EFI 实测"),
     ("fs_tree_test.py", "★ VimtuFS2 v3 目录树 + 盘符层：安装->格式化(v3)->多级 mkdir->子目录写文件->冷启动 stat/mtime/遍历/删除；"
                         "C:/D: 盘符表 + ESP skip + drive64 容量与 df 一致"),
+    ("bigfile64_test.py", "★ 批次 M VimtuFS2 大文件（二级间接块）：bigtest 1mb/8mb/limit/recycle + cat 截断提示 + "
+                          "fatcheck 整文件 CRC + 跨卷复制到 D: + 宿主侧解析 raw 镜像核对块链（50 条断言）"),
     ("explorer64_test.py", "★ 文件资源管理器 / 此电脑（UI）：容量条/四列像素 + 鼠标双击进盘/进目录/跑 ELF64 + 面包屑/上级/后退 + 状态栏计数"),
     ("fileops64_test.py", "★ 批次 J 文件操作：右键菜单（像素）+ 复制/剪切/粘贴（Ctrl+C/X/V）+ F2 重命名内联编辑 + "
                           "删除两段确认（非空目录如实被拒）+ 新建文件夹 + 框选/Ctrl+A 多选 + 工具栏按钮 + "

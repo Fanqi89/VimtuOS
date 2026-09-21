@@ -102,7 +102,11 @@ int fs64_stat64(int vol, const char* path, Fs64Stat64* out);
 // 读文件：最多 max 字节，返回实际字节数 / 负错误码。
 int fs64_read64(int vol, const char* path, void* buf, int max);
 // 分块读（大文件校验用）：*out_got = 实际读到的字节数；0 = 成功。
+// 分块读（大文件校验用）：*out_got = 实际读到的字节数；0 = 成功。缓冲区由调用方给（建议 ≤64KB/次）。
 int fs64_read_range64(int vol, const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got);
+// ★ 批次 M：分块写（按偏移；保留原有字节；off > 当前大小 = 空洞**补零**；**8 MiB 上限**由 vfs64 把关，
+//   超上限/空间不足一律先失败、不写一半）。只读卷（FAT32）返回 -FS64_EROFS。
+int fs64_write_at64(int vol, const char* path, uint32_t off, const void* buf, uint32_t len);
 // 写操作：FAT 卷上一律返回 -FS64_EROFS（打点 [FS64] reject ... readonly）。
 int fs64_write64(int vol, const char* path, const void* buf, int len);
 int fs64_create64(int vol, const char* path);

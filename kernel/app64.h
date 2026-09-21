@@ -41,8 +41,15 @@
 #define VAP64_VERSION64        1u
 #define VAP64_HEADER_SIZE64    32u
 #define VAP64_NAME_MAX64       24u          // 含结尾 NUL -> 名字最长 23 个可见字符
-#define VAP64_MAX_CODE64       32768u       // 与 user64_run_blob64 的 8 页上限对齐
-#define VAP64_MAX_FILE_BYTES64 65536u       // 读盘缓冲上限（头+名字+代码必然 < 64KB）
+#define VAP64_MAX_CODE64       32768u       // ★ **用户窗口**上限（user64_run_blob64 的 8 页）—— 不要动
+// ---- 三项上限的**归属**（批次 M 写清；别把三者混成一个数）----
+//   1) **FS 侧（文件总长）**：VimtuFS2 单文件上限 **8 MiB**（批次 M：二级间接块；v2 卷 67584 B）——
+//      盘上放得下多得多的字节，但 VAP64 的"代码段"另有上限（下一项）。
+//   2) **用户窗口**：`VAP64_MAX_CODE64` = 32 KiB（代码段拷进用户页、只能占 8 页）—— 硬约束，不动。
+//   3) **读盘缓冲**：`VAP64_MAX_FILE_BYTES64` = 64 KiB（app64.cpp 的 .bss 里）。
+//      它比"32 KiB 代码 + 32B 头 + 24B 名字"大得多，所以**只要 code_size 合法，文件一定读得下**；
+//      超过它一律 `reason=size` 拒绝（不截断）。刻意不抬到 8 MiB（缓冲白吃内存，真正卡住的是第 2 条）。
+#define VAP64_MAX_FILE_BYTES64 65536u
 
 // ============================ API ============================
 

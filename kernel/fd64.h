@@ -17,21 +17,25 @@
 //     写满返回短写（一点空间都没有 -> -EAGAIN）；读空且写端还开着 -> -EAGAIN，
 //     写端全关 -> 0（EOF）。fork 后父子各持一端即可通信。
 //   * 底层只有 vfs64（VimtuFS2）：路径形如 "/dir/sub/name"（也接受 "name" = 从根开始），
-//     大小写敏感、**支持多级路径**（v3 起；'.'/'..' 交给 vfs64 解析）、单文件 <= 67584 B
-//     （FD64_FILE_MAX = VFS64_MAX_FILE_BYTES），没有权限、不能删非空目录。
-//   * 读：vfs64 没有 read-at-offset 原语，所以每次读把整个文件读进**一块全局读缓冲**
-//     （FD64_FILE_MAX），再按游标拷贝请求的片段；读/写期间关中断。
-//   * 写：vfs64_write 是"整体覆盖"语义 —— 本层每次写做一次**整文件 read-modify-write**，
-//     写完立刻整体落盘（不缓存脏页，也不留写暂存跨调用）。好处：多个 fd/多个进程同时写
-//     同一个文件时语义仍然正确（O_APPEND 的真值就靠它）；代价：每次写都读写整个文件，
-//     单文件 <= 67584 B，演示规模够用。
+//     大小写敏感、**支持多级路径**（v3 起；'.'/'..' 交给 vfs64 解析）、单文件 <= **8 MiB**
+//     （FD64_FILE_MAX = VFS64_MAX_FILE_BYTES；v2 旧卷仍是 67584 B，由 vfs64 按卷布局把关），
+//     没有权限、不能删非空目录。
+//   * ★ 批次 M：读/写都走 vfs64 的**按偏移分块**原语（fs64_read_range64 / fs64_write_at64），
+//     **不再有 8MiB 级别的全局读写缓冲**：`read` 直接读进调用方的缓冲；`write` 只改被覆盖的块
+//     （保留原内容、缺块按需分配、seek 过末尾的洞补零）。所以"写一个字节"不再需要把整个文件过一遍内存，
+//     8 MiB 的文件也能用 64KB 的小缓冲分块读写（推荐每次 ≤ VFS64_READ_CHUNK_BYTES）。
+//   * 偏移/长度：对外都是 **64 位**（fd64_lseek64 收 int64_t）。内部按单文件上限（8 MiB < 4GiB）
+//     用 32 位保存，**超出上限一律 -EINVAL/-EFBIG，绝不回绕**。
+//   * 写：vfs64_write_at64 是"部分写"，写到上限/空间不足时**先失败**（不会写一半）；
+//     每次写后游标 = 写完的位置；O_APPEND 每次先定位到末尾（以盘上的当前大小为准）。
 //   * 目录句柄：fd64_opendir64 + fd64_readdir64（线性枚举，第一次重列目录后缓存 16 条）。
 //
 // 边界（如实写在文档里，别把没做的说成做了）：
 //   * 没有文件权限/属主；没有 O_CLOEXEC、fcntl(72)/F_DUPFD、非阻塞标志的完整语义；
 //   * 没有 select/poll/epoll、没有文件的 mmap、没有硬链接/符号链接；
 //   * pipe 没有阻塞/信号语义（见上），容量固定 64 B，最多 8 条同时在用；
-//   * vfs64 没有 read-at-offset，读写都要把整个文件过一遍内存。
+//   * 单文件上限 8 MiB（v2 卷 67584 B）：单次 read/write 的长度受调用方缓冲限制（推荐 ≤64KB/次）；
+//     没有 O_SYNC/mmap/直接 I/O；写失败（空间不足/超上限）是**部分写也没有**（先失败）。
 //
 // 打点（自动验收 grep，格式勿改）：
 //   [FD64] open path=<p> fd=<n> flags=<n>
@@ -50,7 +54,10 @@
 #define FD64_PIPE_BYTES 64u          // ★ pipe 容量（固定；没有阻塞语义，见文件头）
 #define FD64_PATH_MAX   64u          // 路径缓冲：支持多级路径（"/apps/demo/file.txt" 这种）
 #define FD64_NAME_MAX   32u          // 目录项名字缓冲（与 vfs64_ls 的 [][32] 对齐；v3 名字上限 31）
-#define FD64_FILE_MAX   67584u       // 单文件上限（= VFS64_MAX_FILE_BYTES）
+#define FD64_FILE_MAX   VFS64_MAX_FILE_BYTES   // ★ 批次 M：单文件上限 8 MiB（= VFS64_MAX_FILE_BYTES；
+                                               //   v2 旧卷由 vfs64 按卷布局把关成 67584 B）
+#define FD64_IO_CHUNK   4096u                  // 单次 read/write 的**推荐**分块（缓冲由调用方给；
+                                               //   一次更大的长度也支持，只是调用方要装得下）
 
 // open 标志（Linux 的一个子集；不认识的高位一律忽略）
 #define FD64_O_RDONLY    0x0000u

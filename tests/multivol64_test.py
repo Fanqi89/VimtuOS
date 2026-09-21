@@ -119,6 +119,14 @@ def vfs3_inode(buf, vol, idx):
                 d3=_u32(raw, 20), ind=_u32(raw, 24), parent=_u32(raw, 28))
 
 
+def vfs3_inode_dind(buf, vol, idx):
+    """★ 批次 M：v3 inode 偏移 71 的二级间接块指针（0 = 没有；v2 卷没有这个字段）。"""
+    if vol["ver"] != 3:
+        return 0
+    raw = vfs3_inode_raw(buf, vol, idx)
+    return _u32(raw, 71) if len(raw) >= 75 else 0
+
+
 def vfs3_read(buf, vol, idx):
     ino = vfs3_inode(buf, vol, idx)
     size = ino["size"]
@@ -128,6 +136,16 @@ def vfs3_read(buf, vol, idx):
     if ino["ind"]:
         p = (vol["start"] + ino["ind"]) * SECTOR
         ptrs += [_u32(buf, p + 4 * k) for k in range(128)]
+    dind = vfs3_inode_dind(buf, vol, idx)          # ★ 二级间接块：128 个子块 x 128 个块号
+    if dind:
+        p = (vol["start"] + dind) * SECTOR
+        for c in range(128):
+            cb = _u32(buf, p + 4 * c)
+            if cb == 0:
+                ptrs += [0] * 128
+                continue
+            q = (vol["start"] + cb) * SECTOR
+            ptrs += [_u32(buf, q + 4 * k) for k in range(128)]
     out = bytearray()
     for k in range((size + SECTOR - 1) // SECTOR):
         blk = ptrs[k]

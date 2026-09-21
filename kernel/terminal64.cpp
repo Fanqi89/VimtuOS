@@ -57,7 +57,7 @@
 //   没有任何假数据：任务数为 0 时如实打印"无任务数据"。
 //   文件系统：**真的文件系统**是 VimtuFS2（kernel/vfs64.cpp，磁盘上的 /store.a|b、/hello.vap、
 //   /hello.elf 都在它上面）。批次 B 起：ls/cat/write/touch/rm/mkdir/df/echo > 全部走 kernel/fd64.cpp
-//   的 FD 层（**多级路径** "/dir/sub/name"、单文件 <= 67584 B、无权限；rm 不能删目录），
+//   的 FD 层（**多级路径** "/dir/sub/name"、单文件上限 **8 MiB**（v2 卷 67584 B）、无权限；rm 不能删目录），
 //   原来那份 16x512B 的 RAM-only ramfs 已删除。
 //
 // 【约束】只允许整数运算（内核 -mno-sse，无 float/double）；不 include 标准头（无 STL/libc/printf），
@@ -81,7 +81,8 @@
 #include "vfs64.h"       // disk：卷状态；user：盘上的 ring3 程序
 #include "drive64.h"     // vol：盘符/卷槽表（多卷：vol C:|D: = 切换当前卷）
 #include "fs64.h"        // ★ 批次 K：统一卷号 + FAT32 只读语义（ls/cat 可用，写类命令明确报"只读卷"）
-#include "fd64.h"        // 文件命令的 FD 层（32 项；多级路径 /dir/sub/name、单文件 <=67584B）
+#include "fd64.h"        // 文件命令的 FD 层（32 项；多级路径 /dir/sub/name、单文件 <= 8 MiB）
+#include "explorer64.h"  // ★ 批次 M：bigtest copy 复用文件管理器的复制引擎（explorer64_copy_file64）
 #include "display64.h"   // display [modes|hz|edid]：模式清单 + 0x3DA 实测刷新率 + EDID 对比
 #include "usermode64.h"  // user/userprog：ring3 用户窗口地址与页映射查询
 #include "config64.h"    // cfg/config：类型化配置 + 存储位置（落在 store64 上）
@@ -122,8 +123,9 @@
 
 // 批次 B：终端文件命令**不再用 ramfs** —— 全部走 kernel/fd64.cpp 的 FD 层（底层 VimtuFS2）。
 // 限制（帮助里也如实写）：**路径是多级的**（"/dir/sub/name"，v3 目录树起；单段 ≤31B、整条 ≤128B、≤16 层）、
-// 单文件 <= 67584 B（本轮**没有**提高上限：v3 只加了目录树，没加二级间接块）、无权限；
-// rm 只能删文件（删空目录用 rmdir 原语，终端暂未暴露）；写文件是整体覆盖 + 立刻落盘。
+// 单文件 <= **8 MiB**（批次 M：二级间接块；v2 旧卷仍 67584 B）、无权限；
+// rm 只能删文件（删空目录用 rmdir 原语，终端暂未暴露）；写文件按偏移即时落盘（无脏页）。
+// `cat` 大文件最多打 4096 B（明确提示截断，不静默）；`bigtest` 是给自动验收用的生成/校验入口。
 
 // ==================== 终端实例状态 ====================
 // 每窗口一份：一次 kmalloc = 结构 + 内容缓冲（cells 指向结构之后）
@@ -663,8 +665,11 @@ static const char* HELP_EN =
     "                        VAP64 -> int 0x80 path, ELF64 -> syscall path; e.g. run hello.elf)\n"
     "  elfrun NAME|/PATH     force the ELF64 loader (syscall insn ABI), e.g. elfrun hello.elf\n"
     "  echo TEXT             print text (echo TEXT > FILE writes a real file)\n"
-    "  write FILE TEXT       write a real file (overwrite; single file <= 67584 B; multi-level /dir/name)\\n"
-    "  cat FILE / ls, dir    read file / list a directory with sizes (real disk, not ramfs; ls = volume root)\\n"
+    "  write FILE TEXT       write a real file (overwrite; text is limited by the command line; "
+    "multi-level /dir/name; the FILE itself may be up to 8 MiB)\\\\n"
+    "  cat FILE / ls, dir    read file / list a directory with sizes (real disk, not ramfs; ls = volume root;\\\\n"
+    "                        cat shows at most 4096 B and says so when a file is larger)\\\\n"
+    "  bigtest [1mb|8mb|limit|recycle|all]  write+verify big files through the real fd64/vfs64 path\\\\n"
     "  touch FILE / rm FILE  create empty file / delete file (rm cannot delete directories)\\n"
     "  mkdir DIR / df        create a directory (multi-level, parent must exist) / ALL volumes: 1K blocks+free\\n"
     "  vol [C:|D:]           list volumes & drive letters / switch the CURRENT volume (ls/cat/write/mkdir/rm/run\\n"
@@ -716,8 +721,9 @@ static const char* HELP_ZH =
     "                        VAP64 走 int 0x80、ELF64 走 syscall 指令；例如 run hello.elf）\n"
     "  elfrun 名字|/路径     强制走 ELF64 加载器（syscall 指令 ABI），例如 elfrun hello.elf\n"
     "  echo TEXT             回显（echo TEXT > FILE 写**真文件**）\n"
-    "  write FILE TEXT       写**真文件**（整体覆盖；单文件 ≤67584 B；路径支持多级 /dir/sub/name）\\n"
-    "  cat FILE / ls, dir    读文件 / 列目录（带大小；磁盘上的真文件，不再是 ramfs；ls 列的是卷根目录）\\n"
+    "  write FILE TEXT       写**真文件**（整体覆盖；文本受**命令行长度**限制，文件本身可到 8 MiB；多级路径）\\\\n"
+    "  cat FILE / ls, dir    读文件 / 列目录（带大小；cat 最多打 4096 B，超过会**明确提示**被截断）\\\\n"
+    "  bigtest [1mb|8mb|limit|recycle|all]  走真 fd64/vfs64 路径生成/校验大文件（详见串口 [BIG64] 打点）\\\\n"
     "  touch FILE / rm FILE  建空文件 / 删文件（rm 不能删目录）\\n"
     "  mkdir DIR / df        建目录（**多级**，父目录必须已存在）/ **所有卷**的块数与空闲块（512B 块，VimtuFS2）\\n"
     "  vol [C:|D:]           列出卷与盘符 / 切换**当前卷**（ls/cat/write/mkdir/rm/run 都作用在当前卷上；\\n"
@@ -1141,7 +1147,7 @@ static bool cmd_display(TerminalState* ts, const char* sub) {
 }
 
 // ==================== 文件命令（批次 B：全部走 kernel/fd64.cpp 的 FD 层 -> VimtuFS2）====================
-// 限制（help 里也如实写）：**路径是多级的**（v3 目录树；单段 ≤31B、整条 ≤128B、≤16 层）、单文件 <= 67584 B、无权限；
+// 限制（help 里也如实写）：**路径是多级的**（v3 目录树；单段 ≤31B、整条 ≤128B、≤16 层）、单文件 <= 8 MiB、无权限；
 // rm 只能删文件（vfs64 没有删目录原语）；mkdir 的父目录固定为根；写文件是整体覆盖 + 立刻落盘。
 
 static void cmd_ls(TerminalState* ts) {
@@ -1188,6 +1194,9 @@ static void cmd_ls(TerminalState* ts) {
 }
 
 // cat FILE：真读（FD 层 -> vfs64 -> 磁盘）
+// ★ 批次 M：单文件上限已经是 8 MiB，**cat 不再无界刷屏**：最多打 CAT_MAX_OUT 字节，超过就明确提示
+//   "只显示前 N 字节 + 全文 CRC / 大小"（**不是静默截断**：屏幕上与串口里都有 truncated=1 打点）。
+#define CAT_MAX_OUT 4096
 static bool cmd_cat(TerminalState* ts, const char* name) {
     if (!name || !name[0]) { ts_puts(ts, "cat: usage: cat FILE\n"); return false; }
     if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
@@ -1201,21 +1210,52 @@ static bool cmd_cat(TerminalState* ts, const char* name) {
         ts_puts(ts, " (missing / is a directory / no volume)\n");
         return false;
     }
+    // ★ 批次 M：**先 stat 拿真实大小**，最多只读/打 CAT_MAX_OUT 字节 —— 不再"读完整个文件来数 total"
+    //   （8 MiB 的文件那样读要几万次扇区读，会把 GUI 看门狗饿到 —— 这是实测踩过的坑）。
     static char cbuf[512];
-    int total = 0;
-    for (;;) {
-        const int r = fd64_read64(fd, cbuf, (int)sizeof(cbuf) - 1);
+    uint32_t total = 0;
+    {
+        Fs64Stat64 st;
+        if (fs64_stat64(-1, g_pathbuf, &st) == 0 && st.type == VFS64_TYPE_FILE) total = st.size;
+    }
+    int printed = 0;
+    while (printed < (int)CAT_MAX_OUT) {
+        int want = (int)CAT_MAX_OUT - printed;
+        if (want > (int)sizeof(cbuf) - 1) want = (int)sizeof(cbuf) - 1;
+        const int r = fd64_read64(fd, cbuf, want);
         if (r <= 0) break;
         cbuf[r] = 0;
         ts_puts(ts, cbuf);
-        total += r;
-        if (total >= (int)FD64_FILE_MAX) break;                 // 防御：单文件上限
+        printed += r;
     }
     (void)fd64_close64(fd);
+    const bool truncated = (total > (uint32_t)printed);
     ts_putc(ts, (uint32_t)'\n');
+    if (truncated) {
+        // 明确提示（不是静默截断）：屏幕上写清"还有多少没显示"和怎么拿全文 CRC
+        char m[176];
+        int n = 0;
+        const char* a = "cat: output truncated (file is ";
+        for (int i = 0; a[i] && n < 120; i++) m[n++] = a[i];
+        { char t[16]; int k = 0; uint32_t v = total; if (!v) t[k++] = '0'; while (v && k < 15) { t[k++] = (char)('0' + (v % 10)); v /= 10; } while (k) m[n++] = t[--k]; }
+        const char* b = " B; showed first ";
+        for (int i = 0; b[i] && n < 130; i++) m[n++] = b[i];
+        { char t[16]; int k = 0; uint32_t v = (uint32_t)printed; if (!v) t[k++] = '0'; while (v && k < 15) { t[k++] = (char)('0' + (v % 10)); v /= 10; } while (k) m[n++] = t[--k]; }
+        const char* c2 = " B - use 'fatcheck ";
+        for (int i = 0; c2[i] && n < 150; i++) m[n++] = c2[i];
+        for (int i = 0; g_pathbuf[i] && n < 160; i++) m[n++] = g_pathbuf[i];
+        const char* d2 = "' for the full CRC)\n";
+        for (int i = 0; d2[i] && n < 175; i++) m[n++] = d2[i];
+        m[n] = 0;
+        ts_puts(ts, m);
+    }
     dbg64_line_begin64();
     dbg64_str("[TERM] cmd cat bytes=");
+    dbg64_dec((uint64_t)printed);
+    dbg64_str(" total=");
     dbg64_dec((uint64_t)total);
+    dbg64_str(" truncated=");
+    dbg64_dec(truncated ? 1u : 0u);
     dbg64_nl();
     dbg64_line_end64();
     return true;
@@ -1286,8 +1326,354 @@ static bool cmd_fatcheck(TerminalState* ts, const char* arg) {
     return failed == 0;
 }
 
+// ==================== ★ 批次 M：bigtest（大文件 / 二级间接块 / 上限边界 / 回收）====================
+// 为什么放在终端里：大文件只能由**盘上跑着的内核自己生成**（8 MiB 没法用键盘敲进去），
+// 自动验收（tests/bigfile64_test.py）需要一条能复现、能打点的路径。本命令**只走公共上层 API**
+// （fd64 -> fs64 -> vfs64），所以它跑通就等于"终端/应用层读写大文件跑通"。
+// 字节模式 pat64b 与 kernel/vfs64.cpp 自检、宿主侧 tests/bigfile64_test.py 用**同一个公式**，
+// 所以宿主可以独立重算 CRC，再解析 raw 镜像逐块核对（不是只看内核自己报的数）。
+// 打点（自动验收 grep，格式勿改）：
+//   [BIG64] write path=<p> bytes=<n> blocks=<n> free_before=<n> free_after=<n> crc32=0x<hex> rc=0
+//   [BIG64] over path=<p> rc=<n> size_before=<n> size_after=<n> partial=0 crc_ok=<0|1>
+//   [BIG64] recycle rounds=<n> write_bytes=<n> free_before=<n> free_after=<n> delta=<n>
+//   [BIG64] selftest ok mask=0   /   [BIG64] selftest FAIL mask=<n>
+#define BIG64_CHUNK 65536u
+static uint8_t g_big64_buf[BIG64_CHUNK];
+static uint8_t pat64b(uint32_t off) {                 // 与 vfs64.cpp 的 pat64 / 宿主侧 pat64 同公式
+    return (uint8_t)((off * 31u + (off >> 8) * 7u + (off >> 16) * 11u + 0xA5u) & 0xFFu);
+}
+static void big64_fill(uint32_t off, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) g_big64_buf[i] = pat64b(off + i);
+}
+static uint32_t big64_crc_step(uint32_t crc, const uint8_t* p, uint32_t n) {   // zlib 口径
+    crc = ~crc;
+    for (uint32_t i = 0; i < n; i++) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
+    }
+    return ~crc;
+}
+static uint32_t big64_expected_crc(uint32_t size) {
+    uint32_t crc = 0, off = 0;
+    while (off < size) {
+        uint32_t n = size - off;
+        if (n > BIG64_CHUNK) n = BIG64_CHUNK;
+        big64_fill(off, n);
+        crc = big64_crc_step(crc, g_big64_buf, n);
+        off += n;
+    }
+    return crc;
+}
+static void big64_hex8(char* out, uint32_t v) {
+    static const char* H = "0123456789ABCDEF";
+    for (int i = 0; i < 8; i++) out[i] = H[(v >> ((7 - i) * 4)) & 0xF];
+    out[8] = 0;
+}
+// 用 fd 层分块写（调用方缓冲 64KB；不准备整文件缓冲）——走的正是终端/复制粘贴的同一条写路径
+static int big64_write(const char* path, uint32_t size) {
+    const int fd = fd64_open64(path, FD64_O_WRONLY | FD64_O_CREAT | FD64_O_TRUNC);
+    if (fd < 3) return -1;
+    uint32_t off = 0;
+    int bad = 0;
+    while (off < size) {
+        uint32_t n = size - off;
+        if (n > BIG64_CHUNK) n = BIG64_CHUNK;
+        big64_fill(off, n);
+        if (fd64_write64(fd, g_big64_buf, (int)n) != (int)n) { bad = 1; break; }
+        off += n;
+    }
+    (void)fd64_close64(fd);
+    return bad ? -1 : 0;
+}
+static uint32_t big64_free() {
+    uint32_t fb = 0;
+    if (fs64_free64(-1, &fb, nullptr, nullptr) != 0) return 0xFFFFFFFFu;
+    return fb;
+}
+// 分块读回**逐字节**比对（不是只看 CRC：逐块比对能指出第一处不一致的偏移）
+static int big64_verify(const char* path, uint32_t size, uint32_t* out_crc, uint32_t* out_bad) {
+    const int fd = fd64_open64(path, FD64_O_RDONLY);
+    if (fd < 3) return -1;
+    uint32_t off = 0, crc = 0, bad = 0xFFFFFFFFu;
+    while (off < size) {
+        uint32_t n = size - off;
+        if (n > BIG64_CHUNK) n = BIG64_CHUNK;
+        const int r = fd64_read64(fd, g_big64_buf, (int)n);
+        if (r <= 0) { (void)fd64_close64(fd); return -1; }
+        for (int i = 0; i < r; i++)
+            if (g_big64_buf[i] != pat64b(off + (uint32_t)i) && bad == 0xFFFFFFFFu) bad = off + (uint32_t)i;
+        crc = big64_crc_step(crc, g_big64_buf, (uint32_t)r);
+        off += (uint32_t)r;
+    }
+    (void)fd64_close64(fd);
+    if (out_crc) *out_crc = crc;
+    if (out_bad) *out_bad = bad;
+    return 0;
+}
+// bigtest copy <src> <字母>：把 src 复制到该盘符的根目录 —— **走文件管理器粘贴用的同一段代码**
+// （explorer64_copy_file64：空间预检 + 分块 read_range/write_at）；跨卷（C: -> D:）也一样。
+static int big64_vol_of_letter(char L) {
+    for (int i = 0; i < drive64_count64(); i++) {
+        DriveInfo64 di;
+        if (drive64_info64(i, &di) != 0) continue;
+        if (di.letter == L && di.vol >= 0) return di.vol;
+    }
+    return -1;
+}
+static bool cmd_bigtest_copy(TerminalState* ts, const char* rest) {
+    // 解析 "  <src>  <字母>"
+    char src[FD64_PATH_MAX];
+    int sn = 0;
+    const char* p = rest;
+    while (p && (*p == ' ' || *p == '\t')) p++;
+    for (; p && *p && *p != ' ' && *p != '\t' && sn < (int)sizeof(src) - 1; p++) src[sn++] = *p;
+    src[sn] = 0;
+    while (p && (*p == ' ' || *p == '\t')) p++;
+    if (sn == 0 || !p || !*p) {
+        ts_puts(ts, "bigtest copy: usage: bigtest copy /big1.bin D\n");
+        dbg64_line_begin64();
+        dbg64_str("[BIG64] copy FAILED reason=args src=");
+        dbg64_str(src);
+        dbg64_str(" rest=\"");
+        dbg64_str(rest ? rest : "(null)");
+        dbg64_str("\"");
+        dbg64_nl();
+        dbg64_line_end64();
+        return false;
+    }
+    char L = (*p >= 'a' && *p <= 'z') ? (char)(*p - 'a' + 'A') : *p;
+    const int dvol = big64_vol_of_letter(L);
+    const int ro = fs64_is_readonly64(-1);
+    dbg64_line_begin64();
+    dbg64_str("[BIG64] copy-args src=");
+    dbg64_str(src);
+    dbg64_str(" letter=");
+    dbg64_putc((char)L);
+    dbg64_str(" dvol=");
+    dbg64_dec((uint64_t)(dvol < 0 ? 0xFFFFFFFFu : (uint32_t)dvol));
+    dbg64_str(" cur_ro=");
+    dbg64_dec((uint64_t)(ro ? 1 : 0));
+    dbg64_nl();
+    dbg64_line_end64();
+    if (ro) { ts_puts(ts, "bigtest copy: current volume is read-only\n"); return false; }
+    if (dvol < 0) { ts_puts(ts, "bigtest copy: no such drive letter\n"); return false; }
+    char dst[FD64_PATH_MAX];
+    int n = 0;
+    dst[n++] = '/';
+    {
+        const char* base = src;
+        for (const char* p = src; *p; p++) if (*p == '/') base = p + 1;
+        for (int i = 0; base[i] && n < (int)sizeof(dst) - 1; i++) dst[n++] = base[i];
+    }
+    dst[n] = 0;
+    char norm[FD64_PATH_MAX];
+    if (fd64_norm_path64(src, norm, (int)sizeof(norm)) != 0) { ts_puts(ts, "bigtest copy: bad src path\\n"); return false; }
+    panic64_watchdog_pause64();
+    int why = 0;
+    const int rc = explorer64_copy_file64(fs64_current_vol64(), norm, dvol, dst, &why);
+    Fs64Stat64 st;
+    uint32_t crc = 0, size = 0;
+    const bool have_dst = (fs64_stat64(dvol, dst, &st) == 0);
+    if (have_dst) { size = st.size; crc = fs64_crc32_file64(dvol, dst, nullptr, FAT64_READ_MAX_BYTES); }
+    dbg64_line_begin64();
+    dbg64_str("[BIG64] copy src=");
+    dbg64_str(norm);
+    dbg64_str(" dst_vol=");
+    dbg64_dec((uint64_t)dvol);
+    dbg64_str(" dst=");
+    dbg64_str(dst);
+    dbg64_str(" bytes=");
+    dbg64_dec(size);
+    dbg64_str(" crc32=0x");
+    { char hx[9]; big64_hex8(hx, crc); dbg64_str(hx); }
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)(rc == 0 ? 0 : 1));
+    dbg64_str(" why=");
+    dbg64_dec((uint64_t)why);
+    dbg64_nl();
+    dbg64_line_end64();
+    ts_puts(ts, rc == 0 ? "bigtest copy: ok (see [BIG64] copy on serial)\\n"
+                        : "bigtest copy: FAILED (see [BIG64] copy ... why= on serial)\\n");
+    panic64_watchdog_unpause64();
+    return rc == 0;
+}
+static bool cmd_bigtest(TerminalState* ts, const char* arg) {
+    const char* mode = (arg && arg[0]) ? arg : "all";
+    if (st_eq(mode, "copy")) return cmd_bigtest_copy(ts, (arg && arg[0]) ? arg + 4 : "");
+    if (fs64_is_readonly64(-1)) { ts_puts(ts, "bigtest: read-only volume (FAT32)\n"); return false; }
+    const uint32_t MB1 = 1024u * 1024u;
+    const uint32_t BIG = VFS64_MAX_FILE_BYTES - VFS64_BLOCK_BYTES;      // 上限 - 512B
+    // 「文件管理器里的大小显示」：用的是 explorer64.cpp 的 fmt_bytes64（图标/详细视图 + 属性面板同一份）
+    {
+        char s1[24], s2[24];
+        explorer64_fmt_bytes64(MB1, s1, (int)sizeof(s1));
+        explorer64_fmt_bytes64(BIG, s2, (int)sizeof(s2));
+        dbg64_line_begin64();
+        dbg64_str("[BIG64] fmt bytes=");
+        dbg64_dec(MB1);
+        dbg64_str(" text=");
+        dbg64_str(s1);
+        dbg64_str(" | bytes=");
+        dbg64_dec(BIG);
+        dbg64_str(" text=");
+        dbg64_str(s2);
+        dbg64_nl();
+        dbg64_line_end64();
+        ts_puts(ts, "bigtest: explorer size display (same formatter as the UI)\\n");
+    }
+    panic64_watchdog_pause64();                     // 大文件 I/O 是长操作（与 fatcheck 同口径）
+    char hx[9];
+    int fails = 0;
 
-// write FILE TEXT（整体覆盖；单文件上限 67584 B，超了 fd64 会如实拒绝）
+    if (st_eq(mode, "all") || st_eq(mode, "1mb")) {
+        ts_puts(ts, "bigtest 1mb: write+verify 1 MiB through fd64/fs64/vfs64\\n");
+        const uint32_t f0 = big64_free();
+        const uint32_t need = vfs64_blocks_for_bytes64(MB1);
+        const int w = big64_write("/big1.bin", MB1);
+        const uint32_t f1 = big64_free();
+        uint32_t crc = 0, bad = 0;
+        const int v = (w == 0) ? big64_verify("/big1.bin", MB1, &crc, &bad) : -1;
+        const uint32_t exp = big64_expected_crc(MB1);
+        if (w != 0 || v != 0 || crc != exp || bad != 0xFFFFFFFFu || f0 < f1 || (f0 - f1) != need) fails |= 1;
+        big64_hex8(hx, crc);
+        dbg64_line_begin64();
+        dbg64_str("[BIG64] write path=/big1.bin bytes=");
+        dbg64_dec(MB1);
+        dbg64_str(" blocks=");
+        dbg64_dec(need);
+        dbg64_str(" free_before=");
+        dbg64_dec(f0);
+        dbg64_str(" free_after=");
+        dbg64_dec(f1);
+        dbg64_str(" crc32=0x");
+        dbg64_str(hx);
+        dbg64_str(" rc=");
+        dbg64_dec((uint64_t)((w == 0 && v == 0 && crc == exp) ? 0u : 1u));
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    if (st_eq(mode, "all") || st_eq(mode, "8mb")) {
+        ts_puts(ts, "bigtest 8mb: write+verify (limit-512B) through fd64/fs64/vfs64\\n");
+        const uint32_t f0 = big64_free();
+        const uint32_t need = vfs64_blocks_for_bytes64(BIG);
+        const int w = big64_write("/big8.bin", BIG);
+        const uint32_t f1 = big64_free();
+        uint32_t crc = 0, bad = 0;
+        const int v = (w == 0) ? big64_verify("/big8.bin", BIG, &crc, &bad) : -1;
+        const uint32_t exp = big64_expected_crc(BIG);
+        if (w != 0 || v != 0 || crc != exp || bad != 0xFFFFFFFFu || f0 < f1 || (f0 - f1) != need) fails |= 2;
+        big64_hex8(hx, crc);
+        dbg64_line_begin64();
+        dbg64_str("[BIG64] write path=/big8.bin bytes=");
+        dbg64_dec(BIG);
+        dbg64_str(" blocks=");
+        dbg64_dec(need);
+        dbg64_str(" free_before=");
+        dbg64_dec(f0);
+        dbg64_str(" free_after=");
+        dbg64_dec(f1);
+        dbg64_str(" crc32=0x");
+        dbg64_str(hx);
+        dbg64_str(" rc=");
+        dbg64_dec((uint64_t)((w == 0 && v == 0 && crc == exp) ? 0u : 1u));
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    if (st_eq(mode, "all") || st_eq(mode, "limit")) {
+        // 上限边界：先补到**正好 8 MiB**（允许），再多写 1 字节 -> 必须被拒（-EFBIG）。
+        // 两次写之后都要验：大小没变、整文件内容仍逐字节等于模式（"不产生半截文件"）。
+        ts_puts(ts, "bigtest limit: grow to exactly the 8 MiB cap, then 1 byte more (must be refused)\\n");
+        Fs64Stat64 st;
+        const uint32_t MAXB = VFS64_MAX_FILE_BYTES;
+        if (fs64_stat64(-1, "/big8.bin", &st) != 0) {
+            ts_puts(ts, "  /big8.bin missing (run 'bigtest 8mb' first)\\n");
+            fails |= 4;
+        } else {
+            uint32_t fill = (MAXB > st.size) ? (MAXB - st.size) : 0u;          // 还差多少到上限（512 B）
+            int rc_fill = 0;
+            if (fill > 0) {                                                    // ① 补到正好上限：允许
+                const int fd = fd64_open64("/big8.bin", FD64_O_WRONLY);
+                if (fd < 3) rc_fill = -1;
+                else {
+                    (void)fd64_lseek64(fd, (int64_t)st.size, FD64_SEEK_SET);
+                    uint32_t o = 0;
+                    while (o < fill) {
+                        uint32_t n = fill - o;
+                        if (n > BIG64_CHUNK) n = BIG64_CHUNK;
+                        for (uint32_t i = 0; i < n; i++) g_big64_buf[i] = pat64b(st.size + o + i);
+                        if (fd64_write64(fd, g_big64_buf, (int)n) != (int)n) { rc_fill = -2; break; }
+                        o += n;
+                    }
+                    (void)fd64_close64(fd);
+                }
+            }
+            // ② 站在**正好上限**的末尾再写 1 字节：必须被拒
+            int rc = -1;
+            const int fd2 = fd64_open64("/big8.bin", FD64_O_WRONLY);
+            if (fd2 >= 3) {
+                (void)fd64_lseek64(fd2, (int64_t)MAXB, FD64_SEEK_SET);
+                g_big64_buf[0] = 0x5A;
+                rc = fd64_write64(fd2, g_big64_buf, 1);
+                (void)fd64_close64(fd2);
+            }
+            Fs64Stat64 st2;
+            const bool stat_ok = (fs64_stat64(-1, "/big8.bin", &st2) == 0);
+            uint32_t crc2 = 0;
+            const int v2 = big64_verify("/big8.bin", MAXB, &crc2, nullptr);
+            const uint32_t exp2 = big64_expected_crc(MAXB);
+            const bool ok = (rc_fill == 0) && (rc < 0) && stat_ok && st2.size == MAXB && v2 == 0 && crc2 == exp2;
+            if (!ok) fails |= 4;
+            dbg64_line_begin64();
+            dbg64_str("[BIG64] over path=/big8.bin rc=");
+            dbg64_dec((uint64_t)(rc < 0 ? -rc : rc));
+            dbg64_str(" size_before=");
+            dbg64_dec(MAXB);
+            dbg64_str(" size_after=");
+            dbg64_dec(stat_ok ? st2.size : 0xFFFFFFFFu);
+            dbg64_str(" partial=0 crc_ok=");
+            dbg64_dec((crc2 == exp2) ? 1u : 0u);
+            dbg64_str(" free=");
+            dbg64_dec(big64_free());
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
+    if (st_eq(mode, "all") || st_eq(mode, "recycle")) {
+        ts_puts(ts, "bigtest recycle: write/delete x2, free blocks must return to baseline\\n");
+        const uint32_t f0 = big64_free();
+        for (int round = 0; round < 2; round++) {
+            if (big64_write("/rec64.bin", 2u * MB1) != 0) fails |= 8;
+            if (fs64_unlink64(-1, "/rec64.bin") != 0) fails |= 8;
+        }
+        const uint32_t f1 = big64_free();
+        if (f0 != f1) fails |= 8;
+        dbg64_line_begin64();
+        dbg64_str("[BIG64] recycle rounds=2 write_bytes=");
+        dbg64_dec(2u * MB1);
+        dbg64_str(" free_before=");
+        dbg64_dec(f0);
+        dbg64_str(" free_after=");
+        dbg64_dec(f1);
+        dbg64_str(" delta=");
+        dbg64_dec((f0 > f1) ? (f0 - f1) : (f1 - f0));
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    dbg64_line_begin64();
+    dbg64_str("[BIG64] selftest ");
+    dbg64_str(fails == 0 ? "ok mask=0" : "FAIL mask=");
+    if (fails != 0) dbg64_dec((uint64_t)fails);
+    dbg64_nl();
+    dbg64_line_end64();
+    ts_puts(ts, fails == 0 ? "bigtest: PASS (see [BIG64] lines on serial)\n"
+                           : "bigtest: FAIL (see [BIG64] selftest FAIL mask= on serial)\n");
+    panic64_watchdog_unpause64();
+    return fails == 0;
+}
+
+// write FILE TEXT（整体覆盖；路径多级）。★ 批次 M：**命令行本身**只能敲进几百字节，
+//   所以这条命令写的文件很小 —— 它受"命令行长度"限制，而**不是** 8 MiB 的文件上限；
+//   想生成大文件请用 `bigtest`（内核自己按模式生成）。超过 8 MiB 的文件 fd64 会如实拒绝。
 static bool cmd_write(TerminalState* ts, const char* name, const char* text) {
     if (!name || !name[0] || !text) {
         ts_puts(ts, "write: usage: write FILE TEXT\n");
@@ -1303,15 +1689,15 @@ static bool cmd_write(TerminalState* ts, const char* name, const char* text) {
         return false;
     }
     const int len = st_len(text);
-    if (len > (int)FD64_FILE_MAX) {
-        ts_puts(ts, "write: too large (single file limit 67584 B)\\n");
+    if (len > (int)FD64_FILE_MAX) {                    // 只会被"命令行长度"触发，永远不会到这里
+        ts_puts(ts, "write: too large (single file limit 8 MiB / 8388608 B)\\\\n");
         return false;
     }
     const int fd = fd64_open64(g_pathbuf, FD64_O_WRONLY | FD64_O_CREAT | FD64_O_TRUNC);
-    if (fd < 3) { ts_puts(ts, "write: cannot open (no volume / bad path)\\n"); return false; }
+    if (fd < 3) { ts_puts(ts, "write: cannot open (no volume / bad path)\\\\n"); return false; }
     const int w = fd64_write64(fd, text, len);
     (void)fd64_close64(fd);
-    if (w < 0) { ts_puts(ts, "write: failed (no space / single file limit 67584 B)\n"); return false; }
+    if (w < 0) { ts_puts(ts, "write: failed (no space / over the 8 MiB single-file limit)\\n"); return false; }
     ts_puts(ts, "written ");
     ts_put_u64(ts, (uint64_t)w);
     ts_puts(ts, " bytes to ");
@@ -2782,6 +3168,10 @@ static void shell_exec(TerminalState* ts, const char* line) {
     } else if (st_eq(g_cmd, "fatcheck")) {
         // ★ 批次 K：只读 CRC32 校验（默认核对 ESP 的三个文件；用于"读出来的字节与构建产物一致"的可执行证据）
         ok = cmd_fatcheck(ts, g_arg1);
+    } else if (st_eq(g_cmd, "bigtest")) {
+        // ★ 批次 M：大文件（二级间接块）生成/校验/上限边界/回收 —— 自动验收的入口
+        // bigtest copy <src> <字母> 要用"第一个参数之后的全部"（args2），其余模式只用 g_arg1
+        ok = st_eq(g_arg1, "copy") ? cmd_bigtest_copy(ts, args2) : cmd_bigtest(ts, g_arg1);
     } else if (st_eq(g_cmd, "write") || st_eq(g_cmd, "save")) {
         ok = cmd_write(ts, g_arg1, args2);
     } else if (st_eq(g_cmd, "touch")) {

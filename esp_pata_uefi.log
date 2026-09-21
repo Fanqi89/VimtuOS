@@ -1,0 +1,443 @@
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1,0x1)/Ata(Primary,Master,0x0)
+BdsDxe: starting Boot0001 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1,0x1)/Ata(Primary,Master,0x0)
+S12345J
+U:==== Vimtu64 UEFI 引导（自研 BOOTX64.EFI + 平铺长模式引导器）====
+U:loaded KERNEL64.BIN bytes=4096000
+U:missing SYSTEM.IMG (optional, skipped)
+U:gop 1280x800 fmt=1 lfb=80000000 pitch_px=1280
+U:e820 entries=64
+U:medium desc kind=0 (no payload: installed disk)
+U:bootinfo lfb=80000000 res=1280x800 pitch=5120
+U:direct map VA 0xFFFFFFFF80000000+PA, bytes=24
+U:pml4[511] before=0
+U:fw cr4=668 efer=D00 cr3=1F801000 cr0=80010033
+R
+U:ExitBootServices ok -> 进内核（全 64 位）
+U:high half check ok
+U:entry=FFFFFFFF80100000
+abBcdEsK[LM64] ENTERED LONG MODE efer=0000000000000D00
+[LM64] bss FFFFFFFF803CD400..FFFFFFFF82992000
+..... |[LM64] BSS CLEARED
+[LM64] BOOTINFO OK magic=0000000041555231
+[LM64] LFB addr=0000000080000000 size=1280x800 bpp=32 pitch=5120 mode=0x0000000000000000 modes=0 edid=0
+[LM64] E820[0] base=0000000000000000 len=00000000000A0000 type=1 size_kb=640
+[LM64] E820[1] base=0000000000100000 len=0000000000700000 type=1 size_kb=7168
+[LM64] E820[2] base=0000000000800000 len=0000000000008000 type=2 size_kb=32
+[LM64] E820[3] base=0000000000808000 len=0000000000003000 type=1 size_kb=12
+[LM64] E820[4] base=000000000080B000 len=0000000000001000 type=2 size_kb=4
+[LM64] E820[5] base=000000000080C000 len=0000000000005000 type=1 size_kb=20
+[LM64] E820[6] base=0000000000811000 len=00000000000EF000 type=2 size_kb=956
+[LM64] E820[7] base=0000000000900000 len=0000000000E80000 type=2 size_kb=14848
+[LM64] E820 usable_above_1M_kb=472748
+[MEM64] pool=[0000000008000000,000000001DE43000) pages=89667 free=89667 heap=[0000000005000000,0000000008000000)
+[HEAP64] before-selftest used=0KB alloc=0KB total=49152KB nalloc=0 nfree=0 walkmax=0
+[MEM64] selftest PASS mask=0 heap_used=0KB pages_free=89667
+[HEAP64] after-selftest used=0KB alloc=0KB total=49152KB nalloc=68 nfree=68 walkmax=1
+[HW64] cpu vendor=AuthenticAMD brand=QEMU Virtual CPU version 2.5+ cores=1 leafmax=0xd hyp=none
+[HW64] features=SMP:0 NX:1 PAE:1 SSE2:1 AVX:0 VMX:0 SMEP:0 LM:1
+[HW64] pci devices=6 ide=1 net=1 vga=1
+[HW64] pci 0:0.0 8086:1237 class=0x06 rev=0x02
+[HW64] pci 0:1.0 8086:7000 class=0x06 rev=0x00
+[HW64] pci 0:1.1 8086:7010 class=0x01 rev=0x00
+[HW64] pci 0:1.3 8086:7113 class=0x06 rev=0x03
+[HW64] pci 0:2.0 1234:1111 class=0x03 rev=0x02
+[HW64] pci 0:3.0 8086:100e class=0x02 rev=0x03
+[HW64] selftest PASS
+[ACPI64] rsdp=0x000000001F77E014 rev=2 oem=BOCHS  tables=5 src=uefi
+[ACPI64] madt cpus=1 ioapics=1 isos=5 lapic=0x00000000FEE00000
+[ACPI64] fadt sci=9 pm1a_cnt=0x000000000000B004 hpet=0x00000000FED00000 mcfg=无
+[ACPI64] selftest PASS
+[EDID64] present=0 (no EDID from firmware)
+[EDID64] selftest PASS
+[VFS64] system slot=0 (set by format)
+[VFS64] format ok blocks=64 version=3 inode=128 root=2
+[VFS64] mount ok blocks=64 inodes=16 free=58 version=3 inode=128B
+[VFS64] fake-disk write/read ok len=3000 crc=0x57081DF1
+[VFS64] fake-disk ls entries=3
+[VFS64] path component not found path=nope.bin
+[VFS64] stat64: not found
+[VFS64] path component not found path=alpha.bin
+[VFS64] stat64: not found
+[VFS64] path component not found path=alpha.bin
+[VFS64] read64: not found
+[VFS64] mkdir64: already exists
+[VFS64] mkdir64: already exists
+[VFS64] mkdir64: already exists
+[VFS64] mkdir64: already exists
+[VFS64] unlink64: refuse to remove a directory (use rmdir64)
+[VFS64] read64: not a file
+[VFS64] list64: not a directory
+[VFS64] ls: bad args
+[VFS64] path component not found path=x/y
+[VFS64] write: bad path
+[VFS64] path segment too long path=abcdefghijklmnopqrstuvwxyzabcdef
+[VFS64] write: bad path
+[VFS64] write64: too large
+[VFS64] stat64: bad args
+[VFS64] read64: bad args
+[VFS64] write64: bad args
+[VFS64] mount FAILED reason=magic
+[VFS64] mount FAILED reason=crc
+[VFS64] mount FAILED reason=version
+[VFS64] mount ok blocks=64 inodes=16 free=56 version=3 inode=128B
+[VFS64] BAD block=71 not in data area [6,64)
+[VFS64] skip corrupt inode=1 reason=crc
+[VFS64] path component not found path=hack2
+[VFS64] stat64: not found
+[VFS64] format FAILED reason=too-small sectors=31
+[VFS64] mount ok blocks=64 inodes=16 free=56 version=3 inode=128B
+[VFS64] path component not found path=/nope/x
+[VFS64] mkdir64: bad path / parent not found
+[VFS64] mkdir64: already exists
+[VFS64] readdir64: handle not open
+[VFS64] fake-disk tree root_entries=4 demo_entries=1
+[VFS64] write: path is a directory
+[VFS64] mkdir64: already exists
+[VFS64] unlink64: refuse to remove a directory (use rmdir64)
+[VFS64] path segment too long path=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+[VFS64] stat64: not found
+[VFS64] path segment too long path=zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+[VFS64] mkdir64: bad path / parent not found
+[VFS64] path component not found path=/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a
+[VFS64] stat64: not found
+[VFS64] path bad name path=/ab
+[VFS64] stat64: not found
+[VFS64] mount ok blocks=64 inodes=16 free=55 version=3 inode=128B
+[VFS64] path component not found path=/apps/demo/a.txt
+[VFS64] stat64: not found
+[VFS64] rmdir64: directory not empty
+[VFS64] rmdir64: refuse to remove the root directory
+[VFS64] path component not found path=/efi
+[VFS64] stat64: not found
+[VFS64] fake-disk tree/path/time/remount checks done
+[VFS64] write_stream64: no space (pre-flight)
+[VFS64] real-disk mount probe skipped (no mounted fs)
+[VFS64] format ok blocks=32 version=3 inode=128 root=2
+[VFS64] format ok blocks=32 version=3 inode=128 root=34
+[VFS64] activate slot=0 drive=0 start=0 blocks=32 version=3
+[VFS64] path component not found path=b.txt
+[VFS64] read64: not found
+[VFS64] activate slot=1 drive=0 start=32 blocks=32 version=3
+[VFS64] path component not found path=a.txt
+[VFS64] read64: not found
+[VFS64] activate slot=0 drive=0 start=0 blocks=32 version=3
+[VFS64] path component not found path=onlyB.txt
+[VFS64] stat64: not found
+[VFS64] stat64: bad args
+[VFS64] path component not found path=/dirB
+[VFS64] stat64: not found
+[VFS64] activate slot=1 drive=0 start=32 blocks=32 version=3
+[VFS64] path component not found path=b.txt
+[VFS64] read64: not found
+[VFS64] mount ok blocks=32 inodes=16 free=25 version=3 inode=128B
+[VFS64] mount slot=2 ok drive=0 start=0
+[VFS64] mount ok blocks=32 inodes=16 free=24 version=3 inode=128B
+[VFS64] mount slot=3 ok drive=0 start=32
+[VFS64] mount_slot64: bad slot=4 (slots=4)
+[VFS64] activate_slot64: bad slot=4 (slots=4)
+[VFS64] activate slot=2 drive=0 start=0 blocks=32 version=3
+[VFS64] read_on64: slot=99 not mounted
+[VFS64] multivol selftest ok
+[VFS64] format ok blocks=4096 version=3 inode=128 root=4098
+[VFS64] bigfile ok bytes=1572864 blocks=3097 ind=1 dind=1 free_delta=3097 unlink_back_to_base=1 crc=0xA2EC1872
+[VFS64] write_at64: too large (over the single-file limit)
+[VFS64] path component not found path=/huge.bin
+[VFS64] stat64: not found
+[VFS64] write_stream64: no space (pre-flight)
+[VFS64] path component not found path=/big2.bin
+[VFS64] stat64: not found
+[VFS64] recycle ok rounds=2 free_before=4078 free_after=4078 delta=0
+[VFS64] write_at64: too large (over the single-file limit)
+[VFS64] write64: too large
+[VFS64] path component not found path=/lim.bin
+[VFS64] stat64: not found
+[VFS64] limit ok max=8388608 over_rejected=2 rewrite_shrink=1 truncate_free=1
+[VFS64] selftest PASS
+[TASK64] init idle=kmain max=16 stack_bytes=16384 slice_ticks=2 hz=250
+[LM64] ptr_bits=64 cr3=000000001F801000 cr4=0000000000000668
+[LM64] kernel_image_kb=41544 limit_kb=4000
+[LM64] x86_init64 ...
+[X64] gdt kcode=08 kdata=10 udata=23 ucode=2B tss=30 limit=63 usr_ok=1
+[X64] isr32=FFFFFFFF8020E9DF table[32]=FFFFFFFF8020E9DF
+[X64] idt[32]=00000000000000DF 00000000000000E9 0000000000000008 0000000000000000 0000000000000000 000000000000008E 0000000000000020 0000000000000080 00000000000000FF 00000000000000FF 00000000000000FF 00000000000000FF 0000000000000000 0000000000000000 0000000000000000 0000000000000000 
+[X64] idt[32] sel=0000000000000008 attr=000000000000008E idtr.limit=0000000000000FFF idtr.base=FFFFFFFF803CD420
+[X64] PIC remapped, IDT/TSS loaded, PIT 250Hz
+[LM64] pre-sti rsp=000000000007BF90 cs=0000000000000008 ticks0=1
+[LM64] PIT IRQ OK ticks=12 irq_total=13 rtc=18:38:36
+[LM64] M0 PASS
+[G64] fb render=1280x800 phys=1280x800 zoom=100
+[G64] font faces=4 line_h=20
+[FONT64] faces=4 ascii=1 cjk=1 mono=1 fallback=1
+[FONT64] mono ascii=8 cjk=16 ratio=2
+[FONT64] fallback hit cp=0x2229 face=3
+[FONT64] selftest PASS mask=0x000000000000001F
+[G64] input ready (kbd irq1 + mouse irq12)
+[AHCI64] not found
+[USER64] user window NOT available (boot paging is firmware-owned, cr3=0x000000001F801000): firmware page tables are read-only -> ring3 demos skipped (UEFI path)
+[NVME64] not found
+[HWUI] report lines=33 storage=2 controllers=2
+[HWUI] selftest PASS
+[HWUI] report shown ms=5000 skipped=0
+[OS] booted from installed disk (system kernel, no installer)
+[APIC] lapic base=0x00000000FEE00000 id=0 svr=0x00000000000001FF enabled=1
+[APIC] ioapic #0 addr=0x00000000FEC00000 gsi_base=0 max_redir=23
+[APIC] route irq0 -> gsi=2 vec=32 dest=0
+[APIC] route irq1 -> gsi=1 vec=33 dest=0
+[APIC] route irq12 -> gsi=12 vec=44 dest=0
+[APIC] route irq14 -> gsi=14 vec=46 dest=0
+[APIC] pic masked all (8259 disabled)
+[APIC] irq mode = apic
+[APIC] selftest PASS
+[SMP] single cpu (no AP to start)
+[AHCI64] selftest skipped (no controller)
+[NVME64] selftest skipped (no controller)
+[ATA64] irq14 enabled (irq-driven waits, polling fallback)
+[ATA64] irq14 selftest reads=2 irqs=1 polled=0 status=ok
+[ATA64] irq14 selftest PASS
+[DISP64] vga measure=n/a samples=691052 edges=345526 reason=0x3da-toggles-per-read (untrustworthy edge rate)
+[DISP64] mode list=0 (no mode table from boot loader)
+[DISP64] init modes=0 cur=1280x800@unknown src=none bpp=32 pitch=5120
+[DISP64] ddc runtime re-probe skipped (i2c bit-bang risk; boot-time EDID only)
+[DISP64] selftest PASS
+[TASK64] selftest PASS
+[TASK64] create id=1 name=kheart slot=1 stack=0x0000000005000020 frame=0x0000000005003F48
+[TASK64] create id=2 name=kwork slot=2 stack=0x0000000005004040 frame=0x0000000005007F68
+[TASK64] create id=3 name=ksum slot=3 stack=0x0000000005008060 frame=0x000000000500BF88
+[TASK64] create id=4 name=kstress slot=4 stack=0x000000000500C080 frame=0x000000000500FFA8
+[TASK64] create id=5 name=kusb slot=5 stack=0x00000000050100A0 frame=0x0000000005013FC8
+[TASK64] critical id=2 name=kwork on=1
+[TASK64] kill denied reason=critical id=2 name=kwork
+[TASK64] critical id=2 name=kwork on=0
+[TASK64] slice id=2 name=kwork ticks=3
+[TASK64] slice id=2 name=kwork ticks=2
+[TASK64] create id=6 name=kforce slot=6 stack=0x00000000050140C0 frame=0x0000000005017FE8
+[TASK64] force-remove id=6 name=kforce slot=6 state=FREE
+[TASK64] diag slot=0 id=0 name=kmain state=2 ticks=0 switches=0 proc=0x0000000000000000 critical=1 slice=2 cpu_permille=0
+[TASK64] diag slot=1 id=1 name=kheart state=1 ticks=0 switches=0 proc=0x0000000000000000 critical=0 slice=2 cpu_permille=0
+[TASK64] diag slot=2 id=2 name=kwork state=1 ticks=0 switches=0 proc=0x0000000000000000 critical=0 slice=2 cpu_permille=0
+[TASK64] diag slot=3 id=3 name=ksum state=1 ticks=0 switches=0 proc=0x0000000000000000 critical=0 slice=2 cpu_permille=0
+[TASK64] diag slot=4 id=4 name=kstress state=1 ticks=0 switches=0 proc=0x0000000000000000 critical=0 slice=2 cpu_permille=0
+[TASK64] diag slot=5 id=5 name=kusb state=1 ticks=0 switches=0 proc=0x0000000000000000 critical=0 slice=2 cpu_permille=0
+[TASK64] diag tasks=6 cur=0 switches_total=0 kernel_cr3=0x000000001F801000
+[TASK64] api selftest PASS
+[TASK64] scheduler up tasks=6 cur=kmain
+[SYSCALL] int 0x80 gate installed (dpl=3, abi: rax=nr rdi/rsi/rdx=args ret=rax)
+[SYSCALL] msr init EFER.SCE=1 star=001B000800000000 lstar=FFFFFFFF8020EB70 fmask=0000000000000700
+[TASK64] kwork iters=1 acc=0x00000000DF93B9B9
+[TASK64] kwork iters=2 acc=0x0000000002E7FAB9
+[TASK64] ksum done sum=0x000000946150A870 iters=100000
+[TASK64] exit name=ksum id=3 ticks=0
+[TASK64] reap name=ksum id=3 stack_bytes=16384
+[SYSCALL] syscall insn entry ready (rustar: STAR=0x1B<<48|0x08<<32 -> CS=0x2B SS=0x23)
+[SYSCALL] msr init EFER.SCE=1 star=001B000800000000 lstar=FFFFFFFF8020EB70 fmask=0000000000000700
+[SYSCALL] syscall insn entry ready (rustar: STAR=0x1B<<48|0x08<<32 -> CS=0x2B SS=0x23)
+[SYSCALL] selftest PASS
+[USER64] ring3 demos skipped (user window unavailable on this boot path)
+[APP64] main partition drive=0 lba=8009 (from MBR type=0x07)
+[TASK64] kwork iters=3 acc=0x000000006B41FBD9
+[VFS64] mount FAILED reason=magic
+[VFS64] mount slot=0 FAILED (current)
+[VFS64] mount_system FAILED (mount)
+[APP64] boot: vfs64 mount failed -> install/launch skipped (terminal 'run' can retry)
+[APP64] boot: drive scan without system volume (FAT32 read-only volumes still browsable)
+[FAT64] format reject sectors=512 (< 66600，装不下 FAT32 的 65525 簇)
+[FAT64] format reject sectors=65536 (< 66600，装不下 FAT32 的 65525 簇)
+[FAT64] format reject sectors=66599 (< 66600，装不下 FAT32 的 65525 簇)
+[FAT64] format reject drive<0
+[FAT64] FAIL file: volume not ready
+[FAT64] FAIL mkdir: volume not ready
+[FAT64] format lba=0 sectors=69632 fs=FAT32 clusters=68512 free=68511 fat_sectors=544 spc=1
+[FAT64] mkdir path=EFI cluster=3
+[FAT64] mkdir path=EFI/BOOT cluster=4
+[FAT64] file path=EFI/BOOT/TEST.BIN bytes=3000 cluster=5
+[FAT64] FAIL mkdir: parent missing
+[FAT64] FAIL file: bad path
+[FAT64] list path=/ entries=1
+[FAT64] read path=/EFI/BOOT/TEST.BIN size=3000 bytes=3000
+[FAT64] reject path: component not found
+[FAT64] stat path=/NO/SUCH.TXT not found
+[FAT64] probe lba=9 fs=none (bad BPB)
+[FAT64] probe lba=163807 fs=FAT32 clusters=96736 spc=1 fatsz=768 label=VIMTU64ESP
+[FAT64] probe real disks=1 fat=1 (read-only)
+[FAT64] selftest PASS (FAT32, clusters=65525+)
+[FAT64] probe lba=9 fs=none (bad BPB)
+[FAT64] probe lba=8009 fs=none (bad BPB)
+[FAT64] probe lba=163807 fs=FAT32 clusters=96736 spc=1 fatsz=768 label=VIMTU64ESP
+[FAT64] mount vol=0 lba=163807 clusters=96736 free=88656 fat_ok=1 spc=1 ro=1
+[FS64] mount fat vol=4 disk=0 lba=163807 clusters=96736 spc=1 ro=1
+[DRV64] skipped (VimtuFS2 not mounted) - C: falls back to MBR type=0x07
+[DRV64] scan disks=1 parts=3 fs=1
+[DRV64] letter=C: disk=0 part=3 fs=FAT32 total_kb=48368 free_kb=44328 slot=- ro=1 fatvol=0
+[DRV64] skip lba=9 type=0xEF reason=esp
+[DRV64] skip lba=8009 type=unknown reason=no-fs
+[DRV64] dump entries=3 scanned=yes
+[DRV64] dump  [0] -- EFI 系统分区 fs=unknown disk=0 part=1 lba=9+8000 total_kb=unknown free_kb=unknown vol_v=- slot=- browsable=no system=no skip=esp
+[DRV64] dump  [1] -- 未识别分区 fs=unknown disk=0 part=2 lba=8009+155798 total_kb=unknown free_kb=unknown vol_v=- slot=- browsable=no system=no skip=no-fs
+[DRV64] dump  [2] C: EFI 系统分区 fs=FAT32 disk=0 part=3 lba=163807+98304 total_kb=48368 free_kb=44328 vol_v=- slot=- browsable=yes system=yes skip=none
+[TASK64] kheart beat=1 switches=323 ticks_now=1611
+[FAT64] probe lba=9 fs=none (bad BPB)
+[FAT64] probe lba=8009 fs=none (bad BPB)
+[FAT64] probe lba=163807 fs=FAT32 clusters=96736 spc=1 fatsz=768 label=VIMTU64ESP
+[DRV64] skipped (VimtuFS2 not mounted) - C: falls back to MBR type=0x07
+[DRV64] scan disks=1 parts=3 fs=1
+[DRV64] letter=C: disk=0 part=3 fs=FAT32 total_kb=48368 free_kb=44328 slot=- ro=1 fatvol=0
+[DRV64] skip lba=9 type=0xEF reason=esp
+[DRV64] skip lba=8009 type=unknown reason=no-fs
+[DRV64] activate letter=C: fatvol=0 disk=0 lba=163807 ok
+[DRV64] activate letter=Z: FAILED reason=no-letter
+[DRV64] selftest PASS
+[TASK64] stress spawn=200 done=200 reap=200 live=5 count=5 fail=0 PASS
+[TASK64] exit name=kstress id=4 ticks=108
+[TASK64] reap name=kstress id=4 stack_bytes=16384
+[FS64] reject vol=4 ro=1 op=write path=/__fs64test.tmp (read-only FAT32: write/delete/rename/mkdir are not implemented)
+[FS64] reject vol=4 ro=1 op=create path=/__fs64test.tmp (read-only FAT32: write/delete/rename/mkdir are not implemented)
+[FS64] reject vol=4 ro=1 op=mkdir path=/__fs64test.dir (read-only FAT32: write/delete/rename/mkdir are not implemented)
+[FS64] reject vol=4 ro=1 op=unlink path=/__fs64test.tmp (read-only FAT32: write/delete/rename/mkdir are not implemented)
+[FS64] reject vol=4 ro=1 op=rmdir path=/__fs64test.dir (read-only FAT32: write/delete/rename/mkdir are not implemented)
+[FS64] reject vol=4 ro=1 op=rename path=/__fs64test.tmp (read-only FAT32: write/delete/rename/mkdir are not implemented)
+[FAT64] reject path: component not found
+[FAT64] stat path=/__fs64test.tmp not found
+[FS64] activate FAILED vol=8 reason=no-such-volume
+[FAT64] reject path: component not found
+[FAT64] stat path=/__no_such_fs64_path__ not found
+[FS64] selftest PASS mask=0 vols=1 cur=4 kind=FAT32
+[EXPL] selftest PASS mask=0
+[VFS64] stat_on64: slot=0 not mounted
+[STORE64] WARN raw slot area LBA 8009 overlaps the data partition; use VFS-backed store
+[STORE64] slot=A invalid reason=magic
+[STORE64] slot=B invalid reason=magic
+[STORE64] both slots invalid -> defaults
+[STORE64] init via=raw slot=none gen=0 keys=0
+[VFS64] stat_on64: slot=0 not mounted
+[STORE64] selftest disk probe ok slotA=rd slotB=rd
+[STORE64] selftest PASS
+[STORE64] kv count=0 gen=0 slot=none
+[CONF64] init carrier=raw slot=none keys=0 defs=19
+[CONF64] default ui.lang=1 type=int
+[CONF64] default ui.text_mirror=0 type=int
+[CONF64] default mouse.sens=1700 type=int
+[CONF64] default display.zoom=100 type=int
+[CONF64] default icon.x0=24 type=int
+[CONF64] default icon.y0=24 type=int
+[CONF64] default icon.x1=24 type=int
+[CONF64] default icon.y1=108 type=int
+[CONF64] default icon.x2=24 type=int
+[CONF64] default icon.y2=192 type=int
+[CONF64] default win.term.w=974 type=int
+[CONF64] default win.term.h=678 type=int
+[CONF64] defaults n=19 shown=12
+[SESS64] policy=VOLATILE apps=9 keep=0 restore=(none)
+[SYS64] state=BOOT
+[SYS64] module mem64 registered
+[SYS64] module x86_64 registered
+[SYS64] module ata64 registered
+[SYS64] module vfs64 registered
+[SYS64] module store64 registered
+[SYS64] module task64 registered
+[SYS64] module apic64 registered
+[SYS64] module smp64 registered
+[SYS64] module hwinfo64 registered
+[SYS64] module acpi64 registered
+[SYS64] module edid64 registered
+[SYS64] module net64 registered
+[SYS64] module usb64 registered
+[SYS64] module syscall64 registered
+[SYS64] module usermode64 registered
+[SYS64] module config64 registered
+[SYS64] module session64 registered
+[SYS64] module sysstate64 registered
+[SYS64] module gui64 registered
+[PRELOAD64] init cache_cap=1408 lru_cap=256 cn_unique=200 cycles_per_ms=1966553
+[SYS64] module preload64 registered
+[VFS64] read_on64: slot=0 not mounted
+[UPDATE64] init version=0.1.0 applied=(none) carrier=raw pending=no
+[SYS64] module update64 registered
+[SYS64] state=STARTING
+[SYS64] module mem64 init ok (try=0)
+[SYS64] module x86_64 init ok (try=0)
+[SYS64] module ata64 init ok (try=0)
+[VFS64] stat_on64: slot=0 not mounted
+[SYS64] module vfs64 FAILED (critical, rc=-1)
+[SYS64] module store64 init ok (try=0)
+[SYS64] module task64 init ok (try=0)
+[SYS64] module apic64 init ok (try=0)
+[SYS64] module smp64 init ok (try=0)
+[SYS64] module hwinfo64 init ok (try=0)
+[SYS64] module acpi64 init ok (try=0)
+[SYS64] module edid64 DEGRADED (non-critical, rc=-1)
+[SYS64] module net64 init ok (try=0)
+[SYS64] module usb64 init ok (try=0)
+[SYS64] module syscall64 init ok (try=0)
+[SYS64] module usermode64 init ok (try=0)
+[SYS64] module config64 init ok (try=0)
+[SYS64] module session64 init ok (try=0)
+[SYS64] module sysstate64 init ok (try=0)
+[SYS64] module gui64 init ok (try=0)
+[SYS64] module preload64 init ok (try=0)
+[SYS64] module update64 init ok (try=0)
+[SYS64] stage STARTING done elapsed=32ms
+[TASK64] create id=207 name=watchdog slot=3 stack=0x0000000005008060 frame=0x000000000500BF88
+[WD64] watchdog task up id=207 period=250ms timeout=5000ms
+[E1000] pci 0:3.0 id=8086:100e bar0=0x81040000 mmio=ok
+[E1000] mac=52:54:00:12:34:56 link=up
+[E1000] init ok tx_desc=32 rx_desc=32
+[E1000] selftest PASS
+[NET64] config ip=10.0.2.15/24 gw=10.0.2.2 dns=10.0.2.3 mac=52:54:00:12:34:56
+[NET64] arp who-has 10.0.2.2
+[TASK64] kheart beat=2 switches=455 ticks_now=1865
+[TASK64] kheart beat=3 switches=583 ticks_now=2121
+[NET64] arp reply 10.0.2.2 is-at 52:55:0a:00:02:02 (rx=1 arp=1)
+[NET64] icmp reply from 10.0.2.2 seq=1 bytes=18 ttl=255 (tx=2 rx=2)
+[NET64] selftest PASS
+[USB64] not found (no UHCI controller)
+[USB64] selftest skipped (not found)
+[VFS64] read_on64: slot=0 not mounted
+[UPDATE64] no pending
+[PRELOAD64] prewarm set fits lru=256 (idempotent)
+[TASK64] kheart beat=4 switches=711 ticks_now=2377
+[PRELOAD64] glyphs prewarmed=432 ms=123
+[PRELOAD64] icons cached=4
+[PRELOAD64] first paint before=6469198 after=2219368 cycles
+[PRELOAD64] done glyphs_new=432 cached=638/1408 cn_unique=200 icons=4 icon_cache=4 ms=131 runs=1
+[CONF64] apply lang=zh zoom=100 mirror=0 sens=1700 icon0=24,24 icon1=24,108 icon2=24,192 startup=t0,m0,d1,h0
+[GUI64] desktop init 1280x800 taskbar=32 title_h=24
+[TASK64] kwork iters=256 acc=0x00000000BDE5A8D9
+[UI] boot logo show frames=12 fade=ok
+[GUI64] selftest PASS mask=0 slots=16
+[UI] start icon blit size=24
+[UI] clock text=2026-09-21 18:38:43
+[GUI64] ready
+[OS] ready (idle)
+[SESS64] restore skipped (mode=VOLATILE)
+[SYS64] state=RUNNING gen=1 modules=21
+[SYS64] health down modules=21 failed=2 degraded=0 unknown=3
+[SYS64] health module mem64 state=READY health=UP
+[SYS64] health module x86_64 state=READY health=UP
+[SYS64] health module ata64 state=READY health=UP
+[SYS64] health module vfs64 state=FAILED health=DOWN
+[SYS64] health module store64 state=READY health=UP
+[SYS64] health module task64 state=READY health=UP
+[SYS64] health module apic64 state=READY health=UP
+[SYS64] health module smp64 state=READY health=UP
+[SYS64] health module hwinfo64 state=READY health=UP
+[SYS64] health module acpi64 state=READY health=UP
+[SYS64] health module edid64 state=DEGRADED health=DOWN
+[SYS64] health module net64 state=READY health=UP
+[SYS64] health module usb64 state=READY health=unknown
+[SYS64] health module syscall64 state=READY health=unknown
+[SYS64] health module usermode64 state=READY health=unknown
+[SYS64] health module config64 state=READY health=UP
+[SYS64] health module session64 state=READY health=UP
+[SYS64] health module sysstate64 state=READY health=UP
+[SYS64] health module gui64 state=READY health=UP
+[SYS64] health module preload64 state=READY health=UP
+[SYS64] health module update64 state=READY health=UP
+[WD64] watchdog armed timeout=5000ms source=gui64-frame (kernel/panic64.cpp)
+[WD64] watchdog beat stale=20ms checks=1
+[TASK64] kheart beat=5 switches=839 ticks_now=2633
+[UI] clock text=2026-09-21 18:38:44
+[TASK64] kheart beat=6 switches=966 ticks_now=2887
+[TASK64] kheart beat=7 switches=1094 ticks_now=3143
+[UI] clock text=2026-09-21 18:38:45
+[TASK64] kheart beat=8 switches=1222 ticks_now=3399
+[TASK64] kwork iters=512 acc=0x00000000E84898D9

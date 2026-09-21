@@ -4,7 +4,7 @@
 //   块 0              : 超级块（见下面 VFS_O_* 偏移；末尾 0xAA55；CRC32 自校验）
 //   块 1 .. 1+bmn-1   : 空闲块位图（1 = 已用，额外把"分区外"的位也置 1，分配器永不发放）
 //   块 bp .. bp+ibn-1 : inode 表（v3 = 128B/个 4 个/块、v2 = 64B/个 8 个/块；inode 0 = 根目录）
-//   块 dp .. total-1  : 数据区（文件内容 + 一级间接块，文件最大 = 4*512 + 128*512 = 67584B）
+//   块 dp .. total-1  : 数据区（文件内容 + 一级/二级间接块；单文件最大 = 8 MiB，见 vfs64.h）
 //   bmn = ceil(total/4096)、ibn = ceil(inodes/每块 inode 数)、bp = 1+bmn、dp = bp+ibn
 //
 // 设计取舍（**目录树**）：
@@ -59,7 +59,7 @@ static const uint32_t VFS_I_NAMELEN = 1;     // u8  名字长度（v2 ≤27 / v3
 static const uint32_t VFS_I_RSVD    = 2;     // u16 保留（0）
 static const uint32_t VFS_I_SIZE    = 4;     // u32 文件字节数
 static const uint32_t VFS_I_D0      = 8;     // u32 直接块 0..3（偏移 8/12/16/20）
-static const uint32_t VFS_I_IND     = 24;    // u32 一级间接块（128 个块号）
+static const uint32_t VFS_I_IND     = 24;    // u32 一级间接块（128 个数据块号）
 static const uint32_t VFS_I_PARENT  = 28;    // u32 父目录 inode 号（根 = 自己 = 0）
 // v3 追加字段（v2 里 32..59 是名字、60 是 CRC）：
 static const uint32_t VFS_I3_MTIME  = 32;    // u32 打包时间戳
@@ -67,7 +67,10 @@ static const uint32_t VFS_I3_NLINK  = 36;    // u16 链接数
 static const uint32_t VFS_I3_KIND   = 38;    // u8  类型判定缓存
 static const uint32_t VFS_I3_RSVD2  = 39;    // u8  保留（0）
 static const uint32_t VFS_I3_NAME   = 40;    // 31B 名字
-static const uint32_t VFS_I3_RSVD3  = 71;    // 保留区 [71,124) 必须全 0
+// ★ 批次 M：v3 inode 的 `dind`（二级间接块指针）= **原保留区首 4 字节（偏移 71）**；保留区缩到 [75,124)。
+//    v2 卷没有这个字段（它的 32..59 是名字、60 是 CRC）→ v2 卷单文件上限仍是 67584 B。
+static const uint32_t VFS_I3_DIND   = 71;    // u32 二级间接块（0 = 没有）
+static const uint32_t VFS_I3_RSVD3  = 75;    // 保留区起点 [75,124) 必须全 0
 // v2 的名字/CRC：
 static const uint32_t VFS_I2_NAME   = 32;    // 28B 名字（只用前 27）
 static const uint32_t VFS_I2_CRC    = 60;    // u32 inode CRC32（覆盖 [0,60)）
@@ -85,20 +88,28 @@ struct Vfs64Layout {
     uint32_t nlink_off;        // nlink 偏移（0 = 没有）
     uint32_t kind_off;         // kind 偏移（0 = 没有）
     uint32_t crc_off;          // inode CRC 偏移
+    uint32_t dind_off;         // ★ 批次 M：二级间接块指针偏移（0 = 该版本没有这一层）
 };
 static constexpr Vfs64Layout VFS_LAY_V2 = { VFS64_VERSION_V2, 64u,  8u,
-                                            VFS_I2_NAME, VFS64_NAME_MAX_V2, 0u, 0u, 0u, VFS_I2_CRC };
+                                            VFS_I2_NAME, VFS64_NAME_MAX_V2, 0u, 0u, 0u, VFS_I2_CRC, 0u };
 static constexpr Vfs64Layout VFS_LAY_V3 = { VFS64_VERSION,    128u, 4u,
                                             VFS_I3_NAME, VFS64_NAME_MAX, VFS_I3_MTIME, VFS_I3_NLINK,
-                                            VFS_I3_KIND, 124u };
+                                            VFS_I3_KIND, 124u, VFS_I3_DIND };
 
 static_assert(VFS64_BLOCK_BYTES == VFS64_SECTOR_BYTES, "块就是扇区（vfs64_format 也按这个算几何）");
 static_assert(VFS64_INODES_PER_BLK * VFS64_INODE_BYTES == VFS64_BLOCK_BYTES, "v3：每块必须正好 4 个 inode");
 static_assert(VFS64_INODES_PER_BLK_V2 * VFS64_INODE_BYTES_V2 == VFS64_BLOCK_BYTES, "v2：每块必须正好 8 个 inode");
 static_assert(VFS64_BITMAP_BLK_BITS == VFS64_BLOCK_BYTES * 8u, "位图块 512B = 4096 个块位");
 static_assert(VFS_I3_RSVD3 + 1u <= 124u, "v3 inode 保留区必须在 CRC 之前");
+static_assert(VFS_I3_DIND + 4u <= VFS_I3_RSVD3, "v3 的 dind 必须在保留区之前（不越界）");
 static_assert(VFS_LAY_V3.crc_off + 4u == 128u, "v3 inode 字段必须正好铺满 128B");
 static_assert(VFS_LAY_V2.crc_off + 4u == 64u, "v2 inode 字段必须正好铺满 64B");
+static_assert(VFS_LAY_V3.dind_off == VFS_I3_DIND && VFS_LAY_V2.dind_off == 0u, "dind 只在 v3 存在");
+static_assert(VFS64_L2_FIRST_BLOCK == 132u, "第一个走二级间接的 fs 块必须是 132（4 直接 + 128 一级）");
+static_assert(VFS64_MAX_MAP_BLOCKS == 16516u, "映射能力 = 4 + 128 + 128*128");
+static_assert(VFS64_MAX_FILE_BYTES == 8388608u, "★ 单文件上限 = 8 MiB（16384 块）");
+static_assert(VFS64_MAX_FILE_BYTES <= VFS64_MAX_MAP_BLOCKS * VFS64_BLOCK_BYTES, "上限不能超过映射能力");
+static_assert(VFS64_MAX_FILE_BYTES_V2 == 67584u, "v2 卷上限 = 4 + 128 块（与 vfs64.h 的描述一致）");
 static_assert(VFS_O_CRC + 4u <= VFS64_SECTOR_BYTES, "超级块 CRC 必须落在扇区 0 内");
 
 // ==================== 小工具（不依赖 libc）====================
@@ -174,9 +185,19 @@ struct Vfs64Geom {
 };
 
 static uint8_t  g_sec[VFS64_SECTOR_BYTES];            // 唯一工作扇区（先读进来再解析）
-static uint8_t  g_ind[VFS64_SECTOR_BYTES];            // 待写出的间接块镜像
-static uint32_t g_ptrs[VFS64_INDIRECT_PTRS];          // 释放文件时搬运的 128 个块号
+static uint32_t g_ptrs[VFS64_INDIRECT_PTRS];          // 释放/搬运时用的 128 个块号
 static uint8_t  g_ino_cache[VFS64_SECTOR_BYTES];      // inode 表"当前扇区"缓存（扫描时少读盘）
+// ★ 批次 M：大文件（二级间接）用的工作镜像与记账（都只在一次文件操作内有效，操作串行、不重入）
+static uint8_t  g_l1[VFS64_SECTOR_BYTES];             // 一级间接块镜像（inode->ind）
+static uint8_t  g_l2[VFS64_SECTOR_BYTES];             // 二级间接块镜像（inode->dind）
+static uint8_t  g_l3[VFS64_SECTOR_BYTES];             // 二级间接块里"当前子块"的镜像
+static uint32_t g_rm_ind[VFS64_INDIRECT_PTRS];        // 只读路径：一级间接块的 128 个块号
+static uint32_t g_rm_dind[VFS64_INDIRECT_PTRS];       // 只读路径：二级间接块的 128 个子块号
+static uint32_t g_rm_child[VFS64_INDIRECT_PTRS];      // 只读路径：当前子块的 128 个块号
+// 本次操作**新分配**的块号（失败回滚用）。上限 = 映射能力 + 间接块数 + 余量：
+// 一次调用最多把整个文件链建起来（write_stream 整文件重写），所以按最坏情况开表。
+static uint32_t g_newblk[VFS64_MAX_MAP_BLOCKS + VFS64_DIND_CHILDREN + 16u];
+static uint32_t g_newn = 0;
 static int      g_ino_cache_slot  = -1;               // ★ 缓存键 = (slot, drive, lba)
 static int      g_ino_cache_drive = -1;
 static uint32_t g_ino_cache_lba   = 0xFFFFFFFFu;
@@ -279,7 +300,14 @@ static void log_op_fail(const char* op, const char* why) {
 }
 
 // ==================== 设备层：假盘 / 弱 ATA ====================
-static const uint32_t VFS64_FAKE_SECTORS = 64;                          // 自检假盘：32KB
+// ★ 批次 M：自检假盘从 64 扇区（32KB）扩大到 **8192 扇区（4MB）** —— 32KB 的卷装不下
+//   超过 67584 B 的文件，二级间接块就没法在自检里真的走一遍。分两个区用：
+//     [0, VFS64_FAKE_SMALL_SECTORS)      —— bit0..bit12（既有自检：目录树/路径/**空间耗尽**/多卷…）
+//     [VFS64_FAKE_BIG_LBA, 尾部)          —— bit13..bit15（大文件：二级间接 / 回收 / 上限边界）
+//   小卷仍是 **64 扇区（32KB）**：bit6 的"写满 -> 删除 -> 再写"就是靠它才跑得动（数据区只有几十块）。
+static const uint32_t VFS64_FAKE_SECTORS       = 8192;                  // 假盘容量（4MB）
+static const uint32_t VFS64_FAKE_SMALL_SECTORS = 64;                    // bit0..11 的卷（32KB，保持原语义）
+static const uint32_t VFS64_FAKE_BIG_LBA       = 4096;                  // 大文件自检卷的起始 LBA
 static uint8_t  g_fake_disk[VFS64_FAKE_SECTORS * VFS64_SECTOR_BYTES];
 static bool     g_fake_active = false;
 
@@ -548,12 +576,16 @@ static bool inode_ok(const uint8_t* b, const char** why) {
     if (rd16(b + VFS_I_RSVD) != 0) { *why = "reserved"; return false; }
     if (t == VFS64_TYPE_FREE) return true;
     if (rd32(b + g_lay->crc_off) != crc32_64(b, g_lay->crc_off)) { *why = "crc"; return false; }
-    if (t == VFS64_TYPE_FILE && rd32(b + VFS_I_SIZE) > VFS64_MAX_FILE_BYTES) { *why = "size"; return false; }
+    // ★ 批次 M：上限按**当前卷布局**算（v3 = 8 MiB、v2 = 67584）—— 不能拿 v3 的上限去放行 v2 的 inode。
+    const uint32_t lim = (g_lay->dind_off != 0) ? VFS64_MAX_FILE_BYTES : VFS64_MAX_FILE_BYTES_V2;
+    if (t == VFS64_TYPE_FILE && rd32(b + VFS_I_SIZE) > lim) { *why = "size"; return false; }
     if (g_lay->version == VFS64_VERSION) {
         if (b[VFS_I3_RSVD2] != 0) { *why = "rsvd2"; return false; }
         for (uint32_t i = VFS_I3_RSVD3; i < g_lay->crc_off; i++)
             if (b[i] != 0) { *why = "rsvd3"; return false; }
-        for (uint32_t i = VFS_I3_NAME + g_lay->name_max; i < VFS_I3_RSVD3; i++)
+        // 名字区之后到 `dind` 之间必须是 0（★ 批次 M：**止于 VFS_I3_DIND(71) 而不是保留区** ——
+        // 71..74 现在是有意义的 dind 字段，早期版本把它当保留区，正是这里最容易写错的地方）
+        for (uint32_t i = VFS_I3_NAME + g_lay->name_max; i < VFS_I3_DIND; i++)
             if (b[i] != 0) { *why = "name pad"; return false; }
         if (b[VFS_I3_KIND] > VFS64_KIND_MAX) { *why = "kind"; return false; }
         if (rd16(b + VFS_I3_NLINK) == 0) { *why = "nlink"; return false; }
@@ -573,6 +605,19 @@ static bool inode_ok(const uint8_t* b, const char** why) {
             for (uint32_t d = 0; d < VFS64_DIRECT_BLOCKS; d++)
                 if (rd32(b + VFS_I_D0 + 4u * d) != 0) { *why = "dir ptr"; return false; }
             if (rd32(b + VFS_I_IND) != 0) { *why = "dir ind"; return false; }
+            if (rd32(b + VFS_I3_DIND) != 0) { *why = "dir dind"; return false; }
+        } else if (t == VFS64_TYPE_FILE) {
+            // ★ 批次 M：间接块指针**必须在数据区内**（越界一律拒绝：读/删路径都不会去碰它）；且
+            //   用到二级间接（size > 132 块）的文件必须同时有一级间接块（几何自洽）。
+            const uint32_t ind = rd32(b + VFS_I_IND);
+            const uint32_t dind = rd32(b + VFS_I3_DIND);
+            if (ind != 0 && !blk_ok_data(ind)) { *why = "ind range"; return false; }
+            if (dind != 0 && !blk_ok_data(dind)) { *why = "dind range"; return false; }
+            if (dind != 0 && ind == 0) { *why = "dind without ind"; return false; }
+            const uint32_t blocks = (rd32(b + VFS_I_SIZE) + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
+            if (blocks > VFS64_DIRECT_BLOCKS && ind == 0) { *why = "missing ind"; return false; }
+            if (blocks > VFS64_L2_FIRST_BLOCK && dind == 0) { *why = "missing dind"; return false; }
+            if (blocks > VFS64_MAX_MAP_BLOCKS) { *why = "too many blocks"; return false; }
         }
     }
     return true;
@@ -586,15 +631,16 @@ static bool alloc_inode(uint32_t* out_idx) {
     }
     return false;
 }
-// 读出一级间接块里的 128 个块号（不解析指针内容，只搬运到局部缓冲）
+// 读出一个间接块里的 128 个块号（不解析指针内容，只搬运到调用方缓冲；越界直接拒绝）
 static bool load_indirect(uint32_t ind, uint32_t* out128) {
     if (!blk_ok_data(ind)) { log_bad_block(ind); return false; }
     if (!blk_read(ind, g_sec)) return false;
     for (uint32_t k = 0; k < VFS64_INDIRECT_PTRS; k++) out128[k] = rd32(g_sec + 4u * k);
     return true;
 }
-// 释放 inode 引用的全部数据块（直接 + 间接）。遇到越界块号：打印并返回 false，
-// 但已经释放的部分保持释放（宁可泄漏，也不越界读写）。
+// 释放 inode 引用的全部数据块（直接 + 一级间接 + **二级间接**及其 128 个子块）。
+// 遇到越界块号：打印并返回 false，但已经释放的部分保持释放（宁可泄漏，也不越界读写）。
+// ★ 批次 M：二级间接块自己 + 它的每个子块 + 子块里的数据块都要回收 —— 写-删循环不能漏块。
 static bool free_file_blocks(const uint8_t* ino) {
     bool ok = true;
     for (uint32_t d = 0; d < VFS64_DIRECT_BLOCKS; d++) {
@@ -615,9 +661,437 @@ static bool free_file_blocks(const uint8_t* ino) {
         }
         if (!bitmap_set(ind, false)) ok = false;
     }
+    const uint32_t dind = (g_lay->dind_off != 0) ? rd32(ino + g_lay->dind_off) : 0u;
+    if (dind != 0) {
+        if (!blk_ok_data(dind)) { log_bad_block(dind); return false; }
+        if (!load_indirect(dind, g_ptrs)) return false;                  // 二级间接块：128 个子块号
+        for (uint32_t c = 0; c < VFS64_DIND_CHILDREN; c++) {
+            const uint32_t child = g_ptrs[c];
+            if (child == 0) continue;
+            if (!blk_ok_data(child)) { log_bad_block(child); ok = false; continue; }
+            if (!load_indirect(child, g_rm_child)) { ok = false; continue; }   // 子块：128 个数据块号
+            for (uint32_t k = 0; k < VFS64_INDIRECT_PTRS; k++) {
+                const uint32_t b = g_rm_child[k];
+                if (b == 0) continue;
+                if (!blk_ok_data(b)) { log_bad_block(b); ok = false; continue; }
+                if (!bitmap_set(b, false)) ok = false;
+            }
+            if (!bitmap_set(child, false)) ok = false;
+        }
+        if (!bitmap_set(dind, false)) ok = false;
+    }
     return ok;
 }
 
+// ==================== ★ 批次 M：块映射（直接 / 一级间接 / 二级间接）====================
+// 三个层级的唯一实现点。设计要点（为什么长这样）：
+//   * 读用一个"顺序游标"（g_rm_ind / g_rm_dind / g_rm_child）：顺序扫 fs 块时每级只读一次盘；
+//   * 写用"RAM 镜像 + 最后统一落盘"（g_l1 / g_l2 / g_l3）：
+//       1) 先把要新建的数据块全部分配 + 写好 + 记进镜像（**此时盘上的指针树还没动**）；
+//       2) 再把镜像里的指针块按 子块 -> 二级 -> 一级 的顺序写盘；
+//       3) 最后提交 inode（size/CRC）。
+//     所以任何一步失败都不会让盘上的 inode 指向"已释放/没写过"的块；第 1 步失败可以
+//     **回滚**（把新分配的块标回空闲），第 2/3 步失败只可能泄漏块（与既有 write64 同口径）。
+//   * 新分配的块号记在 g_newblk[] 里（回滚与"块数记账"都用它）。
+static bool alloc_track(uint32_t* out_blk) {
+    const uint32_t b = alloc_block();
+    if (b == 0) return false;
+    if (g_newn >= (uint32_t)(sizeof(g_newblk) / sizeof(g_newblk[0]))) {   // 表满：宁可不写
+        bitmap_set(b, false);
+        log_line("alloc track table full");
+        return false;
+    }
+    g_newblk[g_newn++] = b;
+    *out_blk = b;
+    return true;
+}
+static void alloc_rollback() {
+    for (uint32_t i = 0; i < g_newn; i++) bitmap_set(g_newblk[i], false);
+    g_newn = 0;
+}
+static void alloc_forget() { g_newn = 0; }
+
+// 写用的映射上下文（一次文件操作一份）
+struct Vfs64MapCtx {
+    uint8_t* ino;              // inode 镜像（d0..d3 / ind / dind 可改；提交前盘上不变）
+    bool     l1_loaded, l1_dirty;
+    bool     l2_loaded, l2_dirty;
+    bool     l3_loaded, l3_dirty;
+    uint32_t l3_child;         // 当前 l3 对应二级间接块里的第几个子块（0xFFFFFFFF = 无）
+    uint32_t l3_blk;           // 当前子块的卷块号
+    uint32_t max_fs_blocks;    // 本次操作最多会用到多少个 fs 块（用于拒绝超上限）
+    bool     used_l2;          // 本次是否真的碰过二级间接（诊断/自检用）
+};
+
+static void ctx_init(Vfs64MapCtx* m, uint8_t* ino) {
+    m->ino = ino;
+    m->l1_loaded = m->l1_dirty = false;
+    m->l2_loaded = m->l2_dirty = false;
+    m->l3_loaded = m->l3_dirty = false;
+    m->l3_child = 0xFFFFFFFFu;
+    m->l3_blk = 0;
+    m->max_fs_blocks = 0;
+    m->used_l2 = false;
+}
+// 一级间接块：装载 / 按需分配
+static bool ctx_l1_load(Vfs64MapCtx* m) {
+    if (m->l1_loaded) return true;
+    const uint32_t b = rd32(m->ino + VFS_I_IND);
+    if (b != 0) {
+        if (!blk_ok_data(b)) { log_bad_block(b); return false; }
+        if (!blk_read(b, g_l1)) return false;
+    } else {
+        zero_bytes(g_l1, VFS64_SECTOR_BYTES);
+    }
+    m->l1_loaded = true;
+    return true;
+}
+static bool ctx_l1_ensure(Vfs64MapCtx* m) {
+    if (rd32(m->ino + VFS_I_IND) != 0) return ctx_l1_load(m);
+    uint32_t b = 0;
+    if (!alloc_track(&b)) return false;
+    wr32(m->ino + VFS_I_IND, b);
+    zero_bytes(g_l1, VFS64_SECTOR_BYTES);
+    m->l1_loaded = true;
+    m->l1_dirty = true;
+    return true;
+}
+// 二级间接块：装载 / 按需分配
+static bool ctx_l2_load(Vfs64MapCtx* m) {
+    if (g_lay->dind_off == 0) { log_op_fail("map", "no double indirect on this volume (v2)"); return false; }
+    if (m->l2_loaded) return true;
+    const uint32_t b = rd32(m->ino + g_lay->dind_off);
+    if (b != 0) {
+        if (!blk_ok_data(b)) { log_bad_block(b); return false; }
+        if (!blk_read(b, g_l2)) return false;
+    } else {
+        zero_bytes(g_l2, VFS64_SECTOR_BYTES);
+    }
+    m->l2_loaded = true;
+    return true;
+}
+static bool ctx_l2_ensure(Vfs64MapCtx* m) {
+    if (g_lay->dind_off == 0) { log_op_fail("map", "no double indirect on this volume (v2)"); return false; }
+    if (rd32(m->ino + g_lay->dind_off) != 0) return ctx_l2_load(m);
+    uint32_t b = 0;
+    if (!alloc_track(&b)) return false;
+    wr32(m->ino + g_lay->dind_off, b);
+    zero_bytes(g_l2, VFS64_SECTOR_BYTES);
+    m->l2_loaded = true;
+    m->l2_dirty = true;
+    m->used_l2 = true;
+    return true;
+}
+// 把"当前子块"的镜像写盘（切换子块 / 收尾时调用）
+static bool ctx_l3_flush(Vfs64MapCtx* m) {
+    if (!m->l3_loaded || !m->l3_dirty) return true;
+    if (!blk_write(m->l3_blk, g_l3)) return false;
+    m->l3_dirty = false;
+    return true;
+}
+// 当前子块（二级间接块里第 child 个指针指向的"一级间接块"）：装载 / 按需分配
+static bool ctx_l3_load(Vfs64MapCtx* m, uint32_t child) {
+    if (m->l3_loaded && m->l3_child == child) return true;
+    if (!ctx_l3_flush(m)) return false;                 // 换子块前先把上一个写盘（指针不能丢）
+    m->l3_loaded = false;
+    if (!ctx_l2_load(m)) return false;
+    m->l3_child = child;
+    m->l3_blk = rd32(g_l2 + 4u * child);
+    if (m->l3_blk != 0) {
+        if (!blk_ok_data(m->l3_blk)) { log_bad_block(m->l3_blk); return false; }
+        if (!blk_read(m->l3_blk, g_l3)) return false;
+    } else {
+        zero_bytes(g_l3, VFS64_SECTOR_BYTES);
+    }
+    m->l3_loaded = true;
+    return true;
+}
+static bool ctx_l3_ensure(Vfs64MapCtx* m, uint32_t child) {
+    if (!ctx_l2_ensure(m)) return false;
+    if (rd32(g_l2 + 4u * child) != 0) return ctx_l3_load(m, child);
+    if (!ctx_l3_flush(m)) return false;      // ★ 换子块前必须先把上一个写盘（否则那 128 个指针全丢 -> 空洞）
+    m->l3_loaded = false;
+    uint32_t b = 0;
+    if (!alloc_track(&b)) return false;
+    wr32(g_l2 + 4u * child, b);
+    m->l2_dirty = true;
+    m->l3_child = child;
+    m->l3_blk = b;
+    zero_bytes(g_l3, VFS64_SECTOR_BYTES);
+    m->l3_loaded = true;
+    m->l3_dirty = true;
+    m->used_l2 = true;
+    return true;
+}
+
+
+// ---- 写侧：按 fs 块号查/设映射块号（顺序访问友好；需要时按需分配间接块）----
+// map_get：*out = 0 表示该 fs 块**还没映射**（文件尾部的空洞是正常的；空洞出现在 size 以内 = 损坏）。
+static bool map_get(Vfs64MapCtx* m, uint32_t i, uint32_t* out_blk) {
+    *out_blk = 0;
+    if (i < VFS64_DIRECT_BLOCKS) { *out_blk = rd32(m->ino + VFS_I_D0 + 4u * i); return true; }
+    if (i < VFS64_L2_FIRST_BLOCK) {
+        if (!ctx_l1_load(m)) return false;
+        *out_blk = rd32(g_l1 + 4u * (i - VFS64_DIRECT_BLOCKS));
+        return true;
+    }
+    if (i >= VFS64_MAX_MAP_BLOCKS) { log_op_fail("map", "fs block index beyond map capacity"); return false; }
+    const uint32_t child = (i - VFS64_L2_FIRST_BLOCK) / VFS64_INDIRECT_PTRS;
+    if (!ctx_l3_load(m, child)) return false;
+    *out_blk = rd32(g_l3 + 4u * ((i - VFS64_L2_FIRST_BLOCK) % VFS64_INDIRECT_PTRS));
+    return true;
+}
+// map_put：把块号写进**RAM 镜像**（间接块按需分配）；落盘统一由 map_flush 负责
+static bool map_put(Vfs64MapCtx* m, uint32_t i, uint32_t blk) {
+    if (i < VFS64_DIRECT_BLOCKS) { wr32(m->ino + VFS_I_D0 + 4u * i, blk); return true; }
+    if (i < VFS64_L2_FIRST_BLOCK) {
+        if (!ctx_l1_ensure(m)) return false;
+        wr32(g_l1 + 4u * (i - VFS64_DIRECT_BLOCKS), blk);
+        m->l1_dirty = true;
+        return true;
+    }
+    if (i >= VFS64_MAX_MAP_BLOCKS) { log_op_fail("map", "fs block index beyond map capacity"); return false; }
+    const uint32_t child = (i - VFS64_L2_FIRST_BLOCK) / VFS64_INDIRECT_PTRS;
+    if (!ctx_l3_ensure(m, child)) return false;
+    wr32(g_l3 + 4u * ((i - VFS64_L2_FIRST_BLOCK) % VFS64_INDIRECT_PTRS), blk);
+    m->l3_dirty = true;
+    return true;
+}
+// 指针块落盘：**子块 -> 二级间接 -> 一级间接**（数据块早已写好；顺序保证"先有被指的人，再有指针"）
+static bool map_flush(Vfs64MapCtx* m) {
+    if (!ctx_l3_flush(m)) { log_op_fail("map", "child block write failed"); return false; }
+    if (m->l2_dirty) {
+        const uint32_t b = rd32(m->ino + g_lay->dind_off);
+        if (b == 0 || !blk_write(b, g_l2)) { log_op_fail("map", "double-indirect write failed"); return false; }
+        m->l2_dirty = false;
+    }
+    if (m->l1_dirty) {
+        const uint32_t b = rd32(m->ino + VFS_I_IND);
+        if (b == 0 || !blk_write(b, g_l1)) { log_op_fail("map", "indirect write failed"); return false; }
+        m->l1_dirty = false;
+    }
+    return true;
+}
+
+// ---- 只读游标（一次读取内复用：顺序扫时每一级只读一次盘）----
+struct Vfs64RMap {
+    bool     ind_loaded, dind_loaded;
+    uint32_t ind_blk, dind_blk;
+    uint32_t child_idx;        // 0xFFFFFFFF = 还没装载任何子块
+    uint32_t child_blk;
+};
+static void rmap_init(Vfs64RMap* r) {
+    r->ind_loaded = r->dind_loaded = false;
+    r->ind_blk = r->dind_blk = 0;
+    r->child_idx = 0xFFFFFFFFu;
+    r->child_blk = 0;
+}
+// 取 fs 块 i 的卷块号（0 = 未映射）；-1 = 指针越界/读盘失败
+static bool rmap_get(Vfs64RMap* r, const uint8_t* ino, uint32_t i, uint32_t* out) {
+    *out = 0;
+    if (i < VFS64_DIRECT_BLOCKS) { *out = rd32(ino + VFS_I_D0 + 4u * i); return true; }
+    if (i < VFS64_L2_FIRST_BLOCK) {
+        if (!r->ind_loaded) {
+            const uint32_t b = rd32(ino + VFS_I_IND);
+            zero_bytes(g_rm_ind, (uint32_t)sizeof(g_rm_ind));
+            if (b != 0) {
+                if (!blk_ok_data(b)) { log_bad_block(b); return false; }
+                if (!load_indirect(b, g_rm_ind)) return false;
+            }
+            r->ind_loaded = true;
+            r->ind_blk = b;
+        }
+        *out = g_rm_ind[i - VFS64_DIRECT_BLOCKS];
+        return true;
+    }
+    if (i >= VFS64_MAX_MAP_BLOCKS) { log_op_fail("read", "fs block index beyond map capacity"); return false; }
+    if (g_lay->dind_off == 0) { log_op_fail("read", "no double indirect on this volume (v2)"); return false; }
+    if (!r->dind_loaded) {
+        const uint32_t b = rd32(ino + g_lay->dind_off);
+        zero_bytes(g_rm_dind, (uint32_t)sizeof(g_rm_dind));
+        if (b != 0) {
+            if (!blk_ok_data(b)) { log_bad_block(b); return false; }
+            if (!load_indirect(b, g_rm_dind)) return false;
+        }
+        r->dind_loaded = true;
+        r->dind_blk = b;
+    }
+    const uint32_t child = (i - VFS64_L2_FIRST_BLOCK) / VFS64_INDIRECT_PTRS;
+    if (r->child_idx != child) {
+        const uint32_t cb = g_rm_dind[child];
+        zero_bytes(g_rm_child, (uint32_t)sizeof(g_rm_child));
+        if (cb != 0) {
+            if (!blk_ok_data(cb)) { log_bad_block(cb); return false; }
+            if (!load_indirect(cb, g_rm_child)) return false;
+        }
+        r->child_idx = child;
+        r->child_blk = cb;
+    }
+    *out = g_rm_child[(i - VFS64_L2_FIRST_BLOCK) % VFS64_INDIRECT_PTRS];
+    return true;
+}
+
+// ---- 纯函数：写 bytes 字节需要的块数（数据块 + 间接块）/ 当前卷的真实上限 ----
+uint32_t vfs64_blocks_for_bytes64(uint32_t bytes) {
+    if (bytes == 0) return 0;
+    const uint32_t data = (bytes + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
+    uint32_t n = data;
+    if (data > VFS64_DIRECT_BLOCKS) n += 1u;                                   // 一级间接块
+    if (data > VFS64_L2_FIRST_BLOCK)                                           // 二级间接块 + 子块
+        n += 1u + ((data - VFS64_L2_FIRST_BLOCK + VFS64_INDIRECT_PTRS - 1u) / VFS64_INDIRECT_PTRS);
+    return n;
+}
+uint32_t vfs64_max_file_bytes64() {
+    if (!g_mounted) return 0u;
+    return (g_lay->dind_off != 0) ? VFS64_MAX_FILE_BYTES : VFS64_MAX_FILE_BYTES_V2;
+}
+
+// ---- 写一段字节到 fs 块区间（src == nullptr 表示写 0 = 补空洞）----
+// 缺块按需分配（新块先清零再写）；部分覆盖时先把原块读出来。返回 false = 失败（调用方回滚）。
+static bool write_range_ctx(Vfs64MapCtx* m, uint32_t off, const uint8_t* src, uint32_t len) {
+    const uint32_t first = off / VFS64_BLOCK_BYTES;
+    const uint32_t last  = (off + len + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
+    for (uint32_t i = first; i < last; i++) {
+        uint32_t blk = 0;
+        if (!map_get(m, i, &blk)) return false;
+        bool fresh = false;
+        if (blk == 0) {
+            if (!alloc_track(&blk)) { log_op_fail("write_at64", "no space (data block)"); return false; }
+            if (!map_put(m, i, blk)) return false;
+            zero_bytes(g_sec, VFS64_SECTOR_BYTES);
+            if (!blk_write(blk, g_sec)) { log_op_fail("write_at64", "new block write failed"); return false; }
+            fresh = true;
+        } else if (!blk_ok_data(blk)) {
+            log_bad_block(blk);
+            return false;
+        }
+        if (src == nullptr && fresh) continue;                 // 新块已经是 0：补零不必再写一遍
+        const uint32_t blk_off = i * VFS64_BLOCK_BYTES;
+        const uint32_t c0 = (off > blk_off) ? (off - blk_off) : 0u;
+        const uint32_t c1 = ((off + len) < (blk_off + VFS64_BLOCK_BYTES))
+                            ? (off + len - blk_off) : VFS64_BLOCK_BYTES;
+        if (!fresh) { if (!blk_read(blk, g_sec)) return false; }   // 部分覆盖：读出原内容
+        for (uint32_t k = c0; k < c1; k++)
+            g_sec[k] = (src != nullptr) ? src[(blk_off + k) - off] : (uint8_t)0;
+        if (!blk_write(blk, g_sec)) { log_op_fail("write_at64", "data block write failed"); return false; }
+    }
+    return true;
+}
+
+// ---- 部分写（盘上 inode 由调用方提交；本函数只改 ino 镜像 + 盘上的数据/指针块）----
+static int write_at_inode(uint8_t* ino, uint32_t off, const void* buf, uint32_t len, bool* out_used_l2) {
+    if (out_used_l2) *out_used_l2 = false;
+    const uint32_t lim = (g_lay->dind_off != 0) ? VFS64_MAX_FILE_BYTES : VFS64_MAX_FILE_BYTES_V2;
+    if (off > lim || len > (lim - off)) {                      // ★ 上限检查在**任何写盘之前**
+        log_op_fail("write_at64", "too large (over the single-file limit)");
+        return -1;
+    }
+    const uint32_t old_size = rd32(ino + VFS_I_SIZE);
+    const uint32_t new_end  = off + len;
+    const uint32_t new_size = (old_size > new_end) ? old_size : new_end;
+    const uint32_t need_blocks = (new_size + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
+    const uint32_t have_blocks = (old_size + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
+
+    // 空预检（保守）：新数据块 + 最坏情况下的间接块（一级 1、二级 1 + 每组子块 1）+ 1 块余量。
+    // 目的是"空间不足**先失败**，不写一半"；真实分配仍会再检查一次（alloc_block 返回 0 时回滚）。
+    {
+        uint32_t ptr_max = 0;
+        if (need_blocks > VFS64_DIRECT_BLOCKS) ptr_max += 1u;
+        if (need_blocks > VFS64_L2_FIRST_BLOCK)
+            ptr_max += 2u + ((need_blocks - VFS64_L2_FIRST_BLOCK + VFS64_INDIRECT_PTRS - 1u) / VFS64_INDIRECT_PTRS);
+        const uint32_t data_need = (need_blocks > have_blocks) ? (need_blocks - have_blocks) : 0u;
+        uint32_t fb = 0;
+        if (vfs64_free64(&fb, nullptr, nullptr) != 0) { log_op_fail("write_at64", "free space unknown"); return -1; }
+        if (fb < data_need + ptr_max + 1u) { log_op_fail("write_at64", "no space (pre-flight)"); return -1; }
+    }
+
+    Vfs64MapCtx m;
+    ctx_init(&m, ino);
+    m.max_fs_blocks = need_blocks;
+    if (off > old_size) {                                      // ★ 空洞补零（不做稀疏文件）
+        if (!write_range_ctx(&m, old_size, nullptr, off - old_size)) { alloc_rollback(); return -1; }
+    }
+    if (len > 0) {
+        if (!write_range_ctx(&m, off, (const uint8_t*)buf, len)) { alloc_rollback(); return -1; }
+    }
+    if (!map_flush(&m)) return -1;                             // 指针已可能落盘：不再回滚（只泄漏，不损坏）
+    wr32(ino + VFS_I_SIZE, new_size);
+    if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
+    if (g_lay->kind_off != 0 && off == 0 && len > 0) {          // kind：只在"写文件头"时按首块重判
+        const uint32_t k = (len < VFS64_BLOCK_BYTES) ? len : VFS64_BLOCK_BYTES;
+        ino[g_lay->kind_off] = (uint8_t)vfs64_kind_of_data64(buf, k, nullptr, 0);
+    }
+    wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
+    alloc_forget();
+    if (out_used_l2) *out_used_l2 = m.used_l2;
+    return 0;
+}
+
+// ---- 流式建链（整体重写）：建**全新**块链，数据由 src 回调提供（want ≤ 512，必须写满）----
+// 新块号写进 ino_new 镜像 + 间接块镜像并落盘；失败时（建链阶段）释放本次新分配的块。
+static int build_chain_stream64(uint8_t* ino_new, uint32_t len, Vfs64Src64 src, void* ctx) {
+    const uint32_t lim = (g_lay->dind_off != 0) ? VFS64_MAX_FILE_BYTES : VFS64_MAX_FILE_BYTES_V2;
+    if (len > lim) { log_op_fail("write_stream64", "too large (over the single-file limit)"); return -1; }
+    const uint32_t needed = (len + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
+    if (needed > VFS64_MAX_MAP_BLOCKS) { log_op_fail("write_stream64", "size exceeds block map"); return -1; }
+    {
+        uint32_t fb = 0;
+        if (vfs64_free64(&fb, nullptr, nullptr) != 0) { log_op_fail("write_stream64", "free space unknown"); return -1; }
+        if (fb < vfs64_blocks_for_bytes64(len) + 1u) { log_op_fail("write_stream64", "no space (pre-flight)"); return -1; }
+    }
+    Vfs64MapCtx m;
+    ctx_init(&m, ino_new);
+    m.max_fs_blocks = needed;
+    for (uint32_t i = 0; i < needed; i++) {
+        uint32_t blk = 0;
+        if (!alloc_track(&blk)) { alloc_rollback(); log_op_fail("write_stream64", "no space (data block)"); return -1; }
+        if (!map_put(&m, i, blk)) { alloc_rollback(); return -1; }
+        const uint32_t off = i * VFS64_BLOCK_BYTES;
+        uint32_t c = len - off;
+        if (c > VFS64_BLOCK_BYTES) c = VFS64_BLOCK_BYTES;
+        zero_bytes(g_sec, VFS64_SECTOR_BYTES);                  // 末块尾部补 0（不写工作缓冲里的旧字节）
+        if (src != nullptr && src(ctx, off, g_sec, c) != 0) {
+            alloc_rollback();
+            log_op_fail("write_stream64", "source callback failed");
+            return -1;
+        }
+        if (!blk_write(blk, g_sec)) { alloc_rollback(); log_op_fail("write_stream64", "data block write failed"); return -1; }
+    }
+    if (!map_flush(&m)) return -1;
+    alloc_forget();
+    return 0;
+}
+
+// ---- 只读：把 inode 里 [off, off+len) 的字节拷进 buf（跨级都对；*got = 实际读到的字节数）----
+static int read_at_inode(const uint8_t* ino, uint32_t off, void* buf, uint32_t len, uint32_t* got) {
+    if (got) *got = 0;
+    if (!buf) { log_op_fail("read_at64", "bad args"); return -1; }
+    const uint32_t size = rd32(ino + VFS_I_SIZE);
+    if (off >= size) return 0;                                  // EOF：0 字节（正常）
+    uint32_t want = size - off;
+    if (want > len) want = len;
+    if (want == 0) return 0;
+    Vfs64RMap r;
+    rmap_init(&r);
+    uint32_t done = 0;
+    uint8_t* out = (uint8_t*)buf;
+    const uint32_t first = off / VFS64_BLOCK_BYTES;
+    const uint32_t last  = (off + want + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
+    for (uint32_t i = first; i < last; i++) {
+        uint32_t blk = 0;
+        if (!rmap_get(&r, ino, i, &blk)) { log_op_fail("read_at64", "bad block chain"); return -1; }
+        if (blk == 0) { log_op_fail("read_at64", "hole in file (corrupt chain)"); return -1; }
+        if (!blk_ok_data(blk)) { log_bad_block(blk); return -1; }
+        if (!blk_read(blk, g_sec)) return -1;
+        const uint32_t blk_off = i * VFS64_BLOCK_BYTES;
+        const uint32_t c0 = (off > blk_off) ? (off - blk_off) : 0u;
+        const uint32_t c1 = ((off + want) < (blk_off + VFS64_BLOCK_BYTES))
+                            ? (off + want - blk_off) : VFS64_BLOCK_BYTES;
+        for (uint32_t k = c0; k < c1; k++) out[done++] = g_sec[k];
+    }
+    if (got) *got = done;
+    return 0;
+}
 // ==================== 名字 / 路径（v3：多级 + '.'/'..'）====================
 static bool name_valid(const char* name, uint32_t len) {
     if (len == 0 || len > g_lay->name_max) return false;
@@ -1348,6 +1822,22 @@ int vfs64_write_on64(int slot, const char* path, const void* buf, int len) {
     if (!g.active) return on64_slot_unavailable("write", slot);
     return vfs64_write(path, buf, len);
 }
+// ★ 批次 M：大文件读写/流式写的按槽变体（fs64 固定卷读写用）
+int vfs64_read_at_on64(int slot, const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) { if (out_got) *out_got = 0; return on64_slot_unavailable("read_at", slot); }
+    return vfs64_read_at64(path, off, buf, len, out_got);
+}
+int vfs64_write_at_on64(int slot, const char* path, uint32_t off, const void* buf, uint32_t len) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("write_at", slot);
+    return vfs64_write_at64(path, off, buf, len);
+}
+int vfs64_write_stream_on64(int slot, const char* path, uint32_t len, Vfs64Src64 src, void* ctx) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("write_stream", slot);
+    return vfs64_write_stream64(path, len, src, ctx);
+}
 int vfs64_mkdir_on64(int slot, const char* path) {
     Vfs64SlotGuard g(slot);
     if (!g.active) return on64_slot_unavailable("mkdir", slot);
@@ -1395,160 +1885,164 @@ int vfs64_free_on64(int slot, uint32_t* free_blocks, uint32_t* free_bytes, uint3
     if (!g.active) return on64_slot_unavailable("free", slot);
     return vfs64_free64(free_blocks, free_bytes, total_blocks);
 }
-// ==================== 读文件 ====================
+// ==================== 读文件（★ 批次 M：按偏移分块，跨一级/二级间接）====================
+// 载入并校验路径 -> 文件 inode，返回 0（*out_idx）。失败打点 + -1。
+static int lookup_file64(const char* path, const char* op, uint32_t* out_idx, uint8_t* ino) {
+    uint32_t idx = 0;
+    if (path_resolve(path, false, &idx, nullptr, nullptr, nullptr) != 0) {
+        log_op_fail(op, "not found");
+        return -1;
+    }
+    if (inode_load_ok(idx, ino, op) != 0) return -1;
+    if (ino[VFS_I_TYPE] != VFS64_TYPE_FILE) { log_op_fail(op, "not a file"); return -1; }
+    if (out_idx) *out_idx = idx;
+    return 0;
+}
+// 路径版：读 [off, off+len)（**缓冲区由调用方给**；*out_got = 实际读到的字节数）。
+int vfs64_read_at64(const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got) {
+    if (out_got) *out_got = 0;
+    if (!g_mounted) { log_op_fail("read_at64", "not mounted"); return -1; }
+    if (!path || !buf) { log_op_fail("read_at64", "bad args"); return -1; }
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    if (lookup_file64(path, "read_at64", nullptr, ino) != 0) return -1;
+    return read_at_inode(ino, off, buf, len, out_got);
+}
+// 兼容旧 API：整读前 max 字节（= read_at64(path, 0, buf, max)）。
 int vfs64_read64(const char* path, void* buf, int max) {
     if (!g_mounted) { log_op_fail("read64", "not mounted"); return -1; }
     if (!path || !buf || max < 0) { log_op_fail("read64", "bad args"); return -1; }
-
-    uint32_t idx = 0;
-    if (path_resolve(path, false, &idx, nullptr, nullptr, nullptr) != 0) {
-        log_op_fail("read64", "not found");
-        return -1;
-    }
     uint8_t ino[VFS64_INODE_BYTES_MAX];
-    if (inode_load_ok(idx, ino, "read64") != 0) return -1;
-    if (ino[VFS_I_TYPE] != VFS64_TYPE_FILE) { log_op_fail("read64", "not a file"); return -1; }
-
-    const uint32_t size = rd32(ino + VFS_I_SIZE);
-    uint32_t left = size;
-    if ((uint32_t)max < left) left = (uint32_t)max;
-    uint32_t done = 0;
-    uint8_t* out = (uint8_t*)buf;
-    bool ind_loaded = false;
-    uint32_t ptrs[VFS64_INDIRECT_PTRS];
-    for (uint32_t i = 0; left > 0; i++) {
-        uint32_t blk = 0;
-        if (i < VFS64_DIRECT_BLOCKS) {
-            blk = rd32(ino + VFS_I_D0 + 4u * i);
-        } else {
-            if (i - VFS64_DIRECT_BLOCKS >= VFS64_INDIRECT_PTRS) { log_op_fail("read64", "block index out of range"); return -1; }
-            if (!ind_loaded) {
-                const uint32_t ind = rd32(ino + VFS_I_IND);
-                if (ind == 0) { log_op_fail("read64", "hole in file (no indirect)"); return -1; }
-                if (!load_indirect(ind, ptrs)) return -1;
-                ind_loaded = true;
-            }
-            blk = ptrs[i - VFS64_DIRECT_BLOCKS];
-        }
-        if (blk == 0) { log_op_fail("read64", "hole in file"); return -1; }
-        if (!blk_ok_data(blk)) { log_bad_block(blk); return -1; }   // 关键边界检查：数据块必须在数据区
-        if (!blk_read(blk, g_sec)) return -1;
-        const uint32_t c = (left < VFS64_BLOCK_BYTES) ? left : VFS64_BLOCK_BYTES;
-        copy_bytes(out, g_sec, c);
-        out += c;
-        done += c;
-        left -= c;
-    }
-    return (int)done;
+    if (lookup_file64(path, "read64", nullptr, ino) != 0) return -1;
+    uint32_t got = 0;
+    if (read_at_inode(ino, 0, buf, (uint32_t)max, &got) != 0) return -1;
+    return (int)got;
 }
 int vfs64_read(const char* path, void* buf, int max) { return vfs64_read64(path, buf, max); }
 
-// ==================== 写文件 ====================
-// 回滚：把本次新分配、但还没提交的块全部标回空闲（inode 槽 0 号是根目录，绝不在这里动）。
-static void rollback_new(const uint8_t* ino_new, uint32_t new_ind) {
-    for (uint32_t d = 0; d < VFS64_DIRECT_BLOCKS; d++) {
-        const uint32_t b = rd32(ino_new + VFS_I_D0 + 4u * d);
-        if (b != 0) bitmap_set(b, false);
-    }
-    for (uint32_t k = 0; k < VFS64_INDIRECT_PTRS; k++) {
-        const uint32_t b = rd32(g_ind + 4u * k);
-        if (b != 0) bitmap_set(b, false);
-    }
-    if (new_ind != 0) bitmap_set(new_ind, false);
+// ==================== 写文件（★ 批次 M：流式建链 + 部分写）====================
+// 数据源：内存缓冲（vfs64_write64 用）
+struct Vfs64MemSrc64 { const uint8_t* p; };
+static int mem_src64(void* ctx, uint32_t off, void* dst, uint32_t want) {
+    const Vfs64MemSrc64* s = (const Vfs64MemSrc64*)ctx;
+    copy_bytes(dst, s->p + off, want);
+    return 0;
 }
 
-int vfs64_write64(const char* path, const void* buf, int len) {
-    if (!g_mounted) { log_op_fail("write64", "not mounted"); return -1; }
-    if (!path || !buf || len < 0) { log_op_fail("write64", "bad args"); return -1; }
-    if ((uint32_t)len > VFS64_MAX_FILE_BYTES) { log_op_fail("write64", "too large"); return -1; }
+// 解析"要写的路径"：返回 0 = 已有文件（*idx 有效、new_file=false）；1 = 要新建（父目录/名字已回填）；
+// -1 = 失败（已打点）。语义与旧 write64 完全一致（覆盖时父目录/名字以 inode 里的为准）。
+static int write_resolve64(const char* path, uint32_t* idx, uint32_t* parent, char* nm, uint32_t* nlen,
+                           bool* new_file, uint8_t* old_ino) {
+    uint32_t i = 0, par = 0, nl = 0;
+    char name[VFS64_NAME_MAX + 1];
+    const int pr = path_resolve(path, true, &i, &par, name, &nl);
+    if (pr < 0) { log_op_fail("write", "bad path"); return -1; }
+    *new_file = (pr != 0);
+    if (pr == 0) {
+        if (inode_load_ok(i, old_ino, "write") != 0) return -1;
+        if (old_ino[VFS_I_TYPE] != VFS64_TYPE_FILE) { log_op_fail("write", "path is a directory"); return -1; }
+        par = rd32(old_ino + VFS_I_PARENT);
+        nl = old_ino[VFS_I_NAMELEN];
+        copy_bytes(name, old_ino + g_lay->name_off, nl);
+        name[nl] = 0;
+    }
+    *idx = i;
+    *parent = par;
+    *nlen = nl;
+    copy_bytes(nm, name, nl + 1);
+    return 0;
+}
+// 填一个"新文件"的 inode 镜像（type/namelen/name/parent/nlink；size 由调用方按长度写）
+static void fill_new_file_ino64(uint8_t* ino, const char* nm, uint32_t nlen, uint32_t parent, uint32_t len) {
+    zero_bytes(ino, VFS64_INODE_BYTES_MAX);
+    ino[VFS_I_TYPE] = (uint8_t)VFS64_TYPE_FILE;
+    ino[VFS_I_NAMELEN] = (uint8_t)nlen;
+    copy_bytes(ino + g_lay->name_off, nm, nlen);
+    wr32(ino + VFS_I_PARENT, parent);
+    wr32(ino + VFS_I_SIZE, len);
+    if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
+    if (g_lay->nlink_off != 0) wr16(ino + g_lay->nlink_off, 1);
+}
 
+// ★ 整体重写（不存在则创建）：建全新块链 -> 提交 inode -> 最后释放旧块。
+// 语义与旧 vfs64_write64 逐条一致（中途失败只泄漏块，绝不让 inode 指向已释放的块）。
+int vfs64_write_stream64(const char* path, uint32_t len, Vfs64Src64 src, void* ctx) {
+    if (!g_mounted) { log_op_fail("write_stream64", "not mounted"); return -1; }
+    if (!path) { log_op_fail("write_stream64", "bad args"); return -1; }
     uint32_t idx = 0, parent = 0, nlen = 0;
     char nm[VFS64_NAME_MAX + 1];
-    const int pr = path_resolve(path, true, &idx, &parent, nm, &nlen);
-    if (pr < 0) { log_op_fail("write64", "bad path"); return -1; }
-
-    const bool exists = (pr == 0);
+    bool is_new = false;
     uint8_t old_ino[VFS64_INODE_BYTES_MAX];
-    if (exists) {
-        if (inode_load_ok(idx, old_ino, "write64") != 0) return -1;
-        if (old_ino[VFS_I_TYPE] != VFS64_TYPE_FILE) { log_op_fail("write64", "path is a directory"); return -1; }
-        // 覆盖已有文件：父目录与名字以 inode 里的为准（"." 之类也会走到这里）
-        parent = rd32(old_ino + VFS_I_PARENT);
-        nlen = old_ino[VFS_I_NAMELEN];
-        copy_bytes(nm, old_ino + g_lay->name_off, nlen);
-        nm[nlen] = 0;
-    } else {
-        if (!alloc_inode(&idx)) { log_op_fail("write64", "no free inode"); return -1; }
-        zero_bytes(old_ino, VFS64_INODE_BYTES_MAX);
-    }
+    if (write_resolve64(path, &idx, &parent, nm, &nlen, &is_new, old_ino) != 0) return -1;
+    if (is_new && !alloc_inode(&idx)) { log_op_fail("write_stream64", "no free inode"); return -1; }
+    // 已有文件：old_ino 由 write_resolve64 载入并校验（父目录/名字也以 inode 里的为准）
 
-    // 新的 inode 镜像（先全部填好，提交前不碰盘；失败时旧 inode 原样保留）
     uint8_t ino_new[VFS64_INODE_BYTES_MAX];
-    zero_bytes(ino_new, VFS64_INODE_BYTES_MAX);
-    ino_new[VFS_I_TYPE] = (uint8_t)VFS64_TYPE_FILE;
-    ino_new[VFS_I_NAMELEN] = (uint8_t)nlen;
-    copy_bytes(ino_new + g_lay->name_off, nm, nlen);
-    wr32(ino_new + VFS_I_PARENT, parent);
-    wr32(ino_new + VFS_I_SIZE, (uint32_t)len);
-    if (g_lay->mtime_off != 0) wr32(ino_new + g_lay->mtime_off, vfs64_now64());
-    if (g_lay->nlink_off != 0) wr16(ino_new + g_lay->nlink_off, 1);
-    if (g_lay->kind_off != 0) ino_new[g_lay->kind_off] = (uint8_t)vfs64_kind_of_data64(buf, (uint32_t)len, nm, nlen);
-    zero_bytes(g_ind, VFS64_SECTOR_BYTES);
-
-    const uint32_t needed = ((uint32_t)len + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
-    if (needed > VFS64_DIRECT_BLOCKS + VFS64_INDIRECT_PTRS) { log_op_fail("write64", "size exceeds block map"); return -1; }
-    uint32_t new_ind = 0;
-    if (needed > VFS64_DIRECT_BLOCKS) {
-        new_ind = alloc_block();                       // 间接块先分配（指针数组要指向数据块）
-        if (new_ind == 0) { log_op_fail("write64", "no space for indirect block"); return -1; }
-    }
-
-    const uint8_t* src = (const uint8_t*)buf;
-    for (uint32_t i = 0; i < needed; i++) {
-        const uint32_t b = alloc_block();
-        if (b == 0) {
-            rollback_new(ino_new, new_ind);
-            log_op_fail("write64", "no space (data)");
-            return -1;
-        }
-        if (i < VFS64_DIRECT_BLOCKS) wr32(ino_new + VFS_I_D0 + 4u * i, b);
-        else                         wr32(g_ind + 4u * (i - VFS64_DIRECT_BLOCKS), b);
-
-        // 组一个满块（末块补 0，避免把工作缓冲里的旧数据写进去）
-        const uint32_t off = i * VFS64_BLOCK_BYTES;
-        uint32_t c = (uint32_t)len - off;
-        if (c > VFS64_BLOCK_BYTES) c = VFS64_BLOCK_BYTES;
-        for (uint32_t j = c; j < VFS64_BLOCK_BYTES; j++) g_sec[j] = 0;
-        copy_bytes(g_sec, src + off, c);
-        if (!blk_write(b, g_sec)) {
-            rollback_new(ino_new, new_ind);
-            log_op_fail("write64", "data block write failed");
-            return -1;
-        }
-    }
-    if (new_ind != 0) {
-        wr32(ino_new + VFS_I_IND, new_ind);
-        if (!blk_write(new_ind, g_ind)) {              // 间接块内容 = 512B 的块号数组
-            rollback_new(ino_new, new_ind);
-            log_op_fail("write64", "indirect block write failed");
-            return -1;
-        }
-    }
-    wr32(ino_new + g_lay->crc_off, crc32_64(ino_new, g_lay->crc_off));
-    if (!inode_store(idx, ino_new)) {                  // 提交点：新 inode 落盘
-        rollback_new(ino_new, new_ind);
-        log_op_fail("write64", "inode commit failed");
+    fill_new_file_ino64(ino_new, nm, nlen, parent, len);
+    if (build_chain_stream64(ino_new, len, src, ctx) != 0) {
+        if (is_new) alloc_forget();
         return -1;
     }
-    // 旧块在提交之后才释放：中途任何一步失败都只泄漏块，不会让 inode 指向已释放的块
-    if (exists) {
-        if (!free_file_blocks(old_ino)) log_line("write64: WARN old blocks partially freed");
-    } else {
-        touch_dir(parent, 0);                          // 新建：刷新父目录 mtime（尽力而为）
+    if (g_lay->kind_off != 0) {                                 // kind：只看首块（流式写没整份缓冲）
+        uint8_t head[VFS64_BLOCK_BYTES];
+        zero_bytes(head, VFS64_BLOCK_BYTES);
+        if (len > 0 && src != nullptr) {
+            const uint32_t c = (len < VFS64_BLOCK_BYTES) ? len : VFS64_BLOCK_BYTES;
+            if (src(ctx, 0, head, c) != 0) { log_op_fail("write_stream64", "source head failed"); return -1; }
+        }
+        ino_new[g_lay->kind_off] = (uint8_t)vfs64_kind_of_data64(head, (len < VFS64_BLOCK_BYTES) ? len : VFS64_BLOCK_BYTES,
+                                                                 nm, nlen);
     }
-    return len;
+    wr32(ino_new + g_lay->crc_off, crc32_64(ino_new, g_lay->crc_off));
+    if (!inode_store(idx, ino_new)) {                           // 提交点
+        log_op_fail("write_stream64", "inode commit failed");
+        return -1;
+    }
+    if (!is_new) {
+        if (!free_file_blocks(old_ino)) log_line("write_stream64: WARN old blocks partially freed");
+    } else {
+        touch_dir(parent, 0);                                   // 新建：刷新父目录 mtime（尽力而为）
+    }
+    return (int)len;
+}
+// 兼容旧 API：整文件重写（buf 必须装得下 len 字节）
+int vfs64_write64(const char* path, const void* buf, int len) {
+    if (!g_mounted) { log_op_fail("write64", "not mounted"); return -1; }
+    if (!path || (!buf && len > 0) || len < 0) { log_op_fail("write64", "bad args"); return -1; }
+    const uint32_t lim = (g_lay->dind_off != 0) ? VFS64_MAX_FILE_BYTES : VFS64_MAX_FILE_BYTES_V2;
+    if ((uint32_t)len > lim) { log_op_fail("write64", "too large"); return -1; }
+    Vfs64MemSrc64 s;
+    s.p = (const uint8_t*)buf;
+    return vfs64_write_stream64(path, (uint32_t)len, (len > 0) ? mem_src64 : nullptr, &s);
 }
 int vfs64_write(const char* path, const void* buf, int len) { return vfs64_write64(path, buf, len); }
+
+// ★ 部分写 / 追加（不存在则创建）：保留原有字节，缺块按需分配，off > size 的空洞补零。
+// 返回 0 = 成功；-1 = 失败（**盘上 inode 不变**；建链阶段的失败会把新块回滚，绝不写一半）。
+int vfs64_write_at64(const char* path, uint32_t off, const void* buf, uint32_t len) {
+    if (!g_mounted) { log_op_fail("write_at64", "not mounted"); return -1; }
+    if (!path || (!buf && len > 0)) { log_op_fail("write_at64", "bad args"); return -1; }
+    uint32_t idx = 0, parent = 0, nlen = 0;
+    char nm[VFS64_NAME_MAX + 1];
+    bool is_new = false;
+    uint8_t old_ino[VFS64_INODE_BYTES_MAX];
+    if (write_resolve64(path, &idx, &parent, nm, &nlen, &is_new, old_ino) != 0) return -1;
+    if (is_new) {
+        if (!alloc_inode(&idx)) { log_op_fail("write_at64", "no free inode"); return -1; }
+        fill_new_file_ino64(old_ino, nm, nlen, parent, 0);
+    }
+    if (len == 0) {
+        if (is_new) {                                           // 建空文件：只提交 inode
+            wr32(old_ino + g_lay->crc_off, crc32_64(old_ino, g_lay->crc_off));
+            if (!inode_store(idx, old_ino)) { log_op_fail("write_at64", "inode commit failed"); return -1; }
+            touch_dir(parent, 0);
+        }
+        return 0;
+    }
+    if (write_at_inode(old_ino, off, buf, len, nullptr) != 0) return -1;
+    if (!inode_store(idx, old_ino)) { log_op_fail("write_at64", "inode commit failed"); return -1; }
+    if (is_new) touch_dir(parent, 0);
+    return 0;
+}
 
 int vfs64_create64(const char* path) {
     if (!g_mounted) { log_op_fail("create64", "not mounted"); return -1; }
@@ -2055,6 +2549,28 @@ void vfs64_dump64() {
 static uint8_t g_sel_a[4096];        // 自检读写缓冲（4KB 模式，覆盖直接块 + 间接块）
 static uint8_t g_sel_b[4096];
 
+// ---- ★ 批次 M：大文件自检用的工具（确定性字节模式 / 流式 CRC / 生成式数据源）----
+// 字节模式**必须与宿主侧 tests/bigfile64_test.py 的 pat64() 完全一致**（两边独立算同一个 CRC）。
+static uint8_t pat64(uint32_t off) {
+    return (uint8_t)((off * 31u + (off >> 8) * 7u + (off >> 16) * 11u + 0xA5u) & 0xFFu);
+}
+// 与 kernel/fs64.cpp 同口径的流式 CRC32（zlib：反射 0xEDB88320 / 初值·末异或 0xFFFFFFFF）
+static uint32_t crc32_cont64(uint32_t crc, const uint8_t* p, uint32_t n) {
+    crc = ~crc;
+    for (uint32_t i = 0; i < n; i++) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
+    }
+    return ~crc;
+}
+// 生成式数据源（写 1.5MB 大文件不用准备 1.5MB 缓冲）：dst[0..want) = pat64(off + i)
+static int sel_src64(void* ctx, uint32_t off, void* dst, uint32_t want) {
+    (void)ctx;
+    uint8_t* d = (uint8_t*)dst;
+    for (uint32_t i = 0; i < want; i++) d[i] = pat64(off + i);
+    return 0;
+}
+
 // 在 ls 结果里找名字，返回下标（找不到 -1）
 static int sel_find(char names[][VFS64_LS_NAME_BUF], int n, const char* want) {
     for (int i = 0; i < n; i++) {
@@ -2079,8 +2595,7 @@ int vfs64_selftest64() {
     uint32_t t = 0;
     uint32_t sz = 0;
 
-    // ---- bit0：格式化 + 挂载（v3）----
-    if (vfs64_format(0, 0, VFS64_FAKE_SECTORS) != 0) {
+    if (vfs64_format(0, 0, VFS64_FAKE_SMALL_SECTORS) != 0) {
         fails |= 1;
         log_line("fake-disk format FAIL");
     } else {
@@ -2622,7 +3137,166 @@ int vfs64_selftest64() {
         dbg64_nl();
         if (!ok) fails |= 4096;
     }
+    // ---- bit13..15（8192/16384/32768）：★ 批次 M —— 二级间接块（大文件）/ 回收 / 上限边界 ----
+    // 在假盘的**后半段**另起一个 2MB 卷（前半段既有自检的内容不动），走真实读写路径。
+    {
+        Vfs64Geom saved_big;
+        geom_save(&saved_big);
+        const int save_cur_b = g_cur_slot;
+        const int save_sys_b = g_system_slot;
+        bool ok = true;
+        g_fake_active = true;
+        g_cur_slot = 0;
+        uint32_t fb0 = 0, fb1 = 0, fb2 = 0;
+        const uint32_t BIGLEN = 1536u * 1024u;                        // 3072 个块（跨一级 + 二级间接）
+        const uint32_t blk_need = vfs64_blocks_for_bytes64(BIGLEN);
+        static uint8_t chunk[4096];
 
+        if (vfs64_format(0, VFS64_FAKE_BIG_LBA, VFS64_FAKE_SECTORS - VFS64_FAKE_BIG_LBA) != 0) ok = false;
+        if (vfs64_free64(&fb0, nullptr, nullptr) != 0) ok = false;
+        if (g_lay->version != VFS64_VERSION || g_lay->dind_off == 0) ok = false;   // 大文件自检必须是 v3 卷
+
+        // ---- bit13(8192)：流式写 1.5MB（生成式数据源）-> 分块读回逐字节 + CRC 一致 + 块数记账 ----
+        if (ok) {
+            if (vfs64_write_stream64("/big.bin", BIGLEN, sel_src64, nullptr) != (int)BIGLEN) {
+                ok = false;
+                log_line("bigfile write FAIL");
+            }
+            if (vfs64_free64(&fb1, nullptr, nullptr) != 0) ok = false;
+            if (fb0 < fb1 || (fb0 - fb1) != blk_need) {               // 正好少掉"数据块 + 一级 + 二级 + 子块"
+                ok = false;
+                log_line("bigfile block accounting FAIL");
+            }
+            uint8_t ino[VFS64_INODE_BYTES_MAX];
+            if (lookup_file64("/big.bin", "selftest.big", nullptr, ino) != 0) ok = false;
+            else if (rd32(ino + VFS_I3_DIND) == 0 || rd32(ino + VFS_I_IND) == 0) {
+                ok = false;
+                log_line("bigfile dind/ind not used FAIL");           // 真的用了二级间接块才算数
+            } else if (rd32(ino + VFS_I_SIZE) != BIGLEN) {
+                ok = false;
+                log_line("bigfile size FAIL");
+            }
+            uint32_t off = 0, crc = 0, bad_at = 0xFFFFFFFFu;
+            while (off < BIGLEN) {
+                uint32_t want = BIGLEN - off;
+                if (want > sizeof(chunk)) want = sizeof(chunk);
+                uint32_t got = 0;
+                if (vfs64_read_at64("/big.bin", off, chunk, want, &got) != 0 || got != want) {
+                    ok = false;
+                    log_line("bigfile read FAIL");
+                    break;
+                }
+                for (uint32_t i = 0; i < got; i++)
+                    if (chunk[i] != pat64(off + i) && bad_at == 0xFFFFFFFFu) bad_at = off + i;
+                crc = crc32_cont64(crc, chunk, got);
+                off += got;
+            }
+            if (bad_at != 0xFFFFFFFFu) { ok = false; log_line("bigfile byte compare FAIL"); }
+            uint32_t got2 = 123;
+            if (vfs64_read_at64("/big.bin", BIGLEN, chunk, 16, &got2) != 0 || got2 != 0) {
+                ok = false;                                          // off >= size：0 字节（正常 EOF），不是错误
+                log_line("bigfile EOF read FAIL");
+            }
+            // ★ 回收的一半：删掉这个 1.5MB 文件后，空闲块数必须回到写之前的基线（间接块/子块都不能漏）
+            if (vfs64_unlink64("/big.bin") != 0) ok = false;
+            uint32_t fb_del = 0;
+            if (vfs64_free64(&fb_del, nullptr, nullptr) != 0 || fb_del != fb0) {
+                ok = false;
+                log_line("bigfile unlink leak FAIL");
+            }
+            dbg64_str("[VFS64] bigfile ok bytes=");
+            dbg64_dec(BIGLEN);
+            dbg64_str(" blocks=");
+            dbg64_dec(blk_need);
+            dbg64_str(" ind=1 dind=1 free_delta=");
+            dbg64_dec(fb0 - fb1);
+            dbg64_str(" unlink_back_to_base=");
+            dbg64_dec((fb_del == fb0) ? 1u : 0u);
+            dbg64_str(" crc=0x");
+            log_hex32(crc);
+            dbg64_nl();
+            if (!ok) fails |= 8192;
+        }
+
+        // ---- bit14(16384)：回收不泄漏（写-删-写 2 轮回到基线）+ 空间不足**预检**不留半截 ----
+        if (ok) {
+            bool rec = true;
+            uint32_t fbA = 0;
+            if (vfs64_free64(&fbA, nullptr, nullptr) != 0) rec = false;      // ★ 本段的基线（此刻 /big.bin 还在）
+            for (int round = 0; round < 2; round++) {
+                if (vfs64_write_stream64("/rec.bin", BIGLEN, sel_src64, nullptr) != (int)BIGLEN) rec = false;
+                if (vfs64_unlink64("/rec.bin") != 0) rec = false;
+                uint32_t fbn = 0;
+                if (vfs64_free64(&fbn, nullptr, nullptr) != 0 || fbn != fbA) rec = false;
+            }
+            // 上限：off 落在上限之内、"跨过上限 1 字节"的部分写 -> 必须被上限检查先拒掉
+            const uint32_t over_byte = pat64(0);
+            const uint32_t off_over = VFS64_MAX_FILE_BYTES - 4u;
+            chunk[0] = (uint8_t)over_byte;
+            if (vfs64_write_at64("/huge.bin", off_over, chunk, 8) != -1) {
+                rec = false;
+                log_line("bigfile over-limit not rejected FAIL");
+            }
+            uint32_t ty = 0, sz = 0;
+            if (vfs64_stat("/huge.bin", &ty, &sz) == 0) rec = false;          // 没留下半截文件
+            // 真·空间预检：想写 4MiB 而卷只有 2MB -> 预检直接失败（也不留文件）
+            if (vfs64_write_stream64("/big2.bin", 4u * 1024u * 1024u, sel_src64, nullptr) != -1) {
+                rec = false;
+                log_line("bigfile ENOSPC pre-flight not refused FAIL");
+            }
+            if (vfs64_stat("/big2.bin", &ty, &sz) == 0) rec = false;
+            if (vfs64_free64(&fb2, nullptr, nullptr) != 0 || fb2 != fbA) rec = false;   // 失败的尝试不留垃圾块
+            dbg64_str("[VFS64] recycle ok rounds=2 free_before=");
+            dbg64_dec(fbA);
+            dbg64_str(" free_after=");
+            dbg64_dec(fb2);
+            dbg64_str(" delta=");
+            dbg64_dec((fbA > fb2) ? (fbA - fb2) : (fb2 - fbA));
+            dbg64_nl();
+            if (!rec) fails |= 16384;
+        }
+
+        // ---- bit15(32768)：上限边界 + 整体重写（变小要释放多余块）+ 覆盖成 0 字节后全部回收 ----
+        if (ok) {
+            bool lim = true;
+            uint8_t tiny[8];
+            for (uint32_t i = 0; i < sizeof(tiny); i++) tiny[i] = pat64(i);
+            uint32_t fbL = 0;
+            if (vfs64_free64(&fbL, nullptr, nullptr) != 0) lim = false;      // ★ 本段自己的基线
+            // ① 越过上限：write_at 从 off = 上限 开始写 1 字节、write64 写"上限 + 1"字节 —— 都必须被拒
+            if (vfs64_write_at64("/lim.bin", VFS64_MAX_FILE_BYTES, tiny, 1) != -1) lim = false;
+            if (vfs64_write64("/lim.bin", tiny, (int)(VFS64_MAX_FILE_BYTES + 1)) != -1) lim = false;
+            uint32_t ty = 0, sz = 0;
+            if (vfs64_stat("/lim.bin", &ty, &sz) == 0) lim = false;          // 两个请求都不该建出文件
+            // ② 上限内的普通写（1 块）+ 整体重写成 700KB（多余块必须释放）
+            if (vfs64_write_at64("/lim.bin", 0, tiny, 8) != 0) lim = false;
+            uint32_t f1 = 0;
+            if (vfs64_free64(&f1, nullptr, nullptr) != 0 || fbL < f1 || (fbL - f1) != 1u) lim = false;
+            if (vfs64_write_stream64("/lim.bin", 700u * 1024u, sel_src64, nullptr) != (int)(700u * 1024u)) lim = false;
+            uint32_t f700 = 0;
+            if (vfs64_free64(&f700, nullptr, nullptr) != 0) lim = false;
+            if (fbL < f700 || (fbL - f700) != vfs64_blocks_for_bytes64(700u * 1024u)) lim = false;
+            uint32_t got = 0;
+            if (vfs64_read_at64("/lim.bin", 700u * 1024u, chunk, 16, &got) != 0 || got != 0) lim = false;
+            if (vfs64_read_at64("/lim.bin", 699u * 1024u, chunk, 1024, &got) != 0 || got != 1024) lim = false;
+            for (uint32_t i = 0; i < got; i++) if (chunk[i] != pat64(699u * 1024u + i)) lim = false;
+            // ③ 整体重写成 0 字节：全部块回收，文件仍然是合法空文件
+            if (vfs64_write64("/lim.bin", tiny, 0) != 0) lim = false;
+            uint32_t f0 = 0;
+            if (vfs64_free64(&f0, nullptr, nullptr) != 0 || f0 != fbL) lim = false;
+            if (vfs64_stat("/lim.bin", &ty, &sz) != 0 || sz != 0 || ty != VFS64_TYPE_FILE) lim = false;
+            dbg64_str("[VFS64] limit ok max=");
+            dbg64_dec(VFS64_MAX_FILE_BYTES);
+            dbg64_str(" over_rejected=2 rewrite_shrink=1 truncate_free=1");
+            dbg64_nl();
+            if (!lim) fails |= 32768;
+        }
+
+        g_fake_active = false;
+        geom_restore(&saved_big);
+        g_cur_slot = save_cur_b;
+        g_system_slot = save_sys_b;
+    }
     dbg64_str("[VFS64] selftest ");
     if (fails == 0) {
         dbg64_str("PASS");

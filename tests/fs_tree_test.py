@@ -24,7 +24,7 @@
   五个阶段都禁止 PANIC / TRIPLE FAULT / FAILED mask= / selftest FAIL / [TERM] unsupported。
 
 边界（如实写，别把没做的说成做了）：
-  * 单文件上限仍是 67584 B（v3 没有加二级间接块）；名字上限 31B（v2 卷仍 27B）；
+  * 单文件上限 **8 MiB**（批次 M：二级间接块；v2 旧卷仍 67584B）；名字上限 31B（v2 卷仍 27B）；
     inode 总数上限 512；路径深度上限 16；无权限/硬链接/符号链接；
     非空目录必须先清空才能 rmdir64。
   * FAT（ESP）只做**识别**（BPB 指纹 + 名字"EFI 系统分区"），**不能浏览**（本内核只有 FAT32 写入器）。
@@ -517,8 +517,8 @@ def main():
         log3 = slog(s3)
         check("坏路径：父目录不存在被拒（[VFS64] mkdir64 ... parent not found）",
               "mkdir64" in log3 and "bad path / parent not found" in log3)
-        check("坏路径：/../.. 被拒（[VFS64] write64: path is a directory）",
-              "write64: path is a directory" in log3)
+        check("坏路径：/../.. 被拒（[VFS64] write: path is a directory）",
+              ("path is a directory" in log3 and "[VFS64] write" in log3))
         check("坏路径：超长段被拒（[VFS64] path segment too long）",
               "path segment too long" in log3)
         check("坏路径之后终端仍可用（没有 PANIC）", "PANIC" not in log3)

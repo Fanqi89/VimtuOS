@@ -327,17 +327,20 @@ int fs64_read_range64(int vol, const char* path, uint32_t off, void* buf, uint32
     if (v < 0 || !buf || !out_got) return -1;
     *out_got = 0;
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
-        static uint8_t tmp[VFS64_MAX_FILE_BYTES];             // VimtuFS2 没有 read-at-offset：整读再切片
-        const int n = vfs64_read_on64(g_vols[v].vfs_slot, path, tmp, (int)sizeof(tmp));
-        if (n < 0) return -1;
-        if (off >= (uint32_t)n) return 0;
-        uint32_t got = (uint32_t)n - off;
-        if (got > len) got = len;
-        for (uint32_t i = 0; i < got; i++) ((uint8_t*)buf)[i] = tmp[off + i];
-        *out_got = got;
-        return 0;
+        // ★ 批次 M：VimtuFS2 现在有**按偏移分块读**（二级间接块也支持）——
+        //   不再"整读进 8MiB 静态缓冲再切片"，缓冲区直接用调用方的（零拷贝、零大缓冲）。
+        return vfs64_read_at_on64(g_vols[v].vfs_slot, path, off, buf, len, out_got);
     }
     return fat64_read_range64(g_vols[v].fat_slot, path, off, buf, len, out_got);
+}
+// ★ 批次 M：分块写（按偏移，保留原有字节；off > 当前大小 = 空洞补零）。只读卷一律 -FS64_EROFS。
+// 语义与 vfs64_write_at64 一致；返回 0 = 成功 / -FS64_EROFS / -1。
+int fs64_write_at64(int vol, const char* path, uint32_t off, const void* buf, uint32_t len) {
+    const int v = resolve_vol(vol);
+    if (v < 0) return -1;
+    if (g_vols[v].readonly) { log_reject_ro(v, "write_at", path); return -FS64_EROFS; }
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;          // FAT 只读（上面已拒），这里不会到
+    return vfs64_write_at_on64(g_vols[v].vfs_slot, path, off, buf, len);
 }
 // 写操作：FAT 一律拒绝（只读卷），VimtuFS2 转 vfs64_*_on64
 int fs64_write64(int vol, const char* path, const void* buf, int len) {

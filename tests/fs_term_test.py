@@ -19,7 +19,7 @@
     8) 再敲 `ls`：entries=C，必须 C == B-1（**rm 之后 ls 不再列出**）。
   两遍都禁止 PANIC / TRIPLE FAULT / FAILED mask= / selftest FAIL / [TERM] unsupported。
 
-边界（如实写）：单层路径 "/name"、单文件 <= 67584 B、无子目录树、无权限；rm 不能删目录。
+边界（如实写）：**多级路径** "/dir/sub/name"、单文件 <= 8 MiB（批次 M）、无权限；rm 不能删目录。
 用法（必须用 Windows 原生 Python）：py -3 tests\\fs_term_test.py [--timeout 180] [--keep]
 退出码：0 = 全过；1 = 有断言失败；2 = 环境问题（QEMU/构建产物缺失）
 """
