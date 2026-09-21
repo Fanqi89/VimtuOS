@@ -114,12 +114,14 @@ $NASM -f elf64 kernel/syscall_entry64.asm -o "$BUILD/syscall_entry64.o"
 
 echo "==> 准备资源（字体 / logo / 图标；生成脚本产物落在 build/，两份内核都要嵌）"
 "$PY" _otf2ttf.py
-"$PY" _subset_fonts.py
+# 顺序有讲究：face 1（中文）先建，_subset_fonts.py 才能按"前三个面的**产物**实际覆盖"算出
+# 兜底面（face 3）的码点集合 —— 见 _subset_fonts.py 的 fallback_chars()。
 "$PY" _subsetsimhei.py
+"$PY" _subset_fonts.py
 "$PY" _make_logo.py
 "$PY" _make_icons.py
 "$PY" _make_start_icon.py
-cp build/font_bahnschrift.ttf build/font_chaparral.ttf build/font_simhei.ttf "$BUILD/"
+cp build/font_bahnschrift.ttf build/font_simhei.ttf build/font_mono.ttf build/font_fallback.ttf "$BUILD/"
 cp build/logo_rgba.bin build/icon_mycomputer.bin build/icon_recyclebin.bin \
    build/icon_terminal.bin build/icon_start.bin "$BUILD/"
 
@@ -141,8 +143,9 @@ done
 
 echo "==> 资源对象（objcopy -> elf64，两份内核共用同一批）"
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_bahnschrift.ttf font_bahnschrift.o)
-(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_chaparral.ttf font_chaparral.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_simhei.ttf font_simhei.o)
+(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_mono.ttf font_mono.o)
+(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_fallback.ttf font_fallback.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 logo_rgba.bin logo_rgba.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_mycomputer.bin icon_mycomputer.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_recyclebin.bin icon_recyclebin.o)

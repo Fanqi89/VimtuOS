@@ -24,14 +24,14 @@
 //       有 on_close 钩子后可以彻底消除。
 //   待释放队列延迟 TERM_PEND_DELAY 个 tick，且释放前再确认没有任何活窗口的 userdata 指向它。
 //
-// 【排版】列/行由客户区尺寸推导（不再是编译期常量），默认 60x40：
-//     cols = (client_w - PAD_X) / 16,  rows = (client_h - PAD_Y) / 16
-//   字符格 16x16 = 内建 8x8 位图字体 × scale 2（fb_draw_char 正好适合终端）。
-//   但 8x8 位图字体只有 ASCII 32..126，所以内容缓冲做成**码点网格**（uint16_t，0 = 空）：
-//     cp < 0x7F  -> fb_draw_char(...)（等宽、带底色）
-//     其它（中文）-> font_draw_glyph_cp(...)（TrueType，CJK 自动落回 simhei 面；只有前景色，底色靠预填）
-//   于是"中英混排都是一格一字"，退格 / 滚动 / 重排与 32 位完全一致，中文提示也能显示。
-//   拖边框缩放 -> 下一次绘制时重排（保留"旧区域 ∩ 新区域"，越界裁剪），并打一行 [UI] term layout。
+// 【排版】列/行由客户区尺寸推导（不再是编译期常量），默认 60x40 个**汉字格**：
+//     cols = (client_w - PAD_X) / 8    （8px = 半格）、rows = (client_h - PAD_Y) / 16
+//   内容缓冲是**码点网格**（uint16_t，0 = 空），每格宽度按字体推进宽度算：
+//     ASCII  -> 终端等宽面（face 2 = Sarasa Mono SC；8px = 汉字宽的一半）
+//     其它    -> font_draw_glyph_cp(...)（查询链：当前面 -> 中文面(16px) -> 兜底面；只有前景色，底色靠预填）
+//   ★ 中英 1:2：两个 ASCII 正好占一个汉字格的宽度。旧版是内建 8x8 位图字体 ×2 = 16x16 整格；
+//     现在整格都用等宽面 TrueType，宽度由字体度量决定（见 kernel/font.cpp 的 font_selftest）。
+//   退格 / 滚动 / 重排语义与 32 位一致；拖边框缩放重排时打一行 [UI] term layout。
 //
 // 【日志】自动验收依赖下面这些行（原样）：
 //   [APP] term opened cols=N rows=M     开窗（含实例内实际排版列/行）
@@ -95,19 +95,21 @@
 
 // ==================== 常量 ====================
 #define TERM_MAX_INST    4          // 多开上限（照 32 位；第 5 次只激活最新的）
-#define TERM_CHAR_SCALE  2          // 8x8 位图字体放大 2 倍 -> 16x16
-#define TERM_CELL_W      (8 * TERM_CHAR_SCALE)      // 字符格宽（像素）
-#define TERM_CELL_H      (8 * TERM_CHAR_SCALE)      // 字符格高（像素）
-#define TERM_COLS_MAX    128        // 内容缓冲列上限（1920 宽的桌面最大化也够）
+#define TERM_CHAR_SCALE  2          // 格高基准（8x8 × 2 = 16px；ASCII 字形现在来自等宽面 TTF）
+#define TERM_CELL_W      (8 * TERM_CHAR_SCALE)      // 一个**汉字格**宽（像素）= 16
+#define TERM_HALF_W      (TERM_CELL_W / 2)          // 半格 = ASCII 推进宽度 8px（等宽面 ASCII 宽 = 汉字宽/2）
+#define TERM_CELL_H      (8 * TERM_CHAR_SCALE)      // 字符格高（像素）= 16
+#define TERM_COLS_MAX    256        // 内容缓冲列上限（8px 单位：1920 宽最大化 = 240 列，留余量）
 #define TERM_ROWS_MAX    72         // 内容缓冲行上限
-#define TERM_COLS_MIN    20         // 排版列下限（更窄的客户区绘制时按像素裁剪）
+#define TERM_COLS_MIN    20         // 排版列下限（8px 单位 = 10 个汉字格）
 #define TERM_ROWS_MIN    6          // 排版行下限
 #define TERM_CMD_MAX     256        // 命令行缓冲
-#define TERM_DEF_COLS    60         // 新建窗口默认排版（与 32 位一致）
+#define TERM_DEF_COLS    120        // 新建窗口默认排版（120 半格 = 60 汉字格 = 960px，与旧版像素尺寸一致）
 #define TERM_DEF_ROWS    40
 #define TERM_BUF_MAX     (TERM_COLS_MAX * TERM_ROWS_MAX)
 #define TERM_PAD_X       4          // 排版可用宽 = client_w - PAD_X
 #define TERM_PAD_Y       4          // 排版可用高 = client_h - PAD_Y
+#define TERM_MONO_DY     (-2)       // 等宽面 ASCII 字形相对格顶的微调（与 TERM_ZH_DY 同一基线补偿）
 #define TERM_ZH_DY       (-2)       // TrueType 中文字形相对格顶的微调（em 盒 vs 位图字形对齐）
 #define TERM_PEND_MAX    8          // 待释放队列长度
 #define TERM_PEND_DELAY  4          // 延迟释放的 tick 数（约 16ms，足够外壳销毁窗口）
@@ -391,9 +393,9 @@ static void ts_dirty_row(TerminalState* ts, int row) {
     gui64_dirty(w->client_x, w->client_y + TERM_PAD_Y + row * TERM_CELL_H, w->client_w, TERM_CELL_H);
 }
 
-// 排版尺寸：客户区放得下的列/行（不钳制）
+// 排版尺寸：客户区放得下的列/行（不钳制；列的单位是 8px 半格 = 等宽面 ASCII 推进宽度）
 static void ts_fit(Window* w, int* cols, int* rows) {
-    int c = (w->client_w - TERM_PAD_X) / TERM_CELL_W;
+    int c = (w->client_w - TERM_PAD_X) / TERM_HALF_W;
     int r = (w->client_h - TERM_PAD_Y) / TERM_CELL_H;
     if (c < 0) c = 0;
     if (r < 0) r = 0;
@@ -481,7 +483,42 @@ static void ts_newline(TerminalState* ts, bool* scrolled) {
     }
 }
 
-// 写一个码点：按该实例当前 cols/rows 裁剪与滚动，并只标脏受影响的区域
+// ---------------- 变宽网格的推进宽度（终端等宽面：ASCII 8px / 汉字 16px）----------------
+// 一个码点在终端里占多少像素：ASCII 走等宽面（face 2），其它走查询链（汉字落中文面 16px、
+// 兜底字形 8/16px）。★ "中英 1:2" 就是靠字体度量落地：渲染 / 换行 / 光标全用它。
+static int term_adv(uint32_t cp) {
+    font_select(FONT_FACE_MONO);
+    if (cp < 0x80) return font_glyph_advance((char)cp);
+    return font_glyph_advance_cp(cp);
+}
+
+// 网格单位 = 等宽面 ASCII 的推进宽度（构建期 _subset_fonts.py 断言它是 8px = 汉字宽的一半）
+static int term_unit() {
+    font_select(FONT_FACE_MONO);
+    int w = font_glyph_advance(' ');
+    return (w > 0) ? w : TERM_HALF_W;
+}
+
+// 客户区可用的横向像素（排版/换行用）
+static int ts_usable_w(TerminalState* ts) {
+    int w = (ts && ts->win) ? ts->win->client_w : 0;
+    w -= TERM_PAD_X;
+    return w > 0 ? w : 0;
+}
+
+// 一行里前 c 个码点的累计像素宽度（变宽网格：每格宽度 = term_adv(该码点)）
+static int ts_row_px(TerminalState* ts, int r, int c) {
+    if (!ts || r < 0 || r >= TERM_ROWS_MAX) return 0;
+    const uint16_t* row = ts->cells + r * TERM_COLS_MAX;
+    int w = 0;
+    for (int i = 0; i < c && i < TERM_COLS_MAX; i++) {
+        uint16_t cp = row[i];
+        w += (cp >= 0x20) ? term_adv((uint32_t)cp) : term_unit();
+    }
+    return w;
+}
+
+// 写一个码点：按该实例当前 cols/rows 与**像素宽度**裁剪与滚动，并只标脏受影响的区域
 static void ts_putc(TerminalState* ts, uint32_t cp) {
     if (!ts || !ts->used || ts->cols < 1 || ts->rows < 1) return;
     int r0 = ts->cur_r;
@@ -495,8 +532,11 @@ static void ts_putc(TerminalState* ts, uint32_t cp) {
         do { ts->cur_c++; } while ((ts->cur_c % 4) && ts->cur_c < ts->cols);
         if (ts->cur_c >= ts->cols) ts_newline(ts, &scrolled);
     } else if (cp >= 0x20) {
-        if (ts->cur_c >= ts->cols) ts_newline(ts, &scrolled);   // 行满自动换行
         if (cp > 0xFFFF) cp = (uint32_t)'?';                    // 缓冲是 uint16 码点（BMP）
+        int adv = term_adv(cp);
+        // 行满自动换行：格子数满 **或** 像素宽度放不下（ASCII 半格 + 汉字整格混排不会溢出客户区）
+        if (ts->cur_c >= ts->cols || ts_row_px(ts, ts->cur_r, ts->cur_c) + adv > ts_usable_w(ts))
+            ts_newline(ts, &scrolled);
         ts_cell_set(ts, ts->cur_r, ts->cur_c, (uint16_t)cp);
         ts->cur_c++;
     } else {
@@ -547,13 +587,16 @@ static void ts_puts_pad(TerminalState* ts, const char* s, int width) {
 
 
 // ==================== 绘制 ====================
-// 一格：ASCII 走内建位图字体（自带底色），非 ASCII 走 TrueType（只有前景色，底色靠预填）
-static void term_draw_cell(int x, int y, uint16_t cp, uint32_t fg, uint32_t bg) {
-    if (cp >= 0x20 && cp < 0x7F) {
-        fb_draw_char(x, y, (char)cp, fg, bg, TERM_CHAR_SCALE);
-    } else if (cp >= 0x20) {
-        font_draw_glyph_cp(x, y + TERM_ZH_DY, (uint32_t)cp, fg);
-    }
+// 一格：ASCII 走**终端等宽面**（face 2，Sarasa Mono SC，推进 8px = 汉字宽的一半，自带底色靠预填），
+// 其余（汉字/制表符/兜底字形）走 font_draw_glyph_cp 的查询链（当前面 -> 中文面 -> 兜底面）。
+// ★ 与旧版的区别：旧版 ASCII 走内建 8x8 位图字体（fb_draw_char ×2 = 16x16），
+//   现在整格都用等宽面 TrueType —— 于是"中英 1:2"是字体自己的度量：ASCII 8px、汉字 16px。
+static void term_draw_cell(int x, int y, int w, uint16_t cp, uint32_t fg, uint32_t bg) {
+    if (bg != TERM_BG || w != TERM_CELL_W) fb_fill_rect(x, y, w, TERM_CELL_H, bg);
+    if (cp < 0x20) return;
+    font_select(FONT_FACE_MONO);                 // 终端字符格的字体面
+    if (cp < 0x7F) font_draw_glyph(x, y + TERM_MONO_DY, (char)cp, fg);
+    else           font_draw_glyph_cp(x, y + TERM_ZH_DY, (uint32_t)cp, fg);
 }
 
 static void term_draw(Window* w) {
@@ -573,21 +616,29 @@ static void term_draw(Window* w) {
     int dr = (ts->rows < fit_r) ? ts->rows : fit_r;
     if (dc < 0) dc = 0;
     if (dr < 0) dr = 0;
+    int right = x0 + cw;                                  // 右侧像素裁剪（变宽网格：整行宽度按推进累加）
     for (int r = 0; r < dr; r++) {
         const uint16_t* row = ts->cells + r * TERM_COLS_MAX;
         int ty = y0 + TERM_PAD_Y + r * TERM_CELL_H;
+        int tx = x0 + TERM_PAD_X;
         for (int c = 0; c < dc; c++) {
             uint16_t cp = row[c];
-            if (cp >= 0x20) term_draw_cell(x0 + TERM_PAD_X + c * TERM_CELL_W, ty, cp, TERM_FG, TERM_BG);
+            int adv = (cp >= 0x20) ? term_adv((uint32_t)cp) : term_unit();
+            if (tx >= right) break;
+            if (cp >= 0x20) term_draw_cell(tx, ty, adv, cp, TERM_FG, TERM_BG);
+            tx += adv;
         }
     }
-    // 光标：块状光标（绿底黑字），不依赖 '_' 字形
+    // 光标：块状光标（绿底黑字），宽度 = 该格码点的推进宽度（ASCII 半格 / 汉字整格），不依赖 '_' 字形
     if (w->active && ts->cur_r >= 0 && ts->cur_r < dr && ts->cur_c >= 0 && ts->cur_c < dc) {
-        int cx = x0 + TERM_PAD_X + ts->cur_c * TERM_CELL_W;
+        int cx = x0 + TERM_PAD_X + ts_row_px(ts, ts->cur_r, ts->cur_c);
         int cy = y0 + TERM_PAD_Y + ts->cur_r * TERM_CELL_H;
-        fb_fill_rect(cx, cy, TERM_CELL_W, TERM_CELL_H, TERM_CUR);
         uint16_t cp = ts->cells[ts->cur_r * TERM_COLS_MAX + ts->cur_c];
-        if (cp >= 0x20) term_draw_cell(cx, cy, cp, TERM_CURFG, TERM_CUR);
+        int adv = (cp >= 0x20) ? term_adv((uint32_t)cp) : term_unit();
+        if (cx < right) {
+            fb_fill_rect(cx, cy, adv, TERM_CELL_H, TERM_CUR);
+            if (cp >= 0x20) term_draw_cell(cx, cy, adv, cp, TERM_CURFG, TERM_CUR);
+        }
     }
 }
 
@@ -3056,8 +3107,8 @@ void app_term_open64() {
         return;
     }
 
-    // 目标客户区 = 默认 60x40 格
-    int cw  = TERM_DEF_COLS * TERM_CELL_W + TERM_PAD_X;
+    // 目标客户区 = 默认 60x40 个**汉字格**（120x40 个半格；像素尺寸与旧版 60x40 位图格完全一致）
+    int cw  = TERM_DEF_COLS * TERM_HALF_W + TERM_PAD_X;
     int chh = TERM_DEF_ROWS * TERM_CELL_H + TERM_PAD_Y;
     int W = gui64_screen_w(), H = gui64_screen_h();
     int off = (g_count % TERM_MAX_INST) * 24;      // 级联摆放，避免完全重叠

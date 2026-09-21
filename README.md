@@ -84,7 +84,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
 4. **两套系统调用入口并存**：自有 `int 0x80`（rax/rdi/rsi/rdx）与 Linux 号段的 `syscall` 指令（STAR/LSTAR/FMASK + 专用 16KB syscall 内核栈，和 TSS.rsp0 的耦合被显式切断）；号段语义互不干扰，帧标记分流。
 5. **两种应用格式、两条完整链路**：自有 VAP64（32B 头 + 名字 + CRC32，`tools/make_vap.py` 打包）走 `int 0x80`；ELF64 走 `syscall` 指令 —— 从盘上读出来（VimtuFS2）到 ring3 跑完再回收，全程有串口证据。
 6. **自研 UEFI 引导（不用 gnu-efi）**：自造 PE32+ 桩（2.5KB）+ 平铺长模式引导器（36KB，链接到 72MB，绕过 EDK2 的 PE 校验）；**RSDP 经固定槽 0x7800 从固件配置表传给内核**。
-7. **一切自写工具链**：没有 mkfs.fat、没有 mtools —— FAT32 卷、ISO9660 解析与打包、GPT、LBA 回填、PE 摊平、字体子集化（3 套 TTF）、图标生成、VAP64 打包，全是本仓库的 Python 脚本。
+7. **一切自写工具链**：没有 mkfs.fat、没有 mtools —— FAT32 卷、ISO9660 解析与打包、GPT、LBA 回填、PE 摊平、字体子集化（**4 套 TTF**：西文/中文/终端等宽/缺字兜底）、图标生成、VAP64 打包，全是本仓库的 Python 脚本。
 8. **APIC / ACPI / SMP 都带"宁可不启用也不变砖"的回退**：拿不到 ACPI 就留 8259、启动 AP 全程有界超时、每个自检失败都整体回滚，降级路径都有串口证据。
 9. **每次改动都跑自动验收**：**31 个验收脚本**（≥850 条断言，本轮新增 `tests/usb_boot_both_fw_test.py` 与 `tests/esp_install_test.py`），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
 
@@ -159,13 +159,13 @@ pacman -S --noconfirm --needed mingw-w64-x86_64-clang mingw-w64-x86_64-lld \
                                mingw-w64-x86_64-compiler-rt nasm xorriso
 # 还需要 Python 3 + fontTools + Pillow（字体子集化 / 图标生成）：pip install fonttools pillow
 #
-# ① 先下载**开源字体**到 Fonts-open/（仓库不含字体源文件：约 19 MB，见 .gitignore；说明见
-#    docs/字体许可说明.md）：三套字体 + 三份 OFL 许可全文，都是 SIL OFL 1.1
-#      curl -LO https://raw.githubusercontent.com/notofonts/notofonts.github.io/a775299f3e6cb5077e26d2819737927c5e5e477c/fonts/NotoSans/hinted/ttf/NotoSans-Regular.ttf
-#      curl -LO https://raw.githubusercontent.com/notofonts/notofonts.github.io/a775299f3e6cb5077e26d2819737927c5e5e477c/fonts/NotoSerif/hinted/ttf/NotoSerif-Regular.ttf
-#      curl -LO "https://raw.githubusercontent.com/google/fonts/b346dc3e18bed8b4ca602e00537eb35d76ed5025/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf"
-#      # 三份许可全文（OFL-NotoSans.txt / OFL-NotoSerif.txt / OFL-NotoSansSC.txt）同目录，链接见该文档
-#    对应关系：NotoSans-Regular(界面正文/face0) / NotoSerif-Regular(衬线标题/face1) / NotoSansSC(中文/face2)
+# ① 字体（源码仓库**不含字体本体**）：直接跑 `py -3 _otf2ttf.py` 就会按清单校验/下载/派生
+#    —— 需要的文件、URL、版本、SHA256 全在 [FONTS.md](FONTS.md) 与 docs/字体许可说明.md 里。
+#    目录结构：Fonts/（西文 Noto Sans 五个静态字重）+ Fonts-open/（Noto Sans SC 五个静态字重 +
+#    sarasa-mono-sc-regular.ttf 终端等宽 + unifont-14.0.01.ttf 缺字兜底 + 四份许可全文）。
+#    ★ 字体缺失/损坏 = **构建硬失败**（校验魔数 + SHA256，绝不静默换字体）；许可本体进仓，
+#      另有一份副本在 docs/fonts/。
+#    四个内核字体面：face0 西文 / face1 中文 / face2 终端等宽（中英 1:2）/ face3 缺字兜底。
 
 # ② 构建：产出 vimtu64-64.iso（三合一安装盘）
 bash build64.sh
@@ -309,42 +309,149 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 ## 九、目录结构
 
 ```
-build64.sh              唯一构建脚本（产出 ISO / IMG / 两个内核）
-build_uefi.sh           UEFI 两段式引导的构建（被 build64.sh 调用）
-boot/                   引导层（16 位实模式 + 长模式入口，物理必经）  12 文件 / 3,575 行
-  boot.asm              512B MBR
-  loader64.asm          实模式准备 + ATA 读内核 + 进长模式 + 跳高半区内核
-  loader64_atapi.inc    ATAPI(PACKET) 读光盘
-  cdiso.asm             光盘引导桩（与 U 盘硬盘分支共用）
-  hybrid_mbr.asm        写进 ISO 第 0 扇区的 hybrid MBR
-  efi/                  UEFI：stub.c(PE 桩) + uefi64.c(平铺引导器) + jump64.asm + efi.h
-kernel/                 64 位内核 + 桌面 + 应用  94 文件 / 41,779 行（kernel/*.cpp|*.h|*.asm）
-  kernel64.cpp          入口 / 自检 / 两条启动路径 / 子系统初始化顺序
-  task64.*              调度器（任务表 / 时间片 / 抢占 / 回收 / kstress）
-  vfs64.*               VimtuFS2 文件系统
-  store64.*             设置持久化（/store.a、/store.b 双槽）
-  usermode64.*          ring3 用户态（用户窗口 / 页映射原语 / TSS.rsp0）
-  syscall64.* + syscall_entry64.asm   两套系统调用入口 + Linux 号段表
-  app64.*               自有应用格式 VAP64（安装器 / 校验 / 加载器 / 魔数分派）
-  elf64.*               ELF64 加载器（PT_LOAD / p_flags 权限 / SysV 初始栈）
-  hwinfo64.* acpi64.* apic64.* smp64.* edid64.*      硬件与固件
-  e1000_64.* net64.*    网卡驱动 + 以太网/IPv4/ARP/ICMP
-  usb64.*               UHCI + HID 引导键盘
-  ap_trampoline64.asm   AP 跳板（234B，按物理 0x8000 汇编）
-  gui64.* calc64.cpp mines64.cpp terminal64.cpp settings64.cpp taskmgr64.cpp
-  ata64.* part64.cpp setup64.cpp                磁盘层：PATA + 分区/安装引擎 + 向导
-  ahci64.* nvme64.*                             AHCI(SATA) 与 NVMe 驱动（统一驱动器号 8..15 / 16..）
-  mem64.cpp x86_64.cpp fb.cpp font.cpp input.cpp ...
-tools/                  自写打包/诊断工具（Python，6 脚本 / 1,092 行；根目录另有 6 个 _*.py 资源脚本）
-  make_vap.py           VAP64 应用打包器（与 kernel/app64.h 逐字段一致）
-tests/                  验收脚本（38 个 .py：32 个 `*_test.py` + `boot64_assert.py` / `screen64_probe.py` /
-                        `status_report.py` 等；新增 `nvme64_test.py`）
-user/                   ring3 示例程序（6 文件；filedemo64.asm 文件读写、proc64.asm 多进程、pipe64.asm 管道）
-  hello64.asm           VAP64 示例（int 0x80 自有 ABI）
-  hello_elf64.asm/.ld   ELF64 示例（syscall 指令 Linux 号段 + 用户窗口链接脚本）
-docs/                   架构、安装、UEFI、桌面栈、应用层与系统调用、状态总览等中文文档
-docs/screenshots/       自动抓取的桌面截图（desktop64.png）
+VimtuOS/
+├── build64.sh                # 唯一构建脚本（产出 ISO / IMG / 安装内核 / 系统内核）
+├── build_uefi.sh             # UEFI 两段式引导的构建（被 build64.sh 调用）
+├── bootinfo.h                # 引导层 → 内核的启动信息结构（BootInfo / E820 / VBE / EDID）
+├── 构建与运行说明.md          # 环境准备、构建、运行、验收的步骤说明
+├── _make_logo.py             # logo/logo.png → 开机画面 RGBA 资源（240×150）
+├── _make_icons.py            # 桌面图标 RGBA 资源（我的电脑/回收站/终端）
+├── _make_start_icon.py       # 开始按钮图标（logo/kaisi.png → 24×24）
+├── _otf2ttf.py               # 源字体准备：四个面的源文件校验/下载/中文静态字重派生（缺=硬失败）
+├── _subset_fonts.py          # face 0/2/3 子集化（Noto Sans / Sarasa Mono SC / Unifont）+ 链路自检
+├── _subsetsimhei.py          # face 1 中文子集化（Noto Sans SC 静态 Regular）
+├── FONTS.md                  # 字体清单：文件名｜来源 URL｜版本｜协议｜SHA256（含哪些参与构建）
+│
+├── boot/                     # ① 引导层（16 位实模式只出现在 BIOS 物理必经阶段）
+│   ├── boot.asm              # 512B MBR：自搬到 0x0600 再执行
+│   ├── hybrid_mbr.asm        # 写进 ISO 第 0 扇区的 hybrid MBR（U 盘/硬盘引导）
+│   ├── cdiso.asm             # 光盘引导桩（El Torito）+ 介质描述符
+│   ├── loader64.asm          # 实模式准备 + INT 13h 读内核 + 建页表 + 进长模式（≤4096B）
+│   ├── loader64_atapi.inc    # ATAPI(PACKET) 读光盘（光盘路径专用）
+│   └── efi/                  # UEFI 两段式
+│       ├── stub.c            # 自研 PE32+ 极小桩（-base:0x0，2.5KB）
+│       ├── uefi64.c          # 平铺长模式引导器（GOP / 内存映射 / 页表 / 跳内核）
+│       ├── jump64.asm        # 远跳进内核（换 CS）
+│       ├── efi.h             # UEFI 类型定义
+│       ├── efi_main.c        # （废弃）早期 UEFI 试验
+│       ├── enter64.asm       # （废弃）
+│       └── probe_main.c      # （废弃）
+│
+├── kernel/                   # ② 内核（x86_64 长模式，链接在高半区 0xFFFFFFFF80100000）
+│   ├── kernel64.cpp          # 入口 / 清 BSS / 自检 / 两条启动路径（安装向导 或 桌面）
+│   ├── linker64.ld           # 链接脚本（高半区基址与段布局）
+│   ├── memlayout64.h         # 内存/磁盘布局唯一定义点（LBA、地址、页表位置）
+│   ├── entry64.asm           # 内核入口（段选择子 / 栈）
+│   ├── x86_64.cpp/.h         # GDT/IDT/TSS/PIC/PIT 250Hz/RTC + IRQ 分派（APIC 与 PIC 双模式）
+│   ├── isr_stubs64.asm       # 中断桩（0xD0 帧布局的唯一权威定义）
+│   ├── switch64.asm          # 任务上下文切换（抬栈 iretq）
+│   ├── mem64.cpp / mem_64.h  # 物理页池 + 48MB 内核堆 + 归属记账 + 页表助手 + libc 例程
+│   ├── task64.cpp/.h         # 调度器（16 槽任务表 / 8ms 时间片 / IRQ0 抢占 / 回收 / kstress）
+│   ├── proc64.cpp/.h         # 进程与地址空间（每进程 CR3 / fork / execve / wait4 / kill）
+│   ├── usermode64.cpp/.h     # ring3 入口与用户窗口（4GiB 起，代码 R/X、栈 R/W/NX）
+│   ├── syscall64.cpp/.h      # 系统调用分发（int 0x80 自有 ABI + syscall 指令 Linux 号段）
+│   ├── syscall_entry64.asm   # syscall 指令入口（专用内核栈 + 帧校验 + o64 sysret）
+│   ├── vfs64.cpp/.h          # VimtuFS2（v3：超级块 CRC / 位图 / inode / 目录树 / 4 槽多卷）
+│   ├── fs64.cpp/.h           # 文件系统分派层（VimtuFS2 读写 / FAT32 只读）
+│   ├── fd64.cpp/.h           # 每进程 fd 表 + 引用计数打开文件对象 + pipe
+│   ├── fat64.cpp/.h          # FAT32 读写器（安装时写 48MB ESP + 只读浏览 + VFAT 长名）
+│   ├── store64.cpp/.h        # 设置持久化（/store.a、/store.b 双槽 + 世代号 + 双 CRC32）
+│   ├── config64.cpp/.h       # 类型化配置 KV（落在 store 上；含图标位置、语言、缩放）
+│   ├── session64.cpp/.h      # 会话 / 应用内容策略
+│   ├── sysstate64.cpp/.h     # 运行状态机 + 模块注册表 + 健康报告 + ring log
+│   ├── panic64.cpp/.h        # BSOD 蓝屏 + 看门狗
+│   ├── preload64.cpp/.h      # 字形与图标预热（首帧 61.3M → 1.80M cycles）
+│   ├── update64.cpp/.h       # 更新机制（/update.pending → 应用 → 软重启）
+│   ├── app64.cpp/.h          # VAP64 自有应用格式（安装器 / 校验 / 启动器 / 魔数分派）
+│   ├── elf64.cpp/.h          # ELF64 加载器（PT_LOAD / p_flags 权限 / SysV 初始栈与 auxv）
+│   ├── hwui64.cpp/.h         # 屏幕硬件检查报告（启动期 / 向导无盘 / 设置页 三处展示）
+│   ├── ata64.cpp/.h          # PATA PIO + IRQ14 等待（超时回退轮询）
+│   ├── ahci64.cpp/.h         # AHCI(SATA) 驱动（非队列 DMA + 轮询）
+│   ├── nvme64.cpp/.h         # NVMe 驱动（BAR0 64 位 MMIO + admin/I-O 队列 + PRP）
+│   ├── part64.cpp/.h         # 分区表（MBR/GPT）+ 新建/删除/格式化 + 安装引擎（含 ESP）
+│   ├── setup64.cpp           # Win10 同款安装向导（无密钥、真分区、真进度、自动重启）
+│   ├── gui64.cpp/.h          # 桌面外壳（窗口 / 任务栏 / 开始菜单 / 脏矩形 / 桌面图标）
+│   ├── explorer64.cpp/.h     # 文件资源管理器 + 此电脑（导航 / 面包屑 / 双视图 / 右键菜单 / 文件操作）
+│   ├── calc64.cpp            # 计算器（Q16.16 纯整数）
+│   ├── mines64.cpp           # 扫雷（三难度 / 右键标旗 / 键盘）
+│   ├── terminal64.cpp        # 终端（30+ 命令：ps/run/elfrun/vol/ping/store/ping…）
+│   ├── settings64.cpp        # 设置（显示 / 缩放 / 语言 / 会话 / 设备规格 / 关于）
+│   ├── taskmgr64.cpp         # 任务管理器（进程页=真进程 / 性能页含显卡项 / 启动 / 详细信息）
+│   ├── fb.cpp/.h             # 帧缓冲（VBE-LFB、缩放、裁剪、脏区提交）
+│   ├── font.cpp/.h font8x8.h # TrueType 渲染（4 个字体面 + 查询链 + 缺字占位；8x8 位图兜底）
+│   ├── input.cpp/.h          # PS/2 键鼠（IRQ1/IRQ12）+ 串口按键通道 + USB 注入口
+│   ├── display64.cpp/.h      # 运行期显示层（模式清单 / 0x3DA 刷新率实测）
+│   ├── edid64.cpp/.h         # EDID 解析（厂商 / 型号 / 尺寸 / 首选时序 / 刷新率）
+│   ├── acpi64.cpp/.h         # ACPI 解析（RSDP→RSDT/XSDT→FADT/MADT/HPET/MCFG）
+│   ├── apic64.cpp/.h         # LAPIC + IOAPIC 接管（可回退 8259）
+│   ├── smp64.cpp/.h          # SMP：INIT-SIPI-SIPI 启动 AP
+│   ├── ap_trampoline64.asm   # AP 跳板（234B，按物理 0x8000 汇编）
+│   ├── hwinfo64.cpp/.h       # CPUID / PCI 只读枚举 / 磁盘信息
+│   ├── e1000_64.cpp/.h       # Intel 82540EM 网卡驱动（轮询）
+│   ├── net64.cpp/.h          # 以太网 / IPv4 / ARP / ICMP
+│   ├── usb64.cpp/.h          # UHCI + HID 引导键盘（按键注入 PS/2 队列）
+│   ├── debug64.h             # 串口打点 + 行级锁
+│   ├── port.h                # 端口 IO 助手
+│   ├── uefi_gop.h            # GOP 模式信息结构
+│   └── isr_dbg64.asm / isr_out64.asm / isr_probe64.asm   # 排障用中断桩（可保留）
+│
+├── user/                     # ③ ring3 示例程序（构建时嵌进内核，启动时幂等装进系统盘）
+│   ├── hello64.asm           # VAP64 示例（int 0x80 自有 ABI）
+│   ├── hello_elf64.asm/.ld   # ELF64 示例（syscall 指令 + 用户窗口链接脚本）
+│   ├── filedemo64.asm        # 文件读写示例
+│   ├── proc64.asm            # 多进程示例（fork / execve / wait4 / kill）
+│   ├── pipe64.asm            # 管道示例（父子通信）
+│   └── spin64.asm            # 长命进程示例（任务管理器进程页演示）
+│
+├── tools/                    # ④ 自写打包与诊断工具（Python，纯标准库）
+│   ├── make_iso64.py         # ISO9660 + El Torito + GPT + ESP + hybrid MBR 打包
+│   ├── make_esp.py           # 手写 FAT32 卷（ESP，48MB，簇数 ≥65525 硬断言）
+│   ├── make_vap.py           # VAP64 应用打包器（与 kernel/app64.h 逐字段一致）
+│   ├── make_flat.py          # PE 摊平
+│   ├── fat_check.py          # FAT12/16/32 卷按规范体检
+│   └── pe_info.py            # PE 体检（能告出 ImageBase）
+│
+├── tests/                    # ⑤ 验收脚本（40+ 个 .py / 断言 1,000+ 条：串口 + 像素 + 字节）
+│   ├── status_report.py      # 状态核查（每项能力绑证据：DONE / PARTIAL / MISSING）
+│   ├── boot64_assert.py      # 长模式 / IDT / PIT / BootInfo
+│   ├── install_flow_test.py  # 端到端安装 + 装完单独启动
+│   ├── partition_ops_test.py # 新建 / 格式化 / 删除 真实写盘（字节级）
+│   ├── iso64_install_test.py / iso64_usb_test.py            # 光盘 / U 盘形态
+│   ├── vmware_install_test.py / uefi64_install_test.py       # VMware BIOS / UEFI 全流程
+│   ├── esp_install_test.py / disk_boot_test.py / usb_boot_both_fw_test.py   # 安装盘与双固件
+│   ├── ahci64_test.py / nvme64_test.py                       # SATA / NVMe 目标盘
+│   ├── explorer64_test.py / fileops64_test.py                # 文件管理器与文件操作（像素 + 鼠标注入）
+│   ├── multivol64_test.py / fatread64_test.py                # 多卷挂载 / FAT32 只读浏览
+│   ├── fs_tree_test.py / fs_term_test.py / fd64_test.py       # 目录树 / 终端文件命令 / fd 语义
+│   ├── store64_test.py / sysstate64_test.py / preload_update_test.py   # 持久化 / 状态机 / 预热与更新
+│   ├── proc64_test.py / user64_test.py / elf64_test.py / app64_test.py # 进程 / ring3 / ELF64 / VAP64
+│   ├── apic64_test.py / smp64_test.py / sched_stress_test.py  # APIC / SMP / 调度压力
+│   ├── net64_test.py / usb64_test.py / tmgr_proc_test.py      # 网络 / USB / 任务管理器进程页
+│   ├── desktop64_test.py / ui_extra64_test.py                 # 桌面外壳 / 补回的 UI 功能
+│   ├── display64_test.py / display_runtime_test.py            # EDID / 运行期显示层
+│   ├── mouse_parse_test.py / screen64_probe.py / screenshot64.py   # 鼠标解码复放 / 像素探测 / 截图
+│   └── vmware_make_vm.py / vmware_mouse_probe.py              # VMware 环境辅助
+│
+├── logo/                     # 开机 logo 与开始按钮图标源图（logo.png / kaisi.png）
+│
+└── docs/                     # ⑥ 中文文档（14 篇）与截图
+    ├── VimtuOS系统介绍.md      # 对外介绍（含桌面截图）
+    ├── 项目状态总览.md         # 能力项 × 证据 × 发布记录
+    ├── 应用层与系统调用说明.md  # VAP64 / ELF64 / 两套 syscall / 进程与地址空间 / 离 glibc 差什么
+    ├── 发布流程.md             # 版本号规则与发布步骤（每次发布新建标签）
+    ├── 真机验证指南.md         # U 盘写入 / BIOS 设置 / 逐阶段期望 / 故障排查 / 兼容性矩阵
+    ├── UEFI引导说明.md · UEFI地址空间实验报告.md · 引导链架构.md
+    ├── 安装程序说明.md · ISO安装介质说明.md · 桌面栈移植说明.md
+    ├── 中断调试记录.md · 重启与任务管理器设计.md · 字体许可说明.md · 64位升级验证记录.md
+    ├── fonts/                 # 四份许可全文（OFL-NotoSans / OFL-NotoSansSC / OFL-Sarasa / UNIFONT-LICENSE）
+    ├── screenshots/           # 自动抓取的界面截图（桌面 / 此电脑 / 管理器 / BSOD / 任务管理器…）
+    └── shots/                 # 历史验证截图集
 ```
+
+仓库规模：内核 `kernel/` 94 文件 / 4 万余行、引导 `boot/` 12 文件、验收 `tests/` 40+ 脚本、
+文档 `docs/` 14 篇；**发布进仓库的源码约 2 MB**（第三方字体、打包的交叉编译器、构建产物与退役的
+32 位工程都不进仓，见 `.gitignore`）。
+
 
 ## 十、开源与发布状态
 
@@ -356,21 +463,24 @@ docs/screenshots/       自动抓取的桌面截图（desktop64.png）
 |---|---|---|
 | `tools/i686-elf/` | 849 MB | 打包的第三方交叉编译器（README 里给安装方式即可） |
 | `legacy32/` | 770 MB | 已退役的 32 位工程，建议将来单独立仓作"移植参考" |
-| `Fonts/` | 684 MB | 开发机上的 Windows 字体副本，**构建已不再使用**（只留着做历史对照） |
-| `Fonts-open/` | 19 MB | 构建真正用的**开源字体**（Noto Sans / Noto Serif / Noto Sans SC，SIL OFL）——下载地址见第五节与 [docs/字体许可说明.md](docs/字体许可说明.md) |
+| `Fonts/` | 2.8 MB | 西文 UI 字重（Noto Sans Thin/Light/Regular/Bold/Black，SIL OFL 1.1）——只有 `OFL-NotoSans.txt` 进仓 |
+| `Fonts-open/` | 75 MB | 中文/等宽/兜底源字体（Noto Sans SC 静态字重 + 官方 VF、Sarasa Mono SC、GNU Unifont）——只有 `OFL-*.txt` 与 `UNIFONT-LICENSE.txt` 进仓；下载见 [FONTS.md](FONTS.md) |
 | `build64/` + `build/` | 80 MB | 构建产物 |
-| `vimtu64-64.iso` / `.img` | 8 MB / 56 MB | 构建产物（内嵌的字体子集是 OFL 开源字体，可分发；Release 附件里有） |
+| `vimtu64-64.iso` / `.img` | 56 MB / 8 MB | 构建产物（内嵌的字体子集是 OFL/GPL 开源字体，可分发；Release 附件里有） |
 | `target-*.img` / `*.log` | ~64 MB | 验收测试残留 |
 
-**发布二进制（ISO/IMG）的字体问题已解决**：安装镜像里内嵌的三套字体子集已经从
-`bahnschrift` / `ChaparralPro` / `simhei`（Windows 商业字体，不可再分发）换成
-**Noto Sans / Noto Serif / Noto Sans SC**（SIL OFL 1.1，可自由再分发）：
-`_otf2ttf.py` / `_subset_fonts.py` / `_subsetsimhei.py` 已指向 `Fonts-open/`，输出文件名
-（`build/font_bahnschrift.ttf` / `font_chaparral.ttf` / `font_simhei.ttf`）与内核里的 objcopy 符号名保持不变。
+**发布二进制（ISO/IMG）的字体问题已解决 + 本轮重构为四个字体面**：安装镜像里的字体子集已经从
+`bahnschrift` / `ChaparralPro` / `simhei`（Windows 商业字体，不可再分发）换成开源字体族：
+**face0 Noto Sans（西文）/ face1 Noto Sans SC（中文）/ face2 Sarasa Mono SC（终端等宽，中英严格 1:2）/
+face3 GNU Unifont（缺字兜底，只收前三个面都没有的界面/终端码点）**，衬线面已退役；
+`_otf2ttf.py` / `_subset_fonts.py` / `_subsetsimhei.py` 读 `Fonts/` 与 `Fonts-open/`，输出文件名
+（`build/font_bahnschrift.ttf` / `font_simhei.ttf` / `font_mono.ttf` / `font_fallback.ttf`）与内核里的
+objcopy 符号名保持不变。运行时打点：`[FONT64] faces=4 …` / `mono ascii=8 cjk=16 ratio=2` /
+`fallback hit cp=0x… face=3` / `selftest PASS mask=…`（验收：`py -3 tests\fonts64_test.py`）。
 许可与派生说明见 [docs/字体许可说明.md](docs/字体许可说明.md)。**因此 ISO/IMG 可以直接公开分发。**
 
-**版本与发布**：标签 `v0.2.0-beta.5`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.2.0-beta.5>
-（历史版本各自保留安装程序：`v0.2.0-beta.4`、`v0.2.0-beta.3`、`v0.2.0-beta.2`、`v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
+**版本与发布**：标签 `v0.2.1-beta6`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.2.1-beta6>
+（历史版本各自保留安装程序：`v0.2.0-beta.5` / `v0.2.0-beta.4` / `v0.2.0-beta.3` / `v0.2.0-beta.2` / `v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
 （预发布；**安装盘已附上**：`vimtu64-64.iso` 三合一安装盘 + `vimtu64-64.img` 裸盘介质）。
 
 ```bash

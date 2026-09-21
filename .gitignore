@@ -15,15 +15,17 @@ tools/i686-elf/
 tools/nasm/
 tools/__pycache__/
 
-# ==================== 字体（第三方的都不进仓）====================
-# Fonts/ 是 Windows 字体副本（684 MB，商业字体，**构建已不再使用**，保留只为历史对照）
-# ★ 必须写 /Fonts/ 而不是 Fonts/：Windows 上 git 默认忽略大小写，写成 Fonts/ 会连
-#   docs/fonts/（License 全文，必须进仓）一起排掉 —— 本次实测踩到的坑。
-/Fonts/
-# Fonts-open/ 是构建真正使用的开源字体（SIL OFL，约 19 MB 的源文件）：
-#   NotoSans-Regular.ttf / NotoSerif-Regular.ttf / NotoSansSC[wght].ttf / OFL-*.txt
-# 源字体太大没必要进仓 —— 下载地址与许可见 README 第五节 与 docs/字体许可说明.md
-/Fonts-open/
+# ==================== 字体（第三方字体本体都不进仓）====================
+# Fonts/     西文 UI 字重（Noto Sans 五个静态字重）+ 许可
+# Fonts-open/ 中文（Noto Sans SC 五个静态字重 + 官方可变字体）+ 终端等宽（Sarasa Mono SC）
+#            + 缺字兜底（GNU Unifont）+ 三份许可
+#   ★ 用 "/Fonts/*" 而不是 "/Fonts/"：只有父目录**没有**被整体排除，`!` 否定规则才能把许可放行
+#     （gitignore 的否定规则无法重新包含"被排除目录里的文件"）。docs/fonts/ 里另留一份许可全文。
+/Fonts/*
+!/Fonts/OFL-*.txt
+/Fonts-open/*
+!/Fonts-open/OFL-*.txt
+!/Fonts-open/UNIFONT-LICENSE.txt
 
 # ==================== 已退役的 32 位工程（770 MB）====================
 # 若想公开，建议单独建一个仓库作为"移植参考"

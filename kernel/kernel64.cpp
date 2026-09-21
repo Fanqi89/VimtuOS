@@ -681,6 +681,7 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     dbg64_str(" line_h=");
     dbg64_dec((uint64_t)font_line_height());
     dbg64_nl();
+    font_selftest();     // 四个字体面：加载状态 / 中英 1:2 / 查询链 / 兜底命中 —— [FONT64] 打点（验收脚本按行断言）
 
     // ★ 踩坑记录（M2：安装程序按键全乱："回车"变成 Esc）：
     //   这段初始化曾经被复制成两份。第二次 kbd_init() 读 8042 命令字节时，

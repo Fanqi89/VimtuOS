@@ -1,23 +1,30 @@
-// font.cpp - TrueType 字体子系统（最小实现，三字体 + UTF-8/CJK）
-// 嵌入字体（构建期子集化，全部是 SIL OFL 1.1 开源字体，见 docs/字体许可说明.md）：
-//           build/font_bahnschrift.ttf（Noto Sans，sans，GUI 正文）
-//           build/font_chaparral.ttf（Noto Serif，serif，标题）
-//           build/font_simhei.ttf（Noto Sans SC 黑体，简体中文）
+// font.cpp - TrueType 字体子系统（最小实现，**四个字体面** + UTF-8/CJK + 码点查询链）
+// 嵌入字体（构建期子集化，全部是开源字体，来源/版本/许可见 FONTS.md 与 docs/字体许可说明.md）：
+//   [0] build/font_bahnschrift.ttf  西文 UI    （Noto Sans 子集，SIL OFL 1.1）
+//   [1] build/font_simhei.ttf       中文       （Noto Sans SC 子集，SIL OFL 1.1）
+//   [2] build/font_mono.ttf         终端等宽   （Sarasa Mono SC 子集，SIL OFL 1.1；ASCII 宽 = 汉字宽/2）
+//   [3] build/font_fallback.ttf     缺字兜底   （GNU Unifont 子集，只收前三个面都没有、界面/终端字面量里出现的码点）
 // 特性：cmap format 4（BMP）、hmtx 推进宽度、简单字形扫描线光栅化、
-//       ASCII 固定缓存 + CJK LRU 缓存、UTF-8 文本解码。
+//       ASCII 固定缓存 + CJK LRU 缓存、UTF-8 文本解码、
+//       码点查询链（当前面 -> 中文面 -> 兜底面 -> 缺字占位+打点）。
 // 中文（CJK）后续：cmap format 12 + 扩展码点。
 // 全程无堆分配、无浮点、无 64 位除法（int32 足够）。
 #include "font.h"
 #include "fb.h"
+#include "debug64.h"     // [FONT64] 打点（行锁：dbg64_line_begin64/end64）
 #include <stdint.h>
 
-// objcopy -I binary 生成的符号（build/font_*.ttf）
+#define FONT64_LOG_N 16  // [FONT64] fallback hit / glyph miss 的去重表大小（同一码点只打一行）
+
+// objcopy -I binary 生成的符号（build/font_*.ttf；符号名由文件名决定，不能改产物名）
 extern "C" const uint8_t _binary_font_bahnschrift_ttf_start[];
 extern "C" const uint8_t _binary_font_bahnschrift_ttf_end[];
-extern "C" const uint8_t _binary_font_chaparral_ttf_start[];
-extern "C" const uint8_t _binary_font_chaparral_ttf_end[];
 extern "C" const uint8_t _binary_font_simhei_ttf_start[];
 extern "C" const uint8_t _binary_font_simhei_ttf_end[];
+extern "C" const uint8_t _binary_font_mono_ttf_start[];
+extern "C" const uint8_t _binary_font_mono_ttf_end[];
+extern "C" const uint8_t _binary_font_fallback_ttf_start[];
+extern "C" const uint8_t _binary_font_fallback_ttf_end[];
 
 #define FONT_PX 20            // 光栅化缓冲（em 高像素 + descender 余量）
 #define FONT_SIZE_PX 16       // 字号（em 高度，像素）
@@ -59,8 +66,8 @@ struct FontFace {
     uint32_t lru_tick;
 };
 
-static FontFace g_face[3];            // [0]=Noto Sans, [1]=Noto Serif, [2]=Noto Sans SC（中文）
-static FontFace* cur = &g_face[0];
+static FontFace g_face[FONT_FACE_COUNT];   // [0]=西文 [1]=中文 [2]=终端等宽 [3]=缺字兜底
+static FontFace* cur = &g_face[FONT_FACE_ASCII];
 
 // 当前字形扁平化边表（渲染临时区，单线程，可共享）
 static int32_t ex0[MAX_EDGES], ey0[MAX_EDGES], ex1[MAX_EDGES], ey1[MAX_EDGES];
@@ -195,19 +202,20 @@ static void face_init(FontFace* fc, const uint8_t* start, const uint8_t* end) {
 }
 
 void font_init() {
-    face_init(&g_face[0], _binary_font_bahnschrift_ttf_start, _binary_font_bahnschrift_ttf_end);
-    face_init(&g_face[1], _binary_font_chaparral_ttf_start, _binary_font_chaparral_ttf_end);
-    face_init(&g_face[2], _binary_font_simhei_ttf_start, _binary_font_simhei_ttf_end);
-    cur = &g_face[0];
+    face_init(&g_face[FONT_FACE_ASCII],    _binary_font_bahnschrift_ttf_start, _binary_font_bahnschrift_ttf_end);
+    face_init(&g_face[FONT_FACE_CJK],      _binary_font_simhei_ttf_start,      _binary_font_simhei_ttf_end);
+    face_init(&g_face[FONT_FACE_MONO],     _binary_font_mono_ttf_start,        _binary_font_mono_ttf_end);
+    face_init(&g_face[FONT_FACE_FALLBACK], _binary_font_fallback_ttf_start,    _binary_font_fallback_ttf_end);
+    cur = &g_face[FONT_FACE_ASCII];
 }
 
 void font_select(int face) {
     if (face < 0) face = 0;
-    if (face > 2) face = 2;
+    if (face >= FONT_FACE_COUNT) face = FONT_FACE_COUNT - 1;
     cur = &g_face[face];
 }
 
-int font_face_count() { return 3; }
+int font_face_count() { return FONT_FACE_COUNT; }
 
 // ---------------- 扁平化 ----------------
 static void add_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
@@ -459,20 +467,60 @@ int font_glyph_advance(char c) {
     return cur->advPx[idx];
 }
 
-// 按 Unicode 码点推进宽度（非 ASCII 按码点查 cmap）
-// 中文（CJK）若当前字体无字形则自动使用中文字体面（g_face[2]）
+// ---------------- 码点查询链：当前面 -> 中文面 -> 兜底面 ----------------
+// 四个面的码点集按需求表分工（见 _subset_fonts.py / _subsetsimhei.py）：ASCII+界面符号（面 0）、
+// GB2312 一级汉字（面 1）、制表符/块元素/几何图形（面 2）、"前三个面都没有的界面/终端字面量码点"（面 3）。
+// 链保证：只要四个面里任何一个有该字形就画得出来；都没有才画缺字占位（1px 空心方框）+ 计数 + 打点。
+static uint32_t g_fb_logged[FONT64_LOG_N];
+static int g_fb_logged_n = 0;
+static uint32_t g_miss_logged[FONT64_LOG_N];
+static int g_miss_logged_n = 0;
+static uint32_t g_fallback_hits = 0;
+static uint32_t g_glyph_miss = 0;
+
+static void font64_hex4(uint32_t cp) {
+    static const char* H = "0123456789abcdef";
+    char b[5];
+    b[0] = H[(cp >> 12) & 0xF]; b[1] = H[(cp >> 8) & 0xF];
+    b[2] = H[(cp >> 4) & 0xF];  b[3] = H[cp & 0xF]; b[4] = 0;
+    dbg64_str(b);
+}
+
+// 同一个码点只打一行（刷屏会把串口塞满；计数照常累加）
+static bool font64_log_once(uint32_t* tab, int* n, uint32_t cp) {
+    for (int i = 0; i < *n; i++) if (tab[i] == cp) return false;
+    if (*n < FONT64_LOG_N) tab[(*n)++] = cp;
+    return true;
+}
+
+static bool face_has_cp(FontFace* fc, uint32_t cp) {
+    if (!fc || !fc->font_ok || cp > 0xFFFF) return false;
+    uint16_t g = cmap_lookup(fc, (uint16_t)cp);
+    return g != 0 && g < fc->numGlyphs;
+}
+
 static FontFace* font_resolve_cp(uint32_t cp) {
-    FontFace* fc = cur;
-    if (fc != &g_face[2] && cp >= 0x4E00 && cp <= 0x9FFF) {
-        if (cmap_lookup(fc, (uint16_t)cp) == 0 && g_face[2].font_ok) fc = &g_face[2];
+    if (face_has_cp(cur, cp)) return cur;
+    if (face_has_cp(&g_face[FONT_FACE_CJK], cp)) return &g_face[FONT_FACE_CJK];
+    if (face_has_cp(&g_face[FONT_FACE_FALLBACK], cp)) {
+        g_fallback_hits++;
+        if (font64_log_once(g_fb_logged, &g_fb_logged_n, cp)) {
+            dbg64_line_begin64();
+            dbg64_str("[FONT64] fallback hit cp=0x");
+            font64_hex4(cp);
+            dbg64_str(" face=3");
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        return &g_face[FONT_FACE_FALLBACK];
     }
-    return fc;
+    return nullptr;                 // 四个面都没有 -> 调用方画缺字占位
 }
 
 int font_glyph_advance_cp(uint32_t cp) {
     if (cp < FONT_CACHE_N) return font_glyph_advance((char)cp);
     FontFace* fc = font_resolve_cp(cp);
-    if (!fc->font_ok) return FONT_SIZE_PX;
+    if (!fc) return FONT_SIZE_PX;        // 缺字占位按一个 em 宽推进
     uint16_t g = cmap_lookup(fc, (uint16_t)cp);
     if (g >= fc->numGlyphs) return FONT_SIZE_PX;
     if (g >= fc->numHMetrics) g = (uint16_t)(fc->numHMetrics - 1);
@@ -537,11 +585,35 @@ bool font_draw_glyph(int x, int y, char c, uint32_t fg) {
     return true;
 }
 
-// 按 Unicode 码点绘制（CJK 走 LRU 缓存；当前字体无字形时自动用中文字体面）
+// 缺字占位：四个面都没有这个码点时画一个 1px 空心方框（并计数 + 打点，见 font_draw_glyph_cp）
+static void font_draw_missing_box(int x, int y, uint32_t fg) {
+    int w = FONT_SIZE_PX - 6, h = FONT_SIZE_PX - 4;
+    for (int i = 0; i < w; i++) {
+        fb_putpixel(x + i, y + 2, fg);
+        fb_putpixel(x + i, y + 2 + h - 1, fg);
+    }
+    for (int j = 0; j < h; j++) {
+        fb_putpixel(x, y + 2 + j, fg);
+        fb_putpixel(x + w - 1, y + 2 + j, fg);
+    }
+}
+
+// 按 Unicode 码点绘制（CJK 走 LRU 缓存；查询链：当前面 -> 中文面 -> 兜底面；都没有 = 缺字占位）
 bool font_draw_glyph_cp(int x, int y, uint32_t cp, uint32_t fg) {
     if (cp < FONT_CACHE_N) return font_draw_glyph(x, y, (char)cp, fg);
     FontFace* fc = font_resolve_cp(cp);
-    if (!fc->font_ok) return false;
+    if (!fc) {
+        g_glyph_miss++;
+        if (font64_log_once(g_miss_logged, &g_miss_logged_n, cp)) {
+            dbg64_line_begin64();
+            dbg64_str("[FONT64] glyph miss cp=0x");
+            font64_hex4(cp);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        font_draw_missing_box(x, y, fg);
+        return false;
+    }
     int slot = lru_get_slot(fc, cp);
     if (slot < 0) return false;
     if (fc->lruW[slot] <= 0) return true;   // 空白字形
@@ -602,7 +674,7 @@ int font_prewarm_ascii() {
 int font_prewarm_ascii_all() {
     FontFace* save = cur;
     int n = 0;
-    for (int f = 0; f < 3; f++) {
+    for (int f = 0; f < FONT_FACE_COUNT; f++) {        // 四个面全预热（含等宽面/兜底面）
         if (!g_face[f].font_ok) continue;
         cur = &g_face[f];
         n += font_prewarm_ascii();
@@ -624,7 +696,7 @@ int font_prewarm_text(const char* s) {
                 if (prewarm_one_ascii(fc, (int)cp)) n++;
             } else {
                 FontFace* fc = font_resolve_cp(cp);
-                if (fc->font_ok) {
+                if (fc && fc->font_ok) {
                     bool hit = false;
                     for (int i = 0; i < FONT_LRU_N; i++)
                         if (fc->lru_key[i] == cp) { hit = true; break; }
@@ -639,7 +711,7 @@ int font_prewarm_text(const char* s) {
 
 int font_cache_used() {
     int n = 0;
-    for (int f = 0; f < 3; f++) {
+    for (int f = 0; f < FONT_FACE_COUNT; f++) {        // 四个面都算
         FontFace* fc = &g_face[f];
         if (!fc->font_ok) continue;
         for (int i = 32; i < FONT_CACHE_N; i++)
@@ -652,9 +724,80 @@ int font_cache_used() {
 
 int font_cache_capacity() {
     int n = 0;
-    for (int f = 0; f < 3; f++) {
+    for (int f = 0; f < FONT_FACE_COUNT; f++) {
         if (!g_face[f].font_ok) continue;
         n += FONT_CACHE_N - 32 + FONT_LRU_N;
     }
     return n;
+}
+
+// ==================== 四面的自检 / 打点（行锁；kernel64.cpp 在 font_init 之后调用）====================
+uint32_t font_fallback_hits() { return g_fallback_hits; }
+uint32_t font_glyph_miss_count() { return g_glyph_miss; }
+
+// 某个面里一个码点的推进宽度（像素）；0 = 这个面没有该字形
+static int face_adv_px(FontFace* fc, uint32_t cp) {
+    if (!fc || !fc->font_ok) return 0;
+    uint16_t g = cmap_lookup(fc, (uint16_t)cp);
+    if (g == 0 || g >= fc->numGlyphs) return 0;
+    if (g >= fc->numHMetrics) g = (uint16_t)(fc->numHMetrics - 1);
+    uint16_t aw = be16(fc->F + fc->offHmtx + 4 * g);
+    int px = (int)(((int32_t)aw * fc->scaleFix + 512) >> 10);
+    return px < 1 ? 1 : px;
+}
+
+void font_selftest() {
+    uint32_t mask = 0;
+    dbg64_line_begin64();
+    dbg64_str("[FONT64] faces=");
+    dbg64_dec(FONT_FACE_COUNT);
+    dbg64_str(" ascii=");    dbg64_dec(g_face[FONT_FACE_ASCII].font_ok ? 1 : 0);
+    dbg64_str(" cjk=");      dbg64_dec(g_face[FONT_FACE_CJK].font_ok ? 1 : 0);
+    dbg64_str(" mono=");     dbg64_dec(g_face[FONT_FACE_MONO].font_ok ? 1 : 0);
+    dbg64_str(" fallback="); dbg64_dec(g_face[FONT_FACE_FALLBACK].font_ok ? 1 : 0);
+    dbg64_nl();
+    dbg64_line_end64();
+
+    // bit0：四个面都加载成功
+    int loaded = 0;
+    for (int f = 0; f < FONT_FACE_COUNT; f++) if (g_face[f].font_ok) loaded++;
+    if (loaded == FONT_FACE_COUNT) mask |= 1;
+    // bit1：等宽面 ASCII 宽 *2 == 中文面汉字宽（中英 1:2；终端就是按这个混排的）
+    int ma = face_adv_px(&g_face[FONT_FACE_MONO], (uint32_t)'A');
+    int ca = face_adv_px(&g_face[FONT_FACE_CJK], 0x4E00u);
+    if (ma > 0 && ca == ma * 2) mask |= 2;
+    dbg64_line_begin64();
+    dbg64_str("[FONT64] mono ascii="); dbg64_dec((uint64_t)ma);
+    dbg64_str(" cjk=");                dbg64_dec((uint64_t)ca);
+    dbg64_str(" ratio=");              dbg64_dec(ma > 0 ? (uint64_t)(ca / ma) : 0);
+    dbg64_nl();
+    dbg64_line_end64();
+    // bit2：查询链 —— 从任何一个面发起画汉字，都要落到中文面
+    bool chain_ok = true;
+    for (int f = 0; f < FONT_FACE_COUNT; f++) {
+        if (!g_face[f].font_ok) continue;
+        cur = &g_face[f];
+        if (font_resolve_cp(0x4E00u) != &g_face[FONT_FACE_CJK]) chain_ok = false;
+    }
+    cur = &g_face[FONT_FACE_ASCII];
+    if (chain_ok) mask |= 4;
+    // bit3：兜底面命中 —— 只在前三个面缺席、由 Unifont 补的码点（界面/终端字面量里出现，见 _subset_fonts.py）
+    static const uint32_t fb_cand[] = { 0x2229u, 0x6D4Fu, 0x6E32u };   // ∩ / 浏 / 渲
+    bool fb_ok = false;
+    for (unsigned i = 0; i < sizeof(fb_cand) / sizeof(fb_cand[0]); i++) {
+        if (font_resolve_cp(fb_cand[i]) == &g_face[FONT_FACE_FALLBACK]) { fb_ok = true; break; }
+    }
+    if (fb_ok) mask |= 8;
+    // bit4：面 0/1/2 的 ASCII 推进宽度都算得出来（ASCII 是这三面的硬要求；面 3 只收"前三面没有的码点"）
+    bool adv_ok = true;
+    for (int f = 0; f <= FONT_FACE_MONO; f++)
+        if (face_adv_px(&g_face[f], (uint32_t)'A') <= 0) adv_ok = false;
+    if (adv_ok) mask |= 16;
+
+    dbg64_line_begin64();
+    dbg64_str("[FONT64] selftest ");
+    dbg64_str((mask == 0x1Fu) ? "PASS mask=0x" : "FAIL mask=0x");
+    dbg64_hex64((uint64_t)mask);
+    dbg64_nl();
+    dbg64_line_end64();
 }
