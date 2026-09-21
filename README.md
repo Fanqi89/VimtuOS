@@ -479,8 +479,8 @@ objcopy 符号名保持不变。运行时打点：`[FONT64] faces=4 …` / `mono
 `fallback hit cp=0x… face=3` / `selftest PASS mask=…`（验收：`py -3 tests\fonts64_test.py`）。
 许可与派生说明见 [docs/字体许可说明.md](docs/字体许可说明.md)。**因此 ISO/IMG 可以直接公开分发。**
 
-**版本与发布**：标签 `v0.2.1-beta6`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.2.1-beta6>
-（历史版本各自保留安装程序：`v0.2.0-beta.5` / `v0.2.0-beta.4` / `v0.2.0-beta.3` / `v0.2.0-beta.2` / `v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
+**版本与发布**：标签 `v0.2.1-beta8`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.2.1-beta8>
+（历史版本各自保留安装程序：`v0.2.1-beta7` / `v0.2.1-beta6` / `v0.2.0-beta.5` / `v0.2.0-beta.4` / `v0.2.0-beta.3` / `v0.2.0-beta.2` / `v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
 （预发布；**安装盘已附上**：`vimtu64-64.iso` 三合一安装盘 + `vimtu64-64.img` 裸盘介质）。
 
 ```bash
