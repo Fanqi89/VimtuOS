@@ -42,4 +42,9 @@ void mouse_clear_event_flag();
 // 鼠标按钮事件（按下瞬间）
 bool mouse_button_pressed(int btn);   // 0=左 1=右 2=中
 void mouse_consume_pressed(int btn);
+
+// ★ 批次 L：最近一次**左键按下包到达**时刻（ticks64() 的 tick 值；还没按下过 = 0）。
+//   双击判定请用它，不要用 GUI 回调时刻：一帧重绘/调度延迟会把"用户的双击"误判成两次单击。
+//   （实测：宿主负载高时两次按下包在 200ms 内到达，GUI 回调却被拖到相隔 >500ms。）
+uint32_t mouse_press_tick64();
 void mouse_drain();                   // 清空按键/事件状态

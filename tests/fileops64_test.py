@@ -17,6 +17,13 @@
  12) 错误路径：36 字符名字被截到 31 B 上限（不越界）；含空格的非法名字被拒 rc=1；重名被拒 rc=1；
  13) 日志卫生：禁止 PANIC / TRIPLE FAULT / FAILED mask= / selftest FAIL / OOM。
 
+★ 批次 L：注入确定性（不改语义）
+   * 双击注入（进入目录 / 预览 / 进盘）走 Mouse.dclick_until（最多 3 次注入，**打点真的出现才算过**）：
+     宿主负载高时 QEMU 注入的两次按下偶尔会被内核判成两次单击（QEMU+PS/2 时序抖动），
+     这是注入抖动、不是 UI 语义错误；断言语义没放宽（导航/预览打点仍然必须真的出现）。
+   * 框选同理走 Mouse.box_until（最多 3 次，仍然要求 sel n=2 mode=box）。
+   * 新增 1 条断言：双击判定按**包到达间隔**算（[UI] explorer dbl src=card idx=.. gap=..，gap <= 125 tick = 500ms 窗口）。
+
 跑法：py -3 tests\\fileops64_test.py（需要先 bash build64.sh；复用 explorer64_test 的鼠标闭环工具）
 """
 import argparse
@@ -175,6 +182,29 @@ class Mouse:
         self.goto(tx, ty)
         exp.double_click(self.mon)
 
+    def dclick_until(self, tx, ty, pattern, timeout=12, tries=3):
+        """双击 + 有界重试（**只重试注入，不放宽断言**）：宿主负载高时，注入的两次按下偶尔会被
+        判成两次单击（内核按 500ms 窗口判双击，QEMU 注入的时序抖动会吃掉它）—— 这属于注入抖动，
+        不是 UI 语义错误。做法：最多注入 tries 次，**pattern（导航/预览打点）真的出现才算过**。
+        每次重试前等一会儿，让上一轮单击的 500ms 双击窗口过期，避免和下一轮的第一下粘连。"""
+        for _ in range(tries):
+            since = self.vm.mark()
+            self.dclick(tx, ty)
+            if self.vm.wait_new(pattern, timeout, since):
+                return True
+            time.sleep(0.7)
+        return False
+
+    def box_until(self, x0, y0, x1, y1, pattern, timeout=12, tries=3):
+        """框选 + 有界重试（同上：pattern = `sel n=.. mode=box` 打点，必须真的出现；不放宽语义）。"""
+        for _ in range(tries):
+            since = self.vm.mark()
+            self.box(x0, y0, x1, y1)
+            if self.vm.wait_new(pattern, timeout, since):
+                return True
+            time.sleep(0.4)
+        return False
+
     def right_click(self, tx, ty):
         # QEMU HMP：`mouse_button state (1=L, 2=R, 4=M)` -> 右键 = 2（实测 4 是左中键，不产生右键）
         self.goto(tx, ty)
@@ -275,9 +305,14 @@ def main():
         mcard = card_idx(vm, "C")
         ck("C: 卡片下标可读", mcard is not None, "idx=%s" % mcard)
         since = vm.mark()
-        mouse.dclick(*exp.card_center(mcard))
-        ck("双击 C: 进入盘根（nav path=/ view=icons）",
-           vm.wait_new(r"\[UI\] explorer nav path=/ items=\d+ view=icons", 25, since))
+        ok_nav = mouse.dclick_until(*exp.card_center(mcard),
+                                    r"\[UI\] explorer nav path=/ items=\d+ view=icons", timeout=25)
+        ck("双击 C: 进入盘根（nav path=/ view=icons）", ok_nav)
+        m = None
+        for mm in re.finditer(r"\[UI\] explorer dbl src=card idx=\d+ gap=(\d+)", vm.log()[since:]):
+            m = mm
+        ck("双击判定按包到达间隔算（[UI] explorer dbl src=card gap<=125）",
+           m is not None and int(m.group(1)) <= 125, ("gap=%s" % m.group(1)) if m else "（缺 dbl 打点）")
         idx_copy = last_item_idx(vm, "copy_me.txt")
         ck("根目录里能看到 copy_me.txt", idx_copy >= 0, "idx=%d" % idx_copy)
 
@@ -319,9 +354,9 @@ def main():
         ck("Ctrl+C 入剪贴板（clip op=copy n=1）", vm.wait_new(r"\[UI\] explorer clip op=copy n=1", 20, since))
         idx_docs = last_item_idx(vm, "docs")
         ck("docs 条目可定位", idx_docs >= 0, "idx=%d" % idx_docs)
-        since = vm.mark()
-        mouse.dclick(*cell(idx_docs))
-        ck("双击进 /docs（nav path=/docs items=0）", vm.wait_nav("/docs", 0, 20, since))
+        ok_docs = mouse.dclick_until(*cell(idx_docs),
+                                     r"\[UI\] explorer nav path=/docs items=0 view=\w+", timeout=20)
+        ck("双击进 /docs（nav path=/docs items=0）", ok_docs)
         since = vm.mark()
         mon.key("ctrl-v", wait=1.5)
         ck("Ctrl+V 粘贴成功（paste ok n=1 dst=/docs skipped=0）",
@@ -329,10 +364,9 @@ def main():
         ck("/docs 现在 1 条（nav path=/docs items=1）", vm.wait_nav("/docs", 1, 20, since))
         idx_p = last_item_idx(vm, "copy_me.txt")
         ck("粘贴出来的条目在列表里（item name=copy_me.txt）", idx_p >= 0, "idx=%d" % idx_p)
-        since = vm.mark()
-        mouse.dclick(*cell(idx_p))
-        ck("双击粘贴出的文件 -> 预览读回 17 B（内容一致）",
-           vm.wait_new(r"\[UI\] explorer preview name=copy_me\.txt bytes=17", 20, since))
+        ok_prev = mouse.dclick_until(*cell(idx_p),
+                                     r"\[UI\] explorer preview name=copy_me\.txt bytes=17", timeout=20)
+        ck("双击粘贴出的文件 -> 预览读回 17 B（内容一致）", ok_prev)
 
         # ==================== 阶段 6：重命名（F2 内联编辑）====================
         print("=== 阶段 6：F2 -> Esc 取消 -> F2 -> renamed.txt -> 回车 ===")
@@ -365,10 +399,9 @@ def main():
            vm.wait_new(r"\[UI\] explorer rename old=copy_me\.txt new=renamed\.txt rc=0", 25, since))
         idx_r = last_item_idx(vm, "renamed.txt")
         ck("列表里出现新名（item name=renamed.txt）", idx_r >= 0, "idx=%d" % idx_r)
-        since = vm.mark()
-        mouse.dclick(*cell(idx_r))
-        ck("重命名后内容不变（preview name=renamed.txt bytes=17）",
-           vm.wait_new(r"\[UI\] explorer preview name=renamed\.txt bytes=17", 20, since))
+        ok_ren = mouse.dclick_until(*cell(idx_r),
+                                    r"\[UI\] explorer preview name=renamed\.txt bytes=17", timeout=20)
+        ck("重命名后内容不变（preview name=renamed.txt bytes=17）", ok_ren)
 
         # ==================== 阶段 7：重名策略 + 框选 + Ctrl+A + 删除 ====================
         print("=== 阶段 7：再粘贴一次（重名加 (2)）-> 框选 2 条 -> Ctrl+A -> Delete 两次确认 ===")
@@ -380,9 +413,10 @@ def main():
         ck("重名自动加后缀（paste ok n=1 + item name=renamed(2).txt）",
            ok_paste and vm.wait_new(r"\[UI\] explorer item idx=\d+ name=renamed\(2\)\.txt", 20, since))
         ck("/docs 现在 2 条", vm.wait_nav("/docs", 2, 20, since))
-        since = vm.mark()
-        mouse.box(sx(CONTENT_X + 430), sy(CONTENT_Y + 300), sx(CONTENT_X + 4), sy(CONTENT_Y + 8))
-        ck("框选 2 条（sel n=2 mode=box）", vm.wait_new(r"\[UI\] explorer sel n=2 mode=box", 25, since))
+        ok_box = mouse.box_until(sx(CONTENT_X + 430), sy(CONTENT_Y + 300),
+                                 sx(CONTENT_X + 4), sy(CONTENT_Y + 8),
+                                 r"\[UI\] explorer sel n=2 mode=box", timeout=15)
+        ck("框选 2 条（sel n=2 mode=box）", ok_box)
         since = vm.mark()
         mon.key("ctrl-a", wait=1.2)
         ck("Ctrl+A 全选（sel n=2 mode=all）", vm.wait_new(r"\[UI\] explorer sel n=2 mode=all", 20, since))
@@ -483,9 +517,9 @@ def main():
             ck("列表里出现 newdir（item name=newdir type=dir）",
                vm.wait_new(r"\[UI\] explorer item idx=\d+ name=newdir type=dir", 20, since))
             idx_nd = last_item_idx(vm, "newdir")
-            since = vm.mark()
-            mouse.dclick(*cell(idx_nd))
-            ck("双击进新目录（nav path=/newdir items=0）", vm.wait_nav("/newdir", 0, 20, since))
+            ok_nd = mouse.dclick_until(*cell(idx_nd),
+                                       r"\[UI\] explorer nav path=/newdir items=0 view=\w+", timeout=20)
+            ck("双击进新目录（nav path=/newdir items=0）", ok_nd)
             since = vm.mark()
             mouse.click(sx(75), sy(40), want_hit="btn:up")
             vm.wait_new(r"\[UI\] explorer nav path=/ items=\d+ view=\w+", 15, since)
@@ -502,10 +536,9 @@ def main():
         ck("回到此电脑（thispc）", vm.wait_new(r"\[UI\] explorer thispc", 20, since))
         md = card_idx(vm, "D")
         ck("D: 卡片可定位", md is not None, "idx=%s" % md)
-        since = vm.mark()
-        mouse.dclick(*exp.card_center(md))
-        ck("进入 D: 根目录（enter letter=D: ... ok）",
-           vm.wait_new(r"\[UI\] explorer enter letter=D:.+ ok items=\d+", 25, since))
+        ok_d = mouse.dclick_until(*exp.card_center(md),
+                                  r"\[UI\] explorer enter letter=D:.+ ok items=\d+", timeout=25)
+        ck("进入 D: 根目录（enter letter=D: ... ok）", ok_d)
         since = vm.mark()
         mon.key("ctrl-v", wait=1.8)
         ck("跨卷粘贴成功（paste ok n=1 dst=/ skipped=0）",

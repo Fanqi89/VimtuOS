@@ -1186,7 +1186,7 @@ def cap_fileops_ui():
           "\"[UI] explorer rename old=copy_me.txt new=renamed.txt rc=0\"、"
           "\"[UI] explorer delete path=/nonempty kind=dir rc=1 reason=not-empty\"、"
           "\"[UI] explorer mkdir path=/newdir rc=0\"、\"[UI] explorer sel n=2 mode=box\"",
-          "端到端脚本 tests/fileops64_test.py：%s（94 条断言：右键菜单像素 + Ctrl+C/V + F2 内联编辑 + 框选多选 + "
+          "端到端脚本 tests/fileops64_test.py：%s（95 条断言：右键菜单像素 + Ctrl+C/V + F2 内联编辑 + 框选多选 + "
           "Delete 两段确认 + 非空目录被拒 + 新建文件夹 + 剪切 + 工具栏 + 跨卷粘贴（宿主侧解析 D: 卷）+ 属性面板 + 错误路径）"
           % ("存在" if test else "缺失"),
           "截图 docs/screenshots/explorer_{ctxmenu,rename}64.png：%s" % ("两张齐" if shots else "缺")]
@@ -1281,7 +1281,7 @@ TESTS = [
     ("explorer64_test.py", "★ 文件资源管理器 / 此电脑（UI）：容量条/四列像素 + 鼠标双击进盘/进目录/跑 ELF64 + 面包屑/上级/后退 + 状态栏计数"),
     ("fileops64_test.py", "★ 批次 J 文件操作：右键菜单（像素）+ 复制/剪切/粘贴（Ctrl+C/X/V）+ F2 重命名内联编辑 + "
                           "删除两段确认（非空目录如实被拒）+ 新建文件夹 + 框选/Ctrl+A 多选 + 工具栏按钮 + "
-                          "跨卷 C:→D: 粘贴（宿主侧解析 D: 卷字节）+ 属性面板 + 错误路径（94 条断言）"),
+                          "跨卷 C:→D: 粘贴（宿主侧解析 D: 卷字节）+ 属性面板 + 错误路径（95 条断言）"),
 ]
 
 

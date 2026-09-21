@@ -49,6 +49,8 @@
 //   [UI] explorer scroll top=<n> items=<n>      （滚动/翻页，有界）
 //   [UI] explorer click x=<cx> y=<cy> sx=<sx> sy=<sy> hit=<none|card:<i>|item:<i>|btn:<id>|crumb:<k>|nav:<id>>
 //       （x/y = 客户区坐标，sx/sy = 屏幕坐标：自动验收的鼠标闭环定位靠它）
+//   ★ 批次 L：[UI] explorer dbl src=<card|item> idx=<i> gap=<ticks>  （双击成立；gap = 两次按下**包到达**间隔，
+//       250Hz 下 500ms 窗口 = 125；按到达时刻判定，渲染/调度延迟不会把双击吃掉）
 //   ---- ★ 批次 J：文件操作（右键菜单 / 复制 / 剪切 / 粘贴 / 重命名 / 删除 / 新建文件夹 / 多选 / 属性）----
 //   [UI] explorer ctxmenu items=<n> at=<sel|blank>     （右键菜单打开；n = 6（条目）/ 4（空白））
 //   [UI] explorer ctxmenu rect x=<cx> y=<cy> w=<w> h=<h>  （菜单矩形，客户区坐标：验收按它定位像素）

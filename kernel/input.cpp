@@ -1,6 +1,7 @@
 // input.cpp - PS/2 键盘与鼠标驱动（手搓）
 #include "input.h"
 #include "port.h"
+#include "x86_64.h"      // ★ 批次 L：ticks64()（记录左键按下包的到达时刻）
 #if defined(VIMTU_KBD_TRACE) || defined(VIMTU_PS2_TRACE)
 #include "debug64.h"
 #endif
@@ -263,18 +264,23 @@ static volatile int mouse_packet_cycle = 0;
 static volatile uint8_t mouse_packet[4];
 static volatile bool mouse_has_data = false;
 
+// ★ 批次 L：按下事件用**小计数器**而不是布尔标志 —— 一次 IRQ 排空里可能同时到"按下+松开+按下"
+//   （宿主负载高、客人排空间隔变长时实测出现），布尔标志会把两次按下并成一次，双击就丢了第一个。
+//   上限 4：极端积压时也不会无界增长（GUI 每次循环消费一个）。
 static volatile uint8_t pressed_left = 0, pressed_right = 0, pressed_middle = 0;
+static volatile uint32_t mouse_left_press_tick = 0;   // 最近一次左键按下的**包到达**时刻
 
 bool mouse_button_pressed(int btn) {
-    if (btn == 0) return pressed_left;
-    if (btn == 1) return pressed_right;
-    return pressed_middle;
+    if (btn == 0) return pressed_left != 0;
+    if (btn == 1) return pressed_right != 0;
+    return pressed_middle != 0;
 }
 void mouse_consume_pressed(int btn) {
-    if (btn == 0) pressed_left = 0;
-    else if (btn == 1) pressed_right = 0;
-    else pressed_middle = 0;
+    if (btn == 0) { if (pressed_left) pressed_left--; }
+    else if (btn == 1) { if (pressed_right) pressed_right--; }
+    else { if (pressed_middle) pressed_middle--; }
 }
+uint32_t mouse_press_tick64() { return mouse_left_press_tick; }
 bool mouse_has_event() { return mouse_has_data; }
 void mouse_clear_event_flag() { mouse_has_data = false; }
 
@@ -344,9 +350,10 @@ static void mouse_process_byte(uint8_t data) {
     if (mouse_y > mouse_max_y - 1) mouse_y = mouse_max_y - 1;
     const uint8_t nb = (uint8_t)(b0 & 0x07);
     const uint8_t old = mouse_buttons;
-    if ((nb & 1) && !(old & 1)) pressed_left = 1;
-    if ((nb & 2) && !(old & 2)) pressed_right = 1;
-    if ((nb & 4) && !(old & 4)) pressed_middle = 1;
+    // ★ 批次 L：左键按下记录**包到达时刻**（双击窗口用，见 mouse_press_tick64）；按下事件计数（不并包）
+    if ((nb & 1) && !(old & 1)) { mouse_left_press_tick = ticks64(); if (pressed_left < 4) pressed_left++; }
+    if ((nb & 2) && !(old & 2)) { if (pressed_right < 4) pressed_right++; }
+    if ((nb & 4) && !(old & 4)) { if (pressed_middle < 4) pressed_middle++; }
     mouse_buttons = nb;
     mouse_has_data = true;
 #ifdef VIMTU_PS2_TRACE

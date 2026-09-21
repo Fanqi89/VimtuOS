@@ -8,9 +8,10 @@
 //   2) 绘制全部用简单几何图形（无位图资源）：文件夹 = 琥珀色带标签的方块、VAP64 = 蓝色方块 +
 //      白色三角、ELF64 = 绿色方块 + 白色 ">_"、文本 = 白纸 + 灰线、二进制/未知 = 灰纸 + 点。
 //   3) 打点集中在 exp_log_* 里，全部走 dbg64_line_begin64()/dbg64_line_end64() 行锁。
-//   4) 双击（按下->按下 间隔 <= 500ms 且同一条目）= 进入/运行/预览；单击 = 选中。
-//      鼠标滚轮在内核里没有（kernel/input.h 的 PS/2 鼠标只报 3 字节包），所以滚动用：
-//      上下方向键（NAV_UP/DOWN，0xFD/0xFE）+ 点击内容区右侧的滚动条（上/下半页）+ 翻页按钮语义。
+//   4) 双击（同一条目上两次按下，间隔 <= 500ms）= 进入/运行/预览；单击 = 选中。
+//      ★ 批次 L：间隔按**鼠标包到达时刻**算（input.h mouse_press_tick64），不是 GUI 回调时刻 ——
+//      渲染/调度延迟不再把双击判成两次单击。鼠标滚轮在内核里没有（kernel/input.h 的 PS/2 鼠标只报 3 字节包），
+//      所以滚动用：上下方向键（NAV_UP/DOWN，0xFD/0xFE）+ 点击内容区右侧的滚动条（上/下半页）+ 翻页按钮语义。
 //   5) 所有下标/坐标先钳制再用：滚动、选中、命中测试都有界，越界一律不写不画。
 //
 // ★ 自动验收（tests/explorer64_test.py）依赖的**几何常量**（改这里必须同步改脚本）：
@@ -534,6 +535,21 @@ static void exp_log_click(int cx, int cy, int sx, int sy, const char* hit) {
     dbg64_dec((uint64_t)sy);
     dbg64_str(" hit=");
     dbg64_str(hit);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// ★ 批次 L：双击成立打点（自动验收 grep）：gap = 两次按下**包到达**的间隔（tick，250Hz -> 500ms 窗口 = 125）。
+//   为什么要打这一行：双击窗口以前按"GUI 回调时刻"算，宿主负载高时回调被拖到相隔 >500ms，
+//   明明设备侧两次按下只隔 200ms 却被判成两次单击。改按到达时刻之后，这行就是判定依据的证据。
+static void exp_log_dbl(const char* src, int idx, int32_t gap) {
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer dbl src=");
+    dbg64_str(src ? src : "?");
+    dbg64_str(" idx=");
+    dbg64_dec((uint64_t)(idx < 0 ? 0 : idx));
+    dbg64_str(" gap=");
+    dbg64_dec((uint64_t)(gap < 0 ? 0 : gap));
     dbg64_nl();
     dbg64_line_end64();
 }
@@ -2225,8 +2241,12 @@ static void exp_click(Window* w, int cx, int cy) {
     exp_log_click(cx, cy, sx, sy, hit);
     g_press_id = (id != IDC_NONE) ? id : IDC_NONE;
     g_press_tick = ticks64() + ms_to_ticks64(120);      // 120ms 的按下反馈
-    const uint32_t now = ticks64();
-    const bool dbl_ok = (int32_t)(now - g_last_tick) <= (int32_t)ms_to_ticks64(EXP_CLICK_MS);
+    // ★ 批次 L：双击窗口按**包到达时刻**判定（input.h 的 mouse_press_tick64）：GUI 回调可能被一帧
+    //   重绘/调度拖后，用回调时刻会把用户/注入的双击误判成两次单击（实测宿主负载高时回调间隔 >500ms，
+    //   虽然两次按下包只隔 ~200ms -> 目录双击丢了、后面一串操作跟着错位）。
+    const uint32_t pt = mouse_press_tick64();
+    const int32_t pt_gap = (int32_t)(pt - g_last_tick);
+    const bool dbl_ok = (pt_gap >= 0) && (pt_gap <= (int32_t)ms_to_ticks64(EXP_CLICK_MS));
 
     // ---- 文件菜单打开时优先处理菜单 ----
     if (g_menu_open) {
@@ -2326,6 +2346,7 @@ static void exp_click(Window* w, int cx, int cy) {
         const DriveInfo64* d = &g_drives[ci];
         if (dbl_ok && g_last_item == ci) {
             g_last_item = -1;
+            exp_log_dbl("card", ci, pt_gap);           // ★ 批次 L：双击成立（gap = 包到达间隔）
             if (!d->browsable) {
                 exp_msg((d->skip == DRV64_SKIP_ESP)
                         ? gui64_tr("EFI System Partition: not browsable",
@@ -2337,7 +2358,7 @@ static void exp_click(Window* w, int cx, int cy) {
             return;
         }
         g_last_item = ci;
-        g_last_tick = now;
+        g_last_tick = pt;                              // ★ 批次 L：存**包到达**时刻（双击窗口的基准）
         gui64_invalidate_window(w);
         return;
     }
@@ -2383,12 +2404,13 @@ static void exp_click(Window* w, int cx, int cy) {
         else                          { sel_pick(ii, false); exp_log_sel(sel_count(), "click"); }
         if (dbl_ok && g_last_item == ii) {
             g_last_item = -1;
+            exp_log_dbl("item", ii, pt_gap);           // ★ 批次 L：双击成立（gap = 包到达间隔）
             exp_open_item(ii);
             gui64_invalidate_window(w);
             return;
         }
         g_last_item = ii;
-        g_last_tick = now;
+        g_last_tick = pt;                              // ★ 批次 L：存**包到达**时刻（双击窗口的基准）
         exp_msg("");                                   // 单击条目 = 清掉上一条提示
         gui64_invalidate_window(w);
     }
