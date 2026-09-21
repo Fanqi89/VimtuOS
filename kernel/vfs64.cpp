@@ -149,26 +149,22 @@ static uint32_t crc32_64(const uint8_t* p, uint32_t n) {
     return c ^ 0xFFFFFFFFu;
 }
 
-static uint8_t  g_sec[VFS64_SECTOR_BYTES];            // 唯一工作扇区（先读进来再解析）
-static uint8_t  g_ind[VFS64_SECTOR_BYTES];            // 待写出的间接块镜像
-static uint32_t g_ptrs[VFS64_INDIRECT_PTRS];          // 释放文件时搬运的 128 个块号
-static uint8_t  g_ino_cache[VFS64_SECTOR_BYTES];      // inode 表"当前扇区"缓存（扫描时少读盘）
-static uint32_t g_ino_cache_lba = 0xFFFFFFFFu;
-static bool     g_ino_cache_valid = false;
-
-static bool     g_mounted     = false;
-static int      g_drive       = -1;
-static uint32_t g_start       = 0;                    // 分区起始绝对 LBA
-static uint32_t g_blocks      = 0;                    // 总块数
-static uint32_t g_bitmap_start = 0;
-static uint32_t g_bitmap_blocks = 0;
-static uint32_t g_inode_start  = 0;
-static uint32_t g_inode_count  = 0;
-static uint32_t g_data_start   = 0;
-static uint32_t g_data_blocks  = 0;
-static const Vfs64Layout* g_lay = &VFS_LAY_V3;         // 当前卷的 inode 布局
-
-// 挂载状态的整份快照（mount 失败时要恢复回去，别把已挂载的卷弄丢）
+// ==================== ★ 多卷：卷槽表 + "当前卷"====================
+// 为什么长这样（设计取舍写清）：
+//   * 这份实现原本是**单卷**的：超级块几何放在一组全局变量里，vfs64_mount/format 直接改它们。
+//     多卷需求（文件管理器里 C:/D:/E: 都能点进去）最省痛的做法不是把 2000 行里的 g_drive/g_start…
+//     全都加一遍参数（那样每一处都可能漏改），而是：
+//       1) 把几何收进 Vfs64Geom，卷槽表 g_vol[VFS64_SLOT_MAX] **每槽一份**；
+//       2) g_cur_slot 指向"当前卷"，下面用宏把原来的全局名映射成 g_vol[g_cur_slot] 的字段 ——
+//          于是既有代码（路径解析/inode/位图/读写/遍历）**逐字不动**地作用于当前卷；
+//       3) 切卷 = 改 g_cur_slot（外加 inode 缓存键控），没有任何数据搬运。
+//   * **inode 扇区缓存按 (slot, drive, lba) 三元组键控**（g_ino_cache_slot/drive/lba）：
+//     这是切卷最容易出的 bug —— 缓存只有 LBA 而没有卷身份时，切到另一块盘的同号 LBA 会
+//     把上一个卷的 inode 字节当本卷的用。三元组键控 + 任何写盘都失效（dev_write）双保险。
+//   * 系统卷槽 g_system_slot 由 vfs64_mount_system64 / vfs64_format 记录；store64/config64/
+//     update64/app64/elf64/proc64/sysstate64 一律用 vfs64_*_on64(vfs64_system_slot64(), …) ——
+//     "当前卷"只在那一次调用期间被临时换掉，返回前**原样切回**（LIFO 守卫）。所以无论用户正在
+//     浏览 D: 还是 E:，3 秒自动落盘/关机落盘都只写系统卷 C:。
 struct Vfs64Geom {
     bool     mounted;
     int      drive;
@@ -176,20 +172,54 @@ struct Vfs64Geom {
     uint32_t inode_start, inode_count, data_start, data_blocks;
     const Vfs64Layout* lay;
 };
+
+static uint8_t  g_sec[VFS64_SECTOR_BYTES];            // 唯一工作扇区（先读进来再解析）
+static uint8_t  g_ind[VFS64_SECTOR_BYTES];            // 待写出的间接块镜像
+static uint32_t g_ptrs[VFS64_INDIRECT_PTRS];          // 释放文件时搬运的 128 个块号
+static uint8_t  g_ino_cache[VFS64_SECTOR_BYTES];      // inode 表"当前扇区"缓存（扫描时少读盘）
+static int      g_ino_cache_slot  = -1;               // ★ 缓存键 = (slot, drive, lba)
+static int      g_ino_cache_drive = -1;
+static uint32_t g_ino_cache_lba   = 0xFFFFFFFFu;
+static bool     g_ino_cache_valid = false;
+
+static Vfs64Geom g_vol[VFS64_SLOT_MAX];               // 卷槽表（0 号槽 = 系统卷）
+static int       g_cur_slot      = 0;                 // 当前卷槽（恒为合法下标；mounted=false 表示没挂卷）
+static int       g_system_slot   = -1;                // 系统卷槽（C:）
+static int       g_vol_switch_depth = 0;              // 临时切卷守卫的嵌套计数（诊断用；0 = 不在按槽调用里）
+
+// 既有代码零改动的关键：这些名字原来是全局变量，现在是"当前卷"的字段别名。
+#define g_mounted      (g_vol[g_cur_slot].mounted)
+#define g_drive        (g_vol[g_cur_slot].drive)
+#define g_start        (g_vol[g_cur_slot].start)
+#define g_blocks       (g_vol[g_cur_slot].blocks)
+#define g_bitmap_start (g_vol[g_cur_slot].bitmap_start)
+#define g_bitmap_blocks (g_vol[g_cur_slot].bitmap_blocks)
+#define g_inode_start  (g_vol[g_cur_slot].inode_start)
+#define g_inode_count  (g_vol[g_cur_slot].inode_count)
+#define g_data_start   (g_vol[g_cur_slot].data_start)
+#define g_data_blocks  (g_vol[g_cur_slot].data_blocks)
+#define g_lay          (g_vol[g_cur_slot].lay)
+
+// inode 缓存失效（写盘、重挂载时调用；宁可多读，绝不给旧字节）
+static void ino_cache_invalidate() {
+    g_ino_cache_valid = false;
+    g_ino_cache_slot = -1;
+    g_ino_cache_drive = -1;
+    g_ino_cache_lba = 0xFFFFFFFFu;
+}
+// 缓存命中判定：**卷身份**（slot/drive/lba）三项全对才算命中
+static bool ino_cache_hit(int drive, uint32_t lba) {
+    return g_ino_cache_valid && g_ino_cache_slot == g_cur_slot &&
+           g_ino_cache_drive == drive && g_ino_cache_lba == lba;
+}
+
+// 挂载状态的整份快照（mount 失败时要恢复回去，别把已挂载的卷弄丢）
 static void geom_save(Vfs64Geom* g) {
-    g->mounted = g_mounted;         g->drive = g_drive;                 g->start = g_start;
-    g->blocks = g_blocks;           g->bitmap_start = g_bitmap_start;   g->bitmap_blocks = g_bitmap_blocks;
-    g->inode_start = g_inode_start; g->inode_count = g_inode_count;
-    g->data_start = g_data_start;   g->data_blocks = g_data_blocks;
-    g->lay = g_lay;
+    *g = g_vol[g_cur_slot];
 }
 static void geom_restore(const Vfs64Geom* g) {
-    g_mounted = g->mounted;         g_drive = g->drive;                 g_start = g->start;
-    g_blocks = g->blocks;           g_bitmap_start = g->bitmap_start;   g_bitmap_blocks = g->bitmap_blocks;
-    g_inode_start = g->inode_start; g_inode_count = g->inode_count;
-    g_data_start = g->data_start;   g_data_blocks = g->data_blocks;
-    g_lay = g->lay;
-    g_ino_cache_valid = false;      g_ino_cache_lba = 0xFFFFFFFFu;
+    g_vol[g_cur_slot] = *g;
+    ino_cache_invalidate();
 }
 
 // ==================== 串口打点（统一 [VFS64] 前缀）====================
@@ -291,7 +321,7 @@ static bool dev_read_at(int drive, uint32_t abs_lba, uint32_t count, void* buf) 
 }
 static bool dev_write_at(int drive, uint32_t abs_lba, uint32_t count, const void* buf) {
     if (count == 0) return true;
-    g_ino_cache_valid = false;          // 任何写盘都让 inode 扇区缓存失效（宁可多读，绝不给旧字节）
+    ino_cache_invalidate();             // 任何写盘都让 inode 扇区缓存失效（宁可多读，绝不给旧字节）
     if (g_fake_active) {
         if ((uint64_t)abs_lba + count > VFS64_FAKE_SECTORS) {
             dbg64_str("[VFS64] fake-disk range fail lba=");
@@ -477,12 +507,16 @@ static bool inode_slot(uint32_t idx, uint32_t* out_blk, uint32_t* out_off) {
     }
     return true;
 }
+// inode 扇区缓存：**键 = (slot, drive, lba)** —— 切卷/换盘后即使 LBA 相同也一定不命中，
+// 绝不会把上一个卷的 inode 字节当本卷的用（多卷里最容易出的 bug，见文件头"多卷"一节）。
 static bool inode_load(uint32_t idx, uint8_t* out) {
     uint32_t blk = 0, off = 0;
     if (!inode_slot(idx, &blk, &off)) return false;
     const uint32_t lba = g_start + blk;
-    if (!g_ino_cache_valid || g_ino_cache_lba != lba) {
-        if (!dev_read(lba, 1, g_ino_cache)) { g_ino_cache_valid = false; return false; }
+    if (!ino_cache_hit(g_drive, lba)) {
+        if (!dev_read(lba, 1, g_ino_cache)) { ino_cache_invalidate(); return false; }
+        g_ino_cache_slot = g_cur_slot;               // 记下**卷身份**，不只是 LBA
+        g_ino_cache_drive = g_drive;
         g_ino_cache_lba = lba;
         g_ino_cache_valid = true;
     }
@@ -493,14 +527,16 @@ static bool inode_store(uint32_t idx, const uint8_t* in) {
     uint32_t blk = 0, off = 0;
     if (!inode_slot(idx, &blk, &off)) return false;
     const uint32_t lba = g_start + blk;
-    if (!g_ino_cache_valid || g_ino_cache_lba != lba) {
-        if (!dev_read(lba, 1, g_ino_cache)) { g_ino_cache_valid = false; return false; }
+    if (!ino_cache_hit(g_drive, lba)) {
+        if (!dev_read(lba, 1, g_ino_cache)) { ino_cache_invalidate(); return false; }
+        g_ino_cache_slot = g_cur_slot;
+        g_ino_cache_drive = g_drive;
         g_ino_cache_lba = lba;
         g_ino_cache_valid = true;
     }
     copy_bytes(g_ino_cache + off, in, g_lay->inode_bytes);
-    if (!dev_write(lba, 1, g_ino_cache)) { g_ino_cache_valid = false; return false; }
-    g_ino_cache_valid = false;                        // 写后失效：以后要用就重读
+    if (!dev_write(lba, 1, g_ino_cache)) { ino_cache_invalidate(); return false; }
+    ino_cache_invalidate();                           // 写后失效：以后要用就重读
     return true;
 }
 // 结构合法性：类型/名字长度/保留字段/CRC/大小/（v3）时间与保留区。
@@ -873,6 +909,17 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
     const uint32_t data_start   = inode_start + inode_blocks;
     const uint32_t data_blocks  = total_sectors - data_start;
 
+    // ★ 多卷：格式化 = 造一个**卷**（安装器 / 自检路径）。如果还没有登记过系统卷槽，就把当前槽
+    //   登记为系统卷槽 —— 之后 store64/config64/update64 等"固定写系统卷"的组件才有明确目标。
+    //   （系统内核的正常路径是 vfs64_mount_system64，它在挂载时就把 0 号槽登记成系统卷槽。）
+    if (g_system_slot < 0) {
+        g_system_slot = g_cur_slot;
+        dbg64_str("[VFS64] system slot=");
+        dbg64_dec((uint64_t)g_system_slot);
+        dbg64_str(" (set by format)");
+        dbg64_nl();
+    }
+
     g_mounted = false;
     g_drive = drive;
     g_start = start_lba;
@@ -884,7 +931,7 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
     g_data_start = data_start;
     g_data_blocks = data_blocks;
     g_lay = &VFS_LAY_V3;
-    g_ino_cache_valid = false;
+    ino_cache_invalidate();
 
     // 1) 超级块（先把 CRC 覆盖区清零，再填字段，最后算 CRC）
     zero_bytes(g_sec, VFS64_SECTOR_BYTES);
@@ -975,7 +1022,7 @@ static void geom_apply(const Vfs64SbGeo& g) {
     g_data_start    = g.data_start;
     g_data_blocks   = g.data_blocks;
     g_lay           = g.lay;
-    g_ino_cache_valid = false;
+    ino_cache_invalidate();
 }
 int vfs64_mount(int drive, uint32_t start_lba) {
     Vfs64Geom saved;
@@ -983,7 +1030,7 @@ int vfs64_mount(int drive, uint32_t start_lba) {
     g_mounted = false;
     g_drive = drive;
     g_start = start_lba;
-    g_ino_cache_valid = false;
+    ino_cache_invalidate();
 
     if (!g_fake_active && !ata_linked()) {
         log_line("no ATA driver linked");
@@ -1072,6 +1119,270 @@ int vfs64_mounted_volume64(int* drive, uint32_t* start_lba, Vfs64VolInfo64* out)
     return 0;
 }
 
+
+// ==================== ★ 多卷：卷槽 API + 按槽调用守卫 ====================
+// 打点都带 slot=<n>：自动验收能把"切到哪块盘"与盘符对上（[UI] explorer enter letter=D: slot=2 ok）。
+static void log_slot_bad(const char* op, int slot) {
+    dbg64_str("[VFS64] ");
+    dbg64_str(op);
+    dbg64_str(": bad slot=");
+    dbg64_dec((uint64_t)slot);
+    dbg64_str(" (slots=");
+    dbg64_dec((uint64_t)VFS64_SLOT_MAX);
+    dbg64_str(")");
+    dbg64_nl();
+}
+
+int vfs64_slot_used64(int slot) {
+    if (slot < 0 || slot >= (int)VFS64_SLOT_MAX) return 0;
+    return g_vol[slot].mounted ? 1 : 0;
+}
+int vfs64_current_slot64() { return g_mounted ? g_cur_slot : -1; }
+int vfs64_system_slot64()  { return g_system_slot; }        // 没挂过/没格式化过系统卷时是 -1（调用方如实失败）
+
+int vfs64_slot_alloc64() {
+    for (int i = 0; i < (int)VFS64_SLOT_MAX; i++) if (!g_vol[i].mounted) return i;
+    return -1;                                              // 卷表满：调用方必须如实拒绝，绝不覆盖已有卷
+}
+int vfs64_slot_find64(int drive, uint32_t start_lba) {
+    for (int i = 0; i < (int)VFS64_SLOT_MAX; i++) {
+        if (!g_vol[i].mounted) continue;
+        if (g_vol[i].drive == drive && g_vol[i].start == start_lba) return i;
+    }
+    return -1;
+}
+int vfs64_slot_info64(int slot, int* drive, uint32_t* start_lba, Vfs64VolInfo64* out) {
+    if (slot < 0 || slot >= (int)VFS64_SLOT_MAX || !g_vol[slot].mounted) {
+        log_slot_bad("slot_info64", slot);
+        return -1;
+    }
+    const Vfs64Geom& v = g_vol[slot];
+    if (drive) *drive = v.drive;
+    if (start_lba) *start_lba = v.start;
+    if (out) {
+        uint32_t free_blocks = 0;
+        // 只读：显式传 (drive, 起始 LBA) 数一遍位图 —— **不切换当前卷、不碰挂载状态**。
+        if (!count_free_at(v.drive, v.start, v.bitmap_start, v.bitmap_blocks,
+                           v.blocks, v.data_start, &free_blocks)) return -1;
+        out->version = v.lay->version;
+        out->blocks = v.blocks;
+        out->inodes = v.inode_count;
+        out->inode_bytes = v.lay->inode_bytes;
+        out->bitmap_start = v.bitmap_start;
+        out->bitmap_blocks = v.bitmap_blocks;
+        out->data_start = v.data_start;
+        out->data_blocks = v.data_blocks;
+        out->free_blocks = free_blocks;
+    }
+    return 0;
+}
+
+// ---- 把一个卷挂进指定槽（不改变当前卷）----
+int vfs64_mount_slot64(int slot, int drive, uint32_t start_lba) {
+    if (slot < 0 || slot >= (int)VFS64_SLOT_MAX) { log_slot_bad("mount_slot64", slot); return -1; }
+    const int saved_cur = g_cur_slot;
+    if (slot == saved_cur) {                                // 挂进当前槽：mount 内部自己 save/restore
+        const int rc0 = vfs64_mount(drive, start_lba);
+        dbg64_str("[VFS64] mount slot=");
+        dbg64_dec((uint64_t)slot);
+        dbg64_str(rc0 == 0 ? " ok (current)" : " FAILED (current)");
+        dbg64_nl();
+        return rc0;
+    }
+    g_cur_slot = slot;                                      // 只让 mount 改这个槽的几何
+    const int rc = vfs64_mount(drive, start_lba);
+    g_cur_slot = saved_cur;                                 // 当前卷立刻换回（挂载不是激活）
+    dbg64_str("[VFS64] mount slot=");
+    dbg64_dec((uint64_t)slot);
+    dbg64_str(rc == 0 ? " ok drive=" : " FAILED drive=");
+    dbg64_dec((uint64_t)drive);
+    dbg64_str(" start=");
+    dbg64_dec(start_lba);
+    dbg64_nl();
+    return rc;
+}
+
+// ---- 激活一个槽 = 把"当前卷"切过去 ----
+int vfs64_activate_slot64(int slot) {
+    if (slot < 0 || slot >= (int)VFS64_SLOT_MAX) { log_slot_bad("activate_slot64", slot); return -1; }
+    if (!g_vol[slot].mounted) {
+        dbg64_str("[VFS64] activate slot=");
+        dbg64_dec((uint64_t)slot);
+        dbg64_str(" FAILED reason=not-mounted");
+        dbg64_nl();
+        return -1;
+    }
+    g_cur_slot = slot;
+    // 缓存按 (slot, drive, lba) 键控，切卷不需要清 —— 这里只打点，证明"切到哪个卷"。
+    dbg64_str("[VFS64] activate slot=");
+    dbg64_dec((uint64_t)slot);
+    dbg64_str(" drive=");
+    dbg64_dec((uint64_t)g_drive);
+    dbg64_str(" start=");
+    dbg64_dec(g_start);
+    dbg64_str(" blocks=");
+    dbg64_dec(g_blocks);
+    dbg64_str(" version=");
+    dbg64_dec(g_lay->version);
+    dbg64_nl();
+    return 0;
+}
+
+// ---- 挂系统卷：0 号槽 + 记成系统卷槽 + 激活 ----
+int vfs64_mount_system64(int drive, uint32_t start_lba) {
+    const int slot = 0;                                     // 约定：系统卷固定 0 号槽（盘符 C:）
+    const int existed = vfs64_slot_find64(drive, start_lba);
+    if (existed >= 0) {
+        // 已经挂过（例如二次初始化）：直接把它记成系统卷槽并激活，不重复挂载。
+        g_system_slot = existed;
+        if (vfs64_activate_slot64(existed) != 0) return -1;
+    } else {
+        if (vfs64_mount_slot64(slot, drive, start_lba) != 0) {
+            log_line("mount_system FAILED (mount)");
+            return -1;
+        }
+        g_system_slot = slot;
+
+        if (vfs64_activate_slot64(slot) != 0) return -1;
+    }
+
+    dbg64_str("[VFS64] mount_system slot=");
+    dbg64_dec((uint64_t)g_system_slot);
+    dbg64_str(" drive=");
+    dbg64_dec((uint64_t)drive);
+    dbg64_str(" start=");
+    dbg64_dec(start_lba);
+    dbg64_nl();
+    return 0;
+}
+
+// 卷槽表串口打印（终端 `vol` / 自动验收：[VFS64] slots n=<n> system=<s> current=<c>）
+void vfs64_slots_dump64() {
+    int used = 0;
+    for (int i = 0; i < (int)VFS64_SLOT_MAX; i++) if (g_vol[i].mounted) used++;
+    dbg64_str("[VFS64] slots n=");
+    dbg64_dec((uint64_t)VFS64_SLOT_MAX);
+    dbg64_str(" used=");
+    dbg64_dec((uint64_t)used);
+    dbg64_str(" system=");
+    if (g_system_slot >= 0) dbg64_dec((uint64_t)g_system_slot); else dbg64_str("-");
+    dbg64_str(" current=");
+    if (g_mounted) dbg64_dec((uint64_t)g_cur_slot); else dbg64_str("-");
+    dbg64_nl();
+    for (int i = 0; i < (int)VFS64_SLOT_MAX; i++) {
+        dbg64_str("[VFS64] slot=");
+        dbg64_dec((uint64_t)i);
+        if (!g_vol[i].mounted) { dbg64_str(" used=no"); dbg64_nl(); continue; }
+        uint32_t free_blocks = 0;
+        const bool freed = count_free_at(g_vol[i].drive, g_vol[i].start, g_vol[i].bitmap_start,
+                                         g_vol[i].bitmap_blocks, g_vol[i].blocks,
+                                         g_vol[i].data_start, &free_blocks);
+        dbg64_str(" used=yes drive=");
+        dbg64_dec((uint64_t)g_vol[i].drive);
+        dbg64_str(" start=");
+        dbg64_dec(g_vol[i].start);
+        dbg64_str(" blocks=");
+        dbg64_dec(g_vol[i].blocks);
+        dbg64_str(" version=");
+        dbg64_dec(g_vol[i].lay ? g_vol[i].lay->version : 0u);
+        dbg64_str(" free=");
+        if (freed) dbg64_dec(free_blocks); else dbg64_str("?");
+        dbg64_str(i == g_cur_slot ? " current=yes" : "");
+        dbg64_nl();
+    }
+}
+
+// ---- 临时切卷守卫：_on64 的实现基础 ----
+// 构造 = 当前卷换成 slot（必须已挂载）；析构 = **原样换回**进来时那个槽。
+//   * 嵌套（理论上不会：_on64 内部只调旧 API）：计数 + LIFO 恢复，语义不乱。
+//   * 中断：vfs64 的调用点都在任务上下文（GUI 主循环 / 终端 / 自检）；即便被抢断，别的上下文
+//     也只会以同样的守卫方式切卷，每次恢复的都是"自己进来时"的卷 —— 当前卷不会丢。
+//   * inode 缓存按 (slot, drive, lba) 键控，所以切卷不必清缓存，也不会读到别的卷的字节。
+struct Vfs64SlotGuard {
+    int  saved;
+    bool active;
+    explicit Vfs64SlotGuard(int slot) {
+        active = false;
+        if (slot < 0 || slot >= (int)VFS64_SLOT_MAX || !g_vol[slot].mounted) return;
+        if (g_vol_switch_depth > 0) log_line("WARN nested volume switch (LIFO restore)");
+        saved = g_cur_slot;
+        g_cur_slot = slot;
+        g_vol_switch_depth++;
+        active = true;
+    }
+    ~Vfs64SlotGuard() {
+        if (!active) return;
+        g_vol_switch_depth--;
+        g_cur_slot = saved;                                 // ★ 原样切回：用户的浏览卷不受影响
+    }
+};
+// 守卫失败（槽非法/没挂载）时的统一打点：说明"这次按槽调用没有落到任何卷上"，绝不静默写错地方。
+static int on64_slot_unavailable(const char* op, int slot) {
+    dbg64_str("[VFS64] ");
+    dbg64_str(op);
+    dbg64_str("_on64: slot=");
+    dbg64_dec((uint64_t)slot);
+    dbg64_str(" not mounted");
+    dbg64_nl();
+    return -1;
+}
+
+// ---- 按槽别名（系统组件固定写系统卷用的入口）----
+int vfs64_stat_on64(int slot, const char* path, uint32_t* type, uint32_t* size) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("stat", slot);
+    return vfs64_stat(path, type, size);
+}
+int vfs64_stat64_on64(int slot, const char* path, Vfs64Info64* out) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("stat64", slot);
+    return vfs64_stat64(path, out);
+}
+int vfs64_read_on64(int slot, const char* path, void* buf, int max) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("read", slot);
+    return vfs64_read(path, buf, max);
+}
+int vfs64_write_on64(int slot, const char* path, const void* buf, int len) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("write", slot);
+    return vfs64_write(path, buf, len);
+}
+int vfs64_mkdir_on64(int slot, const char* path) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("mkdir", slot);
+    return vfs64_mkdir(path);
+}
+int vfs64_create_on64(int slot, const char* path) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("create", slot);
+    return vfs64_create64(path);
+}
+int vfs64_unlink_on64(int slot, const char* path) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("unlink", slot);
+    return vfs64_unlink(path);
+}
+int vfs64_rmdir_on64(int slot, const char* path) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("rmdir", slot);
+    return vfs64_rmdir64(path);
+}
+int vfs64_ls_on64(int slot, const char* path, char names[][VFS64_LS_NAME_BUF], int max, uint32_t* sizes) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("ls", slot);
+    return vfs64_ls(path, names, max, sizes);
+}
+int vfs64_list64_on64(int slot, const char* path, Vfs64Dirent64* out, int max, uint32_t* cursor) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("list64", slot);
+    return vfs64_list64(path, out, max, cursor);
+}
+int vfs64_tree_dump64_on64(int slot, const char* path, int max_entries, int max_depth) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("tree_dump64", slot);
+    return vfs64_tree_dump64(path, max_entries, max_depth);
+}
 // ==================== 读文件 ====================
 int vfs64_read64(const char* path, void* buf, int max) {
     if (!g_mounted) { log_op_fail("read64", "not mounted"); return -1; }
@@ -1418,12 +1729,23 @@ int vfs64_stat(const char* path, uint32_t* type, uint32_t* size) {
 }
 
 // ---- 目录游标（opendir / readdir / closedir）----
+// ★ 多卷：游标记住**打开时的卷身份**（slot/drive/start）。readdir 期间即使用户切了卷，
+//   也会按记住的槽去读，绝不拿另一个卷的 inode 表当这个目录的内容；卷被重挂/换卷则如实报错。
 struct Vfs64DirStream {
     bool     used;
+    int      slot;     // 打开时的卷槽
+    int      drive;    // 打开时的驱动器号
+    uint32_t start;    // 打开时的卷起始 LBA
     uint32_t dir;      // 目录 inode 号
     uint32_t cursor;   // 下一个待扫描的 inode 下标
 };
 static Vfs64DirStream g_streams[VFS64_DIRSTREAM_MAX];
+
+// 游标还指向当初那个卷吗？（同一个槽被重挂到别的盘 -> 不认，避免读到不相干的字节）
+static bool stream_vol_ok(const Vfs64DirStream* st) {
+    if (st->slot < 0 || st->slot >= (int)VFS64_SLOT_MAX || !g_vol[st->slot].mounted) return false;
+    return g_vol[st->slot].drive == st->drive && g_vol[st->slot].start == st->start;
+}
 
 int vfs64_opendir64(const char* path, int* out_handle) {
     if (!g_mounted) { log_op_fail("opendir64", "not mounted"); return -1; }
@@ -1439,6 +1761,9 @@ int vfs64_opendir64(const char* path, int* out_handle) {
     for (uint32_t i = 0; i < VFS64_DIRSTREAM_MAX; i++) {
         if (g_streams[i].used) continue;
         g_streams[i].used = true;
+        g_streams[i].slot = g_cur_slot;                 // ★ 记住卷身份
+        g_streams[i].drive = g_drive;
+        g_streams[i].start = g_start;
         g_streams[i].dir = idx;
         g_streams[i].cursor = 1u;
         *out_handle = (int)i;
@@ -1452,6 +1777,9 @@ int vfs64_readdir64(int handle, Vfs64Dirent64* out) {
     Vfs64DirStream* st = &g_streams[handle];
     if (!st->used) { log_op_fail("readdir64", "handle not open"); return -1; }
     if (!out) { log_op_fail("readdir64", "bad args"); return -1; }
+    if (!stream_vol_ok(st)) { log_op_fail("readdir64", "volume changed (handle is stale)"); return -1; }
+    Vfs64SlotGuard g(st->slot);                          // 按打开时的卷操作（返回前切回当前卷）
+    if (!g.active) { log_op_fail("readdir64", "volume not mounted"); return -1; }
     const int n = list_inode64(st->dir, out, 1, &st->cursor);
     if (n < 0) return -1;
     return n;                                   // 1 = 一条；0 = 枚举结束
@@ -1460,6 +1788,9 @@ int vfs64_closedir64(int handle) {
     if (handle < 0 || handle >= (int)VFS64_DIRSTREAM_MAX) { log_op_fail("closedir64", "bad handle"); return -1; }
     if (!g_streams[handle].used) { log_op_fail("closedir64", "handle not open"); return -1; }
     g_streams[handle].used = false;
+    g_streams[handle].slot = -1;
+    g_streams[handle].drive = -1;
+    g_streams[handle].start = 0;
     g_streams[handle].dir = 0;
     g_streams[handle].cursor = 1u;
     return 0;
@@ -1585,6 +1916,12 @@ int vfs64_tree_dump64(const char* path, int max_entries, int max_depth) {
 void vfs64_dump64() {
     dbg64_str("[VFS64] dump mounted=");
     dbg64_str(g_mounted ? "yes" : "no");
+    dbg64_str(" slot=");
+    dbg64_dec((uint64_t)g_cur_slot);
+    dbg64_str(" system_slot=");
+    dbg64_dec((uint64_t)g_system_slot);
+    dbg64_str(" slots=");
+    dbg64_dec((uint64_t)VFS64_SLOT_MAX);
     if (!g_mounted) { dbg64_nl(); return; }
     uint32_t free_blocks = 0;
     count_free_blocks(&free_blocks);
@@ -1654,7 +1991,7 @@ int vfs64_selftest64() {
 
     // ---- 切到 64 扇区内存假盘（真盘状态在 saved 里，最后恢复）----
     g_fake_active = true;
-    g_ino_cache_valid = false;
+    ino_cache_invalidate();
     zero_bytes(g_fake_disk, (uint32_t)sizeof(g_fake_disk));
     for (uint32_t i = 0; i < (uint32_t)sizeof(g_sel_a); i++) g_sel_a[i] = (uint8_t)((i * 7u + 3u) & 0xFFu);
     zero_bytes(g_sel_b, (uint32_t)sizeof(g_sel_b));
@@ -2127,6 +2464,85 @@ int vfs64_selftest64() {
             log_hex32(ri.mtime);
             dbg64_nl();
         }
+    }
+
+    // ---- bit12（4096）：★ 多卷 —— 卷槽表 / 切换 / 卷身份缓存键控 / on64 守卫 / 表满拒绝 ----
+    // 做法：在**内存假盘**上造两个独立小卷（同一驱动器号、不同起始 LBA：A@0、B@32 各 32 扇区）。
+    // 同一块盘不同 LBA 正好是"只按 LBA 键控会串卷"的最坏情形 —— 读 B 的 inode 必须拿到 B 的字节。
+    // 位置：放在真盘只读探测**之后**（bit7 已经跑完），跑完把槽 0 的真卷现场原样恢复。
+    {
+        Vfs64Geom saved_mv;
+        geom_save(&saved_mv);                       // 当前槽（真系统卷 / 无卷）现场
+        const int save_cur = g_cur_slot;
+        const int save_sys = g_system_slot;
+        g_fake_active = true;
+        bool ok = true;
+        int mv_step = 0;
+        char rb[8];
+
+        // --- 槽 0：卷 A（LBA 0，32 扇区）；槽 1：卷 B（LBA 32，32 扇区）---
+        g_cur_slot = 0;
+        if (vfs64_format(0, 0, 32) != 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_write("/a.txt", "AAAA", 4) != 4) { mv_step = __LINE__; ok = false; }          // ★ A 卷里的文件（后面逐字节比对）
+        g_cur_slot = 1;
+        if (vfs64_format(0, 32, 32) != 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_write("/b.txt", "BBBB", 4) != 4) { mv_step = __LINE__; ok = false; }
+
+        if (vfs64_slot_used64(0) != 1 || vfs64_slot_used64(1) != 1) { mv_step = __LINE__; ok = false; }
+        if (vfs64_slot_find64(0, 0) != 0 || vfs64_slot_find64(0, 32) != 1) { mv_step = __LINE__; ok = false; }
+        Vfs64VolInfo64 vi;
+        if (vfs64_slot_info64(1, nullptr, nullptr, &vi) != 0 || vi.blocks != 32) { mv_step = __LINE__; ok = false; }
+
+        // --- 切到 A：只能看到 A 的文件（卷独立 + 缓存不串卷）---
+        if (vfs64_activate_slot64(0) != 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_read("a.txt", rb, 8) != 4 || cmp_bytes(rb, "AAAA", 4) != 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_read("b.txt", rb, 8) != -1) { mv_step = __LINE__; ok = false; }
+
+        // --- 切到 B：读 b.txt 必须拿到 B 的 inode（这一步专门抓"缓存没带卷身份"的 bug）---
+        if (vfs64_activate_slot64(1) != 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_current_slot64() != 1) { mv_step = __LINE__; ok = false; }
+        if (vfs64_read("b.txt", rb, 8) != 4 || cmp_bytes(rb, "BBBB", 4) != 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_read("a.txt", rb, 8) != -1) { mv_step = __LINE__; ok = false; }
+        if (vfs64_write("/onlyB.txt", "B2", 2) != 2) { mv_step = __LINE__; ok = false; }
+        if (vfs64_mkdir64("/dirB") != 0) { mv_step = __LINE__; ok = false; }
+
+        // --- 回 A：A 的内容还在，且 B 的文件在 A 上不存在（双卷独立）---
+        if (vfs64_activate_slot64(0) != 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_read("a.txt", rb, 8) != 4 || cmp_bytes(rb, "AAAA", 4) != 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_stat("onlyB.txt", nullptr, nullptr) == 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_stat64("/dirB", nullptr) == 0) { mv_step = __LINE__; ok = false; }
+        { Vfs64Info64 tmpi; if (vfs64_stat64("/dirB", &tmpi) == 0) { mv_step = __LINE__; ok = false; } }   // 参数合法：测的是"不存在"
+        // --- on64（显式槽）在切到 B 之后按槽 0 读 A：读完**当前卷必须还是 B**（守卫 LIFO 切回）---
+        if (vfs64_activate_slot64(1) != 0) { mv_step = __LINE__; ok = false; }
+        zero_bytes(rb, sizeof(rb));
+        if (vfs64_read_on64(0, "a.txt", rb, 8) != 4 || cmp_bytes(rb, "AAAA", 4) != 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_current_slot64() != 1) { mv_step = __LINE__; ok = false; }                    // ★ 没被 on64 改掉
+        if (vfs64_read_on64(0, "b.txt", rb, 8) != -1) { mv_step = __LINE__; ok = false; }       // A 上没有 b.txt
+        if (vfs64_current_slot64() != 1) { mv_step = __LINE__; ok = false; }
+        if (vfs64_stat_on64(1, "/onlyB.txt", nullptr, nullptr) != 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_current_slot64() != 1) { mv_step = __LINE__; ok = false; }
+
+        // --- 槽表满（4 槽全占）与非法槽号：如实拒绝、不崩、不覆盖已有卷 ---
+        if (vfs64_mount_slot64(2, 0, 0) != 0) { mv_step = __LINE__; ok = false; }               // 同一个卷挂进别的槽（只读语义）
+        if (vfs64_mount_slot64(3, 0, 32) != 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_slot_alloc64() != -1) { mv_step = __LINE__; ok = false; }                     // 表满 -> 必须 -1
+        if (vfs64_mount_slot64((int)VFS64_SLOT_MAX, 0, 0) == 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_activate_slot64((int)VFS64_SLOT_MAX) == 0) { mv_step = __LINE__; ok = false; }
+        if (vfs64_activate_slot64(2) != 0) { mv_step = __LINE__; ok = false; }                  // 已挂载的槽能激活
+        if (vfs64_read("a.txt", rb, 8) != 4) { mv_step = __LINE__; ok = false; }                // 槽 2 = 卷 A
+        if (vfs64_read_on64(99, "a.txt", rb, 8) != -1) { mv_step = __LINE__; ok = false; }      // 非法槽号：负返回 + 打点
+        if (vfs64_current_slot64() != 2) { mv_step = __LINE__; ok = false; }                    // 非法槽号也不改当前卷
+
+        // --- 收尾：清掉自检用的槽 1..3，恢复当前槽与系统卷槽现场 ---
+        for (int s = 1; s < (int)VFS64_SLOT_MAX; s++) g_vol[s] = Vfs64Geom();
+        g_cur_slot = save_cur;
+        geom_restore(&saved_mv);
+        g_system_slot = save_sys;
+        g_fake_active = false;
+        dbg64_str("[VFS64] multivol selftest ");
+        dbg64_str(ok ? "ok" : "FAIL");
+        dbg64_nl();
+        if (!ok) fails |= 4096;
     }
 
     dbg64_str("[VFS64] selftest ");

@@ -12,6 +12,10 @@
 #include "store64.h"     // update.applied 持久化
 #include "sysstate64.h"  // ring log + 软重启 + 模块注册
 #include "debug64.h"     // 串口打点
+//
+// ★ 多卷（为什么不会写错卷）：/update.pending、/update.done 与 store64 的键都在**系统卷**上，
+//   所以本文件所有 VFS 调用都用 vfs64_*_on64(vfs64_system_slot64(), …) —— 写只在这一次调用期间
+//   临时切到系统卷槽，返回前原样切回；用户浏览 D: 时更新检查不会把标记文件写到 D: 上。
 
 static bool g_up_init = false;
 
@@ -54,7 +58,8 @@ static int up64_parse_ver(const char* text, char* out, int max) {
 // 返回 1 = 应用成功（pending -> done，store 已写并 flush）；0 = 没有/非法。不重启。
 int update64_apply64() {
     char text[UP64_TEXT_MAX];
-    const int n = vfs64_read(UPDATE64_PENDING_PATH, text, (int)sizeof(text) - 1);
+    const int sys = vfs64_system_slot64();
+    const int n = vfs64_read_on64(sys, UPDATE64_PENDING_PATH, text, (int)sizeof(text) - 1);
     if (n <= 0) return 0;
     text[n] = 0;
 
@@ -83,8 +88,8 @@ int update64_apply64() {
     for (int i = 0; p2[i] && dn < (int)sizeof(done) - 1; i++) done[dn++] = p2[i];
     for (int i = 0; UPDATE64_VERSION[i] && dn < (int)sizeof(done) - 1; i++) done[dn++] = UPDATE64_VERSION[i];
     for (int i = 0; p3[i] && dn < (int)sizeof(done) - 1; i++) done[dn++] = p3[i];
-    const int drc = vfs64_write(UPDATE64_DONE_PATH, done, dn);
-    const int urc = vfs64_unlink(UPDATE64_PENDING_PATH);
+    const int drc = vfs64_write_on64(sys, UPDATE64_DONE_PATH, done, dn);
+    const int urc = vfs64_unlink_on64(sys, UPDATE64_PENDING_PATH);
 
     // 3) ring log（sysstate64 的 64 条循环日志也在终端 syslog 里可见）
     sys64_logf64("[UPDATE64] applied ver=%s (pending -> store + /update.done)", ver);
@@ -147,7 +152,7 @@ int update64_check64() {
 
 int update64_pending_exists64(char* out, int max) {
     if (!out || max <= 1) return 0;
-    const int n = vfs64_read(UPDATE64_PENDING_PATH, out, max - 1);
+    const int n = vfs64_read_on64(vfs64_system_slot64(), UPDATE64_PENDING_PATH, out, max - 1);
     if (n <= 0) { out[0] = 0; return 0; }
     out[n] = 0;
     return 1;
@@ -161,7 +166,7 @@ int update64_write_pending64(const char* ver) {
     for (int i = 0; p[i] && n < (int)sizeof(buf) - 1; i++) buf[n++] = p[i];
     for (int i = 0; ver[i] && n < (int)sizeof(buf) - 1; i++) buf[n++] = ver[i];
     if (n < (int)sizeof(buf) - 1) buf[n++] = '\n';
-    const int rc = vfs64_write(UPDATE64_PENDING_PATH, buf, n);
+    const int rc = vfs64_write_on64(vfs64_system_slot64(), UPDATE64_PENDING_PATH, buf, n);
     dbg64_line_begin64();
     dbg64_str("[UPDATE64] stage pending ver=");
     dbg64_str(ver);
@@ -250,7 +255,7 @@ void update64_report64(char* out, int maxlen) {
 
     uint32_t t = 0, sz = 0;
     up64_app_s(out, &n, maxlen, " done=");
-    up64_app_s(out, &n, maxlen, (vfs64_stat(UPDATE64_DONE_PATH, &t, &sz) == 0) ? "yes" : "no");
+    up64_app_s(out, &n, maxlen, (vfs64_stat_on64(vfs64_system_slot64(), UPDATE64_DONE_PATH, &t, &sz) == 0) ? "yes" : "no");
     up64_app_s(out, &n, maxlen, " carrier=");
     up64_app_s(out, &n, maxlen, store64_carrier64());
     up64_app_s(out, &n, maxlen, " store_gen=");

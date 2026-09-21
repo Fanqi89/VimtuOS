@@ -267,12 +267,18 @@ VimtuOS 0.1.0 x86_64 (VimtuOS 64-bit)
 
 ### 6.8 文件系统与持久化
 
-* **VimtuFS2**（`vfs64.cpp`，1256 行）磁盘布局：块 0 超级块（`VIMTUFS2` + CRC32 + 几何）、空闲位图、64B inode 表、数据区；
-  inode 里直接放名字（≤27B）与 4 个直接块 + 1 个一级间接块 → 单文件 ≤67584B；
-* 路径语义故意很小：**只支持单层** `/name`；多级路径、`.`/`..` 留到下一阶段（出现 `/` 一律拒绝并打点）；
-* **store**（`store64.cpp`，1017 行）：槽就是 VimtuFS2 里的 `/store.a`、`/store.b`（各 16KB），
+* **VimtuFS2 v3**（`vfs64.cpp`）：块 0 超级块（`VIMTUFS2` + CRC32 + 几何重算校验）、空闲位图、**128B inode**、数据区；
+  inode 里直接放名字（≤31B）+ `parent/mtime/nlink/kind`，4 个直接块 + 1 个一级间接块 → 单文件 ≤67584B；
+* **真正的目录树**：多级路径 `/dir/sub/file`、`.`/`..`（根的父目录还是根，POSIX）、目录 = `parent` 相同的 inode 集合
+  （目录没有数据块）；v2 旧卷照常挂载（按单层语义），新格式化一律 v3；
+* **★ 多卷（本批次）**：`vfs64` 有 **4 个卷槽**（每槽独立几何），系统卷固定 0 号槽 = `C:`，盘符层把其余可浏览卷挂到
+  1..3 号槽 = `D:/E:/F:`；`vfs64_activate_slot64` 切"当前卷"，inode 缓存按 `(slot, drive, lba)` 键控。
+  **系统组件（store/config/update/app/elf/proc/sysstate）固定写系统卷**（`vfs64_*_on64`，单次调用临时切卷后切回）——
+  浏览 `D:` 时的 3 秒自动落盘不会污染数据盘；
+* **store**（`store64.cpp`）：槽就是**系统卷**里的 `/store.a`、`/store.b`（各 16KB），
   世代号 + 头部/payload 双 CRC32 + "先写数据、最后写头部"的提交点；裸盘槽只在没有可用卷时降级使用并打 WARN；
-* 终端 `store dump|get|set|flush`；`store64_test.py` 用一次**真重启**证明设置真的活下来了。
+* 终端 `store dump|get|set|flush`、`vol`（列卷/切当前卷）、`df`（系统卷 + 所有卷）；`store64_test.py` 用一次
+  **真重启**证明设置真的活下来了；`multivol64_test.py` 证明多卷与"写卷安全"。
 
 ### 6.9 用户态与两套系统调用（`usermode64` / `syscall64` / `app64` / `elf64`）
 
@@ -336,6 +342,10 @@ VimtuOS 0.1.0 x86_64 (VimtuOS 64-bit)
 
 * **20 个断言脚本 / 540 条断言，全部 PASS**（2026-09-19 实测）。`--full` 覆盖 15 个脚本 / **368 条断言**；
   另有 5 个专项脚本 / **172 条断言**（`elf64_test` 56 / `store64_test` 46 / `app64_test` 31 / `display64_test` 22 / `user64_test` 17）。
+* **本批次新增**：`tests/multivol64_test.py`（**108 条断言**）—— 装好的 `C:` + 宿主侧 Python 造的第二个
+  VimtuFS2 卷（预置 `/docs`/`readme.txt`）：终端 `vol`/`ls`/`cat`/`mkdir`/`write` 双卷独立、
+  Explorer 鼠标注入双击 `D:`/`C:` 卡片、**写卷安全**（浏览 `D:` 期间 3 秒自动落盘：D: 卷逐字节未变 +
+  C: 的 `/store.a` 内容正确）、卷表满（4 块 AHCI 数据盘）与坏情况（`vol z`/`vol a`/`vol 1`）全部如实。
 * **三类证据**：
   * **串口级**：每步打标记（`[LM64]` / `[G64]` / `[SETUP]` / `[PART]` / `[TASK64]` / `[VFS64]` / `[STORE64]` /
     `[SYSCALL]` / `[USER64]` / `[APP64]` / `[ELF64]` / `[APIC]` / `[SMP]` / `[NET64]` / `[USB64]` /

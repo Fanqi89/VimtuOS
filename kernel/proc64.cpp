@@ -1048,11 +1048,18 @@ int proc64_install_builtin64(int drive, uint32_t part_lba) {
         p64_log2("[PROC64] install FAILED reason=blob path=/proc64.elf", "");
         return -1;
     }
+    // ★ 多卷（为什么不会写错卷）：/proc64.elf、/pipe64.elf 都是**系统卷**上的文件 —— 挂载用
+    //   vfs64_mount_system64（登记系统卷槽，不改别的槽），探/写一律 *_on64(系统卷槽, …)：
+    //   用户浏览 D: 时这次安装也只落 C:（on64 只在单次调用期间临时切卷，返回前切回）。
     uint32_t t = 0, sz = 0;
-    if (vfs64_stat("/", &t, &sz) != 0) {
-        if (vfs64_mount(drive, part_lba) != 0) { p64_log2("[PROC64] install FAILED reason=", "mount"); return -1; }
+    {
+        const int sys0 = vfs64_system_slot64();
+        if (sys0 < 0 || vfs64_stat_on64(sys0, "/", &t, &sz) != 0) {
+            if (vfs64_mount_system64(drive, part_lba) != 0) { p64_log2("[PROC64] install FAILED reason=", "mount"); return -1; }
+        }
     }
-    if (vfs64_stat(PROC64_PATH64, &t, &sz) == 0) {                      // 幂等
+    const int sys = vfs64_system_slot64();
+    if (vfs64_stat_on64(sys, PROC64_PATH64, &t, &sz) == 0) {            // 幂等
         dbg64_line_begin64();
         dbg64_str("[PROC64] install skipped (exists) /proc64.elf size=");
         dbg64_dec(sz);
@@ -1060,7 +1067,7 @@ int proc64_install_builtin64(int drive, uint32_t part_lba) {
         dbg64_line_end64();
         return 0;
     }
-    const int w = vfs64_write(PROC64_PATH64, _binary_build64_proc64_elf_start, (int)bytes);
+    const int w = vfs64_write_on64(sys, PROC64_PATH64, _binary_build64_proc64_elf_start, (int)bytes);
     if (w != (int)bytes) { p64_log2("[PROC64] install FAILED reason=", "write"); return -1; }
     dbg64_line_begin64();
     dbg64_str("[PROC64] install ok path=/proc64.elf bytes=");
@@ -1076,14 +1083,14 @@ int proc64_install_builtin64(int drive, uint32_t part_lba) {
             p64_log2("[PROC64] install FAILED reason=blob path=/pipe64.elf", "");
             return -1;
         }
-        if (vfs64_stat(PROC64_PIPE_PATH64, &t, &sz) == 0) {
+        if (vfs64_stat_on64(sys, PROC64_PIPE_PATH64, &t, &sz) == 0) {
             dbg64_line_begin64();
             dbg64_str("[PROC64] install skipped (exists) /pipe64.elf size=");
             dbg64_dec(sz);
             dbg64_nl();
             dbg64_line_end64();
         } else {
-            const int w2 = vfs64_write(PROC64_PIPE_PATH64, _binary_build64_pipe64_elf_start, (int)pbytes);
+            const int w2 = vfs64_write_on64(sys, PROC64_PIPE_PATH64, _binary_build64_pipe64_elf_start, (int)pbytes);
             if (w2 != (int)pbytes) { p64_log2("[PROC64] install FAILED reason=", "write(/pipe64.elf)"); return -1; }
             dbg64_line_begin64();
             dbg64_str("[PROC64] install ok path=/pipe64.elf bytes=");

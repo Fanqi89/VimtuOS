@@ -185,19 +185,26 @@ int app64_install_builtin64(int drive, uint32_t part_lba) {
         return -1;
     }
 
-    // 卷可能没挂载（例如有人不经过启动路径直接调用）：先探根目录，没有就按 (drive, part_lba) 挂一次。
+    // 卷可能没挂载（例如有人不经过启动路径直接调用）：先探**系统卷**根目录，没有就 vfs64_mount_system64
+    // （挂/登记系统卷槽并激活它；已挂过就直接复用，绝不顶掉别的卷的槽）。
+    // ★ 多卷（为什么不会写错卷）：安装目标是系统卷上的 /hello.vap —— 读写一律 *_on64(系统卷槽, …)：
+    //   即使用户此刻正在浏览 D:，这次安装也只会落在 C: 上（on64 只在单次调用期间临时切卷，返回前切回）。
     uint32_t t = 0, sz = 0;
-    if (vfs64_stat("/", &t, &sz) != 0) {
-        if (vfs64_mount(drive, part_lba) != 0) {
-            dbg64_line_begin64();
-            dbg64_str("[APP64] install FAILED reason=mount\n");
-            dbg64_line_end64();
-            return -1;
+    {
+        const int sys0 = vfs64_system_slot64();
+        if (sys0 < 0 || vfs64_stat_on64(sys0, "/", &t, &sz) != 0) {
+            if (vfs64_mount_system64(drive, part_lba) != 0) {
+                dbg64_line_begin64();
+                dbg64_str("[APP64] install FAILED reason=mount\n");
+                dbg64_line_end64();
+                return -1;
+            }
         }
     }
+    const int sys = vfs64_system_slot64();
 
     // 幂等：已存在就跳过，绝不重复写（重启动安全）
-    if (vfs64_stat(VAP64_INSTALL_PATH64, &t, &sz) == 0) {
+    if (vfs64_stat_on64(sys, VAP64_INSTALL_PATH64, &t, &sz) == 0) {
         dbg64_line_begin64();
         dbg64_str("[APP64] install skipped (exists) /hello.vap size=");
         dbg64_dec(sz);
@@ -206,7 +213,7 @@ int app64_install_builtin64(int drive, uint32_t part_lba) {
         return 0;
     }
 
-    const int w = vfs64_write(VAP64_INSTALL_PATH64, _binary_build64_hello_vap_start, (int)bytes);
+    const int w = vfs64_write_on64(sys, VAP64_INSTALL_PATH64, _binary_build64_hello_vap_start, (int)bytes);
     if (w != (int)bytes) {
         dbg64_line_begin64();
         dbg64_str("[APP64] install FAILED reason=write\n");

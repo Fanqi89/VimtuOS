@@ -391,12 +391,16 @@ static const char* st_slot_path(int s) {
 static bool st_slot_size_ok(uint32_t bytes) {
     return bytes == ST_SLOT_BYTES;
 }
-// VFS 可用性探测：卷已挂载时 vfs64_stat("/") 成功（与 kernel/app64.cpp 用同一条判断：
-// "根目录 stat 成功 = VimtuFS2 卷就在那儿"）。没挂载时 vfs64 自己会打一行 stat: not mounted。
+// VFS 可用性探测：**系统卷**挂载着时 vfs64_stat_on64(系统卷槽, "/") 成功（与 kernel/app64.cpp
+// 用同一条判断："根目录 stat 成功 = VimtuFS2 卷就在那儿"）。没挂载时 on64 自己会打一行 not mounted。
+// ★ 多卷（为什么不会写错卷）：store64 的 /store.a、/store.b 是**系统卷上的文件**，所以这里以及下面
+//   每一个读写都用 vfs64_*_on64(vfs64_system_slot64(), …)：只在这一次调用期间把"当前卷"临时切成
+//   系统卷槽，函数返回前原样切回（vfs64.cpp 的 Vfs64SlotGuard，LIFO）。用户正在浏览 D: 时，
+//   3 秒自动落盘/flush 仍然只写 C:（系统卷），D: 的位图/inode 一个字节都不会被碰到。
 static bool st_vfs_available() {
     uint32_t type = 0;
     uint32_t size = 0;
-    return vfs64_stat("/", &type, &size) == 0;
+    return vfs64_stat_on64(vfs64_system_slot64(), "/", &type, &size) == 0;
 }
 // 裸盘槽区的重叠警告（只打一次）：这块区域就是安装程序创建的数据分区本身。
 static void st_warn_raw_overlap() {
@@ -414,10 +418,11 @@ static int st_carrier_read_slot(int s, uint8_t* buf, const char** why) {
     if (g_carrier == ST_CARRIER_VFS) {
         uint32_t type = 0;
         uint32_t size = 0;
-        if (vfs64_stat(st_slot_path(s), &type, &size) != 0) { *why = "absent";   return 1; }  // 文件不存在 = 无效槽
+        const int sys = vfs64_system_slot64();                     // ★ 固定系统卷
+        if (vfs64_stat_on64(sys, st_slot_path(s), &type, &size) != 0) { *why = "absent";   return 1; }  // 文件不存在 = 无效槽
         if (type != VFS64_TYPE_FILE)                        { *why = "not_file"; return 1; }
         if (!st_slot_size_ok(size))                         { *why = "size";     return 1; }
-        const int n = vfs64_read(st_slot_path(s), buf, (int)ST_SLOT_BYTES);
+        const int n = vfs64_read_on64(sys, st_slot_path(s), buf, (int)ST_SLOT_BYTES);
         if (n != (int)ST_SLOT_BYTES)                        { *why = "read";     return 1; }
         return 0;
     }
@@ -434,7 +439,8 @@ static int st_carrier_read_slot(int s, uint8_t* buf, const char** why) {
 // "先写数据扇区（1..31），最后写头部扇区（0，带 CRC）"。失败返回 false 且旧槽不受影响。
 static bool st_carrier_write_slot(int s, const uint8_t* buf, const char** why) {
     if (g_carrier == ST_CARRIER_VFS) {
-        const int n = vfs64_write(st_slot_path(s), buf, (int)ST_SLOT_BYTES);
+        // ★ 固定系统卷：只写 C: 上的 /store.<x>（见 st_vfs_available 上方说明）
+        const int n = vfs64_write_on64(vfs64_system_slot64(), st_slot_path(s), buf, (int)ST_SLOT_BYTES);
         if (n != (int)ST_SLOT_BYTES) { *why = "vfs64_write"; return false; }
         return true;
     }
@@ -918,13 +924,14 @@ int store64_selftest64() {
     //        没有卷才退回裸盘**只读**探测（ATA 未链接 / 没 init 时跳过，不算失败）。
     if (st_vfs_available()) {
         for (uint32_t i = 0; i < ST_SLOT_BYTES; i++) g_slot_buf[0][i] = (uint8_t)(0xA5u ^ (uint8_t)(i * 7u));
-        const int wn = vfs64_write(ST_VFS_TMP, g_slot_buf[0], (int)ST_SLOT_BYTES);
+        const int sys = vfs64_system_slot64();                   // ★ 临时文件也钉在系统卷上
+        const int wn = vfs64_write_on64(sys, ST_VFS_TMP, g_slot_buf[0], (int)ST_SLOT_BYTES);
         int rn = -1;
-        if (wn == (int)ST_SLOT_BYTES) rn = vfs64_read(ST_VFS_TMP, g_slot_buf[1], (int)ST_SLOT_BYTES);
+        if (wn == (int)ST_SLOT_BYTES) rn = vfs64_read_on64(sys, ST_VFS_TMP, g_slot_buf[1], (int)ST_SLOT_BYTES);
         const bool same = (rn == (int)ST_SLOT_BYTES) &&
                           (st_cmp(g_slot_buf[0], g_slot_buf[1], ST_SLOT_BYTES) == 0);
         if (!same) fails |= 512;
-        if (vfs64_unlink(ST_VFS_TMP) != 0) {
+        if (vfs64_unlink_on64(vfs64_system_slot64(), ST_VFS_TMP) != 0) {
             dbg64_line_begin64();
             dbg64_str("[STORE64] selftest vfs probe WARN: temp file not removed");   // 只警告：多余文件不影响正确性
             dbg64_nl();

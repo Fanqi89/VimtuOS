@@ -24,11 +24,14 @@
 //   历史栈 = 16 条的 (mode, letter, path) 记录 + 游标：进入/跳转 = push（并截断"前进"分支），
 //   后退/前进 = 移动游标后重放。**"上级"** 走父目录（根目录的上级 = 此电脑）。
 //
-// ==================== 与 vfs64/drive64 的关系（如实写清限制）====================
-//   * 驱动器列表来自 drive64_scan64()（只读探测，不挂载）；目录内容来自 vfs64_list64（游标分页）。
-//   * **vfs64 同一时刻只挂载一个卷**（vfs64_mounted_volume64）——所以只有"当前挂载的那个卷"
-//     （= C:，系统盘）真的能点进去；其它可浏览盘符（D:/E:…）照样列出容量，但点击会如实打点
-//     `mount skip letter=D: reason=one-volume` 并在状态栏说明，**不假装能进**。
+// ==================== 与 vfs64/drive64 的关系（★ 多卷：真的能进 D:/E:）====================
+//   * 驱动器列表来自 drive64_scan64()（只读探测 + 给每个可浏览卷分配一个 vfs64 卷槽）；
+//     目录内容来自 vfs64_list64（游标分页，作用于**当前卷**）。
+//   * **双击盘符卡片 = drive64_activate_letter64(letter)**：把该盘对应的卷槽激活成"当前卷"，
+//     然后列它的根目录 —— 所以 C:/D:/E: 点进去看到的都是各自盘上的真实内容；失败时如实打点
+//     `[UI] explorer enter letter=D: slot=2 FAILED reason=...` 并在状态栏说明，不假装能进。
+//   * 要进 D: 的目录（而不是只列根目录），进盘前会先激活卷；浏览中如果别的组件（终端 `vol`）
+//     换了当前卷，exp_refresh_dir 会按界面盘符把卷同步回来（打点 [UI] explorer volume sync ...）。
 //   * ESP / 未识别文件系统的条目显示为灰字 + "（不浏览）"，不响应双击。
 //
 // ==================== 打点（自动验收 grep；格式勿改）====================
@@ -41,6 +44,7 @@
 //   [UI] explorer preview name=<n> bytes=<n>
 //   [UI] explorer noassoc name=<n> kind=<..>
 //   [UI] explorer back path=<p> / [UI] explorer forward path=<p> / [UI] explorer up path=<p>
+//   [UI] explorer enter letter=<C:|D:> slot=<n> ok items=<n>    （★ 多卷：真的切到该盘并列出内容）
 //   [UI] explorer view=icons rows=<n> / [UI] explorer view=details rows=<n>
 //   [UI] explorer scroll top=<n> items=<n>      （滚动/翻页，有界）
 //   [UI] explorer click x=<cx> y=<cy> sx=<sx> sy=<sy> hit=<none|card:<i>|item:<i>|btn:<id>|crumb:<k>|nav:<id>>

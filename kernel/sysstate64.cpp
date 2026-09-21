@@ -173,7 +173,8 @@ static int m_ata_init() {
     return g_ata_ok ? 0 : -1;
 }
 static int m_ata_health()      { return g_ata_ok ? SYS64_MODH_UP : SYS64_MODH_DOWN; }
-static int m_vfs_init()        { g_vfs_ok = (vfs64_stat("/", nullptr, nullptr) == 0) ? 1 : 0; return g_vfs_ok ? 0 : -1; }
+// ★ 多卷：vfs64 模块健康 = **系统卷**可用（不管当前卷是哪个盘符）—— on64 只在这次调用里临时切卷。
+static int m_vfs_init()        { g_vfs_ok = (vfs64_stat_on64(vfs64_system_slot64(), "/", nullptr, nullptr) == 0) ? 1 : 0; return g_vfs_ok ? 0 : -1; }
 static int m_vfs_health()      { return g_vfs_ok ? SYS64_MODH_UP : SYS64_MODH_DOWN; }
 static int m_store_init() {
     const char* c = store64_carrier64();
@@ -564,7 +565,10 @@ int sysstate64_fsinfo64(Fs64Info* out) {
             const uint32_t inodes = *(const uint32_t*)(sec + 40);
             const uint32_t data_st = *(const uint32_t*)(sec + 48);
             uint32_t bm_use = bm_n;
-            if (magic_ok && total >= 32 && total <= 0x00FFFFFFu && data_st < total && bm_use >= 1 && bm_use <= 8) {
+            // 上限 64 块位图 = 最多 64*4096*512B = 128MB 卷（128MB 安装盘的主分区正好 39 块）。
+            // ★ 多卷：这个上限原来写 8（16MB 封顶），导致 128MB 系统卷的 df 快照永远是 "no volume"；
+            //   装上 D:/E: 大卷之后容量显示必须准，所以把上限提到 64 并保留"有界读取"的纪律。
+            if (magic_ok && total >= 32 && total <= 0x00FFFFFFu && data_st < total && bm_use >= 1 && bm_use <= 64) {
                 // 空闲块 = 位图里 [data_start, total) 的 0 位（1 位 = 1 块）
                 uint32_t freeb = 0;
                 for (uint32_t b = 0; b < bm_use; b++) {
@@ -581,10 +585,11 @@ int sysstate64_fsinfo64(Fs64Info* out) {
                 g_fs.inodes = inodes;
             }
         }
-        // 文件数/字节数走真 VFS API（挂载过才有值；没挂载保持 0）
+        // 文件数/字节数走真 VFS API：**系统卷**的根目录（与上面的超级块探测同一个分区）。
+        // ★ 多卷：用 *_on64(系统卷槽) —— 不会跟着用户正在浏览的 D: 跑偏。
         static char names[64][32];
         static uint32_t sizes[64];
-        const int n = vfs64_ls("/", names, 64, sizes);
+        const int n = vfs64_ls_on64(vfs64_system_slot64(), "/", names, 64, sizes);
         if (n > 0) {
             g_fs.files = (uint32_t)n;
             uint32_t used = 0;

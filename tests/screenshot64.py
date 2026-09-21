@@ -104,7 +104,52 @@ def shot_page(qemu, tmp, args):
     serial = os.path.join(tmp, "page_serial.log")
     ppm = os.path.join(tmp, "page.ppm")
     port = args.port
-    vm = E.Vm(qemu, img, port, serial, "Vimtu64-shot-page")
+    extra_disk = None
+    if args.page == "ddrive":
+        # ★ 多卷：第二块盘（32MB，宿主侧造 v3 卷 + /docs + readme.txt），启动后会分到 D: 与 slot=1
+        try:
+            import multivol64_test as mv
+        except Exception as e:
+            sys.stderr.write("--page ddrive 需要 tests/multivol64_test.py 的夹具：%s\n" % e)
+            return 2
+        extra_disk = os.path.join(tmp, "data_d.img")
+        mv.make_data_vol_disk(extra_disk)
+        print("[shot] ddrive: second disk (v3 volume + /docs + readme.txt) ready")
+
+    if extra_disk is not None:
+        class _TwoDiskVm:
+            """两块盘的 VM（接口与 explorer64_test.Vm 一致：log/wait_log/close）。"""
+            def __init__(self):
+                self.serial = serial
+                import fs_tree_test as _fst
+                self.proc = subprocess.Popen(
+                    _fst.qemu_args(qemu, [img, extra_disk], serial, port, "Vimtu64-shot-ddrive"),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            def log(self):
+                try:
+                    with open(self.serial, "r", encoding="utf-8", errors="replace") as f:
+                        return f.read()
+                except OSError:
+                    return ""
+            def wait_log(self, needle, timeout, since=0):
+                t0 = time.time()
+                while time.time() - t0 < timeout:
+                    if needle in self.log()[since:]:
+                        return True
+                    if self.proc.poll() is not None:
+                        return False
+                    time.sleep(0.4)
+                return False
+            def close(self):
+                if self.proc.poll() is None:
+                    self.proc.kill()
+                    try:
+                        self.proc.wait(timeout=10)
+                    except Exception:
+                        pass
+        vm = _TwoDiskVm()
+    else:
+        vm = E.Vm(qemu, img, port, serial, "Vimtu64-shot-page")
     mon = E.Monitor(port)
     try:
         if not vm.wait_log("[GUI64] ready", 120):
@@ -119,6 +164,22 @@ def shot_page(qemu, tmp, args):
         time.sleep(1.0)
         E.SAFE_POINT = (E.sx(E.CONTENT_X + E.CONTENT_W - 40), E.sy(E.CONTENT_Y + E.CONTENT_H - 40))
         E.ensure_window_on_top(vm, mon)
+        if args.page == "ddrive":
+            # 从串口打点里取 D: 卡片的格子号（不硬编码排序：前面可能还有 ESP 卡片）
+            import re as _re
+            idx = -1
+            for m in _re.finditer(r"\[UI\] explorer card idx=(\d+) letter=(.)", vm.log()):
+                if m.group(2) == "D":
+                    idx = int(m.group(1))
+            if idx < 0:
+                sys.stderr.write("--page ddrive: no D: card on the This PC page\n")
+                return 1
+            tx, ty = E.card_center(idx)
+            E.aim_click(vm, mon, tx, ty, "card:%d" % idx)     # 双击 -> drive64_activate_letter64('D')
+            if not vm.wait_log("[UI] explorer enter letter=D: slot=1 ok", 30):
+                sys.stderr.write("--page ddrive: no 'enter letter=D: slot=1 ok' after double-click\n")
+                return 1
+            time.sleep(1.5)
         if args.page in ("drive", "details"):
             tx, ty = E.card_center(1)                # 第 0 张是不可浏览的 ESP，第 1 张 = C:
             E.aim_click(vm, mon, tx, ty, "card:1")   # 双击进入盘根

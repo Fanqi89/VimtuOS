@@ -7,11 +7,13 @@
 全部是本工程自己的 C++ / 汇编代码。
 它自带一张"三合一"安装盘（BIOS 光盘 / U 盘 / UEFI），安装界面与步骤照 Windows 10 做（去掉了输入产品密钥那一步）。
 
-> 版本 **0.1.0** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
-> 状态（权威判据：`python tests/status_report.py`）：**完成 36 / 部分 0 / 未做 1（共 37 项能力）**，
+> 版本 **0.2.0-beta.4** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
+> 状态（权威判据：`python tests/status_report.py`）：**完成 38 / 部分 0 / 未做 1（共 39 项能力）**，
 > 唯一未做项是 **Rust 参与实现（可选要求，本机未装 Rust 工具链）**。
-> 全量验收（`--full` + 专项/扩展脚本）：**27 个断言脚本全部 PASS**（本批次实测；上一批 752 条断言保持全过，
-> 本批次另加 fs_tree（VimtuFS2 v3 目录树 + 盘符层）**84 条新断言**、explorer64（文件资源管理器 UI）**71 条新断言**、vfs64/fd64 自检新增 4 个位掩码）。
+> 全量验收（`--full` + 专项/扩展脚本）：**31 个断言脚本全部 PASS**（本批次实测；上一批断言保持全过，
+> 本批次新增 **multivol64_test（多卷挂载 / 盘符切换）108 条断言**；vfs64 自检新增 bit12（卷槽表/切卷/on64 守卫/表满拒绝）、
+> drive64 自检新增 bit6（卷槽一致性 + 按盘符激活），fs_tree(84)/explorer64(71)/fs_term(32)/fd64(34)/store64(46)/
+> app64(31)/elf64(56)/proc64(67)/sysstate64(100) 等既有脚本保持绿）。
 
 ---
 
@@ -25,7 +27,8 @@
 | **装完就是一台独立系统** | 开机直接进桌面：桌面图标、任务栏、开始菜单（10 项）、窗口拖拽/缩放/最大化/最小化、脏矩形重绘 |
 | **调度器（多任务）** | `task64.cpp`：16 个任务槽、每任务 16KB 内核栈、8ms 时间片轮转、IRQ0 抢占、睡眠/退出/回收、`task_kill64`；启动即 `[TASK64] scheduler up tasks=N`、`kheart` 心跳持续增长；任务管理器"进程"页与终端 `ps/kill` 读的是**真实任务表** |
 | **真实文件系统 VimtuFS2（v3 目录树）** | `vfs64.cpp`：超级块（magic `VIMTUFS2` + CRC32）、空闲位图、**128B inode**（直接块×4 + 一级间接块 → 单文件 ≤67584B）、**多级路径**（`/dir/sub/file`，`.`/`..` 语义齐全）、inode **mtime**（RTC 打包 u32）与**类型判定**（目录/VAP64/ELF64/文本/二进制存进 inode 的 `kind` 字段）；`vfs64_format/mount/stat64/list64/opendir+readdir/closedir/mkdir64/create64/write64/read64/unlink64/rmdir64/tree_dump64` + 兼容旧 API；**v2 旧卷仍可挂载**（按单层语义工作），新格式化一律产出 v3 |
-| **盘符与驱动器枚举（"此电脑"的数据来源）** | `drive64.cpp`：枚举 PATA/AHCI(SATA)/NVMe 每块盘 → 读 MBR 分区 → 识别文件系统（VimtuFS2 超级块只读校验 / FAT32 BPB 指纹）→ 盘符表：**系统分区 = `C:`**（依据：vfs64 当前真正挂载的卷，兜底 drive 0 的 MBR `0x07` 项），其余可浏览的 VimtuFS2 卷依次 **`D:`/`E:`…**；**ESP/未知文件系统不占字母但仍列出**（`skip reason=esp|no-fs`）；每项给显示名/总容量/可用/文件系统/是否可浏览。打点 `[DRV64] scan\|letter=\|skip\|selftest`；**FAT 只识别不浏览**（本内核只有 FAT32 写入器） |
+| **盘符与驱动器枚举（"此电脑"的数据来源）** | `drive64.cpp`：枚举 PATA/AHCI(SATA)/NVMe 每块盘 → 读 MBR 分区 → 识别文件系统（VimtuFS2 超级块只读校验 / FAT32 BPB 指纹）→ 盘符表：**系统分区 = `C:`**（依据：vfs64 当前真正挂载的卷，兜底 drive 0 的 MBR `0x07` 项），其余可浏览的 VimtuFS2 卷依次 **`D:`/`E:`…**（**每个可浏览卷在扫描时占一个 vfs64 卷槽**，条目带 `slot=<n>`；`drive64_activate_letter64('D')` = 把当前卷切到那个槽）；**ESP/未知文件系统不占字母但仍列出**（`skip reason=esp|no-fs`）；卷槽满（>4 个可浏览卷）时**如实拒绝**：该条目 `skip reason=voltable-full`、不占字母，绝不覆盖已挂载的卷。每项给显示名/总容量/可用（**实时**：走已挂载槽现数位图）/文件系统/是否可浏览。打点 `[DRV64] scan\|letter=\|skip\|activate\|selftest`；**FAT 只识别不浏览**（本内核只有 FAT32 写入器） |
+| **★ 多卷挂载 / 盘符切换（本批次新增）** | `vfs64.cpp` 从"一次只挂一个卷"改成**卷槽表**：至少 4 个槽 （`VFS64_SLOT_MAX`），每槽独立保存 drive/起始 LBA/位图/inode/数据区几何；`vfs64_mount_slot64(slot,…)` / `vfs64_activate_slot64(slot)` / `vfs64_current_slot64()` / `vfs64_slot_info64()`；**inode 扇区缓存按 (slot, drive, lba) 三元组键控**（切卷绝不读到上一个卷的字节）。旧 API（`stat64/read64/write64/ls/opendir…`）保持"作用于当前卷"，fd64 新增 `fd64_open_on64(slot,…)`（打开后锁定该卷）。**系统组件固定写系统卷**：store64/config64/update64/app64/elf64/proc64/sysstate64 一律 `vfs64_*_on64(vfs64_system_slot64(), …)` —— 只在单次调用里临时切卷、返回前原样切回（LIFO 守卫），所以**用户浏览 `D:` 时 3 秒自动落盘也只会写 `C:`**（`tests/multivol64_test.py` 用宿主侧字节比对证明：D: 卷整盘逐字节不变、C: 的 `/store.a` 内容正确）。终端新增 `vol`（列卷/`vol C:|D:` 切当前卷）、`df` 列**所有卷**；Explorer 双击 `D:` 卡片 = `drive64_activate_letter64` 真切卷并列它的根目录（打点 `[UI] explorer enter letter=D: slot=1 ok`）。端到端：**108/108 PASS**（宿主机预置第二个 VimtuFS2 卷 `/docs` + `readme.txt` + `/docs/notes.txt`） |
 | **设置持久化 store** | `store64.cpp`：A/B 双槽（VimtuFS2 里的 `/store.a`、`/store.b`）+ 世代号 + 头部/payload 双 CRC32 + "先数据后头部"的提交点；实测跨重启保留（第二遍启动 `keys=1` 里仍有 `theme=dark`）；终端 `store dump\|get\|set\|flush` |
 | **ring3 用户态** | `usermode64.cpp`：GDT 8 项（内核 0x08/0x10、用户 0x23/0x2B、TSS 0x30）；用户窗口在 4GiB（代码页 R/X、栈页 R/W/NX）；TSS.rsp0 随任务切换维护 |
 | **两套系统调用入口** | `int 0x80`（自有 ABI：rax/rdi/rsi/rdx）与 **`syscall` 指令**（MSR EFER.SCE / STAR=0x1B<<48\|0x08<<32 / LSTAR / FMASK，Linux x86_64 号段）双入口并存，帧标记分流；用户指针一律先过 `user64_range_ok64` 范围校验 |
@@ -38,7 +41,7 @@
 | **USB 主机 + HID 键盘** | `usb64.cpp`：UHCI + 控制/中断传输 + HID 引导键盘，按键经 `kbd_inject_scancode()` 注入 PS/2 **同一条队列** —— 桌面零改动即可响应（实测 USB 键盘按键真的打开了终端） |
 | **ATA 中断** | `ata64.cpp` 接上 IRQ14（中断唤醒替代 PIO 轮询），超时 / 从通道 / IF=0 自动回退轮询并只告警一次；实测 `irq14 selftest reads=2 irqs=1 polled=0` |
 | **桌面外壳与自带应用** | 窗口 z 序 / 拖拽缩放 / 任务栏 / 开始菜单 / 脏矩形 + **扫雷、计算器、终端、设置、任务管理器、文件资源管理器（此电脑）、系统监视器、关于** |
-| **★ 文件资源管理器 / 此电脑（UI，本批次新增）** | `explorer64.cpp`：**单窗口导航**（此电脑页 + 盘内浏览）。左**导航窗格**（快速访问 / 此电脑 / 每个驱动器一个节点）、顶部**工具栏**（文件 / 计算机 / 查看）、**面包屑地址栏**（`此电脑 > 本地磁盘 (C:) > apps > demo`，每段可点）与**后退/前进/上级**按钮（hover/按下都有可见反馈）；右侧两视图：**图标视图**（几何画出的分类图标：文件夹/VAP64/ELF64/文本/其它）与**详细信息视图**（名称 / 修改日期（`YYYY-MM-DD HH:MM`）/ 类型 / 大小 四列）；此电脑页每块盘一张卡片：**容量条** + `X 可用，共 Y`（KB→GB/MB 换算，保留一位小数），**ESP/未知文件系统灰字标注"不浏览"且点不进去**；底部状态栏 `N 个项目`。交互：单击选中、**双击**目录进入 / VAP64 走 `app64_launch64` / ELF64 走 `elf64_run64` / 文本开**只读预览窗口** / 其它给"没有关联的应用"提示；上下键选择、回车打开、Tab 切视图、滚动条分页（有界）。打点 `[UI] explorer …`、自检 `[EXPL] selftest PASS`；端到端 `tests/explorer64_test.py`（71 项：像素 + 串口 + QEMU 鼠标注入） |
+| **★ 文件资源管理器 / 此电脑（UI，本批次新增）** | `explorer64.cpp`：**单窗口导航**（此电脑页 + 盘内浏览）。左**导航窗格**（快速访问 / 此电脑 / 每个驱动器一个节点）、顶部**工具栏**（文件 / 计算机 / 查看）、**面包屑地址栏**（`此电脑 > 本地磁盘 (C:) > apps > demo`，每段可点）与**后退/前进/上级**按钮（hover/按下都有可见反馈）；右侧两视图：**图标视图**（几何画出的分类图标：文件夹/VAP64/ELF64/文本/其它）与**详细信息视图**（名称 / 修改日期（`YYYY-MM-DD HH:MM`）/ 类型 / 大小 四列）；此电脑页每块盘一张卡片：**容量条** + `X 可用，共 Y`（KB→GB/MB 换算，保留一位小数），**ESP/未知文件系统灰字标注"不浏览"且点不进去**；**双击任意可浏览盘符卡片 = 切到那个卷**（C:/D:/E: 都是各自盘上的真实内容）；底部状态栏 `N 个项目`。交互：单击选中、**双击**目录进入 / VAP64 走 `app64_launch64` / ELF64 走 `elf64_run64` / 文本开**只读预览窗口** / 其它给"没有关联的应用"提示；上下键选择、回车打开、Tab 切视图、滚动条分页（有界）。打点 `[UI] explorer …`、自检 `[EXPL] selftest PASS`；端到端 `tests/explorer64_test.py`（71 项：像素 + 串口 + QEMU 鼠标注入） |
 | **AHCI(SATA) + 屏幕硬件检查报告（item 5a）** | `ahci64.cpp`：PCI 找 class 01/06/prog-if 01 → BAR5(ABAR，含 64 位高位) → 逐端口 PxCLB/PxFB + PxCMD(FRE→ST) → PxSSTS/PxSIG 判设备 → 非队列 DMA 命令表（CFIS H2D `0x27` + READ/WRITE DMA EXT `0x25/0x35`，LBA48）+ PRDT + PxCI 轮询（`g_ticks64`/自旋双超时、hlt 让出）。**统一驱动器号**：`0..3`=PATA、`8..`=AHCI 盘，`ata64.cpp` 内部按号分派 → 安装程序/分区引擎/VFS/store 的 weak 引用**都不用改**。`hwui64.cpp`：**真机没有串口时的唯一诊断画面** —— 把 CPU/内存/固件与地址空间/中断与 SMP/**存储（PATA 通道 + AHCI 控制器与端口 + NVMe 控制器/命名空间/容量）**/显示（fb+EDID）/输入（PS/2 8042 + UHCI HID；EHCI/xHCI 标"不支持"）/ACPI/网络逐条画在黑底分区块页面上；三处展示：① 启动期约 5 秒（任意键跳过）② 安装程序找不到磁盘时直接画在向导里 ③ 桌面 设置 → **硬件检查**页。指南见 `docs/真机验证指南.md` |
 | **NVMe 驱动：能装到 NVMe 盘、UEFI 从这块盘启动（item 6）** | `kernel/nvme64.{h,cpp}`：PCI 找 class `0x01`/subclass `0x08`/prog-if `0x02`（= `0x010802`）→ **BAR0（64 位 MMIO，高 32 位也处理）** → 控制器使能（`CSTS.RDY=0` → `INTMS=0xFFFFFFFF` **全程轮询** → `AQA`/`ASQ`/`ACQ` → `CC`：CSS=0/MPS=0/IOSQES=6/IOCQES=4/EN=1 → `CSTS.RDY=1`）→ Admin 队列（Identify Controller / Identify Namespace(NSID 1，`NSZE`+`LBAF`) / Create I/O CQ+SQ，QD=8）→ I/O 轮询（Read/Write、`NLB` 0-based、**PRP1 + PRP2（两页直接指针 / 三页以上 PRP 列表）**、SQ tail / CQ head 门铃、CQ **phase 位**、`g_ticks64`+自旋双超时）。**驱动器号 `16..`**：`ata64.cpp` 内部按号分派，`ata64_drive_count64()`/`slot_to_drive64()` 把命名空间算进枚举 → 向导里直接能选、能分区、能装。单条命令 ≤ 128 扇区（64KB，内部分块）。QEMU 实测：**识别 → 装到 NVMe 盘（`[PART] … drive=16`、ESP FAT32 fat_ok=1）→ UEFI(OVMF) 从这块盘启动进桌面**（`U:loaded KERNEL64.BIN` → `[OS] booted from installed disk` → `[GUI64] ready`，`tests/nvme64_test.py`）；SeaBIOS 也能从 NVMe 启（真机 BIOS 是否认 NVMe 取决于固件，**推荐 UEFI**）。边界：单控制器/单队列/单命名空间/只支持 512B 逻辑块 |
 | **内核自检** | 启动即跑内存、图形、调度器、VFS、store、syscall、ring3、ELF64/VAP64、APIC/SMP、USB、EDID 等自检，结果打到串口供自动验收断言 |
@@ -50,7 +53,7 @@
 | ⚠️ **用户态独立地址空间** | 批次 C 起：proc64 每进程独立 CR3 + fork/execve/wait4/kill（BIOS 路径）；UEFI（固件页表）下默认仍如实降级为共享地址空间模式（`[PROC64] cr3 isolation OFF`）。**批次 D 实测**：在固件 PML4 上就地挂用户窗口（清 CR0.WP 手法）与自带 PML4 + 运行期 `mov cr3` **两条路径都在 QEMU+OVMF 与 VMware EFI 下成功**（`[PROC64] uefi exp result=B mode=isolated`），但默认构建不编这段实验（宏 `PROC64_UEFI_CR3_EXPERIMENT`），见 `docs/UEFI地址空间实验报告.md` |
 | ⚠️ **fd 语义（批次 D）** | **每进程 fd 表**（32 槽/张；`Proc64` 持有，终端/桌面用内核表）；fd → 引用计数的 `OpenFile64`（**共享偏移游标**）：`dup/dup2` 共享同一对象、`fork` 逐槽继承、`execve` 默认保留（**无 `O_CLOEXEC`**）、`close` 只是 refs-1；`O_APPEND` 真实现；**`pipe(22)` 真实现**（64 B 环形缓冲、非阻塞：写满短写/读空 `-EAGAIN`），`user/pipe64.asm` 是 fork 后父子各持一端的环回证据 |
 | ⚠️ **ELF64 只验证过自有静态程序** | 用 `ld.lld -static -nostdlib` 链接的自己的 ELF64 能 load → ring3 → `syscall` → exit；**glibc / 发行版二进制没有验证过**（缺 vDSO、TLS(FS.base) 的完整语义、信号投递、futex、动态链接与重定位） |
-| ⚠️ **VFS 的限制（v3 目录树已落地，仍有边界）** | 支持多级路径 `/dir/sub/file`（`.`/`..`、大小写敏感）；**名字 ≤31B**、**inode 总数 ≤512**、**路径 ≤128B / 16 段**、**目录深度 16**；目录删除只支持 `rmdir` **空目录**（非空必须先清空）；**单文件仍 ≤67584B**（v3 没加二级间接块）；无权限/属主、无硬链接/符号链接、无稀疏文件。v2 旧卷仍能挂载（按单层语义）。终端 `ls/cat/write/touch/rm/mkdir/df` 与 ring3 的 `open/read/write/close` 都走 `kernel/fd64.cpp` 的 FD 层直连 VimtuFS2（终端命令的多级路径也已支持；**终端帮助与错误文案已改写成多级路径口径**，文件管理器 UI 也已落地（见上表））。终端另有 `fdtest`（独立游标/dup 共享/O_APPEND/pipe/fork 继承一键演示） |
+| ⚠️ **VFS 的限制（v3 目录树已落地，仍有边界）** | 支持多级路径 `/dir/sub/file`（`.`/`..`、大小写敏感）；**名字 ≤31B**、**inode 总数 ≤512**、**路径 ≤128B / 16 段**、**目录深度 16**；目录删除只支持 `rmdir` **空目录**（非空必须先清空）；**单文件仍 ≤67584B**（v3 没加二级间接块）；无权限/属主、无硬链接/符号链接、无稀疏文件。v2 旧卷仍能挂载（按单层语义）。**多卷**：最多 4 个可浏览卷同时挂载（系统卷 `C:` + `D:/E:/F:`），第 5 个起如实拒绝（`reason=voltable-full`）；终端 `vol` 切当前卷、`df` 列所有卷。终端 `ls/cat/write/touch/rm/mkdir/df` 与 ring3 的 `open/read/write/close` 都走 `kernel/fd64.cpp` 的 FD 层直连 VimtuFS2（终端命令的多级路径也已支持；**终端帮助与错误文案已改写成多级路径口径**，文件管理器 UI 也已落地（见上表））。终端另有 `fdtest`（独立游标/dup 共享/O_APPEND/pipe/fork 继承一键演示） |
 | ⚠️ **设置页接线范围** | 显示/会话分区已接 `config64`/`session64`（真落 store64，跨重启保留）；系统/关于页是只读实测值（设备规格来自 hwinfo64/display64/net64/usb64） |
 | ⚠️ **没有 TCP/IP / DHCP / DNS** | 网络只有 IPv4 + ARP + ICMP echo（e1000 轮询收发，无中断收包）；UDP/TCP、路由、DHCP、DNS 都没有；只适配 e1000，VMware 的 vmxnet3 未适配 |
 | ⚠️ **USB 只有 UHCI + HID 引导键盘** | 没有 EHCI(USB 2.0) / xHCI(USB 3.x)，没有 USB 鼠标、U 盘、集线器；只认直接插在根端口上的键盘；不接中断（由 `kusb` 线程轮询） |
@@ -111,7 +114,8 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
      part64.cpp        分区表（MBR/混合 MBR/盘尾 GPT）/ 新建 / 删除 / 格式化（VimtuFS2）/ 安装引擎 + ESP 安装
      fat64.cpp         最小 FAT32 写入器（安装时在目标盘建 ESP；卷参数与 tools/make_esp.py 逐条对齐）
      vfs64.cpp         VimtuFS2 v3：超级块+CRC32 / 空闲位图 / 128B inode + mtime/kind / 多级路径 / 目录树遍历 / v2 兼容
-     drive64.cpp       盘符与驱动器枚举：所有盘 -> MBR 分区 -> fs 识别 -> C:/D:/E: 盘符表（只读）
+                      ★ 多卷：4 个卷槽 + 按槽挂载/激活 + on64（固定系统卷）写路径 + 缓存按 (slot,drive,lba) 键控
+     drive64.cpp       盘符与驱动器枚举：所有盘 -> MBR 分区 -> fs 识别 -> C:/D:/E: 盘符表 + 卷槽分配/激活
      store64.cpp       设置持久化：/store.a、/store.b 双槽 + 世代号 + 双 CRC32（裸盘槽仅降级+WARN）
      app64.cpp         VAP64 安装器 / 校验 / 启动器 + 按魔数自动分派
      elf64.cpp         ELF64 加载器：PT_LOAD 映射、p_flags 权限、SysV 初始栈/auxv、装载回收
@@ -362,7 +366,8 @@ docs/screenshots/       自动抓取的桌面截图（desktop64.png）
 （`build/font_bahnschrift.ttf` / `font_chaparral.ttf` / `font_simhei.ttf`）与内核里的 objcopy 符号名保持不变。
 许可与派生说明见 [docs/字体许可说明.md](docs/字体许可说明.md)。**因此 ISO/IMG 可以直接公开分发。**
 
-**版本与发布**：标签 `v0.1.0-beta.1`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.1.0-beta.1>
+**版本与发布**：标签 `v0.2.0-beta.4`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.2.0-beta.4>
+（历史版本各自保留安装程序：`v0.2.0-beta.3`、`v0.2.0-beta.2`、`v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
 （预发布；**安装盘已附上**：`vimtu64-64.iso` 三合一安装盘 + `vimtu64-64.img` 裸盘介质）。
 
 ```bash

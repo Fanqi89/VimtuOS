@@ -79,6 +79,7 @@
 #include "edid64.h"      // display edid：引导期 EDID（0x7600）解析结果
 #include "ata64.h"       // disk/ata：ATA IDENTIFY（型号/容量；读取自带超时保护）
 #include "vfs64.h"       // disk：卷状态；user：盘上的 ring3 程序
+#include "drive64.h"     // vol：盘符/卷槽表（多卷：vol C:|D: = 切换当前卷）
 #include "fd64.h"        // 文件命令的 FD 层（32 项；多级路径 /dir/sub/name、单文件 <=67584B）
 #include "display64.h"   // display [modes|hz|edid]：模式清单 + 0x3DA 实测刷新率 + EDID 对比
 #include "usermode64.h"  // user/userprog：ring3 用户窗口地址与页映射查询
@@ -613,7 +614,9 @@ static const char* HELP_EN =
     "  write FILE TEXT       write a real file (overwrite; single file <= 67584 B; multi-level /dir/name)\\n"
     "  cat FILE / ls, dir    read file / list a directory with sizes (real disk, not ramfs; ls = volume root)\\n"
     "  touch FILE / rm FILE  create empty file / delete file (rm cannot delete directories)\\n"
-    "  mkdir DIR / df        create a directory (multi-level, parent must exist) / volume blocks & free (512B blocks)\\n"
+    "  mkdir DIR / df        create a directory (multi-level, parent must exist) / ALL volumes: 1K blocks+free\\n"
+    "  vol [C:|D:]           list volumes & drive letters / switch the CURRENT volume (ls/cat/write/mkdir/rm/run\\n"
+    "                        all act on the CURRENT volume; the explorer switches it when you open a drive card)\\n"
     "  date / time           RTC date / time\n"
     "  uptime                time since boot (ticks/250)\n"
     "  irq                   total interrupt count\n"
@@ -664,7 +667,9 @@ static const char* HELP_ZH =
     "  write FILE TEXT       写**真文件**（整体覆盖；单文件 ≤67584 B；路径支持多级 /dir/sub/name）\\n"
     "  cat FILE / ls, dir    读文件 / 列目录（带大小；磁盘上的真文件，不再是 ramfs；ls 列的是卷根目录）\\n"
     "  touch FILE / rm FILE  建空文件 / 删文件（rm 不能删目录）\\n"
-    "  mkdir DIR / df        建目录（**多级**，父目录必须已存在）/ 卷的块数与空闲块（512B 块，VimtuFS2）\\n"
+    "  mkdir DIR / df        建目录（**多级**，父目录必须已存在）/ **所有卷**的块数与空闲块（512B 块，VimtuFS2）\\n"
+    "  vol [C:|D:]           列出卷与盘符 / 切换**当前卷**（ls/cat/write/mkdir/rm/run 都作用在当前卷上；\\n"
+    "                        在文件管理器里双击盘符卡片 = 把当前卷切到那块盘）\\n"
     "  date / time           RTC 日期 / 时间\n"
     "  uptime                开机时长（ticks/250）\n"
     "  irq                   中断总数\n"
@@ -1260,7 +1265,51 @@ static bool cmd_mkdir(TerminalState* ts, const char* name) {
 }
 
 // df：卷总块/空闲块（sysstate64 的只读探测快照）+ 实时文件统计（vfs64_ls）
+// ★ 多卷：df 的"所有卷"清单。**独立于系统卷快照是否可用** —— 128MB 级系统卷的快照受
+//   sysstate64 旧上限限制（bm_use<=8 = 16MB 封顶），但盘符/卷槽/实时容量来自 drive64 的
+//   已挂载槽（vfs64_slot_info64 现数位图），所以在任何卷规模下都能给出真值。
+//   打点：[TERM] cmd df volumes=<n> current=<C:|->（fs_term_test 依赖的旧行也照旧打）
+static void df_print_volumes(TerminalState* ts) {
+    if (drive64_count64() == 0) (void)drive64_scan64();
+    const int dn = drive64_count64();
+    const char cur = drive64_current_letter64();
+    int shown = 0;
+    ts_puts(ts, "  volumes (* = current volume used by ls/cat/write/mkdir/rm/run):\n");
+    for (int i = 0; i < dn; i++) {
+        DriveInfo64 d;
+        if (drive64_info64(i, &d) != 0 || !d.present) continue;
+        if (!d.browsable || !d.letter) continue;
+        ts_puts(ts, (cur == d.letter) ? "   * " : "     ");
+        char l[3]; l[0] = d.letter; l[1] = ':'; l[2] = 0;
+        ts_puts_pad(ts, l, 4);
+        ts_puts(ts, " slot=");
+        ts_put_u64(ts, (uint64_t)d.slot);
+        ts_puts(ts, " fs=");
+        ts_puts(ts, d.fs);
+        ts_puts(ts, " total_kb=");
+        ts_put_u64(ts, d.total_kb);
+        ts_puts(ts, " free_kb=");
+        ts_put_u64(ts, d.free_kb);
+        ts_puts(ts, d.system ? " system\n" : "\n");
+        shown++;
+    }
+    ts_puts(ts, "  browsable volumes=");
+    ts_put_u64(ts, (uint64_t)shown);
+    ts_puts(ts, " vfs64 slots=");
+    ts_put_u64(ts, (uint64_t)VFS64_SLOT_MAX);
+    ts_putc(ts, (uint32_t)'\n');
+    dbg64_line_begin64();
+    dbg64_str("[TERM] cmd df volumes=");
+    dbg64_dec((uint64_t)shown);
+    dbg64_str(" current=");
+    if (cur) { char cb[3]; cb[0] = cur; cb[1] = ':'; cb[2] = 0; dbg64_str(cb); } else dbg64_str("-");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
 static bool cmd_df(TerminalState* ts) {
+    // 注意打点顺序：**先**打旧行 "[TERM] cmd df blocks=..."（fs_term/fs_tree 的 wait_for 就等它），
+    // 卷清单（df_print_volumes）放在后面/或无卷分支里 —— 顺序反了会让旧脚本在"等 df 行"时提前返回。
     Fs64Info fs;
     const int rc = sysstate64_fsinfo64(&fs);
     char names[FD64_MAX][FD64_NAME_MAX];
@@ -1271,6 +1320,7 @@ static bool cmd_df(TerminalState* ts) {
     for (int i = 0; i < n; i++) live_bytes += sizes[i];
     if (rc != 0 || !fs.ok) {
         ts_puts(ts, "df: no VimtuFS2 volume (no partition table / mount failed)\n");
+        df_print_volumes(ts);                   // ★ 多卷：系统卷快照读不到也要列出盘符/卷槽
         return true;
     }
     const uint64_t used = (uint64_t)fs.total_blocks - (uint64_t)fs.free_blocks;
@@ -1297,7 +1347,8 @@ static bool cmd_df(TerminalState* ts) {
     ts_puts(ts, " bytes=");
     ts_put_u64(ts, live_bytes);
     ts_putc(ts, (uint32_t)'\n');
-    ts_puts(ts, "  (block bitmap = first-probe snapshot at boot; file list/bytes are live; VimtuFS2 v3 directory tree)\n");
+    ts_puts(ts, "  (system volume: bitmap snapshot from the boot probe; file list/bytes are live; VimtuFS2 v3 tree)\n");
+
     dbg64_line_begin64();
     dbg64_str("[TERM] cmd df blocks=");
     dbg64_dec((uint64_t)fs.total_blocks);
@@ -1307,6 +1358,107 @@ static bool cmd_df(TerminalState* ts) {
     dbg64_dec(live_files);
     dbg64_nl();
     dbg64_line_end64();
+    df_print_volumes(ts);                       // ★ 多卷：最后再列所有卷（含实时容量与当前卷标记）
+    return true;
+}
+
+// vol：多卷命令。
+//   vol          -> 列出所有盘符/卷槽（打点 [VOL] list n=<n> current=<C:|->）
+//   vol C:|D:    -> 切换"当前卷"（drive64_activate_letter64；打点 [VOL] switch letter=D: slot=1 ok）
+// 说明：ls/cat/write/touch/rm/mkdir/run 等文件命令都以**当前卷**为根，所以这个命令就是"选盘"。
+static bool cmd_vol(TerminalState* ts, const char* arg) {
+    if (arg && arg[0]) {
+        char letter = arg[0];
+        if (letter >= 'a' && letter <= 'z') letter = (char)(letter - 'a' + 'A');
+        if (letter < 'A' || letter > 'Z' || (arg[1] != 0 && arg[1] != ':')) {
+            ts_puts(ts, "vol: usage: vol | vol C: | vol D:\n");
+            dbg64_line_begin64();
+            dbg64_str("[VOL] usage bad-arg");
+            dbg64_nl();
+            dbg64_line_end64();
+            return false;
+        }
+        const int di = drive64_by_letter64(letter);
+        DriveInfo64 d;
+        int slot = -1;
+        if (di >= 0 && drive64_info64(di, &d) == 0) slot = (int)d.slot;
+        const int rc = drive64_activate_letter64(letter);
+        char lb[3]; lb[0] = letter; lb[1] = ':'; lb[2] = 0;
+        if (rc == 0) {
+            ts_puts(ts, "vol: current volume = ");
+            ts_puts(ts, lb);
+            ts_puts(ts, "  slot=");
+            ts_put_u64(ts, (uint64_t)(slot < 0 ? 0 : slot));
+            ts_puts(ts, "  (ls/cat/write/mkdir/rm/run now act on this volume)\n");
+        } else {
+            ts_puts(ts, "vol: cannot switch to ");
+            ts_puts(ts, lb);
+            ts_puts(ts, " (no such letter / not browsable / no slot; see the list below)\n");
+        }
+        dbg64_line_begin64();
+        dbg64_str(rc == 0 ? "[VOL] switch letter=" : "[VOL] switch FAILED letter=");
+        dbg64_str(lb);
+        dbg64_str(" slot=");
+        if (slot >= 0) dbg64_dec((uint64_t)slot); else dbg64_str("-");
+        dbg64_nl();
+        dbg64_line_end64();
+        return rc == 0;
+    }
+
+    // 列表：盘符 / 卷槽 / 容量 / 是否当前
+    if (drive64_count64() == 0) (void)drive64_scan64();
+    const int dn = drive64_count64();
+    const char cur = drive64_current_letter64();
+    int n = 0;
+    ts_puts(ts, "volumes (vfs64 slots -> drive letters):\n");
+    for (int i = 0; i < dn; i++) {
+        DriveInfo64 d;
+        if (drive64_info64(i, &d) != 0 || !d.present) continue;
+        ts_puts(ts, "  ");
+        if (d.letter) {
+            char l[3]; l[0] = d.letter; l[1] = ':'; l[2] = 0;
+            ts_puts(ts, (cur == d.letter) ? "* " : "  ");
+            ts_puts_pad(ts, l, 4);
+            ts_puts(ts, "slot=");
+            ts_put_u64(ts, (uint64_t)d.slot);
+            ts_puts(ts, " fs=");
+            ts_puts(ts, d.fs);
+            ts_puts(ts, " total_kb=");
+            ts_put_u64(ts, d.total_kb);
+            ts_puts(ts, " free_kb=");
+            ts_put_u64(ts, d.free_kb);
+            ts_puts(ts, d.system ? " system" : "");
+            ts_puts(ts, " disk=");
+            ts_put_u64(ts, (uint64_t)d.disk);
+            ts_puts(ts, " lba=");
+            ts_put_u64(ts, d.start_lba);
+            ts_putc(ts, (uint32_t)'\n');
+            n++;
+        } else {
+            ts_puts(ts, "  --  (no letter) fs=");
+            ts_puts(ts, d.fs);
+            ts_puts(ts, " skip=");
+            ts_puts(ts, drive64_skip_reason64(d.skip));
+            ts_putc(ts, (uint32_t)'\n');
+        }
+    }
+    ts_puts(ts, "  current=");
+    if (cur) { char l[3]; l[0] = cur; l[1] = ':'; l[2] = 0; ts_puts(ts, l); } else ts_puts(ts, "(none)");
+    ts_puts(ts, "  browsable=");
+    ts_put_u64(ts, (uint64_t)n);
+    ts_puts(ts, "  vfs64 slots=");
+    ts_put_u64(ts, (uint64_t)VFS64_SLOT_MAX);
+    ts_putc(ts, (uint32_t)'\n');
+    dbg64_line_begin64();
+    dbg64_str("[VOL] list n=");
+    dbg64_dec((uint64_t)n);
+    dbg64_str(" current=");
+    if (cur) { char l[3]; l[0] = cur; l[1] = ':'; l[2] = 0; dbg64_str(l); } else dbg64_str("-");
+    dbg64_str(" slots=");
+    dbg64_dec((uint64_t)VFS64_SLOT_MAX);
+    dbg64_nl();
+    dbg64_line_end64();
+    vfs64_slots_dump64();                                   // 卷槽表（串口，验收用）
     return true;
 }
 
@@ -2483,8 +2635,11 @@ static void shell_exec(TerminalState* ts, const char* line) {
         // 真：vfs64_mkdir（阶段一：父目录固定为根，单层）
         ok = cmd_mkdir(ts, g_arg1);
     } else if (st_eq(g_cmd, "df")) {
-        // 真：VimtuFS2 卷几何（总块/空闲块/已用）+ 实时文件统计
+        // 真：VimtuFS2 卷几何（总块/空闲块/已用）+ 实时文件统计 + **所有卷**清单
         ok = cmd_df(ts);
+    } else if (st_eq(g_cmd, "vol")) {
+        // ★ 多卷：vol 列出卷/盘符；vol C:|D: 切换"当前卷"（ls/cat/write/... 都作用在当前卷上）
+        ok = cmd_vol(ts, g_arg1);
     } else if (st_eq(g_cmd, "fdtest")) {
         // 批次 D：FD 语义演示（独立游标 / dup 共享游标 / O_APPEND / pipe 环回）。
         // 实现在 fd64.cpp（fd64_demo64），这里只负责跑 + 一行命令级打点（自动验收 grep）。

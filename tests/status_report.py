@@ -535,6 +535,45 @@ def cap_fs_tree():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_multivol():
+    """★ 多卷挂载 / 按盘符切换：vfs64 卷槽表（至少 4 槽）+ 按槽写系统卷。
+
+    判据绑到"代码里真的这么做" + 新的验收脚本与接口。
+    写卷安全：store64/config64/update64/app64/elf64/proc64/sysstate64 全部走
+    vfs64_*_on64(vfs64_system_slot64(), ...) —— 只在单次调用里临时切卷、返回前切回（LIFO），
+    所以用户浏览 D: 时 3 秒自动落盘不会写到 D:；inode 缓存按 (slot, drive, lba) 三元组键控。"""
+    need = ["kernel/vfs64.cpp", "kernel/vfs64.h", "kernel/drive64.cpp", "kernel/drive64.h",
+            "kernel/explorer64.cpp", "kernel/terminal64.cpp"]
+    for f in need:
+        if not exists(f):
+            return "MISSING", ["缺 %s（多卷链路）" % f]
+    slots = grep_count(r"VFS64_SLOT_MAX|vfs64_mount_slot64|vfs64_activate_slot64|vfs64_system_slot64|"
+                       r"vfs64_slot_info64|Vfs64SlotGuard",
+                       ["kernel/vfs64.h", "kernel/vfs64.cpp"])
+    cache = grep_count(r"g_ino_cache_slot|ino_cache_hit", ["kernel/vfs64.cpp"])
+    oncalls = grep_count(r"vfs64_(stat|read|write|unlink|stat64|list64|ls)_on64",
+                         ["kernel/store64.cpp", "kernel/update64.cpp", "kernel/app64.cpp",
+                          "kernel/elf64.cpp", "kernel/proc64.cpp", "kernel/sysstate64.cpp"])
+    drv = grep_count(r"drive64_activate_letter64|drive64_current_letter64|DRV64_SLOT_NONE",
+                     ["kernel/drive64.cpp", "kernel/drive64.h"])
+    slotfull = grep_count(r"voltable-full|DRV64_SKIP_NOSLOT", ["kernel/drive64.cpp"])
+    term = grep_count(r"cmd_vol|df_print_volumes", ["kernel/terminal64.cpp"])
+    expl = grep_count(r"enter letter=|drive64_activate_letter64|exp_sync_volume",
+                      ["kernel/explorer64.cpp"])
+    fdtst = grep_count(r"fd64_open_on64|of->slot", ["kernel/fd64.cpp", "kernel/fd64.h"])
+    tst = exists("tests/multivol64_test.py")
+    ev = ["vfs64 多卷 API（卷槽表 / 激活 / 当前卷参数化 / on64 守卫）命中 %d 处" % slots,
+          "inode 扇区缓存按 (slot, drive, lba) 三元组键控：%d 处" % cache,
+          "系统组件固定写系统卷（vfs64_*_on64 调用）：%d 处" % oncalls,
+          "drive64 激活/当前盘符/卷表满如实拒绝：%d 处" % (drv + slotfull),
+          "终端 vol 与 df 全卷清单：%d 处；fd64 按卷打开变体：%d 处" % (term, fdtst),
+          "资源管理器盘符切换链路（enter letter=/同步）：%d 处" % expl,
+          "端到端脚本 tests/multivol64_test.py：%s（宿主机预置第二卷 + 双卷独立 + Explorer 双击 D: + "
+          "写卷安全逐字节比对 + 卷表满 + 坏情况）" % ("有" if tst else "缺")]
+    done = bool(slots and cache and oncalls and drv and slotfull and term and expl and fdtst and tst)
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 def cap_drive_layer():
     """盘符/驱动器枚举层：C: = 系统卷，其余 VimtuFS2 卷 D:/E:…；ESP/未知不占字母但列出。"""
     if not (exists("kernel/drive64.cpp") and exists("kernel/drive64.h")):
@@ -1129,6 +1168,8 @@ CAPS = [
     ("内核", "文件系统（真实 VFS）", cap_filesystem),
     ("内核", "★ VimtuFS2 目录树 v3（多级路径 + inode 时间戳 + 类型判定；v2 旧卷仍可挂载）", cap_fs_tree),
     ("存储", "★ 盘符与驱动器枚举（C: = 系统卷 + D:/E:… 盘符表；ESP/未知不占字母但列出）", cap_drive_layer),
+    ("存储", "★ 多卷挂载 / 盘符切换（vfs64 卷槽表 + drive64 按字母激活 + 系统组件固定写系统卷）",
+     cap_multivol),
     ("应用", "★ 文件资源管理器 / 此电脑（UI：导航窗格 + 面包屑 + 图标/详细信息双视图 + 容量条 + 双击运行）",
      cap_explorer_ui),
     ("内核", "设置持久化（store/VCAT 双槽）", cap_persistence),
@@ -1144,6 +1185,8 @@ CAPS = [
 
 TESTS = [
     ("boot64_assert.py", "M0/M1：长模式/IDT/PIT/BootInfo"),
+    ("multivol64_test.py", "★ 多卷挂载/盘符切换：装好的盘 + 宿主侧预置的第二个 VimtuFS2 卷 -> D: 浏览/读写 + "
+                          "Explorer 双击盘符卡片 + 写卷安全（浏览 D: 期间自动落盘不动 D: 逐字节）+ 卷表满如实拒绝"),
     ("ahci64_test.py", "★ item 5a：AHCI(SATA) 控制器/端口/签名 + 屏幕硬件检查报告（打点 + 像素）"),
     ("mouse_parse_test.py", "PS/2 鼠标解码 + 位移限速（纯 Python 复放）"),
     ("ahci64_test.py", "★ item 5a：AHCI(SATA) 控制器/端口/签名 + 屏幕硬件检查报告（打点 + 像素）"),

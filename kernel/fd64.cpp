@@ -43,6 +43,7 @@ struct OpenFile64 {
     uint32_t flags;           // 打开时的 flags（原样存下，打点/诊断用）
     uint32_t off;             // ★ 共享读写游标（dup/fork 共享的就是它）
     uint32_t size;            // 文件大小缓存（每次读/写/lseek 前重新 stat 刷新）
+    int32_t  slot;            // ★ 多卷：**打开时所在卷槽**（-1 = 打开时没有卷）；读写都按这个槽走
     uint8_t  used;
     uint8_t  kind;            // FD64_KIND_*
     uint8_t  writable;        // 1 = O_WRONLY/O_RDWR
@@ -120,7 +121,7 @@ static OpenFile64* fd64_of_alloc64() {
         OpenFile64* of = &g_files[i];
         uint8_t* p = (uint8_t*)of;
         for (uint32_t k = 0; k < (uint32_t)sizeof(OpenFile64); k++) p[k] = 0;
-        of->used = 1; of->refs = 1; of->dirc = -1;
+        of->used = 1; of->refs = 1; of->dirc = -1; of->slot = -1;   // -1 = 打开时没有卷
         return of;
     }
     return nullptr;
@@ -252,15 +253,18 @@ static int fd64_is_root_path64(const char* p) {
 }
 
 // 文件大小刷新：另一个 fd/另一个进程刚写过同一个文件时，本对象缓存的大小会过期（读/seek(END)/
-// O_APPEND 都靠它）。每次操作前 stat 一次，代价小（vfs64_stat 是内存里的 inode 查询）。
+// O_APPEND 都靠它）。每次操作前 stat 一次，代价小（vfs64_stat_on64 是内存里的 inode 查询）。
+// ★ 多卷：按**打开时的卷槽** stat（vfs64_stat_on64 只在这一次调用期间切卷，返回前切回），
+//   所以用户切了盘/别的组件换了当前卷都不会让这个 fd 指向别处的同名文件。
 static void fd64_refresh64(OpenFile64* of) {
     if (!of || of->kind != FD64_KIND_FILE) return;
     uint32_t ty = 0, sz = 0;
-    if (vfs64_stat(of->path, &ty, &sz) == 0 && ty != VFS64_TYPE_DIR) of->size = sz;
+    if (vfs64_stat_on64(of->slot, of->path, &ty, &sz) == 0 && ty != VFS64_TYPE_DIR) of->size = sz;
 }
 
 // 打开时的公共准备：路径规范化 + 存在性/类型判定
-static int fd64_prepare_64(const char* path, char* norm, uint32_t flags, int* out_dir) {
+// ★ 多卷：探盘/建文件都走 **on64(slot, …)** —— "这个 fd 属于哪个卷"在打开那一刻定死。
+static int fd64_prepare_64(int slot, const char* path, char* norm, uint32_t flags, int* out_dir) {
     if (fd64_is_root_path64(path)) {                          // 根目录：只有目录句柄能打开
         if (!(flags & FD64_O_DIRECTORY)) return -FD64_EISDIR;
         norm[0] = '/'; norm[1] = 0;
@@ -270,7 +274,7 @@ static int fd64_prepare_64(const char* path, char* norm, uint32_t flags, int* ou
     const int pr = fd64_norm_path64(path, norm, (int)FD64_PATH_MAX);
     if (pr != 0) return pr;
     uint32_t type = 0, size = 0;
-    const int have = (vfs64_stat(norm, &type, &size) == 0);
+    const int have = (vfs64_stat_on64(slot, norm, &type, &size) == 0);
     const int want_dir = (flags & FD64_O_DIRECTORY) != 0;
     if (have) {
         if (type == VFS64_TYPE_DIR) {
@@ -285,16 +289,18 @@ static int fd64_prepare_64(const char* path, char* norm, uint32_t flags, int* ou
     // 不存在：只有 O_CREAT 才允许（目录句柄不允许创建）
     if (want_dir) return -FD64_ENOENT;
     if (!(flags & FD64_O_CREAT)) return -FD64_ENOENT;
-    if (vfs64_write(norm, "", 0) < 0) return -FD64_ENOSPC;  // 建空文件（vfs64_write 支持 len=0）
+    if (vfs64_write_on64(slot, norm, "", 0) < 0) return -FD64_ENOSPC;  // 建空文件（write 支持 len=0）
     *out_dir = 0;
     return 0;
 }
 
 // ==================== open / close ====================
-int fd64_open64(const char* path, uint32_t flags) {
+// ★ 多卷：按**显式卷槽**打开（系统组件要固定系统卷时用这个变体；终端/ring3 用默认入口 = 当前卷）。
+// 语义与 fd64_open64 逐字一致，只是这个对象之后的所有读写都锁定在 slot 这个卷上。
+int fd64_open_on64(int slot, const char* path, uint32_t flags) {
     char norm[FD64_PATH_MAX];
     int is_dir = 0;
-    const int pr = fd64_prepare_64(path, norm, flags, &is_dir);
+    const int pr = fd64_prepare_64(slot, path, norm, flags, &is_dir);
     if (pr != 0) {
         dbg64_line_begin64();
         dbg64_str("[FD64] open FAILED path=");
@@ -310,6 +316,7 @@ int fd64_open64(const char* path, uint32_t flags) {
     OpenFile64* of = fd64_of_alloc64();
     if (!of) return -FD64_EMFILE;
     of->flags    = flags;
+    of->slot     = slot;                                     // ★ 记住卷槽（-1 = 无卷）
     of->kind     = is_dir ? FD64_KIND_DIR : FD64_KIND_FILE;
     of->writable = (!is_dir && (flags & (FD64_O_WRONLY | FD64_O_RDWR))) ? 1 : 0;
     of->append   = (!is_dir && (flags & FD64_O_APPEND)) ? 1 : 0;
@@ -320,11 +327,11 @@ int fd64_open64(const char* path, uint32_t flags) {
     } else if (of->writable && (flags & FD64_O_TRUNC)) {
         // ★ O_TRUNC 在 open 时落地（Linux 也是 open 即截断）：写路径每次都是整文件 RMW，
         //   所以不需要"第一次写再截断"的延迟标志了。
-        (void)vfs64_write(norm, "", 0);
+        (void)vfs64_write_on64(slot, norm, "", 0);
         of->size = 0;
     } else {
         uint32_t type = 0, size = 0;
-        (void)vfs64_stat(norm, &type, &size);
+        (void)vfs64_stat_on64(slot, norm, &type, &size);
         of->size = size;
     }
 
@@ -338,11 +345,17 @@ int fd64_open64(const char* path, uint32_t flags) {
     dbg64_dec((uint64_t)fd);
     dbg64_str(" flags=");
     dbg64_dec((uint64_t)flags);
+    dbg64_str(" slot=");                                     // ★ 多卷：这个 fd 属于哪个卷槽
+    dbg64_dec((uint64_t)(slot < 0 ? 0 : slot));
     if (is_dir) dbg64_str(" (dir)");
     if (of->append) dbg64_str(" (append)");
     dbg64_nl();
     dbg64_line_end64();
     return fd;
+}
+// 默认入口：绑定"当前卷"（终端/ring3 的普通打开都走这里，行为与以前一致）
+int fd64_open64(const char* path, uint32_t flags) {
+    return fd64_open_on64(vfs64_current_slot64(), path, flags);
 }
 
 int fd64_close64(int fd) {
@@ -487,7 +500,7 @@ int fd64_read64(int fd, void* buf, int len) {
     const uint64_t if_save = dbg64_irq_save64();
     fd64_refresh64(of);
     if (of->off >= of->size) { dbg64_irq_restore64(if_save); return 0; }   // EOF
-    const int n = vfs64_read(of->path, g_fd64_rbuf, (int)FD64_FILE_MAX);
+    const int n = vfs64_read_on64(of->slot, of->path, g_fd64_rbuf, (int)FD64_FILE_MAX);
     if (n < 0) { dbg64_irq_restore64(if_save); return -FD64_ENOENT; }
     const uint32_t avail = ((uint32_t)n > of->size) ? of->size : (uint32_t)n;
     if (of->off >= avail) { dbg64_irq_restore64(if_save); return 0; }
@@ -529,7 +542,7 @@ int fd64_write64(int fd, const void* buf, int len) {
     // 整文件 read-modify-write（每次写都读一遍：多个 fd/多个进程同时写时语义才正确）
     uint32_t sz = 0;
     {
-        const int n = vfs64_read(of->path, g_fd64_wbuf, (int)FD64_FILE_MAX);
+        const int n = vfs64_read_on64(of->slot, of->path, g_fd64_wbuf, (int)FD64_FILE_MAX);
         sz = (n > 0) ? (uint32_t)n : 0;
         if (sz > FD64_FILE_MAX) sz = FD64_FILE_MAX;
     }
@@ -542,7 +555,7 @@ int fd64_write64(int fd, const void* buf, int len) {
     fd64_copy(g_fd64_wbuf + of->off, buf, (uint32_t)len);
     const uint32_t end2 = of->off + (uint32_t)len;
     if (end2 > sz) sz = end2;
-    const int wn = vfs64_write(of->path, g_fd64_wbuf, (int)sz);
+    const int wn = vfs64_write_on64(of->slot, of->path, g_fd64_wbuf, (int)sz);
     of->size = sz;
     of->off  = end2;                                           // 写后游标 = 末尾（O_APPEND 亦然）
     dbg64_irq_restore64(if_save);
@@ -646,7 +659,7 @@ int fd64_readdir64(int fd, char* name_out, int name_cap, uint32_t* type_out, uin
         if (slot < 0) return -FD64_EMFILE;
         g_dirc[slot].used = 1;
         g_dirc[slot].cursor = 0;
-        const int n = vfs64_ls(of->path, g_dirc[slot].names, (int)FD64_DIR_CACHE, g_dirc[slot].sizes);
+        const int n = vfs64_ls_on64(of->slot, of->path, g_dirc[slot].names, (int)FD64_DIR_CACHE, g_dirc[slot].sizes);
         if (n < 0) { g_dirc[slot].used = 0; return -FD64_ENOENT; }
         g_dirc[slot].count = (uint32_t)n;
         of->dirc = slot;
@@ -669,7 +682,7 @@ int fd64_readdir64(int fd, char* name_out, int name_cap, uint32_t* type_out, uin
             full[p++] = '/';
             for (int k = 0; dc->names[idx][k] && p + 1 < (int)FD64_PATH_MAX; k++) full[p++] = dc->names[idx][k];
             full[p] = 0;
-            if (vfs64_stat(full, &ty, &sz) != 0) ty = VFS64_TYPE_FILE;
+            if (vfs64_stat_on64(of->slot, full, &ty, &sz) != 0) ty = VFS64_TYPE_FILE;
         }
         if (type_out) *type_out = ty;
         if (size_out) *size_out = (ty == VFS64_TYPE_FILE) ? sz : 0;

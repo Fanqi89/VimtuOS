@@ -421,13 +421,14 @@ def main():
         kill(proc)
     check("格式化主分区 P2（[PART] 格式化 OK drive=1 index=2 start=8009）",
           "[PART] 格式化 OK drive=1 index=2 start=8009" in log2)
-    mf = last_match(r"\[VFS64\] format ok blocks=(\d+) version=(\d+) inode=(\d+) root=(\d+)", log2)
-    check("格式化产出 v3（[VFS64] format ok ... version=3 inode=128）",
-          bool(mf) and mf.group(2) == "3" and mf.group(3) == "128",
-          mf.group(0) if mf else "（缺 [VFS64] format ok 行）")
-    check("格式化块数 = 主分区扇区数（155798）",
-          bool(mf) and mf.group(1) == str(TARGET_MAIN_BLOCKS),
-          "blocks=%s 期望 %d" % (mf.group(1) if mf else "?", TARGET_MAIN_BLOCKS))
+    # ★ 多卷说明：系统启动盘一启动就会把**所有可浏览卷**挂进卷槽（D:/E:…），串口里因此有不止一条
+    #   `[VFS64] mount ok ...` / `[VFS64] format ok ...`（数据卷的块数不同，取"最后一条"会拿到别的卷）。
+    #   所以这里明确按**系统卷的块数**去找那一行 —— 断言强度不变（仍要求 v3 + 128B inode + 155798 块）。
+    mf = last_match(r"\[VFS64\] format ok blocks=%d version=(\d+) inode=(\d+) root=(\d+)" % TARGET_MAIN_BLOCKS, log2)
+    check("格式化产出 v3（[VFS64] format ok blocks=%d ... version=3 inode=128）" % TARGET_MAIN_BLOCKS,
+          bool(mf) and mf.group(1) == "3" and mf.group(2) == "128",
+          mf.group(0) if mf else "（缺 [VFS64] format ok blocks=%d 行）" % TARGET_MAIN_BLOCKS)
+    check("格式化块数 = 主分区扇区数（155798）", bool(mf), "blocks=%d" % TARGET_MAIN_BLOCKS)
     check("自检全过（[VFS64] selftest PASS）", "[VFS64] selftest PASS" in log2)
     forbid("阶段2", log2)
 
@@ -442,12 +443,13 @@ def main():
         check("装好的系统进桌面（[GUI64] ready）", up and "[OS] ready (idle)" in slog(s3))
 
         # ---- 卷版本 + 盘符表 ----
-        mv = last_match(r"\[VFS64\] mount ok blocks=(\d+) inodes=(\d+) free=(\d+) version=(\d+) inode=(\d+)B", slog(s3))
-        check("系统卷按 v3 挂载（mount ok ... version=3 inode=128B）",
-              bool(mv) and mv.group(4) == "3" and mv.group(5) == "128",
+        # ★ 多卷：按系统卷的块数定位系统卷的挂载行（数据卷也会打 mount ok，块数=24576）
+        mv = last_match(r"\[VFS64\] mount ok blocks=%d inodes=(\d+) free=(\d+) version=(\d+) inode=(\d+)B"
+                        % TARGET_MAIN_BLOCKS, slog(s3))
+        check("系统卷按 v3 挂载（mount ok blocks=%d ... version=3 inode=128B）" % TARGET_MAIN_BLOCKS,
+              bool(mv) and mv.group(3) == "3" and mv.group(4) == "128",
               mv.group(0) if mv else "（缺 mount ok 行）")
-        check("挂载块数 = 主分区扇区数", bool(mv) and mv.group(1) == str(TARGET_MAIN_BLOCKS),
-              "blocks=%s" % (mv.group(1) if mv else "?"))
+        check("挂载块数 = 主分区扇区数", bool(mv), "blocks=%d" % TARGET_MAIN_BLOCKS)
 
         log3 = slog(s3)
         ms = re.search(r"\[DRV64\] scan disks=(\d+) parts=(\d+) fs=(\d+)", log3)

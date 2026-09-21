@@ -110,6 +110,7 @@
 #define VFS64_DIRSTREAM_MAX    8u           // 同时打开的目录游标数
 #define VFS64_MAX_FILE_BYTES   (VFS64_DIRECT_BLOCKS * VFS64_BLOCK_BYTES + \
                                 VFS64_INDIRECT_PTRS * VFS64_BLOCK_BYTES)   // 67584
+#define VFS64_SLOT_MAX         4u           // ★ 多卷：卷槽数（0 = 系统卷，另外最多 3 个数据卷 -> D:/E:/F:）
 
 // inode 类型（磁盘字段 type）
 #define VFS64_TYPE_FREE        0u
@@ -199,6 +200,63 @@ int  vfs64_probe_volume64(int drive, uint32_t start_lba, Vfs64VolInfo64* out);
 
 // 当前挂载卷的身份（drive + 起始 LBA）；未挂载返回 -1。out 参数都可传 nullptr。
 int  vfs64_mounted_volume64(int* drive, uint32_t* start_lba, Vfs64VolInfo64* out);
+
+// ==================== ★ 多卷（卷槽表 + 按盘符/槽切换）====================
+// 模型（为什么这样设计见 vfs64.cpp 的"多卷"一节）：
+//   * 卷槽表 g_vol[0..VFS64_SLOT_MAX-1]：每个槽独立保存一份卷几何（drive/起始 LBA/位图/inode/数据区/布局）。
+//   * g_cur_slot = **当前卷**：所有旧 API（vfs64_stat64/read64/write64/ls/opendir…）都作用于当前卷 —— 
+//     fd64/终端/explorer 不必改调用点（"当前卷"就是用户在文件管理器里点进去的那块盘）。
+//   * 系统组件（store64/config64/update64/app64/elf64/proc64/sysstate64）**必须**用
+//     vfs64_*_on64(vfs64_system_slot64(), ...)：写盘只在这一次调用期间临时切到系统卷槽，
+//     调用返回前原样切回（不可重入计数 + LIFO 恢复）—— 用户在浏览 D: 时 3 秒自动落盘也不会写到 D:。
+//   * inode 扇区缓存按 (slot, drive, lba) 三元组键控（见 vfs64.cpp），切卷绝不会读到上一个卷的字节。
+
+// 挂系统卷：挂进 **0 号槽**并激活它，同时把它记成"系统卷槽"（store64 等固定写卷的依据）。返回 0/-1。
+int  vfs64_mount_system64(int drive, uint32_t start_lba);
+
+// 把一个卷挂进指定槽（**不改变**当前卷）。失败时该槽保持调用前的状态。返回 0/-1。
+// 打点：[VFS64] mount slot=<n> ok blocks=.. / mount slot=<n> FAILED reason=<..>
+int  vfs64_mount_slot64(int slot, int drive, uint32_t start_lba);
+
+// 激活某个槽（= 把"当前卷"切到这个槽）。0 = 成功；-1 = 槽号非法/该槽没挂载。
+// 打点：[VFS64] activate slot=<n> drive=<d> start=<lba> blocks=<n> version=<v>
+int  vfs64_activate_slot64(int slot);
+
+// 当前卷槽号；没有挂载任何卷时返回 -1。
+int  vfs64_current_slot64();
+
+// 系统卷槽号（C:；固定写卷用）。从未挂载/格式化过系统卷时返回 -1。
+int  vfs64_system_slot64();
+
+// 槽占用查询：1 = 该槽已挂载一个卷；0 = 空槽/槽号非法。
+int  vfs64_slot_used64(int slot);
+
+// 找一个**空槽**（不挂载、不激活）；-1 = 卷表满（调用方必须如实拒绝，不能偷偷覆盖已有卷）。
+int  vfs64_slot_alloc64();
+
+// (drive, start_lba) 那个卷在哪个槽；-1 = 没挂载过。drive64 靠它做"重扫幂等"。
+int  vfs64_slot_find64(int drive, uint32_t start_lba);
+
+// 槽的卷信息（几何 + 剩余块数，**只读**，不切换当前卷、不碰挂载状态）。
+// drive/start_lba 可传 nullptr。0 = 该槽有卷；-1 = 空槽/槽号非法。
+// 串口打印卷槽表（终端 `vol` 与自动验收用，每槽一行：used/drive/start/blocks/version/free）。
+void vfs64_slots_dump64();
+
+int  vfs64_slot_info64(int slot, int* drive, uint32_t* start_lba, Vfs64VolInfo64* out);
+
+// ---- 按槽操作（显式卷号；语义与同名旧 API 逐字一致，只是"当前卷"在调用期间临时换成 slot）----
+// 这些是**系统组件固定写系统卷**的入口：调用返回前一定把当前卷切回去（见 .cpp 的守卫实现）。
+int  vfs64_stat_on64(int slot, const char* path, uint32_t* type, uint32_t* size);
+int  vfs64_read_on64(int slot, const char* path, void* buf, int max);
+int  vfs64_write_on64(int slot, const char* path, const void* buf, int len);
+int  vfs64_mkdir_on64(int slot, const char* path);
+int  vfs64_create_on64(int slot, const char* path);
+int  vfs64_unlink_on64(int slot, const char* path);
+int  vfs64_rmdir_on64(int slot, const char* path);
+int  vfs64_ls_on64(int slot, const char* path, char names[][VFS64_LS_NAME_BUF], int max, uint32_t* sizes);
+int  vfs64_stat64_on64(int slot, const char* path, Vfs64Info64* out);
+int  vfs64_list64_on64(int slot, const char* path, Vfs64Dirent64* out, int max, uint32_t* cursor);
+int  vfs64_tree_dump64_on64(int slot, const char* path, int max_entries, int max_depth);
 
 // ==================== v3 新 API（多级路径）====================
 // 查属性（含 type/size/mtime/parent/nlink/kind/名字）。返回 0 = 找到；-1 = 不存在/非法/未挂载。

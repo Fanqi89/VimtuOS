@@ -44,13 +44,13 @@ static void log_line(const char* s) {
     dbg64_str(s);
     dbg64_nl();
 }
-static void log_skip(uint32_t lba, bool type_ef, bool esp_reason) {
+static void log_skip(uint32_t lba, const char* type, const char* reason) {
     dbg64_str("[DRV64] skip lba=");
     dbg64_dec(lba);
     dbg64_str(" type=");
-    dbg64_str(type_ef ? "0xEF" : "unknown");
+    dbg64_str(type);
     dbg64_str(" reason=");
-    dbg64_str(esp_reason ? "esp" : "no-fs");
+    dbg64_str(reason);
     dbg64_nl();
 }
 static void log_letter(const DriveInfo64& e) {
@@ -70,8 +70,11 @@ static void log_letter(const DriveInfo64& e) {
     dbg64_dec(e.total_kb);
     dbg64_str(" free_kb=");
     dbg64_dec(e.free_kb);
+    dbg64_str(" slot=");                       // ★ 多卷：这个盘符落在哪个 vfs64 卷槽
+    if (e.slot != DRV64_SLOT_NONE) dbg64_dec((uint64_t)e.slot); else dbg64_str("-");
     dbg64_nl();
 }
+
 
 // ==================== 文件系统指纹 ====================
 // VimtuFS2：magic 命中 + 过 vfs64 的超级块校验（CRC32 + 几何重算）+ 数一遍空闲块。
@@ -182,7 +185,7 @@ int drive64_scan64() {
             e.fskind = DRV64_FS_UNKNOWN;
             e.skip = DRV64_SKIP_NOFS;
             add_entry(e, nullptr);
-            log_skip(0, false, false);
+            log_skip(0, "unknown", "no-fs");
             continue;
         }
 
@@ -192,6 +195,7 @@ int drive64_scan64() {
             parts++;
             DriveInfo64 e;
             zero_bytes(&e, (uint32_t)sizeof(e));
+            e.slot = DRV64_SLOT_NONE;                          // ★ 多卷：默认没占槽（0 是合法槽号，必须显式置 NONE）
             e.present = true;
             e.disk = d;
             e.part = i + 1;
@@ -253,6 +257,33 @@ int drive64_scan64() {
         if (main_idx >= 0 && g_entry_main_count < 32) g_entry_main[g_entry_main_count++] = main_idx;
     }
 
+    // ---- ★ 多卷：给每个可浏览卷分配/复用一个 vfs64 卷槽（只读挂载：不改盘上内容）----
+    // 幂等依据：先按 (drive, start_lba) 查"是不是已经挂过" —— 系统卷在 os_boot_path 里已经
+    // 挂进 0 号槽（vfs64_mount_system64），重扫时直接用回同一个槽，不会把槽表撑爆。
+    // 槽不够 / 挂载失败：**如实降级**成不可浏览（reason=voltable-full / mount-failed），
+    // 绝不偷偷覆盖别的已挂载卷 —— 那会污染别的数据盘。
+    for (int i = 0; i < g_count; i++) {
+        DriveInfo64& e = g_entries[i];
+        if (!e.browsable) continue;
+        int slot = vfs64_slot_find64(e.disk, e.start_lba);
+        if (slot < 0) {
+            slot = vfs64_slot_alloc64();
+            if (slot < 0) {
+                e.browsable = false;
+                e.skip = DRV64_SKIP_NOSLOT;
+                log_skip(e.start_lba, "VimtuFS2", "voltable-full");
+                continue;
+            }
+            if (vfs64_mount_slot64(slot, e.disk, e.start_lba) != 0) {
+                e.browsable = false;
+                e.skip = DRV64_SKIP_NOFS;
+                log_skip(e.start_lba, "VimtuFS2", "mount-failed");
+                continue;
+            }
+        }
+        e.slot = (uint8_t)slot;
+    }
+
     // ---- 盘符分配：C: = 系统卷，其余可浏览卷 D:、E:… ----
     // 1) 首选"真正挂载的那个卷"（运行中的系统就在它上面）
     int md = -1;
@@ -307,7 +338,8 @@ int drive64_scan64() {
     for (int i = 0; i < g_count; i++) {
         if (g_entries[i].letter != 0) continue;
         const bool ty_ef = (g_entries[i].skip == DRV64_SKIP_ESP);
-        log_skip(g_entries[i].start_lba, ty_ef, ty_ef);
+        const char* ty = ty_ef ? "0xEF" : (g_entries[i].fskind == DRV64_FS_VIMTUFS2 ? "VimtuFS2" : "unknown");
+        log_skip(g_entries[i].start_lba, ty, drive64_skip_reason64(g_entries[i].skip));
     }
     return g_count;
 }
@@ -325,6 +357,94 @@ int drive64_info64(int i, DriveInfo64* out) {
         return -1;
     }
     *out = g_entries[i];
+    // ★ 多卷：可浏览条目刷新成**实时**容量/可用（走已挂载的卷槽数一遍位图；只读、不改挂载状态）。
+    // 为什么在这里做：explorer 的"此电脑"页每张卡片都读一次 info64，写盘（在 D: 上 mkdir/write）之后
+    // 立即重绘就能看到可用空间变化；反过来说容量数字永远与卷槽里的真值一致（不是开机快照）。
+    if (out->browsable && out->slot != DRV64_SLOT_NONE && out->slot < (uint8_t)VFS64_SLOT_MAX) {
+        Vfs64VolInfo64 vi;
+        if (vfs64_slot_info64((int)out->slot, nullptr, nullptr, &vi) == 0) {
+            out->total_kb = (uint64_t)vi.blocks / 2u;
+            out->free_kb = (uint64_t)vi.free_blocks / 2u;
+            out->total_known = true;
+            out->free_known = true;
+        }
+    }
+    return 0;
+}
+
+// ★ 跳过原因的稳定字符串（打点与 UI 共用）
+const char* drive64_skip_reason64(uint8_t skip) {
+    if (skip == DRV64_SKIP_ESP) return "esp";
+    if (skip == DRV64_SKIP_NOFS) return "no-fs";
+    if (skip == DRV64_SKIP_NOSLOT) return "voltable-full";
+    return "none";
+}
+
+// ★ 激活盘符对应的卷：把 vfs64 的"当前卷"切到这个盘。0 = 成功；-1 = 没这个盘符/不可浏览/没占槽。
+// 打点：[DRV64] activate letter=D: slot=1 disk=1 lba=8192 ok（失败 reason=<no-letter|not-browsable|no-slot|vfs64>）
+int drive64_activate_letter64(char letter) {
+    if (letter >= 'a' && letter <= 'z') letter = (char)(letter - 'a' + 'A');
+    const int i = drive64_by_letter64(letter);
+    char lb[3];
+    lb[0] = letter ? letter : '?';
+    lb[1] = ':';
+    lb[2] = 0;
+    if (i < 0) {
+        dbg64_str("[DRV64] activate letter=");
+        dbg64_str(lb);
+        dbg64_str(" FAILED reason=no-letter");
+        dbg64_nl();
+        return -1;
+    }
+    const DriveInfo64& e = g_entries[i];
+    // ★ 打点顺序有讲究：**先**调 vfs64_activate_slot64（它会打自己的 [VFS64] activate 行），
+    //   再打这一条完整的 [DRV64] activate 行 —— 否则两行会在串口上交错成
+    //   "[DRV64] activate letter=D: slot=1[VFS64] activate ... disk=1 lba=8192 ok"，
+    //   按行 grep 就匹配不到（实测踩过的坑）。
+    if (!e.browsable) {
+        dbg64_str("[DRV64] activate letter=");
+        dbg64_str(lb);
+        dbg64_str(" slot=");
+        if (e.slot != DRV64_SLOT_NONE) dbg64_dec((uint64_t)e.slot); else dbg64_str("-");
+        dbg64_str(" FAILED reason=not-browsable skip=");
+        dbg64_str(drive64_skip_reason64(e.skip));
+        dbg64_nl();
+        return -1;
+    }
+    if (e.slot == DRV64_SLOT_NONE || e.slot >= (uint8_t)VFS64_SLOT_MAX) {
+        dbg64_str("[DRV64] activate letter=");
+        dbg64_str(lb);
+        dbg64_str(" FAILED reason=no-slot");
+        dbg64_nl();
+        return -1;
+    }
+    const int vrc = vfs64_activate_slot64((int)e.slot);
+    dbg64_str("[DRV64] activate letter=");
+    dbg64_str(lb);
+    dbg64_str(" slot=");
+    dbg64_dec((uint64_t)e.slot);
+    if (vrc != 0) {
+        dbg64_str(" FAILED reason=vfs64");
+        dbg64_nl();
+        return -1;
+    }
+    dbg64_str(" disk=");
+    dbg64_dec((uint64_t)e.disk);
+    dbg64_str(" lba=");
+    dbg64_dec(e.start_lba);
+    dbg64_str(" ok");
+    dbg64_nl();
+    return 0;
+}
+
+// ★ 当前活动盘符 = vfs64 当前卷对应的字母；没有可浏览卷时 0
+char drive64_current_letter64() {
+    const int slot = vfs64_current_slot64();
+    if (slot < 0) return 0;
+    for (int i = 0; i < g_count; i++) {
+        if (!g_entries[i].browsable || g_entries[i].letter == 0) continue;
+        if ((int)g_entries[i].slot == slot) return g_entries[i].letter;
+    }
     return 0;
 }
 
@@ -437,6 +557,34 @@ int drive64_selftest64() {
         if (e.part > 0 && e.sectors > 0 && e.start_lba > 0x7FFFFFFFu) fails |= 32;
     }
 
+    // bit6（64）：★ 多卷槽一致性 —— 每个可浏览条目都占一个有效槽，且该槽挂的卷就是条目的
+    //   (disk, start_lba)；activate_letter64 与 current_letter64 对得上（有可浏览卷时）。
+    //   注意 bit4 已经重扫过一次，这里检查的是**重扫后**的表（也顺带证明槽复用幂等）。
+    for (int i = 0; i < g_count; i++) {
+        const DriveInfo64& e = g_entries[i];
+        if (!e.browsable) continue;
+        if (e.slot == DRV64_SLOT_NONE || e.slot >= (uint8_t)VFS64_SLOT_MAX) { fails |= 64; continue; }
+        int sd = -1;
+        uint32_t sl = 0;
+        if (vfs64_slot_info64((int)e.slot, &sd, &sl, nullptr) != 0) { fails |= 64; continue; }
+        if (sd != e.disk || sl != e.start_lba) fails |= 64;
+    }
+    if (browsable > 0) {
+        if (drive64_activate_letter64('C') != 0) fails |= 64;              // C: = 系统卷，必须能激活
+        else if (drive64_current_letter64() != 'C') fails |= 64;
+        // 有第二个可浏览卷（D:）时双向切一次（激活 -> 校验 -> 切回）
+        const int di = drive64_by_letter64('D');
+        if (di >= 0 && g_entries[di].browsable) {
+            if (drive64_activate_letter64('D') != 0) fails |= 64;
+            else if (drive64_current_letter64() != 'D') fails |= 64;
+            if (drive64_activate_letter64('C') != 0) fails |= 64;
+            else if (drive64_current_letter64() != 'C') fails |= 64;
+        }
+        // 不存在的盘符 / 不可浏览条目：必须 -1 且不崩（也不改当前盘）
+        if (drive64_activate_letter64('Z') != -1) fails |= 64;
+        if (drive64_current_letter64() != 'C') fails |= 64;
+    }
+
     dbg64_str("[DRV64] selftest ");
     if (fails == 0) {
         dbg64_str("PASS");
@@ -479,12 +627,14 @@ void drive64_dump64() {
         if (e.free_known) dbg64_dec(e.free_kb); else dbg64_str("unknown");
         dbg64_str(" vol_v=");
         if (e.vol_version) dbg64_dec(e.vol_version); else dbg64_str("-");
+        dbg64_str(" slot=");
+        if (e.slot != DRV64_SLOT_NONE) dbg64_dec((uint64_t)e.slot); else dbg64_str("-");
         dbg64_str(" browsable=");
         dbg64_str(e.browsable ? "yes" : "no");
         dbg64_str(" system=");
         dbg64_str(e.system ? "yes" : "no");
         dbg64_str(" skip=");
-        dbg64_str((e.skip == DRV64_SKIP_ESP) ? "esp" : (e.skip == DRV64_SKIP_NOFS) ? "no-fs" : "none");
+        dbg64_str(drive64_skip_reason64(e.skip));
         dbg64_nl();
     }
 }

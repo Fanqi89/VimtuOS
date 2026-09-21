@@ -371,7 +371,9 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
     {
         const int app_drive = 0;
         const uint32_t app_lba = app64_main_part_lba64(app_drive);
-        if (vfs64_mount(app_drive, app_lba) == 0) {
+        // ★ 多卷：系统卷挂进 **0 号槽**并登记成"系统卷槽"（store64/config64/update64 固定写卷的依据），
+        //   同时激活它 —— 之后 drive64_scan64 会给其余可浏览卷分配 1..3 号槽，D:/E: 就能真点进去。
+        if (vfs64_mount_system64(app_drive, app_lba) == 0) {
             // ---- 盘符/驱动器枚举 + 目录树打印（"此电脑"的数据来源；只读，不写盘）----
             // 位置讲究：必须在**挂载成功之后** —— C: 的判定依据就是"当前真正挂载的那个卷"
             // （见 kernel/drive64.h 的盘符规则）；再早调用只能退化成"按 MBR 0x07 猜"。
@@ -380,6 +382,7 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
             //   drive64_selftest64 ：盘符唯一/容量自洽/幂等（[DRV64] selftest PASS）
             //   vfs64_tree_dump64  ：有界打印目录树（多级路径 + 类型/大小/mtime 的实测证据）
             (void)drive64_scan64();
+            vfs64_slots_dump64();                                // ★ 多卷：卷槽表（每槽 drive/起始 LBA/容量）
             drive64_dump64();
             (void)drive64_selftest64();
             (void)vfs64_tree_dump64("/", 32, 4);

@@ -421,7 +421,32 @@ static void exp_scan_drives() {
 }
 
 // 目录内容刷新（游标分页扫描：完整计数 + 只缓存前 EXP_MAX_ITEMS 条）
+// ★ 多卷：先保证"当前卷"与界面盘符一致 —— 别的组件（终端 `vol C:|D:` 等）也可能切卷，
+// 目录内容必须来自界面上写着的那块盘（而不是"碰巧当前挂着的那块"）。失败就如实打点并原样列出。
+static void exp_sync_volume() {
+    if (g_mode != 1 || !g_letter) return;
+    const char cur = drive64_current_letter64();
+    if (cur == g_letter) return;
+    if (drive64_activate_letter64(g_letter) == 0) {
+        dbg64_line_begin64();
+        dbg64_str("[UI] explorer volume sync letter=");
+        char lb[3]; lb[0] = g_letter; lb[1] = ':'; lb[2] = 0;
+        dbg64_str(lb);
+        dbg64_str(" from=");
+        if (cur) { char cb[3]; cb[0] = cur; cb[1] = ':'; cb[2] = 0; dbg64_str(cb); } else dbg64_str("-");
+        dbg64_nl();
+        dbg64_line_end64();
+    } else {
+        dbg64_line_begin64();
+        dbg64_str("[UI] explorer volume sync FAILED letter=");
+        char lb[3]; lb[0] = g_letter; lb[1] = ':'; lb[2] = 0;
+        dbg64_str(lb);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+}
 static void exp_refresh_dir() {
+    exp_sync_volume();                                   // ★ 多卷：目录内容必须来自界面上的盘
     g_items = 0;
     g_sel = -1;
     if (g_scroll < 0) g_scroll = 0;
@@ -467,38 +492,73 @@ static void exp_enter_thispc() {
     if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
 }
 
-// 进入某个盘符的根目录（只有"当前挂载的卷"能进：vfs64 一次只挂一个卷）
+// 进入某个盘符的根目录：**先把这个盘对应的卷激活**（vfs64_activate_slot64），再列目录。
+// ★ 多卷：以前这里只能列"当前挂载的那个卷"（= C:），D:/E: 点进来其实还是 C: 的内容 —— 那是假的。
+// 现在盘符 -> 卷槽 -> 当前卷这条链是真的：打点 [UI] explorer enter letter=D: slot=1 ok 就是证据。
 static int exp_enter_drive_letter(char letter) {
     if (!letter) return -1;
-    for (int i = 0; i < g_drive_n; i++) {
-        if (g_drives[i].letter != letter) continue;
-        if (!g_drives[i].browsable) return -1;
-        int md = -1, lba = 0;
-        Vfs64VolInfo64 vi;
-        if (vfs64_mounted_volume64(&md, (uint32_t*)&lba, &vi) == 0) { /* 已挂载 */ }
-        g_cur_drive = g_drives[i];
-
-        g_cur_drive_ok = true;
-        g_mode = 1;
-        e_strcpy(g_path, "/", (int)sizeof(g_path));
-        g_scroll = 0;
-        exp_refresh_dir();
+    const int di = drive64_by_letter64(letter);
+    if (di < 0) {
+        exp_msg(gui64_tr("No such drive letter", "没有这个盘符"));
+        return -1;
+    }
+    DriveInfo64 d;
+    if (drive64_info64(di, &d) != 0 || !d.browsable) {
+        exp_msg(gui64_tr("This entry is not browsable", "该条目不可浏览"));
+        return -1;
+    }
+    const char* why = nullptr;
+    if (drive64_activate_letter64(letter) != 0) why = "activate";
+    if (!why) {                                          // 激活之后容量再取一次（实时值）
+        (void)drive64_info64(di, &d);
+        if (vfs64_current_slot64() != (int)d.slot) why = "slot-mismatch";
+    }
+    if (why) {
+        char lb[3];
+        lb[0] = letter; lb[1] = ':'; lb[2] = 0;
         dbg64_line_begin64();
-        dbg64_str("[UI] explorer drive letter=");
-        char l[3]; l[0] = letter; l[1] = ':'; l[2] = 0;
-        dbg64_str(l);
-        dbg64_str(" fs=");
-        dbg64_str(g_drives[i].fs);
-        dbg64_str(" total_kb=");
-        dbg64_dec(g_drives[i].total_kb);
-        dbg64_str(" free_kb=");
-        dbg64_dec(g_drives[i].free_kb);
+        dbg64_str("[UI] explorer enter letter=");
+        dbg64_str(lb);
+        dbg64_str(" slot=");
+        dbg64_dec((uint64_t)d.slot);
+        dbg64_str(" FAILED reason=");
+        dbg64_str(why);
         dbg64_nl();
         dbg64_line_end64();
-        if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
-        return 0;
+        exp_msg(gui64_tr("Cannot switch to this volume", "无法切换到该卷"));
+        return -1;
     }
-    return -1;
+
+    g_cur_drive = d;
+    g_cur_drive_ok = true;
+    g_mode = 1;
+    g_letter = letter;
+    e_strcpy(g_path, "/", (int)sizeof(g_path));
+    g_scroll = 0;
+    exp_refresh_dir();
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer enter letter=");            // ★ 多卷证据行（验收 grep）
+    char l[3]; l[0] = letter; l[1] = ':'; l[2] = 0;
+    dbg64_str(l);
+    dbg64_str(" slot=");
+    dbg64_dec((uint64_t)d.slot);
+    dbg64_str(" ok items=");
+    dbg64_dec((uint64_t)g_items);
+    dbg64_nl();
+    dbg64_line_end64();
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer drive letter=");
+    dbg64_str(l);
+    dbg64_str(" fs=");
+    dbg64_str(d.fs);
+    dbg64_str(" total_kb=");
+    dbg64_dec(d.total_kb);
+    dbg64_str(" free_kb=");
+    dbg64_dec(d.free_kb);
+    dbg64_nl();
+    dbg64_line_end64();
+    if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+    return 0;
 }
 // 导航 + 历史（push = 1 时压栈）
 static int exp_browsable_count() {
@@ -515,10 +575,28 @@ static void exp_nav_apply(const ExpNav* r) {
         g_scroll = 0;
         exp_log_thispc(g_drive_n, exp_browsable_count());   // 回到"此电脑"也要有打点（自动验收据此断言）
     } else {
+        // ★ 多卷：历史记录里的盘符可能不是当前卷 —— 先把对应的卷激活，再列目录。
+        // （此前这里只能"假设当前卷就是它"，切到 D: 后按后退/前进会列错卷；现在按盘符重新激活。）
         g_mode = 1;
         g_letter = r->letter;
+        if (r->letter) {
+            char cur = drive64_current_letter64();
+            if (cur != r->letter) {
+                if (drive64_activate_letter64(r->letter) == 0) {
+                    cur = r->letter;
+                } else {
+                    dbg64_line_begin64();
+                    dbg64_str("[UI] explorer nav volume switch FAILED letter=");
+                    char lb[3]; lb[0] = r->letter; lb[1] = ':'; lb[2] = 0;
+                    dbg64_str(lb);
+                    dbg64_nl();
+                    dbg64_line_end64();
+                }
+            }
+            const int di = drive64_by_letter64(r->letter);
+            if (di >= 0 && drive64_info64(di, &g_cur_drive) == 0) g_cur_drive_ok = true;
+        }
         e_strcpy(g_path, r->path, (int)sizeof(g_path));
-        if (g_cur_drive_ok) { /* 保持当前盘符信息（状态栏容量显示用） */ }
         g_scroll = 0;
         exp_refresh_dir();
     }
