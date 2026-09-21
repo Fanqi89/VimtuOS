@@ -80,6 +80,7 @@
 #include "ata64.h"       // disk/ata：ATA IDENTIFY（型号/容量；读取自带超时保护）
 #include "vfs64.h"       // disk：卷状态；user：盘上的 ring3 程序
 #include "drive64.h"     // vol：盘符/卷槽表（多卷：vol C:|D: = 切换当前卷）
+#include "fs64.h"        // ★ 批次 K：统一卷号 + FAT32 只读语义（ls/cat 可用，写类命令明确报"只读卷"）
 #include "fd64.h"        // 文件命令的 FD 层（32 项；多级路径 /dir/sub/name、单文件 <=67584B）
 #include "display64.h"   // display [modes|hz|edid]：模式清单 + 0x3DA 实测刷新率 + EDID 对比
 #include "usermode64.h"  // user/userprog：ring3 用户窗口地址与页映射查询
@@ -1092,7 +1093,6 @@ static bool cmd_display(TerminalState* ts, const char* sub) {
 // 限制（help 里也如实写）：**路径是多级的**（v3 目录树；单段 ≤31B、整条 ≤128B、≤16 层）、单文件 <= 67584 B、无权限；
 // rm 只能删文件（vfs64 没有删目录原语）；mkdir 的父目录固定为根；写文件是整体覆盖 + 立刻落盘。
 
-// ls / dir：列 VimtuFS2 根目录 + 大小（目录句柄走 fd64_opendir/readdir，真路径）
 static void cmd_ls(TerminalState* ts) {
     // 只用目录句柄列一次（fd64 内部把这次扫描缓存进句柄；不再额外做一次 vfs64_ls +
     // 每个条目一次 stat —— 那在真机上是秒级 I/O，会把 GUI 看门狗饿到）。
@@ -1104,7 +1104,9 @@ static void cmd_ls(TerminalState* ts) {
         dbg64_line_end64();
         return;
     }
-    ts_puts(ts, "VimtuFS2 / (FD layer, multi-level paths; this lists the volume root):\n");
+    ts_puts(ts, fs64_is_readonly64(-1)
+                 ? "current volume (FAT32, read-only; root of the volume):\n"
+                 : "current volume (VimtuFS2; multi-level paths; this lists the volume root):\n");
     int rows = 0;
     uint64_t bytes = 0;
     for (;;) {
@@ -1167,6 +1169,72 @@ static bool cmd_cat(TerminalState* ts, const char* name) {
     dbg64_line_end64();
     return true;
 }
+// fatcheck [PATH]：把当前卷上的文件按块读一遍算 CRC32（IEEE，zlib 同多项式），串口打
+//   [FAT64] crc path=<p> size=<n> crc32=<HEX8>
+// 不带参数时核对 ESP 的三个文件（EFI/BOOT/BOOTX64.EFI、UEFI64.BIN、KERNEL64.BIN）——
+// 自动验收拿宿主侧对 build64/ 构建产物算的同一个 CRC 逐项比对（最强证据：读出来的字节一致）。
+// 只读：不写盘；CRC32 用逐位实现（内核无表/无 SSE）。
+static bool cmd_fatcheck(TerminalState* ts, const char* arg) {
+    static const char* fixed[3] = { "EFI/BOOT/BOOTX64.EFI", "UEFI64.BIN", "KERNEL64.BIN" };
+    const char* one = (arg && arg[0]) ? arg : nullptr;
+    ts_puts(ts, "fatcheck (read-only CRC32 of the current volume; byte-for-byte vs build64/):\n");
+    // ★ 大文件（4MB 的 KERNEL64.BIN）按簇链读要几十次 PIO —— 会超过 5 秒心跳阈值：
+    //   与 ping 一样暂停看门狗（不是 bug，是长操作）。
+    panic64_watchdog_pause64();
+    int checked = 0, failed = 0;
+    for (int k = 0; k < (one ? 1 : 3); k++) {
+        const char* p = one ? one : fixed[k];
+        char path[FD64_PATH_MAX];
+        int pl = 0;
+        if (p[0] != '/' && pl < (int)sizeof(path) - 1) path[pl++] = '/';
+        for (int i = 0; p[i] && pl < (int)sizeof(path) - 1; i++) path[pl++] = p[i];
+        path[pl] = 0;
+        uint32_t size = 0;
+        const uint32_t crc = fs64_crc32_file64(-1, path, &size, FAT64_READ_MAX_BYTES);
+        ts_puts(ts, "  ");
+        ts_puts_pad(ts, path, 24);
+        if (crc == 0) {
+            ts_puts(ts, "  MISSING / too large (no CRC)\n");
+            dbg64_line_begin64();
+            dbg64_str("[FAT64] crc path=");
+            dbg64_str(path);
+            dbg64_str(" size=0 crc32=00000000 (missing)");
+            dbg64_nl();
+            dbg64_line_end64();
+            failed++;
+            continue;
+        }
+        ts_puts(ts, "  size=");
+        ts_put_u64(ts, (uint64_t)size);
+        ts_puts(ts, "  crc32=0x");
+        {
+            static const char* H = "0123456789ABCDEF";
+            char hx[9];
+            for (int i = 0; i < 8; i++) hx[i] = H[(crc >> ((7 - i) * 4)) & 0xF];
+            hx[8] = 0;
+            ts_puts(ts, hx);
+        }
+        ts_putc(ts, (uint32_t)'\n');
+        dbg64_line_begin64();
+        dbg64_str("[FAT64] crc path=");
+        dbg64_str(path);
+        dbg64_str(" size=");
+        dbg64_dec((uint64_t)size);
+        dbg64_str(" crc32=");
+        dbg64_hex64((uint64_t)crc);
+        dbg64_nl();
+        dbg64_line_end64();
+        checked++;
+    }
+    ts_puts(ts, "  checked=");
+    ts_put_u64(ts, (uint64_t)checked);
+    ts_puts(ts, " failed=");
+    ts_put_u64(ts, (uint64_t)failed);
+    panic64_watchdog_unpause64();
+    return failed == 0;
+    return failed == 0;
+}
+
 
 // write FILE TEXT（整体覆盖；单文件上限 67584 B，超了 fd64 会如实拒绝）
 static bool cmd_write(TerminalState* ts, const char* name, const char* text) {
@@ -1178,13 +1246,18 @@ static bool cmd_write(TerminalState* ts, const char* name, const char* text) {
         ts_puts(ts, "write: bad path (multi-level /dir/sub/name, <=128 B, <=16 segments)\n");
         return false;
     }
+    // ★ 批次 K：只读卷（FAT32）上写类命令**明确报"只读卷"**（fd64 也会拒，这里是给用户看清楚）
+    if (fs64_is_readonly64(-1)) {
+        ts_puts(ts, "write: read-only volume (FAT32): writing is not implemented (see [FS64] reject on serial)\\n");
+        return false;
+    }
     const int len = st_len(text);
     if (len > (int)FD64_FILE_MAX) {
-        ts_puts(ts, "write: too large (single file limit 67584 B)\n");
+        ts_puts(ts, "write: too large (single file limit 67584 B)\\n");
         return false;
     }
     const int fd = fd64_open64(g_pathbuf, FD64_O_WRONLY | FD64_O_CREAT | FD64_O_TRUNC);
-    if (fd < 3) { ts_puts(ts, "write: cannot open (no volume / bad path)\n"); return false; }
+    if (fd < 3) { ts_puts(ts, "write: cannot open (no volume / bad path)\\n"); return false; }
     const int w = fd64_write64(fd, text, len);
     (void)fd64_close64(fd);
     if (w < 0) { ts_puts(ts, "write: failed (no space / single file limit 67584 B)\n"); return false; }
@@ -1199,12 +1272,16 @@ static bool cmd_write(TerminalState* ts, const char* name, const char* text) {
 // touch FILE：不存在就建空文件（真落盘）
 static bool cmd_touch(TerminalState* ts, const char* name) {
     if (!name || !name[0]) { ts_puts(ts, "touch: usage: touch FILE\n"); return false; }
+    if (fs64_is_readonly64(-1)) {           // ★ 批次 K：只读卷（FAT32）上不能建文件
+        ts_puts(ts, "touch: read-only volume (FAT32)\n");
+        return false;
+    }
     if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
         ts_puts(ts, "touch: bad path (multi-level /dir/sub/name, <=128 B, <=16 segments)\n");
         return false;
     }
-    uint32_t ty = 0, sz = 0;
-    const bool exists = (vfs64_stat(g_pathbuf, &ty, &sz) == 0);
+    Fs64Stat64 st;
+    const bool exists = (fs64_stat64(-1, g_pathbuf, &st) == 0);
     const int fd = fd64_open64(g_pathbuf, FD64_O_WRONLY | FD64_O_CREAT);
     if (fd < 3) { ts_puts(ts, "touch: failed (no volume / bad path)\n"); return false; }
     (void)fd64_close64(fd);
@@ -1214,28 +1291,32 @@ static bool cmd_touch(TerminalState* ts, const char* name) {
     return true;
 }
 
-// rm / del FILE：真删（vfs64_unlink；目录会被拒绝并如实说明）
+// rm / del FILE：真删（fs64_unlink；目录会被拒绝并如实说明；FAT 卷明确报"只读卷"）
 static bool cmd_rm(TerminalState* ts, const char* name) {
     if (!name || !name[0]) { ts_puts(ts, "rm: usage: rm FILE\n"); return false; }
+    if (fs64_is_readonly64(-1)) {           // ★ 批次 K
+        ts_puts(ts, "rm: read-only volume (FAT32): deleting is not implemented\n");
+        return false;
+    }
     if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
         ts_puts(ts, "rm: bad path (multi-level /dir/sub/name, <=128 B, <=16 segments)\n");
         return false;
     }
-    uint32_t ty = 0, sz = 0;
-    if (vfs64_stat(g_pathbuf, &ty, &sz) != 0) {
+    Fs64Stat64 st;
+    if (fs64_stat64(-1, g_pathbuf, &st) != 0) {
         ts_puts(ts, "rm: no such file: ");
         ts_puts(ts, g_pathbuf);
         ts_putc(ts, (uint32_t)'\n');
         return false;
     }
-    if (ty == VFS64_TYPE_DIR) {
+    if (st.type == VFS64_TYPE_DIR) {
         ts_puts(ts, "rm: ");
         ts_puts(ts, g_pathbuf);
-        ts_puts(ts, " is a directory (vfs64 has no rmdir: deleting directories is not supported)\n");
+        ts_puts(ts, " is a directory (deleting directories is not supported here)\n");
         return false;
     }
-    if (vfs64_unlink(g_pathbuf) != 0) {
-        ts_puts(ts, "rm: failed (see serial log for the VFS64 reason)\n");
+    if (fs64_unlink64(-1, g_pathbuf) != 0) {
+        ts_puts(ts, "rm: failed (see serial log for the reason)\n");
         return false;
     }
     ts_puts(ts, "removed ");
@@ -1244,20 +1325,24 @@ static bool cmd_rm(TerminalState* ts, const char* name) {
     return true;
 }
 
-// mkdir DIR：vfs64_mkdir（阶段一：父目录固定为根，单层）
+// mkdir DIR：fs64_mkdir（多级，父目录必须存在；FAT 卷明确报"只读卷"）
 static bool cmd_mkdir(TerminalState* ts, const char* name) {
     if (!name || !name[0]) { ts_puts(ts, "mkdir: usage: mkdir DIR\n"); return false; }
+    if (fs64_is_readonly64(-1)) {           // ★ 批次 K
+        ts_puts(ts, "mkdir: read-only volume (FAT32): creating folders is not implemented\n");
+        return false;
+    }
     if (fd64_norm_path64(name, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
         ts_puts(ts, "mkdir: bad path (multi-level /dir/sub/name, parent must exist)\n");
         return false;
     }
-    uint32_t ty = 0, sz = 0;
-    if (vfs64_stat(g_pathbuf, &ty, &sz) == 0) {
-        if (ty == VFS64_TYPE_DIR) { ts_puts(ts, "mkdir: exists "); ts_puts(ts, g_pathbuf); ts_putc(ts, (uint32_t)'\n'); return true; }
+    Fs64Stat64 st;
+    if (fs64_stat64(-1, g_pathbuf, &st) == 0) {
+        if (st.type == VFS64_TYPE_DIR) { ts_puts(ts, "mkdir: exists "); ts_puts(ts, g_pathbuf); ts_putc(ts, (uint32_t)'\n'); return true; }
         ts_puts(ts, "mkdir: path exists and is a file\n");
         return false;
     }
-    if (vfs64_mkdir(g_pathbuf) != 0) { ts_puts(ts, "mkdir: failed (see serial log)\n"); return false; }
+    if (fs64_mkdir64(-1, g_pathbuf) != 0) { ts_puts(ts, "mkdir: failed (see serial log)\n"); return false; }
     ts_puts(ts, "created directory ");
     ts_puts(ts, g_pathbuf);
     ts_putc(ts, (uint32_t)'\n');
@@ -1381,7 +1466,11 @@ static bool cmd_vol(TerminalState* ts, const char* arg) {
         const int di = drive64_by_letter64(letter);
         DriveInfo64 d;
         int slot = -1;
-        if (di >= 0 && drive64_info64(di, &d) == 0) slot = (int)d.slot;
+        bool ro = false;
+        if (di >= 0 && drive64_info64(di, &d) == 0) {
+            ro = d.readonly ? true : false;
+            slot = (d.fskind == DRV64_FS_FAT32) ? -1 : (int)d.slot;   // FAT 卷不占 vfs64 槽（打点写 '-'）
+        }
         const int rc = drive64_activate_letter64(letter);
         char lb[3]; lb[0] = letter; lb[1] = ':'; lb[2] = 0;
         if (rc == 0) {
@@ -1389,6 +1478,7 @@ static bool cmd_vol(TerminalState* ts, const char* arg) {
             ts_puts(ts, lb);
             ts_puts(ts, "  slot=");
             ts_put_u64(ts, (uint64_t)(slot < 0 ? 0 : slot));
+            if (ro) ts_puts(ts, "  ro=1 (FAT32 read-only)");
             ts_puts(ts, "  (ls/cat/write/mkdir/rm/run now act on this volume)\n");
         } else {
             ts_puts(ts, "vol: cannot switch to ");
@@ -1410,7 +1500,7 @@ static bool cmd_vol(TerminalState* ts, const char* arg) {
     const int dn = drive64_count64();
     const char cur = drive64_current_letter64();
     int n = 0;
-    ts_puts(ts, "volumes (vfs64 slots -> drive letters):\n");
+    ts_puts(ts, "volumes (unified volume table -> drive letters; ro=1 = read-only FAT32):\n");
     for (int i = 0; i < dn; i++) {
         DriveInfo64 d;
         if (drive64_info64(i, &d) != 0 || !d.present) continue;
@@ -1420,19 +1510,34 @@ static bool cmd_vol(TerminalState* ts, const char* arg) {
             ts_puts(ts, (cur == d.letter) ? "* " : "  ");
             ts_puts_pad(ts, l, 4);
             ts_puts(ts, "slot=");
-            ts_put_u64(ts, (uint64_t)d.slot);
+            ts_put_u64(ts, (d.fskind == DRV64_FS_FAT32) ? (uint64_t)d.vol : (uint64_t)d.slot);
             ts_puts(ts, " fs=");
             ts_puts(ts, d.fs);
             ts_puts(ts, " total_kb=");
             ts_put_u64(ts, d.total_kb);
             ts_puts(ts, " free_kb=");
             ts_put_u64(ts, d.free_kb);
+            if (d.readonly) ts_puts(ts, " ro");
             ts_puts(ts, d.system ? " system" : "");
             ts_puts(ts, " disk=");
             ts_put_u64(ts, (uint64_t)d.disk);
             ts_puts(ts, " lba=");
             ts_put_u64(ts, d.start_lba);
             ts_putc(ts, (uint32_t)'\n');
+            dbg64_line_begin64();                       // ★ 批次 K：串口证据行（含 ro）
+            dbg64_str("[VOL] vol letter=");
+            char lb[3]; lb[0] = d.letter; lb[1] = ':'; lb[2] = 0;
+            dbg64_str(lb);
+            dbg64_str(" fs=");
+            dbg64_str(d.fs);
+            dbg64_str(" ro=");
+            dbg64_dec(d.readonly ? 1 : 0);
+            dbg64_str(" total_kb=");
+            dbg64_dec(d.total_kb);
+            dbg64_str(" free_kb=");
+            dbg64_dec(d.free_kb);
+            dbg64_nl();
+            dbg64_line_end64();
             n++;
         } else {
             ts_puts(ts, "  --  (no letter) fs=");
@@ -2623,6 +2728,9 @@ static void shell_exec(TerminalState* ts, const char* line) {
         cmd_ls(ts);
     } else if (st_eq(g_cmd, "cat")) {
         ok = cmd_cat(ts, g_arg1);
+    } else if (st_eq(g_cmd, "fatcheck")) {
+        // ★ 批次 K：只读 CRC32 校验（默认核对 ESP 的三个文件；用于"读出来的字节与构建产物一致"的可执行证据）
+        ok = cmd_fatcheck(ts, g_arg1);
     } else if (st_eq(g_cmd, "write") || st_eq(g_cmd, "save")) {
         ok = cmd_write(ts, g_arg1, args2);
     } else if (st_eq(g_cmd, "touch")) {

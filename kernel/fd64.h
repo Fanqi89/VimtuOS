@@ -79,6 +79,7 @@
 #define FD64_ENOSPC  28
 #define FD64_EPERM   1
 #define FD64_EAGAIN  11
+#define FD64_EROFS   30   // ★ 只读文件系统（FAT32 卷：打开写模式一律被拒）
 
 // 路径规范化：接受 "/dir/sub/name" 与 "dir/sub/name"（相对路径 = 从根开始）；折叠连续的 '/'、
 // 去掉结尾 '/'、去前导空白；".." **原样保留**（父目录语义由 vfs64 负责）；拒绝空串、'/'、控制字符、超长。
@@ -99,10 +100,12 @@ uint32_t   fd64_table_used64(const FdTable64* t);    // 已占用槽位数
 uint64_t   fd64_object_id64(int fd);                 // 该 fd 指向的 OpenFile64 标识（0 = 无效）
 
 // 文件句柄（fd >= 3）。错误一律返回负 errno。
-// ★ 多卷：按**显式卷槽**打开（-1 = 当前没有卷，行为与"没挂载"一致）。之后这个 fd 的读/写/stat/
-// 目录枚举都锁定在打开的卷槽上 —— 用户切盘不会让已打开的 fd 读到另一块盘的同名文件。
-// 默认 fd64_open64 就是 fd64_open_on64(vfs64_current_slot64(), ...) 的包装（行为不变）。
-int fd64_open_on64(int slot, const char* path, uint32_t flags);
+// ★ 多卷（批次 K 起统一走 fs64）：vol = **统一卷号**（0..3 = VimtuFS2 卷槽、>=4 = FAT 卷；
+// -1 = 当前卷）。之后这个 fd 的读/写/stat/目录枚举都锁定在打开的卷上 —— 用户切盘不会
+// 让已打开的 fd 读到另一块盘的同名文件。**只读卷（FAT32）上带写意图的打开直接
+// 返回 -FD64_EROFS**（打点 [FD64] open FAILED ... ro=1），不会创建/截断任何文件。
+// 默认 fd64_open64 就是 fd64_open_on64(fs64_current_vol64(), ...) 的包装。
+int fd64_open_on64(int vol, const char* path, uint32_t flags);
 int fd64_open64(const char* path, uint32_t flags);
 int fd64_close64(int fd);
 int fd64_read64(int fd, void* buf, int len);

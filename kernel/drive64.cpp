@@ -12,7 +12,9 @@
 #include "debug64.h"
 #include "ata64.h"
 #include "vfs64.h"
-#include "part64.h"          // 只为常量/struct（PART_MAIN_LBA / PartInfo）；**不调用** part64 的函数
+#include "fat64.h"
+#include "fs64.h"          // ★ 批次 K：统一卷表/只读语义（FAT32 的挂载与写拒绝都在这一层）
+#include "part64.h"        // 只为常量/struct（PART_MAIN_LBA / PartInfo）；**不调用** part64 的函数
 
 // ==================== 小工具 ====================
 static void zero_bytes(void* p, uint32_t n) {
@@ -72,6 +74,11 @@ static void log_letter(const DriveInfo64& e) {
     dbg64_dec(e.free_kb);
     dbg64_str(" slot=");                       // ★ 多卷：这个盘符落在哪个 vfs64 卷槽
     if (e.slot != DRV64_SLOT_NONE) dbg64_dec((uint64_t)e.slot); else dbg64_str("-");
+    if (e.readonly) dbg64_str(" ro=1");        // ★ 批次 K：FAT32 卷一律只读
+    if (e.fatvol != DRV64_SLOT_NONE) {
+        dbg64_str(" fatvol=");
+        dbg64_dec((uint64_t)e.fatvol);
+    }
     dbg64_nl();
 }
 
@@ -89,26 +96,13 @@ static bool fs_vimtu_probe(int disk, uint32_t start_lba, bool* present_magic, Vf
     *present_magic = true;
     return (vfs64_probe_volume64(disk, start_lba, info) == 0);
 }
-// FAT（12/16/32）：合法 BPB 指纹。*out_kind = DRV64_FS_FAT*/UNKNOWN，*out_total_kb = BPB 里的总扇区数/2。
-static uint8_t fs_fat_probe(int disk, uint32_t start_lba, uint64_t* out_total_kb) {
-    *out_total_kb = 0;
-    if (!ata64_read(disk, start_lba, 1, g_sec)) return DRV64_FS_UNKNOWN;
-    if (g_sec[510] != 0x55 || g_sec[511] != 0xAA) return DRV64_FS_UNKNOWN;
-    const uint8_t jmp = g_sec[0];
-    if (!(jmp == 0xEB || jmp == 0xE9)) return DRV64_FS_UNKNOWN;
-    uint32_t total = rd16(g_sec + 19);                  // BPB：小卷的总扇区数（16 位）
-    const uint32_t total32 = rd32(g_sec + 32);          // BPB：总扇区数（32 位）
-    if (total == 0) total = total32;
-    const uint8_t spc = g_sec[13];                      // 每簇扇区数（必须 2 的幂且非 0）
-    if (spc == 0 || (spc & (spc - 1)) != 0) return DRV64_FS_UNKNOWN;
-    if (out_total_kb && total) *out_total_kb = (uint64_t)total / 2u;
-    // FAT32 的指纹：偏移 82 = "FAT32   "（FAT12/16 用偏移 54 的 "FAT"）
-    static const char f32[8] = { 'F','A','T','3','2',' ',' ',' ' };
-    bool is32 = true;
-    for (uint32_t i = 0; i < 8; i++) if (g_sec[82 + i] != (uint8_t)f32[i]) { is32 = false; break; }
-    if (is32) return DRV64_FS_FAT32;
-    if (g_sec[54] == 'F' && g_sec[55] == 'A' && g_sec[56] == 'T') return DRV64_FS_FAT12_16;
-    return DRV64_FS_UNKNOWN;
+// FAT（12/16/32）：走 fat64 的**只读 BPB 探测**（与读取器同一份校验：512B 扇区、SPC 2 的幂、
+// FATSz16/32 互斥、簇数判类型）。*out_type = FAT64_TYPE_*（0 = 不是 FAT）；*out = 完整几何。
+// ★ 这里同时把"实际类型"（FAT12/16/32）算出来了：< 4085 簇 = FAT12、4085..65524 = FAT16、
+//   >= 65525 = FAT32 —— 只有 FAT32 才继续挂载浏览（FAT12/16 的簇链项位宽不同，本批不做）。
+static bool fs_fat_probe(int disk, uint32_t start_lba, Fat64Info64* out) {
+    if (!out) return false;
+    return (fat64_probe64(disk, start_lba, out) == 0);
 }
 
 // ==================== 扫描 ====================
@@ -196,6 +190,8 @@ int drive64_scan64() {
             DriveInfo64 e;
             zero_bytes(&e, (uint32_t)sizeof(e));
             e.slot = DRV64_SLOT_NONE;                          // ★ 多卷：默认没占槽（0 是合法槽号，必须显式置 NONE）
+            e.fatvol = DRV64_SLOT_NONE;                        // ★ FAT：默认没有 fat64 卷号
+            e.vol = -1;                                        // ★ fs64 统一卷号：没有
             e.present = true;
             e.disk = d;
             e.part = i + 1;
@@ -206,8 +202,8 @@ int drive64_scan64() {
             bool magic = false;
             Vfs64VolInfo64 vi;
             const bool vimtu_ok = fs_vimtu_probe(d, p[i].start, &magic, &vi);
-            uint64_t fat_total_kb = 0;
-            const uint8_t fat_kind = vimtu_ok ? DRV64_FS_UNKNOWN : fs_fat_probe(d, p[i].start, &fat_total_kb);
+            Fat64Info64 fi;
+            const bool fat_ok = (!vimtu_ok && fs_fat_probe(d, p[i].start, &fi));
 
             if (vimtu_ok) {
                 fs_recognized++;
@@ -221,28 +217,49 @@ int drive64_scan64() {
                 e.total_kb = (uint64_t)vi.blocks / 2u;              // 512B/块 -> KB
                 e.free_kb = (uint64_t)vi.free_blocks / 2u;
                 e.skip = DRV64_SKIP_NONE;
-            } else if (p[i].type == 0xEF) {
-                // EFI 系统分区（或 P1 那个 0xEF 引导区）：不浏览、不分配盘符
-                e.fskind = (fat_kind == DRV64_FS_FAT32) ? DRV64_FS_FAT32 :
-                           (fat_kind == DRV64_FS_FAT12_16) ? DRV64_FS_FAT12_16 : DRV64_FS_UNKNOWN;
-                if (e.fskind == DRV64_FS_FAT32) { fs_recognized++; copy_str(e.fs, DRV64_FS_MAX, "FAT32"); }
-                else if (e.fskind == DRV64_FS_FAT12_16) { fs_recognized++; copy_str(e.fs, DRV64_FS_MAX, "FAT16"); }
-                copy_str(e.name, DRV64_NAME_MAX, "EFI 系统分区");
-                e.total_known = (fat_total_kb != 0);
-                e.total_kb = fat_total_kb;
-                e.free_known = false;                               // FAT 的可用空间要读 FSInfo/FAT：没做
-                e.browsable = false;
-                e.skip = DRV64_SKIP_ESP;
-            } else if (fat_kind != DRV64_FS_UNKNOWN) {
+            } else if (fat_ok && fi.fat_type == FAT64_TYPE_32) {
+                // ★ 批次 K：真 FAT32（簇数 >= 65525）= 可浏览的**只读**卷（ESP / U 盘 / 数据分区）。
+                // 挂载（读 BPB + 两份 FAT 校验 + FSInfo 快照）由 fs64 统一做；失败则如实降级成不浏览。
                 fs_recognized++;
-                e.fskind = fat_kind;
-                copy_str(e.fs, DRV64_FS_MAX, (fat_kind == DRV64_FS_FAT32) ? "FAT32" : "FAT16");
-                copy_str(e.name, DRV64_NAME_MAX, "FAT 卷（只读识别，未实现浏览）");
-                e.total_known = (fat_total_kb != 0);
-                e.total_kb = fat_total_kb;
+                Fs64Vol64 fv;
+                const int fvol = fs64_mount_fat64(d, p[i].start, &fv);
+                if (fvol >= 0) {
+                    e.fskind = DRV64_FS_FAT32;
+                    copy_str(e.fs, DRV64_FS_MAX, "FAT32");
+                    copy_str(e.name, DRV64_NAME_MAX, (p[i].type == 0xEF) ? "EFI 系统分区" : "FAT32 卷");
+                    e.browsable = true;
+                    e.readonly = true;
+                    e.vol = fvol;
+                    e.fatvol = (uint8_t)(fvol - FS64_VOL_FAT_BASE);
+                    e.total_known = fv.total_known ? true : false;
+                    e.free_known = fv.free_known ? true : false;
+                    e.total_kb = fv.total_kb;
+                    e.free_kb = fv.free_kb;
+                    e.skip = DRV64_SKIP_NONE;
+                } else {
+                    e.fskind = DRV64_FS_FAT32;
+                    copy_str(e.fs, DRV64_FS_MAX, "FAT32(挂载失败)");
+                    copy_str(e.name, DRV64_NAME_MAX, "FAT32 卷（挂载失败）");
+                    e.browsable = false;
+                    e.skip = (p[i].type == 0xEF) ? DRV64_SKIP_ESP : DRV64_SKIP_NOFS;
+                }
+            } else if (fat_ok) {
+                // FAT12/16：认出来了，但本批只浏览 FAT32（簇链项位宽不同）——如实标注、不分配盘符
+                fs_recognized++;
+                e.fskind = DRV64_FS_FAT12_16;
+                copy_str(e.fs, DRV64_FS_MAX, (fi.fat_type == FAT64_TYPE_16) ? "FAT16" : "FAT12");
+                copy_str(e.name, DRV64_NAME_MAX, "FAT 卷（FAT12/16：本批不浏览）");
+                e.total_known = true;
+                e.total_kb = ((uint64_t)fi.clusters * fi.cluster_bytes) / 1024u;
                 e.free_known = false;
                 e.browsable = false;
-                e.skip = DRV64_SKIP_NOFS;
+                e.skip = (p[i].type == 0xEF) ? DRV64_SKIP_ESP : DRV64_SKIP_NOFS;
+            } else if (p[i].type == 0xEF) {
+                // 0xEF 但不是合法 FAT32（例如 P1 那个装 loader64 的引导区）：保持旧行为（skip reason=esp）
+                copy_str(e.fs, DRV64_FS_MAX, "unknown");
+                copy_str(e.name, DRV64_NAME_MAX, "EFI 系统分区");
+                e.browsable = false;
+                e.skip = DRV64_SKIP_ESP;
             } else {
                 copy_str(e.fs, DRV64_FS_MAX, magic ? "VimtuFS2(坏卷)" : "unknown");
                 copy_str(e.name, DRV64_NAME_MAX, magic ? "VimtuFS2 卷（超级块校验未通过）" : "未识别分区");
@@ -265,6 +282,8 @@ int drive64_scan64() {
     for (int i = 0; i < g_count; i++) {
         DriveInfo64& e = g_entries[i];
         if (!e.browsable) continue;
+        // ★ 批次 K：FAT32 卷的挂载已经由 fs64_mount_fat64 做成（统一卷号在 e.vol），不占 vfs64 槽
+        if (e.fskind != DRV64_FS_VIMTUFS2) continue;
         int slot = vfs64_slot_find64(e.disk, e.start_lba);
         if (slot < 0) {
             slot = vfs64_slot_alloc64();
@@ -282,6 +301,7 @@ int drive64_scan64() {
             }
         }
         e.slot = (uint8_t)slot;
+        e.vol = (int)slot;                                    // ★ 统一卷号：VimtuFS2 = 槽号
     }
 
     // ---- 盘符分配：C: = 系统卷，其余可浏览卷 D:、E:… ----
@@ -290,7 +310,7 @@ int drive64_scan64() {
     uint32_t ml = 0;
     if (vfs64_mounted_volume64(&md, &ml, nullptr) == 0) {
         for (int i = 0; i < g_count; i++) {
-            if (!g_entries[i].browsable) continue;
+            if (!g_entries[i].browsable || g_entries[i].fskind != DRV64_FS_VIMTUFS2) continue;
             if (g_entries[i].disk != md || g_entries[i].start_lba != ml) continue;
             sys_letter_idx = i;
             break;
@@ -357,16 +377,17 @@ int drive64_info64(int i, DriveInfo64* out) {
         return -1;
     }
     *out = g_entries[i];
-    // ★ 多卷：可浏览条目刷新成**实时**容量/可用（走已挂载的卷槽数一遍位图；只读、不改挂载状态）。
+    // ★ 多卷：可浏览条目刷新成**实时**容量/可用（VimtuFS2 位图实时；FAT32 是挂载时的 FSInfo 快照）。
     // 为什么在这里做：explorer 的"此电脑"页每张卡片都读一次 info64，写盘（在 D: 上 mkdir/write）之后
-    // 立即重绘就能看到可用空间变化；反过来说容量数字永远与卷槽里的真值一致（不是开机快照）。
-    if (out->browsable && out->slot != DRV64_SLOT_NONE && out->slot < (uint8_t)VFS64_SLOT_MAX) {
-        Vfs64VolInfo64 vi;
-        if (vfs64_slot_info64((int)out->slot, nullptr, nullptr, &vi) == 0) {
-            out->total_kb = (uint64_t)vi.blocks / 2u;
-            out->free_kb = (uint64_t)vi.free_blocks / 2u;
-            out->total_known = true;
-            out->free_known = true;
+    // 立即重绘就能看到可用空间变化；FAT 卷只读，数字不会变，但字段仍与统一卷表一致（fs64 一处口径）。
+    if (out->browsable && out->vol >= 0) {
+        Fs64Vol64 fv;
+        if (fs64_vol_info64(out->vol, &fv) == 0) {
+            out->total_kb = fv.total_kb;
+            out->free_kb = fv.free_kb;
+            out->total_known = fv.total_known ? true : false;
+            out->free_known = fv.free_known ? true : false;
+            out->readonly = fv.readonly ? true : false;
         }
     }
     return 0;
@@ -411,20 +432,27 @@ int drive64_activate_letter64(char letter) {
         dbg64_nl();
         return -1;
     }
-    if (e.slot == DRV64_SLOT_NONE || e.slot >= (uint8_t)VFS64_SLOT_MAX) {
+    if (e.vol < 0) {
         dbg64_str("[DRV64] activate letter=");
         dbg64_str(lb);
-        dbg64_str(" FAILED reason=no-slot");
+        dbg64_str(" FAILED reason=no-volume");
         dbg64_nl();
         return -1;
     }
-    const int vrc = vfs64_activate_slot64((int)e.slot);
+    // ★ 批次 K：激活统一卷（VimtuFS2 走 vfs64_activate_slot64、FAT32 走 fs64 的只读卷表），
+    //   调用顺序不变（先切卷、后打这条完整行，避免两行在串口上交错）。
+    const int vrc = fs64_activate64((int)e.vol);
     dbg64_str("[DRV64] activate letter=");
     dbg64_str(lb);
-    dbg64_str(" slot=");
-    dbg64_dec((uint64_t)e.slot);
+    if (e.fskind == DRV64_FS_FAT32) {
+        dbg64_str(" fatvol=");
+        dbg64_dec((uint64_t)e.fatvol);
+    } else {
+        dbg64_str(" slot=");
+        dbg64_dec((uint64_t)e.slot);
+    }
     if (vrc != 0) {
-        dbg64_str(" FAILED reason=vfs64");
+        dbg64_str(" FAILED reason=fs64");
         dbg64_nl();
         return -1;
     }
@@ -437,13 +465,13 @@ int drive64_activate_letter64(char letter) {
     return 0;
 }
 
-// ★ 当前活动盘符 = vfs64 当前卷对应的字母；没有可浏览卷时 0
+// ★ 当前活动盘符 = 统一卷表里的当前卷（fs64）对应的字母；没有可浏览卷时 0
 char drive64_current_letter64() {
-    const int slot = vfs64_current_slot64();
-    if (slot < 0) return 0;
+    const int cur = fs64_current_vol64();
+    if (cur < 0) return 0;
     for (int i = 0; i < g_count; i++) {
         if (!g_entries[i].browsable || g_entries[i].letter == 0) continue;
-        if ((int)g_entries[i].slot == slot) return g_entries[i].letter;
+        if (g_entries[i].vol == cur) return g_entries[i].letter;
     }
     return 0;
 }
@@ -485,12 +513,14 @@ int drive64_selftest64() {
         if (ci >= 0) fails |= 1;
     }
 
-    // bit1：可浏览条目的容量自洽
+    // bit1：可浏览条目的容量自洽（FAT32：total 必须有；free 允许"未知"（FSInfo 无效），只读卷不虚构数字）
     for (int i = 0; i < g_count; i++) {
         const DriveInfo64& e = g_entries[i];
         if (!e.browsable) continue;
-        if (!e.total_known || !e.free_known) { fails |= 2; continue; }
-        if (e.total_kb == 0 || e.free_kb > e.total_kb) fails |= 2;
+        if (!e.total_known) { fails |= 2; continue; }
+        if (e.total_kb == 0) { fails |= 2; continue; }
+        if (!e.free_known) { if (e.fskind != DRV64_FS_FAT32) fails |= 2; continue; }
+        if (e.free_kb > e.total_kb) fails |= 2;
     }
 
     // bit2：盘符唯一 + 从 C 起连续；被跳过的条目没有盘符
@@ -559,15 +589,24 @@ int drive64_selftest64() {
 
     // bit6（64）：★ 多卷槽一致性 —— 每个可浏览条目都占一个有效槽，且该槽挂的卷就是条目的
     //   (disk, start_lba)；activate_letter64 与 current_letter64 对得上（有可浏览卷时）。
-    //   注意 bit4 已经重扫过一次，这里检查的是**重扫后**的表（也顺带证明槽复用幂等）。
     for (int i = 0; i < g_count; i++) {
         const DriveInfo64& e = g_entries[i];
         if (!e.browsable) continue;
-        if (e.slot == DRV64_SLOT_NONE || e.slot >= (uint8_t)VFS64_SLOT_MAX) { fails |= 64; continue; }
-        int sd = -1;
-        uint32_t sl = 0;
-        if (vfs64_slot_info64((int)e.slot, &sd, &sl, nullptr) != 0) { fails |= 64; continue; }
-        if (sd != e.disk || sl != e.start_lba) fails |= 64;
+        if (e.vol < 0) { fails |= 64; continue; }
+        if (e.fskind == DRV64_FS_FAT32) {
+            // FAT32：统一卷号必须落在 FAT 区间，且卷表里的 (disk, lba) 与条目一致、只读标记为真
+            Fs64Vol64 fv;
+            if (e.fatvol == DRV64_SLOT_NONE || e.vol < FS64_VOL_FAT_BASE) { fails |= 64; continue; }
+            if (fs64_vol_info64(e.vol, &fv) != 0) { fails |= 64; continue; }
+            if (fv.kind != FS64_KIND_FAT32 || !fv.readonly) { fails |= 64; continue; }
+            if (fv.disk != e.disk || fv.start_lba != e.start_lba) fails |= 64;
+        } else {
+            if (e.slot == DRV64_SLOT_NONE || e.slot >= (uint8_t)VFS64_SLOT_MAX) { fails |= 64; continue; }
+            int sd = -1;
+            uint32_t sl = 0;
+            if (vfs64_slot_info64((int)e.slot, &sd, &sl, nullptr) != 0) { fails |= 64; continue; }
+            if (sd != e.disk || sl != e.start_lba) fails |= 64;
+        }
     }
     if (browsable > 0) {
         if (drive64_activate_letter64('C') != 0) fails |= 64;              // C: = 系统卷，必须能激活

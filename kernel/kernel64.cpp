@@ -23,6 +23,7 @@
 #include "edid64.h"     // 显示器 EDID（引导层已落在 0x7600）只读解析：厂商/名字/首选时序/刷新率
 #include "vfs64.h"      // 真文件系统 VimtuFS2（v3 目录树；安装程序格式化分区要用）
 #include "drive64.h"    // 盘符/驱动器枚举层（C: = 系统卷；只读扫描，见 os_boot_path）
+#include "fs64.h"       // ★ 批次 K：统一文件系统分派层（VimtuFS2 读写 / FAT32 只读）
 #include "ata64.h"      // ATA：IRQ14 中断驱动等待（超时回退 PIO 轮询），系统内核也要初始化
 #ifndef VIMTU_INSTALLER_MEDIA
 #include "store64.h"    // 设置持久化 store：只有系统内核链接它（安装程序不链 store64.cpp）
@@ -381,7 +382,9 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
             //   drive64_dump64     ：打印盘符表（自动验收 grep）
             //   drive64_selftest64 ：盘符唯一/容量自洽/幂等（[DRV64] selftest PASS）
             //   vfs64_tree_dump64  ：有界打印目录树（多级路径 + 类型/大小/mtime 的实测证据）
-            (void)drive64_scan64();
+            (void)fat64_selftest64();                            // ★ 批次 K：写入器 + **新的只读读取器**离线自检
+            (void)drive64_scan64();                              // （FAT32 分区的探测/挂载就在这一步）
+            (void)fs64_selftest64();                             // ★ 批次 K：统一卷表 + FAT 只读语义自检
             vfs64_slots_dump64();                                // ★ 多卷：卷槽表（每槽 drive/起始 LBA/容量）
             drive64_dump64();
             (void)drive64_selftest64();
@@ -429,7 +432,19 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
             //      open/read/close 都走这一层（kernel/fd64.cpp）。放在 VFS 挂载成功之后。----
             (void)fd64_selftest64();
         } else {
+            // ★ 批次 K：系统卷挂不上（例如"装好但主分区还没格式化"的盘）也**照常枚举盘符** ——
+            //   FAT32 只读卷（ESP / U 盘）不依赖 VimtuFS2，文件管理器和终端仍然要能进去看。
+            //   （C: 的判定退化成"第一个可浏览卷"；没有可浏览卷时照旧不给盘符。）
             dbg64_str("[APP64] boot: vfs64 mount failed -> install/launch skipped (terminal 'run' can retry)\n");
+            dbg64_line_begin64();
+            dbg64_str("[APP64] boot: drive scan without system volume (FAT32 read-only volumes still browsable)\n");
+            dbg64_line_end64();
+            (void)fat64_selftest64();                 // ★ 批次 K：只读读取器自检（写入器 + 内存卷往返 + LFN）
+            (void)drive64_scan64();
+            drive64_dump64();
+            (void)drive64_selftest64();
+            (void)fs64_selftest64();
+            (void)explorer64_selftest64();
         }
     }
     // ---- 设置持久化 store：**必须放在 VFS 挂载之后** ----

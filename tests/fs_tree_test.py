@@ -466,17 +466,26 @@ def main():
                   total_kb == TARGET_MAIN_TOTAL_KB, "total_kb=%d" % total_kb)
             check("C: free <= total 且 free > 0", 0 < free_kb <= total_kb,
                   "free_kb=%d total_kb=%d" % (free_kb, total_kb))
-        md = re.search(r"\[DRV64\] letter=D: disk=(\d+) part=(\d+) fs=(\S+) total_kb=(\d+) free_kb=(\d+)", log3)
-        check("D: = 第二块盘的 VimtuFS2 卷（disk=1 part=1 fs=VimtuFS2）",
-              bool(md) and md.group(1) == "1" and md.group(2) == "1" and md.group(3) == "VimtuFS2",
+        # ★ 批次 K：盘符顺序变了 —— ESP（disk0 part3，真 FAT32）现在可浏览并排到 D:，
+        #   第二块盘的 VimtuFS2 数据卷顺延到 E:。
+        md = re.search(r"\[DRV64\] letter=D: disk=(\d+) part=(\d+) fs=(\S+) total_kb=(\d+) free_kb=(\S+) slot=(\S+) ro=1 fatvol=(\d+)", log3)
+        check("D: = ESP（disk=0 part=3 fs=FAT32 只读卷）",
+              bool(md) and md.group(1) == "0" and md.group(2) == "3" and md.group(3) == "FAT32",
               md.group(0) if md else "（缺 letter=D: 行）")
-        check("D: 容量 = 数据盘分区容量（total_kb=%d）" % (DATA_PART_SECTORS // 2),
-              bool(md) and int(md.group(4)) == DATA_PART_SECTORS // 2,
+        check("D: 容量 = ESP 数据区容量（total_kb=%d；free 允许 unknown：本例安装器的 FSInfo 写盘失败）"
+              % (48368),        # FAT 卷容量 = 数据区簇数(96736) x 512B / 1024（不含保留/FAT 区）
+              bool(md) and int(md.group(4)) == 48368,
               md.group(0) if md else "")
-        check("只有 C:/D: 两个盘符（没有 E:）", "[DRV64] letter=E:" not in log3)
-        check("ESP 被 skip 且写明原因（lba=163807 type=0xEF reason=esp）",
-              ("[DRV64] skip lba=%d type=0xEF reason=esp" % TARGET_ESP_LBA) in log3)
-        check("引导分区（lba=9 type=0xEF）也被 skip、不占盘符",
+        me = re.search(r"\[DRV64\] letter=E: disk=(\d+) part=(\d+) fs=(\S+) total_kb=(\d+) free_kb=(\d+)", log3)
+        check("E: = 第二块盘的 VimtuFS2 卷（disk=1 part=1 fs=VimtuFS2）",
+              bool(me) and me.group(1) == "1" and me.group(2) == "1" and me.group(3) == "VimtuFS2",
+              me.group(0) if me else "（缺 letter=E: 行）")
+        check("E: 容量 = 数据盘分区容量（total_kb=%d）" % (DATA_PART_SECTORS // 2),
+              bool(me) and int(me.group(4)) == DATA_PART_SECTORS // 2,
+              me.group(0) if me else "")
+        check("FAT 读取器挂载了 ESP（[FAT64] mount … lba=%d … fat_ok=1 … spc=1 ro=1）" % TARGET_ESP_LBA,
+              re.search(r"\[FAT64\] mount vol=\d+ lba=%d clusters=\d+ free=(unknown|\d+) fat_ok=1 spc=1 ro=1" % TARGET_ESP_LBA, log3) is not None)
+        check("引导分区（lba=9 type=0xEF 无 BPB）仍然 skip、不占盘符",
               "[DRV64] skip lba=9 type=0xEF reason=esp" in log3)
         check("盘符自检通过（[DRV64] selftest PASS）", "[DRV64] selftest PASS" in log3)
         check("启动期目录树打印（[VFS64] tree root=/）", "[VFS64] tree root=/" in log3)

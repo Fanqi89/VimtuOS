@@ -268,6 +268,25 @@ def cap_boot_uefi():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_fat_readonly():
+    """★ 批次 K：FAT32 **只读浏览**（含 VFAT 长名）—— kernel/fat64.cpp 读侧 + kernel/fs64.* 分派层。"""
+    read = grep_count(r"fat64_list64|fat64_read64|dir_step|lfn_checksum|utf16_to_utf8|chain_next",
+                      ["kernel/fat64.cpp"])
+    disp = exists("kernel/fs64.cpp") and exists("kernel/fs64.h")
+    ro = grep_count(r"FS64_EROFS|reject_ro|is_readonly", ["kernel/fs64.cpp", "kernel/fd64.cpp",
+                                                          "kernel/explorer64.cpp"])
+    script = exists("tests/fatread64_test.py")
+    ev = ["FAT 读取器（BPB 校验/簇数判类型/簇链/LFN/UTF-16）：kernel/fat64.cpp 命中 %d 处；"
+          "统一分派层 kernel/fs64.*：%s" % (read, "有" if disp else "★ 缺")]
+    ev.append("只读语义（fs64 写拒绝 + fd64 写模式打开拒绝 + explorer 置灰/roact）：命中 %d 处" % ro)
+    ev.append("端到端验收 tests/fatread64_test.py：%s —— 真安装 ESP 的 BOOTX64.EFI/UEFI64.BIN/"
+              "KERNEL64.BIN 读回 CRC32 与 build64/ 构建产物逐项一致；长名/中文长名可列出；"
+              "write/mkdir/rm/粘贴被拒；explorer 进入 ESP 的 EFI/BOOT；启动前后 ESP 分区字节 CRC32 不变"
+              % ("有" if script else "★ 缺"))
+    ok = read > 0 and disp and ro > 0 and script
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
 def cap_gpt_part():
     """现代分区表：ISO 里的 GPT（构建期，tools/make_iso64.py）**与**
     安装时在目标盘写的 GPT + FAT32 ESP（48MB；kernel/part64.cpp + kernel/fat64.cpp）。
@@ -1189,6 +1208,7 @@ CAPS = [
     ("引导", "★ 引导层 INT 13h 读盘（SATA/AHCI、任意 BIOS 可见盘可直启；失败打点停机）", cap_boot_int13),
     ("引导", "UEFI 引导（两段式 PE + 平铺长模式）", cap_boot_uefi),
     ("存储", "现代分区表 GPT", cap_gpt_part),
+    ("存储", "★ FAT32 只读浏览（含 VFAT 长名）", cap_fat_readonly),
     ("安装", "Win10 风格安装界面（步骤齐全、无密钥）", cap_installer_ui),
     ("安装", "新建/删除/格式化分区（真实写盘）", cap_partition_ops),
     ("安装", "安装进度百分比 + 完成后自动重启", cap_progress_reboot),

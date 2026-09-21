@@ -79,15 +79,18 @@ struct DriveInfo64 {
     uint32_t start_lba;            // 分区起始绝对 LBA（part=0 时 = 0）
     uint32_t sectors;              // 分区扇区数（part=0 时 = 整盘扇区数）
     uint64_t total_kb;             // 总容量 KB（total_known = false 时无意义）
-    uint64_t free_kb;              // 可用容量 KB（free_known = false 时无意义）
+    uint64_t free_kb;              // 可用容量 KB（free_known = false 时无意义；FAT 是挂载时的 FSInfo 快照）
     bool     total_known;          // 容量已知（VimtuFS2：超级块；FAT：BPB；unknown：否）
-    bool     free_known;           // 可用已知（只有 VimtuFS2 能从位图算）
-    bool     browsable;            // 是否可浏览（= 校验通过的 VimtuFS2 卷 + **已经占用一个 vfs64 卷槽**）
+    bool     free_known;           // 可用已知（VimtuFS2：位图实时；FAT：FSInfo 快照，未实时刷新）
+    bool     browsable;            // 是否可浏览（校验通过的 VimtuFS2 卷 / 校验通过的 FAT32 卷）
     bool     system;               // 是否系统盘/系统分区（C:）
+    bool     readonly;             // ★ 只读卷（FAT32 = true；写/删/改名/建目录一律被拒）
     uint32_t vol_version;          // VimtuFS2 卷版本（2 / 3）；非 VimtuFS2 = 0
     uint8_t  fskind;               // DRV64_FS_*
     uint8_t  skip;                 // DRV64_SKIP_*
-    uint8_t  slot;                 // ★ vfs64 卷槽号（browsable = true 时有效）；DRV64_SLOT_NONE = 没占槽
+    uint8_t  slot;                 // ★ vfs64 卷槽号（VimtuFS2 可浏览时有效）；DRV64_SLOT_NONE = 没占槽
+    uint8_t  fatvol;               // ★ fat64 卷号（FAT32 可浏览时有效）；DRV64_SLOT_NONE = 没有
+    int      vol;                  // ★ 统一卷号（fs64）：VimtuFS2 = vfs 槽号、FAT32 = FS64_VOL_FAT_BASE + fatvol
 };
 
 // 扫描/刷新（**幂等**：重复调用结果一致，只是重新读一遍盘）。返回表里的条目数（>= 0）。

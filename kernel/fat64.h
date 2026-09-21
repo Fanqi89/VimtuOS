@@ -85,3 +85,99 @@ int fat64_write_file_from_disk64(int drive, const char* path8_3, int src_drive,
 //   fat64_format64（显式切后端）—— 曾经因为自检里误用真盘后端把安装介质格式化掉，
 //   这条路径不能再退回去。
 int fat64_selftest64();
+
+// ==================== ★ 批次 K：读取器（只读浏览）====================
+// 背景：FAT 卷以前只"识别"不"浏览"（本内核只有写入器）。本批给同一个文件加上**只读**读路径：
+//   挂载/校验 BPB -> 列目录（8.3 + VFAT 长名 LFN）-> 按簇链读文件。
+//
+// 支持范围（如实写清，别指望它是一般意义的 FAT 实现）：
+//   * **只读**：没有写/删/改名/建目录；上层（fs64/explorer/terminal/fd64）对 FAT 卷的写请求一律拒绝。
+//   * 扇区固定 512B（BPB_BytsPerSec == 512，其它值拒绝）；每簇扇区数按 BPB 计算（1..128，含 U 盘常见的 8）；
+//   * 卷类型按**簇数**判定：< 4085 -> FAT12、4085..65524 -> FAT16、>= 65525 -> FAT32；
+//     本批**只挂载/浏览 FAT32**（FAT12/16 的簇链项是 12/16 位，本批不做；probe 仍会如实报出实际类型）。
+//   * 目录：根目录簇链 + 任意层子目录簇链（"." / ".." 走真项）；跳过 0xE5 删除项、0x00 终止项、卷标项；
+//     LFN（0x0F 项）：顺序位（0x40 = 最后逻辑项）/校验和（8.3 名字的 checksum）/UTF-16 拼接全按规范做，
+//     非法 LFN 组回退成 8.3 短名；名字以 UTF-8 输出（LFN 上限 255 个 UTF-16 码元，缓冲 FAT64_NAME_MAX）。
+//   * 时间：FAT 的 date/time（1980 基准）**转成与 vfs64 同一种打包编码**（见 kernel/vfs64.h），
+//     这样文件管理器的"修改日期"列、属性面板不用为 FAT 再写一套格式化。
+//   * 边界：簇号范围、簇链长度上限（FAT64_CHAIN_MAX，防坏链死循环）、单文件读取上限
+//     （FAT64_READ_MAX_BYTES）、卷 LBA 范围全部先校验再用；坏 BPB / 坏链 / 越界一律打点 + 返回 -1。
+//   * 不做：碎片整理、删除项复用、8.3 与 LFN 冲突的写回处理（读侧只看 LFN 是否自洽）。
+//   * 可用空间：优先取 FSInfo 的 free 字段；FSInfo 无效时**不实时扫 FAT**（如实标为未知）。
+//     所以容量数字是挂载那一刻的快照（见 fs64/drive64 的说明）。
+//
+// 打点（[FAT64] 前缀，行锁）：
+//   [FAT64] probe lba=<n> fs=FAT32|FAT16|FAT12|none clusters=<n> spc=<n> fatsz=<n> [label=..]
+//   [FAT64] mount vol=<n> lba=<n> clusters=<n> free=<n> fat_ok=1
+//   [FAT64] list path=<p> entries=<n> / [FAT64] read path=<p> size=<n> bytes=<n>
+//   [FAT64] reject <why>（坏 BPB / 坏链 / 越界 / 只支持 FAT32 等）
+static const uint32_t FAT64_TYPE_12 = 12;    // 簇数 < 4085
+static const uint32_t FAT64_TYPE_16 = 16;    // 4085..65524
+static const uint32_t FAT64_TYPE_32 = 32;    // >= 65525
+static const int      FAT64_VOL_MAX  = 4;    // 同时挂载的 FAT 卷上限（只读；与 vfs64 的 4 个卷槽同规格）
+static const int      FAT64_VOL_NONE = -1;
+static const uint32_t FAT64_NAME_MAX = 256;  // UTF-8 名字缓冲（LFN 255 UTF-16 码元解出来够用）
+static const uint32_t FAT64_LFN_CHARS = 260; // LFN 组装缓冲（UTF-16 码元数；规范上限 255 + 余量）
+static const uint32_t FAT64_CHAIN_MAX = 1u << 20;      // 单条簇链的簇数上限（坏链防护）
+static const uint32_t FAT64_READ_MAX_BYTES = 16u * 1024u * 1024u;  // 单次读取上限（16MB）
+
+// 卷信息（只读探测 / 挂载后查询）
+struct Fat64Info64 {
+    uint32_t bytes_per_sector;
+    uint32_t spc;              // 每簇扇区数
+    uint32_t reserved;
+    uint32_t num_fats;
+    uint32_t fatsz;            // 每份 FAT 的扇区数（FAT32 = BPB_FATSz32）
+    uint32_t total_sectors;
+    uint32_t root_cluster;
+    uint32_t data_start;       // 卷内第一个数据扇区
+    uint32_t clusters;         // 数据区簇数
+    uint32_t cluster_bytes;    // spc * 512
+    uint32_t fsinfo_sector;
+    uint32_t free_clusters;    // FSInfo 的 free（0xFFFFFFFF = 未知）
+    uint32_t fat_type;         // FAT64_TYPE_*
+    uint8_t  mirr;             // 1 = 两份 FAT 互为镜像且逐字节一致
+    uint8_t  fsinfo_ok;        // 1 = FSInfo 三个签名有效
+    char     oem[9];           // BPB_OEMName（NUL 结尾）
+    char     label[12];        // BPB 卷标（NUL 结尾）
+};
+
+// 目录项 / stat 结果
+struct Fat64Entry64 {
+    char     name[FAT64_NAME_MAX];   // UTF-8（LFN 长名或 "BASE.EXT" 短名）
+    uint32_t attr;                   // FAT 属性位（0x10 = 目录、0x01 = 只读、0x02 = 隐藏、0x04 = 系统）
+    uint32_t cluster;                // 首簇（0 = 空文件）
+    uint32_t size;                   // 字节数（目录 = 0）
+    uint32_t mtime;                  // 打包时间（vfs64 口径；0 = 未知）
+    uint8_t  lfn;                    // 1 = 名字来自 VFAT 长名
+};
+
+// 只读探测：(drive, lba) 的首扇区必须是合法 BPB。成功 0 并把几何填进 *out；失败 -1（已打点）。
+// **不改任何卷状态**（drive64 扫描所有分区时用）；out 可传 nullptr（只判真假）。
+int fat64_probe64(int drive, uint32_t lba, Fat64Info64* out);
+
+// 挂载一个 FAT32 卷（只读）到卷槽；同 (drive,lba) **幂等**（复用已有槽，不重复占）。成功 0 并填 *out_vol。
+int fat64_mount64(int drive, uint32_t lba, int* out_vol);
+// (drive,lba) 已挂载的卷号；-1 = 没挂载过。
+int fat64_mount_find64(int drive, uint32_t lba);
+// 卷号是否有效（合法且已挂载）。
+int fat64_vol_used64(int vol);
+// 卷信息（只读）。
+int fat64_vol_info64(int vol, Fat64Info64* out);
+// 卷的空闲簇数（挂载时从 FSInfo 缓存的快照；0xFFFFFFFF = 未知）。
+uint32_t fat64_vol_free64(int vol);
+
+// 列目录：path 形如 "/"、"EFI"、"EFI/BOOT"（大小写不敏感；"." / ".." 段支持）。
+// 从 *cursor 开始最多填 max 条（跳过 "." / ".."）；把 *cursor 推到下一条；返回填充条数、0 = 结束、-1 = 错。
+int fat64_list64(int vol, const char* path, Fat64Entry64* out, int max, uint32_t* cursor);
+
+// 查属性（文件/目录都可以；根目录 "/" 返回 dir 条目）。成功 0；失败 -1（打点 path not found）。
+int fat64_stat64(int vol, const char* path, Fat64Entry64* out);
+
+// 读文件：最多 max 字节（同时受文件大小与 FAT64_READ_MAX_BYTES 约束），*out_len = 实际字节数。
+// 目录 / 超上限 / 坏链 / 越界一律 -1。成功 0。
+int fat64_read64(int vol, const char* path, void* buf, uint32_t max, uint32_t* out_len);
+
+// 分块读：从文件偏移 off 读 len 字节（供大文件（如 4MB 的 KERNEL64.BIN）分块校验用）。
+// *out_got = 实际读到的字节数（到文件末尾会短读）；成功 0。
+int fat64_read_range64(int vol, const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got);

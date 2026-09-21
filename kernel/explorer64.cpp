@@ -28,7 +28,8 @@
 #include "input.h"
 #include "debug64.h"
 #include "x86_64.h"
-#include "vfs64.h"
+#include "vfs64.h"     // 常量/名字上限（VimtuFS2 的具体实现由 fs64 分派层调用）
+#include "fs64.h"      // ★ 批次 K：统一文件系统接口（VimtuFS2 读写 / FAT32 只读）
 #include "drive64.h"
 #include "app64.h"
 #include "elf64.h"
@@ -164,7 +165,8 @@ static int  g_view = 0;               // 0 = 图标视图，1 = 详细信息
 static int  g_sel = -1;               // 选中条目（-1 = 无）
 static int  g_scroll = 0;             // 首个可见条目下标
 static int  g_items = 0;              // 当前目录条目数（完整计数）
-static Vfs64Dirent64 g_ents[EXP_MAX_ITEMS];
+static Fs64Dirent64 g_ents[EXP_MAX_ITEMS];   // ★ 批次 K：统一目录项（VimtuFS2 与 FAT32 都走这一个结构）
+static bool g_ro = false;                     // ★ 当前卷是否只读（FAT32）—— 文件操作按钮/菜单的置灰依据
 
 static DriveInfo64 g_drives[DRV64_MAX_ENTRIES];
 static int  g_drive_n = 0;
@@ -191,7 +193,7 @@ static uint8_t g_selmap[(EXP_MAX_ITEMS + 7) / 8] = {0};
 static int  g_sel_n = 0;                   // 选中总数（0 = 无选中）
 
 // 内核内剪贴板（记录 **卷槽 + 完整路径**；op：0 = 空、1 = 复制、2 = 剪切）
-struct ExpClipEnt64 { int slot; char path[VFS64_PATH_MAX]; };
+struct ExpClipEnt64 { int vol; char path[VFS64_PATH_MAX]; };   // ★ 统一卷号（FAT 源也能复制出来）
 static ExpClipEnt64 g_clip[EXP_CLIP_MAX];
 static int  g_clip_n = 0;
 static int  g_clip_op = 0;
@@ -487,6 +489,7 @@ static void exp_log_card(int idx, const DriveInfo64* d) {
         dbg64_dec(d->total_kb);
         dbg64_str(" free_kb=");
         dbg64_dec(d->free_kb);
+        if (d->readonly) dbg64_str(" ro=1");              // ★ 批次 K：FAT32 只读卷
         dbg64_nl();
         dbg64_line_end64();
     } else {
@@ -540,6 +543,23 @@ static void exp_msg(const char* s) {
     e_strcpy(g_msg, s, (int)sizeof(g_msg));
     g_msg_tick = ticks64() + ms_to_ticks64(4000);
     if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+}
+
+// ★ 批次 K：在只读卷（FAT32）上尝试了写类操作 —— 统一打点（自动验收 grep），并给用户一句明确提示。
+// 上层（按钮/菜单）会先置灰；这里覆盖键盘快捷键/右键菜单等仍能触发到的路径，绝不静默。
+static void exp_roact(const char* op) {
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer roact op=");
+    dbg64_str(op ? op : "?");
+    if (g_letter) {
+        char lb[3]; lb[0] = g_letter; lb[1] = ':'; lb[2] = 0;
+        dbg64_str(" letter=");
+        dbg64_str(lb);
+    }
+    dbg64_str(" fs=FAT32 ro=1 (read-only volume: not allowed)");
+    dbg64_nl();
+    dbg64_line_end64();
+    exp_msg(gui64_tr("Read-only volume (FAT32)", "只读卷（FAT32）"));
 }
 
 
@@ -771,17 +791,17 @@ static bool exp_cell_hits_box(int i) {
     return !(x + w < bx0 || x > bx1 || y + h < by0 || y > by1);
 }
 // 界面上写着哪个盘 -> vfs64 卷槽；并保证"当前卷"就是它（文件操作必须落在用户看到的盘上）。
-// -1 = 盘符非法/不可浏览/切不过去（调用方如实报错）。
 static int exp_ensure_volume() {
     if (g_mode != 1 || !g_letter) return -1;
     const int di = drive64_by_letter64(g_letter);
     if (di < 0) return -1;
     DriveInfo64 d;
     if (drive64_info64(di, &d) != 0 || !d.browsable) return -1;
-    if ((int)d.slot != vfs64_current_slot64()) {
+    g_ro = d.readonly ? true : false;                     // ★ 只读卷（FAT32）：所有写操作都要被拦
+    if (fs64_current_vol64() != d.vol) {
         if (drive64_activate_letter64(g_letter) != 0) return -1;
     }
-    return (int)d.slot;
+    return d.vol;                                          // 返回**统一卷号**（FAT 卷 >= FS64_VOL_FAT_BASE）
 }
 static void exp_refresh_dir() {
     exp_sync_volume();                                   // ★ 多卷：目录内容必须来自界面上的盘
@@ -790,14 +810,15 @@ static void exp_refresh_dir() {
     sel_clear();                                         // ★ 批次 J：目录内容变了，多选集一起清（下标已失效）
     if (g_scroll < 0) g_scroll = 0;
     uint32_t cursor = 0;
-    Vfs64Dirent64 one;
+    Fs64Dirent64 one;                                   // ★ 批次 K：统一目录项（VimtuFS2 / FAT32 同一个结构）
     int guard = 0;
+    g_ro = fs64_is_readonly64(-1) ? true : false;       // 当前卷是否只读（FAT32）—— 置灰/拦截的依据
     for (;;) {
-        const int r = vfs64_list64(g_path, &one, 1, &cursor);
+        const int r = fs64_list64(-1, g_path, &one, 1, &cursor);
         if (r <= 0) break;
         if (g_items < EXP_MAX_ITEMS) g_ents[g_items] = one;
         g_items++;
-        if (++guard > (int)VFS64_MAX_INODES) break;       // 护栏：绝不无界循环
+        if (++guard > (int)FAT64_CHAIN_MAX) break;       // 护栏：绝不无界循环（FAT 卷的条目上限）
     }
     g_scroll = clamp_scroll_pure(g_scroll, g_items, 1);
     // 每个条目一行（自动验收按 idx 定位单元格/行；同时把"详细信息"四列的内容也留成证据）
@@ -848,9 +869,9 @@ static int exp_enter_drive_letter(char letter) {
     }
     const char* why = nullptr;
     if (drive64_activate_letter64(letter) != 0) why = "activate";
-    if (!why) {                                          // 激活之后容量再取一次（实时值）
+    if (!why) {                                          // 激活之后容量/只读标记再取一次（实时值）
         (void)drive64_info64(di, &d);
-        if (vfs64_current_slot64() != (int)d.slot) why = "slot-mismatch";
+        if (fs64_current_vol64() != d.vol) why = "vol-mismatch";
     }
     if (why) {
         char lb[3];
@@ -858,8 +879,8 @@ static int exp_enter_drive_letter(char letter) {
         dbg64_line_begin64();
         dbg64_str("[UI] explorer enter letter=");
         dbg64_str(lb);
-        dbg64_str(" slot=");
-        dbg64_dec((uint64_t)d.slot);
+        dbg64_str(" vol=");
+        dbg64_dec((uint64_t)(d.vol < 0 ? 0 : d.vol));
         dbg64_str(" FAILED reason=");
         dbg64_str(why);
         dbg64_nl();
@@ -872,6 +893,7 @@ static int exp_enter_drive_letter(char letter) {
     g_cur_drive_ok = true;
     g_mode = 1;
     g_letter = letter;
+    g_ro = d.readonly ? true : false;                    // ★ 只读卷（FAT32）：写操作全部置灰/拦截
     e_strcpy(g_path, "/", (int)sizeof(g_path));
     g_scroll = 0;
     exp_refresh_dir();
@@ -879,8 +901,13 @@ static int exp_enter_drive_letter(char letter) {
     dbg64_str("[UI] explorer enter letter=");            // ★ 多卷证据行（验收 grep）
     char l[3]; l[0] = letter; l[1] = ':'; l[2] = 0;
     dbg64_str(l);
-    dbg64_str(" slot=");
-    dbg64_dec((uint64_t)d.slot);
+    if (d.fskind == DRV64_FS_FAT32) {
+        dbg64_str(" fatvol=");                           // ★ 批次 K：FAT32 卷用 fat64 卷号（不占 vfs64 槽）
+        dbg64_dec((uint64_t)d.fatvol);
+    } else {
+        dbg64_str(" slot=");
+        dbg64_dec((uint64_t)d.slot);
+    }
     dbg64_str(" ok items=");
     dbg64_dec((uint64_t)g_items);
     dbg64_nl();
@@ -894,8 +921,20 @@ static int exp_enter_drive_letter(char letter) {
     dbg64_dec(d.total_kb);
     dbg64_str(" free_kb=");
     dbg64_dec(d.free_kb);
+    dbg64_str(" ro=");
+    dbg64_dec(d.readonly ? 1 : 0);
     dbg64_nl();
     dbg64_line_end64();
+    if (d.readonly) {                                    // ★ 批次 K：只读卷打点（自动验收 grep）
+        dbg64_line_begin64();
+        dbg64_str("[UI] explorer vol letter=");
+        dbg64_str(l);
+        dbg64_str(" fs=");
+        dbg64_str(d.fs);
+        dbg64_str(" ro=1 readonly (paste/cut/delete/rename/mkdir disabled)");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
     if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
     return 0;
 }
@@ -1044,7 +1083,7 @@ static void prev_draw(Window* w) {
 }
 static void prev_close(Window* w) { (void)w; g_prev_win = nullptr; }
 static void exp_open_preview(const char* full, const char* name) {
-    g_prev_len = vfs64_read64(full, g_prev_buf, (int)sizeof(g_prev_buf) - 1);
+    g_prev_len = fs64_read64(-1, full, g_prev_buf, (int)sizeof(g_prev_buf) - 1);   // ★ 统一接口（FAT 文本也能预览）
     if (g_prev_len < 0) g_prev_len = 0;
     g_prev_buf[g_prev_len] = 0;
     e_strcpy(g_prev_name, name, (int)sizeof(g_prev_name));
@@ -1069,63 +1108,64 @@ static void exp_open_preview(const char* full, const char* name) {
 }
 
 // ★ 批次 J：本节的函数（新建文件夹/属性/右键菜单）会回调 exp_open_item（菜单里的"打开"），
-// 而它在文件后面才定义 —— C++ 里必须先声明。
 static void exp_open_item(int i);
 
 // ★ 批次 J：剪贴板/复制粘贴那一节里 exp_ctx_activate 也要用它。
 // ==================== ★ 批次 J：复制 / 剪切 / 粘贴（内核内剪贴板）====================
 // 模型（写清楚，免得后来人猜）：
-//   * 剪贴板 = 最多 8 条 (卷槽, 完整路径) + 操作（复制/剪切）。**不是**文件内容快照 —— 粘贴时现读现写，
+//   * 剪贴板 = 最多 8 条 (统一卷号, 完整路径) + 操作（复制/剪切）。**不是**文件内容快照 —— 粘贴时现读现写，
 //     所以源被删掉后粘贴会失败（如实报 skipped）。
-//   * 空格检查：写前用 vfs64_free64 估目标卷的空闲块（含间接块 + 1 块余量）；不够就**整条跳过，不写一半**。
+//   * 空格检查：写前用 fs64_free64 估目标卷的空闲块（含间接块 + 1 块余量）；不够就**整条跳过，不写一半**。
 //   * 单文件上限 67584 B（VFS64_MAX_FILE_BYTES）：超过的源会被拒绝（skipped），不是截断复制。
 //   * 目录递归复制：深度 ≤ EXP_COPY_DEPTH(4)、整棵 ≤ EXP_COPY_ITEMS(96) 条；超限的条目计入 skipped。
-//   * 跨卷（C: ↔ D:）：源用 vfs64_*_on64(源槽) 读、目标用 vfs64_*_on64(目标槽) 写 —— 与"当前卷"无关。
+//   * 跨卷（C: ↔ D: ↔ FAT32 只读卷）：源用 fs64_read64(源卷) 读、目标用 fs64_write64(目标卷) 写 ——
+//     与"当前卷"无关。**只读卷（FAT32）可以做源**（复制出来），但目标侧 fs64 会直接 -FS64_EROFS。
 //   * 剪切 = 复制成功后删源（**先全部复制成功再删**；某一条失败就保留它的源，绝不半删）。
 // 拼路径 + 在同目录里挑一个不撞名的名字（撞了就按 " (2)"、" (3)"… 追加；见 suffix_name_pure）
-static int exp_unique_name(char* out, int cap, int slot, const char* dir, const char* name) {
+static int exp_unique_name(char* out, int cap, int vol, const char* dir, const char* name) {
     char cand[VFS64_NAME_MAX + 1];
     e_strcpy(cand, name, (int)sizeof(cand));
     char full[VFS64_PATH_MAX];
-    Vfs64Info64 info;
+    Fs64Stat64 info;
     for (int k = 1; k <= 32; k++) {
         exp_build_path(full, (int)sizeof(full), dir, cand);
-        if (vfs64_stat64_on64(slot, full, &info) != 0) { e_strcpy(out, cand, cap); return 0; }
+        if (fs64_stat64(vol, full, &info) != 0) { e_strcpy(out, cand, cap); return 0; }
         if (k == 32) break;
         suffix_name_pure(name, k + 1, cand, (int)sizeof(cand));
     }
     return -1;                                  // 32 次都撞名：如实放弃
 }
-static int exp_copy_file(int sslot, const char* sp, int dslot, const char* dp, int* why) {
+static int exp_copy_file(int svol, const char* sp, int dvol, const char* dp, int* why) {
     if (why) *why = 0;
-    Vfs64Info64 si;
-    if (vfs64_stat64_on64(sslot, sp, &si) != 0) { if (why) *why = 1; return -1; }        // 源没了
+    Fs64Stat64 si;
+    if (fs64_stat64(svol, sp, &si) != 0) { if (why) *why = 1; return -1; }               // 源没了
     if (si.type != VFS64_TYPE_FILE) { if (why) *why = 2; return -1; }
     if (si.size > VFS64_MAX_FILE_BYTES) { if (why) *why = 3; return -1; }                // 超过单文件上限
+    if (fs64_is_readonly64(dvol)) { if (why) *why = 6; return -1; }                      // ★ 目标只读（FAT32）
     uint32_t fb = 0, fby = 0;
-    if (vfs64_free_on64(dslot, &fb, &fby, nullptr) != 0) { if (why) *why = 4; return -1; }
+    if (fs64_free64(dvol, &fb, &fby, nullptr) != 0) { if (why) *why = 4; return -1; }
     // 需要的数据块 + 间接块（> 4 个直接块时才要间接块）+ 1 块余量
     const uint32_t data_blocks = (si.size + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
     const uint32_t need = data_blocks + ((data_blocks > VFS64_DIRECT_BLOCKS) ? 1u : 0u) + 1u;
     if (fb < need) { if (why) *why = 5; return -1; }                                     // 空间不足
-    const int n = vfs64_read_on64(sslot, sp, g_copy_buf, (int)sizeof(g_copy_buf));
+    const int n = fs64_read64(svol, sp, g_copy_buf, (int)sizeof(g_copy_buf));
     if (n < 0 || (uint32_t)n != si.size) { if (why) *why = 1; return -1; }
-    if (vfs64_write_on64(dslot, dp, g_copy_buf, n) != n) { if (why) *why = 4; return -1; }
+    if (fs64_write64(dvol, dp, g_copy_buf, n) != n) { if (why) *why = 4; return -1; }
     return 0;
 }
 // 递归复制一棵目录树（有界；budget 是"还剩多少条目可复制"的共享计数器）
-static int exp_copy_tree(int sslot, const char* sp, int dslot, const char* dp,
+static int exp_copy_tree(int svol, const char* sp, int dvol, const char* dp,
                          int depth, int* budget, int* skipped) {
     if (depth > EXP_COPY_DEPTH) { (*skipped)++; return -1; }
     if (path_is_ancestor_pure(sp, dp)) { (*skipped)++; return -1; }   // 目标在自己的子树里 -> 拒绝（防自喂）
-    if (vfs64_mkdir_on64(dslot, dp) != 0) {
-        Vfs64Info64 di;                                              // 已存在：是目录就合并，不是目录算失败
-        if (vfs64_stat64_on64(dslot, dp, &di) != 0 || di.type != VFS64_TYPE_DIR) { (*skipped)++; return -1; }
+    if (fs64_mkdir64(dvol, dp) != 0) {
+        Fs64Stat64 di;                                                // 已存在：是目录就合并，不是目录算失败
+        if (fs64_stat64(dvol, dp, &di) != 0 || di.type != VFS64_TYPE_DIR) { (*skipped)++; return -1; }
     }
-    Vfs64Dirent64 ents[EXP_COPY_LIST];
+    Fs64Dirent64 ents[EXP_COPY_LIST];
     uint32_t cursor = 0;
     for (;;) {
-        const int got = vfs64_list64_on64(sslot, sp, ents, (int)EXP_COPY_LIST, &cursor);
+        const int got = fs64_list64(svol, sp, ents, (int)EXP_COPY_LIST, &cursor);
         if (got < 0) { (*skipped)++; return -1; }
         if (got == 0) break;
         for (int i = 0; i < got; i++) {
@@ -1133,12 +1173,12 @@ static int exp_copy_tree(int sslot, const char* sp, int dslot, const char* dp,
             (*budget)--;
             char csrc[VFS64_PATH_MAX], cdst[VFS64_PATH_MAX], uniq[VFS64_NAME_MAX + 1];
             exp_build_path(csrc, (int)sizeof(csrc), sp, ents[i].name);
-            if (exp_unique_name(uniq, (int)sizeof(uniq), dslot, dp, ents[i].name) != 0) { (*skipped)++; continue; }
+            if (exp_unique_name(uniq, (int)sizeof(uniq), dvol, dp, ents[i].name) != 0) { (*skipped)++; continue; }
             exp_build_path(cdst, (int)sizeof(cdst), dp, uniq);
             if (ents[i].type == VFS64_TYPE_DIR) {
-                if (exp_copy_tree(sslot, csrc, dslot, cdst, depth + 1, budget, skipped) != 0) return -1;
+                if (exp_copy_tree(svol, csrc, dvol, cdst, depth + 1, budget, skipped) != 0) return -1;
             } else {
-                if (exp_copy_file(sslot, csrc, dslot, cdst, nullptr) != 0) { (*skipped)++; return -1; }
+                if (exp_copy_file(svol, csrc, dvol, cdst, nullptr) != 0) { (*skipped)++; return -1; }
             }
         }
         if (got < (int)EXP_COPY_LIST) break;
@@ -1147,12 +1187,16 @@ static int exp_copy_tree(int sslot, const char* sp, int dslot, const char* dp,
 }
 static void exp_clip_set(int op) {          // 1 = 复制、2 = 剪切：把当前选中项收进剪贴板
     if (g_mode != 1) { exp_msg(gui64_tr("Not in a folder", "不在文件夹里")); return; }
-    const int slot = exp_ensure_volume();
-    if (slot < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
+    if (op == 2 && g_ro) {                  // ★ 只读卷不能剪切（源删不掉）
+        exp_roact("cut");                   // ★ 只读卷不能剪切（源删不掉）
+        return;
+    }
+    const int vol = exp_ensure_volume();
+    if (vol < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
     int n = 0;
     for (int i = 0; i < g_items && i < EXP_MAX_ITEMS && n < EXP_CLIP_MAX; i++) {
         if (!sel_has(i)) continue;
-        g_clip[n].slot = slot;
+        g_clip[n].vol = vol;
         exp_build_path(g_clip[n].path, (int)sizeof(g_clip[n].path), g_path, g_ents[i].name);
         n++;
     }
@@ -1175,34 +1219,39 @@ static void exp_paste() {
         return;
     }
     if (g_mode != 1) { exp_msg(gui64_tr("Open a folder first", "先进入一个文件夹")); return; }
-    const int dslot = exp_ensure_volume();
-    if (dslot < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
+    if (g_ro) {                                                        // ★ 批次 K：只读卷不能被粘贴
+        exp_roact("paste");                 // ★ 只读卷不能被粘贴
+        exp_log_paste(0, g_path, g_clip_n);
+        return;
+    }
+    const int dvol = exp_ensure_volume();
+    if (dvol < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
     int okn = 0, skipped = 0, budget = EXP_COPY_ITEMS;
     char pasted[EXP_CLIP_MAX][VFS64_PATH_MAX];                       // 剪切：只删真正复制过来的源
-    int pasted_slot[EXP_CLIP_MAX];
+    int pasted_vol[EXP_CLIP_MAX];
     for (int i = 0; i < g_clip_n; i++) {
         char nm[VFS64_NAME_MAX + 1];
         path_last_seg_pure(g_clip[i].path, nm, (int)sizeof(nm));
         if (!nm[0]) { skipped++; continue; }
         char uniq[VFS64_NAME_MAX + 1];
-        if (exp_unique_name(uniq, (int)sizeof(uniq), dslot, g_path, nm) != 0) { skipped++; continue; }
+        if (exp_unique_name(uniq, (int)sizeof(uniq), dvol, g_path, nm) != 0) { skipped++; continue; }
         char dp[VFS64_PATH_MAX];
         exp_build_path(dp, (int)sizeof(dp), g_path, uniq);
-        Vfs64Info64 si;
-        if (vfs64_stat64_on64(g_clip[i].slot, g_clip[i].path, &si) != 0) { skipped++; continue; }
+        Fs64Stat64 si;
+        if (fs64_stat64(g_clip[i].vol, g_clip[i].path, &si) != 0) { skipped++; continue; }
         int rc = -1;
         if (si.type == VFS64_TYPE_DIR) {
             int sub_skip = 0;
-            rc = exp_copy_tree(g_clip[i].slot, g_clip[i].path, dslot, dp, 0, &budget, &sub_skip);
+            rc = exp_copy_tree(g_clip[i].vol, g_clip[i].path, dvol, dp, 0, &budget, &sub_skip);
             skipped += sub_skip;
         } else {
             int why = 0;
-            rc = exp_copy_file(g_clip[i].slot, g_clip[i].path, dslot, dp, &why);
+            rc = exp_copy_file(g_clip[i].vol, g_clip[i].path, dvol, dp, &why);
             if (rc != 0) skipped++;
         }
         if (rc == 0) {
             e_strcpy(pasted[okn], g_clip[i].path, (int)sizeof(pasted[0]));
-            pasted_slot[okn] = g_clip[i].slot;
+            pasted_vol[okn] = g_clip[i].vol;
             okn++;
         }
     }
@@ -1210,10 +1259,10 @@ static void exp_paste() {
     if (g_clip_op == 2) {                                           // 剪切：复制成功后删源
         int cut_ok = 0;
         for (int i = 0; i < okn; i++) {
-            Vfs64Info64 si;
-            if (vfs64_stat64_on64(pasted_slot[i], pasted[i], &si) != 0) continue;
-            const int r = (si.type == VFS64_TYPE_DIR) ? vfs64_rmdir_on64(pasted_slot[i], pasted[i])
-                                                      : vfs64_unlink_on64(pasted_slot[i], pasted[i]);
+            Fs64Stat64 si;
+            if (fs64_stat64(pasted_vol[i], pasted[i], &si) != 0) continue;
+            const int r = (si.type == VFS64_TYPE_DIR) ? fs64_rmdir64(pasted_vol[i], pasted[i])
+                                                      : fs64_unlink64(pasted_vol[i], pasted[i]);
             if (r == 0) cut_ok++;
             else exp_log_delete(pasted[i], si.type == VFS64_TYPE_DIR ? "dir" : "file", 1, "cut-src-keep");
         }
@@ -1231,6 +1280,7 @@ static void exp_paste() {
 // ==================== ★ 批次 J：重命名 / 删除 / 新建文件夹 / 属性 ====================
 static void exp_edit_begin(int mode, int item) {   // 进入内联编辑（重命名 / 新建文件夹）
     if (g_mode != 1) { exp_msg(gui64_tr("Not in a folder", "不在文件夹里")); return; }
+    if (g_ro) { exp_roact("rename/mkdir"); return; }   // ★ 只读卷（FAT32）上不能改名/新建
     if (mode == EXP_EDIT_RENAME) {
         if (item < 0 || item >= g_items || item >= EXP_MAX_ITEMS) { exp_msg(gui64_tr("Nothing selected", "没有选中任何项")); return; }
         e_strcpy(g_edit_buf, g_ents[item].name, (int)sizeof(g_edit_buf));
@@ -1272,22 +1322,22 @@ static void exp_edit_commit() {                    // 回车：按模式落到�
         if (item < 0 || item >= g_items || item >= EXP_MAX_ITEMS) { exp_edit_cancel(); return; }
         char full[VFS64_PATH_MAX];
         exp_build_path(full, (int)sizeof(full), g_path, g_ents[item].name);
-        const int rc = vfs64_rename64(full, nm);
+        const int rc = fs64_rename64(-1, full, nm);
         exp_log_rename(g_ents[item].name, nm, rc == 0 ? 0 : 1);
         exp_msg(rc == 0 ? gui64_tr("Renamed", "已重命名")
                         : gui64_tr("Rename failed (name exists or volume error)", "重命名失败（重名或卷错误）"));
     } else {
-        const int slot = exp_ensure_volume();
-        if (slot < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
+        const int vol = exp_ensure_volume();
+        if (vol < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
         char uniq[VFS64_NAME_MAX + 1];
-        if (exp_unique_name(uniq, (int)sizeof(uniq), slot, g_path, nm) != 0) {
+        if (exp_unique_name(uniq, (int)sizeof(uniq), vol, g_path, nm) != 0) {
             exp_log_mkdir(nm, 1);
             exp_msg(gui64_tr("Too many name conflicts", "同名冲突太多"));
             return;
         }
         char full[VFS64_PATH_MAX];
         exp_build_path(full, (int)sizeof(full), g_path, uniq);
-        const int rc = vfs64_mkdir64(full);
+        const int rc = fs64_mkdir64(vol, full);
         exp_log_mkdir(full, rc == 0 ? 0 : 1);
         exp_msg(rc == 0 ? gui64_tr("Folder created", "已新建文件夹")
                         : gui64_tr("Cannot create folder", "无法新建文件夹"));
@@ -1301,6 +1351,7 @@ static void exp_edit_commit() {                    // 回车：按模式落到�
 static void exp_delete_now();
 static void exp_delete_request() {
     if (g_mode != 1) { exp_msg(gui64_tr("Not in a folder", "不在文件夹里")); return; }
+    if (g_ro) { exp_roact("delete"); return; }        // ★ 只读卷（FAT32）上不能删除
     if (sel_count() <= 0) { exp_msg(gui64_tr("Nothing selected", "没有选中任何项")); return; }
     if (g_del_confirm && (int32_t)(ticks64() - g_del_confirm_tick) < 0) {
         g_del_confirm = 0;
@@ -1326,18 +1377,19 @@ static void exp_delete_request() {
     exp_msg(gui64_tr("Press Delete again to confirm (10s)", "再按一次 Delete 确认删除（10 秒内有效）"));
 }
 static void exp_delete_now() {
-    const int slot = exp_ensure_volume();
-    if (slot < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
+    const int vol = exp_ensure_volume();
+    if (vol < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
+    if (g_ro) { exp_roact("delete"); return; }        // 防御：只读卷的删除在这里也被拦（UI 已置灰）
     int done = 0, refused = 0;
     for (int i = 0; i < g_items && i < EXP_MAX_ITEMS; i++) {
         if (!sel_has(i)) continue;
-        const Vfs64Dirent64* d = &g_ents[i];
+        const Fs64Dirent64* d = &g_ents[i];
         char full[VFS64_PATH_MAX];
         exp_build_path(full, (int)sizeof(full), g_path, d->name);
         if (d->type == VFS64_TYPE_DIR) {
-            Vfs64Dirent64 one;
+            Fs64Dirent64 one;
             uint32_t cur = 0;
-            const int n = vfs64_list64(full, &one, 1, &cur);
+            const int n = fs64_list64(vol, full, &one, 1, &cur);
             if (n < 0) { exp_log_delete(full, "dir", 1, "stat-failed"); refused++; continue; }
             if (n > 0) {                                  // 非空目录：**明说暂不支持递归删除**，绝不假装成功
                 exp_log_delete(full, "dir", 1, "not-empty");
@@ -1346,11 +1398,11 @@ static void exp_delete_now() {
                 refused++;
                 continue;
             }
-            const int rc = vfs64_rmdir64(full);
+            const int rc = fs64_rmdir64(vol, full);
             exp_log_delete(full, "dir", rc == 0 ? 0 : 1, rc == 0 ? "" : "rmdir-failed");
             if (rc == 0) done++; else refused++;
         } else {
-            const int rc = vfs64_unlink64(full);
+            const int rc = fs64_unlink64(vol, full);
             exp_log_delete(full, "file", rc == 0 ? 0 : 1, rc == 0 ? "" : "unlink-failed");
             if (rc == 0) done++; else refused++;
         }
@@ -1358,7 +1410,8 @@ static void exp_delete_now() {
     if (done > 0 && refused == 0) exp_msg(gui64_tr("Deleted", "已删除"));
     exp_refresh_dir();
 }
-// 属性：数据全从 vfs64_stat64 来（名称/类型/大小/修改日期/所在卷），画成内容区里的小面板 + 打点。
+// 属性：数据全从 fs64_stat64 来（名称/类型/大小/修改日期/所在卷；FAT 卷的日期也是同一编码），
+// 画成内容区里的小面板 + 打点。
 static void exp_props_show(int item) {
     char full[VFS64_PATH_MAX];
     char nm[48];
@@ -1370,8 +1423,8 @@ static void exp_props_show(int item) {
         path_last_seg_pure(g_path, nm, (int)sizeof(nm));
         if (!nm[0]) e_strcpy(nm, "/", (int)sizeof(nm));
     }
-    Vfs64Info64 info;
-    if (vfs64_stat64(full, &info) != 0) {
+    Fs64Stat64 info;
+    if (fs64_stat64(-1, full, &info) != 0) {
         exp_msg(gui64_tr("Cannot read properties", "读不到属性"));
         exp_log_props(nm, "unknown", 0, "-", g_letter);
         return;
@@ -1411,9 +1464,15 @@ static const char* exp_ctx_label(int k) {
 }
 static bool exp_ctx_enabled(int k) {              // 与工具栏按钮同一套置灰规则
     if (g_ctx_blank) {
+        if (g_ro) {                                  // ★ 只读卷：空白菜单只有"刷新/属性"可用
+            if (k == 1) return false;                // 粘贴
+            if (k == 0) return false;                // 新建文件夹
+            return true;
+        }
         if (k == 1) return g_clip_op != 0 && g_clip_n > 0;
         return true;
     }
+    if (g_ro) return (k == 1) && sel_count() > 0;    // ★ 只读卷：条目菜单里只有"复制"可用
     if (k == 1) return sel_count() > 0;           // 复制
     if (k == 2) return sel_count() > 0;           // 剪切
     if (k == 3 || k == 4) return sel_count() > 0; // 重命名/删除
@@ -1475,7 +1534,7 @@ static void exp_ctx_activate(int k) {              // 菜单项动作（k = 下�
 // ==================== 打开条目（双击 / 回车 / 菜单"打开"）====================
 static void exp_open_item(int i) {
     if (i < 0 || i >= g_items || i >= EXP_MAX_ITEMS) return;
-    const Vfs64Dirent64* d = &g_ents[i];
+    const Fs64Dirent64* d = &g_ents[i];
     const int a = exp_assoc(d->type, d->kind);
     const char* kstr = vfs64_kind_str64(d->kind);
     char full[VFS64_PATH_MAX];
@@ -1670,7 +1729,7 @@ static void draw_drive_card(const DriveInfo64* d, int cx0, int cy0, int selected
     }
     e_strcat(txt, "  ", (int)sizeof(txt));
     e_strcat(txt, d->fs, (int)sizeof(txt));
-    txt_clip(x + 58, y + 52, txt, C_EXP_DIM, EXP_CARD_W - 70);
+    if (d->readonly) e_strcat(txt, gui64_tr(" (read-only)", "（只读）"), (int)sizeof(txt));   // ★ 批次 K
     // 不可浏览的条目：灰字说明原因（不假装能点进去）
     if (!d->browsable) {
         const char* why = (d->skip == DRV64_SKIP_ESP)
@@ -1681,7 +1740,7 @@ static void draw_drive_card(const DriveInfo64* d, int cx0, int cy0, int selected
 }
 
 // 条目图标（几何画法；不做位图资源）
-static void draw_item_icon(int x, int y, const Vfs64Dirent64* d) {
+static void draw_item_icon(int x, int y, const Fs64Dirent64* d) {
     const int s = EXP_ICON_SIZE;
     if (d->type == VFS64_TYPE_DIR) {                       // 文件夹：琥珀色 + 标签
         frect(x, y + 4, s, s - 6, rgb(240, 190, 80));
@@ -1767,7 +1826,7 @@ static void draw_content(void) {
             const int ry = EXP_DET_ROW_Y + r * EXP_DET_ROW_H;
             if (sel_has(i)) frect(ax + 1, ry, aw - 2, EXP_DET_ROW_H, C_EXP_SEL);
             if (i == g_sel && sel_has(i)) drect(ax + 1, ry, aw - 2, EXP_DET_ROW_H, C_EXP_BOX_LINE);
-            const Vfs64Dirent64* d = &g_ents[i];
+            const Fs64Dirent64* d = &g_ents[i];
             char date[32], size[32];
             fmt_mtime64(d->mtime, date, (int)sizeof(date));
             if (d->type == VFS64_TYPE_DIR) e_strcpy(size, "-", (int)sizeof(size));
@@ -1799,6 +1858,8 @@ static void draw_content(void) {
 // ★ 批次 J：6 个文件操作按钮的可用状态（与右键菜单同一套规则；置灰就是真的不能点，点了只给提示）
 static bool exp_tb_enabled(int id) {
     if (g_mode != 1) return false;                     // "此电脑"页没有文件操作对象
+    // ★ 批次 K：只读卷（FAT32）上 新建/粘贴/剪切/重命名/删除 一律置灰；复制（从只读卷读出来）仍可用
+    if (g_ro) return (id == IDC_COPY) && sel_count() > 0;
     if (id == IDC_MKDIR) return true;
     if (id == IDC_PASTE) return g_clip_op != 0 && g_clip_n > 0;
     return sel_count() > 0;                            // 复制/剪切/重命名/删除
@@ -2199,7 +2260,8 @@ static void exp_click(Window* w, int cx, int cy) {
         const int k = (cy - g_ctx_y - 2) / EXP_CTX_ITEM_H;
         if (cx >= g_ctx_x && cx < g_ctx_x + EXP_CTX_W && cy >= g_ctx_y + 2 && k >= 0 && k < exp_ctx_count()) {
             if (exp_ctx_enabled(k)) { exp_ctx_activate(k); return; }
-            exp_msg(gui64_tr("That action is not available", "该操作当前不可用"));
+            if (g_ro) exp_roact("menu");
+            else exp_msg(gui64_tr("That action is not available", "该操作当前不可用"));
             exp_ctx_close();
             return;
         }
@@ -2209,7 +2271,7 @@ static void exp_click(Window* w, int cx, int cy) {
     if (g_props_open) { g_props_open = 0; gui64_invalidate_window(w); return; }
     // ---- ★ 批次 J：文件操作按钮（置灰的点了只给提示，不做事）----
     if (id >= IDC_MKDIR && id <= IDC_DEL) {
-        if (!exp_tb_enabled(id)) { exp_msg(gui64_tr("That action is not available", "该操作当前不可用")); return; }
+        if (!exp_tb_enabled(id)) { if (g_ro) exp_roact("toolbar"); else exp_msg(gui64_tr("That action is not available", "该操作当前不可用")); return; }
         if (id == IDC_MKDIR)       exp_edit_begin(EXP_EDIT_MKDIR, -1);
         else if (id == IDC_COPY)   exp_clip_set(1);
         else if (id == IDC_CUT)    exp_clip_set(2);

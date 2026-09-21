@@ -533,3 +533,25 @@ VMware 里同样可以：**新建虚拟机时 `guestOS` 必须选 64 位（`othe
 
 *文档版本：与 `README.md`、`docs/项目状态总览.md`、`docs/应用层与系统调用说明.md` 同步；
 状态数字由 `python tests/status_report.py` 生成，全量断言数字由 `python tests/status_report.py --full` + 5 个专项脚本实测，可复现。*
+
+## 批次 K：FAT32 只读浏览（含 VFAT 长名）
+
+内核以前只有 FAT32 **写入器**（安装时在目标盘写 48MB ESP），读侧一概不认；"此电脑"里
+FAT 卷只能显示成"EFI 系统分区（不浏览）"。批次 K 补上只读读侧：
+
+* `kernel/fat64.{h,cpp}`：只读读取器 —— 读 BPB 校验（`FATSz16=0 && FATSz32!=0`、512B 扇区、
+  每簇扇区数按 BPB、两份 FAT 首扇区比对、FSInfo 三签名）、**按簇数判定 FAT12/16/32**
+  （<4085 / 4085..65524 / >=65525；只有 FAT32 可浏览）、根目录与任意层子目录的簇链遍历、
+  8.3 短名 + **VFAT 长名（0x0F 项：顺序位 0x40、8.3 校验和、UTF-16 -> UTF-8）**、
+  `0xE5` 删除项与卷标项跳过、FAT 日期时间转成与 VimtuFS2 相同的打包编码；
+  边界：簇号范围、链长上限（防死循环）、单文件读取上限 16MB、卷内 LBA 范围全部先校验。
+* `kernel/fs64.{h,cpp}`：**统一分派层** —— 统一卷号（0..3 = vfs64 槽、4..7 = FAT 卷）、
+  `list/stat/read/卷信息/激活`；写操作在 FAT 卷上一律 `-FS64_EROFS`。
+* `kernel/drive64`：FAT32 分区（ESP / U 盘 / 数据分区）**分配盘符、标记只读**，
+  可用空间取挂载时的 FSInfo 快照；FAT12/16 仍只识别。
+* 文件管理器/终端/FD 层都改用 `fs64`：ESP 里能进 `EFI/BOOT`、看到 `BOOTX64.EFI`，
+  文本可预览、二进制双击提示"没有关联的应用打开此文件"；只读卷上粘贴/剪切/删除/重命名/新建
+  一律置灰并提示"只读卷（FAT32）"。终端 `ls/cat` 可用、`vol` 标 `ro`、新增 `fatcheck`
+  （按块读并算 CRC32，与构建产物核验），`write/rm/mkdir` 明确报只读。
+* 验收：`tests/fatread64_test.py`（真安装 ESP 三文件 CRC32 与 `build64/` 一致、长名/中文长名、
+  只读拒绝、explorer 端到端、启动前后 ESP 分区字节 CRC32 不变）。

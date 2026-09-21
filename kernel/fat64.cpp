@@ -531,6 +531,697 @@ int fat64_write_file_from_disk64(int drive, const char* path8_3, int src_drive,
     return 0;
 }
 
+// ==================== ★ 批次 K：读取器（只读浏览；支持范围见 fat64.h）====================
+// 设计要点（为什么这样写）：
+//   * 卷状态**独立**于写入器：写入器用 g_drive/g_start/g_chains… 维护"正在写的那个卷"，
+//     读取器用 g_rvol[FAT64_VOL_MAX] 维护"挂载了哪几个只读卷"。两者互不影响 ——
+//     自检里"先 format+write 内存卷、再用读取器读回来"跑的就是同一份代码。
+//   * 所有 I/O 先过 rv_read：卷号/已挂载/卷内 LBA 范围三重校验，越界一律拒绝（绝不越出分区）。
+//   * FAT 表访问带一个单扇区缓存：走簇链/列目录是顺序访问，缓存命中率很高。
+struct Fat64RVol {
+    bool        used;
+    bool        ram;
+    int         drive;
+    uint32_t    start_lba;
+    Fat64Info64 info;
+    uint32_t    fat_cache_sector;
+    uint8_t     fat_cache[FAT64_SECTOR];
+};
+static Fat64RVol g_rvol[FAT64_VOL_MAX];
+
+static uint8_t g_rsec[FAT64_SECTOR];
+static uint8_t g_rbuf[32 * 1024];
+static uint8_t g_rcheck[FAT64_SECTOR];
+
+static const uint32_t FAT64_RCACHE_INVALID = 0xFFFFFFFFu;
+
+static void rlog(const char* s) {
+    dbg64_line_begin64();
+    dbg64_str("[FAT64] ");
+    dbg64_str(s);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void rlog_reject(const char* why) {
+    dbg64_line_begin64();
+    dbg64_str("[FAT64] reject ");
+    dbg64_str(why);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static bool rv_read(int vol, uint32_t vol_lba, uint32_t count, uint8_t* data) {
+    if (vol < 0 || vol >= FAT64_VOL_MAX || !g_rvol[vol].used || !data || count == 0) return false;
+    Fat64RVol& v = g_rvol[vol];
+    if (count > v.info.total_sectors || vol_lba > v.info.total_sectors - count) return false;
+    if (v.ram) return ram_xfer(vol_lba, count, data, nullptr);
+    if (v.drive < 0) return false;
+    return ata64_read(v.drive, v.start_lba + vol_lba, count, data);
+}
+static int r_strlen(const char* s) { int n = 0; if (!s) return 0; while (s[n]) n++; return n; }
+static void r_strcpy(char* d, const char* s, int cap) {
+    int i = 0;
+    if (cap <= 0) return;
+    for (; s && s[i] && i < cap - 1; i++) d[i] = s[i];
+    d[i] = 0;
+}
+static bool r_name_eq(const char* a, const char* b) {
+    if (!a || !b) return false;
+    int i = 0;
+    for (; a[i] && b[i]; i++) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'a' && ca <= 'z') ca = (char)(ca - 32);
+        if (cb >= 'a' && cb <= 'z') cb = (char)(cb - 32);
+        if (ca != cb) return false;
+    }
+    return a[i] == 0 && b[i] == 0;
+}
+static bool r_is_dot_name(const char* n) {
+    if (!n) return false;
+    if (n[0] == '.' && n[1] == 0) return true;
+    if (n[0] == '.' && n[1] == '.' && n[2] == 0) return true;
+    return false;
+}
+// ---- BPB 解析（只读；s = 卷首扇区）----
+// 与写入器共用 FAT64_* 卷参数常量；**按 BPB 实际值算几何**（支持 4KB/簇 等 U 盘常见布局）。
+static int bpb_parse(const uint8_t* s, Fat64Info64* o) {
+    if (s[510] != 0x55 || s[511] != 0xAA) return -1;
+    if (!(s[0] == 0xEB || s[0] == 0xE9)) return -1;
+    const uint32_t bps = rd16(s + 11);
+    if (bps != FAT64_SECTOR) return -1;
+    const uint32_t spc = s[13];
+    if (spc == 0 || (spc & (spc - 1)) != 0 || spc > 128) return -1;
+    const uint32_t reserved = rd16(s + 14);
+    const uint32_t nfats = s[16];
+    const uint32_t root_ent = rd16(s + 17);
+    const uint32_t fatsz16 = rd16(s + 22);
+    const uint32_t fatsz32 = rd32(s + 36);
+    if (reserved == 0 || nfats == 0 || nfats > 2) return -1;
+    uint32_t total = rd16(s + 19);
+    if (total == 0) total = rd32(s + 32);
+    if (total == 0) return -1;
+    uint32_t fatsz = 0;
+    if (fatsz16 == 0 && fatsz32 != 0) fatsz = fatsz32;
+    else if (fatsz16 != 0 && fatsz32 == 0) fatsz = fatsz16;
+    else return -1;
+    const uint32_t root_dir_secs = (root_ent * 32u + FAT64_SECTOR - 1u) / FAT64_SECTOR;
+    const uint32_t data_start = reserved + nfats * fatsz + root_dir_secs;
+    if (data_start >= total) return -1;
+    const uint32_t clusters = (total - data_start) / spc;
+    if (clusters == 0) return -1;
+    memzero8((uint8_t*)o, (uint32_t)sizeof(*o));
+    o->bytes_per_sector = bps;
+    o->spc = spc;
+    o->reserved = reserved;
+    o->num_fats = nfats;
+    o->fatsz = fatsz;
+    o->total_sectors = total;
+    o->data_start = data_start;
+    o->clusters = clusters;
+    o->cluster_bytes = spc * FAT64_SECTOR;
+    o->free_clusters = 0xFFFFFFFFu;
+    o->fat_type = (clusters < 4085u) ? FAT64_TYPE_12 : ((clusters < 65525u) ? FAT64_TYPE_16 : FAT64_TYPE_32);
+    o->root_cluster = (fatsz16 == 0) ? rd32(s + 44) : 0;
+    o->fsinfo_sector = (fatsz16 == 0) ? rd16(s + 48) : 0;
+    if (fatsz16 == 0 && nfats >= 2 && (rd16(s + 40) & 0x0080u) == 0) o->mirr = 2;
+    else o->mirr = 0;
+    for (int i = 0; i < 8; i++) o->oem[i] = (char)s[3 + i];
+    o->oem[8] = 0;
+    for (int i = 0; i < 11; i++) o->label[i] = (char)s[71 + i];
+    o->label[11] = 0;
+    for (int i = 10; i >= 0 && o->label[i] == ' '; i--) o->label[i] = 0;
+    if (o->fat_type == FAT64_TYPE_32 && o->root_cluster < 2) return -1;
+    return 0;
+}
+int fat64_probe64(int drive, uint32_t lba, Fat64Info64* out) {
+    if (drive < 0) return -1;
+    if (!ata64_read(drive, lba, 1, g_rsec)) return -1;
+    Fat64Info64 info;
+    if (bpb_parse(g_rsec, &info) != 0) {
+        dbg64_line_begin64();
+        dbg64_str("[FAT64] probe lba=");
+        dbg64_dec(lba);
+        dbg64_str(" fs=none (bad BPB)");
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[FAT64] probe lba=");
+    dbg64_dec(lba);
+    dbg64_str(" fs=");
+    dbg64_str(info.fat_type == FAT64_TYPE_32 ? "FAT32" : (info.fat_type == FAT64_TYPE_16 ? "FAT16" : "FAT12"));
+    dbg64_str(" clusters=");
+    dbg64_dec(info.clusters);
+    dbg64_str(" spc=");
+    dbg64_dec(info.spc);
+    dbg64_str(" fatsz=");
+    dbg64_dec(info.fatsz);
+    if (info.label[0]) {
+        dbg64_str(" label=");
+        dbg64_str(info.label);
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+    if (out) *out = info;
+    return 0;
+}
+int fat64_mount_find64(int drive, uint32_t lba) {
+    for (int i = 0; i < FAT64_VOL_MAX; i++) {
+        if (!g_rvol[i].used || g_rvol[i].ram) continue;
+        if (g_rvol[i].drive == drive && g_rvol[i].start_lba == lba) return i;
+    }
+    return -1;
+}
+int fat64_vol_used64(int vol) {
+    return (vol >= 0 && vol < FAT64_VOL_MAX && g_rvol[vol].used) ? 1 : 0;
+}
+int fat64_vol_info64(int vol, Fat64Info64* out) {
+    if (!fat64_vol_used64(vol)) return -1;
+    if (out) *out = g_rvol[vol].info;
+    return 0;
+}
+uint32_t fat64_vol_free64(int vol) {
+    if (!fat64_vol_used64(vol)) return 0xFFFFFFFFu;
+    return g_rvol[vol].info.free_clusters;
+}
+// ---- FAT 项 / 簇链 ----
+static bool rfat_entry(int vol, uint32_t c, uint32_t* out) {
+    Fat64RVol& v = g_rvol[vol];
+    if ((c + 1u) * 4u > v.info.fatsz * FAT64_SECTOR) return false;
+    const uint32_t off = c * 4u;
+    const uint32_t sec = v.info.reserved + off / FAT64_SECTOR;
+    const uint32_t o   = off % FAT64_SECTOR;
+    if (v.fat_cache_sector != sec) {
+        if (!rv_read(vol, sec, 1, v.fat_cache)) return false;
+        v.fat_cache_sector = sec;
+    }
+    *out = rd32(v.fat_cache + o) & 0x0FFFFFFFu;
+    return true;
+}
+static uint32_t rcluster_lba(int vol, uint32_t c) {
+    return g_rvol[vol].info.data_start + (c - 2u) * g_rvol[vol].info.spc;
+}
+static bool rchain_next(int vol, uint32_t c, uint32_t* out_next) {
+    const uint32_t clusters = g_rvol[vol].info.clusters;
+    uint32_t val = 0;
+    if (c < 2 || c > clusters + 1u) { rlog_reject("chain: cluster out of range"); return false; }
+    if (!rfat_entry(vol, c, &val)) { rlog_reject("chain: FAT read failed"); return false; }
+    if (val >= 0x0FFFFFF8u) { *out_next = 0; return true; }
+    if (val < 2 || val > clusters + 1u || val == c) { rlog_reject("chain: bad next (loop/out of range)"); return false; }
+    *out_next = val;
+    return true;
+}
+
+// ---- 目录项：8.3 短名 / VFAT 长名（LFN）----
+struct Fat64Lfn64 {
+    uint16_t buf[FAT64_LFN_CHARS];
+    uint32_t count;
+    uint32_t expect;
+    uint8_t  sum;
+    uint8_t  active;
+};
+static void lfn_reset(Fat64Lfn64* l) { l->count = 0; l->expect = 0; l->sum = 0; l->active = 0; }
+static uint8_t lfn_checksum(const uint8_t e11[11]) {
+    uint8_t s = 0;
+    for (int i = 0; i < 11; i++) s = (uint8_t)(((s & 1u) << 7) + (s >> 1) + e11[i]);
+    return s;
+}
+static void lfn_put(Fat64Lfn64* l, uint32_t seq, const uint8_t* e) {
+    static const uint8_t off[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+    const uint32_t base = (seq - 1u) * 13u;
+    for (uint32_t k = 0; k < 13u; k++) {
+        if (base + k >= FAT64_LFN_CHARS) break;
+        l->buf[base + k] = (uint16_t)(e[off[k]] | ((uint16_t)e[off[k] + 1] << 8));
+    }
+}
+static void utf16_to_utf8(const uint16_t* in, uint32_t n, char* out, int cap) {
+    int o = 0;
+    for (uint32_t i = 0; i < n && o < cap - 1; i++) {
+        uint32_t cp = in[i];
+        if (cp == 0) break;
+        if (cp >= 0xD800u && cp <= 0xDBFFu) {
+            if (i + 1u < n && in[i + 1] >= 0xDC00u && in[i + 1] <= 0xDFFFu) {
+                cp = 0x10000u + ((cp - 0xD800u) << 10) + (in[i + 1] - 0xDC00u);
+                i++;
+            } else {
+                cp = '?';
+            }
+        } else if (cp >= 0xDC00u && cp <= 0xDFFFu) {
+            cp = '?';
+        }
+        if (cp < 0x80u) {
+            out[o++] = (char)cp;
+        } else if (cp < 0x800u) {
+            if (o + 2 > cap - 1) break;
+            out[o++] = (char)(0xC0u | (cp >> 6));
+            out[o++] = (char)(0x80u | (cp & 0x3Fu));
+        } else if (cp < 0x10000u) {
+            if (o + 3 > cap - 1) break;
+            out[o++] = (char)(0xE0u | (cp >> 12));
+            out[o++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+            out[o++] = (char)(0x80u | (cp & 0x3Fu));
+        } else {
+            if (o + 4 > cap - 1) break;
+            out[o++] = (char)(0xF0u | (cp >> 18));
+            out[o++] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+            out[o++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+            out[o++] = (char)(0x80u | (cp & 0x3Fu));
+        }
+    }
+    out[o] = 0;
+}
+static void short_name83(const uint8_t e[11], uint8_t ntflags, char* out, int cap) {
+    char base[9], ext[4];
+    int bn = 0, en = 0;
+    for (int i = 0; i < 8; i++) {
+        uint8_t c = e[i];
+        if (i == 0 && c == 0x05) c = 0xE5;
+        if (ntflags & 0x08u) { if (c >= 'A' && c <= 'Z') c = (uint8_t)(c + 32); }
+        base[bn++] = (char)c;
+    }
+    base[bn] = 0;
+    while (bn > 0 && base[bn - 1] == ' ') base[--bn] = 0;
+    for (int i = 8; i < 11; i++) {
+        uint8_t c = e[i];
+        if (ntflags & 0x10u) { if (c >= 'A' && c <= 'Z') c = (uint8_t)(c + 32); }
+        ext[en++] = (char)c;
+    }
+    ext[en] = 0;
+    while (en > 0 && ext[en - 1] == ' ') ext[--en] = 0;
+    int o = 0;
+    for (int i = 0; i < bn && o < cap - 1; i++) out[o++] = base[i];
+    if (en > 0) {
+        if (o < cap - 1) out[o++] = '.';
+        for (int i = 0; i < en && o < cap - 1; i++) out[o++] = ext[i];
+    }
+    out[o] = 0;
+}
+static uint32_t fat_pack_time(uint16_t fdate, uint16_t ftime) {
+    const uint32_t y = 1980u + ((fdate >> 9) & 0x7Fu);
+    const uint32_t mo = (fdate >> 5) & 0x0Fu;
+    const uint32_t d = fdate & 0x1Fu;
+    const uint32_t h = (ftime >> 11) & 0x1Fu;
+    const uint32_t mi = (ftime >> 5) & 0x3Fu;
+    const uint32_t s = (ftime & 0x1Fu) * 2u;
+    if (y < 2000u || y > 2063u || mo < 1u || mo > 12u || d < 1u || d > 31u ||
+        h > 23u || mi > 59u || s > 59u) return 0;
+    return ((y - 2000u) << 26) | (mo << 22) | (d << 17) | (h << 12) | (mi << 6) | s;
+}
+static int dir_step(Fat64Lfn64* st, const uint8_t* e, Fat64Entry64* out) {
+    if (e[0] == 0xE5) { lfn_reset(st); return 0; }
+    const uint8_t attr = e[11];
+    if (attr == 0x0F) {
+        const uint8_t seq = (uint8_t)(e[0] & 0x3Fu);
+        if (e[0] & 0x40u) { lfn_reset(st); st->active = 1; st->expect = seq; st->count = seq; st->sum = e[12]; }
+        if (!st->active || seq == 0 || seq > (FAT64_LFN_CHARS / 13u) ||
+            e[12] != st->sum || seq != st->expect) {
+            lfn_reset(st);
+            return 0;
+        }
+        lfn_put(st, seq, e);
+        st->expect = seq - 1u;
+        return 0;
+    }
+    if (attr & 0x08u) { lfn_reset(st); return 0; }
+    memzero8((uint8_t*)out, (uint32_t)sizeof(*out));
+    out->attr = attr;
+    out->cluster = ((uint32_t)rd16(e + 20) << 16) | rd16(e + 26);
+    out->size = rd32(e + 28);
+    out->mtime = fat_pack_time((uint16_t)rd16(e + 24), (uint16_t)rd16(e + 22));
+    if (st->active && st->expect == 0 && st->count > 0 && st->count <= FAT64_LFN_CHARS &&
+        lfn_checksum(e) == st->sum) {
+        char nm[FAT64_NAME_MAX];
+        // ★ 每个 0x0F 项携带 13 个 UTF-16 码元；count = **项数**，字符区 = count*13（超出部分是补零）。
+        //   之前这里把 count 直接当"字符数"用，26 字符的长名只解出前 3 个字符（LFN 自检抓到的 bug）。
+        uint32_t lfn_units = st->count * 13u;
+        if (lfn_units > FAT64_LFN_CHARS) lfn_units = FAT64_LFN_CHARS;
+        utf16_to_utf8(st->buf, lfn_units, nm, (int)sizeof(nm));
+        if (nm[0]) {
+            r_strcpy(out->name, nm, (int)sizeof(out->name));
+            out->lfn = 1;
+        } else {
+            short_name83(e, e[12], out->name, (int)sizeof(out->name));
+        }
+    } else {
+        short_name83(e, e[12], out->name, (int)sizeof(out->name));
+    }
+    lfn_reset(st);
+    return out->name[0] ? 1 : 0;
+}
+
+// 目录遍历：cb 返回 false 提前停止。返回 1 = 走完、0 = cb 停止、-1 = I/O/坏链。
+typedef bool (*Fat64DirCb64)(void* ctx, const Fat64Entry64* e);
+static int dir_walk(int vol, uint32_t start_cluster, Fat64DirCb64 cb, void* ctx) {
+    if (!fat64_vol_used64(vol)) return -1;
+    const uint32_t clusters = g_rvol[vol].info.clusters;
+    if (start_cluster < 2 || start_cluster > clusters + 1u) return -1;
+    Fat64Lfn64 lfn;
+    lfn_reset(&lfn);
+    uint32_t c = start_cluster;
+    uint32_t guard = 0;
+    for (;;) {
+        const uint32_t clba = rcluster_lba(vol, c);
+        for (uint32_t s = 0; s < g_rvol[vol].info.spc; s++) {
+            if (!rv_read(vol, clba + s, 1, g_rsec)) { rlog_reject("dir: read failed"); return -1; }
+            for (uint32_t o = 0; o + 32u <= FAT64_SECTOR; o += 32u) {
+                const uint8_t* e = g_rsec + o;
+                if (e[0] == 0x00) return 1;
+                Fat64Entry64 ent;
+                if (dir_step(&lfn, e, &ent) == 1) {
+                    if (!cb(ctx, &ent)) return 0;
+                }
+            }
+        }
+        uint32_t nx = 0;
+        if (!rchain_next(vol, c, &nx)) return -1;
+        if (nx == 0) return 1;
+        c = nx;
+        if (++guard > FAT64_CHAIN_MAX) { rlog_reject("dir: chain too long"); return -1; }
+    }
+}
+struct Fat64Find64 { const char* name; Fat64Entry64* out; int found; };
+static bool find_cb(void* p, const Fat64Entry64* e) {
+    Fat64Find64* f = (Fat64Find64*)p;
+    if (r_name_eq(e->name, f->name)) {
+        *f->out = *e;
+        f->found = 1;
+        return false;
+    }
+    return true;
+}
+static int dir_find(int vol, uint32_t dir_cluster, const char* name, Fat64Entry64* out) {
+    Fat64Find64 f;
+    f.name = name;
+    f.out = out;
+    f.found = 0;
+    const int r = dir_walk(vol, dir_cluster, find_cb, &f);
+    if (r < 0) return -1;
+    return f.found ? 1 : 0;
+}
+static int resolve64(int vol, const char* path, Fat64Entry64* out_entry, uint32_t* out_cluster) {
+    if (!fat64_vol_used64(vol) || !path) return -1;
+    const uint32_t root = g_rvol[vol].info.root_cluster;
+    uint32_t cur = root;
+    char seg[FAT64_NAME_MAX];
+    int i = 0;
+    int depth = 0;
+    for (;;) {
+        while (path[i] == '/') i++;
+        if (path[i] == 0) break;
+        int n = 0;
+        while (path[i] && path[i] != '/') {
+            if (n < (int)sizeof(seg) - 1) seg[n++] = path[i];
+            i++;
+        }
+        seg[n] = 0;
+        if (n == 0) continue;
+        if (n == 1 && seg[0] == '.') continue;
+        if (++depth > 32) { rlog_reject("path: too deep"); return -1; }
+        if (n == 2 && seg[0] == '.' && seg[1] == '.') {
+            Fat64Entry64 up;
+            const int r = dir_find(vol, cur, "..", &up);
+            if (r < 0) return -1;
+            cur = (r == 1 && up.cluster >= 2) ? up.cluster : root;
+            continue;
+        }
+        Fat64Entry64 e;
+        const int r = dir_find(vol, cur, seg, &e);
+        if (r < 0) return -1;
+        if (r == 0) { rlog_reject("path: component not found"); return -1; }
+        const bool last = (path[i] == 0) || (path[i] == '/' && path[i + 1] == 0);
+        if (last) {
+            if (out_entry) *out_entry = e;
+            if (out_cluster) *out_cluster = e.cluster;
+            return 0;
+        }
+        if (!(e.attr & 0x10u)) { rlog_reject("path: not a directory"); return -1; }
+        if (e.cluster < 2 || e.cluster > g_rvol[vol].info.clusters + 1u) { rlog_reject("path: bad dir cluster"); return -1; }
+        cur = e.cluster;
+    }
+    if (out_entry) {
+        memzero8((uint8_t*)out_entry, (uint32_t)sizeof(*out_entry));
+        out_entry->name[0] = '/'; out_entry->name[1] = 0;
+        out_entry->attr = 0x10u;
+        out_entry->cluster = root;
+        out_entry->mtime = 0;
+    }
+    if (out_cluster) *out_cluster = root;
+    return 0;
+}
+
+// ---- 列目录（游标分页）----
+struct Fat64List64 { Fat64Entry64* out; int max; int n; uint32_t cursor; uint32_t idx; };
+static bool list_cb(void* p, const Fat64Entry64* e) {
+    Fat64List64* l = (Fat64List64*)p;
+    if (r_is_dot_name(e->name)) return true;
+    if (l->idx++ < l->cursor) return true;
+    if (l->n >= l->max) return false;
+    l->out[l->n++] = *e;
+    return true;
+}
+int fat64_list64(int vol, const char* path, Fat64Entry64* out, int max, uint32_t* cursor) {
+    if (!out || max <= 0) return -1;
+    Fat64Entry64 de;
+    uint32_t cluster = 0;
+    if (resolve64(vol, path, &de, &cluster) != 0) return -1;
+    if (!(de.attr & 0x10u)) { rlog_reject("list: not a directory"); return -1; }
+    Fat64List64 l;
+    l.out = out; l.max = max; l.n = 0;
+    l.cursor = cursor ? *cursor : 0;
+    l.idx = 0;
+    const int r = dir_walk(vol, cluster, list_cb, &l);
+    if (r < 0) return -1;
+    if (cursor) *cursor = l.cursor + (uint32_t)l.n;
+    if (l.n > 0) {
+        dbg64_line_begin64();
+        dbg64_str("[FAT64] list path=");
+        dbg64_str(path ? path : "/");
+        dbg64_str(" entries=");
+        dbg64_dec((uint64_t)l.n);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    return l.n;
+}
+int fat64_stat64(int vol, const char* path, Fat64Entry64* out) {
+    if (!out) return -1;
+    const int r = resolve64(vol, path, out, nullptr);
+    if (r != 0) {
+        dbg64_line_begin64();
+        dbg64_str("[FAT64] stat path=");
+        dbg64_str(path ? path : "?");
+        dbg64_str(" not found");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    return r;
+}
+
+// ---- 读文件（按簇链；off/len 先校验）----
+int fat64_read_range64(int vol, const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got) {
+    if (!buf || !out_got) return -1;
+    *out_got = 0;
+    Fat64Entry64 e;
+    if (resolve64(vol, path, &e, nullptr) != 0) { rlog_reject("read: path not found"); return -1; }
+    if (e.attr & 0x10u) { rlog_reject("read: is a directory"); return -1; }
+    if (e.size > FAT64_READ_MAX_BYTES) { rlog_reject("read: file too large (limit 16MB)"); return -1; }
+    if (off >= e.size || len == 0) return 0;
+    uint32_t want = e.size - off;
+    if (want > len) want = len;
+    if (want > FAT64_READ_MAX_BYTES) { rlog_reject("read: request too large"); return -1; }
+    uint32_t c = e.cluster;
+    if (c < 2) { rlog_reject("read: empty file has no cluster"); return -1; }
+    uint32_t skip = off / g_rvol[vol].info.cluster_bytes;
+    uint32_t within = off % g_rvol[vol].info.cluster_bytes;
+    uint32_t guard = 0;
+    while (skip > 0) {
+        uint32_t nx = 0;
+        if (!rchain_next(vol, c, &nx) || nx == 0) { rlog_reject("read: chain ended early"); return -1; }
+        c = nx;
+        skip--;
+        if (++guard > FAT64_CHAIN_MAX) { rlog_reject("read: chain too long"); return -1; }
+    }
+    uint32_t done = 0;
+    uint32_t remaining = want;
+    while (remaining > 0) {
+        const uint32_t clba = rcluster_lba(vol, c);
+        const uint32_t cb = g_rvol[vol].info.cluster_bytes;
+        uint32_t to_copy = cb - within;
+        if (to_copy > remaining) to_copy = remaining;
+        uint32_t seg = within;
+        const uint32_t seg_end = within + to_copy;
+        while (seg < seg_end) {
+            const uint32_t sec = seg / FAT64_SECTOR;
+            const uint32_t off_in = seg % FAT64_SECTOR;
+            if (sec >= g_rvol[vol].info.spc) break;
+            uint32_t secs = (off_in + (seg_end - seg) + FAT64_SECTOR - 1u) / FAT64_SECTOR;
+            const uint32_t max_secs = g_rvol[vol].info.spc - sec;
+            if (secs > max_secs) secs = max_secs;
+            if (secs * FAT64_SECTOR > sizeof(g_rbuf)) secs = (uint32_t)(sizeof(g_rbuf) / FAT64_SECTOR);
+            if (secs == 0) { rlog_reject("read: bad sector math"); return -1; }
+            if (!rv_read(vol, clba + sec, secs, g_rbuf)) { rlog_reject("read: I/O failed"); return -1; }
+            uint32_t chunk = secs * FAT64_SECTOR - off_in;
+            if (chunk > seg_end - seg) chunk = seg_end - seg;
+            memcopy8((uint8_t*)buf + done, g_rbuf + off_in, chunk);
+            done += chunk;
+            seg += chunk;
+        }
+        remaining -= to_copy;
+        if (remaining == 0) break;
+        uint32_t nx = 0;
+        if (!rchain_next(vol, c, &nx) || nx == 0) { rlog_reject("read: chain ended early"); return -1; }
+        c = nx;
+        within = 0;
+        if (++guard > FAT64_CHAIN_MAX) { rlog_reject("read: chain too long"); return -1; }
+    }
+    *out_got = done;
+    dbg64_line_begin64();
+    dbg64_str("[FAT64] read path=");
+    dbg64_str(path ? path : "?");
+    dbg64_str(" size=");
+    dbg64_dec(e.size);
+    dbg64_str(" bytes=");
+    dbg64_dec(done);
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+int fat64_read64(int vol, const char* path, void* buf, uint32_t max, uint32_t* out_len) {
+    return fat64_read_range64(vol, path, 0, buf, max, out_len);
+}
+
+// ---- 挂载（只读）----
+// 同 (drive,lba) 幂等复用；只挂 FAT32（FAT12/16 的 12/16 位 FAT 项本批不做，如实拒绝并写清类型）。
+int fat64_mount64(int drive, uint32_t lba, int* out_vol) {
+    const int exist = fat64_mount_find64(drive, lba);
+    if (exist >= 0) {
+        if (out_vol) *out_vol = exist;
+        return 0;
+    }
+    if (!ata64_read(drive, lba, 1, g_rsec)) { rlog_reject("mount: boot sector read failed"); return -1; }
+    Fat64Info64 info;
+    if (bpb_parse(g_rsec, &info) != 0) { rlog_reject("mount: bad BPB"); return -1; }
+    if (info.fat_type != FAT64_TYPE_32) {
+        dbg64_line_begin64();
+        dbg64_str("[FAT64] reject mount: only FAT32 browsing is implemented (type=");
+        dbg64_dec(info.fat_type);
+        dbg64_str(")");
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+    int slot = -1;
+    for (int i = 0; i < FAT64_VOL_MAX; i++) if (!g_rvol[i].used) { slot = i; break; }
+    if (slot < 0) { rlog_reject("mount: no free FAT volume slot"); return -1; }
+    Fat64RVol& v = g_rvol[slot];
+    memzero8((uint8_t*)&v, (uint32_t)sizeof(v));
+    v.used = true; v.ram = false; v.drive = drive; v.start_lba = lba;
+    v.info = info;
+    v.fat_cache_sector = FAT64_RCACHE_INVALID;
+    uint8_t fat_ok = 0;
+    uint32_t e0 = 0, e1 = 0;
+    if (rfat_entry(slot, 0, &e0) && rfat_entry(slot, 1, &e1) && e0 >= 0x0FFFFFF8u && e1 >= 0x0FFFFFF8u) {
+        fat_ok = 1;
+        if (v.info.mirr == 2 && v.info.num_fats >= 2) {
+            v.info.mirr = 1;
+            if (!rv_read(slot, v.info.reserved, 1, g_rsec) ||
+                !rv_read(slot, v.info.reserved + v.info.fatsz, 1, g_rcheck)) {
+                fat_ok = 0;
+            } else {
+                for (uint32_t i = 0; i < FAT64_SECTOR; i++) {
+                    if (g_rsec[i] != g_rcheck[i]) { v.info.mirr = 0; break; }
+                }
+            }
+        }
+    }
+    if (v.info.fsinfo_sector > 0 && v.info.fsinfo_sector < v.info.reserved) {
+        if (rv_read(slot, v.info.fsinfo_sector, 1, g_rsec) &&
+            rd32(g_rsec + 0) == 0x41615252u && rd32(g_rsec + 484) == 0x61417272u &&
+            rd32(g_rsec + 508) == 0xAA550000u) {
+            const uint32_t freec = rd32(g_rsec + 488);
+            v.info.fsinfo_ok = 1;
+            v.info.free_clusters = (freec <= v.info.clusters) ? freec : 0xFFFFFFFFu;
+        }
+    }
+    dbg64_line_begin64();
+    dbg64_str("[FAT64] mount vol=");
+    dbg64_dec((uint64_t)slot);
+    dbg64_str(" lba=");
+    dbg64_dec(lba);
+    dbg64_str(" clusters=");
+    dbg64_dec(v.info.clusters);
+    dbg64_str(" free=");
+    if (v.info.free_clusters == 0xFFFFFFFFu) dbg64_str("unknown"); else dbg64_dec(v.info.free_clusters);
+    dbg64_str(" fat_ok=");
+    dbg64_dec(fat_ok);
+    dbg64_str(" spc=");
+    dbg64_dec(v.info.spc);
+    dbg64_str(" ro=1");
+    dbg64_nl();
+    dbg64_line_end64();
+    if (!fat_ok) { rlog_reject("mount: FAT header invalid"); g_rvol[slot].used = false; return -1; }
+    if (out_vol) *out_vol = slot;
+    return 0;
+}
+
+// 自检用：把写入器刚格式化好的**内存卷**注册成只读卷（不碰真盘）。
+static int fat64_mount_ram64(uint32_t sectors, int* out_vol) {
+    if (g_ram_pages == 0 || sectors == 0) return -1;
+    if (!ram_xfer(0, 1, g_rsec, nullptr)) return -1;
+    Fat64Info64 info;
+    if (bpb_parse(g_rsec, &info) != 0) return -1;
+    if (info.fat_type != FAT64_TYPE_32 || info.total_sectors != sectors) return -1;
+    int slot = -1;
+    for (int i = 0; i < FAT64_VOL_MAX; i++) if (!g_rvol[i].used) { slot = i; break; }
+    if (slot < 0) return -1;
+    Fat64RVol& v = g_rvol[slot];
+    memzero8((uint8_t*)&v, (uint32_t)sizeof(v));
+    v.used = true; v.ram = true; v.drive = -1; v.start_lba = 0;
+    v.info = info;
+    v.fat_cache_sector = FAT64_RCACHE_INVALID;
+    if (out_vol) *out_vol = slot;
+    return 0;
+}
+static void fat64_unmount64(int vol) {
+    if (vol < 0 || vol >= FAT64_VOL_MAX) return;
+    memzero8((uint8_t*)&g_rvol[vol], (uint32_t)sizeof(g_rvol[vol]));
+    g_rvol[vol].fat_cache_sector = FAT64_RCACHE_INVALID;
+}
+
+// 只读探测真实磁盘上的 FAT 分区（**绝不写盘**；找不到就如实打一行）。
+// 装好的盘启动时找到的就是安装器写的那个 ESP；光驱（ATAPI）跳过（读法不同）。
+static void fat64_probe_real64() {
+    int disks = 0, fat_found = 0;
+    const int slots = ata64_drive_count64();
+    for (int s = 0; s < slots && disks < 8; s++) {
+        const int d = ata64_slot_to_drive64(s);
+        if (d < 0) continue;
+        DiskInfo di;
+        if (!ata64_identify(d, &di) || !di.present || di.atapi) continue;
+        disks++;
+        uint8_t mbr[FAT64_SECTOR];
+        if (!ata64_read(d, 0, 1, mbr)) continue;
+        if (mbr[510] != 0x55 || mbr[511] != 0xAA) continue;
+        for (int p = 0; p < 4; p++) {
+            const uint8_t* e = mbr + 446 + p * 16;
+            const uint8_t type = e[4];
+            const uint32_t start = rd32(e + 8);
+            if (type == 0) continue;
+            const bool fatish = (type == 0xEF || type == 0x01 || type == 0x04 || type == 0x06 ||
+                                 type == 0x0B || type == 0x0C || type == 0x0E);
+            if (!fatish) continue;
+            if (fat64_probe64(d, start, nullptr) == 0) fat_found++;
+        }
+    }
+    dbg64_line_begin64();
+    dbg64_str("[FAT64] probe real disks=");
+    dbg64_dec((uint64_t)disks);
+    dbg64_str(" fat=");
+    dbg64_dec((uint64_t)fat_found);
+    dbg64_str(" (read-only)");
+    dbg64_nl();
+    dbg64_line_end64();
+}
 // ---------------- 离线自检 ----------------
 // 目的：把"卷结构自洽"变成可执行的证据，而不是靠人读代码：
 //   1) 坏参数被拒（卷太小 / 32MB 这种"装不下 65525 簇"的卷 / 未格式化就写文件）
@@ -701,6 +1392,137 @@ int fat64_selftest64() {
         }
         if (fat64_mkdir64(0, "NOPE/SUB") == 0) mask |= 32768;         // 父目录不存在 -> 必须失败
         if (fat64_write_file64(0, "ZZZZZZZZZ.BIN", pat, 16) == 0) mask |= 65536;  // 主名 > 8 -> 必须失败
+
+        // ---- ★ 批次 K：读取器（只读）在同一内存卷上的完整往返 ----
+        // format -> mkdir EFI / EFI/BOOT -> write 3000B TEST.BIN 已经在上面做完；
+        // 现在**用新的读取器**（不共享写入器的内存目录表/簇表）重新挂载这块内存卷：
+        // list("/") 找 EFI -> stat EFI/BOOT/TEST.BIN -> 读回 3000B 逐字节比对。
+        {
+            int rvol = -1;
+            if (fat64_mount_ram64(FAT64_SELFTEST_SECTORS, &rvol) != 0) {
+                mask |= 4194304;                                          // bit22：读取器挂载失败
+            } else {
+                Fat64Info64 ri;
+                if (fat64_vol_info64(rvol, &ri) != 0 || ri.fat_type != FAT64_TYPE_32 ||
+                    ri.clusters < FAT64_CLUSTER_MIN || ri.cluster_bytes != FAT64_SPC * FAT64_SECTOR) {
+                    mask |= 4194304;
+                }
+                Fat64Entry64 ents[8];
+                uint32_t cur = 0;
+                const int ln = fat64_list64(rvol, "/", ents, 8, &cur);
+                bool found_efi = false;
+                if (ln >= 1) {
+                    for (int i = 0; i < ln; i++) {
+                        if (r_name_eq(ents[i].name, "EFI") && (ents[i].attr & 0x10u)) { found_efi = true; break; }
+                    }
+                } else {
+                    mask |= 4194304;
+                }
+                if (!found_efi) mask |= 4194304;
+                Fat64Entry64 te;
+                if (fat64_stat64(rvol, "/EFI/BOOT/TEST.BIN", &te) != 0 ||
+                    te.size != sizeof(pat) || (te.attr & 0x10u)) {
+                    mask |= 4194304;
+                } else {
+                    static uint8_t rback[3000];
+                    uint32_t got = 0;
+                    if (fat64_read64(rvol, "/EFI/BOOT/TEST.BIN", rback, sizeof(rback), &got) != 0 ||
+                        got != sizeof(pat)) {
+                        mask |= 4194304;
+                    } else {
+                        for (uint32_t i = 0; i < sizeof(pat); i++) {
+                            if (rback[i] != pat[i]) { mask |= 4194304; break; }
+                        }
+                    }
+                }
+                if (fat64_stat64(rvol, "/NO/SUCH.TXT", &te) == 0) mask |= 4194304;   // 不存在的路径必须被拒
+                fat64_unmount64(rvol);
+            }
+        }
+
+        // ---- ★ 批次 K：LFN（0x0F）纯函数自检：顺序位 / 校验和 / UTF-16 拼接 / 回退短名 ----
+        // 直接喂 4 个 32B 目录项（2 个 LFN 项 + 1 个短名项 + 1 个坏校验和组），不碰盘。
+        {
+            static const char* LNAME = "LongName-Document-2026.txt";        // 26 字符 -> 需要 2 个 LFN 项
+            static const uint8_t offs[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+            uint8_t e0[32], e1[32], e2[32], e3[32];
+            memzero8(e0, 32); memzero8(e1, 32); memzero8(e2, 32); memzero8(e3, 32);
+            for (int i = 0; i < 11; i++) { e2[i] = (uint8_t)"LONGNA~1TXT"[i]; e3[i] = e2[i]; }
+            const uint8_t sum = lfn_checksum(e2);
+            e0[0] = 0x42; e0[11] = 0x0F; e0[12] = sum;                     // 最后逻辑项（第二项）
+            e1[0] = 0x01; e1[11] = 0x0F; e1[12] = sum;                     // 第一项
+            e2[11] = 0x20;
+            wr16(e2 + 26, 5); wr32(e2 + 28, 123);                          // 首簇 5 / 大小 123
+            wr16(e2 + 22, (uint16_t)((12u << 11) | (34u << 5) | (10u / 2u)));   // 12:34:10
+            wr16(e2 + 24, (uint16_t)((26u << 9) | (9u << 5) | 20u));            // 2026-09-20
+            for (uint32_t k = 0; k < 13u; k++) {
+                const uint16_t c0 = (k + 13u < 27u) ? (uint16_t)LNAME[k + 13u] : 0;
+                const uint16_t c1 = (k < 27u) ? (uint16_t)LNAME[k] : 0;
+                e0[offs[k]] = (uint8_t)(c0 & 0xFF); e0[offs[k] + 1] = (uint8_t)(c0 >> 8);
+                e1[offs[k]] = (uint8_t)(c1 & 0xFF); e1[offs[k] + 1] = (uint8_t)(c1 >> 8);
+            }
+            e3[0] = 0x42; e3[11] = 0x0F; e3[12] = (uint8_t)(sum ^ 0x01);    // 校验和错：必须回退短名
+            Fat64Lfn64 st;
+            Fat64Entry64 out;
+            lfn_reset(&st);
+            bool lfn_ok = (dir_step(&st, e0, &out) == 0) && (dir_step(&st, e1, &out) == 0);
+            lfn_ok = lfn_ok && dir_step(&st, e2, &out) == 1 && out.lfn == 1 &&
+                     r_name_eq(out.name, LNAME) && out.cluster == 5 && out.size == 123 &&
+                     out.mtime == fat_pack_time((uint16_t)((26u << 9) | (9u << 5) | 20u),
+                                                (uint16_t)((12u << 11) | (34u << 5) | 5u));
+            lfn_reset(&st);
+            const bool fb_ok = (dir_step(&st, e0, &out) == 0) && (dir_step(&st, e3, &out) == 0) &&
+                               dir_step(&st, e2, &out) == 1 && out.lfn == 0 &&
+                               r_name_eq(out.name, "LONGNA~1.TXT");
+            uint8_t ev[32];                                               // 卷标项必须被跳过
+            memzero8(ev, 32);
+            for (int i = 0; i < 8; i++) ev[i] = (uint8_t)"VIMTU64 "[i];
+            ev[11] = 0x08;
+            lfn_reset(&st);
+            const bool vol_ok = (dir_step(&st, ev, &out) == 0);
+            // ---- 中文 LFN（UTF-16 -> UTF-8 的真实证据；终端 sendkey 打不进中文，所以放在内核自检里）----
+            // 名字 "这是.TXT"（U+8FD9 U+662F + ".TXT"）= 6 个 UTF-16 码元 -> 1 个 0x0F 项。
+            uint8_t ecn[32];
+            memzero8(ecn, 32);
+            ecn[0] = 0x41; ecn[11] = 0x0F;
+            {
+                const uint16_t cn[8] = { 0x8FD9, 0x662F, '.', 'T', 'X', 'T', 0, 0 };
+                static const uint8_t cn_off[13] = { 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
+                for (int k = 0; k < 13; k++) {
+                    const uint16_t c = (k < 8) ? cn[k] : 0;
+                    ecn[cn_off[k]] = (uint8_t)(c & 0xFF);
+                    ecn[cn_off[k] + 1] = (uint8_t)(c >> 8);
+                }
+            }
+            uint8_t eshort[32];
+            memzero8(eshort, 32);
+            for (int i = 0; i < 11; i++) eshort[i] = (uint8_t)"ZHE   TXT  "[i];
+            eshort[11] = 0x20;
+            {
+                // 校验和必须对**短名**算：重造 ecn[12]（上面用的是 e2 的短名，占位）
+                ecn[12] = lfn_checksum(eshort);
+            }
+            lfn_reset(&st);
+            const bool cn_ok = (dir_step(&st, ecn, &out) == 0) &&
+                               dir_step(&st, eshort, &out) == 1 && out.lfn == 1 &&
+                               (uint8_t)out.name[0] == 0xE8 && (uint8_t)out.name[1] == 0xBF &&
+                               (uint8_t)out.name[2] == 0x99 && (uint8_t)out.name[3] == 0xE6 &&
+                               (uint8_t)out.name[4] == 0x98 && (uint8_t)out.name[5] == 0xAF &&
+                               out.name[6] == '.' && out.name[7] == 'T' && out.name[8] == 'X' &&
+                               out.name[9] == 'T' && out.name[10] == 0;
+            if (!cn_ok) mask |= 16777216;                        // bit24：UTF-16 -> UTF-8 有问题
+            if (!(lfn_ok && fb_ok && vol_ok)) mask |= 8388608;              // bit23：LFN 解析有问题
+        }
+#ifdef VIMTU_INSTALLER_MEDIA
+        // ★ 安装介质内核里**不**扫真盘：安装向导里的 PATA 设备选择实测会被影响（fs_tree 回归里
+        //   ESP 格式化在 fat-write 处失败）。自检的读取器往返 + LFN 检查照跑；真盘只读探测
+        //   留给系统内核的启动路径（那时盘上已经有安装器写的 ESP，探的就是它）。
+        dbg64_line_begin64();
+        dbg64_str("[FAT64] probe real skipped (installer kernel; system boot probes it read-only)\n");
+        dbg64_line_end64();
+#else
+        fat64_probe_real64();                                              // 真实 ESP 只读探测（找不到不算失败）
+#endif
     }
     // 收尾：自检不留下"活着的假卷"，也确认**它真的只动了内存卷**（内存卷里有 BPB、g_drive 无效），
     //       并把 34MB 页还给页池（不然每次启动都漏 34MB）
