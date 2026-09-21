@@ -157,6 +157,8 @@ bool kbd_win_pressed() { return win_key_flag != 0; }
 void kbd_consume_win() { win_key_flag = 0; }
 bool kbd_tm_hotkey() { return tm_hotkey_flag != 0; }
 void kbd_consume_tm_hotkey() { tm_hotkey_flag = 0; }
+bool kbd_ctrl_pressed() { return ctrl_pressed; }     // ★ 批次 J：修饰键状态（供 Ctrl 加选）
+bool kbd_shift_pressed() { return shift_pressed; }   // ★ 批次 J：同上（供 Shift 加选）
 void kbd_drain() { kbd_tail = kbd_head; }   // 停止阶段丢弃输入（不再接收新任务）
 
 // 处理一个键盘扫描码（集 1；E0 前缀的扩展键在这里单独走）
@@ -171,8 +173,13 @@ static void kbd_process_scancode(uint8_t sc) {
         else if (sc == 0x50) kbd_push(NAV_DOWN);             // 下方向
         else if (sc == 0x4B) kbd_push(NAV_LEFT);             // 左方向
         else if (sc == 0x4D) kbd_push(NAV_RIGHT);            // 右方向
+        else if (sc == 0x53) kbd_push((uint8_t)KBD_KEY_DELETE);  // ★ 批次 J：Delete（E0 53）
         return;
     }
+
+    // ★ 批次 J：F2（扫描码 0x3C，不是可打印字符，旧表解码成 0 -> 直接丢掉；显式投递键码）
+    if (sc == 0x3C) { kbd_push((uint8_t)KBD_KEY_F2); return; }
+
 
     // 修饰键
     if (sc == 0x2A || sc == 0x36) shift_pressed = true;

@@ -15,6 +15,14 @@ bool kbd_tm_hotkey();
 void kbd_consume_tm_hotkey();
 void kbd_drain();               // 清空键盘队列（重启的停止阶段丢弃输入）
 
+// ★ 批次 J 新增：特殊键码（复用键盘字符队列，落在 0xFA/0xF9；与方向键 NAV_* 的 0xFB..0xFE 同一约定）
+//   为什么要有：Delete / F2 不是可打印字符，旧表里解码成 0（被直接丢掉），文件管理器拿不到。
+//   注意：Ctrl+字母仍然按老口径**折成控制字符**（Ctrl+A=0x01、Ctrl+C=0x03、Ctrl+X=0x18、Ctrl+V=0x16），
+//   所以应用要判 Ctrl 组合就认这些控制码；kbd_ctrl_pressed() 只是把修饰键状态暴露出来（供 Ctrl 点选）。
+#define KBD_KEY_DELETE 0xFAu    // Delete（扫描码集 1 的 E0 53）
+#define KBD_KEY_F2     0xF9u    // F2（扫描码 0x3C）
+bool kbd_ctrl_pressed();        // Ctrl 当前是否按下（读修饰键状态；不做边沿、不消费）
+bool kbd_shift_pressed();       // Shift 当前是否按下（同上）
 // ★ 给 USB HID 键盘（kernel/usb64.cpp）用：把一个 PS/2 集 1 扫描码（含 E0 前缀就分两次调）
 //   投进**同一个**按键环形队列 —— 复用 Shift/Ctrl/Alt/Caps、方向键 NAV_*、Win 键标志
 //   (E0 5B/5C) 与 Ctrl+Shift+Esc 热键的全部逻辑。桌面外壳（gui64.cpp）因此一行都不用改。

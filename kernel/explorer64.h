@@ -49,6 +49,18 @@
 //   [UI] explorer scroll top=<n> items=<n>      （滚动/翻页，有界）
 //   [UI] explorer click x=<cx> y=<cy> sx=<sx> sy=<sy> hit=<none|card:<i>|item:<i>|btn:<id>|crumb:<k>|nav:<id>>
 //       （x/y = 客户区坐标，sx/sy = 屏幕坐标：自动验收的鼠标闭环定位靠它）
+//   ---- ★ 批次 J：文件操作（右键菜单 / 复制 / 剪切 / 粘贴 / 重命名 / 删除 / 新建文件夹 / 多选 / 属性）----
+//   [UI] explorer ctxmenu items=<n> at=<sel|blank>     （右键菜单打开；n = 6（条目）/ 4（空白））
+//   [UI] explorer ctxmenu rect x=<cx> y=<cy> w=<w> h=<h>  （菜单矩形，客户区坐标：验收按它定位像素）
+//   [UI] explorer sel n=<n> mode=click|box|all          （多选：单击 / 框选 / Ctrl+A 全选）
+//   [UI] explorer clip op=copy|cut n=<n>                （入剪贴板：最多 8 条，带卷槽 + 完整路径）
+//   [UI] explorer paste ok n=<n> dst=<path> skipped=<n> （粘贴；skipped = 空间不足/超上限/源没了等，整条跳过不写一半）
+//   [UI] explorer rename old=<a> new=<b> rc=<n>         （F2/菜单改名；rc=0 成功，rc=1 被拒（重名/非法/超长））
+//   [UI] explorer delete confirm n=<n> path=<p>         （两段式确认的第一段：只提示、没删）
+//   [UI] explorer delete path=<p> kind=<file|dir> rc=<n> [reason=<not-empty|...>]   （真删；非空目录 rc=1）
+//   [UI] explorer mkdir path=<p> rc=<n>                 （新建文件夹；撞名自动追加 (2)/(3)…（无空格：0x20 非法））
+//   [UI] explorer props name=<..> kind=<..> size=<..> mtime=<..> vol=<C:|D:>   （属性面板）
+//   其它：工具栏第 2 组按钮的点击打点复用上面的 [UI] explorer click ... hit=btn:<mkdir|copy|cut|paste|rename|del>。
 //   [EXPL] selftest PASS / [EXPL] selftest FAIL mask=<n>
 #pragma once
 #include <stdint.h>

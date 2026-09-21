@@ -1137,6 +1137,44 @@ def cap_explorer_ui():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+# -------------------------------------------------------------------------------- ★ 批次 J
+def cap_fileops_ui():
+    """★ 文件操作（右键菜单 / 复制 / 剪切 / 粘贴 / 重命名 / 删除 / 新建文件夹 / 多选/框选 / 工具栏 / 快捷键）。"""
+    if not (exists("kernel/explorer64.cpp") and exists("kernel/explorer64.h")):
+        return "MISSING", ["kernel/explorer64.cpp/.h 不存在（没有文件管理器 UI）"]
+    ren = grep_count(r"vfs64_rename64|vfs64_rename_on64|vfs64_free_on64",
+                     ["kernel/vfs64.cpp", "kernel/vfs64.h", "kernel/explorer64.cpp"])
+    keys = grep_count(r"KBD_KEY_DELETE|KBD_KEY_F2|kbd_ctrl_pressed", ["kernel/input.h", "kernel/input.cpp"])
+    log = grep_count(r"\[UI\] explorer (ctxmenu|clip|paste|rename|delete|mkdir|sel|props)",
+                     ["kernel/explorer64.cpp"])
+    tb = grep_count(r"IDC_MKDIR|IDC_PASTE|IDC_RENAME|EXP_TB2_N|exp_tb_enabled", ["kernel/explorer64.cpp"])
+    box = grep_count(r"g_box_active|exp_cell_hits_box|draw_selbox|exp_box_finish", ["kernel/explorer64.cpp"])
+    edit = grep_count(r"EXP_EDIT_RENAME|EXP_EDIT_MKDIR|exp_edit_commit|draw_edit", ["kernel/explorer64.cpp"])
+    clip = grep_count(r"g_clip\[|exp_clip_set|exp_paste|exp_copy_tree|exp_copy_file", ["kernel/explorer64.cpp"])
+    suffix = grep_count(r"suffix_name_pure|name_ok_pure", ["kernel/explorer64.cpp"])
+    test = exists("tests/fileops64_test.py")
+    shots = (exists("docs/screenshots/explorer_ctxmenu64.png") and
+             exists("docs/screenshots/explorer_rename64.png"))
+    ev = ["vfs64 新增原语：vfs64_rename64（同目录改名）/ vfs64_free64（写前空间查询）/ *_on64 按槽入口：命中 %d" % ren,
+          "input 新增键码与修饰键状态（Delete=0xFA / F2=0xF9 / Ctrl/Shift 可读）：命中 %d" % keys,
+          "打点（[UI] explorer ctxmenu|clip|paste|rename|delete|mkdir|sel|props）：命中 %d" % log,
+          "工具栏第 2 组 6 按钮（新建/复制/剪切/粘贴/重命名/删除 + 置灰规则）：命中 %d" % tb,
+          "框选（浅蓝矩形 + 单元格命中 + on_tick 跟踪）：命中 %d" % box,
+          "内联编辑（重命名/新建文件夹：字符/退格/回车/Esc + 光标）：命中 %d" % edit,
+          "内核内剪贴板 + 复制/粘贴 + 目录递归复制（跨卷不依赖当前卷）：命中 %d" % clip,
+          "名字校验与重名后缀（(2)/(3)，无空格 —— 0x20 不是合法文件名字符）：命中 %d" % suffix,
+          "实测串口：\"[UI] explorer ctxmenu items=6 at=sel\"、\"[UI] explorer paste ok n=1 dst=/docs skipped=0\"、"
+          "\"[UI] explorer rename old=copy_me.txt new=renamed.txt rc=0\"、"
+          "\"[UI] explorer delete path=/nonempty kind=dir rc=1 reason=not-empty\"、"
+          "\"[UI] explorer mkdir path=/newdir rc=0\"、\"[UI] explorer sel n=2 mode=box\"",
+          "端到端脚本 tests/fileops64_test.py：%s（94 条断言：右键菜单像素 + Ctrl+C/V + F2 内联编辑 + 框选多选 + "
+          "Delete 两段确认 + 非空目录被拒 + 新建文件夹 + 剪切 + 工具栏 + 跨卷粘贴（宿主侧解析 D: 卷）+ 属性面板 + 错误路径）"
+          % ("存在" if test else "缺失"),
+          "截图 docs/screenshots/explorer_{ctxmenu,rename}64.png：%s" % ("两张齐" if shots else "缺")]
+    done = ren and keys and log and tb and box and edit and clip and suffix and test
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 CAPS = [
     ("存储", "★ AHCI(SATA) 驱动（PCI 找控制器 + ABAR + 端口/命令表/PRDT + 轮询 DMA；QEMU 上命令未被执行，见证据行）",
      cap_ahci_sata),
@@ -1172,6 +1210,8 @@ CAPS = [
      cap_multivol),
     ("应用", "★ 文件资源管理器 / 此电脑（UI：导航窗格 + 面包屑 + 图标/详细信息双视图 + 容量条 + 双击运行）",
      cap_explorer_ui),
+    ("应用", "★ 文件操作（右键菜单 + 复制/剪切/粘贴 + 重命名/删除/新建文件夹 + 多选/框选 + 工具栏按钮 + 快捷键）",
+     cap_fileops_ui),
     ("内核", "设置持久化（store/VCAT 双槽）", cap_persistence),
     ("驱动", "ATA 中断（IRQ14）替代 PIO 轮询", cap_ata_irq),
     ("驱动", "运行期显示层（EDID/刷新率）", cap_display_layer),
@@ -1218,6 +1258,9 @@ TESTS = [
     ("fs_tree_test.py", "★ VimtuFS2 v3 目录树 + 盘符层：安装->格式化(v3)->多级 mkdir->子目录写文件->冷启动 stat/mtime/遍历/删除；"
                         "C:/D: 盘符表 + ESP skip + drive64 容量与 df 一致"),
     ("explorer64_test.py", "★ 文件资源管理器 / 此电脑（UI）：容量条/四列像素 + 鼠标双击进盘/进目录/跑 ELF64 + 面包屑/上级/后退 + 状态栏计数"),
+    ("fileops64_test.py", "★ 批次 J 文件操作：右键菜单（像素）+ 复制/剪切/粘贴（Ctrl+C/X/V）+ F2 重命名内联编辑 + "
+                          "删除两段确认（非空目录如实被拒）+ 新建文件夹 + 框选/Ctrl+A 多选 + 工具栏按钮 + "
+                          "跨卷 C:→D: 粘贴（宿主侧解析 D: 卷字节）+ 属性面板 + 错误路径（94 条断言）"),
 ]
 
 

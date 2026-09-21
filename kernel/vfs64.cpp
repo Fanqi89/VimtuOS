@@ -1383,6 +1383,18 @@ int vfs64_tree_dump64_on64(int slot, const char* path, int max_entries, int max_
     if (!g.active) return on64_slot_unavailable("tree_dump64", slot);
     return vfs64_tree_dump64(path, max_entries, max_depth);
 }
+
+// ★ 批次 J：同目录改名 / 空间查询 的按槽入口（explorer 复制/剪切/粘贴时按显式卷操作）
+int vfs64_rename_on64(int slot, const char* old_path, const char* new_name) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("rename", slot);
+    return vfs64_rename64(old_path, new_name);
+}
+int vfs64_free_on64(int slot, uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_blocks) {
+    Vfs64SlotGuard g(slot);
+    if (!g.active) return on64_slot_unavailable("free", slot);
+    return vfs64_free64(free_blocks, free_bytes, total_blocks);
+}
 // ==================== 读文件 ====================
 int vfs64_read64(const char* path, void* buf, int max) {
     if (!g_mounted) { log_op_fail("read64", "not mounted"); return -1; }
@@ -1636,6 +1648,72 @@ int vfs64_rmdir64(const char* path) {
     zero_bytes(empty, VFS64_INODE_BYTES_MAX);
     if (!inode_store(idx, empty)) { log_op_fail("rmdir64", "inode clear failed"); return -1; }
     touch_dir(parent, -1);                             // 父目录：mtime 刷新 + nlink-1
+    return 0;
+    return 0;
+}
+
+// ==================== 改名（同目录）/ 空间查询（批次 J）====================
+// 为什么只做同目录：目录表示 = "parent 字段相同的 inode 集合"（见 vfs64.h），改名只动 name 字段 +
+// mtime + CRC —— 一个 inode 落盘就完事，没有中间态、不会出现"两边都看不到"的窗口。
+// 跨目录移动要改 parent 并且维护两个目录的 nlink，属于另一档复杂度，本批**明说不做**。
+int vfs64_rename64(const char* old_path, const char* new_name) {
+    if (!g_mounted) { log_op_fail("rename64", "not mounted"); return -1; }
+    if (!old_path || !new_name) { log_op_fail("rename64", "bad args"); return -1; }
+
+    uint32_t nlen = 0;
+    while (new_name[nlen] != 0) nlen++;
+    if (!name_valid(new_name, nlen)) {                 // 空/超长/含 '/'/不可打印/'.'/'..' 全在这里被拒
+        log_op_fail("rename64", "bad new name");
+        return -1;
+    }
+
+    uint32_t idx = 0;
+    if (path_resolve(old_path, false, &idx, nullptr, nullptr, nullptr) != 0) {
+        log_op_fail("rename64", "not found");
+        return -1;
+    }
+    if (idx == 0) { log_op_fail("rename64", "refuse to rename the root directory"); return -1; }
+
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    if (inode_load_ok(idx, ino, "rename64") != 0) return -1;
+    const uint32_t parent = rd32(ino + VFS_I_PARENT);
+    const uint32_t onlen = ino[VFS_I_NAMELEN];
+    if (onlen == nlen && cmp_bytes(ino + g_lay->name_off, new_name, nlen) == 0) return 0;   // 同名 = 幂等
+
+    uint32_t exist = 0;
+    if (find_child(parent, new_name, nlen, &exist) == 0) {
+        log_op_fail("rename64", "target name already exists in the same directory");
+        return -1;
+    }
+    char old_name[VFS64_NAME_MAX + 1];
+    copy_bytes(old_name, ino + g_lay->name_off, onlen);
+    old_name[onlen] = 0;
+
+    zero_bytes(ino + g_lay->name_off, g_lay->name_max);          // 先清干净再写（v3 的 name pad 必须为 0）
+    copy_bytes(ino + g_lay->name_off, new_name, nlen);
+    ino[VFS_I_NAMELEN] = (uint8_t)nlen;
+    if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
+    wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
+    if (!inode_store(idx, ino)) { log_op_fail("rename64", "inode write failed"); return -1; }
+    touch_dir(parent, 0);                                        // 父目录 mtime 刷新（尽力而为）
+
+    dbg64_str("[VFS64] rename ok idx=");
+    dbg64_dec(idx);
+    dbg64_str(" old=");
+    dbg64_str(old_name);
+    dbg64_str(" new=");
+    dbg64_str(new_name);
+    dbg64_nl();
+    return 0;
+}
+
+int vfs64_free64(uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_blocks) {
+    if (!g_mounted) { log_op_fail("free64", "not mounted"); return -1; }
+    uint32_t n = 0;
+    if (!count_free_blocks(&n)) { log_op_fail("free64", "bitmap read failed"); return -1; }
+    if (free_blocks) *free_blocks = n;
+    if (free_bytes) *free_bytes = n * VFS64_BLOCK_BYTES;
+    if (total_blocks) *total_blocks = g_data_blocks;
     return 0;
 }
 

@@ -7,12 +7,13 @@
 全部是本工程自己的 C++ / 汇编代码。
 它自带一张"三合一"安装盘（BIOS 光盘 / U 盘 / UEFI），安装界面与步骤照 Windows 10 做（去掉了输入产品密钥那一步）。
 
-> 版本 **0.2.0-beta.4** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
-> 状态（权威判据：`python tests/status_report.py`）：**完成 38 / 部分 0 / 未做 1（共 39 项能力）**，
+> 版本 **0.2.0-beta.5** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
+> 状态（权威判据：`python tests/status_report.py`）：**完成 39 / 部分 0 / 未做 1（共 40 项能力）**，
 > 唯一未做项是 **Rust 参与实现（可选要求，本机未装 Rust 工具链）**。
-> 全量验收（`--full` + 专项/扩展脚本）：**31 个断言脚本全部 PASS**（本批次实测；上一批断言保持全过，
-> 本批次新增 **multivol64_test（多卷挂载 / 盘符切换）108 条断言**；vfs64 自检新增 bit12（卷槽表/切卷/on64 守卫/表满拒绝）、
-> drive64 自检新增 bit6（卷槽一致性 + 按盘符激活），fs_tree(84)/explorer64(71)/fs_term(32)/fd64(34)/store64(46)/
+> 全量验收（`--full` + 专项/扩展脚本）：**32 个断言脚本全部 PASS**（本批次实测；上一批断言保持全过，
+> 本批次新增 **fileops64_test（文件操作：右键菜单/复制/剪切/粘贴/重命名/删除/新建文件夹/多选）94 条断言**；
+> vfs64 自检新增 rename 用例、explorer64 自检新增名字/后缀/多选位图用例；
+> multivol64(108)/explorer64(71)/fs_tree(84)/fs_term(32)/fd64(34)/store64(46)/
 > app64(31)/elf64(56)/proc64(67)/sysstate64(100) 等既有脚本保持绿）。
 
 ---
@@ -20,6 +21,7 @@
 ## 一、它能做什么
 
 | 能力 | 说明 |
+| **★ 文件操作：右键菜单 / 复制 / 剪切 / 粘贴 / 重命名 / 删除 / 新建文件夹 / 多选（本批次新增）** | `explorer64.cpp` + `vfs64_rename64`：**右键菜单**（条目：打开/复制/剪切/重命名/删除/属性；空白：新建文件夹/粘贴/刷新/属性；hover 高亮、置灰、Esc/点外部关闭）；**多选**（单击、Ctrl 加选、Shift 范围选、**空白拖动框选**（浅蓝矩形，内核无 alpha 混合故用实色近似）、Ctrl+A 全选、Esc 取消）；**内核内剪贴板**（最多 8 条 `(卷槽, 完整路径)` + 复制/剪切）→ 粘贴：文件按"读整个文件再整体写"复制（单文件 ≤67584 B）、**目录递归复制**（深度 ≤4、整棵 ≤96 条，超限如实计入 `skipped`）、**跨卷 C:↔D: 真能粘贴**（源用 `vfs64_*_on64(源槽)` 读、目标按界面盘符写）；**重名策略：自动追加 `(2)`、`(3)`…**（插在扩展名之前；**不带空格** —— VimtuFS2 名字只允许 `0x21..0x7E`，空格不合法）；**剪切 = 复制成功后删源**（先全部复制成功再删，绝不半删）；**重命名**（F2 / 菜单 → 内联编辑，重名一律拒绝）；**删除**（Delete / 菜单 → **两段式确认**：状态栏提示"再按一次 Delete 确认删除（10 秒内有效）"；**非空目录明确提示"目录非空，暂不支持递归删除"**，绝不假装成功）；**属性**（小面板 + 打点：名称/类型/大小/修改日期/所在卷）；**工具栏 6 个按钮**（新建文件夹/复制/剪切/粘贴/重命名/删除，无选中或剪贴板为空时置灰）；**快捷键** Delete / F2 / Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+A / Esc。打点 `[UI] explorer ctxmenu|clip|paste|rename|delete|mkdir|sel|props …`；端到端 `tests/fileops64_test.py`（94 项：像素 + 串口 + 鼠标/键盘注入 + 宿主侧解析 D: 卷字节） |
 |---|---|
 | **四种引导方式 + 装好的盘双固件** | BIOS 光盘（El Torito）、U 盘 / 硬盘（hybrid MBR）、裸盘（MBR→loader→ATA）、**UEFI 自动引导**（自研 PE 桩 + 平铺长模式引导器）。QEMU 与 VMware、BIOS 与 UEFI 四种组合全部实测通过；**"ISO 当 U 盘"形态在 OVMF（UEFI）与 SeaBIOS（BIOS）下也都进安装向导**（`tests/usb_boot_both_fw_test.py` 四档）；装好的盘在 UEFI 与 BIOS 下都能启动（`tests/esp_install_test.py`） |
 | **现代磁盘结构（安装盘 + 目标盘都有）** | 自写 GPT（工具链的 xorriso 不生 GPT）与 MBR 双兼容；**FAT32 ESP 也是自写的**（这台机器没有 mkfs.fat/mtools）：48MB 卷、簇数 96736（真 FAT32 的硬下限是 65525 簇）、FSInfo + 备份引导扇区齐全。**安装时会往目标盘写混合 MBR + 盘尾 GPT + 48MB FAT32 ESP**（内核实现在 `kernel/fat64.{h,cpp}`，卷参数与构建期 `tools/make_esp.py` 逐条对齐），ESP 里放 `EFI/BOOT/BOOTX64.EFI` + `UEFI64.BIN` + `KERNEL64.BIN` |
@@ -50,6 +52,7 @@
 
 | 边界 | 现状 |
 |---|---|
+| ⚠️ **文件操作的边界（本批次新增，如实写清）** | ① **没有递归删除**：非空目录点删除只会提示"目录非空，暂不支持递归删除"（`delete … rc=1 reason=not-empty`），不假装成功；② **单文件上限 67584 B**：超过的源在粘贴时被**整条跳过**（不是截断复制）；③ **没有权限/属主、没有回收站**：删除即真删（`unlink64`/`rmdir64`）；④ **重命名只在同一目录内**（改 inode 的 name 字段），**没有跨目录移动/拖拽**（`vfs64_rename64` 不动 `parent`）；⑤ 目录递归复制有界（深度 ≤4、条目 ≤96），超限的条目计入 `skipped`；⑥ 剪贴板是**内核内的路径列表**（不是文件内容快照、不跨重启、最多 8 条）；⑦ 重名后缀是 `(2)`/`(3)`（**无空格**，空格不是合法文件名字符） |
 | ⚠️ **用户态独立地址空间** | 批次 C 起：proc64 每进程独立 CR3 + fork/execve/wait4/kill（BIOS 路径）；UEFI（固件页表）下默认仍如实降级为共享地址空间模式（`[PROC64] cr3 isolation OFF`）。**批次 D 实测**：在固件 PML4 上就地挂用户窗口（清 CR0.WP 手法）与自带 PML4 + 运行期 `mov cr3` **两条路径都在 QEMU+OVMF 与 VMware EFI 下成功**（`[PROC64] uefi exp result=B mode=isolated`），但默认构建不编这段实验（宏 `PROC64_UEFI_CR3_EXPERIMENT`），见 `docs/UEFI地址空间实验报告.md` |
 | ⚠️ **fd 语义（批次 D）** | **每进程 fd 表**（32 槽/张；`Proc64` 持有，终端/桌面用内核表）；fd → 引用计数的 `OpenFile64`（**共享偏移游标**）：`dup/dup2` 共享同一对象、`fork` 逐槽继承、`execve` 默认保留（**无 `O_CLOEXEC`**）、`close` 只是 refs-1；`O_APPEND` 真实现；**`pipe(22)` 真实现**（64 B 环形缓冲、非阻塞：写满短写/读空 `-EAGAIN`），`user/pipe64.asm` 是 fork 后父子各持一端的环回证据 |
 | ⚠️ **ELF64 只验证过自有静态程序** | 用 `ld.lld -static -nostdlib` 链接的自己的 ELF64 能 load → ring3 → `syscall` → exit；**glibc / 发行版二进制没有验证过**（缺 vDSO、TLS(FS.base) 的完整语义、信号投递、futex、动态链接与重定位） |
@@ -175,7 +178,7 @@ bash build64.sh
 | `vimtu64-64.iso` | 56.2 MB | **三合一安装盘**：BIOS 光盘 + 可写 U 盘 + UEFI |
 | `vimtu64-64.img` | 8.3 MB | 安装介质裸盘（把一个 8MB 镜像直接当硬盘用） |
 | `build64/kernel64.bin` | 1.89 MB | 安装程序内核（1,980,680 B；含 ATA/AHCI/**NVMe** 驱动、分区/安装引擎、FAT32 ESP 写入器） |
-| `build64/kernel64_os.bin` | 2.59 MB | 装进硬盘的系统内核（2,719,856 B；调度器/VFS/store/ring3/网络/USB/AHCI/**NVMe**/文件管理器 都在这里） |
+| `build64/kernel64_os.bin` | 2.80 MB | 装进硬盘的系统内核（2,797,944 B；调度器/VFS/store/ring3/网络/USB/AHCI/**NVMe**/文件管理器 + **文件操作** 都在这里） |
 | `build64/BOOTX64.EFI` / `UEFI64.BIN` | 2.5 KB / 36 KB | UEFI 两段式引导 |
 | `build64/esp.img` | 48 MB | 手写 FAT32 ESP（96736 簇，>= 65525） |
 
@@ -366,8 +369,8 @@ docs/screenshots/       自动抓取的桌面截图（desktop64.png）
 （`build/font_bahnschrift.ttf` / `font_chaparral.ttf` / `font_simhei.ttf`）与内核里的 objcopy 符号名保持不变。
 许可与派生说明见 [docs/字体许可说明.md](docs/字体许可说明.md)。**因此 ISO/IMG 可以直接公开分发。**
 
-**版本与发布**：标签 `v0.2.0-beta.4`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.2.0-beta.4>
-（历史版本各自保留安装程序：`v0.2.0-beta.3`、`v0.2.0-beta.2`、`v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
+**版本与发布**：标签 `v0.2.0-beta.5`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.2.0-beta.5>
+（历史版本各自保留安装程序：`v0.2.0-beta.4`、`v0.2.0-beta.3`、`v0.2.0-beta.2`、`v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
 （预发布；**安装盘已附上**：`vimtu64-64.iso` 三合一安装盘 + `vimtu64-64.img` 裸盘介质）。
 
 ```bash

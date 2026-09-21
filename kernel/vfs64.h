@@ -75,6 +75,9 @@
 //   * 删除：文件可以删（vfs64_unlink64）；**空目录**可以删（vfs64_rmdir64）；非空目录必须自己先清空。
 //   * 兼容 API vfs64_ls 的名字缓冲是 [32]，实现里把超过 31 B 的名字截断（v3 上限就是 31，所以
 //     实际不会截断）；新代码请用 vfs64_list64 / opendir+readdir（报告完整名字 + 类型 + 时间）。
+//   * **改名**（批次 J）：vfs64_rename64 只能**同目录改名**（改 inode 的 name 字段）；
+//     **没有跨目录移动、没有递归删除**（非空目录只能自己先清空）。
+//   * **空间查询**（批次 J）：vfs64_free64 给数据区空闲块/字节数（写前估用；位图读失败如实返回 -1）。
 //
 // ---- 使用顺序 ----
 //   vfs64_format(drive, start_lba, sectors)   // 建 v3 卷（成功后新卷即处于已挂载状态）
@@ -257,6 +260,8 @@ int  vfs64_ls_on64(int slot, const char* path, char names[][VFS64_LS_NAME_BUF], 
 int  vfs64_stat64_on64(int slot, const char* path, Vfs64Info64* out);
 int  vfs64_list64_on64(int slot, const char* path, Vfs64Dirent64* out, int max, uint32_t* cursor);
 int  vfs64_tree_dump64_on64(int slot, const char* path, int max_entries, int max_depth);
+int  vfs64_rename_on64(int slot, const char* old_path, const char* new_name);
+int  vfs64_free_on64(int slot, uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_blocks);
 
 // ==================== v3 新 API（多级路径）====================
 // 查属性（含 type/size/mtime/parent/nlink/kind/名字）。返回 0 = 找到；-1 = 不存在/非法/未挂载。
@@ -293,6 +298,17 @@ int  vfs64_unlink64(const char* path);
 // 删除**空目录**（非空/根目录/不存在一律 -1 + 打点；成功后父目录 nlink-1）。
 int  vfs64_rmdir64(const char* path);
 
+// ★ 批次 J：同目录改名（**不移动位置**，没有"跨目录移动"）。old_path 必须存在且不是根目录；
+// new_name 是**单个名字段**（不含 '/'，长度/字符规则与建目录一致），只改 inode 的 name + mtime + CRC。
+// 同名（old 的最后一段 == new_name）幂等返回 0；同目录已有同名项 -> -1 + 打点（不覆盖）。
+// 返回 0 = 成功；-1 = 未挂载/路径不存在/是根目录/名字非法或超长/重名/写盘失败。
+// 打点：[VFS64] rename ok idx=<n> old=<a> new=<b> / rename64: <why>
+int  vfs64_rename64(const char* old_path, const char* new_name);
+
+// ★ 批次 J：写前空间查询（当前卷数据区）。*free_bytes = 空闲块数 × 512（"还能写多少字节"的**上限**，
+// 因为还要扣间接块；调用方按自己需要的块数（含间接块）留 1 块的余量更稳）。
+// 任何指针都可传 nullptr。返回 0 = 成功；-1 = 未挂载/位图读失败。
+int  vfs64_free64(uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_blocks);
 // 目录树串口打印（有界）：从 path 开始（递归 ≤ max_depth 层、全树 ≤ max_entries 条），每行
 //   [VFS64] tree <完整路径> type=<dir|file> size=<n> mtime=0x<hex> ymd=<YYYY-MM-DD> hms=<HH:MM:SS> kind=<str> idx=<inode>
 // 返回打印的条目数；越界/不存在返回 -1（并打点）。供启动自检与自动验收 grep。

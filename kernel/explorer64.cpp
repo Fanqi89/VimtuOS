@@ -108,9 +108,39 @@
 #define PREV_WIN_H 300
 #define C_EXP_MENU      rgb(255, 255, 255)
 #define C_EXP_MENU_HOV  rgb(229, 243, 255)
+// ★ 批次 J（文件操作）配色
+#define C_EXP_CTX_BG    rgb(255, 255, 255)     // 右键菜单底
+#define C_EXP_CTX_HOV   rgb(229, 243, 255)     // 菜单项 hover
+#define C_EXP_CTX_LINE  rgb(130, 130, 130)     // 菜单边框
+#define C_EXP_DIS       rgb(160, 160, 160)     // 置灰（不可用按钮 / 不可用菜单项）
+#define C_EXP_BOX_IN    rgb(214, 232, 248)     // 框选填充（内核没有 alpha 混合 -> 用浅蓝近似"半透明"）
+#define C_EXP_BOX_LINE  rgb(0, 120, 215)       // 框选边框
+#define C_EXP_EDIT_BG   rgb(255, 255, 255)     // 内联编辑底
+#define C_EXP_EDIT_LINE rgb(0, 120, 215)       // 内联编辑边框
+#define C_EXP_PROPS_BG  rgb(252, 252, 252)     // 属性面板底
+// ★ 批次 J：文件操作按钮（工具栏第 2 组；x=212 起 6 个，宽 56 间距 4 -> 212..556，客户区宽 658）
+#define EXP_TB2_X      212
+#define EXP_TB2_W      56
+#define EXP_TB2_GAP    4
+#define EXP_TB2_H      (EXP_TOOLBAR_H - 7)
+#define EXP_TB2_N      6
+// ★ 批次 J：右键菜单几何（菜单项高 26）
+#define EXP_CTX_W      176
+#define EXP_CTX_ITEM_H 26
+#define EXP_CTX_ITEM_N 6                       // 条目标 6 项：打开/复制/剪切/重命名/删除/属性
+#define EXP_CTX_BLANK_N 4                      // 空白处 4 项：新建文件夹/粘贴/刷新/属性
+// ★ 批次 J：剪贴板与复制上限（如实写清：内核内剪贴板、最多 8 个源、递归复制有界）
+#define EXP_CLIP_MAX   8
+#define EXP_COPY_DEPTH 4                       // 目录递归复制深度上限（含根）
+#define EXP_COPY_LIST  16                      // 单层一次最多列的条目
+#define EXP_COPY_ITEMS 96                      // 一棵树最多复制的条目总数（超了如实计入 skipped）
+#define EXP_BOX_MIN    4                       // 拖动小于 4px 不算框选（与单击区分）
 
 // 工具栏按钮 id（hit 打点用）
-enum { IDC_NONE = 0, IDC_FILE, IDC_COMPUTER, IDC_VIEW, IDC_BACK, IDC_FWD, IDC_UP, IDC_CRUMB, IDC_NAV };
+enum { IDC_NONE = 0, IDC_FILE, IDC_COMPUTER, IDC_VIEW, IDC_BACK, IDC_FWD, IDC_UP, IDC_CRUMB, IDC_NAV,
+       IDC_MKDIR, IDC_COPY, IDC_CUT, IDC_PASTE, IDC_RENAME, IDC_DEL,
+       IDC_CTX_BASE = 40 };                 // ★ 右键菜单项 = IDC_CTX_BASE + k（与"文件"菜单的 IDC_FILE+10 不撞）
+
 // 内容条目关联的应用（双击行为）
 enum { ASSOC_NONE = 0, ASSOC_DIR, ASSOC_VAP, ASSOC_ELF, ASSOC_TEXT };
 
@@ -155,6 +185,52 @@ static char g_prev_name[40] = {0};
 static char g_prev_buf[1025] = {0};
 static int  g_prev_len = 0;
 
+// ==================== ★ 批次 J：文件操作状态（多选 / 剪贴板 / 右键菜单 / 内联编辑 / 属性 / 框选）====================
+// 多选：位图（下标 < EXP_MAX_ITEMS）；g_sel 仍然是"焦点条目"（状态栏/回车/双击都看它），向后兼容旧逻辑。
+static uint8_t g_selmap[(EXP_MAX_ITEMS + 7) / 8] = {0};
+static int  g_sel_n = 0;                   // 选中总数（0 = 无选中）
+
+// 内核内剪贴板（记录 **卷槽 + 完整路径**；op：0 = 空、1 = 复制、2 = 剪切）
+struct ExpClipEnt64 { int slot; char path[VFS64_PATH_MAX]; };
+static ExpClipEnt64 g_clip[EXP_CLIP_MAX];
+static int  g_clip_n = 0;
+static int  g_clip_op = 0;
+
+// 右键菜单
+static int  g_ctx_open = 0;
+static int  g_ctx_blank = 0;               // 1 = 空白处菜单（新建/粘贴/刷新/属性）
+static int  g_ctx_x = 0, g_ctx_y = 0;      // 菜单左上角（客户区坐标，已钳在内容区内）
+static int  g_ctx_item = -1;               // 右键点中的条目（-1 = 空白）
+static int  g_ctx_hover = -1;              // hover 的菜单项下标
+static int  g_ctx_n = 0;                    // 本菜单项数
+
+// 内联编辑（重命名 / 新建文件夹）
+enum { EXP_EDIT_NONE = 0, EXP_EDIT_RENAME, EXP_EDIT_MKDIR };
+static int  g_edit_mode = EXP_EDIT_NONE;
+static int  g_edit_item = -1;              // 重命名：g_ents 下标
+static char g_edit_buf[VFS64_NAME_MAX + 1] = {0};
+static int  g_edit_len = 0;
+
+// 删除确认（两次 Delete / 两次菜单：第一次只提示，4 秒内第二次才真删）
+static int  g_del_confirm = 0;
+static uint32_t g_del_confirm_tick = 0;
+
+// 属性面板（内容区里的小窗；Esc/点别处关闭）
+static int  g_props_open = 0;
+static char g_props_name[48] = {0};
+static char g_props_kind[16] = {0};
+static char g_props_size[24] = {0};
+static char g_props_mtime[32] = {0};
+static char g_props_vol[4] = {0};
+static char g_props_path[VFS64_PATH_MAX] = {0};
+
+// 框选（空白处按下拖动；由 on_tick 跟踪鼠标，因为窗口 API 没有"移动/释放"回调）
+static int  g_box_active = 0;
+static int  g_box_x0 = 0, g_box_y0 = 0, g_box_x1 = 0, g_box_y1 = 0;
+
+// 复制缓冲（单文件上限 67584 B；与 fd64 的读缓冲同规格，粘贴时"先读整个文件再整体写"）
+static uint8_t g_copy_buf[VFS64_MAX_FILE_BYTES];
+
 // ==================== 小工具（内核里没有 libc）====================
 static void e_strcpy(char* dst, const char* src, int cap) {
     int i = 0;
@@ -193,6 +269,69 @@ static void text_clip(int x, int y, const char* s, uint32_t fg, int maxw) {
     b[i] = 0;
     while (i > 0 && tw(b) > maxw) b[--i] = 0;       // 简单截断（够用：名字上限 31B）
     if (b[0]) text(x, y, b, fg);
+}
+
+// ---- ★ 批次 J 纯函数（自检直接调；不碰盘、不改状态）----
+// 名字合法性（与 kernel/vfs64.cpp 的 name_valid 同口径）：1..31 B、可打印 ASCII 0x21..0x7E、不含 '/'、
+// 不接受 "." / ".."；界面上"看起来能建"的名字必须先过这一关，再去碰盘。
+static bool name_ok_pure(const char* s, int len) {
+    if (!s || len <= 0 || len > (int)VFS64_NAME_MAX) return false;
+    if (len == 1 && s[0] == '.') return false;
+    if (len == 2 && s[0] == '.' && s[1] == '.') return false;
+    for (int i = 0; i < len; i++) {
+        const unsigned char ch = (unsigned char)s[i];
+        if (ch < 0x21 || ch > 0x7E || ch == '/') return false;
+    }
+    return true;
+}
+// 重名策略（**本批选定并写清**）：粘贴 / 新建文件夹撞名时**自动追加 "(2)"、"(3)"…**（最多到 (32)）。
+// ⚠️ 为什么**没有**空格（与 Windows 的 "readme (2).txt" 不同）：VimtuFS2 的名字只允许 0x21..0x7E，
+//    **空格（0x20）不合法**（见 kernel/vfs64.cpp 的 name_valid）—— 带空格的候选名会被盘上的校验直接拒掉，
+//    所以这里用 "readme(2).txt"；插在扩展名之前，基名太长就截断基名，保证总长 <= 31 B。
+// 重命名（F2）**不自动改名**：用户明确输入的名字撞名一律拒绝（打点 rc=1）。
+static void suffix_name_pure(const char* name, int n, char* out, int cap) {
+    if (!name || !out || cap <= 0) return;
+    int len = 0;
+    while (name[len]) len++;
+    int dot = -1;
+    for (int i = len - 1; i > 0; i--) if (name[i] == '.') { dot = i; break; }
+    const int ext_len = (dot >= 0) ? (len - dot) : 0;
+    char tail[8];
+    int tl = 0;
+    tail[tl++] = '(';
+    if (n >= 10) tail[tl++] = (char)('0' + (n / 10));
+    tail[tl++] = (char)('0' + (n % 10));
+    tail[tl++] = ')';
+    tail[tl] = 0;
+    const int room = (int)VFS64_NAME_MAX - tl - ext_len;      // 基名可用字节数
+    int k = 0;
+    const int base_len = (dot >= 0) ? dot : len;
+    for (int i = 0; i < base_len && k < room && k < cap - 1; i++) out[k++] = name[i];
+    for (int i = 0; i < tl && k < cap - 1; i++) out[k++] = tail[i];
+    if (ext_len > 0) for (int i = dot; i < len && k < cap - 1; i++) out[k++] = name[i];
+    out[k] = 0;
+}
+// 路径的最后一段（"a/b/c.txt" -> "c.txt"；"/" -> ""）
+static void path_last_seg_pure(const char* path, char* out, int cap) {
+    if (cap > 0) out[0] = 0;
+    if (!path) return;
+    int len = e_strlen(path);
+    while (len > 1 && path[len - 1] == '/') len--;
+    int start = 0;
+    for (int i = 0; i < len; i++) if (path[i] == '/') start = i + 1;
+    int k = 0;
+    for (int i = start; i < len && k < cap - 1; i++) out[k++] = path[i];
+    if (cap > 0) out[k] = 0;
+}
+// a 是否是 b 的**祖先目录**（"a" 与 "a/b" -> true；"a" 与 "ab" -> false）。
+// 复制目录时用它拒绝"把目录复制进自己的子树"（否则递归会自己喂自己，永远停不下来）。
+static bool path_is_ancestor_pure(const char* a, const char* b) {
+    if (!a || !b) return false;
+    int n = e_strlen(a);
+    while (n > 1 && a[n - 1] == '/') n--;
+    if (n == 1 && a[0] == '/') return b[0] == '/' && b[1] != 0;
+    for (int i = 0; i < n; i++) if (a[i] != b[i]) return false;
+    return b[n] == '/';
 }
 
 // ---- 人读单位换算（KB -> GB/MB，保留一位小数；自动验收断言换算正确）----
@@ -403,6 +542,98 @@ static void exp_msg(const char* s) {
     if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
 }
 
+
+// ==================== ★ 批次 J：文件操作打点（格式见 explorer64.h；行锁）====================
+static void exp_log_ctxmenu(int items, int blank) {
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer ctxmenu items=");
+    dbg64_dec((uint64_t)items);
+    dbg64_str(" at=");
+    dbg64_str(blank ? "blank" : "sel");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void exp_log_clip(const char* op, int n) {
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer clip op=");
+    dbg64_str(op);
+    dbg64_str(" n=");
+    dbg64_dec((uint64_t)n);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void exp_log_paste(int okn, const char* dst, int skipped) {
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer paste ok n=");
+    dbg64_dec((uint64_t)okn);
+    dbg64_str(" dst=");
+    dbg64_str(dst ? dst : "/");
+    dbg64_str(" skipped=");
+    dbg64_dec((uint64_t)skipped);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void exp_log_rename(const char* oldn, const char* newn, int rc) {
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer rename old=");
+    dbg64_str(oldn ? oldn : "?");
+    dbg64_str(" new=");
+    dbg64_str(newn ? newn : "?");
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)(uint32_t)rc);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void exp_log_delete(const char* p, const char* kind, int rc, const char* why) {
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer delete path=");
+    dbg64_str(p ? p : "?");
+    dbg64_str(" kind=");
+    dbg64_str(kind);
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)(uint32_t)rc);
+    if (why && why[0]) { dbg64_str(" reason="); dbg64_str(why); }
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void exp_log_mkdir(const char* p, int rc) {
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer mkdir path=");
+    dbg64_str(p ? p : "?");
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)(uint32_t)rc);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void exp_log_sel(int n, const char* mode) {
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer sel n=");
+    dbg64_dec((uint64_t)n);
+    dbg64_str(" mode=");
+    dbg64_str(mode);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void exp_log_props(const char* name, const char* kind, uint32_t size,
+                          const char* mtime, char vol) {
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer props name=");
+    dbg64_str(name ? name : "?");
+    dbg64_str(" kind=");
+    dbg64_str(kind ? kind : "?");
+    dbg64_str(" size=");
+    dbg64_dec(size);
+    dbg64_str(" mtime=");
+    dbg64_str((mtime && mtime[0]) ? mtime : "-");
+    dbg64_str(" vol=");
+    char v[3];
+    v[0] = vol ? vol : '?';
+    v[1] = ':';
+    v[2] = 0;
+    dbg64_str(v);
+    dbg64_nl();
+    dbg64_line_end64();
+}
 // ==================== 驱动器扫描 / 此电脑页 ====================
 static void exp_scan_drives() {
     g_drive_n = drive64_scan64();
@@ -445,10 +676,118 @@ static void exp_sync_volume() {
         dbg64_line_end64();
     }
 }
+
+// ==================== ★ 批次 J：多选（位图 + 焦点条目）====================
+// 设计取舍：g_sel（焦点）保持原样（状态栏/回车/双击都看它），多选信息另存一份位图 ——
+// 这样旧逻辑（单选手势、导航后 -1）一行都不用重写，而框选/Ctrl+A 只要把位图填满。
+static bool sel_has(int i) {
+    if (i < 0 || i >= EXP_MAX_ITEMS) return false;
+    return (g_selmap[i >> 3] & (uint8_t)(1u << (i & 7))) != 0;
+}
+static void sel_mark(int i, bool on) {
+    if (i < 0 || i >= EXP_MAX_ITEMS) return;
+    const uint8_t mask = (uint8_t)(1u << (i & 7));
+    if (on) g_selmap[i >> 3] |= mask;
+    else    g_selmap[i >> 3] = (uint8_t)(g_selmap[i >> 3] & (uint8_t)~mask);
+}
+static void sel_clear() {
+    for (unsigned k = 0; k < sizeof(g_selmap); k++) g_selmap[k] = 0;
+    g_sel_n = 0;
+}
+static int sel_count() { return g_sel_n; }
+// 加选/单选：add = true 时保留已有选中（Ctrl 点选/框选累积）
+static void sel_pick(int i, bool add) {
+    if (!add) sel_clear();
+    if (!sel_has(i)) { sel_mark(i, true); g_sel_n++; }
+    g_sel = i;
+}
+static void sel_toggle(int i) {
+    if (sel_has(i)) { sel_mark(i, false); if (g_sel_n > 0) g_sel_n--; }
+    else { sel_mark(i, true); g_sel_n++; }
+    g_sel = i;
+}
+// Shift 范围选：从锚点 g_sel 到 i（含两端）
+static void sel_range(int i) {
+    const int a = (g_sel < 0) ? i : g_sel;
+    const int lo = (a < i) ? a : i;
+    const int hi = (a < i) ? i : a;
+    sel_clear();
+    for (int k = lo; k <= hi && k < EXP_MAX_ITEMS; k++) { sel_mark(k, true); g_sel_n++; }
+    g_sel = i;
+}
+static void exp_select_all() {
+    if (g_mode != 1) { exp_msg(gui64_tr("No items here", "这里没有条目")); return; }
+    sel_clear();
+    const int lim = (g_items < EXP_MAX_ITEMS) ? g_items : (int)EXP_MAX_ITEMS;
+    for (int i = 0; i < lim; i++) { sel_mark(i, true); g_sel_n++; }
+    if (lim > 0) g_sel = lim - 1;
+    exp_log_sel(g_sel_n, "all");
+    exp_msg(gui64_tr("Select all", "已全选"));
+    if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+}
+// 目录内容变了：选中集里越界/失效的下标清掉（否则状态栏会显示不存在的名字）
+static void sel_prune() {
+    const int lim = (g_items < EXP_MAX_ITEMS) ? g_items : (int)EXP_MAX_ITEMS;
+    for (int i = 0; i < EXP_MAX_ITEMS; i++) {
+        if (!sel_has(i)) continue;
+        if (i >= lim) { sel_mark(i, false); if (g_sel_n > 0) g_sel_n--; }
+    }
+    if (g_sel >= lim) g_sel = -1;
+}
+// ---- 条目在客户区里的"单元格"矩形（图标格 / 详细行都算）----
+// 传 i == g_items 得到"下一个空位"（内联新建文件夹时在那里画编辑框）。
+static void exp_cell_rect(int i, int* x, int* y, int* w, int* h) {
+    const int k = (i < 0) ? 0 : (i - g_scroll);
+    if (k < 0) { *x = EXP_CONTENT_X; *y = EXP_CONTENT_Y; *w = EXP_ICON_CELL_W; *h = EXP_ICON_CELL_H; return; }
+    if (g_view == 0) {
+        int cols = EXP_CONTENT_W / EXP_ICON_CELL_W;
+        if (cols < 1) cols = 1;
+        const int col = k % cols, row = k / cols;
+        *x = EXP_CONTENT_X + col * EXP_ICON_CELL_W;
+        *y = EXP_CONTENT_Y + 2 + row * EXP_ICON_CELL_H;
+        *w = EXP_ICON_CELL_W;
+        *h = EXP_ICON_CELL_H;
+    } else {
+        *x = EXP_CONTENT_X + 2;
+        *y = EXP_DET_ROW_Y + k * EXP_DET_ROW_H;
+        *w = EXP_COL_NAME_W + EXP_COL_NAME_X - 4;
+        *h = EXP_DET_ROW_H;
+    }
+    // 画到内容区外就钳回可见区最后一行（有界：绝不写到导航窗格/状态栏上）
+    if (*y + *h > EXP_CONTENT_Y + EXP_CONTENT_H - 2) {
+        *y = EXP_CONTENT_Y + EXP_CONTENT_H - 2 - *h;
+        if (*y < EXP_CONTENT_Y) *y = EXP_CONTENT_Y;
+    }
+    if (*x + *w > EXP_CONTENT_X + EXP_CONTENT_W - 2) *x = EXP_CONTENT_X + EXP_CONTENT_W - 2 - *w;
+}
+// 框选命中：条目单元格与框有交集就算命中（与桌面 selbox 的 icon_hits_sel 同思路）
+static bool exp_cell_hits_box(int i) {
+    int x = 0, y = 0, w = 0, h = 0;
+    exp_cell_rect(i, &x, &y, &w, &h);
+    const int bx0 = (g_box_x0 < g_box_x1) ? g_box_x0 : g_box_x1;
+    const int by0 = (g_box_y0 < g_box_y1) ? g_box_y0 : g_box_y1;
+    const int bx1 = (g_box_x0 < g_box_x1) ? g_box_x1 : g_box_x0;
+    const int by1 = (g_box_y0 < g_box_y1) ? g_box_y1 : g_box_y0;
+    return !(x + w < bx0 || x > bx1 || y + h < by0 || y > by1);
+}
+// 界面上写着哪个盘 -> vfs64 卷槽；并保证"当前卷"就是它（文件操作必须落在用户看到的盘上）。
+// -1 = 盘符非法/不可浏览/切不过去（调用方如实报错）。
+static int exp_ensure_volume() {
+    if (g_mode != 1 || !g_letter) return -1;
+    const int di = drive64_by_letter64(g_letter);
+    if (di < 0) return -1;
+    DriveInfo64 d;
+    if (drive64_info64(di, &d) != 0 || !d.browsable) return -1;
+    if ((int)d.slot != vfs64_current_slot64()) {
+        if (drive64_activate_letter64(g_letter) != 0) return -1;
+    }
+    return (int)d.slot;
+}
 static void exp_refresh_dir() {
     exp_sync_volume();                                   // ★ 多卷：目录内容必须来自界面上的盘
     g_items = 0;
     g_sel = -1;
+    sel_clear();                                         // ★ 批次 J：目录内容变了，多选集一起清（下标已失效）
     if (g_scroll < 0) g_scroll = 0;
     uint32_t cursor = 0;
     Vfs64Dirent64 one;
@@ -729,6 +1068,411 @@ static void exp_open_preview(const char* full, const char* name) {
     dbg64_line_end64();
 }
 
+// ★ 批次 J：本节的函数（新建文件夹/属性/右键菜单）会回调 exp_open_item（菜单里的"打开"），
+// 而它在文件后面才定义 —— C++ 里必须先声明。
+static void exp_open_item(int i);
+
+// ★ 批次 J：剪贴板/复制粘贴那一节里 exp_ctx_activate 也要用它。
+// ==================== ★ 批次 J：复制 / 剪切 / 粘贴（内核内剪贴板）====================
+// 模型（写清楚，免得后来人猜）：
+//   * 剪贴板 = 最多 8 条 (卷槽, 完整路径) + 操作（复制/剪切）。**不是**文件内容快照 —— 粘贴时现读现写，
+//     所以源被删掉后粘贴会失败（如实报 skipped）。
+//   * 空格检查：写前用 vfs64_free64 估目标卷的空闲块（含间接块 + 1 块余量）；不够就**整条跳过，不写一半**。
+//   * 单文件上限 67584 B（VFS64_MAX_FILE_BYTES）：超过的源会被拒绝（skipped），不是截断复制。
+//   * 目录递归复制：深度 ≤ EXP_COPY_DEPTH(4)、整棵 ≤ EXP_COPY_ITEMS(96) 条；超限的条目计入 skipped。
+//   * 跨卷（C: ↔ D:）：源用 vfs64_*_on64(源槽) 读、目标用 vfs64_*_on64(目标槽) 写 —— 与"当前卷"无关。
+//   * 剪切 = 复制成功后删源（**先全部复制成功再删**；某一条失败就保留它的源，绝不半删）。
+// 拼路径 + 在同目录里挑一个不撞名的名字（撞了就按 " (2)"、" (3)"… 追加；见 suffix_name_pure）
+static int exp_unique_name(char* out, int cap, int slot, const char* dir, const char* name) {
+    char cand[VFS64_NAME_MAX + 1];
+    e_strcpy(cand, name, (int)sizeof(cand));
+    char full[VFS64_PATH_MAX];
+    Vfs64Info64 info;
+    for (int k = 1; k <= 32; k++) {
+        exp_build_path(full, (int)sizeof(full), dir, cand);
+        if (vfs64_stat64_on64(slot, full, &info) != 0) { e_strcpy(out, cand, cap); return 0; }
+        if (k == 32) break;
+        suffix_name_pure(name, k + 1, cand, (int)sizeof(cand));
+    }
+    return -1;                                  // 32 次都撞名：如实放弃
+}
+static int exp_copy_file(int sslot, const char* sp, int dslot, const char* dp, int* why) {
+    if (why) *why = 0;
+    Vfs64Info64 si;
+    if (vfs64_stat64_on64(sslot, sp, &si) != 0) { if (why) *why = 1; return -1; }        // 源没了
+    if (si.type != VFS64_TYPE_FILE) { if (why) *why = 2; return -1; }
+    if (si.size > VFS64_MAX_FILE_BYTES) { if (why) *why = 3; return -1; }                // 超过单文件上限
+    uint32_t fb = 0, fby = 0;
+    if (vfs64_free_on64(dslot, &fb, &fby, nullptr) != 0) { if (why) *why = 4; return -1; }
+    // 需要的数据块 + 间接块（> 4 个直接块时才要间接块）+ 1 块余量
+    const uint32_t data_blocks = (si.size + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
+    const uint32_t need = data_blocks + ((data_blocks > VFS64_DIRECT_BLOCKS) ? 1u : 0u) + 1u;
+    if (fb < need) { if (why) *why = 5; return -1; }                                     // 空间不足
+    const int n = vfs64_read_on64(sslot, sp, g_copy_buf, (int)sizeof(g_copy_buf));
+    if (n < 0 || (uint32_t)n != si.size) { if (why) *why = 1; return -1; }
+    if (vfs64_write_on64(dslot, dp, g_copy_buf, n) != n) { if (why) *why = 4; return -1; }
+    return 0;
+}
+// 递归复制一棵目录树（有界；budget 是"还剩多少条目可复制"的共享计数器）
+static int exp_copy_tree(int sslot, const char* sp, int dslot, const char* dp,
+                         int depth, int* budget, int* skipped) {
+    if (depth > EXP_COPY_DEPTH) { (*skipped)++; return -1; }
+    if (path_is_ancestor_pure(sp, dp)) { (*skipped)++; return -1; }   // 目标在自己的子树里 -> 拒绝（防自喂）
+    if (vfs64_mkdir_on64(dslot, dp) != 0) {
+        Vfs64Info64 di;                                              // 已存在：是目录就合并，不是目录算失败
+        if (vfs64_stat64_on64(dslot, dp, &di) != 0 || di.type != VFS64_TYPE_DIR) { (*skipped)++; return -1; }
+    }
+    Vfs64Dirent64 ents[EXP_COPY_LIST];
+    uint32_t cursor = 0;
+    for (;;) {
+        const int got = vfs64_list64_on64(sslot, sp, ents, (int)EXP_COPY_LIST, &cursor);
+        if (got < 0) { (*skipped)++; return -1; }
+        if (got == 0) break;
+        for (int i = 0; i < got; i++) {
+            if (*budget <= 0) { (*skipped)++; continue; }            // 预算用完：如实计入 skipped
+            (*budget)--;
+            char csrc[VFS64_PATH_MAX], cdst[VFS64_PATH_MAX], uniq[VFS64_NAME_MAX + 1];
+            exp_build_path(csrc, (int)sizeof(csrc), sp, ents[i].name);
+            if (exp_unique_name(uniq, (int)sizeof(uniq), dslot, dp, ents[i].name) != 0) { (*skipped)++; continue; }
+            exp_build_path(cdst, (int)sizeof(cdst), dp, uniq);
+            if (ents[i].type == VFS64_TYPE_DIR) {
+                if (exp_copy_tree(sslot, csrc, dslot, cdst, depth + 1, budget, skipped) != 0) return -1;
+            } else {
+                if (exp_copy_file(sslot, csrc, dslot, cdst, nullptr) != 0) { (*skipped)++; return -1; }
+            }
+        }
+        if (got < (int)EXP_COPY_LIST) break;
+    }
+    return 0;
+}
+static void exp_clip_set(int op) {          // 1 = 复制、2 = 剪切：把当前选中项收进剪贴板
+    if (g_mode != 1) { exp_msg(gui64_tr("Not in a folder", "不在文件夹里")); return; }
+    const int slot = exp_ensure_volume();
+    if (slot < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
+    int n = 0;
+    for (int i = 0; i < g_items && i < EXP_MAX_ITEMS && n < EXP_CLIP_MAX; i++) {
+        if (!sel_has(i)) continue;
+        g_clip[n].slot = slot;
+        exp_build_path(g_clip[n].path, (int)sizeof(g_clip[n].path), g_path, g_ents[i].name);
+        n++;
+    }
+    if (n == 0) { exp_msg(gui64_tr("Nothing selected", "没有选中任何项")); return; }
+    g_clip_n = n;
+    g_clip_op = op;
+    exp_log_clip(op == 2 ? "cut" : "copy", n);
+    char m[72];
+    e_strcpy(m, op == 2 ? gui64_tr("Cut ", "已剪切 ") : gui64_tr("Copied ", "已复制 "), (int)sizeof(m));
+    char t[8];
+    u2s(t, (uint64_t)n);
+    e_strcat(m, t, (int)sizeof(m));
+    e_strcat(m, gui64_tr(" item(s)", " 项"), (int)sizeof(m));
+    exp_msg(m);
+}
+static void exp_paste() {
+    if (g_clip_op == 0 || g_clip_n <= 0) {
+        exp_msg(gui64_tr("Clipboard is empty", "剪贴板是空的"));
+        exp_log_paste(0, g_mode == 1 ? g_path : "/", 0);            // 空剪贴板：如实报 0，无副作用
+        return;
+    }
+    if (g_mode != 1) { exp_msg(gui64_tr("Open a folder first", "先进入一个文件夹")); return; }
+    const int dslot = exp_ensure_volume();
+    if (dslot < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
+    int okn = 0, skipped = 0, budget = EXP_COPY_ITEMS;
+    char pasted[EXP_CLIP_MAX][VFS64_PATH_MAX];                       // 剪切：只删真正复制过来的源
+    int pasted_slot[EXP_CLIP_MAX];
+    for (int i = 0; i < g_clip_n; i++) {
+        char nm[VFS64_NAME_MAX + 1];
+        path_last_seg_pure(g_clip[i].path, nm, (int)sizeof(nm));
+        if (!nm[0]) { skipped++; continue; }
+        char uniq[VFS64_NAME_MAX + 1];
+        if (exp_unique_name(uniq, (int)sizeof(uniq), dslot, g_path, nm) != 0) { skipped++; continue; }
+        char dp[VFS64_PATH_MAX];
+        exp_build_path(dp, (int)sizeof(dp), g_path, uniq);
+        Vfs64Info64 si;
+        if (vfs64_stat64_on64(g_clip[i].slot, g_clip[i].path, &si) != 0) { skipped++; continue; }
+        int rc = -1;
+        if (si.type == VFS64_TYPE_DIR) {
+            int sub_skip = 0;
+            rc = exp_copy_tree(g_clip[i].slot, g_clip[i].path, dslot, dp, 0, &budget, &sub_skip);
+            skipped += sub_skip;
+        } else {
+            int why = 0;
+            rc = exp_copy_file(g_clip[i].slot, g_clip[i].path, dslot, dp, &why);
+            if (rc != 0) skipped++;
+        }
+        if (rc == 0) {
+            e_strcpy(pasted[okn], g_clip[i].path, (int)sizeof(pasted[0]));
+            pasted_slot[okn] = g_clip[i].slot;
+            okn++;
+        }
+    }
+    exp_log_paste(okn, g_path, skipped);
+    if (g_clip_op == 2) {                                           // 剪切：复制成功后删源
+        int cut_ok = 0;
+        for (int i = 0; i < okn; i++) {
+            Vfs64Info64 si;
+            if (vfs64_stat64_on64(pasted_slot[i], pasted[i], &si) != 0) continue;
+            const int r = (si.type == VFS64_TYPE_DIR) ? vfs64_rmdir_on64(pasted_slot[i], pasted[i])
+                                                      : vfs64_unlink_on64(pasted_slot[i], pasted[i]);
+            if (r == 0) cut_ok++;
+            else exp_log_delete(pasted[i], si.type == VFS64_TYPE_DIR ? "dir" : "file", 1, "cut-src-keep");
+        }
+        if (cut_ok > 0) { g_clip_op = 0; g_clip_n = 0; }            // 源已删 -> 剪贴板清空（Windows 语义）
+    }
+    char m[72];
+    e_strcpy(m, gui64_tr("Pasted ", "已粘贴 "), (int)sizeof(m));
+    { char t[8]; u2s(t, (uint64_t)okn); e_strcat(m, t, (int)sizeof(m)); }
+    if (skipped > 0) e_strcat(m, gui64_tr(" item(s), some skipped", " 项（有跳过）"), (int)sizeof(m));
+    else e_strcat(m, gui64_tr(" item(s)", " 项"), (int)sizeof(m));
+    exp_msg(m);
+    exp_refresh_dir();
+}
+
+// ==================== ★ 批次 J：重命名 / 删除 / 新建文件夹 / 属性 ====================
+static void exp_edit_begin(int mode, int item) {   // 进入内联编辑（重命名 / 新建文件夹）
+    if (g_mode != 1) { exp_msg(gui64_tr("Not in a folder", "不在文件夹里")); return; }
+    if (mode == EXP_EDIT_RENAME) {
+        if (item < 0 || item >= g_items || item >= EXP_MAX_ITEMS) { exp_msg(gui64_tr("Nothing selected", "没有选中任何项")); return; }
+        e_strcpy(g_edit_buf, g_ents[item].name, (int)sizeof(g_edit_buf));
+        g_edit_item = item;
+    } else {
+        g_edit_buf[0] = 0;
+        g_edit_item = -1;
+    }
+    g_edit_len = e_strlen(g_edit_buf);
+    g_edit_mode = mode;
+    exp_msg(mode == EXP_EDIT_RENAME ? gui64_tr("Type a new name, Enter = OK, Esc = cancel",
+                                              "输入新名字，回车确认，Esc 取消")
+                                    : gui64_tr("Type a folder name, Enter = OK, Esc = cancel",
+                                              "输入文件夹名字，回车确认，Esc 取消"));
+    if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+}
+static void exp_edit_cancel() {
+    g_edit_mode = EXP_EDIT_NONE;
+    g_edit_item = -1;
+    g_edit_len = 0;
+    g_edit_buf[0] = 0;
+    if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+}
+static void exp_edit_commit() {                    // 回车：按模式落到盘上
+    if (g_edit_mode == EXP_EDIT_NONE) return;
+    const int mode = g_edit_mode;
+    const int item = g_edit_item;
+    char nm[VFS64_NAME_MAX + 1];
+    e_strcpy(nm, g_edit_buf, (int)sizeof(nm));
+    g_edit_mode = EXP_EDIT_NONE;
+    g_edit_item = -1;
+    if (!name_ok_pure(nm, g_edit_len)) {          // 长度/字符校验（1..31 B、可打印 ASCII、不含 '/'）
+        exp_msg(gui64_tr("Bad name (1..31 chars, no '/')", "名字不合法（1..31 个字符，不能含 /）"));
+        if (mode == EXP_EDIT_RENAME && item >= 0 && item < EXP_MAX_ITEMS) exp_log_rename(g_ents[item].name, nm, 1);
+        if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+        return;
+    }
+    if (mode == EXP_EDIT_RENAME) {
+        if (item < 0 || item >= g_items || item >= EXP_MAX_ITEMS) { exp_edit_cancel(); return; }
+        char full[VFS64_PATH_MAX];
+        exp_build_path(full, (int)sizeof(full), g_path, g_ents[item].name);
+        const int rc = vfs64_rename64(full, nm);
+        exp_log_rename(g_ents[item].name, nm, rc == 0 ? 0 : 1);
+        exp_msg(rc == 0 ? gui64_tr("Renamed", "已重命名")
+                        : gui64_tr("Rename failed (name exists or volume error)", "重命名失败（重名或卷错误）"));
+    } else {
+        const int slot = exp_ensure_volume();
+        if (slot < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
+        char uniq[VFS64_NAME_MAX + 1];
+        if (exp_unique_name(uniq, (int)sizeof(uniq), slot, g_path, nm) != 0) {
+            exp_log_mkdir(nm, 1);
+            exp_msg(gui64_tr("Too many name conflicts", "同名冲突太多"));
+            return;
+        }
+        char full[VFS64_PATH_MAX];
+        exp_build_path(full, (int)sizeof(full), g_path, uniq);
+        const int rc = vfs64_mkdir64(full);
+        exp_log_mkdir(full, rc == 0 ? 0 : 1);
+        exp_msg(rc == 0 ? gui64_tr("Folder created", "已新建文件夹")
+                        : gui64_tr("Cannot create folder", "无法新建文件夹"));
+    }
+    exp_refresh_dir();
+}
+// 删除确认（本批选**两段式**）：第一次只提示，**10 秒内**再来一次（Delete 或右键菜单）才真删。
+// 为什么不用小确认框：内容区已经在画右键菜单/属性面板，再多一个模态框会挡视线；
+// 状态栏提示 + 打点同样可验收，而且不会误删（手快连按两次也能看出来）。
+// 10 秒窗口：给"看一眼提示再按"留时间（自动验收里截一次图要 2~4 秒，4 秒窗口会被截图吃掉）。
+static void exp_delete_now();
+static void exp_delete_request() {
+    if (g_mode != 1) { exp_msg(gui64_tr("Not in a folder", "不在文件夹里")); return; }
+    if (sel_count() <= 0) { exp_msg(gui64_tr("Nothing selected", "没有选中任何项")); return; }
+    if (g_del_confirm && (int32_t)(ticks64() - g_del_confirm_tick) < 0) {
+        g_del_confirm = 0;
+        exp_delete_now();
+        return;
+    }
+    g_del_confirm = 1;
+    g_del_confirm_tick = ticks64() + ms_to_ticks64(10000);
+    // 打点：两段式的第一段（表明这次按 Delete 只提示、什么都没删；验收据此断言"没假装成功"）
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer delete confirm n=");
+    dbg64_dec((uint64_t)sel_count());
+    dbg64_str(" path=");
+    for (int i = 0; i < g_items && i < EXP_MAX_ITEMS; i++) {
+        if (!sel_has(i)) continue;
+        char full[VFS64_PATH_MAX];
+        exp_build_path(full, (int)sizeof(full), g_path, g_ents[i].name);
+        dbg64_str(full);
+        break;
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+    exp_msg(gui64_tr("Press Delete again to confirm (10s)", "再按一次 Delete 确认删除（10 秒内有效）"));
+}
+static void exp_delete_now() {
+    const int slot = exp_ensure_volume();
+    if (slot < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
+    int done = 0, refused = 0;
+    for (int i = 0; i < g_items && i < EXP_MAX_ITEMS; i++) {
+        if (!sel_has(i)) continue;
+        const Vfs64Dirent64* d = &g_ents[i];
+        char full[VFS64_PATH_MAX];
+        exp_build_path(full, (int)sizeof(full), g_path, d->name);
+        if (d->type == VFS64_TYPE_DIR) {
+            Vfs64Dirent64 one;
+            uint32_t cur = 0;
+            const int n = vfs64_list64(full, &one, 1, &cur);
+            if (n < 0) { exp_log_delete(full, "dir", 1, "stat-failed"); refused++; continue; }
+            if (n > 0) {                                  // 非空目录：**明说暂不支持递归删除**，绝不假装成功
+                exp_log_delete(full, "dir", 1, "not-empty");
+                exp_msg(gui64_tr("Directory is not empty (recursive delete not supported yet)",
+                                 "目录非空，暂不支持递归删除"));
+                refused++;
+                continue;
+            }
+            const int rc = vfs64_rmdir64(full);
+            exp_log_delete(full, "dir", rc == 0 ? 0 : 1, rc == 0 ? "" : "rmdir-failed");
+            if (rc == 0) done++; else refused++;
+        } else {
+            const int rc = vfs64_unlink64(full);
+            exp_log_delete(full, "file", rc == 0 ? 0 : 1, rc == 0 ? "" : "unlink-failed");
+            if (rc == 0) done++; else refused++;
+        }
+    }
+    if (done > 0 && refused == 0) exp_msg(gui64_tr("Deleted", "已删除"));
+    exp_refresh_dir();
+}
+// 属性：数据全从 vfs64_stat64 来（名称/类型/大小/修改日期/所在卷），画成内容区里的小面板 + 打点。
+static void exp_props_show(int item) {
+    char full[VFS64_PATH_MAX];
+    char nm[48];
+    if (item >= 0 && item < g_items && item < EXP_MAX_ITEMS) {
+        exp_build_path(full, (int)sizeof(full), g_path, g_ents[item].name);
+        e_strcpy(nm, g_ents[item].name, (int)sizeof(nm));
+    } else {                                            // 空白处属性 = 当前目录自己
+        e_strcpy(full, g_path, (int)sizeof(full));
+        path_last_seg_pure(g_path, nm, (int)sizeof(nm));
+        if (!nm[0]) e_strcpy(nm, "/", (int)sizeof(nm));
+    }
+    Vfs64Info64 info;
+    if (vfs64_stat64(full, &info) != 0) {
+        exp_msg(gui64_tr("Cannot read properties", "读不到属性"));
+        exp_log_props(nm, "unknown", 0, "-", g_letter);
+        return;
+    }
+    e_strcpy(g_props_name, nm, (int)sizeof(g_props_name));
+    e_strcpy(g_props_kind, (info.type == VFS64_TYPE_DIR) ? "dir" : vfs64_kind_str64(info.kind),
+             (int)sizeof(g_props_kind));
+    if (info.type == VFS64_TYPE_DIR) e_strcpy(g_props_size, "-", (int)sizeof(g_props_size));
+    else fmt_bytes64(info.size, g_props_size, (int)sizeof(g_props_size));
+    fmt_mtime64(info.mtime, g_props_mtime, (int)sizeof(g_props_mtime));
+    g_props_vol[0] = g_letter ? g_letter : '?';
+    g_props_vol[1] = ':';
+    g_props_vol[2] = 0;
+    e_strcpy(g_props_path, full, (int)sizeof(g_props_path));
+    g_props_open = 1;
+    exp_log_props(g_props_name, g_props_kind, info.type == VFS64_TYPE_DIR ? 0 : info.size,
+                  g_props_mtime, g_props_vol[0]);
+    if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+}
+
+// ==================== ★ 批次 J：右键菜单（打开/复制/剪切/重命名/删除/属性 或 新建/粘贴/刷新/属性）====
+static int exp_ctx_count() { return g_ctx_blank ? EXP_CTX_BLANK_N : EXP_CTX_ITEM_N; }
+static int exp_ctx_height() { return exp_ctx_count() * EXP_CTX_ITEM_H + 4; }
+static const char* exp_ctx_label(int k) {
+    if (g_ctx_blank) {
+        if (k == 0) return gui64_tr("New folder", "新建文件夹");
+        if (k == 1) return gui64_tr("Paste", "粘贴");
+        if (k == 2) return gui64_tr("Refresh", "刷新");
+        return gui64_tr("Properties", "属性");
+    }
+    if (k == 0) return gui64_tr("Open", "打开");
+    if (k == 1) return gui64_tr("Copy", "复制");
+    if (k == 2) return gui64_tr("Cut", "剪切");
+    if (k == 3) return gui64_tr("Rename", "重命名");
+    if (k == 4) return gui64_tr("Delete", "删除");
+    return gui64_tr("Properties", "属性");
+}
+static bool exp_ctx_enabled(int k) {              // 与工具栏按钮同一套置灰规则
+    if (g_ctx_blank) {
+        if (k == 1) return g_clip_op != 0 && g_clip_n > 0;
+        return true;
+    }
+    if (k == 1) return sel_count() > 0;           // 复制
+    if (k == 2) return sel_count() > 0;           // 剪切
+    if (k == 3 || k == 4) return sel_count() > 0; // 重命名/删除
+    return true;                                  // 打开/属性：右键点中的那一项总是可以
+}
+static void exp_ctx_close() {
+    if (!g_ctx_open) return;
+    g_ctx_open = 0;
+    g_ctx_hover = -1;
+    if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+}
+static void exp_ctx_open_at(int cx, int cy, int blank, int item) {
+    g_ctx_blank = blank ? 1 : 0;
+    g_ctx_item = blank ? -1 : item;
+    g_ctx_n = exp_ctx_count();
+    int x = cx, y = cy;
+    const int h = exp_ctx_height();
+    if (x + EXP_CTX_W > EXP_CONTENT_X + EXP_CONTENT_W - 2) x = EXP_CONTENT_X + EXP_CONTENT_W - 2 - EXP_CTX_W;
+    if (y + h > EXP_CONTENT_Y + EXP_CONTENT_H - 2) y = EXP_CONTENT_Y + EXP_CONTENT_H - 2 - h;
+    if (x < EXP_CONTENT_X) x = EXP_CONTENT_X;
+    if (y < EXP_CONTENT_Y) y = EXP_CONTENT_Y;
+    g_ctx_x = x;
+    g_ctx_y = y;
+    g_ctx_hover = -1;
+    g_ctx_open = 1;
+    exp_log_ctxmenu(g_ctx_n, g_ctx_blank);
+    dbg64_line_begin64();                           // 菜单矩形（验收按它定位像素；与上面那行分开，格式互不影响）
+    dbg64_str("[UI] explorer ctxmenu rect x=");
+    dbg64_dec((uint64_t)x);
+    dbg64_str(" y=");
+    dbg64_dec((uint64_t)y);
+    dbg64_str(" w=");
+    dbg64_dec((uint64_t)EXP_CTX_W);
+    dbg64_str(" h=");
+    dbg64_dec((uint64_t)h);
+    dbg64_nl();
+    dbg64_line_end64();
+    if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+}
+static void exp_ctx_activate(int k) {              // 菜单项动作（k = 下标）
+    const int blank = g_ctx_blank;
+    const int item = g_ctx_item;
+    exp_ctx_close();
+    if (blank) {
+        if (k == 0) exp_edit_begin(EXP_EDIT_MKDIR, -1);
+        else if (k == 1) exp_paste();
+        else if (k == 2) { exp_refresh_dir(); exp_msg(gui64_tr("Refreshed", "已刷新")); }
+        else exp_props_show(-1);
+        return;
+    }
+    if (k == 0) exp_open_item(item);
+    else if (k == 1) exp_clip_set(1);
+    else if (k == 2) exp_clip_set(2);
+    else if (k == 3) exp_edit_begin(EXP_EDIT_RENAME, item);
+    else if (k == 4) exp_delete_request();
+    else exp_props_show(item);
+}
+
+// ==================== 打开条目（双击 / 回车 / 菜单"打开"）====================
 static void exp_open_item(int i) {
     if (i < 0 || i >= g_items || i >= EXP_MAX_ITEMS) return;
     const Vfs64Dirent64* d = &g_ents[i];
@@ -811,10 +1555,14 @@ static int per_page(void) {
 static int btn_id_at(int cx, int cy, int* crumb_idx) {
     if (crumb_idx) *crumb_idx = -1;
     if (cy < 0 || cy >= EXP_TOOLBAR_H + EXP_ADDR_H) return IDC_NONE;
-    if (cy < EXP_TOOLBAR_H) {                       // 工具栏：固定三按钮
+    if (cy < EXP_TOOLBAR_H) {                       // 工具栏：固定三按钮 + ★ 批次 J 的 6 个文件操作按钮
         if (cx >= 8 && cx < 8 + EXP_TB_BTN_W) return IDC_FILE;
         if (cx >= 8 + EXP_TB_BTN_W + 4 && cx < 8 + EXP_TB_BTN_W * 2 + 4) return IDC_COMPUTER;
         if (cx >= 8 + EXP_TB_BTN_W * 2 + 8 && cx < 8 + EXP_TB_BTN_W * 3 + 8) return IDC_VIEW;
+        for (int i = 0; i < EXP_TB2_N; i++) {
+            const int bx = EXP_TB2_X + i * (EXP_TB2_W + EXP_TB2_GAP);
+            if (cx >= bx && cx < bx + EXP_TB2_W) return IDC_MKDIR + i;
+        }
         return IDC_NONE;
     }
     if (cy < EXP_TOOLBAR_H + EXP_ADDR_H) {          // 地址栏
@@ -995,7 +1743,8 @@ static void draw_content(void) {
             if (row >= rows) break;
             const int cx = ax + col * EXP_ICON_CELL_W;
             const int cy = ay + 2 + row * EXP_ICON_CELL_H;
-            if (i == g_sel) frect(cx + 2, cy, EXP_ICON_CELL_W - 4, EXP_ICON_CELL_H - 6, C_EXP_SEL);
+            if (sel_has(i)) frect(cx + 2, cy, EXP_ICON_CELL_W - 4, EXP_ICON_CELL_H - 6, C_EXP_SEL);
+            if (i == g_sel && sel_has(i)) drect(cx + 2, cy, EXP_ICON_CELL_W - 4, EXP_ICON_CELL_H - 6, C_EXP_BOX_LINE);
             draw_item_icon(cx + (EXP_ICON_CELL_W - EXP_ICON_SIZE) / 2, cy + 6, &g_ents[i]);
             txt_clip(cx + 4, cy + 44, g_ents[i].name, C_EXP_TEXT, EXP_ICON_CELL_W - 8);
         }
@@ -1016,7 +1765,8 @@ static void draw_content(void) {
             const int r = i - g_scroll;
             if (r >= rows) break;
             const int ry = EXP_DET_ROW_Y + r * EXP_DET_ROW_H;
-            if (i == g_sel) frect(ax + 1, ry, aw - 2, EXP_DET_ROW_H, C_EXP_SEL);
+            if (sel_has(i)) frect(ax + 1, ry, aw - 2, EXP_DET_ROW_H, C_EXP_SEL);
+            if (i == g_sel && sel_has(i)) drect(ax + 1, ry, aw - 2, EXP_DET_ROW_H, C_EXP_BOX_LINE);
             const Vfs64Dirent64* d = &g_ents[i];
             char date[32], size[32];
             fmt_mtime64(d->mtime, date, (int)sizeof(date));
@@ -1046,8 +1796,15 @@ static void draw_content(void) {
     frect(ax, ay + ah - 1, aw, 1, C_EXP_LINE);      // 内容区底边
 }
 
+// ★ 批次 J：6 个文件操作按钮的可用状态（与右键菜单同一套规则；置灰就是真的不能点，点了只给提示）
+static bool exp_tb_enabled(int id) {
+    if (g_mode != 1) return false;                     // "此电脑"页没有文件操作对象
+    if (id == IDC_MKDIR) return true;
+    if (id == IDC_PASTE) return g_clip_op != 0 && g_clip_n > 0;
+    return sel_count() > 0;                            // 复制/剪切/重命名/删除
+}
 static void draw_toolbar(void) {
-    frect(0, 0, EXP_CONTENT_X, EXP_TOOLBAR_H, C_EXP_TOOLBAR);
+    frect(0, 0, EXP_WIN_W - 2, EXP_TOOLBAR_H, C_EXP_TOOLBAR);   // ★ 批次 J：铺满整行（第 2 组按钮也在这一行）
     frect(0, EXP_TOOLBAR_H - 1, EXP_WIN_W - 2, 1, C_EXP_LINE);
     const char* labels[3];
     labels[0] = gui64_tr("File", "文件");
@@ -1063,9 +1820,22 @@ static void draw_toolbar(void) {
         const int lw = tw(labels[i]);
         txt(x + (EXP_TB_BTN_W - lw) / 2, 6, labels[i], C_EXP_TEXT);
     }
-    // 状态栏提示（点"文件"菜单里的项 / 打不开的文件时给可见反馈）
-    if (g_msg[0] && (int32_t)(ticks64() - g_msg_tick) < 0)
-        txt(EXP_TB_BTN_W * 3 + 24, 6, g_msg, rgb(160, 60, 60));
+    // ★ 批次 J：6 个文件操作按钮（无选中/剪贴板为空 -> 置灰；hover 高亮、按下变深）
+    static const char* lbl_en[EXP_TB2_N] = { "New", "Copy", "Cut", "Paste", "Rename", "Delete" };
+    static const char* lbl_zh[EXP_TB2_N] = { "新建", "复制", "剪切", "粘贴", "重命名", "删除" };
+    const int ids2[EXP_TB2_N] = { IDC_MKDIR, IDC_COPY, IDC_CUT, IDC_PASTE, IDC_RENAME, IDC_DEL };
+    for (int i = 0; i < EXP_TB2_N; i++) {
+        const int x = EXP_TB2_X + i * (EXP_TB2_W + EXP_TB2_GAP);
+        const bool en = exp_tb_enabled(ids2[i]);
+        uint32_t bg = C_EXP_TOOLBAR;
+        if (en && g_press_id == ids2[i]) bg = C_EXP_BTN_PRESS;
+        else if (en && g_hover_id == ids2[i]) bg = C_EXP_BTN_HOV;
+        if (bg != C_EXP_TOOLBAR) frect(x, 3, EXP_TB2_W, EXP_TB2_H, bg);
+        drect(x, 3, EXP_TB2_W, EXP_TB2_H, en ? C_EXP_LINE : rgb(214, 214, 214));
+        const char* lb = gui64_tr(lbl_en[i], lbl_zh[i]);
+        const int lw = tw(lb);
+        txt(x + (EXP_TB2_W - lw) / 2, 6, lb, en ? C_EXP_TEXT : C_EXP_DIS);
+    }
 }
 static void draw_addr(void) {
     const int y0 = EXP_TOOLBAR_H;
@@ -1176,8 +1946,15 @@ static void draw_status(void) {
             e_strcat(buf, "  ", (int)sizeof(buf));
             e_strcat(buf, s, (int)sizeof(buf));
         }
+        if (sel_count() > 1) {                         // ★ 批次 J：多选时补一句"等 N 项"
+            char t[16];
+            u2s(t, (uint64_t)sel_count());
+            e_strcat(buf, gui64_tr(" (+", "（共 "), (int)sizeof(buf));
+            e_strcat(buf, t, (int)sizeof(buf));
+            e_strcat(buf, gui64_tr(")", " 项）"), (int)sizeof(buf));
+        }
     }
-    txt(8, y + 4, buf, C_EXP_DIM);
+    txt_clip(8, y + 4, buf, C_EXP_DIM, 300);
     // 当前盘符容量（Win10 状态栏右侧也有容量信息）
     if (g_mode == 1 && g_cur_drive_ok && g_cur_drive.total_known && g_cur_drive.free_known) {
         char a[32], b[32], r[96];
@@ -1188,6 +1965,10 @@ static void draw_status(void) {
         e_strcat(r, b, (int)sizeof(r));
         txt_clip(EXP_CONTENT_X + EXP_CONTENT_W - tw(r) - 6, y + 4, r, C_EXP_DIM, EXP_CONTENT_W);
     }
+    // ★ 批次 J：操作提示（"再按一次 Delete 确认"等）—— 原来画在工具栏行，现在工具栏放了文件操作按钮，
+    // 提示移到状态栏中段（红棕色，肉眼可见；自动验收按颜色像素判定"用户真的看到了提示"）。
+    if (g_msg[0] && (int32_t)(ticks64() - g_msg_tick) < 0)
+        txt_clip(310, y + 4, g_msg, rgb(160, 60, 60), EXP_CONTENT_X + EXP_CONTENT_W - 316);
 }
 static void draw_filemenu(void) {
     if (!g_menu_open) return;
@@ -1202,6 +1983,65 @@ static void draw_filemenu(void) {
         if (g_hover_id == IDC_FILE + 10 + i) frect(x + 2, iy, 166, 24, C_EXP_MENU_HOV);
         txt(x + 10, iy + 5, items[i], C_EXP_TEXT);
     }
+}
+// ==================== ★ 批次 J：右键菜单 / 内联编辑 / 属性面板 / 框选 的绘制 ====================
+static void draw_ctxmenu(void) {
+    if (!g_ctx_open) return;
+    const int x = g_ctx_x, y = g_ctx_y, h = exp_ctx_height();
+    frect(x, y, EXP_CTX_W, h, C_EXP_CTX_BG);
+    drect(x, y, EXP_CTX_W, h, C_EXP_CTX_LINE);
+    for (int k = 0; k < exp_ctx_count(); k++) {
+        const int iy = y + 2 + k * EXP_CTX_ITEM_H;
+        const bool en = exp_ctx_enabled(k);
+        if (en && g_hover_id == IDC_CTX_BASE + k)
+            frect(x + 2, iy, EXP_CTX_W - 4, EXP_CTX_ITEM_H - 2, C_EXP_CTX_HOV);
+        txt_clip(x + 10, iy + 5, exp_ctx_label(k), en ? C_EXP_TEXT : C_EXP_DIS, EXP_CTX_W - 16);
+    }
+}
+// 内联编辑框（重命名：画在条目自己的名字行上；新建文件夹：画在"下一个空位"）
+static void draw_edit(void) {
+    if (g_edit_mode == EXP_EDIT_NONE) return;
+    int cx = 0, cy = 0, cw = 0, ch = 0;
+    const int anchor = (g_edit_mode == EXP_EDIT_RENAME) ? g_edit_item : g_items;
+    exp_cell_rect(anchor, &cx, &cy, &cw, &ch);
+    if (g_view == 0) { cy += 40; ch = 16; }        // 图标视图：名字在图标下面那一行
+    frect(cx, cy, cw, ch, C_EXP_EDIT_BG);
+    drect(cx, cy, cw, ch, C_EXP_EDIT_LINE);
+    txt_clip(cx + 2, cy + 2, g_edit_buf, C_EXP_TEXT, cw - 6);
+    frect(cx + 3 + tw(g_edit_buf), cy + 3, 1, 10, C_EXP_EDIT_LINE);   // 光标（简单竖线）
+}
+static void draw_props(void) {
+    if (!g_props_open) return;
+    const int x = EXP_CONTENT_X + 20, y = EXP_CONTENT_Y + 18, w = 330, h = 132;
+    frect(x, y, w, h, C_EXP_PROPS_BG);
+    drect(x, y, w, h, C_EXP_CTX_LINE);
+    frect(x + 1, y + 1, w - 2, 18, rgb(240, 240, 240));
+    frect(x + 1, y + 19, w - 2, 1, C_EXP_SEP);
+    txt(x + 8, y + 6, gui64_tr("Properties", "属性"), rgb(0, 60, 120));
+    int ly = y + 24;
+    const int lh = 19;
+    txt(x + 10, ly, gui64_tr("Name:", "名称："), C_EXP_DIM);
+    txt_clip(x + 82, ly, g_props_name, C_EXP_TEXT, w - 94); ly += lh;
+    txt(x + 10, ly, gui64_tr("Type:", "类型："), C_EXP_DIM);
+    txt_clip(x + 82, ly, g_props_kind, C_EXP_TEXT, w - 94); ly += lh;
+    txt(x + 10, ly, gui64_tr("Size:", "大小："), C_EXP_DIM);
+    txt_clip(x + 82, ly, g_props_size, C_EXP_TEXT, w - 94); ly += lh;
+    txt(x + 10, ly, gui64_tr("Modified:", "修改日期："), C_EXP_DIM);
+    txt_clip(x + 82, ly, g_props_mtime[0] ? g_props_mtime : "-", C_EXP_TEXT, w - 94); ly += lh;
+    txt(x + 10, ly, gui64_tr("Volume:", "所在卷："), C_EXP_DIM);
+    txt_clip(x + 82, ly, g_props_vol, C_EXP_TEXT, w - 94);
+    txt_clip(x + 10, y + h - 16, g_props_path, C_EXP_DIM, w - 20);
+}
+// 框选矩形（内核没有 alpha 混合：用浅蓝填充 + 蓝边框近似 Win10 的半透明选择框）
+static void draw_selbox(void) {
+    if (!g_box_active) return;
+    const int x0 = (g_box_x0 < g_box_x1) ? g_box_x0 : g_box_x1;
+    const int y0 = (g_box_y0 < g_box_y1) ? g_box_y0 : g_box_y1;
+    const int bw = (g_box_x0 < g_box_x1) ? (g_box_x1 - g_box_x0) : (g_box_x0 - g_box_x1);
+    const int bh = (g_box_y0 < g_box_y1) ? (g_box_y1 - g_box_y0) : (g_box_y0 - g_box_y1);
+    if (bw < 2 || bh < 2) return;
+    frect(x0, y0, bw, bh, C_EXP_BOX_IN);
+    drect(x0, y0, bw, bh, C_EXP_BOX_LINE);
 }
 static void exp_draw(Window* w) {
     g_ox = w->client_x;             // 客户区相对坐标 -> 屏幕坐标（见上面的绘制坐标约定）
@@ -1222,21 +2062,29 @@ static void exp_draw(Window* w) {
             hov = btn_id_at(mx, my, &ci);
             if (hov == IDC_NONE && g_menu_open && mx >= 8 && mx < 178 && my >= EXP_TOOLBAR_H && my < EXP_TOOLBAR_H + 56)
                 hov = IDC_FILE + 10 + (my - EXP_TOOLBAR_H - 2) / 26;
+            if (hov == IDC_NONE && g_ctx_open && mx >= g_ctx_x && mx < g_ctx_x + EXP_CTX_W &&
+                my >= g_ctx_y + 2 && my < g_ctx_y + 2 + exp_ctx_count() * EXP_CTX_ITEM_H)
+                hov = IDC_CTX_BASE + (my - g_ctx_y - 2) / EXP_CTX_ITEM_H;
         }
     }
     if (hov != g_hover_id) {
         g_hover_id = hov;
         gui64_dirty(w->client_x, w->client_y, w->client_w, EXP_TOOLBAR_H + EXP_ADDR_H);
-        if (hov >= IDC_FILE + 10) gui64_dirty(w->client_x + 8, w->client_y + EXP_TOOLBAR_H, 176, 60);
+        if (hov >= IDC_FILE + 10 && hov < IDC_CTX_BASE) gui64_dirty(w->client_x + 8, w->client_y + EXP_TOOLBAR_H, 176, 60);
+        if (g_ctx_open) gui64_dirty(w->client_x + g_ctx_x, w->client_y + g_ctx_y, EXP_CTX_W, exp_ctx_height());
     }
     // 内容区（自己再设一次裁剪：内容不得溢出到导航窗格/状态栏）
     fb_set_clip(w->client_x + EXP_CONTENT_X, w->client_y + EXP_CONTENT_Y, EXP_CONTENT_W, EXP_CONTENT_H);
     draw_content();
+    draw_selbox();                                     // ★ 批次 J：框选矩形（画在内容之上、菜单之下）
     fb_set_clip(w->client_x, w->client_y, w->client_w, w->client_h);
     draw_toolbar();
     draw_addr();
     draw_nav();
     draw_filemenu();
+    draw_props();                                      // ★ 批次 J：属性面板
+    draw_ctxmenu();                                    // ★ 批次 J：右键菜单（最上层）
+    draw_edit();                                       // ★ 批次 J：内联编辑框（菜单之上，避免被盖）
     draw_status();
     fb_set_clip(w->client_x, w->client_y, w->client_w, w->client_h);   // 把外壳的客户区裁剪还回去（勿 reset）
 }
@@ -1298,6 +2146,12 @@ static void exp_click(Window* w, int cx, int cy) {
     else if (id == IDC_BACK) e_strcpy(hit, "btn:back", (int)sizeof(hit));
     else if (id == IDC_FWD) e_strcpy(hit, "btn:fwd", (int)sizeof(hit));
     else if (id == IDC_UP) e_strcpy(hit, "btn:up", (int)sizeof(hit));
+    else if (id == IDC_MKDIR)  e_strcpy(hit, "btn:mkdir", (int)sizeof(hit));
+    else if (id == IDC_COPY)   e_strcpy(hit, "btn:copy", (int)sizeof(hit));
+    else if (id == IDC_CUT)    e_strcpy(hit, "btn:cut", (int)sizeof(hit));
+    else if (id == IDC_PASTE)  e_strcpy(hit, "btn:paste", (int)sizeof(hit));
+    else if (id == IDC_RENAME) e_strcpy(hit, "btn:rename", (int)sizeof(hit));
+    else if (id == IDC_DEL)    e_strcpy(hit, "btn:del", (int)sizeof(hit));
     if (id == IDC_NONE) {
         const int ic = hit_card(cx, cy);
         const int ii = hit_item(cx, cy);
@@ -1330,6 +2184,38 @@ static void exp_click(Window* w, int cx, int cy) {
         }
         g_menu_open = 0;
         gui64_invalidate_window(w);
+        return;
+    }
+    // ---- ★ 批次 J：内联编辑 / 右键菜单 / 属性面板：点别处 = 关掉（Win10 语义），且这一下不再做别的 ----
+    if (g_edit_mode != EXP_EDIT_NONE) {
+        int ex = 0, ey = 0, ew = 0, eh = 0;
+        const int anchor = (g_edit_mode == EXP_EDIT_RENAME) ? g_edit_item : g_items;
+        exp_cell_rect(anchor, &ex, &ey, &ew, &eh);
+        if (g_view == 0) { ey += 40; eh = 16; }
+        if (!(cx >= ex && cx < ex + ew && cy >= ey && cy < ey + eh)) exp_edit_cancel();
+        return;
+    }
+    if (g_ctx_open) {
+        const int k = (cy - g_ctx_y - 2) / EXP_CTX_ITEM_H;
+        if (cx >= g_ctx_x && cx < g_ctx_x + EXP_CTX_W && cy >= g_ctx_y + 2 && k >= 0 && k < exp_ctx_count()) {
+            if (exp_ctx_enabled(k)) { exp_ctx_activate(k); return; }
+            exp_msg(gui64_tr("That action is not available", "该操作当前不可用"));
+            exp_ctx_close();
+            return;
+        }
+        exp_ctx_close();
+        return;                                    // 点菜单外面：这一下只关菜单（不误触发下面的按钮/条目）
+    }
+    if (g_props_open) { g_props_open = 0; gui64_invalidate_window(w); return; }
+    // ---- ★ 批次 J：文件操作按钮（置灰的点了只给提示，不做事）----
+    if (id >= IDC_MKDIR && id <= IDC_DEL) {
+        if (!exp_tb_enabled(id)) { exp_msg(gui64_tr("That action is not available", "该操作当前不可用")); return; }
+        if (id == IDC_MKDIR)       exp_edit_begin(EXP_EDIT_MKDIR, -1);
+        else if (id == IDC_COPY)   exp_clip_set(1);
+        else if (id == IDC_CUT)    exp_clip_set(2);
+        else if (id == IDC_PASTE)  exp_paste();
+        else if (id == IDC_RENAME) exp_edit_begin(EXP_EDIT_RENAME, g_sel);
+        else                       exp_delete_request();
         return;
     }
     // ---- 工具栏 / 地址栏 ----
@@ -1417,8 +2303,22 @@ static void exp_click(Window* w, int cx, int cy) {
             return;
         }
         const int ii = hit_item(cx, cy);
-        if (ii < 0) { g_sel = -1; gui64_invalidate_window(w); return; }
-        g_sel = ii;
+        if (ii < 0) {
+            // 空白处：清选择 + **开始框选**（左键按下起框，由 on_tick 跟踪拖动/松开）
+            sel_clear();
+            g_sel = -1;
+            if (rx >= 0 && ry >= 0 && rx < EXP_CONTENT_W && ry < EXP_CONTENT_H) {
+                g_box_active = 1;
+                g_box_x0 = g_box_x1 = cx;
+                g_box_y0 = g_box_y1 = cy;
+            }
+            gui64_invalidate_window(w);
+            return;
+        }
+        // ★ 批次 J：Ctrl = 加选/取消，Shift = 范围选，裸点 = 单选（键状态读得到，见 input.cpp 的 kbd_*_pressed）
+        if (kbd_ctrl_pressed())       { sel_toggle(ii); exp_log_sel(sel_count(), "click"); }
+        else if (kbd_shift_pressed()) { sel_range(ii);  exp_log_sel(sel_count(), "click"); }
+        else                          { sel_pick(ii, false); exp_log_sel(sel_count(), "click"); }
         if (dbl_ok && g_last_item == ii) {
             g_last_item = -1;
             exp_open_item(ii);
@@ -1439,6 +2339,7 @@ static void exp_select_move(int delta) {
     if (s < 0) s = 0;
     if (s > g_items - 1) s = g_items - 1;
     g_sel = s;
+    if (s >= 0) sel_pick(s, false);                    // ★ 批次 J：方向键走位 = 单选该条目
     const int pp = per_page();
     int sc = g_scroll;
     if (g_sel < sc) sc = g_sel;
@@ -1456,9 +2357,43 @@ static void exp_select_move(int delta) {
     }
     if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
 }
+static void exp_tick(Window* w);                       // ★ 批次 J：框选跟踪（窗口 tick，见下）
 static void exp_key(Window* w, char c) {
     (void)w;
-    switch ((unsigned char)c) {
+    const unsigned char uc = (unsigned char)c;
+    // ---- ★ 批次 J：内联编辑优先吃键（字符 / 退格 / 回车 / Esc）----
+    if (g_edit_mode != EXP_EDIT_NONE) {
+        if (uc == 0x1B) { exp_edit_cancel(); return; }                        // Esc = 取消
+        if (uc == '\n' || uc == '\r') { exp_edit_commit(); return; }          // 回车 = 确认
+        if (uc == 0x08) {                                                     // 退格
+            if (g_edit_len > 0) { g_edit_buf[--g_edit_len] = 0; }
+            if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+            return;
+        }
+        if (uc >= 0x20 && uc <= 0x7E && uc != '/') {                          // 可打印字符（'/' 是路径分隔符，不收）
+            if (g_edit_len < (int)VFS64_NAME_MAX) {
+                g_edit_buf[g_edit_len++] = (char)uc;
+                g_edit_buf[g_edit_len] = 0;
+            }
+            if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+            return;
+        }
+        return;                                                               // 编辑中其它键不穿透到导航
+    }
+    switch (uc) {
+        // ---- ★ 批次 J：快捷键（键码见 input.h 的 KBD_KEY_*；Ctrl 组合按老口径折成控制字符）----
+        case KBD_KEY_DELETE: exp_delete_request(); break;      // Delete = 删除（两次确认）
+        case KBD_KEY_F2:     exp_edit_begin(EXP_EDIT_RENAME, g_sel); break;   // F2 = 重命名
+        case 0x03: exp_clip_set(1); break;                     // Ctrl+C = 复制
+        case 0x18: exp_clip_set(2); break;                     // Ctrl+X = 剪切
+        case 0x16: exp_paste(); break;                         // Ctrl+V = 粘贴
+        case 0x01: exp_select_all(); break;                    // Ctrl+A = 全选
+        case 0x1B:                                             // Esc = 关菜单/属性，其次取消选择
+            if (g_ctx_open) { exp_ctx_close(); break; }
+            if (g_props_open) { g_props_open = 0; if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win); break; }
+            if (sel_count() > 0) { sel_clear(); g_sel = -1; exp_msg(gui64_tr("Selection cleared", "已取消选择")); }
+            if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+            break;
         case 0xFD: exp_select_move(-1); break;         // NAV_UP
         case 0xFE: exp_select_move(+1); break;         // NAV_DOWN
         case 0xFB: exp_back(); break;                  // NAV_LEFT
@@ -1483,11 +2418,91 @@ static void exp_key(Window* w, char c) {
         default: break;
     }
 }
+// ==================== ★ 批次 J：框选（空白拖动；窗口 API 没有"移动/释放"回调，所以用 on_tick 跟）====
+// 每帧读一次鼠标：左键还按着就更新矩形 + 实时选中框内条目；左键松开就收敛 + 打点。
+// 与桌面外壳的 selbox（gui64.cpp）同一思路，只是这里没有独立的消息循环，所以挂在窗口 tick 上。
+static void exp_box_finish(Window* w) {
+    g_box_active = 0;
+    const int bw = (g_box_x0 < g_box_x1) ? (g_box_x1 - g_box_x0) : (g_box_x0 - g_box_x1);
+    const int bh = (g_box_y0 < g_box_y1) ? (g_box_y1 - g_box_y0) : (g_box_y0 - g_box_y1);
+    if (bw < EXP_BOX_MIN && bh < EXP_BOX_MIN) {          // 太小的拖动 = 单击空白：只清选择
+        if (gui64_window_alive(w)) gui64_invalidate_window(w);
+        return;
+    }
+    sel_clear();
+    int n = 0, last = -1;
+    const int lim = (g_items < EXP_MAX_ITEMS) ? g_items : (int)EXP_MAX_ITEMS;
+    for (int i = 0; i < lim; i++) {
+        if (!exp_cell_hits_box(i)) continue;
+        sel_mark(i, true);
+        n++;
+        last = i;
+    }
+    g_sel_n = n;
+    g_sel = last;
+    exp_log_sel(n, "box");                               // 验收按这行断言"框选 N 个"
+    char m[64];
+    e_strcpy(m, gui64_tr("Box selected ", "框选 "), (int)sizeof(m));
+    { char t[8]; u2s(t, (uint64_t)n); e_strcat(m, t, (int)sizeof(m)); }
+    e_strcat(m, gui64_tr(" item(s)", " 项"), (int)sizeof(m));
+    exp_msg(m);
+    if (gui64_window_alive(w)) gui64_invalidate_window(w);
+}
+static void exp_tick(Window* w) {
+    if (!g_box_active) return;
+    if (!gui64_window_alive(w)) { g_box_active = 0; return; }
+    if (!(mouse_get_buttons() & 1)) { exp_box_finish(w); return; }     // 左键已松开
+    const int mx = mouse_get_x() - w->client_x;
+    const int my = mouse_get_y() - w->client_y;
+    if (mx == g_box_x1 && my == g_box_y1) return;
+    g_box_x1 = mx;
+    g_box_y1 = my;
+    sel_clear();                                                        // 实时选中（框走一次算一次，绝不累积旧的）
+    int n = 0, last = -1;
+    const int lim = (g_items < EXP_MAX_ITEMS) ? g_items : (int)EXP_MAX_ITEMS;
+    for (int i = 0; i < lim; i++) {
+        if (!exp_cell_hits_box(i)) continue;
+        sel_mark(i, true);
+        n++;
+        last = i;
+    }
+    g_sel_n = n;
+    g_sel = last;
+    gui64_invalidate_window(w);
+}
+// ★ 批次 J：右键（on_click2 的 button == 1）。内容区右键 -> 条目菜单 / 空白菜单。
+static void exp_click2(Window* w, int cx, int cy, int button) {
+    (void)w;
+    if (button != 1) return;
+    if (g_edit_mode != EXP_EDIT_NONE) return;            // 编辑中右键不弹菜单（先回车/Esc 收场）
+    const int rx = cx - EXP_CONTENT_X, ry = cy - EXP_CONTENT_Y;
+    const bool in_content = (rx >= 0 && ry >= 0 && rx < EXP_CONTENT_W && ry < EXP_CONTENT_H);
+    if (!in_content) { exp_ctx_close(); return; }
+    g_props_open = 0;
+    const int ii = hit_item(cx, cy);
+    if (ii >= 0) {
+        if (!sel_has(ii)) { sel_clear(); sel_pick(ii, false); exp_log_sel(sel_count(), "click"); }
+        else g_sel = ii;
+        exp_ctx_open_at(cx, cy, 0, ii);
+    } else {
+        sel_clear();                                     // 空白右键：清选择（与 Win10 一致）
+        g_sel = -1;
+        exp_ctx_open_at(cx, cy, 1, -1);
+    }
+}
 static void exp_close(Window* w) {
     (void)w;
     g_win = nullptr;
     g_menu_open = 0;
     g_last_item = -1;
+    g_ctx_open = 0;                                      // ★ 批次 J：关窗 = 清掉所有覆盖层/中间态
+    g_ctx_hover = -1;
+    g_edit_mode = EXP_EDIT_NONE;
+    g_edit_item = -1;
+    g_props_open = 0;
+    g_box_active = 0;
+    g_del_confirm = 0;
+    sel_clear();
     dbg64_str("[APP] mypc closed");
     dbg64_nl();
 }
@@ -1502,6 +2517,14 @@ void explorer64_open64() {
     g_last_item = -1;
     g_hist_n = 0;
     g_hist_pos = -1;
+    g_ctx_open = 0;                                      // ★ 批次 J：每次打开从干净状态开始
+    g_ctx_hover = -1;
+    g_edit_mode = EXP_EDIT_NONE;
+    g_edit_item = -1;
+    g_props_open = 0;
+    g_box_active = 0;
+    g_del_confirm = 0;
+    sel_clear();
     g_win = gui64_create_window(gui64_tr("File Explorer - This PC", "文件资源管理器 - 此电脑"),
                                 EXP_WIN_X, EXP_WIN_Y, EXP_WIN_W, EXP_WIN_H,
                                 exp_draw, exp_key, exp_click, APP_ID_MYPC);
@@ -1511,6 +2534,8 @@ void explorer64_open64() {
         return;
     }
     g_win->on_close = exp_close;
+    gui64_set_click2(g_win, exp_click2);                 // ★ 批次 J：右键菜单
+    gui64_set_tick(g_win, exp_tick);                     // ★ 批次 J：框选跟踪
     gui64_set_min_size(g_win, 420, 300);
     exp_enter_thispc();
     dbg64_str("[APP] mypc opened");
@@ -1597,6 +2622,63 @@ int explorer64_selftest64() {
         hist_push_pure(h, &n, &pos, &r, 4);
         if (n != 3) fails |= 4194304;
         if (pos != 2) fails |= 8388608;
+    }
+    // 7) ★ 批次 J：名字校验 / 重名后缀 / 路径最后一段 / 祖先判定（文件操作的纯逻辑；位图 extra 单独记，
+    //    免得跟旧检查的 bit 撞号 —— 只要有失败，fails 就非 0，自检照样 FAIL 并打出 extra）。
+    int extra = 0;
+    {
+        if (!name_ok_pure("readme.txt", 10)) extra |= 1;
+        if (name_ok_pure("", 0)) extra |= 2;                    // 空名字不许
+        if (name_ok_pure("..", 2)) extra |= 4;                  // ".." 不许
+        if (name_ok_pure(".", 1)) extra |= 8;                   // "." 不许
+        {
+            char longname[40];
+            for (int i = 0; i < 32; i++) longname[i] = 'a';     // 32 B > 上限 31 -> 必须被拒
+            longname[32] = 0;
+            if (name_ok_pure(longname, 32)) extra |= 16;
+        }
+        if (name_ok_pure("a/b", 3)) extra |= 32;                // 含 '/' 不许
+        char s[40];
+        suffix_name_pure("readme.txt", 2, s, (int)sizeof(s));
+        if (!e_streq(s, "readme(2).txt")) extra |= 64;          // 重名策略：插在扩展名之前（无空格，空格非法）
+        suffix_name_pure("dir", 3, s, (int)sizeof(s));
+        if (!e_streq(s, "dir(3)")) extra |= 128;
+        {
+            char huge[40];
+            for (int i = 0; i < 31; i++) huge[i] = 'x';
+            huge[31] = 0;
+            suffix_name_pure(huge, 2, s, (int)sizeof(s));
+            if (e_strlen(s) > (int)VFS64_NAME_MAX) extra |= 256;   // 加后缀后绝不超 31 B
+            if (e_strlen(s) < 6) extra |= 512;
+        }
+        path_last_seg_pure("/apps/demo/readme.txt", s, (int)sizeof(s));
+        if (!e_streq(s, "readme.txt")) extra |= 1024;
+        path_last_seg_pure("/", s, (int)sizeof(s));
+        if (s[0] != 0) extra |= 2048;
+        if (!path_is_ancestor_pure("/apps", "/apps/demo/x")) extra |= 4096;   // 真祖先
+        if (path_is_ancestor_pure("/apps", "/appsies")) extra |= 8192;        // 前缀但不同目录：不算
+        if (path_is_ancestor_pure("/apps/demo", "/apps")) extra |= 16384;
+    }
+    // 8) ★ 批次 J：多选位图（加选/取消/范围选/有界）—— 用真实状态机跑一遍，跑完清干净
+    {
+        sel_clear();
+        sel_pick(2, false);
+        sel_pick(5, true);
+        if (sel_count() != 2 || !sel_has(2) || !sel_has(5) || sel_has(0)) extra |= 32768;
+        sel_toggle(2);
+        if (sel_count() != 1 || sel_has(2)) extra |= 65536;
+        sel_range(0);                                           // 锚点 = 刚 toggle 过的 2 -> 0..2 共 3 条
+        if (sel_count() != 3) extra |= 131072;
+        sel_mark(70, true);                                     // 越界下标：不写不崩
+        if (sel_has(70)) extra |= 262144;
+        sel_clear();
+        if (sel_count() != 0) extra |= 524288;
+    }
+    if (extra != 0) {
+        fails |= (1 << 30);                                     // 旧位图满了，用 bit30 表示"批次 J 的检查有失败"
+        dbg64_str("[EXPL] selftest extra=");
+        dbg64_dec((uint64_t)extra);
+        dbg64_nl();
     }
     dbg64_str("[EXPL] selftest ");
     dbg64_str(fails == 0 ? "PASS" : "FAIL");
