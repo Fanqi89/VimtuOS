@@ -377,6 +377,52 @@ def main():
             check("D: 上 big1.bin 与 C: 上的内容完全一致（两边宿主侧 CRC 相同）",
                   ddata is not None and ino1 is not None and ddata == read_via_chain(after, cvol_a, ino1)[0])
 
+    # ==================== 阶段 4：冷启动第二遍，从盘上读回大文件（持久化 + CRC 一致）====================
+    # 这一遍不看任何内存状态：**同一对盘重新开机**，终端 `fatcheck` 把整文件按块读一遍算 CRC。
+    print("=== 阶段 4：冷启动第二遍（同一对盘）-> fatcheck 读回大文件 CRC ===")
+    serial4 = os.path.join(tmp, "serial4.log")
+    port4 = fst.free_port()
+    proc4 = subprocess.Popen(fst.qemu_args(qemu, [c_disk, d_disk], serial4, port4, "Vimtu64-bigfile-cold"),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    mon4 = fst.Monitor(port4)
+    try:
+        check("冷启动第二遍：桌面就绪", fst.wait_for(serial4, "[GUI64] ready", 150, proc4) and
+              "[GUI64] ready" in fst.slog(serial4))
+        check("冷启动第二遍：VimtuFS2 自检仍 PASS（含大文件 bit13-15）",
+              "[VFS64] selftest PASS" in fst.slog(serial4))
+        check("冷启动第二遍：打开终端", fst.open_terminal(mon4, serial4, proc4))
+        cold_ok = True
+        for (f, want_crc, want_size) in (("/big1.bin", expected_crc(1 << 20), (1 << 20)),
+                                         ("/big8.bin", expected_crc(LIMIT), LIMIT)):
+            got = None
+            for _ in range(3):
+                m0 = len(fst.slog(serial4))
+                mon4.type_line("fatcheck %s" % f)
+                t0 = time.time()
+                while time.time() - t0 < 420:
+                    mm = re.search(r"\[FAT64\] crc path=%s size=(\d+) crc32=([0-9A-F]{16})" % re.escape(f),
+                                   fst.slog(serial4)[m0:])
+                    if mm is not None:
+                        got = mm
+                        break
+                    if proc4.poll() is not None:
+                        break
+                    time.sleep(0.5)
+                if got is not None:
+                    break
+                mon4.key("meta_l", wait=0.8)
+                mon4.key("1", wait=1.5)
+            okc = (got is not None and int(got.group(1)) == want_size and int(got.group(2), 16) == want_crc)
+            cold_ok = cold_ok and okc
+            check("冷启动第二遍：%s 读回 size=%d crc=0x%08X（与写时一致）" % (f, want_size, want_crc), okc,
+                  got.group(0) if got else "（缺打点）")
+        check("冷启动第二遍：两个大文件都完整读回（CRC 一致）", cold_ok)
+        log4 = fst.slog(serial4)
+        forbid("阶段4", log4)
+    finally:
+        fst.kill(proc4)
+        time.sleep(1.0)
+
     print("\n断言：%d 条，PASS %d 条" % (len(checks), sum(1 for _, c in checks if c)))
     if not args.keep:
         print("（临时盘：%s；加 --keep 可保留）" % tmp)
