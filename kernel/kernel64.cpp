@@ -71,6 +71,7 @@ extern "C" const uint8_t _binary_build64_user_demo64_bin_end[];
 #include "debug64.h"
 #include "memlayout64.h"
 
+#include "console64.h"   // ★ 批次 N：开机滚屏引导控制台（启动日志环形缓冲 + 回放 + dmesg）
 #include "hwui64.h"      // ★ item 5a：屏幕硬件检查报告（**两份内核都编**：安装介质与系统内核共用）
 // ---- 平台层（64 位）：PIC/PIT/IDT/TSS/RTC，实现在 kernel/x86_64.cpp ----
 #include "x86_64.h"
@@ -505,6 +506,12 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
 #if defined(PROC64_UEFI_CR3_EXPERIMENT) && (PROC64_UEFI_CR3_EXPERIMENT == 1)
     (void)proc64_uefi_cr3_experiment_start64();
 #endif
+    // ==================== 开机滚屏引导控制台（批次 N）====================
+    // 位置：所有启动期工作之后、gui64_run 之前 —— 也就是"进桌面之前"屏上跑一遍这次启动真的
+    //   跑出来的内核日志（回放缓冲 + 实时追加），停 CON64_STAY_MS 或按任意键，然后进桌面。
+    // 开关：config64 的 boot.verbose（默认 1；终端 `boot verbose on|off` 持久化到 store64）。
+    //   关掉时只打 [CON64] verbose=0 skipped，缓冲/dmesg 照常。
+    (void)con64_boot_screen64(config64_get_bool64("boot.verbose", 1));
     gui64_run(bi);          // 不返回：进入桌面消息循环
 }
 #endif
@@ -514,6 +521,10 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
 
     // 1) 串口先就绪，保证后面每条日志都能看到
     dbg64_serial_init();
+    // 1b) 开机滚屏引导控制台：**从第一条日志起**就镜像进环形缓冲（这台机器/这次启动的完整启动日志）。
+    //     位置讲究：必须在 bss_clear_64() **之前** —— 缓冲本体在 .data（section(".data.con64")），
+    //     清 .bss 不会碰它；而 dbg64 的 sink 指针在 .bss，所以清完还要 con64_rehook64() 重挂。
+    con64_init64();
 
     // 2) 确认我们真的在 64 位长模式下（读 IA32_EFER，LMA 位必须为 1）
     uint32_t efer_lo, efer_hi;
@@ -532,6 +543,7 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     dbg64_hex64((uint64_t)(uintptr_t)__bss_end);
     dbg64_nl();
     bss_clear_64();
+    con64_rehook64();       // ★ 清 .bss 把 sink 指针清零了：重新挂上（缓冲内容还在，见 console64.h 顶部说明）
     dbg64_str("[LM64] BSS CLEARED");
     dbg64_nl();
 
@@ -709,6 +721,10 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     (void)hwui64_show64(5000);
 
 #ifdef VIMTU_INSTALLER_MEDIA
+    // 安装介质**不显示开机滚屏引导控制台**（有意为之）：
+    //   向导一开机就在等按键，滚屏会吞掉注入/按下的按键 —— 实测会让 install_flow / esp_install
+    //   这类"回车×N 进向导"的脚本失败。滚屏只用于"进入已安装系统"那条路径（见 os_boot_path()）；
+    //   启动日志本体照旧进环形缓冲，装好后终端 `dmesg` 仍可看。
     // ==================== 安装介质：进入安装程序（不返回）====================
     // 流程：语言 → 现在安装 → 许可 → 安装类型 → 磁盘与分区 → 安装进度 → 完成/自动重启。
     dbg64_str("[G64] entering setup wizard");

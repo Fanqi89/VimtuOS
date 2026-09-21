@@ -71,6 +71,116 @@ def mon_send(port, cmd, wait=0.6):
         s.close()
 
 
+def shot_bootlog(qemu, tmp, args):
+    """--page bootlog：抓**开机滚屏引导控制台**那一帧（批次 N）。
+
+    流程：引导 build64/system.img -> 等串口出现 [CON64] screen ready（引导控制台开画）
+    -> 每 ~0.4s 抓一帧，挑"黑底 + 多行等宽文字"的那一帧（QEMU 在 -display none 下
+    显示表面会滞后 1~2s，所以要连抓几帧）-> 存成 PNG。
+    """
+    serial = os.path.join(tmp, "bootlog_serial.log")
+    port = args.port
+    proc = subprocess.Popen([
+        qemu, "-name", "Vimtu64-bootlog",
+        "-drive", "format=raw,file=%s" % q(args.img),
+        "-boot", "order=c", "-m", "512", "-vga", "std",
+        "-display", "none",
+        "-serial", "file:%s" % q(serial),
+        "-monitor", "telnet:127.0.0.1:%d,server,nowait" % port,
+        "-no-reboot",
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(120):
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                break
+            except OSError:
+                time.sleep(0.25)
+
+        def slog():
+            try:
+                with open(serial, "r", encoding="utf-8", errors="replace") as f:
+                    return f.read()
+            except OSError:
+                return ""
+
+        # 等到"进引导控制台"的那一刻：报告页展示完（[HWUI] report shown）随后就是控制台；
+        # [CON64] screen ready 也说明进控制台了 —— 两个信号谁先到都行。
+        t0 = time.time()
+        while time.time() - t0 < 90:
+            s = slog()
+            if "[HWUI] report shown" in s or "[CON64] screen ready" in s:
+                break
+            time.sleep(0.05)
+        print("[shot] boot console: %s" % ("started" if "[CON64]" in slog() or "[HWUI] report shown" in slog()
+                                          else "超时"))
+
+        def read_ppm(path):
+            data = open(path, "rb").read()
+            pos, vals = 2, []
+            while len(vals) < 3:
+                while data[pos:pos + 1].isspace():
+                    pos += 1
+                s = pos
+                while not data[pos:pos + 1].isspace():
+                    pos += 1
+                vals.append(int(data[s:pos]))
+            pos += 1
+            w, h = vals[0], vals[1]
+            return w, h, data[pos:pos + w * h * 3]
+
+        best = None
+        for i in range(20):
+            ppm = os.path.join(tmp, "bootlog_%02d.ppm" % i)
+            if os.path.exists(ppm):
+                os.remove(ppm)
+            mon_send(port, "screendump %s" % q(ppm), wait=0.3)
+            if not (os.path.exists(ppm) and os.path.getsize(ppm) > 1024):
+                continue
+            w, h, px = read_ppm(ppm)
+            # 判据与 tests/bootlog64_test.py 的"控制台帧"一致：黑底（黑 >= 60%）+ 墨 0.5%~25% + 多行文字。
+            # 取"文字行最多"的一帧（显示表面会滞后 1~2s，同一段窗口里能抓到控制台的不同阶段）。
+            ink = 0
+            rows = 0
+            for y in range(h):
+                o = y * w * 3
+                n = 0
+                for x in range(0, w, 3):
+                    if px[o + 3 * x] > 60 or px[o + 3 * x + 1] > 60 or px[o + 3 * x + 2] > 60:
+                        n += 1
+                ink += n * 3
+                if n * 3 >= 60:
+                    rows += 1
+            ratio = ink / float(w * h)
+            if 0.005 <= ratio <= 0.25 and rows >= 120 and (best is None or rows > best[0]):
+                best = (rows, ratio, ppm)
+            time.sleep(0.05)
+        if best is None:
+            sys.stderr.write("--page bootlog：没抓到引导控制台帧（引导控制台只出现一次，可重试一次）\n")
+            return 1
+        ppm = best[2]
+        out_dir = os.path.dirname(os.path.abspath(args.out))
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            from PIL import Image   # noqa
+            Image.open(ppm).save(args.out)
+            print("[shot] 已保存 PNG：%s（%d 字节，文字像素行=%d 墨=%.1f%%）"
+                  % (args.out, os.path.getsize(args.out), best[0], best[1] * 100))
+        except Exception as e:
+            kept = os.path.join(out_dir, os.path.basename(args.out) + ".ppm")
+            with open(ppm, "rb") as a, open(kept, "wb") as b:
+                b.write(a.read())
+            print("[shot] 没有 Pillow（%s），已保留 PPM：%s" % (e, kept))
+        return 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+
+
 def shot_page(qemu, tmp, args):
     """--page 模式：抓「文件资源管理器」的三种页面（此电脑 / 盘内图标 / 详细信息四列）。
 
@@ -240,6 +350,8 @@ def main():
         return 2
 
     tmp = tempfile.mkdtemp(prefix="vimtu64_shot_")
+    if args.page == "bootlog":
+        return shot_bootlog(qemu, tmp, args)
     if args.page:
         return shot_page(qemu, tmp, args)
     serial = os.path.join(tmp, "serial.log")

@@ -67,3 +67,6 @@ __pycache__/
 .idea/
 Thumbs.db
 desktop.ini
+
+# 验收/调试日志一律不进仓（含 esp_pata_uefi.log 这类）
+*.log

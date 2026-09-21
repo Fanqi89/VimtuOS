@@ -16,6 +16,7 @@ void font_select(int face);          // 见上面的 FONT_FACE_*（历史调用�
                                      // 现在是终端等宽面，汉字由查询链落到 FONT_FACE_CJK，不会出豆腐块）
 int  font_face_count();              // 4
 int  font_line_height();             // 行高（像素）
+int  font_current_face();            // ★ 当前面序号（只读；console64 画完引导日志后恢复现场用）
 int  font_glyph_advance(char c);     // ASCII 字符推进宽度（像素，取当前面）
 int  font_glyph_advance_cp(uint32_t cp);  // Unicode 码点推进宽度（走查询链）
 int  font_text_width(const char* s); // UTF-8 字符串总宽（像素）

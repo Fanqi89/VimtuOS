@@ -1230,8 +1230,39 @@ def cap_fileops_ui():
     done = ren and keys and log and tb and box and edit and clip and suffix and test
     return ("DONE" if done else "PARTIAL"), ev
 
+# -------------------------------------------------------------------------------- ★ 批次 N
+def cap_boot_console():
+    """★ 开机滚屏引导控制台（boot console + dmesg）：dbg64 唯一出口镜像 -> 16 KiB 环形缓冲
+    -> fb/font 就绪后回放（黑底 + 等宽面 + 时间戳 + FAIL/WARN 着色 + 滚屏）-> 有界停留/按键跳过
+    -> 终端 `dmesg` 回看 + `boot verbose on|off` 持久化开关。"""
+    if not (exists("kernel/console64.cpp") and exists("kernel/console64.h")):
+        return "MISSING", ["kernel/console64.cpp/.h 不存在（没有引导控制台）"]
+    sink = grep_count(r"dbg64_set_sink64|g_dbg64_sink64", ["kernel/debug64.h", "kernel/console64.cpp"])
+    ring = grep_count(r"CON64_RING_BYTES|CON64_TEXT_MAX|CON64_HEAD_LINES", ["kernel/console64.h"])
+    marks = grep_count(r"\[CON64\] (ring init|screen ready|replay|live|skip key|selftest|dmesg|boot verbose|verbose=0)",
+                       ["kernel/console64.cpp", "kernel/terminal64.cpp"])
+    call = grep_count(r"con64_boot_screen64|con64_init64|con64_rehook64",
+                      ["kernel/kernel64.cpp", "kernel/console64.cpp"])
+    cfg = grep_count(r"boot\.verbose", ["kernel/config64.cpp", "kernel/kernel64.cpp", "kernel/terminal64.cpp"])
+    keys = grep_count(r"FONT_FACE_MONO|font_draw_glyph|kbd_has_char|fb_flip_region", ["kernel/console64.cpp"])
+    test = exists("tests/bootlog64_test.py")
+    shot = exists("docs/screenshots/bootlog64.png")
+    ev = ["唯一出口镜像：dbg64_putc -> sink 钩子（既有打点零改动）：命中 %d" % sink,
+          "16 KiB 环形缓冲（含行内上限/头部保留行常量）：命中 %d" % ring,
+          "[CON64] 打点（ring init / screen ready / replay / live / skip key / selftest / dmesg / boot verbose）：命中 %d" % marks,
+          "调用点（kmain64 最早 init + BSS 清零后重挂 + 向导/桌面之前 boot_screen）：命中 %d" % call,
+          "boot.verbose（config64 默认表 + 启动读 + 终端 `boot verbose on|off` 持久化）：命中 %d" % cfg,
+          "屏幕绘制原语（等宽面 + 字形绘制 + 任意键跳过 + 脏区提交）：命中 %d" % keys,
+          "端到端脚本 tests/bootlog64_test.py：%s（30 条断言：串口打点 / 黑底像素 / 行间距 / vram 直读滚动证据 / "
+          "按键跳过 / dmesg 早期行 / 冷启动 verbose=0 不回放）" % ("存在" if test else "缺失"),
+          "截图 docs/screenshots/bootlog64.png：%s" % ("有" if shot else "缺")]
+    done = sink and ring and marks and call and cfg and keys and test and shot
+    return ("DONE" if done else "PARTIAL"), ev
+
 
 CAPS = [
+    ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
+     cap_boot_console),
     ("存储", "★ AHCI(SATA) 驱动（PCI 找控制器 + ABAR + 端口/命令表/PRDT + 轮询 DMA；QEMU 上命令未被执行，见证据行）",
      cap_ahci_sata),
     ("存储", "★ NVMe 驱动（PCI 0x010802 → BAR0/64 位 MMIO → admin/I-O 队列 → 轮询 PRP 读写；"
@@ -1283,6 +1314,8 @@ CAPS = [
 
 TESTS = [
     ("boot64_assert.py", "M0/M1：长模式/IDT/PIT/BootInfo"),
+    ("bootlog64_test.py", "★ 批次 N 开机滚屏引导控制台：[CON64] 打点 / 黑底+等宽文本像素 / 行间距 / "
+                          "vram 直读滚动证据 / 按键跳过 / dmesg 早期行 / 冷启动 verbose=0 不回放（30 条断言）"),
     ("multivol64_test.py", "★ 多卷挂载/盘符切换：装好的盘 + 宿主侧预置的第二个 VimtuFS2 卷 -> D: 浏览/读写 + "
                           "Explorer 双击盘符卡片 + 写卷安全（浏览 D: 期间自动落盘不动 D: 逐字节）+ 卷表满如实拒绝"),
     ("ahci64_test.py", "★ item 5a：AHCI(SATA) 控制器/端口/签名 + 屏幕硬件检查报告（打点 + 像素）"),

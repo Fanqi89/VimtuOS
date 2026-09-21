@@ -8,10 +8,11 @@
 它自带一张"三合一"安装盘（BIOS 光盘 / U 盘 / UEFI），安装界面与步骤照 Windows 10 做（去掉了输入产品密钥那一步）。
 
 > 版本 **0.2.0-beta.5** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
-> 状态（权威判据：`python tests/status_report.py`）：**完成 40 / 部分 0 / 未做 1（共 41 项能力）**，
+> 状态（权威判据：`python tests/status_report.py`）：**完成 42 / 部分 0 / 未做 1（共 43 项能力）**，
 > 唯一未做项是 **Rust 参与实现（可选要求，本机未装 Rust 工具链）**。
-> 全量验收（`--full` + 专项/扩展脚本）：**32 个断言脚本全部 PASS**（本批次实测；上一批断言保持全过，
-> 本批次新增 **fileops64_test（文件操作：右键菜单/复制/剪切/粘贴/重命名/删除/新建文件夹/多选）95 条断言**；
+> 全量验收（`--full` + 专项/扩展脚本）：**33 个断言脚本全部 PASS**（本批次实测；上一批断言保持全过，
+> 本批次新增 **bootlog64_test（开机滚屏引导控制台：串口打点/像素/vram 直读滚动证据/按键跳过/dmesg/冷启动开关）30 条断言**；
+> 上一批的 **fileops64_test 95 条断言** 保持全过；
 > vfs64 自检新增 rename 用例、explorer64 自检新增名字/后缀/多选位图用例；
 > multivol64(108)/explorer64(71)/fs_tree(84)/fs_term(32)/fd64(34)/store64(46)/
 > app64(31)/elf64(56)/proc64(67)/sysstate64(100) 等既有脚本保持绿）。
@@ -21,6 +22,7 @@
 ## 一、它能做什么
 
 | 能力 | 说明 |
+| **★ 开机滚屏引导控制台（boot console + dmesg，本批次新增）** | `console64.{h,cpp}`：`dbg64_putc()`（串口/调试口**唯一出口**）加一个 `dbg64_set_sink64()` 钩子，**既有打点一行都不用改**就镜像进 **16 KiB 环形缓冲**（含每条打点的 tick；行内上限 160 字符、超出截断；环形满丢最旧并计数，头部保留 16 行永不丢）→ `fb_init`/`font_init` 之后、**进向导/桌面之前**把这次启动真的跑出来的日志**整屏回放**（黑底 + 终端等宽面 Sarasa Mono + 行首 Linux 风格时间戳 `[    0.123]`，`FAIL/PANIC` 红、`WARN` 黄、其余浅灰；行满整体上移、只提交脏区）→ 有界停留（1200 tick-ms）或**按任意键立即进桌面** → 终端 `dmesg` 回看（头部保留 + 环形缓冲，串口打 `[CON64] dmesg[i]` 证据）→ `boot verbose on|off` 把开关持久化到 config64/store64（下次冷启动不再回放）。打点 `[CON64] ring init|screen ready|replay|live|skip key|selftest|dmesg|boot verbose`；端到端 `tests/bootlog64_test.py`（30 条断言：串口打点 + 黑底像素 + 行间距 + **直读 vram 的滚动证据** + 按键跳过 + dmesg 早期行 + 冷启动 verbose=0 不回放），截图 `docs/screenshots/bootlog64.png` |
 | **★ 文件操作：右键菜单 / 复制 / 剪切 / 粘贴 / 重命名 / 删除 / 新建文件夹 / 多选（本批次新增）** | `explorer64.cpp` + `vfs64_rename64`：**右键菜单**（条目：打开/复制/剪切/重命名/删除/属性；空白：新建文件夹/粘贴/刷新/属性；hover 高亮、置灰、Esc/点外部关闭）；**多选**（单击、Ctrl 加选、Shift 范围选、**空白拖动框选**（浅蓝矩形，内核无 alpha 混合故用实色近似）、Ctrl+A 全选、Esc 取消）；**内核内剪贴板**（最多 8 条 `(卷槽, 完整路径)` + 复制/剪切）→ 粘贴：文件**分块复制**（64 KiB/块；单文件 ≤8 MiB，v2 旧卷 67584 B）、**目录递归复制**（深度 ≤4、整棵 ≤96 条，超限如实计入 `skipped`）、**跨卷 C:↔D: 真能粘贴**（源用 `vfs64_*_on64(源槽)` 读、目标按界面盘符写）；**重名策略：自动追加 `(2)`、`(3)`…**（插在扩展名之前；**不带空格** —— VimtuFS2 名字只允许 `0x21..0x7E`，空格不合法）；**剪切 = 复制成功后删源**（先全部复制成功再删，绝不半删）；**重命名**（F2 / 菜单 → 内联编辑，重名一律拒绝）；**删除**（Delete / 菜单 → **两段式确认**：状态栏提示"再按一次 Delete 确认删除（10 秒内有效）"；**非空目录明确提示"目录非空，暂不支持递归删除"**，绝不假装成功）；**属性**（小面板 + 打点：名称/类型/大小/修改日期/所在卷）；**工具栏 6 个按钮**（新建文件夹/复制/剪切/粘贴/重命名/删除，无选中或剪贴板为空时置灰）；**快捷键** Delete / F2 / Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+A / Esc。打点 `[UI] explorer ctxmenu|clip|paste|rename|delete|mkdir|sel|props …`；端到端 `tests/fileops64_test.py`（95 项：像素 + 串口 + 鼠标/键盘注入 + 宿主侧解析 D: 卷字节；双击/框选注入有界重试） |
 |---|---|
 | **四种引导方式 + 装好的盘双固件** | BIOS 光盘（El Torito）、U 盘 / 硬盘（hybrid MBR）、裸盘（MBR→loader→ATA）、**UEFI 自动引导**（自研 PE 桩 + 平铺长模式引导器）。QEMU 与 VMware、BIOS 与 UEFI 四种组合全部实测通过；**"ISO 当 U 盘"形态在 OVMF（UEFI）与 SeaBIOS（BIOS）下也都进安装向导**（`tests/usb_boot_both_fw_test.py` 四档）；装好的盘在 UEFI 与 BIOS 下都能启动（`tests/esp_install_test.py`） |
@@ -53,6 +55,7 @@
 | 边界 | 现状 |
 |---|---|
 | ⚠️ **文件操作的边界（本批次新增，如实写清）** | ① **没有递归删除**：非空目录点删除只会提示"目录非空，暂不支持递归删除"（`delete … rc=1 reason=not-empty`），不假装成功；② **单文件上限 8 MiB**（v2 旧卷 67584 B）：超过的源在粘贴时被**整条跳过**（不是截断复制），大文件粘贴走**分块复制**（64 KiB/块，不占大内存、不静默截断）；③ **没有权限/属主、没有回收站**：删除即真删（`unlink64`/`rmdir64`）；④ **重命名只在同一目录内**（改 inode 的 name 字段），**没有跨目录移动/拖拽**（`vfs64_rename64` 不动 `parent`）；⑤ 目录递归复制有界（深度 ≤4、条目 ≤96），超限的条目计入 `skipped`；⑥ 剪贴板是**内核内的路径列表**（不是文件内容快照、不跨重启、最多 8 条）；⑦ 重名后缀是 `(2)`/`(3)`（**无空格**，空格不是合法文件名字符） |
+| ⚠️ **开机滚屏引导控制台的有界性（本批次新增，如实写清）** | ① **滚屏是有界的**：只回放环形缓冲里最近的 320 行、每批 6 行上移（像素拷贝，不做字形重光栅化），最后停 1200 tick-ms —— 之后一定是既有的向导/桌面流程；② **任意键立即结束**（按键会被吞掉，不会影响后面的界面）；③ 环形缓冲 16 KiB：启动后期日志多时最早的**普通**行会被覆盖（`[CON64] replay … dropped=N` 如实计数），只有**头部 16 行**（长模式 / BootInfo / E820 等）永久保留，所以 `dmesg` 里一定看得到最早那几行；④ 缓冲不落盘（`/boot.log` 未做）。 |
 | ⚠️ **用户态独立地址空间** | 批次 C 起：proc64 每进程独立 CR3 + fork/execve/wait4/kill（BIOS 路径）；UEFI（固件页表）下默认仍如实降级为共享地址空间模式（`[PROC64] cr3 isolation OFF`）。**批次 D 实测**：在固件 PML4 上就地挂用户窗口（清 CR0.WP 手法）与自带 PML4 + 运行期 `mov cr3` **两条路径都在 QEMU+OVMF 与 VMware EFI 下成功**（`[PROC64] uefi exp result=B mode=isolated`），但默认构建不编这段实验（宏 `PROC64_UEFI_CR3_EXPERIMENT`），见 `docs/UEFI地址空间实验报告.md` |
 | ⚠️ **fd 语义（批次 D）** | **每进程 fd 表**（32 槽/张；`Proc64` 持有，终端/桌面用内核表）；fd → 引用计数的 `OpenFile64`（**共享偏移游标**）：`dup/dup2` 共享同一对象、`fork` 逐槽继承、`execve` 默认保留（**无 `O_CLOEXEC`**）、`close` 只是 refs-1；`O_APPEND` 真实现；**`pipe(22)` 真实现**（64 B 环形缓冲、非阻塞：写满短写/读空 `-EAGAIN`），`user/pipe64.asm` 是 fork 后父子各持一端的环回证据 |
 | ⚠️ **ELF64 只验证过自有静态程序** | 用 `ld.lld -static -nostdlib` 链接的自己的 ELF64 能 load → ring3 → `syscall` → exit；**glibc / 发行版二进制没有验证过**（缺 vDSO、TLS(FS.base) 的完整语义、信号投递、futex、动态链接与重定位） |
@@ -195,6 +198,10 @@ qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=<OVMF_CODE.fd> \
                    -drive if=pflash,format=raw,file=<2MB 全零 vars.fd> \
                    -cdrom vimtu64-64.iso -drive format=raw,file=target.img -m 512 -vga std
 ```
+> ★ **开机现象（批次 N）**：QEMU/真机开机后，**硬件检查报告页（约 5 秒，可按键跳过）之后、进向导/桌面之前**，
+> 屏上会像 Linux 一样**滚一遍这次启动的内核日志**（黑底 + 等宽英文 + 行首 `[    0.123]` 时间戳，`FAIL/PANIC` 红、
+> `WARN` 黄），跑完停约 1.2 秒（**按任意键立即进系统**）。日志本体是 16 KiB 环形缓冲（头部 16 行永久保留），
+> 装好后在终端里 `dmesg` 可随时回看；不想看可以 `boot verbose off`（持久化，下次冷启动直接进桌面）。
 
 演示顺序（装完后）：
 
@@ -365,6 +372,7 @@ VimtuOS/
 │   ├── app64.cpp/.h          # VAP64 自有应用格式（安装器 / 校验 / 启动器 / 魔数分派）
 │   ├── elf64.cpp/.h          # ELF64 加载器（PT_LOAD / p_flags 权限 / SysV 初始栈与 auxv）
 │   ├── hwui64.cpp/.h         # 屏幕硬件检查报告（启动期 / 向导无盘 / 设置页 三处展示）
+│   ├── console64.cpp/.h      # ★ 开机滚屏引导控制台（dbg64 出口镜像 -> 16 KiB 环形缓冲 -> 回放/滚屏 + dmesg）
 │   ├── ata64.cpp/.h          # PATA PIO + IRQ14 等待（超时回退轮询）
 │   ├── ahci64.cpp/.h         # AHCI(SATA) 驱动（非队列 DMA + 轮询）
 │   ├── nvme64.cpp/.h         # NVMe 驱动（BAR0 64 位 MMIO + admin/I-O 队列 + PRP）

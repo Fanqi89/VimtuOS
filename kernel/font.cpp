@@ -217,6 +217,12 @@ void font_select(int face) {
 
 int font_face_count() { return FONT_FACE_COUNT; }
 
+// ★ 只读：当前面（console64 的引导日志画完之后把面恢复回去；不改渲染语义）
+int font_current_face() {
+    for (int f = 0; f < FONT_FACE_COUNT; f++) if (cur == &g_face[f]) return f;
+    return FONT_FACE_ASCII;
+}
+
 // ---------------- 扁平化 ----------------
 static void add_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
     if (ne < MAX_EDGES) { ex0[ne] = x0; ey0[ne] = y0; ex1[ne] = x1; ey1[ne] = y1; ne++; }

@@ -10,6 +10,15 @@
 #pragma once
 #include <stdint.h>
 
+// ==================== 启动日志镜像挂钩（批次 N：开机滚屏引导控制台）====================
+// 为什么挂在 dbg64_putc()：它是"串口 + 调试口"的**唯一出口**（dbg64_str/dec/hex64/nl 最终都
+//   落到这里），所以在这里加一次镜像，内核里既有的一百多处打点**不用改一个调用点**就自动
+//   进了引导日志环形缓冲（kernel/console64.cpp 的 con64_sink64）。
+// ★ 注意：这个函数指针是零初始化（.bss），kmain64 的 bss_clear_64() 会把它清掉 ——
+//   console64 那边用 con64_rehook64() 重挂（缓冲本体在 .data，不受影响）。
+inline void (*g_dbg64_sink64)(char c) = nullptr;
+inline void dbg64_set_sink64(void (*fn)(char)) { g_dbg64_sink64 = fn; }
+
 static inline void dbg64_outb(uint16_t port, uint8_t v) {
     __asm__ volatile("outb %0, %1" : : "a"(v), "Nd"(port));
 }
@@ -23,6 +32,7 @@ static inline void dbg64_putc(char c) {
         if (lsr & 0x20) break;
     }
     dbg64_outb(0x3F8, (uint8_t)c);
+    if (g_dbg64_sink64) g_dbg64_sink64(c);       // ★ 唯一出口的镜像（boot console 缓冲）
 }
 
 static inline void dbg64_str(const char* s) {

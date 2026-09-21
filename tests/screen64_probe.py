@@ -134,7 +134,7 @@ def main():
         "-drive", "format=raw,file=%s" % q(args.img),
         "-boot", "order=c", "-m", "512", "-vga", "std",
         "-display", "none",
-        "-serial", "null",
+        "-serial", "file:%s" % q(os.path.join(tempfile.gettempdir(), "screen64_probe_serial.log")),
         "-monitor", "telnet:127.0.0.1:%d,server,nowait" % args.port,
         "-no-reboot",
     ]
@@ -148,7 +148,28 @@ def main():
                 break
             except OSError:
                 time.sleep(0.25)
-        time.sleep(args.wait)
+        # ★ 批次 N：引导期多了"开机滚屏控制台"（回放启动日志 + 有界停留），进向导的整体时间后移。
+        #   所以这里改成**有界等待向导自己打点**（[SETUP] 磁盘枚举完成 / [SETUP] page=），等到再抓帧；
+        #   等不到就退回原来的固定等待（语义断言一个字都没改：还是抓向导页做像素核对）。
+        serial_log = os.path.join(tempfile.gettempdir(), "screen64_probe_serial.log")
+        t0 = time.time()
+        got_wizard = False
+        while time.time() - t0 < max(args.wait, 60.0):
+            try:
+                with open(serial_log, "r", encoding="utf-8", errors="replace") as f:
+                    txt = f.read()
+            except OSError:
+                txt = ""
+            if "[SETUP] page=" in txt or "磁盘枚举完成" in txt:
+                got_wizard = True
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(0.25)
+        if got_wizard:
+            time.sleep(1.0)                 # 等向导把这一页画完（含 TTF 首帧）
+        else:
+            time.sleep(args.wait)           # 兜底：保持老行为
         resp, err = monitor_cmd(args.port, "screendump %s" % q(out), wait=2.5)
         if err:
             print("[FAIL] monitor 连接失败：%s" % err)

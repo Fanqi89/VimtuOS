@@ -101,6 +101,7 @@ static const Cfg64Def kDefs[] = {
     { "session.mode",      CFG64_T_INT,  0,    nullptr },   // 0=VOLATILE 1=PERSIST（session64）
     { "sess.restore",      CFG64_T_STR,  0,    ""        }, // 会话恢复列表 "3,2"（应用 id）
     { "store.persist",     CFG64_T_INT,  1,    nullptr },
+    { "boot.verbose",      CFG64_T_BOOL, 1,    nullptr },   // ★ 批次 N：开机滚屏引导控制台（1=显示，0=跳过）
 };
 #define CFG64_DEF_N ((int)(sizeof(kDefs) / sizeof(kDefs[0])))
 // 启动日志里最多逐条打印多少个默认值（避免刷屏；总数单独打一行）

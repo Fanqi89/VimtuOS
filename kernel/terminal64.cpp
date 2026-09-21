@@ -93,6 +93,7 @@
 #include "preload64.h"   // preload：字形/图标预热统计（启动期已跑一轮）
 #include "update64.h"    // update：标记文件 -> 应用 -> store/重启（边界见 update64.h）
 #include "proc64.h"      // proc：proc64 进程表（list / run / kill）
+#include "console64.h"   // ★ 批次 N：dmesg（开机滚屏引导控制台的启动日志缓冲）+ boot verbose
 
 // ==================== 常量 ====================
 #define TERM_MAX_INST    4          // 多开上限（照 32 位；第 5 次只激活最新的）
@@ -693,8 +694,9 @@ static const char* HELP_EN =
     "  store flush           persist to VimtuFS2 /store.a|/store.b (raw-disk fallback if no volume)\n"
     "  ping <ip>             ARP + ICMP echo x3 via e1000/net64 (e.g. ping 10.0.2.2); serial: [NET64] cmd ping\n"
     "  cfg                   config64: type (int/str/bool) + value + default/store source + carrier/slot/gen\n"
-    "  cfg get KEY           one config key; cfg set KEY VALUE (or KEY=VALUE); cfg save; cfg reset\n"
     "  syslog                sysstate64 ring log (fixed 64-line circular log) + [SYS64] syslog lines=N\n"
+    "  dmesg                 boot console log (16 KiB ring + head keep; screen + [CON64] dmesg[i] serial dump)\n"
+    "  boot verbose on|off   show/skip the scrolling boot console before the desktop (persisted: boot.verbose)\n"
     "  state                 system state machine (BOOT/STARTING/RUNNING/STOPPING/STOPPED) + module table\n"
     "  health                per-module health report ([SYS64] health ok modules=N failed=0)\n"
     "  session               session policy (VOLATILE/PERSIST + per-app keep flags, persisted via config64)\n"
@@ -749,7 +751,9 @@ static const char* HELP_ZH =
     "  cfg                   config64 配置：类型（int/str/bool）+ 值 + 来源（默认/store）+ 载体/槽/世代号\n"
     "  cfg get KEY           单键查询；cfg set KEY VALUE（或 KEY=VALUE）；cfg save；cfg reset\n"
     "  syslog                sysstate64 的 ring log（固定 64 条循环日志）+ 串口打 [SYS64] syslog lines=N\n"
-    "  state                 运行状态机（BOOT/STARTING/RUNNING/STOPPING/STOPPED）+ 模块表\n"
+    "  dmesg                 开机滚屏引导控制台的启动日志（16 KiB 环形缓冲 + 头部保留；屏幕 + 串口 [CON64] dmesg[i]）\\n"
+    "  boot verbose on|off   进桌面前是否显示滚屏引导日志（持久化键 boot.verbose）\\n"
+    "  state                 运行状态机（BOOT/STARTING/RUNNING/STOPPING/STOPPED）+ 模块表\\n"
     "  health                各模块健康报告（串口打 [SYS64] health ok modules=N failed=0）\n"
     "  session               会话策略（VOLATILE/PERSIST + 每应用 keep 开关，走 config64 持久化）\n"
     "  disk, hw, lspci       ATA IDENTIFY（型号/容量）+ VimtuFS2 卷；CPU/PCI；PCI 设备列表\n"
@@ -2654,6 +2658,85 @@ static void cmd_syslog(TerminalState* ts) {
     }
     if (n > 24) ts_puts(ts, "  ... (older lines are in the serial log)\n");
 }
+// ---------- dmesg：开机滚屏引导控制台的启动日志（kernel/console64.cpp）----------
+// 数据源：16 KiB 环形缓冲（最近的 N 行）+ 头部保留区（最早的 16 行，环形覆盖不到它们）。
+//   顺序 = 头部保留行 -> 省略标记（dropped>0 时）-> 环形缓冲内容（最旧 -> 最新）。
+// 屏幕：全部行打进终端（可滚动回看）；串口：有界证据（前 first 行 + 后 last 行，带 [CON64] dmesg[i] 前缀，
+//   自动验收就 grep 这个；全量只在屏幕上，避免 250+ 行刷串口拖慢桌面）。
+static void cmd_dmesg(TerminalState* ts) {
+    const int n = con64_dmesg_count64();
+    ts_puts(ts, "dmesg: lines=");
+    ts_put_u64(ts, (uint64_t)n);
+    ts_puts(ts, " (ring ");
+    ts_put_u64(ts, (uint64_t)(con64_ring_bytes64() / 1024));
+    ts_puts(ts, " KiB, text_max=");
+    ts_put_u64(ts, (uint64_t)con64_text_max64());
+    ts_puts(ts, ", buffered=");
+    ts_put_u64(ts, (uint64_t)con64_buffered_lines64());
+    ts_puts(ts, ", head_keep=");
+    ts_put_u64(ts, (uint64_t)con64_head_lines64());
+    ts_puts(ts, ", dropped=");
+    ts_put_u64(ts, (uint64_t)con64_dropped_lines64());
+    ts_puts(ts, ", trunc=");
+    ts_put_u64(ts, (uint64_t)con64_trunc_lines64());
+    ts_puts(ts, ")\n");
+    for (int i = 0; i < n; i++) {
+        char lb[CON64_TEXT_MAX + 64];
+        if (con64_dmesg_text64(i, lb, (int)sizeof lb) <= 0) continue;
+        ts_puts(ts, lb);
+        ts_putc(ts, (uint32_t)'\n');
+    }
+    con64_dmesg_dump_serial64(16, 16);      // 串口证据（有界）
+}
+
+// ---------- boot：进桌面之前的滚屏引导控制台开关（持久化到 config64/store64）----------
+// 支持：boot | boot verbose | boot verbose on|off
+static bool cmd_boot(TerminalState* ts, const char* sub, const char* val) {
+    if (!sub || !sub[0]) {
+        ts_puts(ts, "boot: verbose=");
+        ts_puts(ts, config64_get_bool64("boot.verbose", 1) ? "on" : "off");
+        ts_puts(ts, "  (boot.verbose; show/skip the scrolling boot console before the desktop)\n");
+        ts_puts(ts, "  usage: boot verbose on|off\n");
+        return true;
+    }
+    if (!st_eq(sub, "verbose")) {
+        ts_puts(ts, "boot: usage: boot [verbose [on|off]]\n");
+        return false;
+    }
+    if (!val || !val[0]) {
+        ts_puts(ts, "boot verbose: ");
+        ts_puts(ts, config64_get_bool64("boot.verbose", 1) ? "on" : "off");
+        ts_puts(ts, "\n");
+        return true;
+    }
+    int want = -1;
+    if (st_eq(val, "on") || st_eq(val, "1") || st_eq(val, "true")) want = 1;
+    else if (st_eq(val, "off") || st_eq(val, "0") || st_eq(val, "false")) want = 0;
+    if (want < 0) {
+        ts_puts(ts, "boot verbose: usage: boot verbose on|off\n");
+        return false;
+    }
+    const int rc_set = config64_set_bool64("boot.verbose", want);
+    const int rc_flush = (rc_set == 0) ? config64_flush64() : -1;
+
+    ts_puts(ts, "boot verbose = ");
+    ts_puts(ts, want ? "on" : "off");
+    ts_puts(ts, " -> config64 boot.verbose (persisted via store64; takes effect at next boot), flush rc=");
+    ts_put_u64(ts, (uint64_t)(rc_flush < 0 ? 0 : rc_flush));
+    ts_putc(ts, (uint32_t)'\n');
+    dbg64_line_begin64();
+    dbg64_str("[CON64] boot verbose=");
+    dbg64_str(want ? "on" : "off");
+    dbg64_str(" persisted=");
+    dbg64_dec((uint64_t)(rc_flush == 0 ? 1 : 0));
+    dbg64_str(" set_rc=");
+    dbg64_dec((uint64_t)(rc_set < 0 ? 0 : rc_set));
+    dbg64_str(" flush_rc=");
+    dbg64_dec((uint64_t)(rc_flush < 0 ? 0 : rc_flush));
+    dbg64_nl();
+    dbg64_line_end64();
+    return (rc_set == 0) && (rc_flush == 0);
+}
 
 // ---------- state：状态机 + 模块表 ----------
 static void cmd_state(TerminalState* ts) {
@@ -3329,6 +3412,12 @@ static void shell_exec(TerminalState* ts, const char* line) {
     } else if (st_eq(g_cmd, "syslog")) {
         // 真：sysstate64 的 ring log（固定 64 条循环日志）
         cmd_syslog(ts);
+    } else if (st_eq(g_cmd, "dmesg")) {
+        // ★ 批次 N：开机滚屏引导控制台的启动日志缓冲（头部保留 + 16 KiB 环形缓冲）
+        cmd_dmesg(ts);
+    } else if (st_eq(g_cmd, "boot")) {
+        // ★ 批次 N：进桌面前的滚屏引导控制台开关（boot | boot verbose | boot verbose on|off）
+        ok = cmd_boot(ts, g_arg1, g_arg2);
     } else if (st_eq(g_cmd, "state")) {
         // 真：运行状态机 + 模块表（sysstate64）
         cmd_state(ts);
