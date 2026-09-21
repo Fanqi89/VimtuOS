@@ -10,13 +10,13 @@
 //   2) 屏幕控制台：等宽面（face 2）逐字符画；黑底；行首 Linux 风格时间戳；
 //      按关键字着色（FAIL/PANIC=红、WARN=黄、其余浅灰）；行满整体上移一行（像素行拷贝滚屏）；
 //      每次只提交受影响的行/区域（fb_flip_region）。
-//   3) 有界停留 / 跳过：回放完成后停 CON64_STAY_MS，任意键立即结束（并吞掉这个键）。
+//   3) 不停留 / 可跳过：按节奏滚完立即返回（滚屏总时长有界 ≈0.5~1.2s），任意键可提前结束（并吞掉这个键）。
 //   4) dmesg 数据源 + 串口证据（终端命令在 kernel/terminal64.cpp）。
 //
 // 有界性（保证既有验收脚本不超时）：
 //   * 回放行数 <= CON64_REPLAY_MAX(320)，每行只画一次；滚屏是像素拷贝，不重新光栅化字形；
-//   * 停留 <= CON64_STAY_MS(1200ms)，任意键立即结束；
-//   * 总屏上时间 = 回放（与日志量成正比、有上限）+ 1.2s（实测见 [CON64] replay ... ms=）。
+//   * 滚屏节奏：总时长目标 CON64_SCROLL_TOTAL_TICKS（≈1000ms），按行数摊到每行（1..CON64_SCROLL_MAX_PER_LINE tick）；
+//   * 总屏上时间 = 回放（与日志量成正比、有上限 ≈0.5~1.2s），**没有停留阶段**（实测见 [CON64] replay ... ms=）。
 #include "console64.h"
 #include "debug64.h"      // dbg64_* + 行锁 + sink 挂钩 + irq save/restore
 #include "fb.h"           // 帧缓冲（黑底 + fb_flip_region 局部提交）
@@ -30,7 +30,7 @@
 //   * 回放时攒 CON64_SCROLL_BATCH 行才整体上移一次（总像素搬运量 ≈ 1/批大小；屏上依旧连续上滚）；
 //   * 行宽表 row_ink 记录每行真的画了多少列 —— 滚屏只搬"有墨"的那段宽度（不是整屏宽）。
 #define CON64_ROWS_MAX    64                    // 控制台最大行数（行宽表上限；1280x800 下是 39 行）
-#define CON64_SCROLL_BATCH 6                    // 回放时攒 6 行再整体上移（像素搬运总量 ≈ 1/6，屏上仍是连续上滚）
+#define CON64_SCROLL_BATCH 24                   // 回放时攒 24 行再整体上移（步数更少 → 整屏拷贝/flip 次数少，QEMU 上快得多）
 #define CON64_STAMP_CHARS 14                    // "[    0.123456]"（Linux 的 %5lu.%06lu）
 #define CON64_REC_HDR     16                    // 每条记录的头：tick(8) + len(2) + level(1) + flags(1) + 保留(4)
 #define CON64_REC_MAX     (CON64_REC_HDR + CON64_TEXT_MAX)
@@ -638,11 +638,19 @@ int con64_boot_screen64(int verbose) {
     fb_fill_rect(0, 0, W, H, CON64_C_BG);
     fb_flip_region(0, 0, W, H);
 
-    // ---- 回放缓冲里已有的全部行（有界：最多 CON64_REPLAY_MAX 行 = 最近的这些）----
+    // ---- 回放缓冲里已有的行：**按节奏逐行滚出**（有界；跑完不停留）----
+    //   节奏：总时长目标 CON64_SCROLL_TOTAL_TICKS，按本次要画的**行数**摊到每行
+    //   （每行 1..CON64_SCROLL_MAX_PER_LINE tick）：行少 → 每行多等一点（看得清），
+    //   行多 → 每行 1 tick（总量仍有上限）。★ 用户要求：滚完**不停留**，直接进系统。
+    //   等待用 pause 自旋（不依赖 IF、不需要 hlt），期间继续 drain 与轮询按键。
     g_scr64.active = 1;
     const uint64_t t0 = g_ticks64;
     const int have = con64_buffered_lines64();
     const int first = (have > CON64_REPLAY_MAX) ? (have - CON64_REPLAY_MAX) : 0;
+    const int planned = (have > first) ? (have - first) : 0;
+    int per_line = (planned > 0) ? (CON64_SCROLL_TOTAL_TICKS / planned) : 1;
+    if (per_line < 1) per_line = 1;
+    if (per_line > CON64_SCROLL_MAX_PER_LINE) per_line = CON64_SCROLL_MAX_PER_LINE;
     int replayed = 0;
     char lb[CON64_TEXT_MAX + 8];
     for (int i = first; i < have; i++) {
@@ -651,6 +659,15 @@ int con64_boot_screen64(int verbose) {
         con64_scr_put64(tick, lv, lb, CON64_SCROLL_BATCH);   // 回放阶段：攒 4 行批量滚（少搬像素）
         replayed++;
         if (con64_poll_key64()) { g_scr64.skip = 1; break; }   // 回放期间按键：立即结束
+        // 节奏等待：**按计划时间**等（第 replayed 行的目标时刻 = replayed*per_line），
+        //   绘制本身已经比计划慢时就不再额外等待 —— 总时长自动收敛到 max(绘制, 计划)，不会叠加。
+        const uint64_t target = (uint64_t)replayed * (uint64_t)per_line;
+        while (!g_scr64.skip && (g_ticks64 - t0) < target) {
+            con64_scr_drain64();
+            if (con64_poll_key64()) { g_scr64.skip = 1; break; }
+            __asm__ volatile("pause");
+        }
+        if (g_scr64.skip) break;
     }
     const uint64_t replay_ms = (uint64_t)(g_ticks64 - t0) * (uint64_t)TICK_MS_64;
     dbg64_line_begin64();
@@ -673,18 +690,9 @@ int con64_boot_screen64(int verbose) {
     dbg64_nl();
     dbg64_line_end64();
 
-    // ---- 有界停留：CON64_STAY_MS 或任意键 ----
-    uint64_t if_on;
-    __asm__ volatile("pushfq; popq %0" : "=r"(if_on));
-    const int can_hlt = (if_on & 0x200ULL) != 0;
-    const uint64_t want = (CON64_STAY_MS + TICK_MS_64 - 1) / TICK_MS_64;
-    const uint64_t ts0 = g_ticks64;
-    while (!g_scr64.skip && (g_ticks64 - ts0) < want) {
-        con64_scr_drain64();
-        if (con64_poll_key64()) { g_scr64.skip = 1; break; }
-        if (can_hlt) __asm__ volatile("hlt");
-        else         __asm__ volatile("pause");
-    }
+    // ---- ★ 不停留：日志滚完（或按键跳过）后立即返回，接着进系统 ----
+    //   用户要求："跑完后不停留直接进桌面"。此处刻意**没有**停留阶段；
+    //   想让屏幕停住看日志的话，进系统后用终端 `dmesg` 看完整日志。
     con64_scr_drain64();
     g_scr64.active = 0;
     if (g_scr64.skip) {

@@ -7,7 +7,7 @@
 //   dbg64_putc()（串口/调试口的**唯一出口**）-> con64 的 sink 逐字符攒行
 //     -> 环形缓冲（16 KiB，保存最近的若干行；行内文本上限 160 字符，超出截断为 "..."）
 //   fb_init()+font_init() 之后 -> con64_boot_screen64()：回放缓冲里已有的全部行（滚屏）
-//     -> 实时追加新打点 -> 有界停留（1200ms / 任意键跳过）-> 回到既有流程（向导 / 桌面）。
+//     -> 实时追加新打点 -> **不停留**直接回到既有流程（向导 / 桌面）；回放期间按任意键可提前结束。
 //
 // ★ 为什么缓冲的状态放在 .data 而不是 .bss（关键踩坑点）：
 //   kmain64() 在第 3 步会 bss_clear_64() 清整个 .bss（CPU 复位不清 RAM，必须自己清）。
@@ -20,7 +20,7 @@
 //   [CON64] screen ready cols=<n> rows=<n>               屏幕控制台几何（等宽面 8px/字符）
 //   [CON64] replay lines=<n> dropped=<n> ms=<n>         回放完成（lines=本次真的画上去的行数）
 //   [CON64] live lines=<n> drawn=<n>                    进入实时追加模式（n=当前缓冲行数）
-//   [CON64] skip key=1                                  用户在回放/停留期间按键 -> 立即结束
+//   [CON64] skip key=1                                  用户在回放期间按键 -> 立即结束（不停留）
 //   [CON64] verbose=0 skipped lines=<n>                 boot.verbose=0：不画屏（缓冲/dmesg 照常）
 //   [CON64] selftest PASS mask=0x0                      / FAIL mask=0x<hex>
 //   [CON64] dmesg lines=<n> head=<n> dropped=<n>        终端 dmesg：缓冲规模
@@ -34,7 +34,8 @@
 #define CON64_TEXT_MAX     160     // 单行文本上限（含截断标记 "..."）：超出部分丢弃
 #define CON64_HEAD_LINES   16      // 头部保留行数（见下）
 #define CON64_HEAD_TEXT    160     // 头部保留区的单行上限
-#define CON64_STAY_MS      1200    // 回放完成后的停留（有界；任意键立即结束）
+#define CON64_SCROLL_TOTAL_TICKS 400   // 滚屏节奏的目标总时长（400 tick ≈ 1600ms；全程都在滚、滚完不停留）
+#define CON64_SCROLL_MAX_PER_LINE 12   // 每行最多等多少 tick（12 ≈ 48ms）；行多时降到 1 tick/行
 #define CON64_REPLAY_MAX   320     // 一次最多回放多少行（有界：屏上只画最近的这么多行）
 
 // ==================== 日志等级（屏幕着色 + dmesg 判定）====================
