@@ -72,6 +72,7 @@ extern "C" const uint8_t _binary_build64_user_demo64_bin_end[];
 #include "memlayout64.h"
 
 #include "console64.h"   // ★ 批次 N：开机滚屏引导控制台（启动日志环形缓冲 + 回放 + dmesg）
+#include "rust64.h"     // ★ 项目路线（C + C++ + Rust）：Rust 模块的 C 链接声明（kernel/rust64.rs）
 #include "hwui64.h"      // ★ item 5a：屏幕硬件检查报告（**两份内核都编**：安装介质与系统内核共用）
 // ---- 平台层（64 位）：PIC/PIT/IDT/TSS/RTC，实现在 kernel/x86_64.cpp ----
 #include "x86_64.h"
@@ -512,6 +513,24 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
     // 开关：config64 的 boot.verbose（默认 1；终端 `boot verbose on|off` 持久化到 store64）。
     //   关掉时只打 [CON64] verbose=0 skipped，缓冲/dmesg 照常。
     (void)con64_boot_screen64(config64_get_bool64("boot.verbose", 1));
+    // ==================== Rust 模块自检（项目路线：C + C++ + Rust）====================
+    // kernel/rust64.rs 是 no_std 的 Rust 模块（FNV-1a 64 / CRC32 / 自检 / panic_handler），
+    // 由 build64.sh 用 `rustc --target x86_64-unknown-none` 编成 rust64.o 并链进**系统内核**
+    // （安装介质内核不链它）。这里跑一次自检：mask=0 全过；Rust 侧 panic 会置标志位。
+    {
+        const uint32_t rp     = rust_present64();
+        const uint32_t rf     = rust_selftest64();
+        const uint32_t rpanic = rust_panicked64();
+        dbg64_str("[RUST64] present=");
+        dbg64_dec((uint64_t)rp);
+        dbg64_str(" selftest mask=");
+        dbg64_dec((uint64_t)rf);
+        dbg64_str(" panicked=");
+        dbg64_dec((uint64_t)rpanic);
+        if (rp == 1 && rf == 0 && rpanic == 0) dbg64_str(" PASS");
+        else                                    dbg64_str(" FAIL");
+        dbg64_nl();
+    }
     gui64_run(bi);          // 不返回：进入桌面消息循环
 }
 #endif
