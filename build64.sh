@@ -156,31 +156,6 @@ echo "==> 资源对象（objcopy -> elf64，两份内核共用同一批）"
 # OS 内核用同一批资源对象（直接复用）
 cp "$BUILD"/font_*.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o "$BUILD/os/"
 
-echo "==> Rust 模块（kernel/rust64.rs；项目路线：C + C++ + Rust）"
-# 为什么单独一段：Rust 用 `rustc --target x86_64-unknown-none` 编成**可直接被 ld.lld 链接**的目标文件。
-#   前置：装好 Rust 工具链并加 no_std 目标（见 构建与运行说明.md）：
-#     rustup-init.exe -y --default-host x86_64-pc-windows-gnu --profile default
-#     rustup target add x86_64-unknown-none
-#   ★ 只进**系统内核**（安装介质不链 Rust 模块）；-C panic=abort + relocation-model=static
-#     产出无 unwinding / 无动态重定位的目标文件，链接进内核镜像最省事。
-# ★ 必须用 rustup 的 shim **绝对路径**：MSYS2 里 $HOME 往往不是 C:\Users\<你>，
-#   而 PATH 里可能还有别的 rustc（例如 MSYS2 自带的），它没有 x86_64-unknown-none 的 core
-#   （实测报错：error[E0463]: can't find crate for `core`）。
-RUSTC_BIN=""
-for c in "$HOME/.cargo/bin/rustc" "/c/Users/fanqi/.cargo/bin/rustc"; do
-    if [ -x "$c" ]; then RUSTC_BIN="$c"; break; fi
-done
-if [ -z "$RUSTC_BIN" ]; then
-    echo "ERROR: 找不到 rustup 的 rustc（已试 \$HOME/.cargo/bin 与 /c/Users/fanqi/.cargo/bin）" >&2
-    echo "  安装：rustup-init.exe -y --default-host x86_64-pc-windows-gnu" >&2
-    echo "        rustup target add x86_64-unknown-none" >&2
-    exit 1
-fi
-echo "    $("$RUSTC_BIN" --version)  [$RUSTC_BIN]"
-"$RUSTC_BIN" --target x86_64-unknown-none --crate-type lib -O -C panic=abort \
-      -C relocation-model=static --emit obj="$BUILD/os/rust64.o" kernel/rust64.rs
-echo "      kernel/rust64.rs -> $BUILD/os/rust64.o ($(stat -c%s "$BUILD/os/rust64.o") bytes)"
-
 echo "==> 用户态演示程序（真实 ring3 代码：nasm 平铺二进制 -> objcopy 嵌入内核）"
 # user/demo64.asm 是**用户态**程序（ring3，用 int 0x80 与内核通信），不是内核代码：
 #   nasm 出平铺二进制 -> objcopy 变 elf64 目标文件 -> 链进两份内核（成本很低）。
@@ -266,7 +241,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
     "$BUILD"/user_demo64.o "$BUILD"/font_*.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o
 $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 
-$LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/rust64.o "$BUILD/os"/x86_64.o \
+$LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
     "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/mem64.o \
     "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o \
     "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
