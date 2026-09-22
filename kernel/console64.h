@@ -34,9 +34,9 @@
 #define CON64_TEXT_MAX     160     // 单行文本上限（含截断标记 "..."）：超出部分丢弃
 #define CON64_HEAD_LINES   16      // 头部保留行数（见下）
 #define CON64_HEAD_TEXT    160     // 头部保留区的单行上限
-#define CON64_SCROLL_TOTAL_TICKS 400   // 滚屏节奏的目标总时长（400 tick ≈ 1600ms；全程都在滚、滚完不停留）
-#define CON64_SCROLL_MAX_PER_LINE 12   // 每行最多等多少 tick（12 ≈ 48ms）；行多时降到 1 tick/行
-#define CON64_REPLAY_MAX   320     // 一次最多回放多少行（有界：屏上只画最近的这么多行）
+#define CON64_SCROLL_TOTAL_TICKS 1000  // 滚屏节奏的目标总时长（1000 tick ≈ 4000ms；全程都在滚、滚完不停留）
+#define CON64_SCROLL_MAX_PER_LINE 20   // 每行最多等多少 tick（20 ≈ 80ms）；行多时降到 1 tick/行
+#define CON64_REPLAY_MAX   64      // 一次最多回放多少行（★ 性能：只画最后 64 行 = 一屏多；更早的看终端 dmesg）
 
 // ==================== 日志等级（屏幕着色 + dmesg 判定）====================
 #define CON64_LV_INFO   0          // 浅灰

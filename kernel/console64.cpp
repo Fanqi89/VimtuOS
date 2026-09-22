@@ -30,7 +30,7 @@
 //   * 回放时攒 CON64_SCROLL_BATCH 行才整体上移一次（总像素搬运量 ≈ 1/批大小；屏上依旧连续上滚）；
 //   * 行宽表 row_ink 记录每行真的画了多少列 —— 滚屏只搬"有墨"的那段宽度（不是整屏宽）。
 #define CON64_ROWS_MAX    64                    // 控制台最大行数（行宽表上限；1280x800 下是 39 行）
-#define CON64_SCROLL_BATCH 24                   // 回放时攒 24 行再整体上移（步数更少 → 整屏拷贝/flip 次数少，QEMU 上快得多）
+#define CON64_SCROLL_BATCH 8                    // 回放时攒 8 行再整体上移（滚动步数适中：屏上明显在滚，整屏拷贝/flip 也不多）
 #define CON64_STAMP_CHARS 14                    // "[    0.123456]"（Linux 的 %5lu.%06lu）
 #define CON64_REC_HDR     16                    // 每条记录的头：tick(8) + len(2) + level(1) + flags(1) + 保留(4)
 #define CON64_REC_MAX     (CON64_REC_HDR + CON64_TEXT_MAX)
@@ -663,7 +663,9 @@ int con64_boot_screen64(int verbose) {
         //   绘制本身已经比计划慢时就不再额外等待 —— 总时长自动收敛到 max(绘制, 计划)，不会叠加。
         const uint64_t target = (uint64_t)replayed * (uint64_t)per_line;
         while (!g_scr64.skip && (g_ticks64 - t0) < target) {
-            con64_scr_drain64();
+            // ★ 这里**不要调 con64_scr_drain64()**：drain 会把 pending 里的行**逐行**刷出去，
+            //   每行都触发一次整屏拷贝/flip —— 那会让"攒 CON64_SCROLL_BATCH 行再滚"完全失效
+            //   （实测：64 行 16 秒 ≈ 每行 250ms）。实时行的刷新交给回放结束后的 drain。
             if (con64_poll_key64()) { g_scr64.skip = 1; break; }
             __asm__ volatile("pause");
         }
