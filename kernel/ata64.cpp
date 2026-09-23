@@ -16,6 +16,15 @@
 #include "x86_64.h"      // pic_unmask64 / g_ticks64：IRQ14 等待与超时计时
 #include "hwinfo64.h"    // ★ 批次 B：IDENTIFY 成功后把型号/容量填进 hwinfo64 的磁盘表
 
+// ★ 批次 O：USB 存储（U 盘）—— 驱动器号 ≥ ATA64_USB_BASE 时把识别/读分派到 USB 模块。
+//   只在**系统内核**里链接：安装介质内核（-DVIMTU_INSTALLER_MEDIA=1）不链 usb64.cpp ——
+//   U 盘因此绝不会出现在安装向导的磁盘表里、也就绝不会被当成安装目标（见 kernel/setup64.cpp）。
+//   宏隔离而不是加"空实现"：安装内核里 usb64_msc_* 的调用点整段消失，链接期不会有未定义符号。
+#if !defined(VIMTU_INSTALLER_MEDIA)
+#include "usb64.h"
+#define ATA64_HAVE_USB64 1
+#endif
+
 // ---------------- 端口基址 ----------------
 static inline uint16_t base_port(int drive) {
     return (drive & 2) ? 0x170 : 0x1F0;          // 2,3 = secondary
@@ -191,10 +200,20 @@ static bool ata_wait_done_irq(int drive) {
 }
 
 // ---------------- 枚举接口（统一驱动器号，见 ata64.h）----------------
-// 上层（setup64 / part64）用它枚举，不要自己写 for (d=0; d<4; d++)：
-//   槽 0..3 -> 驱动器号 0..3（PATA）；其后 -> 8,9,...（AHCI 盘）；再后 -> 16,17,...（NVMe 命名空间）
-// ★ 顺序有讲究：先 PATA、再 AHCI、最后 NVMe —— 与"驱动器号从小往大"一致，界面行序稳定。
-int ata64_drive_count64() { return 4 + ahci64_count64() + nvme64_count64(); }
+// 上层（setup64 / part64 / drive64）用它枚举，不要自己写 for (d=0; d<4; d++)：
+//   槽 0..3 -> 驱动器号 0..3（PATA）；其后 -> 8,9,...（AHCI 盘）；再后 -> 16,17,...（NVMe 命名空间）；
+//   最后 -> 24..（★ 批次 O：USB 存储）。
+// ★ 顺序有讲究：先 PATA、再 AHCI、NVMe、最后 USB —— 与"驱动器号从小往大"一致，界面行序稳定。
+// USB 存储的"可用块设备"数量（**安装介质内核里恒为 0**：那份内核不链 usb64.cpp，
+// 见文件头/ata64.h 的说明 —— U 盘绝不会成为安装目标）。
+static int ata64_usb_count() {
+#ifdef ATA64_HAVE_USB64
+    return usb64_msc_count64();
+#else
+    return 0;
+#endif
+}
+int ata64_drive_count64() { return 4 + ahci64_count64() + nvme64_count64() + ata64_usb_count(); }
 
 int ata64_slot_to_drive64(int slot) {
     if (slot < 0) return -1;
@@ -205,16 +224,28 @@ int ata64_slot_to_drive64(int slot) {
     const int m = nvme64_count64();
     const int j = i - n;
     if (j < m) return ATA64_NVME_BASE + j;      // NVMe 命名空间：驱动器号 16..
+    const int u = ata64_usb_count();
+    const int k = j - m;
+    if (k < u) return ATA64_USB_BASE + k;       // ★ 批次 O：USB 存储（U 盘）：驱动器号 24..
     return -1;                                  // 越界（槽数比实际盘多时）
 }
 
 // ---------------- IDENTIFY ----------------
-// 分派：≥ ATA64_NVME_BASE 走 NVMe、≥ ATA64_AHCI_BASE 走 AHCI（两者都复用同一份 DiskInfo）。
+// 分派：≥ ATA64_USB_BASE 走 USB 存储（★ 批次 O，型号来自 INQUIRY、容量来自 READ CAPACITY(10)）、
+//       ≥ ATA64_NVME_BASE 走 NVMe、≥ ATA64_AHCI_BASE 走 AHCI（三者都复用同一份 DiskInfo）。
 bool ata64_identify(int drive, DiskInfo* out) {
     out->present = false;
     out->atapi = false;
     out->sectors = 0;
     out->model[0] = 0;
+#ifdef ATA64_HAVE_USB64
+    if (drive >= ATA64_USB_BASE) {
+        // ★ 批次 O：USB 存储（U 盘）。只读设备：atapi = false（它不是光驱），
+        //   型号 = INQUIRY 的"厂商 + 型号"，sectors = 容量按 512B 换算的总扇区数。
+        return usb64_msc_info64(drive - ATA64_USB_BASE, out->model, 41, &out->sectors) &&
+               (out->present = true);
+    }
+#endif
     if (drive >= ATA64_NVME_BASE) return nvme64_info64(drive - ATA64_NVME_BASE, out);
     if (drive >= ATA64_AHCI_BASE) return ahci64_info64(drive - ATA64_AHCI_BASE, out);
     if (drive < 0 || drive > 3) return false;   // 4..7 保留空洞：不映射任何设备
@@ -331,8 +362,12 @@ static bool ata_pio_read_once(int drive, uint32_t lba, uint32_t count, void* buf
 
 // READ 对外入口：分派 + 分块 + 每块重试（语义与改动前一致；>128 扇区不再被 8 位寄存器截断）
 bool ata64_read(int drive, uint32_t lba, uint32_t count, void* buf) {
-    // ★ 分派：驱动器号 16.. -> NVMe 命名空间读（内部按 128 扇区分块）；
+    // ★ 分派：驱动器号 24.. -> USB 存储（★ 批次 O：BOT + READ(10)，内部按 ≤8 扇区分块）；
+    //          16.. -> NVMe 命名空间读（内部按 128 扇区分块）；
     //          8..15 -> AHCI(SATA) DMA 读（LBA48）
+#ifdef ATA64_HAVE_USB64
+    if (drive >= ATA64_USB_BASE) return usb64_msc_read64(drive - ATA64_USB_BASE, lba, count, buf);
+#endif
     if (drive >= ATA64_NVME_BASE) return nvme64_read64(drive - ATA64_NVME_BASE, lba, count, buf);
     if (drive >= ATA64_AHCI_BASE) return ahci64_read64(drive - ATA64_AHCI_BASE, lba, count, buf);
     if (drive < 0 || drive > 3) return false;   // 4..7 保留空洞
@@ -380,11 +415,27 @@ static bool ata_pio_write_once(int drive, uint32_t lba, uint32_t count, const vo
 }
 
 // WRITE 对外入口：分派 + 分块 + 每块重试（语义与改动前一致；>128 扇区不再被 8 位寄存器截断）
+// ★ 批次 O：USB 存储**本批只读** —— 驱动器号 24.. 一律**直接失败**并打点，绝不假装成功
+//   （否则上层会以为文件真的写进了 U 盘：FAT 卷本来也是只读的，这里再兜一层）。
 bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf) {
+#ifdef ATA64_HAVE_USB64
+    if (drive >= ATA64_USB_BASE) {
+        dbg64_line_begin64();
+        dbg64_str("[USBST] write refused (USB storage is read-only in this batch) drive=");
+        dbg64_dec((uint64_t)drive);
+        dbg64_str(" lba=");
+        dbg64_dec((uint64_t)lba);
+        dbg64_str(" count=");
+        dbg64_dec((uint64_t)count);
+        dbg64_nl();
+        dbg64_line_end64();
+        (void)buf;
+        return false;
+    }
+#endif
     // ★ 分派同 ata64_read：16.. -> NVMe、8..15 -> AHCI(SATA) DMA 写
     if (drive >= ATA64_NVME_BASE) return nvme64_write64(drive - ATA64_NVME_BASE, lba, count, buf);
     if (drive >= ATA64_AHCI_BASE) return ahci64_write64(drive - ATA64_AHCI_BASE, lba, count, buf);
-    if (drive < 0 || drive > 3) return false;   // 4..7 保留空洞
     if (count == 0) return true;
     const uint8_t* p = (const uint8_t*)buf;
     for (uint32_t done = 0; done < count; ) {

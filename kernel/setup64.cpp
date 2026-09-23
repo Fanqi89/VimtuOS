@@ -142,6 +142,8 @@ static ListRow   g_rows[24];
 // 用途：① 在列表里把它标出来；② 默认选中行与"自动选分区"都跳过它，
 //       免得用户/自动化一上来就把安装介质格式化掉。
 static int       g_medium_drive = -1;
+// ★ 批次 O：可移动盘（USB 存储）的标记只打一次串口（build_rows 会被重复调用）
+static bool      g_removable_logged = false;
 static int       g_row_count = 0;
 static int       g_row_sel = -1;
 
@@ -346,7 +348,20 @@ static void build_rows() {
         str_append_size(p, g_disks[d].sectors, 20);
         str_append(p, g_disks[d].has_gpt ? "  GPT" : (g_disks[d].has_mbr ? "  MBR" : "  未初始化"), 16);
         if (d == g_medium_drive) str_append(p, "  <== 安装介质", 24);
-
+        // ★ 批次 O：USB 存储（U 盘）= **可移动** —— 在行里标出来，且默认不选中（见下面两处默认行选择）。
+        //   理由（明确写下来）：① U 盘随时可能被拔走/换机器，系统装在上面会变得不可靠；
+        //   ② 它常常正是"安装介质本身"（ISO 写进 U 盘）；③ 本批 USB 存储**只读**，根本装不进去。
+        //   注意：安装介质内核（-DVIMTU_INSTALLER_MEDIA=1）**不链 usb64.cpp**，所以驱动器号
+        //   24.. 在向导里天然不会出现 —— 这里的分支是"换内核/以后接进来"时的兜底，不是死代码。
+        if (d >= ATA64_USB_BASE) {
+            str_append(p, "  <== 可移动(不建议安装)", 32);
+            if (!g_removable_logged) {
+                g_removable_logged = true;
+                dbg64_str("[SETUP] removable drive marked (USB storage) drive=");
+                dbg64_dec((uint64_t)d);
+                dbg64_str(" -> 不建议安装目标, 默认不选中\n");
+            }
+        }
         uint64_t used = 0;
         for (int i = 0; i < g_disks[d].part_count && g_row_count < 24; i++) {
             ListRow& pr = g_rows[g_row_count++];
@@ -930,15 +945,21 @@ static void progress_tick() {
             dbg64_nl();
             build_rows();                  // 重建一次，把"<== 安装介质"标上去
         }
-        // 默认选中"目标磁盘"那一行：优先选不是安装介质的磁盘（避免用户一上来就把介质盘分区）
+        // 默认选中"目标磁盘"那一行：优先选不是安装介质的磁盘（避免用户一上来就把介质盘分区）；
+        // ★ 批次 O：**可移动盘（USB 存储，驱动器号 >= ATA64_USB_BASE）也不默认选中** ——
+        //   选它当安装目标没有任何意义（本批它只读，装不进去），但"默认行"会被自动化直接回车确认，
+        //   所以必须在这一步就绕开（不然一次回车就把光标停在 U 盘上）。
         g_row_sel = (g_row_count > 0) ? 0 : -1;
         for (int i = 0; i < g_row_count; i++) {
+            if (g_rows[i].drive >= ATA64_USB_BASE) continue;              // 可移动盘：跳过
             if (g_rows[i].part == -1 && g_rows[i].drive != g_medium_drive) { g_row_sel = i; break; }
         }
     }
-    // 如果这块盘上已经有分区，直接选中第一个分区（省一步）；同样跳过安装介质盘
-    for (int i = 0; i < g_row_count; i++)
+    // 如果这块盘上已经有分区，直接选中第一个分区（省一步）；同样跳过安装介质盘与可移动盘
+    for (int i = 0; i < g_row_count; i++) {
+        if (g_rows[i].drive >= ATA64_USB_BASE) continue;                  // 可移动盘：跳过
         if (g_rows[i].selectable && g_rows[i].drive != g_medium_drive) { g_row_sel = i; break; }
+    }
 
     // 鼠标初始位置放屏幕中间，避免"光标在角落看不见"
     // 鼠标初始位置放屏幕中间，并把屏幕边界告诉鼠标驱动（驱动会把光标钳在界内，

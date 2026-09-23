@@ -33,19 +33,36 @@
 //    Shift/Ctrl/Caps/方向键/WIN 键标志/Ctrl+Shift+Esc 热键全部复用现成逻辑，
 //    桌面外壳 gui64.cpp 一行都不用改（这是"真的送到桌面外壳"的最短路径）。
 //
+// 6) ★ 批次 O：**USB 存储（U 盘）—— Bulk-Only Transport + SCSI 只读**：
+//    * 批量传输复用同一套 TD 链机制（一次最多 64 包 = 4KB，一包一个 TD，DATA0/DATA1 逐包翻转，
+//      IN 方向开短包检测"短包即结束"，NAK 由硬件按帧重试）；等待用 g_ticks64 计时**有界超时**
+//      （USB64_BULK_TIMEOUT_MS = 600ms），超时/出错一律 abort 整条链，绝不挂死。
+//    * 一个 QH 同一时刻只能挂一条链 —— 所以传输期间中断 TD 不在队列上，传完立刻重新武装；
+//      传输与 kusb 的 poll 用自旋锁互斥（poll 是 try-lock，拿不到就下次再来，绝不阻塞）。
+//    * SCSI：INQUIRY / TEST UNIT READY / REQUEST SENSE / READ CAPACITY(10) / READ(10)；
+//      **只读**：没有 WRITE(10)（上层 ata64_write 对 USB 驱动器号直接返回失败并打点）。
+//    * 驱动器号接入见 kernel/ata64.h 的 ATA64_USB_BASE（24）：识别/读走本模块，
+//      上层（part64/drive64/vfs64/fs64/fat64/explorer64）一行都不用改。
+//
 // 没验证到的点（如实记录，见文件末）：
 //   * 低速（low-speed）设备：代码里按 PORTSC.LSDA 支持（TD 状态 LS 位 + 端口不使能时
 //     仍可枚举），但 QEMU 的 usb-kbd 是全速设备，**低速路径没有实机/仿真验证**。
-//   * 只能识别**直接插在根端口**上的设备（没有 hub/地址分配多设备；只用一个地址 1）。
-//   * 只做引导键盘（没做报告描述符解析、没做 typematic 自动重复、没做 USB 鼠标/存储）。
+//   * 只识别**直接插在根端口**上的设备（没有 hub/地址分配多设备；最多 2 台：1 键盘 + 1 U 盘）。
+//   * 没做：EHCI(USB 2.0)/xHCI(USB 3.x) 主控、USB 鼠标、集线器、拔出检测（热插拔）、
+//     U 盘上的分区表解析（分区表由上层 part64/drive64 读，本模块只提供"按扇区读"）、
+//     块大小 ≠ 512 的盘（如实拒绝：打点后不暴露成块设备）、USB 存储的写。
 // ======================================================================
 #include "usb64.h"
 #include "port.h"        // inb/inw/inl + outb/outw/outl（32 位端口读写这里已有，不用另加内联汇编）
 #include "debug64.h"     // 串口打点（行锁 begin/end）
 #include "input.h"       // kbd_inject_scancode()：注入到 PS/2 同一条按键队列
-#include "mem_64.h"      // page_alloc_64 / memset_64（恒等映射：物理地址即指针）
+#include "memlayout64.h" // ★ 必须先于 mem_64.h（PAGE_SIZE_64 会撞）；ML64_KERNEL_VA_BASE 用它
+#include "mem_64.h"      // page_alloc_64 / memset_64（低内存恒等映射：物理地址即指针）
 #include "x86_64.h"      // g_ticks64 / ms_to_ticks64 / nop_pause()
 #include <stdint.h>
+#include <stddef.h>
+
+extern "C" char __bss_end[];               // 内核镜像高半区上界（判断指针是否落在内核镜像里）
 #include <stddef.h>
 
 // ==================== UHCI 寄存器（偏移，与 Intel UHCI 规范和 Linux uhci-hcd.h 对齐）====
@@ -121,11 +138,21 @@ struct UhciQh {                  // 16 字节：link / element（低两位是 T/
 
 #define USB64_FL_ENTRIES  1024u
 #define USB64_FL_BYTES    (USB64_FL_ENTRIES * 4u)      // 4096 字节 = 正好一页
-#define USB64_TD_SLOTS    64                           // TD 池槽数（16 + 64*32 = 2064 字节，一页够）
+#define USB64_TD_SLOTS    100                          // TD 池槽数：16 + 100*32 = 3216 字节（一页 4096 够）。
+                                                       // ★ 批次 O：从 64 提到 100 —— 批量传输要 64 个包
+                                                       //   （4KB）+ 链尾，槽 0 = 空 TD、1/2 = 中断 TD/tail，
+                                                       //   3..99 = 传输链可用。
 #define USB64_TD_IDLE     0                            // 槽 0 = 永久"空 TD"（绝不复用）
 #define USB64_CTL_TIMEOUT_MS 250u                      // 单次控制传输的等待上限
 #define USB64_CTL_MAX_TD  32                           // 一次控制传输最多几个数据 TD（256B/8 = 32）
 #define USB64_CTL_BUF_BYTES 256u                       // 控制数据缓冲（描述符）大小
+// ★ 批次 O：USB 存储（批量传输 + BOT）用到的上界。都是**有界**的（绝不无限等）。
+#define USB64_BULK_TIMEOUT_MS 600u                     // 单次批量传输的等待上限（正常 1 帧就完成）
+#define USB64_BULK_MAX_BYTES  4096u                    // 单次批量调用的字节上限（64 包 × 64B）
+#define USB64_BULK_MAX_TD     64                       // 单次批量链的 TD 上限（一包一个 TD）
+#define USB64_MSC_MAX_DATA    4096u                    // 一条 BOT 命令的数据阶段上限（= 8 个 512B 扇区）
+#define USB64_MSC_MAX_SECTORS 8                        // 同上，按 512B 扇区数表达
+#define USB64_MAX_DEV         2                        // 最多两台设备：1 个 HID 键盘 + 1 个 USB 存储
 // ==================== 全局状态 ====================
 enum Usb64State : uint32_t {
     USB64_ST_INIT = 0,
@@ -159,11 +186,19 @@ static uint8_t*  g_setup_buf   = nullptr;    // 8 字节 SETUP 包
 static uint8_t*  g_ctl_buf     = nullptr;    // 控制传输的数据缓冲（256 字节）
 static uint8_t*  g_null_buf    = nullptr;    // 状态阶段（0 字节）用的哨兵缓冲
 static uint8_t*  g_report_buf  = nullptr;    // 8 字节 HID 报告
+// ★ 批次 O：**DMA 暂存页** —— 调用方缓冲区落在"认不出物理地址"的地方时的兜底（见 usb_pa32）
+static uint8_t*  g_bounce_page = nullptr;    // 4096 字节（页池：恒等映射，物理地址可用）
+// ★ 批次 O：USB 存储（U 盘）在 g_data_page 里用到的额外缓冲（都在同一页，恒等映射）
+static uint8_t*  g_msc_sec     = nullptr;    // 512 字节：READ(10) 的扇区缓冲 / 自检读的那一块
+static uint8_t*  g_cbw_buf     = nullptr;    // 64 字节：CBW（31 字节有效）
+static uint8_t*  g_csw_buf     = nullptr;    // 16 字节：CSW（13 字节有效）
+static uint8_t*  g_msc_scratch = nullptr;    // 64 字节：INQUIRY / SENSE / CAPACITY 的临时数据
 
-// 设备状态
-static uint8_t   g_addr        = 0;          // 分配到的 USB 地址（1）
-static bool      g_low_speed   = false;
-static uint8_t   g_ctl_mps     = 8;          // EP0 最大包（先按 8 收，再读设备描述符修正）
+// 设备状态（★ 批次 O：本结构只描述**唯一的 HID 引导键盘**；U 盘的上下文在 g_msc 里，
+//   USB64_MAX_DEV = 2 = 1 个键盘 + 1 个存储，两种角色各只有一个实例）
+static bool      g_hid_present = false;      // 枚举到 HID 引导键盘（bit5..bit7 自检只看它）
+static uint8_t   g_addr        = 0;          // 键盘分配到的 USB 地址（1；有 U 盘时可能是 2）
+static bool      g_low_speed   = false;      // 键盘端口是不是低速
 static uint8_t   g_ep_in       = 0;          // HID 中断 IN 端点号
 static uint16_t  g_ep_mps      = 0;          // 端点最大包（引导键盘 = 8）
 static uint16_t  g_vendor      = 0;
@@ -191,9 +226,64 @@ static void usb_hex(uint32_t v, int digits) {
     for (int i = digits - 1; i >= 0; i--) { buf[i] = H[v & 0xFu]; v >>= 4; }
     for (int i = 0; i < digits; i++) dbg64_putc(buf[i]);
 }
+// ★ 物理地址换算（与 ahci64/nvme64 同款约定，踩过坑）：
+//   * 低内存（< 4GB，含帧列表/TD 池/页池/DMA 暂存）：恒等映射，PA == VA；
+//   * 内核镜像高半区对象（.bss/.data 里的静态缓冲区，例如 drive64.cpp 的扇区缓冲
+//     —— **上层 ata64_read 传进来的就是这种指针**）：直映关系 PA = VA - (VA_BASE - 物理基址)；
+//   * 认不出来：返回 0，调用方退回 **DMA 暂存页**（拷贝进出），绝不把错地址交给硬件。
+//   为什么必须有这一层：UHCI 的 TD 里放的是**物理**地址，把高半区虚拟地址直接塞进去，
+//   QEMU/硬件会往物理低地址写 —— 控制器报"传了 512 字节"，调用方缓冲区却一个字没变
+//   （实测踩过：MBR 签名读不到、FAT 探测全灭）。
+static inline uint32_t usb_pa32(const void* ptr) {
+    const uint64_t v = (uint64_t)(uintptr_t)ptr;
+    if (v == 0) return 0;
+    if (v < 0x100000000ULL) return (uint32_t)v;
+    if (v >= ML64_KERNEL_VA_BASE &&
+        v < ((uint64_t)(uintptr_t)__bss_end) + 0x10000ULL) {
+        return (uint32_t)(v - (ML64_KERNEL_VA_BASE - (uint64_t)ML64_KERNEL_BASE));
+    }
+    return 0;
+}
 
 static inline void usb_barrier() { __asm__ volatile("" ::: "memory"); }
 
+
+// ==================== 传输互斥 + 设备上下文 ====================
+// 为什么需要互斥：批量传输（U 盘）是**同步自旋等待**的（由发起的文件管理器/终端线程调用），
+// 而 kusb 内核线程每 ~12ms 也会进来调 usb64_poll64() 重新武装中断 TD；两者都写 QH.element。
+// 做法：传输侧自旋拿锁（临界区只有几十条指令，拿不到也只是多转几圈）；poll 侧**try-lock**，
+// 拿不到就"这次不重新武装"，下次再来 —— 绝不阻塞、绝不挂死。
+static volatile uint32_t g_usb_lock = 0;
+
+static inline bool usb_lock_try64() {
+    uint32_t v = 1;
+    __asm__ volatile("xchgl %0, %1" : "+r"(v) : "m"(g_usb_lock) : "memory");
+    return v == 0;                                  // 拿到的标志 = 换出来的旧值是 0
+}
+
+static void usb_lock_acquire64() {
+    uint64_t spins = 0;
+    while (!usb_lock_try64() && spins < 400000000ull) { spins++; nop_pause(); }
+}
+
+static inline void usb_lock_release64() {
+    __asm__ volatile("" ::: "memory");
+    g_usb_lock = 0;
+}
+
+// 一台设备在**枚举/控制传输/批量传输**时需要的最小上下文：
+//   addr      = 目标 USB 地址（枚举第一步是 0，SET_ADDRESS 之后才是分配到的地址）
+//   ctl_mps   = EP0 最大包   low_speed = 低速设备标志（TD 的 LS 位 + 控制传输分片大小）
+struct Usb64Ctl64 {
+    uint8_t  addr;
+    uint8_t  ctl_mps;
+    bool     low_speed;
+    uint16_t vendor;
+    uint16_t product;
+};
+
+// 前置声明：控制/批量传输跑完要把中断 TD 重新挂回队列（定义在本文件后半，见 usb_arm_interrupt）
+static void usb_arm_interrupt();
 // 有界忙等：用 PIT 计时（中断开着，别的任务/桌面照常被调度），再加硬自旋上界兜底。
 static void usb_delay_ms(uint32_t ms) {
     const uint64_t t0 = g_ticks64;
@@ -332,11 +422,16 @@ static bool usb_wait_td(const volatile UhciTd* td, uint32_t timeout_ms) {
 }
 
 // ==================== 控制传输（SETUP / DATA / STATUS 三阶段）====================
-// rt/req/val/idx/len = 标准 USB 控制请求字段；data = 数据缓冲（IN 收 / OUT 发，可为 nullptr）
+// c = 目标设备的上下文（EP0 最大包 / 低速标志从它取；**地址仍用参数 addr** —— 枚举第一步
+//     必须在默认地址 0 上收发，而那时 c->addr 还没生效）；
+// rt/req/val/idx/len = 标准 USB 控制请求字段；data = 数据缓冲（IN 收 / OUT 发，可为 nullptr）。
 // 返回 0 = 成功；-1 = 超时或硬件错；-2 = 设备 STALL。
-static int usb_control64(uint8_t addr, uint8_t rt, uint8_t req, uint16_t val, uint16_t idx,
-                         uint16_t len, uint8_t* data, uint16_t* out_len) {
+static int usb_control64(const Usb64Ctl64* c, uint8_t addr, uint8_t rt, uint8_t req, uint16_t val,
+                         uint16_t idx, uint16_t len, uint8_t* data, uint16_t* out_len) {
     if (out_len) *out_len = 0;
+    if (!c) return -1;
+    // ★ 批次 O：控制传输与 kusb 的 poll / 批量传输共用同一个 QH —— 全程互斥（见 usb_lock_*）。
+    usb_lock_acquire64();
 
     // ---- SETUP 包（8 字节，PID=SETUP，toggle 恒为 DATA0）----
     uint8_t* su = g_setup_buf;
@@ -346,7 +441,7 @@ static int usb_control64(uint8_t addr, uint8_t rt, uint8_t req, uint16_t val, ui
     su[6] = (uint8_t)(len & 0xFFu); su[7] = (uint8_t)(len >> 8);
 
     const bool in_dir = (rt & 0x80u) != 0;
-    const uint32_t lsflag = g_low_speed ? (uint32_t)TD_LS : 0u;
+    const uint32_t lsflag = c->low_speed ? (uint32_t)TD_LS : 0u;
 
     // 先把硬件从队列上摘下来，再重填槽位（发布点在函数尾部那一次 32 位写）
     uhci_stop_queue();
@@ -370,7 +465,7 @@ static int usb_control64(uint8_t addr, uint8_t rt, uint8_t req, uint16_t val, ui
     int data_tds = 0;
     while (remain > 0 && data_tds < USB64_CTL_MAX_TD) {
         data_tds++;
-        uint16_t pktsze = (uint16_t)(g_ctl_mps ? g_ctl_mps : 8);
+        uint16_t pktsze = (uint16_t)(c->ctl_mps ? c->ctl_mps : 8);
         uint32_t st = TD_MAXERR3 | lsflag | TD_ACTIVE;
         if (in_dir) st |= TD_SPD;                   // IN 方向：短包检测（最后一包除外）
         if (remain <= pktsze) { pktsze = remain; st &= ~(uint32_t)TD_SPD; }
@@ -387,7 +482,11 @@ static int usb_control64(uint8_t addr, uint8_t rt, uint8_t req, uint16_t val, ui
         dp += pktsze;
         remain -= pktsze;
     }
-    if (remain != 0) { uhci_abort_chain(setup_td); return -1; }   // 切片太多（理论到不了）
+    if (remain != 0) {                              // 切片太多（理论到不了）
+        uhci_abort_chain(setup_td);
+        usb_lock_release64();
+        return -1;
+    }
 
     // ---- STATUS 阶段：方向与数据阶段相反（无数据阶段 -> IN）；零长度；toggle 恒 DATA1 ----
     const uint32_t st_pid = (len > 0 && in_dir) ? (uint32_t)PID_OUT : (uint32_t)PID_IN;
@@ -412,12 +511,13 @@ static int usb_control64(uint8_t addr, uint8_t rt, uint8_t req, uint16_t val, ui
     // ---- 等状态阶段完成 ----
     if (!usb_wait_td(status_td, USB64_CTL_TIMEOUT_MS)) {
         uhci_abort_chain(setup_td);
+        usb_lock_release64();
         return -1;
     }
 
     const uint32_t ss = status_td->status;
-    if (ss & TD_STALLED) { uhci_abort_chain(setup_td); return -2; }
-    if (ss & TD_ERR_MASK) { uhci_abort_chain(setup_td); return -3; }
+    if (ss & TD_STALLED) { uhci_abort_chain(setup_td); usb_lock_release64(); return -2; }
+    if (ss & TD_ERR_MASK) { uhci_abort_chain(setup_td); usb_lock_release64(); return -3; }
 
     // ---- 汇总数据阶段实际收到的字节数（按"短包即结束"的规则）----
     uint16_t total = 0;
@@ -425,7 +525,7 @@ static int usb_control64(uint8_t addr, uint8_t rt, uint8_t req, uint16_t val, ui
         volatile UhciTd* t = first_data;
         for (;;) {
             const uint32_t ts = t->status;
-            if (ts & TD_ERR_MASK) { uhci_abort_chain(setup_td); return -3; }
+            if (ts & TD_ERR_MASK) { uhci_abort_chain(setup_td); usb_lock_release64(); return -3; }
             const uint16_t act = (uint16_t)UHCI_ACTLEN(ts);
             total = (uint16_t)(total + act);
             const uint16_t want = (uint16_t)UHCI_EXPLEN(t->token);
@@ -439,12 +539,16 @@ static int usb_control64(uint8_t addr, uint8_t rt, uint8_t req, uint16_t val, ui
     if (out_len) *out_len = total;
 
     uhci_stop_queue();
+    // 控制传输期间中断 TD 也不在队列上：传完立刻重新武装（否则键盘会一直待机）
+    if (g_ready && g_irq_td) usb_arm_interrupt();
+    usb_lock_release64();
     return 0;
 }
 
 // ==================== 枚举失败打点（多打一行 stage，方便定位卡在哪一步）====================
+// 注意：**不在这里改 g_state** —— 批次 O 起一台设备失败不代表整个主控失败（例如键盘枚举
+// 失败但 U 盘成功了），状态由 usb64_init64 在所有端口都试完后统一判定。
 static int usb_enum_fail(const char* stage, int rc) {
-    g_state = USB64_ST_ENUM_FAILED;
     usb_log_begin();
     dbg64_str("[USB64] enum FAILED stage=");
     dbg64_str(stage);
@@ -598,8 +702,11 @@ static void usb_arm_interrupt() {
 
 void usb64_poll64() {
     if (!g_ready || !g_irq_td) return;
+    // ★ 批次 O：有传输在跑时（mass storage 的批量传输是同步自旋等待的）不碰队列 ——
+    //   拿不到锁就"这次不重新武装"，下次轮询再来。绝不阻塞、绝不挂死。
+    if (!usb_lock_try64()) return;
     const uint32_t st = g_irq_td->status;
-    if (st & TD_ACTIVE) return;                          // 还没完成（没有报告时硬件一直 NAK）
+    if (st & TD_ACTIVE) { usb_lock_release64(); return; }   // 还没完成（没有报告时硬件一直 NAK）
 
     const uint16_t act = (uint16_t)UHCI_ACTLEN(st);
     if (st & TD_ERR_MASK) {
@@ -614,6 +721,7 @@ void usb64_poll64() {
         g_toggle ^= 1;
     }
     usb_arm_interrupt();
+    usb_lock_release64();
 }
 
 // ==================== 端口复位 ====================
@@ -650,34 +758,436 @@ static bool usb_port_reset(int idx, bool* low_speed) {
     return (v & PORTSC_CCS) != 0;
 }
 
-// ==================== 枚举 ====================
-// GET_DESCRIPTOR(Device,8) -> SET_ADDRESS(1) -> GET_DESCRIPTOR(Device,18)
-// -> GET_DESCRIPTOR(Config,9) -> GET_DESCRIPTOR(Config,total) -> 解析 HID 接口/端点
-// -> SET_CONFIGURATION(1) -> SET_PROTOCOL(0 引导) + SET_IDLE(0)
-static int usb_enumerate() {
-    uint8_t* buf = g_ctl_buf;                       //  DMA 缓冲：必须在页池里（恒等映射物理地址）
+
+// ==================== 批量传输（Bulk IN / Bulk OUT）====================
+// 复用同一套"TD 链 + QH 发布"机制（见文件头第 3 点）。与中断/控制传输的差别：
+//   * 一次最多 64 个包（USB64_BULK_MAX_TD = 64 × 64B = 4KB），**有界超时**（不挂死）；
+//   * IN 方向：除最后一包外都开 **SPD（短包检测）** —— 短包 = 传输自然结束
+//     （INQUIRY / CSW 都可能短），链上后面的 TD 不再被执行；我们扫链时"遇到第一个短包就收尾"；
+//   * NAK 由硬件按帧重试（TD 保持 ACTIVE、队列停在这一帧），软件只负责超时与出错判定。
+// 结果码 -> 打点用的原因（与 [USBST] read FAILED reason=... 对齐；STALL/硬件错都归 "nak"）。
+#define USB64_XFER_OK       0
+#define USB64_XFER_TIMEOUT (-1)
+#define USB64_XFER_STALL   (-2)
+#define USB64_XFER_HWERR   (-3)
+
+static const char* usb_xfer_reason(int r) {
+    switch (r) {
+    case USB64_XFER_TIMEOUT: return "timeout";
+    case USB64_XFER_STALL:   return "nak";
+    case USB64_XFER_HWERR:   return "nak";
+    default:                 return "?";
+    }
+}
+
+// 一次批量传输：ep = 端点号（不含方向位）、in = 方向、len = 字节数、mps = 该端点最大包。
+// toggle = 进出参（进入时是本次第一个包的 DATA 位，返回时推进到"下一个包该用的值"）。
+static int usb_bulk64(const Usb64Ctl64* c, uint8_t ep, bool in, uint8_t* buf, uint32_t len,
+                      uint16_t mps, uint8_t* toggle, uint32_t* got_out) {
+    if (got_out) *got_out = 0;
+    uint16_t pk = mps ? mps : 64;
+    if (pk > 64) pk = 64;                                // UHCI/全速：单包最大 64 字节
+    if (len == 0) return USB64_XFER_OK;
+    if (len > USB64_BULK_MAX_BYTES) return USB64_XFER_HWERR;    // 调用方必须自己分块
+    // ★ 物理地址：UHCI 的 TD 里必须放**物理**地址（见 usb_pa32 的踩坑说明）。
+    //   调用方缓冲区落在"认不出的地址空间"时退回 **DMA 暂存页**（拷进/拷出），绝不把错地址给硬件。
+    uint8_t* dma = buf;
+    bool bounce = false;
+    if (usb_pa32(buf) == 0) {
+        if (!g_bounce_page) return USB64_XFER_HWERR;
+        dma = g_bounce_page;
+        bounce = true;
+        if (!in) memcpy_64(dma, buf, len);               // OUT：先把要发的数据拷进暂存页
+    }
+
+    usb_lock_acquire64();
+    uhci_stop_queue();
+
+    const uint32_t lsflag = c->low_speed ? (uint32_t)TD_LS : 0u;
+    int slot = g_td_next;
+    uint8_t tg = toggle ? *toggle : 0;
+    volatile UhciTd* first = nullptr;
+    volatile UhciTd* prev  = nullptr;
+    volatile UhciTd* tds[USB64_BULK_MAX_TD];
+    int n = 0;
+    uint32_t remain = len;
+    uint8_t* dp = dma;
+    while (remain > 0 && n < (int)USB64_BULK_MAX_TD) {
+        const uint32_t chunk = (remain < pk) ? remain : pk;
+        const uint32_t pa = usb_pa32(dp);
+        if (pa == 0) {                                   // 防御：暂存页本身认不出（不该发生）
+            if (first) uhci_abort_chain(first);
+            g_td_next = slot;
+            usb_lock_release64();
+            return USB64_XFER_HWERR;
+        }
+        uint32_t st = TD_MAXERR3 | lsflag | TD_ACTIVE;
+        if (in && remain > pk) st |= TD_SPD;             // 短包检测：短包 = 传输结束
+        volatile UhciTd* t = td_slot(slot); slot = td_next_slot(slot);
+        td_fill(t, st, UHCI_TOKEN(in ? (uint32_t)PID_IN : (uint32_t)PID_OUT, c->addr, ep, tg, chunk),
+                pa);
+        t->link = UHCI_PTR_TERM;
+        if (prev) prev->link = td_phys(t);
+        prev = t;
+        if (!first) first = t;
+        tds[n++] = t;
+        tg ^= 1;
+        dp += chunk;
+        remain -= chunk;
+    }
+    if (remain != 0 || !first) {                         // 防御：太长（调用方没分块）
+        if (first) uhci_abort_chain(first);
+        g_td_next = slot;
+        usb_lock_release64();
+        return USB64_XFER_HWERR;
+    }
+    // 链尾：不活跃的空 TD + 终止（硬件走完最后一个真 TD 只会看到"不活跃 + 终止"）
+    volatile UhciTd* tail = td_slot(slot); slot = td_next_slot(slot);
+    td_fill(tail, 0, UHCI_TOKEN((uint32_t)PID_OUT, c->addr, ep, 0, 0), 0);
+    tail->link = UHCI_PTR_TERM;
+    prev->link = td_phys(tail);
+    g_td_next = slot;
+
+    // ★ 发布：一次 32 位对齐写（硬件要么看到空链，要么看到这条链）
+    usb_barrier();
+    g_qh->element = td_phys(first);
+    usb_barrier();
+
+    // ---- 等链完成 / 短包 / 出错 / 超时 ----
+    int res = USB64_XFER_OK;
+    uint32_t total = 0;
+    int idx = 0;
+    bool done = false;
+    const uint64_t t0 = g_ticks64;
+    const uint64_t want = ms_to_ticks64(USB64_BULK_TIMEOUT_MS);
+    uint64_t spin = 0;
+    for (;;) {
+        for (; idx < n; idx++) {
+            const uint32_t st = tds[idx]->status;
+            if (st & TD_ACTIVE) break;                    // 还没完成（或被前面的短包截停）
+            if (st & TD_STALLED) { res = USB64_XFER_STALL; done = true; break; }
+            if (st & TD_ERR_MASK) { res = USB64_XFER_HWERR; done = true; break; }
+            const uint16_t act = (uint16_t)UHCI_ACTLEN(st);
+            total += act;
+            // 短包 = 传输结束（剩下的 TD 不会再被执行，队列停在这里）
+            if (act < (uint16_t)UHCI_EXPLEN(tds[idx]->token)) { idx++; done = true; break; }
+        }
+        if (done) break;
+        if (idx >= n) break;                             // 整条链都完成了
+        if ((g_ticks64 - t0) >= want || ++spin > 400000000ull) { res = USB64_XFER_TIMEOUT; break; }
+        nop_pause();
+    }
+
+    if (res != USB64_XFER_OK) uhci_abort_chain(first);
+    else                      uhci_stop_queue();
+    if (toggle) *toggle = tg;
+    if (got_out) *got_out = total;
+    // 暂存页兜底：IN 方向把真正收到的字节拷回调用方缓冲区（短包时只拷实际长度）
+    if (bounce && in && total > 0) memcpy_64(buf, dma, (total < len) ? total : len);
+
+    // ★ 批量传输期间中断 TD 不在队列上（一个 QH 同一时刻只挂一条链）——传完立刻重新武装，
+    //   否则键盘会一直"待机"（poll 看到它还 ACTIVE 就不会重新发布）。
+    if (g_ready && g_irq_td) usb_arm_interrupt();
+    usb_lock_release64();
+    return res;
+}
+
+// ==================== USB 存储：Bulk-Only Transport（BOT）+ SCSI 只读子集 ====================
+// 依据 USB MSC BOT 规范（rev 1.0）：
+//   CBW（31 字节）：签名 'USBC'（0x43425355）、Tag、dCBWDataTransferLength、方向（bit7 = IN）、
+//     LUN、CB 长度、16 字节 CDB；
+//   CSW（13 字节）：签名 'USBS'（0x53425355）、Tag 回显、dCSWDataResidue、状态（0 = 通过）。
+// DATA toggle（如实按规范）：CBW 恒 DATA0、CSW 恒 DATA1、数据阶段从 DATA0 起逐包翻转；
+//   每条命令开始时两条批量端点的 toggle 都从 DATA0 重新开始（Linux usb-storage 同款假设）。
+// 本批只做**读**：INQUIRY / TEST UNIT READY / REQUEST SENSE / READ CAPACITY(10) / READ(10)。
+#define BOT_CBW_SIG 0x43425355u
+#define BOT_CSW_SIG 0x53425355u
+#define BOT_CBW_LEN 31
+#define BOT_CSW_LEN 13
+#define BOT_DIR_IN  0x80u
+
+struct Usb64Msc64 {
+    bool     present;          // 枚举到 BOT 接口
+    bool     supported;        // 探测全过 + 块大小 512（才算一块可用的块设备）
+    uint8_t  addr;
+    bool     low_speed;
+    uint8_t  iface;
+    uint8_t  lun;
+    uint8_t  ep_in, ep_out;
+    uint16_t mps_in, mps_out;
+    uint32_t csw_residue;      // dCSWDataResidue（应为 0；!= 0 = 数据阶段没搬完 -> 当失败）
+    uint32_t dbg_data_got;     // 最近一次数据阶段实际搬到的字节数（诊断/排障）
+    uint32_t tag;              // CBW/CSW 配对的 Tag（自增）
+    uint32_t blocks;           // 块数（= READ CAPACITY(10) 的"最后一个 LBA + 1"）
+    uint32_t block_size;
+    uint8_t  csw_status;       // 最近一次 CSW 状态字节
+    uint32_t reads_ok, reads_fail;
+    int      last_reason;      // 见 usb64_msc_last_reason64()
+    char     vendor[9];        // INQUIRY 的厂商（8 字节 + NUL）
+    char     product[17];      // INQUIRY 的型号（16 字节 + NUL）
+    uint8_t  removable;        // INQUIRY 的 RMB 位（= 可移动介质）
+    uint32_t selftest_mask;
+};
+static Usb64Msc64 g_msc;
+static uint32_t   g_usbst_read_logs = 0;      // 成功读的打点上限（防刷屏；失败另有上限）
+static uint32_t   g_usbst_fail_logs = 0;
+#define USBST_READ_LOG_MAX 128u
+#define USBST_FAIL_LOG_MAX 64u
+
+static uint32_t msc_rd32be(const uint8_t* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+static uint32_t msc_rd32le(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static void msc_wr32le(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+static void msc_wr16be(uint8_t* p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
+
+// 打印定长字段（INQUIRY 的厂商/型号是空格填充的）；不可打印字节替换成 '.'，别把控制字符灌进串口
+static void msc_log_str(const char* s, int n) {
+    int last = n - 1;
+    while (last >= 0 && (s[last] == ' ' || s[last] == 0)) last--;
+    for (int i = 0; i <= last; i++) {
+        const char ch = s[i];
+        dbg64_putc((ch >= 0x20 && ch < 0x7F) ? ch : '.');
+    }
+}
+
+// 一条 BOT 命令：CBW -> [数据阶段] -> CSW。
+// 返回 0 = 通过；1/2 = CSW 报的命令失败/阶段错；<0 = 传输层失败（见 g_msc.last_reason）。
+static int usb_bot64(uint8_t* cdb, uint8_t cdb_len, bool dir_in, uint32_t data_len, uint8_t* data) {
+    Usb64Msc64& m = g_msc;
+    if (!m.present) { m.last_reason = 5; return -1; }
+    if (data_len > USB64_MSC_MAX_DATA) { m.last_reason = 4; return -1; }
+
+    Usb64Ctl64 c;
+    c.addr = m.addr; c.ctl_mps = 64; c.low_speed = m.low_speed; c.vendor = 0; c.product = 0;
+
+    // ---- CBW（31 字节，DATA0）----
+    uint8_t* cbw = g_cbw_buf;
+    for (int i = 0; i < BOT_CBW_LEN; i++) cbw[i] = 0;
+    msc_wr32le(cbw + 0, BOT_CBW_SIG);
+    m.tag++;
+    msc_wr32le(cbw + 4, m.tag);
+    msc_wr32le(cbw + 8, data_len);
+    cbw[12] = dir_in ? (uint8_t)BOT_DIR_IN : 0;
+    cbw[13] = (uint8_t)(m.lun & 0x0Fu);
+    cbw[14] = (uint8_t)(cdb_len & 0x1Fu);
+    for (int i = 0; i < 16; i++) cbw[15 + i] = (i < (int)cdb_len) ? cdb[i] : 0;
+
+    uint8_t  tg = 0;
+    uint32_t got = 0;
+    int r = usb_bulk64(&c, m.ep_out, false, cbw, BOT_CBW_LEN, m.mps_out, &tg, &got);
+    if (r != USB64_XFER_OK || got != BOT_CBW_LEN) {
+        m.last_reason = (r == USB64_XFER_TIMEOUT) ? 2 : 3;
+        return -1;
+    }
+
+    // ---- 数据阶段（toggle 从 DATA0 起；短包由 usb_bulk64 的短包检测收尾）----
+    if (data_len > 0 && data) {
+        tg = 0;
+        got = 0;
+        r = usb_bulk64(&c, dir_in ? m.ep_in : m.ep_out, dir_in, data, data_len,
+                       dir_in ? m.mps_in : m.mps_out, &tg, &got);
+        m.dbg_data_got = got;
+        if (r != USB64_XFER_OK) { m.last_reason = (r == USB64_XFER_TIMEOUT) ? 2 : 3; return -1; }
+        // 短包（got < data_len）不算传输层错误：设备可以只回它有的（INQUIRY 常见），
+        // 由调用方按 got 判断；但**一个字节都没有**就是真失败。
+        if (got == 0) { m.last_reason = 1; return -1; }
+    } else {
+        m.dbg_data_got = 0;
+    }
+
+    // ---- CSW（13 字节，DATA1）----
+    tg = 1;
+    got = 0;
+    r = usb_bulk64(&c, m.ep_in, true, g_csw_buf, BOT_CSW_LEN, m.mps_in, &tg, &got);
+    if (r != USB64_XFER_OK || got != BOT_CSW_LEN) {
+        m.last_reason = (r == USB64_XFER_TIMEOUT) ? 2 : 3;
+        return -1;
+    }
+    const uint32_t sig = msc_rd32le(g_csw_buf);
+    const uint32_t tag = msc_rd32le(g_csw_buf + 4);
+    m.csw_status  = g_csw_buf[12];
+    m.csw_residue = msc_rd32le(g_csw_buf + 8);        // dCSWDataResidue（规范字段，诊断/校验都用它）
+    if (sig != BOT_CSW_SIG || tag != m.tag) { m.last_reason = 1; return -1; }   // 签名/Tag 不对 = 阶段错
+    if (m.csw_status != 0) { m.last_reason = 1; return (int)m.csw_status; }
+    // ★ 数据阶段没搬完（residue != 0）也要**当成失败**：上层（ata64）以为整段都读到了，
+    //   实际只有前面一部分 —— 不报错的话 FAT/MBR 会解析到"混合数据"（实测踩过：MBR 签名读不到）。
+    if (m.csw_residue != 0) { m.last_reason = 6; return -2; }
+    m.last_reason = 0;
+    return 0;
+}
+
+// REQUEST SENSE(0x03)：出错时读 18 字节 SENSE 并把 key/asc/ascq 打进串口（定位用）
+static void usb_msc_log_sense64(const char* what) {
+    uint8_t cdb[16];
+    for (int i = 0; i < 16; i++) cdb[i] = 0;
+    cdb[0] = 0x03;
+    cdb[4] = 18;
+    for (int i = 0; i < 18; i++) g_msc_scratch[i] = 0;
+    const int r = usb_bot64(cdb, 6, true, 18, g_msc_scratch);
+    usb_log_begin();
+    dbg64_str("[USBST] sense after=");
+    dbg64_str(what);
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)(r < 0 ? 99u : (uint32_t)r));
+    if (r == 0 && g_msc_scratch[0] == 0x70u) {              // 固定格式 SENSE 数据
+        dbg64_str(" key=");
+        usb_hex((uint32_t)(g_msc_scratch[2] & 0x0Fu), 1);
+        dbg64_str(" asc=");
+        usb_hex(g_msc_scratch[12], 2);
+        dbg64_str(" ascq=");
+        usb_hex(g_msc_scratch[13], 2);
+    }
+    usb_log_end();
+}
+
+// INQUIRY(0x12)：36 字节标准查询数据（厂商 8 + 型号 16 + 版本 4），RMB 位看是否可移动
+static int usb_msc_inquiry64() {
+    uint8_t cdb[16];
+    for (int i = 0; i < 16; i++) cdb[i] = 0;
+    cdb[0] = 0x12;
+    cdb[4] = 36;
+    for (int i = 0; i < 36; i++) g_msc_scratch[i] = 0;
+    const int r = usb_bot64(cdb, 6, true, 36, g_msc_scratch);
+    if (r != 0) { usb_msc_log_sense64("inquiry"); return -1; }
+    g_msc.removable = (g_msc_scratch[1] & 0x80u) ? 1 : 0;
+    for (int i = 0; i < 8; i++)  g_msc.vendor[i]  = (char)g_msc_scratch[8 + i];
+    g_msc.vendor[8] = 0;
+    for (int i = 0; i < 16; i++) g_msc.product[i] = (char)g_msc_scratch[16 + i];
+    g_msc.product[16] = 0;
+    usb_log_begin();
+    dbg64_str("[USBST] inquiry vendor=");
+    msc_log_str(g_msc.vendor, 8);
+    dbg64_str(" product=");
+    msc_log_str(g_msc.product, 16);
+    dbg64_str(g_msc.removable ? " rmb=1" : " rmb=0");
+    usb_log_end();
+    return 0;
+}
+
+// READ CAPACITY(10)(0x25)：8 字节（最后 LBA(4, 大端) + 块大小(4, 大端)）
+// 打点：[USBST] capacity blocks=<n> block_size=<n> bytes=<n> cap_mb=<n>[ cap_gb=<x.yy>]
+static int usb_msc_capacity64() {
+    uint8_t cdb[16];
+    for (int i = 0; i < 16; i++) cdb[i] = 0;
+    cdb[0] = 0x25;
+    for (int i = 0; i < 8; i++) g_msc_scratch[i] = 0;
+    const int r = usb_bot64(cdb, 10, true, 8, g_msc_scratch);
+    if (r != 0) { usb_msc_log_sense64("read-capacity"); return -1; }
+    const uint32_t last = msc_rd32be(g_msc_scratch);
+    const uint32_t bs   = msc_rd32be(g_msc_scratch + 4);
+    g_msc.blocks = last + 1u;
+    g_msc.block_size = bs;
+    const uint64_t bytes = (uint64_t)g_msc.blocks * (uint64_t)bs;
+    usb_log_begin();
+    dbg64_str("[USBST] capacity blocks=");
+    dbg64_dec((uint64_t)g_msc.blocks);
+    dbg64_str(" block_size=");
+    dbg64_dec((uint64_t)bs);
+    dbg64_str(" bytes=");
+    dbg64_dec(bytes);
+    dbg64_str(" cap_mb=");
+    dbg64_dec(bytes / (1024ull * 1024ull));
+    if (bytes >= (1024ull * 1024ull * 1024ull)) {           // ≥ 1GB 时再给一个两位小数的 GB
+        const uint64_t gb100 = (bytes * 100ull) / (1024ull * 1024ull * 1024ull);
+        dbg64_str(" cap_gb=");
+        dbg64_dec(gb100 / 100ull);
+        dbg64_putc('.');
+        const uint64_t frac = gb100 % 100ull;
+        dbg64_putc((char)('0' + (frac / 10ull)));
+        dbg64_putc((char)('0' + (frac % 10ull)));
+    }
+    usb_log_end();
+    return 0;
+}
+
+// READ(10)(0x28)：lba(4, 大端) @2..5、传输块数(2, 大端) @7..8；数据 = count × 512 字节
+// 打点：[USBST] read lba=<n> count=<n> ok / read FAILED lba=<n> reason=<...>
+static int usb_msc_read10_64(uint32_t lba, uint16_t count, uint8_t* buf) {
+    uint8_t cdb[16];
+    for (int i = 0; i < 16; i++) cdb[i] = 0;
+    cdb[0] = 0x28;
+    cdb[2] = (uint8_t)(lba >> 24); cdb[3] = (uint8_t)(lba >> 16);
+    cdb[4] = (uint8_t)(lba >> 8);  cdb[5] = (uint8_t)lba;
+    msc_wr16be(cdb + 7, count);
+    const uint32_t bytes = (uint32_t)count * 512u;
+    const int r = usb_bot64(cdb, 10, true, bytes, buf);
+    if (r != 0) {
+        g_msc.reads_fail++;
+        if (g_usbst_fail_logs < USBST_FAIL_LOG_MAX) {
+            g_usbst_fail_logs++;
+            usb_log_begin();
+            dbg64_str("[USBST] read FAILED lba=");
+            dbg64_dec((uint64_t)lba);
+            dbg64_str(" count=");
+            dbg64_dec((uint64_t)count);
+            dbg64_str(" reason=");
+            dbg64_str(r > 0 ? "csw status" : usb_xfer_reason(r));
+            if (r > 0) {
+                dbg64_str(" csw=");
+                dbg64_dec((uint64_t)g_msc.csw_status);
+            }
+            usb_log_end();
+            if (r > 0) usb_msc_log_sense64("read10");
+        }
+        return -1;
+    }
+    g_msc.reads_ok++;
+    if (g_usbst_read_logs < USBST_READ_LOG_MAX) {
+        g_usbst_read_logs++;
+        usb_log_begin();
+        dbg64_str("[USBST] read lba=");
+        dbg64_dec((uint64_t)lba);
+        dbg64_str(" count=");
+        dbg64_dec((uint64_t)count);
+        dbg64_str(" ok");
+        usb_log_end();
+        if (g_usbst_read_logs == USBST_READ_LOG_MAX) {
+            usb_log_begin();
+            dbg64_str("[USBST] read log capped at ");
+            dbg64_dec((uint64_t)USBST_READ_LOG_MAX);
+            dbg64_str(" lines (further successes not printed; counters still count)");
+            usb_log_end();
+        }
+    }
+    return 0;
+}
+// ==================== 枚举（一台设备）====================
+// 流程与改动前一致，只是从"只做第一台设备"变成"每台设备各做一遍"：
+//   GET_DESCRIPTOR(Device,8) -> SET_ADDRESS(addr) -> GET_DESCRIPTOR(Device,18)
+//   -> GET_DESCRIPTOR(Config,9) -> GET_DESCRIPTOR(Config,total)
+//   -> 遍历描述符链：HID 引导键盘（class=3 sub=1，中断 IN）/ USB 存储 BOT
+//      （class=8 sub=6 proto=0x50，两个批量端点）
+//   -> SET_CONFIGURATION(1) -> 角色化（键盘：SET_PROTOCOL(0) + SET_IDLE(0) + 武装中断端点）
+// 返回 0 = 这台设备被本驱动接管（键盘或存储）；-1 = 失败 / 不是支持的设备（调用方继续看别的端口）。
+static int usb_enum_port(int port_idx, uint8_t addr, bool low_speed) {
+    Usb64Ctl64 c;
+    c.addr = addr; c.ctl_mps = 8; c.low_speed = low_speed; c.vendor = 0; c.product = 0;
+    uint8_t* buf = g_ctl_buf;                       // DMA 缓冲：必须在页池里（恒等映射物理地址）
     const uint16_t buf_bytes = USB64_CTL_BUF_BYTES;
     uint16_t n = 0;
 
     // ---- 1) 8 字节设备描述符（默认地址 0；此时还不知道设备 mps，只能按 8 字节收）----
-    g_ctl_mps = 8;
-    if (usb_control64(0, 0x80, 6, 0x0100, 0, 8, buf, &n) != 0 || n < 8)
+    if (usb_control64(&c, 0, 0x80, 6, 0x0100, 0, 8, buf, &n) != 0 || n < 8)
         return usb_enum_fail("get-device-8", 1);
     uint8_t mps = buf[7];
     if (mps != 8 && mps != 16 && mps != 32 && mps != 64) mps = 8;
-    g_ctl_mps = mps;
+    c.ctl_mps = mps;
 
-    // ---- 2) SET_ADDRESS(1)（0 字节数据阶段）----
-    if (usb_control64(0, 0x00, 5, 1, 0, 0, nullptr, nullptr) != 0)
+    // ---- 2) SET_ADDRESS(addr)（0 字节数据阶段）----
+    if (usb_control64(&c, 0, 0x00, 5, (uint16_t)addr, 0, 0, nullptr, nullptr) != 0)
         return usb_enum_fail("set-address", 2);
-    g_addr = 1;
     usb_delay_ms(10);                                    // 设备切换地址的恢复时间
 
-    // ---- 3) 完整设备描述符（18 字节，现在在地址 1）----
-    if (usb_control64(g_addr, 0x80, 6, 0x0100, 0, 18, buf, &n) != 0 || n < 18)
+    // ---- 3) 完整设备描述符（18 字节，现在在新地址上）----
+    if (usb_control64(&c, addr, 0x80, 6, 0x0100, 0, 18, buf, &n) != 0 || n < 18)
         return usb_enum_fail("get-device-18", 3);
-    g_vendor  = (uint16_t)(buf[8] | ((uint16_t)buf[9] << 8));
-    g_product = (uint16_t)(buf[10] | ((uint16_t)buf[11] << 8));
+    c.vendor  = (uint16_t)(buf[8] | ((uint16_t)buf[9] << 8));
+    c.product = (uint16_t)(buf[10] | ((uint16_t)buf[11] << 8));
 
     // ★ 这一行的 addr=0 指的是"枚举时发现它的默认地址"（8 字节描述符就是在地址 0 读的，
     //   mps 也来自那一次读）；vendor/product 只存在于 18 字节描述符里，而按 USB 规定
@@ -686,18 +1196,18 @@ static int usb_enumerate() {
     dbg64_str("[USB64] device addr=0 mps=");
     dbg64_dec((uint64_t)mps);
     dbg64_str(" vendor=");
-    usb_hex(g_vendor, 4);
+    usb_hex(c.vendor, 4);
     dbg64_str(" product=");
-    usb_hex(g_product, 4);
+    usb_hex(c.product, 4);
     usb_log_end();
     usb_log_begin();
     dbg64_str("[USB64] set address=");
-    dbg64_dec((uint64_t)g_addr);
+    dbg64_dec((uint64_t)addr);
     dbg64_str(" ok");
     usb_log_end();
 
     // ---- 4) 配置描述符前 9 字节（拿 wTotalLength）----
-    if (usb_control64(g_addr, 0x80, 6, 0x0200, 0, 9, buf, &n) != 0 || n < 9)
+    if (usb_control64(&c, addr, 0x80, 6, 0x0200, 0, 9, buf, &n) != 0 || n < 9)
         return usb_enum_fail("get-config-9", 4);
     uint16_t total = (uint16_t)(buf[2] | ((uint16_t)buf[3] << 8));
     const uint8_t ifaces = buf[4];
@@ -705,64 +1215,199 @@ static int usb_enumerate() {
     if (total > buf_bytes) total = buf_bytes;
 
     // ---- 5) 完整配置描述符 ----
-    if (usb_control64(g_addr, 0x80, 6, 0x0200, 0, total, buf, &n) != 0 || n < 9)
+    if (usb_control64(&c, addr, 0x80, 6, 0x0200, 0, total, buf, &n) != 0 || n < 9)
         return usb_enum_fail("get-config", 6);
 
-    // ---- 6) 遍历描述符链，找 HID 引导键盘接口 + 它的 IN 中断端点 ----
-    //    4 = 接口描述符、5 = 端点描述符、0x21 = HID 描述符。
-    //    引导键盘固定 8 字节报告，所以"wMaxPacketSize + 端点地址"从 HID 接口下的
-    //    端点描述符取（HID 描述符自己的 wDescriptorLength 只是报告描述符长度，不需要）。
-    int hid_iface = -1;
-    uint8_t ep_in = 0;
-    uint16_t ep_mps = 0;
-    bool in_hid = false;
+    // ---- 6) 遍历描述符链，找两种我们支持的接口 ----
+    //    4 = 接口描述符、5 = 端点描述符（bmAttributes 低 2 位：3 = 中断、2 = 批量）、
+    //    0x21 = HID 描述符（这里只需跳过）。引导键盘固定 8 字节报告，所以端点信息从端点
+    //    描述符取；USB 存储要两个**批量**端点（IN = 设备到主机、OUT = 主机到设备）。
+    int hid_iface = -1; uint8_t hid_ep = 0; uint16_t hid_mps = 0;
+    int msc_iface = -1; uint8_t msc_in = 0, msc_out = 0; uint16_t msc_mps_in = 0, msc_mps_out = 0;
+    bool in_hid = false, in_msc = false;
     const uint8_t* p = buf;
     const uint8_t* end = buf + (n < total ? n : total);
     while (p + 2 <= end && p[0] >= 2u) {
         const uint8_t blen = p[0], btype = p[1];
         if (btype == 4u && blen >= 9u) {                       // 接口
-            const uint8_t iclass = p[5], isub = p[6];
+            const uint8_t iclass = p[5], isub = p[6], iproto = p[7];
             in_hid = (iclass == 3u && isub == 1u);             // HID + Boot Interface
-            if (in_hid) hid_iface = p[2];
+            in_msc = (iclass == 8u && isub == 6u && iproto == 0x50u);   // Mass Storage + SCSI + BOT
+            if (in_hid && hid_iface < 0) hid_iface = p[2];
+            if (in_msc && msc_iface < 0) msc_iface = p[2];
         } else if (btype == 5u && blen >= 7u) {                // 端点
             const uint8_t ea = p[2];
-            const uint16_t mp = (uint16_t)(p[4] | ((uint16_t)p[5] << 8));
-            if (in_hid && (ea & 0x80u) && ep_in == 0) { ep_in = ea; ep_mps = (uint16_t)(mp & 0x7FFu); }
+            const uint8_t attr = (uint8_t)(p[3] & 0x03u);
+            const uint16_t mp = (uint16_t)((p[4] | ((uint16_t)p[5] << 8)) & 0x7FFu);
+            if (in_hid && attr == 3u && (ea & 0x80u) && hid_ep == 0) { hid_ep = ea; hid_mps = mp; }
+            if (in_msc && attr == 2u) {                        // ★ 批量端点
+                if ((ea & 0x80u) && msc_in == 0)         { msc_in = ea;  msc_mps_in = mp; }
+                else if (!(ea & 0x80u) && msc_out == 0)  { msc_out = ea; msc_mps_out = mp; }
+            }
         } else if (btype == 0x21u) {                           // HID 描述符（这里只需跳过）
         }
         if (p + blen > end) break;
         p += blen;
     }
-    if (hid_iface < 0 || ep_in == 0) return usb_enum_fail("hid-interface", 7);
+
+    // 角色判定：键盘优先（已经有键盘就不占），其次 USB 存储（已经有存储就不占）。
+    int role = 0;                                              // 0=不支持 1=HID 键盘 2=USB 存储
+    if (hid_iface >= 0 && hid_ep != 0 && !g_hid_present)       role = 1;
+    else if (msc_iface >= 0 && msc_in != 0 && msc_out != 0 && !g_msc.present) role = 2;
+    if (role == 0) {
+        usb_log_begin();
+        dbg64_str("[USB64] device addr=0 port=");
+        dbg64_dec((uint64_t)port_idx);
+        dbg64_str(" unsupported interface (skipped: only HID boot keyboard and USB storage BOT)");
+        usb_log_end();
+        return -1;
+    }
 
     // ---- 7) SET_CONFIGURATION(1) ----
-    if (usb_control64(g_addr, 0x00, 9, 1, 0, 0, nullptr, nullptr) != 0)
+    if (usb_control64(&c, addr, 0x00, 9, 1, 0, 0, nullptr, nullptr) != 0)
         return usb_enum_fail("set-config", 8);
 
-    g_ep_in  = (uint8_t)(ep_in & 0x0Fu);
-    g_ep_mps = ep_mps;
-    g_devices = 1;
+    if (role == 1) {
+        // ---- HID 引导键盘 ----
+        g_addr    = addr;
+        g_low_speed = low_speed;
+        g_vendor  = c.vendor;
+        g_product = c.product;
+        g_ep_in   = (uint8_t)(hid_ep & 0x0Fu);
+        g_ep_mps  = hid_mps;
+        g_hid_present = true;
+
+        usb_log_begin();
+        dbg64_str("[USB64] config set value=1 ifaces=");
+        dbg64_dec((uint64_t)ifaces);
+        dbg64_str(" hid=1 ep_in=");
+        usb_hex(hid_ep, 2);
+        dbg64_str(" mps=");
+        dbg64_dec((uint64_t)hid_mps);
+        usb_log_end();
+
+        // ---- 8) HID 引导协议：SET_PROTOCOL(0) + SET_IDLE(0) ----
+        //    bmRequestType=0x21（类请求、接口、主机到设备）、wIndex = 接口号、wLength = 0
+        if (usb_control64(&c, addr, 0x21, 0x0B, 0, (uint16_t)hid_iface, 0, nullptr, nullptr) != 0)
+            return usb_enum_fail("set-protocol", 9);
+        if (usb_control64(&c, addr, 0x21, 0x0A, 0, (uint16_t)hid_iface, 0, nullptr, nullptr) != 0)
+            return usb_enum_fail("set-idle", 10);
+
+        usb_log_begin();
+        dbg64_str("[USB64] hid boot protocol set (8-byte reports)");
+        usb_log_end();
+
+        g_toggle = 0;
+        usb_arm_interrupt();                       // 从这一刻起按键会进 PS/2 同一条队列
+        g_ready = true;
+        return 0;
+    }
+
+    // ---- USB 存储（Bulk-Only Transport）：记下两个批量端点，探测放在所有设备枚举完之后 ----
+    g_msc.present   = true;
+    g_msc.supported = false;                       // 探测（INQUIRY/CAPACITY/READ）过了才置 true
+    g_msc.addr      = addr;
+    g_msc.low_speed = low_speed;
+    g_msc.iface     = (uint8_t)msc_iface;
+    g_msc.lun       = 0;
+    g_msc.ep_in     = (uint8_t)(msc_in & 0x0Fu);
+    g_msc.ep_out    = (uint8_t)(msc_out & 0x0Fu);
+    g_msc.mps_in    = msc_mps_in ? msc_mps_in : 64u;
+    g_msc.mps_out   = msc_mps_out ? msc_mps_out : 64u;
+    g_msc.tag       = 0;
+    g_msc.last_reason = 0;
 
     usb_log_begin();
     dbg64_str("[USB64] config set value=1 ifaces=");
     dbg64_dec((uint64_t)ifaces);
-    dbg64_str(" hid=1 ep_in=");
-    usb_hex(ep_in, 2);
+    dbg64_str(" msc=1 ep_in=");
+    usb_hex(msc_in, 2);
+    dbg64_str(" ep_out=");
+    usb_hex(msc_out, 2);
     dbg64_str(" mps=");
-    dbg64_dec((uint64_t)ep_mps);
+    dbg64_dec((uint64_t)g_msc.mps_in);
     usb_log_end();
 
-    // ---- 8) HID 引导协议：SET_PROTOCOL(0) + SET_IDLE(0) ----
-    //    bmRequestType=0x21（类请求、接口、主机到设备）、wIndex = 接口号、wLength = 0
-    if (usb_control64(g_addr, 0x21, 0x0B, 0, (uint16_t)hid_iface, 0, nullptr, nullptr) != 0)
-        return usb_enum_fail("set-protocol", 9);
-    if (usb_control64(g_addr, 0x21, 0x0A, 0, (uint16_t)hid_iface, 0, nullptr, nullptr) != 0)
-        return usb_enum_fail("set-idle", 10);
-
+    // ★ 自动验收用的固定打点（class=08 / sub=06 / proto=50 = BOT，任务书里指定的格式）
     usb_log_begin();
-    dbg64_str("[USB64] hid boot protocol set (8-byte reports)");
+    dbg64_str("[USBST] iface found class=08 sub=06 proto=50 ep_in=");
+    usb_hex(msc_in, 2);
+    dbg64_str(" ep_out=");
+    usb_hex(msc_out, 2);
     usb_log_end();
     return 0;
+}
+// ==================== USB 存储：探测（INQUIRY / TUR / READ CAPACITY / READ(10)）====================
+// 探测顺序照 USB MSC 的常规做法（也是任务要求）：
+//   INQUIRY -> TEST UNIT READY -> （出错时 REQUEST SENSE 打点）-> READ CAPACITY(10) -> READ(10) LBA0
+// 自检位（[USBST] selftest mask=，0 = 全过；**没插 U 盘时整行打 skipped**）：
+//   bit0(1)  存储设备没枚举到（防御用，正常不会出现在 FAIL 里）
+//   bit1(2)  INQUIRY 失败          bit2(4)  READ CAPACITY 失败
+//   bit3(8)  TEST UNIT READY 失败  bit4(16) 块大小不是 512（本批只支持 512，如实拒绝）
+//   bit5(32) READ(10) LBA 0 失败   bit6(64) LBA 0 读回**全 0**（可疑：通路可能读到空数据）
+static void usb_msc_probe() {
+    uint32_t mask = 0;
+    if (!g_msc.present) {
+        usb_log_begin();
+        dbg64_str("[USBST] selftest skipped (no storage device)");
+        usb_log_end();
+        return;
+    }
+
+    // ---- 1) INQUIRY：厂商 + 型号（顺带看 RMB 位 = 可移动）----
+    if (usb_msc_inquiry64() != 0) mask |= 2u;
+
+    // ---- 2) TEST UNIT READY：没数据阶段；刚上电的介质可能要一点时间，重试 3 次 ----
+    {
+        uint8_t cdb[16];
+        for (int i = 0; i < 16; i++) cdb[i] = 0;
+        cdb[0] = 0x00;
+        int r = -1;
+        for (int t = 0; t < 3 && r != 0; t++) {
+            r = usb_bot64(cdb, 6, false, 0, nullptr);
+            if (r != 0) usb_delay_ms(60);
+        }
+        if (r != 0) {
+            usb_msc_log_sense64("test-unit-ready");
+            mask |= 8u;
+        }
+    }
+
+    // ---- 3) READ CAPACITY(10)：块数 + 块大小（换算成 MB/GB 一起打点）----
+    if (usb_msc_capacity64() != 0) mask |= 4u;
+    if (g_msc.present && g_msc.block_size != 512u) {
+        mask |= 16u;
+        usb_log_begin();
+        dbg64_str("[USBST] block_size=");
+        dbg64_dec((uint64_t)g_msc.block_size);
+        dbg64_str(" != 512 -> not exposed as a block device (this batch only reads 512-byte blocks)");
+        usb_log_end();
+    }
+
+    // ---- 4) READ(10) LBA 0：真的从盘上读一块（只读，不动盘）----
+    if (mask == 0) {
+        if (usb_msc_read10_64(0, 1, g_msc_sec) != 0) {
+            mask |= 32u;
+        } else {
+            bool all0 = true;
+            for (uint32_t i = 0; i < 512u; i++) if (g_msc_sec[i] != 0) { all0 = false; break; }
+            if (all0) mask |= 64u;
+        }
+    }
+
+    // ★ supported = 探测全过：探测没过的盘**不暴露成块设备**（宁可如实说"没盘"，
+    //   也不给上层一个读必失败的驱动器号 —— 那会让 FAT 挂载/浏览到处报错）。
+    g_msc.supported = (mask == 0);
+    g_msc.selftest_mask = mask;
+
+    usb_log_begin();
+    if (mask == 0) {
+        dbg64_str("[USBST] selftest PASS mask=0");
+    } else {
+        dbg64_str("[USBST] selftest FAIL mask=");
+        dbg64_dec((uint64_t)mask);
+    }
+    usb_log_end();
 }
 
 // ==================== 初始化 ====================
@@ -770,7 +1415,8 @@ static int usb_enumerate() {
 //   bit0 内存结构没建起来   bit1 控制器没在跑（USBCMD.RS 读回 0）
 //   bit2 端口数不合理       bit3 帧列表项没指向 QH
 //   bit4 FRBASEADD 读回值不对（寄存器读写本身不通）
-//   bit5 有设备但没就绪     bit6 中断 TD 没建    bit7 端点号/包长不对
+//   bit5 有键盘但没就绪     bit6 中断 TD 没建    bit7 端点号/包长不对
+//   bit8(256) ★ 批次 O：U 盘枚举到了但 BOT 探测没过（[USBST] selftest mask != 0）
 int usb64_selftest64() {
     if (!g_found) return 0;
     uint32_t mask = 0;
@@ -783,11 +1429,12 @@ int usb64_selftest64() {
         if (fl[0] != want || fl[USB64_FL_ENTRIES - 1] != want) mask |= 8u;
     }
     if (g_fl_page && uhci_rd32(UHCI_FLBASEADD) != (uint32_t)(uintptr_t)g_fl_page) mask |= 16u;
-    if (g_devices > 0) {                                                // 有设备就该就绪
+    if (g_hid_present) {                                                // 有键盘就该就绪
         if (!g_ready)       mask |= 32u;
         if (!g_irq_td)      mask |= 64u;
         if (g_ep_in == 0 || g_ep_mps != 8) mask |= 128u;                // 引导键盘：8 字节报告
     }
+    if (g_msc.present && g_msc.selftest_mask) mask |= 256u;              // ★ 批次 O：U 盘探测失败
     return (int)mask;
 }
 
@@ -854,11 +1501,12 @@ int usb64_init64() {
     dbg64_str(g_mmio ? " mmio=1" : "");
     usb_log_end();
 
-    // ---- 3) 内存结构（帧列表 / QH / TD 池 / 数据缓冲）----
-    g_fl_page   = (uint8_t*)page_alloc_64();
-    g_td_page   = (uint8_t*)page_alloc_64();
-    g_data_page = (uint8_t*)page_alloc_64();
-    if (!g_fl_page || !g_td_page || !g_data_page) {
+    // ---- 3) 内存结构（帧列表 / QH / TD 池 / 数据缓冲 / DMA 暂存页）----
+    g_fl_page     = (uint8_t*)page_alloc_64();
+    g_td_page     = (uint8_t*)page_alloc_64();
+    g_data_page   = (uint8_t*)page_alloc_64();
+    g_bounce_page = (uint8_t*)page_alloc_64();      // ★ 批次 O：认不出物理地址时的 DMA 暂存
+    if (!g_fl_page || !g_td_page || !g_data_page || !g_bounce_page) {
         g_state = USB64_ST_NOT_FOUND;
         usb_log_begin();
         dbg64_str("[USB64] not found (out of pages)");
@@ -868,7 +1516,6 @@ int usb64_init64() {
     }
     memset_64(g_fl_page, 0, PAGE_SIZE_64);
     memset_64(g_td_page, 0, PAGE_SIZE_64);
-    memset_64(g_data_page, 0, PAGE_SIZE_64);
 
     g_qh       = (UhciQh*)(void*)g_td_page;                // 页首 16 字节 = QH
     g_idle_td  = td_slot(USB64_TD_IDLE);                   // 槽 0 = 永久空 TD
@@ -876,6 +1523,10 @@ int usb64_init64() {
     g_ctl_buf    = g_data_page + 0x010;                    // 256 字节（描述符）
     g_report_buf = g_data_page + 0x200;                    // 8 字节
     g_null_buf   = g_data_page + 0x300;                    // 状态阶段（零长度）哨兵
+    g_msc_sec    = g_data_page + 0x400;                    // 512 字节（READ(10) 的扇区缓冲）
+    g_cbw_buf    = g_data_page + 0x600;                    // 64 字节（CBW）
+    g_csw_buf    = g_data_page + 0x640;                    // 16 字节（CSW）
+    g_msc_scratch= g_data_page + 0x680;                    // 64 字节（INQUIRY/SENSE/CAPACITY）
     g_irq_td   = td_slot(1);
     g_irq_tail = td_slot(2);
     g_td_next  = 3;
@@ -922,8 +1573,13 @@ int usb64_init64() {
     dbg64_str(" (1024 entries)");
     usb_log_end();
 
-    // ---- 6) 扫根端口：第一个有设备的端口做复位 + 枚举 ----
-    int chosen = -1;
+    // ---- 6) 扫**所有**根端口：每个有设备的端口做复位 + 枚举 ----
+    // ★ 批次 O：从"只认第一个端口的一台设备"扩到"最多两台（1 键盘 + 1 U 盘）"。
+    //   地址按端口顺序分配（1、2…）；已经拿够角色（键盘/存储各一个）后，剩下的设备只复位不枚举
+    //   （避免给不用的设备分配地址，也就不会出现"地址占着但没人管"的状态）。
+    int      found = 0;
+    uint8_t  next_addr = 1;
+    bool     any_connected = false;
     for (int i = 1; i <= g_ports; i++) {
         const uint16_t reg = (i == 1) ? (uint16_t)UHCI_PORTSC1 : (uint16_t)UHCI_PORTSC2;
         const uint16_t v = uhci_rd16(reg);
@@ -934,6 +1590,7 @@ int usb64_init64() {
             usb_log_end();
             continue;
         }
+        any_connected = true;
         bool low = false;
         const bool ok = usb_port_reset(i, &low);
         if (!ok) {
@@ -943,7 +1600,6 @@ int usb64_init64() {
             usb_log_end();
             continue;
         }
-        g_low_speed = low;
         usb_log_begin();
         dbg64_str("[USB64] port ");
         dbg64_dec((uint64_t)i);
@@ -951,28 +1607,35 @@ int usb64_init64() {
         dbg64_str(low ? "low" : "full");
         dbg64_str(" reset ok");
         usb_log_end();
-        chosen = i;
-        break;                                             // 单设备：只认第一个
-    }
-    if (chosen < 0) {
-        g_state = USB64_ST_NO_DEVICE;
-        usb_selftest_log();
-        return -2;
-    }
 
-    // ---- 7) 枚举 + HID 引导协议 ----
-    if (usb_enumerate() != 0) {
-        usb_selftest_log();
-        return -3;
+        if (found >= USB64_MAX_DEV || next_addr > 0x7Fu) {
+            usb_log_begin();
+            dbg64_str("[USB64] port ");
+            dbg64_dec((uint64_t)i);
+            dbg64_str(" device skipped (device limit reached: this driver handles 1 keyboard + 1 storage)");
+            usb_log_end();
+            continue;
+        }
+        if (usb_enum_port(i, next_addr, low) == 0) { found++; next_addr++; }
     }
+    if (found == 0) {
+        g_state = any_connected ? USB64_ST_ENUM_FAILED : USB64_ST_NO_DEVICE;
+        if (!any_connected) {
+            // （"no device on port n" 已经在上面逐端口打过了）
+        }
+        usb_selftest_log();
+        return any_connected ? -3 : -2;
+    }
+    g_devices = found;
 
-    // ---- 8) 武装中断端点：从这一刻起按键会进 PS/2 同一条队列 ----
-    g_toggle = 0;
-    usb_arm_interrupt();
-    g_ready = true;
+    // ---- 7) ★ 批次 O：USB 存储（U 盘）探测：INQUIRY -> TUR -> READ CAPACITY -> READ(10) ----
+    //   位置：所有设备枚举完之后（这时地址/端点/配置都已经生效）。只读，不动盘上内容。
+    (void)usb64_msc_selftest64();          // 没插 U 盘时打 skipped；探测结果在这里打
+
+    // ---- 8) 状态：有键盘就当"ready"（HID 中断端点已武装）；只插 U 盘也算 ready ----
     g_state = USB64_ST_READY;
     usb_selftest_log();
-    return 0;
+    return g_hid_present ? 0 : -1;
 }
 
 // ==================== 只读接口 ====================
@@ -989,3 +1652,61 @@ int      usb64_ports64()       { return g_found ? g_ports : 0; }
 int      usb64_devices64()     { return g_devices; }
 uint64_t usb64_hid_reports64() { return g_hid_reports; }
 uint64_t usb64_key_events64()  { return g_key_events; }
+
+// ==================== USB 存储：对外只读接口（给 kernel/ata64.cpp 的驱动器号分派用）====================
+// 只有"探测全过（supported）"的 U 盘才算一块可用的块设备 —— 如实拒绝而不是给一个读必失败的盘。
+int usb64_msc_count64() { return (g_msc.present && g_msc.supported) ? 1 : 0; }
+
+// 型号 = "厂商 + 空格 + 型号"（已去尾空格）；sectors_512 = 总扇区数（按 512B 换算）
+bool usb64_msc_info64(int idx, char* model, int model_cap, uint64_t* sectors_512) {
+    if (idx != 0 || !g_msc.present || !g_msc.supported) return false;
+    if (model && model_cap > 0) {
+        int o = 0;
+        for (int i = 0; i < 8 && g_msc.vendor[i] && o < model_cap - 1; i++) model[o++] = g_msc.vendor[i];
+        if (o < model_cap - 1) model[o++] = ' ';
+        for (int i = 0; i < 16 && g_msc.product[i] && o < model_cap - 1; i++) model[o++] = g_msc.product[i];
+        model[o] = 0;
+    }
+    if (sectors_512) {
+        const uint64_t bytes = (uint64_t)g_msc.blocks * (uint64_t)g_msc.block_size;
+        *sectors_512 = bytes / 512u;
+    }
+    return true;
+}
+
+// 按 512B 扇区读（ata64 的语义）；一条 READ(10) 最多 8 个扇区（4KB），多了就自动分块。
+bool usb64_msc_read64(int idx, uint32_t lba, uint32_t count, void* buf) {
+    if (idx != 0 || !g_msc.present || !g_msc.supported) return false;
+    if (count == 0) return true;
+    uint8_t* p = (uint8_t*)buf;
+    for (uint32_t done = 0; done < count; ) {
+        uint32_t n = count - done;
+        if (n > USB64_MSC_MAX_SECTORS) n = USB64_MSC_MAX_SECTORS;
+        if (usb_msc_read10_64(lba + done, (uint16_t)n, p) != 0) return false;
+        done += n;
+        p += n * 512u;
+    }
+    return true;
+}
+
+int usb64_msc_selftest64() {
+    if (!g_msc.present) {
+        usb_log_begin();
+        dbg64_str("[USBST] selftest skipped (no storage device)");
+        usb_log_end();
+        return 0;                                   // 没插 U 盘 = 合法降级，不算失败
+    }
+    usb_msc_probe();
+    return (int)g_msc.selftest_mask;
+}
+
+const char* usb64_msc_last_reason64() {
+    switch (g_msc.last_reason) {
+    case 0:  return "ok";
+    case 1:  return "csw status";
+    case 2:  return "timeout";
+    case 3:  return "nak";
+    case 4:  return "block-size";
+    default: return "no-device";
+    }
+}

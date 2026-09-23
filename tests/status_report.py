@@ -888,9 +888,78 @@ def cap_usb_host():
     ev.append("降级证据：-usb 无键盘 -> \"[USB64] no device on port 1\" + "
               "\"[USB64] selftest skipped (no device)\"（桌面照常、PS/2 键盘照常）；"
               "不加 -usb -> \"[USB64] not found (no UHCI controller)\"，一律不变砖")
-    ev.append("范围外（未做）：EHCI(USB 2.0)/xHCI(USB 3.x) 主控未适配；USB 鼠标/存储/集线器未做"
-              "（只认直接插在根端口上的 HID 引导键盘）；低速设备路径未在仿真里验证")
+    ev.append("范围外（未做）：EHCI(USB 2.0)/xHCI(USB 3.x) 主控未适配；USB 鼠标/集线器未做"
+              "（只认直接插在根端口上的设备；USB 存储见下面单独的\"USB 存储\"能力项）；"
+              "低速设备路径未在仿真里验证")
     done = bool(not missing and regs and xfer and hid and marker and boot and thrd and bld and test)
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_usb_storage():
+    """★ 批次 O：USB 存储（U 盘只读，可从 U 盘拷应用）—— 完成。
+
+    范围（如实）：UHCI 上认出 U 盘（接口 Class=8 / SubClass=6 / Protocol=0x50 = BOT），取配置
+    描述符里两个**批量**端点（Bulk IN/OUT），做 BOT（CBW 签名 'USBC' / CSW 签名 'USBS'、Tag 回显、
+    dCSWDataResidue 校验）+ SCSI 只读子集：INQUIRY -> TEST UNIT READY ->（失败时 REQUEST SENSE
+    打点）-> READ CAPACITY(10) -> READ(10)。**只读**：没有 WRITE(10)，ata64_write 对 USB 驱动器号
+    **直接失败并打点**（不假装成功）。
+    接进磁盘抽象：ATA64_USB_BASE = 24 -> ata64_identify/ata64_read 分派到 usb64_msc_*，于是
+    drive64（盘符 D:/E:… 与只读标记）/fs64/fat64（FAT32 只读挂载）/explorer64（复制粘贴）一行都不用改。
+    不做（如实）：EHCI(USB2.0)/xHCI(USB3)、hub、拔出检测（热插拔）、写、分区表解析、
+    块大小 != 512 的盘（打点后不暴露成块设备）、安装目标（U 盘默认不选中且向导内核不链 USB 存储）。
+
+    证据绑这几个字符串（改名/挪文件必须同步这里）：
+      kernel/usb64.cpp 的 usb_bulk64() / usb_bot64() / [USBST] 打点 / usb_pa32()（物理地址换算 + DMA 暂存页）
+      kernel/ata64.{h,cpp} 的 ATA64_USB_BASE 分派与 write refused
+      kernel/kernel64.cpp 的"U 盘接入后重扫盘符"；kernel/setup64.cpp 的可移动盘标出 + 不默认选中
+      tests/usbstorage_test.py 端到端验收（99 条断言）；docs/screenshots/explorer_usbstick64.png
+    """
+    need = ["kernel/usb64.cpp", "kernel/usb64.h", "kernel/ata64.cpp", "kernel/ata64.h",
+            "tests/usbstorage_test.py", "docs/screenshots/explorer_usbstick64.png"]
+    missing = [f for f in need if not exists(f)]
+    ev = []
+    if missing:
+        ev.append("缺文件：%s" % ", ".join(missing))
+    bulk = grep_count(r"usb_bulk64|Bulk IN / Bulk OUT|TD_SPD|USB64_BULK_TIMEOUT_MS", ["kernel/usb64.cpp"])
+    bot = grep_count(r"BOT_CBW_SIG|BOT_CSW_SIG|static int usb_bot64|csw_residue", ["kernel/usb64.cpp"])
+    scsi = grep_count(r"usb_msc_inquiry64|usb_msc_capacity64|usb_msc_read10_64|usb_msc_log_sense64",
+                      ["kernel/usb64.cpp"])
+    marks = grep_count(r"\[USBST\] (iface found|inquiry|capacity|read |selftest)", ["kernel/usb64.cpp"])
+    disp = grep_count(r"ATA64_USB_BASE|usb64_msc_read64|usb64_msc_info64|write refused",
+                      ["kernel/ata64.cpp", "kernel/ata64.h"])
+    boot = grep_count(r"usb64_msc_count64|rescan drive letters", ["kernel/kernel64.cpp"])
+    setup = grep_count(r"ATA64_USB_BASE|可移动", ["kernel/setup64.cpp"])
+    test = exists("tests/usbstorage_test.py")
+    ev.append("kernel/usb64.cpp %d 行（含批量传输命中 %d、BOT/CBW/CSW 命中 %d、SCSI 子集命中 %d）："
+              "一次最多 64 包 4KB、DATA0/DATA1 逐包翻转、IN 方向短包即结束、NAK 由硬件按帧重试、"
+              "等待用 g_ticks64 有界超时（600ms）后 abort 整条链 —— 绝不挂死"
+              % (lines("kernel/usb64.cpp"), bulk, bot, scsi))
+    ev.append('串口打点 "[USBST] ..." 五类行命中 %d（iface found / inquiry / capacity / read ok|FAILED / '
+              'selftest）+ [USB64] 多设备（1 键盘 + 1 U 盘，地址 1/2）' % marks)
+    ev.append("磁盘抽象接入：ATA64_USB_BASE=24 分派命中 %d（ata64_identify 填 INQUIRY 型号 + "
+              "READ CAPACITY 容量；ata64_read 走 READ(10)；ata64_write 直接失败 + "
+              "[USBST] write refused）；kernel64.cpp 接入后重扫盘符命中 %d；"
+              "setup64.cpp 可移动盘标出/不默认选中命中 %d" % (disp, boot, setup))
+    ev.append("实测串口（tests/usbstorage_test.py，99 项全过、宿主侧逐字节核对）："
+              "[USBST] iface found class=08 sub=06 proto=50 ep_in=81 ep_out=02、"
+              "[USBST] inquiry vendor=QEMU product=QEMU HARDDISK、"
+              "[USBST] capacity blocks=72048 block_size=512 bytes=36888576 cap_mb=35、"
+              "[USBST] read lba=0 count=1 ok、[USBST] selftest PASS mask=0")
+    ev.append("端到端：U 盘（宿主侧造的 35MB 真 FAT32）-> [DRV64] letter=D: disk=24 part=1 fs=FAT32 "
+              "total_kb=34437 ro=1 -> 管理器里双击 D: 进入（items=4，含 VFAT 长名 USB-Readme-2026.txt）"
+              "-> 把 STICKELF.ELF(9664B) 与 STICKAPP.VAP(240B) 从 U 盘复制到 C:（paste ok n=1）"
+              "-> 关掉 QEMU 后宿主侧解析 C: 的 VimtuFS2 v3 卷，与 build64/hello.elf、hello.vap "
+              "**逐字节一致**；整根 U 盘镜像测试前后 CRC32 相同（没有任何写）")
+    ev.append("只读证据：终端 vol 把 D: 标成 ro=1、write/mkdir 失败；管理器里 Delete/Ctrl+V 被拒"
+              "（[UI] explorer roact op=delete|paste letter=D: fs=FAT32 ro=1 + paste ok n=0 skipped=1）")
+    ev.append("回归：键盘 + U 盘同时插（QEMU 上给存储显式指定 port=2）-> HID 键盘照常 "
+              "（[USB64] config set … hid=1 ep_in=81 mps=8 + 引导协议 + 自检 PASS），"
+              "U 盘也照常（capacity/read/selftest PASS），两台设备各拿一个地址")
+    ev.append("范围外（如实）：EHCI(USB 2.0)/xHCI(USB 3.x) 未适配（机器上只有 EHCI 时打 not found "
+              "后优雅退出）；没有 WRITE(10)（U 盘只读）；没有拔出检测（热插拔）；"
+              "hub 后面的设备认不出来（QEMU 不给 port=2 时会把第二个设备挂到隐式 hub 后面）；"
+              "块大小 != 512 的盘如实拒绝；文件拷贝走『只读 FAT32 -> 可写 VimtuFS2』这一条通路")
+    done = bool(not missing and bulk and bot and scsi and marks and disp and boot and setup and test)
     return ("DONE" if done else "PARTIAL"), ev
 
 
@@ -1308,6 +1377,7 @@ CAPS = [
     ("驱动", "ACPI 解析（RSDP→RSDT/XSDT→FADT/MADT/HPET/MCFG）", cap_acpi_parse),
     ("驱动", "网络（e1000 + ARP/ICMP）", cap_network),
     ("驱动", "USB 主机", cap_usb_host),
+    ("存储", "★ USB 存储（U 盘只读，可从 U 盘拷应用）", cap_usb_storage),
     ("内核", "APIC 启用", cap_apic_enable),
     ("内核", "SMP（启动 AP）", cap_smp_ap),
 ]
@@ -1340,6 +1410,9 @@ TESTS = [
     ("sched_stress_test.py", "调度器压力：创建→运行→退出→回收 200 轮 + 待切换帧校验（kstress）"),
     ("proc64_test.py", "进程/地址空间：每进程 CR3 + fork/execve/wait4/kill（BIOS 隔离 + UEFI 如实降级）"),
     ("usb64_test.py", "USB 主机：UHCI + HID 引导键盘（sendkey -> 桌面响应）+ 两种降级"),
+    ("usbstorage_test.py", "★ 批次 O USB 存储（U 盘只读）：BOT+SCSI（INQUIRY/READ CAPACITY/READ(10)）"
+                           "-> 驱动器号 24 -> 盘符 D: -> 管理器浏览 + 从 U 盘拷 .vap/.elf 到 C:"
+                           "（宿主侧逐字节核对）+ 写被拒 + 键盘与 U 盘同时插（99 条断言）"),
     ("preload_update_test.py", "预加载 + 更新：字形/图标预热实测 + update 标记->应用->store/done->重启闭环"),
     ("tmgr_proc_test.py", "任务管理器进程页 = proc64 真进程：真进程行 + kill(SIGKILL) 端到端（键盘注入）"),
     ("display_runtime_test.py", "运行期显示层：模式清单 + 0x3DA 实测/如实降级 + EDID 对比 + DDC 未实现说明"),

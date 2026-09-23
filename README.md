@@ -7,15 +7,15 @@
 全部是本工程自己的 C++ / 汇编代码。
 它自带一张"三合一"安装盘（BIOS 光盘 / U 盘 / UEFI），安装界面与步骤照 Windows 10 做（去掉了输入产品密钥那一步）。
 
-> 版本 **0.2.0-beta.5** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
-> 状态（权威判据：`python tests/status_report.py`）：**完成 42 / 部分 0 / 未做 1（共 43 项能力）**，
+> 版本 **0.2.3-beta11** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
+> 状态（权威判据：`python tests/status_report.py`）：**完成 43 / 部分 0 / 未做 1（共 44 项能力）**，
 > 唯一未做项是 **Rust 参与实现（可选要求，本机未装 Rust 工具链）**。
-> 全量验收（`--full` + 专项/扩展脚本）：**33 个断言脚本全部 PASS**（本批次实测；上一批断言保持全过，
-> 本批次新增 **bootlog64_test（开机滚屏引导控制台：串口打点/像素/vram 直读滚动证据/按键跳过/dmesg/冷启动开关）30 条断言**；
-> 上一批的 **fileops64_test 95 条断言** 保持全过；
-> vfs64 自检新增 rename 用例、explorer64 自检新增名字/后缀/多选位图用例；
-> multivol64(108)/explorer64(71)/fs_tree(84)/fs_term(32)/fd64(34)/store64(46)/
-> app64(31)/elf64(56)/proc64(67)/sysstate64(100) 等既有脚本保持绿）。
+> 全量验收（`--full` + 专项/扩展脚本）：**34 个断言脚本全部 PASS**（本批次实测；上一批断言保持全过，
+> 本批次新增 **usbstorage_test（USB 存储 / U 盘：BOT+SCSI 只读 + 盘符 + 管理器浏览 + 从 U 盘拷 .vap/.elf
+> 到 C: 宿主侧逐字节核对 + 写被拒 + 键盘与 U 盘同时插）99 条断言**；
+> 上一批的 **bootlog64_test 30 条断言**、**fileops64_test 95 条断言** 保持全过；
+> multivol64(108)/explorer64(71)/fatread64(61)/fs_tree(85)/fs_term(32)/fd64(34)/store64(46)/
+> app64(31)/elf64(56)/proc64(67)/sysstate64/boot64_assert 等既有脚本保持绿）。
 
 ---
 
@@ -24,6 +24,7 @@
 | 能力 | 说明 |
 | **★ 开机滚屏引导控制台（boot console + dmesg，本批次新增）** | `console64.{h,cpp}`：`dbg64_putc()`（串口/调试口**唯一出口**）加一个 `dbg64_set_sink64()` 钩子，**既有打点一行都不用改**就镜像进 **16 KiB 环形缓冲**（含每条打点的 tick；行内上限 160 字符、超出截断；环形满丢最旧并计数，头部保留 16 行永不丢）→ `fb_init`/`font_init` 之后、**进向导/桌面之前**把这次启动真的跑出来的日志**整屏回放**（黑底 + 终端等宽面 Sarasa Mono + 行首 Linux 风格时间戳 `[    0.123]`，`FAIL/PANIC` 红、`WARN` 黄、其余浅灰；行满整体上移、只提交脏区）→ 有界停留（1200 tick-ms）或**按任意键立即进桌面** → 终端 `dmesg` 回看（头部保留 + 环形缓冲，串口打 `[CON64] dmesg[i]` 证据）→ `boot verbose on|off` 把开关持久化到 config64/store64（下次冷启动不再回放）。打点 `[CON64] ring init|screen ready|replay|live|skip key|selftest|dmesg|boot verbose`；端到端 `tests/bootlog64_test.py`（30 条断言：串口打点 + 黑底像素 + 行间距 + **直读 vram 的滚动证据** + 按键跳过 + dmesg 早期行 + 冷启动 verbose=0 不回放），截图 `docs/screenshots/bootlog64.png` |
 | **★ 文件操作：右键菜单 / 复制 / 剪切 / 粘贴 / 重命名 / 删除 / 新建文件夹 / 多选（本批次新增）** | `explorer64.cpp` + `vfs64_rename64`：**右键菜单**（条目：打开/复制/剪切/重命名/删除/属性；空白：新建文件夹/粘贴/刷新/属性；hover 高亮、置灰、Esc/点外部关闭）；**多选**（单击、Ctrl 加选、Shift 范围选、**空白拖动框选**（浅蓝矩形，内核无 alpha 混合故用实色近似）、Ctrl+A 全选、Esc 取消）；**内核内剪贴板**（最多 8 条 `(卷槽, 完整路径)` + 复制/剪切）→ 粘贴：文件**分块复制**（64 KiB/块；单文件 ≤8 MiB，v2 旧卷 67584 B）、**目录递归复制**（深度 ≤4、整棵 ≤96 条，超限如实计入 `skipped`）、**跨卷 C:↔D: 真能粘贴**（源用 `vfs64_*_on64(源槽)` 读、目标按界面盘符写）；**重名策略：自动追加 `(2)`、`(3)`…**（插在扩展名之前；**不带空格** —— VimtuFS2 名字只允许 `0x21..0x7E`，空格不合法）；**剪切 = 复制成功后删源**（先全部复制成功再删，绝不半删）；**重命名**（F2 / 菜单 → 内联编辑，重名一律拒绝）；**删除**（Delete / 菜单 → **两段式确认**：状态栏提示"再按一次 Delete 确认删除（10 秒内有效）"；**非空目录明确提示"目录非空，暂不支持递归删除"**，绝不假装成功）；**属性**（小面板 + 打点：名称/类型/大小/修改日期/所在卷）；**工具栏 6 个按钮**（新建文件夹/复制/剪切/粘贴/重命名/删除，无选中或剪贴板为空时置灰）；**快捷键** Delete / F2 / Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+A / Esc。打点 `[UI] explorer ctxmenu|clip|paste|rename|delete|mkdir|sel|props …`；端到端 `tests/fileops64_test.py`（95 项：像素 + 串口 + 鼠标/键盘注入 + 宿主侧解析 D: 卷字节；双击/框选注入有界重试） |
+| **★ USB 存储（U 盘只读，可从 U 盘拷应用；本批次新增）** | `usb64.cpp` 在 UHCI 上认 **USB Mass Storage（Class=08 / SubClass=06 / Protocol=0x50 = Bulk-Only Transport）**：取配置描述符里两个**批量**端点 → **批量传输**（一包一个 TD、最多 64 包 4KB、DATA0/DATA1 逐包翻转、IN 方向**短包即结束**、NAK 由硬件按帧重试、等待用 `g_ticks64` **有界超时**后 abort 整条链）→ **BOT**（CBW 签名 `'USBC'` / CSW 签名 `'USBS'` + Tag 回显 + `dCSWDataResidue` 校验）→ **SCSI 只读子集** `INQUIRY` / `TEST UNIT READY` / `REQUEST SENSE`（出错时打 key/asc/ascq）/ `READ CAPACITY(10)`（块数 + 块大小 → MB/GB 换算打点）/ **`READ(10)`**。摸到的盘**接到既有磁盘抽象**：驱动器号 `ATA64_USB_BASE = 24` → `ata64_identify`（型号取 INQUIRY、容量取 READ CAPACITY）/ `ata64_read`（走 READ(10)），于是 `drive64` 盘符（U 盘就是 `D:`，容量/可用/`ro=1` 由现有代码算）、`fs64`/`fat64`（FAT32 **只读**挂载）、`explorer64`（浏览 + **Ctrl+C/Ctrl+V 把文件从 U 盘拷进 C:**）**一行都不用改**。**只读**：没有 `WRITE(10)`，`ata64_write` 对 USB 驱动器号直接失败并打 `[USBST] write refused`（不假装成功）。打点 `[USBST] iface found|inquiry|capacity|read lba=.. ok|read FAILED reason=..|selftest PASS/FAIL mask=|write refused`；端到端 `tests/usbstorage_test.py`（99 条断言：串口 + 像素 + monitor 键鼠注入 + **宿主侧解析 C: 的 VimtuFS2 卷与 `build64/hello.elf`、`hello.vap` 逐字节比对** + 整根 U 盘镜像 CRC32 前后不变），截图 `docs/screenshots/explorer_usbstick64.png` |
 |---|---|
 | **四种引导方式 + 装好的盘双固件** | BIOS 光盘（El Torito）、U 盘 / 硬盘（hybrid MBR）、裸盘（MBR→loader→ATA）、**UEFI 自动引导**（自研 PE 桩 + 平铺长模式引导器）。QEMU 与 VMware、BIOS 与 UEFI 四种组合全部实测通过；**"ISO 当 U 盘"形态在 OVMF（UEFI）与 SeaBIOS（BIOS）下也都进安装向导**（`tests/usb_boot_both_fw_test.py` 四档）；装好的盘在 UEFI 与 BIOS 下都能启动（`tests/esp_install_test.py`） |
 | **现代磁盘结构（安装盘 + 目标盘都有）** | 自写 GPT（工具链的 xorriso 不生 GPT）与 MBR 双兼容；**FAT32 ESP 也是自写的**（这台机器没有 mkfs.fat/mtools）：48MB 卷、簇数 96736（真 FAT32 的硬下限是 65525 簇）、FSInfo + 备份引导扇区齐全。**安装时会往目标盘写混合 MBR + 盘尾 GPT + 48MB FAT32 ESP**（内核实现在 `kernel/fat64.{h,cpp}`，卷参数与构建期 `tools/make_esp.py` 逐条对齐），ESP 里放 `EFI/BOOT/BOOTX64.EFI` + `UEFI64.BIN` + `KERNEL64.BIN` |
@@ -62,7 +63,7 @@
 | ⚠️ **VFS 的限制（v3 目录树已落地，仍有边界）** | 支持多级路径 `/dir/sub/file`（`.`/`..`、大小写敏感）；**名字 ≤31B**、**inode 总数 ≤512**、**路径 ≤128B / 16 段**、**目录深度 16**；目录删除只支持 `rmdir` **空目录**（非空必须先清空）；**单文件 ≤8 MiB**（批次 M：二级间接块 128×128 块；v2 旧卷仍 67584B）；无权限/属主、无硬链接/符号链接、无稀疏文件。v2 旧卷仍能挂载（按单层语义）。**多卷**：最多 4 个可浏览卷同时挂载（系统卷 `C:` + `D:/E:/F:`），第 5 个起如实拒绝（`reason=voltable-full`）；终端 `vol` 切当前卷、`df` 列所有卷。终端 `ls/cat/write/touch/rm/mkdir/df` 与 ring3 的 `open/read/write/close` 都走 `kernel/fd64.cpp` 的 FD 层直连 VimtuFS2（终端命令的多级路径也已支持；**终端帮助与错误文案已改写成多级路径口径**，文件管理器 UI 也已落地（见上表））。终端另有 `fdtest`（独立游标/dup 共享/O_APPEND/pipe/fork 继承一键演示）。**FAT32 只读浏览的边界**：只读（写/删/改名/建目录/粘贴一律 `-FS64_EROFS` 拒绝）；扇区固定 512B、每簇扇区数按 BPB（1..128，U 盘常见 8=4KB/簇）；可用空间取**挂载时 FSInfo 快照**（不实时刷新，FSInfo 无效则标 unknown）；LFN 上限为 256B 缓冲内的 UTF-16 码元；无碎片整理/无删除项复用 |
 | ⚠️ **设置页接线范围** | 显示/会话分区已接 `config64`/`session64`（真落 store64，跨重启保留）；系统/关于页是只读实测值（设备规格来自 hwinfo64/display64/net64/usb64） |
 | ⚠️ **没有 TCP/IP / DHCP / DNS** | 网络只有 IPv4 + ARP + ICMP echo（e1000 轮询收发，无中断收包）；UDP/TCP、路由、DHCP、DNS 都没有；只适配 e1000，VMware 的 vmxnet3 未适配 |
-| ⚠️ **USB 只有 UHCI + HID 引导键盘** | 没有 EHCI(USB 2.0) / xHCI(USB 3.x)，没有 USB 鼠标、U 盘、集线器；只认直接插在根端口上的键盘；不接中断（由 `kusb` 线程轮询） |
+| ⚠️ **USB：UHCI 只读 U 盘 + HID 键盘，没有 EHCI/xHCI/USB3** | 主控只有 UHCI（USB 1.1）：没有 EHCI(USB 2.0) / xHCI(USB 3.x)（机器上只有 EHCI 时打 `[USB64] not found` 后优雅退出）；**U 盘只读**（没有 `WRITE(10)`，`write`/`mkdir`/粘贴一律被拒）、**没有分区表解析**（分区表由上层 `part64`/`drive64` 读，本模块只提供"按扇区读"）、**没有拔出检测（热插拔）**；**hub 后面的设备认不出来**（QEMU 不给显式端口时会把第二个设备挂到一个隐式 hub 后面）；一次最多 2 台设备（1 键盘 + 1 U 盘，各拿一个地址）；块大小 ≠ 512 的盘如实拒绝（打点后不暴露成块设备）；USB 鼠标未做；不接中断（由 `kusb` 线程轮询 + 传输自旋锁互斥） |
 | ⚠️ **AP 只是停着** | SMP 能启动 AP 并让它报在线，但**没有多核调度**（调度器仍单核、IRQ0 只在 BSP）、没有 IPI、没有 per-CPU 数据/GDT/TSS，AP 自己的 LAPIC/中断不参与 |
 | ⚠️ **ACPI/APIC 覆盖有限** | 只解析 RSDP/RSDT/XSDT/FADT/MADT/HPET/MCFG；关机仍走 ACPI 端口 0x604 + 8042 回退链；x2APIC 未适配；固件页表没映射 LAPIC/IOAPIC 的机器会留在 PIC |
 | ✅ **SATA/AHCI 盘可直启（引导层已改 BIOS INT 13h）** | 引导层（`boot/loader64.asm`）的**磁盘启动路径**读内核不再用自写 PATA PIO，改走 **BIOS INT 13h 扩展读（AH=0x42 + DAP）**：驱动器号用固件传进来的 `DL`，分块 64 扇区（32KB、不跨 64KB 边界）读进低内存暂存区 `0x20000`，每批再进一次保护模式搬到 `0x100000`；失败复位磁盘重试 3 次后打 `[LM] int13 read FAILED ah=… lba=… retry=…` 并停机（不静默失败）。**BIOS 不需要把 SATA 设成 IDE 兼容模式** —— QEMU 上"只把装好的盘挂 `ich9-ahci` 启动"已进桌面（`tests/disk_boot_test.py`：`[LM] disk boot via INT 13h dl=0x80` → `[OS] booted from installed disk` → `[GUI64] ready`）；真机仍待复验。磁盘级 IDENTIFY/读写也已在 `--strict-dma` 档 PASS（item 5b 修好命令头布局） |
@@ -179,9 +180,9 @@ bash build64.sh
 | 文件 | 大小 | 说明 |
 |---|---|---|
 | `vimtu64-64.iso` | 56.2 MB | **三合一安装盘**：BIOS 光盘 + 可写 U 盘 + UEFI |
-| `vimtu64-64.img` | 8.3 MB | 安装介质裸盘（把一个 8MB 镜像直接当硬盘用） |
-| `build64/kernel64.bin` | 1.89 MB | 安装程序内核（1,980,680 B；含 ATA/AHCI/**NVMe** 驱动、分区/安装引擎、FAT32 ESP 写入器） |
-| `build64/kernel64_os.bin` | 2.80 MB | 装进硬盘的系统内核（2,797,944 B；调度器/VFS/store/ring3/网络/USB/AHCI/**NVMe**/文件管理器 + **文件操作** 都在这里） |
+| `vimtu64-64.img` | 7.9 MB | 安装介质裸盘（把一个 7.9MB 镜像直接当硬盘用；实际 8,328,192 B） |
+| `build64/kernel64.bin` | 2.06 MB | 安装程序内核（2,160,528 B；含 ATA/AHCI/**NVMe** 驱动、分区/安装引擎、FAT32 ESP 写入器） |
+| `build64/kernel64_os.bin` | 2.85 MB | 装进硬盘的系统内核（2,984,976 B；调度器/VFS/store/ring3/网络/USB（含 **USB 存储/U 盘只读**）/AHCI/**NVMe**/文件管理器 + **文件操作** 都在这里；硬上限 4,096,000 B） |
 | `build64/BOOTX64.EFI` / `UEFI64.BIN` | 2.5 KB / 36 KB | UEFI 两段式引导 |
 | `build64/esp.img` | 48 MB | 手写 FAT32 ESP（96736 簇，>= 65525） |
 
@@ -238,7 +239,14 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 
 ## 六、工程质量（这个项目最值得说的部分）
 
-* **28 个断言脚本全部 PASS**（2026-09-19 实测；上一批的断言保持全过 + 本批次新增 51 条）。`--full` 覆盖 22 个脚本 / **613 条断言**：
+* **34 个断言脚本全部 PASS**（2026-09-23 实测：本批次（O：USB 存储）新增 `usbstorage_test.py` **99 条断言**，
+  并逐脚本复跑既有脚本 —— `usb64_test` 51、`fatread64_test` 61、`explorer64_test` 71、`fileops64_test` 95、
+  `multivol64_test` 108、`fs_tree_test` 85、`bootlog64_test` 30、`boot64_assert`、`desktop64_test`、
+  `install_flow_test`、`partition_ops_test`、`esp_install_test`、`disk_boot_test`、`iso64_install_test`、
+  `iso64_usb_test`(ata/usb)、`usb_boot_both_fw_test`、`uefi64_install_test`、`vmware_install_test`、
+  `nvme64_test`、`ahci64_test`(--strict-dma --sata-install)、`app64_test`、`elf64_test`、`proc64_test`、
+  `sysstate64_test`、`ui_extra64_test`、`fs_term_test`、`fd64_test`、`store64_test`、`bigfile64_test` 全部 PASS）。
+  `--full` 覆盖的脚本与断言数（历史上的一批固定脚本）：
 
   | 脚本 | 断言 | 脚本 | 断言 |
   |---|---|---|---|
@@ -296,6 +304,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | M13 | **ACPI 解析 + APIC 接管 + SMP 启动 AP**（均有优雅降级） | ✅ |
 | M14 | **网络（e1000 + ARP/ICMP）与 USB 主机（UHCI + HID 键盘）** | ✅ |
 | M15 | **NVMe 驱动（item 6）**：PCI `0x010802` + BAR0(64 位 MMIO) + admin/I-O 队列 + 轮询 PRP 读写 → **驱动器号 `16..`**（上层零改动）→ 可装到 NVMe 盘、**UEFI 从这块盘启动进桌面** | ✅ |
+| M16 | **USB 存储（U 盘只读，批次 O）**：UHCI 上认 Mass Storage BOT（Class=08/SubClass=06/Protocol=0x50）→ 批量传输（TD 链 + toggle + 短包 + 有界超时）→ CBW/CSW + SCSI `INQUIRY`/`READ CAPACITY(10)`/`READ(10)` → **驱动器号 `24..`**（`drive64`/`fat64`/`explorer64` 零改动）→ U 盘 FAT32 只读浏览 + **把 .vap/.elf 从 U 盘拷进 C:**（宿主侧逐字节核对） | ✅ |
 
 ## 八、路线图（未完成的部分）
 
@@ -307,7 +316,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | ② | **glibc 级兼容** | 只验证过自有静态 ELF64 | TLS(FS.base) 真生效、信号投递、vDSO、futex、动态链接与重定位；毕业考试是"静态 busybox 起 shell" |
 | ③ | **VFS 补齐** | ~~单层路径~~（v3 已支持多级目录树 + 空目录删除 + mtime/类型判定）；仍缺：权限/属主、宿主机拷文件工具、FAT 浏览、文件管理器 UI（**本批次已完成**：explorer64.cpp + 	ests/explorer64_test.py 71 项） | FAT 只读浏览 + 更大单文件 + 复制/粘贴/重命名等文件操作 |
 | ④ | **TCP/IP** | 只有 IPv4/ARP/ICMP、静态地址、无中断收包 | DHCP/DNS/UDP/TCP；vmware vmxnet3 适配 |
-| ⑤ | **EHCI / xHCI / USB 存储 / 集线器 / 鼠标** | 只有 UHCI + 根端口 HID 引导键盘 | U 盘、鼠标、带 hub 的真机 |
+| ⑤ | **EHCI / xHCI / 集线器 / 鼠标 / U 盘写** | UHCI（USB 1.1）已能驱动 **HID 引导键盘 + U 盘（只读）**（批次 O）；仍缺：EHCI(USB 2.0)/xHCI(USB 3.x)、hub、USB 鼠标、**U 盘写（`WRITE(10)`）**、拔出检测（热插拔） | 更快的 U 盘、鼠标、带 hub 的真机、往 U 盘写文件 |
 | ⑥ | **多核调度** | AP 起来后只是 `cli; hlt`；无 IPI、无 per-CPU 数据 | 真 SMP：AP 参与调度与中断；x2APIC |
 | ⑦ | **设置页接 store** | store 本体可用，设置页/启动项未接线 | 分辨率/缩放/窗口位置能真的保存 |
 | ⑧ | **真机验证** | 只在 QEMU + VMware 验证过 | 真机驱动覆盖（ACPI 变体、EHCI/xHCI、网卡）与稳定性 |

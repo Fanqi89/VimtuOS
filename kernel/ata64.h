@@ -17,20 +17,24 @@
 //   8..(8+N-1)    = AHCI 上第 1..N 块 **ATA 盘**（N = ahci64_count64()；AHCI 端口按端口号升序编号）
 //   4..7          = 保留空洞（不映射任何设备）—— 旧代码里的"0..3 循环"必须改成下面的槽位接口
 //   16..(16+M-1)  = NVMe 第 1..M 个**命名空间**（M = nvme64_count64()；见 kernel/nvme64.h）
-// 上层（setup64 / part64 / vfs64 / store64）拿到的驱动器号就是上面这套编号，读写/识别全部由
-// 本文件的 ata64_* 内部**分派**：≥ ATA64_NVME_BASE 转 nvme64_*，≥ ATA64_AHCI_BASE 转 ahci64_*，
-// 其余走 PATA。
+//   24..          = ★ 批次 O：USB 存储（U 盘，最多 1 个，Bulk-Only Transport + SCSI **只读**）
+// 上层（setup64 / part64 / vfs64 / store64 / drive64 / fs64 / fat64）拿到的驱动器号就是上面这套编号，
+// 读写/识别全部由本文件的 ata64_* 内部**分派**：≥ ATA64_USB_BASE 转 usb64_*，
+// ≥ ATA64_NVME_BASE 转 nvme64_*，≥ ATA64_AHCI_BASE 转 ahci64_*，其余走 PATA。
 // 为什么要留空洞而不是紧接着 4 号：AHCI 盘的编号一旦与 PATA 混在一起，将来加第三类控制器
-// （NVMe 之类）就会漂；留一段固定基址，编号=接口类型，分区表/安装逻辑里写下的号永远可解释。
+// （NVMe / USB 之类）就会漂；留一段固定基址，编号=接口类型，分区表/安装逻辑里写下的号永远可解释。
 static const int ATA64_AHCI_BASE = 8;
 static const int ATA64_NVME_BASE = 16;
+static const int ATA64_USB_BASE  = 24;      // ★ 批次 O：USB 存储（U 盘）
 // 按驱动器号开数组的调用点（setup64.cpp 的磁盘表）用这个"最大驱动器号 + 1"：
-//   NVMe 侧上限= 8 个命名空间（与 kernel/nvme64.h 的 NVME64_MAX_NS 一致）。
-static const int ATA64_MAX_DRIVE64 = ATA64_NVME_BASE + 8;
+//   NVMe 侧上限 = 8 个命名空间（与 kernel/nvme64.h 的 NVME64_MAX_NS 一致）；
+//   USB 侧上限 = 1 个 U 盘（USB64_MAX_DEV 里只留一个存储角色，见 kernel/usb64.h）。
+static const int ATA64_USB_MAX_DEVS = 1;
+static const int ATA64_MAX_DRIVE64 = ATA64_USB_BASE + ATA64_USB_MAX_DEVS;
 
 // 枚举接口（**新代码用它，不要自己写 for (d=0; d<4; d++)**）：
-//   ata64_drive_count64()   = 4 + AHCI 盘数 + NVMe 命名空间数（即"有几个可枚举的槽"）
-//   ata64_slot_to_drive64(i)= 第 i 个槽的驱动器号（0,1,2,3,8,9,...,16,...；i 越界返回 -1）
+//   ata64_drive_count64()   = 4 + AHCI 盘数 + NVMe 命名空间数 + USB 存储数（即"有几个可枚举的槽"）
+//   ata64_slot_to_drive64(i)= 第 i 个槽的驱动器号（0,1,2,3,8,9,...,16,...,24；i 越界返回 -1）
 int ata64_drive_count64();
 int ata64_slot_to_drive64(int slot);
 
@@ -42,15 +46,20 @@ struct DiskInfo {
 };
 
 // drive: 0=primary master, 1=primary slave, 2=secondary master, 3=secondary slave,
-//        8..=AHCI 盘、16..=NVMe 命名空间（见上面的统一驱动器号说明）；4..7 是保留空洞，调用必失败。
+//        8..=AHCI 盘、16..=NVMe 命名空间、24..=USB 存储（见上面的统一驱动器号说明）；
+//        4..7 是保留空洞，调用必失败。
 bool ata64_identify(int drive, DiskInfo* out);
 
 // 读写：PATA 侧 LBA28、count **任意**（内部按 ≤128 扇区分块 + 每块最多 3 次重试 —— ATA 的
 //   扇区计数寄存器只有 8 位，一条命令 >255 个扇区会被设备静默截断；见 ata64.cpp 的总说明）；
 //   AHCI 侧 LBA48、count ≤ 65536（按 128 扇区分块）；NVMe 侧 count 任意（按 128 扇区分块）。
-//   驱动器号分派：≥ ATA64_NVME_BASE 走 nvme64_*，≥ ATA64_AHCI_BASE 走 ahci64_*。返回 false 表示出错。
+//   驱动器号分派：≥ ATA64_USB_BASE 走 usb64_msc_*（**只读**）、≥ ATA64_NVME_BASE 走 nvme64_*、
+//   ≥ ATA64_AHCI_BASE 走 ahci64_*。返回 false 表示出错。
 bool ata64_read (int drive, uint32_t lba, uint32_t count, void* buf);
+// ★ 批次 O：USB 存储**本批只读** —— ata64_write() 对 USB 驱动器号**直接返回 false** 并打点
+//   （不假装成功：否则上层会以为文件写进去了）。
 bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf);
+
 
 // ---------------- ATAPI（光驱）：PACKET 命令 + PIO 读 ----------------
 // 为什么需要它：64 位安装介质的正确形态是 **ISO**（光盘/U 盘/虚拟机光驱），

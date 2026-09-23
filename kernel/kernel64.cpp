@@ -494,6 +494,24 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
     //   只打点并返回负值，系统照常启动、桌面照常工作（自检按 skipped 处理，不算失败）。
     // 运行期轮询由 kusb 内核线程负责（见 kernel/task64.cpp），不占用这里的执行流。
     (void)usb64_init64();
+    // ---- ★ 批次 O：USB 存储（U 盘）接进来之后**重扫盘符表** ----
+    // 为什么必须重扫：drive64_scan64() 上面（vfs64 挂载成功那条路径）已经跑过一次，那时 USB
+    //   存储还没枚举（usb64_init64 排在 net64 之后）。重扫会把 U 盘上的 FAT32/VimtuFS2 卷按现有
+    //   规则识别 -> 只读挂载 -> 分配盘符（D:/E:…），容量/可用/只读标记全部由现有代码算出来。
+    // 幂等性：drive64_scan64() 对同一块盘/同一个卷复用已有的 vfs64 槽与 fs64 卷号（见其注释），
+    //   所以重扫不会动 C: 的盘符、也不会把卷表撑爆；**没插 U 盘时整段跳过**（行为与改动前一致）。
+    if (usb64_msc_count64() > 0) {
+        dbg64_line_begin64();
+        dbg64_str("[USBST] storage attached -> rescan drive letters (usb drives=");
+        dbg64_dec((uint64_t)usb64_msc_count64());
+        dbg64_str(")\n");
+        dbg64_line_end64();
+        (void)drive64_scan64();
+        drive64_dump64();
+        (void)drive64_selftest64();
+    }
+    // 运行期轮询由 kusb 内核线程负责（见 kernel/task64.cpp），不占用这里的执行流。
+    // （上面那行 usb64_init64() 的注释见下：找不到主控/没插设备只打点，系统照常启动。）
     // ---- 批次 A 后半：update 标记检查 + preload 预热（都在进桌面之前）----
     // 顺序：update 先查（有 pending 会应用 -> store/ring log -> /update.done -> 自动软重启，不返回）；
     //       没有 pending 就照常往下走，然后 preload 预热字形/图标（打点带 rdtsc64 实测证据）。
