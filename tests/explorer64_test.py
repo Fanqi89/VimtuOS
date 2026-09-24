@@ -253,6 +253,27 @@ class Vm:
         fst.kill(self.proc)
 
 
+def settle_frames(vm, since, n=2, timeout=20):
+    """等外壳至少跑过 n 个"每秒重画"周期再截图。
+
+    为什么需要：外壳每秒都会把 explorer 整窗标脏重画（gui64_run 的每秒脏矩形），
+    而点击回调的打点（[UI] explorer click/nav/view=…）发生在**重画之前**。
+    旧视觉一帧很轻，截图大体能等到重画；本批（Windows 11 外观：玻璃/阴影）一帧更重，
+    截图会抢在重画之前拿到上一屏 —— 这里用"时钟打点条数"当帧循环的见证，
+    保证内容区已经按当前状态重画过一次，再截图。**不改任何像素判据。**
+    """
+    t0 = time.time()
+    base = vm.log()[since:].count("[UI] clock text=")
+    while time.time() - t0 < timeout:
+        if vm.log()[since:].count("[UI] clock text=") >= base + n:
+            time.sleep(0.4)          # 再留半帧给 flip
+            return True
+        if vm.proc.poll() is not None:
+            return False
+        time.sleep(0.3)
+    return False
+
+
 # ==================== 鼠标闭环（用 explorer 自己的点击打点定位）====================
 # 为什么这么做：QEMU monitor 只能发"相对位移包"，guest 侧 PS/2 驱动按包限速（实测每包 ~24px，
 # 且残余位移会继续跟着后续包走）。盲走会累积误差，所以这里用资源管理器自己打的
@@ -632,6 +653,7 @@ def main():
             p0 = click_once(vm, mon)         # 多探几次把停车残余排空（park 会留 -72 的累加器）
         check("标定后回到起点 (0,0)", p0 is not None and p0[0] <= 40 and p0[1] <= 40, str(p0))
         tx, ty = card_center(idx_c)
+        since_icons = len(vm.log())
         hit_ok, det = aim_click(vm, mon, tx, ty, "card:%d" % idx_c, label="C: 卡片")
         check("双击 C: 卡片（精确移动 + 双击）", hit_ok, det)
         nlog = vm.log()
@@ -648,6 +670,8 @@ def main():
         idx_apps = int(mdir.group(1)) if mdir else -1
         idx_elf = int(mel.group(1)) if mel else -1
 
+        # 等外壳按新状态（C: 图标视图）把内容区重画过再截图 —— 见 settle_frames 的说明
+        settle_frames(vm, since_icons)
         shot2 = os.path.join(tmp, "drive_icons.ppm")
         check("图标视图截图", mon.shot(shot2))
         if os.path.exists(shot2):
@@ -721,11 +745,14 @@ def main():
               vm.log().count("[UI] explorer view=") > view_before)
         # 重新进 C: 根目录（面包屑 -> 此电脑 -> 双击卡片），在详细信息视图下看四列
         tx, ty = card_center(idx_c)
+        since_details = len(vm.log())
         hit_ok, det = aim_click(vm, mon, tx, ty, "card:%d" % idx_c, label="C: 卡片（details）")
         check("详细信息视图下再进 C:（精确移动 + 双击）", hit_ok, det)
         vlog = fst.wait_for(serial, "view=details", 20, vm.proc)
         mvd = re.findall(r"\[UI\] explorer nav path=/ items=(\d+) view=details", vlog)
         check("详细信息视图的 nav 打点（view=details items=<n>）", bool(mvd), mvd[-1] if mvd else "（缺行）")
+        # 同上：先等外壳把"详细信息视图"这一屏重画过，再截图
+        settle_frames(vm, since_details)
         shot3 = os.path.join(tmp, "details.ppm")
         check("详细信息视图截图", mon.shot(shot3))
         det_px = read_ppm(shot3) if os.path.exists(shot3) else None

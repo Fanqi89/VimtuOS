@@ -35,13 +35,18 @@ static inline int cc_r(uint32_t c) { return (int)((c >> 16) & 0xFF); }
 static inline int cc_g(uint32_t c) { return (int)((c >> 8) & 0xFF); }
 static inline int cc_b(uint32_t c) { return (int)(c & 0xFF); }
 
+// ★ 性能关键：每像素混合里**不能有除法**（QEMU TCG 下整数除要几十个周期；双层阴影 + 毛玻璃
+//   每帧要混合十几万像素，用 /255 会把一帧拖到几百毫秒，进而把看门狗/宿主验收的时序拖崩）。
+//   v/255 用 (v*257+128)>>16 近似：对 0..65535 的 v 误差 <= 1 级，肉眼与验收都无差。
+static inline int div255_64(int v) { return (v * 257 + 128) >> 16; }
+
 static inline uint32_t blend_c64(uint32_t dst, uint32_t c, int a) {
     if (a >= 255) return c & 0x00FFFFFF;
     if (a <= 0) return dst;
     const int ia = 255 - a;
-    const int r = (cc_r(c) * a + cc_r(dst) * ia) / 255;
-    const int g = (cc_g(c) * a + cc_g(dst) * ia) / 255;
-    const int b = (cc_b(c) * a + cc_b(dst) * ia) / 255;
+    const int r = div255_64(cc_r(c) * a + cc_r(dst) * ia);
+    const int g = div255_64(cc_g(c) * a + cc_g(dst) * ia);
+    const int b = div255_64(cc_b(c) * a + cc_b(dst) * ia);
     return (uint32_t)((r << 16) | (g << 8) | b);
 }
 
@@ -135,9 +140,9 @@ static void fill_round_impl64(int x, int y, int w, int h, int r, uint32_t c, int
                         int t = grad_diag ? (dx + dy) * 256 / (w + h ? w + h : 1) : dx * 256 / (w ? w : 1);
                         if (t < 0) t = 0; if (t > 255) t = 255;
                         const int it = 255 - t;
-                        const int rr = (cc_r(c) * it + cc_r(c1) * t) / 255;
-                        const int gg = (cc_g(c) * it + cc_g(c1) * t) / 255;
-                        const int bb = (cc_b(c) * it + cc_b(c1) * t) / 255;
+                        const int rr = div255_64(cc_r(c) * it + cc_r(c1) * t);
+                        const int gg = div255_64(cc_g(c) * it + cc_g(c1) * t);
+                        const int bb = div255_64(cc_b(c) * it + cc_b(c1) * t);
                         col = (uint32_t)((rr << 16) | (gg << 8) | bb);
                     }
                     row[xx] = blend_c64(row[xx], col, a);
@@ -148,7 +153,7 @@ static void fill_round_impl64(int x, int y, int w, int h, int r, uint32_t c, int
         for (int xx = x0; xx < x0 + ww; xx++) {
             const int cov = cov_px64(tab, r, w, h, xx - x, dy);
             if (cov <= 0) continue;
-            const int aa = cov * a / 255;
+            const int aa = div255_64(cov * a);
             if (aa <= 0) continue;
             uint32_t col = c;
             if (c1 != c) {
@@ -156,9 +161,9 @@ static void fill_round_impl64(int x, int y, int w, int h, int r, uint32_t c, int
                 int t = grad_diag ? (dx2 + dy) * 256 / (w + h ? w + h : 1) : dx2 * 256 / (w ? w : 1);
                 if (t < 0) t = 0; if (t > 255) t = 255;
                 const int it = 255 - t;
-                const int rr = (cc_r(c) * it + cc_r(c1) * t) / 255;
-                const int gg = (cc_g(c) * it + cc_g(c1) * t) / 255;
-                const int bb = (cc_b(c) * it + cc_b(c1) * t) / 255;
+                const int rr = div255_64(cc_r(c) * it + cc_r(c1) * t);
+                const int gg = div255_64(cc_g(c) * it + cc_g(c1) * t);
+                const int bb = div255_64(cc_b(c) * it + cc_b(c1) * t);
                 col = (uint32_t)((rr << 16) | (gg << 8) | bb);
             }
             row[xx] = blend_c64(row[xx], col, aa);
@@ -211,7 +216,7 @@ void gfx64_stroke_round64(int x, int y, int w, int h, int r, uint32_t c, int a) 
                 ci = cov_px64(tabi, r > 1 ? r - 1 : 0, iw, ih, dx - 1, dy - 1);
             const int cov = co - ci;
             if (cov <= 0) continue;
-            row[xx] = blend_c64(row[xx], c, cov * a / 255);
+            row[xx] = blend_c64(row[xx], c, div255_64(cov * a));
         }
     }
 }
@@ -379,7 +384,7 @@ static void mask_blit64(const uint8_t* m, int mw, int mh, int mx0, int my0, int 
         if (mx1 < 0) mx1 = 0;
         if (mx2 > mw) mx2 = mw;
         for (int mx = mx1; mx < mx2; mx++) {
-            const int ma = row[mx] * a / 255;
+            const int ma = div255_64(row[mx] * a);
             if (ma <= 2) continue;                    // 极浅的阴影不落笔（也省带宽）
             int sx = mx0 + mx * 2;
             int wid = 2;
