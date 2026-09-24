@@ -31,6 +31,8 @@ void fb_set_zoom(int pct);  // 设置显示缩放（渲染分辨率 = 物理/缩
 // 拖动窗口时这些"溢出像素"会被脏区提交上屏，表现为拖影/残影。
 void fb_set_clip(int x, int y, int w, int h);
 void fb_reset_clip();
+void fb_get_clip64(int* x, int* y, int* w, int* h);   // 读当前裁剪矩形（gfx64 的图元必须遵守它）
+uint32_t* fb_surface64(int* w, int* h);               // 后备缓冲基址（32bpp，stride = fb_width()）
 uint32_t fb_get_pixel(int x, int y);
 
 // 颜色辅助

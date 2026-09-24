@@ -101,6 +101,35 @@ void cfg64_set_startup64(const char* item, int on);
 // 显示缩放（%）：启动时应用，设置页应用时写回
 int  cfg64_zoom64();
 void cfg64_set_zoom64(int pct);
+
+// ---- 本批（Windows 11 现代外观）：主题 / 壁纸 / Dock / 减少动画（全部跨重启持久化）----
+// 界面主题 id：0 白（默认）1 暗 2 蓝白渐变 3 粉白渐变 4 粉绿渐变 5 粉紫渐变（theme64.h 的 THEME64_ID_*）
+int  cfg64_theme64();
+void cfg64_set_theme64(int id);
+// 减少动画：1 = 所有动效退化到 0ms / 1 帧到位
+int  cfg64_reduce_motion64();
+void cfg64_set_reduce_motion64(int on);
+// 桌面壁纸适应模式：0 填充（默认）1 适应 2 拉伸 3 平铺 4 居中 5 跨屏（gfx64.h 的 GFX64_WALL_*）
+int  cfg64_wall_mode64();
+void cfg64_set_wall_mode64(int mode);
+// 锁屏壁纸适应模式（**下一波**锁屏用；本批先把键建好并持久化）
+int  cfg64_lock_wall_mode64();
+void cfg64_set_lock_wall_mode64(int mode);
+// 壁纸文件路径（VimtuFS2 卷内；空 = 用内核内置兜底壁纸）
+int  cfg64_wall_path64(char* out, int out_max);
+void cfg64_set_wall_path64(const char* path);
+// 头像路径（下一波锁屏/开始菜单用；本批建键）
+int  cfg64_avatar_path64(char* out, int out_max);
+void cfg64_set_avatar_path64(const char* path);
+// Dock 几何：长度（0 = 自动=图标数）/ 高度 / 图标边长 / 图标间距
+int  cfg64_dock_len64();
+void cfg64_set_dock_len64(int len);
+int  cfg64_dock_size64();
+void cfg64_set_dock_size64(int h);
+int  cfg64_dock_icon64();
+void cfg64_set_dock_icon64(int px);
+int  cfg64_dock_gap64();
+void cfg64_set_dock_gap64(int px);
 // 会话策略 / 会话恢复列表（由 session64 读写）
 int  cfg64_session_mode64();
 void cfg64_set_session_mode64(int mode);

@@ -52,6 +52,24 @@ static inline bool clip_rect(int* x, int* y, int* w, int* h) {
 static uint32_t backbuf_storage[3840 * 2160];
 static uint32_t* backbuf = nullptr;
 
+void fb_get_clip64(int* x, int* y, int* w, int* h) {
+    if (g_clip_on) {
+        *x = g_clip_x0; *y = g_clip_y0;
+        *w = g_clip_x1 - g_clip_x0; *h = g_clip_y1 - g_clip_y0;
+    } else {
+        *x = 0; *y = 0; *w = fb_width(); *h = fb_height();
+    }
+}
+
+// 后备缓冲（32bpp）基址 + 渲染分辨率：现代图元层（gfx64）直接写这里，避免每像素走函数调用。
+uint32_t* fb_surface64(int* w, int* h) {
+    if (!backbuf) backbuf = backbuf_storage;
+    if (w) *w = fb_width();
+    if (h) *h = fb_height();
+    return backbuf;
+}
+
+
 // Bochs VBE 扩展寄存器（QEMU stdvga 支持）：0x1CE 索引 / 0x1CF 数据
 #define VBE_INDEX_ID      0x0
 #define VBE_INDEX_XRES    0x1

@@ -71,6 +71,11 @@ SRCS_INSTALLER="$SRCS_CORE kernel/part64.cpp kernel/setup64.cpp kernel/vfs64.cpp
 #   注意：这几个文件依赖 kernel/gui64.cpp 提供的外壳实现，任何新增应用都要同时加进这里。
 SRCS_DESKTOP="kernel/gui64.cpp kernel/explorer64.cpp kernel/calc64.cpp kernel/mines64.cpp \
  kernel/terminal64.cpp kernel/settings64.cpp kernel/taskmgr64.cpp"
+# ★ 本批（Windows 11 现代外观）：theme64（设计 Token 唯一真源 + 主题表 + 减少动画开关）/
+#   gfx64（圆角 + 双层阴影 + 毛玻璃缓存 + 渐变 + 壁纸 6 种适应模式）/ img64（PNG/BMP 解码：
+#   壁纸/头像/开始图标优先从 VimtuFS2 读）。三者都是 gui64 的依赖，**只进系统内核**
+#   （安装介质不带桌面，保持它的 4MB 预算不被这些新增代码吃掉）。
+SRCS_DESKTOP="$SRCS_DESKTOP kernel/theme64.cpp kernel/gfx64.cpp kernel/img64.cpp"
 # 这四个子系统 + 批次 A 后半的两个：**只进系统内核**（安装介质不链它们；只有系统内核有 gui64/store64/app64）
 #   sysstate64 = 运行状态机 + 模块注册表 + 健康 + ring log（terminal 的 state/health/syslog）
 #   config64   = 类型化配置 KV，落在 store64（VimtuFS2 的 /store.a|b，真落盘）
@@ -260,6 +265,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
     "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o "$BUILD/os"/explorer64.o \
     "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
+    "$BUILD/os"/theme64.o "$BUILD/os"/gfx64.o "$BUILD/os"/img64.o \
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \

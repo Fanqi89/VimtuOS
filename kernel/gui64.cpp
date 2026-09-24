@@ -35,6 +35,10 @@
 #include "sysstate64.h"
 #include "panic64.h"
 #include "explorer64.h"   // 我的电脑/文件资源管理器（本轮：外壳只做钩子，实现全在 explorer64.cpp）
+// ---- 本批（Windows 11 现代外观）：设计 Token（theme64）/ 现代图元（gfx64）/ 图像解码（img64）----
+#include "theme64.h"
+#include "gfx64.h"
+#include "img64.h"
 
 // ==================== 资源符号（build64.sh 用 objcopy 生成）====================
 extern "C" const uint8_t _binary_icon_mycomputer_bin_start[];
@@ -46,22 +50,28 @@ extern "C" const uint8_t _binary_logo_rgba_bin_start[];    // 240x150 RGBA（log
 #define ICON_SRC_W 128          // 图标源图尺寸（RGBA，见 _make_icons.py）
 
 // ==================== 几何常量 ====================
+// ★ 本批（Windows 11 现代外观）：底部 32px 老任务栏 → Dock（高 60 + 离底 16 = 76）。
+//   TASKBAR_H 这个名字**保留**，语义改为"底部保留区高度"（窗口最大化/拖拽钳制、图标拖动边界、
+//   各应用窗口排布都用它；= THEME64_DOCK_H + THEME64_DOCK_MARGIN = 76）。所有数字来自 theme64.h 的 Token。
 #define TITLE_H      24         // 标题栏高
 #define BORDER       1          // 边框
 #define DECO_H       (TITLE_H + BORDER)     // 客户区相对窗口顶部的偏移
 #define DECO_W       (BORDER * 2)           // 客户区相对窗口左侧的偏移
-#define TASKBAR_H    32
+#define TASKBAR_H    (THEME64_DOCK_H + THEME64_DOCK_MARGIN)
+#define DOCK_H       THEME64_DOCK_H
+#define DOCK_MARGIN  THEME64_DOCK_MARGIN
 #define BTN_W        30         // 标题栏按钮宽
 #define ICON_W       48         // 桌面图标位图边长
 #define ICON_CELL_W  88         // 图标单元格（含标签）
 #define ICON_CELL_H  84
 #define MAX_WINS     16
 #define MENU_ITEMS   10
-#define CLOCK_W      260        // 任务栏右侧时钟（年月日 + 时间）占位宽度
+#define CLOCK_W      210        // 右下角时钟玻璃片宽度（[UI] clock text 打点仍在这里）
 #define LOGO_W       240        // 开机/关机画面用的 logo 嵌入尺寸（logo/logo.png，见 _make_logo.py）
 #define LOGO_H       150
 #define START_ICON_SRC   64     // 开始按钮图标源尺寸（logo/kaisi.png，见 _make_start_icon.py）
-#define START_ICON_DISP  24     // 开始按钮实际绘制尺寸（任务栏高 32，上下留 4px）
+#define START_ICON_DISP  24     // 老接口（gui64_draw_start_icon64）的绘制尺寸；Dock 用 BEGIN_START_DISP
+#define DOCK_START_DISP  THEME64_DOCK_ICON   // Dock 开始按钮图标 46（Token 44–48）
 
 // ==================== 配色（Win10 风格）====================
 #define C_DESKTOP    rgb(0, 84, 158)
@@ -734,100 +744,543 @@ static void power_anim_screen(const char* txt, const char* log_tag) {
     dbg64_nl();
 }
 
-// ==================== 中间层绘制 ====================
-static void draw_desktop_bg(int x0, int y0, int x1, int y1) {
-    fb_fill_rect(x0, y0, x1 - x0, y1 - y0, C_DESKTOP);
+// ==================== Windows 11 风格 Dock（本批：替换老任务栏）====================
+// 几何（需求原文）：居中靠下、离屏幕底边 16px、高 60 → dock_y = 屏高 − 76；圆角 24、图标 44–48（取 46）、
+//   图标间距 10–12（取 11）；最左固定开始按钮（图标 = logo/kaisi.png）；运行中应用底部小圆点；
+//   最小化后图标下方"小横杠"（宽≈图标 40%、跟随主题强调色、**纯视觉不可点击**）。
+// 动效：悬停放大 1.20 且邻位 1.04 轻微让位；点击上下回弹（弹簧曲线 THEME64_MS_DOCK=260ms）；
+//   减少动画开关打开时全部 0ms/1 帧到位（theme64_dur64）。
+// 打点：[DOCK64] geom/items/hover/press/bounce/minbar/clock（都有行数上限，防刷屏）。
+// 前置声明：老开始菜单开关（dock_press64 的开始按钮要开它；定义在下面菜单一节）
+static void menu_toggle();
+
+#define DOCK_ITEMS 9
+struct DockItem64 { int app_id; int icon_kind; const char* en; const char* zh; };
+static const DockItem64 kDockItems[DOCK_ITEMS] = {
+    { APP_ID_NONE,     -1, "Start",          "开始" },        // 最左固定开始按钮
+    { APP_ID_MYPC,      0, "My Computer",    "我的电脑" },
+    { APP_ID_RECYCLE,   1, "Recycle Bin",    "回收站" },
+    { APP_ID_TERM,      2, "Terminal",       "终端" },
+    { APP_ID_CALC,     -1, "Calculator",     "计算器" },
+    { APP_ID_MINES,    -1, "Minesweeper",    "扫雷" },
+    { APP_ID_SETTINGS, -1, "Settings",       "设置" },
+    { APP_ID_TMGR,     -1, "Task Manager",   "任务管理器" },
+    { APP_ID_MONITOR,  -1, "System Monitor", "系统监视器" },
+};
+
+static int  g_dock_x = 0, g_dock_y = 0, g_dock_w = 0, g_dock_h = DOCK_H;
+static int  g_dock_icon = THEME64_DOCK_ICON, g_dock_gap = THEME64_DOCK_GAP;
+static int  g_dock_pressed = -1;            // 当前按下的项（-1 = 无）
+static int  g_dock_hover = -1;              // 悬停项
+static int  g_dock_scale[DOCK_ITEMS];       // 当前缩放（256 = 100%）
+static int  g_dock_shift[DOCK_ITEMS];       // 当前横向让位（px）
+static int  g_dock_clock_x = 0, g_dock_clock_w = CLOCK_W;
+static bool g_dock_geom_logged = false;
+static int  g_dock_log_budget = 220;         // [DOCK64] press/bounce/minbar 行上限（防刷屏）
+static int  g_dock_bounce_total = 0;
+// 点击回弹动画状态
+static int      g_dock_bounce_idx = -1;
+static uint32_t g_dock_bounce_t0 = 0;
+static int      g_dock_bounce_dur = 0;
+static int      g_dock_bounce_frame = 0;
+static int      g_dock_bounce_dy = 0;
+// Dock 开始按钮图标（46x46 RGBA）：优先 VimtuFS2 的 /logo/kaisi.png、/kaisi.png，
+// 兜底内核内嵌的 icon_start.bin（= 构建期 _make_start_icon.py 从 logo/kaisi.png 生成的 RGBA）。
+static uint8_t g_dock_start_rgba[DOCK_START_DISP * DOCK_START_DISP * 4];
+static bool    g_dock_start_ok = false;
+static const char* g_dock_start_src = "builtin:icon_start.bin";
+
+static void dock_log_start64() {
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] start icon src=");
+    dbg64_str(g_dock_start_src);
+    dbg64_str(" size=");
+    dbg64_dec((uint64_t)DOCK_START_DISP);
+    dbg64_str(" ok=");
+    dbg64_dec((uint64_t)(g_dock_start_ok ? 1 : 0));
+    dbg64_nl();
+    dbg64_line_end64();
 }
-static void draw_icons(void) {
-    for (int i = 0; i < 3; i++) {
-        const DeskIcon& ic = g_icons[i];
-        if (g_icon_sel == i)
-            fb_fill_rect(ic.x - 4, ic.y - 4, ICON_W + 8, ICON_W + 20, C_ICON_SEL);
-        gui64_draw_icon_kind64(ic.x, ic.y, ic.kind);   // 缓存命中走预缩放位图，否则退回逐帧缩放
-        const char* nm = icon_name(ic.kind);
-        const int tw = text_w(nm);
-        int tx = ic.x + (ICON_W - tw) / 2;
-        if (tx < 0) tx = 0;
-        // 文字加一圈描边，避免蓝底上看不清
-        fb_fill_rect(ic.x + (ICON_W - tw) / 2 - 2, ic.y + ICON_W + 2, tw + 4, 18, C_ICON_SEL);
-        text_ttf(tx, ic.y + ICON_W + 3, nm, C_ICON_TXT);
+
+// 把 Img64（0xAARRGGBB）转成 RGBA 字节流（blit_rgba_scaled 的格式）
+static void dock_rgba_from_img64(const Img64* im, uint8_t* dst, int dw, int dh) {
+    for (int y = 0; y < dh; y++) {
+        const int sy = (int)((int64_t)y * im->h / dh);
+        for (int x = 0; x < dw; x++) {
+            const int sx = (int)((int64_t)x * im->w / dw);
+            const uint32_t c = im->px[(uint64_t)sy * im->w + sx];
+            uint8_t* q = dst + (((size_t)y * dw) + x) * 4;
+            q[0] = (uint8_t)((c >> 16) & 0xFF);
+            q[1] = (uint8_t)((c >> 8) & 0xFF);
+            q[2] = (uint8_t)(c & 0xFF);
+            q[3] = (uint8_t)((c >> 24) & 0xFF);
+        }
     }
 }
-static void draw_title_buttons(Window* w) {
-    // 三个按钮必须**肉眼可区分**：最小化=短横线、最大化=方框、关闭=红底 ✕；hover 高亮。
-    // 几何与 handle_mouse_press 的点击判定一致（bx = 窗口右缘 - 3*BTN_W，点击 y ∈ [w->y+2, w->y+24)）。
-    const int bx = w->x + w->w - BORDER - BTN_W * 3;
-    const int by = w->y + BORDER + 4;
-    for (int b = 0; b < 3; b++) {
-        const int x = bx + b * BTN_W + 3;
-        const int bw = BTN_W - 6, bh = 16;
-        const bool hov = (g_cur_x >= bx + b * BTN_W) && (g_cur_x < bx + (b + 1) * BTN_W) &&
-                         (g_cur_y >= w->y + BORDER + 1) && (g_cur_y < w->y + TITLE_H);
-        uint32_t bg;
-        if (b == 2) bg = hov ? C_BTN_CLOSE_H : C_BTN_CLOSE;
-        else        bg = hov ? C_BTN_BG_HOV : C_BTN_BG;
-        fb_fill_rect(x, by, bw, bh, bg);
-        const int cx = x + bw / 2;
-        const int cy = by + bh / 2;
-        if (b == 0) {                       // 最小化：底部短横线
-            fb_fill_rect(cx - 5, cy + 2, 11, 2, C_BTN_GLYPH);
-        } else if (b == 1) {                // 最大化：空心方框
-            fb_draw_rect(cx - 5, cy - 5, 11, 11, C_BTN_GLYPH);
-        } else {                            // 关闭：✕
-            for (int i = -4; i <= 4; i++) {
-                fb_putpixel(cx + i, cy + i, C_BTN_GLYPH);
-                fb_putpixel(cx - i, cy + i, C_BTN_GLYPH);
+
+static void dock_start_icon_init64() {
+    // 1) 优先 VimtuFS2（需求：图标/壁纸/头像优先从 VimtuFS2 读）
+    const char* cand[2] = { "/logo/kaisi.png", "/kaisi.png" };
+    for (int i = 0; i < 2; i++) {
+        Img64 im{};
+        if (img64_load_vfs64(cand[i], &im) == 0) {
+            dock_rgba_from_img64(&im, g_dock_start_rgba, DOCK_START_DISP, DOCK_START_DISP);
+            img64_free64(&im);
+            g_dock_start_ok = true;
+            g_dock_start_src = "vfs";
+            dock_log_start64();
+            return;
+        }
+    }
+    // 2) 兜底：内核内嵌 RGBA（就是 logo/kaisi.png 的内容）
+    if (_binary_icon_start_bin_start) {
+        scale_rgba64(_binary_icon_start_bin_start, START_ICON_SRC, START_ICON_SRC,
+                     g_dock_start_rgba, DOCK_START_DISP, DOCK_START_DISP);
+        g_dock_start_ok = true;
+        g_dock_start_src = "builtin:icon_start.bin";
+    }
+    dock_log_start64();
+}
+
+// 第 i 项的**基准**左边界（不含悬停让位）
+static int dock_item_x64(int i) {
+    return g_dock_x + THEME64_DOCK_PAD + i * (g_dock_icon + g_dock_gap);
+}
+// 第 i 项的当前绘制左边界（含让位；回弹只作用于 y，所以 x 与基准一致）
+static int dock_item_draw_x64(int i) { return dock_item_x64(i) + g_dock_shift[i]; }
+
+// Dock 几何：全部由 Token + config64（dock.size/icon/gap/len）算出
+static void dock_geom_init64() {
+    g_dock_h = DOCK_H;
+    g_dock_icon = cfg64_dock_icon64();
+    g_dock_gap = cfg64_dock_gap64();
+    const int len_cfg = cfg64_dock_len64();
+    g_dock_w = g_dock_icon * DOCK_ITEMS + g_dock_gap * (DOCK_ITEMS - 1) + THEME64_DOCK_PAD * 2;
+    if (len_cfg > 0) g_dock_w = len_cfg;
+    if (g_dock_w > g_screen_w - 32) g_dock_w = g_screen_w - 32;
+    g_dock_x = (g_screen_w - g_dock_w) / 2;                       // 水平居中
+    g_dock_y = g_screen_h - DOCK_MARGIN - g_dock_h;               // 离屏幕底边 16px
+    g_dock_clock_w = CLOCK_W;
+    g_dock_clock_x = g_screen_w - DOCK_MARGIN - g_dock_clock_w;
+    for (int i = 0; i < DOCK_ITEMS; i++) { g_dock_scale[i] = 256; g_dock_shift[i] = 0; }
+    if (g_dock_geom_logged) return;
+    g_dock_geom_logged = true;
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] geom x=");
+    dbg64_dec((uint64_t)g_dock_x);
+    dbg64_str(" y=");
+    dbg64_dec((uint64_t)g_dock_y);
+    dbg64_str(" w=");
+    dbg64_dec((uint64_t)g_dock_w);
+    dbg64_str(" h=");
+    dbg64_dec((uint64_t)g_dock_h);
+    dbg64_str(" r=");
+    dbg64_dec((uint64_t)THEME64_R_DOCK);
+    dbg64_str(" icon=");
+    dbg64_dec((uint64_t)g_dock_icon);
+    dbg64_str(" gap=");
+    dbg64_dec((uint64_t)g_dock_gap);
+    dbg64_str(" items=");
+    dbg64_dec((uint64_t)DOCK_ITEMS);
+    dbg64_str(" margin=");
+    dbg64_dec((uint64_t)DOCK_MARGIN);
+    dbg64_str(" center=1 screen=");
+    dbg64_dec((uint64_t)g_screen_w);
+    dbg64_str("x");
+    dbg64_dec((uint64_t)g_screen_h);
+    dbg64_nl();
+    dbg64_line_end64();
+    for (int i = 0; i < DOCK_ITEMS; i++) {
+        dbg64_line_begin64();
+        dbg64_str("[DOCK64] item idx=");
+        dbg64_dec((uint64_t)i);
+        dbg64_str(" app=");
+        dbg64_dec((uint64_t)kDockItems[i].app_id);
+        dbg64_str(" name=");
+        dbg64_str(g_lang_zh ? kDockItems[i].zh : kDockItems[i].en);
+        dbg64_str(" x=");
+        dbg64_dec((uint64_t)dock_item_x64(i));
+        dbg64_str(" y=");
+        dbg64_dec((uint64_t)(g_dock_y + (g_dock_h - g_dock_icon) / 2));
+        dbg64_str(" w=");
+        dbg64_dec((uint64_t)g_dock_icon);
+        dbg64_str(" h=");
+        dbg64_dec((uint64_t)g_dock_icon);
+        dbg64_str(" cx=");
+        dbg64_dec((uint64_t)(dock_item_x64(i) + g_dock_icon / 2));
+        dbg64_str(" cy=");
+        dbg64_dec((uint64_t)(g_dock_y + g_dock_h / 2));
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] clock chip x=");
+    dbg64_dec((uint64_t)g_dock_clock_x);
+    dbg64_str(" y=");
+    dbg64_dec((uint64_t)g_dock_y);
+    dbg64_str(" w=");
+    dbg64_dec((uint64_t)g_dock_clock_w);
+    dbg64_str(" h=");
+    dbg64_dec((uint64_t)g_dock_h);
+    dbg64_str(" r=");
+    dbg64_dec((uint64_t)THEME64_R_DOCK);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// 目标缩放/让位：悬停项 120%（Token），紧邻两项 104% 且向外让位
+static void dock_targets64(int* tgt_scale, int* tgt_shift) {
+    for (int i = 0; i < DOCK_ITEMS; i++) { tgt_scale[i] = 256; tgt_shift[i] = 0; }
+    if (g_dock_hover < 0) return;
+    const int hi = g_dock_hover;
+    tgt_scale[hi] = 256 * THEME64_DOCK_HOVER_PCT / 100;
+    const int grow = g_dock_icon * (THEME64_DOCK_HOVER_PCT - 100) / 100;   // 悬停多出来的宽度
+    for (int i = 0; i < DOCK_ITEMS; i++) {
+        if (i == hi) continue;
+        if (i == hi - 1 || i == hi + 1) {
+            const int d = (i < hi) ? -1 : 1;
+            tgt_shift[i] = d * (grow / 2 + 2);
+            tgt_scale[i] = 256 * THEME64_DOCK_NEIGH_PCT / 100;
+        }
+    }
+}
+
+// 每帧推进 Dock 动效（悬停缩放/让位 + 点击回弹）；返回 1 = 画面有变化（需要重画 Dock 区）
+static int dock_anim_tick64() {
+    int changed = 0;
+    int tgt_scale[DOCK_ITEMS], tgt_shift[DOCK_ITEMS];
+    dock_targets64(tgt_scale, tgt_shift);
+    const int reduce = theme64_reduce_motion64();
+    for (int i = 0; i < DOCK_ITEMS; i++) {
+        if (reduce) {                                  // 减少动画：0ms / 1 帧到位
+            if (g_dock_scale[i] != tgt_scale[i] || g_dock_shift[i] != tgt_shift[i]) changed = 1;
+            g_dock_scale[i] = tgt_scale[i];
+            g_dock_shift[i] = tgt_shift[i];
+            continue;
+        }
+        // 快动效 150ms：每帧按定步长逼近（60Hz 下约 9 帧到位）
+        const int step = 30;
+        int ds = tgt_scale[i] - g_dock_scale[i];
+        int dsh = tgt_shift[i] - g_dock_shift[i];
+        if (ds > -step && ds < step) {          // 快到位：直接落到目标（否则会停在 109% 这种非整数档）
+            if (ds != 0) changed = 1;
+            g_dock_scale[i] = tgt_scale[i];
+        } else {
+            g_dock_scale[i] += ds * step / 256;
+            changed = 1;
+        }
+        if (dsh > -1 && dsh < 1) {
+            if (dsh != 0) changed = 1;
+            g_dock_shift[i] = tgt_shift[i];
+        } else {
+            g_dock_shift[i] += dsh / 3;
+            changed = 1;
+        }
+    }
+    if (g_dock_bounce_idx >= 0) {
+        const uint32_t now = ticks64();
+        const uint32_t dur = (uint32_t)g_dock_bounce_dur;
+        if (dur == 0) {                                 // 减少动画：1 帧到位
+            g_dock_bounce_dy = 0;
+            dbg64_line_begin64();
+            dbg64_str("[DOCK64] bounce idx=");
+            dbg64_dec((uint64_t)g_dock_bounce_idx);
+            dbg64_str(" frames=1 motion=reduced");
+            dbg64_nl();
+            dbg64_line_end64();
+            g_dock_bounce_idx = -1;
+            changed = 1;
+        } else {
+            const uint32_t el = now - g_dock_bounce_t0;
+            if ((int32_t)el >= (int32_t)dur) {
+                g_dock_bounce_dy = 0;
+                dbg64_line_begin64();
+                dbg64_str("[DOCK64] bounce idx=");
+                dbg64_dec((uint64_t)g_dock_bounce_idx);
+                dbg64_str(" done frames=");
+                dbg64_dec((uint64_t)g_dock_bounce_frame);
+                dbg64_str(" motion=spring(260ms)");
+                dbg64_nl();
+                dbg64_line_end64();
+                g_dock_bounce_idx = -1;
+                changed = 1;
+            } else {
+                const int t = (int)(el * 256 / dur);
+                g_dock_bounce_dy = -(int)((int64_t)9 * theme64_spring64(t) / 256);  // 向上最多 9px + 回弹
+                if (g_dock_bounce_frame < 24) {   // 每次回弹最多打 24 帧（防刷屏；帧计数不受影响）
+                dbg64_line_begin64();
+                dbg64_str("[DOCK64] bounce idx=");
+                dbg64_dec((uint64_t)g_dock_bounce_idx);
+                dbg64_str(" frame=");
+                dbg64_dec((uint64_t)g_dock_bounce_frame);
+                dbg64_str(" t=");
+                dbg64_dec((uint64_t)t);
+                dbg64_str(" dy=");
+                dbg64_dec((uint64_t)(unsigned)(-g_dock_bounce_dy));
+                dbg64_str(" dir=");
+                dbg64_str(g_dock_bounce_dy < 0 ? "up" : (g_dock_bounce_dy > 0 ? "down" : "rest"));
+                dbg64_nl();
+                dbg64_line_end64();
+                }
+                g_dock_bounce_frame++;
+                changed = 1;
             }
         }
     }
-    if (!g_title_btn_logged) {
-        g_title_btn_logged = true;
-        dbg64_str("[UI] title btn min/max/close draw ok");
-        dbg64_nl();
+    return changed;
+}
+
+// 命中测试：返回 Dock 项下标（-1 = 不在 Dock 项上）；*on_clock = 落在右下时钟玻璃片上
+static int dock_hit64(int mx, int my, int* on_clock) {
+    if (on_clock) *on_clock = 0;
+    if (my < g_dock_y || my >= g_dock_y + g_dock_h) return -1;
+    // ★ 面板最下面 6px 是"运行中小圆点 / 最小化小横杠"那一行：**纯视觉，不可点击**
+    //   （要求原文：最小化小横杠"纯视觉不可点击"；这一行也不该把点击落到图标上。）
+    if (my >= g_dock_y + g_dock_h - 6) return -1;
+    if (mx >= g_dock_clock_x && mx < g_dock_clock_x + g_dock_clock_w) {
+        if (on_clock) *on_clock = 1;
+        return -1;
+    }
+    for (int i = 0; i < DOCK_ITEMS; i++) {
+        const int cx = dock_item_draw_x64(i) + g_dock_icon / 2;
+        const int w = g_dock_icon * g_dock_scale[i] / 256;
+        const int h = w;
+        const int yy = g_dock_y + (g_dock_h - h) / 2 + (g_dock_bounce_idx == i ? g_dock_bounce_dy : 0);
+        if (mx >= cx - w / 2 && mx < cx - w / 2 + w && my >= yy && my < yy + h) return i;
+    }
+    return -1;
+}
+
+// 某应用当前窗口数 / 是否全部最小化
+static void dock_app_state64(int app_id, int* nwin, int* nvis, int* all_min) {
+    int n = 0, vis = 0, mn = 0;
+    for (int i = 0; i < MAX_WINS; i++) {
+        if (!g_used[i]) continue;
+        Window* w = &g_wins[i];
+        if ((int)w->app_id != app_id) continue;
+        n++;
+        if (w->visible) vis++;
+        if (w->minimized) mn++;
+    }
+    *nwin = n; *nvis = vis;
+    *all_min = (n > 0 && mn == n) ? 1 : 0;
+}
+
+static void dock_open_app64(int app_id) {
+    switch (app_id) {
+        case APP_ID_MYPC:     app_mypc_open64();     break;
+        case APP_ID_RECYCLE:  app_recycle_open64();  break;
+        case APP_ID_TERM:     app_term_open64();     break;
+        case APP_ID_CALC:     app_calc_open64();     break;
+        case APP_ID_MINES:    app_mines_open64();    break;
+        case APP_ID_SETTINGS: app_settings_open64(); break;
+        case APP_ID_TMGR:     app_tmgr_open64();     break;
+        case APP_ID_MONITOR:  app_monitor_open64();  break;
+        default: break;
     }
 }
-static void draw_window(Window* w) {
-    // 边框 + 标题栏
-    fb_fill_rect(w->x, w->y, w->w, w->h, C_BORDER);
-    fb_fill_rect(w->x + BORDER, w->y + BORDER, w->w - BORDER * 2, TITLE_H - BORDER,
-                 w->active ? C_TITLE_ACT : C_TITLE_INA);
-    // 标题文字（居中偏左）
-    const int ty = w->y + BORDER + (TITLE_H - 14) / 2;
-    text_ttf(w->x + 8, ty, w->title, C_TITLE_TXT);
-    // 三个按钮（简化绘制：三条横线/方块；关闭按钮红底）
-    draw_title_buttons(w);
-    // 客户区底色 + 应用内容
-    fb_fill_rect(w->client_x, w->client_y, w->client_w, w->client_h, C_CLIENT);
-    if (w->draw) {
-        fb_set_clip(w->client_x, w->client_y, w->client_w, w->client_h);
-        const uint64_t t0 = rdtsc64();
-        w->draw(w);
-        w->cpu_cycles += rdtsc64() - t0;
-        fb_reset_clip();
+
+static void dock_press64(int idx) {
+    if (idx < 0 || idx >= DOCK_ITEMS) return;
+    // 点击回弹：减少动画时 0ms（1 帧到位）
+    g_dock_bounce_idx = idx;
+    g_dock_bounce_t0 = ticks64();
+    g_dock_bounce_dur = (int)theme64_dur64(THEME64_MS_DOCK);
+    g_dock_bounce_frame = 0;
+    g_dock_bounce_dy = 0;
+    g_dock_bounce_total++;
+    if (idx == 0) {
+        // 需求：本批点开始按钮只需要"被按下 + 打点"（真正的开始菜单是 P2）。
+        // 老开始菜单仍可开（Win 键或此项），既有验收与用户习惯不被打断。
+        if (g_dock_log_budget > 0) {
+            g_dock_log_budget--;
+            dbg64_line_begin64();
+            dbg64_str("[DOCK64] start press idx=0 pressed=1 bounce=1 menu=legacy-toggle (P2 = 真开始菜单)");
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        menu_toggle();
+        return;
+    }
+    const int app = kDockItems[idx].app_id;
+    int n = 0, vis = 0, mn = 0;
+    dock_app_state64(app, &n, &vis, &mn);
+    const char* action = "open";
+    if (n == 0) {
+        dock_open_app64(app);
+    } else {
+        Window* top = nullptr;
+        for (int i = 0; i < MAX_WINS; i++)
+            if (g_used[i] && (int)g_wins[i].app_id == app && !g_wins[i].minimized) top = &g_wins[i];
+        if (top && top->active) {
+            action = "minimize";
+            for (int i = 0; i < MAX_WINS; i++)
+                if (g_used[i] && (int)g_wins[i].app_id == app) g_wins[i].minimized = true;
+            gui64_invalidate();
+        } else if (top) {
+            action = "restore+activate";
+            gui64_set_active(top);
+            gui64_invalidate();
+        } else {
+            action = "restore-all";
+            for (int i = 0; i < MAX_WINS; i++)
+                if (g_used[i] && (int)g_wins[i].app_id == app) { g_wins[i].minimized = false; gui64_set_active(&g_wins[i]); }
+            gui64_invalidate();
+        }
+    }
+    if (g_dock_log_budget > 0) {
+        g_dock_log_budget--;
+        dbg64_line_begin64();
+        dbg64_str("[DOCK64] press idx=");
+        dbg64_dec((uint64_t)idx);
+        dbg64_str(" app=");
+        dbg64_dec((uint64_t)app);
+        dbg64_str(" action=");
+        dbg64_str(action);
+        dbg64_str(" wins=");
+        dbg64_dec((uint64_t)n);
+        dbg64_nl();
+        dbg64_line_end64();
     }
 }
-static void draw_taskbar(void) {
-    const int y = g_screen_h - TASKBAR_H;
-    fb_fill_rect(0, y, g_screen_w, TASKBAR_H, C_TASKBAR);
-    // 开始按钮：logo/kaisi.png（64x64 RGBA）缩放到 24x24（点击区仍是 mx<34，见 handle_mouse_press）
-    gui64_draw_start_icon64(6, y + (TASKBAR_H - START_ICON_DISP) / 2);
-    if (!g_start_icon_logged) {
-        g_start_icon_logged = true;
-        dbg64_str("[UI] start icon blit size=");
-        dbg64_dec((uint64_t)START_ICON_DISP);
-        dbg64_nl();
+
+// 单个图标：圆角正方形彩色渐变底 + 中心字母（前三个内置图标用真位图）；悬停先铺 hover 底色
+static void dock_draw_one64(int idx, int cx, int icon_px, int hovered, const Theme64Tokens* t) {
+    const int x = cx - icon_px / 2;
+    const int y = g_dock_y + (g_dock_h - icon_px) / 2 + (g_dock_bounce_idx == idx ? g_dock_bounce_dy : 0);
+    if (hovered) {
+        gfx64_fill_round64(x - 4, y - 4, icon_px + 8, icon_px + 8, THEME64_R_ICON + 2,
+                           t->dock_hover_bg, 200);
     }
-    // 窗口按钮
-    int bx = 34;
-    for (Window* w = g_z; w; w = w->next) {
-        if (!w->visible) continue;
-        const int bw = text_w(w->title) + 16;
-        if (bx + bw > g_screen_w - CLOCK_W) break;
-        fb_fill_rect(bx, y + 3, bw, TASKBAR_H - 6, w->active ? C_TASK_ACT : C_TASK_BTN);
-        text_ttf(bx + 8, y + 8, w->title, C_TITLE_TXT);
-        bx += bw + 4;
+    if (idx == 0) {
+        // 开始按钮：真文件 logo/kaisi.png（VimtuFS2 优先，兜底内核内嵌 RGBA）
+        if (g_dock_start_ok) {
+            static uint8_t scratch[DOCK_START_DISP * DOCK_START_DISP * 4];
+            if (icon_px != DOCK_START_DISP) {
+                scale_rgba64(g_dock_start_rgba, DOCK_START_DISP, DOCK_START_DISP, scratch, icon_px, icon_px);
+                blit_rgba_scaled(x, y, icon_px, icon_px, scratch);
+            } else {
+                blit_rgba_scaled(x, y, icon_px, icon_px, g_dock_start_rgba);
+            }
+        } else {
+            gfx64_grad_round64(x, y, icon_px, icon_px, THEME64_R_ICON, t->grad_a, t->grad_b, 1, 255);
+        }
+        return;
     }
-    // 时钟（右对齐）：日期 + 时间，如 "2026-09-19 12:11:35"（必须含年月日）
+    const int kind = kDockItems[idx].icon_kind;
+    if (kind >= 0 && kind <= 2) {
+        // 我的电脑 / 回收站 / 终端：内核内嵌真图标（128x128 -> icon_px）
+        blit_rgba(x, y, icon_px, icon_px, icon_src(kind), ICON_SRC_W, ICON_SRC_W, 255);
+        return;
+    }
+    // 其它应用：圆角正方形 + 主题渐变（扁平但有立体感：渐变 + 1px 高光边）
+    uint32_t c0 = t->grad_a, c1 = t->grad_b;
+    if (idx % 3 == 1) { c0 = t->grad_b; c1 = t->accent; }
+    else if (idx % 3 == 2) { c0 = t->accent; c1 = t->grad_a; }
+    gfx64_grad_round64(x, y, icon_px, icon_px, THEME64_R_ICON, c0, c1, 1, 255);
+    gfx64_stroke_round64(x, y, icon_px, icon_px, THEME64_R_ICON, rgb(255, 255, 255), 90);
+    // 中心字母（8x8 位图字体；图标 >=40px 时 scale 3 ≈ 24px）
+    const char* nm = g_lang_zh ? kDockItems[idx].zh : kDockItems[idx].en;
+    char ch = nm[0];
+    if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+    const int sc = icon_px >= 40 ? 3 : 2;
+    const int tx = x + (icon_px - 8 * sc) / 2;
+    const int ty = y + (icon_px - 8 * sc) / 2;
+    fb_draw_char(tx, ty, ch, rgb(255, 255, 255), rgb(0, 0, 0), sc);
+}
+
+// Dock 阴影的包围盒（面板 + 远层阴影的最大外扩）：render 用它判断脏区是否需要补画阴影
+static void dock_shadow_box64(int* bx, int* by, int* bw, int* bh) {
+    const int pad = THEME64_SH_F_BLUR * 2 + 4;
+    *bx = g_dock_x - pad;
+    *by = g_dock_y - pad;
+    *bw = g_dock_w + pad * 2;
+    *bh = g_dock_h + pad * 2 + THEME64_SH_F_DY;
+}
+// Dock 的双层浅阴影（近层 0/2/4 a=0.08 + 远层 0/12/32 a=0.12，Token）——
+// ★ 它是"壁纸之上、窗口之下"的**静态图层**：任何一块脏区重画了壁纸，落在阴影里的那部分都会消失，
+//   所以 render() 在脏区压到阴影包围盒时会按脏区补画（mask 的 blit 本来就与裁剪求交，代价 = 脏区大小）。
+static void draw_dock_shadow(void) {
+    const Theme64Tokens* t = theme64_tokens64();
+    gfx64_shadow64(g_dock_x, g_dock_y, g_dock_w, g_dock_h, THEME64_R_DOCK, t);
+    gfx64_shadow64(g_dock_clock_x, g_dock_y, g_dock_clock_w, g_dock_h, THEME64_R_DOCK, t);
+}
+
+// Dock 面板 + 图标 + 运行点/最小化小横杠 + 右下角时钟玻璃片（替换老 32px 任务栏）
+static void draw_dock(void) {
+    const Theme64Tokens* t = theme64_tokens64();
+    // 1) 阴影不在这里画（见 draw_dock_shadow：它由 render 按脏区补画，避免被壁纸重绘抹掉）
+    // 2) 毛玻璃(亚克力)：非暗色主题 = **固定默认色**（Token dock_bg，+ 一点背景材质感）；
+    //    暗色主题 = 深灰半透（Token 0.45）+ 内高光
+    const int alpha = t->dark ? THEME64_A_BACKDROP : (THEME64_A_CARD + 40);
+    gfx64_glass64(g_dock_x, g_dock_y, g_dock_w, g_dock_h, THEME64_R_DOCK, 0,
+                  t->dock_bg, alpha, t->dock_border, THEME64_A_BORDER, t);
+    gfx64_glass64(g_dock_clock_x, g_dock_y, g_dock_clock_w, g_dock_h, THEME64_R_DOCK, 0,
+                  t->dock_bg, alpha, t->dock_border, THEME64_A_BORDER, t);
+    // 3) 图标 + 运行中小圆点 / 最小化小横杠
+    for (int i = 0; i < DOCK_ITEMS; i++) {
+        const int cx = dock_item_draw_x64(i) + g_dock_icon / 2;
+        const int icon_px = g_dock_icon * g_dock_scale[i] / 256;
+        dock_draw_one64(i, cx, icon_px, g_dock_hover == i, t);
+        if (i == 0) continue;
+        int n = 0, vis = 0, mn = 0;
+        dock_app_state64(kDockItems[i].app_id, &n, &vis, &mn);
+        if (n > 0) {
+            const int bw = g_dock_icon * THEME64_DOCK_BAR_PCT / 100;   // 小横杠宽 = 图标宽 40%
+            const int by = g_dock_y + g_dock_h - 5;
+            if (mn) {
+                // 最小化：图标下方"小横杠"（跟随主题强调色；纯视觉、不可点击）
+                gfx64_fill_round64(cx - bw / 2, by, bw, 3, 1, t->dock_bar, 255);
+                if (g_dock_log_budget > 0) {
+                    g_dock_log_budget--;
+                    dbg64_line_begin64();
+                    dbg64_str("[DOCK64] minbar idx=");
+                    dbg64_dec((uint64_t)i);
+                    dbg64_str(" x=");
+                    dbg64_dec((uint64_t)(cx - bw / 2));
+                    dbg64_str(" y=");
+                    dbg64_dec((uint64_t)by);
+                    dbg64_str(" w=");
+                    dbg64_dec((uint64_t)bw);
+                    dbg64_str(" h=3 color=#");
+                    // 6 位十六进制（不要用 dbg64_hex64：它是 16 位零填充，验收正则不好写）
+                    {
+                        static const char* H = "0123456789ABCDEF";
+                        const char hx[7] = {
+                            H[(t->dock_bar >> 20) & 0xF], H[(t->dock_bar >> 16) & 0xF],
+                            H[(t->dock_bar >> 12) & 0xF], H[(t->dock_bar >> 8) & 0xF],
+                            H[(t->dock_bar >> 4) & 0xF], H[t->dock_bar & 0xF], 0
+                        };
+                        dbg64_str(hx);
+                    }
+                    dbg64_str(" clickable=0");
+                    dbg64_nl();
+                    dbg64_line_end64();
+                    // ★ 确定性证据：对横杠中心做一次命中测试，必须**不命中任何 Dock 项**
+                    //   （横杠只是视觉提示；点它既不激活也不恢复。）
+                    const int hit = dock_hit64(cx, by + 1, nullptr);
+                    dbg64_line_begin64();
+                    dbg64_str("[DOCK64] minbar hit_test idx=");
+                    dbg64_dec((uint64_t)i);
+                    dbg64_str(" x=");
+                    dbg64_dec((uint64_t)cx);
+                    dbg64_str(" y=");
+                    dbg64_dec((uint64_t)(by + 1));
+                    dbg64_str(" -> hit=");
+                    if (hit < 0) dbg64_str("none");
+                    else dbg64_dec((uint64_t)hit);
+                    dbg64_str(" (visual only, not clickable)");
+                    dbg64_nl();
+                    dbg64_line_end64();
+                }
+            } else {
+                // 运行中：底部小圆点（主题强调色）
+                gfx64_fill_round64(cx - THEME64_DOCK_DOT_W / 2, by, THEME64_DOCK_DOT_W,
+                                   THEME64_DOCK_DOT_W, THEME64_DOCK_DOT_W / 2, t->dock_dot, 255);
+            }
+        }
+    }
+    // 4) 右下角时钟玻璃片（保留老的 [UI] clock text 打点与年月日语义）
     int hh = 0, mm = 0, ss = 0, yy = 0, mo = 0, dd = 0, wd = 0;
     rtc_get_time64(&hh, &mm, &ss);
     rtc_get_date64(&yy, &mo, &dd, &wd);
@@ -853,9 +1306,10 @@ static void draw_taskbar(void) {
     buf[n++] = (char)('0' + (ss / 10) % 10);
     buf[n++] = (char)('0' + ss % 10);
     buf[n] = 0;
-    const int tw = text_w(buf);
-    text_ttf(g_screen_w - tw - 10, y + (TASKBAR_H - 14) / 2, buf, C_TITLE_TXT);
-    // 时钟文本打点：只在文本变化（每秒）时打一行，便于自动验收 grep 年月日
+    font_select(2);
+    const int tw = font_text_width(buf);
+    text_ttf(g_dock_clock_x + (g_dock_clock_w - tw) / 2,
+             g_dock_y + (g_dock_h - THEME64_FS_NORMAL) / 2, buf, t->dock_txt);
     if (!str_eq64(buf, g_clock_log)) {
         str_copy64(g_clock_log, buf, (int)sizeof(g_clock_log));
         dbg64_str("[UI] clock text=");
@@ -864,6 +1318,98 @@ static void draw_taskbar(void) {
     }
 }
 
+// ==================== 中间层绘制 ====================
+// 桌面背景：壁纸 + 适应模式（gfx64 把 6 种模式铺好的整屏壁纸面缓存着，这里只按脏矩形拷贝；
+// 绝不每帧重算缩放/模糊 —— 见 kernel/gfx64.cpp 的 wall_ensure64/wall_compose64）。
+static void draw_desktop_bg(int x0, int y0, int x1, int y1) {
+    gfx64_wall_draw64(x0, y0, x1 - x0, y1 - y0);
+}
+static void draw_icons(void) {
+    const Theme64Tokens* t = theme64_tokens64();
+    for (int i = 0; i < 3; i++) {
+        const DeskIcon& ic = g_icons[i];
+        if (g_icon_sel == i)
+            gfx64_fill_round64(ic.x - 4, ic.y - 4, ICON_W + 8, ICON_W + 20, THEME64_R_ICON,
+                               t->sel_bg, 255);   // 选中底色 = Token 主色（不透明，保证像素级断言可复现）
+        gui64_draw_icon_kind64(ic.x, ic.y, ic.kind);   // 缓存命中走预缩放位图，否则退回逐帧缩放
+        const char* nm = icon_name(ic.kind);
+        const int tw = text_w(nm);
+        int tx = ic.x + (ICON_W - tw) / 2;
+        if (tx < 0) tx = 0;
+        // 标签底板：浅色壁纸上用半透明白底 + 深色字（深色主题反过来），保证任何壁纸上都可读
+        const uint32_t plate = t->dark ? rgb(0, 0, 0) : rgb(255, 255, 255);
+        gfx64_fill_round64(ic.x + (ICON_W - tw) / 2 - 4, ic.y + ICON_W + 1, tw + 8, 18, 6, plate, 150);
+        text_ttf(tx, ic.y + ICON_W + 3, nm, t->icon_txt);
+    }
+}
+static void draw_title_buttons(Window* w) {
+    // 三个按钮必须**肉眼可区分**：最小化=短横线、最大化=方框、关闭=红底 ✕；hover 高亮。
+    // 几何与 handle_mouse_press 的点击判定一致（bx = 窗口右缘 - 3*BTN_W，点击 y ∈ [w->y+2, w->y+24)）。
+    // 颜色本批改为从 Token 取（theme64）：浅色主题用浅灰按钮 + 白字，暗色主题用深灰按钮 + 白字。
+    const Theme64Tokens* t = theme64_tokens64();
+    const int bx = w->x + w->w - BORDER - BTN_W * 3;
+    const int by = w->y + BORDER + 4;
+    for (int b = 0; b < 3; b++) {
+        const int x = bx + b * BTN_W + 3;
+        const int bw = BTN_W - 6, bh = 16;
+        const bool hov = (g_cur_x >= bx + b * BTN_W) && (g_cur_x < bx + (b + 1) * BTN_W) &&
+                         (g_cur_y >= w->y + BORDER + 1) && (g_cur_y < w->y + TITLE_H);
+        uint32_t bg;
+        if (b == 2) bg = hov ? t->btn_close_hover : t->btn_close;
+        else        bg = hov ? t->btn_bg_hover : t->btn_bg;
+        gfx64_fill_round64(x, by, bw, bh, THEME64_R_BUTTON, bg, 255);
+        const int cx = x + bw / 2;
+        const int cy = by + bh / 2;
+        if (b == 0) {                       // 最小化：底部短横线
+            fb_fill_rect(cx - 5, cy + 2, 11, 2, t->btn_glyph);
+        } else if (b == 1) {                // 最大化：空心方框
+            fb_draw_rect(cx - 5, cy - 5, 11, 11, t->btn_glyph);
+        } else {                            // 关闭：✕
+            for (int i = -4; i <= 4; i++) {
+                fb_putpixel(cx + i, cy + i, t->btn_glyph);
+                fb_putpixel(cx - i, cy + i, t->btn_glyph);
+            }
+        }
+    }
+    if (!g_title_btn_logged) {
+        g_title_btn_logged = true;
+        dbg64_str("[UI] title btn min/max/close draw ok");
+        dbg64_nl();
+    }
+}
+// 窗口外观（本批改版）：大圆角 14（Token）+ 双层浅阴影 + 标题栏毛玻璃(内容层 12 模糊缓存) +
+// 1px 玻璃边框。**几何完全不变**：边框 1px、标题栏 24、客户区偏移与老实现逐像素一致，
+// 所以所有应用布局与老验收（标题栏三按钮/客户区几何）都不受影响。
+static void draw_window(Window* w) {
+    const Theme64Tokens* t = theme64_tokens64();
+    // 1) 双层浅阴影（预生成 alpha mask，按 w/h/r 缓存复用）
+    gfx64_shadow64(w->x, w->y, w->w, w->h, THEME64_R_WINDOW, t);
+    // 2) 标题栏玻璃：**只铺标题栏那条**（内容层区域模糊 r=12；整窗面积铺会把每帧开销拉到卡住
+    //    看门狗的程度 —— 实测 7 个窗口时 5s 超时 PANIC）。底边/侧边的 1px 玻璃边框在第 4 步统一描。
+    const uint32_t tb = w->active ? t->title_bg : t->title_bg_ina;
+    gfx64_glass64(w->x, w->y, w->w, DECO_H + 2, THEME64_R_WINDOW, 1, tb, THEME64_A_TITLE,
+                  0, 0, t);
+    // 3) 标题文字（居中偏左）
+    const int ty = w->y + BORDER + (TITLE_H - 14) / 2;
+    text_ttf(w->x + 8, ty, w->title, t->title_txt);
+    // 4) 三个按钮（简化绘制：三条横线/方块；关闭按钮红底）
+    draw_title_buttons(w);
+    // 5) 客户区底色 + 应用内容（内容卡片：不透明底，老验收依赖 240,240,240）
+    fb_fill_rect(w->client_x, w->client_y, w->client_w, w->client_h, t->client_bg);
+    if (w->draw) {
+        fb_set_clip(w->client_x, w->client_y, w->client_w, w->client_h);
+        const uint64_t t0 = rdtsc64();
+        w->draw(w);
+        w->cpu_cycles += rdtsc64() - t0;
+        fb_reset_clip();
+    }
+    // 6) 整窗 1px 玻璃边框（1px 半透明白/黑 = 玻璃厚度与高光边缘）+ 圆角裁切
+    gfx64_stroke_round64(w->x, w->y, w->w, w->h, THEME64_R_WINDOW, t->win_frame, THEME64_A_BORDER);
+    // 圆角裁切：客户区是方形，把 4 个角"圆角外"的像素用模糊壁纸采样补回（= 玻璃圆角）
+    gfx64_corner_cut64(w->x, w->y, w->w, w->h, THEME64_R_WINDOW, 0);
+}
+// 老 32px 任务栏已在批次"Windows 11 现代外观"里被 draw_dock()（Dock 栏 + 右下时钟玻璃片）取代；
+// 这里保留这条注释作为考古标记：时钟 [UI] clock text= 打点与窗口按钮语义都迁到了 draw_dock/dock_press64。
 // 开始菜单条目（与 32 位同名同序）
 static const char* menu_zh[MENU_ITEMS] = {
     "终端", "我的电脑", "系统监视器", "计算器", "扫雷",
@@ -930,6 +1476,12 @@ static void render(void) {
             fb_draw_rect(sbx, sby, sbw, sbh, rgb(64, 160, 255));
         }
     }
+    // Dock 双层阴影：脏区压到它的包围盒就补画（壁纸/图标已画完，窗口还没画 → 层次正确）
+    {
+        int bx, by, bw, bh;
+        dock_shadow_box64(&bx, &by, &bw, &bh);
+        if (!(bx >= x1 || by >= y1 || bx + bw <= x0 || by + bh <= y0)) draw_dock_shadow();
+    }
     // 窗口从底到顶画：先把 z 序反转
     Window* stack[MAX_WINS];
     int n = 0;
@@ -937,10 +1489,13 @@ static void render(void) {
     for (int i = n - 1; i >= 0; i--) {
         Window* w = stack[i];
         if (!w->visible || w->minimized) continue;
-        if (w->x >= x1 || w->y >= y1 || w->x + w->w <= x0 || w->y + w->h <= y0) continue;
+        // ★ 参与判定扩到"窗口 + 阴影包围盒"：脏区落在窗口外的阴影里也要重画阴影（否则会被壁纸重绘抹掉）
+        const int sp = THEME64_SH_F_BLUR * 2 + 4;
+        if (w->x - sp >= x1 || w->y - sp >= y1 || w->x + w->w + sp <= x0 || w->y + w->h + sp + THEME64_SH_F_DY <= y0)
+            continue;
         draw_window(w);
     }
-    draw_taskbar();
+    draw_dock();                 // ★ 本批：Windows 11 风格 Dock（替换老 32px 任务栏）
     draw_menu();
     draw_cursor();
     fb_reset_clip();
@@ -1145,25 +1700,27 @@ static void press_in_client(Window* w, int mx, int my, int button) {
 }
 
 static void handle_mouse_press(int mx, int my, int button) {
-    // 1) 任务栏
-    const int ty = g_screen_h - TASKBAR_H;
-    if (my >= ty) {
-        g_menu_open = false;
-        if (mx < 34) { menu_toggle(); return; }
-        int bx = 34;
-        for (Window* w = g_z; w; w = w->next) {
-            if (!w->visible) continue;
-            const int bw = text_w(w->title) + 16;
-            if (bx + bw > g_screen_w - 90) break;
-            if (mx >= bx && mx < bx + bw) {
-                if (w->active && !w->minimized) { w->minimized = true; dirty_add(0, 0, g_screen_w, g_screen_h); }
-                else { w->minimized = false; gui64_set_active(w); }
-                dirty_add(0, ty, g_screen_w, TASKBAR_H);
-                return;
-            }
-            bx += bw + 4;
+    // 1) Dock 栏（本批：Windows 11 风格）。命中项 → 按下：回弹动画 + 动作（开始按钮只打点 + 老菜单开关）；时钟玻璃片吞掉点击。
+    {
+        int on_clock = 0;
+        const int idx = dock_hit64(mx, my, &on_clock);
+        if (idx >= 0) {
+            g_menu_open = false;
+            g_dock_pressed = idx;
+            dock_press64(idx);
+            dirty_add(g_dock_x, g_dock_y, g_dock_w, g_dock_h);
+            return;
         }
-        return;
+        if (on_clock) {
+            // 时钟玻璃片：纯显示，不响应点击（只是把事件吃掉，避免穿透到桌面拉选择框）
+            g_menu_open = false;
+            return;
+        }
+        if (my >= g_dock_y) {
+            // Dock 行内的空白（面板两端留白/图标之间）：也吞掉，不穿透桌面
+            g_menu_open = false;
+            return;
+        }
     }
     // 2) 开始菜单
     if (g_menu_open) {
@@ -1282,6 +1839,32 @@ static void handle_mouse(void) {
     if (mouse_button_pressed(0)) { mouse_consume_pressed(0); handle_mouse_press(mx, my, 0); }
     if (mouse_button_pressed(1)) { mouse_consume_pressed(1); handle_mouse_press(mx, my, 1); }
     if (mouse_button_pressed(2)) { mouse_consume_pressed(2); handle_mouse_press(mx, my, 2); }
+    // ---- Dock：悬停命中 + 动效推进（悬停放大/邻位让位/点击回弹）----
+    {
+        int on_clock = 0;
+        const int hov = dock_hit64(mx, my, &on_clock);
+        if (hov != g_dock_hover) {
+            g_dock_hover = hov;
+            if (g_dock_log_budget > 0) {
+                g_dock_log_budget--;
+                dbg64_line_begin64();
+                dbg64_str("[DOCK64] hover idx=");
+                dbg64_dec((uint64_t)(hov < 0 ? 0 : hov));
+                dbg64_str(hov < 0 ? " none" : " scale=");
+                if (hov >= 0) dbg64_dec((uint64_t)THEME64_DOCK_HOVER_PCT);
+                dbg64_str(" neighbor_shift=");
+                dbg64_dec((uint64_t)THEME64_DOCK_NEIGH_PCT);
+                dbg64_str(" motion=150ms");
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+            dirty_add(g_dock_x, g_dock_y, g_dock_w, g_dock_h);
+        }
+        if (dock_anim_tick64()) {
+            // 动效每帧都在变 → 只重画 Dock 那一条（脏矩形小，不整屏）
+            dirty_add(g_dock_x, g_dock_y, g_dock_w, g_dock_h);
+        }
+    }
 
     // 桌面图标拖动：位移 >5px（dx²+dy²>25）才算拖动，从而区分单击/双击/拖动（移植自 32 位）
     if ((btn & 1) && g_icon_drag_idx >= 0) {
@@ -1445,6 +2028,12 @@ static void handle_keyboard(void) {
     }
     uint8_t c = 0;
     while (kbd_pop_char(&c)) {
+        // 本批新增热键：Ctrl+Shift+T 循环主题 / Ctrl+Shift+N 循环壁纸适应模式 / Ctrl+Shift+R 减少动画开关
+        //（theme64_hotkey64 里实时生效 + 写 config64 持久化；减少动画也可用终端 `cfg set ui.reduce_motion 1`）
+        if (kbd_ctrl_pressed() && theme64_hotkey64(c, 1, kbd_shift_pressed() ? 1 : 0)) {
+            gui64_invalidate();
+            continue;
+        }
         if (g_menu_open) {
             if (c == 0xFD) { g_menu_sel = (g_menu_sel + MENU_ITEMS - 1) % MENU_ITEMS; dirty_add(menu_x(), menu_y(), MENU_W, MENU_H); continue; }
             if (c == 0xFE) { g_menu_sel = (g_menu_sel + 1) % MENU_ITEMS; dirty_add(menu_x(), menu_y(), MENU_W, MENU_H); continue; }
@@ -1596,7 +2185,53 @@ int gui64_selftest() {
     dbg64_str(" title_h=");
     dbg64_dec((uint64_t)TITLE_H);
     dbg64_nl();
-
+    // ---- ★ 本批：主题 Token 生效 + 壁纸（VimtuFS2 优先，兜底内置）+ Dock 几何 + 图像解码自检 ----
+    // 顺序：theme64_init64（读 ui.theme/ui.reduce_motion）→ wall（读 ui.wall.path → img64 解码）→ dock。
+    theme64_init64();
+    {
+        const Theme64Tokens* t0 = theme64_tokens64();
+        char wpath[CFG64_STR_MAX];
+        wpath[0] = 0;
+        cfg64_wall_path64(wpath, (int)sizeof(wpath));
+        bool loaded = false;
+        if (wpath[0]) {
+            Img64 wim{};
+            if (img64_load_vfs64(wpath, &wim) == 0) {
+                loaded = (gfx64_wall_set_source64(wim.px, wim.w, wim.h, 1, "vfs:wallpaper") == 0);
+                img64_free64(&wim);
+            }
+        }
+        if (!loaded) {
+            // 未配置/读不到 → 内核内置兜底壁纸（程序化渐变 + 柔光斑 + 定位标记）
+            gfx64_wall_build_default64();
+            dbg64_line_begin64();
+            dbg64_str("[GFX64] init surface=");
+            dbg64_dec((uint64_t)g_screen_w);
+            dbg64_str("x");
+            dbg64_dec((uint64_t)g_screen_h);
+            dbg64_str(" wall=");
+            dbg64_dec((uint64_t)gfx64_wall_src_w64());
+            dbg64_str("x");
+            dbg64_dec((uint64_t)gfx64_wall_src_h64());
+            dbg64_str(" src=");
+            dbg64_str(gfx64_wall_src_desc64());
+            dbg64_str(" theme=");
+            dbg64_dec((uint64_t)theme64_id64());
+            dbg64_str(" name=");
+            dbg64_str(t0->name);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        const int rc_img = img64_selftest64();
+        if (rc_img != 0) {
+            dbg64_str("[IMG64] selftest mask=");
+            dbg64_dec((uint64_t)rc_img);
+            dbg64_nl();
+        }
+        dock_start_icon_init64();
+        dock_geom_init64();
+        g_dock_hover = -1;
+    }
     // ---- 开机 logo：桌面首帧之前先放一段黑底 + 居中 logo 的淡入（~12 帧 ≈ 200ms）----
     boot_logo_fade_in();
 
@@ -1609,13 +2244,14 @@ int gui64_selftest() {
         dbg64_nl();
     }
 
-    fb_clear(C_DESKTOP);
+    fb_clear(theme64_tokens64()->desktop_base);   // 首帧背景：主题底色（随后 render 铺壁纸+适应模式）
     g_cur_x = mouse_get_x();
     g_cur_y = mouse_get_y();
     g_prev_cur_x = g_cur_x;
     g_prev_cur_y = g_cur_y;
     gui64_invalidate();
     render();
+    gfx64_report64("first_frame");   // 缓存统计（blur_hit/miss、shadow_hit/miss、wall_builds）
 
     // 这两行都是自动验收的断言行：
     //   "[GUI64] ready"      —— 桌面验收（tests/desktop64_test.py）
@@ -1647,6 +2283,12 @@ int gui64_selftest() {
         }
         session64_tick64();          // 关窗后的"清状态"延迟落到这里（避免在销毁路径里递归销毁）
         (void)config64_tick64();     // 配置改动后的延迟落盘（3 秒去抖）
+        // ★ 本批：主题/壁纸模式被外部改过（终端 cfg set / 热键）→ 实时生效 + 整屏重建（壁纸+玻璃缓存）
+        if (theme64_tick64() | gfx64_wall_tick64()) {
+            g_dock_geom_logged = false;
+            dock_geom_init64();
+            gui64_invalidate();
+        }
         handle_mouse();
         handle_keyboard();
 
@@ -1665,7 +2307,7 @@ int gui64_selftest() {
             // 时钟/监视器每秒重画一次
             if ((int32_t)(now - next_tick) >= 0) {
                 next_tick = now + PIT_HZ_64;
-                dirty_add(g_screen_w - CLOCK_W, g_screen_h - TASKBAR_H, CLOCK_W, TASKBAR_H);
+                dirty_add(g_dock_clock_x, g_dock_y, g_dock_clock_w, g_dock_h);   // 右下角时钟玻璃片
                 if (gui64_window_alive(g_mon_win)) gui64_invalidate_window(g_mon_win);
                 if (explorer64_window64()) gui64_invalidate_window(explorer64_window64());
                 if (gui64_window_alive(g_about_win)) gui64_invalidate_window(g_about_win);

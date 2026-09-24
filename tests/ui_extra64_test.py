@@ -5,14 +5,14 @@
 覆盖（每一项都要串口打点 + 像素/输入证据）：
   1) 开机 logo 淡入      [UI] boot logo show frames=N fade=ok
   2) 关机/重启画面        [UI] shutdown anim start / [UI] reboot anim start + 动画帧数 + 画面像素
-  3) 开始按钮图标        [UI] start icon blit size=24 + 任务栏开始按钮处有彩色图标像素
+  3) 开始按钮图标        [DOCK64] start icon src=.. size=46 ok=1 + Dock 最左开始图标处有彩色像素
   4) 桌面图标拖动        QEMU monitor 注入左键拖动 >5px -> [UI] icon drag idx=..
                         再对（移动后的）图标双击 -> [UI] desktop icon open kind=..（双击没被弄坏）
   5) 标题栏三按钮        像素可区分：最小化/最大化不再与标题栏同色（64,64,64），关闭是红底、
                         最小化是横线（白像素纵向跨度小）、最大化是方框（跨度大）
-  6) 时钟年月日          [UI] clock text=YYYY-MM-DD HH:MM:SS + 任务栏右侧白色文字像素
+  6) 时钟年月日          [UI] clock text=YYYY-MM-DD HH:MM:SS + 右下角时钟玻璃片有文字像素
   另：桌面选择框（空白处拉框）[UI] selbox x0=.. y0=.. x1=.. y1=.. sel=..
-      + 拖动中的截图里有边框色(64,160,255)与半透明填充色(0,90,173)
+      + 拖动中的截图里：边框色(64,160,255) + 填充区域像素与拖前不同（半透明填充）
 
 鼠标注入的实测规律（本脚本据此做闭环定位，见 settle()/aim_axis()/press_on_icon()）：
   * QEMU monitor 的 `mouse_move dx dy` 每个事件 = guest 侧**一个 PS/2 包**；
@@ -41,13 +41,14 @@ QEMU_CANDIDATES = [
 ]
 
 # 与 kernel/gui64.cpp 一致的常量（判像素用）
-TASKBAR_H = 32
+# 本批（Windows 11 现代外观）：32px 任务栏 -> 60px Dock（离底 16px）；标题栏改为浅色玻璃 + 浅灰按钮
+TASKBAR_H = 76                 # = Dock 60 + 离底 16（底部保留区）
 BTN_W = 30
-C_TITLE_ACT = (32, 32, 32)
-C_BTN_BG = (64, 64, 64)
-C_DESKTOP = (0, 84, 158)
+C_TITLE_ACT = (246, 247, 249)  # 标题栏玻璃底色（浅色主题 Token title_bg）
+C_BTN_BG = (224, 224, 224)     # 最小化/最大化按钮底色（Token btn_bg）
+C_BTN_CLOSE = (196, 43, 28)    # 关闭按钮红底（Token btn_close）
+C_DESKTOP = (0, 84, 158)       # 旧 Win10 蓝：本批只用于"不应再出现"的反向断言
 C_SEL_EDGE = (64, 160, 255)
-C_SEL_FILL = (0, 90, 173)      # 桌面色 (0,84,158) 与 (0,128,255)@alpha40 的混合结果
 C_ICON_SEL = (0, 120, 215)
 
 # 桌面图标 0 的命中框（kernel/gui64.cpp：x±4 / y-4..y+ICON_W+18，ICON_W=48）
@@ -213,13 +214,13 @@ def rect_count_color(px, w, x0, y0, x1, y1, target, tol=8):
 
 
 def rect_white_spread(px, w, x0, y0, x1, y1):
-    """白色（>=200）像素数量 + 纵向跨度。"""
+    """白色（>=250，避免把浅色按钮底 224 / 标题栏 246 算进来）像素数量 + 纵向跨度。"""
     n = 0
     ys = []
     for y in range(y0, y1):
         for x in range(x0, x1):
             c = sample(px, w, x, y)
-            if c[0] > 200 and c[1] > 200 and c[2] > 200:
+            if c[0] >= 250 and c[1] >= 250 and c[2] >= 250:
                 n += 1
                 ys.append(y)
     return n, (max(ys) - min(ys) if ys else -1)
@@ -343,9 +344,15 @@ def main():
         check("开机 logo 淡入打点", m is not None, "frames=%s" % (m.group(1) if m else "?"))
         check("开机 logo 帧数 >= 8", (m is not None) and int(m.group(1)) >= 8)
 
-        m = re.search(r"\[UI\] start icon blit size=(\d+)", log0)
-        check("开始按钮图标打点", m is not None, "size=%s" % (m.group(1) if m else "?"))
-        check("开始按钮图标 16..32px", (m is not None) and 16 <= int(m.group(1)) <= 32)
+        m = re.search(r"\[DOCK64\] start icon src=(\S+) size=(\d+) ok=(\d)", log0)
+        check("开始按钮图标打点（Dock 最左，真文件 logo/kaisi.png）", m is not None,
+              m.group(0) if m else "?")
+        check("开始按钮图标 44..48px（Token 44-48）", (m is not None) and 44 <= int(m.group(2)) <= 48,
+              "size=%s" % (m.group(2) if m else "?"))
+        dg = re.search(r"\[DOCK64\] item idx=0 app=\d+ name=\S+ x=(\d+) y=(\d+) w=(\d+)", log0)
+        check("Dock 最左开始项几何打点", dg is not None, dg.group(0) if dg else "?")
+        START_BOX = (int(dg.group(1)), int(dg.group(2)), int(dg.group(1)) + int(dg.group(3)),
+                     int(dg.group(2)) + int(dg.group(3))) if dg else (389, 731, 435, 777)
 
         m = re.search(r"\[UI\] clock text=(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})", log0)
         check("时钟文本含年月日", m is not None)
@@ -358,6 +365,11 @@ def main():
         pos = settle(vm, mon)
         check("光标位置探测（零尺寸选择框打点）", pos is not None, "pos=%s" % (pos,))
         before = len(vm.log())
+        shot_pre = os.path.join(tmp, "preselbox.ppm")
+        mon.shot(shot_pre)                          # 拖之前的同区域（用于差分判填充）
+        pre_px = None
+        if os.path.exists(shot_pre):
+            _w, _h, pre_px = read_ppm(shot_pre)
         mon.button(1, wait=0.5)                     # 从当前空白处按下
         for _ in range(22):
             mon.move(-100, -100, wait=0.3)          # 每包 24px -> 往左上拉出大框
@@ -366,9 +378,16 @@ def main():
         if os.path.exists(shot_sel):
             w, h, px = read_ppm(shot_sel)
             edge = rect_count_color(px, w, 0, 0, 520, 390, C_SEL_EDGE, tol=10)
-            fill = rect_count_color(px, w, 8, 8, 500, 380, C_SEL_FILL, tol=4)
             check("选择框边框像素", edge > 50, "边框色像素=%d" % edge)
-            check("选择框半透明填充像素", fill > 500, "填充色像素=%d" % fill)
+            # 半透明填充：与"拖之前"的同区域比，必须有大片像素被改变（壁纸是渐变，填充色随底色变）
+            changed = 0
+            if pre_px is not None:
+                for y in range(10, 380, 2):
+                    for x in range(10, 500, 2):
+                        if sample(px, w, x, y) != sample(pre_px, w, x, y):
+                            changed += 1
+            check("选择框半透明填充（与拖前同区域对比，变化像素 > 500）", changed > 500,
+                  "变化像素=%d" % changed)
         mon.button(0, wait=0.6)
         time.sleep(0.8)
         m = re.search(r"\[UI\] selbox x0=(\d+) y0=(\d+) x1=(\d+) y1=(\d+) sel=(\d+)",
@@ -435,18 +454,20 @@ def main():
         mon.shot(shot_win)
         if os.path.exists(shot_win):
             w, h, px = read_ppm(shot_win)
+            # 本批标题栏是浅色玻璃：改用"关闭按钮红底（196,43,28）"定位标题行与三按钮区
             rows = []
             for y in range(0, h // 2):
                 c = 0
                 for x in range(0, w, 2):
-                    if near(sample(px, w, x, y), C_TITLE_ACT, 6):
+                    cc = sample(px, w, x, y)
+                    if cc[0] > 150 and cc[0] - cc[1] > 50 and cc[0] - cc[2] > 50:
                         c += 1
-                if c > 30:
+                if c >= 8:
                     rows.append(y)
             if rows:
                 ty2 = rows[len(rows) // 2]
-                xs = [x for x in range(0, w, 1) if near(sample(px, w, x, ty2), C_TITLE_ACT, 6)]
-                bx = max(xs) - BTN_W * 3            # 三按钮区左边界（= 窗口右缘 - 90）
+                xs = [x for x in range(0, w, 1) if near(sample(px, w, x, ty2), C_BTN_BG, 12)]
+                bx = max(xs) + 1 - BTN_W * 3 + 3 - 3    # 三按钮区左边界（= 窗口右缘 - 90）
                 y0, y1 = ty2 - 4, ty2 + 8           # 落在按钮矩形（高 16，居中）内部
                 r_min = (bx + 3, bx + 3 + BTN_W - 6)
                 r_max = (bx + BTN_W + 3, bx + BTN_W + 3 + BTN_W - 6)
@@ -465,8 +486,8 @@ def main():
                         if c[0] > 130 and c[0] - c[1] > 60 and c[0] - c[2] > 60:
                             close_red += 1
                 check("三按钮不再与标题栏同色", title_in < 20, "按钮内标题栏色像素=%d" % title_in)
-                check("最小化按钮背景可见", min_bg > 100, "(64,64,64) 像素=%d" % min_bg)
-                check("最大化按钮背景可见", max_bg > 100, "(64,64,64) 像素=%d" % max_bg)
+                check("最小化按钮背景可见", min_bg > 100, "(224,224,224) 像素=%d" % min_bg)
+                check("最大化按钮背景可见", max_bg > 100, "(224,224,224) 像素=%d" % max_bg)
                 check("最小化按钮有白色横线", min_white > 5, "白色像素=%d" % min_white)
                 check("最大化按钮有白色方框", max_white > 5, "白色像素=%d" % max_white)
                 check("最小化=横线 / 最大化=方框（纵向跨度可区分）",
@@ -479,20 +500,22 @@ def main():
             check("窗口截图", False, "screendump 失败")
 
         print("=== 5) 开始按钮图标 + 时钟像素 ===")
-        shot_tb = os.path.join(tmp, "taskbar.ppm")
+        shot_tb = os.path.join(tmp, "dock.ppm")
         mon.shot(shot_tb)
         if os.path.exists(shot_tb):
             w, h, px = read_ppm(shot_tb)
-            yb = h - TASKBAR_H
-            colorful = rect_colorful(px, w, 4, yb + 2, 34, yb + 30, thr=40)
-            check("开始按钮处有彩色图标像素（非手画色块）", colorful > 60, "彩色像素=%d" % colorful)
-            white = 0
-            for y in range(yb + 2, yb + TASKBAR_H - 2):
-                for x in range(w - 300, w - 4):
+            colorful = rect_colorful(px, w, START_BOX[0], START_BOX[1], START_BOX[2], START_BOX[3], thr=40)
+            check("Dock 最左开始按钮处有彩色图标像素（真 kaisi.png）", colorful > 60, "彩色像素=%d" % colorful)
+            ck = re.search(r"\[DOCK64\] clock chip x=(\d+) y=(\d+) w=(\d+) h=(\d+)", vm.log())
+            cx0, cy0, cw0, ch0 = (int(ck.group(i)) for i in range(1, 5)) if ck else (1054, 724, 210, 60)
+            base = sample(px, w, cx0 + 6, cy0 + ch0 // 2)
+            text = 0
+            for y in range(cy0 + 4, cy0 + ch0 - 4):
+                for x in range(cx0 + 2, cx0 + cw0 - 2):
                     c = sample(px, w, x, y)
-                    if c[0] > 200 and c[1] > 200 and c[2] > 200:
-                        white += 1
-            check("任务栏右侧有白色时钟文字", white > 25, "白色像素=%d" % white)
+                    if sum(abs(c[i] - base[i]) for i in range(3)) > 45:
+                        text += 1
+            check("右下角时钟玻璃片有文字像素", text > 25, "文字像素=%d" % text)
 
         print("=== 6) 不能出现的日志 ===")
         log = vm.log()

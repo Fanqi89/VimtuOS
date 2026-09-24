@@ -12,6 +12,7 @@
 //   这样既保持了 store64 的格式不动（它有自己的验收断言），又让 `store dump` 里的人眼可读。
 #include "config64.h"
 #include "store64.h"      // 真落盘载体（VFS 文件 /store.a|b，无卷时降级裸盘槽）
+#include "theme64.h"     // 本批新增键的取值范围/默认值直接取 Token（dock.size/dock.icon/dock.gap）
 #include "debug64.h"      // dbg64_* + 行锁
 #include "x86_64.h"       // ticks64 / ms_to_ticks64
 
@@ -102,6 +103,17 @@ static const Cfg64Def kDefs[] = {
     { "sess.restore",      CFG64_T_STR,  0,    ""        }, // 会话恢复列表 "3,2"（应用 id）
     { "store.persist",     CFG64_T_INT,  1,    nullptr },
     { "boot.verbose",      CFG64_T_BOOL, 1,    nullptr },   // ★ 批次 N：开机滚屏引导控制台（1=显示，0=跳过）
+    // ★ 本批（Windows 11 现代外观）：主题 / 壁纸 / Dock / 减少动画
+    { "ui.theme",          CFG64_T_INT,  0,    nullptr },   // 界面主题 id（0 白=默认 … 5 粉紫；theme64.h）
+    { "ui.reduce_motion",  CFG64_T_BOOL, 0,    nullptr },   // 1 = 减少动画（动效全部 0ms/1 帧到位）
+    { "ui.wall.mode",      CFG64_T_INT,  0,    nullptr },   // 桌面壁纸适应模式（0 填充=默认）
+    { "ui.wall.lock_mode", CFG64_T_INT,  0,    nullptr },   // 锁屏壁纸适应模式（下一波锁屏用）
+    { "ui.wall.path",      CFG64_T_STR,  0,    ""        }, // 壁纸文件路径（VimtuFS2 内；空=内置兜底）
+    { "ui.avatar.path",    CFG64_T_STR,  0,    ""        }, // 头像文件路径（下一波用）
+    { "dock.len",          CFG64_T_INT,  0,    nullptr },   // Dock 长度（0 = 自动）
+    { "dock.size",         CFG64_T_INT,  60,   nullptr },   // Dock 高（Token 60）
+    { "dock.icon",         CFG64_T_INT,  46,   nullptr },   // 图标边长（Token 44–48 → 46）
+    { "dock.gap",          CFG64_T_INT,  11,   nullptr },   // 图标间距（Token 10–12 → 11）
 };
 #define CFG64_DEF_N ((int)(sizeof(kDefs) / sizeof(kDefs[0])))
 // 启动日志里最多逐条打印多少个默认值（避免刷屏；总数单独打一行）
@@ -671,3 +683,63 @@ int  cfg64_session_mode64() { return config64_get_int64("session.mode", 0) ? 1 :
 void cfg64_set_session_mode64(int mode) { config64_set_int64("session.mode", mode ? 1 : 0); }
 int  cfg64_session_restore64(char* out, int out_max) { return config64_get_str64("sess.restore", "", out, out_max); }
 void cfg64_set_session_restore64(const char* list) { config64_set_str64("sess.restore", list ? list : ""); }
+
+// ==================== 本批（Windows 11 现代外观）的语义封装 ====================
+int  cfg64_theme64() { return config64_get_int64("ui.theme", 0); }
+void cfg64_set_theme64(int id) {
+    if (id < 0) id = 0;
+    if (id > THEME64_THEME_COUNT - 1) id = THEME64_THEME_COUNT - 1;
+    config64_set_int64("ui.theme", id);
+}
+
+int  cfg64_reduce_motion64() { return config64_get_int64("ui.reduce_motion", 0) ? 1 : 0; }
+void cfg64_set_reduce_motion64(int on) { config64_set_int64("ui.reduce_motion", on ? 1 : 0); }
+
+int  cfg64_wall_mode64() {
+    int m = config64_get_int64("ui.wall.mode", 0);
+    if (m < 0 || m > 5) m = 0;
+    return m;
+}
+void cfg64_set_wall_mode64(int mode) {
+    if (mode < 0 || mode > 5) mode = 0;
+    config64_set_int64("ui.wall.mode", mode);
+}
+
+int  cfg64_lock_wall_mode64() {
+    int m = config64_get_int64("ui.wall.lock_mode", 0);
+    if (m < 0 || m > 5) m = 0;
+    return m;
+}
+void cfg64_set_lock_wall_mode64(int mode) {
+    if (mode < 0 || mode > 5) mode = 0;
+    config64_set_int64("ui.wall.lock_mode", mode);
+}
+
+int  cfg64_wall_path64(char* out, int out_max) { return config64_get_str64("ui.wall.path", "", out, out_max); }
+void cfg64_set_wall_path64(const char* path) { config64_set_str64("ui.wall.path", path ? path : ""); }
+int  cfg64_avatar_path64(char* out, int out_max) { return config64_get_str64("ui.avatar.path", "", out, out_max); }
+void cfg64_set_avatar_path64(const char* path) { config64_set_str64("ui.avatar.path", path ? path : ""); }
+
+int  cfg64_dock_len64() { int v = config64_get_int64("dock.len", 0); return v < 0 ? 0 : v; }
+void cfg64_set_dock_len64(int len) { config64_set_int64("dock.len", len < 0 ? 0 : len); }
+int  cfg64_dock_size64() {
+    int v = config64_get_int64("dock.size", THEME64_DOCK_H);
+    if (v < 44) v = 44;            // 需求：Dock 高 60（Token）→ 允许 44..80
+    if (v > 80) v = 80;
+    return v;
+}
+void cfg64_set_dock_size64(int h) { config64_set_int64("dock.size", h); }
+int  cfg64_dock_icon64() {
+    int v = config64_get_int64("dock.icon", THEME64_DOCK_ICON);
+    if (v < 44) v = 44;            // 需求：图标 44–48px（Token 46）
+    if (v > 48) v = 48;
+    return v;
+}
+void cfg64_set_dock_icon64(int px) { config64_set_int64("dock.icon", px); }
+int  cfg64_dock_gap64() {
+    int v = config64_get_int64("dock.gap", THEME64_DOCK_GAP);
+    if (v < 0) v = 0;
+    if (v > 40) v = 40;
+    return v;
+}
+void cfg64_set_dock_gap64(int px) { config64_set_int64("dock.gap", px); }

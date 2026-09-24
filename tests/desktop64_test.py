@@ -6,8 +6,8 @@
   1) 内存层      [MEM64] selftest PASS（堆/页池/归属记账/坏指针防护）
   2) 外壳自检    [GUI64] selftest PASS（窗口建销/z 序/几何/close_app/语言/脏矩形）
   3) 桌面起来    [GUI64] desktop init WxH + [GUI64] ready + [OS] ready (idle)
-  4) 纯色桌面    桌面主色（Win10 蓝 0,84,158）占屏幕多数像素
-  5) 任务栏      底部 32px 是深色条，且有条内白色文字（时钟）
+  4) 壁纸桌面    默认白色主题：桌面区是浅色壁纸（不是纯色块，有渐变/纹理），且不是旧的 Win10 蓝
+  5) Dock 栏     底部 76px 保留区里是 Windows 11 风格 Dock（面板色与壁纸不同 + 右侧时钟玻璃片有文字）
   6) 应用能开    用 Win 键 + 数字快捷键逐个打开 8 个应用，断言各自的串口开场行
   7) 窗口真的画  开窗后 (32,32,32) 标题栏像素数从 ~0 跳到几千（前后对比）
   8) 脏矩形      鼠标移动后只有小块像素变化（>20 且 <3% 屏幕），证明不是整屏重绘
@@ -254,23 +254,44 @@ def main():
             w, h, px = read_ppm(shot1)
             check("分辨率 1280x800", (w, h) == (1280, 800), "实际 %dx%d" % (w, h))
             if (w, h) == (1280, 800):
+                # 本批（Windows 11 现代外观）：默认白色主题，桌面是"壁纸 + 适应模式"，
+                # 不再是纯 Win10 蓝。这里锁三件事：不是旧蓝、是浅色、有纹理（不是纯色块）。
                 nblue = count_color(px, w, h, (0, 84, 158), tol=8, step=8)
                 total = ((w + 7) // 8) * ((h + 7) // 8)
                 ratio = nblue / max(1, total)
-                check("桌面主色占比 >40%", ratio > 0.40, "实际 %.1f%%" % (ratio * 100))
-                bar = sample(px, w, 640, 785)
-                check("任务栏是深色条", all(abs(bar[i] - v) <= 12 for i, v in enumerate((20, 20, 20))),
-                      "y=785 实际 %s" % (bar,))
-                # 时钟是右对齐的 8 个数字，字形细、抗锯齿，必须 step=1 精确数
-                white = 0
-                for y in range(772, 798, 1):
-                    for x in range(1000, 1279, 1):
+                check("不再是旧的 Win10 纯蓝桌面（占比 <5%）", ratio < 0.05, "旧蓝占比 %.2f%%" % (ratio * 100))
+                # 桌面区（避开 Dock 与桌面图标）均值 + 方差
+                tot = 0
+                npx = 0
+                vals = []
+                for y in range(120, 420, 4):
+                    for x in range(300, 900, 4):
                         c = sample(px, w, x, y)
-                        if c[0] > 200 and c[1] > 200 and c[2] > 200:
-                            white += 1
-                check("任务栏有白色时钟文字", white > 25, "白色像素=%d" % white)
-                dwin0 = count_color(px, w, h, (32, 32, 32), tol=6, step=2)
-                check("开窗之前没有窗口标题栏", dwin0 < 200, "(32,32,32) 像素=%d" % dwin0)
+                        tot += c[0] + c[1] + c[2]
+                        npx += 1
+                        vals.append(c[1])
+                lum = tot / (3.0 * npx)
+                mean = sum(vals) / len(vals)
+                var = sum((v - mean) ** 2 for v in vals) / len(vals)
+                check("白色主题：桌面是浅色（平均亮度 > 200）", lum > 200, "亮度 %.1f" % lum)
+                check("桌面是壁纸（有渐变/纹理，方差 > 0.5）", var > 0.5, "绿通道方差 %.2f" % var)
+                # Dock：面板色（固定浅灰）出现在保留区；上方壁纸不同
+                bar = sample(px, w, 640, 750)
+                above = sample(px, w, 640, 680)
+                check("底部保留区里是 Dock 面板（与壁纸明显不同）",
+                      sum(abs(bar[i] - above[i]) for i in range(3)) > 6, "面板 %s 壁纸 %s" % (bar, above))
+                # 右侧时钟玻璃片：内有文字像素（与面板底色不同）
+                text = 0
+                for y in range(736, 772, 1):
+                    for x in range(1058, 1260, 1):
+                        c = sample(px, w, x, y)
+                        if sum(abs(c[i] - bar[i]) for i in range(3)) > 45:
+                            text += 1
+                check("时钟玻璃片里有文字像素", text > 25, "文字像素=%d" % text)
+                # 开窗之前：屏幕中心是壁纸（没有窗口）
+                ctr = sample(px, w, 640, 400)
+                check("开窗之前屏幕中心是壁纸（不是窗口内容）", ctr != (240, 240, 240),
+                      "center=%s" % (ctr,))
 
         print("=== 3) 鼠标移动 -> 脏矩形（只该有一小块变化）===")
         if up:
@@ -303,18 +324,13 @@ def main():
             mon.shot(shot3)
             w3, h3, px3 = read_ppm(shot3)
             if (w3, h3) == (1280, 800):
-                dwin1 = count_color(px3, w3, h3, (32, 32, 32), tol=6, step=2)
-                check("开窗后出现标题栏像素（>2000）", dwin1 > 2000, "(32,32,32) 像素=%d" % dwin1)
-                # 任务栏窗口按钮：任务栏里应该出现非纯深色的按钮块
-                # 任务栏窗口按钮：只在任务栏条内按 step=1 精确统计（不用全屏抽样）
-                # 单独扫任务栏区域（避免全屏 step 混入）
-                n_tb = 0
-                for y in range(772, 796, 2):
-                    for x in range(40, 900, 3):
-                        c = sample(px3, w3, x, y)
-                        if abs(c[0] - 48) <= 14 and abs(c[1] - 48) <= 14 and abs(c[2] - 48) <= 14:
-                            n_tb += 1
-                check("任务栏出现窗口按钮", n_tb > 20, "按钮色像素=%d" % n_tb)
+                # 窗口真的画上去了：与"开窗前"的同区域对比（屏幕中上部大面积变化）
+                d_win = 0
+                for y in range(60, 500, 2):
+                    for x in range(200, 1100, 2):
+                        if sample(px, w, x, y) != sample(px3, w3, x, y):
+                            d_win += 1
+                check("开窗后屏幕中上部大面积变化（窗口真的画出来了）", d_win > 5000, "变化点=%d" % d_win)
                 log = slog()
                 check("扫雷布局日志出现", "[UI] mines layout client=" in log,
                       "" if "[UI] mines layout client=" in log else "（未出现）")
