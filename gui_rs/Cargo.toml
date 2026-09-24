@@ -1,0 +1,25 @@
+# gui_rs/Cargo.toml - 只是为了 IDE / 将来切换 cargo 时有一份清单；
+# ★ 当前构建链**不用 cargo**：build64.sh -> gui_rs/build_rs.sh 直接调 rustc
+#   （理由与参数见 build_rs.sh 顶部注释：单 crate、产物路径可控、不引入 target/ 目录）。
+#
+# 若真要用 cargo 编（不推荐，构建链不依赖）：
+#   rustup target add x86_64-unknown-none
+#   cargo build --release --target x86_64-unknown-none
+[package]
+name = "gui_rs"
+version = "0.1.0"
+edition = "2021"
+description = "VimtuOS GUI Rust side: design tokens + theme palette (no_std, no alloc)"
+license = "MIT"
+
+[lib]
+name = "gui_rs"
+crate-type = ["staticlib"]
+
+[dependencies]
+# 无依赖：no_std、无 alloc（内核里没有分配器）
+
+[profile.release]
+panic = "abort"
+debug = false
+opt-level = 2

@@ -156,6 +156,17 @@ echo "==> 资源对象（objcopy -> elf64，两份内核共用同一批）"
 # OS 内核用同一批资源对象（直接复用）
 cp "$BUILD"/font_*.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o "$BUILD/os/"
 
+echo "==> Rust 模块（gui_rs crate：设计 Token 表 + 主题配色计算；项目路线 C + C++ + Rust）"
+# 为什么单独一段：Rust 用 `rustc --target x86_64-unknown-none` 编成**可直接被 ld.lld 链接**
+#   的目标文件（gui_rs/gui_rs.o）。
+#   ★ 工具链前置（本机已装）：rustup + stable-x86_64-pc-windows-gnu (rustc 1.98.1)，
+#     且 `rustup target add x86_64-unknown-none`（装 no_std 的 core/rust-src）。
+#   ★ 只进**系统内核**（安装介质不链 Rust 模块）；具体参数与"为什么用 rustup shim 的
+#     绝对路径（MSYS2 自带 rustc 会 E0463: can't find crate for `core`）"见 gui_rs/build_rs.sh。
+#   ★ 找不到 rustc / 没有那个目标 / 编译失败：build_rs.sh 会**明确报错并非 0 退出**，
+#     set -e 让整个构建立刻失败（绝不静默跳过 —— 那样 Rust 模块会悄悄从内核里消失）。
+bash gui_rs/build_rs.sh
+
 echo "==> 用户态演示程序（真实 ring3 代码：nasm 平铺二进制 -> objcopy 嵌入内核）"
 # user/demo64.asm 是**用户态**程序（ring3，用 int 0x80 与内核通信），不是内核代码：
 #   nasm 出平铺二进制 -> objcopy 变 elf64 目标文件 -> 链进两份内核（成本很低）。
@@ -242,6 +253,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
 $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 
 $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
+    gui_rs/gui_rs.o \
     "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/mem64.o \
     "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o \
     "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \

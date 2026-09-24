@@ -94,6 +94,7 @@
 #include "update64.h"    // update：标记文件 -> 应用 -> store/重启（边界见 update64.h）
 #include "proc64.h"      // proc：proc64 进程表（list / run / kill）
 #include "console64.h"   // ★ 批次 N：dmesg（开机滚屏引导控制台的启动日志缓冲）+ boot verbose
+#include "rust64.h"     // ★ Rust 模块（gui_rs）：设计 Token + 主题配色（terminal `rust` 命令用它）
 
 // ==================== 常量 ====================
 #define TERM_MAX_INST    4          // 多开上限（照 32 位；第 5 次只激活最新的）
@@ -710,6 +711,7 @@ static const char* HELP_EN =
     "  proc list             proc64 process table (pid/ppid/state/tasks/CR3/name) - real processes with per-process CR3\n"
     "  proc run NAME|/PATH   create + start a real proc64 process (built-in: spin -> long-lived /spin.elf)\n"
     "  proc kill PID [SIG]   signal a proc64 process (default SIGKILL=9; the task manager process page uses this)\n"
+    "  rust [tokens|set N]   Rust module (gui_rs): design tokens + theme palette; rust set N switches theme\n"
     "No 'not supported' commands remain: update/preload were the last two and are real now.\n";
 
 static const char* HELP_ZH =
@@ -766,6 +768,7 @@ static const char* HELP_ZH =
     "  proc list             proc64 进程表（pid/ppid/状态/线程数/CR3/名字）—— 每进程独立 CR3 的真进程\n"
     "  proc run 名字|/路径   创建并启动一个真 proc64 进程（内置：spin -> 长命 /spin.elf）\n"
     "  proc kill PID [SIG]   给 proc64 进程发信号（默认 SIGKILL=9；任务管理器进程页回车走的就是它）\n"
+    "  rust [tokens|set N]   Rust 模块（gui_rs）：设计 Token + 主题配色；rust set N 切换主题\n"
     "没有\"未支持\"命令了：最后两条 update / preload 已接真。\n";
 // ---------- 命令实现 ----------
 static void cmd_help(TerminalState* ts) {
@@ -3201,6 +3204,187 @@ static void cmd_about(TerminalState* ts) {
                          "    性能页补\\\"显卡\\\"项、in_ring3 槽位 kill 后复用的缺陷根治\\n"));
 }
 
+// ==================== rust：Rust 模块（gui_rs）运行期接口 ====================
+// 这是"Rust 侧供 C++ 调用"的第二个调用点（第一个是启动期自检，见 kernel64.cpp）：
+//   主题表 / 设计 Token / 配色计算全部从 Rust 取（C++ 侧不各存一份常量）。
+// 打点（自动验收 grep）：[TERM] rust cmd=<sub> rc=<0|1>
+static void rust64_put_hex6(TerminalState* ts, uint32_t v) {
+    static const char* H = "0123456789ABCDEF";
+    char buf[7];
+    for (int i = 5; i >= 0; i--) { buf[i] = H[v & 0xF]; v >>= 4; }
+    buf[6] = 0;
+    ts_puts(ts, buf);
+}
+
+static int32_t rust64_tok_id(const char* name) {
+    uintptr_t n = 0;
+    while (name[n]) n++;
+    return rust64_token_lookup64((const uint8_t*)name, n);
+}
+
+// 串口打点（自动验收 grep）：[RUST64] term rust cmd=<sub> theme=<i> accent=#RRGGBB tokens=<n>
+static void rust64_dbg_hex6(uint32_t v) {
+    static const char* H = "0123456789ABCDEF";
+    char buf[7];
+    for (int i = 5; i >= 0; i--) { buf[i] = H[v & 0xF]; v >>= 4; }
+    buf[6] = 0;
+    dbg64_str(buf);
+}
+
+static void rust64_term_log64(const char* what, uint32_t theme) {
+    dbg64_line_begin64();
+    dbg64_str("[RUST64] term rust cmd=");
+    dbg64_str(what);
+    dbg64_str(" theme=");
+    dbg64_dec((uint64_t)theme);
+    dbg64_str(" accent=#");
+    rust64_dbg_hex6(rust64_accent_rgb64(theme));
+    dbg64_str(" tokens=");
+    dbg64_dec((uint64_t)rust64_token_count64());
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+static void rust64_put_tok_px(TerminalState* ts, const char* name) {
+    const int32_t id = rust64_tok_id(name);
+    ts_puts(ts, " ");
+    ts_puts(ts, name);
+    ts_puts(ts, "=");
+    if (id < 0) { ts_puts(ts, "?"); return; }
+    const int32_t px = rust64_token_px64((uint32_t)id);
+    const uint32_t pm = rust64_token_permille64((uint32_t)id);
+    if (px >= 0) ts_put_i64(ts, px);
+    else { ts_put_u64(ts, (uint64_t)pm); ts_puts(ts, "permille"); }
+}
+
+// rust | rust tokens | rust set <idx>
+static bool cmd_rust(TerminalState* ts, const char* sub, const char* arg2) {
+    const uint32_t n = rust64_theme_count64();
+    uint8_t name[48];
+
+    if (st_eq(sub, "set") || st_eq(sub, "theme")) {
+        const int idx = parse_dec(arg2 ? arg2 : "");
+        if (idx < 0 || (uint32_t)idx >= n) {
+            ts_puts(ts, gui64_tr("rust set: usage: rust set <0..", "rust set: 用法: rust set <0.."));
+            ts_put_u64(ts, (uint64_t)(n - 1));
+            ts_puts(ts, gui64_tr(">   (rust lists them)\n", ">   （rust 会列出全部主题）\n"));
+            return false;
+        }
+        if (rust64_theme_set64((uint32_t)idx) != 0) {
+            ts_puts(ts, "rust set: rust64_theme_set64() failed\n");
+            return false;
+        }
+        const uint32_t cur = rust64_theme_current64();
+        ts_puts(ts, "[RUST64] theme set idx=");
+        ts_put_u64(ts, (uint64_t)cur);
+        ts_puts(ts, " accent=#");
+        rust64_put_hex6(ts, rust64_accent_rgb64(cur));
+        ts_puts(ts, gui64_tr(" (theme palette is read back from Rust on demand)\n",
+                             "（配色是每次按需从 Rust 侧读回来的）\n"));
+        rust64_term_log64("set", cur);   // 串口证据：[RUST64] term rust cmd=set ...
+        return true;
+    }
+
+    if (st_eq(sub, "tokens")) {
+        const uint32_t tn = rust64_token_count64();
+        ts_puts(ts, "[RUST64] design tokens (gui_rs, count=");
+        ts_put_u64(ts, (uint64_t)tn);
+        ts_puts(ts, ")\n");
+        for (uint32_t i = 0; i < tn; i++) {
+            const uint32_t len = rust64_token_name64(i, name, sizeof(name));
+            const int32_t px = rust64_token_px64(i);
+            const uint32_t pm = rust64_token_permille64(i);
+            ts_puts(ts, "  [");
+            ts_put_u64(ts, (uint64_t)i);
+            ts_puts(ts, "] ");
+            for (uint32_t j = 0; j < len && j < (uint32_t)sizeof(name); j++) ts_putc(ts, (uint32_t)name[j]);
+            ts_puts(ts, " = ");
+            if (px >= 0) { ts_put_i64(ts, px); ts_puts(ts, " px/ms"); }
+            else         { ts_put_u64(ts, (uint64_t)pm); ts_puts(ts, " permille"); }
+            ts_putc(ts, '\n');
+        }
+        rust64_term_log64("tokens", rust64_theme_current64());
+        return true;
+    }
+
+    if (sub[0] != 0) {
+        ts_puts(ts, gui64_tr("rust: unknown subcommand; try: rust | rust tokens | rust set <idx>\n",
+                             "rust: 未知子命令；试试: rust | rust tokens | rust set <idx>\n"));
+        return false;
+    }
+
+    // 默认：当前主题（名字 + 配色 + 阴影）+ 全部主题的 accent + 关键 Token 抽样
+    const uint32_t cur = rust64_theme_current64();
+    ts_puts(ts, "[RUST64] gui_rs (no_std Rust) theme=");
+    ts_put_u64(ts, (uint64_t)cur);
+    ts_puts(ts, " name=");
+    {
+        const uint32_t len = rust64_theme_name64(cur, name, sizeof(name));
+        for (uint32_t j = 0; j < len && j < (uint32_t)sizeof(name); j++) ts_putc(ts, (uint32_t)name[j]);
+    }
+    ts_puts(ts, " accent=#");
+    rust64_put_hex6(ts, rust64_accent_rgb64(cur));
+    ts_puts(ts, gui64_tr(" (all ", " （全部 "));
+    ts_put_u64(ts, (uint64_t)n);
+    ts_puts(ts, gui64_tr(" themes: ", " 个主题: "));
+    rust64_term_log64("info", cur);
+
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t len = rust64_theme_name64(i, name, sizeof(name));
+        ts_puts(ts, "[");
+        ts_put_u64(ts, (uint64_t)i);
+        ts_puts(ts, "]");
+
+        for (uint32_t j = 0; j < len && j < (uint32_t)sizeof(name); j++) ts_putc(ts, (uint32_t)name[j]);
+        ts_puts(ts, "=#");
+        rust64_put_hex6(ts, rust64_accent_rgb64(i));
+        ts_puts(ts, " ");
+    }
+    ts_puts(ts, ")\n");
+    Rust64ThemeColors c;
+    if (rust64_theme_colors64(cur, &c) == 0) {
+        ts_puts(ts, "  window_bg=");
+        rust64_put_hex6(ts, ((uint32_t)c.window_bg.r << 16) | ((uint32_t)c.window_bg.g << 8) | c.window_bg.b);
+        ts_puts(ts, " card=");
+        rust64_put_hex6(ts, ((uint32_t)c.card_bg.r << 16) | ((uint32_t)c.card_bg.g << 8) | c.card_bg.b);
+        ts_puts(ts, " text=");
+        rust64_put_hex6(ts, ((uint32_t)c.text.r << 16) | ((uint32_t)c.text.g << 8) | c.text.b);
+        ts_puts(ts, " dock=");
+        rust64_put_hex6(ts, ((uint32_t)c.dock.r << 16) | ((uint32_t)c.dock.g << 8) | c.dock.b);
+        ts_puts(ts, " dark=");
+        ts_put_u64(ts, (uint64_t)c.is_dark);
+        ts_putc(ts, '\n');
+        Rust64Shadow sh;
+        if (rust64_theme_shadow64(cur, 0, &sh) == 0) {
+            ts_puts(ts, "  shadow near dy=");
+            ts_put_i64(ts, sh.dy);
+            ts_puts(ts, " blur=");
+            ts_put_u64(ts, (uint64_t)sh.blur);
+            ts_puts(ts, " alpha=");
+            ts_put_u64(ts, (uint64_t)sh.color.a);
+            if (rust64_theme_shadow64(cur, 1, &sh) == 0) {
+                ts_puts(ts, "  far dy=");
+                ts_put_i64(ts, sh.dy);
+                ts_puts(ts, " blur=");
+                ts_put_u64(ts, (uint64_t)sh.blur);
+                ts_puts(ts, " alpha=");
+                ts_put_u64(ts, (uint64_t)sh.color.a);
+            }
+            ts_putc(ts, '\n');
+        }
+    }
+    ts_puts(ts, "  tokens:");
+    rust64_put_tok_px(ts, "radius.window");
+    rust64_put_tok_px(ts, "radius.button");
+    rust64_put_tok_px(ts, "blur.background");
+    rust64_put_tok_px(ts, "alpha.backdrop_material");
+    rust64_put_tok_px(ts, "alpha.content_card");
+    rust64_put_tok_px(ts, "motion.normal_ms");
+    rust64_put_tok_px(ts, "ease.x1");
+    ts_puts(ts, "   (rust tokens = all)\n");
+    return true;
+}
+
 static void cmd_clear(TerminalState* ts) {
     ts_clear(ts);
     ts_dirty_client(ts);
@@ -3298,6 +3482,9 @@ static void shell_exec(TerminalState* ts, const char* line) {
         ok = cmd_set(ts, g_arg1, g_arg2);
     } else if (st_eq(g_cmd, "about")) {
         cmd_about(ts);
+    } else if (st_eq(g_cmd, "rust")) {
+        // ★ Rust 模块（gui_rs）：设计 Token + 主题配色（rust | rust tokens | rust set <idx>）
+        ok = cmd_rust(ts, g_arg1, g_arg2);
     } else if (st_eq(g_cmd, "clear") || st_eq(g_cmd, "cls")) {
         cmd_clear(ts);
     } else if (st_eq(g_cmd, "reboot") || st_eq(g_cmd, "restart")) {

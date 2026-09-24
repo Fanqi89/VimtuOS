@@ -72,6 +72,8 @@ extern "C" const uint8_t _binary_build64_user_demo64_bin_end[];
 #include "memlayout64.h"
 
 #include "console64.h"   // ★ 批次 N：开机滚屏引导控制台（启动日志环形缓冲 + 回放 + dmesg）
+#include "rust64.h"      // ★ 项目路线（C + C++ + Rust）：Rust 模块 gui_rs 的 C 链接声明
+                         //   （设计 Token + 主题配色；只有**系统内核**链接它，见 build64.sh）
 #include "hwui64.h"      // ★ item 5a：屏幕硬件检查报告（**两份内核都编**：安装介质与系统内核共用）
 // ---- 平台层（64 位）：PIC/PIT/IDT/TSS/RTC，实现在 kernel/x86_64.cpp ----
 #include "x86_64.h"
@@ -298,6 +300,67 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
 #endif
 
 #ifndef VIMTU_INSTALLER_MEDIA
+// ==================== Rust 模块（gui_rs crate）：设计 Token + 主题配色 ====================
+// 位置与理由：
+//   1) 只在**系统内核**里链接 gui_rs.o（安装介质内核不链，见 build64.sh），所以本段必须
+//      待在 `#ifndef VIMTU_INSTALLER_MEDIA` 里 —— 安装程序内核编不到这些调用；
+//   2) Rust 侧导出的是 `#[no_mangle] extern "C"` 符号，C++ 必须在**文件作用域**声明
+//      （块作用域上的 linkage 说明符 clang 不接受：实测 "expected unqualified-id"）；
+//      声明都集中在 kernel/rust64.h，这里只放钩子与启动打点。
+// 打点格式（自动验收 grep，勿改）：[RUST64] tokens ok themes=N accent=#RRGGBB selftest PASS
+extern "C" void rust64_panic_hook64(const uint8_t* msg, uint32_t len) {
+    // Rust 侧 panic：先把现场打到串口（msg 是 NUL 结尾的 UTF-8），再走内核统一蓝屏。
+    // panic64_bsod64 不返回；万一它返回了，Rust 侧自己还有 `cli; hlt` 兜底。
+    (void)len;
+    dbg64_str("[RUST64] panic hook: ");
+    if (msg) dbg64_str((const char*)msg);
+    dbg64_nl();
+    panic64_bsod64("RUST64 panic", (uint64_t)(uintptr_t)msg);
+}
+
+// 小工具：打 6 位大写十六进制（accent 色值；dbg64_hex64 是固定 16 位宽，不适合这里）
+static void rust64_print_hex6_64(uint32_t v) {
+    static const char* H = "0123456789ABCDEF";
+    char buf[7];
+    for (int i = 5; i >= 0; i--) { buf[i] = H[v & 0xF]; v >>= 4; }
+    buf[6] = 0;
+    dbg64_str(buf);
+}
+
+// 启动期调用一次：装 panic 钩子 + 跑 Rust 侧自检 + 打点。
+// 注意"不改运行期状态"：rust64_tokens_init64() 的自检内部会保存/恢复当前主题。
+static void rust64_boot_init64() {
+    rust64_panic_hook_set64(&rust64_panic_hook64);   // Rust panic -> [RUST64] + 内核蓝屏
+    const uint32_t st  = rust64_tokens_init64();     // 0 = Token/主题/配色计算自检全过
+    const uint32_t cur = rust64_theme_current64();
+    const uint32_t acc = rust64_accent_rgb64(cur);
+    dbg64_line_begin64();
+    dbg64_str("[RUST64] tokens ok themes=");
+    dbg64_dec((uint64_t)rust64_theme_count64());
+    dbg64_str(" accent=#");
+    rust64_print_hex6_64(acc);
+    dbg64_str(" selftest ");
+    if (st == 0 && rust64_panicked64() == 0) {
+        dbg64_str("PASS");
+    } else {
+        dbg64_str("FAIL mask=");
+        dbg64_dec((uint64_t)st);
+        dbg64_str(" panicked=");
+        dbg64_dec((uint64_t)rust64_panicked64());
+    }
+    // 主题名（UTF-8，名字是稳定接口）：把 "当前主题 + 名字" 一起留在启动日志里
+    dbg64_str(" theme=");
+    dbg64_dec((uint64_t)cur);
+    dbg64_str(" name=");
+    {
+        uint8_t name[32];
+        const uint32_t n = rust64_theme_name64(cur, name, sizeof(name));
+        for (uint32_t i = 0; i < n && i < (uint32_t)sizeof(name); i++) dbg64_putc((char)name[i]);
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
 [[noreturn]] static void os_boot_path(const BootInfo* bi) {
     dbg64_str("[OS] booted from installed disk (system kernel, no installer)");
     dbg64_nl();
@@ -524,6 +587,10 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
 #if defined(PROC64_UEFI_CR3_EXPERIMENT) && (PROC64_UEFI_CR3_EXPERIMENT == 1)
     (void)proc64_uefi_cr3_experiment_start64();
 #endif
+    // ==================== Rust 模块自检（项目路线：C + C++ + Rust）====================
+    // 位置：所有启动期工作之后、开机滚屏之前 —— 这样 [RUST64] 行会进 boot console 的
+    //   回放缓冲（屏上也能看到），并且**在进桌面之前**就证明"Rust 真的在跑"。
+    rust64_boot_init64();
     // ==================== 开机滚屏引导控制台（批次 N）====================
     // 位置：所有启动期工作之后、gui64_run 之前 —— 也就是"进桌面之前"屏上跑一遍这次启动真的
     //   跑出来的内核日志（回放缓冲 + 实时追加），停 CON64_STAY_MS 或按任意键，然后进桌面。
