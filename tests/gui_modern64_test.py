@@ -147,6 +147,29 @@ def png_render46(png_bytes, d=46):
     return cells, (w, h)
 
 
+def wait_repaint64(vm, since, timeout=30):
+    """等外壳按新主题/新模式**把整屏重画完**再截图（照 explorer64_test 的 settle 思路：只等状态，不放宽断言）。
+
+    判据：`[GFX64] wall blur once ...` / `[GFX64] wall mode=...`（壁纸 + 模糊面重建完成，
+    同一帧随后就画 Dock/窗口）。QEMU TCG 下这段重建要几秒（切主题尤其明显），
+    固定 sleep 会抢在重画之前截图。"""
+    wall = 0
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        seg = vm.log()[since:]
+        m = re.search(r"\[GFX64\] wall (blur once|mode=)", seg)
+        if m:
+            wall = m.end()
+        # 判据 1：整屏重建已经开始；判据 2：之后再等到一行 [UI] clock text=（外壳每秒一行，
+        # 说明这一帧真的画完了）——两个都要满足，避免"重建刚开始就截图"。
+        if wall and re.search(r"\[UI\] clock text=", seg[wall:]):
+            return True
+        if vm.proc.poll() is not None:
+            return False
+        time.sleep(0.4)
+    return False
+
+
 def make_vfs_fixture(dst, sys_img):
     """16MB 夹具盘：build64/system.img 的字节 + 标准 MBR + @8009 的空 v3 卷。
     规则与 tests/fs_tree_test.py 的 make_small_system_disk 同一套（直接复用它的 _mbr_entry/vimtufs3_format），
@@ -616,7 +639,9 @@ def main():
             ml = re.search(r"\[THEME64\] apply theme=%d name=%s dark=\d accent=#\w{6}" % (want, name), vm.log())
             check("切到主题 %d（%s）打点（含 name/dark/accent）" % (want, name), got and ml is not None,
                   ml.group(0) if ml else "（无）")
-            time.sleep(2.0)     # 壁纸重建（模糊只算一次，但整屏重建要 1-2 秒）
+            repainted = wait_repaint64(vm, before)      # ★ 先等整屏按新主题重画完（TCG 下几秒）
+            check("主题 %d 整屏按新主题重画完成（[GFX64] wall 行）" % want, repainted)
+            time.sleep(0.6)                             # 让同一帧里的 Dock/时钟画完再截
             sp = os.path.join(tmp, "theme%d.ppm" % want)
             mon.shot(sp)
             wa, ha, pxa = read_ppm(sp)
@@ -671,9 +696,11 @@ def main():
               len(_acc) >= 7 and "7C4DFF" in _acc, "accent 集合=%s" % sorted(_acc))
         # 切回白（把系统留在干净状态，避免影响复跑）
         if theme_id != 0:
+            back_before = len(vm.log())
             mon.key("ctrl-shift-t", wait=1.0)
             vm.wait_log("[THEME64] apply theme=0", 25)
-            time.sleep(1.5)
+            wait_repaint64(vm, back_before)     # ★ 等切回白色也重画完（下面第 6 节直接量壁纸像素）
+            time.sleep(0.6)
 
         print("=== 6) 壁纸 6 种适应模式（几何 + 定位标记像素）===")
         mk = re.search(r"\[GFX64\] wall markers r=(\d+),(\d+) g=(\d+),(\d+) b=(\d+),(\d+) y=(\d+),(\d+) size=(\d+)", vm.log())
