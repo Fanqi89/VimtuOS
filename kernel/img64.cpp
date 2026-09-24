@@ -471,14 +471,69 @@ int img64_decode64(const void* data, int len, Img64* out) {
     return rc;
 }
 
+// 幂等装进系统卷（见 img64.h 的说明）
+int img64_install_blob64(const char* path, const uint8_t* data, uint32_t len, const char* src) {
+    if (!path || !path[0] || !data || len == 0) return -1;
+    const int sys = vfs64_system_slot64();
+    uint32_t rt = 0, rs = 0;
+    if (sys < 0 || vfs64_stat_on64(sys, "/", &rt, &rs) != 0) {
+        dbg64_line_begin64();
+        dbg64_str("[IMG64] install skip path=");
+        dbg64_str(path);
+        dbg64_str(" reason=no-volume src=");
+        dbg64_str(src ? src : "?");
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+    uint32_t type = 0, size = 0;
+    if (vfs64_stat_on64(sys, path, &type, &size) == 0 && type == VFS64_TYPE_FILE && size == len) {
+        dbg64_line_begin64();
+        dbg64_str("[IMG64] install skip path=");
+        dbg64_str(path);
+        dbg64_str(" reason=exists bytes=");
+        dbg64_dec((uint64_t)size);
+        dbg64_nl();
+        dbg64_line_end64();
+        return 0;
+    }
+    // 父目录（只做一层：/logo/kaisi.png 的 /logo；已存在时 mkdir 返回非 0，忽略即可）
+    {
+        char parent[VFS64_PATH_MAX];
+        int cut = -1;
+        for (int i = 0; path[i] && i < (int)sizeof(parent) - 1; i++) if (path[i] == '/') cut = i;
+        if (cut > 0) {
+            for (int i = 0; i < cut && i < (int)sizeof(parent) - 1; i++) parent[i] = path[i];
+            parent[cut] = 0;
+            (void)vfs64_mkdir_on64(sys, parent);
+        }
+    }
+    const int wr = vfs64_write_on64(sys, path, data, (int)len);
+    dbg64_line_begin64();
+    dbg64_str("[IMG64] install path=");
+    dbg64_str(path);
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)len);
+    dbg64_str(" written=");
+    dbg64_dec((uint64_t)(wr < 0 ? 0 : wr));
+    dbg64_str(" ok=");
+    dbg64_dec((uint64_t)(wr == (int)len ? 1 : 0));
+    dbg64_str(" src=");
+    dbg64_str(src ? src : "?");
+    dbg64_nl();
+    dbg64_line_end64();
+    return wr == (int)len ? 0 : -1;
+}
+
 int img64_load_vfs64(const char* path, Img64* out) {
     if (!path || !path[0]) return -1;
     uint32_t type = 0, size = 0;
-    if (vfs64_stat_on64(vfs64_system_slot64(), path, &type, &size) != 0) {
+    if (vfs64_system_slot64() < 0 ||
+        vfs64_stat_on64(vfs64_system_slot64(), path, &type, &size) != 0) {
         dbg64_line_begin64();
         dbg64_str("[IMG64] load skip path=");
         dbg64_str(path);
-        dbg64_str(" reason=not-found");
+        dbg64_str(" reason=not-found ok=0");
         dbg64_nl();
         dbg64_line_end64();
         return -1;
@@ -510,9 +565,9 @@ int img64_load_vfs64(const char* path, Img64* out) {
     kfree_64(buf);
     if (rc == 0) {
         dbg64_line_begin64();
-        dbg64_str("[IMG64] load vfs:");
+        dbg64_str("[IMG64] load path=");
         dbg64_str(path);
-        dbg64_str(" size=");
+        dbg64_str(" ok=1 bytes=");
         dbg64_dec((uint64_t)got);
         dbg64_str(" fmt=");
         dbg64_str(g_fmt);
@@ -520,6 +575,17 @@ int img64_load_vfs64(const char* path, Img64* out) {
         dbg64_dec((uint64_t)out->w);
         dbg64_str("x");
         dbg64_dec((uint64_t)out->h);
+        dbg64_str(" (from VimtuFS2 system volume)");
+        dbg64_nl();
+        dbg64_line_end64();
+    } else {
+        dbg64_line_begin64();
+        dbg64_str("[IMG64] load path=");
+        dbg64_str(path);
+        dbg64_str(" ok=0 bytes=");
+        dbg64_dec((uint64_t)got);
+        dbg64_str(" err=");
+        dbg64_str(g_err);
         dbg64_nl();
         dbg64_line_end64();
     }

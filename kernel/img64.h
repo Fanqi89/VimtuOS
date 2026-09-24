@@ -27,6 +27,13 @@ struct Img64 {
 int img64_decode64(const void* data, int len, Img64* out);
 // 从 VimtuFS2 读文件并解码（系统卷）：返回 0 = 成功；-1 = 打不开/读失败
 int img64_load_vfs64(const char* path, Img64* out);
+// 把内核内嵌的字节**幂等装进 VimtuFS2 系统卷**（与 /hello.vap、/hello.elf 的既有做法一致）：
+//   * 卷没挂上 -> 打点 [IMG64] install skip ... reason=no-volume，返回 -1（调用方走内置兜底）
+//   * 已存在且大小一致 -> 打点 reason=exists，返回 0（不重写，省一次 20KB 写盘）
+//   * 否则建父目录（一层，够 /logo/kaisi.png 用）+ 写文件，打点 [IMG64] install path=.. bytes=.. ok=1
+// 目的：让"开始按钮用真文件 logo/kaisi.png"这条需求在**任何有 VimtuFS2 系统卷的盘**上都成立
+//（安装器装出来的盘、测试夹具盘），而裸 system.img（没有卷）走内核内置兜底，行为与之前一致。
+int img64_install_blob64(const char* path, const uint8_t* data, uint32_t len, const char* src);
 void img64_free64(Img64* img);
 const char* img64_last_err64();
 // 最近一次成功解码的格式名（"png" / "bmp"）

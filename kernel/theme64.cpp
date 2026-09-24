@@ -4,6 +4,7 @@
 // 颜色用 rgb(r,g,b) 直接给（颜色本身是主题数据，允许写在这里；几何/动效不许）。
 #include "theme64.h"
 #include "config64.h"
+#include "rust64.h"     // 主题真源方向：与 Rust 侧主题表交叉核对 + 同步当前主题
 #include "gfx64.h"      // 热键 Ctrl+Shift+M 循环壁纸适应模式
 #include "debug64.h"    // dbg64_*
 #include "x86_64.h"     // ticks64（动画时间基）
@@ -232,6 +233,43 @@ static const Theme64Tokens kThemes[THEME64_THEME_COUNT] = {
         rgb(248, 244, 252),
         rgb(0, 0, 0), rgb(0, 0, 0), rgb(255, 255, 255),
     },
+    // ---- 6：紫白渐变（用户参考图风格板；强调色 #7C4DFF；
+    //          与 gui_rs/src/theme.rs 的第 6 个主题同名，含义一致）----
+    {
+        "purplegrad", 0,
+        rgb(206, 196, 226),                 // win_frame
+        rgb(248, 245, 255),                 // title_bg
+        rgb(240, 236, 250),                 // title_bg_ina
+        rgb(40, 30, 62),                    // title_txt
+        rgb(240, 240, 240),                 // client_bg（老验收依赖 240,240,240）
+        rgb(36, 28, 56),                    // text
+        rgb(120, 104, 146),                 // text_dim
+        rgb(124, 77, 255),                  // accent = #7C4DFF
+        rgb(105, 60, 220),                  // accent2
+        rgb(124, 77, 255),                  // sel_bg
+        rgb(255, 255, 255),                 // sel_border
+        rgb(36, 28, 56),                    // icon_txt
+        rgb(124, 77, 255),                  // sel_fill
+        rgb(178, 150, 255),                 // sel_edge
+        rgb(246, 243, 255),                 // dock_bg（非暗色：固定默认色偏紫）
+        rgb(255, 255, 255),                 // dock_border
+        rgb(46, 34, 70),                    // dock_txt
+        rgb(124, 77, 255),                  // dock_dot
+        rgb(124, 77, 255),                  // dock_bar
+        rgb(233, 226, 252),                 // dock_hover_bg
+        rgb(224, 224, 224),                 // btn_bg
+        rgb(206, 206, 206),                 // btn_bg_hover
+        rgb(196, 43, 28),                   // btn_close
+        rgb(232, 17, 35),                   // btn_close_hover
+        rgb(255, 255, 255),                 // btn_glyph
+        rgb(232, 224, 250),                 // wall_a（紫）
+        rgb(255, 255, 255),                 // wall_b（白）
+        rgb(255, 255, 255),                 // wall_blob
+        rgb(168, 128, 255),                 // grad_a（紫）
+        rgb(255, 255, 255),                 // grad_b（白）
+        rgb(248, 245, 255),                 // desktop_base
+        rgb(0, 0, 0), rgb(0, 0, 0), rgb(255, 255, 255),
+    },
 };
 
 // ==================== 状态 ====================
@@ -260,6 +298,68 @@ static void log_hex_color(uint32_t c) {
     b[5] = H[(c >> 4) & 0xF];  b[6] = H[c & 0xF];
     b[7] = 0;
     dbg64_str(b);
+}
+
+// ==================== 与 Rust 侧主题表的交叉核对（主题真源方向）====================
+// 本批：Rust 侧 gui_rs/src/theme.rs 是“主题表”的方向性真源（`rust64_theme_count64/name64/colors64/set64/current64`）。
+// 但 Rust 表目前只有 11 个颜色（window/card/text/text_dim/accent/dock/border_hi/shadow/grad_start/grad_end/is_dark），
+// 而外壳绘制需要 34 个（标题栏玻璃/三按钮/选中色/壁纸渐变/桌面底色/双层阴影等），
+// 所以本批先做“双表 + 交叉核对 + 同步当前主题”（数量必须一致，名字/accent 逐条对比打点），
+// 后续把外壳绘制切到 Rust 表需先给 Rust 表补齐缺失字段（见报告“后续计划”）。
+static int g_rust_theme_count = -1;
+
+void theme64_rust_crosscheck64() {
+    const uint32_t n = rust64_theme_count64();
+    g_rust_theme_count = (int)n;
+    int count_ok = (n == (uint32_t)THEME64_THEME_COUNT) ? 1 : 0;
+    dbg64_line_begin64();
+    dbg64_str("[THEME64] rust cross-check count=");
+    dbg64_dec((uint64_t)n);
+    dbg64_str(" cpp=");
+    dbg64_dec((uint64_t)THEME64_THEME_COUNT);
+    dbg64_str(" count_ok=");
+    dbg64_dec((uint64_t)count_ok);
+    dbg64_str(" current=");
+    dbg64_dec((uint64_t)rust64_theme_current64());
+    dbg64_nl();
+    dbg64_line_end64();
+    // 逐主题：名字长度 + accent 对比（一行一个，上限 8 个主题，防刷屏）
+    const int lim = (int)n < THEME64_THEME_COUNT ? (int)n : THEME64_THEME_COUNT;
+    for (int i = 0; i < lim && i < 8; i++) {
+        Rust64ThemeColors rc{};
+        uint8_t nm[64];
+        const uint32_t nlen = rust64_theme_name64((uint32_t)i, nm, (uint32_t)sizeof(nm));
+        const uint32_t rc_ok = rust64_theme_colors64((uint32_t)i, &rc);
+        const uint32_t rust_accent = (rc_ok == 0)
+            ? (((uint32_t)rc.accent.r << 16) | ((uint32_t)rc.accent.g << 8) | rc.accent.b)
+            : 0xFFFFFFFFu;
+        const uint32_t cpp_accent = kThemes[i].accent & 0xFFFFFFu;
+        dbg64_line_begin64();
+        dbg64_str("[THEME64] theme idx=");
+        dbg64_dec((uint64_t)i);
+        dbg64_str(" cpp=");
+        dbg64_str(kThemes[i].name);
+        dbg64_str(" accent=");
+        log_hex_color(cpp_accent);
+        dbg64_str(" rust=");
+        if (nlen == 0 || nlen >= 60) {
+            dbg64_str("?");
+        } else {
+            nm[nlen] = 0;
+            dbg64_str((const char*)nm);
+        }
+        dbg64_str(" rust_accent=");
+        if (rust_accent == 0xFFFFFFFFu) dbg64_str("?");
+        else log_hex_color(rust_accent);
+        dbg64_str(" accent_same=");
+        dbg64_dec((uint64_t)(rust_accent == cpp_accent ? 1 : 0));
+        dbg64_str(" rust_dark=");
+        dbg64_dec((uint64_t)(rc_ok == 0 ? (rc.is_dark ? 1 : 0) : 0));
+        dbg64_str(" cpp_dark=");
+        dbg64_dec((uint64_t)(kThemes[i].dark ? 1 : 0));
+        dbg64_nl();
+        dbg64_line_end64();
+    }
 }
 
 // ==================== API ====================
@@ -331,6 +431,7 @@ void theme64_init64() {
     dbg64_str(" ease=cubic-bezier(0.2,0,0,1)");
     dbg64_nl();
     dbg64_line_end64();
+    theme64_rust_crosscheck64();      // 与 Rust 侧主题表交叉核对（数量/名字/accent）
     log_apply("init");
 }
 
@@ -379,6 +480,7 @@ void theme64_set_theme64(int id, const char* why) {
     const bool changed = (id != g_theme_id);
     g_theme_id = id;
     g_applied_theme = id;
+    (void)rust64_theme_set64((uint32_t)id);      // 同步 Rust 侧“当前主题”（真源方向：一处切换两边跟上）
     cfg64_set_theme64(id);                 // 跨重启持久化（config64 -> store64，3 秒去抖落盘）
     if (changed) gfx64_wall_invalidate64();  // 壁纸/玻璃缓存按主题重建（渐变主题换壁纸）
     log_apply(why);

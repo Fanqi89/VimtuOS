@@ -46,6 +46,10 @@ extern "C" const uint8_t _binary_icon_recyclebin_bin_start[];
 extern "C" const uint8_t _binary_icon_terminal_bin_start[];
 extern "C" const uint8_t _binary_icon_start_bin_start[];   // 64x64 RGBA（logo/kaisi.png）
 extern "C" const uint8_t _binary_logo_rgba_bin_start[];    // 240x150 RGBA（logo/logo.png）
+// ★ 本批：真正的 logo/kaisi.png 原始字节（build64.sh 用 objcopy 从 logo/kaisi.png 嵌入）——
+//   启动期幂等装进 VimtuFS2 系统卷，开始按钮就从盘上读真图（见 dock_start_icon_init64）。
+extern "C" const uint8_t _binary_kaisi_png_start[];
+extern "C" const uint8_t _binary_kaisi_png_end[];
 
 #define ICON_SRC_W 128          // 图标源图尺寸（RGBA，见 _make_icons.py）
 
@@ -819,6 +823,14 @@ static void dock_rgba_from_img64(const Img64* im, uint8_t* dst, int dw, int dh) 
 }
 
 static void dock_start_icon_init64() {
+    // ★ 先把内嵌的**真 PNG 字节**幂等装进系统卷（照 /hello.vap 的既有做法），再按"VimtuFS2 优先"加载：
+    //   这样任何带 VimtuFS2 系统卷的盘（安装器装出来的盘、测试夹具盘）上，开始按钮用的都是
+    //   logo/kaisi.png 这个真文件的像素；裸 system.img（没有卷）时 install 如实 skip、走内置兜底。
+    {
+        const uint32_t plen = (uint32_t)(_binary_kaisi_png_end - _binary_kaisi_png_start);
+        (void)img64_install_blob64("/logo/kaisi.png", _binary_kaisi_png_start, plen, "logo/kaisi.png");
+        (void)img64_install_blob64("/kaisi.png", _binary_kaisi_png_start, plen, "logo/kaisi.png");
+    }
     // 1) 优先 VimtuFS2（需求：图标/壁纸/头像优先从 VimtuFS2 读）
     const char* cand[2] = { "/logo/kaisi.png", "/kaisi.png" };
     for (int i = 0; i < 2; i++) {
@@ -827,7 +839,7 @@ static void dock_start_icon_init64() {
             dock_rgba_from_img64(&im, g_dock_start_rgba, DOCK_START_DISP, DOCK_START_DISP);
             img64_free64(&im);
             g_dock_start_ok = true;
-            g_dock_start_src = "vfs";
+            g_dock_start_src = cand[i];      // 打点里写实际路径（验收要求 src=vfs:/logo/kaisi.png）
             dock_log_start64();
             return;
         }

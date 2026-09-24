@@ -214,7 +214,7 @@ def main():
                       log)
         check("Token 真源打点 [THEME64] init", m is not None, m.group(0) if m else "（无）")
         if m:
-            check("内置主题 >= 6 组（白/暗/蓝白/粉白/粉绿/粉紫）", int(m.group(1)) >= 6,
+            check("内置主题 >= 7 组（白/暗/蓝白/粉白/粉绿/粉紫/紫白）", int(m.group(1)) >= 7,
                   "themes=%s" % m.group(1))
             check("默认白色主题", m.group(2) == "0" and m.group(3) == "white" and m.group(4) == "0",
                   "theme=%s name=%s dark=%s" % (m.group(2), m.group(3), m.group(4)))
@@ -266,8 +266,13 @@ def main():
             check("自检用例是 4x4 PNG 且解码 rc=0", mm.group(3) == "4" and mm.group(4) == "4" and mm.group(5) == "0")
         check("[IMG64] PNG 解码打点（含尺寸）", "[IMG64] decode png rc=0" in log,
               "见 [IMG64] decode png rc=0 bytes=112 -> 4x4")
-        check("图标/壁纸优先从 VimtuFS2 读（无卷时如实打 skip）",
-              "[IMG64] load skip path=/logo/kaisi.png" in log or "[IMG64] load vfs:/logo/kaisi.png" in log)
+        check("图标/壁纸优先从 VimtuFS2 读（裸 system.img 无卷时如实打 skip ok=0；有卷时 load ok=1）",
+              "[IMG64] load skip path=/logo/kaisi.png reason=not-found ok=0" in log or
+              re.search(r"\[IMG64\] load path=/logo/kaisi\.png ok=1 ", log) is not None,
+              (re.search(r"\[IMG64\] load (skip )?path=/logo/kaisi\.png[^\r\n]*", log) or ["（无）"])[0])
+        check("启动期幂等安装打点（有卷 ok=1 / 无卷 reason=no-volume，不假装成功）",
+              re.search(r"\[IMG64\] install (skip )?path=/logo/kaisi\.png[^\r\n]*", log) is not None,
+              (re.search(r"\[IMG64\] install (skip )?path=/logo/kaisi\.png[^\r\n]*", log) or ["（无）"])[0])
         check("开始图标兜底路径打点（kaisi.png 的 RGBA 内嵌副本）",
               re.search(r"\[DOCK64\] start icon src=(\S+) size=(\d+) ok=1", log) is not None,
               (re.search(r"\[DOCK64\] start icon src=(\S+) size=(\d+) ok=1", log) or [None, "?"])[0])

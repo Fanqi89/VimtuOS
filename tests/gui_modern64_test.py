@@ -12,18 +12,24 @@
   4) 最小化小横杠      Dock 图标 -> 最小化 -> [DOCK64] press action=minimize + [DOCK64] minbar ...
                       （宽 = 图标 40%、跟随强调色）+ 像素：横杠处有强调色像素；
                       并且**在横杠上点击不产生任何 Dock 动作**（纯视觉不可点击）。
-  5) 主题切换（>=4）    Ctrl+Shift+T 循环：白 -> 暗 -> 蓝白 -> 粉白 …；每条 [THEME64] apply 打点 +
-                      整屏像素差 > 阈值（暗色主题下 Dock 变深灰、主色变化）。
+  5) 主题切换（7 种）    Ctrl+Shift+T 循环：白 -> 暗 -> 蓝白 -> 粉白 -> 粉绿 -> 粉紫 -> 紫白 …；
+                      每条 [THEME64] apply 打点 + 整屏像素差 > 阈值（暗色主题下 Dock 变深灰、主色变化）；
+                      紫白额外断言强调色 #7C4DFF（打点 + Dock 小横杠像素）。
   6) 壁纸 6 种适应模式  Ctrl+Shift+N 循环 fill/fit/stretch/tile/center/span：
                       [GFX64] wall 几何（dst/scale/crop/tiles）+ 4 个定位标记的屏幕位置/裁剪 +
                       留白（无图区域方差≈0）/ 平铺接缝（x=1200 列 == x=0 列）/ 拉伸比例失真。
   7) 减少动画开关      Ctrl+Shift+R -> [THEME64] motion reduce=1 dock=0ms，点击后 bounce frames=1 motion=reduced。
+  8) 开始按钮真图      [IMG64] install/load path=/logo/kaisi.png ok=1 + [DOCK64] start icon src=vfs:/logo/kaisi.png；
+                      宿主 Pillow 解 logo/kaisi.png（按内核 dock_rgba_from_img64 的 46x46 最近邻映射）与
+                      截图里开始按钮逐像素比对；冷启动第二遍 reason=exists；再把盘上那份真图的第一块改坏，
+                      验证「画出来的像素真的来自盘上文件」（load ok=0 -> 走 /kaisi.png 兜底）。
 用法：python tests/gui_modern64_test.py [--img build64/system.img] [--keep]
 退出码：0 = 全通过；1 = 有断言失败；2 = 环境问题
 """
 import argparse
 import os
 import re
+import struct
 import socket
 import subprocess
 import sys
@@ -52,6 +58,7 @@ THEME_EXPECT = {
     3: ("pinkgrad", 0),
     4: ("pinkgreen", 0),
     5: ("pinkpurple", 0),
+    6: ("purplegrad", 0),
 }
 
 
@@ -112,6 +119,105 @@ def diff_count(a, b):
         if a[i] != b[i] or a[i + 1] != b[i + 1] or a[i + 2] != b[i + 2]:
             n += 1
     return n
+
+
+# ==================== 真图验收用的宿主侧工具（Pillow + VimtuFS2 v3 直读）====================
+PNG_LOGO = os.path.join(ROOT, "logo", "kaisi.png")
+SECTOR = 512
+V3_INODE_BYTES = 128
+
+
+def png_render46(png_bytes, d=46):
+    """Pillow 解 PNG，并按**内核 dock_rgba_from_img64 的映射**缩到 d x d：
+    sx = x*w/dw、sy = y*h/dh（都是整型截断）。返回 (cells, (w,h))；没有 Pillow 时返回 (None, None)。
+    cells 行优先，元素 = (r,g,b,a)——与内核喂给 blit_rgba_scaled 的 RGBA 缓冲逐字节对应。"""
+    try:
+        import io
+        from PIL import Image
+    except Exception:
+        return None, None
+    im = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    w, h = im.size
+    px = im.load()
+    cells = []
+    for y in range(d):
+        sy = y * h // d
+        for x in range(d):
+            cells.append(px[x * w // d, sy])
+    return cells, (w, h)
+
+
+def make_vfs_fixture(dst, sys_img):
+    """16MB 夹具盘：build64/system.img 的字节 + 标准 MBR + @8009 的空 v3 卷。
+    规则与 tests/fs_tree_test.py 的 make_small_system_disk 同一套（直接复用它的 _mbr_entry/vimtufs3_format），
+    差别只是源镜像可以指定（--img）。返回 dict（多一个 bytes 字段）或 None。"""
+    try:
+        import fs_tree_test as fst
+    except Exception:
+        return None
+    try:
+        with open(sys_img, "rb") as f:
+            sysb = f.read()
+    except OSError:
+        return None
+    if not sysb or len(sysb) % SECTOR or len(sysb) > fst.SMALL_SECTORS * SECTOR:
+        return None
+    buf = bytearray(fst.SMALL_SECTORS * SECTOR)
+    buf[0:len(sysb)] = sysb
+    buf[446:462] = fst._mbr_entry(True, 0xEF, fst.PART_BOOT_LBA, fst.PART_BOOT_SECS)
+    buf[462:478] = fst._mbr_entry(False, 0x07, fst.PART_MAIN_LBA, fst.SMALL_MAIN_SECTORS)
+    buf[478:510] = b"\0" * 32
+    buf[510], buf[511] = 0x55, 0xAA
+    info = fst.vimtufs3_format(buf, fst.PART_MAIN_LBA, fst.SMALL_MAIN_SECTORS)
+    if info is None:
+        return None
+    info["main_lba"] = fst.PART_MAIN_LBA
+    with open(dst, "wb") as f:
+        f.write(buf)
+    return info
+
+
+def v3_find_inodes(buf, base_lba, name):
+    """宿主侧在 v3 卷里找 name 的所有 inode（v3：名字在 inode 偏移 40、长度在偏移 1）。
+    返回 [(inode 字节偏移, inode 号, parent)]；superblock 不对时返回 []。"""
+    off = base_lba * SECTOR
+    if buf[off:off + 8] != b"VIMTUFS2":
+        return []
+    inode_start = struct.unpack_from("<I", buf, off + 36)[0]     # inode 区起始块号
+    inodes = struct.unpack_from("<I", buf, off + 40)[0]
+    out = []
+    for i in range(inodes):
+        o = off + inode_start * SECTOR + i * V3_INODE_BYTES
+        if buf[o] == 0 or buf[o + 1] != len(name):               # 空槽 / 名字长度不同
+            continue
+        if bytes(buf[o + 40:o + 40 + len(name)]) == name:
+            out.append((o, i, struct.unpack_from("<I", buf, o + 28)[0]))
+    return out
+
+
+def v3_read_file(buf, vol_off, inode_off):
+    """按 v3 映射读文件（4 个直接块 + 一级间接块）；返回 (size, bytes)。"""
+    size = struct.unpack_from("<I", buf, inode_off + 4)[0]
+    blocks = [struct.unpack_from("<I", buf, inode_off + 8 + 4 * d)[0] for d in range(4)]
+    need = (size + SECTOR - 1) // SECTOR
+    if need > 4:
+        ind = struct.unpack_from("<I", buf, inode_off + 24)[0]
+        for k in range(min(need - 4, 128)):
+            blocks.append(struct.unpack_from("<I", buf, vol_off + ind * SECTOR + 4 * k)[0])
+    out = bytearray()
+    for b in blocks:
+        out += buf[vol_off + b * SECTOR:vol_off + b * SECTOR + SECTOR]
+        if len(out) >= size:
+            break
+    return size, bytes(out[:size])
+
+
+def v3_corrupt_file(buf, vol_off, inode_off, n=64):
+    """把文件第一块的前 n 字节写成 0xFF（大小不变）——用来证明"画出来的像素真的来自盘上文件"。"""
+    blocks = [struct.unpack_from("<I", buf, inode_off + 8 + 4 * d)[0] for d in range(4)]
+    p = vol_off + blocks[0] * SECTOR
+    buf[p:p + n] = b"\xFF" * n
+    return blocks[0]
 
 
 class Monitor:
@@ -340,6 +446,28 @@ def main():
                     colorful += 1
         check("开始按钮用的是彩色真图标（logo/kaisi.png 像素）", colorful > 80, "彩色像素=%d" % colorful)
 
+        # ---- 本段真图证据（默认的 build64/system.img 是**裸**镜像：没有 VimtuFS2 卷 -> 必须如实走内置兜底）----
+        si = re.search(r"\[DOCK64\] start icon src=(\S+) size=(\d+) ok=(\d)", log)
+        check("开始按钮打点（[DOCK64] start icon ...）", si is not None, si.group(0) if si else "（无）")
+        bare = os.path.abspath(args.img) == os.path.abspath(os.path.join(ROOT, "build64", "system.img"))
+        if bare:
+            check("裸 system.img（无 VimtuFS2 卷）：开始按钮如实用内置兜底图（不假装从盘上读）",
+                  si is not None and si.group(1) == "builtin:icon_start.bin" and si.group(3) == "1",
+                  si.group(0) if si else "（无）")
+            check("裸 system.img：真图 install/load 如实 skip（ok=0）",
+                  "[IMG64] install skip path=/logo/kaisi.png reason=no-volume src=logo/kaisi.png" in log and
+                  "[IMG64] load skip path=/logo/kaisi.png reason=not-found ok=0" in log,
+                  (re.search(r"\[IMG64\] load skip path=/logo/kaisi\.png[^\r\n]*", log) or ["（无）"])[0])
+        else:
+            check("开始按钮 ok=1（内置兜底或 VimtuFS2 真图，--img 指定盘）",
+                  si is not None and si.group(3) == "1" and
+                  (si.group(1) == "builtin:icon_start.bin" or si.group(1).startswith("vfs:")),
+                  si.group(0) if si else "（无）")
+            check("真图来源可审计（install/load 打点都在）",
+                  re.search(r"\[IMG64\] install (skip )?path=/logo/kaisi\.png", log) is not None and
+                  re.search(r"\[IMG64\] load (skip )?path=/logo/kaisi\.png", log) is not None,
+                  (re.search(r"\[IMG64\] load (skip )?path=/logo/kaisi\.png[^\r\n]*", log) or ["（无）"])[0])
+
         print("=== 2) 悬停放大 1.20 + 邻位让位（真实鼠标）===")
         # 先把光标挪到桌面空白处（顶边），再闭环挪到 idx=3（终端）图标中心
         mon.move(0, -1200, wait=0.5)
@@ -413,6 +541,7 @@ def main():
               done.group(0) if done else "（无 done 行）")
 
         print("=== 4) 最小化小横杠（40% 宽、强调色、不可点击）===")
+        MINBAR_GEO = None
         # 先开计算器（开始菜单数字快捷键 4）
         mon.key("meta_l", wait=1.0)
         mon.key("4", wait=2.2)
@@ -440,6 +569,7 @@ def main():
             if m:
                 bx, by, bw2 = int(m.group(2)), int(m.group(3)), int(m.group(4))
                 col = tuple(int(m.group(6)[i:i + 2], 16) for i in (0, 2, 4))
+                MINBAR_GEO = (bx, by, bw2)     # 供主题切换那节复用（紫白要按同一个横杠位置量像素）
                 check("小横杠宽 = 图标宽 40%%（%d 的 40%% = %d）" % (icon, icon * 40 // 100),
                       bw2 == icon * 40 // 100, "w=%d" % bw2)
                 check("小横杠高 3px 且位置在图标下方（Dock 内）",
@@ -461,15 +591,21 @@ def main():
                 check("横杠不可点击（内核命中测试 hit=none）",
                       ht is not None, ht.group(0) if ht else "（无）")
 
-        print("=== 5) 主题切换（>= 4 种，实时生效 + 像素差）===")
+        print("=== 5) 主题切换（7 种，实时生效 + 像素差）===")
         shots = {}
-        base_log = len(vm.log())
-        cur = re.search(r"\[THEME64\] init themes=\d+ theme=(\d+)", vm.log())
-        theme_id = int(cur.group(1)) if cur else 0
+        cur = re.search(r"\[THEME64\] init themes=(\d+) theme=(\d+)", vm.log())
+        n_themes = int(cur.group(1)) if cur else -1
+        theme_id = int(cur.group(2)) if cur else 0
+        check("主题表 7 套（[THEME64] init themes=7：白/暗/蓝白/粉白/粉绿/粉紫/紫白）",
+              n_themes == 7, "themes=%s" % n_themes)
+        rc = re.search(r"\[THEME64\] rust cross-check count=(\d+) cpp=(\d+) count_ok=(\d)", vm.log())
+        check("Rust 侧主题表交叉核对（数量一致 count_ok=1）",
+              rc is not None and rc.group(1) == rc.group(2) == "7" and rc.group(3) == "1",
+              rc.group(0) if rc else "（无）")
         shots[theme_id] = px0
-        # 依次 Ctrl+Shift+T 切换 5 次（覆盖 6 个主题；单次切完断言打点与像素差）
-        for step in range(5):
-            want = (theme_id + 1) % 6
+        # 依次 Ctrl+Shift+T 切换 6 次（覆盖 7 个主题；单次切完断言打点与像素差）
+        for step in range(6):
+            want = (theme_id + 1) % 7
             before = len(vm.log())
             mon.key("ctrl-shift-t", wait=1.0)
             got = vm.wait_log("[THEME64] apply theme=%d" % want, 30)
@@ -496,13 +632,43 @@ def main():
                 check("暗色主题下 Dock 是深灰（亮度 < 110）", lum < 110, "%.0f" % lum)
             else:
                 check("非暗色主题下 Dock 用浅色固定默认色（亮度 > 150）", lum > 150, "%.0f" % lum)
+            if want == 6:
+                # ---- 紫白渐变（参考图风格板）专属断言：强调色 #7C4DFF + Dock 紫调 + 小横杠像素 ----
+                pm = re.search(r"\[THEME64\] apply theme=6 name=purplegrad dark=0 accent=#([0-9A-Fa-f]{6})",
+                               vm.log())
+                check("紫白渐变的强调色 = #7C4DFF（打点）",
+                      pm is not None and pm.group(1).upper() == "7C4DFF",
+                      pm.group(0) if pm else "（无）")
+                check("紫白渐变：Dock 面板浅色且带紫调（B >= R > G、亮度 > 150）",
+                      lum > 150 and pc[2] >= pc[0] and pc[0] > pc[1],
+                      "面板 %s 亮度 %.0f" % (pc, lum))
+                check("紫白渐变：Dock 面板色与白色主题不同（主题真的换了 Dock 颜色）",
+                      sum(abs(pc[i] - panel[i]) for i in range(3)) >= 8,
+                      "紫白 %s vs 白 %s" % (pc, panel))
+                if MINBAR_GEO:
+                    bx2, by2, bw3 = MINBAR_GEO
+                    purple = blue = 0
+                    for x in range(bx2 - 2, bx2 + bw3 + 2):
+                        for y in range(by2 - 1, by2 + 4):
+                            c = sample(pxa, wa, x, y)
+                            if near(c, (0x7C, 0x4D, 0xFF), 24):
+                                purple += 1
+                            elif near(c, (0x00, 0x78, 0xD7), 12):
+                                blue += 1
+                    check("紫白渐变：Dock 小横杠像素 = 强调色 #7C4DFF（紫像素 >= 8）",
+                          purple >= 8, "紫像素=%d（横杠 %d,%d %dx3）" % (purple, bx2, by2, bw3))
+                    check("紫白渐变：小横杠不再是白色主题的蓝 #0078D7（蓝像素 <= 4）",
+                          blue <= 4, "蓝像素=%d" % blue)
+                else:
+                    check("紫白渐变：Dock 小横杠位置可用（第 4 节拿到了 minbar 几何）", False, "（无几何）")
             theme_id = want
-        ns = len({id(v): v for v in shots.values()}) if False else len(shots)
-        check("至少 4 种主题有像素证据", ns >= 4, "主题数=%d" % ns)
+        ns = len(shots)
+        check("7 种主题都有整屏像素证据", ns >= 7, "主题数=%d" % ns)
         # 主色（强调色）随主题变化：暗色/蓝白 的 accent 打点不同
         accents = re.findall(r"\[THEME64\] apply theme=(\d+) name=\S+ dark=\d accent=#(\w{6})", vm.log())
-        check("不同主题的强调色不同（主色变化）",
-              len({a[1] for a in accents}) >= 3, "accent 集合=%s" % sorted({a[1] for a in accents}))
+        _acc = {a[1].upper() for a in accents}
+        check("7 种主题的强调色互不相同（含紫白 #7C4DFF）",
+              len(_acc) >= 7 and "7C4DFF" in _acc, "accent 集合=%s" % sorted(_acc))
         # 切回白（把系统留在干净状态，避免影响复跑）
         if theme_id != 0:
             mon.key("ctrl-shift-t", wait=1.0)
@@ -654,7 +820,152 @@ def main():
         back = vm.wait_log("[THEME64] motion reduce=0", 8)
         check("再按一次恢复动画（reduce=0）", back)
 
-        print("=== 8) 不能出现的日志 ===")
+        # ==================== 8) Dock 开始按钮 = 真图 logo/kaisi.png（带 VimtuFS2 系统卷的盘）====================
+        print("=== 8) Dock 开始按钮用真图 logo/kaisi.png（VimtuFS2 系统卷夹具盘）===")
+        vm.close()          # 主 VM 收工：下面两次启动都在夹具盘上（省 CPU，别影响夹具盘的启动时序）
+        with open(PNG_LOGO, "rb") as f:
+            png_src = f.read()
+        check("宿主侧 logo/kaisi.png 可读（真文件）", len(png_src) > 0, "%d 字节" % len(png_src))
+        render, png_dim = png_render46(png_src)
+        check("宿主 Pillow 解 logo/kaisi.png 并缩到 46x46（内核 dock_rgba_from_img64 同一映射）",
+              render is not None and len(render) == 46 * 46,
+              "PNG 尺寸=%s 不透明像素=%s" % (png_dim,
+                                            sum(1 for c in render if c[3] >= 252) if render else "?"))
+        fixture = os.path.join(tmp, "small_system.img")
+        finfo = make_vfs_fixture(fixture, args.img)
+        check("造夹具盘（system.img 字节 + MBR + @8009 的空 v3 卷）", finfo is not None,
+              fixture if finfo else "（fs_tree_test 不可用 / 镜像不合法）")
+        if finfo and render is not None:
+            # ---- 8a) 第一遍：空卷 -> 启动期安装 -> 从盘上读真图 -> 像素比对 ----
+            vm1 = Vm(qemu, fixture, args.port + 7, "vimtu-modern-vfs1", tmp)
+            try:
+                mon1 = vm1.wait_monitor()
+                check("夹具盘进桌面（[GUI64] ready）", vm1.wait_ready(120))
+                L1 = vm1.log()
+                inst = re.search(r"\[IMG64\] install path=/logo/kaisi\.png bytes=(\d+) written=(\d+) ok=(\d) src=(\S+)", L1)
+                check("启动期把内嵌真 PNG 幂等装进 VimtuFS2 系统卷（/logo/kaisi.png ok=1）",
+                      inst is not None and inst.group(3) == "1" and
+                      inst.group(1) == inst.group(2) == str(len(png_src)),
+                      inst.group(0) if inst else "（无）")
+                inst2 = re.search(r"\[IMG64\] install path=/kaisi\.png bytes=(\d+) written=(\d+) ok=(\d)", L1)
+                check("兜底路径 /kaisi.png 也装了（同一份字节）",
+                      inst2 is not None and inst2.group(3) == "1" and inst2.group(1) == str(len(png_src)),
+                      inst2.group(0) if inst2 else "（无）")
+                load = re.search(r"\[IMG64\] load path=/logo/kaisi\.png ok=1 bytes=(\d+) fmt=png "
+                                 r"(\d+)x(\d+) \(from VimtuFS2 system volume\)", L1)
+                check("从 VimtuFS2 系统卷读真图（[IMG64] load path=/logo/kaisi.png ok=1）",
+                      load is not None and load.group(1) == str(len(png_src)) and
+                      (int(load.group(2)), int(load.group(3))) == png_dim,
+                      load.group(0) if load else "（无）")
+                check("没有走 skip（有卷时不许 [IMG64] load skip path=/logo/kaisi.png）",
+                      "[IMG64] load skip path=/logo/kaisi.png" not in L1)
+                sx1 = re.search(r"\[DOCK64\] start icon src=(\S+) size=(\d+) ok=(\d)", L1)
+                check("Dock 开始按钮 src=vfs:/logo/kaisi.png（用的是盘上真图）",
+                      sx1 is not None and sx1.group(1) == "vfs:/logo/kaisi.png" and sx1.group(3) == "1",
+                      sx1.group(0) if sx1 else "（无）")
+                check("夹具盘第一遍没有 PANIC/selftest FAIL/OOM",
+                      "PANIC" not in L1 and "selftest FAIL" not in L1 and "OOM:" not in L1)
+                it0 = re.search(r"\[DOCK64\] item idx=0 app=\d+ name=\S+ x=(\d+) y=(\d+) w=(\d+) h=(\d+)", L1)
+                if it0 is None:
+                    check("开始按钮几何（[DOCK64] item idx=0）", False, "（无）")
+                else:
+                    x0, y0, w0, h0 = (int(it0.group(i)) for i in range(1, 5))
+                    time.sleep(1.5)
+                    shotv = os.path.join(tmp, "vfs_png.ppm")
+                    mon1.shot(shotv)
+                    wv, hv, pxv = read_ppm(shotv)
+                    check("夹具盘截图分辨率 1280x800", (wv, hv) == (1280, 800), "%dx%d" % (wv, hv))
+                    panv = sample(pxv, wv, x0 + w0 + 5, y0 + h0 // 2)      # 图标 0/1 之间的纯面板
+                    # (a) 用户口径：中心区主色（PIL 解真图 -> 46x46 -> 中心 24x24，合成到面板色上）
+                    ec = [0, 0, 0]
+                    mc = [0, 0, 0]
+                    n = 0
+                    for j in range(11, 35):
+                        for i in range(11, 35):
+                            r_, g_, b_, a_ = render[j * 46 + i]
+                            for k, v in enumerate((r_, g_, b_)):
+                                ec[k] += (v * a_ + panv[k] * (255 - a_)) // 255
+                            c = sample(pxv, wv, x0 + i, y0 + j)
+                            for k in range(3):
+                                mc[k] += c[k]
+                            n += 1
+                    exp = tuple(v // n for v in ec)
+                    got = tuple(v // n for v in mc)
+                    check("中心区主色：宿主 PIL 解真图 == QEMU 截图（容差 12/通道）",
+                          all(abs(exp[k] - got[k]) <= 12 for k in range(3)),
+                          "宿主 %s 截图 %s（面板 %s）" % (exp, got, panv))
+                    # (b) 像素级：alpha>=252 的像素内核是**原样拷贝**（blit_rgba_scaled: a>=252 直接写 RGB）
+                    okpx = tot = maxd = 0
+                    for j in range(46):
+                        for i in range(46):
+                            r_, g_, b_, a_ = render[j * 46 + i]
+                            if a_ < 252:
+                                continue
+                            tot += 1
+                            c = sample(pxv, wv, x0 + i, y0 + j)
+                            dd = max(abs(c[k] - (r_, g_, b_)[k]) for k in range(3))
+                            maxd = max(maxd, dd)
+                            if dd <= 6:
+                                okpx += 1
+                    check("逐像素：真图的不透明像素与截图一致（>=90%，最大偏差 <= 6）",
+                          tot >= 400 and okpx * 100 >= tot * 90 and maxd <= 6,
+                          "一致 %d/%d，最大偏差 %d" % (okpx, tot, maxd))
+                # ---- 宿主侧直读夹具盘：两处真图都与 logo/kaisi.png 逐字节相同 ----
+                with open(fixture, "rb") as f:
+                    disk = bytearray(f.read())
+                vol_off = finfo["main_lba"] * SECTOR
+                inos = v3_find_inodes(disk, finfo["main_lba"], b"kaisi.png")
+                check("夹具盘 v3 卷里有两处 kaisi.png（/logo/kaisi.png + /kaisi.png）",
+                      len(inos) >= 2, "inode=%s" % [(i, p) for _, i, p in inos])
+                same = size_ok = 0
+                for o, _i, _p in inos:
+                    sz, data = v3_read_file(disk, vol_off, o)
+                    if sz == len(png_src):
+                        size_ok += 1
+                    if data == png_src:
+                        same += 1
+                check("盘上两处文件大小都 = %d B（= 真文件大小）" % len(png_src), size_ok >= 2,
+                      "命中 %d 处" % size_ok)
+                check("盘上两处文件都与 logo/kaisi.png 逐字节相同（VFS 真图，不是兜底副本）", same >= 2,
+                      "逐字节相同 %d 处" % same)
+                # ---- 8b) 第二遍：把盘上 /logo/kaisi.png 的第一块改坏（大小不变）-> 冷启动 ----
+                logo_ino = root_ino = None
+                for o, _i, par in inos:
+                    if par != 0:
+                        logo_ino = o
+                    else:
+                        root_ino = o
+                check("能按 parent 区分 /logo/kaisi.png（parent != 0）与根目录那份",
+                      logo_ino is not None and root_ino is not None,
+                      "logo=%s root=%s" % (logo_ino, root_ino))
+                if logo_ino is not None:
+                    blk = v3_corrupt_file(disk, vol_off, logo_ino)
+                    with open(fixture, "wb") as f:
+                        f.write(disk)
+                    print("      已把盘上 /logo/kaisi.png 的第 1 块（fs 块 %d）前 64 B 改坏（大小不变）" % blk)
+                    vm2 = Vm(qemu, fixture, args.port + 8, "vimtu-modern-vfs2", tmp)
+                    try:
+                        vm2.wait_monitor()
+                        check("冷启动第二遍进桌面（同一夹具盘）", vm2.wait_ready(120))
+                        L2 = vm2.log()
+                        check("幂等：第二遍 install 打 reason=exists（盘上已有同大小文件）",
+                              "[IMG64] install skip path=/logo/kaisi.png reason=exists bytes=%d" % len(png_src) in L2,
+                              (re.search(r"\[IMG64\] install skip path=/logo/kaisi\.png[^\r\n]*", L2) or ["（无）"])[0])
+                        check("盘上那份被改坏 -> 解码失败（[IMG64] load path=/logo/kaisi.png ok=0）",
+                              re.search(r"\[IMG64\] load path=/logo/kaisi\.png ok=0 bytes=\d+ err=", L2) is not None,
+                              (re.search(r"\[IMG64\] load path=/logo/kaisi\.png[^\r\n]*", L2) or ["（无）"])[0])
+                        check("于是落到 VimtuFS2 的第二条候选 /kaisi.png（load ok=1 + src=vfs:/kaisi.png）",
+                              re.search(r"\[IMG64\] load path=/kaisi\.png ok=1 bytes=\d+ fmt=png", L2) is not None and
+                              re.search(r"\[DOCK64\] start icon src=vfs:/kaisi\.png size=\d+ ok=1", L2) is not None,
+                              (re.search(r"\[DOCK64\] start icon src=\S+[^\r\n]*", L2) or ["（无）"])[0])
+                        check("第二遍没有 PANIC/selftest FAIL/OOM",
+                              "PANIC" not in L2 and "selftest FAIL" not in L2 and "OOM:" not in L2)
+                    finally:
+                        vm2.close()
+            finally:
+                vm1.close()
+
+        print("=== 9) 不能出现的日志 ===")
         log = slog = vm.log()
         for bad in ("PANIC", "TRIPLE FAULT", "FAILED mask=", "selftest FAIL", "OOM:", "kfree: bad"):
             check("不应出现 %s" % bad, bad not in log)

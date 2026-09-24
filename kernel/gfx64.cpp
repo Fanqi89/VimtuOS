@@ -9,6 +9,7 @@
 #include "mem_64.h"
 #include "debug64.h"
 #include "x86_64.h"     // ticks64
+#include "panic64.h"    // panic64_watchdog_pause64/unpause64（整屏重建是长操作，见 wall_ensure64）
 
 // ==================== 画布 / 裁剪 ====================
 static uint32_t* g_fb = nullptr;
@@ -905,12 +906,19 @@ static void wall_ensure64() {
     if (!g_wallpx) gfx64_wall_build_default64();
     if (!g_surface_valid || g_surface_theme != theme64_id64() || g_surface_mode != g_mode ||
         g_surface_src != g_wallpx || g_sw != fb_width() || g_sh != fb_height()) {
+        panic64_watchdog_pause64();
+        // ★ 整屏壁纸 + 模糊面重建在 QEMU TCG 下单次要几秒（切主题/切适应模式都会走这里），
+        //   而 GUI 帧心跳的看门狗阈值只有 5s —— 这是**正常的长操作**，不是卡死。
+        //   照 kernel/terminal64.cpp 对"大文件 I/O 长操作"的既有做法：暂停看门狗，做完再恢复
+        //   （pause/unpause 都会刷新 kick 时间）。不这么做时，主题切换在 TCG 下会偶发
+        //   [WD64] watchdog fire stale≈5.1s -> [PANIC64] WATCHDOG_TIMEOUT（本批实测踩到）。
         // 主题变了 → 内置壁纸要按新主题重生成（文件壁纸不受主题影响）
         if (g_wall_desc && g_wall_desc[0] == 'b' && g_surface_theme != theme64_id64()) {
             gfx64_wall_build_default64();
             g_wall_log_budget = 12;
         }
         wall_compose64();
+        panic64_watchdog_unpause64();
     }
 }
 

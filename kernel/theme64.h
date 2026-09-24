@@ -74,7 +74,8 @@
 #define THEME64_ID_PINKGRAD   3      // 粉白渐变
 #define THEME64_ID_PINKGREEN  4      // 自定义渐变：粉绿
 #define THEME64_ID_PINKPURPLE 5      // 自定义渐变：粉紫
-#define THEME64_THEME_COUNT   6
+#define THEME64_ID_PURPLEGRAD 6      // 紫白渐变（用户参考图风格板；强调色 #7C4DFF）
+#define THEME64_THEME_COUNT   7
 
 // ==================== Token 结构 ====================
 // 一个主题 = 一组颜色 + 两个渐变端点。几何/模糊/动效 token 是**全主题共用**的（上面的宏）。
@@ -132,6 +133,8 @@ struct Theme64Tokens {
 // ==================== API ====================
 // 初始化：读 config64 的 ui.theme / ui.reduce_motion / ui.wall.* → 生效 + 打点。必须在 config64_init64 之后。
 void theme64_init64();
+// 与 Rust 侧主题表交叉核对（数量/名字/accent）并打点 [THEME64] rust cross-check / theme
+void theme64_rust_crosscheck64();
 const Theme64Tokens* theme64_tokens64();          // 当前主题 token（永不为空）
 int  theme64_id64();
 const char* theme64_name64(int id);               // 非法 id 返回 "?"

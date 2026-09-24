@@ -8,6 +8,7 @@
 //! 六个主题（索引固定，C++ 侧 / 测试按索引与名字两层核对）：
 //!   0 白色(默认)     1 暗色        2 蓝白渐变
 //!   3 粉白渐变       4 粉绿渐变     5 粉紫渐变
+//!   6 紫白渐变（用户参考图风格板：纯白/暗黑/蓝白渐变/紫白渐变/粉白渐变/自定义颜色）
 //!
 //! 两条约定（本文件里是代码，不是注释）：
 //!   * **非暗色主题的 Dock 用固定的默认色**（DEFAULT_DOCK）；只有暗色主题用
@@ -99,7 +100,7 @@ pub struct ThemeDef {
 }
 
 // ---- 六个主题：颜色就写在这里，别的文件不再各写一份 ----
-pub static THEMES: [ThemeDef; 6] = [
+pub static THEMES: [ThemeDef; 7] = [
     // 0 白色（默认）：Windows 观感的白底 + 桌面的 Win10 蓝强调色（0,84,158）
     ThemeDef {
         name: "白色(默认)",
@@ -188,6 +189,21 @@ pub static THEMES: [ThemeDef; 6] = [
         shadow: Rgba::new(0, 0, 0, 20),
         grad_start: Rgba::rgb(255, 150, 200),
         grad_end: Rgba::rgb(170, 140, 240),
+        dark: false,
+    },
+    // 6 紫白渐变：紫 -> 白（用户参考图风格板里的主题；强调色 #7C4DFF）
+    ThemeDef {
+        name: "紫白渐变",
+        window_bg: Rgba::rgb(246, 242, 255),
+        card_bg: Rgba::new(255, 255, 255, 204), // 0.80
+        text: Rgba::rgb(40, 30, 62),
+        text_dim: Rgba::rgb(120, 104, 146),
+        accent: Rgba::rgb(0x7C, 0x4D, 0xFF),    // #7C4DFF
+        dock: DEFAULT_DOCK,                     // 非暗色主题：固定默认色
+        border_hi: Rgba::new(255, 255, 255, 140),
+        shadow: Rgba::new(0, 0, 0, 20),         // 0.08
+        grad_start: Rgba::rgb(168, 128, 255),   // 紫
+        grad_end: Rgba::rgb(255, 255, 255),     // 白
         dark: false,
     },
 ];
@@ -395,7 +411,7 @@ pub fn selftest() -> u32 {
     }
 
     // ---- bit2：主题表 ----
-    if count() != 6 || name_bytes(0) != Some("白色(默认)".as_bytes()) {
+    if count() != 7 || name_bytes(0) != Some("白色(默认)".as_bytes()) {
         fail |= 4;
     }
     let mut i = 0u32;

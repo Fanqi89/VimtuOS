@@ -131,6 +131,11 @@ echo "==> 准备资源（字体 / logo / 图标；生成脚本产物落在 build
 cp build/font_bahnschrift.ttf build/font_simhei.ttf build/font_mono.ttf build/font_fallback.ttf "$BUILD/"
 cp build/logo_rgba.bin build/icon_mycomputer.bin build/icon_recyclebin.bin \
    build/icon_terminal.bin build/icon_start.bin "$BUILD/"
+# ★ 本批：把**真文件 logo/kaisi.png 的原始字节**也嵌进系统内核（objcopy，符号 _binary_kaisi_png_*）——
+#   启动期由 gui64 幂等装进 VimtuFS2 系统卷（/logo/kaisi.png + /kaisi.png），开始按钮从盘上读真图。
+#   只进系统内核：安装介质不跑桌面，不需要它（省它的 4MB 预算）。
+cp logo/kaisi.png "$BUILD/kaisi.png"
+echo "    嵌入 logo/kaisi.png = $(stat -c%s logo/kaisi.png) 字节"
 
 echo "==> 编译 64 位内核对象（两套：OS 与 安装程序）"
 # --- 系统内核（装进硬盘后运行）---
@@ -158,8 +163,10 @@ echo "==> 资源对象（objcopy -> elf64，两份内核共用同一批）"
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_recyclebin.bin icon_recyclebin.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_terminal.bin icon_terminal.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_start.bin icon_start.o)
+(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 kaisi.png kaisi_png.o)
 # OS 内核用同一批资源对象（直接复用）
 cp "$BUILD"/font_*.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o "$BUILD/os/"
+cp "$BUILD"/kaisi_png.o "$BUILD/os/"      # 只给系统内核（桌面用）
 
 echo "==> Rust 模块（gui_rs crate：设计 Token 表 + 主题配色计算；项目路线 C + C++ + Rust）"
 # 为什么单独一段：Rust 用 `rustc --target x86_64-unknown-none` 编成**可直接被 ld.lld 链接**
@@ -273,7 +280,8 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD/os"/hello_vap64.o \
-    "$BUILD/os"/user_demo64.o "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o
+    "$BUILD/os"/user_demo64.o "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
+    "$BUILD/os"/kaisi_png.o
 $OBJCOPY -O binary "$BUILD/kernel64_os.elf" "$BUILD/kernel64_os.bin"
 
 KBSZ=$(stat -c%s "$BUILD/kernel64.bin")
