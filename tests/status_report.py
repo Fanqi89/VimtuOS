@@ -481,10 +481,68 @@ def cap_app_layer_linux():
 
 
 def cap_rust():
-    n = grep_count(r"rustc|Cargo|cargo|\.rs\b", ["build64.sh", "build_uefi.sh", "构建与运行说明.md"])
-    ev = ["构建脚本中 Rust 相关命中 %d" % n,
-          "现状：全部为 C/C++（clang），未引入 Rust" if n == 0 else "已有 Rust 痕迹"]
-    return ("MISSING" if n == 0 else "PARTIAL"), ev
+    """Rust 参与实现：gui_rs crate（#![no_std]）作为设计 Token + 主题配色真源，链接进系统内核。"""
+    if not (exists("gui_rs/src/lib.rs") and exists("gui_rs/build_rs.sh") and exists("kernel/rust64.h")):
+        return "MISSING", ["gui_rs/ 或 kernel/rust64.h 不存在（Rust 未接入）"]
+    n = (lines("gui_rs/src/lib.rs") + lines("gui_rs/src/tokens.rs") + lines("gui_rs/src/theme.rs")
+         + lines("gui_rs/src/panic.rs"))
+    exp = grep_count(r"#\[no_mangle\]", ["gui_rs/src/lib.rs"])
+    bld = grep_count(r"gui_rs/build_rs.sh", ["build64.sh"])
+    lnk = grep_count(r"gui_rs\.o", ["build64.sh"])
+    boot = grep_count(r"rust64_boot_init64", ["kernel/kernel64.cpp"])
+    tag = grep_count(r"RUST64-GUI-TOKENS-THEME-1", ["gui_rs/src/lib.rs"])
+    tst = exists("tests/rust64_test.py")
+    ev = ["gui_rs crate（no_std、无 alloc、无浮点）：%d 行" % n,
+          "extern \"C\" 导出（#[no_mangle]、POD 接口）：命中 %d" % exp,
+          "build64.sh 调 gui_rs/build_rs.sh + 链接 gui_rs.o（仅系统内核）：命中 %d/%d" % (bld, lnk),
+          "启动期自检 rust64_boot_init64：命中 %d" % boot,
+          "字节级链接标记 \"RUST64-GUI-TOKENS-THEME-1\"：命中 %d" % tag,
+          "验收脚本 tests/rust64_test.py：%s（nm/objdump 符号 + 安装内核 0 符号 + 体积上限 + 串口 accent 与源码比对）"
+          % ("有" if tst else "★ 缺"),
+          "实测串口：\"[RUST64] tokens ok themes=6 accent=#00549E selftest PASS theme=0 name=白色(默认)\"；终端 `rust [tokens|set N]`"]
+    done = n and exp and bld and lnk and boot and tag and tst
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_ui_modern():
+    """★ Windows 11 现代外观：Token + 毛玻璃 + 大圆角 + 双层浅阴影 + 新 Dock（居中靠下 y=高-76）。"""
+    need = ["kernel/theme64.h", "kernel/theme64.cpp", "kernel/gfx64.h", "kernel/gfx64.cpp", "kernel/gui64.cpp"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    tk = grep_count(r"THEME64|round|blur|shadow|alpha|token", ["kernel/theme64.h"])
+    gl = grep_count(r"gfx64_glass64|wall_build_default64|gfx64_shadow64", ["kernel/gfx64.cpp"])
+    dk = grep_count(r"dock_geom_init64|dock_anim_tick64|dock_hit64|draw_dock", ["kernel/gui64.cpp"])
+    g1 = exists("tests/gfx64_test.py")
+    g2 = exists("tests/gui_modern64_test.py")
+    ev = ["theme64 = Token 唯一真源（圆角 14/12/9/24、模糊 24/12、透明度 0.45/0.80、双层阴影、150/220/320ms）：命中 %d" % tk,
+          "gfx64 圆角/双层阴影/毛玻璃缓存/壁纸 6 适应模式：命中 %d" % gl,
+          "gui64 新 Dock（几何/动画/命中/绘制）：命中 %d" % dk,
+          "验收脚本 tests/gfx64_test.py：%s / tests/gui_modern64_test.py：%s" % ("有" if g1 else "★ 缺", "有" if g2 else "★ 缺"),
+          "实测串口：\"[DOCK64] geom x=380 y=724 w=520 h=60 r=24 icon=46 gap=11 ... screen=1280x800\"（724 = 800 − 76）",
+          "实测串口：\"[GFX64] wall blur once r=24 ... builds=1\"（毛玻璃整屏只算一次）",
+          "截图：docs/screenshots/modern_white64.png / modern_dark64.png / modern_bluegrad64.png"]
+    done = tk and gl and dk and g1 and g2
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_img_decode():
+    """★ 内置 PNG 解码（img64）：壁纸/头像/开始按钮图标优先从 VimtuFS2 读，缺失时内置兜底。"""
+    if not (exists("kernel/img64.cpp") and exists("kernel/img64.h")):
+        return "MISSING", ["kernel/img64.cpp/.h 不存在（无图像解码）"]
+    n = lines("kernel/img64.cpp")
+    png = grep_count(r"decode_png64|img64_decode64", ["kernel/img64.cpp"])
+    zl = grep_count(r"inflate", ["kernel/img64.cpp"])
+    vfs = grep_count(r"img64_load_vfs64", ["kernel/img64.cpp"])
+    mark = grep_count(r"IMG64", ["kernel/img64.cpp"])
+    ev = ["img64.cpp %d 行（inflate + PNG 色型 0/2/3/4/6 + 1/2/4/8/16 位 + BMP）" % n,
+          "PNG 解码入口：命中 %d；inflate：命中 %d" % (png, zl),
+          "VimtuFS2 加载通道 img64_load_vfs64：命中 %d" % vfs,
+          "打点 \"[IMG64]\"：命中 %d" % mark,
+          "实测串口：\"[IMG64] selftest PASS mask=0 png=4x4 rc=0 bytes=112 fmt=png\"",
+          "边界（如实）：JPEG 未实现（返回 -2 并打点）；PNG Adam7 隔行未支持"]
+    done = png and vfs
+    return ("DONE" if done else "PARTIAL"), ev
 
 
 def cap_scheduler():
@@ -1355,7 +1413,9 @@ CAPS = [
     ("内核", "内存管理（堆 + 页池 + 归属记账）", cap_memory),
     ("应用层", "★ 可安装应用：自有格式 + 加载器 + 系统调用 + 用户态", cap_app_layer_loadable),
     ("应用层", "★ Linux 应用适配（ELF64 + syscall 指令 + ring3）", cap_app_layer_linux),
-    ("工具链", "Rust 参与实现（可选要求）", cap_rust),
+    ("工具链", "★ Rust 参与实现（gui_rs：设计 Token 表 + 主题配色真源，链接进系统内核）", cap_rust),
+    ("应用", "★ Windows 11 现代外观（Token + 毛玻璃 + 大圆角 + 双层浅阴影 + 居中靠下 Dock）", cap_ui_modern),
+    ("应用", "★ 内置 PNG 解码（壁纸/头像/开始按钮图标：VimtuFS2 优先 + 内置兜底）", cap_img_decode),
     ("内核", "调度器（多任务）", cap_scheduler),
     ("内核", "文件系统（真实 VFS）", cap_filesystem),
     ("内核", "每进程 fd 表 + fd 继承 + O_APPEND + pipe（批次 D）", cap_fd64_batch_d),
@@ -1413,6 +1473,11 @@ TESTS = [
     ("usbstorage_test.py", "★ 批次 O USB 存储（U 盘只读）：BOT+SCSI（INQUIRY/READ CAPACITY/READ(10)）"
                            "-> 驱动器号 24 -> 盘符 D: -> 管理器浏览 + 从 U 盘拷 .vap/.elf 到 C:"
                            "（宿主侧逐字节核对）+ 写被拒 + 键盘与 U 盘同时插（99 条断言）"),
+    ("rust64_test.py", "★ Rust 接入：gui_rs 符号进系统内核（nm/objdump）+ 安装内核 0 符号 + 体积上限 + "
+                       "串口 accent 与 Rust 源码解析值比对（124 条断言）"),
+    ("gfx64_test.py", "★ 现代图元层：圆角抗锯齿 / 双层阴影梯度 / 毛玻璃方差 / 壁纸渐变单调 / Token 区间（49 条断言）"),
+    ("gui_modern64_test.py", "★ 新 Dock：几何(y=高-76 / 630 均居中) + 悬停放大让位 + 回弹 + 小横杠 + 主题切换像素 + "
+                             "6 种壁纸适应模式（105 条断言）"),
     ("preload_update_test.py", "预加载 + 更新：字形/图标预热实测 + update 标记->应用->store/done->重启闭环"),
     ("tmgr_proc_test.py", "任务管理器进程页 = proc64 真进程：真进程行 + kill(SIGKILL) 端到端（键盘注入）"),
     ("display_runtime_test.py", "运行期显示层：模式清单 + 0x3DA 实测/如实降级 + EDID 对比 + DDC 未实现说明"),
