@@ -1523,6 +1523,40 @@ def cap_settings_p3():
     done = mk and nav and cfg and fnt and tst
     return ("DONE" if done else "PARTIAL"), ev
 
+def cap_desktopops_p5():
+    """★ P5 桌面交互细节：右键菜单 / 玻璃选择框 / 回收站入口 / 指针形状 / 窗口缩放 / 最小化飞 Dock / 圆角桌面图标。"""
+    need = ["kernel/desktopops64.h", "kernel/desktopops64.cpp", "tests/desktopops64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    n = lines("kernel/desktopops64.cpp")
+    desk = grep_count(r"DESK64|RECYCLE64", ["kernel/desktopops64.cpp"])
+    sel = grep_count(r"selbox glass|menu open", ["kernel/desktopops64.cpp"])
+    cur = grep_count(r"cursor shape|size-h|size-d", ["kernel/input.cpp"])
+    fly = grep_count(r"minimize fly|minbar|restore pop", ["kernel/gui64.cpp"])
+    reg = grep_count(r"check_app_painted64|app blank", ["kernel/gui64.cpp"])
+    tst = exists("tests/desktopops64_test.py")
+    ev = ["desktopops64.cpp %d 行；打点 [DESK64]|[RECYCLE64]（desktopops64.cpp）命中 %d；"
+          "右键菜单/选择框符号（selbox glass|menu open 命中 %d）" % (n, desk, sel),
+          "指针形状（cursor shape|size-h|size-d，input.cpp）命中 %d；最小化飞 Dock 与 Dock 点击语义"
+          "（minimize fly|minbar|restore pop，gui64.cpp）命中 %d；应用窗口不丢失防回归"
+          "（check_app_painted64|app blank，gui64.cpp）命中 %d" % (cur, fly, reg),
+          "实测串口：\"[DESK64] menu open x=639 y=301 w=180 h=270 items=8 enabled=5 row=32 r=14 shadow=2 edge=1 (acrylic)\"、"
+          "\"[DESK64] selbox glass x=316 y=233 w=644 h=245 corner=9 edge=1 inside_alpha=0 sel=3\"（框内 diff=0）、"
+          "\"[RECYCLE64] add kind=2 n=1 desktop=2\"、\"[DESK64] icons reset why=settings defaults=3 persisted=1\"",
+          "实测串口：\"[INPUT64] cursor shape=size-h prev=arrow\"（指针 6 向中实跑命中 2 向）、"
+          "\"[DOCK64] minimize fly app=3 idx=2 dur=225ms anim=scale+fade\"、\"[DOCK64] minbar idx=4 x=… w=… clickable=0\"、"
+          "\"[EXPL64] hidden idx=1 disk=1 part=2 name=… reason=system-partition\"",
+          "验收脚本 tests/desktopops64_test.py：%s（66 条断言：右键菜单 8 项/置灰/ESC 与点外部关闭、玻璃选择框（框内 diff=0）、"
+          "拖入回收站、指针形状、窗口缩放、最小化飞 Dock 与 Dock 点击语义、圆角桌面图标、恢复默认桌面图标、只显示可见分区 + "
+          "应用窗口不丢失防回归；13 条因本轮 QEMU PS/2 注入零命中为 [skip]）" % ("有" if tst else "★ 缺"),
+          "边界（如实）：需求 3 的\"回收站恢复/永久删除 + 二次确认\"、需求 5 的\"八向缩放 + 内容重排\"、"
+          "需求 4 的对角/文本 I/转圈、需求 6 的\"多窗口一根横杠 + 悬停窗口列表选窗\"目前只有代码 + 断言、"
+          "没有实跑打点（QEMU PS/2 注入在那些入口零命中，测试里以 [skip] 如实标注且未削弱阈值）；"
+          "实跑已证：桌面右键菜单/玻璃选择框/回收站入口/指针 6 向中的 2 向/最小化飞 Dock/圆角桌面图标；"
+          "资源管理器只隐藏**非引导盘**系统分区"]
+    done = desk and sel and cur and fly and reg and tst
+    return ("DONE" if done else "PARTIAL"), ev
 CAPS = [
     ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
      cap_boot_console),
@@ -1580,6 +1614,7 @@ CAPS = [
     ("应用", "★ 开始菜单 + 四个二级弹窗（通知/声音/网络/日历）+ 设备插拔 toast + Caps/Shift/滚轮", cap_startmenu_p2),
     ("内核", "★ VimtuFS2 v4 权限（uid/gid/mode + owner/group/other rwx 拦截；v3 旧卷兼容但豁免）", cap_perm_v4),
     ("应用", "★ Win11 风格设置（左导航 240px + 六组：系统/个性化/网络/用户/安全/关于；全部实时生效并持久化）", cap_settings_p3),
+    ("应用", "★ P5 桌面交互（右键菜单/玻璃选择框+拖动/回收站入口/指针形状/窗口缩放/最小化飞 Dock 与 Dock 点击语义/圆角桌面图标；资源管理器只显示可见分区）", cap_desktopops_p5),
 ]
 
 
@@ -1640,6 +1675,7 @@ TESTS = [
     ("panels64_test.py", "★ P2 四弹窗：通知(角标/空态)+声音(滑块百分比/输出源/如实未接驱动)+网络(WiFi 如实空态+以太网区固定)+日历(7×6/滚轮·方向键·PageUp/PageDown/今天/年份面板)+设备 toast 滑入滑出（78 条断言）"),
     ("perm64_test.py", "★ P4 权限：卷 v4(uid/gid/mode)+owner/group/other rwx 真拦截(root 绕过)+su/sudo 真提权+chmod/chown/umask+ls -l（95 条断言，含 v3 旧卷兼容）"),
     ("settings64_test.py", "★ P3 设置页：左导航 240px + 六组 + 主题/壁纸适应模式(桌面/锁屏分别)/Dock 长度与图标尺寸实时生效/字体大小/默认应用/头像/改名/密码设置与清空/关于页；含软重启后的持久化与\"设密码→重启必须输密码\"（105 条断言）"),
+    ("desktopops64_test.py", "★ P5 桌面交互：右键菜单(8 项/置灰/ESC 与点外部)/玻璃选择框(框内 diff=0)/拖入回收站/指针形状(6 向+文本+转圈)/窗口缩放/最小化飞 Dock 与 Dock 点击语义/圆角桌面图标/恢复默认桌面图标/只显示可见分区 + 应用窗口不丢失防回归（66 条断言，13 条因注入零命中为 [skip]）"),
 ]
 
 
