@@ -2374,19 +2374,20 @@ static void handle_keyboard(void) {
     }
     uint8_t c = 0;
     while (kbd_pop_char(&c)) {
-        // 本批新增热键：Ctrl+Shift+T 循环主题 / Ctrl+Shift+N 循环壁纸适应模式 / Ctrl+Shift+R 减少动画开关
-        //（theme64_hotkey64 里实时生效 + 写 config64 持久化；减少动画也可用终端 `cfg set ui.reduce_motion 1`）
-        if (kbd_ctrl_pressed() && theme64_hotkey64(c, 1, kbd_shift_pressed() ? 1 : 0)) {
-            gui64_invalidate();
-            continue;
-        }
-        // ★ P5：Ctrl+Shift+W = 最小化活动窗口（需求原文：标题栏最小化按钮**或快捷键**）。
-        //   修饰键状态在**按键时刻**由 input.cpp 记下来（kbd_ctrl_shift_char64）：QEMU sendkey
-        //   的按下/释放只隔几毫秒，外壳忙一帧再处理时 kbd_ctrl_pressed() 已经是 false，
-        //   只看控制码/修饰键会漏（实测：空闲时命中、带窗口红绘时 0 命中）。
+        // ★ P5：Ctrl+Shift+<字母> 组合热键 —— 统一走"按键时刻记录"（input.cpp kbd_ctrl_shift_char64）。
+        //   为什么：QEMU sendkey 的按下/释放只隔几毫秒，外壳忙一帧再处理时 kbd_ctrl_pressed()
+        //   已经变回 false，组合热键会**偶发漏掉**（实测 gui_modern64_test 的 Ctrl+Shift+R 会红）。
+        //   覆盖：Ctrl+Shift+T/N/R（主题 / 壁纸适应 / 减动效）+ Ctrl+Shift+W（最小化活动窗口）。
         {
             char csw = 0;
-            if (kbd_ctrl_shift_char64(&csw) && csw == 'W') {
+            const bool cs_key = kbd_ctrl_shift_char64(&csw);       // 取走即清空
+            if (cs_key && (csw == 'T' || csw == 'N' || csw == 'R')) {
+                if (theme64_hotkey64((uint8_t)csw, 1, 1)) {
+                    gui64_invalidate();
+                    continue;
+                }
+            }
+            if (cs_key && csw == 'W') {
                 Window* aw = top_visible_win64();
                 dbg64_str("[UI] hotkey ctrl+shift+w minimize");
                 dbg64_nl();
@@ -2397,6 +2398,13 @@ static void handle_keyboard(void) {
                 }
                 continue;                              // 消费这一次按键（不再落到应用/菜单）
             }
+        }
+        // 老路径：不带 Shift 的 Ctrl+<字母>（键盘层折成的控制码）—— 保持既有行为
+        if (kbd_ctrl_pressed() && theme64_hotkey64(c, 1, kbd_shift_pressed() ? 1 : 0)) {
+            char drain = 0;
+            (void)kbd_ctrl_shift_char64(&drain);       // 同一按键的"按键时刻记录"一并取走，避免重复触发
+            gui64_invalidate();
+            continue;
         }
         // ★ P2：二级弹窗优先吃键（ESC 一级）→ 开始菜单（ESC 二级）→ ★ P5 桌面右键菜单 → 老菜单
         if (panels64_handle_key64(c)) continue;
