@@ -135,3 +135,34 @@ int  cfg64_session_mode64();
 void cfg64_set_session_mode64(int mode);
 int  cfg64_session_restore64(char* out, int out_max);
 void cfg64_set_session_restore64(const char* list);
+// ---- ★ P3（Windows 11 风格设置应用）：字体大小档 / 壁纸同步 / 自定义渐变 / 声音 / 默认应用 ----
+// 字体大小：渲染字号档（像素 em 高度；14=小 / 16=中（默认，与 font.cpp 的 FONT_SIZE_PX 一致）/ 18=大）
+int  cfg64_font_size64();
+void cfg64_set_font_size64(int px);
+// 桌面 / 锁屏壁纸适应模式"同步"开关：1（默认）= 改桌面就跟着改锁屏；0 = 两者分别设置
+int  cfg64_wall_sync64();
+void cfg64_set_wall_sync64(int on);
+// 自定义渐变两端色（#RRGGBB 文本）+ 开关（1 = 用自定义渐变当桌面壁纸；壁纸文件优先）
+int  cfg64_grad_on64();
+void cfg64_set_grad_on64(int on);
+int  cfg64_grad_a64(char* out, int out_max);
+void cfg64_set_grad_a64(const char* hex);
+int  cfg64_grad_b64(char* out, int out_max);
+void cfg64_set_grad_b64(const char* hex);
+// 声音（**没有音频驱动**：这两个值只进内存 + 配置，绝不写硬件；见设置页的打点）
+int  cfg64_sound_vol64();
+void cfg64_set_sound_vol64(int vol);
+int  cfg64_sound_src64();
+void cfg64_set_sound_src64(int src);
+// 默认应用（按类型/扩展名 -> 应用）：
+//   kind: CFG64_DEFK_ELF=0 / VAP=1 / TXT=2 / VIDEO=3
+//   值 = 应用短名（"term"/"mypc"/"monitor"/"about"；"" = 不指定）
+//   键："ui.def.elf" / "ui.def.vap" / "ui.def.txt" / "ui.def.video"
+#define CFG64_DEFK_ELF    0
+#define CFG64_DEFK_VAP    1
+#define CFG64_DEFK_TXT    2
+#define CFG64_DEFK_VIDEO  3
+#define CFG64_DEFK_COUNT  4
+const char* cfg64_defapp_key64(int kind);          // 非法 kind -> ""
+int  cfg64_defapp64(int kind, char* out, int out_max);
+void cfg64_set_defapp64(int kind, const char* app);

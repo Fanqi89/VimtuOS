@@ -44,6 +44,8 @@
 // ★ P2：开始菜单（startmenu64）+ 四个二级弹窗/通知/设备 toast（panels64）
 #include "startmenu64.h"
 #include "panels64.h"
+#include "settings64.h"      // ★ P3：设置页的启动期生效点（字体大小档 + 自定义渐变壁纸）
+
 
 // ==================== 资源符号（build64.sh 用 objcopy 生成）====================
 extern "C" const uint8_t _binary_icon_mycomputer_bin_start[];
@@ -945,6 +947,16 @@ static void dock_geom_init64() {
     dbg64_dec((uint64_t)THEME64_R_DOCK);
     dbg64_nl();
     dbg64_line_end64();
+}
+
+// ★ P3（设置应用）：Dock 长度/图标尺寸/图标间距被设置页改过之后调一次：
+//   清掉"已打点"标记 -> 重新按 config64 算几何（于是会**再打一行 [DOCK64] geom**，
+//   这就是"改完 DOCK64 geom 变化"的证据）-> 整屏重绘。
+//   不动任何既有绘制逻辑；只有设置页会调它（gui64.h 里没有声明，设置页自己 extern 声明）。
+void gui64_dock_reload64() {
+    g_dock_geom_logged = false;
+    dock_geom_init64();
+    gui64_invalidate();
 }
 
 // 目标缩放/让位：悬停项 120%（Token），紧邻两项 104% 且向外让位
@@ -2283,6 +2295,9 @@ int gui64_selftest() {
             dbg64_dec((uint64_t)rc_img);
             dbg64_nl();
         }
+        // ★ P3：设置页持久化的项在这里生效（字体大小档 + 自定义渐变壁纸）。必须在壁纸装载决定
+        //   **之后**（否则会被 gfx64_wall_build_default64 覆盖）、锁屏/桌面首帧之前（字号要先生效）。
+        settings64_boot_apply64();
         dock_start_icon_init64();
         dock_geom_init64();
         g_dock_hover = -1;

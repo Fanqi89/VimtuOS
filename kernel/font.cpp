@@ -27,8 +27,11 @@ extern "C" const uint8_t _binary_font_fallback_ttf_start[];
 extern "C" const uint8_t _binary_font_fallback_ttf_end[];
 
 #define FONT_PX 20            // 光栅化缓冲（em 高像素 + descender 余量）
-#define FONT_SIZE_PX 16       // 字号（em 高度，像素）
-#define FONT_LINE_HEIGHT 20   // 行高（ascender+descender 最大 ≈ bahnschrift 19.2px，取 20）
+#define FONT_SIZE_PX 16       // 字号（em 高度，像素）—— ★ P3 起只是**默认档**，运行期用 g_em_px
+#define FONT_SIZE_MIN 12      // font_set_size64() 的下限
+#define FONT_SIZE_MAX 18      // 上限 18：光栅缓冲 FONT_PX=20，再大字形会被裁（如实不让选）
+static int g_em_px = FONT_SIZE_PX;    // 当前 em 高度（font_set_size64 改它；默认 16 = 历史值）
+#define FONT_LINE_HEIGHT 20   // 历史行高常量（em=16 时的值；运行期行高见 font_line_height()）
 #define FONT_CACHE_N 128      // ASCII 固定缓存 0x20..0x7F
 // 非 ASCII（CJK）LRU 缓存槽数。
 // 256 而不是 192：系统级预加载（preload.cpp）一次预热 193 个界面常用汉字，
@@ -127,6 +130,26 @@ static uint32_t loca_offset(FontFace* fc, uint16_t g) {
     return be32(fc->F + fc->offLoca + 4 * g);
 }
 
+// ---- ★ P3：字号档（em 像素高）→ 面的 scaleFix / ascFix / ASCII 推进宽度 ----
+// face_init 与 font_set_size64() 共用；只依赖 unitsPerEm / hhea.ascender / hmtx（cmap 只在
+// face_init 的第二次调用时才就绪 —— 第一次调用只算 scale/asc，advPx 留给第二次）。
+static void face_metrics(FontFace* fc) {
+    const int16_t asc = be16s(fc->F + fc->offHhea + 4);
+    fc->scaleFix = (g_em_px * 1024) / fc->unitsPerEm;
+    if (fc->scaleFix < 1) fc->scaleFix = 1;
+    fc->ascFix = (int32_t)asc * fc->scaleFix;
+    if (!fc->cmap4) return;                       // cmap 还没解析：只算 scale
+    for (int i = 0; i < FONT_CACHE_N; i++) {
+        uint16_t g = cmap_lookup(fc, (uint16_t)i);
+        if (g >= fc->numGlyphs) g = 0;
+        if (g >= fc->numHMetrics) g = (uint16_t)(fc->numHMetrics - 1);
+        const uint16_t aw = be16(fc->F + fc->offHmtx + 4 * g);
+        int px = (int)(((int32_t)aw * fc->scaleFix + 512) >> 10);
+        if (px < 1) px = 1;
+        fc->advPx[i] = px;
+    }
+}
+
 // ---------------- 初始化 ----------------
 static void face_init(FontFace* fc, const uint8_t* start, const uint8_t* end) {
     fc->F = start;
@@ -170,9 +193,9 @@ static void face_init(FontFace* fc, const uint8_t* start, const uint8_t* end) {
     if (fc->numGlyphs == 0) return;
 
     int16_t asc = be16s(fc->F + fc->offHhea + 4);
-    fc->scaleFix = (FONT_SIZE_PX * 1024) / fc->unitsPerEm;
-    if (fc->scaleFix < 1) fc->scaleFix = 1;
-    fc->ascFix = (int32_t)asc * fc->scaleFix;
+    (void)asc;
+    fc->cmap4 = nullptr;
+    face_metrics(fc);
 
     // cmap：优先 Windows Unicode BMP（platform 3 / encoding 1）的 format 4
     uint16_t nTabs = be16(fc->F + fc->offCmap + 2);
@@ -188,16 +211,8 @@ static void face_init(FontFace* fc, const uint8_t* start, const uint8_t* end) {
     if (!fc->cmap4) fc->cmap4 = fc->F + fc->offCmap;  // 退化：恒等映射
     fc->segCount = (be16(fc->cmap4 + 6) >= 2) ? be16(fc->cmap4 + 6) / 2 : 0;
 
-    // 预计算 ASCII 推进宽度
-    for (int i = 0; i < FONT_CACHE_N; i++) {
-        uint16_t g = cmap_lookup(fc, (uint16_t)i);
-        if (g >= fc->numGlyphs) g = 0;
-        if (g >= fc->numHMetrics) g = (uint16_t)(fc->numHMetrics - 1);
-        uint16_t aw = be16(fc->F + fc->offHmtx + 4 * g);
-        int px = (int)(((int32_t)aw * fc->scaleFix + 512) >> 10);
-        if (px < 1) px = 1;
-        fc->advPx[i] = px;
-    }
+    // 预计算 ASCII 推进宽度（cmap 就绪后才能查；见 face_metrics）
+    face_metrics(fc);
     fc->font_ok = true;
 }
 
@@ -465,7 +480,39 @@ static int lru_get_slot(FontFace* fc, uint32_t cp) {
 }
 
 // ---------------- 公共 API ----------------
-int font_line_height() { return FONT_LINE_HEIGHT; }
+// 行高：em + 4（em=16 时 = 20 = 历史 FONT_LINE_HEIGHT，默认档下逐像素不变）
+int font_line_height() { return g_em_px + 4; }
+
+// ★ P3：字体大小档（设置页"字体大小"）。改完立刻影响**全部**后续绘制（advPx/缓存全部按新
+// scaleFix 重算；已缓存的字形位图全部失效重光栅化）。返回实际生效值（被钳制过）。
+void font_set_size64(int px) {
+    if (px < FONT_SIZE_MIN) px = FONT_SIZE_MIN;
+    if (px > FONT_SIZE_MAX) px = FONT_SIZE_MAX;
+    if (px == g_em_px) return;
+    g_em_px = px;
+    for (int f = 0; f < FONT_FACE_COUNT; f++) {
+        FontFace* fc = &g_face[f];
+        if (!fc->F) continue;
+        face_metrics(fc);                        // 重算 scaleFix/ascFix + ASCII 推进宽度
+        for (int i = 0; i < FONT_CACHE_N; i++) {  // ASCII 缓存全部作废（位图与推进宽都变了）
+            fc->cacheOk[i] = false;
+            fc->cacheW[i] = fc->cacheH[i] = 0;
+        }
+        for (int i = 0; i < FONT_LRU_N; i++) fc->lru_key[i] = 0;   // CJK LRU 全部作废
+        fc->lru_tick = 0;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[FONT64] size px=");
+    dbg64_dec((uint64_t)g_em_px);
+    dbg64_str(" line=");
+    dbg64_dec((uint64_t)(g_em_px + 4));
+    dbg64_str(" faces=");
+    dbg64_dec((uint64_t)FONT_FACE_COUNT);
+    dbg64_str(" caches_rebuilt=1 (scaleFix/advance recomputed; glyph bitmaps invalidated)");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+int font_get_size64() { return g_em_px; }
 
 int font_glyph_advance(char c) {
     int idx = (unsigned char)c;
@@ -526,9 +573,9 @@ static FontFace* font_resolve_cp(uint32_t cp) {
 int font_glyph_advance_cp(uint32_t cp) {
     if (cp < FONT_CACHE_N) return font_glyph_advance((char)cp);
     FontFace* fc = font_resolve_cp(cp);
-    if (!fc) return FONT_SIZE_PX;        // 缺字占位按一个 em 宽推进
+    if (!fc) return g_em_px;             // 缺字占位按一个 em 宽推进
     uint16_t g = cmap_lookup(fc, (uint16_t)cp);
-    if (g >= fc->numGlyphs) return FONT_SIZE_PX;
+    if (g >= fc->numGlyphs) return g_em_px;
     if (g >= fc->numHMetrics) g = (uint16_t)(fc->numHMetrics - 1);
     uint16_t aw = be16(fc->F + fc->offHmtx + 4 * g);
     int px = (int)(((int32_t)aw * fc->scaleFix + 512) >> 10);
@@ -593,7 +640,7 @@ bool font_draw_glyph(int x, int y, char c, uint32_t fg) {
 
 // 缺字占位：四个面都没有这个码点时画一个 1px 空心方框（并计数 + 打点，见 font_draw_glyph_cp）
 static void font_draw_missing_box(int x, int y, uint32_t fg) {
-    int w = FONT_SIZE_PX - 6, h = FONT_SIZE_PX - 4;
+    int w = g_em_px - 6, h = g_em_px - 4;
     for (int i = 0; i < w; i++) {
         fb_putpixel(x + i, y + 2, fg);
         fb_putpixel(x + i, y + 2 + h - 1, fg);
@@ -637,7 +684,7 @@ void font_draw_text(int x, int y, const char* s, uint32_t fg) {
     while (*s) {
         int adv;
         uint32_t cp = utf8_decode(s, &adv);
-        if (cp == 0 && adv == 1 && (uint8_t)s[0] == '\n') { cx = x; y += FONT_LINE_HEIGHT; s++; continue; }
+        if (cp == 0 && adv == 1 && (uint8_t)s[0] == '\n') { cx = x; y += font_line_height(); s++; continue; }
         if (cp == 0 && adv == 1) { s++; continue; }  // 非法字节跳过
         if (cp < FONT_CACHE_N) {
             font_draw_glyph(cx, y, (char)cp, fg);

@@ -14,6 +14,12 @@ enum {
 void font_init();                    // 解析嵌入 TTF（无堆分配）+ 打 [FONT64] faces= 行
 void font_select(int face);          // 见上面的 FONT_FACE_*（历史调用方写 font_select(2)：
                                      // 现在是终端等宽面，汉字由查询链落到 FONT_FACE_CJK，不会出豆腐块）
+// ★ P3（字体大小档）：设置应用把渲染字号档写进这里（em 高度像素，14/16/18）。
+//   * 只改 scaleFix/ascFix 与全部字形缓存，**不改**光栅缓冲尺寸（FONT_PX），所以绝不越界；
+//   * 取值被钳制在 12..18（>18 时字形会被 FONT_PX=20 的缓冲裁掉，如实不让选）；
+//   * 默认 16 = 历史 FONT_SIZE_PX，不调用它时行为与之前逐像素一致。
+void font_set_size64(int px);
+int  font_get_size64();
 int  font_face_count();              // 4
 int  font_line_height();             // 行高（像素）
 int  font_current_face();            // ★ 当前面序号（只读；console64 画完引导日志后恢复现场用）

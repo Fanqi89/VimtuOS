@@ -114,6 +114,18 @@ static const Cfg64Def kDefs[] = {
     { "dock.size",         CFG64_T_INT,  60,   nullptr },   // Dock 高（Token 60）
     { "dock.icon",         CFG64_T_INT,  46,   nullptr },   // 图标边长（Token 44–48 → 46）
     { "dock.gap",          CFG64_T_INT,  11,   nullptr },   // 图标间距（Token 10–12 → 11）
+    // ★ P3（Windows 11 风格设置应用）：字体大小档 / 壁纸同步 / 自定义渐变 / 声音 / 默认应用
+    { "ui.font.size",      CFG64_T_INT,  16,   nullptr },   // 渲染字号档（14/16/18；= font.cpp 的 em 像素高）
+    { "ui.wall.sync",      CFG64_T_BOOL, 1,    nullptr },   // 桌面/锁屏壁纸适应模式同步（1=默认同步）
+    { "ui.grad.on",        CFG64_T_BOOL, 0,    nullptr },   // 自定义渐变壁纸开关（0=不用）
+    { "ui.grad.a",         CFG64_T_STR,  0,    "#5AA9F0" }, // 自定义渐变起点（#RRGGBB）
+    { "ui.grad.b",         CFG64_T_STR,  0,    "#C9A7FF" }, // 自定义渐变终点（#RRGGBB）
+    { "ui.sound.volume",   CFG64_T_INT,  42,   nullptr },   // 音量（无音频驱动：内存态 + 持久化，不写硬件）
+    { "ui.sound.src",      CFG64_T_INT,  0,    nullptr },   // 输出源 0=音箱 1=耳机（同上）
+    { "ui.def.elf",        CFG64_T_STR,  0,    "term"    }, // 默认应用：.elf  -> 终端
+    { "ui.def.vap",        CFG64_T_STR,  0,    "term"    }, //              .vap  -> 终端
+    { "ui.def.txt",        CFG64_T_STR,  0,    "term"    }, //              .txt  -> 终端
+    { "ui.def.video",      CFG64_T_STR,  0,    ""        }, //              视频类 -> 无（本系统没有播放器）
 };
 #define CFG64_DEF_N ((int)(sizeof(kDefs) / sizeof(kDefs[0])))
 // 启动日志里最多逐条打印多少个默认值（避免刷屏；总数单独打一行）
@@ -743,3 +755,68 @@ int  cfg64_dock_gap64() {
     return v;
 }
 void cfg64_set_dock_gap64(int px) { config64_set_int64("dock.gap", px); }
+
+// ==================== ★ P3：设置应用用到的语义封装 ====================
+// 字体大小档：只在 14/16/18 三档里取值（font.cpp 的 em 像素高；16 = 本批默认，
+// 也正是 FONT_SIZE_PX 的历史值 —— 保持不变就不会影响既有像素断言）。
+int  cfg64_font_size64() {
+    int v = config64_get_int64("ui.font.size", 16);
+    if (v < 14) v = 14;
+    if (v > 18) v = 18;
+    return v;
+}
+void cfg64_set_font_size64(int px) {
+    if (px < 14) px = 14;
+    if (px > 18) px = 18;
+    config64_set_int64("ui.font.size", px);
+}
+
+int  cfg64_wall_sync64() { return config64_get_bool64("ui.wall.sync", 1) ? 1 : 0; }
+void cfg64_set_wall_sync64(int on) { config64_set_bool64("ui.wall.sync", on ? 1 : 0); }
+
+int  cfg64_grad_on64() { return config64_get_bool64("ui.grad.on", 0) ? 1 : 0; }
+void cfg64_set_grad_on64(int on) { config64_set_bool64("ui.grad.on", on ? 1 : 0); }
+int  cfg64_grad_a64(char* out, int out_max) { return config64_get_str64("ui.grad.a", "#5AA9F0", out, out_max); }
+void cfg64_set_grad_a64(const char* hex) { config64_set_str64("ui.grad.a", hex ? hex : ""); }
+int  cfg64_grad_b64(char* out, int out_max) { return config64_get_str64("ui.grad.b", "#C9A7FF", out, out_max); }
+void cfg64_set_grad_b64(const char* hex) { config64_set_str64("ui.grad.b", hex ? hex : ""); }
+
+int  cfg64_sound_vol64() {
+    int v = config64_get_int64("ui.sound.volume", 42);
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    return v;
+}
+void cfg64_set_sound_vol64(int vol) {
+    if (vol < 0) vol = 0;
+    if (vol > 100) vol = 100;
+    config64_set_int64("ui.sound.volume", vol);
+}
+int  cfg64_sound_src64() { return config64_get_int64("ui.sound.src", 0) ? 1 : 0; }
+void cfg64_set_sound_src64(int src) { config64_set_int64("ui.sound.src", src ? 1 : 0); }
+
+const char* cfg64_defapp_key64(int kind) {
+    switch (kind) {
+        case CFG64_DEFK_ELF:   return "ui.def.elf";
+        case CFG64_DEFK_VAP:   return "ui.def.vap";
+        case CFG64_DEFK_TXT:   return "ui.def.txt";
+        case CFG64_DEFK_VIDEO: return "ui.def.video";
+        default:               return "";
+    }
+}
+int cfg64_defapp64(int kind, char* out, int out_max) {
+    const char* k = cfg64_defapp_key64(kind);
+    if (!k[0] || out_max <= 0) return -1;
+    if (out) out[0] = 0;
+    char dflt[8];
+    dflt[0] = 0;
+    if (kind != CFG64_DEFK_VIDEO) {
+        dflt[0] = 't'; dflt[1] = 'e'; dflt[2] = 'r'; dflt[3] = 'm'; dflt[4] = 0;
+    }
+    return config64_get_str64(k, dflt, out, out_max);
+}
+void cfg64_set_defapp64(int kind, const char* app) {
+    const char* k = cfg64_defapp_key64(kind);
+    if (!k[0]) return;
+    config64_set_str64(k, app ? app : "");
+}
