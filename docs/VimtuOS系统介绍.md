@@ -39,7 +39,7 @@ VimtuOS 是一个**学习与实验性质的自研操作系统**。它的出发�
 ### 运行环境自报（终端 `ver`）
 
 ```
-VimtuOS 0.1.0 x86_64 (VimtuOS 64-bit)
+VimtuOS 0.3.2-beta14 x86_64 (VimtuOS 64-bit)      ← 版本号取自 build64.sh 的 VIMTUOS_VERSION（唯一真源）
   arch: x86_64 long mode, 4-level paging, page size 4096 bytes
   tick: 250 Hz PIT, ticks=<n>, uptime=<秒>
   64 位长模式内核：GDT/IDT/PIC/PIT/RTC + 4 级页表
@@ -538,7 +538,7 @@ VMware 里同样可以：**新建虚拟机时 `guestOS` 必须选 64 位（`othe
 
 ## 15. 已知的不足与瑕疵（诚实清单）
 
-* **版本号展示不一致**：终端 `ver` 显示 `VimtuOS 0.1.0`，而设置页"关于"里仍写着 `Vimtu64 v2.0.1 (x86-64)` —— 历史遗留，待统一。
+* ~~**版本号展示不一致**~~（已修）：终端 `ver`、终端 banner、设置页"关于"现在都取自 `build64.sh` 的 `VIMTUOS_VERSION`（编译期宏 `VIMTUOS_VERSION_STR`，唯一真源），显示 `VimtuOS 0.3.2-beta14`。
 * **"我的电脑"页的文案过时**：仍写着"尚未有文件系统驱动（store/VFS 未移植）"，而 VimtuFS2 与 store 都已可用（该页目前只显示 C: 盘信息，没有文件浏览功能）。
 * **设置页不落盘**：store 本体可用（终端命令真落盘、跨重启保留），但设置页/启动项没接线，页面里如实标注。
 * **终端文件命令仍是 ramfs**：`ls/cat/write/touch/rm` 用内核内 16×512B 的 RAM 文件表，没接 VimtuFS2；真文件系统目前由 `run/elfrun/store` 使用。

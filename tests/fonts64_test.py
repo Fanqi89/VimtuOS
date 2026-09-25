@@ -25,6 +25,7 @@
 """
 import argparse
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -241,11 +242,21 @@ def main():
         if w and h:
             # 终端默认窗口：客户区 (17,41) 起 964x644，PAD 4 -> 第 0 行 y=45，第 1 行 y=61
             cx, cy = 17, 41
-            banner = "VimtuOS Terminal v0.1 (64-bit long mode)"
+            # banner 的版本号唯一真源 = build64.sh 的 VIMTUOS_VERSION（编译期宏 VIMTUOS_VERSION_STR，
+            # kernel/terminal64.cpp 的 shell_banner 用的就是它）。这里按真源算期望字符串，
+            # 不再写死旧原文 —— 版本号升级时这条断言**不需要**再跟着改（对齐真源，不是放宽）。
+            banner = "VimtuOS Terminal v0.3.2-beta14 (64-bit long mode)"
+            try:
+                with open(os.path.join(ROOT, "build64.sh"), "r", encoding="utf-8", errors="replace") as _bf:
+                    _vm = re.search(r'VIMTUOS_VERSION="([^"]+)"', _bf.read())
+                if _vm:
+                    banner = "VimtuOS Terminal v%s (64-bit long mode)" % _vm.group(1)
+            except OSError:
+                pass
             span0 = row_ink_span(px, w, cy + 4 + 8, cx + 4, cx + 4 + 900)
             check("像素：终端 ASCII 行墨水宽度 ≈ 字符数 × 8px（半格）",
                   span0 is not None and (len(banner) * 7) <= (span0[1] - span0[0]) <= (len(banner) * 8 + 24),
-                  "span=%s, 期望≈%dpx（40 字符 × 8px）" % (span0, len(banner) * 8) if span0 else "该行没有墨水")
+                  "span=%s, 期望≈%dpx（banner=%d 字符 × 8px）" % (span0, len(banner) * 8, len(banner)) if span0 else "该行没有墨水")
             run0 = row_max_ink_run(px, w, cy + 4 + 8, cx + 4, cx + 4 + 900)
             check("像素：ASCII 字形最大墨水游程 <= 9px（半宽字形，不是 16px 位图块）", run0 <= 9,
                   "max_run=%dpx" % run0)

@@ -668,8 +668,10 @@ static void shell_prompt(TerminalState* ts) {
     }
 }
 
+// ★ 版本号唯一真源：build64.sh 的 VIMTUOS_VERSION（编译期宏 VIMTUOS_VERSION_STR，
+//   与设置页"关于"同源）。未定义时（裸编译）打 unknown —— 与 settings64.cpp 同一套兜底。
 static void shell_banner(TerminalState* ts) {
-    ts_puts(ts, "VimtuOS Terminal v0.1 (64-bit long mode)\n");
+    ts_puts(ts, "VimtuOS Terminal v" VIMTUOS_VERSION_STR " (64-bit long mode)\n");
     ts_puts(ts, gui64_tr("type 'help' for commands\n", "输入 help 查看命令\n"));
 }
 

@@ -1412,7 +1412,10 @@ def cap_users_login():
           "实测串口：\"[LOCK64] lock screen shown … blur_bg=0 why=boot\"、\"[LOGIN64] login ok user=vimtu uid=1000 via=click\"、"
           "\"[USER64] passwd ok … algo=sha256 iter=1000 salt=16B（plaintext never stored）\"、"
           "\"[USER64] su ok from=vimtu to=root euid=0 gui=vimtu gui_unchanged=1\"",
-          "边界（如实）：权限位尚未拦截（P4）；口令哈希=盐(rdtsc 非 CSPRNG)+SHA-256×1000；头像 JPEG 不支持；每用户桌面 UI 未展开"]
+          "边界（如实）：权限位**已拦截**（P4 落地）：VimtuFS2 v4 inode 的 owner/group/other rwx 逐级校验，"
+          "越权访问打 \"[PERM64] deny op=… path=… uid=… mode=… need=…\" 并返回 -EACCES（fd64 不分配 fd）；"
+          "root(euid=0) 绕过；v2/v3 旧卷无权限字段 → 豁免（兼容）。"
+          "口令哈希=盐(rdtsc 非 CSPRNG)+SHA-256×1000；头像 JPEG 不支持；每用户桌面 UI 未展开"]
     done = lk and lg and hk and cmd and tst
     return ("DONE" if done else "PARTIAL"), ev
 
