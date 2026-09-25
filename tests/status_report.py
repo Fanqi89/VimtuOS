@@ -588,8 +588,9 @@ def cap_fs_tree():
     if not (exists("kernel/vfs64.cpp") and exists("kernel/vfs64.h")):
         return "MISSING", ["kernel/vfs64.cpp/.h 不存在（无 VFS 实现）"]
     n = lines("kernel/vfs64.cpp")
-    ver = grep_count(r"VFS64_VERSION\s+3u", ["kernel/vfs64.h"])
-    v2 = grep_count(r"VFS64_VERSION_V2|VFS_LAY_V2", ["kernel/vfs64.h", "kernel/vfs64.cpp"])
+    ver = grep_count(r"VFS64_VERSION\s+4u", ["kernel/vfs64.h"])
+    v2 = grep_count(r"VFS64_VERSION_V3|VFS64_VERSION_V2|VFS_LAY_V3|VFS_LAY_V2",
+                    ["kernel/vfs64.h", "kernel/vfs64.cpp"])
     tree = grep_count(r"path_resolve|vfs64_mkdir64|vfs64_rmdir64|vfs64_tree_dump64",
                       ["kernel/vfs64.cpp"])
     iter64 = grep_count(r"vfs64_opendir64|vfs64_readdir64|vfs64_list64", ["kernel/vfs64.cpp"])
@@ -597,15 +598,16 @@ def cap_fs_tree():
     kind = grep_count(r"vfs64_kind_of_data64|VFS64_KIND_ELF|VFS64_KIND_VAP", ["kernel/vfs64.cpp"])
     boot = grep_count(r"vfs64_tree_dump64\(", ["kernel/kernel64.cpp"])
     test = exists("tests/fs_tree_test.py")
-    ev = ["vfs64.cpp %d 行（v3：多级路径解析 + 目录树遍历 + 时间戳/类型判定；v2 旧卷仍可挂载）" % n,
-          "卷版本 v3（VFS64_VERSION 3u）：命中 %d；v2 兼容布局（VFS_LAY_V2）：命中 %d" % (ver, v2),
+    ev = ["vfs64.cpp %d 行（多级路径解析 + 目录树遍历 + 时间戳/类型判定；v4 为新格式化产出，v3/v2 旧卷仍可挂载）" % n,
+          "卷版本 v4（VFS64_VERSION 4u，P4 起含 uid/gid/mode）：命中 %d；旧卷布局兼容 V3/V2"
+          "（VFS64_VERSION_V3/V2 + VFS_LAY_V3/V2）：命中 %d" % (ver, v2),
           "多级路径/建目录/删空目录/目录树打印：命中 %d" % tree,
           "游标式遍历（opendir/readdir/closedir + 路径版 list 分页）：命中 %d" % iter64,
           "mtime 打包/解包（(年-2000)<<26|月<<22|日<<17|时<<12|分<<6|秒）：命中 %d" % mtime,
           "类型判定（VAP64/ELF64/文本/二进制，写盘时存进 inode.kind）：命中 %d" % kind,
           "启动期打印目录树 vfs64_tree_dump64()（kernel64.cpp）：命中 %d" % boot,
           "实测串口：\"[VFS64] selftest PASS\"（bit8 多级目录树 / bit9 路径语义 / bit10 mtime+类型 / "
-          "bit11 代际几何+重挂载）、\"[VFS64] format ok blocks=24759 version=3 inode=128 root=8017\"",
+          "bit11 代际几何+重挂载）、\"[VFS64] format ok blocks=24759 version=4 inode=128 root=8017\"（P4 起新卷一律 v4）",
           "端到端脚本 tests/fs_tree_test.py：%s（多级 mkdir -> 子目录写文件 -> 冷启动 stat/mtime/遍历 -> 删除）"
           % ("存在" if test else "缺失")]
     done = ver and tree and iter64 and mtime and kind and boot and test
@@ -1415,6 +1417,79 @@ def cap_users_login():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_startmenu_p2():
+    """★ P2 开始菜单（居中/离 Dock 11px/上 24 下 10 圆角/搜索/2×4 网格）+ 四个二级弹窗 + 设备插拔 toast。"""
+    need = ["kernel/startmenu64.h", "kernel/startmenu64.cpp", "kernel/panels64.h", "kernel/panels64.cpp"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    n = lines("kernel/startmenu64.cpp") + lines("kernel/panels64.cpp")
+    mk = grep_count(r"START64|PANEL64|TOAST64", ["kernel/startmenu64.cpp", "kernel/panels64.cpp"])
+    wire = grep_count(r"startmenu64_toggle64", ["kernel/gui64.cpp"])
+    slots = grep_count(r"GFX64_SH_SLOTS")
+    t1 = exists("tests/startmenu64_test.py")
+    t2 = exists("tests/panels64_test.py")
+    ev = ["startmenu64.cpp + panels64.cpp = %d 行（开始菜单几何/固定网格/搜索 + 四弹窗 + 设备 toast）" % n,
+          "START64/PANEL64/TOAST64 打点：命中 %d；开始按钮接线 startmenu64_toggle64（gui64.cpp）：命中 %d；"
+          "GFX64_SH_SLOTS（形状槽）：命中 %d" % (mk, wire, slots),
+          "菜单几何：\"[START64] geom x=440 y=293 w=400 h=420 bottom=713 dock_top=724 gap=11 center=1 "
+          "screen=1280x800 r_top=24 r_bottom=10\"、\"[START64] grid cols=2 rows=4 n=8 tile=108x62\"、"
+          "\"[START64] search box x=630 y=357 w=194 h=34 r=8 acrylic=accent text=搜索\"",
+          "弹窗：\"[PANEL64] open panel=notif anchor=right-of-menu x=848 y=301 w=320 h=380 r=14 shadow=2 "
+          "edge=1px blur=24 dock_top=724 screen=1280x800 menu=440,293,400x420 follow=menu no_dock_overlap=1\"、"
+          "\"[PANEL64] net wifi count=0 state=no-hardware text=无无线硬件\"、"
+          "\"[PANEL64] cal panel … grid=7x6 today=2026-09-25\"",
+          "设备 toast：\"[TOAST64] toast idx=0 state=in from_x=1280 -> x=942 w=320 h=64 hold=5000ms\"、"
+          "\"[TOAST64] toast close idx=0 by=click (slide out)\"、\"[TOAST64] toast stack n=2 overlap=0\"",
+          "输入：\"[INPUT64] caps on=1\"、\"[INPUT64] shift toggle count=1 lang=英\"、"
+          "\"[INPUT64] wheel mode=1 id=3 packet=4B (Intellimouse)\"",
+          "验收脚本 tests/startmenu64_test.py：%s（58 条断言：居中/离 Dock 11px/上 24 下 10 圆角/搜索启动/"
+          "2×4 固定网格/状态区线性图标/电源菜单/ESC 两级退出）；tests/panels64_test.py：%s（78 条断言）"
+          % ("有" if t1 else "★ 缺", "有" if t2 else "★ 缺"),
+          "边界（如实）：声卡/无线驱动未做（声音面板 only memory-state \"applied=0\"、网络面板 WiFi 空态 "
+          "\"no-hardware\"）；U 盘热插拔事件源不可用（usb64 无拔出检测，toast 只用 e1000 STATUS.LU 的活值）；"
+          "通知逐条/全部清除未在测试里注入点击；电源菜单动效只有按下高亮+内缩"]
+    done = mk and wire and slots and t1 and t2
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_perm_v4():
+    """★ VimtuFS2 v4 权限：uid/gid/mode + owner/group/other rwx 拦截；v3 旧卷兼容但豁免。"""
+    need = ["kernel/vfs64.h", "kernel/vfs64.cpp", "kernel/userdb64.cpp", "kernel/syscall64.cpp"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    ver = grep_count(r"VFS64_VERSION\s+4u", ["kernel/vfs64.h"])
+    perm = grep_count(r"perm_can64|perm_check_ino64|perm_deny64",
+                      ["kernel/vfs64.h", "kernel/vfs64.cpp", "kernel/fd64.cpp"])
+    cred = grep_count(r"\[PERM64\] cred", ["kernel/userdb64.cpp"])
+    sysc = grep_count(r"geteuid|chmod|chown|umask", ["kernel/syscall64.cpp"])
+    tst = exists("tests/perm64_test.py")
+    ev = ["卷格式：\"[VFS64] format ok blocks=24759 version=4 inode=128 root=8017 perm=uid/gid/mode@75/77/79 "
+          "rootmode=0755\"（inode 128B：type@0/namelen@1/size@4/d0..d3@8,12,16,20/ind@24/parent@28/mtime@32/"
+          "nlink@36/kind@38/name@40..71/dind@71/uid@75,gid@77,mode@79/保留@81..124/CRC@124 覆盖 [0,124)）",
+          "版本宏 VFS64_VERSION=4u（kernel/vfs64.h）：命中 %d；权限判定符号 perm_can64|perm_check_ino64|perm_deny64："
+          "命中 %d；凭证发布打点 [PERM64] cred（userdb64.cpp）：命中 %d；系统调用 "
+          "geteuid|chmod|chown|umask（syscall64.cpp）：命中 %d" % (ver, perm, cred, sysc),
+          "拒绝路径：\"[PERM64] deny op=traverse path=/home/alice/private.txt uid=1002 gid=1002 mode=0700 need=x "
+          "owner=1001:1001\"、\"[FD64] open FAILED path=/home/alice/private.txt rc=13\"（-EACCES）、"
+          "\"[PERM64] deny op=access path=/shared/f.txt uid=1002 gid=1002 mode=0644 need=w owner=1001:1001\"",
+          "提权：\"[PERM64] cred uid=0 gid=0 euid=0 egid=0 user=root via=su-dash\"、"
+          "\"[PERM64] cred uid=1001 gid=1001 euid=1001 egid=1001 user=alice via=su-dash\"、"
+          "\"[VFS64] chmod ok path=/home/alice/private.txt mode=0600\"、\"[VFS64] chown ok path=/shared/f.txt "
+          "uid=1001 gid=1001\"",
+          "挂载自检：\"[VFS64] mount ok blocks=24759 inodes=386 free=24654 version=4 inode=128B perm=on\"、"
+          "\"[VFS64] perm selftest ok owner/mode/other/root/chmod/chown/umask=1\"",
+          "终端：ls -l（uid/gid/mode 列）/ chmod / chown / umask / tree / su / id 全部走真值（uid/gid/euid/egid "
+          "随 fork/execve 继承）",
+          "验收脚本 tests/perm64_test.py：%s（95 条断言，含 v3 旧卷兼容）" % ("有" if tst else "★ 缺"),
+          "边界（如实）：无 ACL/xattr、无 setuid 可执行文件提权、无附加组（gid=uid）；**v2/v3 旧卷不拦截**"
+          "（uid 显示 root、mode 默认 0755/0644，chmod 明确回 \"volume v3 has no mode field\"）；root 完全绕过 DAC；"
+          "无 sticky/setgid 目录位；FAT32 卷无权限字段；su 对空口令目标免密"]
+    done = ver and perm and cred and sysc and tst
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 CAPS = [
     ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
      cap_boot_console),
@@ -1469,6 +1544,8 @@ CAPS = [
     ("内核", "APIC 启用", cap_apic_enable),
     ("内核", "SMP（启动 AP）", cap_smp_ap),
     ("应用", "★ 锁屏 + 登录 + 多用户骨架（/etc/users.db 加盐哈希；su/sudo 会话身份；root 不在登录界面）", cap_users_login),
+    ("应用", "★ 开始菜单 + 四个二级弹窗（通知/声音/网络/日历）+ 设备插拔 toast + Caps/Shift/滚轮", cap_startmenu_p2),
+    ("内核", "★ VimtuFS2 v4 权限（uid/gid/mode + owner/group/other rwx 拦截；v3 旧卷兼容但豁免）", cap_perm_v4),
 ]
 
 TESTS = [
@@ -1524,6 +1601,9 @@ TESTS = [
                           "跨卷 C:→D: 粘贴（宿主侧解析 D: 卷字节）+ 属性面板 + 错误路径（95 条断言）"),
     ("locklogin64_test.py", "★ P1c 锁屏/登录/多用户：时间 72px/年月日 18px、背景清晰→登录后模糊 20px(250-350ms)、"
                             "头像与密码框/确认按钮像素、ESC 返回、重启仍锁屏、两用户桌面隔离、su/sudo/exit（88 条断言）"),
+    ("startmenu64_test.py", "★ P2 开始菜单：居中/离 Dock 11px/上圆角 24 下 10/搜索启动/2×4 固定网格/状态区线性图标/电源菜单/ESC 两级退出（58 条断言）"),
+    ("panels64_test.py", "★ P2 四弹窗：通知(角标/空态)+声音(滑块百分比/输出源/如实未接驱动)+网络(WiFi 如实空态+以太网区固定)+日历(7×6/滚轮·方向键·PageUp/PageDown/今天/年份面板)+设备 toast 滑入滑出（78 条断言）"),
+    ("perm64_test.py", "★ P4 权限：卷 v4(uid/gid/mode)+owner/group/other rwx 真拦截(root 绕过)+su/sudo 真提权+chmod/chown/umask+ls -l（95 条断言，含 v3 旧卷兼容）"),
 ]
 
 
