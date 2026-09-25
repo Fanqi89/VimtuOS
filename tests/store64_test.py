@@ -13,8 +13,11 @@
      敲 `store set theme dark` / `store flush` / `store dump`，断言串口出现
      [STORE64] cmd set/flush/dump、[STORE64] flush via=vfs -> slot=... ok、[STORE64] selftest PASS；
      并且**宿主 Python 直接解析这块 raw 镜像的 VimtuFS2**：/store.a|/store.b 存在、16KB、
-     VSTORE64 头部 CRC + payload CRC 正确、KV 里有 theme=dark（绕过 GUI 的字节级证据）；
-  3) 第二遍**冷启动同一块镜像**：断言 [STORE64] init via=vfs ... 与 dump 里的 theme=dark
+    VSTORE64 头部 CRC + payload CRC 正确、**两槽并集 / 按世代号取最新槽**里有 theme=dark
+    （绕过 GUI 的字节级证据。注意 P1c 之后登录路径自己会写 cfg.ui.login.last 并落盘，
+     全新盘上第一次落盘就占了 /store.a，主题因此落在 /store.b —— 不能再"只看第一个槽"）；
+  3) 第二遍**冷启动同一块镜像**：断言 [STORE64] init via=vfs slot/gen/keys 与盘上最新槽逐字对上
+     （keys >= 2：1 条登录 cfg.* 键 + 1 条 theme）与 dump 里的 theme=dark / cfg.*
      —— 这就证明"设置真的跨重启存下来了"；
   4) 第三遍（只读对照）：启动**没有分区表/没有卷**的 build64/system.img，断言降级路径打印
      [STORE64] WARN raw slot area LBA 8009 overlaps the data partition; use VFS-backed store
@@ -480,23 +483,55 @@ def main():
     files = files or {}
     names = sorted(files.keys())
     print("     卷内文件：%s" % (names if names else "(空)"))
-    slot_name, slot = None, None
+    # ★ P1c（锁屏/登录）之后：登录路径自己会 config64_set_str64("ui.login.last") + config64_flush64()，
+    #   于是**全新盘上的第一次落盘就占掉了 /store.a**（里面只有 cfg.* 键），终端 `store set theme dark`
+    #   + `store flush` 落到 /store.b —— 主题在**第二个**槽里。所以不能再"只看第一个存在的槽"。
+    #   下面的判据：两个槽都解析出来，按世代号取最新那个（P1c 之后它必然是含 theme 的那次落盘），
+    #   同时看两槽并集；结构校验（magic/版本/头部 CRC/payload CRC/世代号）对**每个存在的槽**都查。
+    slots = []
     for cand in ("store.a", "store.b"):
         if cand in files:
-            slot_name = cand
-            slot = parse_store_slot(files[cand]["data"])
-            break
-    check("存在 /store.a 或 /store.b 槽文件", slot is not None,
-          ("命中 /%s size=%d" % (slot_name, files[slot_name]["size"])) if slot_name else "")
-    if slot_name:
-        check("槽文件大小 = 16384（= 一个槽）", files[slot_name]["size"] == STORE_SLOT_BYTES)
-    if slot:
-        check("VSTORE64 magic + 结构版本 1", slot["magic"] == STORE_MAGIC and slot["ver"] == 1)
-        check("槽头部 CRC32 正确（覆盖 [0,32)）", slot["header_ok"])
-        check("槽 payload CRC32 正确（覆盖记录区）", slot["payload_ok"])
-        check("世代号 >= 1", slot["gen"] >= 1, "gen=%d" % slot["gen"])
-        check("KV 里有 theme=dark", slot["kv"].get("theme") == "dark",
-              "kv=%s" % (slot["kv"],))
+            p = parse_store_slot(files[cand]["data"])
+            p["name"] = cand
+            slots.append(p)
+    check("存在 /store.a 或 /store.b 槽文件", bool(slots),
+          ("命中 %s" % " ".join("/%s size=%d" % (s["name"], files[s["name"]]["size"])
+                               for s in slots)) if slots else "")
+    for s in slots:
+        check("/%s 大小 = 16384（= 一个槽）" % s["name"],
+              files[s["name"]]["size"] == STORE_SLOT_BYTES,
+              "size=%d" % files[s["name"]]["size"])
+        check("/%s 是有效 VSTORE64 槽（magic + 版本 1 + 头部 CRC32 覆盖 [0,32)）" % s["name"],
+              bool(s["ok"]) and s["header_ok"],
+              "magic=%r ver=%s gen=%s %s" % (s.get("magic"), s.get("ver"), s.get("gen"),
+                                             s.get("why", "")))
+        check("/%s 槽 payload CRC32 正确（覆盖记录区）" % s["name"], bool(s.get("payload_ok")))
+        check("/%s 世代号 >= 1" % s["name"], s.get("gen", 0) >= 1, "gen=%s" % s.get("gen"))
+    valid_slots = [s for s in slots if s["ok"]]
+    newest = max(valid_slots, key=lambda s: s["gen"]) if valid_slots else None
+    kv_union = {}
+    for s in valid_slots:
+        kv_union.update(s["kv"])
+    theme_slots = [s["name"] for s in valid_slots if s["kv"].get("theme") == "dark"]
+    check("两槽并集里有 theme=dark（P1c 起主题在第二个槽，故按并集判定）",
+          kv_union.get("theme") == "dark",
+          "含 theme 的槽：%s" % (" ".join("/" + n for n in theme_slots) if theme_slots else "(无)"))
+    check("两槽并集里有 cfg.* 键（P1c 登录自动落盘写下的那些键）",
+          any(k.startswith("cfg.") for k in kv_union),
+          "并集键集=%s" % sorted(kv_union.keys()))
+    if newest is not None:
+        check("按世代号取最新槽（gen 最大者）里有 theme=dark",
+              newest["kv"].get("theme") == "dark",
+              "/%s gen=%d keys=%d kv=%s" % (newest["name"], newest["gen"],
+                                            newest["count"], newest["kv"]))
+    flushes1 = re.findall(
+        r"\[STORE64\] flush via=vfs -> slot=([AB]) gen=(\d+) crc=0x([0-9A-F]{8}) ok", log1)
+    if newest is not None and flushes1:
+        check("盘上最新槽 = 第一遍最后一次成功 flush（slot/gen 逐字对上）",
+              flushes1[-1][0] == ("A" if newest["name"] == "store.a" else "B")
+              and int(flushes1[-1][1]) == newest["gen"],
+              "最后一次 flush slot=%s gen=%s vs 最新槽 /%s gen=%d"
+              % (flushes1[-1][0], flushes1[-1][1], newest["name"], newest["gen"]))
     check("没有残留自检临时文件 /%s" % STORE_TMP, STORE_TMP not in files)
 
     # ---------------- 第二遍：冷启动同一块镜像 ----------------
@@ -512,13 +547,30 @@ def main():
     for needle, what in MUST2:
         check("第二遍 %s（%s）" % (needle, what), needle in log2)
     m2 = re.search(r"\[STORE64\] init via=vfs slot=([AB]) gen=(\d+) keys=(\d+)", log2)
-    check("第二遍 [STORE64] init via=vfs slot=A|B gen=N keys=1", bool(m2),
+    check("第二遍 [STORE64] init via=vfs slot=A|B gen=N keys=N（N >= 2）", bool(m2),
           (m2.group(0) if m2 else "未出现"))
     if m2:
-        check("冷启动读到 1 个键（= 第一遍存的那条）", m2.group(3) == "1")
+        # ★ 不能再写死 keys=1：P1c 的登录路径落盘时就带了 cfg.ui.login.last，
+        #   所以在**全新盘**上第一次落盘（/store.a）就有 1 条 cfg 键，终端 `store flush`
+        #   写出的第二个槽（/store.b）是 2 条（cfg 键 + theme）。这里的"正确期望"=
+        #   盘上世代号最大的那个槽的记录数（逐字对上），且至少 2 条。
+        if newest is not None:
+            want_slot = "A" if newest["name"] == "store.a" else "B"
+            check("冷启动选中的就是盘上世代号最大的槽（slot 与 gen 逐字对上）",
+                  m2.group(1) == want_slot and int(m2.group(2)) == newest["gen"],
+                  "log slot=%s gen=%s vs 盘上 /%s gen=%d"
+                  % (m2.group(1), m2.group(2), newest["name"], newest["gen"]))
+            check("冷启动读到盘上最新槽的全部键（keys=%d：登录 cfg.* + theme）" % newest["count"],
+                  int(m2.group(3)) == newest["count"],
+                  "log keys=%s vs 盘上 keys=%d（kv=%s）"
+                  % (m2.group(3), newest["count"], sorted(newest["kv"].keys())))
+        check("冷启动 keys >= 2（1 条登录 cfg.* 键 + 1 条 theme）", int(m2.group(3)) >= 2,
+              "keys=%s" % m2.group(3))
         check("世代号沿用盘上的（>=1）", int(m2.group(2)) >= 1)
     check("第二遍 dump 里有 theme=dark（真正的跨重启持久化）",
           "[STORE64] dump theme=dark" in log2)
+    check("第二遍 dump 里有 cfg.* 键（P1c 登录落盘的键同样跨重启）",
+          "[STORE64] dump cfg." in log2)
     check("第二遍正常路径不得出现裸盘重叠警告", WARN_RAW not in log2)
     for needle in FORBIDDEN:
         check("第二遍不得出现 %s" % needle, needle not in log2)
