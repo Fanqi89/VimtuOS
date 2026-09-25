@@ -162,6 +162,15 @@ bool kbd_tm_hotkey() { return tm_hotkey_flag != 0; }
 void kbd_consume_tm_hotkey() { tm_hotkey_flag = 0; }
 bool kbd_ctrl_pressed() { return ctrl_pressed; }     // ★ 批次 J：修饰键状态（供 Ctrl 加选）
 bool kbd_shift_pressed() { return shift_pressed; }   // ★ 批次 J：同上（供 Shift 加选）
+// ★ P5：Ctrl+Shift+<字母> 的**按键时刻**记录（见 input.h 的说明）。取走即清空。
+static volatile uint8_t ctrl_shift_ch = 0;
+bool kbd_ctrl_shift_char64(char* out) {
+    const uint8_t c = ctrl_shift_ch;
+    if (!c) return false;
+    ctrl_shift_ch = 0;
+    if (out) *out = (char)c;
+    return true;
+}
 void kbd_drain() { kbd_tail = kbd_head; }   // 停止阶段丢弃输入（不再接收新任务）
 
 // ★ P2：Caps / 中英指示（无输入法时恒"英"）/ Shift 边沿计数
@@ -251,6 +260,11 @@ static void kbd_process_scancode(uint8_t sc) {
             // Ctrl 组合
             if (ctrl_pressed) {
                 if (c >= 'a' && c <= 'z') c = c - 'a' + 1;   // Ctrl-A = 0x01 等
+                else if (shift_pressed && c >= 'A' && c <= 'Z') {
+                    // ★ P5：Ctrl+Shift+<字母>（大写形态）—— 按键时刻的修饰键状态记下来，
+                    //   外壳稍后取走（处理按键时 Shift/Ctrl 可能已经松开，见 input.h）。
+                    ctrl_shift_ch = (uint8_t)c;
+                }
             }
             kbd_push((uint8_t)c);
         }
@@ -309,6 +323,9 @@ static volatile bool mouse_has_data = false;
 //   （宿主负载高、客人排空间隔变长时实测出现），布尔标志会把两次按下并成一次，双击就丢了第一个。
 //   上限 4：极端积压时也不会无界增长（GUI 每次循环消费一个）。
 static volatile uint8_t pressed_left = 0, pressed_right = 0, pressed_middle = 0;
+// ★ P5：**释放**事件也要计数 —— 帧采样（比对上一帧按钮位）会漏：按下+松开落在同一帧时
+//   （拖拽/大重绘后的那几帧）release 边沿永远看不到，桌面图标的**双击**与拖拽结束就会失效。
+static volatile uint8_t released_left = 0, released_right = 0, released_middle = 0;
 static volatile uint32_t mouse_left_press_tick = 0;   // 最近一次左键按下的**包到达**时刻
 
 bool mouse_button_pressed(int btn) {
@@ -320,6 +337,16 @@ void mouse_consume_pressed(int btn) {
     if (btn == 0) { if (pressed_left) pressed_left--; }
     else if (btn == 1) { if (pressed_right) pressed_right--; }
     else { if (pressed_middle) pressed_middle--; }
+}
+bool mouse_button_released64(int btn) {
+    if (btn == 0) return released_left != 0;
+    if (btn == 1) return released_right != 0;
+    return released_middle != 0;
+}
+void mouse_consume_released64(int btn) {
+    if (btn == 0) { if (released_left) released_left--; }
+    else if (btn == 1) { if (released_right) released_right--; }
+    else { if (released_middle) released_middle--; }
 }
 uint32_t mouse_press_tick64() { return mouse_left_press_tick; }
 bool mouse_has_event() { return mouse_has_data; }
@@ -334,6 +361,35 @@ static int       mouse_wheel_log_budget = 6;
 
 int mouse_wheel_mode64() { return mouse_wheel_mode; }
 int mouse_pop_wheel64() { const int v = mouse_wheel_acc; mouse_wheel_acc = 0; return v; }
+
+// ==================== ★ P5：光标形状（状态在驱动层；切换由桌面外壳按命中区域调用）====================
+static volatile int mouse_cursor_shape = MOUSE_CUR_ARROW;
+static int mouse_cursor_log_budget = 80;      // [INPUT64] cursor 行上限（防刷屏脚本乱按）
+static const char* kCursorNames[] = {
+    "arrow", "text", "wait", "size-h", "size-v", "size-d1", "size-d2", "move"
+};
+const char* mouse_cursor_name64(int shape) {
+    if (shape < 0 || shape > MOUSE_CUR_MOVE) return "arrow";
+    return kCursorNames[shape];
+}
+int mouse_get_cursor64() { return mouse_cursor_shape; }
+void mouse_set_cursor64(int shape) {
+    if (shape < 0 || shape > MOUSE_CUR_MOVE) shape = MOUSE_CUR_ARROW;
+    const int prev = mouse_cursor_shape;
+    if (prev == shape) return;
+    mouse_cursor_shape = shape;
+    if (mouse_cursor_log_budget > 0) {
+        mouse_cursor_log_budget--;
+        dbg64_line_begin64();
+        dbg64_str("[INPUT64] cursor shape=");
+        dbg64_str(mouse_cursor_name64(shape));
+        dbg64_str(" prev=");
+        dbg64_str(mouse_cursor_name64(prev));
+        dbg64_str(" (driver state; switched by gui64 hit-test)");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+}
 
 // 处理一个**鼠标**字节（3 或 4 字节包状态机）。键盘 IRQ 读到鼠标字节时也走这里。
 static void mouse_process_byte(uint8_t data) {
@@ -404,6 +460,9 @@ static void mouse_process_byte(uint8_t data) {
     if ((nb & 1) && !(old & 1)) { mouse_left_press_tick = ticks64(); if (pressed_left < 4) pressed_left++; }
     if ((nb & 2) && !(old & 2)) { if (pressed_right < 4) pressed_right++; }
     if ((nb & 4) && !(old & 4)) { if (pressed_middle < 4) pressed_middle++; }
+    if (!(nb & 1) && (old & 1)) { if (released_left < 4) released_left++; }
+    if (!(nb & 2) && (old & 2)) { if (released_right < 4) released_right++; }
+    if (!(nb & 4) && (old & 4)) { if (released_middle < 4) released_middle++; }
     mouse_buttons = nb;
     mouse_has_data = true;
     // ★ P2：滚轮（4 字节包的第 4 字节 = Z，二补码；标准 PS/2/Intellimouse 约定：+1 = 向上/远离用户）
@@ -574,6 +633,9 @@ void mouse_drain() {
     pressed_left = 0;
     pressed_right = 0;
     pressed_middle = 0;
+    released_left = 0;
+    released_right = 0;
+    released_middle = 0;
     mouse_has_data = false;
     mouse_packet_cycle = 0;
 }

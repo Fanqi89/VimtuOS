@@ -2386,6 +2386,9 @@ static void set_draw(Window* w) {
         dbg64_str(" page="); dbg64_dec((uint64_t)g_page);
         dbg64_nl();
         dbg64_line_end64();
+    }   // ★ P5 回归修复：这个 if **只包住"尺寸变化时的布局打点"**；下面的实际绘制必须每帧都跑
+    //   （上一轮接线版把整块绘制都关在 if 里 -> 任何不带尺寸变化的窗口重绘都只铺 client_bg、
+    //     应用内容被抹成纯色 —— 与 gui64 的脏矩形不清一起构成"应用窗口内容丢失"的两个成因）
     g_cl_x = x0;
     g_cl_y = y0;
     // 客户区底：主题客户区底色（Token）；卡片再叠亚克力
@@ -2425,7 +2428,6 @@ static void set_draw(Window* w) {
             const int a = 255 - prog * 255 / 256;
             if (a > 0) fb_fill_rect_alpha(ax, y0, aw, ch, t->client_bg, a);
         }
-    }
     // 消息行（全局最后画，覆盖内容）
     if (msg_fresh()) {
         const int mw = L.card_w;

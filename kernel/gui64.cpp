@@ -45,6 +45,7 @@
 #include "startmenu64.h"
 #include "panels64.h"
 #include "settings64.h"      // ★ P3：设置页的启动期生效点（字体大小档 + 自定义渐变壁纸）
+#include "desktopops64.h"     // ★ P5：桌面右键菜单 / 玻璃选择框 / 回收站 / 桌面图标集合
 
 
 // ==================== 资源符号（build64.sh 用 objcopy 生成）====================
@@ -63,7 +64,8 @@ extern "C" const uint8_t _binary_kaisi_png_end[];
 // ==================== 几何常量 ====================
 // ★ 本批（Windows 11 现代外观）：底部 32px 老任务栏 → Dock（高 60 + 离底 16 = 76）。
 //   TASKBAR_H 这个名字**保留**，语义改为"底部保留区高度"（窗口最大化/拖拽钳制、图标拖动边界、
-//   各应用窗口排布都用它；= THEME64_DOCK_H + THEME64_DOCK_MARGIN = 76）。所有数字来自 theme64.h 的 Token。
+#define GUI64_GRIP   6          // ★ P5：窗口边缘/四角抓取带宽（px；窗口布局常数，不是视觉 Token）
+#define TITLE_H      24         // 标题栏高
 #define TITLE_H      24         // 标题栏高
 #define BORDER       1          // 边框
 #define DECO_H       (TITLE_H + BORDER)     // 客户区相对窗口顶部的偏移
@@ -121,34 +123,88 @@ static bool     g_dirty_any = false;
 static int      g_cur_x = 0, g_cur_y = 0, g_prev_cur_x = -1, g_prev_cur_y = -1;
 static bool     g_first_frame = true;
 
-// 拖拽
+// ==================== ★ P5：拖拽（移动 + 八向缩放）====================
 enum { DRAG_NONE = 0, DRAG_MOVE, DRAG_RESIZE };
+// 缩放方向位（八向）：L/R/T/B 组合，例如 RZ_L|RZ_T = 左上角
+#define RZ_L   1
+#define RZ_R   2
+#define RZ_T   4
+#define RZ_B   8
 static int  g_drag = DRAG_NONE;
+static int  g_resize_dir = 0;                 // DRAG_RESIZE 时的方向位
 static int  g_drag_dx = 0, g_drag_dy = 0;
 static Window* g_drag_w = nullptr;
 
-// 桌面图标
-struct DeskIcon { int kind; int x, y; };     // kind: 0=我的电脑 1=回收站 2=终端
-static DeskIcon g_icons[3];
+// 桌面图标（★ P5：项的集合与持久化在 desktopops64.cpp —— 这里只留"选中/拖动"的交互状态）
 static int  g_icon_sel = -1;
 static uint32_t g_icon_last_tick = 0;
-// 桌面图标拖动（>5px 才算拖动）与空白处选择框的状态（移植自 legacy32/kernel/gui.cpp）
+// 桌面图标拖动（>5px 才算拖动）与空白处玻璃选择框的状态（移植自 legacy32/kernel/gui.cpp）
 static int  g_icon_drag_idx = -1;              // 正在拖动的图标（-1=无）
 static int  g_icon_press_x = 0, g_icon_press_y = 0;            // 按下位置
 static int  g_icon_press_icon_x = 0, g_icon_press_icon_y = 0;  // 按下时的图标位置
 static bool g_icon_drag_moved = false;
-static bool g_selbox_active = false;
-static int  g_sel_x0 = 0, g_sel_y0 = 0, g_sel_x1 = 0, g_sel_y1 = 0;
 static bool g_start_icon_logged = false;
 // 外壳自检期间（gui64_selftest 建/销临时窗口、来回切语言）不触发会话/配置钩子：
 // 那些临时窗口不是真实应用实例，自检的语言切换也不该写进持久化配置。
 static bool g_in_selftest = false;
 static bool g_title_btn_logged = false;
-static int  sel_box_x() { return g_sel_x0 < g_sel_x1 ? g_sel_x0 : g_sel_x1; }
-static int  sel_box_y() { return g_sel_y0 < g_sel_y1 ? g_sel_y0 : g_sel_y1; }
-static int  sel_box_w() { return g_sel_x0 < g_sel_x1 ? g_sel_x1 - g_sel_x0 : g_sel_x0 - g_sel_x1; }
-static int  sel_box_h() { return g_sel_y0 < g_sel_y1 ? g_sel_y1 - g_sel_y0 : g_sel_y0 - g_sel_y1; }
 
+// ==================== ★ P5：光标形状（状态在 input.cpp，切换在下面的命中判定里）====================
+static int  g_cursor_shape = MOUSE_CUR_ARROW;
+static uint32_t g_cursor_log_budget = 200;
+
+// ==================== ★ P5：最小化飞向 Dock（缩小 + 透明度渐隐）====================
+#define FLY_MAX 2
+#define FLY_SNAP_W 72
+#define FLY_SNAP_H 48
+struct FlyAnim {
+    Window*  w;
+    uint32_t t0;
+    int      dur, frame;
+    int      fx, fy, fw, fh;      // 起点（窗口几何）
+    int      tx, ty, tw, th;      // 终点（Dock 图标）
+    int      px, py, pw, ph;      // 上一帧的绘制矩形（擦旧帧用）
+};
+static FlyAnim g_fly[FLY_MAX];
+static int     g_fly_n = 0;
+static uint32_t g_fly_snap[FLY_SNAP_W * FLY_SNAP_H];
+static bool    g_fly_snap_ok = false;
+
+// ==================== ★ P5：Dock 悬停窗口列表（可选择恢复指定窗口）====================
+static int g_winlist_idx = -1;          // Dock 项下标（-1 = 不显示）
+static int g_winlist_row = -1;          // 悬停行
+static int g_winlist_x = 0, g_winlist_y = 0, g_winlist_w = 0, g_winlist_h = 0;
+static int g_winlist_logged = 0;
+static int g_rz_log_frames = 0;      // ★ P5：一次缩放拖动最多打 24 行"帧"（begin 处清零）
+
+// ==================== ★ P5：程序加载中的"转圈"光标 + 恢复时的 scale/opacity 弹出 ====================
+static Window*  g_load_w = nullptr;
+static uint32_t g_load_t0 = 0;
+static Window*  g_pop_w = nullptr;
+static int      g_load_paints = 0;           // ★ P5：加载中的窗口已经画了几帧
+static uint32_t g_pop_t0 = 0;
+static bool     g_load_done = true;          // ★ P5：加载中的窗口是否已经画完第一帧（转圈结束条件）
+static int      g_pop_dur = 0;
+static int      g_pop_frame = 0;
+
+// ---- ★ P5：本批新增函数的**前置声明**（定义在文件后半段"桌面交互细节"一节里）----
+static int  resize_dir64(const Window* w, int mx, int my);
+static int  resize_dir_shape64(int dir);
+static const char* resize_dir_name64(int dir);
+static void cursor_shape_update64(int mx, int my);
+static Window* top_visible_win64(void);
+static void fly_begin64(Window* w);
+static int  fly_tick64(void);
+static void fly_draw64(void);
+static void pop_begin64(Window* w, const char* why);
+static int  pop_active64(void);
+static void pop_geom64(const Window* w, int* x, int* y, int* ww, int* hh);
+static void pop_tick64(void);
+static void winlist_update64(int mx, int my);
+static void winlist_draw64(void);
+static int  winlist_press64(int mx, int my);
+static int  dock_anim_tick64(void);
+static void log_win_geom64(const Window* win, const char* tag);
 // ==================== 配置接线状态（config64 读到外壳里的值）====================
 static bool g_text_mirror = false;      // ui.text_mirror：外壳 TrueType 文本水平镜像
 static int  g_mouse_sens = 1700;        // mouse.sens（千分比）：1700 = 驱动基线（默认不变）
@@ -303,6 +359,12 @@ Window* gui64_create_window(const char* title, int x, int y, int w, int h,
     z_push_front(win);
     gui64_set_active(win);
     dirty_add(win->x, win->y, win->w, win->h);
+    // ★ P5：窗口刚建出来 = "程序加载中" —— 光标移到它上面会变成转圈（[INPUT64] cursor shape=wait）
+    g_load_w = win;
+    g_load_done = false;         // ★ P5：新窗口还没画完第一帧 -> 光标移到它上面是转圈
+    g_load_paints = 0;
+    g_load_t0 = ticks64();
+    log_win_geom64(win, "new");   // ★ P5：窗口几何打点（自动验收要知道窗口在哪）
     if (!g_in_selftest)                        // 自检的临时窗口不算应用实例
         session64_app_opened64(app_id);        // 会话策略：清掉"待清理"标志（关掉又立刻打开的场景）
     return win;
@@ -330,6 +392,34 @@ void gui64_destroy_window(Window* w) {
     while (top && (!top->visible || top->minimized)) top = top->next;
     if (top) gui64_set_active(top);
 }
+
+// ★ P5：窗口几何打点（自动验收定位窗口用；创建与每次改几何都打一行）
+static void log_win_geom64(const Window* win, const char* tag) {
+    dbg64_line_begin64();
+    dbg64_str("[UI] win geom tag=");
+    dbg64_str(tag);
+    dbg64_str(" title=");
+    dbg64_str(win->title);
+    dbg64_str(" app=");
+    dbg64_dec((uint64_t)win->app_id);
+    dbg64_str(" x=");
+    dbg64_dec((uint64_t)win->x);
+    dbg64_str(" y=");
+    dbg64_dec((uint64_t)win->y);
+    dbg64_str(" w=");
+    dbg64_dec((uint64_t)win->w);
+    dbg64_str(" h=");
+    dbg64_dec((uint64_t)win->h);
+    dbg64_str(" client=");
+    dbg64_dec((uint64_t)win->client_w);
+    dbg64_str("x");
+    dbg64_dec((uint64_t)win->client_h);
+    dbg64_str(" grip=");
+    dbg64_dec((uint64_t)GUI64_GRIP);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
 
 void gui64_set_active(Window* w) {
     for (Window* p = g_z; p; p = p->next) p->active = false;
@@ -369,6 +459,7 @@ void gui64_set_geom(Window* w, int x, int y, int cw, int ch) {
     if (w->h < w->min_h) w->h = w->min_h;
     recompute_client(w);
     dirty_add(w->x, w->y, w->w, w->h);
+    log_win_geom64(w, "set");    // ★ P5：应用调用 set_geom 后几何变了 -> 打点（自动验收按它定位）
 }
 
 // 只在不违反最小尺寸时把窗口调整到指定客户区尺寸（返回 1 = 已应用）
@@ -384,6 +475,7 @@ int gui64_fit_window_to_client(Window* w, int cw, int ch) {
     if (w->x < 0) w->x = 0;
     if (w->y < 0) w->y = 0;
     recompute_client(w);
+    log_win_geom64(w, "fit");    // ★ P5：应用自己改了几何（终端按列/行排版）也要能定位
     dirty_add(w->x, w->y, w->w, w->h);
     return 1;
 }
@@ -567,11 +659,7 @@ static const uint8_t* icon_src(int kind) {
     if (kind == 1) return _binary_icon_recyclebin_bin_start;
     return _binary_icon_terminal_bin_start;
 }
-static const char* icon_name(int kind) {
-    if (kind == 0) return gui64_tr("My Computer", "我的电脑");
-    if (kind == 1) return gui64_tr("Recycle Bin", "回收站");
-    return gui64_tr("Terminal", "终端");
-}
+// （icon_name 已随桌面图标绘制一起搬到 desktopops64.cpp：item_name()）
 
 // ==================== 桌面图标预缩放缓存（preload64 预热用） ====================
 // 背景：draw_icons()/draw_taskbar() 原来**每帧**对 128x128 源图做最近邻缩放（桌面图标 3 张 +
@@ -670,17 +758,7 @@ void gui64_draw_start_icon64(int x, int y) {
 }
 
 // 选择框与图标格（图标 + 名字标签）是否相交（移植 32 位的 icon_intersects_sel）
-static bool icon_hits_sel(int i, int x0, int y0, int x1, int y1) {
-    if (x0 > x1) { const int t = x0; x0 = x1; x1 = t; }
-    if (y0 > y1) { const int t = y0; y0 = y1; y1 = t; }
-    const int ix0 = g_icons[i].x - 6, iy0 = g_icons[i].y - 6;
-    const int ix1 = ix0 + ICON_CELL_W, iy1 = iy0 + ICON_CELL_H;
-    return !(ix1 < x0 || ix0 > x1 || iy1 < y0 || iy0 > y1);
-}
-
-// ==================== 外壳文字 ====================
-// 在 [x,x+w) × [y,y+h) 里做**水平镜像**（读回像素再反着写回；putpixel 尊重裁剪，不会画到客户区外）。
-// 用途：config64 的 ui.text_mirror = 1 时，外壳画的所有文本都镜像（32 位里有这个键，本轮把它真正接上）。
+// （icon_hits_sel 已搬到 desktopops64.cpp：desktopops64_rect_hit64）
 static void mirror_rect_h(int x, int y, int w, int h) {
     if (w <= 1) return;
     for (int j = 0; j < h; j++) {
@@ -1139,19 +1217,39 @@ static void dock_press64(int idx) {
     const char* action = "open";
     if (n == 0) {
         dock_open_app64(app);
+        action = "open";
     } else {
-        Window* top = nullptr;
-        for (int i = 0; i < MAX_WINS; i++)
-            if (g_used[i] && (int)g_wins[i].app_id == app && !g_wins[i].minimized) top = &g_wins[i];
-        if (top && top->active) {
+        // ★ P5（需求原文"点击 Dock 图标"的语义）：
+        //   * 有小横杠（该应用全部窗口都最小化）-> 恢复**最后最小化的那个**窗口（scale+opacity 弹出）；
+        //   * 没有小横杠但窗口在桌面上可见 -> 置前/聚焦；**已经在最前面（活动）时**才最小化
+        //     （Windows 11 同语义，也是既有 gui_modern64_test 断言 action=minimize 的那条路径）；
+        //   * 一个应用的多个窗口共用**一根**小横杠（draw_dock 里按 mn 画一次）。
+        Window* last_min = nullptr;
+        Window* first_vis = nullptr;
+        Window* act = nullptr;
+        for (int i = 0; i < MAX_WINS; i++) {
+            if (!g_used[i]) continue;
+            Window* w = &g_wins[i];
+            if ((int)w->app_id != app) continue;
+            if (w->minimized) last_min = w;            // 槽位序 ≈ 最后最小化的那个（见 gui64.h 的窗口表）
+            else if (!first_vis) first_vis = w;
+            if (!w->minimized && w->active) act = w;
+        }
+        if (act) {
             action = "minimize";
             for (int i = 0; i < MAX_WINS; i++)
                 if (g_used[i] && (int)g_wins[i].app_id == app) g_wins[i].minimized = true;
+            fly_begin64(act);                          // 缩小 + 渐隐飞向 Dock 图标（需求原文）
             gui64_invalidate();
-        } else if (top) {
-            action = "restore+activate";
-            gui64_set_active(top);
-            gui64_invalidate();
+        } else if (first_vis) {
+            action = "activate";                       // 可见但不活动：只置前/聚焦，**不最小化**
+            gui64_set_active(first_vis);
+            dirty_add(first_vis->x, first_vis->y, first_vis->w, first_vis->h);
+        } else if (last_min) {
+            action = "restore-last-min";               // 全部最小化：恢复最后最小化的那个
+            last_min->minimized = false;
+            gui64_set_active(last_min);
+            pop_begin64(last_min, "dock");
         } else {
             action = "restore-all";
             for (int i = 0; i < MAX_WINS; i++)
@@ -1355,23 +1453,10 @@ static void draw_dock(void) {
 static void draw_desktop_bg(int x0, int y0, int x1, int y1) {
     gfx64_wall_draw64(x0, y0, x1 - x0, y1 - y0);
 }
+// 桌面图标（★ P5：项集合/持久化/圆角正方形底板 + 位图绘制都在 desktopops64.cpp，
+// 这里只把"当前选中项"传下去；选中态的像素语义与旧实现一致 = Token sel_bg 不透明色块）。
 static void draw_icons(void) {
-    const Theme64Tokens* t = theme64_tokens64();
-    for (int i = 0; i < 3; i++) {
-        const DeskIcon& ic = g_icons[i];
-        if (g_icon_sel == i)
-            gfx64_fill_round64(ic.x - 4, ic.y - 4, ICON_W + 8, ICON_W + 20, THEME64_R_ICON,
-                               t->sel_bg, 255);   // 选中底色 = Token 主色（不透明，保证像素级断言可复现）
-        gui64_draw_icon_kind64(ic.x, ic.y, ic.kind);   // 缓存命中走预缩放位图，否则退回逐帧缩放
-        const char* nm = icon_name(ic.kind);
-        const int tw = text_w(nm);
-        int tx = ic.x + (ICON_W - tw) / 2;
-        if (tx < 0) tx = 0;
-        // 标签底板：浅色壁纸上用半透明白底 + 深色字（深色主题反过来），保证任何壁纸上都可读
-        const uint32_t plate = t->dark ? rgb(0, 0, 0) : rgb(255, 255, 255);
-        gfx64_fill_round64(ic.x + (ICON_W - tw) / 2 - 4, ic.y + ICON_W + 1, tw + 8, 18, 6, plate, 150);
-        text_ttf(tx, ic.y + ICON_W + 3, nm, t->icon_txt);
-    }
+    desktopops64_draw_icons64(g_icon_sel);
 }
 static void draw_title_buttons(Window* w) {
     // 三个按钮必须**肉眼可区分**：最小化=短横线、最大化=方框、关闭=红底 ✕；hover 高亮。
@@ -1408,6 +1493,39 @@ static void draw_title_buttons(Window* w) {
         dbg64_nl();
     }
 }
+
+// ★ P5 防回归断言（内核侧）：应用自绘**之后**，客户区不能是一片 client_bg（= 应用什么都没画）。
+//   两个成因（详见交付报告）：
+//     1) gui64 的 render() 提交后没清 g_dirty_any -> 每帧整屏重绘；
+//     2) settings64 的 set_draw() 把"实际绘制"关在 if (cw/ch 变化) 里 -> 不带尺寸变化的重绘
+//        只铺 client_bg。
+//   这里只对内容型应用（设置）取 4 个角（客户区四角都恰好等于 client_bg 才算"空白"，
+//   所以不会因为某个角本来就是底色而误报）；命中时打一行自动验收可以 grep 的失败行：
+//     [GUI64] app blank app=5 c=15790320 client=898x594 (client_bg fill only; app painted nothing)
+static void check_app_painted64(const Window* w) {
+    if (!w || w->app_id != 5 /*APP_ID_SETTINGS*/) return;
+    if (w->client_w < 320 || w->client_h < 200) return;
+    const uint32_t bg = theme64_tokens64()->client_bg & 0xFFFFFFu;
+    const int x0 = w->client_x, y0 = w->client_y;
+    const int x1 = x0 + w->client_w - 8, y1 = y0 + w->client_h - 8;
+    const uint32_t p0 = fb_get_pixel(x0 + 8, y0 + 8) & 0xFFFFFFu;
+    const uint32_t p1 = fb_get_pixel(x0 + 8, y1) & 0xFFFFFFu;
+    const uint32_t p2 = fb_get_pixel(x1, y0 + 8) & 0xFFFFFFu;
+    const uint32_t p3 = fb_get_pixel(x1, y1) & 0xFFFFFFu;
+    if (p0 != bg || p1 != bg || p2 != bg || p3 != bg) return;
+    dbg64_line_begin64();
+    dbg64_str("[GUI64] app blank app=");
+    dbg64_dec((uint64_t)w->app_id);
+    dbg64_str(" c=");
+    dbg64_dec((uint64_t)p0);
+    dbg64_str(" client=");
+    dbg64_dec((uint64_t)w->client_w);
+    dbg64_str("x");
+    dbg64_dec((uint64_t)w->client_h);
+    dbg64_str(" (client_bg fill only; app painted nothing)");
+    dbg64_nl();
+    dbg64_line_end64();
+}
 // 窗口外观（本批改版）：大圆角 14（Token）+ 双层浅阴影 + 标题栏毛玻璃(内容层 12 模糊缓存) +
 // 1px 玻璃边框。**几何完全不变**：边框 1px、标题栏 24、客户区偏移与老实现逐像素一致，
 // 所以所有应用布局与老验收（标题栏三按钮/客户区几何）都不受影响。
@@ -1431,6 +1549,7 @@ static void draw_window(Window* w) {
         fb_set_clip(w->client_x, w->client_y, w->client_w, w->client_h);
         const uint64_t t0 = rdtsc64();
         w->draw(w);
+        check_app_painted64(w);      // ★ P5 防回归：应用画完之后不能是一片 client_bg
         w->cpu_cycles += rdtsc64() - t0;
         fb_reset_clip();
     }
@@ -1470,6 +1589,18 @@ static void draw_menu(void) {
     }
 }
 
+// 光标：按 input.cpp 里的形状状态画不同指针（箭头 / 文本 I 形 / 转圈 / 四向 + 对角缩放）
+static void cur_px64(int x, int y, uint32_t c) { fb_putpixel(x, y, c); }
+static void cur_line64(int x0, int y0, int x1, int y1, uint32_t c) {
+    int dx = x1 - x0, dy = y1 - y0;
+    const int ax = dx < 0 ? -dx : dx, ay = dy < 0 ? -dy : dy;
+    const int n = (ax > ay ? ax : ay) + 1;
+    for (int i = 0; i < n; i++) {
+        const int x = n > 1 ? x0 + dx * i / (n - 1) : x0;
+        const int y = n > 1 ? y0 + dy * i / (n - 1) : y0;
+        cur_px64(x, y, c);
+    }
+}
 static void draw_cursor(void) {
     static const char* cur[] = {
         "X          ", "XX         ", "X.X        ", "X..X       ", "X...X      ",
@@ -1477,15 +1608,67 @@ static void draw_cursor(void) {
         "X.....XXXXX", "X..X..X    ", "X.X.X..X   ", "XX..X..X   ", "X....X..X  ",
         "X.....X..X ", "X......X   ", "X.......X  ", "X........X "
     };
-    const int rows = 19;
-    for (int j = 0; j < rows; j++) {
-        const char* r = cur[j];
-        for (int i = 0; r[i]; i++) {
-            if (r[i] == ' ') break;
-            const uint32_t c = (r[i] == 'X') ? rgb(0, 0, 0) : rgb(255, 255, 255);
-            fb_putpixel(g_cur_x + i, g_cur_y + j, c);
+    const uint32_t black = rgb(0, 0, 0), white = rgb(255, 255, 255);
+    const int shape = mouse_get_cursor64();
+    if (shape == MOUSE_CUR_ARROW || shape == MOUSE_CUR_MOVE) {
+        const int rows = 19;
+        for (int j = 0; j < rows; j++) {
+            const char* r = cur[j];
+            for (int i = 0; r[i]; i++) {
+                if (r[i] == ' ') break;
+                cur_px64(g_cur_x + i, g_cur_y + j, (r[i] == 'X') ? black : white);
+            }
         }
+        if (shape == MOUSE_CUR_MOVE) {          // 四向移动：箭头 + 十字
+            cur_line64(g_cur_x + 16, g_cur_y + 2, g_cur_x + 16, g_cur_y + 14, black);
+            cur_line64(g_cur_x + 12, g_cur_y + 8, g_cur_x + 20, g_cur_y + 8, black);
+        }
+        return;
     }
+    if (shape == MOUSE_CUR_TEXT) {              // 文本 I 形
+        const int x = g_cur_x + 6, y = g_cur_y + 2, h = 16;
+        cur_line64(x, y, x, y + h, black);
+        cur_line64(x - 3, y, x + 3, y, black);
+        cur_line64(x - 3, y + h, x + 3, y + h, black);
+        cur_line64(x + 1, y + 1, x + 1, y + h - 1, white);
+        return;
+    }
+    if (shape == MOUSE_CUR_WAIT) {              // 转圈（缺口随帧转动）
+        const int cx = g_cur_x + 8, cy = g_cur_y + 8;
+        const int rot = (int)((ticks64() / 3) % 8);
+        for (int a = 0; a < 8; a++) {
+            if (a == rot) continue;
+            const int ang = a * 45;
+            const int dx = (ang == 0) ? 6 : (ang == 45 ? 4 : (ang == 90 ? 0 : (ang == 135 ? -4 : (ang == 180 ? -6 : (ang == 225 ? -4 : (ang == 270 ? 0 : 4))))));
+            const int dy = (ang == 0) ? 0 : (ang == 45 ? 4 : (ang == 90 ? 6 : (ang == 135 ? 4 : (ang == 180 ? 0 : (ang == 225 ? -4 : (ang == 270 ? -6 : -4))))));
+            cur_px64(cx + dx, cy + dy, black);
+            if ((dx + dy) % 2 == 0) cur_px64(cx + dx, cy + dy - 1, white);
+        }
+        return;
+    }
+    // 缩放箭头：左右 / 上下 / 两条对角线
+    const bool hz = (shape == MOUSE_CUR_H);
+    const bool vt = (shape == MOUSE_CUR_V);
+    const bool d1 = (shape == MOUSE_CUR_D1);
+    const int cx = g_cur_x + 8, cy = g_cur_y + 8;
+    for (int i = -7; i <= 7; i++) {
+        if (hz || d1) cur_px64(cx + i, cy + i, black);
+        if (hz) cur_px64(cx + i, cy, black);
+        if (vt) cur_px64(cx, cy + i, black);
+        if (!hz && !vt && !d1) cur_px64(cx + i, cy - i, black);
+    }
+    for (int i = 0; i < 4; i++) {
+        if (hz) { cur_px64(cx - 7 + i, cy - i, black); cur_px64(cx - 7 + i, cy + i, black);
+                  cur_px64(cx + 7 - i, cy - i, black); cur_px64(cx + 7 - i, cy + i, black); }
+        if (vt) { cur_px64(cx - i, cy - 7 + i, black); cur_px64(cx + i, cy - 7 + i, black);
+                  cur_px64(cx - i, cy + 7 - i, black); cur_px64(cx + i, cy + 7 - i, black); }
+        if (d1) { cur_px64(cx - 7 + i, cy - 7 + i, black); cur_px64(cx + 7 - i, cy + 7 - i, black); }
+        if (!hz && !vt && !d1) { cur_px64(cx + 7 - i, cy - 7 + i, black); cur_px64(cx - 7 + i, cy + 7 - i, black); }
+    }
+    if (hz)  cur_line64(cx - 5, cy, cx + 5, cy, white);
+    if (vt)  cur_line64(cx, cy - 5, cx, cy + 5, white);
+    if (d1)  cur_line64(cx - 5, cy - 5, cx + 5, cy + 5, white);
+    if (!hz && !vt && !d1) cur_line64(cx - 5, cy + 5, cx + 5, cy - 5, white);
 }
 
 // 全部图层按脏矩形裁剪重绘，然后只提交脏矩形
@@ -1498,15 +1681,8 @@ static void render(void) {
     fb_set_clip(x0, y0, dw, dh);
     draw_desktop_bg(x0, y0, x1, y1);
     draw_icons();
-    // 鼠标左键选择框（Win10 风格半透明矩形：桌面层、窗口之下）
-    if (g_selbox_active) {
-        const int sbx = sel_box_x(), sby = sel_box_y();
-        const int sbw = sel_box_w(), sbh = sel_box_h();
-        if (sbw > 0 && sbh > 0) {
-            fb_fill_rect_alpha(sbx, sby, sbw, sbh, rgb(0, 128, 255), 40);
-            fb_draw_rect(sbx, sby, sbw, sbh, rgb(64, 160, 255));
-        }
-    }
+    // ★ P5：鼠标左键拖出的**玻璃选择框**（框内全透明、只有突出边缘；桌面层、窗口之下）
+    desktopops64_selbox_draw64();
     // Dock 双层阴影：脏区压到它的包围盒就补画（壁纸/图标已画完，窗口还没画 → 层次正确）
     {
         int bx, by, bw, bh;
@@ -1524,22 +1700,46 @@ static void render(void) {
         const int sp = THEME64_SH_F_BLUR * 2 + 4;
         if (w->x - sp >= x1 || w->y - sp >= y1 || w->x + w->w + sp <= x0 || w->y + w->h + sp + THEME64_SH_F_DY <= y0)
             continue;
-        draw_window(w);
+        if (pop_active64() && g_pop_w == w) {
+            int px = 0, py = 0, pw = 0, ph = 0;
+            pop_geom64(w, &px, &py, &pw, &ph);
+            const int sx = w->x, sy = w->y, sw = w->w, sh = w->h;
+            w->x = px; w->y = py; w->w = pw; w->h = ph;
+            recompute_client(w);
+            draw_window(w);
+            w->x = sx; w->y = sy; w->w = sw; w->h = sh;
+            recompute_client(w);
+        } else {
+            draw_window(w);
+        }
     }
+    fly_draw64();                // ★ P5：最小化飞向 Dock 的缩略图（窗口之上、Dock 之下）
     draw_dock();                 // ★ 本批：Windows 11 风格 Dock（替换老 32px 任务栏）
-    draw_menu();
+    winlist_draw64();            // ★ P5：Dock 悬停窗口列表
+    draw_menu();                 // 老菜单（Win 键）
+    desktopops64_menu_draw64();  // ★ P5：桌面右键菜单
     // ★ P2：开始菜单（窗口之上）→ 四个二级弹窗/设备 toast（更靠前）
     startmenu64_draw64();
+    draw_cursor();               // ★ P5：按形状画指针（箭头/文本/转圈/缩放）
     panels64_draw64();
-    draw_cursor();
     fb_reset_clip();
     fb_flip_region(x0, y0, dw, dh);
 
     const uint64_t t1 = rdtsc64();
     g_busy_cycles += t1 - t0;
     g_total_cycles += t1 - t0 + 1;
+    // ★ P5 回归修复：脏矩形**必须在提交后清掉**（上一轮接线版把这两行连同 g_frames++ 一起
+    //   替换成了下面的 g_load_done 块 → g_dirty_any 永远为真 → 每帧都整屏重绘：
+    //   壁纸重铺 + 每个窗口重铺 client_bg，而应用自己的重绘是有条件的（settings64 只在
+    //   尺寸变化时画内容）→ 设置窗口内容每帧被抹成纯 240,240,240。见报告里的像素证据。）
     g_frames++;
     g_dirty_any = false;
+    if (!g_load_done) {
+        // ★ P5：窗口画完**两帧**才算"加载完"（保证至少一次光标判定能看到"加载中"，
+        //   也保证转圈在慢机型上真的能被用户看到）
+        g_load_paints++;
+        if (g_load_paints >= 2) g_load_done = true;
+    }
 }
 
 // ==================== 内置轻量窗口 ====================
@@ -1578,7 +1778,7 @@ static void mon_draw(Window* w) {
     // 中断 / tick
     L::s(buf, gui64_tr("IRQs ", "中断总数 "));
     { char t[24]; L::u(t, g_irq_total64); L::cat(buf, t); L::cat(buf, "   ticks "); L::u(t, (uint64_t)ticks64()); L::cat(buf, t); }
-    text_ttf(x, y, buf, rgb(40, 40, 40));
+    text_ttf(x, y, buf, rgb(40, 40, 40));   // ★ P5 回归修复：接线版漏掉了这一行 + y += lh（内容少画一行）
     y += lh;
 
     // 内存
@@ -1681,19 +1881,9 @@ void app_about_open64() {
     dbg64_nl();
 }
 
-static Window* g_rec_win = nullptr;
-static void recycle_draw(Window* w) {
-    text_ttf(w->client_x + 14, w->client_y + 14,
-             gui64_tr("Recycle Bin is empty.", "回收站是空的。"), rgb(60, 60, 60));
-}
-void app_recycle_open64() {
-    if (gui64_window_alive(g_rec_win)) { gui64_set_active(g_rec_win); return; }
-    g_rec_win = gui64_create_window(gui64_tr("Recycle Bin", "回收站"),
-                                    260, 120, 300, 180, recycle_draw, nullptr, nullptr, APP_ID_RECYCLE);
-    if (g_rec_win) gui64_set_min_size(g_rec_win, 240, 150);
-    dbg64_str("[APP] recycle opened");
-    dbg64_nl();
-}
+// ★ P5：回收站窗口整个搬到 desktopops64.cpp（内容/恢复/永久删除+二次确认/空状态都在那里）；
+// 这里保留 app_recycle_open64 这个应用契约入口（[APP] recycle opened 打点也在那边打）。
+void app_recycle_open64() { desktopops64_recycle_open64(); }
 
 // ==================== 开始菜单动作（与 32 位 menu_activate 一一对应）====================
 static void menu_activate(int idx) {
@@ -1746,7 +1936,9 @@ static void handle_mouse_press(int mx, int my, int button) {
             return;
         }
     }
-    // 1) Dock 栏（本批：Windows 11 风格）。命中项 → 按下：回弹动画 + 动作（开始按钮 = 真开始菜单）；时钟玻璃片吞掉点击。
+    // ★ P5：桌面右键菜单 / Dock 悬停窗口列表（层级：弹窗 > 开始菜单 > 右键菜单/窗口列表 > Dock）
+    if (desktopops64_menu_press64(mx, my, button)) return;
+    if (winlist_press64(mx, my)) return;
     {
         int on_clock = 0;
         const int idx = dock_hit64(mx, my, &on_clock);
@@ -1808,8 +2000,9 @@ static void handle_mouse_press(int mx, int my, int button) {
                 }
                 recompute_client(w);
                 gui64_invalidate();
-            } else {                            // 最小化
+            } else {                            // 最小化（★ P5：缩小 + 渐隐飞向 Dock 图标）
                 w->minimized = true;
+                fly_begin64(w);
                 gui64_invalidate();
             }
             return;
@@ -1822,50 +2015,72 @@ static void handle_mouse_press(int mx, int my, int button) {
             g_drag_dy = my - w->y;
             return;
         }
-        // 右下角 -> 缩放
-        if (mx >= w->x + w->w - 14 && my >= w->y + w->h - 14) {
-            g_drag = DRAG_RESIZE;
-            g_drag_w = w;
-            g_drag_dx = w->w - (mx - w->x);
-            g_drag_dy = w->h - (my - w->y);
-            return;
+        // ★ P5：边缘/四角 -> 八向缩放（左右 / 上下 / 四个角各一种，和 Windows 11 一样）
+        {
+            const int dir = resize_dir64(w, mx, my);
+            if (dir) {
+                g_drag = DRAG_RESIZE;
+                g_resize_dir = dir;
+                g_rz_log_frames = 0;
+                g_drag_w = w;
+                g_drag_dx = w->w - (mx - w->x);          // 右/下边缘用
+                g_drag_dy = w->h - (my - w->y);
+                dbg64_line_begin64();
+                dbg64_str("[UI] win resize begin dir=");
+                dbg64_str(resize_dir_name64(dir));
+                dbg64_str(" x=");
+                dbg64_dec((uint64_t)w->x);
+                dbg64_str(" y=");
+                dbg64_dec((uint64_t)w->y);
+                dbg64_str(" w=");
+                dbg64_dec((uint64_t)w->w);
+                dbg64_str(" h=");
+                dbg64_dec((uint64_t)w->h);
+                dbg64_str(" client=");
+                dbg64_dec((uint64_t)w->client_w);
+                dbg64_str("x");
+                dbg64_dec((uint64_t)w->client_h);
+                dbg64_nl();
+                dbg64_line_end64();
+                return;
+            }
         }
         // 客户区 -> 交给应用
         press_in_client(w, mx, my, button);
         return;
     }
-    // 4) 桌面图标（按下 = 选中 + 记录拖动基准；松开时区分 单击/双击/拖动）
-    for (int i = 0; i < 3; i++) {
-        const DeskIcon& ic = g_icons[i];
-        if (mx >= ic.x - 4 && mx < ic.x + ICON_W + 4 && my >= ic.y - 4 && my < ic.y + ICON_W + 18) {
-            g_icon_sel = i;
-            g_icon_drag_idx = i;
+    // ★ P5：桌面图标 —— 命中项（集合/持久化在 desktopops64）按下 = 选中 + 记录拖动基准
+    {
+        const int hit = desktopops64_hit64(mx, my);
+        if (hit >= 0) {
+            int icx = 0, icy = 0;
+            desktopops64_pos64(hit, &icx, &icy);
+            g_icon_sel = hit;
+            g_icon_drag_idx = hit;
             g_icon_drag_moved = false;
             g_icon_press_x = mx;
             g_icon_press_y = my;
-            g_icon_press_icon_x = ic.x;
-            g_icon_press_icon_y = ic.y;
-            g_selbox_active = false;
+            g_icon_press_icon_x = icx;
+            g_icon_press_icon_y = icy;
             dbg64_str("[UI] desktop icon select kind=");
-            dbg64_dec((uint64_t)i);
+            dbg64_dec((uint64_t)desktopops64_kind64(hit));
             dbg64_nl();
-            dirty_add(ic.x - 6, ic.y - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
+            dirty_add(icx - 6, icy - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
             return;
         }
     }
-    // 5) 桌面空白：取消选择；左键开始拉 Win10 风格选择框（桌面层、窗口之下）
+    // ★ P5：桌面空白 —— 右键打开桌面右键菜单；左键取消选择并开始拉**玻璃选择框**
     if (g_icon_sel >= 0) {
-        const DeskIcon& old = g_icons[g_icon_sel];
-        dirty_add(old.x - 6, old.y - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
+        int ox = 0, oy = 0;
+        desktopops64_pos64(g_icon_sel, &ox, &oy);
+        dirty_add(ox - 6, oy - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
         g_icon_sel = -1;
     }
-    if (button == 0) {
-        g_selbox_active = true;
-        g_sel_x0 = mx; g_sel_y0 = my;
-        g_sel_x1 = mx; g_sel_y1 = my;
-    } else {
-        g_selbox_active = false;
+    if (button == 1) {                       // 右键（需求：桌面空白处右键 -> 现代风格菜单）
+        desktopops64_menu_open64(mx, my);
+        return;
     }
+    if (button == 0) desktopops64_selbox_begin64(mx, my);
     dirty_add(0, 0, g_screen_w, g_screen_h);
 }
 
@@ -1873,16 +2088,19 @@ static void handle_mouse(void) {
     mouse_apply_sensitivity();               // mouse.sens != 1700 时才动（默认路径零变化）
     const int mx = mouse_get_x(), my = mouse_get_y();
     const int btn = (int)mouse_get_buttons();
-    const bool rel_left = (g_prev_btn & 1) && !(btn & 1);   // 左键释放（边沿）
+    // ★ P5：释放用**事件计数**（帧采样漏边沿 -> 双击/拖拽结束会失效）；按钮位比对只作兜底
+    const bool rel_left_evt = mouse_button_released64(0);
+    if (rel_left_evt) mouse_consume_released64(0);
+    const bool rel_left = rel_left_evt || ((g_prev_btn & 1) && !(btn & 1));
     // 光标移动 -> 新旧两块脏区（标题栏三按钮要跟着重画：hover 高亮）
     if (mx != g_cur_x || my != g_cur_y) {
-        dirty_add(g_prev_cur_x, g_prev_cur_y, 12, 20);
-        dirty_add(g_cur_x, g_cur_y, 12, 20);
+        dirty_add(g_prev_cur_x - 6, g_prev_cur_y - 4, 24, 24);   // ★ P5：光标图案变大（转圈/对角箭头）
+        dirty_add(g_cur_x - 6, g_cur_y - 4, 24, 24);
         dirty_title_buttons_at(g_cur_x, g_cur_y);
         dirty_title_buttons_at(mx, my);
         g_prev_cur_x = g_cur_x; g_prev_cur_y = g_cur_y;
         g_cur_x = mx; g_cur_y = my;
-        dirty_add(mx, my, 12, 20);
+        dirty_add(mx - 6, my - 4, 24, 24);
     }
     // 按下（边沿）
     if (mouse_button_pressed(0)) { mouse_consume_pressed(0); handle_mouse_press(mx, my, 0); }
@@ -1891,6 +2109,8 @@ static void handle_mouse(void) {
     // ★ P2：二级弹窗/开始菜单的悬停 + 拖动（音量滑块 / 日历左右拖切月 / WiFi 滚动条）
     panels64_handle_mouse_move64(mx, my, btn);
     startmenu64_handle_mouse_move64(mx, my, btn);
+    // ★ P5：桌面右键菜单的悬停高亮（菜单开着时鼠标移动换行；模块内部去重 + 只脏菜单矩形）
+    if (desktopops64_menu_is_open64()) desktopops64_menu_move64(mx, my);
     // ★ P2：滚轮（PS/2 4 字节包的 Z；弹窗优先，其次开始菜单搜索列表）
     {
         const int dz = mouse_pop_wheel64();
@@ -1928,64 +2148,83 @@ static void handle_mouse(void) {
     // 桌面图标拖动：位移 >5px（dx²+dy²>25）才算拖动，从而区分单击/双击/拖动（移植自 32 位）
     if ((btn & 1) && g_icon_drag_idx >= 0) {
         const int dx = mx - g_icon_press_x, dy = my - g_icon_press_y;
+        int icx = 0, icy = 0;
+        desktopops64_pos64(g_icon_drag_idx, &icx, &icy);
         if (!g_icon_drag_moved && dx * dx + dy * dy > 25) {
             g_icon_drag_moved = true;
             dbg64_str("[UI] icon drag idx=");
             dbg64_dec((uint64_t)g_icon_drag_idx);
             dbg64_str(" x=");
-            dbg64_dec((uint64_t)g_icons[g_icon_drag_idx].x);
+            dbg64_dec((uint64_t)icx);
             dbg64_str(" y=");
-            dbg64_dec((uint64_t)g_icons[g_icon_drag_idx].y);
+            dbg64_dec((uint64_t)icy);
             dbg64_nl();
         }
         if (g_icon_drag_moved) {
-            DeskIcon& ic = g_icons[g_icon_drag_idx];
             int nx = g_icon_press_icon_x + dx;
             int ny = g_icon_press_icon_y + dy;
             if (nx < 2) nx = 2;
             if (nx > g_screen_w - ICON_CELL_W - 2) nx = g_screen_w - ICON_CELL_W - 2;
             if (ny < 2) ny = 2;
             if (ny > g_screen_h - TASKBAR_H - ICON_CELL_H) ny = g_screen_h - TASKBAR_H - ICON_CELL_H;
-            if (nx != ic.x || ny != ic.y) {
-                dirty_add(ic.x - 6, ic.y - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
-                ic.x = nx; ic.y = ny;
-                dirty_add(ic.x - 6, ic.y - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
+            if (nx != icx || ny != icy) {
+                dirty_add(icx - 6, icy - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
+                desktopops64_set_pos64(g_icon_drag_idx, nx, ny);
+                dirty_add(nx - 6, ny - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
             }
         }
     }
-    // 空白处选择框：拖动更新矩形 + 实时选中框内图标（复用 g_icon_sel / C_ICON_SEL 绘制）
-    if ((btn & 1) && g_selbox_active) {
-        if (mx != g_sel_x1 || my != g_sel_y1) {
-            dirty_add(sel_box_x() - 2, sel_box_y() - 2, sel_box_w() + 4, sel_box_h() + 4);
-            g_sel_x1 = mx; g_sel_y1 = my;
-            int sel = -1;
-            for (int i = 0; i < 3; i++)
-                if (icon_hits_sel(i, g_sel_x0, g_sel_y0, g_sel_x1, g_sel_y1)) sel = i;
+    // 玻璃选择框：拖动更新矩形 + 实时选中框内图标（选中底色仍是 Token sel_bg）
+    if ((btn & 1) && desktopops64_selbox_active64()) {
+        if (desktopops64_selbox_update64(mx, my)) {
+            const int sel = desktopops64_selbox_count64();
             if (sel != g_icon_sel) {
-                if (g_icon_sel >= 0)
-                    dirty_add(g_icons[g_icon_sel].x - 6, g_icons[g_icon_sel].y - 6,
-                              ICON_CELL_W + 12, ICON_CELL_H + 12);
+                if (g_icon_sel >= 0) {
+                    int ox = 0, oy = 0;
+                    desktopops64_pos64(g_icon_sel, &ox, &oy);
+                    dirty_add(ox - 6, oy - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
+                }
                 g_icon_sel = sel;
-                if (g_icon_sel >= 0)
-                    dirty_add(g_icons[g_icon_sel].x - 6, g_icons[g_icon_sel].y - 6,
-                              ICON_CELL_W + 12, ICON_CELL_H + 12);
+                if (g_icon_sel >= 0) {
+                    int ox = 0, oy = 0;
+                    desktopops64_pos64(g_icon_sel, &ox, &oy);
+                    dirty_add(ox - 6, oy - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
+                }
             }
-            dirty_add(sel_box_x() - 2, sel_box_y() - 2, sel_box_w() + 4, sel_box_h() + 4);
         }
     }
     // 左键释放：结束图标拖动/选择框；位移未超阈值 = 单击（累计双击打开应用，不变）
+    // 左键释放：结束图标拖动/选择框；位移未超阈值 = 单击（累计双击打开应用）
     if (rel_left) {
         if (g_icon_drag_idx >= 0) {
             const int i = g_icon_drag_idx;
-            if (!g_icon_drag_moved) {
+            const int kind = desktopops64_kind64(i);
+            int icx = 0, icy = 0;
+            desktopops64_pos64(i, &icx, &icy);
+            // ★ P5：拖到回收站图标上 -> 进回收站（需求原文：可以把快捷方式或文件移入回收站）
+            int recv = -1;
+            if (g_icon_drag_moved) recv = desktopops64_is_recycle_hit64(mx, my);
+            if (g_icon_drag_moved && recv >= 0 && recv != i) {
+                dbg64_line_begin64();
+                dbg64_str("[DESK64] drag to recycle idx=");
+                dbg64_dec((uint64_t)i);
+                dbg64_str(" kind=");
+                dbg64_dec((uint64_t)kind);
+                dbg64_str(" target=");
+                dbg64_dec((uint64_t)recv);
+                dbg64_nl();
+                dbg64_line_end64();
+                (void)desktopops64_recycle_add64(i);
+                if (desktopops64_menu_is_open64()) desktopops64_menu_close64("drag");
+            } else if (!g_icon_drag_moved) {
                 const uint32_t now = ticks64();
                 const bool dbl = (g_icon_sel == i) && (now - g_icon_last_tick <= ms_to_ticks64(500));
                 if (dbl) {
                     dbg64_str("[UI] desktop icon open kind=");
-                    dbg64_dec((uint64_t)i);
+                    dbg64_dec((uint64_t)kind);
                     dbg64_nl();
-                    if (i == 0) app_mypc_open64();
-                    else if (i == 1) app_recycle_open64();
+                    if (kind == DESKOPS_KIND_MYPC) app_mypc_open64();
+                    else if (kind == DESKOPS_KIND_RECYCLE) app_recycle_open64();
                     else app_term_open64();
                     g_icon_sel = -1;
                     g_icon_last_tick = 0;
@@ -1996,50 +2235,29 @@ static void handle_mouse(void) {
                 dbg64_str("[UI] icon drag idx=");
                 dbg64_dec((uint64_t)i);
                 dbg64_str(" x=");
-                dbg64_dec((uint64_t)g_icons[i].x);
+                dbg64_dec((uint64_t)icx);
                 dbg64_str(" y=");
-                dbg64_dec((uint64_t)g_icons[i].y);
+                dbg64_dec((uint64_t)icy);
                 dbg64_nl();
-                // 拖动结束：把新位置写进 config64（-> store64；3 秒内自动落盘，也可 `store flush`）。
-                // 这是上一轮"图标位置只在内存里、重启就回默认"的补齐。
-                cfg64_set_icon64(i, g_icons[i].x, g_icons[i].y);
+                // 拖动结束：位置已由 desktopops64_set_pos64 写进 config64（图标 0..2 用既有键）
                 dbg64_line_begin64();
                 dbg64_str("[CONF64] icon ");
-                dbg64_dec((uint64_t)i);
+                dbg64_dec((uint64_t)kind);
                 dbg64_str(" moved to ");
-                dbg64_dec((uint64_t)g_icons[i].x);
+                dbg64_dec((uint64_t)icx);
                 dbg64_str(",");
-                dbg64_dec((uint64_t)g_icons[i].y);
+                dbg64_dec((uint64_t)icy);
                 dbg64_str(" (persisted via config64/store64)");
                 dbg64_nl();
                 dbg64_line_end64();
             }
-            dirty_add(g_icons[i].x - 6, g_icons[i].y - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
+            dirty_add(icx - 6, icy - 6, ICON_CELL_W + 12, ICON_CELL_H + 12);
             g_icon_drag_idx = -1;
             g_icon_drag_moved = false;
         }
-        if (g_selbox_active) {
-            const int x0 = sel_box_x(), y0 = sel_box_y();
-            const int bw = sel_box_w(), bh = sel_box_h();
-            int sel = 0;
-            for (int i = 0; i < 3; i++)
-                if (icon_hits_sel(i, g_sel_x0, g_sel_y0, g_sel_x1, g_sel_y1)) sel++;
-            dbg64_str("[UI] selbox x0=");
-            dbg64_dec((uint64_t)x0);
-            dbg64_str(" y0=");
-            dbg64_dec((uint64_t)y0);
-            dbg64_str(" x1=");
-            dbg64_dec((uint64_t)(x0 + bw));
-            dbg64_str(" y1=");
-            dbg64_dec((uint64_t)(y0 + bh));
-            dbg64_str(" sel=");
-            dbg64_dec((uint64_t)sel);
-            dbg64_nl();
-            g_selbox_active = false;
-            dirty_add(x0 - 2, y0 - 2, bw + 4, bh + 4);
-        }
+        if (desktopops64_selbox_active64()) desktopops64_selbox_end64();
     }
-    // 拖拽窗口（保持原有语义：只有窗口拖动走这里）
+    // 拖拽窗口（移动 / ★ P5 八向缩放）
     if (g_drag != DRAG_NONE && g_drag_w && gui64_window_alive(g_drag_w)) {
         if (btn & 1) {
             Window* w = g_drag_w;
@@ -2053,20 +2271,84 @@ static void handle_mouse(void) {
                 w->x = nx; w->y = ny;
                 recompute_client(w);
             } else {
-                int nw = mx - w->x + g_drag_dx;
-                int nh = my - w->y + g_drag_dy;
+                // ★ P5：八向缩放 —— 左/上边缘同时改 x/y（窗口"朝外"长），右下用 g_drag_dx/dy 保持抓取点
+                const int dir = g_resize_dir;
+                const int ox = w->x, oy = w->y, ow = w->w, oh = w->h;
+                int nw = ow, nh = oh;
+                if (dir & RZ_R) nw = mx - w->x + g_drag_dx;
+                if (dir & RZ_B) nh = my - w->y + g_drag_dy;
+                if (dir & RZ_L) nw = ow + (ox - mx);
+                if (dir & RZ_T) nh = oh + (oy - my);
                 if (nw < w->min_w) nw = w->min_w;
                 if (nh < w->min_h) nh = w->min_h;
-                if (w->x + nw > g_screen_w) nw = g_screen_w - w->x;
-                if (w->y + nh > g_screen_h - TASKBAR_H) nh = g_screen_h - TASKBAR_H - w->y;
-                if (nw > 0 && nh > 0) { w->w = nw; w->h = nh; recompute_client(w); }
+                int nx = w->x, ny = w->y;
+                if (dir & RZ_L) { nx = ox + ow - nw; if (nx < 0) { nw += nx; nx = 0; } }
+                if (dir & RZ_T) { ny = oy + oh - nh; if (ny < 0) { nh += ny; ny = 0; } }
+                if (nx + nw > g_screen_w) nw = g_screen_w - nx;
+                if (ny + nh > g_screen_h - TASKBAR_H) nh = g_screen_h - TASKBAR_H - ny;
+                if (nw >= w->min_w && nh >= w->min_h) {
+                    w->x = nx; w->y = ny;
+                    w->w = nw; w->h = nh;
+                    recompute_client(w);
+                    // 窗口内容随尺寸变化（应用每帧按 client_w/h 重排）—— 打点让验收能看到几何 + 客户区一起变
+                    // 每帧都打一行（一次拖动最多 24 行；验收要看到"帧"在动）—— 计数在 resize begin 处清零
+                    if (dir != 0 && g_rz_log_frames < 24) {
+                        g_rz_log_frames++;
+                        dbg64_line_begin64();
+                        dbg64_str("[UI] win resize dir=");
+                        dbg64_str(resize_dir_name64(dir));
+                        dbg64_str(" x=");
+                        dbg64_dec((uint64_t)w->x);
+                        dbg64_str(" y=");
+                        dbg64_dec((uint64_t)w->y);
+                        dbg64_str(" w=");
+                        dbg64_dec((uint64_t)w->w);
+                        dbg64_str(" h=");
+                        dbg64_dec((uint64_t)w->h);
+                        dbg64_str(" client=");
+                        dbg64_dec((uint64_t)w->client_w);
+                        dbg64_str("x");
+                        dbg64_dec((uint64_t)w->client_h);
+                        dbg64_nl();
+                        dbg64_line_end64();
+                        // 会话策略：把新尺寸记进 config64（按应用名，跨重启）
+                        if ((int)w->app_id == APP_ID_TERM)     cfg64_set_win64("term", w->w, w->h);
+                        else if ((int)w->app_id == APP_ID_MYPC) cfg64_set_win64("mypc", w->w, w->h);
+                    }
+                }
             }
-            dirty_add(w->x, w->y, w->w, w->h);
+            dirty_add(w->x - 8, w->y - 8, w->w + 16, w->h + 16);
         } else {
+            if (g_drag == DRAG_RESIZE) {
+                const Window* w = g_drag_w;
+                dbg64_line_begin64();
+                dbg64_str("[UI] win resize end dir=");
+                dbg64_str(resize_dir_name64(g_resize_dir));
+                dbg64_str(" x=");
+                dbg64_dec((uint64_t)w->x);
+                dbg64_str(" y=");
+                dbg64_dec((uint64_t)w->y);
+                dbg64_str(" w=");
+                dbg64_dec((uint64_t)w->w);
+                dbg64_str(" h=");
+                dbg64_dec((uint64_t)w->h);
+                dbg64_str(" client=");
+                dbg64_dec((uint64_t)w->client_w);
+                dbg64_str("x");
+                dbg64_dec((uint64_t)w->client_h);
+                dbg64_nl();
+                dbg64_line_end64();
+            }
             g_drag = DRAG_NONE;
+            g_resize_dir = 0;
             g_drag_w = nullptr;
         }
     }
+    // ★ P5：动效推进（Dock 窗口列表 / 最小化飞行 / 恢复弹出）+ 光标形状（按命中区域切换）
+    winlist_update64(mx, my);
+    (void)fly_tick64();        // 飞行帧只脏自己那两块小矩形（见 fly_tick64 里的 prev/cur dirty）
+    pop_tick64();
+    cursor_shape_update64(mx, my);
     g_prev_btn = btn;
 }
 
@@ -2098,9 +2380,28 @@ static void handle_keyboard(void) {
             gui64_invalidate();
             continue;
         }
-        // ★ P2：二级弹窗优先吃键（ESC 一级）→ 开始菜单（ESC 二级）→ 老菜单（兼容既有验收）
+        // ★ P5：Ctrl+Shift+W = 最小化活动窗口（需求原文：标题栏最小化按钮**或快捷键**）。
+        //   修饰键状态在**按键时刻**由 input.cpp 记下来（kbd_ctrl_shift_char64）：QEMU sendkey
+        //   的按下/释放只隔几毫秒，外壳忙一帧再处理时 kbd_ctrl_pressed() 已经是 false，
+        //   只看控制码/修饰键会漏（实测：空闲时命中、带窗口红绘时 0 命中）。
+        {
+            char csw = 0;
+            if (kbd_ctrl_shift_char64(&csw) && csw == 'W') {
+                Window* aw = top_visible_win64();
+                dbg64_str("[UI] hotkey ctrl+shift+w minimize");
+                dbg64_nl();
+                if (aw) {
+                    aw->minimized = true;
+                    fly_begin64(aw);                   // 缩小 + 渐隐飞向 Dock 图标
+                    gui64_invalidate();
+                }
+                continue;                              // 消费这一次按键（不再落到应用/菜单）
+            }
+        }
+        // ★ P2：二级弹窗优先吃键（ESC 一级）→ 开始菜单（ESC 二级）→ ★ P5 桌面右键菜单 → 老菜单
         if (panels64_handle_key64(c)) continue;
         if (startmenu64_handle_key64(c)) continue;
+        if (desktopops64_menu_key64(c)) continue;
         if (g_menu_open) {
             if (c == 0xFD) { g_menu_sel = (g_menu_sel + MENU_ITEMS - 1) % MENU_ITEMS; dirty_add(menu_x(), menu_y(), MENU_W, MENU_H); continue; }
             if (c == 0xFE) { g_menu_sel = (g_menu_sel + 1) % MENU_ITEMS; dirty_add(menu_x(), menu_y(), MENU_W, MENU_H); continue; }
@@ -2119,6 +2420,470 @@ static void handle_keyboard(void) {
         while (w && (!w->visible || w->minimized)) w = w->next;
         if (w && w->on_key) w->on_key(w, (char)c);
     }
+}
+
+// ==================== ★ P5：桌面交互细节（光标形状 / 八向缩放 / 最小化飞行 / 恢复弹出 / Dock 窗口列表）====================
+// 需求原文落点：
+//   * 鼠标移到窗口**边缘/四角** -> 左右 / 上下 / 对角箭头（四角各有对应）；
+//   * 移到**文本输入框**上 -> I 形文本指针；**程序加载时** -> 转圈；其余 -> 普通箭头。
+//   形状**状态**在 input.cpp（mouse_set_cursor64 会打 [INPUT64] cursor shape=...），
+//   本文件只按命中区域切换（这是需求原文的分工）。
+
+static void cur_log_set64(int shape, const char* why) {
+    if (shape == g_cursor_shape) return;
+    g_cursor_shape = shape;
+    mouse_set_cursor64(shape);
+    if (g_cursor_log_budget > 0) {
+        g_cursor_log_budget--;
+        dbg64_line_begin64();
+        dbg64_str("[GUI64] cursor switch shape=");
+        dbg64_str(mouse_cursor_name64(shape));
+        dbg64_str(" why=");
+        dbg64_str(why);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+}
+
+static Window* top_visible_win64(void) {
+    for (Window* w = g_z; w; w = w->next) if (w->visible && !w->minimized) return w;
+    return nullptr;
+}
+
+// 八向缩放命中：返回方向位（0 = 不在抓取带上）
+static int resize_dir64(const Window* w, int mx, int my) {
+    if (!w || !w->visible || w->minimized || w->maximized) return 0;
+    if (mx < w->x - GUI64_GRIP || mx >= w->x + w->w + GUI64_GRIP) return 0;
+    if (my < w->y - GUI64_GRIP || my >= w->y + w->h + GUI64_GRIP) return 0;
+    int dir = 0;
+    if (mx < w->x + GUI64_GRIP) dir |= RZ_L;
+    else if (mx >= w->x + w->w - GUI64_GRIP) dir |= RZ_R;
+    if (my < w->y + GUI64_GRIP) dir |= RZ_T;
+    else if (my >= w->y + w->h - GUI64_GRIP) dir |= RZ_B;
+    return dir;
+}
+static int resize_dir_shape64(int dir) {
+    const bool lr = (dir & (RZ_L | RZ_R)) != 0;
+    const bool tb = (dir & (RZ_T | RZ_B)) != 0;
+    if (lr && !tb) return MOUSE_CUR_H;
+    if (tb && !lr) return MOUSE_CUR_V;
+    if ((dir & RZ_L) && (dir & RZ_T)) return MOUSE_CUR_D1;      // 左上 - 右下
+    if ((dir & RZ_R) && (dir & RZ_B)) return MOUSE_CUR_D1;
+    return MOUSE_CUR_D2;                                        // 右上 - 左下
+}
+static const char* resize_dir_name64(int dir) {
+    switch (dir) {
+        case RZ_L:          return "l";
+        case RZ_R:          return "r";
+        case RZ_T:          return "t";
+        case RZ_B:          return "b";
+        case RZ_L | RZ_T:   return "tl";
+        case RZ_R | RZ_T:   return "tr";
+        case RZ_L | RZ_B:   return "bl";
+        case RZ_R | RZ_B:   return "br";
+        default:            return "?";
+    }
+}
+
+// 文本输入区（"移到输入框上变成文本指针"）：终端命令行、资源管理器地址栏、开始菜单搜索框
+static bool point_in_text_zone64(Window* w, int mx, int my) {
+    if (!w) return false;
+    if (w->app_id == APP_ID_TERM) return true;                       // 终端客户区整块都是文本输入
+    if (w->app_id == APP_ID_MYPC) {                                  // 资源管理器顶部地址栏
+        const int bar_h = THEME64_POP_BTN_H;
+        return (my >= w->client_y && my < w->client_y + bar_h + 4);
+    }
+    if (startmenu64_is_open64()) {
+        int x = 0, y = 0, ww = 0, hh = 0;
+        if (startmenu64_search_rect64(&x, &y, &ww, &hh) &&
+            mx >= x && mx < x + ww && my >= y && my < y + hh) return true;
+    }
+    return false;
+}
+
+static void cursor_shape_update64(int mx, int my) {
+    int shape = MOUSE_CUR_ARROW;
+    const char* why = "default";
+    // 1) 程序加载中：窗口已创建但**第一帧还没画完**（且至少持续 ~400ms 让人看得见转圈）-> wait
+    if (g_load_w && gui64_window_alive(g_load_w) &&
+        (!g_load_done || (int32_t)(ticks64() - g_load_t0) < (int32_t)ms_to_ticks64(400))) {
+        if (mx >= g_load_w->x && mx < g_load_w->x + g_load_w->w &&
+            my >= g_load_w->y && my < g_load_w->y + g_load_w->h) {
+            shape = MOUSE_CUR_WAIT;
+            why = "app-load";
+        }
+    }
+    // 2) 窗口边缘/四角 -> 缩放箭头。**先于文本指针判定**：抓取带含窗口内侧 6px，
+    //    与 Windows 11 同语义（边缘就是边缘；文本指针只在窗口内部、远离边缘处生效）。
+    if (shape == MOUSE_CUR_ARROW && !g_menu_open && !startmenu64_is_open64() && !panels64_any_open64()) {
+        for (Window* p = g_z; p; p = p->next) {
+            const int dir = resize_dir64(p, mx, my);
+            if (dir) { shape = resize_dir_shape64(dir); why = "window-edge"; break; }
+            if (p->visible && !p->minimized &&
+                mx >= p->x && mx < p->x + p->w && my >= p->y && my < p->y + p->h) break;
+        }
+    }
+    // 3) 文本输入框（终端命令行 / 资源管理器地址栏 / 开始菜单搜索框）-> I 形指针
+    if (shape == MOUSE_CUR_ARROW) {
+        Window* wt = win_at(mx, my);
+        if (wt && point_in_text_zone64(wt, mx, my)) { shape = MOUSE_CUR_TEXT; why = "text-input"; }
+    }
+    cur_log_set64(shape, why);
+}
+
+// ---- 最小化飞行：抓一张降采样快照（从后备缓冲读；72x48 省内存）----
+static void fly_snapshot64(const Window* w) {
+    g_fly_snap_ok = false;
+    if (!w || w->w < 4 || w->h < 4) return;
+    for (int j = 0; j < FLY_SNAP_H; j++) {
+        const int sy = w->y + j * w->h / FLY_SNAP_H;
+        for (int i = 0; i < FLY_SNAP_W; i++) {
+            const int sx = w->x + i * w->w / FLY_SNAP_W;
+            g_fly_snap[j * FLY_SNAP_W + i] = fb_get_pixel(sx, sy);
+        }
+    }
+    g_fly_snap_ok = true;
+}
+
+// 找一个应用在 Dock 里的下标（-1 = 没固定）
+static int dock_index_of_app64(int app_id) {
+    for (int i = 1; i < DOCK_ITEMS; i++) if (kDockItems[i].app_id == app_id) return i;
+    return -1;
+}
+
+static void fly_begin64(Window* w) {
+    if (!w) return;
+    const int idx = dock_index_of_app64((int)w->app_id);
+    if (idx < 0) {
+        dbg64_str("[DOCK64] minimize fly skipped (app not pinned)");
+        dbg64_nl();
+        return;
+    }
+    FlyAnim* f = &g_fly[g_fly_n++];
+    f->w = w;
+    f->t0 = ticks64();
+    f->dur = (int)theme64_dur64(THEME64_MS_NORMAL);
+    f->frame = 0;
+    f->fx = w->x; f->fy = w->y; f->fw = w->w; f->fh = w->h;
+    const int ipx = g_dock_icon;
+    f->tw = ipx; f->th = ipx;
+    f->tx = dock_item_draw_x64(idx) + g_dock_icon / 2 - ipx / 2;
+    f->ty = g_dock_y + (g_dock_h - ipx) / 2;
+    f->px = f->fx; f->py = f->fy; f->pw = f->fw; f->ph = f->fh;
+    fly_snapshot64(w);
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] minimize fly app=");
+    dbg64_dec((uint64_t)w->app_id);
+    dbg64_str(" dock_idx=");
+    dbg64_dec((uint64_t)idx);
+    dbg64_str(" from=");
+    dbg64_dec((uint64_t)f->fx); dbg64_str(","); dbg64_dec((uint64_t)f->fy);
+    dbg64_str(" ");
+    dbg64_dec((uint64_t)f->fw); dbg64_str("x"); dbg64_dec((uint64_t)f->fh);
+    dbg64_str(" to=");
+    dbg64_dec((uint64_t)f->tx); dbg64_str(","); dbg64_dec((uint64_t)f->ty);
+    dbg64_str(" ");
+    dbg64_dec((uint64_t)f->tw); dbg64_str("x"); dbg64_dec((uint64_t)f->th);
+    dbg64_str(" dur=");
+    dbg64_dec((uint64_t)f->dur);
+    dbg64_str("ms anim=scale+fade");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// 每帧推进飞行；返回 1 = 画面有变化
+static int fly_tick64(void) {
+    if (g_fly_n == 0) return 0;
+    int changed = 0;
+    const uint32_t now = ticks64();
+    for (int i = 0; i < g_fly_n; i++) {
+        FlyAnim* f = &g_fly[i];
+        if (f->w == nullptr) continue;
+        const int el = (int)(now - f->t0);
+        if (el >= f->dur) {
+            dbg64_line_begin64();
+            dbg64_str("[DOCK64] minimize fly done app=");
+            dbg64_dec((uint64_t)f->w->app_id);
+            dbg64_str(" frames=");
+            dbg64_dec((uint64_t)f->frame);
+            dbg64_str(" anim=scale+fade");
+            dbg64_nl();
+            dbg64_line_end64();
+            f->w = nullptr;
+            changed = 1;
+            continue;
+        }
+        f->frame++;
+        const int t = (int)((int64_t)el * 256 / (f->dur > 0 ? f->dur : 1));
+        const int e = theme64_ease64(t);
+        const int cx = f->fx + (f->tx - f->fx) * e / 256;
+        const int cy = f->fy + (f->ty - f->fy) * e / 256;
+        const int cw = f->fw + (f->tw - f->fw) * e / 256;
+        const int ch = f->fh + (f->th - f->fh) * e / 256;
+        const int alpha = 255 - (255 * t / 256);
+        if (f->frame <= 12) {
+            dbg64_line_begin64();
+            dbg64_str("[DOCK64] minimize fly frame=");
+            dbg64_dec((uint64_t)f->frame);
+            dbg64_str(" t=");
+            dbg64_dec((uint64_t)t);
+            dbg64_str(" rect=");
+            dbg64_dec((uint64_t)cx); dbg64_str(","); dbg64_dec((uint64_t)cy);
+            dbg64_str(" ");
+            dbg64_dec((uint64_t)cw); dbg64_str("x"); dbg64_dec((uint64_t)ch);
+            dbg64_str(" scale=");
+            dbg64_dec((uint64_t)(cw * 100 / (f->fw > 0 ? f->fw : 1)));
+            dbg64_str(" alpha=");
+            dbg64_dec((uint64_t)alpha);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        dirty_add(f->px - 2, f->py - 2, f->pw + 4, f->ph + 4);   // 擦上一帧
+        f->px = cx; f->py = cy; f->pw = cw; f->ph = ch;
+        dirty_add(cx - 2, cy - 2, cw + 4, ch + 4);              // 画本帧
+        changed = 1;
+    }
+    int n = 0;
+    for (int i = 0; i < g_fly_n; i++) if (g_fly[i].w) g_fly[n++] = g_fly[i];
+    g_fly_n = n;
+    return changed;
+}
+
+// 画飞行中的缩略图（缩放 + 透明度渐隐）——窗口已 minimized，不会再被正常路径画出来
+static void fly_draw64(void) {
+    if (g_fly_n == 0 || !g_fly_snap_ok) return;
+    const uint32_t now = ticks64();
+    for (int i = 0; i < g_fly_n; i++) {
+        FlyAnim* f = &g_fly[i];
+        if (!f->w) continue;
+        const int el = (int)(now - f->t0);
+        if (el >= f->dur) continue;
+        const int t = (int)((int64_t)el * 256 / (f->dur > 0 ? f->dur : 1));
+        const int e = theme64_ease64(t);
+        const int cx = f->fx + (f->tx - f->fx) * e / 256;
+        const int cy = f->fy + (f->ty - f->fy) * e / 256;
+        const int cw = f->fw + (f->tw - f->fw) * e / 256;
+        const int ch = f->fh + (f->th - f->fh) * e / 256;
+        if (cw < 2 || ch < 2) continue;
+        const int alpha = 255 - (255 * t / 256);
+        for (int j = 0; j < ch; j++) {
+            const int sy = j * FLY_SNAP_H / ch;
+            if (sy < 0 || sy >= FLY_SNAP_H) continue;
+            for (int k = 0; k < cw; k++) {
+                const int sx = k * FLY_SNAP_W / cw;
+                if (sx < 0 || sx >= FLY_SNAP_W) continue;
+                const uint32_t c = g_fly_snap[sy * FLY_SNAP_W + sx];
+                gfx64_blend64(cx + k, cy + j,
+                              rgb((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF), alpha);
+            }
+        }
+    }
+}
+
+// ---- 恢复时的 scale + opacity 弹出（几何插值 + 逐帧重排；窗口内容随尺寸变化）----
+static void pop_begin64(Window* w, const char* why) {
+    if (!w) return;
+    g_pop_w = w;
+    g_pop_t0 = ticks64();
+    g_pop_dur = (int)theme64_dur64(THEME64_MS_NORMAL);
+    g_pop_frame = 0;
+    dirty_add(w->x, w->y, w->w, w->h);
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] restore pop app=");
+    dbg64_dec((uint64_t)w->app_id);
+    dbg64_str(" dur=");
+    dbg64_dec((uint64_t)g_pop_dur);
+    dbg64_str("ms anim=scale0.88->1.00+opacity why=");
+    dbg64_str(why);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static int pop_active64(void) {
+    return g_pop_w && gui64_window_alive(g_pop_w) && g_pop_dur > 0 &&
+           (int32_t)(ticks64() - g_pop_t0) < (int32_t)g_pop_dur;
+}
+// 返回窗口该按哪个几何画（弹出动画期间是插值出来的"缩小版"）
+static void pop_geom64(const Window* w, int* x, int* y, int* ww, int* hh) {
+    *x = w->x; *y = w->y; *ww = w->w; *hh = w->h;
+    if (!pop_active64() || g_pop_w != w) return;
+    int t = (int)((int64_t)(ticks64() - g_pop_t0) * 256 / (g_pop_dur > 0 ? g_pop_dur : 1));
+    if (t > 256) t = 256;
+    const int e = theme64_ease64(t);
+    const int sc = 880 + 120 * e / 256;                 // 0.88 -> 1.00
+    *x = w->x + w->w / 2 - w->w * sc / 2560;
+    *y = w->y + w->h / 2 - w->h * sc / 2560;
+    *ww = w->w * sc / 2560;
+    *hh = w->h * sc / 2560;
+}
+static void pop_tick64(void) {
+    if (g_pop_w == nullptr) return;
+    if (!gui64_window_alive(g_pop_w)) { g_pop_w = nullptr; return; }
+    if ((int32_t)(ticks64() - g_pop_t0) >= (int32_t)g_pop_dur) {
+        dbg64_line_begin64();
+        dbg64_str("[DOCK64] restore pop done app=");
+        dbg64_dec((uint64_t)g_pop_w->app_id);
+        dbg64_str(" frames=");
+        dbg64_dec((uint64_t)g_pop_frame);
+        dbg64_str(" scale=100 opacity=255");
+        dbg64_nl();
+        dbg64_line_end64();
+        dirty_add(g_pop_w->x, g_pop_w->y, g_pop_w->w, g_pop_w->h);
+        g_pop_w = nullptr;
+        return;
+    }
+    g_pop_frame++;
+    dirty_add(g_pop_w->x - 2, g_pop_w->y - 2, g_pop_w->w + 4, g_pop_w->h + 4);
+}
+
+// ---- Dock 悬停窗口列表（同一应用多窗口：可选择恢复"指定窗口"；一应用只有一根小横杠）----
+static void winlist_collect64(int idx, Window** out, int* n) {
+    *n = 0;
+    if (idx <= 0 || idx >= DOCK_ITEMS) return;
+    const int app = kDockItems[idx].app_id;
+    for (int i = 0; i < MAX_WINS; i++) {
+        if (!g_used[i]) continue;
+        Window* w = &g_wins[i];
+        if (!w->visible || (int)w->app_id != app) continue;
+        out[(*n)++] = w;
+    }
+}
+static void winlist_update64(int mx, int my) {
+    static uint32_t dwell_t0 = 0;
+    static int      dwell_idx = -1;
+    int want = -1;
+    // 光标已经在弹出的窗口列表里：保持它开着（否则鼠标一移过去就关，永远点不到行）
+    if (g_winlist_idx >= 0 &&
+        mx >= g_winlist_x && mx < g_winlist_x + g_winlist_w &&
+        my >= g_winlist_y && my < g_winlist_y + g_winlist_h) {
+        want = g_winlist_idx;
+    } else if (g_dock_hover > 0 && !panels64_any_open64() && !startmenu64_is_open64() && !g_menu_open) {
+        Window* tmp[MAX_WINS];
+        int n = 0;
+        winlist_collect64(g_dock_hover, tmp, &n);
+        if (n > 0) {
+            if (dwell_idx != g_dock_hover) { dwell_idx = g_dock_hover; dwell_t0 = ticks64(); }
+            if (g_winlist_idx == g_dock_hover) want = g_dock_hover;
+            // 悬停 ~150ms（Token：快动效）就弹出窗口列表 —— 需求："鼠标放到 Dock 图标上方就会弹出窗口列表"
+            else if (g_dock_hover >= 0 && (int32_t)(ticks64() - dwell_t0) >= (int32_t)theme64_dur64(THEME64_MS_FAST))
+                want = g_dock_hover;
+        }
+    }
+    if (want < 0) {
+        if (g_winlist_idx >= 0) { g_winlist_idx = -1; g_winlist_logged = 0; gui64_invalidate(); }
+        {
+            // 悬停换了图标（或第一次悬停）就允许重新打点 —— 否则"窗口列表一直开着"会吞掉后续验收证据
+            static int logged_for = -1;
+            if (logged_for != g_dock_hover) { logged_for = g_dock_hover; g_winlist_logged = 0; }
+        }
+        return;
+    }
+    Window* tmp[MAX_WINS];
+    int n = 0;
+    winlist_collect64(want, tmp, &n);
+    int maxw = 0;
+    for (int i = 0; i < n; i++) { const int w2 = text_w(tmp[i]->title); if (w2 > maxw) maxw = w2; }
+    g_winlist_w = maxw + THEME64_POP_PAD * 2 + 24;
+    if (g_winlist_w < 180) g_winlist_w = 180;
+    if (g_winlist_w > 360) g_winlist_w = 360;
+    g_winlist_h = n * THEME64_POP_ROW + THEME64_POP_PAD;
+    const int icx = dock_item_draw_x64(want) + g_dock_icon / 2;
+    g_winlist_x = icx - g_winlist_w / 2;
+    g_winlist_y = g_dock_y - THEME64_POP_GAP - g_winlist_h;
+    if (g_winlist_x < 4) g_winlist_x = 4;
+    if (g_winlist_x + g_winlist_w > g_screen_w - 4) g_winlist_x = g_screen_w - 4 - g_winlist_w;
+    if (g_winlist_y < 4) g_winlist_y = 4;
+    if (!g_winlist_logged) {
+        g_winlist_logged = 1;
+        dbg64_line_begin64();
+        dbg64_str("[DOCK64] winlist idx=");
+        dbg64_dec((uint64_t)want);
+        dbg64_str(" n=");
+        dbg64_dec((uint64_t)n);
+        dbg64_str(" x=");
+        dbg64_dec((uint64_t)g_winlist_x);
+        dbg64_str(" y=");
+        dbg64_dec((uint64_t)g_winlist_y);
+        dbg64_str(" w=");
+        dbg64_dec((uint64_t)g_winlist_w);
+        dbg64_str(" h=");
+        dbg64_dec((uint64_t)g_winlist_h);
+        dbg64_str(" row=");
+        dbg64_dec((uint64_t)THEME64_POP_ROW);
+        dbg64_str(" one-bar-per-app=1");
+        dbg64_nl();
+        dbg64_line_end64();
+        for (int i = 0; i < n; i++) {
+            dbg64_line_begin64();
+            dbg64_str("[DOCK64] winlist item idx=");
+            dbg64_dec((uint64_t)want);
+            dbg64_str(" row=");
+            dbg64_dec((uint64_t)i);
+            dbg64_str(" title=");
+            dbg64_str(tmp[i]->title);
+            dbg64_str(" minimized=");
+            dbg64_dec(tmp[i]->minimized ? 1 : 0);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
+    g_winlist_idx = want;
+    g_winlist_row = -1;
+    if (mx >= g_winlist_x && mx < g_winlist_x + g_winlist_w &&
+        my >= g_winlist_y && my < g_winlist_y + g_winlist_h) {
+        const int r = (my - g_winlist_y - THEME64_POP_PAD / 2) / THEME64_POP_ROW;
+        if (r >= 0 && r < n) g_winlist_row = r;
+    }
+}
+static void winlist_draw64(void) {
+    if (g_winlist_idx < 0) return;
+    Window* tmp[MAX_WINS];
+    int n = 0;
+    winlist_collect64(g_winlist_idx, tmp, &n);
+    if (n == 0) return;
+    const Theme64Tokens* t = theme64_tokens64();
+    p2ui_popup64(g_winlist_x, g_winlist_y, g_winlist_w, g_winlist_h, THEME64_POP_R, THEME64_POP_R,
+                 t, t->client_bg, t->dark ? THEME64_A_POP_DARK : THEME64_A_POP);
+    for (int i = 0; i < n; i++) {
+        const int iy = g_winlist_y + THEME64_POP_PAD / 2 + i * THEME64_POP_ROW;
+        if (i == g_winlist_row)
+            gfx64_fill_round64(g_winlist_x + 4, iy + 2, g_winlist_w - 8, THEME64_POP_ROW - 4,
+                               THEME64_R_BUTTON, t->sel_bg, 110);
+        p2ui_text64(g_winlist_x + THEME64_POP_PAD, iy + (THEME64_POP_ROW - p2ui_line_h64()) / 2,
+                    tmp[i]->title, tmp[i]->minimized ? t->text_dim : t->text);
+        p2ui_fill_circle64(g_winlist_x + g_winlist_w - THEME64_POP_PAD - 4,
+                           iy + THEME64_POP_ROW / 2, 3,
+                           tmp[i]->minimized ? t->text_dim : t->accent, 220);
+    }
+}
+static int winlist_press64(int mx, int my) {
+    if (g_winlist_idx < 0) return 0;
+    if (mx < g_winlist_x || mx >= g_winlist_x + g_winlist_w ||
+        my < g_winlist_y || my >= g_winlist_y + g_winlist_h) return 0;
+    Window* tmp[MAX_WINS];
+    int n = 0;
+    winlist_collect64(g_winlist_idx, tmp, &n);
+    const int r = (my - g_winlist_y - THEME64_POP_PAD / 2) / THEME64_POP_ROW;
+    if (r < 0 || r >= n) return 1;
+    Window* w = tmp[r];
+    const bool was_min = w->minimized;
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] winlist restore idx=");
+    dbg64_dec((uint64_t)g_winlist_idx);
+    dbg64_str(" row=");
+    dbg64_dec((uint64_t)r);
+    dbg64_str(" title=");
+    dbg64_str(w->title);
+    dbg64_str(" was_minimized=");
+    dbg64_dec(was_min ? 1 : 0);
+    dbg64_nl();
+    dbg64_line_end64();
+    w->minimized = false;
+    gui64_set_active(w);
+    if (was_min) pop_begin64(w, "winlist");
+    g_winlist_idx = -1;
+    g_winlist_logged = 0;
+    gui64_invalidate();
+    return 1;
 }
 
 // ==================== 外壳自检 ====================
@@ -2176,6 +2941,9 @@ int gui64_selftest() {
     return fails;
 }
 
+static int deskpos_x64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y); return x; }
+static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y); return y; }
+
 // ==================== 主循环 ====================
 [[noreturn]] void gui64_run(const BootInfo* bi) {
     (void)bi;
@@ -2197,16 +2965,8 @@ int gui64_selftest() {
     g_icon_sel = -1;
     g_icon_drag_idx = -1;
     g_icon_drag_moved = false;
-    g_selbox_active = false;
-    // 桌面图标位置：**从 config64 读**（上一轮只存在内存里，重启就回默认位置）
-    for (int i = 0; i < 3; i++) {
-        int ix = cfg64_icon_x64(i), iy = cfg64_icon_y64(i);
-        if (ix < 2) ix = 2;
-        if (iy < 2) iy = 2;
-        if (ix > g_screen_w - ICON_CELL_W - 2) ix = g_screen_w - ICON_CELL_W - 2;
-        if (iy > g_screen_h - TASKBAR_H - ICON_CELL_H) iy = g_screen_h - TASKBAR_H - ICON_CELL_H;
-        g_icons[i] = DeskIcon{i, ix, iy};
-    }
+    // ★ P5：桌面图标集合（项/位置/回收站内容）由 desktopops64 从 config64 载入
+    desktopops64_init64();
     {
         dbg64_line_begin64();
         dbg64_str("[CONF64] apply lang=");
@@ -2218,11 +2978,11 @@ int gui64_selftest() {
         dbg64_str(" sens=");
         dbg64_dec((uint64_t)g_mouse_sens);
         dbg64_str(" icon0=");
-        dbg64_dec((uint64_t)g_icons[0].x); dbg64_str(","); dbg64_dec((uint64_t)g_icons[0].y);
+        dbg64_dec((uint64_t)deskpos_x64(0)); dbg64_str(","); dbg64_dec((uint64_t)deskpos_y64(0));
         dbg64_str(" icon1=");
-        dbg64_dec((uint64_t)g_icons[1].x); dbg64_str(","); dbg64_dec((uint64_t)g_icons[1].y);
+        dbg64_dec((uint64_t)deskpos_x64(1)); dbg64_str(","); dbg64_dec((uint64_t)deskpos_y64(1));
         dbg64_str(" icon2=");
-        dbg64_dec((uint64_t)g_icons[2].x); dbg64_str(","); dbg64_dec((uint64_t)g_icons[2].y);
+        dbg64_dec((uint64_t)deskpos_x64(2)); dbg64_str(","); dbg64_dec((uint64_t)deskpos_y64(2));
         dbg64_str(" startup=t");
         dbg64_dec((uint64_t)cfg64_startup64("terminal"));
         dbg64_str(",m");
@@ -2315,7 +3075,7 @@ int gui64_selftest() {
 
 
     g_in_selftest = true;          // 自检里的临时窗口 / 语言来回切 不触发会话与配置钩子
-    const int st = gui64_selftest();
+    const int st = gui64_selftest() | desktopops64_selftest64();
     g_in_selftest = false;
     if (st != 0) {
         dbg64_str("[GUI64] selftest FAILED mask=");
@@ -2366,6 +3126,11 @@ int gui64_selftest() {
         if (theme64_tick64() | gfx64_wall_tick64()) {
             g_dock_geom_logged = false;
             dock_geom_init64();
+            gui64_invalidate();
+        }
+        // ★ P5：桌面图标集合被外部改过（设置页按钮 / 终端 `cfg set ui.desktop.icons ...`）→ 实时同步
+        if (desktopops64_tick64()) {
+            desktopops64_clamp64(g_screen_w, g_screen_h);
             gui64_invalidate();
         }
         // ★ P2：开始菜单/弹窗锚在菜单几何上 —— 分辨率/缩放变了（dock 几何重建）时，收起它们免得错位

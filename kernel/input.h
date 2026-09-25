@@ -45,10 +45,14 @@ void mouse_clear_event_flag();
 // 鼠标按钮事件（按下瞬间）
 bool mouse_button_pressed(int btn);   // 0=左 1=右 2=中
 void mouse_consume_pressed(int btn);
+// ★ P5：左键**释放**事件（帧采样会漏边沿：双击/拖拽结束必须用事件计数，不用按钮位比对）
+bool mouse_button_released64(int btn);
+void mouse_consume_released64(int btn);
 
 // ★ 批次 L：最近一次**左键按下包到达**时刻（ticks64() 的 tick 值；还没按下过 = 0）。
 //   双击判定请用它，不要用 GUI 回调时刻：一帧重绘/调度延迟会把"用户的双击"误判成两次单击。
 
+//   （实测：宿主负载高时两次按下包在 200ms 内到达，GUI 回调却被拖到相隔 >500ms。）
 // ==================== ★ 批次 P2：Caps / 中英指示 / 滚轮 ====================
 // 背景（需求原文）：键盘补充 = Caps 切换大小写、Shift 切换中/英（**无中文输入法时指示只显示"英"**，
 // 中文输入法后期）；二级弹窗还要鼠标滚轮（日历切月 / WiFi 列表滚动）。
@@ -67,6 +71,28 @@ uint32_t kbd_shift_toggles64();      // Shift 按下边沿累计（"Shift 切换
 
 int      mouse_wheel_mode64();       // 1 = 4 字节包（滚轮可用）/ 0 = 3 字节包（设备不支持）
 int      mouse_pop_wheel64();        // 取走累计滚轮增量（上滚 > 0、下滚 < 0；无增量 = 0）
-//   （实测：宿主负载高时两次按下包在 200ms 内到达，GUI 回调却被拖到相隔 >500ms。）
+
+// ==================== ★ P5：光标形状（需求原文：窗口边缘/四角、文本输入框、程序加载中、其余默认）====================
+// 状态放在驱动层（input.cpp），**切换在桌面外壳**（gui64.cpp 按命中区域调 mouse_set_cursor64）——
+// 这是需求原文要求的分工。形状变化时会打点：
+//   [INPUT64] cursor shape=<name> prev=<name>
+//   name ∈ arrow | text | wait | size-h | size-v | size-d1 | size-d2 | move
+#define MOUSE_CUR_ARROW  0    // 普通箭头（默认）
+#define MOUSE_CUR_TEXT   1    // 文本 I 形（输入框上）
+#define MOUSE_CUR_WAIT   2    // 转圈（程序加载中）
+#define MOUSE_CUR_H      3    // 左右拖动箭头（左/右边缘）
+#define MOUSE_CUR_V      4    // 上下拖动箭头（上/下边缘）
+#define MOUSE_CUR_D1     5    // 对角箭头（左上 - 右下）
+#define MOUSE_CUR_D2     6    // 对角箭头（右上 - 左下）
+#define MOUSE_CUR_MOVE   7    // 四向移动
+void        mouse_set_cursor64(int shape);      // 外壳切换；变化时打点（同一形状重复设置不打点）
+int         mouse_get_cursor64();
+const char* mouse_cursor_name64(int shape);
+// ★ P5：Ctrl+Shift+<字母> 的**按键时刻**修饰键状态（外壳稍后取走）。
+//   为什么要有：外壳（gui64）处理按键时，QEMU sendkey 的"松开"可能早就到了 ——
+//   kbd_ctrl_pressed() 已经变回 false，于是"Ctrl+Shift+W"这种组合热键会被漏掉
+//   （实测：客人空闲时能命中，忙一帧就 0 命中）。这里在**按键那一刻**把字母记下来。
+//   语义：1 = 有一个待处理的 Ctrl+Shift+字母（*out = 大写字母）；取走即清空。
+bool kbd_ctrl_shift_char64(char* out);
 uint32_t mouse_press_tick64();
 void mouse_drain();                   // 清空按键/事件状态
