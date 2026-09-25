@@ -99,6 +99,13 @@
 #include "userdb64.h"
 #include "locklogin64.h"
 
+// ★ 版本号唯一真源 = build64.sh 的 VIMTUOS_VERSION（编译期宏，发布时只改那一处）。
+//   独立编译这个文件（例如 IDE 语法检查）而没有该宏时，如实打 unknown，不编造版本号
+//   （与 kernel/settings64.cpp 的 about 页同一写法）。
+#ifndef VIMTUOS_VERSION_STR
+#define VIMTUOS_VERSION_STR "unknown"
+#endif
+
 // ==================== 常量 ====================
 #define TERM_MAX_INST    4          // 多开上限（照 32 位；第 5 次只激活最新的）
 #define TERM_CHAR_SCALE  2          // 格高基准（8x8 × 2 = 16px；ASCII 字形现在来自等宽面 TTF）
@@ -817,7 +824,7 @@ static void cmd_help(TerminalState* ts) {
 }
 
 static void cmd_ver(TerminalState* ts) {
-    ts_puts(ts, "VimtuOS 0.1.0 x86_64 (VimtuOS 64-bit)\n");
+    ts_puts(ts, "VimtuOS " VIMTUOS_VERSION_STR " x86_64 (VimtuOS 64-bit)\n");
     ts_puts(ts, "  arch: x86_64 long mode, 4-level paging, page size ");
     ts_put_u64(ts, (uint64_t)PAGE_SIZE_64);
     ts_puts(ts, " bytes\n");
@@ -3469,7 +3476,7 @@ static bool cmd_proc(TerminalState* ts, const char* sub, const char* arg1, const
 
 static void cmd_about(TerminalState* ts) {
     ts_puts(ts,
-        "VimtuOS 0.1.0 (VimtuOS 64-bit)\n"
+        "VimtuOS " VIMTUOS_VERSION_STR " (VimtuOS 64-bit)\n"
         "  - 64-bit x86 kernel, long mode, hand-written GDT/IDT/PIC/PIT/RTC\n"
         "  - 4-level paging (4KB pages), kernel heap + physical page pool\n"
         "  - drivers: PS/2 keyboard + mouse, VBE LFB framebuffer, TrueType fonts\n"

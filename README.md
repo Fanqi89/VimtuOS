@@ -341,7 +341,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | M15 | **NVMe 驱动（item 6）**：PCI `0x010802` + BAR0(64 位 MMIO) + admin/I-O 队列 + 轮询 PRP 读写 → **驱动器号 `16..`**（上层零改动）→ 可装到 NVMe 盘、**UEFI 从这块盘启动进桌面** | ✅ |
 | M16 | **USB 存储（U 盘只读，批次 O）**：UHCI 上认 Mass Storage BOT（Class=08/SubClass=06/Protocol=0x50）→ 批量传输（TD 链 + toggle + 短包 + 有界超时）→ CBW/CSW + SCSI `INQUIRY`/`READ CAPACITY(10)`/`READ(10)` → **驱动器号 `24..`**（`drive64`/`fat64`/`explorer64` 零改动）→ U 盘 FAT32 只读浏览 + **把 .vap/.elf 从 U 盘拷进 C:**（宿主侧逐字节核对） | ✅ |
 | M17 | **Windows 11 现代外观 + Rust 接入（批次 P1）**：`theme64`（设计 Token 唯一真源）+ `gfx64`（圆角/双层阴影/毛玻璃/壁纸 6 适应模式）+ `img64`（PNG/BMP 解码，JPEG 未支持）+ **居中靠下 Dock** + **7 套主题**；`gui_rs`（`#![no_std]` Rust）作为 Token/主题配色真源**只链系统内核** | ✅ |
-| M18 | **锁屏 + 登录 + 多用户骨架（批次 P1c）**：`locklogin64`（锁屏 72px/18px、背景清晰→登录模糊 20px、104px 头像、360×48 密码框）+ `userdb64`（`/etc/users.db` 加盐 SHA-256×1000；`su`/`sudo` 只改会话身份；root 不在登录界面；**权限位属 P4，尚未拦截**） | ✅ |
+| M18 | **锁屏 + 登录 + 多用户骨架（批次 P1c）**：`locklogin64`（锁屏 72px/18px、背景清晰→登录模糊 20px、104px 头像、360×48 密码框）+ `userdb64`（`/etc/users.db` 加盐 SHA-256×1000；`su`/`sudo` 只改会话身份；root 不在登录界面；**权限位自 P4 起真拦截**（owner/group/other rwx + `su`/`sudo` 真提权，见 M20）） | ✅ |
 | M19 | **开始菜单 + 四个二级弹窗 + 设备插拔 toast（批次 P2）**：`startmenu64`（居中 400×420、底边距 Dock 顶 11px、上圆角 24 下圆角 10、搜索框 + 2×4 固定网格、状态区四个线性图标、电源菜单、ESC 两级退出）+ `panels64`（通知/声音/网络/日历四弹窗：亚克力 + 双层浅阴影 + 1px 高光边 + 跟随主题 + 锚点跟随开始菜单 + 不压 Dock；设备 toast 右侧滑入 / 停 5s / 可关闭 / 堆叠）+ `input.cpp`（Caps 反转 Shift / Shift 切中英 / Intellimouse 4 字节滚轮） | ✅ |
 | M20 | **VimtuFS2 v4 权限（批次 P4）**：inode 128B 加 `uid@75 / gid@77 / mode@79` + **owner/group/other 三段 rwx 真拦截**（`-EACCES`(13) + `[PERM64] deny` 打点）+ 进程 uid/gid/euid/egid（fork/execve 继承）+ `geteuid/setuid/chmod/chown/umask/access/stat` 返回真值 + `su`/`sudo` 真提权（`[PERM64] cred`）；**v3/v2 旧卷可挂载可读写但不拦截** | ✅ |
 | M21 | **Windows 11 风格设置应用（批次 P3）**：`settings64` 重写为**左导航 240px + 卡片内容 + 六组**（系统：显示/声音/电源；个性化：主题 7 套/壁纸/颜色渐变/**壁纸适应模式（桌面与锁屏分别设置）**/Dock 长度·图标尺寸·间距/字体大小；网络：以太网真状态 + WiFi 无硬件；用户：头像（内置 3 + 本地 PNG）/改名；安全：密码设置与清空；关于：版本/驱动/GPU + 硬件检查），**全部实时生效并持久化**（改主题重启仍暗色 / 设密码重启必须输密码 / 清空密码直接进桌面）；顺带修掉**关于页版本号写死 `VimtuOS 0.1.0`**（改为 `build64.sh` 的编译期宏 `VIMTUOS_VERSION_STR`，发布只改一处） | ✅ |
@@ -605,7 +605,7 @@ shadows, acrylic glass, a bottom-centred Dock, **7 themes** and **6 wallpaper fi
 PNG/BMP decode — JPEG is not supported), a **Rust `gui_rs` crate** (`#![no_std]`, no alloc, no float) as the
 token/theme source of truth linked into the **system kernel only** (0 Rust symbols in the installer kernel),
 and a **lock screen + login + multi-user skeleton** (`/etc/users.db`, salted SHA-256 x1000; `su`/`sudo` switch
-only the session identity; permission bits are **not** enforced yet — that is P4, and the salt is not a CSPRNG).
+the session identity **and really elevate since P4** — permission checks are enforced now (VimtuFS2 v4: owner/group/other rwx with `-EACCES` + `[PERM64] deny`; root bypasses DAC; v2/v3 legacy volumes are exempt and print an honest legacy notice — see the boundaries); the salt is not a CSPRNG).
 
 The latest batch (P3) rewrites the **Settings app** as a Windows 11-style window: a **240px left navigation** with six
 groups (System / Personalisation / Network / Users / Security / About), card content, and **everything takes effect live

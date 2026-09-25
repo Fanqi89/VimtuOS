@@ -499,7 +499,7 @@ def cap_rust():
           "字节级链接标记 \"RUST64-GUI-TOKENS-THEME-1\"：命中 %d" % tag,
           "验收脚本 tests/rust64_test.py：%s（nm/objdump 符号 + 安装内核 0 符号 + 体积上限 + 串口 accent 与源码比对）"
           % ("有" if tst else "★ 缺"),
-          "实测串口：\"[RUST64] tokens ok themes=6 accent=#00549E selftest PASS theme=0 name=白色(默认)\"；终端 `rust [tokens|set N]`"]
+          "实测串口：\"[RUST64] tokens ok themes=7 accent=#00549E selftest PASS theme=0 name=白色(默认)\"；终端 `rust [tokens|set N]`"]
     done = n and exp and bld and lnk and boot and tag and tst
     return ("DONE" if done else "PARTIAL"), ev
 
