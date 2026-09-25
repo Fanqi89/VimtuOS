@@ -1421,6 +1421,30 @@ CAPS = [
     ("内核", "每进程 fd 表 + fd 继承 + O_APPEND + pipe（批次 D）", cap_fd64_batch_d),
     ("内核", "UEFI 运行期 CR3 实验（方案 A/B，默认不编；两条固件路径实测）", cap_uefi_cr3_experiment),
     ("内核", "文件系统（真实 VFS）", cap_filesystem),
+def cap_users_login():
+    """★ 锁屏 + 登录 + 多用户骨架：LOCK→LOGIN→DESKTOP，用户库落 VimtuFS2，su/sudo 会话身份。"""
+    need = ["kernel/locklogin64.h", "kernel/locklogin64.cpp", "kernel/userdb64.h", "kernel/userdb64.cpp"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    n = lines("kernel/locklogin64.cpp") + lines("kernel/userdb64.cpp")
+    lk = grep_count(r"LOCK64|lock screen shown", ["kernel/locklogin64.cpp"])
+    lg = grep_count(r"LOGIN64|login screen shown|blur anim", ["kernel/locklogin64.cpp"])
+    us = grep_count(r"USER64|userdb|passwd", ["kernel/userdb64.cpp"])
+    hk = grep_count(r"sha256|salt", ["kernel/userdb64.cpp"])
+    cmd = grep_count(r"useradd|passwd|whoami|sudo", ["kernel/terminal64.cpp"])
+    tst = exists("tests/locklogin64_test.py")
+    ev = ["locklogin64.cpp + userdb64.cpp = %d 行（LOCK/LOGIN/DESKTOP 状态机 + 用户库 + 会话身份）" % n,
+          "锁屏打点：命中 %d；登录界面/模糊动画打点：命中 %d" % (lk, lg),
+          "用户库/口令打点：命中 %d；加盐哈希（sha256/salt）：命中 %d" % (us, hk),
+          "终端命令（useradd/passwd/whoami/sudo/loginctl 等）：命中 %d" % cmd,
+          "验收脚本 tests/locklogin64_test.py：%s（88 条断言：锁屏字号 72/18px、背景清晰 vs 登录后模糊 20px、"
+          "密码框 360x48 + 确认 48x48、ESC 反向动画 20→0、软重启后仍锁屏、两用户桌面互不可见、su/sudo/exit）"
+          % ("有" if tst else "★ 缺"),
+          "实测串口：\"[LOCK64] lock screen shown … blur_bg=0 why=boot\"、\"[LOGIN64] login ok user=vimtu uid=1000 via=click\"、"
+          "\"[USER64] passwd ok … algo=sha256 iter=1000 salt=16B（plaintext never stored）\"、"
+          "\"[USER64] su ok from=vimtu to=root euid=0 gui=vimtu gui_unchanged=1\"",
+          "边界（如实）：权限位尚未拦截（P4）；口令哈希=盐(rdtsc 非 CSPRNG)+SHA-256×1000；头像 JPEG 不支持；每用户桌面 UI 未展开"]
     ("内核", "★ VimtuFS2 目录树 v3（多级路径 + inode 时间戳 + 类型判定；v2 旧卷仍可挂载）", cap_fs_tree),
     ("内核", "★ VimtuFS2 大文件（二级间接块，单文件上限 8 MiB）", cap_fs_bigfile),
     ("存储", "★ 盘符与驱动器枚举（C: = 系统卷 + D:/E:… 盘符表；ESP/未知不占字母但列出）", cap_drive_layer),
@@ -1440,6 +1464,7 @@ CAPS = [
     ("存储", "★ USB 存储（U 盘只读，可从 U 盘拷应用）", cap_usb_storage),
     ("内核", "APIC 启用", cap_apic_enable),
     ("内核", "SMP（启动 AP）", cap_smp_ap),
+    ("应用", "★ 锁屏 + 登录 + 多用户骨架（/etc/users.db 加盐哈希；su/sudo 会话身份；root 不在登录界面）", cap_users_login),
 ]
 
 TESTS = [
@@ -1483,6 +1508,8 @@ TESTS = [
     ("display_runtime_test.py", "运行期显示层：模式清单 + 0x3DA 实测/如实降级 + EDID 对比 + DDC 未实现说明"),
     ("fs_term_test.py", "终端真文件系统：write/ls/df/ring3 读 + 冷启动第二遍 cat 跨重启读回 + rm"),
     ("fonts64_test.py", "四个字体面：[FONT64] faces/selftest/中英 1:2/兜底命中 + 终端等宽像素（ASCII 8px 半格）"),
+    ("locklogin64_test.py", "★ P1c 锁屏/登录/多用户：时间 72px/年月日 18px、背景清晰→登录后模糊 20px(250-350ms)、"
+                            "头像与密码框/确认按钮像素、ESC 返回、重启仍锁屏、两用户桌面隔离、su/sudo/exit（88 条断言）"),
     ("fd64_test.py", "批次 D FD 语义：每进程 fd 表 + dup 共享游标 + fork 继承 + O_APPEND + pipe 环回"),
     ("uefi_cr3_experiment_test.py", "批次 D UEFI 运行期 CR3 实验：方案 A/B 两方案 + QEMU/OVMF 与 VMware EFI 实测"),
     ("fs_tree_test.py", "★ VimtuFS2 v3 目录树 + 盘符层：安装->格式化(v3)->多级 mkdir->子目录写文件->冷启动 stat/mtime/遍历/删除；"
