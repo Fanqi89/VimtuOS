@@ -734,8 +734,11 @@ def main():
             time.sleep(0.6)
 
         print("=== 6) 壁纸 6 种适应模式（几何 + 定位标记像素）===")
-        mk = re.search(r"\[GFX64\] wall markers r=(\d+),(\d+) g=(\d+),(\d+) b=(\d+),(\d+) y=(\d+),(\d+) size=(\d+)", vm.log())
+        mk = re.search(r"\[GFX64\] wall markers r=(\d+),(\d+) g=(\d+),(\d+) b=(\d+),(\d+) y=(\d+),(\d+) size=(\d+)(?: markers_drawn=(\d+))?", vm.log())
         check("[GFX64] wall markers 打点（4 个定位标记）", mk is not None, mk.group(0) if mk else "（无）")
+        # ★ 计量证据（本批加的内核打点）：内置壁纸真的落笔了 4 个定位标记；老内核没有该字段就跳过
+        if mk is not None and mk.group(10) is not None:
+            check("内置壁纸画了 4 个定位标记（markers_drawn=4）", mk.group(10) == "4", "markers_drawn=%s" % mk.group(10))
         marks = {}
         if mk:
             marks["r"] = (int(mk.group(1)), int(mk.group(2)))
@@ -756,7 +759,12 @@ def main():
                 mon.key("ctrl-shift-n", wait=1.0)
                 wl = vm.wait_log("[GFX64] wall mode=%d name=%s" % (want_mode, want_name), 30)
             check("模式 %d（%s）生效并打了几何行" % (want_mode, want_name), wl)
-            time.sleep(2.5)
+            # ★ 截图前等**这一帧真的画完**：TCG 下壁纸 + 整屏模糊重建要 0.3~0.4s（机器有负载时数秒），
+            #   原来固定 sleep 2.5s 会拍到上一帧（定位标记像素断言假失败 = 本批"壁纸模式回归"的真相）。
+            #   判据同第 5 节：wall 行之后出现一行 [UI] clock text=（时钟是在这一帧画到 Dock 时才打的）。
+            if not wait_repaint64(vm, 0 if want_mode == 0 else before, timeout=60 if want_mode else 10):
+                print("      （等整屏重画超时，按现状截图）")
+            time.sleep(0.6)
             spawn = os.path.join(tmp, "wall%d.ppm" % want_mode)
             mon.shot(spawn, wait=3.0)
             ww, wh, pxw = read_ppm(spawn)

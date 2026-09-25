@@ -41,6 +41,11 @@ static inline int cc_b(uint32_t c) { return (int)(c & 0xFF); }
 //   v/255 用 (v*257+128)>>16 近似：对 0..65535 的 v 误差 <= 1 级，肉眼与验收都无差。
 static inline int div255_64(int v) { return (v * 257 + 128) >> 16; }
 
+// 窗口和归一化（盒子模糊 v/win）：win <= 4097 时 v <= 255*win < 2^20，
+// floor(v*inv >> 40) == v / win 精确相等（inv = ceil(2^40/win)，误差 v/2^40 < 1/win）。
+// 省掉整屏模糊里 4 * W * H 次整数除（1280x800 = 400 万次；QEMU TCG 下每次几十周期）。
+static inline int div_win40_64(int v, uint64_t inv40) { return (int)((uint64_t)(uint32_t)v * inv40 >> 40); }
+
 static inline uint32_t blend_c64(uint32_t dst, uint32_t c, int a) {
     if (a >= 255) return c & 0x00FFFFFF;
     if (a <= 0) return dst;
@@ -413,12 +418,15 @@ void gfx64_shadow64(int x, int y, int w, int h, int r, const Theme64Tokens* t) {
 static void box_blur_buf64(uint32_t* buf, int w, int h, int r) {
     if (r <= 0 || w <= 0 || h <= 0) return;
     static uint32_t scratch[4096];
+    // ★ 性能（TCG）：归一化 v/win 在 QEMU TCG 下每次整数除要几十周期，整屏模糊要做
+    //   4 * W * H = 400 万次（1280x800, r=24）。改成 40 位定点倒数乘法（见 div_win40_64）。
+    const int win = 2 * r + 1;
+    const uint64_t win_inv = ((1ULL << 40) + (uint64_t)win - 1) / (uint64_t)win;
     for (int pass = 0; pass < 2; pass++) {
         for (int y = 0; y < h; y++) {
             uint32_t* row = buf + (uint64_t)y * w;
             const int n = w > 4096 ? 4096 : w;
             for (int i = 0; i < n; i++) scratch[i] = row[i];
-            const int win = 2 * r + 1;
             int sr = 0, sg = 0, sb = 0;
             for (int i = -r; i <= r; i++) {
                 const int xi = i < 0 ? 0 : (i >= w ? w - 1 : i);
@@ -426,7 +434,9 @@ static void box_blur_buf64(uint32_t* buf, int w, int h, int r) {
                 sr += cc_r(c); sg += cc_g(c); sb += cc_b(c);
             }
             for (int x = 0; x < w; x++) {
-                row[x] = (uint32_t)(((sr / win) << 16) | ((sg / win) << 8) | (sb / win));
+                row[x] = (uint32_t)(((uint32_t)div_win40_64(sr, win_inv) << 16) |
+                                    ((uint32_t)div_win40_64(sg, win_inv) << 8) |
+                                    (uint32_t)div_win40_64(sb, win_inv));
                 const int xa = x - r, xb = x + r + 1;
                 const int ia = xa < 0 ? 0 : (xa >= w ? w - 1 : xa);
                 const int ib = xb < 0 ? 0 : (xb >= w ? w - 1 : xb);
@@ -440,7 +450,6 @@ static void box_blur_buf64(uint32_t* buf, int w, int h, int r) {
         for (int x = 0; x < w; x++) {
             const int n = h > 4096 ? 4096 : h;
             for (int i = 0; i < n; i++) scratch[i] = buf[(uint64_t)i * w + x];
-            const int win = 2 * r + 1;
             int sr = 0, sg = 0, sb = 0;
             for (int i = -r; i <= r; i++) {
                 const int yi = i < 0 ? 0 : (i >= h ? h - 1 : i);
@@ -448,7 +457,9 @@ static void box_blur_buf64(uint32_t* buf, int w, int h, int r) {
                 sr += cc_r(c); sg += cc_g(c); sb += cc_b(c);
             }
             for (int y = 0; y < h; y++) {
-                buf[(uint64_t)y * w + x] = (uint32_t)(((sr / win) << 16) | ((sg / win) << 8) | (sb / win));
+                buf[(uint64_t)y * w + x] = (uint32_t)(((uint32_t)div_win40_64(sr, win_inv) << 16) |
+                                                    ((uint32_t)div_win40_64(sg, win_inv) << 8) |
+                                                    (uint32_t)div_win40_64(sb, win_inv));
                 const int ya = y - r, yb = y + r + 1;
                 const int ia = ya < 0 ? 0 : (ya >= h ? h - 1 : ya);
                 const int ib = yb < 0 ? 0 : (yb >= h ? h - 1 : yb);
@@ -602,11 +613,17 @@ static const uint32_t* g_surface_src = nullptr;
 static char g_wall_geom[320] = {0};
 static int  g_wall_log_budget = 12;        // [GFX64] wall 行上限（防刷屏）
 static uint64_t g_wall_build_count = 0;
+// ---- 计量（回归定位用）：内置壁纸生成/铺图/模糊各段 ticks + 实际画出的定位标记数 ----
+static uint64_t g_wall_markers_drawn = 0;   // 每次 gfx64_wall_build_default64 里真实落笔的标记数（4 = 正常）
+static uint64_t g_wall_build_ticks = 0;     // 最近一次 gfx64_wall_build_default64 用时
+static uint64_t g_wall_compose_ticks = 0;   // 最近一次 wall_compose64 像素铺图用时（不含模糊）
+static uint64_t g_wall_blur_ticks = 0;      // 最近一次整屏模糊用时
 
 // ---- 内置壁纸生成（也是模糊证据的载体：细颗粒在玻璃下被抹平）----
 // 组成：主题渐变（对角） + 网格柔光斑（160 间距，半径 62） + 细颗粒（±4） + 4 个定位标记
 //   标记（16x16，不透明，写在最后）：红 TL(96,96) 绿 TR(1088,96) 蓝 BL(96,788) 黄 BR(1088,788)
 void gfx64_wall_build_default64() {
+    const uint64_t t_build0 = ticks64();
     const Theme64Tokens* t = theme64_tokens64();
     if (g_wallpx) { kfree_64(g_wallpx); g_wallpx = nullptr; }
     g_wallw = GFX64_DEF_W;
@@ -651,16 +668,21 @@ void gfx64_wall_build_default64() {
         { GFX64_DEF_INSET,                    GFX64_DEF_H - GFX64_DEF_INSET - GFX64_DEF_MARK, rgb(48, 64, 192), "b" },
         { GFX64_DEF_W - GFX64_DEF_INSET - GFX64_DEF_MARK, GFX64_DEF_H - GFX64_DEF_INSET - GFX64_DEF_MARK, rgb(224, 192, 48), "y" },
     };
+    int marks_drawn = 0;
     for (int m = 0; m < 4; m++) {
+        bool in_range = true;
         for (int y = marks[m].y; y < marks[m].y + GFX64_DEF_MARK; y++) {
-            if (y < 0 || y >= g_wallh) continue;
+            if (y < 0 || y >= g_wallh) { in_range = false; continue; }
             uint32_t* row = g_wallpx + (uint64_t)y * g_wallw;
             for (int x = marks[m].x; x < marks[m].x + GFX64_DEF_MARK; x++) {
-                if (x < 0 || x >= g_wallw) continue;
+                if (x < 0 || x >= g_wallw) { in_range = false; continue; }
                 row[x] = marks[m].c;
             }
         }
+        if (in_range) marks_drawn++;
     }
+    g_wall_markers_drawn = (uint64_t)marks_drawn;
+    g_wall_build_ticks = ticks64() - t_build0;
     g_wall_desc = "builtin(default wallpaper)";
     dbg64_line_begin64();
     dbg64_str("[GFX64] wall markers r=");
@@ -670,6 +692,10 @@ void gfx64_wall_build_default64() {
     dbg64_str(" y="); dbg64_dec((uint64_t)marks[3].x); dbg64_str(","); dbg64_dec((uint64_t)marks[3].y);
     dbg64_str(" size=");
     dbg64_dec((uint64_t)GFX64_DEF_MARK);
+    dbg64_str(" markers_drawn=");
+    dbg64_dec((uint64_t)marks_drawn);
+    dbg64_str(" build_ticks=");
+    dbg64_dec(g_wall_build_ticks);
     dbg64_str(" src=");
     dbg64_dec((uint64_t)g_wallw); dbg64_str("x"); dbg64_dec((uint64_t)g_wallh);
     dbg64_nl();
@@ -839,24 +865,27 @@ static void wall_compose64() {
     for (uint64_t i = 0; i < (uint64_t)W * H; i++) g_surface[i] = t->desktop_base;
     // 2) 铺图
     const bool tile = (mode == GFX64_WALL_TILE);
-    const bool stretch = (mode == GFX64_WALL_STRETCH);
+    // ★ 性能：行常量（sy16/sy）在 x 循环外算一次 —— 原来每个像素都要做一次 64 位除法
+    //   （1280x800 就是 100 万次；QEMU TCG 下占可见比例），值不变。
     for (int y = 0; y < H; y++) {
         // ★ 平铺模式：图块会**重复**到 dst 之外，所以不能按 dst 裁剪（否则右边/下边留底色）
         if (!tile && (y < dy || y >= dy + dh)) continue;
         uint32_t* row = g_surface + (uint64_t)y * W;
+        int sy16 = 0;
+        if (tile) {
+            int sy = (y - dy) % g_wallh; if (sy < 0) sy += g_wallh;
+            sy16 = sy << 16;
+        } else {
+            sy16 = (int)(((int64_t)(y - dy) * g_wallh << 16) / dh);
+        }
         for (int x = 0; x < W; x++) {
             if (!tile && (x < dx || x >= dx + dw)) continue;
-            int sx16, sy16;
+            int sx16;
             if (tile) {
                 int sx = (x - dx) % g_wallw; if (sx < 0) sx += g_wallw;
-                int sy = (y - dy) % g_wallh; if (sy < 0) sy += g_wallh;
-                sx16 = sx << 16; sy16 = sy << 16;
-            } else if (stretch) {
-                sx16 = (int)(((int64_t)(x - dx) * g_wallw << 16) / dw);
-                sy16 = (int)(((int64_t)(y - dy) * g_wallh << 16) / dh);
+                sx16 = sx << 16;
             } else {
                 sx16 = (int)(((int64_t)(x - dx) * g_wallw << 16) / dw);
-                sy16 = (int)(((int64_t)(y - dy) * g_wallh << 16) / dh);
             }
             row[x] = src_sample64(sx16, sy16);
         }
@@ -866,7 +895,10 @@ static void wall_compose64() {
     // 3) 墙纸模糊：**只算一次**（背景层玻璃 = r=Token 24）
     if (g_surface_blur) {
         for (uint64_t i = 0; i < (uint64_t)W * H; i++) g_surface_blur[i] = g_surface[i];
+        const uint64_t t_blur0 = ticks64();
         box_blur_buf64(g_surface_blur, W, H, THEME64_BLUR_BACKDROP);
+        g_wall_blur_ticks = ticks64() - t_blur0;
+        g_wall_compose_ticks = t1 - t0;
         dbg64_line_begin64();
         dbg64_str("[GFX64] wall blur once r=");
         dbg64_dec((uint64_t)THEME64_BLUR_BACKDROP);
@@ -874,6 +906,8 @@ static void wall_compose64() {
         dbg64_dec((uint64_t)W); dbg64_str("x"); dbg64_dec((uint64_t)H);
         dbg64_str(" compose_ticks=");
         dbg64_dec((uint64_t)(t1 - t0));
+        dbg64_str(" blur_ticks=");
+        dbg64_dec(g_wall_blur_ticks);
         dbg64_str(" ticks=");
         dbg64_dec((uint64_t)(ticks64() - t0));
         dbg64_str(" builds=");
@@ -907,18 +941,40 @@ static void wall_ensure64() {
     if (!g_surface_valid || g_surface_theme != theme64_id64() || g_surface_mode != g_mode ||
         g_surface_src != g_wallpx || g_sw != fb_width() || g_sh != fb_height()) {
         panic64_watchdog_pause64();
+        const uint64_t t_ensure0 = ticks64();
         // ★ 整屏壁纸 + 模糊面重建在 QEMU TCG 下单次要几秒（切主题/切适应模式都会走这里），
         //   而 GUI 帧心跳的看门狗阈值只有 5s —— 这是**正常的长操作**，不是卡死。
         //   照 kernel/terminal64.cpp 对"大文件 I/O 长操作"的既有做法：暂停看门狗，做完再恢复
         //   （pause/unpause 都会刷新 kick 时间）。不这么做时，主题切换在 TCG 下会偶发
         //   [WD64] watchdog fire stale≈5.1s -> [PANIC64] WATCHDOG_TIMEOUT（本批实测踩到）。
         // 主题变了 → 内置壁纸要按新主题重生成（文件壁纸不受主题影响）
+        uint64_t t_build = 0;
         if (g_wall_desc && g_wall_desc[0] == 'b' && g_surface_theme != theme64_id64()) {
+            const uint64_t tb = ticks64();
             gfx64_wall_build_default64();
+            t_build = ticks64() - tb;
             g_wall_log_budget = 12;
         }
         wall_compose64();
+        const uint64_t t_ensure = ticks64() - t_ensure0;
         panic64_watchdog_unpause64();
+        dbg64_line_begin64();
+        dbg64_str("[GFX64] wall ensure rebuild=1 build_ticks=");
+        dbg64_dec(t_build);
+        dbg64_str(" compose_ticks=");
+        dbg64_dec(g_wall_compose_ticks);
+        dbg64_str(" blur_ticks=");
+        dbg64_dec(g_wall_blur_ticks);
+        dbg64_str(" total_ticks=");
+        dbg64_dec(t_ensure);
+        dbg64_str(" markers_drawn=");
+        dbg64_dec(g_wall_markers_drawn);
+        dbg64_str(" src_wh=");
+        dbg64_dec((uint64_t)g_wallw); dbg64_str("x"); dbg64_dec((uint64_t)g_wallh);
+        dbg64_str(" mode=");
+        dbg64_dec((uint64_t)g_mode);
+        dbg64_nl();
+        dbg64_line_end64();
     }
 }
 
