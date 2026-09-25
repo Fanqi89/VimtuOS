@@ -126,6 +126,9 @@ static const Cfg64Def kDefs[] = {
     { "ui.def.vap",        CFG64_T_STR,  0,    "term"    }, //              .vap  -> 终端
     { "ui.def.txt",        CFG64_T_STR,  0,    "term"    }, //              .txt  -> 终端
     { "ui.def.video",      CFG64_T_STR,  0,    ""        }, //              视频类 -> 无（本系统没有播放器）
+    // ★ P5：桌面交互细节（右键菜单/玻璃选择框/回收站/桌面图标集合）
+    { "ui.desktop.icons",  CFG64_T_STR,  0,    "0,1,2|"  }, // 桌面集合|回收站集合（"0,1,2|" = 默认三项，兼容旧行为）
+    { "ui.explorer.show_system", CFG64_T_INT, 0, nullptr  }, // 0 = 隐藏系统分区（默认）1 = 显示（终端/设置可开）
 };
 #define CFG64_DEF_N ((int)(sizeof(kDefs) / sizeof(kDefs[0])))
 // 启动日志里最多逐条打印多少个默认值（避免刷屏；总数单独打一行）
@@ -794,6 +797,18 @@ void cfg64_set_sound_vol64(int vol) {
 }
 int  cfg64_sound_src64() { return config64_get_int64("ui.sound.src", 0) ? 1 : 0; }
 void cfg64_set_sound_src64(int src) { config64_set_int64("ui.sound.src", src ? 1 : 0); }
+
+// ★ P5：桌面图标集合（desktopops64 读写）："<桌面集合>|<回收站集合>"，如 "0,1,2|"。
+// 空串 = 桌面一个图标都不显示（用户把图标都删了）；默认值 "0,1,2|" 与旧行为完全一致。
+int  cfg64_desktop_icons64(char* out, int out_max) {
+    return config64_get_str64("ui.desktop.icons", "0,1,2|", out, out_max);
+}
+void cfg64_set_desktop_icons64(const char* set) {
+    config64_set_str64("ui.desktop.icons", set ? set : "0,1,2|");
+}
+// ★ P5：文件资源管理器是否显示系统分区（0 = 隐藏，默认；需求原文："系统分区默认是隐藏状态的"）
+int  cfg64_explorer_show_system64() { return config64_get_int64("ui.explorer.show_system", 0) ? 1 : 0; }
+void cfg64_set_explorer_show_system64(int on) { config64_set_int64("ui.explorer.show_system", on ? 1 : 0); }
 
 const char* cfg64_defapp_key64(int kind) {
     switch (kind) {

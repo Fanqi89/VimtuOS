@@ -104,6 +104,7 @@
 #include "apic64.h"          // IRQ_MODE64_*（中断路由）
 #include "hwinfo64.h"        // CPUID + PCI 枚举 + 磁盘
 #include "userdb64.h"        // 用户表 / 加盐哈希 / /etc/users.db
+#include "desktopops64.h"    // ★ P5：恢复默认桌面图标 / 显示隐藏分区（本页唯一新增入口）
 
 // gui64.cpp 提供的 Dock 几何热重载（★ P3 新增的小接线：改完 Dock 长度/图标/间距立刻重算 + 再打
 // 一行 [DOCK64] geom 作为几何变化的证据；不动外壳的 Dock 绘制逻辑）。
@@ -193,6 +194,7 @@ enum {
     CID_UNAME_FIELD = 150, CID_UNAME_APPLY = 151,
     CID_PW_FIELD = 160, CID_PW_APPLY = 161, CID_PW_CLEAR = 162,
     CID_HW_CHECK = 170, CID_HW_BACK = 171,
+    CID_DESK_RESET = 180, CID_SHOW_SYS = 181,     // ★ P5：恢复默认桌面图标 / 显示隐藏分区（个性化页）
     CID_RES_LIST = 200,            // 展开的分辨率下拉（列表项 = 200 + 下标）
 };
 // 控件种类（决定绘制与"按下态/选中态"的画法）
@@ -1704,6 +1706,38 @@ static void page_dock(const Lay* L, int x0, int y0) {
         ctl_reg(P_DOCK, CID_DOCK_RESET, CK_BUTTON, bx, ry + (L->row_h - bh) / 2, bw, bh);
         ry += L->row_h;
     }
+    // ==================== ★ P5：桌面图标 / 隐藏分区（**本批唯一新增的设置入口**）====================
+    // 需求原文："当桌面上的快捷图标删掉了或者桌面上没有某个快捷方式图标，可以在设置中把快捷图标调回来"
+    //          + "文件资源管理器只能显示可见分区，系统分区默认是隐藏状态的"。
+    // 只加这一张两行的卡（两个控件），不改本页/本文件其它结构；**栈占用尽量小**（去掉临时字符串/缓冲）。
+    {
+        const int y2 = y + c1h + 12;
+        // ★ 不新建卡片/不再申请阴影 mask（gfx64 的阴影缓存压力已经很大：长会话里再要一张会卡住），
+        //   直接放在页面内容区（视觉上仍是"个性化页里的一块入口"）。
+        int r2 = y2;
+        {
+            int rx = 0;
+            row_label(L, r2, zh ? "桌面图标 / 恢复默认" : "Desktop icons / restore", nullptr, &rx);
+            const int bw = 190, bh = 32;
+            const int bx = rx - bw;
+            draw_button(bx, r2 + (L->row_h - bh) / 2, bw, bh,
+                        zh ? "恢复默认桌面图标" : "Restore default icons", 0,
+                        g_hover == CID_DESK_RESET, g_press == CID_DESK_RESET);
+            ctl_reg(P_DOCK, CID_DESK_RESET, CK_BUTTON, bx, r2 + (L->row_h - bh) / 2, bw, bh);
+            r2 += L->row_h;
+        }
+        {
+            int rx = 0;
+            row_label(L, r2, zh ? "显示隐藏分区（系统分区默认隐藏）" : "Show hidden partitions",
+                      nullptr, &rx);
+            const int sw = 44, sh = 22;
+            const int sx = rx - sw;
+            const int sy = r2 + (L->row_h - sh) / 2;
+            draw_switch(sx, sy, explorer64_show_system64(), g_hover == CID_SHOW_SYS, g_press == CID_SHOW_SYS);
+            ctl_reg(P_DOCK, CID_SHOW_SYS, CK_SWITCH, sx, sy, sw, sh);
+            r2 += L->row_h;
+        }
+    }
     {
         Buf b; b_init(&b);
         b_str(&b, zh ? "实际生效：" : "in effect: ");
@@ -2646,6 +2680,16 @@ static void set_click(Window* w, int cx, int cy0) {
         case CID_FIT_SYNC:
             cfg64_set_wall_sync64(cfg64_wall_sync64() ? 0 : 1);
             log_num("[SET64] wall sync=", (uint64_t)cfg64_wall_sync64());
+            break;
+        // ---- ★ P5：桌面图标 / 隐藏分区（唯一新增的两处入口）----
+        case CID_DESK_RESET:
+            desktopops64_restore_defaults64("settings");
+            msg_set(gui64_lang_zh() ? "已恢复默认桌面图标（含回收站内容）" : "default desktop icons restored", tk64()->accent);
+            break;
+        case CID_SHOW_SYS:
+            explorer64_set_show_system64(explorer64_show_system64() ? 0 : 1, "settings");
+            msg_set(gui64_lang_zh() ? "隐藏分区显示开关已切换（资源管理器已重扫）"
+                                    : "hidden partition switch toggled", tk64()->accent);
             break;
         // ---- Dock ----
         case CID_DOCK_LEN: case CID_DOCK_ICON: case CID_DOCK_GAP:

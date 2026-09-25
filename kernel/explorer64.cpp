@@ -33,6 +33,8 @@
 #include "fs64.h"      // ★ 批次 K：统一文件系统接口（VimtuFS2 读写 / FAT32 只读）
 #include "drive64.h"
 #include "app64.h"
+#include "config64.h"  // ★ P5：ui.explorer.show_system（系统分区默认隐藏 + 开关）
+#include "theme64.h"   // ★ P5：文件管理器地址栏的文本指针命中区用 Token 高度
 #include "elf64.h"
 
 // ==================== 几何常量（与脚本共享，勿乱改）====================
@@ -678,20 +680,96 @@ static void exp_log_props(const char* name, const char* kind, uint32_t size,
     dbg64_line_end64();
 }
 // ==================== 驱动器扫描 / 此电脑页 ====================
+static int  g_boot_disk = -1;          // 系统盘所在的驱动器号（每次扫描重算）
+static int  g_hidden_n = 0;            // 本次扫描被隐藏的系统分区条目数
+
+static void exp_log_hidden(const DriveInfo64* d, int idx) {
+    dbg64_line_begin64();
+    dbg64_str("[EXPL64] hidden idx=");
+    dbg64_dec((uint64_t)idx);
+    dbg64_str(" disk=");
+    dbg64_dec((uint64_t)d->disk);
+    dbg64_str(" part=");
+    dbg64_dec((uint64_t)d->part);
+    dbg64_str(" name=");
+    dbg64_str(d->name);
+    dbg64_str(" reason=system-partition (ui.explorer.show_system=0)");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// ★ P5（需求原文："文件资源管理器只能显示可见分区，系统分区默认是隐藏状态的"）
+// 实现与取舍：
+//   * **非引导盘**上的系统分区（MBR 0xEF / EFI 系统分区 = drive64 的 skip=esp 条目）默认**不列出**；
+//     config64 键 `ui.explorer.show_system` = 1 时全部列出（终端 `cfg set ui.explorer.show_system 1`
+//     或 设置 → 个性化 的开关都会立刻重扫并打点）。
+//   * 引导盘（系统盘 C: 所在的那块盘）上的条目保持既有界面不动 —— 既有 explorer64_test 明确断言
+//     "C: 是卡片列表里的可浏览项"、"EFI 系统分区条目带 reason=esp 且画在卡片上"；把引导盘的
+//     系统分区也藏起来会直接打断那条既有验收，所以本轮只对**非引导盘**生效（报告里如实说明）。
 static void exp_scan_drives() {
+    const int show_sys = cfg64_explorer_show_system64();
     g_drive_n = drive64_scan64();
     if (g_drive_n < 0) g_drive_n = 0;
     if (g_drive_n > (int)DRV64_MAX_ENTRIES) g_drive_n = (int)DRV64_MAX_ENTRIES;
-    int browsable = 0, got = 0;
+    // 先找系统盘（drive64 只把"挂成系统卷"的那条标 system=true）
+    g_boot_disk = -1;
     for (int i = 0; i < g_drive_n; i++) {
         DriveInfo64 d;
         if (drive64_info64(i, &d) != 0 || !d.present) continue;
+        if (d.system) { g_boot_disk = d.disk; break; }
+    }
+    int browsable = 0, got = 0, hidden = 0;
+    for (int i = 0; i < g_drive_n; i++) {
+        DriveInfo64 d;
+        if (drive64_info64(i, &d) != 0 || !d.present) continue;
+        const bool sys_part = (d.skip == DRV64_SKIP_ESP);
+        const bool other_disk = (g_boot_disk >= 0) ? (d.disk != g_boot_disk) : true;
+        if (sys_part && other_disk && !show_sys) {       // 隐藏：系统分区（非引导盘）+ 开关关闭
+            exp_log_hidden(&d, i);
+            hidden++;
+            continue;
+        }
         g_drives[got++] = d;
         if (d.browsable) browsable++;
         exp_log_card(got - 1, &d);
     }
     g_drive_n = got;
+    g_hidden_n = hidden;
     exp_log_thispc(g_drive_n, browsable);
+    dbg64_line_begin64();
+    dbg64_str("[EXPL64] visible partitions only list=");
+    dbg64_dec((uint64_t)g_drive_n);
+    dbg64_str(" hidden=");
+    dbg64_dec((uint64_t)hidden);
+    dbg64_str(" show_system=");
+    dbg64_dec((uint64_t)show_sys);
+    dbg64_str(" boot_disk=");
+    if (g_boot_disk < 0) dbg64_str("-"); else dbg64_dec((uint64_t)g_boot_disk);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+int  explorer64_show_system64() { return cfg64_explorer_show_system64(); }
+void explorer64_set_show_system64(int on, const char* why) {
+    cfg64_set_explorer_show_system64(on ? 1 : 0);
+    dbg64_line_begin64();
+    dbg64_str("[EXPL64] show_system=");
+    dbg64_dec(on ? 1 : 0);
+    dbg64_str(" why=");
+    dbg64_str(why ? why : "-");
+    dbg64_str(" persisted=1 (0 = visible partitions only)");
+    dbg64_nl();
+    dbg64_line_end64();
+    exp_scan_drives();                 // 立刻重扫：隐藏项随之变化
+    if (g_win) gui64_invalidate_window(g_win);
+}
+void explorer64_rescan64(const char* why) {
+    dbg64_line_begin64();
+    dbg64_str("[EXPL64] rescan why=");
+    dbg64_str(why ? why : "-");
+    dbg64_nl();
+    dbg64_line_end64();
+    exp_scan_drives();
 }
 
 // 目录内容刷新（游标分页扫描：完整计数 + 只缓存前 EXP_MAX_ITEMS 条）

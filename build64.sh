@@ -88,7 +88,9 @@ SRCS_DESKTOP="$SRCS_DESKTOP kernel/locklogin64.cpp kernel/userdb64.cpp"
 #   + P2 UI 工具箱：混合圆角/亚克力/线性图标）与 panels64（通知/声音/网络/日历 + 通知列表 + 设备 toast）。
 #   **只进系统内核**（安装介质没有桌面外壳，保持它的 4MB 预算不被这批代码吃掉）。
 SRCS_DESKTOP="$SRCS_DESKTOP kernel/startmenu64.cpp kernel/panels64.cpp"
-# 这四个子系统 + 批次 A 后半的两个：**只进系统内核**（安装介质不链它们；只有系统内核有 gui64/store64/app64）
+#  ★ 本批（P5：桌面交互细节）：desktopops64（桌面右键菜单 / 玻璃选择框 / 回收站 / 桌面图标集合，
+#   以及设置页那一处最小入口的两个后端）。**只进系统内核**（安装介质没有桌面外壳）。
+SRCS_DESKTOP="$SRCS_DESKTOP kernel/desktopops64.cpp"
 #   sysstate64 = 运行状态机 + 模块注册表 + 健康 + ring log（terminal 的 state/health/syslog）
 #   config64   = 类型化配置 KV，落在 store64（VimtuFS2 的 /store.a|b，真落盘）
 #   session64  = 会话/应用内容策略（关窗清状态、退出保存、启动恢复）
@@ -286,7 +288,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
     "$BUILD/os"/theme64.o "$BUILD/os"/gfx64.o "$BUILD/os"/img64.o \
     "$BUILD/os"/locklogin64.o "$BUILD/os"/userdb64.o \
-    "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o \
+    "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o \
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \

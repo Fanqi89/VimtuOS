@@ -166,3 +166,11 @@ void cfg64_set_sound_src64(int src);
 const char* cfg64_defapp_key64(int kind);          // 非法 kind -> ""
 int  cfg64_defapp64(int kind, char* out, int out_max);
 void cfg64_set_defapp64(int kind, const char* app);
+
+// ---- ★ P5：桌面交互细节（desktopops64 / explorer64 / settings64 共用）----
+// 桌面图标集合："<桌面集合>|<回收站集合>"，如 "0,1,2|"（= 默认三项，跨重启持久化）
+int  cfg64_desktop_icons64(char* out, int out_max);
+void cfg64_set_desktop_icons64(const char* set);
+// 文件资源管理器是否显示系统分区（0 = 隐藏，默认；1 = 显示）
+int  cfg64_explorer_show_system64();
+void cfg64_set_explorer_show_system64(int on);
