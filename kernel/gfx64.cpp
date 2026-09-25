@@ -229,7 +229,9 @@ void gfx64_stroke_round64(int x, int y, int w, int h, int r, uint32_t c, int a) 
 
 // ==================== 双层阴影（预生成 alpha mask + LRU）====================
 // mask 以 1/2 分辨率生成（ds=2）：阴影是低频渐变，最近邻放大肉眼无差，写入带宽省 3/4。
-#define GFX64_SH_SLOTS 6
+// ★ P2：开始菜单/四个弹窗/toast/电源按钮/头像再多 5 种 (w,h,r) 键 —— 6 槽会互相淘汰
+//   （每帧重建阴影 mask，实测帧率掉到 1~2Hz）。纯缓存，加槽不改变任何绘制结果。
+#define GFX64_SH_SLOTS 10
 struct Gfx64ShMask {
     bool     used;
     int      w, h, r;
@@ -346,6 +348,25 @@ static Gfx64ShMask* sh_mask_get64(int w, int h, int r, const char* why) {
     //   （写 +pad 会让形状在 mask 里整体偏移 2*pad，阴影会缺一半并错位。）
     if (s->near_m) mask_build64(s->near_m, s->nw, s->nh, -pad_n, -pad_n, w, h, r, THEME64_SH_N_BLUR);
     if (s->far_m)  mask_build64(s->far_m, s->fw, s->fh, -pad_f, -pad_f, w, h, r, THEME64_SH_F_BLUR);
+    // ★ 临时诊断（本批次调试阴影强度用；确认后可删）：把两条 mask 沿 Dock 中线的采样打进串口
+    if (s->near_m && s->far_m) {
+        const int row_n = s->nh / 2, row_f = s->fh / 2;
+        dbg64_line_begin64();
+        dbg64_str("[GFX64] shadow probe");
+        for (int off = -70; off <= 6; off += 8) {
+            const int mxn = (off + pad_n) / 2, mxf = (off + pad_f) / 2;
+            dbg64_str(" o=");
+            dbg64_dec((uint64_t)(unsigned)(off < 0 ? -off : off));
+            dbg64_str("/");
+            dbg64_str(off < 0 ? "L" : "I");
+            dbg64_str(" n=");
+            dbg64_dec((uint64_t)((mxn >= 0 && mxn < s->nw && row_n >= 0 && row_n < s->nh) ? s->near_m[(uint64_t)row_n * s->nw + mxn] : 0));
+            dbg64_str(" f=");
+            dbg64_dec((uint64_t)((mxf >= 0 && mxf < s->fw && row_f >= 0 && row_f < s->fh) ? s->far_m[(uint64_t)row_f * s->fw + mxf] : 0));
+        }
+        dbg64_nl();
+        dbg64_line_end64();
+    }
     dbg64_line_begin64();
     dbg64_str("[GFX64] shadow mask build w=");
     dbg64_dec((uint64_t)w);

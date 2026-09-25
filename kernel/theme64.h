@@ -158,3 +158,71 @@ int theme64_spring64(int t);
 // 主题切换热键（Ctrl+Shift+T 循环 / Ctrl+Shift+M 换壁纸模式 / Ctrl+Shift+R 减少动画）——
 // 由 gui64 的消息循环调用；返回 1 = 已消费（调用方不要再把字符喂给应用）
 int theme64_hotkey64(uint8_t c, int ctrl, int shift);
+
+// ==================== ★ P2：开始菜单 / 四个二级弹窗 / 设备通知（需求原文数字，改前先读需求）====================
+// ---- 开始菜单（屏幕水平居中；底边 = Dock 顶边上方 10~12px；上圆角 24 / 下圆角 10；竖直长方形、偏正方形、较小）----
+#define THEME64_SM_W            400     // 宽（"较小"：约屏宽 1/3）
+#define THEME64_SM_H            420     // 高（竖直长方形、偏正方形一点）
+#define THEME64_SM_R_TOP        24      // 上面直边大圆角
+#define THEME64_SM_R_BOTTOM     10      // 下面直边小圆角
+#define THEME64_SM_GAP_DOCK     11      // 底边 = Dock 顶边上方 10~12px
+#define THEME64_SM_PAD          16      // 内边距
+#define THEME64_SM_ICON         22      // 状态区线性图标尺寸（线宽统一）
+#define THEME64_SM_ICON_GAP     13      // 状态图标间距
+#define THEME64_SM_ICON_LINE    2       // 线性图标线宽（端点圆润，见 p2ui_line64）
+#define THEME64_SM_SEARCH_H     34      // 搜索框高
+#define THEME64_SM_SEARCH_R     8       // 搜索框"长方形小圆角"
+#define THEME64_SM_TILE_W       108     // 已固定应用网格单元宽
+#define THEME64_SM_TILE_H       62      // 单元高
+#define THEME64_SM_TILE_COLS    2       // 默认 2 列
+#define THEME64_SM_TILE_ROWS    4       // × 4 行
+#define THEME64_SM_TILE_ICON    30      // 网格图标
+#define THEME64_SM_SROW         28      // 搜索结果行高
+#define THEME64_SM_AVATAR       30      // 左下角圆形用户头像直径
+#define THEME64_SM_POWER        38      // 右下角圆形电源按钮直径
+#define THEME64_SM_BADGE        15      // 未读数字角标直径
+#define THEME64_SM_A_SEARCH     150     // 搜索框亚克力（跟随主题色，白色"搜索"字）
+#define THEME64_SM_A_MENU       224     // 开始菜单主体不透明度（~0.88）
+#define THEME64_SM_A_MENU_DARK  192     // 暗色主题：深灰亚克力（~0.75）
+#define THEME64_SM_A_CTRL       210     // 菜单内控件（电源/设置/网格悬停底）
+#define THEME64_PM_W            122     // 电源二级菜单：竖长方形小圆角框（高 > 宽）
+#define THEME64_PM_ROW          42      // 关机/重启/锁定 三个横长方形按钮高（3 行 + 2*8 内边距 = 142 > 122 = 竖长方形）
+#define THEME64_PM_R            10
+// ---- 二级弹窗（统一：亚克力半透明 + 圆角 + 双层浅阴影 + 1px 高光边缘；跟随主题；暗色自动变深灰）----
+#define THEME64_POP_R           14      // 弹窗圆角 12–16
+#define THEME64_POP_R_SMALL     10
+#define THEME64_POP_PAD         14
+#define THEME64_POP_GAP         8       // 与触发区域/开始菜单的间距（锚点）
+#define THEME64_POP_ROW         32      // 列表行高
+#define THEME64_POP_BTN_H       30
+#define THEME64_A_POP           232     // 弹窗主体不透明度（浅色主题）
+#define THEME64_A_POP_DARK      190     // 暗色主题：深灰亚克力
+#define THEME64_BLUR_POP        24      // 弹窗背景模糊半径 20–30（= 背景层 Token）
+#define THEME64_A_EDGE          90      // 1px 半透明白高光边
+#define THEME64_CAL_W           400     // 日历宽 360–420
+#define THEME64_CAL_H           450     // 日历高 420–480
+#define THEME64_CAL_CELL        46      // 日历单元（7 列 × 6 行）
+#define THEME64_CAL_ANIM_IN     220     // 打开动画 200–250ms（fade + scale 0.98->1 + translateY 6->0）
+#define THEME64_CAL_ANIM_OUT    150     // 关闭动画 150ms
+#define THEME64_CAL_S1000       980     // 打开动画起始 scale（0.98 -> 1.00，单位 1/1000）
+#define THEME64_CAL_DY0         6       // 打开动画起始 translateY
+#define THEME64_PANEL_SLIDER_H  10      // 声音滑轨高（左小右大）
+#define THEME64_PANEL_KNOB      16      // 声音滑块直径（悬停/拖动微亮）
+#define THEME64_NOTIF_W         320     // 通知面板：竖直长方形（开始菜单右侧）
+#define THEME64_NOTIF_H         380
+#define THEME64_NOTIF_MAX       8       // 通知列表上限
+#define THEME64_SOUND_W         340     // 声音面板：四边圆角横长方形（开始菜单右侧）
+#define THEME64_SOUND_H         104
+#define THEME64_NET_W           300     // 网络面板：竖向长方形（开始菜单左侧）
+#define THEME64_NET_H           380
+#define THEME64_NET_ETH_H       62      // 以太网区（固定最下方，不随滚动）
+#define THEME64_A_TOAST         226     // 设备通知 toast 亚克力
+#define THEME64_TOAST_W         320     // 设备插拔 toast（从桌面右侧滑入）
+#define THEME64_TOAST_H         64
+#define THEME64_TOAST_GAP       10      // 多个 toast 堆叠间距（不互相覆盖）
+#define THEME64_TOAST_MARGIN    18      // 离屏幕右/上边
+#define THEME64_TOAST_MAX       4
+#define THEME64_TOAST_HOLD      5000    // 停留几秒后自动滑出
+#define THEME64_TOAST_MS_IN     220     // 滑入
+#define THEME64_TOAST_MS_OUT    180     // 滑出
+#define THEME64_RED_BADGE       0xE81123u  // 未读小红点/数字角标（Win11 红）

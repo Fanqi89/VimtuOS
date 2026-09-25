@@ -41,6 +41,9 @@
 #include "img64.h"
 // ★ 本批（P1c）：锁屏 / 登录界面 / 多用户骨架（实现全在 locklogin64.cpp + userdb64.cpp）
 #include "locklogin64.h"
+// ★ P2：开始菜单（startmenu64）+ 四个二级弹窗/通知/设备 toast（panels64）
+#include "startmenu64.h"
+#include "panels64.h"
 
 // ==================== 资源符号（build64.sh 用 objcopy 生成）====================
 extern "C" const uint8_t _binary_icon_mycomputer_bin_start[];
@@ -1109,11 +1112,11 @@ static void dock_press64(int idx) {
         if (g_dock_log_budget > 0) {
             g_dock_log_budget--;
             dbg64_line_begin64();
-            dbg64_str("[DOCK64] start press idx=0 pressed=1 bounce=1 menu=legacy-toggle (P2 = 真开始菜单)");
+            dbg64_str("[DOCK64] start press idx=0 pressed=1 bounce=1 menu=start64 (P2 真开始菜单)");
             dbg64_nl();
             dbg64_line_end64();
         }
-        menu_toggle();
+        startmenu64_toggle64();
         return;
     }
     const int app = kDockItems[idx].app_id;
@@ -1511,6 +1514,9 @@ static void render(void) {
     }
     draw_dock();                 // ★ 本批：Windows 11 风格 Dock（替换老 32px 任务栏）
     draw_menu();
+    // ★ P2：开始菜单（窗口之上）→ 四个二级弹窗/设备 toast（更靠前）
+    startmenu64_draw64();
+    panels64_draw64();
     draw_cursor();
     fb_reset_clip();
     fb_flip_region(x0, y0, dw, dh);
@@ -1714,12 +1720,25 @@ static void press_in_client(Window* w, int mx, int my, int button) {
 }
 
 static void handle_mouse_press(int mx, int my, int button) {
-    // 1) Dock 栏（本批：Windows 11 风格）。命中项 → 按下：回弹动画 + 动作（开始按钮只打点 + 老菜单开关）；时钟玻璃片吞掉点击。
+    // ★ P2（最先）：设备 toast 关闭按钮 → 二级弹窗 → 开始菜单（层级栈：弹窗 > 菜单 > Dock/窗口/桌面）
+    if (panels64_handle_mouse_press64(mx, my, button)) return;
+    if (startmenu64_is_open64()) {
+        int sx = 0, sy = 0, sw = 0, sh = 0;
+        startmenu64_geom64(&sx, &sy, &sw, &sh);
+        const bool in_menu = (mx >= sx && mx < sx + sw && my >= sy && my < sy + sh);
+        if (in_menu) {
+            (void)startmenu64_handle_mouse_press64(mx, my, button);
+            dirty_add(sx - 8, sy - 8, sw + 16, sh + 16);
+            return;
+        }
+    }
+    // 1) Dock 栏（本批：Windows 11 风格）。命中项 → 按下：回弹动画 + 动作（开始按钮 = 真开始菜单）；时钟玻璃片吞掉点击。
     {
         int on_clock = 0;
         const int idx = dock_hit64(mx, my, &on_clock);
         if (idx >= 0) {
             g_menu_open = false;
+            if (idx != 0 && startmenu64_is_open64()) startmenu64_close64("dock-item");
             g_dock_pressed = idx;
             dock_press64(idx);
             dirty_add(g_dock_x, g_dock_y, g_dock_w, g_dock_h);
@@ -1736,6 +1755,8 @@ static void handle_mouse_press(int mx, int my, int button) {
             return;
         }
     }
+    // 2) 开始菜单（P2 新菜单：点菜单外部关闭；不消费点击，让点击继续落到桌面 —— 与老菜单同语义）
+    if (startmenu64_is_open64()) startmenu64_handle_mouse_press64(mx, my, button);
     // 2) 开始菜单
     if (g_menu_open) {
         const int mx0 = menu_x(), my0 = menu_y();
@@ -1853,6 +1874,16 @@ static void handle_mouse(void) {
     if (mouse_button_pressed(0)) { mouse_consume_pressed(0); handle_mouse_press(mx, my, 0); }
     if (mouse_button_pressed(1)) { mouse_consume_pressed(1); handle_mouse_press(mx, my, 1); }
     if (mouse_button_pressed(2)) { mouse_consume_pressed(2); handle_mouse_press(mx, my, 2); }
+    // ★ P2：二级弹窗/开始菜单的悬停 + 拖动（音量滑块 / 日历左右拖切月 / WiFi 滚动条）
+    panels64_handle_mouse_move64(mx, my, btn);
+    startmenu64_handle_mouse_move64(mx, my, btn);
+    // ★ P2：滚轮（PS/2 4 字节包的 Z；弹窗优先，其次开始菜单搜索列表）
+    {
+        const int dz = mouse_pop_wheel64();
+        if (dz != 0) {
+            if (!panels64_wheel64(dz)) (void)startmenu64_wheel64(dz);
+        }
+    }
     // ---- Dock：悬停命中 + 动效推进（悬停放大/邻位让位/点击回弹）----
     {
         int on_clock = 0;
@@ -2034,9 +2065,14 @@ static void handle_keyboard(void) {
         app_tmgr_open64();
         return;
     }
-    // 热键：Win -> 开始菜单
+    // 热键：Win -> 开始菜单（P2：新开始菜单/弹窗打开时，Win = 关掉它们；否则老菜单，兼容既有验收）
     if (kbd_win_pressed()) {
         kbd_consume_win();
+        if (panels64_any_open64() || startmenu64_is_open64()) {
+            (void)panels64_close_all64("win-key");
+            startmenu64_close64("win-key");
+            return;
+        }
         menu_toggle();
         return;
     }
@@ -2048,6 +2084,9 @@ static void handle_keyboard(void) {
             gui64_invalidate();
             continue;
         }
+        // ★ P2：二级弹窗优先吃键（ESC 一级）→ 开始菜单（ESC 二级）→ 老菜单（兼容既有验收）
+        if (panels64_handle_key64(c)) continue;
+        if (startmenu64_handle_key64(c)) continue;
         if (g_menu_open) {
             if (c == 0xFD) { g_menu_sel = (g_menu_sel + MENU_ITEMS - 1) % MENU_ITEMS; dirty_add(menu_x(), menu_y(), MENU_W, MENU_H); continue; }
             if (c == 0xFE) { g_menu_sel = (g_menu_sel + 1) % MENU_ITEMS; dirty_add(menu_x(), menu_y(), MENU_W, MENU_H); continue; }
@@ -2245,6 +2284,9 @@ int gui64_selftest() {
         dock_start_icon_init64();
         dock_geom_init64();
         g_dock_hover = -1;
+        // ★ P2：开始菜单（几何/自检）与四个二级弹窗 + 设备 toast（锚点全在这里定型）
+        startmenu64_init64();
+        panels64_init64();
     }
     // ---- 开机 logo：桌面首帧之前先放一段黑底 + 居中 logo 的淡入（~12 帧 ≈ 200ms）----
     boot_logo_fade_in();
@@ -2309,12 +2351,30 @@ int gui64_selftest() {
             dock_geom_init64();
             gui64_invalidate();
         }
+        // ★ P2：开始菜单/弹窗锚在菜单几何上 —— 分辨率/缩放变了（dock 几何重建）时，收起它们免得错位
+        if (startmenu64_is_open64() || panels64_any_open64()) {
+            static int last_sw = -1, last_sh = -1;
+            if (last_sw < 0) {
+                last_sw = g_screen_w;      // 第一次看到：只记录，不关（否则一打开就被自己关掉）
+                last_sh = g_screen_h;
+            } else if (last_sw != g_screen_w || last_sh != g_screen_h) {
+                if (startmenu64_is_open64()) startmenu64_close64("screen-change");
+                (void)panels64_close_all64("screen-change");
+                last_sw = g_screen_w;
+                last_sh = g_screen_h;
+            }
+        }
         // 只有这一个 hook：终端 `loginctl lock` 把状态切回 LOCK 之后，这里会接管输入与整屏重绘，
         // 桌面外壳在锁屏期间既不派发按键也不画窗口。
         // 解锁（登录成功）后的第一帧：整屏重绘一次，把锁屏/登录画面换成桌面。
         {
             static int lock_active = 0;
             if (locklogin64_active64()) {
+                if (lock_active == 0) {
+                    // ★ P2：切到锁屏/登录层 -> 收起开始菜单与所有弹窗（不留残影/不吃键）
+                    if (startmenu64_is_open64()) startmenu64_close64("lock");
+                    (void)panels64_close_all64("lock");
+                }
                 lock_active = 1;
                 (void)locklogin64_tick64();
                 __asm__ volatile("pause");
@@ -2331,6 +2391,9 @@ int gui64_selftest() {
         // 每 ~60Hz：跑应用的 tick 回调 + 重绘
         if ((int32_t)(now - next_frame) >= 0) {
             next_frame = now + (PIT_HZ_64 / 60);
+            // ★ P2：开始菜单 + 二级弹窗/设备 toast 的每帧推进（动画、时间、设备轮询、toast 生命周期）
+            startmenu64_tick64();
+            panels64_tick64();
             // 应用的定时回调（计时器等）
             for (Window* w = g_z; w; w = w->next) {
                 if (!w->visible) continue;

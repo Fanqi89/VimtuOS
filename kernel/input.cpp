@@ -2,9 +2,7 @@
 #include "input.h"
 #include "port.h"
 #include "x86_64.h"      // ★ 批次 L：ticks64()（记录左键按下包的到达时刻）
-#if defined(VIMTU_KBD_TRACE) || defined(VIMTU_PS2_TRACE)
-#include "debug64.h"
-#endif
+#include "debug64.h"   // ★ P2：Caps/Shift/滚轮打点无条件需要（原来只在 VIMTU_KBD_TRACE 下包含）
 
 // ================ 8042（PS/2 控制器）公共助手 ================
 //
@@ -100,6 +98,10 @@ static volatile bool caps_lock = false;
 static volatile bool scroll_lock = false;
 static volatile bool num_lock = false;
 
+// ★ P2：Caps/Shift/滚轮（见 input.h 的"批次 P2"一段）
+static volatile uint32_t shift_toggles = 0;    // Shift 按下边沿累计（"Shift 切换中/英"接线证据）
+static int kbd_log_budget = 12;                // [INPUT64] caps/shift 行上限（防刷屏）
+
 // Win 键（E0 5B/5C 按下标志；GUI 读取后清除）
 static volatile uint8_t win_key_flag = 0;
 static bool e0_pending = false;
@@ -162,6 +164,12 @@ bool kbd_ctrl_pressed() { return ctrl_pressed; }     // ★ 批次 J：修饰键
 bool kbd_shift_pressed() { return shift_pressed; }   // ★ 批次 J：同上（供 Shift 加选）
 void kbd_drain() { kbd_tail = kbd_head; }   // 停止阶段丢弃输入（不再接收新任务）
 
+// ★ P2：Caps / 中英指示（无输入法时恒"英"）/ Shift 边沿计数
+bool     kbd_caps_on() { return caps_lock; }
+int      kbd_lang64() { return 0; }              // 0 = 英：本批**没有中文输入法**，指示器不许假装有
+int      kbd_ime_available64() { return 0; }     // 0 = 无中文输入法（后期批次）
+uint32_t kbd_shift_toggles64() { return shift_toggles; }
+
 // 处理一个键盘扫描码（集 1；E0 前缀的扩展键在这里单独走）
 static void kbd_process_scancode(uint8_t sc) {
     if (sc == 0xE0) { e0_pending = true; return; }
@@ -174,6 +182,8 @@ static void kbd_process_scancode(uint8_t sc) {
         else if (sc == 0x50) kbd_push(NAV_DOWN);             // 下方向
         else if (sc == 0x4B) kbd_push(NAV_LEFT);             // 左方向
         else if (sc == 0x4D) kbd_push(NAV_RIGHT);            // 右方向
+        else if (sc == 0x49) kbd_push((uint8_t)KBD_KEY_PAGEUP);    // ★ P2：PageUp（日历切年）
+        else if (sc == 0x51) kbd_push((uint8_t)KBD_KEY_PAGEDOWN);  // ★ P2：PageDown（日历切年）
         else if (sc == 0x53) kbd_push((uint8_t)KBD_KEY_DELETE);  // ★ 批次 J：Delete（E0 53）
         return;
     }
@@ -183,13 +193,41 @@ static void kbd_process_scancode(uint8_t sc) {
 
 
     // 修饰键
+    // ★ P2：Shift 按下边沿累计（"Shift 切换中/英"这条需求的接线证据；没有中文输入法时 lang 恒为"英"）
+    if ((sc == 0x2A || sc == 0x36) && !shift_pressed) {
+        shift_toggles++;
+        if (kbd_log_budget > 0) {
+            kbd_log_budget--;
+            dbg64_line_begin64();
+            dbg64_str("[INPUT64] shift toggle count=");
+            dbg64_dec((uint64_t)shift_toggles);
+            dbg64_str(" lang=");
+            dbg64_str(kbd_lang64() ? "中" : "英");
+            dbg64_str(" ime=");
+            dbg64_dec((uint64_t)kbd_ime_available64());
+            dbg64_str(" (no Chinese IME -> indicator stays 英; IME is a later batch)");
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
     if (sc == 0x2A || sc == 0x36) shift_pressed = true;
     if (sc == 0xAA || sc == 0xB6) shift_pressed = false;
     if (sc == 0x1D) ctrl_pressed = true;
     if (sc == 0x9D) ctrl_pressed = false;
     if (sc == 0x38) alt_pressed = true;
     if (sc == 0xB8) alt_pressed = false;
-    if (sc == 0x3A) caps_lock = !caps_lock;
+    if (sc == 0x3A) {
+        caps_lock = !caps_lock;
+        if (kbd_log_budget > 0) {
+            kbd_log_budget--;
+            dbg64_line_begin64();
+            dbg64_str("[INPUT64] caps on=");
+            dbg64_dec(caps_lock ? 1 : 0);
+            dbg64_str(" (letters switch case; Caps+Shift = lowercase)");
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
     if (sc == 0x45) num_lock = !num_lock;
     if (sc == 0x46) scroll_lock = !scroll_lock;
 
@@ -205,9 +243,11 @@ static void kbd_process_scancode(uint8_t sc) {
         char c = shift_pressed ? kbd_map_shift[sc] : kbd_map[sc];
         if (sc == 0x01) c = 0;   // Esc 已单独处理
         if (c) {
-            // Caps Lock 对字母生效
-            if (caps_lock && c >= 'a' && c <= 'z') c = c - 'a' + 'A';
-            if (caps_lock && c >= 'A' && c <= 'Z') c = c - 'a' + 'A';
+            // ★ P2：Caps Lock 对字母生效（标准语义：Caps 反转 Shift 对字母的作用）
+            //   旧写法第二条 `if (caps && c >= 'A' ..)` 把 Caps+Shift 也折成大写（等于 Shift 失效），
+            //   这里改成：小写字母 -> 大写；大写字母（= Shift 按下的结果）-> 小写。
+            if (caps_lock && c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+            else if (caps_lock && c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
             // Ctrl 组合
             if (ctrl_pressed) {
                 if (c >= 'a' && c <= 'z') c = c - 'a' + 1;   // Ctrl-A = 0x01 等
@@ -245,6 +285,7 @@ void kbd_init() {
     dbg64_str((after & 0x40) ? " translate=on" : " translate=OFF!");
     dbg64_nl();
 #endif
+    (void)before; (void)after;   // 只在 VIMTU_KBD_TRACE 下打点：关掉时不留未用变量告警
 }
 
 // ================ 鼠标 ================
@@ -284,11 +325,22 @@ uint32_t mouse_press_tick64() { return mouse_left_press_tick; }
 bool mouse_has_event() { return mouse_has_data; }
 void mouse_clear_event_flag() { mouse_has_data = false; }
 
-// 处理一个**鼠标**字节（3 字节包状态机）。键盘 IRQ 读到鼠标字节时也走这里。
+// ★ P2：滚轮 = Intellimouse 的**第 4 字节**（Z）。设备侧握手见 mouse_try_wheel_mode64()：
+//   只有设备回了 ID=3（滚轮鼠标）才切 4 字节包；否则老实按 3 字节解析（不猜、不假装）。
+static volatile int mouse_wheel_mode = 0;    // 1 = 4 字节包（滚轮可用）
+static volatile int mouse_wheel_acc = 0;     // 累计 Z（>0 = 滚轮向上；GUI 每帧 mouse_pop_wheel64 取走）
+static uint8_t   mouse_pkt_size = 3;
+static int       mouse_wheel_log_budget = 6;
+
+int mouse_wheel_mode64() { return mouse_wheel_mode; }
+int mouse_pop_wheel64() { const int v = mouse_wheel_acc; mouse_wheel_acc = 0; return v; }
+
+// 处理一个**鼠标**字节（3 或 4 字节包状态机）。键盘 IRQ 读到鼠标字节时也走这里。
 static void mouse_process_byte(uint8_t data) {
+    const uint8_t pkt = mouse_pkt_size;
     mouse_packet[mouse_packet_cycle] = data;
     mouse_packet_cycle++;
-    if (mouse_packet_cycle != 3) return;
+    if (mouse_packet_cycle != (int)pkt) return;
     mouse_packet_cycle = 0;
     const uint8_t b0 = mouse_packet[0];
     // 检查同步位（包首字节的 bit3 恒为 1）
@@ -297,13 +349,11 @@ static void mouse_process_byte(uint8_t data) {
 #ifdef VIMTU_PS2_TRACE
         ps2_trace_byte('!', b0);
 #endif
-        if (mouse_packet[1] & 0x08) {
-            mouse_packet[0] = mouse_packet[1];
-            mouse_packet[1] = mouse_packet[2];
-            mouse_packet_cycle = 2;
-        } else if (mouse_packet[2] & 0x08) {
-            mouse_packet[0] = mouse_packet[2];
-            mouse_packet_cycle = 1;
+        int k = 1;
+        for (; k < (int)pkt; k++) if (mouse_packet[k] & 0x08) break;
+        if (k < (int)pkt) {
+            for (int i = k; i < (int)pkt; i++) mouse_packet[i - k] = mouse_packet[i];
+            mouse_packet_cycle = (int)pkt - k;
         }
         return;
     }
@@ -356,6 +406,26 @@ static void mouse_process_byte(uint8_t data) {
     if ((nb & 4) && !(old & 4)) { if (pressed_middle < 4) pressed_middle++; }
     mouse_buttons = nb;
     mouse_has_data = true;
+    // ★ P2：滚轮（4 字节包的第 4 字节 = Z，二补码；标准 PS/2/Intellimouse 约定：+1 = 向上/远离用户）
+    if (pkt == 4) {
+        const int8_t z = (int8_t)mouse_packet[3];
+        if (z) {
+            mouse_wheel_acc += z;
+            if (mouse_wheel_acc > 1000) mouse_wheel_acc = 1000;
+            if (mouse_wheel_acc < -1000) mouse_wheel_acc = -1000;
+            if (mouse_wheel_log_budget > 0) {
+                mouse_wheel_log_budget--;
+                dbg64_line_begin64();
+                dbg64_str("[INPUT64] wheel z=");
+                dbg64_dec((uint64_t)(uint32_t)(int32_t)z);
+                dbg64_str(" acc=");
+                dbg64_dec((uint64_t)(uint32_t)(int32_t)mouse_wheel_acc);
+                dbg64_str(" packet=4B");
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+        }
+    }
 #ifdef VIMTU_PS2_TRACE
     // 结果光标位置（4 位 hex + 4 位 hex），用来确认它不再贴在边缘
     dbg64_str("|c");
@@ -407,6 +477,27 @@ static uint8_t mouse_read() {
     return inb(0x60);
 }
 
+// ★ P2：滚轮握手。返回 1 = 设备是滚轮鼠标（成功切到 4 字节包）。
+//   序列（Intellimouse 规范 / Linux psmouse 同款）：采样率 200 -> 100 -> 80（魔数），
+//   再 0xF2 读设备 ID：3 = 滚轮 5 键，0 = 老 3 字节鼠标。任何一步没有 ACK（0xFA）就如实放弃。
+static volatile int mouse_wheel_id = -1;
+static int mouse_wheel_id64() { return mouse_wheel_id; }
+static int mouse_try_wheel_mode64() {
+    const uint8_t rates[3] = {200, 100, 80};
+    for (int i = 0; i < 3; i++) {
+        mouse_write(0xF3);                        // Set Sample Rate
+        if (mouse_read() != 0xFA) { mouse_wheel_id = -1; ps2_drain_out(); return 0; }
+        mouse_write(rates[i]);
+        if (mouse_read() != 0xFA) { mouse_wheel_id = -1; ps2_drain_out(); return 0; }
+    }
+    mouse_write(0xF2);                            // Get Device ID
+    if (mouse_read() != 0xFA) { mouse_wheel_id = -1; ps2_drain_out(); return 0; }
+    const uint8_t id = mouse_read();
+    mouse_wheel_id = id;
+    ps2_drain_out();                              // 握手期间可能夹带的采样包
+    return (id == 3 || id == 4) ? 1 : 0;
+}
+
 void mouse_init() {
     // 启用辅助设备（鼠标）
     mouse_wait_write(); outb(0x64, 0xA8);
@@ -422,6 +513,7 @@ void mouse_init() {
     dbg64_hex64(after);
     dbg64_nl();
 #endif
+    (void)before; (void)after;   // 同上：只在 VIMTU_KBD_TRACE 下打点
     // 默认设置
     mouse_write(0xF6);
     uint8_t ack1 = mouse_read();
@@ -439,6 +531,23 @@ void mouse_init() {
     for (int t = 0; t < 4; t++) {
         for (volatile int w = 0; w < 30000; w++);
         for (int i = 0; i < 100 && (inb(0x64) & PS2_ST_OBF); i++) inb(0x60);
+    }
+    // ★ P2：滚轮握手（Intellimouse 4 字节包）——采样率魔数序列 200/100/80 + 读设备 ID（0xF2）。
+    //   只有设备明确回 ID=3/4（滚轮/5 键）才切 4 字节包；否则老实留在 3 字节（不猜、不假装）。
+    //   做在 F4 之后、清缓冲之前：握手期间设备可能在流里插入字节，随后统一排空。
+    mouse_wheel_mode = mouse_try_wheel_mode64();
+    mouse_pkt_size = mouse_wheel_mode ? 4 : 3;
+    {
+        mouse_wheel_log_budget = 6;
+        dbg64_line_begin64();
+        dbg64_str("[INPUT64] wheel mode=");
+        dbg64_dec((uint64_t)mouse_wheel_mode);
+        dbg64_str(" id=");
+        dbg64_dec((uint64_t)mouse_wheel_id64());
+        dbg64_str(mouse_wheel_mode ? " packet=4B (Intellimouse; QEMU monitor: mouse_move dx dy dz)"
+                                   : " packet=3B (device has no wheel; scroll keys unavailable)");
+        dbg64_nl();
+        dbg64_line_end64();
     }
     // 初始位置：屏幕中央（由 GUI 设置，这里给默认）
     mouse_x = 512;
