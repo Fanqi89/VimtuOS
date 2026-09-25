@@ -6,7 +6,7 @@
   1) 源码真源：gui_rs/src/tokens.rs 的关键 Token 值 == 视觉线的设计约定
      （圆角 14/12/9/24/24/10、模糊 24/12、透明 450/800/1000、阴影 0.08/0.12、动效 150/225/330、
       缓动 200/0/0/1000），并且这些**常量**确实被 Token 表引用（防止"常量改了表没改"）。
-  2) 主题表：gui_rs/src/theme.rs 里 6 个主题（白色(默认)/暗色/蓝白/粉白/粉绿/粉紫）解析成
+  2) 主题表：gui_rs/src/theme.rs 里 7 个主题（白色(默认)/暗色/蓝白/粉白/粉绿/粉紫/紫白）解析成
      "名字 + accent 十六进制"；**accent 的期望值从 Rust 源码解析**，不写死第二份。
   3) 链接证据（nm/objdump）：
      * gui_rs/gui_rs.o 里 7 个规定导出符号 + 扩展符号全部是已定义（T）；
@@ -57,7 +57,7 @@ OBJDUMP_CANDIDATES = [
 ]
 
 # ---- 设计要求（与任务书/视觉线约定一致；这是"规格"，不是"实现"的副本）----
-SPEC_THEME_NAMES = ["白色(默认)", "暗色", "蓝白渐变", "粉白渐变", "粉绿渐变", "粉紫渐变"]
+SPEC_THEME_NAMES = ["白色(默认)", "暗色", "蓝白渐变", "粉白渐变", "粉绿渐变", "粉紫渐变", "紫白渐变"]
 SPEC_TOKEN_PX = {                       # i32 常量 -> 期望值
     "RADIUS_WINDOW_PX": 14, "RADIUS_CARD_PX": 12, "RADIUS_BUTTON_PX": 9,
     "RADIUS_DOCK_PX": 24, "RADIUS_START_TOP_PX": 24, "RADIUS_START_BOTTOM_PX": 10,
@@ -307,7 +307,7 @@ def main():
     print("=== 2) 主题表（gui_rs/src/theme.rs）===")
     declared, themes = parse_themes(src_theme)
     names = [t["name"] for t in themes]
-    ck.ok("THEMES 声明 %d 个主题" % declared, declared == 6 and len(themes) == 6,
+    ck.ok("THEMES 声明 %d 个主题" % declared, declared == 7 and len(themes) == 7,
           "解析到 %d" % len(themes))
     ck.ok("主题名与约定一致（顺序固定）", names == SPEC_THEME_NAMES, "解析=%s" % names)
     ck.ok("默认主题 = 白色(默认) 且非暗色", themes[0]["name"] == "白色(默认)" and not themes[0]["dark"])
@@ -317,7 +317,7 @@ def main():
           all(t["dock"] == "DEFAULT_DOCK" for t in themes if not t["dark"]))
     ck.ok("暗色主题 Dock = DARK_DOCK（深灰半透）", themes[1]["dock"] == "DARK_DOCK")
     grads = [t for t in themes if t["grad_start"] != t["grad_end"]]
-    ck.ok("4 个自定义渐变主题（蓝白/粉白/粉绿/粉紫）", len(grads) == 4,
+    ck.ok("5 个自定义渐变主题（蓝白/粉白/粉绿/粉紫/紫白）", len(grads) == 5,
           "渐变=%s" % [t["name"] for t in grads])
     tag = parse_build_tag(src_lib)
     print("[parse] 源码解析：theme0 accent=#%06X tag=%s" % (themes[0]["accent_rgb"], tag.decode()))
