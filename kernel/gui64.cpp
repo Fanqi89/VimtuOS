@@ -39,6 +39,8 @@
 #include "theme64.h"
 #include "gfx64.h"
 #include "img64.h"
+// ★ 本批（P1c）：锁屏 / 登录界面 / 多用户骨架（实现全在 locklogin64.cpp + userdb64.cpp）
+#include "locklogin64.h"
 
 // ==================== 资源符号（build64.sh 用 objcopy 生成）====================
 extern "C" const uint8_t _binary_icon_mycomputer_bin_start[];
@@ -2246,6 +2248,12 @@ int gui64_selftest() {
     }
     // ---- 开机 logo：桌面首帧之前先放一段黑底 + 居中 logo 的淡入（~12 帧 ≈ 200ms）----
     boot_logo_fade_in();
+    // ---- ★ 本批（P1c）：锁屏 -> 登录（开机顺序：滚屏 -> 开机动画 -> 锁屏 -> 登录 -> 桌面）----
+    // 这个调用**不返回**直到登录成功，所以下面的自检/首帧/[GUI64] ready（桌面出现）一定晚于
+    // "[LOCK64] lock screen shown"。安装介质内核不链 locklogin64（见 build64.sh），
+    // 所以安装向导路径上不会出现锁屏。
+    locklogin64_run64();
+
 
     g_in_selftest = true;          // 自检里的临时窗口 / 语言来回切 不触发会话与配置钩子
     const int st = gui64_selftest();
@@ -2300,6 +2308,22 @@ int gui64_selftest() {
             g_dock_geom_logged = false;
             dock_geom_init64();
             gui64_invalidate();
+        }
+        // 只有这一个 hook：终端 `loginctl lock` 把状态切回 LOCK 之后，这里会接管输入与整屏重绘，
+        // 桌面外壳在锁屏期间既不派发按键也不画窗口。
+        // 解锁（登录成功）后的第一帧：整屏重绘一次，把锁屏/登录画面换成桌面。
+        {
+            static int lock_active = 0;
+            if (locklogin64_active64()) {
+                lock_active = 1;
+                (void)locklogin64_tick64();
+                __asm__ volatile("pause");
+                continue;
+            }
+            if (lock_active) {
+                lock_active = 0;
+                gui64_invalidate();          // 从锁屏/登录回到桌面：整屏重绘
+            }
         }
         handle_mouse();
         handle_keyboard();

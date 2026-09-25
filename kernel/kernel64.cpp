@@ -53,6 +53,9 @@
 #include "session64.h"   // 会话/应用内容策略（关窗清状态、退出保存、启动恢复）
 #include "sysstate64.h"  // 运行状态机 + 模块注册表 + 健康报告 + ring log
 #include "panic64.h"     // 蓝屏（BSOD）+ 看门狗（gui64 帧心跳）
+// ---- ★ 本批（P1c）：多用户骨架（用户表/口令哈希/会话身份）----
+//   必须在 vfs64 挂载系统卷 + config64_init64 之后 init（见 os_boot_path 的调用点）。
+#include "userdb64.h"
 // ---- 批次 A 后半的两个子系统（同样只进系统内核；os_boot_path 里注册 + 跑）----
 #include "preload64.h"   // 字形/图标预热（进桌面之前跑一轮，带 rdtsc64 实测证据）
 #include "update64.h"    // update 子系统（标记 -> 应用 -> store/重启；不是真"升级包"，见其头文件）
@@ -537,6 +540,10 @@ static void rust64_boot_init64() {
     //   4) panic64_init64()：建看门狗任务（需要 task_start64() 已经跑过），桌面首帧时武装。
     config64_init64();
     session64_init64();
+    // ★ 本批（P1c）：多用户骨架（/etc/users.db + /home/<用户> + root 隐藏记录 + 引导用户）。
+    //   位置讲究：必须在 vfs64 挂载系统卷之后（写 /etc/users.db）、config64_init64() 之后
+    //   （读 ui.login.last），且在任何"要登录"之前的启动阶段；它自己会打 [USER64] userdb 行。
+    userdb64_init64();
     sysstate64_begin64();
     sys64_register_builtin64();
     // ★ 批次 A 后半：preload64 / update64 也要进模块表 —— 必须在 sysstate64_start64() **之前**

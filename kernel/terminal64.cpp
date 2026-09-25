@@ -95,6 +95,9 @@
 #include "proc64.h"      // proc：proc64 进程表（list / run / kill）
 #include "console64.h"   // ★ 批次 N：dmesg（开机滚屏引导控制台的启动日志缓冲）+ boot verbose
 #include "rust64.h"     // ★ Rust 模块（gui_rs）：设计 Token + 主题配色（terminal `rust` 命令用它）
+// ★ 本批（P1c）：多用户骨架（userdb64）+ 锁屏/登录（loginctl lock）
+#include "userdb64.h"
+#include "locklogin64.h"
 
 // ==================== 常量 ====================
 #define TERM_MAX_INST    4          // 多开上限（照 32 位；第 5 次只激活最新的）
@@ -647,8 +650,15 @@ static void term_draw(Window* w) {
 }
 
 // ==================== Shell：输出与命令 ====================
+// ★ 本批（P1c）：提示符 = **会话身份**（su - root / su - / sudo -i 之后变 root，提示符变 '#'）
 static void shell_prompt(TerminalState* ts) {
-    ts_puts(ts, "vimtu64:~$ ");
+    const char* u = userdb64_session_name64();
+    if (u && u[0] && u[0] != '-') {
+        ts_puts(ts, u);
+        ts_puts(ts, userdb64_root_session64() ? "@vimtu64:~# " : "@vimtu64:~$ ");
+    } else {
+        ts_puts(ts, "vimtu64:~$ ");          // 还没登录（理论上到不了这里）：退回旧提示符
+    }
 }
 
 static void shell_banner(TerminalState* ts) {
@@ -712,9 +722,28 @@ static const char* HELP_EN =
     "  proc run NAME|/PATH   create + start a real proc64 process (built-in: spin -> long-lived /spin.elf)\n"
     "  proc kill PID [SIG]   signal a proc64 process (default SIGKILL=9; the task manager process page uses this)\n"
     "  rust [tokens|set N]   Rust module (gui_rs): design tokens + theme palette; rust set N switches theme\n"
+    "  ---- multi-user / session identity (P1c; **no permission checks yet**, that is P4) ----\n"
+    "  useradd NAME          create a normal user (uid >= 1000; home /home/NAME, desktop /home/NAME/Desktop)\n"
+    "  userdel NAME          remove a user record (home dir kept; root / last normal user refused)\n"
+    "  passwd [NAME] [PW]    set a password (PW omitted = hidden interactive input; PW='-' clears;\n"
+    "                        stored as salt + SHA-256 x1000 iterations, never plaintext)\n"
+    "  users                 user table: root (hidden in the login UI) + normal users + session ids\n"
+    "  whoami / id           session identity (euid): root after 'su - root' / 'sudo -i'\n"
+    "  su - root | su - | sudo -i   switch the SESSION identity to root (GUI user/avatar unchanged)\n"
+    "  exit                  leave the root session (back to the GUI user)\n"
+    "  loginctl lock         lock the screen (press Enter/click, then sign in again)\n"
     "No 'not supported' commands remain: update/preload were the last two and are real now.\n";
 
 static const char* HELP_ZH =
+    "  ---- 多用户 / 会话身份（P1c；**权限位尚未拦截**，P4 收口）----\n"
+    "  useradd 名字          建普通用户（uid >= 1000；主目录 /home/名字、桌面 /home/名字/Desktop）\n"
+    "  userdel 名字          删用户记录（主目录保留；root / 最后一个普通用户拒绝）\n"
+    "  passwd [名字] [口令]  设口令（省略口令 = 交互式**隐藏输入**；口令写 - 就清掉；只存盐 + SHA-256×1000 轮）\n"
+    "  users                 用户表：root（登录界面隐藏）+ 普通用户 + 当前 GUI/会话身份\n"
+    "  whoami / id           会话身份（euid）：su - root / sudo -i 之后是 root\n"
+    "  su - root | su - | sudo -i   把**会话**身份切成 root（GUI 用户名/头像不变）\n"
+    "  exit                  退出 root 会话（回到 GUI 用户）\n"
+    "  loginctl lock         回锁屏（回车/点击后重新登录）\n"
     "VimtuOS 64 位 Shell 命令：\n"
     "  help                  本帮助\n"
     "  ver, uname            版本与架构\n"
@@ -769,6 +798,15 @@ static const char* HELP_ZH =
     "  proc run 名字|/路径   创建并启动一个真 proc64 进程（内置：spin -> 长命 /spin.elf）\n"
     "  proc kill PID [SIG]   给 proc64 进程发信号（默认 SIGKILL=9；任务管理器进程页回车走的就是它）\n"
     "  rust [tokens|set N]   Rust 模块（gui_rs）：设计 Token + 主题配色；rust set N 切换主题\n"
+    "  ---- 多用户 / 会话身份（P1c；**权限位尚未拦截**，P4 收口）----\n"
+    "  useradd 名字          建普通用户（uid >= 1000；主目录 /home/名字、桌面 /home/名字/Desktop）\n"
+    "  userdel 名字          删用户记录（主目录保留；root / 最后一个普通用户拒绝）\n"
+    "  passwd [名字] [口令]  设口令（省略口令 = 交互式**隐藏输入**；口令写 - 就清掉；只存盐 + SHA-256×1000 轮）\n"
+    "  users                 用户表：root（登录界面隐藏）+ 普通用户 + 当前 GUI/会话身份\n"
+    "  whoami / id           会话身份（euid）：su - root / sudo -i 之后是 root\n"
+    "  su - root | su - | sudo -i   把**会话**身份切成 root（GUI 用户名/头像不变）\n"
+    "  exit                  退出 root 会话（回到 GUI 用户）\n"
+    "  loginctl lock         回锁屏（回车/点击后重新登录）\n"
     "没有\"未支持\"命令了：最后两条 update / preload 已接真。\n";
 // ---------- 命令实现 ----------
 static void cmd_help(TerminalState* ts) {
@@ -3390,6 +3428,212 @@ static void cmd_clear(TerminalState* ts) {
     ts_dirty_client(ts);
     gui64_invalidate_window(ts->win);
 }
+// ==================== ★ 本批（P1c）：多用户 / 会话身份命令（locklogin64 + userdb64）====================
+// 语义（**P4 之前不做权限拦截**，只把身份做成真实可查字段；见 kernel/userdb64.h 开头）：
+//   useradd NAME              建用户（uid >= 1000；主目录 /home/NAME、桌面 /home/NAME/Desktop）
+//   userdel NAME              删用户记录（不删主目录；不能删 root、也不能删最后一个普通用户）
+//   passwd [NAME] [PW]        设/改口令（NAME 缺省 = 当前会话用户；PW 缺省 = 交互式**隐藏输入**；
+//                             PW 为空串 = 清除口令）。只存盐 + SHA-256 迭代哈希，绝不落明文
+//   users                     用户表（标出 root（登录界面里隐藏）与普通用户 + 当前 GUI / 会话身份）
+//   whoami / id               会话身份（euid）：su/sudo -i 之后是 root
+//   su [- | - root | root]    把**会话**身份切成 root（GUI 的用户名/头像不变）
+//   sudo -i                   同上（sudo 只实现了 -i）
+//   exit                      退回 GUI 用户（本来就不是 root 会话时如实提示）
+//   loginctl lock             回锁屏（重新登录后回到桌面）
+static int  g_pw_pending = 0;                 // 1 = 下一行输入是口令（不回显）
+static char g_pw_user[USERDB64_NAME_MAX];
+
+static void cmd_passwd_line(TerminalState* ts, const char* line) {
+    // 空行 = **取消**（不改口令）：避免"注入的按键丢了、只剩一个回车"时把口令误清掉。
+    if (!line || !line[0]) {
+        ts_puts(ts, "passwd: cancelled (empty input; password unchanged)\\n");
+        g_pw_pending = 0;
+        g_pw_user[0] = 0;
+        return;
+    }
+    const int idx = userdb64_find64(g_pw_user);
+    const int rc = (idx >= 0) ? userdb64_set_password64(idx, line) : -1;
+    if (rc == 0) {
+        ts_puts(ts, "passwd: password updated (salt + SHA-256, 1000 iterations)\\n");
+    } else {
+        ts_puts(ts, "passwd: FAILED (user gone or disk write failed)\\n");
+    }
+    g_pw_pending = 0;
+    g_pw_user[0] = 0;
+}
+
+static bool cmd_useradd(TerminalState* ts, const char* name) {
+    if (!name || !name[0]) { ts_puts(ts, "useradd: usage: useradd NAME\n"); return false; }
+    uint32_t uid = 0;
+    if (userdb64_add64(name, &uid) != 0) {
+        ts_puts(ts, "useradd: FAILED (exists / bad name / table full)\n");
+        return false;
+    }
+    ts_puts(ts, "useradd: created ");
+    ts_puts(ts, name);
+    ts_puts(ts, " uid=");
+    ts_put_u64(ts, (uint64_t)uid);
+    ts_puts(ts, " home=/home/");
+    ts_puts(ts, name);
+    ts_puts(ts, " desktop=/home/");
+    ts_puts(ts, name);
+    ts_puts(ts, "/Desktop  password=none (use 'passwd ");
+    ts_puts(ts, name);
+    ts_puts(ts, " PW' to set one)\n");
+    return true;
+}
+
+static bool cmd_userdel(TerminalState* ts, const char* name) {
+    if (!name || !name[0]) { ts_puts(ts, "userdel: usage: userdel NAME\n"); return false; }
+    if (userdb64_del64(name) != 0) {
+        ts_puts(ts, "userdel: FAILED (no such user / root / last normal user)\n");
+        return false;
+    }
+    ts_puts(ts, "userdel: removed ");
+    ts_puts(ts, name);
+    ts_puts(ts, " (home directory kept)\n");
+    return true;
+}
+
+static bool cmd_passwd(TerminalState* ts, const char* name, const char* pw) {
+    char who[USERDB64_NAME_MAX];
+    const char* src = (name && name[0]) ? name : userdb64_session_name64();
+    int i = 0;
+    while (src && src[i] && i < (int)sizeof(who) - 1) { who[i] = src[i]; i++; }
+    who[i] = 0;
+    if (!who[0] || who[0] == '-') { ts_puts(ts, "passwd: usage: passwd [NAME] [PW]\n"); return false; }
+    const int idx = userdb64_find64(who);
+    if (idx < 0) { ts_puts(ts, "passwd: no such user: "); ts_puts(ts, who); ts_puts(ts, "\n"); return false; }
+    if (pw && pw[0]) {                          // 非交互形式：passwd NAME PW
+        if (pw[0] == '-' && !pw[1]) {           //   PW 为 "-" = 清口令（回到免密码直接登录）
+            if (userdb64_set_password64(idx, "") != 0) { ts_puts(ts, "passwd: write failed\n"); return false; }
+            ts_puts(ts, "passwd: password cleared (direct login)\n");
+            return true;
+        }
+        if (userdb64_set_password64(idx, pw) != 0) { ts_puts(ts, "passwd: write failed\n"); return false; }
+        ts_puts(ts, "passwd: password updated (stored as salted SHA-256; never plaintext)\n");
+        return true;
+    }
+    g_pw_pending = 1;                           // 交互形式：下一行隐藏输入（空行 = 取消）
+    i = 0;
+    while (who[i] && i < (int)sizeof(g_pw_user) - 1) { g_pw_user[i] = who[i]; i++; }
+    g_pw_user[i] = 0;
+    ts_puts(ts, "New password for ");
+    ts_puts(ts, who);
+    ts_puts(ts, " (input hidden; empty line cancels): ");
+    return true;
+}
+
+static void cmd_users(TerminalState* ts) {
+    static char buf[2048];
+    const int n = userdb64_report64(buf, (int)sizeof(buf));
+    for (int i = 0; i < n; i++) ts_putc(ts, (uint32_t)(unsigned char)buf[i]);
+    // ★ 同一份报告也进串口（自动验收要 grep `[USER64] users count=.. root=1 normal=..`；有界）
+    dbg64_line_begin64();
+    for (int i = 0; i < n; i++) {
+        const char c = buf[i];
+        if (c == '\n') dbg64_nl(); else dbg64_putc(c);
+    }
+    dbg64_line_end64();
+}
+
+static void cmd_whoami(TerminalState* ts) {
+    const char* u = userdb64_session_name64();
+    ts_puts(ts, u);
+    ts_putc(ts, (uint32_t)'\n');
+    dbg64_line_begin64();
+    dbg64_str("[USER64] whoami user=");
+    dbg64_str(u);
+    dbg64_str(" euid=");
+    dbg64_dec((uint64_t)userdb64_euid64());
+    dbg64_str(" gui=");
+    dbg64_str(userdb64_gui_user64() ? userdb64_gui_user64()->name : "-");
+    dbg64_str(" root_session=");
+    dbg64_dec((uint64_t)userdb64_root_session64());
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+static void cmd_id(TerminalState* ts) {
+    ts_puts(ts, "uid=");
+    ts_put_u64(ts, (uint64_t)userdb64_euid64());
+    ts_puts(ts, "(");
+    ts_puts(ts, userdb64_session_name64());
+    ts_puts(ts, ") gid=");
+    ts_put_u64(ts, (uint64_t)userdb64_euid64());
+    ts_puts(ts, " groups=");
+    ts_put_u64(ts, (uint64_t)userdb64_euid64());
+    ts_puts(ts, "(no permission checks yet; P4)\n");
+}
+
+static bool cmd_su(TerminalState* ts, const char* a1, const char* a2) {
+    const char* target = "root";                // 支持：su | su - | su - root | su root
+    const char* via = "su";
+    if (a1 && a1[0]) {
+        if (st_eq(a1, "-")) { via = "su-dash"; if (a2 && a2[0]) target = a2; }
+        else { target = a1; via = "su"; }
+    }
+    if (!st_eq(target, "root")) {
+        ts_puts(ts, "su: only 'root' can be switched to in this batch (P4 adds real users/setuid)\n");
+        return false;
+    }
+    if (userdb64_session_root64(via) != 0) {
+        ts_puts(ts, "su: FAILED (not logged in / already root / no root record)\n");
+        return false;
+    }
+    ts_puts(ts, "su: session identity is now root (uid=0).\n");
+    ts_puts(ts, "    NOTE: permission bits are NOT enforced yet (P4); the GUI user/avatar is unchanged.\n");
+    return true;
+}
+
+static bool cmd_sudo(TerminalState* ts, const char* a1) {
+    if (!a1 || !st_eq(a1, "-i")) {
+        ts_puts(ts, "sudo: only 'sudo -i' is implemented in this batch (no command execution yet)\n");
+        return false;
+    }
+    if (userdb64_session_root64("sudo-i") != 0) {
+        ts_puts(ts, "sudo: FAILED (not logged in / already root / no root record)\n");
+        return false;
+    }
+    ts_puts(ts, "sudo: session identity is now root (uid=0).\n");
+    ts_puts(ts, "      NOTE: permission bits are NOT enforced yet (P4); the GUI user/avatar is unchanged.\n");
+    return true;
+}
+
+static bool cmd_exit(TerminalState* ts) {
+    if (userdb64_session_exit64() == 0) {
+        ts_puts(ts, "exit: back to ");
+        ts_puts(ts, userdb64_session_name64());
+        ts_puts(ts, " (euid=");
+        ts_put_u64(ts, (uint64_t)userdb64_euid64());
+        ts_puts(ts, ")\n");
+        return true;
+    }
+    ts_puts(ts, "exit: this is not a root session (the terminal window stays open; use Esc to close)\n");
+    return false;
+}
+
+static bool cmd_loginctl(TerminalState* ts, const char* a1) {
+    if (!a1 || !a1[0]) {
+        ts_puts(ts, "loginctl: usage: loginctl lock   (lock the screen; only 'lock' is implemented)\n");
+        ts_puts(ts, "loginctl: session user=");
+        ts_puts(ts, userdb64_session_name64());
+        ts_puts(ts, " euid=");
+        ts_put_u64(ts, (uint64_t)userdb64_euid64());
+        ts_puts(ts, " gui=");
+        ts_puts(ts, userdb64_gui_user64() ? userdb64_gui_user64()->name : "-");
+        ts_putc(ts, (uint32_t)'\n');
+        return true;
+    }
+    if (st_eq(a1, "lock")) {
+        ts_puts(ts, "loginctl: locking (press Enter/click on the lock screen, then sign in again)\n");
+        locklogin64_lock64("terminal");
+        return true;
+    }
+    ts_puts(ts, "loginctl: unknown verb (only 'lock' is implemented)\n");
+    return false;
+}
+
 
 // 命令分发：cmd / arg1 / args（原文，供 echo / write 用）
 static void shell_exec(TerminalState* ts, const char* line) {
@@ -3642,6 +3886,26 @@ static void shell_exec(TerminalState* ts, const char* line) {
     } else if (st_eq(g_cmd, "proc")) {
         // 真：proc64 进程表（list / run / kill）；`proc run spin` 跑内嵌的长命程序 /spin.elf
         ok = cmd_proc(ts, g_arg1, g_arg2, args2);
+    } else if (st_eq(g_cmd, "useradd")) {
+        ok = cmd_useradd(ts, g_arg1);
+    } else if (st_eq(g_cmd, "userdel")) {
+        ok = cmd_userdel(ts, g_arg1);
+    } else if (st_eq(g_cmd, "passwd")) {
+        ok = cmd_passwd(ts, g_arg1, g_arg2);
+    } else if (st_eq(g_cmd, "users")) {
+        cmd_users(ts);
+    } else if (st_eq(g_cmd, "whoami")) {
+        cmd_whoami(ts);
+    } else if (st_eq(g_cmd, "id")) {
+        cmd_id(ts);
+    } else if (st_eq(g_cmd, "su")) {
+        ok = cmd_su(ts, g_arg1, g_arg2);
+    } else if (st_eq(g_cmd, "sudo")) {
+        ok = cmd_sudo(ts, g_arg1);
+    } else if (st_eq(g_cmd, "exit") || st_eq(g_cmd, "logout")) {
+        ok = cmd_exit(ts);
+    } else if (st_eq(g_cmd, "loginctl")) {
+        ok = cmd_loginctl(ts, g_arg1);
     } else if (st_eq(g_cmd, "bsod") || st_eq(g_cmd, "panic")) {
         // 真：受控蓝屏（kernel/panic64.cpp）。先打命令日志，再进 BSOD（不返回）
         term_log_cmd(g_cmd, true);
@@ -3692,7 +3956,8 @@ static void term_key(Window* w, char c) {
     if (c == '\n' || c == '\r') {          // 回车执行
         ts->cmdline[ts->cmdlen] = 0;
         ts_putc(ts, (uint32_t)'\n');
-        shell_exec(ts, ts->cmdline);
+        if (g_pw_pending) cmd_passwd_line(ts, ts->cmdline);   // ★ P1c：交互式口令那一行
+        else shell_exec(ts, ts->cmdline);
         ts->cmdlen = 0;
         shell_prompt(ts);
     } else if (c == '\b' || c == 0x7F) {   // 退格
@@ -3703,7 +3968,8 @@ static void term_key(Window* w, char c) {
     } else if ((unsigned char)c >= 0x20 && (unsigned char)c < 0x7F) {
         if (ts->cmdlen < TERM_CMD_MAX - 1) {
             ts->cmdline[ts->cmdlen++] = c;
-            ts_putc(ts, (uint32_t)(unsigned char)c);
+            // ★ P1c：口令输入不回显（只打 '*'）—— 明文绝不进屏/串口
+            ts_putc(ts, g_pw_pending ? (uint32_t)'*' : (uint32_t)(unsigned char)c);
         }
     }
 }
