@@ -308,11 +308,15 @@ static void divider(int x, int y, int w) {
     const Theme64Tokens* t = tk64();
     for (int i = 0; i < w; i++) gfx64_blend64(x + i, y, t->text_dim, 70);
 }
-// 卡片：双层浅阴影（Token）+ 内容层毛玻璃（Token 半径/卡片透明度）+ 1px 玻璃边/暗色内高光
+// 卡片：双层浅阴影（Token）+ 卡片透明度（Token A_CARD）+ 圆角（Token R_CARD）+ 1px 玻璃高光边。
+// ★ 性能硬约束（实测）：这里**不能**用 gfx64_glass64(layer=1) 那种"内容层逐像素毛玻璃"——
+//   626x280 的卡片在 QEMU TCG 下模糊一次要 5s 以上，直接触发 5s 看门狗 PANIC
+//   （desktop64_test 实测：打开设置窗口那一帧 [WD64] watchdog fire stale=5040ms）。
+//   所以卡片 = Token 的半透明填充 + 阴影 + 高光边（视觉上就是 Win11 的卡片；透明度/圆角/阴影全部走 Token）。
 static void card_rect(int x, int y, int w, int h) {
     const Theme64Tokens* t = tk64();
     p2ui_shadow64(x, y, w, h, THEME64_R_CARD, t);
-    gfx64_glass64(x, y, w, h, THEME64_R_CARD, 1, t->client_bg, THEME64_A_CARD, 0, 0, t);
+    gfx64_fill_round64(x, y, w, h, THEME64_R_CARD, t->dark ? t->title_bg : 0xFFFFFFu, THEME64_A_CARD);
     p2ui_stroke_mixed64(x, y, w, h, THEME64_R_CARD, THEME64_R_CARD,
                         t->dark ? t->highlight : 0xFFFFFFu, THEME64_A_EDGE);
 }
@@ -1087,7 +1091,8 @@ static void nav_rect(const Lay* L, int page, int* x, int* y, int* w, int* h) {
 static void draw_nav(const Lay* L, int x0, int y0) {
     const Theme64Tokens* t = tk64();
     // 导航底：亚克力（Token 的标题层透明度）
-    p2ui_acrylic_mixed64(x0, y0, L->nav_w, L->ch, 0, 0, t->title_bg, THEME64_A_TITLE, t);
+    // 导航底：Token 的标题层透明度（半透明填充；同样理由不用逐像素毛玻璃，见 card_rect 的说明）
+    fb_fill_rect_alpha(x0, y0, L->nav_w, L->ch, t->title_bg, THEME64_A_TITLE);
     // 用户头像小圆 + 用户名（Win11 导航底部；这里放顶部，避免与条目抢高度）
     int y = L->nav_top;
     for (int p = 0; p < P_COUNT; p++) {
@@ -2377,7 +2382,7 @@ static void set_draw(Window* w) {
         if (prog < 256) {
             // 淡入：用客户区底色按剩余进度盖一层（Token 透明度的整数混合）
             const int a = 255 - prog * 255 / 256;
-            if (a > 0) p2ui_fill_mixed64(ax, y0, aw, ch, 0, 0, t->client_bg, a);
+            if (a > 0) fb_fill_rect_alpha(ax, y0, aw, ch, t->client_bg, a);
         }
     }
     // 消息行（全局最后画，覆盖内容）
