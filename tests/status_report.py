@@ -515,7 +515,7 @@ def cap_ui_modern():
     dk = grep_count(r"dock_geom_init64|dock_anim_tick64|dock_hit64|draw_dock", ["kernel/gui64.cpp"])
     g1 = exists("tests/gfx64_test.py")
     g2 = exists("tests/gui_modern64_test.py")
-    ev = ["theme64 = Token 唯一真源（圆角 14/12/9/24、模糊 24/12、透明度 0.45/0.80、双层阴影、150/220/320ms）：命中 %d" % tk,
+    ev = ["theme64 = Token 唯一真源（圆角 14/12/9/24、模糊 24/12、透明度 0.45/0.80、双层阴影、150/225/330ms）：命中 %d" % tk,
           "gfx64 圆角/双层阴影/毛玻璃缓存/壁纸 6 适应模式：命中 %d" % gl,
           "gui64 新 Dock（几何/动画/命中/绘制）：命中 %d" % dk,
           "验收脚本 tests/gfx64_test.py：%s / tests/gui_modern64_test.py：%s" % ("有" if g1 else "★ 缺", "有" if g2 else "★ 缺"),
@@ -1490,6 +1490,36 @@ def cap_perm_v4():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+
+def cap_settings_p3():
+    """★ P3 设置页（Win11 风格）：左导航 240px + 六组卡片（系统/个性化/网络/用户/安全/关于），全部实时生效并持久化。"""
+    need = ["kernel/settings64.h", "kernel/settings64.cpp"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    n = lines("kernel/settings64.cpp")
+    mk = grep_count(r"SET64", ["kernel/settings64.cpp"])
+    nav = grep_count(r"nav w=|nav_rect|draw_nav", ["kernel/settings64.cpp"])
+    cfg = grep_count(r"ui\.font\.size|ui\.def\.", ["kernel/config64.cpp"])
+    fnt = grep_count(r"font_set_size64", ["kernel/font.cpp"])
+    tst = exists("tests/settings64_test.py")
+    ev = ["settings64.cpp %d 行；左导航 240px（nav w=|nav_rect|draw_nav 命中 %d）；打点 [SET64]：命中 %d" % (n, nav, mk),
+          "配置真源 config64（ui.font.size|ui.def. 命中 %d）+ 字号接线 font_set_size64（font.cpp 命中 %d）" % (cfg, fnt),
+          "六组：系统（显示/声音/电源）/ 个性化（主题 7 套/壁纸/颜色渐变/壁纸适应模式（桌面与锁屏分别）/Dock 长度·图标尺寸·间距/字体大小）/ "
+          "网络（以太网真状态 + WiFi 无硬件）/ 用户（内置 3 头像 + 本地 PNG/改名）/ 安全（密码设置与清空）/ 关于（版本/驱动/GPU + 硬件检查）",
+          "实测串口：\"[SET64] nav w=240 item_h=27 groups=6 items=16 …\"、\"[SET64] page=4 name=theme anim=225 how=nav\"",
+          "实测串口：\"[SET64] theme id=1 name=dark … persisted=1\"（软重启后 [THEME64] init 仍暗色）、"
+          "\"[SET64] dock len=872 auto=0 icon=46 gap=11 size=60 why=slider applied=1 persisted=1\"",
+          "实测串口：\"[SET64] default kind=txt app=mypc … persisted=1\"、\"[SET64] about … drivers implemented=12 missing=4 gpu=software\"、"
+          "\"[SET64] gpu accel=none renderer=software reason=no GPU driver\"",
+          "验收脚本 tests/settings64_test.py：%s（105 条断言：六组逐条 + 主题/壁纸适应模式（桌面/锁屏分别）/Dock 长度与图标尺寸实时生效/"
+          "字体大小/默认应用/头像/改名/密码设置与清空/关于页 + 软重启后持久化 + 设密码后重启必须输密码）" % ("有" if tst else "★ 缺"),
+          "边界（如实）：卡片/导航是 Token 半透明填充，**不是逐像素毛玻璃**（逐像素内容层模糊在 TCG 下 >5s 会触发看门狗）；"
+          "音频仅内存态（无驱动）；WiFi 无硬件；刷新率只读；dock.size 未接外壳；字体大小只改 font.cpp（em 12–18，未改 8×8 位图/终端网格）；"
+          "默认应用只做映射+持久化（无关联引擎）；主题/头像/用户名/密码的正路是设置页，终端 passwd/useradd 作为管理员工具保留"]
+    done = mk and nav and cfg and fnt and tst
+    return ("DONE" if done else "PARTIAL"), ev
+
 CAPS = [
     ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
      cap_boot_console),
@@ -1545,8 +1575,10 @@ CAPS = [
     ("内核", "SMP（启动 AP）", cap_smp_ap),
     ("应用", "★ 锁屏 + 登录 + 多用户骨架（/etc/users.db 加盐哈希；su/sudo 会话身份；root 不在登录界面）", cap_users_login),
     ("应用", "★ 开始菜单 + 四个二级弹窗（通知/声音/网络/日历）+ 设备插拔 toast + Caps/Shift/滚轮", cap_startmenu_p2),
+    ("应用", "★ Win11 风格设置（左导航 240px + 六组：系统/个性化/网络/用户/安全/关于；全部实时生效并持久化）", cap_settings_p3),
     ("内核", "★ VimtuFS2 v4 权限（uid/gid/mode + owner/group/other rwx 拦截；v3 旧卷兼容但豁免）", cap_perm_v4),
 ]
+
 
 TESTS = [
     ("boot64_assert.py", "M0/M1：长模式/IDT/PIT/BootInfo"),
@@ -1604,6 +1636,7 @@ TESTS = [
     ("startmenu64_test.py", "★ P2 开始菜单：居中/离 Dock 11px/上圆角 24 下 10/搜索启动/2×4 固定网格/状态区线性图标/电源菜单/ESC 两级退出（58 条断言）"),
     ("panels64_test.py", "★ P2 四弹窗：通知(角标/空态)+声音(滑块百分比/输出源/如实未接驱动)+网络(WiFi 如实空态+以太网区固定)+日历(7×6/滚轮·方向键·PageUp/PageDown/今天/年份面板)+设备 toast 滑入滑出（78 条断言）"),
     ("perm64_test.py", "★ P4 权限：卷 v4(uid/gid/mode)+owner/group/other rwx 真拦截(root 绕过)+su/sudo 真提权+chmod/chown/umask+ls -l（95 条断言，含 v3 旧卷兼容）"),
+    ("settings64_test.py", "★ P3 设置页：左导航 240px + 六组 + 主题/壁纸适应模式(桌面/锁屏分别)/Dock 长度与图标尺寸实时生效/字体大小/默认应用/头像/改名/密码设置与清空/关于页；含软重启后的持久化与\"设密码→重启必须输密码\"（105 条断言）"),
 ]
 
 
