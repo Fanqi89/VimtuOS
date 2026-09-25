@@ -9,7 +9,8 @@
 // 像素格式：解码结果统一 0xAARRGGBB（A=255 表示不透明）；壁纸铺图时会丢掉 alpha（0x00FFFFFF 掩码）。
 //
 // 串口打点（自动验收 grep；带防刷屏上限）：
-//   [IMG64] selftest PASS png=4x4 rc=0
+//   [IMG64] selftest PASS png=4x4 rc=0 bytes=112 fmt=png real=158x158
+//   [IMG64] selftest real ok=1 bytes=19810 158x158 px=24964 fnv=00000000EAD69FF1 rc=0 fmt=png
 //   [IMG64] decode png 4x4 ct=6 bd=8 bytes=112 -> px=16
 //   [IMG64] load vfs:/wallpaper.png size=... png=1400x1000
 //   [IMG64] load skip path=/wallpaper.png reason=not-found
@@ -42,5 +43,8 @@ const char* img64_last_fmt64();
 // 缩放（最近邻；src 是 AARRGGBB）：dst 需要 dw*dh*4 字节
 void img64_scale64(const Img64* src, uint32_t* dst, int dw, int dh);
 
-// 自检（启动期调用；解内核内嵌的 4x4 测试 PNG 并逐像素比对）：返回 0 = 通过
+// 自检（启动期调用；返回 0 = 通过）：
+//   * 内嵌 4x4 PNG 逐像素比对 + 缩放用例；
+//   * ★ 真文件 logo/kaisi.png（内核内嵌原始字节，158x158 RGBA）解码 -> 尺寸 + 整块像素缓冲 FNV-1a 32
+//     指纹比对（宿主侧 PIL/纯 Python 同一指纹）——专门挡住 inflate 的"动态块之后收尾固定块"这类退化。
 int img64_selftest64();

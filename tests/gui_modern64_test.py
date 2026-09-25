@@ -19,7 +19,8 @@
                       [GFX64] wall 几何（dst/scale/crop/tiles）+ 4 个定位标记的屏幕位置/裁剪 +
                       留白（无图区域方差≈0）/ 平铺接缝（x=1200 列 == x=0 列）/ 拉伸比例失真。
   7) 减少动画开关      Ctrl+Shift+R -> [THEME64] motion reduce=1 dock=0ms，点击后 bounce frames=1 motion=reduced。
-  8) 开始按钮真图      [IMG64] install/load path=/logo/kaisi.png ok=1 + [DOCK64] start icon src=vfs:/logo/kaisi.png；
+  8) 开始按钮真图      [IMG64] install/load path=/logo/kaisi.png ok=1 + [IMG64] selftest real ok=1
+                       + [DOCK64] start icon src=/logo/kaisi.png（或带 vfs: 前缀的同一条）；
                       宿主 Pillow 解 logo/kaisi.png（按内核 dock_rgba_from_img64 的 46x46 最近邻映射）与
                       截图里开始按钮逐像素比对；冷启动第二遍 reason=exists；再把盘上那份真图的第一块改坏，
                       验证「画出来的像素真的来自盘上文件」（load ok=0 -> 走 /kaisi.png 兜底）。
@@ -121,6 +122,13 @@ def diff_count(a, b):
     return n
 
 
+def dock_src_is_vfs(src):
+    """[DOCK64] start icon src= 是否为"从 VimtuFS2 读到的真图"（不是内核内置兜底）。
+    gui64 现在打的 src 是**裸路径**（/logo/kaisi.png、/kaisi.png）；早期文档写成 vfs:/... 前缀。
+    两种形式都算真图；只有 builtin:icon_start.bin 是内置兜底。"""
+    return isinstance(src, str) and (src.startswith("vfs:/") or src.startswith("/"))
+
+
 # ==================== 真图验收用的宿主侧工具（Pillow + VimtuFS2 v3 直读）====================
 PNG_LOGO = os.path.join(ROOT, "logo", "kaisi.png")
 SECTOR = 512
@@ -145,6 +153,29 @@ def png_render46(png_bytes, d=46):
         for x in range(d):
             cells.append(px[x * w // d, sy])
     return cells, (w, h)
+
+
+def png_full_fnva(png_bytes):
+    """宿主侧真文件基准：PIL 解**整张** PNG -> 内核同款 AARRGGBB 缓冲（小端）-> FNV-1a 32。
+    没有 Pillow 时返回 None（调用方按"跳过指纹比对"处理）。"""
+    try:
+        import io
+        import struct as _s
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        data = Image.open(io.BytesIO(png_bytes)).convert("RGBA").tobytes()
+    except Exception:
+        return None
+    buf = bytearray(len(data))
+    for i in range(0, len(data), 4):
+        r, g, b, a = data[i], data[i + 1], data[i + 2], data[i + 3]
+        buf[i:i + 4] = _s.pack("<I", (a << 24) | (r << 16) | (g << 8) | b)
+    h = 2166136261
+    for x in buf:
+        h = ((h ^ x) * 16777619) & 0xFFFFFFFF
+    return h
 
 
 def wait_repaint64(vm, since, timeout=30):
@@ -484,7 +515,7 @@ def main():
         else:
             check("开始按钮 ok=1（内置兜底或 VimtuFS2 真图，--img 指定盘）",
                   si is not None and si.group(3) == "1" and
-                  (si.group(1) == "builtin:icon_start.bin" or si.group(1).startswith("vfs:")),
+                  (si.group(1) == "builtin:icon_start.bin" or dock_src_is_vfs(si.group(1))),
                   si.group(0) if si else "（无）")
             check("真图来源可审计（install/load 打点都在）",
                   re.search(r"\[IMG64\] install (skip )?path=/logo/kaisi\.png", log) is not None and
@@ -721,6 +752,9 @@ def main():
             elif "[GFX64] wall mode=0 name=fill" not in vm.log():
                 mon.key("ctrl-shift-n", wait=1.0)
             wl = vm.wait_log("[GFX64] wall mode=%d name=%s" % (want_mode, want_name), 30)
+            if not wl and want_mode != 0:   # 按键偶发丢失：再按一次（QEMU sendkey 在多核/忙时可能丢）
+                mon.key("ctrl-shift-n", wait=1.0)
+                wl = vm.wait_log("[GFX64] wall mode=%d name=%s" % (want_mode, want_name), 30)
             check("模式 %d（%s）生效并打了几何行" % (want_mode, want_name), wl)
             time.sleep(2.5)
             spawn = os.path.join(tmp, "wall%d.ppm" % want_mode)
@@ -884,11 +918,24 @@ def main():
                       load is not None and load.group(1) == str(len(png_src)) and
                       (int(load.group(2)), int(load.group(3))) == png_dim,
                       load.group(0) if load else "（无）")
+                # ★ 启动自检的"真文件"用例（1 个大动态 Huffman 块 + 收尾空固定块 + 100 KB 输出）：
+                #   内核解出的像素指纹必须等于宿主 PIL 解同一份文件的指纹（老 inflate 在这里 rc=18）
+                sr = re.search(r"\[IMG64\] selftest real ok=(\d+) bytes=(\d+) (\d+)x(\d+) px=(\d+) "
+                               r"fnv=([0-9A-Fa-f]{16}) rc=(\d+)", L1)
+                hfnv = png_full_fnva(png_src)
+                check("启动自检解真文件 logo/kaisi.png（[IMG64] selftest real ok=1 rc=0）",
+                      sr is not None and sr.group(1) == "1" and sr.group(7) == "0",
+                      sr.group(0) if sr else (re.search(r"\[IMG64\] selftest real[^\r\n]*", L1) or ["（无）"])[0])
+                if sr is not None and hfnv is not None:
+                    check("自检像素指纹 = 宿主 PIL 解码同一文件（FNV-1a 32，逐字节）",
+                          int(sr.group(2)) == len(png_src) and int(sr.group(6), 16) == hfnv,
+                          "内核 bytes=%s fnv=%s / 宿主 bytes=%d fnv=%08X"
+                          % (sr.group(2), sr.group(6), len(png_src), hfnv))
                 check("没有走 skip（有卷时不许 [IMG64] load skip path=/logo/kaisi.png）",
                       "[IMG64] load skip path=/logo/kaisi.png" not in L1)
                 sx1 = re.search(r"\[DOCK64\] start icon src=(\S+) size=(\d+) ok=(\d)", L1)
-                check("Dock 开始按钮 src=vfs:/logo/kaisi.png（用的是盘上真图）",
-                      sx1 is not None and sx1.group(1) == "vfs:/logo/kaisi.png" and sx1.group(3) == "1",
+                check("Dock 开始按钮用的是盘上真图（src=vfs:/logo/kaisi.png 或 /logo/kaisi.png）",
+                      sx1 is not None and dock_src_is_vfs(sx1.group(1)) and sx1.group(3) == "1",
                       sx1.group(0) if sx1 else "（无）")
                 check("夹具盘第一遍没有 PANIC/selftest FAIL/OOM",
                       "PANIC" not in L1 and "selftest FAIL" not in L1 and "OOM:" not in L1)
@@ -983,7 +1030,7 @@ def main():
                               (re.search(r"\[IMG64\] load path=/logo/kaisi\.png[^\r\n]*", L2) or ["（无）"])[0])
                         check("于是落到 VimtuFS2 的第二条候选 /kaisi.png（load ok=1 + src=vfs:/kaisi.png）",
                               re.search(r"\[IMG64\] load path=/kaisi\.png ok=1 bytes=\d+ fmt=png", L2) is not None and
-                              re.search(r"\[DOCK64\] start icon src=vfs:/kaisi\.png size=\d+ ok=1", L2) is not None,
+                              re.search(r"\[DOCK64\] start icon src=(?:vfs:)?/kaisi\.png size=\d+ ok=1", L2) is not None,
                               (re.search(r"\[DOCK64\] start icon src=\S+[^\r\n]*", L2) or ["（无）"])[0])
                         check("第二遍没有 PANIC/selftest FAIL/OOM",
                               "PANIC" not in L2 and "selftest FAIL" not in L2 and "OOM:" not in L2)

@@ -117,6 +117,118 @@ def dist(a, b):
     return sum(abs(a[i] - b[i]) for i in range(3))
 
 
+# ==================== 真文件回归基准：宿主侧独立解 PNG ====================
+# inflate 用 zlib（= 与内核无关的第二实现），反滤波/展开按 kernel/img64.cpp 的同一套步骤，
+# 产出内核同款 AARRGGBB 像素缓冲（小端字节序），供 FNV-1a 32 指纹比对。
+def img64_fnval(buf):
+    h = 2166136261
+    for b in buf:
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def host_png_aarrggbb(png):
+    """返回 (w, h, AARRGGBB 小端 bytes)；不支持的形态返回 None。"""
+    import struct as _s
+    import zlib as _z
+    if len(png) < 8 or png[:4] != b"\x89PNG":
+        return None
+    w = h = bd = ct = 0
+    plte = None
+    trns = b""
+    idat = b""
+    p = 8
+    while p + 8 <= len(png):
+        ln = _s.unpack(">I", png[p:p + 4])[0]
+        t = png[p + 4:p + 8]
+        c = png[p + 8:p + 8 + ln]
+        if t == b"IHDR":
+            w, h, bd, ct = _s.unpack(">IIBB", c[:10])
+        elif t == b"PLTE":
+            plte = c
+        elif t == b"tRNS":
+            trns = c
+        elif t == b"IDAT":
+            idat += c
+        elif t == b"IEND":
+            break
+        p += 12 + ln
+    if ct not in (0, 2, 3, 4, 6) or w <= 0 or h <= 0:
+        return None
+    ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ct]
+    stride = (w * ch * bd + 7) // 8
+    raw = _z.decompress(idat)
+    if len(raw) != (stride + 1) * h:
+        return None
+    bpp = max(1, (ch * bd + 7) // 8)
+    prev = bytearray(stride)
+    out = []
+    off = 0
+    for _y in range(h):
+        ft = raw[off]
+        src = raw[off + 1:off + 1 + stride]
+        off += 1 + stride
+        cur = bytearray(stride)
+        if ft == 0:
+            cur[:] = src
+        elif ft == 1:
+            for i in range(stride):
+                cur[i] = (src[i] + (cur[i - bpp] if i >= bpp else 0)) & 0xFF
+        elif ft == 2:
+            for i in range(stride):
+                cur[i] = (src[i] + prev[i]) & 0xFF
+        elif ft == 3:
+            for i in range(stride):
+                left = cur[i - bpp] if i >= bpp else 0
+                cur[i] = (src[i] + ((left + prev[i]) >> 1)) & 0xFF
+        elif ft == 4:
+            for i in range(stride):
+                a = cur[i - bpp] if i >= bpp else 0
+                bb = prev[i]
+                cc = prev[i - bpp] if i >= bpp else 0
+                pp = a + bb - cc
+                pa, pb, pc = abs(pp - a), abs(pp - bb), abs(pp - cc)
+                pr = a if (pa <= pb and pa <= pc) else (bb if pb <= pc else cc)
+                cur[i] = (src[i] + pr) & 0xFF
+        else:
+            return None
+        prev = cur
+        for x in range(w):
+            if bd == 8:
+                s = cur[x * ch:(x + 1) * ch]
+                if ch == 1:
+                    out.append(0xFF000000 | (s[0] << 16) | (s[0] << 8) | s[0])
+                elif ch == 2:
+                    out.append((s[1] << 24) | (s[0] << 16) | (s[0] << 8) | s[0])
+                elif ch == 3:
+                    out.append(0xFF000000 | (s[0] << 16) | (s[1] << 8) | s[2])
+                else:
+                    out.append((s[3] << 24) | (s[0] << 16) | (s[1] << 8) | s[2])
+            elif bd == 16 and ch in (1, 2, 3, 4):
+                s = cur[x * ch * 2:(x + 1) * ch * 2]
+                if ch == 1:
+                    out.append(0xFF000000 | (s[0] << 16) | (s[0] << 8) | s[0])
+                elif ch == 2:
+                    out.append((s[2] << 24) | (s[0] << 16) | (s[0] << 8) | s[0])
+                elif ch == 3:
+                    out.append(0xFF000000 | (s[0] << 16) | (s[2] << 8) | s[4])
+                else:
+                    out.append((s[6] << 24) | (s[0] << 16) | (s[2] << 8) | s[4])
+            elif bd in (1, 2, 4) and ch == 1:
+                per = 8 // bd
+                v = (cur[x // per] >> (8 - bd * (x % per + 1))) & ((1 << bd) - 1)
+                if ct == 3:
+                    if plte is None or v * 3 + 2 >= len(plte):
+                        return None
+                    a = trns[v] if v < len(trns) else 255
+                    out.append((a << 24) | (plte[v * 3] << 16) | (plte[v * 3 + 1] << 8) | plte[v * 3 + 2])
+                else:
+                    g = v * 255 // ((1 << bd) - 1)
+                    out.append(0xFF000000 | (g << 16) | (g << 8) | g)
+            else:
+                return None
+    return w, h, _s.pack("<%dI" % len(out), *out)
+
 def region_var(px, w, x0, y0, rw, rh):
     """局部方差（只算绿通道，返回放大 100 倍的整数，和内核 gfx64_var64 同口径）。"""
     vals = []
@@ -276,6 +388,32 @@ def main():
         check("开始图标兜底路径打点（kaisi.png 的 RGBA 内嵌副本）",
               re.search(r"\[DOCK64\] start icon src=(\S+) size=(\d+) ok=1", log) is not None,
               (re.search(r"\[DOCK64\] start icon src=(\S+) size=(\d+) ok=1", log) or [None, "?"])[0])
+        # ★ 真文件回归：启动自检必须能**解出真文件 logo/kaisi.png**（= 1 个大动态 Huffman 块 + 收尾空固定块 +
+        #   100 KB 输出；老 inflate 在这里 inflate_rc=18，整张图解不出来），并用宿主侧**独立实现**（zlib）
+        #   解出的像素指纹逐字节比对——这个缺陷以后不会再悄悄回归。
+        try:
+            with open(os.path.join(ROOT, "logo", "kaisi.png"), "rb") as f:
+                png_src = f.read()
+        except OSError:
+            png_src = b""
+        check("宿主侧 logo/kaisi.png 可读（回归基准）", len(png_src) > 0, "%d 字节" % len(png_src))
+        rl = re.search(r"\[IMG64\] selftest real ok=(\d+) bytes=(\d+) (\d+)x(\d+) px=(\d+) "
+                       r"fnv=([0-9A-Fa-f]{16}) rc=(\d+)", log)
+        check("启动自检解真文件 logo/kaisi.png（[IMG64] selftest real ok=1 rc=0）",
+              rl is not None and rl.group(1) == "1" and rl.group(7) == "0",
+              rl.group(0) if rl else (re.search(r"\[IMG64\] selftest real[^\r\n]*", log) or ["（无）"])[0])
+        host_px = host_png_aarrggbb(png_src) if png_src else None
+        if rl is not None and host_px is not None:
+            hw, hh, hbuf = host_px
+            check("自检报的 bytes = 真文件大小", int(rl.group(2)) == len(png_src),
+                  "内核 %s vs 宿主 %d" % (rl.group(2), len(png_src)))
+            check("自检报的尺寸 = 宿主解 PNG 的尺寸", (int(rl.group(3)), int(rl.group(4))) == (hw, hh),
+                  "内核 %sx%s vs 宿主 %dx%d" % (rl.group(3), rl.group(4), hw, hh))
+            check("自检像素指纹 = 宿主解 PNG 的像素指纹（FNV-1a 32，逐字节）",
+                  int(rl.group(6), 16) == img64_fnval(hbuf),
+                  "内核 fnv=%s 宿主 fnv=%08X（%dx%d）" % (rl.group(6), img64_fnval(hbuf), hw, hh))
+        elif host_px is None and png_src:
+            print("      宿主解码器不支持这个 PNG 形态，跳过指纹比对")
 
         print("=== 4) Dock 面板几何 + 圆角抗锯齿（像素）===")
         g = re.search(r"\[DOCK64\] geom x=(\d+) y=(\d+) w=(\d+) h=(\d+) r=(\d+) icon=(\d+) gap=(\d+) items=(\d+) margin=(\d+) center=1 screen=(\d+)x(\d+)", log)

@@ -100,9 +100,14 @@ static const short kDistExtra[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9
 
 static Huff64 g_len_h, g_dist_h;         // 固定/动态块共用（单线程，静态表足够）
 
+// ★ 固定 Huffman 表：**每遇到一个 BTYPE=1 块都必须重建**，不能做"只建一次"的缓存。
+//   原因：g_len_h/g_dist_h 与动态块共用；动态块解完后这两张表是**动态表**，
+//   而 zlib 生成的流常见形态是"一个大动态块 + 收尾的空固定块（BFINAL=1，只含 EOB）"。
+//   老实现用 static built 缓存 -> 固定块拿动态表解固定码 -> 解出乱码符号、把输入读到尽头，
+//   整张图 decode 失败（实测 [IMG64] decode png rc=3 err=inflate failed inflate_rc=18，
+//   真文件 logo/kaisi.png 就是这么挂的；4x4 自检因为只有一个固定块反而看不出来）。
+//   重建只要 288+30 次赋值，代价可忽略。
 static int inflate_fixed_tables() {
-    static bool built = false;
-    if (built) return 0;
     short l[288];
     int i = 0;
     for (; i < 144; i++) l[i] = 8;
@@ -113,7 +118,6 @@ static int inflate_fixed_tables() {
     short d[30];
     for (i = 0; i < 30; i++) d[i] = 5;
     if (huff_build(&g_dist_h, d, 30) != 0) return -1;
-    built = true;
     return 0;
 }
 
@@ -606,7 +610,8 @@ void img64_scale64(const Img64* src, uint32_t* dst, int dw, int dh) {
 }
 
 // ==================== 自检 ====================
-// 内嵌 4x4 RGBA PNG（由 Python zlib 生成；112 字节，含全部 5 种滤波之外的"None"行 + deflate 动态/固定块覆盖）
+// 内嵌 4x4 RGBA PNG（由 Python zlib 生成；112 字节，行滤波全为 None，deflate 是**单个固定 Huffman 块**）
+// ★ 因此它挡不住"动态块之后再遇到固定块"这类缺陷（真文件回归用例见下面的 logo/kaisi.png）。
 static const uint8_t kTestPng[112] = {
     0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,0x00,0x00,0x00,0x04,
     0x00,0x00,0x00,0x04,0x08,0x06,0x00,0x00,0x00,0xA9,0xF1,0x9E,0x7E,0x00,0x00,0x00,0x37,0x49,0x44,0x41,
@@ -623,6 +628,22 @@ static const uint32_t kTestPix[16] = {
     0x00804020, 0x00204080, 0x00C8C8C8, 0x000A141E,
     0x00FF8000, 0x000080FF, 0x005A5A5A, 0x00F0F0F0,
 };
+
+// ★ 真文件回归用例：内核内嵌的 logo/kaisi.png 原始字节（build64.sh 用 objcopy 嵌 _binary_kaisi_png_*，
+//   只链进系统内核；img64.cpp 也只编进系统内核，所以这里直接引用安全）。
+//   158x158 / RGBA8：IDAT 19,396 B -> inflate 100,014 B，形态是"1 个大动态块 + BFINAL 的收尾空固定块"，
+//   正是曾经解不出来的那种流（固定表只建一次 -> 收尾固定块拿动态表解 -> inflate_rc=18）。
+//   期望像素指纹由宿主侧独立算出（纯 Python 解码 + Pillow 双向核对，两者一致）。
+extern "C" const uint8_t _binary_kaisi_png_start[];
+extern "C" const uint8_t _binary_kaisi_png_end[];
+#define IMG64_REAL_W      158
+#define IMG64_REAL_H      158
+#define IMG64_REAL_PIXFNV 0xEAD69FF1u
+static uint32_t img64_fnv32_64(const uint8_t* p, int n) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
 
 int img64_selftest64() {
     int fails = 0;
@@ -641,6 +662,19 @@ int img64_selftest64() {
         if ((tmp[0] & 0x00FFFFFFu) != 0x00FF0000) fails |= 8;
         if ((tmp[7 * 8 + 7] & 0x00FFFFFFu) != 0x00F0F0F0) fails |= 16;
     }
+    // 第三个用例（★ 本批新增）：真文件 logo/kaisi.png —— 动态 Huffman + 收尾固定块 + 100 KB 输出；
+    // 比对尺寸与**整块像素缓冲的 FNV-1a 32**（宿主侧 PIL/纯 Python 同一指纹），以后不会再悄悄退化。
+    const int real_len = (int)(_binary_kaisi_png_end - _binary_kaisi_png_start);
+    Img64 real{};
+    uint32_t real_fnv = 0;
+    const int rc_real = real_len > 0 ? img64_decode64(_binary_kaisi_png_start, real_len, &real) : -1;
+    if (rc_real != 0) {
+        fails |= 32;
+    } else {
+        if (real.w != IMG64_REAL_W || real.h != IMG64_REAL_H) fails |= 32;
+        real_fnv = img64_fnv32_64((const uint8_t*)real.px, real.w * real.h * 4);
+        if (real_fnv != IMG64_REAL_PIXFNV) fails |= 64;
+    }
     dbg64_line_begin64();
     dbg64_str("[IMG64] selftest ");
     dbg64_str(fails == 0 ? "PASS" : "FAIL");
@@ -652,8 +686,33 @@ int img64_selftest64() {
     dbg64_dec((uint64_t)sizeof(kTestPng));
     dbg64_str(" fmt=");
     dbg64_str(g_fmt);
+    dbg64_str(" real=");
+    dbg64_dec((uint64_t)real.w);
+    dbg64_str("x");
+    dbg64_dec((uint64_t)real.h);
     dbg64_nl();
     dbg64_line_end64();
+    // 专项打点（自动验收 grep）：解真文件 logo/kaisi.png 的结果 + 像素指纹
+    dbg64_line_begin64();
+    dbg64_str("[IMG64] selftest real ok=");
+    dbg64_dec((uint64_t)((fails & (32 | 64)) == 0 ? 1 : 0));
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)real_len);
+    dbg64_str(" ");
+    dbg64_dec((uint64_t)real.w);
+    dbg64_str("x");
+    dbg64_dec((uint64_t)real.h);
+    dbg64_str(" px=");
+    dbg64_dec((uint64_t)(real.w * real.h));
+    dbg64_str(" fnv=");
+    dbg64_hex64((uint64_t)real_fnv);
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)(unsigned)(-rc_real));
+    dbg64_str(" fmt=");
+    dbg64_str(g_fmt);
+    dbg64_nl();
+    dbg64_line_end64();
+    img64_free64(&real);
     img64_free64(&im);
     return fails;
 }
