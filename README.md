@@ -7,25 +7,27 @@
 全部是本工程自己的 C++ / 汇编代码。
 它自带一张"三合一"安装盘（BIOS 光盘 / U 盘 / UEFI），安装界面与步骤照 Windows 10 做（去掉了输入产品密钥那一步）。
 
-> 版本 **0.2.3-beta11** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
-> 状态（权威判据：`python tests/status_report.py`，本批实测）：**完成 47 / 部分 0 / 未做 0（共 47 项能力）** ——
-> 原唯一未做项 **Rust 参与实现**已在**批次 P1** 落地（`gui_rs` crate：设计 Token + 主题配色真源，只链进系统内核；
-> 安装介质里 0 个 Rust 符号）。
-> 全量验收（`--full` + 专项/扩展脚本）：**38 个断言脚本**（上一批 34 个脚本的实测结论保持不变，本批新增 4 个全 PASS）：
-> **rust64_test（Rust 接入：gui_rs 符号进系统内核 + 安装内核 0 符号 + Token 与 Rust 源码比对）124 条断言**、
-> **gfx64_test（圆角抗锯齿 / 双层阴影 / 毛玻璃 / 壁纸 6 种适应模式）55 条断言**、
-> **gui_modern64_test（Dock 几何 / 悬停放大让位 / 点击回弹 / 7 套主题 / 开始按钮真图）149 条断言**、
-> **locklogin64_test（锁屏 / 登录 / 多用户骨架）88 条断言**；
-> 上一批的 **usbstorage_test 99 条**、**bootlog64_test 30 条**、**fileops64_test 95 条** 与
-> multivol64(108)/explorer64(71)/fatread64(61)/fs_tree(85)/fs_term(32)/fd64(34)/store64(46)/
-> app64(31)/elf64(56)/proc64(67)/sysstate64/boot64_assert 等既有脚本的结论照旧。
+> 版本 **0.3.1-beta13** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
+> 状态（权威判据：`python tests/status_report.py`，本批实测）：**完成 49 / 部分 0 / 未做 0（共 49 项能力）** ——
+> 本批（**P2 + P4**）新增两项能力：**开始菜单 + 四个二级弹窗（通知/声音/网络/日历）+ 设备插拔 toast + Caps/Shift/滚轮**、
+> **VimtuFS2 v4 权限（uid/gid/mode + owner/group/other rwx 真拦截；v3 旧卷兼容但豁免）**。
+> 全量验收（`status_report.py --full` 的 `TESTS` 列表 + 专项/扩展脚本）：**43 个断言脚本**（列表长度实测 43；上一批脚本的结论保持不变）：
+> **startmenu64_test（开始菜单：居中 / 离 Dock 11px / 上圆角 24 下 10 / 400×420 / 搜索启动 / 2×4 固定网格 / ESC 两级退出）58 条断言**、
+> **panels64_test（四个弹窗 + 设备 toast 滑入滑出）78 条断言**、
+> **perm64_test（卷 v4 + owner/group/other rwx 真拦截 + su/sudo 提权 + chmod/chown/umask）95 条断言**、
+> **store64_test 55 条**（P1c 登录期自动落盘语义）、**locklogin64_test 88 条**；
+> 上一批的 **rust64_test 124**、**gfx64_test 55**、**gui_modern64_test 149** 与 usbstorage(99)/bootlog64(30)/
+> fileops64(95)/explorer64(71)/fatread64(61)/fs_tree(87)/fs_term(32)/fd64(34)/bigfile64(61)/multivol64(109)/
+> app64(31)/elf64(56)/proc64(67)/sysstate64/boot64_assert 等既有脚本的结论照旧（本批 **0 FAIL**）。
 
 ---
 
 ## 一、它能做什么
 
 | 能力 | 说明 |
-| **★ 锁屏 + 登录 + 多用户骨架（批次 P1c）** | `kernel/locklogin64.{h,cpp}`（1447 行）：开机第一屏 = **锁屏**（时间 **72px**、年月日 **18px**、白色亚克力、背景**清晰不模糊**）→ 回车/点击 → 背景**清晰→模糊 20px**（动画 250–350ms，取 300ms）→ **登录界面**（**104px** 圆头像、**96×96 圆角 24** 主题渐变登录按钮、有密码时 **360×48** 磨砂密码框 + **48×48** 确认按钮；ESC 平滑反向返回）；`kernel/userdb64.{h,cpp}`（1186 行）：用户库 **`/etc/users.db` v1 文本**（用户名/UID/主目录/头像/加盐哈希；普通用户 uid≥1000、`/home/<名>/Desktop`，root `/root` **不在登录界面**，首启自动建无密码引导用户 `vimtu`）。终端 `useradd/userdel/passwd/users/whoami/id/su/sudo/exit/loginctl lock`；`su - root`/`su -`/`sudo -i` **只提升会话身份**（euid=0，GUI 用户名/头像不变），`exit` 退回；会话身份只在内存（重启回锁屏）。打点 `[LOCK64]`/`[LOGIN64]`/`[USER64]`；端到端 `tests/locklogin64_test.py`（88 条断言）。边界：**权限位尚未拦截**（P4）、口令哈希 = 盐（`rdtsc` xorshift，非 CSPRNG）+ SHA-256×1000（非 bcrypt/argon2）、头像 **JPEG 不支持**、每用户桌面只在用户库/会话层（GUI 桌面图标网格未按用户分目录） |
+| **★ 开始菜单 + 四个二级弹窗 + 设备插拔 toast（批次 P2）** | `kernel/startmenu64.{h,cpp}` + `kernel/panels64.{h,cpp}`（3593 行）：**居中开始菜单**（`x=440 y=293 w=400 h=420`、**底边距 Dock 顶 11px**：`bottom=713 dock_top=724 gap=11`、**上圆角 24 / 下圆角 10**、亚克力 + 双层浅阴影 + 1px 高光边、跟随主题）；**搜索框**（`x=630 y=357 w=194 h=34 r=8`，实时过滤 + 回车启动走 `app64_launch64`）；**2×4 固定网格**（8 个磁贴 108×62，应用名中英双语）；**左上时间 + 年月日**；**状态区四个极简线性图标**（网络→声音→中/英→通知，`[START64] status icon …` 逐个打点）；**左下头像 + 用户名**、**右下设置 + 电源菜单**（关机/重启/锁定；动效只有按下高亮 + 内缩）；**ESC 两级退出**（先关弹窗再关菜单）。**四个二级弹窗**（各 320×380 / 340×104 / 300×380 / 400×450）：**通知**（角标 + 未读计数 + 空态“无通知”）、**声音**（滑块 + 百分比 + 输出源，**如实标注未接音频驱动** `applied=0`）、**网络**（WiFi 区如实空态 `[PANEL64] net wifi count=0 state=no-hardware text=无无线硬件` + 以太网区固定行）、**日历**（**7×6** 网格、滚轮 / 方向键 / PageUp·PageDown 翻月、今天、年份面板）；弹窗全部**亚克力 + 双层浅阴影 + 1px 高光边 + 跟随主题 + 锚点跟随开始菜单**（`follow=menu`）且**不压 Dock / 不超屏**（`no_dock_overlap=1`）；`input.cpp` 加 **Caps 反转 Shift**、**Shift 切中英**、**Intellimouse 4 字节滚轮**（`[INPUT64] wheel mode=1 id=3 packet=4B`）。端到端 `tests/startmenu64_test.py`（58 条断言）+ `tests/panels64_test.py`（78 条断言）。P2 边界见下表 |
+| **★ VimtuFS2 v4 权限（uid/gid/mode + 真拦截 + su/sudo 提权，批次 P4）** | `kernel/vfs64.{h,cpp}`：卷格式 **v4**（inode 仍 **128B**：`type@0` / `namelen@1` / `size@4` / `d0..d3@8,12,16,20` / `ind@24` / `parent@28` / `mtime@32` / `nlink@36` / `kind@38` / `name@40..71` / `dind@71` / **`uid@75, gid@77, mode@79`** / 保留 `@81..124` / `CRC@124`（覆盖 `[0,124)`））；**owner / group / other 三段 rwx 真拦截**（读 `r`、写 `w`、遍历 `x`、目录写 `w+x`），拒绝一律 **`-EACCES`(13)** 并打 `[PERM64] deny op=… path=… uid=… gid=… mode=… need=… owner=u:g`（调用方 `[FD64] open FAILED … rc=13`）；**进程 uid/gid/euid/egid**（fork/execve 继承）+ **`getuid/geteuid/setuid/chmod/chown/umask/access/stat` 返回真值**；`su - root` / `su -` / `sudo -i` **真提权**（`[PERM64] cred uid=0 gid=0 euid=0 egid=0 user=root via=su-dash`）；终端 `ls -l` / `chmod` / `chown` / `umask` / `tree` / `su` / `id` 全走真权限。新格式化一律产出 **v4**（`[VFS64] format ok blocks=24759 version=4 inode=128 root=8017 perm=uid/gid/mode@75/77/79 rootmode=0755`）；**v3/v2 旧卷可挂载可读写但不拦截**（卷里没有权限字段，`chmod` 明确回 `volume v3 has no mode field`）。自检 `[VFS64] perm selftest ok owner/mode/other/root/chmod/chown/umask=1`；端到端 `tests/perm64_test.py`（95 条断言，含 v3 旧卷兼容）。P4 边界见下表 |
+| **★ 锁屏 + 登录 + 多用户骨架（批次 P1c）** | `kernel/locklogin64.{h,cpp}`（1447 行）：开机第一屏 = **锁屏**（时间 **72px**、年月日 **18px**、白色亚克力、背景**清晰不模糊**）→ 回车/点击 → 背景**清晰→模糊 20px**（动画 250–350ms，取 300ms）→ **登录界面**（**104px** 圆头像、**96×96 圆角 24** 主题渐变登录按钮、有密码时 **360×48** 磨砂密码框 + **48×48** 确认按钮；ESC 平滑反向返回）；`kernel/userdb64.{h,cpp}`（1186 行）：用户库 **`/etc/users.db` v1 文本**（用户名/UID/主目录/头像/加盐哈希；普通用户 uid≥1000、`/home/<名>/Desktop`，root `/root` **不在登录界面**，首启自动建无密码引导用户 `vimtu`）。终端 `useradd/userdel/passwd/users/whoami/id/su/sudo/exit/loginctl lock`；`su - root`/`su -`/`sudo -i` 提权会话身份（euid=0，GUI 用户名/头像不变），`exit` 退回；会话身份只在内存（重启回锁屏）。打点 `[LOCK64]`/`[LOGIN64]`/`[USER64]`；端到端 `tests/locklogin64_test.py`（88 条断言）。**★ 批次 P4 起会话身份真的管权限**：登录/`su`/`sudo` 会把 `uid/gid/euid/egid` 发布进进程凭证（`[PERM64] cred`），文件系统按它做 rwx 拦截（见上表 P4 行）。边界：口令哈希 = 盐（`rdtsc` xorshift，非 CSPRNG）+ SHA-256×1000（非 bcrypt/argon2）、头像 **JPEG 不支持**、每用户桌面只在用户库/会话层（GUI 桌面图标网格未按用户分目录） |
 | **★ Windows 11 现代外观（批次 P1）** | `kernel/theme64.{h,cpp}` = **设计 Token 唯一真源**（圆角 14/12/9/24、图标 10；模糊 24/12；透明度 0.45/0.80；双层阴影 `0 2 4 rgba(0,0,0,0.08)` + `0 12 32 rgba(0,0,0,0.12)`；动效 150/225/330ms + `cubic-bezier(0.2,0,0,1)`）+ **7 套主题**（白色(默认)/暗色/蓝白渐变/粉白渐变/粉绿渐变/粉紫渐变/紫白渐变）；`kernel/gfx64.{h,cpp}` = 现代图元层（圆角抗锯齿、双层阴影 mask 缓存、毛玻璃缓存、渐变、**壁纸 6 种适应模式**：填充/适应/拉伸/平铺/居中/跨屏）；`kernel/gui64.cpp` 换成**居中靠下 Dock**（y = 屏高−76、高 60、圆角 24、图标 46、间距 11、悬停放大 1.20 + 邻位让位、点击回弹、运行小圆点、最小化小横杠）。截图 `docs/screenshots/modern_white64.png`、`modern_dark64.png`、`modern_bluegrad64.png`；验收 `tests/gfx64_test.py`（55 条）/ `tests/gui_modern64_test.py`（149 条）。边界：壁纸/主题整屏重建在 QEMU TCG 上约 0.33–0.44s（宿主 CPU 争用可达 3s） |
 | **★ Dock 开始按钮用真图 + 内置 PNG 解码（批次 P1）** | `kernel/img64.{h,cpp}`：PNG 解码（inflate **stored/fixed/dynamic 三种块**、色型 **0/2/3/4/6**、多块 IDAT、全部滤波器）+ BMP（未压缩）；**JPEG 未支持**（如实打 `unsupported format`）。`logo/kaisi.png`（158×158，19,810 B）构建期由 objcopy 嵌入系统内核 → 启动期**幂等写入 VimtuFS2**（`[IMG64] install path=/logo/kaisi.png … ok=1`）→ 运行时从卷加载（`[IMG64] load path=/logo/kaisi.png ok=1 … 158x158 (from VimtuFS2 system volume)`、`[DOCK64] start icon src=/logo/kaisi.png size=46 ok=1`），解不开时回落内置图标。**已修的一个真 bug**：inflate 的固定 Huffman 表曾被动态表污染（共享表 + 一次性缓存，真 PNG 末尾的 BFINAL 空固定块解错 → rc=18）——现在**每个固定块重建表**，并加"解真图 + 全图像素 FNV-1a 指纹比对"回归自检（`[IMG64] selftest real ok=1 … fnv=…`）。边界：`[DOCK64] start icon src=` 打点目前是裸路径（不带 `vfs:` 前缀） |
 | **★ Rust 正本接入：gui_rs 设计 Token + 主题配色真源（批次 P1）** | `gui_rs/` crate（**`#![no_std]`、无 alloc、无浮点**；33 个 Token + 7 套主题 + panic 钩子）用 **rustup shim 绝对路径的 rustc** 编成 `gui_rs/gui_rs.o`（target `x86_64-unknown-none`），**只链进系统内核**（安装介质 **0 个 Rust 符号**）；启动期自检 `[RUST64] tokens ok themes=7 accent=#RRGGBB selftest PASS`，并与 C++ 主题表交叉核对数量/名字/accent；终端 `rust [tokens\|set N]`；`kernel/rust64.h` 是 C 链接声明（全 POD + UTF-8 `(ptr,len)`，无 Rust 引用/String/泛型）。验收 `tests/rust64_test.py`（124 条：nm/objdump 符号、安装内核 0 符号、体积上限、串口 accent 与 Rust 源码比对） |
@@ -38,7 +40,7 @@
 | **Win10 同款安装程序** | 语言 → 现在安装 → 许可条款 → 安装类型 → **磁盘与分区（新建/删除/格式化，真实写盘）** → 复制与真实百分比进度 → 完成并**自动重启**；**无产品密钥步骤** |
 | **装完就是一台独立系统** | 开机直接进桌面：桌面图标、任务栏、开始菜单（10 项）、窗口拖拽/缩放/最大化/最小化、脏矩形重绘 |
 | **调度器（多任务）** | `task64.cpp`：16 个任务槽、每任务 16KB 内核栈、8ms 时间片轮转、IRQ0 抢占、睡眠/退出/回收、`task_kill64`；启动即 `[TASK64] scheduler up tasks=N`、`kheart` 心跳持续增长；任务管理器"进程"页与终端 `ps/kill` 读的是**真实任务表** |
-| **真实文件系统 VimtuFS2（v3 目录树）** | `vfs64.cpp`：超级块（magic `VIMTUFS2` + CRC32）、空闲位图、**128B inode**（直接块×4 + 一级间接块 + **二级间接块** → 单文件 ≤**8 MiB**）、**多级路径**（`/dir/sub/file`，`.`/`..` 语义齐全）、inode **mtime**（RTC 打包 u32）与**类型判定**（目录/VAP64/ELF64/文本/二进制存进 inode 的 `kind` 字段）；`vfs64_format/mount/stat64/list64/opendir+readdir/closedir/mkdir64/create64/write64/read64/unlink64/rmdir64/tree_dump64` + 兼容旧 API；**v2 旧卷仍可挂载**（按单层语义工作），新格式化一律产出 v3 |
+| **真实文件系统 VimtuFS2（v4：目录树 + 权限）** | `vfs64.cpp`：超级块（magic `VIMTUFS2` + CRC32）、空闲位图、**128B inode**（直接块×4 + 一级间接块 + **二级间接块** → 单文件 ≤**8 MiB**）、**多级路径**（`/dir/sub/file`，`.`/`..` 语义齐全）、inode **mtime**（RTC 打包 u32）与**类型判定**（目录/VAP64/ELF64/文本/二进制存进 inode 的 `kind` 字段）、**★ P4：`uid@75 / gid@77 / mode@79` + owner/group/other rwx 拦截**；`vfs64_format/mount/stat64/list64/opendir+readdir/closedir/mkdir64/create64/write64/read64/unlink64/rmdir64/tree_dump64` + 兼容旧 API；**v3/v2 旧卷仍可挂载可读写但不拦截**（卷里没有权限字段），新格式化一律产出 **v4** |
 | **盘符与驱动器枚举（"此电脑"的数据来源）** | `drive64.cpp`：枚举 PATA/AHCI(SATA)/NVMe 每块盘 → 读 MBR 分区 → 识别文件系统（VimtuFS2 超级块只读校验 / FAT32 BPB 指纹）→ 盘符表：**系统分区 = `C:`**（依据：vfs64 当前真正挂载的卷，兜底 drive 0 的 MBR `0x07` 项），其余可浏览的 VimtuFS2 卷依次 **`D:`/`E:`…**（**每个可浏览卷在扫描时占一个 vfs64 卷槽**，条目带 `slot=<n>`；`drive64_activate_letter64('D')` = 把当前卷切到那个槽）；**ESP/未知文件系统不占字母但仍列出**（`skip reason=esp|no-fs`）；卷槽满（>4 个可浏览卷）时**如实拒绝**：该条目 `skip reason=voltable-full`、不占字母，绝不覆盖已挂载的卷。每项给显示名/总容量/可用（**实时**：走已挂载槽现数位图）/文件系统/是否可浏览。打点 `[DRV64] scan\|letter=\|skip\|activate\|selftest`；**★ 批次 K：FAT32 只读浏览（含 VFAT 长名）**：`kernel/fat64.cpp` 增加只读读取器（BPB 校验/簇链遍历/LFN(0x0F) 校验和与 UTF-16 拼接/FAT 日期时间），`kernel/fs64.{h,cpp}` 作为统一分派层（VimtuFS2 读写 / FAT32 只读）；FAT12/16 仍只识别不浏览（簇链项位宽不同） |
 | **★ 多卷挂载 / 盘符切换（本批次新增）** | `vfs64.cpp` 从"一次只挂一个卷"改成**卷槽表**：至少 4 个槽 （`VFS64_SLOT_MAX`），每槽独立保存 drive/起始 LBA/位图/inode/数据区几何；`vfs64_mount_slot64(slot,…)` / `vfs64_activate_slot64(slot)` / `vfs64_current_slot64()` / `vfs64_slot_info64()`；**inode 扇区缓存按 (slot, drive, lba) 三元组键控**（切卷绝不读到上一个卷的字节）。旧 API（`stat64/read64/write64/ls/opendir…`）保持"作用于当前卷"，fd64 新增 `fd64_open_on64(slot,…)`（打开后锁定该卷）。**系统组件固定写系统卷**：store64/config64/update64/app64/elf64/proc64/sysstate64 一律 `vfs64_*_on64(vfs64_system_slot64(), …)` —— 只在单次调用里临时切卷、返回前原样切回（LIFO 守卫），所以**用户浏览 `D:` 时 3 秒自动落盘也只会写 `C:`**（`tests/multivol64_test.py` 用宿主侧字节比对证明：D: 卷整盘逐字节不变、C: 的 `/store.a` 内容正确）。终端新增 `vol`（列卷/`vol C:|D:` 切当前卷）、`df` 列**所有卷**；Explorer 双击 `D:` 卡片 = `drive64_activate_letter64` 真切卷并列它的根目录（打点 `[UI] explorer enter letter=D: slot=1 ok`）。端到端：**108/108 PASS**（宿主机预置第二个 VimtuFS2 卷 `/docs` + `readme.txt` + `/docs/notes.txt`） |
 | **设置持久化 store** | `store64.cpp`：A/B 双槽（VimtuFS2 里的 `/store.a`、`/store.b`）+ 世代号 + 头部/payload 双 CRC32 + "先数据后头部"的提交点；实测跨重启保留（第二遍启动 `keys=1` 里仍有 `theme=dark`）；终端 `store dump\|get\|set\|flush` |
@@ -62,14 +64,16 @@
 
 | 边界 | 现状 |
 |---|---|
-| ⚠️ **多用户 / 登录的边界（批次 P1c，如实写清）** | ① **权限位尚未拦截**（uid/gid/mode 检查属 **P4**）：`getuid/getgid`(102/104) 仍恒 0，`su`/`sudo` 只改**会话身份**（euid），不拦任何文件操作；② **口令哈希不是 bcrypt/argon2**：盐 = `rdtsc` xorshift（**非 CSPRNG**，16 B）+ **SHA-256 × 1000 轮**，明文绝不落盘/进串口；③ 头像只支持 **PNG/BMP**，**JPEG 不支持**；④ **每用户桌面目前只在用户库/会话层**（`/home/<名>/Desktop` 真实枚举，登录时打 `[USER64] desktop list`），**GUI 桌面图标网格尚未按用户分目录**；⑤ 会话身份只在内存：软重启/断电后回到开机锁屏（root 不在登录界面），`userdel` 不删主目录 | 
+| ⚠️ **多用户 / 登录的边界（批次 P1c；P4 起权限已拦截，剩余边界如实写清）** | ① ~~权限位尚未拦截~~ —— **批次 P4 已落地**：`getuid/geteuid/setuid/chmod/chown/umask/access/stat` 返回真值，`su`/`sudo` 提权后的会话身份**真的参与文件权限判定**（详见上文 P4 行与权限边界行）；剩余边界：**无 ACL/xattr、无 setuid、无附加组（gid=uid）、root 绕过 DAC、v2/v3 旧卷不拦截**；② **口令哈希不是 bcrypt/argon2**：盐 = `rdtsc` xorshift（**非 CSPRNG**，16 B）+ **SHA-256 × 1000 轮**，明文绝不落盘/进串口；③ 头像只支持 **PNG/BMP**，**JPEG 不支持**；④ **每用户桌面目前只在用户库/会话层**（`/home/<名>/Desktop` 真实枚举，登录时打 `[USER64] desktop list`），**GUI 桌面图标网格尚未按用户分目录**；⑤ 会话身份只在内存：软重启/断电后回到开机锁屏（root 不在登录界面），`userdel` 不删主目录；⑥ `su` 对**空口令**目标免密 |
 | ⚠️ **现代外观 / 图像 / 测试环境的边界（批次 P1，如实写清）** | ① 壁纸/主题**整屏重建在 QEMU TCG 上约 0.33–0.44s**（空闲状态），宿主 CPU 争用时可达 **3s**；② `[DOCK64] start icon src=` 打点目前是**裸路径**（不带 `vfs:` 前缀）；③ `explorer64`/`fileops64` 各有 1–2 条"鼠标位移模型"断言在 QEMU TCG 下**偶发失败**（基线可复现，属环境抖动，**不是功能缺陷**）；④ 图像解码只支持 PNG（色型 0/2/3/4/6）与未压缩 BMP，**JPEG 未支持**；⑤ 开始按钮图路径的完整来源链：内嵌字节 → 幂等装进 VimtuFS2 → 卷上文件优先 → 解不开才回落内置图标（裸 system.img 没有卷时如实走兜底） |
+| ⚠️ **开始菜单 / 弹窗 / toast 的边界（批次 P2 新增，如实写清）** | ① **声卡 / 无线驱动未做**：声音面板只改**内存态**（`[PANEL64] sound volume=… why=drag applied=0`，不接任何音频硬件）、**输出源切换只有界面与打点**；网络面板 WiFi 区永远是**如实空态**（`count=0 state=no-hardware text=无无线硬件`，列表绝不造假），只有以太网区是真值（e1000 `STATUS.LU` 活读）；② **U 盘热插拔事件源不可用**：`usb64` 没有拔出检测，toast 事件源只有 e1000 `STATUS.LU`（网线插拔）+ USB 计数轮询差（`[TOAST64] usb poll … hotplug=unsupported`，没有事件就不编事件）；③ **通知的逐条清除 / 全部清除未在测试里注入点击**（界面有，自动化只覆盖角标、空态、新增、超时自动消失、点击关闭）；④ **电源菜单动效只有按下高亮 + 内缩**（关机/重启/锁定三项真实生效，但没有 Win11 那种展开动画）；⑤ 状态区中/英指示器**只显示「英」**：**没有中文输入法**（Shift 只切计数与指示器，`ime=0`）；⑥ **没有 Win 键热键**开关菜单（点开始按钮 / ESC 两级退出） |
+| ⚠️ **权限（批次 P4）的边界（如实写清）** | ① **无 ACL / xattr**：只有 owner / group / other 三段 rwx；② **无 setuid / setgid / sticky 目录位**，也就**没有 setuid 可执行文件提权**路径；③ **无附加组**：没有 `/etc/group`，`gid = uid`（group 段只在 gid 相等时生效）；④ **v2/v3 旧卷不拦截**：卷里没有权限字段（uid 显示 root、mode 默认 0755/0644，`chmod` 明确回 `volume v3 has no mode field`），旧卷要重新格式化才拿到权限；⑤ **root 完全绕过 DAC**（`uid=0` 不做任何检查）；⑥ **FAT32 卷没有权限字段**（只读挂载，不参与权限判定）；⑦ **`su` 对空口令目标免密**（未设密码的用户直接切换）；⑧ 权限主体是**会话身份**（euid/egid 与进程凭证，fork/execve 继承），GUI 侧仍以进程边界隔离 |
 | ⚠️ **文件操作的边界（本批次新增，如实写清）** | ① **没有递归删除**：非空目录点删除只会提示"目录非空，暂不支持递归删除"（`delete … rc=1 reason=not-empty`），不假装成功；② **单文件上限 8 MiB**（v2 旧卷 67584 B）：超过的源在粘贴时被**整条跳过**（不是截断复制），大文件粘贴走**分块复制**（64 KiB/块，不占大内存、不静默截断）；③ **没有权限/属主、没有回收站**：删除即真删（`unlink64`/`rmdir64`）；④ **重命名只在同一目录内**（改 inode 的 name 字段），**没有跨目录移动/拖拽**（`vfs64_rename64` 不动 `parent`）；⑤ 目录递归复制有界（深度 ≤4、条目 ≤96），超限的条目计入 `skipped`；⑥ 剪贴板是**内核内的路径列表**（不是文件内容快照、不跨重启、最多 8 条）；⑦ 重名后缀是 `(2)`/`(3)`（**无空格**，空格不是合法文件名字符） |
 | ⚠️ **开机滚屏引导控制台的有界性（本批次新增，如实写清）** | ① **滚屏是有界的**：只回放环形缓冲里最近的 320 行、每批 6 行上移（像素拷贝，不做字形重光栅化），最后停 1200 tick-ms —— 之后一定是既有的向导/桌面流程；② **任意键立即结束**（按键会被吞掉，不会影响后面的界面）；③ 环形缓冲 16 KiB：启动后期日志多时最早的**普通**行会被覆盖（`[CON64] replay … dropped=N` 如实计数），只有**头部 16 行**（长模式 / BootInfo / E820 等）永久保留，所以 `dmesg` 里一定看得到最早那几行；④ 缓冲不落盘（`/boot.log` 未做）。 |
 | ⚠️ **用户态独立地址空间** | 批次 C 起：proc64 每进程独立 CR3 + fork/execve/wait4/kill（BIOS 路径）；UEFI（固件页表）下默认仍如实降级为共享地址空间模式（`[PROC64] cr3 isolation OFF`）。**批次 D 实测**：在固件 PML4 上就地挂用户窗口（清 CR0.WP 手法）与自带 PML4 + 运行期 `mov cr3` **两条路径都在 QEMU+OVMF 与 VMware EFI 下成功**（`[PROC64] uefi exp result=B mode=isolated`），但默认构建不编这段实验（宏 `PROC64_UEFI_CR3_EXPERIMENT`），见 `docs/UEFI地址空间实验报告.md` |
 | ⚠️ **fd 语义（批次 D）** | **每进程 fd 表**（32 槽/张；`Proc64` 持有，终端/桌面用内核表）；fd → 引用计数的 `OpenFile64`（**共享偏移游标**）：`dup/dup2` 共享同一对象、`fork` 逐槽继承、`execve` 默认保留（**无 `O_CLOEXEC`**）、`close` 只是 refs-1；`O_APPEND` 真实现；**`pipe(22)` 真实现**（64 B 环形缓冲、非阻塞：写满短写/读空 `-EAGAIN`），`user/pipe64.asm` 是 fork 后父子各持一端的环回证据 |
 | ⚠️ **ELF64 只验证过自有静态程序** | 用 `ld.lld -static -nostdlib` 链接的自己的 ELF64 能 load → ring3 → `syscall` → exit；**glibc / 发行版二进制没有验证过**（缺 vDSO、TLS(FS.base) 的完整语义、信号投递、futex、动态链接与重定位） |
-| ⚠️ **VFS 的限制（v3 目录树已落地，仍有边界）** | 支持多级路径 `/dir/sub/file`（`.`/`..`、大小写敏感）；**名字 ≤31B**、**inode 总数 ≤512**、**路径 ≤128B / 16 段**、**目录深度 16**；目录删除只支持 `rmdir` **空目录**（非空必须先清空）；**单文件 ≤8 MiB**（批次 M：二级间接块 128×128 块；v2 旧卷仍 67584B）；无权限/属主、无硬链接/符号链接、无稀疏文件。v2 旧卷仍能挂载（按单层语义）。**多卷**：最多 4 个可浏览卷同时挂载（系统卷 `C:` + `D:/E:/F:`），第 5 个起如实拒绝（`reason=voltable-full`）；终端 `vol` 切当前卷、`df` 列所有卷。终端 `ls/cat/write/touch/rm/mkdir/df` 与 ring3 的 `open/read/write/close` 都走 `kernel/fd64.cpp` 的 FD 层直连 VimtuFS2（终端命令的多级路径也已支持；**终端帮助与错误文案已改写成多级路径口径**，文件管理器 UI 也已落地（见上表））。终端另有 `fdtest`（独立游标/dup 共享/O_APPEND/pipe/fork 继承一键演示）。**FAT32 只读浏览的边界**：只读（写/删/改名/建目录/粘贴一律 `-FS64_EROFS` 拒绝）；扇区固定 512B、每簇扇区数按 BPB（1..128，U 盘常见 8=4KB/簇）；可用空间取**挂载时 FSInfo 快照**（不实时刷新，FSInfo 无效则标 unknown）；LFN 上限为 256B 缓冲内的 UTF-16 码元；无碎片整理/无删除项复用 |
+| ⚠️ **VFS 的限制（目录树 v3 + 权限 v4 已落地，仍有边界）** | 支持多级路径 `/dir/sub/file`（`.`/`..`、大小写敏感）；**名字 ≤31B**、**inode 总数 ≤512**、**路径 ≤128B / 16 段**、**目录深度 16**；目录删除只支持 `rmdir` **空目录**（非空必须先清空）；**单文件 ≤8 MiB**（批次 M：二级间接块 128×128 块；v2 旧卷仍 67584B）；**权限/属主自批次 P4 起真有**（卷 v4：`uid@75/gid@77/mode@79` + owner/group/other 三段 rwx 拦截；**v3/v2 旧卷可挂载可读写但不拦截**：卷里没有权限字段，uid 显示 root、mode 默认 0755/0644，`chmod` 明确回 `volume v3 has no mode field`）；仍**无 ACL/xattr、无硬链接/符号链接、无稀疏文件、无 setuid/sticky 位**。**多卷**：最多 4 个可浏览卷同时挂载（系统卷 `C:` + `D:/E:/F:`），第 5 个起如实拒绝（`reason=voltable-full`）；终端 `vol` 切当前卷、`df` 列所有卷。终端 `ls/cat/write/touch/rm/mkdir/df/ls -l/chmod/chown/umask/tree/su/id` 与 ring3 的 `open/read/write/close` 都走 `kernel/fd64.cpp` 的 FD 层直连 VimtuFS2（终端命令的多级路径也已支持；**终端帮助与错误文案已改写成多级路径口径**，文件管理器 UI 也已落地（见上表））。终端另有 `fdtest`（独立游标/dup 共享/O_APPEND/pipe/fork 继承一键演示）。**FAT32 只读浏览的边界**：只读（写/删/改名/建目录/粘贴一律 `-FS64_EROFS` 拒绝）、**无权限字段**（FAT32 本身没有 uid/gid/mode）；扇区固定 512B、每簇扇区数按 BPB（1..128，U 盘常见 8=4KB/簇）；可用空间取**挂载时 FSInfo 快照**（不实时刷新，FSInfo 无效则标 unknown）；LFN 上限为 256B 缓冲内的 UTF-16 码元；无碎片整理/无删除项复用 |
 | ⚠️ **设置页接线范围** | 显示/会话分区已接 `config64`/`session64`（真落 store64，跨重启保留）；系统/关于页是只读实测值（设备规格来自 hwinfo64/display64/net64/usb64） |
 | ⚠️ **没有 TCP/IP / DHCP / DNS** | 网络只有 IPv4 + ARP + ICMP echo（e1000 轮询收发，无中断收包）；UDP/TCP、路由、DHCP、DNS 都没有；只适配 e1000，VMware 的 vmxnet3 未适配 |
 | ⚠️ **USB：UHCI 只读 U 盘 + HID 键盘，没有 EHCI/xHCI/USB3** | 主控只有 UHCI（USB 1.1）：没有 EHCI(USB 2.0) / xHCI(USB 3.x)（机器上只有 EHCI 时打 `[USB64] not found` 后优雅退出）；**U 盘只读**（没有 `WRITE(10)`，`write`/`mkdir`/粘贴一律被拒）、**没有分区表解析**（分区表由上层 `part64`/`drive64` 读，本模块只提供"按扇区读"）、**没有拔出检测（热插拔）**；**hub 后面的设备认不出来**（QEMU 不给显式端口时会把第二个设备挂到一个隐式 hub 后面）；一次最多 2 台设备（1 键盘 + 1 U 盘，各拿一个地址）；块大小 ≠ 512 的盘如实拒绝（打点后不暴露成块设备）；USB 鼠标未做；不接中断（由 `kusb` 线程轮询 + 传输自旋锁互斥） |
@@ -171,7 +175,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
    build64.sh     唯一构建脚本（clang/lld/nasm/xorriso/Python）
    tools/*.py     自写打包/诊断：make_iso64 / make_esp / make_flat / make_vap / pe_info / fat_check
    gui_rs/build_rs.sh  Rust 侧构建：rustc（rustup shim 绝对路径，x86_64-unknown-none）-> gui_rs/gui_rs.o，只链进系统内核
-   tests/*.py     51 个 .py（本批新增 rust64_test / gfx64_test / gui_modern64_test / locklogin64_test）：串口断言 + screendump 像素断言 + 目标盘字节断言
+   tests/*.py     54 个 .py（本批新增 startmenu64_test / panels64_test / perm64_test）：串口断言 + screendump 像素断言 + 目标盘字节断言
 ```
 
 ## 五、快速开始
@@ -201,8 +205,8 @@ bash build64.sh
 |---|---|---|
 | `vimtu64-64.iso` | 56.2 MB | **三合一安装盘**：BIOS 光盘 + 可写 U 盘 + UEFI |
 | `vimtu64-64.img` | 7.9 MB | 安装介质裸盘（把一个 7.9MB 镜像直接当硬盘用；实际 8,328,192 B） |
-| `build64/kernel64.bin` | 2.06 MB | 安装程序内核（2,160,528 B；含 ATA/AHCI/**NVMe** 驱动、分区/安装引擎、FAT32 ESP 写入器） |
-| `build64/kernel64_os.bin` | 2.85 MB | 装进硬盘的系统内核（2,984,976 B；调度器/VFS/store/ring3/网络/USB（含 **USB 存储/U 盘只读**）/AHCI/**NVMe**/文件管理器 + **文件操作** 都在这里；硬上限 4,096,000 B） |
+| `build64/kernel64.bin` | 2.09 MB | 安装程序内核（**2,196,688 B**；含 ATA/AHCI/**NVMe** 驱动、分区/安装引擎、FAT32 ESP 写入器） |
+| `build64/kernel64_os.bin` | 3.34 MB | 装进硬盘的系统内核（**3,505,520 B**；调度器/VFS（**v4 权限**）/store/ring3/网络/USB（含 **USB 存储/U 盘只读**）/AHCI/**NVMe**/文件管理器 + **文件操作** + **开始菜单 / 四弹窗 / toast** 都在这里；硬上限 4,096,000 B） |
 | `build64/BOOTX64.EFI` / `UEFI64.BIN` | 2.5 KB / 36 KB | UEFI 两段式引导 |
 | `build64/esp.img` | 48 MB | 手写 FAT32 ESP（96736 簇，>= 65525） |
 
@@ -245,9 +249,9 @@ VMware 里也一样（**新建虚拟机时 `guestOS` 必须选 64 位：`other-6
 
 ```bash
 python tests/status_report.py          # 先看状态：哪些完成/部分/未做（带证据，秒级）
-python tests/status_report.py --full   # 再真跑 40 个验收脚本（约 6-8 分钟；含本批新增的 4 个）
+python tests/status_report.py --full   # 再真跑 43 个验收脚本（约 6-8 分钟；含本批新增的 3 个）
 
-# 另有专项脚本（--full 列表之外，建议一起跑）；本批新增的 4 个已进 --full 列表，也可单跑：
+# 另有专项脚本（--full 列表之外，建议一起跑）；本批新增的 3 个已进 --full 列表，也可单跑：
 python tests/user64_test.py            # ring3 / GDT / 用户页权限
 python tests/display64_test.py         # EDID 显示层（设置页里的刷新率）
 python tests/app64_test.py             # VAP64：安装 + 校验 + ring3 运行
@@ -257,13 +261,16 @@ python tests/rust64_test.py            # Rust 接入：gui_rs 符号进系统内
 python tests/gfx64_test.py             # 现代图元层：圆角/双层阴影/毛玻璃/壁纸 6 适应模式
 python tests/gui_modern64_test.py      # 新 Dock + 7 套主题 + 开始按钮真图
 python tests/locklogin64_test.py       # 锁屏 / 登录 / 多用户骨架
+python tests/startmenu64_test.py       # P2 开始菜单：几何 / 搜索 / 2×4 网格 / 电源菜单 / ESC 两级退出
+python tests/panels64_test.py          # P2 四弹窗（通知/声音/网络/日历）+ 设备插拔 toast
+python tests/perm64_test.py            # P4 卷 v4 权限：rwx 真拦截 + su/sudo 提权 + chmod/chown/umask
 
 python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 ```
 
 ## 六、工程质量（这个项目最值得说的部分）
 
-* **38 个断言脚本**（上一批 34 个脚本的全部 PASS 结论保持不变；本批新增 **rust64_test 124 条**、**gfx64_test 55 条**、**gui_modern64_test 149 条**、**locklogin64_test 88 条**，全部 PASS —— 2026-09-23 实测：本批次（O：USB 存储）新增 `usbstorage_test.py` **99 条断言**，
+* **43 个断言脚本**（`status_report.py --full` 的 `TESTS` 列表长度实测 43；上一批脚本的全部 PASS 结论保持不变；**本批（P2 + P4）新增 3 个脚本全 PASS**：**startmenu64_test 58 条**、**panels64_test 78 条**、**perm64_test 95 条**，另有 **store64_test 55 条**（P1c 登录期自动落盘语义）、**locklogin64_test 88 条**、**rust64_test 124 条**、**gfx64_test 55 条**、**gui_modern64_test 149 条** —— 2026-09-25 实测：本批次（P2 + P4）逐脚本复跑既有脚本（0 FAIL），
   并逐脚本复跑既有脚本 —— `usb64_test` 51、`fatread64_test` 61、`explorer64_test` 71、`fileops64_test` 95、
   `multivol64_test` 108、`fs_tree_test` 85、`bootlog64_test` 30、`boot64_assert`、`desktop64_test`、
   `install_flow_test`、`partition_ops_test`、`esp_install_test`、`disk_boot_test`、`iso64_install_test`、
@@ -333,6 +340,8 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | M16 | **USB 存储（U 盘只读，批次 O）**：UHCI 上认 Mass Storage BOT（Class=08/SubClass=06/Protocol=0x50）→ 批量传输（TD 链 + toggle + 短包 + 有界超时）→ CBW/CSW + SCSI `INQUIRY`/`READ CAPACITY(10)`/`READ(10)` → **驱动器号 `24..`**（`drive64`/`fat64`/`explorer64` 零改动）→ U 盘 FAT32 只读浏览 + **把 .vap/.elf 从 U 盘拷进 C:**（宿主侧逐字节核对） | ✅ |
 | M17 | **Windows 11 现代外观 + Rust 接入（批次 P1）**：`theme64`（设计 Token 唯一真源）+ `gfx64`（圆角/双层阴影/毛玻璃/壁纸 6 适应模式）+ `img64`（PNG/BMP 解码，JPEG 未支持）+ **居中靠下 Dock** + **7 套主题**；`gui_rs`（`#![no_std]` Rust）作为 Token/主题配色真源**只链系统内核** | ✅ |
 | M18 | **锁屏 + 登录 + 多用户骨架（批次 P1c）**：`locklogin64`（锁屏 72px/18px、背景清晰→登录模糊 20px、104px 头像、360×48 密码框）+ `userdb64`（`/etc/users.db` 加盐 SHA-256×1000；`su`/`sudo` 只改会话身份；root 不在登录界面；**权限位属 P4，尚未拦截**） | ✅ |
+| M19 | **开始菜单 + 四个二级弹窗 + 设备插拔 toast（批次 P2）**：`startmenu64`（居中 400×420、底边距 Dock 顶 11px、上圆角 24 下圆角 10、搜索框 + 2×4 固定网格、状态区四个线性图标、电源菜单、ESC 两级退出）+ `panels64`（通知/声音/网络/日历四弹窗：亚克力 + 双层浅阴影 + 1px 高光边 + 跟随主题 + 锚点跟随开始菜单 + 不压 Dock；设备 toast 右侧滑入 / 停 5s / 可关闭 / 堆叠）+ `input.cpp`（Caps 反转 Shift / Shift 切中英 / Intellimouse 4 字节滚轮） | ✅ |
+| M20 | **VimtuFS2 v4 权限（批次 P4）**：inode 128B 加 `uid@75 / gid@77 / mode@79` + **owner/group/other 三段 rwx 真拦截**（`-EACCES`(13) + `[PERM64] deny` 打点）+ 进程 uid/gid/euid/egid（fork/execve 继承）+ `geteuid/setuid/chmod/chown/umask/access/stat` 返回真值 + `su`/`sudo` 真提权（`[PERM64] cred`）；**v3/v2 旧卷可挂载可读写但不拦截** | ✅ |
 
 ## 八、路线图（未完成的部分）
 
@@ -342,7 +351,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 |---|---|---|---|
 | ① | ~~**独立地址空间 + fork/execve**~~ | 批次 C 已完成（每进程 CR3 + fork/execve/wait4/kill；UEFI 固件页表下如实降级为共享模式） | —— |
 | ② | **glibc 级兼容** | 只验证过自有静态 ELF64 | TLS(FS.base) 真生效、信号投递、vDSO、futex、动态链接与重定位；毕业考试是"静态 busybox 起 shell" |
-| ③ | **VFS 补齐** | ~~单层路径~~（v3 已支持多级目录树 + 空目录删除 + mtime/类型判定）；仍缺：权限/属主、宿主机拷文件工具、FAT 浏览、文件管理器 UI（**本批次已完成**：explorer64.cpp + 	ests/explorer64_test.py 71 项） | FAT 只读浏览 + 更大单文件 + 复制/粘贴/重命名等文件操作 |
+| ③ | **VFS 补齐** | ~~单层路径~~（v3 已支持多级目录树 + 空目录删除 + mtime/类型判定）；~~权限/属主~~（**P4 已完成**：卷 v4 uid/gid/mode + owner/group/other rwx 真拦截 + `chmod`/`chown`/`umask`，v3 旧卷豁免）；~~FAT 浏览~~、~~文件管理器 UI~~（批次 K/J + 本批已完成）；仍缺：宿主机拷文件工具、ACL/xattr、setuid/sticky | 宿主机 ↔ 镜像拷文件工具、更完整的 Unix 权限语义 |
 | ④ | **TCP/IP** | 只有 IPv4/ARP/ICMP、静态地址、无中断收包 | DHCP/DNS/UDP/TCP；vmware vmxnet3 适配 |
 | ⑤ | **EHCI / xHCI / 集线器 / 鼠标 / U 盘写** | UHCI（USB 1.1）已能驱动 **HID 引导键盘 + U 盘（只读）**（批次 O）；仍缺：EHCI(USB 2.0)/xHCI(USB 3.x)、hub、USB 鼠标、**U 盘写（`WRITE(10)`）**、拔出检测（热插拔） | 更快的 U 盘、鼠标、带 hub 的真机、往 U 盘写文件 |
 | ⑥ | **多核调度** | AP 起来后只是 `cli; hlt`；无 IPI、无 per-CPU 数据 | 真 SMP：AP 参与调度与中断；x2APIC |
@@ -467,7 +476,7 @@ VimtuOS/
 │   ├── fat_check.py          # FAT12/16/32 卷按规范体检
 │   └── pe_info.py            # PE 体检（能告出 ImageBase）
 │
-├── tests/                    # ⑤ 验收脚本（40+ 个 .py / 断言 1,000+ 条：串口 + 像素 + 字节）
+├── tests/                    # ⑤ 验收脚本（54 个 .py / 断言 1,000+ 条：串口 + 像素 + 字节）
 │   ├── status_report.py      # 状态核查（每项能力绑证据：DONE / PARTIAL / MISSING）
 │   ├── boot64_assert.py      # 长模式 / IDT / PIT / BootInfo
 │   ├── install_flow_test.py  # 端到端安装 + 装完单独启动
@@ -478,6 +487,8 @@ VimtuOS/
 │   ├── ahci64_test.py / nvme64_test.py                       # SATA / NVMe 目标盘
 │   ├── explorer64_test.py / fileops64_test.py                # 文件管理器与文件操作（像素 + 鼠标注入）
 │   ├── rust64_test.py / gfx64_test.py / gui_modern64_test.py / locklogin64_test.py   # ★ P1/P1c：Rust 接入 / 现代图元 / 新 Dock / 锁屏登录
+│   ├── startmenu64_test.py / panels64_test.py                # ★ P2：开始菜单 / 四弹窗 + 设备 toast
+│   ├── perm64_test.py                                        # ★ P4：卷 v4 + rwx 真拦截 + su/sudo 提权
 │   ├── multivol64_test.py / fatread64_test.py                # 多卷挂载 / FAT32 只读浏览
 │   ├── fs_tree_test.py / fs_term_test.py / fd64_test.py       # 目录树 / 终端文件命令 / fd 语义
 │   ├── store64_test.py / sysstate64_test.py / preload_update_test.py   # 持久化 / 状态机 / 预热与更新
@@ -506,14 +517,14 @@ VimtuOS/
     └── shots/                 # 历史验证截图集
 ```
 
-仓库规模：内核 `kernel/` 114 文件 / 49,609 行、引导 `boot/` 12 文件、Rust `gui_rs/` 6 个源文件、验收 `tests/` 51 脚本、
-文档 `docs/` 16 篇；**发布进仓库的文件 299 个 / 约 8.2 MB**（含 `docs/screenshots/`、`docs/shots/` 的 PNG 截图与字体
+仓库规模：内核 `kernel/` 118 文件 / 58,381 行、引导 `boot/` 12 文件、Rust `gui_rs/` 7 个文件、验收 `tests/` 54 脚本、
+文档 `docs/` 16 篇；**发布进仓库的文件 306 个 / 约 8.2 MB**（含 `docs/screenshots/`、`docs/shots/` 的 PNG 截图与字体
 许可全文；第三方字体、打包的交叉编译器、构建产物与退役的 32 位工程都不进仓，见 `.gitignore`）。
 
 
 ## 十、开源与发布状态
 
-**本仓库已开源：<https://github.com/Fanqi89/VimtuOS>** —— 只发**源码**（**299 个文件 / 约 8.2 MB**，含 `docs/` 截图与字体许可全文；`gui_rs/gui_rs.o` 等构建产物不进仓），许可 **GPL-3.0**。
+**本仓库已开源：<https://github.com/Fanqi89/VimtuOS>** —— 只发**源码**（**306 个文件 / 约 8.2 MB**，含 `docs/` 截图与字体许可全文；`gui_rs/gui_rs.o` 等构建产物不进仓），许可 **GPL-3.0**。
 
 **没有进仓的东西**（都在 `.gitignore` 里，按体积排序）：
 
@@ -537,8 +548,8 @@ objcopy 符号名保持不变。运行时打点：`[FONT64] faces=4 …` / `mono
 `fallback hit cp=0x… face=3` / `selftest PASS mask=…`（验收：`py -3 tests\fonts64_test.py`）。
 许可与派生说明见 [docs/字体许可说明.md](docs/字体许可说明.md)。**因此 ISO/IMG 可以直接公开分发。**
 
-**版本与发布**：标签 `v0.2.1-beta8`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.2.1-beta8>
-（历史版本各自保留安装程序：`v0.2.1-beta7` / `v0.2.1-beta6` / `v0.2.0-beta.5` / `v0.2.0-beta.4` / `v0.2.0-beta.3` / `v0.2.0-beta.2` / `v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
+**版本与发布**：标签 `v0.3.1-beta13`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.3.1-beta13>
+（历史版本各自保留安装程序：`v0.3.0-beta12` / `v0.2.3-beta11` / `v0.2.3-beta10` / `v0.2.1-beta9` / `v0.2.1-beta8` / `v0.2.1-beta7` / `v0.2.1-beta6` / `v0.2.0-beta.5` / `v0.2.0-beta.4` / `v0.2.0-beta.3` / `v0.2.0-beta.2` / `v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
 （预发布；**安装盘已附上**：`vimtu64-64.iso` 三合一安装盘 + `vimtu64-64.img` 裸盘介质）。
 
 ```bash
