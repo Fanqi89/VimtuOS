@@ -17,7 +17,7 @@
        （安装内核不链 Rust 目标文件）；
      * gui_rs.o 里没有任何 xmm/SSE 指令（引导链没有开 CR4.OSFXSR），且未定义符号只剩
        memcpy（内核 mem64.cpp 提供）。
-  4) QEMU 启动系统镜像读串口：`[RUST64] tokens ok themes=6 accent=#RRGGBB selftest PASS`
+  4) QEMU 启动系统镜像读串口：`[RUST64] tokens ok themes=7 accent=#RRGGBB selftest PASS`
      行存在、themes/accent 与源码解析值一致、且启动日志里没有 Rust panic / 蓝屏。
   5) 体积：系统内核与安装内核都 < 4,096,000 B（内核区硬上限）。
 

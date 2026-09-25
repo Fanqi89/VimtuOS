@@ -17,7 +17,7 @@
 //   * Rust 侧 no_std、无 alloc、无浮点（小数一律千分比整数，见 gui_rs/src/tokens.rs）。
 //
 // 串口打点（自动验收 grep，格式勿改）：
-//   [RUST64] tokens ok themes=6 accent=#RRGGBB selftest PASS
+//   [RUST64] tokens ok themes=7 accent=#RRGGBB selftest PASS
 //     （失败时后缀是 `selftest FAIL mask=N`；由 kernel64.cpp 的系统内核启动路径打出）
 #pragma once
 #include <stdint.h>

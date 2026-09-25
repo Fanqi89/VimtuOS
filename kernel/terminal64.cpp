@@ -2897,8 +2897,10 @@ static bool cmd_cfg(TerminalState* ts, const char* sub, const char* arg1, const 
             const char* p = s + kn + 1;
             while (*p && vn < (int)sizeof(val) - 1) val[vn++] = *p++;
         } else {
-            const char* p = rest ? rest : "";
-            while (*p == ' ') p++;
+            // 空格写法：rest 是"第一个参数之后的整段原文"（以 KEY 开头）—— 值必须取
+            // KEY 之后的那一段（保留 VALUE 里的空格），绝不能把 KEY 一起塞进值里。
+            // （旧实现直接把 rest 当值，`cfg set ui.theme 1` 会变成 key=ui.theme value="ui.theme 1"。）
+            const char* p = store_val_after_key(rest, key);
             while (*p && vn < (int)sizeof(val) - 1) val[vn++] = *p++;
         }
         val[vn] = 0;

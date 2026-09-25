@@ -838,13 +838,15 @@ static void dock_start_icon_init64() {
     }
     // 1) 优先 VimtuFS2（需求：图标/壁纸/头像优先从 VimtuFS2 读）
     const char* cand[2] = { "/logo/kaisi.png", "/kaisi.png" };
+    // 打点的 src 用 `vfs:` 前缀（明确这是从 VimtuFS2 卷里读到的真图）；加载仍用裸路径。
+    const char* cand_src[2] = { "vfs:/logo/kaisi.png", "vfs:/kaisi.png" };
     for (int i = 0; i < 2; i++) {
         Img64 im{};
         if (img64_load_vfs64(cand[i], &im) == 0) {
             dock_rgba_from_img64(&im, g_dock_start_rgba, DOCK_START_DISP, DOCK_START_DISP);
             img64_free64(&im);
             g_dock_start_ok = true;
-            g_dock_start_src = cand[i];      // 打点里写实际路径（验收要求 src=vfs:/logo/kaisi.png）
+            g_dock_start_src = cand_src[i];  // 打点里写实际路径（验收要求 src=vfs:/logo/kaisi.png）
             dock_log_start64();
             return;
         }

@@ -10,11 +10,11 @@
 //   模糊：背景层 20–30（取 24）、内容层 8–16（取 12）
 //   透明度：背景材质 0.35–0.55（取 0.45）、内容卡片 0.72–0.85（取 0.80）
 //   阴影：近层 0 2 4 rgba(0,0,0,0.08)、远层 0 12 32 rgba(0,0,0,0.12)
-//   动效：快 150ms、普通 200–250ms（取 220）、大面板 300–350ms（取 320）；缓动 cubic-bezier(0.2,0,0,1)
-//   主题：白（默认）/暗/蓝白渐变/粉白渐变 + 自定义渐变（粉绿、粉紫）+ 自定义背景图片
+//   动效：快 150ms、普通 200–250ms（取 225）、大面板 300–350ms（取 330）；缓动 cubic-bezier(0.2,0,0,1)
+//   主题：白色(默认)/暗色/蓝白渐变/粉白渐变/粉绿渐变/粉紫渐变/紫白渐变 + 自定义背景图片
 //
 // 串口打点（自动验收 grep；每类都有上限，防刷屏）：
-//   [THEME64] init themes=6 theme=0 name=white dark=0 reduce_motion=0
+//   [THEME64] init themes=7 theme=0 name=white dark=0 reduce_motion=0
 //   [THEME64] apply theme=<id> name=<name> dark=<0/1> accent=#RRGGBB why=<原因>
 //   [THEME64] motion reduce=<0/1> fast/normal/large=<ms>
 //   [THEME64] switch wall mode=...
@@ -48,8 +48,8 @@
 #define THEME64_SH_F_A        31      // 远层 alpha = 0.12*255
 // ---- 动效（ms）----
 #define THEME64_MS_FAST      150
-#define THEME64_MS_NORMAL    220
-#define THEME64_MS_LARGE     320
+#define THEME64_MS_NORMAL    225
+#define THEME64_MS_LARGE     330
 #define THEME64_MS_DOCK      260      // Dock 点击回弹
 #define THEME64_EASE_C1       51      // cubic-bezier(0.2,0,0,1) 的第一控制点 x=0.2（*256）
 // ---- 字号（TrueType 面 2 = simhei）----
