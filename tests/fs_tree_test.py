@@ -425,8 +425,8 @@ def main():
     #   `[VFS64] mount ok ...` / `[VFS64] format ok ...`（数据卷的块数不同，取"最后一条"会拿到别的卷）。
     #   所以这里明确按**系统卷的块数**去找那一行 —— 断言强度不变（仍要求 v3 + 128B inode + 155798 块）。
     mf = last_match(r"\[VFS64\] format ok blocks=%d version=(\d+) inode=(\d+) root=(\d+)" % TARGET_MAIN_BLOCKS, log2)
-    check("格式化产出 v3（[VFS64] format ok blocks=%d ... version=3 inode=128）" % TARGET_MAIN_BLOCKS,
-          bool(mf) and mf.group(1) == "3" and mf.group(2) == "128",
+    check("格式化产出 v4（[VFS64] format ok blocks=%d ... version=4 inode=128；P4 起新格式化 = v4）" % TARGET_MAIN_BLOCKS,
+          bool(mf) and mf.group(1) == "4" and mf.group(2) == "128",
           mf.group(0) if mf else "（缺 [VFS64] format ok blocks=%d 行）" % TARGET_MAIN_BLOCKS)
     check("格式化块数 = 主分区扇区数（155798）", bool(mf), "blocks=%d" % TARGET_MAIN_BLOCKS)
     check("自检全过（[VFS64] selftest PASS）", "[VFS64] selftest PASS" in log2)
@@ -446,8 +446,8 @@ def main():
         # ★ 多卷：按系统卷的块数定位系统卷的挂载行（数据卷也会打 mount ok，块数=24576）
         mv = last_match(r"\[VFS64\] mount ok blocks=%d inodes=(\d+) free=(\d+) version=(\d+) inode=(\d+)B"
                         % TARGET_MAIN_BLOCKS, slog(s3))
-        check("系统卷按 v3 挂载（mount ok blocks=%d ... version=3 inode=128B）" % TARGET_MAIN_BLOCKS,
-              bool(mv) and mv.group(3) == "3" and mv.group(4) == "128",
+        check("系统卷按 v4 挂载（mount ok blocks=%d ... version=4 inode=128B perm=on）" % TARGET_MAIN_BLOCKS,
+              bool(mv) and mv.group(3) == "4" and mv.group(4) == "128",
               mv.group(0) if mv else "（缺 mount ok 行）")
         check("挂载块数 = 主分区扇区数", bool(mv), "blocks=%d" % TARGET_MAIN_BLOCKS)
 
@@ -492,6 +492,17 @@ def main():
 
         # ---- 终端：多级目录 + 子目录写文件 ----
         check("打开终端（[APP] term opened）", open_terminal(mon, s3, proc))
+        # ★ P4 起：新格式化 = v4，**根目录属于 root 且 0755** -> 普通用户不能在 / 下建目录/写文件。
+        #   这些命令要的正是"在根下建树"，所以先切到 root 会话（`su - root`；身份/gui 打点见下）。
+        n_su = slog(s3).count("[USER64] su ok")
+        mon.type_line("su - root")
+        wait_for(s3, "[TERM] cmd su ok", 25, proc)
+        log3 = slog(s3)
+        check("su - root：终端会话身份变 root（[USER64] su ok ... to=root euid=0 ... via=su-dash）",
+              log3.count("[USER64] su ok") > n_su and
+              re.search(r"\[USER64\] su ok from=\w+ to=root euid=0", log3) is not None)
+        check("权限位已生效（[PERM64] cred ... user=root via=su-dash）",
+              re.search(r"\[PERM64\] cred uid=0 gid=0 euid=0 egid=0 user=root via=su-dash", log3) is not None)
         mon.type_line("mkdir /efi")
         mon.type_line("mkdir /apps")
         mon.type_line("mkdir /apps/demo")
@@ -567,6 +578,9 @@ def main():
         check("冷启动后 cat 仍读到 5 字节（跨重启持久化）",
               bool(mc4) and mc4.group(1) == "5", mc4.group(0) if mc4 else "（缺 cat 行）")
         n_cat_ok = log4.count("[TERM] cmd cat bytes=")
+        # ★ P4：rm 需要父目录的 w+x（/apps/demo 是 root 0755）-> 切到 root 会话再删
+        mon.type_line("su - root")
+        wait_for(s4, "[TERM] cmd su ok", 25, proc)
         mon.type_line("rm /apps/demo/demo.txt")
         log4 = wait_for(s4, "[TERM] cmd rm", 25, proc)
         check("rm 删掉子目录里的文件（[TERM] cmd rm ok）", "[TERM] cmd rm ok" in log4)

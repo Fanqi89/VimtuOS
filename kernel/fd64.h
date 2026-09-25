@@ -84,10 +84,11 @@
 #define FD64_ENOTDIR 20
 #define FD64_ESPIPE  29
 #define FD64_ENOSPC  28
+// 负错误码（= -errno；与 syscall64 的 LX64_* 同一口径）
 #define FD64_EPERM   1
 #define FD64_EAGAIN  11
 #define FD64_EROFS   30   // ★ 只读文件系统（FAT32 卷：打开写模式一律被拒）
-
+#define FD64_EACCES  13   // ★ P4：权限不足（vfs64 的 -EACCES 透传；与 LX64_EACCES 同值）
 // 路径规范化：接受 "/dir/sub/name" 与 "dir/sub/name"（相对路径 = 从根开始）；折叠连续的 '/'、
 // 去掉结尾 '/'、去前导空白；".." **原样保留**（父目录语义由 vfs64 负责）；拒绝空串、'/'、控制字符、超长。
 // 成功返回 0 并把规范形式（含 '/' 前缀）写进 out；失败返回负错误码。
@@ -123,6 +124,10 @@ int fd64_fsync64(int fd);
 // dup：newfd >= 3 时占用该槽；newfd < 0 时自动分配一个新槽。返回新 fd 或负错误码。
 // ★ Linux 语义：新旧 fd 指向**同一个 OpenFile64**（共享偏移/目录游标），引用计数 +1。
 int fd64_dup64(int oldfd, int newfd);
+
+// ★ P4：fd -> (统一卷号, 规范化路径)。fchmod/fchown 用（内核没有 inode 句柄可直接改，按路径改）。
+// 返回 0 = 已填入；-FD64_EBADF = fd 无效；-FD64_EINVAL = 缓冲太小。
+int fd64_where64(int fd, int* out_vol, char* path_out, int cap);
 
 // ==================== pipe（64 B 环形缓冲；无阻塞语义）====================
 // 成功返回 0 并填入读端/写端两个 fd；失败返回负错误码（-EMFILE 池/fd 槽满）。

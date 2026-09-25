@@ -220,6 +220,9 @@ static void fill_from_fat(Fs64Dirent64* out, const Fat64Entry64* e) {
                 ? VFS64_KIND_DIR
                 : vfs64_kind_by_name64(VFS64_TYPE_FILE, e->name, (uint32_t)i);
     out->attr = e->attr;
+    out->uid = 0;                                             // ★ P4：FAT 没有属主（恒 0 = root，如实标注）
+    out->gid = 0;
+    out->mode = (out->type == VFS64_TYPE_DIR) ? (VFS64_S_IFDIR | 0755u) : (VFS64_S_IFREG | 0644u);
 }
 // 名字长度（FAT 条目给的是 NUL 结尾字符串）
 static int fat_name_len(const char* s) {
@@ -239,15 +242,41 @@ static void fill_from_vfs(Fs64Dirent64* out, const Vfs64Dirent64* e) {
     out->mtime = e->mtime;
     out->kind = e->kind;
     out->attr = 0;
+    out->uid = e->uid;                                            // ★ P4
+    out->gid = e->gid;
+    out->mode = e->mode;
 }
+
+// ==================== ★ P4：统一卷 -> vfs64 的"按当前身份"调用范围 ====================
+// 设计（一句话）：**当前卷**直接用非 on64 的 vfs64 API（权限判定照实），跨卷时临时切到目标槽
+//   但**不把身份置成 root**（vfs64_scope_enter64/leave64 只换卷）。系统组件固定写系统卷的路径另走
+//   vfs64_*_on64()（那一族期间身份 = root，见 kernel/vfs64.cpp 的 Vfs64SlotGuard 说明）。
+struct Fs64VfsScope64 {
+    int  saved;
+    bool entered;
+    bool ok;
+    explicit Fs64VfsScope64(int vfs_slot) {
+        saved = -1;
+        entered = false;
+        ok = false;
+        if (vfs_slot < 0 || vfs_slot >= (int)VFS64_SLOT_MAX) return;
+        if (vfs64_current_slot64() == vfs_slot) { ok = true; return; }       // 已经是当前卷
+        if (vfs64_scope_enter64(vfs_slot, &saved) != 0) return;
+        entered = true;
+        ok = true;
+    }
+    ~Fs64VfsScope64() { if (entered) vfs64_scope_leave64(saved); }
+};
 
 // ==================== 统一操作 ====================
 int fs64_list64(int vol, const char* path, Fs64Dirent64* out, int max, uint32_t* cursor) {
     const int v = resolve_vol(vol);
     if (v < 0 || !out || max <= 0) return -1;
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
+        Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+        if (!sc.ok) return -1;
         Vfs64Dirent64 tmp;                                    // 逐个转（vfs 的游标直接透传）
-        const int n = vfs64_list64_on64(g_vols[v].vfs_slot, path, &tmp, 1, cursor);
+        const int n = vfs64_list64(path, &tmp, 1, cursor);
         if (n < 0) return -1;
         if (n == 0) return 0;
         fill_from_vfs(out, &tmp);
@@ -266,8 +295,11 @@ int fs64_ls64(int vol, const char* path, char names[][VFS64_LS_NAME_BUF], int ma
     const int v = resolve_vol(vol);
     if (v < 0 || !names || max <= 0) return -1;
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
-        return vfs64_ls_on64(g_vols[v].vfs_slot, path, names, max, sizes);
+        Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+        if (!sc.ok) return -1;
+        return vfs64_ls(path, names, max, sizes);
     }
+
     static Fat64Entry64 tmp[8];
     int got = 0;
     uint32_t cursor = 0;
@@ -292,13 +324,19 @@ int fs64_stat64(int vol, const char* path, Fs64Stat64* out) {
     const int v = resolve_vol(vol);
     if (v < 0 || !out) return -1;
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
+        Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+        if (!sc.ok) return -1;
         Vfs64Info64 vi;
-        if (vfs64_stat64_on64(g_vols[v].vfs_slot, path, &vi) != 0) return -1;
+        const int rc = vfs64_stat64(path, &vi);
+        if (rc != 0) return rc;                               // ★ P4：-EACCES 原样透传（缺 x 进不去）
         out->type = vi.type;
         out->size = vi.size;
         out->mtime = vi.mtime;
         out->kind = vi.kind;
         out->attr = 0;
+        out->uid = vi.uid;                                    // ★ P4
+        out->gid = vi.gid;
+        out->mode = vi.mode;
         return 0;
     }
     Fat64Entry64 fe;
@@ -310,13 +348,46 @@ int fs64_stat64(int vol, const char* path, Fs64Stat64* out) {
                 ? VFS64_KIND_DIR
                 : vfs64_kind_by_name64(VFS64_TYPE_FILE, fe.name, (uint32_t)fat_name_len(fe.name));
     out->attr = fe.attr;
+    out->uid = 0;                                             // FAT 没有属主（如实：恒 root/0）
+    out->gid = 0;
+    out->mode = (out->type == VFS64_TYPE_DIR) ? (VFS64_S_IFDIR | 0755u) : (VFS64_S_IFREG | 0644u);
     return 0;
+}
+// ★ P4：access(2) 的按卷变体（fd64 在 open 时用它做 r/w 判定；FAT 卷没有权限模型 -> 恒 0）
+int fs64_access64(int vol, const char* path, uint32_t mask) {
+    const int v = resolve_vol(vol);
+    if (v < 0) return -1;
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return 0;
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_access64(path, mask);
+}
+// ★ P4：chmod/chown 的按卷变体（终端命令用；越权错误码原样透传）
+int fs64_chmod64(int vol, const char* path, uint32_t mode) {
+    const int v = resolve_vol(vol);
+    if (v < 0) return -1;
+    if (g_vols[v].readonly) { log_reject_ro(v, "chmod", path); return -FS64_EROFS; }
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_chmod64(path, mode);
+}
+int fs64_chown64(int vol, const char* path, uint32_t uid, uint32_t gid) {
+    const int v = resolve_vol(vol);
+    if (v < 0) return -1;
+    if (g_vols[v].readonly) { log_reject_ro(v, "chown", path); return -FS64_EROFS; }
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_chown64(path, uid, gid);
 }
 int fs64_read64(int vol, const char* path, void* buf, int max) {
     const int v = resolve_vol(vol);
     if (v < 0 || !buf || max <= 0) return -1;
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
-        return vfs64_read_on64(g_vols[v].vfs_slot, path, buf, max);
+        Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+        if (!sc.ok) return -1;
+        return vfs64_read64(path, buf, max);
     }
     uint32_t got = 0;
     if (fat64_read64(g_vols[v].fat_slot, path, buf, (uint32_t)max, &got) != 0) return -1;
@@ -327,63 +398,84 @@ int fs64_read_range64(int vol, const char* path, uint32_t off, void* buf, uint32
     if (v < 0 || !buf || !out_got) return -1;
     *out_got = 0;
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
-        // ★ 批次 M：VimtuFS2 现在有**按偏移分块读**（二级间接块也支持）——
-        //   不再"整读进 8MiB 静态缓冲再切片"，缓冲区直接用调用方的（零拷贝、零大缓冲）。
-        return vfs64_read_at_on64(g_vols[v].vfs_slot, path, off, buf, len, out_got);
+        Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+        if (!sc.ok) return -1;
+        // ★ 批次 M：VimtuFS2 有**按偏移分块读**（二级间接块也支持）——缓冲区直接用调用方的。
+        return vfs64_read_at64(path, off, buf, len, out_got);
     }
     return fat64_read_range64(g_vols[v].fat_slot, path, off, buf, len, out_got);
 }
 // ★ 批次 M：分块写（按偏移，保留原有字节；off > 当前大小 = 空洞补零）。只读卷一律 -FS64_EROFS。
-// 语义与 vfs64_write_at64 一致；返回 0 = 成功 / -FS64_EROFS / -1。
+// ★ P4：写权限判定在 vfs64 内部（已有文件 w / 新建父目录 w+x）；越权 -> -EACCES。
 int fs64_write_at64(int vol, const char* path, uint32_t off, const void* buf, uint32_t len) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "write_at", path); return -FS64_EROFS; }
     if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;          // FAT 只读（上面已拒），这里不会到
-    return vfs64_write_at_on64(g_vols[v].vfs_slot, path, off, buf, len);
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_write_at64(path, off, buf, len);
 }
-// 写操作：FAT 一律拒绝（只读卷），VimtuFS2 转 vfs64_*_on64
+// 写操作：FAT 一律拒绝（只读卷），VimtuFS2 按当前身份调用（权限判定在 vfs64 内）
 int fs64_write64(int vol, const char* path, const void* buf, int len) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "write", path); return -FS64_EROFS; }
-    return vfs64_write_on64(g_vols[v].vfs_slot, path, buf, len);
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_write64(path, buf, len);
 }
 int fs64_create64(int vol, const char* path) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "create", path); return -FS64_EROFS; }
-    return vfs64_create_on64(g_vols[v].vfs_slot, path);
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_create64(path);
 }
 int fs64_mkdir64(int vol, const char* path) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "mkdir", path); return -FS64_EROFS; }
-    return vfs64_mkdir_on64(g_vols[v].vfs_slot, path);
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_mkdir64(path);
 }
 int fs64_unlink64(int vol, const char* path) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "unlink", path); return -FS64_EROFS; }
-    return vfs64_unlink_on64(g_vols[v].vfs_slot, path);
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_unlink64(path);
 }
 int fs64_rmdir64(int vol, const char* path) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "rmdir", path); return -FS64_EROFS; }
-    return vfs64_rmdir_on64(g_vols[v].vfs_slot, path);
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_rmdir64(path);
 }
 int fs64_rename64(int vol, const char* old_path, const char* new_name) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "rename", old_path); return -FS64_EROFS; }
-    return vfs64_rename_on64(g_vols[v].vfs_slot, old_path, new_name);
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_rename64(old_path, new_name);
 }
 int fs64_free64(int vol, uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_blocks) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
-        return vfs64_free_on64(g_vols[v].vfs_slot, free_blocks, free_bytes, total_blocks);
+        return vfs64_free_on64(g_vols[v].vfs_slot, free_blocks, free_bytes, total_blocks);   // 无路径：不涉权限
     }
     Fat64Info64 fi;
     if (fat64_vol_info64(g_vols[v].fat_slot, &fi) != 0) return -1;

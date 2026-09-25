@@ -433,7 +433,8 @@ def main():
             log = vm.wait_new("[USER64] su ok", 20, n)
             check("su - root：会话 euid 变 0，GUI 身份不变（gui_unchanged=1）",
                   bool(log) and bool(re.search(r"\[USER64\] su ok from=vimtu to=root euid=0 gui=vimtu gui_unchanged=1 via=su-dash", log)))
-            check("打点如实写明权限位尚未拦截（P4）", "permission bits not enforced yet; P4" in vm.log())
+            check("★ P4 收口：提权把凭证同步给 VFS（[PERM64] cred ... user=root via=su-dash），权限位真的开始拦截",
+                  bool(re.search(r"\[PERM64\] cred uid=0 gid=0 euid=0 egid=0 user=root via=su-dash", vm.log())))
             n = vm.log().count("[USER64] whoami")
             vm.type_line("whoami")
             log = vm.wait_new("[USER64] whoami", 20, n)

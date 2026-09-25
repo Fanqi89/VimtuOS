@@ -150,7 +150,12 @@ void task64_load_fs_base64(uint64_t v) {
 }
 uint64_t task64_kernel_cr364() { return g_task64_kernel_cr364; }
 
-// 切换前的统一装载：rsp0 / syscall 栈顶 / CR3 / FS 基址（互不依赖，顺序无关）
+// ★ P4：每进程凭证（uid/gid/euid/egid）的装载钩子。任务表**不认识** Proc64 结构，所以这里只把
+//   proc 指针转给 proc64.cpp 定义的强符号（安装介质内核不链 proc64.cpp -> 该符号缺失，
+//   weak 引用为 0，直接跳过：安装介质的任务没有权限语义）。
+extern "C" void task64_cred_hook64(void* proc) __attribute__((weak));
+
+// 切换前的统一装载：rsp0 / syscall 栈顶 / CR3 / FS 基址 / ★ P4 凭证（互不依赖，顺序无关）
 static void task_apply_ctx64(Task64* n) {
     tss_set_rsp0(task_rsp0_of(n));
     if (n->syscall_kstack) {
@@ -160,6 +165,7 @@ static void task_apply_ctx64(Task64* n) {
     }
     task64_load_cr364(n->mm_cr3 ? n->mm_cr3 : g_task64_kernel_cr364);
     task64_load_fs_base64(n->proc ? n->mm_fs_base : 0);
+    if (task64_cred_hook64) task64_cred_hook64(n->proc);        // ★ P4：proc=nullptr -> 恢复会话身份
 }
 
 // ==================== 小工具 ====================

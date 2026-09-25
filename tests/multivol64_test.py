@@ -112,7 +112,7 @@ def vfs3_inode(buf, vol, idx):
     raw = vfs3_inode_raw(buf, vol, idx)
     t = raw[0]
     nl = raw[1]
-    noff = 40 if vol["ver"] == 3 else 32
+    noff = 40 if vol["ver"] in (3, 4) else 32          # ★ P4：v4 的 inode 名字偏移与 v3 相同（40）
     return dict(idx=idx, type=t, namelen=nl,
                 name=bytes(raw[noff:noff + nl]).decode("ascii", "replace"),
                 size=_u32(raw, 4), d0=_u32(raw, 8), d1=_u32(raw, 12), d2=_u32(raw, 16),
@@ -121,7 +121,7 @@ def vfs3_inode(buf, vol, idx):
 
 def vfs3_inode_dind(buf, vol, idx):
     """★ 批次 M：v3 inode 偏移 71 的二级间接块指针（0 = 没有；v2 卷没有这个字段）。"""
-    if vol["ver"] != 3:
+    if vol["ver"] not in (3, 4):                       # ★ P4：v4 也把 dind 放在偏移 71
         return 0
     raw = vfs3_inode_raw(buf, vol, idx)
     return _u32(raw, 71) if len(raw) >= 75 else 0
@@ -462,8 +462,8 @@ def main():
     check("格式化主分区 P2（[PART] 格式化 OK drive=1 index=2 start=8009）",
           "[PART] 格式化 OK drive=1 index=2 start=8009" in log2)
     mf = fst.last_match(r"\[VFS64\] format ok blocks=(\d+) version=(\d+) inode=(\d+) root=(\d+)", log2)
-    check("格式化产出 v3（version=3 inode=128）",
-          bool(mf) and mf.group(2) == "3" and mf.group(3) == "128",
+    check("格式化产出 v4（version=4 inode=128；★ P4 起新格式化 = v4）",
+          bool(mf) and mf.group(2) == "4" and mf.group(3) == "128",
           mf.group(0) if mf else "（缺 [VFS64] format ok 行）")
     check("格式化块数 = 主分区扇区数（%d）" % TARGET_MAIN_SECTORS,
           bool(mf) and mf.group(1) == str(TARGET_MAIN_SECTORS),
@@ -547,6 +547,11 @@ def main():
         # ---- 双卷独立：切回 C: 写哨兵 -> 再切数据卷看它不在 ----
         mon.type_line("vol c")
         check("切回 C: 成功", vm.wait_log("[VOL] switch letter=C: slot=0", 20))
+        # ★ P4：C: 是新格式化的 **v4** 卷（/ 属于 root、0755）-> 普通用户不能在 / 下写；切到 root 再写
+        n_su = vm.log().count("[USER64] su ok")
+        mon.type_line("su - root")
+        check("su - root（P4：C: 根目录属于 root，写哨兵要 root 会话）",
+              vm.wait_log("[USER64] su ok", 20) is not None and vm.log().count("[USER64] su ok") > n_su)
         before_w9 = len(re.findall(r"\[FD64\] write fd=\d+ n=9 total=9", vm.log()))
         mon.type_line("write /csentinel.txt c-side-ok")
         check("在 C: 上写哨兵文件（FD 层 n=9）",
@@ -686,7 +691,7 @@ def main():
         # C: 的 /store.a 内容正确（宿主侧解析槽 + 新键）
         cbuf = read_file(target)
         cvol = vfs3_vol(cbuf, PART_MAIN_LBA)
-        check("C: 是合法 v3 卷（宿主侧）", cvol is not None and cvol["ver"] == 3)
+        check("C: 是合法 v3/v4 卷（宿主侧；★ P4 起安装向导格式化产出 v4）", cvol is not None and cvol["ver"] in (3, 4))
         if cvol:
             fa = vfs3_find(cbuf, cvol, "store.a")
             fb = vfs3_find(cbuf, cvol, "store.b")

@@ -290,6 +290,48 @@ static int g_dirty = 0;            // 1 = 内存表与磁盘不一致（需要�
 
 static int sys_slot64() { return vfs64_system_slot64(); }
 
+// ★ P4：本系统"每个用户一个主组"（Linux 的 user-private-group 口径）：普通用户 gid = uid，root = 0。
+//   没有独立的组表/附加组 —— 如实标注（group 段只比 egid）。
+static uint32_t gid_of64(const User64Entry* e) {
+    return (e && !(e->flags & USERDB64_F_ROOT)) ? e->uid : 0u;
+}
+// ★ P4：把某个用户的主目录/桌面设成"属主 = 自己、0700"（默认私有）。旧卷（v2/v3）没有权限字段：
+//   vfs64_perm_fields64() == 0 时直接跳过（打点已经由 vfs64 mount 时的 legacy 行说明）。
+static void apply_home_perm64(const User64Entry* e) {
+    if (!e) return;
+    const int slot = sys_slot64();
+    if (slot < 0) return;
+    if (vfs64_perm_fields64() != 1) return;
+    const uint32_t uid = e->uid;
+    const uint32_t gid = gid_of64(e);
+    (void)vfs64_chown_on64(slot, e->home, uid, gid);
+    (void)vfs64_chmod_on64(slot, e->home, VFS64_S_IFDIR | 0700u);
+    (void)vfs64_chown_on64(slot, e->desktop, uid, gid);
+    (void)vfs64_chmod_on64(slot, e->desktop, VFS64_S_IFDIR | 0700u);
+}
+// ★ P4：会话身份变化 -> 同步给 VFS（终端/桌面的文件操作按它做权限判定），并打一行可 grep 的证据。
+static void publish_cred64(const char* via) {
+    const int i = g_sess_idx;
+    const uint32_t uid = (i >= 0) ? g_ent[i].uid : 0u;
+    const uint32_t gid = (i >= 0) ? gid_of64(&g_ent[i]) : 0u;
+    vfs64_set_cred64(uid, gid, uid, gid);
+    dbg64_line_begin64();
+    dbg64_str("[PERM64] cred uid=");
+    dbg64_dec(uid);
+    dbg64_str(" gid=");
+    dbg64_dec(gid);
+    dbg64_str(" euid=");
+    dbg64_dec(uid);
+    dbg64_str(" egid=");
+    dbg64_dec(gid);
+    dbg64_str(" user=");
+    dbg64_str(i >= 0 ? g_ent[i].name : "root");
+    dbg64_str(" via=");
+    dbg64_str(via ? via : "?");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
 static void ent_clear64(User64Entry* e) {
     for (uint32_t i = 0; i < (uint32_t)sizeof(User64Entry); i++) ((uint8_t*)e)[i] = 0;
     e->theme = -1;
@@ -327,6 +369,7 @@ static void ensure_dir64(const char* path) {
 static void ensure_user_dirs64(const User64Entry* e) {
     ensure_dir64(e->home);
     ensure_dir64(e->desktop);
+    apply_home_perm64(e);                                  // ★ P4：属主 = 用户、0700（默认私有）
 }
 
 // ==================== 序列化 / 解析 ====================
@@ -607,11 +650,18 @@ void userdb64_init64() {
         return;
     }
 
-    // 1) 目录骨架（Linux 语义）
+    // 1) 目录骨架（Linux 语义）+ ★ P4 权限：/etc 与 /home 是 0755（大家可进可读），/root 是 0700 root
     ensure_dir64("/etc");
     ensure_dir64("/home");
     ensure_dir64("/root");
     ensure_dir64("/root/Desktop");
+    if (vfs64_perm_fields64() == 1) {
+        (void)vfs64_chmod_on64(sys_slot64(), "/etc", VFS64_S_IFDIR | 0755u);
+        (void)vfs64_chmod_on64(sys_slot64(), "/home", VFS64_S_IFDIR | 0755u);
+        (void)vfs64_chown_on64(sys_slot64(), "/root", 0u, 0u);
+        (void)vfs64_chmod_on64(sys_slot64(), "/root", VFS64_S_IFDIR | 0700u);
+        (void)vfs64_chmod_on64(sys_slot64(), "/root/Desktop", VFS64_S_IFDIR | 0700u);
+    }
 
     // 2) 读表
     const int loaded = db_load64();
@@ -972,6 +1022,7 @@ int userdb64_login64(const char* name) {
     }
     g_gui_idx = i;
     g_sess_idx = i;                                   // 登录 = 会话身份也回到该用户（root 会话不跨登录）
+    publish_cred64("login");                          // ★ P4：终端/桌面的文件操作按这个身份做权限判定
     config64_set_str64("ui.login.last", g_ent[i].name);
     (void)config64_flush64();
     desktop_scan64(&g_ent[i]);
@@ -996,23 +1047,35 @@ int userdb64_login64(const char* name) {
     return 0;
 }
 
-int userdb64_session_root64(const char* via) {
-    if (g_root_idx < 0) return -1;
+// ★ P4：把**会话身份**切成指定用户（su/sudo 用；GUI 身份不变）。成功 0；-1 = 未登录/无此用户。
+//   语义：root 可以切到任何人；普通用户也能切（口令校验在终端层：目标有口令时要先输对，见 terminal64）。
+int userdb64_su64(const char* name, const char* via) {
+    const int to = userdb64_find64(name);
+    if (to < 0) return -1;
     if (g_gui_idx < 0) return -1;                     // 还没登录过：没有会话可切
-    if ((g_ent[g_gui_idx].flags & USERDB64_F_ROOT)) return -1;
     const int from = g_sess_idx;
-    g_sess_idx = g_root_idx;
+    g_sess_idx = to;
+    publish_cred64(via ? via : "su");
     if (log_ok64(LOGK_CMD)) {
         dbg64_line_begin64();
         dbg64_str("[USER64] su ok from=");
         dbg64_str(from >= 0 ? g_ent[from].name : "-");
-        dbg64_str(" to=root euid=0 gui=");
+        dbg64_str(" to=");
+        dbg64_str(g_ent[to].name);
+        dbg64_str(" euid=");
+        dbg64_dec((uint64_t)g_ent[to].uid);
+        dbg64_str(" gui=");
         dbg64_str(g_ent[g_gui_idx].name);
         dbg64_str(" gui_unchanged=1 via=");
         dbg64_str(via ? via : "su");
-        dbg64_str(" (permission bits not enforced yet; P4)\n");
+        dbg64_nl();
         dbg64_line_end64();
     }
+    return 0;
+}
+int userdb64_session_root64(const char* via) {
+    const int rc = userdb64_su64("root", via ? via : "su");
+    if (rc != 0) return rc;
     return 0;
 }
 
@@ -1020,6 +1083,7 @@ int userdb64_session_exit64() {
     if (g_sess_idx < 0 || !(g_ent[g_sess_idx].flags & USERDB64_F_ROOT)) return 1;
     const int from = g_sess_idx;
     g_sess_idx = g_gui_idx;
+    publish_cred64("exit");                           // ★ P4：退回 GUI 用户 -> 身份跟着回
     if (log_ok64(LOGK_CMD)) {
         dbg64_line_begin64();
         dbg64_str("[USER64] exit ok from=");

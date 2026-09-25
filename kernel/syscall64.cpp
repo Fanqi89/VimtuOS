@@ -121,6 +121,7 @@
 #include "usermode64.h"     // user64_range_ok64 / user64_exit_to_kernel64 / 用户窗口常量
 #include "vfs64.h"          // Linux open/read 走真实文件系统
 #include "fd64.h"           // 批次 B：FD 层（open/read/write/close/lseek/fstat/dup 的公共底座）
+#include "fs64.h"           // ★ P4：统一卷分派（stat/access/chmod/chown 按当前卷 + 权限判定）
 
 // ---- 批次 C：proc64（进程/地址空间）的**弱引用** ----
 // proc64.cpp 只在系统内核里链接（安装介质内核没有进程/地址空间、没有 task64/elf64）。
@@ -143,6 +144,9 @@ uint64_t proc64_get_fs_base64()                           __attribute__((weak));
 int  proc64_record_sigaction64(int, uint64_t)             __attribute__((weak));
 int  proc64_record_sigmask64(uint64_t)                    __attribute__((weak));
 int  proc64_alarm_set64(int)                              __attribute__((weak));
+// ★ P4：每进程凭证（proc64.cpp；安装内核不链它 -> weak 为 0 -> 退化为会话身份/EPERM）
+int  proc64_get_cred64(uint32_t*, uint32_t*, uint32_t*, uint32_t*)    __attribute__((weak));
+int  proc64_set_cred64(uint32_t, uint32_t, uint32_t, uint32_t)        __attribute__((weak));
 static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
 #include "mem_64.h"         // PAGE_SIZE_64 / page_free_64 / PTE_*
 #include "debug64.h"
@@ -173,6 +177,11 @@ static const int64_t  LX64_ENOTTY = 25;
 static const int64_t  LX64_ESPIPE = 29;
 static const int64_t  LX64_ENOSYS = 38;
 static const int64_t  LX64_ENOTEMPTY = 39;
+
+// 这些 errno 目前没有调用点，但它们是**对外承诺的错误码表**（文档/测试按这个口径读）；
+// 这里用 static_assert 钉住取值 —— 顺带消掉 -Wextra 的"未被引用"告警（本文件要求零告警）。
+static_assert(LX64_ESRCH == 3 && LX64_ECHILD == 10 && LX64_EAGAIN == 11 && LX64_EMFILE == 24 &&
+              LX64_ESPIPE == 29 && LX64_ENOTEMPTY == 39, "LX64_* 错误码表（= -errno）");
 
 // 批次 C：有"当前进程"（且隔离模式开着）时，brk/mmap/mprotect/munmap 走每进程实现；
 // 否则退回原来的共享窗口实现（UEFI/固件页表 -> 共享地址空间模式，行为与批次 B 完全一致）。
@@ -396,17 +405,21 @@ static int64_t lx64_close64(uint64_t nr, uint64_t fd) {
 static const uint32_t LX64_S_IFCHR = 0020000u;
 static const uint32_t LX64_S_IFDIR = 0040000u;
 static const uint32_t LX64_S_IFREG = 0100000u;
-static void lx64_fill_stat64(uint8_t* st, uint32_t mode, uint64_t size) {
+// ★ P4：st_uid/st_gid 不再恒 0；mode 也不再恒 0755/0444 —— 由调用方给出真实值。
+static void lx64_fill_stat64_ex(uint8_t* st, uint32_t mode, uint64_t size, uint32_t uid, uint32_t gid) {
     for (uint32_t i = 0; i < 144; i++) st[i] = 0;
     lx64_wr64(st + 0,  1);                          // st_dev
     lx64_wr64(st + 8,  1);                          // st_ino
     lx64_wr64(st + 16, 1);                          // st_nlink
     lx64_wr32(st + 24, mode);                       // st_mode
-    lx64_wr32(st + 28, 0);                          // st_uid
-    lx64_wr32(st + 32, 0);                          // st_gid
+    lx64_wr32(st + 28, uid);                        // st_uid
+    lx64_wr32(st + 32, gid);                        // st_gid
     lx64_wr64(st + 48, size);                       // st_size
     lx64_wr64(st + 56, 4096);                       // st_blksize
     lx64_wr64(st + 64, (size + 511) / 512);         // st_blocks
+}
+static void lx64_fill_stat64(uint8_t* st, uint32_t mode, uint64_t size) {
+    lx64_fill_stat64_ex(st, mode, size, 0, 0);
 }
 static int64_t lx64_fstat64(uint64_t nr, uint64_t fd, uint64_t st_va) {
     if (!user64_range_ok64(st_va, 144)) { syscall64_deny64(nr, st_va); return -LX64_EFAULT; }
@@ -414,10 +427,26 @@ static int64_t lx64_fstat64(uint64_t nr, uint64_t fd, uint64_t st_va) {
     if (fd <= 2) {
         lx64_fill_stat64(st, LX64_S_IFCHR | 0666u, 0);      // 标准流：最小三字段（mode/nlink/size）
     } else {
-        uint32_t ty = 0, sz = 0;
-        const int r = fd64_stat64((int)fd, &ty, &sz);
-        if (r != 0) { syscall64_deny64(nr, fd); return r; }
-        lx64_fill_stat64(st, (ty == VFS64_TYPE_DIR) ? (LX64_S_IFDIR | 0755u) : (LX64_S_IFREG | 0444u), sz);
+        int fvol = -1;
+        char fpath[FD64_PATH_MAX];
+        if (fd64_where64((int)fd, &fvol, fpath, (int)sizeof(fpath)) == 0) {
+            Fs64Stat64 si;
+            if (fs64_stat64(fvol, fpath, &si) == 0) {
+                uint32_t mode = si.mode;
+                if ((mode & VFS64_S_IFMT) == 0) mode = (si.type == VFS64_TYPE_DIR) ? (LX64_S_IFDIR | 0755u) : (LX64_S_IFREG | 0644u);
+                lx64_fill_stat64_ex(st, mode, si.size, si.uid, si.gid);   // ★ P4：真实 uid/gid/mode
+            } else {
+                uint32_t ty = 0, sz = 0;
+                const int r = fd64_stat64((int)fd, &ty, &sz);
+                if (r != 0) { syscall64_deny64(nr, fd); return r; }
+                lx64_fill_stat64(st, (ty == VFS64_TYPE_DIR) ? (LX64_S_IFDIR | 0755u) : (LX64_S_IFREG | 0644u), sz);
+            }
+        } else {
+            uint32_t ty = 0, sz = 0;
+            const int r = fd64_stat64((int)fd, &ty, &sz);
+            if (r != 0) { syscall64_deny64(nr, fd); return r; }
+            lx64_fill_stat64(st, (ty == VFS64_TYPE_DIR) ? (LX64_S_IFDIR | 0755u) : (LX64_S_IFREG | 0644u), sz);
+        }
     }
     lx64_copy_to_user64(st_va, st, 144);
     return 0;
@@ -711,28 +740,114 @@ static int64_t lx64_rt_sigprocmask64(uint64_t how, uint64_t set_va, uint64_t old
     return 0;
 }
 
-// ---- 4/6）stat / lstat：按路径的最小实现（走 vfs64；不区分符号链接 —— 本文件系统没有）----
+// ---- 4/6）stat / lstat：按路径（走 fs64 的统一分派；不区分符号链接 —— 本文件系统没有）----
+// ★ P4：st_uid/st_gid/st_mode 现在给**真实值**（之前恒 0/0755/0444）；缺 x 进不去 -> -EACCES。
 static int64_t lx64_stat_path64(uint64_t nr, uint64_t path_va, uint64_t st_va) {
     char path[LX64_PATH_MAX];
     if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(nr, path_va); return -LX64_EFAULT; }
     if (!user64_range_ok64(st_va, 144)) { syscall64_deny64(nr, st_va); return -LX64_EFAULT; }
-    uint32_t type = 0, size = 0;
-    if (vfs64_stat(path, &type, &size) != 0) return -LX64_ENOENT;
+    Fs64Stat64 si;
+    const int rc = fs64_stat64(-1, path, &si);
+    if (rc != 0) return (rc == -13) ? -LX64_EACCES : -LX64_ENOENT;
+    uint32_t mode = si.mode;
+    if ((mode & VFS64_S_IFMT) == 0) mode = (si.type == VFS64_TYPE_DIR) ? (LX64_S_IFDIR | 0755u) : (LX64_S_IFREG | 0644u);
     uint8_t st[144];
-    if (type == VFS64_TYPE_DIR) lx64_fill_stat64(st, LX64_S_IFDIR | 0755u, size);
-    else                       lx64_fill_stat64(st, LX64_S_IFREG | 0444u, size);
+    lx64_fill_stat64_ex(st, mode, si.size, si.uid, si.gid);
     lx64_copy_to_user64(st_va, st, 144);
     return 0;
 }
-// ---- 21）access ----
+// ---- 21）access：真按 r/w/x 判定（★ P4；FAT/旧卷没有权限模型 -> 恒允许）----
 static int64_t lx64_access64(uint64_t nr, uint64_t path_va, uint64_t mode) {
     char path[LX64_PATH_MAX];
-    (void)mode;                                          // 本内核没有权限模型（uid/gid 恒 0）
     if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(nr, path_va); return -LX64_EFAULT; }
-    uint32_t type = 0, size = 0;
-    if (vfs64_stat(path, &type, &size) != 0) return -LX64_ENOENT;
+    const int rc = fs64_access64(-1, path, (uint32_t)mode & 7u);
+    if (rc == 0) return 0;
+    if (rc == -13) return -LX64_EACCES;
+    return -LX64_ENOENT;
+}
+// ==================== ★ P4：身份 / 模式 / 属主 系统调用 ====================
+// 凭证来源（与 VFS 完全同一份，见 vfs64.h 的"★ P4 权限"）：
+//   * 有进程上下文（ring3 程序）-> proc64 的**每进程** uid/gid/euid/egid；
+//   * 没有（终端/桌面 = 任务 0、安装介质内核）-> vfs64 的会话身份（userdb64 设的那份）。
+// 语义裁剪（如实标注）：
+//   * x86_64 **没有** seteuid/setegid 系统调用（glibc 用 setresuid/setresgid 实现）—— 这里实现
+//     105 setuid / 106 setgid / 113 setreuid / 114 setregid / 117 setresgid / 118 setresuid；
+//     "-1"（0xFFFFFFFF）表示"这一项不改"（Linux 语义）。
+//   * **不维护 saved-set-uid**（setresuid 的第三项忽略）；因此"root 降权之后还能不能再回来"按
+//     Linux 的 setuid 语义走：root 调 setuid(x) 会把 ruid/euid 都设成 x，之后就不是 root 了（不可逆）。
+static void lx64_cred64(uint32_t* uid, uint32_t* gid, uint32_t* euid, uint32_t* egid) {
+    uint32_t u = 0, g = 0, eu = 0, eg = 0;
+    if (proc64_get_cred64 && proc64_get_cred64(&u, &g, &eu, &eg) == 0) {
+        if (uid) *uid = u; if (gid) *gid = g; if (euid) *euid = eu; if (egid) *egid = eg;
+        return;
+    }
+    Vfs64Cred64 c;
+    vfs64_get_cred64(&c);
+    if (uid) *uid = c.uid; if (gid) *gid = c.gid; if (euid) *euid = c.euid; if (egid) *egid = c.egid;
+}
+// 统一入口：-1（0xFFFFFFFF）= 不改；非 root 只允许在"已有的 uid/euid（gid/egid）"里取值。
+// 没有进程上下文（安装内核）-> -EPERM（诚实：那里没有身份可改）。
+static int64_t lx64_apply_cred64(uint32_t uid, uint32_t gid, uint32_t euid, uint32_t egid) {
+    uint32_t cu = 0, cg = 0, ceu = 0, ceg = 0;
+    lx64_cred64(&cu, &cg, &ceu, &ceg);
+    const uint32_t nu  = (uid  == 0xFFFFFFFFu) ? cu  : uid;
+    const uint32_t ng  = (gid  == 0xFFFFFFFFu) ? cg  : gid;
+    const uint32_t neu = (euid == 0xFFFFFFFFu) ? ceu : euid;
+    const uint32_t neg = (egid == 0xFFFFFFFFu) ? ceg : egid;
+    if (ceu != 0) {                                   // 非 root：不能凭空提权
+        const bool uok = (nu == cu || nu == ceu) && (neu == cu || neu == ceu);
+        const bool gok = (ng == cg || ng == ceg) && (neg == cg || neg == ceg);
+        if (!uok || !gok) return -LX64_EPERM;
+    }
+    if (!(proc64_set_cred64 && proc64_current_pid64 && proc64_current_pid64() > 0)) return -LX64_EPERM;
+    if (proc64_set_cred64(nu, ng, neu, neg) != 0) return -LX64_EPERM;
     return 0;
 }
+static int64_t lx64_getuid64()  { uint32_t v = 0; lx64_cred64(&v, nullptr, nullptr, nullptr); return (int64_t)v; }
+static int64_t lx64_geteuid64() { uint32_t v = 0; lx64_cred64(nullptr, nullptr, &v, nullptr); return (int64_t)v; }
+static int64_t lx64_getgid64()  { uint32_t v = 0; lx64_cred64(nullptr, &v, nullptr, nullptr); return (int64_t)v; }
+static int64_t lx64_getegid64() { uint32_t v = 0; lx64_cred64(nullptr, nullptr, nullptr, &v); return (int64_t)v; }
+// chmod/fchmod：mode 原样交给 vfs64（它只接受类型位 + 0777）；越权/只读卷/旧卷按 errno 原样回报。
+static int64_t lx64_chmod_path64(uint64_t path_va, uint64_t mode) {
+    char path[LX64_PATH_MAX];
+    if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) return -LX64_EFAULT;
+    const int rc = fs64_chmod64(-1, path, (uint32_t)mode);
+    if (rc == 0) return 0;
+    if (rc == -13) return -LX64_EACCES;
+    return -LX64_EPERM;                              // -1：非属主/非 root / 不存在 / 旧卷无字段
+}
+static int64_t lx64_fchmod64(uint64_t fd, uint64_t mode) {
+    int fvol = -1;
+    char fpath[FD64_PATH_MAX];
+    const int r = fd64_where64((int)fd, &fvol, fpath, (int)sizeof(fpath));
+    if (r != 0) return r;
+    const int rc = fs64_chmod64(fvol, fpath, (uint32_t)mode);
+    if (rc == 0) return 0;
+    if (rc == -13) return -LX64_EACCES;
+    return -LX64_EPERM;
+}
+// chown/fchown：只有 root 能改（vfs64 内部判定）；owner/group 传 -1 = 不改那一项（Linux 语义）。
+static int64_t lx64_chown_path64(uint64_t path_va, uint64_t owner, uint64_t group) {
+    char path[LX64_PATH_MAX];
+    if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) return -LX64_EFAULT;
+    const int rc = fs64_chown64(-1, path, (uint32_t)owner, (uint32_t)group);
+    if (rc == 0) return 0;
+    if (rc == -13) return -LX64_EACCES;
+    return -LX64_EPERM;                              // 非 root / 不存在 / 旧卷无字段
+}
+static int64_t lx64_fchown64(uint64_t fd, uint64_t owner, uint64_t group) {
+    int fvol = -1;
+    char fpath[FD64_PATH_MAX];
+    const int r = fd64_where64((int)fd, &fvol, fpath, (int)sizeof(fpath));
+    if (r != 0) return r;
+    const int rc = fs64_chown64(fvol, fpath, (uint32_t)owner, (uint32_t)group);
+    if (rc == 0) return 0;
+    if (rc == -13) return -LX64_EACCES;
+    return -LX64_EPERM;
+}
+// umask：只影响**新建**文件/目录的模式（vfs64 内部：默认模式 & ~umask）。返回旧值（Linux 语义）。
+static int64_t lx64_umask64(uint64_t mask) { return (int64_t)vfs64_umask64((uint32_t)mask); }
+
 // ---- 89）readlink：只对 /proc/self/exe 给出真实值（当前进程的映像路径）----
 static int64_t lx64_readlink64(uint64_t nr, uint64_t path_va, uint64_t buf_va, uint64_t size) {
     char path[LX64_PATH_MAX];
@@ -973,9 +1088,23 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 89:  return lx64_readlink64(nr, a1, a2, a3);                // 只对 /proc/self/exe 有值
     case 96:  return lx64_gettimeofday64(nr, a1, a2);
     case 97:  return lx64_getrlimit64(nr, a1, a2);
-    case 102: return 0;                                             // getuid（没有权限模型：如实 0）
-    case 104: return 0;                                             // getgid
+    case 90:  return lx64_chmod_path64(a1, a2);                     // ★ P4：chmod(path, mode)
+    case 91:  return lx64_fchmod64(a1, a2);                         // ★ P4：fchmod(fd, mode)
+    case 92:  return lx64_chown_path64(a1, a2, a3);                 // ★ P4：chown(path, owner, group)
+    case 93:  return lx64_fchown64(a1, a2, a3);                     // ★ P4：fchown(fd, owner, group)
+    case 95:  return lx64_umask64(a1);                              // ★ P4：umask（返回旧值）
+    case 102: return lx64_getuid64();                               // ★ P4：真实 uid
+    case 104: return lx64_getgid64();                               // ★ P4：真实 gid
+    case 105: return lx64_apply_cred64((uint32_t)a1, 0xFFFFFFFFu, (uint32_t)a1, 0xFFFFFFFFu);   // setuid
+    case 106: return lx64_apply_cred64(0xFFFFFFFFu, (uint32_t)a1, 0xFFFFFFFFu, (uint32_t)a1);   // setgid
+    case 107: return lx64_geteuid64();                              // ★ P4：真实 euid
+    case 108: return lx64_getegid64();                              // ★ P4：真实 egid
     case 110: return lx64_getppid64();
+    case 113: return lx64_apply_cred64((uint32_t)a1, 0xFFFFFFFFu, (uint32_t)a2, 0xFFFFFFFFu);   // setreuid
+    case 114: return lx64_apply_cred64(0xFFFFFFFFu, (uint32_t)a1, 0xFFFFFFFFu, (uint32_t)a2);   // setregid
+    case 117: return lx64_apply_cred64(0xFFFFFFFFu, (uint32_t)a1, 0xFFFFFFFFu, (uint32_t)a2);   // setresgid
+    case 118: return lx64_apply_cred64((uint32_t)a1, 0xFFFFFFFFu, (uint32_t)a2, 0xFFFFFFFFu);   // setresuid
+    case 120: return 0;                                             // getgroups：没有附加组（返回 0 个）
     case 158: return lx64_arch_prctl64(nr, a1, a2);                  // FS.base：真写 MSR
     case 160: return lx64_setrlimit64(nr, a1, a2);
     case 218: return 0;                                             // set_tid_address（没有 clear_child_tid 唤醒）

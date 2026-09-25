@@ -55,13 +55,13 @@ static const uint32_t VFS_SB_CRC_LEN = 60;
 // ==================== inode 字段偏移 ====================
 // **两个版本共用的前缀**（0..31 字节完全同布局）：
 static const uint32_t VFS_I_TYPE    = 0;     // u8  0=空 1=文件 2=目录
-static const uint32_t VFS_I_NAMELEN = 1;     // u8  名字长度（v2 ≤27 / v3 ≤31；0 仅用于根目录）
+static const uint32_t VFS_I_NAMELEN = 1;     // u8  名字长度（v2 ≤27 / v3/v4 ≤31；0 仅用于根目录）
 static const uint32_t VFS_I_RSVD    = 2;     // u16 保留（0）
 static const uint32_t VFS_I_SIZE    = 4;     // u32 文件字节数
 static const uint32_t VFS_I_D0      = 8;     // u32 直接块 0..3（偏移 8/12/16/20）
 static const uint32_t VFS_I_IND     = 24;    // u32 一级间接块（128 个数据块号）
 static const uint32_t VFS_I_PARENT  = 28;    // u32 父目录 inode 号（根 = 自己 = 0）
-// v3 追加字段（v2 里 32..59 是名字、60 是 CRC）：
+// v3/v4 追加字段（v2 里 32..59 是名字、60 是 CRC）：
 static const uint32_t VFS_I3_MTIME  = 32;    // u32 打包时间戳
 static const uint32_t VFS_I3_NLINK  = 36;    // u16 链接数
 static const uint32_t VFS_I3_KIND   = 38;    // u8  类型判定缓存
@@ -70,7 +70,12 @@ static const uint32_t VFS_I3_NAME   = 40;    // 31B 名字
 // ★ 批次 M：v3 inode 的 `dind`（二级间接块指针）= **原保留区首 4 字节（偏移 71）**；保留区缩到 [75,124)。
 //    v2 卷没有这个字段（它的 32..59 是名字、60 是 CRC）→ v2 卷单文件上限仍是 67584 B。
 static const uint32_t VFS_I3_DIND   = 71;    // u32 二级间接块（0 = 没有）
-static const uint32_t VFS_I3_RSVD3  = 75;    // 保留区起点 [75,124) 必须全 0
+// ★ P4：v4 再把保留区首 6 字节变成 uid/gid/mode（v3 卷这 6 字节**必须为 0** -> 读作默认 root/0755/0644）。
+//    与 vfs64.h 的 VFS64_INO_*_OFF 是同一处定义（下面 static_assert 钉死）。
+static const uint32_t VFS_I4_UID    = 75;    // u16 属主 uid
+static const uint32_t VFS_I4_GID    = 77;    // u16 属主 gid
+static const uint32_t VFS_I4_MODE   = 79;    // u16 类型位 + 权限位（S_IF*|0777）
+static const uint32_t VFS_I4_RSVD3  = 81;    // 保留区起点 [81,124) 必须全 0
 // v2 的名字/CRC：
 static const uint32_t VFS_I2_NAME   = 32;    // 28B 名字（只用前 27）
 static const uint32_t VFS_I2_CRC    = 60;    // u32 inode CRC32（覆盖 [0,60)）
@@ -89,22 +94,40 @@ struct Vfs64Layout {
     uint32_t kind_off;         // kind 偏移（0 = 没有）
     uint32_t crc_off;          // inode CRC 偏移
     uint32_t dind_off;         // ★ 批次 M：二级间接块指针偏移（0 = 该版本没有这一层）
+    uint32_t uid_off;          // ★ P4：uid 偏移（0 = 该版本没有权限字段 -> 拦截关闭）
+    uint32_t gid_off;          // ★ P4：gid 偏移（0 = 没有）
+    uint32_t mode_off;         // ★ P4：mode 偏移（0 = 没有）
 };
 static constexpr Vfs64Layout VFS_LAY_V2 = { VFS64_VERSION_V2, 64u,  8u,
-                                            VFS_I2_NAME, VFS64_NAME_MAX_V2, 0u, 0u, 0u, VFS_I2_CRC, 0u };
-static constexpr Vfs64Layout VFS_LAY_V3 = { VFS64_VERSION,    128u, 4u,
+                                            VFS_I2_NAME, VFS64_NAME_MAX_V2, 0u, 0u, 0u, VFS_I2_CRC, 0u,
+                                            0u, 0u, 0u };
+// v3：与 v4 **inode 大小/每块个数/名字/CRC 全同**，只有权限三字段缺失（保留区是 [75,124)）
+static constexpr Vfs64Layout VFS_LAY_V3 = { VFS64_VERSION_V3, 128u, 4u,
                                             VFS_I3_NAME, VFS64_NAME_MAX, VFS_I3_MTIME, VFS_I3_NLINK,
-                                            VFS_I3_KIND, 124u, VFS_I3_DIND };
+                                            VFS_I3_KIND, 124u, VFS_I3_DIND,
+                                            0u, 0u, 0u };
+// v4：当前格式化产出（权限字段在 75/77/79；保留区 [81,124)）
+static constexpr Vfs64Layout VFS_LAY_V4 = { VFS64_VERSION,    128u, 4u,
+                                            VFS_I3_NAME, VFS64_NAME_MAX, VFS_I3_MTIME, VFS_I3_NLINK,
+                                            VFS_I3_KIND, 124u, VFS_I3_DIND,
+                                            VFS_I4_UID, VFS_I4_GID, VFS_I4_MODE };
 
 static_assert(VFS64_BLOCK_BYTES == VFS64_SECTOR_BYTES, "块就是扇区（vfs64_format 也按这个算几何）");
-static_assert(VFS64_INODES_PER_BLK * VFS64_INODE_BYTES == VFS64_BLOCK_BYTES, "v3：每块必须正好 4 个 inode");
+static_assert(VFS64_INODES_PER_BLK * VFS64_INODE_BYTES == VFS64_BLOCK_BYTES, "v3/v4：每块必须正好 4 个 inode");
 static_assert(VFS64_INODES_PER_BLK_V2 * VFS64_INODE_BYTES_V2 == VFS64_BLOCK_BYTES, "v2：每块必须正好 8 个 inode");
 static_assert(VFS64_BITMAP_BLK_BITS == VFS64_BLOCK_BYTES * 8u, "位图块 512B = 4096 个块位");
-static_assert(VFS_I3_RSVD3 + 1u <= 124u, "v3 inode 保留区必须在 CRC 之前");
-static_assert(VFS_I3_DIND + 4u <= VFS_I3_RSVD3, "v3 的 dind 必须在保留区之前（不越界）");
+static_assert(VFS_I3_DIND + 4u <= VFS_I4_UID, "v4 的 dind 必须在 uid 之前（不越界）");
+static_assert(VFS_I4_MODE + 2u <= VFS_I4_RSVD3, "v4 的 mode 必须在保留区之前");
+static_assert(VFS_I4_RSVD3 < 124u, "v4 inode 保留区必须在 CRC 之前");
+static_assert(VFS_LAY_V4.crc_off + 4u == 128u, "v4 inode 字段必须正好铺满 128B");
 static_assert(VFS_LAY_V3.crc_off + 4u == 128u, "v3 inode 字段必须正好铺满 128B");
 static_assert(VFS_LAY_V2.crc_off + 4u == 64u, "v2 inode 字段必须正好铺满 64B");
-static_assert(VFS_LAY_V3.dind_off == VFS_I3_DIND && VFS_LAY_V2.dind_off == 0u, "dind 只在 v3 存在");
+static_assert(VFS_LAY_V3.dind_off == VFS_I3_DIND && VFS_LAY_V4.dind_off == VFS_I3_DIND, "dind 在 v3/v4 都存在");
+static_assert(VFS_LAY_V2.dind_off == 0u && VFS_LAY_V2.uid_off == 0u, "v2 没有 dind / 权限字段");
+static_assert(VFS_LAY_V3.uid_off == 0u && VFS_LAY_V3.mode_off == 0u, "★ v3 没有权限字段（拦截关闭的依据）");
+static_assert(VFS_LAY_V4.uid_off == VFS64_INO_UID_OFF && VFS_LAY_V4.gid_off == VFS64_INO_GID_OFF &&
+              VFS_LAY_V4.mode_off == VFS64_INO_MODE_OFF && VFS_LAY_V4.uid_off == VFS_I4_UID,
+              "v4 权限字段偏移必须与 vfs64.h 逐字节一致");
 static_assert(VFS64_L2_FIRST_BLOCK == 132u, "第一个走二级间接的 fs 块必须是 132（4 直接 + 128 一级）");
 static_assert(VFS64_MAX_MAP_BLOCKS == 16516u, "映射能力 = 4 + 128 + 128*128");
 static_assert(VFS64_MAX_FILE_BYTES == 8388608u, "★ 单文件上限 = 8 MiB（16384 块）");
@@ -276,6 +299,7 @@ static void log_bad_inode(uint32_t idx) {
     dbg64_dec(idx);
     dbg64_str(" (count=");
     dbg64_dec(g_inode_count);
+    dbg64_dec(g_inode_count);
     dbg64_str(")");
     dbg64_nl();
 }
@@ -297,6 +321,159 @@ static void log_op_fail(const char* op, const char* why) {
     dbg64_str(": ");
     dbg64_str(why);
     dbg64_nl();
+}
+
+static bool inode_load(uint32_t idx, uint8_t* out);          // 前置声明（perm_check_idx64 要用）
+// ==================== ★ P4：凭证（credentials）+ 权限判定 ====================
+// 为什么是"全局一份"而不是给每个 API 加参数：
+//   本文件里 40+ 个公开入口、上百处内部调用，加参数会把改动面铺满整棵树（漏一处就是权限洞）。
+//   凭证只有两个来源（会话身份 / 进程身份），且都在**上下文切换点**变化，所以收在一处：
+static const uint32_t VFS64_PERM_LOG_MAX = 128u;               // 上限放大一点：长会话（GUI+终端）也够用
+//     * ring3 进程 —— proc64 记录每进程凭证，任务切换时调 vfs64_set_proc_cred64()
+//       （proc64 的钩子由 kernel/task64.cpp 的 task_apply_ctx64 调用；切回内核线程 → have=0 恢复会话身份）；
+//     * 其它（启动早期、安装介质内核、系统组件）—— 保持默认 root（0/0/0/0）。
+//   判定只在**当前卷的布局有权限字段（v4）**时生效：v2/v3 旧卷没有字段，拦截关闭（见 mount 的 legacy 打点）。
+static Vfs64Cred64 g_cred      = { 0, 0, 0, 0 };                 // 当前生效凭证（默认 = root）
+static Vfs64Cred64 g_sess_cred = { 0, 0, 0, 0 };                 // 会话身份（进程身份退出后回到它）
+static uint32_t    g_umask64   = VFS64_UMASK_DEFAULT;
+static uint32_t    g_perm_denies = 0;                            // [PERM64] deny 行计数（有上限，防刷屏）
+// ★ P4：**凭证覆盖**（_on64 的"临时 root"）。为什么需要单独一套状态：
+//   _on64 的调用体内可能被 PIT 抢占换任务；任务切换钩子（vfs64_set_proc_cred64）会把凭证刷成
+//   被调度任务的凭证（任务 0 -> 会话身份）。若不管，覆盖就在半途丢失（实测：useradd 的 mkdir
+//   会被自己的权限检查拒掉）。做法：记录"覆盖归谁"（任务 id）与覆盖值；切换回来的是覆盖者时
+//   重新装上覆盖值，别的任务照常按自己的身份走；覆盖退出时把进入前的凭证原样还回。
+static uint32_t    g_cred_hold_depth = 0;
+static uint32_t    g_cred_hold_owner = 0xFFFFFFFFu;              // 覆盖者的任务 id（无 task64 = 不追踪）
+static Vfs64Cred64 g_cred_hold_cred  = { 0, 0, 0, 0 };           // 覆盖期间的凭证（root）
+extern "C" uint32_t task_current_id_64() __attribute__((weak));  // 安装介质内核没有调度器（弱引用）
+// 打点：固定打印 4 位八进制（"0644"），与 ls -l / 报告口径一致
+static void log_octal4(uint32_t v) {
+    char b[5];
+    b[0] = (char)('0' + ((v >> 9) & 7u));
+    b[1] = (char)('0' + ((v >> 6) & 7u));
+    b[2] = (char)('0' + ((v >> 3) & 7u));
+    b[3] = (char)('0' + (v & 7u));
+    b[4] = 0;
+    dbg64_str(b);
+}
+// 当前卷是否**开启**权限判定（v4 卷；v2/v3 旧卷没有 uid/gid/mode 字段 -> 关闭）
+static bool perm_enforced64() { return g_mounted && g_lay->mode_off != 0; }
+
+void vfs64_set_cred64(uint32_t uid, uint32_t gid, uint32_t euid, uint32_t egid) {
+    g_sess_cred.uid = uid; g_sess_cred.gid = gid; g_sess_cred.euid = euid; g_sess_cred.egid = egid;
+    g_cred = g_sess_cred;
+}
+void vfs64_get_cred64(Vfs64Cred64* out) { if (out) *out = g_cred; }
+void vfs64_set_proc_cred64(int have, uint32_t uid, uint32_t gid, uint32_t euid, uint32_t egid) {
+    if (g_cred_hold_depth > 0) {                                 // 覆盖期间：只认"覆盖者回来"
+        if (task_current_id_64) {
+            if (task_current_id_64() == g_cred_hold_owner) { g_cred = g_cred_hold_cred; return; }
+        } else {
+            return;                                              // 没有任务表：覆盖优先
+        }
+    }
+    if (have) { g_cred.uid = uid; g_cred.gid = gid; g_cred.euid = euid; g_cred.egid = egid; }
+    else      { g_cred = g_sess_cred; }                          // 内核线程/任务 0：回到会话身份
+}
+// 当前卷是否有权限字段（v4 = 1；v2/v3 旧卷 = 0 -> 拦截关闭）
+int vfs64_perm_fields64() { return perm_enforced64() ? 1 : 0; }
+// umask：新建文件/目录的模式 = 默认模式 & ~umask（返回旧值）。本系统 umask 是**全局一份**（如实标注）。
+uint32_t vfs64_umask64(uint32_t new_mask) {
+    const uint32_t old = g_umask64;
+    g_umask64 = new_mask & 0777u;
+    return old;
+}
+uint32_t vfs64_get_umask64() { return g_umask64; }
+// 注意：need 用 VFS64_S_I*USR（9 位口径的调用方掩码），这里先折算成 3 位 rwx 再比 ——
+//   两者混用会让"other 有 x 却被判无 x"（实测踩过：所有非 root 的 traversal 全被拒）。
+static uint32_t perm_need3(uint32_t need) {
+    uint32_t n = 0;
+    if (need & VFS64_S_IRUSR) n |= 4u;
+    if (need & VFS64_S_IWUSR) n |= 2u;
+    if (need & VFS64_S_IXUSR) n |= 1u;
+    return n;
+}
+static bool perm_can64(uint32_t iuid, uint32_t igid, uint32_t mode, uint32_t need) {
+    if (g_cred.euid == 0) return true;
+    const uint32_t n = perm_need3(need);
+    if (n == 0) return true;
+    uint32_t bits;
+    if (g_cred.euid == iuid)      bits = (mode >> 6) & 7u;
+    else if (g_cred.egid == igid) bits = (mode >> 3) & 7u;
+    else                          bits = mode & 7u;
+    return (bits & n) == n;
+}
+// 从 inode 读属主/组/模式（v2/v3 用默认值：root:root + 类型默认 0755/0644）
+static uint32_t ino_uid_of64(const uint8_t* b) {
+    return (g_lay->uid_off != 0) ? (uint32_t)rd16(b + g_lay->uid_off) : 0u;
+}
+static uint32_t ino_gid_of64(const uint8_t* b) {
+    return (g_lay->gid_off != 0) ? (uint32_t)rd16(b + g_lay->gid_off) : 0u;
+}
+static uint32_t ino_mode_of64(const uint8_t* b, uint32_t type) {
+    if (g_lay->mode_off != 0) {
+        const uint32_t m = (uint32_t)rd16(b + g_lay->mode_off);
+        if (m != 0) return m;
+    }
+    return (type == VFS64_TYPE_DIR) ? VFS64_LEGACY_DIR_MODE : VFS64_LEGACY_FILE_MODE;
+}
+// 统一拒绝打点（有上限）：[PERM64] deny op=… path=… uid=… mode=…
+static int perm_deny64(const char* op, const char* path, uint32_t iuid, uint32_t igid,
+                       uint32_t mode, uint32_t need) {
+    if (g_perm_denies < VFS64_PERM_LOG_MAX) {
+        g_perm_denies++;
+        char p[41];
+        uint32_t i = 0;
+        if (path) { for (; path[i] && i < 40u; i++) p[i] = path[i]; }
+        p[i] = 0;
+        dbg64_str("[PERM64] deny op=");
+        dbg64_str(op);
+        dbg64_str(" path=");
+        dbg64_str(p);
+        dbg64_str(" uid=");
+        dbg64_dec(g_cred.euid);
+        dbg64_str(" gid=");
+        dbg64_dec(g_cred.egid);
+        dbg64_str(" mode=");
+        log_octal4(mode & VFS64_S_IRWX);
+        dbg64_str(" need=");
+        if (need & VFS64_S_IRUSR) dbg64_str("r");
+        if (need & VFS64_S_IWUSR) dbg64_str("w");
+        if (need & VFS64_S_IXUSR) dbg64_str("x");
+        dbg64_str(" owner=");
+        dbg64_dec(iuid);
+        dbg64_str(":");
+        dbg64_dec(igid);
+        dbg64_nl();
+    }
+    return -VFS64_EACCES;
+}
+// 判定一个已经载入的 inode。返回 0 = 允许；-EACCES = 拒绝（已打点）。
+static int perm_check_ino64(const uint8_t* ino, const char* op, const char* path, uint32_t need) {
+    if (!perm_enforced64()) return 0;
+    const uint32_t type = ino[VFS_I_TYPE];
+    const uint32_t iuid = ino_uid_of64(ino);
+    const uint32_t igid = ino_gid_of64(ino);
+    const uint32_t mode = ino_mode_of64(ino, type);
+    if (perm_can64(iuid, igid, mode, need)) return 0;
+    return perm_deny64(op, path, iuid, igid, mode, need);
+}
+// 判定一个 inode 号（失败自己打点：读盘失败 -> -1）
+static int perm_check_idx64(uint32_t idx, const char* op, const char* path, uint32_t need) {
+    if (!perm_enforced64()) return 0;
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    if (!inode_load(idx, ino)) return -1;
+    if (ino[VFS_I_TYPE] == VFS64_TYPE_FREE) return -1;
+    return perm_check_ino64(ino, op, path, need);
+}
+// 目录写（建/删/改名）需要 w+x —— Linux 语义
+#define VFS64_NEED_WX (VFS64_S_IWUSR | VFS64_S_IXUSR)
+#define VFS64_NEED_R  (VFS64_S_IRUSR)
+#define VFS64_NEED_W  (VFS64_S_IWUSR)
+#define VFS64_NEED_X  (VFS64_S_IXUSR)
+// 新建 inode 的模式：默认模式 & ~umask（只对权限位生效，类型位保留）
+static uint32_t new_mode64(uint32_t base_type_mode) {
+    return (base_type_mode & VFS64_S_IFMT) | ((base_type_mode & VFS64_S_IRWX) & ~g_umask64);
 }
 
 // ==================== 设备层：假盘 / 弱 ATA ====================
@@ -409,16 +586,18 @@ struct Vfs64SbGeo {
 };
 
 // 读盘内容来自调用方给的缓冲。magic -> CRC -> 版本 -> 几何重算，逐项都要过。
-// 版本 2 与 3 都接受（v2 旧卷继续能挂：只是 inode 布局不同、没有 mtime/kind）。
+// 版本 2 / 3 / 4 都接受（v2/v3 旧卷继续能挂：inode 布局不同、没有权限字段；v4 = 当前格式）。
 static int sb_verify(const uint8_t* sb, Vfs64SbGeo* geo) {
     static const char magic[8] = { 'V','I','M','T','U','F','S','2' };
     if (cmp_bytes(sb + VFS_O_MAGIC, magic, 8) != 0) return SB_ERR_MAGIC;
     if (rd32(sb + VFS_O_CRC) != crc32_64(sb, VFS_SB_CRC_LEN)) return SB_ERR_CRC;
     const uint32_t ver = rd32(sb + VFS_O_VERSION);
     const Vfs64Layout* lay = nullptr;
-    if (ver == VFS64_VERSION)         lay = &VFS_LAY_V3;
-    else if (ver == VFS64_VERSION_V2) lay = &VFS_LAY_V2;
-    else                              return SB_ERR_VERSION;
+    if (ver == VFS64_VERSION)             lay = &VFS_LAY_V4;
+    else if (ver == VFS64_VERSION_V3)     lay = &VFS_LAY_V3;
+    else if (ver == VFS64_VERSION_V2)     lay = &VFS_LAY_V2;
+    else                                  return SB_ERR_VERSION;
+    if (rd16(sb + VFS_O_SIG) != 0xAA55u) return SB_ERR_LAYOUT;
     if (rd16(sb + VFS_O_SIG) != 0xAA55u) return SB_ERR_LAYOUT;
 
     const uint32_t sector = rd32(sb + VFS_O_SECTOR);
@@ -567,7 +746,7 @@ static bool inode_store(uint32_t idx, const uint8_t* in) {
     ino_cache_invalidate();                           // 写后失效：以后要用就重读
     return true;
 }
-// 结构合法性：类型/名字长度/保留字段/CRC/大小/（v3）时间与保留区。
+// 结构合法性：类型/名字长度/保留字段/CRC/大小/（v3/v4）时间与保留区/（v4）权限字段。
 // 空槽（type=0）不校验 CRC —— 格式化后它就是全 0。
 static bool inode_ok(const uint8_t* b, const char** why) {
     const uint8_t t = b[VFS_I_TYPE];
@@ -576,13 +755,22 @@ static bool inode_ok(const uint8_t* b, const char** why) {
     if (rd16(b + VFS_I_RSVD) != 0) { *why = "reserved"; return false; }
     if (t == VFS64_TYPE_FREE) return true;
     if (rd32(b + g_lay->crc_off) != crc32_64(b, g_lay->crc_off)) { *why = "crc"; return false; }
-    // ★ 批次 M：上限按**当前卷布局**算（v3 = 8 MiB、v2 = 67584）—— 不能拿 v3 的上限去放行 v2 的 inode。
+    // ★ 批次 M：上限按**当前卷布局**算（v3/v4 = 8 MiB、v2 = 67584）—— 不能拿 v3 的上限去放行 v2 的 inode。
     const uint32_t lim = (g_lay->dind_off != 0) ? VFS64_MAX_FILE_BYTES : VFS64_MAX_FILE_BYTES_V2;
     if (t == VFS64_TYPE_FILE && rd32(b + VFS_I_SIZE) > lim) { *why = "size"; return false; }
-    if (g_lay->version == VFS64_VERSION) {
+    if (g_lay->version == VFS64_VERSION || g_lay->version == VFS64_VERSION_V3) {
         if (b[VFS_I3_RSVD2] != 0) { *why = "rsvd2"; return false; }
-        for (uint32_t i = VFS_I3_RSVD3; i < g_lay->crc_off; i++)
+        // 保留区起点：v3 从 75 起（权限字段的位置也是保留区，必须全 0）；v4 从 81 起
+        const uint32_t rsvd_from = (g_lay->uid_off != 0) ? VFS_I4_RSVD3 : VFS_I3_DIND + 4u;
+        for (uint32_t i = rsvd_from; i < g_lay->crc_off; i++)
             if (b[i] != 0) { *why = "rsvd3"; return false; }
+        if (g_lay->version == VFS64_VERSION) {
+            // ★ P4：v4 的权限三字段必须自洽（uid/gid 任意；mode 的类型位必须与 type 对得上、权限位 ≤ 0777）
+            const uint32_t um = (uint32_t)rd16(b + VFS_I4_MODE);
+            const uint32_t want_ifmt = (t == VFS64_TYPE_DIR) ? VFS64_S_IFDIR : VFS64_S_IFREG;
+            if ((um & VFS64_S_IFMT) != want_ifmt) { *why = "mode type"; return false; }
+            if ((um & ~(VFS64_S_IFMT | VFS64_S_IRWX)) != 0) { *why = "mode bits"; return false; }
+        }
         // 名字区之后到 `dind` 之间必须是 0（★ 批次 M：**止于 VFS_I3_DIND(71) 而不是保留区** ——
         // 71..74 现在是有意义的 dind 字段，早期版本把它当保留区，正是这里最容易写错的地方）
         for (uint32_t i = VFS_I3_NAME + g_lay->name_max; i < VFS_I3_DIND; i++)
@@ -1129,9 +1317,9 @@ static int find_child(uint32_t dir, const char* name, uint32_t nlen, uint32_t* o
 }
 // 路径解析（**多级**）。语义见 vfs64.h：".." 在根目录仍是根（POSIX）；大小写敏感。
 // 返回：0  = 解析成功，*out_ino 是终点 inode；
-//       1  = **最后一段不存在**，但父目录有效（此时 *out_parent/*out_name/*out_nlen 已填）
 //            —— 只有 want_parent=true 时才会返回 1；
-//      -1  = 非法路径 / 中间分量不存在 / 读盘失败（已打点）。
+//      -1  = 非法路径 / 中间分量不存在 / 读盘失败（已打点）；
+//      -EACCES = ★ P4：某一级目录缺 x（进不去，已打 [PERM64] deny 行）。
 static int path_resolve(const char* path, bool want_parent,
                         uint32_t* out_ino, uint32_t* out_parent, char* out_name, uint32_t* out_nlen) {
     if (!path) { log_path_bad("null", path); return -1; }
@@ -1145,6 +1333,12 @@ static int path_resolve(const char* path, bool want_parent,
     for (;;) {
         while (*p == '/') p++;                          // 冗余分隔符等价于一个
         if (*p == 0) break;                             // 路径结束 -> cur 就是终点
+        // ★ P4：进目录/遍历路径要求每一级目录都有 x（Linux 语义；root 与 v2/v3 旧卷在内部直接放行）。
+        //   注意：**在解析下一段之前**检查 cur —— 最后一级"目标自身"的 x 不属于遍历（stat 目标只要父目录 x）。
+        if (perm_enforced64()) {
+            const int px = perm_check_idx64(cur, "traverse", path, VFS64_NEED_X);
+            if (px != 0) return -VFS64_EACCES;          // px == -1（读盘失败）也按权限错返回：已打点
+        }
         char seg[VFS64_NAME_MAX + 1];
         uint32_t n = 0;
         while (p[n] != 0 && p[n] != '/') {
@@ -1372,12 +1566,12 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
         return -1;
     }
 
-    // 几何：位图在最前，inode 区居中，数据区占剩下的全部（inode 记录大小按 v3 = 128B）
+    // 几何：位图在最前，inode 区居中，数据区占剩下的全部（inode 记录大小按 v4 = 128B）
     const uint32_t bitmap_blocks = (total_sectors + VFS64_BITMAP_BLK_BITS - 1u) / VFS64_BITMAP_BLK_BITS;
     uint32_t inodes = total_sectors / 64u;
     if (inodes < 16u) inodes = 16u;
     if (inodes > VFS64_MAX_INODES) inodes = VFS64_MAX_INODES;
-    const uint32_t inode_blocks = (inodes + VFS_LAY_V3.inodes_per_blk - 1u) / VFS_LAY_V3.inodes_per_blk;
+    const uint32_t inode_blocks = (inodes + VFS_LAY_V4.inodes_per_blk - 1u) / VFS_LAY_V4.inodes_per_blk;
     const uint32_t bitmap_start = 1u;
     const uint32_t inode_start  = bitmap_start + bitmap_blocks;
     const uint32_t data_start   = inode_start + inode_blocks;
@@ -1404,7 +1598,7 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
     g_inode_count = inodes;
     g_data_start = data_start;
     g_data_blocks = data_blocks;
-    g_lay = &VFS_LAY_V3;
+    g_lay = &VFS_LAY_V4;                                // ★ P4：新格式化一律产出 v4（带权限字段）
     ino_cache_invalidate();
 
     // 1) 超级块（先把 CRC 覆盖区清零，再填字段，最后算 CRC）
@@ -1457,7 +1651,8 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
         }
     }
 
-    // 4) 根目录 inode（0 号槽）：目录、无名、size=0、parent=自己、nlink=1、mtime=现在
+    // 4) 根目录 inode（0 号槽）：目录、无名、size=0、parent=自己、nlink=1、mtime=现在、
+    //    ★ P4：uid=gid=0（root）、mode = S_IFDIR|0755（root 的 / 就是 0755；用户不能往根目录写）
     uint8_t root[VFS64_INODE_BYTES_MAX];
     zero_bytes(root, VFS64_INODE_BYTES_MAX);
     root[VFS_I_TYPE] = (uint8_t)VFS64_TYPE_DIR;
@@ -1465,7 +1660,10 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
     wr32(root + VFS_I3_MTIME, vfs64_now64());
     wr16(root + VFS_I3_NLINK, 1);
     root[VFS_I3_KIND] = (uint8_t)VFS64_KIND_DIR;
-    wr32(root + VFS_LAY_V3.crc_off, crc32_64(root, VFS_LAY_V3.crc_off));
+    wr16(root + VFS_I4_UID, 0);
+    wr16(root + VFS_I4_GID, 0);
+    wr16(root + VFS_I4_MODE, (uint16_t)(VFS64_S_IFDIR | 0755u));
+    wr32(root + VFS_LAY_V4.crc_off, crc32_64(root, VFS_LAY_V4.crc_off));
     if (!inode_store(0, root)) {
         log_line("format FAILED step=root-inode");
         g_mounted = false;
@@ -1481,6 +1679,13 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
     dbg64_dec(VFS64_INODE_BYTES);
     dbg64_str(" root=");
     dbg64_dec((uint64_t)start_lba + inode_start);   // 根目录 inode 所在扇区的绝对 LBA
+    dbg64_str(" perm=uid/gid/mode@");
+    dbg64_dec(VFS_I4_UID);
+    dbg64_str("/");
+    dbg64_dec(VFS_I4_GID);
+    dbg64_str("/");
+    dbg64_dec(VFS_I4_MODE);
+    dbg64_str(" rootmode=0755");
     dbg64_nl();
     return 0;
 }
@@ -1544,7 +1749,16 @@ int vfs64_mount(int drive, uint32_t start_lba) {
     dbg64_str(" inode=");
     dbg64_dec(g_lay->inode_bytes);
     dbg64_str("B");
+    dbg64_str(perm_enforced64() ? " perm=on" : " perm=off");
     dbg64_nl();
+    // ★ P4：旧卷（v2/v3）没有 uid/gid/mode 字段 -> 权限拦截**如实关闭**（打一行说清楚；不假装拦了）
+    if (!perm_enforced64()) {
+        dbg64_str("[PERM64] legacy volume v");
+        dbg64_dec(g_lay->version);
+        dbg64_str(": no uid/gid/mode fields -> permission checks disabled");
+        dbg64_str(" (owner shows as root, mode = default 0755/0644)\n");
+        dbg64_nl();
+    }
     return 0;
 }
 int vfs64_probe_volume64(int drive, uint32_t start_lba, Vfs64VolInfo64* out) {
@@ -1767,18 +1981,34 @@ void vfs64_slots_dump64() {
 }
 
 // ---- 临时切卷守卫：_on64 的实现基础 ----
-// 构造 = 当前卷换成 slot（必须已挂载）；析构 = **原样换回**进来时那个槽。
+// 构造 = 当前卷换成 slot（必须已挂载）；析构 = **原样换回**进来时那个槽（凭证也一并还原）。
 //   * 嵌套（理论上不会：_on64 内部只调旧 API）：计数 + LIFO 恢复，语义不乱。
 //   * 中断：vfs64 的调用点都在任务上下文（GUI 主循环 / 终端 / 自检）；即便被抢断，别的上下文
 //     也只会以同样的守卫方式切卷，每次恢复的都是"自己进来时"的卷 —— 当前卷不会丢。
 //   * inode 缓存按 (slot, drive, lba) 键控，所以切卷不必清缓存，也不会读到别的卷的字节。
+//     img64/app64/elf64/proc64/sysstate64/update64 这些"固定写系统卷"的系统组件不被自己的权限检查
+//     卡住 —— 规格明文要求）；用户侧的当前卷操作走**非 on64** 入口（身份照实，见 fs64 的 self 路径）。
 struct Vfs64SlotGuard {
     int  saved;
     bool active;
-    explicit Vfs64SlotGuard(int slot) {
+    bool rooted;
+    Vfs64Cred64 saved_cred;
+    explicit Vfs64SlotGuard(int slot, bool as_root = false) {
         active = false;
+        rooted = false;
         if (slot < 0 || slot >= (int)VFS64_SLOT_MAX || !g_vol[slot].mounted) return;
         if (g_vol_switch_depth > 0) log_line("WARN nested volume switch (LIFO restore)");
+        if (as_root) {
+            saved_cred = g_cred;
+            if (g_cred_hold_depth == 0) {                      // 最外层覆盖：记下"归谁"
+                g_cred_hold_cred.uid = 0; g_cred_hold_cred.gid = 0;
+                g_cred_hold_cred.euid = 0; g_cred_hold_cred.egid = 0;
+                g_cred_hold_owner = task_current_id_64 ? task_current_id_64() : 0xFFFFFFFFu;
+            }
+            g_cred_hold_depth++;
+            g_cred = g_cred_hold_cred;
+            rooted = true;
+        }
         saved = g_cur_slot;
         g_cur_slot = slot;
         g_vol_switch_depth++;
@@ -1786,6 +2016,11 @@ struct Vfs64SlotGuard {
     }
     ~Vfs64SlotGuard() {
         if (!active) return;
+        if (rooted) {
+            g_cred_hold_depth--;
+            if (g_cred_hold_depth == 0) g_cred_hold_owner = 0xFFFFFFFFu;
+            g_cred = saved_cred;                            // ★ 身份原样还给调用方
+        }
         g_vol_switch_depth--;
         g_cur_slot = saved;                                 // ★ 原样切回：用户的浏览卷不受影响
     }
@@ -1800,96 +2035,120 @@ static int on64_slot_unavailable(const char* op, int slot) {
     dbg64_nl();
     return -1;
 }
+// ★ fs64 用：把"当前卷"临时切到 slot，但**不改调用方身份**（权限判定照常）。返回 0 / -1。
+int vfs64_scope_enter64(int slot, int* out_saved) {
+    if (slot < 0 || slot >= (int)VFS64_SLOT_MAX || !g_vol[slot].mounted) return -1;
+    if (out_saved) *out_saved = g_cur_slot;
+    g_cur_slot = slot;
+    return 0;
+}
+void vfs64_scope_leave64(int saved_slot) {
+    if (saved_slot >= 0 && saved_slot < (int)VFS64_SLOT_MAX) g_cur_slot = saved_slot;
+}
 
-// ---- 按槽别名（系统组件固定写系统卷用的入口）----
+// ---- 按槽别名（系统组件固定写系统卷用的入口；期间身份 = root，见 Vfs64SlotGuard）----
 int vfs64_stat_on64(int slot, const char* path, uint32_t* type, uint32_t* size) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("stat", slot);
     return vfs64_stat(path, type, size);
 }
 int vfs64_stat64_on64(int slot, const char* path, Vfs64Info64* out) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("stat64", slot);
     return vfs64_stat64(path, out);
 }
 int vfs64_read_on64(int slot, const char* path, void* buf, int max) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("read", slot);
     return vfs64_read(path, buf, max);
 }
 int vfs64_write_on64(int slot, const char* path, const void* buf, int len) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("write", slot);
     return vfs64_write(path, buf, len);
 }
 // ★ 批次 M：大文件读写/流式写的按槽变体（fs64 固定卷读写用）
 int vfs64_read_at_on64(int slot, const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) { if (out_got) *out_got = 0; return on64_slot_unavailable("read_at", slot); }
     return vfs64_read_at64(path, off, buf, len, out_got);
 }
 int vfs64_write_at_on64(int slot, const char* path, uint32_t off, const void* buf, uint32_t len) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("write_at", slot);
     return vfs64_write_at64(path, off, buf, len);
 }
 int vfs64_write_stream_on64(int slot, const char* path, uint32_t len, Vfs64Src64 src, void* ctx) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("write_stream", slot);
     return vfs64_write_stream64(path, len, src, ctx);
 }
 int vfs64_mkdir_on64(int slot, const char* path) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("mkdir", slot);
     return vfs64_mkdir(path);
 }
 int vfs64_create_on64(int slot, const char* path) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("create", slot);
     return vfs64_create64(path);
 }
 int vfs64_unlink_on64(int slot, const char* path) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("unlink", slot);
     return vfs64_unlink(path);
 }
 int vfs64_rmdir_on64(int slot, const char* path) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("rmdir", slot);
     return vfs64_rmdir64(path);
 }
 int vfs64_ls_on64(int slot, const char* path, char names[][VFS64_LS_NAME_BUF], int max, uint32_t* sizes) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("ls", slot);
     return vfs64_ls(path, names, max, sizes);
 }
 int vfs64_list64_on64(int slot, const char* path, Vfs64Dirent64* out, int max, uint32_t* cursor) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("list64", slot);
     return vfs64_list64(path, out, max, cursor);
 }
 int vfs64_tree_dump64_on64(int slot, const char* path, int max_entries, int max_depth) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("tree_dump64", slot);
     return vfs64_tree_dump64(path, max_entries, max_depth);
 }
 
 // ★ 批次 J：同目录改名 / 空间查询 的按槽入口（explorer 复制/剪切/粘贴时按显式卷操作）
 int vfs64_rename_on64(int slot, const char* old_path, const char* new_name) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("rename", slot);
     return vfs64_rename64(old_path, new_name);
 }
 int vfs64_free_on64(int slot, uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_blocks) {
-    Vfs64SlotGuard g(slot);
+    Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("free", slot);
     return vfs64_free64(free_blocks, free_bytes, total_blocks);
 }
+// ★ P4：chmod/chown 的按槽入口（userdb64 给 /home/<user> 设属主/模式用；期间身份 = root）
+int vfs64_chmod_on64(int slot, const char* path, uint32_t mode) {
+    Vfs64SlotGuard g(slot, true);
+    if (!g.active) return on64_slot_unavailable("chmod", slot);
+    return vfs64_chmod64(path, mode);
+}
+int vfs64_chown_on64(int slot, const char* path, uint32_t uid, uint32_t gid) {
+    Vfs64SlotGuard g(slot, true);
+    if (!g.active) return on64_slot_unavailable("chown", slot);
+    return vfs64_chown64(path, uid, gid);
+}
 // ==================== 读文件（★ 批次 M：按偏移分块，跨一级/二级间接）====================
-// 载入并校验路径 -> 文件 inode，返回 0（*out_idx）。失败打点 + -1。
+// 载入并校验路径 -> 文件 inode，返回 0（*out_idx）；-1 = 失败；-EACCES = 权限不足（已打点）。
+// want_rw：★ P4 由调用方给出需要的位（读=NEED_R、写=NEED_W）；0 = 只查存在/类型（write_resolve 自己判）。
 static int lookup_file64(const char* path, const char* op, uint32_t* out_idx, uint8_t* ino) {
     uint32_t idx = 0;
-    if (path_resolve(path, false, &idx, nullptr, nullptr, nullptr) != 0) {
+    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr != 0) {
+        if (pr == -VFS64_EACCES) { log_op_fail(op, "permission denied (traverse)"); return -VFS64_EACCES; }
         log_op_fail(op, "not found");
         return -1;
     }
@@ -1904,7 +2163,10 @@ int vfs64_read_at64(const char* path, uint32_t off, void* buf, uint32_t len, uin
     if (!g_mounted) { log_op_fail("read_at64", "not mounted"); return -1; }
     if (!path || !buf) { log_op_fail("read_at64", "bad args"); return -1; }
     uint8_t ino[VFS64_INODE_BYTES_MAX];
-    if (lookup_file64(path, "read_at64", nullptr, ino) != 0) return -1;
+    const int lk = lookup_file64(path, "read_at64", nullptr, ino);
+    if (lk != 0) return lk;
+    const int pc = perm_check_ino64(ino, "read", path, VFS64_NEED_R);      // ★ P4：读要 r
+    if (pc != 0) { log_op_fail("read_at64", "permission denied (r)"); return pc; }
     return read_at_inode(ino, off, buf, len, out_got);
 }
 // 兼容旧 API：整读前 max 字节（= read_at64(path, 0, buf, max)）。
@@ -1912,7 +2174,10 @@ int vfs64_read64(const char* path, void* buf, int max) {
     if (!g_mounted) { log_op_fail("read64", "not mounted"); return -1; }
     if (!path || !buf || max < 0) { log_op_fail("read64", "bad args"); return -1; }
     uint8_t ino[VFS64_INODE_BYTES_MAX];
-    if (lookup_file64(path, "read64", nullptr, ino) != 0) return -1;
+    const int lk = lookup_file64(path, "read64", nullptr, ino);
+    if (lk != 0) return lk;
+    const int pc = perm_check_ino64(ino, "read", path, VFS64_NEED_R);      // ★ P4：读要 r
+    if (pc != 0) { log_op_fail("read64", "permission denied (r)"); return pc; }
     uint32_t got = 0;
     if (read_at_inode(ino, 0, buf, (uint32_t)max, &got) != 0) return -1;
     return (int)got;
@@ -1929,21 +2194,36 @@ static int mem_src64(void* ctx, uint32_t off, void* dst, uint32_t want) {
 }
 
 // 解析"要写的路径"：返回 0 = 已有文件（*idx 有效、new_file=false）；1 = 要新建（父目录/名字已回填）；
-// -1 = 失败（已打点）。语义与旧 write64 完全一致（覆盖时父目录/名字以 inode 里的为准）。
+// -1 = 失败；-EACCES = 权限不足（已打点）。语义与旧 write64 完全一致。
+// ★ P4：这里**同时做写权限判定**（已有文件要 w；新建要父目录 w+x）—— 写路径只有这一处入口。
 static int write_resolve64(const char* path, uint32_t* idx, uint32_t* parent, char* nm, uint32_t* nlen,
                            bool* new_file, uint8_t* old_ino) {
     uint32_t i = 0, par = 0, nl = 0;
     char name[VFS64_NAME_MAX + 1];
     const int pr = path_resolve(path, true, &i, &par, name, &nl);
-    if (pr < 0) { log_op_fail("write", "bad path"); return -1; }
+    if (pr < 0) {
+        if (pr == -VFS64_EACCES) { log_op_fail("write", "permission denied (traverse)"); return -VFS64_EACCES; }
+        log_op_fail("write", "bad path");
+        return -1;
+    }
     *new_file = (pr != 0);
     if (pr == 0) {
         if (inode_load_ok(i, old_ino, "write") != 0) return -1;
         if (old_ino[VFS_I_TYPE] != VFS64_TYPE_FILE) { log_op_fail("write", "path is a directory"); return -1; }
+        // 已有文件：写要 w（覆盖/截断/部分写都是写）
+        const int pc = perm_check_ino64(old_ino, "write", path, VFS64_NEED_W);
+        if (pc != 0) { log_op_fail("write", "permission denied (w)"); return pc; }
         par = rd32(old_ino + VFS_I_PARENT);
         nl = old_ino[VFS_I_NAMELEN];
         copy_bytes(name, old_ino + g_lay->name_off, nl);
         name[nl] = 0;
+    } else {
+        // 新建：父目录必须存在且是目录（path_resolve 已保证存在），并且要 w+x
+        uint8_t pino[VFS64_INODE_BYTES_MAX];
+        if (inode_load_ok(par, pino, "write") != 0) return -1;
+        if (pino[VFS_I_TYPE] != VFS64_TYPE_DIR) { log_op_fail("write", "parent is not a directory"); return -1; }
+        const int pc = perm_check_ino64(pino, "create", path, VFS64_NEED_WX);
+        if (pc != 0) { log_op_fail("write", "permission denied (dir w+x)"); return pc; }
     }
     *idx = i;
     *parent = par;
@@ -1951,7 +2231,8 @@ static int write_resolve64(const char* path, uint32_t* idx, uint32_t* parent, ch
     copy_bytes(nm, name, nl + 1);
     return 0;
 }
-// 填一个"新文件"的 inode 镜像（type/namelen/name/parent/nlink；size 由调用方按长度写）
+// 填一个"新文件"的 inode 镜像（type/namelen/name/parent/nlink/★P4 uid+gid+mode；size 由调用方按长度写）
+// ★ P4：新建文件的属主 = **当前 euid/egid**；模式 = S_IFREG | (0666 & ~umask)（默认 0644）。
 static void fill_new_file_ino64(uint8_t* ino, const char* nm, uint32_t nlen, uint32_t parent, uint32_t len) {
     zero_bytes(ino, VFS64_INODE_BYTES_MAX);
     ino[VFS_I_TYPE] = (uint8_t)VFS64_TYPE_FILE;
@@ -1961,10 +2242,16 @@ static void fill_new_file_ino64(uint8_t* ino, const char* nm, uint32_t nlen, uin
     wr32(ino + VFS_I_SIZE, len);
     if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
     if (g_lay->nlink_off != 0) wr16(ino + g_lay->nlink_off, 1);
+    if (g_lay->uid_off != 0) {
+        wr16(ino + g_lay->uid_off, (uint16_t)g_cred.euid);
+        wr16(ino + g_lay->gid_off, (uint16_t)g_cred.egid);
+        wr16(ino + g_lay->mode_off, (uint16_t)new_mode64(VFS64_S_IFREG | 0666u));
+    }
 }
 
 // ★ 整体重写（不存在则创建）：建全新块链 -> 提交 inode -> 最后释放旧块。
 // 语义与旧 vfs64_write64 逐条一致（中途失败只泄漏块，绝不让 inode 指向已释放的块）。
+// ★ P4：写权限判定在 write_resolve64 里（已有文件 w / 新建父目录 w+x），这里只透传错误码。
 int vfs64_write_stream64(const char* path, uint32_t len, Vfs64Src64 src, void* ctx) {
     if (!g_mounted) { log_op_fail("write_stream64", "not mounted"); return -1; }
     if (!path) { log_op_fail("write_stream64", "bad args"); return -1; }
@@ -1972,12 +2259,17 @@ int vfs64_write_stream64(const char* path, uint32_t len, Vfs64Src64 src, void* c
     char nm[VFS64_NAME_MAX + 1];
     bool is_new = false;
     uint8_t old_ino[VFS64_INODE_BYTES_MAX];
-    if (write_resolve64(path, &idx, &parent, nm, &nlen, &is_new, old_ino) != 0) return -1;
+    const int wr = write_resolve64(path, &idx, &parent, nm, &nlen, &is_new, old_ino);
+    if (wr != 0) return wr;
     if (is_new && !alloc_inode(&idx)) { log_op_fail("write_stream64", "no free inode"); return -1; }
-    // 已有文件：old_ino 由 write_resolve64 载入并校验（父目录/名字也以 inode 里的为准）
+    // 已有文件：old_ino 由 write_resolve64 载入并校验（父目录/名字也以 inode 里的为准）；
+    // 新文件：idx 由上一步分配（**绝不能是 0** —— inode 0 是根目录）
 
     uint8_t ino_new[VFS64_INODE_BYTES_MAX];
     fill_new_file_ino64(ino_new, nm, nlen, parent, len);
+    if (!is_new && g_lay->uid_off != 0) {                       // ★ P4：覆盖已有文件**保留属主/模式/组**
+        copy_bytes(ino_new + g_lay->uid_off, old_ino + g_lay->uid_off, 6);   // uid(2)+gid(2)+mode(2)（Linux 语义：
+    }                                                          //  重写不改属主、不改 mode；只有新建才按 euid/umask）
     if (build_chain_stream64(ino_new, len, src, ctx) != 0) {
         if (is_new) alloc_forget();
         return -1;
@@ -2017,7 +2309,7 @@ int vfs64_write64(const char* path, const void* buf, int len) {
 int vfs64_write(const char* path, const void* buf, int len) { return vfs64_write64(path, buf, len); }
 
 // ★ 部分写 / 追加（不存在则创建）：保留原有字节，缺块按需分配，off > size 的空洞补零。
-// 返回 0 = 成功；-1 = 失败（**盘上 inode 不变**；建链阶段的失败会把新块回滚，绝不写一半）。
+// 返回 0 = 成功；-1 = 失败（**盘上 inode 不变**）；-EACCES = 权限不足（write_resolve 已打点）。
 int vfs64_write_at64(const char* path, uint32_t off, const void* buf, uint32_t len) {
     if (!g_mounted) { log_op_fail("write_at64", "not mounted"); return -1; }
     if (!path || (!buf && len > 0)) { log_op_fail("write_at64", "bad args"); return -1; }
@@ -2025,7 +2317,8 @@ int vfs64_write_at64(const char* path, uint32_t off, const void* buf, uint32_t l
     char nm[VFS64_NAME_MAX + 1];
     bool is_new = false;
     uint8_t old_ino[VFS64_INODE_BYTES_MAX];
-    if (write_resolve64(path, &idx, &parent, nm, &nlen, &is_new, old_ino) != 0) return -1;
+    const int wr = write_resolve64(path, &idx, &parent, nm, &nlen, &is_new, old_ino);
+    if (wr != 0) return wr;
     if (is_new) {
         if (!alloc_inode(&idx)) { log_op_fail("write_at64", "no free inode"); return -1; }
         fill_new_file_ino64(old_ino, nm, nlen, parent, 0);
@@ -2043,12 +2336,14 @@ int vfs64_write_at64(const char* path, uint32_t off, const void* buf, uint32_t l
     if (is_new) touch_dir(parent, 0);
     return 0;
 }
-
+// 建空文件（父目录必须存在；已存在且是文件 = 0 幂等；是目录 = -1）。
+// ★ P4：新建走 write 的权限判定（父目录 w+x），已存在则要 w（覆盖提交一次空内容 = 截断语义）。
 int vfs64_create64(const char* path) {
     if (!g_mounted) { log_op_fail("create64", "not mounted"); return -1; }
     if (!path) { log_op_fail("create64", "bad args"); return -1; }
     uint32_t idx = 0;
     const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr == -VFS64_EACCES) return -VFS64_EACCES;
     if (pr == 0) {
         uint8_t ino[VFS64_INODE_BYTES_MAX];
         if (inode_load_ok(idx, ino, "create64") != 0) return -1;
@@ -2056,10 +2351,12 @@ int vfs64_create64(const char* path) {
         return 0;                                      // 已存在且是文件 = 幂等成功
     }
     static const char empty[1] = { 0 };
-    return (vfs64_write64(path, empty, 0) == 0) ? 0 : -1;
+    const int w = vfs64_write64(path, empty, 0);
+    return (w == 0) ? 0 : w;                            // -1 / -EACCES 原样透传
 }
 
 // ==================== 建目录 / 删除 ====================
+// 建目录（多级：父目录必须存在）。★ P4：父目录需要 w+x；新目录属主 = 当前 euid，模式 = 0777 & ~umask。
 int vfs64_mkdir64(const char* path) {
     if (!g_mounted) { log_op_fail("mkdir64", "not mounted"); return -1; }
     if (!path) { log_op_fail("mkdir64", "bad args"); return -1; }
@@ -2067,11 +2364,17 @@ int vfs64_mkdir64(const char* path) {
     uint32_t idx = 0, parent = 0, nlen = 0;
     char nm[VFS64_NAME_MAX + 1];
     const int pr = path_resolve(path, true, &idx, &parent, nm, &nlen);
-    if (pr < 0) { log_op_fail("mkdir64", "bad path / parent not found"); return -1; }
+    if (pr < 0) {
+        if (pr == -VFS64_EACCES) { log_op_fail("mkdir64", "permission denied (traverse)"); return -VFS64_EACCES; }
+        log_op_fail("mkdir64", "bad path / parent not found");
+        return -1;
+    }
     if (pr == 0) { log_op_fail("mkdir64", "already exists"); return -1; }
     uint8_t pino[VFS64_INODE_BYTES_MAX];               // 父目录必须真的是目录
     if (inode_load_ok(parent, pino, "mkdir64") != 0) return -1;
     if (pino[VFS_I_TYPE] != VFS64_TYPE_DIR) { log_op_fail("mkdir64", "parent is not a directory"); return -1; }
+    const int pc = perm_check_ino64(pino, "mkdir", path, VFS64_NEED_WX);   // ★ P4：目录写要 w+x
+    if (pc != 0) { log_op_fail("mkdir64", "permission denied (dir w+x)"); return pc; }
 
     uint32_t slot = 0;
     if (!alloc_inode(&slot)) { log_op_fail("mkdir64", "no free inode"); return -1; }
@@ -2084,6 +2387,11 @@ int vfs64_mkdir64(const char* path) {
     if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
     if (g_lay->nlink_off != 0) wr16(ino + g_lay->nlink_off, 1);
     if (g_lay->kind_off != 0) ino[g_lay->kind_off] = (uint8_t)VFS64_KIND_DIR;
+    if (g_lay->uid_off != 0) {                          // ★ P4：属主/模式
+        wr16(ino + g_lay->uid_off, (uint16_t)g_cred.euid);
+        wr16(ino + g_lay->gid_off, (uint16_t)g_cred.egid);
+        wr16(ino + g_lay->mode_off, (uint16_t)new_mode64(VFS64_S_IFDIR | 0777u));
+    }
     wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
     if (!inode_store(slot, ino)) { log_op_fail("mkdir64", "inode write failed"); return -1; }
     touch_dir(parent, (g_lay->nlink_off != 0) ? 1 : 0);   // 父目录：mtime 刷新 + nlink+1（子目录数）
@@ -2091,18 +2399,24 @@ int vfs64_mkdir64(const char* path) {
 }
 int vfs64_mkdir(const char* path) { return vfs64_mkdir64(path); }
 
+// 删除普通文件。★ P4：删除只要**父目录 w+x**（Linux 不在删的时候看文件本身的权限）。
 int vfs64_unlink64(const char* path) {
     if (!g_mounted) { log_op_fail("unlink64", "not mounted"); return -1; }
     if (!path) { log_op_fail("unlink64", "bad args"); return -1; }
 
     uint32_t idx = 0;
-    if (path_resolve(path, false, &idx, nullptr, nullptr, nullptr) != 0) {
+    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr != 0) {
+        if (pr == -VFS64_EACCES) return -VFS64_EACCES;
         log_op_fail("unlink64", "not found");
         return -1;
     }
     uint8_t ino[VFS64_INODE_BYTES_MAX];
     if (inode_load_ok(idx, ino, "unlink64") != 0) return -1;
     if (ino[VFS_I_TYPE] == VFS64_TYPE_DIR) { log_op_fail("unlink64", "refuse to remove a directory (use rmdir64)"); return -1; }
+    // ★ P4：父目录 w+x（先判权限再动块：被拒时盘上什么都不变）
+    const int pc = perm_check_idx64(rd32(ino + VFS_I_PARENT), "unlink", path, VFS64_NEED_WX);
+    if (pc != 0) { log_op_fail("unlink64", "permission denied (dir w+x)"); return pc; }
     // inode 里有越界块号时拒绝删除（保持"能删掉的一定是结构自洽的项"）
     if (!free_file_blocks(ino)) { log_op_fail("unlink64", "corrupt inode (not removed)"); return -1; }
 
@@ -2114,12 +2428,15 @@ int vfs64_unlink64(const char* path) {
 }
 int vfs64_unlink(const char* path) { return vfs64_unlink64(path); }
 
+// 删除空目录。★ P4：父目录 w+x（并且目标目录本身会被删掉，不需要目标自己的权限 —— Linux 语义）。
 int vfs64_rmdir64(const char* path) {
     if (!g_mounted) { log_op_fail("rmdir64", "not mounted"); return -1; }
     if (!path) { log_op_fail("rmdir64", "bad args"); return -1; }
 
     uint32_t idx = 0;
-    if (path_resolve(path, false, &idx, nullptr, nullptr, nullptr) != 0) {
+    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr != 0) {
+        if (pr == -VFS64_EACCES) return -VFS64_EACCES;
         log_op_fail("rmdir64", "not found");
         return -1;
     }
@@ -2127,6 +2444,8 @@ int vfs64_rmdir64(const char* path) {
     uint8_t ino[VFS64_INODE_BYTES_MAX];
     if (inode_load_ok(idx, ino, "rmdir64") != 0) return -1;
     if (ino[VFS_I_TYPE] != VFS64_TYPE_DIR) { log_op_fail("rmdir64", "not a directory"); return -1; }
+    const int pc = perm_check_idx64(rd32(ino + VFS_I_PARENT), "rmdir", path, VFS64_NEED_WX);   // ★ P4
+    if (pc != 0) { log_op_fail("rmdir64", "permission denied (dir w+x)"); return pc; }
 
     // 必须空：扫一遍看有没有 parent == idx 的活条目
     uint8_t child[VFS64_INODE_BYTES_MAX];
@@ -2150,6 +2469,7 @@ int vfs64_rmdir64(const char* path) {
 // 为什么只做同目录：目录表示 = "parent 字段相同的 inode 集合"（见 vfs64.h），改名只动 name 字段 +
 // mtime + CRC —— 一个 inode 落盘就完事，没有中间态、不会出现"两边都看不到"的窗口。
 // 跨目录移动要改 parent 并且维护两个目录的 nlink，属于另一档复杂度，本批**明说不做**。
+// 改名（同目录）。★ P4：所在目录需要 w+x。
 int vfs64_rename64(const char* old_path, const char* new_name) {
     if (!g_mounted) { log_op_fail("rename64", "not mounted"); return -1; }
     if (!old_path || !new_name) { log_op_fail("rename64", "bad args"); return -1; }
@@ -2162,7 +2482,9 @@ int vfs64_rename64(const char* old_path, const char* new_name) {
     }
 
     uint32_t idx = 0;
-    if (path_resolve(old_path, false, &idx, nullptr, nullptr, nullptr) != 0) {
+    const int pr = path_resolve(old_path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr != 0) {
+        if (pr == -VFS64_EACCES) return -VFS64_EACCES;
         log_op_fail("rename64", "not found");
         return -1;
     }
@@ -2171,6 +2493,8 @@ int vfs64_rename64(const char* old_path, const char* new_name) {
     uint8_t ino[VFS64_INODE_BYTES_MAX];
     if (inode_load_ok(idx, ino, "rename64") != 0) return -1;
     const uint32_t parent = rd32(ino + VFS_I_PARENT);
+    const int pc = perm_check_idx64(parent, "rename", old_path, VFS64_NEED_WX);   // ★ P4
+    if (pc != 0) { log_op_fail("rename64", "permission denied (dir w+x)"); return pc; }
     const uint32_t onlen = ino[VFS_I_NAMELEN];
     if (onlen == nlen && cmp_bytes(ino + g_lay->name_off, new_name, nlen) == 0) return 0;   // 同名 = 幂等
 
@@ -2211,6 +2535,133 @@ int vfs64_free64(uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_bl
     return 0;
 }
 
+// ==================== ★ P4：chmod / chown / access ====================
+// 规则（Linux 语义的裁剪版，如实写明取舍）：
+//   * chmod：**root 或属主**可以改；参数只接受"类型位 + 0777"（不实现 setuid/setgid/sticky 位）。
+//     非属主且非 root -> -EPERM(-1)（并打点 [PERM64] deny op=chmod）；找不到/旧卷无字段 -> -1。
+//   * chown：**只有 root** 能改属主（属主自己也不能改，Linux 的实际行为就是 root-only）；否则 -EPERM(-1)。
+//     uid/gid 传 (uint32_t)-1 表示"不改这一项"（与 Linux 的 -1 语义一致）。
+//   * access：只按 r/w/x 三段判定（root 恒通过）。
+static int chmod64_common(const char* path, uint32_t mode) {
+    if (!g_mounted) { log_op_fail("chmod64", "not mounted"); return -1; }
+    if (!path) { log_op_fail("chmod64", "bad args"); return -1; }
+    if ((mode & VFS64_S_IFMT) == 0) mode |= VFS64_S_IFREG;      // 只给权限位时按普通文件类型补
+    if ((mode & ~(VFS64_S_IFMT | VFS64_S_IRWX)) != 0) { log_op_fail("chmod64", "bad mode"); return -1; }
+    if (!perm_enforced64()) {                                   // v2/v3 旧卷：没有字段可写，如实拒绝
+        dbg64_str("[PERM64] chmod: volume v");
+        dbg64_dec(g_lay->version);
+        dbg64_str(" has no mode field (unsupported in this batch)\n");
+        dbg64_nl();
+        return -1;
+    }
+    uint32_t idx = 0;
+    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr != 0) {
+        if (pr == -VFS64_EACCES) return -VFS64_EACCES;
+        log_op_fail("chmod64", "not found");
+        return -1;
+    }
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    if (inode_load_ok(idx, ino, "chmod64") != 0) return -1;
+    const uint32_t iuid = ino_uid_of64(ino);
+    const uint32_t type = ino[VFS_I_TYPE];
+    if (g_cred.euid != 0 && g_cred.euid != iuid) {               // 非 root 且非属主 -> EPERM
+        dbg64_str("[PERM64] deny op=chmod path=");
+        char p[41];
+        uint32_t i = 0;
+        for (; path[i] && i < 40u; i++) p[i] = path[i];
+        p[i] = 0;
+        dbg64_str(p);
+        dbg64_str(" uid=");
+        dbg64_dec(g_cred.euid);
+        dbg64_str(" owner=");
+        dbg64_dec(iuid);
+        dbg64_str(" (only the owner or root can chmod)\n");
+        dbg64_nl();
+        return -VFS64_EPERM;
+    }
+    const uint32_t want_ifmt = (type == VFS64_TYPE_DIR) ? VFS64_S_IFDIR : VFS64_S_IFREG;
+    const uint16_t nm = (uint16_t)(want_ifmt | (mode & VFS64_S_IRWX));
+    wr16(ino + g_lay->mode_off, nm);
+    if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
+    wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
+    if (!inode_store(idx, ino)) { log_op_fail("chmod64", "inode write failed"); return -1; }
+    dbg64_str("[VFS64] chmod ok path=");
+    dbg64_str(path);
+    dbg64_str(" mode=");
+    log_octal4(mode & VFS64_S_IRWX);
+    dbg64_nl();
+    return 0;
+}
+int vfs64_chmod64(const char* path, uint32_t mode) { return chmod64_common(path, mode); }
+
+static int chown64_common(const char* path, uint32_t uid, uint32_t gid) {
+    if (!g_mounted) { log_op_fail("chown64", "not mounted"); return -1; }
+    if (!path) { log_op_fail("chown64", "bad args"); return -1; }
+    if (!perm_enforced64()) {
+        dbg64_str("[PERM64] chown: volume v");
+        dbg64_dec(g_lay->version);
+        dbg64_str(" has no uid/gid fields (unsupported in this batch)\n");
+        dbg64_nl();
+        return -1;
+    }
+    if (g_cred.euid != 0) {                                      // 只有 root 能改属主
+        dbg64_str("[PERM64] deny op=chown path=");
+        char p[41];
+        uint32_t i = 0;
+        for (; path[i] && i < 40u; i++) p[i] = path[i];
+        p[i] = 0;
+        dbg64_str(p);
+        dbg64_str(" uid=");
+        dbg64_dec(g_cred.euid);
+        dbg64_str(" (only root can chown)\n");
+        dbg64_nl();
+        return -VFS64_EPERM;
+    }
+    uint32_t idx = 0;
+    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr != 0) {
+        if (pr == -VFS64_EACCES) return -VFS64_EACCES;
+        log_op_fail("chown64", "not found");
+        return -1;
+    }
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    if (inode_load_ok(idx, ino, "chown64") != 0) return -1;
+    if (uid != 0xFFFFFFFFu) wr16(ino + g_lay->uid_off, (uint16_t)uid);
+    if (gid != 0xFFFFFFFFu) wr16(ino + g_lay->gid_off, (uint16_t)gid);
+    if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
+    wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
+    if (!inode_store(idx, ino)) { log_op_fail("chown64", "inode write failed"); return -1; }
+    dbg64_str("[VFS64] chown ok path=");
+    dbg64_str(path);
+    dbg64_str(" uid=");
+    dbg64_dec(ino_uid_of64(ino));
+    dbg64_str(" gid=");
+    dbg64_dec(ino_gid_of64(ino));
+    dbg64_nl();
+    return 0;
+}
+int vfs64_chown64(const char* path, uint32_t uid, uint32_t gid) { return chown64_common(path, uid, gid); }
+
+// access(2)：mask 用 Linux 低 3 位（4=r / 2=w / 1=x；0 = 只查存在）。
+int vfs64_access64(const char* path, uint32_t mask) {
+    if (!g_mounted) { log_op_fail("access64", "not mounted"); return -1; }
+    if (!path) { log_op_fail("access64", "bad args"); return -1; }
+    uint32_t idx = 0;
+    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr != 0) return (pr == -VFS64_EACCES) ? -VFS64_EACCES : -1;
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    if (inode_load_ok(idx, ino, "access64") != 0) return -1;
+    uint32_t need = 0;
+    if (mask & 4u) need |= VFS64_NEED_R;
+    if (mask & 2u) need |= VFS64_NEED_W;
+    if (mask & 1u) need |= VFS64_NEED_X;
+    if (need == 0) return 0;
+    const int pc = perm_check_ino64(ino, "access", path, need);
+    return (pc == 0) ? 0 : pc;
+}
+
+
 // ==================== 属性 / 遍历 ====================
 static void dirent_from_inode(const uint8_t* ino, uint32_t idx, Vfs64Dirent64* d) {
     const uint32_t nl = ino[VFS_I_NAMELEN];
@@ -2227,6 +2678,9 @@ static void dirent_from_inode(const uint8_t* ino, uint32_t idx, Vfs64Dirent64* d
     } else {
         d->kind = vfs64_kind_by_name64(d->type, d->name, nl);   // v2 卷：没有 kind 字段，按扩展名保守判
     }
+    d->uid = ino_uid_of64(ino);                                 // ★ P4（旧卷 -> 0 = root）
+    d->gid = ino_gid_of64(ino);
+    d->mode = ino_mode_of64(ino, d->type);                      // 旧卷 -> 默认 0755/0644
 }
 // 列目录的**核心**（按 inode 号）：从 *cursor 开始最多 max 条。返回条数（0 = 结束），-1 = 参数错。
 static int list_inode64(uint32_t dir, Vfs64Dirent64* out, int max, uint32_t* cursor) {
@@ -2250,24 +2704,34 @@ static int list_inode64(uint32_t dir, Vfs64Dirent64* out, int max, uint32_t* cur
     if (cursor) *cursor = c;
     return n;
 }
+// 列目录（路径版）。★ P4：需要 r（**列目录不要求目录有 x** —— 与 Linux 一致：x 只用于遍历路径）。
 int vfs64_list64(const char* path, Vfs64Dirent64* out, int max, uint32_t* cursor) {
     if (!g_mounted) { log_op_fail("list64", "not mounted"); return -1; }
     if (!path) { log_op_fail("list64", "bad args"); return -1; }
     uint32_t idx = 0;
-    if (path_resolve(path, false, &idx, nullptr, nullptr, nullptr) != 0) {
+    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr != 0) {
+        if (pr == -VFS64_EACCES) return -VFS64_EACCES;
         log_op_fail("list64", "path not found");
         return -1;
     }
     uint8_t ino[VFS64_INODE_BYTES_MAX];
     if (inode_load_ok(idx, ino, "list64") != 0) return -1;
     if (ino[VFS_I_TYPE] != VFS64_TYPE_DIR) { log_op_fail("list64", "not a directory"); return -1; }
+    const int pc = perm_check_ino64(ino, "list", path, VFS64_NEED_R);
+    if (pc != 0) { log_op_fail("list64", "permission denied (r)"); return pc; }
     return list_inode64(idx, out, max, cursor);
 }
+// 查属性。★ P4：stat 只看路径遍历（父目录 x）—— 不需要目标自己的 r（Linux 语义），
+// 查属性。★ P4：stat 只看路径遍历（父目录 x）—— 不需要目标自己的 r（Linux 语义），
+//   uid/gid/mode 一并给出（旧卷：uid=gid=0、mode = 默认 0755/0644）。
 int vfs64_stat64(const char* path, Vfs64Info64* out) {
     if (!g_mounted) { log_op_fail("stat64", "not mounted"); return -1; }
     if (!path || !out) { log_op_fail("stat64", "bad args"); return -1; }
     uint32_t idx = 0;
-    if (path_resolve(path, false, &idx, nullptr, nullptr, nullptr) != 0) {
+    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr != 0) {
+        if (pr == -VFS64_EACCES) return -VFS64_EACCES;
         log_op_fail("stat64", "not found");
         return -1;
     }
@@ -2280,6 +2744,9 @@ int vfs64_stat64(const char* path, Vfs64Info64* out) {
     out->parent = rd32(ino + VFS_I_PARENT);
     out->mtime = (g_lay->mtime_off != 0) ? rd32(ino + g_lay->mtime_off) : 0;
     out->nlink = (g_lay->nlink_off != 0) ? rd16(ino + g_lay->nlink_off) : 1u;
+    out->uid = ino_uid_of64(ino);                                // ★ P4
+    out->gid = ino_gid_of64(ino);
+    out->mode = ino_mode_of64(ino, out->type);
     const uint32_t nl = ino[VFS_I_NAMELEN];
     out->name_len = nl;
     copy_bytes(out->name, ino + g_lay->name_off, nl);
@@ -2323,13 +2790,17 @@ int vfs64_opendir64(const char* path, int* out_handle) {
     if (!g_mounted) { log_op_fail("opendir64", "not mounted"); return -1; }
     if (!path || !out_handle) { log_op_fail("opendir64", "bad args"); return -1; }
     uint32_t idx = 0;
-    if (path_resolve(path, false, &idx, nullptr, nullptr, nullptr) != 0) {
+    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr != 0) {
+        if (pr == -VFS64_EACCES) return -VFS64_EACCES;
         log_op_fail("opendir64", "path not found");
         return -1;
     }
     uint8_t ino[VFS64_INODE_BYTES_MAX];
     if (inode_load_ok(idx, ino, "opendir64") != 0) return -1;
     if (ino[VFS_I_TYPE] != VFS64_TYPE_DIR) { log_op_fail("opendir64", "not a directory"); return -1; }
+    const int pc = perm_check_ino64(ino, "opendir", path, VFS64_NEED_R);   // ★ P4：r
+    if (pc != 0) { log_op_fail("opendir64", "permission denied (r)"); return pc; }
     for (uint32_t i = 0; i < VFS64_DIRSTREAM_MAX; i++) {
         if (g_streams[i].used) continue;
         g_streams[i].used = true;
@@ -2440,6 +2911,12 @@ static void tree_walk(uint32_t dir, const char* prefix, int depth, TreeDumpCtx* 
             dbg64_str(vfs64_kind_str64(page[i].kind));
             dbg64_str(" idx=");
             dbg64_dec(page[i].index);
+            dbg64_str(" uid=");                                  // ★ P4：行尾追加（既有断言的字段顺序不变）
+            dbg64_dec(page[i].uid);
+            dbg64_str(" gid=");
+            dbg64_dec(page[i].gid);
+            dbg64_str(" mode=");
+            log_octal4(page[i].mode & VFS64_S_IRWX);
             dbg64_nl();
             ctx->printed++;
             if (page[i].type == VFS64_TYPE_DIR && depth < ctx->max_depth) {
@@ -2541,8 +3018,31 @@ void vfs64_dump64() {
         dbg64_str(vfs64_kind_str64(ok ? in.kind : VFS64_KIND_NONE));
         dbg64_str(" mtime=0x");
         log_hex32(ok ? in.mtime : 0u);
+        dbg64_str(" uid=");
+        dbg64_dec(ok ? in.uid : 0u);
+        dbg64_str(" gid=");
+        dbg64_dec(ok ? in.gid : 0u);
+        dbg64_str(" mode=");
+        log_octal4(ok ? (in.mode & VFS64_S_IRWX) : 0u);
         dbg64_nl();
     }
+    Vfs64Cred64 cr;
+    vfs64_get_cred64(&cr);
+    dbg64_str("[PERM64] dump cred uid=");
+    dbg64_dec(cr.uid);
+    dbg64_str(" gid=");
+    dbg64_dec(cr.gid);
+    dbg64_str(" euid=");
+    dbg64_dec(cr.euid);
+    dbg64_str(" egid=");
+    dbg64_dec(cr.egid);
+    dbg64_str(" umask=");
+    log_octal4(vfs64_get_umask64());
+    dbg64_str(" enforce=");
+    dbg64_dec((g_mounted && g_lay->mode_off != 0) ? 1u : 0u);
+    dbg64_str(" volume=v");
+    dbg64_dec(g_mounted ? g_lay->version : 0u);
+    dbg64_nl();
 }
 
 // ==================== 自检（不需要真盘）====================
@@ -2582,6 +3082,11 @@ int vfs64_selftest64() {
     int fails = 0;
     Vfs64Geom saved;
     geom_save(&saved);
+    // ★ P4：自检按**系统组件口径**在 root 凭证下跑（它检查的是卷格式/几何/大文件这条链）；
+    //   权限本身由 bit16 用**显式切换的凭证**覆盖（root -> 1234 -> root），跑完原样还回去。
+    Vfs64Cred64 sel_cred;
+    vfs64_get_cred64(&sel_cred);
+    vfs64_set_proc_cred64(1, 0, 0, 0, 0);
 
     // ---- 切到 64 扇区内存假盘（真盘状态在 saved 里，最后恢复）----
     g_fake_active = true;
@@ -2608,6 +3113,111 @@ int vfs64_selftest64() {
             log_line("fake-disk mount identity FAIL");
         }
     }
+    // ---- bit16(65536)：★ P4 权限（**v4 卷**：三段判定 + root 绕过 + chmod/chown + umask）----
+    // 为什么放在 bit0 刚格式化完的位置：此时假卷是**新的 v4 卷**、根目录 0755 root:root；
+    //   本段末尾把凭证与 umask 恢复，bit1..bit15 继续在 root 凭证下跑（= 系统组件的同一口径）。
+    if (!(fails & 1)) {
+        bool ok = true;
+        Vfs64Cred64 cred0;
+        vfs64_get_cred64(&cred0);
+        const uint32_t umask0 = vfs64_umask64(VFS64_UMASK_DEFAULT);
+        Vfs64Info64 pinfo;
+        char pbuf[8];
+        // ① root 建目录/文件：属主 = 调用方（root）、模式 = 默认 & ~umask
+        int step = 0;
+        step = 1;
+        if (vfs64_mkdir64("/perm") != 0) ok = false;
+        if (ok && vfs64_write64("/perm/f.txt", "hello", 5) != 5) ok = false;
+        if (ok && (vfs64_stat64("/perm", &pinfo) != 0 || pinfo.uid != 0 || pinfo.gid != 0 ||
+                   (pinfo.mode & VFS64_S_IRWX) != 0755u || (pinfo.mode & VFS64_S_IFMT) != VFS64_S_IFDIR)) {
+            ok = false;
+            log_line("perm: dir owner/mode FAIL");
+        }
+        if (ok && (vfs64_stat64("/perm/f.txt", &pinfo) != 0 ||
+                   (pinfo.mode & VFS64_S_IRWX) != 0644u || (pinfo.mode & VFS64_S_IFMT) != VFS64_S_IFREG)) {
+            ok = false;
+            log_line("perm: file mode FAIL");
+        }
+        // ② root 把 /perm 收成 0700 + 文件 0600：别的用户连 x 都没有（进不去）
+        if (ok && vfs64_chmod64("/perm", VFS64_S_IFDIR | 0700u) != 0) ok = false;
+        if (ok && vfs64_chmod64("/perm/f.txt", VFS64_S_IFREG | 0600u) != 0) ok = false;
+        vfs64_set_cred64(1234, 1234, 1234, 1234);                 // uid=gid=1234 的普通用户
+        if (ok && vfs64_stat64("/perm/f.txt", &pinfo) != -VFS64_EACCES) ok = false;    // 目录无 x：进不去
+        if (ok && vfs64_read64("/perm/f.txt", pbuf, 5) != -VFS64_EACCES) ok = false;
+        if (ok && vfs64_mkdir64("/perm/sub") != -VFS64_EACCES) ok = false;
+        // ③ root 先把目录放宽到 0755（让 1234 能进目录）-> 再验证：
+        //    非属主 chmod / 非 root chown 一律 -EPERM；other 有 r 无 w -> 读通过、写被拒（-EACCES）
+        vfs64_set_cred64(cred0.uid, cred0.gid, cred0.euid, cred0.egid);       // 回到 root（自检本体）
+        if (ok && vfs64_chmod64("/perm", VFS64_S_IFDIR | 0755u) != 0) ok = false;
+        if (ok && vfs64_chmod64("/perm/f.txt", VFS64_S_IFREG | 0644u) != 0) ok = false;
+        vfs64_set_cred64(1234, 1234, 1234, 1234);
+        if (ok && vfs64_chmod64("/perm/f.txt", VFS64_S_IFREG | 0600u) != -VFS64_EPERM) {
+            ok = false;                                           // 非属主不能 chmod
+            log_line("perm: non-owner chmod was not denied FAIL");
+        }
+        if (ok && vfs64_chown64("/perm/f.txt", 1234u, 1234u) != -VFS64_EPERM) ok = false;  // 非 root 不能 chown
+        vfs64_set_cred64(1234, 1234, 1234, 1234);
+        if (ok && vfs64_read64("/perm/f.txt", pbuf, 5) != 5) ok = false;         // other: r
+        if (ok && vfs64_write64("/perm/f.txt", "x", 1) != -VFS64_EACCES) {
+            ok = false;                                           // other: 没有 w
+            log_line("perm: other write was not denied FAIL");
+        }
+        if (ok && vfs64_mkdir64("/perm/sub") != -VFS64_EACCES) {
+            ok = false;                                           // 目录 w 不给
+            log_line("perm: dir write without w was not denied FAIL");
+        }
+        if (ok && vfs64_list64("/", nullptr, 0, nullptr) != -1) ok = false;       // 参数错仍然 -1（不是权限错）
+        step = 4;
+        vfs64_set_cred64(cred0.uid, cred0.gid, cred0.euid, cred0.egid);
+        if (ok && vfs64_chmod64("/perm/f.txt", VFS64_S_IFREG | 0000u) != 0) ok = false;
+        if (ok && vfs64_read64("/perm/f.txt", pbuf, 5) != 5) ok = false;
+        if (ok && vfs64_write64("/perm/f.txt", "root", 4) != 4) ok = false;
+        // ⑤ root chown 给普通用户 + 属主自己可读写；umask 077 影响新文件模式
+        step = 5;
+        vfs64_set_cred64(1234, 1234, 1234, 1234);
+        if (ok && vfs64_read64("/perm/f.txt", pbuf, 4) != -VFS64_EACCES) ok = false;   // 0000：属主也不行
+        step = 6;
+        vfs64_set_cred64(cred0.uid, cred0.gid, cred0.euid, cred0.egid);
+        if (ok && vfs64_chmod64("/perm/f.txt", VFS64_S_IFREG | 0600u) != 0) ok = false;
+        if (ok && vfs64_chown64("/perm/f.txt", 1234u, 1234u) != 0) ok = false;   // root 把属主给 1234（下面验"属主自己"）
+        vfs64_set_cred64(1234, 1234, 1234, 1234);
+        if (ok && vfs64_read64("/perm/f.txt", pbuf, 4) != 4) ok = false;         // 属主 r
+        if (ok && vfs64_write64("/perm/f.txt", "me", 2) != 2) ok = false;        // 属主 w
+        vfs64_set_cred64(cred0.uid, cred0.gid, cred0.euid, cred0.egid);
+        (void)vfs64_umask64(0077u);
+        step = 7;
+        if (ok && vfs64_write64("/perm/u.txt", "u", 1) != 1) ok = false;
+        if (ok && (vfs64_stat64("/perm/u.txt", &pinfo) != 0 || (pinfo.mode & VFS64_S_IRWX) != 0600u)) {
+            ok = false;
+            log_line("perm: umask 077 FAIL");
+        }
+        // ⑥ chown 到另一个 uid 后：属主读通过、原属主（root 之外的 1234）被拒
+        if (ok && vfs64_chown64("/perm/u.txt", 999u, 999u) != 0) ok = false;
+        vfs64_set_cred64(1234, 1234, 1234, 1234);
+        if (ok && vfs64_read64("/perm/u.txt", pbuf, 1) != -VFS64_EACCES) ok = false;   // other 无 r
+        if (ok && vfs64_chmod64("/perm/u.txt", VFS64_S_IFREG | 0644u) != -VFS64_EPERM) ok = false;  // 非属主不许
+        vfs64_set_cred64(cred0.uid, cred0.gid, cred0.euid, cred0.egid);
+        if (ok && vfs64_chmod64("/perm/u.txt", VFS64_S_IFREG | 0644u) != 0) ok = false;  // root 改回 0644
+        vfs64_set_cred64(1234, 1234, 1234, 1234);
+        if (ok && vfs64_read64("/perm/u.txt", pbuf, 1) != 1) ok = false;         // 0644：other r
+        step = 8;
+        // ★ 清理前必须回到原凭证：/perm 是 root 的（这个时刻 cred 还是 1234，删不掉）
+        vfs64_set_cred64(cred0.uid, cred0.gid, cred0.euid, cred0.egid);
+        (void)vfs64_umask64(umask0);
+        (void)vfs64_unlink64("/perm/u.txt");
+        (void)vfs64_unlink64("/perm/f.txt");
+        (void)vfs64_rmdir64("/perm");
+        if (ok) {
+            dbg64_str("[VFS64] perm selftest ok owner/mode/other/root/chmod/chown/umask=1");
+            dbg64_nl();
+        } else {
+            dbg64_str("[VFS64] perm selftest FAIL step=");
+            dbg64_dec((uint64_t)step);
+            dbg64_nl();
+            fails |= 65536;
+        }
+    }
+
 
     // ---- bit1：写 3000B（跨 4 个直接块 + 间接块）-> 读回逐字节比对 ----
     if (!(fails & 1)) {
@@ -2754,8 +3364,11 @@ int vfs64_selftest64() {
             wr32(bad + VFS_I3_MTIME, vfs64_pack_time64(2025, 1, 1, 0, 0, 0));
             wr16(bad + VFS_I3_NLINK, 1);
             bad[VFS_I3_KIND] = (uint8_t)VFS64_KIND_BIN;
+            wr16(bad + VFS_I4_UID, 0);                            // ★ P4：v4 的权限字段必须自洽
+            wr16(bad + VFS_I4_GID, 0);
+            wr16(bad + VFS_I4_MODE, (uint16_t)(VFS64_S_IFREG | 0644u));
             wr32(bad + VFS_I_D0, g_blocks + 7);                // 越界块号
-            wr32(bad + VFS_LAY_V3.crc_off, crc32_64(bad, VFS_LAY_V3.crc_off));
+            wr32(bad + VFS_LAY_V4.crc_off, crc32_64(bad, VFS_LAY_V4.crc_off));
             if (dev_write(g_start + g_inode_start, 1, g_sel_b)) {
                 if (vfs64_read("hack", g_sel_b, 16) != -1) ok = false;
                 if (vfs64_stat("hack", &t, &sz) != 0) ok = false;   // inode 本身结构是合法的
@@ -2773,7 +3386,10 @@ int vfs64_selftest64() {
             for (uint32_t i = 0; i < 5; i++) bad[VFS_I3_NAME + i] = (uint8_t)("hack2"[i]);
             wr32(bad + VFS_I_SIZE, 128);
             wr16(bad + VFS_I3_NLINK, 1);
-            wr32(bad + VFS_LAY_V3.crc_off, 0x12345678u);       // 故意写错
+            wr16(bad + VFS_I4_UID, 0);                            // ★ P4：权限字段自洽（要测的是 CRC，不是 mode）
+            wr16(bad + VFS_I4_GID, 0);
+            wr16(bad + VFS_I4_MODE, (uint16_t)(VFS64_S_IFREG | 0644u));
+            wr32(bad + VFS_LAY_V4.crc_off, 0x12345678u);       // 故意写错
             if (dev_write(g_start + g_inode_start, 1, g_sel_b)) {
                 if (vfs64_stat("hack2", &t, &sz) == 0) ok = false;
                 zero_bytes(g_sel_b, VFS64_SECTOR_BYTES);
@@ -3134,6 +3750,8 @@ int vfs64_selftest64() {
         g_fake_active = false;
         dbg64_str("[VFS64] multivol selftest ");
         dbg64_str(ok ? "ok" : "FAIL");
+        dbg64_str(" step=");                                  // mv_step：失败时是出错那一行的行号（0 = 全过）
+        dbg64_dec((uint64_t)mv_step);
         dbg64_nl();
         if (!ok) fails |= 4096;
     }
@@ -3297,6 +3915,7 @@ int vfs64_selftest64() {
         g_cur_slot = save_cur_b;
         g_system_slot = save_sys_b;
     }
+    vfs64_set_cred64(sel_cred.uid, sel_cred.gid, sel_cred.euid, sel_cred.egid);
     dbg64_str("[VFS64] selftest ");
     if (fails == 0) {
         dbg64_str("PASS");

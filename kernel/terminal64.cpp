@@ -722,28 +722,25 @@ static const char* HELP_EN =
     "  proc run NAME|/PATH   create + start a real proc64 process (built-in: spin -> long-lived /spin.elf)\n"
     "  proc kill PID [SIG]   signal a proc64 process (default SIGKILL=9; the task manager process page uses this)\n"
     "  rust [tokens|set N]   Rust module (gui_rs): design tokens + theme palette; rust set N switches theme\n"
-    "  ---- multi-user / session identity (P1c; **no permission checks yet**, that is P4) ----\n"
-    "  useradd NAME          create a normal user (uid >= 1000; home /home/NAME, desktop /home/NAME/Desktop)\n"
+    "  ---- multi-user / session identity (★ P4: uid/gid/mode permission bits ARE enforced) ----\n"
+    "  useradd NAME          create a normal user (uid >= 1000; home /home/NAME owns itself, mode 0700)\n"
     "  userdel NAME          remove a user record (home dir kept; root / last normal user refused)\n"
     "  passwd [NAME] [PW]    set a password (PW omitted = hidden interactive input; PW='-' clears;\n"
     "                        stored as salt + SHA-256 x1000 iterations, never plaintext)\n"
     "  users                 user table: root (hidden in the login UI) + normal users + session ids\n"
-    "  whoami / id           session identity (euid): root after 'su - root' / 'sudo -i'\n"
-    "  su - root | su - | sudo -i   switch the SESSION identity to root (GUI user/avatar unchanged)\n"
+    "  whoami / id           session identity: real uid/gid/euid/egid (su/sudo change euid/egid)\n"
+    "  su [-] [NAME]         switch the SESSION identity (default root; prompts for the target's password\n"
+    "                        when it has one; GUI user/avatar unchanged)\n"
+    "  sudo -i               same as above (only -i is implemented)\n"
     "  exit                  leave the root session (back to the GUI user)\n"
+    "  chmod MODE PATH       change the mode (octal, e.g. chmod 600 /a.txt; root or the owner only)\n"
+    "  chown USER[:GROUP] P  change owner/group (root only; GROUP defaults to the user's gid)\n"
+    "  umask [MASK]          show/set the umask for newly created files (default 022)\n"
+    "  ls [-l] [PATH]        list a directory; -l shows -rw-r--r-- owner group size name (default /)\n"
+    "  tree [PATH]           dump the directory tree to the serial log (each line has uid/gid/mode)\n"
     "  loginctl lock         lock the screen (press Enter/click, then sign in again)\n"
     "No 'not supported' commands remain: update/preload were the last two and are real now.\n";
-
 static const char* HELP_ZH =
-    "  ---- 多用户 / 会话身份（P1c；**权限位尚未拦截**，P4 收口）----\n"
-    "  useradd 名字          建普通用户（uid >= 1000；主目录 /home/名字、桌面 /home/名字/Desktop）\n"
-    "  userdel 名字          删用户记录（主目录保留；root / 最后一个普通用户拒绝）\n"
-    "  passwd [名字] [口令]  设口令（省略口令 = 交互式**隐藏输入**；口令写 - 就清掉；只存盐 + SHA-256×1000 轮）\n"
-    "  users                 用户表：root（登录界面隐藏）+ 普通用户 + 当前 GUI/会话身份\n"
-    "  whoami / id           会话身份（euid）：su - root / sudo -i 之后是 root\n"
-    "  su - root | su - | sudo -i   把**会话**身份切成 root（GUI 用户名/头像不变）\n"
-    "  exit                  退出 root 会话（回到 GUI 用户）\n"
-    "  loginctl lock         回锁屏（回车/点击后重新登录）\n"
     "VimtuOS 64 位 Shell 命令：\n"
     "  help                  本帮助\n"
     "  ver, uname            版本与架构\n"
@@ -798,14 +795,20 @@ static const char* HELP_ZH =
     "  proc run 名字|/路径   创建并启动一个真 proc64 进程（内置：spin -> 长命 /spin.elf）\n"
     "  proc kill PID [SIG]   给 proc64 进程发信号（默认 SIGKILL=9；任务管理器进程页回车走的就是它）\n"
     "  rust [tokens|set N]   Rust 模块（gui_rs）：设计 Token + 主题配色；rust set N 切换主题\n"
-    "  ---- 多用户 / 会话身份（P1c；**权限位尚未拦截**，P4 收口）----\n"
-    "  useradd 名字          建普通用户（uid >= 1000；主目录 /home/名字、桌面 /home/名字/Desktop）\n"
+    "  ---- 多用户 / 会话身份（★ P4：uid/gid/mode 权限位**真的拦截**）----\n"
+    "  useradd 名字          建普通用户（uid >= 1000；主目录 /home/名字 = 属主自己、0700）\n"
     "  userdel 名字          删用户记录（主目录保留；root / 最后一个普通用户拒绝）\n"
     "  passwd [名字] [口令]  设口令（省略口令 = 交互式**隐藏输入**；口令写 - 就清掉；只存盐 + SHA-256×1000 轮）\n"
     "  users                 用户表：root（登录界面隐藏）+ 普通用户 + 当前 GUI/会话身份\n"
-    "  whoami / id           会话身份（euid）：su - root / sudo -i 之后是 root\n"
-    "  su - root | su - | sudo -i   把**会话**身份切成 root（GUI 用户名/头像不变）\n"
+    "  whoami / id           会话身份：uid/gid/euid/egid 都是真值（su/sudo 会改 euid/egid）\n"
+    "  su [-] [名字]         切**会话身份**（默认 root；目标有口令时交互式输口令；GUI 用户名/头像不变）\n"
+    "  sudo -i               同上（sudo 只实现了 -i）\n"
     "  exit                  退出 root 会话（回到 GUI 用户）\n"
+    "  chmod 模式 路径       改模式（八进制，如 chmod 600 /a.txt；**root 或属主**才行）\n"
+    "  chown 用户[:组] 路径  改属主/组（**只有 root** 能改；组缺省 = 用户的 gid）\n"
+    "  ls [-l] [路径]        列目录；-l 显示 -rw-r--r-- 属主 组 大小 名字（缺省路径 = /）\n"
+    "  tree [路径]           把目录树打到串口（每行带 uid/gid/mode；验收证据）\n"
+    "  ls [-l] [路径]        列目录；-l 显示 -rw-r--r-- 属主 组 大小 名字（缺省路径 = /）\n"
     "  loginctl lock         回锁屏（回车/点击后重新登录）\n"
     "没有\"未支持\"命令了：最后两条 update / preload 已接真。\n";
 // ---------- 命令实现 ----------
@@ -1192,23 +1195,62 @@ static bool cmd_display(TerminalState* ts, const char* sub) {
 }
 
 // ==================== 文件命令（批次 B：全部走 kernel/fd64.cpp 的 FD 层 -> VimtuFS2）====================
-// 限制（help 里也如实写）：**路径是多级的**（v3 目录树；单段 ≤31B、整条 ≤128B、≤16 层）、单文件 <= 8 MiB、无权限；
-// rm 只能删文件（vfs64 没有删目录原语）；mkdir 的父目录固定为根；写文件是整体覆盖 + 立刻落盘。
+// 限制（help 里也如实写）：**路径是多级的**（单段 ≤31B、整条 ≤128B、≤16 层）、单文件 <= 8 MiB；
+//   ★ P4：**权限位真的拦**（读要 r、进目录要 x、写要 w —— root 绕过；详见 vfs64.h 的"★ P4 权限"）。
+// rm 只能删文件；mkdir 支持多级；写文件是整体覆盖 + 立刻落盘。
 
-static void cmd_ls(TerminalState* ts) {
+// ★ P4：把 mode 变成 ls -l 那样的字符串（"drwxr-xr-x"）；type 用目录位判断。
+static void ts_mode_str64(char out[11], uint32_t mode, uint32_t type) {
+    out[0] = (type == VFS64_TYPE_DIR) ? 'd' : '-';
+    for (int g = 0; g < 3; g++) {
+        const uint32_t bits = (mode >> (6 - 3 * g)) & 7u;
+        out[1 + 3 * g] = (bits & 4u) ? 'r' : '-';
+        out[2 + 3 * g] = (bits & 2u) ? 'w' : '-';
+        out[3 + 3 * g] = (bits & 1u) ? 'x' : '-';
+    }
+    out[10] = 0;
+}
+// uid/gid -> 名字（本系统 gid = uid 一个主组；root 两侧都是 "root"）；找不到用户时打数字。
+static void ts_user_name64(TerminalState* ts, uint32_t uid) {
+    const char* n = userdb64_name_for_uid64(uid);
+    if (n && n[0]) ts_puts(ts, n);
+    else           ts_put_u64(ts, (uint64_t)uid);
+}
+
+// ls [-l] [路径]：列目录（缺省 = 当前卷的根目录）。-l 给"权限串 属主 组 大小 名字"。
+static void cmd_ls(TerminalState* ts, const char* a1, const char* a2) {
+    bool long_fmt = false;
+    const char* path = "/";
+    if (a1 && a1[0]) {
+        if (st_eq(a1, "-l")) { long_fmt = true; if (a2 && a2[0]) path = a2; }
+        else path = a1;
+    }
+    // ★ 根目录单独处理：fd64_norm_path64 是"文件路径"规范化（拒绝 "/"），缺省路径就是 "/"
+    if (st_eq(path, "/") || st_eq(path, "//")) {
+        g_pathbuf[0] = '/';
+        g_pathbuf[1] = 0;
+    } else if (fd64_norm_path64(path, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
+        ts_puts(ts, "ls: bad path (multi-level /dir/sub/name, <=128 B, <=16 segments)\n");
+        return;
+    }
     // 只用目录句柄列一次（fd64 内部把这次扫描缓存进句柄；不再额外做一次 vfs64_ls +
     // 每个条目一次 stat —— 那在真机上是秒级 I/O，会把 GUI 看门狗饿到）。
-    const int dfd = fd64_opendir64("/");
+    const int dfd = fd64_opendir64(g_pathbuf);
     if (dfd < 3) {
-        ts_puts(ts, "ls: no VimtuFS2 volume (see 'disk' for volume state)\n");
+        ts_puts(ts, gui64_tr("ls: cannot open ", "ls: 打不开 "));
+        ts_puts(ts, g_pathbuf);
+        ts_puts(ts, gui64_tr(" (missing / denied / not a directory / no volume)\n",
+                             "（不存在 / 被权限拒绝 / 不是目录 / 没有卷）\n"));
         dbg64_line_begin64();
-        dbg64_str("[TERM] cmd ls entries=0 (no volume)\n");
+        dbg64_str("[TERM] cmd ls entries=0 denied-or-missing path=");
+        dbg64_str(g_pathbuf);
+        dbg64_nl();
         dbg64_line_end64();
         return;
     }
     ts_puts(ts, fs64_is_readonly64(-1)
-                 ? "current volume (FAT32, read-only; root of the volume):\n"
-                 : "current volume (VimtuFS2; multi-level paths; this lists the volume root):\n");
+                 ? "current volume (FAT32, read-only):\n"
+                 : "current volume (VimtuFS2):\n");
     int rows = 0;
     uint64_t bytes = 0;
     for (;;) {
@@ -1216,10 +1258,53 @@ static void cmd_ls(TerminalState* ts) {
         uint32_t ty = 0, sz = 0;
         const int r = fd64_readdir64(dfd, nm, (int)sizeof(nm), &ty, &sz);
         if (r <= 0) break;
-        ts_puts(ts, "  ");
-        ts_puts_pad(ts, nm, 20);
-        ts_put_u64(ts, (uint64_t)sz);
-        ts_puts(ts, ty == VFS64_TYPE_DIR ? " B  <DIR>\n" : " B\n");
+        if (long_fmt) {
+            // 长格式：每个条目一次 stat（-- P4 的 uid/gid/mode 只能从 stat 拿）
+            char full[VFS64_PATH_MAX + VFS64_NAME_MAX + 4];
+            int f = 0;
+            for (int i = 0; g_pathbuf[i] && f < (int)sizeof(full) - 2; i++) full[f++] = g_pathbuf[i];
+            if (f == 0 || full[f - 1] != '/') full[f++] = '/';
+            for (int i = 0; nm[i] && f < (int)sizeof(full) - 1; i++) full[f++] = nm[i];
+            full[f] = 0;
+            Fs64Stat64 si;
+            uint32_t m = 0, uid = 0, gid = 0;
+            if (fs64_stat64(-1, full, &si) == 0) { m = si.mode; uid = si.uid; gid = si.gid; }
+            char ms[11];
+            ts_mode_str64(ms, m, ty);
+            ts_puts(ts, ms);
+            ts_puts(ts, "  ");
+            ts_user_name64(ts, uid);
+            ts_puts(ts, " ");
+            ts_user_name64(ts, gid);
+            ts_puts(ts, "  ");
+            ts_put_u64(ts, (uint64_t)sz);
+            ts_puts(ts, "  ");
+            ts_puts(ts, nm);
+            ts_putc(ts, (uint32_t)'\n');
+            // ★ 串口证据行（自动验收 grep；有界：目录句柄缓存最多 16 条，不会刷屏）
+            dbg64_line_begin64();
+            dbg64_str("[TERM] ls -l ");
+            dbg64_str(full);
+            dbg64_str(" ");
+            dbg64_str(ms);
+            dbg64_str(" uid=");
+            dbg64_dec(uid);
+            dbg64_str(" gid=");
+            dbg64_dec(gid);
+            dbg64_str(" user=");
+            dbg64_str(userdb64_name_for_uid64(uid)[0] ? userdb64_name_for_uid64(uid) : "-");
+            dbg64_str(" group=");
+            dbg64_str(userdb64_name_for_uid64(gid)[0] ? userdb64_name_for_uid64(gid) : "-");
+            dbg64_str(" size=");
+            dbg64_dec(sz);
+            dbg64_nl();
+            dbg64_line_end64();
+        } else {
+            ts_puts(ts, "  ");
+            ts_puts_pad(ts, nm, 20);
+            ts_put_u64(ts, (uint64_t)sz);
+            ts_puts(ts, ty == VFS64_TYPE_DIR ? " B  <DIR>\n" : " B\n");
+        }
         bytes += sz;
         rows++;
     }
@@ -1228,14 +1313,180 @@ static void cmd_ls(TerminalState* ts) {
     ts_put_u64(ts, (uint64_t)rows);
     ts_puts(ts, " entries, ");
     ts_put_u64(ts, bytes);
-    ts_puts(ts, " bytes\\n");
+    ts_puts(ts, " bytes\n");
     dbg64_line_begin64();
     dbg64_str("[TERM] cmd ls entries=");
     dbg64_dec((uint64_t)rows);
     dbg64_str(" bytes=");
     dbg64_dec(bytes);
+    dbg64_str(" path=");
+    dbg64_str(g_pathbuf);
+    dbg64_str(long_fmt ? " long=1" : " long=0");
     dbg64_nl();
     dbg64_line_end64();
+}
+
+// ★ P4：chmod MODE PATH（八进制；root 或属主）。越权/旧卷/不存在都如实报错（不假装成功）。
+static bool cmd_chmod(TerminalState* ts, const char* mode_s, const char* path) {
+    if (!mode_s || !mode_s[0] || !path || !path[0]) {
+        ts_puts(ts, "chmod: usage: chmod MODE PATH   (MODE is octal, e.g. 600 / 644 / 755)\n");
+        return false;
+    }
+    uint32_t mode = 0;
+    int digits = 0;
+    for (int i = 0; mode_s[i]; i++) {
+        if (mode_s[i] < '0' || mode_s[i] > '7') { ts_puts(ts, "chmod: MODE must be octal (0..7 per digit)\n"); return false; }
+        mode = mode * 8u + (uint32_t)(mode_s[i] - '0');
+        digits++;
+        if (digits > 4) break;
+    }
+    if (digits == 0) { ts_puts(ts, "chmod: MODE must be octal\n"); return false; }
+    if (fd64_norm_path64(path, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
+        ts_puts(ts, "chmod: bad path (multi-level /dir/sub/name)\n");
+        return false;
+    }
+    const int rc = fs64_chmod64(-1, g_pathbuf, mode);
+    if (rc == 0) {
+        ts_puts(ts, "chmod: ok mode=");
+        ts_put_u64(ts, (uint64_t)mode);
+        ts_puts(ts, " path=");
+        ts_puts(ts, g_pathbuf);
+        ts_putc(ts, (uint32_t)'\n');
+        return true;
+    }
+    if (rc == -13) ts_puts(ts, "chmod: permission denied (only the owner or root can chmod)\n");
+    else           ts_puts(ts, "chmod: failed (not found / only root or the owner / volume v2-v3 has no mode field)\n");
+    return false;
+}
+// ★ P4：chown USER[:GROUP] PATH（只有 root 能改；组缺省 = 该用户的 gid，本系统 gid = uid）
+static bool cmd_chown(TerminalState* ts, const char* owner_s, const char* path) {
+    if (!owner_s || !owner_s[0] || !path || !path[0]) {
+        ts_puts(ts, "chown: usage: chown USER[:GROUP] PATH   (only root can chown)\n");
+        return false;
+    }
+    char user[USERDB64_NAME_MAX];
+    char group[USERDB64_NAME_MAX];
+    int n = 0;
+    while (owner_s[n] && owner_s[n] != ':' && n < (int)sizeof(user) - 1) { user[n] = owner_s[n]; n++; }
+    user[n] = 0;
+    group[0] = 0;
+    if (owner_s[n] == ':') {
+        int g = 0;
+        for (int i = n + 1; owner_s[i] && g < (int)sizeof(group) - 1; i++) group[g++] = owner_s[i];
+        group[g] = 0;
+    }
+    const int idx = userdb64_find64(user);
+    if (idx < 0) { ts_puts(ts, "chown: no such user: "); ts_puts(ts, user); ts_putc(ts, (uint32_t)'\n'); return false; }
+    const User64Entry* e = userdb64_at64(idx);
+    const uint32_t uid = e ? e->uid : 0u;
+    uint32_t gid = (uid == 0) ? 0u : uid;
+    if (group[0]) {
+        const int gi = userdb64_find64(group);
+        if (gi < 0) { ts_puts(ts, "chown: no such group: "); ts_puts(ts, group); ts_putc(ts, (uint32_t)'\n'); return false; }
+        const User64Entry* ge = userdb64_at64(gi);
+        gid = (ge && ge->uid != 0) ? ge->uid : 0u;
+    }
+    if (fd64_norm_path64(path, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
+        ts_puts(ts, "chown: bad path (multi-level /dir/sub/name)\n");
+        return false;
+    }
+    const int rc = fs64_chown64(-1, g_pathbuf, uid, gid);
+    if (rc == 0) {
+        ts_puts(ts, "chown: ok uid=");
+        ts_put_u64(ts, (uint64_t)uid);
+        ts_puts(ts, " gid=");
+        ts_put_u64(ts, (uint64_t)gid);
+        ts_puts(ts, " path=");
+        ts_puts(ts, g_pathbuf);
+        ts_putc(ts, (uint32_t)'\n');
+        return true;
+    }
+    if (rc == -13) ts_puts(ts, "chown: permission denied (only root can chown)\n");
+    else           ts_puts(ts, "chown: failed (only root can chown / not found / volume v2-v3 has no uid-gid fields)\n");
+    return false;
+}
+// ★ P4：umask [掩码]（八进制；无参数 = 显示当前值）。只影响**新建**文件/目录的模式。
+// 屏幕上与串口里都按**3 位八进制**打印（0xx），与 chmod 的口径一致。
+static void ts_put_oct3(TerminalState* ts, uint32_t v) {
+    char b[4];
+    b[0] = (char)('0' + ((v >> 6) & 7u));
+    b[1] = (char)('0' + ((v >> 3) & 7u));
+    b[2] = (char)('0' + (v & 7u));
+    b[3] = 0;
+    ts_puts(ts, b);
+}
+static bool cmd_umask(TerminalState* ts, const char* arg) {
+    if (!arg || !arg[0]) {
+        ts_puts(ts, "umask: current = 0");
+        ts_put_oct3(ts, vfs64_get_umask64());
+        ts_puts(ts, " (octal; new files 666 & ~umask, new dirs 777 & ~umask)\\n");
+        dbg64_line_begin64();
+        dbg64_str("[TERM] cmd umask value=0");
+        {
+            char b[4];
+            const uint32_t v = vfs64_get_umask64();
+            b[0] = (char)('0' + ((v >> 6) & 7u));
+            b[1] = (char)('0' + ((v >> 3) & 7u));
+            b[2] = (char)('0' + (v & 7u));
+            b[3] = 0;
+            dbg64_str(b);
+        }
+        dbg64_nl();
+        dbg64_line_end64();
+        return true;
+    }
+    uint32_t m = 0;
+    for (int i = 0; arg[i]; i++) {
+        if (arg[i] < '0' || arg[i] > '7') { ts_puts(ts, "umask: MASK must be octal (0..7 per digit)\\n"); return false; }
+        m = m * 8u + (uint32_t)(arg[i] - '0');
+    }
+    const uint32_t old = vfs64_umask64(m);
+    ts_puts(ts, "umask: 0");
+    ts_put_oct3(ts, old);
+    ts_puts(ts, " -> 0");
+    ts_put_oct3(ts, vfs64_get_umask64());
+    ts_putc(ts, (uint32_t)'\n');
+    dbg64_line_begin64();
+    dbg64_str("[TERM] cmd umask set old=0");
+    {
+        char b[4];
+        b[0] = (char)('0' + ((old >> 6) & 7u));
+        b[1] = (char)('0' + ((old >> 3) & 7u));
+        b[2] = (char)('0' + (old & 7u));
+        b[3] = 0;
+        dbg64_str(b);
+    }
+    dbg64_str(" new=0");
+    {
+        char b[4];
+        const uint32_t v = vfs64_get_umask64();
+        b[0] = (char)('0' + ((v >> 6) & 7u));
+        b[1] = (char)('0' + ((v >> 3) & 7u));
+        b[2] = (char)('0' + (v & 7u));
+        b[3] = 0;
+        dbg64_str(b);
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+    return true;
+}
+
+// ★ P4：tree [路径] —— 把目录树打到串口（每行带 uid/gid/mode；验收证据 + 诊断）
+static bool cmd_tree(TerminalState* ts, const char* arg) {
+    const char* p = (arg && arg[0]) ? arg : "/";
+    if (fd64_norm_path64(p, g_pathbuf, (int)sizeof(g_pathbuf)) != 0) {
+        ts_puts(ts, "tree: bad path (multi-level /dir/sub/name)\n");
+        return false;
+    }
+    const int n = vfs64_tree_dump64(g_pathbuf, 64, 4);
+    if (n < 0) {
+        ts_puts(ts, "tree: not found / not a directory / permission denied (see serial [VFS64] lines)\n");
+        return false;
+    }
+    ts_puts(ts, "tree: entries=");
+    ts_put_u64(ts, (uint64_t)n);
+    ts_puts(ts, " (serial: [VFS64] tree <path> ... uid= gid= mode=)\n");
+    return true;
 }
 
 // cat FILE：真读（FD 层 -> vfs64 -> 磁盘）
@@ -1253,6 +1504,7 @@ static bool cmd_cat(TerminalState* ts, const char* name) {
         ts_puts(ts, "cat: cannot open ");
         ts_puts(ts, g_pathbuf);
         ts_puts(ts, " (missing / is a directory / no volume)\n");
+
         return false;
     }
     // ★ 批次 M：**先 stat 拿真实大小**，最多只读/打 CAT_MAX_OUT 字节 —— 不再"读完整个文件来数 total"
@@ -3435,14 +3687,20 @@ static void cmd_clear(TerminalState* ts) {
 //   passwd [NAME] [PW]        设/改口令（NAME 缺省 = 当前会话用户；PW 缺省 = 交互式**隐藏输入**；
 //                             PW 为空串 = 清除口令）。只存盐 + SHA-256 迭代哈希，绝不落明文
 //   users                     用户表（标出 root（登录界面里隐藏）与普通用户 + 当前 GUI / 会话身份）
-//   whoami / id               会话身份（euid）：su/sudo -i 之后是 root
-//   su [- | - root | root]    把**会话**身份切成 root（GUI 的用户名/头像不变）
+//   whoami / id               会话身份：uid/gid/euid/egid 都是真值（su/sudo 改 euid/egid）
+//   su [-] [名字]             切**会话身份**（默认 root；目标有口令且调用方非 root 时交互式输口令；
+//                             GUI 的用户名/头像不变）—— ★ P4：切换后 VFS 真的按新身份拦
 //   sudo -i                   同上（sudo 只实现了 -i）
 //   exit                      退回 GUI 用户（本来就不是 root 会话时如实提示）
+//   chmod/chown/umask/ls -l   ★ P4：改模式 / 改属主 / 掩码 / 长格式列目录（见各自 usage）
 //   loginctl lock             回锁屏（重新登录后回到桌面）
 static int  g_pw_pending = 0;                 // 1 = 下一行输入是口令（不回显）
 static char g_pw_user[USERDB64_NAME_MAX];
-
+// ★ P4：su 的口令交互（与 passwd 同一套"隐藏输入"机制：下一行不回显；空行/错口令 = 取消）
+static int  g_su_pending = 0;
+static char g_su_user[USERDB64_NAME_MAX];
+static char g_su_via[16];
+static void cmd_su_line(TerminalState* ts, const char* line);       // 定义在 cmd_su 之后
 static void cmd_passwd_line(TerminalState* ts, const char* line) {
     // 空行 = **取消**（不改口令）：避免"注入的按键丢了、只剩一个回车"时把口令误清掉。
     if (!line || !line[0]) {
@@ -3554,49 +3812,142 @@ static void cmd_whoami(TerminalState* ts) {
     dbg64_line_end64();
 }
 
+// ★ P4：id 显示**真实** uid/gid/euid/egid（终端 = 会话身份；没有附加组 —— 如实标注）
 static void cmd_id(TerminalState* ts) {
+    Vfs64Cred64 c;
+    vfs64_get_cred64(&c);
     ts_puts(ts, "uid=");
-    ts_put_u64(ts, (uint64_t)userdb64_euid64());
+    ts_put_u64(ts, (uint64_t)c.uid);
     ts_puts(ts, "(");
-    ts_puts(ts, userdb64_session_name64());
+    ts_user_name64(ts, c.uid);
     ts_puts(ts, ") gid=");
-    ts_put_u64(ts, (uint64_t)userdb64_euid64());
-    ts_puts(ts, " groups=");
-    ts_put_u64(ts, (uint64_t)userdb64_euid64());
-    ts_puts(ts, "(no permission checks yet; P4)\n");
+    ts_put_u64(ts, (uint64_t)c.gid);
+    ts_puts(ts, "(");
+    ts_user_name64(ts, c.gid);
+    ts_puts(ts, ") euid=");
+    ts_put_u64(ts, (uint64_t)c.euid);
+    ts_puts(ts, " egid=");
+    ts_put_u64(ts, (uint64_t)c.egid);
+    ts_puts(ts, " groups=(");
+    ts_user_name64(ts, c.gid);
+    ts_puts(ts, ")  [no supplementary groups]\\n");
+    dbg64_line_begin64();
+    dbg64_str("[PERM64] id uid=");
+    dbg64_dec(c.uid);
+    dbg64_str(" gid=");
+    dbg64_dec(c.gid);
+    dbg64_str(" euid=");
+    dbg64_dec(c.euid);
+    dbg64_str(" egid=");
+    dbg64_dec(c.egid);
+    dbg64_str(" user=");
+    dbg64_str(userdb64_session_name64());
+    dbg64_str(" root=");
+    dbg64_dec(userdb64_root_session64() ? 1u : 0u);
+    dbg64_nl();
+    dbg64_line_end64();
 }
 
+// ★ P4：su [-] [名字] —— 切会话身份。口令规则（Linux 的裁剪版，如实标注）：
+//   * 目标 == 当前会话用户：直接报"已经是它"（Linux 的 su self 也不问口令）；
+//   * 当前 euid == 0：直接切（root 不需要口令）；
+//   * 目标**没有口令**：直接切（与登录界面"没设密码直接登录"一致）；
+//   * 否则：交互式隐藏输入口令（下一行），错口令/空行 = 取消。
 static bool cmd_su(TerminalState* ts, const char* a1, const char* a2) {
-    const char* target = "root";                // 支持：su | su - | su - root | su root
+    const char* target = "root";                // 支持：su | su - | su - root | su root | su - A | su A
     const char* via = "su";
     if (a1 && a1[0]) {
         if (st_eq(a1, "-")) { via = "su-dash"; if (a2 && a2[0]) target = a2; }
         else { target = a1; via = "su"; }
     }
-    if (!st_eq(target, "root")) {
-        ts_puts(ts, "su: only 'root' can be switched to in this batch (P4 adds real users/setuid)\n");
+    const int ti = userdb64_find64(target);
+    if (ti < 0) {
+        ts_puts(ts, "su: no such user: ");
+        ts_puts(ts, target);
+        ts_putc(ts, (uint32_t)'\n');
         return false;
     }
-    if (userdb64_session_root64(via) != 0) {
-        ts_puts(ts, "su: FAILED (not logged in / already root / no root record)\n");
+    const int ci = userdb64_find64(userdb64_session_name64());
+    if (ci == ti) {
+        ts_puts(ts, "su: already ");
+        ts_puts(ts, target);
+        ts_puts(ts, " (session identity unchanged)\\n");
+        return true;
+    }
+    const User64Entry* te = userdb64_at64(ti);
+    const bool need_pw = (te && te->hash[0] && userdb64_euid64() != 0);
+    if (need_pw) {
+        g_su_pending = 1;
+        int i = 0;
+        for (; target[i] && i < (int)sizeof(g_su_user) - 1; i++) g_su_user[i] = target[i];
+        g_su_user[i] = 0;
+        for (i = 0; via[i] && i < (int)sizeof(g_su_via) - 1; i++) g_su_via[i] = via[i];
+        g_su_via[i] = 0;
+        ts_puts(ts, "Password: ");
+        dbg64_line_begin64();
+        dbg64_str("[TERM] cmd su password-prompt user=");
+        dbg64_str(g_su_user);
+        dbg64_nl();
+        dbg64_line_end64();
+        return true;
+    }
+    if (userdb64_su64(target, via) != 0) {
+        ts_puts(ts, "su: FAILED (not logged in / no such user)\\n");
         return false;
     }
-    ts_puts(ts, "su: session identity is now root (uid=0).\n");
-    ts_puts(ts, "    NOTE: permission bits are NOT enforced yet (P4); the GUI user/avatar is unchanged.\n");
+    ts_puts(ts, "su: session identity is now ");
+    ts_puts(ts, target);
+    ts_puts(ts, " (euid=");
+    ts_put_u64(ts, (uint64_t)userdb64_euid64());
+    ts_puts(ts, "); permission checks are ENFORCED (P4); GUI user/avatar unchanged.\\n");
     return true;
+}
+// su 的口令行（隐藏输入；空行/错口令 = 取消）
+static void cmd_su_line(TerminalState* ts, const char* line) {
+    const int ti = userdb64_find64(g_su_user);
+    const bool ok = (ti >= 0) && line && line[0] && (userdb64_check_password64(ti, line) == 1);
+    const bool cancelled = (!line || !line[0]);
+    char user[USERDB64_NAME_MAX];
+    char via[16];
+    int i = 0;
+    for (; g_su_user[i] && i < (int)sizeof(user) - 1; i++) user[i] = g_su_user[i];
+    user[i] = 0;
+    for (i = 0; g_su_via[i] && i < (int)sizeof(via) - 1; i++) via[i] = g_su_via[i];
+    via[i] = 0;
+    g_su_pending = 0;
+    g_su_user[0] = 0;
+    g_su_via[0] = 0;
+    if (!ok) {
+        dbg64_line_begin64();
+        dbg64_str(cancelled ? "[TERM] cmd su cancelled user=" : "[TERM] cmd su auth-failure user=");
+        dbg64_str(user);
+        dbg64_nl();
+        dbg64_line_end64();
+        ts_puts(ts, cancelled ? "su: cancelled (empty input)\\n" : "su: Authentication failure\\n");
+        return;
+    }
+    if (userdb64_su64(user, via[0] ? via : "su") != 0) {
+        ts_puts(ts, "su: FAILED (not logged in)\\n");
+        return;
+    }
+    ts_puts(ts, "su: ok, session identity = ");
+    ts_puts(ts, user);
+    ts_puts(ts, " (euid=");
+    ts_put_u64(ts, (uint64_t)userdb64_euid64());
+    ts_puts(ts, "); permission checks are ENFORCED (P4)\\n");
 }
 
 static bool cmd_sudo(TerminalState* ts, const char* a1) {
     if (!a1 || !st_eq(a1, "-i")) {
-        ts_puts(ts, "sudo: only 'sudo -i' is implemented in this batch (no command execution yet)\n");
+        ts_puts(ts, "sudo: only 'sudo -i' is implemented in this batch (no command execution yet)\\n");
         return false;
     }
     if (userdb64_session_root64("sudo-i") != 0) {
-        ts_puts(ts, "sudo: FAILED (not logged in / already root / no root record)\n");
+        ts_puts(ts, "sudo: FAILED (not logged in / no root record)\\n");
         return false;
     }
-    ts_puts(ts, "sudo: session identity is now root (uid=0).\n");
-    ts_puts(ts, "      NOTE: permission bits are NOT enforced yet (P4); the GUI user/avatar is unchanged.\n");
+    ts_puts(ts, "sudo: session identity is now root (uid=0); permission checks are ENFORCED (P4);\\n");
+    ts_puts(ts, "      the GUI user/avatar is unchanged.\\n");
     return true;
 }
 
@@ -3673,7 +4024,7 @@ static void shell_exec(TerminalState* ts, const char* line) {
     } else if (st_eq(g_cmd, "disp") || st_eq(g_cmd, "display")) {
         ok = cmd_display(ts, g_arg1);
     } else if (st_eq(g_cmd, "ls") || st_eq(g_cmd, "dir")) {
-        cmd_ls(ts);
+        cmd_ls(ts, g_arg1, g_arg2);                 // ★ P4：ls [-l] [路径]
     } else if (st_eq(g_cmd, "cat")) {
         ok = cmd_cat(ts, g_arg1);
     } else if (st_eq(g_cmd, "fatcheck")) {
@@ -3902,6 +4253,14 @@ static void shell_exec(TerminalState* ts, const char* line) {
         ok = cmd_su(ts, g_arg1, g_arg2);
     } else if (st_eq(g_cmd, "sudo")) {
         ok = cmd_sudo(ts, g_arg1);
+    } else if (st_eq(g_cmd, "chmod")) {                     // ★ P4：chmod MODE PATH
+        ok = cmd_chmod(ts, g_arg1, g_arg2);
+    } else if (st_eq(g_cmd, "chown") || st_eq(g_cmd, "chgrp")) {   // ★ P4：chown USER[:GROUP] PATH
+        ok = cmd_chown(ts, g_arg1, g_arg2);
+    } else if (st_eq(g_cmd, "umask")) {                     // ★ P4：umask [MASK]
+        ok = cmd_umask(ts, g_arg1);
+    } else if (st_eq(g_cmd, "tree")) {                      // ★ P4：tree [路径]（串口行带 uid/gid/mode）
+        ok = cmd_tree(ts, g_arg1);
     } else if (st_eq(g_cmd, "exit") || st_eq(g_cmd, "logout")) {
         ok = cmd_exit(ts);
     } else if (st_eq(g_cmd, "loginctl")) {
@@ -3955,8 +4314,8 @@ static void term_key(Window* w, char c) {
     }
     if (c == '\n' || c == '\r') {          // 回车执行
         ts->cmdline[ts->cmdlen] = 0;
-        ts_putc(ts, (uint32_t)'\n');
         if (g_pw_pending) cmd_passwd_line(ts, ts->cmdline);   // ★ P1c：交互式口令那一行
+        else if (g_su_pending) cmd_su_line(ts, ts->cmdline);   // ★ P4：su 的口令行（隐藏输入）
         else shell_exec(ts, ts->cmdline);
         ts->cmdlen = 0;
         shell_prompt(ts);
@@ -3969,7 +4328,7 @@ static void term_key(Window* w, char c) {
         if (ts->cmdlen < TERM_CMD_MAX - 1) {
             ts->cmdline[ts->cmdlen++] = c;
             // ★ P1c：口令输入不回显（只打 '*'）—— 明文绝不进屏/串口
-            ts_putc(ts, g_pw_pending ? (uint32_t)'*' : (uint32_t)(unsigned char)c);
+            ts_putc(ts, (g_pw_pending || g_su_pending) ? (uint32_t)'*' : (uint32_t)(unsigned char)c);
         }
     }
 }

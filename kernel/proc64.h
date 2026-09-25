@@ -159,11 +159,15 @@ int   proc64_record_sigaction64(int sig, uint64_t handler);
 int   proc64_record_sigmask64(uint64_t mask);
 int   proc64_sig_pending64(int sig);          // 记录型查询（不投递）
 int   proc64_alarm_set64(int sec);            // 只记录（无投递）；返回上一次的秒数
+// ★ P4：每进程凭证（uid/gid/euid/egid；root = 0）。fork/execve 继承；setuid/setgid/seteuid 改它。
+//   * proc64_get_cred64：0 = 已填入（当前进程）；-1 = 没有进程上下文（调用方退化为会话身份）。
+//   * proc64_set_cred64：改当前进程凭证并**立刻发布**给 VFS；-1 = 没有进程上下文（不改）。
+int   proc64_get_cred64(uint32_t* uid, uint32_t* gid, uint32_t* euid, uint32_t* egid);
+int   proc64_set_cred64(uint32_t uid, uint32_t gid, uint32_t euid, uint32_t egid);
 
 // 内嵌 /proc64.elf 的幂等安装（与 elf64_install_builtin64 同一套路；VFS 没挂载就返回 -1）
 int   proc64_install_builtin64(int drive, uint32_t part_lba);
 // 启动期多进程演示（父子打印 pid / execve / wait4 / kill）。返回 0 = 跑完（含跳过/失败，只打点）。
-
 // ==================== 每进程 fd 表（批次 D）====================
 // Proc64 上挂一张 fd64 的 FdTable64（指针，池由 fd64.cpp 管）：
 //   * proc64_create64 分配、fork 时 fd64_table_clone64 **逐槽共享**（引用计数 +1，父子共享偏移）、

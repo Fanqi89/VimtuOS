@@ -269,7 +269,9 @@ static int fd64_prepare_64(int vol, const char* path, char* norm, uint32_t flags
     const int pr = fd64_norm_path64(path, norm, (int)FD64_PATH_MAX);
     if (pr != 0) return pr;
     Fs64Stat64 st;
-    const int have = (fs64_stat64(vol, norm, &st) == 0);
+    const int st_rc = fs64_stat64(vol, norm, &st);
+    if (st_rc == -13) return -FD64_EACCES;                      // ★ P4：路径上某一级目录缺 x（进不去）
+    const int have = (st_rc == 0);
     const int want_dir = (flags & FD64_O_DIRECTORY) != 0;
     if (have) {
         if (st.type == VFS64_TYPE_DIR) {
@@ -282,10 +284,12 @@ static int fd64_prepare_64(int vol, const char* path, char* norm, uint32_t flags
         return 0;
     }
     // 不存在：只有 O_CREAT 才允许（目录句柄不允许创建）
+    // ★ P4：创建走 vfs64 的权限判定（父目录 w+x）与"属主 = 当前 euid"；越权 -> -EACCES 原样上报。
     if (want_dir) return -FD64_ENOENT;
     if (!(flags & FD64_O_CREAT)) return -FD64_ENOENT;
     const int wrc = fs64_write64(vol, norm, "", 0);           // 建空文件（write 支持 len=0）
     if (wrc == -FS64_EROFS) return -FD64_EROFS;               // 只读卷：明确拒绝（不假装建成）
+    if (wrc == -13) return -FD64_EACCES;                      // ★ P4：目录没有 w+x
     if (wrc < 0) return -FD64_ENOSPC;
     *out_dir = 0;
     return 0;
@@ -320,6 +324,32 @@ int fd64_open_on64(int vol, const char* path, uint32_t flags) {
         dbg64_nl();
         dbg64_line_end64();
         return pr;
+    }
+    // ★ P4：权限（v4 卷；v2/v3 旧卷与 FAT 在 vfs64/fs64 内部直接放行）——
+    //   文件：RDONLY 要 r、WRONLY 要 w、RDWR 要 r+w（TRUNC/APPEND 也算写）；目录句柄要 r（列目录）。
+    //   越权 -> -EACCES（vfs64 已打 [PERM64] deny 行），**不分配 fd**。
+    {
+        uint32_t need = 0;
+        if (is_dir) {
+            need = 4u;
+        } else {
+            const uint32_t am = flags & 0x3u;
+            if (am == FD64_O_RDWR)         need = 6u;
+            else if (am == FD64_O_WRONLY)  need = 2u;
+            else                           need = 4u;
+            if (flags & (FD64_O_TRUNC | FD64_O_APPEND)) need |= 2u;
+        }
+        const int ac = fs64_access64(vol, norm, need);
+        if (ac == -13) {
+            dbg64_line_begin64();
+            dbg64_str("[FD64] open FAILED path=");
+            dbg64_str(norm);
+            dbg64_str(" rc=13 (EACCES: permission denied) need=");
+            dbg64_dec(need);
+            dbg64_nl();
+            dbg64_line_end64();
+            return -FD64_EACCES;
+        }
     }
 
     FdTable64* t = fd64_current_table64();
@@ -365,6 +395,21 @@ int fd64_open_on64(int vol, const char* path, uint32_t flags) {
 // 默认入口：绑定"当前卷"（终端/ring3 的普通打开都走这里；批次 K 起 = fs64 的统一当前卷）
 int fd64_open64(const char* path, uint32_t flags) {
     return fd64_open_on64(fs64_current_vol64(), path, flags);
+}
+
+// ★ P4：fd -> (统一卷号, 规范化路径)。fchmod/fchown 用（内核按路径改；fd 只是"我指的是谁"的把手）。
+// 语义：任何已打开的 fd（文件/目录）都行；pipe 没有路径 -> -FD64_EINVAL。
+int fd64_where64(int fd, int* out_vol, char* path_out, int cap) {
+    FdTable64* t = fd64_current_table64();
+    OpenFile64* of = fd64_slot_obj64(t, fd);
+    if (!of) return -FD64_EBADF;
+    if (of->kind == FD64_KIND_PIPE_R || of->kind == FD64_KIND_PIPE_W) return -FD64_EINVAL;
+    if (!path_out || cap <= 0) return -FD64_EINVAL;
+    int i = 0;
+    for (; of->path[i] && i < cap - 1; i++) path_out[i] = of->path[i];
+    path_out[i] = 0;
+    if (out_vol) *out_vol = of->vol;
+    return 0;
 }
 
 int fd64_close64(int fd) {
@@ -514,8 +559,10 @@ int fd64_read64(int fd, void* buf, int len) {
     // ★ 批次 M：直接把 [off, off+want) 读进**调用方的缓冲**（fs64/vfs64 内部按块分包，
     //   支持二级间接块的大文件；内核不再需要一块整文件缓冲）。
     uint32_t got = 0;
-    if (fs64_read_range64(of->vol, of->path, of->off, buf, want, &got) != 0) {
+    const int rr = fs64_read_range64(of->vol, of->path, of->off, buf, want, &got);
+    if (rr != 0) {
         dbg64_irq_restore64(if_save);
+        if (rr == -13) return -FD64_EACCES;                    // ★ P4：读权限不足（vfs64 已打点）
         return -FD64_ENOENT;
     }
     if (got > want) got = want;                       // 防御：分派层不该超量
@@ -533,7 +580,7 @@ int fd64_read64(int fd, void* buf, int len) {
     dbg64_line_end64();
     return (int)got;
 }
-
+// ★ P4：写路径 —— 权限判定在 vfs64（已有文件 w / 新建父目录 w+x）；越权 -> -EACCES 原样上报。
 int fd64_write64(int fd, const void* buf, int len) {
     FdTable64* t = fd64_current_table64();
     OpenFile64* of = fd64_slot_obj64(t, fd);
@@ -558,6 +605,7 @@ int fd64_write64(int fd, const void* buf, int len) {
     if (wn != 0) {
         dbg64_irq_restore64(if_save);
         if (wn == -FS64_EROFS) return -FD64_EROFS;              // 只读卷（防御：打开时已拦）
+        if (wn == -13) return -FD64_EACCES;                     // ★ P4：写权限不足（vfs64 已打点）
         // vfs64 的失败码只有 -1（超上限 / 空间不足 / 写盘失败）：超上限在**上面**已经拦掉（-EFBIG），
         // 走到这里就是空间不足或写盘失败 —— 如实报 -ENOSPC（不假装写成功）。
         return -FD64_ENOSPC;

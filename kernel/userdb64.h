@@ -19,12 +19,16 @@
 //   * theme/wall/lock_mode 的 -1（或空串）= 继承全局配置；flags：1=root、2=隐藏、4=系统
 //   * 每次改动（useradd / passwd / userdel / 登录记录）立即整体重写该文件（vfs64 的写是"先数据后 inode"）
 //
-// ==================== 会话身份（P4 之前不拦截，只如实反映）====================
+// ==================== 会话身份（★ P4 起：**权限位真的拦截**）====================
 //   GUI 身份（登录界面的用户名/头像）与**会话身份**（euid）是两份：
 //     * userdb64_login64()  设置 GUI 身份 = 该用户，会话身份也 = 该用户
-//     * `su - root` / `su -` / `sudo -i` 只改**会话身份**（euid=0），GUI 的用户名/头像**不变**
+//     * `su - root` / `sudo -i` / `su - <user>` 只改**会话身份**（GUI 的用户名/头像**不变**）
 //     * `exit` 退回 GUI 用户
 //     * 会话身份只在内存里：软重启/断电后回到"开机锁屏、只有普通用户"
+//   ★ P4：每次身份变化都调 vfs64_set_cred64(uid, gid, euid, egid)（普通用户 gid = uid，root = 0）
+//     并打一行 `[PERM64] cred uid=.. gid=.. euid=.. egid=.. user=.. via=login|su|exit`；
+//     VFS 层按这份凭证做 Linux 三段判定（见 kernel/vfs64.h 的"★ P4 权限"）。
+//   ★ 每个用户的主目录/桌面由本模块建成 **属主=该用户、mode=0700**（root 的 /root 也是 0700）。
 //
 // 串口打点（自动验收 grep；每类都有**上限**防刷屏，见 .cpp 的 log_budget）：
 //   ★ 注意：[USER64] 这个前缀**早已被 ring3 那一批占用**（[USER64] map/enter/selftest/slotreuse…，
@@ -115,8 +119,11 @@ const User64Entry* userdb64_gui_user64();             // GUI 身份（su 不改�
 const User64Entry* userdb64_session_user64();         // 会话身份（su/sudo/exit 改）
 int  userdb64_euid64();                               // 会话 euid；未登录 -1
 const char* userdb64_session_name64();                // 会话用户名；未登录 "-"
+// 切成指定用户（su/sudo 用；GUI 身份不变）。成功 0；-1 = 未登录/没有该用户。
+// 语义：root 可切任何人；普通用户也可切（口令校验在终端层：目标有口令时先输对）。
+int  userdb64_su64(const char* name, const char* via);
 int  userdb64_root_session64();                       // 1 = 当前会话身份是 root
-// 切成 root（via = "su-dash" / "su-root" / "sudo-i"）；返回 0 = 成功
+// 切成 root（via = "su-dash" / "su-root" / "sudo-i"）；返回 0 = 成功（= userdb64_su64("root", via)）
 int  userdb64_session_root64(const char* via);
 // 退回 GUI 用户（exit）；返回 0 = 有 root 会话可退，1 = 本来就不是 root（调用方如实提示）
 int  userdb64_session_exit64();

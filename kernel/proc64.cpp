@@ -51,6 +51,10 @@ static const int64_t P64_EFAULT  = 14;
 static const int64_t P64_EINVAL  = 22;
 static const int64_t P64_ENOSYS  = 38;
 
+// 这三个 errno 目前没有调用点，但它们是**对外承诺的错误码表**的一部分（与 syscall64 同口径）；
+// static_assert 钉住取值，同时消掉 -Wextra 的"未被引用"告警（本文件要求零告警）。
+static_assert(P64_EPERM == 1 && P64_EINTR == 4 && P64_EFAULT == 14, "P64_* 错误码表（= -errno）");
+
 // ---- 规模常量 ----
 static const uint32_t PROC64_FORK_MAX_PAGES    = 256;   // fork 整页复制的页数上限（≈1MiB）
 static const int      PROC64_WAIT_TIMEOUT_SEC  = 5;     // wait4 有界等待（防挂死）
@@ -81,11 +85,13 @@ struct Proc64 {
     uint64_t entry;             // 最近一次装载的入口（readlink /proc/self/exe 相关日志用）
     uint64_t sighand[PROC64_SIG_MAX];   // rt_sigaction 记录（只记录不投递）
     FdTable64* fdtab;                   // ★ 批次 D：每进程 fd 表（fd64.h；池由 fd64.cpp 管）
+    // ★ P4：每进程凭证（uid/gid/euid/egid；root = 0）。fork/execve 继承，setuid/setgid/seteuid 改它；
+    //   任务被调度时由 task64_cred_hook64 -> vfs64_set_proc_cred64 发布给 VFS（切回任务 0 恢复会话身份）。
+    uint32_t uid, gid, euid, egid;
     uint32_t sigmask_lo, sigmask_hi;    // rt_sigprocmask 记录
     char     name[PROC64_NAME_MAX];
     char     exe[PROC64_PATH_MAX];
 };
-
 static Proc64   g_procs[PROC64_MAX];
 static int      g_proc_count   = 0;
 static int32_t  g_next_pid64   = 1;
@@ -97,6 +103,7 @@ static Proc64* p64_current64();
 extern "C" FdTable64* proc64_fdtab_of_current64();
 // 引导期状态（proc64_init64 探测一次）
 static uint64_t g_boot_cr364   = 0;      // 内核地址空间（引导期页表根）
+static void p64_publish_cred64(Proc64* p);           // ★ P4：凭证发布（定义在 create 之后）
 static int      g_isolate64    = 0;      // 1 = 每进程 CR3 生效；0 = 共享地址空间模式
 static bool     g_init_done64  = false;
 static bool     g_shared_warn64 = false; // "共享模式"的说明只打一次
@@ -209,6 +216,7 @@ void proc64_switch_to64(int pid) {
     if (!p) return;
     if (p->cr3) task64_load_cr364(p->cr3);
     task64_load_fs_base64(p->fs_base);
+    p64_publish_cred64(p);                           // ★ P4：显式切地址空间时也把凭证带上
 }
 // "当前 CPU 的 CR3 是不是就是这个进程的"：决定释放地址空间前要不要切回内核地址空间。
 // ★ 绝不能无条件切：fork 失败回滚时当前任务是**父进程**（它自己的地址空间正在用），
@@ -421,6 +429,11 @@ int proc64_create64(const char* name, int ppid) {
     p->fs_base = 0;
     p64_strcpy_n(p->name, name ? name : "proc", PROC64_NAME_MAX);
     p64_strcpy_n(p->exe, "?", PROC64_PATH_MAX);
+    {   // ★ P4：新进程**继承当前凭证**（内核启动期 = root；fork = 父进程；终端 run = 终端会话身份）
+        Vfs64Cred64 cr;
+        vfs64_get_cred64(&cr);
+        p->uid = cr.uid; p->gid = cr.gid; p->euid = cr.euid; p->egid = cr.egid;
+    }
     g_proc_count++;
 
     dbg64_line_begin64();
@@ -432,9 +445,47 @@ int proc64_create64(const char* name, int ppid) {
     dbg64_hex64(p->cr3);
     dbg64_str(" ppid=");
     dbg64_dec((uint64_t)(p->ppid < 0 ? 0 : p->ppid));
+    dbg64_str(" uid=");
+    dbg64_dec(p->euid);
     dbg64_nl();
     dbg64_line_end64();
     return (int)p->pid;
+}
+
+// ==================== ★ P4：每进程凭证（uid/gid/euid/egid）+ 发布给 VFS ====================
+// 发布点有两个：
+//   * 任务被调度时（task64 的 task_apply_ctx64 -> task64_cred_hook64，见下）；
+//   * 显式切地址空间（proc64_switch_to64）。
+// have = 0（proc == nullptr，任务 0/内核线程）-> vfs64 恢复**会话身份**（userdb64 设的那份）。
+static void p64_publish_cred64(Proc64* p) {
+    if (p) vfs64_set_proc_cred64(1, p->uid, p->gid, p->euid, p->egid);
+    else   vfs64_set_proc_cred64(0, 0, 0, 0, 0);
+}
+// task64.cpp 的弱引用目标：每次任务切换都会调用（安装介质内核不链本文件 -> 该符号缺失，弱引用为 0）
+extern "C" void task64_cred_hook64(void* proc) {
+    Proc64* p = (Proc64*)proc;
+    if (p && (p < &g_procs[0] || p >= &g_procs[PROC64_MAX])) p = nullptr;   // 防御：不是我们的表
+    if (p && p->state == PROC64_FREE) p = nullptr;
+    p64_publish_cred64(p);
+}
+// 系统调用侧用：取当前进程凭证（返回 -1 = 没有进程上下文，调用方退化为"会话身份"）
+int proc64_get_cred64(uint32_t* uid, uint32_t* gid, uint32_t* euid, uint32_t* egid) {
+    Proc64* p = p64_current64();
+    if (!p) return -1;
+    if (uid) *uid = p->uid;
+    if (gid) *gid = p->gid;
+    if (euid) *euid = p->euid;
+    if (egid) *egid = p->egid;
+    return 0;
+}
+// 系统调用侧用：改当前进程凭证（setuid/setgid/seteuid/setegid 的落点）；
+//   改完**立刻发布**给 VFS（本进程之后即使不切换任务也按新身份判定）。
+int proc64_set_cred64(uint32_t uid, uint32_t gid, uint32_t euid, uint32_t egid) {
+    Proc64* p = p64_current64();
+    if (!p) return -1;
+    p->uid = uid; p->gid = gid; p->euid = euid; p->egid = egid;
+    p64_publish_cred64(p);
+    return 0;
 }
 
 // 释放进程槽（地址空间在 p64_exit64 里已经还了）。调用方保证它的任务已经不会再跑。

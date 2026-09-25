@@ -1,5 +1,5 @@
 // vfs64.h - VimtuFS2：Vimtu64 的极简但**真实**的磁盘文件系统
-//           （v3 = 真正的目录树：多级路径 + inode 时间戳 + 类型判定）
+//           （v4 = 目录树 + 二级间接块 + **uid/gid/mode 权限位**；v3/v2 旧卷仍可挂载）
 //
 // 为什么自研格式而不是 FAT16/32：
 //   本阶段需求是"格式化 / 挂载 / 建多级目录 / 建文件 / 写 / 读 / 删 / 遍历 + 元数据自校验"，
@@ -14,20 +14,20 @@
 //   其中 bmn = ceil(总块数/4096)、ibn = ceil(inode 数/每块 inode 数)、bp = 1+bmn、dp = bp+ibn；
 //   这些数字都写在超级块里，挂载时**逐项重算校验**（不信任盘上数字，见 sb_verify）。
 //
-// ==================== 卷版本（**唯一定义点就是本节 + vfs64.cpp 的 LAY_V2/LAY_V3**）====================
+// ==================== 卷版本（**唯一定义点就是本节 + vfs64.cpp 的 LAY_V2/LAY_V3/LAY_V4**）====================
 //   版本字段：超级块偏移 8（u32）；inode 记录大小：超级块偏移 44（u32）。
-//   * **v3（当前，vfs64_format 产出）= 本文档描述的格式**：
-//       超级块：块 0，偏移见 vfs64.cpp 的 VFS_O_*（CRC32 覆盖 [0,60)，签名 0xAA55）
-//       inode ：**128 B/个**（每块 4 个），布局见下
-//       名字上限 31 B（足够喂满旧调用方的 [32] 缓冲）、inode 上限 512
-//       单文件上限 **8 MiB（8388608 B）**：4 直接块 + 1 一级间接块（128 块）+ 1 **二级间接块**（128×128 块）
-//       目录树：**多级路径**，目录 = "parent 字段相同的 inode 列表"（见"目录表示"）
-//   * **v2（旧卷，仍能挂载）**：超级块布局相同（版本=2、inode=64 B/个、8 个/块、
-//       名字上限 27 B、**没有 mtime/kind/nlink 字段**）。挂载后按"单层语义"工作
-//       （v2 卷里所有条目的 parent 都是 0，所以多级路径照样能解析，只是建不出子目录树）。
-//       不拒绝 v2：现有已安装的系统盘就是 v2（回归测试依赖它）；新格式化一律产出 v3。
+//   * **v4（当前，vfs64_format 产出）= 本文档描述的格式 + 权限字段**：
+//       超级块：块 0，偏移见 vfs64.cpp 的 VFS_O_*（CRC32 覆盖 [0,60)，签名 0xAA55）**与 v3 逐字节相同**
+//       inode ：**128 B/个**（每块 4 个），布局见下（v3 的保留区首 6 字节变成 uid/gid/mode）
+//       名字上限 31 B；inode 上限 512；单文件上限 8 MiB（二级间接块）；目录树多级路径
+//   * **v3（旧卷，仍能挂载读写）**：超级块/几何/inode 大小全同 v4；**没有 uid/gid/mode 字段**
+//       （偏移 75..123 是"必须为 0"的保留区）→ 读作 属主 root(0/0)、模式按类型默认
+//       （目录 0755、文件 0644）；**权限拦截对 v3/v2 旧卷如实关闭**（没有字段就无法表达属主，
+//       见 .cpp 的 [PERM64] legacy 打点）——不编造一个属主然后拦住用户。
+//   * **v2（旧卷，仍能挂载）**：版本=2、inode=64 B/个、8 个/块、名字上限 27 B、
+//       没有 mtime/kind/nlink 字段，按"单层语义"工作；同样没有权限字段。
 //
-// ---- v3 inode（128 B，全部小端；偏移为**唯一权威定义**，vfs64.cpp 有 static_assert）----
+// ---- v4 inode（128 B，全部小端；偏移为**唯一权威定义**，vfs64.cpp 有 static_assert）----
 //   0   u8  type      0 = 空槽 / 1 = 普通文件 / 2 = 目录
 //   1   u8  namelen   名字字节数 0..31（0 只用于根目录）
 //   2   u16 rsvd      必须为 0
@@ -43,38 +43,38 @@
 //   38  u8  kind      类型判定缓存（VFS64_KIND_*，写文件时按内容算好，供 UI 直接用）
 //   39  u8  rsvd2     必须为 0
 //   40  31B name      名字（ASCII 可打印，NUL 不写盘，长度看 namelen）
-//   40  31B name      名字（ASCII 可打印，NUL 不写盘，长度看 namelen）
 //   71  u32 dind      **二级间接块**（128 个"一级间接块"号，每个再指 128 个数据块 -> 16384 块）
 //                     0 = 没有（<= 67584 B 的文件 / 批次 M 之前写的 v3 卷 / v2 卷没有这个字段）
-//   75  ..  123       保留区，必须全 0
+//   ---- ★ P4（v4 新增；v3 卷这 6 字节必须是 0）----
+//   75  u16 uid       属主用户 ID（0 = root）
+//   77  u16 gid       属主组 ID（0 = root；本系统"每组一个用户"：普通用户 gid = uid）
+//   79  u16 mode      **Linux 风格模式**：类型位 + 权限位（S_IFDIR|0755 / S_IFREG|0644）；
+//                     权限位只有 0777（不实现 setuid/setgid/sticky —— 如实标注）
+//   81  ..  123       保留区，必须全 0
 //   124 u32 crc32     inode CRC32（覆盖 [0,124)）
 //   **mtime 打包编码**：(年-2000)<<26 | 月<<22 | 日<<17 | 时<<12 | 分<<6 | 秒
 //     （6+4+5+5+6+6 = 32 位；年 2000..2063、月 1..12、日 1..31、时 0..23、分/秒 0..59；
 //      与 kernel/x86_64.cpp 的 rtc_get_date64（月 1..12、年已加 2000）口径一致）
 //
+// ---- v3 -> v4 的映射（读旧卷时唯一要做的事）----
+//   旧 v3 inode 的 [75,124) 全 0（旧内核的 rsvd3 检查）→ v4 内核按布局读：
+//     uid = 0（root）、gid = 0（root）、mode = S_IFDIR|0755（目录）/ S_IFREG|0644（文件）。
+//   反过来：v4 卷上新写的 inode 在**旧 v3 内核**眼里保留区非 0 -> 那一个 inode 会被拒（单向升级，
+//   与"批次 M 的 dind"同一口径，如实标注）。
 
-// ==================== ★ 批次 M：v3 **语义扩展** —— 二级间接块（唯一改动点）====================
-// 改了什么（一页纸）：
-//   * v3 inode 的保留区首 4 字节（偏移 **71**）从"必须为 0"变成 u32 **`dind`（二级间接块）**；
-//     保留区缩到 [75,124)。inode 仍是 128 B、每块仍是 4 个、inode 区几何、CRC 覆盖区间 [0,124)、
-//     名字上限 31 B、inode 总数上限 512 —— **超级块、位图、几何计算、CRC 规则全都没变**。
-//   * 块链层级（"唯一权威定义"= 下面这张表 + vfs64.cpp 的 VFS_I_*/VFS64_MAX_* 常量）：
-//       fs 块 0..3          : inode 的 d0..d3（4 块 = 2048 B）
-//       fs 块 4..131        : inode->ind 指向的一级间接块里的 128 个块号（64 KiB）
-//       fs 块 132..16515    : inode->dind 指向的二级间接块里的 128 个"子块号"，每个子块 128 个块号
-//                             （128×128 = 16384 块 = 8 MiB）
-//       合计映射能力 16516 块 = 8456192 B；**对外上限取整到 16384 块 = 8388608 B（8 MiB）**。
-//   * **卷版本号不变（仍是 3）**，理由与兼容矩阵：
-//       - 老 v3 卷（批次 M 之前写的）该字段恒为 0（保留区必须为 0）→ 新内核读作"没有二级间接"，
-//         完全兼容：能挂载、能读、能写；而且**新内核可以在老 v3 卷上继续写 8 MiB 的大文件**
-//         （那 4 个字节本来就是空的）。
-//       - 老内核（批次 M 之前）读"含二级间接的新文件"会因保留区非 0 而拒绝**那一个 inode**
-//         （reason=rsvd3，其余文件照常）—— 这是格式扩展的**单向升级**，如实写清、不假装双向兼容。
-//       - 不改版本号的好处：同一个"v3"在两种内核下都表示"同一套超级块/inode 几何"，
-//         差异只有"这个文件用了几级间接块"，用版本号区分反而会让人误以为几何不同。
-//   * v2 卷：inode 只有 64 B、**没有 dind 字段**（32..59 是名字、60 是 CRC）→ v2 卷上限仍是 67584 B，
-//     超过一律 -1 + 打点（vfs64_max_file_bytes64() 会按当前卷的布局给出真实上限）。
-//   * 新增/变更的 API 都在"§ 大文件读写"一节，旧 API 语义不变（vfs64_write64 仍是"整体重写"）。
+// ==================== ★ 批次 M：二级间接块 / ★ P4：权限字段（都是"保留区再利用"）====================
+// 批次 M：v3 inode 的保留区首 4 字节（偏移 **71**）从"必须为 0"变成 u32 **`dind`（二级间接块）**；
+//   块链层级（"唯一权威定义"= 下面这张表 + vfs64.cpp 的 VFS_I_*/VFS64_MAX_* 常量）：
+//      fs 块 0..3          : inode 的 d0..d3（4 块 = 2048 B）
+//      fs 块 4..131        : inode->ind 指向的一级间接块里的 128 个块号（64 KiB）
+//      fs 块 132..16515    : inode->dind 指向的二级间接块里的 128 个"子块号"，每个子块 128 个块号
+//                            （128×128 = 16384 块 = 8 MiB）
+//   合计映射能力 16516 块 = 8456192 B；**对外上限取整到 16384 块 = 8388608 B（8 MiB）**。
+// P4（本批）：保留区**再取 6 字节**（偏移 75/77/79 = uid/gid/mode），保留区缩到 [81,124)。
+//   inode 仍是 128 B、每块仍是 4 个、inode 区几何、CRC 覆盖区间 [0,124)、名字上限 31 B、
+//   inode 总数上限 512 —— 超级块、位图、几何计算、CRC 规则**全都没变**，只有版本号从 3 升到 4
+//   （v3 卷没有这 6 字节，读出来是"默认属主 root + 默认模式"，权限拦截对旧卷关闭）。
+// v2 卷：inode 只有 64 B、**没有 dind / uid / gid / mode 字段**（32..59 是名字、60 是 CRC）→ 上限仍 67584 B。
 // ---- 目录表示（取舍写清）----
 //   名字**放在 inode 里**（不另设目录项结构、目录没有数据块）："目录" = 父 inode 号等于它的
 //   那批 inode 的集合。取舍：
@@ -99,11 +99,12 @@
 //       直接块 4（2 KiB）+ 一级间接块 1×128 块（64 KiB，覆盖到 67584 B）
 //       + 二级间接块 1×128×128 块（8 MiB 映射能力）→ 合计映射能力 16516 块 = 8456192 B；
 //       上限**刻意取整到 16384 块（正好 8 MiB）**，留 132 块映射余量（见 .cpp 的 vfs64_blocks_for_bytes64）。
-//     **只有 v3 卷有二级间接块**：v2 卷的 inode 只有 64 B（没有该字段）→ v2 卷单文件上限仍是 **67584 B**。
+//     **只有 v3/v4 卷有二级间接块与权限字段**；v2 卷的 inode 只有 64 B → 单文件上限仍是 67584 B。
 //     空间语义：**没有稀疏文件**（size 以内的每个 fs 块必须有映射块；read 碰到未映射块 = 损坏 -> -1 打点）。
 //     写空洞由上层（fd64 的"seek 过末尾再写"）**补零**，FS 层只负责把块写满。
-//   * 名字上限 31 B（v3）/ 27 B（v2）；inode 总数上限 512；目录深度上限 16 层；
-//     无权限/属主、无硬链接、无符号链接、无日志/崩溃一致性（只有"先数据后 inode"的提交顺序）。
+//   * 名字上限 31 B（v3/v4）/ 27 B（v2）；inode 总数上限 512；目录深度上限 16 层；
+//     无 ACL/xattr、无硬链接/符号链接（因此**没有符号链接的权限跟随**）、无日志/崩溃一致性
+//     （只有"先数据后 inode"的提交顺序）。权限模型见"★ P4 权限"一节。
 //   * 删除：文件可以删（vfs64_unlink64）；**空目录**可以删（vfs64_rmdir64）；非空目录必须自己先清空。
 //   * 兼容 API vfs64_ls 的名字缓冲是 [32]，实现里把超过 31 B 的名字截断（v3 上限就是 31，所以
 //     实际不会截断）；新代码请用 vfs64_list64 / opendir+readdir（报告完整名字 + 类型 + 时间）。
@@ -112,27 +113,46 @@
 //   * **空间查询**（批次 J）：vfs64_free64 给数据区空闲块/字节数（写前估用；位图读失败如实返回 -1）。
 //
 // ---- 使用顺序 ----
-//   vfs64_format(drive, start_lba, sectors)   // 建 v3 卷（成功后新卷即处于已挂载状态）
-//   vfs64_mount(drive, start_lba)             // 或者挂载已有卷（v2/v3 都认）
+//   vfs64_format(drive, start_lba, sectors)   // 建 v4 卷（成功后新卷即处于已挂载状态）
+//   vfs64_mount(drive, start_lba)             // 或者挂载已有卷（v2/v3/v4 都认）
 //   vfs64_list64 / read64 / write64 / mkdir64 / unlink64 / rmdir64 / stat64 / create64
+//   vfs64_chmod64 / vfs64_chown64             // ★ P4：改模式/属主（Linux 语义的裁剪版）
 //   vfs64_opendir64 / readdir64 / closedir64  // 游标式遍历（适合长列表，不一次读爆缓冲）
 //   vfs64_tree_dump64("/", 32, 4)             // 串口打目录树（验收 grep；有界）
 //   vfs64_dump64()                            // 串口打当前状态
 //   vfs64_selftest64()                        // 64 扇区假盘自检 + 真盘只读探测
+//
+// ==================== ★ P4：权限（Linux 语义的裁剪版）====================
+// 调用方身份 = 一份**凭证**（credentials）：uid/gid/euid/egid。
+//   * 终端/桌面（内核任务 0）用**会话身份**：userdb64 在 login/su/sudo -i/exit 时调
+//     vfs64_set_cred64()（见 kernel/userdb64.cpp）；启动早期/系统组件 = root（默认值 0/0/0/0）。
+//   * ring3 进程（proc64）**每进程一份**：proc64 记录 uid/gid/euid/egid，fork/execve 继承，
+//     任务被调度时由 proc64 的钩子把当前凭证发布给 VFS（vfs64_set_proc_cred64）；
+//     切回内核线程（任务 0）时自动恢复会话身份。setuid/setgid/seteuid 系统调用改的就是这份。
+// 判定规则（三段：owner / group / other；**没有附加组**，group 只比 gid 与 egid）：
+//   读文件/列目录 需要 `r`；写/改 需要 `w`；进目录/遍历路径 需要 `x`（每一级都要）；
+//   目录里建/删/改名 需要该目录 `w+x`（Linux 语义）。
+//   **root（euid == 0）绕过所有 DAC 检查**（Linux 的 CAP_DAC_OVERRIDE 口径：root 连 x 都不要；
+//   本实现取"完全绕过"这一档，且**只在 v4 卷上做检查** —— v2/v3 旧卷没有字段，见上）。
+//   违反时返回 **-EACCES(-13)** 并打点（有上限）：
+//     [PERM64] deny op=<op> path=<p> uid=<euid> mode=<4 位八进制> need=<r|w|x 组合>
+//   chmod：root 或属主；chown：**仅 root**（属主/组也不许改，如实标注）。
+//   umask：新建文件的模式 = (目录 0777 / 文件 0666) & ~umask（默认 022）。
 #pragma once
 #include <stdint.h>
 
 // ---- 卷头/几何常量（与 vfs64.cpp 的偏移注释一一对应）----
 #define VFS64_MAGIC            "VIMTUFS2"   // 8B；老占位超级块是 "VIMTUFS1"，故意区分
-#define VFS64_VERSION          3u           // 新格式化产出
+#define VFS64_VERSION          4u           // 新格式化产出（v4 = 权限字段）
+#define VFS64_VERSION_V3       3u           // 旧卷（批次 M 的 v3：有 dind、无权限字段；仍可挂载）
 #define VFS64_VERSION_V2       2u           // 旧卷（仍可挂载）
 #define VFS64_SECTOR_BYTES     512u
 #define VFS64_BLOCK_BYTES      512u         // 1 块 = 1 扇区（不做块缓存，够简单）
-#define VFS64_INODE_BYTES      128u         // v3 inode 记录大小
+#define VFS64_INODE_BYTES      128u         // v3/v4 inode 记录大小
 #define VFS64_INODES_PER_BLK   4u           // 512 / 128
 #define VFS64_INODE_BYTES_V2   64u          // v2 inode 记录大小
 #define VFS64_INODES_PER_BLK_V2 8u          // 512 / 64
-#define VFS64_NAME_MAX         31u          // v3 名字上限（[32] 兼容缓冲够用）
+#define VFS64_NAME_MAX         31u          // v3/v4 名字上限（[32] 兼容缓冲够用）
 #define VFS64_NAME_MAX_V2      27u          // v2 名字上限
 #define VFS64_DIRECT_BLOCKS    4u           // 直接块（2 KiB）
 #define VFS64_INDIRECT_PTRS    128u         // 一级间接块 = 512B / 4B = 128 个数据块号
@@ -144,14 +164,71 @@
 #define VFS64_MAX_FILE_BYTES   (VFS64_MAX_FILE_BLOCKS * VFS64_BLOCK_BYTES)   // 8388608
 #define VFS64_MAX_FILE_BYTES_V2 67584u      // v2 卷（inode 没有 dind 字段）的上限：4 + 128 块
 #define VFS64_READ_CHUNK_BYTES 4096u        // ★ 推荐分块大小（上层一次读/写这么多；见 fd64/explorer）
-#define VFS64_MAX_INODES       512u         // inode 总数上限（v3 格式化上限；v2 卷历史上最多 256）
+#define VFS64_MAX_INODES       512u         // inode 总数上限（v3/v4 格式化上限；v2 卷历史上最多 256）
 #define VFS64_BITMAP_BLK_BITS  4096u        // 512B * 8
 #define VFS64_MIN_BLOCKS       32u          // 格式化下限（16KB 分区）
 #define VFS64_PATH_MAX         128u         // 整条路径字节上限
 #define VFS64_PATH_DEPTH_MAX   16u          // 路径段数上限
 #define VFS64_LS_NAME_BUF      32u          // 兼容 API vfs64_ls 的名字缓冲（旧调用方写死 32）
 #define VFS64_DIRSTREAM_MAX    8u           // 同时打开的目录游标数
+// 当前卷是否有权限字段（v4 = 1）。旧卷（v2/v3）没有字段 -> chmod/chown 无意义（属主显示 root、模式默认）。
+int vfs64_perm_fields64();
 #define VFS64_SLOT_MAX         4u           // ★ 多卷：卷槽数（0 = 系统卷，另外最多 3 个数据卷 -> D:/E:/F:）
+
+// ---- ★ P4：inode 权限字段偏移（唯一权威定义；vfs64.cpp 有 static_assert 钉住）----
+#define VFS64_INO_UID_OFF      75u          // u16 属主 uid（v4 才有；v3 该处必须为 0）
+#define VFS64_INO_GID_OFF      77u          // u16 属主 gid
+#define VFS64_INO_MODE_OFF     79u          // u16 类型位 + 权限位（S_IF*|0777）
+#define VFS64_INO_RSVD4_OFF    81u          // v4 保留区起点 [81,124)
+
+// ---- mode 的位（Linux 风格的裁剪：只有类型位 + 0777；不实现 setuid/setgid/sticky）----
+#define VFS64_S_IFMT           0170000u     // 类型掩码
+#define VFS64_S_IFREG          0100000u     // 普通文件
+#define VFS64_S_IFDIR          0040000u     // 目录
+#define VFS64_S_IRWXU          0000700u
+#define VFS64_S_IRWXG          0000070u
+#define VFS64_S_IRWXO          0000007u
+#define VFS64_S_IRWX           0000777u
+#define VFS64_S_IRUSR          0000400u
+#define VFS64_S_IWUSR          0000200u
+#define VFS64_S_IXUSR          0000100u
+#define VFS64_DEF_DIR_MODE     (VFS64_S_IFDIR | 0755u)   // 新建目录默认模式（再 & ~umask）
+#define VFS64_DEF_FILE_MODE    (VFS64_S_IFREG | 0644u)   // 新建文件默认模式（再 & ~umask）
+#define VFS64_LEGACY_DIR_MODE  (VFS64_S_IFDIR | 0755u)   // v2/v3 旧卷"读出来的默认模式"
+#define VFS64_LEGACY_FILE_MODE (VFS64_S_IFREG | 0644u)
+#define VFS64_UMASK_DEFAULT    022u
+#define VFS64_EACCES           13            // -EACCES：权限不足（VFS 层的"权限错"）
+#define VFS64_EPERM            1             // -EPERM：chown 等"只有 root 能做"的操作
+
+// 一次调用期间"调用方身份"（不落盘；只影响 DAC 判定）
+struct Vfs64Cred64 {
+    uint32_t uid, gid, euid, egid;
+};
+
+// 设置/读取**会话身份**（userdb64 的 login/su/exit 调；同时立即成为当前生效凭证）。
+void vfs64_set_cred64(uint32_t uid, uint32_t gid, uint32_t euid, uint32_t egid);
+void vfs64_get_cred64(Vfs64Cred64* out);
+// 进程身份发布（proc64 的任务切换钩子调）：have = 0 -> 恢复会话身份（内核任务 0）。
+void vfs64_set_proc_cred64(int have, uint32_t uid, uint32_t gid, uint32_t euid, uint32_t egid);
+// umask：返回旧值（new_mask & 0777）。本系统 umask 是**全局一份**（会话/进程退出不重置，如实标注）。
+uint32_t vfs64_umask64(uint32_t new_mask);
+uint32_t vfs64_get_umask64();
+
+// access(2) 的最小实现：mask 用 Linux 低 3 位（4=r / 2=w / 1=x，0 只查存在）。
+// 返回 0 = 允许；-EACCES = 权限不足；-1 = 路径不存在/非法/未挂载。
+int vfs64_access64(const char* path, uint32_t mask);
+
+// chmod / chown（Linux 语义的裁剪版：mode 只取类型位 + 0777；chown 只有 root 能做）。
+// 返回 0 = 成功；-VFS64_EACCES(-13) = 非属主且非 root；-1 = 只有 root 能做/不存在/旧卷无字段。
+int vfs64_chmod64(const char* path, uint32_t mode);
+int vfs64_chown64(const char* path, uint32_t uid, uint32_t gid);   // uid/gid 传 (uint32)-1 = 不改
+int vfs64_chmod_on64(int slot, const char* path, uint32_t mode);
+int vfs64_chown_on64(int slot, const char* path, uint32_t uid, uint32_t gid);
+
+// ★ fs64 用：把"当前卷"临时切到 slot **但不改调用方身份**（权限判定照常）。
+// 返回 0 = 已进入（*out_saved = 进入前的槽号，退出时原样交回）；-1 = 槽非法/未挂载。
+int  vfs64_scope_enter64(int slot, int* out_saved);
+void vfs64_scope_leave64(int saved_slot);
 
 // 写 bytes 字节需要占用多少块（数据块 + 需要的间接块：一级 1 块、二级 dind 1 块 + 每个 128 块组 1 个子块）。
 // 纯函数（不碰盘），explorer 的"粘贴前估空间"与 vfs64 自己的预检都用它。
@@ -184,6 +261,9 @@ struct Vfs64Info64 {
     uint32_t parent;                      // 父目录 inode 号
     uint32_t nlink;                       // 链接数（v2 卷恒报 1）
     uint32_t kind;                        // VFS64_KIND_*
+    uint32_t uid;                         // ★ P4：属主 uid（v2/v3 旧卷恒 0 = root）
+    uint32_t gid;                         // ★ P4：属主 gid（v2/v3 旧卷恒 0 = root）
+    uint32_t mode;                        // ★ P4：模式（类型位 + 0777；旧卷按默认值给出）
     char     name[VFS64_NAME_MAX + 1];    // NUL 结尾（根目录 = ""）
     uint32_t name_len;
 };
@@ -196,6 +276,9 @@ struct Vfs64Dirent64 {
     uint32_t size;
     uint32_t mtime;
     uint32_t kind;
+    uint32_t uid;                         // ★ P4（与 Vfs64Info64 同一口径）
+    uint32_t gid;
+    uint32_t mode;
 };
 
 // 解包后的时间（供 UI 显示；year 是真实年份，例如 2025）
@@ -206,10 +289,10 @@ struct Vfs64Time64 {
 
 // 卷信息（只读探测 / 盘符层用）
 struct Vfs64VolInfo64 {
-    uint32_t version;        // 2 / 3
+    uint32_t version;        // 2 / 3 / 4
     uint32_t blocks;         // 总块数（= 分区扇区数）
     uint32_t inodes;         // inode 总数
-    uint32_t inode_bytes;    // 单个 inode 字节数（v2 = 64、v3 = 128）
+    uint32_t inode_bytes;    // 单个 inode 字节数（v2 = 64、v3/v4 = 128）
     uint32_t bitmap_start;
     uint32_t bitmap_blocks;
     uint32_t data_start;
@@ -233,13 +316,15 @@ uint32_t vfs64_kind_by_name64(uint32_t type, const char* name, uint32_t name_len
 const char* vfs64_kind_str64(uint32_t kind);
 
 // ==================== 卷生命周期 ====================
-// 格式化：写超级块 + 空闲块位图 + 清零 inode 区 + 根目录 inode（**v3**）。成功返回 0（并且卷已挂载），
-// 失败返回 -1（已打印原因）。start_lba = 分区起始绝对 LBA；total_sectors = 分区扇区数。
-// 打点：[VFS64] format ok blocks=<n> version=3 inode=<128> root=<绝对 LBA>
+// 格式化：写超级块 + 空闲块位图 + 清零 inode 区 + 根目录 inode（**v4**：root/root、目录 0755）。
+// 成功返回 0（并且卷已挂载），失败返回 -1（已打印原因）。start_lba = 分区起始绝对 LBA；
+// total_sectors = 分区扇区数。
+// 打点：[VFS64] format ok blocks=<n> version=4 inode=<128> root=<绝对 LBA>
 int  vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors);
 
-// 挂载：读扇区 0，校验 magic / CRC32 / 版本（2 或 3）/ 几何自洽（位图与 inode 区必须严丝合缝地接在数据区前）。
+// 挂载：读扇区 0，校验 magic / CRC32 / 版本（2 / 3 / 4）/ 几何自洽（位图与 inode 区必须严丝合缝地接在数据区前）。
 // 成功打印 "[VFS64] mount ok blocks=<n> inodes=<n> free=<n> version=<v> inode=<n>B"，失败打印 reason=<...>。
+// v2/v3 旧卷（没有权限字段）：额外打一行 [PERM64] legacy ...，权限拦截对该卷关闭。
 int  vfs64_mount(int drive, uint32_t start_lba);
 
 // 只读探测：读 (drive, start_lba) 的超级块并校验（含几何重算与空闲块统计），把几何填进 *out。
@@ -254,9 +339,12 @@ int  vfs64_mounted_volume64(int* drive, uint32_t* start_lba, Vfs64VolInfo64* out
 //   * 卷槽表 g_vol[0..VFS64_SLOT_MAX-1]：每个槽独立保存一份卷几何（drive/起始 LBA/位图/inode/数据区/布局）。
 //   * g_cur_slot = **当前卷**：所有旧 API（vfs64_stat64/read64/write64/ls/opendir…）都作用于当前卷 —— 
 //     fd64/终端/explorer 不必改调用点（"当前卷"就是用户在文件管理器里点进去的那块盘）。
-//   * 系统组件（store64/config64/update64/app64/elf64/proc64/sysstate64）**必须**用
+//   * 系统组件（store64/config64/update64/app64/elf64/proc64/sysstate64/img64）**必须**用
 //     vfs64_*_on64(vfs64_system_slot64(), ...)：写盘只在这一次调用期间临时切到系统卷槽，
 //     调用返回前原样切回（不可重入计数 + LIFO 恢复）—— 用户在浏览 D: 时 3 秒自动落盘也不会写到 D:。
+//     ★ P4：这一族 **同时把调用方身份临时置成 root**（"固定写系统卷的系统组件不被自己的权限检查卡住"，
+//     与规格明文一致）；用户侧的当前卷操作走**非 on64** 入口（身份照实）—— fs64 对"当前卷"就转非 on64，
+//     跨卷时才用 on64（它等价于内核上下文）。
 //   * inode 扇区缓存按 (slot, drive, lba) 三元组键控（见 vfs64.cpp），切卷绝不会读到上一个卷的字节。
 
 // 挂系统卷：挂进 **0 号槽**并激活它，同时把它记成"系统卷槽"（store64 等固定写卷的依据）。返回 0/-1。
@@ -293,7 +381,8 @@ void vfs64_slots_dump64();
 int  vfs64_slot_info64(int slot, int* drive, uint32_t* start_lba, Vfs64VolInfo64* out);
 
 // ---- 按槽操作（显式卷号；语义与同名旧 API 逐字一致，只是"当前卷"在调用期间临时换成 slot）----
-// 这些是**系统组件固定写系统卷**的入口：调用返回前一定把当前卷切回去（见 .cpp 的守卫实现）。
+// 这些是**系统组件固定写系统卷**的入口：调用返回前一定把当前卷切回去（见 .cpp 的守卫实现）；
+// 期间调用方身份 = root（见上）。返回值与同名 API 一致，权限不足时是 -EACCES(-13)。
 int  vfs64_stat_on64(int slot, const char* path, uint32_t* type, uint32_t* size);
 int  vfs64_read_on64(int slot, const char* path, void* buf, int max);
 int  vfs64_write_on64(int slot, const char* path, const void* buf, int len);
@@ -308,12 +397,13 @@ int  vfs64_tree_dump64_on64(int slot, const char* path, int max_entries, int max
 int  vfs64_rename_on64(int slot, const char* old_path, const char* new_name);
 int  vfs64_free_on64(int slot, uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_blocks);
 
-// ==================== v3 新 API（多级路径）====================
-// 查属性（含 type/size/mtime/parent/nlink/kind/名字）。返回 0 = 找到；-1 = 不存在/非法/未挂载。
+// ==================== v3/v4 新 API（多级路径）====================
+// 查属性（含 type/size/mtime/parent/nlink/kind/名字/**uid/gid/mode**）。返回 0 = 找到；
+// -1 = 不存在/非法/未挂载；-EACCES = 路径上某一级目录没有 x（进不去）。
 int  vfs64_stat64(const char* path, Vfs64Info64* out);
 
 // 列目录（**路径版 + 游标分页**）：从 *cursor 开始最多读 max 条进 out[]，并把 *cursor 推进到下一个待读位置。
-// 返回填充条数（0 = 枚举结束）；-1 = 路径非法/不是目录/未挂载。cursor 可传 nullptr（= 从 0 开始，只读一页）。
+// 返回填充条数（0 = 枚举结束）；-1/-EACCES = 路径非法/缺 x/缺 r（v4 卷）/未挂载。cursor 可传 nullptr。
 // 不排序（按 inode 号顺序 = 创建顺序），条目多时调用方自己分页，别一次要一大片。
 int  vfs64_list64(const char* path, Vfs64Dirent64* out, int max, uint32_t* cursor);
 
@@ -383,7 +473,8 @@ int  vfs64_rename64(const char* old_path, const char* new_name);
 // 任何指针都可传 nullptr。返回 0 = 成功；-1 = 未挂载/位图读失败。
 int  vfs64_free64(uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_blocks);
 // 目录树串口打印（有界）：从 path 开始（递归 ≤ max_depth 层、全树 ≤ max_entries 条），每行
-//   [VFS64] tree <完整路径> type=<dir|file> size=<n> mtime=0x<hex> ymd=<YYYY-MM-DD> hms=<HH:MM:SS> kind=<str> idx=<inode>
+//   [VFS64] tree <完整路径> type=<dir|file> size=<n> mtime=0x<hex> ymd=<YYYY-MM-DD> hms=<HH:MM:SS> kind=<str> idx=<inode> uid=<n> gid=<n> mode=0<ooo>
+//   （★ P4 在行尾追加 uid/gid/mode；既有断言用的是行首字段的前缀匹配，不受影响）
 // 返回打印的条目数；越界/不存在返回 -1（并打点）。供启动自检与自动验收 grep。
 int  vfs64_tree_dump64(const char* path, int max_entries, int max_depth);
 
@@ -399,7 +490,7 @@ int  vfs64_mkdir(const char* path);                         // = vfs64_mkdir64�
 int  vfs64_stat(const char* path, uint32_t* type, uint32_t* size);
 
 // 自检（位掩码，0 = 全过；打印 [VFS64] selftest PASS|FAIL mask=<n>）：
-//   bit0(1)    假盘格式化 + 挂载（v3）
+//   bit0(1)    假盘格式化 + 挂载（**v4**）
 //   bit1(2)    写 3000B（跨直接+间接块）读回逐字节比对
 //   bit2(4)    根目录列举
 //   bit3(8)    stat（类型/大小/不存在）
@@ -412,7 +503,7 @@ int  vfs64_stat(const char* path, uint32_t* type, uint32_t* size);
 //   bit9(512)  **路径语义**："." 与 ".."、/../.. = 根、超长段被拒、超深路径被拒、坏路径不崩
 //   bit10(1024) **mtime 与类型判定**：写入后 mtime 非 0 且字段在合法范围；.txt -> TEXT、VAP64 头 -> VAP、
 //              ELF 头 -> ELF、二进制 -> BIN
-//   bit11(2048) **代际/几何 + 重挂载持久化**：超级块版本=3、inode=128B、几何自洽；重新 mount 后子目录文件仍在
+//   bit11(2048) **代际/几何 + 重挂载持久化**：超级块版本=4、inode=128B、几何自洽；重新 mount 后子目录文件仍在
 //   ★ 批次 M（真实假盘从 32KB 扩大到 2MB，才能真的走二级间接）：
 //   bit12(4096) **二级间接块大文件**：写 1.5 MB 模式文件（跨一级+二级间接）-> 分块读回逐块 CRC 一致；
 //              断言 inode 的 dind 字段非 0（真的用了二级间接）+ 块数记账 = 数据块 + 子块 + dind + ind
@@ -420,7 +511,11 @@ int  vfs64_stat(const char* path, uint32_t* type, uint32_t* size);
 //              **预检直接失败**且不产生半截文件（大小/内容不变）
 //   bit14(16384) **上限边界与流式重写**：write_at 到 off = 上限 -> 被拒（不越界、不半截）；
 //              write64(上限+1) -> 被拒；write_stream64 整体重写后 CRC 一致；覆盖成 0 字节后块全部回收
+//   ★ P4：
+//   bit15(32768) **权限**：v4 假卷上 root 建文件/目录 -> uid/gid/mode = 调用方与默认模式；
+//              换非 root 凭证：读 0644 文件可以、写被拒（-EACCES）、少 r 读被拒、目录缺 x 进不去、
+//              目录写要 w+x、root 绕过、chmod（root/属主）与 chown（仅 root）、umask 影响新文件；
+//              v3 旧卷 -> 拦截关闭（[PERM64] legacy 打点）
 int  vfs64_selftest64();
-
 // 串口打印当前挂载状态 + 根目录条目（供自动验收 grep）。
 void vfs64_dump64();

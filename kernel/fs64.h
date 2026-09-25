@@ -38,12 +38,17 @@
 #define FS64_KIND_FAT32    2u
 
 // 统一的 stat / 目录项（字段与 vfs64 的对应结构对齐，外加 FAT 的属性位）
+// ★ P4：uid/gid/mode 与 vfs64 的 Vfs64Info64/Vfs64Dirent64 同一口径；FAT 卷没有属主 -> 恒 0 = root、
+//   mode 按类型给默认（目录 S_IFDIR|0755、文件 S_IFREG|0644）。
 struct Fs64Stat64 {
     uint32_t type;      // VFS64_TYPE_FILE / VFS64_TYPE_DIR
     uint32_t size;      // 字节数（目录 = 0）
     uint32_t mtime;     // 打包时间（vfs64 口径；FAT 的 date/time 也转成同一编码）
     uint32_t kind;      // VFS64_KIND_*（FAT 按名字后缀保守判定）
     uint32_t attr;      // FAT 属性位（VimtuFS2 = 0）
+    uint32_t uid;       // ★ P4：属主 uid（FAT = 0）
+    uint32_t gid;       // ★ P4：属主 gid（FAT = 0）
+    uint32_t mode;      // ★ P4：类型位 + 权限位（FAT = 默认 0755/0644）
 };
 struct Fs64Dirent64 {
     char     name[FS64_NAME_MAX];
@@ -53,6 +58,9 @@ struct Fs64Dirent64 {
     uint32_t mtime;
     uint32_t kind;
     uint32_t attr;
+    uint32_t uid;       // ★ P4
+    uint32_t gid;
+    uint32_t mode;
 };
 // 统一卷信息（只读）
 struct Fs64Vol64 {
@@ -94,18 +102,19 @@ int fs64_is_readonly64(int vol);
 uint32_t fs64_vol_kind64(int vol);
 
 // ---- 统一文件操作（vol = -1 时作用在当前卷；语义与 vfs64_* 逐条对齐）----
-// 列目录（游标分页）：返回填充条数、0 = 结束、-1 = 错。
+// ★ P4：当前卷的操作用**调用方身份**做权限判定（vfs64 内部三段判定），-EACCES 原样返回；
+//   跨卷时临时切槽但**不改身份**（见 fs64.cpp 的 Fs64VfsScope64）。FAT 卷没有权限模型（只读）。
+// 列目录（游标分页）：返回填充条数、0 = 结束、-1 = 错、-13(-EACCES) = 权限不足。
 int fs64_list64(int vol, const char* path, Fs64Dirent64* out, int max, uint32_t* cursor);
 // 兼容版列目录（[][32] 名字 + 大小数组；FAT 长名超过 31B 会截断，与 vfs64_ls 同口径）。
 int fs64_ls64(int vol, const char* path, char names[][VFS64_LS_NAME_BUF], int max, uint32_t* sizes);
 int fs64_stat64(int vol, const char* path, Fs64Stat64* out);
-// 读文件：最多 max 字节，返回实际字节数 / 负错误码。
+// 读文件：最多 max 字节，返回实际字节数 / 负错误码（-EACCES 见上）。
 int fs64_read64(int vol, const char* path, void* buf, int max);
-// 分块读（大文件校验用）：*out_got = 实际读到的字节数；0 = 成功。
 // 分块读（大文件校验用）：*out_got = 实际读到的字节数；0 = 成功。缓冲区由调用方给（建议 ≤64KB/次）。
 int fs64_read_range64(int vol, const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got);
 // ★ 批次 M：分块写（按偏移；保留原有字节；off > 当前大小 = 空洞**补零**；**8 MiB 上限**由 vfs64 把关，
-//   超上限/空间不足一律先失败、不写一半）。只读卷（FAT32）返回 -FS64_EROFS。
+//   超上限/空间不足一律先失败、不写一半）。只读卷（FAT32）返回 -FS64_EROFS。★ P4：越权 -> -EACCES。
 int fs64_write_at64(int vol, const char* path, uint32_t off, const void* buf, uint32_t len);
 // 写操作：FAT 卷上一律返回 -FS64_EROFS（打点 [FS64] reject ... readonly）。
 int fs64_write64(int vol, const char* path, const void* buf, int len);
@@ -114,6 +123,11 @@ int fs64_mkdir64(int vol, const char* path);
 int fs64_unlink64(int vol, const char* path);
 int fs64_rmdir64(int vol, const char* path);
 int fs64_rename64(int vol, const char* old_path, const char* new_name);
+// ★ P4：access/chmod/chown 的按卷变体（fd64 在 open 时做 r/w 判定；终端 chmod/chown 命令用）。
+//   返回 0 = 允许/成功；-VFS64_EACCES(-13) = 权限不足；-1 = 不存在/只有 root 能做/旧卷无字段/只读卷。
+int fs64_access64(int vol, const char* path, uint32_t mask);       // mask：4=r / 2=w / 1=x
+int fs64_chmod64(int vol, const char* path, uint32_t mode);
+int fs64_chown64(int vol, const char* path, uint32_t uid, uint32_t gid);   // uid/gid = -1 表示不改
 // 空间查询：*free_blocks/*total_blocks 以 512B 块计（与 vfs64_free64 同口径）。
 // FAT 的空闲字节由挂载时的 FSInfo 快照折算；FSInfo 无效 -> -1（如实说"未知"）。
 int fs64_free64(int vol, uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_blocks);
