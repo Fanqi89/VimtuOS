@@ -1575,8 +1575,8 @@ CAPS = [
     ("内核", "SMP（启动 AP）", cap_smp_ap),
     ("应用", "★ 锁屏 + 登录 + 多用户骨架（/etc/users.db 加盐哈希；su/sudo 会话身份；root 不在登录界面）", cap_users_login),
     ("应用", "★ 开始菜单 + 四个二级弹窗（通知/声音/网络/日历）+ 设备插拔 toast + Caps/Shift/滚轮", cap_startmenu_p2),
-    ("应用", "★ Win11 风格设置（左导航 240px + 六组：系统/个性化/网络/用户/安全/关于；全部实时生效并持久化）", cap_settings_p3),
     ("内核", "★ VimtuFS2 v4 权限（uid/gid/mode + owner/group/other rwx 拦截；v3 旧卷兼容但豁免）", cap_perm_v4),
+    ("应用", "★ Win11 风格设置（左导航 240px + 六组：系统/个性化/网络/用户/安全/关于；全部实时生效并持久化）", cap_settings_p3),
 ]
 
 
