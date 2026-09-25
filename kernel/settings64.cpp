@@ -2083,14 +2083,21 @@ static void page_passwd(const Lay* L, int x0, int y0) {
             t->text_dim);
 }
 
+// ★ 版本号唯一真源 = build64.sh 的 VIMTUOS_VERSION（编译期宏，发布时只改那一处）。
+//   独立编译这个文件（例如 IDE 语法检查）而没有该宏时，如实打 unknown，不编造版本号。
+#ifndef VIMTUOS_VERSION_STR
+#define VIMTUOS_VERSION_STR "unknown"
+#endif
+
 // ---- 驱动 / GPU / 版本（关于页）----
 static void about_log_once() {
     static bool done = false;
     if (done) return;
     done = true;
-    // 版本：字符串与终端 `ver` 同口径（VimtuOS 0.1.0 x86_64），构建标记直接取 rust64 的 BUILD_TAG
+    // 版本：唯一真源 = build64.sh 的 VIMTUOS_VERSION（编译期宏 VIMTUOS_VERSION_STR），
+    //       别在这里写死版本串；构建标记仍取 rust64 的 BUILD_TAG
     dbg64_line_begin64();
-    dbg64_str("[SET64] about version=VimtuOS 0.1.0 x86_64 build_tag=");
+    dbg64_str("[SET64] about version=VimtuOS " VIMTUOS_VERSION_STR " x86_64 build_tag=");
     const uint8_t* tag = rust64_build_tag64();
     const uint32_t tl = rust64_build_tag_len64();
     if (tag && tl > 0 && tl < 96) {
@@ -2146,11 +2153,11 @@ static void page_about(const Lay* L, int x0, int y0) {
     card_begin(L, y, c1h);
     int ry = y + 12;
     {
-        ui_text(L->card_x + 16, ry + 4, "VimtuOS 0.1.0 x86_64", t->text);
+        ui_text(L->card_x + 16, ry + 4, "VimtuOS " VIMTUOS_VERSION_STR " x86_64", t->text);
         Buf b; b_init(&b);
         b_str(&b, zh ? "  64 位长模式内核（clang++ -target x86_64-elf, C++17, -mno-sse）"
                      : "  64-bit long mode kernel");
-        ui_text(L->card_x + 16 + ui_w("VimtuOS 0.1.0 x86_64"), ry + 4, b.b, t->text_dim);
+        ui_text(L->card_x + 16 + ui_w("VimtuOS " VIMTUOS_VERSION_STR " x86_64"), ry + 4, b.b, t->text_dim);
         ry += L->row_h;
     }
     {

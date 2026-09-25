@@ -51,6 +51,10 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 一次性实测钩子（默认空，不影响任何既有构建）：
 #   批次 C 要实测"UEFI（固件页表）下运行期 mov cr3 到底行不行"，那次构建需要
 #   -DPROC64_UEFI_CR3_EXPERIMENT=1。用法：VIMTU_EXTRA_CXXFLAGS=-DPROC64_UEFI_CR3_EXPERIMENT=1 bash build64.sh
+# ★ 版本号**唯一真源**（发布时只改这一行）：编译期宏 VIMTUOS_VERSION_STR 进两份内核，
+#   设置页"关于"（kernel/settings64.cpp）与串口打点都从这里取值（未定义时内核打 unknown）。
+VIMTUOS_VERSION="0.3.2-beta14"
+CXXFLAGS="$CXXFLAGS -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\""
 CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
 CXXFLAGS_INSTALLER="$CXXFLAGS -DVIMTU_INSTALLER_MEDIA=1 -DVIMTU_PAYLOAD_LBA=$PAYLOAD_LBA -DVIMTU_KBD_TRACE=1"
 

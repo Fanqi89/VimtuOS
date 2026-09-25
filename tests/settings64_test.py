@@ -46,6 +46,15 @@ import proc64_test as p64         # noqa: E402 （find_qemu）
 FORBIDDEN = ("PANIC", "TRIPLE FAULT", "FAILED mask=", "selftest FAIL", "OOM:")
 SENS = 1.7                        # kernel/input.cpp：鼠标灵敏度 ×1.7
 
+def build64_version():
+    """版本号唯一真源：build64.sh 里的 VIMTUOS_VERSION（发布时只改那一处）。"""
+    try:
+        with open(os.path.join(ROOT, "build64.sh"), "r", encoding="utf-8", errors="replace") as f:
+            m = re.search(r'^\s*VIMTUOS_VERSION="([^"]+)"', f.read(), re.M)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
 # ---- 页面 id（与 kernel/settings64.cpp 的 P_* 一一对应）----
 P_DISPLAY, P_SOUND, P_POWER, P_DEFAPP = 0, 1, 2, 3
 P_THEME, P_WALL, P_COLOR, P_FIT, P_DOCK, P_FONT = 4, 5, 6, 7, 8, 9
@@ -613,9 +622,12 @@ def main():
         # ---------- 5) 关于页 ----------
         print("--- 5) 关于：版本 / 驱动 / GPU 加速状态 + 硬件检查报告 ---")
         goto_page(vm, P_ABOUT, checks, "第1遍")
+        exp_ver = build64_version()
         ab = last(r"\[SET64\] about version=(\S+) (\S+) (\S+) build_tag=(\S+) bits=(\d+)", vm.log())
-        check("关于页打点版本（[SET64] about version=VimtuOS 0.1.0 x86_64 build_tag=.. bits=64）",
-              ab is not None and ab.group(5) == "64" and ab.group(4) not in ("", "(none)"),
+        check("关于页打点版本（[SET64] about version=VimtuOS %s x86_64 build_tag=.. bits=64；"
+              "期望值来自 build64.sh 的 VIMTUOS_VERSION 唯一真源，不在这里写死第二份）" % (exp_ver or "?"),
+              ab is not None and ab.group(1) == "VimtuOS" and ab.group(2) == exp_ver
+              and ab.group(5) == "64" and ab.group(4) not in ("", "(none)"),
               ab.group(0) if ab else "（无）")
         dv = last(r"\[SET64\] drivers implemented=(\d+) missing=(\d+) gpu=(\S+)", vm.log())
         check("驱动清单打点（implemented=12 missing=4 gpu=software）",
