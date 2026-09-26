@@ -21,6 +21,7 @@
 #include "locklogin64.h"    // 锁定 -> 回锁屏
 #include "e1000_64.h"       // 以太网真实链路（网络图标：有线 = 以太网）
 #include "mem_64.h"
+#include "icons64.h"        // ★ 本批：外置图标包（真图标）；取不到就回落下面的程序化线性图标
 
 // ==================== 小工具（内核里没有 libc）====================
 static int s_len(const char* s) { int n = 0; while (s && s[n]) n++; return n; }
@@ -434,7 +435,21 @@ static void icon_check64(int cx, int cy, int s, uint32_t c, int a, int lw) {
     p2ui_line64(cx - s / 3, cy, cx - s / 10, cy + s / 4, lw, c, a);
     p2ui_line64(cx - s / 10, cy + s / 4, cx + s / 3, cy - s / 4, lw, c, a);
 }
+// ★ 本批（真图标）：P2UI 线性图标 kind -> 外置图标包 kind（顺序不同，所以用显式表；
+//   关机与电源共用一个 power 图标，和程序化绘制同口径）
+static const uint8_t kP2Icon64[P2UI_ICON_COUNT] = {
+    ICON64_K_GLOBE, ICON64_K_ETHERNET, ICON64_K_WIFI, ICON64_K_VOLUME, ICON64_K_VOLUME_MUTE,
+    ICON64_K_BELL, ICON64_K_SEARCH, ICON64_K_CLOSE, ICON64_K_POWER, ICON64_K_GEAR,
+    ICON64_K_LOCK, ICON64_K_REBOOT, ICON64_K_POWER, ICON64_K_CHEV_L, ICON64_K_CHEV_R,
+    ICON64_K_PLUS, ICON64_K_PERSON, ICON64_K_USB, ICON64_K_MONITOR, ICON64_K_CHECK,
+};
 void p2ui_icon64(int kind, int x, int y, int size, uint32_t c, int a) {
+    // ★ 本批（真图标）：优先外置图标包（系统镜像尾部的外置资源，见 kernel/icons64.h）。
+    //   取不到（没包/CRC 坏/解码失败）-> icons64 打 [ICON64] fallback -> 落到下面的程序化绘制。
+    if (kind >= 0 && kind < P2UI_ICON_COUNT &&
+        icons64_draw_kind64(kP2Icon64[kind], x, y, size, c, a) == 0) {
+        return;
+    }
     const int lw = THEME64_SM_ICON_LINE;
     const int cx = x + size / 2, cy = y + size / 2;
     switch (kind) {
@@ -464,17 +479,18 @@ void p2ui_icon64(int kind, int x, int y, int size, uint32_t c, int a) {
 }
 
 // ==================== 应用表（搜索 + 固定网格）====================
-struct SmApp64 { int app_id; int icon_kind; const char* zh; const char* en; const char* alias; };
+// ★ 本批（真图标）：icon64 = 外置图标包里的应用 kind（>0 时优先画真图标；0 = 没有）
+struct SmApp64 { int app_id; int icon_kind; int icon64; const char* zh; const char* en; const char* alias; };
 static const SmApp64 kApps[] = {
-    { APP_ID_TERM,     P2UI_ICON_MONITOR, "终端",       "Terminal",      "term shell console" },
-    { APP_ID_MYPC,     P2UI_ICON_MONITOR, "我的电脑",   "My Computer",   "mypc computer explorer files" },
-    { APP_ID_SETTINGS, P2UI_ICON_GEAR,    "设置",       "Settings",      "settings cfg control" },
-    { APP_ID_CALC,     P2UI_ICON_PLUS,    "计算器",     "Calculator",    "calc calculator" },
-    { APP_ID_MINES,    P2UI_ICON_PLUS,    "扫雷",       "Minesweeper",   "mines mine game" },
-    { APP_ID_TMGR,     P2UI_ICON_MONITOR, "任务管理器", "Task Manager",  "tmgr taskmgr process" },
-    { APP_ID_MONITOR,  P2UI_ICON_MONITOR, "系统监视器", "System Monitor","monitor perf" },
-    { APP_ID_ABOUT,    P2UI_ICON_PERSON,  "关于",       "About VimtuOS", "about version" },
-    { APP_ID_RECYCLE,  P2UI_ICON_CLOSE,   "回收站",     "Recycle Bin",   "recycle trash bin" },
+    { APP_ID_TERM,     P2UI_ICON_MONITOR, ICON64_A_TERMINAL, "终端",       "Terminal",      "term shell console" },
+    { APP_ID_MYPC,     P2UI_ICON_MONITOR, ICON64_A_MYPC,     "我的电脑",   "My Computer",   "mypc computer explorer files" },
+    { APP_ID_SETTINGS, P2UI_ICON_GEAR,    ICON64_A_SETTINGS, "设置",       "Settings",      "settings cfg control" },
+    { APP_ID_CALC,     P2UI_ICON_PLUS,    ICON64_A_CALC,     "计算器",     "Calculator",    "calc calculator" },
+    { APP_ID_MINES,    P2UI_ICON_PLUS,    ICON64_A_MINES,    "扫雷",       "Minesweeper",   "mines mine game" },
+    { APP_ID_TMGR,     P2UI_ICON_MONITOR, ICON64_A_TMGR,     "任务管理器", "Task Manager",  "tmgr taskmgr process" },
+    { APP_ID_MONITOR,  P2UI_ICON_MONITOR, ICON64_A_MONITOR,  "系统监视器", "System Monitor","monitor perf" },
+    { APP_ID_ABOUT,    P2UI_ICON_PERSON,  ICON64_A_ABOUT,    "关于",       "About VimtuOS", "about version" },
+    { APP_ID_RECYCLE,  P2UI_ICON_CLOSE,   ICON64_A_RECYCLE,  "回收站",     "Recycle Bin",   "recycle trash bin" },
 };
 #define SM_APP_N ((int)(sizeof(kApps) / sizeof(kApps[0])))
 // 默认固定网格 2 列 × 4 行（8 个）
@@ -1101,7 +1117,15 @@ static void draw_tile64(int idx, bool hover) {
     const int ix = x + (w - isz) / 2, iy = y + 6;
     // 图标：圆角方块渐变底 + 线性图标（统一线性风格）
     p2ui_fill_mixed64(ix, iy, isz, isz, THEME64_R_ICON, THEME64_R_ICON, t->grad_a, 235);
-    p2ui_icon64(a.icon_kind, ix + 4, iy + 4, isz - 8, rgb(255, 255, 255), 235);
+    // ★ 本批（真图标）：应用图标走外置图标包（应用专属亮色，在渐变底板上也清楚）；
+    //   取不到就回落"线性图标 + 白色"
+    if (a.icon64 > 0 &&
+        icons64_draw_kind64(a.icon64, ix + 4, iy + 4, isz - 8,
+                            icons64_app_color64(a.icon64), 235) == 0) {
+        // 已画真图标
+    } else {
+        p2ui_icon64(a.icon_kind, ix + 4, iy + 4, isz - 8, rgb(255, 255, 255), 235);
+    }
     const char* nm = p2ui_text_w64(a.zh) <= w - 6 ? a.zh : a.en;
     const int tw = p2ui_text_w64(nm), lh = p2ui_line_h64();
     p2ui_text64(x + (w - tw) / 2, iy + isz + 4, nm, t->dark ? t->text : rgb(32, 32, 32));
@@ -1181,7 +1205,12 @@ static void draw_menu64() {
                 if (i == g_hit_sel)
                     p2ui_fill_mixed64(rx, ry, rw, rh, THEME64_R_BUTTON, THEME64_R_BUTTON, t->accent, 60);
                 const SmApp64& a = kApps[g_hit_app[i]];
-                p2ui_icon64(a.icon_kind, rx + 6, ry + (rh - 18) / 2, 18, p2ui_icon_color64(t), 255);
+                // ★ 本批（真图标）：搜索结果行里用真图标但**着主题线色**（浅色行底上要看得清）
+                if (!(a.icon64 > 0 &&
+                      icons64_draw_kind64(a.icon64, rx + 6, ry + (rh - 18) / 2, 18,
+                                          p2ui_icon_color64(t), 255) == 0)) {
+                    p2ui_icon64(a.icon_kind, rx + 6, ry + (rh - 18) / 2, 18, p2ui_icon_color64(t), 255);
+                }
                 const int lh = p2ui_line_h64();
                 p2ui_text64(rx + 32, ry + (rh - lh) / 2, a.zh, t->dark ? t->text : rgb(24, 26, 32));
                 const int ew = p2ui_text_w64(a.en);

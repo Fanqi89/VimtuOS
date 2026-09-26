@@ -46,7 +46,7 @@
 #include "panels64.h"
 #include "settings64.h"      // ★ P3：设置页的启动期生效点（字体大小档 + 自定义渐变壁纸）
 #include "desktopops64.h"     // ★ P5：桌面右键菜单 / 玻璃选择框 / 回收站 / 桌面图标集合
-
+#include "icons64.h"         // ★ 本批：外置图标包（真图标）—— 内核里不含图标字节，见 icons64.h
 
 // ==================== 资源符号（build64.sh 用 objcopy 生成）====================
 extern "C" const uint8_t _binary_icon_mycomputer_bin_start[];
@@ -659,6 +659,8 @@ static const uint8_t* icon_src(int kind) {
     if (kind == 1) return _binary_icon_recyclebin_bin_start;
     return _binary_icon_terminal_bin_start;
 }
+// ★ 本批（真图标）：桌面图标 kind 0..2 <-> 外置图标包里的应用 kind
+static const int kIcon64AppKind[3] = { ICON64_A_MYPC, ICON64_A_RECYCLE, ICON64_A_TERMINAL };
 // （icon_name 已随桌面图标绘制一起搬到 desktopops64.cpp：item_name()）
 
 // ==================== 桌面图标预缩放缓存（preload64 预热用） ====================
@@ -716,6 +718,15 @@ static void blit_rgba_scaled(int x, int y, int dw, int dh, const uint8_t* src) {
 int gui64_preload_icons64() {
     int n = 0;
     for (int k = 0; k < 3; k++) {
+        // ★ 本批（真图标）：优先用外置图标包里的应用图标（Dock/桌面同一份缓存，绘制路径不变）；
+        //   包里没有（或解码失败）才用内核内嵌的程序化图标 —— 绝不因为缺文件把图标画空。
+        const int ak = kIcon64AppKind[k];
+        if (ak > 0 && icons64_export_rgba64(ak, ICON_W, g_icon48_cache[k], ICON_W, ICON_W,
+                                            icons64_app_color64(ak)) == 0) {
+            g_icon48_ok[k] = 1;
+            n++;
+            continue;
+        }
         const uint8_t* src = icon_src(k);
         if (!src) continue;
         scale_rgba64(src, ICON_SRC_W, ICON_SRC_W, g_icon48_cache[k], ICON_W, ICON_W);
@@ -844,17 +855,18 @@ static void power_anim_screen(const char* txt, const char* log_tag) {
 static void menu_toggle();
 
 #define DOCK_ITEMS 9
-struct DockItem64 { int app_id; int icon_kind; const char* en; const char* zh; };
+// ★ 本批（真图标）：icon64 = 外置图标包里的应用 kind（>0 时优先画真图标；-1 = 没有对应图标）
+struct DockItem64 { int app_id; int icon_kind; int icon64; const char* en; const char* zh; };
 static const DockItem64 kDockItems[DOCK_ITEMS] = {
-    { APP_ID_NONE,     -1, "Start",          "开始" },        // 最左固定开始按钮
-    { APP_ID_MYPC,      0, "My Computer",    "我的电脑" },
-    { APP_ID_RECYCLE,   1, "Recycle Bin",    "回收站" },
-    { APP_ID_TERM,      2, "Terminal",       "终端" },
-    { APP_ID_CALC,     -1, "Calculator",     "计算器" },
-    { APP_ID_MINES,    -1, "Minesweeper",    "扫雷" },
-    { APP_ID_SETTINGS, -1, "Settings",       "设置" },
-    { APP_ID_TMGR,     -1, "Task Manager",   "任务管理器" },
-    { APP_ID_MONITOR,  -1, "System Monitor", "系统监视器" },
+    { APP_ID_NONE,     -1, -1,                 "Start",          "开始" },     // 最左固定开始按钮（真图 logo/kaisi.png，不许换）
+    { APP_ID_MYPC,      0, ICON64_A_MYPC,      "My Computer",    "我的电脑" },
+    { APP_ID_RECYCLE,   1, ICON64_A_RECYCLE,   "Recycle Bin",    "回收站" },
+    { APP_ID_TERM,      2, ICON64_A_TERMINAL,  "Terminal",       "终端" },
+    { APP_ID_CALC,     -1, ICON64_A_CALC,      "Calculator",     "计算器" },
+    { APP_ID_MINES,    -1, ICON64_A_MINES,     "Minesweeper",    "扫雷" },
+    { APP_ID_SETTINGS, -1, ICON64_A_SETTINGS,  "Settings",       "设置" },
+    { APP_ID_TMGR,     -1, ICON64_A_TMGR,      "Task Manager",   "任务管理器" },
+    { APP_ID_MONITOR,  -1, ICON64_A_MONITOR,   "System Monitor", "系统监视器" },
 };
 
 static int  g_dock_x = 0, g_dock_y = 0, g_dock_w = 0, g_dock_h = DOCK_H;
@@ -1297,8 +1309,25 @@ static void dock_draw_one64(int idx, int cx, int icon_px, int hovered, const The
         return;
     }
     const int kind = kDockItems[idx].icon_kind;
+    const int app64 = kDockItems[idx].icon64;
+    // ★ 本批（真图标）：Dock 上的应用图标统一走"圆角渐变底 + 外置图标包里的真图标"；
+    //   包缺失/解码失败 -> 落回下面的内嵌位图 / 渐变底 + 首字母（界面不会空）。
+    //   （不先问 icons64_available64：让"取不到"这条路真的走到 icons64 里打 [ICON64] fallback 点）
+    if (app64 > 0) {
+        uint32_t a0 = t->grad_a, a1 = t->grad_b;
+        if (idx % 3 == 1) { a0 = t->grad_b; a1 = t->accent; }
+        else if (idx % 3 == 2) { a0 = t->accent; a1 = t->grad_a; }
+        gfx64_grad_round64(x, y, icon_px, icon_px, THEME64_R_ICON, a0, a1, 1, 255);
+        gfx64_stroke_round64(x, y, icon_px, icon_px, THEME64_R_ICON, rgb(255, 255, 255), 90);
+        const int pad = icon_px / 8;
+        if (icon_px - 2 * pad > 0 &&
+            icons64_draw_kind64(app64, x + pad, y + pad, icon_px - 2 * pad,
+                                icons64_app_color64(app64), 255) == 0) {
+            return;
+        }
+    }
     if (kind >= 0 && kind <= 2) {
-        // 我的电脑 / 回收站 / 终端：内核内嵌真图标（128x128 -> icon_px）
+        // 我的电脑 / 回收站 / 终端：内核内嵌程序化位图（128x128 -> icon_px）
         blit_rgba(x, y, icon_px, icon_px, icon_src(kind), ICON_SRC_W, ICON_SRC_W, 255);
         return;
     }
@@ -3010,6 +3039,12 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
             dbg64_line_end64();
         }
     }
+
+    // ---- ★ 本批（真图标）：读外置图标包（系统镜像内核区尾部的固定区间；读不到就一路回落程序化绘制）----
+    // 位置讲究：进桌面前、theme/dock 之前 —— 之后所有绘制（Dock/桌面图标/开始菜单/面板/设置）都用它。
+    // 为什么不在 kernel64.cpp 里初始化：那一层不链本模块（icons64 只进系统内核），且此处已在启动路径上。
+    (void)icons64_init64();
+    (void)icons64_selftest64();
 
     dbg64_str("[GUI64] desktop init ");
     dbg64_dec((uint64_t)g_screen_w);

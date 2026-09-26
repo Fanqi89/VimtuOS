@@ -13,6 +13,11 @@
 #   LBA 9..8008      : kernel*.bin     （最多 4MB）
 #   LBA 8009..8072   : 设置持久化保留区（64 扇区）
 #   ---- 以上 8073 扇区就是"一份完整的系统磁盘映像"（system.img 的内容）----
+#   LBA 7497..8008   : ★ 本批：**图标包**（build/iconpack.bin，上限 512 扇区 = 256KB）——
+#                      外置图标资源（真图标）就放这里：内核区尾部、内核二进制之后、数据分区之前。
+#                      为什么不用文件系统：system.img 里没有 VimtuFS2 卷（卷在安装器建的数据分区上，
+#                      起点 LBA 8009 与 store 的裸盘降级槽重叠，见 kernel/memlayout64.h 的 ★★ 段），
+#                      而这段字节装到硬盘后原样保留（loader 就从 LBA 9 读内核）。
 #   ★ 安装程序把这个映像写到目标盘后，还会在目标盘**盘尾**再建一个 48MB 的 FAT32 ESP
 #     （EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN）与盘尾备份 GPT ——
 #     这样"装好的盘"在 UEFI 与 BIOS 下都能启动（见 kernel/fat64.cpp、kernel/part64.cpp）。
@@ -88,6 +93,9 @@ SRCS_DESKTOP="$SRCS_DESKTOP kernel/locklogin64.cpp kernel/userdb64.cpp"
 #   + P2 UI 工具箱：混合圆角/亚克力/线性图标）与 panels64（通知/声音/网络/日历 + 通知列表 + 设备 toast）。
 #   **只进系统内核**（安装介质没有桌面外壳，保持它的 4MB 预算不被这批代码吃掉）。
 SRCS_DESKTOP="$SRCS_DESKTOP kernel/startmenu64.cpp kernel/panels64.cpp"
+# ★ 本批（真图标）：kernel/icons64.cpp = 统一图标层（读系统镜像里的外置图标包 -> img64 解码 -> 缓存
+#   -> 按主题 palette 着色上屏；取不到就回落既有程序化绘制）。**只进系统内核**（安装介质不带桌面）。
+SRCS_DESKTOP="$SRCS_DESKTOP kernel/icons64.cpp"
 #  ★ 本批（P5：桌面交互细节）：desktopops64（桌面右键菜单 / 玻璃选择框 / 回收站 / 桌面图标集合，
 #   以及设置页那一处最小入口的两个后端）。**只进系统内核**（安装介质没有桌面外壳）。
 SRCS_DESKTOP="$SRCS_DESKTOP kernel/desktopops64.cpp"
@@ -143,6 +151,7 @@ echo "==> 准备资源（字体 / logo / 图标；生成脚本产物落在 build
 "$PY" _make_icons.py
 "$PY" _make_start_icon.py
 cp build/font_bahnschrift.ttf build/font_simhei.ttf build/font_mono.ttf build/font_fallback.ttf "$BUILD/"
+"$PY" tools/make_iconpack.py
 cp build/logo_rgba.bin build/icon_mycomputer.bin build/icon_recyclebin.bin \
    build/icon_terminal.bin build/icon_start.bin "$BUILD/"
 # ★ 本批：把**真文件 logo/kaisi.png 的原始字节**也嵌进系统内核（objcopy，符号 _binary_kaisi_png_*）——
@@ -289,6 +298,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/theme64.o "$BUILD/os"/gfx64.o "$BUILD/os"/img64.o \
     "$BUILD/os"/locklogin64.o "$BUILD/os"/userdb64.o \
     "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o \
+    "$BUILD/os"/icons64.o \
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
@@ -314,6 +324,26 @@ dd if=/dev/zero of="$BUILD/system.img" bs=512 count="$SYS_SECTORS" status=none
 dd if="$BUILD/boot.bin"        of="$BUILD/system.img" conv=notrunc status=none
 dd if="$BUILD/loader64.bin"    of="$BUILD/system.img" seek=1 conv=notrunc status=none
 dd if="$BUILD/kernel64_os.bin" of="$BUILD/system.img" seek="$KERNEL_LBA" conv=notrunc status=none
+
+# ---- ★ 本批（真图标）：把外置图标包写进系统镜像**内核区尾部的固定区间**。
+#      区间常量与 kernel/icons64.h 的 ICON64_PACK_MAX_SECTORS/ICON64_PACK_LBA 必须一致：
+#      LBA = 9 + 8000 - 512 = 7497（内核二进制之后、数据分区起点 8009 之前）。
+#      两道断言：包不能超过预留区间；系统内核不能长到压住包（否则安装出来的盘会互相覆盖）。
+ICONPACK_MAX_SECTORS=512
+ICONPACK_LBA=$((KERNEL_LBA + KERNEL_SECTORS - ICONPACK_MAX_SECTORS))
+ICONPACK_BYTES=$(stat -c%s "$RES/iconpack.bin")
+ICONPACK_SECTORS=$(( (ICONPACK_BYTES + 511) / 512 ))
+KERNEL_OS_SECTORS=$(( (OSSZ + 511) / 512 ))
+if [ "$ICONPACK_SECTORS" -gt "$ICONPACK_MAX_SECTORS" ]; then
+    echo "ERROR: 图标包 $ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）超过内核区尾部预留的 $ICONPACK_MAX_SECTORS 扇区" >&2
+    exit 1
+fi
+if [ $((KERNEL_LBA + KERNEL_OS_SECTORS)) -gt "$ICONPACK_LBA" ]; then
+    echo "ERROR: 系统内核（$OSSZ B = $KERNEL_OS_SECTORS 扇区）已长到图标包区间 LBA $ICONPACK_LBA" >&2
+    exit 1
+fi
+dd if="$RES/iconpack.bin" of="$BUILD/system.img" seek="$ICONPACK_LBA" conv=notrunc status=none
+echo "    图标包：$ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）@ LBA $ICONPACK_LBA..$((ICONPACK_LBA + ICONPACK_SECTORS - 1))；系统内核 $OSSZ B / $KERNEL_OS_SECTORS 扇区（余 $((ICONPACK_LBA - KERNEL_LBA - KERNEL_OS_SECTORS)) 扇区不重叠）"
 
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
 "$PY" - "$BUILD/payload_hdr.bin" "$SYS_SECTORS" "$((PAYLOAD_LBA + 1))" <<'PYEOF'
