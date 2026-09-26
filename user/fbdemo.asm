@@ -1,4 +1,4 @@
-﻿; fbdemo.asm - A1：**用户态绘图演示**（真实 ring3 程序自己把画面画到屏幕上）
+; fbdemo.asm - A1：**用户态绘图演示**（真实 ring3 程序自己把画面画到屏幕上）
 ;
 ; 构建方式（见 build64.sh）：
 ;   nasm -f bin user/fbdemo.asm -> build64/user_fbdemo64.bin
