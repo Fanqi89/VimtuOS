@@ -439,12 +439,18 @@ def main():
         checks.append((name, bool(cond), detail))
         print("  [%s] %s %s" % ("PASS" if cond else "FAIL", name, detail))
 
-    def boot(tag):
+    def boot(tag, login=False):
         vm = Vm(qemu, disk, tmp, tag)
         vms.append(vm)
         up = vm.wait_boot()
         check("第 %s 遍冷启动（锁屏/桌面出现）" % tag, up,
               (last(r"\[(LOCK64|GUI64)\][^\r\n]*", vm.log()) or ["（无）"])[0])
+        if login:
+            # ★ 缺陷 4：登录界面必须**显式输入**才进桌面（默认不再自动登录）—— 回车两次：
+            #   锁屏 -> 登录界面 -> 点登录按钮（无密码用户直接进桌面）
+            vm.wait_new("[LOCK64] bg blur ready", 150)
+            vm.mon.key("ret", wait=1.0)
+            vm.mon.key("ret", wait=1.5)
         return vm
 
     # =====================================================================
@@ -452,10 +458,52 @@ def main():
     # =====================================================================
     print("=== 第 1 遍：左导航 -> 声音 -> 头像 -> 字号 -> 改名 -> 默认应用 -> 关于 -> 主题=暗色 ===")
     try:
-        vm = boot("1")
+        vm = boot("1", login=True)   # ★ 缺陷 4：登录界面必须显式回车
         if not open_settings(vm, checks, "第1遍"):
             raise SystemExit(1)
         log = vm.log()
+
+        # ---------- 0) ★ 缺陷 3 防回归：打开设置后移动鼠标，设置页内容像素必须保持 ----------
+        # 用户实测口径："设置界面里一移动鼠标就整屏空白"。历史根因（P5 接线版）是脏矩形永不清除 ->
+        # 每帧整屏重画、而应用内容只在尺寸变化时画 -> 客户区被抹成纯 240,240,240。
+        # 这条断言就盯这个：鼠标在窗口里走一圈后，内容区**不能**退化成纯色，且文字/卡片像素基本不变。
+        print("--- 0) ★ 缺陷 3：设置页里移动鼠标后内容不空白（像素保持）---")
+        vr0 = view_rect(vm, P_DISPLAY) or view_rect(vm, 0)
+        sh_mv0 = save_shot(vm.mon, os.path.join(tmp, "set_move_before.ppm"))
+        for (mx0, my0) in ((700, 200), (520, 380), (880, 520), (620, 640), (440, 130), (900, 170)):
+            vm.cur.goto(vm.mon, mx0, my0)
+            time.sleep(0.35)
+        time.sleep(1.5)
+        sh_mv1 = save_shot(vm.mon, os.path.join(tmp, "set_move_after.ppm"))
+        if vr0 and sh_mv0 and sh_mv1:
+            wmv, hmv, pmv0 = read_ppm(sh_mv0)
+            _, _, pmv1 = read_ppm(sh_mv1)
+            colors0 = set()
+            colors1 = set()
+            ink0 = ink1 = tot_mv = same_mv = 0
+            for yy in range(vr0["y"] + 6, vr0["y"] + vr0["h"] - 6, 7):
+                for xx in range(vr0["x"] + 6, vr0["x"] + vr0["w"] - 6, 7):
+                    c0 = sample(pmv0, wmv, xx, yy)
+                    c1 = sample(pmv1, wmv, xx, yy)
+                    colors0.add(c0)
+                    colors1.add(c1)
+                    tot_mv += 1
+                    if c0 == c1:
+                        same_mv += 1
+                    if min(c0) < 170:
+                        ink0 += 1
+                    if min(c1) < 170:
+                        ink1 += 1
+            check("★ 缺陷 3：移动鼠标后设置页内容区不是纯色空白（颜色数 %d，>= 20）" % len(colors1),
+                  len(colors1) >= 20, "before=%d after=%d" % (len(colors0), len(colors1)))
+            check("★ 缺陷 3：内容区文字/卡片像素没有消失（暗像素 %d -> %d，>= 80%%）" % (ink0, ink1),
+                  ink0 > 100 and ink1 >= ink0 * 0.8, "tot=%d" % tot_mv)
+            check("★ 缺陷 3：内容区取样点绝大多数没变（%d/%d 点相同）" % (same_mv, tot_mv),
+                  tot_mv > 800 and same_mv >= tot_mv * 0.85,
+                  "same=%d tot=%d" % (same_mv, tot_mv))
+        else:
+            check("★ 缺陷 3：设置页移动鼠标前后截图可用", False,
+                  "view=%s shot0=%s shot1=%s" % (vr0, bool(sh_mv0), bool(sh_mv1)))
 
         # ---------- 1) 左导航 240px / 6 组 / 16 条目 ----------
         print("--- 1) 左导航：240px + 6 个分组 + 16 个条目 + 切页像素变化 ---")
@@ -705,7 +753,7 @@ def main():
     # =====================================================================
     print("=== 第 2 遍：重启后持久化 -> Dock 几何 -> 壁纸适应模式 -> 解锁 -> 设密码 ===")
     try:
-        vm = boot("2")
+        vm = boot("2", login=True)   # ★ 缺陷 4：登录界面必须显式回车
         log = vm.log()
         init1 = last(r"\[THEME64\] init themes=\d+ theme=(\d+) name=(\S+) dark=(\d)", log)
         check("★ 重启后主题仍是「暗色」（[THEME64] init theme=1 name=dark dark=1）",
@@ -932,21 +980,26 @@ def main():
         vms[-1].stop()
 
     # =====================================================================
-    # 第 4 遍：没密码 -> 直接进桌面
+    # 第 4 遍：没密码 -> ★ 缺陷 4 后仍要**显式回车**才进桌面（不再自动登录）
     # =====================================================================
-    print("=== 第 4 遍：清空密码后重启 -> 直接进桌面（不再要口令）===")
+    print("=== 第 4 遍：清空密码后重启 -> 仍要显式回车登录（不再自动跳过）===")
     try:
         vm = Vm(qemu, disk, tmp, "4")
         vms.append(vm)
-        up = vm.wait_new("[GUI64] ready", 200) or vm.wait_new("[LOCK64] lock screen shown", 30)
+        vm.wait_new("[LOCK64] bg blur ready", 200)
+        # ★ 缺陷 4：无密码用户也**不自动登录** —— 回车（锁屏 -> 登录界面）+ 回车（登录按钮）
+        vm.mon.key("ret", wait=1.0)
+        vm.mon.key("ret", wait=1.5)
+        up = vm.wait_new("[GUI64] ready", 200)
         log = vm.log()
-        check("第 4 遍重启到桌面（[GUI64] ready）", up and "[GUI64] ready" in log,
+        check("第 4 遍：显式回车登录后到桌面（[GUI64] ready）", up and "[GUI64] ready" in log,
               (last(r"\[GUI64\] ready", log) or ["（无）"])[0])
         check("★ 清空密码后不再要口令（没有 [LOGIN64] password prompt）",
               "[LOGIN64] password prompt" not in log, "")
-        check("★ 无密码用户自动登录（[LOCK64] auto login user=vimtu2）",
-              "[LOCK64] auto login user=vimtu2" in log,
-              (last(r"\[LOCK64\] auto login[^\r\n]*", log) or ["（无）"])[0])
+        check("★ 无密码用户**不自动登录**（没有 [LOCK64] auto login；[LOGIN64] login ok .. via=key-enter）",
+              "[LOCK64] auto login" not in log and
+              re.search(r"\[LOGIN64\] login ok user=vimtu2 uid=\d+ via=key-enter", log) is not None,
+              (last(r"\[LOGIN64\] login ok[^\r\n]*", log) or ["（无）"])[0])
         for bad in FORBIDDEN:
             check("第 4 遍日志里不得出现 %s" % bad, bad not in log, "")
     finally:

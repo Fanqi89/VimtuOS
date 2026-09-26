@@ -899,6 +899,11 @@ void startmenu64_open64(const char* why) {
     dbg64_dec((uint64_t)sm_h());
     dbg64_nl();
     dbg64_line_end64();
+    // ★ 缺陷 1 兼容同步点（老菜单已删除，这行由新菜单发出 —— 见 close64 的说明）
+    dbg64_line_begin64();
+    dbg64_str("[UI] menu open");
+    dbg64_nl();
+    dbg64_line_end64();
     if (!g_geom_logged) {
         g_geom_logged = true;
         const int bottom = sm_y() + sm_h();
@@ -1037,10 +1042,22 @@ void startmenu64_close64(const char* why) {
     dbg64_str(why);
     dbg64_nl();
     dbg64_line_end64();
+    // ★ 缺陷 1 兼容同步点：既有脚本（desktop64/usb64/apic64/sysstate64/store64）用 "[UI] menu open"
+    //   当"菜单已打开"的同步信号。老菜单实现已整体删除（gui64.cpp 里不再有 draw_menu/menu_toggle），
+    //   这两行现在由**新**开始菜单发出（语义完全相同：菜单开/关），便于老脚本逐步迁移到 [START64] 打点。
+    dbg64_line_begin64();
+    dbg64_str("[UI] menu close");
+    dbg64_nl();
+    dbg64_line_end64();
 }
 void startmenu64_toggle64() {
     if (g_open) startmenu64_close64("toggle");
     else startmenu64_open64("start-button");
+}
+// ★ 缺陷 1：Win 键专用开关（打开/关闭都打 why=win-key；验收按 [START64] open why=win-key 判定）
+void startmenu64_win_key_toggle64() {
+    if (g_open) startmenu64_close64("win-key");
+    else startmenu64_open64("win-key");
 }
 
 // ==================== 绘制 ====================
@@ -1554,6 +1571,24 @@ int startmenu64_handle_key64(uint8_t c) {
     if (c == 0xFD) { g_hit_sel = g_hit_sel > 0 ? g_hit_sel - 1 : 0; dirty_menu64(0); return 1; }  // 上
     if (c == 0xFE) { if (g_hit_sel < g_hits - 1) g_hit_sel++; dirty_menu64(0); return 1; }        // 下
     if (c == 0xFB || c == 0xFC) return 1;        // 左右（本批菜单内不响应）
+    // ★ 缺陷 1 兼容：老菜单的**数字快捷键**（搜索框为空时）1..8 = 终端/我的电脑/系统监视器/
+    //   计算器/扫雷/设置/任务管理器/关于 —— 语义与老 menu_activate(idx) 完全一致（同一批 app_*_open64），
+    //   所以既有脚本（desktop64 / fs_tree 的 open_terminal / usb64 / apic64：Win 键 + "1" 开终端）
+    //   在新菜单上照旧可用；打点 [UI] menu activate idx=N 由这里补上（老打点的兼容同步点）。
+    //   '9'/'0'（老菜单 = 重启/关机）**不再**绑定：避免误触发作电源动作，需要关机请用电源按钮菜单。
+    if (!g_query[0] && !g_pm_open && c >= '1' && c <= '8') {
+        static const int kDigitApp[8] = { APP_ID_TERM, APP_ID_MYPC, APP_ID_MONITOR, APP_ID_CALC,
+                                          APP_ID_MINES, APP_ID_SETTINGS, APP_ID_TMGR, APP_ID_ABOUT };
+        const int legacy = c - '1';
+        dbg64_line_begin64();
+        dbg64_str("[UI] menu activate idx=");
+        dbg64_dec((uint64_t)legacy);
+        dbg64_nl();
+        dbg64_line_end64();
+        startmenu64_close64("digit-shortcut");
+        startmenu64_launch64(kDigitApp[legacy], "digit");
+        return 1;
+    }
     if (c >= 0x20 && c < 0x7F) {                 // 可打印字符 -> 搜索框（Caps/Shift 已由 input.cpp 处理）
         const int n = s_len(g_query);
         if (n < (int)sizeof(g_query) - 1) {

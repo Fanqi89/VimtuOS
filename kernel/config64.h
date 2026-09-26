@@ -113,6 +113,11 @@ void cfg64_set_reduce_motion64(int on);
 int  cfg64_wall_mode64();
 void cfg64_set_wall_mode64(int mode);
 // 锁屏壁纸适应模式（**下一波**锁屏用；本批先把键建好并持久化）
+// ★ 缺陷 5：内置兜底壁纸的四角**定位标记**（测试用）—— 键 `ui.wall.markers`，**默认 0（不可见）**。
+//   1 = 画出 4 个 16x16 红/绿/蓝/黄标记（gfx64 的 [GFX64] wall markers 打点里 markers_drawn=4）；
+//   gui64 的 Ctrl+Shift+M 在运行时切换（gui_modern64_test 用它拿像素证据）。
+int  cfg64_wall_markers64();
+void cfg64_set_wall_markers64(int on);
 int  cfg64_lock_wall_mode64();
 void cfg64_set_lock_wall_mode64(int mode);
 // 壁纸文件路径（VimtuFS2 卷内；空 = 用内核内置兜底壁纸）

@@ -117,8 +117,10 @@ static uint32_t g_caret_t0 = 0;
 static int      g_caret_on = 1;
 
 static uint32_t g_lock_t0 = 0;             // 进入锁屏的时刻（自动登录计时）
-static int      g_auto_login = 1;          // ui.login.auto（默认 1：兼容既有回归脚本；置 0 = 必须按键/点击）
-static uint32_t g_auto_ms = 8000;          // ui.login.auto_delay_ms
+static int      g_auto_login = 0;          // ★ 缺陷 4 修复：ui.login.auto **默认 0** = 必须等用户显式输入
+                                           //   （回车/点登录按钮）才进桌面；无密码用户也不许自动跳过。
+                                           //   置 1 才恢复"空闲 N 秒自动登录"的旧行为（只对无密码用户）。
+static uint32_t g_auto_ms = 8000;          // ui.login.auto_delay_ms（仅 auto=1 时有意义）
 static int      g_auto_fired = 0;
 
 static int      g_blur_cur = 0;            // 当前背景模糊强度 0..255
@@ -1328,14 +1330,16 @@ static void locklogin64_tick_once64() {
     }
     // 4) 动画
     if (anim_tick64()) paint_full64();
-    // 5) 自动登录（兼容既有回归脚本：锁屏/登录界面空闲 N 秒且该用户无密码 -> 自动进桌面；
-    //    ui.login.auto=0 时永不自动登录。有密码的用户**绝不**自动登录。）
-    //    ★ 每秒重读一次配置：终端里 `cfg set ui.login.auto 0` 能立刻让锁屏只等用户输入。
+    // 5) 自动登录（★ 缺陷 4 修复：**默认关闭**。）
+    //    需求：登录界面必须等用户**显式输入**（回车 / 点登录按钮）才进桌面；无密码用户也不许自动跳过。
+    //    所以 ui.login.auto 的默认值从 1 改成 0；只有显式 `cfg set ui.login.auto 1`（或打了这个键的老盘）
+    //    才恢复"空闲 N 秒自动进桌面"的旧行为，且只对**无密码**用户生效。
+    //    ★ 每秒重读一次配置：终端里 `cfg set ui.login.auto 1` 能立刻生效。
     {
         static uint32_t cfg_recheck = 0;
         if ((uint32_t)(ticks64() - cfg_recheck) >= PIT_HZ_64) {
             cfg_recheck = ticks64();
-            g_auto_login = config64_get_bool64("ui.login.auto", 1);
+            g_auto_login = config64_get_bool64("ui.login.auto", 0);
             const int ms = config64_get_int64("ui.login.auto_delay_ms", (int)g_auto_ms);
             if (ms >= 1000 && ms <= 60000) g_auto_ms = (uint32_t)ms;
         }
@@ -1434,10 +1438,8 @@ void locklogin64_lock64(const char* why) {
 
 void locklogin64_init64() {
     for (int i = 0; i < LK_LOG_N; i++) g_lk_used[i] = 0;
-    g_auto_login = config64_get_bool64("ui.login.auto", 1);
+    g_auto_login = config64_get_bool64("ui.login.auto", 0);   // ★ 缺陷 4：默认 0 = 只等用户输入
     g_auto_ms = (uint32_t)config64_get_int64("ui.login.auto_delay_ms", 8000);
-    if (g_auto_ms < 1000) g_auto_ms = 1000;
-    if (g_auto_ms > 60000) g_auto_ms = 60000;
     // 默认选中"上次登录的用户"（找不到就第一个普通用户）
     const char* last = userdb64_last_user64();
     g_sel = 0;

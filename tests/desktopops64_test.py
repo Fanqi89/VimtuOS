@@ -22,7 +22,7 @@
      都进 config64 覆盖表；下一次打开资源管理器时按新值重扫。
   4) 持久化：上面的两个键在重启后仍在（[CONF64] load ...）。
 
-用法：py -3 tests\\desktopops64_test.py [--img build64/system.img] [--qemu 路径] [--port 5678] [--keep] [--no-reboot]
+用法：py -3 tests\desktopops64_test.py [--img build64/system.img] [--qemu 路径] [--port 5678] [--keep] [--no-reboot]
 退出码：0 = 全通过；1 = 有断言失败；2 = 环境问题
 """
 import argparse
@@ -307,6 +307,10 @@ def main():
 
     try:
         print("=== 0) 引导 ===")
+        # ★ 缺陷 4（登录必须显式输入）：默认不再自动登录 —— 先等锁屏可交互，再回车两次进桌面。
+        vm.wait_log("[LOCK64] bg blur ready", 150)
+        mon.key("ret", wait=1.0)          # 锁屏 -> 登录界面
+        mon.key("ret", wait=1.5)          # 登录按钮（无密码用户）
         up = vm.wait_log("[GUI64] ready", 120)
         check("桌面就绪 [GUI64] ready", up)
         if not up:
@@ -355,6 +359,8 @@ def main():
             click_until(int(nav.group(1)), int(nav.group(2)), "[SET64] page=8")
             page8 = vm.wait_log("[SET64] page=8", 4, since=n1)
             check("点导航切到「Dock 栏」页（[SET64] page=8）", page8, "")
+        # ★ 等待 page=8 那一帧的控件打点落下（切页动效 225ms；原来直接 re.search 会与重绘赛跑）
+        vm.wait_log("[SET64] ctl page=8 id=181", 6, since=0)
         sw = re.search(r"\[SET64\] ctl page=8 id=181 kind=switch x=\d+ y=\d+ w=\d+ h=\d+ cx=\d+ cy=\d+ "
                        r"ax=(\d+) ay=(\d+) acx=(\d+) acy=(\d+)", vm.log())
         check("新入口控件打点（[SET64] ctl page=8 id=181 kind=switch）", sw is not None,
@@ -373,6 +379,7 @@ def main():
                       "off list=%s on list=%s" % (off[0], on[-1]))
 
         print("=== 3) 设置入口：恢复默认桌面图标（id=180，持久化 ui.desktop.icons）===")
+        vm.wait_log("[SET64] ctl page=8 id=180", 6)
         btn = re.search(r"\[SET64\] ctl page=8 id=180 kind=button x=\d+ y=\d+ w=\d+ h=\d+ cx=\d+ cy=\d+ "
                         r"ax=(\d+) ay=(\d+) acx=(\d+) acy=(\d+)", vm.log())
         check("新入口控件打点（[SET64] ctl page=8 id=180 kind=button）", btn is not None, btn.group(0) if btn else "")
@@ -944,6 +951,10 @@ def main():
             time.sleep(2)
             vm = Vm(qemu, [args.img, esp], args.port, "vimtu-deskops2", tmp)
             mon = vm.wait_monitor()
+            # ★ 缺陷 4：重启后同样必须显式输入才进桌面
+            vm.wait_log("[LOCK64] bg blur ready", 150)
+            mon.key("ret", wait=1.0)
+            mon.key("ret", wait=1.5)
             up2 = vm.wait_log("[GUI64] ready", 120)
             check("重启后桌面再次就绪", up2)
             if up2:

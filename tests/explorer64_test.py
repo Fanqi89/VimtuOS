@@ -550,6 +550,10 @@ def main():
     try:
         # ==================== 阶段 1：引导 + 启动期打点 ====================
         print("=== 阶段 1：引导（Python 造的 16MB 系统盘：C: = VimtuFS2 v3 卷 + ESP 条目）===")
+        # ★ 缺陷 4（登录必须显式输入）：默认不再自动登录 —— 先等锁屏可交互，再回车两次进桌面。
+        vm.wait_log("[LOCK64] bg blur ready", 150)
+        mon.key("ret", wait=1.0)          # 锁屏 -> 登录界面
+        mon.key("ret", wait=1.5)          # 登录按钮（无密码用户）
         up = vm.wait_log("[GUI64] ready", 120)
         check("桌面就绪（[GUI64] ready）", up)
         log = vm.log()

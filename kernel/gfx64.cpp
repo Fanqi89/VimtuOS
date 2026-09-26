@@ -774,9 +774,14 @@ static uint64_t g_wall_markers_drawn = 0;   // 每次 gfx64_wall_build_default64
 static uint64_t g_wall_build_ticks = 0;     // 最近一次 gfx64_wall_build_default64 用时
 static uint64_t g_wall_compose_ticks = 0;   // 最近一次 wall_compose64 像素铺图用时（不含模糊）
 static uint64_t g_wall_blur_ticks = 0;      // 最近一次整屏模糊用时
+// ★ 缺陷 5：内置兜底壁纸的四角**定位标记**（测试用）—— 生产默认完全不可见。
+//   开关 = config64 的 `ui.wall.markers`（默认 0；1 = 画出 4 个标记）。
+//   gui64 里 Ctrl+Shift+M 可以在运行时切换它（测试脚本用），切换后 gfx64_wall_tick64 重建壁纸。
+static int g_markers_cfg = -1;              // -1 = 还没读过配置
 
 // ---- 内置壁纸生成（也是模糊证据的载体：细颗粒在玻璃下被抹平）----
-// 组成：主题渐变（对角） + 网格柔光斑（160 间距，半径 62） + 细颗粒（±4） + 4 个定位标记
+// 组成：主题渐变（对角） + 网格柔光斑（160 间距，半径 62） + 细颗粒（±4）
+//   + 仅当 ui.wall.markers=1 时：4 个定位标记
 //   标记（16x16，不透明，写在最后）：红 TL(96,96) 绿 TR(1088,96) 蓝 BL(96,788) 黄 BR(1088,788)
 void gfx64_wall_build_default64() {
     const uint64_t t_build0 = ticks64();
@@ -824,18 +829,23 @@ void gfx64_wall_build_default64() {
         { GFX64_DEF_INSET,                    GFX64_DEF_H - GFX64_DEF_INSET - GFX64_DEF_MARK, rgb(48, 64, 192), "b" },
         { GFX64_DEF_W - GFX64_DEF_INSET - GFX64_DEF_MARK, GFX64_DEF_H - GFX64_DEF_INSET - GFX64_DEF_MARK, rgb(224, 192, 48), "y" },
     };
+    // ★ 缺陷 5：默认**不画**（生产观感优先）。只有 ui.wall.markers != 0 时才落笔（测试用）。
+    const int want_marks = cfg64_wall_markers64();
+    g_markers_cfg = want_marks;
     int marks_drawn = 0;
-    for (int m = 0; m < 4; m++) {
-        bool in_range = true;
-        for (int y = marks[m].y; y < marks[m].y + GFX64_DEF_MARK; y++) {
-            if (y < 0 || y >= g_wallh) { in_range = false; continue; }
-            uint32_t* row = g_wallpx + (uint64_t)y * g_wallw;
-            for (int x = marks[m].x; x < marks[m].x + GFX64_DEF_MARK; x++) {
-                if (x < 0 || x >= g_wallw) { in_range = false; continue; }
-                row[x] = marks[m].c;
+    if (want_marks) {
+        for (int m = 0; m < 4; m++) {
+            bool in_range = true;
+            for (int y = marks[m].y; y < marks[m].y + GFX64_DEF_MARK; y++) {
+                if (y < 0 || y >= g_wallh) { in_range = false; continue; }
+                uint32_t* row = g_wallpx + (uint64_t)y * g_wallw;
+                for (int x = marks[m].x; x < marks[m].x + GFX64_DEF_MARK; x++) {
+                    if (x < 0 || x >= g_wallw) { in_range = false; continue; }
+                    row[x] = marks[m].c;
+                }
             }
+            if (in_range) marks_drawn++;
         }
-        if (in_range) marks_drawn++;
     }
     g_wall_markers_drawn = (uint64_t)marks_drawn;
     g_wall_build_ticks = ticks64() - t_build0;
@@ -1196,7 +1206,10 @@ int gfx64_wall_tick64() {
             dbg64_line_end64();
             return 1;
         }
-        return 0;
+        // ★ 缺陷 5：首次读到 cfg 就把 g_mode_cfg 固定下来（g_mode 与 cfg 相同的情况）——
+        //   否则 g_mode_cfg 永远是 -1，下面的"cfg 变了 / 标记开关变了"两条检查都走不到。
+        //   （原来只有"cfg != 当前模式"才会置 g_mode_cfg，导致这两条检查在这条路径上永不生效。）
+        g_mode_cfg = m;
     }
     const int m = cfg64_wall_mode64();
     if (m != g_mode_cfg && m >= 0 && m < GFX64_WALL_MODE_COUNT) {
@@ -1211,6 +1224,28 @@ int gfx64_wall_tick64() {
         dbg64_nl();
         dbg64_line_end64();
         return 1;
+    }
+    // ★ 缺陷 5：`ui.wall.markers` 开关变了 -> 内置兜底壁纸要重建（四角定位标记只在测试里开）。
+    //   只在"用的是内置壁纸"时重建（文件壁纸里没有标记，重建没意义）。
+    if (g_markers_cfg < 0) g_markers_cfg = cfg64_wall_markers64();
+    {
+        const int wm = cfg64_wall_markers64();
+        if (wm != g_markers_cfg && g_wall_desc && g_wall_desc[0] == 'b') {
+            const int prev = g_markers_cfg;
+            g_markers_cfg = wm;
+            gfx64_wall_build_default64();
+            gfx64_wall_invalidate64();
+            dbg64_line_begin64();
+            dbg64_str("[GFX64] wall markers cfg ");
+            dbg64_dec((uint64_t)(prev != 0 ? 1 : 0));
+            dbg64_str("->");
+            dbg64_dec((uint64_t)(wm != 0 ? 1 : 0));
+            dbg64_str(" (ui.wall.markers; default 0 = invisible)");
+            dbg64_nl();
+            dbg64_line_end64();
+            return 1;
+        }
+        g_markers_cfg = wm;
     }
     return 0;
 }

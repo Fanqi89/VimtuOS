@@ -261,9 +261,13 @@ def main():
     vm = Vm(qemu, args.img, args.port, "vimtu-start64", tmp)
     try:
         mon = vm.wait_monitor()
-        print("=== 0) 开机就绪（锁屏 -> 自动登录 -> 桌面）===")
+        print("=== 0) 开机就绪（锁屏 -> 显式回车登录 -> 桌面）===")
+        # ★ 缺陷 4（登录必须等显式输入）：默认不再自动登录 —— 先等锁屏可交互，再回车两次进桌面。
+        vm.wait_log("[LOCK64] bg blur ready", 150)
+        mon.key("ret", wait=1.0)          # 锁屏 -> 登录界面
+        mon.key("ret", wait=1.5)          # 登录按钮（无密码用户）
         up = vm.wait_log("[GUI64] ready", 120)
-        check("桌面就绪（[GUI64] ready；锁屏/登录在它之前）", up)
+        check("桌面就绪（[GUI64] ready；锁屏/显式登录在它之前）", up)
         log = vm.log()
         init = re.search(r"\[START64\] init screen=(\d+)x(\d+) menu=(\d+)x(\d+) r_top=(\d+) r_bottom=(\d+) gap_dock=(\d+)", log)
         check("[START64] init 打点（菜单尺寸/圆角/离 Dock 间距来自 Token）", init is not None,
@@ -313,6 +317,68 @@ def main():
                   (re.search(r"\[START64\] open why=[^\r\n]*", vm.log()) or [""])[0])
         log = vm.log()
         check("open 计数增加", log.count("[START64] open why=") > n_open)
+
+        # ---------- 1b) ★ 缺陷 1：Win 键 -> **新**开始菜单（旧菜单整体删除、不可达）----------
+        print("=== 1b) Win 键 -> 新开始菜单（[START64] open why=win-key；旧菜单位置没有像素）===")
+        mon.key("esc", wait=0.9)                  # 先关掉上面点按钮开的新菜单
+        time.sleep(0.5)
+        n_win = len(vm.log())
+        mon.key("meta_l", wait=1.4)
+        got_win = vm.wait_log("[START64] open why=win-key", 8, since=n_win)
+        check("★ 缺陷 1：Win 键打开**新**开始菜单（[START64] open why=win-key）", got_win,
+              (re.search(r"\[START64\] open why=[^\r\n]*", vm.log()[n_win:]) or [""])[0])
+        # 新菜单几何就在 open 行里（x/y/w/h）：居中偏方 400x420（旧菜单是左侧 240x308 的条目表）
+        ow = re.search(r"\[START64\] open why=win-key x=(\d+) y=(\d+) w=(\d+) h=(\d+)", vm.log()[n_win:])
+        check("★ 缺陷 1：Win 键开的是**新**菜单几何（w=400 h=420 且水平居中，不是旧菜单 240 宽左侧条）",
+              ow is not None and int(ow.group(3)) == 400 and int(ow.group(4)) == 420 and
+              abs(int(ow.group(1)) + int(ow.group(3)) // 2 - 640) <= 1 and int(ow.group(1)) > 4,
+              ow.group(0) if ow else "（无 open 行）")
+        # 旧开始菜单是**左侧竖条条目表**：x=4..244、宽 240、高 10*30+8=308、底边贴老 32px 任务栏上沿。
+        # 老实现已整体删除（gui64.cpp 里没有 draw_menu/menu_activate/g_menu_open），所以这块必须在
+        # 像素上与"没开菜单的基线"逐点相同 —— 这比"旧打点不存在"更硬（打点是文本，像素是画面）。
+        time.sleep(0.8)
+        shotw = os.path.join(tmp, "win_key.ppm")
+        mon.shot(shotw)
+        ww0, hh0, pxw0 = read_ppm(shotw)
+        same_old = diff_old = 0
+        try:
+            wb2, hb2, pxb2 = read_ppm(os.path.join(tmp, "base.ppm"))
+        except (OSError, ValueError):
+            wb2, hb2, pxb2 = 0, 0, b""
+        if (ww0, hh0) == (wb2, hb2) and pxb2:
+            old_y0 = hh0 - 76 - 308 - 2
+            for yy in range(max(0, old_y0), min(hh0, old_y0 + 308), 4):
+                for xx in range(4, 244, 4):
+                    if sample(pxw0, ww0, xx, yy) != sample(pxb2, wb2, xx, yy):
+                        diff_old += 1
+                    else:
+                        same_old += 1
+        check("★ 缺陷 1：旧菜单位置与基线逐点相同（旧 GUI 没有残留；采样 %d 点，差异 %d）"
+              % (same_old + diff_old, diff_old), same_old > 2000 and diff_old == 0,
+              "same=%d diff=%d" % (same_old, diff_old))
+        n_win2 = len(vm.log())
+        mon.key("meta_l", wait=1.2)               # 再按一次 Win = 关（close why=win-key）
+        check("★ 缺陷 1：再按 Win 关闭新菜单（[START64] close why=win-key）",
+              vm.wait_log("[START64] close why=win-key", 8, since=n_win2),
+              (re.search(r"\[START64\] close why=[^\r\n]*", vm.log()[n_win2:]) or [""])[0])
+        # 收尾：把菜单重新开起来（后面第 2 节要的"菜单面板像素"断言依赖菜单是开的）。
+        # QEMU sendkey 偶发丢键：最多按 4 次，按日志里最后一次 open/close 判定当前状态。
+        menu_open_now = False
+        got_reopen = False
+        for _try in range(4):
+            n_win3 = len(vm.log())
+            mon.key("meta_l", wait=1.3)
+            seg3 = vm.log()[n_win3:]
+            if "[START64] open why=win-key" in seg3:
+                menu_open_now = True
+                got_reopen = True
+                break
+            if "[START64] close why=win-key" in seg3:
+                menu_open_now = False
+            time.sleep(0.4)
+        check("★ 缺陷 1：Win 键可以再把新菜单开起来（菜单开关可重复）", got_reopen and menu_open_now,
+              "menu_open=%s（最后一次 Win 的结果）" % menu_open_now)
+        time.sleep(0.6)
 
         # ---------- 2) 几何（打点 + 像素）----------
         print("=== 2) 开始菜单几何：居中 / 离 Dock 10~12 / 上圆角 24 下圆角 10 / 不压 Dock ===")

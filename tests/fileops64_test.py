@@ -260,6 +260,10 @@ def main():
     try:
         # ==================== 阶段 1：引导 ====================
         print("=== 阶段 1：引导（C: = 16MB v3 卷，D: = 预置数据的第二块盘）===")
+        # ★ 缺陷 4（登录必须显式输入）：默认不再自动登录 —— 先等锁屏可交互，再回车两次进桌面。
+        vm.wait_log("[LOCK64] bg blur ready", 150)
+        mon.key("ret", wait=1.0)          # 锁屏 -> 登录界面
+        mon.key("ret", wait=1.5)          # 登录按钮（无密码用户）
         ck("桌面就绪（[GUI64] ready）", vm.wait_log("[GUI64] ready", 150))
         log = vm.log()
         ck("文件管理器自检（含批次 J 的名字/后缀/多选位图检查）[EXPL] selftest PASS",

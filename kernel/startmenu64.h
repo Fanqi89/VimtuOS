@@ -90,7 +90,9 @@ void startmenu64_init64();                       // gui64_run 里（theme64/gfx6
 bool startmenu64_is_open64();
 void startmenu64_open64(const char* why);
 void startmenu64_close64(const char* why);
-void startmenu64_toggle64();
+void startmenu64_toggle64();                     // Dock 开始按钮：open why=start-button / close why=toggle
+// ★ 缺陷 1：Win 键专用开关 —— 打开/关闭都打 [START64] open|close why=win-key（验收判据）
+void startmenu64_win_key_toggle64();
 int  startmenu64_handle_mouse_press64(int mx, int my, int button);   // 1 = 已消费
 void startmenu64_handle_mouse_move64(int mx, int my, int buttons);
 int  startmenu64_handle_key64(uint8_t c);        // 1 = 已消费（含 ESC 一级）

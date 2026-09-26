@@ -238,7 +238,11 @@ def main():
         mon = Monitor(args.port)
 
         print("=== 1) 等桌面起来 ===")
-        up = wait_for("[GUI64] ready", 60, "桌面就绪 [GUI64] ready")
+        # ★ 缺陷 4（登录必须显式输入）：默认不再自动登录 —— 先等锁屏可交互，再回车两次进桌面。
+        wait_for("[LOCK64] bg blur ready", 150, "锁屏可交互")
+        mon.key("ret", wait=1.0)          # 锁屏 -> 登录界面
+        mon.key("ret", wait=1.5)          # 登录按钮（无密码用户）
+        up = wait_for("[GUI64] ready", 90, "桌面就绪 [GUI64] ready")
         log = slog()
         check("等待桌面就绪", up)
         check("内存自检通过", "[MEM64] selftest PASS" in log)

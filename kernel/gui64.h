@@ -109,7 +109,8 @@ void    gui64_dirty(int x, int y, int w, int h);
 int     gui64_screen_w();
 int     gui64_screen_h();
 int     gui64_taskbar_h();
-bool    gui64_start_menu_open();
+// （★ 缺陷 1：老朋友 gui64_start_menu_open() 已随老开始菜单一起删除 —— 用
+//   kernel/startmenu64.h 的 startmenu64_is_open64() 查询"开始菜单是否打开"。）
 Window* gui64_top_window();
 Window* gui64_window_at(int i);              // 遍历所有窗口（0..gui64_window_count()-1）
 int     gui64_window_count();

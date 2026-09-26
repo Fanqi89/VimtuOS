@@ -403,6 +403,16 @@ def aim_axis(mon, axis, d):
     _move_axis(mon, axis, d, -20)
 
 
+
+
+def login_desktop(vm, mon):
+    """★ 缺陷 4（登录必须等显式输入）：默认不再自动登录 ——
+    先等锁屏可交互，再回车（锁屏 -> 登录界面）+ 回车（无密码用户点登录按钮）进桌面。"""
+    if not vm.wait_log("[LOCK64] bg blur ready", 150):
+        return False
+    mon.key("ret", wait=1.0)
+    mon.key("ret", wait=1.5)
+    return True
 def goto(vm, mon, tx, ty, tries=10):
     """把光标闭环挪到 (tx,ty) 附近；返回最终探测到的位置（或 None，表示已压在图标上）。"""
     for _ in range(tries):
@@ -447,6 +457,7 @@ def main():
     try:
         mon = vm.wait_monitor()
         print("=== 1) Dock 几何（串口 + 像素）===")
+        login_desktop(vm, mon)            # ★ 缺陷 4：登录界面要显式输入（回车两次）
         up = vm.wait_ready(90)
         check("桌面就绪", up)
         log = vm.log()
@@ -734,11 +745,31 @@ def main():
             time.sleep(0.6)
 
         print("=== 6) 壁纸 6 种适应模式（几何 + 定位标记像素）===")
-        mk = re.search(r"\[GFX64\] wall markers r=(\d+),(\d+) g=(\d+),(\d+) b=(\d+),(\d+) y=(\d+),(\d+) size=(\d+)(?: markers_drawn=(\d+))?", vm.log())
-        check("[GFX64] wall markers 打点（4 个定位标记）", mk is not None, mk.group(0) if mk else "（无）")
-        # ★ 计量证据（本批加的内核打点）：内置壁纸真的落笔了 4 个定位标记；老内核没有该字段就跳过
-        if mk is not None and mk.group(10) is not None:
-            check("内置壁纸画了 4 个定位标记（markers_drawn=4）", mk.group(10) == "4", "markers_drawn=%s" % mk.group(10))
+        # ★ 缺陷 5：内置兜底壁纸的四角定位标记**默认不可见**（ui.wall.markers=0）。
+        #   判据顺序：(a) 开机后的 markers 行必须是 markers_drawn=0（默认不落笔）；
+        #   (b) Ctrl+Shift+M 把 ui.wall.markers 打开 -> 同一条打点变成 markers_drawn=4；
+        #   (c) 下面的 6 种模式像素断言用打开后的标记做坐标（测试能力保留，生产观感优先）；
+        #   (d) 末尾再关回去，并断言 4 个角点像素 == 邻近壁纸像素（差异 <= 2）。
+        mk0 = re.search(r"\[GFX64\] wall markers r=(\d+),(\d+) g=(\d+),(\d+) b=(\d+),(\d+) y=(\d+),(\d+) size=(\d+)(?: markers_drawn=(\d+))?", vm.log())
+        check("[GFX64] wall markers 打点（4 个定位标记几何）", mk0 is not None, mk0.group(0) if mk0 else "（无）")
+        check("★ 缺陷 5：默认（ui.wall.markers=0）内置壁纸不画定位标记（markers_drawn=0）",
+              mk0 is not None and mk0.group(10) == "0",
+              "markers_drawn=%s" % (mk0.group(10) if mk0 else "?"))
+        before_m = len(vm.log())
+        mon.key("ctrl-shift-m", wait=1.2)
+        got_m = vm.wait_log("[GFX64] wall markers cfg 0->1", 20, since=before_m)
+        if not got_m:                       # 按键偶发丢失：再按一次
+            mon.key("ctrl-shift-m", wait=1.2)
+            got_m = vm.wait_log("[GFX64] wall markers cfg 0->1", 20, since=before_m)
+        check("★ 测试开关：Ctrl+Shift+M 打开 ui.wall.markers（打点 [UI] hotkey ctrl+shift+m wall.markers=1）",
+              got_m and "ctrl+shift+m wall.markers=1" in vm.log()[before_m:],
+              (re.search(r"\[UI\] hotkey ctrl\+shift\+m[^\r\n]*", vm.log()[before_m:]) or ["（无）"])[0])
+        wait_repaint64(vm, before_m, timeout=30)
+        mk = re.search(r"\[GFX64\] wall markers r=(\d+),(\d+) g=(\d+),(\d+) b=(\d+),(\d+) y=(\d+),(\d+) size=(\d+) markers_drawn=4", vm.log())
+        check("开关打开后重新生成了内置壁纸（markers_drawn=4）", mk is not None,
+              (re.search(r"\[GFX64\] wall markers[^\r\n]*markers_drawn=4[^\r\n]*", vm.log()) or ["（无）"])[0])
+        if mk is None:
+            mk = mk0
         marks = {}
         if mk:
             marks["r"] = (int(mk.group(1)), int(mk.group(2)))
@@ -869,6 +900,59 @@ def main():
                 check("拉伸模式：标记宽高比 != 1（图被拉变形）", bb is not None and abs(bb[0] / float(bb[1]) - 1.0) > 0.08,
                       "bbox=%s" % (bb,))
 
+        # ★ 缺陷 5（收尾）：把 ui.wall.markers 关回 0，并**用像素证明**四角真的没有标记了：
+        #   每个标记位置的一小块（3x3 平均）必须与紧邻它旁边（+12px，同一条壁纸上）的小块同色（差异 <=2）。
+        before_off = len(vm.log())
+        mon.key("ctrl-shift-m", wait=1.2)
+        off_ok = vm.wait_log("[GFX64] wall markers cfg 1->0", 20, since=before_off)
+        if not off_ok:
+            mon.key("ctrl-shift-m", wait=1.2)
+            off_ok = vm.wait_log("[GFX64] wall markers cfg 1->0", 20, since=before_off)
+        check("★ 缺陷 5：再按一次 Ctrl+Shift+M 关掉标记（打点 wall.markers cfg 1->0）", off_ok,
+              (re.search(r"\[GFX64\] wall markers cfg[^\r\n]*", vm.log()[before_off:]) or ["（无）"])[0])
+        wait_repaint64(vm, before_off, timeout=30)
+        time.sleep(0.8)
+        shot_off = os.path.join(tmp, "wall_marks_off.ppm")
+        mon.shot(shot_off, wait=3.0)
+        wo, ho, pxo = read_ppm(shot_off)
+        check("关掉标记后截图 1280x800", (wo, ho) == (1280, 800), "%dx%d" % (wo, ho))
+        gl_off = re.search(r"\[GFX64\] wall mode=(\d+) name=(\S+) src=(\d+)x(\d+) screen=(\d+)x(\d+) "
+                           r"dst=(-?\d+),(-?\d+),(\d+)x(\d+) scale=(\d+)/(\d+) crop=l(\d+),t(\d+),r(\d+),b(\d+) tiles=(\d+)x(\d+)",
+                           vm.log())
+        if gl_off and marks:
+            gsw, gsh = int(gl_off.group(3)), int(gl_off.group(4))
+            gdx, gdy, gdw, gdh = (int(gl_off.group(i)) for i in range(7, 11))
+            gmode = int(gl_off.group(1))
+
+            def to_screen(sx, sy):
+                if gmode == 3:
+                    return (gdx + sx, gdy + sy)
+                return (gdx + int(round(sx * gdw / float(gsw))), gdy + int(round(sy * gdh / float(gsh))))
+
+            def patch_avg(px, w, hh, x, y, n=1):
+                tot = [0, 0, 0]
+                cnt = 0
+                for yy in range(y - n, y + n + 1):
+                    for xx in range(x - n, x + n + 1):
+                        if 0 <= xx < 1280 and 0 <= yy < 800:
+                            c = sample(px, w, xx, yy)
+                            for k in range(3):
+                                tot[k] += c[k]
+                            cnt += 1
+                return tuple(v // max(1, cnt) for v in tot)
+
+            for key, (sx, sy) in marks.items():
+                ex, ey = to_screen(sx, sy)
+                mx2 = ex + max(1, int(msize * gdw / float(gsw) / 2))
+                my2 = ey + max(1, int(msize * gdh / float(gsh) / 2))
+                if not (20 <= mx2 < 1260 and 20 <= my2 < 780):
+                    continue
+                a = patch_avg(pxo, wo, ho, mx2, my2, 1)
+                b = patch_avg(pxo, wo, ho, mx2 + 14, my2, 1)
+                d = max(abs(a[k] - b[k]) for k in range(3))
+                check("★ 缺陷 5：默认不可见 —— %s 角标记位置(%d,%d)与邻域壁纸同色（差 %d <= 2）"
+                      % (key, mx2, my2, d), d <= 2, "标记处 %s 邻域 %s" % (a, b))
+
         print("=== 7) 减少动画开关 ===")
         before = len(vm.log())
         mon.key("ctrl-shift-r", wait=1.0)
@@ -909,6 +993,7 @@ def main():
             vm1 = Vm(qemu, fixture, args.port + 7, "vimtu-modern-vfs1", tmp)
             try:
                 mon1 = vm1.wait_monitor()
+                login_desktop(vm1, mon1)       # ★ 缺陷 4：显式输入才进桌面
                 check("夹具盘进桌面（[GUI64] ready）", vm1.wait_ready(120))
                 L1 = vm1.log()
                 inst = re.search(r"\[IMG64\] install path=/logo/kaisi\.png bytes=(\d+) written=(\d+) ok=(\d) src=(\S+)", L1)
@@ -1027,7 +1112,8 @@ def main():
                     print("      已把盘上 /logo/kaisi.png 的第 1 块（fs 块 %d）前 64 B 改坏（大小不变）" % blk)
                     vm2 = Vm(qemu, fixture, args.port + 8, "vimtu-modern-vfs2", tmp)
                     try:
-                        vm2.wait_monitor()
+                        mon2 = vm2.wait_monitor()
+                        login_desktop(vm2, mon2)   # ★ 缺陷 4：显式输入才进桌面
                         check("冷启动第二遍进桌面（同一夹具盘）", vm2.wait_ready(120))
                         L2 = vm2.log()
                         check("幂等：第二遍 install 打 reason=exists（盘上已有同大小文件）",

@@ -722,6 +722,15 @@ static void set_cur_user_theme64(int theme_id, int lock_mode) {
     dbg64_nl();
     dbg64_line_end64();
 }
+
+// ★ 缺陷 6①：**所有**改主题/锁屏模式的入口都要同步当前用户的按用户字段，否则会出现
+//   "全局配置被登录时的按用户字段拉回旧值"的互相覆盖。设置页那条路径已经在用
+//   set_cur_user_theme64；这里再给**别的入口**（gui64 的 Ctrl+Shift+T 主题热键）一个可调用的
+//   契约（gui64.cpp 用 extern 声明调用它 —— settings64.h 不在本批可改文件里）。
+void settings64_sync_user_prefs64(int theme_id, int lock_mode) {
+    if (theme_id < 0 && lock_mode < 0) return;
+    set_cur_user_theme64(theme_id, lock_mode);
+}
 static void avatar_apply(const char* src, bool from_file) {
     char path[USERDB64_PATH_MAX];
     int i = 0;

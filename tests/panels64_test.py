@@ -258,6 +258,10 @@ def main():
     cur = Cursor()
     try:
         print("=== 0) 桌面就绪 + panels64 自检 ===")
+        # ★ 缺陷 4（登录必须显式输入）：默认不再自动登录 —— 先等锁屏可交互，再回车两次进桌面。
+        vm.wait_log("[LOCK64] bg blur ready", 150)
+        mon.key("ret", wait=1.0)          # 锁屏 -> 登录界面
+        mon.key("ret", wait=1.5)          # 登录按钮（无密码用户）
         up = vm.wait_log("[GUI64] ready", 120)
         check("桌面就绪（[GUI64] ready）", up)
         log = vm.log()

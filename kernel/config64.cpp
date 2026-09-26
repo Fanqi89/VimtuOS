@@ -107,6 +107,7 @@ static const Cfg64Def kDefs[] = {
     { "ui.theme",          CFG64_T_INT,  0,    nullptr },   // 界面主题 id（0 白=默认 … 5 粉紫；theme64.h）
     { "ui.reduce_motion",  CFG64_T_BOOL, 0,    nullptr },   // 1 = 减少动画（动效全部 0ms/1 帧到位）
     { "ui.wall.mode",      CFG64_T_INT,  0,    nullptr },   // 桌面壁纸适应模式（0 填充=默认）
+    { "ui.wall.markers",   CFG64_T_INT,  0,    nullptr },   // ★ 缺陷 5：内置壁纸四角定位标记（默认 0=不可见）
     { "ui.wall.lock_mode", CFG64_T_INT,  0,    nullptr },   // 锁屏壁纸适应模式（下一波锁屏用）
     { "ui.wall.path",      CFG64_T_STR,  0,    ""        }, // 壁纸文件路径（VimtuFS2 内；空=内置兜底）
     { "ui.avatar.path",    CFG64_T_STR,  0,    ""        }, // 头像文件路径（下一波用）
@@ -720,6 +721,9 @@ void cfg64_set_wall_mode64(int mode) {
     config64_set_int64("ui.wall.mode", mode);
 }
 
+// ★ 缺陷 5：内置兜底壁纸的四角定位标记（测试用开关；默认 0 = 完全不可见）
+int  cfg64_wall_markers64() { return config64_get_int64("ui.wall.markers", 0) ? 1 : 0; }
+void cfg64_set_wall_markers64(int on) { config64_set_int64("ui.wall.markers", on ? 1 : 0); }
 int  cfg64_lock_wall_mode64() {
     int m = config64_get_int64("ui.wall.lock_mode", 0);
     if (m < 0 || m > 5) m = 0;

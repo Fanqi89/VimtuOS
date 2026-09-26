@@ -48,6 +48,10 @@
 #include "desktopops64.h"     // ★ P5：桌面右键菜单 / 玻璃选择框 / 回收站 / 桌面图标集合
 #include "icons64.h"         // ★ 本批：外置图标包（真图标）—— 内核里不含图标字节，见 icons64.h
 
+// ★ 缺陷 6①：settings64.cpp 里的按用户偏好同步（theme/lock_mode）—— settings64.h 不在本批可改文件里，
+//   所以在这里给出声明（实现在 settings64.cpp）。
+void settings64_sync_user_prefs64(int theme_id, int lock_mode);
+
 // ==================== 资源符号（build64.sh 用 objcopy 生成）====================
 extern "C" const uint8_t _binary_icon_mycomputer_bin_start[];
 extern "C" const uint8_t _binary_icon_recyclebin_bin_start[];
@@ -78,7 +82,6 @@ extern "C" const uint8_t _binary_kaisi_png_end[];
 #define ICON_CELL_W  88         // 图标单元格（含标签）
 #define ICON_CELL_H  84
 #define MAX_WINS     16
-#define MENU_ITEMS   10
 #define CLOCK_W      210        // 右下角时钟玻璃片宽度（[UI] clock text 打点仍在这里）
 #define LOGO_W       240        // 开机/关机画面用的 logo 嵌入尺寸（logo/logo.png，见 _make_logo.py）
 #define LOGO_H       150
@@ -115,8 +118,6 @@ static bool     g_used[MAX_WINS];
 static Window*  g_z = nullptr;              // z 序链表：头 = 最前
 static int      g_screen_w = 0, g_screen_h = 0;
 static bool     g_lang_zh = true;
-static bool     g_menu_open = false;
-static int      g_menu_sel = 0;
 static bool     g_click_right = false;
 static int      g_dirty_x0, g_dirty_y0, g_dirty_x1, g_dirty_y1;   // 半开区间
 static bool     g_dirty_any = false;
@@ -492,7 +493,6 @@ void gui64_flip_window(Window* w) {
 int     gui64_screen_w()        { return g_screen_w; }
 int     gui64_screen_h()        { return g_screen_h; }
 int     gui64_taskbar_h()       { return TASKBAR_H; }
-bool    gui64_start_menu_open() { return g_menu_open; }
 Window* gui64_top_window()      { return g_z; }
 bool    gui64_click_is_right()  { return g_click_right; }
 int     gui64_window_count() {
@@ -852,7 +852,8 @@ static void power_anim_screen(const char* txt, const char* log_tag) {
 //   减少动画开关打开时全部 0ms/1 帧到位（theme64_dur64）。
 // 打点：[DOCK64] geom/items/hover/press/bounce/minbar/clock（都有行数上限，防刷屏）。
 // 前置声明：老开始菜单开关（dock_press64 的开始按钮要开它；定义在下面菜单一节）
-static void menu_toggle();
+// ★ 缺陷 1：老开始菜单（menu_toggle/draw_menu/menu_activate/g_menu_open）**整体删除**——
+//   Win 键与 Dock 开始按钮现在都只操作 startmenu64 的新开始菜单（见 handle_keyboard / dock_press64）。
 
 #define DOCK_ITEMS 9
 // ★ 本批（真图标）：icon64 = 外置图标包里的应用 kind（>0 时优先画真图标；-1 = 没有对应图标）
@@ -1296,12 +1297,23 @@ static void dock_draw_one64(int idx, int cx, int icon_px, int hovered, const The
     if (idx == 0) {
         // 开始按钮：真文件 logo/kaisi.png（VimtuFS2 优先，兜底内核内嵌 RGBA）
         if (g_dock_start_ok) {
-            static uint8_t scratch[DOCK_START_DISP * DOCK_START_DISP * 4];
-            if (icon_px != DOCK_START_DISP) {
-                scale_rgba64(g_dock_start_rgba, DOCK_START_DISP, DOCK_START_DISP, scratch, icon_px, icon_px);
-                blit_rgba_scaled(x, y, icon_px, icon_px, scratch);
+            // ★ 缺陷 2 根因修复（BSOD：点"扫雷"/开始菜单"关机·重启" -> CPU_EXCEPTION 0xD #GP err=0）：
+            //   悬停放大时 icon_px = g_dock_icon * 120%（DOCK_HOVER_PCT）> DOCK_START_DISP(46)，
+            //   而这里原来的 scratch 只按 DOCK_START_DISP 开 46*46*4 —— 55*55*4 起的**越界写**
+            //   会连踩后面 3.6KB 的 BSS 静态量（calc64 的 g_slots、mines64 的 g_ms_slot/g_ms_last、
+            //   gui64 的 g_icon_press_* 等）-> 点扫雷读 `st->magic`（#GP，CR2=0）/ 关机复位路径
+            //   kfree 野指针（[MEM64] kfree: bad pointer）。缓冲按**最大**绘制尺寸开 + 入口夹取。
+            //   上限：dock.icon <= 48（config64 夹取）+ 120% = 57 -> 取 64 留余量。
+            #define DOCK_ICON_PX_MAX 64
+            static uint8_t scratch[DOCK_ICON_PX_MAX * DOCK_ICON_PX_MAX * 4];
+            int disp = icon_px;
+            if (disp > DOCK_ICON_PX_MAX) disp = DOCK_ICON_PX_MAX;      // 任何配置下都不越界
+            if (disp < 1) disp = 1;
+            if (disp != DOCK_START_DISP) {
+                scale_rgba64(g_dock_start_rgba, DOCK_START_DISP, DOCK_START_DISP, scratch, disp, disp);
+                blit_rgba_scaled(x, y, disp, disp, scratch);
             } else {
-                blit_rgba_scaled(x, y, icon_px, icon_px, g_dock_start_rgba);
+                blit_rgba_scaled(x, y, disp, disp, g_dock_start_rgba);
             }
         } else {
             gfx64_grad_round64(x, y, icon_px, icon_px, THEME64_R_ICON, t->grad_a, t->grad_b, 1, 255);
@@ -1589,34 +1601,9 @@ static void draw_window(Window* w) {
 }
 // 老 32px 任务栏已在批次"Windows 11 现代外观"里被 draw_dock()（Dock 栏 + 右下时钟玻璃片）取代；
 // 这里保留这条注释作为考古标记：时钟 [UI] clock text= 打点与窗口按钮语义都迁到了 draw_dock/dock_press64。
-// 开始菜单条目（与 32 位同名同序）
-static const char* menu_zh[MENU_ITEMS] = {
-    "终端", "我的电脑", "系统监视器", "计算器", "扫雷",
-    "设置", "任务管理器", "关于 VimtuOS", "重启", "关机"
-};
-static const char* menu_en[MENU_ITEMS] = {
-    "Terminal", "My Computer", "System Monitor", "Calculator", "Minesweeper",
-    "Settings", "Task Manager", "About VimtuOS", "Reboot", "Shutdown"
-};
-static const char* menu_item(int i) { return g_lang_zh ? menu_zh[i] : menu_en[i]; }
-
-#define MENU_W 240
-#define MENU_ITEM_H 30
-#define MENU_H (MENU_ITEMS * MENU_ITEM_H + 8)
-static int menu_x() { return 4; }
-static int menu_y() { return g_screen_h - TASKBAR_H - MENU_H - 2; }
-
-static void draw_menu(void) {
-    if (!g_menu_open) return;
-    const int mx = menu_x(), my = menu_y();
-    fb_fill_rect(mx, my, MENU_W, MENU_H, C_MENU_BG);
-    fb_draw_rect(mx, my, MENU_W, MENU_H, rgb(140, 140, 140));
-    for (int i = 0; i < MENU_ITEMS; i++) {
-        const int iy = my + 4 + i * MENU_ITEM_H;
-        if (i == g_menu_sel) fb_fill_rect(mx + 4, iy, MENU_W - 8, MENU_ITEM_H - 2, C_MENU_SEL);
-        text_ttf(mx + 14, iy + 7, menu_item(i), C_MENU_TXT);
-    }
-}
+// ★ 缺陷 1（新 GUI 替换旧 GUI）：老开始菜单的**条目表 / 几何 / 绘制**（menu_zh/menu_en/MENU_* /
+//   draw_menu）整体删除。Win 键与 Dock 开始按钮 → startmenu64 的新开始菜单；老菜单的
+//   app 入口（终端…关机）现在由 startmenu64 的固定网格 / 搜索 / 电源菜单提供。
 
 // 光标：按 input.cpp 里的形状状态画不同指针（箭头 / 文本 I 形 / 转圈 / 四向 + 对角缩放）
 static void cur_px64(int x, int y, uint32_t c) { fb_putpixel(x, y, c); }
@@ -1745,7 +1732,6 @@ static void render(void) {
     fly_draw64();                // ★ P5：最小化飞向 Dock 的缩略图（窗口之上、Dock 之下）
     draw_dock();                 // ★ 本批：Windows 11 风格 Dock（替换老 32px 任务栏）
     winlist_draw64();            // ★ P5：Dock 悬停窗口列表
-    draw_menu();                 // 老菜单（Win 键）
     desktopops64_menu_draw64();  // ★ P5：桌面右键菜单
     // ★ P2：开始菜单（窗口之上）→ 四个二级弹窗/设备 toast（更靠前）
     startmenu64_draw64();
@@ -1914,32 +1900,9 @@ void app_about_open64() {
 // 这里保留 app_recycle_open64 这个应用契约入口（[APP] recycle opened 打点也在那边打）。
 void app_recycle_open64() { desktopops64_recycle_open64(); }
 
-// ==================== 开始菜单动作（与 32 位 menu_activate 一一对应）====================
-static void menu_activate(int idx) {
-    dbg64_str("[UI] menu activate idx=");
-    dbg64_dec((uint64_t)idx);
-    dbg64_nl();
-    switch (idx) {
-        case 0: app_term_open64();     break;
-        case 1: app_mypc_open64();     break;
-        case 2: app_monitor_open64();  break;
-        case 3: app_calc_open64();     break;
-        case 4: app_mines_open64();    break;
-        case 5: app_settings_open64(); break;
-        case 6: app_tmgr_open64();     break;
-        case 7: app_about_open64();    break;
-        case 8: sys_reboot64();        break;
-        case 9: sys_shutdown64();      break;
-        default: break;
-    }
-}
-static void menu_toggle() {
-    g_menu_open = !g_menu_open;
-    g_menu_sel = 0;
-    dirty_add(0, menu_y(), MENU_W + 8, MENU_H + 4);
-    dbg64_str(g_menu_open ? "[UI] menu open" : "[UI] menu close");
-    dbg64_nl();
-}
+// ★ 缺陷 1：老开始菜单的**动作分派**（menu_activate）与**开关**（menu_toggle）整体删除。
+//   新开始菜单的应用启动 / 关机·重启·锁定都在 kernel/startmenu64.cpp（固定网格 / 搜索 / 电源菜单），
+//   走的是同一个 app_*_open64 / sys_reboot64 / sys_shutdown64 契约入口，所以行为语义不变。
 
 // ==================== 输入处理 ====================
 static int g_prev_btn = 0;      // 上一帧的鼠标按键位
@@ -1972,8 +1935,6 @@ static void handle_mouse_press(int mx, int my, int button) {
         int on_clock = 0;
         const int idx = dock_hit64(mx, my, &on_clock);
         if (idx >= 0) {
-            g_menu_open = false;
-            if (idx != 0 && startmenu64_is_open64()) startmenu64_close64("dock-item");
             g_dock_pressed = idx;
             dock_press64(idx);
             dirty_add(g_dock_x, g_dock_y, g_dock_w, g_dock_h);
@@ -1981,32 +1942,17 @@ static void handle_mouse_press(int mx, int my, int button) {
         }
         if (on_clock) {
             // 时钟玻璃片：纯显示，不响应点击（只是把事件吃掉，避免穿透到桌面拉选择框）
-            g_menu_open = false;
             return;
         }
         if (my >= g_dock_y) {
             // Dock 行内的空白（面板两端留白/图标之间）：也吞掉，不穿透桌面
-            g_menu_open = false;
             return;
         }
     }
     // 2) 开始菜单（P2 新菜单：点菜单外部关闭；不消费点击，让点击继续落到桌面 —— 与老菜单同语义）
     if (startmenu64_is_open64()) startmenu64_handle_mouse_press64(mx, my, button);
-    // 2) 开始菜单
-    if (g_menu_open) {
-        const int mx0 = menu_x(), my0 = menu_y();
-        if (mx >= mx0 && mx < mx0 + MENU_W && my >= my0 && my < my0 + MENU_H) {
-            const int idx = (my - my0 - 4) / MENU_ITEM_H;
-            if (idx >= 0 && idx < MENU_ITEMS) {
-                g_menu_open = false;
-                dirty_add(mx0, my0, MENU_W, MENU_H);
-                menu_activate(idx);
-                return;
-            }
-        }
-        g_menu_open = false;
-        dirty_add(mx0, my0, MENU_W, MENU_H);
-    }
+    // ★ 缺陷 1：老菜单的"点菜单项 = 执行"分支已删除；新菜单的点击在 startmenu64_handle_mouse_press64
+    //   （上面那行按几何命中处理；点菜单外部由它自己关）。
     // 3) 窗口
     Window* w = win_at(mx, my);
     if (w) {
@@ -2390,15 +2336,15 @@ static void handle_keyboard(void) {
         app_tmgr_open64();
         return;
     }
-    // 热键：Win -> 开始菜单（P2：新开始菜单/弹窗打开时，Win = 关掉它们；否则老菜单，兼容既有验收）
+    // 热键：Win -> 开始菜单（★ 缺陷 1 修复：只开**新**开始菜单 startmenu64；
+    //   老菜单已整体删除，Win 键不可能再弹出旧 GUI。再按一次 Win = 关掉它）
     if (kbd_win_pressed()) {
         kbd_consume_win();
-        if (panels64_any_open64() || startmenu64_is_open64()) {
+        if (panels64_any_open64()) {
             (void)panels64_close_all64("win-key");
-            startmenu64_close64("win-key");
             return;
         }
-        menu_toggle();
+        startmenu64_win_key_toggle64();  // 未开 -> open why=win-key；已开 -> close why=win-key
         return;
     }
     uint8_t c = 0;
@@ -2406,15 +2352,34 @@ static void handle_keyboard(void) {
         // ★ P5：Ctrl+Shift+<字母> 组合热键 —— 统一走"按键时刻记录"（input.cpp kbd_ctrl_shift_char64）。
         //   为什么：QEMU sendkey 的按下/释放只隔几毫秒，外壳忙一帧再处理时 kbd_ctrl_pressed()
         //   已经变回 false，组合热键会**偶发漏掉**（实测 gui_modern64_test 的 Ctrl+Shift+R 会红）。
-        //   覆盖：Ctrl+Shift+T/N/R（主题 / 壁纸适应 / 减动效）+ Ctrl+Shift+W（最小化活动窗口）。
+        //   覆盖：Ctrl+Shift+T/N/R（主题 / 壁纸适应 / 减动效）+ Ctrl+Shift+W（最小化活动窗口）
+        //       + ★ Ctrl+Shift+M（缺陷 5：切换内置壁纸的四角定位标记 ui.wall.markers，测试用）
         {
             char csw = 0;
             const bool cs_key = kbd_ctrl_shift_char64(&csw);       // 取走即清空
             if (cs_key && (csw == 'T' || csw == 'N' || csw == 'R')) {
                 if (theme64_hotkey64((uint8_t)csw, 1, 1)) {
+                    // ★ 缺陷 6①：主题热键改的是全局 ui.theme；按用户字段（userdb64）登录时会写回
+                    //   全局 —— 不同步就会"登录后被旧值拉回去"。这里和设置页一样同步当前用户。
+                    if (csw == 'T') settings64_sync_user_prefs64(theme64_id64(), -1);
                     gui64_invalidate();
                     continue;
                 }
+            }
+            // ★ 缺陷 5：Ctrl+Shift+M —— 内置壁纸四角定位标记开关（ui.wall.markers，默认 0 不可见）。
+            //   写成 config 键（和主题/壁纸模式同一套持久化语义），gfx64_wall_tick64 会重建壁纸。
+            if (cs_key && csw == 'M') {
+                const int on = cfg64_wall_markers64() ? 0 : 1;
+                cfg64_set_wall_markers64(on);
+                dbg64_line_begin64();
+                dbg64_str("[UI] hotkey ctrl+shift+m wall.markers=");
+                dbg64_dec((uint64_t)on);
+                dbg64_str(cfg64_wall_markers64() ? " (4 test markers visible)" : " (invisible)");
+                dbg64_nl();
+                dbg64_line_end64();
+                (void)gfx64_wall_tick64();          // 立即重建内置壁纸（不等下一帧）
+                gui64_invalidate();
+                continue;
             }
             if (cs_key && csw == 'W') {
                 Window* aw = top_visible_win64();
@@ -2435,23 +2400,11 @@ static void handle_keyboard(void) {
             gui64_invalidate();
             continue;
         }
-        // ★ P2：二级弹窗优先吃键（ESC 一级）→ 开始菜单（ESC 二级）→ ★ P5 桌面右键菜单 → 老菜单
+        // ★ P2：二级弹窗优先吃键（ESC 一级）→ 开始菜单（ESC 二级 + 数字快捷键）→ ★ P5 桌面右键菜单
+        //   （老菜单那一整段"上下选/回车/数字"的分支已随老菜单一起删除）
         if (panels64_handle_key64(c)) continue;
         if (startmenu64_handle_key64(c)) continue;
         if (desktopops64_menu_key64(c)) continue;
-        if (g_menu_open) {
-            if (c == 0xFD) { g_menu_sel = (g_menu_sel + MENU_ITEMS - 1) % MENU_ITEMS; dirty_add(menu_x(), menu_y(), MENU_W, MENU_H); continue; }
-            if (c == 0xFE) { g_menu_sel = (g_menu_sel + 1) % MENU_ITEMS; dirty_add(menu_x(), menu_y(), MENU_W, MENU_H); continue; }
-            if (c == '\n' || c == '\r') { const int s = g_menu_sel; g_menu_open = false; dirty_add(menu_x(), menu_y(), MENU_W, MENU_H); menu_activate(s); return; }
-            if (c == 0x1B) { menu_toggle(); continue; }
-            if (c >= '0' && c <= '9') {
-                int idx = (c == '0') ? 9 : (c - '1');
-                g_menu_open = false; dirty_add(menu_x(), menu_y(), MENU_W, MENU_H);
-                menu_activate(idx);
-                return;
-            }
-            continue;
-        }
         // 归一化回车：应用两种都认，但统一成 '\n' 更省心（保留原码给终端也无妨）
         Window* w = g_z;
         while (w && (!w->visible || w->minimized)) w = w->next;
@@ -2552,7 +2505,7 @@ static void cursor_shape_update64(int mx, int my) {
     }
     // 2) 窗口边缘/四角 -> 缩放箭头。**先于文本指针判定**：抓取带含窗口内侧 6px，
     //    与 Windows 11 同语义（边缘就是边缘；文本指针只在窗口内部、远离边缘处生效）。
-    if (shape == MOUSE_CUR_ARROW && !g_menu_open && !startmenu64_is_open64() && !panels64_any_open64()) {
+    if (shape == MOUSE_CUR_ARROW && !startmenu64_is_open64() && !panels64_any_open64()) {
         for (Window* p = g_z; p; p = p->next) {
             const int dir = resize_dir64(p, mx, my);
             if (dir) { shape = resize_dir_shape64(dir); why = "window-edge"; break; }
@@ -2793,7 +2746,7 @@ static void winlist_update64(int mx, int my) {
         mx >= g_winlist_x && mx < g_winlist_x + g_winlist_w &&
         my >= g_winlist_y && my < g_winlist_y + g_winlist_h) {
         want = g_winlist_idx;
-    } else if (g_dock_hover > 0 && !panels64_any_open64() && !startmenu64_is_open64() && !g_menu_open) {
+    } else if (g_dock_hover > 0 && !panels64_any_open64() && !startmenu64_is_open64()) {
         Window* tmp[MAX_WINS];
         int n = 0;
         winlist_collect64(g_dock_hover, tmp, &n);
@@ -2958,8 +2911,8 @@ int gui64_selftest() {
     if (gui64_tr("E", "Z")[0] != 'E') fails |= 4096;
     gui64_set_lang_zh(save);
     // 8) 菜单表完整性
-    for (int i = 0; i < MENU_ITEMS; i++)
-        if (!menu_zh[i] || !menu_en[i] || !menu_zh[i][0] || !menu_en[i][0]) fails |= 8192;
+    // 8) ★ 缺陷 1：老菜单表（menu_zh/menu_en/MENU_ITEMS）已删除 —— 检查位保留但不参与失败判定；
+    //    新开始菜单的条目/几何自检在 startmenu64_selftest64()（[START64] selftest PASS）。
     // 9) 脏矩形并集
     g_dirty_any = false;
     gui64_dirty(10, 10, 20, 20);
