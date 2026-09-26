@@ -7,17 +7,23 @@
 全部是本工程自己的 C++ / 汇编代码。
 它自带一张"三合一"安装盘（BIOS 光盘 / U 盘 / UEFI），安装界面与步骤照 Windows 10 做（去掉了输入产品密钥那一步）。
 
-> 版本 **0.3.2-beta14** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
-> 状态（权威判据：`python tests/status_report.py`，本批实测）：**完成 50 / 部分 0 / 未做 0（共 50 项能力）** ——
-> 本批（**P3**）新增一项能力：**Windows 11 风格设置应用（左导航 240px + 卡片内容 + 六组：系统/个性化/网络/用户/安全/关于，全部实时生效并持久化）**；
-> 另修正一个用户可见的真问题：**关于页版本号曾写死 `VimtuOS 0.1.0`** → 改为读 `build64.sh` 的编译期宏（唯一真源，发布只改一处）。
-> 全量验收（`status_report.py --full` 的 `TESTS` 列表 + 专项/扩展脚本；`Get-ChildItem tests\*.py` 实数 **55 个脚本**、`TESTS` 列表实测 44 个）：**本批 0 FAIL** ——
-> **settings64_test（P3 设置页：左导航 240px + 六组 + 主题/壁纸适应模式(桌面·锁屏分别)/Dock 长度与图标尺寸实时生效/字体大小/默认应用/头像/改名/密码设置与清空/关于页 + 软重启持久化)105 条断言**、
-> **locklogin64_test 88 条**（含"设密码→重启必须输密码"、"清空密码直接进桌面"）、
-> **startmenu64_test 58**、**panels64_test 78**、**gui_modern64_test 149**、**ui_extra64_test 47**、**gfx64_test 55**、
-> **rust64_test 124**、**store64_test 55**、**desktop64_test**（曾因逐像素毛玻璃 >5s 触发看门狗 PANIC，改 Token 半透明填充后 PASS）；
-> 上一批的 **perm64_test 95** 与 usbstorage(99)/bootlog64(30)/fileops64(95)/explorer64(71)/fatread64(61)/fs_tree(87)/
-> fs_term(32)/fd64(34)/bigfile64(61)/multivol64(109)/app64(31)/elf64(56)/proc64(67)/sysstate64/boot64_assert 等既有脚本的结论照旧。
+> 版本 **0.3.3-beta15** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
+> 状态（权威判据：`python tests/status_report.py`，本批实测）：**完成 51 / 部分 0 / 未做 0（共 51 项能力）** ——
+> 本批（**P5**，里程碑 M22）新增一项能力：**桌面交互**（桌面右键菜单 8 项（置灰 3 项）/ESC 与点外部关闭、**玻璃选择框 + 拖动**（框内 diff=0）、
+> 拖入回收站、指针形状（6 向 + 文本 I + 转圈）、窗口缩放、最小化飞 Dock 与 Dock 点击语义、圆角桌面图标、恢复默认桌面图标、
+> 资源管理器只隐藏**非引导盘**系统分区）；
+> 本批还修掉**两个用户可见的真 bug**：① **应用窗口内容丢失**（`kernel/gui64.cpp` 的 `render()` 丢了 `g_frames++; g_dirty_any=false;` → 每帧整屏重绘；
+> `kernel/settings64.cpp` 的 `set_draw()` 把**实际绘制**关进了"尺寸变化"的 `if` 里 → 尺寸没变就不画；已修 + 加防回归断言：内核 `[GUI64] app blank` 必须不出现 + `desktopops64_test` 第 9 节）；
+> ② **改壁纸适应模式后桌面不重绘**（真因**不是脏标记** —— 实测整屏标脏 + `fb_flip_region` 都到位；而是**整屏壁纸重建 ~6.3s**：
+> `[GFX64] wall ensure rebuild=1 build_ticks=… compose_ticks=… blur_ticks=3094 total_ticks=3226` → `kernel/gfx64.cpp` 盒式模糊改**按行推进 + 源/目标分开的滑窗**后
+> `blur_ticks 3094 → 141~158`、`total_ticks 3226 → 265~291`，桌面片变化 `0/7560 → 6243/7560`，**逐像素等价**（核外 262 组随机/边界样本 0 处不同））；
+> 顺带清掉残留文本：终端 banner / `ver` 走唯一真源，`git grep "VimtuOS 0.1.0"` 在 `kernel/` `gui_rs/` `build64.sh` `tests/` **全 0 命中**。
+> 全量验收（`status_report.py --full` 的 `TESTS` 列表 + 专项/扩展脚本；`Get-ChildItem tests\*.py` 实数 **56 个脚本**、`TESTS` 列表实测 45 个）：**本批 0 FAIL** ——
+> **desktopops64_test 65-66 条**（P5 桌面交互：右键菜单 8 项/置灰/ESC 与点外部/玻璃选择框（框内 diff=0）/拖入回收站/指针形状/窗口缩放/最小化飞 Dock 与 Dock 点击语义/圆角桌面图标/恢复默认桌面图标/只显示可见分区 + 应用窗口内容防回归 + 壁纸重绘）、
+> **settings64_test 105 条（连跑 2 次）**、**gui_modern64_test 149**、**desktop64_test PASS**、**startmenu64_test 58**、**panels64_test 78**、
+> **locklogin64_test 88**、**explorer64_test 71**、**fileops64_test 95**；`bash build64.sh` EXIT=0；核查汇总 = 完成 51 / 部分 0 / 未做 0（共 51 项能力）；
+> 上一批的 **perm64_test 95** 与 usbstorage(99)/bootlog64(30)/fatread64(61)/fs_tree(87)/fs_term(32)/fd64(34)/bigfile64(61)/
+> multivol64(109)/app64(31)/elf64(56)/proc64(67)/sysstate64/boot64_assert 等既有脚本的结论照旧。
 
 ---
 
@@ -25,6 +31,7 @@
 
 | 能力 | 说明 |
 | **★ Windows 11 风格设置应用（批次 P3）** | `kernel/settings64.{h,cpp}`（3054 行）：**左导航 240px**（`[SET64] nav w=240 item_h=27 groups=6 items=16`）+ 右侧卡片内容，**六组 16 个条目** —— **系统**（显示：分辨率/刷新率只读 + 缩放文案；声音：音量滑块 + 输出源，仅内存态 `applied=0`；电源：锁定/重启/关机）；**个性化**（**主题 7 套**、壁纸、颜色渐变、**壁纸适应模式 6 种且桌面与锁屏分别设置**（可关同步：`[SET64] wall mode=4 name=center target=lock sync=0 lock_mode=4 desktop_mode=3`）、**Dock 长度/图标尺寸/间距**（拖动实时生效 `[SET64] dock len=872 auto=0 icon=46 gap=11 size=60 why=slider applied=1 persisted=1`）、**字体大小 14/16/18**（`[FONT64] size px=18 line=22 … caches_rebuilt=1`））；**网络**（以太网真状态 + WiFi 如实空态 `state=no-hardware`）；**用户**（头像：内置 3 + 本地 PNG `/logo/kaisi.png`（`[USER64] avatar user=vimtu src=/logo/kaisi.png via=settings … persisted=1`）；改名：`[USER64] rename ok from=vimtu to=vimtu2 via=settings` 写 `/etc/users.db` 并同步开始菜单）；**安全**（密码设置与清空，走 `userdb64` 加盐 SHA-256）；**关于**（版本/驱动清单 `implemented=12 missing=4 gpu=software` / GPU 状态 `accel=none renderer=software` + 硬件检查报告）。**全部实时生效 + 持久化**（`config64`→`store64`）：实测"改主题重启仍是暗色"（`[SET64] theme id=1 name=dark … persisted=1`，重启后 `[THEME64] init … theme=1 name=dark`）、"设密码→重启必须输密码"（`[LOGIN64] password prompt user=vimtu2`）、"清空密码直接进桌面"（`[LOCK64] auto login user=vimtu2`）。端到端 `tests/settings64_test.py`（105 条断言）。P3 边界见下表 |
+| **★ 桌面交互（右键菜单 / 玻璃选择框 + 拖动 / 回收站入口 / 指针形状 / 窗口缩放 / 最小化飞 Dock / 圆角桌面图标；批次 P5，里程碑 M22）** | `kernel/desktopops64.{h,cpp}`（1117 行，新建）+ `kernel/input.cpp`（指针形状）/ `kernel/gui64.cpp`（飞 Dock、minbar、防回归断言）/ `kernel/gfx64.cpp`（模糊滑窗）接线：**① 桌面右键菜单** 8 项、置灰 3 项、ESC 与点外部关闭（`[DESK64] menu open x=639 y=301 w=180 h=270 items=8 enabled=5 row=32 r=14 shadow=2 edge=1 (acrylic)`）；**② 玻璃选择框 + 拖动**（`[DESK64] selbox glass x=316 y=233 w=644 h=245 corner=9 edge=1 inside_alpha=0 sel=3`，**框内 diff=0**：选择框不糊内容）；**③ 回收站入口**（拖入/删除进回收站 `[RECYCLE64] add kind=2 n=1 desktop=2`）；**④ 指针形状**（6 向 + 文本 I + 转圈：`[INPUT64] cursor shape=size-h prev=arrow`，实跑命中 2 向）；**⑤ 窗口缩放**（八向缩放 + 内容重排）；**⑥ 最小化飞 Dock + Dock 点击语义**（`[DOCK64] minimize fly app=3 idx=2 dur=225ms anim=scale+fade`、`[DOCK64] minbar idx=4 x=… w=… clickable=0`、多窗口一根横杠 + 悬停窗口列表选窗）；**⑦ 圆角桌面图标**（恢复默认 `[DESK64] icons reset why=settings defaults=3 persisted=1`）+ **资源管理器只显示可见分区**（`[EXPL64] hidden idx=1 disk=1 part=2 name=… reason=system-partition`）。本批修掉的两个真 bug：**应用窗口内容丢失**（`gui64.cpp` `render()` 丢 `g_frames++; g_dirty_any=false;` + `settings64.cpp` `set_draw()` 把绘制关进"尺寸变化"的 `if`；防回归断言 = 内核 `[GUI64] app blank` 必须不出现）与**改壁纸适应模式后桌面不重绘**（真因是整屏壁纸重建 ~6.3s：模糊内核改行序滑窗后 `blur_ticks 3094 → 141~158`、`total_ticks 3226 → 265~291`，桌面片 `0/7560 → 6243/7560`，逐像素等价）。验收 `tests/desktopops64_test.py` 65-66 条 + `tests/settings64_test.py` 105 条 |
 | **★ 开始菜单 + 四个二级弹窗 + 设备插拔 toast（批次 P2）** | `kernel/startmenu64.{h,cpp}` + `kernel/panels64.{h,cpp}`（3593 行）：**居中开始菜单**（`x=440 y=293 w=400 h=420`、**底边距 Dock 顶 11px**：`bottom=713 dock_top=724 gap=11`、**上圆角 24 / 下圆角 10**、亚克力 + 双层浅阴影 + 1px 高光边、跟随主题）；**搜索框**（`x=630 y=357 w=194 h=34 r=8`，实时过滤 + 回车启动走 `app64_launch64`）；**2×4 固定网格**（8 个磁贴 108×62，应用名中英双语）；**左上时间 + 年月日**；**状态区四个极简线性图标**（网络→声音→中/英→通知，`[START64] status icon …` 逐个打点）；**左下头像 + 用户名**、**右下设置 + 电源菜单**（关机/重启/锁定；动效只有按下高亮 + 内缩）；**ESC 两级退出**（先关弹窗再关菜单）。**四个二级弹窗**（各 320×380 / 340×104 / 300×380 / 400×450）：**通知**（角标 + 未读计数 + 空态“无通知”）、**声音**（滑块 + 百分比 + 输出源，**如实标注未接音频驱动** `applied=0`）、**网络**（WiFi 区如实空态 `[PANEL64] net wifi count=0 state=no-hardware text=无无线硬件` + 以太网区固定行）、**日历**（**7×6** 网格、滚轮 / 方向键 / PageUp·PageDown 翻月、今天、年份面板）；弹窗全部**亚克力 + 双层浅阴影 + 1px 高光边 + 跟随主题 + 锚点跟随开始菜单**（`follow=menu`）且**不压 Dock / 不超屏**（`no_dock_overlap=1`）；`input.cpp` 加 **Caps 反转 Shift**、**Shift 切中英**、**Intellimouse 4 字节滚轮**（`[INPUT64] wheel mode=1 id=3 packet=4B`）。端到端 `tests/startmenu64_test.py`（58 条断言）+ `tests/panels64_test.py`（78 条断言）。P2 边界见下表 |
 | **★ VimtuFS2 v4 权限（uid/gid/mode + 真拦截 + su/sudo 提权，批次 P4）** | `kernel/vfs64.{h,cpp}`：卷格式 **v4**（inode 仍 **128B**：`type@0` / `namelen@1` / `size@4` / `d0..d3@8,12,16,20` / `ind@24` / `parent@28` / `mtime@32` / `nlink@36` / `kind@38` / `name@40..71` / `dind@71` / **`uid@75, gid@77, mode@79`** / 保留 `@81..124` / `CRC@124`（覆盖 `[0,124)`））；**owner / group / other 三段 rwx 真拦截**（读 `r`、写 `w`、遍历 `x`、目录写 `w+x`），拒绝一律 **`-EACCES`(13)** 并打 `[PERM64] deny op=… path=… uid=… gid=… mode=… need=… owner=u:g`（调用方 `[FD64] open FAILED … rc=13`）；**进程 uid/gid/euid/egid**（fork/execve 继承）+ **`getuid/geteuid/setuid/chmod/chown/umask/access/stat` 返回真值**；`su - root` / `su -` / `sudo -i` **真提权**（`[PERM64] cred uid=0 gid=0 euid=0 egid=0 user=root via=su-dash`）；终端 `ls -l` / `chmod` / `chown` / `umask` / `tree` / `su` / `id` 全走真权限。新格式化一律产出 **v4**（`[VFS64] format ok blocks=24759 version=4 inode=128 root=8017 perm=uid/gid/mode@75/77/79 rootmode=0755`）；**v3/v2 旧卷可挂载可读写但不拦截**（卷里没有权限字段，`chmod` 明确回 `volume v3 has no mode field`）。自检 `[VFS64] perm selftest ok owner/mode/other/root/chmod/chown/umask=1`；端到端 `tests/perm64_test.py`（95 条断言，含 v3 旧卷兼容）。P4 边界见下表 |
 | **★ 锁屏 + 登录 + 多用户骨架（批次 P1c）** | `kernel/locklogin64.{h,cpp}`（1447 行）：开机第一屏 = **锁屏**（时间 **72px**、年月日 **18px**、白色亚克力、背景**清晰不模糊**）→ 回车/点击 → 背景**清晰→模糊 20px**（动画 250–350ms，取 300ms）→ **登录界面**（**104px** 圆头像、**96×96 圆角 24** 主题渐变登录按钮、有密码时 **360×48** 磨砂密码框 + **48×48** 确认按钮；ESC 平滑反向返回）；`kernel/userdb64.{h,cpp}`（1186 行）：用户库 **`/etc/users.db` v1 文本**（用户名/UID/主目录/头像/加盐哈希；普通用户 uid≥1000、`/home/<名>/Desktop`，root `/root` **不在登录界面**，首启自动建无密码引导用户 `vimtu`）。终端 `useradd/userdel/passwd/users/whoami/id/su/sudo/exit/loginctl lock`；`su - root`/`su -`/`sudo -i` 提权会话身份（euid=0，GUI 用户名/头像不变），`exit` 退回；会话身份只在内存（重启回锁屏）。打点 `[LOCK64]`/`[LOGIN64]`/`[USER64]`；端到端 `tests/locklogin64_test.py`（88 条断言）。**★ 批次 P4 起会话身份真的管权限**：登录/`su`/`sudo` 会把 `uid/gid/euid/egid` 发布进进程凭证（`[PERM64] cred`），文件系统按它做 rwx 拦截（见上表 P4 行）。边界：口令哈希 = 盐（`rdtsc` xorshift，非 CSPRNG）+ SHA-256×1000（非 bcrypt/argon2）、头像 **JPEG 不支持**、每用户桌面只在用户库/会话层（GUI 桌面图标网格未按用户分目录） |
@@ -69,6 +76,7 @@
 | ⚠️ **开始菜单 / 弹窗 / toast 的边界（批次 P2 新增，如实写清）** | ① **声卡 / 无线驱动未做**：声音面板只改**内存态**（`[PANEL64] sound volume=… why=drag applied=0`，不接任何音频硬件）、**输出源切换只有界面与打点**；网络面板 WiFi 区永远是**如实空态**（`count=0 state=no-hardware text=无无线硬件`，列表绝不造假），只有以太网区是真值（e1000 `STATUS.LU` 活读）；② **U 盘热插拔事件源不可用**：`usb64` 没有拔出检测，toast 事件源只有 e1000 `STATUS.LU`（网线插拔）+ USB 计数轮询差（`[TOAST64] usb poll … hotplug=unsupported`，没有事件就不编事件）；③ **通知的逐条清除 / 全部清除未在测试里注入点击**（界面有，自动化只覆盖角标、空态、新增、超时自动消失、点击关闭）；④ **电源菜单动效只有按下高亮 + 内缩**（关机/重启/锁定三项真实生效，但没有 Win11 那种展开动画）；⑤ 状态区中/英指示器**只显示「英」**：**没有中文输入法**（Shift 只切计数与指示器，`ime=0`）；⑥ **没有 Win 键热键**开关菜单（点开始按钮 / ESC 两级退出） |
 | ⚠️ **权限（批次 P4）的边界（如实写清）** | ① **无 ACL / xattr**：只有 owner / group / other 三段 rwx；② **无 setuid / setgid / sticky 目录位**，也就**没有 setuid 可执行文件提权**路径；③ **无附加组**：没有 `/etc/group`，`gid = uid`（group 段只在 gid 相等时生效）；④ **v2/v3 旧卷不拦截**：卷里没有权限字段（uid 显示 root、mode 默认 0755/0644，`chmod` 明确回 `volume v3 has no mode field`），旧卷要重新格式化才拿到权限；⑤ **root 完全绕过 DAC**（`uid=0` 不做任何检查）；⑥ **FAT32 卷没有权限字段**（只读挂载，不参与权限判定）；⑦ **`su` 对空口令目标免密**（未设密码的用户直接切换）；⑧ 权限主体是**会话身份**（euid/egid 与进程凭证，fork/execve 继承），GUI 侧仍以进程边界隔离 |
 | ⚠️ **设置页（批次 P3）的边界（如实写清）** | ① **卡片/导航是 Token 半透明填充，不是逐像素毛玻璃**（逐像素内容层模糊在 QEMU TCG 下 >5s，会触发看门狗；`desktop64_test` 曾因此 PANIC，改成半透明填充后 PASS）；② **音频仅内存态**（`applied=0`，没有声卡驱动）；③ **WiFi 无硬件**（如实空态 `no-hardware`，列表绝不造假）；④ **刷新率只读**（来自 EDID）；⑤ **`dock.size`（Dock 高度）未接外壳**（长度/图标尺寸/间距已生效）；⑥ **字体大小只改 `font.cpp`**（em 12–18；**不改** 8×8 位图/终端等宽网格）；⑦ **默认应用只做映射 + 持久化**（`[SET64] default kind=txt app=mypc … persisted=1`，**没有关联引擎**）；⑧ 主题/头像/用户名/密码的**正路是设置页**，终端 `passwd`/`useradd` 作为管理员工具保留 |
+| ⚠️ **桌面交互（批次 P5）的边界（如实写清）** | ① 需求 3 的**回收站恢复 / 永久删除 + 二次确认**、需求 5 的**八向缩放 + 内容重排**、需求 4 的**对角 / 文本 I / 转圈**、需求 6 的**多窗口一根横杠 + 悬停窗口列表选窗**：**只有代码 + 断言，没有实跑打点**（QEMU PS/2 注入在这些入口零命中，测试里以 `[skip]` 如实标注且**未削弱阈值**；实跑已证的是桌面右键菜单 / 玻璃选择框 / 回收站入口 / 指针 6 向中的 2 向 / 最小化飞 Dock / 圆角桌面图标）；② 资源管理器只隐藏**非引导盘**系统分区（引导盘 ESP 照列）；③ **锁屏自己的整屏模糊仍 ≈5.5s**（`kernel/locklogin64.cpp` 自算 20px 盒式模糊，**未在本批范围**）；④ 两处既有窄竞态**靠复跑判定**：`tests/settings64_test.py` 的 `[SET64] ctl page=8 id=181/180` 打点延迟 ≈0.56s、`gui_modern64_test` 的 Dock 回弹相位 |
 | ⚠️ **文件操作的边界（本批次新增，如实写清）** | ① **没有递归删除**：非空目录点删除只会提示"目录非空，暂不支持递归删除"（`delete … rc=1 reason=not-empty`），不假装成功；② **单文件上限 8 MiB**（v2 旧卷 67584 B）：超过的源在粘贴时被**整条跳过**（不是截断复制），大文件粘贴走**分块复制**（64 KiB/块，不占大内存、不静默截断）；③ **没有权限/属主、没有回收站**：删除即真删（`unlink64`/`rmdir64`）；④ **重命名只在同一目录内**（改 inode 的 name 字段），**没有跨目录移动/拖拽**（`vfs64_rename64` 不动 `parent`）；⑤ 目录递归复制有界（深度 ≤4、条目 ≤96），超限的条目计入 `skipped`；⑥ 剪贴板是**内核内的路径列表**（不是文件内容快照、不跨重启、最多 8 条）；⑦ 重名后缀是 `(2)`/`(3)`（**无空格**，空格不是合法文件名字符） |
 | ⚠️ **开机滚屏引导控制台的有界性（本批次新增，如实写清）** | ① **滚屏是有界的**：只回放环形缓冲里最近的 320 行、每批 6 行上移（像素拷贝，不做字形重光栅化），最后停 1200 tick-ms —— 之后一定是既有的向导/桌面流程；② **任意键立即结束**（按键会被吞掉，不会影响后面的界面）；③ 环形缓冲 16 KiB：启动后期日志多时最早的**普通**行会被覆盖（`[CON64] replay … dropped=N` 如实计数），只有**头部 16 行**（长模式 / BootInfo / E820 等）永久保留，所以 `dmesg` 里一定看得到最早那几行；④ 缓冲不落盘（`/boot.log` 未做）。 |
 | ⚠️ **用户态独立地址空间** | 批次 C 起：proc64 每进程独立 CR3 + fork/execve/wait4/kill（BIOS 路径）；UEFI（固件页表）下默认仍如实降级为共享地址空间模式（`[PROC64] cr3 isolation OFF`）。**批次 D 实测**：在固件 PML4 上就地挂用户窗口（清 CR0.WP 手法）与自带 PML4 + 运行期 `mov cr3` **两条路径都在 QEMU+OVMF 与 VMware EFI 下成功**（`[PROC64] uefi exp result=B mode=isolated`），但默认构建不编这段实验（宏 `PROC64_UEFI_CR3_EXPERIMENT`），见 `docs/UEFI地址空间实验报告.md` |
@@ -104,7 +112,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
 6. **自研 UEFI 引导（不用 gnu-efi）**：自造 PE32+ 桩（2.5KB）+ 平铺长模式引导器（36KB，链接到 72MB，绕过 EDK2 的 PE 校验）；**RSDP 经固定槽 0x7800 从固件配置表传给内核**。
 7. **一切自写工具链**：没有 mkfs.fat、没有 mtools —— FAT32 卷、ISO9660 解析与打包、GPT、LBA 回填、PE 摊平、字体子集化（**4 套 TTF**：西文/中文/终端等宽/缺字兜底）、图标生成、VAP64 打包，全是本仓库的 Python 脚本。
 8. **APIC / ACPI / SMP 都带"宁可不启用也不变砖"的回退**：拿不到 ACPI 就留 8259、启动 AP 全程有界超时、每个自检失败都整体回滚，降级路径都有串口证据。
-9. **每次改动都跑自动验收**：**55 个验收脚本**（`Get-ChildItem tests\*.py` 实数；`status_report.py --full` 的 `TESTS` 列表 44 个，本次新登记 `settings64_test` 105 条断言），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
+9. **每次改动都跑自动验收**：**56 个验收脚本**（`Get-ChildItem tests\*.py` 实数；`status_report.py --full` 的 `TESTS` 列表 45 个，本批新登记 `desktopops64_test` 65-66 条断言），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
 
 ## 四、系统架构
 
@@ -250,7 +258,7 @@ VMware 里也一样（**新建虚拟机时 `guestOS` 必须选 64 位：`other-6
 
 ```bash
 python tests/status_report.py          # 先看状态：哪些完成/部分/未做（带证据，秒级）
-python tests/status_report.py --full   # 再真跑 44 个验收脚本（约 6-8 分钟；本次新登记 settings64_test）
+python tests/status_report.py --full   # 再真跑 45 个验收脚本（约 6-8 分钟；本批新登记 desktopops64_test）
 
 # 另有专项脚本（--full 列表之外，建议一起跑）；本批新增的 1 个已进 --full 列表，也可单跑：
 python tests/user64_test.py            # ring3 / GDT / 用户页权限
@@ -266,13 +274,14 @@ python tests/startmenu64_test.py       # P2 开始菜单：几何 / 搜索 / 2×
 python tests/panels64_test.py          # P2 四弹窗（通知/声音/网络/日历）+ 设备插拔 toast
 python tests/perm64_test.py            # P4 卷 v4 权限：rwx 真拦截 + su/sudo 提权 + chmod/chown/umask
 python tests/settings64_test.py        # P3 设置页：左导航 240px + 六组 + 实时生效/持久化 + 设密码重启必须输密码
+python tests/desktopops64_test.py      # P5 桌面交互：右键菜单/玻璃选择框/回收站/指针形状/缩放/最小化飞 Dock/圆角图标 + 应用窗口内容防回归 + 壁纸重绘
 
 python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 ```
 
 ## 六、工程质量（这个项目最值得说的部分）
 
-* **55 个验收脚本**（`Get-ChildItem tests\*.py` 实数 55；其中 `status_report.py --full` 的 `TESTS` 列表长度实测 **44**；上一批脚本的全部 PASS 结论保持不变；**本批（P3）登记 1 个脚本全 PASS**：**settings64_test 105 条**（P3 设置页 + 软重启持久化 + "设密码→重启必须输密码"），另有 **locklogin64_test 88 条**、**startmenu64_test 58 条**、**panels64_test 78 条**、**perm64_test 95 条**、**store64_test 55 条**、**rust64_test 124 条**、**gfx64_test 55 条**、**gui_modern64_test 149 条**、**ui_extra64_test 47 条** —— 2026-09-25 实测：本批 0 FAIL（`desktop64_test` 曾在逐像素毛玻璃下触发看门狗 PANIC，改 Token 半透明填充后 PASS），
+* **56 个验收脚本**（`Get-ChildItem tests\*.py` 实数 56；其中 `status_report.py --full` 的 `TESTS` 列表长度实测 **45**；上一批脚本的全部 PASS 结论保持不变；**本批（P5）登记 1 个脚本全 PASS**：**desktopops64_test 65-66 条**（P5 桌面交互 8 项能力 + 应用窗口内容防回归 + 壁纸重绘），另有 **settings64_test 105 条（连跑 2 次）**、**gui_modern64_test 149 条**、**startmenu64_test 58 条**、**panels64_test 78 条**、**locklogin64_test 88 条**、**explorer64_test 71 条**、**fileops64_test 95 条**、**perm64_test 95 条**、**store64_test 55 条**、**rust64_test 124 条**、**gfx64_test 55 条** —— 2026-09-26 实测：本批 0 FAIL（两个真 bug 已修：应用窗口内容丢失、改壁纸适应模式后桌面不重绘），
   并逐脚本复跑既有脚本 —— `usb64_test` 51、`fatread64_test` 61、`explorer64_test` 71、`fileops64_test` 95、
   `multivol64_test` 108、`fs_tree_test` 85、`bootlog64_test` 30、`boot64_assert`、`desktop64_test`、
   `install_flow_test`、`partition_ops_test`、`esp_install_test`、`disk_boot_test`、`iso64_install_test`、
@@ -345,6 +354,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | M19 | **开始菜单 + 四个二级弹窗 + 设备插拔 toast（批次 P2）**：`startmenu64`（居中 400×420、底边距 Dock 顶 11px、上圆角 24 下圆角 10、搜索框 + 2×4 固定网格、状态区四个线性图标、电源菜单、ESC 两级退出）+ `panels64`（通知/声音/网络/日历四弹窗：亚克力 + 双层浅阴影 + 1px 高光边 + 跟随主题 + 锚点跟随开始菜单 + 不压 Dock；设备 toast 右侧滑入 / 停 5s / 可关闭 / 堆叠）+ `input.cpp`（Caps 反转 Shift / Shift 切中英 / Intellimouse 4 字节滚轮） | ✅ |
 | M20 | **VimtuFS2 v4 权限（批次 P4）**：inode 128B 加 `uid@75 / gid@77 / mode@79` + **owner/group/other 三段 rwx 真拦截**（`-EACCES`(13) + `[PERM64] deny` 打点）+ 进程 uid/gid/euid/egid（fork/execve 继承）+ `geteuid/setuid/chmod/chown/umask/access/stat` 返回真值 + `su`/`sudo` 真提权（`[PERM64] cred`）；**v3/v2 旧卷可挂载可读写但不拦截** | ✅ |
 | M21 | **Windows 11 风格设置应用（批次 P3）**：`settings64` 重写为**左导航 240px + 卡片内容 + 六组**（系统：显示/声音/电源；个性化：主题 7 套/壁纸/颜色渐变/**壁纸适应模式（桌面与锁屏分别设置）**/Dock 长度·图标尺寸·间距/字体大小；网络：以太网真状态 + WiFi 无硬件；用户：头像（内置 3 + 本地 PNG）/改名；安全：密码设置与清空；关于：版本/驱动/GPU + 硬件检查），**全部实时生效并持久化**（改主题重启仍暗色 / 设密码重启必须输密码 / 清空密码直接进桌面）；顺带修掉**关于页版本号写死 `VimtuOS 0.1.0`**（改为 `build64.sh` 的编译期宏 `VIMTUOS_VERSION_STR`，发布只改一处） | ✅ |
+| M22 | **桌面交互（批次 P5）**：`desktopops64`（右键菜单 8 项/置灰/ESC 与点外部关闭、玻璃选择框 + 拖动、拖入回收站、指针形状、窗口缩放、最小化飞 Dock、圆角桌面图标、恢复默认图标）+ `input.cpp`（指针形状 6 向/文本 I/转圈）+ `gui64`（飞 Dock 225ms `scale+fade`、minbar 点击语义、`check_app_painted64` 防回归）+ `gfx64`（整屏模糊改**行序滑窗**：`blur_ticks 3094 → 141~158`、`total_ticks 3226 → 265~291`，逐像素等价）+ `explorer`（只显示可见分区）；顺带修掉**两个用户可见真 bug**：**应用窗口内容丢失**（`render()` 丢 `g_frames++/g_dirty_any=false` + `set_draw()` 把绘制关进"尺寸变化"的 `if`）、**改壁纸适应模式后桌面不重绘**（真因是整屏壁纸重建 ~6.3s） | ✅ |
 
 ## 八、路线图（未完成的部分）
 
@@ -479,7 +489,7 @@ VimtuOS/
 │   ├── fat_check.py          # FAT12/16/32 卷按规范体检
 │   └── pe_info.py            # PE 体检（能告出 ImageBase）
 │
-├── tests/                    # ⑤ 验收脚本（54 个 .py / 断言 1,000+ 条：串口 + 像素 + 字节）
+├── tests/                    # ⑤ 验收脚本（56 个 .py / 断言 1,000+ 条：串口 + 像素 + 字节）
 │   ├── status_report.py      # 状态核查（每项能力绑证据：DONE / PARTIAL / MISSING）
 │   ├── boot64_assert.py      # 长模式 / IDT / PIT / BootInfo
 │   ├── install_flow_test.py  # 端到端安装 + 装完单独启动
@@ -520,7 +530,7 @@ VimtuOS/
     └── shots/                 # 历史验证截图集
 ```
 
-仓库规模：内核 `kernel/` 118 文件 / 58,381 行、引导 `boot/` 12 文件、Rust `gui_rs/` 7 个文件、验收 `tests/` 54 脚本、
+仓库规模：内核 `kernel/` 118 文件 / 58,381 行、引导 `boot/` 12 文件、Rust `gui_rs/` 7 个文件、验收 `tests/` 56 脚本、
 文档 `docs/` 16 篇；**发布进仓库的文件 306 个 / 约 8.2 MB**（含 `docs/screenshots/`、`docs/shots/` 的 PNG 截图与字体
 许可全文；第三方字体、打包的交叉编译器、构建产物与退役的 32 位工程都不进仓，见 `.gitignore`）。
 
@@ -551,9 +561,9 @@ objcopy 符号名保持不变。运行时打点：`[FONT64] faces=4 …` / `mono
 `fallback hit cp=0x… face=3` / `selftest PASS mask=…`（验收：`py -3 tests\fonts64_test.py`）。
 许可与派生说明见 [docs/字体许可说明.md](docs/字体许可说明.md)。**因此 ISO/IMG 可以直接公开分发。**
 
-**版本与发布**：标签 `v0.3.2-beta14`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.3.2-beta14>
-（历史版本各自保留安装程序：`v0.3.1-beta13` / `v0.3.0-beta12` / `v0.2.3-beta11` / `v0.2.2-beta10` / `v0.2.1-beta9` / `v0.2.1-beta8` / `v0.2.1-beta7` / `v0.2.1-beta6` / `v0.2.0-beta.5` / `v0.2.0-beta.4` / `v0.2.0-beta.3` / `v0.2.0-beta.2` / `v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
-（预发布；**安装盘已附上**：`vimtu64-64.iso` 三合一安装盘 + `vimtu64-64.img` 裸盘介质）。
+**版本与发布**：标签 `v0.3.3-beta15`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.3.3-beta15>
+（历史版本各自保留安装程序：`v0.3.2-beta14` / `v0.3.1-beta13` / `v0.3.0-beta12` / `v0.2.3-beta11` / `v0.2.2-beta10` / `v0.2.1-beta9` / `v0.2.1-beta8` / `v0.2.1-beta7` / `v0.2.1-beta6` / `v0.2.0-beta.5` / `v0.2.0-beta.4` / `v0.2.0-beta.3` / `v0.2.0-beta.2` / `v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
+（预发布；**安装盘已附上**：`vimtu64-64.iso` 三合一安装盘 + `vimtu64-64.img` 裸盘介质；系统内核 **3,697,088 B**（上限 4,096,000 B，**余量 ~399 KB**）、安装内核 **2,200,272 B**）
 
 ```bash
 # 日常：改完代码这样提交推送（★ 不要用网页拖拽上传 —— 那会绕过 .gitignore）
@@ -607,7 +617,7 @@ token/theme source of truth linked into the **system kernel only** (0 Rust symbo
 and a **lock screen + login + multi-user skeleton** (`/etc/users.db`, salted SHA-256 x1000; `su`/`sudo` switch
 the session identity **and really elevate since P4** — permission checks are enforced now (VimtuFS2 v4: owner/group/other rwx with `-EACCES` + `[PERM64] deny`; root bypasses DAC; v2/v3 legacy volumes are exempt and print an honest legacy notice — see the boundaries); the salt is not a CSPRNG).
 
-The latest batch (P3) rewrites the **Settings app** as a Windows 11-style window: a **240px left navigation** with six
+Batch P3 rewrote the **Settings app** as a Windows 11-style window: a **240px left navigation** with six
 groups (System / Personalisation / Network / Users / Security / About), card content, and **everything takes effect live
 and persists across reboots** through `config64`/`store64` — 7 themes, wallpaper fit modes set separately for desktop
 and lock screen, Dock length/icon size/gap, font size, default-app mapping, avatar, rename, password set/clear, plus an
@@ -616,6 +626,22 @@ About page whose **version string now comes from a single source of truth** (`VI
 semi-transparent fills rather than per-pixel blur (per-pixel content blur exceeded 5s under QEMU TCG and tripped the
 watchdog), audio and WiFi remain honest stubs (memory state / no hardware), the refresh rate is read-only, `dock.size`
 is not wired, font size only changes the em size in `font.cpp`, and default apps are mapping + persistence only.
+
+The newest batch (P5) is about **desktop interaction**: a right-click desktop menu (8 items, 3 greyed out, ESC or
+click-outside closes it), a draggable **glass selection box** (inside diff = 0), drag-to-recycle-bin, cursor shapes
+(6 resize directions + text I-beam + busy spinner), window resizing, **minimise-fly-to-Dock** (225 ms token
+animation, `scale+fade`) with honest Dock click semantics (the running minbar is not clickable), rounded desktop
+icons (restorable to settings defaults), and an Explorer that only lists **visible partitions** (non-boot system
+partitions are hidden, the boot ESP is still listed). It also fixed **two real user-visible bugs**: (1) *app
+windows losing their content* — `render()` in `gui64.cpp` had lost `g_frames++; g_dirty_any=false;` (so every
+frame repainted the whole screen) while `set_draw()` in `settings64.cpp` kept the actual drawing inside the
+"size changed" branch; a regression assertion now requires that the kernel never logs `[GUI64] app blank`;
+(2) *the desktop not repainting after changing the wallpaper fit mode* — the root cause was **not** dirty
+tracking (full-screen invalidation and `fb_flip_region` were both verified fine) but the **full-screen wallpaper
+rebuild taking ~6.3 s** (`blur_ticks=3094 total_ticks=3226`), so the ~5.6 s test screenshot still showed the old
+wallpaper; the box-blur kernel in `gfx64.cpp` now advances **row by row with separate source/destination sliding
+windows**, giving `blur_ticks 3094 → 141~158` / `total_ticks 3226 → 265~291` with **pixel-identical output**
+(0 differences over 262 out-of-kernel random/edge samples) and 6243/7560 changed desktop pixels instead of 0/7560.
 
 Honest boundaries: user address spaces are **per-process** on the BIOS path (proc64: own CR3 +
 fork/execve/wait4/kill) and degrade to a shared window on UEFI firmware tables — a runtime CR3
@@ -633,8 +659,9 @@ whole table, `execve` keeps fds (no `O_CLOEXEC` yet), `O_APPEND` is real and `pi
 
 Everything was validated on **QEMU and VMware, BIOS and UEFI — not on bare metal**.
 
-Quality-wise, every change is verified by assertion scripts (55 `tests/*.py` files; the `tests/status_report.py --full`
-list alone runs 44 scripts — including the new `settings64_test` 105, `locklogin64_test` 88, `gui_modern64_test` 149,
-`rust64_test` 124 and `startmenu64_test` 58 — that check serial logs, screen pixels (QEMU screendumps) and raw disk bytes).
+Quality-wise, every change is verified by assertion scripts (56 `tests/*.py` files; the `tests/status_report.py --full`
+list alone runs 45 scripts — including the new `desktopops64_test` 65-66, `settings64_test` 105, `locklogin64_test` 88,
+`gui_modern64_test` 149, `rust64_test` 124 and `startmenu64_test` 58 — that check serial logs, screen pixels
+(QEMU screendumps) and raw disk bytes).
 Tooling adds ~3k lines of self-written Python (ISO9660/GPT/FAT32/VAP64 packing, font subsetting, PE/FAT diagnostics).
 
