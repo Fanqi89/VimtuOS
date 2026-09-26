@@ -192,9 +192,10 @@ static uint32_t crc32_64(const uint8_t* p, uint32_t n) {
 //       2) g_cur_slot 指向"当前卷"，下面用宏把原来的全局名映射成 g_vol[g_cur_slot] 的字段 ——
 //          于是既有代码（路径解析/inode/位图/读写/遍历）**逐字不动**地作用于当前卷；
 //       3) 切卷 = 改 g_cur_slot（外加 inode 缓存键控），没有任何数据搬运。
-//   * **inode 扇区缓存按 (slot, drive, lba) 三元组键控**（g_ino_cache_slot/drive/lba）：
-//     这是切卷最容易出的 bug —— 缓存只有 LBA 而没有卷身份时，切到另一块盘的同号 LBA 会
-//     把上一个卷的 inode 字节当本卷的用。三元组键控 + 任何写盘都失效（dev_write）双保险。
+//   * **inode 表缓存 = 32 扇区窗口，键 = (slot, drive, 窗口区间)**：这是切卷最容易出的 bug ——
+//     缓存只有 LBA 而没有卷身份时，切到另一块盘的同号 LBA 会把上一个卷的 inode 字节当本卷的用；
+//     三元组键控 + 任何写盘都失效（dev_write）双保险。窗口化本身是**性能**修复（见 ino_cache_fill）：
+//     平表目录扫描每扇区一次 ATA 事务时，一次"进盘符"要 256+ 次事务，TCG 下一帧就顶爆看门狗。
 //   * 系统卷槽 g_system_slot 由 vfs64_mount_system64 / vfs64_format 记录；store64/config64/
 //     update64/app64/elf64/proc64/sysstate64 一律用 vfs64_*_on64(vfs64_system_slot64(), …) ——
 //     "当前卷"只在那一次调用期间被临时换掉，返回前**原样切回**（LIFO 守卫）。所以无论用户正在
@@ -209,7 +210,12 @@ struct Vfs64Geom {
 
 static uint8_t  g_sec[VFS64_SECTOR_BYTES];            // 唯一工作扇区（先读进来再解析）
 static uint32_t g_ptrs[VFS64_INDIRECT_PTRS];          // 释放/搬运时用的 128 个块号
-static uint8_t  g_ino_cache[VFS64_SECTOR_BYTES];      // inode 表"当前扇区"缓存（扫描时少读盘）
+// ★ 本轮（性能修复）：inode 表窗口缓存 —— 一窗 32 扇区 = 128 个 128B inode（表尾按实际块数裁剪）。
+//   为什么：inode 表是平表，列一次目录必须扫完 512 个槽；一扇区一次 ATA 事务时"进盘符"一帧要
+//   256+ 次事务（TCG 下每次十几毫秒）-> [WD64] watchdog fire -> PANIC64 stop=WATCHDOG_TIMEOUT
+//   （tests/multivol64_test.py 阶段 3 实测）。窗口化后全表扫描 = 4 次事务，读的字节完全一样。
+#define VFS64_INO_WIN_SEC 32u
+static uint8_t  g_ino_win[VFS64_INO_WIN_SEC * VFS64_SECTOR_BYTES] __attribute__((aligned(16)));
 // ★ 批次 M：大文件（二级间接）用的工作镜像与记账（都只在一次文件操作内有效，操作串行、不重入）
 static uint8_t  g_l1[VFS64_SECTOR_BYTES];             // 一级间接块镜像（inode->ind）
 static uint8_t  g_l2[VFS64_SECTOR_BYTES];             // 二级间接块镜像（inode->dind）
@@ -221,9 +227,10 @@ static uint32_t g_rm_child[VFS64_INDIRECT_PTRS];      // 只读路径：当前�
 // 一次调用最多把整个文件链建起来（write_stream 整文件重写），所以按最坏情况开表。
 static uint32_t g_newblk[VFS64_MAX_MAP_BLOCKS + VFS64_DIND_CHILDREN + 16u];
 static uint32_t g_newn = 0;
-static int      g_ino_cache_slot  = -1;               // ★ 缓存键 = (slot, drive, lba)
+static int      g_ino_cache_slot  = -1;               // ★ 缓存键 = (slot, drive) + 窗口区间
 static int      g_ino_cache_drive = -1;
-static uint32_t g_ino_cache_lba   = 0xFFFFFFFFu;
+static uint32_t g_ino_win_base    = 0xFFFFFFFFu;      // 窗口首扇区（inode 表内相对块号）
+static uint32_t g_ino_win_count   = 0;                // 窗口里有效扇区数（表尾不足一窗时更少）
 static bool     g_ino_cache_valid = false;
 
 static Vfs64Geom g_vol[VFS64_SLOT_MAX];               // 卷槽表（0 号槽 = 系统卷）
@@ -249,12 +256,39 @@ static void ino_cache_invalidate() {
     g_ino_cache_valid = false;
     g_ino_cache_slot = -1;
     g_ino_cache_drive = -1;
-    g_ino_cache_lba = 0xFFFFFFFFu;
+    g_ino_win_base = 0xFFFFFFFFu;
+    g_ino_win_count = 0;
 }
-// 缓存命中判定：**卷身份**（slot/drive/lba）三项全对才算命中
-static bool ino_cache_hit(int drive, uint32_t lba) {
+// 缓存命中判定：**卷身份**（slot/drive）两项全对 + 目标扇区落在窗口内，才算命中
+static bool ino_cache_hit(int drive, uint32_t rel_blk) {
     return g_ino_cache_valid && g_ino_cache_slot == g_cur_slot &&
-           g_ino_cache_drive == drive && g_ino_cache_lba == lba;
+           g_ino_cache_drive == drive && rel_blk >= g_ino_win_base &&
+           rel_blk < g_ino_win_base + g_ino_win_count;
+}
+// 前向声明（定义在下面的"设备层"一节）：窗口填充要走它，才能一次读多个扇区
+static bool dev_read_at(int drive, uint32_t abs_lba, uint32_t count, void* buf);
+// 把**覆盖 rel_blk 的那一窗** inode 表一次读进来（一窗 = 32 扇区 = 128 个 128B inode；
+// 表尾不足一窗时按表尾裁剪，绝不读到 inode 区之外）。
+// 为什么这么读：inode 表是**平表**（条目不按目录聚簇，靠 parent 字段认亲），列一次目录必须扫完整张表
+// （512 槽 = 128 扇区）。一扇区一次 ATA 事务的话，一次"进盘符"（enter + nav_apply 两次全表扫描）
+// 就是 256+ 次事务，QEMU TCG 下单次事务十几毫秒 -> 一帧 5s+，直接把 GUI 帧顶过看门狗阈值
+// （[WD64] watchdog fire -> PANIC64 stop=WATCHDOG_TIMEOUT，tests/multivol64_test.py 阶段 3 实测）。
+// 改成窗口读之后全表扫描 = 4 次事务；读的字节完全一样，语义不变。
+static bool ino_cache_fill(int drive, uint32_t rel_blk) {
+    ino_cache_invalidate();
+    if (!g_lay) return false;
+    const uint32_t ino_blocks = (g_inode_count + g_lay->inodes_per_blk - 1u) / g_lay->inodes_per_blk;
+    if (rel_blk >= ino_blocks) return false;             // 防御：调用方 inode_slot 已挡过一遍
+    uint32_t base = rel_blk - (rel_blk % VFS64_INO_WIN_SEC);
+    uint32_t n = ino_blocks - base;
+    if (n > VFS64_INO_WIN_SEC) n = VFS64_INO_WIN_SEC;
+    if (!dev_read_at(drive, g_start + g_inode_start + base, n, g_ino_win)) return false;
+    g_ino_win_base  = base;
+    g_ino_win_count = n;
+    g_ino_cache_slot  = g_cur_slot;                      // 记下**卷身份**，不只是 LBA
+    g_ino_cache_drive = drive;
+    g_ino_cache_valid = true;
+    return true;
 }
 
 // 挂载状态的整份快照（mount 失败时要恢复回去，别把已挂载的卷弄丢）
@@ -639,23 +673,81 @@ static int sb_verify(const uint8_t* sb, Vfs64SbGeo* geo) {
 }
 
 // 统计数据区里还空着多少块（挂载/探测打点用）。base_lba = 卷起始绝对 LBA，位图必须能全部读出。
+// ★ 本轮（性能修复）：位图**按 8 扇区一块**读（一次 ATA 事务覆盖 8*4096 = 32768 个块）。
+//   为什么必须改：128MB 卷的位图是 39 个扇区，一扇区一次 ATA 事务就是 39 次；而 df / 资源管理器每张
+//   盘卡片 / 每次写的空间预检都走这里。QEMU TCG 下单次事务 = 命令 + IRQ14/DRQ 等待（hlt）+ PIO，
+//   实测十几毫秒 —— 它和 inode 全表扫描一起把"进盘符"那一帧顶过看门狗 5s（见 g_ino_win 的说明）。
+#define VFS64_BM_CHUNK_SEC 8u
 static bool count_free_at(int drive, uint32_t base_lba, uint32_t bitmap_start, uint32_t bitmap_blocks,
                           uint32_t blocks, uint32_t data_start, uint32_t* out) {
+    static uint8_t bm[VFS64_BM_CHUNK_SEC * VFS64_SECTOR_BYTES];   // 只在这里用；FS 操作串行、不重入
     uint32_t free_n = 0;
-    for (uint32_t m = 0; m < bitmap_blocks; m++) {
-        if (!dev_read_at(drive, base_lba + bitmap_start + m, 1, g_sec)) return false;
-        for (uint32_t k = 0; k < VFS64_BITMAP_BLK_BITS; k++) {
-            const uint32_t blk = m * VFS64_BITMAP_BLK_BITS + k;
-            if (blk < data_start || blk >= blocks) continue;
-            if ((g_sec[k >> 3] & (uint8_t)(1u << (k & 7u))) == 0) free_n++;
+    for (uint32_t m = 0; m < bitmap_blocks; ) {
+        uint32_t c = bitmap_blocks - m;
+        if (c > VFS64_BM_CHUNK_SEC) c = VFS64_BM_CHUNK_SEC;
+        if (!dev_read_at(drive, base_lba + bitmap_start + m, c, bm)) return false;
+        for (uint32_t s = 0; s < c; s++) {
+            const uint8_t* sec = bm + (uint64_t)s * VFS64_SECTOR_BYTES;
+            for (uint32_t k = 0; k < VFS64_BITMAP_BLK_BITS; k++) {
+                const uint32_t blk = (m + s) * VFS64_BITMAP_BLK_BITS + k;
+                if (blk < data_start || blk >= blocks) continue;
+                if ((sec[k >> 3] & (uint8_t)(1u << (k & 7u))) == 0) free_n++;
+            }
         }
+        m += c;
     }
     *out = free_n;
     return true;
 }
-// 已在挂载状态里的卷：等价于用当前几何调用上面那个
+// ==================== 空闲块数缓存（★ 本轮性能修复）====================
+// 为什么需要：count_free_at 要把整张位图数一遍（128MB 卷 = 155798 个位 = 39 个扇区）。而 fs64 的
+// **每一次入口**都会间接数一遍（fs64 的 resolve_vol -> ensure_vfs64 -> vfs64_slot_info64 要
+// free_blocks）—— 资源管理器列一次目录要做十几次 FS 调用（每一项一次 fs64_list64），于是"进盘符"
+// 那一帧要数几十遍位图（几千万次位测试 + 上千次 ATA 事务），QEMU TCG 下直接把 GUI 帧顶过看门狗 5s
+// 阈值（[WD64] watchdog fire -> PANIC64 stop=WATCHDOG_TIMEOUT，tests/multivol64_test.py 阶段 3 实测）。
+// 语义不变：位图**只在** bitmap_set / alloc_block / vfs64_format 里被改，这三处一律让缓存失效；
+// 因此缓存里的数字永远等于"最后一次改位图之后的真实空闲块数"（宁可多数一遍，绝不给旧数字）。
+#define VFS64_FREECACHE_N 4
+struct Vfs64FreeEnt {
+    bool     used;
+    uint32_t gen;
+    int      drive;
+    uint32_t lba, bitmap_start, bitmap_blocks, blocks, data_start, free_blocks;
+};
+static Vfs64FreeEnt g_freecache[VFS64_FREECACHE_N];
+static uint32_t g_freegen  = 1u;      // 代次：任何位图写入都 +1 -> 旧条目自动失效
+static uint32_t g_freerot  = 0;       // 简单轮转淘汰
+static void free_cache_bump() {
+    if (++g_freegen == 0u) {          // 回绕：整表作废（不会误命中）
+        g_freegen = 1u;
+        for (int i = 0; i < VFS64_FREECACHE_N; i++) { g_freecache[i].used = false; g_freecache[i].gen = 0; }
+    }
+}
+// 带缓存的位图统计（键 = 卷几何，含盘号 + 起始 LBA；换盘/换卷/被写都会自然失效）
+static bool count_free_cached64(int drive, uint32_t base_lba, uint32_t bitmap_start, uint32_t bitmap_blocks,
+                                uint32_t blocks, uint32_t data_start, uint32_t* out) {
+    for (int i = 0; i < VFS64_FREECACHE_N; i++) {
+        const Vfs64FreeEnt& e = g_freecache[i];
+        if (e.used && e.gen == g_freegen && e.drive == drive && e.lba == base_lba &&
+            e.bitmap_start == bitmap_start && e.bitmap_blocks == bitmap_blocks &&
+            e.blocks == blocks && e.data_start == data_start) {
+            if (out) *out = e.free_blocks;
+            return true;
+        }
+    }
+    uint32_t n = 0;
+    if (!count_free_at(drive, base_lba, bitmap_start, bitmap_blocks, blocks, data_start, &n)) return false;
+    Vfs64FreeEnt& e = g_freecache[g_freerot % VFS64_FREECACHE_N];
+    g_freerot++;
+    e.used = true; e.gen = g_freegen; e.drive = drive; e.lba = base_lba;
+    e.bitmap_start = bitmap_start; e.bitmap_blocks = bitmap_blocks;
+    e.blocks = blocks; e.data_start = data_start; e.free_blocks = n;
+    if (out) *out = n;
+    return true;
+}
+// 已在挂载状态里的卷：等价于用当前几何调用带缓存的那个
 static bool count_free_blocks(uint32_t* out) {
-    return count_free_at(g_drive, g_start, g_bitmap_start, g_bitmap_blocks, g_blocks, g_data_start, out);
+    return count_free_cached64(g_drive, g_start, g_bitmap_start, g_bitmap_blocks, g_blocks, g_data_start, out);
 }
 
 // ==================== 块读写 / 位图 ====================
@@ -681,7 +773,9 @@ static bool bitmap_set(uint32_t blk, bool used) {
     const uint8_t mask = (uint8_t)(1u << (k & 7u));
     if (used) g_sec[k >> 3] |= mask;
     else      g_sec[k >> 3] &= (uint8_t)~mask;
-    return dev_write(g_start + g_bitmap_start + m, 1, g_sec);
+    if (!dev_write(g_start + g_bitmap_start + m, 1, g_sec)) return false;
+    free_cache_bump();                     // 位图变了 -> 空闲块数缓存失效
+    return true;
 }
 
 // 分配一个数据区空闲块：置位并返回块号；没有空闲返回 0（块 0 是超级块，永远已用，可当失败哨兵）。
@@ -694,6 +788,7 @@ static uint32_t alloc_block() {
             if ((g_sec[k >> 3] & (uint8_t)(1u << (k & 7u))) != 0) continue;
             g_sec[k >> 3] |= (uint8_t)(1u << (k & 7u));
             if (!dev_write(g_start + g_bitmap_start + m, 1, g_sec)) return 0;
+            free_cache_bump();             // 位图变了 -> 空闲块数缓存失效
             return blk;
         }
     }
@@ -719,31 +814,26 @@ static bool inode_slot(uint32_t idx, uint32_t* out_blk, uint32_t* out_off) {
 static bool inode_load(uint32_t idx, uint8_t* out) {
     uint32_t blk = 0, off = 0;
     if (!inode_slot(idx, &blk, &off)) return false;
-    const uint32_t lba = g_start + blk;
-    if (!ino_cache_hit(g_drive, lba)) {
-        if (!dev_read(lba, 1, g_ino_cache)) { ino_cache_invalidate(); return false; }
-        g_ino_cache_slot = g_cur_slot;               // 记下**卷身份**，不只是 LBA
-        g_ino_cache_drive = g_drive;
-        g_ino_cache_lba = lba;
-        g_ino_cache_valid = true;
+    const uint32_t rel = blk - g_inode_start;            // inode 表内的**相对块号**（窗口按它对齐）
+    if (!ino_cache_hit(g_drive, rel)) {
+        if (!ino_cache_fill(g_drive, rel)) { ino_cache_invalidate(); return false; }
     }
-    copy_bytes(out, g_ino_cache + off, g_lay->inode_bytes);
+    copy_bytes(out, g_ino_win + (uint64_t)(rel - g_ino_win_base) * VFS64_SECTOR_BYTES + off,
+               g_lay->inode_bytes);
     return true;
 }
 static bool inode_store(uint32_t idx, const uint8_t* in) {
     uint32_t blk = 0, off = 0;
     if (!inode_slot(idx, &blk, &off)) return false;
-    const uint32_t lba = g_start + blk;
-    if (!ino_cache_hit(g_drive, lba)) {
-        if (!dev_read(lba, 1, g_ino_cache)) { ino_cache_invalidate(); return false; }
-        g_ino_cache_slot = g_cur_slot;
-        g_ino_cache_drive = g_drive;
-        g_ino_cache_lba = lba;
-        g_ino_cache_valid = true;
+    const uint32_t rel = blk - g_inode_start;
+    if (!ino_cache_hit(g_drive, rel)) {
+        if (!ino_cache_fill(g_drive, rel)) { ino_cache_invalidate(); return false; }
     }
-    copy_bytes(g_ino_cache + off, in, g_lay->inode_bytes);
-    if (!dev_write(lba, 1, g_ino_cache)) { ino_cache_invalidate(); return false; }
-    ino_cache_invalidate();                           // 写后失效：以后要用就重读
+    uint8_t* sec = g_ino_win + (uint64_t)(rel - g_ino_win_base) * VFS64_SECTOR_BYTES;
+    copy_bytes(sec + off, in, g_lay->inode_bytes);
+    // 只写这一扇区（窗口里别的 inode 字节原样不动）；写完全表失效：以后要用就重读
+    if (!dev_write(g_start + blk, 1, sec)) { ino_cache_invalidate(); return false; }
+    ino_cache_invalidate();
     return true;
 }
 // 结构合法性：类型/名字长度/保留字段/CRC/大小/（v3/v4）时间与保留区/（v4）权限字段。
@@ -1670,6 +1760,7 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
         return -1;
     }
 
+    free_cache_bump();                     // 格式化刚写完位图 -> 空闲块数缓存作废
     g_mounted = true;
     dbg64_str("[VFS64] format ok blocks=");
     dbg64_dec(total_sectors);
@@ -1732,6 +1823,7 @@ int vfs64_mount(int drive, uint32_t start_lba) {
     geom_apply(geo);
     g_mounted = true;
 
+    free_cache_bump();                     // 新挂载：旧几何可能被别的卷用过，缓存一律作废
     uint32_t free_blocks = 0;
     if (!count_free_blocks(&free_blocks)) {
         log_mount_fail("bitmap");
@@ -1850,8 +1942,8 @@ int vfs64_slot_info64(int slot, int* drive, uint32_t* start_lba, Vfs64VolInfo64*
     if (out) {
         uint32_t free_blocks = 0;
         // 只读：显式传 (drive, 起始 LBA) 数一遍位图 —— **不切换当前卷、不碰挂载状态**。
-        if (!count_free_at(v.drive, v.start, v.bitmap_start, v.bitmap_blocks,
-                           v.blocks, v.data_start, &free_blocks)) return -1;
+        if (!count_free_cached64(v.drive, v.start, v.bitmap_start, v.bitmap_blocks,
+                                 v.blocks, v.data_start, &free_blocks)) return -1;
         out->version = v.lay->version;
         out->blocks = v.blocks;
         out->inodes = v.inode_count;
