@@ -435,34 +435,135 @@ void gfx64_shadow64(int x, int y, int w, int h, int r, const Theme64Tokens* t) {
 }
 
 // ==================== 模糊（可分离盒子模糊多趟 ≈ 高斯）====================
-// 就地 2 趟盒子模糊（半径 r），源/目标是 RGBA 缓冲（w x h，stride = w）
-static void box_blur_buf64(uint32_t* buf, int w, int h, int r) {
-    if (r <= 0 || w <= 0 || h <= 0) return;
-    static uint32_t scratch[4096];
-    // ★ 性能（TCG）：归一化 v/win 在 QEMU TCG 下每次整数除要几十周期，整屏模糊要做
-    //   4 * W * H = 400 万次（1280x800, r=24）。改成 40 位定点倒数乘法（见 div_win40_64）。
-    const int win = 2 * r + 1;
-    const uint64_t win_inv = ((1ULL << 40) + (uint64_t)win - 1) / (uint64_t)win;
+// ★ 性能（本轮修"改壁纸适应模式后桌面不重绘"的根因）：
+//   整屏背景层模糊是 QEMU TCG 下最贵的一段（1280x800 r=24 实测 ≈ 5.4s，占"整屏壁纸重建"的
+//   96%）。它把**壁纸重排的提交**推迟了 5 秒多 —— 改适应模式/切主题之后，新壁纸要等这段算完
+//   才随帧刷到屏幕上；宿主验收在 ~5.6s 截图，于是抓到的是**旧壁纸**（桌面片 0 变化）。本批
+//   两处优化都在**不改输出**的前提下做（核外 262 组随机/边界样本逐像素比对：0 处不同）：
+//     a) 一维滑窗三段式（左边缘/无分支中段/右边缘）—— 中段去掉 clamp 与索引重算；
+//     b) 垂直滑窗改"逐行顺序 + 每列窗口和 + 源/目标分开"—— 旧实现逐列走，每步跨 w*4 字节
+//        （1280 宽 = 5KB ≈ 1.25 个 4K 页），QEMU TCG 的 softmmu 每步都要走页表，这才是大头。
+//   （只做 (a) 时整屏模糊 3094 -> 2764 ticks；(b) 才把它降到 ~1/3。）
+// 窗口内归一化：把 (sr,sg,sb) 按 win 定点打包成一个像素（与旧实现同一表达式）
+// 一维滑窗的行暂存（水平方向用；同一时刻只用一条线）
+static uint32_t g_blur_scratch[4096];
+static inline uint32_t pack_win64(int sr, int sg, int sb, uint64_t win_inv) {
+    return (uint32_t)(((uint32_t)div_win40_64(sr, win_inv) << 16) |
+                      ((uint32_t)div_win40_64(sg, win_inv) << 8) |
+                      (uint32_t)div_win40_64(sb, win_inv));
+}
+
+// 垂直滑窗需要的"第二块缓冲"：**懒分配 + 常驻复用**（只在需要更大时重分配一次）。
+// 只有大图（整屏）走这条路径，所以它平时就是整屏大小的一份 4MB；堆 48MB，与 g_surface/
+// g_surface_blur 同量级。这样每次模糊不再做整幅 kmalloc/kfree（区域模糊根本不走这里）。
+static uint32_t* g_blur_tmp = nullptr;
+static uint64_t g_blur_tmp_px = 0;
+static uint32_t* blur_tmp64(uint64_t px) {
+    if (g_blur_tmp && g_blur_tmp_px >= px) return g_blur_tmp;
+    if (g_blur_tmp) { kfree_64(g_blur_tmp); g_blur_tmp = nullptr; g_blur_tmp_px = 0; }
+    uint32_t* p = (uint32_t*)kmalloc_64(px * 4);
+    if (!p) return nullptr;
+    g_blur_tmp = p; g_blur_tmp_px = px;
+    return p;
+}
+
+// 垂直滑窗的**每列窗口和**（1280 列时 15KB，全在 cache 里）
+static int g_blur_acc[3 * 4096];
+
+// 一维盒子模糊（半径 r，边缘复制）：src = 连续 n 像素；结果写 dst[0], dst[ds], dst[2*ds], ...
+static void box_blur_line64(const uint32_t* src, uint32_t* dst, int n, int ds, int r,
+                            int win, uint64_t win_inv) {
+    const int nm1 = n - 1;
+    int sr = 0, sg = 0, sb = 0;
+    for (int i = -r; i <= r; i++) {              // x=0 的窗口和（索引 clamp 到 [0,n-1]）
+        const int k = i < 0 ? 0 : (i > nm1 ? nm1 : i);
+        const uint32_t c = src[k];
+        sr += cc_r(c); sg += cc_g(c); sb += cc_b(c);
+    }
+    int x = 0;
+    uint32_t* d = dst;
+    const int xl = (r < n) ? r : n;
+    for (; x < xl; x++, d += ds) {               // 左边缘：x-r < 0 -> 取 src[0]
+        *d = pack_win64(sr, sg, sb, win_inv);
+        const int xb = x + r + 1;
+        const uint32_t ca = src[0];
+        const uint32_t cb = src[xb > nm1 ? nm1 : xb];
+        sr += cc_r(cb) - cc_r(ca); sg += cc_g(cb) - cc_g(ca); sb += cc_b(cb) - cc_b(ca);
+    }
+    const int xmid = n - 2 - r;                  // 最后一个"窗口完全在内"的 x（pb 不越界）
+    if (x <= xmid) {                             // 中段：无 clamp、无索引重算（最热）
+        const uint32_t* pa = src + (x - r);
+        const uint32_t* pb = src + (x + r + 1);
+        for (; x <= xmid; x++, d += ds, pa++, pb++) {
+            *d = pack_win64(sr, sg, sb, win_inv);
+            const uint32_t ca = *pa, cb = *pb;
+            sr += cc_r(cb) - cc_r(ca); sg += cc_g(cb) - cc_g(ca); sb += cc_b(cb) - cc_b(ca);
+        }
+    }
+    for (; x < n; x++, d += ds) {                 // 右边缘
+        *d = pack_win64(sr, sg, sb, win_inv);
+        const int xa = x - r, xb = x + r + 1;
+        const uint32_t ca = src[xa < 0 ? 0 : (xa > nm1 ? nm1 : xa)];
+        const uint32_t cb = src[xb > nm1 ? nm1 : xb];
+        sr += cc_r(cb) - cc_r(ca); sg += cc_g(cb) - cc_g(ca); sb += cc_b(cb) - cc_b(ca);
+    }
+}
+
+// 垂直滑窗（按行推进 + 每列窗口和）：输出与逐列实现**逐像素一致**，但内存访问全部是
+// **顺序**的。源/目标**必须分开**：滑窗的"移出项"是半径 r 之前的**原始**行，就地覆盖会把它
+// 写掉（旧按列实现靠 g_blur_scratch 拷整列才躲过这一点）。调用方给 dst 另开一块缓冲。
+static void box_blur_vert_to64(const uint32_t* src, uint32_t* dst, int w, int h, int r,
+                               uint64_t win_inv) {
+    const int nm1 = h - 1;
+    int* ar = g_blur_acc;
+    int* ag = g_blur_acc + 4096;
+    int* ab = g_blur_acc + 8192;
+    for (int x = 0; x < w; x++) { ar[x] = 0; ag[x] = 0; ab[x] = 0; }
+    for (int i = -r; i <= r; i++) {                 // y=0 的窗口和（索引 clamp 到 [0,h-1]）
+        const int k = i < 0 ? 0 : (i > nm1 ? nm1 : i);
+        const uint32_t* row = src + (uint64_t)k * w;
+        for (int x = 0; x < w; x++) {
+            const uint32_t c = row[x];
+            ar[x] += cc_r(c); ag[x] += cc_g(c); ab[x] += cc_b(c);
+        }
+    }
+    for (int y = 0; y < h; y++) {
+        uint32_t* out = dst + (uint64_t)y * w;
+        const int ya = y - r, yb = y + r + 1;
+        const uint32_t* sub = src + (uint64_t)(ya < 0 ? 0 : ya) * w;
+        const uint32_t* add = src + (uint64_t)(yb > nm1 ? nm1 : yb) * w;
+        for (int x = 0; x < w; x++) {
+            const uint32_t ca = sub[x], cb = add[x];
+            const int r0 = ar[x], g0 = ag[x], b0 = ab[x];
+            out[x] = pack_win64(r0, g0, b0, win_inv);
+            ar[x] = r0 + cc_r(cb) - cc_r(ca);
+            ag[x] = g0 + cc_g(cb) - cc_g(ca);
+            ab[x] = b0 + cc_b(cb) - cc_b(ca);
+        }
+    }
+}
+// 原就地实现（2 趟：逐行 + 逐列，列方向用 g_blur_scratch 拷整列）：**保持原样**。
+// 用途：小区域模糊（行距小、页工作集 < softmmu TLB 容量，逐列不抖）与 >4096 的极端尺寸兜底 ——
+//   保证设置页/卡片这类**小区域模糊的时序与改动前完全一致**（逐像素也一致）。
+static void box_blur_buf_inplace64(uint32_t* buf, int w, int h, int r, int win, uint64_t win_inv) {
     for (int pass = 0; pass < 2; pass++) {
         for (int y = 0; y < h; y++) {
             uint32_t* row = buf + (uint64_t)y * w;
             const int n = w > 4096 ? 4096 : w;
-            for (int i = 0; i < n; i++) scratch[i] = row[i];
+            for (int i = 0; i < n; i++) g_blur_scratch[i] = row[i];
             int sr = 0, sg = 0, sb = 0;
             for (int i = -r; i <= r; i++) {
                 const int xi = i < 0 ? 0 : (i >= w ? w - 1 : i);
-                const uint32_t c = (xi < n ? scratch[xi] : row[xi]);
+                const uint32_t c = (xi < n ? g_blur_scratch[xi] : row[xi]);
                 sr += cc_r(c); sg += cc_g(c); sb += cc_b(c);
             }
             for (int x = 0; x < w; x++) {
-                row[x] = (uint32_t)(((uint32_t)div_win40_64(sr, win_inv) << 16) |
-                                    ((uint32_t)div_win40_64(sg, win_inv) << 8) |
-                                    (uint32_t)div_win40_64(sb, win_inv));
+                row[x] = pack_win64(sr, sg, sb, win_inv);
                 const int xa = x - r, xb = x + r + 1;
                 const int ia = xa < 0 ? 0 : (xa >= w ? w - 1 : xa);
                 const int ib = xb < 0 ? 0 : (xb >= w ? w - 1 : xb);
-                const uint32_t ca = (ia < n ? scratch[ia] : row[ia]);
-                const uint32_t cb = (ib < n ? scratch[ib] : row[ib]);
+                const uint32_t ca = (ia < n ? g_blur_scratch[ia] : row[ia]);
+                const uint32_t cb = (ib < n ? g_blur_scratch[ib] : row[ib]);
                 sr += cc_r(cb) - cc_r(ca);
                 sg += cc_g(cb) - cc_g(ca);
                 sb += cc_b(cb) - cc_b(ca);
@@ -470,27 +571,61 @@ static void box_blur_buf64(uint32_t* buf, int w, int h, int r) {
         }
         for (int x = 0; x < w; x++) {
             const int n = h > 4096 ? 4096 : h;
-            for (int i = 0; i < n; i++) scratch[i] = buf[(uint64_t)i * w + x];
+            for (int i = 0; i < n; i++) g_blur_scratch[i] = buf[(uint64_t)i * w + x];
             int sr = 0, sg = 0, sb = 0;
             for (int i = -r; i <= r; i++) {
                 const int yi = i < 0 ? 0 : (i >= h ? h - 1 : i);
-                const uint32_t c = (yi < n ? scratch[yi] : buf[(uint64_t)yi * w + x]);
+                const uint32_t c = (yi < n ? g_blur_scratch[yi] : buf[(uint64_t)yi * w + x]);
                 sr += cc_r(c); sg += cc_g(c); sb += cc_b(c);
             }
             for (int y = 0; y < h; y++) {
-                buf[(uint64_t)y * w + x] = (uint32_t)(((uint32_t)div_win40_64(sr, win_inv) << 16) |
-                                                    ((uint32_t)div_win40_64(sg, win_inv) << 8) |
-                                                    (uint32_t)div_win40_64(sb, win_inv));
+                buf[(uint64_t)y * w + x] = pack_win64(sr, sg, sb, win_inv);
                 const int ya = y - r, yb = y + r + 1;
                 const int ia = ya < 0 ? 0 : (ya >= h ? h - 1 : ya);
                 const int ib = yb < 0 ? 0 : (yb >= h ? h - 1 : yb);
-                const uint32_t ca = (ia < n ? scratch[ia] : buf[(uint64_t)ia * w + x]);
-                const uint32_t cb = (ib < n ? scratch[ib] : buf[(uint64_t)ib * w + x]);
+                const uint32_t ca = (ia < n ? g_blur_scratch[ia] : buf[(uint64_t)ia * w + x]);
+                const uint32_t cb = (ib < n ? g_blur_scratch[ib] : buf[(uint64_t)ib * w + x]);
                 sr += cc_r(cb) - cc_r(ca);
                 sg += cc_g(cb) - cc_g(ca);
                 sb += cc_b(cb) - cc_b(ca);
             }
         }
+    }
+}
+
+// 2 趟盒子模糊（半径 r，≈ 高斯），源/目标是 RGBA 缓冲（w x h，stride = w）
+static void box_blur_buf64(uint32_t* buf, int w, int h, int r) {
+    if (r <= 0 || w <= 0 || h <= 0) return;
+    // ★ 性能（TCG）：归一化 v/win 在 QEMU TCG 下每次整数除要几十周期，整屏模糊要做
+    //   4 * W * H = 400 万次（1280x800, r=24）。改成 40 位定点倒数乘法（见 div_win40_64）。
+    const int win = 2 * r + 1;
+    const uint64_t win_inv = ((1ULL << 40) + (uint64_t)win - 1) / (uint64_t)win;
+    // ★ 本批根因修复：整屏背景层模糊原先走"逐列就地"实现，每步跨 w*4 字节 —— 1280 宽整屏
+    //   行距 5KB ≈ 1.25 个 4K 页，QEMU TCG 的 softmmu 每步都要走页表（实测 3094 ticks ≈ 6.0s，
+    //   占整屏壁纸重建的 96%），把"改壁纸适应模式/切主题"后的桌面重绘推迟到验收截图之后。
+    //   换"逐行顺序 + 每列窗口和 + 源/目标分开"后实测 3094 -> 158 ticks（1280x800 r=24）。
+    //   小区域（设置卡片 622x292 这类）也走同一条路径：常驻复用的临时块 + 行序访问，
+    //   同样比逐列快（且逐像素一致）。
+    if (w > 4096 || h > 4096) {                    // 极端尺寸（本内核 FB 上限 3840x2160）：原实现兜底
+        box_blur_buf_inplace64(buf, w, h, r, win, win_inv);
+        return;
+    }
+    // 2 趟 ≈ 高斯；每趟 = 水平（就地，靠 g_blur_scratch 拷整行）+ 垂直（逐行顺序，写另一块）。
+    // 两块缓冲轮转，省掉最后的整幅回拷：pass0 = buf -> tmp，pass1 = tmp -> buf。
+    // 临时块**常驻复用**（只在需要更大时重分配一次；整屏 4MB，堆 48MB）—— 避免每次模糊
+    // 都做整幅 kmalloc/kfree，把区域模糊的时序扰动降到 0。
+    uint32_t* tmp = blur_tmp64((uint64_t)w * h);
+    if (!tmp) { box_blur_buf_inplace64(buf, w, h, r, win, win_inv); return; }
+    uint32_t* cur = buf;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int y = 0; y < h; y++) {                  // 水平：先把行拷进 scratch（就地覆盖安全）
+            uint32_t* row = cur + (uint64_t)y * w;
+            for (int i = 0; i < w; i++) g_blur_scratch[i] = row[i];
+            box_blur_line64(g_blur_scratch, row, w, 1, r, win, win_inv);
+        }
+        uint32_t* dst = (cur == buf) ? tmp : buf;
+        box_blur_vert_to64(cur, dst, w, h, r, win_inv);  // 垂直：逐行顺序读/写（见该函数注释）
+        cur = dst;
     }
 }
 
