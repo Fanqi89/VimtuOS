@@ -35,6 +35,21 @@ void fb_get_clip64(int* x, int* y, int* w, int* h);   // 读当前裁剪矩形�
 uint32_t* fb_surface64(int* w, int* h);               // 后备缓冲基址（32bpp，stride = fb_width()）
 uint32_t fb_get_pixel(int x, int y);
 
+// ==================== A1：用户态绘图（映射显存 + 提交区域）====================
+// 目标：**ring3 程序自己把画面画到屏幕上**，内核只做两件事：把后备缓冲映射进用户地址空间、
+// 把用户画好的区域提交到 LFB（见 kernel/syscall64.cpp 的 fb_map(9) / fb_flip(10) / fb_present(11)）。
+//
+// 后备缓冲的**物理基址**（4KB 对齐）+ 字节数（out_bytes 可为 nullptr）。为什么需要它：
+//   内核跑在高半区（VA = 0xFFFFFFFF80000000 + PA），而映射给用户的是**物理页**；
+//   backbuf_storage 带 aligned(4096)，所以返回值可以直接逐页映射，不用做页内偏移。
+uint64_t fb_surface_phys64(int* out_bytes);
+// A1 演示开关：0 = **关掉内核侧绘制与提交**（用户程序独占屏幕；fb_user_flip64 不受影响）。
+//   由 user64_run_fbdemo64()（kernel/usermode64.cpp）在演示前后切换，进程退出/被 kill 时恢复。
+void fb_kernel_paint64(int on);
+int  fb_kernel_paint_on64();
+// A1：用户态的区域提交（fb_flip(10) 的实现）——把后备缓冲的矩形拷到 LFB。
+//   **不受**内核绘制开关影响（这是用户程序自己的提交，不是内核在画）；坐标在此再夹一次。
+void fb_user_flip64(int x, int y, int w, int h);
 // 颜色辅助
 inline uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) {
     return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;

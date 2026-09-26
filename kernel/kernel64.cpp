@@ -65,6 +65,10 @@
 // 符号名由 objcopy 按输入路径生成：_binary_build64_user_demo64_bin_start/_end。
 extern "C" const uint8_t _binary_build64_user_demo64_bin_start[];
 extern "C" const uint8_t _binary_build64_user_demo64_bin_end[];
+// ★ A1：用户态绘图演示程序 blob（user/fbdemo.asm -> nasm -f bin -> objcopy 嵌入；见 build64.sh）。
+//   符号名同样由 objcopy 按输入路径生成：_binary_build64_user_fbdemo64_bin_start/_end。
+extern "C" const uint8_t _binary_build64_user_fbdemo64_bin_start[];
+extern "C" const uint8_t _binary_build64_user_fbdemo64_bin_end[];
 #endif
 
 #include <stdint.h>
@@ -417,6 +421,16 @@ static void rust64_boot_init64() {
             const uint64_t blob_sz = (uint64_t)(_binary_build64_user_demo64_bin_end -
                                                 _binary_build64_user_demo64_bin_start);
             (void)user64_run_blob64(_binary_build64_user_demo64_bin_start, (uint32_t)blob_sz, "demo64");
+        }
+        // ---- ★ A1：用户态绘图演示（ring3 自己把画面画到屏幕上；内核只映射显存 + 提交区域）----
+        //   位置：紧跟 demo64（同一个"用户窗口可用"分支）；顺序上在 app64/elf64/proc64 演示之前，
+        //   这样启动期的像素证据（tests/fbmap64_test.py）落在屏幕还没被别的阶段重画的时候。
+        //   演示期间内核侧绘制/提交关闭（fb_kernel_paint64(0)，由 user64_run_fbdemo64 切换）：
+        //   屏幕上那一条色带**只**由用户程序画 —— 这就是"这确实是用户程序在画"的证据。
+        {
+            const uint64_t fb_blob_sz = (uint64_t)(_binary_build64_user_fbdemo64_bin_end -
+                                                  _binary_build64_user_fbdemo64_bin_start);
+            (void)user64_run_fbdemo64(_binary_build64_user_fbdemo64_bin_start, (uint32_t)fb_blob_sz);
         }
     } else {
         dbg64_line_begin64();

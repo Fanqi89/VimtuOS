@@ -34,6 +34,15 @@ static const uint64_t USER64_BRK_BYTES64    = 64ULL * 1024ULL;        // 64KiB
 static const uint64_t USER64_MMAP_VA64      = 0x0000000100090000ULL;  // 4GiB+576KiB：mmap 起点
 static const uint64_t USER64_MMAP_MIN_BYTES64 = 64ULL * 1024ULL;      // mmap 至少要有这么多可用
 
+// ★ A1：用户态**帧缓冲映射区**（5GiB 起，上限 40MiB —— 4K 后备缓冲 3840x2160x4 = 33MiB）。
+//   为什么单开一块、而不是放进上面那个 1MiB 用户窗口：
+//     1) 1MiB 装不下后备缓冲（1280x800 就要 4MiB）；
+//     2) 这一块落在 PML4[0] 的 **PDPT[5]**，而进程回收（kernel/proc64.cpp 的
+//        proc64_release_user_area64）只走 PDPT[4] —— 显存页是**内核的后备缓冲物理页**，
+//        绝不能被当成"进程自己的页"回收（那是双重释放，症状极难查）。
+//   逐页映射由 user64_map_phys_page64() 做（内核把物理页挂到用户页表，用户直接读写）。
+static const uint64_t USER64_FB_VA64       = 0x0000000140000000ULL;    // 5GiB
+static const uint64_t USER64_FB_BYTES64    = 40ULL * 1024ULL * 1024ULL;
 // 自检（位掩码，0 = 全过）：用户页映射/权限位、iretq 帧字段、选择子/GDT 现场、范围校验
 int user64_selftest64();
 
@@ -108,3 +117,14 @@ void     user64_paging_sync64();
 int      user64_page_is_user_ok64(uint64_t va);
 // 读叶子 PTE 的**标志位**（0 = 没有映射；物理地址不外泄）。自检/调试用。
 uint64_t user64_page_flags64(uint64_t va);
+
+// ==================== A1：用户态绘图（映射显存 + 提交区域）====================
+// 把**指定物理页**映射成用户页（共享映射：显存/后备缓冲）。与 user64_map_page64 的区别：
+//   * 物理页由调用方给（不分配、不回收），所以是"同一块物理内存两边都能写"的共享映射；
+//   * va 允许落在用户窗口或 USER64_FB_VA64 映射区（后者给显存用）。
+// 返回 1 = 成功；0 = 参数非法（未页对齐/越出用户区/撞大页）或页表页不足。
+int user64_map_phys_page64(uint64_t va, uint64_t phys, uint64_t leaf_flags);
+// 跑"用户态绘图"演示（A1）：blob = user/fbdemo.asm 的平铺二进制（见 build64.sh）。
+//   演示期间 fb_kernel_paint64(0)：**内核侧不再绘制/提交**（屏幕只由用户程序画），
+//   无论用户程序是正常 exit 还是被 kill（回收路径）都会恢复。返回 user64_run_blob64 的值。
+int user64_run_fbdemo64(const void* blob, uint32_t size);

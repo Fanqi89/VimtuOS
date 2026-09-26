@@ -42,6 +42,7 @@
 #include "memlayout64.h"    // ML64_PML4_PHYS（判断"引导期页表是不是我们自己的"）
 #include "mem_64.h"       // page_alloc_64 / page_free_64 / PTE_* / PAGE_SIZE_64
 #include "syscall64.h"  // g_syscall64_kstack64：SYSCALL 入口的切栈目标（每任务一份，见 u64_set_kernel_stack64）
+#include "fb.h"         // ★ A1：用户态绘图演示期间关掉内核侧绘制/提交（fb_kernel_paint64）
 // 页表助手（自己走表）里的 CR3 读法；u64_rd_cr364 在下面定义，这里先用一个前置声明式的小函数。
 static inline uint64_t u64_rd_cr364();
 
@@ -149,6 +150,7 @@ extern "C" void user64_slot_release64(int slot) {
     if (g_user64_ctxp64 == (uint64_t)(uintptr_t)&g_user64_ctx64[slot]) {
         g_user64_ctxp64 = (uint64_t)(uintptr_t)&g_user64_ctx64[0];
     }
+    fb_kernel_paint64(1);                   // ★ A1：被 kill 的绘图演示也要把内核绘制恢复（否则屏幕不再更新）
     if (was_in_ring3) {                         // 只有真的清掉脏位才打点（正常退出/普通任务不打）
         dbg64_line_begin64();
         dbg64_str("[USER64] slot release slot=");
@@ -311,9 +313,17 @@ static inline uint64_t u64_leaf_keep64(uint64_t leaf_flags) {
     return (leaf_flags & 0xFFFULL) | (leaf_flags & PTE_NX_64);
 }
 
+// A1：这个 VA 是否落在"用户区"（用户窗口 4GiB..4GiB+1MiB，或 FB 映射区 5GiB..+40MiB）。
+// 页级原语的**唯一**范围判据：加一个用户区就只改这里，别在各个调用点各写一份。
+static inline bool u64_va_in_user_area64(uint64_t va) {
+    if (va >= USER64_CODE_VA64 && va < USER64_CODE_VA64 + USER64_WINDOW_BYTES64) return true;
+    if (va >= USER64_FB_VA64 && va < USER64_FB_VA64 + USER64_FB_BYTES64) return true;
+    return false;
+}
+
 int user64_map_page64(uint64_t va, uint64_t leaf_flags, int alloc, uint64_t* out_phys) {
     if (va & 0xFFFULL) return 0;                                          // 必须页对齐
-    if (va < USER64_CODE_VA64 || va >= USER64_CODE_VA64 + USER64_WINDOW_BYTES64) return 0;
+    if (!u64_va_in_user_area64(va)) return 0;                             // 用户窗口 或 A1 的 FB 映射区
     uint64_t* pte = u64_walk64(va, alloc ? 1 : 0);
     if (!pte) return 0;
     const uint64_t keep = u64_leaf_keep64(leaf_flags);
@@ -329,6 +339,20 @@ int user64_map_page64(uint64_t va, uint64_t leaf_flags, int alloc, uint64_t* out
     u64_zero_page64(p);                                                   // 新页清零（ELF 的 .bss/栈都靠这条）
     *pte = ((uint64_t)(uintptr_t)p & ~0xFFFULL) | keep | PTE_PRESENT_64;
     if (out_phys) *out_phys = (uint64_t)(uintptr_t)p;
+    return 1;
+}
+
+// ==================== A1：把**指定物理页**映射进用户地址空间（显存/后备缓冲共享）====================
+// 与 user64_map_page64 的分工：这里**不分配物理页**（页是内核的，用户只是"另一份可读写映射"），
+// 也因此**不负责回收** —— 调用方（syscall64 的 fb_map）只把 fb_surface_phys64() 给的物理页挂上去。
+// 顺序：先夹取参数 -> 页表走法/权限位复用既有实现（u64_walk64 负责补中间层并统一打开 U/S）。
+int user64_map_phys_page64(uint64_t va, uint64_t phys, uint64_t leaf_flags) {
+    if ((va & 0xFFFULL) || (phys & 0xFFFULL)) return 0;                   // 两个都必须页对齐
+    if (!u64_va_in_user_area64(va)) return 0;                             // 越出用户区：拒绝
+    if (phys >= 0x100000000ULL) return 0;                                 // 只映射恒等直映区（<4GB）的物理页
+    uint64_t* pte = u64_walk64(va, 1);                                    // 1 = 缺 PD/PT 就分配（页表页）
+    if (!pte) return 0;
+    *pte = (phys & ~0xFFFULL) | u64_leaf_keep64(leaf_flags) | PTE_PRESENT_64;
     return 1;
 }
 
@@ -462,6 +486,7 @@ int user64_exit_to_kernel64(pt_regs64* r, uint64_t code) {
     r->rflags = 0x002;                                      // IF=0：蹦床复位栈后再 sti
     r->rsp    = 0;                                          // 占位（同特权级 iretq 不弹 rsp）
     r->ss     = SEL64_KDATA;                                // 占位
+    fb_kernel_paint64(1);                                  // ★ A1：退出 ring3 就恢复内核侧绘制/提交
     return 1;
 }
 
@@ -590,6 +615,32 @@ int user64_run_blob64(const void* blob, uint32_t size, const char* name) {
     return 0;
 }
 
+
+// ==================== A1：用户态绘图演示（内核侧绘制关掉，屏幕交给用户程序）====================
+// 位置：os_boot_path 里紧跟 demo64（kernel/kernel64.cpp）——"用户窗口可用"时才跑。
+// 做什么：把内核侧绘制/提交整个关掉（fb_kernel_paint64(0)）-> 跑 user/fbdemo.asm 的 blob
+//   （它在 ring3 用 fb_map(9) 拿后备缓冲、自己画、fb_flip(10) 局部提交）-> 恢复开关。
+// 为什么关内核绘制：A1 的验收要证明"屏幕上这一块确实是用户程序在画"，所以演示期间
+//   内核侧一个像素都不许写（含 write(1,..) 的屏幕回显、启动期的局部提交）。
+// 恢复的两条路径都写了：正常 exit（user64_exit_to_kernel64）与 kill 回收（user64_slot_release64）——
+//   否则用户程序一异常退出，整个系统的屏幕就再也不更新了（很难查）。
+int user64_run_fbdemo64(const void* blob, uint32_t size) {
+    if (!blob || size == 0) return -1;
+    fb_kernel_paint64(0);
+    dbg64_line_begin64();
+    dbg64_str("[FB64] user-draw demo start: kernel paint off, blob=");
+    dbg64_dec(size);
+    dbg64_str(" bytes (fb_map/fb_flip own the screen)\n");
+    dbg64_line_end64();
+    const int rc = user64_run_blob64(blob, size, "fbdemo64");
+    fb_kernel_paint64(1);
+    dbg64_line_begin64();
+    dbg64_str("[FB64] user-draw demo done rc=");
+    dbg64_dec((uint64_t)(rc == 0 ? 0 : 1));
+    dbg64_str(" kernel paint on\n");
+    dbg64_line_end64();
+    return rc;
+}
 // ==================== 从 ELF 入口进 ring3 ====================
 // 与 user64_run_blob64 的分工：这里**不映射、不回收任何页** —— 段与初始栈由 ELF64 加载器
 // （kernel/elf64.cpp）自己在用户窗口里建好，本函数只负责"把 TSS.rsp0/内核栈切好、抬栈

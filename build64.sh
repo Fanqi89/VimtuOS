@@ -209,6 +209,14 @@ echo "==> 用户态演示程序（真实 ring3 代码：nasm 平铺二进制 -> 
 $NASM -f bin user/demo64.asm -o "$BUILD/user_demo64.bin"
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/user_demo64.bin" "$BUILD/user_demo64.o"
 cp "$BUILD/user_demo64.o" "$BUILD/os/user_demo64.o"
+echo "==> A1 用户态绘图演示（ring3 自己画屏：nasm -f bin -> objcopy 嵌入内核）"
+# user/fbdemo.asm 是 ring3 程序，走 int 0x80 自有 ABI 的 fb_map(9) / fb_flip(10) / fb_present(11)：
+#   平铺二进制 -> objcopy -> 链进**两份**内核（安装介质内核也链，成本 ~2KB；调用点在系统内核的
+#   os_boot_path，见 kernel/kernel64.cpp 的 user64_run_fbdemo64()）。
+#   符号名由 objcopy 按输入路径生成：_binary_build64_user_fbdemo64_bin_*。
+$NASM -f bin user/fbdemo.asm -o "$BUILD/user_fbdemo64.bin"
+$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/user_fbdemo64.bin" "$BUILD/user_fbdemo64.o"
+cp "$BUILD/user_fbdemo64.o" "$BUILD/os/user_fbdemo64.o"
 echo "==> 可安装应用示例（VAP64：nasm -> tools/make_vap.py -> objcopy 嵌入系统内核）"
 # user/hello64.asm 是 ring3 程序；tools/make_vap.py 给它加 32B VAP64 头（含代码段 CRC32）；
 # objcopy 把整个 .vap 嵌进内核，app64.cpp 启动时把它装进 VimtuFS2 的 /hello.vap，再从盘上读出来跑。
@@ -284,7 +292,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
     "$BUILD"/ahci64.o "$BUILD"/nvme64.o "$BUILD"/hwui64.o \
     "$BUILD"/display64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o \
-    "$BUILD"/user_demo64.o "$BUILD"/font_*.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o
+    "$BUILD"/user_demo64.o "$BUILD"/user_fbdemo64.o "$BUILD"/font_*.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o
 $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 
 $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
@@ -306,7 +314,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD/os"/hello_vap64.o \
-    "$BUILD/os"/user_demo64.o "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
+    "$BUILD/os"/user_demo64.o "$BUILD/os"/user_fbdemo64.o "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
     "$BUILD/os"/kaisi_png.o
 $OBJCOPY -O binary "$BUILD/kernel64_os.elf" "$BUILD/kernel64_os.bin"
 

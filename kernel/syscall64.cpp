@@ -312,6 +312,160 @@ static int64_t syscall64_sleep64(uint32_t ms) {
     return 0;
 }
 
+// ==================== A1：用户态绘图（fb_map 9 / fb_flip 10 / fb_present 11）====================
+// 只走**自有 ABI（int 0x80）**：号 9/10/11 在 Linux 号段里是 mmap/mprotect/munmap，语义完全不同，
+// 两条路径各用各的 switch（见 syscall64_dispatch64），绝不共号。接口/结构/错误码见 kernel/syscall64.h。
+// 目标：内核只做"把后备缓冲映射给用户 + 把用户画好的区域提交上屏"，**绘制本身全在 ring3**。
+static int64_t sc64_fb_pid64() {
+    return (proc64_current_pid64 && lx64_have_proc64()) ? (int64_t)proc64_current_pid64() : -1;
+}
+// 带符号的十进制（越界 flip 的负坐标要如实打出来）
+static void sc64_fb_dec64(int64_t v) {
+    if (v < 0) { dbg64_str("-"); dbg64_dec((uint64_t)(-v)); }
+    else       { dbg64_dec((uint64_t)v); }
+}
+// 打点：clip=ok（原样提交）/ clipped（见 sub= 的夹取后矩形）/ reject（不提交）
+static void sc64_fb_log_flip64(int64_t x, int64_t y, int64_t w, int64_t h, const char* clip,
+                              int has_sub, int64_t sx, int64_t sy, int64_t sw, int64_t sh) {
+    dbg64_line_begin64();
+    dbg64_str("[FB64] flip pid=");
+    sc64_fb_dec64(sc64_fb_pid64());
+    dbg64_str(" x="); sc64_fb_dec64(x);
+    dbg64_str(" y="); sc64_fb_dec64(y);
+    dbg64_str(" w="); sc64_fb_dec64(w);
+    dbg64_str(" h="); sc64_fb_dec64(h);
+    dbg64_str(" clip="); dbg64_str(clip);
+    if (has_sub) {
+        dbg64_str(" sub=");
+        sc64_fb_dec64(sx); dbg64_str(",");
+        sc64_fb_dec64(sy); dbg64_str(",");
+        sc64_fb_dec64(sw); dbg64_str(",");
+        sc64_fb_dec64(sh);
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// fb_map(out_va**, out_info**)：把后备缓冲逐页映射进**当前地址空间**（用户可读写、不可执行）。
+// 幂等：本地址空间里那个 VA 已经有映射 -> 直接复用（页表项写法相同，重写一遍无副作用，打点 re=1）。
+static int64_t sc64_fb_map64(uint64_t out_va_uptr, uint64_t out_info_uptr) {
+    const int64_t pid = sc64_fb_pid64();
+    if (!user64_available64()) {                       // UEFI 固件页表：用户窗口建不起来，如实失败
+        dbg64_line_begin64();
+        dbg64_str("[FB64] map FAILED pid="); sc64_fb_dec64(pid);
+        dbg64_str(" reason=user-window-unavailable err="); sc64_fb_dec64(SYSCALL64_FB_EPERM64);
+        dbg64_nl(); dbg64_line_end64();
+        return SYSCALL64_FB_EPERM64;
+    }
+    int bw = 0, bh = 0, bytes = 0;
+    uint32_t* bb = fb_surface64(&bw, &bh);
+    const uint64_t phys = fb_surface_phys64(&bytes);
+    if (!bb || !phys || bw <= 0 || bh <= 0 || bytes <= 0) {
+        dbg64_line_begin64();
+        dbg64_str("[FB64] map FAILED pid="); sc64_fb_dec64(pid);
+        dbg64_str(" reason=no-back-buffer/"); sc64_fb_dec64((int64_t)bw);
+        dbg64_str("x"); sc64_fb_dec64((int64_t)bh);
+        dbg64_str(" err="); sc64_fb_dec64(SYSCALL64_FB_ENODEV64);
+        dbg64_nl(); dbg64_line_end64();
+        return SYSCALL64_FB_ENODEV64;
+    }
+    // 出参指针必须先过用户窗口校验（ring0 直接写用户内存，越界就是踩内核）
+    if (!user64_range_ok64(out_va_uptr, 8) ||
+        !user64_range_ok64(out_info_uptr, (uint64_t)SYSCALL64_FB_INFO_SIZE64)) {
+        syscall64_deny64(9, out_va_uptr);
+        return SYSCALL64_FB_EFAULT64;
+    }
+    const uint64_t pages = ((uint64_t)bytes + PAGE_SIZE_64 - 1) / PAGE_SIZE_64;
+    if (pages == 0 || pages > (USER64_FB_BYTES64 / PAGE_SIZE_64)) {
+        return SYSCALL64_FB_ENOMEM64;                   // 后备缓冲比 FB 映射区还大：如实拒绝
+    }
+    const int re = user64_page_is_user_ok64(USER64_FB_VA64) ? 1 : 0;   // 幂等：已映射过？
+    for (uint64_t i = 0; i < pages; i++) {
+        // 同一批**物理页**（后备缓冲）挂到用户页表：写就是写后备缓冲，内核 fb_flip 负责上屏。
+        if (!user64_map_phys_page64(USER64_FB_VA64 + i * PAGE_SIZE_64,
+                                    phys + i * PAGE_SIZE_64,
+                                    PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64)) {
+            dbg64_line_begin64();
+            dbg64_str("[FB64] map FAILED pid="); sc64_fb_dec64(pid);
+            dbg64_str(" reason=map failed at page="); dbg64_dec(i);
+            dbg64_str(" err="); sc64_fb_dec64(SYSCALL64_FB_ENOMEM64);
+            dbg64_nl(); dbg64_line_end64();
+            return SYSCALL64_FB_ENOMEM64;
+        }
+    }
+    user64_paging_sync64();                             // 批量改完页表后投递一次（重载 CR3）
+    const int u = user64_page_is_user_ok64(USER64_FB_VA64) ? 1 : 0;
+
+    *(uint64_t*)(uintptr_t)out_va_uptr = USER64_FB_VA64;               // 出参 1：用户 VA
+    Fb64Info info;                                                     // 出参 2：几何
+    info.width  = (uint32_t)bw;
+    info.height = (uint32_t)bh;
+    info.pitch  = (uint32_t)(bw * 4);
+    info.format = SYSCALL64_FB_FMT_XRGB8888;
+    info.size   = (uint64_t)bytes;
+    info.va     = USER64_FB_VA64;
+    *(Fb64Info*)(uintptr_t)out_info_uptr = info;
+
+    dbg64_line_begin64();
+    dbg64_str("[FB64] map pid="); sc64_fb_dec64(pid);
+    dbg64_str(" va=0x"); dbg64_hex64(USER64_FB_VA64);
+    dbg64_str(" pa=0x"); dbg64_hex64(phys);
+    dbg64_str(" w=");    dbg64_dec((uint64_t)bw);
+    dbg64_str(" h=");    dbg64_dec((uint64_t)bh);
+    dbg64_str(" pitch="); dbg64_dec((uint64_t)(bw * 4));
+    dbg64_str(" fmt=");  dbg64_dec(SYSCALL64_FB_FMT_XRGB8888);
+    dbg64_str(" pages="); dbg64_dec(pages);
+    dbg64_str(" re=");   dbg64_dec((uint64_t)re);
+    dbg64_str(" u=");    dbg64_dec((uint64_t)u);
+    dbg64_str(" bytes="); dbg64_dec((uint64_t)bytes);
+    dbg64_nl();
+    dbg64_line_end64();
+    if (!u) return SYSCALL64_FB_ENOMEM64;               // 说好"用户可访问"：没做到就如实失败
+    return 0;
+}
+
+// fb_flip(x, y, w, h)：把后备缓冲的矩形提交到屏幕。越界**夹取 or 拒绝**，绝不越界写、不崩。
+static int64_t sc64_fb_flip64(uint64_t x, uint64_t y, uint64_t w, uint64_t h) {
+    const int fw = fb_width(), fh = fb_height();
+    if (fw <= 0 || fh <= 0 || !fb_surface64(nullptr, nullptr) || !fb_surface_phys64(nullptr)) {
+        return SYSCALL64_FB_ENODEV64;                   // 还没有帧缓冲（理论上到不了这里）
+    }
+    const int64_t sx = (int64_t)x, sy = (int64_t)y, sw = (int64_t)w, sh = (int64_t)h;
+    if (sw <= 0 || sh <= 0 ||
+        sx >= (int64_t)fw || sy >= (int64_t)fh || sx + sw <= 0 || sy + sh <= 0) {
+        sc64_fb_log_flip64(sx, sy, sw, sh, "reject", 0, 0, 0, 0, 0);   // 完全在外：拒绝并打点
+        return SYSCALL64_FB_REJECT64;
+    }
+    int clamped = 0;
+    int64_t cx = sx, cy = sy, cw = sw, ch = sh;
+    if (cx < 0) { cw += cx; cx = 0; clamped = 1; }
+    if (cy < 0) { ch += cy; cy = 0; clamped = 1; }
+    if (cx + cw > (int64_t)fw) { cw = (int64_t)fw - cx; clamped = 1; }
+    if (cy + ch > (int64_t)fh) { ch = (int64_t)fh - cy; clamped = 1; }
+    if (cw <= 0 || ch <= 0) {
+        sc64_fb_log_flip64(sx, sy, sw, sh, "reject", 0, 0, 0, 0, 0);
+        return SYSCALL64_FB_REJECT64;
+    }
+    fb_user_flip64((int)cx, (int)cy, (int)cw, (int)ch);  // 用户自己的提交（不受内核绘制开关影响）
+    sc64_fb_log_flip64(sx, sy, sw, sh, clamped ? "clamped" : "ok", clamped, cx, cy, cw, ch);
+    return SYSCALL64_FB_FLIPPED64;
+}
+
+// fb_present()：整屏提交（缩放模式下走整帧最近邻放大路径）。
+static int64_t sc64_fb_present64() {
+    const int fw = fb_width(), fh = fb_height();
+    if (fw <= 0 || fh <= 0 || !fb_surface64(nullptr, nullptr)) return SYSCALL64_FB_ENODEV64;
+    fb_user_flip64(0, 0, fw, fh);
+    dbg64_line_begin64();
+    dbg64_str("[FB64] present pid="); sc64_fb_dec64(sc64_fb_pid64());
+    dbg64_str(" w="); dbg64_dec((uint64_t)fw);
+    dbg64_str(" h="); dbg64_dec((uint64_t)fh);
+    dbg64_str(" zoom="); dbg64_dec((uint64_t)fb_get_zoom());
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+
 // ==================================================================================
 // 入口 2）syscall 指令：Linux x86_64 号段（映射表见文件头）
 // ==================================================================================
@@ -1219,6 +1373,19 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
         ret = (fd64_close64((int)a1) == 0) ? 0 : -1;
         break;
 
+    // ★ A1：用户态绘图（自有 ABI 专用号；Linux 号段的 9/10/11 是 mmap/mprotect/munmap，别混）
+    case 9:                                                     // fb_map(out_va, out_info)
+        ret = sc64_fb_map64(a1, a2);
+        break;
+
+    case 10:                                                    // fb_flip(x, y, w, h)：第 4 个参数在 r10
+        ret = sc64_fb_flip64(a1, a2, a3, r->r10);
+        break;
+
+    case 11:                                                    // fb_present()
+        ret = sc64_fb_present64();
+        break;
+
     default:
         ret = -1;
         break;
@@ -1292,6 +1459,12 @@ int syscall64_selftest64() {
     if (USER64_BRK_VA64 + USER64_BRK_BYTES64 > USER64_MMAP_VA64) fail |= 1;
     if (USER64_MMAP_VA64 < USER64_BRK_VA64 + USER64_BRK_BYTES64) fail |= 1;
     if (USER64_MMAP_VA64 + USER64_MMAP_MIN_BYTES64 > USER64_CODE_VA64 + USER64_WINDOW_BYTES64) fail |= 1;
+    // ★ A1：FB 映射区必须"在用户半区（< 0x0000_8000_0000_0000 的规范用户地址）、与用户窗口不重叠、
+    //   且装得下 4K 后备缓冲（3840x2160x4 ≈ 33MiB）"——这三个常量是 fb_map(9) 的地址依据。
+    if (USER64_FB_VA64 < 0x100000000ULL) fail |= 1;
+    if (USER64_FB_VA64 <= USER64_CODE_VA64 + USER64_WINDOW_BYTES64) fail |= 1;
+    if (USER64_FB_VA64 + USER64_FB_BYTES64 > 0x0000800000000000ULL) fail |= 1;
+    if (USER64_FB_BYTES64 < 3840ULL * 2160ULL * 4ULL) fail |= 1;
 
     // ---- bit1：GDT 现场（access 字节 = 原始描述符 bits 40..47；gran = bits 48..55）----
     // ★ 屏蔽 CPU 会自己置的位：段被加载时置"访问位 A"（type bit0），ltr 把 TSS 类型

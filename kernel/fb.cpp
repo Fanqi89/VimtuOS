@@ -15,6 +15,16 @@ static int g_zoom = 100;                     // 显示缩放百分比
 static int g_clip_x0 = 0, g_clip_y0 = 0, g_clip_x1 = 0, g_clip_y1 = 0;
 static int g_clip_on = 0;      // 0 = 不裁剪（整屏）
 
+// ---- A1：内核侧绘制/提交总开关（1 = 正常；0 = 用户绘图演示期间"内核不再画"）----
+// 为什么需要它：A1 要让"屏幕上这一段确实是**用户程序**在画"这件事可验证 —— 演示期间把内核侧
+// 的所有绘制/提交都挡掉（含 write(1,..) 的屏幕回显、启动期的局部提交），只放行用户程序自己的
+// fb_flip（fb_user_flip64）。开关由 kernel/usermode64.cpp 的 user64_run_fbdemo64() 切换，
+// 用户程序退出（或被 kill 的回收路径）时一定恢复。
+static int g_kernel_paint64 = 1;
+
+void fb_kernel_paint64(int on) { g_kernel_paint64 = on ? 1 : 0; }
+int  fb_kernel_paint_on64() { return g_kernel_paint64; }
+
 void fb_set_clip(int x, int y, int w, int h) {
     int x1 = x + w, y1 = y + h;
     if (x < 0) x = 0;
@@ -33,6 +43,7 @@ void fb_reset_clip() {
 
 // 把矩形与裁剪区求交；返回 false = 完全被裁掉（无需绘制）
 static inline bool clip_rect(int* x, int* y, int* w, int* h) {
+    if (!g_kernel_paint64) return false;      // ★ A1：内核侧绘制关闭时一律不画（含清屏/填充）
     if (g_clip_on) {
         if (*x < g_clip_x0) { *w += *x - g_clip_x0; *x = g_clip_x0; }
         if (*y < g_clip_y0) { *h += *y - g_clip_y0; *y = g_clip_y0; }
@@ -49,7 +60,9 @@ static inline bool clip_rect(int* x, int* y, int* w, int* h) {
 // 后备缓冲（32bpp 统一格式）：所有绘制先写这里，fb_flip() 一次性提交到 LFB，
 // 避免 GUI 每秒整屏重绘时在屏幕上出现中间状态（闪烁/撕裂）。
 // 上限 3840x2160x4B ≈ 33MB（支持 4K 分辨率切换），放 .bss（_end 之后）。
-static uint32_t backbuf_storage[3840 * 2160];
+// ★ A1：**必须 4KB 对齐** —— 用户态绘图时这整块会被逐页映射给 ring3（见 fb_surface_phys64），
+//   对齐之后映射就是"整块原样"，不用做页内偏移，也不会顺带暴露别的内核变量。
+static uint32_t backbuf_storage[3840 * 2160] __attribute__((aligned(4096)));
 static uint32_t* backbuf = nullptr;
 
 void fb_get_clip64(int* x, int* y, int* w, int* h) {
@@ -67,6 +80,16 @@ uint32_t* fb_surface64(int* w, int* h) {
     if (w) *w = fb_width();
     if (h) *h = fb_height();
     return backbuf;
+}
+
+// A1：后备缓冲的物理基址（4KB 对齐）+ 字节数。恒等映射（PA 0..4GB）与高半区直映
+// （VA = 0xFFFFFFFF80000000 + PA，见 boot/loader64.asm）在引导期都已建好，所以：
+//   PA = VA - 0xFFFFFFFF80000000（与 kernel/proc64.cpp、kernel/kernel64.cpp 用的是同一条公式）。
+uint64_t fb_surface_phys64(int* out_bytes) {
+    uint32_t* bb = fb_surface64(nullptr, nullptr);
+    if (!bb) { if (out_bytes) *out_bytes = 0; return 0; }
+    if (out_bytes) *out_bytes = fb_width() * fb_height() * 4;
+    return (uint64_t)(uintptr_t)bb - 0xFFFFFFFF80000000ULL;
 }
 
 
@@ -136,8 +159,8 @@ void fb_set_zoom(int pct) {
     for (uint32_t i = 0; i < n; i++) backbuf[i] = 0;
 }
 
-// 后备缓冲 -> LFB（整帧提交）
-void fb_flip() {
+// 后备缓冲 -> LFB（整帧提交）：共享实现（内核侧 fb_flip 与 A1 的 fb_user_flip64 都走它）
+static void fb_flip_all64() {
     if (!backbuf || !fb_addr) return;
     if (g_zoom == 100) {
         if (fb_bpp == 32 && fb_pitch == fb_w * 4) {
@@ -180,10 +203,17 @@ void fb_flip() {
     }
 }
 
+// 后备缓冲 -> LFB（整帧提交）：**内核侧**提交入口（A1 演示期间被开关挡住）
+void fb_flip() {
+    if (!g_kernel_paint64) return;              // ★ A1：内核侧提交关闭（用户程序独占屏幕）
+    fb_flip_all64();
+}
+
 // 后备缓冲 -> LFB（仅提交指定区域；用于光标等局部更新，避免整帧 3MB 拷贝拖慢跟手）
-void fb_flip_region(int x, int y, int w, int h) {
+// 共享实现：fb_flip_region（内核侧，受开关影响）与 fb_user_flip64（用户态提交，不受影响）都用它。
+static void fb_blit_region64(int x, int y, int w, int h) {
     if (!backbuf || !fb_addr) return;
-    if (g_zoom != 100) { fb_flip(); return; }   // 缩放时无法局部映射，退化整帧
+    if (g_zoom != 100) { fb_flip_all64(); return; }   // 缩放时无法局部映射，退化整帧
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x + w > fb_w) w = fb_w - x;
@@ -216,7 +246,23 @@ void fb_flip_region(int x, int y, int w, int h) {
     }
 }
 
+// 后备缓冲 -> LFB（仅提交指定区域；用于光标等局部更新，避免整帧 3MB 拷贝拖慢跟手）
+// **内核侧**提交入口：A1 演示期间被"内核侧绘制/提交"开关挡住（用户程序用 fb_user_flip64）。
+void fb_flip_region(int x, int y, int w, int h) {
+    if (!g_kernel_paint64) return;              // ★ A1：内核侧提交关闭
+    fb_blit_region64(x, y, w, h);
+}
+// A1：**用户程序**的区域提交（fb_flip(10) 的实现）。与 fb_flip_region 的区别只有两点：
+//   1) 不被"内核侧绘制开关"挡住 —— 这是用户自己的提交；
+//   2) 坐标在这里**再夹一次**（syscall 侧已经夹过，双保险：不越界、不崩）。
+void fb_user_flip64(int x, int y, int w, int h) {
+    // 夹取在 fb_blit_region64 里做（负 x/y 夹到 0、w/h 夹到边界），这里只转交。
+    fb_blit_region64(x, y, w, h);
+}
+
+// ---- 逐像素绘制（全部走后备缓冲；受内核侧绘制开关 + 裁剪矩形约束）----
 static inline void putpx(int x, int y, uint32_t color) {
+    if (!g_kernel_paint64) return;              // ★ A1：内核侧绘制关闭时一律不画
     if (x < 0 || y < 0 || x >= g_render_w || y >= g_render_h) return;
     if (g_clip_on && (x < g_clip_x0 || y < g_clip_y0 || x >= g_clip_x1 || y >= g_clip_y1)) return;
     if (backbuf) {
@@ -228,6 +274,7 @@ void fb_putpixel(int x, int y, uint32_t color) { putpx(x, y, color); }
 
 void fb_clear(uint32_t color) {
     if (!backbuf) return;
+    if (!g_kernel_paint64) return;              // ★ A1：内核侧绘制关闭（清屏也算绘制）
     // ★ 清屏必须**尊重裁剪**。安装程序为了鼠标跟手改成"脏矩形重绘"（鼠标移动时只重画
     //   光标新旧位置那一小块），如果这里无视裁剪整屏清屏，那一小块的背景就画不回来
     //   （表现为光标拖影、整屏闪烁），局部重绘也就白做了。
@@ -382,6 +429,7 @@ void fb_draw_bitmap16(int x, int y, const uint16_t* bmp, int w, int h, uint32_t 
 // RGBA 图像绘制到后备缓冲（假设背景为黑色，直接按 alpha 混合）
 void fb_blit_rgba(int x, int y, const uint8_t* rgba, int w, int h) {
     if (!backbuf) return;
+    if (!g_kernel_paint64) return;              // ★ A1：内核侧绘制关闭（RGBA 直写后备缓冲也算绘制）
     int by0 = 0, by1 = h;      // 行裁剪范围
     if (g_clip_on) {
         if (y < g_clip_y0) by0 = g_clip_y0 - y;
