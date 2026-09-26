@@ -42,6 +42,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import proc64_test as p64          # noqa: E402  （OVMF 路径 / 变量卷 / qemu 查找复用）
 import esp_install_test as esp     # noqa: E402  （宿主侧 MBR/GPT/FAT32 解析器，交叉验证用）
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -162,11 +163,15 @@ def run_install(qemu, target, serial, port, dwell=1.2):
 
 
 def boot_nvme(qemu, target, serial, tag, ovmf=None, timeout=420):
-    """从 NVMe 盘启动（ovmf=code fd 路径 -> UEFI；否则 BIOS/SeaBIOS）。返回串口日志。"""
+    """从 NVMe 盘启动（ovmf=code fd 路径 -> UEFI；否则 BIOS/SeaBIOS）。返回串口日志。
+    ★ 登录界面必须**显式输入**（ui.login.auto 默认 0）：所以这里挂一个 monitor 端口做登录手势。"""
     if os.path.exists(serial):
         os.remove(serial)
+    mport = qh.free_port()
     args = ([qemu, "-name", "VimtuOS-" + tag, "-m", "512", "-vga", "std", "-display", "none",
-             "-serial", "file:%s" % q(serial), "-no-reboot"]
+             "-serial", "file:%s" % q(serial),
+             "-monitor", "telnet:127.0.0.1:%d,server,nowait" % mport,
+             "-no-reboot"]
             + nvme_disk_args(target) + ["-boot", "order=c"])
     if ovmf:
         args += ["-drive", "if=pflash,format=raw,unit=0,readonly=on,file=%s" % q(ovmf),
@@ -174,6 +179,7 @@ def boot_nvme(qemu, target, serial, tag, ovmf=None, timeout=420):
     print("     QEMU: " + " ".join(args))
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
+        qh.login_desktop(Monitor(mport), lambda: slog(serial), proc, timeout=min(timeout, 180))
         deadline = time.time() + timeout
         while time.time() < deadline:
             s = slog(serial)

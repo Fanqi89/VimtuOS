@@ -45,6 +45,7 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import proc64_test as p64          # noqa: E402  （OVMF 路径/变量卷/qemu 参数复用）
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -163,17 +164,22 @@ def run_install(qemu, target, serial, port, dwell=1.2, bus="ahci"):
 
 
 def boot_disk(qemu, img, serial, tag, ovmf=None, timeout=300):
-    """从一块盘启动：BIOS 或 UEFI（ovmf=code fd 路径）。返回串口日志。"""
+    """从一块盘启动：BIOS 或 UEFI（ovmf=code fd 路径）。返回串口日志。
+    ★ 登录界面必须**显式输入**（ui.login.auto 默认 0）：挂一个 monitor 端口做登录手势。"""
     if os.path.exists(serial):
         os.remove(serial)
+    mport = qh.free_port()
     args = [qemu, "-name", "VimtuOS-" + tag, "-m", "512", "-vga", "std", "-display", "none",
-            "-serial", "file:%s" % q(serial), "-no-reboot",
+            "-serial", "file:%s" % q(serial),
+            "-monitor", "telnet:127.0.0.1:%d,server,nowait" % mport, "-no-reboot",
             "-drive", "format=raw,file=%s" % q(img), "-boot", "order=c"]
     if ovmf:
         args += ["-drive", "if=pflash,format=raw,unit=0,readonly=on,file=%s" % q(ovmf),
                  "-drive", "if=pflash,format=raw,unit=1,file=%s" % q(p64._ovmf_vars())]
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
+        # ★ 登录手势：等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次（锁屏 -> 登录 -> 桌面）
+        qh.login_desktop(Monitor(mport), serial, proc, timeout=min(timeout, 180))
         deadline = time.time() + timeout
         while time.time() < deadline:
             s = slog(serial)

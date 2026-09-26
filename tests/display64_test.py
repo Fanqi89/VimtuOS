@@ -39,6 +39,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",
@@ -180,6 +182,8 @@ def main():
 
     try:
         print("=== 1) 等桌面起来 ===")
+        # ★ 登录手势：等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次（锁屏 -> 登录 -> 桌面）
+        qh.login_desktop(Monitor(args.port), slog, proc, timeout=min(args.timeout, 180))
         up = wait_for("[GUI64] ready", args.timeout, "桌面就绪 [GUI64] ready")
         log = slog()
         check("系统内核启动到桌面", up)

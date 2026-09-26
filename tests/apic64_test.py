@@ -42,6 +42,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",
@@ -168,7 +170,8 @@ def diff_count(px1, px2):
 
 def boot(qemu, img, extra_args, serial, errfile, wait_for, timeout, monitor_port=None,
          keep_alive=False):
-    """无头启动；轮询串口日志到 wait_for（或超时/提前退出）。返回 (log, early, err)。"""
+    """无头启动；轮询串口日志到 wait_for（或超时/提前退出）。返回 (log, early, err)。
+    ★ wait_for == "[GUI64] ready" 时先做登录手势（登录界面必须显式输入，ui.login.auto 默认 0）。"""
     if os.path.exists(serial):
         os.remove(serial)
     if os.path.exists(errfile):
@@ -182,6 +185,8 @@ def boot(qemu, img, extra_args, serial, errfile, wait_for, timeout, monitor_port
         "-no-reboot",
     ]
     args += list(extra_args)
+    if monitor_port is None and wait_for == "[GUI64] ready":
+        monitor_port = qh.free_port()      # ★ 登录手势要 monitor（回车两次）
     if monitor_port:
         args += ["-monitor", "telnet:127.0.0.1:%d,server,nowait" % monitor_port]
     err = open(errfile, "wb")
@@ -194,6 +199,9 @@ def boot(qemu, img, extra_args, serial, errfile, wait_for, timeout, monitor_port
                 return f.read()
         except OSError:
             return ""
+
+    if wait_for == "[GUI64] ready" and monitor_port:
+        qh.login_desktop(Monitor(monitor_port), slog, proc, timeout=min(timeout, 180))
 
     try:
         deadline = time.time() + timeout

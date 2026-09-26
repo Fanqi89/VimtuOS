@@ -42,6 +42,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import fs_tree_test as fst        # noqa: E402  （Monitor / boot_installed / boot_media / vimtufs3_format / MBR）
+import qemuhelp as qh             # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 import proc64_test as p64         # noqa: E402  （find_qemu / prepare_fixture 的 SYSTEM_IMG 路径）
 
 SECTOR = 512
@@ -242,7 +243,8 @@ def main():
     proc, mon = fst.boot_installed(qemu, [sys_disk, data_disk], serial, port, "Vimtu64-perm64-A")
     log = ""
     try:
-        # 自动登录（ui.login.auto 默认 1）-> 桌面
+        # ★ 登录界面必须**显式输入**（ui.login.auto 默认 0）：等锁屏可交互 -> 回车两次 -> 桌面
+        qh.login_desktop(mon, serial, proc, timeout=180)
         log = fst.wait_for(serial, "[GUI64] ready", args.timeout, proc) or ""
         check("阶段 A：v4 卷系统进桌面（[GUI64] ready）", "[GUI64] ready" in log)
 

@@ -50,6 +50,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import proc64_test as p64          # noqa: E402  （夹具/启动工具复用：find_qemu/q）
+import qemuhelp as qh            # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0，必须显式回车）
 
 MEDIUM = os.path.join(ROOT, "vimtu64-64.img")
 SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")   # 系统盘映像（boot+loader+内核）
@@ -312,7 +313,11 @@ def wait_wizard_ready(proc, serial, timeout=90):
     return "磁盘枚举完成" in log
 
 
-def wait_desktop(proc, serial, timeout=120):
+def wait_desktop(proc, serial, timeout=150, mon=None):
+    """装好的盘启动到桌面。★ 登录界面必须**显式输入**（ui.login.auto 默认 0）：
+    给了 mon 就先做登录手势（等锁屏可交互 -> 回车两次），否则会一直停在锁屏/登录界面。"""
+    if mon is not None:
+        qh.login_desktop(mon, serial, proc, timeout=min(timeout, 180))
     log = wait_for(serial, "[GUI64] ready", timeout, proc)
     return "[GUI64] ready" in log
 
@@ -439,7 +444,7 @@ def main():
     p3 = free_port()
     proc, mon = boot_installed(qemu, [target, data_disk], s3, p3)
     try:
-        up = wait_desktop(proc, s3)
+        up = wait_desktop(proc, s3, mon=mon)         # ★ 登录手势（显式回车）
         check("装好的系统进桌面（[GUI64] ready）", up and "[OS] ready (idle)" in slog(s3))
 
         # ---- 卷版本 + 盘符表 ----
@@ -547,7 +552,7 @@ def main():
     p4 = free_port()
     proc, mon = boot_installed(qemu, [target, data_disk], s4, p4)
     try:
-        up = wait_desktop(proc, s4)
+        up = wait_desktop(proc, s4, mon=mon)         # ★ 登录手势（显式回车）
         check("冷启动后进桌面", up)
         log4 = slog(s4)
         mt = re.search(r"\[VFS64\] tree (/apps/demo/demo\.txt) type=file size=(\d+) mtime=0x([0-9A-F]{8}) "
@@ -607,7 +612,7 @@ def main():
         p5 = free_port()
         proc, mon = boot_installed(qemu, [small_disk], s5, p5, "Vimtu64-fstree-small")
         try:
-            up = wait_desktop(proc, s5)
+            up = wait_desktop(proc, s5, mon=mon)     # ★ 登录手势（显式回车）
             check("小卷系统盘进桌面（Python 造的 v3 卷被内核认出）", up)
             log5 = slog(s5)
             check("小卷按 v3 挂载（mount ok ... version=3）",

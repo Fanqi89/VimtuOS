@@ -32,6 +32,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import qemuhelp as qh             # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",
@@ -90,6 +92,7 @@ def boot(qemu, img, logdir, timeout):
     if os.path.exists(serial):
         os.remove(serial)
     netid = "n0"
+    mport = qh.free_port()
     args = [
         qemu, "-name", "Vimtu64-net64",
         "-drive", "format=raw,file=%s" % q(img),
@@ -99,6 +102,7 @@ def boot(qemu, img, logdir, timeout):
         "-netdev", "user,id=%s" % netid,
         "-device", "e1000,netdev=%s" % netid,
         "-no-reboot",
+        "-monitor", "telnet:127.0.0.1:%d,server,nowait" % mport,
     ]
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     early = False
@@ -109,6 +113,8 @@ def boot(qemu, img, logdir, timeout):
                 return f.read()
         except OSError:
             return ""
+    # ★ 登录手势：等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次（锁屏 -> 登录 -> 桌面）
+    qh.login_desktop(qh.Monitor(mport), slog, proc, timeout=min(timeout, 180))
 
     try:
         deadline = time.time() + timeout

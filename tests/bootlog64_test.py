@@ -51,6 +51,7 @@ import tempfile
 import time
 import proc64_test as p64      # noqa: E402  find_qemu / prepare_fixture
 import fs_tree_test as fstq    # noqa: E402  kill / free_port / boot_installed
+import qemuhelp as qh          # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 FORBIDDEN = ["PANIC", "TRIPLE FAULT", "FAILED mask=", "selftest FAIL"]
 LINE_H = 20                    # console64 的行高（font_line_height）：像素断言用它
@@ -355,7 +356,8 @@ def main():
                   "lines=%s dropped=%s ms=%s" % (m.group(1), m.group(2), m.group(3)))
         check("[CON64] selftest PASS mask=0x0", "[CON64] selftest PASS mask=0x0" in log)
         check("[CON64] live lines=（进入实时追加模式）", "[CON64] live lines=" in log)
-        log = wait_mark(serial1, "[GUI64] ready", 40, proc)
+        qh.login_desktop(mon, serial1, proc, timeout=150)     # ★ 登录手势（锁屏可交互 -> 回车两次）
+        log = wait_mark(serial1, "[GUI64] ready", 90, proc)
         check("本遍正常进桌面（[GUI64] ready）", "[GUI64] ready" in log)
 
         print("=== 4) dmesg：终端命令 -> 屏幕 + 串口早期行 ===")
@@ -423,7 +425,8 @@ def main():
         skip_seen = skip_seen or ("[CON64] skip key=1" in log2)
         check("[CON64] skip key=1（任意键立即结束引导控制台）", skip_seen,
               (re.search(r"\[CON64\] (skip|replay|live)[^\r\n]*", log2) or re.search(r"$^", log2)).group(0))
-        log2 = wait_mark(serial2, "[GUI64] ready", 30, proc2, step=0.15)
+        qh.login_desktop(mon2, serial2, proc2, timeout=150)   # ★ 登录手势（显式回车两次）
+        log2 = wait_mark(serial2, "[GUI64] ready", 90, proc2, step=0.15)
         check("跳过之后**继续**既有流程（[GUI64] ready）", "[GUI64] ready" in log2)
         if fstq.open_terminal(mon2, serial2, proc2):
             time.sleep(0.8)
@@ -449,7 +452,8 @@ def main():
         log3 = wait_mark(serial3, "[CON64] verbose=0 skipped", 90, proc3, step=0.15)
         check("[CON64] verbose=0 skipped（关掉的开关真的生效）", "[CON64] verbose=0 skipped" in log3,
               (re.search(r"\[CON64\] verbose=0[^\r\n]*", log3) or re.search(r"$^", log3)).group(0))
-        log3 = wait_mark(serial3, "[GUI64] ready", 40, proc3, step=0.15)
+        qh.login_desktop(mon3, serial3, proc3, timeout=150)   # ★ 登录手势（显式回车两次）
+        log3 = wait_mark(serial3, "[GUI64] ready", 90, proc3, step=0.15)
         check("第三遍仍正常进桌面（[GUI64] ready）", "[GUI64] ready" in log3)
         check("verbose=0 时不回放（无 [CON64] replay lines=）", "[CON64] replay lines=" not in log3)
         if fstq.open_terminal(mon3, serial3, proc3):

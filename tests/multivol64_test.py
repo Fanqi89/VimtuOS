@@ -494,7 +494,7 @@ def main():
     vm = Vm(qemu, [target, data1], p3, s3, "Vimtu64-multivol-os")
     mon = exp.Monitor(p3)          # 该 Monitor 有 shot()（screendump -> PPM）
     try:
-        check("装好的系统进入桌面（[GUI64] ready）", fst.wait_desktop(vm.proc, s3, 120))
+        check("装好的系统进入桌面（[GUI64] ready）", fst.wait_desktop(vm.proc, s3, 150, mon))
         log3 = vm.log()
         # ---- 启动期：卷槽表 + 盘符 ----
         check("系统卷挂进 0 号槽（[VFS64] mount_system slot=0）", "[VFS64] mount_system slot=0" in log3)
@@ -744,7 +744,7 @@ def main():
     vm = VmAhci(qemu, target, data_extra, p4, s4, "Vimtu64-multivol-volfull")
     mon = exp.Monitor(p4)
     try:
-        check("装好的系统进入桌面（卷表满会话）", fst.wait_desktop(vm.proc, s4, 120))
+        check("装好的系统进入桌面（卷表满会话）", fst.wait_desktop(vm.proc, s4, 150, mon))
         log4 = vm.log()
         check("卷槽表 4 个槽全满（used=4 system=0 current=0）",
               re.search(r"\[VFS64\] slots n=4 used=4 system=0 current=0", log4) is not None)

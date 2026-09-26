@@ -48,6 +48,7 @@ sys.path.insert(0, HERE)
 import proc64_test as p64          # noqa: E402  find_qemu
 import fs_tree_test as fst         # noqa: E402  夹具（qemu_args / vimtufs3_format / 串口工具）
 import multivol64_test as mv       # noqa: E402  宿主侧 v3 卷解析 + D: 盘夹具
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 SECTOR = 512
 SYSTEM_IMG = fst.SYSTEM_IMG
@@ -204,7 +205,8 @@ def main():
     BIG = 8388608 - SECTOR                            # 8mb 步骤写"上限 - 512B" = 8388096
     LIMIT = 8388608                                   # limit 步骤先补到**正好上限**，再多写 1 字节
     try:
-        check("桌面就绪（[GUI64] ready）", fst.wait_for(serial, "[GUI64] ready", 150, proc) and
+        qh.login_desktop(mon, serial, proc, timeout=180)   # ★ 登录手势（锁屏可交互 -> 回车两次）
+        check("桌面就绪（[GUI64] ready）", fst.wait_for(serial, "[GUI64] ready", 180, proc) and
               "[GUI64] ready" in fst.slog(serial))
         log = fst.slog(serial)
         check("VimtuFS2 自检全过（[VFS64] selftest PASS，含二级间接块 bit13..15）", "[VFS64] selftest PASS" in log)
@@ -386,7 +388,8 @@ def main():
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     mon4 = fst.Monitor(port4)
     try:
-        check("冷启动第二遍：桌面就绪", fst.wait_for(serial4, "[GUI64] ready", 150, proc4) and
+        qh.login_desktop(mon4, serial4, proc4, timeout=180)   # ★ 登录手势（显式回车）
+        check("冷启动第二遍：桌面就绪", fst.wait_for(serial4, "[GUI64] ready", 180, proc4) and
               "[GUI64] ready" in fst.slog(serial4))
         check("冷启动第二遍：VimtuFS2 自检仍 PASS（含大文件 bit13-15）",
               "[VFS64] selftest PASS" in fst.slog(serial4))

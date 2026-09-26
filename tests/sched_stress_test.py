@@ -49,6 +49,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import qemuhelp as qh             # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",
@@ -96,16 +98,19 @@ def q(p):
 
 
 def boot_and_wait(qemu, img, serial, errfile, timeout):
-    """无头启动系统内核；轮询串口日志到 [GUI64] ready（或超时/提前停住）。返回 (proc, slog, early)"""
+    """无头启动系统内核；轮询串口日志到 [GUI64] ready（或超时/提前停住）。返回 (proc, slog, early)
+    ★ 登录界面必须**显式输入**（ui.login.auto 默认 0）：挂一个 monitor 端口做登录手势。"""
     for p in (serial, errfile):
         if os.path.exists(p):
             os.remove(p)
+    mport = qh.free_port()
     args = [
         qemu, "-name", "Vimtu64-sched-stress",
         "-drive", "format=raw,file=%s" % q(img),
         "-boot", "order=c", "-m", "512", "-vga", "std",
         "-display", "none",
         "-serial", "file:%s" % q(serial),
+        "-monitor", "telnet:127.0.0.1:%d,server,nowait" % mport,
         "-no-reboot",
     ]
     err = open(errfile, "wb")
@@ -119,6 +124,9 @@ def boot_and_wait(qemu, img, serial, errfile, timeout):
                 return f.read()
         except OSError:
             return ""
+
+    # ★ 登录手势：等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次（锁屏 -> 登录 -> 桌面）
+    qh.login_desktop(qh.Monitor(mport), slog, proc, timeout=min(timeout, 180))
 
     deadline = time.time() + timeout
     while time.time() < deadline:

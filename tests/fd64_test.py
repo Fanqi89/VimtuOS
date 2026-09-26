@@ -51,6 +51,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import proc64_test as p64          # noqa: E402  （夹具/启动工具复用：prepare_fixture/find_qemu）
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 FORBIDDEN = [
     "PANIC",
@@ -150,7 +151,9 @@ def boot(qemu, img, serial, port):
               "-monitor", "telnet:127.0.0.1:%d,server,nowait" % port,
               "-no-reboot"]
     proc = subprocess.Popen(args_q, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    log = wait_for(serial, "[GUI64] ready", 90, proc)
+    # ★ 登录手势：等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次（锁屏 -> 登录 -> 桌面）
+    qh.login_desktop(Monitor(port), serial, proc, timeout=180)
+    log = wait_for(serial, "[GUI64] ready", 120, proc)
     return proc, log
 
 

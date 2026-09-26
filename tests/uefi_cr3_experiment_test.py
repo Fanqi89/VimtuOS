@@ -48,6 +48,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import proc64_test as p64          # noqa: E402  （夹具/OVMF/关键词法复用）
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 KERNEL_EXP = os.path.join(ROOT, "build64", "kernel64_os_cr3exp.bin")
 FIXTURE_EXP = os.path.join(ROOT, "build64", "cr3exp_uefi.img")
@@ -175,14 +176,18 @@ def run_qemu(qemu, img, tag, logdir, timeout):
     serial = os.path.join(logdir, tag + ".log")
     if os.path.exists(serial):
         os.remove(serial)
+    mport = qh.free_port()
     args = [qemu, "-name", "Vimtu64-" + tag,
             "-drive", "format=raw,file=%s" % p64.q(img),
             "-boot", "order=c", "-m", "512", "-vga", "std", "-display", "none",
             "-serial", "file:%s" % p64.q(serial),
+            "-monitor", "telnet:127.0.0.1:%d,server,nowait" % mport,
             "-no-reboot",
             "-drive", "if=pflash,format=raw,unit=0,readonly=on,file=%s" % p64.q(ovmf),
             "-drive", "if=pflash,format=raw,unit=1,file=%s" % p64.q(p64._ovmf_vars())]
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # ★ 登录手势：等锁屏可交互 -> 回车两次（登录界面必须显式输入，ui.login.auto 默认 0）
+    qh.login_desktop(qh.Monitor(mport), lambda: read_text(serial), proc, timeout=min(timeout, 180))
     log, hit = wait_marker(serial, ["[PROC64] uefi exp result=", "[PROC64] uefi exp B stage=cr3"],
                            timeout, proc)
     # 结果行/失败行之后再给一点时间把后续（GUI/isolation ON 行）刷完

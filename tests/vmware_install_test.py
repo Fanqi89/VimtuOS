@@ -40,6 +40,9 @@ SCRATCH = os.environ.get("PI_SCRATCH_DIR", HERE)
 
 LOADER = os.path.join(ROOT, "build64", "loader64.bin")
 KEY_TCP_PORT = 4557            # COM2 按键通道（VMware network 模式串口，服务端在 VMware 侧）
+sys.path.insert(0, HERE)
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
+VNC_BOOT_PORT = 5904            # 与 vmware_make_vm.py 的 VNC_BOOT_PORT 一致（启动 VM 的 VNC）
 INS_KERNEL = os.path.join(ROOT, "build64", "kernel64.bin")
 TARGET_SECTORS = 32768
 
@@ -240,6 +243,12 @@ def main():
     print("=== 7) 单独启动装好的硬盘（VMware 里验证真能开机）===")
     ok_boot, out = start_vm(VMX_BOOT)
     print("   startVM ok=%s %s" % (ok_boot, out.strip()[:200]))
+    # ★ 登录手势（VMware 路径没有 QEMU monitor -> 用 VNC 的 RFB KeyEvent 送回车）：
+    #   登录界面必须**显式输入**（ui.login.auto 默认 0）；"[OS] ready (idle)" 在登录之后才打。
+    if qh.vnc_login_desktop(SERIAL_BOOT, VNC_BOOT_PORT, None, timeout=180, count=2):
+        print("   [ok] 登录手势已注入（VNC %d：锁屏 -> 回车两次 -> 桌面）" % VNC_BOOT_PORT)
+    else:
+        print("   [!!] 没能注入登录手势（VNC %d 连不上或没等到锁屏）" % VNC_BOOT_PORT)
     wait_for(SERIAL_BOOT, "[OS] ready (idle)", 120, "装好的系统就绪")
     time.sleep(1)
     boot = read_text(SERIAL_BOOT)

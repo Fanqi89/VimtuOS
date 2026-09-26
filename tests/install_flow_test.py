@@ -27,6 +27,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",
@@ -278,16 +280,27 @@ def main():
     def q(p):
         return p.replace("\\", "/")
 
+    mport = qh.free_port()
     args2 = [
         qemu, "-name", "VimtuOS-installed",
         "-drive", "format=raw,file=%s" % q(args.target),
         "-boot", "order=c", "-m", "512", "-vga", "std",
         "-display", "none",
         "-serial", "file:%s" % q(boot_log),
+        "-monitor", "telnet:127.0.0.1:%d,server,nowait" % mport,
         "-no-reboot",
     ]
     proc = subprocess.Popen(args2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(14)
+    # ★ 登录手势：登录界面必须**显式输入**（ui.login.auto 默认 0）——
+    #   等锁屏可交互 -> 回车两次（锁屏 -> 登录 -> 桌面）；"[OS] ready (idle)" 在登录之后才打。
+    qh.login_desktop(Monitor(mport), boot_log, proc, timeout=180)
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        if "[OS] ready (idle)" in qh.read_log(boot_log):
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.4)
     if proc.poll() is None:
         proc.kill()
         try:

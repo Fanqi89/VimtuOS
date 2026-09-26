@@ -36,6 +36,9 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
+sys.path.insert(0, HERE)
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
+
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",
     r"C:\Program Files (x86)\qemu\qemu-system-x86_64.exe",
@@ -405,17 +408,23 @@ def main():
         boot_log = os.path.join(ROOT, "ahci_installed_boot.log")
         if os.path.exists(boot_log):
             os.remove(boot_log)
+        bport = qh.free_port()
         boot_args = [
             qemu, "-name", "VimtuOS-ahci-installed",
             "-drive", "format=raw,file=%s,index=0,media=disk" % q(args.target),
             "-boot", "order=c", "-m", "512", "-vga", "std", "-display", "none",
             "-serial", "file:%s" % q(boot_log),
+            "-monitor", "telnet:127.0.0.1:%d,server,nowait" % bport,
             "-no-reboot",
         ]
         bproc = subprocess.Popen(boot_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        bmon = Monitor(bport)
         booted = ""
         try:
-            for _ in range(240):                    # 最多 60s 等进桌面
+            # ★ 登录手势：登录界面必须显式输入（ui.login.auto 默认 0）——
+            #   等锁屏可交互 -> 回车两次（锁屏 -> 登录 -> 桌面）
+            qh.login_desktop(bmon, boot_log, bproc, timeout=180)
+            for _ in range(480):                    # 最多 120s 等进桌面
                 time.sleep(0.25)
                 try:
                     with open(boot_log, "r", encoding="utf-8", errors="replace") as f:

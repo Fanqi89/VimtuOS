@@ -38,6 +38,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
@@ -209,6 +212,7 @@ def phase2_boot_ahci(qemu, target, log, seconds=180):
     """★ 关键一段：**只把装好的盘挂在 AHCI 上**（没有 IDE 兼容盘、没有安装介质）启动。"""
     if os.path.exists(log):
         os.remove(log)
+    mport = qh.free_port()
     args = [
         qemu, "-name", "VimtuOS-diskboot-ahci",
         "-device", "ich9-ahci,id=ahci",
@@ -216,11 +220,15 @@ def phase2_boot_ahci(qemu, target, log, seconds=180):
         "-device", "ide-hd,drive=d0,bus=ahci.0",
         "-boot", "order=c", "-m", "512", "-vga", "std", "-display", "none",
         "-serial", "file:%s" % q(log),
+        "-monitor", "telnet:127.0.0.1:%d,server,nowait" % mport,
         "-no-reboot",
     ]
     print("     qemu: 唯一的盘 = 装好的系统盘，挂在 ich9-ahci port0（无 IDE 兼容盘）")
     proc = run_qemu(args)
     try:
+        # ★ 登录手势：登录界面必须显式输入（ui.login.auto 默认 0）——
+        #   等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次（锁屏 -> 登录 -> 桌面）
+        qh.login_desktop(Monitor(mport), log, proc, timeout=min(seconds, 180))
         got = wait_for(log, ["[GUI64] ready", "PANIC", "TRIPLE FAULT"], seconds)
         print("     启动终点标记：%s" % (got or "（超时）"))
     finally:

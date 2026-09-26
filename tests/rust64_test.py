@@ -38,6 +38,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",
@@ -459,6 +461,8 @@ def main():
 
             # ---- 5b) 终端 `rust` 命令（C++ -> Rust 运行期接口的第二个调用点）----
             print("=== 6) 终端 `rust` 命令（Win 键 + 1 开终端；打点走串口）===")
+            # ★ 登录手势：等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次（锁屏 -> 登录 -> 桌面）
+            qh.login_desktop(Mon(port), slog, proc, timeout=180)
             up = wait_mark("[GUI64] ready", 150)
             ck.ok("系统内核进桌面（[GUI64] ready）", up)
             mon = Mon(port)

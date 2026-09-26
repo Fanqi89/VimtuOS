@@ -43,6 +43,8 @@ import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",
@@ -441,6 +443,7 @@ def main():
     print("[store64] 第一遍启动：打开终端 -> store set theme dark / store flush / store dump")
     vm = Vm(qemu, img, tmp, "boot1", args.port, args.timeout)
     vm.start()
+    qh.login_desktop(vm.monitor(), vm.log, vm.proc, timeout=min(args.timeout, 180))  # ★ 登录手势
     up1 = vm.wait_for("[GUI64] ready", args.timeout)
     mon = vm.monitor() if up1 else None
     typed = False
@@ -538,6 +541,7 @@ def main():
     print("[store64] 第二遍启动（冷启动同一块镜像）：从盘上读回设置")
     vm = Vm(qemu, img, tmp, "boot2", args.port + 1, args.timeout)
     vm.start()
+    qh.login_desktop(vm.monitor(), vm.log, vm.proc, timeout=min(args.timeout, 180))  # ★ 登录手势
     up2 = vm.wait_for("[GUI64] ready", args.timeout)
     log2 = vm.log()
     vm.stop()
@@ -579,6 +583,7 @@ def main():
     print("[store64] 第三遍启动（build64/system.img，没有分区表/没有卷）：验证降级警告")
     vm = Vm(qemu, SYSTEM_IMG, tmp, "boot3", args.port + 2, args.timeout)
     vm.start()
+    qh.login_desktop(vm.monitor(), vm.log, vm.proc, timeout=min(args.timeout, 180))  # ★ 登录手势
     up3 = vm.wait_for("[GUI64] ready", args.timeout)
     log3 = vm.log()
     vm.stop()

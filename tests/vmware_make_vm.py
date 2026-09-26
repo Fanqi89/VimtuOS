@@ -23,7 +23,8 @@ TESTDIR = os.path.join(BASE, "v64-install-test")
 
 MEDIUM = os.path.join(ROOT, "vimtu64-64.img")
 TARGET_SECTORS = 32768          # 16 MB
-VNC_PORT = 5903
+VNC_PORT = 5903                 # 安装 VM 的 VNC（只读看屏 + 可用 RFB KeyEvent 送按键）
+VNC_BOOT_PORT = 5904            # ★ "装好的盘启动" VM 的 VNC：登录界面必须显式回车，按键从这里送
 KEY_TCP_PORT = 4557          # COM2（串口按键通道）走 TCP，VMware 当服务端、我们连上去写按键
 
 
@@ -187,13 +188,14 @@ def main():
     with open(vmx2, "w", encoding="utf-8", newline="\n") as f:
         f.write(vmx_text("VimtuOS 64 位已安装盘启动测试%s" % ("(UEFI)" if args.uefi else ""),
                          [("0:0", "disk", "target.vmdk")],
-                         boot_serial, key_pipe=None, vnc_port=None, uefi=args.uefi))
+                         boot_serial, key_pipe=None, vnc_port=VNC_BOOT_PORT, uefi=args.uefi))
 
     print("[vm] 安装 VM   = %s" % vmx1)
     print("[vm] 启动 VM   = %s" % vmx2)
     print("[vm] 串口输出  = %s" % install_serial)
+    print("[vm] VNC         = 安装 127.0.0.1:%d / 启动 127.0.0.1:%d（登录手势用 RFB KeyEvent）"
+          % (VNC_PORT, VNC_BOOT_PORT))
     print("[vm] 按键通道  = COM2 <- tcp://127.0.0.1:%d（VMware 当服务端）" % KEY_TCP_PORT)
-    print("[vm] VNC(只读) = 127.0.0.1:%d" % VNC_PORT)
     return 0
 
 

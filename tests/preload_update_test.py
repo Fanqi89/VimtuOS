@@ -43,6 +43,7 @@ sys.path.insert(0, HERE)
 
 # 夹具与启动流程直接复用 proc64_test.py（同一套"已安装系统 + VimtuFS2 主分区"）
 import proc64_test as p64          # noqa: E402
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 SECTOR = p64.SECTOR
 PART_MAIN_LBA = p64.PART_MAIN_LBA
@@ -196,15 +197,18 @@ def vfs_write_small(buf, base, name, data):
 
 
 def boot(qemu, img, tag, logdir, timeout, ready=True):
-    """无头启动；ready=True 等到 [GUI64] ready，ready=False 等到进程退出（自动重启）或超时。"""
+    """无头启动；ready=True 等到 [GUI64] ready，ready=False 等到进程退出（自动重启）或超时。
+    ★ ready=True 时先做登录手势（登录界面必须显式输入，ui.login.auto 默认 0）。"""
     serial = os.path.join(logdir, tag + ".log")
     if os.path.exists(serial):
         os.remove(serial)
+    mport = qh.free_port()
     args = [qemu, "-name", "Vimtu64-" + tag,
             "-drive", "format=raw,file=%s" % p64.q(img),
             "-boot", "order=c", "-m", "512", "-vga", "std",
             "-display", "none",
             "-serial", "file:%s" % p64.q(serial),
+            "-monitor", "telnet:127.0.0.1:%d,server,nowait" % mport,
             "-no-reboot"]
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     exited = False
@@ -215,6 +219,12 @@ def boot(qemu, img, tag, logdir, timeout, ready=True):
                 return f.read()
         except OSError:
             return ""
+    if ready:
+        try:
+            # ★ 登录手势：等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次
+            qh.login_desktop(qh.Monitor(mport), slog, proc, timeout=min(timeout, 180))
+        except Exception:
+            pass
 
     try:
         deadline = time.time() + timeout

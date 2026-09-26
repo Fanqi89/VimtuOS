@@ -71,6 +71,7 @@ import explorer64_test as exp      # noqa: E402  鼠标闭环 / 像素工具
 import fileops64_test as fo        # noqa: E402  条目单元格几何 / 剪贴板流程
 import multivol64_test as mv       # noqa: E402  宿主侧 v3 卷解析（C: 内容逐字节核对）
 import fatread64_test as fatr      # noqa: E402  宿主侧 FAT32 构造器（造 U 盘镜像）
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 SECTOR = 512
 BUILD = os.path.join(ROOT, "build64")
@@ -360,6 +361,8 @@ def main():
     try:
         if not ph1:                                  # --phase：调试时跳过整段（夹具照建，QEMU 照起）
             raise SkipPhase()
+        # ★ 登录手势：等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次（锁屏 -> 登录 -> 桌面）
+        qh.login_desktop(mon, vm.log, vm.proc, timeout=180)
         check("桌面就绪（[GUI64] ready）", vm.wait_log("[GUI64] ready", 200))
 
         # ---- 1a) USB 主机 + 存储枚举的串口证据 ----
@@ -641,6 +644,8 @@ def main():
     try:
         if not ph2:
             raise SkipPhase()
+        # ★ 登录手势（阶段 2 同一个盘：同样必须显式回车）
+        qh.login_desktop(exp.Monitor(port2), vm2.log, vm2.proc, timeout=180)
         check("桌面就绪（[GUI64] ready）", vm2.wait_log("[GUI64] ready", 200))
         log2 = vm2.log()
         check("★ 键盘仍然枚举成功（[USB64] config set value=1 ifaces=1 hid=1 ep_in=.. mps=8）",

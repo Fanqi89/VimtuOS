@@ -29,6 +29,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
@@ -262,6 +265,8 @@ def shot_page(qemu, tmp, args):
         vm = E.Vm(qemu, img, port, serial, "Vimtu64-shot-page")
     mon = E.Monitor(port)
     try:
+        # ★ 登录手势：等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次（锁屏 -> 登录 -> 桌面）
+        qh.login_desktop(mon, vm.log, vm.proc, timeout=180)
         if not vm.wait_log("[GUI64] ready", 120):
             sys.stderr.write("--page：桌面没起来（等 [GUI64] ready 超时）\n")
             return 1

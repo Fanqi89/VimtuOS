@@ -38,6 +38,8 @@ import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",
@@ -375,6 +377,9 @@ class Vm:
         return needle in self.log()[since:]
 
     def wait_ready(self, timeout=None):
+        # ★ 登录界面必须**显式输入**（ui.login.auto 默认 0）：先做登录手势再等桌面
+        qh.login_desktop(self.monitor(), self.log, self.proc,
+                         timeout=min(timeout or self.timeout, 180))
         return self.wait_log("[GUI64] ready", timeout or self.timeout)
 
     def monitor(self):

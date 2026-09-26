@@ -27,6 +27,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",
@@ -319,7 +321,9 @@ def main():
         mon = Monitor(args.port)
 
         print("=== 1) 主题 Token / 图元层启动打点 ===")
-        up = wait_for("[GUI64] ready", 90, "桌面就绪")
+        # ★ 登录手势：等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次（锁屏 -> 登录 -> 桌面）
+        qh.login_desktop(mon, slog, proc, timeout=180)
+        up = wait_for("[GUI64] ready", 120, "桌面就绪")
         log = slog()
         check("等待桌面就绪", up)
         m = re.search(r"\[THEME64\] init themes=(\d+) theme=(\d+) name=(\S+) dark=(\d)",

@@ -29,6 +29,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",
@@ -90,12 +92,14 @@ def main():
 
     tmp = tempfile.mkdtemp(prefix="vimtu64_disp64_")
     serial = os.path.join(tmp, "serial.log")
+    mport = qh.free_port()
     proc = subprocess.Popen([
         qemu, "-name", "Vimtu64-disp64",
         "-drive", "format=raw,file=%s" % q(args.img),
         "-boot", "order=c", "-m", "512", "-vga", "std",
         "-display", "none",
         "-serial", "file:%s" % q(serial),
+        "-monitor", "telnet:127.0.0.1:%d,server,nowait" % mport,
         "-no-reboot",
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -116,6 +120,8 @@ def main():
             return ""
 
     try:
+        # ★ 登录手势：等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次（锁屏 -> 登录 -> 桌面）
+        qh.login_desktop(qh.Monitor(mport), slog, proc, timeout=min(args.timeout, 180))
         # 显示层探测发生在 fb_init 之后、task_start64 之前；等 [GUI64] ready 保证全跑完
         t0 = time.time()
         log = ""

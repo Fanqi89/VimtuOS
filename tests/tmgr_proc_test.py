@@ -34,6 +34,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import proc64_test as p64          # noqa: E402  （夹具/启动工具复用）
+import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 
 # 终端里要敲的命令（QEMU sendkey 键名）
 RUN_CMD_KEYS = ["p", "r", "o", "c", "spc", "r", "u", "n", "spc", "s", "p", "i", "n", "ret"]
@@ -140,6 +141,8 @@ def main():
         print("  [%s] %s%s" % ("PASS" if cond else "FAIL", name, ("  " + detail) if detail else ""))
 
     try:
+        # ★ 登录手势：等锁屏可交互（[LOCK64] bg blur ready）-> 回车两次（锁屏 -> 登录 -> 桌面）
+        qh.login_desktop(Monitor(port), serial, proc, timeout=180)
         log = wait_for(serial, "[GUI64] ready", args.timeout, proc)
         check("[GUI64] ready（桌面起来）", "[GUI64] ready" in log)
         check("[PRELOAD64] glyphs prewarmed=（预热先跑过）", "[PRELOAD64] glyphs prewarmed=" in log)
