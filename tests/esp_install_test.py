@@ -19,7 +19,8 @@
        * ESP 里三个文件与本地构建产物**逐字节一致**：
          EFI/BOOT/BOOTX64.EFI == build64/BOOTX64.EFI
          UEFI64.BIN           == build64/UEFI64.BIN
-         KERNEL64.BIN         == build64/kernel64_os.bin（补零到 4MB 内核区）
+         KERNEL64.BIN         == build64/system.img 的**内核区整块** LBA 9..8008（含尾部的图标包，
+                                4,096,000 B；不是 "kernel64_os.bin + 补零"）
   4) **UEFI（OVMF）从这块装好的盘启动** -> "[OS] booted from installed disk" + "[GUI64] ready"
   5) **BIOS（SeaBIOS）从同一块盘启动** -> 同样进系统（这就是"新老设备都能启动"的直接证据）
   6) **小盘 PATA 回归（128MB PATA 目标盘）**：同样走完安装，断言
@@ -537,7 +538,12 @@ def main():
     stub_ref = open(STUB, "rb").read()
     uefi_ref = open(UEFI64, "rb").read()
     kern_ref = open(OS_KERNEL, "rb").read()
-    kregion = kern_ref + b"\0" * (8000 * 512 - len(kern_ref))    # 目标盘 LBA 9..8008 的整块
+    # ★ 自 P6 起内核区**尾部**（LBA 7497..8008）有外置图标包（build64.sh 写进 system.img）：
+    #   安装器写入 ESP 的 KERNEL64.BIN 是**内核区整块**（LBA 9..8008 = 4,096,000 B），不是
+    #   "kernel64_os.bin + 补零"。独立来源 = build64/system.img 的同一区间（大小 + 逐字节）。
+    with open(os.path.join(BUILD, "system.img"), "rb") as f:
+        f.seek(PART_BOOT_LBA * 512)
+        kregion = f.read(8000 * 512)
     if efi is not None:
         data, size = fat.read_file(efi)
         check("EFI/BOOT/BOOTX64.EFI = build64/BOOTX64.EFI（%d 字节）" % len(stub_ref),
@@ -552,8 +558,9 @@ def main():
     check("KERNEL64.BIN 存在", k is not None)
     if k:
         data, size = fat.read_file(k)
-        check("KERNEL64.BIN = 系统内核整块（kernel64_os.bin + 补零 = %d 字节）" % len(kregion),
-              data == kregion, "盘上 %d 字节" % size)
+        check("KERNEL64.BIN = 内核区整块（system.img LBA 9..8008 的 %d 字节，大小 + 逐字节）"
+              % len(kregion),
+              size == len(kregion) and data == kregion, "盘上 %d 字节" % size)
         check("KERNEL64.BIN 与目标盘 LBA 9.. 的内核区逐字节一致",
               data == disk[PART_BOOT_LBA * SECTOR: (PART_BOOT_LBA + 8000) * SECTOR])
 

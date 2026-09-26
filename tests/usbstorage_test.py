@@ -202,13 +202,14 @@ class Vm:
         return len(self.log())
 
     def wait_log(self, needle, timeout, since=0):
+        # 轮询 0.15s（原来 0.3s）：只改等待粒度，不改任何判据 —— 只影响"多久发现打点"
         t0 = time.time()
         while time.time() - t0 < timeout:
             if needle in self.log()[since:]:
                 return True
             if self.proc.poll() is not None:
                 return False
-            time.sleep(0.3)
+            time.sleep(0.15)
         return False
 
     def wait_new(self, pattern, timeout, since):
@@ -216,7 +217,7 @@ class Vm:
         while time.time() - t0 < timeout:
             if re.search(pattern, self.log()[since:]):
                 return True
-            time.sleep(0.3)
+            time.sleep(0.15)
         return False
 
     def wait_nav(self, path, items, timeout, since):
@@ -246,12 +247,7 @@ def at_thispc(vm):
     return last_thispc > last_inside
 
 
-def goto_volume(vm, mon, letter):
-    """进入某个卷：不在"此电脑"页就先回去，再双击 <letter>: 卡片（等 enter 打点）。"""
-    if not at_thispc(vm):
-        if not mv.back_to_thispc(vm, mon):
-            return False
-    return mv.explorer_dclick_card(vm, mon, letter, "[UI] explorer enter letter=%s:" % letter)
+
 
 
 
@@ -288,6 +284,138 @@ def fresh_or_last_item_idx(vm, name, since):
     """先在 since 之后的窗口里找；找不到就退回"全日志最后一次"（同一卷已经列过时的兜底）。"""
     idx = fresh_item_idx(vm, name, since)
     return idx if idx >= 0 else fo.last_item_idx(vm, name)
+
+# ---------------------------------------------------------------------------
+# ★ 跑法提速（缺陷 2：预算内跑完；判据一字不改）：
+#   原来每一次 aim_click / aim_single_click / fo.Mouse.click 都重新做一次
+#   calibrate_offset（一次 park + ~500px 盲走 ≈ 10s+），一轮十几处就是 150s+；
+#   鼠标包节奏 0.06/0.2 也偏保守。这里：
+#     1) 误差标定**只做一次**并缓存，命中/导航打点没出现才重标（对丢包仍是保险）；
+#     2) park / 盲走用同一模型、同样的包数，只把监控器等待从 0.06/0.2 压到 0.04/0.12
+#        （PS/2 设备队列远不会因为 25 包/秒 而溢出）。
+#   断言、等待对象、超时长度都不变。
+# ---------------------------------------------------------------------------
+def fast_park(mon, times=58, wait=0.04):
+    for _ in range(times):
+        mon.send("mouse_move -100 -100", wait=wait)
+    time.sleep(0.3)
+
+
+def fast_move_axis(mon, axis, d, mag):
+    if axis == 0:
+        mon.send("mouse_move %d 0" % (mag if d > 0 else -mag), wait=0.12)
+    else:
+        mon.send("mouse_move 0 %d" % (mag if d > 0 else -mag), wait=0.12)
+
+
+def fast_move_px(mon, axis, d, px):
+    """与 explorer64_test.move_px 同一内核模型（100 包 = 24px + 刹车包清残余），只改等待粒度。"""
+    if px < 1 or d == 0:
+        return
+    n = min(48, px // exp.MOUSE_STEP)
+    rem = px - n * exp.MOUSE_STEP
+    for _ in range(n):
+        fast_move_axis(mon, axis, d, 100)
+    fast_move_axis(mon, axis, -d, exp.MOUSE_BRAKE)
+    if rem >= 2:
+        mag = int(round(rem / 1.7))
+        if mag >= 1:
+            fast_move_axis(mon, axis, d, mag)
+
+
+def fast_goto(mon, tx, ty):
+    fast_park(mon)
+    fast_move_px(mon, 0, +1, tx)
+    fast_move_px(mon, 1, +1, ty)
+    time.sleep(0.2)
+
+
+class Aim:
+    """一次标定、反复复用的鼠标闭环（只提速，不改判据）。"""
+
+    def __init__(self, vm, mon):
+        self.vm, self.mon = vm, mon
+        self.dxe = self.dye = 0
+
+    def calibrate(self):
+        self.dxe, self.dye, _ = exp.calibrate_offset(self.vm, self.mon)
+        return self.dxe, self.dye
+
+    def click_hit(self, tx, ty, want_hit, tries=3):
+        """单击 + 读 `[UI] explorer click … hit=…` 打点验证命中（同 fo.Mouse.click 的判据）。"""
+        for _ in range(tries):
+            since = len(self.vm.log())
+            fast_goto(self.mon, tx + self.dxe, ty + self.dye)
+            exp.single_click_at(self.mon)
+            p = exp.last_probe(self.vm, since)
+            if p is not None and p[2] == want_hit:
+                return p
+            self.calibrate()
+        return None
+
+    def click_once_at(self, tx, ty):
+        fast_goto(self.mon, tx + self.dxe, ty + self.dye)
+        exp.single_click_at(self.mon)
+
+    def click_until(self, tx, ty, needle, tries=3, timeout=20):
+        since = len(self.vm.log())
+        for _ in range(tries):
+            fast_goto(self.mon, tx + self.dxe, ty + self.dye)
+            exp.single_click_at(self.mon)
+            if self.vm.wait_log(needle, timeout, since=since):
+                return True
+            since = len(self.vm.log())
+            self.calibrate()
+        return False
+
+    def dclick_until(self, tx, ty, needle, tries=3, timeout=20):
+        since = len(self.vm.log())
+        for _ in range(tries):
+            fast_goto(self.mon, tx + self.dxe, ty + self.dye)
+            exp.double_click(self.mon)            # 抬-按-抬-按-抬：两次按下 ~0.2s < 500ms 窗口
+            if self.vm.wait_log(needle, timeout, since=since):
+                return True
+            since = len(self.vm.log())
+            try:
+                exp.ensure_window_on_top(self.vm, self.mon)
+            except Exception:
+                pass
+            self.calibrate()
+        return False
+
+
+def back_to_thispc(aim, vm, mon, tries=3):
+    """回"此电脑"：点导航窗格第一项；不行再点面包屑第 0 段（与 multivol64_test 同判据）。"""
+    needle = "[UI] explorer thispc drives="
+    for _ in range(tries):
+        n0 = vm.log().count(needle)
+        aim.click_once_at(exp.sx(20), exp.sy(exp.CONTENT_Y + 30 + 22 // 2))     # 导航窗格第 1 项
+        if vm.wait_log(needle, 6, since=0) and vm.log().count(needle) > n0:
+            return True
+        n0 = vm.log().count(needle)
+        aim.click_once_at(exp.sx(110), exp.sy(exp.TOOLBAR_H + exp.ADDR_H // 2))  # 面包屑第 0 段
+        if vm.wait_log(needle, 8, since=0) and vm.log().count(needle) > n0:
+            return True
+    return False
+
+
+def dclick_card_until(aim, vm, mon, letter, needle, tries=3):
+    """双击 <letter>: 盘卡片 -> 等 enter 打点（重试只针对注入丢包，判据不变）。"""
+    idx = fo.card_idx(vm, letter)
+    if idx is None:
+        return False
+    cx, cy = exp.card_center(idx)
+    return aim.dclick_until(cx, cy, needle, tries=tries)
+
+
+def goto_volume(aim, vm, mon, letter):
+    """进入某个卷：不在"此电脑"页就先回去，再双击 <letter>: 卡片（等 enter 打点）。"""
+    if not at_thispc(vm):
+        if not back_to_thispc(aim, vm, mon):
+            return False
+    return dclick_card_until(aim, vm, mon, letter, "[UI] explorer enter letter=%s:" % letter)
+
+
 
 
 class SkipPhase(Exception):
@@ -459,11 +587,12 @@ def main():
         exp.park_cursor(mon)
         for _ in range(3):
             exp.click_once(vm, mon)
-        mouse = fo.Mouse(vm, mon)
-        mouse.recalibrate()
+        # ★ 缺陷 2：误差标定只做一次并缓存（原来每次 aim/click 都重标 —— 单次 ~10s，一轮十几处）
+        aim = Aim(vm, mon)
+        aim.calibrate()
 
         since = vm.mark()
-        ok_enter = mv.explorer_dclick_card(vm, mon, "D", "[UI] explorer enter letter=D:")
+        ok_enter = dclick_card_until(aim, vm, mon, "D", "[UI] explorer enter letter=D:")
         check("双击 D: 卡片进入 U 盘（[UI] explorer enter letter=D: fatvol=… ok items=%d）"
               % ROOT_ITEMS, ok_enter)
         elog2 = vm.log()[since:]
@@ -539,7 +668,7 @@ def main():
         idx_d = fresh_or_last_item_idx(vm, VAP_NAME, since)
         check("U 盘条目可定位（%s idx=%s）" % (VAP_NAME, idx_d), idx_d >= 0)
         if idx_d >= 0:
-            p = mouse.click(*fo.cell(idx_d), want_hit="item:%d" % idx_d)
+            p = aim.click_hit(*fo.cell(idx_d), want_hit="item:%d" % idx_d)
             check("单击选中 U 盘条目（click hit=item:%d）" % idx_d,
                   p is not None and p[2] == "item:%d" % idx_d, str(p))
             since = vm.mark()
@@ -550,17 +679,17 @@ def main():
             #     拷贝阶段证明（它必须能重新列出并选中同一个文件）。
 
         # C: 里复制 via.txt（为"往只读卷粘贴"准备一个非空剪贴板）
-        ok_back = mv.back_to_thispc(vm, mon)
+        ok_back = back_to_thispc(aim, vm, mon)
         check("回此电脑（导航窗格/面包屑）", ok_back)
         cidx = fo.card_idx(vm, "C")
         check("C: 卡片可定位（card idx=%s）" % cidx, cidx is not None)
         since = vm.mark()
-        ok_c = goto_volume(vm, mon, "C")
+        ok_c = goto_volume(aim, vm, mon, "C")
         check("双击 C: 进入系统盘根目录", ok_c)
         idx_via = fresh_or_last_item_idx(vm, "via.txt", since)
         check("C: 根目录里能看到 via.txt（idx=%s）" % idx_via, idx_via >= 0)
         if idx_via >= 0:
-            p = mouse.click(*fo.cell(idx_via), want_hit="item:%d" % idx_via)
+            p = aim.click_hit(*fo.cell(idx_via), want_hit="item:%d" % idx_via)
             check("单击选中 via.txt（click hit=item:%d）" % idx_via,
                   p is not None and p[2] == "item:%d" % idx_via, str(p))
             since = vm.mark()
@@ -568,7 +697,7 @@ def main():
             check("Ctrl+C 把 via.txt 收进剪贴板（clip op=copy n=1）",
                   vm.wait_new(r"\[UI\] explorer clip op=copy n=1", 20, since))
             since = vm.mark()
-            ok_d = goto_volume(vm, mon, "D")
+            ok_d = goto_volume(aim, vm, mon, "D")
             check("再进 U 盘（D:）", ok_d)
             since = vm.mark()
             mon.key("ctrl-v", wait=1.5)
@@ -581,14 +710,14 @@ def main():
         copied = []
         for name, size in ((ELF_NAME, len(info["elf"])), (VAP_NAME, len(info["vap"]))):
             since = vm.mark()
-            if not goto_volume(vm, mon, "D"):
+            if not goto_volume(aim, vm, mon, "D"):
                 check("拷贝 %s：进 U 盘 D:" % name, False)
                 continue
             idx = fresh_or_last_item_idx(vm, name, since)
             check("U 盘根目录里找到 %s（idx=%s）" % (name, idx), idx >= 0)
             if idx < 0:
                 continue
-            p = mouse.click(*fo.cell(idx), want_hit="item:%d" % idx)
+            p = aim.click_hit(*fo.cell(idx), want_hit="item:%d" % idx)
             check("单击选中 %s（click hit=item:%d）" % (name, idx),
                   p is not None and p[2] == "item:%d" % idx, str(p))
             since = vm.mark()
@@ -597,7 +726,7 @@ def main():
                 check("Ctrl+C 复制 %s" % name, False, "（没看到 clip op=copy）")
                 continue
             since = vm.mark()
-            if not goto_volume(vm, mon, "C"):
+            if not goto_volume(aim, vm, mon, "C"):
                 check("拷贝 %s：回此电脑并进 C:" % name, False)
                 continue
             since = vm.mark()
@@ -620,12 +749,26 @@ def main():
             want = min(size, 4096)
             type_line_ex(mon, "vol c")
             fst.wait_for(serial, "[VOL] switch letter=C:", 20, vm.proc)
+            since = vm.mark()
             type_line_ex(mon, "cat /" + name)
-            clog = fst.wait_for(serial, "[TERM] cmd cat bytes=", 30, vm.proc)
-            m = re.search(r"\[TERM\] cmd cat bytes=%d\b" % want, clog)
-            check("★ 终端 cat /%s 读回 %d 字节（内核视角；cat 上限 4096 B）" % (name, want), m is not None,
-                  (re.search(r"\[TERM\] cmd cat bytes=\d+", clog).group(0)
-                   if "cmd cat bytes=" in clog else "（缺行）"))
+            # ★ 缺陷 1：等**这条命令自己的**新打点。旧写法用 `wait_for(serial, "cmd cat bytes=")`
+            #   等的是"日志里有没有 cat 行"——上一轮的 `cmd cat bytes=4096` 已经在了，于是立刻
+            #   返回、再用 bytes=240 去匹配老日志 -> 240 B 的文件被误报成"输出了 4096 B"
+            #   （详情行打印的是上一轮 ELF 的 4096）。现在：只看 since 之后的新行，且
+            #   path + bytes 双证据必须与真实文件大小一致（判据不变，cat 上限 4096 也一样）。
+            clog = ""
+            for _w in range(150):                       # ≤30s（落盘延迟 1~3s + 命令执行）
+                seg = vm.log()[since:]
+                if "cmd cat path=" in seg or "cmd cat bytes=" in seg:
+                    clog = seg
+                    break
+                time.sleep(0.2)
+            mp = re.search(r"\[TERM\] cmd cat path=(\S+) bytes=(\d+)\b", clog)
+            ml = re.search(r"\[TERM\] cmd cat bytes=(\d+) total=(\d+) truncated=(\d)\b", clog)
+            ok_cat = (mp is not None and mp.group(1) == "/" + name and int(mp.group(2)) == want
+                      and ml is not None and int(ml.group(1)) == want)
+            check("★ 终端 cat /%s 读回 %d 字节（内核视角；cat 上限 4096 B）" % (name, want), ok_cat,
+                  (mp.group(0) if mp else (ml.group(0) if ml else "（缺行）")))
         print("--- 禁止项 ---")
         forbid("阶段 1", vm.log())
         check("U 盘上没有任何字节被写（没有 [USBST] write refused）",

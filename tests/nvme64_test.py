@@ -339,9 +339,16 @@ def main():
     k = fat.find(["KERNEL64.BIN"])
     if k:
         data, size = fat.read_file(k)
-        kreg = kern_ref + b"\0" * (8000 * SECTOR - len(kern_ref))     # 目标盘 LBA 9..8008 的整块
-        check("ESP 里 KERNEL64.BIN = 系统内核整块（补零到 4MB，逐字节）", data == kreg,
-              "盘上 %d 字节" % size)
+        # ★ 自 P6 起内核区**尾部**（LBA 7497..8008）有外置图标包（build64.sh 把它写进 system.img
+        #   的内核区尾部），安装器写的 KERNEL64.BIN 是**内核区整块**（LBA 9..8008 = 4,096,000 B），
+        #   不是"kernel64_os.bin + 补零"。逐字节比对用 build64/system.img 的同一区间当独立来源
+        #   （大小必须等于内核区大小，不做弱判据）。
+        with open(os.path.join(BUILD, "system.img"), "rb") as f:
+            f.seek(PART_BOOT_LBA * SECTOR)
+            kreg = f.read(PART_BOOT_SECS * SECTOR)
+        check("ESP 里 KERNEL64.BIN = 内核区整块（system.img LBA 9..8008 的 %d 字节，逐字节）"
+              % len(kreg),
+              size == len(kreg) and data == kreg, "盘上 %d 字节" % size)
     else:
         check("ESP 里 KERNEL64.BIN 存在", False)
     print("--- tools/fat_check.py 规范体检（把 NVMe 盘上的 ESP 单独导出）---")

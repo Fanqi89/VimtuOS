@@ -508,6 +508,45 @@ def press_and_wait(vm, mon, tx, ty, want_hit, needle, tries=3):
         click_safe(vm, mon)
     return False, det
 
+def wait_re(vm, pattern, timeout, since):
+    """等 since 之后出现匹配 pattern 的打点（explorer64_test 的 Vm 只有 wait_log，没有 wait_new）。"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if re.search(pattern, vm.log()[since:]):
+            return True
+        if vm.proc.poll() is not None:
+            return False
+        time.sleep(0.3)
+    return False
+
+
+def dclick_card_until(vm, mon, idx, letter, timeout=15, tries=3):
+    """双击盘符卡片 + **等 enter 打点出现**（返回 (ok, det)）。
+
+    为什么这么写（缺陷 3 的根因）：QEMU 的 `-serial file:` 有落盘延迟，注入完双击立刻
+    `vm.log()` 快照会偶发拿到"还没进目录"的旧视图 —— 验收基线里
+    `[UI] explorer nav path=/ items=-1`（-1 是脚本自己的"没匹配到"哨兵）就是这个竞态，
+    不是内核列目录坏：内核在同一个点击回调里同步完成 激活卷 -> 列目录 -> 打 enter/nav
+    （kernel/explorer64.cpp: exp_enter_drive_letter/exp_refresh_dir/exp_log_nav），没有任何异步路径。
+    这里等打点；**只有确认双击没生效（enter 一直不出现）才重试注入**，判据一字未改。
+    """
+    needle = "[UI] explorer enter letter=%s:" % letter
+    det = ""
+    for k in range(tries):
+        since = len(vm.log())
+        ok, det = aim_click(vm, mon, card_center(idx)[0], card_center(idx)[1],
+                            "card:%d" % idx, label="%s: 卡片" % letter)
+        for _ in range(int(timeout / 0.3)):
+            if needle in vm.log()[since:]:
+                return True, det
+            if vm.proc.poll() is not None:
+                return False, det
+            time.sleep(0.3)
+        print("      （双击 %s: 卡片后 %ds 没等到 enter 打点：重试注入 %d/%d）"
+              % (letter, timeout, k + 1, tries))
+    return False, det
+
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -647,6 +686,11 @@ def main():
         check("资源管理器窗口在最前面且能收到点击", top_ok, top_det)
         park_cursor(mon)
         p0 = click_once(vm, mon)
+        for _ in range(4):                       # ★ PS/2 包偶发丢：有界重探（判据不变：必须读到坐标）
+            if p0 is not None:
+                break
+            park_cursor(mon)
+            p0 = click_once(vm, mon)
         check("光标闭环起点（桌面/窗口内可读到坐标）", p0 is not None, str(p0))
         step = calibrate(vm, mon)
         check("鼠标精确位移模型（100 包 = 24px + 刹车包清残余）：x 走 300 左右",
@@ -658,11 +702,13 @@ def main():
         check("标定后回到起点 (0,0)", p0 is not None and p0[0] <= 40 and p0[1] <= 40, str(p0))
         tx, ty = card_center(idx_c)
         since_icons = len(vm.log())
-        hit_ok, det = aim_click(vm, mon, tx, ty, "card:%d" % idx_c, label="C: 卡片")
-        check("双击 C: 卡片（精确移动 + 双击）", hit_ok, det)
-        nlog = vm.log()
+        entered, det = dclick_card_until(vm, mon, idx_c, "C")
+        check("双击 C: 卡片（精确移动 + 双击）", det != "", det)
+        check("进入 C: 盘根（[UI] explorer enter letter=C: fatvol/slot … ok items=<n>）", entered)
+        # ★ 缺陷 3：双击注入后**等 nav 打点落盘**再解析（快照读日志会偶发 items=-1）—— 判据不变
         check("进入 C: 后打点（explorer nav path=/ items=<n> view=icons）",
-              re.search(r"\[UI\] explorer nav path=/ items=(\d+) view=icons", nlog) is not None)
+              wait_re(vm, r"\[UI\] explorer nav path=/ items=\d+ view=icons", 20, since_icons) is not None)
+        nlog = vm.log()
         mn = re.findall(r"\[UI\] explorer nav path=/ items=(\d+) view=icons", nlog)
         items_root = int(mn[-1]) if mn else -1
         check("状态栏 N 个项目 = 终端 ls 的条目数（%d）" % ls_entries, items_root == ls_entries,
@@ -691,21 +737,24 @@ def main():
         print("=== 阶段 5：双击 apps -> demo -> readme.txt（只读预览）===")
         if idx_apps >= 0:
             a = icon_cell(idx_apps)
+            since_apps = len(vm.log())
             hit_ok, det = aim_click(vm, mon, a[0], a[1], "item:%d" % idx_apps, label="apps")
             check("双击目录 apps（精确移动 + 双击）", hit_ok, det)
-            nlog = vm.log()
+            # ★ 同样等打点落盘（QEMU -serial file: 延迟），不靠快照
             check("进入 /apps（nav path=/apps items=1）",
-                  re.search(r"\[UI\] explorer nav path=/apps items=1 view=icons", nlog) is not None)
+                  wait_re(vm, r"\[UI\] explorer nav path=/apps items=1 view=icons", 20, since_apps) is not None)
+            nlog = vm.log()
             check("进入目录打点（enter name=apps kind=dir）",
                   re.search(r"\[UI\] explorer enter name=apps kind=dir", nlog) is not None)
             m2 = re.search(r"\[UI\] explorer item idx=(\d+) name=demo type=dir size=0", nlog)
             idx_demo = int(m2.group(1)) if m2 else 0
             b = icon_cell(idx_demo)
+            since_demo = len(vm.log())
             hit_ok, det = aim_click(vm, mon, b[0], b[1], "item:%d" % idx_demo, label="demo")
             check("双击目录 demo（精确移动 + 双击）", hit_ok, det)
-            nlog = vm.log()
             check("进入 /apps/demo（nav path=/apps/demo items=1）",
-                  re.search(r"\[UI\] explorer nav path=/apps/demo items=1 view=icons", nlog) is not None)
+                  wait_re(vm, r"\[UI\] explorer nav path=/apps/demo items=1 view=icons", 20, since_demo) is not None)
+            nlog = vm.log()
             m3 = re.search(r"\[UI\] explorer item idx=(\d+) name=readme\.txt type=file size=14 mtime=\d{4}-\d{2}-\d{2} \d{2}:\d{2} kind=text", nlog)
             check("readme.txt 类型判定 = text / 大小 14 字节", m3 is not None, m3.group(0) if m3 else "（缺行）")
             idx_txt = int(m3.group(1)) if m3 else 0

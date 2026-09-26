@@ -1518,6 +1518,9 @@ static bool cmd_cat(TerminalState* ts, const char* name) {
     }
     // ★ 批次 M：**先 stat 拿真实大小**，最多只读/打 CAT_MAX_OUT 字节 —— 不再"读完整个文件来数 total"
     //   （8 MiB 的文件那样读要几万次扇区读，会把 GUI 看门狗饿到 —— 这是实测踩过的坑）。
+    // ★ 本批（缺陷 1）：读长度还要**按 stat 的真实 size 夹取** —— 读取层可能按块返回（FAT32 / VimtuFS2
+    //   的"整块缓冲"路径），不夹的话 240 B 的文件会被打满 CAT_MAX_OUT（实测 4096 B）。stat 失败
+    //   （total==0 但打开成功）时退回旧行为：最多 CAT_MAX_OUT，绝不无界。
     static char cbuf[512];
     uint32_t total = 0;
     {
@@ -1527,7 +1530,12 @@ static bool cmd_cat(TerminalState* ts, const char* name) {
     int printed = 0;
     while (printed < (int)CAT_MAX_OUT) {
         int want = (int)CAT_MAX_OUT - printed;
+        if (total > 0u) {
+            if ((uint32_t)printed >= total) break;                    // 已按真实大小打完（EOF，不再多读）
+            if (want > (int)(total - (uint32_t)printed)) want = (int)(total - (uint32_t)printed);
+        }
         if (want > (int)sizeof(cbuf) - 1) want = (int)sizeof(cbuf) - 1;
+        if (want <= 0) break;
         const int r = fd64_read64(fd, cbuf, want);
         if (r <= 0) break;
         cbuf[r] = 0;
@@ -1556,6 +1564,17 @@ static bool cmd_cat(TerminalState* ts, const char* name) {
         ts_puts(ts, m);
     }
     dbg64_line_begin64();
+    // ★ 本批（缺陷 1）：新证据行带 path（验收要求：[TERM] cmd cat path=… bytes=…）。
+    dbg64_str("[TERM] cmd cat path=");
+    dbg64_str(g_pathbuf);
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)printed);
+    dbg64_str(" total=");
+    dbg64_dec((uint64_t)total);
+    dbg64_str(" truncated=");
+    dbg64_dec(truncated ? 1u : 0u);
+    dbg64_nl();
+    // 兼容行：既有 6 个脚本按 "cmd cat bytes=<n> total=<n>" 的紧邻格式解析，原样保留。
     dbg64_str("[TERM] cmd cat bytes=");
     dbg64_dec((uint64_t)printed);
     dbg64_str(" total=");

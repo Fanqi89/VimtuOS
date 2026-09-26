@@ -239,13 +239,13 @@ def main():
     # 字段偏移见 kernel/vfs64.cpp 的 VFS_O_*：8=版本、12=扇区大小、16=块大小、20=总块数、
     # 24=根 inode、28/32=位图起点/块数、36/40/44=inode 起点/个数/大小、48/52=数据区起点/块数、
     # 60=CRC32([0,60))、510=0x55AA。下面期望的几何数字按 vfs64_format 的规则算：
-    # ★ v3（目录树版）：inode 128B/个（每块 4 个）——
-    #   24759 块 -> 位图 ceil(24759/4096)=7 块；inode min(24759/64,512)=386 个=ceil(386/4)=97 块；
-    #   数据区 = 24759 - (1+7+97) = 24654 块。
+    # ★ P4 起新格式化的卷一律 v4（VFS64_VERSION=4u；v3 旧卷仍可挂载）——
+    #   inode 仍是 128B/个（每块 4 个）：24759 块 -> 位图 ceil(24759/4096)=7 块；
+    #   inode min(24759/64,512)=386 个=ceil(386/4)=97 块；数据区 = 24759 - (1+7+97) = 24654 块。
     check("P2 首扇区 = VimtuFS2 真超级块 magic VIMTUFS2", p2[:8] == b"VIMTUFS2", "%r" % p2[:8])
     gf = struct.unpack_from("<13I", p2, 8)
-    check("VimtuFS2 超级块版本 = 3（v3 目录树）且扇区/块 = 512B、inode = 128B",
-          gf[0] == 3 and gf[1] == 512 and gf[2] == 512 and gf[9] == 128,
+    check("VimtuFS2 超级块版本 = 4（P4 起新卷 v4）且扇区/块 = 512B、inode = 128B",
+          gf[0] == 4 and gf[1] == 512 and gf[2] == 512 and gf[9] == 128,
           "version=%d sector=%d block=%d inode=%d" % (gf[0], gf[1], gf[2], gf[9]))
     check("VimtuFS2 超级块记录总块数 = 24759",
           gf[3] == TARGET_SECTORS - PART_MAIN_LBA, "total=%d" % gf[3])

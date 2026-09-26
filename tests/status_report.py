@@ -1782,7 +1782,9 @@ TESTS = [
     ("fs_term_test.py", "终端真文件系统：write/ls/df/ring3 读 + 冷启动第二遍 cat 跨重启读回 + rm"),
     ("fonts64_test.py", "四个字体面：[FONT64] faces/selftest/中英 1:2/兜底命中 + 终端等宽像素（ASCII 8px 半格）"),
     ("fd64_test.py", "批次 D FD 语义：每进程 fd 表 + dup 共享游标 + fork 继承 + O_APPEND + pipe 环回"),
-    ("uefi_cr3_experiment_test.py", "批次 D UEFI 运行期 CR3 实验：方案 A/B 两方案 + QEMU/OVMF 与 VMware EFI 实测"),
+    ("uefi_cr3_experiment_test.py", "批次 D UEFI 运行期 CR3 实验：方案 A/B 两方案 + QEMU/OVMF 与 VMware EFI 实测"
+                                     "（需先 `bash build64.sh --cr3exp` 产出 build64/kernel64_os_cr3exp.bin，"
+                                     "否则打印 SKIP 并 checks=0 —— 那不是真跑过）"),
     ("fs_tree_test.py", "★ VimtuFS2 v3 目录树 + 盘符层：安装->格式化(v3)->多级 mkdir->子目录写文件->冷启动 stat/mtime/遍历/删除；"
                         "C:/D: 盘符表 + ESP skip + drive64 容量与 df 一致"),
     ("bigfile64_test.py", "★ 批次 M VimtuFS2 大文件（二级间接块）：bigtest 1mb/8mb/limit/recycle + cat 截断提示 + "

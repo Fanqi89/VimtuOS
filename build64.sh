@@ -327,6 +327,49 @@ if [ "$LDSZ" -gt 4096 ]; then echo "ERROR: loader64.bin > 4096" >&2; exit 1; fi
 if [ "$KBSZ" -gt $((KERNEL_SECTORS * 512)) ]; then echo "ERROR: 安装程序内核超出内核区" >&2; exit 1; fi
 if [ "$OSSZ" -gt $((KERNEL_SECTORS * 512)) ]; then echo "ERROR: 系统内核超出内核区" >&2; exit 1; fi
 
+# ==================== ★ 可选目标：UEFI 运行期 CR3 实验内核 ====================
+# 只在显式要求时编（默认构建的两个内核 / 安装介质 / ISO 字节都不受影响）：
+#     bash build64.sh --cr3exp          或      VIMTU_BUILD_CR3EXP=1 bash build64.sh
+# 产出 build64/kernel64_os_cr3exp.bin（tests/uefi_cr3_experiment_test.py 默认找这个名字），
+# 否则该脚本没有实验内核会 SKIP 成 checks=0 的空 PASS（不是真跑过）。
+# 做法：只把**引用该宏的 3 个文件**（kernel64.cpp / proc64.cpp / usermode64.cpp ——
+# 见 kernel/*.cpp 里的 `#if defined(PROC64_UEFI_CR3_EXPERIMENT)`）用额外宏重编到
+# build64/cr3exp/，其余目标文件复用本次构建的 build64/os/*.o 重新链接。
+if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
+    echo "==> 可选目标：UEFI 运行期 CR3 实验内核（-DPROC64_UEFI_CR3_EXPERIMENT=1）"
+    mkdir -p "$BUILD/cr3exp"
+    CXXFLAGS_CR3EXP="$CXXFLAGS -DPROC64_UEFI_CR3_EXPERIMENT=1"
+    for src in kernel/kernel64.cpp kernel/proc64.cpp kernel/usermode64.cpp; do
+        base="$(basename "${src%.cpp}")"
+        $CXX -c "$src" -o "$BUILD/cr3exp/$base.o" $CXXFLAGS_CR3EXP
+        echo "      $src -> $BUILD/cr3exp/$base.o"
+    done
+    $LD -m elf_x86_64 -o "$BUILD/kernel64_os_cr3exp.elf" kernel/linker64.ld \
+        "$BUILD/cr3exp/kernel64.o" "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
+        gui_rs/gui_rs.o \
+        "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/mem64.o \
+        "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o \
+        "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
+        "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
+        "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o "$BUILD/os"/explorer64.o \
+        "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
+        "$BUILD/os"/theme64.o "$BUILD/os"/gfx64.o "$BUILD/os"/img64.o \
+        "$BUILD/os"/locklogin64.o "$BUILD/os"/userdb64.o \
+        "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o \
+        "$BUILD/os"/icons64.o \
+        "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
+        "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
+        "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/cr3exp/proc64.o" \
+        "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o \
+        "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
+        "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
+        "$BUILD/os"/hello_vap64.o \
+        "$BUILD/os"/user_demo64.o "$BUILD/os"/user_fbdemo64.o "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
+        "$BUILD/os"/kaisi_png.o
+    $OBJCOPY -O binary "$BUILD/kernel64_os_cr3exp.elf" "$BUILD/kernel64_os_cr3exp.bin"
+    echo "实验内核 OK. $BUILD/kernel64_os_cr3exp.bin = $(stat -c%s "$BUILD/kernel64_os_cr3exp.bin") bytes"
+fi
+
 echo "==> 组装系统镜像载荷 system.img（$SYS_SECTORS 扇区）"
 dd if=/dev/zero of="$BUILD/system.img" bs=512 count="$SYS_SECTORS" status=none
 dd if="$BUILD/boot.bin"        of="$BUILD/system.img" conv=notrunc status=none

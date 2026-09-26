@@ -569,28 +569,62 @@ def main():
         check("[START64] power btn 打点（圆形按钮 + 左边设置按钮）", pwr is not None, pwr.group(0) if pwr else "（无）")
         if pwr:
             pxx, pyy = int(pwr.group(1)), int(pwr.group(2))
-            pm = None
+
+            def pm_last_state(since=0):
+                """since 之后最后一条 [START64] power menu open|close（None = 这次点击的打点还没落盘）。"""
+                st = None
+                for mm in re.finditer(r"\[START64\] power menu (open|close)\b", vm.log()[since:]):
+                    st = mm.group(1)
+                return st
+
+            # ★ 缺陷 4 根因（判据与真实语义不符的那一半在**测试**侧）：电源按钮是**切换**语义
+            #   （kernel/startmenu64.cpp 的 case 7：g_pm_open = !g_pm_open），而旧写法点完立刻在
+            #   日志里找 "power menu open"：QEMU `-serial file:` 有落盘延迟 -> 这一次找不到 ->
+            #   循环再点一次 -> 第二次把刚开的菜单又**关掉**（实际状态=close），随后 ESC 走的就是
+            #   "关整个开始菜单"，不是"只关电源菜单"（基线里 63/62 的稳定失败）。
+            #   修法：每次点击后**等这次点击的 open|close 打点**，只有状态确认是 open 才停手；
+            #   点击丢失（没有打点）才重试。判据（ESC 两级语义）一字未改。
+            opened = False
             for _ in range(3):
+                since_pm = len(vm.log())
                 cur.goto(mon, pxx + int(pwr.group(3)) // 2, pyy + int(pwr.group(3)) // 2)
                 time.sleep(0.3)
                 mon.click()
+                st = None
+                for _w in range(30):
+                    st = pm_last_state(since_pm)
+                    if st is not None:
+                        break
+                    time.sleep(0.3)
+                if st == "open":
+                    opened = True
+                    break
+                print("      （电源按钮这次点击后状态=%s：%s）"
+                      % (st, "点击丢失，重试" if st is None else "菜单被关掉，重点一次"))
+            pm = None
+            if opened:
                 pm = re.search(r"\[START64\] power menu open x=(\d+) y=(\d+) w=(\d+) h=(\d+) rows=3 row0=shutdown row1=reboot row2=lock",
                                vm.log()[before:])
-                if pm:
-                    break
             check("电源二级菜单在当前界面内弹出（竖长方形小圆角框 rows=3）", pm is not None,
-                  pm.group(0) if pm else "（无）")
+                  pm.group(0) if pm else ("（无；最后状态=%s）" % pm_last_state(before)))
             if pm:
                 pmx, pmy, pmw, pmh = (int(pm.group(i)) for i in range(1, 5))
                 check("电源菜单在菜单内部、宽高合理（竖长方形）",
                       pmx > gx and pmx + pmw <= gx + gw and pmy > gy and pmy + pmh <= gy + gh and pmh > pmw,
                       "x=%d y=%d w=%d h=%d" % (pmx, pmy, pmw, pmh))
-            n_esc2 = vm.log().count("[START64] esc level=2")
+            # ESC 第一级：等 esc level=2 打点落盘再判（同样不靠固定 sleep 猜）
+            since_esc = len(vm.log())
             mon.key("esc", wait=0.9)
+            got_lvl2 = False
+            for _w in range(20):
+                if "[START64] esc level=2" in vm.log()[since_esc:]:
+                    got_lvl2 = True
+                    break
+                time.sleep(0.3)
             check("ESC 第一级：只关电源菜单（esc level=2 close=power-menu），开始菜单还在",
-                  vm.log().count("[START64] esc level=2") > n_esc2 and
+                  got_lvl2 and
                   vm.log()[before:].count("[START64] close why=esc") == 0,
-                  (re.search(r"\[START64\] esc level=2[^\r\n]*", vm.log()[before:]) or [""])[0])
+                  (re.search(r"\[START64\] esc level=2[^\r\n]*", vm.log()[since_esc:]) or [""])[0])
             mon.key("esc", wait=0.9)
             check("ESC 第二级：关开始菜单（close why=esc）",
                   "close why=esc" in vm.log()[before:],
