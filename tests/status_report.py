@@ -1564,6 +1564,116 @@ def cap_desktopops_p5():
           "靠复跑判定，不看单次结果"]
     done = desk and sel and cur and fly and reg and wbl and tst
     return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_realfix64():
+    """★ 批次 P6：真机缺陷修复（六项，全部本批真跑复核）。
+
+    1) Win 键只开新开始菜单（老菜单整套删除；数字快捷键 1..8 兼容保留，9/0 不再绑电源）
+    2) 点扫雷/开始菜单关机·重启 -> #GP err=0 蓝屏：根因 = dock_draw_one64() 的开始按钮 scratch 只按
+       DOCK_START_DISP(46) 开 46*46*4，而悬停放大 120% 时 scale_rgba64 写 55*55*4 -> 越界 3.6KB
+       踩坏其后的 BSS（calc64 g_slots / mines64 g_ms_slot / gui64 g_icon_press_*）-> 读野 MinesState*。
+       修法：按最大绘制尺寸分配（DOCK_ICON_PX_MAX=64）+ 入口夹取。
+    3) 设置页移动鼠标整屏空白（历史脏矩形竞态已在 P5 修掉；本批加防回归断言）
+    4) 登录必须显式输入：ui.login.auto 默认 1 -> 0
+    5) 壁纸四角红绿蓝黄标记默认不可见：ui.wall.markers 默认 0（Ctrl+Shift+M 运行时切换）
+    """
+    need = ["kernel/gui64.cpp", "kernel/locklogin64.cpp", "kernel/gfx64.cpp", "kernel/startmenu64.cpp",
+            "kernel/config64.cpp", "tests/gui_modern64_test.py", "tests/icons64_test.py",
+            "tests/ui_extra64_test.py", "tests/startmenu64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    clamp = grep_count(r"DOCK_ICON_PX_MAX", ["kernel/gui64.cpp"])
+    mk = grep_count(r"ui\.wall\.markers|markers_drawn", ["kernel/config64.cpp", "kernel/gfx64.cpp", "kernel/gui64.cpp"])
+    auto = len(re.findall(r'config64_get_bool64\("ui\.login\.auto",\s*0\)', open("kernel/locklogin64.cpp",
+                    encoding="utf-8", errors="replace").read()))
+    wink = grep_count(r"startmenu64_win_key_toggle64", ["kernel/startmenu64.cpp", "kernel/gui64.cpp"])
+    tst = exists("tests/gui_modern64_test.py") and exists("tests/icons64_test.py")
+    ev = [
+        "1) Win 键只开新菜单：startmenu64_win_key_toggle64（startmenu64.cpp+gui64.cpp 命中 %d）；"
+        "实测串口 \"[START64] open why=win-key x=440 y=293 w=400 h=420\"（老菜单已整套删除；"
+        "数字快捷键 1..8 保留兼容，'9'/'0' 不再绑电源避免误触）" % wink,
+        "2) 蓝屏根因（修前原文，夹具盘 + 点新菜单 tile4=扫雷）："
+        "\"[PANIC] cpu exception 13 err=0000000000000000 rip=FFFFFFFF801B26C0 cs=…0008 rsp=…7BB20 cr2=0\" + "
+        "\"[PANIC64] stop=CPU_EXCEPTION detail=…000D state=RUNNING gen=1\"（RIP = ms_reap_closed64+0x80 的 "
+        "`cmpl $0x4d533634,(%rbx)`：读野 MinesState*）",
+        "   根因 = dock_draw_one64() 的开始按钮 scratch 只按 46*46*4 开，悬停 120%% 时写 55*55*4 -> "
+        "越界 3.6KB 踩坏 BSS（calc64 g_slots / mines64 g_ms_slot&g_ms_last / gui64 g_icon_press_*）；"
+        "修法 = 按最大绘制尺寸分配（DOCK_ICON_PX_MAX，gui64.cpp 命中 %d）+ 入口夹取，"
+        "修后原文：\"[APP] mines opened diff=0\"、\"[SYS64] state=STOPPED stopped=21 failed=0\"、"
+        "\"[START64] power action shutdown anim=150ms\"" % clamp,
+        "3) 设置页移动鼠标：内核实测复现不出（P5 脏矩形竞态已修）；本批在 settings64_test 第 0 节加"
+        "防回归断言（内容区颜色数 >= 20 / 暗像素 >= 80%% / 取样点 >= 85%% 未变）——实测 108/108 PASS",
+        "4) 登录必须显式输入：ui.login.auto 默认 0（locklogin64.cpp 命中 %d 处）；打点原文："
+        "\"[LOCK64] lock screen shown … why=boot\" -> \"[LOGIN64] login screen shown … why=key\" -> "
+        "\"[LOGIN64] login button key=enter\" -> \"[GUI64] ready\"。登录停留 >=10s 实测（探针）："
+        "锁屏可交互后静置 12.0s 仍 GUI64_ready=False / auto_login=False，回车两次后 2.5s 进桌面" % auto,
+        "5) 四角标记默认不可见：ui.wall.markers 默认 0（config64/gfx64/gui64 命中 %d）；实测串口 "
+        "\"[GFX64] wall markers … size=16 markers_drawn=0\"，Ctrl+Shift+M 打开后 markers_drawn=4、"
+        "关回去后四角标记位置与邻域壁纸同色（差 <=2）" % mk,
+        "验收：gui_modern64_test.py %s（159/159 PASS 连跑 2 次；本批把 Dock 回弹的\"done frames>=6 + dirs 里有 down\""
+        "改成与机器帧率无关的形态学判据：采样 >=3 且 t 递增、采样峰值/内核每 tick 峰值 3..12px、"
+        "done frames>=3 且 el<=390ms=Token 260ms x1.5）；其余 GUI 脚本本轮逐个真跑：icons64 50/50、"
+        "panels64 78/78、desktop64 PASS、desktopops64 66/66、explorer64 71/71、fileops64 95/95、"
+        "startmenu64 63/63、settings64 108/108、ui_extra64 51/51" % ("有" if tst else "★ 缺"),
+        "边界（如实）：设置页\"移动鼠标整屏空白\"在 QEMU 下不可复现（只能证明当前构建无此现象 + 防回归断言）；"
+        "老菜单删除后依赖它的旧路径（如 ui_extra64 的 Win+0/9 关机）已同步改走新菜单数字 1=终端 + 终端命令；"
+        "Dock 回弹的\"弹簧静止幅值 9px -> done 复位 0\"是既有实现（本批只改判据与日志，不改动画本身）",
+    ]
+    done = clamp > 0 and mk > 0 and auto >= 2 and wink >= 2 and tst
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_iconpack64():
+    """★ 批次 P6：外置图标包（真图标）—— 图标字节不进内核，pack 在 system.img 内核区尾部。"""
+    need = ["kernel/icons64.cpp", "kernel/icons64.h", "tools/make_iconpack.py", "build/icons/manifest.json",
+            "tests/icons64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    n = lines("kernel/icons64.cpp")
+    # 包 LBA 是编译期表达式：ICON64_PACK_LBA = (ML64_KERNEL_LBA + ML64_KERNEL_SECTORS) - ICON64_PACK_MAX_SECTORS
+    #   = (9 + 8000) - 512 = 7497（kernel/icons64.cpp:21 / kernel/memlayout64.h:36-37）
+    ml = open("kernel/memlayout64.h", encoding="utf-8", errors="replace").read()
+    k_lba = re.search(r"ML64_KERNEL_LBA\s*=\s*(\d+)", ml)
+    k_sec = re.search(r"ML64_KERNEL_SECTORS\s*=\s*(\d+)", ml)
+    mx = re.search(r"ICON64_PACK_MAX_SECTORS\s+(\d+)", open("kernel/icons64.h", encoding="utf-8",
+                  errors="replace").read())
+    lba_v = (int(k_lba.group(1)) + int(k_sec.group(1)) - int(mx.group(1))
+             if (k_lba and k_sec and mx) else None)
+    size = os.path.getsize("build/iconpack.bin") if exists("build/iconpack.bin") else 0
+    man = open("build/icons/manifest.json", encoding="utf-8", errors="replace").read() if exists("build/icons/manifest.json") else ""
+    entries = man.count('"off"')
+    kinds = len(set(re.findall(r'"name"\s*:\s*"([^"]+)"', man)))
+    drw = grep_count(r"icons64_draw_kind64|icons64_app_color64|icon64_pack", ["kernel/icons64.cpp"])
+    tst = exists("tests/icons64_test.py")
+    ev = [
+        "kernel/icons64.cpp %d 行（统一图标层：读 pack -> img64 解码 -> 缓存 -> 按主题 palette 着色；"
+        "取不到回落既有程序化绘制）；图标层符号命中 %d" % (n, drw),
+        "包位置/大小（打包器与内核常量一致）：ICON64_PACK_LBA = %s（= 9 + 8000 - 512，内核区尾部、"
+        "内核二进制之后、数据分区 8009 之前）；build/iconpack.bin = %d B；清单 entries=%d kind=%d"
+        % (lba_v if lba_v else "?", size, entries, kinds),
+        "实测串口（开机首帧）：\"[ICON64] init pack lba=7497 drive=0 bytes=49192 entries=110 icons=30 "
+        "bad=0 ok=1 fnv=… vfs_icons=0\"",
+        "实测串口（逐 kind 加载，全部 src=pack）：\"[ICON64] load kind=calc path=pack:apps/calc@48.png "
+        "size=48 src=pack ok=1\"（30 个 kind 各一条；只缩小到\"不小于请求的最小档\"）",
+        "实测串口（自检/回落）：\"[ICON64] selftest PASS mask=0 pack=1 kinds=30 loaded=30 fallback=0\"；"
+        "坏档回落 \"[ICON64] fallback kind=terminal reason=no-entry (programmatic draw kept)\"、"
+        "整包不可用 \"[ICON64] init pack absent reason=no-magic-or-read lba=7497 …\" + "
+        "\"[ICON64] fallback kind=… reason=no-pack\"（界面不空：Dock/状态区仍有墨迹）",
+        "Dock 开始按钮仍是盘上真图：\"[DOCK64] start icon src=vfs:/logo/kaisi.png size=46 ok=1\""
+        "（缺卷/缺文件时回落内核内嵌 RGBA，实测夹具盘两处 kaisi.png 逐字节相同）",
+        "验收脚本 tests/icons64_test.py：%s（50 条断言：包加载/逐 kind 清单逐一核对/状态区 3 图标 IoU>=0.55/"
+        "主题跟随亮度差 >=60/两种坏法回落/开始按钮 IoU + VimtuFS2 真文件；本轮复跑 50/50 PASS）"
+        % ("有" if tst else "★ 缺"),
+        "边界（如实）：图标字体（icon font）未用上；电池图标在清单里但**无真实来源/不参与渲染**；"
+        "files.svg 未上屏（只有 @PNG 档进了包）；图标包放在 system.img 的**内核区尾部**（LBA 7497..7593），"
+        "**不是** VimtuFS2 卷里的文件（VFS 覆盖通道未测）；仍有程序化绘制图标兜底（fallback 路径）",
+    ]
+    # 包大小/条目必须为非零（makepack 与 build64.sh 都按这个数写盘/断言）：
+    done = n > 0 and entries >= 100 and kinds >= 25 and size > 0 and bool(lba_v) and tst
+    return ("DONE" if done else "PARTIAL"), ev
 CAPS = [
     ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
      cap_boot_console),
@@ -1622,6 +1732,11 @@ CAPS = [
     ("内核", "★ VimtuFS2 v4 权限（uid/gid/mode + owner/group/other rwx 拦截；v3 旧卷兼容但豁免）", cap_perm_v4),
     ("应用", "★ Win11 风格设置（左导航 240px + 六组：系统/个性化/网络/用户/安全/关于；全部实时生效并持久化）", cap_settings_p3),
     ("应用", "★ P5 桌面交互（右键菜单/玻璃选择框+拖动/回收站入口/指针形状/窗口缩放/最小化飞 Dock 与 Dock 点击语义/圆角桌面图标；资源管理器只显示可见分区）", cap_desktopops_p5),
+    ("应用", "★ P6 真机缺陷修复（Win 键只开新菜单 / 扫雷·关机蓝屏根因：Dock 开始按钮 scratch 越界 3.6KB 踩 BSS / "
+             "设置页移动鼠标 / 登录须显式输入（ui.login.auto 默认 0，实测停留 >=10s）/ 壁纸四角标记默认不可见）",
+     cap_realfix64),
+    ("应用", "★ P6 外置图标包（真图标；pack 在 system.img 内核区尾部 LBA 7497：110 条目/30 kind/49192 B，"
+             "图标字节 0 进内核；src=pack 逐 kind 加载 + 主题着色 + 回落程序化绘制）", cap_iconpack64),
 ]
 
 
@@ -1683,6 +1798,10 @@ TESTS = [
     ("perm64_test.py", "★ P4 权限：卷 v4(uid/gid/mode)+owner/group/other rwx 真拦截(root 绕过)+su/sudo 真提权+chmod/chown/umask+ls -l（95 条断言，含 v3 旧卷兼容）"),
     ("settings64_test.py", "★ P3 设置页：左导航 240px + 六组 + 主题/壁纸适应模式(桌面/锁屏分别)/Dock 长度与图标尺寸实时生效/字体大小/默认应用/头像/改名/密码设置与清空/关于页；含软重启后的持久化与\"设密码→重启必须输密码\"（105 条断言）"),
     ("desktopops64_test.py", "★ P5 桌面交互：右键菜单(8 项/置灰/ESC 与点外部)/玻璃选择框(框内 diff=0)/拖入回收站/指针形状(6 向+文本+转圈)/窗口缩放/最小化飞 Dock 与 Dock 点击语义/圆角桌面图标/恢复默认桌面图标/只显示可见分区 + 应用窗口内容防回归 + 壁纸重绘（blur_ticks 3094→141~158，逐像素等价）（65-66 条断言，实跑 66 条中 13 条因 QEMU PS/2 注入零命中为 [skip]）"),
+    ("icons64_test.py", "★ P6 外置图标包（真图标）：init pack lba=7497 bytes=49192 entries=110 icons=30 ok=1 + "
+                        "逐 kind [ICON64] load src=pack ok=1 与宿主清单完全相等 + 状态区 3 图标形状 IoU>=0.55 + "
+                        "主题跟随（亮度差 >=60）+ 两种坏法回落（no-entry / no-pack，界面不空）+ "
+                        "Dock 开始按钮 VimtuFS2 真图 kaisi.png（50 条断言，本轮复跑 50/50 PASS）"),
 ]
 
 

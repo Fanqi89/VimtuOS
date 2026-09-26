@@ -224,6 +224,10 @@ def main():
     vm = smt.Vm(qemu, img1, args.port, "vimtu-icons64", tmp)
     try:
         mon = vm.wait_monitor()
+        # ★ 缺陷 4（登录必须显式输入）：默认不再自动登录 —— 先等锁屏可交互，再回车两次进桌面。
+        vm.wait_log("[LOCK64] bg blur ready", 150)
+        mon.key("ret", wait=1.0)          # 锁屏 -> 登录界面
+        mon.key("ret", wait=1.5)          # 登录按钮（无密码用户）
         up = vm.wait_log("[GUI64] ready", 180)
         check("桌面就绪（[GUI64] ready）", up)
         if not up:
@@ -411,6 +415,10 @@ def main():
     vm2 = smt.Vm(qemu, img2, args.port + 221, "vimtu-icons64-crc", tmp)
     try:
         mon2 = vm2.wait_monitor()
+        # ★ 缺陷 4（登录必须显式输入）：锁屏可交互 -> 回车两次进桌面（同 startmenu64_test）。
+        vm2.wait_log("[LOCK64] bg blur ready", 150)
+        mon2.key("ret", wait=1.0)
+        mon2.key("ret", wait=1.5)
         up2 = vm2.wait_log("[GUI64] ready", 180)
         check("坏包盘仍能进桌面（[GUI64] ready）", up2)
         l2 = vm2.log()
@@ -470,6 +478,10 @@ def main():
     vm3 = smt.Vm(qemu, img3, args.port + 22, "vimtu-icons64-nopack", tmp)
     try:
         mon3 = vm3.wait_monitor()
+        # ★ 缺陷 4（登录必须显式输入）：锁屏可交互 -> 回车两次进桌面（同 startmenu64_test）。
+        vm3.wait_log("[LOCK64] bg blur ready", 150)
+        mon3.key("ret", wait=1.0)
+        mon3.key("ret", wait=1.5)
         up3 = vm3.wait_log("[GUI64] ready", 180)
         check("无包盘仍能进桌面（[GUI64] ready）", up3)
         l3 = vm3.log()

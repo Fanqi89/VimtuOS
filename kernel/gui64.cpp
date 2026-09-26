@@ -886,6 +886,9 @@ static uint32_t g_dock_bounce_t0 = 0;
 static int      g_dock_bounce_dur = 0;
 static int      g_dock_bounce_frame = 0;
 static int      g_dock_bounce_dy = 0;
+// ★ 本批：整段动画里 |dy| 的**峰值**（每个 tick 跟踪；与测试采样帧率无关 —— 验收判据用它，
+//   避免"帧数/采样点绑机器性能"）。按下时清零，done 行里打出来。
+static int      g_dock_bounce_peak = 0;
 // Dock 开始按钮图标（46x46 RGBA）：优先 VimtuFS2 的 /logo/kaisi.png、/kaisi.png，
 // 兜底内核内嵌的 icon_start.bin（= 构建期 _make_start_icon.py 从 logo/kaisi.png 生成的 RGBA）。
 static uint8_t g_dock_start_rgba[DOCK_START_DISP * DOCK_START_DISP * 4];
@@ -1121,7 +1124,13 @@ static int dock_anim_tick64() {
                 dbg64_dec((uint64_t)g_dock_bounce_idx);
                 dbg64_str(" done frames=");
                 dbg64_dec((uint64_t)g_dock_bounce_frame);
-                dbg64_str(" motion=spring(260ms)");
+                // ★ 本批：把"从按下到收敛"的实测时长 el 也打出来（毫秒）——验收改成与机器帧率无关的
+                //   形态学判据后，用 el <= Token(260ms) x 1.5 = 390ms 证明"在 Token 时长内回到 0"，
+                //   而不是靠"采样到 >=6 帧"这种绑机器性能的阈值（TCG 下每帧 ~65ms，永远到不了 6 帧）。
+                dbg64_str(" motion=spring(260ms) el=");
+                dbg64_dec((uint64_t)el);
+                dbg64_str(" peak=");
+                dbg64_dec((uint64_t)(unsigned)g_dock_bounce_peak);   // 整段动画的位移峰值（不依赖采样）
                 dbg64_nl();
                 dbg64_line_end64();
                 g_dock_bounce_idx = -1;
@@ -1129,6 +1138,7 @@ static int dock_anim_tick64() {
             } else {
                 const int t = (int)(el * 256 / dur);
                 g_dock_bounce_dy = -(int)((int64_t)9 * theme64_spring64(t) / 256);  // 向上最多 9px + 回弹
+                if (-g_dock_bounce_dy > g_dock_bounce_peak) g_dock_bounce_peak = -g_dock_bounce_dy;  // 峰值（不依赖采样）
                 if (g_dock_bounce_frame < 24) {   // 每次回弹最多打 24 帧（防刷屏；帧计数不受影响）
                 dbg64_line_begin64();
                 dbg64_str("[DOCK64] bounce idx=");
@@ -1209,6 +1219,7 @@ static void dock_press64(int idx) {
     g_dock_bounce_t0 = ticks64();
     g_dock_bounce_dur = (int)theme64_dur64(THEME64_MS_DOCK);
     g_dock_bounce_frame = 0;
+    g_dock_bounce_peak = 0;                     // 峰值跟踪清零（每次点击独立）
     g_dock_bounce_dy = 0;
     g_dock_bounce_total++;
     if (idx == 0) {

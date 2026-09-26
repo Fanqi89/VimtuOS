@@ -5,6 +5,8 @@
 覆盖（每一项都要串口打点 + 像素/输入证据）：
   1) 开机 logo 淡入      [UI] boot logo show frames=N fade=ok
   2) 关机/重启画面        [UI] shutdown anim start / [UI] reboot anim start + 动画帧数 + 画面像素
+                        （★ 缺陷 1 之后 Win 键只开新开始菜单、'8'/'9' 不再绑电源：改走"新菜单数字 1 = 终端"
+                         + 终端命令 reboot/poweroff，触发同一个 sys_reboot64/sys_shutdown64。）
   3) 开始按钮图标        [DOCK64] start icon src=.. size=46 ok=1 + Dock 最左开始图标处有彩色像素
   4) 桌面图标拖动        QEMU monitor 注入左键拖动 >5px -> [UI] icon drag idx=..
                         再对（移动后的）图标双击 -> [UI] desktop icon open kind=..（双击没被弄坏）
@@ -336,6 +338,10 @@ def main():
     vm = Vm(qemu, args.img, args.port, "vimtu-ui-main", tmp)
     try:
         mon = vm.wait_monitor()
+        # ★ 缺陷 4（登录必须显式输入）：默认不再自动登录 —— 先等锁屏可交互，再回车两次进桌面。
+        vm.wait_log("[LOCK64] bg blur ready", 150)
+        mon.key("ret", wait=1.0)          # 锁屏 -> 登录界面
+        mon.key("ret", wait=1.5)          # 登录按钮（无密码用户）
         print("=== 1) 引导 + 本轮新增打点 ===")
         check("桌面就绪 [GUI64] ready", vm.wait_ready(60))
         log0 = vm.log()
@@ -454,21 +460,18 @@ def main():
         mon.shot(shot_win)
         if os.path.exists(shot_win):
             w, h, px = read_ppm(shot_win)
-            # 本批标题栏是浅色玻璃：改用"关闭按钮红底（196,43,28）"定位标题行与三按钮区
-            rows = []
-            for y in range(0, h // 2):
-                c = 0
-                for x in range(0, w, 2):
-                    cc = sample(px, w, x, y)
-                    if cc[0] > 150 and cc[0] - cc[1] > 50 and cc[0] - cc[2] > 50:
-                        c += 1
-                if c >= 8:
-                    rows.append(y)
-            if rows:
-                ty2 = rows[len(rows) // 2]
-                xs = [x for x in range(0, w, 1) if near(sample(px, w, x, ty2), C_BTN_BG, 12)]
-                bx = max(xs) + 1 - BTN_W * 3 + 3 - 3    # 三按钮区左边界（= 窗口右缘 - 90）
-                y0, y1 = ty2 - 4, ty2 + 8           # 落在按钮矩形（高 16，居中）内部
+            # ★ 标题栏三按钮的位置改用**内核几何打点**（[UI] win geom tag=new title=计算器）反推。
+            #   原来的"扫红色像素 -> 找最右浅灰 -> 反推按钮区"在本用例里是坏的：第 3 节双击桌面图标
+            #   开了第二个窗口（资源管理器），屏幕上有**两个**红色关闭按钮，扫出来的行会落在错窗口上
+            #   （实测：按钮区定位偏 → 8 条像素断言全红）。公式与 kernel/gui64.cpp 的
+            #   draw_title_buttons 完全一致：bx = x + w - BORDER(1) - BTN_W(30)*3；by = y + BORDER + 4；
+            #   第 b 个按钮 = (bx + b*BTN_W + 3, by, BTN_W-6, 16)。断言与阈值一条没改。
+            gm = re.search(r"\[UI\] win geom tag=new title=计算器 app=1 x=(\d+) y=(\d+) w=(\d+) h=(\d+)",
+                           vm.log())
+            if gm:
+                bx = int(gm.group(1)) + int(gm.group(3)) - 1 - BTN_W * 3
+                by2 = int(gm.group(2)) + 1 + 4
+                y0, y1 = by2 + 2, by2 + 14          # 落在按钮矩形（高 16）内部
                 r_min = (bx + 3, bx + 3 + BTN_W - 6)
                 r_max = (bx + BTN_W + 3, bx + BTN_W + 3 + BTN_W - 6)
                 r_cls = (bx + 2 * BTN_W + 3, bx + 2 * BTN_W + 3 + BTN_W - 6)
@@ -495,7 +498,7 @@ def main():
                 check("关闭按钮是红底", close_red > 100, "红系像素=%d" % close_red)
                 check("关闭按钮有白色 X 图案", close_white > 3, "白色像素=%d" % close_white)
             else:
-                check("找到窗口标题栏（按钮位置）", False, "截图里没有 (32,32,32) 标题栏行")
+                check("找到计算器窗口几何（[UI] win geom tag=new title=计算器）", False, "（无打点）")
         else:
             check("窗口截图", False, "screendump 失败")
 
@@ -530,11 +533,25 @@ def main():
     vm2 = Vm(qemu, args.img, args.port + 1, "vimtu-ui-shutdown", tmp)
     try:
         mon2 = vm2.wait_monitor()
-        check("关机场景：桌面就绪", vm2.wait_ready(60))
-        mon2.key("meta_l", wait=1.0)
-        mon2.send("sendkey 0", wait=0.35)           # 菜单序号 9 = 关机
+        # ★ 缺陷 4（登录必须显式输入）：锁屏可交互 -> 回车两次进桌面（同 startmenu64_test）。
+        vm2.wait_log("[LOCK64] bg blur ready", 150)
+        mon2.key("ret", wait=1.0)
+        mon2.key("ret", wait=1.5)
+        check("关机场景：桌面就绪", vm2.wait_ready(90))
+        # ★ 缺陷 1（本批已提交的内核修复）：Win 键现在只开**新**开始菜单，'9'/'0' 不再绑电源动作
+        #   （避免误触）——旧路径（Win + 0 = 关机）已经不存在。改走新菜单的数字快捷键 1 = 终端，
+        #   用终端命令 `poweroff` 触发**同一个** sys_shutdown64()（[UI] shutdown anim start 打点不变）。
+        mon2.key("meta_l", wait=1.2)
+        check("Win 键打开新开始菜单（[START64] open why=win-key）",
+              vm2.wait_log("[START64] open why=win-key", 8))
+        mon2.key("1", wait=1.6)                     # 新菜单数字快捷键 1 = 终端（老菜单兼容语义）
+        check("数字快捷键 1 打开终端（[APP] term opened）", vm2.wait_log("[APP] term opened", 10))
+        for k in ("p", "o", "w", "e", "r", "o", "f", "f"):
+            mon2.key(k, wait=0.18)
+        mon2.key("ret", wait=0.2)                   # 关机动画 ~1s：尽早探测/截图（否则 QEMU 已断电退出）
         check("关机打点 [UI] shutdown anim start",
-              vm2.wait_log("[UI] shutdown anim start", 8))
+              vm2.wait_log("[UI] shutdown anim start", 10))
+        time.sleep(0.35)                            # 等进度条长到 ~60%（打点后立刻截会只截到 30%：14 < 20）
         shot_off = os.path.join(tmp, "shutdown.ppm")
         mon2.shot(shot_off, wait=1.0)
         if os.path.exists(shot_off):
@@ -561,11 +578,22 @@ def main():
     vm3 = Vm(qemu, args.img, args.port + 2, "vimtu-ui-reboot", tmp)
     try:
         mon3 = vm3.wait_monitor()
-        check("重启场景：桌面就绪", vm3.wait_ready(60))
-        mon3.key("meta_l", wait=1.0)
-        mon3.send("sendkey 9", wait=0.35)           # 菜单序号 8 = 重启
+        # ★ 缺陷 4（登录必须显式输入）：锁屏可交互 -> 回车两次进桌面（同 startmenu64_test）。
+        vm3.wait_log("[LOCK64] bg blur ready", 150)
+        mon3.key("ret", wait=1.0)
+        mon3.key("ret", wait=1.5)
+        check("重启场景：桌面就绪", vm3.wait_ready(90))
+        # ★ 缺陷 1 同上：Win 键只开新开始菜单，'8'/'9' 不再绑电源 —— 走"数字 1 = 终端" + `reboot`。
+        mon3.key("meta_l", wait=1.2)
+        check("Win 键打开新开始菜单（[START64] open why=win-key）",
+              vm3.wait_log("[START64] open why=win-key", 8))
+        mon3.key("1", wait=1.6)
+        check("数字快捷键 1 打开终端（[APP] term opened）", vm3.wait_log("[APP] term opened", 10))
+        for k in ("r", "e", "b", "o", "o", "t"):
+            mon3.key(k, wait=0.18)
+        mon3.key("ret", wait=0.2)                   # 重启动画 ~1s：尽早探测（-no-reboot 后 QEMU 会退出）
         check("重启打点 [UI] reboot anim start",
-              vm3.wait_log("[UI] reboot anim start", 8))
+              vm3.wait_log("[UI] reboot anim start", 10))
         check("重启也走同一套动画（帧数 >= 30）",
               vm3.wait_log("[UI] power anim frames=", 6) and
               int(re.search(r"\[UI\] power anim frames=(\d+)", vm3.log()).group(1)) >= 30)

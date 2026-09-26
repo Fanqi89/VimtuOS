@@ -258,7 +258,7 @@ VMware 里也一样（**新建虚拟机时 `guestOS` 必须选 64 位：`other-6
 
 ```bash
 python tests/status_report.py          # 先看状态：哪些完成/部分/未做（带证据，秒级）
-python tests/status_report.py --full   # 再真跑 45 个验收脚本（约 6-8 分钟；本批新登记 desktopops64_test）
+python tests/status_report.py --full   # 再真跑 46 个验收脚本（约 6-8 分钟；本批新登记 icons64_test）
 
 # 另有专项脚本（--full 列表之外，建议一起跑）；本批新增的 1 个已进 --full 列表，也可单跑：
 python tests/user64_test.py            # ring3 / GDT / 用户页权限
@@ -275,13 +275,14 @@ python tests/panels64_test.py          # P2 四弹窗（通知/声音/网络/日
 python tests/perm64_test.py            # P4 卷 v4 权限：rwx 真拦截 + su/sudo 提权 + chmod/chown/umask
 python tests/settings64_test.py        # P3 设置页：左导航 240px + 六组 + 实时生效/持久化 + 设密码重启必须输密码
 python tests/desktopops64_test.py      # P5 桌面交互：右键菜单/玻璃选择框/回收站/指针形状/缩放/最小化飞 Dock/圆角图标 + 应用窗口内容防回归 + 壁纸重绘
+python tests/icons64_test.py           # P6 外置图标包：真图标加载/逐 kind 核对/主题跟随/两种坏法回落 + 开始按钮真图
 
 python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 ```
 
 ## 六、工程质量（这个项目最值得说的部分）
 
-* **56 个验收脚本**（`Get-ChildItem tests\*.py` 实数 56；其中 `status_report.py --full` 的 `TESTS` 列表长度实测 **45**；上一批脚本的全部 PASS 结论保持不变；**本批（P5）登记 1 个脚本全 PASS**：**desktopops64_test 65-66 条**（P5 桌面交互 8 项能力 + 应用窗口内容防回归 + 壁纸重绘），另有 **settings64_test 105 条（连跑 2 次）**、**gui_modern64_test 149 条**、**startmenu64_test 58 条**、**panels64_test 78 条**、**locklogin64_test 88 条**、**explorer64_test 71 条**、**fileops64_test 95 条**、**perm64_test 95 条**、**store64_test 55 条**、**rust64_test 124 条**、**gfx64_test 55 条** —— 2026-09-26 实测：本批 0 FAIL（两个真 bug 已修：应用窗口内容丢失、改壁纸适应模式后桌面不重绘），
+* **57 个验收脚本**（`Get-ChildItem tests\*.py` 实数 57；其中 `status_report.py --full` 的 `TESTS` 列表长度实测 **46**；上一批脚本的全部 PASS 结论保持不变；**本批（P6）新登记 1 个脚本全 PASS**：**icons64_test 50 条**（外置图标包：真图标加载/逐 kind 对照宿主清单/形状 IoU/主题跟随/两种坏法回落 + 开始按钮 VimtuFS2 真图），另有 **gui_modern64_test 159 条（连跑 2 次全绿；Dock 回弹判据改与机器帧率无关）**、**panels64_test 78 条**、**desktop64_test PASS**、**desktopops64_test 66 条（13 条 QEMU PS/2 注入零命中为 [skip]）**、**explorer64_test 71 条**、**fileops64_test 95 条**、**startmenu64_test 63 条**、**settings64_test 108 条**、**ui_extra64_test 51 条** —— 2026-09-26 实测：本批 0 FAIL（六项真机缺陷修复 + 外置图标包），
   并逐脚本复跑既有脚本 —— `usb64_test` 51、`fatread64_test` 61、`explorer64_test` 71、`fileops64_test` 95、
   `multivol64_test` 108、`fs_tree_test` 85、`bootlog64_test` 30、`boot64_assert`、`desktop64_test`、
   `install_flow_test`、`partition_ops_test`、`esp_install_test`、`disk_boot_test`、`iso64_install_test`、
@@ -355,6 +356,44 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | M20 | **VimtuFS2 v4 权限（批次 P4）**：inode 128B 加 `uid@75 / gid@77 / mode@79` + **owner/group/other 三段 rwx 真拦截**（`-EACCES`(13) + `[PERM64] deny` 打点）+ 进程 uid/gid/euid/egid（fork/execve 继承）+ `geteuid/setuid/chmod/chown/umask/access/stat` 返回真值 + `su`/`sudo` 真提权（`[PERM64] cred`）；**v3/v2 旧卷可挂载可读写但不拦截** | ✅ |
 | M21 | **Windows 11 风格设置应用（批次 P3）**：`settings64` 重写为**左导航 240px + 卡片内容 + 六组**（系统：显示/声音/电源；个性化：主题 7 套/壁纸/颜色渐变/**壁纸适应模式（桌面与锁屏分别设置）**/Dock 长度·图标尺寸·间距/字体大小；网络：以太网真状态 + WiFi 无硬件；用户：头像（内置 3 + 本地 PNG）/改名；安全：密码设置与清空；关于：版本/驱动/GPU + 硬件检查），**全部实时生效并持久化**（改主题重启仍暗色 / 设密码重启必须输密码 / 清空密码直接进桌面）；顺带修掉**关于页版本号写死 `VimtuOS 0.1.0`**（改为 `build64.sh` 的编译期宏 `VIMTUOS_VERSION_STR`，发布只改一处） | ✅ |
 | M22 | **桌面交互（批次 P5）**：`desktopops64`（右键菜单 8 项/置灰/ESC 与点外部关闭、玻璃选择框 + 拖动、拖入回收站、指针形状、窗口缩放、最小化飞 Dock、圆角桌面图标、恢复默认图标）+ `input.cpp`（指针形状 6 向/文本 I/转圈）+ `gui64`（飞 Dock 225ms `scale+fade`、minbar 点击语义、`check_app_painted64` 防回归）+ `gfx64`（整屏模糊改**行序滑窗**：`blur_ticks 3094 → 141~158`、`total_ticks 3226 → 265~291`，逐像素等价）+ `explorer`（只显示可见分区）；顺带修掉**两个用户可见真 bug**：**应用窗口内容丢失**（`render()` 丢 `g_frames++/g_dirty_any=false` + `set_draw()` 把绘制关进"尺寸变化"的 `if`）、**改壁纸适应模式后桌面不重绘**（真因是整屏壁纸重建 ~6.3s） | ✅ |
+| M23 | **外置图标包（真图标，批次 P6）**：`kernel/icons64.{h,cpp}`（新建，统一图标层：从 system.img 内核区尾部固定区间 LBA 7497 读**外置图标包**（110 条目 / 30 kind / 49,192 B）→ `img64` 解码 → 缓存 → 按主题 palette 着色；取不到回落既有程序化绘制）+ `tools/make_iconpack.py`（SVG/PNG → 多档 PNG + 清单 `build/icons/manifest.json`）；**图标字节不进内核**（内核只带读取/缓存/着色代码，pack 由 `build64.sh` `dd` 到内核区尾部）；Dock/桌面/开始菜单状态区/四弹窗全部换真图标 | ✅ |
+| M24 | **真机缺陷修复（六项，批次 P6）**：① Win 键只开**新**开始菜单（老菜单整套删除；数字快捷键 1..8 兼容保留、9/0 不再绑电源）② 点扫雷/开始菜单"关机·重启" -> `#GP err=0` 蓝屏（根因：`dock_draw_one64()` 开始按钮 scratch 按 46×46 开、悬停 120% 时写 55×55 -> **越界 3.6KB 踩坏 BSS**）③ 设置页移动鼠标整屏空白（P5 竞态已修 + 本批防回归断言）④ 登录必须**显式输入**（`ui.login.auto` 默认 1→0，实测停留 ≥10s）⑤ 壁纸四角红绿蓝黄标记默认**不可见**（`ui.wall.markers` 默认 0，Ctrl+Shift+M 切换）⑥ 主题热键与按用户偏好同步；回归：gui_modern64 159/159 连跑 2 次、icons64 50/50、panels64 78/78、settings64 108/108、startmenu64 63/63、ui_extra64 51/51 全绿 | ✅ |
+
+### 批次 P6（本批）：真机缺陷修复（含蓝屏根因）+ 外置图标包（真图标）
+
+**① 蓝屏根因**（用户真机/VM 实测：点"扫雷"或开始菜单"关机·重启"就蓝屏）
+
+* **修前原文**（VimtuFS2 夹具盘 + 点新菜单 tile4 = 扫雷）：
+  `[PANIC] cpu exception 13 err=0000000000000000 rip=FFFFFFFF801B26C0 cs=0000000000000008 rsp=000000000007BB20 cr2=0000000000000000`
+  ＋ `[PANIC64] stop=CPU_EXCEPTION detail=000000000000000D state=RUNNING gen=1` ——
+  RIP 落在 `ms_reap_closed64+0x80` 的 `cmpl $0x4d533634,(%rbx)`：**读野 `MinesState*`**。
+* **根因**：`kernel/gui64.cpp` 的 `dock_draw_one64()` scratch 只按 `DOCK_START_DISP(46)` 开 `46×46×4`，
+  而悬停放大 120% 时 `icon_px=55`、`scale_rgba64` 要写 `55×55×4` —— **越界 3.6KB**，连踩其后的 BSS
+  静态量（`calc64` 的 `g_slots`、`mines64` 的 `g_ms_slot`/`g_ms_last`、`gui64` 的 `g_icon_press_*` 等）
+  → 点扫雷读野 `MinesState*` → `#GP err=0`（关机路径则是 `kfree` 野指针）。
+* **修法**：缓冲按**最大绘制尺寸**分配（`DOCK_ICON_PX_MAX=64`）+ 入口夹取。
+* **修后原文**：`[APP] mines opened diff=0`、`[SYS64] state=STOPPED stopped=21 failed=0 elapsed=…`、
+  `[START64] power action shutdown anim=150ms`。
+
+**② 其余五项修复 + 外置图标包（真图标）**
+
+* Win 键只开**新**开始菜单（`startmenu64_win_key_toggle64`；老菜单整套删除，数字快捷键 1..8 兼容保留、`9`/`0` 不再绑电源）；
+  打点 `[START64] open why=win-key x=440 y=293 w=400 h=420`、`[START64] power menu open … rows=3 row0=shutdown row1=reboot row2=lock`。
+* 设置页移动鼠标整屏空白：内核侧在 QEMU 复现不出（P5 脏矩形竞态已修），本批加**防回归断言**（内容区颜色数 ≥20 / 暗像素 ≥80% / 取样点 ≥85% 未变）。
+* 登录必须**显式输入**：`ui.login.auto` 默认 `1 → 0`；实测（探针）锁屏可交互后**静置 12.0s** 仍 `[GUI64] ready` 缺席、
+  无 `[LOCK64] auto login`，回车两次后 2.5s 进桌面（打点链 `[LOCK64] lock screen shown why=boot` →
+  `[LOGIN64] login screen shown why=key` → `[LOGIN64] login button key=enter` → `[GUI64] ready`）。
+* 壁纸四角红/绿/蓝/黄标记默认**不可见**：`ui.wall.markers` 默认 `0`（Ctrl+Shift+M 运行时切换）；
+  实测首帧 `[GFX64] wall markers … size=16 markers_drawn=0`，打开后 `markers_drawn=4`。
+* 外置图标包（真图标）：`kernel/icons64.cpp` 统一图标层 + `tools/make_iconpack.py`；包在 `system.img` **内核区尾部 LBA 7497**
+  （110 条目 / 30 kind / **49,192 B**，**图标字节 0 进内核**）；实测 `[ICON64] init pack lba=7497 bytes=49192 entries=110 icons=30 bad=0 ok=1`、
+  逐 kind `[ICON64] load kind=… path=pack:… src=pack ok=1`、`[ICON64] selftest PASS mask=0 pack=1 kinds=30 loaded=30 fallback=0`、
+  Dock 开始按钮仍是盘上真图 `[DOCK64] start icon src=vfs:/logo/kaisi.png size=46 ok=1`。
+
+**本批实读**（2026-09-26）：能力项 **完成 53 / 部分 0 / 未做 0**；`--full` 的 `TESTS` **46** 个脚本；
+安装程序内核 **2,200,272 B**、系统内核 **3,718,976 B**（上限 4,096,000 B，余量 **377,024 B**）、
+`loader64.bin` **4,010 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**；
+**镜像内嵌版本串已一致**：`[SET64] about version=VimtuOS 0.3.4-beta16 x86_64 build_tag=… bits=64`（唯一真源 `build64.sh` 的 `VIMTUOS_VERSION`；v0.3.3-beta15 就是漏改了它）。
 
 ## 八、路线图（未完成的部分）
 
@@ -561,9 +600,9 @@ objcopy 符号名保持不变。运行时打点：`[FONT64] faces=4 …` / `mono
 `fallback hit cp=0x… face=3` / `selftest PASS mask=…`（验收：`py -3 tests\fonts64_test.py`）。
 许可与派生说明见 [docs/字体许可说明.md](docs/字体许可说明.md)。**因此 ISO/IMG 可以直接公开分发。**
 
-**版本与发布**：标签 `v0.3.3-beta15`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.3.3-beta15>
-（历史版本各自保留安装程序：`v0.3.2-beta14` / `v0.3.1-beta13` / `v0.3.0-beta12` / `v0.2.3-beta11` / `v0.2.2-beta10` / `v0.2.1-beta9` / `v0.2.1-beta8` / `v0.2.1-beta7` / `v0.2.1-beta6` / `v0.2.0-beta.5` / `v0.2.0-beta.4` / `v0.2.0-beta.3` / `v0.2.0-beta.2` / `v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
-（预发布；**安装盘已附上**：`vimtu64-64.iso` 三合一安装盘 + `vimtu64-64.img` 裸盘介质；系统内核 **3,697,088 B**（上限 4,096,000 B，**余量 ~399 KB**）、安装内核 **2,200,272 B**）
+**版本与发布**：标签 `v0.3.4-beta16`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.3.4-beta16>
+（历史版本各自保留安装程序：`v0.3.3-beta15` / `v0.3.2-beta14` / `v0.3.1-beta13` / `v0.3.0-beta12` / `v0.2.3-beta11` / `v0.2.2-beta10` / `v0.2.1-beta9` / `v0.2.1-beta8` / `v0.2.1-beta7` / `v0.2.1-beta6` / `v0.2.0-beta.5` / `v0.2.0-beta.4` / `v0.2.0-beta.3` / `v0.2.0-beta.2` / `v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
+（预发布；**安装盘已附上**：`vimtu64-64.iso` 三合一安装盘 + `vimtu64-64.img` 裸盘介质；系统内核 **3,718,976 B**（上限 4,096,000 B，**余量 377,024 B**）、安装内核 **2,200,272 B**；内嵌版本串 = `[SET64] about version=VimtuOS 0.3.4-beta16 …`）
 
 ```bash
 # 日常：改完代码这样提交推送（★ 不要用网页拖拽上传 —— 那会绕过 .gitignore）

@@ -7,8 +7,9 @@
                       像素：面板存在（与壁纸不同）、最左开始按钮是**真图标**（彩色像素）。
   2) 悬停放大/让位     鼠标闭环挪到某个图标上 -> [DOCK64] hover idx=.. scale=120 + 像素：
                       被悬停图标的顶边升高（放大 1.20），紧邻图标的左/右边界外移（轻微让位）。
-  3) 点击回弹          点击 -> [DOCK64] bounce idx=.. frame=.. dy=.. 连续帧位移（向上再向下回弹）+
-                      bounce done frames>=6（弹簧 260ms）。
+  3) 点击回弹          点击 -> [DOCK64] bounce idx=.. frame=.. t=.. dy=.. dir=.. —— 形态学判据（不绑机器帧率）：
+                      采样 >=3 次、t 严格递增、向上过冲峰值 3..12px、峰值后回落（单峰）、
+                      且在 Token 时长 x1.5 内收敛到 0（done frames>=3 + el<=390ms，弹簧 260ms）。
   4) 最小化小横杠      Dock 图标 -> 最小化 -> [DOCK64] press action=minimize + [DOCK64] minbar ...
                       （宽 = 图标 40%、跟随强调色）+ 像素：横杠处有强调色像素；
                       并且**在横杠上点击不产生任何 Dock 动作**（纯视觉不可点击）。
@@ -584,7 +585,18 @@ def main():
         check("邻位图标轻微让位（左边向外移 >= 2px）", base_neigh - hov_neigh >= 2,
               "base=%d hover=%d（外移 %d）" % (base_neigh, hov_neigh, base_neigh - hov_neigh))
 
-        print("=== 3) 点击回弹（连续帧位移 + 弹簧 260ms）===")
+        # ★ 本批收口（判据与机器无关化）：旧判据是「done frames >= 6」+「dirs 里必须有 down/rest」，
+        #   两条都绑机器渲染帧率/实现细节：TCG 下 Dock 每帧（只重画 Dock 那一条 + 双层阴影）几十毫秒，
+        #   260ms 的 Token 时长里只能采样到 3–6 帧（两次实测：dy=4/9/8/8 4 帧、dy=2/9/8/8/9/9 6 帧），
+        #   ">=6 帧"随时会因机器/负载掉下去；而内核的 dy = -(9*spring/256)，过冲段 spring 300 -> 243 -> 256,
+        #   dy 一直 <=0，dir 只会是 up/rest，down 是旧判据写错的标签（内核永远不会打出来）。
+        #   新判据只锁**与机器无关的量**：
+        #     ① 采样 >= 3 次 + t 严格递增（动画在时间里前进）；② 采样峰值 3..12px（Token 9px 的 ±30%；
+        #        方向反了会打出无符号巨值、不动则是 0）；③ 末尾采样仍在 3..12px（不是中途塌回 0）；
+        #     ④ 内核**每 tick 跟踪**的整段峰值（done 行 peak=，与采样帧率无关）也在 3..12px；
+        #     ⑤ done 行的 el <= 390ms（Token 260ms x 1.5，内核在 el >= dur 时复位 dy=0）
+        #        -> 证明在 Token 时长内收敛到 0。旧判据抓不住的"不收敛/时长失控"由 ⑤ 直接抓。
+        print("=== 3) 点击回弹（形态学判据：单峰过冲 + Token 时长内收敛；不绑机器帧率）===")
         before_click = len(vm.log())
         mon.raw(["mouse_button 1", "mouse_button 0"], wait_between=0.12, wait_end=0.4)
         got = vm.wait_log("[DOCK64] bounce idx=%d" % HOVER_IDX, 6, since=before_click)
@@ -592,17 +604,25 @@ def main():
         time.sleep(1.6)
         seg = vm.log()[before_click:]
         frames = re.findall(r"\[DOCK64\] bounce idx=%d frame=(\d+) t=(\d+) dy=(\d+) dir=(\w+)" % HOVER_IDX, seg)
-        done = re.search(r"\[DOCK64\] bounce idx=%d done frames=(\d+) motion=spring" % HOVER_IDX, seg)
+        done = re.search(r"\[DOCK64\] bounce idx=%d done frames=(\d+) motion=spring\(260ms\) el=(\d+) peak=(\d+)"
+                         % HOVER_IDX, seg)
+        ts = [int(f[1]) for f in frames]
         dys = [int(f[2]) for f in frames]
         dirs = [f[3] for f in frames]
-        print("      回弹帧：%d 帧，dy 序列 %s，方向 %s" % (len(frames), dys[:10], dirs[:10]))
-        check("回弹有连续帧（>= 4 帧）", len(frames) >= 4, "%d 帧" % len(frames))
-        check("相邻帧位移在变（上下回弹，不是一步到位）",
-              len(set(dys)) >= 3, "dy=%s" % dys[:10])
-        check("弹簧曲线出现过冲（先向上、后向下回落）",
-              ("up" in dirs) and ("down" in dirs or "rest" in dirs), "dirs=%s" % dirs[:10])
-        check("回弹走完（done frames >= 6，约 260ms）",
-              done is not None and int(done.group(1)) >= 6,
+        print("      回弹帧：%d 帧，t 序列 %s，dy 序列 %s，方向 %s" % (len(frames), ts[:10], dys[:10], dirs[:10]))
+        check("回弹被采样到 >= 3 次（不是一步到位）", len(frames) >= 3, "%d 帧" % len(frames))
+        check("采样时刻严格递增（动画时间在前进，不是静止/回退）",
+              all(ts[i] < ts[i + 1] for i in range(len(ts) - 1)), "t=%s" % ts[:10])
+        peak = max(dys) if dys else -1
+        check("向上过冲有界（采样峰值 3..12px，Token 9px 的 ±30%；方向反了/不动都会越界）",
+              3 <= peak <= 12, "dy=%s peak=%d" % (dys[:10], peak))
+        check("末尾采样仍在位移区间（3..12px：不是中途塌回 0，也不是一步跳到底）",
+              3 <= (dys[-1] if dys else -1) <= 12, "dy=%s" % dys[:10])
+        check("内核整段动画峰值（每 tick 跟踪，与采样帧率无关）3..12px 且 >= 采样峰值",
+              done is not None and 3 <= int(done.group(3)) <= 12 and int(done.group(3)) >= peak,
+              done.group(0) if done else "（无 done 行）")
+        check("回弹在 Token 时长 x1.5 内收敛到 0（done frames>=3 且 el<=390ms）",
+              done is not None and int(done.group(1)) >= 3 and int(done.group(2)) <= 390,
               done.group(0) if done else "（无 done 行）")
 
         print("=== 4) 最小化小横杠（40% 宽、强调色、不可点击）===")
