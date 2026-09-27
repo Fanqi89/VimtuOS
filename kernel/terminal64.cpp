@@ -4023,6 +4023,105 @@ static bool cmd_loginctl(TerminalState* ts, const char* a1) {
 //   但命令分派在 shell_exec 里就要用 -> 这里先声明。
 static bool cmd_shell(TerminalState* ts, const char* arg1);
 
+// ★ A4-2a：`run PATH > FILE`（`>> FILE` 追加 / `< FILE` 输入）—— 把 fd 0/1/2 **真正交给子进程**。
+// 这就是"外部命令重定向"的内核侧实现，也是本批新增 dup2-to-0/1/2 的落地用法：
+//   1) 在内核表里打开目标文件（本表 fd >= 3）；
+//   2) proc64_create64 建子进程 -> 拿它的 fd 表 -> fd64_dup_into64 把文件对象绑到槽 1（或 0）；
+//   3) 关掉内核表那份（引用计数 -1；子进程那份还在）-> proc64_start_elf64 让子进程进 ring3；
+//   4) 子进程的 write(1) 因此落进文件；它的 stdout **不再**是内核控制台。
+// 如实边界：只做一次 `>` / `>>` / `<`（不做管道、不做 `2>`）；失败一律报错，绝不静默忽略。
+static bool term_run_redir64(TerminalState* ts, const char* path, const char* out_file, int append,
+                             const char* in_file) {
+    if (!proc64_isolate64()) {
+        ts_puts(ts, "run: shared address space mode -> no per-process fds (redirection unsupported)\n");
+        return false;
+    }
+    int ofd = -1, ifd = -1;
+    if (out_file && out_file[0]) {
+        ofd = fd64_open64(out_file, FD64_O_WRONLY | FD64_O_CREAT | (append ? FD64_O_APPEND : FD64_O_TRUNC));
+        if (ofd < 0) {
+            ts_puts(ts, "run: cannot open output file: ");
+            ts_puts(ts, out_file);
+            ts_putc(ts, (uint32_t)'\n');
+            return false;
+        }
+    }
+    if (in_file && in_file[0]) {
+        ifd = fd64_open64(in_file, FD64_O_RDONLY);
+        if (ifd < 0) {
+            ts_puts(ts, "run: cannot open input file: ");
+            ts_puts(ts, in_file);
+            ts_putc(ts, (uint32_t)'\n');
+            if (ofd >= 0) (void)fd64_close64(ofd);
+            return false;
+        }
+    }
+    panic64_watchdog_pause64();
+    const int pid = proc64_create64("run", 0);
+    int rc = -1, code = -1, bound = 0;
+    if (pid > 0) {
+        FdTable64* ct = proc64_fdtab_of64(pid);
+        if (!ct) rc = -5;
+        else {
+            if (ofd >= 0 && fd64_dup_into64(ct, ofd, 1) != 1) rc = -3;         // 子进程 fd 1 = 文件
+            if (rc == -1 && ifd >= 0 && fd64_dup_into64(ct, ifd, 0) != 0) rc = -4;  // 子进程 fd 0 = 文件
+            bound = (ofd >= 0) ? 1 : 0;
+        }
+        // ★ 竞态兜底（实测必要）：新任务的"proc 绑定"与"第一次被调度"之间有一个已知窗口
+        //   （见 task64.cpp 里 task_bind_proc64 的说明）——窗口里 proc64_fdtab_of_current64() 返回
+        //   nullptr，fd 层退回**内核表**，于是子进程开头几个 write(1) 又走内核控制台（实测：musl 的
+        //   前两行跑到了串口，后面才进文件）。所以这里把**内核表**的槽 1/0 也临时绑到同一个对象：
+        //   终端自己的输出不走 fd（它用 ts_puts/dbg64），临时占用是安全的；跑完立刻关掉。
+        int kout = -1, kin = -1;
+        if (ofd >= 0) kout = fd64_dup64(ofd, 1);
+        if (ifd >= 0) kin = fd64_dup64(ifd, 0);
+        if (kout != 1) rc = -6;
+        if (rc == -1 && ifd >= 0 && kin != 0) rc = -7;
+        if (rc == -1 && proc64_start_elf64(pid, path) == 0) {
+            rc = -2;
+            const uint64_t t0 = g_ticks64;
+            for (;;) {
+                int st = -1;
+                for (int i = 0; i < PROC64_MAX; i++) {
+                    Proc64Info in;
+                    if (proc64_info64(i, &in) == 0) continue;
+                    if ((int)in.pid == pid) { st = (int)in.state; code = in.exit_code; break; }
+                }
+                if (st == (int)PROC64_EXITED) { rc = 0; break; }   // 退出即"跑完了"；退出码在 code=
+                if (st < 0) break;
+                if (g_ticks64 - t0 >= (uint64_t)PIT_HZ_64 * 20u) break;         // 有界等待
+                task_sleep64(2);
+            }
+            if (rc == -2) { (void)proc64_kill64(pid, 9); }                      // 超时：杀掉
+        }
+        if (kout == 1) (void)fd64_close64(1);                                   // 内核表槽 1 还给终端
+        if (kin == 0) (void)fd64_close64(0);
+    }
+    if (pid > 0 && proc64_find64(pid)) proc64_destroy64(pid);
+    panic64_watchdog_unpause64();
+    if (ofd >= 0) (void)fd64_close64(ofd);
+    if (ifd >= 0) (void)fd64_close64(ifd);
+    dbg64_line_begin64();
+    dbg64_str("[TERM] run redir path=");
+    dbg64_str(path);
+    dbg64_str(" out=");
+    dbg64_str((out_file && out_file[0]) ? out_file : "-");
+    dbg64_str(append ? " append=1" : " append=0");
+    dbg64_str(" in=");
+    dbg64_str((in_file && in_file[0]) ? in_file : "-");
+    dbg64_str(" pid=");
+    dbg64_dec((uint64_t)(pid < 0 ? 0 : pid));
+    dbg64_str(" fd1_bound=");
+    dbg64_dec((uint64_t)bound);
+    dbg64_str(" code=");
+    dbg64_dec((uint64_t)(code < 0 ? 0 : code));
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)rc);
+    dbg64_nl();
+    dbg64_line_end64();
+    return rc == 0;
+}
+
 // 命令分发：cmd / arg1 / args（原文，供 echo / write 用）
 static void shell_exec(TerminalState* ts, const char* line) {
     const char* p = skip_ws(line);
@@ -4169,10 +4268,11 @@ static void shell_exec(TerminalState* ts, const char* line) {
         // 真：从 VimtuFS2 读出应用并在 ring3 里跑。**按文件头魔数自动分派**：
         //   "VAP64\0\0\0" -> app64_launch64（平铺代码段 + int 0x80）
         //   "\x7fELF"     -> elf64_run64（ELF64 加载器 + syscall 指令）
-        // 这样用户不用记格式；想让某条路径强制走某一侧就用 elf（见下面的 elfrun）。
+        // ★ A4-2a：再支持 `run PATH > FILE` / `>> FILE` / `< FILE` —— 走真进程 + 把 fd 0/1 交给子进程
+        //   （term_run_redir64；这是"外部命令重定向"的内核侧落地，见 dup2 到 0/1/2）。
         if (g_arg1[0] == 0) {
-            ts_puts(ts, gui64_tr("run: usage: run <name|/path>   (e.g. run hello.vap | run hello.elf)\\n",
-                                 "run: 用法: run <名字|/路径>   （例如 run hello.vap | run hello.elf）\\n"));
+            ts_puts(ts, gui64_tr("run: usage: run <name|/path> [> out] [< in]   (e.g. run hello.vap)\n",
+                                 "run: 用法: run <名字|/路径> [> 输出] [< 输入]   （例如 run hello.vap）\n"));
             ok = false;
         } else {
             char path[64];
@@ -4180,22 +4280,50 @@ static void shell_exec(TerminalState* ts, const char* line) {
             if (g_arg1[0] != '/') path[plen++] = '/';            // "name" -> "/name"；已带 '/' 就原样
             for (int i = 0; g_arg1[i] && plen < (int)sizeof(path) - 1; i++) path[plen++] = g_arg1[i];
             path[plen] = 0;
-            const int rc = app64_run_any64(path);                // 读盘 -> 判魔数 -> 分派 -> ring3 跑
-            ts_puts(ts, rc == 0 ? gui64_tr("run: ok\\n", "run: 成功\\n")
-                                : gui64_tr("run: failed (see serial log)\\n", "run: 失败（见串口日志）\\n"));
-            ts_puts(ts, "[APP64] run cmd path=");                // 屏幕 + 串口同一条打点（自动验收 grep）
-            ts_puts(ts, path);
-            ts_puts(ts, " rc=");
-            if (rc < 0) ts_putc(ts, (uint32_t)'-');
-            ts_put_u64(ts, (uint64_t)(rc < 0 ? -rc : rc));
-            ts_putc(ts, (uint32_t)'\n');
-            dbg64_str("[APP64] run cmd path=");
-            dbg64_str(path);
-            dbg64_str(" rc=");
-            if (rc < 0) dbg64_putc('-');
-            dbg64_dec((uint64_t)(rc < 0 ? -rc : rc));
-            dbg64_nl();
-            ok = (rc == 0);
+            char rout[80], rin[80];
+            int append = 0, have_redir = 0, redir_bad = 0;
+            rout[0] = 0; rin[0] = 0;
+            {
+                const char* rp = skip_ws(args2);                 // args2 = 第 1 个参数之后的原文
+                if (rp[0] == '>' || rp[0] == '<') {
+                    const int is_out = (rp[0] == '>');
+                    if (is_out && rp[1] == '>') append = 1;
+                    const char* rest = skip_ws(rp + ((is_out && rp[1] == '>') ? 2 : 1));
+                    grab_token(rest, is_out ? rout : rin, 80);
+                    have_redir = 1;
+                    if ((is_out ? rout[0] : rin[0]) == 0) {
+                        ts_puts(ts, "run: redirection needs a file name (e.g. run X > /tmp/o.txt)\n");
+                        redir_bad = 1;
+                        ok = false;
+                    }
+                } else if (rp[0]) {
+                    ts_puts(ts, "run: unsupported argument (only '> FILE' / '>> FILE' / '< FILE')\n");
+                    redir_bad = 1;
+                    ok = false;
+                }
+            }
+            if (have_redir && !redir_bad) {
+                ok = term_run_redir64(ts, path, rout, append, rin);
+                ts_puts(ts, ok ? gui64_tr("run: ok (redirected)\n", "run: 成功（已重定向）\n")
+                               : gui64_tr("run: failed (see serial log)\n", "run: 失败（见串口日志）\n"));
+            } else if (!redir_bad) {
+                const int rc = app64_run_any64(path);            // 读盘 -> 判魔数 -> 分派 -> ring3 跑
+                ts_puts(ts, rc == 0 ? gui64_tr("run: ok\n", "run: 成功\n")
+                                    : gui64_tr("run: failed (see serial log)\n", "run: 失败（见串口日志）\n"));
+                ts_puts(ts, "[APP64] run cmd path=");            // 屏幕 + 串口同一条打点（自动验收 grep）
+                ts_puts(ts, path);
+                ts_puts(ts, " rc=");
+                if (rc < 0) ts_putc(ts, (uint32_t)'-');
+                ts_put_u64(ts, (uint64_t)(rc < 0 ? -rc : rc));
+                ts_putc(ts, (uint32_t)'\n');
+                dbg64_str("[APP64] run cmd path=");
+                dbg64_str(path);
+                dbg64_str(" rc=");
+                if (rc < 0) dbg64_putc('-');
+                dbg64_dec((uint64_t)(rc < 0 ? -rc : rc));
+                dbg64_nl();
+                ok = (rc == 0);
+            }
         }
     } else if (st_eq(g_cmd, "elfrun")) {
         // elfrun 显式走 ELF64 加载器（不做魔数分派），用来把 ELF 路径单独验证出来。

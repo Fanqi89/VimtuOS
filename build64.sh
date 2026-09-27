@@ -213,8 +213,17 @@ echo "==> 资源对象（objcopy -> elf64，两份内核共用同一批）"
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_start.bin icon_start.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 kaisi.png kaisi_png.o)
 # OS 内核用同一批资源对象（直接复用）
-cp "$BUILD"/font_*.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o "$BUILD/os/"
+cp "$BUILD"/font_*.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o "$BUILD"/os/
 cp "$BUILD"/kaisi_png.o "$BUILD/os/"      # 只给系统内核（桌面用）
+# ★ A4-2a：**图标包搬进 VimtuFS2 系统卷** —— 包字节不再放在"内核区尾部（LBA 7497..8008）"，
+#   改成把 build/iconpack.bin 内嵌进**系统内核**（objcopy -> .rodata），启动期由 icons64 幂等
+#   装进系统卷的 /icons/pack.bin，之后一切加载都从**卷**里读（[ICON64] load … src=vfs）。
+#   为什么内嵌：安装器建出来的盘、测试夹具盘上"卷里的包"必须有个来源，而安装器侧不在本批可改范围；
+#   内嵌的代价只有 49 KB，换来的却是内核区从 7,488 扇区放宽到 **8,000 扇区**（+262,144 B）。
+cp "$RES/iconpack.bin" "$BUILD/iconpack.bin"
+(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 iconpack.bin iconpack_bin.o)
+cp "$BUILD/iconpack_bin.o" "$BUILD/os/"
+echo "    内嵌图标包（系统内核）：$RES/iconpack.bin = $(stat -c%s "$RES/iconpack.bin") B -> 启动期装进系统卷 /icons/pack.bin"
 
 echo "==> Rust 模块（gui_rs crate：设计 Token 表 + 主题配色计算；项目路线 C + C++ + Rust）"
 # 为什么单独一段：Rust 用 `rustc --target x86_64-unknown-none` 编成**可直接被 ld.lld 链接**
@@ -436,7 +445,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/hello_vap64.o \
     "$BUILD/os"/user_demo64.o $ASM_FBDEMO_OBJ "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
     "$BUILD/os"/user_*_cblob.o \
-    "$BUILD/os"/kaisi_png.o
+    "$BUILD/os"/kaisi_png.o "$BUILD/os"/iconpack_bin.o
 $OBJCOPY -O binary "$BUILD/kernel64_os.elf" "$BUILD/kernel64_os.bin"
 
 KBSZ=$(stat -c%s "$BUILD/kernel64.bin")
@@ -500,25 +509,31 @@ dd if="$BUILD/boot.bin"        of="$BUILD/system.img" conv=notrunc status=none
 dd if="$BUILD/loader64.bin"    of="$BUILD/system.img" seek=1 conv=notrunc status=none
 dd if="$BUILD/kernel64_os.bin" of="$BUILD/system.img" seek="$KERNEL_LBA" conv=notrunc status=none
 
-# ---- ★ 本批（真图标）：把外置图标包写进系统镜像**内核区尾部的固定区间**。
-#      区间常量与 kernel/icons64.h 的 ICON64_PACK_MAX_SECTORS/ICON64_PACK_LBA 必须一致：
-#      LBA = 9 + 8000 - 512 = 7497（内核二进制之后、数据分区起点 8009 之前）。
-#      两道断言：包不能超过预留区间；系统内核不能长到压住包（否则安装出来的盘会互相覆盖）。
-ICONPACK_MAX_SECTORS=512
-ICONPACK_LBA=$((KERNEL_LBA + KERNEL_SECTORS - ICONPACK_MAX_SECTORS))
+# ---- ★ A4-2a：图标包已**搬进 VimtuFS2 系统卷**（内核区尾部不再预留、也不再写入 dd）。----
+#      改动前：内核区尾部 LBA 7497..8008 被图标包区间占住 -> 系统内核只能用 7,488 扇区
+#              （= 3,833,856 B；实测剩 272 B 余量）。
+#      改动后：这段区间**全部交还内核**（内核可用到 LBA 8008 = 8,000 扇区 = 4,096,000 B，
+#              +262,144 B)；图标包字节改由系统内核内嵌、启动期装进卷的 /icons/pack.bin
+#              （见上面 objcopy 段与 kernel/icons64.cpp 的 icpack 加载路径）。
+#      两道断言仍然保留（把"内核不许越界"钉死，只是边界从 LBA 7497 放宽到 8008）：
+#        ① 内嵌的包字节不能超过 icons64.h 的 ICON64_PACK_MAX_SECTORS 上限（卷里那份的大小上限）；
+#        ② 系统内核不能长过内核区（LBA 9..8008）。
+ICONPACK_MAX_SECTORS=512                       # = kernel/icons64.h 的 ICON64_PACK_MAX_SECTORS
 ICONPACK_BYTES=$(stat -c%s "$RES/iconpack.bin")
 ICONPACK_SECTORS=$(( (ICONPACK_BYTES + 511) / 512 ))
 KERNEL_OS_SECTORS=$(( (OSSZ + 511) / 512 ))
+KERNEL_AREA_BYTES=$(( KERNEL_SECTORS * 512 ))
 if [ "$ICONPACK_SECTORS" -gt "$ICONPACK_MAX_SECTORS" ]; then
-    echo "ERROR: 图标包 $ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）超过内核区尾部预留的 $ICONPACK_MAX_SECTORS 扇区" >&2
+    echo "ERROR: 图标包 $ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）超过 icons64.h 的 ICON64_PACK_MAX_SECTORS=$ICONPACK_MAX_SECTORS" >&2
     exit 1
 fi
-if [ $((KERNEL_LBA + KERNEL_OS_SECTORS)) -gt "$ICONPACK_LBA" ]; then
-    echo "ERROR: 系统内核（$OSSZ B = $KERNEL_OS_SECTORS 扇区）已长到图标包区间 LBA $ICONPACK_LBA" >&2
+if [ "$KERNEL_OS_SECTORS" -gt "$KERNEL_SECTORS" ]; then
+    echo "ERROR: 系统内核（$OSSZ B = $KERNEL_OS_SECTORS 扇区）超出内核区 $KERNEL_SECTORS 扇区（$KERNEL_AREA_BYTES B）" >&2
     exit 1
 fi
-dd if="$RES/iconpack.bin" of="$BUILD/system.img" seek="$ICONPACK_LBA" conv=notrunc status=none
-echo "    图标包：$ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）@ LBA $ICONPACK_LBA..$((ICONPACK_LBA + ICONPACK_SECTORS - 1))；系统内核 $OSSZ B / $KERNEL_OS_SECTORS 扇区（余 $((ICONPACK_LBA - KERNEL_LBA - KERNEL_OS_SECTORS)) 扇区不重叠）"
+echo "    内核区（图标包搬走后）：LBA $KERNEL_LBA..$((KERNEL_LBA + KERNEL_SECTORS - 1)) = $KERNEL_SECTORS 扇区 = $KERNEL_AREA_BYTES B 全部可用；"
+echo "                            系统内核 $OSSZ B / $KERNEL_OS_SECTORS 扇区（余 $((KERNEL_AREA_BYTES - OSSZ)) B；改动前上限 7,488 扇区 = $((7488 * 512)) B）"
+echo "    图标包：$ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）**内嵌进系统内核** -> 启动期装进系统卷 /icons/pack.bin（运行期 src=vfs）"
 
 echo "==> ★ A4-1：带 /bin/shell.bin 的演示盘 + \"内核里没有 shell 字节\"断言"
 # system.img 已经装好 -> 把它 + MBR + 主分区（= 带 /bin/shell.bin 的 VimtuFS2 v4 卷）拼成
@@ -537,6 +552,149 @@ if len(probe) < 64 or probe in k:
     raise SystemExit(1)
 print("    断言 OK：系统内核 %d B 里搜不到 shell.bin 的 64B 探针（偏移 %d）；shell 只从系统卷装载" % (len(k), mid))
 PYEOF
+
+echo "==> ★ A4-2a：ring3 系统调用探针（chdir/rename/rmdir/dup2/utime + execve 失败路径的真证据）"
+# 为什么源码由构建脚本生成：本批只允许改 kernel/*、build64.sh、tests/a42a64_test.py、docs —— user/
+#   由另一条线在改。这份**验收用**的 ring3 程序因此不落在 user/ 里：源码在构建目录里生成、编成
+#   build64/a42a_sys.elf，然后由 tests/a42a64_test.py 装进测试夹具盘的卷里（/bin/a42a_sys.elf），
+#   终端里用 `elfrun /bin/a42a_sys.elf` 跑（真进程 + 真系统调用）。
+#   它用的是 **syscall 指令 + Linux 号段**（与 musl/shell 同一条 ABI），不是 int 0x80 自有号段。
+cat > "$BUILD/a42a_sys.c" <<'A42A_CEOF'
+/* a42a_sys.c - A4-2a ring3 系统调用探针（构建期生成；自包含：不 include 任何头、不依赖 libc） */
+typedef long i64;
+typedef unsigned long u64;
+
+static i64 sc3(i64 n, i64 a, i64 b, i64 c) {
+    i64 r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b), "d"(c) : "rcx", "r11", "memory");
+    return r;
+}
+static i64 sc0(i64 n) { return sc3(n, 0, 0, 0); }
+static i64 sc1(i64 n, i64 a) { return sc3(n, a, 0, 0); }
+static i64 sc2(i64 n, i64 a, i64 b) { return sc3(n, a, b, 0); }
+
+static void out_str(const char* s) {
+    int n = 0;
+    while (s[n]) n++;
+    (void)sc3(1, 1, (i64)(u64)s, n);          /* write(1, ...) -> 内核控制台（串口 + 屏幕） */
+}
+static void out_num(i64 v) {
+    char b[24];
+    int n = 0;
+    u64 x;
+    if (v < 0) { b[n++] = '-'; x = (u64)(-v); } else { x = (u64)v; }
+    char t[24];
+    int k = 0;
+    if (x == 0) t[k++] = '0';
+    while (x) { t[k++] = (char)('0' + (int)(x % 10u)); x /= 10u; }
+    while (k) b[n++] = t[--k];
+    b[n] = 0;
+    out_str(b);
+}
+static void ev(const char* tag, i64 v) { out_str("A42A "); out_str(tag); out_str("="); out_num(v); out_str("\n"); }
+
+static char  g_cwd[64];
+static long  g_tm[2] = { 1, 2 };              /* utimbuf：显式时间（本内核如实 -ENOSYS） */
+static long  g_status;
+
+__attribute__((section(".text.start"), noreturn)) void _start(void) {
+    /* ① execve 失败路径：/nope.bin 不存在 -> 预检失败 -> -ENOENT，**本进程继续跑**（不再 #PF/PANIC） */
+    const i64 ex = sc3(59, (i64)(u64)"/nope.bin", 0, 0);
+
+    /* ② 打开重定向目标 + dup2(file -> 1)：把 stdout 换成文件（重定向的落地动作） */
+    const i64 fo = sc3(2, (i64)(u64)"/tmp/a42a_out.txt", 0x241 /*O_WRONLY|O_CREAT|O_TRUNC*/, 0644);
+    const i64 d2 = sc2(33, fo, 1);
+
+    /* ③ fork：子进程继承 fd 1 = 文件（"把某个 fd 作为 1 交给子进程"的真路径） */
+    const i64 pid = sc0(57);
+    if (pid == 0) {
+        static const char cs[] = "A42A-child-stdout-in-file\n";
+        static const char ce[] = "A42A child stderr on console (fd2 unbound)\n";
+        (void)sc3(1, 1, (i64)(u64)cs, (i64)(sizeof(cs) - 1u));   /* -> 文件（fd 1 已被 dup2） */
+        (void)sc3(1, 2, (i64)(u64)ce, (i64)(sizeof(ce) - 1u));   /* -> 控制台（fd 2 空槽 = 老语义） */
+        (void)sc1(60, 0);
+        for (;;) {}
+    }
+    const i64 w4 = sc3(61, pid, (i64)(u64)&g_status, 0);         /* wait4(pid, &status, 0) */
+
+    /* ④ 用最小控制台 tty 对象把 stdout 换回来：open("/dev/console") + dup2 -> 之后输出回串口/屏幕 */
+    const i64 tty = sc3(2, (i64)(u64)"/dev/console", 2 /*O_RDWR*/, 0);
+    const i64 d2t = sc2(33, tty, 1);
+
+    ev("execve_nope", ex);
+    ev("dup2_file_to_1", d2);
+    ev("fork_pid", pid);
+    ev("wait4", w4);
+    ev("wait_status", g_status);
+    ev("tty_fd", tty);
+    ev("dup2_tty_to_1", d2t);
+    ev("ioctl_tiocgwinsz_on_tty1", sc3(16, 1, 0x5413 /*TIOCGWINSZ*/, (i64)(u64)g_cwd));
+    ev("ioctl_tcgets_on_tty1", sc3(16, 1, 0x5401 /*TCGETS*/, (i64)(u64)g_cwd));
+
+    /* ⑤ chdir / getcwd（含相对路径 ".."：/tmp -> /） */
+    ev("chdir_tmp", sc1(80, (i64)(u64)"/tmp"));
+    (void)sc2(79, (i64)(u64)g_cwd, (i64)sizeof(g_cwd));
+    out_str("A42A getcwd_in_tmp="); out_str(g_cwd); out_str("\n");
+    ev("chdir_missing", sc1(80, (i64)(u64)"/a42a_nope"));
+    ev("chdir_file", sc1(80, (i64)(u64)"/bin/shell.bin"));
+    ev("chdir_rel_dotdot", sc1(80, (i64)(u64)".."));
+    (void)sc2(79, (i64)(u64)g_cwd, (i64)sizeof(g_cwd));
+    out_str("A42A getcwd_root="); out_str(g_cwd); out_str("\n");
+    ev("getcwd_small_buf", sc2(79, (i64)(u64)g_cwd, 1));   /* 缓冲 1 字节 = 装不下 "/" + NUL -> ERANGE */
+
+    /* ⑥ 相对路径的 open/stat（按 cwd 解析）：回到 /tmp 再建文件 */
+    (void)sc1(80, (i64)(u64)"/tmp");
+    ev("open_rel", sc3(2, (i64)(u64)"a42a_rel.txt", 0x241, 0644));
+    ev("stat_rel", sc2(4, (i64)(u64)"a42a_rel.txt", (i64)(u64)g_cwd));
+
+    /* ⑦ rename：同目录成功 / 源缺失 / 目标已存在 / 跨目录（如实 -ENOSYS） */
+    (void)sc2(82, (i64)(u64)"a42a_rel.txt", (i64)(u64)"a42a_rel2.txt");
+    ev("rename_rel_ok", sc2(82, (i64)(u64)"a42a_rel2.txt", (i64)(u64)"a42a_abs.txt"));
+    ev("rename_missing", sc2(82, (i64)(u64)"/tmp/a42a_no.txt", (i64)(u64)"/tmp/a42a_x.txt"));
+    ev("rename_exists", sc2(82, (i64)(u64)"/tmp/a42a_abs.txt", (i64)(u64)"/tmp/a42a_out.txt"));
+    ev("rename_cross_dir", sc2(82, (i64)(u64)"/tmp/a42a_abs.txt", (i64)(u64)"/a42a_moved.txt"));
+
+    /* ⑧ rmdir：成功 / 缺失 / 非空 / 目标是文件 / 根目录 */
+    ev("mkdir_d", sc1(83, (i64)(u64)"/tmp/a42a_d"));
+    ev("rmdir_ok", sc1(84, (i64)(u64)"/tmp/a42a_d"));
+    ev("rmdir_missing", sc1(84, (i64)(u64)"/tmp/a42a_nodir"));
+    ev("rmdir_root", sc1(84, (i64)(u64)"/"));
+    ev("mkdir_ne", sc1(83, (i64)(u64)"/tmp/a42a_ne"));
+    ev("mkdir_ne_sub", sc1(83, (i64)(u64)"/tmp/a42a_ne/sub"));
+    ev("rmdir_nonempty", sc1(84, (i64)(u64)"/tmp/a42a_ne"));
+    ev("rmdir_ne_sub", sc1(84, (i64)(u64)"/tmp/a42a_ne/sub"));
+    ev("rmdir_ne_again", sc1(84, (i64)(u64)"/tmp/a42a_ne"));
+    ev("rmdir_file", sc1(84, (i64)(u64)"/tmp/a42a_abs.txt"));
+
+    /* ⑨ utime：NULL = 幂等成功；缺路径 = -ENOENT；显式时间 = -ENOSYS（如实） */
+    ev("utime_null", sc2(132, (i64)(u64)"/tmp/a42a_abs.txt", 0));
+    ev("utime_missing", sc2(132, (i64)(u64)"/tmp/a42a_nofile.txt", 0));
+    ev("utime_explicit", sc2(132, (i64)(u64)"/tmp/a42a_abs.txt", (i64)(u64)g_tm));
+
+    /* ⑩ dup2 / close 的失败路径（错误码必须准确） */
+    ev("dup2_bad_old", sc2(33, 99, 1));
+    ev("dup2_bad_new", sc2(33, tty, 40));
+    ev("dup2_same", sc2(33, 1, 1));
+    ev("close_stdin_unbound", sc1(3, 0));
+    ev("close_tty1", sc1(3, 1));
+    ev("write1_after_close", sc3(1, 1, (i64)(u64)"A42A back on console after close(1)\n", 34));
+    out_str("A42A done=0\n");
+    (void)sc1(60, 0);
+    for (;;) {}
+}
+A42A_CEOF
+clang --target=x86_64-unknown-none-elf -nostdinc -ffreestanding -nostdlib -fno-builtin \
+  -fno-stack-protector -fno-pic -fno-pie -fno-zero-initialized-in-bss -mcmodel=large -mno-red-zone \
+  -mno-sse -mno-sse2 -mno-mmx -mno-avx -fno-asynchronous-unwind-tables -fno-unwind-tables \
+  -ffunction-sections -fdata-sections -std=c11 -O2 -Wall -Wextra \
+  -c "$BUILD/a42a_sys.c" -o "$BUILD/a42a_sys.o"
+$LD -m elf_x86_64 -T user/lib/user64.ld --gc-sections -o "$BUILD/a42a_sys.elf" "$BUILD/a42a_sys.o"
+A42A_SZ=$(stat -c%s "$BUILD/a42a_sys.elf")
+if [ "$A42A_SZ" -gt 65536 ]; then
+    echo "ERROR: a42a_sys.elf $A42A_SZ B 超过 64KiB（用户窗口装载区上限）" >&2
+    exit 1
+fi
+echo "    $BUILD/a42a_sys.elf = $A42A_SZ B（syscall 指令 + Linux 号段；由 tests/a42a64_test.py 装进夹具卷 /bin/a42a_sys.elf）"
 
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
 "$PY" - "$BUILD/payload_hdr.bin" "$SYS_SECTORS" "$((PAYLOAD_LBA + 1))" <<'PYEOF'

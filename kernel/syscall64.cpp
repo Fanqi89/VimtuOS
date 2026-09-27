@@ -147,6 +147,9 @@ int  proc64_alarm_set64(int)                              __attribute__((weak));
 // ★ P4：每进程凭证（proc64.cpp；安装内核不链它 -> weak 为 0 -> 退化为会话身份/EPERM）
 int  proc64_get_cred64(uint32_t*, uint32_t*, uint32_t*, uint32_t*)    __attribute__((weak));
 int  proc64_set_cred64(uint32_t, uint32_t, uint32_t, uint32_t)        __attribute__((weak));
+// ★ A4-2a：每进程 cwd（proc64.cpp；安装内核不链它 -> weak 为 0 -> getcwd 退回 "/"、chdir 返回 -ENOSYS）
+int  proc64_cwd64(char*, uint32_t)                        __attribute__((weak));
+int  proc64_chdir64(const char*)                          __attribute__((weak));
 static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
 #include "mem_64.h"         // PAGE_SIZE_64 / page_free_64 / PTE_*
 #include "debug64.h"
@@ -171,6 +174,11 @@ static const int64_t  LX64_ENOMEM = 12;
 static const int64_t  LX64_EACCES = 13;
 static const int64_t  LX64_EFAULT = 14;
 static const int64_t  LX64_EBUSY  = 16;
+// ★ A4-2a：新系统调用（chdir/rename/rmdir/utime）要用的错误码
+static const int64_t  LX64_EEXIST = 17;
+static const int64_t  LX64_ENOTDIR = 20;
+static const int64_t  LX64_EISDIR = 21;
+static const int64_t  LX64_ERANGE = 34;
 static const int64_t  LX64_EINVAL = 22;
 static const int64_t  LX64_EMFILE = 24;
 static const int64_t  LX64_ENOTTY = 25;
@@ -181,7 +189,8 @@ static const int64_t  LX64_ENOTEMPTY = 39;
 // 这些 errno 目前没有调用点，但它们是**对外承诺的错误码表**（文档/测试按这个口径读）；
 // 这里用 static_assert 钉住取值 —— 顺带消掉 -Wextra 的"未被引用"告警（本文件要求零告警）。
 static_assert(LX64_ESRCH == 3 && LX64_ECHILD == 10 && LX64_EAGAIN == 11 && LX64_EMFILE == 24 &&
-              LX64_ESPIPE == 29 && LX64_ENOTEMPTY == 39, "LX64_* 错误码表（= -errno）");
+              LX64_ESPIPE == 29 && LX64_ENOTEMPTY == 39 && LX64_EEXIST == 17 && LX64_ENOTDIR == 20 &&
+              LX64_EISDIR == 21 && LX64_ERANGE == 34, "LX64_* 错误码表（= -errno）");
 
 // 批次 C：有"当前进程"（且隔离模式开着）时，brk/mmap/mprotect/munmap 走每进程实现；
 // 否则退回原来的共享窗口实现（UEFI/固件页表 -> 共享地址空间模式，行为与批次 B 完全一致）。
@@ -502,15 +511,50 @@ static int lx64_user_str64(uint64_t uva, char* out, uint32_t cap) {
 //   * open/read/close/lseek/fstat/dup/fsync 全部转调 fd64_*；
 //   * 终端文件命令与 ring3 系统调用因此看到**同一张表**（如实边界见 fd64.h）；
 //   * 读不到 offset 原语的限制由 fd64 内部处理（它读整文件到自己的缓冲再切片）。
-static const uint32_t LX64_PATH_MAX = 32;       // VFS64_NAME_MAX(27) + "/" + NUL
+static const uint32_t LX64_PATH_MAX = 32;       // 老限制（单层路径）：保留给 readlink 等旧调用点
+// ★ A4-2a：路径解析缓冲 —— 相对路径要拼上 cwd，最长 = VFS64_PATH_MAX(128)。
+static const uint32_t LX64_PATHR_MAX = 128;
 static const uint32_t LX64_READ_MAX = 4096;     // 单次 read 上限（fd64 内部读整文件，这里只限制拷贝量）
+// 为什么放在系统调用层：VFS 层没有"当前目录"（见 vfs64.h），POSIX 的 cwd 是**进程属性**
+// （kernel/proc64.cpp 的 Proc64::cwd）。这里只做"拼前缀"；'.' / '..' / 多级路径交给 vfs64 解析。
+// 返回 0 = out 已填（绝对路径）；-LX64_EFAULT = 用户指针读不了；-LX64_EINVAL = 太长/非法。
+static int lx64_resolve_path64(uint64_t path_va, char* out, uint32_t cap) {
+    if (lx64_user_str64(path_va, out, cap) != 0) return -LX64_EFAULT;
+    if (out[0] == '/') return 0;                             // 已经是绝对路径
+    char cwd[PROC64_CWD_MAX];
+    int have = 0;
+    if (lx64_have_proc64() && proc64_cwd64) have = proc64_cwd64(cwd, (uint32_t)sizeof(cwd));
+    if (!have || cwd[0] != '/') { cwd[0] = '/'; cwd[1] = 0; }   // 没有进程上下文 = 根
+    char buf[LX64_PATHR_MAX];
+    uint32_t n = 0;
+    for (uint32_t i = 0; cwd[i] && n + 2u < (uint32_t)sizeof(buf); i++) buf[n++] = cwd[i];
+    if (n == 0 || buf[n - 1] != '/') buf[n++] = '/';
+    for (uint32_t i = 0; out[i] && n + 1u < (uint32_t)sizeof(buf); i++) buf[n++] = out[i];
+    buf[n] = 0;
+    if (n == 0 || n + 1u > cap) return -LX64_EINVAL;
+    for (uint32_t i = 0; i <= n; i++) out[i] = buf[i];
+    return 0;
+}
 // ring3 read 的内核 bounce（syscall 路径全程 IF=0：单 CPU 上不会被别的任务穿插）
 static uint8_t g_lx_readbuf64[LX64_READ_MAX];
-// ---- 0）read ----（fd >= 3 走 fd64；stdin 没有输入流 -> 立刻 EOF，如实）
+// ★ A4-2a：控制台输出 = 串口（总是）+ 屏幕（fd 1 才画；fd 2 = 只串口，与旧行为一致）。
+//   fd64 的"控制台 tty"对象通过下面的 extern "C" 钩子复用同一份实现（弱符号，见 fd64.cpp）。
+static void lx64_console_out64(const char* p, uint64_t len, bool screen) {
+    for (uint64_t i = 0; i < len; i++) dbg64_putc(p[i]);
+    if (screen) syscall64_screen_puts64(p, len);
+}
+extern "C" void syscall64_console_write64(const char* buf, int len) {
+    if (buf && len > 0) lx64_console_out64(buf, (uint64_t)len, true);
+}
+// ---- 0）read ----（★ A4-2a：fd 0..2 的槽**空** = 虚拟标准流（stdin 立刻 EOF）；
+//   槽被 dup2 绑了对象（文件 / pipe / tty）-> 与 fd >= 3 完全同一条 FD 层路径）----
 static int64_t lx64_read64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_t len) {
     if (len == 0) return 0;
-    if (fd == 0) return 0;                                  // stdin：没有输入流 -> 立刻 EOF（如实）
-    if (fd < 3) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (fd <= 2 && !fd64_slot_used64((int)fd)) {
+        if (fd == 0) return 0;                              // stdin：没有输入流 -> 立刻 EOF（如实）
+        syscall64_deny64(nr, fd); return -LX64_EBADF;        // 1/2 空槽不可读
+    }
     if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
     if (len > LX64_READ_MAX) len = LX64_READ_MAX;
     const int n = fd64_read64((int)fd, g_lx_readbuf64, (int)len);
@@ -519,18 +563,18 @@ static int64_t lx64_read64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_t len)
     return (int64_t)n;
 }
 
-// ---- 1）write ----（fd 1/2 = 串口/屏幕；fd >= 3 = 真文件，走 fd64）
+// ---- 1）write ----（★ A4-2a：fd 1/2 的槽空 = 内核控制台（串口+屏幕 / 只串口）；
+//   槽被 dup2 绑了对象 -> FD 层（文件/pipe/tty），这正是"外部命令 > 文件"的落地方式）----
 static int64_t lx64_write64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_t len) {
-    if (fd == 1 || fd == 2) {
+    if (fd <= 2 && !fd64_slot_used64((int)fd)) {
+        if (fd == 0) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
         if (len == 0) return 0;
         if (len > LX64_WRITE_MAX) { syscall64_deny64(nr, len); return -LX64_EINVAL; }
         if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
-        const char* p = (const char*)(uintptr_t)buf;
-        for (uint64_t i = 0; i < len; i++) dbg64_putc(p[i]);
-        if (fd == 1) syscall64_screen_puts64(p, len);
+        lx64_console_out64((const char*)(uintptr_t)buf, len, fd == 1);
         return (int64_t)len;
     }
-    if (fd < 3) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     if (len == 0) return 0;
     if (len > LX64_WRITE_MAX) { syscall64_deny64(nr, len); return -LX64_EINVAL; }
     if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
@@ -541,16 +585,20 @@ static int64_t lx64_write64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_t len
 
 
 // ---- 2 / 257）open / openat ----（走 fd64；flags 按 Linux 子集原样映射，dirfd 仍然忽略）
+// ★ A4-2a：接受**相对路径**（按当前进程的 cwd 拼成绝对路径；cwd 默认 "/"）。
 static int64_t lx64_open64(uint64_t nr, uint64_t path_va, uint64_t flags) {
-    char path[LX64_PATH_MAX];
-    if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(nr, path_va); return -LX64_EFAULT; }
-    if (path[0] != '/') { syscall64_deny64(nr, path_va); return -LX64_EINVAL; }   // 阶段一只支持单层绝对路径
+    char path[LX64_PATHR_MAX];
+    const int rr = lx64_resolve_path64(path_va, path, (uint32_t)sizeof(path));
+    if (rr != 0) { syscall64_deny64(nr, path_va); return rr; }
     const int fd = fd64_open64(path, (uint32_t)flags);
-    return (fd < 0) ? (int64_t)fd : (int64_t)fd;             // fd64 的负错误码 = -errno（同一口径）
+    return (int64_t)fd;                                      // fd64 的负错误码 = -errno（同一口径）
 }
 
-// ---- 3）close ----（标准流没有内核对象：与旧行为一致 -> -EBADF）
+// ---- 3）close ----（★ A4-2a：fd 0..2 的槽**空** = 虚拟标准流（没有对象可关 -> -EBADF）；
+//   槽被 dup2 绑了对象 -> 真的 close（Linux 也允许关 0/1/2），关掉后该 fd 回到控制台语义）----
 static int64_t lx64_close64(uint64_t nr, uint64_t fd) {
+    if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (fd <= 2 && !fd64_slot_used64((int)fd)) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     const int r = fd64_close64((int)fd);
     if (r != 0) { syscall64_deny64(nr, fd); return r; }
     return 0;
@@ -578,8 +626,10 @@ static void lx64_fill_stat64(uint8_t* st, uint32_t mode, uint64_t size) {
 static int64_t lx64_fstat64(uint64_t nr, uint64_t fd, uint64_t st_va) {
     if (!user64_range_ok64(st_va, 144)) { syscall64_deny64(nr, st_va); return -LX64_EFAULT; }
     uint8_t st[144];
-    if (fd <= 2) {
-        lx64_fill_stat64(st, LX64_S_IFCHR | 0666u, 0);      // 标准流：最小三字段（mode/nlink/size）
+    if (fd <= 2 && !fd64_slot_used64((int)fd)) {
+        lx64_fill_stat64(st, LX64_S_IFCHR | 0666u, 0);      // 空槽标准流：字符设备（最小三字段）
+    } else if (fd64_slot_is_tty64((int)fd)) {
+        lx64_fill_stat64(st, LX64_S_IFCHR | 0620u, 0);      // ★ A4-2a：控制台 tty = 字符设备
     } else {
         int fvol = -1;
         char fpath[FD64_PATH_MAX];
@@ -686,24 +736,54 @@ static int64_t lx64_brk64(uint64_t addr) {
     return (int64_t)addr;
 }
 
-// ---- 16）ioctl（最小但真：TIOCGWINSZ 写回 25x80）----
+// ---- 16）ioctl（★ A4-2a：最小控制台 tty —— TIOCGWINSZ / TCGETS / TCSETS*）----
+// 语义表（对"虚拟控制台"（fd 0..2 空槽）与"/dev/console" tty 对象都一样）：
+//   TIOCGWINSZ(0x5413)  -> 25x80 像素 640x200（8x8 字体网格），写回 8B struct winsize
+//   TIOCSWINSZ(0x5414)  -> 0（接受但忽略：我们改不了分辨率；**不假装改了**）
+//   TCGETS(0x5401)      -> 写回 36B struct termios（ICANON|ECHO|ISIG|CS8|38400 + 默认控制字符）
+//   TCSETS/TCSETSW/TCSETSF(0x5402/03/04) -> 校验用户指针后返回 0（接受但忽略：没有真行规程）
+//   普通文件/pipe        -> -ENOTTY（与 Linux 一致）
 struct LxWinsize64 { uint16_t row, col, xpixel, ypixel; };
-static int64_t lx64_ioctl64(uint64_t nr, uint64_t fd, uint64_t req, uint64_t arg) {
-    if (fd > 2) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+static int64_t lx64_tty_ioctl64(uint64_t nr, uint64_t req, uint64_t arg) {
     if (req == 0x5413u) {                                          // TIOCGWINSZ
         if (!user64_range_ok64(arg, sizeof(LxWinsize64))) { syscall64_deny64(nr, arg); return -LX64_EFAULT; }
-        LxWinsize64 ws;
+        LxWinsize64 ws{};
         ws.row = 25; ws.col = 80; ws.xpixel = 640; ws.ypixel = 200;  // 终端是 8x8 字体字符网格
         lx64_copy_to_user64(arg, &ws, sizeof(ws));
         return 0;
     }
     if (req == 0x5414u) return 0;                                  // TIOCSWINSZ：忽略（我们改不了分辨率）
-    return -LX64_ENOTTY;                                           // 其它请求：与 Linux 对非 tty 一致
+    if (req == 0x5401u) {                                          // TCGETS：struct termios = 36 B
+        if (!user64_range_ok64(arg, 36)) { syscall64_deny64(nr, arg); return -LX64_EFAULT; }
+        uint8_t t[36];
+        for (uint32_t i = 0; i < 36; i++) t[i] = 0;
+        lx64_wr32(t + 0, 0x500u);                                  // c_iflag = ICRNL|IXON
+        lx64_wr32(t + 4, 0x5u);                                    // c_oflag = OPOST|ONLCR
+        lx64_wr32(t + 8, 0xBFu);                                   // c_cflag = CS8|CREAD|B38400
+        lx64_wr32(t + 12, 0xBu);                                   // c_lflag = ISIG|ICANON|ECHO
+        t[17] = 3; t[18] = 28; t[19] = 127; t[20] = 21; t[21] = 4; t[22] = 0; t[23] = 1;  // c_cc[VINTR..VMIN]
+        lx64_copy_to_user64(arg, t, 36);
+        return 0;
+    }
+    if (req == 0x5402u || req == 0x5403u || req == 0x5404u) {       // TCSETS*：接受但忽略
+        if (!user64_range_ok64(arg, 36)) { syscall64_deny64(nr, arg); return -LX64_EFAULT; }
+        return 0;
+    }
+    return -LX64_ENOTTY;                                           // 其它请求：与 Linux 对 tty 的口径一致
+}
+static int64_t lx64_ioctl64(uint64_t nr, uint64_t fd, uint64_t req, uint64_t arg) {
+    // ★ A4-2a：fd 0..2 空槽 = 虚拟控制台（老语义，行为不变）；绑了 tty 对象 = 同一套请求；
+    //   绑了文件/pipe（fd 3+ 亦然）-> -ENOTTY。
+    if (fd <= 2 && !fd64_slot_used64((int)fd)) return lx64_tty_ioctl64(nr, req, arg);
+    if (fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (fd64_slot_is_tty64((int)fd)) return lx64_tty_ioctl64(nr, req, arg);
+    return -LX64_ENOTTY;
 }
 
-// ---- 20）writev ----
+// ---- 20）writev ----（★ A4-2a：fd 1/2 的槽空 = 控制台；绑了对象 -> 与 write 同一分派）
 static int64_t lx64_writev64(uint64_t nr, uint64_t fd, uint64_t iov_va, uint64_t iovcnt) {
-    if (fd != 1 && fd != 2) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (fd == 0) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     if (iovcnt == 0) return 0;
     if (iovcnt > 8) { syscall64_deny64(nr, iovcnt); return -LX64_EINVAL; }
     if (!user64_range_ok64(iov_va, iovcnt * 16)) { syscall64_deny64(nr, iov_va); return -LX64_EFAULT; }
@@ -735,14 +815,17 @@ static int64_t lx64_uname64(uint64_t nr, uint64_t buf) {
     return 0;
 }
 
-// ---- 79）getcwd：把 "/" 写进用户 buf，返回 buf 指针（Linux 语义）----
+// ---- 79）getcwd：把**当前进程的 cwd**写进用户 buf，返回 buf 指针（Linux 语义）----
+// ★ A4-2a：cwd 现在由 chdir(80) 真改变（每进程一份，fork 继承）；没有进程上下文时 = "/"。
 static int64_t lx64_getcwd64(uint64_t nr, uint64_t buf, uint64_t size) {
-    if (size < 2) return -LX64_EINVAL;
-    const uint64_t n = (size < 64) ? size : 64;
-    if (!user64_range_ok64(buf, n)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
-    uint8_t* d = (uint8_t*)(uintptr_t)buf;
-    d[0] = '/';
-    d[1] = 0;
+    char cwd[PROC64_CWD_MAX];
+    const int have = (lx64_have_proc64() && proc64_cwd64) ? proc64_cwd64(cwd, (uint32_t)sizeof(cwd)) : 0;
+    if (!have) { cwd[0] = '/'; cwd[1] = 0; }
+    uint32_t n = 0;
+    while (cwd[n]) n++;
+    if (size < (uint64_t)n + 1u) return -LX64_ERANGE;            // Linux：缓冲太小 = ERANGE
+    if (!user64_range_ok64(buf, (uint64_t)n + 1u)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
+    lx64_copy_to_user64(buf, cwd, (uint64_t)n + 1u);
     return (int64_t)buf;
 }
 
@@ -896,9 +979,11 @@ static int64_t lx64_rt_sigprocmask64(uint64_t how, uint64_t set_va, uint64_t old
 
 // ---- 4/6）stat / lstat：按路径（走 fs64 的统一分派；不区分符号链接 —— 本文件系统没有）----
 // ★ P4：st_uid/st_gid/st_mode 现在给**真实值**（之前恒 0/0755/0444）；缺 x 进不去 -> -EACCES。
+// ★ A4-2a：接受相对路径（按当前进程的 cwd 拼成绝对路径）。
 static int64_t lx64_stat_path64(uint64_t nr, uint64_t path_va, uint64_t st_va) {
-    char path[LX64_PATH_MAX];
-    if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(nr, path_va); return -LX64_EFAULT; }
+    char path[LX64_PATHR_MAX];
+    const int rr = lx64_resolve_path64(path_va, path, (uint32_t)sizeof(path));
+    if (rr != 0) { syscall64_deny64(nr, path_va); return rr; }
     if (!user64_range_ok64(st_va, 144)) { syscall64_deny64(nr, st_va); return -LX64_EFAULT; }
     Fs64Stat64 si;
     const int rc = fs64_stat64(-1, path, &si);
@@ -911,9 +996,11 @@ static int64_t lx64_stat_path64(uint64_t nr, uint64_t path_va, uint64_t st_va) {
     return 0;
 }
 // ---- 21）access：真按 r/w/x 判定（★ P4；FAT/旧卷没有权限模型 -> 恒允许）----
+// ★ A4-2a：接受相对路径。
 static int64_t lx64_access64(uint64_t nr, uint64_t path_va, uint64_t mode) {
-    char path[LX64_PATH_MAX];
-    if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(nr, path_va); return -LX64_EFAULT; }
+    char path[LX64_PATHR_MAX];
+    const int rr = lx64_resolve_path64(path_va, path, (uint32_t)sizeof(path));
+    if (rr != 0) { syscall64_deny64(nr, path_va); return rr; }
     const int rc = fs64_access64(-1, path, (uint32_t)mode & 7u);
     if (rc == 0) return 0;
     if (rc == -13) return -LX64_EACCES;
@@ -1028,9 +1115,9 @@ static int64_t lx64_readlink64(uint64_t nr, uint64_t path_va, uint64_t buf_va, u
 // 把"VFS 变更"变成单飞行者（另一个进程同时来会拿到 -EBUSY，而不是交错写坏卷）。
 static volatile int g_lx_vfs_busy64 = 0;
 static int64_t lx64_fs_mutate64(uint64_t nr, uint64_t path_va, int is_mkdir) {
-    char path[LX64_PATH_MAX];
-    if (lx64_user_str64(path_va, path, LX64_PATH_MAX) != 0) { syscall64_deny64(nr, path_va); return -LX64_EFAULT; }
-    if (path[0] != '/') return -LX64_EINVAL;
+    char path[LX64_PATHR_MAX];
+    const int rr = lx64_resolve_path64(path_va, path, (uint32_t)sizeof(path));   // ★ A4-2a：相对路径
+    if (rr != 0) { syscall64_deny64(nr, path_va); return rr; }
     if (g_lx_vfs_busy64) return -LX64_EBUSY;
     g_lx_vfs_busy64 = 1;
     __asm__ volatile("sti" ::: "memory");
@@ -1038,6 +1125,139 @@ static int64_t lx64_fs_mutate64(uint64_t nr, uint64_t path_va, int is_mkdir) {
     __asm__ volatile("cli" ::: "memory");
     g_lx_vfs_busy64 = 0;
     return rc == 0 ? 0 : -LX64_ENOENT;
+}
+
+// ==================== ★ A4-2a：工具链必需的新系统调用 ====================
+// 80）chdir / 82）rename / 84）rmdir / 132）utime —— 语义与错误码逐条写在 docs/应用层与系统调用说明.md
+// 的"A4-2a"一节；这里只放实现要点：
+//   * chdir：每进程 cwd（proc64 里那份），相对路径由 lx64_resolve_path64 拼绝对路径；
+//   * rename：vfs64 只支持**同目录改名**（new_name 是单段名字）-> 跨目录如实 -ENOSYS（不假装做了）；
+//   * rmdir：非空目录先自己判断（-ENOTEMPTY），文件 -ENOTDIR，不存在 -ENOENT（Linux 口径）；
+//   * utime：路径必须存在（-ENOENT），times == NULL 是幂等成功；**显式时间 -> -ENOSYS**
+//     （vfs64 没有"设置 inode mtime"的原语，如实拒绝而不是假装设成 1970）。
+// VFS 变更单飞行者（与 mkdir/unlink 同一套：见上面 g_lx_vfs_busy64 的注释）。
+
+// 取"父目录"（写进 out）与"最后一段名字"（返回指向 path 内部的指针；没有 '/' 返回 nullptr）
+static const char* lx64_split_path64(const char* path, char* out, uint32_t cap) {
+    int last = -1;
+    for (int i = 0; path[i]; i++) if (path[i] == '/') last = i;
+    if (last < 0) return nullptr;
+    const char* base = path + last + 1;
+    int n = 0;
+    if (last == 0) { out[0] = '/'; out[1] = 0; return base; }     // 根下的名字
+    for (int i = 0; i < last && n + 1 < (int)cap; i++) out[n++] = path[i];
+    out[n] = 0;
+    return base;
+}
+
+// ---- 80）chdir ----
+static int64_t lx64_chdir64(uint64_t nr, uint64_t path_va) {
+    char path[LX64_PATHR_MAX];
+    const int rr = lx64_resolve_path64(path_va, path, (uint32_t)sizeof(path));
+    if (rr != 0) { syscall64_deny64(nr, path_va); return rr; }
+    if (!proc64_chdir64) return -LX64_ENOSYS;                // 安装内核不链 proc64：如实 -ENOSYS
+    const int rc = proc64_chdir64(path);
+    if (rc == 0) return 0;
+    if (rc == -2)  return -LX64_ENOENT;                      // 不存在
+    if (rc == -20) return -LX64_ENOTDIR;                     // 不是目录
+    return -LX64_ENOSYS;                                     // 没有进程上下文（终端/内核线程）
+}
+
+// ---- 82）rename ----
+static int64_t lx64_rename64(uint64_t nr, uint64_t old_va, uint64_t new_va) {
+    char oldp[LX64_PATHR_MAX], newp[LX64_PATHR_MAX];
+    int rr = lx64_resolve_path64(old_va, oldp, (uint32_t)sizeof(oldp));
+    if (rr != 0) { syscall64_deny64(nr, old_va); return rr; }
+    rr = lx64_resolve_path64(new_va, newp, (uint32_t)sizeof(newp));
+    if (rr != 0) { syscall64_deny64(nr, new_va); return rr; }
+    char odir[LX64_PATHR_MAX], ndir[LX64_PATHR_MAX];
+    const char* obase = lx64_split_path64(oldp, odir, (uint32_t)sizeof(odir));
+    const char* nbase = lx64_split_path64(newp, ndir, (uint32_t)sizeof(ndir));
+    if (!obase || !nbase || !obase[0] || !nbase[0]) return -LX64_EINVAL;
+    // 源必须存在（Linux：源缺失 = ENOENT）；vfs64 的 rename 也会判，这里先给出准确 errno
+    Fs64Stat64 src_st;
+    if (fs64_stat64(-1, oldp, &src_st) != 0) return -LX64_ENOENT;
+    // 同一父目录？比较字符串（不等 = 跨目录移动：vfs64 只有"同目录改名"）
+    {
+        int same = 1;
+        for (int i = 0; odir[i] || ndir[i]; i++) { if (odir[i] != ndir[i]) { same = 0; break; } }
+        if (!same) {
+            dbg64_line_begin64();
+            dbg64_str("[SYSCALL] rename cross-dir UNSUPPORTED old=");
+            dbg64_str(oldp);
+            dbg64_str(" new=");
+            dbg64_str(newp);
+            dbg64_str(" -> -ENOSYS (vfs64 rename is same-dir only)");
+            dbg64_nl();
+            dbg64_line_end64();
+            return -LX64_ENOSYS;                              // 跨目录移动：vfs64 没有这个原语，如实拒绝
+        }
+    }
+    // 目标已存在：vfs64 不会覆盖（Linux 会覆盖）—— 如实返回 -EEXIST，绝不假装成功
+    {
+        Fs64Stat64 dst_st;
+        int same_name = 1;
+        for (int i = 0; oldp[i] || newp[i]; i++) { if (oldp[i] != newp[i]) { same_name = 0; break; } }
+        if (!same_name && fs64_stat64(-1, newp, &dst_st) == 0) return -LX64_EEXIST;
+    }
+    if (g_lx_vfs_busy64) return -LX64_EBUSY;
+    g_lx_vfs_busy64 = 1;
+    __asm__ volatile("sti" ::: "memory");
+    const int rc = vfs64_rename64(oldp, nbase);
+    __asm__ volatile("cli" ::: "memory");
+    g_lx_vfs_busy64 = 0;
+    if (rc == 0) return 0;
+    return -LX64_ENOENT;                                     // 源不存在 / 名字非法 / 重名
+}
+
+// ---- 84）rmdir ----
+static int64_t lx64_rmdir64(uint64_t nr, uint64_t path_va) {
+    char path[LX64_PATHR_MAX];
+    const int rr = lx64_resolve_path64(path_va, path, (uint32_t)sizeof(path));
+    if (rr != 0) { syscall64_deny64(nr, path_va); return rr; }
+    if (path[0] == '/' && path[1] == 0) return -LX64_EBUSY;  // 根目录不可删（Linux：EBUSY）
+    Fs64Stat64 si;
+    if (fs64_stat64(-1, path, &si) != 0) return -LX64_ENOENT;
+    if (si.type != VFS64_TYPE_DIR) return -LX64_ENOTDIR;
+    // 非空判定：用目录句柄列一次（fd64 的缓存）；有任一条 -> -ENOTEMPTY（Linux 口径）
+    {
+        const int dfd = fd64_opendir64(path);
+        if (dfd < 0) return (dfd == -13) ? -LX64_EACCES : -LX64_ENOENT;
+        char nm[FD64_NAME_MAX];
+        uint32_t fty = 0, fsz = 0;
+        const int has = fd64_readdir64(dfd, nm, (int)sizeof(nm), &fty, &fsz);
+        (void)fd64_close64(dfd);
+        if (has != 0) return -LX64_ENOTEMPTY;
+    }
+    if (g_lx_vfs_busy64) return -LX64_EBUSY;
+    g_lx_vfs_busy64 = 1;
+    __asm__ volatile("sti" ::: "memory");
+    const int rc = vfs64_rmdir64(path);
+    __asm__ volatile("cli" ::: "memory");
+    g_lx_vfs_busy64 = 0;
+    return rc == 0 ? 0 : -LX64_ENOENT;
+}
+
+// ---- 132）utime(path, const struct utimbuf*) ----
+static int64_t lx64_utime64(uint64_t nr, uint64_t path_va, uint64_t times_va) {
+    char path[LX64_PATHR_MAX];
+    const int rr = lx64_resolve_path64(path_va, path, (uint32_t)sizeof(path));
+    if (rr != 0) { syscall64_deny64(nr, path_va); return rr; }
+    Fs64Stat64 si;
+    if (fs64_stat64(-1, path, &si) != 0) return -LX64_ENOENT;
+    if (times_va == 0) {
+        // utime(path, NULL) = "两个时间都置为现在"。本内核的文件时间由**写路径**打戳（vfs64 每次写
+        // 都更新 mtime），所以"置为现在"对刚调用它的 gzip 来说就是**当前状态**：幂等返回 0。
+        return 0;
+    }
+    if (!user64_range_ok64(times_va, 16)) { syscall64_deny64(nr, times_va); return -LX64_EFAULT; }
+    dbg64_line_begin64();
+    dbg64_str("[SYSCALL] utime nr=132 path=");
+    dbg64_str(path);
+    dbg64_str(" times=explicit -> -ENOSYS (no inode mtime setter in vfs64; honest refusal)");
+    dbg64_nl();
+    dbg64_line_end64();
+    return -LX64_ENOSYS;
 }
 
 // ---- 24）sched_yield / 35）nanosleep / 34）pause / 37）alarm ----
@@ -1134,15 +1354,18 @@ static int64_t lx64_getrandom64(uint64_t nr, uint64_t buf, uint64_t len, uint64_
 // ---- 32/33）dup / dup2 / 74）fsync：只对"真实文件/pipe fd"（>= 3）有意义，全部走 fd64 ----
 // ★ 批次 D 语义修正：dup/dup2 返回的新 fd 与旧的**指向同一个打开文件对象**（共享偏移游标、
 //   共享目录游标），引用计数 +1；这正是 Linux 的行为（旧实现是"独立游标复制"，已改对）。
-//   目标 fd <= 2（重定向标准流）仍然 -ENOSYS：标准流是 syscall64 自己认的虚拟流，没有对象。
-// 33）dup2 与 32）dup 共用下面这一条路径（newfd >= 3 = 指定槽位，newfd < 0 = 自动分配）
+// ★ A4-2a：目标 fd 0..31 全部支持 —— **含 0/1/2**（这就是"把 fd 换成标准流"的关键动作：
+//   外部用户程序重定向自己的 stdout/stderr、把某个 fd 作为 0/1/2 传给子进程都靠它）。
+//   newfd == oldfd：Linux 语义 = 不动、直接返回（但 oldfd 必须有效）。
+// 32）dup 与 33）dup2 共用下面这一条路径（newfd >= 0 = 指定槽位，newfd < 0 = 自动分配）
 static int64_t lx64_dup64(uint64_t fd) {
-    const int nf = fd64_dup64((int)fd, -1);              // -1 = 自动分配新槽
+    const int nf = fd64_dup64((int)fd, -1);              // -1 = 自动分配新槽（>= 3）
     return (int64_t)nf;
 }
 static int64_t lx64_dup2_64(uint64_t oldfd, uint64_t newfd) {
-    if (newfd <= 2) return -LX64_ENOSYS;                 // 重定向 stdin/stdout/stderr 需要真设备层：如实 -ENOSYS
-    const int nf = fd64_dup64((int)oldfd, (int)newfd);
+    if (newfd >= (uint64_t)FD64_MAX) return -LX64_EBADF;
+    if (oldfd == newfd) return fd64_slot_used64((int)oldfd) ? (int64_t)newfd : -LX64_EBADF;
+    const int nf = fd64_dup64((int)oldfd, (int)newfd);   // 0..31（含换标准流）；负错误码原样上报
     return (int64_t)nf;
 }
 static int64_t lx64_fsync64(uint64_t fd) {
@@ -1255,11 +1478,13 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 62:  return lx64_kill_wrap64(a1, a2);
     case 63:  return lx64_uname64(nr, a1);
     case 74:  return lx64_fsync64(a1);
-    case 79:  return lx64_getcwd64(nr, a1, a2);
-    case 82:  break;                                                // rename：vfs64 没有 rename -> -ENOSYS
+    case 79:  return lx64_getcwd64(nr, a1, a2);                       // 真：当前进程 cwd（★ A4-2a）
+    case 80:  return lx64_chdir64(nr, a1);                           // ★ A4-2a：chdir(80)
+    case 82:  return lx64_rename64(nr, a1, a2);                      // ★ A4-2a：rename(82)（同目录）
     case 83:  return lx64_fs_mutate64(nr, a1, 1);                    // mkdir：真写盘
-    case 84:  break;                                                // rmdir：vfs64 没有删目录 -> -ENOSYS
-    case 87:  return lx64_fs_mutate64(nr, a1, 0);                    // unlink：真写盘
+    case 84:  return lx64_rmdir64(nr, a1);                           // ★ A4-2a：rmdir(84)
+    case 87:  return lx64_fs_mutate64(nr, a1, 0);                    // unlink：真写盘（★ A4-2a 误删过一次，已恢复）
+    case 132: return lx64_utime64(nr, a1, a2);                       // ★ A4-2a：utime(132)
     case 89:  return lx64_readlink64(nr, a1, a2, a3);                // 只对 /proc/self/exe 有值
     case 96:  return lx64_gettimeofday64(nr, a1, a2);
     case 97:  return lx64_getrlimit64(nr, a1, a2);

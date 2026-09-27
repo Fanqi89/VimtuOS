@@ -16,9 +16,21 @@
 #include "ata64.h"           // ata64_read（统一驱动器号）
 #include "vfs64.h"           // 可选覆盖：系统卷里的 /icons/**
 #include "drive64.h"         // 系统盘（C:）的驱动器号：优先从它读包
+#include "panic64.h"         // ★ A4-2a：把 49KB 图标包装进卷是长 I/O，要暂停 GUI 看门狗
 
 // 图标包在磁盘上的起点：内核区**尾部固定区间**（不随包大小漂移）
+// ★ A4-2a：这个区间**不再被构建脚本写入**（内核区因此从 7,488 扇区放宽到 8,000 扇区）；
+//   这里保留这条老路径只是"卷里没有包"时的**末位兜底**（正常情况下读不到 magic，会被跳过）。
 #define ICON64_PACK_LBA ((uint32_t)(ML64_KERNEL_LBA + ML64_KERNEL_SECTORS) - ICON64_PACK_MAX_SECTORS)
+// ★ A4-2a：图标包在**系统卷**里的文件（构建期内嵌进内核的字节在启动时幂等装进卷，再从卷读回来）
+// ★ A4-2a 定稿：包放在**已有的 /etc 目录**里（`/etc/iconpack.bin`）—— 为什么不是 /icons/：
+//   夹具卷/装好的卷里 /etc 一定存在（/etc/users.db、/etc/sh64hello.txt），而**新建一个根级目录**
+//   会让卷根条目数 +1，把 fs_term_test 的"rm 之后 entries 恰好 -1"和 fd64 目录缓存（16 条上限）
+//   这类既有断言顶出边界（实测：用 /icons 时卷根被顶到 16 条、被截断）。所以复用 /etc。
+#define ICON64_PACK_VFS_PATH "/etc/iconpack.bin"
+// 构建期内嵌的图标包原始字节（build64.sh：cd $BUILD && objcopy -I binary iconpack.bin iconpack_bin.o）
+extern "C" const uint8_t _binary_iconpack_bin_start[];
+extern "C" const uint8_t _binary_iconpack_bin_end[];
 
 #define ICON64_MAX_ENTRIES   256
 #define ICON64_CACHE_MAX     64
@@ -61,6 +73,8 @@ static uint32_t    g_pack_bytes = 0;
 static uint32_t    g_pack_fnv = 0;
 static int         g_pack_drive = -1;
 static uint32_t    g_pack_lba = ICON64_PACK_LBA;
+static const char* g_pack_src = "none";     // ★ A4-2a：包从哪来（"vfs" = 系统卷 / "lba" = 内核区尾部兜底）
+static int         g_pack_bad = 0;          // ★ A4-2a：坏条目数（两条来源共用同一行打点）
 static bool        g_tried = false;
 static bool        g_vfs_icons = false;     // 系统卷里存在 /icons（则 VFS 里的 PNG 优先）
 
@@ -238,10 +252,55 @@ int icons64_init64() {
         Vfs64Info64 si{};
         if (vfs64_stat64("/icons", &si) == 0) g_vfs_icons = true;
     }
-    // ---- 1) 逐盘找图标包（正常的系统盘 = C: 所在盘，退而求其次试 0/8/16/24）----
+    int tried = 0, last = -1;                  // 打点用（两条来源共用；先声明，免得 goto 跳过初始化）
+    // ---- 1) ★ A4-2a：**系统卷里的图标包**优先（这就是"图标包搬进 VimtuFS2 卷"的加载路径）----
+    // 流程：卷里 /icons/pack.bin 不在（或大小对不上）-> 用**内核内嵌的字节**幂等装进卷
+    //       -> 再从卷里读回来解析（src=vfs）。卷里没有 /icons 且没有内嵌字节 -> 走下面老路径。
+    if (vfs64_system_slot64() >= 0) {
+        const int sys = vfs64_system_slot64();
+        uint32_t pty = 0, psz = 0;
+        const int have = (vfs64_stat_on64(sys, ICON64_PACK_VFS_PATH, &pty, &psz) == 0 && pty == VFS64_TYPE_FILE);
+        if (!have) {
+            const uint32_t blen = (uint32_t)(_binary_iconpack_bin_end - _binary_iconpack_bin_start);
+            if (blen >= ICON64_HDR_BYTES && blen <= ICON64_PACK_MAX_BYTES) {
+                panic64_watchdog_pause64();              // 写 49KB 到卷：长 I/O，别让看门狗误判
+                (void)img64_install_blob64(ICON64_PACK_VFS_PATH, _binary_iconpack_bin_start, blen,
+                                           "build/iconpack.bin");
+                panic64_watchdog_unpause64();
+            }
+        }
+        uint32_t ty2 = 0, sz2 = 0;
+        if (vfs64_stat_on64(sys, ICON64_PACK_VFS_PATH, &ty2, &sz2) == 0 && ty2 == VFS64_TYPE_FILE &&
+            sz2 >= ICON64_HDR_BYTES && sz2 <= ICON64_PACK_MAX_BYTES) {
+            const uint32_t sectors = (sz2 + 511u) / 512u;
+            const uint32_t alloc = sectors * 512u;
+            uint8_t* vbuf = (uint8_t*)kmalloc_64(alloc);
+            if (vbuf) {
+                mem_owner_set_64(MEM_OWNER_GUI_64);
+                panic64_watchdog_pause64();
+                const int got = vfs64_read_on64(sys, ICON64_PACK_VFS_PATH, vbuf, (int)alloc);
+                panic64_watchdog_unpause64();
+                int bad = 0;
+                if (got >= ICON64_HDR_BYTES && ic_pack_ok(vbuf, (uint32_t)got) &&
+                    ic_parse_pack(vbuf, (uint32_t)got, &bad) == 0) {
+                    g_pack = vbuf;
+                    g_pack_drive = -1;                       // 卷里没有"驱动器号"概念：-1
+                    g_pack_lba = 0;                          // 卷里的包没有"LBA"概念（打点里 lba=0 = 来自卷）
+                    g_pack_src = "vfs";
+                    g_pack_bad = bad;
+                    // ★ 注意：**不**把 g_vfs_icons 置 1 —— 那个开关是"卷里有 /icons/<sub>/…png 逐文件
+                    //   覆盖"的探测开关；"包从卷里读回来"由 g_pack_src="vfs" 表达（load 打点 src=vfs）。
+                    //   置 1 会让每个图标都去 stat 一次 /icons/...（实测 30 条 not-found 噪声 + 启动期 I/O）。
+                    goto pack_ready;
+                }
+                kfree_64(vbuf);
+            }
+        }
+    }
+    // ---- 1b) 逐盘找图标包（老路径：内核区尾部 LBA；正常的系统盘 = C: 所在盘，退而求其次试 0/8/16/24）----
+    if (!g_pack) {
     int cand[5];
     int nc = ic_candidate_drives(cand, 5);
-    int tried = 0, last = -1;
     for (int i = 0; i < nc; i++) {
         const int d = cand[i];
         tried++;
@@ -275,29 +334,13 @@ int icons64_init64() {
         }
         g_pack = buf;
         g_pack_drive = d;
-        dbg64_line_begin64();
-        dbg64_str("[ICON64] init pack lba=");
-        dbg64_dec((uint64_t)g_pack_lba);
-        dbg64_str(" drive=");
-        ic_put_dec(d);
-        dbg64_str(" bytes=");
-        dbg64_dec((uint64_t)g_pack_bytes);
-        dbg64_str(" entries=");
-        dbg64_dec((uint64_t)g_n);
-        dbg64_str(" icons=");
-        dbg64_dec((uint64_t)g_kinds);
-        dbg64_str(" bad=");
-        dbg64_dec((uint64_t)bad);
-        dbg64_str(" ok=");
-        dbg64_dec(bad == 0 ? 1 : 0);
-        dbg64_str(" fnv=");
-        ic_put_hex8(g_pack_fnv);
-        dbg64_str(" vfs_icons=");
-        dbg64_dec(g_vfs_icons ? 1 : 0);
-        dbg64_nl();
-        dbg64_line_end64();
+        g_pack_src = "lba";                              // 老路径：包还在内核区尾部（正常不该发生）
+        g_pack_bad = bad;
         break;
     }
+    }                                                    // if (!g_pack)：LBA 兜底扫描结束
+    // ---- 1c) 两条来源共用同一行初始化打点（字段顺序与老格式一致，末尾追加 src=）----
+pack_ready:
     if (!g_pack) {
         dbg64_line_begin64();
         dbg64_str("[ICON64] init pack absent reason=no-magic-or-read lba=");
@@ -306,11 +349,37 @@ int icons64_init64() {
         ic_put_dec(tried);
         dbg64_str(" last-drive=");
         ic_put_dec(last);
+        dbg64_str(" vfs=");
+        ic_put_dec(vfs64_system_slot64() >= 0 ? 1 : 0);
         dbg64_str(" -> programmatic fallback stays");
         dbg64_nl();
         dbg64_line_end64();
         return 0;
     }
+    dbg64_line_begin64();
+    dbg64_str("[ICON64] init pack lba=");
+    dbg64_dec((uint64_t)g_pack_lba);
+    dbg64_str(" drive=");
+    ic_put_dec(g_pack_drive);
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)g_pack_bytes);
+    dbg64_str(" entries=");
+    dbg64_dec((uint64_t)g_n);
+    dbg64_str(" icons=");
+    dbg64_dec((uint64_t)g_kinds);
+    dbg64_str(" bad=");
+    dbg64_dec((uint64_t)g_pack_bad);
+    dbg64_str(" ok=");
+    dbg64_dec(g_pack_bad == 0 ? 1 : 0);
+    dbg64_str(" fnv=");
+    ic_put_hex8(g_pack_fnv);
+    dbg64_str(" vfs_icons=");
+    dbg64_dec(g_vfs_icons ? 1 : 0);
+    dbg64_str(" src=");
+    dbg64_str(g_pack_src);
+    if (g_pack_src[0] == 'v') { dbg64_str(" path="); dbg64_str(ICON64_PACK_VFS_PATH); }
+    dbg64_nl();
+    dbg64_line_end64();
     // ---- 2) 预解码"界面必用"的那一档：系统图标 24px（状态区 22 / 面板 20~26 / 网格 22 都由它缩小），
     //         应用图标 48px（Dock 46 / 桌面 40 由它缩小）。这样每个 kind 都有一条 [ICON64] load 证据，
     //         而且首帧绘制路径里不做解码。----
@@ -425,7 +494,8 @@ static const Img64* ic_bitmap(int kind, int want, const char** why) {
         ic_dec(sz, (int)e->size, (int)sizeof(sz));
         ic_strcat(path, sz, (int)sizeof(path));
         ic_strcat(path, ".png", (int)sizeof(path));
-        ic_log_load(kind, path, (int)e->size, "pack");
+        // ★ A4-2a：包的**来源**如实写进 src=（卷里读回来的包 -> src=vfs；内核区尾部老路径 -> src=pack）
+        ic_log_load(kind, path, (int)e->size, (g_pack_src[0] == 'v') ? "vfs" : "pack");
     }
     if (why) *why = nullptr;
     return &slot->im;
@@ -532,7 +602,6 @@ int icons64_selftest64() {
         if (!ic_cache_find(ICON64_K_ETHERNET, 24) && !ic_cache_find(ICON64_K_GLOBE, 24)) mask |= 4;
         if (icons64_handle64(ICON64_A_TERMINAL) <= 0) mask |= 8;        // bit3：核心 kind 可查到
     } else {
-        // 没有包不算失败：只要求"回落路径可用"（取不到就必须是 -1，不崩、不画半个）
         if (icons64_handle64(ICON64_K_ETHERNET) != -1) mask |= 16;
         if (icons64_draw_kind64(ICON64_K_ETHERNET, 0, 0, 24, 0xFFFFFFu, 255) != -1) mask |= 32;
     }
@@ -543,6 +612,8 @@ int icons64_selftest64() {
     dbg64_dec((uint64_t)mask);
     dbg64_str(" pack=");
     dbg64_dec(g_pack ? 1 : 0);
+    dbg64_str(" src=");
+    dbg64_str(g_pack ? g_pack_src : "none");
     dbg64_str(" kinds=");
     dbg64_dec((uint64_t)g_kinds);
     dbg64_str(" loaded=");

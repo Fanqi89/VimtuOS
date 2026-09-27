@@ -2,6 +2,9 @@
 //
 // 设计与边界见 kernel/fd64.h（先读那份；这里只记实现上的三个要点）：
 //   1) 表在池里（FD64_TABLE_MAX 张），对象在池里（FD64_OPEN_MAX 个）。fd 槽只是**指针**，
+// ★ A4-2a：**槽号 = fd 号**（0..31）。槽 0/1/2 = 标准流槽，默认空（= syscall64 的内核控制台语义）；
+//   dup2 可以把任意对象绑上去（"外部程序的 fd 0/1/2 可替换"），关掉后自动回到控制台语义。
+//   另外加了最小"控制台 tty"对象（/dev/console、/dev/tty）：write = 串口 + 屏幕，read = EOF（如实）。
 //      dup/fork 都是"复制指针 + refs++"，close 是 "refs--（归零才释放）" —— 偏移游标在对象里，
 //      所以共享语义是**结构上必然**的，不靠约定。
 //   2) 每次读/写都把整个文件过一遍内存（vfs64 没有 read-at-offset / 部分写）。写路径 = 读全文
@@ -14,6 +17,9 @@
 // ---- proc64 的弱引用：进程表（没有进程上下文 -> 返回 nullptr -> 用内核表）----
 // proc64.cpp 只在系统内核里链接（安装介质内核没有进程），所以这里必须弱引用 + 判空。
 extern "C" FdTable64* proc64_fdtab_of_current64() __attribute__((weak));
+// ★ A4-2a：控制台 tty 对象的 write 要"串口 + 屏幕"，那部分实现留在 syscall64（弱的：
+//   没有它也能编译/链接 —— 那时退回只写串口，绝不静默丢字节）。
+extern "C" void syscall64_console_write64(const char* buf, int len) __attribute__((weak));
 
 // ==================== 对象 ====================
 #define FD64_KIND_FREE 0
@@ -21,11 +27,16 @@ extern "C" FdTable64* proc64_fdtab_of_current64() __attribute__((weak));
 #define FD64_KIND_DIR  2
 #define FD64_KIND_PIPE_R 3
 #define FD64_KIND_PIPE_W 4
-
+#define FD64_KIND_TTY  5      // ★ A4-2a：最小"控制台 tty"对象（open("/dev/console") -> 它）
 // 目录句柄的**一次扫描缓存**：vfs64_ls 每次都要线性扫 inode 表（每个 inode 一次读盘），
 // 逐条 readdir 各扫一遍在真机上要数秒（会把 GUI 看门狗饿到）。所以第一次 readdir 时列一次、
-// 缓存进对象，之后 O(1)。容量 16 条：终端 ls 的演示/验收规模足够；超出部分如实截断。
-#define FD64_DIR_CACHE 16
+// 缓存进对象，之后 O(1)。
+// ★ A4-2a：容量 16 -> 24。为什么必须提：卷根的真实条目数在本批已经超过 16（A3 陆续把
+//   /hello.elf、/pipe64.elf、/musl_hello.elf、/dynhello.elf、/xmmsse.elf、/lib 装进系统卷），
+//   超上限时列表被**静默截断** —— 后创建的文件（例如 fs_term_test 的 /t.txt）会从 ls 里消失，
+//   于是"rm 之后 entries 恰好 -1"这类断言必然失败（实测 before=16 after=16）。提到 24 让卷根完整：
+//   每个缓存项 36 B × 4 个槽 ≈ 3.4 KB .bss，代价可忽略。
+#define FD64_DIR_CACHE 24
 #define FD64_DIRC_MAX  4          // 目录缓存池（同时最多 4 个目录句柄有缓存）
 
 struct Pipe64 {
@@ -147,14 +158,15 @@ static void fd64_of_unref64(OpenFile64* of) {
     }
     of->used = 0;
 }
+// ★ A4-2a：**槽号 = fd 号**（0..31）。0/1/2 是标准流槽，默认空；被 dup2 绑上对象后就走本层。
 static OpenFile64* fd64_slot_obj64(const FdTable64* t, int fd) {
     if (!t || !t->used) return nullptr;
-    if (fd < 3 || fd >= (int)(3u + FD64_MAX)) return nullptr;
-    return t->slot[fd - 3];
+    if (fd < 0 || fd >= (int)FD64_MAX) return nullptr;
+    return t->slot[fd];
 }
 static int fd64_table_alloc_slot64(FdTable64* t) {
     if (!t) return -FD64_EMFILE;
-    for (uint32_t i = 0; i < FD64_MAX; i++) if (!t->slot[i]) return (int)i;
+    for (uint32_t i = FD64_STDIO_MAX; i < FD64_MAX; i++) if (!t->slot[i]) return (int)i;
     return -FD64_EMFILE;
 }
 // 把对象放进表里第一个空槽（refs 由调用方持有：本函数**不**加引用）
@@ -162,7 +174,7 @@ static int fd64_table_put64(FdTable64* t, OpenFile64* of) {
     const int s = fd64_table_alloc_slot64(t);
     if (s < 0) return s;
     t->slot[s] = of;
-    return 3 + s;
+    return s;
 }
 
 int fd64_table_clone64(FdTable64* dst, const FdTable64* src) {
@@ -296,9 +308,41 @@ static int fd64_prepare_64(int vol, const char* path, char* norm, uint32_t flags
 }
 
 // ==================== open / close ====================
+// 路径就是"控制台 tty"对象吗（"/dev/console" / "/dev/tty" / 不带前导 '/' 的两种写法）
+static int fd64_is_tty_path64(const char* path) {
+    if (!path) return 0;
+    static const char* const P[4] = { "/dev/console", "/dev/tty", "dev/console", "dev/tty" };
+    for (int i = 0; i < 4; i++) if (fd64_streq(path, P[i])) return 1;
+    return 0;
+}
 // ★ 多卷：按**显式统一卷号**打开（系统组件要固定系统卷时用这个变体；终端/ring3 用默认入口 = 当前卷）。
 // 只读卷（FAT32）上带写意图（WRONLY/RDWR/CREAT/TRUNC/APPEND）的打开在这里就被拒，返回 -FD64_EROFS。
+// ★ A4-2a："/dev/console" / "/dev/tty" 是**最小控制台 tty 对象**（不查盘、不建文件）。
+static int fd64_tty_open64(uint32_t flags) {
+    FdTable64* t = fd64_current_table64();
+    OpenFile64* of = fd64_of_alloc64();
+    if (!of) return -FD64_EMFILE;
+    of->flags = flags | FD64_O_RDWR;                          // tty 读写都允许（read 无输入 -> 0，见头文件）
+    of->vol = -1;
+    of->kind = FD64_KIND_TTY;
+    of->writable = 1;
+    of->append = 0;
+    of->off = 0;
+    for (uint32_t i = 0; i < (uint32_t)sizeof(FD64_TTY_PATH); i++) of->path[i] = FD64_TTY_PATH[i];
+    const int fd = fd64_table_put64(t, of);
+    if (fd < 0) { fd64_of_unref64(of); return fd; }
+    dbg64_line_begin64();
+    dbg64_str("[FD64] tty open fd=");
+    dbg64_dec((uint64_t)fd);
+    dbg64_str(" path=");
+    dbg64_str(FD64_TTY_PATH);
+    dbg64_str(" rows=25 cols=80");
+    dbg64_nl();
+    dbg64_line_end64();
+    return fd;
+}
 int fd64_open_on64(int vol, const char* path, uint32_t flags) {
+    if (fd64_is_tty_path64(path)) return fd64_tty_open64(flags);
     if (flags & (FD64_O_WRONLY | FD64_O_RDWR | FD64_O_CREAT | FD64_O_TRUNC | FD64_O_APPEND)) {
         if (fs64_is_readonly64(vol)) {
             dbg64_line_begin64();
@@ -417,7 +461,7 @@ int fd64_close64(int fd) {
     OpenFile64* of = fd64_slot_obj64(t, fd);
     if (!of) return -FD64_EBADF;
     const uint32_t left = of->refs - 1u;                      // 打印"还剩几个引用"
-    t->slot[fd - 3] = nullptr;
+    t->slot[fd] = nullptr;
     fd64_of_unref64(of);
     dbg64_line_begin64();
     dbg64_str("[FD64] close fd=");
@@ -502,7 +546,7 @@ int fd64_pipe64(int* fd_r, int* fd_w) {
     int fw = -FD64_EMFILE;
     if (fr >= 0) fw = fd64_table_put64(t, w);
     if (fr < 0 || fw < 0) {
-        if (fr >= 0) { t->slot[fr - 3] = nullptr; }
+        if (fr >= 0) { t->slot[fr] = nullptr; }
         fd64_of_unref64(r);
         fd64_of_unref64(w);
         p->used = 0;
@@ -530,8 +574,8 @@ int fd64_read64(int fd, void* buf, int len) {
     if (!of) return -FD64_EBADF;
     if (of->kind == FD64_KIND_DIR) return -FD64_EISDIR;
     if (of->kind == FD64_KIND_PIPE_W) return -FD64_EBADF;       // 写端不能读
+    if (of->kind == FD64_KIND_TTY) return 0;                    // ★ A4-2a：控制台 tty 没有输入流（如实 EOF）
     if (!buf || len < 0) return -FD64_EFAULT;
-    if (len == 0) return 0;
     if (of->kind == FD64_KIND_PIPE_R) {
         const int n = fd64_pipe_read64(of->pipe, buf, len);
         if (n <= 0) return n;
@@ -591,6 +635,11 @@ int fd64_write64(int fd, const void* buf, int len) {
     if (!buf || len < 0) return -FD64_EFAULT;
     if (len == 0) return 0;
     if (of->kind == FD64_KIND_PIPE_W) return fd64_pipe_write64(of->pipe, buf, len);
+    if (of->kind == FD64_KIND_TTY) {                          // ★ A4-2a：控制台 tty = 串口 + 屏幕
+        if (syscall64_console_write64) syscall64_console_write64((const char*)buf, len);
+        else for (int i = 0; i < len; i++) dbg64_putc(((const char*)buf)[i]);
+        return len;
+    }
 
     const uint64_t if_save = dbg64_irq_save64();
     fd64_refresh64(of);
@@ -667,27 +716,90 @@ int fd64_fsync64(int fd) {
     return 0;                                                // 写路径已即时落盘（无脏页）
 }
 
+// ★ A4-2a：newfd 现在接受 0..31（0/1/2 = 换标准流；Linux dup2 语义），newfd < 0 = 自动分配（>= 3）。
+static int fd64_bind_slot64(FdTable64* t, OpenFile64* src, int dst) {
+    if (t->slot[dst] == src) return dst;                      // 同一个槽：直接返回（Linux 同）
+    if (t->slot[dst]) {                                       // dup2：先关旧目标（引用 -1）
+        OpenFile64* old = t->slot[dst];
+        t->slot[dst] = nullptr;
+        fd64_of_unref64(old);
+    }
+    src->refs++;                                              // ★ 共享同一个对象（共享偏移）
+    t->slot[dst] = src;
+    return dst;
+}
 int fd64_dup64(int oldfd, int newfd) {
     FdTable64* t = fd64_current_table64();
     OpenFile64* src = fd64_slot_obj64(t, oldfd);
     if (!src) return -FD64_EBADF;
     int dst = -1;
-    if (newfd >= 3) {
-        if (newfd >= (int)(3u + FD64_MAX)) return -FD64_EBADF;
-        dst = newfd - 3;
-        if (t->slot[dst] == src) return newfd;                // 同一个槽：直接返回（Linux 同）
-        if (t->slot[dst]) {                                   // dup2：先关旧目标（引用 -1）
-            OpenFile64* old = t->slot[dst];
-            t->slot[dst] = nullptr;
-            fd64_of_unref64(old);
-        }
+    if (newfd >= 0) {
+        if (newfd >= (int)FD64_MAX) return -FD64_EBADF;
+        dst = newfd;
     } else {
         dst = fd64_table_alloc_slot64(t);
         if (dst < 0) return dst;
     }
-    src->refs++;                                              // ★ 共享同一个对象（共享偏移）
-    t->slot[dst] = src;
-    return 3 + dst;
+    const int r = fd64_bind_slot64(t, src, dst);
+    if (newfd >= 0 && newfd <= 2) {                           // 换标准流是"重定向"的关键动作：留证据
+        dbg64_line_begin64();
+        dbg64_str("[FD64] dup old=");
+        dbg64_dec((uint64_t)oldfd);
+        dbg64_str(" new=");
+        dbg64_dec((uint64_t)r);
+        dbg64_str(" refs=");
+        dbg64_dec((uint64_t)src->refs);
+        dbg64_str(" kind=");
+        dbg64_dec((uint64_t)src->kind);
+        dbg64_str(" path=");
+        dbg64_str(src->path);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    return r;
+}
+// 跨表绑定：把**当前表** srcfd 的对象绑到 dst 表的 newfd 槽（内核把 fd 交给子进程用）。
+// fork 的整表克隆走 fd64_table_clone64（逐槽 refs++），这里是"只递一个 fd"，语义与它一致。
+int fd64_dup_into64(FdTable64* dst, int srcfd, int newfd) {
+    FdTable64* cur = fd64_current_table64();
+    OpenFile64* src = fd64_slot_obj64(cur, srcfd);
+    if (!src) return -FD64_EBADF;
+    if (!dst || !dst->used) return -FD64_EINVAL;
+    if (newfd < 0 || newfd >= (int)FD64_MAX) return -FD64_EBADF;
+    const int r = fd64_bind_slot64(dst, src, newfd);
+    Pipe64* p = src->pipe;
+    if (p) {                                                  // 与 fork 的引用记账一致（管道端计数）
+        p->refs++;
+        if (src->kind == FD64_KIND_PIPE_W) p->writers++;
+        else if (src->kind == FD64_KIND_PIPE_R) p->readers++;
+    }
+    return r;
+}
+
+// ==================== ★ A4-2a：标准流槽查询 / 最小控制台 tty ====================
+int fd64_slot_used64(int fd) {
+    return fd64_slot_obj64(fd64_current_table64(), fd) ? 1 : 0;
+}
+int fd64_slot_is_tty64(int fd) {
+    OpenFile64* of = fd64_slot_obj64(fd64_current_table64(), fd);
+    return (of && of->kind == FD64_KIND_TTY) ? 1 : 0;
+}
+void fd64_log_slot64(int fd, const char* tag) {
+    OpenFile64* of = fd64_slot_obj64(fd64_current_table64(), fd);
+    if (!of) return;
+    dbg64_line_begin64();
+    dbg64_str("[FD64] stdio fd=");
+    dbg64_dec((uint64_t)fd);
+    dbg64_str(" kind=");
+    dbg64_dec((uint64_t)of->kind);
+    dbg64_str(" refs=");
+    dbg64_dec((uint64_t)of->refs);
+    dbg64_str(" path=");
+    dbg64_str(of->path);
+    dbg64_str(" tag=");
+    dbg64_str(tag ? tag : "?");
+    dbg64_nl();
+    dbg64_line_end64();
 }
 
 uint64_t fd64_object_id64(int fd) {                            // 自检/证据：对象标识（就是它的地址）
@@ -733,9 +845,14 @@ int fd64_readdir64(int fd, char* name_out, int name_cap, uint32_t* type_out, uin
         uint32_t ty = VFS64_TYPE_FILE;
         uint32_t sz = dc->sizes[idx];
         if (sz == 0) {
+            // ★ A4-2a 修正：按**本句柄打开的父目录**拼路径（of->path），不再是相对卷根的 "/<名字>"。
+            //   老写法只在"列根目录"时碰巧对；列 /tmp/d1 时它会去 stat "/sub"（不存在）-> 判成 FILE，
+            //   于是子目录显示为 "sub  0 bytes"。这里 of->path 是 fd64_norm_path64 规范化过的绝对路径
+            //   （根目录是 "/"），拼出来必然是 "<父目录>/<名字>"。
             char full[FD64_PATH_MAX];
             int p = 0;
-            full[p++] = '/';
+            for (int k = 0; of->path[k] && p + 1 < (int)FD64_PATH_MAX; k++) full[p++] = of->path[k];
+            if (p == 0 || full[p - 1] != '/') full[p++] = '/';
             for (int k = 0; dc->names[idx][k] && p + 1 < (int)FD64_PATH_MAX; k++) full[p++] = dc->names[idx][k];
             full[p] = 0;
             Fs64Stat64 dst;
@@ -943,10 +1060,10 @@ int fd64_demo64() {
         int n = (fa >= 3) ? fd64_read64(fa, seg, 3) : -1;                  // 先把偏移推到 3
         int same = 0, refs_ok = 0, alive = 0, off_a = -1;
         if (fa >= 3 && child && n == 3) {
-            OpenFile64* obj = mine->slot[fa - 3];
+            OpenFile64* obj = mine->slot[fa];
             const uint32_t refs0 = obj->refs;
             if (fd64_table_clone64(child, mine) == 0) {
-                same = (child->slot[fa - 3] == obj) ? 1 : 0;               // ★ 共享同一个对象
+                same = (child->slot[fa] == obj) ? 1 : 0;                  // ★ 共享同一个对象
                 refs_ok = (obj->refs == refs0 + 1u) ? 1 : 0;               // ★ 引用计数 +1
                 fd64_table_close_all64(child);                             // "子进程退出"
                 alive = (obj->refs == refs0 && obj->used) ? 1 : 0;         // ★ 原对象还在
@@ -1020,9 +1137,23 @@ int fd64_selftest64() {
     // bit1：fd 表分配/释放（不碰盘：全是失败路径，不该改变表状态）
     {
         const int before = fd64_table_used64(fd64_current_table64());
-        if (fd64_close64(3 + (int)FD64_MAX) != -FD64_EBADF) fail |= 2;   // 越界 fd
-        if (fd64_read64(1, out, 1) != -FD64_EBADF) fail |= 2;            // 标准流不归本层
+        if (fd64_close64((int)FD64_MAX) != -FD64_EBADF) fail |= 2;       // 越界 fd（FD64_MAX = 32）
+        if (fd64_read64(1, out, 1) != -FD64_EBADF) fail |= 2;            // 标准流槽**空** = 不归本层
+        if (fd64_dup64(1, 1) != -FD64_EBADF) fail |= 2;                  // 空槽 dup2 自己 -> -EBADF
         if (fd64_table_used64(fd64_current_table64()) != (uint32_t)before) fail |= 2;
+    }
+
+    // bit4（★ A4-2a）：标准流槽可替换 + 最小控制台 tty 对象（无副作用：不写屏、不写盘）
+    {
+        const int tfd = fd64_open64(FD64_TTY_PATH, FD64_O_RDWR);         // /dev/console -> tty 对象
+        if (tfd < 3 || !fd64_slot_is_tty64(tfd)) fail |= 16;
+        if (fd64_dup64(tfd, 32) != -FD64_EBADF) fail |= 16;              // newfd 越界 -> -EBADF
+        if (fd64_dup64(tfd, 1) != 1) fail |= 16;                         // ★ 把 stdout 换成 tty
+        if (!fd64_slot_used64(1) || !fd64_slot_is_tty64(1)) fail |= 16;
+        if (fd64_read64(1, out, 1) != 0) fail |= 16;                     // tty 没有输入流 -> EOF（如实）
+        if (fd64_close64(1) != 0) fail |= 16;
+        if (fd64_slot_used64(1)) fail |= 16;                             // 关掉后回到"内核控制台"语义
+        if (tfd >= 3 && fd64_close64(tfd) != 0) fail |= 16;
     }
 
     // bit3：fd 表池 + dup 共享同一个 OpenFile64（用根目录句柄，不需要额外文件）
@@ -1058,6 +1189,7 @@ int fd64_selftest64() {
     dbg64_dec((uint64_t)FD64_PIPE_MAX);
     dbg64_str(" vfs=");
     dbg64_dec((uint64_t)vfs);
+    dbg64_str(" stdio=bindable tty=1");
     dbg64_nl();
     dbg64_line_end64();
 
@@ -1090,7 +1222,7 @@ void fd64_dump64() {
         if (!t->slot[i]) continue;
         dbg64_line_begin64();
         dbg64_str("[FD64] dump fd=");
-        dbg64_dec((uint64_t)(3u + i));
+        dbg64_dec((uint64_t)i);
         dbg64_str(" kind=");
         dbg64_dec((uint64_t)t->slot[i]->kind);
         dbg64_str(" refs=");

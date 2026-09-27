@@ -1,17 +1,20 @@
 // icons64.h - 统一"真图标"查询/绘制层（本批新增）：外置图标包 -> img64 解码 -> 缓存 -> 混色上屏
 //
 // ==================== 图标从哪来（外置，进不了内核）====================
-//   * **首选：图标包（build/iconpack.bin）** —— 构建期由 tools/make_iconpack.py 用自研光栅器
-//     （tools/svg2png.py，Bootstrap Icons MIT 的纯填充路径 SVG）预渲染成 16/24/32/48 px 的
-//     PNG（白 + alpha 掩码），打包后由 build64.sh 用 dd 写进**系统镜像内核区（LBA 9..8008）
-//     的尾部固定区间**（ICON64_PACK_LBA 起 ICON64_PACK_MAX_SECTORS 扇区）。
-//     为什么放这儿而不是 VimtuFS2：system.img 的 8073 扇区里没有 VimtuFS2 卷（卷在安装器建的
-//     数据分区上，起点 LBA 8009 == kernel/memlayout64.h 的 ML64_STORE_LBA，两者重叠是已知约束，
-//     见 memlayout64.h 的 ★★ 段）；而这段内核区字节在"安装到硬盘后"原样保留（loader 就从 LBA 9
-//     读内核），所以裸 system.img、安装出来的盘、测试夹具盘三种情形读到的是同一份包。
-//     资源字节**完全在内核二进制之外**（内核体积不受图标数量影响）。
-//   * **可选覆盖：VimtuFS2 文件** —— 若系统卷里存在 /icons/<system|apps>/<名字>@<尺寸>.png，
-//     它优先于图标包（打点 src=vfs）。给"装好的盘上换图标"留一个口子。
+// ==================== 图标从哪来（★ A4-2a：包搬进系统卷）====================
+//   * **首选：系统卷里的包文件 `/etc/iconpack.bin`（打点 src=vfs）** —— 构建期由 build64.sh 把
+//     tools/make_iconpack.py 产出的 build/iconpack.bin 用 objcopy **内嵌进系统内核**；启动期
+//     icons64_init64() 先看卷里有没有这个文件（大小/CRC 都对得上就直接用），没有就用内嵌的那份
+//     幂等写进卷（img64_install_blob64，打 [IMG64] install path=/etc/iconpack.bin …），再从卷里
+//     读回来解析。**为什么放 /etc 而不是 /icons/**：夹具卷/装好的卷里 /etc 一定存在，而新建根级
+//     目录会让卷根条目数 +1，把 fs_term_test 的"rm 之后 entries 恰好 -1"与 fd64 的目录缓存上限
+//     顶出边界（实测）。
+//   * **可选覆盖：逐文件 VFS 覆盖** —— 若卷里存在 /icons/<system|apps>/<名字>@<尺寸>.png，
+//     它优先于包（打点 src=vfs，path=/icons/…），给"装好的盘上换单个图标"留口子。
+//   * **内置兜底**：内嵌在系统内核里的那份包字节（安装器装出来的盘、测试夹具盘都能装进卷），
+//     以及两者都没有时的**程序化绘制**（调用方拿到 -1 自己画）—— 绝不允许"缺文件把界面画空"。
+//   * 老路径（内核区尾部 LBA 7497 的裸包）**保留为末位兜底**，但 build64.sh 已经不再往那里写；
+//     因此内核区从 7,488 扇区放宽到 8,000 扇区（+262,144 B）。
 //   * 两者都没有（或包解码/CRC 失败）-> **回落既有程序化绘制**（调用方拿到 -1 自己画），
 //     绝不允许"缺文件把界面画空"。
 //
@@ -20,10 +23,10 @@
 //   重新着色，所以状态区图标会随主题（浅色主题深灰线 / 暗色主题浅色线）自动变 —— 不是硬编码色。
 //
 // ==================== 串口打点（自动验收 grep；两类各有上限防刷屏）====================
-//   [ICON64] init pack lba=7497 drive=0 bytes=49176 entries=110 icons=30 ok=1 sha=ffaba02b
-//   [ICON64] init pack absent reason=no-magic drives=1 last-drive=0
-//   [ICON64] load kind=ethernet path=pack:system/ethernet@24.png size=24 src=pack ok=1
-//   [ICON64] load kind=ethernet path=/icons/system/ethernet@24.png size=24 src=vfs ok=1
+//   [ICON64] init pack lba=0 drive=-1 bytes=49192 entries=110 icons=30 bad=0 ok=1 fnv=… vfs_icons=0 src=vfs path=/etc/iconpack.bin
+//   [ICON64] init pack absent reason=no-magic-or-read lba=7497 drives-tried=5 last-drive=0 vfs=1 -> programmatic fallback stays
+//   [ICON64] load kind=ethernet path=pack:system/ethernet@24.png size=24 src=vfs ok=1   （卷里的包）
+//   [ICON64] load kind=ethernet path=/icons/system/ethernet@24.png size=24 src=vfs ok=1 （逐文件覆盖）
 //   [ICON64] fallback kind=terminal reason=no-pack (programmatic draw kept)
 //   [ICON64] fallback kind=bell reason=decode-fail
 //   [ICON64] selftest PASS pack=1 draws=..

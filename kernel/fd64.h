@@ -1,14 +1,19 @@
 // fd64.h - Vimtu64 的 FD 层：**每进程** fd 表 + 引用计数的打开文件对象 + pipe
 //
-// 设计（批次 D：POSIX 语义补完；为什么长这样）：
-//   * **表按进程**：每张 FdTable64 有 32 个槽（fd = 3 + 槽位；0/1/2 是标准流，由
-//     syscall64/终端自己认）。进程结构（kernel/proc64.h 的 Proc64）持有一个
+// ★ A4-2a：**标准流槽可替换**（dup2 到 0/1/2 真生效）+ 最小"控制台 tty"对象 + readdir 类型判定修正。
+//   * **表按进程**：每张 FdTable64 有 32 个槽，**槽号就是 fd 号**（0..31）；槽 0/1/2 是**标准流槽**，
+//     默认**空** —— 空 = 老语义（0 = 立刻 EOF、1 = 串口+屏幕、2 = 只串口，由 syscall64 认）；
+//     一旦被 dup2 绑上真实对象（文件 / pipe / tty），该 fd 的 read/write/close/ioctl 就走本层对象，
+//     与 fd >= 3 完全同一条路径。分配新 fd 时从槽 3 起（0/1/2 不会被自动占用）。
 //     FdTable64*（fd64_table_alloc64 从池里取）；任务经 task_proc_of_current64()
 //     找到自己的进程再拿到表；**没有进程上下文**时（任务 0 = 桌面/终端、安装介质内核、
 //     启动早期）退回**内核表** fd64_kernel_table64()——“终端”就是这张表的拥有者。
 //   * **打开文件对象 + 引用计数**：fd 槽指向一个 OpenFile64（路径、flags、**偏移游标**、
 //     引用计数、目录缓存、pipe 端）。语义严格按 Linux：
-//       - dup/dup2：两张槽指向**同一个** OpenFile64（共享游标）；
+//       - dup/dup2：两张槽指向**同一个** OpenFile64（共享游标）；dup2 的 newfd 可以是 0/1/2；
+//       - **tty 对象**（FD64_TTY_PATH = "/dev/console"、"/dev/tty"）：write 直连控制台
+//         （串口 + 屏幕），read 立刻返回 0（本内核没有"给用户程序的键盘输入流"，如实），
+//         ioctl 认 TIOCGWINSZ/TCGETS/TCSETS（见 syscall64）；
 //       - fork：整张表**逐槽共享**（引用计数 +1），父子共享偏移；
 //       - execve：**默认保留**所有 fd（本内核没有实现 O_CLOEXEC，如实注明）；
 //       - close：引用计数 -1，归零才真正释放对象。
@@ -36,6 +41,8 @@
 //   * pipe 没有阻塞/信号语义（见上），容量固定 64 B，最多 8 条同时在用；
 //   * 单文件上限 8 MiB（v2 卷 67584 B）：单次 read/write 的长度受调用方缓冲限制（推荐 ≤64KB/次）；
 //     没有 O_SYNC/mmap/直接 I/O；写失败（空间不足/超上限）是**部分写也没有**（先失败）。
+//   * ★ A4-2a 的 tty 对象**没有输入流**：read(tty) 立刻返回 0（本内核没有把键盘输入交给用户程序的
+//     通道 —— 终端的行编辑是内核侧对象）。想要输入的程序只能从文件/pipe 读。**不假装有输入**。
 //
 // 打点（自动验收 grep，格式勿改）：
 //   [FD64] open path=<p> fd=<n> flags=<n>
@@ -43,11 +50,16 @@
 //   [FD64] write fd=<n> n=<n> total=<n>
 //   [FD64] close fd=<n> refs=<n>
 //   [FD64] pipe read n=<n> data=<s>
+//   [FD64] dup old=<n> new=<n> refs=<n> path=<p>        （dup/dup2 共享对象；new <= 2 = 换标准流）
+//   [FD64] tty open fd=<n> path=/dev/console            （最小控制台 tty 对象）
 //   [FD64] selftest PASS / [FD64] selftest FAIL mask=<n>
 #pragma once
 #include <stdint.h>
-
-#define FD64_MAX        32u          // 每张 fd 表的槽位数（fd = 3 + 槽位）
+// ★ A4-2a：**槽号 = fd 号**（0..31）。0/1/2 是标准流槽（默认空 = 由 syscall64 认的控制台语义）；
+//   自动分配新 fd 时从 FD64_STDIO_MAX(3) 起，所以 0/1/2 只会被显式 dup2 占用。
+#define FD64_MAX        32u          // 每张 fd 表的槽位数（= 最大 fd 号 + 1）
+#define FD64_STDIO_MAX  3u           // 标准流槽数（0 = stdin / 1 = stdout / 2 = stderr）
+#define FD64_TTY_PATH   "/dev/console"   // ★ 最小"控制台 tty"对象的路径（"/dev/tty" 也认）
 #define FD64_TABLE_MAX  20u          // fd 表池（16 进程 + 内核表 + 余量）
 #define FD64_OPEN_MAX   64u          // OpenFile64 对象池（引用计数，不按进程复制）
 #define FD64_PIPE_MAX   8u           // pipe 对象池（每条 64 B 环形缓冲）
@@ -121,7 +133,8 @@ int fd64_write64(int fd, const void* buf, int len);
 int fd64_lseek64(int fd, int64_t off, int whence);
 int fd64_stat64(int fd, uint32_t* type_out, uint32_t* size_out);
 int fd64_fsync64(int fd);
-// dup：newfd >= 3 时占用该槽；newfd < 0 时自动分配一个新槽。返回新 fd 或负错误码。
+// dup：newfd >= 0 时占用该槽（**含 0/1/2 = 换标准流**）；newfd < 0 时自动分配一个新槽（>= 3）。
+// 返回新 fd 或负错误码（-EBADF：oldfd 无效 / newfd 越界 0..31）。
 // ★ Linux 语义：新旧 fd 指向**同一个 OpenFile64**（共享偏移/目录游标），引用计数 +1。
 int fd64_dup64(int oldfd, int newfd);
 
@@ -132,10 +145,23 @@ int fd64_where64(int fd, int* out_vol, char* path_out, int cap);
 // ==================== pipe（64 B 环形缓冲；无阻塞语义）====================
 // 成功返回 0 并填入读端/写端两个 fd；失败返回负错误码（-EMFILE 池/fd 槽满）。
 int fd64_pipe64(int* fd_r, int* fd_w);
+// 从**当前表**把 srcfd 的对象绑到**另一张表** dst 的 newfd 槽（内核启动外部进程时把 fd 交给子进程用：
+// 先在本表 open，再 dup 进子进程的表，然后 close 本表那份）。返回 newfd 或负错误码。
+int fd64_dup_into64(FdTable64* dst, int srcfd, int newfd);
+
+// ==================== 标准流槽（A4-2a）====================
+// 1 = 当前表的槽 fd（0..31）绑着真实对象（则这个 fd 必须走本层，而不是 syscall64 的控制台语义）。
+int fd64_slot_used64(int fd);
+// 1 = 当前表的槽 fd 绑的是"控制台 tty"对象（ioctl 认 TIOCGWINSZ/TCGETS/TCSETS）。
+int fd64_slot_is_tty64(int fd);
+// 把 fd 的"是谁"写成一行串口证据（仅当槽已绑对象；用于 dup2 重定向的证据链）。
+void fd64_log_slot64(int fd, const char* tag);
 
 // 目录句柄
 int fd64_opendir64(const char* path);
 // 返回 1 = 下一条（name_out 已 NUL 结尾）、0 = 枚举结束、<0 = -errno。type_out/size_out 可空。
+// ★ A4-2a 修正：**大小为 0 的条目**要按**父目录**（本句柄打开的路径）拼路径再 stat，
+// 老代码拼的是相对卷根的 "/<name>"，于是子目录里的子目录被误判成普通文件（ls 显示 "sub 0 bytes"）。
 int fd64_readdir64(int fd, char* name_out, int name_cap, uint32_t* type_out, uint32_t* size_out);
 
 // FD 语义演示（终端 `fdtest` 命令）：独立游标 / dup 共享游标 / O_APPEND / pipe 环回。

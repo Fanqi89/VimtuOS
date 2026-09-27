@@ -394,11 +394,11 @@ def main():
     type_line(mon, "cd ..")
     check("cd .. 回退一级 -> sh64:/tmp/d1$", wait_mark("sh64:/tmp/d1$ ", 20), "")
     type_line(mon, "ls")
-    # ★ 注意 "  sub  0 bytes" 而不是 "sub/"：内核 fd64_readdir64 判"大小 0"条目的类型时用的是
-    #   **/<name>**（相对卷根，不是被列目录）—— 子目录里的子目录被误判成 FILE。这是既有缺陷
-    #   （fd64.cpp，本轮不许改），如实断言当前行为，报告里列了。
-    check("ls（无参数 = 当前目录）列出刚建的 sub（逐字节；子目录类型受内核既有缺陷影响）",
-          wait_stream("/tmp/d1:\n  sub  0 bytes\n", 25))
+    # ★ A4-2a 同步（语义变化处）：fd64_readdir64 判"大小 0"条目的类型时，现在按**父目录**拼路径
+    #   （不再是相对卷根的 "/<名字>"），所以子目录里的子目录会正确显示成目录 —— 逐字节 = "  sub/"。
+    #   A4-1 那一版这里如实断言的是当时的缺陷行为 "  sub  0 bytes"；本批修的正是它。
+    check("ls（无参数 = 当前目录）把刚建的 sub 显示成**目录**（逐字节 = \"  sub/\"）",
+          wait_stream("/tmp/d1:\n  sub/\n", 25))
     type_line(mon, "stat /bin/shell.bin")
     check("stat 报 shell.bin 是 regular 且大小一致",
           wait_stream("  size: %d\n" % shell_sz, 25), "")

@@ -91,6 +91,10 @@ struct Proc64 {
     uint32_t sigmask_lo, sigmask_hi;    // rt_sigprocmask 记录
     char     name[PROC64_NAME_MAX];
     char     exe[PROC64_PATH_MAX];
+    // ★ A4-2a：每进程**工作目录**（chdir(80) / getcwd(79) 的真值；相对路径由 syscall64 拼成绝对路径）。
+    //   为什么放在进程结构里而不是 VFS：VFS 层没有"当前目录"概念（见 vfs64.h），而 POSIX 的 cwd 是
+    //   **进程属性**（fork 继承、各进程独立）—— 放这里才不会被别的进程/终端改掉。
+    char     cwd[PROC64_CWD_MAX];
 };
 static Proc64   g_procs[PROC64_MAX];
 static int      g_proc_count   = 0;
@@ -373,6 +377,61 @@ int proc64_current_pid64() {
 }
 int proc64_find64(int pid) { return p64_find64(pid) ? 1 : 0; }
 int proc64_count64() { return g_proc_count; }
+// ==================== ★ A4-2a：每进程 cwd + 子进程 fd 表查询 ====================
+int proc64_cwd64(char* out, uint32_t cap) {
+    Proc64* p = p64_current64();
+    if (!p || !out || cap == 0) return 0;
+    p64_strcpy_n(out, p->cwd[0] ? p->cwd : "/", cap);
+    return 1;
+}
+// 改当前进程的 cwd。path 必须已经过调用方规范化（绝对路径）；这里只做**存在 + 是目录**判定。
+int proc64_chdir64(const char* path) {
+    Proc64* p = p64_current64();
+    if (!p) return -1;                                        // 没有进程上下文（终端/内核线程）
+    if (!path || path[0] != '/') return -1;
+    uint32_t ty = 0, sz = 0;
+    if (vfs64_stat(path, &ty, &sz) != 0) return -2;            // ENOENT：不存在（或没挂卷）
+    if (ty != VFS64_TYPE_DIR) return -20;                     // ENOTDIR
+    // 规范化：去掉结尾多余的 '/'、结尾的 "." 段，以及"尾段是 '..'"的情况（把前一段也去掉）。
+    // 为什么必须做：cwd 是 getcwd(79) 的返回值，用户会**逐字节**比对（实测 `chdir("..")` 之后
+    // 期望 "/" 而不是 "/tmp/.."）。本文件系统没有符号链接，所以按"段"做文本规范化就是正确解。
+    char canon[PROC64_CWD_MAX];
+    int n = 0;
+    for (int i = 0; path[i] && n < (int)sizeof(canon) - 1; i++) canon[n++] = path[i];
+    canon[n] = 0;
+    for (;;) {
+        int len = n;
+        while (len > 1 && canon[len - 1] == '/') len--;                     // 结尾 '/'
+        if (len > 1 && canon[len - 1] == '.') {
+            if (len == 2 || canon[len - 2] == '/') { len--; n = len; canon[n] = 0; continue; }   // "/."
+            if (len > 2 && canon[len - 2] == '.' && (len == 3 || canon[len - 3] == '/')) {       // "/.."
+                len -= 3;                                                                        // 去掉 "/.."
+                while (len > 1 && canon[len - 1] != '/') len--;                                  // 再吃掉前一段
+                if (len > 1) len--;                                                              // 连同分隔符（保留根 "/"）
+                if (len < 1) len = 1;
+                n = len; canon[n] = 0;
+                continue;
+            }
+        }
+        n = len;
+        canon[n] = 0;
+        break;
+    }
+    if (n <= 0 || n >= (int)PROC64_CWD_MAX) return -1;
+    for (int i = 0; i <= n; i++) p->cwd[i] = canon[i];
+    dbg64_line_begin64();
+    dbg64_str("[PROC64] chdir pid=");
+    dbg64_dec((uint64_t)p->pid);
+    dbg64_str(" cwd=");
+    dbg64_str(p->cwd);
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+FdTable64* proc64_fdtab_of64(int pid) {
+    Proc64* p = p64_find64(pid);
+    return p ? p->fdtab : nullptr;
+}
 const char* proc64_current_name64() {
     Proc64* p = p64_current64();
     return p ? p->name : "none";
@@ -429,6 +488,7 @@ int proc64_create64(const char* name, int ppid) {
     p->fs_base = 0;
     p64_strcpy_n(p->name, name ? name : "proc", PROC64_NAME_MAX);
     p64_strcpy_n(p->exe, "?", PROC64_PATH_MAX);
+    p64_strcpy_n(p->cwd, "/", PROC64_CWD_MAX);          // ★ A4-2a：新进程的 cwd = 根
     {   // ★ P4：新进程**继承当前凭证**（内核启动期 = root；fork = 父进程；终端 run = 终端会话身份）
         Vfs64Cred64 cr;
         vfs64_get_cred64(&cr);
@@ -727,7 +787,6 @@ int64_t proc64_fork64(pt_regs64* r) {
     if (fd64_table_clone64(c->fdtab, par->fdtab) != 0) {
         p64_exit64(c, 1, 0);
         proc64_destroy64(cpid);
-        p64_log2("[PROC64] fork FAILED reason=fd-table parent-name=", par->name);
         return -P64_ENOMEM;
     }
 
@@ -744,6 +803,8 @@ int64_t proc64_fork64(pt_regs64* r) {
     c->brk_end   = par->brk_end;
     c->brk_limit = par->brk_limit;
     c->mmap_next = par->mmap_next;
+    c->fs_base   = par->fs_base;                        // TLS 基址继承（切换时装载）
+    p64_strcpy_n(c->cwd, par->cwd[0] ? par->cwd : "/", PROC64_CWD_MAX);   // ★ A4-2a：cwd 继承
     c->fs_base   = par->fs_base;                        // TLS 基址继承（切换时装载）
 
     // ★ 子进程的用户现场 = 父进程这一次系统调用的帧，只把 rax 改成 0。
@@ -789,6 +850,27 @@ int64_t proc64_fork64(pt_regs64* r) {
 }
 
 // ==================== execve ====================
+// ★ A4-2a：**装载前预检**（不改任何状态）—— 目标必须能打开、不是目录、且是 ELF64 头。
+//   为什么需要它（这就是本批修的 #PF 缺陷的根因）：老实现是"先释放旧映像、再装载"，
+//   装载失败时进程已没有映像、却还要回 ring3 取指（rax = -ENOENT）-> 用户页不存在 -> #PF -> PANIC。
+//   有了预检，"文件不存在 / 不是 ELF"这类**最常见的失败**会保留旧映像继续跑（Linux 语义：
+//   execve 返回 -errno，调用者接着执行）；预检之后的失败（内存不足/段越界）走"干净退出"。
+// 返回 0 = 可以进入装载；否则返回 -errno（-ENOENT / -EINVAL）。
+static int p64_exec_precheck64(const char* path) {
+    const int fd = fd64_open64(path, FD64_O_RDONLY);
+    if (fd == -FD64_EISDIR) return -P64_EINVAL;              // 目录：不是可执行映像
+    if (fd < 0) return -P64_ENOENT;                          // 不存在 / 打不开：**原样保留旧映像**
+    int rc = 0;
+    uint32_t ty = 0, sz = 0;
+    uint8_t head[8];
+    if (fd64_stat64(fd, &ty, &sz) != 0 || ty == VFS64_TYPE_DIR) rc = -P64_EINVAL;
+    else {
+        const int n = fd64_read64(fd, head, (int)sizeof(head));
+        if (n < 4 || !elf64_is_elf64(head, (uint32_t)n)) rc = -P64_EINVAL;
+    }
+    (void)fd64_close64(fd);
+    return rc;
+}
 int64_t proc64_execve64(pt_regs64* r, const char* path, const char* const* argv, uint32_t argc) {
     if (!g_isolate64) { p64_shared_note64(); return -P64_ENOSYS; }
     Proc64* p = p64_current64();
@@ -796,10 +878,26 @@ int64_t proc64_execve64(pt_regs64* r, const char* path, const char* const* argv,
     if (!r || r->cs != SEL64_UCODE || r->ss != SEL64_UDATA) return -P64_EINVAL;
     if (!path || path[0] != '/') return -P64_EINVAL;
 
-    // 1) 释放旧映像（整个用户区 + 页表页）。注意：释放之后如果装载失败，这个进程就没有映像了 ——
-    //    与 Linux 不同（Linux 会保留旧映像继续跑），这里会把它按"退出码 127（command not found）"
-    //    终止，并在日志里如实写明。取舍理由：保留旧映像需要"先装到临时地址空间再原子切换"，
-    //    那要再引入一套影子地址空间/两份记账，收益只是"execve 失败还能继续跑"这一种边角场景。
+    // 0) ★ A4-2a：预检失败 = **执行失败但不是致命错误**：用户区、页表、帧一个字节都没动，
+    //    进程继续跑它原来的映像（这正是 Linux execve 失败的行为）。
+    {
+        const int prc = p64_exec_precheck64(path);
+        if (prc != 0) {
+            dbg64_line_begin64();
+            dbg64_str("[PROC64] execve FAILED path=");
+            dbg64_str(path);
+            dbg64_str(" pid=");
+            dbg64_dec((uint64_t)p->pid);
+            dbg64_str(" rc=");
+            dbg64_dec((uint64_t)(prc < 0 ? -prc : prc));
+            dbg64_str(" reason=precheck old_image_kept=1");
+            dbg64_nl();
+            dbg64_line_end64();
+            return prc;
+        }
+    }
+    // 1) 释放旧映像（整个用户区 + 页表页）。到这一步已经过预检；若装载仍失败（内存不足/段越界），
+    //    进程不能回 ring3（映像已经没了）—— 按退出码 127 **干净退出**（见下），绝不再回旧 RIP。
     const uint32_t old_pages = p64_count_pages64(p);
     p64_release_area64(p);
     elf64_forget64();
@@ -813,11 +911,12 @@ int64_t proc64_execve64(pt_regs64* r, const char* path, const char* const* argv,
         dbg64_str(path);
         dbg64_str(" pid=");
         dbg64_dec((uint64_t)p->pid);
-        dbg64_str(" reason=load -> process terminated (code 127)");
+        dbg64_str(" reason=load -> clean exit code=127 (never returns to ring3)");
         dbg64_nl();
         dbg64_line_end64();
-        p64_exit64(p, 127, 0);
-        return -P64_ENOENT;
+        p64_exit64(p, 127, 0);                              // 记账：僵尸 + 退出码 127
+        task_exit64();                                      // ★ 不返回：绝不再回已释放的 ring3 映像
+        return -P64_ENOENT;                                 // 到不了（task_exit64 不返回）
     }
 
     // 2) 内存记账重置（新映像：brk 从零开始、mmap 游标回起点）

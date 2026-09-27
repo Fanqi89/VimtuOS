@@ -68,6 +68,8 @@ static const int PROC64_MAX          = 16;    // 进程槽（与 TASK64_MAX 一�
 static const int PROC64_NAME_MAX     = 16;
 static const int PROC64_PATH_MAX     = 32;
 static const int PROC64_CHILDREN_MAX = 8;     // 每个进程最多同时记 8 个子（够演示/够验收）
+// ★ A4-2a：每进程工作目录缓冲（与 VFS64_PATH_MAX 一致；cwd 是"进程属性"，见 proc64.cpp 的 Proc64 注释）
+#define PROC64_CWD_MAX 128
 
 enum Proc64State : uint32_t {
     PROC64_FREE    = 0,
@@ -120,6 +122,15 @@ void proc64_destroy64(int pid);
 // ==================== 查询 ====================
 int   proc64_current_pid64();                     // 当前进程 pid；-1 = 不在进程上下文
 int   proc64_find64(int pid);                     // 1 = 存在，0 = 不存在
+// cwd：写进 out（NUL 结尾）并返回 1；没有进程上下文返回 0（调用方按 "/" 处理）。
+// ---- ★ A4-2a：每进程工作目录（chdir(80) / getcwd(79)）+ 子进程 fd 表（内核给外部程序传 fd 用）----
+int   proc64_cwd64(char* out, uint32_t cap);
+// 改变**当前进程**的 cwd（path 必须是已规范化的**绝对路径**且确实存在、是目录）。
+// 返回 0 = 成功；-2 = 不存在（ENOENT）；-20 = 不是目录（ENOTDIR）；-1 = 没有进程上下文。
+int   proc64_chdir64(const char* path);
+// 按 pid 拿它的 fd 表（proc64_create64 时分配；pid 不存在返回 nullptr）。
+struct FdTable64;
+FdTable64* proc64_fdtab_of64(int pid);
 int   proc64_count64();                           // 占用的进程槽数
 int   proc64_info64(int idx, Proc64Info* out);    // 按槽位下标取快照（0 = 该槽空）
 const char* proc64_current_name64();
