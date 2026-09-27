@@ -335,14 +335,21 @@ static uint64_t* u64_walk64(uint64_t va, int alloc) {
 // ==================== 给 syscall64 / elf64 用的页级原语 ====================
 // 说明见 usermode64.h。这里只是把上面的静态页表助手包一层，保证"用户窗口/权限位"只有一套实现。
 //
-// ★ 标志位掩码（踩过的坑，别改回去）：PTE 的**低 12 位就是权限位**（P/W/U/PWT/PCD/A/D/PAT/G），
-//   高位里只有 bit63(NX) 是权限。所以"保留权限"= (f & 0xFFF) | (f & PTE_NX)，而
-//   (f & ~0xFFF) 拿到的是**物理地址位**——曾经就是这里写成了 & ~0xFFF，结果 P|U 全被抹掉，
-//   用户页变成内核页，进 ring3 前 user64_page_is_user64() 立刻判"没映射成用户页"。
+// ★ 权限位掩码（踩过的坑，别改回去）：PTE 的低 12 位就是权限位（P/W/U/PWT/PCD/A/D/G），
+//   高位里只有 bit63(NX) 是权限，中间 bit12..51 是物理地址位。两个助手各自只做一件事：
+//     u64_leaf_keep64(f)  = f 的权限位（低 12 位 + NX）——"这次要设成什么权限"；
+//     u64_phys_bits64(p)  = p 的物理地址位（**不含** NX）——"别把物理地址写坏"。
+//   ★ A3 下半修的真缺陷：原来取物理地址写的是 `*pte & ~0xFFFULL`。那是个 64 位取反，
+//   **bit63(NX) 会留下来**，于是 mmap 给用户页打上的 NX 在 mprotect(PROT_EXEC) 之后清不掉
+//   （系统调用返回 0"成功"，页却还是 NX）。症状：动态链接器把 .so 代码段 mprotect 成 R|X
+//   之后一执行就 #PF err=0x15（P=1,U=1,I/D=1 = 取指撞 NX 页）——ld.so 完全跑不起来。
+//   同一个坑 user64_unmap_page64 早踩过并修好（那里写着"不能用 ~0xFFFULL"），这两处漏了。
 static inline uint64_t u64_leaf_keep64(uint64_t leaf_flags) {
     return (leaf_flags & 0xFFFULL) | (leaf_flags & PTE_NX_64);
 }
-
+static inline uint64_t u64_phys_bits64(uint64_t pte) {
+    return pte & 0x000FFFFFFFFFF000ULL;                          // 只取 bit12..51（物理地址）
+}
 // A1：这个 VA 是否落在"用户区"（用户窗口 4GiB..4GiB+1MiB，或 FB 映射区 5GiB..+40MiB）。
 // 页级原语的**唯一**范围判据：加一个用户区就只改这里，别在各个调用点各写一份。
 static inline bool u64_va_in_user_area64(uint64_t va) {
@@ -358,7 +365,7 @@ int user64_map_page64(uint64_t va, uint64_t leaf_flags, int alloc, uint64_t* out
     if (!pte) return 0;
     const uint64_t keep = u64_leaf_keep64(leaf_flags);
     if (*pte & PTE_PRESENT_64) {                                          // 已映射：复用物理页，只改权限
-        const uint64_t phys = *pte & ~0xFFFULL;
+        const uint64_t phys = u64_phys_bits64(*pte);                      // ★ 不能 & ~0xFFFULL（会留下 NX）
         *pte = phys | keep | PTE_PRESENT_64;
         if (out_phys) *out_phys = phys;
         return 1;
@@ -367,7 +374,7 @@ int user64_map_page64(uint64_t va, uint64_t leaf_flags, int alloc, uint64_t* out
     void* p = page_alloc_64();
     if (!p) return 0;
     u64_zero_page64(p);                                                   // 新页清零（ELF 的 .bss/栈都靠这条）
-    *pte = ((uint64_t)(uintptr_t)p & ~0xFFFULL) | keep | PTE_PRESENT_64;
+    *pte = ((uint64_t)(uintptr_t)p & 0x000FFFFFFFFFF000ULL) | keep | PTE_PRESENT_64;
     if (out_phys) *out_phys = (uint64_t)(uintptr_t)p;
     return 1;
 }
@@ -375,21 +382,23 @@ int user64_map_page64(uint64_t va, uint64_t leaf_flags, int alloc, uint64_t* out
 // ==================== A1：把**指定物理页**映射进用户地址空间（显存/后备缓冲共享）====================
 // 与 user64_map_page64 的分工：这里**不分配物理页**（页是内核的，用户只是"另一份可读写映射"），
 // 也因此**不负责回收** —— 调用方（syscall64 的 fb_map）只把 fb_surface_phys64() 给的物理页挂上去。
-// 顺序：先夹取参数 -> 页表走法/权限位复用既有实现（u64_walk64 负责补中间层并统一打开 U/S）。
 int user64_map_phys_page64(uint64_t va, uint64_t phys, uint64_t leaf_flags) {
     if ((va & 0xFFFULL) || (phys & 0xFFFULL)) return 0;                   // 两个都必须页对齐
     if (!u64_va_in_user_area64(va)) return 0;                             // 越出用户区：拒绝
     if (phys >= 0x100000000ULL) return 0;                                 // 只映射恒等直映区（<4GB）的物理页
     uint64_t* pte = u64_walk64(va, 1);                                    // 1 = 缺 PD/PT 就分配（页表页）
     if (!pte) return 0;
-    *pte = (phys & ~0xFFFULL) | u64_leaf_keep64(leaf_flags) | PTE_PRESENT_64;
+    *pte = (phys & 0x000FFFFFFFFFF000ULL) | u64_leaf_keep64(leaf_flags) | PTE_PRESENT_64;
     return 1;
 }
 
+// ★ 唯一"改权限"的落点（mprotect / ELF 装载收紧权限都走它）。物理地址位与权限位必须
+//   分开取：`~0xFFFULL` 会留下 bit63(NX)，于是"清 NX"永远清不掉（详见上面 u64_phys_bits64
+//   的说明；A3 下半的动态链接就是被这条挡住的）。
 int user64_remap_flags64(uint64_t va, uint64_t leaf_flags) {
     uint64_t* pte = u64_walk64(va, 0);
     if (!pte || !(*pte & PTE_PRESENT_64)) return 0;
-    *pte = (*pte & ~0xFFFULL) | u64_leaf_keep64(leaf_flags) | PTE_PRESENT_64;
+    *pte = u64_phys_bits64(*pte) | u64_leaf_keep64(leaf_flags) | PTE_PRESENT_64;
     return 1;
 }
 
@@ -406,7 +415,6 @@ uint64_t user64_unmap_page64(uint64_t va) {
 }
 
 void user64_paging_sync64() { u64_flush_tlb64(); }
-
 // ---- 进 ring3 前的内核栈：TSS.rsp0（ring3 中断/异常）与 SYSCALL 入口栈 ----
 // 两者不能共用同一块内存：中断帧压在 [rsp0-0xD0, rsp0)，而 SYSCALL 入口也自己压 0xD0 的帧，
 // 一旦共用就会互相覆盖 rip/cs/rsp 槽（既有模块为此开过一个全局专用栈）。

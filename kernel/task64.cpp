@@ -58,6 +58,10 @@ struct Task64 {
     uint64_t mm_cr3;         // 切到这个任务时要装载的 CR3（0 = 内核地址空间；proc64 算好）
     uint64_t mm_fs_base;     // IA32_FS_BASE（TLS）：进程私有的 FS 基址（0 = 内核默认）
     uint64_t syscall_kstack; // SYSCALL 入口专用栈顶（= stack_top - 4KB；任务 0 / 无则 0）
+    // ★ A3 下半：FPU/xmm 上下文（fxsave64 区，512 字节，必须 16 字节对齐 —— 见文件里
+    //   task64_fpu_* 那一整段：为什么必须做、在哪两处保存/恢复、怎么证明互不污染）
+    uint8_t  fpu_area[512] __attribute__((aligned(16)));
+    uint32_t fpu_valid;      // 1 = fpu_area 里是这个任务的有效现场（0 = 从没用过 FPU）
     char     name[TASK64_NAME_MAX];
 };
 
@@ -166,6 +170,81 @@ static void task_apply_ctx64(Task64* n) {
     task64_load_cr364(n->mm_cr3 ? n->mm_cr3 : g_task64_kernel_cr364);
     task64_load_fs_base64(n->proc ? n->mm_fs_base : 0);
     if (task64_cred_hook64) task64_cred_hook64(n->proc);        // ★ P4：proc=nullptr -> 恢复会话身份
+}
+
+// ==================== ★ A3 下半：FPU/xmm 上下文切换 ====================
+// 为什么必须做（真缺陷，不是"加固"）：
+//   xmm0..15 与 MXCSR 是**全局 CPU 状态**。ring3 程序会用 SSE（musl 的静态库、C 的浮点、
+//   以及本批的 /xmmsse.elf），任务切换若不保存/恢复它们，两个进程交替做浮点/SSE 运算时
+//   会互相污染 —— 症状是"数值随机错"，极难定位。修法：每个 TCB 一个 512B 的 fxsave64 区
+//   （fpu_area，16 字节对齐）：切走前对旧任务 fxsave64、切进来前对新任务 fxrstor64。
+// 在哪两处（任务真正换人的地方只有这两处）：
+//   * schedule64（PIT 抢占式切换）：时间片用完、真换人时；
+//   * task_exit64（任务自杀式切换）：死任务的现场不用存，取目标任务的即可。
+// 没跑过 FPU 的任务：fpu_valid = 0 -> 恢复**启动期抓的干净模板**（xmm 全 0、MXCSR=0x1F80）。
+// 打点：只打前 8 次切换（PIT 250Hz 全打会刷屏）：[TASK64] fpu save slot=<a> restore slot=<b> n=<k>
+//   —— 与用户态 /xmmsse.elf 两个进程各自的 ok=1 一起构成"xmm 互不污染"的证据。
+// 打开条件：FXSAVE 需要 CR4.OSFXSR=1、CR0.EM/TS=0。usermode64.cpp 的 u64_fpu_enable64 只在
+// "进 ring3 之前"开，而调度器可能更早就在内核线程之间切换任务，所以这里在 task_init64 里
+// 也开一次（同一个动作；打点 [TASK64] fpu init …）。
+static uint8_t  g_task64_fpu_init64[512] __attribute__((aligned(16)));
+static uint32_t g_task64_fpu_switches64 = 0;
+static uint32_t g_task64_fpu_logged64 = 0;
+
+static inline void t64_fxsave64(void* p) { __asm__ volatile("fxsave64 (%0)" :: "r"(p) : "memory"); }
+static inline void t64_fxrstor64(const void* p) { __asm__ volatile("fxrstor64 (%0)" :: "r"(p) : "memory"); }
+
+static void task64_fpu_enable64() {
+    uint64_t cr0 = 0, cr4 = 0;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    const uint64_t cr0_new = cr0 & ~((uint64_t)0x4u | (uint64_t)0x8u);   // 清 CR0.EM/CR0.TS
+    if (cr0_new != cr0) __asm__ volatile("mov %0, %%cr0" :: "r"(cr0_new) : "memory");
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    const uint64_t cr4_new = cr4 | ((uint64_t)1u << 9) | ((uint64_t)1u << 10);   // OSFXSR | OSXMMEXCPT
+    if (cr4_new != cr4) __asm__ volatile("mov %0, %%cr4" :: "r"(cr4_new) : "memory");
+
+    // 干净模板：xmm0..15 清零 + MXCSR = 默认 0x1F80，然后 fxsave64 抓下来
+    uint32_t mxcsr = 0x1F80u;
+    __asm__ volatile(
+        "xorps %%xmm0, %%xmm0\n\t"  "xorps %%xmm1, %%xmm1\n\t"  "xorps %%xmm2, %%xmm2\n\t"
+        "xorps %%xmm3, %%xmm3\n\t"  "xorps %%xmm4, %%xmm4\n\t"  "xorps %%xmm5, %%xmm5\n\t"
+        "xorps %%xmm6, %%xmm6\n\t"  "xorps %%xmm7, %%xmm7\n\t"  "xorps %%xmm8, %%xmm8\n\t"
+        "xorps %%xmm9, %%xmm9\n\t"  "xorps %%xmm10, %%xmm10\n\t" "xorps %%xmm11, %%xmm11\n\t"
+        "xorps %%xmm12, %%xmm12\n\t" "xorps %%xmm13, %%xmm13\n\t" "xorps %%xmm14, %%xmm14\n\t"
+        "xorps %%xmm15, %%xmm15\n\t"
+        "ldmxcsr %0\n\t"
+        "fxsave64 %1\n\t"
+        :: "m"(mxcsr), "m"(g_task64_fpu_init64) : "memory");
+    dbg64_line_begin64();
+    dbg64_str("[TASK64] fpu init sse=1 cr4=");
+    dbg64_hex64(cr4_new);
+    dbg64_str(" cr0=");
+    dbg64_hex64(cr0_new);
+    dbg64_str(" template=clean (xmm0-15=0 mxcsr=0x1f80)\n");
+    dbg64_line_end64();
+}
+
+// 切换点的唯一入口：存旧、取新、计数、前 8 次打点。
+// slot_from / slot_to 只用于打点（-1 = 无，例如"从没有任务的上下文切过来"）。
+static void task64_fpu_switch64(Task64* from, Task64* to, int slot_from, int slot_to) {
+    if (from) { t64_fxsave64(from->fpu_area); from->fpu_valid = 1; }
+    if (to) {
+        if (to->fpu_valid) t64_fxrstor64(to->fpu_area);
+        else t64_fxrstor64(g_task64_fpu_init64);
+    }
+    g_task64_fpu_switches64++;
+    if (g_task64_fpu_logged64 < 8) {
+        g_task64_fpu_logged64++;
+        dbg64_line_begin64();
+        dbg64_str("[TASK64] fpu save slot=");
+        dbg64_dec((uint64_t)(slot_from < 0 ? 0 : slot_from));
+        dbg64_str(" restore slot=");
+        dbg64_dec((uint64_t)(slot_to < 0 ? 0 : slot_to));
+        dbg64_str(" n=");
+        dbg64_dec(g_task64_fpu_switches64);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
 }
 
 // ==================== 小工具 ====================
@@ -380,6 +459,8 @@ extern "C" void schedule64(pt_regs64* r) {
         if (i != g_cur && g_tasks[i].state == TASK64_DEAD) task_queue_reap(i);
     }
 
+    // ★ A3 下半：时间片用完、真换人时才做 FPU/xmm 上下文切换（没换人就什么都不用做）
+
     if (c->slice_left > 0) c->slice_left--;
     if (c->slice_left > 0) return;          // 时间片未用完：iretq 回去继续跑
 
@@ -396,6 +477,7 @@ extern "C" void schedule64(pt_regs64* r) {
     n->switches++;
     n->slice_left = n->slice_ticks ? n->slice_ticks : TASK64_SLICE_TICKS;   // 每任务时间片（set_slice 可改）
     g_switch_total++;
+    task64_fpu_switch64(c, n, (int)(c - &g_tasks[0]), next);  // ★ A3 下半：存旧任务的 xmm0-15/MXCSR、取新任务的
     task_apply_ctx64(n);                    // ★ rsp0 + syscall 栈顶 + CR3（每进程地址空间）+ FS 基址
     task_frame_guard64("sched", n, next);    // ★ 同上：目标帧不自洽就停下报告，不 iretq
     task_switch_iret64(n->frame);           // 不返回
@@ -426,6 +508,7 @@ extern "C" [[noreturn]] void task_trampoline64() {
 void task_init64() {
     if (g_cur >= 0) return;                 // 幂等
     tz_memset(g_tasks, 0, sizeof(g_tasks));
+    task64_fpu_enable64();                   // ★ A3 下半：开 CR4.OSFXSR + 抓"干净 xmm 模板"（见上）
     g_reap_count = 0;
 
     Task64* t = &g_tasks[0];
@@ -519,7 +602,18 @@ static int task_create_ex64(const char* name, void (*entry)(void*), void* arg, u
     t->id         = (uint32_t)g_next_id++;
     tz_strcpy_n(t->name, name ? name : "task", TASK64_NAME_MAX);
     t->frame      = task_build_frame(t->stack_top);
-    t->state      = TASK64_READY;
+    // ★ A3 下半修的真缺陷（调度侧兜底）：**新任务不能在本语句之后立刻可跑**。
+    //   原来这里直接 state = READY —— 而"建任务"与"把任务绑到进程"（proc64_start_elf64 里的
+    //   task_bind_proc64(…)）是**两条语句**：PIT 正好落进去时新任务会先跑起来，此时
+    //   g_tasks[slot].proc 还是 nullptr -> proc64_current_pid64() == -1（fd 表 / FS 基址 / pid
+    //   全丢）。实测两种症状：① musl 的 arch_prctl(ARCH_SET_FS) 走不到 proc64_set_fs_base64，
+    //   之后 %fs 访问 #PF（cr2=0）；② fork 出来的子进程 close(3)/read(3) 得 EBADF，
+    //   ring3 pipe 演示 TIMEOUT（[PROC64] pipe-demo TIMEOUT）。
+    //   改成 SLEEP 到下一个 tick（≥1 tick = 4ms）：task_wake_scan 在下一个 PIT 里把它唤醒，
+    //   而 proc64 的绑定就在同一段内核代码里紧随其后（期间不会让出 CPU）—— 窗口从此不存在。
+    //   代价：每个新任务晚起 1 个 tick；所有调用方都是秒级超时，无感。
+    t->state      = TASK64_SLEEP;
+    t->wake_tick  = g_ticks64 + 1;
 
     g_task_count++;
 
@@ -886,7 +980,10 @@ void task_sleep64(uint32_t ms) {
     n->state = TASK64_RUNNING;
     n->switches++;
     n->slice_left = n->slice_ticks ? n->slice_ticks : TASK64_SLICE_TICKS;   // 同上：每任务时间片
-    g_switch_total++;
+    g_switch_total++;                            // ★ 自杀路径也算一次切换（原来就在这条语句上，
+                                                 //   A3 下半插 FPU 那一行时**别把它挤掉** ——
+                                                 //   task_switch_total64() 是 taskmgr/诊断打点的来源）
+    task64_fpu_switch64(nullptr, n, me, next);   // ★ A3 下半：死任务的现场不用存，只取目标任务的
     task_apply_ctx64(n);                     // ★ 同上：交给下一个任务前把上下文全部装载好
     task_frame_guard64("exit", n, next);     // ★ 切走前校验目标帧（垃圾帧 -> 停下报告，绝不 iretq）
     task_switch_iret64(n->frame);            // 不返回
@@ -937,12 +1034,27 @@ int task_slot_of_id64(uint32_t id) {
 }
 // 把一个任务绑定到进程的地址空间。必须在任务被调度到之前调用（proc64 在 fork 里
 // 是在关中断的系统调用上下文里做的，PIT 进不来，不存在"先跑起来再绑定"的窗口）。
+// ★ A3 下半实测提醒：**这条假设在 proc64_start_elf64 的"建任务 -> 绑定"路径上不成立**
+//   （任务建好就 READY，PIT 正好落进那两条语句之间时新任务会先跑起来、proc 还是 nullptr；
+//   症状是 musl 的 arch_prctl(ARCH_SET_FS) 走不到 proc64_set_fs_base64，TLS/errno 立刻 #PF
+// 把一个任务绑定到进程的地址空间。必须在任务被调度到之前调用（proc64 在 fork 里
+// 是在关中断的系统调用上下文里做的，PIT 进不来，不存在"先跑起来再绑定"的窗口）。
+// ★ A3 下半实测提醒：**这条假设在 proc64_start_elf64 / fork 的"建任务 -> 绑定"路径上不成立**
+//   （任务建好就 READY，PIT 正好落进那两条语句之间时新任务会先跑起来、proc 还是 nullptr；
+//   症状是 musl 的 arch_prctl(ARCH_SET_FS) 走不到 proc64_set_fs_base64，TLS/errno 立刻 #PF
+//   cr2=0）。task_create_ex64 因此把新任务先挂成 TASK64_SLEEP(wake=下一 tick)，
+//   这里**绑定成功就立刻放行**（把窗口收成"零"：绑定语句一执行任务就可跑）。
 int task_bind_proc64(uint32_t task_id, void* proc, uint64_t cr3, uint64_t fs_base) {
     const int slot = task_slot_of_id64(task_id);
     if (slot < 0) return -1;
-    g_tasks[slot].proc        = proc;
-    g_tasks[slot].mm_cr3      = cr3;
-    g_tasks[slot].mm_fs_base  = fs_base;
+    Task64* t = &g_tasks[slot];
+    t->proc        = proc;
+    t->mm_cr3      = cr3;
+    t->mm_fs_base  = fs_base;
+    if (t->state == TASK64_SLEEP && t->wake_tick > g_ticks64) {   // 还没到"下一 tick"：立刻放行
+        t->wake_tick = 0;
+        t->state = TASK64_READY;
+    }
     return 0;
 }
 // 只改地址空间参数（arch_prctl(ARCH_SET_FS) 之后要立刻生效；CR3 在 execve 后不变）

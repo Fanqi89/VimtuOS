@@ -1155,10 +1155,32 @@ static int64_t lx64_fsync64(uint64_t fd) {
 //     * 立刻写 MSR（当前任务正在跑，立刻生效）；非规范地址返回 -EINVAL（wrmsr 会 #GP）。
 //   没有进程上下文时（例如任务 0 里的 int 0x80）退回按值记录，仍然返回 0 并如实说明。
 static uint64_t g_lx_fs_base64 = 0;
+// ★ A3 下半：待补的 FS 基址（0 = 没有）。见下面 ARCH_SET_FS 的兜底说明。
+static uint64_t g_lx_fs_pending64 = 0;
+// 在"有进程"的系统调用入口调一次：把待补的 FS 基址落到进程 + 当前任务 + MSR 上。
+// 为什么放在分发入口（而不是挂在 fork/execve 上）：竞态窗口里那次 ARCH_SET_FS 之后，
+// 进程的下一次系统调用**一定**已经在 proc64 绑好之后了（task_bind_proc64 紧随
+// task_create64），所以这里补写就是"第一次机会、且确实有效"。
+static void lx64_fs_pending_flush64() {
+    if (!g_lx_fs_pending64) return;
+    if (!lx64_have_proc64() || proc64_current_pid64() <= 0) return;
+    const uint64_t v = g_lx_fs_pending64;
+    g_lx_fs_pending64 = 0;
+    if (proc64_set_fs_base64(v) != 0) g_lx_fs_pending64 = v;        // 失败（非规范地址）：留着
+}
 static int64_t lx64_arch_prctl64(uint64_t nr, uint64_t code, uint64_t arg) {
     if (code == 0x1002u) {                                          // ARCH_SET_FS
         if (lx64_have_proc64() && proc64_current_pid64() > 0) return proc64_set_fs_base64(arg);
+        // ★ A3 下半兜底（真缺陷，详见 task64.cpp 的 task_bind_proc64 注释）：
+        //   proc64_start_elf64 是"先建任务（立刻 READY）再绑定进程"，PIT 正好落进那两条语句
+        //   之间时，新任务会先跑起来 —— 此时 g_tasks[].proc 还是 nullptr，于是本行上面的
+        //   proc64_set_fs_base64 **走不到**：FS.base 从来没写进 MSR。musl 的 TLS/errno 就在
+        //   %fs 上，立刻 #PF（实测 cr2=0、时序相关：同一份内核有的启动过、有的不过）。
+        //   兜底：记住这次请求，等这个进程真正有了 pid 的下一次系统调用再补写
+        //   （proc64_set_fs_base64 会同时更新进程记账 + 当前任务 + MSR，之后任务切换也能恢复）。
+        //   真正的修法在 proc64.cpp（先绑再放行 / task_create64 收 proc 参数）—— 本批不动它。
         g_lx_fs_base64 = arg;
+        g_lx_fs_pending64 = arg;
         return 0;
     }
     if (code == 0x1003u) {                                          // ARCH_GET_FS
@@ -1169,7 +1191,6 @@ static int64_t lx64_arch_prctl64(uint64_t nr, uint64_t code, uint64_t arg) {
     }
     return -LX64_EINVAL;                                            // SET_GS/GET_GS 等：本内核没有
 }
-
 // ---- 22）pipe / pipe2 ----（批次 D：fd64 的真管道对象；pipe2 的 flags 忽略并如实注明）
 // 语义：64 字节环形缓冲 + 读端/写端两个 fd（fd64_pipe64）。**没有阻塞**（没有等待队列/
 //   唤醒原语）：写满 -> 短写；完全没有空间 -> -EAGAIN；读空且写端还开着 -> -EAGAIN；
@@ -1280,6 +1301,7 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
         const uint64_t nr = r->rax;
         const uint64_t a1 = r->rdi, a2 = r->rsi, a3 = r->rdx;
         int64_t ret;
+        lx64_fs_pending_flush64();          // ★ A3 下半：补写竞态窗口里没落地的 ARCH_SET_FS
         if (nr == 60 || nr == 231) {                       // exit / exit_group
             syscall64_log_insn64(nr, a1, a2, a3, 0);
             if (user64_exit_to_kernel64(r, a1)) {

@@ -466,6 +466,236 @@ static void musl64_demo64(const char* path) {
     dbg64_nl();
     dbg64_line_end64();
 }
+
+// ==================== ★ A3 下半：动态链接（PT_INTERP）+ FPU/xmm 上下文回归 ====================
+// 四份内嵌产物（build64.sh 里 objcopy 成 .o；符号名按输入路径生成）：
+//   ldvimtu.so   我们的动态链接器（装到 /lib/ldvimtu.so）
+//   libfoo.so    演示共享库（装到 /lib/libfoo.so）
+//   dynhello.elf 动态主程序（装到 /dynhello.elf；PT_INTERP = /lib/ldvimtu.so）
+//   xmmsse.elf   FPU/xmm 回归程序（装到 /xmmsse.elf；两个进程同时跑）
+extern "C" const uint8_t _binary_build64_ldvimtu_so_start[];
+extern "C" const uint8_t _binary_build64_ldvimtu_so_end[];
+extern "C" const uint8_t _binary_build64_libfoo_so_start[];
+extern "C" const uint8_t _binary_build64_libfoo_so_end[];
+extern "C" const uint8_t _binary_build64_dynhello_elf_start[];
+extern "C" const uint8_t _binary_build64_dynhello_elf_end[];
+extern "C" const uint8_t _binary_build64_xmmsse_elf_start[];
+extern "C" const uint8_t _binary_build64_xmmsse_elf_end[];
+
+static const char DYNLINK_MAIN64[]  = "/dynhello.elf";
+static const char DYNLINK_LIBDIR64[] = "/lib";
+static const char DYNLINK_INTERP64[] = "/lib/ldvimtu.so";
+static const char DYNLINK_LIB64[]   = "/lib/libfoo.so";
+static const char XMM64_PATH64[]    = "/xmmsse.elf";
+
+// 幂等安装一份内嵌 blob：已存在就 skipped (exists)；目录不存在先建（/lib）
+static int dynlink64_install_file64(const char* path, const uint8_t* p, const uint8_t* e, const char* what) {
+    const int len = (int)(e - p);
+    if (len <= 0) {
+        dbg64_line_begin64();
+        dbg64_str("[DYNLINK] FAILED reason=blob-empty file=");
+        dbg64_str(what);
+        dbg64_str("\n");
+        dbg64_line_end64();
+        return -1;
+    }
+    uint32_t ty = 0, sz = 0;
+    if (vfs64_stat(path, &ty, &sz) == 0) {
+        dbg64_line_begin64();
+        dbg64_str("[ELF64] install skipped (exists) ");
+        dbg64_str(path);
+        dbg64_str(" size=");
+        dbg64_dec(sz);
+        dbg64_nl();
+        dbg64_line_end64();
+        return 0;
+    }
+    if (vfs64_write(path, p, len) != len) {
+        dbg64_line_begin64();
+        dbg64_str("[DYNLINK] FAILED reason=write path=");
+        dbg64_str(path);
+        dbg64_str("\n");
+        dbg64_line_end64();
+        return -1;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[ELF64] install ok path=");
+    dbg64_str(path);
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)len);
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+
+// 三份动态链接产物（/lib 目录 + 两个文件 + 主程序）幂等安装到 VimtuFS2
+static int dynlink64_install64() {
+    (void)vfs64_mkdir64(DYNLINK_LIBDIR64);        // 已存在 -> 返回非 0，无所谓
+    int rc = 0;
+    rc |= dynlink64_install_file64(DYNLINK_INTERP64, _binary_build64_ldvimtu_so_start, _binary_build64_ldvimtu_so_end, "ldvimtu.so");
+    rc |= dynlink64_install_file64(DYNLINK_LIB64, _binary_build64_libfoo_so_start, _binary_build64_libfoo_so_end, "libfoo.so");
+    rc |= dynlink64_install_file64(DYNLINK_MAIN64, _binary_build64_dynhello_elf_start, _binary_build64_dynhello_elf_end, "dynhello.elf");
+    return rc;
+}
+
+// 等一个进程退出（有界）：返回 1 = 已退出（*out_code 有效），0 = 超时
+static int dynlink64_wait64(int pid, uint32_t max_ticks, int* out_code) {
+    const uint64_t t0 = g_ticks64;
+    while (g_ticks64 - t0 < (uint64_t)max_ticks) {
+        const int st = k64_proc_state_of64(pid);
+        if (st == (int)PROC64_EXITED) {
+            for (int i = 0; i < PROC64_MAX; i++) {
+                Proc64Info in;
+                if (proc64_info64(i, &in) == 0) continue;
+                if ((int)in.pid == pid) { if (out_code) *out_code = in.exit_code; break; }
+            }
+            return 1;
+        }
+        if (st < 0) break;                        // 进程没了（理论上不该）
+        task_sleep64(2);
+    }
+    return 0;
+}
+
+// 启动期演示：跑 /dynhello.elf（真进程；PT_INTERP -> 内核先装 /lib/ldvimtu.so）
+// 打点（tests/dynlink64_test.py grep）：
+//   [DYNLINK] launch path=/dynhello.elf pid=<n>
+//   [DYNLINK] done pid=<n> exited=<0|1> code=<n> ticks=<n>
+//   [DYNLINK] PASS  /  FAILED reason=<create|start|timeout|code>  /  skipped (…)
+static void dynlink64_demo64(const char* path) {
+    const char* p = (path && path[0] == '/') ? path : DYNLINK_MAIN64;
+    if (!user64_available64()) {
+        dbg64_line_begin64();
+        dbg64_str("[DYNLINK] skipped (user window unavailable on this boot path)\n");
+        dbg64_line_end64();
+        return;
+    }
+    if (dynlink64_install64() != 0) return;
+    if (!proc64_isolate64()) {
+        dbg64_line_begin64();
+        dbg64_str("[DYNLINK] skipped (shared address space mode)\n");
+        dbg64_line_end64();
+        return;
+    }
+    const int pid = proc64_create64("dynhello", 0);
+    if (pid <= 0) {
+        dbg64_line_begin64();
+        dbg64_str("[DYNLINK] FAILED reason=create\n");
+        dbg64_line_end64();
+        return;
+    }
+    if (proc64_start_elf64(pid, p) != 0) {
+        if (proc64_find64(pid)) proc64_destroy64(pid);
+        dbg64_line_begin64();
+        dbg64_str("[DYNLINK] FAILED reason=start path=");
+        dbg64_str(p);
+        dbg64_nl();
+        dbg64_line_end64();
+        return;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[DYNLINK] launch path=");
+    dbg64_str(p);
+    dbg64_str(" pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_nl();
+    dbg64_line_end64();
+
+    const uint64_t t0 = g_ticks64;
+    int code = -1;
+    const int exited = dynlink64_wait64(pid, (uint32_t)PIT_HZ_64 * 10u, &code);
+    if (!exited) (void)proc64_kill64(pid, 9);
+    if (proc64_find64(pid)) proc64_destroy64(pid);
+    dbg64_line_begin64();
+    dbg64_str("[DYNLINK] done pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_str(" exited=");
+    dbg64_dec((uint64_t)(exited ? 1 : 0));
+    dbg64_str(" code=");
+    if (code < 0) dbg64_putc('-');
+    dbg64_dec((uint64_t)(code < 0 ? -code : code));
+    dbg64_str(" ticks=");
+    dbg64_dec(g_ticks64 - t0);
+    dbg64_nl();
+    dbg64_line_end64();
+    dbg64_line_begin64();
+    if (exited && code == 0) {
+        dbg64_str("[DYNLINK] PASS\n");
+    } else {
+        dbg64_str("[DYNLINK] FAILED reason=");
+        dbg64_str(exited ? "code" : "timeout");
+        dbg64_nl();
+    }
+    dbg64_line_end64();
+}
+
+// FPU/xmm 回归：同一个 ELF（/xmmsse.elf）起**两个**真进程，各自把 xmm0..15 初始化成
+// pid 相关的模式、循环 300 轮（每轮 +1 并 nanosleep 让出 CPU），每 10 轮核对一次自己的
+// 16 个 xmm 是否还是"自己的值"。两个进程交替运行 —— 内核若在任务切换处不保存/恢复
+// xmm+MXCSR，双方立刻互相污染，程序会打印 ok=0 并以退出码 1 结束。
+// 打点（tests/dynlink64_test.py grep）：
+//   [TASK64] fpu demo spawn A=<pidA> B=<pidB>
+//   [TASK64] fpu demo A=<codeA> B=<codeB> PASS|FAIL
+static void fpu64_demo64(const char* path) {
+    const char* p = (path && path[0] == '/') ? path : XMM64_PATH64;
+    if (!user64_available64()) {
+        dbg64_line_begin64();
+        dbg64_str("[TASK64] fpu demo skipped (user window unavailable)\n");
+        dbg64_line_end64();
+        return;
+    }
+    if (dynlink64_install_file64(p, _binary_build64_xmmsse_elf_start, _binary_build64_xmmsse_elf_end, "xmmsse.elf") != 0) return;
+    if (!proc64_isolate64()) {
+        dbg64_line_begin64();
+        dbg64_str("[TASK64] fpu demo skipped (shared address space mode)\n");
+        dbg64_line_end64();
+        return;
+    }
+
+    int pids[2] = { -1, -1 };
+    int spawned = 0;
+    for (int k = 0; k < 2; k++) {
+        const int pid = proc64_create64(k ? "xmmB" : "xmmA", 0);
+        if (pid <= 0) break;
+        if (proc64_start_elf64(pid, p) != 0) {
+            if (proc64_find64(pid)) proc64_destroy64(pid);
+            break;
+        }
+        pids[k] = pid;
+        spawned++;
+    }
+    if (spawned < 2) {
+        for (int k = 0; k < 2; k++) if (pids[k] > 0 && proc64_find64(pids[k])) proc64_destroy64(pids[k]);
+        dbg64_line_begin64();
+        dbg64_str("[TASK64] fpu demo spawn FAILED (cannot create 2 procs)\n");
+        dbg64_line_end64();
+        return;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[TASK64] fpu demo spawn A=");
+    dbg64_dec((uint64_t)pids[0]);
+    dbg64_str(" B=");
+    dbg64_dec((uint64_t)pids[1]);
+    dbg64_nl();
+    dbg64_line_end64();
+
+    int codes[2] = { -1, -1 };
+    int exited[2] = { 0, 0 };
+    for (int k = 0; k < 2; k++) exited[k] = dynlink64_wait64(pids[k], (uint32_t)PIT_HZ_64 * 15u, &codes[k]);
+    for (int k = 0; k < 2; k++) {
+        if (!exited[k]) (void)proc64_kill64(pids[k], 9);
+        if (proc64_find64(pids[k])) proc64_destroy64(pids[k]);
+    }
+    const int pass = (exited[0] && exited[1] && codes[0] == 0 && codes[1] == 0);
+    dbg64_line_begin64();
+    dbg64_str("[TASK64] fpu demo A=");
+    dbg64_dec((uint64_t)(uint32_t)codes[0]);
+    dbg64_str(" B=");
+    dbg64_dec((uint64_t)(uint32_t)codes[1]);
+    dbg64_str(pass ? " PASS\n" : " FAIL\n");
+    dbg64_line_end64();
+}
+
 #endif
 
 #ifndef VIMTU_INSTALLER_MEDIA
@@ -478,7 +708,6 @@ static void musl64_demo64(const char* path) {
 //      声明都集中在 kernel/rust64.h，这里只放钩子与启动打点。
 // 打点格式（自动验收 grep，勿改）：[RUST64] tokens ok themes=N accent=#RRGGBB selftest PASS
 extern "C" void rust64_panic_hook64(const uint8_t* msg, uint32_t len) {
-    // Rust 侧 panic：先把现场打到串口（msg 是 NUL 结尾的 UTF-8），再走内核统一蓝屏。
     // panic64_bsod64 不返回；万一它返回了，Rust 侧自己还有 `cli; hlt` 兜底。
     (void)len;
     dbg64_str("[RUST64] panic hook: ");
@@ -695,6 +924,14 @@ static void rust64_boot_init64() {
                 //   proc64 的 fork/pipe/slotreuse 演示都对进程表/日志有断言（tests/proc64_test.py、
                 //   tmgr_proc_test.py 等），musl 那段要多建/多收一个进程 —— 排最后最不容易搅动它们。
                 musl64_demo64(MUSL64_PATH64);
+                // ---- ★ A3 下半：动态链接（PT_INTERP）+ FPU/xmm 上下文切换回归 ----
+                // 位置：同样排在整段 ring3 演示的最后（跑完还要能进桌面）。两者都会多建/多收
+                // 进程（动态链接 1 个、FPU 回归 2 个），排最后最不容易搅动前面那些脚本的断言。
+                //   dynlink64_demo64：/dynhello.elf —— 内核先装 /lib/ldvimtu.so（解释器），
+                //     再由 ld.so 加载 /lib/libfoo.so、做三类重定位、调 DT_INIT/DT_INIT_ARRAY；
+                //   fpu64_demo64：/xmmsse.elf 起两个进程交替跑 SSE（xmm0..15 + MXCSR 回归）。
+                dynlink64_demo64(DYNLINK_MAIN64);
+                fpu64_demo64(XMM64_PATH64);
             } else {
                 proc64_init64();                                 // 仍然打点：mode=shared（如实）
                 (void)proc64_demo64("/proc64.elf");              // 只打一行 "demo skipped (shared address space mode)"

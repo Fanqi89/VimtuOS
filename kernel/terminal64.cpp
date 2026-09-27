@@ -4202,7 +4202,41 @@ static void shell_exec(TerminalState* ts, const char* line) {
             if (g_arg1[0] != '/') path[plen++] = '/';
             for (int i = 0; g_arg1[i] && plen < (int)sizeof(path) - 1; i++) path[plen++] = g_arg1[i];
             path[plen] = 0;
-            const int rc = elf64_run64(path);                    // 读盘 -> ELF64 校验/装载 -> ring3
+            // ★ A3 下半：优先走**真进程**（proc64）那条路 —— musl / 动态程序都要写
+            //   IA32_FS_BASE（arch_prctl 的 TLS），只有真进程路径才会真写 MSR（见 proc64.h 第 3 条）；
+            //   共享地址空间模式（UEFI/固件页表）下退回原来的 elf64_run64（与旧行为一致，如实打点）。
+            //   命令打点（自动验收 grep）：[ELF64] run cmd path=… pid=… via=proc rc=… code=…
+            int rc = -1;
+            int pid = -1;
+            int code = -1;
+            int via_proc = 0;
+            if (proc64_isolate64()) {
+                panic64_watchdog_pause64();                       // 等程序跑完期间别让看门狗误判（与 proc run 同款）
+                pid = proc64_create64("elfrun", 0);
+                if (pid > 0 && proc64_start_elf64(pid, path) == 0) {
+                    via_proc = 1;
+                    const uint64_t t0 = g_ticks64;
+                    int exited = 0;
+                    for (;;) {                                    // 有界等待：20 秒
+                        int st = -1;
+                        for (int i = 0; i < PROC64_MAX; i++) {
+                            Proc64Info in;
+                            if (proc64_info64(i, &in) == 0) continue;
+                            if ((int)in.pid == pid) { st = (int)in.state; code = in.exit_code; break; }
+                        }
+                        if (st == (int)PROC64_EXITED) { exited = 1; rc = (code == 0) ? 0 : -1; break; }
+                        if (st < 0) break;                         // 进程没了
+                        if (g_ticks64 - t0 >= (uint64_t)PIT_HZ_64 * 20u) break;
+                        task_sleep64(2);
+                    }
+                    if (!exited) { (void)proc64_kill64(pid, 9); rc = -1; }
+                    if (proc64_find64(pid)) proc64_destroy64(pid);
+                } else {
+                    if (pid > 0 && proc64_find64(pid)) proc64_destroy64(pid);
+                }
+                panic64_watchdog_unpause64();
+            }
+            if (!via_proc) rc = elf64_run64(path);                 // 共享窗口回退（老路径）
             ts_puts(ts, rc == 0 ? gui64_tr("elfrun: ok\\n", "elfrun: 成功\\n")
                                 : gui64_tr("elfrun: failed (see serial log)\\n", "elfrun: 失败（见串口日志）\\n"));
             ts_puts(ts, "[ELF64] run cmd path=");
@@ -4210,14 +4244,31 @@ static void shell_exec(TerminalState* ts, const char* line) {
             ts_puts(ts, " rc=");
             if (rc < 0) ts_putc(ts, (uint32_t)'-');
             ts_put_u64(ts, (uint64_t)(rc < 0 ? -rc : rc));
+            if (via_proc) {                                        // 真进程路径：把 pid/退出码也写在屏上
+                ts_puts(ts, " via=proc pid=");
+                ts_put_u64(ts, (uint64_t)pid);
+                ts_puts(ts, " code=");
+                if (code < 0) ts_putc(ts, (uint32_t)'-');
+                ts_put_u64(ts, (uint64_t)(code < 0 ? -code : code));
+            }
             ts_putc(ts, (uint32_t)'\n');
             dbg64_str("[ELF64] run cmd path=");
             dbg64_str(path);
             dbg64_str(" rc=");
             if (rc < 0) dbg64_putc('-');
             dbg64_dec((uint64_t)(rc < 0 ? -rc : rc));
+            if (via_proc) {
+                dbg64_str(" via=proc pid=");
+                dbg64_dec((uint64_t)pid);
+                dbg64_str(" code=");
+                if (code < 0) dbg64_putc('-');
+                dbg64_dec((uint64_t)(code < 0 ? -code : code));
+            } else {
+                dbg64_str(" via=shared");
+            }
             dbg64_nl();
-            ok = (rc == 0);
+            ok = (rc == 0);                                    // ★ 成功/失败照旧反映到 shell 的 $?
+                                                               //   （A3 下半改这条命令时误删过这一行）
         }
     } else if (st_eq(g_cmd, "task") || st_eq(g_cmd, "tasks") || st_eq(g_cmd, "top")) {
         cmd_ps(ts, g_arg1);  // 与 ps 同一份真实快照（top 不做全屏刷新，只打一次）

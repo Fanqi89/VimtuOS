@@ -58,12 +58,16 @@ static uint32_t e_strlen(const char* s) { uint32_t n = 0; if (!s) return 0; whil
 #define ELF64_EHDR_SIZE     64u
 #define ELF64_PHDR_SIZE     56u
 #define ELF64_PT_LOAD       1u
+#define ELF64_PT_DYNAMIC    2u
+#define ELF64_PT_INTERP     3u
 #define ELF64_PF_X          0x1u
 #define ELF64_PF_W          0x2u
 #define ELF64_PF_R          0x4u
 #define ELF64_ET_EXEC       2u
 #define ELF64_ET_DYN        3u
 #define ELF64_EM_X86_64     0x3Eu
+// ★ A3 下半：PT_INTERP 的解释器路径缓冲（Linux 的 realpath 上限远大于此，演示/验收够用）
+#define ELF64_INTERP_PATH_MAX64 96u
 
 // 装载区（用户窗口的低 64KiB）
 static inline uint64_t e64_lo64() { return USER64_CODE_VA64; }
@@ -77,13 +81,17 @@ struct Elf64Seg64 {
     uint64_t memsz;     // p_memsz
     uint32_t flags;     // p_flags
 };
-
+// ★ A3 下半：解释器（PT_INTERP）的信息 —— 只有主程序的解析才填
+//   interp[] = PT_INTERP 的路径（可能不是绝对路径 -> 装载时按 /lib 搜索）
 struct Elf64Image64 {
     uint64_t entry;     // e_entry
     uint64_t phdr_va;   // 程序头表在**映像里**的地址（给 auxv AT_PHDR；算不出来 = 0）
     uint64_t phnum;     // e_phnum
+    uint64_t span;      // max(p_vaddr + p_memsz)（解释器算基址要用；主程序只是留证据）
     uint32_t nseg;      // 实际 PT_LOAD 段数
     uint32_t file_bytes;
+    uint8_t  has_interp;
+    char     interp[ELF64_INTERP_PATH_MAX64];
     Elf64Seg64 seg[ELF64_MAX_PHDR64];
 };
 
@@ -94,7 +102,10 @@ enum {
     E64_OK = 0,
     E64_ARG, E64_SIZE, E64_MAGIC, E64_CLASS, E64_DATA, E64_VERSION, E64_MACHINE, E64_TYPE,
     E64_PHDR, E64_NOSEG, E64_SEG_WINDOW, E64_SEG_REGION, E64_SEG_MEMSZ, E64_SEG_FILE,
-    E64_ENTRY, E64_LOAD, E64_STACK, E64_BUSY, E64_VFS
+    E64_ENTRY, E64_LOAD, E64_STACK, E64_BUSY, E64_VFS,
+    // ★ A3 下半：解释器（PT_INTERP）相关
+    E64_INTERP_ARG, E64_INTERP_SIZE, E64_INTERP_VFS, E64_INTERP_BAD,
+    E64_INTERP_WINDOW, E64_INTERP_LOAD
 };
 static const char* e_reason64(int rc) {
     switch (rc) {
@@ -117,6 +128,12 @@ static const char* e_reason64(int rc) {
         case E64_STACK:      return "stack";
         case E64_BUSY:       return "busy";
         case E64_VFS:        return "vfs";
+        case E64_INTERP_ARG:    return "interp-arg";
+        case E64_INTERP_SIZE:   return "interp-size";
+        case E64_INTERP_VFS:    return "interp-vfs";
+        case E64_INTERP_BAD:    return "interp-bad";
+        case E64_INTERP_WINDOW: return "interp-window";
+        case E64_INTERP_LOAD:   return "interp-load";
         default:             return "?";
     }
 }
@@ -128,7 +145,12 @@ int elf64_is_elf64(const uint8_t* p, uint32_t n) {
 
 // ==================== 解析 + 校验（只读，不打印）====================
 // 返回 E64_OK 或错误码；坏段的起始 VA 记进 *bad_va。
-static int elf64_parse64(const uint8_t* p, uint32_t n, Elf64Image64* out, uint64_t* bad_va) {
+// ★ A3 下半：参数化 — base 是**加在 p_vaddr 上的装载偏移**（主程序 = 0；解释器 = 内核挑的
+//   基址），lo/hi 是本映像各段必须完整落进去的**映像地址区间**（含 base）。PT_LOAD 的
+//   p_vaddr 先与 base 相加得到映像 VA，窗口检查按"p_vaddr 不越出 [lo-base, hi-base)"做，
+//   这样既不会溢出、也把"段跨窗口边界"挡在解析期。
+static int e64_parse_ex64(const uint8_t* p, uint32_t n, uint64_t base, uint64_t lo, uint64_t hi,
+                          Elf64Image64* out, uint64_t* bad_va) {
     if (bad_va) *bad_va = 0;
     if (!p || !out || n == 0) return E64_ARG;
     if (n < ELF64_EHDR_SIZE) return E64_SIZE;
@@ -139,8 +161,14 @@ static int elf64_parse64(const uint8_t* p, uint32_t n, Elf64Image64* out, uint64
     if (e_rd16(p + 18) != ELF64_EM_X86_64) return E64_MACHINE;
     const uint16_t etype = e_rd16(p + 16);
     if (etype != ELF64_ET_EXEC && etype != ELF64_ET_DYN) return E64_TYPE;
-
-    const uint64_t entry = e_rd64(p + 24);
+    // 区间自洽性（调用方给的）：lo < hi 且 base 不超过区间上界（否则下面 hi-base 会下溢）。
+    //   ★ 修过的一个真缺陷：这里原来写的是 `hi - base < lo` —— 那是把 base 当 0 才成立的
+    //   判据。解释器装载时 base 是**真实基址**（窗口顶部往下 span）、lo/hi 是**绝对**区间
+    //   （mmap 区..窗口顶），于是 hi-base（只剩 0x5000 字节）< lo（0x100090000）恒真 ->
+    //   解释器解析必被拒（打点 [ELF64] interp reject reason=bad）。主程序那条路 base=0，
+    //   所以两者都只是"恰好"没暴露。
+    if (hi <= lo || base > hi) return E64_SEG_WINDOW;           // 区间自洽性（调用方给的）
+    const uint64_t entry = e_rd64(p + 24) + base;
     const uint64_t phoff = e_rd64(p + 32);
     const uint16_t phentsize = e_rd16(p + 54);
     const uint16_t phnum = e_rd16(p + 56);
@@ -153,16 +181,35 @@ static int elf64_parse64(const uint8_t* p, uint32_t n, Elf64Image64* out, uint64
     out->phnum = phnum;
     out->phdr_va = 0;
     out->nseg = 0;
+    out->span = 0;
     out->file_bytes = n;
+    out->has_interp = 0;
+    out->interp[0] = 0;
 
     for (uint32_t i = 0; i < phnum; i++) {
         const uint8_t* ph = p + phoff + (uint64_t)i * ELF64_PHDR_SIZE;
-        if (e_rd32(ph + 0) != ELF64_PT_LOAD) continue;          // 非 PT_LOAD 一律忽略（无 PT_INTERP 处理）
+        const uint32_t ptype = e_rd32(ph + 0);
+        // ★ A3 下半：PT_INTERP —— 只记路径（主程序的解析才有意义）；装载时按 /lib 搜索。
+        if (ptype == ELF64_PT_INTERP) {
+            const uint64_t ioff = e_rd64(ph + 8);
+            const uint64_t ilen = e_rd64(ph + 32);
+            if (ioff >= (uint64_t)n || ilen == 0 || ilen > ELF64_INTERP_PATH_MAX64) return E64_INTERP_BAD;
+            if (ilen > (uint64_t)n - ioff) return E64_INTERP_BAD;
+            uint32_t k = 0;
+            for (; k + 1 < ilen && p[ioff + k] != 0; k++) out->interp[k] = (char)p[ioff + k];
+            out->interp[k] = 0;
+            if (k == 0) return E64_INTERP_BAD;
+            out->has_interp = 1;
+            continue;
+        }
+        if (ptype != ELF64_PT_LOAD) continue;                   // 其它非 PT_LOAD 一律忽略
         const uint32_t flags = e_rd32(ph + 4);
         const uint64_t off = e_rd64(ph + 8);
-        const uint64_t va = e_rd64(ph + 16);
+        const uint64_t pv = e_rd64(ph + 16);
         const uint64_t filesz = e_rd64(ph + 32);
         const uint64_t memsz = e_rd64(ph + 40);
+        if (pv > hi - base) { if (bad_va) *bad_va = base + pv; return E64_SEG_WINDOW; }
+        const uint64_t va = base + pv;
 
         if (memsz < filesz) { if (bad_va) *bad_va = va; return E64_SEG_MEMSZ; }
         if (filesz > (uint64_t)n || off > (uint64_t)n || filesz > (uint64_t)n - off) {
@@ -170,18 +217,19 @@ static int elf64_parse64(const uint8_t* p, uint32_t n, Elf64Image64* out, uint64
             return E64_SEG_FILE;                                // p_offset+p_filesz 越出文件
         }
         if (memsz == 0) continue;                               // 空段：跳过（合法但没意义）
-        // 目标必须完整落在用户窗口、且不碰窗口里的其它分区（栈/brk/mmap/自检页）
-        if (va < e64_lo64() || memsz > e64_hi64() - e64_lo64() || va + memsz > e64_hi64()) {
+        // 目标必须完整落在本次给它的映像区间、且不碰区间里的其它分区（栈/brk/mmap/自检页）
+        if (va < lo || memsz > hi - lo || va + memsz > hi) {
             if (bad_va) *bad_va = va;
             return E64_SEG_WINDOW;
         }
-        if (((va + memsz + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1)) > e64_hi64()) {
+        if (((va + memsz + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1)) > hi) {
             if (bad_va) *bad_va = va;
-            return E64_SEG_REGION;                              // 页对齐后压到栈区
+            return E64_SEG_REGION;                              // 页对齐后压到区间上界外
         }
         if (out->nseg >= ELF64_MAX_PHDR64) return E64_PHDR;
         Elf64Seg64* s = &out->seg[out->nseg++];
         s->va = va; s->off = off; s->filesz = filesz; s->memsz = memsz; s->flags = flags;
+        if (va + memsz > out->span) out->span = va + memsz;
 
         // AT_PHDR：程序头表落在哪个段的文件范围内，就换算成映像地址
         if (phoff >= off && phoff < off + filesz) out->phdr_va = va + (phoff - off);
@@ -198,17 +246,31 @@ static int elf64_parse64(const uint8_t* p, uint32_t n, Elf64Image64* out, uint64
     return E64_OK;
 }
 
+// 主程序/静态映像的解析（base = 0，映像区间 = 用户窗口的 ELF 装载区 4GiB..USER64_STACK_VA64）
+static int elf64_parse64(const uint8_t* p, uint32_t n, Elf64Image64* out, uint64_t* bad_va) {
+    return e64_parse_ex64(p, n, 0, e64_lo64(), e64_hi64(), out, bad_va);
+}
+
 // ==================== 已装载镜像的状态（单线程模型：同时只有一份）====================
 struct Elf64Range64 { uint64_t va; uint32_t pages; };
 struct Elf64Loaded64 {
     uint8_t  used;
-    uint64_t entry;
+    uint64_t entry;            // **执行入口**（有解释器 = 解释器入口；静态 = 主程序入口）
     uint64_t user_rsp;
+    uint64_t interp_base;      // ★ A3 下半：AT_BASE（0 = 没有解释器）
     uint32_t nrange;
-    Elf64Range64 range[ELF64_MAX_PHDR64 + 2];      // 各 PT_LOAD 各一条 + 栈一条
+    // ★ A3 下半：各 PT_LOAD 一条 + 栈一条；解释器也是映像（≤16 段），所以上限要 ×2 + 1
+    Elf64Range64 range[ELF64_MAX_PHDR64 * 2 + 2];
 };
 static Elf64Loaded64 g_loaded64;
-static Elf64Image64  g_img64;                      // 解析结果（权限收紧那一步还要用）
+static Elf64Image64  g_img64;                      // 主程序解析结果（权限收紧/auxv 还要用）
+// ★ A3 下半：本次装载的 AT_BASE（0 = 静态）。初始栈与 auxv 打点都读它。
+static uint64_t g_e64_at_base64 = 0;
+// 解释器文件缓冲（独立于主程序缓冲：先映射解释器、再映射主程序，两份内容不互相覆盖）
+static uint8_t g_elf_interp64[ELF64_MAX_FILE_BYTES64];
+// 权限收紧的按页并集表（解释器在 mmap 区、最多 448KiB = 112 页，留到 256）
+static uint64_t g_e64_page_va64[256];
+static uint64_t g_e64_page_fl64[256];
 
 // 回收（幂等）：逐页 unmap + 释放物理页。中间页表页保留不回收（同 usermode64.cpp 的说明）。
 int elf64_unload64() {
@@ -224,7 +286,9 @@ int elf64_unload64() {
     g_loaded64.used = 0;
     g_loaded64.entry = 0;
     g_loaded64.user_rsp = 0;
+    g_loaded64.interp_base = 0;
     g_loaded64.nrange = 0;
+    g_e64_at_base64 = 0;
     return 0;
 }
 
@@ -298,7 +362,7 @@ static void e64_log_auxv64(uint64_t rsp) {
     dbg64_str(" phnum=");
     dbg64_dec(g_img64.phnum);
     dbg64_str(" base=");
-    dbg64_hex64(0);
+    dbg64_hex64(g_e64_at_base64);                          // ★ A3 下半：解释器基址（静态 = 0）
     dbg64_str(" entry=");
     dbg64_hex64(g_img64.entry);
     dbg64_str(" random=");
@@ -338,7 +402,7 @@ static uint64_t e64_build_stack64(const char* argv0) {
     w[n++] = E64_AT_PHDR;   w[n++] = g_img64.phdr_va;
     w[n++] = E64_AT_PHENT;  w[n++] = ELF64_PHDR_SIZE;      // ★ A3：musl 按它步进遍历程序头表
     w[n++] = E64_AT_PHNUM;  w[n++] = g_img64.phnum;
-    w[n++] = E64_AT_BASE;   w[n++] = 0;                    // 静态：没有动态链接器（如实 0）
+    w[n++] = E64_AT_BASE;   w[n++] = g_e64_at_base64;      // ★ A3 下半：解释器基址（静态 = 0）
     w[n++] = E64_AT_ENTRY;  w[n++] = g_img64.entry;
     w[n++] = E64_AT_HWCAP;  w[n++] = 0;                    // 本内核不暴露 hwcap（如实 0）
     w[n++] = E64_AT_UID;    w[n++] = 0;
@@ -394,7 +458,7 @@ static uint64_t e64_build_stack_argv64(const char* const* argv, uint32_t argc) {
     w[m++] = E64_AT_PHDR;   w[m++] = g_img64.phdr_va;      // 程序头表在映像里的地址（加载器算好的）
     w[m++] = E64_AT_PHENT;  w[m++] = ELF64_PHDR_SIZE;      // ★ A3：musl 按它步进遍历程序头表
     w[m++] = E64_AT_PHNUM;  w[m++] = g_img64.phnum;
-    w[m++] = E64_AT_BASE;   w[m++] = 0;                    // 静态：没有动态链接器（如实 0）
+    w[m++] = E64_AT_BASE;   w[m++] = g_e64_at_base64;      // ★ A3 下半：解释器基址（静态 = 0）
     w[m++] = E64_AT_ENTRY;  w[m++] = g_img64.entry;
     w[m++] = E64_AT_HWCAP;  w[m++] = 0;                    // 本内核不暴露 hwcap（如实 0）
     w[m++] = E64_AT_UID;    w[m++] = 0;
@@ -412,6 +476,169 @@ static uint64_t e64_build_stack_argv64(const char* const* argv, uint32_t argc) {
     return rsp;
 }
 
+// ==================== 映像映射（映射段 + 拷内容 + 清 .bss + 权限收紧）====================
+// 为什么抽出来：主程序与**解释器**都走同一条 ELF64 段装载规则（只有一份实现才不会漂）。
+// 记账（range）统一记进 g_loaded64：解释器与主程序都要被 unload 回收。
+static int e64_seg_map_union64(const Elf64Image64* img, const uint8_t* p) {
+    // ---- 1) 各 PT_LOAD：先按 P|W|U 映射、拷内容、清 .bss ----
+    for (uint32_t i = 0; i < img->nseg; i++) {
+        const Elf64Seg64* s = &img->seg[i];
+        const uint64_t va0 = s->va & ~((uint64_t)PAGE_SIZE_64 - 1);
+        const uint64_t end = s->va + s->memsz;
+        const uint64_t va1 = (end + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
+        const uint32_t pages = (uint32_t)((va1 - va0) / PAGE_SIZE_64);
+        if (g_loaded64.nrange >= (uint32_t)(ELF64_MAX_PHDR64 * 2 + 2)) return E64_LOAD;
+
+        g_loaded64.range[g_loaded64.nrange].va = va0;
+        g_loaded64.range[g_loaded64.nrange].pages = pages;
+        g_loaded64.nrange++;
+
+        for (uint32_t k = 0; k < pages; k++) {
+            uint64_t phys = 0;
+            if (!user64_map_page64(va0 + (uint64_t)k * PAGE_SIZE_64,
+                                   PTE_USER_64 | PTE_WRITE_64, 1, &phys)) {
+                return E64_LOAD;
+            }
+        }
+        user64_paging_sync64();
+        uint8_t* dst = (uint8_t*)(uintptr_t)s->va;        // 已映射可写：ring0 直接按 VA 写
+        for (uint64_t b = 0; b < s->filesz; b++) dst[b] = p[s->off + b];
+        for (uint64_t b = s->filesz; b < s->memsz; b++) dst[b] = 0;
+    }
+
+    // ---- 2) 权限收紧：按 p_flags 重设各段叶子权限位 ----
+    // ★ 按**页**取并集，而不是"逐段覆盖"：两个权限不同的段可能落在同一页（页粒度权限表示不了
+    //   段粒度），逐段覆盖会让后一个段把前一页的权限抹掉（例如 .text 与 .bss 挤一页时 .text 变
+    //   可写/不可执行 -> 立刻 #PF）。并集规则：任一覆盖该页的段可写 -> 页可写；任一段可执行 ->
+    //   页可执行。自带程序用 user/hello_elf64.ld 把各段页对齐，正常不会命中这条兜底。
+    //   ★ A3 下半：表搬到 .bss 的 g_e64_page_*（256 项）—— 解释器落在 mmap 区、可能上百页。
+    {
+        uint32_t np = 0;
+        for (uint32_t i = 0; i < img->nseg; i++) {
+            const Elf64Seg64* s = &img->seg[i];
+            const uint64_t va0 = s->va & ~((uint64_t)PAGE_SIZE_64 - 1);
+            const uint64_t va1 = (s->va + s->memsz + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
+            for (uint64_t a = va0; a < va1; a += PAGE_SIZE_64) {
+                uint32_t k = 0;
+                while (k < np && g_e64_page_va64[k] != a) k++;
+                if (k == np) {
+                    if (np >= 256u) return E64_LOAD;
+                    g_e64_page_va64[np] = a;
+                    g_e64_page_fl64[np] = 0;
+                    np++;
+                }
+                g_e64_page_fl64[k] |= (uint64_t)(s->flags & (ELF64_PF_W | ELF64_PF_X));
+            }
+        }
+        for (uint32_t k = 0; k < np; k++) {
+            const uint64_t f = PTE_USER_64                                 // PF_R（x86 上 P 就是可读）
+                             | ((g_e64_page_fl64[k] & ELF64_PF_W) ? PTE_WRITE_64 : 0u)
+                             | ((g_e64_page_fl64[k] & ELF64_PF_X) ? 0u : PTE_NX_64);
+            if (!user64_remap_flags64(g_e64_page_va64[k], f)) return E64_LOAD;
+        }
+    }
+    user64_paging_sync64();                                // 权限改完了，投递到 TLB
+    return E64_OK;
+}
+
+// ==================== ★ A3 下半：解释器装载（PT_INTERP）====================
+// 步骤：路径归一化（非绝对路径 -> /lib/<name>）-> 读盘 -> 两遍解析（先定 span 再定基址）
+//       -> 映射 + 权限收紧 -> 打点。基址 = 用户窗口顶部往下 span 页（理由见 elf64.h）。
+static int e64_load_interp64(const char* in_path, uint64_t* out_base, uint64_t* out_entry) {
+    char path[ELF64_INTERP_PATH_MAX64 + 8];
+    uint32_t k = 0;
+    if (!in_path || !in_path[0]) return E64_INTERP_ARG;
+    if (in_path[0] != '/') {                                // 相对名字：按 /lib 搜索
+        static const char LIBDIR64[] = "/lib/";
+        for (uint32_t i = 0; LIBDIR64[i] && k + 1 < (uint32_t)sizeof(path); i++) path[k++] = LIBDIR64[i];
+    }
+    for (uint32_t i = 0; in_path[i] && k + 1 < (uint32_t)sizeof(path); i++) path[k++] = in_path[i];
+    path[k] = 0;
+
+    uint32_t type = 0, size = 0;
+    if (vfs64_stat(path, &type, &size) != 0 || type != VFS64_TYPE_FILE) {
+        dbg64_line_begin64();
+        dbg64_str("[ELF64] interp reject path=");
+        dbg64_str(path);
+        dbg64_str(" reason=vfs\n");
+        dbg64_line_end64();
+        return E64_INTERP_VFS;
+    }
+    if (size == 0 || size > ELF64_MAX_FILE_BYTES64) return E64_INTERP_SIZE;
+    const int rd = vfs64_read(path, g_elf_interp64, (int)sizeof(g_elf_interp64));
+    if (rd != (int)size) {
+        dbg64_line_begin64();
+        dbg64_str("[ELF64] interp reject path=");
+        dbg64_str(path);
+        dbg64_str(" reason=vfs\n");
+        dbg64_line_end64();
+        return E64_INTERP_VFS;
+    }
+
+    const uint64_t wtop  = USER64_CODE_VA64 + USER64_WINDOW_BYTES64;
+    const uint64_t avail = wtop - USER64_MMAP_VA64;          // 解释器只能落在 mmap 起点之上
+    // 第一遍：base = 0、区间 [0, avail) —— 只为量出 span（段的最大 p_vaddr+p_memsz）
+    Elf64Image64 img0;
+    uint64_t bad = 0;
+    int rc = e64_parse_ex64(g_elf_interp64, (uint32_t)rd, 0, 0, avail, &img0, &bad);
+    if (rc != E64_OK || img0.has_interp) {
+        dbg64_line_begin64();
+        dbg64_str("[ELF64] interp reject path=");
+        dbg64_str(path);
+        dbg64_str(img0.has_interp ? " reason=interp\n" : " reason=bad\n");
+        dbg64_line_end64();
+        return img0.has_interp ? E64_INTERP_ARG : E64_INTERP_BAD;
+    }
+    if (img0.span == 0 || img0.span > avail) {
+        dbg64_line_begin64();
+        dbg64_str("[ELF64] interp reject path=");
+        dbg64_str(path);
+        dbg64_str(" reason=window\n");
+        dbg64_line_end64();
+        return E64_INTERP_WINDOW;
+    }
+    const uint64_t span = (img0.span + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
+    const uint64_t base = wtop - span;                       // 钉在窗口顶部
+
+    // 第二遍：以 base 为装载偏移（映像 VA = base + p_vaddr），区间 [USER64_MMAP_VA64, 窗口顶]
+    Elf64Image64 img;
+    rc = e64_parse_ex64(g_elf_interp64, (uint32_t)rd, base, USER64_MMAP_VA64, wtop, &img, &bad);
+    if (rc != E64_OK) {
+        dbg64_line_begin64();
+        dbg64_str("[ELF64] interp reject path=");
+        dbg64_str(path);
+        dbg64_str(" reason=bad\n");
+        dbg64_line_end64();
+        return E64_INTERP_BAD;
+    }
+    const int mrc = e64_seg_map_union64(&img, g_elf_interp64);
+    if (mrc != E64_OK) {
+        dbg64_line_begin64();
+        dbg64_str("[ELF64] interp reject path=");
+        dbg64_str(path);
+        dbg64_str(" reason=load\n");
+        dbg64_line_end64();
+        return E64_INTERP_LOAD;
+    }
+
+    // 证据行（tests/dynlink64_test.py grep）：解释器是谁、落在哪、入口在哪、占了多大
+    dbg64_line_begin64();
+    dbg64_str("[ELF64] interp path=");
+    dbg64_str(path);
+    dbg64_str(" base=");
+    dbg64_hex64(base);
+    dbg64_str(" entry=");
+    dbg64_hex64(img.entry);
+    dbg64_str(" span=");
+    dbg64_dec(span);
+    dbg64_nl();
+    dbg64_line_end64();
+
+    if (out_base)  *out_base  = base;
+    if (out_entry) *out_entry = img.entry;
+    return E64_OK;
+}
+
 // ==================== 装载（映射 + 拷内容 + 建栈；不打印）====================
 static int elf64_load_image64(const uint8_t* p, uint32_t n, uint64_t* out_entry) {
     if (g_loaded64.used) return E64_BUSY;                 // 一份镜像都没收尾：先 unload
@@ -425,31 +652,24 @@ static int elf64_load_image64(const uint8_t* p, uint32_t n, uint64_t* out_entry)
 
     g_loaded64.used = 1;
     g_loaded64.nrange = 0;
+    g_loaded64.interp_base = 0;
+    g_e64_at_base64 = 0;
+    uint64_t run_entry = g_img64.entry;                    // 执行入口（有解释器时会被换掉）
 
-    // ---- 1) 各 PT_LOAD：先按 P|W|U 映射、拷内容、清 .bss ----
-    for (uint32_t i = 0; i < g_img64.nseg; i++) {
-        const Elf64Seg64* s = &g_img64.seg[i];
-        const uint64_t va0 = s->va & ~((uint64_t)PAGE_SIZE_64 - 1);
-        const uint64_t end = s->va + s->memsz;
-        const uint64_t va1 = (end + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
-        const uint32_t pages = (uint32_t)((va1 - va0) / PAGE_SIZE_64);
+    // ---- 0) 解释器优先（有 PT_INTERP 时它要先能被跑起来，才能去重定位主程序）----
+    if (g_img64.has_interp) {
+        uint64_t ibase = 0, ientry = 0;
+        const int irc = e64_load_interp64(g_img64.interp, &ibase, &ientry);
+        if (irc != E64_OK) { g_loaded64.used = 0; g_loaded64.nrange = 0; return irc; }
+        g_loaded64.interp_base = ibase;
+        g_e64_at_base64 = ibase;
+        run_entry = ientry;
+    }
 
-        g_loaded64.range[g_loaded64.nrange].va = va0;
-        g_loaded64.range[g_loaded64.nrange].pages = pages;
-        g_loaded64.nrange++;
-
-        for (uint32_t k = 0; k < pages; k++) {
-            uint64_t phys = 0;
-            if (!user64_map_page64(va0 + (uint64_t)k * PAGE_SIZE_64,
-                                   PTE_USER_64 | PTE_WRITE_64, 1, &phys)) {
-                elf64_unload64();
-                return E64_LOAD;
-            }
-        }
-        user64_paging_sync64();
-        uint8_t* dst = (uint8_t*)(uintptr_t)s->va;        // 已映射可写：ring0 直接按 VA 写
-        for (uint64_t b = 0; b < s->filesz; b++) dst[b] = p[s->off + b];
-        for (uint64_t b = s->filesz; b < s->memsz; b++) dst[b] = 0;
+    // ---- 1) 主程序各 PT_LOAD + 权限收紧 ----
+    {
+        const int mrc = e64_seg_map_union64(&g_img64, p);
+        if (mrc != E64_OK) { elf64_unload64(); return mrc; }
     }
 
     // ---- 2) 用户栈：16KiB（4 页）P|U|W|NX ----
@@ -472,44 +692,9 @@ static int elf64_load_image64(const uint8_t* p, uint32_t n, uint64_t* out_entry)
     if (rsp & 0xFu) { elf64_unload64(); return E64_STACK; }        // ABI 要求 rsp%16==0
     e64_log_auxv64(rsp);                                           // ★ A3：auxv 证据（grep 用）
 
-    // ---- 3) 权限收紧：按 p_flags 重设各段叶子权限位 ----
-    // ★ 按**页**取并集，而不是"逐段覆盖"：两个权限不同的段可能落在同一页（页粒度权限表示不了
-    //   段粒度），逐段覆盖会让后一个段把前一页的权限抹掉（例如 .text 与 .bss 挤一页时 .text 变
-    //   可写/不可执行 -> 立刻 #PF）。并集规则：任一覆盖该页的段可写 -> 页可写；任一段可执行 ->
-    //   页可执行。自带程序用 user/hello_elf64.ld 把各段页对齐，正常不会命中这条兜底。
-    {
-        static const uint32_t E64_MAX_PAGES64 = 32;         // 装载区只有 64KiB（16 页），32 够用
-        uint64_t page_va[E64_MAX_PAGES64];
-        uint64_t page_fl[E64_MAX_PAGES64];
-        uint32_t np = 0;
-        for (uint32_t i = 0; i < g_img64.nseg; i++) {
-            const Elf64Seg64* s = &g_img64.seg[i];
-            const uint64_t va0 = s->va & ~((uint64_t)PAGE_SIZE_64 - 1);
-            const uint64_t va1 = (s->va + s->memsz + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
-            for (uint64_t a = va0; a < va1; a += PAGE_SIZE_64) {
-                uint32_t k = 0;
-                while (k < np && page_va[k] != a) k++;
-                if (k == np) {
-                    if (np >= E64_MAX_PAGES64) { elf64_unload64(); return E64_LOAD; }
-                    page_va[np] = a;
-                    page_fl[np] = 0;
-                    np++;
-                }
-                page_fl[k] |= (uint64_t)(s->flags & (ELF64_PF_W | ELF64_PF_X));
-            }
-        }
-        for (uint32_t k = 0; k < np; k++) {
-            const uint64_t f = PTE_USER_64                                 // PF_R（x86 上 P 就是可读）
-                             | ((page_fl[k] & ELF64_PF_W) ? PTE_WRITE_64 : 0u)
-                             | ((page_fl[k] & ELF64_PF_X) ? 0u : PTE_NX_64);
-            if (!user64_remap_flags64(page_va[k], f)) { elf64_unload64(); return E64_LOAD; }
-        }
-    }
-    user64_paging_sync64();                                // 权限改完了，投递到 TLB
-
-    g_loaded64.entry = g_img64.entry;
+    g_loaded64.entry = run_entry;
     g_loaded64.user_rsp = rsp;
-    if (out_entry) *out_entry = g_img64.entry;
+    if (out_entry) *out_entry = run_entry;
     return E64_OK;
 }
 
@@ -535,8 +720,13 @@ void elf64_forget64() {
     g_loaded64.used    = 0;
     g_loaded64.entry   = 0;
     g_loaded64.user_rsp = 0;
+    g_loaded64.interp_base = 0;
     g_loaded64.nrange  = 0;
+    g_e64_at_base64    = 0;
 }
+
+// ★ A3 下半：最近一次装载的解释器基址（0 = 静态/无解释器）。见 elf64.h。
+uint64_t elf64_interp_base64() { return g_loaded64.interp_base; }
 
 int elf64_blob_ok64(const uint8_t* p, uint32_t n) {
     Elf64Image64 img;

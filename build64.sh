@@ -278,8 +278,39 @@ echo "==> ★ A3：musl 静态程序（third_party/musl 的 libc.a；编译/链�
 #   （排在内核代码段之后的 .rodata 里，不进 .bss、不进安装程序内核）。实测约 30 KB 量级，
 #   构建输出里有精确值；内核上限仍是 4MB（KERNEL_SECTORS=8000），另受图标包区间约束。
 bash tools/musl_build_win.sh "$BUILD/musl_hello.elf"
+# ★ A3 下半（体积）：**内嵌前**去掉符号表。内核装载器只按程序头表读 p_offset 拷字节，.symtab/
+#   .strtab/.shstrtab 一个字节都用不到 —— 但它们也是内嵌字节的一部分（musl 静态 ELF 的符号表
+#   约 9 KB）。本批要把动态链接三件套 + FPU 回归程序塞进**同一份**系统内核，而内核二进制已经顶到
+#   图标包区间的边界（build64.sh 结尾的断言）；这一步换来 ~9 KB 余量，行为零变化
+#   （musl64_test 只断言 16384 < install bytes < 65536，见 tools/musl_build_win.sh 里那份自检
+#   照旧跑在 strip **之前**：它只解析 ELF 头/程序头）。
+$OBJCOPY --strip-all "$BUILD/musl_hello.elf"
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/musl_hello.elf" "$BUILD/os/musl_hello_elf.o"
-echo "    内嵌 musl 程序：$BUILD/musl_hello.elf = $(stat -c%s "$BUILD/musl_hello.elf") B（musl libc.a 静态链接）"
+echo "    内嵌 musl 程序：$BUILD/musl_hello.elf = $(stat -c%s "$BUILD/musl_hello.elf") B（musl libc.a 静态链接；已 strip 符号表）"
+echo "==> ★ A3 下半：动态链接（我们自己的 ld.so + libfoo.so + dynhello.elf；构建期自检见脚本）"
+# 见 tools/dynlink_build_win.sh 与 docs/应用层与系统调用说明.md 的"A3 下半：动态链接"节：
+#   * 三份产物都**不塞进**用户窗口的 64KiB 装载区，而是启动期由内核幂等装进 VimtuFS2：
+#       /lib/ldvimtu.so（解释器） /lib/libfoo.so（共享库） /dynhello.elf（动态主程序）；
+#   * 只内嵌进**系统内核**（安装介质不跑用户程序）；objcopy 的符号名按输入路径生成：
+#       _binary_build64_ldvimtu_so_start / _binary_build64_libfoo_so_start /
+#       _binary_build64_dynhello_elf_start（kernel/kernel64.cpp 引用）。
+#   * 体积代价：三份合计约 45 KB（构建输出里有精确值）；FPU/xmm 回归程序再 ~5 KB。
+bash tools/dynlink_build_win.sh "$BUILD"
+for b in ldvimtu.so libfoo.so dynhello.elf; do
+    $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/$b" "$BUILD/os/$(echo "$b" | tr '.' '_').o"
+done
+echo "    内嵌动态链接产物：$(stat -c%s "$BUILD/ldvimtu.so") + $(stat -c%s "$BUILD/libfoo.so") + $(stat -c%s "$BUILD/dynhello.elf") = $(( $(stat -c%s "$BUILD/ldvimtu.so") + $(stat -c%s "$BUILD/libfoo.so") + $(stat -c%s "$BUILD/dynhello.elf") )) B"
+
+echo "==> ★ A3 下半：FPU/xmm 上下文回归程序（user/xmmsse.asm；两个进程同时跑）"
+# 见 user/xmmsse.asm 顶部说明：同一份 ELF 起两个真进程、各自核对 16 个 xmm 是否被对方污染。
+# 链接脚本 user/xmmsse_elf64.ld（不是 hello_elf64.ld）：本程序只有 FPU 回归、没有段权限断言，
+# 而这段字节要**内嵌进系统内核**（objcopy），所以贴紧排布 + --strip-all —— 9456 B -> 约 2.3 KB。
+# 安全性依据（装载器不做页同余检查、同页复用物理页）写在那个脚本的头部注释里。
+$NASM -f elf64 user/xmmsse.asm -o "$BUILD/xmmsse.o"
+$LD -m elf_x86_64 --strip-all -T user/xmmsse_elf64.ld -o "$BUILD/xmmsse.elf" "$BUILD/xmmsse.o"
+$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/xmmsse.elf" "$BUILD/xmmsse_elf.o"
+cp "$BUILD/xmmsse_elf.o" "$BUILD/os/"
+echo "    内嵌 FPU 回归程序：$BUILD/xmmsse.elf = $(stat -c%s "$BUILD/xmmsse.elf") B"
 echo "==> 可安装应用示例（VAP64：nasm -> tools/make_vap.py -> objcopy 嵌入系统内核）"
 # user/hello64.asm 是 ring3 程序；tools/make_vap.py 给它加 32B VAP64 头（含代码段 CRC32）；
 # objcopy 把整个 .vap 嵌进内核，app64.cpp 启动时把它装进 VimtuFS2 的 /hello.vap，再从盘上读出来跑。
@@ -291,7 +322,7 @@ echo "==> 多进程演示程序（批次 C：fork/execve/wait4/kill；只嵌进�
 # proc64.cpp 幂等把它装成 VimtuFS2 的 /proc64.elf，再由 proc64_demo64() 以 init 进程跑起来。
 # 符号名由 objcopy 按输入路径生成：_binary_build64_proc64_elf_start/_end。
 $NASM -f elf64 user/proc64.asm -o "$BUILD/proc64.o"
-$LD -m elf_x86_64 -T user/hello_elf64.ld -o "$BUILD/proc64.elf" "$BUILD/proc64.o"
+$LD -m elf_x86_64 --strip-all -T user/hello_elf64.ld -o "$BUILD/proc64.elf" "$BUILD/proc64.o"
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/proc64.elf" "$BUILD/proc64_elf.o"
 cp "$BUILD/proc64_elf.o" "$BUILD/os/"
 echo "==> pipe64：ring3 管道演示（批次 D：fork 后父子各持一端；只嵌**系统内核**）"
@@ -300,7 +331,7 @@ echo "==> pipe64：ring3 管道演示（批次 D：fork 后父子各持一端；
 # proc64_pipe_demo64() 当成一个真进程跑起来（fork 后子写父读）。
 # 符号名由 objcopy 按输入路径生成：_binary_build64_pipe64_elf_start/_end。
 $NASM -f elf64 user/pipe64.asm -o "$BUILD/pipe64.o"
-$LD -m elf_x86_64 -T user/hello_elf64.ld -o "$BUILD/pipe64.elf" "$BUILD/pipe64.o"
+$LD -m elf_x86_64 --strip-all -T user/hello_elf64.ld -o "$BUILD/pipe64.elf" "$BUILD/pipe64.o"
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/pipe64.elf" "$BUILD/pipe64_elf.o"
 cp "$BUILD/pipe64_elf.o" "$BUILD/os/"
 $NASM -f bin user/hello64.asm -o "$BUILD/hello64.bin"
@@ -323,7 +354,7 @@ echo "==> spin64：长命用户程序（终端 proc run 用；任务管理器进
 # user/spin64.asm 打印 pid 后每 1 秒 nanosleep，永不退出；只嵌进**系统内核**（终端在系统内核里）。
 # 符号名：_binary_build64_spin64_elf_start/_end（terminal64.cpp 的 `proc run spin` 用它装到 /spin.elf）。
 $NASM -f elf64 user/spin64.asm -o "$BUILD/spin64.o"
-$LD -m elf_x86_64 -T user/hello_elf64.ld -o "$BUILD/spin64.elf" "$BUILD/spin64.o"
+$LD -m elf_x86_64 --strip-all -T user/hello_elf64.ld -o "$BUILD/spin64.elf" "$BUILD/spin64.o"
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/spin64.elf" "$BUILD/spin64_elf.o"
 cp "$BUILD/spin64_elf.o" "$BUILD/os/"
 
@@ -332,7 +363,7 @@ echo "==> filedemo64：ring3 读文件演示（open /t.txt -> read -> write；�
 # 符号名：_binary_build64_filedemo64_elf_start/_end（terminal64.cpp 开终端时幂等装到 /filedemo.elf，
 # 终端 `run filedemo` 即可跑；批次 B 的 syscall open/read/close 接真 FD 层的证据）。
 $NASM -f elf64 user/filedemo64.asm -o "$BUILD/filedemo64.o"
-$LD -m elf_x86_64 -T user/hello_elf64.ld -o "$BUILD/filedemo64.elf" "$BUILD/filedemo64.o"
+$LD -m elf_x86_64 --strip-all -T user/hello_elf64.ld -o "$BUILD/filedemo64.elf" "$BUILD/filedemo64.o"
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/filedemo64.elf" "$BUILD/filedemo64_elf.o"
 cp "$BUILD/filedemo64_elf.o" "$BUILD/os/"
 
@@ -375,6 +406,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
     "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o \
     "$BUILD/os"/musl_hello_elf.o \
+    "$BUILD/os"/ldvimtu_so.o "$BUILD/os"/libfoo_so.o "$BUILD/os"/dynhello_elf.o "$BUILD/os"/xmmsse_elf.o \
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD/os"/hello_vap64.o \
@@ -427,6 +459,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/cr3exp/proc64.o" \
         "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o \
         "$BUILD/os"/musl_hello_elf.o \
+        "$BUILD/os"/ldvimtu_so.o "$BUILD/os"/libfoo_so.o "$BUILD/os"/dynhello_elf.o "$BUILD/os"/xmmsse_elf.o \
         "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
         "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
         "$BUILD/os"/hello_vap64.o \

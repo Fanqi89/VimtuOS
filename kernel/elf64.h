@@ -36,6 +36,33 @@
 //   [ELF64] reject reason=<r> / [ELF64] reject segment va=<hex> reason=<r>
 //   [ELF64] selftest PASS / [ELF64] selftest FAIL mask=<n>
 //   [ELF64] selftest reject sample=<n> reason=<r>   （自检里的坏样本，故意与上面的 [ELF64] reject 区分）
+// ==================== ★ A3 下半：动态链接（PT_INTERP）====================
+// 判据与分工（谁做什么，别混）：
+//   * **内核**：只做"装载"—— 主程序有 PT_INTERP 时，先把**解释器**（我们自己写的 ld.so，
+//     或 musl 的 ld-musl-x86_64.so.1）从 VimtuFS2 读出来、按它自己的链接地址映射进用户
+//     窗口，再把主程序装到它自己的地址；auxv 如实给出：
+//       AT_BASE  = 解释器的加载基址（没有解释器 = 0）
+//       AT_ENTRY = **主程序**的入口
+//       AT_PHDR  = **主程序**的程序头表在映像里的地址
+//     控制权交给**解释器入口**（不是主程序入口）。
+//   * **解释器（ring3）**：处理 PT_DYNAMIC（RELA/JMPREL/SYMTAB/STRTAB/HASH/NEEDED）、做重定位、
+//     按 DT_NEEDED 打开 .so（用 mmap/mprotect 自己映射）、调用 DT_INIT/DT_INIT_ARRAY，
+//     最后跳到 AT_ENTRY。内核不认识 DT_*，也不做任何重定位。
+// 解释器从哪来（两条路都要能被内核装载）：
+//   1) PT_INTERP 是**绝对路径**（Linux 惯例 "/lib/…"）—— 原样进 VFS 打开；
+//   2) 不是绝对路径（例如 "ldvimtu.so"）—— 按 **/lib/<name>** 搜索（拼成绝对路径再打开）。
+//   两条路都失败 = interp reject reason=vfs + 主程序拒绝（reason=interp）。
+// 解释器映射到哪（策略，为什么要这样）：
+//   解释器是 ET_DYN（p_vaddr 从 0 起、位置无关，靠 AT_BASE + R_X86_64_RELATIVE 自定位），
+//   内核把它**钉在用户窗口顶部**：
+//       interp_base = (4GiB + 1MiB) - align_up(解释器 span, 4KiB)
+//   于是解释器自己就能算出"库区" = [USER64_MMAP_VA64, AT_BASE)（它要 mmap 的 .so 放在
+//   自己下方，向上不越过 AT_BASE、向下不撞 brk/mmap 起点）。span 放不进
+//   [USER64_MMAP_VA64, 窗口顶] 就拒绝（reason=interp-window）。
+// 打点（自动验收 tests/dynlink64_test.py grep，格式勿改）：
+//   [ELF64] interp path=<p> base=<hex> entry=<hex> span=<n>
+//   [ELF64] interp reject path=<p> reason=<vfs|bad|window|arg|size|interp>
+//   （静态路径的既有打点一字不改：musl64_test 的断言依赖它们。）
 #pragma once
 #include <stdint.h>
 
@@ -89,3 +116,7 @@ int elf64_load_for_exec64(const char* path, const char* const* argv, uint32_t ar
 void elf64_forget64();
 // 一段内存里的映像是否可解析（proc64 内置 /proc64.elf 的自检用；1 = 可解析）
 int elf64_blob_ok64(const uint8_t* p, uint32_t n);
+
+// ★ A3 下半：最近一次装载的解释器基址（AT_BASE 的那份值；0 = 没有解释器/静态装载）。
+// 用途：日志与自检对照（elf64.cpp 的 [ELF64] interp 行与 auxv 行打印同一个值）。
+uint64_t elf64_interp_base64();
