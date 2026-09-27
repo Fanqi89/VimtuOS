@@ -58,6 +58,10 @@ VMX = os.path.join(VMDIR, "vimtu64-cr3exp.vmx")
 VMIMG = os.path.join(VMDIR, "cr3exp.img")
 VMVMDK = os.path.join(VMDIR, "cr3exp.vmdk")
 VMSERIAL = os.path.join(VMDIR, "serial-cr3exp.log")
+# ★ 登录手势用的 VNC 端口（与 tests/vmware_make_vm.py 的 5903/5904 错开，避免撞车）：
+#   本 vmx 原来没开 VNC —— 而登录界面必须**显式回车**（ui.login.auto 默认 0），
+#   没有 VNC 就没有任何注入按键的通道，[GUI64] ready 永远等不到。见 write_vmx/run_vmware。
+VNC_CR3EXP_PORT = 5905
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +268,11 @@ serial0.fileType = "file"
 serial0.fileName = "%s"
 serial0.tryNoRxLoss = "FALSE"
 serial0.startConnected = "TRUE"
-""" % (title, serial_log.replace("\\", "\\\\"))
+# ★ 登录手势（ui.login.auto 默认 0）：开一个 VNC 端口，测试脚本用 RFB KeyEvent 送回车两次
+#   （与 tests/vmware_make_vm.py 里 VNC_PORT/VNC_BOOT_PORT 的写法同一套）。
+RemoteDisplay.vnc.enabled = "TRUE"
+RemoteDisplay.vnc.port = "%d"
+""" % (title, serial_log.replace("\\", "\\\\"), VNC_CR3EXP_PORT)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(txt)
 
@@ -302,6 +310,15 @@ def run_vmware(img, timeout):
     if not started:
         return None, "vmrun start 失败"
     try:
+        # ★ 登录手势（与 QEMU 分支 qh.login_desktop 同一套语义，只是注入通道换成 VNC）：
+        #   等锁屏可交互（[LOCK64] bg blur ready）-> 用 RFB KeyEvent 送回车两次
+        #   （锁屏 -> 登录界面 -> 登录按钮，无口令用户直接进桌面）。
+        #   只加**等待与手势**：不删改任何断言、不放宽任何阈值；注入失败只打一行提示。
+        #   没有这一步 [GUI64] ready 永远等不到 —— 因为 ui.login.auto 默认 0（见 qemuhelp.py）。
+        if qh.vnc_login_desktop(VMSERIAL, VNC_CR3EXP_PORT, None, timeout=min(timeout, 180)):
+            print("   [ok] 登录手势已注入（VNC %d：锁屏 -> 回车两次 -> 桌面）" % VNC_CR3EXP_PORT)
+        else:
+            print("   [!!] 没能注入登录手势（VNC %d 连不上或没等到锁屏）" % VNC_CR3EXP_PORT)
         log, hit = wait_marker(VMSERIAL, ["[PROC64] uefi exp result=", "[PROC64] uefi exp B stage=cr3"],
                                timeout)
         time.sleep(3.0)

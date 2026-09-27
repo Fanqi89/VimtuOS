@@ -28,6 +28,7 @@
 #include "usermode64.h"     // 用户窗口常量 / user64_map_page64 / user64_enter_at64
 #include "vfs64.h"          // 读盘 + 幂等安装
 #include "mem_64.h"         // PAGE_SIZE_64 / PTE_* / page_free_64
+#include "x86_64.h"         // ★ A3：g_ticks64（AT_RANDOM 的随机种子）
 #include "debug64.h"
 
 // 内嵌的 hello.elf（build64.sh：nasm -f elf64 -> ld.lld -static -> objcopy -I binary 嵌进系统内核）。
@@ -228,16 +229,89 @@ int elf64_unload64() {
 }
 
 // ==================== 初始栈（SysV ABI）====================
+// ★ A3：auxv 的号必须与 Linux/elf.h 逐条一致（这里踩过一个真错：AT_PHNUM 曾是 4，
+//   但 4 是 AT_PHENT —— musl 的 __init_libc/static_init_tls 会按 AT_PHENT 步进遍历
+//   程序头表找 PT_TLS，号错了就是"按 6 字节步进读结构体"，必崩）。逐条清单：
+//     AT_NULL(0) / AT_PHDR(3) / AT_PHENT(4) / AT_PHNUM(5) / AT_PAGESZ(6) / AT_BASE(7) /
+//     AT_ENTRY(9) / AT_UID(11) / AT_EUID(12) / AT_GID(13) / AT_EGID(14) / AT_HWCAP(16) /
+//     AT_SECURE(23) / AT_RANDOM(25)
+//   为什么每条都要（musl 1.2.5 的启动路径，src/env/__libc_start_main.c + __init_tls.c +
+//   __stack_chk_fail.c + malloc/mallocng/glue.h）：
+//     AT_PHDR/AT_PHENT/AT_PHNUM：遍历程序头表（找 PT_TLS / PT_GNU_STACK / PT_DYNAMIC）
+//     AT_PAGESZ：  libc.page_size（malloc/mallocng 的元数据分页全靠它，0 会直接崩）
+//     AT_BASE：    静态程序 = 0（没有动态链接器）；如实给 0
+//     AT_ENTRY：   与 e_entry 一致（部分启动代码用它；本内核给真值）
+//     AT_UID/EUID/GID/EGID + AT_SECURE=0：__init_libc 只在"uid 与 euid 不同或 secure"时
+//                  才去走 poll()+open("/dev/null") 的降权路径（本内核没有 poll -> 会真崩），
+//                  所以这四条**必须**给"相等 + secure=0"（本内核没有权限模型，如实全 0）
+//     AT_HWCAP：   本内核不暴露 CPUID hwcap -> 如实 0（musl 只存不用）
+//     AT_RANDOM：  16 字节随机（__init_ssp 取 8 字节做 canary；mallocng 的 get_random_secret
+//                  取 [8..16)）—— 必须是**可读的用户地址**，否则一取就 #PF。这里放在初始栈上。
 static const uint64_t E64_AT_NULL   = 0;
 static const uint64_t E64_AT_PHDR   = 3;
-static const uint64_t E64_AT_PHNUM  = 4;
+static const uint64_t E64_AT_PHENT  = 4;
+static const uint64_t E64_AT_PHNUM  = 5;
 static const uint64_t E64_AT_PAGESZ = 6;
+static const uint64_t E64_AT_BASE   = 7;
 static const uint64_t E64_AT_ENTRY  = 9;
 static const uint64_t E64_AT_UID    = 11;
 static const uint64_t E64_AT_EUID   = 12;
 static const uint64_t E64_AT_GID    = 13;
 static const uint64_t E64_AT_EGID   = 14;
+static const uint64_t E64_AT_HWCAP  = 16;
+static const uint64_t E64_AT_SECURE = 23;
+static const uint64_t E64_AT_RANDOM = 25;
+// AT_RANDOM 的地址（打印证据用；0 = 本次装载没给）
+static uint64_t g_e64_rand_va64 = 0;
 
+// 16 字节"够用的随机"：rdtsc + PIT tick + xorshift。**不是密码学安全随机**（与
+// syscall64.cpp 的 getrandom(318) 同一口径，如实标注）：AT_RANDOM 只用来做
+// stack canary / malloc 的 secret，本内核按"每次不同、分布还行"给。
+static uint64_t g_e64_rng64 = 0x9E3779B97F4A7C15ULL;
+static uint64_t e64_rand64() {
+    uint32_t lo = 0, hi = 0;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t x = g_e64_rng64;
+    x ^= ((uint64_t)hi << 32) | lo;
+    x ^= g_ticks64 * 0xD6E8FEB86659FD93ULL;
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    g_e64_rng64 = x;
+    return x;
+}
+static void e64_fill_random64(uint64_t va) {
+    uint8_t* p = (uint8_t*)(uintptr_t)va;                 // 栈页已映射（调用点保证）
+    for (uint32_t i = 0; i < 16; i += 8) {
+        const uint64_t r = e64_rand64();
+        for (uint32_t k = 0; k < 8; k++) p[i + k] = (uint8_t)(r >> (8 * k));
+    }
+    g_e64_rand_va64 = va;
+}
+
+// 打印 auxv 证据（自动验收 tests/musl64_test.py grep `[ELF64] auxv`）。格式勿改：
+//   [ELF64] auxv phdr=<hex> phent=<n> phnum=<n> base=<hex> entry=<hex> random=<hex> secure=<n> pagesz=<n>
+static void e64_log_auxv64(uint64_t rsp) {
+    dbg64_line_begin64();
+    dbg64_str("[ELF64] auxv phdr=");
+    dbg64_hex64(g_img64.phdr_va);
+    dbg64_str(" phent=");
+    dbg64_dec(ELF64_PHDR_SIZE);
+    dbg64_str(" phnum=");
+    dbg64_dec(g_img64.phnum);
+    dbg64_str(" base=");
+    dbg64_hex64(0);
+    dbg64_str(" entry=");
+    dbg64_hex64(g_img64.entry);
+    dbg64_str(" random=");
+    dbg64_hex64(g_e64_rand_va64);
+    dbg64_str(" secure=");
+    dbg64_dec(0);
+    dbg64_str(" pagesz=");
+    dbg64_dec(PAGE_SIZE_64);
+    dbg64_str(" rsp=");
+    dbg64_hex64(rsp);
+    dbg64_nl();
+    dbg64_line_end64();
+}
 // 把 [argc][argv..][NULL][envp NULL][auxv..][NULL] 压到用户栈顶；返回初始 rsp。
 // 布局从**低地址到高地址**依次写；字符串放在数组上方。rsp 16 字节对齐（进入 _start 时 rsp%16==0）。
 static uint64_t e64_build_stack64(const char* argv0) {
@@ -249,20 +323,30 @@ static uint64_t e64_build_stack64(const char* argv0) {
     if (argv0) { for (; argv0[k] && k < 24; k++) sp[k] = (uint8_t)argv0[k]; }
     sp[k] = 0;
 
-    uint64_t w[32];
+    uint64_t w[64];
     uint32_t n = 0;
     w[n++] = 1;                    // argc
     w[n++] = str_va;               // argv[0]
     w[n++] = 0;                    // argv 终止
     w[n++] = 0;                    // envp 终止（本内核没有环境变量）
+    // ★ A3：AT_RANDOM 的 16 字节放在 [str_va-32, str_va-16) —— 这一段是**恒空**的：
+    //   字符串在 [str_va, …)，而指针数组从 (str_va-64-n*8) 往下排，所以 str_va 下方
+    //   紧挨着的 64 字节（n 多大都成立）不会被任何东西用掉。放这里的好处：它在 rsp
+    //   **上方**，进程自己的函数调用（往 rsp 下面长）永远不会踩掉它。
+    e64_fill_random64(str_va - 32);
     w[n++] = E64_AT_PAGESZ; w[n++] = PAGE_SIZE_64;
     w[n++] = E64_AT_PHDR;   w[n++] = g_img64.phdr_va;
+    w[n++] = E64_AT_PHENT;  w[n++] = ELF64_PHDR_SIZE;      // ★ A3：musl 按它步进遍历程序头表
     w[n++] = E64_AT_PHNUM;  w[n++] = g_img64.phnum;
+    w[n++] = E64_AT_BASE;   w[n++] = 0;                    // 静态：没有动态链接器（如实 0）
     w[n++] = E64_AT_ENTRY;  w[n++] = g_img64.entry;
+    w[n++] = E64_AT_HWCAP;  w[n++] = 0;                    // 本内核不暴露 hwcap（如实 0）
     w[n++] = E64_AT_UID;    w[n++] = 0;
     w[n++] = E64_AT_EUID;   w[n++] = 0;
     w[n++] = E64_AT_GID;    w[n++] = 0;
     w[n++] = E64_AT_EGID;   w[n++] = 0;
+    w[n++] = E64_AT_RANDOM; w[n++] = str_va - 32;          // 上面那 16 字节随机
+    w[n++] = E64_AT_SECURE; w[n++] = 0;                    // 没有权限模型 -> 非 secure 模式
     w[n++] = E64_AT_NULL;   w[n++] = 0;
 
     const uint64_t rsp = (str_va - 64u - (uint64_t)n * 8u) & ~((uint64_t)15);   // 16 字节对齐
@@ -273,13 +357,14 @@ static uint64_t e64_build_stack64(const char* argv0) {
 
 // ==================== 初始栈（execve 版：argv 由调用方给）====================
 // 与 e64_build_stack64 的区别：字符串从栈顶向下排（不再固定 stack_top-32），复数个 argv 依次
-// 摆放；指针数组与 auxv 在字符串下方。**不动** e64_build_stack64 —— 它的布局被
-// elf64_selftest64 逐字段断言（st[1] == stack_top-32）。
+// 摆放；指针数组与 auxv 在字符串下方。**不动** e64_build_stack64 的布局 —— 它的
+// st[1] == stack_top-32 被 elf64_selftest64 逐字段断言。
 static uint64_t e64_build_stack_argv64(const char* const* argv, uint32_t argc) {
     const uint64_t stack_top = USER64_STACK_VA64 + USER64_STACK_BYTES64;
     if (argc > 16) argc = 16;
 
     uint64_t argp[16];
+    uint64_t ent_va = 0;                                   // argv[0] = 可执行文件路径（给 AT_ENTRY 之外的日志/AT_EXECFN 留用）
     uint64_t sp_va = stack_top;
     for (uint32_t i = 0; i < argc; i++) {
         const char* s = (argv && argv[i]) ? argv[i] : "";
@@ -291,9 +376,15 @@ static uint64_t e64_build_stack_argv64(const char* const* argv, uint32_t argc) {
         for (; k + 1u < len && s[k]; k++) d[k] = (uint8_t)s[k];
         d[k] = 0;
         argp[i] = sp_va;
+        if (i == 0) ent_va = sp_va;
     }
 
-    uint64_t w[48];
+    // ★ A3：AT_RANDOM 的 16 字节放在 [sp_va-16, sp_va) —— 字符串在 [sp_va, stack_top)，
+    //   指针数组在 rsp..(rsp+8m) 且 rsp ≤ sp_va-128，所以这一段同样恒空且在 rsp 上方。
+    const uint64_t rand_va = sp_va - 16;
+    e64_fill_random64(rand_va);
+
+    uint64_t w[64];
     uint32_t m = 0;
     w[m++] = argc;                                         // argc
     for (uint32_t i = 0; i < argc; i++) w[m++] = argp[i];  // argv[0..argc-1]
@@ -301,13 +392,19 @@ static uint64_t e64_build_stack_argv64(const char* const* argv, uint32_t argc) {
     w[m++] = 0;                                            // envp 终止（本内核没有环境变量）
     w[m++] = E64_AT_PAGESZ; w[m++] = PAGE_SIZE_64;
     w[m++] = E64_AT_PHDR;   w[m++] = g_img64.phdr_va;      // 程序头表在映像里的地址（加载器算好的）
+    w[m++] = E64_AT_PHENT;  w[m++] = ELF64_PHDR_SIZE;      // ★ A3：musl 按它步进遍历程序头表
     w[m++] = E64_AT_PHNUM;  w[m++] = g_img64.phnum;
+    w[m++] = E64_AT_BASE;   w[m++] = 0;                    // 静态：没有动态链接器（如实 0）
     w[m++] = E64_AT_ENTRY;  w[m++] = g_img64.entry;
+    w[m++] = E64_AT_HWCAP;  w[m++] = 0;                    // 本内核不暴露 hwcap（如实 0）
     w[m++] = E64_AT_UID;    w[m++] = 0;
     w[m++] = E64_AT_EUID;   w[m++] = 0;
     w[m++] = E64_AT_GID;    w[m++] = 0;
     w[m++] = E64_AT_EGID;   w[m++] = 0;
+    w[m++] = E64_AT_RANDOM; w[m++] = rand_va;              // 上面那 16 字节随机
+    w[m++] = E64_AT_SECURE; w[m++] = 0;                    // 没有权限模型 -> 非 secure 模式
     w[m++] = E64_AT_NULL;   w[m++] = 0;
+    (void)ent_va;                                          // （AT_EXECFN 本轮不给：musl 只在 argv[0] 为空时才用）
 
     const uint64_t rsp = (sp_va - 128u - (uint64_t)m * 8u) & ~((uint64_t)15);   // 16 字节对齐
     uint64_t* d = (uint64_t*)(uintptr_t)rsp;
@@ -373,6 +470,7 @@ static int elf64_load_image64(const uint8_t* p, uint32_t n, uint64_t* out_entry)
     }
     const uint64_t rsp = e64_build_stack64(ELF64_INSTALL_PATH64);
     if (rsp & 0xFu) { elf64_unload64(); return E64_STACK; }        // ABI 要求 rsp%16==0
+    e64_log_auxv64(rsp);                                           // ★ A3：auxv 证据（grep 用）
 
     // ---- 3) 权限收紧：按 p_flags 重设各段叶子权限位 ----
     // ★ 按**页**取并集，而不是"逐段覆盖"：两个权限不同的段可能落在同一页（页粒度权限表示不了
@@ -483,6 +581,24 @@ int elf64_load_for_exec64(const char* path, const char* const* argv, uint32_t ar
         return -1;
     }
     const uint64_t rsp = e64_build_stack_argv64(argv, argc);
+    // ★ A3：execve 路径的打点 —— 与 elf64_load64 的 "[ELF64] load …" 同一格式（这里是
+    //   **真**从 VFS 读出来 + 解析 + 装载 + 建初始栈/auxv 的证据），自动验收 grep 用。
+    dbg64_line_begin64();
+    dbg64_str("[ELF64] load path=");
+    dbg64_str(path);
+    dbg64_str(" entry=");
+    dbg64_hex64(entry);
+    dbg64_str(" phnum=");
+    dbg64_dec(g_img64.phnum);
+    dbg64_str(" segs=");
+    dbg64_dec(g_img64.nseg);
+    dbg64_str(" size=");
+    dbg64_dec((uint64_t)rd);
+    dbg64_str(" rsp=");
+    dbg64_hex64(rsp);
+    dbg64_str(" via=execve\n");
+    dbg64_line_end64();
+    e64_log_auxv64(rsp);
     if (out_entry) *out_entry = entry;
     if (out_rsp)   *out_rsp   = rsp;
     g_loaded64.used = 0;                          // 记账交回调用方（单份全局，见 elf64.h 说明）
@@ -741,12 +857,29 @@ int elf64_selftest64() {
         if (st[0] != 1) fail |= 4;                                                                      // argc
         if (st[1] != USER64_STACK_VA64 + USER64_STACK_BYTES64 - 32) fail |= 4;                          // argv[0] 指针
         if (st[2] != 0 || st[3] != 0) fail |= 4;                                                        // argv/envp 终止
-        bool at_entry = false, at_null = false;
-        for (uint32_t i = 4; i < 32; i += 2) {
+        // ★ A3：auxv 逐条核对（不止 AT_ENTRY/AT_NULL）—— 号错/缺项在这里立刻暴露。
+        //   AT_PHENT 必须是 56、AT_PHNUM 与解析结果一致、AT_RANDOM 必须是可读的 16 字节
+        //   （这里真的逐字节读一遍）、AT_SECURE 必须 0、AT_UID==AT_EUID（musl 才不会走降权路径）。
+        bool at_entry = false, at_null = false, at_phent = false, at_phnum = false;
+        bool at_random = false, at_secure = false, at_uid_eq = false;
+        uint64_t at_uid = 1, at_euid = 2;
+        for (uint32_t i = 4; i < 64; i += 2) {
             if (st[i] == E64_AT_ENTRY && st[i + 1] == tva) at_entry = true;
+            if (st[i] == E64_AT_PHENT && st[i + 1] == ELF64_PHDR_SIZE) at_phent = true;
+            if (st[i] == E64_AT_PHNUM && st[i + 1] == img.phnum) at_phnum = true;
+            if (st[i] == E64_AT_RANDOM) {
+                const uint8_t* rp = (const uint8_t*)(uintptr_t)st[i + 1];
+                uint32_t acc = 0;                                        // 逐字节读（不可读这里就 #PF -> 自检失败）
+                for (uint32_t k = 0; k < 16; k++) acc |= rp[k];
+                at_random = user64_page_is_user_ok64(st[i + 1]) && (acc != 0);
+            }
+            if (st[i] == E64_AT_SECURE && st[i + 1] == 0) at_secure = true;
+            if (st[i] == E64_AT_UID)  at_uid  = st[i + 1];
+            if (st[i] == E64_AT_EUID) at_euid = st[i + 1];
             if (st[i] == E64_AT_NULL) { at_null = true; break; }
         }
-        if (!at_entry || !at_null) fail |= 4;
+        if (at_uid == at_euid) at_uid_eq = true;
+        if (!at_entry || !at_null || !at_phent || !at_phnum || !at_random || !at_secure || !at_uid_eq) fail |= 4;
         const char* a0 = (const char*)(uintptr_t)st[1];                      // argv[0] 是 NUL 结尾的串
         if (a0[0] != '/' || e_strlen(a0) == 0) fail |= 4;
         // 权限位：p_flags = PF_R|PF_X -> P|U、**不可写**、**不加 NX**（可执行）

@@ -266,6 +266,20 @@ for app in $VIMTU_USER_APPS; do
     cp "$BUILD/user_${app}_cblob.o" "$BUILD/os/"
     echo "    内嵌 C 用户程序：user/apps/$app.c -> $BUILD/user_${app}.bin（$(stat -c%s "$BUILD/user_${app}.bin") B）"
 done
+
+echo "==> ★ A3：musl 静态程序（third_party/musl 的 libc.a；编译/链接全在 tools/musl_build_win.sh 里）"
+# 见 tools/musl_build_win.sh 与 docs/应用层与系统调用说明.md 的"musl（A3 第一步）"节：
+#   * 该脚本用 **musl 自己的头文件 + musl 的 lib/libc.a + 自写 _start + tools/musl_hello64.ld**
+#     链出 build64/musl_hello.elf（静态 ELF64，钉在用户窗口 4GiB 起、无 PT_INTERP/无重定位）；
+#   * 只内嵌进**系统内核**（安装介质内核不跑用户程序）；objcopy 的符号名按输入路径生成：
+#     _binary_build64_musl_hello_elf_start/_end（kernel/kernel64.cpp 引用，启动期装进 VimtuFS2
+#     再从盘上读出来、作为**真进程**进 ring3 —— 见 musl64_demo64）。
+# ★ 体积代价（如实记账）：内嵌进 kernel64_os.bin 的就是 musl_hello.elf 的全部字节
+#   （排在内核代码段之后的 .rodata 里，不进 .bss、不进安装程序内核）。实测约 30 KB 量级，
+#   构建输出里有精确值；内核上限仍是 4MB（KERNEL_SECTORS=8000），另受图标包区间约束。
+bash tools/musl_build_win.sh "$BUILD/musl_hello.elf"
+$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/musl_hello.elf" "$BUILD/os/musl_hello_elf.o"
+echo "    内嵌 musl 程序：$BUILD/musl_hello.elf = $(stat -c%s "$BUILD/musl_hello.elf") B（musl libc.a 静态链接）"
 echo "==> 可安装应用示例（VAP64：nasm -> tools/make_vap.py -> objcopy 嵌入系统内核）"
 # user/hello64.asm 是 ring3 程序；tools/make_vap.py 给它加 32B VAP64 头（含代码段 CRC32）；
 # objcopy 把整个 .vap 嵌进内核，app64.cpp 启动时把它装进 VimtuFS2 的 /hello.vap，再从盘上读出来跑。
@@ -360,6 +374,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
     "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o \
+    "$BUILD/os"/musl_hello_elf.o \
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD/os"/hello_vap64.o \
@@ -411,6 +426,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
         "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/cr3exp/proc64.o" \
         "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o \
+        "$BUILD/os"/musl_hello_elf.o \
         "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
         "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
         "$BUILD/os"/hello_vap64.o \

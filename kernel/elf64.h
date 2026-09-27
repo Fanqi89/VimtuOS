@@ -15,15 +15,22 @@
 //       - 权限按 p_flags 给：PF_R→P|U、PF_W→+W、PF_X→不加 NX（不可执行段加 PTE_NX_64）。
 //         实现上先统一按 P|W|U 映射（否则只读段没法写内容），拷/清零完成后再逐页收紧。
 //   * 用户栈：USER64_STACK_VA64 起 16KiB（4 页，P|U|W|NX），按 SysV ABI 压初始栈：
-//       [rsp] argc=1, argv[0]="/hello.elf", NULL, NULL(envp), auxv..., AT_NULL/0
-//       auxv 至少含 AT_PAGESZ(6)/AT_PHDR(3)/AT_PHNUM(4)/AT_ENTRY(9)/AT_UID/EUID/GID/EGID(11..14)
+//       [rsp] argc=1, argv[0]="/hello.elf", NULL, NULL(envp), auxv…, AT_NULL/0
+//       ★ A3：auxv 逐条给全（号与 Linux elf.h 一致，缺一条 musl 启动期就会读崩）：
+//       AT_PAGESZ(6)/AT_PHDR(3)/AT_PHENT(4)/AT_PHNUM(5)/AT_BASE(7)/AT_ENTRY(9)/AT_HWCAP(16)/
+//       AT_UID(11)/AT_EUID(12)/AT_GID(13)/AT_EGID(14)/AT_SECURE(23)/AT_RANDOM(25)（16 字节
+//       随机放在初始栈上、指针数组上方 —— 见 elf64.cpp 的 auxv 段）。
+//       （历史错误：AT_PHNUM 曾是 4，与 AT_PHENT 撞号；musl 会按 AT_PHENT 步进遍历程序头表，
+//         号错了必崩 —— 已修，并在 elf64_selftest64 的 bit2 里逐条核对。）
 //       rsp 16 字节对齐（进入 _start 时 rsp%16==0）。
 //   * 进 ring3 走 user64_enter_at64（usermode64.cpp）：TSS.rsp0 + syscall 栈顶镜像切好、抬栈 iretq。
+//     execve 路径走 proc64_start_elf64（kernel/proc64.cpp）：它有自己的 CR3/任务，见 proc64.h。
 //   * 跑完（exit）回收：逐页解除映射 + page_free_64；中间页表页保留（理由同 usermode64.cpp）。
 //
-// 串口打点（自动验收 tests/elf64_test.py grep，格式勿改）：
-//   [ELF64] install ok path=/hello.elf bytes=<n>   / install skipped (exists) /hello.elf size=<n>
-//   [ELF64] load path=<p> entry=<hex> phnum=<n> segs=<n> size=<n>
+// 串口打点（自动验收 tests/elf64_test.py、tests/musl64_test.py grep，格式勿改）：
+//   [ELF64] install ok path=<p> bytes=<n>   / install skipped (exists) <p> size=<n>
+//   [ELF64] load path=<p> entry=<hex> phnum=<n> segs=<n> size=<n> [rsp=<hex>]  （execve 路径多 size/rsp/via=execve）
+//   [ELF64] auxv phdr=<hex> phent=<n> phnum=<n> base=<hex> entry=<hex> random=<hex> secure=<n> pagesz=<n> rsp=<hex>
 //   [ELF64] enter ring3 entry=<hex> rsp=<hex>      [ELF64] back to kernel (ring0) rc=<n>
 //   [ELF64] launch ok rc=<n> path=<p>              [ELF64] launch FAILED path=<p> reason=<r>
 //   [ELF64] reject reason=<r> / [ELF64] reject segment va=<hex> reason=<r>

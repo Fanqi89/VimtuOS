@@ -192,6 +192,11 @@ static uint64_t read_cs64()  { uint64_t v; __asm__ volatile("mov %%cs, %0"  : "=
 #ifndef VIMTU_INSTALLER_MEDIA
 extern "C" const uint8_t _binary_build64_spin64_elf_start[];
 extern "C" const uint8_t _binary_build64_spin64_elf_end[];
+// ★ A3：内嵌的 musl 静态程序（tools/musl_build_win.sh 编出 build64/musl_hello.elf，
+//   build64.sh 里 objcopy -> build64/os/musl_hello_elf.o，符号名按输入路径生成）。
+//   体积代价见 build64.sh 里那段注释与 docs 的 "musl（A3 第一步）" 节。
+extern "C" const uint8_t _binary_build64_musl_hello_elf_start[];
+extern "C" const uint8_t _binary_build64_musl_hello_elf_end[];
 
 // 任务表快照查询（-1 = 该任务已不在表里 = 槽已回收）
 static int k64_task_state_of64(uint32_t id) {
@@ -317,6 +322,148 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
     } else {
         dbg64_str("[USER64] slotreuse FAIL reason=6 (slot not reused)\n");
     }
+    dbg64_line_end64();
+}
+
+// ==================== ★ A3：musl 静态程序（真进程 + ring3）====================
+// 怎么做（与 /hello.elf 那条"内嵌 blob -> 装进 VimtuFS2 -> 从盘上读出来跑"完全同一套路，
+// 但**跑法**升级成"真进程"）：
+//   1) 把内嵌的 musl ELF（objcopy 出的 _binary_build64_musl_hello_elf_*，由
+//      tools/musl_build_win.sh 产出）幂等装成 VimtuFS2 的 /musl_hello.elf；
+//   2) 用 proc64_create64 + proc64_start_elf64 建**真进程**（自己的 CR3/任务），由
+//      elf64_load_for_exec64 从**文件系统**读出来装载（打点 [ELF64] load … via=execve）；
+//   3) 有界等待它退出（Proc64Info.state == PROC64_EXITED），收尸 + 打点。
+// 为什么必须走进程而不是 user64_run_capp64 那条"平铺 blob"路：
+//   musl 启动期要 arch_prctl(ARCH_SET_FS) 真写 IA32_FS_BASE（%fs 上的 TLS：errno 就在里面），
+//   而 syscall64 的共享模式（没有进程上下文）只**记账**不写 MSR —— 走了也起不来（会 #PF）。
+//   进程路径由 proc64_set_fs_base64 真写 MSR，且任务切换会保存/恢复（见 proc64.h 第 3 条）。
+// 如实边界：UEFI（共享地址空间）下建不了进程 -> 只打一行跳过，绝不假装跑过。
+// 打点（tests/musl64_test.py grep）：
+//   [ELF64] install ok path=/musl_hello.elf bytes=<n>   / install skipped (exists) /musl_hello.elf size=<n>
+//   [MUSL64] launch path=<p> pid=<n>                    （已建进程并挂上）
+//   [MUSL64] done pid=<n> exited=<0|1> code=<n> ticks=<n>
+//   [MUSL64] skipped (user window unavailable) / skipped (shared address space mode) / FAILED reason=<r>
+static const char MUSL64_PATH64[] = "/musl_hello.elf";
+static const char MUSL64_NAME64[] = "muslhello";
+
+static int musl64_install64(const char* path) {
+    uint32_t ty = 0, sz = 0;
+    if (vfs64_stat(path, &ty, &sz) == 0) {
+        dbg64_line_begin64();
+        dbg64_str("[ELF64] install skipped (exists) ");
+        dbg64_str(path);
+        dbg64_str(" size=");
+        dbg64_dec(sz);
+        dbg64_nl();
+        dbg64_line_end64();
+        return 0;
+    }
+    const int len = (int)(_binary_build64_musl_hello_elf_end - _binary_build64_musl_hello_elf_start);
+    if (len <= 0) {
+        dbg64_line_begin64();
+        dbg64_str("[MUSL64] FAILED reason=blob-empty\n");
+        dbg64_line_end64();
+        return -1;
+    }
+    if (vfs64_write(path, _binary_build64_musl_hello_elf_start, len) != len) {
+        dbg64_line_begin64();
+        dbg64_str("[MUSL64] FAILED reason=install path=");
+        dbg64_str(path);
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[ELF64] install ok path=");
+    dbg64_str(path);
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)len);
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+
+static void musl64_demo64(const char* path) {
+    const char* p = (path && path[0] == '/') ? path : MUSL64_PATH64;
+    if (!user64_available64()) {
+        dbg64_line_begin64();
+        dbg64_str("[MUSL64] skipped (user window unavailable on this boot path)\n");
+        dbg64_line_end64();
+        return;
+    }
+    if (musl64_install64(p) != 0) return;
+    if (!proc64_isolate64()) {                          // UEFI/固件页表：共享地址空间模式
+        dbg64_line_begin64();
+        dbg64_str("[MUSL64] skipped (shared address space mode: arch_prctl would not write IA32_FS_BASE)\n");
+        dbg64_line_end64();
+        return;
+    }
+
+    const int pid = proc64_create64(MUSL64_NAME64, 0);
+    if (pid <= 0) {
+        dbg64_line_begin64();
+        dbg64_str("[MUSL64] FAILED reason=create\n");
+        dbg64_line_end64();
+        return;
+    }
+    if (proc64_start_elf64(pid, p) != 0) {
+        if (proc64_find64(pid)) proc64_destroy64(pid);
+        dbg64_line_begin64();
+        dbg64_str("[MUSL64] FAILED reason=start path=");
+        dbg64_str(p);
+        dbg64_nl();
+        dbg64_line_end64();
+        return;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[MUSL64] launch path=");
+    dbg64_str(p);
+    dbg64_str(" pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_nl();
+    dbg64_line_end64();
+
+    // 有界等待（10 秒上限）：musl 程序自己会 exit(7)；超时就 SIGKILL 并如实打点。
+    const uint64_t t0 = g_ticks64;
+    int exited = 0;
+    while ((g_ticks64 - t0) < (uint64_t)PIT_HZ_64 * 10u) {
+        if (k64_proc_state_of64(pid) == (int)PROC64_EXITED) { exited = 1; break; }
+        if (k64_proc_state_of64(pid) < 0) break;         // 进程没了（理论上不该）
+        task_sleep64(2);
+    }
+    int code = -1;
+    for (int i = 0; i < PROC64_MAX; i++) {
+        Proc64Info in;
+        if (proc64_info64(i, &in) == 0) continue;
+        if ((int)in.pid == pid) { code = in.exit_code; break; }
+    }
+    if (!exited) {
+        (void)proc64_kill64(pid, 9);
+        dbg64_line_begin64();
+        dbg64_str("[MUSL64] TIMEOUT pid=");
+        dbg64_dec((uint64_t)pid);
+        dbg64_str(" -> SIGKILL\n");
+        dbg64_line_end64();
+    }
+    if (proc64_find64(pid)) {
+        Proc64Info in;
+        for (int i = 0; i < PROC64_MAX; i++) {
+            if (proc64_info64(i, &in) == 0) continue;
+            if ((int)in.pid == pid) { code = in.exit_code; break; }
+        }
+        proc64_destroy64(pid);
+    }
+    dbg64_line_begin64();
+    dbg64_str("[MUSL64] done pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_str(" exited=");
+    dbg64_dec((uint64_t)(exited ? 1 : 0));
+    dbg64_str(" code=");
+    if (code < 0) dbg64_putc('-');
+    dbg64_dec((uint64_t)(code < 0 ? -code : code));
+    dbg64_str(" ticks=");
+    dbg64_dec(g_ticks64 - t0);
+    dbg64_nl();
     dbg64_line_end64();
 }
 #endif
@@ -543,6 +690,11 @@ static void rust64_boot_init64() {
                 // 位置在 proc64 演示之后、gui64_run 之前（跑完必须还能进桌面）；只走 BIOS 路径
                 // （UEFI 下用户窗口不可用，上面这一整块已经被 user64_available64() 挡在外面）。
                 ring3_slot_reuse_demo64("/spin.elf", 4);
+                // ---- ★ A3：musl 静态程序（真进程 + ring3；"移植 musl libc"的第一块里程碑）----
+                // 位置：整段 ring3 演示的**最后**一个（跑完还要能进桌面）。为什么排最后：
+                //   proc64 的 fork/pipe/slotreuse 演示都对进程表/日志有断言（tests/proc64_test.py、
+                //   tmgr_proc_test.py 等），musl 那段要多建/多收一个进程 —— 排最后最不容易搅动它们。
+                musl64_demo64(MUSL64_PATH64);
             } else {
                 proc64_init64();                                 // 仍然打点：mode=shared（如实）
                 (void)proc64_demo64("/proc64.elf");              // 只打一行 "demo skipped (shared address space mode)"

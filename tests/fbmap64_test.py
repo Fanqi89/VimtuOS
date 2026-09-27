@@ -226,7 +226,7 @@ def main():
         got_map = vm.wait_log("[FB64] map pid=", 180)
         check("用户程序调到了 fb_map(9)（[FB64] map pid=）", got_map)
         log = vm.log()
-        m = re.search(r"\[FB64\] map pid=(-?\d+) va=0x([0-9a-f]+) pa=0x([0-9a-f]+) "
+        m = re.search(r"\[FB64\] map pid=(-?\d+) va=0x([0-9A-Fa-f]+) pa=0x([0-9A-Fa-f]+) "
                       r"w=(\d+) h=(\d+) pitch=(\d+) fmt=(\d+) pages=(\d+) re=(\d+) u=(\d+)", log)
         check("map 打点格式完整（va/pa/w/h/pitch/fmt/pages/re/u）", m is not None)
         if m:

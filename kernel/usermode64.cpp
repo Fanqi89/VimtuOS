@@ -126,6 +126,36 @@ static int u64_ctx_slot64() {
 }
 // 把汇编用的保存区指针指向当前任务那一份（进 ring3 前 / exit 改写帧前各一次）
 static void u64_ctx_bind64() { g_user64_ctxp64 = (uint64_t)(uintptr_t)&g_user64_ctx64[u64_ctx_slot64()]; }
+
+// ★ A3：ring3 的 SSE 开关（只做一次；CR4 是全局寄存器，开了就一直有效）。
+//   为什么需要：musl 的默认静态构建（libc.a）里大量用了 SSE —— 编译器自动向量化出来的
+//   `movaps/xorps/movups`（__init_libc 清 auxv 数组、mallocng 清元数据、open 保存 xmm…）。
+//   长模式启动只设了 CR4.PAE（见 boot/loader64.asm 的 lm64 入口），CR4.OSFXSR=0 时 ring3
+//   执行任何 SSE 指令 = #UD（实测症状：musl 程序跑到 malloc 就 `[PANIC] cpu exception 6`，
+//   rip 指向一条 movaps）。所以进 ring3 之前必须打开 CR4.OSFXSR/OSXMMEXCPT 并清 CR0.EM/TS。
+//   ★ 如实标注的边界：**没有 FPU/xmm 上下文切换**（kernel/switch64.asm 不保存 xmm 寄存器），
+//     所以只保证"同一进程内 SSE 状态连续"；两个进程同时用 SSE 会互相污染。本轮唯一使用者
+//     是启动期那个 musl 程序（单进程），见 docs/应用层与系统调用说明.md 的"musl（A3 第一步）"。
+//   打点（只打一次，留现场证据）：[USER64] fpu sse=1 cr4=… cr0=…
+static void u64_fpu_enable64() {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    uint64_t cr0 = 0, cr4 = 0;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~((uint64_t)0x4u | (uint64_t)0x8u);     // CR0.EM=0（SSE/FP 指令不 #UD）、CR0.TS=0（不做惰性切换）
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0) : "memory");
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= ((uint64_t)1u << 9) | ((uint64_t)1u << 10);   // CR4.OSFXSR=1 + CR4.OSXMMEXCPT=1
+    __asm__ volatile("mov %0, %%cr4" :: "r"(cr4) : "memory");
+    dbg64_line_begin64();
+    dbg64_str("[USER64] fpu sse=1 cr4=");
+    dbg64_hex64(cr4);
+    dbg64_str(" cr0=");
+    dbg64_hex64(cr0);
+    dbg64_str(" (ring3 可使用 SSE/SSE2；无 FPU 上下文切换，如实标注)\n");
+    dbg64_line_end64();
+}
 static inline void u64_in_ring3_set64(int on) {
     const uint32_t bit = 1u << u64_ctx_slot64();
     if (on) g_user64_in_ring3_mask64 |= bit; else g_user64_in_ring3_mask64 &= ~bit;
@@ -608,6 +638,7 @@ static int u64_run_blob_ex64(const void* blob, uint32_t size, const char* name, 
     // ★ 从这里进入 ring3；用户程序 exit(2) 时由被改写的 syscall 帧回到下面这行之后。
     //   返回值 = 用户 exit 的退出码（汇编蹦床把 code 放在 rax 里返回）——不读全局量，
     //   因为 sti 之后本任务可能被抢占、另一个进程的 exit 会覆盖全局量。
+    u64_fpu_enable64();                     // ★ A3：ring3 的 SSE（musl 的静态库要用；只开一次）
     const uint64_t u64_rc = user64_enter64((uint64_t)(uintptr_t)&g_user64_frame64);
     (void)u64_rc;
     u64_in_ring3_set64(0);
@@ -733,6 +764,7 @@ int user64_enter_at64(uint64_t entry, uint64_t user_rsp, const char* name) {
     g_user64_exit_code64 = 0;
     u64_ctx_bind64();                       // ★ 保存区指向本任务那一份
     u64_in_ring3_set64(1);
+    u64_fpu_enable64();                     // ★ A3：ring3 的 SSE（musl 的静态库要用；只开一次）
     // ★ 进入 ring3；exit（int 0x80 或 syscall 指令）后由内核蹦床回到下面这行之后。
     const uint64_t rc = user64_enter64((uint64_t)(uintptr_t)&g_user64_frame64);
     u64_in_ring3_set64(0);
@@ -806,6 +838,7 @@ int user64_enter_frame64(const pt_regs64* frame, const char* name) {
     g_user64_exit_code64 = 0;
     u64_ctx_bind64();
     u64_in_ring3_set64(1);
+    u64_fpu_enable64();                     // ★ A3：ring3 的 SSE（musl 的静态库要用；只开一次）
     const uint64_t rc = user64_enter64((uint64_t)(uintptr_t)&g_user64_frame64);
     u64_in_ring3_set64(0);
 
