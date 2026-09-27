@@ -540,12 +540,36 @@ static int run_external(int argc, char** argv) {
         av[n++] = path;
         for (int i = 1; i < argc && n < SH_ARGV_MAX; i++) av[n++] = argv[i];
         av[n] = 0;
+        /* ★ A4-2b：`run PATH > FILE` 的重定向落地在**子进程**里 —— dup2(fd, 1) 之后再 execve。
+         *   为什么现在才做：批次 D 才把内核的 dup2 修成"目标 0/1/2 也走 FD 层"（
+         *   kernel/syscall64.cpp:567 的注释："槽被 dup2 绑了对象 -> FD 层（文件/pipe/tty），
+         *   这正是\"外部命令 > 文件\"的落地方式"）；在那之前，目标 1 是 -ENOSYS，shell 只能对
+         *   内置命令做「把输出写进文件 fd」的替代实现（见 out_bytes）。子进程 fork 出来的 fd
+         *   表是**复制**的，execve 也保留（proc64.cpp 的 fds_kept），所以这里绑好 fd 1 就行。 */
+        if (g_out_fd >= 0) {
+            const int r = sh_dup(g_out_fd, 1);
+            if (r < 0) {
+                const int saved = g_out_fd;
+                g_out_fd = -1;
+                out_str("run: dup2 to fd 1 failed (err="); out_dec(-r); out_str(")\n");
+                g_out_fd = saved;
+            }
+        }
         (void)sh_execve(path, av, 0);
         sh_exit_group(127);                          /* 装载失败：本内核按 127 终止（如实） */
     }
     int st2 = 0;
+    /* ★ A4-2b：父进程的"run: … exited code=N"这一行要回**终端**而不是重定向文件
+     *   （真 shell 也是这个语义：重定向只作用在那个命令的 stdout 上）。 */
+    const int saved_out_fd = g_out_fd;
+    g_out_fd = -1;
     const int r = sh_wait4(pid, &st2, 0);
-    if (r < 0) { out_str("run: wait4 failed (err="); out_dec(-r); out_str(")\n"); return 2; }
+    if (r < 0) {
+        out_str("run: wait4 failed (err="); out_dec(-r); out_str(")\n");
+        g_out_fd = saved_out_fd;
+        return 2;
+    }
+    g_out_fd = saved_out_fd;
     const int code = (st2 >> 8) & 0xFF;
     out_str("run: "); out_str(path);
     out_str(" pid="); out_dec(r);
@@ -677,11 +701,9 @@ static int run_stage(char* stage, const char* in_buf, int in_len, int last) {
     /* 输出汇 */
     g_cap = 0; g_cap_len = 0; g_cap_ovf = 0; g_out_fd = -1;
     if (last && out_file) {
-        if (which < 0) {
-            out_str("sh: redirection is implemented for built-ins only\n"
-                    "    (kernel dup2 to fd 0/1 is -ENOSYS; run it without '>')\n");
-            return 2;
-        }
+        /* ★ A4-2b：`>` / `>>` 现在对**外部程序**也生效 —— 内置命令走 out_bytes 的"直接写文件
+         *   fd"，外部程序走子进程里的 dup2(fd, 1) + execve（见 run_external）。两条路都不依赖
+         *   内核的"标准流可替换"（批次 D 之后 dup2 到 0/1/2 已经走 FD 层，见上面那段注释）。 */
         char path[SH_PATH_MAX];
         if (path_resolve(out_file, path, (int)sizeof(path)) != 0) { out_str("sh: bad path\n"); return 2; }
         const int fd = sh_open(path, SH_O_WRONLY | SH_O_CREAT | (append ? SH_O_APPEND : SH_O_TRUNC));

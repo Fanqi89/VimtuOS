@@ -321,6 +321,18 @@ for b in ldvimtu.so libfoo.so dynhello.elf; do
 done
 echo "    内嵌动态链接产物：$(stat -c%s "$BUILD/ldvimtu.so") + $(stat -c%s "$BUILD/libfoo.so") + $(stat -c%s "$BUILD/dynhello.elf") = $(( $(stat -c%s "$BUILD/ldvimtu.so") + $(stat -c%s "$BUILD/libfoo.so") + $(stat -c%s "$BUILD/dynhello.elf") )) B"
 
+echo "==> ★ A4-2b：TinyCC（**交付 = 系统卷里的 /tcc + /bin/tcc + /lib/tcc.bin**，内核里一个字节都不加）"
+# 为什么这样交付（内核区只剩 ~187 KB；tcc 是 280 KB 量级的编译器）：
+#   1) tools/tcc_build_win.sh 手写构建（不走上游 configure/Makefile，理由见那个脚本的头部）：
+#        * build64/tcc.bin  —— 真 tcc：静态 ELF64，**非 PIC、按 4GiB+0x90000 定址**（-mcmodel=large）
+#        * build64/tcc      —— 装载驱动（< 64 KiB，走内核的主程序装载器）：它 mmap 到 4GiB+0x90000、
+#                              把 tcc 的段搬进去、改 auxv、jmp 进 tcc（详见 user/apps/tcc/tccdrv.c）
+#        * build64/tcc_stage/ —— /tcc 那棵树的离线镜像（libtcc1.a + musl 头 + crt1.o/crti.o/crtn.o/libc.a）
+#   2) tools/tcc_pack_win.py 把上面这些东西 + A4-1 的 shell 一起离线写进**同一块** VimtuFS2 卷
+#      （写完逐字节回读自检；tcc.bin 单文件 282 KB 要用卷格式的**二级间接**，写入器在 A4-1 那份上补了这一层）。
+#   3) **内核二进制里搜不到 tcc 的字节**（后面有断言）—— 这正是"内核区只剩 187 KB"的纪律要求。
+bash tools/tcc_build_win.sh "$BUILD"
+
 echo "==> ★ A3 下半：FPU/xmm 上下文回归程序（user/xmmsse.asm；两个进程同时跑）"
 # 见 user/xmmsse.asm 顶部说明：同一份 ELF 起两个真进程、各自核对 16 个 xmm 是否被对方污染。
 # 链接脚本 user/xmmsse_elf64.ld（不是 hello_elf64.ld）：本程序只有 FPU 回归、没有段权限断言，
@@ -538,7 +550,12 @@ echo "    图标包：$ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）**内嵌进
 echo "==> ★ A4-1：带 /bin/shell.bin 的演示盘 + \"内核里没有 shell 字节\"断言"
 # system.img 已经装好 -> 把它 + MBR + 主分区（= 带 /bin/shell.bin 的 VimtuFS2 v4 卷）拼成
 # 一块能直接启动的盘：build64/sysdisk.img（验收脚本 tests/sh64_test.py 也用它做夹具）。
-"$PY" tools/make_shellvol.py --shell "$BUILD/shell.bin" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+# ★ A4-2b：造盘改用 tools/tcc_pack_win.py —— 它在同一块卷里再装进 /bin/tcc（驱动）、/lib/tcc.bin
+#   （tcc 本体）、/tcc/**（libtcc1.a + 系统头 + crt/libc）、/tcc/demo/*.c、/hello（宿主版 tcc 产物）。
+#   卷内容与 A4-1 完全兼容（/bin/shell.bin + /etc/sh64hello.txt + /tmp），shell 部分逐字节同前。
+"$PY" tools/tcc_pack_win.py --shell "$BUILD/shell.bin" --bin-tcc "$BUILD/tcc" --tcc "$BUILD/tcc.bin" \
+      --stage "$BUILD/tcc_stage" --hello "$BUILD/tcc_demo_hello" --demo-dir user/apps/tcc \
+      --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 # 断言：内核二进制里**不能**出现 shell.bin 的字节（交付方式必须是"系统卷里的文件"）。
 # 探针取 shell 中段的 64 字节（ELF 头/入口附近的字节模式到处都是，中段最稳）。
 "$PY" - "$BUILD/kernel64_os.bin" "$BUILD/shell.bin" <<'PYEOF'
@@ -552,6 +569,20 @@ if len(probe) < 64 or probe in k:
     raise SystemExit(1)
 print("    断言 OK：系统内核 %d B 里搜不到 shell.bin 的 64B 探针（偏移 %d）；shell 只从系统卷装载" % (len(k), mid))
 PYEOF
+
+# ★ A4-2b 的同一条纪律：**内核二进制里不能出现 tcc 的字节**（tcc 只从系统卷 /lib/tcc.bin 装载）。
+# 探针取 tcc.bin 中段的 64 字节（ELF 头/入口附近的模式到处都是，中段最稳）。
+"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/tcc.bin" <<'PYEOF2'
+import sys
+k = open(sys.argv[1], "rb").read()
+t = open(sys.argv[2], "rb").read()
+mid = len(t) // 2
+probe = t[mid:mid + 64]
+if len(probe) < 64 or probe in k:
+    sys.stderr.write("ERROR: system kernel contains tcc.bin bytes (delivery must be a volume file)\n")
+    raise SystemExit(1)
+print("    断言 OK：系统内核 %d B 里搜不到 tcc.bin 的 64B 探针（偏移 %d）；tcc 只从系统卷装载" % (len(k), mid))
+PYEOF2
 
 echo "==> ★ A4-2a：ring3 系统调用探针（chdir/rename/rmdir/dup2/utime + execve 失败路径的真证据）"
 # 为什么源码由构建脚本生成：本批只允许改 kernel/*、build64.sh、tests/a42a64_test.py、docs —— user/
