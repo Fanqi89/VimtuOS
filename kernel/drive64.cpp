@@ -56,6 +56,7 @@ static void log_skip(uint32_t lba, const char* type, const char* reason) {
     dbg64_nl();
 }
 static void log_letter(const DriveInfo64& e) {
+    dbg64_line_begin64();                     // ★ 行原子（前缀/内容/换行一次写完）
     dbg64_str("[DRV64] letter=");
     char l[3];
     l[0] = e.letter;
@@ -80,6 +81,7 @@ static void log_letter(const DriveInfo64& e) {
         dbg64_dec((uint64_t)e.fatvol);
     }
     dbg64_nl();
+    dbg64_line_end64();
 }
 
 
@@ -637,12 +639,15 @@ int drive64_selftest64() {
 }
 
 void drive64_dump64() {
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[DRV64] dump entries=");
     dbg64_dec((uint64_t)g_count);
     dbg64_str(g_scanned ? " scanned=yes" : " scanned=no");
     dbg64_nl();
+    dbg64_line_end64();
     for (int i = 0; i < g_count; i++) {
         const DriveInfo64& e = g_entries[i];
+        dbg64_line_begin64();                   // ★ 行原子（dump 每条跨很多次调用，实测被 [TASK64] 插过）
         dbg64_str("[DRV64] dump  [");
         dbg64_dec((uint64_t)i);
         dbg64_str("] ");
@@ -675,6 +680,7 @@ void drive64_dump64() {
         dbg64_str(" skip=");
         dbg64_str(drive64_skip_reason64(e.skip));
         dbg64_nl();
+        dbg64_line_end64();
     }
 }
 
@@ -686,4 +692,15 @@ const char* drive64_kind_name64(uint32_t vfs_kind) {
     if (vfs_kind == VFS64_KIND_TEXT) return "text";
     if (vfs_kind == VFS64_KIND_BIN)  return "bin";
     return "unknown";
+}
+
+// ★ 实时重打有盘符条目的 [DRV64] letter= 行（值 = drive64_info64 -> fs64 -> vfs64 现数位图）。
+//   与开机那次扫描的快照不同：这是“查询时刻”的值，给“同一时刻两个来源”的验收用。
+void drive64_log_letters64() {
+    for (int i = 0; i < g_count; i++) {
+        if (g_entries[i].letter == 0) continue;
+        DriveInfo64 live;
+        if (drive64_info64(i, &live) == 0) log_letter(live);
+        else log_letter(g_entries[i]);
+    }
 }

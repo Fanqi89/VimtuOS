@@ -128,6 +128,10 @@ const char* drive64_skip_reason64(uint8_t skip);
 int  drive64_selftest64();
 // 串口打印盘符表（每条一行 [DRV64] letter=... / [DRV64] skip ...；验收与排障用）
 void drive64_dump64();
+// ★ 实时重打有盘符条目的 [DRV64] letter= 行（值走 drive64_info64 = 按需刷新位图/FSInfo）。
+//   用途：自动验收要比较“同一时刻”的两个来源（例如 df 的 blocks/free），不能再拿开机扫描
+//   那次的历史快照去比 —— 快照与 df 之间的装入/写盘会让 1% 容差失效（实测差 399 块）。
+void drive64_log_letters64();
 
 // kind（VFS64_KIND_*，见 kernel/vfs64.h）-> UI 用的稳定小写字符串；未知 -> "unknown"。
 // 放在这里是为了让 UI 只 include 一个头就有"类型名字"。

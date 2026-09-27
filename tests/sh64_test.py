@@ -99,6 +99,36 @@ def q(p):
 # 模块前缀**的整行（都以 \r\n 结尾），剩下的就是经邮箱抽回来的 shell 输出流 —— 它是连续的。
 KERNEL_TAG_RE = re.compile(r"\[[A-Z][A-Z0-9_]*\][^\r\n]*\r?\n")
 
+# ★ A4-2 收口：串口行原子性自检。内核日志本应一条行一次写完（dbg64_line_begin64/end64），
+#   被撕开的行表现成两类：① 行里出现 "[[" + 内核 tag（另一条行从半行中间开始）；② 一行以内核
+#   tag 开头、行内又出现另一个内核 tag（另一条内核行插进了这一行）。
+#   不算命中的（不是内核行互插）：用户程序自己先写前缀再接内核行（如 "[LDSO] [SYSCALL] …"）、
+#   或 shell 字节与内核行叠在同一物理行（第一段不是内核 tag）—— 前者是用户程序行为，后者
+#   过滤器按字节剥掉内核行后 shell 字节一个不少。
+KERNEL_TAGS = (
+    "SYSCALL", "TASK", "TASK64", "WD64", "UI", "TERM", "SH64", "PROC64", "ELF64", "FD64",
+    "VFS64", "DRV64", "ICON64", "IMG64", "GUI64", "FONT64", "APP", "LOCK64", "START64",
+    "DESK64", "DOCK64", "PANEL64", "VOL", "FAT64", "BIG64", "NET64", "INPUT64", "PRELOAD64",
+    "SET64", "ATA64", "AHCI64", "NVME64", "USB64", "MEM64", "PANIC", "BSOD", "USER64",
+    "PERM64", "SYS64", "CON64", "CONF64", "STORE64", "UPDATE64", "SESSION64", "USERDB64",
+    "GFX64", "DISPLAY64", "THEME64", "OS", "RESET", "SHUTDOWN",
+)
+KERNEL_TAG_ANY_RE = re.compile(r"\[(?:%s)\]" % "|".join(KERNEL_TAGS))
+KERNEL_TAG_AT_START_RE = re.compile(r"\[(?:%s)\]" % "|".join(KERNEL_TAGS))
+KERNEL_TAG_DOUBLE_RE = re.compile(r"\[\[(?:%s)\]" % "|".join(KERNEL_TAGS))
+KERNEL_LINE_RE = re.compile(r"\[(?:%s)\][^\r\n]*\r?\n" % "|".join(KERNEL_TAGS))
+
+
+def serial_line_atomicity_hits(text):
+    """返回被撕开的内核日志行 [(行号, 行内容)]；返回 0 条 = 串口行原子性自检通过。"""
+    hits = []
+    for i, line in enumerate(text.splitlines(), 1):
+        m = KERNEL_TAG_AT_START_RE.match(line)
+        if (m is not None and KERNEL_TAG_ANY_RE.search(line, m.end()) is not None) or \
+           KERNEL_TAG_DOUBLE_RE.search(line) is not None:
+            hits.append((i, line))
+    return hits
+
 def shell_stream(text):
     """剥掉内核自己的打点行 -> 只剩 shell 输出流（逐字节可比对）。
     注意：日志是用 text 模式读的（通用换行），内核行的 \\r\\n 已经变成 \\n —— 所以正则收 \\r?\\n。
@@ -118,6 +148,17 @@ def shell_stream(text):
     （不是放宽：剥掉的仍然只是内核打点行；shell 自己的字节一个不少。）"""
     for _ in range(4):
         nxt = KERNEL_TAG_RE.sub("", text)
+        if nxt == text:
+            break
+        text = nxt
+    return text
+
+
+def kernel_stream(text):
+    """只剥**已知内核模块前缀**的整行（与 shell_stream 同思路，但不会误剥 help 文本里的
+    `[PATH]`/`[CODE]` 这类方括号词 —— shell_stream 的宽正则会把它们当内核行吃掉）。"""
+    for _ in range(4):
+        nxt = KERNEL_LINE_RE.sub("", text)
         if nxt == text:
             break
         text = nxt
@@ -477,10 +518,52 @@ def main():
     check("该步之后系统仍活着（没有触发 execve 失败 -> ring3 #PF 那条既有缺陷）",
           proc.poll() is None and "[PANIC]" not in slog()[before_bad:])
 
+    # ★ unlink(87) 回归断言（A4-2a 修回、A4-2 收口钉死）：不只看 shell 文本，还要看内核
+    #   真的收到了 unlink(87) 且返回 0；同时确认删除后 cat 打不开（文件真没了）。
+    before_rm = len(slog())
     type_line(mon, "rm /tmp/o1")
     type_line(mon, "cat /tmp/o1")
-    check("rm 真删（rm: ok /tmp/o1）+ 再 cat 报打不开（cat: cannot open）",
-          wait_mark("cat: cannot open /tmp/o1", 20), "")
+    rm_gone = wait_mark("cat: cannot open /tmp/o1", 20)
+    log_rm = slog()[before_rm:]
+    check("rm 真删：shell 打 rm: ok /tmp/o1 + 内核收到 unlink(87) 返回 0"
+          "（[SYSCALL] insn nr=87 … ret=0000000000000000）",
+          rm_gone and "rm: ok /tmp/o1" in log_rm and
+          re.search(r"\[SYSCALL\] insn nr=87 [^\r\n]*ret=0000000000000000", log_rm) is not None,
+          (re.search(r"\[SYSCALL\] insn nr=87[^\r\n]*", log_rm) or ["（缺 nr=87 打点）"])[0])
+    check("删除生效：再 cat 报打不开（cat: cannot open /tmp/o1）", rm_gone, "")
+
+    # ★ A4-2 收口：`help` 输出约 700 B > 内核每 tick 512 B 的搬运预算。旧实现在预算满时
+    #   \"先消费 out 环、再直接丢弃\" -> help 缺尾 + 下一个提示符一起消失。修法 = 预算满就停，
+    #   字节留在 out 环下一 tick 继续。这里逐字节断言整段 help（含紧随其后的提示符）连续出现。
+    SHELL_HELP = (b"help\n"
+                  b"VimtuOS ring3 shell (sh64) - built-in commands:\n"
+                  b"  help                 this help\n"
+                  b"  echo TEXT...         print TEXT\n"
+                  b"  pwd                  print the shell cwd\n"
+                  b"  cd [PATH]            change the shell cwd (kernel has no chdir(80))\n"
+                  b"  ls [PATH]            list a directory (terminal service -> kernel fd64 readdir)\n"
+                  b"  cat FILE...          print files ('cat' alone reads a pipeline/'<' input)\n"
+                  b"  stat PATH            file status (type/size/mode/uid/gid)\n"
+                  b"  mkdir PATH           create a directory\n"
+                  b"  rm FILE              remove a file\n"
+                  b"  run PATH [ARG...]    run an external program (fork+execve+wait4)\n"
+                  b"  exit [CODE]          leave the shell\n"
+                  b"redirection: > >> < (built-ins)    pipeline: a | b (built-ins)\n"
+                  b"external programs get the kernel console for stdout (dup2 to fd 0/1 = -ENOSYS)\n")
+    type_line(mon, "help")
+    want_help = SHELL_HELP + b"sh64:/tmp/d1$ "
+    _hh_t0 = time.time()
+    _hh_ok = False
+    while time.time() - _hh_t0 < 25:                # 等这一条命令自己的字节到齐再判（同 wait_stream_bytes）
+        if want_help in kernel_stream(slog()).encode("utf-8", "replace"):
+            _hh_ok = True
+            break
+        time.sleep(0.3)
+    check("shell 内置 help 输出完整（约 %d B、跨 tick 不丢字节；逐字节 + 随后提示符正常）" % len(want_help),
+          _hh_ok,
+          kernel_stream(slog()).encode("utf-8", "replace")[-120:])
+    check("help 输出之后 in 环/out 环没有丢包打点（[SH64] in-ring overflow / dropped total 不出现）",
+          "[SH64] in-ring overflow" not in slog() and "[SH64] in-ring dropped total=" not in slog())
 
     # ---------------- ⑦ exit -> 回到终端 ----------------
     type_line(mon, "exit")
@@ -514,6 +597,11 @@ def main():
                   if _pre else "")
         else:
             check("不得出现 %s" % needle, needle not in log_final)
+    # ★ A4-2 收口：串口行原子性自检（扫本次完整串口日志）。
+    _atomic = serial_line_atomicity_hits(log_final)
+    check("串口行原子性自检：同一行两个内核 [TAG] / \"[[tag]\" 命中数 = 0（行锁覆盖）",
+          not _atomic,
+          ("命中 %d 行：%s" % (len(_atomic), _atomic[:3])) if _atomic else "命中 0")
     check("系统还活着（桌面/内核没有 PANIC 后的复位）", proc.poll() is None, "qemu rc=%s" % proc.poll())
 
     if proc.poll() is None:

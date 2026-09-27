@@ -1493,9 +1493,11 @@ static void draw_dock(void) {
              g_dock_y + (g_dock_h - THEME64_FS_NORMAL) / 2, buf, t->dock_txt);
     if (!str_eq64(buf, g_clock_log)) {
         str_copy64(g_clock_log, buf, (int)sizeof(g_clock_log));
-        dbg64_str("[UI] clock text=");
+        dbg64_line_begin64();                       // ★ 行原子：[UI] clock 是每秒一行的高频打点，
+        dbg64_str("[UI] clock text=");              //   前缀/内容/换行必须一次写完（实测被 [TASK64] 插过行）
         dbg64_str(buf);
         dbg64_nl();
+        dbg64_line_end64();
     }
 }
 

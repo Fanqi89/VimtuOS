@@ -302,9 +302,11 @@ static void geom_restore(const Vfs64Geom* g) {
 
 // ==================== 串口打点（统一 [VFS64] 前缀）====================
 static void log_line(const char* s) {
+    dbg64_line_begin64();                       // ★ A4-2 收口：整行原子（实测 [TASK64] 插过 stat/mount 行）
     dbg64_str("[VFS64] ");
     dbg64_str(s);
     dbg64_nl();
+    dbg64_line_end64();
 }
 static void log_hex32(uint32_t v) {
     static const char* H = "0123456789ABCDEF";
@@ -314,11 +316,14 @@ static void log_hex32(uint32_t v) {
     dbg64_str(b);
 }
 static void log_mount_fail(const char* why) {
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] mount FAILED reason=");
     dbg64_str(why);
     dbg64_nl();
+    dbg64_line_end64();
 }
 static void log_bad_block(uint32_t blk) {
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] BAD block=");
     dbg64_dec(blk);
     dbg64_str(" not in data area [");
@@ -327,8 +332,10 @@ static void log_bad_block(uint32_t blk) {
     dbg64_dec(g_blocks);
     dbg64_str(")");
     dbg64_nl();
+    dbg64_line_end64();
 }
 static void log_bad_inode(uint32_t idx) {
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] BAD inode=");
     dbg64_dec(idx);
     dbg64_str(" (count=");
@@ -336,6 +343,7 @@ static void log_bad_inode(uint32_t idx) {
     dbg64_dec(g_inode_count);
     dbg64_str(")");
     dbg64_nl();
+    dbg64_line_end64();
 }
 // 坏路径打点：说明原因 + 路径前 40 字节（不整条打，避免超长行）
 static void log_path_bad(const char* why, const char* path) {
@@ -343,18 +351,22 @@ static void log_path_bad(const char* why, const char* path) {
     uint32_t i = 0;
     if (path) { for (; path[i] && i < 40u; i++) b[i] = path[i]; }
     b[i] = 0;
+    dbg64_line_begin64();                       // ★ 行原子（stat 口径：path not found）
     dbg64_str("[VFS64] path ");
     dbg64_str(why);
     dbg64_str(" path=");
     dbg64_str(b);
     dbg64_nl();
+    dbg64_line_end64();
 }
 static void log_op_fail(const char* op, const char* why) {
+    dbg64_line_begin64();                       // ★ 行原子（stat/free 等操作失败口径）
     dbg64_str("[VFS64] ");
     dbg64_str(op);
     dbg64_str(": ");
     dbg64_str(why);
     dbg64_nl();
+    dbg64_line_end64();
 }
 
 static bool inode_load(uint32_t idx, uint8_t* out);          // 前置声明（perm_check_idx64 要用）
@@ -1672,10 +1684,12 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
     //   （系统内核的正常路径是 vfs64_mount_system64，它在挂载时就把 0 号槽登记成系统卷槽。）
     if (g_system_slot < 0) {
         g_system_slot = g_cur_slot;
+        dbg64_line_begin64();                   // ★ 行原子
         dbg64_str("[VFS64] system slot=");
         dbg64_dec((uint64_t)g_system_slot);
         dbg64_str(" (set by format)");
         dbg64_nl();
+        dbg64_line_end64();
     }
 
     g_mounted = false;
@@ -1762,6 +1776,7 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
 
     free_cache_bump();                     // 格式化刚写完位图 -> 空闲块数缓存作废
     g_mounted = true;
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] format ok blocks=");
     dbg64_dec(total_sectors);
     dbg64_str(" version=");
@@ -1778,6 +1793,7 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
     dbg64_dec(VFS_I4_MODE);
     dbg64_str(" rootmode=0755");
     dbg64_nl();
+    dbg64_line_end64();
     return 0;
 }
 
@@ -1830,7 +1846,8 @@ int vfs64_mount(int drive, uint32_t start_lba) {
         geom_restore(&saved);
         return -1;
     }
-    dbg64_str("[VFS64] mount ok blocks=");
+    dbg64_line_begin64();                   // ★ A4-2 收口：mount 行含 free= 口径数，必须行原子
+    dbg64_str("[VFS64] mount ok blocks=");  //   （实测被 [TASK64] kheart 从 free= 后插进同一物理行）
     dbg64_dec(g_blocks);
     dbg64_str(" inodes=");
     dbg64_dec(g_inode_count);
@@ -1843,13 +1860,16 @@ int vfs64_mount(int drive, uint32_t start_lba) {
     dbg64_str("B");
     dbg64_str(perm_enforced64() ? " perm=on" : " perm=off");
     dbg64_nl();
+    dbg64_line_end64();
     // ★ P4：旧卷（v2/v3）没有 uid/gid/mode 字段 -> 权限拦截**如实关闭**（打一行说清楚；不假装拦了）
     if (!perm_enforced64()) {
+        dbg64_line_begin64();               // ★ 行原子（两行一起写完）
         dbg64_str("[PERM64] legacy volume v");
         dbg64_dec(g_lay->version);
         dbg64_str(": no uid/gid/mode fields -> permission checks disabled");
         dbg64_str(" (owner shows as root, mode = default 0755/0644)\n");
         dbg64_nl();
+        dbg64_line_end64();
     }
     return 0;
 }
@@ -1963,15 +1983,18 @@ int vfs64_mount_slot64(int slot, int drive, uint32_t start_lba) {
     const int saved_cur = g_cur_slot;
     if (slot == saved_cur) {                                // 挂进当前槽：mount 内部自己 save/restore
         const int rc0 = vfs64_mount(drive, start_lba);
+        dbg64_line_begin64();                   // ★ 行原子
         dbg64_str("[VFS64] mount slot=");
         dbg64_dec((uint64_t)slot);
         dbg64_str(rc0 == 0 ? " ok (current)" : " FAILED (current)");
         dbg64_nl();
+        dbg64_line_end64();
         return rc0;
     }
     g_cur_slot = slot;                                      // 只让 mount 改这个槽的几何
     const int rc = vfs64_mount(drive, start_lba);
     g_cur_slot = saved_cur;                                 // 当前卷立刻换回（挂载不是激活）
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] mount slot=");
     dbg64_dec((uint64_t)slot);
     dbg64_str(rc == 0 ? " ok drive=" : " FAILED drive=");
@@ -1979,6 +2002,7 @@ int vfs64_mount_slot64(int slot, int drive, uint32_t start_lba) {
     dbg64_str(" start=");
     dbg64_dec(start_lba);
     dbg64_nl();
+    dbg64_line_end64();
     return rc;
 }
 
@@ -1986,14 +2010,17 @@ int vfs64_mount_slot64(int slot, int drive, uint32_t start_lba) {
 int vfs64_activate_slot64(int slot) {
     if (slot < 0 || slot >= (int)VFS64_SLOT_MAX) { log_slot_bad("activate_slot64", slot); return -1; }
     if (!g_vol[slot].mounted) {
+        dbg64_line_begin64();                   // ★ 行原子
         dbg64_str("[VFS64] activate slot=");
         dbg64_dec((uint64_t)slot);
         dbg64_str(" FAILED reason=not-mounted");
         dbg64_nl();
+        dbg64_line_end64();
         return -1;
     }
     g_cur_slot = slot;
     // 缓存按 (slot, drive, lba) 键控，切卷不需要清 —— 这里只打点，证明"切到哪个卷"。
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] activate slot=");
     dbg64_dec((uint64_t)slot);
     dbg64_str(" drive=");
@@ -2005,6 +2032,7 @@ int vfs64_activate_slot64(int slot) {
     dbg64_str(" version=");
     dbg64_dec(g_lay->version);
     dbg64_nl();
+    dbg64_line_end64();
     return 0;
 }
 
@@ -2026,6 +2054,7 @@ int vfs64_mount_system64(int drive, uint32_t start_lba) {
         if (vfs64_activate_slot64(slot) != 0) return -1;
     }
 
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] mount_system slot=");
     dbg64_dec((uint64_t)g_system_slot);
     dbg64_str(" drive=");
@@ -2033,6 +2062,7 @@ int vfs64_mount_system64(int drive, uint32_t start_lba) {
     dbg64_str(" start=");
     dbg64_dec(start_lba);
     dbg64_nl();
+    dbg64_line_end64();
     return 0;
 }
 
@@ -2040,6 +2070,7 @@ int vfs64_mount_system64(int drive, uint32_t start_lba) {
 void vfs64_slots_dump64() {
     int used = 0;
     for (int i = 0; i < (int)VFS64_SLOT_MAX; i++) if (g_vol[i].mounted) used++;
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] slots n=");
     dbg64_dec((uint64_t)VFS64_SLOT_MAX);
     dbg64_str(" used=");
@@ -2049,10 +2080,12 @@ void vfs64_slots_dump64() {
     dbg64_str(" current=");
     if (g_mounted) dbg64_dec((uint64_t)g_cur_slot); else dbg64_str("-");
     dbg64_nl();
+    dbg64_line_end64();
     for (int i = 0; i < (int)VFS64_SLOT_MAX; i++) {
+        dbg64_line_begin64();                   // ★ 行原子
         dbg64_str("[VFS64] slot=");
         dbg64_dec((uint64_t)i);
-        if (!g_vol[i].mounted) { dbg64_str(" used=no"); dbg64_nl(); continue; }
+        if (!g_vol[i].mounted) { dbg64_str(" used=no"); dbg64_nl(); dbg64_line_end64(); continue; }
         uint32_t free_blocks = 0;
         const bool freed = count_free_at(g_vol[i].drive, g_vol[i].start, g_vol[i].bitmap_start,
                                          g_vol[i].bitmap_blocks, g_vol[i].blocks,
@@ -2069,6 +2102,7 @@ void vfs64_slots_dump64() {
         if (freed) dbg64_dec(free_blocks); else dbg64_str("?");
         dbg64_str(i == g_cur_slot ? " current=yes" : "");
         dbg64_nl();
+        dbg64_line_end64();
     }
 }
 
@@ -2119,12 +2153,14 @@ struct Vfs64SlotGuard {
 };
 // 守卫失败（槽非法/没挂载）时的统一打点：说明"这次按槽调用没有落到任何卷上"，绝不静默写错地方。
 static int on64_slot_unavailable(const char* op, int slot) {
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] ");
     dbg64_str(op);
     dbg64_str("_on64: slot=");
     dbg64_dec((uint64_t)slot);
     dbg64_str(" not mounted");
     dbg64_nl();
+    dbg64_line_end64();
     return -1;
 }
 // ★ fs64 用：把"当前卷"临时切到 slot，但**不改调用方身份**（权限判定照常）。返回 0 / -1。
@@ -2678,11 +2714,13 @@ static int chmod64_common(const char* path, uint32_t mode) {
     if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
     wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
     if (!inode_store(idx, ino)) { log_op_fail("chmod64", "inode write failed"); return -1; }
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] chmod ok path=");
     dbg64_str(path);
     dbg64_str(" mode=");
     log_octal4(mode & VFS64_S_IRWX);
     dbg64_nl();
+    dbg64_line_end64();
     return 0;
 }
 int vfs64_chmod64(const char* path, uint32_t mode) { return chmod64_common(path, mode); }
@@ -2724,6 +2762,7 @@ static int chown64_common(const char* path, uint32_t uid, uint32_t gid) {
     if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
     wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
     if (!inode_store(idx, ino)) { log_op_fail("chown64", "inode write failed"); return -1; }
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] chown ok path=");
     dbg64_str(path);
     dbg64_str(" uid=");
@@ -2731,6 +2770,7 @@ static int chown64_common(const char* path, uint32_t uid, uint32_t gid) {
     dbg64_str(" gid=");
     dbg64_dec(ino_gid_of64(ino));
     dbg64_nl();
+    dbg64_line_end64();
     return 0;
 }
 int vfs64_chown64(const char* path, uint32_t uid, uint32_t gid) { return chown64_common(path, uid, gid); }
@@ -2987,6 +3027,7 @@ static void tree_walk(uint32_t dir, const char* prefix, int depth, TreeDumpCtx* 
             char ymd[12];
             char hms[10];
             vfs64_time_str64(page[i].mtime, ymd, (int)sizeof(ymd), hms, (int)sizeof(hms));
+            dbg64_line_begin64();               // ★ 行原子（tree 每一条跨很多次调用）
             dbg64_str("[VFS64] tree ");
             dbg64_str(full);
             dbg64_str(" type=");
@@ -3010,6 +3051,7 @@ static void tree_walk(uint32_t dir, const char* prefix, int depth, TreeDumpCtx* 
             dbg64_str(" mode=");
             log_octal4(page[i].mode & VFS64_S_IRWX);
             dbg64_nl();
+            dbg64_line_end64();
             ctx->printed++;
             if (page[i].type == VFS64_TYPE_DIR && depth < ctx->max_depth) {
                 tree_walk(page[i].index, full, depth + 1, ctx);
@@ -3034,6 +3076,7 @@ int vfs64_tree_dump64(const char* path, int max_entries, int max_depth) {
     ctx.max_depth = max_depth;
     ctx.printed = 0;
     ctx.over = false;
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] tree root=");
     dbg64_str(path);
     dbg64_str(" max_entries=");
@@ -3041,20 +3084,26 @@ int vfs64_tree_dump64(const char* path, int max_entries, int max_depth) {
     dbg64_str(" max_depth=");
     dbg64_dec((uint64_t)max_depth);
     dbg64_nl();
+    dbg64_line_end64();
     tree_walk(idx, path, 0, &ctx);
     if (ctx.over) {
+        dbg64_line_begin64();                   // ★ 行原子
         dbg64_str("[VFS64] tree truncated at budget=");
         dbg64_dec((uint64_t)max_entries);
         dbg64_nl();
+        dbg64_line_end64();
     }
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] tree entries=");
     dbg64_dec((uint64_t)ctx.printed);
     dbg64_nl();
+    dbg64_line_end64();
     return ctx.printed;
 }
 
 // ==================== 状态打印（验收 grep）====================
 void vfs64_dump64() {
+    dbg64_line_begin64();                       // ★ 行原子（dump 行很长，且中段有 return）
     dbg64_str("[VFS64] dump mounted=");
     dbg64_str(g_mounted ? "yes" : "no");
     dbg64_str(" slot=");
@@ -3063,7 +3112,7 @@ void vfs64_dump64() {
     dbg64_dec((uint64_t)g_system_slot);
     dbg64_str(" slots=");
     dbg64_dec((uint64_t)VFS64_SLOT_MAX);
-    if (!g_mounted) { dbg64_nl(); return; }
+    if (!g_mounted) { dbg64_nl(); dbg64_line_end64(); return; }
     uint32_t free_blocks = 0;
     count_free_blocks(&free_blocks);
     dbg64_str(" drive=");
@@ -3084,14 +3133,17 @@ void vfs64_dump64() {
     dbg64_dec(g_lay->inode_bytes);
     dbg64_str("B");
     dbg64_nl();
+    dbg64_line_end64();
 
     char names[8][VFS64_LS_NAME_BUF];
     uint32_t sizes[8];
     const int n = vfs64_ls("/", names, 8, sizes);
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] dump root entries=");
     if (n < 0) dbg64_str("ERR");
     else dbg64_dec((uint64_t)n);
     dbg64_nl();
+    dbg64_line_end64();
     for (int i = 0; i < n && i < 8; i++) {
         Vfs64Info64 in;
         char full[VFS64_NAME_MAX + 2];
@@ -3300,12 +3352,16 @@ int vfs64_selftest64() {
         (void)vfs64_unlink64("/perm/f.txt");
         (void)vfs64_rmdir64("/perm");
         if (ok) {
+            dbg64_line_begin64();               // ★ 行原子
             dbg64_str("[VFS64] perm selftest ok owner/mode/other/root/chmod/chown/umask=1");
             dbg64_nl();
+            dbg64_line_end64();
         } else {
+            dbg64_line_begin64();               // ★ 行原子
             dbg64_str("[VFS64] perm selftest FAIL step=");
             dbg64_dec((uint64_t)step);
             dbg64_nl();
+            dbg64_line_end64();
             fails |= 65536;
         }
     }

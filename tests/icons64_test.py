@@ -4,7 +4,7 @@
 
 覆盖（每条都要 串口打点 + 像素 证据；判据强度不削弱）：
   ① 首次加载：`[ICON64] init pack lba=.. bytes=.. entries=.. icons=.. bad=0 ok=1` +
-     **每一个** kind 都有一条 `[ICON64] load kind=<名字> path=pack:…@<尺寸>.png src=pack ok=1`，
+     **每一个** kind 都有一条 `[ICON64] load kind=<名字> path=pack:…@<尺寸>.png src=vfs ok=1`（A4-2a 起包在卷里），
      且"加载到的 kind 集合"与宿主侧 build/icons/manifest.json 的图标清单**完全相等**（不重不漏）；
      每条 load 的 path/尺寸 = 清单里"不小于请求的最小档"（只缩小，最清晰）；
      像素：开始菜单状态区 3 个图标（以太网/声音/通知）区域的墨迹形状与宿主侧预渲染 PNG
@@ -37,13 +37,16 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(ROOT, "tools"))   # build/iconpack.bin 的离线卷写入器（make_shellvol）
 
 import startmenu64_test as smt   # noqa: E402  （复用它的 Monitor/Cursor 鼠标模型：其他验收同款）
 
 QEMU_CANDIDATES = smt.QEMU_CANDIDATES
 PORT = 5677
-PACK_LBA = 7497          # 与 kernel/icons64.h 的 ICON64_PACK_LBA（= 9 + 8000 - 512）一致
-SECTOR = 512
+PACK_FILE = "/etc/iconpack.bin"   # ★ A4-2a 起：图标包 = 系统卷里的文件（不再是内核区尾部 LBA 7497）
+PACK_BIN = os.path.join(ROOT, "build", "iconpack.bin")
+SMALL_SECTORS = 32768             # 16 MB 夹具盘（与 fs_tree_test.make_small_system_disk 同几何）
+PART_MAIN_LBA = 8009
 SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 MANIFEST = os.path.join(ROOT, "build", "icons", "manifest.json")
 ICON_DIR = os.path.join(ROOT, "build", "icons")
@@ -151,33 +154,47 @@ def ink_color(px, w, x0, y0, n, thresh=60):
 
 
 # ==================== 夹具盘 ====================
+def fnv1a32(b):
+    """与 kernel/icons64.cpp 的 ic_fnv1a 同口径（32 位 FNV-1a），用来核对 init 打点里的 fnv=。"""
+    h = 2166136261
+    for x in b:
+        h = ((h ^ x) * 16777619) & 0xFFFFFFFF
+    return h
+
+
 def make_fixture(tmp, name, corrupt=None):
-    """夹具盘：16MB 系统盘（system.img 字节 + MBR + @8009 的 v3 卷）。
-    卷存在时开始按钮才会从 VimtuFS2 读 /logo/kaisi.png（"src=vfs:/logo/kaisi.png"这条验收靠它）。
-    图标包在 system.img 的内核区尾部（LBA 7497），因此**原样保留**在夹具盘上。
+    """夹具盘：16MB 系统盘（system.img 字节 + MBR + @8009 的 VimtuFS2 **v4** 卷）。
+    卷存在时开始按钮才会从 VimtuFS2 读 /logo/kaisi.png（\"src=vfs:/logo/kaisi.png\"这条验收靠它）。
+    ★ A4-2a 起图标包在**卷里**（/etc/iconpack.bin），不再是内核区尾部 LBA 7497 —— 夹具直接把
+      （可能已改坏的）包写进卷：ok 走 src=vfs 正常读回；坏法在卷内文件上做，离线可复现。
     corrupt: None | 'crc'（改坏 terminal 三个档 + mypc@48）| 'magic'（清零包 magic）"""
-    import fs_tree_test as fst
-    path = os.path.join(tmp, name)
-    if fst.make_small_system_disk(path) is None:
-        raise RuntimeError("造夹具盘失败（build64/system.img 缺失或过大）")
-    if not corrupt:
-        return path
-    with open(path, "r+b") as f:
-        if corrupt == "magic":
-            f.seek(PACK_LBA * SECTOR)
-            f.write(b"\x00" * 8)                     # magic 清零 -> 整包不可用
-            return path
+    import make_shellvol as msv
+    with open(SYSTEM_IMG, "rb") as f:
+        sys_bytes = f.read()
+    pack = bytearray(open(PACK_BIN, "rb").read())
+    if corrupt == "magic":
+        pack[0:8] = bytes(8)                          # magic 清零 -> 整包不可用
+    elif corrupt == "crc":
         man = json.load(open(MANIFEST, encoding="utf-8"))
         hit = [e for e in man["entries"]
                if e["name"] == "terminal" or (e["name"] == "mypc" and e["size"] == 48)]
         if len(hit) < 4:
             raise RuntimeError("清单里找不到要改坏的条目（terminal×3 + mypc@48）")
         for e in hit:
-            pos = PACK_LBA * SECTOR + e["off"] + e["len"] // 2
-            f.seek(pos)
-            b = f.read(1)
-            f.seek(pos)
-            f.write(bytes([b[0] ^ 0xFF]))            # 翻一个字节 -> CRC32 必失配
+            pack[e["off"] + e["len"] // 2] ^= 0xFF    # 翻一个字节 -> CRC32 必失配
+    pack = bytes(pack)
+    vol = msv.Volume(SMALL_SECTORS - PART_MAIN_LBA)
+    etc = vol.mkdir("etc", mode=0o755)
+    vol.mkdir("tmp", mode=0o777)
+    vol.write_file("iconpack.bin", pack, parent=etc, mode=0o644, kind=6)
+    vol_bytes = vol.finish()
+    bad = msv.verify(vol_bytes, {PACK_FILE: pack})    # 独立回读自检（含改坏后的字节）
+    if bad:
+        raise RuntimeError("夹具卷自检失败：%s" % bad)
+    img = msv.build_disk(sys_bytes, vol_bytes, SMALL_SECTORS)
+    path = os.path.join(tmp, name)
+    with open(path, "wb") as f:
+        f.write(img)
     return path
 
 
@@ -206,6 +223,7 @@ def main():
     for v in by_kind.values():
         v.sort(key=lambda x: x["size"])
     pack_bytes = man["pack_bytes"]
+    host_fnv = fnv1a32(open(PACK_BIN, "rb").read())   # 与内核 ic_fnv1a 同口径（核对 init 的 fnv=）
 
     tmp = tempfile.mkdtemp(prefix="vimtu64_icons64_")
     checks = []
@@ -235,19 +253,26 @@ def main():
         log = vm.log()
 
         print("=== 1) ① 图标包加载（打点 + 与宿主清单逐项核对）===")
-        init = re.search(r"\[ICON64\] init pack lba=(\d+) drive=(\d+) bytes=(\d+) entries=(\d+) "
-                         r"icons=(\d+) bad=(\d+) ok=(\d) fnv=([0-9a-f]{8}) vfs_icons=(\d)", log)
-        check("[ICON64] init pack 打点（lba/drive/bytes/entries/icons/bad/ok）", init is not None,
+        init = re.search(r"\[ICON64\] init pack lba=(\d+) drive=(-?\d+) bytes=(\d+) entries=(\d+) "
+                         r"icons=(\d+) bad=(\d+) ok=(\d) fnv=([0-9a-f]{8}) vfs_icons=(\d) "
+                         r"src=(\S+) path=(\S+)", log)
+        check("[ICON64] init pack 打点（lba/drive/bytes/entries/icons/bad/ok/fnv/src/path）", init is not None,
               init.group(0) if init else "（无）")
         if init:
-            check("包位置 = 内核区尾部 LBA %d（与 icons64.h 一致）" % PACK_LBA, int(init.group(1)) == PACK_LBA,
-                  "lba=%s" % init.group(1))
+            check("包来源 = 系统卷里的文件（src=vfs path=%s；lba=0/drive=-1 = 不来自内核区 LBA）" % PACK_FILE,
+                  init.group(10) == "vfs" and init.group(11) == PACK_FILE and
+                  int(init.group(1)) == 0 and int(init.group(2)) == -1,
+                  "lba=%s drive=%s src=%s path=%s" % (init.group(1), init.group(2), init.group(10), init.group(11)))
             check("包大小 = 宿主 build/iconpack.bin（%d B）" % pack_bytes, int(init.group(3)) == pack_bytes,
                   "内核读到 bytes=%s" % init.group(3))
+            check("包条目数 = 宿主清单 entries（%d）" % len(man["entries"]),
+                  int(init.group(4)) == len(man["entries"]), "entries=%s" % init.group(4))
             check("没有坏条目（bad=0 ok=1）", init.group(6) == "0" and init.group(7) == "1",
                   "bad=%s ok=%s" % (init.group(6), init.group(7)))
             check("kind 数 = 宿主清单图标数（%d）" % len(by_kind), int(init.group(5)) == len(by_kind),
                   "icons=%s" % init.group(5))
+            check("包 FNV-1a = 宿主对 build/iconpack.bin 同口径计算（%08x）" % host_fnv,
+                  init.group(8) == ("%08x" % host_fnv), "内核 fnv=%s" % init.group(8))
 
         loaded = {}
         for m in re.finditer(r"\[ICON64\] load kind=(\S+) path=(\S+) size=(\d+) src=(\S+) ok=(\d)", log):
@@ -256,8 +281,8 @@ def main():
               sorted(loaded) == sorted(by_kind),
               "内核 %d 个；缺 %s 多 %s" % (len(loaded), sorted(set(by_kind) - set(loaded)),
                                           sorted(set(loaded) - set(by_kind))))
-        check("所有 load 都是 ok=1 且 src=pack",
-              all(m.group(5) == "1" and m.group(4) == "pack" for v in loaded.values() for m in v),
+        check("所有 load 都是 ok=1 且 src=vfs（包从系统卷读回来的同一批字节）",
+              all(m.group(5) == "1" and m.group(4) == "vfs" for v in loaded.values() for m in v),
               str(sorted({(m.group(4), m.group(5)) for v in loaded.values() for m in v})))
         bad_path = []
         for name, v in loaded.items():
@@ -422,20 +447,20 @@ def main():
         up2 = vm2.wait_log("[GUI64] ready", 180)
         check("坏包盘仍能进桌面（[GUI64] ready）", up2)
         l2 = vm2.log()
-        init2 = re.search(r"\[ICON64\] init pack lba=\d+ drive=\d+ bytes=\d+ entries=\d+ icons=\d+ "
-                          r"bad=(\d+) ok=(\d)", l2)
-        check("改了 4 个条目 -> bad=4 ok=0（如实打点，不假装成功）",
-              init2 is not None and init2.group(1) == "4" and init2.group(2) == "0",
+        init2 = re.search(r"\[ICON64\] init pack lba=0 drive=-1 bytes=(\d+) entries=(\d+) icons=(\d+) "
+                          r"bad=(\d+) ok=(\d) fnv=([0-9a-f]{8}) vfs_icons=(\d) src=vfs path=/etc/iconpack\.bin", l2)
+        check("改坏的包仍从卷里读（src=vfs）+ 改了 4 个条目 -> bad=4 ok=0（如实打点，不假装成功）",
+              init2 is not None and init2.group(4) == "4" and init2.group(5) == "0",
               init2.group(0) if init2 else "（无）")
         fb = re.search(r"\[ICON64\] fallback kind=terminal reason=(\S+) \(programmatic draw kept\)", l2)
         check("terminal 三个档全坏 -> 回落并打点（[ICON64] fallback kind=terminal reason=…）",
               fb is not None, fb.group(0) if fb else "（无）")
         check("mypc 只坏大档 -> 自动降级用 32px 档（[ICON64] load kind=mypc path=pack:apps/mypc@32.png）",
-              re.search(r"\[ICON64\] load kind=mypc path=pack:apps/mypc@32\.png size=32 src=pack ok=1",
+              re.search(r"\[ICON64\] load kind=mypc path=pack:apps/mypc@32\.png size=32 src=vfs ok=1",
                         l2) is not None,
               (re.search(r"\[ICON64\] load kind=mypc[^\r\n]*", l2) or ["（无）"])[0])
-        check("其它图标照常从包里加载（[ICON64] load kind=volume … src=pack ok=1）",
-              re.search(r"\[ICON64\] load kind=volume path=\S+ size=\d+ src=pack ok=1", l2) is not None)
+        check("其它图标照常从包里加载（[ICON64] load kind=volume … src=vfs ok=1）",
+              re.search(r"\[ICON64\] load kind=volume path=\S+ size=\d+ src=vfs ok=1", l2) is not None)
         time.sleep(0.8)
         shot2 = os.path.join(tmp, "crc_desktop.ppm")
         try:

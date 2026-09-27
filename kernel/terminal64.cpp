@@ -279,10 +279,12 @@ static uint32_t utf8_next(const char* s, int* adv) {
 
 // ==================== 串口日志 ====================
 static void term_log_cmd(const char* name, bool ok) {
+    dbg64_line_begin64();                       // ★ 行原子：前缀 + 内容 + 换行 一次写完
     dbg64_str("[TERM] cmd ");
     dbg64_str((name && name[0]) ? name : "?");
     dbg64_str(ok ? " ok" : " fail");
     dbg64_nl();
+    dbg64_line_end64();
 }
 
 // ==================== 实例查找 / 清理 ====================
@@ -315,12 +317,14 @@ static void ts_prune() {
         if (!ts_slot_live(i)) {
             // 外壳自己销毁了窗口（没经过本文件的关窗路径）：只摘除引用，不释放内存
             // （无法判断外壳是否已 kfree(userdata)，宁可少释放也不能二次 kfree）
+            dbg64_line_begin64();               // ★ 行原子（两条行一起写完，防止别的日志插进中间）
             dbg64_str("[APP] term closed");
             dbg64_nl();
             dbg64_str("[TERM] closed inst=");
             dbg64_dec((uint64_t)g_inst_no[i]);
             dbg64_str(" by shell (state left to window layer)");
             dbg64_nl();
+            dbg64_line_end64();
             continue;
         }
         if (n != i) { g_inst[n] = g_inst[i]; g_win[n] = g_win[i]; g_inst_no[n] = g_inst_no[i]; }
@@ -463,6 +467,7 @@ static void ts_sync_layout(TerminalState* ts, Window* w) {
     ts_layout(w, &cols, &rows);
     ts_reflow(ts, cols, rows);
     if (cols != old_c || rows != old_r) {
+        dbg64_line_begin64();                   // ★ [UI] 高频行：整行原子
         dbg64_str("[UI] term layout client=");
         dbg64_dec((uint64_t)w->client_w);
         dbg64_str("x");
@@ -472,6 +477,7 @@ static void ts_sync_layout(TerminalState* ts, Window* w) {
         dbg64_str(" rows=");
         dbg64_dec((uint64_t)rows);
         dbg64_nl();
+        dbg64_line_end64();
     }
 }
 
@@ -916,11 +922,13 @@ static void ts_put_u64_right(TerminalState* ts, uint64_t v, int width) {
 
 // 打点：自动验收 grep 的行（严格照抄：末尾一行，ASCII）
 static void task_log_ps(int rows) {
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[TASK] ps rows=");
     dbg64_dec((uint64_t)rows);
     dbg64_str(" switches=");
     dbg64_dec(task_switch_total64());
     dbg64_nl();
+    dbg64_line_end64();
 }
 
 // ps / tasks / task / top：真实任务表一次快照（空槽跳过；没有任务数据就如实写"无任务数据"）
@@ -2162,14 +2170,26 @@ static bool cmd_df(TerminalState* ts) {
     // 注意打点顺序：**先**打旧行 "[TERM] cmd df blocks=..."（fs_term/fs_tree 的 wait_for 就等它），
     // 卷清单（df_print_volumes）放在后面/或无卷分支里 —— 顺序反了会让旧脚本在"等 df 行"时提前返回。
     Fs64Info fs;
-    const int rc = sysstate64_fsinfo64(&fs);
+    (void)sysstate64_fsinfo64(&fs);              // 只作兜底快照；blocks/free 下面用实时值覆盖
+    // ★ 口径修正（A4-2 收口）：blocks/free 改用**查询时刻**的实时位图计数（与 [DRV64] letter= 同源：
+    //   drive64_info64 -> fs64_vol_info64 -> vfs64 现数位图）。sysstate64 那份是启动期快照，
+    //   与后来的 df 之间的装入/写盘会让两个来源对不上（实测差 399 块 > 1% 容差）。
+    {
+        const int ci = drive64_by_letter64('C');
+        DriveInfo64 d;
+        if (ci >= 0 && drive64_info64(ci, &d) == 0 && d.total_known) {
+            fs.total_blocks = (uint32_t)(d.total_kb * 2u);
+            if (d.free_known) fs.free_blocks = (uint32_t)(d.free_kb * 2u);
+            fs.ok = 1;
+        }
+    }
     char names[FD64_MAX][FD64_NAME_MAX];
     uint32_t sizes[FD64_MAX];
     const int n = vfs64_ls("/", names, (int)FD64_MAX, sizes);
     uint64_t live_files = (n > 0) ? (uint64_t)n : 0;
     uint64_t live_bytes = 0;
     for (int i = 0; i < n; i++) live_bytes += sizes[i];
-    if (rc != 0 || !fs.ok) {
+    if (!fs.ok) {
         ts_puts(ts, "df: no VimtuFS2 volume (no partition table / mount failed)\n");
         df_print_volumes(ts);                   // ★ 多卷：系统卷快照读不到也要列出盘符/卷槽
         return true;
@@ -2198,8 +2218,9 @@ static bool cmd_df(TerminalState* ts) {
     ts_puts(ts, " bytes=");
     ts_put_u64(ts, live_bytes);
     ts_putc(ts, (uint32_t)'\n');
-    ts_puts(ts, "  (system volume: bitmap snapshot from the boot probe; file list/bytes are live; VimtuFS2 v3 tree)\n");
+    ts_puts(ts, "  (system volume: live bitmap count at df time = same source as [DRV64] letter=; files/bytes are live)\n");
 
+    drive64_log_letters64();                     // ★ 先重打实时 [DRV64] letter= 行：验收拿“同一时刻”两来源比对
     dbg64_line_begin64();
     dbg64_str("[TERM] cmd df blocks=");
     dbg64_dec((uint64_t)fs.total_blocks);
@@ -4565,14 +4586,54 @@ static bool sh64_owns64(TerminalState* ts) {
     return (g_sh_inst64 != 0 && ts && ts->used && ts->inst == g_sh_inst64 && g_sh_pid64 > 0);
 }
 
-// 内核 -> shell：in 环塞一个字节（环满就丢 —— in 环 512 B，按键注入远快不过 shell 的消费）
-static void sh64_in64(char c) {
+// 内核 -> shell：in 环 + 待发 FIFO（★ 环流控修正）。in 环只有 512 B，而一次 `LS` 请求的应答
+//   （16 条 "D/F ..." 行）可能 ~1KB —— 原来环满就**静默丢**，shell 会缺行/等超时。现在：
+//   字节先进 g_sh_pend64（2048 B，严格 FIFO），每个 tick + 每次入环时尽量搬到 in 环；
+//   in 环的**顺序**与入队顺序一致（先排空 FIFO 再搬新字节，绝不插队）。只有 FIFO 也满才丢，
+//   丢必打点（[SH64] in-ring overflow drop=N），绝不静默。
+static char     g_sh_pend64[2048];
+static uint32_t g_sh_pend_r64 = 0;      // FIFO 读索引
+static uint32_t g_sh_pend_w64 = 0;      // FIFO 写索引（空：r == w）
+static uint32_t g_sh_drop64 = 0;        // 有界丢弃计数（打点用）
+static bool     g_sh_drop_logged64 = false;
+
+static bool sh64_in_space64(const Sh64Mail* m) {
+    return ((m->in_w + 1u) % 512u) != m->in_r;
+}
+// 入队（FIFO 满 = 有界丢弃 + 打点）
+static void sh64_pend_push64(char c) {
+    const uint32_t w = g_sh_pend_w64;
+    if (((w + 1u) % (uint32_t)sizeof(g_sh_pend64)) == g_sh_pend_r64) {
+        g_sh_drop64++;
+        if (!g_sh_drop_logged64) {
+            g_sh_drop_logged64 = true;
+            dbg64_line_begin64();
+            dbg64_str("[SH64] in-ring overflow drop=");
+            dbg64_dec((uint64_t)g_sh_drop64);
+            dbg64_str(" (shell consumer behind; bytes dropped are counted, never silent)");
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        return;
+    }
+    g_sh_pend64[w] = c;
+    g_sh_pend_w64 = (w + 1u) % (uint32_t)sizeof(g_sh_pend64);
+}
+// 尽量把 FIFO 搬到 in 环（in 环满就停；剩下的下一 tick 继续）
+static void sh64_drain64(void) {
     Sh64Mail* m = g_sh_mail64;
     if (!m || m->magic != SH64_MAGIC64) return;
-    const uint32_t w = m->in_w;
-    if (((w + 1u) % 512u) == m->in_r) return;
-    m->inb[w] = (uint8_t)c;
-    m->in_w = (w + 1u) % 512u;
+    while (g_sh_pend_r64 != g_sh_pend_w64 && sh64_in_space64(m)) {
+        const uint32_t r = g_sh_pend_r64;
+        m->inb[m->in_w] = (uint8_t)g_sh_pend64[r];
+        m->in_w = (m->in_w + 1u) % 512u;
+        g_sh_pend_r64 = (r + 1u) % (uint32_t)sizeof(g_sh_pend64);
+    }
+}
+// 内核 -> shell：一个字节（按键 / 应答共用同一条有序通道）
+static void sh64_in64(char c) {
+    sh64_pend_push64(c);
+    sh64_drain64();
 }
 
 // 内核 -> shell：一整条服务应答行（0x02 + 内容 + '\n'）
@@ -4639,6 +4700,17 @@ static void sh64_stop64(TerminalState* ts, int code) {
     g_sh_col64 = 0;
     g_sh_req_n64 = 0;
     g_sh_line64 = 1;
+    if (g_sh_drop64 > 0) {                       // ★ 环流控：有丢弃就必须留证（不为 0 才算异常）
+        dbg64_line_begin64();
+        dbg64_str("[SH64] in-ring dropped total=");
+        dbg64_dec((uint64_t)g_sh_drop64);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    g_sh_pend_r64 = 0;
+    g_sh_pend_w64 = 0;
+    g_sh_drop64 = 0;
+    g_sh_drop_logged64 = false;
 }
 
 // term_tick 调：抽干 shell 的输出 -> 本窗口 + 串口；处理请求行；看它是否已退出
@@ -4649,9 +4721,12 @@ static void sh64_poll64(TerminalState* ts) {
     Sh64Mail* m = g_sh_mail64;
     char out[512];
     int n = 0;
+    sh64_drain64();                                          // ★ 每 tick 先把背压 FIFO 里的字节搬进 in 环
     if (m->magic == SH64_MAGIC64) {
         int guard = 0;
         while (m->out_r != m->out_w && guard++ < 4096) {
+            if (n >= (int)sizeof(out)) break;                // ★ 本 tick 预算满：字节留在 out 环，下一 tick 继续；
+                                                             //   绝不\"先消费再丢\"（旧实现就是这里 continue -> 丢字节）
             const char c = (char)m->outb[m->out_r];
             m->out_r = (m->out_r + 1u) % 2048u;
             if (g_sh_col64) {
@@ -4666,7 +4741,6 @@ static void sh64_poll64(TerminalState* ts) {
                 continue;
             }
             if (c == SH64_REQ64 && g_sh_line64) { g_sh_col64 = 1; g_sh_req_n64 = 0; continue; }
-            if (n >= (int)sizeof(out)) continue;                 // 本 tick 预算满：剩下的下一 tick
             out[n++] = c;
             g_sh_line64 = (c == '\n');
         }
@@ -4758,6 +4832,7 @@ static bool term_release_state(Window* w) {
     if (g_sh_inst64 != 0 && g_sh_inst64 == inst && g_sh_pid64 > 0) sh64_stop64(ts, -1);   // 关窗 = 结束 shell
     w->userdata = nullptr;      // 先断引用：外壳若按 app_id kfree(userdata)，看到空指针就跳过
     ts_detach(ts);              // 摘除注册表 + 入待释放队列
+    dbg64_line_begin64();                       // ★ 行原子（两条行一起写完）
     dbg64_str("[APP] term closed");
     dbg64_nl();
     dbg64_str("[TERM] closed inst=");
@@ -4765,6 +4840,7 @@ static bool term_release_state(Window* w) {
     dbg64_str(" remaining=");
     dbg64_dec((uint64_t)g_count);
     dbg64_nl();
+    dbg64_line_end64();
     ts_reap_pending(true);      // 已无人引用 -> 立即回收（宿主自测里断言"关窗后无泄漏"）
     return true;
 }
@@ -4930,6 +5006,7 @@ void app_term_open64() {
     gui64_invalidate_window(win);
 
     // 自动验收断言行：开窗的实例内实际排版
+    dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[APP] term opened cols=");
     dbg64_dec((uint64_t)ts->cols);
     dbg64_str(" rows=");
@@ -4944,6 +5021,7 @@ void app_term_open64() {
     dbg64_str(" windows=");
     dbg64_dec((uint64_t)(live + 1));
     dbg64_nl();
+    dbg64_line_end64();
 }
 
 // 会话重置：清空所有实例的屏幕与命令行（"软件内容不保存"），照 32 位 terminal_reset
@@ -4962,9 +5040,11 @@ void app_term_reset64() {
         gui64_invalidate_window(ts->win);
         n++;
     }
+    dbg64_line_begin64();                       // ★ 行原子（两条行一起写完）
     dbg64_str("[APP] term reset");
     dbg64_nl();
     dbg64_str("[TERM] reset insts=");
     dbg64_dec((uint64_t)n);
     dbg64_nl();
+    dbg64_line_end64();
 }

@@ -1626,15 +1626,17 @@ def cap_realfix64():
 
 
 def cap_iconpack64():
-    """★ 批次 P6：外置图标包（真图标）—— 图标字节不进内核，pack 在 system.img 内核区尾部。"""
+    """★ 批次 P6：外置图标包（真图标）—— 图标字节不进内核；A4-2a 起 pack 在**系统卷** /etc/iconpack.bin。"""
     need = ["kernel/icons64.cpp", "kernel/icons64.h", "tools/make_iconpack.py", "build/icons/manifest.json",
             "tests/icons64_test.py"]
     miss = [x for x in need if not exists(x)]
     if miss:
         return "MISSING", ["缺文件：%s" % ", ".join(miss)]
     n = lines("kernel/icons64.cpp")
-    # 包 LBA 是编译期表达式：ICON64_PACK_LBA = (ML64_KERNEL_LBA + ML64_KERNEL_SECTORS) - ICON64_PACK_MAX_SECTORS
-    #   = (9 + 8000) - 512 = 7497（kernel/icons64.cpp:21 / kernel/memlayout64.h:36-37）
+    # 包位置（★ A4-2a 起为实况）：pack 已搬进 VimtuFS2 系统卷 -> /etc/iconpack.bin；构建期把
+    #   build/iconpack.bin 内嵌进**系统内核**，启动期 icons64_init64() 幂等写进卷再读回（src=vfs）。
+    #   老 LBA 路径仍保留 ICON64_PACK_LBA = (ML64_KERNEL_LBA + ML64_KERNEL_SECTORS) - ICON64_PACK_MAX_SECTORS
+    #   = (9 + 8000) - 512 = 7497，只作末位兜底（build64.sh 已不再往那里写）。
     ml = open("kernel/memlayout64.h", encoding="utf-8", errors="replace").read()
     k_lba = re.search(r"ML64_KERNEL_LBA\s*=\s*(\d+)", ml)
     k_sec = re.search(r"ML64_KERNEL_SECTORS\s*=\s*(\d+)", ml)
@@ -1651,16 +1653,17 @@ def cap_iconpack64():
     ev = [
         "kernel/icons64.cpp %d 行（统一图标层：读 pack -> img64 解码 -> 缓存 -> 按主题 palette 着色；"
         "取不到回落既有程序化绘制）；图标层符号命中 %d" % (n, drw),
-        "包位置/大小（打包器与内核常量一致）：ICON64_PACK_LBA = %s（= 9 + 8000 - 512，内核区尾部、"
-        "内核二进制之后、数据分区 8009 之前）；build/iconpack.bin = %d B；清单 entries=%d kind=%d"
+        "包位置/大小（★ A4-2a 实况）：pack = 系统卷文件 /etc/iconpack.bin（启动期由内核内嵌字节幂等"
+        "装入，读回打点 src=vfs path=/etc/iconpack.bin）；老 LBA 兜底常量 ICON64_PACK_LBA = %s"
+        "（= 9 + 8000 - 512，构建脚本已不再写入）；build/iconpack.bin = %d B；清单 entries=%d kind=%d"
         % (lba_v if lba_v else "?", size, entries, kinds),
-        "实测串口（开机首帧）：\"[ICON64] init pack lba=7497 drive=0 bytes=49192 entries=110 icons=30 "
-        "bad=0 ok=1 fnv=… vfs_icons=0\"",
-        "实测串口（逐 kind 加载，全部 src=pack）：\"[ICON64] load kind=calc path=pack:apps/calc@48.png "
-        "size=48 src=pack ok=1\"（30 个 kind 各一条；只缩小到\"不小于请求的最小档\"）",
+        "实测串口（开机首帧）：\"[ICON64] init pack lba=0 drive=-1 bytes=49192 entries=110 icons=30 "
+        "bad=0 ok=1 fnv=… vfs_icons=0 src=vfs path=/etc/iconpack.bin\"",
+        "实测串口（逐 kind 加载，全部 src=vfs）：\"[ICON64] load kind=calc path=pack:apps/calc@48.png "
+        "size=48 src=vfs ok=1\"（30 个 kind 各一条；只缩小到\"不小于请求的最小档\"）",
         "实测串口（自检/回落）：\"[ICON64] selftest PASS mask=0 pack=1 kinds=30 loaded=30 fallback=0\"；"
         "坏档回落 \"[ICON64] fallback kind=terminal reason=no-entry (programmatic draw kept)\"、"
-        "整包不可用 \"[ICON64] init pack absent reason=no-magic-or-read lba=7497 …\" + "
+        "卷里的包 magic 清零 -> \"[ICON64] init pack absent reason=no-magic-or-read lba=7497 …\" + "
         "\"[ICON64] fallback kind=… reason=no-pack\"（界面不空：Dock/状态区仍有墨迹）",
         "Dock 开始按钮仍是盘上真图：\"[DOCK64] start icon src=vfs:/logo/kaisi.png size=46 ok=1\""
         "（缺卷/缺文件时回落内核内嵌 RGBA，实测夹具盘两处 kaisi.png 逐字节相同）",
@@ -1668,8 +1671,9 @@ def cap_iconpack64():
         "主题跟随亮度差 >=60/两种坏法回落/开始按钮 IoU + VimtuFS2 真文件；本轮复跑 50/50 PASS）"
         % ("有" if tst else "★ 缺"),
         "边界（如实）：图标字体（icon font）未用上；电池图标在清单里但**无真实来源/不参与渲染**；"
-        "files.svg 未上屏（只有 @PNG 档进了包）；图标包放在 system.img 的**内核区尾部**（LBA 7497..7593），"
-        "**不是** VimtuFS2 卷里的文件（VFS 覆盖通道未测）；仍有程序化绘制图标兜底（fallback 路径）",
+        "files.svg 未上屏（只有 @PNG 档进了包）；pack 现为系统卷里的文件 /etc/iconpack.bin"
+        "（老 LBA 7497 路径只作末位兜底、构建期不再写）；/icons/<sub>/*.png 逐文件覆盖通道仍未测；"
+        "仍有程序化绘制图标兜底（fallback 路径）",
     ]
     # 包大小/条目必须为非零（makepack 与 build64.sh 都按这个数写盘/断言）：
     done = n > 0 and entries >= 100 and kinds >= 25 and size > 0 and bool(lba_v) and tst
@@ -1735,8 +1739,8 @@ CAPS = [
     ("应用", "★ P6 真机缺陷修复（Win 键只开新菜单 / 扫雷·关机蓝屏根因：Dock 开始按钮 scratch 越界 3.6KB 踩 BSS / "
              "设置页移动鼠标 / 登录须显式输入（ui.login.auto 默认 0，实测停留 >=10s）/ 壁纸四角标记默认不可见）",
      cap_realfix64),
-    ("应用", "★ P6 外置图标包（真图标；pack 在 system.img 内核区尾部 LBA 7497：110 条目/30 kind/49192 B，"
-             "图标字节 0 进内核；src=pack 逐 kind 加载 + 主题着色 + 回落程序化绘制）", cap_iconpack64),
+    ("应用", "★ P6/A4-2a 外置图标包（真图标；pack = 系统卷 /etc/iconpack.bin：110 条目/30 kind/49192 B，"
+             "图标字节 0 进内核；src=vfs 逐 kind 加载 + 主题着色 + 回落程序化绘制）", cap_iconpack64),
 ]
 
 
@@ -1800,10 +1804,11 @@ TESTS = [
     ("perm64_test.py", "★ P4 权限：卷 v4(uid/gid/mode)+owner/group/other rwx 真拦截(root 绕过)+su/sudo 真提权+chmod/chown/umask+ls -l（95 条断言，含 v3 旧卷兼容）"),
     ("settings64_test.py", "★ P3 设置页：左导航 240px + 六组 + 主题/壁纸适应模式(桌面/锁屏分别)/Dock 长度与图标尺寸实时生效/字体大小/默认应用/头像/改名/密码设置与清空/关于页；含软重启后的持久化与\"设密码→重启必须输密码\"（105 条断言）"),
     ("desktopops64_test.py", "★ P5 桌面交互：右键菜单(8 项/置灰/ESC 与点外部)/玻璃选择框(框内 diff=0)/拖入回收站/指针形状(6 向+文本+转圈)/窗口缩放/最小化飞 Dock 与 Dock 点击语义/圆角桌面图标/恢复默认桌面图标/只显示可见分区 + 应用窗口内容防回归 + 壁纸重绘（blur_ticks 3094→141~158，逐像素等价）（65-66 条断言，实跑 66 条中 13 条因 QEMU PS/2 注入零命中为 [skip]）"),
-    ("icons64_test.py", "★ P6 外置图标包（真图标）：init pack lba=7497 bytes=49192 entries=110 icons=30 ok=1 + "
-                        "逐 kind [ICON64] load src=pack ok=1 与宿主清单完全相等 + 状态区 3 图标形状 IoU>=0.55 + "
+    ("icons64_test.py", "★ P6/A4-2a 外置图标包（真图标）：init pack lba=0 drive=-1 bytes=49192 entries=110 "
+                        "icons=30 ok=1 fnv=宿主同口径 src=vfs path=/etc/iconpack.bin + "
+                        "逐 kind [ICON64] load src=vfs ok=1 与宿主清单完全相等 + 状态区 3 图标形状 IoU>=0.55 + "
                         "主题跟随（亮度差 >=60）+ 两种坏法回落（no-entry / no-pack，界面不空）+ "
-                        "Dock 开始按钮 VimtuFS2 真图 kaisi.png（50 条断言，本轮复跑 50/50 PASS）"),
+                        "Dock 开始按钮 VimtuFS2 真图 kaisi.png"),
 ]
 
 

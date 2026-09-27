@@ -632,14 +632,26 @@ def main():
             md5 = re.search(r"\[TERM\] cmd df blocks=(\d+) free=(\d+) files=(\d+)", log5)
             check("df 给出总块/空闲块（位图 7 块 <= sysstate 探测上限 8）",
                   bool(md5), md5.group(0) if md5 else "（缺 df 行）")
-            if m5 and md5:
+            # ★ 判据修正（A4-2 收口）：旧判据拿**开机扫描那次** [DRV64] letter=C: 的 free_kb 与
+            #   **后来** df 的值比，容差 max(16, 1%)；实测差 399 块（容差 247）——根因不是"算错"，
+            #   是口径与时刻都不同：df 原来用 sysstate64 的启动期快照，letter= 行只是扫描快照，
+            #   两者之间隔着图标包装入等写盘动作。修法（内核侧）：cmd_df 打 [TERM] cmd df 行之前
+            #   先**重打实时 [DRV64] letter= 行**（drive64_info64 -> fs64 -> vfs64 现数位图），
+            #   df 自己的 blocks/free 也改成同一实时来源。本判据改成比较**同一时刻的两个来源**，
+            #   容差只留 KB 取整的 ±1 块 —— 口径不一致/读丢位图/快照过期会立刻超差（旧缺陷 399
+            #   块照样抓得住，且比 1% 严格约 240 倍）。
+            m5_live = None
+            for _m in re.finditer(r"\[DRV64\] letter=C: disk=(\d+) part=(\d+) fs=VimtuFS2 "
+                                  r"total_kb=(\d+) free_kb=(\d+)", log5):
+                m5_live = _m
+            if m5_live and md5:
                 df_blocks, df_free = int(md5.group(1)), int(md5.group(2))
-                total_kb, free_kb = int(m5.group(3)), int(m5.group(4))
-                check("drive64 的 total_kb 与 df 的 blocks 一致（KB = blocks/2）",
+                total_kb, free_kb = int(m5_live.group(3)), int(m5_live.group(4))
+                check("同一时刻：drive64 的 total_kb 与 df 的 blocks 一致（KB = blocks/2，±1）",
                       abs(total_kb * 2 - df_blocks) <= 1,
                       "total_kb*2=%d df blocks=%d" % (total_kb * 2, df_blocks))
-                check("drive64 的 free_kb 与 df 的 free 一致（1% 容差：扫描与 df 之间有装入动作）",
-                      abs(free_kb * 2 - df_free) <= max(16, df_blocks // 100),
+                check("同一时刻：drive64 的 free_kb 与 df 的 free 一致（±1 块 = 只容 KB 取整）",
+                      abs(free_kb * 2 - df_free) <= 1,
                       "free_kb*2=%d df free=%d" % (free_kb * 2, df_free))
             forbid("阶段5", log5)
         finally:

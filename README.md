@@ -214,8 +214,8 @@ bash build64.sh
 |---|---|---|
 | `vimtu64-64.iso` | 56.2 MB | **三合一安装盘**：BIOS 光盘 + 可写 U 盘 + UEFI |
 | `vimtu64-64.img` | 7.9 MB | 安装介质裸盘（把一个 7.9MB 镜像直接当硬盘用；实际 8,328,192 B） |
-| `build64/kernel64.bin` | 2.09 MB | 安装程序内核（**2,198,608 B**；含 ATA/AHCI/**NVMe** 驱动、分区/安装引擎、FAT32 ESP 写入器） |
-| `build64/kernel64_os.bin` | 3.34 MB | 装进硬盘的系统内核（**3,596,368 B**；调度器/VFS（**v4 权限**）/store/ring3/网络/USB（含 **USB 存储/U 盘只读**）/AHCI/**NVMe**/文件管理器 + **文件操作** + **开始菜单 / 四弹窗 / toast** + **P3 设置页（左导航 + 六组）** 都在这里；硬上限 4,096,000 B） |
+| `build64/kernel64.bin` | 2.13 MB | 安装程序内核（**2,232,720 B**；含 ATA/AHCI/**NVMe** 驱动、分区/安装引擎、FAT32 ESP 写入器） |
+| `build64/kernel64_os.bin` | 3.73 MB | 装进硬盘的系统内核（**3,908,752 B**；调度器/VFS（**v4 权限**）/store/ring3/网络/USB（含 **USB 存储/U 盘只读**）/AHCI/**NVMe**/文件管理器 + **文件操作** + **开始菜单 / 四弹窗 / toast** + **P3 设置页（左导航 + 六组）** 都在这里；★ 内核区 LBA 9..8008 = **4,096,000 B 全部可用**，余量 **187,248 B**） |
 | `build64/BOOTX64.EFI` / `UEFI64.BIN` | 2.5 KB / 36 KB | UEFI 两段式引导 |
 | `build64/esp.img` | 48 MB | 手写 FAT32 ESP（96736 簇，>= 65525） |
 
@@ -356,7 +356,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | M20 | **VimtuFS2 v4 权限（批次 P4）**：inode 128B 加 `uid@75 / gid@77 / mode@79` + **owner/group/other 三段 rwx 真拦截**（`-EACCES`(13) + `[PERM64] deny` 打点）+ 进程 uid/gid/euid/egid（fork/execve 继承）+ `geteuid/setuid/chmod/chown/umask/access/stat` 返回真值 + `su`/`sudo` 真提权（`[PERM64] cred`）；**v3/v2 旧卷可挂载可读写但不拦截** | ✅ |
 | M21 | **Windows 11 风格设置应用（批次 P3）**：`settings64` 重写为**左导航 240px + 卡片内容 + 六组**（系统：显示/声音/电源；个性化：主题 7 套/壁纸/颜色渐变/**壁纸适应模式（桌面与锁屏分别设置）**/Dock 长度·图标尺寸·间距/字体大小；网络：以太网真状态 + WiFi 无硬件；用户：头像（内置 3 + 本地 PNG）/改名；安全：密码设置与清空；关于：版本/驱动/GPU + 硬件检查），**全部实时生效并持久化**（改主题重启仍暗色 / 设密码重启必须输密码 / 清空密码直接进桌面）；顺带修掉**关于页版本号写死 `VimtuOS 0.1.0`**（改为 `build64.sh` 的编译期宏 `VIMTUOS_VERSION_STR`，发布只改一处） | ✅ |
 | M22 | **桌面交互（批次 P5）**：`desktopops64`（右键菜单 8 项/置灰/ESC 与点外部关闭、玻璃选择框 + 拖动、拖入回收站、指针形状、窗口缩放、最小化飞 Dock、圆角桌面图标、恢复默认图标）+ `input.cpp`（指针形状 6 向/文本 I/转圈）+ `gui64`（飞 Dock 225ms `scale+fade`、minbar 点击语义、`check_app_painted64` 防回归）+ `gfx64`（整屏模糊改**行序滑窗**：`blur_ticks 3094 → 141~158`、`total_ticks 3226 → 265~291`，逐像素等价）+ `explorer`（只显示可见分区）；顺带修掉**两个用户可见真 bug**：**应用窗口内容丢失**（`render()` 丢 `g_frames++/g_dirty_any=false` + `set_draw()` 把绘制关进"尺寸变化"的 `if`）、**改壁纸适应模式后桌面不重绘**（真因是整屏壁纸重建 ~6.3s） | ✅ |
-| M23 | **外置图标包（真图标，批次 P6）**：`kernel/icons64.{h,cpp}`（新建，统一图标层：从 system.img 内核区尾部固定区间 LBA 7497 读**外置图标包**（110 条目 / 30 kind / 49,192 B）→ `img64` 解码 → 缓存 → 按主题 palette 着色；取不到回落既有程序化绘制）+ `tools/make_iconpack.py`（SVG/PNG → 多档 PNG + 清单 `build/icons/manifest.json`）；**图标字节不进内核**（内核只带读取/缓存/着色代码，pack 由 `build64.sh` `dd` 到内核区尾部）；Dock/桌面/开始菜单状态区/四弹窗全部换真图标 | ✅ |
+| M23 | **外置图标包（真图标，批次 P6；A4-2a 起改为系统卷文件）**：`kernel/icons64.{h,cpp}`（统一图标层：★ A4-2a 起从**系统卷的 `/etc/iconpack.bin`** 读**外置图标包**（110 条目 / 30 kind / 49,192 B）→ `img64` 解码 → 缓存 → 按主题 palette 着色；取不到回落既有程序化绘制）+ `tools/make_iconpack.py`（SVG/PNG → 多档 PNG + 清单 `build/icons/manifest.json`）；**图标字节不进内核镜像文件系统**（`build64.sh` 把 pack objcopy **内嵌进系统内核**，启动期 `icons64_init64()` 幂等写进卷再从卷读回；老 LBA 7497 裸包路径只作末位兜底）；Dock/桌面/开始菜单状态区/四弹窗全部换真图标 | ✅ |
 | M24 | **真机缺陷修复（六项，批次 P6）**：① Win 键只开**新**开始菜单（老菜单整套删除；数字快捷键 1..8 兼容保留、9/0 不再绑电源）② 点扫雷/开始菜单"关机·重启" -> `#GP err=0` 蓝屏（根因：`dock_draw_one64()` 开始按钮 scratch 按 46×46 开、悬停 120% 时写 55×55 -> **越界 3.6KB 踩坏 BSS**）③ 设置页移动鼠标整屏空白（P5 竞态已修 + 本批防回归断言）④ 登录必须**显式输入**（`ui.login.auto` 默认 1→0，实测停留 ≥10s）⑤ 壁纸四角红绿蓝黄标记默认**不可见**（`ui.wall.markers` 默认 0，Ctrl+Shift+M 切换）⑥ 主题热键与按用户偏好同步；回归：gui_modern64 159/159 连跑 2 次、icons64 50/50、panels64 78/78、settings64 108/108、startmenu64 63/63、ui_extra64 51/51 全绿 | ✅ |
 
 ### 批次 P6（本批）：真机缺陷修复（含蓝屏根因）+ 外置图标包（真图标）
@@ -385,14 +385,17 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
   `[LOGIN64] login screen shown why=key` → `[LOGIN64] login button key=enter` → `[GUI64] ready`）。
 * 壁纸四角红/绿/蓝/黄标记默认**不可见**：`ui.wall.markers` 默认 `0`（Ctrl+Shift+M 运行时切换）；
   实测首帧 `[GFX64] wall markers … size=16 markers_drawn=0`，打开后 `markers_drawn=4`。
-* 外置图标包（真图标）：`kernel/icons64.cpp` 统一图标层 + `tools/make_iconpack.py`；包在 `system.img` **内核区尾部 LBA 7497**
-  （110 条目 / 30 kind / **49,192 B**，**图标字节 0 进内核**）；实测 `[ICON64] init pack lba=7497 bytes=49192 entries=110 icons=30 bad=0 ok=1`、
-  逐 kind `[ICON64] load kind=… path=pack:… src=pack ok=1`、`[ICON64] selftest PASS mask=0 pack=1 kinds=30 loaded=30 fallback=0`、
-  Dock 开始按钮仍是盘上真图 `[DOCK64] start icon src=vfs:/logo/kaisi.png size=46 ok=1`。
+* 外置图标包（真图标）：`kernel/icons64.cpp` 统一图标层 + `tools/make_iconpack.py`；★ **A4-2a 起包搬进系统卷**：
+  构建期 objcopy 内嵌进系统内核、启动期幂等写进 `/etc/iconpack.bin` 再读回（110 条目 / 30 kind / **49,192 B**，
+  **图标字节 0 进内核可浏览卷**）；实测 `[ICON64] init pack lba=0 drive=-1 bytes=49192 entries=110 icons=30 bad=0 ok=1
+  fnv=… vfs_icons=0 src=vfs path=/etc/iconpack.bin`、逐 kind `[ICON64] load kind=… path=pack:… src=vfs ok=1`、
+  `[ICON64] selftest PASS mask=0 pack=1 kinds=30 loaded=30 fallback=0`、Dock 开始按钮仍是盘上真图
+  `[DOCK64] start icon src=vfs:/logo/kaisi.png size=46 ok=1`。内核区因此**全部交还内核**：
+  LBA 9..8008 = 8,000 扇区 = **4,096,000 B 全部可用**（改动前图标包占 LBA 7497..8008，只能用 7,488 扇区）。
 
 **本批实读**（2026-09-26）：能力项 **完成 53 / 部分 0 / 未做 0**；`--full` 的 `TESTS` **46** 个脚本；
-安装程序内核 **2,200,272 B**、系统内核 **3,718,976 B**（上限 4,096,000 B，余量 **377,024 B**）、
-`loader64.bin` **4,010 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**；
+安装程序内核 **2,232,720 B**、系统内核 **3,908,752 B**（内核区上限 **4,096,000 B**，余量 **187,248 B** —— ★ A4-2a 起图标包搬进系统卷，内核区不再预留 LBA 7497..8008）、
+`loader64.bin` **4,010 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**（2026-09-27 A4-2 收口实读）；
 **镜像内嵌版本串已一致**：`[SET64] about version=VimtuOS 0.3.4-beta16 x86_64 build_tag=… bits=64`（唯一真源 `build64.sh` 的 `VIMTUOS_VERSION`；v0.3.3-beta15 就是漏改了它）。
 
 ## 八、路线图（未完成的部分）
