@@ -493,7 +493,15 @@ int user64_exit_to_kernel64(pt_regs64* r, uint64_t code) {
 // ==================== 进 ring3 跑一个 blob ====================
 // 失败路径（页池耗尽等）只打印并返回 -1：此时最多泄漏已分配的几个 4KB 页（本函数
 // 只跑启动期一次演示），不值得为它把回收逻辑写得更容易出错。
-int user64_run_blob64(const void* blob, uint32_t size, const char* name) {
+//
+// ★ A2：`writable` 决定**代码页的叶子权限**：
+//   writable = 0（A1 的汇编 blob）：只读 + 可执行 —— 老行为一字不改；
+//   writable = 1（**用 C 写**的程序，见 user/apps/*.c）：可读可写可执行 —— C 程序有 .data/.bss
+//     （errno / printf 的行缓冲 / malloc 竞技场），只读页一写就 #PF。C 程序的 .data/.bss 就落在
+//     同一个 blob 里（链接脚本 user/lib/user64.ld 用 .image_end 哨兵保证 .bss 也进 blob 长度），
+//     所以"让代码页可写"是唯一需要的改动；栈页本来就可写（见下面）。
+//   两个包装（user64_run_blob64 / user64_run_capp64）对外行为一致，只有这一处权限不同。
+static int u64_run_blob_ex64(const void* blob, uint32_t size, const char* name, int writable) {
     static bool busy = false;
     if (busy) {
         dbg64_line_begin64(); dbg64_str("[USER64] run FAILED (busy)\n"); dbg64_line_end64();
@@ -518,7 +526,8 @@ int user64_run_blob64(const void* blob, uint32_t size, const char* name) {
     uint32_t phys_n = 0;
     const uint8_t* src = (const uint8_t*)blob;
 
-    // ---- 代码页：拷 blob -> 映射 用户可读可执行（不可写，无 NX）----
+    // ---- 代码页：拷 blob -> 映射 用户可读可执行（writable=1 时同时可写，见函数头说明）----
+    const uint64_t code_leaf = writable ? (PTE_USER_64 | PTE_WRITE_64) : PTE_USER_64;
     for (uint32_t i = 0; i < code_pages; i++) {
         void* p = page_alloc_64();
         if (!p) {
@@ -531,7 +540,7 @@ int user64_run_blob64(const void* blob, uint32_t size, const char* name) {
         if (n > PAGE_SIZE_64) n = PAGE_SIZE_64;
         for (uint32_t k = 0; k < PAGE_SIZE_64; k++) dst[k] = (k < n) ? src[off + k] : 0;
         phys_pages[phys_n++] = (uint64_t)(uintptr_t)p;
-        if (!u64_map64(USER64_CODE_VA64 + i * PAGE_SIZE_64, (uint64_t)(uintptr_t)p, PTE_USER_64)) {
+        if (!u64_map64(USER64_CODE_VA64 + i * PAGE_SIZE_64, (uint64_t)(uintptr_t)p, code_leaf)) {
             dbg64_line_begin64(); dbg64_str("[USER64] run FAILED (map code)\n"); dbg64_line_end64();
             busy = false; return -1;
         }
@@ -560,6 +569,16 @@ int user64_run_blob64(const void* blob, uint32_t size, const char* name) {
     u64_set_kernel_stack64();
 
     const uint64_t user_rsp = USER64_STACK_VA64 + USER64_STACK_BYTES64 - 16;   // 16 字节对齐的栈顶
+    // ★ A2：C 程序那条路额外打一行（**不改**上面那行既有格式：既有测试按前缀 grep 它）
+    if (writable) {
+        dbg64_line_begin64();
+        dbg64_str("[USER64] capp map writable=1 size=");
+        dbg64_dec((uint64_t)size);
+        dbg64_str(" name=");
+        dbg64_str(name ? name : "?");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
     dbg64_line_begin64();
     dbg64_str("[USER64] map code=");
     dbg64_hex64(USER64_CODE_VA64);
@@ -615,24 +634,43 @@ int user64_run_blob64(const void* blob, uint32_t size, const char* name) {
     return 0;
 }
 
+// ---- blob 加载器的两个公开入口（差别只有**代码页的可写性**，见 u64_run_blob_ex64 的函数头）----
+// user64_run_blob64：A1/既有的**平铺汇编 blob**（纯代码 + 只读数据，用栈做临时区）——只读代码页。
+int user64_run_blob64(const void* blob, uint32_t size, const char* name) {
+    return u64_run_blob_ex64(blob, size, name, 0);
+}
+// ★ A2：user64_run_capp64：**用 C 写**的用户程序 blob（user/apps/*.c 编出来的）——代码页可写，
+//   因为它的 .data/.bss（errno / printf 行缓冲 / malloc 竞技场 / 画图循环的局部静态量）就在里面。
+//   除权限外与 user64_run_blob64 完全同一条路（同样的栈、同样的 iretq 帧、同样的回收）。
+int user64_run_capp64(const void* blob, uint32_t size, const char* name) {
+    return u64_run_blob_ex64(blob, size, name, 1);
+}
 
-// ==================== A1：用户态绘图演示（内核侧绘制关掉，屏幕交给用户程序）====================
+// ==================== A1/A2：用户态绘图演示（内核侧绘制关掉，屏幕交给用户程序）====================
 // 位置：os_boot_path 里紧跟 demo64（kernel/kernel64.cpp）——"用户窗口可用"时才跑。
-// 做什么：把内核侧绘制/提交整个关掉（fb_kernel_paint64(0)）-> 跑 user/fbdemo.asm 的 blob
+// 做什么：把内核侧绘制/提交整个关掉（fb_kernel_paint64(0)）-> 跑 fbdemo 的 blob
 //   （它在 ring3 用 fb_map(9) 拿后备缓冲、自己画、fb_flip(10) 局部提交）-> 恢复开关。
-// 为什么关内核绘制：A1 的验收要证明"屏幕上这一块确实是用户程序在画"，所以演示期间
+// 为什么关内核绘制：验收要证明"屏幕上这一块确实是用户程序在画"，所以演示期间
 //   内核侧一个像素都不许写（含 write(1,..) 的屏幕回显、启动期的局部提交）。
 // 恢复的两条路径都写了：正常 exit（user64_exit_to_kernel64）与 kill 回收（user64_slot_release64）——
 //   否则用户程序一异常退出，整个系统的屏幕就再也不更新了（很难查）。
-int user64_run_fbdemo64(const void* blob, uint32_t size) {
+//
+// ★ A2：**两个入口共用下面这段实现**（差在 blob 的代码页要不要可写）：
+//   user64_run_fbdemo64      <- A1 的汇编版（user/fbdemo.asm，只读代码页）
+//   user64_run_fbdemo_capp64 <- A2 的 **C 版**（user/apps/fbdemo.c，代码页可写）
+//   ★ 这段逻辑必须由**两边**都走：拿掉它（例如让 C 版直接调 user64_run_capp64）内核在演示期间
+//     会继续画屏 —— 实测踩过：串口里 "[FB64] user-draw demo start/done" 两个标记消失，
+//     "屏幕只有用户程序在画" 这条证据也就不成立了。
+static int u64_run_fbdemo_ex64(const void* blob, uint32_t size, int writable) {
     if (!blob || size == 0) return -1;
     fb_kernel_paint64(0);
     dbg64_line_begin64();
     dbg64_str("[FB64] user-draw demo start: kernel paint off, blob=");
     dbg64_dec(size);
-    dbg64_str(" bytes (fb_map/fb_flip own the screen)\n");
+    dbg64_str(writable ? " bytes (C 版 fbdemo_c; fb_map/fb_flip own the screen)\n"
+                       : " bytes (fb_map/fb_flip own the screen)\n");
     dbg64_line_end64();
-    const int rc = user64_run_blob64(blob, size, "fbdemo64");
+    const int rc = u64_run_blob_ex64(blob, size, writable ? "fbdemo_c" : "fbdemo64", writable);
     fb_kernel_paint64(1);
     dbg64_line_begin64();
     dbg64_str("[FB64] user-draw demo done rc=");
@@ -640,6 +678,13 @@ int user64_run_fbdemo64(const void* blob, uint32_t size) {
     dbg64_str(" kernel paint on\n");
     dbg64_line_end64();
     return rc;
+}
+int user64_run_fbdemo64(const void* blob, uint32_t size) {
+    return u64_run_fbdemo_ex64(blob, size, 0);          // A1 汇编版：只读代码页（老行为不变）
+}
+// ★ A2：C 版 fbdemo（user/apps/fbdemo.c）—— 唯一差别是代码页可写（它有 .data/.bss）。
+int user64_run_fbdemo_capp64(const void* blob, uint32_t size) {
+    return u64_run_fbdemo_ex64(blob, size, 1);
 }
 // ==================== 从 ELF 入口进 ring3 ====================
 // 与 user64_run_blob64 的分工：这里**不映射、不回收任何页** —— 段与初始栈由 ELF64 加载器

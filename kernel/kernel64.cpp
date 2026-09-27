@@ -69,6 +69,21 @@ extern "C" const uint8_t _binary_build64_user_demo64_bin_end[];
 //   符号名同样由 objcopy 按输入路径生成：_binary_build64_user_fbdemo64_bin_start/_end。
 extern "C" const uint8_t _binary_build64_user_fbdemo64_bin_start[];
 extern "C" const uint8_t _binary_build64_user_fbdemo64_bin_end[];
+// ★ A2：**用 C 写**的用户程序 blob（user/apps/*.c -> user/build_user.sh 编成静态 ELF64 ->
+//   objcopy 平铺 blob 嵌进内核；见 build64.sh 的"用户程序交叉编译"段）。
+//   跑它们的入口是 user64_run_capp64()（代码页可写：C 程序有 .data/.bss，见 kernel/usermode64.cpp）。
+//   符号名同样由 objcopy 按输入路径生成：_binary_build64_user_<name>_bin_start/_end。
+extern "C" const uint8_t _binary_build64_user_hello_bin_start[];
+extern "C" const uint8_t _binary_build64_user_hello_bin_end[];
+extern "C" const uint8_t _binary_build64_user_libctest_bin_start[];
+extern "C" const uint8_t _binary_build64_user_libctest_bin_end[];
+extern "C" const uint8_t _binary_build64_user_fbdemo_bin_start[];
+extern "C" const uint8_t _binary_build64_user_fbdemo_bin_end[];
+// ★ A2：跑哪个 fbdemo —— 0（默认）= C 版（user/apps/fbdemo.c）；1 = A1 的汇编版（user/fbdemo.asm）。
+//   由 build64.sh 按环境变量 VIMTU_USER_FBDEMO 定义（默认 c；=asm 时切回汇编版，二进制行为一致）。
+#ifndef VIMTU_USER_FBDEMO_ASM
+#define VIMTU_USER_FBDEMO_ASM 0
+#endif
 #endif
 
 #include <stdint.h>
@@ -422,15 +437,41 @@ static void rust64_boot_init64() {
                                                 _binary_build64_user_demo64_bin_start);
             (void)user64_run_blob64(_binary_build64_user_demo64_bin_start, (uint32_t)blob_sz, "demo64");
         }
-        // ---- ★ A1：用户态绘图演示（ring3 自己把画面画到屏幕上；内核只映射显存 + 提交区域）----
+        // ---- ★ A2：**C 写的**用户程序（我们自己的最小 libc + 自有 ABI 包装）----
+        //   位置：紧跟 demo64、在 fbdemo 之前 —— 两个程序只打串口证据、不碰屏幕，所以不会挤掉
+        //   下面 fbdemo 的像素证据窗口（tests/fbmap64_test.py 按 [FBDEMO] 同步抓屏）。
+        //   入口用 user64_run_capp64：C 程序有**可写**的 .data/.bss（errno / printf 行缓冲 /
+        //   malloc 竞技场），必须把代码页映射成可写（见 kernel/usermode64.cpp 的说明）。
+        {
+            const uint64_t hello_sz = (uint64_t)(_binary_build64_user_hello_bin_end -
+                                                 _binary_build64_user_hello_bin_start);
+            (void)user64_run_capp64(_binary_build64_user_hello_bin_start, (uint32_t)hello_sz, "hello_c");
+        }
+        {
+            const uint64_t libc_sz = (uint64_t)(_binary_build64_user_libctest_bin_end -
+                                                _binary_build64_user_libctest_bin_start);
+            (void)user64_run_capp64(_binary_build64_user_libctest_bin_start, (uint32_t)libc_sz, "libctest_c");
+        }
+        // ---- ★ A1/A2：用户态绘图演示（ring3 自己把画面画到屏幕上；内核只映射显存 + 提交区域）----
         //   位置：紧跟 demo64（同一个"用户窗口可用"分支）；顺序上在 app64/elf64/proc64 演示之前，
         //   这样启动期的像素证据（tests/fbmap64_test.py）落在屏幕还没被别的阶段重画的时候。
         //   演示期间内核侧绘制/提交关闭（fb_kernel_paint64(0)，由 user64_run_fbdemo64 切换）：
         //   屏幕上那一条色带**只**由用户程序画 —— 这就是"这确实是用户程序在画"的证据。
+        //   ★ A2 起默认跑 **C 版**（user/apps/fbdemo.c，构建期编成 blob；见 build64.sh 的
+        //     VIMTU_USER_FBDEMO 开关）；VIMTU_USER_FBDEMO_ASM=1 的构建改跑 A1 的汇编版
+        //     （user/fbdemo.asm）。两版的可观测行为逐条一致（对照表见 user/apps/fbdemo.c 顶部）。
         {
+#if VIMTU_USER_FBDEMO_ASM
             const uint64_t fb_blob_sz = (uint64_t)(_binary_build64_user_fbdemo64_bin_end -
                                                   _binary_build64_user_fbdemo64_bin_start);
             (void)user64_run_fbdemo64(_binary_build64_user_fbdemo64_bin_start, (uint32_t)fb_blob_sz);
+#else
+            const uint64_t fb_blob_sz = (uint64_t)(_binary_build64_user_fbdemo_bin_end -
+                                                  _binary_build64_user_fbdemo_bin_start);
+            // C 版走同一个"关内核绘制 -> ring3 画屏 -> 恢复"的入口（user64_run_fbdemo_capp64 与
+            // user64_run_fbdemo64 的差别只有 blob 的代码页可写性，见 usermode64.cpp）。
+            (void)user64_run_fbdemo_capp64(_binary_build64_user_fbdemo_bin_start, (uint32_t)fb_blob_sz);
+#endif
         }
     } else {
         dbg64_line_begin64();

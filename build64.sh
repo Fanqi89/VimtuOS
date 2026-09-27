@@ -61,6 +61,16 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 VIMTUOS_VERSION="0.3.4-beta16"
 CXXFLAGS="$CXXFLAGS -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\""
 CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
+#
+# ★ A2：跑哪个 fbdemo —— 默认 **C 版**（user/apps/fbdemo.c，用我们自己的最小 libc 写），
+#   VIMTU_USER_FBDEMO=asm 时切回 A1 的汇编版（user/fbdemo.asm）。两个版本的可观测行为
+#   （串口打点 + 画的东西 + 越界/夹取判据）逐条一致，见 user/apps/fbdemo.c 顶部的对照表；
+#   这里只是一个编译期宏，内核侧的选择写在 kernel/kernel64.cpp 的 VIMTU_USER_FBDEMO_ASM 分支里。
+if [ "${VIMTU_USER_FBDEMO:-c}" = "asm" ]; then
+    CXXFLAGS="$CXXFLAGS -DVIMTU_USER_FBDEMO_ASM=1"
+else
+    CXXFLAGS="$CXXFLAGS -DVIMTU_USER_FBDEMO_ASM=0"
+fi
 CXXFLAGS_INSTALLER="$CXXFLAGS -DVIMTU_INSTALLER_MEDIA=1 -DVIMTU_PAYLOAD_LBA=$PAYLOAD_LBA -DVIMTU_KBD_TRACE=1"
 
 # 两套源文件清单：
@@ -110,6 +120,21 @@ SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp k
 # elf64.cpp = ELF64 加载器：**只进系统内核**（安装介质不需要它；它内嵌的 hello.elf 是系统程序）
 # apic64.cpp = LAPIC + IOAPIC 接管中断路由：**只进系统内核**（安装链保持纯 8259 PIC，
 #   避免影响安装介质内核的字节级断言；x86_64.cpp 对它的 EOI/掩码分派用 weak 引用，不链也不报错）
+
+# ==================== ★ A2：可选目标 `--user <name>` ====================
+# 只编一个用户态 C 程序（user/apps/<name>.c）然后退出 —— 不进整个内核构建（省几分钟）。
+# 等价入口：bash user/build_user.sh <name>（同一个脚本；这里只是从 build64.sh 也能直接调）。
+# 产出（固定在 build64/）：build64/user_<name>.elf（静态 ELF64）+ build64/user_<name>.bin（平铺 blob）。
+if [ "${1:-}" = "--user" ]; then
+    shift
+    if [ -z "${1:-}" ]; then
+        echo "用法：bash build64.sh --user <name>   （name = user/apps/<name>.c 的文件名主体）" >&2
+        exit 2
+    fi
+    mkdir -p "$BUILD"
+    bash user/build_user.sh "$1" "$BUILD"
+    exit $?
+fi
 
 echo "==> 清理 $BUILD"
 rm -rf "$BUILD"
@@ -217,6 +242,30 @@ echo "==> A1 用户态绘图演示（ring3 自己画屏：nasm -f bin -> objcopy
 $NASM -f bin user/fbdemo.asm -o "$BUILD/user_fbdemo64.bin"
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/user_fbdemo64.bin" "$BUILD/user_fbdemo64.o"
 cp "$BUILD/user_fbdemo64.o" "$BUILD/os/user_fbdemo64.o"
+
+echo "==> ★ A2：用户态 **C** 程序交叉编译（我们自己的最小 libc + 自有 ABI 包装；clang + lld）"
+# 见 user/build_user.sh（编译/链接的全部细节与每条选项的理由都在那里）与
+# docs/应用层与系统调用说明.md 的"用户态 C 运行时（A2）"节。这里做两件事：
+#   1) 把 user/apps/*.c 编成 build64/user_<name>.elf（静态 ELF64）+ build64/user_<name>.bin（平铺 blob）；
+#   2) objcopy 成 elf64 目标文件，**只链进系统内核**（安装介质内核不跑这些程序，别为它们付体积）。
+# 符号名由 objcopy 按输入路径生成：_binary_build64_user_<name>_bin_start/_end。
+# ★ 体积纪律：默认三个 blob 合计 ~25KB（单条上限 8 页 = 32768B，见 user/build_user.sh 的 MAX_BLOB）；
+#   用户态代码只以内嵌 blob 的形式存在这一份，不额外拷进内核代码段。
+# ★ 默认集：hello（hello world）、libctest（printf 子集 + malloc 压力）、fbdemo（C 版 A1 演示）；
+#   VIMTU_USER_FBDEMO=asm 时 fbdemo 换回 A1 汇编版（user/fbdemo.asm），C 版就不再链进内核。
+if [ "${VIMTU_USER_FBDEMO:-c}" = "asm" ]; then
+    VIMTU_USER_APPS="${VIMTU_USER_APPS:-hello libctest}"
+else
+    VIMTU_USER_APPS="${VIMTU_USER_APPS:-hello libctest fbdemo}"
+fi
+for app in $VIMTU_USER_APPS; do
+    bash user/build_user.sh "$app" "$BUILD"
+done
+for app in $VIMTU_USER_APPS; do
+    $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/user_${app}.bin" "$BUILD/user_${app}_cblob.o"
+    cp "$BUILD/user_${app}_cblob.o" "$BUILD/os/"
+    echo "    内嵌 C 用户程序：user/apps/$app.c -> $BUILD/user_${app}.bin（$(stat -c%s "$BUILD/user_${app}.bin") B）"
+done
 echo "==> 可安装应用示例（VAP64：nasm -> tools/make_vap.py -> objcopy 嵌入系统内核）"
 # user/hello64.asm 是 ring3 程序；tools/make_vap.py 给它加 32B VAP64 头（含代码段 CRC32）；
 # objcopy 把整个 .vap 嵌进内核，app64.cpp 启动时把它装进 VimtuFS2 的 /hello.vap，再从盘上读出来跑。
@@ -315,6 +364,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD/os"/hello_vap64.o \
     "$BUILD/os"/user_demo64.o "$BUILD/os"/user_fbdemo64.o "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
+    "$BUILD/os"/user_*_cblob.o \
     "$BUILD/os"/kaisi_png.o
 $OBJCOPY -O binary "$BUILD/kernel64_os.elf" "$BUILD/kernel64_os.bin"
 
@@ -365,6 +415,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
         "$BUILD/os"/hello_vap64.o \
         "$BUILD/os"/user_demo64.o "$BUILD/os"/user_fbdemo64.o "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
+        "$BUILD/os"/user_*_cblob.o \
         "$BUILD/os"/kaisi_png.o
     $OBJCOPY -O binary "$BUILD/kernel64_os_cr3exp.elf" "$BUILD/kernel64_os_cr3exp.bin"
     echo "实验内核 OK. $BUILD/kernel64_os_cr3exp.bin = $(stat -c%s "$BUILD/kernel64_os_cr3exp.bin") bytes"

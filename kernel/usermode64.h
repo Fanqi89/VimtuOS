@@ -47,8 +47,14 @@ static const uint64_t USER64_FB_BYTES64    = 40ULL * 1024ULL * 1024ULL;
 int user64_selftest64();
 
 // 跑一个用户程序 blob：拷到用户代码页 -> 建映射 -> iretq 进 ring3 -> exit 后回到本函数。
-// 返回 0 = 完整跑完（含收尾回收）；-1 = 参数/内存失败。
+// 返回 0 = 完整跑完（含收尾回收）；-1 = 参数/内存失败。代码页**只读**（A1 的汇编 blob 用这条）。
 int user64_run_blob64(const void* blob, uint32_t size, const char* name);
+
+// ★ A2：跑一个**用 C 写**的用户程序 blob（user/apps/*.c + user/lib/ 编出来的平铺 blob）。
+// 与 user64_run_blob64 唯一的差别：用户代码页映射成**可写**（C 程序有 .data/.bss：errno、
+// printf 的行缓冲、malloc 竞技场），其余（栈、iretq 帧、退出/回收）完全一样。
+// 打点：多一行 `[USER64] capp map writable=1 size=<n> name=<n>`（既有那行格式不动）。
+int user64_run_capp64(const void* blob, uint32_t size, const char* name);
 
 // 用户窗口是否可用（批次 C：UEFI 下固件页表只读 -> 连 U/S 都写不进去 -> 必须如实返回 0）：
 // 1 = 可用（BIOS 路径）；0 = 不可用（UEFI 路径，ring3 演示必须跳过，见 usermode64.cpp 的说明）。
@@ -121,7 +127,11 @@ uint64_t user64_page_flags64(uint64_t va);
 // ==================== A1：用户态绘图（映射显存 + 提交区域）====================
 // 把**指定物理页**映射成用户页（共享映射：显存/后备缓冲）。与 user64_map_page64 的区别：
 //   * 物理页由调用方给（不分配、不回收），所以是"同一块物理内存两边都能写"的共享映射；
-//   * va 允许落在用户窗口或 USER64_FB_VA64 映射区（后者给显存用）。
+int user64_run_fbdemo64(const void* blob, uint32_t size);
+// ★ A2：**C 版** fbdemo（user/apps/fbdemo.c）的入口 —— 与上面那条完全同一套流程
+//   （关内核侧绘制 -> ring3 跑 -> 恢复），只有 blob 的代码页可写性不同（C 程序有 .data/.bss）。
+//   两个版本的可观测行为逐条一致，见 user/apps/fbdemo.c 顶部的对照表。
+int user64_run_fbdemo_capp64(const void* blob, uint32_t size);
 // 返回 1 = 成功；0 = 参数非法（未页对齐/越出用户区/撞大页）或页表页不足。
 int user64_map_phys_page64(uint64_t va, uint64_t phys, uint64_t leaf_flags);
 // 跑"用户态绘图"演示（A1）：blob = user/fbdemo.asm 的平铺二进制（见 build64.sh）。
