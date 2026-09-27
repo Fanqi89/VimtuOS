@@ -191,7 +191,7 @@ void drv_main(u64* sp) {
     if (!segs) die("no-load-seg");
     span = (span + 0xFFFu) & ~0xFFFu;
 
-    out_s("[TCCDRV] load path=/lib/tcc.bin size=");
+    out_s("[TCCDRV] load path=/lib/tcc.bin hdr=");
     out_dec((u64)got);
     out_s(" segs=");
     out_dec(segs);
