@@ -267,6 +267,17 @@ for app in $VIMTU_USER_APPS; do
     echo "    内嵌 C 用户程序：user/apps/$app.c -> $BUILD/user_${app}.bin（$(stat -c%s "$BUILD/user_${app}.bin") B）"
 done
 
+echo "==> ★ A4-1：ring3 shell（**交付 = 系统卷里的 /bin/shell.bin**，不内嵌内核）"
+# 交付方式（本批次的核心要求：内核只负责"把它装进用户态并跑起来"）：
+#   1) user/shell/build_shell.sh 用 user/lib（自研最小 libc + 自有 ABI 包装）编出静态 ELF64
+#      -> $BUILD/shell.elf / shell.bin；
+#   2) tools/make_shellvol.py 把 shell.bin 写进一块 VimtuFS2 **v4** 卷（/bin/shell.bin +
+#      /etc/sh64hello.txt + /tmp(0777)）-> $BUILD/shellvol.img（写完会逐字节回读自检）；
+#   3) 系统镜像装完之后，同一条命令再把它放进演示/验收盘的主分区（LBA 8009）
+#      -> $BUILD/sysdisk.img；内核二进制里**不含** shell 的字节（后面有一条断言）。
+bash user/shell/build_shell.sh "$BUILD"
+$PY tools/make_shellvol.py --shell "$BUILD/shell.bin" --vol "$BUILD/shellvol.img"
+
 echo "==> ★ A3：musl 静态程序（third_party/musl 的 libc.a；编译/链接全在 tools/musl_build_win.sh 里）"
 # 见 tools/musl_build_win.sh 与 docs/应用层与系统调用说明.md 的"musl（A3 第一步）"节：
 #   * 该脚本用 **musl 自己的头文件 + musl 的 lib/libc.a + 自写 _start + tools/musl_hello64.ld**
@@ -377,6 +388,19 @@ $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/ap_trampoline64.bin" "
 cp "$BUILD/ap_trampoline64.o" "$BUILD/os/ap_trampoline64.o"
 echo "    AP 跳板 = $(stat -c%s "$BUILD/ap_trampoline64.bin") 字节（按 0x8000 汇编）"
 
+# ★ A4-1 的体积抵消（"删/搬等价量的内核代码"这条纪律）：默认配置（VIMTU_USER_FBDEMO=c）下，
+#   A1 的**汇编版** fbdemo blob（user_fbdemo64.bin = 1313 B）在系统内核里是**死字节** ——
+#   kernel64.cpp 只在 VIMTU_USER_FBDEMO_ASM=1 时引用 `_binary_build64_user_fbdemo64_bin_*`
+#   （见 kernel/kernel64.cpp 的 #if VIMTU_USER_FBDEMO_ASM 段），而 build64.sh 也只在 asm 配置下
+#   排除 C 版（VIMTU_USER_APPS）。本批把这份死字节从**系统内核**的链接行里去掉，正好用来抵消
+#   A4-1 的 ring3 shell 新增内核字节（见报告里的改前/改后对比）；asm 配置照旧包含它。
+#   安装介质内核的链接行**不动**（它没有图标包区间的体积约束）。
+ASM_FBDEMO_OBJ="$BUILD/os/user_fbdemo64.o"
+if [ "${VIMTU_USER_FBDEMO:-c}" = "asm" ]; then
+    :
+else
+    ASM_FBDEMO_OBJ=""
+fi
 echo "==> 链接两个内核"
 $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel64.o "$BUILD"/console64.o "$BUILD"/x86_64.o \
     "$BUILD"/fb.o "$BUILD"/font.o "$BUILD"/input.o "$BUILD"/mem64.o "$BUILD"/ata64.o "$BUILD"/part64.o "$BUILD"/setup64.o \
@@ -410,7 +434,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD/os"/hello_vap64.o \
-    "$BUILD/os"/user_demo64.o "$BUILD/os"/user_fbdemo64.o "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
+    "$BUILD/os"/user_demo64.o $ASM_FBDEMO_OBJ "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
     "$BUILD/os"/user_*_cblob.o \
     "$BUILD/os"/kaisi_png.o
 $OBJCOPY -O binary "$BUILD/kernel64_os.elf" "$BUILD/kernel64_os.bin"
@@ -495,6 +519,24 @@ if [ $((KERNEL_LBA + KERNEL_OS_SECTORS)) -gt "$ICONPACK_LBA" ]; then
 fi
 dd if="$RES/iconpack.bin" of="$BUILD/system.img" seek="$ICONPACK_LBA" conv=notrunc status=none
 echo "    图标包：$ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）@ LBA $ICONPACK_LBA..$((ICONPACK_LBA + ICONPACK_SECTORS - 1))；系统内核 $OSSZ B / $KERNEL_OS_SECTORS 扇区（余 $((ICONPACK_LBA - KERNEL_LBA - KERNEL_OS_SECTORS)) 扇区不重叠）"
+
+echo "==> ★ A4-1：带 /bin/shell.bin 的演示盘 + \"内核里没有 shell 字节\"断言"
+# system.img 已经装好 -> 把它 + MBR + 主分区（= 带 /bin/shell.bin 的 VimtuFS2 v4 卷）拼成
+# 一块能直接启动的盘：build64/sysdisk.img（验收脚本 tests/sh64_test.py 也用它做夹具）。
+"$PY" tools/make_shellvol.py --shell "$BUILD/shell.bin" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+# 断言：内核二进制里**不能**出现 shell.bin 的字节（交付方式必须是"系统卷里的文件"）。
+# 探针取 shell 中段的 64 字节（ELF 头/入口附近的字节模式到处都是，中段最稳）。
+"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/shell.bin" <<'PYEOF'
+import sys
+k = open(sys.argv[1], "rb").read()
+s = open(sys.argv[2], "rb").read()
+mid = len(s) // 2
+probe = s[mid:mid + 64]
+if len(probe) < 64 or probe in k:
+    sys.stderr.write("ERROR: system kernel contains shell.bin bytes (delivery must be a volume file)\n")
+    raise SystemExit(1)
+print("    断言 OK：系统内核 %d B 里搜不到 shell.bin 的 64B 探针（偏移 %d）；shell 只从系统卷装载" % (len(k), mid))
+PYEOF
 
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
 "$PY" - "$BUILD/payload_hdr.bin" "$SYS_SECTORS" "$((PAYLOAD_LBA + 1))" <<'PYEOF'

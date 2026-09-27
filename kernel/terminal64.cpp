@@ -685,6 +685,8 @@ static const char* HELP_EN =
     "  run NAME|/PATH        load an app from VimtuFS2 and run it in ring3 (magic decides:\n"
     "                        VAP64 -> int 0x80 path, ELF64 -> syscall path; e.g. run hello.elf)\n"
     "  elfrun NAME|/PATH     force the ELF64 loader (syscall insn ABI), e.g. elfrun hello.elf\n"
+    "  shell | sh [status|kill]  run the ring3 shell from the system volume (/bin/shell.bin):\\n"
+    "                        keys go to the ring3 shell, its output comes back to this window\\n"
     "  echo TEXT             print text (echo TEXT > FILE writes a real file)\n"
     "  write FILE TEXT       write a real file (overwrite; text is limited by the command line; "
     "multi-level /dir/name; the FILE itself may be up to 8 MiB)\\\\n"
@@ -759,6 +761,8 @@ static const char* HELP_ZH =
     "  run 名字|/路径        从 VimtuFS2 加载应用并在 ring3 里运行（按文件头魔数自动分派：\n"
     "                        VAP64 走 int 0x80、ELF64 走 syscall 指令；例如 run hello.elf）\n"
     "  elfrun 名字|/路径     强制走 ELF64 加载器（syscall 指令 ABI），例如 elfrun hello.elf\n"
+    "  shell | sh [status|kill]  运行**系统卷里**的 ring3 shell（/bin/shell.bin）：\\n"
+    "                        按键转给 ring3 shell，它的输出回到这个窗口\\n"
     "  echo TEXT             回显（echo TEXT > FILE 写**真文件**）\n"
     "  write FILE TEXT       写**真文件**（整体覆盖；文本受**命令行长度**限制，文件本身可到 8 MiB；多级路径）\\\\n"
     "  cat FILE / ls, dir    读文件 / 列目录（带大小；cat 最多打 4096 B，超过会**明确提示**被截断）\\\\n"
@@ -4015,6 +4019,9 @@ static bool cmd_loginctl(TerminalState* ts, const char* a1) {
     return false;
 }
 
+// ★ A4-1：ring3 shell（`shell` 命令 + 终端服务）。定义在本文件后部（term_key/term_tick 之前），
+//   但命令分派在 shell_exec 里就要用 -> 这里先声明。
+static bool cmd_shell(TerminalState* ts, const char* arg1);
 
 // 命令分发：cmd / arg1 / args（原文，供 echo / write 用）
 static void shell_exec(TerminalState* ts, const char* line) {
@@ -4270,6 +4277,10 @@ static void shell_exec(TerminalState* ts, const char* line) {
             ok = (rc == 0);                                    // ★ 成功/失败照旧反映到 shell 的 $?
                                                                //   （A3 下半改这条命令时误删过这一行）
         }
+    } else if (st_eq(g_cmd, "shell") || st_eq(g_cmd, "sh")) {
+        // ★ A4-1：装载并运行**系统卷里的** /bin/shell.bin（ring3 shell）。
+        //   参数：无 = 启动/报忙；status = 会话状态；kill = 结束它（Esc 关窗也会结束）。
+        ok = cmd_shell(ts, g_arg1);
     } else if (st_eq(g_cmd, "task") || st_eq(g_cmd, "tasks") || st_eq(g_cmd, "top")) {
         cmd_ps(ts, g_arg1);  // 与 ps 同一份真实快照（top 不做全屏刷新，只打一次）
     } else if (st_eq(g_cmd, "syslog")) {
@@ -4368,10 +4379,255 @@ static void shell_exec(TerminalState* ts, const char* line) {
 // 为什么可以立即 kfree：状态唯一的对外引用就是 w->userdata（已置空），注册表也摘掉了，
 //   之后再没有任何"活窗口 -> 状态"的路径（ts_reap_pending 还会用 ts_referenced 再确认一次）。
 //   不这么做的话，"关掉最后一个终端"后将没有活窗口触发 tick，状态要等到下次开窗/重置才回收。
+// ==================== ★ A4-1：Ring 3 shell（系统卷里的 /bin/shell.bin）====================
+// 内核这一侧**只做两件事**：① 按请求把 /bin/shell.bin 当 ELF 装进一个真进程（proc64）；
+// ② 当"终端服务"——窗口按键转发给 shell、shell 的输出显示回窗口。shell 自己的代码/内置命令/
+//   外部命令逻辑**全在用户态**（user/shell/），内核里一个字节都没有：交付 = build64.sh 调
+//   tools/make_shellvol.py 把 shell.bin 写进 VimtuFS2 系统卷的 /bin/shell.bin（构建期还有一条
+//   "内核二进制里搜不到 shell 字节"的断言）。
+//
+// ★ 体积纪律（系统内核只剩 6 扇区余量）：这一段刻意写得极紧凑 —— 只留 2 条串口证据行
+//   （launch / exit），失败一律打同一行 `[SH64] launch FAILED`（**一条屏上提示都不打**：
+//   提示由 shell 自己经邮箱画）；`shell` 命令只认"启动"（结束 = Esc 关窗，或 shell 自己 exit）。
+//
+// 交互通道（数据流唯一定义点；用户侧同一份在 user/shell/sh64.h，改一处必须同步另一处）：
+//   一页内核页（page_alloc_64）按 U|W 映射进 shell 进程的固定 VA（5GiB+39MiB）：
+//     in  环：终端按键 -> term_key -> in 环 -> shell 的 read_line
+//     out 环：shell 的输出 -> out 环 -> term_tick -> 本窗口 + 串口
+//   行首控制字节（只有行首有意义）：0x01 = shell 发来的服务请求（"LS <path>"），
+//     0x02 = 内核回的应答行（"D <name>" / "F <size> <name>" / "E <n>"）。
+//   ls 为什么要求内核：ring3 **没有 getdents(217)**（syscall64.cpp 的表里没有），目录枚举
+//   只能由内核用已有的 fd64 原语代劳 —— 如实标注的能力缺口（报告与文档里都列了）。
+struct Sh64Mail {
+    volatile uint32_t magic;      // +0    shell 写 SH64_MAGIC64 = 就绪（内核只在这个值对时才动环）
+    volatile uint32_t in_w;       // +4    内核写
+    volatile uint32_t in_r;       // +8    shell 读
+    volatile uint32_t out_w;      // +12   shell 写
+    volatile uint32_t out_r;      // +16   内核读
+    uint32_t pad[3];              // +20..+31
+    char inb[512];                // +32   in 环
+    char outb[2048];              // +544  out 环
+};
+static_assert(offsetof(Sh64Mail, inb) == 32 && offsetof(Sh64Mail, outb) == 544,
+              "Sh64Mail 布局必须与 user/shell/sh64.h 一致");
+
+// 邮箱 VA 放在**用户窗口**（4GiB+384KiB）而不是 A1 的 FB 区（5GiB）：因为内核的
+//   user64_range_ok64() 只认 1MiB 用户窗口（见 usermode64.cpp:500），shell 侧"用 read(3,VA,1)
+//   探一下邮箱在不在"这一招**只有在窗口内**才成立 —— 不在窗口里就没法安全探测（5GiB 上直接读
+//   未映射页 = ring3 #PF = 内核 PANIC）。4GiB+384KiB 落在窗口内的空闲缝里：ELF 装载区
+//   （< +64KiB）/ 用户栈（+64..80KiB）/ brk（+256..320KiB）/ mmap（+576KiB 起）都不碰它。
+// ★ 这一页在**进程自己的 PDPT[4] 子树**里，所以进程回收时会随用户区一起 page_free ——
+//   内核侧不许再释放一次（见 sh64_stop64 与 cmd_shell 的 mapped 分支）。
+static const uint64_t SH64_MAIL_VA64 = 0x0000000100060000ULL;    // 4GiB + 384KiB（用户窗口内的空闲缝）
+static const uint32_t SH64_MAGIC64   = 0x53483634u;              // 'SH64'
+#define SH64_PATH64 "/bin/shell.bin"        // 宏：打点字符串要能字面拼接
+static const char SH64_REQ64 = 0x01;        // shell -> 内核：服务请求行首
+static const char SH64_RSP64 = 0x02;        // 内核 -> shell：服务应答行首
+
+static Sh64Mail* g_sh_mail64 = nullptr;   // 邮箱页（内核按物理地址直接访问：<4GB 恒等直映）
+static uint32_t  g_sh_phys64 = 0;
+static int       g_sh_pid64  = 0;         // shell 进程（0 = 没有）
+static int       g_sh_inst64 = 0;         // 拥有这个会话的终端实例号（0 = 没有）
+static int       g_sh_col64  = 0;         // 1 = 正在收一行请求
+static int       g_sh_line64 = 1;         // 1 = 下一个输出字节处于"行首"（请求只认行首）
+static char      g_sh_req64[160];
+static int       g_sh_req_n64 = 0;
+
+static bool sh64_owns64(TerminalState* ts) {
+    return (g_sh_inst64 != 0 && ts && ts->used && ts->inst == g_sh_inst64 && g_sh_pid64 > 0);
+}
+
+// 内核 -> shell：in 环塞一个字节（环满就丢 —— in 环 512 B，按键注入远快不过 shell 的消费）
+static void sh64_in64(char c) {
+    Sh64Mail* m = g_sh_mail64;
+    if (!m || m->magic != SH64_MAGIC64) return;
+    const uint32_t w = m->in_w;
+    if (((w + 1u) % 512u) == m->in_r) return;
+    m->inb[w] = (uint8_t)c;
+    m->in_w = (w + 1u) % 512u;
+}
+
+// 内核 -> shell：一整条服务应答行（0x02 + 内容 + '\n'）
+static void sh64_reply64(const char* s) {
+    sh64_in64(SH64_RSP64);
+    while (*s) sh64_in64(*s++);
+    sh64_in64('\n');
+}
+
+// 服务请求：列目录（内核用已有的 fd64 目录原语代劳；ring3 没有 getdents）
+// 请求行形如 "LS <path>"（行首的 0x01 在调用点已经剥掉）；路径一定来自 shell 的**绝对路径**解析，
+// 所以这里直接用（fd64/vfs64 认 "/" 与多级路径），不做二次规范化。
+static void sh64_serve64(const char* line) {
+    if (!(line[0] == 'L' && line[1] == 'S' && line[2] == ' ') || !line[3]) { sh64_reply64("E 1"); return; }
+    panic64_watchdog_pause64();              // 列目录要读盘：暂停 GUI 看门狗（与终端 cmd_ls 同款）
+    const int dfd = fd64_opendir64(line + 3);
+    if (dfd >= 3) {
+        for (;;) {
+            char nm[FD64_NAME_MAX];
+            uint32_t ty = 0, sz = 0;
+            if (fd64_readdir64(dfd, nm, (int)sizeof(nm), &ty, &sz) <= 0) break;
+            char out[80];
+            int o = 0;
+            out[o++] = (ty == VFS64_TYPE_DIR) ? 'D' : 'F';
+            out[o++] = ' ';
+            if (ty != VFS64_TYPE_DIR) { o += fmt_u64(out + o, 16, (uint64_t)sz); out[o++] = ' '; }
+            for (int i = 0; nm[i] && o < (int)sizeof(out) - 1; i++) out[o++] = nm[i];
+            out[o] = 0;
+            sh64_reply64(out);
+        }
+        (void)fd64_close64(dfd);
+    } else {
+        sh64_reply64("E 1");
+    }
+    sh64_reply64("E 0");
+    panic64_watchdog_unpause64();
+}
+
+// shell 退出 / 关窗：收尾（杀进程 + 回收邮箱页 + 清会话）
+// 为什么不在这里补提示符：终端一旦退出 shell 模式，下一次回车（term_key 的普通路径）就会打印
+// 它自己的提示符 —— 少一处 inlined 的 shell_prompt，内核这段就能小几百字节。
+static void sh64_stop64(TerminalState* ts, int code) {
+    (void)ts;
+    if (g_sh_pid64 > 0) {
+        dbg64_line_begin64();
+        dbg64_str("[SH64] exit pid=");
+        dbg64_dec((uint64_t)g_sh_pid64);
+        dbg64_str(" code=");
+        dbg64_dec((uint64_t)(code < 0 ? 0 : code));
+        dbg64_nl();
+        dbg64_line_end64();
+        if (proc64_find64(g_sh_pid64)) {
+            (void)proc64_kill64(g_sh_pid64, 9);
+            proc64_destroy64(g_sh_pid64);
+        }
+    }
+    // ★ 邮箱页**不再由内核释放**：它在 shell 进程自己的用户区（PDPT[4] 子树）里，
+    //   进程退出/被回收时随用户区一起 page_free（见 SH64_MAIL_VA64 的说明）；内核再 free 一次
+    //   就是双重释放（页池记账会被打乱）。这里只清会话状态。
+    g_sh_mail64 = nullptr;
+    g_sh_phys64 = 0;
+    g_sh_pid64 = 0;
+    g_sh_inst64 = 0;
+    g_sh_col64 = 0;
+    g_sh_req_n64 = 0;
+    g_sh_line64 = 1;
+}
+
+// term_tick 调：抽干 shell 的输出 -> 本窗口 + 串口；处理请求行；看它是否已退出
+// 为什么先收集再写串口：串口 115200 波特（~11.5 KB/s），而"行级原子"（dbg64_line_begin64）
+//   期间 IF=0 —— 每 tick 最多搬 512 B（约 44 ms），剩下的下一 tick 继续；请求（要读盘）在
+//   **不持锁**时处理。
+static void sh64_poll64(TerminalState* ts) {
+    Sh64Mail* m = g_sh_mail64;
+    char out[512];
+    int n = 0;
+    if (m->magic == SH64_MAGIC64) {
+        int guard = 0;
+        while (m->out_r != m->out_w && guard++ < 4096) {
+            const char c = (char)m->outb[m->out_r];
+            m->out_r = (m->out_r + 1u) % 2048u;
+            if (g_sh_col64) {
+                if (c == '\n') {
+                    g_sh_col64 = 0;
+                    g_sh_req64[g_sh_req_n64] = 0;
+                    sh64_serve64(g_sh_req64);
+                    g_sh_req_n64 = 0;
+                } else if (g_sh_req_n64 < (int)sizeof(g_sh_req64) - 1) {
+                    g_sh_req64[g_sh_req_n64++] = c;
+                }
+                continue;
+            }
+            if (c == SH64_REQ64 && g_sh_line64) { g_sh_col64 = 1; g_sh_req_n64 = 0; continue; }
+            if (n >= (int)sizeof(out)) continue;                 // 本 tick 预算满：剩下的下一 tick
+            out[n++] = c;
+            g_sh_line64 = (c == '\n');
+        }
+    }
+    if (n > 0) {
+        dbg64_line_begin64();                                    // 串口这一段原子（不被别的日志插行）
+        for (int i = 0; i < n; i++) {
+            ts_putc(ts, (uint32_t)(unsigned char)out[i]);        // 窗口（'\b'/'\n' 由 ts_putc 处理）
+            dbg64_putc(out[i]);                                  // 串口（逐字节，验收按字节比对）
+        }
+        dbg64_line_end64();
+        gui64_invalidate_window(ts->win);
+    }
+    const int st = term_proc_state64(g_sh_pid64);
+    if (st == (int)PROC64_EXITED || st < 0) {
+        int code = -1;
+        for (int i = 0; i < PROC64_MAX; i++) {
+            Proc64Info in;
+            if (proc64_info64(i, &in) == 0) continue;
+            if ((int)in.pid == g_sh_pid64) { code = (int)in.exit_code; break; }
+        }
+        sh64_stop64(ts, code);
+    }
+}
+
+// 终端命令 `shell`（别名 sh）：**从系统卷**装载 /bin/shell.bin 并跑起来
+// 失败原因不打细分（装载失败由内核 ELF64 加载器自己打 `[ELF64] load FAILED … path=…`，
+// 那是更权威的证据），这里只打同一行 FAILED —— 一条字面量省字节。
+static bool cmd_shell(TerminalState* ts, const char* arg1) {
+    (void)arg1;
+    if (g_sh_pid64 > 0 || !proc64_isolate64()) return false;
+    uint32_t ty = 0, sz = 0;
+    const int sys = vfs64_system_slot64();
+    void* pg = nullptr;
+    int pid = 0, mapped = 0;
+    if (sys < 0 || vfs64_stat_on64(sys, SH64_PATH64, &ty, &sz) != 0 || ty != VFS64_TYPE_FILE) goto fail;
+    pg = page_alloc_64();                        // ★ 一页邮箱：shell 按固定 VA 直接读写
+    if (!pg || (uint64_t)(uintptr_t)pg >= 0x100000000ULL) goto fail;
+    {
+        Sh64Mail* m = (Sh64Mail*)pg;             // <4GB 恒等直映：内核按物理地址直接读写这一页
+        m->magic = 0;
+        m->in_w = 0;
+        m->in_r = 0;
+        m->out_w = 0;
+        m->out_r = 0;
+    }
+    panic64_watchdog_pause64();
+    pid = proc64_create64("sh64", 0);
+    if (pid > 0) {
+        proc64_switch_to64(pid);
+        mapped = user64_map_phys_page64(SH64_MAIL_VA64, (uint64_t)(uintptr_t)pg,
+                                        PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64);
+        proc64_switch_to_kernel64();
+        user64_paging_sync64();
+        if (mapped && proc64_start_elf64(pid, SH64_PATH64) == 0) {
+            panic64_watchdog_unpause64();
+            g_sh_mail64 = (Sh64Mail*)pg;
+            g_sh_phys64 = (uint32_t)(uintptr_t)pg;
+            g_sh_pid64 = pid;
+            g_sh_inst64 = ts->inst;
+            g_sh_col64 = 0;
+            g_sh_req_n64 = 0;
+            g_sh_line64 = 1;
+            dbg64_line_begin64();
+            dbg64_str("[SH64] launch path=" SH64_PATH64 " size=");
+            dbg64_dec(sz);
+            dbg64_str(" pid=");
+            dbg64_dec((uint64_t)pid);
+            dbg64_nl();
+            dbg64_line_end64();
+            return true;
+        }
+    }
+    panic64_watchdog_unpause64();
+    if (pid > 0 && proc64_find64(pid)) proc64_destroy64(pid);   // 会连"已映射的用户区"一起回收（含邮箱页）
+fail:
+    if (pg && !mapped) page_free_64(pg);         // 只在**从来没映射进进程**时才由内核释放（避免双重释放）
+    dbg64_line_begin64();
+    dbg64_str("[SH64] launch FAILED\n");
+    dbg64_line_end64();
+    return false;
+}
+
 static bool term_release_state(Window* w) {
     TerminalState* ts = ts_of(w);
     if (!ts) return false;
     int inst = ts->inst;
+    // ★ A4-1：这个终端拥有 shell 会话 -> 关窗 = 结束 shell（杀进程 + 回收邮箱页）
+    if (g_sh_inst64 != 0 && g_sh_inst64 == inst && g_sh_pid64 > 0) sh64_stop64(ts, -1);   // 关窗 = 结束 shell
     w->userdata = nullptr;      // 先断引用：外壳若按 app_id kfree(userdata)，看到空指针就跳过
     ts_detach(ts);              // 摘除注册表 + 入待释放队列
     dbg64_str("[APP] term closed");
@@ -4391,6 +4647,13 @@ static void term_key(Window* w, char c) {
     if (c == 0x1B) {                       // Esc 关闭本窗口（与计算器/扫雷/设置一致）
         term_release_state(w);             // 先接管状态（避免外壳释放 / 本文件释放撞车）
         gui64_destroy_window(w);
+        return;
+    }
+    // ★ A4-1：shell 模式 —— 本窗口的按键全部转发给 ring3 shell（含退格/回车），
+    //   不再走内核自己的行编辑/命令执行（回显由 shell 通过 out 环送回来）
+    if (sh64_owns64(ts)) {                  // 打印字符 / 退格 / 回车原样送进 in 环（其余控制键丢掉）
+        if (c == '\r') c = '\n';
+        if ((unsigned char)c >= 0x20 || c == '\n' || c == '\b' || (unsigned char)c == 0x7F) sh64_in64(c);
         return;
     }
     if (c == '\n' || c == '\r') {          // 回车执行
@@ -4419,6 +4682,11 @@ static void term_tick(Window* w) {
     // 1) 外壳已经在关这个窗口（点标题栏 X / 外壳清理）：抢在销毁前把状态接管下来。
     //    这里**不**销毁窗口：外壳既然置了 closing，就由外壳自己完成销毁（避免在 tick 里改窗口链表）。
     if (w && w->closing && term_release_state(w)) return;
+    // ★ A4-1：这个窗口跑着 ring3 shell -> 每个 tick 抽干它的输出（-> 本窗口 + 串口）并看它是否退出
+    {
+        TerminalState* ts = ts_of(w);
+        if (sh64_owns64(ts)) sh64_poll64(ts);
+    }
     // 2) 外壳一步到位销毁的实例（没给 closing 机会）：只摘除引用，不冒险释放
     ts_prune();
     // 3) 收割自己接管下来的状态
