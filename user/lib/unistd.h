@@ -38,4 +38,14 @@ void    _exit(int code) __attribute__((noreturn));
 unsigned long vimtu64_ticks(void);
 int           vimtu64_sleep_ms(unsigned ms);   /* 自有 ABI 5 */
 
+/* ---- ★ A4-5：fork/wait4（信号演示与 ring3 shell 的 run 用；Linux 号段 57/61，返回 -errno）---- */
+int     fork(void);
+/* wait4 的 status 是 Linux 编码：WEXITSTATUS(status) = (status>>8)&0xFF —— 被信号打死的进程
+ * 退出码是 128+sig（本内核的如实实现，见 kernel/proc64.cpp 的 wait4 注释）。 */
+int     wait4(int pid, int* status, int options, void* rusage);
+/* ---- 内存映射（Linux 号段 9）：编辑器用它拿大块文本缓冲（user/lib 的堆只有 4 KiB）。
+ *      prot: 1=READ 2=WRITE；flags: 0x22 = MAP_PRIVATE|MAP_ANONYMOUS（本内核只认 len/prot/flags）---- */
+void*   mmap(void* addr, size_t len, int prot, int flags, int fd, long off);
+/* ---- 终端 ioctl（Linux 号段 16）：TCGETS/TCSETS（raw 模式）、TIOCGWINSZ ---- */
+int     ioctl(int fd, unsigned long req, void* arg);
 #endif /* VIMTU64_UNISTD_H */

@@ -5113,6 +5113,15 @@ static void term_key(Window* w, char c) {
     // ★ A4-1：shell 模式 —— 本窗口的按键全部转发给 ring3 shell（含退格/回车），
     //   不再走内核自己的行编辑/命令执行（回显由 shell 通过 out 环送回来）
     if (sh64_owns64(ts)) {                  // 打印字符 / 退格 / 回车原样送进 in 环（其余控制键丢掉）
+        // ★ A4-5：Ctrl+C（0x03）不再"丢掉"，而是按终端语义处理：给**前台进程组**发 SIGINT。
+        //   前台进程组 = 最近一次 setpgid(0,0)（自立进程组）的进程（本内核没有会话/tcsetpgrp，
+        //   见 kernel/sig64.h 的说明）；没有登记过就如实打一行并丢弃（老行为）。
+        //   为什么这条路径必须存在：编辑器/编译器这类前台作业要能被 Ctrl+C 打断，
+        //   而 shell 自己的进程组不该跟着一起死（它不在前台组里）。
+        if ((unsigned char)c == 0x03) {
+            (void)sig64_tty_int64();
+            return;
+        }
         if (c == '\r') c = '\n';
         if ((unsigned char)c >= 0x20 || c == '\n' || c == '\b' || (unsigned char)c == 0x7F) sh64_in64(c);
         return;

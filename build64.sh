@@ -82,7 +82,7 @@ CXXFLAGS_INSTALLER="$CXXFLAGS -DVIMTU_INSTALLER_MEDIA=1 -DVIMTU_PAYLOAD_LBA=$PAY
 #     （屏幕硬件检查报告）也进 CORE —— 两份内核都要：安装程序要能看见 SATA/NVMe 盘，
 #     系统内核的 VFS/store 也要能（驱动器号 8.. / 16.. 分派），
 #     而硬件检查报告在安装介质与装好的系统里都是"没有串口时唯一的诊断画面"。
-SRCS_CORE="kernel/kernel64.cpp kernel/console64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp kernel/input.cpp kernel/input64.cpp kernel/mem64.cpp kernel/hwinfo64.cpp kernel/acpi64.cpp kernel/edid64.cpp kernel/display64.cpp kernel/fd64.cpp kernel/usermode64.cpp kernel/syscall64.cpp kernel/ahci64.cpp kernel/nvme64.cpp kernel/hwui64.cpp kernel/drive64.cpp kernel/fat64.cpp kernel/fs64.cpp"
+SRCS_CORE="kernel/kernel64.cpp kernel/console64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp kernel/input.cpp kernel/input64.cpp kernel/mem64.cpp kernel/hwinfo64.cpp kernel/acpi64.cpp kernel/edid64.cpp kernel/display64.cpp kernel/fd64.cpp kernel/usermode64.cpp kernel/syscall64.cpp kernel/ahci64.cpp kernel/nvme64.cpp kernel/hwui64.cpp kernel/drive64.cpp kernel/fat64.cpp kernel/fs64.cpp kernel/sig64.cpp"
 #  ★ 批次 N：console64.cpp = 开机滚屏引导控制台（启动日志环形缓冲 + 回放 + dmesg）。
 #    进 CORE：安装介质与系统**两份内核都要**屏上跑一遍启动日志（安装介质走向导前、系统走桌面前）。
 SRCS_INSTALLER="$SRCS_CORE kernel/part64.cpp kernel/setup64.cpp kernel/vfs64.cpp"
@@ -117,6 +117,9 @@ SRCS_DESKTOP="$SRCS_DESKTOP kernel/desktopops64.cpp"
 SRCS_SYS="kernel/sysstate64.cpp kernel/config64.cpp kernel/session64.cpp kernel/panic64.cpp kernel/preload64.cpp kernel/update64.cpp"
 # ★ 批次 C：kernel/proc64.cpp（进程/地址空间）只进系统内核 —— 它依赖 task64/elf64/vfs64。
 SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/proc64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp kernel/hda64.cpp"
+# ★ A4-5：kernel/sig64.cpp（信号投递）在 **SRCS_CORE** 里加（见上面那行）—— 两份内核都要链它：
+#   syscall64.cpp 的 13/14/15 号是**强引用**它（安装介质内核没有进程表，sig64 内部对 proc64 的访问
+#   全部是弱引用 + 判空 -> 那时它只做参数校验，如实不投递，绝不假装成功）。
 # elf64.cpp = ELF64 加载器：**只进系统内核**（安装介质不需要它；它内嵌的 hello.elf 是系统程序）
 # apic64.cpp = LAPIC + IOAPIC 接管中断路由：**只进系统内核**（安装链保持纯 8259 PIC，
 #   避免影响安装介质内核的字节级断言；x86_64.cpp 对它的 EOI/掩码分派用 weak 引用，不链也不报错）
@@ -484,6 +487,20 @@ PYEVSHM
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/evshm.elf" "$BUILD/evshm_elf.o"
 cp "$BUILD/evshm_elf.o" "$BUILD/os/"
 echo "    内嵌 /evshm.elf = $(stat -c%s "$BUILD/evshm.elf") B（静态 ELF64，装载区 4GiB；proc64.cpp 幂等装进系统卷）"
+echo "==> ★ A4-5：信号投递演示程序（user/apps/sig64_demo.c -> build64/sig64.elf -> **内嵌系统内核**）"
+# 交付方式与 /evshm.elf 完全同构（复用同一批 user/lib 目标文件 EVSHM_OBJS，只是多编一个 .c）：
+# 静态 ELF64（链接脚本 user/apps/evshm_demo.ld）-> objcopy 平铺字节嵌进**系统内核** ->
+# 启动期由 kernel64.cpp 的 sig64_demo64() 幂等装进系统卷 /sig64.elf -> 以**真进程**跑
+# （它要 fork + signal + wait4 + 用户态异常，blob 路径没有进程上下文）。
+# 体积记账：这份 blob 只进**系统内核**（安装介质内核不链 proc64/elf64，也没有这些演示）。
+SIG64_DIR="$BUILD/uapps/sig64"
+mkdir -p "$SIG64_DIR"
+clang $EVSHM_UCFLAGS -c user/apps/sig64_demo.c -o "$SIG64_DIR/sig64_demo.o"
+$LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/apps/evshm_demo.ld \
+    -o "$BUILD/sig64.elf" $EVSHM_OBJS "$SIG64_DIR/sig64_demo.o"
+$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/sig64.elf" "$BUILD/sig64_elf.o"
+cp "$BUILD/sig64_elf.o" "$BUILD/os/"
+echo "    内嵌 /sig64.elf = $(stat -c%s "$BUILD/sig64.elf") B（静态 ELF64；kernel64.cpp 幂等装进系统卷再跑）"
 $NASM -f bin user/hello64.asm -o "$BUILD/hello64.bin"
 "$PY" tools/make_vap.py "$BUILD/hello64.bin" "$BUILD/hello.vap" hello
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/hello.vap" "$BUILD/hello_vap64.o"
@@ -545,7 +562,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
     "$BUILD"/fb.o "$BUILD"/font.o "$BUILD"/input.o "$BUILD"/input64.o "$BUILD"/mem64.o "$BUILD"/ata64.o "$BUILD"/part64.o "$BUILD"/setup64.o \
     "$BUILD"/fat64.o "$BUILD"/fs64.o "$BUILD"/drive64.o \
     "$BUILD"/bootx64_efi.o "$BUILD"/uefi64_bin.o \
-    "$BUILD"/hwinfo64.o "$BUILD"/acpi64.o "$BUILD"/edid64.o "$BUILD"/vfs64.o "$BUILD"/fd64.o "$BUILD"/usermode64.o "$BUILD"/syscall64.o \
+    "$BUILD"/hwinfo64.o "$BUILD"/acpi64.o "$BUILD"/edid64.o "$BUILD"/vfs64.o "$BUILD"/fd64.o "$BUILD"/usermode64.o "$BUILD"/syscall64.o "$BUILD"/sig64.o \
     "$BUILD"/ahci64.o "$BUILD"/nvme64.o "$BUILD"/hwui64.o \
     "$BUILD"/display64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o \
@@ -555,19 +572,19 @@ $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
     gui_rs/gui_rs.o \
     "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
-    "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o \
+    "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o \
     "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
     "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
     "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o "$BUILD/os"/explorer64.o \
     "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
     "$BUILD/os"/theme64.o "$BUILD/os"/gfx64.o "$BUILD/os"/img64.o \
     "$BUILD/os"/locklogin64.o "$BUILD/os"/userdb64.o \
+    "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o "$BUILD/os"/evshm_elf.o "$BUILD/os"/sig64_elf.o \
     "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o \
     "$BUILD/os"/icons64.o \
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
-    "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o "$BUILD/os"/evshm_elf.o \
     "$BUILD/os"/musl_hello_elf.o \
     "$BUILD/os"/ldvimtu_so.o "$BUILD/os"/libfoo_so.o "$BUILD/os"/dynhello_elf.o "$BUILD/os"/xmmsse_elf.o \
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/hda64.o \
@@ -608,7 +625,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/cr3exp/kernel64.o" "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
         gui_rs/gui_rs.o \
         "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
-        "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o \
+        "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o \
         "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
         "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
         "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o "$BUILD/os"/explorer64.o \
@@ -620,7 +637,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
         "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
         "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/cr3exp/proc64.o" \
-        "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o "$BUILD/os"/evshm_elf.o \
+        "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o "$BUILD/os"/evshm_elf.o "$BUILD/os"/sig64_elf.o \
         "$BUILD/os"/musl_hello_elf.o \
         "$BUILD/os"/ldvimtu_so.o "$BUILD/os"/libfoo_so.o "$BUILD/os"/dynhello_elf.o "$BUILD/os"/xmmsse_elf.o \
         "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/hda64.o \
@@ -682,6 +699,11 @@ echo "==> ★ A4-1：带 /bin/shell.bin 的演示盘 + \"内核里没有 shell �
       --drv "$BUILD/lua" --bin "$BUILD/lua.bin" --demo-dir user/lua/demo --probe "$BUILD/a44probe"
 "$PY" tools/gzip_pack_win.py --vol-in "$BUILD/luavol.img" --vol-out "$BUILD/sysvol.img" \
       --gzip "$BUILD/gzip" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+# ★ A4-5：**第四步**——把 Ring 3 编辑器装进同一块卷（/bin/edit + 验收夹具 + 1 MiB 大文件），
+#   并用编辑后的卷重拼演示盘（sysdisk.img 覆盖为含 /bin/edit 的那份；这一步之前的产物一个字节不动）。
+bash user/apps/edit/build_edit.sh "$BUILD"
+"$PY" tools/edit_pack_win.py --vol-in "$BUILD/sysvol.img" --vol-out "$BUILD/editvol.img" \
+      --edit "$BUILD/edit" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 # 断言：内核二进制里**不能**出现 shell.bin 的字节（交付方式必须是"系统卷里的文件"）。
 # 探针取 shell 中段的 64 字节（ELF 头/入口附近的字节模式到处都是，中段最稳）。
 "$PY" - "$BUILD/kernel64_os.bin" "$BUILD/shell.bin" <<'PYEOF'
@@ -728,6 +750,20 @@ for p in sys.argv[2:]:
               % (len(k), p.rsplit("/", 1)[-1], mid))
 raise SystemExit(bad)
 PYEOF3
+
+# ★ A4-5 的同一条纪律：**内核二进制里不能出现编辑器 /bin/edit 的字节**（它只从系统卷装载）。
+# 探针取 build64/edit 中段的 64 字节（ELF 头/入口附近到处都是，中段最稳）。
+"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/edit" <<'PYEOF4'
+import sys
+k = open(sys.argv[1], "rb").read()
+e = open(sys.argv[2], "rb").read()
+mid = len(e) // 2
+probe = e[mid:mid + 64]
+if len(probe) < 64 or probe in k:
+    sys.stderr.write("ERROR: system kernel contains /bin/edit bytes (delivery must be a volume file)\n")
+    raise SystemExit(1)
+print("    断言 OK：系统内核 %d B 里搜不到 /bin/edit 的 64B 探针（偏移 %d）；编辑器只从系统卷装载" % (len(k), mid))
+PYEOF4
 
 echo "==> ★ A4-2a：ring3 系统调用探针（chdir/rename/rmdir/dup2/utime + execve 失败路径的真证据）"
 # 为什么源码由构建脚本生成：本批只允许改 kernel/*、build64.sh、tests/a42a64_test.py、docs —— user/

@@ -22,6 +22,7 @@
 #include "mem_64.h"
 #include "usb64.h"      // USB 主机（UHCI）：kusb 内核线程只调 usb64_poll64()
 #include "syscall64.h"  // g_syscall64_kstack64：SYSCALL 入口专用栈顶（每任务一份，见 task_apply_ctx64）
+#include "sig64.h"      // ★ A4-5：信号投递钩子（IRQ0 出口 —— 纯用户态死循环也能收到信号）
 
 // ==================== ring3 槽位状态清理钩子（批次 B：缺陷根治）====================
 // usermode64.cpp 的 in_ring3 是**按任务槽位**的位图；ring3 进程被 kill 时不会从
@@ -454,6 +455,12 @@ extern "C" void schedule64(pt_regs64* r) {
     c->frame = (uint64_t)(uintptr_t)r;      // ★ 先存帧：这是"回到被打断现场"的唯一凭据
     c->ticks++;
     c->ticks++;
+    // ★ A4-5：IRQ0 出口投递（**必须**在 c->frame 存好之后、决定要不要换人之前做）：
+    //   被打断的现场是 ring3（r->cs == 0x2B）-> 直接改 r：本 tick iretq 回去就进 handler。
+    //   价值：纯用户态死循环（不调任何系统调用）的程序也能在 ~4ms 内收到信号 —— 只靠系统调用
+    //   出口投递的话，spinning 的进程永远收不到（这是"真投递"的判据之一）。
+    //   sig64_deliver64 对内核帧（cs=0x08）直接返回，不产生任何副作用。
+    sig64_deliver64(r, "irq");
     task_wake_scan();
     for (int i = 0; i < TASK64_MAX; i++) {
         if (i != g_cur && g_tasks[i].state == TASK64_DEAD) task_queue_reap(i);
@@ -480,6 +487,10 @@ extern "C" void schedule64(pt_regs64* r) {
     task64_fpu_switch64(c, n, (int)(c - &g_tasks[0]), next);  // ★ A3 下半：存旧任务的 xmm0-15/MXCSR、取新任务的
     task_apply_ctx64(n);                    // ★ rsp0 + syscall 栈顶 + CR3（每进程地址空间）+ FS 基址
     task_frame_guard64("sched", n, next);    // ★ 同上：目标帧不自洽就停下报告，不 iretq
+    // ★ A4-5：切进去之前对**目标任务**的保存帧做一次投递。为什么必须在 task_apply_ctx64 之后：
+    //   投递要往用户栈写信号帧、要用 user64_range_ok64 校验页表 —— 那两件事都要求"当前 CR3
+    //   已经是目标进程的"（apply_ctx 刚做完这件事）。
+    sig64_deliver64((pt_regs64*)(uintptr_t)n->frame, "irq-switch");
     task_switch_iret64(n->frame);           // 不返回
 }
 

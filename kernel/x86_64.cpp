@@ -301,6 +301,10 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) __attribute__((weak));
 // 蓝屏入口（kernel/panic64.cpp，本轮接线）：CPU 异常时把现场交过去画 BSOD。
 // weak：panic64.cpp 只进系统内核，安装程序内核里没有它 —— 那时保持"打点 + 停机"的老行为。
 extern "C" void panic64_cpu_exception64(uint64_t int_no, void* frame) __attribute__((weak));
+// ★ A4-5：ring3 的 CPU 异常 -> 信号（kernel/sig64.cpp）。返回 1 = 已处理（帧已改写：要么进了
+//   用户 handler、要么这个进程按"默认动作"死掉 —— **内核继续跑**，不再 PANIC 整机）。
+//   weak：保持"没链接这个模块 = 老行为（PANIC）"的既有性质；只有 ring3 的异常才会走它。
+extern "C" int sig64_user_fault64(uint64_t int_no, pt_regs64* r) __attribute__((weak));
 
 extern "C" void isr_handler64(pt_regs64* r) {
     const uint64_t no = r->int_no;
@@ -334,6 +338,10 @@ extern "C" void isr_handler64(pt_regs64* r) {
         return;
     }
     if (no < 32) {
+        // ★ A4-5：**先**问信号层 —— 用户态异常只杀该进程（#PF/#GP/#UD/#DE/... -> SIGSEGV/SIGILL/
+        //   SIGFPE），有 handler 就进 handler；不可恢复的（#DF/#TS/#MC）与内核态异常照旧 PANIC。
+        //   为什么放在打点之前：这条路径现在是"正常的进程生命周期事件"，不该再喊 [PANIC]。
+        if (sig64_user_fault64 && sig64_user_fault64(no, r)) return;
         // 把出错上下文打全：只知道"异常号"没法定位（UEFI 路径下曾只报 exception 13，
         // 靠 RIP 才认出是在哪条指令）。RIP/CS/RFLAGS/ERR 都来自中断帧。
         dbg64_str("[PANIC] cpu exception ");

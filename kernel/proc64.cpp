@@ -1,4 +1,4 @@
-// proc64.cpp - Vimtu64 进程与地址空间实现（每进程 CR3 + fork/execve/wait4/kill）
+// proc64.cpp - Vimtu64 进程与地址空间实现（每进程 CR3 + fork/execve/wait4/kill + 信号投递入口）
 //
 // 设计、页表共享策略、取舍的完整说明在 kernel/proc64.h 顶部（先读那份）。
 // 本文件只额外记三件容易踩的事：
@@ -60,16 +60,13 @@ static const int64_t P64_ENOSYS  = 38;
 // static_assert 钉住取值，同时消掉 -Wextra 的"未被引用"告警（本文件要求零告警）。
 static_assert(P64_EPERM == 1 && P64_EINTR == 4 && P64_EFAULT == 14, "P64_* 错误码表（= -errno）");
 
-// ---- 规模常量 ----
+// ---- 规模/超时常量 ----
 static const uint32_t PROC64_FORK_MAX_PAGES    = 256;   // fork 整页复制的页数上限（≈1MiB）
 static const int      PROC64_WAIT_TIMEOUT_SEC  = 5;     // wait4 有界等待（防挂死）
 static const int      PROC64_DEMO_TIMEOUT_SEC  = 12;    // 启动期演示的有界等待
 static const int      PROC64_PIPE_TIMEOUT_SEC  = 12;    // pipe 演示的有界等待（同一口径）
-// ★ A5 前置：/evshm.elf 演示的有界等待。为什么比其他演示长得多：这个演示要**等测试注入**
-//   键鼠事件（QEMU monitor sendkey / VMware VNC），注入发生在启动之后、脚本轮询到
-//   `[EVSHM] listen` 标记才开始 —— 给足两侧的余量，超时才有意义。
 static const int      PROC64_EVSHM_TIMEOUT_SEC = 90;
-static const int      PROC64_SIG_MAX           = 32;    // 记录型信号表（只记录不投递）
+static const int      PROC64_SIG_MAX           = SIG64_NSIG;   // ★ A4-5：信号位图宽度（32；真投递见 sig64.h）
 
 // ==================== 进程表 ====================
 struct Proc64 {
@@ -78,10 +75,11 @@ struct Proc64 {
     int32_t  ppid;
     uint32_t task_id;
     uint32_t exit_code;
-    uint32_t term_sig;          // 被哪个信号终止（0 = 正常退出）
-    uint32_t sigchld;           // 有子可收（子进程退出时置位；只记录不投递）
-    uint32_t sig_pending;       // 记录型：收到过哪些信号（位图，最多 32 个）
-    uint32_t alarm_sec;         // alarm() 记录的秒数（无投递）
+    uint32_t term_sig;          // 被哪个信号终止（0 = 正常退出；★ A4-5 起由 sig64 真投递时置位）
+    uint32_t death_sig;         // ★ A4-5：本进程"正在因为哪个信号而死"（proc64_task_entry64 把它交给 p64_exit64）
+    uint32_t sigchld;           // 有子可收（子进程退出时置位；SIGCHLD 交给既有 wait4，不投递）
+    int32_t  pgid;              // ★ A4-5：进程组 id（fork 继承；create 时 = 自己的 pid；setpgid(109) 改）
+    uint32_t alarm_sec;         // alarm() 记录的秒数（无投递；SIGALRM 不产生信号 —— 如实）
     uint64_t fs_base;           // IA32_FS_BASE（TLS；glibc 的 arch_prctl(ARCH_SET_FS)）
     uint64_t cr3;               // 该进程的页表根（物理地址）——切任务时装载
     uint64_t pml4_phys;         // 我们自己分配的 PML4 页（释放用）
@@ -92,12 +90,12 @@ struct Proc64 {
     uint64_t mmap_next;         // mmap 的 bump 分配器（每进程独立）
     uint64_t frame;             // 用户现场（pt_regs64，仅 fork 出的子进程/启动映像用）
     uint64_t entry;             // 最近一次装载的入口（readlink /proc/self/exe 相关日志用）
-    uint64_t sighand[PROC64_SIG_MAX];   // rt_sigaction 记录（只记录不投递）
+    Sig64State64 sig;                   // ★ A4-5：每进程信号状态（未决/屏蔽/handler/restorer；见 sig64.h）
     FdTable64* fdtab;                   // ★ 批次 D：每进程 fd 表（fd64.h；池由 fd64.cpp 管）
     // ★ P4：每进程凭证（uid/gid/euid/egid；root = 0）。fork/execve 继承，setuid/setgid/seteuid 改它；
     //   任务被调度时由 task64_cred_hook64 -> vfs64_set_proc_cred64 发布给 VFS（切回任务 0 恢复会话身份）。
     uint32_t uid, gid, euid, egid;
-    uint32_t sigmask_lo, sigmask_hi;    // rt_sigprocmask 记录
+    // （A4-5 起 sigmask/sighand/sig_pending 三份旧"记录型"字段由上面 Sig64State64 取代）
     char     name[PROC64_NAME_MAX];
     char     exe[PROC64_PATH_MAX];
     // ★ A4-2a：每进程**工作目录**（chdir(80) / getcwd(79) 的真值；相对路径由 syscall64 拼成绝对路径）。
@@ -818,6 +816,8 @@ int proc64_create64(const char* name, int ppid) {
     p->cr3     = p->pml4_phys;
     p->fs_base = 0;
     p64_strcpy_n(p->name, name ? name : "proc", PROC64_NAME_MAX);
+    p->pgid = (int32_t)p->pid;                          // ★ A4-5：新进程自成一个进程组（fork 会继承）
+    sig64_state_init64(&p->sig);                        // ★ A4-5：信号状态清零（handler 全 SIG_DFL）
     p64_strcpy_n(p->exe, "?", PROC64_PATH_MAX);
     p64_strcpy_n(p->cwd, "/", PROC64_CWD_MAX);          // ★ A4-2a：新进程的 cwd = 根
     {   // ★ P4：新进程**继承当前凭证**（内核启动期 = root；fork = 父进程；终端 run = 终端会话身份）
@@ -995,12 +995,15 @@ extern "C" void proc64_task_entry64(void* arg) {
     dbg64_nl();
     dbg64_line_end64();
     const uint64_t rc = user64_enter_frame64((const pt_regs64*)(uintptr_t)p->frame, p->name);
-    p64_exit64(p, (uint32_t)(rc & 0xFFULL), 0);
+    p64_exit64(p, (uint32_t)(rc & 0xFFULL), p->death_sig);   // ★ A4-5：被信号打死时把死因带进退出记录
     task_exit64();                                      // 不返回（任务侧回收交给 task64）
 }
 
 // ==================== 装载 ELF 并启动（启动期演示 / execve 都复用）====================
-int proc64_start_elf64(int pid, const char* path) {
+// 两个入口：
+//   proc64_start_elf64(pid, path)        —— argv = { path }（老行为，一字不改）；
+//   proc64_start_elf64_argv64(pid, path, argv, argc) —— ★ A4-5：带**真 argv**（编辑器要文件名参数）。
+int proc64_start_elf64_argv64(int pid, const char* path, const char* const* argv, uint32_t argc) {
     Proc64* p = p64_find64(pid);
     if (!p) return -1;
     if (!g_isolate64) { p64_shared_note64(); return -1; }
@@ -1012,8 +1015,7 @@ int proc64_start_elf64(int pid, const char* path) {
     elf64_forget64();
 
     uint64_t entry = 0, rsp = 0;
-    const char* argv[2] = { path, nullptr };
-    if (elf64_load_for_exec64(path, argv, 1, &entry, &rsp) != 0) {
+    if (elf64_load_for_exec64(path, argv, argc, &entry, &rsp) != 0) {
         task_set_current_mm64(0, 0);
         proc64_switch_to_kernel64();
         p64_log2("[PROC64] start FAILED reason=load path=", path);
@@ -1067,6 +1069,11 @@ int proc64_start_elf64(int pid, const char* path) {
         return -1;
     }
     return 0;
+}
+// 老入口：argv = { path }（行为与引入 argv 版之前逐字节一致 —— 现有演示都走这条）
+int proc64_start_elf64(int pid, const char* path) {
+    const char* argv[2] = { path, nullptr };
+    return proc64_start_elf64_argv64(pid, path, argv, 1u);
 }
 
 // ==================== fork ====================
@@ -1163,6 +1170,9 @@ int64_t proc64_fork64(pt_regs64* r) {
     c->brk_end   = par->brk_end;
     c->brk_limit = par->brk_limit;
     c->mmap_next = par->mmap_next;
+    // ★ A4-5：信号状态与进程组一起继承（handler/mask 继承 = POSIX；未决位**不**继承；pgid 继承）。
+    (void)sig64_state_copy64(&c->sig, &par->sig);
+    c->pgid      = par->pgid;
     c->fs_base   = par->fs_base;                        // TLS 基址继承（切换时装载）
     p64_strcpy_n(c->cwd, par->cwd[0] ? par->cwd : "/", PROC64_CWD_MAX);   // ★ A4-2a：cwd 继承
     c->fs_base   = par->fs_base;                        // TLS 基址继承（切换时装载）
@@ -1294,6 +1304,20 @@ int64_t proc64_execve64(pt_regs64* r, const char* path, const char* const* argv,
     p->mmap_next = 0;
     p->entry     = entry;
     p64_strcpy_n(p->exe, path, PROC64_PATH_MAX);
+    // ★ A4-5：execve 的信号语义（POSIX）：**被捕获的 handler 复位成 SIG_DFL**、SIG_IGN 保留、
+    //   屏蔽字保留、未决位清 0。为什么必须做：新映像里那个 handler 地址多半已经不存在了，
+    //   留着它等于埋一个"跳进垃圾地址"的雷（Linux 也是这么定的）。
+    {
+        for (int i = 1; i < SIG64_NSIG; i++) {
+            if (p->sig.handler[i] > SIG64_IGN64) {
+                p->sig.handler[i] = SIG64_DFL64;
+                p->sig.flags[i] = 0;
+                p->sig.restorer[i] = 0;
+                p->sig.act_mask[i] = 0;
+            }
+        }
+        p->sig.pending = 0;
+    }
 
     // 3) 改这一帧：syscall 出口直接回到用户态的**新入口**。
     //    syscall 指令路径的出口汇编取 0xA8(rip)->rcx、0xB8(rflags)->r11、0xC0(rsp)->rsp，
@@ -1367,11 +1391,7 @@ int64_t proc64_wait4(int pid, int* status_out, uint32_t options) {
             if (par) par->state = PROC64_RUNNING;
         }
     }
-
     const uint32_t code = c->exit_code;
-    // Linux 编码：status = (code & 0xFF) << 8。★ 如实标注差异：被信号终止的进程在 Linux 里是
-    // "低 7 位放信号号"（SIGTERM -> 15），本内核**按时说明的方案**改为"目标以退出码 143 结束"，
-    // 所以这里给出的是 (143 & 0xFF) << 8；信号号本身在 [PROC64] kill/exit 行里如实打出。
     const int status = (int)((code & 0xFFu) << 8);
     if (status_out) *status_out = status;
     const int rpid = (int)c->pid;
@@ -1390,51 +1410,27 @@ int64_t proc64_wait4(int pid, int* status_out, uint32_t options) {
     return (int64_t)rpid;
 }
 
-// ==================== kill ====================
+// ==================== kill（★ A4-5：转 sig64 的真投递）====================
+// 语义（单个进程 / 进程组 / 全部）与投递决策都在 sig64.cpp 的 sig64_sys_kill64 里；
+// 这里只保留"入口 + 隔离模式护栏"（共享地址空间模式下没有进程上下文，如实 -ENOSYS）。
+// ★ 行为变化（A4-5）：**允许自杀**（kill(getpid(), sig)）—— 投递点就在本系统调用返回用户态
+//   之前（syscall64 出口的 sig64_deliver64）；有 handler 就进 handler，没有就按默认动作终止。
 int64_t proc64_kill64(int pid, int sig) {
     if (!g_isolate64) { p64_shared_note64(); return -P64_ENOSYS; }
-    if (pid <= 0) return -P64_EINVAL;
-    if (sig <= 0 || sig >= 64) return -P64_EINVAL;
-    Proc64* t = p64_find64(pid);
-    if (!t) return -P64_ESRCH;
-    Proc64* cur = p64_current64();
-    if (cur && cur->pid == pid) {
-        p64_log31("[PROC64] kill self not supported pid=", (uint64_t)pid, " (no signal delivery)");
-        return -P64_EINVAL;
-    }
-
-    if (sig == 9 || sig == 15) {
-        // 立即终止路径（SIGKILL=9 / SIGTERM=15）：把目标任务打死（task_kill64 -> DEAD + 待回收），
-        // 然后释放它的地址空间并置 EXITED。为什么能立刻做：单核 + 我们正在跑，目标任务此刻
-        // 一定不在运行；它的非全局 TLB 项在切 CR3 时已经被刷掉，所以还页是安全的。
-        const uint32_t code = (sig == 15) ? 143u : 137u;
+    // ★ 保留旧的 `[PROC64] kill pid=<n> sig=<n>` 一行（**打点兼容**）：旧实现打的就是它，
+    //   既有验收脚本（tests/proc64_test.py：`[PROC64] kill pid=.. sig=15`）按它 grep；
+    //   这一行现在依然是真的（信号确实发给了这个 pid）—— 后面的 [SIG64] send/default action 是新增证据。
+    if (pid > 0) {
         dbg64_line_begin64();
         dbg64_str("[PROC64] kill pid=");
-        dbg64_dec((uint64_t)pid);
+        dbg64_dec((uint64_t)(uint32_t)pid);
         dbg64_str(" sig=");
-        dbg64_dec((uint64_t)sig);
-        dbg64_str(" task_id=");
-        dbg64_dec((uint64_t)t->task_id);
+        dbg64_dec((uint64_t)(uint32_t)(sig > 0 ? sig : 0));
         dbg64_nl();
         dbg64_line_end64();
-        if (t->task_id) (void)task_kill64(t->task_id);
-        p64_exit64(t, code, (uint32_t)sig);
-        return 0;
     }
-    // 其它信号：**只记录不投递**（本内核没有信号投递路径：没有用户栈上的信号帧、没有
-    // rt_sigreturn、没有 vDSO/restorer）。这里如实记录到进程的位图里，并打一行说明。
-    if (sig < PROC64_SIG_MAX) t->sig_pending |= (1u << sig);
-    dbg64_line_begin64();
-    dbg64_str("[PROC64] kill pid=");
-    dbg64_dec((uint64_t)pid);
-    dbg64_str(" sig=");
-    dbg64_dec((uint64_t)sig);
-    dbg64_str(" recorded=1 delivered=0");
-    dbg64_nl();
-    dbg64_line_end64();
-    return 0;
+    return sig64_sys_kill64(pid, sig);
 }
-
 // ==================== 每进程内存管理 ====================
 uint64_t proc64_brk64(uint64_t addr) {
     Proc64* p = p64_current64();
@@ -1537,26 +1533,107 @@ uint64_t proc64_get_fs_base64() {
     return p ? p->fs_base : 0;
 }
 
-// ==================== 信号（只记录不投递）====================
-int proc64_record_sigaction64(int sig, uint64_t handler) {
-    Proc64* p = p64_current64();
-    if (!p) return -P64_EINVAL;
-    if (sig <= 0 || sig >= PROC64_SIG_MAX) return -P64_EINVAL;
-    if (sig == 9 || sig == 19) return -P64_EINVAL;                      // SIGKILL/SIGSTOP 不可捕获
-    p->sighand[sig] = handler;
-    return 0;
+// ==================== ★ A4-5：信号（真投递）====================
+// 语义/帧布局/打点**全部在 kernel/sig64.h**；这里只提供"进程表视角"的访问器：
+//   * sig64.cpp 用弱引用它们（安装介质内核不链 proc64.cpp -> 那时它们是 0，sig64 如实降级）；
+//   * 谁杀谁、进程组怎么解析，见 sig64.cpp 的 sig64_sys_kill64。
+Sig64State64* proc64_sig_state_of64(int pid) {
+    Proc64* p = p64_find64(pid);
+    if (!p) return nullptr;
+    if (p->state == PROC64_FREE || p->state == PROC64_EXITED) return nullptr;
+    return &p->sig;
 }
-int proc64_record_sigmask64(uint64_t mask) {
+Sig64State64* proc64_sig_state_current64() {
     Proc64* p = p64_current64();
-    if (!p) return -P64_EINVAL;
-    p->sigmask_lo = (uint32_t)mask;
-    p->sigmask_hi = (uint32_t)(mask >> 32);
+    if (!p) return nullptr;
+    if (p->state == PROC64_FREE || p->state == PROC64_EXITED) return nullptr;
+    return &p->sig;
+}
+int proc64_pgid_of64(int pid) {
+    Proc64* p = p64_find64(pid);
+    return p ? (int)p->pgid : -1;
+}
+int proc64_proc_pid_at64(int idx) {
+    Proc64* p = p64_slot64(idx);
+    if (!p || p->state == PROC64_FREE) return -1;
+    return (int)p->pid;
+}
+// 杀**别的**进程：走既有"打死 + 立刻收尸"路径（task_kill64 -> DEAD/待回收；p64_exit64 置 EXITED）。
+// 为什么能立刻做：单核 + 我们正在跑，目标任务此刻一定不在运行；它的非全局 TLB 项在切 CR3 时
+// 已经被刷掉。返回 1 = 已终止。**当前进程**不能走这条路（见下面那个）。
+int proc64_sig_die_other64(int pid, uint32_t code, int sig) {
+    Proc64* t = p64_find64(pid);
+    if (!t) return 0;
+    Proc64* cur = p64_current64();
+    if (cur && cur->pid == (int32_t)pid) return 0;
+    dbg64_line_begin64();
+    dbg64_str("[PROC64] kill pid=");
+    dbg64_dec((uint64_t)t->pid);
+    dbg64_str(" sig=");
+    dbg64_dec((uint64_t)sig);
+    dbg64_str(" task_id=");
+    dbg64_dec((uint64_t)t->task_id);
+    dbg64_nl();
+    dbg64_line_end64();
+    if (t->task_id) (void)task_kill64(t->task_id);
+    p64_exit64(t, code, (uint32_t)sig);
+    return 1;
+}
+// 杀**当前**进程（默认动作 / 用户态异常）：把我的"死因"记进进程，然后**改写当前帧**让它回到
+// 内核蹦床（user64_exit_to_kernel64）—— 那是 ring3 回 ring0 的唯一正规出口：
+//   proc64_task_entry64 里的 user64_enter_frame64 会返回，接着 p64_exit64(p, 128+sig, death_sig)，
+//   退出码与 term_sig 都如实落到 wait4 能看到的地方（status = ((128+sig)&0xFF)<<8）。
+// r == nullptr（拿不到帧）时不能改写：返回 0，由调用方如实处理（绝不做半套）。
+int proc64_sig_die_current64(int sig, pt_regs64* r) {
+    Proc64* p = p64_current64();
+    if (!p || !r) return 0;
+    if (p->state == PROC64_EXITED) return 1;
+    p->death_sig = (sig > 0) ? (uint32_t)sig : 0u;
+    const uint32_t code = (uint32_t)(128 + p->death_sig);
+    dbg64_line_begin64();
+    dbg64_str("[SIG64] exit pid=");
+    dbg64_dec((uint64_t)p->pid);
+    dbg64_str(" sig=");
+    dbg64_dec((uint64_t)p->death_sig);
+    dbg64_str(" code=");
+    dbg64_dec((uint64_t)code);
+    dbg64_str(" by_signal=1");
+    dbg64_nl();
+    dbg64_line_end64();
+    // ★ 先看看这是哪条路径（syscall 指令帧的 int_no 是标记 0x180；int 0x80/中断帧是 0x80/异常号）：
+    //   syscall 指令路径用 sysret 出口，帧改成 ring0 之后必须改走内核蹦床（入口看这个全局开关）。
+    const bool insn_path = (r->int_no == 0x180ULL);
+    if (!user64_exit_to_kernel64(r, code)) return 0;
+    if (insn_path) g_syscall64_exit_to_kernel64 = 1;
+    return 1;
+}
+// setpgid(109) 的裁剪实现：pid == 0 -> 自己；pgid == 0 -> 用该进程的 pid 当新进程组。
+// ★ 本内核的"最小作业控制替代"：setpgid(0,0)（自立进程组）**同时**把它登记成终端会话的
+//   前台进程组（sig64_tty_set_fg64）—— 交互式编辑器靠这一步让终端 Ctrl+C 只打它、不连累 shell。
+int proc64_setpgid64(int pid, int pgid) {
+    Proc64* cur = p64_current64();
+    Proc64* t = (pid == 0) ? cur : p64_find64(pid);
+    if (!t) return -P64_ESRCH;
+    const int npg = (pgid == 0) ? (int)t->pid : pgid;
+    if (npg <= 0) return -P64_EINVAL;
+    if (pid != 0 && (!cur || cur->pid != (int32_t)pid)) {  // 只能改自己（没有会话/权限模型；如实）
+        return -P64_EPERM;
+    }
+    t->pgid = npg;
+    dbg64_line_begin64();
+    dbg64_str("[PROC64] setpgid pid=");
+    dbg64_dec((uint64_t)t->pid);
+    dbg64_str(" pgid=");
+    dbg64_dec((uint64_t)npg);
+    dbg64_nl();
+    dbg64_line_end64();
+    if (npg == (int)t->pid) sig64_tty_set_fg64(npg);      // 自立进程组 = 终端前台作业（见上）
     return 0;
 }
 int proc64_sig_pending64(int sig) {
     Proc64* p = p64_current64();
     if (!p || sig <= 0 || sig >= PROC64_SIG_MAX) return 0;
-    return (p->sig_pending >> sig) & 1u;
+    return (int)((p->sig.pending >> (uint32_t)sig) & 1ULL);
 }
 int proc64_alarm_set64(int sec) {
     Proc64* p = p64_current64();

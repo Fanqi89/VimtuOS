@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "vimtu64.h"
+#include <signal.h>   /* ★ A4-5：signal/sigaction/sigprocmask/kill/raise/fork/wait4/mmap/ioctl */
 
 int errno = 0;          /* 单线程运行时的全局 errno（无 TLS，见 errno.h 的说明） */
 
@@ -202,4 +203,73 @@ time_t time(time_t* tloc) {
     const time_t t = (time_t)(vimtu64_ticks() / VIMTU64_TICKS_HZ);
     if (tloc) *tloc = t;
     return t;
+}
+
+/* ==================== ★ A4-5：信号（rt_sigaction 13 / rt_sigprocmask 14 / kill 62 / setpgid 109）====================
+ * 口径：内核返回 -errno（syscall 指令路径），这里原样搬进 errno 并返回 -1。
+ * sigaction() 包装做两件调用方不该操心的事：
+ *   1) 自动把 act->restorer 填成 __v64_sigreturn_stub（内核拿它当 handler 的返回地址）；
+ *   2) 若调用方给的是 NULL flags，保留 0（不偷偷加标志）。
+ * 为什么 errno 口径是 -errno：这三个号走 **Linux 号段**（syscall 指令），与 4/5/6/8 等一致。 */
+int sigaction(int sig, const struct sigaction* act, struct sigaction* oldact) {
+    struct sigaction a;
+    const struct sigaction* ap = act;
+    if (act) {
+        a = *act;                                   /* 结构体 32 字节：按值拷一份，改副本 */
+        if (!a.restorer) a.restorer = __v64_sigreturn_stub;
+        ap = &a;
+    }
+    const long r = __v64_syscall(13, (long)sig, (long)(uintptr_t)ap, (long)(uintptr_t)oldact, 8, 0);
+    return (r < 0) ? v64_errno_lx(r) : 0;
+}
+void (*signal(int sig, void (*handler)(int)))(int) {
+    struct sigaction a;
+    a.handler = handler; a.flags = 0; a.restorer = __v64_sigreturn_stub; a.mask = 0;
+    struct sigaction old;
+    if (sigaction(sig, &a, &old) != 0) return SIG_ERR;
+    return old.handler;
+}
+int sigprocmask(int how, const sigset_t* set, sigset_t* oldset) {
+    const long r = __v64_syscall(14, (long)how, (long)(uintptr_t)set, (long)(uintptr_t)oldset, 8, 0);
+    return (r < 0) ? v64_errno_lx(r) : 0;
+}
+int kill(int pid, int sig) {
+    const long r = __v64_syscall(62, (long)pid, (long)sig, 0, 0, 0);
+    return (r < 0) ? v64_errno_lx(r) : 0;
+}
+int raise(int sig) {
+    /* 给**自己**发：投递点是本系统调用的出口（内核 syscall 出口钩子），返回时 handler 已经在跑了 */
+    return kill(getpid(), sig);
+}
+int setpgid(int pid, int pgid) {
+    const long r = __v64_syscall(109, (long)pid, (long)pgid, 0, 0, 0);
+    return (r < 0) ? v64_errno_lx(r) : 0;
+}
+void (*vimtu64_sigreturn_addr(void))(void) { return __v64_sigreturn_stub; }
+
+/* ---- 进程（fork/wait4）：ring3 shell 的 run 用它们；信号演示也靠它们验证"父进程 wait4 看到 128+sig" ---- */
+int fork(void) {
+    const long r = __v64_syscall(57, 0, 0, 0, 0, 0);
+    return (r < 0) ? v64_errno_lx(r) : (int)r;
+}
+/* wait4 的 status 是 Linux 编码：正常退出 = (code & 0xFF) << 8；被信号打死 = 低 7 位放信号号
+ * （本内核如实实现的是"退出码 = 128+sig"，所以 WEXITSTATUS(status) 就是 128+sig —— 见
+ *  kernel/proc64.cpp 的 wait4 注释）。 */
+int wait4(int pid, int* status, int options, void* rusage) {
+    const long r = __v64_syscall(61, (long)pid, (long)(uintptr_t)status, (long)options,
+                                (long)(uintptr_t)rusage, 0);
+    return (r < 0) ? v64_errno_lx(r) : (int)r;
+}
+/* ---- ★ A4-5：mmap（9）—— 编辑器用它拿大块文本缓冲（1 MiB 文件不能用 4KB 的堆）---- */
+void* mmap(void* addr, size_t len, int prot, int flags, int fd, long off) {
+    (void)off;      /* 本内核的 mmap 是"每进程 bump 分配器"：没有文件后端，fd/off 忽略（如实） */
+    /* Linux x86_64 的 mmap：rax=9, rdi=addr, rsi=len, rdx=prot, r10=flags, r8=fd, r9=off
+     * 内核只认 len/prot/flags（arch 无关分派：lx64_mmap_disp64(a2,a4,a1)），fd/off 忽略并如实注明。 */
+    const long r = __v64_syscall(9, (long)(uintptr_t)addr, (long)len, (long)prot, (long)flags, (long)fd);
+    return (r < 0) ? (void*)0 : (void*)(uintptr_t)r;
+}
+/* ---- 终端 ioctl（16）：编辑器进入/退出 raw 模式用 TCGETS/TCSETS ---- */
+int ioctl(int fd, unsigned long req, void* arg) {
+    const long r = __v64_syscall(16, (long)fd, (long)req, (long)(uintptr_t)arg, 0, 0);
+    return (r < 0) ? v64_errno_lx(r) : 0;
 }

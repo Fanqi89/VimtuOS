@@ -41,3 +41,21 @@ __v64_syscall:
     .size  __v64_syscall, .-__v64_syscall
 
     .section .note.GNU-stack,"",@progbits
+
+/* ★ A4-5：信号返回桩（rt_sigreturn）。
+ * 内核在信号帧里把这个地址当**返回地址**压在用户栈上，所以 handler 的 `ret` 会落到这里。
+ * 这里只做一件事：`mov $15,%rax; syscall` —— 内核按用户栈上的帧（magic/sig/全部 GPR/rip/rflags/rsp/
+ * 原屏蔽字）精确恢复被信号打断的现场。返回之后用户代码从"被打断的那条指令"继续（就像没被打断过）。
+ * 不该返回：真返回了就说明内核没恢复帧（例如帧被踩坏 -> -EFAULT）—— 那就停住，绝不落到未映射地址。
+ * 为什么不在 C 里写：syscall 指令的约定（rax=号）必须由汇编保证，C 编译器不会替你摆好。 */
+    .text
+    .globl __v64_sigreturn_stub
+    .type  __v64_sigreturn_stub, @function
+__v64_sigreturn_stub:
+    movq    $15, %rax           /* rt_sigreturn */
+    syscall
+.Lsigret_hang:
+    jmp     .Lsigret_hang       /* 不该到这里 */
+    .size  __v64_sigreturn_stub, .-__v64_sigreturn_stub
+
+    .section .note.GNU-stack,"",@progbits

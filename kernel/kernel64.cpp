@@ -45,6 +45,7 @@
 #include "elf64.h"      // ELF64 加载器（自有静态 ELF64 程序 + syscall 指令路径；只进系统内核）
 #include "net64.h"      // 网络：e1000 驱动 + ARP/ICMP（只进系统内核；启动链里跑一次探测）
 #include "proc64.h"      // 进程/地址空间（批次 C：每进程 CR3 + fork/execve/wait4；只进系统内核）
+#include "sig64.h"       // ★ A4-5：信号投递（selftest / tty-int 自检 / 进程信号状态查询）
 #include "usb64.h"      // USB 主机：UHCI + HID 引导键盘（只进系统内核；按键注入 PS/2 同一队列）
 #include "apic64.h"    // LAPIC + IOAPIC 接管中断路由（只进系统内核；拿不到就留在 PIC）
 #include "smp64.h"     // SMP：启动 AP（INIT-SIPI-SIPI + 低端跳板；只进系统内核）
@@ -58,6 +59,8 @@
 #include "userdb64.h"
 // ---- 批次 A 后半的两个子系统（同样只进系统内核；os_boot_path 里注册 + 跑）----
 #include "preload64.h"   // 字形/图标预热（进桌面之前跑一轮，带 rdtsc64 实测证据）
+#include "sig64.h"       // ★ A4-5：信号投递（selftest / tty-int 自检 / 进程信号状态查询）
+uint32_t sig64_suppressed64();          // 打点预算节流统计（收尾打一行）
 // ---- Intel HDA 声卡（kernel/hda64.cpp；只进系统内核，与 net64/usb64 同一批）----
 //   class 0x0403 + BAR0 MMIO + CORB/RIRB + AFG->DAC->Pin + SD0 播放流；全程轮询。
 //   没声卡只打一行 [HDA64] not found，系统照常启动（面板/设置页按 ready 如实降级）。
@@ -87,6 +90,10 @@ extern "C" const uint8_t _binary_build64_user_fbdemo_bin_end[];
 //   系统卷再以真进程跑）。符号名由 objcopy 按输入路径生成：_binary_build64_evshm_elf_start/_end。
 extern "C" const uint8_t _binary_build64_evshm_elf_start[];
 extern "C" const uint8_t _binary_build64_evshm_elf_end[];
+// ★ A4-5：/sig64.elf（user/apps/sig64_demo.c 编出的静态 ELF64，由**本文件**的 sig64_demo64()
+//   幂等装进系统卷再以真进程跑）。符号名由 objcopy 按输入路径生成：_binary_build64_sig64_elf_*。
+extern "C" const uint8_t _binary_build64_sig64_elf_start[];
+extern "C" const uint8_t _binary_build64_sig64_elf_end[];
 // ★ A2：跑哪个 fbdemo —— 0（默认）= C 版（user/apps/fbdemo.c）；1 = A1 的汇编版（user/fbdemo.asm）。
 //   由 build64.sh 按环境变量 VIMTU_USER_FBDEMO 定义（默认 c；=asm 时切回汇编版，二进制行为一致）。
 #ifndef VIMTU_USER_FBDEMO_ASM
@@ -706,6 +713,175 @@ static void fpu64_demo64(const char* path) {
 
 #endif
 
+
+#ifndef VIMTU_INSTALLER_MEDIA
+// ==================== ★ A4-5：信号投递演示（/sig64.elf）+ Ring 3 编辑器（/bin/edit）====================
+// 为什么在 kernel64.cpp：这两段是**启动期演示**（幂等装卷 + 建进程 + 有界等待 + 打点），
+//   与其它演示（/proc64.elf、/evshm.elf、/musl_hello.elf）同一条纪律：
+//   * 信号逻辑本身在 kernel/sig64.cpp；这里只负责"跑起来 + 看结果"；
+//   * /sig64.elf 的字节是**内嵌 blob**（objcopy，build64.sh 段），启动期幂等装进系统卷；
+//   * /bin/edit **不进内核镜像**（卷里的文件，tools/edit_pack_win.py 写的）—— 内核只按路径
+//     去卷里找，找不到就如实打一行 skipped（绝大多数夹具盘没有它）。
+static int sig64_install64(const char* path) {
+    const uint32_t bytes = (uint32_t)(_binary_build64_sig64_elf_end - _binary_build64_sig64_elf_start);
+    if (bytes < 64) { dbg64_str("[SIG64] install FAILED reason=blob\n"); return -1; }
+    const int sys = vfs64_system_slot64();
+    if (sys < 0) { dbg64_str("[SIG64] install FAILED reason=system-slot\n"); return -1; }
+    uint32_t t = 0, sz = 0;
+    if (vfs64_stat_on64(sys, path, &t, &sz) == 0) {
+        dbg64_line_begin64();
+        dbg64_str("[SIG64] install skipped (exists) path=");
+        dbg64_str(path);
+        dbg64_str(" size=");
+        dbg64_dec(sz);
+        dbg64_nl();
+        dbg64_line_end64();
+        return 0;
+    }
+    const int w = vfs64_write_on64(sys, path, _binary_build64_sig64_elf_start, (int)bytes);
+    if (w != (int)bytes) { dbg64_str("[SIG64] install FAILED reason=write\n"); return -1; }
+    dbg64_line_begin64();
+    dbg64_str("[SIG64] install ok path=");
+    dbg64_str(path);
+    dbg64_str(" bytes=");
+    dbg64_dec(bytes);
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+// /sig64.elf 是**真进程**（fork + signal + wait4 + 用户态异常），有界等待（30 秒）。
+// 额外做一件事（终端 Ctrl+C 的端到端证据）：轮询演示进程的 SIGINT handler —— 一旦装好，就调
+//   sig64_tty_int64()（**与终端窗口按键同一条路径**：前台进程组 -> SIGINT，打点 src=tty-int）。
+//   为什么要这个握手：演示进程自己 setpgid(0,0) 登记成前台作业（见 kernel/sig64.h），必须等它
+//   把 handler 装好再打，否则默认动作会把它打死（那是另一条语义）。
+// 进程"是否已退出"怎么判：proc64_sig_state_of64(pid) 在 EXITED/FREE 时返回 nullptr —— 这就是
+//   信号模块给的可见性（内核这侧不需要动进程表内部）。
+static void sig64_demo64(const char* path) {
+    if (!user64_available64()) return;
+    if (vfs64_mount_system64(0, app64_main_part_lba64(0)) != 0) {
+        dbg64_str("[SIG64] demo skipped (no system volume)\n");
+        return;
+    }
+    if (sig64_install64(path) != 0) return;
+    const int sf = sig64_selftest64();
+    dbg64_line_begin64();
+    if (sf == 0) {
+        dbg64_str("[SIG64] selftest PASS\n");
+    } else {
+        dbg64_str("[SIG64] selftest FAIL mask=");
+        dbg64_dec((uint64_t)sf);
+        dbg64_nl();
+    }
+    dbg64_line_end64();
+    const int pid = proc64_create64("sigdemo", 0);
+    if (pid < 0) { dbg64_str("[SIG64] demo skipped (create failed)\n"); return; }
+    if (proc64_start_elf64(pid, path) != 0) {
+        proc64_destroy64(pid);
+        dbg64_str("[SIG64] demo skipped (start failed)\n");
+        return;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[SIG64] demo start pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_str(" path=");
+    dbg64_str(path);
+    dbg64_nl();
+    dbg64_line_end64();
+    const uint64_t t0 = g_ticks64;
+    int tty_done = 0;
+    for (;;) {
+        Sig64State64* st = proc64_sig_state_of64(pid);
+        if (!st) break;                                    // 已退出（EXITED/FREE）
+        if (!tty_done && st->handler[SIG64_INT] > 1) {      // handler 装好了 -> 模拟终端 Ctrl+C
+            (void)sig64_tty_int64();
+            tty_done = 1;
+        }
+        if ((g_ticks64 - t0) > (uint64_t)PIT_HZ_64 * 30u) break;   // 30 秒上限（防挂死）
+        task_sleep64(2);
+    }
+    const int exited = (proc64_sig_state_of64(pid) == nullptr) ? 1 : 0;
+    if (!exited) (void)proc64_kill64(pid, 9);
+    if (proc64_find64(pid)) proc64_destroy64(pid);
+    dbg64_line_begin64();
+    dbg64_str("[SIG64] demo done pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_str(" exited=");
+    dbg64_dec((uint64_t)exited);
+    dbg64_str(" tty_int=");
+    dbg64_dec((uint64_t)tty_done);
+    dbg64_str(" ticks=");
+    dbg64_dec(g_ticks64 - t0);
+    dbg64_str(" log_suppressed=");
+    dbg64_dec(sig64_suppressed64());
+    dbg64_nl();
+    dbg64_line_end64();
+}
+// ---- 编辑器：/bin/edit 在卷里（不在内核里）。跑两轮（都由测试注入按键）：
+//   阶段 a：/etc/edit64_test.txt（小文件：改字符 -> Ctrl+S -> Ctrl+C -> Ctrl+S -> Ctrl+Q）
+//   阶段 b：/tcc/demo/edit1m.txt（1 MiB：只移动/翻页，不保存 -> 卷里那份必须逐字节不变）
+// 缺 /bin/edit 或测试文件就只打一行 skipped（**不假装跑过**）。
+static void edit64_one64(const char* bin, const char* file, const char* tag, uint32_t timeout_sec) {
+    uint32_t t = 0, sz = 0;
+    if (!bin || vfs64_stat(bin, &t, &sz) != 0) return;
+    if (file && vfs64_stat(file, &t, &sz) != 0) return;
+    const int pid = proc64_create64("edit", 0);
+    if (pid < 0) { dbg64_str("[EDIT64] demo skipped (create failed)\n"); return; }
+    const char* av[3];
+    av[0] = bin; av[1] = file; av[2] = nullptr;
+    if (proc64_start_elf64_argv64(pid, bin, av, (uint32_t)(file ? 2 : 1)) != 0) {
+        proc64_destroy64(pid);
+        dbg64_str("[EDIT64] demo skipped (start failed)\n");
+        return;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[EDIT64] demo phase=");
+    dbg64_str(tag);
+    dbg64_str(" start pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_str(" file=");
+    dbg64_str(file ? file : "?");
+    dbg64_nl();
+    dbg64_line_end64();
+    const uint64_t t0 = g_ticks64;
+    int exited = 0;
+    for (;;) {
+        Sig64State64* st = proc64_sig_state_of64(pid);
+        if (!st) { exited = 1; break; }
+        if ((g_ticks64 - t0) > (uint64_t)PIT_HZ_64 * (uint64_t)timeout_sec) break;
+        task_sleep64(2);
+    }
+    if (!exited) (void)proc64_kill64(pid, 9);
+    if (proc64_find64(pid)) proc64_destroy64(pid);
+    dbg64_line_begin64();
+    dbg64_str("[EDIT64] demo phase=");
+    dbg64_str(tag);
+    dbg64_str(" done exited=");
+    dbg64_dec((uint64_t)exited);
+    dbg64_str(" ticks=");
+    dbg64_dec(g_ticks64 - t0);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void edit64_demo64(const char* bin) {
+    if (!user64_available64()) return;
+    if (vfs64_mount_system64(0, app64_main_part_lba64(0)) != 0) {
+        dbg64_str("[EDIT64] demo skipped (no system volume)\n");
+        return;
+    }
+    uint32_t t = 0, sz = 0;
+    if (vfs64_stat(bin, &t, &sz) != 0) {
+        dbg64_line_begin64();
+        dbg64_str("[EDIT64] demo skipped (no /bin/edit in this volume) path=");
+        dbg64_str(bin);
+        dbg64_nl();
+        dbg64_line_end64();
+        return;
+    }
+    edit64_one64(bin, "/etc/edit64_test.txt", "a", 120u);
+    edit64_one64(bin, "/tcc/demo/edit1m.txt", "b", 120u);
+}
+#endif
+
 #ifndef VIMTU_INSTALLER_MEDIA
 // ==================== Rust 模块（gui_rs crate）：设计 Token + 主题配色 ====================
 // 位置与理由：
@@ -959,6 +1135,15 @@ static void rust64_boot_init64() {
                 //   fpu64_demo64：/xmmsse.elf 起两个进程交替跑 SSE（xmm0..15 + MXCSR 回归）。
                 dynlink64_demo64(DYNLINK_MAIN64);
                 fpu64_demo64(XMM64_PATH64);
+                // ---- ★ A4-5：信号投递（/sig64.elf）+ Ring 3 编辑器（/bin/edit）----
+                // 位置：整段 ring3 演示的最后（与 musl/dynlink/fpu 同一条纪律：多建进程的演示排最后，
+                //   最不容易搅动前面那些脚本的断言）。两者都只打自己的 [SIG64]/[EDIT64] 行。
+                //   * sig64：/sig64.elf 是**内嵌 blob**（objcopy，装进系统卷再跑）—— 任何系统内核
+                //     启动都会有它，所以它自己必须快（~3 秒：handler 演示 + tty-int 自检）；
+                //   * edit：/bin/edit **不在内核里**（卷里的文件）—— 只有带它的夹具（sysvol.img 系）
+                //     才会跑；缺 /bin/edit 或 /etc/edit64_test.txt 就只打一行 skipped。
+                sig64_demo64("/sig64.elf");
+                edit64_demo64("/bin/edit");
             } else {
                 proc64_init64();                                 // 仍然打点：mode=shared（如实）
                 (void)proc64_demo64("/proc64.elf");              // 只打一行 "demo skipped (shared address space mode)"

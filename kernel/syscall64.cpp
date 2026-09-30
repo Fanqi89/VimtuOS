@@ -145,8 +145,8 @@ int64_t  proc64_wait4(int, int*, uint32_t)                __attribute__((weak));
 int64_t  proc64_kill64(int, int)                          __attribute__((weak));
 int64_t  proc64_set_fs_base64(uint64_t)                   __attribute__((weak));
 uint64_t proc64_get_fs_base64()                           __attribute__((weak));
-int  proc64_record_sigaction64(int, uint64_t)             __attribute__((weak));
-int  proc64_record_sigmask64(uint64_t)                    __attribute__((weak));
+// ★ A4-5：进程组（setpgid(109)；sig64 的"终端前台进程组"靠它登记）
+int  proc64_setpgid64(int, int)                            __attribute__((weak));
 int  proc64_alarm_set64(int)                              __attribute__((weak));
 // ★ P4：每进程凭证（proc64.cpp；安装内核不链它 -> weak 为 0 -> 退化为会话身份/EPERM）
 int  proc64_get_cred64(uint32_t*, uint32_t*, uint32_t*, uint32_t*)    __attribute__((weak));
@@ -157,6 +157,8 @@ int  proc64_cwd64(char*, uint32_t)                        __attribute__((weak));
 int64_t proc64_shm_create64(uint64_t)                             __attribute__((weak));
 int64_t proc64_shm_map64(uint64_t, uint64_t, uint64_t, uint64_t)  __attribute__((weak));
 int  proc64_chdir64(const char*)                          __attribute__((weak));
+// ★ A4-5：信号投递（kernel/sig64.cpp）**两份内核都链**它，所以这里是强引用（不是弱引用）；
+//   它内部对 proc64 的访问才是弱引用（安装内核没有进程表 -> 只做参数校验，如实不投递）。
 static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
 #include "mem_64.h"         // PAGE_SIZE_64 / page_free_64 / PTE_*
 #include "debug64.h"
@@ -493,6 +495,10 @@ static int64_t sc64_fb_present64() {
 static void lx64_wr32(uint8_t* p, uint32_t v) {
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
 }
+// ★ A4-5：读 32 位（TCSETS 解析用户给的 struct termios；调用方已过 user64_range_ok64）
+static uint32_t lx64_rd32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
 static void lx64_wr64(uint8_t* p, uint64_t v) {
     lx64_wr32(p, (uint32_t)v);
     lx64_wr32(p + 4, (uint32_t)(v >> 32));
@@ -747,14 +753,31 @@ static int64_t lx64_brk64(uint64_t addr) {
     return (int64_t)addr;
 }
 
-// ---- 16）ioctl（★ A4-2a：最小控制台 tty —— TIOCGWINSZ / TCGETS / TCSETS*）----
+// ---- 16）ioctl（★ A4-2a 最小控制台 tty；★ A4-5 起 termios 是**真状态**）----
 // 语义表（对"虚拟控制台"（fd 0..2 空槽）与"/dev/console" tty 对象都一样）：
 //   TIOCGWINSZ(0x5413)  -> 25x80 像素 640x200（8x8 字体网格），写回 8B struct winsize
 //   TIOCSWINSZ(0x5414)  -> 0（接受但忽略：我们改不了分辨率；**不假装改了**）
-//   TCGETS(0x5401)      -> 写回 36B struct termios（ICANON|ECHO|ISIG|CS8|38400 + 默认控制字符）
-//   TCSETS/TCSETSW/TCSETSF(0x5402/03/04) -> 校验用户指针后返回 0（接受但忽略：没有真行规程）
+//   TCGETS(0x5401)      -> 写回**当前** 36B struct termios（初值 = ISIG|ICANON|ECHO + CS8|38400 …）
+//   TCSETS/TCSETSW/TCSETSF(0x5402/03/04) -> ★ A4-5：**存下来**（真状态，不是忽略）
 //   普通文件/pipe        -> -ENOTTY（与 Linux 一致）
+// ★ A4-5 为什么要有真状态：交互式编辑器要"进入 raw 模式、退出还原"，而"设了没有 / 还原了没有"
+//   必须可核对 —— 编辑器退出时再 TCGETS 一次，读回来的就是这里存的值（tests/edit64_test.py 断言）。
+// 如实边界：内核**没有**行规程消费者（按键不走 fd 0；终端 Ctrl+C 由 terminal64 按前台进程组投递），
+//   所以这份 termios 目前只被 TCGETS/TCSETS 读写 —— 这是"编辑器侧的语义与证据"，不是真 ttys。
 struct LxWinsize64 { uint16_t row, col, xpixel, ypixel; };
+static uint32_t g_tty64_iflag = 0x500u;    // ICRNL|IXON
+static uint32_t g_tty64_oflag = 0x5u;      // OPOST|ONLCR
+static uint32_t g_tty64_cflag = 0xBFu;     // CS8|CREAD|B38400
+static uint32_t g_tty64_lflag = 0xBu;      // ISIG|ICANON|ECHO
+static uint8_t  g_tty64_cc[19] = { 3, 28, 127, 21, 4, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+static void lx64_tty_fill64(uint8_t* t) {
+    for (uint32_t i = 0; i < 36; i++) t[i] = 0;
+    lx64_wr32(t + 0,  g_tty64_iflag);
+    lx64_wr32(t + 4,  g_tty64_oflag);
+    lx64_wr32(t + 8,  g_tty64_cflag);
+    lx64_wr32(t + 12, g_tty64_lflag);
+    for (uint32_t i = 0; i < 19; i++) t[17 + i] = g_tty64_cc[i];
+}
 static int64_t lx64_tty_ioctl64(uint64_t nr, uint64_t req, uint64_t arg) {
     if (req == 0x5413u) {                                          // TIOCGWINSZ
         if (!user64_range_ok64(arg, sizeof(LxWinsize64))) { syscall64_deny64(nr, arg); return -LX64_EFAULT; }
@@ -764,20 +787,21 @@ static int64_t lx64_tty_ioctl64(uint64_t nr, uint64_t req, uint64_t arg) {
         return 0;
     }
     if (req == 0x5414u) return 0;                                  // TIOCSWINSZ：忽略（我们改不了分辨率）
-    if (req == 0x5401u) {                                          // TCGETS：struct termios = 36 B
+    if (req == 0x5401u) {                                           // TCGETS：36 B 的**当前** termios
         if (!user64_range_ok64(arg, 36)) { syscall64_deny64(nr, arg); return -LX64_EFAULT; }
         uint8_t t[36];
-        for (uint32_t i = 0; i < 36; i++) t[i] = 0;
-        lx64_wr32(t + 0, 0x500u);                                  // c_iflag = ICRNL|IXON
-        lx64_wr32(t + 4, 0x5u);                                    // c_oflag = OPOST|ONLCR
-        lx64_wr32(t + 8, 0xBFu);                                   // c_cflag = CS8|CREAD|B38400
-        lx64_wr32(t + 12, 0xBu);                                   // c_lflag = ISIG|ICANON|ECHO
-        t[17] = 3; t[18] = 28; t[19] = 127; t[20] = 21; t[21] = 4; t[22] = 0; t[23] = 1;  // c_cc[VINTR..VMIN]
+        lx64_tty_fill64(t);
         lx64_copy_to_user64(arg, t, 36);
         return 0;
     }
-    if (req == 0x5402u || req == 0x5403u || req == 0x5404u) {       // TCSETS*：接受但忽略
+    if (req == 0x5402u || req == 0x5403u || req == 0x5404u) {       // TCSETS*：**存下来**（A4-5）
         if (!user64_range_ok64(arg, 36)) { syscall64_deny64(nr, arg); return -LX64_EFAULT; }
+        const uint8_t* p = (const uint8_t*)(uintptr_t)arg;
+        g_tty64_iflag = lx64_rd32(p + 0);
+        g_tty64_oflag = lx64_rd32(p + 4);
+        g_tty64_cflag = lx64_rd32(p + 8);
+        g_tty64_lflag = lx64_rd32(p + 12);
+        for (uint32_t i = 0; i < 19; i++) g_tty64_cc[i] = p[17 + i];
         return 0;
     }
     return -LX64_ENOTTY;                                           // 其它请求：与 Linux 对 tty 的口径一致
@@ -971,45 +995,24 @@ static int64_t lx64_kill_wrap64(uint64_t pid, uint64_t sig) {
     return proc64_kill64((int)(int32_t)pid, (int)(int32_t)sig);
 }
 
-// ---- 13/14/15）信号：只记录不投递 ----
-// 想清楚再写：本内核没有"用户栈上构造信号帧 + rt_sigreturn 恢复"这套机制，
-// 也没有 vDSO/restorer。所以 rt_sigaction/rt_sigprocmask **只记录**（handler 地址、屏蔽字），
-// kill 也不投递（除 KILL/TERM 的立即终止语义，见 proc64_kill64）；
-// rt_sigreturn 永远 -ENOSYS（框架会先拦 sigreturn，不会走到分发器，但这里仍如实返回）。
-// 安装介质内核没链 proc64.cpp（lx64_have_proc64() == false）：那就只做参数校验、不记录。
+// ---- 13/14/15）信号：★ A4-5 起**真投递**（实现全部在 kernel/sig64.cpp；本文件只做转调）----
+// 语义（帧布局、restorer、默认动作、阻塞/未决、异常映射）与打点格式见 kernel/sig64.h 的文件头。
+// 为什么把实现搬到 sig64.cpp：投递要在**三条**路径上发生（syscall 出口 / IRQ0 抢占出口 /
+//   CPU 异常），而异常那条在 x86_64.cpp —— 放在这里就变成三处互相看不见的复制。
+// 安装介质内核也链 sig64.cpp；它不链 proc64.cpp -> sig64 里的 proc64 访问器是弱引用（0），
+//   那时 rt_sigaction/rt_sigprocmask 只做参数校验（老行为），绝不假装投递成功。
 static int64_t lx64_rt_sigaction64(uint64_t sig, uint64_t act_va, uint64_t old_va, uint64_t sigsetsize) {
-    // struct sigaction { handler; flags(8B); restorer(8B); mask(8B) } = 32 字节（本内核只读 handler）
-    if (act_va && user64_range_ok64(act_va, 32)) {
-        const uint64_t handler = *(const uint64_t*)(uintptr_t)act_va;
-        if (lx64_have_proc64()) (void)proc64_record_sigaction64((int)sig, handler);
-    } else if (act_va) {
-        syscall64_deny64(13, act_va);
-        return -LX64_EFAULT;
-    }
-    if (old_va && user64_range_ok64(old_va, 32)) {
-        uint8_t z[32];
-        for (uint32_t i = 0; i < 32; i++) z[i] = 0;
-        lx64_copy_to_user64(old_va, z, 32);
-    }
-    (void)sigsetsize;
-    return 0;
+    return sig64_sys_rt_sigaction64(sig, act_va, old_va, sigsetsize);
 }
 static int64_t lx64_rt_sigprocmask64(uint64_t how, uint64_t set_va, uint64_t old_va, uint64_t sigsetsize) {
-    (void)how;
-    uint64_t mask = 0;
-    if (set_va) {
-        if (!user64_range_ok64(set_va, 8)) { syscall64_deny64(14, set_va); return -LX64_EFAULT; }
-        mask = *(const uint64_t*)(uintptr_t)set_va;
-        if (lx64_have_proc64()) (void)proc64_record_sigmask64(mask);
-    }
-    if (old_va) {
-        if (!user64_range_ok64(old_va, 8)) { syscall64_deny64(14, old_va); return -LX64_EFAULT; }
-        uint8_t b[8];
-        lx64_wr64(b, mask);
-        lx64_copy_to_user64(old_va, b, 8);
-    }
-    (void)sigsetsize;
-    return 0;
+    return sig64_sys_rt_sigprocmask64(how, set_va, old_va, sigsetsize);
+}
+// ---- 109）setpgid（★ A4-5：本内核"最小作业控制替代"的入口）----
+// 语义裁剪：没有会话（session）、没有权限模型，只允许改**自己**的进程组；setpgid(0,0) 会让该进程
+// 自立一个新进程组，并被 sig64 登记成**终端会话的前台进程组**（终端 Ctrl+C 只打它）。
+static int64_t lx64_setpgid64(uint64_t pid, uint64_t pgid) {
+    if (!lx64_have_proc64()) { syscall64_enosys_once64(109); return -LX64_ENOSYS; }
+    return (int64_t)proc64_setpgid64((int)(int32_t)pid, (int)(int32_t)pgid);
 }
 
 // ---- 4/6）stat / lstat：按路径（走 fs64 的统一分派；不区分符号链接 —— 本文件系统没有）----
@@ -1539,10 +1542,10 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 9:   return lx64_mmap_disp64(a2, a4, a1);                 // arch 无关：len/prot/flags/...
     case 10:  return lx64_mprotect_disp64(a1, a2, a3);
     case 11:  return lx64_munmap_disp64(a1, a2);                   // ★ 收口：这条 case 在 A4-4 的 WIP 里被误删 —— musl/libc 的 munmap 会掉进 default -> [SYSCALL] enosys nr=11（musl64_test/dynlink64_test 的"不得出现 enosys"断言必失败）。恢复。
-    case 12:  return lx64_brk_disp64(a1);
-    case 13:  return lx64_rt_sigaction64(a1, a2, a3, a4);          // 只记录不投递
-    case 14:  return lx64_rt_sigprocmask64(a1, a2, a3, a4);        // 只记录不投递
-    case 15:  break;                                               // rt_sigreturn：没有信号帧可恢复 -> -ENOSYS
+    case 12:  return lx64_brk_disp64(a1);                           // brk
+    case 13:  return lx64_rt_sigaction64(a1, a2, a3, a4);          // ★ A4-5：真注册（handler/restorer/mask）
+    case 14:  return lx64_rt_sigprocmask64(a1, a2, a3, a4);        // ★ A4-5：真屏蔽（阻塞 -> 挂未决）
+    case 15:  return sig64_sys_rt_sigreturn64(r);                  // ★ A4-5：按用户栈上的信号帧恢复现场
     case 16:  return lx64_ioctl64(nr, a1, a2, a3);
     case 19:  return lx64_readv64(nr, a1, a2, a3);                  // ★ A4-4：musl stdio 的 readv
     case 20:  return lx64_writev64(nr, a1, a2, a3);
@@ -1560,7 +1563,7 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 58:  return lx64_fork64(nr, r);                             // vfork：等同 fork（如实，见函数注释）
     case 59:  return lx64_execve64(r, a1, a2, a3);
     case 61:  return lx64_wait4_64(a1, a2, a3);
-    case 62:  return lx64_kill_wrap64(a1, a2);
+    case 62:  return lx64_kill_wrap64(a1, a2);                     // ★ A4-5：真投递（含进程组/自杀）
     case 63:  return lx64_uname64(nr, a1);
     case 74:  return lx64_fsync64(a1);
     case 79:  return lx64_getcwd64(nr, a1, a2);                       // 真：当前进程 cwd（★ A4-2a）
@@ -1584,9 +1587,9 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 106: return lx64_apply_cred64(0xFFFFFFFFu, (uint32_t)a1, 0xFFFFFFFFu, (uint32_t)a1);   // setgid
     case 107: return lx64_geteuid64();                              // ★ P4：真实 euid
     case 108: return lx64_getegid64();                              // ★ P4：真实 egid
+    case 109: return lx64_setpgid64(a1, a2);                       // ★ A4-5：setpgid（最小作业控制替代）
     case 110: return lx64_getppid64();
     case 113: return lx64_apply_cred64((uint32_t)a1, 0xFFFFFFFFu, (uint32_t)a2, 0xFFFFFFFFu);   // setreuid
-    case 114: return lx64_apply_cred64(0xFFFFFFFFu, (uint32_t)a1, 0xFFFFFFFFu, (uint32_t)a2);   // setregid
     case 117: return lx64_apply_cred64(0xFFFFFFFFu, (uint32_t)a1, 0xFFFFFFFFu, (uint32_t)a2);   // setresgid
     case 118: return lx64_apply_cred64((uint32_t)a1, 0xFFFFFFFFu, (uint32_t)a2, 0xFFFFFFFFu);   // setresuid
     case 120: return 0;                                             // getgroups：没有附加组（返回 0 个）
@@ -1649,6 +1652,7 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
         //   已释放的内核栈）。
         g_syscall64_exit_to_kernel64 = 0;
         r->rax = (uint64_t)ret;
+        sig64_deliver64(r, "syscall");                              // ★ A4-5：回用户态前投递未决信号
         return;
     }
 
@@ -1670,7 +1674,13 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
         break;
 
     case 3:                                                     // getpid()
-        ret = task_current_id_64 ? (int64_t)task_current_id_64() : 0;
+        // ★ A4-5：有进程上下文时返回**进程 pid**（与 Linux 号段 39 一致）—— 用户 lib 的 getpid()
+        //   走的就是这一号，而 raise()/setpgid(0,0)/kill(-pgid) 全都要真 pid（拿任务 id 会打错对象：
+        //   实测症状 = `[SIG64] send FAILED pid=223 (no such process)`，raise 根本没打到自己）。
+        //   没有进程上下文（任务 0 / 共享模式）时退回任务 id（老行为）。
+        ret = (lx64_have_proc64() && proc64_current_pid64 && proc64_current_pid64() > 0)
+                  ? (int64_t)proc64_current_pid64()
+                  : (int64_t)(task_current_id_64 ? task_current_id_64() : 0);
         break;
 
     case 4:                                                     // ticks()
@@ -1740,8 +1750,11 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
         ret = -1;
         break;
     }
-
     r->rax = (uint64_t)ret;
+    // ★ A4-5：int 0x80 路径也一样 —— 系统调用出口是"阻塞在 sleep/wait4 里的进程"最先能收到
+    //   信号的地方（帧是中断帧，iretq 会照改后的 rip/rsp 回到 handler 或内核蹦床）。
+    sig64_deliver64(r, "syscall-int80");
+    sig64_deliver64(r, "syscall-int80");
 }
 
 // ==================== MSR：打开 syscall/sysret ====================

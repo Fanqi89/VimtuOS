@@ -47,6 +47,8 @@
 //    proc64_destroy64：先把 CR3 切回内核地址空间（否则会 free 掉正在用的 PML4），再回收用户区
 //      + PDPT + PML4 + 记住的 syscall 栈/任务（任务侧由 task64 的回收路径负责）。
 //
+// 7) ★ A4-5 信号：每进程一份 Sig64State64（未决/屏蔽/handler/restorer），语义与打点见 kernel/sig64.h；
+//    本文件负责进程**进程组**（pgid）与"杀哪个进程"（sig64 通过下面那组访问器拿进程表）。
 // 串口打点（自动验收 tests/proc64_test.py grep，格式勿改）：
 //   [PROC64] init mode=isolated|shared cr3=<hex> proc_max=<n>
 //   [PROC64] create pid=<n> name=<s> cr3=<hex> ppid=<n>
@@ -64,6 +66,7 @@
 #include "x86_64.h"     // pt_regs64（fork/execve 要直接改帧）
 #include "input64.h"    // ★ A5 前置：每进程事件队列（Ev64Queue）内嵌在 Proc64 里
 #include "usermode64.h" // ★ A5 前置：shm 映射窗的位置由 USER64_CODE_VA64/WINDOW_BYTES64 算出来
+#include "sig64.h"      // ★ A4-5：每进程信号状态（Sig64State64）内嵌在 Proc64 里
 
 // ==================== 规模与状态 ====================
 static const int PROC64_MAX          = 16;    // 进程槽（与 TASK64_MAX 一致：1 进程 1 任务）
@@ -110,6 +113,9 @@ int  proc64_create64(const char* name, int ppid);
 // 在进程 p 的地址空间里装载 ELF 并建任务（任务入口 = ring3 跑该 ELF，退出后进程转 EXITED）。
 // 返回 0 = 已就绪（等调度器跑它）；-1 = 失败（已打印 reason）。
 int  proc64_start_elf64(int pid, const char* path);
+// ★ A4-5：同上，但初始栈按调用方给的 **argv** 摆（编辑器这类要文件名参数的程序用它）。
+// argv[0] 约定为主程序路径；argc 上限 16（elf64 的初始栈构建上限）。
+int  proc64_start_elf64_argv64(int pid, const char* path, const char* const* argv, uint32_t argc);
 // 当前进程的父 pid / 映像路径（getppid(110) 与 readlink("/proc/self/exe")(89) 用）。
 // 没有进程上下文时分别返回 0 与 0（= 没有值）。
 int  proc64_current_ppid64();
@@ -145,13 +151,13 @@ int64_t proc64_fork64(pt_regs64* r);
 // 成功时改写 r 让 syscall 出口直接回到用户态的**新入口**，返回 0；失败返回负错误码（r 未改）。
 int64_t proc64_execve64(pt_regs64* r, const char* path, const char* const* argv, uint32_t argc);
 // wait4：阻塞等待子进程（task_sleep64 轮询，见 proc64.cpp 的说明：不做等待队列）。
-// status_out != nullptr 时写入 Linux 编码的 status（(code & 0xFF) << 8 / 信号终止则写信号号）。
+// status_out != nullptr 时写入 Linux 编码的 status（(code & 0xFF) << 8；被信号终止的进程见下）。
 // options: 1 = WNOHANG。返回 pid；-ECHILD/-EAGAIN 等负错误码。
 int64_t proc64_wait4(int pid, int* status_out, uint32_t options);
-// kill：SIGKILL(9) 立即终止；SIGTERM(15) 记录并使目标以退出码 143 结束；其它信号只记录不投递。
+// kill：**真投递**（★ A4-5 起）：pid>0 单个进程；pid==0 自己的进程组；pid<0 = 进程组 |pid|（-1 = 全部）。
+//   实现见 kernel/sig64.cpp 的 sig64_sys_kill64；本函数只是 syscall64 的入口。
 int64_t proc64_kill64(int pid, int sig);
-
-// 进程侧的内存管理（brk/mmap/mprotect/munmap 走这里；每进程独立且可回收）
+// ---- 进程侧的内存管理（brk/mmap/mprotect/munmap 走这里；每进程独立且可回收）----
 uint64_t proc64_brk64(uint64_t addr);                                  // Linux brk 语义
 int64_t  proc64_mmap64(uint64_t len, uint64_t flags, uint64_t addr);   // 每进程 bump 分配器
 int64_t  proc64_mprotect64(uint64_t addr, uint64_t len, uint64_t prot);
@@ -167,9 +173,16 @@ uint64_t proc64_user_pages64(int pid);
 int64_t  proc64_set_fs_base64(uint64_t v);
 uint64_t proc64_get_fs_base64();
 
-// 信号：只记录不投递（真语义见 docs/应用层与系统调用说明.md 的"进程与地址空间"章节）
-int   proc64_record_sigaction64(int sig, uint64_t handler);
-int   proc64_record_sigmask64(uint64_t mask);
+// ==================== ★ A4-5：信号（真投递；语义/打点见 kernel/sig64.h）====================
+// sig64.cpp 通过下面这组访问器拿进程表（它是弱引用它们：安装介质内核不链 proc64.cpp）。
+// 每进程状态本体在 Proc64::sig（Sig64State64），生命周期与进程一致。
+Sig64State64* proc64_sig_state_of64(int pid);          // nullptr = 没有这个 pid / 槽空闲
+Sig64State64* proc64_sig_state_current64();            // nullptr = 没有进程上下文（任务 0/共享模式）
+int  proc64_sig_die_other64(int pid, uint32_t code, int sig);   // 杀**别的**进程（SIGKILL/默认动作）；1 = 已终止
+int  proc64_sig_die_current64(int sig, pt_regs64* r);           // 杀**当前**进程（改写帧回内核）；1 = 已安排
+int  proc64_pgid_of64(int pid);                                 // 进程组 id；-1 = 没有这个 pid
+int  proc64_proc_pid_at64(int idx);                             // 按进程表槽位取 pid；-1 = 空槽
+int  proc64_setpgid64(int pid, int pgid);                       // setpgid(109)：0 = 成功；负数 = -errno
 int   proc64_sig_pending64(int sig);          // 记录型查询（不投递）
 int   proc64_alarm_set64(int sec);            // 只记录（无投递）；返回上一次的秒数
 // ★ P4：每进程凭证（uid/gid/euid/egid；root = 0）。fork/execve 继承；setuid/setgid/seteuid 改它。
