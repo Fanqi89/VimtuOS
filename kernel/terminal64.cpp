@@ -97,6 +97,8 @@
 #include "rust64.h"     // ★ Rust 模块（gui_rs）：设计 Token + 主题配色（terminal `rust` 命令用它）
 // ★ 本批（P1c）：多用户骨架（userdb64）+ 锁屏/登录（loginctl lock）
 #include "userdb64.h"
+// ★ 本批：Intel HDA 声卡驱动（audio 命令：info / vol / mute / playtone / out）
+#include "hda64.h"
 #include "locklogin64.h"
 
 // ★ 版本号唯一真源 = build64.sh 的 VIMTUOS_VERSION（编译期宏，发布时只改那一处）。
@@ -721,6 +723,11 @@ static const char* HELP_EN =
     "  store set KEY VALUE   change the store in memory (run 'store flush' to persist)\n"
     "  store flush           persist to VimtuFS2 /store.a|/store.b (raw-disk fallback if no volume)\n"
     "  ping <ip>             ARP + ICMP echo x3 via e1000/net64 (e.g. ping 10.0.2.2); serial: [NET64] cmd ping\n"
+    "  audio [info]          Intel HDA sound card: codec/pin/format/volume + real playback (kernel/hda64.cpp)\n"
+    "  audio vol <0-100>     set the DAC amp gain (written + read back); 0 = mute; persisted via config64\n"
+    "  audio mute on|off     write the HDA amp mute bit (read back)\n"
+    "  audio playtone [ms]   synthesize a 440Hz square wave into SD0 (10..2000ms) + report LPIB/BCIS\n"
+    "  audio out [N]         list detected outputs / switch pin (real Pin Widget Control write)\n"
     "  cfg                   config64: type (int/str/bool) + value + default/store source + carrier/slot/gen\n"
     "  syslog                sysstate64 ring log (fixed 64-line circular log) + [SYS64] syslog lines=N\n"
     "  dmesg                 boot console log (16 KiB ring + head keep; screen + [CON64] dmesg[i] serial dump)\n"
@@ -795,6 +802,11 @@ static const char* HELP_ZH =
     "  store set KEY VALUE   改内存里的设置（要落盘请再敲 store flush）\n"
     "  store flush           落盘到 VimtuFS2 的 /store.a、/store.b（没有卷时才退回裸盘槽区）\n"
     "  ping <ip>             经 e1000/net64 发 ARP + 3 次 ICMP echo（例如 ping 10.0.2.2）；串口打 [NET64] cmd ping\n"
+    "  audio [info]          Intel HDA 声卡：编解码器/引脚/格式/音量 + 真播放（kernel/hda64.cpp）\n"
+    "  audio vol <0-100>     设 DAC 放大器增益（写入 + 回读）；0 = 静音；经 config64 持久化\n"
+    "  audio mute on|off     写 HDA 放大器静音位（回读）\n"
+    "  audio playtone [ms]   合成 440Hz 方波送 SD0（10..2000ms）+ 报 LPIB/BCIS 数字\n"
+    "  audio out [N]         列出检测到的输出源 / 切换引脚（真写 Pin Widget Control）\n"
     "  cfg                   config64 配置：类型（int/str/bool）+ 值 + 来源（默认/store）+ 载体/槽/世代号\n"
     "  cfg get KEY           单键查询；cfg set KEY VALUE（或 KEY=VALUE）；cfg save；cfg reset\n"
     "  syslog                sysstate64 的 ring log（固定 64 条循环日志）+ 串口打 [SYS64] syslog lines=N\n"
@@ -2660,6 +2672,247 @@ static void ts_put_hex(TerminalState* ts, uint64_t v, int digits) {
     ts_puts(ts, t);
 }
 
+// audio 命令的串口证据行（[HDA64] cmd audio ...；验收按行 grep）
+static void hda_ser_hex(uint32_t v, int digits) {
+    static const char* H = "0123456789abcdef";
+    dbg64_str("0x");
+    for (int i = digits - 1; i >= 0; i--) dbg64_putc(H[(v >> (i * 4)) & 0xFu]);
+}
+static void hda_serial_cmd2(const char* sub, const char* kvs, uint64_t v) {
+    dbg64_line_begin64();
+    dbg64_str("[HDA64] cmd audio "); dbg64_str(sub); dbg64_putc(' ');
+    dbg64_str(kvs); dbg64_dec(v);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void hda_serial_info_absent() {
+    dbg64_line_begin64();
+    dbg64_str("[HDA64] cmd audio info found=0 ready=0 driver_absent=1");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void hda_serial_info(const Hda64Info* h) {
+    dbg64_line_begin64();
+    dbg64_str("[HDA64] cmd audio info pci=");
+    dbg64_dec(h->bus); dbg64_putc(':'); dbg64_dec(h->dev); dbg64_putc('.'); dbg64_dec(h->fn);
+    dbg64_str(" found=1 ready="); dbg64_dec((uint64_t)(h->ready ? 1 : 0));
+    dbg64_str(" codecs="); dbg64_dec((uint64_t)h->codecs);
+    dbg64_str(" vid="); hda_ser_hex(h->vendor, 4);
+    dbg64_str(" did="); hda_ser_hex(h->device, 4);
+    dbg64_str(" dac="); hda_ser_hex(h->dac, 2);
+    dbg64_str(" pin="); hda_ser_hex(h->pin, 2);
+    dbg64_str(" out_en="); dbg64_dec((h->pin_ctl & 0x40u) ? 1 : 0);
+    dbg64_str(" fmt="); hda_ser_hex(h->fmt_get, 4);
+    dbg64_str(" conv="); hda_ser_hex(h->conv_get, 2);
+    dbg64_str(" vol="); dbg64_dec((uint64_t)(h->volume < 0 ? 0 : h->volume));
+    dbg64_str(" mute="); dbg64_dec((uint64_t)(h->muted ? 1 : 0));
+    dbg64_str(" amp_rb="); hda_ser_hex(h->amp_rb, 2);
+    dbg64_str(" outs="); dbg64_dec((uint64_t)hda64_outputs64());
+    dbg64_str(" sel="); dbg64_dec((uint64_t)(h->sel < 0 ? 0 : h->sel));
+    dbg64_str(" runs="); dbg64_dec(h->runs);
+    dbg64_str(" bytes="); dbg64_dec(h->bytes);
+    dbg64_str(" bcis="); dbg64_dec(h->bcis);
+    dbg64_str(" lpib="); dbg64_dec(h->lpib_max);
+    dbg64_str(" cmds="); dbg64_dec(h->cmds);
+    dbg64_str(" timeouts="); dbg64_dec(h->cmd_timeouts);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+// ---------- audio：Intel HDA 声卡（kernel/hda64.cpp 的真驱动；全程轮询）----------
+// audio | audio info | audio vol <0-100> | audio mute on|off | audio playtone [ms] | audio out [N]
+// 音量/静音/输出源直接写码器（Set Pin Widget Control / Set Amp Gain），playtone 送 PCM 后
+// 报控制器侧 LPIB/BCIS 数字。拿不到驱动时明确说 "driver absent" 并**返回失败**，绝不装成功。
+static bool cmd_audio(TerminalState* ts, const char* sub, const char* val) {
+    const Hda64Info* h = hda64_info64();
+    const bool ready = hda64_ready64() == 1;
+
+    // ---- audio / audio info：控制器/码器/DAC/Pin/格式/音量/输出源/引擎计数 ----
+    if (!sub || !sub[0] || st_eq(sub, "info")) {
+        if (!h->found) {
+            ts_puts(ts, gui64_tr("audio: driver absent (no PCI class 0x0403 controller) -> volume/source are memory-state only\n",
+                                 "audio: 驱动不在（PCI 上没找到 class 0x0403 控制器）-> 音量/输出源只是内存态\n"));
+            hda_serial_info_absent();
+            return false;
+        }
+        ts_puts(ts, gui64_tr("audio: HDA controller ", "audio: HDA 控制器 "));
+        ts_put_u64(ts, h->bus); ts_puts(ts, ":");
+        ts_put_u64(ts, h->dev); ts_puts(ts, ".");
+        ts_put_u64(ts, h->fn);
+        ts_puts(ts, " codecs="); ts_put_u64(ts, (uint64_t)h->codecs);
+        ts_puts(ts, gui64_tr(" ready=", " 就绪="));
+        ts_puts(ts, ready ? "1" : "0");
+        if (ready) {
+            ts_puts(ts, gui64_tr(" vid=", " 厂商=")); ts_put_hex(ts, h->vid_did, 8);
+            ts_puts(ts, gui64_tr(" dac=", " 输出转换器=")); ts_put_hex(ts, h->dac, 2);
+            ts_puts(ts, gui64_tr(" pin=", " 引脚=")); ts_put_hex(ts, h->pin, 2);
+            ts_puts(ts, gui64_tr(" out_en=", " 输出使能="));
+            ts_puts(ts, (h->pin_ctl & 0x40u) ? "1" : "0");
+            ts_puts(ts, gui64_tr(" fmt=", " 格式=")); ts_put_hex(ts, h->fmt_get, 4);
+            ts_puts(ts, " (48000/16/2)");
+        }
+        ts_putc(ts, (uint32_t)'\n');
+        if (ready) {
+            ts_puts(ts, gui64_tr("audio: outputs=", "audio: 输出源="));
+            ts_put_u64(ts, (uint64_t)hda64_outputs64());
+            for (int i = 0; i < hda64_outputs64(); i++) {
+                const bool cur = (i == hda64_get_output64());
+                ts_puts(ts, cur ? "[" : " ");
+                ts_puts(ts, hda64_output_name64(i));
+                ts_puts(ts, h->out_digital[i] ? gui64_tr("(digital,not played)", "(数字,本批不播)") : "");
+                ts_puts(ts, cur ? "]" : "");
+            }
+            ts_puts(ts, gui64_tr("  volume=", "  音量="));
+            ts_put_u64(ts, (uint64_t)(hda64_get_volume64() < 0 ? 0 : hda64_get_volume64()));
+            ts_puts(ts, "% mute=");
+            ts_puts(ts, hda64_get_mute64() == 1 ? "on" : "off");
+            ts_puts(ts, gui64_tr("  amp=", "  放大器=")); ts_put_hex(ts, h->amp_rb, 2);
+            ts_putc(ts, (uint32_t)'\n');
+            ts_puts(ts, gui64_tr("audio: engine runs=", "audio: 引擎 启动次数="));
+            ts_put_u64(ts, h->runs);
+            ts_puts(ts, gui64_tr(" bytes=", " 字节=")); ts_put_u64(ts, h->bytes);
+            ts_puts(ts, gui64_tr(" bcis=", " 周期完成=")); ts_put_u64(ts, h->bcis);
+            ts_puts(ts, gui64_tr(" lpib=", " 流位置=")); ts_put_u64(ts, h->lpib_max);
+            ts_puts(ts, gui64_tr(" cmds=", " 码器命令=")); ts_put_u64(ts, h->cmds);
+            ts_puts(ts, gui64_tr(" timeouts=", " 超时=")); ts_put_u64(ts, h->cmd_timeouts);
+            ts_putc(ts, (uint32_t)'\n');
+        }
+        hda_serial_info(h);
+        return true;
+    }
+
+    // ---- audio vol <0-100>：真写放大器（回读在 [HDA64] volume 行里）----
+    if (st_eq(sub, "vol") || st_eq(sub, "volume")) {
+        const int v = (val && val[0]) ? parse_dec(val) : -1;
+        if (v < 0 || v > 100) {
+            ts_puts(ts, gui64_tr("audio vol: usage: audio vol <0-100>\n", "audio vol: 用法: audio vol <0-100>\n"));
+            return false;
+        }
+        if (!ready) {
+            ts_puts(ts, gui64_tr("audio vol: driver absent -> NOT applied (memory-state only)\n",
+                                 "audio vol: 驱动不在 -> 不会生效（只是内存态）\n"));
+            hda_serial_cmd2("vol", "applied=0 driver_absent=1 pct=", (uint64_t)v);
+            return false;
+        }
+        const int got = hda64_set_volume64(v);
+        if (got < 0) { ts_puts(ts, gui64_tr("audio vol: HDA write failed (see [HDA64] error)\n", "audio vol: HDA 写入失败（见 [HDA64] error）\n")); return false; }
+        cfg64_set_sound_vol64(got);                       // 持久化（config64 -> store64）
+        ts_puts(ts, "audio vol = "); ts_put_u64(ts, (uint64_t)got);
+        ts_puts(ts, gui64_tr("% (HDA amp written + read back; persisted)\n", "%（HDA 放大器已写并回读；已持久化）\n"));
+        hda_serial_cmd2("vol", "applied=1 pct=", (uint64_t)got);
+        return true;
+    }
+
+    // ---- audio mute on|off：真写静音位 ----
+    if (st_eq(sub, "mute")) {
+        int on = -1;
+        if (val && (st_eq(val, "on") || st_eq(val, "1"))) on = 1;
+        else if (val && (st_eq(val, "off") || st_eq(val, "0"))) on = 0;
+        if (on < 0) {
+            ts_puts(ts, gui64_tr("audio mute: usage: audio mute on|off\n", "audio mute: 用法: audio mute on|off\n"));
+            return false;
+        }
+        if (!ready) {
+            ts_puts(ts, gui64_tr("audio mute: driver absent -> NOT applied\n", "audio mute: 驱动不在 -> 不会生效\n"));
+            hda_serial_cmd2("mute", "applied=0 driver_absent=1 on=", (uint64_t)on);
+            return false;
+        }
+        if (hda64_mute64(on) != 0) { ts_puts(ts, gui64_tr("audio mute: HDA write failed (see [HDA64] error)\n", "audio mute: HDA 写入失败（见 [HDA64] error）\n")); return false; }
+        ts_puts(ts, "audio mute = "); ts_puts(ts, on ? "on" : "off");
+        ts_puts(ts, gui64_tr(" (HDA amp mute bit written + read back)\n", "（HDA 放大器静音位已写并回读）\n"));
+        hda_serial_cmd2("mute", "applied=1 on=", (uint64_t)on);
+        return true;
+    }
+
+    // ---- audio playtone [ms]：合成方波 -> PCM -> SD0 流（报 LPIB/BCIS 数字）----
+    if (st_eq(sub, "playtone") || st_eq(sub, "beep")) {
+        int ms = 300;
+        if (val && val[0]) {
+            ms = parse_dec(val);
+            if (ms < 0) { ts_puts(ts, gui64_tr("audio playtone: usage: audio playtone [ms] (10..2000)\n", "audio playtone: 用法: audio playtone [ms]（10..2000）\n")); return false; }
+        }
+        if (ms < 10) ms = 10;
+        if (ms > 2000) ms = 2000;
+        if (!ready) {
+            ts_puts(ts, gui64_tr("audio playtone: driver absent -> no sound (not faked)\n",
+                                 "audio playtone: 驱动不在 -> 没有声音（不假装）\n"));
+            hda_serial_cmd2("playtone", "applied=0 driver_absent=1 ms=", (uint64_t)ms);
+            return false;
+        }
+        // 长操作（最多 2s + 轮询）：暂停看门狗（与 ping 同款）
+        panic64_watchdog_pause64();
+        const uint64_t b0 = h->bcis, r0 = h->runs;
+        const int rc = hda64_tone64(ms);
+        panic64_watchdog_unpause64();
+        const uint64_t b1 = hda64_info64()->bcis, r1 = hda64_info64()->runs;
+        if (rc != 0) {
+            ts_puts(ts, gui64_tr("audio playtone: stream failed (see [HDA64] stream done/error)\n",
+                                 "audio playtone: 流出错（见 [HDA64] stream done/error）\n"));
+            hda_serial_cmd2("playtone", "rc=-1 applied=0 ms=", (uint64_t)ms);
+            return false;
+        }
+        ts_puts(ts, "audio playtone "); ts_put_u64(ts, (uint64_t)ms);
+        ts_puts(ts, gui64_tr("ms -> SD0: runs ", "ms -> SD0: 启动 "));
+        ts_put_u64(ts, r1 - r0);
+        ts_puts(ts, gui64_tr(" blocks, bcis +", " 块, 周期完成 +"));
+        ts_put_u64(ts, b1 - b0);
+        ts_puts(ts, gui64_tr(" (controller-side proof)\n", "（控制器侧证据）\n"));
+        dbg64_line_begin64();
+        dbg64_str("[HDA64] cmd audio playtone ms="); dbg64_dec((uint64_t)ms);
+        dbg64_str(" runs+="); dbg64_dec(r1 - r0);
+        dbg64_str(" bcis+="); dbg64_dec(b1 - b0);
+        dbg64_str(" lpib="); dbg64_dec(hda64_info64()->lpib_max);
+        dbg64_str(" ok=1");
+        dbg64_nl();
+        dbg64_line_end64();
+        return true;
+    }
+
+    // ---- audio out [N]：列输出源 / 切换（真写 Pin Widget Control + 通路）----
+    if (st_eq(sub, "out") || st_eq(sub, "src") || st_eq(sub, "output")) {
+        const int n = hda64_outputs64();
+        if (!ready) {
+            ts_puts(ts, gui64_tr("audio out: driver absent (no detected output pin to switch)\n",
+                                 "audio out: 驱动不在（没有检测到的输出引脚可切）\n"));
+            hda_serial_cmd2("out", "applied=0 driver_absent=1 count=", (uint64_t)n);
+            return false;
+        }
+        if (!val || !val[0]) {
+            ts_puts(ts, gui64_tr("audio outputs: ", "audio 输出源: "));
+            for (int i = 0; i < n; i++) {
+                ts_puts(ts, i ? ", " : "");
+                ts_put_u64(ts, (uint64_t)i); ts_puts(ts, "=");
+                ts_puts(ts, hda64_output_name64(i));
+                if (i == hda64_get_output64()) ts_puts(ts, gui64_tr("(active)", "(当前)"));
+                if (h->out_digital[i]) ts_puts(ts, gui64_tr("(digital;not played this batch)", "(数字;本批不播)"));
+            }
+            ts_putc(ts, (uint32_t)'\n');
+            hda_serial_cmd2("out", "list=1 count=", (uint64_t)n);
+            return true;
+        }
+        const int idx = parse_dec(val);
+        if (idx < 0 || idx >= n) {
+            ts_puts(ts, gui64_tr("audio out: usage: audio out <0..n-1> (see 'audio out' for the list)\n",
+                                 "audio out: 用法: audio out <0..n-1>（先敲 audio out 看列表）\n"));
+            return false;
+        }
+        if (hda64_select_output64(idx) != 0) {
+            ts_puts(ts, gui64_tr("audio out: switch failed (see [HDA64] error/unsupported)\n",
+                                 "audio out: 切换失败（见 [HDA64] error/unsupported）\n"));
+            return false;
+        }
+        cfg64_set_sound_src64(idx);
+        ts_puts(ts, "audio out = "); ts_put_u64(ts, (uint64_t)idx);
+        ts_puts(ts, ": "); ts_puts(ts, hda64_output_name64(idx));
+        ts_puts(ts, gui64_tr(" (pin switched + persisted)\n", "（引脚已切换 + 已持久化）\n"));
+        hda_serial_cmd2("out", "applied=1 idx=", (uint64_t)idx);
+        return true;
+    }
+
+    ts_puts(ts, gui64_tr("audio: usage: audio [info] | audio vol <0-100> | audio mute on|off | audio playtone [ms] | audio out [N]\n",
+                         "audio: 用法: audio [info] | audio vol <0-100> | audio mute on|off | audio playtone [ms] | audio out [N]\n"));
+    return false;
+}
+
 // ---------- hw / hwinfo：硬件清单（hwinfo64 的 CPUID + PCI 枚举结果）----------
 static void cmd_hw(TerminalState* ts) {
     const HwInfo64* hw = hw_info64();
@@ -4460,6 +4713,10 @@ static void shell_exec(TerminalState* ts, const char* line) {
     } else if (st_eq(g_cmd, "ping")) {
         // 真：e1000 + ARP/ICMP（kernel/net64.cpp）。屏幕 + 串口都打 [NET64] cmd ping 行。
         ok = cmd_ping(ts, g_arg1);
+    } else if (st_eq(g_cmd, "audio")) {
+        // 真：Intel HDA 驱动（kernel/hda64.cpp）—— info / vol / mute / playtone / out
+        // 音量/静音/输出源写码器；playtone 送 PCM 并报 LPIB/BCIS（屏幕 + 串口 [HDA64] cmd audio）
+        ok = cmd_audio(ts, g_arg1, g_arg2);
     } else if (st_eq(g_cmd, "disk") || st_eq(g_cmd, "ata")) {
         // 真：ATA IDENTIFY（型号/容量；ata64 的读取自带 IRQ14 等待 + 超时回退轮询）+ VimtuFS2 卷几何
         ok = cmd_disk(ts);

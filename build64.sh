@@ -116,7 +116,7 @@ SRCS_DESKTOP="$SRCS_DESKTOP kernel/desktopops64.cpp"
 #   update64   = 标记文件 -> 应用动作 -> store/ring log/自动重启（不是真"升级包"，见 update64.h）
 SRCS_SYS="kernel/sysstate64.cpp kernel/config64.cpp kernel/session64.cpp kernel/panic64.cpp kernel/preload64.cpp kernel/update64.cpp"
 # ★ 批次 C：kernel/proc64.cpp（进程/地址空间）只进系统内核 —— 它依赖 task64/elf64/vfs64。
-SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/proc64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp"
+SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/proc64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp kernel/hda64.cpp"
 # elf64.cpp = ELF64 加载器：**只进系统内核**（安装介质不需要它；它内嵌的 hello.elf 是系统程序）
 # apic64.cpp = LAPIC + IOAPIC 接管中断路由：**只进系统内核**（安装链保持纯 8259 PIC，
 #   避免影响安装介质内核的字节级断言；x86_64.cpp 对它的 EOI/掩码分派用 weak 引用，不链也不报错）
@@ -452,7 +452,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o \
     "$BUILD/os"/musl_hello_elf.o \
     "$BUILD/os"/ldvimtu_so.o "$BUILD/os"/libfoo_so.o "$BUILD/os"/dynhello_elf.o "$BUILD/os"/xmmsse_elf.o \
-    "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
+    "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/hda64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD/os"/hello_vap64.o \
     "$BUILD/os"/user_demo64.o $ASM_FBDEMO_OBJ "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
@@ -505,7 +505,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o \
         "$BUILD/os"/musl_hello_elf.o \
         "$BUILD/os"/ldvimtu_so.o "$BUILD/os"/libfoo_so.o "$BUILD/os"/dynhello_elf.o "$BUILD/os"/xmmsse_elf.o \
-        "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o \
+        "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/hda64.o \
         "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
         "$BUILD/os"/hello_vap64.o \
         "$BUILD/os"/user_demo64.o "$BUILD/os"/user_fbdemo64.o "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \

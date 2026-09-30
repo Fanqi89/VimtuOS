@@ -58,6 +58,10 @@
 #include "userdb64.h"
 // ---- 批次 A 后半的两个子系统（同样只进系统内核；os_boot_path 里注册 + 跑）----
 #include "preload64.h"   // 字形/图标预热（进桌面之前跑一轮，带 rdtsc64 实测证据）
+// ---- Intel HDA 声卡（kernel/hda64.cpp；只进系统内核，与 net64/usb64 同一批）----
+//   class 0x0403 + BAR0 MMIO + CORB/RIRB + AFG->DAC->Pin + SD0 播放流；全程轮询。
+//   没声卡只打一行 [HDA64] not found，系统照常启动（面板/设置页按 ready 如实降级）。
+#include "hda64.h"
 #include "update64.h"    // update 子系统（标记 -> 应用 -> store/重启；不是真"升级包"，见其头文件）
 // ---- 文件资源管理器 / 此电脑（只进系统内核；外壳 gui64 的 app_mypc_open64 转调它）----
 #include "explorer64.h"  // "此电脑"+盘内浏览：纯逻辑自检在启动期跑一次（[EXPL] selftest PASS）
@@ -1026,6 +1030,12 @@ static void rust64_boot_init64() {
     }
     // 运行期轮询由 kusb 内核线程负责（见 kernel/task64.cpp），不占用这里的执行流。
     // （上面那行 usb64_init64() 的注释见下：找不到主控/没插设备只打点，系统照常启动。）
+    // ---- Intel HDA 声卡（kernel/hda64.cpp）：初始化 + 一次可验证的输出证据 ----
+    // 位置：usb 之后、gui64_run 之前（那之后不再返回）；没声卡只打一行 [HDA64] not found，
+    //   面板/设置页按 hda64_ready64() 如实降级（driver absent；内存态），系统照常启动。
+    // 自检会送一段已知 PCM（120ms 1kHz 方波）并断言控制器侧 LPIB/BCIS 前进（[HDA64] selftest PASS）。
+    hda64_init64();
+    (void)hda64_selftest64();
     // ---- 批次 A 后半：update 标记检查 + preload 预热（都在进桌面之前）----
     // 顺序：update 先查（有 pending 会应用 -> store/ring log -> /update.done -> 自动软重启，不返回）；
     //       没有 pending 就照常往下走，然后 preload 预热字形/图标（打点带 rdtsc64 实测证据）。

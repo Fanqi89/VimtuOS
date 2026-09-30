@@ -41,10 +41,10 @@
 //   [SET64] wall mode=.. name=.. target=desktop|lock sync=0|1
 //   [SET64] wall lag src=.. (lock_mode=<a> desktop_mode=<b>)  桌面/锁屏分别设置的状态行
 //   [SET64] color a=#.. b=#.. grad=0|1 built=WxH
+//   [SET64] sound vol=.. src=.. applied=1|0 via=hda64|reason=audio driver not implemented yet
 //   [SET64] dock len=.. auto=<0|1> icon=.. gap=.. size=.. applied=1   （另有 [DOCK64] geom 由外壳打）
 //   [SET64] wall mode=.. name=.. target=desktop|lock sync=0|1 lock_mode=<a> desktop_mode=<b>
 //   [SET64] default kind=<elf|vap|txt|video> app=.. persisted=1
-//   [SET64] sound vol=.. src=.. applied=0 reason=audio driver not implemented yet
 //   [SET64] eth link=.. state=.. mac=.. tx=.. rx=..
 //   [SET64] wifi present=0 wireless=0 pci_net=1 reason=no wireless hardware
 //   [USER64] avatar user=.. src=.. via=settings persisted=1        （头像；走 userdb64 落盘）
@@ -60,8 +60,9 @@
 // 诚实边界（能做的做，做不到的如实写，绝不伪造）：
 //   1) 分辨率切换真调 fb_set_mode()（Bochs VBE DISPI + 回读校验）；失败时页面与日志都写"失败"，
 //      字段永远显示实测值。刷新率只读（EDID 首选时序；没有 CRTC/0x3DA 控制路径）。
-//   2) 声音：**没有音频驱动**（HDA/AC97 都没有）—— 音量/输出源只进内存 + config64，
-//      打点明写 "audio driver not implemented yet"，绝不假装生效。
+//   2) 声音：**有真驱动**（kernel/hda64.cpp，Intel HDA）。有控制器且通路建立时音量/静音/输出源
+//      真写硬件（打点带 [HDA64] 回读值，applied=1 via=hda64）；拿不到驱动时如实降级到内存态 +
+//      config64，并明写 "audio driver not implemented yet" + "driver absent"，绝不假装生效。
 //   3) Wi-Fi：**没有无线硬件**（PCI 扫描 net=1 wired=1 wireless=0）+ 没有 802.11 驱动 —— 如实写
 //      "无无线硬件"，不编造 SSID 列表。
 //   4) 头像：img64 只解 PNG/BMP（JPEG 未实现，选到 .jpg 就如实报错）。
@@ -106,6 +107,8 @@
 #include "userdb64.h"        // 用户表 / 加盐哈希 / /etc/users.db
 #include "desktopops64.h"    // ★ P5：恢复默认桌面图标 / 显示隐藏分区（本页唯一新增入口）
 
+// ★ 本批：Intel HDA 声卡驱动（声音页的滑块/静音/输出源全部走真硬件）
+#include "hda64.h"
 // gui64.cpp 提供的 Dock 几何热重载（★ P3 新增的小接线：改完 Dock 长度/图标/间距立刻重算 + 再打
 // 一行 [DOCK64] geom 作为几何变化的证据；不动外壳的 Dock 绘制逻辑）。
 void gui64_dock_reload64();
@@ -177,7 +180,7 @@ enum {
     CID_THEME_REDUCE = 20,
     CID_RES_DROP = 30, CID_ZOOM_100 = 31, CID_ZOOM_125 = 32, CID_ZOOM_150 = 33,
     CID_DISPLAY_APPLY = 34,
-    CID_SND_VOL = 40, CID_SND_SPK = 41, CID_SND_HP = 42,
+    CID_SND_VOL = 40, CID_SND_SPK = 41, CID_SND_HP = 42, CID_SND_MUTE = 43,
     CID_PWR_SHUTDOWN = 50, CID_PWR_REBOOT = 51, CID_PWR_LOCK = 52,
     CID_DEF_ROW = 300,             // 300..319 = 4 个类型行 × 5 个应用项（默认应用页）
     CID_WALL_FIELD = 70, CID_WALL_APPLY = 71, CID_WALL_BUILTIN = 72, CID_WALL_PRESET = 73,
@@ -1011,30 +1014,61 @@ static void wall_set_path(const char* path) {
     gui64_invalidate();
 }
 
-// ==================== 声音（无音频驱动：内存态 + 持久化 + 诚实打点） ====================
+// ==================== 声音（真驱动 kernel/hda64.cpp；拿不到 = 内存态 + driver absent） ====================
+// 有驱动：音量/静音/输出源直接写 HDA（回读值一起打进 [SET64] 行）；没驱动：值只进内存 + config64，
+// 打点明写 "audio driver not implemented yet" + "driver absent"，绝不假装生效。
 static void sound_log_reason() {
+    if (hda64_ready64()) return;
     logln("[SET64] sound applied=0 reason=audio driver not implemented yet "
-          "(no HDA/AC97 driver; value kept in memory + config64 only, NOT written to hardware)");
+          "(driver absent: no HDA controller/usable path; value kept in memory + config64 only, "
+          "NOT written to hardware)");
 }
 static void sound_set_vol(int v, const char* how) {
     cfg64_set_sound_vol64(v);
-    panels64_set_volume64(v, how);          // 面板与设置页共用同一份内存态（panels 自己也会打点）
+    panels64_set_volume64(v, how);          // 面板与设置页共用同一份驱动状态（panels 自己也会打点）
+    const Hda64Info* h = hda64_info64();
+    const bool drv = hda64_ready64() != 0;
+    const int got = panels64_volume64();
     Buf b; b_init(&b);
-    b_str(&b, "[SET64] sound vol="); b_int(&b, v);
+    b_str(&b, "[SET64] sound vol="); b_int(&b, got);
     b_str(&b, " src="); b_str(&b, panels64_src_name64());
     b_str(&b, " how="); b_str(&b, how);
-    b_str(&b, " applied=0 reason=audio driver not implemented yet");
+    if (drv) {
+        b_str(&b, " applied=1 via=hda64 amp="); b_hex(&b, h->amp_rb, 2);
+        b_str(&b, " gain="); b_int(&b, (int)(h->amp_rb & 0x7Fu));
+        b_str(&b, "/"); b_int(&b, h->amp_steps);
+    } else {
+        b_str(&b, " applied=0 reason=audio driver not implemented yet");
+    }
     logln(b.b);
+    sound_log_reason();
 }
 static void sound_set_src(int src, const char* how) {
     cfg64_set_sound_src64(src);
     panels64_set_src64(src, how);
+    const bool drv = hda64_ready64() != 0;
     Buf b; b_init(&b);
     b_str(&b, "[SET64] sound src="); b_str(&b, panels64_src_name64());
+    b_str(&b, " idx="); b_int(&b, src);
     b_str(&b, " vol="); b_int(&b, panels64_volume64());
     b_str(&b, " how="); b_str(&b, how);
-    b_str(&b, " applied=0 reason=audio driver not implemented yet");
+    b_str(&b, drv ? " applied=1 via=hda64" : " applied=0 reason=audio driver not implemented yet");
     logln(b.b);
+    sound_log_reason();
+}
+// 静音开关（真写 HDA 放大器静音位；没驱动 = 内存态 + driver absent）
+static void sound_set_mute(int on, const char* how) {
+    const bool drv = hda64_ready64() != 0;
+    int applied = 0;
+    if (drv) applied = (hda64_mute64(on) == 0) ? 1 : 0;
+    Buf b; b_init(&b);
+    b_str(&b, "[SET64] sound mute="); b_int(&b, on ? 1 : 0);
+    b_str(&b, " how="); b_str(&b, how);
+    b_str(&b, " applied="); b_int(&b, applied);
+    if (drv) { b_str(&b, " via=hda64 amp="); b_hex(&b, hda64_info64()->amp_rb, 2); }
+    else b_str(&b, " reason=audio driver not implemented yet");
+    logln(b.b);
+    sound_log_reason();
 }
 
 // ==================== 导航绘制 ====================
@@ -1298,12 +1332,17 @@ static void page_display(const Lay* L, int x0, int y0) {
 static void page_sound(const Lay* L, int x0, int y0) {
     const Theme64Tokens* t = tk64();
     const bool zh = gui64_lang_zh();
-    page_title(L, x0 + L->cx, y0, zh ? "声音" : "Sound", zh ? "音量与输出源" : "Volume and output");
+    const bool drv = hda64_ready64() != 0;
+    const Hda64Info* h = hda64_info64();
+    page_title(L, x0 + L->cx, y0, zh ? "声音" : "Sound",
+               drv ? (zh ? "Intel HDA：音量 / 静音 / 输出源（真写硬件）"
+                         : "Intel HDA: volume / mute / output (real hardware)")
+                   : (zh ? "音量与输出源" : "Volume and output"));
     int y = L->card_y;
-    const int c1h = card_rows_h(L, 4);
+    const int c1h = card_rows_h(L, 5);
     card_begin(L, y, c1h);
     int ry = y + 12;
-    // 音量滑块
+    // 音量滑块（有驱动 = 驱动回读值；没驱动 = 内存态）
     {
         int rx = 0;
         row_label(L, ry, zh ? "音量" : "Volume", nullptr, &rx);
@@ -1316,30 +1355,65 @@ static void page_sound(const Lay* L, int x0, int y0) {
         ctl_reg(P_SOUND, CID_SND_VOL, CK_SLIDER, sx, ry + 6, sw, L->row_h - 12);
         ry += L->row_h;
     }
-    // 输出源
+    // 静音（有驱动 = 真写 HDA 放大器静音位；没驱动 = 内存态）
     {
         int rx = 0;
-        row_label(L, ry, zh ? "输出源" : "Output", zh ? "音箱 / 耳机（只改内存态）" : "speaker / headphones", &rx);
-        const char* items[2] = { zh ? "音箱" : "Speaker", zh ? "耳机" : "Headphones" };
-        const int w = 220, h = 32, bx = rx - w;
-        draw_choice(bx, ry + (L->row_h - h) / 2, w, h, items, 2, panels64_src_name64()[0] == 'h' ? 1 : 0, CID_SND_SPK);
-        ctl_reg(P_SOUND, CID_SND_SPK, CK_CHOICE, bx, ry + (L->row_h - h) / 2, w / 2, h);
-        ctl_reg(P_SOUND, CID_SND_HP, CK_CHOICE, bx + w / 2, ry + (L->row_h - h) / 2, w / 2, h);
+        row_label(L, ry, zh ? "静音" : "Mute",
+                  drv ? (zh ? "写 DAC 放大器静音位（回读）" : "HDA amp mute bit (read back)")
+                      : (zh ? "只改内存态（driver absent）" : "memory only (driver absent)"), &rx);
+        const char* items[2] = { zh ? "关" : "Off", zh ? "开" : "On" };
+        const int w = 220, hh = 32, bx = rx - w;
+        const int on = drv ? (hda64_get_mute64() == 1 ? 1 : 0) : 0;
+        draw_choice(bx, ry + (L->row_h - hh) / 2, w, hh, items, 2, on, CID_SND_MUTE);
+        ctl_reg(P_SOUND, CID_SND_MUTE, CK_CHOICE, bx, ry + (L->row_h - hh) / 2, w / 2, hh);
+        ctl_reg(P_SOUND, CID_SND_MUTE + 1, CK_CHOICE, bx + w / 2, ry + (L->row_h - hh) / 2, w / 2, hh);
+        ry += L->row_h;
+    }
+    // 输出源：有驱动 = 检测到的引脚（点选真切 Pin）；没驱动 = 音箱/耳机两个内存态选项
+    {
+        int rx = 0;
+        const int nsrc = drv ? hda64_outputs64() : 2;
+        row_label(L, ry, zh ? "输出源" : "Output",
+                  drv ? (zh ? "检测到的输出引脚（真写 Pin Widget Control）" : "detected pins (real Pin Widget Control)")
+                      : (zh ? "音箱 / 耳机（只改内存态）" : "speaker / headphones"), &rx);
+        const char* items[2] = {
+            (drv && nsrc > 0) ? hda64_output_name64(0) : (zh ? "音箱" : "Speaker"),
+            (drv && nsrc > 1) ? hda64_output_name64(1) : (drv ? "-" : (zh ? "耳机" : "Headphones")) };
+        const int w = 220, hh = 32, bx = rx - w;
+        const int sel = drv ? (hda64_get_output64() == 1 ? 1 : 0)
+                            : (panels64_src_name64()[0] == 'h' ? 1 : 0);
+        draw_choice(bx, ry + (L->row_h - hh) / 2, w, hh, items, 2, sel, CID_SND_SPK);
+        ctl_reg(P_SOUND, CID_SND_SPK, CK_CHOICE, bx, ry + (L->row_h - hh) / 2, w / 2, hh);
+        ctl_reg(P_SOUND, CID_SND_HP, CK_CHOICE, bx + w / 2, ry + (L->row_h - hh) / 2, w / 2, hh);
         ry += L->row_h;
         ry += L->row_h;
     }
+    // 驱动状态行（有驱动 = 真状态；没驱动 = 明写 driver absent）
     {
-        ui_text(L->card_x + 16, ry + 4,
-                zh ? "注意：音频驱动未实现（没有 HDA/AC97 驱动）：音量和输出源只保存在内存 + config64，"
-                     "绝不写硬件，也不会有声音。"
-                   : "audio driver not implemented yet: values are memory/config only.",
-                t->accent2);
+        Buf b; b_init(&b);
+        if (drv) {
+            b_str(&b, zh ? "驱动：HDA 码器 " : "driver: HDA codec ");
+            b_hex(&b, h->vid_did, 8);
+            b_str(&b, zh ? "  输出转换器=0x" : "  dac=0x"); b_int(&b, (int)h->dac);
+            b_str(&b, zh ? " 引脚=0x" : " pin=0x"); b_int(&b, (int)h->pin);
+            b_str(&b, zh ? " OUT_EN=" : " out_en="); b_int(&b, (h->pin_ctl & 0x40u) ? 1 : 0);
+            b_str(&b, " fmt="); b_hex(&b, h->fmt_get, 4);
+            b_str(&b, zh ? " 输出源=" : " outs="); b_int(&b, hda64_outputs64());
+            b_str(&b, zh ? " 音量/静音/输出源都写硬件" : " volume/mute/output write real hw");
+        } else {
+            b_str(&b, zh ? "注意：音频驱动不在（driver absent：没有 HDA 控制器或通路没建立）："
+                           "音量和输出源只保存在内存 + config64，绝不写硬件。"
+                         : "audio driver absent (no HDA controller / no usable path): "
+                           "values are memory/config only.");
+        }
+        ui_text(L->card_x + 16, ry + 4, b.b, drv ? t->text : t->accent2);
         ry += L->row_h;
     }
     {
         Buf b; b_init(&b);
         b_str(&b, zh ? "打点：" : "log: ");
-        b_str(&b, "audio driver not implemented yet");
+        b_str(&b, drv ? "[HDA64] volume/pin/stream + [SET64] applied=1 via=hda64"
+                      : "audio driver not implemented yet");
         b_str(&b, zh ? "（[PANEL64]/[SET64] 都明写，绝不假装生效）" : " ([PANEL64]/[SET64])");
         ui_text(L->card_x + 16, ry + 4, b.b, t->text_dim);
     }
@@ -2284,9 +2358,9 @@ static void page_about(const Lay* L, int x0, int y0) {
     }
     {
         ui_text(L->card_x + 16, ry + 4,
-                zh ? "[未实现] HDA/AC97 声卡驱动、EHCI/xHCI（USB 2.0/3.0）、无线网卡（802.11）、GPU 加速"
-                     "（无 2D/3D/DRM 驱动）"
-                   : "[missing] HDA/AC97 audio, EHCI/xHCI, 802.11 wireless, GPU acceleration",
+                zh ? "[未实现] EHCI/xHCI（USB 2.0/3.0）、无线网卡（802.11）、GPU 加速（无 2D/3D/DRM 驱动）"
+                     "；HDA 声卡本批已实现（Intel HDA，见声音页）"
+                   : "[missing] EHCI/xHCI, 802.11 wireless, GPU acceleration; HDA audio is implemented",
                 t->accent2);
         ry += L->row_h;
     }
@@ -2619,6 +2693,8 @@ static void set_click(Window* w, int cx, int cy0) {
             break;
         case CID_SND_SPK: sound_set_src(0, "settings-click"); break;
         case CID_SND_HP:  sound_set_src(1, "settings-click"); break;
+        case CID_SND_MUTE:    sound_set_mute(0, "settings-click"); break;
+        case CID_SND_MUTE + 1: sound_set_mute(1, "settings-click"); break;
         // ---- 电源 ----
         case CID_PWR_SHUTDOWN:
             logln("[SET64] power action=shutdown via=spec (ACPI S5 -> acpi_poweroff64)");

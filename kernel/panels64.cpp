@@ -4,8 +4,8 @@
 // "跟随开始菜单"，不是固定屏幕坐标；统一用 p2ui_popup64（双层浅阴影 + 亚克力 + 1px 高光边）。
 //
 // 诚实边界（不要假装成功）：
-//   * 声音：**没有声卡驱动**（没有 HDA/AC97 驱动），面板交互与数值都是内存态，每次改动打
-//     "[PANEL64] audio driver not implemented yet"。
+//   * 声音：**接了真驱动** kernel/hda64.cpp（Intel HDA）：音量/静音/输出源直接写码器，
+//     打点带回读值；拿不到驱动（没控制器 / 通路没建立）时保留内存态并明写 "driver absent"。
 //   * 无线：**没有无线网卡驱动**，WiFi 区如实显示"无无线硬件/未检测到无线网卡"，列表恒为空
 //     （panels64_wifi_add64() 是留给未来驱动的接口，本批没有任何调用者 -> 不编造列表）。
 //   * 设备插拔：数据源 = e1000 链路轮询（真实可插拔，QEMU `set_link` 能触发）+ usb64 的存储/设备计数
@@ -23,6 +23,8 @@
 #include "net64.h"        // net64_state_str64()
 #include "port.h"        // PCI 配置口（0xCF8/0xCFC）：**实时**读 e1000 的 STATUS.LU（见 e1000_live_link64）
 #include "usb64.h"        // usb64_msc_count64 / usb64_devices64（轮询差分）
+// ★ 本批：Intel HDA 声卡驱动（声音面板/设置页共用的真音量/静音/输出源）
+#include "hda64.h"
 #include "userdb64.h"
 
 // ==================== 小工具 ====================
@@ -546,39 +548,116 @@ static void device_poll64() {
     }
 }
 
-// ==================== 声音（内存态）====================
-int panels64_volume64() { return g_volume; }
-const char* panels64_src_name64() { return g_src == 1 ? "headphones" : "speaker"; }
+// ==================== 声音（真驱动 kernel/hda64.cpp；拿不到 = 内存态 + driver absent）====================
+// 有驱动：音量/静音/输出源直接写 HDA 放大器与 Pin（回读在 [HDA64] 打点里）；
+// 没驱动（没控制器 / 通路没建立）：保留原来的内存态数值，但每次改动都明写 driver absent，绝不装成功。
+int panels64_volume64() {
+    const int dv = hda64_ready64() ? hda64_get_volume64() : -1;
+    return dv >= 0 ? dv : g_volume;
+}
+static int panels_src_count64() {
+    return hda64_ready64() ? hda64_outputs64() : 2;      // 没驱动：音箱/耳机两个内存态选项
+}
+static int panels_src_active64() {
+    return hda64_ready64() ? hda64_get_output64() : g_src;
+}
+static const char* panels_src_label64(int i) {           // 按钮/打点用的短名
+    return hda64_ready64() ? hda64_output_name64(i) : (i == 1 ? "headphones" : "speaker");
+}
+// 面板按钮上的短标签（56px 宽，中文短名；驱动名太长放不下）
+static const char* panels_src_short64(int i) {
+    if (!hda64_ready64()) return i == 1 ? "耳机" : "音箱";
+    const char* n = hda64_output_name64(i);
+    if (s_eq(n, "speaker")) return "音箱";
+    if (s_eq(n, "headphones")) return "耳机";
+    if (s_eq(n, "line-out")) return "线路";
+    if (s_eq(n, "spdif") || s_eq(n, "digital")) return "数字";
+    if (s_eq(n, "hdmi")) return "HDMI";
+    return "输出";
+}
+static bool panels_src_avail64(int i) {
+    return hda64_ready64() ? (i >= 0 && i < hda64_outputs64()) : (i == 0 || i == 1);
+}
+const char* panels64_src_name64() {
+    const int a = panels_src_active64();
+    return panels_src_label64(a >= 0 ? a : 0);
+}
+static void panels_audio_absent_log64() {
+    if (g_audio_honest_logged) return;
+    g_audio_honest_logged = 1;
+    dbg64_line_begin64();
+    dbg64_str("[PANEL64] audio driver not implemented yet (driver absent: no HDA controller/usable path; "
+              "memory-state only; value NOT applied to hardware)");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+// 面板状态一句话：有驱动 = 真状态；没驱动 = 内存态 + driver absent（打开面板时打一次）。
+static void panels_audio_state_log64(const char* why) {
+    const Hda64Info* h = hda64_info64();
+    dbg64_line_begin64();
+    dbg64_str("[PANEL64] sound panel driver=");
+    dbg64_str(hda64_ready64() ? "hda64" : "absent");
+    dbg64_str(" dac=0x");
+    if (hda64_ready64()) dbg64_dec(h->dac); else dbg64_putc('0');
+    dbg64_str(" pin=0x");
+    if (hda64_ready64()) dbg64_dec(h->pin); else dbg64_putc('0');
+    dbg64_str(" outs=");
+    dbg64_dec((uint64_t)panels_src_count64());
+    dbg64_str(" vol=");
+    dbg64_dec((uint64_t)panels64_volume64());
+    dbg64_str(" applied=");
+    dbg64_dec(hda64_ready64() ? 1 : 0);
+    dbg64_str(" why=");
+    dbg64_str(why ? why : "-");
+    dbg64_nl();
+    dbg64_line_end64();
+    if (!hda64_ready64()) panels_audio_absent_log64();
+}
 void panels64_set_volume64(int v, const char* why) {
     if (v < 0) v = 0;
     if (v > 100) v = 100;
-    g_volume = v;
+    int applied = 0;
+    // ★ 驱动调用放在"开始写这一行日志"**之前**：hda64_set_volume64 自己会打 [HDA64] 行，
+    //   若夹在本行的 begin/end 之间，那一行的换行会把本行劈成两半（实测踩过）。
+    if (hda64_ready64()) {
+        const int got = hda64_set_volume64(v);
+        if (got >= 0) { v = got; applied = 1; }
+    } else {
+        g_volume = v;
+    }
     dbg64_line_begin64();
     dbg64_str("[PANEL64] sound volume=");
-    dbg64_dec((uint64_t)g_volume);
+    dbg64_dec((uint64_t)v);
     dbg64_str(" src=");
     dbg64_str(panels64_src_name64());
     dbg64_str(" why=");
     dbg64_str(why ? why : "-");
-    dbg64_str(" applied=0");                    // 没有声卡驱动 -> 不会真的作用到硬件
+    dbg64_str(" applied=");
+    dbg64_dec((uint64_t)applied);
+    if (applied) dbg64_str(" via=hda64");
     dbg64_nl();
     dbg64_line_end64();
-    if (!g_audio_honest_logged) {
-        g_audio_honest_logged = 1;
-        dbg64_line_begin64();
-        dbg64_str("[PANEL64] audio driver not implemented yet (memory-state only, no HDA/AC97 driver; value NOT applied to hardware)");
-        dbg64_nl();
-        dbg64_line_end64();
-    }
+    if (!hda64_ready64()) panels_audio_absent_log64();
 }
 void panels64_set_src64(int src, const char* why) {
-    g_src = (src == 1) ? 1 : 0;
+    int applied = 0;
+    if (hda64_ready64()) {
+        const int n = hda64_outputs64();
+        if (src < 0 || src >= n) src = 0;
+        applied = (hda64_select_output64(src) == 0) ? 1 : 0;
+    } else {
+        g_src = (src == 1) ? 1 : 0;
+    }
     dbg64_line_begin64();
     dbg64_str("[PANEL64] sound output src=");
     dbg64_str(panels64_src_name64());
     dbg64_str(" why=");
     dbg64_str(why ? why : "-");
-    dbg64_str(" applied=0 (audio driver not implemented yet)");
+    dbg64_str(" applied=");
+    dbg64_dec((uint64_t)applied);
+    dbg64_str(applied ? " via=hda64"
+                      : (hda64_ready64() ? " reason=hda64-switch-failed"
+                                         : " (audio driver not implemented yet)"));
     dbg64_nl();
     dbg64_line_end64();
 }
@@ -887,13 +966,7 @@ void panels64_toggle64(int which, const char* why) {
         }
         panels64_notif_mark_read64();
     } else if (which == PANEL64_SOUND) {
-        if (!g_audio_honest_logged) {
-            g_audio_honest_logged = 1;
-            dbg64_line_begin64();
-            dbg64_str("[PANEL64] audio driver not implemented yet (memory-state only, no HDA/AC97 driver; value NOT applied to hardware)");
-            dbg64_nl();
-            dbg64_line_end64();
-        }
+        panels_audio_state_log64("tab");      // 有驱动 = 真状态；没驱动 = 内存态 + driver absent
     } else if (which == PANEL64_NET) {
         net_log_open64();
     }
@@ -952,12 +1025,13 @@ void panels64_toggle64(int which, const char* why) {
             dbg64_str(" h=");
             dbg64_dec((uint64_t)ah);
             dbg64_str(" pct=");
-            dbg64_dec((uint64_t)g_volume);
+            dbg64_dec((uint64_t)panels64_volume64());
             dbg64_str(" src=");
             dbg64_str(panels64_src_name64());
             dbg64_str(" icon=left-center pct_right=1");
             dbg64_nl();
             dbg64_line_end64();
+            panels_audio_state_log64("open");          // 有驱动 = 真状态；没驱动 = driver absent
         }
     }
 }
@@ -1151,20 +1225,23 @@ static void draw_sound64() {
     p2ui_popup64(x, y, w, h, THEME64_POP_R, THEME64_POP_R, t, t->dock_bg,
                  t->dark ? THEME64_A_POP_DARK : THEME64_A_POP);
     const uint32_t txt = t->dark ? t->text : rgb(24, 26, 32);
-    // 上方：输出源切换（音箱 / 耳机）
+    // 上方：输出源切换（有驱动 = 检测到的输出源；没驱动 = 音箱/耳机两个内存态选项）
     p2ui_text64(x + 14, y + 10, "输出源", t->text_dim);
-    static const char* src_zh[2] = {"音箱", "耳机"};
+    const int nsrc = panels_src_count64();
+    const int asrc = panels_src_active64();
     for (int i = 0; i < 2; i++) {
         const int bw = 56, bh = 22;
         const int bx = x + 66 + i * (bw + 6), by = y + 8;
-        const bool on = (g_src == i);
+        const bool avail = (i < nsrc) && panels_src_avail64(i);
+        const bool on = avail && (asrc == i);
         p2ui_fill_mixed64(bx, by, bw, bh, bh / 2, bh / 2, on ? t->accent : t->dock_bg, on ? 200 : 90);
-        const int tw = text_w64(src_zh[i]);
-        text64(bx + (bw - tw) / 2, by + (bh - p2ui_line_h64()) / 2, src_zh[i],
-               on ? rgb(255, 255, 255) : txt);
+        const char* lab = avail ? panels_src_short64(i) : "-";
+        const int tw = text_w64(lab);
+        text64(bx + (bw - tw) / 2, by + (bh - p2ui_line_h64()) / 2, lab,
+               on ? rgb(255, 255, 255) : (avail ? txt : t->text_dim));
     }
     // 左侧声音图标（面板高度内水平居中 = 垂直居中）
-    p2ui_icon64(g_volume <= 0 ? P2UI_ICON_SOUND_MUTE : P2UI_ICON_SOUND,
+    p2ui_icon64(panels64_volume64() <= 0 ? P2UI_ICON_SOUND_MUTE : P2UI_ICON_SOUND,
                 x + 18, y + (h - 26) / 2 + 8, 26, p2ui_icon_color64(t), 255);
     // 滑轨（左小右大）+ 滑块 + 百分比
     int sx = 0, sy = 0, sw = 0, sh = 0;
@@ -1172,7 +1249,7 @@ static void draw_sound64() {
     const int track_y = sy + sh / 2 - THEME64_PANEL_SLIDER_H / 2;
     p2ui_fill_mixed64(sx, track_y, sw, THEME64_PANEL_SLIDER_H, THEME64_PANEL_SLIDER_H / 2,
                       THEME64_PANEL_SLIDER_H / 2, t->text_dim, 90);
-    const int fillw = sw * g_volume / 100;
+    const int fillw = sw * panels64_volume64() / 100;
     if (fillw > 0)
         p2ui_fill_mixed64(sx, track_y, fillw, THEME64_PANEL_SLIDER_H, THEME64_PANEL_SLIDER_H / 2,
                           THEME64_PANEL_SLIDER_H / 2, t->accent, 240);
@@ -1183,7 +1260,7 @@ static void draw_sound64() {
     p2ui_ring64(knob_x, track_y + THEME64_PANEL_SLIDER_H / 2, THEME64_PANEL_KNOB / 2 + 1, 1,
                 t->accent, hover_knob ? 255 : 160);
     char pct[8];
-    u_dec(pct, (uint64_t)g_volume);
+    u_dec(pct, (uint64_t)panels64_volume64());
     int pn = s_len(pct);
     pct[pn++] = '%';
     pct[pn] = 0;
@@ -1536,7 +1613,7 @@ static void panel_press64(int item, int mx, int my, int button) {
         g_sound_drag_logged = 0;
         int sx = 0, sy = 0, sw = 0, sh = 0;
         panels64_slider_rect64(&sx, &sy, &sw, &sh);
-        int v = sw > 0 ? (mx - sx) * 100 / sw : g_volume;
+        int v = sw > 0 ? (mx - sx) * 100 / sw : panels64_volume64();
         if (v < 0) v = 0;
         if (v > 100) v = 100;
         panels64_set_volume64(v, "drag");
@@ -1721,10 +1798,10 @@ void panels64_handle_mouse_move64(int mx, int my, int buttons) {
     if (g_drag == 1) {                                    // 音量滑块拖动
         int sx = 0, sy = 0, sw = 0, sh = 0;
         panels64_slider_rect64(&sx, &sy, &sw, &sh);
-        int v = sw > 0 ? (mx - sx) * 100 / sw : g_volume;
+        int v = sw > 0 ? (mx - sx) * 100 / sw : panels64_volume64();
         if (v < 0) v = 0;
         if (v > 100) v = 100;
-        if (v != g_volume) {
+        if (v != panels64_volume64()) {
             panels64_set_volume64(v, "drag");
             panel_dirty64(PANEL64_SOUND);
         }
@@ -1820,8 +1897,8 @@ int panels64_handle_key64(uint8_t c) {
         if (c == 0xFE) { cal_shift64(1, "arrow"); panel_dirty64(PANEL64_CAL); return 1; }
     }
     if (g_panel == PANEL64_SOUND) {
-        if (c == 0xFB || c == 0xFE) { panels64_set_volume64(g_volume - 5, "key"); panel_dirty64(PANEL64_SOUND); return 1; }
-        if (c == 0xFC || c == 0xFD) { panels64_set_volume64(g_volume + 5, "key"); panel_dirty64(PANEL64_SOUND); return 1; }
+        if (c == 0xFB || c == 0xFE) { panels64_set_volume64(panels64_volume64() - 5, "key"); panel_dirty64(PANEL64_SOUND); return 1; }
+        if (c == 0xFC || c == 0xFD) { panels64_set_volume64(panels64_volume64() + 5, "key"); panel_dirty64(PANEL64_SOUND); return 1; }
     }
     return 1;                                             // 弹窗打开时其它键不喂给应用
 }
@@ -1853,7 +1930,7 @@ int panels64_wheel64(int dz) {
         return 1;
     }
     if (g_panel == PANEL64_SOUND) {
-        panels64_set_volume64(g_volume + (dz > 0 ? 5 : -5), "wheel");
+        panels64_set_volume64(panels64_volume64() + (dz > 0 ? 5 : -5), "wheel");
         panel_dirty64(PANEL64_SOUND);
         return 1;
     }
