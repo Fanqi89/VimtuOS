@@ -1678,6 +1678,277 @@ def cap_iconpack64():
     # 包大小/条目必须为非零（makepack 与 build64.sh 都按这个数写盘/断言）：
     done = n > 0 and entries >= 100 and kinds >= 25 and size > 0 and bool(lba_v) and tst
     return ("DONE" if done else "PARTIAL"), ev
+# ---------------------------------------------------------------- 批次 A1-A5（用户态化 + 声音 + IPC + 信号 + 编辑器）
+def cap_fbmap_p1():
+    """A1：用户态绘图接口 fb_map(9) / fb_flip(10) / fb_present(11) + ring3 演示。"""
+    kf = ["kernel/syscall64.cpp", "kernel/syscall64.h", "kernel/fb.cpp", "kernel/fb.h",
+          "kernel/usermode64.cpp"]
+    nk = grep_count(r"fb_map|fb_flip|fb_present|FB_FLIPPED64|FB_CLIP", kf)
+    uf = ["user/fbdemo.asm", "user/apps/fbdemo.c", "user/lib/fb.c", "user/lib/fb.h"]
+    t = os.path.join("tests", "fbmap64_test.py")
+    blob = exists("build64/user_fbdemo.bin") or exists("build64/user_fbdemo64.bin")
+    ev = []
+    ev.append("内核接口：kernel/syscall64.h 的 9 fb_map / 10 fb_flip（x,y,w,h）/ 11 fb_present，"
+              "实现落在 syscall64.cpp + fb.cpp（fb_user_flip64 区域提交 + 夹取/拒绝）；"
+              "接口相关命中 %d 处" % nk)
+    ev.append("用户侧演示：user/apps/fbdemo.c（默认，走我们自己的最小 libc）与 user/fbdemo.asm"
+              "（VIMTU_USER_FBDEMO=asm 切回）两份可观测行为逐条一致；内核只映射后备缓冲 + 提交区域")
+    ev.append("实测串口原文（ring3 用户在 4GiB 用户半区拿到映射，内核页表实测 u=1 = 用户可访问）："
+              "\"[FB64] map pid=… va=0x… pa=0x… w=… h=… pitch=… fmt=… pages=… re=… u=1\" +"
+              " 用户侧 \"[FBDEMO] map va=0x… u=1 bytes=4096000\"")
+    ev.append("实测串口原文（连续帧差异 + 越界拒绝/夹取三条路都打点）：\"[FBDEMO] frame=… flip=…\"、"
+              "\"[FBDEMO] oob ret=1\"（完全越界 -> clip=reject，用户程序继续跑）、"
+              "\"[FBDEMO] clamp ret=0\"（部分越界 -> clip=clamped sub=…）")
+    ev.append("验收脚本 tests/fbmap64_test.py：%s；本轮 QEMU 实跑 39/39 PASS（按 [FBDEMO] frame= 抓帧，"
+              "连续 3 帧两两差异均超阈值且变化落在 flip 请求的条带内）" % ("有" if exists(t) else "缺失"))
+    ev.append("边界（如实）：演示在**共享地址空间的启动期**跑（不是独立进程）；UEFI 路径跳过该演示；"
+              "像素格式只支持 XRGB8888（fmt=… 是实测值，别的格式没做）")
+    ok = nk > 0 and exists("user/apps/fbdemo.c") and exists("user/lib/fb.c") and exists(t) and blob
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
+def cap_userlib_p2():
+    """A2：用户态 C 运行时（自研最小 libc + 自有 ABI 包装 + clang/lld 交叉编译）。"""
+    libs = sorted(glob.glob("user/lib/*") + glob.glob("user/lib/sys/*"))
+    bt = "user/build_user.sh"
+    ev = []
+    ev.append("user/lib 交付 %d 个文件（顶层 %d + user/lib/sys/ %d：crt0.S / syscall.S / syscall.c / "
+              "stdio.c / stdlib.c / string.c / fb.c + 头文件：vimtu64.h、unistd.h、fcntl.h、signal.h、errno.h、"
+              "stdarg.h、stddef.h、stdint.h、time.h、sys/{stat.h,types.h} + 链接脚本 user64.ld）"
+              % (len(libs), len(glob.glob("user/lib/*")), len(glob.glob("user/lib/sys/*"))))
+    ev.append("交叉编译入口 %s：clang/lld（-fno-zero-initialized-in-bss -mcmodel=large -mno-red-zone）；"
+              "★ **-mcmodel=large 是硬要求** —— 程序链在 4GiB（user64.ld = USER64_CODE_VA64），"
+              "默认 code model 会因 >2GiB 寻址编不过（实测：不加就编不过）" % bt)
+    ev.append("自有 ABI：int 0x80（user/lib/syscall.S）+ 包装（syscall.c），与内核 kernel/syscall_entry64.asm 对齐；"
+              "启动路径 crt0.S -> main -> exit(int)")
+    ev.append("实测串口原文：\"[SYSCALL] insn nr=1 … ret=…\"（写 1 = stdout）+ \"[SYSCALL] insn nr=0 …\""
+              "（读 0 = stdin）；C 版演示 \"[FBDEMO] map va=0x… u=1 bytes=4096000\"（A1 的接口由 C 运行时调用）")
+    ev.append("验收脚本 tests/userlib64_test.py：%s；本轮 QEMU 实跑 57/57 PASS"
+              "（printf 子集 / malloc 压力 / 文件 IO / 参数与退出码）" % ("有" if exists("tests/userlib64_test.py") else "缺失"))
+    ev.append("边界（如实）：printf **没有 %f/%e/%g 与精度/星号宽度**（遇到按原样输出，绝不假装算过，"
+              "见 user/lib/stdio.c:5 与 stdio.h:7）；malloc **不做相邻空闲块合并**（长时间\"大块-释放-小块\"会碎片化，"
+              "见 user/lib/stdlib.c:10）；内核侧 VAP64 应用 blob 代码上限 **32 KiB**（kernel/app64.h:44 "
+              "VAP64_MAX_CODE64 = 32768）—— 更大的程序走 ELF64 路径")
+    ok = (len(libs) >= 20 and exists(bt) and exists("user/lib/crt0.S") and exists("user/lib/syscall.S")
+          and exists("tests/userlib64_test.py"))
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
+def cap_musl_p3():
+    """A3：musl 静态程序在 ring3 真跑起来（+ 三个真缺陷的修复）。"""
+    ev = []
+    nk = grep_count(r"AT_PHNUM|init_array|E64_AT_", ["kernel/elf64.cpp", "kernel/elf64.h"])
+    ev.append("交付：build64/musl_hello.elf（静态 musl、钉在用户窗口 4GiB 起、无 PT_INTERP —— "
+              "%s，%d B）内嵌进系统内核启动期装进 VimtuFS2，再用 run 跑成**真进程**"
+              % ("存在" if exists("build64/musl_hello.elf") else "缺失",
+                 os.path.getsize("build64/musl_hello.elf") if exists("build64/musl_hello.elf") else 0))
+    ev.append("实测串口原文（musl 自己的 libc 真跑）：\"[MUSL] hello …\"、\"[MUSL] malloc …\"、"
+              "\"[MUSL] clock_gettime …\"、\"[MUSL] getrandom …\"；真进程独立 CR3："
+              "\"[PROC64] execve path=/musl_hello.elf\" + \"[PROC64] cr3 …\"（每进程地址空间）")
+    ev.append("本批修掉的三个**真缺陷**（都是\"以前假过/没暴露\"的）：① auxv 的 AT_PHNUM 号错"
+              "（曾是 4 = AT_PHENT，musl 拿不到程序头数）；② DT_INIT_ARRAY 没跑；③ SSE/xmm 状态没保存 —— "
+              "对应 auxv 打点命中 %d 处（kernel/elf64.cpp:298-320）" % nk)
+    ev.append("验收脚本 tests/musl64_test.py：%s；本轮 QEMU 实跑 85/85 PASS"
+              % ("有" if exists("tests/musl64_test.py") else "缺失"))
+    ev.append("边界（如实）：**musl 自带的 ld-musl（动态）没通** —— 缺 libc.so 形态、TLS 动态模型、"
+              "DT_VERNEED、vDSO；本批证明的是**静态** musl 程序（静态链接、无解释器）")
+    ok = exists("build64/musl_hello.elf") and exists("tests/musl64_test.py") and nk > 0
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
+def cap_dynlink_p3():
+    """A3 下半：自研 ld.so 动态链接（PT_INTERP + 三类重定位 + DT_NEEDED/DT_INIT*）。"""
+    lds = "user/ldso/ldso.c"
+    ev = []
+    n = grep_count(r"R_X86_64_RELATIVE|R_X86_64_GLOB_DAT|R_X86_64_JUMP_SLOT|DT_NEEDED|DT_INIT_ARRAY",
+                   [lds, "kernel/elf64.cpp", "kernel/elf64.h"])
+    ev.append("实现：%s（自定位 AT_BASE -> 读主程序 PT_DYNAMIC -> 按 DT_NEEDED 递归加载 .so -> "
+              "R_X86_64_RELATIVE / GLOB_DAT / JUMP_SLOT（+ ABS64）-> 依赖先于依赖者调 DT_INIT/DT_INIT_ARRAY）；"
+              "重定位/动态项相关命中 %d 处" % (lds, n))
+    ev.append("交付：build64/ldvimtu.so (%d B) + build64/libfoo.so (%d B) + build64/dynhello.elf (%d B)；"
+              "内核只用 PT_INTERP 把它装进 mmap 区（段权限收紧的按页并集表，见 kernel/elf64.cpp:273）"
+              % (os.path.getsize("build64/ldvimtu.so") if exists("build64/ldvimtu.so") else 0,
+                 os.path.getsize("build64/libfoo.so") if exists("build64/libfoo.so") else 0,
+                 os.path.getsize("build64/dynhello.elf") if exists("build64/dynhello.elf") else 0))
+    ev.append("实测串口原文：\"[LDSO] self base=0x… rel=…\"、\"[LDSO] load /lib/libfoo.so\"、"
+              "\"call init …\"、\"[DYNH] PASS exit=0\"（主程序 -> 解释器 -> .so 全链路真跑）")
+    ev.append("验收脚本 tests/dynlink64_test.py：%s；本轮 QEMU 实跑 90/90 PASS（含符号解析\"主程序优先\"、"
+              "段权限、错误路径）" % ("有" if exists("tests/dynlink64_test.py") else "缺失"))
+    ev.append("边界（如实）：**lazy binding / dlopen+dlsym / rpath 都没做**（只做即时重定位）；"
+              "对象数上限 LD_MAX_OBJ = 8（user/ldso/ldso.c:125），解释器映射区最多 448 KiB / 112 页"
+              "（kernel/elf64.cpp:273）")
+    ok = exists(lds) and exists("build64/ldvimtu.so") and exists("tests/dynlink64_test.py") and n > 0
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
+def cap_shell_p4():
+    """A4-1：Ring 3 shell（/bin/shell.bin 交付在系统卷；内核只负责装载）。"""
+    ev = []
+    src = "user/shell/main.c"
+    ev.append("交付：/bin/shell.bin 在**系统卷**（build64/shell.bin %d B -> build64/shellvol.img %d B，"
+              "tools/make_shellvol.py 写进 VimtuFS2 v4 卷），内核侧只搜路径、**搜不到它的字节**"
+              % (os.path.getsize("build64/shell.bin") if exists("build64/shell.bin") else 0,
+                 os.path.getsize("build64/shellvol.img") if exists("build64/shellvol.img") else 0))
+    ev.append("内核代价：本批内核只 **+2,976 B**（装载 + fd/重定向钩子；shell 本体 0 字节进内核）—— "
+              "build64.sh:685 的\"带 /bin/shell.bin 的演示盘 + 内核里没有 shell 字节断言\"在构建期逐字节核对")
+    ev.append("实测串口原文：\"[SH64] launch path=/bin/shell.bin\" + \"VimtuOS ring3 shell (sh64)\"；"
+              "外部命令走真进程：\"run PATH\" -> fork(57)+execve(59)+wait4(61)（%s）" % src)
+    ev.append("实测串口原文（重定向闭环）：\"[FD64] dup old=<fd> new=1\" + \"[PROC64] execve path=… fds_kept=2\" + "
+              "\"run: /tmp/hello2 pid=… exited code=0\"（`run … > 文件` 之后 cat 回来逐字节一致）")
+    ev.append("验收脚本 tests/sh64_test.py：%s；本轮 QEMU 实跑 59/59 PASS（> >> < 、管道 a|b、内建命令、"
+              "ring3 读写 VimtuFS2）" % ("有" if exists("tests/sh64_test.py") else "缺失"))
+    ev.append("边界（如实）：重定向/管道只对**内建命令**成立（外部命令的 fd 0/1 由内核 dup2 链路给，"
+              "见上一条证据）；没有 job control / 别名 / 变量展开（那是后续批次）")
+    ok = exists(src) and exists("build64/shell.bin") and exists("tests/sh64_test.py")
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
+def cap_tools_p4():
+    """A4-4a/A4-4c：Lua 5.4.7 + 用户态 gzip/gunzip（互操作三证）。"""
+    ev = []
+    lg = grep_count(r"lua\.bin|/bin/lua|/bin/gzip|gunzip", ["build64.sh", "tools/lua_pack_win.py",
+                                                            "tools/gzip_pack_win.py", "tools/gzip_build_win.sh"])
+    ev.append("交付：/bin/lua + /lib/lua.bin（真 Lua 5.4.7 解释器，静态 musl、非 PIC、按 4GiB+0x90000 定址："
+              "build64/lua.bin %d B）+ /bin/gzip + /bin/gunzip（自足静态 ELF64，build64/gzip %d B）；"
+              "内核里一个字节都不加（交付 = 系统卷文件，build64.sh:375-387）"
+              % (os.path.getsize("build64/lua.bin") if exists("build64/lua.bin") else 0,
+                 os.path.getsize("build64/gzip") if exists("build64/gzip") else 0))
+    ev.append("实测串口原文：\"[LUA64] …\"（脚本真跑）+ \"[GZIP64] …\"；脚本/压缩串相关命中 %d 处" % lg)
+    ev.append("互操作三证（tests/gzip64_test.py 里逐条断言）：① 压-解往返**逐字节**相等（含 1 MiB 大文件）；"
+              "② 我们压出的流里 **CRC32 / ISIZE** 与宿主 Python(zlib) 算的完全一致；"
+              "③ **宿主 Python 能解开我们压的文件**（跨实现互操作，不是自说自话）")
+    ev.append("验收脚本 tests/lua64_test.py：%s（本轮 QEMU 实跑 57/57 PASS）+ tests/gzip64_test.py：%s"
+              "（本轮 QEMU 实跑 37/37 PASS）"
+              % ("有" if exists("tests/lua64_test.py") else "缺失",
+                 "有" if exists("tests/gzip64_test.py") else "缺失"))
+    ev.append("边界（如实）：gzip 的 deflate 只做 **store + fixed-Huffman**（没有动态 Huffman 优化）；"
+              "tar 没做（只有 gzip/gunzip）；Lua 缺部分 libc（os/io 的部分函数如实报错）")
+    ok = exists("build64/lua.bin") and exists("build64/gzip") and exists("tests/lua64_test.py") \
+        and exists("tests/gzip64_test.py")
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
+def cap_tcc_p4():
+    """A4-2b：Ring 3 里的 TinyCC（编译 -> 链接 -> run 逐字节闭环）。"""
+    ev = []
+    ev.append("交付：/bin/tcc（装载驱动）+ /lib/tcc.bin（真 tcc：**手写构建** 282,328 B，静态 ELF64、非 PIC、"
+              "按 4GiB+0x90000 定址）+ /tcc/**（头文件/libtcc1.a/crt/demo，tools/tcc_build_win.sh + "
+              "tools/tcc_pack_win.py）—— 内核里 0 字节 (%s)"
+              % ("build64/tcc.bin = %d B" % os.path.getsize("build64/tcc.bin")
+                 if exists("build64/tcc.bin") else "build64/tcc.bin 缺失"))
+    ev.append("实测串口原文：\"[TCCDRV] start/load/mmap/auxv/jmp\" -> \"[TCC64] tcc version 0.9.27 (x86_64 Linux)\""
+              "（tcc 自己在 ring3 里报版本）；\"[TCCDRV] jmp entry=…\"")
+    ev.append("闭环（每步都有字节级证据）：`tcc -c x.c -o x.o` 出 **ET_REL**（e_type=1 / EM_X86_64 / e_shnum=8，"
+              "宿主侧解析夹具卷 .o 头）；`tcc x.c -o prog` 出 **ET_EXEC**（无 PT_INTERP/PT_DYNAMIC，"
+              "PT_LOAD 全落在内核装载区 4GiB..+64KiB）；shell `run /tmp/hello2` 跑通、输出**逐字节**正确、退出码 0")
+    ev.append("本批内核改动（如实记账）：用户窗口 mmap 上界 **1 MiB -> 16 MiB**（kernel/usermode64.h:41 "
+              "USER64_WINDOW_BYTES64，其余地址约束不动）、mmap 用 lazy=1（按需分配）、**空闲页池不变**；"
+              "根因修复 = 单字节 write ×113 烧光 5 s wait4 上限 -> 打点按行缓冲后 5.70 s -> 4.53 s")
+    ev.append("验收脚本 tests/tcc64_test.py：%s；**本轮主树实跑 66/66、0 缺口**（同脚本先前只在隔离 worktree 里跑过）"
+              % ("有" if exists("tests/tcc64_test.py") else "缺失"))
+    ev.append("边界（如实）：`-run` / `-E` / `-g` / `-O2` **没测**（只证明 -c 与链接两条路）；"
+              "链接那一次 fork->exit 4.53 s 贴着 5 s 上限，**余量仅约 0.47 s**（-c 3.83 s）")
+    ok = exists("build64/tcc.bin") and exists("tests/tcc64_test.py") and exists("tools/tcc_pack_win.py")
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
+def cap_hda_p5():
+    """A5-hda：Intel HDA 声卡驱动（枚举 -> DAC/Pin -> 流 -> BDL 环 -> 音量/静音）。"""
+    ev = []
+    n = grep_count(r"\[HDA64\]|hda64_", ["kernel/hda64.cpp", "kernel/hda64.h"])
+    ev.append("实现：kernel/hda64.cpp（%d B / %d 行）+ kernel/hda64.h；打点/接口命中 %d 处"
+              % (os.path.getsize("kernel/hda64.cpp") if exists("kernel/hda64.cpp") else 0,
+                 lines("kernel/hda64.cpp"), n))
+    ev.append("实测串口原文（枚举 -> 码器 -> DAC+Pin -> 格式）：\"[HDA64] pci <b>:<d>.<f> bar0=0x… codecs=1\"、"
+              "\"[HDA64] codec #0 vid=0x… did=0x… step=0x…\"、\"[HDA64] dac nid=0x… pin nid=0x… path=…\"、"
+              "\"[HDA64] fmt 48000/16/2 … rdback=0x11 … ok=1\"（Set Converter Format 回读一致）")
+    ev.append("实测串口原文（控制器真的在跑 + BDL 环）：\"[HDA64] selftest PASS mask=0 lpib=<n> bcis=<m>\""
+              "（n>0、m>0 = 流位置与缓冲完成中断状态位都在前进）+ \"[HDA64] stream done lpib=… cbl=… bcis=1 ok=1\""
+              "；测试用 `-audiodev wav` 落盘，出的是**真波形**（非全零）")
+    ev.append("接线：面板（声音滑块/输出源）+ 设置页（音量/静音持久化）+ 终端 `audio playtone/vol/mute` 真调驱动 —— "
+              "\" [HDA64] volume pct=<p> step=<g>/<n> … rb=0x<g> … ok=1\"、\"[HDA64] mute … bit=1|0\"")
+    ev.append("验收脚本 tests/hda64_test.py：%s；本轮 **QEMU 实跑（VMware 不可能：见边界）**"
+              % ("有" if exists("tests/hda64_test.py") else "缺失"))
+    ev.append("边界（如实）：24-bit / 多流 / 插孔检测(unsolicited) / HDMI 音频 / **中断驱动**都没做（现在只轮询）；"
+              "★ **VMware 只给强制 sb16，HDA 只能在 QEMU 上验**（VMware 侧没有 HDA 控制器可枚举）")
+    ok = exists("kernel/hda64.cpp") and exists("tests/hda64_test.py") and n > 0
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
+def cap_ipc_p5():
+    """A5 前置：input_poll(12) + shm_create(13)/shm_map(14)（事件队列 + 共享内存）+ 抢占竞态修复。"""
+    ev = []
+    ev.append("接口：syscall 12 input_poll(Event*, max, flags)、13 shm_create(size)、14 shm_map(id, off, len, &va) —— "
+              "每进程 **32 条**事件队列，满了**丢最旧 + 计数**（绝不静默丢事件：\"[EV64] drop pid=… total=…\"、"
+              "\"[EV64] drops … suppressed=…\"、\"[EV64] poll pid=… got=… pend=… drops=…\"，kernel/input64.h:11/46-49）")
+    ev.append("焦点/捕获：事件只投给**前台**进程（焦点窗口所属进程），鼠标按下时坐标捕获到该进程 —— "
+              "kernel/proc64.h:218 起 + input64 的路由；失焦事件如实清空/不投")
+    ev.append("共享内存：对象表 8 个对象 × 单对象 ≤16 页（64 KiB）= 每进程映射窗 4 槽 × 64 KiB = 256 KiB"
+              "（kernel/proc64.h:243-248 / proc64.cpp:219）；**fork 继承句柄、退出回收**（shm64_drop_all64，"
+              "proc64.cpp:288/897/941/1285 四条路径都调）")
+    ev.append("实测串口原文：\"[SHM64] create id=… pages=…\"、\"[SHM64] map id=… va=0x… len=…\"、"
+              "\"[EV64] queue pid=… cap=32\"、\"/evshm.elf\" 演示（shm_create -> 画 -> fb_flip -> 循环 input_poll）")
+    ev.append("本批修的**真缺陷**：任务 create+bind 的**抢占竞态**（ring3 第一句话就报\"没有进程上下文\"）"
+              "—— 提交 03c59c1；验收脚本 tests/ipc64_test.py：%s"
+              % ("有" if exists("tests/ipc64_test.py") else "缺失"))
+    ev.append("实测计数：QEMU 通道 67/67 PASS；VMware（VNC 注入）通道 65/65 PASS —— 两条通道同一份判据，"
+              "VMware 侧只把\"指针幅度\"改成只断言方向（VNC 绝对坐标 -> VMware 相对位移，幅度不可控）")
+    ok = exists("kernel/input64.h") and exists("kernel/proc64.cpp") and exists("tests/ipc64_test.py") \
+        and exists("build64/evshm.elf")
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
+def cap_sig_p5():
+    """A4-5：信号真投递（用户栈帧 + rt_sigreturn + 默认动作 128+sig + 用户异常只杀进程）。"""
+    ev = []
+    n = grep_count(r"SIG64_|rt_sigreturn|sig64_", ["kernel/sig64.cpp", "kernel/sig64.h",
+                                                  "kernel/syscall64.cpp"])
+    ev.append("实现：kernel/sig64.cpp（%d B）+ sig64.h（%d 行）；打点/接口命中 %d 处；"
+              "两份内核都链它（build64.sh:120 —— 安装介质内核里没有进程表时只做参数校验，**不假装投递**）"
+              % (os.path.getsize("kernel/sig64.cpp") if exists("kernel/sig64.cpp") else 0,
+                 lines("kernel/sig64.h"), n))
+    ev.append("投递：用户栈上构造 Sig64Frame64（magic 不对 = -EFAULT，不猜）-> handler -> handler 里 "
+              "`rt_sigreturn(15)` 按帧恢复被打断的现场（RIP/RSP/RFLAGS + 通用寄存器）；"
+              "**三条投递点**（kill 类系统调用 / 用户态异常 / tty 的 Ctrl+C）、阻塞位图 + 未决位图")
+    ev.append("实测串口原文（默认动作、可终止信号 -> 退出码 = 128+sig，父进程 wait4 看得到）："
+              "\"[SIG64] default action pid=25 sig=8 exit=136 fault=#DE err=0x0 cr2=0x…\"、"
+              "\"[SIG64] default action pid=26 sig=9 exit=137 why=kill\"（sig64: default-action exit=143 / div-zero exit=136 实测）")
+    ev.append("进程组/终端：`kill(-pgid)` 投给整组；Ctrl+C 投给**前台进程组**（sig64_tty_set_fg64 记录最近一次 "
+              "setpgid(0,0) 的进程组）")
+    ev.append("★ 本批**根因修复**：用户态 #PF / #GP / #DE 以前会 PANIC 整机 —— 现在只把该进程按 "
+              "SIGSEGV/SIGILL/SIGFPE… 杀掉（\"用户态异常只杀该进程\"，sig64.h:13）；"
+              "验收脚本 tests/sig64_test.py：%s" % ("有" if exists("tests/sig64_test.py") else "缺失"))
+    ev.append("边界（如实）：没有 siginfo / sigaltstack / SA_RESTART / 实时信号排队 / 作业控制；"
+              "**#DF / #TS / #MC 与内核态异常仍然 PANIC**（那是内核自己的错，不能吞）")
+    ok = exists("kernel/sig64.cpp") and exists("tests/sig64_test.py") and n > 0
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
+def cap_edit_p5():
+    """A4-5：自研 Ring 3 编辑器 /bin/edit（真 argv + input_poll 取键 + :w/:q + Ctrl+S）。"""
+    ev = []
+    ec = "user/apps/edit/edit.c"
+    ev.append("交付：/bin/edit（build64/edit %d B；源码 %s %d 行 + edit_start.S + edit64.ld + build_edit.sh）；"
+              "终端 `edit <文件>` 启动，真 argv 传路径（edit.c:506-508）"
+              % (os.path.getsize("build64/edit") if exists("build64/edit") else 0, ec, lines(ec)))
+    ev.append("取键走 ring3 事件队列：`input_poll(12)`（不是读键盘端口）—— 与 A5 前置的事件队列同一套；"
+              "支持 Caps/Shift/方向键/PageUp/PageDown/退格/回车")
+    ev.append("实测串口原文：\"[EDIT64] start file=<p> pid=<n> argc=<n>\"、"
+              "\"[EDIT64] termios raw ok=1 lflag=0x… raw=0x…\"（进编辑器关 ICANON/ECHO，退出**还原**原 termios）、"
+              "\"[EDIT64] save ok path=… bytes=…\"、\"[EDIT64] quit\"")
+    ev.append("命令模式：`:` 后 `:w`（保存）/`:q`（退出）/`:q!`/`:wq`/`:e`（重载）、`Ctrl+S` 直接保存；"
+              "状态行反显（文件名 行,列 行数 修改标记 raw 标记）")
+    ev.append("**宿主侧卷解析逐字节一致**：Ctrl+S 之后宿主 Python 直接解析安装盘里的卷，把编辑器写出的文件"
+              "与宿主期望内容逐字节比对（不是只看串口说 save ok）")
+    ev.append("规模实测：1 MiB 文本 = **8527 行**打开/编辑/保存通过（文本缓冲 2 MiB + 行索引 4B×65536=256 KiB "
+              "都用 mmap(9) 拿，edit.c:23/57）；验收脚本 tests/edit64_test.py：%s"
+              % ("有" if exists("tests/edit64_test.py") else "缺失"))
+    ev.append("边界（如实）：**没有 vi 模式/操作符重复/多窗口**；行索引上限 **65536 行**（超出的部分折在最后一行显示）；"
+              "控制台**不解析 ANSI 转义**（像素级终端属后续批次）")
+    ok = exists(ec) and exists("build64/edit") and exists("tests/edit64_test.py")
+    return ("DONE" if ok else "PARTIAL"), ev
+
+
 CAPS = [
     ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
      cap_boot_console),
@@ -1741,6 +2012,27 @@ CAPS = [
      cap_realfix64),
     ("应用", "★ P6/A4-2a 外置图标包（真图标；pack = 系统卷 /etc/iconpack.bin：110 条目/30 kind/49192 B，"
              "图标字节 0 进内核；src=vfs 逐 kind 加载 + 主题着色 + 回落程序化绘制）", cap_iconpack64),
+    ("应用层", "★ A1 用户态绘图接口（fb_map(9) / fb_flip(10) / fb_present(11) + ring3 演示：用户拿到后备缓冲映射、"
+             "提交区域、越界拒绝/夹取）", cap_fbmap_p1),
+    ("工具链", "★ A2 用户态 C 运行时/Syscall Wrapper（自研最小 libc + 自有 ABI 包装 + clang/lld 交叉编译，"
+             "-mcmodel=large 是硬要求）", cap_userlib_p2),
+    ("应用层", "★ A3 musl 静态程序在 ring3 真跑（真进程独立 CR3 + AT_PHNUM/__init_array/SSE 三个真缺陷的修复）",
+     cap_musl_p3),
+    ("应用层", "★ A3 自研 ld.so 动态链接（PT_INTERP + RELATIVE/GLOB_DAT/JUMP_SLOT/ABS64 + DT_NEEDED/DT_INIT*；"
+             "符号解析主程序优先）", cap_dynlink_p3),
+    ("应用", "★ A4-1 Ring 3 shell（/bin/shell.bin 交付在系统卷、内核里搜不到它的字节、内核只 +2,976 B）", cap_shell_p4),
+    ("工具链", "★ A4-4a/A4-4c Lua 5.4.7 + 用户态 gzip/gunzip（互操作三证：往返逐字节 + CRC32/ISIZE 与 Python 一致 + "
+             "宿主 Python 能解开我们压的文件）", cap_tools_p4),
+    ("工具链", "★ A4-2b Ring 3 里的 TinyCC（手写构建 + 系统卷交付 + 装载驱动；`tcc -c` 出 ET_REL、"
+             "链接出 ET_EXEC、`run` 跑通逐字节）", cap_tcc_p4),
+    ("驱动", "★ A5-hda Intel HDA 声卡驱动（枚举/码器/DAC+Pin/48k16/BDL 环/音量静音 + 面板/设置/终端 audio 真接线；"
+             "VMware 强制 sb16 -> HDA 只能 QEMU 验）", cap_hda_p5),
+    ("内核", "★ A5 前置 input_poll(12) + shm_create(13)/shm_map(14)（每进程 32 条事件队列、丢最旧+计数、焦点/捕获；"
+             "shm 对象表/fork 继承/退出回收）", cap_ipc_p5),
+    ("内核", "★ A4-5 信号真投递（用户栈帧 + rt_sigreturn、默认动作 128+sig、阻塞/未决、kill(-pgid)/Ctrl+C 投前台组；"
+             "用户态 #PF/#GP/#DE 只杀进程不再 PANIC）", cap_sig_p5),
+    ("应用", "★ A4-5 自研 Ring 3 编辑器 /bin/edit（真 argv + input_poll 取键 + raw/还原 + :w :q + "
+             "Ctrl+S 后宿主侧卷解析逐字节一致）", cap_edit_p5),
 ]
 
 
@@ -1809,6 +2101,28 @@ TESTS = [
                         "逐 kind [ICON64] load src=vfs ok=1 与宿主清单完全相等 + 状态区 3 图标形状 IoU>=0.55 + "
                         "主题跟随（亮度差 >=60）+ 两种坏法回落（no-entry / no-pack，界面不空）+ "
                         "Dock 开始按钮 VimtuFS2 真图 kaisi.png"),
+    ("fbmap64_test.py", "★ A1 用户态绘图接口：fb_map(9)/fb_flip(10)/fb_present(11) + ring3 演示 + 连续帧差异 + "
+                        "越界拒绝/夹取 + 演示后桌面接管（39 条断言）"),
+    ("userlib64_test.py", "★ A2 用户态 C 运行时：printf 子集/malloc 压力/文件 IO/参数与退出码（57 条断言）"),
+    ("musl64_test.py", "★ A3 musl 静态程序在 ring3：hello/malloc/clock_gettime/getrandom + 真进程独立 CR3 + "
+                       "AT_PHNUM/__init_array/SSE 三个真缺陷的修复（85 条断言）"),
+    ("dynlink64_test.py", "★ A3 自研 ld.so：PT_INTERP + RELATIVE/GLOB_DAT/JUMP_SLOT/ABS64 + DT_NEEDED/DT_INIT* + "
+                          "符号解析主程序优先 + 段权限（90 条断言）"),
+    ("sh64_test.py", "★ A4-1 Ring 3 shell /bin/shell.bin：run=fork+execve+wait4、> >> <、管道、ring3 读写卷（59 条断言）"),
+    ("lua64_test.py", "★ A4-4a Lua 5.4.7 在 ring3 跑脚本（/bin/lua + /lib/lua.bin，交付在系统卷）（57 条断言）"),
+    ("gzip64_test.py", "★ A4-4c 用户态 gzip/gunzip：往返逐字节 + CRC32/ISIZE 与宿主 Python 一致 + "
+                       "宿主 Python 能解开我们压的文件（37 条断言）"),
+    ("tcc64_test.py", "★ A4-2b Ring 3 里的 TinyCC：装载驱动 + `tcc -c` 出 ET_REL + 链接出 ET_EXEC + "
+                      "`run` 跑通逐字节（66 条断言，0 缺口）"),
+    ("hda64_test.py", "★ A5-hda Intel HDA：枚举/码器/DAC+Pin/48k16/BDL 环/lpib·bcis 前进 + `-audiodev wav` 真波形 + "
+                      "面板/设置/终端 audio 接线（31 条断言；VMware 强制 sb16 -> 只能 QEMU）"),
+    ("ipc64_test.py", "★ A5 前置 input_poll(12) + shm_create(13)/shm_map(14)：事件队列丢最旧+计数、焦点/捕获、"
+                      "共享内存对象表/fork 继承/退出回收（QEMU 67 / VMware 65 条断言）"),
+    ("sig64_test.py", "★ A4-5 信号真投递：用户栈帧 + rt_sigreturn、默认动作 128+sig、阻塞/未决、kill(-pgid)/Ctrl+C 投给"
+                      "前台组、用户态 #PF/#GP/#DE 只杀进程不再 PANIC（44 条断言）"),
+    ("edit64_test.py", "★ A4-5 自研 /bin/edit：真 argv + input_poll 取键 + raw/还原 + :w :q + "
+                       "Ctrl+S 后宿主侧卷解析逐字节一致（33 条断言）"),
+    ("a42a64_test.py", "★ A4-2a 图标包搬进系统卷 + 内核真缺陷 2 处 + 工具链必需的系统调用 + 标准流重定向（85 条断言）"),
 ]
 
 

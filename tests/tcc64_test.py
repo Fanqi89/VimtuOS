@@ -465,7 +465,7 @@ def main():
     def wait_console(needle, timeout=30):
         """等**控制台输出流**（裸串口剥掉内核打点行）里出现 needle。
         驱动 / tcc / 子程序 / shell 的 "run: …" 汇总行都走这条（tcc 与子程序的输出是分几次
-        write(1) 发的，裸串口上会被内核的 [SYSCALL] 行切碎 —— 见 console_stream 的说明）。
+        write(1) 发的，裸串口上会被内核的 [SYSCALL] 行切碎 —— 见 console_stream 的说明）。"""
         deadline = time.time() + timeout
         while time.time() < deadline:
             if needle in console_stream(slog()):

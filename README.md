@@ -7,23 +7,24 @@
 全部是本工程自己的 C++ / 汇编代码。
 它自带一张"三合一"安装盘（BIOS 光盘 / U 盘 / UEFI），安装界面与步骤照 Windows 10 做（去掉了输入产品密钥那一步）。
 
-> 版本 **0.3.3-beta15** · 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
-> 状态（权威判据：`python tests/status_report.py`，本批实测）：**完成 51 / 部分 0 / 未做 0（共 51 项能力）** ——
-> 本批（**P5**，里程碑 M22）新增一项能力：**桌面交互**（桌面右键菜单 8 项（置灰 3 项）/ESC 与点外部关闭、**玻璃选择框 + 拖动**（框内 diff=0）、
-> 拖入回收站、指针形状（6 向 + 文本 I + 转圈）、窗口缩放、最小化飞 Dock 与 Dock 点击语义、圆角桌面图标、恢复默认桌面图标、
-> 资源管理器只隐藏**非引导盘**系统分区）；
-> 本批还修掉**两个用户可见的真 bug**：① **应用窗口内容丢失**（`kernel/gui64.cpp` 的 `render()` 丢了 `g_frames++; g_dirty_any=false;` → 每帧整屏重绘；
-> `kernel/settings64.cpp` 的 `set_draw()` 把**实际绘制**关进了"尺寸变化"的 `if` 里 → 尺寸没变就不画；已修 + 加防回归断言：内核 `[GUI64] app blank` 必须不出现 + `desktopops64_test` 第 9 节）；
-> ② **改壁纸适应模式后桌面不重绘**（真因**不是脏标记** —— 实测整屏标脏 + `fb_flip_region` 都到位；而是**整屏壁纸重建 ~6.3s**：
-> `[GFX64] wall ensure rebuild=1 build_ticks=… compose_ticks=… blur_ticks=3094 total_ticks=3226` → `kernel/gfx64.cpp` 盒式模糊改**按行推进 + 源/目标分开的滑窗**后
-> `blur_ticks 3094 → 141~158`、`total_ticks 3226 → 265~291`，桌面片变化 `0/7560 → 6243/7560`，**逐像素等价**（核外 262 组随机/边界样本 0 处不同））；
-> 顺带清掉残留文本：终端 banner / `ver` 走唯一真源，`git grep "VimtuOS 0.1.0"` 在 `kernel/` `gui_rs/` `build64.sh` `tests/` **全 0 命中**。
-> 全量验收（`status_report.py --full` 的 `TESTS` 列表 + 专项/扩展脚本；`Get-ChildItem tests\*.py` 实数 **56 个脚本**、`TESTS` 列表实测 45 个）：**本批 0 FAIL** ——
-> **desktopops64_test 65-66 条**（P5 桌面交互：右键菜单 8 项/置灰/ESC 与点外部/玻璃选择框（框内 diff=0）/拖入回收站/指针形状/窗口缩放/最小化飞 Dock 与 Dock 点击语义/圆角桌面图标/恢复默认桌面图标/只显示可见分区 + 应用窗口内容防回归 + 壁纸重绘）、
-> **settings64_test 105 条（连跑 2 次）**、**gui_modern64_test 149**、**desktop64_test PASS**、**startmenu64_test 58**、**panels64_test 78**、
-> **locklogin64_test 88**、**explorer64_test 71**、**fileops64_test 95**；`bash build64.sh` EXIT=0；核查汇总 = 完成 51 / 部分 0 / 未做 0（共 51 项能力）；
-> 上一批的 **perm64_test 95** 与 usbstorage(99)/bootlog64(30)/fatread64(61)/fs_tree(87)/fs_term(32)/fd64(34)/bigfile64(61)/
-> multivol64(109)/app64(31)/elf64(56)/proc64(67)/sysstate64/boot64_assert 等既有脚本的结论照旧。
+> 版本 **0.4.0-beta17**（标签 `v0.4.0-beta17`）· 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
+> 状态（权威判据：`python tests/status_report.py`，本批实测）：**完成 64 / 部分 0 / 未做 0（共 64 项能力）**、
+> `--full` 的 `TESTS` 列表 **59** 个脚本、`Get-ChildItem tests\*.py` 实数 **71** 个脚本 ——
+> 本批（**批次 A1–A5**，里程碑 **M25–M29**）新增 11 项能力：**用户态绘图接口（fb_map/fb_flip/fb_present）**、
+> **用户态 C 运行时（自研最小 libc + clang/lld 交叉编译）**、**musl 静态程序在 ring3 真跑**、**自研 ld.so 动态链接**、
+> **Ring 3 shell（/bin/shell.bin 交付在系统卷）**、**Lua 5.4.7 + 用户态 gzip/gunzip**、**Ring 3 里的 TinyCC**、
+> **Intel HDA 声卡驱动**、**input_poll + 共享内存**、**信号真投递**、**自研 Ring 3 编辑器 /bin/edit**（逐项证据与边界见下文批次小节）。
+> 关键修复：`AT_PHNUM` 号错 / `DT_INIT_ARRAY` 没跑 / SSE 状态没保存（musl 三缺陷）、单字节 `write` ×113 烧光 5 s `wait4`
+> （tcc 链接 5.70 s → 4.53 s）、`input_poll` 侧的**任务 create+bind 抢占竞态**、用户态 #PF/#GP/#DE 以前会 PANIC（现在只杀进程）。
+> 全量验收（在本版构建产物上真跑）：`TESTS` **59 项 = 58 PASS / 1 FAIL / 0 TIMEOUT / 0 MISSING**；
+> **VMware**：BIOS 安装 E2E `vmware_install_test` **PASS**、EFI 安装 E2E `uefi64_install_test` **PASS**、
+> `ipc64_test --vmware` **65/65 PASS**；`vmrun list` = 0（没有 VM 挂着）。
+> 唯一 FAIL：`tmgr_proc_test` **38/39** —— UI"结束任务"点的 pid 已经不存在，内核**如实**返回 `-ESRCH(3)`
+> （`[UI] tmgr kill proc pid=26 … rc=-3`），断言要的是 `rc=0`；**判为 UI/测试侧缺陷，不是内核缺陷**（本批未修，越界改动）。
+> 体积：安装程序内核 **1,881,280 B**、系统内核 **3,689,744 B**（上限 4,096,000 B，**余量 406,256 B**）、
+> `loader64.bin` **4,010 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**（`Get-Item` 实读）。
+> ★ **如实**：本版镜像内嵌版本串仍是 `VimtuOS 0.3.4-beta16`（本批未改 `build64.sh` 的 `VIMTUOS_VERSION`），
+> 即"标签 `v0.4.0-beta17` ≠ 内嵌串 `0.3.4-beta16`"，这一项**未勾**（发布流程 §5）。
 
 ---
 
@@ -358,8 +359,13 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | M22 | **桌面交互（批次 P5）**：`desktopops64`（右键菜单 8 项/置灰/ESC 与点外部关闭、玻璃选择框 + 拖动、拖入回收站、指针形状、窗口缩放、最小化飞 Dock、圆角桌面图标、恢复默认图标）+ `input.cpp`（指针形状 6 向/文本 I/转圈）+ `gui64`（飞 Dock 225ms `scale+fade`、minbar 点击语义、`check_app_painted64` 防回归）+ `gfx64`（整屏模糊改**行序滑窗**：`blur_ticks 3094 → 141~158`、`total_ticks 3226 → 265~291`，逐像素等价）+ `explorer`（只显示可见分区）；顺带修掉**两个用户可见真 bug**：**应用窗口内容丢失**（`render()` 丢 `g_frames++/g_dirty_any=false` + `set_draw()` 把绘制关进"尺寸变化"的 `if`）、**改壁纸适应模式后桌面不重绘**（真因是整屏壁纸重建 ~6.3s） | ✅ |
 | M23 | **外置图标包（真图标，批次 P6；A4-2a 起改为系统卷文件）**：`kernel/icons64.{h,cpp}`（统一图标层：★ A4-2a 起从**系统卷的 `/etc/iconpack.bin`** 读**外置图标包**（110 条目 / 30 kind / 49,192 B）→ `img64` 解码 → 缓存 → 按主题 palette 着色；取不到回落既有程序化绘制）+ `tools/make_iconpack.py`（SVG/PNG → 多档 PNG + 清单 `build/icons/manifest.json`）；**图标字节不进内核镜像文件系统**（`build64.sh` 把 pack objcopy **内嵌进系统内核**，启动期 `icons64_init64()` 幂等写进卷再从卷读回；老 LBA 7497 裸包路径只作末位兜底）；Dock/桌面/开始菜单状态区/四弹窗全部换真图标 | ✅ |
 | M24 | **真机缺陷修复（六项，批次 P6）**：① Win 键只开**新**开始菜单（老菜单整套删除；数字快捷键 1..8 兼容保留、9/0 不再绑电源）② 点扫雷/开始菜单"关机·重启" -> `#GP err=0` 蓝屏（根因：`dock_draw_one64()` 开始按钮 scratch 按 46×46 开、悬停 120% 时写 55×55 -> **越界 3.6KB 踩坏 BSS**）③ 设置页移动鼠标整屏空白（P5 竞态已修 + 本批防回归断言）④ 登录必须**显式输入**（`ui.login.auto` 默认 1→0，实测停留 ≥10s）⑤ 壁纸四角红绿蓝黄标记默认**不可见**（`ui.wall.markers` 默认 0，Ctrl+Shift+M 切换）⑥ 主题热键与按用户偏好同步；回归：gui_modern64 159/159 连跑 2 次、icons64 50/50、panels64 78/78、settings64 108/108、startmenu64 63/63、ui_extra64 51/51 全绿 | ✅ |
+| M25 | **A1 用户态绘图接口**（`fb_map(9)` / `fb_flip(10)` / `fb_present(11)`）：内核把后备缓冲按用户可读写映射 + 提交区域（夹取/拒绝三态打点）；ring3 演示连续帧差异 + 越界拒绝，桌面接管回来；`fbmap64_test` 39/39 | ✅ |
+| M26 | **A2 用户态 C 运行时**：`user/lib` 23 个文件（最小 libc + `int 0x80` 自有 ABI 包装 + crt0/链接脚本）+ `user/build_user.sh`（clang/lld，`-mcmodel=large` 硬要求）；C 版绘图演示；`userlib64_test` 57/57 | ✅ |
+| M27 | **A3 musl 静态 + 自研动态链接**：musl 静态程序真进程独立 CR3 跑起来（修 `AT_PHNUM` / `DT_INIT_ARRAY` / SSE 三个真缺陷，`musl64_test` 85/85）；`user/ldso` 自研 `ld.so`（PT_INTERP + RELATIVE/GLOB_DAT/JUMP_SLOT + DT_NEEDED/DT_INIT*，`dynlink64_test` 90/90） | ✅ |
+| M28 | **A4 Ring 3 工具链**：shell `/bin/shell.bin` 交付在系统卷（内核只装载、+2,976 B，`sh64_test` 59/59）+ Lua 5.4.7（`lua64_test` 57/57）+ 用户态 gzip（互操作三证，`gzip64_test` 37/37）+ **Ring 3 里的 TinyCC**（窗口 1 MiB→16 MiB，`-c` 出 ET_REL / 链接出 ET_EXEC / run 逐字节，`tcc64_test` 66/66） | ✅ |
+| M29 | **A5 声音 + IPC + 信号 + 编辑器**：Intel HDA 驱动（DAC+Pin/48k16/BDL 环/音量静音，`hda64_test` 31/31，只能 QEMU）+ `input_poll(12)`/`shm_create(13)`/`shm_map(14)`（32 条事件队列丢最旧计数，`ipc64_test` QEMU 67 / VMware 65）+ 信号真投递（用户栈帧 + `rt_sigreturn`，用户态异常只杀进程，`sig64_test` 44/44）+ 自研 `/bin/edit`（`edit64_test` 33/33） | ✅ |
 
-### 批次 P6（本批）：真机缺陷修复（含蓝屏根因）+ 外置图标包（真图标）
+### 批次 P6（上一批）：真机缺陷修复（含蓝屏根因）+ 外置图标包（真图标）
 
 **① 蓝屏根因**（用户真机/VM 实测：点"扫雷"或开始菜单"关机·重启"就蓝屏）
 
@@ -393,11 +399,73 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
   `[DOCK64] start icon src=vfs:/logo/kaisi.png size=46 ok=1`。内核区因此**全部交还内核**：
   LBA 9..8008 = 8,000 扇区 = **4,096,000 B 全部可用**（改动前图标包占 LBA 7497..8008，只能用 7,488 扇区）。
 
-**本批实读**（2026-09-26）：能力项 **完成 53 / 部分 0 / 未做 0**；`--full` 的 `TESTS` **46** 个脚本；
-安装程序内核 **2,232,720 B**、系统内核 **3,908,752 B**（内核区上限 **4,096,000 B**，余量 **187,248 B** —— ★ A4-2a 起图标包搬进系统卷，内核区不再预留 LBA 7497..8008）、
-`loader64.bin` **4,010 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**（2026-09-27 A4-2 收口实读）；
-**镜像内嵌版本串已一致**：`[SET64] about version=VimtuOS 0.3.4-beta16 x86_64 build_tag=… bits=64`（唯一真源 `build64.sh` 的 `VIMTUOS_VERSION`；v0.3.3-beta15 就是漏改了它）。
+**本批实读**（2026-10-01，`v0.4.0-beta17`）：能力项 **完成 64 / 部分 0 / 未做 0（共 64 项）**；
+`--full` 的 `TESTS` 列表 **59** 个脚本；`Get-ChildItem tests\*.py` 实数 **71 个脚本**；
+安装程序内核 `build64/kernel64.bin` **1,881,280 B**、系统内核 `build64/kernel64_os.bin` **3,689,744 B**
+（内核区硬上限 **4,096,000 B**，**余量 406,256 B** —— `Get-Item` 实读）、`loader64.bin` **4,010 B**、
+`build64/system.img` **4,133,376 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**。
+★ **版本串如实说明**：本版内核内嵌串仍是 `VimtuOS 0.3.4-beta16` —— 本批**没有改** `build64.sh` 的
+`VIMTUOS_VERSION`（本批只允许改文档与 `tests/status_report.py`），发布标签是 `v0.4.0-beta17`，
+**"镜像内嵌串 vs 标签"不一致这一项如实记录**（发布流程 §5 该勾未勾；修法与 beta15 同：改 `VIMTUOS_VERSION` 后重建）。
 
+
+### 批次 A1–A5（本批）：用户态化（绘图接口 / C 运行时 / musl / 动态链接 / shell / Lua / TinyCC）+ HDA 声卡 + 信号投递与编辑器 —— `v0.4.0-beta17`
+
+**这批把"用户态"从"能跑"推到"能干活"**：屏幕能由用户态自己画、程序能用 C 运行时写、musl 静态程序能跑、
+动态链接能跑、shell / Lua / TinyCC 都在 ring3 里跑、声卡能出声、进程能收信号、编辑器能编辑并保存。
+
+* **A1 用户态绘图接口**（`fb_map(9)` / `fb_flip(10)` / `fb_present(11)`）：内核只把**后备缓冲**按用户可读写映射出去 + 提交区域。
+  实测 `[FB64] map pid=… va=0x… w=… h=… pitch=… fmt=… pages=… re=… u=1`（`u=1` = 内核页表实测用户可访问）+
+  用户侧 `[FBDEMO] map va=0x… u=1 bytes=4096000`、连续帧 `[FBDEMO] frame=… flip=…` 两两差异、
+  越界 `[FBDEMO] oob ret=1`（`clip=reject`，程序继续跑）/ 部分越界 `[FBDEMO] clamp ret=0`（`clip=clamped sub=…`）；
+  `tests/fbmap64_test.py` **39/39**。**边界**：演示在**共享地址空间的启动期**跑（不是独立进程）、UEFI 路径跳过、像素只支持 XRGB8888。
+* **A2 用户态 C 运行时**（`user/lib` 顶层 21 + `user/lib/sys/` 2 = **23 个文件**；入口 `user/build_user.sh`）：自研最小 libc +
+  `int 0x80` 自有 ABI 包装 + **clang/lld 交叉编译**；★ **`-mcmodel=large` 是硬要求**（程序链在 4GiB，默认 code model 编不过）；
+  `tests/userlib64_test.py` **57/57**（printf 子集 / malloc 压力 / 文件 IO / 退出码）。**边界**：`printf` 没有 `%f/%e/%g` 与
+  精度/星号宽度（遇到按原样输出，`user/lib/stdio.c:5`）、`malloc` **不做相邻空闲块合并**（`user/lib/stdlib.c:10`）、
+  VAP64 应用 blob 代码上限 **32 KiB**（`kernel/app64.h:44`）。
+* **A3 musl 静态程序在 ring3 真跑**：`[MUSL] hello / malloc / clock_gettime / getrandom` + **真进程独立 CR3**；
+  修掉三个**真缺陷**：① auxv 的 `AT_PHNUM` 曾写成 4（= `AT_PHENT`，musl 拿不到程序头数）② `DT_INIT_ARRAY` 没跑
+  ③ SSE/xmm 状态没保存；`tests/musl64_test.py` **85/85**。**边界**：**musl 自带的 `ld-musl`（动态形态）没通**
+  —— 缺 `libc.so` 形态、TLS 动态模型、`DT_VERNEED`、vDSO。
+* **A3 下半 自研 `ld.so` 动态链接**：`PT_INTERP` 装载 + `R_X86_64_RELATIVE/GLOB_DAT/JUMP_SLOT/ABS64` + `DT_NEEDED` 递归加载
+  + `DT_INIT/DT_INIT_ARRAY`（依赖先于依赖者）+ **符号解析"主程序优先"** + 段权限收紧（按页并集表）；
+  实测 `[LDSO] self base=0x…`、`[LDSO] load /lib/libfoo.so`、`[DYNH] PASS exit=0`；`tests/dynlink64_test.py` **90/90**。
+  **边界**：**lazy binding / `dlopen`+`dlsym` / rpath 都没做**；对象数上限 `LD_MAX_OBJ = 8`（`user/ldso/ldso.c:125`）、
+  解释器映射区 ≤ **448 KiB / 112 页**（`kernel/elf64.cpp:273`）。
+* **A4-1 Ring 3 shell**：`/bin/shell.bin`（51,856 B）交付在**系统卷**（`tools/make_shellvol.py` 写进 VimtuFS2 v4 卷），
+  内核里**搜不到它的字节**、内核代价只 **+2,976 B**（`build64.sh:685` 构建期断言）；`run` 走 `fork(57)+execve(59)+wait4(61)` 真进程，
+  `>` / `>>` / `<` / 管道可用（`[FD64] dup old=… new=1` + `[PROC64] execve … fds_kept=2` + `cat` 回读逐字节一致）；
+  `tests/sh64_test.py` **59/59**。**边界**：重定向/管道只对**内建命令**成立（外部命令的 fd 0/1 由内核 dup2 链路给）；
+  没有 job control / 别名 / 变量展开。
+* **A4-4a / A4-4c Lua 5.4.7 + 用户态 gzip/gunzip**：`/bin/lua` + `/lib/lua.bin`（**338,032 B**）+ `/bin/gzip`（**25,744 B**）都在系统卷、内核 0 字节；
+  **互操作三证**：① 压-解往返**逐字节**相等（含 1 MiB）② 我们流里的 **CRC32 / ISIZE 与宿主 Python(zlib) 完全一致**
+  ③ **宿主 Python 能解开我们压的文件**；`tests/lua64_test.py` **57/57**、`tests/gzip64_test.py` **37/37**。
+  **边界**：deflate 只做 **store + fixed-Huffman**（没有动态 Huffman 优化）、**tar 没做**、Lua 缺部分 libc（`os`/`io` 部分函数如实报错）。
+* **A4-2b Ring 3 里的 TinyCC**：`/bin/tcc`（装载驱动）+ `/lib/tcc.bin`（**手写构建 282,328 B**）+ `/tcc/**` 全在系统卷、内核 0 字节；
+  `tcc -c x.c -o x.o` 出 **ET_REL**（`e_type=1` / `EM_X86_64` / `e_shnum=8`，宿主侧解析夹具卷 `.o` 头）、
+  `tcc x.c -o prog` 出 **ET_EXEC**（无 PT_INTERP/PT_DYNAMIC，PT_LOAD 全落在 4GiB..+64KiB）、shell `run /tmp/hello2`
+  跑通且输出**逐字节**正确、退出码 0；内核侧：用户窗口 mmap 上界 **1 MiB → 16 MiB**（`kernel/usermode64.h:41`，其余地址不动、`lazy=1`、
+  **空闲页池不变**）；根因修复"单字节 write ×113 烧光 5 s wait4 上限"后 **5.70 s → 4.53 s**；
+  `tests/tcc64_test.py` **66/66、0 缺口**（本轮**主树**实跑，此前只在隔离 worktree 里报过）。**边界**：`-run` / `-E` / `-g` / `-O2` **没测**；
+  链接那一次 4.53 s 贴着 5 s 上限，**余量仅 ~0.47 s**。
+* **A5-hda Intel HDA 声卡驱动**（`kernel/hda64.{h,cpp}`）：PCI 枚举 → 码器 → **DAC + Pin** 通路 → 48 kHz/16bit/2ch → **BDL 环** → 音量/静音；
+  实测 `[HDA64] pci <b>:<d>.<f> bar0=0x… codecs=1`、`[HDA64] dac nid=… pin nid=…`、`[HDA64] fmt 48000/16/2 … rdback=0x11 … ok=1`、
+  `[HDA64] selftest PASS mask=0 lpib=<n> bcis=<m>`（流位置与缓冲完成位都在前进）、`[HDA64] stream done lpib=… bcis=1 ok=1`，
+  测试用 `-audiodev wav` 落盘出**真波形**；声音面板 / 设置页 / 终端 `audio playtone|vol|mute` 真接线；`tests/hda64_test.py` **31/31**。
+  **边界**：24-bit / 多流 / 插孔检测 / HDMI / **中断驱动**都没做（只轮询）；★ **VMware 强制 sb16，HDA 只能在 QEMU 验**。
+* **A5 前置 `input_poll(12)` + `shm_create(13)` / `shm_map(14)`**：每进程 **32 条**事件队列，满了**丢最旧 + 计数**
+  （`[EV64] drop/drops/poll`，绝不静默丢事件）、焦点/捕获路由；共享内存对象表 **8 对象 × 单对象 ≤16 页（64 KiB）**、
+  映射窗 4×64 KiB，**fork 继承句柄 + 退出回收**（`kernel/proc64.cpp:288/897/941/1285`）；修掉**任务 create+bind 的抢占竞态**
+  （ring3 第一句话就"没有进程上下文"）；`tests/ipc64_test.py` **QEMU 67/67、VMware 65/65**（同一份判据，VMware 侧指针只断言方向）。
+* **A4-5 信号真投递 + 自研 Ring 3 编辑器**：用户栈上构造返回帧 + `rt_sigreturn(15)` 恢复被打断的现场、
+  **三条投递点**（kill 类 / 用户态异常 / tty 的 Ctrl+C）、默认动作**退出码 = 128+sig**
+  （`[SIG64] default action pid=25 sig=8 exit=136 fault=#DE …`、`pid=26 sig=9 exit=137 why=kill`）、阻塞/未决位图、
+  `kill(-pgid)` / Ctrl+C 投给**前台进程组**；★ **用户态 #PF / #GP / #DE 只杀该进程、不再 PANIC**（`kernel/sig64.h:13`）；
+  `tests/sig64_test.py` **44/44**。编辑器 `/bin/edit`（`build64/edit` 37,984 B）：真 argv + `input_poll` 取键 + raw/还原 +
+  `:w :q` + `Ctrl+S`，**宿主侧卷解析逐字节一致**，1 MiB 文本 **8527 行**；`tests/edit64_test.py` **33/33**。
+  **边界**：没有 `siginfo` / `sigaltstack` / `SA_RESTART` / 实时信号排队 / 作业控制；**`#DF`/`#TS`/`#MC` 与内核态异常仍 PANIC**；
+  编辑器没有 vi 模式、行索引上限 **65536 行**、控制台不解析 ANSI 转义。
 ## 八、路线图（未完成的部分）
 
 按依赖顺序（这也是欢迎贡献的方向）：
@@ -603,9 +671,11 @@ objcopy 符号名保持不变。运行时打点：`[FONT64] faces=4 …` / `mono
 `fallback hit cp=0x… face=3` / `selftest PASS mask=…`（验收：`py -3 tests\fonts64_test.py`）。
 许可与派生说明见 [docs/字体许可说明.md](docs/字体许可说明.md)。**因此 ISO/IMG 可以直接公开分发。**
 
-**版本与发布**：标签 `v0.3.4-beta16`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.3.4-beta16>
-（历史版本各自保留安装程序：`v0.3.3-beta15` / `v0.3.2-beta14` / `v0.3.1-beta13` / `v0.3.0-beta12` / `v0.2.3-beta11` / `v0.2.2-beta10` / `v0.2.1-beta9` / `v0.2.1-beta8` / `v0.2.1-beta7` / `v0.2.1-beta6` / `v0.2.0-beta.5` / `v0.2.0-beta.4` / `v0.2.0-beta.3` / `v0.2.0-beta.2` / `v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
-（预发布；**安装盘已附上**：`vimtu64-64.iso` 三合一安装盘 + `vimtu64-64.img` 裸盘介质；系统内核 **3,718,976 B**（上限 4,096,000 B，**余量 377,024 B**）、安装内核 **2,200,272 B**；内嵌版本串 = `[SET64] about version=VimtuOS 0.3.4-beta16 …`）
+**版本与发布**：标签 `v0.4.0-beta17`，Release：<https://github.com/Fanqi89/VimtuOS/releases/tag/v0.4.0-beta17>
+（历史版本各自保留安装程序：`v0.3.4-beta16` / `v0.3.3-beta15` / `v0.3.2-beta14` / `v0.3.1-beta13` / `v0.3.0-beta12` / `v0.2.3-beta11` / `v0.2.2-beta10` / `v0.2.1-beta9` / `v0.2.1-beta8` / `v0.2.1-beta7` / `v0.2.1-beta6` / `v0.2.0-beta.5` / `v0.2.0-beta.4` / `v0.2.0-beta.3` / `v0.2.0-beta.2` / `v0.1.0-beta.1` —— 见 <https://github.com/Fanqi89/VimtuOS/releases>）
+（预发布；**安装盘已附上**：`vimtu64-64.iso` 三合一安装盘 + `vimtu64-64.img` 裸盘介质；系统内核 **3,689,744 B**（上限 4,096,000 B，**余量 406,256 B**）、安装内核 **1,881,280 B**；
+★ 内嵌版本串仍是 `[SET64] about version=VimtuOS 0.3.4-beta16 …` —— 本批**没改** `build64.sh` 的 `VIMTUOS_VERSION`（只允许改文档/状态脚本），
+因此"标签 `v0.4.0-beta17` vs 内嵌串 `0.3.4-beta16`"**不一致这一项如实记录**，修法与 beta15 同：改那一行后重建）
 
 ```bash
 # 日常：改完代码这样提交推送（★ 不要用网页拖拽上传 —— 那会绕过 .gitignore）
@@ -701,9 +771,43 @@ whole table, `execve` keeps fds (no `O_CLOEXEC` yet), `O_APPEND` is real and `pi
 
 Everything was validated on **QEMU and VMware, BIOS and UEFI — not on bare metal**.
 
-Quality-wise, every change is verified by assertion scripts (56 `tests/*.py` files; the `tests/status_report.py --full`
-list alone runs 45 scripts — including the new `desktopops64_test` 65-66, `settings64_test` 105, `locklogin64_test` 88,
-`gui_modern64_test` 149, `rust64_test` 124 and `startmenu64_test` 58 — that check serial logs, screen pixels
-(QEMU screendumps) and raw disk bytes).
+**The A1–A5 batch (v0.4.0-beta17) is where user mode becomes useful**: user-space drawing through
+`fb_map(9)`/`fb_flip(10)`/`fb_present(11)` (`[FB64] map … u=1` — the kernel page-table check that the mapping is
+user-accessible — plus a ring3 demo whose consecutive frames differ, with out-of-bounds flips rejected as
+`clip=reject`), a **user-space C runtime** (`user/lib`, 23 files: minimal libc + `int 0x80` ABI wrappers +
+clang/lld cross build, `-mcmodel=large` mandatory because programs link at 4 GiB), **static musl programs really
+running in ring3** (own CR3 per process; fixing three real defects: `AT_PHNUM` had the value of `AT_PHENT`,
+`DT_INIT_ARRAY` was never called, SSE/xmm state was not saved), an **own `ld.so` dynamic linker**
+(`PT_INTERP`, RELATIVE/GLOB_DAT/JUMP_SLOT/ABS64, `DT_NEEDED` recursion, `DT_INIT*`, main-program-first symbol
+resolution), a **Ring 3 shell** (`/bin/shell.bin` delivered on the system volume — zero shell bytes in the kernel,
+which only grew by 2,976 B; `run` = fork+execve+wait4; `> >> <` and pipelines), **Lua 5.4.7 and a user-space
+gzip/gunzip** (`/bin/lua` + `/lib/lua.bin`, `/bin/gzip`; three interop proofs: byte-identical round trip,
+CRC32/ISIZE equal to host Python, and **host Python can inflate our files**), **TinyCC inside ring3**
+(`tcc -c` emits ET_REL, `tcc x.c -o prog` emits ET_EXEC, `run` executes it byte-for-byte; kernel window raised
+1 MiB → 16 MiB with `lazy=1` and an unchanged free-page pool; link step 5.70 s → 4.53 s against the 5 s wait4
+limit), an **Intel HDA audio driver** (enumerate → codec → DAC+Pin → 48k/16/2 → BDL ring; `lpib`/`bcis` advance,
+`-audiodev wav` captures a real waveform), **`input_poll(12)` + `shm_create(13)`/`shm_map(14)`** (32-event
+per-process queues with drop-oldest counters, focus routing, shared objects with fork inheritance and reclaim on
+exit — plus a fix for a task create+bind preemption race), **real signal delivery** (user stack frame +
+`rt_sigreturn`, default action exit code 128+sig, process groups; user-mode `#PF`/`#GP`/`#DE` now kill only the
+faulting process instead of panicking the kernel) and an **own Ring 3 editor `/bin/edit`** (real argv, keys from
+`input_poll`, raw-mode save/restore, `:w :q`, `Ctrl+S` verified byte-for-byte by parsing the volume on the host,
+8527-line 1 MiB file).
+Honest boundaries for this batch: the drawing demo runs during boot in the shared address space (UEFI skips it,
+XRGB8888 only); the C runtime's `printf` has no `%f/%e/%g`/precision and `malloc` never coalesces; musl's own
+`ld-musl` dynamic form is **not** supported (no libc.so/TLS dynamic model/DT_VERNEED/vDSO); lazy binding,
+`dlopen`/`dlsym` and rpath are absent (max 8 objects, 448 KiB interpreter window); gzip only does
+store+fixed-Huffman and there is no tar; TinyCC's `-run`/`-E`/`-g`/`-O2` are untested and the link step has only
+~0.47 s of headroom; HDA lacks 24-bit/multi-stream/jack-detection/HDMI and interrupts (VMware only exposes sb16,
+so HDA is QEMU-only); signals have no `siginfo`/`sigaltstack`/`SA_RESTART`/RT queueing/job control and kernel-mode
+faults still panic; the editor has no vi mode and caps at 65536 lines. The images still embed the version string
+`0.3.4-beta16` because `build64.sh`'s `VIMTUOS_VERSION` was **not** touched by this batch (documented honestly).
+
+Quality-wise, every change is verified by assertion scripts (**71** `tests/*.py` files; the `tests/status_report.py --full`
+list alone runs **59** scripts, of which this release runs **58 PASS / 1 FAIL / 0 TIMEOUT / 0 MISSING** — the single
+failure is `tmgr_proc_test` 38/39, where the task manager's "end task" clicked a pid that had already exited and the
+kernel honestly answered `-ESRCH`, while the assertion demanded `rc=0`; VMware runs: BIOS install E2E **PASS**,
+EFI install E2E **PASS**, `ipc64_test --vmware` **65/65 PASS**, `vmrun list` = 0). They check serial logs,
+screen pixels (QEMU screendumps), **raw disk bytes and host-side volume parsing**.
 Tooling adds ~3k lines of self-written Python (ISO9660/GPT/FAT32/VAP64 packing, font subsetting, PE/FAT diagnostics).
 
