@@ -22,6 +22,7 @@
 //   宏隔离而不是加"空实现"：安装内核里 usb64_msc_* 的调用点整段消失，链接期不会有未定义符号。
 #if !defined(VIMTU_INSTALLER_MEDIA)
 #include "usb64.h"
+#include "xhci64.h"     // ★ xHCI 的 U 盘也走同一段驱动器号（24..）：顺序 = 先 UHCI 后 xHCI
 #define ATA64_HAVE_USB64 1
 #endif
 
@@ -206,9 +207,24 @@ static bool ata_wait_done_irq(int drive) {
 // ★ 顺序有讲究：先 PATA、再 AHCI、NVMe、最后 USB —— 与"驱动器号从小往大"一致，界面行序稳定。
 // USB 存储的"可用块设备"数量（**安装介质内核里恒为 0**：那份内核不链 usb64.cpp，
 // 见文件头/ata64.h 的说明 —— U 盘绝不会成为安装目标）。
+// ★ 统一分派（xHCI 批次）：驱动器号 24.. 的**顺序固定 = 先 UHCI（usb64）后 xHCI（xhci64）**。
+//   为什么集中在这三个小函数里：驱动器号 -> 具体模块的映射只有一处，下面 ata64_identify /
+//   ata64_read 两个调用点都走它（write 只打"只读"点，不涉及模块），界面行序稳定。
+#ifdef ATA64_HAVE_USB64
+static bool ata64_usb_info(int k, char* model, int model_cap, uint64_t* sectors_512) {
+    const int u = usb64_msc_count64();
+    if (k < u) return usb64_msc_info64(k, model, model_cap, sectors_512);
+    return xhci64_msc_info64(k - u, model, model_cap, sectors_512);
+}
+static bool ata64_usb_read(int k, uint32_t lba, uint32_t count, void* buf) {
+    const int u = usb64_msc_count64();
+    if (k < u) return usb64_msc_read64(k, lba, count, buf);
+    return xhci64_msc_read64(k - u, lba, count, buf);
+}
+#endif
 static int ata64_usb_count() {
 #ifdef ATA64_HAVE_USB64
-    return usb64_msc_count64();
+    return usb64_msc_count64() + xhci64_msc_count64();
 #else
     return 0;
 #endif
@@ -242,7 +258,7 @@ bool ata64_identify(int drive, DiskInfo* out) {
     if (drive >= ATA64_USB_BASE) {
         // ★ 批次 O：USB 存储（U 盘）。只读设备：atapi = false（它不是光驱），
         //   型号 = INQUIRY 的"厂商 + 型号"，sectors = 容量按 512B 换算的总扇区数。
-        return usb64_msc_info64(drive - ATA64_USB_BASE, out->model, 41, &out->sectors) &&
+        return ata64_usb_info(drive - ATA64_USB_BASE, out->model, 41, &out->sectors) &&
                (out->present = true);
     }
 #endif
@@ -366,7 +382,7 @@ bool ata64_read(int drive, uint32_t lba, uint32_t count, void* buf) {
     //          16.. -> NVMe 命名空间读（内部按 128 扇区分块）；
     //          8..15 -> AHCI(SATA) DMA 读（LBA48）
 #ifdef ATA64_HAVE_USB64
-    if (drive >= ATA64_USB_BASE) return usb64_msc_read64(drive - ATA64_USB_BASE, lba, count, buf);
+    if (drive >= ATA64_USB_BASE) return ata64_usb_read(drive - ATA64_USB_BASE, lba, count, buf);
 #endif
     if (drive >= ATA64_NVME_BASE) return nvme64_read64(drive - ATA64_NVME_BASE, lba, count, buf);
     if (drive >= ATA64_AHCI_BASE) return ahci64_read64(drive - ATA64_AHCI_BASE, lba, count, buf);

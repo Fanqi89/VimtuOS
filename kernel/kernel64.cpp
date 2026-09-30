@@ -47,6 +47,7 @@
 #include "proc64.h"      // 进程/地址空间（批次 C：每进程 CR3 + fork/execve/wait4；只进系统内核）
 #include "sig64.h"       // ★ A4-5：信号投递（selftest / tty-int 自检 / 进程信号状态查询）
 #include "usb64.h"      // USB 主机：UHCI + HID 引导键盘（只进系统内核；按键注入 PS/2 同一队列）
+#include "xhci64.h"     // ★ xHCI（USB 3.x）+ HID 键盘 + USB 存储（只进系统内核，同 usb64）
 #include "apic64.h"    // LAPIC + IOAPIC 接管中断路由（只进系统内核；拿不到就留在 PIC）
 #include "smp64.h"     // SMP：启动 AP（INIT-SIPI-SIPI + 低端跳板；只进系统内核）
 // ---- 本轮移植的四个子系统（都只进系统内核，见 build64.sh 的 SRCS_OS）----
@@ -1220,16 +1221,25 @@ static void rust64_boot_init64() {
     //   只打点并返回负值，系统照常启动、桌面照常工作（自检按 skipped 处理，不算失败）。
     // 运行期轮询由 kusb 内核线程负责（见 kernel/task64.cpp），不占用这里的执行流。
     (void)usb64_init64();
+    // ---- ★ xHCI（USB 3.x，kernel/xhci64.cpp）：HID 引导键盘 + USB 存储（只读）----
+    // 位置：**usb64_init64() 之后**（两个主控各自独立：先后顺序只决定驱动器号/设备数的排列，
+    //   互不干扰；都是"找不到主控/没插设备只打点"的优雅降级）。运行期轮询同样归 kusb 线程
+    //   （task64.cpp 不改：usb64_poll64() 里会调 xhci64_poll64()）。
+    (void)xhci64_init64();
     // ---- ★ 批次 O：USB 存储（U 盘）接进来之后**重扫盘符表** ----
     // 为什么必须重扫：drive64_scan64() 上面（vfs64 挂载成功那条路径）已经跑过一次，那时 USB
     //   存储还没枚举（usb64_init64 排在 net64 之后）。重扫会把 U 盘上的 FAT32/VimtuFS2 卷按现有
     //   规则识别 -> 只读挂载 -> 分配盘符（D:/E:…），容量/可用/只读标记全部由现有代码算出来。
     // 幂等性：drive64_scan64() 对同一块盘/同一个卷复用已有的 vfs64 槽与 fs64 卷号（见其注释），
     //   所以重扫不会动 C: 的盘符、也不会把卷表撑爆；**没插 U 盘时整段跳过**（行为与改动前一致）。
-    if (usb64_msc_count64() > 0) {
+    if (usb64_msc_count64() > 0 || xhci64_msc_count64() > 0) {
         dbg64_line_begin64();
         dbg64_str("[USBST] storage attached -> rescan drive letters (usb drives=");
+        dbg64_dec((uint64_t)(usb64_msc_count64() + xhci64_msc_count64()));
+        dbg64_str(", uhci=");
         dbg64_dec((uint64_t)usb64_msc_count64());
+        dbg64_str(" xhci=");
+        dbg64_dec((uint64_t)xhci64_msc_count64());
         dbg64_str(")\n");
         dbg64_line_end64();
         (void)drive64_scan64();

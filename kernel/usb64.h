@@ -75,3 +75,14 @@ int      usb64_ports64();         // 根端口数（0 = 没有主控）
 int      usb64_devices64();       // 已枚举成功的设备数（0 = 没有；键盘 + U 盘）
 uint64_t usb64_hid_reports64();   // 收到的 8 字节 HID 报告总数
 uint64_t usb64_key_events64();    // 按键**按下**事件数（HID 边沿检测后）
+
+// ---- ★ xHCI（kernel/xhci64.cpp）复用的 HID 报告解析 ----
+// 为什么共享而不是各写一份：**"HID 引导报告 -> PS/2 集 1 扫描码 -> input.cpp 同一条按键队列"这条
+// 路径只有一套实现**（用法码表 + cli/sti 包住的两字节注入 + 边沿检测），xHCI 只是换了一个"报告
+// 从哪来"的来源（中断端点从 UHCI 的 TD 换成 xHCI 的 Normal TRB）。状态由调用方持有：
+// UHCI 键盘与 xHCI 键盘各有一份，互不干扰（不会因为另一台键盘的报告而漏边沿）。
+struct Usb64Hid64 { uint8_t mods; uint8_t keys[6]; };   // "上一次报告"，调用方自己清零即可
+// 解析一份 8 字节引导键盘报告：只对**边沿**产生事件（新按下 -> down=1，消失 -> down=0）。
+// xhci=0 -> 打点前缀 "[USB64] hid report key="；xhci=1 -> "[XHCI] hid report key="（两种主控不混）。
+// 返回本次的"按下"边沿数；*key_events（可为 null）累加按下边沿数。
+int usb64_hid_report64(const uint8_t* r, Usb64Hid64* st, int xhci, uint64_t* key_events);

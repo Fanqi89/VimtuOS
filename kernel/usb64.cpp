@@ -58,6 +58,7 @@
 #include "input.h"       // kbd_inject_scancode()：注入到 PS/2 同一条按键队列
 #include "memlayout64.h" // ★ 必须先于 mem_64.h（PAGE_SIZE_64 会撞）；ML64_KERNEL_VA_BASE 用它
 #include "mem_64.h"      // page_alloc_64 / memset_64（低内存恒等映射：物理地址即指针）
+#include "xhci64.h"     // ★ xHCI（USB 3.x）：kusb 轮询线程也要驱动它（task64.cpp 不改，见 usb64_poll64）
 #include "x86_64.h"      // g_ticks64 / ms_to_ticks64 / nop_pause()
 #include <stdint.h>
 #include <stddef.h>
@@ -210,9 +211,8 @@ static uint64_t  g_hid_reports = 0;
 static uint64_t  g_key_events  = 0;
 static int       g_devices     = 0;
 
-// HID 报告的边沿检测状态
-static uint8_t   g_last_mods   = 0;
-static uint8_t   g_last_keys[6] = {0, 0, 0, 0, 0, 0};
+// HID 报告的边沿检测状态（★ xHCI 批次：交给 UHCI/xHCI 共用的解析函数持有，见 usb64.h）
+static Usb64Hid64 g_hid_state  = { 0, { 0, 0, 0, 0, 0, 0 } };
 
 // ==================== 小工具 ====================
 static void usb_log_begin() { dbg64_line_begin64(); }
@@ -630,15 +630,15 @@ static void usb_inject_key(uint16_t code, bool down) {
     if (fl & 0x200ull) __asm__ volatile("sti" ::: "memory");
 }
 
-// 一个"新按下 / 释放"边沿：打点 + 注入 + 计数。
-static void usb_key_edge(uint8_t usage, bool down) {
+// 一个"新按下 / 释放"边沿：打点 + 注入（★ 前缀与计数器由调用方给：UHCI 用 [USB64]、xHCI 用 [XHCI]）
+static void usb_key_edge(uint8_t usage, bool down, int xhci, uint64_t* key_events) {
     usb_log_begin();
-    dbg64_str("[USB64] hid report key=");
+    dbg64_str(xhci ? "[XHCI] hid report key=" : "[USB64] hid report key=");
     usb_hex(usage, 2);
     dbg64_str(down ? " down=1" : " down=0");
     usb_log_end();
 
-    if (down) g_key_events++;
+    if (down && key_events) (*key_events)++;
     const uint16_t code = hid_usage_to_scan(usage);
     if (code) usb_inject_key(code, down);
 }
@@ -647,44 +647,53 @@ static void usb_key_edge(uint8_t usage, bool down) {
 // byte0 = 修饰键位图；byte1 = 保留；byte2..7 = 最多 6 个同时按下的用法码。
 // 只对"上一次报告 vs 这一次报告"的**边沿**产生事件（新按下 -> down=1，消失 -> down=0），
 // 所以按住不放不会被重复触发，也不会每个报告都刷屏。
+// ★ 本函数是 UHCI 与 xHCI **共用**的（见 usb64.h）：边沿状态 st 由调用方持有 —— 两种主控
+//   各有一份，互不干扰；打点前缀与计数器也由调用方决定（[USB64] / [XHCI] 不混）。
 static bool key_in_list(const uint8_t* list, uint8_t k) {
     for (int i = 0; i < 6; i++) if (list[i] == k) return true;
     return false;
 }
-static void usb_handle_report(const uint8_t* r) {
-    g_hid_reports++;
+int usb64_hid_report64(const uint8_t* r, Usb64Hid64* st, int xhci, uint64_t* key_events) {
+    int downs = 0;
     static const uint8_t MOD_USAGE[8] = { 0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7 };
     const uint8_t mods = r[0];
 
     // 1) 修饰键的按下边沿（先按修饰键，再按普通键 -> Shift/Ctrl 组合才对）
     for (int i = 0; i < 8; i++) {
-        const bool was = (g_last_mods >> i) & 1u;
+        const bool was = (st->mods >> i) & 1u;
         const bool now = (mods >> i) & 1u;
-        if (now && !was) usb_key_edge(MOD_USAGE[i], true);
+        if (now && !was) { usb_key_edge(MOD_USAGE[i], true, xhci, key_events); downs++; }
     }
     // 2) 普通键的按下边沿（0 = 空槽，1 = ErrorRollOver，都跳过）
     for (int i = 0; i < 6; i++) {
         const uint8_t k = r[2 + i];
         if (k == 0 || k == 1) continue;
-        if (!key_in_list(g_last_keys, k)) usb_key_edge(k, true);
+        if (!key_in_list(st->keys, k)) { usb_key_edge(k, true, xhci, key_events); downs++; }
     }
     // 3) 普通键的释放边沿
     for (int i = 0; i < 6; i++) {
-        const uint8_t k = g_last_keys[i];
+        const uint8_t k = st->keys[i];
         if (k == 0 || k == 1) continue;
-        if (!key_in_list(&r[2], k)) usb_key_edge(k, false);
+        if (!key_in_list(&r[2], k)) usb_key_edge(k, false, xhci, key_events);
     }
     // 4) 修饰键的释放边沿
     for (int i = 0; i < 8; i++) {
-        const bool was = (g_last_mods >> i) & 1u;
+        const bool was = (st->mods >> i) & 1u;
         const bool now = (mods >> i) & 1u;
-        if (was && !now) usb_key_edge(MOD_USAGE[i], false);
+        if (was && !now) usb_key_edge(MOD_USAGE[i], false, xhci, key_events);
     }
 
-    for (int i = 0; i < 6; i++) g_last_keys[i] = r[2 + i];
-    g_last_mods = mods;
+    for (int i = 0; i < 6; i++) st->keys[i] = r[2 + i];
+    st->mods = mods;
+    return downs;
 }
 
+// UHCI 那一侧：报告计数 + 用 [USB64] 前缀走上面这份共享解析（行为与拆分前逐条一致）
+static void usb_handle_report(const uint8_t* r) {
+    g_hid_reports++;
+    (void)usb64_hid_report64(r, &g_hid_state, 0, &g_key_events);
+
+}
 // ==================== 中断 IN 端点（HID 报告）====================
 // 武装：QH.element 指向中断 TD（ACTIVE）—— 硬件每帧重试，直到设备给出报告（NAK 时保持 ACTIVE）。
 static void usb_arm_interrupt() {
@@ -699,8 +708,11 @@ static void usb_arm_interrupt() {
     g_qh->element = td_phys(g_irq_td);                   // ★ 发布
     usb_barrier();
 }
-
 void usb64_poll64() {
+    // ★ xHCI（USB 3.x）：**和 UHCI 共用 kusb 这一个轮询线程**（kernel/task64.cpp 不改）。
+    //   两个主控各有独立的 DMA 结构/事件环/自旋锁，先后顺序互不影响：xhci64_init64() 在
+    //   usb64_init64() 之后调用（见 kernel64.cpp），没有主控时 xhci64_poll64() 首行直接返回。
+    xhci64_poll64();
     if (!g_ready || !g_irq_td) return;
     // ★ 批次 O：有传输在跑时（mass storage 的批量传输是同步自旋等待的）不碰队列 ——
     //   拿不到锁就"这次不重新武装"，下次轮询再来。绝不阻塞、绝不挂死。
