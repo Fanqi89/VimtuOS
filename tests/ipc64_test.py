@@ -685,6 +685,8 @@ def run_vmware(ch, args):
         vnc_holder.close()
     except Exception:
         pass
+    # ★ 纪律：VMware 用完必须停掉（别把 VM 挂着，宿主资源与后续脚本都会被它挡住）。
+    stop_all_vms()
     return log
 
 
