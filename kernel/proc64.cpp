@@ -150,6 +150,17 @@ static inline uint64_t* p64_phys64(uint64_t pa) { return (uint64_t*)(uintptr_t)p
 static inline uint64_t p64_rd_cr364() { uint64_t v; __asm__ volatile("mov %%cr3, %0" : "=r"(v)); return v; }
 static inline uint64_t p64_align_up64(uint64_t v) { return (v + 0xFFFULL) & ~0xFFFULL; }
 static inline bool p64_canonical64(uint64_t v) { return ((v >> 47) == 0) || ((v >> 47) == 0x1FFFFULL); }
+// ★ A5 前置：关中断/恢复（"任务 create + 绑定进程"必须原子，见 proc64_start_elf64/fork 的说明）。
+//   为什么不用 task64 的现成助手：那里没有导出；这里只需要保存 RFLAGS.IF 并在之后恢复，
+//   与 mem64.cpp 的同名助手同一套写法（pushfq/popfq + cli/sti）。
+static inline uint64_t p64_irq_save64() {
+    uint64_t f = 0;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void p64_irq_restore64(uint64_t f) {
+    __asm__ volatile("pushq %0; popfq" :: "r"(f) : "memory", "cc");
+}
 
 // 日志助手（行锁 + 统一前缀）
 static void p64_log2(const char* a, const char* b) {
@@ -1039,13 +1050,22 @@ int proc64_start_elf64(int pid, const char* path) {
     p64_strcpy_n(p->exe, path, PROC64_PATH_MAX);
 
     // 3) 任务：入口 = proc64_task_entry64（它会进 ring3 并等退出）
+    // ★ 竞态修复（A5 前置验收实测到，见本文件顶部第 4 条）：**create + bind 必须在关中断的
+    //   窗口里完成**。任务一旦进 READY 就可能被 PIT（250Hz）抢占先跑起来，那时 TCB 里的 proc
+    //   指针还是 0 —— 它自己的系统调用就会看到"没有进程上下文"（实测症状：同一份内核里
+    //   `[FB64] map pid=-1`、`[SHM64] create FAILED reason=no-process-context`，约 1/3 的启动
+    //   命中一次；窗口只有几十条指令宽）。关中断把这段变成原子的，代价只是一次 16KiB 栈初始化的时间。
+    const uint64_t if0 = p64_irq_save64();
     const int tid = task_create64(p->name, proc64_task_entry64, p);
+    if (tid >= 0) {
+        p->task_id = (uint32_t)tid;
+        task_bind_proc64((uint32_t)tid, p, p->cr3, p->fs_base);
+    }
+    p64_irq_restore64(if0);
     if (tid < 0) {
         p64_log2("[PROC64] start FAILED reason=task path=", path);
         return -1;
     }
-    p->task_id = (uint32_t)tid;
-    task_bind_proc64((uint32_t)tid, p, p->cr3, p->fs_base);
     return 0;
 }
 
@@ -1162,15 +1182,22 @@ int64_t proc64_fork64(pt_regs64* r) {
     c->frame = (uint64_t)(uintptr_t)&s_cframes[cidx];
     c->entry = s_cframes[cidx].rip;
 
+    // ★ 竞态修复（与 proc64_start_elf64 同一处道理）：create + bind 关中断原子完成 ——
+    //   否则子任务可能在 task_bind_proc64 之前就被 PIT 抢占先跑，它第一件事就是回 ring3 继续
+    //   父进程的现场，而 TCB 里还没有 proc 指针 -> 它之后的系统调用全都看到"没有进程上下文"。
+    const uint64_t if0 = p64_irq_save64();
     const int tid = task_create64(c->name, proc64_task_entry64, c);
+    if (tid >= 0) {
+        c->task_id = (uint32_t)tid;
+        task_bind_proc64((uint32_t)tid, c, c->cr3, c->fs_base);
+    }
+    p64_irq_restore64(if0);
     if (tid < 0) {
         p64_exit64(c, 1, 0);
         proc64_destroy64(cpid);
         p64_log2("[PROC64] fork FAILED reason=task parent-name=", par->name);
         return -P64_ENOMEM;
     }
-    c->task_id = (uint32_t)tid;
-    task_bind_proc64((uint32_t)tid, c, c->cr3, c->fs_base);
 
     dbg64_line_begin64();
     dbg64_str("[PROC64] fork parent=");
