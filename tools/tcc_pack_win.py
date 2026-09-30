@@ -112,6 +112,102 @@ class Volume2(SV.Volume):
 
 
 # ---------------------------------------------------------------------------
+# ★ A4-4：VolumeEdit —— "在一块**已存在**的 VimtuFS2 v4 卷镜像上继续写文件" 的离线编辑器
+#
+# 为什么需要它：本批的交付是"多个工具各自把自己的文件装进**同一块**系统卷"（tcc 的脚本先造出
+# 基础卷 -> lua 的脚本加上 /bin/lua + /lib/lua.bin + /tcc/demo/*.lua -> gzip 的脚本再加上
+# /bin/gzip、/bin/gunzip 与 1 MiB 试验文件）—— 谁都不该重写别人那棵树。
+# v4 卷的几何（位图/inode 表/数据区起点）由**总扇区数**唯一决定（与 make_shellvol.Volume 完全
+# 同一套公式，本类继承 Volume2 就是为了共用），所以这里把装进来的字节覆盖回去、从位图重建
+# "已用块"集合、再按空闲 inode 槽继续分配 —— 不需要动格式里的任何一个字段定义。
+# ---------------------------------------------------------------------------
+class VolumeEdit(Volume2):
+    def load(self, img):
+        """把一块已存在的卷镜像装进来（几何/超级块原样保留；只重建分配器状态）。"""
+        want = self.total * SECTOR
+        self.buf[:] = b"\0" * want
+        self.buf[:min(len(img), want)] = img[:want]
+        self.used = set()
+        for m in range(self.bmn):
+            off = (self.bitmap_start + m) * SECTOR
+            blk = self.buf[off:off + SECTOR]
+            for k in range(SV.VFS_BITMAP_BLK_BITS):
+                if (blk[k >> 3] >> (k & 7)) & 1:
+                    self.used.add(m * SV.VFS_BITMAP_BLK_BITS + k)
+
+    def inode_rec(self, i):
+        off = self.inode_start * SECTOR + i * VFS_INODE_BYTES
+        return self.buf[off:off + VFS_INODE_BYTES]
+
+    def _free_inode(self):
+        for i in range(1, self.inodes):          # inode 0 = 根目录，永不分配
+            if self.inode_rec(i)[0] == 0:
+                return i
+        raise ValueError("inode 用完（%d 个）" % self.inodes)
+
+    def find_dir(self, path):
+        """按路径找目录 inode（\"/\" 也认）；找不到返回 None。"""
+        cur = 0
+        for part in [p for p in path.split("/") if p]:
+            hit = None
+            for i in range(self.inodes):
+                rec = self.inode_rec(i)
+                if rec[0] != 2:
+                    continue
+                if struct.unpack_from("<I", rec, VFS_I_PARENT)[0] != cur:
+                    continue
+                if rec[40:40 + rec[1]].decode("ascii") == part:
+                    hit = i
+                    break
+            if hit is None:
+                return None
+            cur = hit
+        return cur
+
+    def mkdirs(self, path, mode=0o755):
+        """逐级建目录（已存在就复用）；返回最后一级目录的 inode。"""
+        cur = self.find_dir("/")
+        if cur is None:
+            raise ValueError("卷里没有根目录（img 不是 VimtuFS2 卷？）")
+        for part in [p for p in path.split("/") if p]:
+            nxt = None
+            for i in range(self.inodes):
+                rec = self.inode_rec(i)
+                if rec[0] != 2:
+                    continue
+                if struct.unpack_from("<I", rec, VFS_I_PARENT)[0] != cur:
+                    continue
+                if rec[40:40 + rec[1]].decode("ascii") == part:
+                    nxt = i
+                    break
+            if nxt is None:
+                ino = self._free_inode()
+                self.next_ino = ino
+                self.mkdir(part, parent=cur, mode=mode)
+                nxt = ino
+            cur = nxt
+        return cur
+
+    def put(self, path, data, mode=0o644, kind=None):
+        """把 data 写到卷里 path（父目录自动建）；返回写入的 inode 号。"""
+        parts = [p for p in path.split("/") if p]
+        if not parts:
+            raise ValueError("put 的路径不能是根：%r" % path)
+        d = self.mkdirs("/".join(parts[:-1]))
+        # 同名文件先删掉（卷不覆盖重名项）——直接清 inode 记录（块不回收：离线卷一次成型，够用）
+        for i in range(self.inodes):
+            rec = self.inode_rec(i)
+            if rec[0] == 1 and struct.unpack_from("<I", rec, VFS_I_PARENT)[0] == d and \
+               rec[40:40 + rec[1]].decode("ascii") == parts[-1]:
+                self.buf[self.inode_start * SECTOR + i * VFS_INODE_BYTES:
+                         self.inode_start * SECTOR + (i + 1) * VFS_INODE_BYTES] = b"\0" * VFS_INODE_BYTES
+        ino = self._free_inode()
+        self.next_ino = ino
+        self.write_file(parts[-1], data, parent=d, mode=mode, kind=kind)
+        return ino
+
+
+# ---------------------------------------------------------------------------
 # 回读自检：**独立**按卷格式把文件读回来（直接块 -> ind -> dind 三级都走一遍）
 # ---------------------------------------------------------------------------
 def _inode_rec(vol, ino):

@@ -467,6 +467,20 @@ int  vfs64_rmdir64(const char* path);
 // 返回 0 = 成功；-1 = 未挂载/路径不存在/是根目录/名字非法或超长/重名/写盘失败。
 // 打点：[VFS64] rename ok idx=<n> old=<a> new=<b> / rename64: <why>
 int  vfs64_rename64(const char* old_path, const char* new_name);
+ 
+ // ★ A4-4b：**跨目录**改名/移动（rename(82) 的 times != NULL… 即 new 路径与 old 不在同一父目录）。
+ // old_path 必须存在且不是根目录；new_path 的最后一段是目标父目录里的新名字（目标**必须不存在**）。
+ // 最小实现 = 改 inode 的 parent + name + mtime + CRC（一次落盘，没有"两边都看不到"的窗口），
+ // 目录移动额外维护两个父目录的 nlink（子目录计数）并拒绝移进自己的子树。
+ // 返回 0 = 成功；-1 = 未挂载/源不存在/目标父目录不是目录/目标已存在/名字非法/移进自己子树/写盘失败；
+ // -EACCES = 权限不足（源父目录与目标父目录都要 w+x）。打点：[VFS64] rename_to ok idx=<n> old=<a> new=<b>。
+ int  vfs64_rename_to64(const char* old_path, const char* new_path);
+ 
+ // ★ A4-4b：**显式设置 mtime**（utime(132) 的 times != NULL 路径）。packed_time = vfs64_pack_time64()
+ // 的打包格式（必须非 0）。只要文件本身可写（w；root 恒通过），父目录要可遍历（x）。
+ // 返回 0 = 成功；-1 = 未挂载/路径不存在/旧卷（v2）没有 mtime 字段/写盘失败；-EACCES = 权限不足。
+ // 打点：[VFS64] utime ok idx=<n> path=<p> mtime=0x<hex>。
+ int  vfs64_set_mtime64(const char* path, uint32_t packed_time);
 
 // ★ 批次 J：写前空间查询（当前卷数据区）。*free_bytes = 空闲块数 × 512（"还能写多少字节"的**上限**，
 // 因为还要扣间接块；调用方按自己需要的块数（含间接块）留 1 块的余量更稳）。

@@ -2652,6 +2652,130 @@ int vfs64_rename64(const char* old_path, const char* new_name) {
     dbg64_nl();
     return 0;
 }
+ 
+ // ==================== ★ A4-4b：显式时间 setter + 跨目录 rename ====================
+ // 这两条是 Lua/gzip 这类"真工具"要的**最小原语**（语义与错误码见 syscall64.cpp 的 132/82）：
+ //   * set_mtime：只改 inode 的 mtime 字段 + CRC，一个 inode 落盘就完事（没有中间态）；
+ //   * rename_to：改 inode 的 parent + name（跨目录移动 = 改目录项本身），同目录改名仍是
+ //     vfs64_rename64 的活；目录移动时维护两个父目录的 nlink（子目录计数），并拒绝把目录移进
+ //     自己的子树（那会把自己孤儿化 —— Linux 的 EINVAL）。
+ // 权限口径与既有写路径一致：动源父目录/目标父目录都要 w+x；set_mtime 还要文件本身 w
+ // （root 恒通过；v2 旧卷没有 mtime 字段 -> 如实 -1，不假装设成 1970）。
+ 
+ // 目录 idx 是不是 ancestor 的祖先链上的节点（含自己）；用于拒绝"目录移进自己的子树"。
+ static bool dir_is_ancestor64(uint32_t ancestor, uint32_t idx) {
+     uint32_t p = idx;
+     for (uint32_t depth = 0; depth <= VFS64_PATH_DEPTH_MAX; depth++) {
+         if (p == ancestor) return true;
+         uint8_t ino[VFS64_INODE_BYTES_MAX];
+         if (!inode_load(p, ino)) return true;               // 读盘失败：保守拒绝（不冒险改结构）
+         const uint32_t np = rd32(ino + VFS_I_PARENT);
+         if (np == p || np >= g_inode_count) break;          // 根目录（parent = 自己）
+         p = np;
+     }
+     return false;
+ }
+ 
+ // 显式设置 mtime（utime(132) 的 times != NULL 路径）。packed_time 必须非 0（= 合法时间戳）。
+ // 返回 0 = 成功；-1 = 未挂载/路径不存在/旧卷无 mtime 字段/写盘失败；-EACCES = 权限不足。
+ int vfs64_set_mtime64(const char* path, uint32_t packed_time) {
+     if (!g_mounted) { log_op_fail("set_mtime64", "not mounted"); return -1; }
+     if (!path) { log_op_fail("set_mtime64", "bad args"); return -1; }
+     if (g_lay->mtime_off == 0) { log_op_fail("set_mtime64", "volume has no mtime field"); return -1; }
+     if (packed_time == 0) { log_op_fail("set_mtime64", "bad time"); return -1; }
+ 
+     uint32_t idx = 0;
+     const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+     if (pr != 0) {
+         if (pr == -VFS64_EACCES) return -VFS64_EACCES;
+         log_op_fail("set_mtime64", "not found");
+         return -1;
+     }
+     uint8_t ino[VFS64_INODE_BYTES_MAX];
+     if (inode_load_ok(idx, ino, "set_mtime64") != 0) return -1;
+     const int pc = perm_check_ino64(ino, "utime", path, VFS64_NEED_W);
+     if (pc != 0) { log_op_fail("set_mtime64", "permission denied (w)"); return pc; }
+ 
+     wr32(ino + g_lay->mtime_off, packed_time);
+     wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
+     if (!inode_store(idx, ino)) { log_op_fail("set_mtime64", "inode write failed"); return -1; }
+     dbg64_str("[VFS64] utime ok idx=");
+     dbg64_dec(idx);
+     dbg64_str(" path=");
+     dbg64_str(path);
+     dbg64_str(" mtime=0x");
+     log_hex32(packed_time);
+     dbg64_nl();
+     return 0;
+ }
+ 
+ // 跨目录改名/移动：old_path 存在（不是根），new_path 的最后一段是目标父目录里的新名字。
+ // 返回 0 = 成功；-1 = 未挂载/源不存在/目标父目录不存在或不是目录/目标已存在/名字非法/移进自己子树/
+ // 写盘失败；-EACCES = 权限不足（两个目录都要 w+x）。
+ int vfs64_rename_to64(const char* old_path, const char* new_path) {
+     if (!g_mounted) { log_op_fail("rename_to64", "not mounted"); return -1; }
+     if (!old_path || !new_path) { log_op_fail("rename_to64", "bad args"); return -1; }
+ 
+     uint32_t idx = 0;
+     int pr = path_resolve(old_path, false, &idx, nullptr, nullptr, nullptr);
+     if (pr != 0) {
+         if (pr == -VFS64_EACCES) return -VFS64_EACCES;
+         log_op_fail("rename_to64", "source not found");
+         return -1;
+     }
+     if (idx == 0) { log_op_fail("rename_to64", "refuse to move the root directory"); return -1; }
+     uint8_t ino[VFS64_INODE_BYTES_MAX];
+     if (inode_load_ok(idx, ino, "rename_to64") != 0) return -1;
+     const uint32_t old_parent = rd32(ino + VFS_I_PARENT);
+     const bool is_dir = (ino[VFS_I_TYPE] == VFS64_TYPE_DIR);
+ 
+     // 目标：**必须不存在**（want_parent：目标已存在时 path_resolve 返回 0 = 我们要拒绝的情形）
+     uint32_t nparent = 0, nlen = 0;
+     char nm[VFS64_NAME_MAX + 1];
+     pr = path_resolve(new_path, true, nullptr, &nparent, nm, &nlen);
+     if (pr == 0) { log_op_fail("rename_to64", "target already exists"); return -1; }
+     if (pr == -VFS64_EACCES) return -VFS64_EACCES;
+     if (pr != 1) { log_op_fail("rename_to64", "bad target path"); return -1; }
+     if (nlen == 0 || !name_valid(nm, nlen)) { log_op_fail("rename_to64", "bad new name"); return -1; }
+ 
+     uint8_t pino[VFS64_INODE_BYTES_MAX];
+     if (inode_load_ok(nparent, pino, "rename_to64") != 0) return -1;
+     if (pino[VFS_I_TYPE] != VFS64_TYPE_DIR) { log_op_fail("rename_to64", "target parent is not a directory"); return -1; }
+     const int pc1 = perm_check_idx64(old_parent, "rename", old_path, VFS64_NEED_WX);
+     if (pc1 != 0) { log_op_fail("rename_to64", "permission denied (source dir w+x)"); return pc1; }
+     const int pc2 = perm_check_ino64(pino, "rename", new_path, VFS64_NEED_WX);
+     if (pc2 != 0) { log_op_fail("rename_to64", "permission denied (target dir w+x)"); return pc2; }
+ 
+     // 同名（同目录同名字）= 幂等；目录移进自己的子树 = 拒绝（Linux 的 EINVAL）
+     if (old_parent == nparent && ino[VFS_I_NAMELEN] == nlen &&
+         cmp_bytes(ino + g_lay->name_off, nm, nlen) == 0)
+         return 0;
+    if (is_dir && dir_is_ancestor64(idx, nparent)) {
+        log_op_fail("rename_to64", "cannot move a directory into its own subtree");
+        return -22;                                   // -EINVAL（Linux 口径：把目录移进自己的子树 = EINVAL）
+    }
+ 
+     // 改目录项：parent + name + mtime + CRC，**一次 inode 落盘**（与同目录改名同一条纪律）
+     zero_bytes(ino + g_lay->name_off, g_lay->name_max);
+     copy_bytes(ino + g_lay->name_off, nm, nlen);
+     ino[VFS_I_NAMELEN] = (uint8_t)nlen;
+     wr32(ino + VFS_I_PARENT, nparent);
+     if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
+     wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
+     if (!inode_store(idx, ino)) { log_op_fail("rename_to64", "inode write failed"); return -1; }
+     // 父目录：刷新 mtime；目录移动还要维护 nlink（子目录计数）
+     touch_dir(old_parent, is_dir ? -1 : 0);
+     touch_dir(nparent, is_dir ? 1 : 0);
+ 
+     dbg64_str("[VFS64] rename_to ok idx=");
+     dbg64_dec(idx);
+     dbg64_str(" old=");
+     dbg64_str(old_path);
+     dbg64_str(" new=");
+     dbg64_str(new_path);
+     dbg64_nl();
+     return 0;
+ }
 
 int vfs64_free64(uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_blocks) {
     if (!g_mounted) { log_op_fail("free64", "not mounted"); return -1; }

@@ -123,6 +123,10 @@ int fs64_mkdir64(int vol, const char* path);
 int fs64_unlink64(int vol, const char* path);
 int fs64_rmdir64(int vol, const char* path);
 int fs64_rename64(int vol, const char* old_path, const char* new_name);
+// ★ A4-4b：跨目录改名（rename(82) 的"目标不在同一父目录"路径）与显式 mtime setter。
+//   与 fs64_rename64 同口径：VimtuFS2 卷 -> vfs64 的最小原语；FAT 卷 -> -FS64_EROFS（只读）。
+int fs64_rename_to64(int vol, const char* old_path, const char* new_path);
+int fs64_set_mtime64(int vol, const char* path, uint32_t packed_time);
 // ★ P4：access/chmod/chown 的按卷变体（fd64 在 open 时做 r/w 判定；终端 chmod/chown 命令用）。
 //   返回 0 = 允许/成功；-VFS64_EACCES(-13) = 权限不足；-1 = 不存在/只有 root 能做/旧卷无字段/只读卷。
 int fs64_access64(int vol, const char* path, uint32_t mask);       // mask：4=r / 2=w / 1=x

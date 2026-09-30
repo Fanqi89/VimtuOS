@@ -1234,7 +1234,8 @@ static int64_t lx64_rename64(uint64_t nr, uint64_t old_va, uint64_t new_va) {
     if (rc == 0) return 0;
     if (rc == -LX64_EACCES) return -LX64_EACCES;             // 目录 w+x 不足（vfs64 已打点）
     if (rc == -LX64_EROFS)  return -LX64_EROFS;              // 只读卷（FAT -> -FS64_EROFS）
-    return -LX64_ENOENT;                                     // 源不存在/名字非法/目标已存在/移进自己子树
+    if (rc == -LX64_EINVAL) return -LX64_EINVAL;             // 目录移进自己的子树（vfs64 返回 -22）
+    return -LX64_ENOENT;                                     // 源不存在/名字非法/目标已存在/目标父目录不可用
 }
 
 // ---- 84）rmdir ----
@@ -1537,7 +1538,7 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 8:   return lx64_lseek64(nr, a1, (int64_t)a2, a3);
     case 9:   return lx64_mmap_disp64(a2, a4, a1);                 // arch 无关：len/prot/flags/...
     case 10:  return lx64_mprotect_disp64(a1, a2, a3);
-    case 11:  return lx64_munmap_disp64(a1, a2);
+    case 11:  return lx64_munmap_disp64(a1, a2);                   // ★ 收口：这条 case 在 A4-4 的 WIP 里被误删 —— musl/libc 的 munmap 会掉进 default -> [SYSCALL] enosys nr=11（musl64_test/dynlink64_test 的"不得出现 enosys"断言必失败）。恢复。
     case 12:  return lx64_brk_disp64(a1);
     case 13:  return lx64_rt_sigaction64(a1, a2, a3, a4);          // 只记录不投递
     case 14:  return lx64_rt_sigprocmask64(a1, a2, a3, a4);        // 只记录不投递

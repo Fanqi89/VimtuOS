@@ -471,6 +471,26 @@ int fs64_rename64(int vol, const char* old_path, const char* new_name) {
     if (!sc.ok) return -1;
     return vfs64_rename64(old_path, new_name);
 }
+// ★ A4-4b：跨目录改名（rename(82) 的跨目录路径）。与 fs64_rename64 同一套卷解析/只读/作用域。
+int fs64_rename_to64(int vol, const char* old_path, const char* new_path) {
+    const int v = resolve_vol(vol);
+    if (v < 0) return -1;
+    if (g_vols[v].readonly) { log_reject_ro(v, "rename_to", old_path); return -FS64_EROFS; }
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_rename_to64(old_path, new_path);
+}
+// ★ A4-4b：显式 mtime（utime(132) times != NULL）。只读卷 -FS64_EROFS；FAT 卷 -1（没有 mtime setter）。
+int fs64_set_mtime64(int vol, const char* path, uint32_t packed_time) {
+    const int v = resolve_vol(vol);
+    if (v < 0) return -1;
+    if (g_vols[v].readonly) { log_reject_ro(v, "utime", path); return -FS64_EROFS; }
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_set_mtime64(path, packed_time);
+}
 int fs64_free64(int vol, uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_blocks) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;

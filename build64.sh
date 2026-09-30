@@ -652,7 +652,7 @@ echo "==> ★ A4-1：带 /bin/shell.bin 的演示盘 + \"内核里没有 shell �
       --stage "$BUILD/tcc_stage" --hello "$BUILD/tcc_demo_hello" --demo-dir user/apps/tcc \
       --vol "$BUILD/tccvol.img"
 "$PY" tools/lua_pack_win.py --vol-in "$BUILD/tccvol.img" --vol-out "$BUILD/luavol.img" \
-      --drv "$BUILD/lua" --bin "$BUILD/lua.bin" --demo-dir user/lua/demo
+      --drv "$BUILD/lua" --bin "$BUILD/lua.bin" --demo-dir user/lua/demo --probe "$BUILD/a44probe"
 "$PY" tools/gzip_pack_win.py --vol-in "$BUILD/luavol.img" --vol-out "$BUILD/sysvol.img" \
       --gzip "$BUILD/gzip" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 # 断言：内核二进制里**不能**出现 shell.bin 的字节（交付方式必须是"系统卷里的文件"）。
