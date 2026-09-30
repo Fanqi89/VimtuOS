@@ -39,6 +39,11 @@ extern "C" const uint8_t _binary_build64_proc64_elf_start[];
 extern "C" const uint8_t _binary_build64_proc64_elf_end[];
 static const char PROC64_PATH64[] = "/proc64.elf";
 
+// ★ A5 前置：内嵌的 /evshm.elf（ring3 演示：shm_create -> 画 -> fb_flip -> 循环 input_poll）
+extern "C" const uint8_t _binary_build64_evshm_elf_start[];
+extern "C" const uint8_t _binary_build64_evshm_elf_end[];
+static const char PROC64_EVSHM_PATH64[] = "/evshm.elf";
+
 // ---- errno（与 syscall64.cpp 的 Linux 号段同一套数值）----
 static const int64_t P64_EPERM   = 1;
 static const int64_t P64_ENOENT  = 2;
@@ -60,6 +65,10 @@ static const uint32_t PROC64_FORK_MAX_PAGES    = 256;   // fork 整页复制的�
 static const int      PROC64_WAIT_TIMEOUT_SEC  = 5;     // wait4 有界等待（防挂死）
 static const int      PROC64_DEMO_TIMEOUT_SEC  = 12;    // 启动期演示的有界等待
 static const int      PROC64_PIPE_TIMEOUT_SEC  = 12;    // pipe 演示的有界等待（同一口径）
+// ★ A5 前置：/evshm.elf 演示的有界等待。为什么比其他演示长得多：这个演示要**等测试注入**
+//   键鼠事件（QEMU monitor sendkey / VMware VNC），注入发生在启动之后、脚本轮询到
+//   `[EVSHM] listen` 标记才开始 —— 给足两侧的余量，超时才有意义。
+static const int      PROC64_EVSHM_TIMEOUT_SEC = 90;
 static const int      PROC64_SIG_MAX           = 32;    // 记录型信号表（只记录不投递）
 
 // ==================== 进程表 ====================
@@ -95,6 +104,14 @@ struct Proc64 {
     //   为什么放在进程结构里而不是 VFS：VFS 层没有"当前目录"概念（见 vfs64.h），而 POSIX 的 cwd 是
     //   **进程属性**（fork 继承、各进程独立）—— 放这里才不会被别的进程/终端改掉。
     char     cwd[PROC64_CWD_MAX];
+    // ★ A5 前置（1/2）：**每进程输入事件队列**（自有 ABI 12 input_poll 的落点）。
+    //   容量/丢最旧/计数/路由语义见 kernel/input64.*；这里只是挂载点。
+    //   fork 出来的子进程**不继承事件**（队列随新进程清零）：父子不是同一个前台，
+    //   队列内容也跟着父进程的\"我已经读走了哪些事件\"走，复制过去只会让两边都误判。
+    Ev64Queue evq;
+    // ★ A5 前置（2/2）：**每进程 shm 句柄表**（对象 id；0 = 空槽）。fork 逐槽继承（引用 +1）、
+    //   execve 默认关闭（逐槽 -1）、进程退出/销毁时逐槽 -1（归零则由对象表回收页帧）。
+    int32_t  shm[SHM64_HANDLES64];
 };
 static Proc64   g_procs[PROC64_MAX];
 static int      g_proc_count   = 0;
@@ -169,10 +186,308 @@ extern "C" FdTable64* proc64_fdtab_of_current64() {
     Proc64* p = p64_current64();
     return p ? p->fdtab : nullptr;
 }
+// ★ A5 前置：事件层（input64.cpp）的两个弱引用目标 —— 每进程事件队列的挂载点。
+extern "C" void* proc64_evq_of64(int pid) {
+    Proc64* p = p64_find64(pid);
+    return p ? (void*)&p->evq : nullptr;
+}
+extern "C" void* proc64_evq_of_current64() {
+    Proc64* p = p64_current64();
+    return p ? (void*)&p->evq : nullptr;
+}
 static int p64_free_slot64() {
     for (int i = 0; i < PROC64_MAX; i++) if (g_procs[i].state == PROC64_FREE) return i;
     return -1;
 }
+// ==================== ★ A5 前置：共享内存缓冲（对象表 + 句柄表 + 映射窗）====================
+// 语义与边界见 kernel/proc64.h 的 A5 段。这里记两条实现要点：
+//   1) 页帧**不属于任何进程**：p64_release_area64 / p64_copy_user_area64 都会**跳过**
+//      映射窗那一段（前者不 free、后者不复制）—— 否则进程退出会把共享页当成自己的页还回去
+//      （双重释放），fork 也会把\"共享\"退化成\"各一份私有拷贝\"。
+//   2) 映射窗在用户窗口（PDPT[4]）**顶部 256 KiB**：仍在用户窗口内（所以验收能断言
+//      \"VA 在用户窗口内、u=1\"），但不与 mmap 的 bump 区（从 4GiB+0x90000 往上）打架；
+//      proc64_mmap64 也显式拒绝落进这一段。
+static const int SHM64_MAX_OBJS64 = 8;      // 同时存在的对象数上限
+
+struct Shm64Obj {
+    uint32_t used;
+    uint32_t id;
+    uint32_t pages;
+    uint32_t refs;                          // 持有句柄的进程数
+    int32_t  owner;                         // 创建者 pid（诊断用）
+    uint64_t frames[SHM64_MAX_PAGES64];
+};
+static Shm64Obj g_shm64[SHM64_MAX_OBJS64];
+static uint32_t g_shm64_next_id = 1;
+static uint32_t g_shm64_live64  = 0;        // 活着的对象数（自检/打点）
+
+static Shm64Obj* shm64_find64(uint32_t id) {
+    for (int i = 0; i < SHM64_MAX_OBJS64; i++) {
+        if (g_shm64[i].used && g_shm64[i].id == id) return &g_shm64[i];
+    }
+    return nullptr;
+}
+static int shm64_free_handle64(const Proc64* p) {
+    for (uint32_t i = 0; i < SHM64_HANDLES64; i++) if (p->shm[i] == 0) return (int)i;
+    return -1;
+}
+static bool shm64_handle_has64(const Proc64* p, int32_t id) {
+    for (uint32_t i = 0; i < SHM64_HANDLES64; i++) if (p->shm[i] == id) return true;
+    return false;
+}
+
+// 句柄 +1 引用（fork 继承用）。返回 0 = 成功；-1 = 没有这个对象（不继承这一槽）。
+static int shm64_hold64(uint32_t id) {
+    Shm64Obj* o = shm64_find64(id);
+    if (!o) return -1;
+    o->refs++;
+    return 0;
+}
+
+// 句柄 -1 引用。返回 1 = 对象已回收（页帧已还池）、0 = 还有引用、-1 = 没有这个对象。
+static int shm64_release64(int32_t id, int pid) {
+    Shm64Obj* o = shm64_find64((uint32_t)id);
+    if (!o) return -1;
+    if (o->refs > 0) o->refs--;
+    const uint32_t refs = o->refs;
+    const uint32_t objid = o->id;
+    if (refs == 0) {
+        uint32_t freed = 0;
+        for (uint32_t i = 0; i < o->pages; i++) {
+            if (o->frames[i]) { page_free_64((void*)(uintptr_t)o->frames[i]); o->frames[i] = 0; freed++; }
+        }
+        p64_zero(o, (uint32_t)sizeof(Shm64Obj));
+        if (g_shm64_live64 > 0) g_shm64_live64--;
+        dbg64_line_begin64();
+        dbg64_str("[SHM64] release pid="); dbg64_dec((uint64_t)(pid < 0 ? 0 : pid));
+        dbg64_str(" id=");                 dbg64_dec((uint64_t)objid);
+        dbg64_str(" refs=0 freed_pages="); dbg64_dec((uint64_t)freed);
+        dbg64_str(" live=");               dbg64_dec((uint64_t)g_shm64_live64);
+        dbg64_nl(); dbg64_line_end64();
+        return 1;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[SHM64] release pid="); dbg64_dec((uint64_t)(pid < 0 ? 0 : pid));
+    dbg64_str(" id=");                 dbg64_dec((uint64_t)objid);
+    dbg64_str(" refs=");               dbg64_dec((uint64_t)refs);
+    dbg64_str(" freed_pages=0");
+    dbg64_nl(); dbg64_line_end64();
+    return 0;
+}
+
+// 释放该进程持有的全部句柄（退出 / 销毁 / execve 默认关闭都走它）。
+static void shm64_drop_all64(Proc64* p) {
+    if (!p) return;
+    for (uint32_t i = 0; i < SHM64_HANDLES64; i++) {
+        if (!p->shm[i]) continue;
+        (void)shm64_release64(p->shm[i], (int)p->pid);
+        p->shm[i] = 0;
+    }
+}
+
+// fork：逐槽继承父进程的句柄（每个 +1 引用）。对象已经没了就跳过该槽（不假装继承）。
+static void shm64_clone_handles64(Proc64* child, const Proc64* parent) {
+    if (!child || !parent) return;
+    uint32_t held = 0;
+    for (uint32_t i = 0; i < SHM64_HANDLES64; i++) {
+        const int32_t id = parent->shm[i];
+        if (!id) continue;
+        if (shm64_hold64((uint32_t)id) != 0) continue;
+        child->shm[i] = id;
+        held++;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[SHM64] inherit pid="); dbg64_dec((uint64_t)child->pid);
+    dbg64_str(" from=");               dbg64_dec((uint64_t)parent->pid);
+    dbg64_str(" held=");               dbg64_dec((uint64_t)held);
+    dbg64_str(" refs_plus=1");
+    dbg64_nl(); dbg64_line_end64();
+}
+
+// 该 VA 是否落在 shm 映射窗内（p64_release_area64 / p64_copy_user_area64 的跳过判据）
+static inline bool shm64_in_window64(uint64_t va) {
+    return va >= SHM64_WINDOW_VA64 && va < SHM64_WINDOW_VA64 + SHM64_WINDOW_BYTES64;
+}
+
+int proc64_shm_held64() {
+    Proc64* p = p64_current64();
+    if (!p) return 0;
+    int n = 0;
+    for (uint32_t i = 0; i < SHM64_HANDLES64; i++) if (p->shm[i]) n++;
+    return n;
+}
+
+int64_t proc64_shm_create64(uint64_t size) {
+    Proc64* p = p64_current64();
+    const int pid = p ? (int)p->pid : -1;
+    if (!p) {
+        dbg64_line_begin64();
+        dbg64_str("[SHM64] create FAILED reason=no-process-context err=");
+        dbg64_dec((uint64_t)(-SHM64_EPERM64));
+        dbg64_nl(); dbg64_line_end64();
+        return SHM64_EPERM64;
+    }
+    if (size == 0 || size > (uint64_t)SHM64_MAX_PAGES64 * PAGE_SIZE_64) {
+        dbg64_line_begin64();
+        dbg64_str("[SHM64] create FAILED pid="); dbg64_dec((uint64_t)pid);
+        dbg64_str(" reason=bad-size size="); dbg64_dec(size);
+        dbg64_str(" cap="); dbg64_dec((uint64_t)SHM64_MAX_PAGES64 * PAGE_SIZE_64);
+        dbg64_str(" err="); dbg64_dec((uint64_t)(-SHM64_EINVAL64));
+        dbg64_nl(); dbg64_line_end64();
+        return SHM64_EINVAL64;
+    }
+    if (shm64_free_handle64(p) < 0) {          // 先看句柄表：满了就别分配对象（免得立刻回滚）
+        dbg64_line_begin64();
+        dbg64_str("[SHM64] create FAILED pid="); dbg64_dec((uint64_t)pid);
+        dbg64_str(" reason=handle-table-full cap="); dbg64_dec((uint64_t)SHM64_HANDLES64);
+        dbg64_str(" err="); dbg64_dec((uint64_t)(-SHM64_ENOMEM64));
+        dbg64_nl(); dbg64_line_end64();
+        return SHM64_ENOMEM64;
+    }
+    Shm64Obj* o = nullptr;
+    for (int i = 0; i < SHM64_MAX_OBJS64; i++) if (!g_shm64[i].used) { o = &g_shm64[i]; break; }
+    if (!o) {
+        dbg64_line_begin64();
+        dbg64_str("[SHM64] create FAILED pid="); dbg64_dec((uint64_t)pid);
+        dbg64_str(" reason=object-table-full cap="); dbg64_dec((uint64_t)SHM64_MAX_OBJS64);
+        dbg64_str(" err="); dbg64_dec((uint64_t)(-SHM64_ENOMEM64));
+        dbg64_nl(); dbg64_line_end64();
+        return SHM64_ENOMEM64;
+    }
+    p64_zero(o, (uint32_t)sizeof(Shm64Obj));
+    o->used  = 1;
+    o->id    = g_shm64_next_id++;
+    if (g_shm64_next_id == 0) g_shm64_next_id = 1;
+    const uint32_t want_pages = (uint32_t)((size + PAGE_SIZE_64 - 1) / PAGE_SIZE_64);
+    o->pages = want_pages;
+    o->refs  = 1;
+    o->owner = p->pid;
+    for (uint32_t i = 0; i < want_pages; i++) {
+        void* fp = page_alloc_64();
+        if (!fp) {                             // 页池空：把已经拿到的页还回去（不泄漏）
+            for (uint32_t k = 0; k < i; k++) {
+                if (o->frames[k]) page_free_64((void*)(uintptr_t)o->frames[k]);
+            }
+            p64_zero(o, (uint32_t)sizeof(Shm64Obj));
+            dbg64_line_begin64();
+            dbg64_str("[SHM64] create FAILED pid="); dbg64_dec((uint64_t)pid);
+            dbg64_str(" reason=page-pool-empty pages="); dbg64_dec((uint64_t)want_pages);
+            dbg64_str(" err="); dbg64_dec((uint64_t)(-SHM64_ENOMEM64));
+            dbg64_nl(); dbg64_line_end64();
+            return SHM64_ENOMEM64;
+        }
+        p64_zero(fp, PAGE_SIZE_64);            // ★ 页池的页**不清零**：不给下一个进程看旧内容
+        o->frames[i] = (uint64_t)(uintptr_t)fp;
+    }
+    g_shm64_live64++;
+    p->shm[shm64_free_handle64(p)] = (int32_t)o->id;
+    dbg64_line_begin64();
+    dbg64_str("[SHM64] create pid="); dbg64_dec((uint64_t)pid);
+    dbg64_str(" id=");                dbg64_dec((uint64_t)o->id);
+    dbg64_str(" size=");              dbg64_dec(size);
+    dbg64_str(" pages=");             dbg64_dec((uint64_t)o->pages);
+    dbg64_str(" refs=1 live=");       dbg64_dec((uint64_t)g_shm64_live64);
+    dbg64_nl(); dbg64_line_end64();
+    return (int64_t)o->id;
+}
+
+int64_t proc64_shm_map64(uint64_t id, uint64_t offset, uint64_t len, uint64_t out_va_uptr) {
+    Proc64* p = p64_current64();
+    const int pid = p ? (int)p->pid : -1;
+    if (!p || id == 0 || id > 0xFFFFFFFFull) {
+        dbg64_line_begin64();
+        dbg64_str("[SHM64] map FAILED pid="); dbg64_dec((uint64_t)(pid < 0 ? 0 : pid));
+        dbg64_str(" reason=no-process-or-bad-id err="); dbg64_dec((uint64_t)(-SHM64_EPERM64));
+        dbg64_nl(); dbg64_line_end64();
+        return SHM64_EPERM64;
+    }
+    Shm64Obj* o = shm64_find64((uint32_t)id);
+    if (!o) {
+        dbg64_line_begin64();
+        dbg64_str("[SHM64] map FAILED pid="); dbg64_dec((uint64_t)pid);
+        dbg64_str(" id="); dbg64_dec(id);
+        dbg64_str(" reason=no-such-object err="); dbg64_dec((uint64_t)(-SHM64_EINVAL64));
+        dbg64_nl(); dbg64_line_end64();
+        return SHM64_EINVAL64;
+    }
+    if (!shm64_handle_has64(p, (int32_t)id)) {      // 只允许映射\"本进程持有句柄\"的对象
+        dbg64_line_begin64();
+        dbg64_str("[SHM64] map FAILED pid="); dbg64_dec((uint64_t)pid);
+        dbg64_str(" id="); dbg64_dec(id);
+        dbg64_str(" reason=handle-not-held err="); dbg64_dec((uint64_t)(-SHM64_EPERM64));
+        dbg64_nl(); dbg64_line_end64();
+        return SHM64_EPERM64;
+    }
+    const uint64_t obj_bytes = (uint64_t)o->pages * PAGE_SIZE_64;
+    if ((offset & (PAGE_SIZE_64 - 1)) || offset >= obj_bytes || len == 0 || len > obj_bytes - offset) {
+        dbg64_line_begin64();
+        dbg64_str("[SHM64] map FAILED pid="); dbg64_dec((uint64_t)pid);
+        dbg64_str(" id="); dbg64_dec(id);
+        dbg64_str(" reason=bad-offset-or-len off="); dbg64_dec(offset);
+        dbg64_str(" len="); dbg64_dec(len);
+        dbg64_str(" obj_bytes="); dbg64_dec(obj_bytes);
+        dbg64_str(" err="); dbg64_dec((uint64_t)(-SHM64_EINVAL64));
+        dbg64_nl(); dbg64_line_end64();
+        return SHM64_EINVAL64;
+    }
+    if (!user64_range_ok64(out_va_uptr, 8)) {
+        dbg64_line_begin64();
+        dbg64_str("[SHM64] map FAILED pid="); dbg64_dec((uint64_t)pid);
+        dbg64_str(" reason=bad-out-ptr err="); dbg64_dec((uint64_t)(-SHM64_EFAULT64));
+        dbg64_nl(); dbg64_line_end64();
+        return SHM64_EFAULT64;
+    }
+    const uint32_t page_off = (uint32_t)(offset / PAGE_SIZE_64);
+    const uint32_t npages   = (uint32_t)((len + PAGE_SIZE_64 - 1) / PAGE_SIZE_64);
+    if (page_off + npages > o->pages) return SHM64_EINVAL64;
+    // 找一个还没被映射的窗（整槽空），把同一批**物理页**挂进当前地址空间
+    int slot = -1;
+    for (uint32_t s = 0; s < SHM64_SLOTS64; s++) {
+        const uint64_t base = SHM64_WINDOW_VA64 + (uint64_t)s * SHM64_SLOT_BYTES64;
+        if (!user64_page_is_user_ok64(base)) { slot = (int)s; break; }
+    }
+    if (slot < 0) {
+        dbg64_line_begin64();
+        dbg64_str("[SHM64] map FAILED pid="); dbg64_dec((uint64_t)pid);
+        dbg64_str(" id="); dbg64_dec(id);
+        dbg64_str(" reason=window-full slots="); dbg64_dec((uint64_t)SHM64_SLOTS64);
+        dbg64_str(" err="); dbg64_dec((uint64_t)(-SHM64_ENOMEM64));
+        dbg64_nl(); dbg64_line_end64();
+        return SHM64_ENOMEM64;
+    }
+    const uint64_t va = SHM64_WINDOW_VA64 + (uint64_t)slot * SHM64_SLOT_BYTES64;
+    for (uint32_t i = 0; i < npages; i++) {
+        if (!user64_map_phys_page64(va + (uint64_t)i * PAGE_SIZE_64, o->frames[page_off + i],
+                                   PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64)) {
+            for (uint32_t k = 0; k < i; k++) (void)user64_unmap_page64(va + (uint64_t)k * PAGE_SIZE_64);
+            user64_paging_sync64();
+            dbg64_line_begin64();
+            dbg64_str("[SHM64] map FAILED pid="); dbg64_dec((uint64_t)pid);
+            dbg64_str(" id="); dbg64_dec(id);
+            dbg64_str(" reason=pagetable page="); dbg64_dec((uint64_t)i);
+            dbg64_str(" err="); dbg64_dec((uint64_t)(-SHM64_ENOMEM64));
+            dbg64_nl(); dbg64_line_end64();
+            return SHM64_ENOMEM64;
+        }
+    }
+    user64_paging_sync64();
+    *(uint64_t*)(uintptr_t)out_va_uptr = va;
+    const int u = user64_page_is_user_ok64(va) ? 1 : 0;
+    dbg64_line_begin64();
+    dbg64_str("[SHM64] map pid=");  dbg64_dec((uint64_t)pid);
+    dbg64_str(" id=");              dbg64_dec(id);
+    dbg64_str(" slot=");            dbg64_dec((uint64_t)slot);
+    dbg64_str(" va=0x");            dbg64_hex64(va);
+    dbg64_str(" pa=0x");            dbg64_hex64(o->frames[page_off]);
+    dbg64_str(" off=");             dbg64_dec(offset);
+    dbg64_str(" len=");             dbg64_dec(len);
+    dbg64_str(" pages=");           dbg64_dec((uint64_t)npages);
+    dbg64_str(" refs=");            dbg64_dec((uint64_t)o->refs);
+    dbg64_str(" u=");               dbg64_dec((uint64_t)u);
+    dbg64_nl(); dbg64_line_end64();
+    return u ? 0 : SHM64_ENOMEM64;   // 说好\"用户可读写\"：没做到就如实失败
+}
+
 
 // ==================== 地址空间 ====================
 // 建一份新地址空间：新 PML4 + 新 PDPT；内核高半区与"前 4GB 恒等映射"共享引导期的页表。
@@ -246,6 +561,11 @@ static uint32_t p64_release_area64(Proc64* p) {
         for (int i1 = 0; i1 < 512; i1++) {
             const uint64_t e1 = pt[i1];
             if (!(e1 & PTE_PRESENT_64)) continue;
+            // ★ A5 前置：shm 映射窗里的页帧**属于 shm 对象**（不是进程自己的页）——
+            //   这里只清 PTE，绝不能 page_free（否则进程退出会把共享页还回页池 = 双重释放，
+            //   另一个进程还在用那块内存）。对象在引用数归零时自己回收（shm64_release64）。
+            const uint64_t va = USER64_CODE_VA64 + ((uint64_t)i2 << 21) + ((uint64_t)i1 << 12);
+            if (shm64_in_window64(va)) { pt[i1] = 0; continue; }
             page_free_64((void*)(uintptr_t)p64_page64(e1));
             pt[i1] = 0;
             n++;
@@ -561,6 +881,10 @@ void proc64_destroy64(int pid) {
         fd64_table_free64(p->fdtab);
         p->fdtab = nullptr;
     }
+    // ★ A5 前置：句柄/焦点清理（对\"已经 exit 过\"的进程是空操作：p64_exit64 里已清完、
+    //   shm[] 已置 0；对\"没走过 exit 就被销毁\"的进程是真正的回收）。
+    shm64_drop_all64(p);
+    ev64_proc_release64((int)p->pid);
     if (p->pdpt_phys || p->pml4_phys) {
         p64_release_area64(p);
         if (p->pdpt_phys) page_free_64((void*)(uintptr_t)p->pdpt_phys);
@@ -600,6 +924,12 @@ static void p64_exit64(Proc64* p, uint32_t code, uint32_t sig) {
         fd64_table_free64(p->fdtab);
         p->fdtab = nullptr;
     }
+    // ★ A5 前置：进程退出 -> (a) 每个 shm 句柄引用 -1（归零则由对象表回收页帧）；
+    //   (b) 如果它正持有键盘焦点/指针捕获，代它释放（打点 reason=exit），
+    //   否则焦点会停在一个已经死掉的 pid 上，后面的进程再也收不到键盘。
+    shm64_drop_all64(p);
+    ev64_proc_release64((int)p->pid);
+    ev64_reset64(&p->evq);
     p->cr3       = 0;
     p->exit_code = code & 0xFFu;
     p->term_sig  = sig;
@@ -743,6 +1073,13 @@ static int p64_copy_user_area64(const Proc64* src, Proc64* dst, uint32_t* out_pa
         for (int i1 = 0; i1 < 512; i1++) {
             const uint64_t e1 = spt[i1];
             if (!(e1 & PTE_PRESENT_64)) continue;
+            // ★ A5 前置：shm 映射窗**不复制**（子进程拿一份\"空的窗外\"是刻意的）：
+            //   shm 的页帧属于对象而不是父进程，复制它们就等于把\"共享\"退化成\"各一份私有拷贝\"；
+            //   子进程用 fork 继承到的**句柄**自己 shm_map 同一批页帧（这才是 Wayland 的 buffer 语义）。
+            {
+                const uint64_t va = USER64_CODE_VA64 + ((uint64_t)i2 << 21) + ((uint64_t)i1 << 12);
+                if (shm64_in_window64(va)) continue;
+            }
             if (n >= PROC64_FORK_MAX_PAGES) return -1;          // 超上限：调用方回滚
             void* np = page_alloc_64();
             if (!np) return -1;
@@ -789,6 +1126,9 @@ int64_t proc64_fork64(pt_regs64* r) {
         proc64_destroy64(cpid);
         return -P64_ENOMEM;
     }
+    // ★ A5 前置：shm 句柄继承（逐个对象引用 +1；页帧不复制 —— 父子看的是同一块内存）。
+    //   放在复制用户区之前，与 fd 表同一条理由：失败路径由 p64_exit64 统一回收。
+    shm64_clone_handles64(c, par);
 
     uint32_t pages = 0;
     if (p64_copy_user_area64(par, c, &pages) != 0) {
@@ -903,6 +1243,9 @@ int64_t proc64_execve64(pt_regs64* r, const char* path, const char* const* argv,
     elf64_forget64();
     // ★ 批次 D：execve **默认保留**所有 fd（Linux 语义；本内核没有实现 O_CLOEXEC，如实注明）
     const uint32_t fds_kept = fd64_table_used64(p->fdtab);
+    // ★ A5 前置：execve **默认关闭**所有 shm 句柄（换映像 = 换一套地址空间语义，
+    //   旧句柄不该继续跟着新程序跑）。页帧由对象表在引用归零时回收。
+    shm64_drop_all64(p);
 
     uint64_t entry = 0, rsp = 0;
     if (elf64_load_for_exec64(path, argv, argc, &entry, &rsp) != 0) {
@@ -1097,6 +1440,11 @@ int64_t proc64_mmap64(uint64_t len, uint64_t flags, uint64_t addr) {
     else va = p64_align_up64(p->mmap_next ? p->mmap_next : USER64_MMAP_VA64);
     if (va < USER64_MMAP_VA64) return -P64_ENOMEM;
     if (n > (USER64_CODE_VA64 + USER64_WINDOW_BYTES64) - va) return -P64_ENOMEM;
+    // ★ A5 前置：mmap 不许落进 shm 映射窗（那一段的页帧属于 shm 对象，被 mmap 覆盖会
+    //   变成\"进程自己的页\"，退出时就会被 page_free —— 把共享页还回页池）。
+    if (va + n > SHM64_WINDOW_VA64 && va < SHM64_WINDOW_VA64 + SHM64_WINDOW_BYTES64) {
+        return -P64_ENOMEM;
+    }
 
     uint32_t made = 0;
     for (uint64_t a = va; a < va + n; a += PAGE_SIZE_64) {
@@ -1304,6 +1652,112 @@ int proc64_pipe_demo64(const char* path) {
     return 0;
 }
 
+// ==================== ★ A5 前置：ring3 演示（/evshm.elf：shm + 输入事件投递）====================
+// 复杂度都在用户程序（user/apps/evshm_demo.c）里：
+//   fb_map(9) -> shm_create(13) -> shm_map(14) -> 往共享缓冲画矩形 -> 拷进后备缓冲 -> fb_flip(10)
+//   -> fork(57) -> 子进程用继承到的句柄 shm_map 同一块内存（逐字节核对 + 写一个魔数）-> 父进程读回
+//   -> 父进程 input_poll(12)（带 FOCUS|CAPTURE）循环收键鼠事件并计数。
+// 内核这侧只做：幂等装卷 + 建进程 + 有界等待 + 页池基线核对 + 收尾 + 打点。
+//
+// 幂等安装（与 /proc64.elf、/pipe64.elf 同一条路径：blob 校验 + 存在即跳过 + 真写盘）
+int proc64_evshm_install64(int drive, uint32_t part_lba) {
+    const uint32_t bytes = (uint32_t)(_binary_build64_evshm_elf_end - _binary_build64_evshm_elf_start);
+    if (bytes < 64 || !elf64_blob_ok64(_binary_build64_evshm_elf_start, bytes)) {
+        p64_log2("[EVSHM] install FAILED reason=blob path=/evshm.elf", "");
+        return -1;
+    }
+    const int sys0 = vfs64_system_slot64();
+    uint32_t t = 0, sz = 0;
+    if (sys0 < 0 || vfs64_stat_on64(sys0, "/", &t, &sz) != 0) {
+        if (vfs64_mount_system64(drive, part_lba) != 0) { p64_log2("[EVSHM] install FAILED reason=", "mount"); return -1; }
+    }
+    const int sys = vfs64_system_slot64();
+    if (sys < 0) { p64_log2("[EVSHM] install FAILED reason=", "system-slot"); return -1; }
+    if (vfs64_stat_on64(sys, PROC64_EVSHM_PATH64, &t, &sz) == 0) {
+        dbg64_line_begin64();
+        dbg64_str("[EVSHM] install skipped (exists) /evshm.elf size=");
+        dbg64_dec(sz);
+        dbg64_nl(); dbg64_line_end64();
+        return 0;
+    }
+    const int w = vfs64_write_on64(sys, PROC64_EVSHM_PATH64, _binary_build64_evshm_elf_start, (int)bytes);
+    if (w != (int)bytes) { p64_log2("[EVSHM] install FAILED reason=", "write(/evshm.elf)"); return -1; }
+    dbg64_line_begin64();
+    dbg64_str("[EVSHM] install ok path=/evshm.elf bytes=");
+    dbg64_dec(bytes);
+    dbg64_nl(); dbg64_line_end64();
+    return 0;
+}
+
+// 跑 /evshm.elf（有界等待 + 页池基线核对：演示跑完页池必须回到基线 = 无泄漏）
+int proc64_evshm_demo64(const char* path) {
+    if (!g_isolate64) {
+        dbg64_line_begin64();
+        dbg64_str("[EVSHM] demo skipped (shared address space mode: no per-process address space)\n");
+        dbg64_line_end64();
+        return 0;
+    }
+    const char* p = (path && path[0] == '/') ? path : PROC64_EVSHM_PATH64;
+    uint32_t t = 0, sz = 0;
+    if (vfs64_stat(p, &t, &sz) != 0) {
+        p64_log2("[EVSHM] demo skipped (no elf on vfs) path=", p);
+        return 0;
+    }
+    const uint64_t free_before = page_count_free_64();
+    const int pid = proc64_create64("evshm", 0);
+    if (pid < 0) { p64_log2("[EVSHM] demo skipped (create failed) path=", p); return 0; }
+    if (proc64_start_elf64(pid, p) != 0) {
+        proc64_destroy64(pid);
+        p64_log2("[EVSHM] demo skipped (start failed) path=", p);
+        return 0;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[EVSHM] demo start pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_str(" path=");
+    dbg64_str(p);
+    dbg64_str(" pool_free=");
+    dbg64_dec(free_before);
+    dbg64_nl(); dbg64_line_end64();
+
+    // 有界等待：演示自己会跑 fork/子进程核对/input_poll 循环（最长 ~30 秒：等注入）。
+    const uint64_t t0 = g_ticks64;
+    Proc64* ip = p64_find64(pid);
+    while (ip && ip->state != PROC64_EXITED &&
+           (g_ticks64 - t0) < (uint64_t)PIT_HZ_64 * (uint64_t)PROC64_EVSHM_TIMEOUT_SEC) {
+        task_sleep64(2);
+    }
+    const int exited = (ip && ip->state == PROC64_EXITED) ? 1 : 0;
+    const uint32_t code = ip ? ip->exit_code : 0;
+    if (!exited) {
+        p64_log31("[EVSHM] demo TIMEOUT pid=", (uint64_t)pid, " (still running)");
+        (void)proc64_kill64(pid, 9);
+    }
+    if (p64_find64(pid)) proc64_destroy64(pid);
+    const uint64_t free_after = page_count_free_64();
+    dbg64_line_begin64();
+    dbg64_str("[EVSHM] demo done pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_str(" exited=");
+    dbg64_dec((uint64_t)exited);
+    dbg64_str(" code=");
+    dbg64_dec((uint64_t)code);
+    dbg64_str(" ticks=");
+    dbg64_dec(g_ticks64 - t0);
+    dbg64_str(" pool_free=");
+    dbg64_dec(free_after);
+    dbg64_str(" pool_delta=");
+    if (free_after >= free_before) { dbg64_str("+"); dbg64_dec(free_after - free_before); }
+    else                           { dbg64_str("-"); dbg64_dec(free_before - free_after); }
+    dbg64_str(" shm_live=");
+    dbg64_dec((uint64_t)g_shm64_live64);
+    dbg64_str(" procs_left=");
+    dbg64_dec((uint64_t)g_proc_count);
+    dbg64_nl(); dbg64_line_end64();
+    return 0;
+}
+
+
 // ==================== 启动期多进程演示 ====================
 // 复杂度都在用户程序（user/proc64.asm）里：fork -> 子 execve /hello.elf -> 父 wait4 ->
 // 再 fork 两个子（一个 execve 自己带 argv、一个等被 kill）-> 父 wait4 收两次 -> exit(0)。
@@ -1394,7 +1848,14 @@ int proc64_selftest64() {
     }
 
     // ---- bit3：常量自洽 ----
-    if (USER64_WINDOW_BYTES64 != 1024ULL * 1024ULL) fail |= 8;
+    // ★ A4-2b-2：窗口从 1 MiB 放大到 16 MiB（tcc 在 ring3 里真编译的内存账，见 usermode64.h）。
+    //   这里只钉**结构性**不变量，不写死具体尺寸（写死会让"以后调窗口"变成改自检）：
+    //   (a) 页对齐；(b) 必须完整落在 PDPT[4]（4GiB..5GiB）内 —— p64_build_as64 把这一条
+    //   当作"每进程私有用户窗口"（p64_release_area64 也只回收这一条），越出 5GiB 就会撞上
+    //   A1 的 fb 区（PDPT[5]，显存页绝不能当进程页回收）。
+    if (USER64_WINDOW_BYTES64 & (PAGE_SIZE_64 - 1)) fail |= 8;
+    if (USER64_WINDOW_BYTES64 < 1ULL * 1024ULL * 1024ULL) fail |= 8;
+    if (USER64_WINDOW_BYTES64 > (1ULL << 30)) fail |= 8;
     if (USER64_MMAP_VA64 < USER64_BRK_VA64 + USER64_BRK_BYTES64) fail |= 8;
     if (USER64_MMAP_VA64 + USER64_MMAP_MIN_BYTES64 > USER64_CODE_VA64 + USER64_WINDOW_BYTES64) fail |= 8;
     if (PROC64_FORK_MAX_PAGES < 16 || PROC64_FORK_MAX_PAGES > 4096) fail |= 8;

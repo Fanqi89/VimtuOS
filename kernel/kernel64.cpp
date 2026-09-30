@@ -83,6 +83,10 @@ extern "C" const uint8_t _binary_build64_user_libctest_bin_start[];
 extern "C" const uint8_t _binary_build64_user_libctest_bin_end[];
 extern "C" const uint8_t _binary_build64_user_fbdemo_bin_start[];
 extern "C" const uint8_t _binary_build64_user_fbdemo_bin_end[];
+// ★ A5 前置：/evshm.elf（user/apps/evshm_demo.c 编出的静态 ELF64，由 proc64.cpp 幂等装进
+//   系统卷再以真进程跑）。符号名由 objcopy 按输入路径生成：_binary_build64_evshm_elf_start/_end。
+extern "C" const uint8_t _binary_build64_evshm_elf_start[];
+extern "C" const uint8_t _binary_build64_evshm_elf_end[];
 // ★ A2：跑哪个 fbdemo —— 0（默认）= C 版（user/apps/fbdemo.c）；1 = A1 的汇编版（user/fbdemo.asm）。
 //   由 build64.sh 按环境变量 VIMTU_USER_FBDEMO 定义（默认 c；=asm 时切回汇编版，二进制行为一致）。
 #ifndef VIMTU_USER_FBDEMO_ASM
@@ -919,6 +923,25 @@ static void rust64_boot_init64() {
                 // 为什么单开一个程序：proc64_test 断言了上面那次 fork 的 pages=8，往 /proc64.elf 里
                 // 加代码会挪动页数。这里跑的 /pipe64.elf 只做 pipe(22) + fork(57) + 读/写 + wait4(61)。
                 (void)proc64_pipe_demo64("/pipe64.elf");
+                // ---- ★ A5 前置：输入事件投递（自有 ABI 12）+ 共享内存缓冲（13/14）----
+                // 事件层的结构体/队列自检先跑一次（布局 40B、满则丢最旧、焦点/捕获路由表）。
+                // 位置：pipe 演示之后、slot 复用演示之前 —— 这两个演示都不碰输入/共享内存，
+                // 而下面那段 fbdemo 的像素断言要求\"带外没有别的绘制\"，本演示只画一个矩形
+                // （写在 fbdemo 之前，抓帧对比的两帧里都已经包含它，不影响那条断言）。
+                {
+                    const int evf = ev64_selftest64();
+                    dbg64_line_begin64();
+                    if (evf == 0) {
+                        dbg64_str("[EV64] selftest PASS (event ABI 40B / ring drop-oldest / focus+capture)\n");
+                    } else {
+                        dbg64_str("[EV64] selftest FAIL mask=");
+                        dbg64_dec((uint64_t)evf);
+                        dbg64_nl();
+                    }
+                    dbg64_line_end64();
+                }
+                (void)proc64_evshm_install64(app_drive, app_lba);   // 幂等：把 /evshm.elf 装进系统卷
+                (void)proc64_evshm_demo64("/evshm.elf");            // shm_create/map + fb_flip + input_poll
                 // ---- 批次 B：缺陷回归 —— kill 掉 ring3 进程后复用同一任务槽，必须还能进 ring3 ----
                 // 位置在 proc64 演示之后、gui64_run 之前（跑完必须还能进桌面）；只走 BIOS 路径
                 // （UEFI 下用户窗口不可用，上面这一整块已经被 user64_available64() 挡在外面）。

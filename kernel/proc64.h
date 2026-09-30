@@ -62,6 +62,8 @@
 #pragma once
 #include <stdint.h>
 #include "x86_64.h"     // pt_regs64（fork/execve 要直接改帧）
+#include "input64.h"    // ★ A5 前置：每进程事件队列（Ev64Queue）内嵌在 Proc64 里
+#include "usermode64.h" // ★ A5 前置：shm 映射窗的位置由 USER64_CODE_VA64/WINDOW_BYTES64 算出来
 
 // ==================== 规模与状态 ====================
 static const int PROC64_MAX          = 16;    // 进程槽（与 TASK64_MAX 一致：1 进程 1 任务）
@@ -199,3 +201,58 @@ int proc64_uefi_cr3_experiment_start64();
 #endif
 // 位置：os_boot_path 里"现有 ring3 演示之后、gui64_run 之前"。隔离模式关闭时只打一行跳过。
 int   proc64_demo64(const char* path);
+
+// ==================== ★ A5 前置（1/2）：每进程输入事件队列（自有 ABI 12 input_poll）====================
+// 队列本体 = Ev64Queue（kernel/input64.h），内嵌在 Proc64 里；事件层（input64.cpp）通过
+// proc64_evq_of64() / proc64_evq_of_current64() 拿它。路由/焦点/背压语义全在 input64.h 里，
+// 这里只负责\"挂载点 + 生命周期\"：
+//   * create 时清零；fork 时**子进程拿一份空队列**（事件不继承 —— 父子不是同一个前台）；
+// ★ 必须是 extern "C"：input64.cpp 用**弱引用**取它们（安装介质内核不链 proc64.cpp）。
+//   弱符号按 C 名解析 —— 若这里是 C++ 名字，弱引用永远解析不到、静默变成 0（症状：
+//   \"所有事件都进不了队列\"，与 task64.h 里 task_slot_current64 踩过的是同一个坑）。
+extern "C" void* proc64_evq_of64(int pid);              // nullptr = 没有这个 pid
+extern "C" void* proc64_evq_of_current64();             // nullptr = 当前不在进程上下文
+
+// ==================== ★ A5 前置（2/2）：共享内存缓冲（自有 ABI 13 shm_create / 14 shm_map）====================
+// 目标：支撑\"一个进程画、另一个进程看/提交\"（Wayland 的 buffer 语义）的最小地基。
+// 实现（为什么这么切）：
+//   * **对象表**：8 个槽，每槽 = {页帧数组, 页数, 引用数, 拥有者 pid}；页帧由 page_alloc_64 分配
+//     （零初始化），对象持有它们 —— 页帧**不属于任何进程**，进程退出不会把它们当成\"自己的页\"回收；
+//   * **每进程句柄表**：Proc64.shm[]（4 个槽）= 该进程持有句柄的对象 id。**fork 继承**
+//     （逐槽 +1 引用；父子共享同一批页帧），**execve 默认关闭**（换映像时逐槽 -1），退出时逐槽 -1；
+//   * **映射**：每进程一块固定映射窗（4GiB+16MiB 顶部 256 KiB = 4 槽 × 64 KiB，全部落在
+//     PDPT[4] = 用户窗口内，所以页表回收/统计的那些既有路径仍然成立）。shm_map 把**同一批物理页**
+//     挂进调用进程的页表（PTE U|W|NX）—— 两边写同一块内存，这就是\"共享\"的落地方式；
+//   * 回收：引用数归零时把页帧还回页池（打点 `[SHM64] release id=.. refs=0 freed=..`）。
+// ★ 如实边界（别把没做的说成做了）：没有 mmap 文件语义（没有 fd、没有 offset 分页共享的
+//   文件后端）、没有跨进程同步原语（锁/信号量/futex）、没有 shm_unlink/权限位；引用计数也
+//   只在\"进程退出/execve\"上递减，没有显式 close 系统调用。
+static const uint32_t SHM64_SLOTS64       = 4;                                   // 每进程最多 4 个映射窗
+static const uint64_t SHM64_SLOT_BYTES64  = 64ULL * 1024ULL;                     // 单窗 = 单对象上限
+static const uint64_t SHM64_WINDOW_BYTES64 = SHM64_SLOTS64 * SHM64_SLOT_BYTES64; // 256 KiB
+static const uint64_t SHM64_WINDOW_VA64   = USER64_CODE_VA64 + USER64_WINDOW_BYTES64 - SHM64_WINDOW_BYTES64;
+static const uint32_t SHM64_HANDLES64     = 4;                                   // 每进程句柄表槽数
+static const uint32_t SHM64_MAX_PAGES64   = 16;                                  // 单对象页数上限（= 64 KiB）
+
+// 错误码（负数；口径与 A1 的 fb_map / EV64_* 一致）
+static const int64_t SHM64_EPERM64  = -1;   // 没有进程上下文 / 本进程没有这个对象的句柄
+static const int64_t SHM64_EFAULT64 = -2;   // out_va 用户指针非法
+static const int64_t SHM64_EINVAL64 = -3;   // size/offset/len 非法（0、越界、非页对齐）
+static const int64_t SHM64_ENOMEM64 = -4;   // 对象表/页池满；映射窗被占用；页表页不足
+
+// shm_create(size)：建对象 -> 返回**跨进程可共享的对象 id**（>= 1）/ 负错误码。
+// 调用进程同时拿到一个句柄（引用数 = 1）。打点：`[SHM64] create pid=.. id=.. size=.. pages=.. refs=1`
+int64_t proc64_shm_create64(uint64_t size);
+// shm_map(id, offset, len, out_va)：把对象的一段映射进**当前进程**（用户可读写），
+// *out_va 写回用户态基址；返回 0 = 成功，负数 = 错误码。offset 必须 4KiB 对齐。
+// 打点：`[SHM64] map pid=.. id=.. va=0x.. off=.. len=.. pages=.. refs=.. u=1 slot=..`
+int64_t proc64_shm_map64(uint64_t id, uint64_t offset, uint64_t len, uint64_t out_va_uptr);
+// 当前进程持有句柄的对象数（任务管理器/自检用；不动状态）
+int     proc64_shm_held64();
+
+// ---- A5 前置的 ring3 演示（/evshm.elf：shm_create -> 画 -> fb_flip -> 循环 input_poll）----
+// 幂等把内嵌 blob 装进系统卷（`/evshm.elf`），再以**真进程**跑它（父 fork/子读同一块 shm）。
+// 位置：os_boot_path 里 proc64_pipe_demo64 之后、ring3_slot_reuse_demo64 之前。
+// 返回 0 = 跑完（含跳过/超时，只打点）。
+int proc64_evshm_install64(int drive, uint32_t part_lba);
+int proc64_evshm_demo64(const char* path);

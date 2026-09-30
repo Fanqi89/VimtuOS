@@ -82,7 +82,7 @@ CXXFLAGS_INSTALLER="$CXXFLAGS -DVIMTU_INSTALLER_MEDIA=1 -DVIMTU_PAYLOAD_LBA=$PAY
 #     （屏幕硬件检查报告）也进 CORE —— 两份内核都要：安装程序要能看见 SATA/NVMe 盘，
 #     系统内核的 VFS/store 也要能（驱动器号 8.. / 16.. 分派），
 #     而硬件检查报告在安装介质与装好的系统里都是"没有串口时唯一的诊断画面"。
-SRCS_CORE="kernel/kernel64.cpp kernel/console64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp kernel/input.cpp kernel/mem64.cpp kernel/hwinfo64.cpp kernel/acpi64.cpp kernel/edid64.cpp kernel/display64.cpp kernel/fd64.cpp kernel/usermode64.cpp kernel/syscall64.cpp kernel/ahci64.cpp kernel/nvme64.cpp kernel/hwui64.cpp kernel/drive64.cpp kernel/fat64.cpp kernel/fs64.cpp"
+SRCS_CORE="kernel/kernel64.cpp kernel/console64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp kernel/input.cpp kernel/input64.cpp kernel/mem64.cpp kernel/hwinfo64.cpp kernel/acpi64.cpp kernel/edid64.cpp kernel/display64.cpp kernel/fd64.cpp kernel/usermode64.cpp kernel/syscall64.cpp kernel/ahci64.cpp kernel/nvme64.cpp kernel/hwui64.cpp kernel/drive64.cpp kernel/fat64.cpp kernel/fs64.cpp"
 #  ★ 批次 N：console64.cpp = 开机滚屏引导控制台（启动日志环形缓冲 + 回放 + dmesg）。
 #    进 CORE：安装介质与系统**两份内核都要**屏上跑一遍启动日志（安装介质走向导前、系统走桌面前）。
 SRCS_INSTALLER="$SRCS_CORE kernel/part64.cpp kernel/setup64.cpp kernel/vfs64.cpp"
@@ -137,7 +137,16 @@ if [ "${1:-}" = "--user" ]; then
 fi
 
 echo "==> 清理 $BUILD"
-rm -rf "$BUILD"
+# ★ 占用容忍（本批实测踩到）：别的验收脚本可能在 build64/ 里留着一个正在被 QEMU/测试进程
+#   占用的镜像（例如 gzip_test.img）。`set -e` 下 rm 的非零返回会**直接中断整个构建** ——
+#   而构建产物全是按路径覆盖写的，残留一个测试镜像不影响内核/镜像产出。这里重试 + 如实警告，
+#   绝不让"一个被占用的测试镜像"变成"整个构建失败"。
+for _i in 1 2 3 4 5; do
+    rm -rf "$BUILD" 2>/dev/null && break
+    echo "    [warn] $BUILD 里有文件被占用（第 $_i 次），3 秒后重试"
+    sleep 3
+done
+rm -rf "$BUILD" 2>/dev/null || echo "    [warn] $BUILD 未能完全清空（有文件被占用）；继续构建（产物按路径覆盖写）"
 mkdir -p "$BUILD" "$BUILD/os" "$RES"   # $RES：资源脚本（_*.py）会往这里写字体/图标，必须先建好
 
 echo "==> 编译引导扇区（MBR）与 64 位 loader"
@@ -333,6 +342,20 @@ echo "==> ★ A4-2b：TinyCC（**交付 = 系统卷里的 /tcc + /bin/tcc + /lib
 #   3) **内核二进制里搜不到 tcc 的字节**（后面有断言）—— 这正是"内核区只剩 187 KB"的纪律要求。
 bash tools/tcc_build_win.sh "$BUILD"
 
+echo "==> ★ A4-4a/A4-4c：Lua 5.4.7（**交付 = 系统卷里的 /bin/lua + /lib/lua.bin + /tcc/demo/*.lua**）"
+# 交付方式与 tcc 同构（内核里一个字节都不加；内核区只剩 ~187 KB）：
+#   * tools/lua_build_win.sh：
+#       build64/lua.bin —— 真解释器：静态 musl、非 PIC、按 4GiB+0x90000 定址（-mcmodel=large）；
+#       build64/lua     —— 装载驱动（< 64 KiB，走内核主程序装载器）：mmap 到 4GiB+0x90000、
+#                          搬段、改 auxv、jmp 进 Lua（详见 user/lua/luadrv.c）
+#   * tools/lua_pack_win.py 把上面两件 + user/lua/demo/*.lua 装进"tcc 那块卷"（逐字节回读自检）。
+bash tools/lua_build_win.sh "$BUILD"
+
+echo "==> ★ A4-4c：用户态 gzip/gunzip（**交付 = 系统卷里的 /bin/gzip + /bin/gunzip**）"
+# tools/gzip_build_win.sh：自足（不引 user/lib / musl）的 < 64 KiB 静态 ELF64 —— 直接走内核的
+# 主程序装载器（`run /bin/gzip ...`），deflate = fixed-Huffman + stored，inflate = 完整实现。
+bash tools/gzip_build_win.sh "$BUILD"
+
 echo "==> ★ A3 下半：FPU/xmm 上下文回归程序（user/xmmsse.asm；两个进程同时跑）"
 # 见 user/xmmsse.asm 顶部说明：同一份 ELF 起两个真进程、各自核对 16 个 xmm 是否被对方污染。
 # 链接脚本 user/xmmsse_elf64.ld（不是 hello_elf64.ld）：本程序只有 FPU 回归、没有段权限断言，
@@ -366,6 +389,74 @@ $NASM -f elf64 user/pipe64.asm -o "$BUILD/pipe64.o"
 $LD -m elf_x86_64 --strip-all -T user/hello_elf64.ld -o "$BUILD/pipe64.elf" "$BUILD/pipe64.o"
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/pipe64.elf" "$BUILD/pipe64_elf.o"
 cp "$BUILD/pipe64_elf.o" "$BUILD/os/"
+
+echo "==> ★ A5 前置：/evshm.elf（用户态输入事件投递 + 共享内存缓冲演示；只嵌**系统内核**）"
+# user/apps/evshm_demo.c 用自研 user/lib 编成**静态 ELF64**（链接脚本 user/apps/evshm_demo.ld：
+# 4GiB 基址 + .text.start + .l* 段；无 PT_INTERP/PT_DYNAMIC/重定位），
+# kernel/proc64.cpp 启动期幂等把它装进 VimtuFS2 的 /evshm.elf，再以**真进程**跑起来
+# （演示要 fork：父子两个进程共享同一块 shm；blob 路径没有进程上下文，fork 会是 -ENOSYS）。
+# 体积记账：这份 blob 只进**系统内核**（安装介质不链 proc64.cpp，也没有 ELF64 加载器）。
+EVSHM_DIR="$BUILD/uapps/evshm"
+mkdir -p "$EVSHM_DIR"
+EVSHM_UCFLAGS="--target=x86_64-unknown-none-elf -nostdinc -I user/lib \
+ -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -fno-pic -fno-pie \
+ -mcmodel=large -mno-red-zone -mno-sse -mno-sse2 -mno-mmx -mno-avx \
+ -fno-asynchronous-unwind-tables -fno-unwind-tables \
+ -ffunction-sections -fdata-sections -std=c11 -O2 -Wall -Wextra"
+EVSHM_ASFLAGS="--target=x86_64-unknown-none-elf -nostdinc -ffreestanding -fno-pic -fno-pie \
+ -ffunction-sections -fdata-sections -Wall -Wextra"
+EVSHM_OBJS=""
+for src in syscall.c string.c stdlib.c stdio.c fb.c; do
+    clang $EVSHM_UCFLAGS -c "user/lib/$src" -o "$EVSHM_DIR/lib_${src%.c}.o"
+    EVSHM_OBJS="$EVSHM_OBJS $EVSHM_DIR/lib_${src%.c}.o"
+done
+for src in crt0.S syscall.S; do
+    clang $EVSHM_ASFLAGS -c "user/lib/$src" -o "$EVSHM_DIR/lib_${src%.S}_asm.o"
+    EVSHM_OBJS="$EVSHM_OBJS $EVSHM_DIR/lib_${src%.S}_asm.o"
+done
+clang $EVSHM_UCFLAGS -c user/apps/evshm_demo.c -o "$EVSHM_DIR/evshm_demo.o"
+$LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/apps/evshm_demo.ld \
+    -o "$BUILD/evshm.elf" $EVSHM_OBJS "$EVSHM_DIR/evshm_demo.o"
+# 自检（纯 Python 解析 ELF 头/程序头）：PT_LOAD 落在 4GiB..4GiB+64KiB、无 PT_INTERP/PT_DYNAMIC、
+# 程序头表在首个 PT_LOAD 内、入口在某个段里 —— 这些是 kernel/elf64.cpp 的硬门槛，提前拦住。
+$PY - "$BUILD/evshm.elf" <<'PYEVSHM'
+import struct, sys
+path = sys.argv[1]
+d = open(path, "rb").read()
+assert d[:4] == b"\x7fELF" and d[4] == 2 and d[5] == 1, "不是 ELF64 小端"
+etype, machine = struct.unpack_from("<HH", d, 16)
+assert etype == 2 and machine == 0x3E, "必须是 ET_EXEC / x86_64"
+entry = struct.unpack_from("<Q", d, 24)[0]
+phoff = struct.unpack_from("<Q", d, 32)[0]
+phentsize, phnum = struct.unpack_from("<H", d, 54)[0], struct.unpack_from("<H", d, 56)[0]
+assert phentsize == 56 and 0 < phnum <= 16, "程序头表不合法"
+LO, HI = 0x100000000, 0x100000000 + 0x10000
+segs, nload, first_off, first_filesz = [], 0, None, None
+for i in range(phnum):
+    p = phoff + i * phentsize
+    ptype = struct.unpack_from("<I", d, p)[0]
+    poff, pva, _ppa, pfsz, pmsz, _al = struct.unpack_from("<QQQQQQ", d, p + 8)
+    if ptype == 3:
+        raise SystemExit("ERROR: 出现 PT_INTERP（内核只做静态装载）")
+    if ptype == 2:
+        raise SystemExit("ERROR: 出现 PT_DYNAMIC（静态链接不该有）")
+    if ptype != 1:
+        continue
+    nload += 1
+    if first_off is None:
+        first_off, first_filesz = poff, pfsz
+    assert pmsz >= pfsz and poff + pfsz <= len(d), "段文件范围越界"
+    assert pva >= LO and pva + pmsz <= HI, "PT_LOAD 越出装载区（va=0x%x memsz=0x%x）" % (pva, pmsz)
+    assert (pva + pmsz + 0xFFF) & ~0xFFF <= HI, "PT_LOAD 页对齐后压到用户栈区"
+    segs.append((pva, pmsz))
+assert nload and any(va <= entry < va + msz for va, msz in segs), "入口不在任何 PT_LOAD 内"
+assert first_off == 0 and phoff + phnum * phentsize <= first_filesz, "程序头表不在首个 PT_LOAD 内"
+assert len(d) <= 96 * 1024, "文件超过内核读盘缓冲 96 KiB"
+print("    evshm.elf 自检 OK：entry=0x%x phnum=%d segs=%d size=%d B" % (entry, phnum, nload, len(d)))
+PYEVSHM
+$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/evshm.elf" "$BUILD/evshm_elf.o"
+cp "$BUILD/evshm_elf.o" "$BUILD/os/"
+echo "    内嵌 /evshm.elf = $(stat -c%s "$BUILD/evshm.elf") B（静态 ELF64，装载区 4GiB；proc64.cpp 幂等装进系统卷）"
 $NASM -f bin user/hello64.asm -o "$BUILD/hello64.bin"
 "$PY" tools/make_vap.py "$BUILD/hello64.bin" "$BUILD/hello.vap" hello
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/hello.vap" "$BUILD/hello_vap64.o"
@@ -424,7 +515,7 @@ else
 fi
 echo "==> 链接两个内核"
 $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel64.o "$BUILD"/console64.o "$BUILD"/x86_64.o \
-    "$BUILD"/fb.o "$BUILD"/font.o "$BUILD"/input.o "$BUILD"/mem64.o "$BUILD"/ata64.o "$BUILD"/part64.o "$BUILD"/setup64.o \
+    "$BUILD"/fb.o "$BUILD"/font.o "$BUILD"/input.o "$BUILD"/input64.o "$BUILD"/mem64.o "$BUILD"/ata64.o "$BUILD"/part64.o "$BUILD"/setup64.o \
     "$BUILD"/fat64.o "$BUILD"/fs64.o "$BUILD"/drive64.o \
     "$BUILD"/bootx64_efi.o "$BUILD"/uefi64_bin.o \
     "$BUILD"/hwinfo64.o "$BUILD"/acpi64.o "$BUILD"/edid64.o "$BUILD"/vfs64.o "$BUILD"/fd64.o "$BUILD"/usermode64.o "$BUILD"/syscall64.o \
@@ -436,7 +527,7 @@ $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 
 $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
     gui_rs/gui_rs.o \
-    "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/mem64.o \
+    "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
     "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o \
     "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
     "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
@@ -449,7 +540,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
-    "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o \
+    "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o "$BUILD/os"/evshm_elf.o \
     "$BUILD/os"/musl_hello_elf.o \
     "$BUILD/os"/ldvimtu_so.o "$BUILD/os"/libfoo_so.o "$BUILD/os"/dynhello_elf.o "$BUILD/os"/xmmsse_elf.o \
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/hda64.o \
@@ -489,7 +580,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
     $LD -m elf_x86_64 -o "$BUILD/kernel64_os_cr3exp.elf" kernel/linker64.ld \
         "$BUILD/cr3exp/kernel64.o" "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
         gui_rs/gui_rs.o \
-        "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/mem64.o \
+        "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
         "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o \
         "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
         "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
@@ -502,7 +593,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
         "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
         "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/cr3exp/proc64.o" \
-        "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o \
+        "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o "$BUILD/os"/evshm_elf.o \
         "$BUILD/os"/musl_hello_elf.o \
         "$BUILD/os"/ldvimtu_so.o "$BUILD/os"/libfoo_so.o "$BUILD/os"/dynhello_elf.o "$BUILD/os"/xmmsse_elf.o \
         "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/hda64.o \
@@ -550,12 +641,20 @@ echo "    图标包：$ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）**内嵌进
 echo "==> ★ A4-1：带 /bin/shell.bin 的演示盘 + \"内核里没有 shell 字节\"断言"
 # system.img 已经装好 -> 把它 + MBR + 主分区（= 带 /bin/shell.bin 的 VimtuFS2 v4 卷）拼成
 # 一块能直接启动的盘：build64/sysdisk.img（验收脚本 tests/sh64_test.py 也用它做夹具）。
-# ★ A4-2b：造盘改用 tools/tcc_pack_win.py —— 它在同一块卷里再装进 /bin/tcc（驱动）、/lib/tcc.bin
-#   （tcc 本体）、/tcc/**（libtcc1.a + 系统头 + crt/libc）、/tcc/demo/*.c、/hello（宿主版 tcc 产物）。
+# ★ A4-2b / A4-4：造盘 = **三步串起来**（每步都逐字节回读自检，谁都不重写别人那棵树）：
+#   1) tools/tcc_pack_win.py：同一块卷里装进 /bin/tcc（驱动）、/lib/tcc.bin（tcc 本体）、
+#      /tcc/**（libtcc1.a + 系统头 + crt/libc）、/tcc/demo/*.c、/hello（宿主版 tcc 产物）；
+#   2) tools/lua_pack_win.py：在那块卷上再加 /bin/lua + /lib/lua.bin + /tcc/demo/*.lua（★ A4-4a）；
+#   3) tools/gzip_pack_win.py：再加 /bin/gzip + /bin/gunzip + /tcc/demo/big1m.txt（★ A4-4c），
+#      最后由它拼出完整演示盘 build64/sysdisk.img。
 #   卷内容与 A4-1 完全兼容（/bin/shell.bin + /etc/sh64hello.txt + /tmp），shell 部分逐字节同前。
 "$PY" tools/tcc_pack_win.py --shell "$BUILD/shell.bin" --bin-tcc "$BUILD/tcc" --tcc "$BUILD/tcc.bin" \
       --stage "$BUILD/tcc_stage" --hello "$BUILD/tcc_demo_hello" --demo-dir user/apps/tcc \
-      --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+      --vol "$BUILD/tccvol.img"
+"$PY" tools/lua_pack_win.py --vol-in "$BUILD/tccvol.img" --vol-out "$BUILD/luavol.img" \
+      --drv "$BUILD/lua" --bin "$BUILD/lua.bin" --demo-dir user/lua/demo
+"$PY" tools/gzip_pack_win.py --vol-in "$BUILD/luavol.img" --vol-out "$BUILD/sysvol.img" \
+      --gzip "$BUILD/gzip" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 # 断言：内核二进制里**不能**出现 shell.bin 的字节（交付方式必须是"系统卷里的文件"）。
 # 探针取 shell 中段的 64 字节（ELF 头/入口附近的字节模式到处都是，中段最稳）。
 "$PY" - "$BUILD/kernel64_os.bin" "$BUILD/shell.bin" <<'PYEOF'
@@ -583,6 +682,25 @@ if len(probe) < 64 or probe in k:
     raise SystemExit(1)
 print("    断言 OK：系统内核 %d B 里搜不到 tcc.bin 的 64B 探针（偏移 %d）；tcc 只从系统卷装载" % (len(k), mid))
 PYEOF2
+
+# ★ A4-4 的同一条纪律：**内核二进制里不能出现 Lua 与 gzip 的字节**（两者都只从系统卷装载；
+# 内核区只剩 ~187 KB，交付一律"卷里的文件"）。探针同样取中段 64 字节。
+"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/lua.bin" "$BUILD/gzip" <<'PYEOF3'
+import sys
+k = open(sys.argv[1], "rb").read()
+bad = 0
+for p in sys.argv[2:]:
+    b = open(p, "rb").read()
+    mid = len(b) // 2
+    probe = b[mid:mid + 64]
+    if len(probe) < 64 or probe in k:
+        sys.stderr.write("ERROR: system kernel contains %s bytes (delivery must be a volume file)\n" % p)
+        bad = 1
+    else:
+        print("    断言 OK：系统内核 %d B 里搜不到 %s 的 64B 探针（偏移 %d）；它只从系统卷装载"
+              % (len(k), p.rsplit("/", 1)[-1], mid))
+raise SystemExit(bad)
+PYEOF3
 
 echo "==> ★ A4-2a：ring3 系统调用探针（chdir/rename/rmdir/dup2/utime + execve 失败路径的真证据）"
 # 为什么源码由构建脚本生成：本批只允许改 kernel/*、build64.sh、tests/a42a64_test.py、docs —— user/

@@ -160,6 +160,43 @@ int chdir(const char* path) {
     return -1;
 }
 
+/* ---------------- ★ A5 前置：输入事件投递 + 共享内存缓冲（自有 ABI 12/13/14） ----------------
+   errno 口径：内核这三号返回的是**有语义的小负数**（-1..-5，见 vimtu64.h 的 V64_EV_ 与 V64_SHM_ 两组宏），
+   与 fb_map 同一套分工 —— 原样返回给调用方（它比 errno 更具体），同时把 errno 映射成 POSIX 值，
+   这样\"只用 errno 的代码\"也能拿到一个合理的分类。**绝不把负值改成 0**。 */
+static int v64_errno_ev64(long r) {
+    switch (r) {
+    case V64_EV_EPERM:  errno = EPERM;  break;
+    case V64_EV_EFAULT: errno = EFAULT; break;
+    case V64_EV_ENODEV: errno = ENODEV; break;
+    case V64_EV_ENOMEM: errno = ENOMEM; break;
+    case V64_EV_EINVAL: errno = EINVAL; break;
+    default:            errno = EIO;    break;
+    }
+    return (int)r;
+}
+
+int poll_event(struct Ev64Event* out, unsigned max, unsigned flags) {
+    /* max == 0：只查询待取条数（内核不看 out 指针） */
+    const long r = __v64_int80(V64_NR_INPUT_POLL, (long)(uintptr_t)out, (long)max, (long)flags, 0);
+    if (r < 0) return v64_errno_ev64(r);
+    return (int)r;
+}
+
+int shm_create(unsigned size) {
+    const long r = __v64_int80(V64_NR_SHM_CREATE, (long)size, 0, 0, 0);
+    if (r < 0) return v64_errno_ev64(r);
+    return (int)r;                       /* 对象 id（>= 1），跨进程可传递 */
+}
+
+int shm_map(int id, unsigned offset, unsigned len, void** out_va) {
+    if (!out_va) { errno = EFAULT; return -1; }
+    const long r = __v64_int80(V64_NR_SHM_MAP, (long)id, (long)offset, (long)len,
+                               (long)(uintptr_t)out_va);
+    if (r < 0) return v64_errno_ev64(r);
+    return (int)r;
+}
+
 /* ---------------- 时间 ---------------- */
 time_t time(time_t* tloc) {
     const time_t t = (time_t)(vimtu64_ticks() / VIMTU64_TICKS_HZ);

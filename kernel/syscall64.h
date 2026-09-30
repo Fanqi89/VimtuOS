@@ -32,6 +32,28 @@
 //                                        （含**夹取**后的部分提交）、1 = 完全越界被拒（打点 clip=reject，
 //                                        什么都不提交、不崩）。
 //   11 fb_present()                      整屏提交（缩放模式下的整帧路径），返回 0。
+//   ==================== ★ A5 前置：每进程输入事件队列 + 共享内存缓冲 ====================
+//   12 input_poll(Event *out, unsigned max, unsigned flags)
+//                                        **每进程**事件队列取事件（自有 ABI，详见 kernel/input64.h）：
+//                                        rdi=out（用户数组，40B/条）、rsi=max、rdx=flags；
+//                                        max=0 -> 只查询\"有多少待取\"并返回条数；
+//                                        max>0 -> 最多拷 max 条并返回条数；负数 = 错误码：
+//                                          -1 EPERM  没有进程上下文（任务 0 / 共享模式）
+//                                          -2 EFAULT out 指针非法
+//                                          -4 ENOMEM max 超过队列容量（EV64_MAX_EVENTS64=32）
+//                                          -5 EINVAL flags 有未知位
+//                                        flags：bit0 申请键盘焦点、bit1 申请指针捕获、bit2 释放两者。
+//                                        队列满**丢最旧**并计数打点（`[EV64] drop`），绝不静默。
+//   13 shm_create(size)                  建一块**跨进程可共享**的内存对象，返回对象 id（>=1）；
+//                                        负数 = 错误码（-1 EPERM 无进程上下文 / -3 EINVAL size 非法 /
+//                                        -4 ENOMEM：对象表满、页池空、句柄表满）。上限 64 KiB/对象。
+//   14 shm_map(id, offset, len, out_va)  把对象的 [offset,offset+len) 映射进**当前进程**
+//                                        （用户可读写、不可执行），*out_va 写回用户态基址；
+//                                        offset 必须 4KiB 对齐；返回 0 = 成功。
+//                                        错误码：-1 EPERM（没有这个句柄）、-2 EFAULT（out_va 非法）、
+//                                        -3 EINVAL（越界/非对齐/len=0）、-4 ENOMEM（映射窗满/页表页不足）。
+//                                        句柄 fork 继承、execve 默认关闭、退出引用 -1 并在归零时回收页帧。
+//
 //   错误码（负数，两个入口的 errno 风格一致，**不与 Linux 号段共用号**）：
 //     -1 = EPERM  用户窗口/页表不可用（UEFI 固件只读页表，见 kernel/usermode64.cpp）
 //     -2 = EFAULT 用户指针非法（没通过 user64_range_ok64）

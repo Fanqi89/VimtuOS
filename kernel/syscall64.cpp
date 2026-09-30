@@ -2,7 +2,7 @@
 //
 // ============================ 安全模型（两条路径共用，别省）============================
 //   所有来自用户态的指针参数都必须先过 user64_range_ok64()：要求整段落在用户窗口
-//   （4GiB..4GiB+1MiB）内、且四级页表都是 present + U/S（已映射的用户页）。越界/未映射
+//   （4GiB..4GiB+16MiB，★ A4-2b-2 起；窗口尺寸的唯一真源是 usermode64.h）内、且四级页表都是 present + U/S（已映射的用户页）。越界/未映射
 //   一律返回错误并打 [SYSCALL] deny nr=<n> arg=<ptr>。**绝不能**让用户传一个内核地址就把
 //   内核内存读出去：ring0 读内核地址是合法的，唯一的闸门就是这里的范围校验。
 //   write 另加一条：单次 len 上限（演示/日志用途，别用它搬大块数据）。
@@ -37,6 +37,8 @@
 //   15   rt_sigreturn      **-ENOSYS**：没有信号帧可恢复。
 //   16   ioctl             真（最小）：TIOCGWINSZ → 25x80 struct winsize；TIOCSWINSZ 忽略返回 0；
 //                           其它 → -ENOTTY（与 Linux 对非 tty 一致）。
+//   19   readv            真：最多 8 个 iovec；按顺序读、**短读立即返回**（★ A4-4：musl 的 stdio
+//                           读路径就是 readv —— Lua 的脚本装载与 io.read 依赖它）。
 //   20   writev            真：fd∈{1,2}，最多 8 个 iovec；iovcnt 超限 -EINVAL。
 //   21   access            真（最小）：存在性检查（本内核没有权限模型 → mode 忽略，如实注明）。
 //   22   pipe / pipe2      **真实现（批次 D）**：fd64 的 64 B 环形缓冲 + 读端/写端两个 fd（写进
@@ -65,9 +67,10 @@
 //   63   uname             真：写一份静态 struct utsname（6 x 65B）。
 //   74   fsync             **部分**：走到 0（本内核的 fd 只有只读缓存，没有脏数据要刷）。
 //   79   getcwd            真：把 "/" 写进用户 buf（len>=2）并返回 buf 指针。
-//   82   rename            **-ENOSYS**（vfs64 没有 rename 原语）。
+//   82   rename            真：同目录改名（A4-2a）；**跨目录移动**（A4-4b：改 inode 的 parent+name，
+//                           一次落盘，目录移动维护两边 nlink 并拒绝移进自己的子树）。
 //   83   mkdir             真（走 vfs64，真写盘）；单飞行者：并发调用返回 -EBUSY。
-//   84   rmdir             **-ENOSYS**（vfs64 没有删目录原语）。
+//   84   rmdir             真（A4-2a 起，走 vfs64）：非空 -ENOTEMPTY / 文件 -ENOTDIR / 根 -EBUSY。
 //   87   unlink            真（走 vfs64，真写盘）；单飞行者同上。
 //   89   readlink          **部分**：只对 "/proc/self/exe" 返回当前进程的映像路径；其它 -ENOENT。
 //   96   gettimeofday      真：用 g_ticks64（250Hz PIT）造近似值（tv_usec 4ms 粒度）；tz 恒 0。
@@ -121,6 +124,7 @@
 #include "usermode64.h"     // user64_range_ok64 / user64_exit_to_kernel64 / 用户窗口常量
 #include "vfs64.h"          // Linux open/read 走真实文件系统
 #include "fd64.h"           // 批次 B：FD 层（open/read/write/close/lseek/fstat/dup 的公共底座）
+#include "input64.h"        // ★ A5 前置：自有 ABI 12 的落点 ev64_poll64（事件队列/焦点/背压）
 #include "fs64.h"           // ★ P4：统一卷分派（stat/access/chmod/chown 按当前卷 + 权限判定）
 
 // ---- 批次 C：proc64（进程/地址空间）的**弱引用** ----
@@ -149,6 +153,9 @@ int  proc64_get_cred64(uint32_t*, uint32_t*, uint32_t*, uint32_t*)    __attribut
 int  proc64_set_cred64(uint32_t, uint32_t, uint32_t, uint32_t)        __attribute__((weak));
 // ★ A4-2a：每进程 cwd（proc64.cpp；安装内核不链它 -> weak 为 0 -> getcwd 退回 "/"、chdir 返回 -ENOSYS）
 int  proc64_cwd64(char*, uint32_t)                        __attribute__((weak));
+// ★ A5 前置：共享内存缓冲（proc64.cpp 的 shm 对象表；安装内核不链它 -> 0 -> 号 13/14 返回 -1）
+int64_t proc64_shm_create64(uint64_t)                             __attribute__((weak));
+int64_t proc64_shm_map64(uint64_t, uint64_t, uint64_t, uint64_t)  __attribute__((weak));
 int  proc64_chdir64(const char*)                          __attribute__((weak));
 static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
 #include "mem_64.h"         // PAGE_SIZE_64 / page_free_64 / PTE_*
@@ -185,6 +192,10 @@ static const int64_t  LX64_ENOTTY = 25;
 static const int64_t  LX64_ESPIPE = 29;
 static const int64_t  LX64_ENOSYS = 38;
 static const int64_t  LX64_ENOTEMPTY = 39;
+
+// ★ A4-4b：132）utime 的显式时间路径要用的错误码（与 Linux 取值一致）
+static const int64_t  LX64_EIO   = 5;    // 写盘失败 / 旧卷没有 mtime 字段
+static const int64_t  LX64_EROFS = 30;   // 只读卷（fs64 在 FAT 卷上返回 -FS64_EROFS）
 
 // 这些 errno 目前没有调用点，但它们是**对外承诺的错误码表**（文档/测试按这个口径读）；
 // 这里用 static_assert 钉住取值 —— 顺带消掉 -Wextra 的"未被引用"告警（本文件要求零告警）。
@@ -800,6 +811,30 @@ static int64_t lx64_writev64(uint64_t nr, uint64_t fd, uint64_t iov_va, uint64_t
     return total;
 }
 
+// ---- 19）readv ----（★ A4-4：musl 的 stdio **读**路径用 readv —— Lua 的脚本装载与 io.read 依赖它）
+// 语义与 Linux 一致（简化版）：按 iovec 顺序读进用户缓冲；**短读立即返回**已读字节数；
+// 第一个 iovec 就出错且还没读到任何字节 -> 返回错误码；iovcnt 上限 8（与 writev 同口径）。
+// 为什么它是"工具需要的系统调用"：musl 的 __stdio_read 对带缓冲的 FILE 发的是 readv(19)，
+// 内核没有它 -> ENOSYS -> Lua 报 "cannot read xxx: Function not implemented"（实测踩过）。
+static int64_t lx64_readv64(uint64_t nr, uint64_t fd, uint64_t iov_va, uint64_t iovcnt) {
+    if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (iovcnt == 0) return 0;
+    if (iovcnt > 8) { syscall64_deny64(nr, iovcnt); return -LX64_EINVAL; }
+    if (!user64_range_ok64(iov_va, iovcnt * 16)) { syscall64_deny64(nr, iov_va); return -LX64_EFAULT; }
+    int64_t total = 0;
+    for (uint64_t i = 0; i < iovcnt; i++) {
+        const uint8_t* e = (const uint8_t*)(uintptr_t)(iov_va + i * 16);
+        uint64_t base = 0, len = 0;
+        for (int k = 0; k < 8; k++) { base |= (uint64_t)e[k] << (8 * k); len |= (uint64_t)e[8 + k] << (8 * k); }
+        if (len == 0) continue;
+        const int64_t r = lx64_read64(nr, fd, base, len);
+        if (r < 0) return (total > 0) ? total : r;      // 已读到字节：按 Linux 返回已读（短读语义）
+        total += r;
+        if ((uint64_t)r < len) break;                   // 短读 = 数据到头（别越过后面的 iovec 再读）
+    }
+    return total;
+}
+
 // ---- 63）uname ----
 static int64_t lx64_uname64(uint64_t nr, uint64_t buf) {
     if (!user64_range_ok64(buf, 390)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }   // 6 x 65
@@ -1131,10 +1166,12 @@ static int64_t lx64_fs_mutate64(uint64_t nr, uint64_t path_va, int is_mkdir) {
 // 80）chdir / 82）rename / 84）rmdir / 132）utime —— 语义与错误码逐条写在 docs/应用层与系统调用说明.md
 // 的"A4-2a"一节；这里只放实现要点：
 //   * chdir：每进程 cwd（proc64 里那份），相对路径由 lx64_resolve_path64 拼绝对路径；
-//   * rename：vfs64 只支持**同目录改名**（new_name 是单段名字）-> 跨目录如实 -ENOSYS（不假装做了）；
+//   * rename：同目录改名走 vfs64_rename64（只改 name）；**跨目录移动**走 vfs64_rename_to64
+//     （★ A4-4b：改 inode 的 parent+name，一次落盘；目录移动维护两边 nlink、拒绝移进自己的子树）；
 //   * rmdir：非空目录先自己判断（-ENOTEMPTY），文件 -ENOTDIR，不存在 -ENOENT（Linux 口径）；
-//   * utime：路径必须存在（-ENOENT），times == NULL 是幂等成功；**显式时间 -> -ENOSYS**
-//     （vfs64 没有"设置 inode mtime"的原语，如实拒绝而不是假装设成 1970）。
+//   * utime：路径必须存在（-ENOENT），times == NULL 是幂等成功；**显式时间**（★ A4-4b 起）
+//     把 struct utimbuf 的 modtime（Unix 秒，UTC）写进 inode mtime（actime 无字段可落 -> 日志里
+//     如实写明"只落了 mtime"）；超出 2000..2063 -> -EINVAL。
 // VFS 变更单飞行者（与 mkdir/unlink 同一套：见上面 g_lx_vfs_busy64 的注释）。
 
 // 取"父目录"（写进 out）与"最后一段名字"（返回指向 path 内部的指针；没有 '/' 返回 nullptr）
@@ -1177,22 +1214,9 @@ static int64_t lx64_rename64(uint64_t nr, uint64_t old_va, uint64_t new_va) {
     // 源必须存在（Linux：源缺失 = ENOENT）；vfs64 的 rename 也会判，这里先给出准确 errno
     Fs64Stat64 src_st;
     if (fs64_stat64(-1, oldp, &src_st) != 0) return -LX64_ENOENT;
-    // 同一父目录？比较字符串（不等 = 跨目录移动：vfs64 只有"同目录改名"）
-    {
-        int same = 1;
-        for (int i = 0; odir[i] || ndir[i]; i++) { if (odir[i] != ndir[i]) { same = 0; break; } }
-        if (!same) {
-            dbg64_line_begin64();
-            dbg64_str("[SYSCALL] rename cross-dir UNSUPPORTED old=");
-            dbg64_str(oldp);
-            dbg64_str(" new=");
-            dbg64_str(newp);
-            dbg64_str(" -> -ENOSYS (vfs64 rename is same-dir only)");
-            dbg64_nl();
-            dbg64_line_end64();
-            return -LX64_ENOSYS;                              // 跨目录移动：vfs64 没有这个原语，如实拒绝
-        }
-    }
+    // 同一父目录？比较字符串：不等 = 跨目录移动（★ A4-4b 起有原语：fs64_rename_to64）
+    int same_dir = 1;
+    for (int i = 0; odir[i] || ndir[i]; i++) { if (odir[i] != ndir[i]) { same_dir = 0; break; } }
     // 目标已存在：vfs64 不会覆盖（Linux 会覆盖）—— 如实返回 -EEXIST，绝不假装成功
     {
         Fs64Stat64 dst_st;
@@ -1203,11 +1227,14 @@ static int64_t lx64_rename64(uint64_t nr, uint64_t old_va, uint64_t new_va) {
     if (g_lx_vfs_busy64) return -LX64_EBUSY;
     g_lx_vfs_busy64 = 1;
     __asm__ volatile("sti" ::: "memory");
-    const int rc = vfs64_rename64(oldp, nbase);
+    // 同目录 -> vfs64_rename64（只改 name）；跨目录 -> fs64_rename_to64（改 parent+name，一次落盘）
+    const int rc = same_dir ? vfs64_rename64(oldp, nbase) : fs64_rename_to64(-1, oldp, newp);
     __asm__ volatile("cli" ::: "memory");
     g_lx_vfs_busy64 = 0;
     if (rc == 0) return 0;
-    return -LX64_ENOENT;                                     // 源不存在 / 名字非法 / 重名
+    if (rc == -LX64_EACCES) return -LX64_EACCES;             // 目录 w+x 不足（vfs64 已打点）
+    if (rc == -LX64_EROFS)  return -LX64_EROFS;              // 只读卷（FAT -> -FS64_EROFS）
+    return -LX64_ENOENT;                                     // 源不存在/名字非法/目标已存在/移进自己子树
 }
 
 // ---- 84）rmdir ----
@@ -1238,6 +1265,31 @@ static int64_t lx64_rmdir64(uint64_t nr, uint64_t path_va) {
     return rc == 0 ? 0 : -LX64_ENOENT;
 }
 
+// ★ A4-4b：Unix 秒 -> VimtuOS 打包时间（utime(132) 显式时间用）。
+// 口径 **UTC**（本内核没有时区/夏令时；vfs64_pack_time64 只接受 2000..2063 的打包格式）。
+// 算法 = Howard Hinnant 的 civil_from_days（整数、无闰秒表、不需要任何 libc 时间函数）。
+// 返回 0 = 成功（*out 已填）；-1 = 超出可表示范围（packed == 0）。
+static int lx64_pack_unix_time64(int64_t sec, uint32_t* out) {
+    int64_t days = sec / 86400;
+    int64_t rem  = sec % 86400;
+    if (rem < 0) { rem += 86400; days -= 1; }              // 负秒数（1970 之前）：向负无穷取整
+    const int hour = (int)(rem / 3600);
+    const int minu = (int)((rem % 3600) / 60);
+    const int secd = (int)(rem % 60);
+    const int64_t z = days + 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const uint32_t doe = (uint32_t)(z - era * 146097);                        // [0, 146096]
+    const uint32_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;   // [0, 399]
+    const uint32_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);             // [0, 365]
+    const uint32_t mp  = (5 * doy + 2) / 153;                                 // [0, 11]
+    const int day   = (int)(doy - (153 * mp + 2) / 5 + 1);                    // [1, 31]
+    const int month = (int)mp + (mp < 10 ? 3 : -9);                           // [1, 12]
+    const int year  = (int)yoe + (int)(era * 400) + (month <= 2 ? 1 : 0);
+    const uint32_t packed = vfs64_pack_time64(year, month, day, hour, minu, secd);
+    if (packed == 0) return -1;
+    if (out) *out = packed;
+    return 0;
+}
 // ---- 132）utime(path, const struct utimbuf*) ----
 static int64_t lx64_utime64(uint64_t nr, uint64_t path_va, uint64_t times_va) {
     char path[LX64_PATHR_MAX];
@@ -1251,13 +1303,44 @@ static int64_t lx64_utime64(uint64_t nr, uint64_t path_va, uint64_t times_va) {
         return 0;
     }
     if (!user64_range_ok64(times_va, 16)) { syscall64_deny64(nr, times_va); return -LX64_EFAULT; }
-    dbg64_line_begin64();
-    dbg64_str("[SYSCALL] utime nr=132 path=");
-    dbg64_str(path);
-    dbg64_str(" times=explicit -> -ENOSYS (no inode mtime setter in vfs64; honest refusal)");
-    dbg64_nl();
-    dbg64_line_end64();
-    return -LX64_ENOSYS;
+    // ★ A4-4b：显式时间。struct utimbuf { time_t actime; time_t modtime; }（16 B）。
+    // 只落地 **modtime -> inode mtime**（VimtuFS2 没有 atime 字段：actime 如实忽略并写在日志里，
+    // 不假装两个都写了）。时间口径 = Unix 秒按 **UTC** 折算；超出 2000..2063 -> -EINVAL。
+    const uint8_t* tp = (const uint8_t*)(uintptr_t)times_va;
+    int64_t modtime = 0;
+    for (int i = 0; i < 8; i++) modtime |= (int64_t)((uint64_t)tp[8 + i] << (8 * i));
+    uint32_t packed = 0;
+    if (lx64_pack_unix_time64(modtime, &packed) != 0) {
+        dbg64_line_begin64();
+        dbg64_str("[SYSCALL] utime nr=132 path=");
+        dbg64_str(path);
+        dbg64_str(" sec=");
+        dbg64_dec((uint64_t)modtime);
+        dbg64_str(" -> -EINVAL (out of 2000..2063 representable range)\n");
+        dbg64_nl();
+        dbg64_line_end64();
+        return -LX64_EINVAL;
+    }
+    if (g_lx_vfs_busy64) return -LX64_EBUSY;
+    g_lx_vfs_busy64 = 1;
+    __asm__ volatile("sti" ::: "memory");
+    const int rc = fs64_set_mtime64(-1, path, packed);
+    __asm__ volatile("cli" ::: "memory");
+    g_lx_vfs_busy64 = 0;
+    if (rc == 0) {
+        dbg64_line_begin64();
+        dbg64_str("[SYSCALL] utime nr=132 path=");
+        dbg64_str(path);
+        dbg64_str(" mtime=");
+        dbg64_dec((uint64_t)modtime);
+        dbg64_str(" (actime ignored: no atime field in VimtuFS2)\n");
+        dbg64_nl();
+        dbg64_line_end64();
+        return 0;
+    }
+    if (rc == -LX64_EACCES) return -LX64_EACCES;
+    if (rc == -LX64_EROFS)  return -LX64_EROFS;
+    return -LX64_EIO;                                        // 写盘失败 / 旧卷没有 mtime 字段（已打点）
 }
 
 // ---- 24）sched_yield / 35）nanosleep / 34）pause / 37）alarm ----
@@ -1460,6 +1543,7 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 14:  return lx64_rt_sigprocmask64(a1, a2, a3, a4);        // 只记录不投递
     case 15:  break;                                               // rt_sigreturn：没有信号帧可恢复 -> -ENOSYS
     case 16:  return lx64_ioctl64(nr, a1, a2, a3);
+    case 19:  return lx64_readv64(nr, a1, a2, a3);                  // ★ A4-4：musl stdio 的 readv
     case 20:  return lx64_writev64(nr, a1, a2, a3);
     case 21:  return lx64_access64(nr, a1, a2);
     case 22:  return lx64_pipe64(nr, a1);                          // pipe(int[2])：fd64 真管道（批次 D）
@@ -1632,6 +1716,24 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
     case 11:                                                    // fb_present()
         ret = sc64_fb_present64();
         break;
+
+    // ★ A5 前置：自有 ABI 12/13/14（用户态输入事件投递 + 共享内存缓冲）。
+    //   语义/结构体/错误码：kernel/input64.h（12）与 kernel/proc64.h 的 A5 段（13/14）。
+    //   安装介质内核不链 proc64.cpp -> 13/14 的 weak 引用为 0 -> 返回 -1（**不假装成功**）。
+    case 12:                                                    // input_poll(out, max, flags)
+        ret = ev64_poll64(a1, (uint32_t)a2, (uint32_t)a3);
+        break;
+
+    case 13:                                                    // shm_create(size)
+        ret = proc64_shm_create64 ? proc64_shm_create64(a1) : -1;
+        if (!proc64_shm_create64) syscall64_deny64(nr, a1);
+        break;
+
+    case 14:                                                    // shm_map(id, offset, len, out_va)：out_va 在 r10
+        ret = proc64_shm_map64 ? proc64_shm_map64(a1, a2, a3, r->r10) : -1;
+        if (!proc64_shm_map64) syscall64_deny64(nr, r->r10);
+        break;
+
 
     default:
         ret = -1;

@@ -3,7 +3,7 @@
 #include "port.h"
 #include "x86_64.h"      // ★ 批次 L：ticks64()（记录左键按下包的到达时刻）
 #include "debug64.h"   // ★ P2：Caps/Shift/滚轮打点无条件需要（原来只在 VIMTU_KBD_TRACE 下包含）
-
+#include "input64.h"   // ★ A5 前置：把\"解码完成的键码/鼠标包\"投给每进程事件队列（自有 ABI 12）
 // ================ 8042（PS/2 控制器）公共助手 ================
 //
 // 踩坑记录（M2：安装程序里"按回车出来的是 Esc"，按键全乱）：
@@ -138,12 +138,29 @@ static const char kbd_map_shift[128] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
+// ★ A5 前置：事件的修饰键掩码 + 键盘\"按下表\"索引（input64.cpp 按它记下按下时的键码，
+//   KEY_UP 才能报出与 KEY_DOWN 相同的键码）。索引口径：普通键 = 扫描码；E0 扩展键 = 扫描码 | 0x80
+//   （于是 E0 上方向 0x48 与数字键盘 0x48 不会互相顶掉记录）。纯修饰键不产事件，只出现在 mods 里。
+static uint8_t g_kbd_ev_idx = 0;
+static inline uint32_t kbd_ev_mods64() {
+    uint32_t m = 0;
+    if (shift_pressed) m |= EV64_MOD_SHIFT64;
+    if (ctrl_pressed)  m |= EV64_MOD_CTRL64;
+    if (alt_pressed)   m |= EV64_MOD_ALT64;
+    if (caps_lock)     m |= EV64_MOD_CAPS64;
+    return m;
+}
+
 static void kbd_push(uint8_t c) {
     uint32_t next = (kbd_head + 1) % KBD_BUF_SIZE;
     if (next != kbd_tail) {
         kbd_buf[kbd_head] = c;
         kbd_head = next;
     }
+    // ★ A5 前置：这是\"键码解码完成\"的**唯一出口**（普通字符 / 控制字符 / Esc / NAV_* /
+    //   KBD_KEY_F2|DELETE|PAGEUP|PAGEDOWN 全都从这里出去）—— 事件层在这里生成 KEY_DOWN。
+    //   纯修饰键（Shift/Ctrl/Alt/Caps）不走这里，所以它们不会产生按键事件（只进 mods）。
+    ev64_key_press64(g_kbd_ev_idx, c, kbd_ev_mods64());
 }
 
 static bool kbd_pop(uint8_t* c) {
@@ -181,10 +198,15 @@ uint32_t kbd_shift_toggles64() { return shift_toggles; }
 
 // 处理一个键盘扫描码（集 1；E0 前缀的扩展键在这里单独走）
 static void kbd_process_scancode(uint8_t sc) {
+    // ★ A5 前置：**释放**（sc >= 0x80）先投事件层 —— E0 扩展键的释放（E0 + 0xC8 之类）走的也是这里，
+    //   索引口径与 kbd_push 一侧完全一致：E0 在前的用 \"扫描码 | 0x80\"，普通键用扫描码本身。
+    //   释放不能提前 return（下面还要更新修饰键状态），所以这里只投事件、不改变控制流。
+    if (sc >= 0x80) ev64_key_release64((uint8_t)((e0_pending ? 0x80u : 0u) | (sc & 0x7Fu)), kbd_ev_mods64());
     if (sc == 0xE0) { e0_pending = true; return; }
     if (sc == 0xE1) { e0_pending = false; return; }
     if (e0_pending) {
         e0_pending = false;
+        g_kbd_ev_idx = (uint8_t)(sc | 0x80u);            // E0 扩展键：按下表索引 = 扫描码 | 0x80
         // Win 键按下（边沿触发：释放不清除，GUI 读取后 consume 才清除）
         if (sc == 0x5B || sc == 0x5C) win_key_flag = 1;
         else if (sc == 0x48) kbd_push(NAV_UP);               // 上方向
@@ -197,6 +219,7 @@ static void kbd_process_scancode(uint8_t sc) {
         return;
     }
 
+    g_kbd_ev_idx = sc;                                   // 普通键：按下表索引 = 扫描码本身
     // ★ 批次 J：F2（扫描码 0x3C，不是可打印字符，旧表解码成 0 -> 直接丢掉；显式投递键码）
     if (sc == 0x3C) { kbd_push((uint8_t)KBD_KEY_F2); return; }
 
@@ -465,6 +488,21 @@ static void mouse_process_byte(uint8_t data) {
     if (!(nb & 4) && (old & 4)) { if (released_middle < 4) released_middle++; }
     mouse_buttons = nb;
     mouse_has_data = true;
+    // ★ A5 前置：一次包解码完成 -> 事件层（与上面各状态完全同一份数据：位移/位置/键位/滚轮）。
+    //   路由规则见 kernel/input64.h：捕获者优先，没有捕获者给焦点进程（前台窗口所属进程）。
+    {
+        const uint32_t mods = kbd_ev_mods64();
+        if (sx != 0 || sy != 0) {
+            ev64_mouse64(EV64_TYPE_MOUSE_MOVE, 0, (int32_t)mouse_x, (int32_t)mouse_y,
+                         (int32_t)sx, (int32_t)sy, nb, mods);
+        }
+        if ((nb & 1u) && !(old & 1u)) ev64_mouse64(EV64_TYPE_MOUSE_DOWN, EV64_BTN_LEFT64,   (int32_t)mouse_x, (int32_t)mouse_y, 0, 0, nb, mods);
+        if ((nb & 2u) && !(old & 2u)) ev64_mouse64(EV64_TYPE_MOUSE_DOWN, EV64_BTN_RIGHT64,  (int32_t)mouse_x, (int32_t)mouse_y, 0, 0, nb, mods);
+        if ((nb & 4u) && !(old & 4u)) ev64_mouse64(EV64_TYPE_MOUSE_DOWN, EV64_BTN_MIDDLE64, (int32_t)mouse_x, (int32_t)mouse_y, 0, 0, nb, mods);
+        if (!(nb & 1u) && (old & 1u)) ev64_mouse64(EV64_TYPE_MOUSE_UP,   EV64_BTN_LEFT64,   (int32_t)mouse_x, (int32_t)mouse_y, 0, 0, nb, mods);
+        if (!(nb & 2u) && (old & 2u)) ev64_mouse64(EV64_TYPE_MOUSE_UP,   EV64_BTN_RIGHT64,  (int32_t)mouse_x, (int32_t)mouse_y, 0, 0, nb, mods);
+        if (!(nb & 4u) && (old & 4u)) ev64_mouse64(EV64_TYPE_MOUSE_UP,   EV64_BTN_MIDDLE64, (int32_t)mouse_x, (int32_t)mouse_y, 0, 0, nb, mods);
+    }
     // ★ P2：滚轮（4 字节包的第 4 字节 = Z，二补码；标准 PS/2/Intellimouse 约定：+1 = 向上/远离用户）
     if (pkt == 4) {
         const int8_t z = (int8_t)mouse_packet[3];
@@ -483,6 +521,9 @@ static void mouse_process_byte(uint8_t data) {
                 dbg64_nl();
                 dbg64_line_end64();
             }
+            // ★ A5 前置：滚轮事件（dy = 增量，>0 = 向上；4 字节包才有）
+            ev64_mouse64(EV64_TYPE_WHEEL, 0, (int32_t)mouse_x, (int32_t)mouse_y,
+                         0, (int32_t)z, mouse_buttons, kbd_ev_mods64());
         }
     }
 #ifdef VIMTU_PS2_TRACE

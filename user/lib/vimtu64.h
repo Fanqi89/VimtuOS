@@ -22,6 +22,85 @@
 #define V64_NR_FB_MAP      9   /* fb_map(&va, &info)     -> 0 / -1..-4（A1） */
 #define V64_NR_FB_FLIP     10  /* fb_flip(x, y, w, h)    -> 0 = 已提交(含夹取) / 1 = 完全越界被拒 */
 #define V64_NR_FB_PRESENT  11  /* fb_present()           -> 0/负 */
+/* ---- ★ A5 前置：用户态输入事件投递 + 共享内存缓冲（内核侧定义见 kernel/input64.h 与
+ *      kernel/proc64.h 的 A5 段；改这里必须同步那两份 + docs/应用层与系统调用说明.md） ---- */
+#define V64_NR_INPUT_POLL  12  /* input_poll(Event*, max, flags) -> 事件数 / 待取数(max=0) / 负错误码 */
+#define V64_NR_SHM_CREATE  13  /* shm_create(size)               -> 跨进程共享的对象 id(>=1) / 负错误码 */
+#define V64_NR_SHM_MAP     14  /* shm_map(id, off, len, &va)     -> 0 / 负错误码（第 4 参数走 r10） */
+
+/* input_poll 的错误码（与 kernel/input64.h 的 EV64_* 一致） */
+#define V64_EV_EPERM    (-1)   /* 没有进程上下文（任务 0 / 共享地址空间模式） */
+#define V64_EV_EFAULT   (-2)   /* out 指针非法 */
+#define V64_EV_ENODEV   (-3)   /* 没有事件层（理论上到不了） */
+#define V64_EV_ENOMEM   (-4)   /* max 超过队列容量（32） */
+#define V64_EV_EINVAL   (-5)   /* flags 有未知位 */
+
+/* shm 的错误码（与 kernel/proc64.h 的 SHM64_* 一致） */
+#define V64_SHM_EPERM   (-1)   /* 没有进程上下文 / 本进程没有这个对象的句柄 */
+#define V64_SHM_EFAULT  (-2)   /* out_va 指针非法 */
+#define V64_SHM_EINVAL  (-3)   /* size/offset/len 非法 */
+#define V64_SHM_ENOMEM  (-4)   /* 对象表/页池/句柄表满；映射窗被占用 */
+
+/* ---------------- ★ A5 前置：事件结构（与内核 Ev64Event **逐字节**一致：40 B，POD） ---------------- */
+struct Ev64Event {
+    uint32_t type;     /* +0  EV64_TYPE_* */
+    uint32_t code;     /* +4  键码 / 鼠标键位掩码 / 0 */
+    int32_t  x;        /* +8  光标 x */
+    int32_t  y;        /* +12 光标 y（向下为正） */
+    int32_t  dx;       /* +16 本次实际生效的 x 位移 */
+    int32_t  dy;       /* +20 本次实际生效的 y 位移（WHEEL 时 = 滚轮增量） */
+    uint32_t buttons;  /* +24 鼠标键位掩码 */
+    uint32_t mods;     /* +28 修饰键掩码 */
+    uint64_t t_ms;     /* +32 毫秒时间戳（250Hz PIT，4ms 粒度） */
+};
+#define V64_EV_SIZE        40
+
+#define V64_EV_KEY_DOWN    1u
+#define V64_EV_KEY_UP      2u
+#define V64_EV_MOUSE_MOVE  3u
+#define V64_EV_MOUSE_DOWN  4u
+#define V64_EV_MOUSE_UP    5u
+#define V64_EV_WHEEL       6u
+
+/* input_poll 的 flags：bit0 申请键盘焦点、bit1 申请指针捕获、bit2 释放两者 */
+#define V64_EV_FLAG_FOCUS    0x1u
+#define V64_EV_FLAG_CAPTURE  0x2u
+#define V64_EV_FLAG_RELEASE  0x4u
+
+/* mods 位 */
+#define V64_EV_MOD_SHIFT   0x1u
+#define V64_EV_MOD_CTRL    0x2u
+#define V64_EV_MOD_ALT     0x4u
+#define V64_EV_MOD_CAPS    0x8u
+
+/* 鼠标键位（MOUSE_DOWN/UP 的 code + buttons 的位） */
+#define V64_EV_BTN_LEFT    0x1u
+#define V64_EV_BTN_RIGHT   0x2u
+#define V64_EV_BTN_MIDDLE  0x4u
+
+/* 键码口径（与内核 input.h / input.cpp 的键盘缓冲一致；验收脚本按这些值断言） */
+#define V64_KEY_ESC        0x1Bu
+#define V64_KEY_UP         0xFDu
+#define V64_KEY_DOWN       0xFEu
+#define V64_KEY_LEFT       0xFBu
+#define V64_KEY_RIGHT      0xFCu
+#define V64_KEY_DELETE     0xFAu
+#define V64_KEY_F2         0xF9u
+#define V64_KEY_PAGEUP     0xF8u
+#define V64_KEY_PAGEDOWN   0xF7u
+
+/* 单对象上限（= kernel/proc64.h 的 SHM64_MAX_PAGES64 * 4KiB） */
+#define V64_SHM_MAX_BYTES  (64u * 1024u)
+
+/* ---------------- ★ A5 前置：包装（user/lib/syscall.c） ----------------
+ * poll_event(out, max, flags)：out != NULL 时最多取 max 条事件（40 B/条）并返回条数；
+ *   max == 0 时只查询\"有多少待取\"（out 忽略）；返回负数 = 内核错误码（V64_EV_*）。
+ * shm_create(size)：返回跨进程可共享的对象 id（>= 1）；负数 = V64_SHM_*。
+ * shm_map(id, offset, len, out_va)：把对象的一段映射进**当前进程**，*out_va 写回基址；
+ *   offset 必须 4KiB 对齐；返回 0 = 成功。 */
+int poll_event(struct Ev64Event* out, unsigned max, unsigned flags);
+int shm_create(unsigned size);
+int shm_map(int id, unsigned offset, unsigned len, void** out_va);
 
 /* write(1,...) 单次上限：内核 SYSCALL64_WRITE_MAX = 1024（超了算参数错误并打 [SYSCALL] deny）。
    write() 包装按这个值**自动分块**，调用方不用管。 */
