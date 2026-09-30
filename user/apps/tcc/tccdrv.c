@@ -24,9 +24,11 @@
  *       run /bin/tcc -c /tmp/t1.c -o /tmp/t1.o
  *
  * 体积/内存账（为什么要写得这么抠，见 docs/应用层与系统调用说明.md 的 A4-2b 节）：
- *   用户窗口总共 1 MiB：装载区 64 KiB（本驱动占头十几 KB）+ 栈 16 KiB + brk 64 KiB +
- *   mmap 448 KiB。tcc 的映像占掉 mmap 区前 297 KiB，剩下的才是它的堆 —— 所以本驱动
- *   **不引任何 libc**（不用 user/lib、不用 musl），系统调用全部内联汇编直接发；
+ *   ★ A4-2b-2：用户窗口已从 1 MiB 放大到 **16 MiB**（kernel/usermode64.h）。本驱动原先
+ *   抠到极致的写法（不引 libc、16 KiB 的栈）保留不变，但 tcc 的堆不再是瓶颈：
+ *   装载区 64 KiB（本驱动占十几 KB）+ 栈 16 KiB + brk 64 KiB + mmap **16 MiB - 0x90000**。
+ *   tcc 的映像 276 KiB + 本驱动换的 256 KiB 栈之后，tcc 的堆仍有 ~15 MiB。
+ *   本驱动**不引任何 libc**（不用 user/lib、不用 musl），系统调用全部内联汇编直接发；
  *   串口/控制台打点单次 ≤ 1024 字节（本内核 Linux write 单次上限 4096，自有 ABI 是 1024）。
  *
  * 出错一律打 `[TCCDRV] FAIL ...` 后 exit_group(127)，绝不"假装成功"。
@@ -39,11 +41,13 @@ typedef unsigned short u16;
 typedef short i16;
 
 /* ---- 与本内核对齐的常量（用户态看不到 kernel/*.h，这里是同一份约定的拷贝）---- */
-#define DRV_STACK_BYTES 24576ULL                /* 给 tcc 的栈：24 KiB（内核给的 16 KiB 不够，见注释） */
+#define DRV_STACK_BYTES 262144ULL               /* 给 tcc 的栈：256 KiB（内核给的 16 KiB 不够，见注释；
+                                                 * ★ A4-2b-2：窗口 16 MiB 后给足 —— tcc 编译期的
+                                                 * 递归下降/表达式栈远不止 24 KiB） */
 #define U64_STACK_VA64  0x0000000100010000ULL   /* USER64_STACK_VA64：内核给的用户栈底 */
 #define U64_MMAP_VA64   0x0000000100090000ULL   /* USER64_MMAP_VA64：mmap bump 起点 */
-#define U64_WINDOW_TOP  0x0000000100100000ULL   /* 4GiB + 1MiB（窗口顶） */
-#define TCC_SPAN_MAX    (U64_WINDOW_TOP - U64_MMAP_VA64)   /* 448 KiB */
+#define U64_WINDOW_TOP  0x0000000101000000ULL   /* ★ A4-2b-2：4GiB + 16MiB（窗口顶；原 4GiB+1MiB） */
+#define TCC_SPAN_MAX    (U64_WINDOW_TOP - U64_MMAP_VA64)   /* ~15.4 MiB */
 #define TCC_PATH        "/lib/tcc.bin"
 #define ELF64_PHDR_SIZE 56
 #define E64_MAX_PHDR    16
@@ -79,13 +83,39 @@ static inline i64 sc6(long nr, i64 a1, i64 a2, i64 a3, i64 a4, i64 a5, i64 a6) {
     return r;
 }
 
-/* ---- 输出（fd 1 = 内核控制台；shell 的 `>` 重定向后就是文件）---- */
+/* ---- 输出（fd 1 = 内核控制台；shell 的 `>` 重定向后就是文件）----
+ *   ★ A4-2b-2：**按行缓冲**（每行只发一次 write(2)）。
+ *   原先 out_dec/out_hex 是"每位单独发一次 write(2)"，一次 `run /bin/tcc` 的装载期
+ *   实测有 **113 次单字节 write(2)**；而本内核给**每个**系统调用打一行
+ *   `[SYSCALL] insn nr=… rdi=… rsi=… rdx=… ret=…`（≈90 B 串口，见
+ *   kernel/syscall64.cpp），按 115200 8N1 ≈ 11520 B/s 算，这 113 行 ≈ 10 KB ≈ 0.9 秒。
+ *   实测：装载期整段 344 行日志 / 27.7 KB / ≈2.5 s —— 几乎全是**打点自身**的串口时间。
+ *   为什么必须省：shell 的 `run` 走 wait4(61)，而内核的 wait4 是**有界等待**
+ *   （kernel/proc64.cpp 的 PROC64_WAIT_TIMEOUT_SEC = 5 s，PIT_HZ_64 = 250 -> 1250 tick）。
+ *   超了就返回 EAGAIN(11)，shell 打的是 `run: wait4 failed (err=11)` 而**不是**
+ *   `run: <path> pid=N exited code=C` —— 于是验收脚本看不到汇总行。
+ *   缓冲后：单字节 write(2) 从 113 次 -> 0 次，每行一条多字节 write(2)。 */
+#define OUT_BUF_BYTES 1024
+static char g_outbuf[OUT_BUF_BYTES];
+static unsigned long g_outlen = 0;
+
+static void out_flush(void) {
+    unsigned long off = 0;
+    while (off < g_outlen) {
+        const i64 w = sc3(NR_WRITE, 1, (i64)(g_outbuf + off), (i64)(g_outlen - off));
+        if (w <= 0) break;                       /* 控制台写失败：丢弃，绝不死循环 */
+        off += (unsigned long)w;
+    }
+    g_outlen = 0;
+}
 static void out_n(const char* s, unsigned long n) {
     while (n) {
-        unsigned long k = n > 1024 ? 1024 : n;
-        const i64 w = sc3(NR_WRITE, 1, (i64)s, (i64)k);
-        if (w <= 0) return;
-        s += w; n -= (unsigned long)w;
+        unsigned long room = (unsigned long)OUT_BUF_BYTES - g_outlen;
+        if (!room) { out_flush(); room = (unsigned long)OUT_BUF_BYTES; }
+        const unsigned long k = (n < room) ? n : room;
+        for (unsigned long i = 0; i < k; i++) g_outbuf[g_outlen + i] = s[i];
+        g_outlen += k;
+        s += k; n -= k;
     }
 }
 static unsigned long slen(const char* s) { unsigned long n = 0; while (s[n]) n++; return n; }
@@ -104,10 +134,12 @@ static void out_hex(u64 v) {
     out_s("0x");
     while (n) out_n(&t[--n], 1);
 }
+/* 一行收尾：补 '\n' 并**一次** flush（所有打点行都用它结尾，别漏） */
+static void out_eol(void) { out_n("\n", 1); out_flush(); }
 static void die(const char* why) {
     out_s("[TCCDRV] FAIL reason=");
     out_s(why);
-    out_s("\n");
+    out_eol();                                   /* 必须 flush：下一句就是 exit_group */
     sc1(NR_EXITG, 127);
     for (;;) { }
 }
@@ -159,7 +191,7 @@ void drv_main(u64* sp) {
     out_dec(argc);
     out_s(" argv0=");
     out_s(argv0 ? argv0 : "(null)");
-    out_s("\n");
+    out_eol();
 
     const i64 fd = sc3(NR_OPEN, (i64)TCC_PATH, 0, 0);
     if (fd < 0) die("open-tcc");
@@ -199,7 +231,7 @@ void drv_main(u64* sp) {
     out_dec(span);
     out_s(" entry=");
     out_hex(eh->e_entry);
-    out_s("\n");
+    out_eol();
 
     /* 本进程第一次 mmap：内核 bump 分配器的起点就是 USER64_MMAP_VA64（= tcc 的链接基址） */
     const i64 va = sc6(NR_MMAP, 0, (i64)span, 3 /*R|W*/, 0x22 /*MAP_PRIVATE|MAP_ANONYMOUS*/, -1, 0);
@@ -210,7 +242,7 @@ void drv_main(u64* sp) {
     out_dec(span);
     out_s(" expected=");
     out_hex(U64_MMAP_VA64);
-    out_s("\n");
+    out_eol();
     if ((u64)va != U64_MMAP_VA64) die("mmap-va-mismatch");
 
     /* 逐段搬：p_offset -> p_vaddr（分块读，内核单次 read 上限 4096） */
@@ -246,7 +278,7 @@ void drv_main(u64* sp) {
     out_dec(span);
     out_s(" prot=7 rc=");
     out_dec((u64)(mrc < 0 ? (i64)(-mrc) : mrc));
-    out_s("\n");
+    out_eol();
     if (mrc < 0) die("mprotect");
 
     /* ★ A4-2b：给 tcc **换一块更大的栈**（内核给的 16 KiB 用户栈不够用 —— 实测：
@@ -255,7 +287,9 @@ void drv_main(u64* sp) {
      *   这里在**映像之后**再 mmap 一块栈（顺序不能反：映像必须落在固定的 4GiB+0x90000），
      *   把内核压在初始栈上的那一小段（argc/argv/envp/auxv + 参数字符串，实测 ~432 B）
      *   原样搬到新栈顶，再把 auxv 的几项改写成 tcc 自己的，最后用新 rsp 跳进 tcc。
-     *   代价：这 64 KiB 与 tcc 的堆同抢窗口剩下的 448 KiB（如实记账，见 README 的内存账）。 */
+     *   ★ A4-2b-2：窗口 16 MiB 之后这块栈是 **256 KiB**（原来 24 KiB）：编译期的递归下降
+     *   与 musl 的 vfprintf 栈用量都可能超过 24 KiB；它只从 mmap 区拿 256 KiB，tcc 的堆
+     *   仍有 ~15 MiB（见文件头的内存账）。 */
     const i64 stk = sc6(NR_MMAP, 0, (i64)DRV_STACK_BYTES, 3, 0x22, -1, 0);
     if (stk < 0) die("mmap-stack");
     {
@@ -274,7 +308,7 @@ void drv_main(u64* sp) {
         out_dec(len);
         out_s(" new_rsp=");
         out_hex(new_sp);
-        out_s("\n");
+        out_eol();
     }
 
     /* auxv 改写成 tcc 自己的（musl 的 static_init_tls 要按 AT_PHDR 遍历程序头表） */
@@ -300,12 +334,12 @@ void drv_main(u64* sp) {
     out_dec(eh->e_phnum);
     out_s(" entry=");
     out_hex(eh->e_entry);
-    out_s("\n");
+    out_eol();
 
     out_s("[TCCDRV] jmp entry=");
     out_hex(eh->e_entry);
     out_s(" rsp=");
     out_hex((u64)sp);
-    out_s("\n");
+    out_eol();
     jump_to(sp, eh->e_entry);
 }

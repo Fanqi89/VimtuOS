@@ -350,7 +350,7 @@ static inline uint64_t u64_leaf_keep64(uint64_t leaf_flags) {
 static inline uint64_t u64_phys_bits64(uint64_t pte) {
     return pte & 0x000FFFFFFFFFF000ULL;                          // 只取 bit12..51（物理地址）
 }
-// A1：这个 VA 是否落在"用户区"（用户窗口 4GiB..4GiB+1MiB，或 FB 映射区 5GiB..+40MiB）。
+// A1/A4-2b-2：这个 VA 是否落在"用户区"（用户窗口 4GiB..4GiB+16MiB，或 FB 映射区 5GiB..+40MiB）。
 // 页级原语的**唯一**范围判据：加一个用户区就只改这里，别在各个调用点各写一份。
 static inline bool u64_va_in_user_area64(uint64_t va) {
     if (va >= USER64_CODE_VA64 && va < USER64_CODE_VA64 + USER64_WINDOW_BYTES64) return true;
@@ -961,5 +961,22 @@ int user64_selftest64() {
         dbg64_nl();
         dbg64_line_end64();
     }
+
+    // ★ A4-2b-2：窗口放大后的**惰性映射**对照证据（boot 打点，自动验收按前缀 grep）：
+    //   本行打印"窗口字节数 + 当前页池空闲页数"。窗口 1 MiB 与 16 MiB 两份内核在**同一启动点**
+    //   上必须打出相同的 free_pages —— 因为尺寸只进范围判定，页表页/物理页只在
+    //   user64_map_page64()/user64_map_phys_page64() 里按被触碰的 VA 分配，没有任何
+    //   "按窗口尺寸预建页表/预占页"的循环（见 usermode64.h 的布局段与 u64_walk64）。
+    // 打点：[USER64] window bytes=<n> free_pages=<n>/<n> lazy=1
+    dbg64_line_begin64();
+    dbg64_str("[USER64] window bytes=");
+    dbg64_dec(USER64_WINDOW_BYTES64);
+    dbg64_str(" free_pages=");
+    dbg64_dec(page_count_free_64());
+    dbg64_str("/");
+    dbg64_dec(page_count_total_64());
+    dbg64_str(" lazy=1");
+    dbg64_nl();
+    dbg64_line_end64();
     return fail;
 }

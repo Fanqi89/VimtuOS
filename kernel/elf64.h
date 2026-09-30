@@ -9,7 +9,7 @@
 //   * 校验：\x7fELF / class=2 / data=1(小端) / version=1 / machine=0x3E / type=ET_EXEC(2)|ET_DYN(3) /
 //     e_phentsize=56 / 程序头表整段落在文件内（e_phoff + e_phnum*56 <= 文件长度）。
 //   * 每个 PT_LOAD：
-//       - 目标 [p_vaddr, p_vaddr+p_memsz) 必须完整落在**用户窗口**（usermode64.h 的 4GiB..4GiB+1MiB）
+//       - 目标 [p_vaddr, p_vaddr+p_memsz) 必须完整落在**用户窗口**（usermode64.h 的 4GiB..4GiB+16MiB，★ A4-2b-2 起）
 //         的 ELF 装载区（窗口低 64KiB，即 4GiB..USER64_STACK_VA64）；
 //       - p_filesz 字节从**文件**拷到 p_vaddr，p_filesz..p_memsz 清零（.bss）；
 //       - 权限按 p_flags 给：PF_R→P|U、PF_W→+W、PF_X→不加 NX（不可执行段加 PTE_NX_64）。
@@ -54,11 +54,12 @@
 //   两条路都失败 = interp reject reason=vfs + 主程序拒绝（reason=interp）。
 // 解释器映射到哪（策略，为什么要这样）：
 //   解释器是 ET_DYN（p_vaddr 从 0 起、位置无关，靠 AT_BASE + R_X86_64_RELATIVE 自定位），
-//   内核把它**钉在用户窗口顶部**：
+//   内核把它**钉在解释器窗顶部**（★ A4-2b-2：这个上界是**固定的** 4GiB+1MiB，
+//   USER64_INTERP_TOP_VA64，不跟着用户窗口一起放大 —— 见 elf64.cpp 的说明）：
 //       interp_base = (4GiB + 1MiB) - align_up(解释器 span, 4KiB)
 //   于是解释器自己就能算出"库区" = [USER64_MMAP_VA64, AT_BASE)（它要 mmap 的 .so 放在
 //   自己下方，向上不越过 AT_BASE、向下不撞 brk/mmap 起点）。span 放不进
-//   [USER64_MMAP_VA64, 窗口顶] 就拒绝（reason=interp-window）。
+//   [USER64_MMAP_VA64, 解释器窗上界] 就拒绝（reason=interp-window）。
 // 打点（自动验收 tests/dynlink64_test.py grep，格式勿改）：
 //   [ELF64] interp path=<p> base=<hex> entry=<hex> span=<n>
 //   [ELF64] interp reject path=<p> reason=<vfs|bad|window|arg|size|interp>

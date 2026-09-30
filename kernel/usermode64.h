@@ -17,26 +17,43 @@
 #include "x86_64.h"      // pt_regs64 / SEL64_* / PR64_SIZE
 
 // ==================== 用户内存布局（唯一定义点）====================
-// 整个用户地址空间 = **一个 1MiB 的窗口**：4GiB .. 4GiB+1MiB。窗口内再分区：
-//   4GiB + 0x00000 .. USER64_STACK_VA64   ELF64 装载区（PT_LOAD 段按 p_vaddr 落在这里）
+// 整个用户地址空间 = **一个 16 MiB 的窗口**：4GiB .. 4GiB+16MiB。
+//   ★ A4-2b-2：从 1 MiB 放大到 16 MiB。为什么（一句话的内存账）：
+//     1 MiB 窗口 = 装载区 64 KiB + 栈 16 KiB + brk 64 KiB + mmap 448 KiB；tcc 的映像 276 KiB
+//     进 mmap 区、驱动再换一块栈之后只剩 ~148 KiB 堆，而 tcc 启动期（tcc_new -> tccpp_new/
+//     tccelf_new）实测就要 ~169 KB —— 于是 `tcc: error: memory full (malloc)`。
+//     放大后 tcc 的堆有 ~15 MiB（16 MiB - 0x90000 - 映像 - 驱动换的栈）。
+//   ★ 尺寸只影响**范围判定**：页表页/物理页只在 user64_map_page64()/user64_map_phys_page64()
+//     被调用时按 VA 惰性分配（见本文件 "页级原语" 段），没有任何按窗口尺寸预建的循环。
+//     自动验收对照 boot 打点：`[USER64] window bytes=<n> free_pages=<n>/<n> lazy=1`
+//     （1 MiB 与 16 MiB 两份内核在同一启动点上打印的 free_pages 必须完全一样）。
+// 窗口内分区（**所有已用地址一个字都不动**，只有 mmap 区上界从 1 MiB 抬到 16 MiB）：
+//   4GiB + 0x00000 .. USER64_STACK_VA64   ELF64 装载区（PT_LOAD 段按 p_vaddr 落在这里；64 KiB）
 //   USER64_STACK_VA64 .. +16KiB           用户栈（VAP64 演示与 ELF64 共用；ELF 初始栈也建在这）
 //   4GiB + 0x40000 .. +0x40000+64KiB      brk 区（Linux brk(12) 的固定可写区）
+//   4GiB + 0x60000                        shell 的终端邮箱（kernel/terminal64.cpp 的 SH64_MAIL_VA64）
 //   USER64_TEST_VA64 .. +4KiB             自检临时页（user64_selftest64 用完即解除映射）
-//   4GiB + 0x90000 .. 4GiB+1MiB           mmap 碰撞分配器（Linux mmap(9)）
+//   4GiB + 0x90000 .. 4GiB+16MiB          mmap 碰撞分配器（Linux mmap(9)；放大后 ~15.4 MiB）
 // ★ 分区互不重叠这一条由 syscall64_selftest64 的 bit0 断言把关（改常量先跑它）。
 static const uint64_t USER64_CODE_VA64      = 0x0000000100000000ULL;  // 4GiB：用户代码/入口
 static const uint64_t USER64_STACK_VA64     = 0x0000000100010000ULL;  // 4GiB+64KiB：用户栈底
 static const uint64_t USER64_TEST_VA64      = 0x0000000100080000ULL;  // 自检用测试页（窗口内）
-static const uint64_t USER64_WINDOW_BYTES64 = 1024ULL * 1024ULL;      // 用户窗口 = 4GiB..4GiB+1MiB
+static const uint64_t USER64_WINDOW_BYTES64 = 16ULL * 1024ULL * 1024ULL; // ★ A4-2b-2：4GiB..4GiB+16MiB（原 1 MiB）
 static const uint64_t USER64_STACK_BYTES64  = 16ULL * 1024ULL;        // 用户栈 16KiB = 4 页
 static const uint64_t USER64_BRK_VA64       = 0x0000000100040000ULL;  // 4GiB+256KiB：brk 固定区
 static const uint64_t USER64_BRK_BYTES64    = 64ULL * 1024ULL;        // 64KiB
 static const uint64_t USER64_MMAP_VA64      = 0x0000000100090000ULL;  // 4GiB+576KiB：mmap 起点
 static const uint64_t USER64_MMAP_MIN_BYTES64 = 64ULL * 1024ULL;      // mmap 至少要有这么多可用
+// ★ A4-2b-2：解释器（PT_INTERP）的固定装载窗上界 = 4GiB+1MiB（= 放大前的窗口顶）。
+//   为什么不让它跟着窗口一起变大：elf64.cpp 把解释器**钉在窗口顶部**（base = top - span），
+//   而 tests/dynlink64_test.py 把解释器基址的落点上界钉在 4GiB+1MiB（本批不动那条验收断言）。
+//   固定下来 = 解释器地址与放大前逐字节相同；窗口放大只抬高 mmap 区的上界。
+static const uint64_t USER64_INTERP_TOP_VA64 = 0x0000000100100000ULL; // 4GiB+1MiB（与放大前的窗口顶重合）
 
 // ★ A1：用户态**帧缓冲映射区**（5GiB 起，上限 40MiB —— 4K 后备缓冲 3840x2160x4 = 33MiB）。
-//   为什么单开一块、而不是放进上面那个 1MiB 用户窗口：
-//     1) 1MiB 装不下后备缓冲（1280x800 就要 4MiB）；
+//   为什么单开一块、而不是放进上面那个用户窗口：
+//     1) 1MiB 装不下后备缓冲（1280x800 就要 4MiB；A4-2b-2 放大到 16 MiB 也仍然不该把
+//        显存页混进"进程自己的地址空间"——见下一条）；
 //     2) 这一块落在 PML4[0] 的 **PDPT[5]**，而进程回收（kernel/proc64.cpp 的
 //        proc64_release_user_area64）只走 PDPT[4] —— 显存页是**内核的后备缓冲物理页**，
 //        绝不能被当成"进程自己的页"回收（那是双重释放，症状极难查）。

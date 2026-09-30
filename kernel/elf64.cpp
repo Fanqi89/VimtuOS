@@ -13,9 +13,11 @@
 //    本来是 67584B，够用。超过上限直接拒绝（reason=size），不截断。
 //
 // 3) 装载区上界 = USER64_STACK_VA64：
-//    用户窗口只有 1MiB，栈固定在 4GiB+64KiB。把"段必须落在 4GiB..4GiB+64KiB"作为硬约束，
-//    一次性排掉"段压到栈/brk/mmap 区"的所有重叠场景；越界一律
-//    `[ELF64] reject segment va=<hex> reason=outside-user-window|overlaps-user-region`。
+//    主程序装载区固定在 4GiB..4GiB+64KiB，栈固定在 4GiB+64KiB。把"段必须落在
+//    4GiB..4GiB+64KiB"作为硬约束，一次性排掉"段压到栈/brk/mmap 区"的所有重叠场景；
+//    越界一律 `[ELF64] reject segment va=<hex> reason=outside-user-window|overlaps-user-region`。
+//    ★ A4-2b-2 起用户窗口是 16 MiB（usermode64.h），但**主程序装载区仍是这 64 KiB**：
+//    窗口放大只抬高 mmap 区（4GiB+0x90000 往上）的上界，装载区/栈语义一个字没变。
 //
 // 4) ET_DYN（PIE）接受但**不做重定位**：
 //    只按 p_vaddr 原样装载（相当于把链接基址当绝对地址）。真正的 PIE 需要重定位表处理，
@@ -575,7 +577,11 @@ static int e64_load_interp64(const char* in_path, uint64_t* out_base, uint64_t* 
         return E64_INTERP_VFS;
     }
 
-    const uint64_t wtop  = USER64_CODE_VA64 + USER64_WINDOW_BYTES64;
+    // ★ A4-2b-2：解释器仍然钉在**4GiB+1MiB 之下**（= 放大前的窗口顶，USER64_INTERP_TOP_VA64）。
+    //   为什么不跟着窗口一起变大：base = top - span 会把解释器基址抬到 16 MiB 处，而
+    //   tests/dynlink64_test.py 把解释器基址的落点上界钉在 4GiB+1MiB（本批不改那条断言）。
+    //   固定下来后：解释器地址与放大前逐字节相同，窗口放大只抬高 mmap 区的上界。
+    const uint64_t wtop  = USER64_INTERP_TOP_VA64;           // 4GiB+1MiB（解释器窗上界）
     const uint64_t avail = wtop - USER64_MMAP_VA64;          // 解释器只能落在 mmap 起点之上
     // 第一遍：base = 0、区间 [0, avail) —— 只为量出 span（段的最大 p_vaddr+p_memsz）
     Elf64Image64 img0;

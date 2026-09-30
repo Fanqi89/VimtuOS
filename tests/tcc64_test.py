@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""tests/tcc64_test.py - ★ A4-2b：**Ring 3 里的 TinyCC** 端到端验收
+"""tests/tcc64_test.py - ★ A4-2b/A4-2b-2：**Ring 3 里的 TinyCC** 端到端验收
 
-要证明的事（对应任务书 A4-2b 的验收六条）：
+要证明的事（对应任务书 A4-2b 的验收六条 + A4-2b-2 的"闭环"三条）：
   ① tcc 能在 VimtuOS 的 ring3 里跑起来（`run /bin/tcc -v` / `-print-search-dirs`）：
        * 装载驱动打点 [TCCDRV] start/load/mmap/auxv/jmp（tcc 是 280 KB 的映像，走的是
          驱动自己 mmap + 搬段 + jmp 这条路，见 user/apps/tcc/tccdrv.c 的说明）；
-       * tcc **自己的输出**（`tcc version 0.9.27 (x86_64 Linux)`）出现在串口上。
-  ② `tcc -c X.c -o X.o` 产出 ELF64 目标文件（ET_REL/EM_X86_64）—— 本内核的窗口只有 1 MiB，
-     这一条的**内存账**很紧：tcc 的映像 297 KiB + 它的堆（实测 ~300 KB）会顶到窗口上限。
-     脚本**如实**处理：成功就断言字节/大小；失败就把 tcc 的原文（memory full / OOM）作为
-     缺口（GAP）逐字打印，绝不假装通过。
-  ③ tcc 产出的**可执行文件**能在本内核里跑起来（`run /hello` 逐字节输出正确）。
-     卷里的 /hello 由**同一份 tcc 源码**（宿主交叉构建的 build64/tcc_host.exe）在构建期产出；
-     如果 ring3 里的 tcc 自己也能链出可执行文件，脚本会额外跑它（`run /tmp/hello`）。
+       * tcc **自己的输出**（`tcc version 0.9.27 (x86_64 Linux)`）出现在控制台上；
+       * 启动期不再 OOM（A4-2b-2 把用户窗口从 1 MiB 放大到 16 MiB，见 kernel/usermode64.h）。
+  ② `tcc -c X.c -o X.o` 产出 ELF64 目标文件（ET_REL/EM_X86_64）—— **字节级**证据：
+     跑完 QEMU 之后本脚本直接从夹具盘的卷里把 /tmp/demo_tiny.o **读回来**解析 ELF 头
+     （7f 45 4c 46 02 01 01 00 / e_type=1 / e_machine=0x3e / e_shnum 与节名）。
+  ③ `tcc X.c -o X` 产出**可执行**静态 ELF64，再用 shell `run /tmp/hello2` 真跑起来：
+     输出逐字节正确、退出码 0；同样从卷里读回来断言 ET_EXEC/无 PT_INTERP/段在 4GiB 装载区。
   ④ libtcc1.a 与系统头确实来自**系统卷**：`-print-search-dirs` 打出的 install/include/
      libraries/libtcc1/crt 五条路径都必须是 /tcc 与 /tcc/lib（构建期由 tools/tcc_pack_win.py
      装进卷，脚本再用卷格式的二级间接路径逐字节回读）。
@@ -64,7 +63,12 @@ SECTOR = 512
 MMAP_VA = 0x100000000 + 0x90000          # USER64_MMAP_VA64：tcc 的链接/装载地址
 BASE64 = 0x100000000                     # USER64_CODE_VA64：主程序装载区起点
 STACK64 = 0x100000000 + 0x10000          # USER64_STACK_VA64（装载区上界）
-SPAN_MAX = 0x100000 - 0x90000            # 448 KiB
+# ★ A4-2b-2：用户窗口 1 MiB -> 16 MiB（kernel/usermode64.h 的 USER64_WINDOW_BYTES64）。
+#   mmap 区上界跟着窗口顶走；解释器（PT_INTERP）仍钉在 4GiB+1MiB 之下（USER64_INTERP_TOP_VA64）。
+WINDOW_BYTES = 16 * 1024 * 1024          # USER64_WINDOW_BYTES64
+WINDOW_TOP = 0x100000000 + WINDOW_BYTES
+INTERP_TOP = 0x100000000 + 0x100000      # USER64_INTERP_TOP_VA64（放大前 window 顶）
+TCC_SPAN_MAX = WINDOW_TOP - MMAP_VA      # tcc 映像能占的 mmap 区（~15.4 MiB）
 
 TYPED_NAMES = {
     " ": "spc", "/": "slash", ".": "dot", "-": "minus", ">": "shift-dot",
@@ -140,12 +144,76 @@ def elf_phdrs(path):
     return d, etype, machine, entry, phoff, phes, phn, ph
 
 
+# ==================== 卷回读：把 ring3 产物从夹具盘里**读回来**（字节级证据）====================
+# 为什么要这一步（A4-2b-2）：用户态产生的 .o / 可执行文件写在 VimtuFS2 卷里，而串口只剩
+# 可打印字符（内核控制台会滤掉非打印字节）—— 光靠 `cat` 拿不到 e_type/e_machine/e_shnum。
+# 夹具盘是本脚本自己造的（prepare_fixture，strict=True），卷格式已知：盘 = system.img +
+# MBR + 主分区卷（LBA 8009..TARGET_SECTORS）。直接按 tools/tcc_pack_win.py 的读取器解析。
+def load_packmod():
+    import importlib.util
+    path = os.path.join(ROOT, "tools", "tcc_pack_win.py")
+    spec = importlib.util.spec_from_file_location("tcc_pack_win", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def read_guest_file(img_path, mod, parts):
+    """从夹具盘的卷里读 /a/b/c（parts = ["tmp", "demo_tiny.o"]）；找不到返回 None。"""
+    import struct
+    d = open(img_path, "rb").read()
+    vol = d[PART_MAIN_LBA * SECTOR:TARGET_SECTORS * SECTOR]
+    if vol[0:8] != b"VIMTUFS2":
+        return None
+    total = struct.unpack_from("<I", vol, 20)[0]
+    inodes = struct.unpack_from("<I", vol, 40)[0]
+    cur = 0
+    rec = None
+    for part in parts:
+        hit = None
+        for i, nm, r in mod._entries(vol, cur, inodes):
+            if nm == part:
+                hit = (i, r)
+                break
+        if not hit:
+            return None
+        _, rec = hit
+        cur = hit[0]
+    return mod._read_file(vol, rec, total)
+
+
+def elf_sections(d):
+    """解析 ELF64 的节表：返回 (e_shnum, e_shstrndx, [节名])（读不到就返回 (0,0,[])）。"""
+    import struct
+    e_shoff = struct.unpack_from("<Q", d, 40)[0]
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", d, 58)
+    names = []
+    if e_shoff == 0 or e_shnum == 0 or e_shstrndx >= e_shnum:
+        return e_shnum, e_shstrndx, names
+    str_off = struct.unpack_from("<Q", d, e_shoff + e_shstrndx * e_shentsize + 24)[0]
+    str_size = struct.unpack_from("<Q", d, e_shoff + e_shstrndx * e_shentsize + 32)[0]
+    if str_off + str_size > len(d):
+        return e_shnum, e_shstrndx, names
+    for i in range(e_shnum):
+        no = struct.unpack_from("<I", d, e_shoff + i * e_shentsize)[0]
+        if no >= str_size:
+            continue
+        end = d.find(b"\x00", str_off + no)
+        if end < 0:
+            continue
+        names.append(d[str_off + no:end].decode("latin-1"))
+    return e_shnum, e_shstrndx, names
+
+
 def console_stream(text):
     """内核控制台（fd 1）上的字节流 = 裸串口剥掉内核打点行。
 
-    为什么驱动/tcc/子程序的输出也要剥：它们的每一行是**分几次 write(1)** 发出去的，而内核对
-    每次 write 都会在串口插一条 `[SYSCALL] insn nr=1 …` —— 于是驱动的一行会被切碎，裸串口上
-    用整串匹配会假失败（实测过：`[TCCDRV] mmap va=[SYSCALL]…` 后面才接着 `90000 expected=…`）。
+    为什么驱动/tcc/子程序的输出也要剥：内核给**每次 write(1)** 都在串口插一条
+    `[SYSCALL] insn nr=1 …`，于是任何"一行分几次 write"的输出都会被切碎（实测过：
+    `[TCCDRV] mmap va=[SYSCALL]…` 后面才接着 `90000 expected=…`）。
+    ★ A4-2b-2：装载驱动（user/apps/tcc/tccdrv.c）已改成**按行缓冲**（每行一次 write），
+    它的打点在裸串口上就是连续的；tcc 本体与子程序（musl stdio）仍然会分多次 write，
+    所以这一层过滤对它们照旧必要。
     剥掉内核行之后，剩下的就是连续的"控制台输出流"，可以整串比对。"""
     return shell_stream(text)
 
@@ -317,8 +385,8 @@ def main():
               etype == 2 and machine == 0x3E and all(x[2] >= MMAP_VA for x in loads) and
               loads and loads[0][1] == 0 and loads[0][2] == MMAP_VA,
               "entry=%#x segs=%d" % (entry, len(loads)))
-        check("tcc.bin 的映像 span 落在用户窗口的 448 KiB 里（%d B）" % span, 0 < span <= SPAN_MAX,
-              "span=%d B 窗口上限=%d B 余量=%d B" % (span, SPAN_MAX, SPAN_MAX - span))
+        check("tcc.bin 的映像 span 落在用户窗口 mmap 区里（%d B）" % span, 0 < span <= TCC_SPAN_MAX,
+              "span=%d B mmap 区上限=%d B 余量=%d B" % (span, TCC_SPAN_MAX, TCC_SPAN_MAX - span))
         check("tcc.bin 无 PT_INTERP / PT_DYNAMIC（驱动不做重定位）",
               all(x[0] not in (2, 3) for x in ph))
     if os.path.exists(DRIVER):
@@ -396,8 +464,8 @@ def main():
 
     def wait_console(needle, timeout=30):
         """等**控制台输出流**（裸串口剥掉内核打点行）里出现 needle。
-        驱动 / tcc / 子程序 / shell 的 "run: …" 汇总行都走这条（它们的输出是分几次 write(1) 发的，
-        裸串口上会被内核的 [SYSCALL] 行切碎 —— 见 console_stream 的说明）。"""
+        驱动 / tcc / 子程序 / shell 的 "run: …" 汇总行都走这条（tcc 与子程序的输出是分几次
+        write(1) 发的，裸串口上会被内核的 [SYSCALL] 行切碎 —— 见 console_stream 的说明）。
         deadline = time.time() + timeout
         while time.time() < deadline:
             if needle in console_stream(slog()):
@@ -411,7 +479,18 @@ def main():
     check("内核装载并启动 /bin/shell.bin", wait_raw("[SH64] launch path=/bin/shell.bin", 40))
     check("shell banner 出现", wait_raw("VimtuOS ring3 shell (sh64)", 30))
 
-    # ---------------- ① tcc 本体在 ring3 里跑起来（驱动 + 装载 + jmp）----------------
+    def wait_console_since(needle, start, timeout=30):
+        """只在 console_stream 的**第 start 字节之后**等 needle（避免和更早的输出撞车）。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if needle in console_stream(slog())[start:]:
+                return True
+            time.sleep(0.3)
+        return False
+
+    # ---------------- ① tcc 本体在 ring3 里跑起来（驱动 + 装载 + jmp + 版本行）----------------
+    check("A4-2b-2 的窗口放大已在 boot 打点里（[USER64] window bytes=16777216 … lazy=1）",
+          "[USER64] window bytes=16777216" in slog() and "lazy=1" in slog())
     type_line(mon, "run /bin/tcc -v")
     drv_ok = wait_console("[TCCDRV] jmp entry=", 60)
     check("驱动把 /lib/tcc.bin 读出来、按固定地址 mmap、改 auxv、jmp 进 tcc（[TCCDRV] 四条打点）",
@@ -419,34 +498,23 @@ def main():
     check("mmap 返回地址 = 4GiB+0x90000（tcc 的链接地址，驱动自己断言过）",
           "expected=0x100090000" in console_stream(slog())
           and "[TCCDRV] FAIL reason=mmap-va-mismatch" not in console_stream(slog()))
-    check("驱动给 tcc 换了一块更大的栈（内核给的 16 KiB 不够，见 tccdrv.c 的说明）",
-          "stack mmap va=" in console_stream(slog()))
+    check("驱动给 tcc 换了一块更大的栈（A4-2b-2 起 256 KiB；内核给的 16 KiB 不够，见 tccdrv.c）",
+          "stack mmap va=" in console_stream(slog()) and "size=262144" in console_stream(slog()))
     tcc_done = wait_console("run: /bin/tcc pid=", 90)
-    tcc_oom = "tcc: error: memory full (malloc)" in console_stream(slog())
-    check("tcc 在 ring3 里**真的执行到自己的代码**（进程正常结束：打印版本、或打出它自己的报错）",
-          tcc_done and (tcc_oom or "tcc version 0.9.27" in console_stream(slog())),
-          "OOM=%s" % tcc_oom)
-    if tcc_oom:
-        gap("tcc -v / -print-search-dirs 在**启动期 OOM**：拿不到版本行与搜索路径（运行期证据）",
-            "tcc 原文：tcc: error: memory full (malloc)。内存账（1 MiB 用户窗口 = 硬上限）："
-            "tcc 映像 276 KiB + 驱动换的 24 KiB 栈之后，tcc 的堆只剩 ~148 KiB，"
-            "而它启动期（tcc_new -> tccpp_new/tccelf_new + 三个小块分配器）实测要 ~169 KB"
-            "（宿主 -DMEM_DEBUG=1 -bench 量的；上游原版是 1.87 MB，本批已降 11 倍）")
-    elif not wait_console("tcc version 0.9.27 (x86_64 Linux)", 20):
-        check("tcc 在 ring3 里打印出版本（tcc version 0.9.27 (x86_64 Linux)）", False,
-              "既没版本行也没 OOM 行")
+    check("tcc 进程正常结束（shell 汇总行 run: /bin/tcc pid=… exited code=0）",
+          tcc_done and re.search(r"run: /bin/tcc pid=\d+ exited code=0", console_stream(slog())) is not None)
+    check("tcc 在 ring3 里打印出版本（tcc version 0.9.27 (x86_64 Linux)）",
+          wait_console("tcc version 0.9.27 (x86_64 Linux)", 20))
+    if "tcc: error: memory full (malloc)" in console_stream(slog()):
+        gap("tcc 启动期仍然 OOM（窗口已放大到 16 MiB，不该再出现）",
+            "tcc 原文：tcc: error: memory full (malloc)")
 
     # ---------------- ④ 路径证据：头/libtcc1.a/crt 都指向系统卷 /tcc ----------------
     type_line(mon, "run /bin/tcc -print-search-dirs")
-    dirs_ok = wait_console("install: /tcc", 40)
-    if dirs_ok:
-        for want in ("include:", "  /tcc/include", "libraries:", "  /tcc/lib",
-                     "libtcc1:", "  /tcc/libtcc1.a", "crt:", "  /tcc/lib"):
-            check("tcc 的搜索路径指向系统卷：%r" % want, wait_console(want, 20), "")
-    else:
-        gap("tcc 的搜索路径证据（-print-search-dirs）拿不到（同一个启动期 OOM）",
-            "卷里 /tcc/{libtcc1.a,include/**,lib/**} 的**静态**证据见本脚本前半段的卷回读断言"
-            "（223 个文件逐字节）+ build64/tcc_stage + third_party/tcc/tcc-0.9.27/config.h 的四个 CONFIG_* 路径")
+    check("tcc -print-search-dirs 打出搜索路径（install: /tcc）", wait_console("install: /tcc", 40))
+    for want in ("include:", "  /tcc/include", "libraries:", "  /tcc/lib",
+                 "libtcc1:", "  /tcc/libtcc1.a", "crt:", "  /tcc/lib"):
+        check("tcc 的搜索路径指向系统卷：%r" % want, wait_console(want, 20), "")
 
     # ---------------- ③ 卷里那个 tcc 产物能在本内核里跑 ----------------
     type_line(mon, "run /hello")
@@ -454,12 +522,12 @@ def main():
           wait_console("hello from TinyCC inside VimtuOS ring3", 40),
           "（/hello 由同一份 tcc 源码在构建期产出，见 build64/tcc_host.exe）")
     check("hello 退出码 0（shell 汇总行，已经回到终端了）",
-          wait_console("run: /hello pid=", 20))
+          wait_console("run: /hello pid=", 20)
+          and re.search(r"run: /hello pid=\d+ exited code=0", console_stream(slog())) is not None)
 
-    # ---------------- ② -c：ring3 里编一个目标文件（内存紧，失败如实记缺口） ----------------
-    # ---------------- ② -c：ring3 里编一个目标文件 ----------------
+    # ---------------- ② -c：ring3 里编一个目标文件（窗口放大后应当闭环） ----------------
     # 判定方式（结实）：只看**这条命令之后**新出现的 shell 汇总行 "run: /bin/tcc pid=N exited code=C"，
-    #   把 code 与 tcc 自己的报错原文一起拿出来 —— 成功就做字节级断言，失败（内存上限）就记缺口。
+    #   把 code 与 tcc 自己的报错原文一起拿出来 —— 成功就做字节级断言，失败就记缺口（如实）。
     n_before = len(console_stream(slog()))
     type_line(mon, "run /bin/tcc -c /tcc/demo/demo_tiny.c -o /tmp/demo_tiny.o")
     cc_m = None
@@ -481,7 +549,7 @@ def main():
         em = None
         for m2 in re.finditer(r"tcc: error: ([^\r\n]*)", seg):
             em = m2
-        gap("ring3 里的 tcc -c 没能完成（运行期的内存上限，tcc 进程退出码 %s）" % cc_m.group(2),
+        gap("ring3 里的 tcc -c 没能完成（tcc 进程退出码 %s）" % cc_m.group(2),
             "tcc 原文：%s" % (em.group(0) if em else "（没有 tcc 的 error 行，见串口日志）"))
     if tcc_o_ok:
         type_line(mon, "stat /tmp/demo_tiny.o")
@@ -499,11 +567,53 @@ def main():
         type_line(mon, "cat /tmp/demo_tiny.o")
         time.sleep(3.0)
         after = console_stream(slog())[n0:]
-        check("cat 出来的 .o 头字节里出现 ELF 魔数（可打印部分 'ELF'；控制台过滤非打印字节）",
-              "ELF" in after and "cat: cannot open" not in after)
+        check("cat 出来的 .o 里有 ELF 魔数与节名（可打印部分；字节级头/机器/节数在 QEMU 停后从卷里读回）",
+              "ELF" in after and ".text" in after and "cat: cannot open" not in after)
     else:
-        gap("-c 的字节级断言（ELF64 relocatable 头）",
-            "依赖上一条；宿主侧同一份 tcc 的产物已在构建期校验（build64/tcc_demo_hello 是链接产物）")
+        gap("-c 的字节级断言（ELF64 relocatable 头）", "依赖上一条")
+
+    # ---------------- ③b 链接：ring3 里的 tcc 自己链出静态 ELF64，再用 run 跑起来 ----------------
+    n_before = len(console_stream(slog()))
+    type_line(mon, "run /bin/tcc /tcc/demo/hello.c -o /tmp/hello2")
+    link_m = None
+    for _ in range(300):
+        seg = console_stream(slog())[n_before:]
+        hits = list(re.finditer(r"run: /bin/tcc pid=(\d+) exited code=(\d+)", seg))
+        if hits:
+            link_m = hits[-1]
+            break
+        time.sleep(0.5)
+    link_ok = False
+    if link_m is None:
+        gap("ring3 里的 tcc 链接（hello.c -> /tmp/hello2）没有返回（超时）", "见串口日志 time-out")
+    elif link_m.group(2) == "0":
+        link_ok = True
+        check("ring3 里的 `run /bin/tcc /tcc/demo/hello.c -o /tmp/hello2` 返回 0", True)
+    else:
+        seg = console_stream(slog())[n_before:]
+        em = None
+        for m2 in re.finditer(r"tcc: error: ([^\r\n]*)", seg):
+            em = m2
+        gap("ring3 里的 tcc 链接没能完成（tcc 进程退出码 %s）" % link_m.group(2),
+            "tcc 原文：%s" % (em.group(0) if em else "（没有 tcc 的 error 行，见串口日志）"))
+    if link_ok:
+        n0 = len(console_stream(slog()))
+        type_line(mon, "run /tmp/hello2")
+        out_ok = wait_console_since("hello from TinyCC inside VimtuOS ring3", n0, 40)
+        check("ring3 里 tcc 生成的 /tmp/hello2 跑起来、逐字节输出正确", out_ok)
+        h2m = None
+        for _ in range(60):
+            seg = console_stream(slog())[n0:]
+            hits = list(re.finditer(r"run: /tmp/hello2 pid=(\d+) exited code=(\d+)", seg))
+            if hits:
+                h2m = hits[-1]
+                break
+            time.sleep(0.5)
+        check("tcc 生成的程序退出码 0（shell 汇总行 run: /tmp/hello2 pid=… exited code=0）",
+              h2m is not None and h2m.group(2) == "0",
+              (h2m.group(0) if h2m else "（没有汇总行）"))
+    else:
+        gap("tcc 生成的程序跑起来的逐字节输出/退出码", "依赖上一条（链接未完成）")
     # ---------------- ⑤ run … > 文件 闭环（A4-2b 顺手补的 shell 缺口） ----------------
     n_before = len(slog())
     type_line(mon, "run /musl_hello.elf > /tmp/tcc_o.txt")
@@ -541,6 +651,61 @@ def main():
         proc.wait(timeout=10)
     except Exception:
         proc.kill()
+
+    # ---------------- ②b/③c：QEMU 停了 —— 从夹具盘的卷里把 ring3 产物**读回来**（字节级） ----------------
+    # 为什么放到最后：写盘是经 QEMU 完成的，进程退出后读主机上的镜像文件最稳；而且这一步给出
+    # 串口拿不到的证据（ELF 头/e_type/e_machine/节表 —— 控制台会滤掉非打印字节）。
+    if strict and os.path.exists(img):
+        try:
+            mod = load_packmod()
+            obj = read_guest_file(img, mod, ["tmp", "demo_tiny.o"])
+            if obj is None:
+                check("从夹具盘卷里读回 /tmp/demo_tiny.o（字节级证据的前提）", False, "卷里没有这个文件")
+            else:
+                import struct
+                etype, machine = struct.unpack_from("<HH", obj, 16)
+                shnum, shstrndx, names = elf_sections(obj)
+                head8 = " ".join("%02x" % b for b in obj[:8])
+                check("ring3 的 tcc -c 产物头 8 字节 = %s（ELF64 小端应为 7f 45 4c 46 02 01 01 00）" % head8,
+                      obj[:4] == b"\x7fELF" and obj[4] == 2 and obj[5] == 1, "%d B" % len(obj))
+                check("ring3 的 .o 是 ELF64 可重定位对象（e_type=%d ET_REL / e_machine=%#x EM_X86_64）"
+                      % (etype, machine), etype == 1 and machine == 0x3E)
+                check("ring3 的 .o 节表非空（e_shnum=%d；节名：%s）" % (shnum, " ".join(names)),
+                      shnum >= 4 and ".text" in names and ".symtab" in names and ".strtab" in names)
+                check("ring3 的 .o 里带源码里的符号（tcc_demo_add / tcc_demo_mul）",
+                      b"tcc_demo_add" in obj and b"tcc_demo_mul" in obj)
+            exe = read_guest_file(img, mod, ["tmp", "hello2"])
+            if exe is None:
+                gap("从夹具盘卷里读回 /tmp/hello2（链接产物）", "卷里没有这个文件（链接那一步没成功时才会出现）")
+            else:
+                import struct
+                etype2, machine2 = struct.unpack_from("<HH", exe, 16)
+                entry2 = struct.unpack_from("<Q", exe, 24)[0]
+                phoff2 = struct.unpack_from("<Q", exe, 32)[0]
+                phes2, phn2 = struct.unpack_from("<H", exe, 54)[0], struct.unpack_from("<H", exe, 56)[0]
+                segs2, has_interp, has_dyn = [], False, False
+                for i in range(phn2):
+                    o2 = phoff2 + i * phes2
+                    t2 = struct.unpack_from("<I", exe, o2)[0]
+                    va2 = struct.unpack_from("<Q", exe, o2 + 16)[0]
+                    msz2 = struct.unpack_from("<Q", exe, o2 + 40)[0]
+                    if t2 == 3:
+                        has_interp = True
+                    elif t2 == 2:
+                        has_dyn = True
+                    elif t2 == 1:
+                        segs2.append((va2, msz2))
+                check("ring3 链接产物 /tmp/hello2 是静态 ELF64 可执行（ET_EXEC=2 / EM_X86_64 / 无 PT_INTERP/PT_DYNAMIC）",
+                      etype2 == 2 and machine2 == 0x3E and not has_interp and not has_dyn,
+                      "%d B phnum=%d" % (len(exe), phn2))
+                check("ring3 链接产物的 PT_LOAD 全落在内核装载区（4GiB..4GiB+64KiB）且入口在其中",
+                      bool(segs2) and all(BASE64 <= v and v + m <= STACK64 for v, m in segs2)
+                      and any(v <= entry2 < v + m for v, m in segs2),
+                      "entry=%#x segs=%s" % (entry2, [(hex(v), m) for v, m in segs2]))
+        except Exception as e:                       # 解析失败必须如实报，不能吞
+            gap("从夹具盘卷里读回 ring3 产物（解析异常）", repr(e))
+    else:
+        gap("ring3 产物的字节级证据（卷回读）", "只对脚本自造的夹具盘（strict）做；--img 模式跳过")
     if not args.keep:
         shutil.rmtree(tmp, ignore_errors=True)
 
