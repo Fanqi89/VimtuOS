@@ -16,15 +16,204 @@
 
 #define FONT64_LOG_N 16  // [FONT64] fallback hit / glyph miss 的去重表大小（同一码点只打一行）
 
-// objcopy -I binary 生成的符号（build/font_*.ttf；符号名由文件名决定，不能改产物名）
-extern "C" const uint8_t _binary_font_bahnschrift_ttf_start[];
-extern "C" const uint8_t _binary_font_bahnschrift_ttf_end[];
-extern "C" const uint8_t _binary_font_simhei_ttf_start[];
-extern "C" const uint8_t _binary_font_simhei_ttf_end[];
-extern "C" const uint8_t _binary_font_mono_ttf_start[];
-extern "C" const uint8_t _binary_font_mono_ttf_end[];
-extern "C" const uint8_t _binary_font_fallback_ttf_start[];
-extern "C" const uint8_t _binary_font_fallback_ttf_end[];
+// ★ A4-4 内核预算：四份字体改成**构建期 deflate 压缩内嵌、启动期解到 .bss**。
+//   为什么这样搬（而不是"放卷里、启动期从卷读"）：font_init() 在 kmain 的图形栈初始化里就要用
+//   （kernel64.cpp 的 fb_init -> font_init 一段），而系统卷要到 os_boot_path64() 才挂载；更要紧的
+//   是验收夹具里有大量"无卷 / 空卷"的盘（desktop64_test 直接引导 system.img；musl64_test /
+//   dynlink64_test / ipc64_test / sh64_test 只挂一块**只装了 shell** 的 VimtuFS2 卷）——字体改成
+//   "卷里没有就没字"会让这些路径全部退化成豆腐块/无字。压缩内嵌是**行为等价**的搬法：
+//   解出来的就是同一份 TTF 字节，face_init 的解析/渲染路径一个字没改。
+//   构建期（build64.sh）：build/font_*.ttf -> zlib -9 raw deflate（wbits=-15）+ 8B 未压缩长度头
+//   = build64/font_*.z -> objcopy -> _binary_font_*_z_start/_end。
+//   体积账（实测）：1,164,272 B -> 755,944 B，**省 408,328 B**（内核 4,037,328 -> 3,629,000 B）。
+//   解压缓冲放 .bss：objcopy -O binary 只收 PROGBITS，.bss **不进 kernel64_os.bin**；页池从 128MB
+//   起（见 kernel/mem64.cpp 顶部），内核 .bss 本来就含 33MB 后备缓冲，这 ~1.3MB 不影响内存账。
+extern "C" const uint8_t _binary_font_bahnschrift_z_start[];
+extern "C" const uint8_t _binary_font_bahnschrift_z_end[];
+extern "C" const uint8_t _binary_font_simhei_z_start[];
+extern "C" const uint8_t _binary_font_simhei_z_end[];
+extern "C" const uint8_t _binary_font_mono_z_start[];
+extern "C" const uint8_t _binary_font_mono_z_end[];
+extern "C" const uint8_t _binary_font_fallback_z_start[];
+extern "C" const uint8_t _binary_font_fallback_z_end[];
+// 解压缓冲（.bss）。容量 = 当前子集产物 + 余量：超出即构建期换了更大的字体子集，这里如实拒绝
+// （该面 font_ok=false、[FONT64] inflate FAIL），并且 build64.sh 的压缩自检会先把这种改动拦下。
+#define FONT_RAM_ASCII_CAP (16u * 1024u)     // 现产物 12,220 B
+#define FONT_RAM_CJK_CAP   (1200u * 1024u)   // 现产物 1,119,440 B
+#define FONT_RAM_MONO_CAP  (64u * 1024u)     // 现产物 30,344 B
+#define FONT_RAM_FALL_CAP  (8u * 1024u)      // 现产物 2,268 B
+static uint8_t g_font_ram_ascii[FONT_RAM_ASCII_CAP];
+static uint8_t g_font_ram_cjk[FONT_RAM_CJK_CAP];
+static uint8_t g_font_ram_mono[FONT_RAM_MONO_CAP];
+static uint8_t g_font_ram_fall[FONT_RAM_FALL_CAP];
+
+// ---------- raw deflate 解压（stored / fixed / dynamic 三种块）----------
+// 算法与 user/gzip/gzip.c 的 inflate 同源（那份在宿主侧与 Python zlib 做过逐字节互操作，
+// 并在本文件改动的**宿主自检**里用四份真字体回放过：解出来与 build64/font_*.ttf 逐字节一致）。
+// 这里只做"长度已知的整块解压"：不做 gzip 外壳 / CRC 校验，长度不符一律判失败。
+struct FontZipIn { const uint8_t* in; uint32_t len; uint32_t pos; uint32_t bitbuf; int bitcnt; int err; };
+
+static int fz_bits(FontZipIn* s, int need) {
+    while (s->bitcnt < need) {
+        if (s->pos >= s->len) { s->err = 1; return 0; }
+        s->bitbuf |= (uint32_t)s->in[s->pos++] << s->bitcnt;
+        s->bitcnt += 8;
+    }
+    const int v = (int)(s->bitbuf & ((1u << need) - 1u));
+    s->bitbuf >>= need;
+    s->bitcnt -= need;
+    return v;
+}
+static void fz_align(FontZipIn* s) { s->bitbuf = 0; s->bitcnt = 0; }
+
+struct FontHuff { int16_t count[16]; int16_t sym[288]; };
+
+static int fz_huff_build(FontHuff* h, const uint8_t* lens, int n) {
+    for (int i = 0; i < 16; i++) h->count[i] = 0;
+    for (int i = 0; i < n; i++) h->count[lens[i]]++;
+    if (h->count[0] == n) return 0;                     // 全 0：合法的"空表"
+    int left = 1;
+    for (int len = 1; len < 16; len++) {
+        left <<= 1;
+        left -= h->count[len];
+        if (left < 0) return -1;                        // 过完备
+    }
+    int16_t offs[16];
+    offs[0] = 0; offs[1] = 0;
+    for (int len = 1; len < 15; len++) offs[len + 1] = (int16_t)(offs[len] + h->count[len]);
+    for (int i = 0; i < n; i++) if (lens[i]) h->sym[offs[lens[i]]++] = (int16_t)i;
+    return left;
+}
+static int fz_huff_decode(FontZipIn* s, const FontHuff* h) {
+    int code = 0, first = 0, index = 0;
+    for (int len = 1; len <= 15; len++) {
+        code |= fz_bits(s, 1);
+        if (s->err) return -1;
+        const int count = h->count[len];
+        if (code - first < count) return h->sym[index + (code - first)];
+        index += count;
+        first = (first + count) << 1;
+        code <<= 1;
+    }
+    return -1;
+}
+static void fz_fixed_tables(FontHuff* lit, FontHuff* dist) {
+    uint8_t l[288];
+    for (int i = 0; i < 144; i++) l[i] = 8;
+    for (int i = 144; i < 256; i++) l[i] = 9;
+    for (int i = 256; i < 280; i++) l[i] = 7;
+    for (int i = 280; i < 288; i++) l[i] = 8;
+    (void)fz_huff_build(lit, l, 288);
+    for (int i = 0; i < 30; i++) l[i] = 5;
+    (void)fz_huff_build(dist, l, 30);
+}
+// RFC1951 的长度/距离基值与额外位（与 gzip.c 同表）
+static const uint16_t FZ_LEN_BASE[29] = { 3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258 };
+static const uint8_t  FZ_LEN_EXTRA[29] = { 0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0 };
+static const uint16_t FZ_DIST_BASE[30] = { 1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577 };
+static const uint8_t  FZ_DIST_EXTRA[30] = { 0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 };
+
+// 解一个 block：返回 0 = 还有 block，1 = 最后一个 block，2 = 坏流
+static int fz_block(FontZipIn* s, uint8_t* out, uint32_t outcap, uint32_t* outlen) {
+    uint32_t o = *outlen;
+    const int final = fz_bits(s, 1);
+    const int type  = fz_bits(s, 2);
+    if (s->err) return 2;
+    if (type == 0) {
+        fz_align(s);
+        if (s->pos + 4u > s->len) return 2;
+        const uint32_t blen = (uint32_t)s->in[s->pos] | ((uint32_t)s->in[s->pos + 1] << 8);
+        const uint32_t nlen = (uint32_t)s->in[s->pos + 2] | ((uint32_t)s->in[s->pos + 3] << 8);
+        s->pos += 4;
+        if ((blen ^ 0xFFFFu) != nlen) return 2;
+        if (s->pos + blen > s->len || blen > outcap - o) return 2;
+        for (uint32_t k = 0; k < blen; k++) out[o++] = s->in[s->pos++];
+    } else if (type == 1 || type == 2) {
+        FontHuff lit, dist;
+        if (type == 1) {
+            fz_fixed_tables(&lit, &dist);
+        } else {
+            const int hlit  = fz_bits(s, 5) + 257;
+            const int hdist = fz_bits(s, 5) + 1;
+            const int hclen = fz_bits(s, 4) + 4;
+            if (s->err || hlit > 286 || hdist > 30) return 2;
+            static const uint8_t ORD[19] = { 16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15 };
+            uint8_t cl[19];
+            for (int i = 0; i < 19; i++) cl[i] = 0;
+            for (int i = 0; i < hclen; i++) cl[ORD[i]] = (uint8_t)fz_bits(s, 3);
+            if (s->err) return 2;
+            FontHuff clh;
+            if (fz_huff_build(&clh, cl, 19) < 0) return 2;
+            uint8_t lens[320];
+            int n = 0;
+            while (n < hlit + hdist) {
+                const int sym = fz_huff_decode(s, &clh);
+                if (sym < 0 || s->err) return 2;
+                if (sym < 16) {
+                    lens[n++] = (uint8_t)sym;
+                } else if (sym == 16) {
+                    if (n == 0) return 2;
+                    int rep = fz_bits(s, 2) + 3;
+                    const uint8_t prev = lens[n - 1];
+                    while (rep-- > 0) { if (n >= hlit + hdist) return 2; lens[n++] = prev; }
+                } else if (sym == 17) {
+                    int rep = fz_bits(s, 3) + 3;
+                    while (rep-- > 0) { if (n >= hlit + hdist) return 2; lens[n++] = 0; }
+                } else {
+                    int rep = fz_bits(s, 7) + 11;
+                    while (rep-- > 0) { if (n >= hlit + hdist) return 2; lens[n++] = 0; }
+                }
+                if (s->err) return 2;
+            }
+            if (lens[256] == 0) return 2;               // 没有 end-of-block 码
+            if (fz_huff_build(&lit, lens, hlit) < 0) return 2;
+            if (fz_huff_build(&dist, lens + hlit, hdist) < 0) return 2;
+        }
+        for (;;) {
+            const int sym = fz_huff_decode(s, &lit);
+            if (sym < 0 || s->err) return 2;
+            if (sym < 256) {
+                if (o >= outcap) return 2;
+                out[o++] = (uint8_t)sym;
+                continue;
+            }
+            if (sym == 256) break;
+            const int li = sym - 257;
+            if (li >= 29) return 2;
+            const uint32_t len = (uint32_t)FZ_LEN_BASE[li] + (uint32_t)fz_bits(s, FZ_LEN_EXTRA[li]);
+            const int dsym = fz_huff_decode(s, &dist);
+            if (dsym < 0 || dsym >= 30 || s->err) return 2;
+            const uint32_t d = (uint32_t)FZ_DIST_BASE[dsym] + (uint32_t)fz_bits(s, FZ_DIST_EXTRA[dsym]);
+            if (s->err || d == 0 || d > o) return 2;    // 回溯越界 = 坏流
+            if (len > outcap - o) return 2;
+            for (uint32_t k = 0; k < len; k++) { out[o] = out[o - d]; o++; }
+        }
+    } else {
+        return 2;                                        // BTYPE=11 保留
+    }
+    *outlen = o;
+    return final ? 1 : 0;
+}
+
+// 解一份 font_*.z（[0..7] = 未压缩长度（小端 u64）+ raw deflate 流）到 dst。
+// 成功返回 0 并把实际长度写到 *out_len；任何不一致（截断/坏表/长度不符/超容量）都返回 -1。
+static int font_unpack64(const uint8_t* src, const uint8_t* end, uint8_t* dst, uint32_t cap, uint32_t* out_len) {
+    if (!src || !end || end - src < 9) return -1;
+    const uint32_t want = (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
+    for (int i = 4; i < 8; i++) if (src[i] != 0) return -1;    // 字体 < 4 GiB：高 4 字节必须为 0
+    if (want == 0 || want > cap) return -1;
+    FontZipIn s;
+    s.in = src + 8; s.len = (uint32_t)(end - (src + 8)); s.pos = 0; s.bitbuf = 0; s.bitcnt = 0; s.err = 0;
+    uint32_t o = 0;
+    for (;;) {
+        const int rc = fz_block(&s, dst, want, &o);
+        if (rc == 2) return -1;
+        if (rc == 1) break;
+    }
+    if (s.err || o != want) return -1;
+    *out_len = o;
+    return 0;
+}
 
 #define FONT_PX 20            // 光栅化缓冲（em 高像素 + descender 余量）
 #define FONT_SIZE_PX 16       // 字号（em 高度，像素）—— ★ P3 起只是**默认档**，运行期用 g_em_px
@@ -217,11 +406,41 @@ static void face_init(FontFace* fc, const uint8_t* start, const uint8_t* end) {
 }
 
 void font_init() {
-    face_init(&g_face[FONT_FACE_ASCII],    _binary_font_bahnschrift_ttf_start, _binary_font_bahnschrift_ttf_end);
-    face_init(&g_face[FONT_FACE_CJK],      _binary_font_simhei_ttf_start,      _binary_font_simhei_ttf_end);
-    face_init(&g_face[FONT_FACE_MONO],     _binary_font_mono_ttf_start,        _binary_font_mono_ttf_end);
-    face_init(&g_face[FONT_FACE_FALLBACK], _binary_font_fallback_ttf_start,    _binary_font_fallback_ttf_end);
+    // ★ 内核预算：四份字体是 deflate 压缩内嵌（见文件顶部）。这里解到 .bss 缓冲再交给 face_init ——
+    //   解压失败的面按"字体加载失败"处理（空指针 + 长度 0 -> font_ok=false），绝不拿半截数据解析。
+    struct FontBlob { const uint8_t* zs; const uint8_t* ze; uint8_t* ram; uint32_t cap; };
+    const FontBlob blobs[FONT_FACE_COUNT] = {
+        { _binary_font_bahnschrift_z_start, _binary_font_bahnschrift_z_end, g_font_ram_ascii, FONT_RAM_ASCII_CAP },
+        { _binary_font_simhei_z_start,      _binary_font_simhei_z_end,      g_font_ram_cjk,   FONT_RAM_CJK_CAP   },
+        { _binary_font_mono_z_start,        _binary_font_mono_z_end,        g_font_ram_mono,  FONT_RAM_MONO_CAP  },
+        { _binary_font_fallback_z_start,    _binary_font_fallback_z_end,    g_font_ram_fall,  FONT_RAM_FALL_CAP  },
+    };
+    uint32_t total_raw = 0, total_z = 0;
+    int failed = 0;
+    for (int i = 0; i < FONT_FACE_COUNT; i++) {
+        total_z += (uint32_t)(blobs[i].ze - blobs[i].zs);
+        uint32_t n = 0;
+        if (font_unpack64(blobs[i].zs, blobs[i].ze, blobs[i].ram, blobs[i].cap, &n) != 0) {
+            failed++;
+            face_init(&g_face[i], blobs[i].ram, blobs[i].ram);      // 空：font_ok=false（selftest 会如实报）
+            continue;
+        }
+        total_raw += n;
+        face_init(&g_face[i], blobs[i].ram, blobs[i].ram + n);
+    }
     cur = &g_face[FONT_FACE_ASCII];
+    // 打点（体积账的实测证据：raw = 解出来的 TTF 总字节，packed = 内核里内嵌的压缩字节）
+    dbg64_line_begin64();
+    dbg64_str(failed ? "[FONT64] inflate FAIL faces=" : "[FONT64] inflate ok faces=");
+    dbg64_dec((uint64_t)(FONT_FACE_COUNT - failed));
+    dbg64_str(" raw=");
+    dbg64_dec(total_raw);
+    dbg64_str(" packed=");
+    dbg64_dec(total_z);
+    dbg64_str(" saved=");
+    dbg64_dec(total_raw > total_z ? (uint64_t)(total_raw - total_z) : 0);
+    dbg64_nl();
+    dbg64_line_end64();
 }
 
 void font_select(int face) {

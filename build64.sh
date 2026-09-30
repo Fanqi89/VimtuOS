@@ -211,10 +211,37 @@ for src in $SRCS_CORE kernel/ata64.cpp kernel/part64.cpp kernel/setup64.cpp kern
 done
 
 echo "==> 资源对象（objcopy -> elf64，两份内核共用同一批）"
-(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_bahnschrift.ttf font_bahnschrift.o)
-(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_simhei.ttf font_simhei.o)
-(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_mono.ttf font_mono.o)
-(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_fallback.ttf font_fallback.o)
+# ★ 内核预算（A4-4）：四份**字体**改成"构建期 zlib -9 压缩 + 启动期内核解到 .bss"。
+#   为什么不是"放卷里、启动期从卷读"：font_init() 在 kmain 的图形栈初始化里就要用，而系统卷要到
+#   os_boot_path64() 才挂载；且验收夹具里有大量"无卷/空卷"盘（desktop64_test 直接引导 system.img；
+#   musl64_test/dynlink64_test/ipc64_test/sh64_test 的卷里只有 shell）——卷里没有就没字会让这些
+#   路径全变成豆腐块。压缩内嵌是行为等价的搬法（解出来就是同一份 TTF 字节，见 kernel/font.cpp）。
+#   格式：font_<name>.z = 8B 未压缩长度（小端 u64）+ raw deflate（wbits=-15，无 zlib 头）。
+#   实测：1,164,272 B -> 755,944 B（省 408,328 B；内核 4,037,328 -> 3,629,000 B）。
+#   原始 .ttf 仍留在 build64/（fonts64_test 看 build/ 的产物；这里是同批拷贝），只作留档/许可核对。
+"$PY" - "$BUILD" <<'PYFONTZ'
+import os, struct, sys, zlib
+b = sys.argv[1]
+tot_raw = tot_pack = 0
+for n in ("bahnschrift", "simhei", "mono", "fallback"):
+    raw = open(os.path.join(b, "font_%s.ttf" % n), "rb").read()
+    co = zlib.compressobj(9, zlib.DEFLATED, -15)          # raw deflate（无 zlib 头/adler32）
+    z = co.compress(raw) + co.flush()
+    packed = struct.pack("<Q", len(raw)) + z
+    with open(os.path.join(b, "font_%s.z" % n), "wb") as f:
+        f.write(packed)
+    # 构建期自检：宿主 zlib 必须能把自己压出来的解回来（逐字节）
+    back = zlib.decompressobj(-15).decompress(z)
+    assert back == raw, "字体压缩往返自检失败：font_%s" % n
+    tot_raw += len(raw); tot_pack += len(packed)
+    print("    字体 %-12s %8d B -> %8d B（deflate -9 + 8B 长度头）" % (n, len(raw), len(packed)))
+print("    字体合计：%d B -> %d B（省 %d B；内核里只留压缩形态，解压缓冲在 .bss）"
+      % (tot_raw, tot_pack, tot_raw - tot_pack))
+PYFONTZ
+(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_bahnschrift.z font_bahnschrift_z.o)
+(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_simhei.z font_simhei_z.o)
+(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_mono.z font_mono_z.o)
+(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_fallback.z font_fallback_z.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 logo_rgba.bin logo_rgba.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_mycomputer.bin icon_mycomputer.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_recyclebin.bin icon_recyclebin.o)
@@ -222,7 +249,7 @@ echo "==> 资源对象（objcopy -> elf64，两份内核共用同一批）"
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_start.bin icon_start.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 kaisi.png kaisi_png.o)
 # OS 内核用同一批资源对象（直接复用）
-cp "$BUILD"/font_*.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o "$BUILD"/os/
+cp "$BUILD"/font_*_z.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o "$BUILD"/os/
 cp "$BUILD"/kaisi_png.o "$BUILD/os/"      # 只给系统内核（桌面用）
 # ★ A4-2a：**图标包搬进 VimtuFS2 系统卷** —— 包字节不再放在"内核区尾部（LBA 7497..8008）"，
 #   改成把 build/iconpack.bin 内嵌进**系统内核**（objcopy -> .rodata），启动期由 icons64 幂等
@@ -522,7 +549,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
     "$BUILD"/ahci64.o "$BUILD"/nvme64.o "$BUILD"/hwui64.o \
     "$BUILD"/display64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o \
-    "$BUILD"/user_demo64.o "$BUILD"/user_fbdemo64.o "$BUILD"/font_*.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o
+    "$BUILD"/user_demo64.o "$BUILD"/user_fbdemo64.o "$BUILD"/font_*_z.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o
 $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 
 $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
@@ -546,7 +573,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/hda64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD/os"/hello_vap64.o \
-    "$BUILD/os"/user_demo64.o $ASM_FBDEMO_OBJ "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
+    "$BUILD/os"/user_demo64.o $ASM_FBDEMO_OBJ "$BUILD/os"/font_*_z.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
     "$BUILD/os"/user_*_cblob.o \
     "$BUILD/os"/kaisi_png.o "$BUILD/os"/iconpack_bin.o
 $OBJCOPY -O binary "$BUILD/kernel64_os.elf" "$BUILD/kernel64_os.bin"
@@ -599,7 +626,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/hda64.o \
         "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
         "$BUILD/os"/hello_vap64.o \
-        "$BUILD/os"/user_demo64.o "$BUILD/os"/user_fbdemo64.o "$BUILD/os"/font_*.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
+        "$BUILD/os"/user_demo64.o "$BUILD/os"/user_fbdemo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
         "$BUILD/os"/user_*_cblob.o \
         "$BUILD/os"/kaisi_png.o
     $OBJCOPY -O binary "$BUILD/kernel64_os_cr3exp.elf" "$BUILD/kernel64_os_cr3exp.bin"

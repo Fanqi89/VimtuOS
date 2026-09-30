@@ -14,7 +14,8 @@
      （终端 `ls -l` 的模式串以 d 开头；ring3 shell 的 `ls` 打出 "sub/"）。
   ④ 新系统调用 chdir(80)/dup2(33)/rename(82)/rmdir(84)/utime(132) 的**成功与失败路径 + 错误码**：
      ring3 探针逐条打 `A42A <名字>=<返回值>`，本脚本逐条比对（-2 ENOENT / -20 ENOTDIR / -17 EEXIST /
-     -39 ENOTEMPTY / -9 EBADF / -38 ENOSYS(utime 显式时间) / 0 成功）。
+     -13 EACCES（跨目录 rename 的目标目录不可写）/ -39 ENOTEMPTY / -22 EINVAL（utime 显式时间超出
+     2000..2063）/ -9 EBADF / 0 成功）。
   ⑤ dup2 后**子进程输出落到文件**：内核侧 `run /musl_hello.elf > /tmp/o.txt`（把 fd 1 交给子进程）+
      ring3 侧探针 `dup2(file->1)` 后 fork 的子进程 write(1) —— 两处都落进文件，再由 shell 的 `cat`
      逐字节读出（重定向真的生效，而不是把子程序输出漏到控制台）。
@@ -221,9 +222,16 @@ def main():
     ossz = os.path.getsize(KERNEL_OS)
     check("系统内核存在且**在内核区硬上限内**（LBA 9..8008 = %d B）" % NEW_LIMIT_BYTES,
           ossz <= NEW_LIMIT_BYTES, "kernel64_os.bin=%d B / 上限 %d B" % (ossz, NEW_LIMIT_BYTES))
-    check("图标包搬走后**内核可用字节数增加**：硬上限 %d B -> %d B（+%d B）"
-          % (OLD_LIMIT_BYTES, NEW_LIMIT_BYTES, NEW_LIMIT_BYTES - OLD_LIMIT_BYTES),
-          (NEW_LIMIT_BYTES - OLD_LIMIT_BYTES) == 262144 and (NEW_LIMIT_BYTES - ossz) > 150 * 1024,
+    # ★ A4-4（内核预算收口）：字体从"整份 TTF 内嵌"改成"构建期 deflate 压缩内嵌 + 启动期解到 .bss"
+    #   （kernel/font.cpp + build64.sh）：四份 TTF 1,164,272 B -> 755,944 B，**省 408,328 B**。
+    #   余量阈值 = 预留 384 KiB = 393,216 B，依据（是"钉住新基线"，不是放宽）：
+    #     * A5 前置那一批（input64 + 事件/shm + evshm 支持）实测净增 ~113 KB —— 384 KiB 是它的 3.4 倍；
+    #     * 任何"把字体退回未压缩形态"的改动 = +408,328 B > 384 KiB，这条断言会立刻失败；
+    #     * 改动前实测余量 58,672 B（连 64 KiB 都不到），所以这条阈值不是"必然通过"。
+    RESERVE_BYTES = 384 * 1024
+    check("图标包搬走后**内核可用字节数增加**且系统内核余量 ≥ 预留 384 KiB（%d B；依据见上面注释）"
+          % RESERVE_BYTES,
+          (NEW_LIMIT_BYTES - OLD_LIMIT_BYTES) == 262144 and (NEW_LIMIT_BYTES - ossz) >= RESERVE_BYTES,
           "系统内核 %d B；余量 %d B（改动前：上限 %d B - 内核 %d B = %d B）"
           % (ossz, NEW_LIMIT_BYTES - ossz, OLD_LIMIT_BYTES, BEFORE_KERNEL_BYTES,
              OLD_LIMIT_BYTES - BEFORE_KERNEL_BYTES))
@@ -385,7 +393,9 @@ def main():
         ("rename_rel_ok", "0", "rename(82) 成功（相对路径 -> /tmp/a42a_abs.txt）"),
         ("rename_missing", "-2", "rename 源缺失 -> -ENOENT"),
         ("rename_exists", "-17", "rename 目标已存在 -> -EEXIST（vfs64 不覆盖，如实）"),
-        ("rename_cross_dir", "-38", "rename 跨目录 -> -ENOSYS（vfs64 只支持同目录，如实）"),
+        ("rename_cross_dir", "-13", "rename 跨目录已支持（A4-4b：改 parent+name 一次落盘）；本条是**权限**失败："
+                                    "/tmp/a42a_abs.txt -> /a42a_moved.txt，目标父目录 / 是 root 属主 0755、"
+                                    "探针进程非 root -> 目标目录 w+x 不足 = -EACCES"),
         ("mkdir_d", "0", "mkdir（rmdir 的素材）"),
         ("rmdir_ok", "0", "rmdir(84) 成功"),
         ("rmdir_missing", "-2", "rmdir 不存在 -> -ENOENT"),
@@ -398,7 +408,8 @@ def main():
         ("rmdir_file", "-20", "rmdir 目标是文件 -> -ENOTDIR"),
         ("utime_null", "0", "utime(132) times=NULL -> 0"),
         ("utime_missing", "-2", "utime 路径不存在 -> -ENOENT"),
-        ("utime_explicit", "-38", "utime 显式时间 -> -ENOSYS（vfs64 没有 mtime setter，如实）"),
+        ("utime_explicit", "-22", "utime 显式时间已落地 mtime（A4-4b）；探针的 utimbuf = {1,2}（1970-01-01）"
+                                  "超出可表示范围 2000..2063 -> -EINVAL"),
         ("dup2_bad_old", "-9", "dup2 oldfd 无效 -> -EBADF"),
         ("dup2_bad_new", "-9", "dup2 newfd 越界 -> -EBADF"),
         ("dup2_same", "1", "dup2(1,1) 幂等返回 1"),
