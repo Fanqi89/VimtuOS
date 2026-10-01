@@ -663,13 +663,18 @@ static int call_builtin(int which, int argc, char** argv) {
 #define SHC_QB 0x02
 #define SHC_QE 0x03
 static void quote_fold(char* line) {
-    int inq = 0;
+    int inq = 0;                                          /* 0 无 / 1 双引号组 / 2 单引号组 */
     char* w = line;
     for (char* r = line; *r; r++) {
         const char c = *r;
-        if (c == '\'' || c == '"') {                     /* 只支持成对同种引号（简单口径） */
+        /* ★ 收口修：引号**按种类配对**。原来任何 `'`/`"` 都翻转 inq，于是
+         *   `lua -e 'print("a".."b")'` 被切碎（内外引号互相闭合：组变成 print( / a / .. / b / …），
+         *   本该传给 Lua 的 `"` 反而被折叠吃掉 -> lua64_test 的 `-e` 字符串断言红。
+         *   现在：组内出现**另一种**引号时按普通字面量保留（POSIX 口径，也正是 /bin/sh 自己的
+         *   `-c` 解析（expand_cmd，按 quote=1/2 分类配对）已有的行为）—— 交互行与 `-c` 行口径一致。 */
+        if ((c == '\'' || c == '"') && (inq == 0 || inq == (c == '\'' ? 2 : 1))) {
             *w++ = inq ? (char)SHC_QE : (char)SHC_QB;
-            inq = !inq;
+            inq = inq ? 0 : ((c == '\'') ? 2 : 1);
             continue;
         }
         if (inq && (c == ' ' || c == '\t')) *w++ = (char)SHC_QSP;

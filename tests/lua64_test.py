@@ -444,14 +444,28 @@ def main():
           (re.search(r"run: /bin/lua pid=\d+ exited code=0", shell_stream(slog()[base:])) is not None) or
           wait_kernel_exit(rb, 0, 60))
 
-    # ---------------- ② -e 算术（无空格 token：shell 没有引号语法）----------------
+    # ---------------- ② -e 算术（引号口径见下面的收口修注释）----------------
     base = len(slog())
     rb = len(slog())
     type_line(mon, "run /bin/lua -e print(1+2)")
     check("★ `-e` 算术输出逐字节 = 3", wait_console("\n3\n", 90, since=base))
+    # ★ 收口修：带引号的 `-e` 必须**把整段用引号包住**再敲（正确引用写法）：
+    #     run /bin/lua -e 'print("a".."b",10//3,2*10*10)'
+    #   根因（实测）：交互行先过 user/shell/main.c 的 quote_fold。收口修之前它**任何** `'`/`"`
+    #   都翻转引号状态，于是 `"a"`/`"b"` 的引号被折叠吃掉 -> Lua 收到 `print(a..b,…)` -> nil 拼接报错，
+    #   断言红。现在 quote_fold **按引号种类配对**：外层单引号组里内的 `"` 是字面量，原样传给 Lua。
+    #   口径（写清楚，避免下次再撞）：引号折叠**只对交互行**生效；`-c` 行（`/bin/sh -c '<cmd>'`）
+    #   走 expand_cmd 的引号剥离，同样按种类配对。两条路径都在回归里：本行 + 下一行 = 交互行
+    #   （两种引号种类各一遍），`-c` 路径由 make64_test 的 `sh -c` 子集（59 条 sh64 / 8 条 -c）覆盖。
     base2 = len(slog())
-    type_line(mon, "run /bin/lua -e print(\"a\"..\"b\",10//3,2*10*10)")
-    check("★ `-e` 字符串/整除/乘法 = ab 3 200", wait_console("\nab\t3\t200\n", 90, since=base2))
+    type_line(mon, "run /bin/lua -e 'print(\"a\"..\"b\",10//3,2*10*10)'")
+    check("★ `-e` 字符串/整除/乘法 = ab 3 200（单引号包整段：引号真的传给了 Lua）",
+          wait_console("\nab\t3\t200\n", 90, since=base2))
+    # 同一条命令的"镜像引用"：外层双引号、内层单引号 —— 证明两种引号种类都按字面量保留
+    base2b = len(slog())
+    type_line(mon, "run /bin/lua -e \"print('a'..'b',10//3,2*10*10)\"")
+    check("★ 镜像引用：`-e \"print('a'..'b',…)\"` 同样 = ab 3 200（引号种类不影响字面量传递）",
+          wait_console("\nab\t3\t200\n", 90, since=base2b))
 
     # ---------------- ③ 从系统卷读脚本文件并跑 ----------------
     base = len(slog())

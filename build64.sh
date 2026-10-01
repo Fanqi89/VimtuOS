@@ -758,7 +758,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/hello_vap64.o \
         "$BUILD/os"/user_demo64.o "$BUILD/os"/user_fbdemo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
         "$BUILD/os"/user_*_cblob.o \
-        "$BUILD/os"/kaisi_png.o
+        "$BUILD/os"/kaisi_png.o "$BUILD/os"/iconpack_bin.o   # ★ 收口修：图标包也是内嵌对象（与系统内核链接行一致，见上面第 306/706 行）
     $OBJCOPY -O binary "$BUILD/kernel64_os_cr3exp.elf" "$BUILD/kernel64_os_cr3exp.bin"
     echo "实验内核 OK. $BUILD/kernel64_os_cr3exp.bin = $(stat -c%s "$BUILD/kernel64_os_cr3exp.bin") bytes"
 fi

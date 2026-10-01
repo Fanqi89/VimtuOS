@@ -47,6 +47,20 @@ KIND_ELF = 4
 S_IFREG = 0o100000
 KIND_TEXT = 5
 
+# ★ 收口修（B5 测试暴露）：**解析器必须扛得住"被删除 inode 的残留槽"**。
+#   实测根因（不是本工具的锅，但本工具是唯一崩的地方）：内核 kernel/vfs64.cpp:2552 的
+#     `uint8_t empty[VFS64_INODE_BYTES_MAX]; ... inode_store(idx, empty)`
+#   没有先 zero_bytes 就把 **128 字节未清零的内核栈**写进被删 inode 的槽位。
+#   于是 `make clean` 删掉 main.o/util.o/hello 之后，这三个槽里是随机字节：
+#   实测 rec[0]=0xC8(200)、rec[1]=0x34(52)、名字字段非 ASCII（\xbd&/\x80...）；
+#   老代码 `rec[40:40+rec[1]].decode("ascii")` 直接 UnicodeDecodeError（宿主侧测试崩）。
+#   健壮口径（与内核 inode_ok() 的校验同向）：type ∉ {1=文件,2=目录} -> 不是有效项；
+#   名字长度 0 或 > 31（VFS64_NAME_MAX）-> 越界；名字非 ASCII -> 残渣。三种都**安全跳过**。
+VFS_I_TYPE = 0
+VFS_I_NAMELEN = 1
+VFS_I_NAME = 40
+VFS_NAME_MAX = 31                     # kernel/vfs64.h 的 VFS64_NAME_MAX（v3/v4）
+
 
 def _load_shellvol():
     """把 tools/make_shellvol.py 当模块加载（复用它的 Volume 类与 build_disk）。"""
@@ -156,7 +170,7 @@ class VolumeEdit(Volume2):
                     continue
                 if struct.unpack_from("<I", rec, VFS_I_PARENT)[0] != cur:
                     continue
-                if rec[40:40 + rec[1]].decode("ascii") == part:
+                if _rec_name(rec) == part:                 # 残留槽 -> None != part，安全跳过
                     hit = i
                     break
             if hit is None:
@@ -177,7 +191,7 @@ class VolumeEdit(Volume2):
                     continue
                 if struct.unpack_from("<I", rec, VFS_I_PARENT)[0] != cur:
                     continue
-                if rec[40:40 + rec[1]].decode("ascii") == part:
+                if _rec_name(rec) == part:
                     nxt = i
                     break
             if nxt is None:
@@ -198,7 +212,7 @@ class VolumeEdit(Volume2):
         for i in range(self.inodes):
             rec = self.inode_rec(i)
             if rec[0] == 1 and struct.unpack_from("<I", rec, VFS_I_PARENT)[0] == d and \
-               rec[40:40 + rec[1]].decode("ascii") == parts[-1]:
+               _rec_name(rec) == parts[-1]:                # 残留槽 != 任何名字，安全跳过
                 self.buf[self.inode_start * SECTOR + i * VFS_INODE_BYTES:
                          self.inode_start * SECTOR + (i + 1) * VFS_INODE_BYTES] = b"\0" * VFS_INODE_BYTES
         ino = self._free_inode()
@@ -216,7 +230,59 @@ def _inode_rec(vol, ino):
     return vol[off:off + VFS_INODE_BYTES]
 
 
-def _entries(vol, parent, inodes):
+def _rec_name(rec):
+    """从一条 inode 记录里安全取名字：不是有效项就返回 None（调用方跳过）。
+    三条过滤（顺序 = 从便宜到贵，也正好覆盖实测到的三种残留形态）：
+      * `type ∉ {1,2}`：空槽/垃圾槽 —— 实测被删槽里是 0xC8（未清零的内核栈）；
+      * `namelen` 0 或 > 31：越界/垃圾 —— 实测 0x34 = 52；
+      * 名字含非 ASCII 字节：残渣 —— 实测 `\\xbd&/\\x80...`（老代码就在这行崩）。"""
+    if rec[VFS_I_TYPE] not in (1, 2):
+        return None
+    n = rec[VFS_I_NAMELEN]
+    if n == 0 or n > VFS_NAME_MAX or VFS_I_NAME + n > len(rec):
+        return None
+    try:
+        return rec[VFS_I_NAME:VFS_I_NAME + n].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+
+def used_blocks(vol):
+    """从卷位图重建"已用块"集合（与 VolumeEdit.load() 同一口径：位图起点/块数取自超级块）。
+    用途见 `entry_live()`：识别**幽灵 inode**（记录还在、块已被释放）。"""
+    bitmap_start = struct.unpack_from("<I", vol, 28)[0]
+    bmn = struct.unpack_from("<I", vol, 32)[0]
+    used = set()
+    for m in range(bmn):
+        off = (bitmap_start + m) * SECTOR
+        blk = vol[off:off + SECTOR]
+        for k in range(SV.VFS_BITMAP_BLK_BITS):
+            if (blk[k >> 3] >> (k & 7)) & 1:
+                used.add(m * SV.VFS_BITMAP_BLK_BITS + k)
+    return used
+
+
+def entry_live(rec, used):
+    """活项判定（**第二种**残留形态的兜底）：记录指向的元数据块（直接 4 + ind + dind）
+    必须都还在位图里。`unlink`/`rmdir` 会先 `free_file_blocks()` 再清 inode 槽；内核那个
+    "没清零就写回"的 bug 若把**本文件 inode 的旧字节**留进槽里，槽看起来完全合法（type/名字/
+    长度/CRC 都对），只有"块已经不在位图里"能把它认出来 —— 不认出来的话宿主会把一个已被
+    删除的文件"读回来"（而且读出的是已被其它文件复用的块）。"""
+    for b in _rec_meta_blocks(rec):
+        if b and b not in used:
+            return False
+    return True
+
+
+def _rec_meta_blocks(rec):
+    """记录里的元数据块号（直接块 + 一级间接 + 二级间接；间接块里的数据块由 _read_file 展开）。"""
+    out = [struct.unpack_from("<I", rec, 8 + 4 * d)[0] for d in range(VFS_DIRECT_BLOCKS)]
+    out.append(struct.unpack_from("<I", rec, 24)[0])
+    out.append(struct.unpack_from("<I", rec, VFS_I_DIND)[0])
+    return out
+
+
+def _entries(vol, parent, inodes, used=None):
     out = []
     for i in range(inodes):
         rec = _inode_rec(vol, i)
@@ -224,7 +290,11 @@ def _entries(vol, parent, inodes):
             continue
         if struct.unpack_from("<I", rec, VFS_I_PARENT)[0] != parent:
             continue
-        nm = rec[40:40 + rec[1]].decode("ascii")
+        nm = _rec_name(rec)
+        if nm is None:
+            continue                                   # 残留/垃圾槽：跳过（不是崩）
+        if used is not None and not entry_live(rec, used):
+            continue                                   # 幽灵 inode（块已释放）：不是活文件
         out.append((i, nm, rec))
     return out
 

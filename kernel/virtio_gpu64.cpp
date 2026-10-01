@@ -100,6 +100,13 @@ enum VgpuCmd : uint32_t {
 // 自检每段在屏幕上保持多久（验收脚本要在这段时间里用 QEMU monitor 抓帧）
 #define VGPU_HOLD_MS    3000
 
+// ★ 预算收口：`[VGPU] equiv …` 的**冗余诊断**（pat=/lfb=/dev= 转储 + MISMATCH 长说明）默认不编译，
+//   要人工排查时：VIMTU_EXTRA_CXXFLAGS=-DVGPU64_DIAG_EQUIV_VERBOSE=1 bash build64.sh
+//   （那条 `[VGPU] equiv lcg=… rect=… bytes=… diff=…` 主证据行**始终**编译 —— 验收脚本要 grep 它。）
+#ifndef VGPU64_DIAG_EQUIV_VERBOSE
+#define VGPU64_DIAG_EQUIV_VERBOSE 0
+#endif
+
 // ==================== 结构（与 spec 逐字节一致；packed 保证没有对齐洞）====================
 struct __attribute__((packed)) VgpuHdr {
     uint32_t type;
@@ -151,6 +158,12 @@ static uint64_t   g_notify_pa = 0;                // 队列 0 的通知地址（
 static uint16_t   g_qsize = 0;                    // 队列 0 实际大小
 static uint32_t   g_fence = 0;
 static uint8_t    g_resp[512] __attribute__((aligned(16)));   // 响应缓冲（最大 = display_info 408B）
+// ★ 收口：tick 标定缓存。原来标定（50 tick = 200 ms 空转）挤在 vgpu64_bench64() 里，
+//   于是 selftest PASS 打完之后要空等 200 ms 才出第一条 `[VGPU] bench` 行 —— 验收脚本
+//   tests/virtiogpu64_test.py 的快照点在 PASS 后 ~87 ms（实测），就会拿到"0 条 bench"的伪失败。
+//   现在在 init 尾部标一次并缓存：口径不变（同一次 boot 的 rdtsc/PIT 关系），bench 行紧跟 PASS。
+static uint64_t   g_cyc_per_tick = 0;
+static uint64_t   vgpu_cyc_per_tick();            // 前向声明（实现见文件下面的基准段）
 static VgpuMemEntry* g_entries = nullptr;         // ATTACH_BACKING 的页表（kmalloc，重配时复用）
 static uint32_t   g_entries_cap = 0;
 static int        g_fails = 0;                    // 连续失败计数（到 VGPU_MAX_FAILS 就降级）
@@ -743,6 +756,9 @@ void vgpu64_init64() {
     vgpu_puts("[VGPU] ready backend=virtio-gpu-2d scanout=pending status=");
     vgpu_hex32((uint32_t)g_i.device_status);
     vgpu_log_end();
+    // ★ 收口：tick 标定在这里做一次并缓存（见 g_cyc_per_tick 的注释）—— 设备在、队列在、
+    //   PIT 早就在跑（标定带着自旋上限，绝不挂死）。标定失败（0）时 bench 会如实不带 us 字段。
+    if (!g_cyc_per_tick) g_cyc_per_tick = vgpu_cyc_per_tick();
 }
 
 int vgpu64_ready64() { return g_i.ready ? 1 : 0; }
@@ -1020,7 +1036,7 @@ int vgpu64_selftest64() {
     //   为什么这么比：QEMU 的 virtio-vga 早期 boot 把 console 留给 legacy VGA（见报告），屏幕截图
     //   在那一刻证明不了设备像素；这条在 guest 内存里直接比，与显示仲裁无关。
     {
-        const int ex = 0, ey = 64, ew = (int)g_res_w, eh = 240;  // 图案带 = 整行宽（见传输语义注释）
+        const int ey = 64, ew = (int)g_res_w, eh = 240;  // 图案带 = 整行宽（x 恒 0，不参与传输；见传输语义注释）
         const int sy = 400;                                     // 回读落点：resource 内另一段行（不与图案带重叠）
         int bw2 = 0, bh2 = 0;
         uint32_t* bb2 = fb_surface64(&bw2, &bh2);
@@ -1054,6 +1070,13 @@ int vgpu64_selftest64() {
         vgpu_puts("x"); vgpu_num((uint64_t)eh);
         vgpu_puts(" bytes="); vgpu_num((uint64_t)ew * (uint64_t)eh * 4u);
         vgpu_puts(" diff="); vgpu_num((uint64_t)(diff < 0 ? 0xFFFFFFFFu : (uint32_t)diff));
+        /* ★ 预算收口（本批）：这一段的**冗余诊断**改由编译期开关控制，默认**不编译** ——
+         *   `pat=/lfb=/dev=` 三个十六进制转储 + MISMATCH 长说明只用于人工排查；
+         *   自动验收只要上面那条 `[VGPU] equiv lcg=… rect=… bytes=… diff=…`（tests/virtiogpu64_test.py:310
+         *   的正则到 `diff=` 为止，后面的额外字段/后缀都不参与判定）。
+         *   要开：VIMTU_EXTRA_CXXFLAGS=-DVGPU64_DIAG_EQUIV_VERBOSE=1 bash build64.sh
+         *   （报告里给了"关掉省了多少字节"的实测值）。 */
+#if VGPU64_DIAG_EQUIV_VERBOSE
         if (bb2) {
             vgpu_puts(" pat="); vgpu_hex32(bb2[(size_t)ey * bw2]);
             vgpu_puts(" lfb="); vgpu_hex32(fb_lfb_pixel64(0, ey));
@@ -1068,6 +1091,9 @@ int vgpu64_selftest64() {
             //   （期望值在 Python 侧独立重算，见 tests/virtiogpu64_test.py 的 LCG 部分）。
             vgpu_puts(" MISMATCH (TRANSFER_FROM_HOST_2D 不回写非 blob 2D 资源；见报告没做到)");
         }
+#else
+        if (diff != 0) vgpu_puts(" GAP(TRANSFER_FROM_HOST_2D 不回写非 blob 2D 资源)");   /* 一行，始终可见 */
+#endif
         vgpu_log_end();
     }
 
@@ -1157,7 +1183,7 @@ static void vgpu_bench_case(const char* kind, int x, int y, int w, int h, int ru
 int vgpu64_bench64() {
     if (!g_i.ready || !g_scanout_on) return 0;
     const int W = (int)g_res_w, H = (int)g_res_h;
-    const uint64_t cpt = vgpu_cyc_per_tick();
+    const uint64_t cpt = g_cyc_per_tick ? g_cyc_per_tick : vgpu_cyc_per_tick();  // ★ init 已缓存（见上）
     int n = 0;
     vgpu_bench_case("full", 0, 0, W, H, 5, cpt); n++;               // 整屏 flip（上屏主用例）
     vgpu_bench_case("region", W / 4, H / 4, 512, 512, 5, cpt); n++; // 窗口搬移

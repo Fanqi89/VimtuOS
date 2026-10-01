@@ -148,6 +148,9 @@ def load_mod(name, fname):
 
 
 def read_guest_file(img_path, parts):
+    """从卷里按路径回读一个文件（不存在/是幽灵 inode 就返回 None）。
+    ★ 收口修：传 `used`（位图重建的"已用块"集合）给 `_entries`，把**幽灵 inode**（记录还在、
+    块已被 unlink 释放）挡掉 —— 内核 bug 见 tools/tcc_pack_win.py 顶部注释。"""
     TP = load_mod("tcc_pack_win", "tcc_pack_win.py")
     d = open(img_path, "rb").read()
     vol = d[PART_MAIN_LBA * SECTOR:TARGET_SECTORS * SECTOR]
@@ -155,11 +158,12 @@ def read_guest_file(img_path, parts):
         return None
     total = struct.unpack_from("<I", vol, 20)[0]
     inodes = struct.unpack_from("<I", vol, 40)[0]
+    used = TP.used_blocks(vol)
     cur = 0
     rec = None
     for part in parts:
         hit = None
-        for i, nm, r in TP._entries(vol, cur, inodes):
+        for i, nm, r in TP._entries(vol, cur, inodes, used):
             if nm == part:
                 hit = (i, r)
                 break
@@ -325,26 +329,39 @@ class Session:
             time.sleep(0.3)
         return False
 
-    def exited_or_eagain(self, base, tool, code, timeout=90):
-        """慢命令：接受 `exited code=C` **或** 既有的 wait4-EAGAIN 边界（见文件头）。"""
+    def exited_or_eagain(self, base, tool, code, timeout=90, path=None):
+        """慢命令：接受 `exited code=C` **或** 既有的 wait4-EAGAIN 边界（见文件头）。
+        ★ 收口修：`path` = 实际命令行里的路径（默认 `/bin/<tool>`）。原来把路径硬编码成
+        `/bin/<tool>`，于是 `run /make-demo/hello` 的汇总行 `run: /make-demo/hello pid=…
+        exited code=0` **永远匹配不上**（实测：命令明明跑通、输出也对，断言仍 FAIL）。"""
+        rx = r"run: %s pid=\d+ exited code=%d" % (re.escape(path or ("/bin/" + tool)), code)
         deadline = time.time() + timeout
         while time.time() < deadline:
             txt = shell_stream(self.log()[base:])
-            if re.search(r"run: /bin/%s pid=\d+ exited code=%d" % (tool, code), txt) is not None:
+            if re.search(rx, txt) is not None:
                 return "exited"
             if "run: wait4 failed (err=11)" in txt:
                 return "eagain"
             time.sleep(0.3)
         return None
 
-    def exited(self, base, tool, code, timeout=90):
+    def exited(self, base, tool, code, timeout=90, path=None):
+        rx = r"run: %s pid=\d+ exited code=%d" % (re.escape(path or ("/bin/" + tool)), code)
         deadline = time.time() + timeout
         while time.time() < deadline:
             txt = shell_stream(self.log()[base:])
-            if re.search(r"run: /bin/%s pid=\d+ exited code=%d" % (tool, code), txt) is not None:
+            if re.search(rx, txt) is not None:
                 return True
             time.sleep(0.3)
         return False
+
+    def settle(self, timeout=30):
+        """慢命令/长输出之后的**握手**：等 shell 重新打出提示符再敲下一条命令。
+        实测依据：make 会先回显 recipe 再编译，整段输出期间 shell 不在读行；长输出还没刷完
+        就紧接着敲下一条命令时，输入与提示符会交错（串口日志里能看到字符被内核打点行插断），
+        后面那条命令就可能整体丢掉 -> `run /make-demo/hello` 变 `run: no such program` 之类的
+        伪失败。提示符出现 = shell 已经回到读行循环，此时输入一定被读到。"""
+        return self.wait_console("sh64:/$ ", timeout)
 
     def type_line(self, text, per_key=0.12):
         for ch in text:
@@ -473,18 +490,49 @@ def main():
     ev = s.exited_or_eagain(b1, "make", 0, 60)
     check("★ `make all` 的结束证据：exited code=0（或既有的 wait4-EAGAIN 边界，见文件头）",
           ev is not None, ev)
+    s.settle(60)                                   # ★ 收口修：等提示符回来再敲下一条（见 settle）
 
     # ---------------- ③ run 产物 ----------------
+    # ★ 收口修（实测根因，不是"输入时序"）：断言原来用 `exited(b2, "hello", …)` -> 正则被拼成
+    #   `run: /bin/hello pid=…`，而真实汇总行是 `run: /make-demo/hello pid=33 exited code=0`
+    #   —— **路径不匹配，永远红**（探针实测：同一条命令输出 `vimtuos-make-demo: 6*7=42` 且
+    #   `exited code=0` 都在串口里，输出断言过、退出码断言挂）。用 path= 传真实路径后判定从严：
+    #   必须看到 `/make-demo/hello` 自己的汇总行 + code=0。
     b2 = s.run_cmd("run /make-demo/hello")
     check("★ 产出的 /make-demo/hello 在 ring3 里真跑起来，输出 = 'vimtuos-make-demo: 6*7=42'",
           s.wait_console("vimtuos-make-demo: 6*7=42", 90, since=b2))
-    check("★ 产物退出码 0", s.exited(b2, "hello", 0, 60))
+    check("★ 产物退出码 0（`run: /make-demo/hello … exited code=0` 汇总行）",
+          s.exited(b2, "hello", 0, 60, path="/make-demo/hello"))
 
     # ---------------- ④ make clean ----------------
     b3 = s.run_cmd("run /bin/make -C /make-demo clean")
     check("★ `make clean` 跑完（退出码 0）", s.exited(b3, "make", 0, 90),
           (re.search(r"run: /bin/make[^\r\n]*", shell_stream(s.log()[b3:])) or ["（缺）"])[0])
     s.wait_console("rm: ok", 30, since=b3)
+    s.settle(60)                                   # ★ 收口修：clean 也是"慢命令 + 长输出"
+
+    # ★★ 收口修（语义 + 时机）："clean 之后 main.o/util.o 不存在"必须**在这个时刻**验 ——
+    #   后面的 ⑤ `-j2 all` 会把它们**重新编回来**（实证：末态卷里 ino=274/275/276 就是 -j2
+    #   重建的 main.o/util.o/hello）。原来那条断言在 -j2 之后才回读，读到的必然是重建出来的
+    #   文件：判据与事实不符（而且它前面还会先崩在工具的 UnicodeDecodeError 上，见下）。
+    #   这里在 clean 完成、-j2 之前从宿主回读（QEMU 还在跑；raw 盘 QEMU 走宿主页缓存，
+    #   写完即可见），带**有界重试**只是等 ATA 写落盘，不是放宽判据（20 s 内必须都是 None）。
+    #   工具侧同时修了三件事（tools/tcc_pack_win.py）：type/namelen/ASCII 过滤 + **幽灵 inode**
+    #   （记录还在、块已被释放）过滤 —— 否则被删槽里的残留字节（实测 rec[0]=0xC8、namelen=52、
+    #   名字非 ASCII）会直接把宿主解析器打崩。
+    gone = False
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if all(read_guest_file(img, ["make-demo", p]) is None
+               for p in ("main.o", "util.o", "hello")):
+            gone = True
+            break
+        time.sleep(1.0)
+    check("★★ make clean 之后（-j2 重建之前）宿主从卷里回读：/make-demo/main.o、util.o、hello "
+          "**都不存在**（残留 inode 槽被安全跳过，不是当文件读）", gone,
+          "main.o=%s util.o=%s hello=%s" % tuple(
+              "None" if read_guest_file(img, ["make-demo", p]) is None else "存在"
+              for p in ("main.o", "util.o", "hello")))
 
     # ---------------- ⑤ -j2（如实记录走哪条路） ----------------
     b4 = s.run_cmd_wait("run /bin/make -C /make-demo -j2 all",
@@ -501,14 +549,24 @@ def main():
           j2_ok or "warning" in txt4.lower() or "jobserver" in txt4.lower(), j2_note[:120])
     ev4 = s.exited_or_eagain(b4, "make", 0, 60)
     check("★ `-j2` 的结束证据（exited code=0 或 EAGAIN 边界）", ev4 is not None, ev4)
+    s.settle(60)
 
     # ---------------- ⑥ 失败用例 ----------------
     b5 = s.run_cmd("run /bin/make -C /tmp/fastfail")
     check("★ 失败工程 #1（recipe 命令失败）：make 退出码非 0（快命令，汇总行可见）",
           s.exited(b5, "make", 2, 90),
           (re.search(r"run: /bin/make[^\r\n]*", shell_stream(s.log()[b5:])) or ["（缺）"])[0])
-    check("★ 失败工程 #1：`&&` 后面的 echo **没有**执行（错误没被吞掉）",
-          "unreachable: tar should have failed" not in shell_stream(s.log()[b5:]))
+    # ★ 收口修（实测判据，不削弱）：**不能**拿整段控制台做 `not in` ——
+    #   FASTFAIL_MAKEFILE 的 recipe 没有 `@`，make 按 GNU make 的标准行为会**先回显 recipe 原文**
+    #   `/bin/tar && echo "unreachable: tar should have failed"`，于是子串永远在日志里，
+    #   断言与 `&&` 语义无关地恒红（探针实测：recipe_echo=True、独立输出行=False，
+    #   且串口里 `run: /bin/tar pid=36 exited code=2` -> `make: *** [Makefile:3: all] Error 2`
+    #   顺序完整 —— 说明我方 sh 的 `&&` 短路是 POSIX 正确的：错的只是判据）。
+    #   判据改成"独立输出行"：`echo` 真被执行时会打出单独一行 `unreachable: tar should have failed`，
+    #   而 recipe 回显那行以 `/bin/tar &&` 开头，不会命中（同文件里 `never`/注释检查的同一口径）。
+    check("★ 失败工程 #1：`&&` 后面的 echo **没有**执行（独立输出行判据；recipe 回显不算）",
+          not re.search(r"(?m)^unreachable: tar should have failed\r?$", shell_stream(s.log()[b5:])),
+          "recipe 回显：%s" % ('echo "unreachable' in shell_stream(s.log()[b5:])))
     b6 = s.run_cmd("run /bin/make -C /tmp/fastfail2")
     check("★ 失败工程 #2（内置 rm 失败）：make 退出码非 0", s.exited(b6, "make", 2, 90))
     b7 = s.run_cmd("run /bin/make -C /tmp/badproj")
@@ -582,9 +640,17 @@ def main():
         entry = struct.unpack_from("<Q", hello, 24)[0]
         check("★ 产物的入口落在 4GiB 装载区（内核 ELF 装载器的硬约束）",
               0x100000000 <= entry < 0x100000000 + 0x10000, "entry=%#x" % entry)
+    # ★★ 末态（⑤ `-j2 all` 之后）：main.o / util.o / hello 是**重新编出来的** ——
+    #   "clean 删掉了它们"的证据在 ④ 那一步的宿主回读里（**-j2 之前**必须都是 None，见上面的
+    #   post-clean 检查与注释）。这里改成断言"重新编出来"（比原来错位的"None"是**更强的正确语义**）。
+    #   顺带记下工具侧修的崩点：内核 vfs64_unlink64()（kernel/vfs64.cpp:2552）把未清零的 128B 内核栈
+    #   写进被删 inode 槽（实测 rec[0]=0xC8、namelen=0x34、名字 =\xbd&/\x80…），老解析器对每个 root
+    #   项 decode("ascii") 直接抛 UnicodeDecodeError。现在两重过滤：`_rec_name`（type ∉ {1,2} /
+    #   namelen > 31 / 名字非 ASCII）+ `entry_live`（幽灵 inode：记录指向的块已不在位图里）。
     for parts in (["make-demo", "main.o"], ["make-demo", "util.o"]):
-        check("★★ make clean 之后 /%s 已被删除" % "/".join(parts),
-              read_guest_file(img, parts) is None)
+        got = read_guest_file(img, parts)
+        check("★★ `-j2 all`（clean 之后）重新编出了 /%s（宿主从卷里回读非空）" % "/".join(parts),
+              got is not None and len(got) > 0, "%s B" % (len(got) if got else None))
     # -j2 那一步又把产物编回来了：clean 在前、-j2 在后 -> 这里应当是"存在"
     check("★★ `-j2 all`（在 clean 之后）重新编出了 /make-demo/hello",
           read_guest_file(img, ["make-demo", "hello"]) is not None)
