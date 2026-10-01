@@ -106,6 +106,8 @@
 #include "hwinfo64.h"        // CPUID + PCI 枚举 + 磁盘
 #include "userdb64.h"        // 用户表 / 加盐哈希 / /etc/users.db
 #include "desktopops64.h"    // ★ P5：恢复默认桌面图标 / 显示隐藏分区（本页唯一新增入口）
+// ★ 驱动线 3：显示后端（virtio-gpu 2D）只读状态 —— 关于页的 GPU 卡按它如实展示
+#include "virtio_gpu64.h"
 
 // ★ 本批：Intel HDA 声卡驱动（声音页的滑块/静音/输出源全部走真硬件）
 #include "hda64.h"
@@ -2226,13 +2228,33 @@ static void about_log_once() {
     dbg64_str(" bits=64 (long mode)");
     dbg64_nl();
     dbg64_line_end64();
+    // ★ 驱动线 3：GPU/显示后端如实反映（只读展示）——
+    //   有 virtio-gpu 2D 设备时：上屏（整屏/区域 blit）走设备，标为 virtio-gpu-2d；
+    //   没有设备时**逐字保持**原来的三行（外部脚本/文档引用的就是这几行，别改文字）。
+    const int gpu2d = vgpu64_ready64();
+    const Vgpu64Info* gv = vgpu64_info64();
     dbg64_str("[SET64] drivers implemented=");
-    dbg64_dec((uint64_t)12);
+    dbg64_dec((uint64_t)(12 + (gpu2d ? 1 : 0)));
     dbg64_str(" missing=");
     dbg64_dec((uint64_t)4);
-    dbg64_str(" gpu=software (no accelerator driver; CPU rasterizer into the LFB)");
+    dbg64_str(" gpu=");
+    if (gpu2d) dbg64_str("virtio-gpu-2d (2D blit/flip handed to the device; rasterizer still CPU)");
+    else       dbg64_str("software (no accelerator driver; CPU rasterizer into the LFB)");
     dbg64_nl();
-    dbg64_str("[SET64] gpu accel=none renderer=software reason=no GPU driver (no 2D/3D accel, no DRM/KMS)");
+    dbg64_str("[SET64] gpu accel=");
+    dbg64_str(gpu2d ? "virtio-gpu-2d" : "none");
+    dbg64_str(" renderer=software");
+    dbg64_str(gpu2d ? " reason=2D scanout backend active (TRANSFER_TO_HOST_2D + RESOURCE_FLUSH)"
+                    : " reason=no GPU driver (no 2D/3D accel, no DRM/KMS)");
+    dbg64_nl();
+    // 明细行（新增，只读）：后端名 + 上屏计数（走了设备还是软件）+ 超时数。
+    //   字段刻意压到最少：settings64 在系统内核里是大户，每多一次内联 dbg64 展开就是几百字节。
+    dbg64_str("[SET64] gpu backend=");
+    dbg64_str(vgpu64_backend_name64());
+    dbg64_str(" res="); dbg64_dec(gv->res_id);
+    dbg64_str(" blits_dev="); dbg64_dec(gv->blits_dev);
+    dbg64_str(" blits_soft="); dbg64_dec(gv->blits_soft);
+    dbg64_str(" timeouts="); dbg64_dec(gv->cmd_timeouts);
     dbg64_nl();
 }
 static void page_about(const Lay* L, int x0, int y0) {
@@ -2372,23 +2394,36 @@ static void page_about(const Lay* L, int x0, int y0) {
         ctl_reg(P_ABOUT, CID_HW_CHECK, CK_BUTTON, bx, ry + (L->row_h - bh) / 2, bw, bh);
         ry += L->row_h;
     }
-    // 卡 3：GPU 加速状态（如实：未实现）
+    // 卡 3：GPU / 显示后端（如实：有 virtio-gpu 2D 就是"上屏走设备，绘制仍 CPU"；没有就是纯软件）
     const int y3 = y2 + c2h + 12;
     const int c3h = card_rows_h(L, 2);
     card_begin(L, y3, c3h);
     {
+        const int gpu2d = vgpu64_ready64();
         ui_text(L->card_x + 16, y3 + 12 + 4,
-                zh ? "GPU 加速状态：**未实现** —— 当前为软件渲染" : "GPU acceleration: not implemented (software)",
+                gpu2d ? (zh ? "GPU 加速状态：**2D 上屏已交给设备**（virtio-gpu 2D）"
+                            : "GPU acceleration: 2D flip/blit on the device (virtio-gpu 2D)")
+                      : (zh ? "GPU 加速状态：**未实现** —— 当前为软件渲染"
+                            : "GPU acceleration: not implemented (software)"),
                 t->text);
         Buf b; b_init(&b);
-        b_str(&b, zh ? "所有绘制（圆角/阴影/毛玻璃/渐变）都由 CPU 光栅化到帧缓冲；没有 DRM/KMS、没有 2D/3D"
-                       " 加速器驱动、没有 GPU 命令提交。"
-                     : "all rendering is CPU rasterized into the framebuffer; no accelerator driver.");
+        if (gpu2d) {
+            // 只读展示：一句话 + 设备/软件上屏计数。**不重复**讲 2D 命令集的细节
+            //（那在 docs/应用层与系统调用说明.md 的 virtio-gpu 2D 一节里）—— 内核余量很紧。
+            const Vgpu64Info* gv = vgpu64_info64();
+            b_str(&b, zh ? "上屏（整屏/区域 blit）= TRANSFER_TO_HOST_2D + RESOURCE_FLUSH；"
+                           "绘制（圆角/阴影/毛玻璃）仍 CPU。设备 " : "blits via device: ");
+            b_u64(&b, gv->blits_dev);
+            b_str(&b, zh ? " / 软件 " : " / soft ");
+            b_u64(&b, gv->blits_soft);
+        } else {
+            b_str(&b, zh ? "所有绘制（圆角/阴影/毛玻璃/渐变）都由 CPU 光栅化到帧缓冲；没有 DRM/KMS、没有 2D/3D"
+                           " 加速器驱动、没有 GPU 命令提交（本机没有 virtio-gpu 设备）。"
+                         : "all rendering is CPU rasterized into the framebuffer; no accelerator driver.");
+        }
         ui_text(L->card_x + 16, y3 + 12 + 4 + ui_h() + 6, b.b, t->text_dim);
     }
 }
-
-// ==================== 页面分派 ====================
 static void draw_page(const Lay* L, int x0, int y0) {
     switch (g_page) {
         case P_DISPLAY: page_display(L, x0, y0); break;

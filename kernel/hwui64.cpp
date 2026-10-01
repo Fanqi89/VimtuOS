@@ -488,6 +488,8 @@ int hwui64_build64() {
         l.s("  zoom="); l.u((uint64_t)fb_get_zoom()); l.s("%");
         l.s("  bootinfo="); l.u(bi->width); l.s("x"); l.u(bi->height);
         l.s("@"); l.u(bi->bpp); l.s("bpp");
+        // ★ 驱动线 3：显示后端（如实：没有 virtio-gpu 时就是 soft-lfb = CPU 光栅化写 LFB）
+        l.s("  backend="); l.s(fb_backend_name64());
     }
     {
         const Edid64* ed = edid64_get();

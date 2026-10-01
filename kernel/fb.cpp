@@ -3,6 +3,10 @@
 #include "font8x8.h"
 #include "../bootinfo.h"
 #include "port.h"
+// ★ 驱动线 3：显示后端（virtio-gpu 2D 设备路径 / 软件 LFB 路径）。这里**只调用**它，
+//   不反向依赖：没有设备时 vgpu64_blit64() 一律返回 0，下面的软件路径一个字节都没变。
+#include "virtio_gpu64.h"
+#include "debug64.h"     // fb_backend_log64() 的 [FB64] 打点
 
 static uint32_t fb_addr = 0;
 static int fb_w = 0, fb_h = 0;
@@ -162,6 +166,10 @@ void fb_set_zoom(int pct) {
 // 后备缓冲 -> LFB（整帧提交）：共享实现（内核侧 fb_flip 与 A1 的 fb_user_flip64 都走它）
 static void fb_flip_all64() {
     if (!backbuf || !fb_addr) return;
+    // ★ 驱动线 3：设备路径优先。virtio-gpu 2D 可用时整屏也用**一个区域**提交：
+    //   TRANSFER_TO_HOST_2D(整屏) + RESOURCE_FLUSH —— 不再让 CPU 逐像素写 LFB。
+    //   返回 0（没有设备/几何不匹配/超时）就原样往下走既有软件路径（这一条是硬要求）。
+    if (g_zoom == 100 && vgpu64_blit64(0, 0, fb_w, fb_h)) return;
     if (g_zoom == 100) {
         if (fb_bpp == 32 && fb_pitch == fb_w * 4) {
             // 快速路径：整块逐像素拷贝
@@ -214,6 +222,10 @@ void fb_flip() {
 static void fb_blit_region64(int x, int y, int w, int h) {
     if (!backbuf || !fb_addr) return;
     if (g_zoom != 100) { fb_flip_all64(); return; }   // 缩放时无法局部映射，退化整帧
+    // ★ 驱动线 3：设备路径优先（TRANSFER_TO_HOST_2D + RESOURCE_FLUSH 只搬脏矩形）。
+    //   真走了设备就直接返回；否则（无设备/降级/超时）原样走下面的软件路径。
+    if (vgpu64_blit64(x, y, w, h)) return;
+    vgpu64_note_soft_blit64(x, y, w, h);              // 如实统计"这次走的是软件路径"
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     if (x + w > fb_w) w = fb_w - x;
@@ -258,6 +270,49 @@ void fb_flip_region(int x, int y, int w, int h) {
 void fb_user_flip64(int x, int y, int w, int h) {
     // 夹取在 fb_blit_region64 里做（负 x/y 夹到 0、w/h 夹到边界），这里只转交。
     fb_blit_region64(x, y, w, h);
+}
+
+// ★ 驱动线 3：显示后端查询 / 打点 / **强制软件路径**提交（三者都不改变默认行为）
+const char* fb_backend_name64() { return vgpu64_backend_name64(); }
+
+// 一行"当前显示后端"（规格要求：启动期打一行 [FB64] backend=...）。几何不在这里重复打
+// （[G64] fb render= / [HWUI] 显示区块都有）—— 少一次内联 dbg64 展开就是几百字节（余量很紧）。
+void fb_backend_log64(const char* backend) {
+    dbg64_line_begin64();
+    dbg64_str("[FB64] backend=");
+    dbg64_str(backend ? backend : "?");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// 强制走软件路径的区域提交：**不看后端**（设备自检要的就是"软件路径的屏幕内容"）。
+void fb_soft_flip_region64(int x, int y, int w, int h) {
+    if (!backbuf || !fb_addr) return;
+    if (g_zoom != 100) { fb_flip_all64(); return; }
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x + w > fb_w) w = fb_w - x;
+    if (y + h > fb_h) h = fb_h - y;
+    if (w <= 0 || h <= 0) return;
+    if (fb_bpp == 32 && fb_pitch == fb_w * 4) {
+        uint32_t* dst = (uint32_t*)(uintptr_t)fb_addr;
+        for (int row = 0; row < h; row++) {
+            uint32_t* d = dst + (y + row) * fb_w + x;
+            uint32_t* s = backbuf + (y + row) * fb_w + x;
+            for (int i = 0; i < w; i++) d[i] = s[i];
+        }
+    } else {
+        for (int yy = y; yy < y + h; yy++) {
+            volatile uint8_t* row = (volatile uint8_t*)(uintptr_t)(fb_addr + (uint32_t)yy * (uint32_t)fb_pitch);
+            for (int xx = x; xx < x + w; xx++) {
+                uint32_t c = backbuf[yy * fb_w + xx];
+                if (fb_bpp == 32)      ((volatile uint32_t*)row)[xx] = c;
+                else if (fb_bpp == 24) { row[xx * 3] = c & 0xFF; row[xx * 3 + 1] = (c >> 8) & 0xFF; row[xx * 3 + 2] = (c >> 16) & 0xFF; }
+                else                   ((volatile uint16_t*)row)[xx] = (uint16_t)(((c >> 16 & 0xF8) << 8) | ((c >> 8 & 0xFC) << 3) | (c >> 3));
+            }
+        }
+    }
+    vgpu64_note_soft_blit64(x, y, w, h);
 }
 
 // ---- 逐像素绘制（全部走后备缓冲；受内核侧绘制开关 + 裁剪矩形约束）----
@@ -456,6 +511,13 @@ void fb_blit_rgba(int x, int y, const uint8_t* rgba, int w, int h) {
             backbuf[yy * g_render_w + xx] = c;
         }
     }
+}
+
+// ★ 驱动线 3：读 LFB 的像素（自检用；只支持 32bpp，别的 bpp 返回 0）。
+uint32_t fb_lfb_pixel64(int x, int y) {
+    if (!fb_addr || x < 0 || y < 0 || x >= fb_w || y >= fb_h) return 0;
+    if (fb_bpp != 32) return 0;
+    return ((volatile uint32_t*)(uintptr_t)fb_addr)[y * (fb_pitch / 4) + x];
 }
 
 uint32_t fb_get_pixel(int x, int y) {

@@ -15,6 +15,8 @@
 //   [LM64] BOOTINFO OK
 //   [LM64] LFB ...             图形模式参数可读
 #include "fb.h"
+// ★ 驱动线 3：virtio-gpu 2D 驱动（显示后端；两份内核都链 —— 安装程序的向导画面也走同一条上屏路径）
+#include "virtio_gpu64.h"
 #include "font.h"
 #include "input.h"
 // ---- 硬件清单 / ACPI 平台表 / VimtuFS2 文件系统：两份内核都链接（只读探测 + 内存假盘自检）----
@@ -1460,6 +1462,17 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     dbg64_dec((uint64_t)fb_phys_width()); dbg64_str("x"); dbg64_dec((uint64_t)fb_phys_height());
     dbg64_str(" zoom="); dbg64_dec((uint64_t)fb_get_zoom());
     dbg64_nl();
+    // ★ 驱动线 3：virtio-gpu（2D）显示后端 —— 把"整屏/区域 blit"从 CPU 逐像素搬到设备。
+    //   位置讲究：**必须在 fb_init 之后**（要 LFB/后备缓冲的几何与物理页），且在 font_init/桌面之前
+    //   （自检的三段要在屏幕上还没有别的内容时抓帧）。没有 virtio-gpu 时 init 只打一行
+    //   "[VGPU] not found"、selftest 打一行 skipped、bench 直接返回 —— 软件路径一个字节都不变。
+    //   有设备时：init 建 resource + 绑后备缓冲物理页（先不设 scanout），selftest 三段
+    //   （软件路径截图 / 设 scanout + 同一图案走设备 / 只改请求区域）各保持 2.5s 供验收抓帧，
+    //   （软件路径截图 / 设 scanout + 同一图案走设备 / 只改请求区域）各保持 2.5s 供验收抓帧，
+    //   随后 bench 打设备 vs 软件的 rdtsc 中位数（见 [VGPU] bench 行）。
+    vgpu64_init64();
+    (void)vgpu64_selftest64();
+    (void)vgpu64_bench64();
 
     font_init();
     dbg64_str("[G64] font faces=");

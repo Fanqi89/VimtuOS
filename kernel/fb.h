@@ -34,7 +34,20 @@ void fb_reset_clip();
 void fb_get_clip64(int* x, int* y, int* w, int* h);   // 读当前裁剪矩形（gfx64 的图元必须遵守它）
 uint32_t* fb_surface64(int* w, int* h);               // 后备缓冲基址（32bpp，stride = fb_width()）
 uint32_t fb_get_pixel(int x, int y);
+// ★ 驱动线 3：直接读 **LFB**（物理显存）里的像素 —— 软件路径的产物在这里，设备路径的产物在
+//   resource 里。自检里的"设备 vs 软件逐字节等价"拿这一份和 TRANSFER_FROM_HOST_2D 回读的那份比。
+uint32_t fb_lfb_pixel64(int x, int y);
 
+// ==================== ★ 驱动线 3：显示后端选择（virtio-gpu 2D 设备路径 vs 软件 LFB 路径）====================
+// 语义：**没有 virtio-gpu（或初始化失败/运行期降级）时，下面这些全是空操作**，
+//   所有上屏仍原样走既有软件路径（CPU 逐行写 LFB）—— 行为与改动前完全一致。
+// 后端名的唯一真源在 kernel/virtio_gpu64.cpp（"virtio-gpu-2d" / "soft-lfb"）。
+const char* fb_backend_name64();
+// 打一行 "[FB64] backend=<...>"（virtio_gpu64 在初始化完成/降级时调用；启动期一次）
+void fb_backend_log64(const char* backend);
+// **强制**软件路径的区域提交（不受后端选择影响）：
+//   设备自检的第一段要用它做出"软件路径"的屏幕内容（那段里 scanout 还没设，屏幕上就是 LFB）。
+void fb_soft_flip_region64(int x, int y, int w, int h);
 // ==================== A1：用户态绘图（映射显存 + 提交区域）====================
 // 目标：**ring3 程序自己把画面画到屏幕上**，内核只做两件事：把后备缓冲映射进用户地址空间、
 // 把用户画好的区域提交到 LFB（见 kernel/syscall64.cpp 的 fb_map(9) / fb_flip(10) / fb_present(11)）。
