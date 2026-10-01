@@ -157,6 +157,15 @@ int  proc64_cwd64(char*, uint32_t)                        __attribute__((weak));
 int64_t proc64_shm_create64(uint64_t)                             __attribute__((weak));
 int64_t proc64_shm_map64(uint64_t, uint64_t, uint64_t, uint64_t)  __attribute__((weak));
 int  proc64_chdir64(const char*)                          __attribute__((weak));
+// ★ A5：Wayland 基础骨架（kernel/wl64.cpp；安装内核不链它 -> 0 -> 号 15..21 返回 -1 并打
+//   [SYSCALL] deny，绝不假装成功）。这些落点内部会用到 proc64/shm 与 fb，只有系统内核才有全套。
+int64_t wl64_surface_create64(uint64_t, uint64_t, uint64_t)       __attribute__((weak));
+int64_t wl64_surface_attach64(uint64_t, uint64_t, uint64_t)       __attribute__((weak));
+int64_t wl64_surface_damage64(uint64_t, uint64_t, uint64_t)       __attribute__((weak));
+int64_t wl64_surface_commit64(uint64_t)                           __attribute__((weak));
+int64_t wl64_surface_destroy64(uint64_t)                          __attribute__((weak));
+int64_t wl64_seat_get64()                                        __attribute__((weak));
+int64_t wl64_display_dispatch64(uint64_t, uint64_t, uint64_t)     __attribute__((weak));
 // ★ A4-5：信号投递（kernel/sig64.cpp）**两份内核都链**它，所以这里是强引用（不是弱引用）；
 //   它内部对 proc64 的访问才是弱引用（安装内核没有进程表 -> 只做参数校验，如实不投递）。
 static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
@@ -1745,6 +1754,50 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
         if (!proc64_shm_map64) syscall64_deny64(nr, r->r10);
         break;
 
+    // ★ A5：Wayland 基础骨架（自有 ABI 15..21）。语义/结构/错误码：kernel/wl64.h。
+    //   号位对应（rdi/rsi/rdx/r10 = 参数 1..4）：
+    //     15 wl_surface_create(w, h, format)
+    //     16 wl_surface_attach(surf, shm_id, offset)
+    //     17 wl_surface_damage(surf, x|y<<32, w|h<<32)     ← 5 个分量打包进 2 个寄存器（见 wl64.h）
+    //     18 wl_surface_commit(surf)
+    //     19 wl_surface_destroy(surf)
+    //     20 wl_seat_get()
+    //     21 wl_display_dispatch(timeout_ms, out, max)
+    //   安装介质内核不链 wl64.cpp -> weak 为 0 -> 返回 -1 并打 [SYSCALL] deny（**不假装成功**）。
+    case 15:                                                    // wl_surface_create(w, h, format)
+        ret = wl64_surface_create64 ? wl64_surface_create64(a1, a2, a3) : -1;
+        if (!wl64_surface_create64) syscall64_deny64(nr, a1);
+        break;
+
+    case 16:                                                    // wl_surface_attach(surf, shm_id, offset)
+        ret = wl64_surface_attach64 ? wl64_surface_attach64(a1, a2, a3) : -1;
+        if (!wl64_surface_attach64) syscall64_deny64(nr, a1);
+        break;
+
+    case 17:                                                    // wl_surface_damage(surf, xy, wh)
+        ret = wl64_surface_damage64 ? wl64_surface_damage64(a1, a2, a3) : -1;
+        if (!wl64_surface_damage64) syscall64_deny64(nr, a1);
+        break;
+
+    case 18:                                                    // wl_surface_commit(surf)
+        ret = wl64_surface_commit64 ? wl64_surface_commit64(a1) : -1;
+        if (!wl64_surface_commit64) syscall64_deny64(nr, a1);
+        break;
+
+    case 19:                                                    // wl_surface_destroy(surf)
+        ret = wl64_surface_destroy64 ? wl64_surface_destroy64(a1) : -1;
+        if (!wl64_surface_destroy64) syscall64_deny64(nr, a1);
+        break;
+
+    case 20:                                                    // wl_seat_get()
+        ret = wl64_seat_get64 ? wl64_seat_get64() : -1;
+        if (!wl64_seat_get64) syscall64_deny64(nr, 0);
+        break;
+
+    case 21:                                                    // wl_display_dispatch(timeout_ms, out, max)
+        ret = wl64_display_dispatch64 ? wl64_display_dispatch64(a1, a2, a3) : -1;
+        if (!wl64_display_dispatch64) syscall64_deny64(nr, a2);
+        break;
 
     default:
         ret = -1;

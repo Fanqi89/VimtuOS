@@ -118,7 +118,10 @@ SRCS_DESKTOP="$SRCS_DESKTOP kernel/desktopops64.cpp"
 #   update64   = 标记文件 -> 应用动作 -> store/ring log/自动重启（不是真"升级包"，见 update64.h）
 SRCS_SYS="kernel/sysstate64.cpp kernel/config64.cpp kernel/session64.cpp kernel/panic64.cpp kernel/preload64.cpp kernel/update64.cpp"
 # ★ 批次 C：kernel/proc64.cpp（进程/地址空间）只进系统内核 —— 它依赖 task64/elf64/vfs64。
-SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/proc64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp kernel/xhci64.cpp kernel/hda64.cpp"
+SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/proc64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp kernel/xhci64.cpp kernel/hda64.cpp kernel/wl64.cpp"
+# ★ A5：kernel/wl64.cpp（Wayland 基础骨架：surface/commit/seat + 最小合成器）**只进系统内核** ——
+#   它要用 proc64 的 shm 对象表（读共享缓冲的物理页）与 fb 的提交路径；安装介质内核不链它，
+#   syscall64.cpp 对 15..21 号用弱引用（那里返回 -1 并打 [SYSCALL] deny，不假装成功）。
 # ★ A4-5：kernel/sig64.cpp（信号投递）在 **SRCS_CORE** 里加（见上面那行）—— 两份内核都要链它：
 #   syscall64.cpp 的 13/14/15 号是**强引用**它（安装介质内核没有进程表，sig64 内部对 proc64 的访问
 #   全部是弱引用 + 判空 -> 那时它只做参数校验，如实不投递，绝不假装成功）。
@@ -521,6 +524,72 @@ PYEVSHM
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/evshm.elf" "$BUILD/evshm_elf.o"
 cp "$BUILD/evshm_elf.o" "$BUILD/os/"
 echo "    内嵌 /evshm.elf = $(stat -c%s "$BUILD/evshm.elf") B（静态 ELF64，装载区 4GiB；proc64.cpp 幂等装进系统卷）"
+
+echo "==> ★ A5：/wlclient.elf（Wayland 基础骨架的 ring3 客户端；只嵌**系统内核**）"
+# user/apps/wlclient.c 用自研 user/lib 编成**静态 ELF64**（链接脚本复用 user/apps/evshm_demo.ld：
+# 4GiB 基址 + .text.start + .l* 段；无 PT_INTERP/PT_DYNAMIC/重定位），
+# kernel/wl64.cpp 启动期幂等把它装进 VimtuFS2 的 /wlclient.elf，再以**真进程**跑起来。
+# 源文件清单**不复制** EVSHM 那一份（只加 Wayland 包装 user/lib/wl.c）：多编出来的目标文件
+# 不会进别人的链接行，也就不会挪动 evshm/sig64 的字节。
+# 入口用 user/lib/crt0.S（argc=1、argv[0]="user64"）：本程序**不靠 argv**，full/short 模式由
+# /etc/wl64_probe 探针决定（内核与客户端各自判一次同一个文件，见 kernel/wl64.h 与 wlclient.c）。
+WL_DIR="$BUILD/uapps/wlclient"
+mkdir -p "$WL_DIR"
+WL_OBJS=""
+for src in syscall.c string.c stdlib.c stdio.c wl.c; do
+    clang $EVSHM_UCFLAGS -c "user/lib/$src" -o "$WL_DIR/lib_${src%.c}.o"
+    WL_OBJS="$WL_OBJS $WL_DIR/lib_${src%.c}.o"
+done
+for src in crt0.S syscall.S; do
+    clang $EVSHM_ASFLAGS -c "user/lib/$src" -o "$WL_DIR/lib_${src%.S}_asm.o"
+    WL_OBJS="$WL_OBJS $WL_DIR/lib_${src%.S}_asm.o"
+done
+clang $EVSHM_UCFLAGS -c user/apps/wlclient.c -o "$WL_DIR/wlclient.o"
+$LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/apps/evshm_demo.ld \
+    -o "$BUILD/wlclient.elf" $WL_OBJS "$WL_DIR/wlclient.o"
+# 自检（纯 Python 解析 ELF 头/程序头，判据与 evshm.elf 完全相同：PT_LOAD 落在装载区、无
+# PT_INTERP/PT_DYNAMIC、程序头表在首个 PT_LOAD 内、入口在某个段里）—— kernel/elf64.cpp 的硬门槛。
+$PY - "$BUILD/wlclient.elf" <<'PYWL'
+import struct, sys
+path = sys.argv[1]
+d = open(path, "rb").read()
+assert d[:4] == b"\x7fELF" and d[4] == 2 and d[5] == 1, "不是 ELF64 小端"
+etype, machine = struct.unpack_from("<HH", d, 16)
+assert etype == 2 and machine == 0x3E, "必须是 ET_EXEC / x86_64"
+entry = struct.unpack_from("<Q", d, 24)[0]
+phoff = struct.unpack_from("<Q", d, 32)[0]
+phentsize, phnum = struct.unpack_from("<H", d, 54)[0], struct.unpack_from("<H", d, 56)[0]
+assert phentsize == 56 and 0 < phnum <= 16, "程序头表不合法"
+LO, HI = 0x100000000, 0x100000000 + 0x10000
+segs, nload, first_off, first_filesz = [], 0, None, None
+for i in range(phnum):
+    p = phoff + i * phentsize
+    ptype = struct.unpack_from("<I", d, p)[0]
+    poff, pva, _ppa, pfsz, pmsz, _al = struct.unpack_from("<QQQQQQ", d, p + 8)
+    if ptype == 3:
+        raise SystemExit("ERROR: 出现 PT_INTERP（内核只做静态装载）")
+    if ptype == 2:
+        raise SystemExit("ERROR: 出现 PT_DYNAMIC（静态链接不该有）")
+    if ptype != 1:
+        continue
+    nload += 1
+    if first_off is None:
+        first_off, first_filesz = poff, pfsz
+    assert pmsz >= pfsz and poff + pfsz <= len(d), "段文件范围越界"
+    assert pva >= LO and pva + pmsz <= HI, "PT_LOAD 越出装载区（va=0x%x memsz=0x%x）" % (pva, pmsz)
+    assert (pva + pmsz + 0xFFF) & ~0xFFF <= HI, "PT_LOAD 页对齐后压到用户栈区"
+    segs.append((pva, pmsz))
+assert nload and any(va <= entry < va + msz for va, msz in segs), "入口不在任何 PT_LOAD 内"
+assert first_off == 0 and phoff + phnum * phentsize <= first_filesz, "程序头表不在首个 PT_LOAD 内"
+assert len(d) <= 96 * 1024, "文件超过内核读盘缓冲 96 KiB"
+print("    wlclient.elf 自检 OK：entry=0x%x phnum=%d segs=%d size=%d B" % (entry, phnum, nload, len(d)))
+PYWL
+# ★ 体积纪律（与 shell/tcc/lua/gzip/edit 同一条）：/wlclient.elf **不内嵌进内核** —— 它是
+#   "系统卷里的文件"，由验收夹具写进卷（tests/wl64_test.py 的夹具盘）；内核只在卷里按路径找它，
+#   找不到就如实打一行 [WL64] demo skipped (no elf on vfs)。理由：system.img 的内核余量只剩
+#   ~700 KB 的硬线（tests/a42a64_test.py 断言），而这个 blob 值 ~18 KB；更重要的是这本来就是
+#   本项目对"可交付程序"的一贯交付方式（内核里搜不到它的字节 —— 见下面那条断言）。
+echo "    /wlclient.elf = $(stat -c%s "$BUILD/wlclient.elf") B（**不内嵌**：由夹具写进系统卷 /wlclient.elf）"
 echo "==> ★ A4-5：信号投递演示程序（user/apps/sig64_demo.c -> build64/sig64.elf -> **内嵌系统内核**）"
 # 交付方式与 /evshm.elf 完全同构（复用同一批 user/lib 目标文件 EVSHM_OBJS，只是多编一个 .c）：
 # 静态 ELF64（链接脚本 user/apps/evshm_demo.ld）-> objcopy 平铺字节嵌进**系统内核** ->
@@ -614,6 +683,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/theme64.o "$BUILD/os"/gfx64.o "$BUILD/os"/img64.o \
     "$BUILD/os"/locklogin64.o "$BUILD/os"/userdb64.o \
     "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o "$BUILD/os"/evshm_elf.o "$BUILD/os"/sig64_elf.o \
+    "$BUILD/os"/wl64.o \
     "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o \
     "$BUILD/os"/icons64.o \
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
@@ -672,6 +742,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
         "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/cr3exp/proc64.o" \
         "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o "$BUILD/os"/evshm_elf.o "$BUILD/os"/sig64_elf.o \
+        "$BUILD/os"/wl64.o \
         "$BUILD/os"/musl_hello_elf.o \
         "$BUILD/os"/ldvimtu_so.o "$BUILD/os"/libfoo_so.o "$BUILD/os"/dynhello_elf.o "$BUILD/os"/xmmsse_elf.o \
         "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/hda64.o \
@@ -870,6 +941,20 @@ if len(probe) < 64 or probe in k:
     raise SystemExit(1)
 print("    断言 OK：系统内核 %d B 里搜不到 /bin/edit 的 64B 探针（偏移 %d）；编辑器只从系统卷装载" % (len(k), mid))
 PYEOF4
+
+# ★ A5 的同一条纪律：**内核二进制里不能出现 /wlclient.elf 的字节**（它只从系统卷装载）。
+#   探针取 build64/wlclient.elf 中段的 64 字节（ELF 头/入口附近的字节模式到处都是，中段最稳）。
+"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/wlclient.elf" <<'PYEOF5'
+import sys
+k = open(sys.argv[1], "rb").read()
+w = open(sys.argv[2], "rb").read()
+mid = len(w) // 2
+probe = w[mid:mid + 64]
+if len(probe) < 64 or probe in k:
+    sys.stderr.write("ERROR: system kernel contains /wlclient.elf bytes (delivery must be a volume file)\n")
+    raise SystemExit(1)
+print("    断言 OK：系统内核 %d B 里搜不到 /wlclient.elf 的 64B 探针（偏移 %d）；客户端只从系统卷装载" % (len(k), mid))
+PYEOF5
 
 echo "==> ★ A4-2a：ring3 系统调用探针（chdir/rename/rmdir/dup2/utime + execve 失败路径的真证据）"
 # 为什么源码由构建脚本生成：本批只允许改 kernel/*、build64.sh、tests/a42a64_test.py、docs —— user/

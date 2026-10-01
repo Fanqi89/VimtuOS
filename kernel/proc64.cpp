@@ -120,6 +120,11 @@ static int32_t  g_next_pid64   = 1;
 // 定义放在 p64_current64 之后（它在下面"进程查找"一节里）。
 static Proc64* p64_current64();
 extern "C" FdTable64* proc64_fdtab_of_current64();
+// ★ A5：Wayland 组合器（kernel/wl64.cpp）的回收钩子。**弱引用**：没有链这个模块的构建
+//   （安装介质内核不链 proc64.cpp，但这条声明也只在 proc64.cpp 里）里它就解析不到 —— 判空跳过，
+//   与 ev64_proc_release64 同一条纪律。为什么不在 proc64.h 里声明：头文件被多个 TU 包含，
+//   弱属性一旦与 wl64.h 的强声明在同一个 TU 里重复，编译期会为属性不一致告警（本文件要求零告警）。
+extern "C" void wl64_proc_release64(int pid) __attribute__((weak));
 // 引导期状态（proc64_init64 探测一次）
 static uint64_t g_boot_cr364   = 0;      // 内核地址空间（引导期页表根）
 static void p64_publish_cred64(Proc64* p);           // ★ P4：凭证发布（定义在 create 之后）
@@ -324,6 +329,32 @@ int proc64_shm_held64() {
     int n = 0;
     for (uint32_t i = 0; i < SHM64_HANDLES64; i++) if (p->shm[i]) n++;
     return n;
+}
+
+// ==================== ★ A5：给 Wayland 组合器（kernel/wl64.cpp）的 shm 原语 ====================
+// 见 proc64.h 的说明：只读视图 + 引用计数加减 + 句柄准入校验。这里不新增任何状态，
+// 全部走既有的 shm64_find64/shm64_hold64/shm64_release64/shm64_handle_has64。
+int proc64_shm_view64(uint32_t id, uint64_t* out_frames, uint32_t max_frames, uint32_t* out_pages, uint32_t* out_refs) {
+    Shm64Obj* o = shm64_find64(id);
+    if (!o) return -1;
+    if (out_pages) *out_pages = o->pages;
+    if (out_refs)  *out_refs  = o->refs;
+    if (out_frames) {
+        for (uint32_t i = 0; i < max_frames; i++) out_frames[i] = (i < o->pages) ? o->frames[i] : 0;
+    }
+    return 0;
+}
+int proc64_shm_hold_id64(uint32_t id) {
+    return shm64_hold64(id);            // 0 = 成功；-1 = 没有这个对象
+}
+int proc64_shm_release_id64(int32_t id, int pid) {
+    return shm64_release64(id, pid);    // 1 = 已回收 / 0 = 还有引用 / -1 = 没有这个对象
+}
+
+int proc64_shm_has_handle_id64(int32_t id) {
+    Proc64* p = p64_current64();
+    if (!p || id <= 0) return 0;
+    return shm64_handle_has64(p, id) ? 1 : 0;
 }
 
 int64_t proc64_shm_create64(uint64_t size) {
@@ -896,6 +927,8 @@ void proc64_destroy64(int pid) {
     //   shm[] 已置 0；对\"没走过 exit 就被销毁\"的进程是真正的回收）。
     shm64_drop_all64(p);
     ev64_proc_release64((int)p->pid);
+    // ★ A5：Wayland 组合器的 surface/引用回收（弱引用：没有这个模块时按 nullptr 跳过）
+    if (wl64_proc_release64) wl64_proc_release64((int)p->pid);
     if (p->pdpt_phys || p->pml4_phys) {
         p64_release_area64(p);
         if (p->pdpt_phys) page_free_64((void*)(uintptr_t)p->pdpt_phys);
@@ -940,6 +973,8 @@ static void p64_exit64(Proc64* p, uint32_t code, uint32_t sig) {
     //   否则焦点会停在一个已经死掉的 pid 上，后面的进程再也收不到键盘。
     shm64_drop_all64(p);
     ev64_proc_release64((int)p->pid);
+    // ★ A5：Wayland 组合器的 surface/引用回收（与上面同一条：弱引用 + 判空）
+    if (wl64_proc_release64) wl64_proc_release64((int)p->pid);
     ev64_reset64(&p->evq);
     p->cr3       = 0;
     p->exit_code = code & 0xFFu;

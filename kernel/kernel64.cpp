@@ -45,7 +45,8 @@
 #include "elf64.h"      // ELF64 加载器（自有静态 ELF64 程序 + syscall 指令路径；只进系统内核）
 #include "net64.h"      // 网络：e1000 驱动 + ARP/ICMP（只进系统内核；启动链里跑一次探测）
 #include "proc64.h"      // 进程/地址空间（批次 C：每进程 CR3 + fork/execve/wait4；只进系统内核）
-#include "sig64.h"       // ★ A4-5：信号投递（selftest / tty-int 自检 / 进程信号状态查询）
+// ★ A5：Wayland 基础骨架（surface/buffer/commit/seat + 最小合成器；只进系统内核，见 wl64.h）
+#include "wl64.h"
 #include "usb64.h"      // USB 主机：UHCI + HID 引导键盘（只进系统内核；按键注入 PS/2 同一队列）
 #include "xhci64.h"     // ★ xHCI（USB 3.x）+ HID 键盘 + USB 存储（只进系统内核，同 usb64）
 #include "apic64.h"    // LAPIC + IOAPIC 接管中断路由（只进系统内核；拿不到就留在 PIC）
@@ -1145,6 +1146,15 @@ static void rust64_boot_init64() {
                 //     才会跑；缺 /bin/edit 或 /etc/edit64_test.txt 就只打一行 skipped。
                 sig64_demo64("/sig64.elf");
                 edit64_demo64("/bin/edit");
+                // ---- ★ A5：Wayland 基础骨架（surface/buffer/commit/seat + 最小合成器）----
+                //   kernel/wl64.cpp 幂等把内嵌的 /wlclient.elf 装进系统卷，再以**真进程**跑它；
+                //   客户端在用户态画进共享缓冲 -> wl_surface_commit -> 内核合成器把它画进后备缓冲
+                //   并用 fb_user_flip64 上屏（可见区域 = 屏幕中央的一块面板）。
+                //   位置：整段 ring3 演示的最后（多建/多收一个进程的场景排最后最不容易搅动前面那些
+                //   脚本的断言）。两种模式见 wl64.h：卷里有 /etc/wl64_probe = 完整演示（验收脚本的
+                //   夹具会写它，含 seat 监听），没有 = 短模式（2 帧，~1 s，别的脚本几乎不受影响）。
+                (void)wl64_demo64("/wlclient.elf");
+
             } else {
                 proc64_init64();                                 // 仍然打点：mode=shared（如实）
                 (void)proc64_demo64("/proc64.elf");              // 只打一行 "demo skipped (shared address space mode)"

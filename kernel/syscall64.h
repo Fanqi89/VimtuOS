@@ -54,6 +54,25 @@
 //                                        -3 EINVAL（越界/非对齐/len=0）、-4 ENOMEM（映射窗满/页表页不足）。
 //                                        句柄 fork 继承、execve 默认关闭、退出引用 -1 并在归零时回收页帧。
 //
+//   ==================== ★ A5：Wayland 基础骨架（surface / buffer / commit / seat = 号 15..21）====================
+//   目标：把"客户端在用户态画进共享缓冲 -> 提交 -> 合成器显示"这条最小闭环按 Wayland 术语立起来
+//   （接口/语义/错码/打点格式的唯一定义点 = kernel/wl64.h，实现 = kernel/wl64.cpp）。
+//   15 wl_surface_create(w, h, format)          -> surface id (>=1)；fmt=0(XRGB8888)、单面 <= 16384 px
+//   16 wl_surface_attach(surf, shm_id, offset)  -> 0；缓冲 = 一个 shm 对象 + 4 字节对齐的 offset
+//   17 wl_surface_damage(surf, xy, wh)          -> 0；★ rsi=(x|y<<32)、rdx=(w|h<<32)（5 分量打包）
+//   18 wl_surface_commit(surf)                  -> 0；**入提交队列**（异步：dispatch 里合成上屏）
+//   19 wl_surface_destroy(surf)                 -> 0；归还 attach 的 shm 引用
+//   20 wl_seat_get()                            -> seat id (1)；申请键盘焦点 + 指针捕获（复用 12 的 flags）
+//   21 wl_display_dispatch(timeout_ms, out, max)-> 本次投递的 seat 事件条数；同一轮里合成提交队列
+//       out = Wl64SeatEvent 数组（64B/条 = input_poll 的 40B 事件 + seat/surf/sx/sy/inside），max <= 32。
+//   错误码：-1 EPERM（没有进程上下文 / surface 不属于本进程）、-2 EFAULT（out 指针）、
+//           -3 ENOENT（没有这个 surface/shm 对象/句柄）、-4 EINVAL（尺寸/格式/offset/越界/max）、
+//           -5 ENODEV（没有可用的显示/面板放不下）、-6 ENOSPC（surface 表满/引用计数）。
+//   ★ 安装介质内核不链 kernel/wl64.cpp -> 这 7 号的弱引用为 0 -> 返回 -1 并打 [SYSCALL] deny
+//     （**不假装成功**；它们不是 enosys 号，所以不会污染"不得出现 enosys"那些断言）。
+//   打点：[WL64] init / surface create / attach / commit / blit / composite / seat event /
+//         surface destroy / release / selftest / demo —— 见 kernel/wl64.h 的清单。
+//
 //   错误码（负数，两个入口的 errno 风格一致，**不与 Linux 号段共用号**）：
 //     -1 = EPERM  用户窗口/页表不可用（UEFI 固件只读页表，见 kernel/usermode64.cpp）
 //     -2 = EFAULT 用户指针非法（没通过 user64_range_ok64）

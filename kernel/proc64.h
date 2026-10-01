@@ -260,6 +260,19 @@ int64_t proc64_shm_create64(uint64_t size);
 // *out_va 写回用户态基址；返回 0 = 成功，负数 = 错误码。offset 必须 4KiB 对齐。
 // 打点：`[SHM64] map pid=.. id=.. va=0x.. off=.. len=.. pages=.. refs=.. u=1 slot=..`
 int64_t proc64_shm_map64(uint64_t id, uint64_t offset, uint64_t len, uint64_t out_va_uptr);
+// ==================== ★ A5：给 Wayland 组合器（kernel/wl64.cpp）的三个 shm 原语 ====================
+// 组合器要读客户端共享缓冲里的**像素**，还要按"持有/归还一个引用"表达缓冲生命周期（wl64.h 语义 3）。
+// 这三个原语就是那条边界：对象表本体仍然只在这里（wl64 拿不到内部指针，只看只读视图）。
+//   * view：0 = 成功（*out_pages/*out_refs 已填，frames 拷进调用方数组，最多 max_frames 个）；
+//           -1 = 没有这个对象（不区分"已回收"与"从未存在"）。
+//   * hold：引用 +1（等价于"组合器把这个缓冲留在手里"），0 = 成功；-1 = 没有这个对象。
+//   * release：引用 -1，口径与 shm64_release64 完全一致（1 = 已回收并还页 / 0 = 还有引用 / -1 = 没有）。
+//     pid 只是打点用：**传 0 = 组合器持有的那份引用**（组合器的打点因此读作 pid=0）。
+//   * has_handle：调用进程是否持有该对象的**句柄**（attach 的准入校验：客户端必须先 shm_create）。
+int proc64_shm_view64(uint32_t id, uint64_t* out_frames, uint32_t max_frames, uint32_t* out_pages, uint32_t* out_refs);
+int proc64_shm_hold_id64(uint32_t id);
+int proc64_shm_release_id64(int32_t id, int pid);
+int proc64_shm_has_handle_id64(int32_t id);
 // 当前进程持有句柄的对象数（任务管理器/自检用；不动状态）
 int     proc64_shm_held64();
 
