@@ -84,7 +84,12 @@ CXXFLAGS_INSTALLER="$CXXFLAGS -DVIMTU_INSTALLER_MEDIA=1 -DVIMTU_PAYLOAD_LBA=$PAY
 #     （屏幕硬件检查报告）也进 CORE —— 两份内核都要：安装程序要能看见 SATA/NVMe 盘，
 #     系统内核的 VFS/store 也要能（驱动器号 8.. / 16.. 分派），
 #     而硬件检查报告在安装介质与装好的系统里都是"没有串口时唯一的诊断画面"。
-SRCS_CORE="kernel/kernel64.cpp kernel/console64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp kernel/input.cpp kernel/input64.cpp kernel/mem64.cpp kernel/hwinfo64.cpp kernel/acpi64.cpp kernel/edid64.cpp kernel/display64.cpp kernel/fd64.cpp kernel/usermode64.cpp kernel/syscall64.cpp kernel/ahci64.cpp kernel/nvme64.cpp kernel/hwui64.cpp kernel/drive64.cpp kernel/fat64.cpp kernel/fs64.cpp kernel/sig64.cpp"
+SRCS_CORE="kernel/kernel64.cpp kernel/console64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp kernel/input.cpp kernel/input64.cpp kernel/mem64.cpp kernel/hwinfo64.cpp kernel/acpi64.cpp kernel/edid64.cpp kernel/display64.cpp kernel/fd64.cpp kernel/usermode64.cpp kernel/syscall64.cpp kernel/ahci64.cpp kernel/nvme64.cpp kernel/hwui64.cpp kernel/drive64.cpp kernel/fat64.cpp kernel/fs64.cpp kernel/sig64.cpp kernel/virtio_gpu64.cpp"
+#
+#  ★ 驱动线 3：kernel/virtio_gpu64.cpp（现代 virtio-gpu 2D：resource/scanout/TRANSFER_TO_HOST_2D）
+#    进 CORE：**两份内核都要**（kernel/fb.cpp 的"上屏后端选择"引用它 —— 系统内核的桌面与
+#    安装介质的向导画面都走同一条 fb 提交路径；没有 virtio-gpu 设备时它只打一行 not found，
+#    软件 LFB 路径的行为**完全不变**）。
 #  ★ 批次 N：console64.cpp = 开机滚屏引导控制台（启动日志环形缓冲 + 回放 + dmesg）。
 #    进 CORE：安装介质与系统**两份内核都要**屏上跑一遍启动日志（安装介质走向导前、系统走桌面前）。
 SRCS_INSTALLER="$SRCS_CORE kernel/part64.cpp kernel/setup64.cpp kernel/vfs64.cpp"
@@ -667,6 +672,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
     "$BUILD"/bootx64_efi.o "$BUILD"/uefi64_bin.o \
     "$BUILD"/hwinfo64.o "$BUILD"/acpi64.o "$BUILD"/edid64.o "$BUILD"/vfs64.o "$BUILD"/fd64.o "$BUILD"/usermode64.o "$BUILD"/syscall64.o "$BUILD"/sig64.o \
     "$BUILD"/ahci64.o "$BUILD"/nvme64.o "$BUILD"/hwui64.o \
+    "$BUILD"/virtio_gpu64.o \
     "$BUILD"/display64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o \
     "$BUILD"/user_demo64.o "$BUILD"/user_fbdemo64.o "$BUILD"/font_*_z.o "$BUILD"/icon_start_mini.o
@@ -677,6 +683,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
     "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o \
     "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
+    "$BUILD/os"/virtio_gpu64.o \
     "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
     "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o "$BUILD/os"/explorer64.o \
     "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
@@ -731,6 +738,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
         "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o \
         "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
+        "$BUILD/os"/virtio_gpu64.o \
         "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
         "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o "$BUILD/os"/explorer64.o \
         "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
@@ -822,6 +830,40 @@ bash user/apps/edit/build_edit.sh "$BUILD"
 #   脚本用 tcc_pack_win.verify 把 5 个文件逐字节回读比对（直接块 / ind / dind 三级）。
 "$PY" tools/assets_pack_win.py --vol-in "$BUILD/editvol.img" --vol-out "$BUILD/assetsvol.img" \
       --res build --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+
+# ★ B5（本批）：**GNU make 与 tar**（交付 = 系统卷里的文件，内核里一个字节都不加）。
+#   为什么这样交付（内核区只剩 ~700 KB）：make 是 300 KB 量级的构建工具，装不进 64 KiB 的
+#   主程序装载窗口 —— 与 /bin/tcc、/bin/lua 同构：一个 < 64 KiB 的驱动 /bin/make
+#   （user/make/makedrv.c）mmap 到 4GiB+0x90000、把 /lib/make.bin 的段搬进去再 jmp。
+#   tar 只有 53 KB，直接当主程序装（不引驱动）。
+#   容器里同时补一份 **/bin/sh**（= shell.bin 的字节）：GNU make 的 recipe 就是 `/bin/sh -c '<recipe>'`，
+#   而本批刚给 ring3 shell 加了 `-c` 与 make 需要的语义子集（见 user/shell/main.c 的 B5 段）。
+echo "==> ★ B5：GNU make（/bin/make + /lib/make.bin + /bin/sh）与 tar（/bin/tar）→ 系统卷"
+bash tools/make_build_win.sh "$BUILD"
+bash tools/tar_build_win.sh "$BUILD"
+"$PY" tools/make_pack_win.py --vol-in "$BUILD/assetsvol.img" --vol-out "$BUILD/makevol.img" \
+      --make "$BUILD/make" --bin "$BUILD/make.bin" --shell "$BUILD/shell.bin" \
+      --demo-dir user/make/demo --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+"$PY" tools/tar_pack_win.py --vol-in "$BUILD/makevol.img" --vol-out "$BUILD/tarvol.img" \
+      --tar "$BUILD/tar" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+# 同一条体积纪律：**内核二进制里不能出现 make/tar 的字节**（工具只从系统卷装载）。
+# 探针取每个文件中段的 64 字节（代码/数据混排的中段最稳）。
+"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/make.bin" "$BUILD/make" "$BUILD/tar" "$BUILD/shell.bin" <<'PYEOF5B'
+import sys
+k = open(sys.argv[1], "rb").read()
+bad = 0
+for p in sys.argv[2:]:
+    b = open(p, "rb").read()
+    mid = len(b) // 2
+    probe = b[mid:mid + 64]
+    if len(probe) < 64 or probe in k:
+        sys.stderr.write("ERROR: system kernel contains %s bytes (delivery must be a volume file)\n" % p)
+        bad = 1
+    else:
+        print("    断言 OK：系统内核 %d B 里搜不到 %s 的 64B 探针（偏移 %d）；它只从系统卷装载"
+              % (len(k), p.rsplit("/", 1)[-1], mid))
+raise SystemExit(bad)
+PYEOF5B
 # 断言（两条，都是"资源真的搬走了"的硬证据）：
 #   ① **整份文件**的字节在内核里搜不到（最硬的一条：objcopy 一塞回去就必红）；
 #   ② 再取一个**高熵探针**（扫全图挑"不同字节值最多"的 64B 窗口；纯色/透明区域的中段探针会因为

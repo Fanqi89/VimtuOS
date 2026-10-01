@@ -19,7 +19,11 @@
  * 内置命令：help echo pwd cd ls cat stat mkdir rm run exit（未知命令按外部程序试跑）
  * 重定向  ：> >> <（内置命令；外部命令的 > / < 不做 —— 同一个 dup2 边界）
  * 管道    ：|（内置命令之间；实现 = 上一段的输出捕获进内存缓冲，作为下一段的输入）
- * 不做（如实）：'~' 展开（没有 home 查询的口子）、引号/转义、通配符、后台任务、$?/$变量。
+ * ★ B5：`-c "命令"`（见文件末尾的"B5 段"）——GNU make 的每条 recipe 都是 `/bin/sh -c '<recipe>'`，
+ *   所以本 shell 必须能当这个 sh 用：`;` / `&&` / `||` 串接、`set -e`、`$?`、`NAME=VALUE`
+ *   与 `$X` / `${X}` 展开、`#` 注释、'…' 原样 / "…" 可展开。不做（如实）：命令替换 $(...)/`...`、
+ *   通配符、后台 `&`、算术/条件/循环、**跨进程管道**（管道仍只在内置命令之间成立）。
+ * 不做（如实）：'~' 展开（没有 home 查询的口子）、转义 `\`、通配符、后台任务。
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -51,11 +55,13 @@ static char g_cwd[SH_PATH_MAX] = "/";
 /* 输出汇（一次 run_stage 期间唯一）：
  *   g_cap != 0    -> 捕获进内存（管道的前几段）
  *   g_out_fd >= 0 -> 写这个文件 fd（`>` / `>>`）
+ *   g_nomb != 0   -> ★ B5：没有终端邮箱（`-c` 模式）-> 直接写 fd 1
  *   否则          -> 邮箱（-> 终端窗口 + 串口） */
 static char* g_cap;
 static int   g_cap_len;
 static int   g_cap_ovf;
 static int   g_out_fd = -1;
+static int   g_nomb;                            /* ★ B5：1 = 本进程没有信箱（-c），输出走 fd 1 */
 
 /* 输入汇（`<` 文件 或 上一段捕获；只有 cat 会消费） */
 static const char* g_in;
@@ -158,6 +164,15 @@ static void out_bytes(const char* p, int n) {
         int off = 0;
         while (off < n) {
             const long w = sh_write(g_out_fd, p + off, (unsigned long)(n - off));
+            if (w <= 0) return;                      /* 写失败：停止（不假装写完） */
+            off += (int)w;
+        }
+        return;
+    }
+    if (g_nomb) {                                    /* ★ B5：-c 模式没有邮箱 -> 写 fd 1 */
+        int off = 0;
+        while (off < n) {
+            const long w = sh_write(1, p + off, (unsigned long)(n - off));
             if (w <= 0) return;                      /* 写失败：停止（不假装写完） */
             off += (int)w;
         }
@@ -512,6 +527,22 @@ static int bi_help(int argc, char** argv) {
  * ★ 先 stat 一次再 fork：本内核的 **execve 失败路径有个已知缺陷**（proc64.cpp：装载失败时旧映像
  *   已经被释放、进程却还在 ring3 取指 -> #PF -> PANIC，见报告"A4-1 发现的既有缺陷"）。shell 不碰
  *   内核代码，就用**用户态预检**把它绕开：目标不存在/不是普通文件 -> 只打一行错误，不 fork。 */
+/* ★ B5：裸命令名的 /bin 兜底 —— make 的 recipe 里 `tcc -c x.c`（不带路径）很常见；本内核没有
+ *   PATH 环境变量，这里等价于一个**写死的 PATH=/bin**：只在 cwd 相对路径不存在、且名字里没有
+ *   '/' 时才试 /bin/<name>。绝对路径与相对路径（含 '/'）的行为一个字不变。 */
+static int try_bin_fallback(const char* name, char* path, void* st144) {
+    for (int i = 0; name[i]; i++) if (name[i] == '/') return 0;
+    static const char PFX[] = "/bin/";
+    char alt[SH_PATH_MAX];
+    int n = 0;
+    for (int i = 0; PFX[i] && n < SH_PATH_MAX - 1; i++) alt[n++] = PFX[i];
+    for (int i = 0; name[i] && n < SH_PATH_MAX - 1; i++) alt[n++] = name[i];
+    alt[n] = 0;
+    if (sh_stat(alt, (long*)st144) != 0) return 0;                /* 兜底也不存在：如实失败 */
+    for (int i = 0; i <= n; i++) path[i] = alt[i];
+    return 1;
+}
+
 static int run_external(int argc, char** argv) {
     char path[SH_PATH_MAX];
     if (path_resolve(argv[0], path, (int)sizeof(path)) != 0) {
@@ -520,7 +551,7 @@ static int run_external(int argc, char** argv) {
     }
     struct { long v[18]; } st;
     for (int i = 0; i < 18; i++) st.v[i] = 0;
-    if (sh_stat(path, &st) != 0) {
+    if (sh_stat(path, &st) != 0 && !try_bin_fallback(argv[0], path, &st)) {
         out_str("run: no such program: "); out_str(path); out_str("\n");
         return 1;
     }
@@ -563,7 +594,15 @@ static int run_external(int argc, char** argv) {
      *   （真 shell 也是这个语义：重定向只作用在那个命令的 stdout 上）。 */
     const int saved_out_fd = g_out_fd;
     g_out_fd = -1;
-    const int r = sh_wait4(pid, &st2, 0);
+    /* ★ 实测修：内核的 wait4(61) 对**还在跑**的子进程 5 秒后返回 -EAGAIN(-11)
+     *   （kernel/proc64.cpp 的 PROC64_WAIT_TIMEOUT_SEC）。交互式 `run 慢命令` 时那只是
+     *   "看不到汇总行"（既有边界，验收脚本都按这条口径写的）；但 **make 的 recipe 是
+     *   `/bin/sh -c '<recipe>'`** —— recipe 一慢（tcc 编译 / 链接）这里就返回 2，于是
+     *   `&&` 短路、make 报 `make: *** [Makefile:27: hello] Error 2` 整个构建断掉，
+     *   而那个 tcc 其实**成功退出**了（实测：[PROC64] exit pid=31 code=0 在 sh 退出之后）。
+     *   修法：EAGAIN 不是失败，就是把那个 5 秒窗口**续下去**（上限 240 个窗口 ≈ 20 分钟）。 */
+    int r = sh_wait4(pid, &st2, 0);
+    for (int guard = 0; r == -11 && guard < 240; guard++) r = sh_wait4(pid, &st2, 0);
     if (r < 0) {
         out_str("run: wait4 failed (err="); out_dec(-r); out_str(")\n");
         g_out_fd = saved_out_fd;
@@ -611,15 +650,53 @@ static int call_builtin(int which, int argc, char** argv) {
     }
 }
 
-/* 切一个以空白分隔的 token（原地改 s）；返回 token 起始指针，*pp 指向下一个位置 */
+/* 切一个以空白分隔的 token（原地改 s）；返回 token 起始指针，*pp 指向下一个位置
+ * ★ B5：引号内的空格在展开阶段被写成 SHC_QSP 占位符（见 expand_cmd），这里还原成空格 ——
+ *   于是 `echo "a b"` 是一个 token（内容是 `a b`），而不是两个。 */
+#define SHC_QSP 0x01
+/* ★ B5：交互行（终端里敲的那一行）也支持引号 —— 没有这一条，
+ *   `run /bin/shell.bin -c "echo hi | cat > /tmp/o"` 会被**外层** shell 先按空格/`|`/`>`
+ *   切开（`run` 就把 `echo`、`hi` 当成两个参数、`|` 当成管道、`>` 当成重定向）。
+ *   read_line 之后先跑 quote_fold()：把引号里的整段包进 0x02 … 0x03 标记（空格写成 SHC_QSP），
+ *   于是 exec_line 的 `|` 切分与 run_stage 的 `>`/`<` 识别都**跳过引号组**，tok() 把整组当
+ *   一个 token 交出来。引号里的内容原样（不做转义/嵌套，如实）。 */
+#define SHC_QB 0x02
+#define SHC_QE 0x03
+static void quote_fold(char* line) {
+    int inq = 0;
+    char* w = line;
+    for (char* r = line; *r; r++) {
+        const char c = *r;
+        if (c == '\'' || c == '"') {                     /* 只支持成对同种引号（简单口径） */
+            *w++ = inq ? (char)SHC_QE : (char)SHC_QB;
+            inq = !inq;
+            continue;
+        }
+        if (inq && (c == ' ' || c == '\t')) *w++ = (char)SHC_QSP;
+        else *w++ = c;
+    }
+    if (inq) *w++ = (char)SHC_QE;                          /* 引号没闭合：补上（不报错） */
+    *w = 0;
+}
+
 static char* tok(char** pp) {
     char* s = *pp;
     while (*s == ' ' || *s == '\t') s++;
     if (!*s) { *pp = s; return 0; }
     char* b = s;
+    if (*s == SHC_QB) {                                  /* 引号组：整体一个 token（空格还原） */
+        s++;
+        char* w = b;
+        while (*s && *s != SHC_QE) { *w++ = (*s == SHC_QSP) ? ' ' : *s; s++; }
+        if (*s == SHC_QE) s++;
+        *w = 0;
+        *pp = s;
+        return b;
+    }
     while (*s && *s != ' ' && *s != '\t') s++;
     if (*s) *s++ = 0;
     *pp = s;
+    for (char* t = b; *t; t++) if (*t == SHC_QSP) *t = ' ';
     return b;
 }
 
@@ -648,6 +725,11 @@ static int run_stage(char* stage, const char* in_buf, int in_len, int last) {
     for (;;) {
         char* t = tok(&p);
         if (!t) break;
+        {
+            const int was_quoted = (t[0] == SHC_QB);
+            if (was_quoted) t++;                         /* 引号组里的字符都是字面量 */
+            if (was_quoted) { if (argc < SH_ARGV_MAX) argv[argc++] = t; continue; }
+        }
         if (t[0] == '>' && !out_file) {
             append = (t[1] == '>');
             char* f = (t[1] == '>') ? (t + 2) : (t + 1);
@@ -737,8 +819,11 @@ static int exec_line(char* line) {
     char* stages[SH_STAGES_MAX];
     int nstage = 0;
     stages[nstage++] = line;
+    int inq = 0;
     for (char* p = line; *p; p++) {
-        if (*p == '|') {
+        if (*p == SHC_QB) { inq = 1; continue; }
+        if (*p == SHC_QE) { inq = 0; continue; }
+        if (*p == '|' && !inq) {
             *p = 0;
             if (nstage >= SH_STAGES_MAX) {
                 out_str("sh: too many pipeline stages (max 4)\n");
@@ -792,8 +877,234 @@ static void prompt(void) {
     out_str("$ ");
 }
 
+/* ==================== ★ B5：`-c "命令"` 与 make 需要的 shell 语义子集 ====================
+ * 谁在用：GNU make 的每条 recipe（含 shell 元字符时）都是 `/bin/sh -c '<recipe>'`；本内核没有
+ *   别的 sh，所以 ring3 shell 必须能当这个 sh 用。`-c` 模式下**没有终端邮箱**（进程不是终端
+ *   服务启动的）：输出直接写 fd 1（内核控制台；被 `run … > file` 重定向时就是那个文件），
+ *   也不打 banner/提示符。
+ *
+ * 支持的语法（tests/make64_test.py 逐条断言）：
+ *   `;` 串接、`&&` / `||` 短路、`set -e` / `set +e`、`$?`、`NAME=VALUE` 赋值、
+ *   `$X` / `${X}` 展开（未定义 = 空串，与 sh 一致）、`#` 注释（到行尾）、换行等价 `;`、
+ *   '…' 原样 / "…" 内仍展开、`>` / `>>` / `<` / `|`（沿用本 shell 既有实现）。
+ * 不支持（如实）：命令替换 $(…)/`…`、算术/条件/循环/函数、通配符、后台 `&`、转义 `\`、
+ *   **跨进程管道**（`run a | run b` 仍是既有边界"外部命令不能做管道段"）。
+ * 退出码：最后一条执行的命令的退出码（`set -e` 下 = 第一条失败命令的退出码）。
+ */
+#define SHC_MAX      512        /* -c 脚本文本缓冲（argv 字符串；超出如实截断并告警） */
+#define SH_VAR_MAX   8          /* 变量表（make 的 recipe 一般只用 1~2 个） */
+#define SH_VAR_NAME  12
+#define SH_VAR_VAL   64
+
+static char g_scratch[SHC_MAX];                 /* -c 文本的可写副本 */
+static char g_expand[SHC_MAX];                  /* 变量展开后的文本（交给 run_stage） */
+static struct { char name[SH_VAR_NAME]; char value[SH_VAR_VAL]; } g_vars[SH_VAR_MAX];
+static int  g_var_n;
+static int  g_last_status;                      /* $? */
+static int  g_set_e;                            /* set -e */
+
+static int name_len(const char* s) { int n = 0; while (s[n]) n++; return n; }
+static int is_name_ch(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+static int var_find(const char* name, int nlen) {
+    for (int i = 0; i < g_var_n; i++) {
+        int k = 0;
+        while (k < nlen && g_vars[i].name[k] && g_vars[i].name[k] == name[k]) k++;
+        if (k == nlen && g_vars[i].name[k] == 0) return i;
+    }
+    return -1;
+}
+static void var_set(const char* name, int nlen, const char* val, int vlen) {
+    if (nlen <= 0 || nlen >= SH_VAR_NAME) return;             /* 超长名字：忽略（如实） */
+    int i = var_find(name, nlen);
+    if (i < 0) {
+        if (g_var_n >= SH_VAR_MAX) return;                    /* 表满：忽略（如实） */
+        i = g_var_n++;
+        for (int k = 0; k < nlen; k++) g_vars[i].name[k] = name[k];
+        g_vars[i].name[nlen] = 0;
+    }
+    if (vlen > SH_VAR_VAL - 1) vlen = SH_VAR_VAL - 1;         /* 值截断：不假装完整 */
+    for (int k = 0; k < vlen; k++) g_vars[i].value[k] = val[k];
+    g_vars[i].value[vlen] = 0;
+}
+
+/* 展开一条命令：引号剥离、`$X`/`${X}`/`$?` 展开、引号内的空格写成占位符（tok 还原）。
+ * `#` 在**词首**时 = 注释（到命令结尾；POSIX 语义，make 的 recipe 里有 `# comment` 的写法）。
+ * 返回 0 = 成功；-1 = 文本被截断（已尽量拷进去，调用方负责告警）。 */
+static int expand_cmd(const char* src, char* dst, int cap) {
+    int o = 0, quote = 0, trunc = 0;                          /* quote: 0 无 / 1 " / 2 ' */
+    int word_start = 1;
+    for (int i = 0; src[i]; ) {
+        char c = src[i];
+        if (c == '#' && quote == 0 && word_start) break;      /* 注释：余下整段丢掉 */
+        if (c == ' ' || c == '\t') word_start = 1; else word_start = 0;
+        if (c == '\'') { quote = (quote == 2) ? 0 : (quote == 0 ? 2 : quote); i++; continue; }
+        if (c == '"')  { quote = (quote == 1) ? 0 : (quote == 0 ? 1 : quote); i++; continue; }
+        if (c == '$' && quote != 2) {
+            char nb[SH_VAR_NAME];
+            int nl = 0;
+            i++;
+            if (src[i] == '{') {
+                i++;
+                while (src[i] && src[i] != '}' && nl < SH_VAR_NAME - 1) nb[nl++] = src[i++];
+                if (src[i] == '}') i++;
+            } else if (src[i] == '?') {
+                nb[nl++] = '?'; i++;
+            } else {
+                while (src[i] && is_name_ch(src[i]) && nl < SH_VAR_NAME - 1) nb[nl++] = src[i++];
+            }
+            nb[nl] = 0;
+            if (nl == 0) {                                    /* 裸 '$'：原样 */
+                if (o < cap - 1) dst[o++] = '$'; else trunc = 1;
+                continue;
+            }
+            char vb[SH_VAR_VAL];
+            const int vi = (nl == 1 && nb[0] == '?') ? -2 : var_find(nb, nl);
+            const char* vs = "";
+            if (vi >= 0) vs = g_vars[vi].value;
+            else if (vi == -2) {                              /* $?：上一条命令的退出码 */
+                int v = g_last_status, k = 0;
+                if (v < 0) v = 0;
+                if (v == 0) vb[k++] = '0';
+                while (v > 0 && k < SH_VAR_VAL - 1) { vb[k++] = (char)('0' + (v % 10)); v /= 10; }
+                for (int a = 0, b2 = k - 1; a < b2; a++, b2--) { const char t = vb[a]; vb[a] = vb[b2]; vb[b2] = t; }
+                vb[k] = 0;
+                vs = vb;
+            }                                                 /* 未定义 = 空串 */
+            for (int k = 0; vs[k]; k++) {
+                char ec = vs[k];
+                if (ec == ' ' && quote) ec = SHC_QSP;
+                if (o < cap - 1) dst[o++] = ec; else { trunc = 1; break; }
+            }
+            continue;
+        }
+        if (c == ' ' && quote) c = SHC_QSP;
+        if (o < cap - 1) dst[o++] = c; else { trunc = 1; i++; continue; }
+        i++;
+    }
+    dst[o] = 0;
+    return trunc ? -1 : 0;
+}
+
+/* 执行一条简单命令：`set` / 赋值 / 走 run_stage（重定向 + 内置 + run）。
+ * 返回退出码。 */
+static int exec_one(char* cmd) {
+    /* 前导空白 */
+    while (*cmd == ' ' || *cmd == '\t') cmd++;
+    if (!*cmd) return 0;
+
+    if (expand_cmd(cmd, g_expand, (int)sizeof(g_expand)) != 0)
+        out_str("sh: command line truncated (512 B buffer)\n");
+    char* e = g_expand;
+    while (*e == ' ' || *e == '\t') e++;
+    if (!e[0]) return 0;                                      /* 只有引号/变量且展开成空 */
+
+    /* set -e / set +e（make 的 recipe 常带 `set -e`）*/
+    if (e[0] == 's' && e[1] == 'e' && e[2] == 't' && (e[3] == ' ' || e[3] == 0)) {
+        char* q = e + 3;
+        char* t = tok(&q);
+        if (t && t[0] == '-' && t[1] == 'e') { g_set_e = 1; return 0; }
+        if (t && t[0] == '+' && t[1] == 'e') { g_set_e = 0; return 0; }
+        out_str("sh: set: only -e/+e is supported\n");
+        return 2;
+    }
+
+    /* 纯赋值 `NAME=VALUE`（作为**整条命令**时才成立；`NAME=VALUE cmd` 不支持，如实） */
+    {
+        int i = 0;
+        while (is_name_ch(e[i]) && i < SH_VAR_NAME - 1) i++;
+        if (i > 0 && e[i] == '=') {
+            const int nl = i;
+            const char* v = e + i + 1;
+            int vl = name_len(v);
+            /* ★ 实测修：纯赋值的值要**去掉尾部空白**。原来 `X=hello ; echo ${X}world` 会把
+             *   "hello "（带那个分隔用的空格）存进变量，于是展开成 "hello world" 而不是
+             *   "helloworld"（tests/make64_test.py 的 ${X} 检查就是这么撞出来的）。 */
+            while (vl > 0 && (v[vl - 1] == ' ' || v[vl - 1] == '\t')) vl--;
+            var_set(e, nl, v, vl);
+            return 0;
+        }
+    }
+
+    /* 走既有的一段命令实现（重定向/管道/内置/run 全都在那里）。
+     * ★ 实测修：走 **exec_line** 而不是 run_stage —— exec_line 会按 `|` 切段（把前一段的捕获
+     *   喂给后一段），于是 `-c 'echo hi | cat > /tmp/o'` 的管道才真的是管道。原来直接调
+     *   run_stage 时 `|` 被当普通 token，`echo hi | cat` 会原样打出 "hi | cat"（实测原文），
+     *   与 main.c 头部注释承诺的"`|` 沿用本 shell 既有实现"不符。 */
+    return exec_line(e);
+}
+
+/* 执行 `-c` 的脚本：`;` / `&&` / `||` / 换行 串接 + `set -e`。返回退出码 = 最后一条命令。 */
+static int exec_script(const char* src) {
+    int o = 0, trunc = 0;
+    for (; src[o]; o++) {
+        if (o >= SHC_MAX - 1) { trunc = 1; break; }
+        g_scratch[o] = src[o];
+    }
+    g_scratch[o] = 0;
+    if (trunc) out_str("sh: -c script truncated (512 B buffer)\n");
+
+    char* p = g_scratch;
+    int status = 0;
+    int skip = 0;                                             /* 短路：跳过下一条 */
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p == '#') { while (*p && *p != '\n') p++; continue; }
+        if (!*p) break;
+
+        /* 找这条命令的结尾（引号感知：引号里的 ; && || 不算分隔符） */
+        char* q = p;
+        int quote = 0;
+        while (*q) {
+            const char c = *q;
+            if (c == '\'') { quote = !quote; q++; continue; }
+            if (!quote) {
+                if (c == '\n' || c == ';') break;
+                if (c == '&' && q[1] == '&') break;
+                if (c == '|' && q[1] == '|') break;
+            }
+            q++;
+        }
+        char op = 0;
+        char* next = q;
+        if (*q == '\n' || *q == ';') { op = 0; next = q + 1; }
+        else if (*q == '&') { op = '&'; next = q + 2; }
+        else if (*q == '|') { op = '|'; next = q + 2; }
+        const char saved = *q;
+        *q = 0;
+        if (!skip) status = exec_one(p);
+        *q = saved;
+        g_last_status = status;
+        if (g_set_e && status != 0) {
+            out_str("sh: set -e: command failed with code ");
+            out_dec(status);
+            out_str("; exiting\n");
+            return status;
+        }
+        if (op == '&') skip = (status != 0);
+        else if (op == '|') skip = (status == 0);
+        else skip = 0;
+        p = next;
+    }
+    return status;
+}
 int main(int argc, char** argv) {
-    (void)argc; (void)argv;
+    /* ★ B5：`sh -c "命令"` —— 没有邮箱、不打 banner/提示符，跑完就 exit(最后一条的退出码)。
+     *   `argc < 3`（`-c` 后面没东西）也走这里：如实报用法并返回 2（**不去碰邮箱**）。 */
+    if (argc >= 2 && argv[1] && argv[1][0] == '-' && argv[1][1] == 'c' && argv[1][2] == 0) {
+        g_nomb = 1;
+        if (argc < 3) {
+            static const char U[] = "sh: -c requires a command string\n";
+            (void)sh_write(1, U, sizeof U - 1u);
+            return 2;
+        }
+        /* cwd 从**内核**拿（本进程可能是 make 的子进程，cwd 由 make 的 chdir 决定）；
+         * 交互模式下 shell 自己维护 g_cwd（内核 chdir 号段不可用时也能 cd）。 */
+        if (sh_getcwd(g_cwd, (unsigned long)sizeof(g_cwd)) == 0) { g_cwd[0] = '/'; g_cwd[1] = 0; }
+        const int rc = exec_script(argv[2]);
+        sh_exit_group(rc);                                  /* 不返回 */
+    }
     if (!mb_probe()) {
         static const char MSG[] =
             "[sh64] no terminal mailbox at 0x100060000: this shell must be started by the\n"
@@ -808,6 +1119,9 @@ int main(int argc, char** argv) {
         prompt();
         char line[SH_LINE_MAX];
         const int n = read_line(line, (int)sizeof(line));
-        if (n > 0) (void)exec_line(line);
+        if (n > 0) {
+            quote_fold(line);                            /* ★ B5：引号折叠（见 quote_fold 的说明） */
+            (void)exec_line(line);
+        }
     }
 }
