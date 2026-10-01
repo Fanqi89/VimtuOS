@@ -596,6 +596,66 @@ int img64_load_vfs64(const char* path, Img64* out) {
     return rc;
 }
 
+// ==================== ★ 本批（资源外置）：raw 资源从系统卷读 ====================
+// 见 img64.h 的说明：内核里不再内嵌 logo_rgba.bin / icon_*.bin（合计 356,992 B），它们由构建期
+// 写进系统卷的 /etc/logo.bin、/etc/icon_mypc.bin、/etc/icon_recycle.bin、/etc/icon_term.bin、
+// /etc/icon_start.bin；这里只做"按路径 + 期望长度读回"，失败就如实打点交给调用方兜底。
+static int g_asset_ok_log = 0;                 // 成功行打点上限（防刷屏）
+static int g_asset_skip_log = 0;               // 失败行打点上限
+
+int img64_load_asset64(const char* path, uint32_t want_bytes, uint8_t** out) {
+    if (out) *out = nullptr;
+    if (!path || !path[0] || !out || want_bytes == 0) return -1;
+
+    // 失败打点的小工具（reason 是静态串："no-volume"/"not-found"/"size"/"read-failed"/"oom"）
+    auto skip = [&](const char* reason) {
+        if (g_asset_skip_log >= 24) return;
+        g_asset_skip_log++;
+        dbg64_line_begin64();
+        dbg64_str("[IMG64] asset skip path=");
+        dbg64_str(path);
+        dbg64_str(" want=");
+        dbg64_dec((uint64_t)want_bytes);
+        dbg64_str(" reason=");
+        dbg64_str(reason);
+        dbg64_str(" src=builtin ok=0");
+        dbg64_nl();
+        dbg64_line_end64();
+    };
+
+    const int sys = vfs64_system_slot64();
+    if (sys < 0) { skip("no-volume"); return -1; }
+    uint32_t type = 0, size = 0;
+    if (vfs64_stat_on64(sys, path, &type, &size) != 0 || type != VFS64_TYPE_FILE) {
+        skip("not-found");
+        return -1;
+    }
+    if (size != want_bytes) {
+        skip("size");
+        return -1;
+    }
+    uint8_t* buf = (uint8_t*)kmalloc_64(want_bytes);
+    if (!buf) { skip("oom"); return -1; }
+    const int got = vfs64_read_on64(sys, path, buf, (int)want_bytes);
+    if (got != (int)want_bytes) { kfree_64(buf); skip("read-failed"); return -1; }
+
+    if (g_asset_ok_log < 16) {
+        g_asset_ok_log++;
+        dbg64_line_begin64();
+        dbg64_str("[IMG64] asset path=");
+        dbg64_str(path);
+        dbg64_str(" want=");
+        dbg64_dec((uint64_t)want_bytes);
+        dbg64_str(" bytes=");
+        dbg64_dec((uint64_t)got);
+        dbg64_str(" src=vfs ok=1");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    *out = buf;
+    return got;
+}
+
 void img64_scale64(const Img64* src, uint32_t* dst, int dw, int dh) {
     if (!src || !src->px || !dst || dw <= 0 || dh <= 0) return;
     for (int y = 0; y < dh; y++) {

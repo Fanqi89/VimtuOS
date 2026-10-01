@@ -10,10 +10,14 @@
        断言新增打点 [UI] tmgr proc rows=<n>（n>=1）与进程行内容
        [UI] tmgr proc row pid=.. ppid=.. name=spin state=.. cr3=0x.. threads=.. cpu_permille=.. pages=..
        （cr3 必须不是 0、也不是内核地址空间 0x40000 -> 每进程地址空间是真生效的）
-  3) 键盘 down + 回车 -> 进程页的"结束进程"走 proc64_kill64(pid, SIGKILL=9)：
-       断言 [UI] tmgr kill proc pid=<pid> ... rc=0
-            + [PROC64] kill pid=<pid> sig=9 task_id=..
-            + [PROC64] exit pid=<pid> code=137 cr3_released=1
+  3) 键盘 down + 回车 -> 进程页的"结束进程"走 proc64_kill64(pid, SIGKILL=9)：判据分两条（★ 口径修正）——
+       A 真杀（保留原强度）：[UI] tmgr kill proc pid=<pid> … rc=0 **且**随后有
+         [PROC64] kill pid=<pid> sig=9 task_id=.. + [PROC64] exit pid=<pid> code=137 cr3_released=1
+         （= 点的是活进程、真走了内核 kill、进程真的没了）；
+       B 重复点（新语义）：同一轮最多压 5 次 down+ret，打到**已退出**的 pid 时内核如实回 -ESRCH(3) ——
+         这被判为正确行为，但只允许 -3 这一个非 0 码，且必须有"目标确实不在了"的正面证据（最后一次
+         -3 之后 tmgr 进程行里不再出现该 pid 的活状态）+ 全程不得 PANIC（= UI 不崩）。
+         原判据把 rc 不是 0 一律当失败，等于要求内核在目标不存在时假装成功 —— 那是口径错，不是内核缺陷。
   4) 原有打点 [UI] tmgr page proc / [UI] tmgr rows= 必须仍在（不许因本轮改动丢失）。
   5) 禁止出现 PANIC / TRIPLE FAULT / FAILED mask= / selftest FAIL。
 
@@ -218,25 +222,55 @@ def main():
                 check(nm, False)
 
         # ---- 3) down + 回车 -> 结束进程（proc64_kill64 SIGKILL=9）----
-        # 键盘注入偶发丢键（--full 里实测过：down/ret 没到窗口 -> 没有 kill 行），所以重试最多 5 次，
-        # 每次 down+ret+ret（重复回车对已被杀的行只会再打一条 rc=0，幂等无害）。
+        # 键盘注入偶发丢键（--full 里实测过：down/ret 没到窗口 -> 没有 kill 行），所以重试最多 5 次；
+        # ★ 判据（本轮口径修正，见下面的注释）：**重复按"结束任务"**时，第一次打到的是活进程（rc=0），
+        #   之后那几次打到的是**已经退出的 pid** —— 内核如实回 -ESRCH(3)，这是正确语义，不是缺陷。
         kill_re = re.compile(r"\[UI\] tmgr kill proc pid=(\d+) name=\S+ sig=9 rc=(-?\d+)")
-        mk = None
+        hits = []
         for _attempt in range(5):
             mon.key("down", wait=0.8)
             mon.key("ret", wait=1.2)
             mon.key("ret", wait=1.2)
             log = wait_for(serial, "[UI] tmgr kill proc", 6, proc)
-            hits = kill_re.findall(log)
-            want = [h for h in hits if (pid is None or h[0] == pid)] or hits
-            if want:
-                mk = want[-1]
+            h = kill_re.findall(log)
+            hits = [x for x in h if (pid is None or x[0] == pid)] or h
+            if any(x[1] == "0" for x in hits):     # 真杀那一条拿到了就不用再压键
                 break
-        check("新增打点 [UI] tmgr kill proc pid=.. sig=9 rc=0", bool(mk) and mk[1] == "0",
-              (" ".join(mk)) if mk else "")
-        if mk and pid is not None:
-            check("被 kill 的 pid 与建出来的进程一致", mk[0] == pid,
-                  "kill=%s run=%s" % (mk[0], pid))
+        ok_kills = [h for h in hits if h[1] == "0"]
+        esrch_kills = [h for h in hits if h[1] == "-3"]
+        other_kills = [h for h in hits if h[1] not in ("0", "-3")]
+        # 真退出证据（与下面 ④ 的两条断言同源：SIGKILL -> code=137 + cr3 释放）
+        exit_line = ("[PROC64] exit pid=%s code=137 cr3_released=1" % pid) if pid is not None else None
+        exit_ok = bool(exit_line) and (exit_line in log)
+
+        # 判据 A（**保留原强度**）：真杀一条必须存在 —— rc=0 **且**目标进程随后真的消失（[PROC64] exit
+        #   code=137 cr3_released=1）。"点了一个活进程并且它没了"这条证据链一个字都没松。
+        check("★ [UI] tmgr kill proc … sig=9 rc=0（真杀：活进程 -> rc=0 且随后 [PROC64] exit code=137）",
+              bool(ok_kills) and exit_ok,
+              ("kill=%s exit=%s" % (" | ".join(" ".join(h) for h in ok_kills) or "（无）",
+                                    exit_line if exit_ok else "（无 [PROC64] exit 行）")))
+        # 判据 B（**新语义**，修的就是这条口径）：同一轮的重复按键会打到**已退出**的 pid，内核如实回
+        #   -ESRCH(3)。允许非 0，但只允许这一个码（别的错误码 = 真缺陷），且必须有"目标确实不在了"的
+        #   正面证据：从最后一次非 0 命中往后，tmgr 的进程行里**不再出现**该 pid 的活状态。
+        #   为什么不是放宽：原判据把"重复点已退出的 pid"当成失败，等于要求内核在目标不存在时假装成功；
+        #   新判据把"真杀"（rc=0 + 进程消失）与"重复点"（-3 + 进程确实不在）分开钉，强度只增不减。
+        gone_after = True
+        if esrch_kills:
+            last_idx = log.rfind("[UI] tmgr kill proc pid=%s" % esrch_kills[-1][0])
+            tail = log[last_idx:] if last_idx >= 0 else log
+            live_after = [m for m in re.finditer(
+                r"\[UI\] tmgr proc row pid=%s ppid=\d+ name=\S+ state=(\d+)" % esrch_kills[-1][0], tail)
+                if 1 <= int(m.group(1)) <= 3]
+            gone_after = not live_after
+        check("重复点已退出的 pid 时允许 -ESRCH(-3)：只此一个非 0 码，且目标确实已不在（UI 不崩/不 panic）",
+              (not other_kills) and (not esrch_kills or (exit_ok and gone_after)),
+              "rc=%s other=%s exit=%s gone_after=%s" %
+              (sorted(set(h[1] for h in hits)), " | ".join(" ".join(h) for h in other_kills) or "（无）",
+               exit_ok, gone_after))
+        if mk := (ok_kills[-1] if ok_kills else (hits[-1] if hits else None)):
+            if pid is not None:
+                check("被 kill 的 pid 与建出来的进程一致", mk[0] == pid, "kill=%s run=%s" % (mk[0], pid))
+        # 内核侧证据（原样保留）：kill 真走 proc64 路径 + SIGKILL 的退出码/地址空间释放
         if pid:
             check("[PROC64] kill pid=%s sig=9 task_id=（真走 proc64 kill 路径）" % pid,
                   ("[PROC64] kill pid=%s sig=9" % pid) in log)

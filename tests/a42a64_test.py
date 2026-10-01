@@ -222,17 +222,21 @@ def main():
     ossz = os.path.getsize(KERNEL_OS)
     check("系统内核存在且**在内核区硬上限内**（LBA 9..8008 = %d B）" % NEW_LIMIT_BYTES,
           ossz <= NEW_LIMIT_BYTES, "kernel64_os.bin=%d B / 上限 %d B" % (ossz, NEW_LIMIT_BYTES))
-    # ★ A4-4（内核预算收口）：字体从"整份 TTF 内嵌"改成"构建期 deflate 压缩内嵌 + 启动期解到 .bss"
-    #   （kernel/font.cpp + build64.sh）：四份 TTF 1,164,272 B -> 755,944 B，**省 408,328 B**。
-    #   余量阈值 = 预留 384 KiB = 393,216 B，依据（是"钉住新基线"，不是放宽）：
-    #     * A5 前置那一批（input64 + 事件/shm + evshm 支持）实测净增 ~113 KB —— 384 KiB 是它的 3.4 倍；
-    #     * 任何"把字体退回未压缩形态"的改动 = +408,328 B > 384 KiB，这条断言会立刻失败；
-    #     * 改动前实测余量 58,672 B（连 64 KiB 都不到），所以这条阈值不是"必然通过"。
-    RESERVE_BYTES = 384 * 1024
-    check("图标包搬走后**内核可用字节数增加**且系统内核余量 ≥ 预留 384 KiB（%d B；依据见上面注释）"
+    # ★ A4-4（字体压缩）之后的本轮第二次预算收口：**raw 图标/logo 搬进系统卷**（tools/assets_pack_win.py）。
+    #   内核里曾经内嵌 5 份 raw RGBA：logo_rgba.bin 144,000 + icon_mycomputer/recyclebin/terminal 各
+    #   65,536（合计 196,608）+ icon_start.bin 16,384 = **356,992 B**；本轮全部搬进系统卷的
+    #   /etc/logo.bin、/etc/icon_mypc.bin、/etc/icon_recycle.bin、/etc/icon_term.bin、/etc/icon_start.bin，
+    #   只留 2,304 B 的开始按钮 24x24 内置兜底 mip（裸 system.img 无卷时用）。
+    #   余量阈值 = 预留 **700 KiB = 716,800 B**，依据（是"钉住搬移后的新基线"，不是放宽）：
+    #     * 搬移前实测余量 369,504 B（3,726,496 B 内核）—— 384 KiB 的旧阈值离实测太近（差 23,712 B 就红）；
+    #     * 搬走 356,992 B、加回 2,304 B -> 余量 ~726 KB；700 KiB 恰好卡在"搬移必须真的发生"的位置：
+    #       任何一份资源被塞回内核（最小的 icon_start.bin 也有 16,384 B）都会让这条断言立刻失败；
+    #     * 反向也钉住：字体退回未压缩形态（+408,328 B）同样必失败。
+    RESERVE_BYTES = 700 * 1024
+    check("raw 图标/logo 搬进系统卷后系统内核余量 ≥ 预留 700 KiB（%d B；依据见上面注释）"
           % RESERVE_BYTES,
           (NEW_LIMIT_BYTES - OLD_LIMIT_BYTES) == 262144 and (NEW_LIMIT_BYTES - ossz) >= RESERVE_BYTES,
-          "系统内核 %d B；余量 %d B（改动前：上限 %d B - 内核 %d B = %d B）"
+          "系统内核 %d B；余量 %d B（搬移前 3,726,496 B / 余量 369,504 B；图标包搬走前上限 %d B - 内核 %d B = %d B）"
           % (ossz, NEW_LIMIT_BYTES - ossz, OLD_LIMIT_BYTES, BEFORE_KERNEL_BYTES,
              OLD_LIMIT_BYTES - BEFORE_KERNEL_BYTES))
     if os.path.exists(SYSTEM_IMG):

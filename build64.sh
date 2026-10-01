@@ -58,7 +58,9 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 #   -DPROC64_UEFI_CR3_EXPERIMENT=1。用法：VIMTU_EXTRA_CXXFLAGS=-DPROC64_UEFI_CR3_EXPERIMENT=1 bash build64.sh
 # ★ 版本号**唯一真源**（发布时只改这一行）：编译期宏 VIMTUOS_VERSION_STR 进两份内核，
 #   设置页"关于"（kernel/settings64.cpp）与串口打点都从这里取值（未定义时内核打 unknown）。
-VIMTUOS_VERSION="0.3.4-beta16"
+# ★ 本批（版本串收口）：发布标签 v0.4.0-beta17 与镜像内嵌串**从此一致** —— 上一批的发布正文
+#   如实记录过"标签 0.4.0-beta17 vs 内嵌串 0.3.4-beta16"这一项未勾，改的就是这一行。
+VIMTUOS_VERSION="0.4.0-beta17"
 CXXFLAGS="$CXXFLAGS -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\""
 CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
 #
@@ -189,8 +191,40 @@ echo "==> 准备资源（字体 / logo / 图标；生成脚本产物落在 build
 "$PY" _make_start_icon.py
 cp build/font_bahnschrift.ttf build/font_simhei.ttf build/font_mono.ttf build/font_fallback.ttf "$BUILD/"
 "$PY" tools/make_iconpack.py
-cp build/logo_rgba.bin build/icon_mycomputer.bin build/icon_recyclebin.bin \
-   build/icon_terminal.bin build/icon_start.bin "$BUILD/"
+# ★ 本批（开始按钮的**内置兜底**）：icon_start.bin（64x64 RGBA = 16,384 B）也搬走了，但"裸
+#   system.img（没有 VimtuFS2 卷）"这条路径必须仍有一个**内置**兜底（tests/gui_modern64_test.py
+#   的裸盘断言：`[DOCK64] start icon src=builtin:icon_start.bin … ok=1` + 该区域彩色像素 > 80）。
+#   做法：构建期从 build/icon_start.bin 取 24x24 最近邻 mip（2,304 B）内嵌 —— Dock 显示 46px、
+#   老接口显示 24px（START_ICON_DISP），24x24 的 mip 在两条路径上都够用，且只占 2.3 KB。
+"$PY" - "build/icon_start.bin" "build/icon_start_mini.bin" <<'PYMINI'
+import sys
+src = open(sys.argv[1], "rb").read()
+SW = SH = 64
+assert len(src) == SW * SH * 4, "icon_start.bin 不是 64x64 RGBA（实际 %d B）" % len(src)
+N = 24
+# 最近邻采样写成 sx = x*SW//N（**覆盖整张源图**）—— 不能写 x*(SW//N)：64/24 = 2，那样只取到左上
+# 48x48 的一块（等于裁图），mip 会偏心。颜色保持原样（不混色），与 gui64 的 scale_rgba64 同一条公式。
+sx_of = [x * SW // N for x in range(N)]
+sy_of = [y * SH // N for y in range(N)]
+dst = bytearray(N * N * 4)
+for y in range(N):
+    for x in range(N):
+        o = ((sy_of[y] * SW) + sx_of[x]) * 4
+        dst[(y * N + x) * 4:(y * N + x) * 4 + 4] = src[o:o + 4]
+assert sx_of[0] == 0 and sy_of[0] == 0 and sx_of[N - 1] >= SW - 4 and sy_of[N - 1] >= SH - 4
+assert len(dst) == N * N * 4
+# 自检：mip 的每个像素都逐字节来自源图（同一公式），尺寸钉死
+for y in range(N):
+    for x in range(N):
+        o = ((sy_of[y] * SW) + sx_of[x]) * 4
+        assert dst[(y * N + x) * 4:(y * N + x) * 4 + 4] == src[o:o + 4]
+open(sys.argv[2], "wb").write(bytes(dst))
+print("    开始按钮内置兜底 mip：64x64(%d B) -> %dx%d(%d B)" % (len(src), N, N, len(dst)))
+PYMINI
+cp build/icon_start_mini.bin "$BUILD/icon_start_mini.bin"
+# ★ 本批（资源外置）：这 5 份 raw 资源**不再内嵌进内核** —— 它们的去处是"构建期写进系统卷"
+#   （见本文件后面的 tools/assets_pack_win.py 那一步），内核侧从 /etc/logo.bin 等 5 个文件里读。
+#   所以这里**不**再把它们 cp 进 $BUILD/ 做 objcopy（留在 build/ 给打包脚本用）。
 # ★ 本批：把**真文件 logo/kaisi.png 的原始字节**也嵌进系统内核（objcopy，符号 _binary_kaisi_png_*）——
 #   启动期由 gui64 幂等装进 VimtuFS2 系统卷（/logo/kaisi.png + /kaisi.png），开始按钮从盘上读真图。
 #   只进系统内核：安装介质不跑桌面，不需要它（省它的 4MB 预算）。
@@ -245,14 +279,14 @@ PYFONTZ
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_simhei.z font_simhei_z.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_mono.z font_mono_z.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 font_fallback.z font_fallback_z.o)
-(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 logo_rgba.bin logo_rgba.o)
-(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_mycomputer.bin icon_mycomputer.o)
-(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_recyclebin.bin icon_recyclebin.o)
-(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_terminal.bin icon_terminal.o)
-(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_start.bin icon_start.o)
+# ★ 本批（资源外置）：logo_rgba.bin / icon_mycomputer.bin / icon_recyclebin.bin / icon_terminal.bin /
+#   icon_start.bin（16,384 B）**都不再内嵌**（objcopy 那几行已删）—— 它们由 tools/assets_pack_win.py
+#   写进系统卷的 /etc/logo.bin、/etc/icon_*.bin，运行期从卷里读。这里只留**开始按钮的内置兜底 mip**
+#   （24x24 = 2,304 B；裸 system.img 无卷时用，符号 _binary_icon_start_mini_bin_start/_end）。
+(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_start_mini.bin icon_start_mini.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 kaisi.png kaisi_png.o)
 # OS 内核用同一批资源对象（直接复用）
-cp "$BUILD"/font_*_z.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o "$BUILD"/os/
+cp "$BUILD"/font_*_z.o "$BUILD"/icon_start_mini.o "$BUILD/os/"
 cp "$BUILD"/kaisi_png.o "$BUILD/os/"      # 只给系统内核（桌面用）
 # ★ A4-2a：**图标包搬进 VimtuFS2 系统卷** —— 包字节不再放在"内核区尾部（LBA 7497..8008）"，
 #   改成把 build/iconpack.bin 内嵌进**系统内核**（objcopy -> .rodata），启动期由 icons64 幂等
@@ -566,7 +600,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
     "$BUILD"/ahci64.o "$BUILD"/nvme64.o "$BUILD"/hwui64.o \
     "$BUILD"/display64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o \
-    "$BUILD"/user_demo64.o "$BUILD"/user_fbdemo64.o "$BUILD"/font_*_z.o "$BUILD"/logo_rgba.o "$BUILD"/icon_*.o
+    "$BUILD"/user_demo64.o "$BUILD"/user_fbdemo64.o "$BUILD"/font_*_z.o "$BUILD"/icon_start_mini.o
 $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 
 $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
@@ -590,7 +624,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/hda64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD/os"/hello_vap64.o \
-    "$BUILD/os"/user_demo64.o $ASM_FBDEMO_OBJ "$BUILD/os"/font_*_z.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
+    "$BUILD/os"/user_demo64.o $ASM_FBDEMO_OBJ "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
     "$BUILD/os"/user_*_cblob.o \
     "$BUILD/os"/kaisi_png.o "$BUILD/os"/iconpack_bin.o
 $OBJCOPY -O binary "$BUILD/kernel64_os.elf" "$BUILD/kernel64_os.bin"
@@ -643,7 +677,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/hda64.o \
         "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
         "$BUILD/os"/hello_vap64.o \
-        "$BUILD/os"/user_demo64.o "$BUILD/os"/user_fbdemo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/logo_rgba.o "$BUILD/os"/icon_*.o \
+        "$BUILD/os"/user_demo64.o "$BUILD/os"/user_fbdemo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
         "$BUILD/os"/user_*_cblob.o \
         "$BUILD/os"/kaisi_png.o
     $OBJCOPY -O binary "$BUILD/kernel64_os_cr3exp.elf" "$BUILD/kernel64_os_cr3exp.bin"
@@ -681,6 +715,10 @@ fi
 echo "    内核区（图标包搬走后）：LBA $KERNEL_LBA..$((KERNEL_LBA + KERNEL_SECTORS - 1)) = $KERNEL_SECTORS 扇区 = $KERNEL_AREA_BYTES B 全部可用；"
 echo "                            系统内核 $OSSZ B / $KERNEL_OS_SECTORS 扇区（余 $((KERNEL_AREA_BYTES - OSSZ)) B；改动前上限 7,488 扇区 = $((7488 * 512)) B）"
 echo "    图标包：$ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）**内嵌进系统内核** -> 启动期装进系统卷 /icons/pack.bin（运行期 src=vfs）"
+KERNEL_FREE_BYTES=$((KERNEL_AREA_BYTES - OSSZ))
+echo "    资源外置（本批）：5 份 raw 图标/logo 合计 356,992 B 搬进系统卷 /etc（tools/assets_pack_win.py）；"
+echo "                            系统内核 3,726,496 B -> $OSSZ B（省 356,992 B 内嵌资源，另加 2,304 B 开始按钮 mip）；"
+echo "                            余量 $KERNEL_FREE_BYTES B = $((KERNEL_FREE_BYTES / 1024)) KiB（本批目标 ≥ 700 KiB = 716,800 B）"
 
 echo "==> ★ A4-1：带 /bin/shell.bin 的演示盘 + \"内核里没有 shell 字节\"断言"
 # system.img 已经装好 -> 把它 + MBR + 主分区（= 带 /bin/shell.bin 的 VimtuFS2 v4 卷）拼成
@@ -704,6 +742,74 @@ echo "==> ★ A4-1：带 /bin/shell.bin 的演示盘 + \"内核里没有 shell �
 bash user/apps/edit/build_edit.sh "$BUILD"
 "$PY" tools/edit_pack_win.py --vol-in "$BUILD/sysvol.img" --vol-out "$BUILD/editvol.img" \
       --edit "$BUILD/edit" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+# ★ 本批（资源外置）：**第五步**——把内核里搬出来的 5 份 raw 资源写进同一块卷的 /etc：
+#   /etc/logo.bin(144,000) / /etc/icon_mypc.bin(65,536) / /etc/icon_recycle.bin(65,536) /
+#   /etc/icon_term.bin(65,536) / /etc/icon_start.bin(16,384) —— 合计 356,992 B（= 内核省下的字节）。
+#   为什么放在最后一步：前四步的产物（shell/tcc/lua/gzip/edit）一个字节都不动，本步只"再加 5 个文件"。
+#   盘内位置：全部落在**已存在**的 /etc 里（不新建根级目录 —— 理由见 kernel/icons64.h 的 ★ 段）。
+#   ★ 二级间接：/etc/logo.bin 是 282 块 > 132 块，走 VimtuFS2 v4 的 dind（tcc_pack_win.py 已实现），
+#   脚本用 tcc_pack_win.verify 把 5 个文件逐字节回读比对（直接块 / ind / dind 三级）。
+"$PY" tools/assets_pack_win.py --vol-in "$BUILD/editvol.img" --vol-out "$BUILD/assetsvol.img" \
+      --res build --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+# 断言（两条，都是"资源真的搬走了"的硬证据）：
+#   ① **整份文件**的字节在内核里搜不到（最硬的一条：objcopy 一塞回去就必红）；
+#   ② 再取一个**高熵探针**（扫全图挑"不同字节值最多"的 64B 窗口；纯色/透明区域的中段探针会因为
+#      内核里本来就有大片同色数据而假命中 —— 实测 logo_rgba.bin 的中段就是一片透明），要求也不在内核里。
+"$PY" - "$BUILD/kernel64_os.bin" build/logo_rgba.bin build/icon_mycomputer.bin \
+      build/icon_recyclebin.bin build/icon_terminal.bin <<'PYASSET'
+import sys
+k = open(sys.argv[1], "rb").read()
+bad = []
+for p in sys.argv[2:]:
+    b = open(p, "rb").read()
+    name = p.rsplit("/", 1)[-1]
+    if len(b) >= 64 and b in k:                       # ① 整份文件
+        bad.append(p)
+        sys.stderr.write("ERROR: 系统内核里含整份 %s（%d B）—— 资源没搬干净\n" % (name, len(b)))
+        continue
+    best_off, best_n = -1, -1                         # ② 高熵探针（32B 步长扫一遍）
+    for off in range(0, max(1, len(b) - 64), 32):
+        win = b[off:off + 64]
+        n = len(set(win))
+        if n > best_n:
+            best_n, best_off = n, off
+    probe = b[best_off:best_off + 64] if best_off >= 0 else b""
+    if len(probe) == 64 and best_n >= 8 and probe in k:
+        bad.append(p)
+        sys.stderr.write("ERROR: 系统内核里含 %s 的 64B 高熵探针（偏移 %d，不同字节值 %d）\n"
+                         % (name, best_off, best_n))
+    else:
+        print("    断言 OK：系统内核 %d B 里既没有 %s 整份字节，也没有它的 64B 高熵探针"
+              "（偏移 %d，不同字节值 %d）" % (len(k), name, best_off, best_n))
+raise SystemExit(1 if bad else 0)
+PYASSET
+# 同样的纪律单独钉一遍 icon_start.bin（它的"内置兜底"只剩 24x24 mip = 2,304 B，
+#   64x64 原图必须只在卷里；否则这条搬移就是假的）。
+"$PY" - "$BUILD/kernel64_os.bin" build/icon_start.bin build/icon_start_mini.bin <<'PYASSET2'
+import sys
+k = open(sys.argv[1], "rb").read()
+full = open(sys.argv[2], "rb").read()
+mini = open(sys.argv[3], "rb").read()
+mid = len(full) // 2
+bad = 0
+# ① 整份原图不能在内核里（64x64 RGBA = 16,384 B）
+if full in k:
+    sys.stderr.write("ERROR: 系统内核里含整份 icon_start.bin(64x64, %d B)\n" % len(full))
+    bad = 1
+# ② 中段 64B 探针（仅当它不是"内核里到处都是的同色窗口"时才有判别力）
+probe = full[mid:mid + 64]
+if len(set(probe)) >= 8 and probe in k:
+    sys.stderr.write("ERROR: 系统内核里仍有 icon_start.bin(64x64) 的 64B 探针（偏移 %d）\n" % mid)
+    bad = 1
+# ③ 内置的 24x24 mip 必须在（无卷盘的兜底就靠它）
+if mini not in k:
+    sys.stderr.write("ERROR: 系统内核里找不到 icon_start_mini.bin（%d B）\n" % len(mini))
+    bad = 1
+if not bad:
+    print("    断言 OK：icon_start.bin 原图（%d B）不在内核里；内核里只有 24x24 mip（%d B）"
+          % (len(full), len(mini)))
+raise SystemExit(bad)
+PYASSET2
 # 断言：内核二进制里**不能**出现 shell.bin 的字节（交付方式必须是"系统卷里的文件"）。
 # 探针取 shell 中段的 64 字节（ELF 头/入口附近的字节模式到处都是，中段最稳）。
 "$PY" - "$BUILD/kernel64_os.bin" "$BUILD/shell.bin" <<'PYEOF'

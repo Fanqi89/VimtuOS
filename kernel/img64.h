@@ -2,8 +2,9 @@
 //
 // 用途（对应需求"图标/壁纸/头像优先从 VimtuFS2 读，内核只留少量兜底"）：
 //   * 桌面壁纸：优先读 ui.wall.path 指定的 VimtuFS2 文件，读不到就用内置兜底壁纸（gfx64 的程序化壁纸）；
-//   * 开始按钮（Dock 最左）：优先读 VimtuFS2 的 /logo/kaisi.png、/kaisi.png，读不到就用内核里
-//     已嵌的 icon_start.bin（就是 logo/kaisi.png 的 RGBA，构建期由 _make_start_icon.py 生成）；
+//   * 开始按钮（Dock 最左）：优先读 VimtuFS2 的 /logo/kaisi.png、/kaisi.png，读不到再读系统卷里的
+//     /etc/icon_start.bin（64x64 RGBA，构建期由 _make_start_icon.py 生成、打包脚本写进卷），
+//     最后才是内核里**只剩 24x24 mip（2,304 B）**的 icon_start_mini.bin 兜底（见下面的"资源外置"段）；
 //   * 头像：路径建在 config64（ui.avatar.path），本批只把解码/加载能力备好（锁屏下一波用）。
 //
 // 像素格式：解码结果统一 0xAARRGGBB（A=255 表示不透明）；壁纸铺图时会丢掉 alpha（0x00FFFFFF 掩码）。
@@ -35,6 +36,25 @@ int img64_load_vfs64(const char* path, Img64* out);
 // 目的：让"开始按钮用真文件 logo/kaisi.png"这条需求在**任何有 VimtuFS2 系统卷的盘**上都成立
 //（安装器装出来的盘、测试夹具盘），而裸 system.img（没有卷）走内核内置兜底，行为与之前一致。
 int img64_install_blob64(const char* path, const uint8_t* data, uint32_t len, const char* src);
+
+// ==================== ★ 本批（资源外置）：raw 图标/logo 从**系统卷**读，内核里不再内嵌 ====================
+// 背景：内核里曾经内嵌 5 份 raw RGBA 资源（合计 356,992 B）——logo_rgba.bin 144,000 B（240x150）、
+//   icon_mycomputer/recyclebin/terminal.bin 各 65,536 B（128x128）、icon_start.bin 16,384 B（64x64）。
+//   它们由**构建期**写进系统卷（tools/assets_pack_win.py）：/etc/logo.bin、/etc/icon_mypc.bin、
+//   /etc/icon_recycle.bin、/etc/icon_term.bin、/etc/icon_start.bin（都落在已存在的 /etc 里，
+//   不新建根级目录）。内核侧只剩"怎么从卷里取"，取不到就回落调用方的内置/程序化绘制。
+//
+// 语义（★ 每个取用点都要打点，验收 grep 用）：
+//   * 成功：*out = kmalloc_64 的缓冲（长度**恰好** want_bytes，调用方 kfree_64），返回 want_bytes；
+//           打点  [IMG64] asset path=/etc/logo.bin want=144000 bytes=144000 src=vfs ok=1
+//   * 失败：*out = nullptr，返回 < 0，并如实打一条 skip（reason=no-volume / not-found / size /
+//           read-failed / oom）：
+//            [IMG64] asset skip path=/etc/logo.bin want=144000 reason=no-volume src=builtin ok=0
+//            [IMG64] asset skip path=/etc/icon_term.bin want=65536 reason=not-found src=builtin ok=0
+// 为什么按**长度**校验而不是内容：卷里那份就是构建期资源文件的逐字节副本（打包脚本用
+//   tcc_pack_win.verify 回读比对过），长度对上就是同一份；内容再校验一遍只会多花时间。
+// 打点上限：每个路径只打一次成功行（g_asset_log 计数），失败行也按路径去重（避免每帧刷屏）。
+int img64_load_asset64(const char* path, uint32_t want_bytes, uint8_t** out);
 void img64_free64(Img64* img);
 const char* img64_last_err64();
 // 最近一次成功解码的格式名（"png" / "bmp"）

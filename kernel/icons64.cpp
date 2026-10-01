@@ -297,6 +297,28 @@ int icons64_init64() {
             }
         }
     }
+    // ---- 1a2) ★ 本批（资源外置）：**无卷盘（裸 system.img）直接用内嵌字节** ----
+    // 为什么需要：本轮把内核里三张 128x128 的 raw 桌面/ Dock 位图（各 65,536 B）搬进了系统卷
+    //   （/etc/icon_mypc.bin 等），裸 system.img 没有卷，取不到那三张位图了；而**图标包字节本来
+    //   就在内核里**（49,192 B，启动期要装进卷的那份），无卷时直接就地解析它 —— 桌面/Dock/开始菜单
+    //   照样是"真图标"，不必回落到程序化绘制。打点里 src=builtin 如实标出这条来源。
+    // ★ **有卷**时不走这条路：卷里的包才是真源，坏包必须如实报 bad=/absent（tests/icons64_test.py
+    //   场景 ②(a)/(b) 钉的就是这个语义）—— 绝不拿内嵌副本把坏包"圆过去"。
+    if (!g_pack && vfs64_system_slot64() < 0) {
+        const uint32_t blen = (uint32_t)(_binary_iconpack_bin_end - _binary_iconpack_bin_start);
+        if (blen >= ICON64_HDR_BYTES && blen <= ICON64_PACK_MAX_BYTES &&
+            ic_pack_ok(_binary_iconpack_bin_start, blen)) {
+            int bad = 0;
+            uint8_t* p = (uint8_t*)_binary_iconpack_bin_start;   // .rodata：只读解析，绝不写回
+            if (ic_parse_pack(p, blen, &bad) == 0) {
+                g_pack = p;                                      // .rodata：不 kmalloc、不释放
+                g_pack_drive = -1;
+                g_pack_lba = 0;                                  // 打点里 lba=0/drive=-1 = 不来自内核区 LBA
+                g_pack_src = "builtin";
+                g_pack_bad = bad;
+            }
+        }
+    }
     // ---- 1b) 逐盘找图标包（老路径：内核区尾部 LBA；正常的系统盘 = C: 所在盘，退而求其次试 0/8/16/24）----
     if (!g_pack) {
     int cand[5];
@@ -494,8 +516,10 @@ static const Img64* ic_bitmap(int kind, int want, const char** why) {
         ic_dec(sz, (int)e->size, (int)sizeof(sz));
         ic_strcat(path, sz, (int)sizeof(path));
         ic_strcat(path, ".png", (int)sizeof(path));
-        // ★ A4-2a：包的**来源**如实写进 src=（卷里读回来的包 -> src=vfs；内核区尾部老路径 -> src=pack）
-        ic_log_load(kind, path, (int)e->size, (g_pack_src[0] == 'v') ? "vfs" : "pack");
+        // ★ A4-2a：包的**来源**如实写进 src=（卷里读回来的包 -> src=vfs；内核区尾部老路径 -> src=pack；
+        //   本批新增的"无卷盘直接用内嵌字节" -> src=builtin）
+        ic_log_load(kind, path, (int)e->size,
+                    (g_pack_src[0] == 'v') ? "vfs" : (g_pack_src[0] == 'b' ? "builtin" : "pack"));
     }
     if (why) *why = nullptr;
     return &slot->im;

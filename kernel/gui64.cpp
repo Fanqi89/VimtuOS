@@ -53,17 +53,43 @@
 void settings64_sync_user_prefs64(int theme_id, int lock_mode);
 
 // ==================== 资源符号（build64.sh 用 objcopy 生成）====================
-extern "C" const uint8_t _binary_icon_mycomputer_bin_start[];
-extern "C" const uint8_t _binary_icon_recyclebin_bin_start[];
-extern "C" const uint8_t _binary_icon_terminal_bin_start[];
-extern "C" const uint8_t _binary_icon_start_bin_start[];   // 64x64 RGBA（logo/kaisi.png）
-extern "C" const uint8_t _binary_logo_rgba_bin_start[];    // 240x150 RGBA（logo/logo.png）
-// ★ 本批：真正的 logo/kaisi.png 原始字节（build64.sh 用 objcopy 从 logo/kaisi.png 嵌入）——
-//   启动期幂等装进 VimtuFS2 系统卷，开始按钮就从盘上读真图（见 dock_start_icon_init64）。
+// ★ 本批（资源外置）：这里**曾经**有 5 个 raw 资源符号 —— 它们的内嵌字节合计 356,992 B：
+//     _binary_logo_rgba_bin_start      144,000 B（240x150，开机/关机画面）
+//     _binary_icon_mycomputer_bin_start 65,536 B（128x128，桌面/Dock 的"我的电脑"）
+//     _binary_icon_recyclebin_bin_start 65,536 B（回收站）
+//     _binary_icon_terminal_bin_start   65,536 B（终端）
+//     _binary_icon_start_bin_start      16,384 B（64x64 开始按钮兜底图）
+//   本轮按 /bin/shell.bin、/lib/tcc.bin、/etc/iconpack.bin 的既有模式把它们**搬进系统卷**
+//   （构建期 tools/assets_pack_win.py 写进 /etc/logo.bin、/etc/icon_mypc.bin、/etc/icon_recycle.bin、
+//   /etc/icon_term.bin、/etc/icon_start.bin），运行期只从卷里读（img64_load_asset64），
+//   读不到就按下面各取用点的兜底顺序走（每一步都打点）。**内嵌数组一个都不留**。
+// 仍然内嵌的两份（另有用途，不属本轮搬迁对象）：
+//   * logo/kaisi.png 原始字节 —— 启动期幂等装进系统卷（/logo/kaisi.png + /kaisi.png），开始按钮读真图；
+//     同时它是开机 logo 的**内置兜底**画源（见 logo_fallback_rgba64）。
+//   * icon_start_mini.bin（24x24 = 2,304 B）—— 开始按钮的**内置兜底** mip（裸 system.img 无卷时用；
+//     Dock 显示 46px、老接口显示 START_ICON_DISP=24px，24x24 的 mip 两边都够用）。
 extern "C" const uint8_t _binary_kaisi_png_start[];
 extern "C" const uint8_t _binary_kaisi_png_end[];
+extern "C" const uint8_t _binary_icon_start_mini_bin_start[];
+extern "C" const uint8_t _binary_icon_start_mini_bin_end[];
 
 #define ICON_SRC_W 128          // 图标源图尺寸（RGBA，见 _make_icons.py）
+
+// ==================== ★ 本批（资源外置）：内核外置资源的**卷内路径** ====================
+// 与 tools/assets_pack_win.py 的 ASSETS 表一一对应（改一处就得改另一处；字节数在两侧都是钉死的）：
+//   /etc/logo.bin        144,000 B = 240x150 RGBA（构建前的 logo_rgba.bin，逐字节搬）
+//   /etc/icon_mypc.bin    65,536 B = 128x128 RGBA（构建前 icon_mycomputer.bin）
+//   /etc/icon_recycle.bin 65,536 B = 128x128 RGBA（构建前 icon_recyclebin.bin）
+//   /etc/icon_term.bin    65,536 B = 128x128 RGBA（构建前 icon_terminal.bin）
+//   /etc/icon_start.bin   16,384 B = 64x64  RGBA（构建前 icon_start.bin）
+// 为什么都在 /etc：那个目录在夹具卷/装好的卷里**一定存在**（新建根级目录会改卷根条目数，
+// 见 kernel/icons64.h 的 ★ 段）；名字都 ≤ 31 B（NAME_MAX）。
+#define LOGO64_ASSET_PATH   "/etc/logo.bin"
+#define ICON64_ASSET_MYPC   "/etc/icon_mypc.bin"
+#define ICON64_ASSET_RECYC  "/etc/icon_recycle.bin"
+#define ICON64_ASSET_TERM   "/etc/icon_term.bin"
+#define START64_ASSET_PATH  "/etc/icon_start.bin"
+#define START_ICON_MIP_SIDE 24  // 内置兜底 mip 的边长（= build64.sh 生成的 icon_start_mini.bin）
 
 // ==================== 几何常量 ====================
 // ★ 本批（Windows 11 现代外观）：底部 32px 老任务栏 → Dock（高 60 + 离底 16 = 76）。
@@ -629,13 +655,84 @@ static void blit_rgba(int x, int y, int dw, int dh, const uint8_t* src, int sw, 
         }
     }
 }
+// 前置声明（定义在下面 Dock 那一节）：把 Img64（0xAARRGGBB）转成 RGBA 字节流 + 最近邻缩放到 dw×dh
+static void dock_rgba_from_img64(const Img64* im, uint8_t* dst, int dw, int dh);
 
-// ==================== 开机 logo（淡入）====================
-// 桌面首帧之前跑：黑底 + 屏幕居中 logo（240x150 RGBA，logo/logo.png）；
-// 12 帧逐帧提高不透明度，帧间用 ticks64() 节流到 ~60Hz，每帧只提交 logo 那块小矩形。
-static void boot_logo_fade_in(void) {
+
+// ==================== ★ 本批（资源外置）：开机/关机画面的 logo ====================
+// 240x150 RGBA（144,000 B）原本内嵌在内核里（_binary_logo_rgba_bin_start），本轮搬进系统卷
+// 的 /etc/logo.bin。取用顺序（每一步都打点，验收 grep 用）：
+//   ① 卷里 /etc/logo.bin（构建期由 tools/assets_pack_win.py 写进去的那份 240x150 RGBA）；
+//      成功 -> 打点 [IMG64] asset path=/etc/logo.bin want=144000 bytes=144000 src=vfs ok=1
+//   ② 内置兜底：内核里**仍在**的 logo/kaisi.png 原始字节解成 132x132 RGBA 居中画 + 一行 "VimtuOS"。
+//      这是"读不到时回落内置绘制"，界面绝不空 —— 并由 [UI] boot logo show 行如实标出 src=。
+// 为什么缓存：开机 logo 与关机画面都要用同一张图，读一次（144 KB）留在堆上（48 MB 堆，占比可忽略）。
+static const char* g_logo_src_desc = "builtin:kaisi.png";   // [UI] boot logo show 行的 src=
+
+static uint8_t* logo_asset_rgba64() {
+    static uint8_t* buf = nullptr;
+    static int state = 0;                                   // 0 = 未试；1 = 卷里有；-1 = 没有
+    if (state == 0) {
+        state = -1;
+        const int want = LOGO_W * LOGO_H * 4;
+        if (img64_load_asset64(LOGO64_ASSET_PATH, (uint32_t)want, &buf) == want && buf) {
+            state = 1;
+            g_logo_src_desc = "vfs:" LOGO64_ASSET_PATH;
+        } else {
+            buf = nullptr;
+        }
+    }
+    return state > 0 ? buf : nullptr;
+}
+
+// 内置兜底画源：把内核里仍在的 logo/kaisi.png（158x158 PNG）解码后缩成 132x132 RGBA
+static const uint8_t* logo_fallback_rgba64() {
+    static uint8_t fb[132 * 132 * 4];
+    static int state = 0;
+    if (state == 0) {
+        state = -1;
+        const uint32_t n = (uint32_t)(_binary_kaisi_png_end - _binary_kaisi_png_start);
+        Img64 im{};
+        if (n > 0 && img64_decode64(_binary_kaisi_png_start, (int)n, &im) == 0) {
+            dock_rgba_from_img64(&im, fb, 132, 132);
+            img64_free64(&im);
+            state = 1;
+        }
+    }
+    return state > 0 ? fb : nullptr;
+}
+
+// 画一帧开机 logo（含兜底），并把"这一帧真正提交的矩形"通过 out 参数回给调用方（只 flip 这一块）。
+static void boot_logo_draw64(int a_scale, int* rx, int* ry, int* rw, int* rh) {
     const int x0 = (g_screen_w - LOGO_W) / 2;
     const int y0 = (g_screen_h - LOGO_H) / 2;
+    *rx = x0; *ry = y0; *rw = LOGO_W; *rh = LOGO_H;
+    const uint8_t* src = logo_asset_rgba64();
+    if (src) {
+        blit_rgba(x0, y0, LOGO_W, LOGO_H, src, LOGO_W, LOGO_H, a_scale);
+        return;
+    }
+    // 兜底：居中 132x132 的 kaisi 图标 + 一行 "VimtuOS"（同一条 alpha 淡入；不动字号档位）
+    const int s = 132;
+    const int fx = (g_screen_w - s) / 2;
+    const int fy = (g_screen_h - s) / 2 - 14;
+    const uint8_t* fb = logo_fallback_rgba64();
+    if (fb) blit_rgba(fx, fy, s, s, fb, s, s, a_scale);
+    const int v = 200 * a_scale / 255;
+    const uint32_t fg = ((uint32_t)v << 16) | ((uint32_t)v << 8) | (uint32_t)v;
+    const int face_save = font_current_face();
+    font_select(FONT_FACE_ASCII);
+    const int tw = font_text_width("VimtuOS");
+    font_draw_text((g_screen_w - tw) / 2, fy + s + 6, "VimtuOS", fg);
+    font_select(face_save);
+    *rx = fx - 8; *ry = fy - 8; *rw = s + 16; *rh = s + 16 + font_line_height() + 8;
+}
+// ==================== 开机 logo（淡入）====================
+// 桌面首帧之前跑：黑底 + 屏幕居中 logo（240x150 RGBA）；12 帧逐帧提高不透明度，帧间用 ticks64()
+// 节流到 ~60Hz，每帧只提交 logo 那一块小矩形。
+// ★ 本批（资源外置）：图不再内嵌 —— 从系统卷 /etc/logo.bin 读（见 logo_asset_rgba64）；读不到就用
+//   内置的 kaisi 图标 + 一行 "VimtuOS" 兜底（boot_logo_draw64），[UI] boot logo show 行里如实标出 src=。
+static void boot_logo_fade_in(void) {
     const int frames = 12;
     fb_clear(rgb(0, 0, 0));
     fb_flip();
@@ -644,23 +741,33 @@ static void boot_logo_fade_in(void) {
         int guard = 0;   // 护栏：万一 PIT 停摆也不至于死在等待里
         while ((int32_t)(ticks64() - next) < 0 && ++guard < 2000000) __asm__ volatile("pause");
         next += PIT_HZ_64 / 60;
-        blit_rgba(x0, y0, LOGO_W, LOGO_H, _binary_logo_rgba_bin_start, LOGO_W, LOGO_H,
-                  f * 255 / frames);
-        fb_flip_region(x0, y0, LOGO_W, LOGO_H);
+        int rx = 0, ry = 0, rw = 0, rh = 0;
+        boot_logo_draw64(f * 255 / frames, &rx, &ry, &rw, &rh);
+        fb_flip_region(rx, ry, rw, rh);          // 只提交 logo 那块（区域由 boot_logo_draw64 回填）
     }
     dbg64_str("[UI] boot logo show frames=");
     dbg64_dec((uint64_t)frames);
-    dbg64_str(" fade=ok");
+    dbg64_str(" fade=ok src=");
+    dbg64_str(g_logo_src_desc);
     dbg64_nl();
 }
 
-static const uint8_t* icon_src(int kind) {
-    if (kind == 0) return _binary_icon_mycomputer_bin_start;
-    if (kind == 1) return _binary_icon_recyclebin_bin_start;
-    return _binary_icon_terminal_bin_start;
-}
+// ★ 本批（资源外置）：**这里原来有 icon_src(kind)** —— 它直接返回内核内嵌的 3 张 128x128 RGBA 位图
+//   （各 65,536 B，合计 196,608 B），Dock / 桌面图标都靠它。本轮这三张位图搬进了系统卷的
+//   /etc/icon_mypc.bin、/etc/icon_recycle.bin、/etc/icon_term.bin，内核侧改成"从卷里读一次 +
+//   预缩放进缓存"（见下面的 icon_rgba_from_asset64），读不到就按下面的顺序兜底（每一步都打点）。
 // ★ 本批（真图标）：桌面图标 kind 0..2 <-> 外置图标包里的应用 kind
 static const int kIcon64AppKind[3] = { ICON64_A_MYPC, ICON64_A_RECYCLE, ICON64_A_TERMINAL };
+// 卷里那三份 raw 位图的路径（与 tools/assets_pack_win.py 的 ASSETS 表一一对应）——
+// 顺序与 kind 一致（0 = 我的电脑 / 1 = 回收站 / 2 = 终端）。
+static const char* const kIcon64AssetPath[3] = {
+    ICON64_ASSET_MYPC, ICON64_ASSET_RECYC, ICON64_ASSET_TERM
+};
+// 程序化兜底（包与卷里那两份都没有时）用的 1 个字：中文名字与英文名字各一套
+static const char* const kIcon64GlyphZh[3] = { "我", "回", "终" };
+static const char* const kIcon64GlyphEn[3] = { "M", "R", "T" };
+static uint8_t     g_icon_fb_logged[3];
+static bool        g_start_fb_logged = false;
 // （icon_name 已随桌面图标绘制一起搬到 desktopops64.cpp：item_name()）
 
 // ==================== 桌面图标预缩放缓存（preload64 预热用） ====================
@@ -712,14 +819,79 @@ static void blit_rgba_scaled(int x, int y, int dw, int dh, const uint8_t* src) {
         }
     }
 }
+// ==================== ★ 本批（资源外置）：从卷里取 raw 位图 ====================
+// 读 /etc/icon_mypc.bin 等（128x128 RGBA = 65,536 B）并按老采样公式缩到 ICON_W 缓存里。
+// 返回 0 = 成功（缓存可用）；-1 = 卷里没有/大小不符/读了失败（img64_load_asset64 已打点）。
+static int icon_rgba_from_asset64(int kind, uint8_t* dst) {
+    const int want = ICON_SRC_W * ICON_SRC_W * 4;
+    uint8_t* raw = nullptr;
+    const int got = img64_load_asset64(kIcon64AssetPath[kind], (uint32_t)want, &raw);
+    if (got != want || !raw) {
+        if (raw) kfree_64(raw);
+        return -1;
+    }
+    scale_rgba64(raw, ICON_SRC_W, ICON_SRC_W, dst, ICON_W, ICON_W);
+    kfree_64(raw);
+    return 0;
+}
+
+// 开始按钮的兜底源：① 卷里 /etc/icon_start.bin（64x64 RGBA，构建期搬进去的那份）；② 内核里仅剩的
+// 24x24 mip（2,304 B，build64.sh 生成）。*side 回填源图边长（调用方按它缩放，不写死尺寸）。
+static const uint8_t* start_icon_src64(int* side) {
+    static uint8_t* asset = nullptr;
+    static int state = 0;                       // 0 = 未试；1 = 卷里有；-1 = 没有
+    if (state == 0) {
+        state = -1;
+        const int want = START_ICON_SRC * START_ICON_SRC * 4;
+        if (img64_load_asset64(START64_ASSET_PATH, (uint32_t)want, &asset) == want && asset) state = 1;
+        else asset = nullptr;
+    }
+    if (state > 0) { if (side) *side = START_ICON_SRC; return asset; }
+    // 内置 mip：长度当场对一遍（构建期生成的字节数钉死 24*24*4），不对就如实不打图（界面照旧不空：
+    // Dock 会画渐变底、桌面画渐变底板 + 下面 icon_draw_prog64 的字）
+    const int mip_bytes = (int)(_binary_icon_start_mini_bin_end - _binary_icon_start_mini_bin_start);
+    if (mip_bytes != START_ICON_MIP_SIDE * START_ICON_MIP_SIDE * 4) {
+        if (!g_start_fb_logged) {
+            g_start_fb_logged = true;
+            dbg64_str("[GUI64] start icon fallback bytes=");
+            dbg64_dec((uint64_t)mip_bytes);
+            dbg64_str(" expected=");
+            dbg64_dec((uint64_t)(START_ICON_MIP_SIDE * START_ICON_MIP_SIDE * 4));
+            dbg64_str(" draw=skip (programmatic plate kept)");
+            dbg64_nl();
+        }
+        return nullptr;
+    }
+    if (side) *side = START_ICON_MIP_SIDE;
+    return _binary_icon_start_mini_bin_start;
+}
+
+// 桌面图标（kind 0..2）的**程序化兜底**：包和卷里那两份都取不到时画 1 个字（TTF，白字）。
+// 底板是 desktopops64 画的主题渐变圆角方块，所以这里只补字形 —— "绝不因为缺文件把界面画空"。
+static void icon_draw_prog64(int x, int y, int size, int kind) {
+    const char* s = g_lang_zh ? kIcon64GlyphZh[kind] : kIcon64GlyphEn[kind];
+    font_select(2);                              // 与界面其它文字同一条字体查询链
+    const int tw = font_text_width(s);
+    const int lh = font_line_height();
+    font_draw_text(x + (size - tw) / 2, y + (size - lh) / 2, s, rgb(255, 255, 255));
+    if (!g_icon_fb_logged[kind]) {
+        g_icon_fb_logged[kind] = 1;
+        dbg64_str("[GUI64] icon fallback kind=");
+        dbg64_dec((uint64_t)kind);
+        dbg64_str(" reason=no-asset (programmatic glyph kept)");
+        dbg64_nl();
+    }
+}
 
 // 预缩放：3 个桌面图标（128x128 -> ICON_W）与开始图标（64x64 -> START_ICON_DISP）。
+// 每个图标的取用顺序（与 icons64 的"包优先"一致，逐级兜底、逐级打点）：
+//   ① 外置图标包 icons64（卷 /etc/iconpack.bin；打点 [ICON64] load … src=vfs）；
+//   ② 系统卷里的 raw 位图 /etc/icon_*.bin（本轮从内核搬出去的那三份；打点 [IMG64] asset … src=vfs）；
+//   ③ 都没有 -> 不建缓存，绘制点走程序化兜底 icon_draw_prog64（打点 [GUI64] icon fallback …）。
 // 返回建好的缓存位图数（4 = 全部成功；资源缺失时如实返回较小的数）。
 int gui64_preload_icons64() {
     int n = 0;
     for (int k = 0; k < 3; k++) {
-        // ★ 本批（真图标）：优先用外置图标包里的应用图标（Dock/桌面同一份缓存，绘制路径不变）；
-        //   包里没有（或解码失败）才用内核内嵌的程序化图标 —— 绝不因为缺文件把图标画空。
         const int ak = kIcon64AppKind[k];
         if (ak > 0 && icons64_export_rgba64(ak, ICON_W, g_icon48_cache[k], ICON_W, ICON_W,
                                             icons64_app_color64(ak)) == 0) {
@@ -727,15 +899,17 @@ int gui64_preload_icons64() {
             n++;
             continue;
         }
-        const uint8_t* src = icon_src(k);
-        if (!src) continue;
-        scale_rgba64(src, ICON_SRC_W, ICON_SRC_W, g_icon48_cache[k], ICON_W, ICON_W);
-        g_icon48_ok[k] = 1;
-        n++;
+        if (icon_rgba_from_asset64(k, g_icon48_cache[k]) == 0) {   // ★ 卷里的 raw 位图（外置资源）
+            g_icon48_ok[k] = 1;
+            n++;
+            continue;
+        }
+        // 两级都没有：留空缓存，交给 icon_draw_prog64（不在这条路上打点：绘制点会打一次）
     }
-    if (_binary_icon_start_bin_start) {
-        scale_rgba64(_binary_icon_start_bin_start, START_ICON_SRC, START_ICON_SRC,
-                     g_start24_cache, START_ICON_DISP, START_ICON_DISP);
+    int side = 0;
+    const uint8_t* s = start_icon_src64(&side);
+    if (s && side > 0) {
+        scale_rgba64(s, side, side, g_start24_cache, START_ICON_DISP, START_ICON_DISP);
         g_start24_ok = true;
         n++;
     }
@@ -749,22 +923,24 @@ int gui64_icon_cache_count64() {
     return n;
 }
 
-// 画桌面图标（kind 0..2）：有缓存只做混合；没缓存（进桌面之前）按旧路径的等价工作量做
-// "缩放进临时位图 + 混合"（采样公式与 blit_rgba 完全相同，像素逐点一致）。
+// 画桌面图标（kind 0..2）：有缓存只做混合；没有缓存（包与卷里都没有）走程序化兜底（1 个字）。
 void gui64_draw_icon_kind64(int x, int y, int kind) {
     if (x < 0 || y < 0 || kind < 0 || kind > 2) return;
     if (g_icon48_ok[kind]) { blit_rgba_scaled(x, y, ICON_W, ICON_W, g_icon48_cache[kind]); return; }
-    static uint8_t scratch[3][ICON_W * ICON_W * 4];
-    scale_rgba64(icon_src(kind), ICON_SRC_W, ICON_SRC_W, scratch[kind], ICON_W, ICON_W);
-    blit_rgba_scaled(x, y, ICON_W, ICON_W, scratch[kind]);
+    icon_draw_prog64(x, y, ICON_W, kind);
 }
 
+// 开始按钮图标的**老接口**（24x24 显示；Dock 走另一条路径）：有 24x24 缓存就混合；没有就现取现缩
+// （卷里 /etc/icon_start.bin 优先，其次内核里仅剩的 24x24 mip）。两者都没有时如实打点并不画 ——
+// 调用点（Dock/桌面）自己会画渐变底板，界面不会空。
 void gui64_draw_start_icon64(int x, int y) {
     if (x < 0 || y < 0) return;
     if (g_start24_ok) { blit_rgba_scaled(x, y, START_ICON_DISP, START_ICON_DISP, g_start24_cache); return; }
+    int side = 0;
+    const uint8_t* s = start_icon_src64(&side);
+    if (!s || side <= 0) return;
     static uint8_t scratch[START_ICON_DISP * START_ICON_DISP * 4];
-    scale_rgba64(_binary_icon_start_bin_start, START_ICON_SRC, START_ICON_SRC,
-                 scratch, START_ICON_DISP, START_ICON_DISP);
+    scale_rgba64(s, side, side, scratch, START_ICON_DISP, START_ICON_DISP);
     blit_rgba_scaled(x, y, START_ICON_DISP, START_ICON_DISP, scratch);
 }
 
@@ -811,15 +987,16 @@ static char g_clock_log[40] = {0};   // 上一次打点的时钟文本（变化�
 static void power_anim_screen(const char* txt, const char* log_tag) {
     dbg64_str(log_tag);
     dbg64_nl();
-    const int x0 = (g_screen_w - LOGO_W) / 2;
-    const int y0 = (g_screen_h - LOGO_H) / 2 - 20;
     const int pw = 360, ph = 12;
     const int px = (g_screen_w - pw) / 2;
-    const int py = y0 + LOGO_H + 56;
+    const int py = (g_screen_h - LOGO_H) / 2 - 20 + LOGO_H + 56;
     fb_clear(rgb(0, 0, 0));
-    blit_rgba(x0, y0, LOGO_W, LOGO_H, _binary_logo_rgba_bin_start, LOGO_W, LOGO_H, 255);
+    // ★ 本批（资源外置）：logo 不再内嵌 —— 用与开机画面同一个取用点（卷里 /etc/logo.bin，读不到走
+    //   内置 kaisi 图标兜底），这样"开机/关机看到的是同一张图"这条性质保持不变。
+    int rx = 0, ry = 0, rw = 0, rh = 0;
+    boot_logo_draw64(255, &rx, &ry, &rw, &rh);
     const int tw = text_w(txt);
-    text_ttf((g_screen_w - tw) / 2, y0 + LOGO_H + 22, txt, rgb(240, 240, 240));
+    text_ttf((g_screen_w - tw) / 2, (g_screen_h - LOGO_H) / 2 - 20 + LOGO_H + 22, txt, rgb(240, 240, 240));
     fb_draw_rect(px - 1, py - 1, pw + 2, ph + 2, rgb(120, 120, 120));
     fb_flip();
     const uint32_t t0 = ticks64();
@@ -889,11 +1066,16 @@ static int      g_dock_bounce_dy = 0;
 // ★ 本批：整段动画里 |dy| 的**峰值**（每个 tick 跟踪；与测试采样帧率无关 —— 验收判据用它，
 //   避免"帧数/采样点绑机器性能"）。按下时清零，done 行里打出来。
 static int      g_dock_bounce_peak = 0;
-// Dock 开始按钮图标（46x46 RGBA）：优先 VimtuFS2 的 /logo/kaisi.png、/kaisi.png，
-// 兜底内核内嵌的 icon_start.bin（= 构建期 _make_start_icon.py 从 logo/kaisi.png 生成的 RGBA）。
+// Dock 开始按钮图标（46x46 RGBA），四条来源（按优先级；哪一条生效由 [DOCK64] start icon src= 如实写出）：
+//   ① VimtuFS2 的 /logo/kaisi.png、② /kaisi.png（二者都是**真图**；启动期由内核把内嵌 PNG 幂等装进卷）
+//   ③ 系统卷里的 /etc/icon_start.bin（64x64 RGBA，本轮从内核搬出去的那份外置资源）
+//   ④ 内核内嵌的 icon_start_mini.bin（24x24 mip = 2,304 B）—— 裸 system.img（无卷）时的**内置兜底**
+// 为什么保留第 ④ 条：tests/gui_modern64_test.py 的裸盘断言要求"无卷时如实用内置兜底图"
+//   （src=builtin:icon_start.bin + 该区域彩色像素足够），它同时也是"绝不把界面画空"的最后一道。
 static uint8_t g_dock_start_rgba[DOCK_START_DISP * DOCK_START_DISP * 4];
 static bool    g_dock_start_ok = false;
 static const char* g_dock_start_src = "builtin:icon_start.bin";
+static int     g_dock_start_srcside = START_ICON_MIP_SIDE;   // 生效来源的源图边长（打点用）
 
 static void dock_log_start64() {
     dbg64_line_begin64();
@@ -903,6 +1085,10 @@ static void dock_log_start64() {
     dbg64_dec((uint64_t)DOCK_START_DISP);
     dbg64_str(" ok=");
     dbg64_dec((uint64_t)(g_dock_start_ok ? 1 : 0));
+    dbg64_str(" srcside=");                 // 源图边长（158 = 盘上真图 PNG；64 = 卷里 raw；24 = 内置 mip）
+    dbg64_dec((uint64_t)g_dock_start_srcside);
+    dbg64_str(" mip=");
+    dbg64_dec((uint64_t)(g_dock_start_srcside == START_ICON_MIP_SIDE ? 1 : 0));
     dbg64_nl();
     dbg64_line_end64();
 }
@@ -939,20 +1125,42 @@ static void dock_start_icon_init64() {
     for (int i = 0; i < 2; i++) {
         Img64 im{};
         if (img64_load_vfs64(cand[i], &im) == 0) {
+            const int src_side = im.h;   // 真图的源边长（158）：打点里如实写出，别留着初始的 mip 值
             dock_rgba_from_img64(&im, g_dock_start_rgba, DOCK_START_DISP, DOCK_START_DISP);
-            img64_free64(&im);
+            img64_free64(&im);           // 注意：free 会把 w/h 归零，所以边长先取出来
             g_dock_start_ok = true;
             g_dock_start_src = cand_src[i];  // 打点里写实际路径（验收要求 src=vfs:/logo/kaisi.png）
+            g_dock_start_srcside = src_side;
             dock_log_start64();
             return;
         }
     }
-    // 2) 兜底：内核内嵌 RGBA（就是 logo/kaisi.png 的内容）
-    if (_binary_icon_start_bin_start) {
-        scale_rgba64(_binary_icon_start_bin_start, START_ICON_SRC, START_ICON_SRC,
-                     g_dock_start_rgba, DOCK_START_DISP, DOCK_START_DISP);
-        g_dock_start_ok = true;
-        g_dock_start_src = "builtin:icon_start.bin";
+    // 2) 兜底一：系统卷里的 /etc/icon_start.bin（64x64 RGBA，本轮搬出去的那份外置资源）
+    {
+        const int want = START_ICON_SRC * START_ICON_SRC * 4;
+        uint8_t* raw = nullptr;
+        if (img64_load_asset64(START64_ASSET_PATH, (uint32_t)want, &raw) == want && raw) {
+            scale_rgba64(raw, START_ICON_SRC, START_ICON_SRC,
+                         g_dock_start_rgba, DOCK_START_DISP, DOCK_START_DISP);
+            kfree_64(raw);
+            g_dock_start_ok = true;
+            g_dock_start_src = "vfs:" START64_ASSET_PATH;
+            g_dock_start_srcside = START_ICON_SRC;
+            dock_log_start64();
+            return;
+        }
+        if (raw) kfree_64(raw);
+    }
+    // 3) 兜底二（**内置**）：icon_start_mini.bin = 24x24 mip（build64.sh 从 64x64 原图子采样生成）
+    {
+        int mip_side = 0;
+        const uint8_t* mip = start_icon_src64(&mip_side);
+        if (mip && mip_side == START_ICON_MIP_SIDE) {
+            scale_rgba64(mip, mip_side, mip_side, g_dock_start_rgba, DOCK_START_DISP, DOCK_START_DISP);
+            g_dock_start_ok = true;
+            g_dock_start_src = "builtin:icon_start.bin";
+            g_dock_start_srcside = mip_side;
+        }
     }
     dock_log_start64();
 }
@@ -1334,8 +1542,9 @@ static void dock_draw_one64(int idx, int cx, int icon_px, int hovered, const The
     const int kind = kDockItems[idx].icon_kind;
     const int app64 = kDockItems[idx].icon64;
     // ★ 本批（真图标）：Dock 上的应用图标统一走"圆角渐变底 + 外置图标包里的真图标"；
-    //   包缺失/解码失败 -> 落回下面的内嵌位图 / 渐变底 + 首字母（界面不会空）。
-    //   （不先问 icons64_available64：让"取不到"这条路真的走到 icons64 里打 [ICON64] fallback 点）
+    //   包缺失/解码失败 -> 落回下面的预缩放缓存（包或卷里 /etc/icon_*.bin 的 48x48）/ 渐变底 + 首字母
+    //   （界面不会空）。（不先问 icons64_available64：让"取不到"这条路真的走到 icons64 里打
+    //   [ICON64] fallback 点）
     if (app64 > 0) {
         uint32_t a0 = t->grad_a, a1 = t->grad_b;
         if (idx % 3 == 1) { a0 = t->grad_b; a1 = t->accent; }
@@ -1350,9 +1559,13 @@ static void dock_draw_one64(int idx, int cx, int icon_px, int hovered, const The
         }
     }
     if (kind >= 0 && kind <= 2) {
-        // 我的电脑 / 回收站 / 终端：内核内嵌程序化位图（128x128 -> icon_px）
-        blit_rgba(x, y, icon_px, icon_px, icon_src(kind), ICON_SRC_W, ICON_SRC_W, 255);
-        return;
+        // 我的电脑 / 回收站 / 终端：★ 本批**内核里不再有** 128x128 的 raw 位图（搬进系统卷了）——
+        //   用预缩放缓存 g_icon48_cache（来源：图标包 或 卷里 /etc/icon_*.bin）缩放到 icon_px 混合；
+        //   缓存也没有（包坏 + 卷里缺文件）就落回下面的"渐变底 + 首字母"，并在绘制点打过点。
+        if (g_icon48_ok[kind]) {
+            blit_rgba(x, y, icon_px, icon_px, g_icon48_cache[kind], ICON_W, ICON_W, 255);
+            return;
+        }
     }
     // 其它应用：圆角正方形 + 主题渐变（扁平但有立体感：渐变 + 1px 高光边）
     uint32_t c0 = t->grad_a, c1 = t->grad_b;
