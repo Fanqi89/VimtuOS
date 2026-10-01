@@ -72,6 +72,26 @@
 //     （**不假装成功**；它们不是 enosys 号，所以不会污染"不得出现 enosys"那些断言）。
 //   打点：[WL64] init / surface create / attach / commit / blit / composite / seat event /
 //         surface destroy / release / selftest / demo —— 见 kernel/wl64.h 的清单。
+//   ==================== ★ B-wm：Ring 3 合成器（号 22..26）====================
+//   目标：把"合成 + 上屏"从内核搬到用户态合成器进程（/bin/wm）—— 内核只留 surface 表、提交队列、
+//   缓冲页映射、seat 路由/投递、fb_map/fb_flip。接口/语义/错误码的唯一定义点 = kernel/wl64.h。
+//   22 wl_composer_get()            -> (seat id) | (gpu<<8)；注册当前进程为合成器 + 申请焦点/捕获
+//   23 wl_surface_export(idx, out)  -> 0 = 填好一条 Wl64SurfaceInfo(64B)；1 = 该下标没有 surface
+//   24 wl_surface_map(surf, out)    -> 0；把该 surface 的缓冲页映射进合成器（Wl64SurfaceMap(16B)）
+//   25 wl_surface_ack(surf)         -> 0；合成器声明"这条合成完了"（清 pending/damage、content=1）
+//   26 wl_seat_post(out_ev)         -> 投递到的 pid；合成器把事件投回目标 surface 的拥有者队列
+//   22..26 只有注册过的合成器能调（其它进程 EPERM）；没有合成器时内核继续走 15..21 的老路
+//   （dispatch 里合成、打 [WL64] composite），两条路互不影响。安装介质内核不链 wl64.cpp -> deny。
+//   ==================== ★ B-wm：Ring 3 合成器（号 22..26）====================
+//   目标：把"合成 + 上屏"从内核搬到用户态合成器进程（/bin/wm）—— 内核只留 surface 表、提交队列、
+//   缓冲页映射、seat 路由/投递、fb_map/fb_flip。接口/语义/错误码的唯一定义点 = kernel/wl64.h。
+//   22 wl_composer_get()            -> (seat id) | (gpu<<8)；注册当前进程为合成器 + 申请焦点/捕获
+//   23 wl_surface_export(idx, out)  -> 0 = 填好一条 Wl64SurfaceInfo(64B)；1 = 该下标没有 surface
+//   24 wl_surface_map(surf, out)    -> 0；把该 surface 的缓冲页映射进合成器（Wl64SurfaceMap(16B)）
+//   25 wl_surface_ack(surf)         -> 0；合成器声明"这条合成完了"（清 pending/damage、content=1）
+//   26 wl_seat_post(out_ev)         -> 投递到的 pid；合成器把事件投回目标 surface 的拥有者队列
+//   22..26 只有注册过的合成器能调（其它进程 EPERM）；没有合成器时内核继续走 15..21 的老路
+//   （dispatch 里合成、打 [WL64] composite），两条路互不影响。安装介质内核不链 wl64.cpp -> deny。
 //
 //   错误码（负数，两个入口的 errno 风格一致，**不与 Linux 号段共用号**）：
 //     -1 = EPERM  用户窗口/页表不可用（UEFI 固件只读页表，见 kernel/usermode64.cpp）

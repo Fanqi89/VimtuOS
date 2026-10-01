@@ -166,6 +166,12 @@ int64_t wl64_surface_commit64(uint64_t)                           __attribute__(
 int64_t wl64_surface_destroy64(uint64_t)                          __attribute__((weak));
 int64_t wl64_seat_get64()                                        __attribute__((weak));
 int64_t wl64_display_dispatch64(uint64_t, uint64_t, uint64_t)     __attribute__((weak));
+// ★ B-wm：Ring 3 合成器（kernel/wl64.cpp 的 22..26；安装内核不链 wl64.cpp -> 0 -> 返回 -1 并 deny）
+int64_t wl64_composer_get64(uint64_t)                              __attribute__((weak));
+int64_t wl64_surface_export64(uint64_t, uint64_t)                 __attribute__((weak));
+int64_t wl64_surface_map64(uint64_t, uint64_t)                    __attribute__((weak));
+int64_t wl64_surface_ack64(uint64_t)                              __attribute__((weak));
+int64_t wl64_seat_post64(uint64_t)                                __attribute__((weak));
 // ★ A4-5：信号投递（kernel/sig64.cpp）**两份内核都链**它，所以这里是强引用（不是弱引用）；
 //   它内部对 proc64 的访问才是弱引用（安装内核没有进程表 -> 只做参数校验，如实不投递）。
 static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
@@ -1799,6 +1805,39 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
         if (!wl64_display_dispatch64) syscall64_deny64(nr, a2);
         break;
 
+    // ★ B-wm：Ring 3 合成器（自有 ABI 22..26）。语义/结构/错误码：kernel/wl64.h 的 "B-wm" 段。
+    //   号位对应（rdi/rsi/rdx/r10 = 参数 1..4）：
+    //     22 wl_composer_get()
+    //     23 wl_surface_export(idx, out)
+    //     24 wl_surface_map(surf, out)
+    //     25 wl_surface_ack(surf)
+    //     26 wl_seat_post(out_ev)
+    //   只有注册过的合成器进程能调（权限判定在 wl64.cpp 里，这里只转交）。
+    //   安装介质内核不链 wl64.cpp -> weak 为 0 -> 返回 -1 并打 [SYSCALL] deny（**不假装成功**）。
+    case 22:                                                    // wl_composer_get(out_rect)
+        ret = wl64_composer_get64 ? wl64_composer_get64(a1) : -1;
+        if (!wl64_composer_get64) syscall64_deny64(nr, 0);
+        break;
+
+    case 23:                                                    // wl_surface_export(idx, out)
+        ret = wl64_surface_export64 ? wl64_surface_export64(a1, a2) : -1;
+        if (!wl64_surface_export64) syscall64_deny64(nr, a2);
+        break;
+
+    case 24:                                                    // wl_surface_map(surf, out)
+        ret = wl64_surface_map64 ? wl64_surface_map64(a1, a2) : -1;
+        if (!wl64_surface_map64) syscall64_deny64(nr, a2);
+        break;
+
+    case 25:                                                    // wl_surface_ack(surf)
+        ret = wl64_surface_ack64 ? wl64_surface_ack64(a1) : -1;
+        if (!wl64_surface_ack64) syscall64_deny64(nr, a1);
+        break;
+
+    case 26:                                                    // wl_seat_post(out_ev)
+        ret = wl64_seat_post64 ? wl64_seat_post64(a1) : -1;
+        if (!wl64_seat_post64) syscall64_deny64(nr, a1);
+        break;                                              // ★ 这条 case 的 break 不能少：少了会掉进 48 号（pci_map_bar）
     default:
         ret = -1;
         break;

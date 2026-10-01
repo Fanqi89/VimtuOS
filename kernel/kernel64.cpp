@@ -1156,6 +1156,11 @@ static void rust64_boot_init64() {
                 //   脚本的断言）。两种模式见 wl64.h：卷里有 /etc/wl64_probe = 完整演示（验收脚本的
                 //   夹具会写它，含 seat 监听），没有 = 短模式（2 帧，~1 s，别的脚本几乎不受影响）。
                 (void)wl64_demo64("/wlclient.elf");
+                // ---- ★ B-wm：把"图形"搬到 Ring 3 —— 用户态合成器 /bin/wm + 两个真客户端 ----
+                //   内核只做映射/提交/输入（fb_map/fb_flip/input_poll + 22..26 号）；合成在用户态。
+                //   交付纪律同 /wlclient.elf：**卷里的文件**（夹具写 /bin/wm.elf + /etc/wm_probe）；
+                //   没有它就只打一行 [WL64] wm skipped，不进桌面之后也不改变任何行为。
+                (void)wl64_wm64("/bin/wm.elf");
 
             } else {
                 proc64_init64();                                 // 仍然打点：mode=shared（如实）

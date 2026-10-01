@@ -128,6 +128,16 @@ static uint32_t    g_wl64_created64 = 0;      // 累计创建（槽位 = created
 // 面板（可见区域）几何：init 里按当前屏幕算一次
 static int  g_wl64_px64 = 0, g_wl64_py64 = 0, g_wl64_pw64 = 0, g_wl64_ph64 = 0;
 static int  g_wl64_panel_ok64 = 0;            // 1 = 面板可用（fb 已初始化且放得下）
+// ★ B-wm：注册过的 Ring 3 合成器（0 = 没有 -> 走 A5 的内核合成老路）。
+// 为什么要这个状态位：同一个内核里两条合成路必须**互斥且可判定** —— 有合成器时内核一个像素
+// 都不许碰面板（否则"合成在用户态"这句话就是假的）；没有合成器时（/wlclient.elf 的既有验收）
+// 行为必须逐条不变。它只决定"谁来合成"，不改任何 surface/缓冲/提交语义。
+static int      g_wl64_wm_pid64      = 0;
+static uint64_t g_wl64_wm_exports64  = 0;     // 累计导出条数（诊断）
+static uint64_t g_wl64_wm_maps64     = 0;     // 累计映射条数（诊断）
+static uint64_t g_wl64_wm_acks64     = 0;     // 累计 ack 条数（诊断）
+static uint64_t g_wl64_wm_posts64    = 0;     // 累计 seat 投递条数（诊断）
+static uint32_t g_wl64_wm_hint_log64 = 0;     // "composite=external" 提示行的打印预算（防刷屏）
 static int  g_wl64_painted64 = 0;             // 面板底色/边框是否已经画过（只在第一次合成时画）
 
 // seat：座位 id（每个持有者都是 1，语义 = "这台显示器的那个座位"）+ 每 pid 的键盘焦点 surface
@@ -219,8 +229,14 @@ static void wl64_layout64() {
     g_wl64_panel_ok64 = 1;
     g_wl64_pw64 = pw;
     g_wl64_ph64 = ph;
-    g_wl64_px64 = (fw - pw) / 2;
-    g_wl64_py64 = (fh - ph) / 2;
+    // ★ B-wm：可见区域 = 屏幕**右下角**的"外部面板区"（320x200），**避开 Dock**（Dock 高 60 +
+    //   离底边 16 = 76，见 kernel/theme64.h 的 THEME64_DOCK_H/MARGIN 与 gui64 的 g_dock_*）。
+    //   为什么从"居中"改成"右下"：内核外壳（gui64/panels64/explorer64）是屏幕的主人，Ring 3
+    //   合成器只是**租用一块明确的区域**；贴右下角、避开 Dock 与左侧桌面图标是"互不干扰"最容易
+    //   讲清楚的一种切法。谁拥有整屏、如何逐步搬家见 docs/应用层与系统调用说明.md 文末的
+    //   "Ring 3 合成器（外壳外置第一步）"节。
+    g_wl64_px64 = fw - pw - (int)WL64_PANEL_MARGIN64;
+    g_wl64_py64 = fh - ph - (int)WL64_PANEL_BOTTOM64;
     if (g_wl64_px64 < 0) g_wl64_px64 = 0;
     if (g_wl64_py64 < 0) g_wl64_py64 = 0;
 }
@@ -406,6 +422,17 @@ static void wl64_free_surface64(Wl64Surface* s, const char* why) {
             refs_after = (int)refs;
         }
     }
+    // ★ B-wm：把它在**合成器**地址空间里的缓冲映射窗也撤掉（注销 PTE）。
+    // 为什么必须做：shm 页帧在引用归零后会被还回页池，留着 PTE 就等于给合成器留了一个
+    // "指向已回收物理页"的读写窗口（越权 + 读到别人的页）。页帧本身不在这里回收（属于 shm 对象）。
+    if (g_wl64_wm_pid64) {
+        const uint64_t wva = wl64_surf_win_va64(s->slot);
+        for (uint32_t i = 0; i < (uint32_t)WL64_MAX_FRAMES64; i++) {
+            if (!user64_page_is_user_ok64(wva + (uint64_t)i * PAGE_SIZE_64)) break;
+            (void)user64_unmap_page64(wva + (uint64_t)i * PAGE_SIZE_64);
+        }
+        user64_paging_sync64();
+    }
     wl64_begin64();
     wl64_puts64("[WL64] surface destroy id="); wl64_udec64(s->id);
     wl64_puts64(" pid=");                      wl64_dec64(s->pid);
@@ -434,6 +461,23 @@ extern "C" void wl64_proc_release64(int pid) {
         surfs++;
     }
     *wl64_focus_slot64(pid) = 0;
+    // ★ B-wm：合成器进程退出/被杀 -> **交回合成权**（回到 A5 的内核合成老路）。
+    // 为什么必须做：内核不能留着一个指向已死进程的"合成权"——否则提交队列永远没人来拉，
+    // 表面上看就是"客户端提交了却什么都不显示"（假死）。交回之后内核合成继续工作，
+    // 桌面外壳与后来的 /wlclient.elf 都不受影响（验收 ⑦ 钉的就是这一条）。
+    if (g_wl64_wm_pid64 == pid) {
+        wl64_begin64();
+        wl64_puts64("[WL64] composer release pid="); wl64_dec64(pid);
+        wl64_puts64(" exports=");                    wl64_udec64(g_wl64_wm_exports64);
+        wl64_puts64(" maps=");                       wl64_udec64(g_wl64_wm_maps64);
+        wl64_puts64(" acks=");                       wl64_udec64(g_wl64_wm_acks64);
+        wl64_puts64(" posts=");                      wl64_udec64(g_wl64_wm_posts64);
+        wl64_puts64(" mode=internal");
+        wl64_nl64();
+        wl64_end64();
+        g_wl64_wm_pid64 = 0;
+        g_wl64_wm_hint_log64 = 0;
+    }
     if (surfs > 0 || refs_ret > 0) {
         wl64_begin64();
         wl64_puts64("[WL64] release pid=");         wl64_dec64(pid);
@@ -665,8 +709,24 @@ int64_t wl64_display_dispatch64(uint64_t timeout_ms, uint64_t out_uptr, uint64_t
     if (!q) return WL64_ENODEV64;
 
     // ---- ① 合成（本轮的提交队列）----
-    uint32_t bytes = 0;
-    (void)wl64_flush64(&bytes);
+    //   ★ B-wm：注册了 Ring 3 合成器就**什么都不合成** —— 提交队列留在表里，由合成器用
+    //   wl_surface_export(23) 拉取 + 自己合成 + wl_surface_ack(25) 确认。这里只打一行计数
+    //   （前 8 轮），让"内核没有合成"这件事在串口上可核对（[WL64] composite 一行都不会再出现）。
+    if (g_wl64_wm_pid64 == 0) {
+        uint32_t bytes = 0;
+        (void)wl64_flush64(&bytes);
+    } else if (g_wl64_wm_hint_log64 < 8) {
+        uint32_t pend = 0;
+        for (uint32_t i = 0; i < WL64_MAX_SURFACES64; i++)
+            if (g_wl64_surfs[i].used && g_wl64_surfs[i].pending) pend++;
+        g_wl64_wm_hint_log64++;
+        wl64_begin64();
+        wl64_puts64("[WL64] dispatch pid="); wl64_dec64(pid);
+        wl64_puts64(" composite=external pending="); wl64_udec64((uint64_t)pend);
+        wl64_puts64(" owner="); wl64_dec64((int64_t)g_wl64_wm_pid64);
+        wl64_nl64();
+        wl64_end64();
+    }
 
     // ---- ② 事件（没有就按 timeout 有界等待）----
     Ev64Event raw[EV64_MAX_EVENTS64];
@@ -741,6 +801,224 @@ int64_t wl64_display_dispatch64(uint64_t timeout_ms, uint64_t out_uptr, uint64_t
     return (int64_t)got;
 }
 
+// ==================== ★ B-wm：Ring 3 合成器的系统调用落点（号 22..26）====================
+// 语义/ABI/错误码的唯一定义点在 kernel/wl64.h 的 "B-wm" 段。这一段的共同前提：
+//   **只有注册过的合成器进程**能调（否则 EPERM）—— 否则任何进程都能读别人的缓冲（越权）。
+static inline bool wl64_is_wm64(int64_t pid) {
+    return pid > 0 && g_wl64_wm_pid64 == (int)pid;
+}
+
+// 22 wl_composer_get(out_rect)
+// 注册当前进程为合成器（幂等）+ 申请键盘焦点与指针捕获（复用 input_poll 的 flags，
+// 所以"谁拿输入"与既有 EV64 口径完全一致，不新增一套路由状态）；out_rect != 0 时把内核
+// 租给它的"外部面板区"写回去（合成器据此划自己的地盘，不再猜）。
+// 返回值：(seat id) | (gpu << 8)：gpu = 1 表示显示后端是 virtio-gpu 2D 设备（fb_backend_name64），
+//   Ring 3 合成器据此决定"够大的矩形才值得交给设备提交路径"。**如实**：没设备就是 0（soft-lfb）。
+int64_t wl64_composer_get64(uint64_t out_rect_uptr) {
+    const int64_t pid = wl64_pid64();
+    if (pid <= 0) return WL64_EPERM64;
+    if (!g_wl64_panel_ok64) return WL64_ENODEV64;
+    if (out_rect_uptr && !user64_range_ok64(out_rect_uptr, (uint64_t)WL64_RECT_SIZE64)) return WL64_EFAULT64;
+    const int64_t rc = ev64_poll64(0, 0, EV64_FLAG_FOCUS64 | EV64_FLAG_CAPTURE64);
+    if (rc < 0) return rc;
+    const bool re = (g_wl64_wm_pid64 == (int)pid);
+    if (!re && g_wl64_wm_pid64) {
+        // 换人：旧合成器的 surface 不动（它自己在退出路径上 destroy），只把"合成权"交出去。
+        wl64_begin64();
+        wl64_puts64("[WL64] composer replace prev="); wl64_dec64((int64_t)g_wl64_wm_pid64);
+        wl64_puts64(" new=");                         wl64_dec64(pid);
+        wl64_nl64();
+        wl64_end64();
+    }
+    g_wl64_wm_pid64 = (int)pid;
+    const char* backend = fb_backend_name64();
+    const uint32_t gpu = (backend && backend[0] == 'v') ? 1u : 0u;   // "virtio-gpu-2d" vs "soft-lfb"
+    wl64_begin64();
+    wl64_puts64("[WL64] composer pid=");  wl64_dec64(pid);
+    wl64_puts64(" seat=");                wl64_udec64((uint64_t)WL64_SEAT_ID64);
+    wl64_puts64(" gpu=");                 wl64_udec64((uint64_t)gpu);
+    wl64_puts64(" backend=");             wl64_puts64(backend ? backend : "?");
+    wl64_puts64(" surfs=");               wl64_udec64((uint64_t)g_wl64_live64);
+    wl64_puts64(" re=");                  wl64_udec64(re ? 1u : 0u);
+    wl64_puts64(" rect=");                wl64_dec64(g_wl64_px64); wl64_puts64(",");
+    wl64_dec64(g_wl64_py64);              wl64_puts64(",");
+    wl64_dec64(g_wl64_pw64);              wl64_puts64(","); wl64_dec64(g_wl64_ph64);
+    wl64_nl64();
+    wl64_end64();
+    if (out_rect_uptr) {
+        Wl64Rect r;
+        r.x = g_wl64_px64; r.y = g_wl64_py64; r.w = g_wl64_pw64; r.h = g_wl64_ph64;
+        *(Wl64Rect*)(uintptr_t)out_rect_uptr = r;
+    }
+    return (int64_t)WL64_SEAT_ID64 | ((int64_t)gpu << 8);
+}
+
+// 23 wl_surface_export(idx, out)：把第 idx 个 surface 槽的只读快照写进 *(Wl64SurfaceInfo*)out。
+// 返回 0 = 填好；1 = 这个下标没有 surface（合成器据此结束遍历）；负 = 错误码。
+int64_t wl64_surface_export64(uint64_t idx, uint64_t out_uptr) {
+    const int64_t pid = wl64_pid64();
+    if (pid <= 0) return WL64_EPERM64;
+    if (!wl64_is_wm64(pid)) return WL64_EPERM64;
+    if (idx >= (uint64_t)WL64_MAX_SURFACES64) return WL64_EINVAL64;
+    if (!user64_range_ok64(out_uptr, (uint64_t)WL64_SURFINFO_SIZE64)) {
+        wl64_begin64();
+        wl64_puts64("[WL64] export FAILED pid="); wl64_dec64(pid);
+        wl64_puts64(" reason=bad-out-ptr err=");  wl64_dec64(-WL64_EFAULT64);
+        wl64_nl64();
+        wl64_end64();
+        return WL64_EFAULT64;
+    }
+    const Wl64Surface* s = &g_wl64_surfs[idx];
+    if (!s->used) return 1;
+    Wl64SurfaceInfo info;
+    info.id = s->id;
+    info.pid = s->pid;
+    info.w = s->w;
+    info.h = s->h;
+    info.x = s->x;
+    info.y = s->y;
+    info.shm_id = s->shm_id;
+    info.shm_off = s->shm_off;
+    info.shm_bytes = s->shm_bytes;
+    info.refs = 0;
+    if (s->shm_id) {
+        uint64_t tmp[WL64_MAX_FRAMES64];
+        uint32_t pages = 0, refs = 0;
+        if (proc64_shm_view64((uint32_t)s->shm_id, tmp, WL64_MAX_FRAMES64, &pages, &refs) == 0) info.refs = refs;
+    }
+    // 没有 damage = 整面（与 commit 打点同一口径，见 wl64.h 语义 4）
+    info.dmg_x = s->have_damage ? s->dmg_x : 0;
+    info.dmg_y = s->have_damage ? s->dmg_y : 0;
+    info.dmg_w = s->have_damage ? s->dmg_w : (int32_t)s->w;
+    info.dmg_h = s->have_damage ? s->dmg_h : (int32_t)s->h;
+    info.flags = (s->pending ? WL64_SURFINFO_PENDING64 : 0u) |
+                 (s->content ? WL64_SURFINFO_CONTENT64 : 0u) |
+                 (s->shm_id  ? WL64_SURFINFO_HASBUF64  : 0u);
+    info.pad = 0;
+    *(Wl64SurfaceInfo*)(uintptr_t)out_uptr = info;
+    g_wl64_wm_exports64++;
+    wl64_begin64();
+    wl64_puts64("[WL64] export i=");   wl64_udec64(idx);
+    wl64_puts64(" id=");               wl64_udec64(s->id);
+    wl64_puts64(" pid=");              wl64_dec64(s->pid);
+    wl64_puts64(" rect=");             wl64_dec64(s->x); wl64_puts64(","); wl64_dec64(s->y);
+    wl64_puts64(",");                  wl64_udec64(s->w); wl64_puts64(","); wl64_udec64(s->h);
+    wl64_puts64(" buf=");              wl64_dec64(s->shm_id);
+    wl64_puts64(" off=");              wl64_udec64(s->shm_off);
+    wl64_puts64(" dmg=");              wl64_dec64(info.dmg_x); wl64_puts64(",");
+    wl64_dec64(info.dmg_y);            wl64_puts64(",");
+    wl64_dec64(info.dmg_w);            wl64_puts64(","); wl64_dec64(info.dmg_h);
+    wl64_puts64(" flags=");            wl64_udec64((uint64_t)info.flags);
+    wl64_nl64();
+    wl64_end64();
+    return 0;
+}
+
+// 24 wl_surface_map(surf, out)：把该 surface attach 的缓冲页映射进**合成器**的地址空间。
+// 映射窗 = FB 映射区顶部 512 KiB 里的第 slot 个 64 KiB（见 wl64.h 的说明）。
+// 幂等：同一个 surface 重复调用只重打一行 re=1（页表项写法相同，重写无副作用）。
+int64_t wl64_surface_map64(uint64_t surf, uint64_t out_uptr) {
+    const int64_t pid = wl64_pid64();
+    if (pid <= 0) return WL64_EPERM64;
+    if (!wl64_is_wm64(pid)) return WL64_EPERM64;
+    if (!user64_range_ok64(out_uptr, (uint64_t)WL64_SURFMAP_SIZE64)) return WL64_EFAULT64;
+    Wl64Surface* s = wl64_find64((uint32_t)surf);
+    if (!s) return WL64_ENOENT64;
+    if (!s->shm_id || s->shm_pages == 0) return WL64_ENOENT64;   // 还没有缓冲
+    const uint64_t va = wl64_surf_win_va64(s->slot);
+    const int re = user64_page_is_user_ok64(va) ? 1 : 0;
+    for (uint32_t i = 0; i < s->shm_pages && i < (uint32_t)WL64_MAX_FRAMES64; i++) {
+        if (!user64_map_phys_page64(va + (uint64_t)i * PAGE_SIZE_64, s->frames[i],
+                                    PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64)) {
+            wl64_begin64();
+            wl64_puts64("[WL64] surfmap FAILED id="); wl64_udec64(s->id);
+            wl64_puts64(" page=");                    wl64_udec64((uint64_t)i);
+            wl64_puts64(" err=");                     wl64_dec64(-WL64_ENOSPC64);
+            wl64_nl64();
+            wl64_end64();
+            return WL64_ENOSPC64;
+        }
+    }
+    user64_paging_sync64();
+    const uint32_t u = user64_page_is_user_ok64(va) ? 1u : 0u;
+    Wl64SurfaceMap m;
+    m.va = va;
+    m.bytes = s->shm_pages * (uint32_t)PAGE_SIZE_64;
+    m.pages = s->shm_pages;
+    *(Wl64SurfaceMap*)(uintptr_t)out_uptr = m;
+    g_wl64_wm_maps64++;
+    wl64_begin64();
+    wl64_puts64("[WL64] surfmap id=");  wl64_udec64(s->id);
+    wl64_puts64(" shm=");               wl64_dec64(s->shm_id);
+    wl64_puts64(" va=0x");              wl64_udec64(va);
+    wl64_puts64(" bytes=");             wl64_udec64((uint64_t)m.bytes);
+    wl64_puts64(" pages=");             wl64_udec64((uint64_t)m.pages);
+    wl64_puts64(" re=");                wl64_udec64(re ? 1u : 0u);
+    wl64_puts64(" u=");                 wl64_udec64((uint64_t)u);
+    wl64_nl64();
+    wl64_end64();
+    return u ? 0 : WL64_ENOSPC64;
+}
+
+// 25 wl_surface_ack(surf)：合成器声明"这条我合成完了" —— 清 pending/damage、content=1
+// （content=1 之后内核的命中测试才会把事件路由到它：与"屏上有它的像素"同一口径）。
+int64_t wl64_surface_ack64(uint64_t surf) {
+    const int64_t pid = wl64_pid64();
+    if (pid <= 0) return WL64_EPERM64;
+    if (!wl64_is_wm64(pid)) return WL64_EPERM64;
+    Wl64Surface* s = wl64_find64((uint32_t)surf);
+    if (!s) return WL64_ENOENT64;
+    const uint32_t was_pending = s->pending;
+    const int w = s->have_damage ? s->dmg_w : (int)s->w;
+    const int h = s->have_damage ? s->dmg_h : (int)s->h;
+    s->pending = 0;
+    s->have_damage = 0;
+    s->ndamage = 0;
+    s->content = 1;
+    g_wl64_wm_acks64++;
+    wl64_begin64();
+    wl64_puts64("[WL64] ack id=");      wl64_udec64(s->id);
+    wl64_puts64(" dmg=");
+    wl64_dec64(was_pending ? s->dmg_x : 0); wl64_puts64(",");
+    wl64_dec64(was_pending ? s->dmg_y : 0); wl64_puts64(",");
+    wl64_dec64(w);                          wl64_puts64(",");
+    wl64_dec64(h);
+    wl64_puts64(" pending=");           wl64_udec64((uint64_t)was_pending);
+    wl64_nl64();
+    wl64_end64();
+    return 0;
+}
+
+// 26 wl_seat_post(out_ev)：合成器把一条事件**投回**目标 surface 拥有者的队列（用户态路由）。
+// *ev = Wl64SeatEvent（64 B），只用 surf 做寻址（其余字段就是事件本体）。返回投递到的 pid。
+// 为什么这么切：合成器是唯一知道"哪块 surface 在最上面"的用户态实体（它自己合成），
+//   所以命中测试搬到了用户态；内核只负责"把这条事件放进 pid 的队列"（不猜路由）。
+int64_t wl64_seat_post64(uint64_t out_ev_uptr) {
+    const int64_t pid = wl64_pid64();
+    if (pid <= 0) return WL64_EPERM64;
+    if (!wl64_is_wm64(pid)) return WL64_EPERM64;
+    if (!user64_range_ok64(out_ev_uptr, (uint64_t)WL64_SEAT_EVENT_SIZE64)) return WL64_EFAULT64;
+    const Wl64SeatEvent* se = (const Wl64SeatEvent*)(uintptr_t)out_ev_uptr;
+    Wl64Surface* s = wl64_find64(se->surf);
+    if (!s) return 0;                                   // 目标没了：如实返回 0（不投给任何人）
+    void* qv = proc64_evq_of64(s->pid);
+    if (!qv) return 0;
+    ev64_push64((Ev64Queue*)qv, s->pid, &se->ev);
+    g_wl64_wm_posts64++;
+    wl64_begin64();
+    wl64_puts64("[WL64] seatpost surf="); wl64_udec64(s->id);
+    wl64_puts64(" pid=");                 wl64_dec64(s->pid);
+    wl64_puts64(" type=");                wl64_udec64(se->ev.type);
+    wl64_puts64(" x=");                   wl64_dec64(se->ev.x);
+    wl64_puts64(" y=");                   wl64_dec64(se->ev.y);
+    wl64_nl64();
+    wl64_end64();
+    return (int64_t)s->pid;
+}
+
+// 诊断：当前注册的合成器 pid（0 = 没有）
+int wl64_composer_pid64() { return g_wl64_wm_pid64; }
+
 // ==================== 初始化 / 标定 / 自检 ====================
 // rdtsc -> us 标定：用 PIT tick（250Hz）量一小段时间的周期数。为了不浪费启动时间只量 ~20ms。
 // 标定失败（dt=0 / tsc 不动）时 g_wl64_tsc_per_ms64 = 0 -> us 打 0（如实，不编数）。
@@ -759,7 +1037,8 @@ static void wl64_calib64() {
     else                   g_wl64_tsc_per_ms64 = 0;
 }
 
-// 位掩码：bit0 ABI 布局 / bit1 纯函数（矩形） / bit2 无进程上下文的负例 / bit3 几何在屏内
+// 位掩码：bit0 ABI 布局 / bit1 纯函数（矩形） / bit2 无进程上下文的负例 / bit3 几何在屏内 /
+//         bit4 ★ B-wm 合成器 ABI（22..26 的结构体布局 + 映射窗不与后备缓冲重叠）
 int wl64_selftest64() {
     int fail = 0;
 
@@ -803,6 +1082,12 @@ int wl64_selftest64() {
         if (wl64_surface_destroy64(1) != WL64_EPERM64) fail |= 4;
         if (wl64_seat_get64() != WL64_EPERM64) fail |= 4;
         if (wl64_display_dispatch64(0, 0, 1) != WL64_EPERM64) fail |= 4;
+        // ★ B-wm：合成器专属调用在**没有合成器 / 没有进程上下文**时一律 EPERM（不假装有合成器）
+        if (wl64_surface_export64(0, 0) != WL64_EPERM64) fail |= 4;
+        if (wl64_surface_map64(1, 0) != WL64_EPERM64) fail |= 4;
+        if (wl64_surface_ack64(1) != WL64_EPERM64) fail |= 4;
+        if (wl64_seat_post64(0) != WL64_EPERM64) fail |= 4;
+        if (wl64_composer_get64(0) != WL64_EPERM64) fail |= 4;   // 没有进程上下文：不许注册成功
     }
 
     // ---- bit3：面板/槽位几何在屏内（放得下才检查）----
@@ -818,6 +1103,28 @@ int wl64_selftest64() {
             if (sx + 64 > g_wl64_px64 + g_wl64_pw64 || sy + 64 > g_wl64_py64 + g_wl64_ph64) fail |= 8;
         }
     }
+    // ---- bit4 起：与面板无关（面板放不下时也要查 ABI 布局）----
+
+    // ---- bit4：★ B-wm 合成器 ABI（22..26）的结构体布局 + 映射窗不与后备缓冲重叠 ----
+    if (WL64_SURFINFO_SIZE64 != 64 || WL64_SURFMAP_SIZE64 != 16 || WL64_RECT_SIZE64 != 16) fail |= 16;
+    if (sizeof(Wl64SurfaceInfo) != 64 || sizeof(Wl64SurfaceMap) != 16 || sizeof(Wl64Rect) != 16) fail |= 16;
+    if (offsetof(Wl64SurfaceInfo, id) != 0 || offsetof(Wl64SurfaceInfo, pid) != 4 ||
+        offsetof(Wl64SurfaceInfo, x) != 16 || offsetof(Wl64SurfaceInfo, shm_id) != 24 ||
+        offsetof(Wl64SurfaceInfo, dmg_x) != 40 || offsetof(Wl64SurfaceInfo, flags) != 56) fail |= 16;
+    if (offsetof(Wl64SurfaceMap, va) != 0 || offsetof(Wl64SurfaceMap, bytes) != 8 ||
+        offsetof(Wl64SurfaceMap, pages) != 12) fail |= 16;
+    if (WL64_SURF_WIN_BYTES64 != (uint64_t)WL64_MAX_SURFACES64 * 65536ULL) fail |= 16;
+    {
+        // 映射窗必须在 FB 映射区内，且**不压到后备缓冲**（否则合成器会把自己映射进显存里）
+        int bb_bytes = 0;
+        (void)fb_surface_phys64(&bb_bytes);
+        if (wl64_surf_win_base64() < USER64_FB_VA64) fail |= 16;
+        if (wl64_surf_win_base64() + WL64_SURF_WIN_BYTES64 > USER64_FB_VA64 + USER64_FB_BYTES64) fail |= 16;
+        if (bb_bytes > 0 && (uint64_t)bb_bytes > wl64_surf_win_base64() - USER64_FB_VA64) fail |= 16;
+        if (wl64_surf_win_va64((uint32_t)WL64_MAX_SURFACES64 - 1u) + 65536ULL >
+            USER64_FB_VA64 + USER64_FB_BYTES64) fail |= 16;
+    }
+    if (g_wl64_wm_pid64 != 0) fail |= 16;        // 自检时不该有合成器（注册只走 22 号）
     return fail;
 }
 
@@ -838,7 +1145,7 @@ void wl64_init64() {
     wl64_end64();
     wl64_begin64();
     if (sf == 0) {
-        wl64_puts64("[WL64] selftest PASS (abi 15..21 / Wl64SeatEvent 64B / rect clip / no-proc EPERM)\n");
+        wl64_puts64("[WL64] selftest PASS (abi 15..21 + composer 22..26 / events 64B / info 64B / rect clip / no-proc EPERM)\n");
     } else {
         wl64_puts64("[WL64] selftest FAIL mask=");
         wl64_udec64((uint64_t)sf);
@@ -953,6 +1260,126 @@ int wl64_demo64(const char* path) {
     wl64_puts64(" seat_users=");            wl64_udec64(g_wl64_seat_users64);
     wl64_puts64(" seat_logged=");           wl64_udec64(g_wl64_seat_logged64);
     wl64_puts64(" seat_supp=");             wl64_udec64(g_wl64_seat_supp64);
+    wl64_nl64();
+    wl64_end64();
+    return 0;
+}
+
+// ==================== ★ B-wm：Ring 3 合成器的启动期驱动（/bin/wm + 两个客户端：**卷交付**）====
+// 交付纪律与 /wlclient.elf 完全相同：三个 ELF **都不内嵌进内核**，是系统卷里的文件（验收夹具/
+// tools/wm_pack_win.py 写进卷）；卷里没有 /bin/wm.elf 就如实打一行 [WL64] wm skipped 并返回。
+// 模式判据与客户端**同一个文件**（/etc/wm_probe）：有 = full（再起 wmclock/wmpanel 两个真客户端，
+// 有界等待 90 s）；没有 = short（只起 wm 一个，它自己映射 fb + 注册合成器 + 合成约 1 s 就退出）。
+static const char WL64_WM_PATH64[]      = "/bin/wm.elf";
+static const char WL64_WMCLOCK_PATH64[] = "/wmclock.elf";
+static const char WL64_WMPANEL_PATH64[] = "/wmpanel.elf";
+static const char WL64_WM_PROBE64[]     = "/etc/wm_probe";
+
+// 起一个 ring3 进程（不等待）：成功返回 pid（>=1），失败打点并返回 0。
+static int wl64_wm_spawn64(const char* name, const char* path) {
+    const int pid = proc64_create64(name, 0);
+    if (pid < 0) {
+        wl64_begin64();
+        wl64_puts64("[WL64] wm spawn FAILED name="); wl64_puts64(name);
+        wl64_puts64(" reason=create err="); wl64_dec64(pid);
+        wl64_nl64();
+        wl64_end64();
+        return 0;
+    }
+    if (proc64_start_elf64(pid, path) != 0) {
+        proc64_destroy64(pid);
+        wl64_begin64();
+        wl64_puts64("[WL64] wm spawn FAILED name="); wl64_puts64(name);
+        wl64_puts64(" path="); wl64_puts64(path);
+        wl64_puts64(" reason=start"); wl64_nl64();
+        wl64_end64();
+        return 0;
+    }
+    return pid;
+}
+
+int wl64_wm64(const char* wm_path) {
+    const char* p = (wm_path && wm_path[0] == '/') ? wm_path : WL64_WM_PATH64;
+    wl64_init64();                                    // 几何 + 标定 + 自检（含 composer ABI 位）
+    if (proc64_isolate64() == 0) {
+        wl64_begin64();
+        wl64_puts64("[WL64] wm skipped (shared address space mode: no per-process address space)\n");
+        wl64_end64();
+        return 0;
+    }
+    if (vfs64_mount_system64(0, app64_main_part_lba64(0)) != 0) {
+        wl64_begin64();
+        wl64_puts64("[WL64] wm skipped (no system volume)\n");
+        wl64_end64();
+        return 0;
+    }
+    uint32_t t = 0, sz = 0, vol_bytes = 0;
+    const bool full = (vfs64_stat(WL64_WM_PROBE64, &t, &sz) == 0);
+    if (!wl64_client_probe64(p, &vol_bytes)) {         // 复用既有的"卷里有这个文件吗"打点函数
+        wl64_begin64();
+        wl64_puts64("[WL64] wm skipped (no elf on vfs) path="); wl64_puts64(p);
+        wl64_nl64();
+        wl64_end64();
+        return 0;
+    }
+    const uint64_t free_before = page_count_free_64();
+    int pid[3] = { 0, 0, 0 };
+    pid[0] = wl64_wm_spawn64("wm", p);
+    if (pid[0] && full) {
+        pid[1] = wl64_wm_spawn64("wmclock", WL64_WMCLOCK_PATH64);
+        pid[2] = wl64_wm_spawn64("wmpanel", WL64_WMPANEL_PATH64);
+    }
+    wl64_begin64();
+    wl64_puts64("[WL64] wm start pid=");    wl64_udec64((uint64_t)pid[0]);
+    wl64_puts64(" mode=");                  wl64_puts64(full ? "full" : "short");
+    wl64_puts64(" clients=");               wl64_udec64((uint64_t)((pid[1] ? 1 : 0) + (pid[2] ? 1 : 0)));
+    wl64_puts64(" from_volume=");           wl64_udec64(vol_bytes);
+    wl64_puts64(" pool_free=");             wl64_udec64(free_before);
+    wl64_nl64();
+    wl64_end64();
+    if (!pid[0]) return 0;
+
+    // 有界等待：合成器自己决定什么时候退出（full 最长 90 s；short 20 s 足够它映射几帧）
+    const uint32_t limit_sec = full ? 90u : 20u;
+    const uint64_t t0 = g_ticks64;
+    while ((g_ticks64 - t0) < (uint64_t)PIT_HZ_64 * (uint64_t)limit_sec) {
+        int live = 0;
+        for (int i = 0; i < 3; i++) if (pid[i] && proc64_sig_state_of64(pid[i]) != nullptr) live++;
+        if (live == 0) break;
+        if (task_sleep_ms64) task_sleep_ms64(5);
+        else { const uint64_t w = g_ticks64 + 1; uint64_t g = 0; while (g_ticks64 < w && ++g < 50000000ULL) __asm__ volatile("hlt"); }
+    }
+    // 收尾：没退出的强杀；surface/shm 兜底回收；每个进程都销毁（幂等）
+    int exited = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!pid[i]) continue;
+        const bool gone = (proc64_sig_state_of64(pid[i]) == nullptr);
+        if (gone) exited++;
+        else {
+            wl64_begin64();
+            wl64_puts64("[WL64] wm TIMEOUT pid="); wl64_udec64((uint64_t)pid[i]);
+            wl64_puts64(" still_running=1"); wl64_nl64();
+            wl64_end64();
+            (void)proc64_kill64(pid[i], 9);
+        }
+        wl64_proc_release64(pid[i]);                   // 幂等：正常路径客户端自己销毁过
+        if (proc64_find64(pid[i])) proc64_destroy64(pid[i]);
+    }
+    const uint64_t free_after = page_count_free_64();
+    wl64_begin64();
+    wl64_puts64("[WL64] wm done procs=");      wl64_udec64((uint64_t)((pid[0] ? 1 : 0) + (pid[1] ? 1 : 0) + (pid[2] ? 1 : 0)));
+    wl64_puts64(" exited=");                   wl64_udec64((uint64_t)exited);
+    wl64_puts64(" ticks=");                    wl64_udec64(g_ticks64 - t0);
+    wl64_puts64(" pool_free=");                wl64_udec64(free_after);
+    wl64_puts64(" pool_delta=");
+    if (free_after >= free_before) { wl64_puts64("+"); wl64_udec64(free_after - free_before); }
+    else                           { wl64_puts64("-"); wl64_udec64(free_before - free_after); }
+    wl64_puts64(" surfs=");                    wl64_udec64((uint64_t)g_wl64_live64);
+    wl64_puts64(" composer=");                 wl64_udec64((uint64_t)(g_wl64_wm_pid64 ? 1 : 0));
+    wl64_puts64(" exports=");                  wl64_udec64(g_wl64_wm_exports64);
+    wl64_puts64(" maps=");                     wl64_udec64(g_wl64_wm_maps64);
+    wl64_puts64(" acks=");                     wl64_udec64(g_wl64_wm_acks64);
+    wl64_puts64(" posts=");                    wl64_udec64(g_wl64_wm_posts64);
     wl64_nl64();
     wl64_end64();
     return 0;

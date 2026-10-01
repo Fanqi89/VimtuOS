@@ -595,6 +595,68 @@ PYWL
 #   ~700 KB 的硬线（tests/a42a64_test.py 断言），而这个 blob 值 ~18 KB；更重要的是这本来就是
 #   本项目对"可交付程序"的一贯交付方式（内核里搜不到它的字节 —— 见下面那条断言）。
 echo "    /wlclient.elf = $(stat -c%s "$BUILD/wlclient.elf") B（**不内嵌**：由夹具写进系统卷 /wlclient.elf）"
+# ★ B-wm：Ring 3 合成器 + 两个真客户端（user/wm/*.c）—— **不内嵌**，卷交付（同 /wlclient.elf）。
+#   为什么放这里：三者共用同一批 user/lib 目标文件（WL_OBJS），也不进任何人的链接行。
+#   交付路径（由验收夹具 / tools/wm_pack_win.py 写进系统卷）：/bin/wm.elf、/wmclock.elf、/wmpanel.elf。
+#   ★ 内核**不会**把它们内嵌：kernel/wl64.cpp 只按路径在卷里找 /bin/wm.elf；找不到就打
+#     [WL64] wm skipped (no elf on vfs)。下面还有一条"内核二进制里搜不到 wm.elf 字节"的断言。
+WM_DIR="$BUILD/uapps/wm"
+mkdir -p "$WM_DIR"
+WM_OBJS=""
+for src in syscall.c string.c stdlib.c stdio.c fb.c wl.c; do
+    clang $EVSHM_UCFLAGS -c "user/lib/$src" -o "$WM_DIR/lib_${src%.c}.o"
+    WM_OBJS="$WM_OBJS $WM_DIR/lib_${src%.c}.o"
+done
+for src in crt0.S syscall.S; do
+    clang $EVSHM_ASFLAGS -c "user/lib/$src" -o "$WM_DIR/lib_${src%.S}_asm.o"
+    WM_OBJS="$WM_OBJS $WM_DIR/lib_${src%.S}_asm.o"
+done
+clang $EVSHM_UCFLAGS -I user/wm -c user/wm/wmabi.c -o "$WM_DIR/wmabi.o"
+WM_OBJS="$WM_OBJS $WM_DIR/wmabi.o"
+for app in wm wmclock wmpanel; do
+    clang $EVSHM_UCFLAGS -I user/wm -c "user/wm/$app.c" -o "$WM_DIR/$app.o"
+    $LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/apps/evshm_demo.ld \
+        -o "$BUILD/$app.elf" $WM_OBJS "$WM_DIR/$app.o"
+    # 自检（判据与 evshm/wlclient 完全相同：静态 ET_EXEC、PT_LOAD 落在 4GiB..4GiB+64KiB、
+    # 无 PT_INTERP/PT_DYNAMIC、程序头表在首个 PT_LOAD 内、入口在某个段里、文件 <= 96 KiB）
+    "$PY" - "$BUILD/$app.elf" "$app" <<'PYWM'
+import struct, sys
+path, name = sys.argv[1], sys.argv[2]
+d = open(path, "rb").read()
+assert d[:4] == b"\x7fELF" and d[4] == 2 and d[5] == 1, "不是 ELF64 小端"
+etype, machine = struct.unpack_from("<HH", d, 16)
+assert etype == 2 and machine == 0x3E, "必须是 ET_EXEC / x86_64"
+entry = struct.unpack_from("<Q", d, 24)[0]
+phoff = struct.unpack_from("<Q", d, 32)[0]
+phentsize, phnum = struct.unpack_from("<H", d, 54)[0], struct.unpack_from("<H", d, 56)[0]
+assert phentsize == 56 and 0 < phnum <= 16, "程序头表不合法"
+LO, HI = 0x100000000, 0x100000000 + 0x10000
+segs, nload, first_off, first_filesz = [], 0, None, None
+for i in range(phnum):
+    p = phoff + i * phentsize
+    ptype = struct.unpack_from("<I", d, p)[0]
+    poff, pva, _ppa, pfsz, pmsz, _al = struct.unpack_from("<QQQQQQ", d, p + 8)
+    if ptype == 3:
+        raise SystemExit("ERROR: %s 出现 PT_INTERP（内核只做静态装载）" % name)
+    if ptype == 2:
+        raise SystemExit("ERROR: %s 出现 PT_DYNAMIC（静态链接不该有）" % name)
+    if ptype != 1:
+        continue
+    nload += 1
+    if first_off is None:
+        first_off, first_filesz = poff, pfsz
+    assert pmsz >= pfsz and poff + pfsz <= len(d), "%s 段文件范围越界" % name
+    assert pva >= LO and pva + pmsz <= HI, "%s PT_LOAD 越出装载区（va=0x%x memsz=0x%x）" % (name, pva, pmsz)
+    assert (pva + pmsz + 0xFFF) & ~0xFFF <= HI, "%s PT_LOAD 页对齐后压到用户栈区" % name
+    segs.append((pva, pmsz))
+assert nload and any(va <= entry < va + msz for va, msz in segs), "%s 入口不在任何 PT_LOAD 内" % name
+assert first_off == 0 and phoff + phnum * phentsize <= first_filesz, "%s 程序头表不在首个 PT_LOAD 内" % name
+assert len(d) <= 96 * 1024, "%s 文件超过内核读盘缓冲 96 KiB" % name
+print("    %s.elf 自检 OK：entry=0x%x phnum=%d segs=%d size=%d B" % (name, entry, phnum, nload, len(d)))
+PYWM
+    echo "    /bin/$app.elf <- build64/$app.elf = $(stat -c%s "$BUILD/$app.elf") B（**不内嵌**，卷交付）"
+done
+
 echo "==> ★ A4-5：信号投递演示程序（user/apps/sig64_demo.c -> build64/sig64.elf -> **内嵌系统内核**）"
 # 交付方式与 /evshm.elf 完全同构（复用同一批 user/lib 目标文件 EVSHM_OBJS，只是多编一个 .c）：
 # 静态 ELF64（链接脚本 user/apps/evshm_demo.ld）-> objcopy 平铺字节嵌进**系统内核** ->
@@ -1171,3 +1233,18 @@ echo "==> 生成 64 位安装 ISO（vimtu64-64.iso：BIOS 光盘 + U 盘 hybrid 
 echo
 echo "启动安装介质: qemu-system-x86_64 -drive format=raw,file=$IMG -drive format=raw,file=target.img -boot order=c -m 512 -vga std -serial stdio"
 echo "端到端安装测试: python tests/install_flow_test.py"
+
+# ★ B-wm 的同一条纪律：**内核二进制里不能出现 /bin/wm.elf 的字节**（它只从系统卷装载）。
+#   探针取 build64/wm.elf 中段的 64 字节（与 /wlclient.elf 的判据完全相同）。
+"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/wm.elf" <<'PYEOF6'
+import sys
+k = open(sys.argv[1], "rb").read()
+w = open(sys.argv[2], "rb").read()
+mid = len(w) // 2
+probe = w[mid:mid + 64]
+if len(probe) < 64 or probe in k:
+    sys.stderr.write("ERROR: system kernel contains /bin/wm.elf bytes (delivery must be a volume file)\n")
+    raise SystemExit(1)
+print("    断言 OK：系统内核 %d B 里搜不到 /bin/wm.elf 的 64B 探针（偏移 %d）；合成器只从系统卷装载" % (len(k), mid))
+PYEOF6
+

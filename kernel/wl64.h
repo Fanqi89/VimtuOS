@@ -85,16 +85,29 @@
 //   [WL64] selftest PASS / [WL64] selftest FAIL mask=<n>
 //   [WL64] demo start pid=<n> mode=<full|short> path=<p> pool_free=<n>
 //   [WL64] demo done pid=<n> exited=<n> ticks=<n> pool_free=<n> pool_delta=<±n> surfs=<n> seat_users=<n> seat_logged=<n> seat_supp=<n>
+//   [WL64] composer pid=<n> seat=<n> gpu=<0|1> backend=<s> surfs=<n>     （Ring 3 合成器注册）
+//   [WL64] export i=<n> id=<n> pid=<n> rect=<x>,<y>,<w>,<h> buf=<0|id> off=<n> dmg=<..> flags=<hex>
+//   [WL64] surfmap id=<n> shm=<id> va=0x<hex> bytes=<n> pages=<n> re=<0|1> u=<0|1>
+//   [WL64] ack id=<n> dmg=<x>,<y>,<w>,<h> pending=<0|1>
+//   [WL64] seatpost surf=<n> pid=<n> type=<n> x=<n> y=<n>
+//   [WL64] wm start pid=<n> … / [WL64] wm done …                      （Ring 3 合成器的启动期驱动）
 //   [WL64] demo skipped (...)
 #pragma once
 #include <stdint.h>
+#include "usermode64.h"   // ★ B-wm：合成器的缓冲映射窗落在 FB 映射区顶部（wl64_surf_win_*）
 #include "input64.h"      // 复用 40 B 的 Ev64Event（seat 事件 = 它 + 路由字段）
 
 // ==================== 规模/常量 ====================
 static const uint32_t WL64_MAX_SURFACES64 = 8;    // surface 表槽数（每进程最多这么多，够演示/验收）
 static const uint32_t WL64_MAX_SLOTS64    = 2;    // 可见区域的槽位数（>1 才能演示重叠/z 序）
-static const uint32_t WL64_PANEL_W64      = 288;  // 可见区域（面板）逻辑尺寸；放不下时按屏幕缩小
+// ★ B-wm：可见区域 = **屏幕右下角的"外部面板区" 320x200**（Ring 3 合成器租用的那块地）。
+//   放不下时按屏幕缩小（两侧各留 MARGIN）；底部给 Dock 让位（Dock 高 60 + 离底边 16 = 76，
+//   再留 8 像素间隙 = BOTTOM 84）。改这两个常量等于改"外部面板区"的位置，验收脚本按 [WL64] init
+//   打出来的 panel= 反推，所以不需要同步改脚本。
+static const uint32_t WL64_PANEL_W64      = 320;
 static const uint32_t WL64_PANEL_H64      = 200;
+static const uint32_t WL64_PANEL_MARGIN64 = 12;   // 距屏幕右边缘
+static const uint32_t WL64_PANEL_BOTTOM64 = 84;   // 距屏幕下边缘（Dock 76 + 8 间隙）
 // 槽位相对面板原点的偏移（槽位 = 创建序号 % WL64_MAX_SLOTS64；两块槽位**故意重叠**，用于验证 z 序）。
 // 用内联函数而不是 static const 数组：头文件被多个 TU 包含，未使用的数组可能触发 -Wunused-const-variable。
 static inline uint32_t wl64_slot_dx64(uint32_t slot) { return (slot & 1u) ? 112u : 16u; }
@@ -166,3 +179,84 @@ int wl64_surfaces_held64();
 //   * short：没有它 -> 2 帧提交 + 立即销毁退出（~1 s），别的脚本只多几行 [WL64] 打点。
 // 返回 0 = 跑完（含跳过/超时，只打点）。
 int wl64_demo64(const char* path);
+
+// ==================== ★ B-wm：Ring 3 合成器（自有 ABI 22..26）+ 启动期驱动 ====================
+// 目标：把"合成 + 上屏"从内核搬到 **Ring 3 的合成器进程**（交付物 /bin/wm）。角色划分：
+//   内核（本文件 + fb + proc64/shm + input64）= ①surface 表 ②提交队列 ③把客户端缓冲页映射给
+//   合成器 ④seat 事件的路由与投递 ⑤fb_map/fb_flip 的映射与提交 —— **一个像素都不合成**；
+//   合成器（用户态）= fb_map 后备缓冲 -> 按 surface 表在用户态 blit/遮挡/alpha -> fb_flip 上屏。
+// 两条路共存（同一个内核、互不影响；这是"只加不改语义"的前提）：
+//   * 没有合成器注册（g_wl64_wm_pid == 0）：行为与 A5 逐条一致（dispatch 里内核合成，打
+//     [WL64] composite / [WL64] blit）—— tests/wl64_test.py 的 91 项既有验收原样通过；
+//   * 有合成器注册：dispatch 只投 seat 事件，提交队列交给合成器（**不再**出现 [WL64] composite）。
+// 调用号（rdi/rsi/rdx/r10 = 参数 1..4）：
+//   22 wl_composer_get()            -> (seat id) | (gpu<<8)；注册当前进程为合成器 + 申请焦点/捕获
+//   23 wl_surface_export(idx, out)  -> 0 = 填好 *(Wl64SurfaceInfo*)out；1 = 该下标没有 surface；负错误
+//   24 wl_surface_map(surf, out)    -> 0 = 缓冲页已映射（*(Wl64SurfaceMap*)out 填 VA/bytes/pages）
+//   25 wl_surface_ack(surf)         -> 0；合成器声明"这条我合成完了"（清 pending/damage、content=1）
+//   26 wl_seat_post(out_ev)         -> 投递到的 pid（>=1）/ 0 = 目标 surface 没了 / 负错误
+// 权限模型（最小、如实）：22..26 **只有注册过的合成器进程**能调（别的进程一律 WL64_EPERM64）；
+//   没有合成器时也是一律 EPERM（不假装有合成器）。注册幂等（同一进程再调只重打一行）；换进程
+//   注册会把旧的那个顶掉（旧的再调用就 EPERM）。
+static const uint32_t WL64_ABI_COMPOSER_GET64   = 22;
+static const uint32_t WL64_ABI_SURFACE_EXPORT64 = 23;
+static const uint32_t WL64_ABI_SURFACE_MAP64    = 24;
+static const uint32_t WL64_ABI_SURFACE_ACK64    = 25;
+static const uint32_t WL64_ABI_SEAT_POST64      = 26;
+
+// 合成器的缓冲映射窗：FB 映射区（5GiB..+40MiB）的**顶部 512 KiB** = 8 个 surface 槽 × 64 KiB
+// （= 单 shm 对象上限）。为什么放这里而不是新开一段 VA：① 5GiB 起那一段已经在
+//   usermode64.cpp 的 u64_va_in_user_area64() 白名单里（页级原语的唯一范围判据，不去动它）；
+//   ② 后备缓冲 <= 3840x2160x4 约 33 MiB < 40MiB-512KiB —— 自检里断言两者不重叠；
+//   ③ 建页表项走的就是 fb_map 用的 user64_map_phys_page64()。
+static const uint64_t WL64_SURF_WIN_BYTES64 = 512ULL * 1024ULL;
+static inline uint64_t wl64_surf_win_base64() { return USER64_FB_VA64 + USER64_FB_BYTES64 - WL64_SURF_WIN_BYTES64; }
+static inline uint64_t wl64_surf_win_va64(uint32_t slot) { return wl64_surf_win_base64() + (uint64_t)slot * 65536ULL; }
+
+// ---- 23 的出参：一条 surface 的只读快照（64 B POD，字段顺序固定）----
+// ---- Wl64Rect：一个屏幕矩形（16 B POD；22 号给出"外部面板区"，合成器据此划自己的地盘）----
+struct Wl64Rect { int32_t x, y, w, h; };
+static const uint32_t WL64_RECT_SIZE64 = 16;
+
+// ---- 23 的出参：一条 surface 的只读快照（64 B POD，字段顺序固定）----
+struct Wl64SurfaceInfo {
+    uint32_t id;        // +0  surface id
+    int32_t  pid;       // +4  拥有者进程
+    uint32_t w, h;      // +8,+12  逻辑尺寸
+    int32_t  x, y;      // +16,+20 屏幕坐标（组合器策略给的槽位）
+    int32_t  shm_id;    // +24 attach 的 shm 对象（0 = 还没有缓冲）
+    uint32_t shm_off;   // +28 缓冲在对象里的字节偏移
+    uint32_t shm_bytes; // +32 缓冲字节数
+    uint32_t refs;      // +36 该对象的引用数（诊断）
+    int32_t  dmg_x, dmg_y, dmg_w, dmg_h;   // +40..+52 damage 包围盒（surface 局部坐标）
+    uint32_t flags;     // +56 bit0 pending / bit1 content / bit2 has_buf
+    uint32_t pad;       // +60
+};
+static const uint32_t WL64_SURFINFO_SIZE64    = 64;
+static const uint32_t WL64_SURFINFO_PENDING64 = 0x1u;
+static const uint32_t WL64_SURFINFO_CONTENT64 = 0x2u;
+static const uint32_t WL64_SURFINFO_HASBUF64  = 0x4u;
+
+// ---- 24 的出参：缓冲页的映射结果（16 B POD）。像素地址 = va + shm_off + y*pitch + x*4 ----
+struct Wl64SurfaceMap {
+    uint64_t va;        // +0  用户可读 VA（对象页 0 的映射基址）
+    uint32_t bytes;     // +8  已映射字节数（= pages * 4096）
+    uint32_t pages;     // +12 页数
+};
+static const uint32_t WL64_SURFMAP_SIZE64 = 16;
+
+// ---- 系统调用落点（int 0x80 号 22..26）----
+int64_t wl64_composer_get64(uint64_t out_rect_uptr);            // 22（out_rect 可为 0）
+int64_t wl64_surface_export64(uint64_t idx, uint64_t out_uptr);  // 23
+int64_t wl64_surface_map64(uint64_t surf, uint64_t out_uptr);    // 24
+int64_t wl64_surface_ack64(uint64_t surf);                       // 25
+int64_t wl64_seat_post64(uint64_t out_ev_uptr);                  // 26
+int     wl64_composer_pid64();                                   // 当前注册的合成器（0 = 没有）
+
+// ==================== ★ B-wm：启动期驱动（/bin/wm + 两个客户端：卷交付）====================
+// 与 wl64_demo64 同一条纪律（**不内嵌**：/bin/wm.elf 是系统卷里的文件，找不到就如实打一行
+// [WL64] wm skipped），但启动的是一组进程：/bin/wm.elf（合成器）+ wmclock/wmpanel（两个真客户端，
+// 只在 full 模式起）。模式判据与客户端**同一个文件**：卷里有 /etc/wm_probe = full（起 3 个进程 +
+// 有界等待），没有 = short（只起 wm，它自己映射 fb + 注册合成器 + 合成约 1 s 就退出）。
+// 返回 0 = 跑完（含跳过/超时，只打点）。
+int wl64_wm64(const char* wm_path);
