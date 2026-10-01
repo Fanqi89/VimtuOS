@@ -82,16 +82,34 @@
 //   26 wl_seat_post(out_ev)         -> 投递到的 pid；合成器把事件投回目标 surface 的拥有者队列
 //   22..26 只有注册过的合成器能调（其它进程 EPERM）；没有合成器时内核继续走 15..21 的老路
 //   （dispatch 里合成、打 [WL64] composite），两条路互不影响。安装介质内核不链 wl64.cpp -> deny。
-//   ==================== ★ B-wm：Ring 3 合成器（号 22..26）====================
-//   目标：把"合成 + 上屏"从内核搬到用户态合成器进程（/bin/wm）—— 内核只留 surface 表、提交队列、
-//   缓冲页映射、seat 路由/投递、fb_map/fb_flip。接口/语义/错误码的唯一定义点 = kernel/wl64.h。
-//   22 wl_composer_get()            -> (seat id) | (gpu<<8)；注册当前进程为合成器 + 申请焦点/捕获
-//   23 wl_surface_export(idx, out)  -> 0 = 填好一条 Wl64SurfaceInfo(64B)；1 = 该下标没有 surface
-//   24 wl_surface_map(surf, out)    -> 0；把该 surface 的缓冲页映射进合成器（Wl64SurfaceMap(16B)）
-//   25 wl_surface_ack(surf)         -> 0；合成器声明"这条合成完了"（清 pending/damage、content=1）
-//   26 wl_seat_post(out_ev)         -> 投递到的 pid；合成器把事件投回目标 surface 的拥有者队列
-//   22..26 只有注册过的合成器能调（其它进程 EPERM）；没有合成器时内核继续走 15..21 的老路
-//   （dispatch 里合成、打 [WL64] composite），两条路互不影响。安装介质内核不链 wl64.cpp -> deny。
+//   ==================== ★ 本批：用户态设备映射（号 48 pci_map_bar）====================
+//   目标：让 ring3 的**驱动服务**能直接读自己那块设备的寄存器（用户态驱动的第一块地基）。
+//   48 pci_map_bar(bdf, bar_index, out_va, out_len)
+//      rdi = bdf        打包的 PCI 位置：bdf = (bus << 8) | (dev << 3) | (fn)（0..0xFFFF）
+//      rsi = bar_index  BAR 序号 0..5（64 位 BAR 只填它的**低半**序号，高半自动一起读）
+//      rdx = out_va     用户指针（8 字节）：写回映射到的**用户 VA**
+//      r10 = out_len    用户指针（8 字节）：写回 **BAR 的实际大小**（字节）
+//      -> 0 = 成功；< 0 = 错误码（见下）。**幂等**：同一个 (bdf, bar) 重复调用返回同一个 VA，
+//         不重复分配页表页（内核打点里 `re=1`）。
+//   语义要点（细节与风险见 docs/应用层与系统调用说明.md 末节"用户态设备映射与驱动服务骨架"）：
+//     * 只映射 **MMIO**（memory BAR）：I/O 端口 BAR 直接用 -EINVAL 拒掉，绝不假装能映射；
+//     * 长度取**写全 1 回读**探出来的真实大小（不盲信寄存器里的地址位）；64 位 BAR 读高 32 位；
+//     * 页表项 = P|U|W|NX（用户可读写、不可执行）——与内核驱动读同一段物理地址的内存类型一致；
+//     * 窗口：每进程 DEV64_SLOTS64=8 槽 × 256 KiB（见 kernel/proc64.h），**不是页池的页**，
+//       进程退出/execve/fork/munmap 四条路径都跳过它（否则会往页池链表里插设备地址）；
+//     * 权限：**只允许 root（euid == 0）**。非 root 返回 -EPERM 并打 `[PCIMAP] deny ... reason=not-root`。
+//   错误码（自有 ABI 的负数风格；与 kernel/pci64.h 的 PCI64_* 同一张表）：
+//     -1 = EPERM   非 root / 没有进程上下文
+//     -2 = EFAULT  out_va / out_len 不是用户可写指针
+//     -3 = EINVAL  bdf 编码非法 / bar_index > 5 / **该 BAR 是 I/O 端口不是 MMIO**
+//     -4 = ENOMEM  映射窗满（8 槽）/ BAR 比单槽（256 KiB）还大 / 页表页不足（已回滚）
+//     -5 = ENODEV  没有这个设备 / 该 BAR 未实现 / BAR 物理地址在恒等映射之外（>= 4 GiB）
+//   ★ 号位为什么是 48：22..26 已被 Ring 3 合成器（另一条线）占用，48 与 1..26 都拉开距离。
+//   ★ 打点（自动验收 tests/drvsvc64_test.py grep，格式勿改；失败行有上限防刷屏）：
+//     [PCIMAP] map pid=<n> bdf=0x<hex> bar=<n> pa=0x<hex> len=<n> va=0x<hex> pages=<n> u=1 re=<0|1>
+//     [PCIMAP] FAILED pid=<n> bdf=0x<hex> bar=<n> reason=<...> err=<n>
+//     [PCIMAP] deny pid=<n> euid=<n> reason=<...> err=<n>
+//     [PCIMAP] release pid=<n> slots=<n> freed=0 (mmio, not page-pool)      （进程退出路径）
 //
 //   错误码（负数，两个入口的 errno 风格一致，**不与 Linux 号段共用号**）：
 //     -1 = EPERM  用户窗口/页表不可用（UEFI 固件只读页表，见 kernel/usermode64.cpp）
@@ -159,6 +177,17 @@ static const int64_t SYSCALL64_FB_ENOMEM64 = -4;   // 映射失败（页表页�
 // fb_flip 的返回码：0 = 已提交（可能被夹取）、1 = 完全越界被拒（打点 clip=reject）
 static const int64_t SYSCALL64_FB_FLIPPED64 = 0;
 static const int64_t SYSCALL64_FB_REJECT64  = 1;
+// ==================== ★ 本批：用户态设备映射（自有 ABI 48 pci_map_bar）====================
+// 语义/权限/打点格式的唯一说明见本文件上面那一段。这里只放**内核与用户程序共用的常量**：
+// 号位（用户程序按它取号）与错误码（负数，返回值放 rax）。
+static const uint64_t SYSCALL64_PCIMAP_NR64 = 48;
+static const int64_t  PCIMAP64_EPERM64  = -1;   // 非 root / 没有进程上下文
+static const int64_t  PCIMAP64_EFAULT64 = -2;   // out 指针非法
+static const int64_t  PCIMAP64_EINVAL64 = -3;   // bdf/bar_index 非法，或该 BAR 是 I/O 端口
+static const int64_t  PCIMAP64_ENOMEM64 = -4;   // 窗满 / BAR 比单槽大 / 页表页不足
+static const int64_t  PCIMAP64_ENODEV64 = -5;   // 没有这个设备 / BAR 未实现 / 在恒等映射之外
+// pci_map_bar 的"复用"返回约定：rax = 0 = 新建映射；与内核对齐，用户拿到的一直是 0
+// （`re=1` 只是内核打点里的信息，不改变用户可见返回值）。
 // ==================== syscall 指令路径（给汇编入口 / usermode64 用）====================
 // 帧标记：syscall 指令路径的 int_no 槽填这个值（int 0x80 是 0x80）。改它必须同步
 // kernel/syscall_entry64.asm 的 %define FRAME_MARK。

@@ -110,6 +110,17 @@ struct Proc64 {
     // ★ A5 前置（2/2）：**每进程 shm 句柄表**（对象 id；0 = 空槽）。fork 逐槽继承（引用 +1）、
     //   execve 默认关闭（逐槽 -1）、进程退出/销毁时逐槽 -1（归零则由对象表回收页帧）。
     int32_t  shm[SHM64_HANDLES64];
+    // ★ 本批：**每进程设备 BAR 映射记账**（pci_map_bar(22) 落地用；语义/窗口/风险见 proc64.h）。
+    //   只记"哪个槽属于哪个 (bdf,bar) + 长度"——VA 由槽号算出来，页表本身就是映射的真值。
+    //   页帧是设备 MMIO 地址，**不属于页池**，所以退出/fork/munmap 三条路径都要跳过这一段
+    //   （判据 = dev64_in_window64，见下面的 p64_release_area64 / p64_copy_user_area64 / munmap）。
+    struct Proc64DevMap64 {
+        uint32_t bdf;           // (bus<<8)|(dev<<3)|fn
+        uint32_t len;           // 映射字节数（= BAR 实际大小）
+        uint8_t  bar;           // BAR 序号
+        uint8_t  used;          // 1 = 该槽有效
+        uint16_t pad;
+    } dev[DEV64_SLOTS64];
 };
 static Proc64   g_procs[PROC64_MAX];
 static int      g_proc_count   = 0;
@@ -321,6 +332,91 @@ static void shm64_clone_handles64(Proc64* child, const Proc64* parent) {
 // 该 VA 是否落在 shm 映射窗内（p64_release_area64 / p64_copy_user_area64 的跳过判据）
 static inline bool shm64_in_window64(uint64_t va) {
     return va >= SHM64_WINDOW_VA64 && va < SHM64_WINDOW_VA64 + SHM64_WINDOW_BYTES64;
+}
+
+// ==================== 本批：设备 BAR 映射窗（pci_map_bar(48) 的落地/记账/回收）====================
+// 窗口定义与理由见 proc64.h 的"设备 BAR 映射窗"一节。这里只强调**回收纪律**：
+//   窗里的 PTE 指向设备 MMIO（不是页池的页），所以 p64_release_area64 / p64_copy_user_area64 /
+//   proc64_munmap64 三处都必须**跳过**它 —— 否则 page_free_64 会拿一个设备地址去插页池链表。
+static inline bool dev64_in_window64(uint64_t va) {
+    return va >= DEV64_WINDOW_VA64 && va < DEV64_WINDOW_VA64 + DEV64_WINDOW_BYTES64;
+}
+static inline uint64_t dev64_slot_va64(uint32_t slot) {
+    return DEV64_WINDOW_VA64 + (uint64_t)slot * DEV64_SLOT_BYTES64;
+}
+// 退出 / execve / 销毁时清记账（PTE 由 p64_release_area64 的跳过分支清掉，这里不碰页表）。
+static void dev64_drop_all64(Proc64* p) {
+    if (!p) return;
+    uint32_t held = 0;
+    for (uint32_t i = 0; i < DEV64_SLOTS64; i++) {
+        if (!p->dev[i].used) continue;
+        p->dev[i].used = 0;
+        p->dev[i].bdf  = 0;
+        p->dev[i].len  = 0;
+        held++;
+    }
+    if (held) {            // 只在真的映射过时才打点（不刷屏）
+        dbg64_line_begin64();
+        dbg64_str("[PCIMAP] release pid=");
+        dbg64_dec((uint64_t)(p->pid < 0 ? 0 : p->pid));
+        dbg64_str(" slots=");
+        dbg64_dec((uint64_t)held);
+        dbg64_str(" freed=0 (mmio, not page-pool) pool_free=");
+        dbg64_dec(page_count_free_64());     // ★ 回收判据：与 [PCIMAP] map 的 pool_free 比（应当相等）
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+}
+
+
+// pci_map_bar(48) 的落地：幂等 + 记账 + 逐页映射（失败回滚）。语义见 proc64.h。
+int64_t proc64_devmap64(uint32_t bdf, uint32_t bar_index, uint64_t phys, uint64_t len, uint64_t out_va_uptr) {
+    Proc64* p = p64_current64();
+    if (!p) return -1;                                   // EPERM：没有进程上下文（映射无处可放）
+    if (len == 0 || len > DEV64_SLOT_BYTES64) return -4; // ENOMEM：这一个 BAR 比我们的槽还大
+    if (!user64_range_ok64(out_va_uptr, 8)) return -2;    // EFAULT
+    if ((phys & (PAGE_SIZE_64 - 1)) != 0 || (len & (PAGE_SIZE_64 - 1)) != 0) return -3;   // EINVAL
+    // ★ 幂等：同一个 (bdf, bar) 之前映射过 -> 直接返回同一个 VA（页表不动、不重复分配）
+    for (uint32_t i = 0; i < DEV64_SLOTS64; i++) {
+        if (!p->dev[i].used) continue;
+        if (p->dev[i].bdf == bdf && (uint32_t)p->dev[i].bar == bar_index) {
+            *(uint64_t*)(uintptr_t)out_va_uptr = dev64_slot_va64(i);
+            return 1;                                    // 1 = 复用（调用方按 re=1 打点）
+        }
+    }
+    // 找一个空槽（记账空 + 页表空；两者都对上才用 —— 页表是"映射的真值"）
+    int slot = -1;
+    for (uint32_t s = 0; s < DEV64_SLOTS64; s++) {
+        if (p->dev[s].used) continue;
+        if (user64_page_is_user_ok64(dev64_slot_va64(s))) continue;
+        slot = (int)s;
+        break;
+    }
+    if (slot < 0) return -4;                             // ENOMEM：窗满
+    const uint64_t va = dev64_slot_va64((uint32_t)slot);
+    const uint32_t npages = (uint32_t)(len / PAGE_SIZE_64);
+    for (uint32_t i = 0; i < npages; i++) {
+        // ★ 映射标志 = P|U|W|NX **+ PCD（cache disable）**。PCD 是设备 MMIO 的硬要求：
+        //   本批实测踩到过 —— 不带 PCD 时，**第一次**读某个刚映射的设备页会被 CPU 缓存/合并成
+        //   一个陈旧的 0（或旧值），于是按寄存器内容识别设备的那几个判断全部读到 0，设备认不出来
+        //   （同一段地址第二次读又是对的）。加上 PCD 后每次读写都直达设备。
+        //   代价：内核驱动走的是**恒等映射**（不带 PCD），同一物理地址因此有两种缓存属性
+        //   —— 这正是 kernel/pci64.h 风险段列出的那一条（x86 上表现为"读到的可能是陈旧值"，
+        //   不是内存损坏）。要彻底消除得让内核的 MMIO 访问也走 PCD，那超出本批可改范围。
+        if (!user64_map_phys_page64(va + (uint64_t)i * PAGE_SIZE_64, phys + (uint64_t)i * PAGE_SIZE_64,
+                                   PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64 | PTE_PCD_64)) {
+            for (uint32_t k = 0; k < i; k++) (void)user64_unmap_page64(va + (uint64_t)k * PAGE_SIZE_64);
+            user64_paging_sync64();
+            return -4;                                   // ENOMEM：页表页不足（已回滚）
+        }
+    }
+    user64_paging_sync64();
+    p->dev[slot].used = 1;
+    p->dev[slot].bdf  = bdf;
+    p->dev[slot].bar  = (uint8_t)bar_index;
+    p->dev[slot].len  = (uint32_t)len;
+    *(uint64_t*)(uintptr_t)out_va_uptr = va;
+    return 0;
 }
 
 int proc64_shm_held64() {
@@ -604,8 +700,10 @@ static uint32_t p64_release_area64(Proc64* p) {
             // ★ A5 前置：shm 映射窗里的页帧**属于 shm 对象**（不是进程自己的页）——
             //   这里只清 PTE，绝不能 page_free（否则进程退出会把共享页还回页池 = 双重释放，
             //   另一个进程还在用那块内存）。对象在引用数归零时自己回收（shm64_release64）。
+            // ★ 本批：**设备 BAR 映射窗同理**（而且更硬）—— 那些"页"是 MMIO 物理地址，
+            //   本来就不是页池的页；把它们 page_free 等于往页池链表里插一个设备地址。
             const uint64_t va = USER64_CODE_VA64 + ((uint64_t)i2 << 21) + ((uint64_t)i1 << 12);
-            if (shm64_in_window64(va)) { pt[i1] = 0; continue; }
+            if (shm64_in_window64(va) || dev64_in_window64(va)) { pt[i1] = 0; continue; }
             page_free_64((void*)(uintptr_t)p64_page64(e1));
             pt[i1] = 0;
             n++;
@@ -926,6 +1024,7 @@ void proc64_destroy64(int pid) {
     // ★ A5 前置：句柄/焦点清理（对\"已经 exit 过\"的进程是空操作：p64_exit64 里已清完、
     //   shm[] 已置 0；对\"没走过 exit 就被销毁\"的进程是真正的回收）。
     shm64_drop_all64(p);
+    dev64_drop_all64(p);                 // ★ 本批：设备映射记账（MMIO 页帧不属于页池，只清记账）
     ev64_proc_release64((int)p->pid);
     // ★ A5：Wayland 组合器的 surface/引用回收（弱引用：没有这个模块时按 nullptr 跳过）
     if (wl64_proc_release64) wl64_proc_release64((int)p->pid);
@@ -972,6 +1071,7 @@ static void p64_exit64(Proc64* p, uint32_t code, uint32_t sig) {
     //   (b) 如果它正持有键盘焦点/指针捕获，代它释放（打点 reason=exit），
     //   否则焦点会停在一个已经死掉的 pid 上，后面的进程再也收不到键盘。
     shm64_drop_all64(p);
+    dev64_drop_all64(p);                 // ★ 本批：同上（进程退出路径）
     ev64_proc_release64((int)p->pid);
     // ★ A5：Wayland 组合器的 surface/引用回收（与上面同一条：弱引用 + 判空）
     if (wl64_proc_release64) wl64_proc_release64((int)p->pid);
@@ -1135,12 +1235,14 @@ static int p64_copy_user_area64(const Proc64* src, Proc64* dst, uint32_t* out_pa
         for (int i1 = 0; i1 < 512; i1++) {
             const uint64_t e1 = spt[i1];
             if (!(e1 & PTE_PRESENT_64)) continue;
-            // ★ A5 前置：shm 映射窗**不复制**（子进程拿一份\"空的窗外\"是刻意的）：
-            //   shm 的页帧属于对象而不是父进程，复制它们就等于把\"共享\"退化成\"各一份私有拷贝\"；
+            // ★ A5 前置：shm 映射窗**不复制**（子进程拿一份"空的窗外"是刻意的）：
+            //   shm 的页帧属于对象而不是父进程，复制它们就等于把"共享"退化成"各一份私有拷贝"；
             //   子进程用 fork 继承到的**句柄**自己 shm_map 同一批页帧（这才是 Wayland 的 buffer 语义）。
+            // ★ 本批：设备 BAR 映射窗也**不复制**（复制 MMIO 没有意义：设备是同一个，子进程要用
+            //   就自己 pci_map_bar 一次；而且 PhysPage 复制会去读设备寄存器）。
             {
                 const uint64_t va = USER64_CODE_VA64 + ((uint64_t)i2 << 21) + ((uint64_t)i1 << 12);
-                if (shm64_in_window64(va)) continue;
+                if (shm64_in_window64(va) || dev64_in_window64(va)) continue;
             }
             if (n >= PROC64_FORK_MAX_PAGES) return -1;          // 超上限：调用方回滚
             void* np = page_alloc_64();
@@ -1318,6 +1420,7 @@ int64_t proc64_execve64(pt_regs64* r, const char* path, const char* const* argv,
     // ★ A5 前置：execve **默认关闭**所有 shm 句柄（换映像 = 换一套地址空间语义，
     //   旧句柄不该继续跟着新程序跑）。页帧由对象表在引用归零时回收。
     shm64_drop_all64(p);
+    dev64_drop_all64(p);                 // ★ 本批：execve 换映像 -> 旧地址空间语义作废，记账一起清
 
     uint64_t entry = 0, rsp = 0;
     if (elf64_load_for_exec64(path, argv, argc, &entry, &rsp) != 0) {
@@ -1504,6 +1607,10 @@ int64_t proc64_mmap64(uint64_t len, uint64_t flags, uint64_t addr) {
         return -P64_ENOMEM;
     }
 
+    // ★ 本批：设备 BAR 映射窗同理（里面是 MMIO 物理地址，被 mmap 覆盖会被当成进程自己的页回收）。
+    if (va + n > DEV64_WINDOW_VA64 && va < DEV64_WINDOW_VA64 + DEV64_WINDOW_BYTES64) {
+        return -P64_ENOMEM;
+    }
     uint32_t made = 0;
     for (uint64_t a = va; a < va + n; a += PAGE_SIZE_64) {
         uint64_t phys = 0;
@@ -1529,6 +1636,9 @@ int64_t proc64_munmap64(uint64_t addr, uint64_t len) {
     const uint64_t n = p64_align_up64(len);
     if (addr < USER64_CODE_VA64 || addr > USER64_CODE_VA64 + USER64_WINDOW_BYTES64) return -P64_EINVAL;
     if (n > (USER64_CODE_VA64 + USER64_WINDOW_BYTES64) - addr) return -P64_EINVAL;
+    // ★ 本批：设备映射窗**不许 munmap**（返回 -EINVAL，与"未映射"同一条口径）：
+    //   那一段的"物理页"是设备 MMIO 地址，page_free_64 会把设备地址插进页池链表 = 页池损坏。
+    if (addr + n > DEV64_WINDOW_VA64 && addr < DEV64_WINDOW_VA64 + DEV64_WINDOW_BYTES64) return -P64_EINVAL;
     for (uint64_t a = addr; a < addr + n; a += PAGE_SIZE_64) {
         const uint64_t phys = user64_unmap_page64(a);
         if (!phys) return -P64_EINVAL;                                   // 未映射：Linux 也返回 -EINVAL
@@ -1994,6 +2104,13 @@ int proc64_selftest64() {
     //   A1 的 fb 区（PDPT[5]，显存页绝不能当进程页回收）。
     if (USER64_WINDOW_BYTES64 & (PAGE_SIZE_64 - 1)) fail |= 8;
     if (USER64_WINDOW_BYTES64 < 1ULL * 1024ULL * 1024ULL) fail |= 8;
+    // ★ 本批：设备映射窗 / shm 窗的**位置与不重叠**（两个窗的页帧都不属于页池，靠这段常量钉住）
+    if (DEV64_WINDOW_BYTES64 & (PAGE_SIZE_64 - 1)) fail |= 8;
+    if (DEV64_SLOT_BYTES64 < PAGE_SIZE_64) fail |= 8;
+    if (DEV64_WINDOW_BYTES64 != (uint64_t)DEV64_SLOTS64 * DEV64_SLOT_BYTES64) fail |= 8;
+    if (DEV64_WINDOW_VA64 + DEV64_WINDOW_BYTES64 != SHM64_WINDOW_VA64) fail |= 8;      // 紧贴不重叠
+    if (SHM64_WINDOW_VA64 + SHM64_WINDOW_BYTES64 != USER64_CODE_VA64 + USER64_WINDOW_BYTES64) fail |= 8;
+    if (DEV64_WINDOW_VA64 < USER64_MMAP_VA64 + USER64_MMAP_MIN_BYTES64) fail |= 8;     // 不压 mmap 区
     if (USER64_WINDOW_BYTES64 > (1ULL << 30)) fail |= 8;
     if (USER64_MMAP_VA64 < USER64_BRK_VA64 + USER64_BRK_BYTES64) fail |= 8;
     if (USER64_MMAP_VA64 + USER64_MMAP_MIN_BYTES64 > USER64_CODE_VA64 + USER64_WINDOW_BYTES64) fail |= 8;

@@ -85,6 +85,11 @@ CXXFLAGS_INSTALLER="$CXXFLAGS -DVIMTU_INSTALLER_MEDIA=1 -DVIMTU_PAYLOAD_LBA=$PAY
 #     系统内核的 VFS/store 也要能（驱动器号 8.. / 16.. 分派），
 #     而硬件检查报告在安装介质与装好的系统里都是"没有串口时唯一的诊断画面"。
 SRCS_CORE="kernel/kernel64.cpp kernel/console64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp kernel/input.cpp kernel/input64.cpp kernel/mem64.cpp kernel/hwinfo64.cpp kernel/acpi64.cpp kernel/edid64.cpp kernel/display64.cpp kernel/fd64.cpp kernel/usermode64.cpp kernel/syscall64.cpp kernel/ahci64.cpp kernel/nvme64.cpp kernel/hwui64.cpp kernel/drive64.cpp kernel/fat64.cpp kernel/fs64.cpp kernel/sig64.cpp kernel/virtio_gpu64.cpp"
+# ★ 本批（用户态设备映射）：kernel/pci64.cpp = PCI 配置空间 + BAR 解码（pci_map_bar(48) 的底层）。
+#   进 **SRCS_CORE** 的理由：kernel/syscall64.cpp（也在 CORE 里）对它的是**强引用**，
+#   两份内核都必须在链接行里能解析到它；它只有"配置空间读写 + BAR 解码"这一小块，
+#   安装介质内核里不会被调用（那边没有 ring3），代价 ~1.5 KB。
+SRCS_CORE="$SRCS_CORE kernel/pci64.cpp"
 #
 #  ★ 驱动线 3：kernel/virtio_gpu64.cpp（现代 virtio-gpu 2D：resource/scanout/TRANSFER_TO_HOST_2D）
 #    进 CORE：**两份内核都要**（kernel/fb.cpp 的"上屏后端选择"引用它 —— 系统内核的桌面与
@@ -732,7 +737,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
     "$BUILD"/fb.o "$BUILD"/font.o "$BUILD"/input.o "$BUILD"/input64.o "$BUILD"/mem64.o "$BUILD"/ata64.o "$BUILD"/part64.o "$BUILD"/setup64.o \
     "$BUILD"/fat64.o "$BUILD"/fs64.o "$BUILD"/drive64.o \
     "$BUILD"/bootx64_efi.o "$BUILD"/uefi64_bin.o \
-    "$BUILD"/hwinfo64.o "$BUILD"/acpi64.o "$BUILD"/edid64.o "$BUILD"/vfs64.o "$BUILD"/fd64.o "$BUILD"/usermode64.o "$BUILD"/syscall64.o "$BUILD"/sig64.o \
+    "$BUILD"/hwinfo64.o "$BUILD"/acpi64.o "$BUILD"/edid64.o "$BUILD"/vfs64.o "$BUILD"/fd64.o "$BUILD"/usermode64.o "$BUILD"/syscall64.o "$BUILD"/sig64.o "$BUILD"/pci64.o \
     "$BUILD"/ahci64.o "$BUILD"/nvme64.o "$BUILD"/hwui64.o \
     "$BUILD"/virtio_gpu64.o \
     "$BUILD"/display64.o \
@@ -743,7 +748,7 @@ $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
     gui_rs/gui_rs.o \
     "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
-    "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o \
+    "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o \
     "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
     "$BUILD/os"/virtio_gpu64.o \
     "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
@@ -798,7 +803,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/cr3exp/kernel64.o" "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
         gui_rs/gui_rs.o \
         "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
-        "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o \
+        "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o \
         "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
         "$BUILD/os"/virtio_gpu64.o \
         "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
@@ -908,6 +913,16 @@ bash tools/tar_build_win.sh "$BUILD"
       --demo-dir user/make/demo --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 "$PY" tools/tar_pack_win.py --vol-in "$BUILD/makevol.img" --vol-out "$BUILD/tarvol.img" \
       --tar "$BUILD/tar" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+# ★ 本批（用户态设备映射）：卷链的**最后一步** —— 把 /bin/drvdemo 写进同一块系统卷。
+#   读 tarvol.img（上一步的产物）-> 写 drvsvcvol.img + 重拼 sysdisk.img。
+#   ★ 与另一条线（Ring 3 合成器）的合流说明：他们的 /bin/wm.elf 由 tools/wm_pack_win.py 写；
+#     两个"最后一步"必须**串成一条链**（谁的步骤在后面，谁就读前一步的 --vol-in），
+#     否则后跑的那一步会用自己的卷覆盖 sysdisk.img、把前一步的文件丢掉。
+#     合并时的正确接法：把本步的 --vol-in 改成上一步的输出卷（或把本步整体后移）。
+if [ -f "$BUILD/drvdemo.elf" ]; then
+    "$PY" tools/drvdemo_pack_win.py --vol-in "$BUILD/tarvol.img" --vol-out "$BUILD/drvsvcvol.img" \
+          --drvdemo "$BUILD/drvdemo.elf" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+fi
 # 同一条体积纪律：**内核二进制里不能出现 make/tar 的字节**（工具只从系统卷装载）。
 # 探针取每个文件中段的 64 字节（代码/数据混排的中段最稳）。
 "$PY" - "$BUILD/kernel64_os.bin" "$BUILD/make.bin" "$BUILD/make" "$BUILD/tar" "$BUILD/shell.bin" <<'PYEOF5B'
@@ -1202,6 +1217,42 @@ if [ "$A42A_SZ" -gt 65536 ]; then
     exit 1
 fi
 echo "    $BUILD/a42a_sys.elf = $A42A_SZ B（syscall 指令 + Linux 号段；由 tests/a42a64_test.py 装进夹具卷 /bin/a42a_sys.elf）"
+
+echo "==> ★ 本批：Ring 3 驱动服务骨架 /bin/drvdemo（**不内嵌**内核，卷交付；pci_map_bar 的真实用户）"
+# 交付方式与 /bin/shell.bin、/wlclient.elf 完全相同的一条纪律：**内核二进制里一个字节都不加**。
+#   1) 源码 user/svc/drvdemo.c 自足（不 include 任何头、不链 user/lib）：另一条线在改 user/lib 与
+#      user/shell，这份程序不依赖它们就不会被它们的中间态带崩；
+#   2) 链接脚本复用 user/lib/user64.ld（4GiB 定址 + .text.start 第一 + .image_end 哨兵）——
+#      与 A4-2a 的 ring3 探针同一套，kernel/elf64.cpp 的装载门槛逐条满足；
+#   3) 产物只落 build64/drvdemo.elf，由 tools/drvdemo_pack_win.py 写进系统卷的 /bin/drvdemo
+#      （验收夹具 tests/drvsvc64_test.py 也会自己写一份到它的夹具卷里）。
+DRVDEMO_SZ=0
+clang --target=x86_64-unknown-none-elf -nostdinc -ffreestanding -nostdlib -fno-builtin \
+  -fno-stack-protector -fno-pic -fno-pie -fno-zero-initialized-in-bss -mcmodel=large -mno-red-zone \
+  -mno-sse -mno-sse2 -mno-mmx -mno-avx -fno-asynchronous-unwind-tables -fno-unwind-tables \
+  -ffunction-sections -fdata-sections -std=c11 -O2 -Wall -Wextra \
+  -c user/svc/drvdemo.c -o "$BUILD/drvdemo.o"
+$LD -m elf_x86_64 -T user/lib/user64.ld --gc-sections -o "$BUILD/drvdemo.elf" "$BUILD/drvdemo.o"
+DRVDEMO_SZ=$(stat -c%s "$BUILD/drvdemo.elf")
+if [ "$DRVDEMO_SZ" -gt 65536 ]; then
+    echo "ERROR: drvdemo.elf $DRVDEMO_SZ B 超过 64KiB（用户窗口装载区上限）" >&2
+    exit 1
+fi
+# 断言：内核二进制里**不能**出现 drvdemo 的字节（交付方式必须是"系统卷里的文件"）。
+# 探针取中段的 64 字节（ELF 头/入口附近的字节模式到处都是，中段最稳）。
+"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/drvdemo.elf" <<'PYEOFDRV'
+import sys
+k = open(sys.argv[1], "rb").read()
+d = open(sys.argv[2], "rb").read()
+mid = len(d) // 2
+probe = d[mid:mid + 64]
+if len(probe) < 64 or probe in k:
+    sys.stderr.write("ERROR: system kernel contains drvdemo.elf bytes (delivery must be a volume file)\n")
+    raise SystemExit(1)
+print("    断言 OK：系统内核 %d B 里搜不到 drvdemo.elf 的 64B 探针（偏移 %d）；它只从系统卷装载"
+      % (len(k), mid))
+PYEOFDRV
+echo "    /bin/drvdemo = $DRVDEMO_SZ B（静态 ELF64；由 tools/drvdemo_pack_win.py 装进系统卷）"
 
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
 "$PY" - "$BUILD/payload_hdr.bin" "$SYS_SECTORS" "$((PAYLOAD_LBA + 1))" <<'PYEOF'

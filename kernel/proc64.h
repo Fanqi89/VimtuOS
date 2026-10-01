@@ -276,6 +276,26 @@ int proc64_shm_has_handle_id64(int32_t id);
 // 当前进程持有句柄的对象数（任务管理器/自检用；不动状态）
 int     proc64_shm_held64();
 
+// ==================== 设备 BAR 映射窗（pci_map_bar(22) 的落地 + 记账 + 回收）====================
+// 与 shm 窗（上面那段）是**两件事**，所以两块窗分开：
+//   * shm 窗的页帧属于**对象表**（page_alloc 出来的页池页），进程退出时只清 PTE、不还页；
+//   * 设备窗的"页"是 **MMIO 物理地址**（BAR 指向的设备寄存器）—— 它们**根本不是页池的页**，
+//     所以任何"当作进程自己的页还回页池"的路径（退出/fork/munmap）都必须**跳过**这一段，
+//     否则 page_free_64 会把一个设备地址插回页池链表（页池当场损坏，后面任何分配都踩设备寄存器）。
+//     ★ 这是本批在 proc64 里改动的全部理由（记账 + 回收 + 三处跳过判据）。
+//   * 位置：紧贴 shm 窗下方（都在用户窗口 16 MiB 的顶部），仍在 USER64_CODE_VA64..
+//     +USER64_WINDOW_BYTES64 之内 —— 所以"VA 落在用户窗口内、u=1"这类既有断言口径不变。
+static const uint32_t DEV64_SLOTS64        = 8;                                   // 每进程最多 8 个设备映射
+static const uint64_t DEV64_SLOT_BYTES64   = 256ULL * 1024ULL;                    // 单槽 = 单 BAR 上限
+static const uint64_t DEV64_WINDOW_BYTES64 = DEV64_SLOTS64 * DEV64_SLOT_BYTES64;  // 2 MiB
+static const uint64_t DEV64_WINDOW_VA64    = SHM64_WINDOW_VA64 - DEV64_WINDOW_BYTES64;
+
+// 把**一段物理 MMIO**（phys..phys+map_len，页对齐）按用户可读写/不可执行映射进**当前进程**，
+// *out_va_uptr 写回用户 VA；返回 0 = 新建映射、1 = **幂等复用**（同一个 bdf+bar 之前映射过，
+// 页表没动），负数 = 错误码（口径与 kernel/pci64.h 的 PCI64_* 一致：-1 EPERM / -2 EFAULT /
+// -3 EINVAL / -4 ENOMEM）。记账进 Proc64::dev[]；回收发生在进程退出 / execve / 销毁三条路径的
+// dev64_drop_all64（清记账），以及 p64_release_area64 里"跳过设备窗、只清 PTE"的那一支。
+int64_t proc64_devmap64(uint32_t bdf, uint32_t bar_index, uint64_t phys, uint64_t map_len, uint64_t out_va_uptr);
 // ---- A5 前置的 ring3 演示（/evshm.elf：shm_create -> 画 -> fb_flip -> 循环 input_poll）----
 // 幂等把内嵌 blob 装进系统卷（`/evshm.elf`），再以**真进程**跑它（父 fork/子读同一块 shm）。
 // 位置：os_boot_path 里 proc64_pipe_demo64 之后、ring3_slot_reuse_demo64 之前。

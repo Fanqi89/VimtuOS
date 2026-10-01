@@ -157,6 +157,13 @@ int  proc64_cwd64(char*, uint32_t)                        __attribute__((weak));
 int64_t proc64_shm_create64(uint64_t)                             __attribute__((weak));
 int64_t proc64_shm_map64(uint64_t, uint64_t, uint64_t, uint64_t)  __attribute__((weak));
 int  proc64_chdir64(const char*)                          __attribute__((weak));
+// ★ 本批：设备 BAR 映射的落地（proc64.cpp 的设备映射窗；安装内核不链 proc64.cpp -> 0 -> 号 48
+//   返回 -1 并打 [SYSCALL] deny —— 安装介质里根本没有 ring3，这条只是防御性写法）。
+int64_t proc64_devmap64(uint32_t, uint32_t, uint64_t, uint64_t, uint64_t)  __attribute__((weak));
+// ★ 本批：凭证查询（root 判定用；同上，安装内核为 0 -> 当"拿不到凭证"处理=拒绝）
+int     proc64_get_cred64(uint32_t*, uint32_t*, uint32_t*, uint32_t*)       __attribute__((weak));
+// ★ 本批：BAR 解码（kernel/pci64.cpp，**两份内核都链**它，所以这里是强引用而不是弱引用）
+#include "pci64.h"
 // ★ A5：Wayland 基础骨架（kernel/wl64.cpp；安装内核不链它 -> 0 -> 号 15..21 返回 -1 并打
 //   [SYSCALL] deny，绝不假装成功）。这些落点内部会用到 proc64/shm 与 fb，只有系统内核才有全套。
 int64_t wl64_surface_create64(uint64_t, uint64_t, uint64_t)       __attribute__((weak));
@@ -1533,6 +1540,132 @@ static int64_t lx64_pipe64(uint64_t nr, uint64_t fds_va) {
     return 0;
 }
 
+// ==================== ★ 本批：用户态设备映射（自有 ABI 48 pci_map_bar）====================
+// 语义/权限/错误码/打点格式的唯一定义点：kernel/syscall64.h 上面那一段 + kernel/pci64.h。
+// 这里只写"分发入口"这一层：权限 -> 指针 -> BAR 解码 -> 落地映射 -> 打点。
+//   rax=48, rdi=bdf, rsi=bar_index, rdx=out_va(用户指针), r10=out_len(用户指针)
+// ★ 打点是给自动化验收（tests/drvsvc64_test.py）与排障用的，格式勿改；失败行有上限防刷屏。
+static uint32_t g_pcimap64_logged64 = 0;                 // FAILED/deny 已打条数
+static const uint32_t PCIMAP64_LOG_MAX64 = 12;           // 上限：超过它以后失败行静默（防刷屏）
+
+static void pcimap64_fail64(uint64_t pid, uint64_t bdf, uint64_t bar, const char* reason, int64_t err, int deny) {
+    if (g_pcimap64_logged64 >= PCIMAP64_LOG_MAX64) return;   // 上限：之后的失败静默（防刷屏，见 syscall64.h）
+    g_pcimap64_logged64++;
+    dbg64_line_begin64();
+    dbg64_str(deny ? "[PCIMAP] deny pid=" : "[PCIMAP] FAILED pid=");
+    dbg64_dec(pid);
+    dbg64_str(" bdf=0x");
+    dbg64_hex64(bdf);
+    dbg64_str(" bar=");
+    dbg64_dec(bar);
+    dbg64_str(" reason=");
+    dbg64_str(reason);
+    dbg64_str(" err=");
+    dbg64_dec((uint64_t)(err < 0 ? -err : err));
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+static int64_t sc64_pci_map_bar64(uint64_t bdf, uint64_t bar_index, uint64_t out_va, uint64_t out_len) {
+    const int64_t pid = (lx64_have_proc64() && proc64_current_pid64) ? (int64_t)proc64_current_pid64() : -1;
+    // ① 必须有进程上下文（映射要落进"当前进程"的地址空间）+ 必须是 root(euid=0)
+    if (pid <= 0) {
+        pcimap64_fail64(0, bdf, bar_index, "no-process-context", PCIMAP64_EPERM64, 1);
+        syscall64_deny64(SYSCALL64_PCIMAP_NR64, bdf);
+        return PCIMAP64_EPERM64;
+    }
+    uint32_t uid = 0, gid = 0, euid = 0, egid = 0;
+    if (!proc64_get_cred64 || proc64_get_cred64(&uid, &gid, &euid, &egid) != 0) {
+        pcimap64_fail64((uint64_t)pid, bdf, bar_index, "no-cred", PCIMAP64_EPERM64, 1);
+        syscall64_deny64(SYSCALL64_PCIMAP_NR64, bdf);
+        return PCIMAP64_EPERM64;
+    }
+    if (euid != 0) {                                     // ★ 只允许 root（userdb64 的 root 会话 / 内核启动期）
+        // 拒绝时**不**在这里打 euid：用户程序自己会打（DRVDEMO init euid=…），内核打点是
+        // "谁在什么位置被拒 + 错误码"，两边各出一半证据（省字节也省一次格式化）。
+        pcimap64_fail64((uint64_t)pid, bdf, bar_index, "not-root", PCIMAP64_EPERM64, 1);
+        syscall64_deny64(SYSCALL64_PCIMAP_NR64, bdf);
+        return PCIMAP64_EPERM64;
+    }
+    // ② 两个 out 指针都必须是用户可写（各 8 字节）
+    if (!user64_range_ok64(out_va, 8) || !user64_range_ok64(out_len, 8)) {
+        pcimap64_fail64((uint64_t)pid, bdf, bar_index, "bad-out-ptr", PCIMAP64_EFAULT64, 0);
+        return PCIMAP64_EFAULT64;
+    }
+    // ③ BAR 解码（I/O 端口 -> -EINVAL；没有设备/BAR 未实现/在 4GiB 之上 -> -ENODEV）
+    Pci64Bar64 bar{};                                    // 清零：早期返回路径下也要能安全地读 is_io
+    const int pr = pci64_bar_probe64((uint32_t)bdf, (uint8_t)bar_index, &bar);
+    if (pr != 0) {
+        pcimap64_fail64((uint64_t)pid, bdf, bar_index,
+                        bar.is_io ? "bar-is-io-port" : (pr == PCI64_EINVAL64 ? "bad-arg" : "no-such-bar"),
+                        pr, 0);
+        return (int64_t)pr;
+    }
+    // ★ BAR 解码结果**始终**打一行（哪怕后面映射失败）：排障时要能一眼看出"解出来的大小/基址"，
+    //   否则 ENOMEM 到底是"BAR 太大"还是"页表页不够"无法区分（本批实测踩过）。
+    dbg64_line_begin64();
+    dbg64_str("[PCIMAP] bar pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_str(" bdf=0x");
+    dbg64_hex64(bdf);
+    dbg64_str(" bar=");
+    dbg64_dec(bar_index);
+    dbg64_str(" pa=0x");
+    dbg64_hex64(bar.phys);
+    dbg64_str(" size=");
+    dbg64_dec(bar.size);
+    dbg64_str(" b64=");
+    dbg64_dec(bar.is_64 ? 1u : 0u);
+    dbg64_str(" slot_need=");
+    dbg64_dec((bar.size + PAGE_SIZE_64 - 1) / PAGE_SIZE_64);
+    dbg64_str(" pages");
+    dbg64_nl();
+    dbg64_line_end64();
+    // ④ 落地映射（页对齐后的长度；用户看到的 out_len 仍是 **BAR 实际大小**）
+    const uint64_t map_len = (bar.size + PAGE_SIZE_64 - 1) & ~(PAGE_SIZE_64 - 1);
+    if ((bar.phys & (PAGE_SIZE_64 - 1)) != 0) {          // 极小 BAR（< 一页且基址不对齐）：如实拒绝
+        pcimap64_fail64((uint64_t)pid, bdf, bar_index, "bar-base-not-page-aligned", PCIMAP64_ENODEV64, 0);
+        return PCIMAP64_ENODEV64;
+    }
+    const int64_t mr = proc64_devmap64
+                           ? proc64_devmap64((uint32_t)bdf, (uint32_t)bar_index, bar.phys, map_len, out_va)
+                           : PCIMAP64_EPERM64;
+    if (mr < 0) {
+        pcimap64_fail64((uint64_t)pid, bdf, bar_index,
+                        (mr == PCIMAP64_ENOMEM64) ? "window-full-or-no-pagetable" : "map-failed", mr, 0);
+        return mr;
+    }
+    *(uint64_t*)(uintptr_t)out_len = bar.size;           // 长度 = BAR 实际大小（写全 1 回读法）
+    const uint64_t va = *(const uint64_t*)(uintptr_t)out_va;
+    dbg64_line_begin64();
+    dbg64_str("[PCIMAP] map pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_str(" bdf=0x");
+    dbg64_hex64(bdf);
+    dbg64_str(" bar=");
+    dbg64_dec(bar_index);
+    dbg64_str(" pa=0x");
+    dbg64_hex64(bar.phys);
+    dbg64_str(" len=");
+    dbg64_dec(bar.size);
+    dbg64_str(" va=0x");
+    dbg64_hex64(va);
+    dbg64_str(" pages=");
+    dbg64_dec(map_len / PAGE_SIZE_64);
+    dbg64_str(" u=");
+    dbg64_dec(user64_page_is_user_ok64(va) ? 1u : 0u);   // ★ 说好"用户可访问"就必须真的是
+    dbg64_str(" re=");
+    dbg64_dec((mr == 1) ? 1u : 0u);
+    dbg64_str(" b64=");
+    dbg64_dec(bar.is_64 ? 1u : 0u);
+    dbg64_str(" pool_free=");                              // 映射后页池水位（回收判据：见 [PCIMAP] release）
+    dbg64_dec(page_count_free_64());
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;                                            // 用户可见：0 = 成功（复用也是 0）
+}
+
+
 
 
 // ---- Linux 号段分发 ----
@@ -1838,6 +1971,14 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
         ret = wl64_seat_post64 ? wl64_seat_post64(a1) : -1;
         if (!wl64_seat_post64) syscall64_deny64(nr, a1);
         break;                                              // ★ 这条 case 的 break 不能少：少了会掉进 48 号（pci_map_bar）
+    // ★ 本批：用户态设备映射（48 pci_map_bar）。语义/权限/错误码：kernel/syscall64.h 的那一段。
+    //   第 4 个参数（out_len）在 r10 —— 与 fb_flip(10) 同款（自有 ABI 只有 rdi/rsi/rdx + r10）。
+    //   安装介质内核不链 proc64.cpp -> proc64_devmap64 为 0 -> 返回 -1 并 deny（不假装成功）。
+    case 48:                                                    // pci_map_bar(bdf, bar, out_va, out_len)
+        ret = sc64_pci_map_bar64(a1, a2, a3, r->r10);
+        break;
+        break;
+
     default:
         ret = -1;
         break;
