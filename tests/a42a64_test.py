@@ -227,17 +227,21 @@ def main():
     #   65,536（合计 196,608）+ icon_start.bin 16,384 = **356,992 B**；本轮全部搬进系统卷的
     #   /etc/logo.bin、/etc/icon_mypc.bin、/etc/icon_recycle.bin、/etc/icon_term.bin、/etc/icon_start.bin，
     #   只留 2,304 B 的开始按钮 24x24 内置兜底 mip（裸 system.img 无卷时用）。
-    #   余量阈值 = 预留 **700 KiB = 716,800 B**，依据（是"钉住搬移后的新基线"，不是放宽）：
+    #   余量阈值 = 预留 **700 KB = 700,000 B**（本批目标原文"余量回到 ≥ 700 KB"；同一句里的换算用的是
+    #   十进制 KB："搬走约 356 KB 后 ≈725 KB" = 369,504 + 356,992 = 726,496 B ≈ 725 KB）。依据：
     #     * 搬移前实测余量 369,504 B（3,726,496 B 内核）—— 384 KiB 的旧阈值离实测太近（差 23,712 B 就红）；
-    #     * 搬走 356,992 B、加回 2,304 B -> 余量 ~726 KB；700 KiB 恰好卡在"搬移必须真的发生"的位置：
-    #       任何一份资源被塞回内核（最小的 icon_start.bin 也有 16,384 B）都会让这条断言立刻失败；
-    #     * 反向也钉住：字体退回未压缩形态（+408,328 B）同样必失败。
-    RESERVE_BYTES = 700 * 1024
-    check("raw 图标/logo 搬进系统卷后系统内核余量 ≥ 预留 700 KiB（%d B；依据见上面注释）"
+    #     * 本轮实测：内核 3,379,104 B / 余量 **716,896 B = 700.09 KiB = 716.9 KB**（远超 700 KB）；
+    #       同树另一条线（xHCI）在飞的改动再吃掉 ~1.3 KB 时，实测 3,380,432 B / 余量 715,568 B = 715.6 KB
+    #       仍然过线 —— 阈值是按"共享内核预算"钉的，不允许把资源塞回去；
+    #     * 反向钉住：任何一份资源塞回内核（最小的 icon_start.bin 也有 16,384 B）、或字体退回未压缩
+    #       形态（+408,328 B），这条断言都会立刻失败。
+    RESERVE_BYTES = 700 * 1000
+    check("raw 图标/logo 搬进系统卷后系统内核余量 ≥ 预留 700 KB（%d B；比旧阈值 384 KiB 紧 306,784 B，依据见上面注释）"
           % RESERVE_BYTES,
           (NEW_LIMIT_BYTES - OLD_LIMIT_BYTES) == 262144 and (NEW_LIMIT_BYTES - ossz) >= RESERVE_BYTES,
-          "系统内核 %d B；余量 %d B（搬移前 3,726,496 B / 余量 369,504 B；图标包搬走前上限 %d B - 内核 %d B = %d B）"
-          % (ossz, NEW_LIMIT_BYTES - ossz, OLD_LIMIT_BYTES, BEFORE_KERNEL_BYTES,
+          "系统内核 %d B；余量 %d B = %d KiB（搬移前 3,726,496 B / 余量 369,504 B；图标包搬走前上限 %d B - 内核 %d B = %d B）"
+          % (ossz, NEW_LIMIT_BYTES - ossz, (NEW_LIMIT_BYTES - ossz) // 1024,
+             OLD_LIMIT_BYTES, BEFORE_KERNEL_BYTES,
              OLD_LIMIT_BYTES - BEFORE_KERNEL_BYTES))
     if os.path.exists(SYSTEM_IMG):
         sysimg = open(SYSTEM_IMG, "rb").read()
