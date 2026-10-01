@@ -19,15 +19,17 @@
 //
 // 串口打点（自动验收 tests/xhci64_test.py 靠这些行判定，改格式要同步改脚本）：
 //   [XHCI] pci <b>:<d>.<f> bar0=<hex> caplen=<hex> hcs1=<hex> max_slots=<n> max_ports=<n> csz=<0|1> ver=<hex>
-//   [XHCI] proto rev=2|3 portoff=<hex> ports=<n>          （Supported Protocol 扩展能力，如实列出）
+//   [XHCI] proto rev=2|3 portoff=<hex> ports=<n>          （Supported Protocol 扩展能力；端口偏移/个数在 DW2）
 //   [XHCI] reset HCRST ok usbcmd=<hex> usbsts=<hex>       （复位完成）
 //   [XHCI] cmd ring @<hex> erst @<hex> event ring @<hex> dcbaa @<hex> scratchpad=<n>
 //   [XHCI] doorbell mode=<n> enable slot=<n> ok           （DB Target 位序的自探结果）
 //   [XHCI] mfindex=0x<hex> delta=0x<hex>                  （时间真的在走：复位/等 PRC 期间采样）
 //   [XHCI] erdp ehb cleared erdp=0x<hex>                  （ERDP.EHB 写 1 清语义）
-//   [XHCI] port <n> connected speed=low|full|high|super reset ok
+//   [XHCI] transfer evt ok idx=<n> seen=<n>                （★ Transfer Event 落环并被配对识别，一次性证据）
+//   [XHCI] port <n> connected speed=low|full|high|super reset ok   （QEMU 的 usb-kbd 在 xHCI 上是高速）
 //   [XHCI] no device on port <n>
 //   [XHCI] device addr=<n> speed=<..> mps=<n> vendor=<hex> product=<hex>
+//   [XHCI] config ep retry without EP0: first cc=<n> second cc=<n>   （Configure Endpoint 的两条写法）
 //   [XHCI] config set value=1 ifaces=<n> hid=1 ep_in=<hex> mps=<n> interval=<n>        （键盘）
 //   [XHCI] config set value=1 ifaces=<n> msc=1 ep_in=<hex> mps=<n> ep_out=<hex> mps=<n>（存储）
 //   [XHCI] hid boot protocol set (8-byte reports)

@@ -4,26 +4,32 @@
 
 为什么必须用 qemu-xhci：xHCI 只能这样**精确**测（PI 的 piix3 只有 UHCI；-usb 那套是 UHCI/EHCI）。
 
-测试内容（四个启动）：
-  1) ★ 主跑：`-device qemu-xhci -device usb-kbd`（xHCI 主控 + 全速 HID 引导键盘）
-       * 控制器识别：[XHCI] pci <b>:<d>.<f> bar0=… caplen=… hcs1=… max_slots=… max_ports=…
-                      [XHCI] proto rev=2|3 …（Supported Protocol 扩展能力）
+  1) ★ 主跑：`-device qemu-xhci -device usb-kbd`（xHCI 主控 + 高速 HID 引导键盘）
+       * 控制器识别：[XHCI] pci <b>:<d>.<f> bar0=… caplen=… hcs1=… max_slots=… max_ports=… csz=0 ver=…
+                      [XHCI] proto rev=2 portoff=0x05 ports=4 / rev=3 portoff=0x01 ports=4
+                      （Supported Protocol 扩展能力：端口偏移/个数在能力的 DW2；xECP 是 dword 偏移）
        * 复位：[XHCI] reset HCRST ok usbcmd=… usbsts=…（HCRST 自清）
        * 环：[XHCI] cmd ring @… erst @… event ring @… dcbaa @… scratchpad=N
               [XHCI] doorbell mode=N enable slot=N ok（DB Target 位序是自探出来的）
               [XHCI] mfindex=0x… delta=0x…（复位期间时间在走）、[XHCI] erdp ehb cleared（EHB 写 1 清）
-       * 枚举 + 速率：[XHCI] port <n> connected speed=full|high|super reset ok ped=1
-                      [XHCI] device addr=N speed=… mps=8 vendor=0627 product=0001
-                      [XHCI] config set value=1 ifaces=1 hid=1 ep_in=81 mps=8 interval=…
+       * ★ 事件环： [XHCI] transfer evt ok idx=… seen=…（Transfer Event 落环并被识别 —— 原 GAP 的判据）
+       * 枚举 + 速率：[XHCI] port <n> connected speed=high|super reset ok ped=1
+                      [XHCI] device addr=N speed=high mps=64 vendor=0627 product=0001
+                      （QEMU 的 usb-kbd 挂在 qemu-xhci 上协商到 **高速**：`info usb` 显示 480 Mb/s，
+                        bMaxPacketSize0=64；这与 UHCI 那套 full/8 不同，是本文件与 usb64_test 的真实差异）
+                      [XHCI] config set value=1 ifaces=1 hid=1 ep_in=03 mps=8 interval=7
                       [XHCI] hid boot protocol set (8-byte reports)
        * ★ 端到端打字：QEMU monitor sendkey -> xHCI 中断端点 -> [XHCI] hid report key=E3 down=1
          -> 桌面外壳响应（[UI] menu open / [APP] term opened）
+         ※ QEMU 的 sendkey 在有 USB 键盘时**只发给 USB 键盘**（实测：`-trace input_event_key_qcode`
+           配 `usb_xhci_fetch_trb`；没有 USB 键盘时才走 PS/2）—— 所以"打字"这条链路真的经过 xHCI。
        * [XHCI] selftest PASS + [GUI64] ready + kheart 心跳持续增长（kusb 不饿着桌面）
-  2) ★ 存储：`-device qemu-xhci -device usb-kbd -device usb-storage`（两根设备 + 一根 U 盘）
+  2) ★ 存储：`-device qemu-xhci -device usb-kbd -device usb-storage`（键盘 + 一根 U 盘）
+       * U 盘是 **SuperSpeed** 设备：[XHCI] device addr=1 speed=super mps=512（bMaxPacketSize0=9 是指数编码）
        * [XHCI] msc inquiry / capacity（blocks 必须等于宿主镜像的扇区数）
        * [XHCI] msc READ(10) ok lba=0 count=1 bytes=512 crc=XXXXXXXX head=<16 字节>
          —— **宿主侧逐字节核对**：crc/head 与宿主造的字节逐位比较（不是"看起来成功了"）
-       * 盘符：[USBST] storage attached -> rescan … xhci=1、[DRV64] letter=X: disk=24 … fs=FAT32
+       * 盘符：[USBST] storage attached -> rescan … xhci=1、[DRV64] letter=** disk=24 … fs=FAT32
        * U 盘镜像 CRC32 测试前后一致（谁都没写它：本批只读）
   3) 有主控没插设备：`-device qemu-xhci` -> [XHCI] no device on port N + selftest PASS，无 hid report
   4) 没有 xHCI：不加 `-device qemu-xhci` -> [XHCI] not found + selftest skipped，系统照常起桌面
@@ -272,9 +278,12 @@ def main():
     check("① [XHCI] proto rev=…（Supported Protocol 扩展能力：USB2/USB3 端口区间）",
           bool(re.search(r"\[XHCI\] proto rev=\d+ portoff=0x[0-9A-F]+ ports=\d+", log)),
           first_match(r"\[XHCI\] proto[^\r\n]*", log))
-    check("① 至少列出一个 rev=2（USB 2.0 协议）的端口区间",
-          bool(re.search(r"\[XHCI\] proto rev=2 ", log)),
+    check("① 至少列出一个 rev=2（USB 2.0 协议）的端口区间，且 portoff/ports 与实测一致（5..8 共 4 个口）",
+          bool(re.search(r"\[XHCI\] proto rev=2 portoff=0x05 ports=4", log)),
           first_match(r"\[XHCI\] proto rev=2[^\r\n]*", log))
+    check("① 至少列出一个 rev=3（USB 3.0 协议）的端口区间，且 portoff/ports 与实测一致（1..4 共 4 个口）",
+          bool(re.search(r"\[XHCI\] proto rev=3 portoff=0x01 ports=4", log)),
+          first_match(r"\[XHCI\] proto rev=3[^\r\n]*", log))
 
     # ---- ② 复位 / HCRST / 环 / ERST ----
     check("② [XHCI] reset HCRST ok usbcmd=… usbsts=…（软复位完成、HCRST 自清）",
@@ -306,10 +315,14 @@ def main():
           m_port.group(0) if m_port else first_match(r"\[XHCI\] port \d+ connected[^\r\n]*", log))
     m_dev = re.search(r"\[XHCI\] device addr=(\d+) speed=(\w+) mps=(\d+) vendor=([0-9A-Fa-f]{4}) "
                       r"product=([0-9A-Fa-f]{4})", log)
-    check("③ [XHCI] device addr=N speed=… mps=8 vendor=0627 product=0001（Address Device 成功）",
-          bool(m_dev) and m_dev.group(2) == "full" and m_dev.group(3) == "8" and
+    check("③ [XHCI] device addr=N speed=high mps=64 vendor=0627 product=0001（Address Device 成功）",
+          bool(m_dev) and m_dev.group(2) == "high" and m_dev.group(3) == "64" and
           m_dev.group(4).upper() == "0627" and m_dev.group(5).upper() == "0001",
           m_dev.group(0) if m_dev else first_match(r"\[XHCI\] device addr[^\r\n]*", log))
+    # ★ 事件环证据（原 GAP 的判据）：Transfer Event 真的落进事件环并被配对认出来
+    check("③★ [XHCI] transfer evt ok idx=… seen=…（Transfer Event 落环并被识别）",
+          bool(re.search(r"\[XHCI\] transfer evt ok idx=\d+ seen=\d+", log)),
+          first_match(r"\[XHCI\] transfer evt ok[^\r\n]*", log))
     m_cfg = re.search(r"\[XHCI\] config set value=1 ifaces=(\d+) hid=1 ep_in=([0-9A-Fa-f]{2}) "
                       r"mps=(\d+) interval=(\d+)", log)
     check("③ [XHCI] config set value=1 ifaces=1 hid=1 ep_in=03 mps=8 interval=…（Configure Endpoint 成功）",
@@ -375,6 +388,9 @@ def main():
     check("⑤ 两根设备都枚举到（键盘 + 存储）：[XHCI] device addr= 至少 2 行",
           len(re.findall(r"\[XHCI\] device addr=\d+ speed=", logm)) >= 2,
           "行数=%d" % len(re.findall(r"\[XHCI\] device addr=\d+ speed=", logm)))
+    check("⑤ U 盘走的是 **SuperSpeed** 链路（qemu-xhci 的 USB3 口）：[XHCI] device addr=1 speed=super mps=512",
+          bool(re.search(r"\[XHCI\] device addr=\d+ speed=super mps=512 ", logm)),
+          first_match(r"\[XHCI\] device addr=\d+ speed=super[^\r\n]*", logm))
     check("⑤ [XHCI] config set … msc=1 ep_in=… ep_out=…（存储接口端点都配好）",
           bool(re.search(r"\[XHCI\] config set value=1 ifaces=\d+ msc=1 ep_in=[0-9A-Fa-f]{2} mps=\d+ "
                          r"ep_out=[0-9A-Fa-f]{2} mps=\d+", logm)),

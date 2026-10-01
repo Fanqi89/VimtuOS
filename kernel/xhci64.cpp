@@ -21,19 +21,23 @@
 // 4) 事件环消费者游标 + ERDP.EHB：取一个事件就把 dequeue 前移并写 ERDP，**bit3（EHB）写 1**
 //    —— 这是规范里"事件已处理完、清掉挂起标志"的语义（写 1 清，不是写 0 清）。第一次取到
 //    事件时打一行 [XHCI] erdp ehb cleared 作为证据。
-// 5) ★ 门铃（Doorbell）的 DB Target 位序在资料上有分歧，本驱动**自探**：
-//    先用 (EndpointID<<8)|1（Linux/NetBSD 那套），超时就换 (1<<EndpointID)，再换 1；
-//    以"Enable Slot 命令有没有拿到完成事件"为判据，探到的模式打进 [XHCI] doorbell mode=<n>。
-//    这样在 QEMU 与真机上都能起来，而且"哪种位序对"是**实测出来的**，不是猜的。
+// 5) ★ 门铃（Doorbell）的 DB Target 位序在资料上有分歧，本驱动**自探**（以"第一条控制传输能不能
+//    完成"为判据，探到的模式打进 [XHCI] doorbell mode=<n>）：
+//      mode 0 = 值就是 DCI（**低字节**；QEMU 11.1 与 BIOS 自带 xHCI 驱动实测，SeaBIOS 就是 writel(DB+slot*4, ep)）；
+//      mode 1 = DCI 在 bits31:16（xHCI 规范的 DB Target 位）；
+//      mode 2 = 值恒为 1（只要求"写非 0"的实现）。寄存器地址恒为 DBOFF + slot*4。
+//    ★ 三者对 EP0（DCI=1）可区分（1 / 0x10000 / 1），所以探出来的位序对批量/中断端点一样成立。
+//    踩过：原先写 `1 | (dci<<8)`，EP0 恰好等效、键盘靠 QEMU 对 NAK 的自重试也能跑，但 U 盘的
+//    EP4 门铃被当成 EP1 —— 批量传输永远不启动，INQUIRY 超时（这是存储那条链路的真因）。
 // 6) 速率协商：复位后读 PORTSC 的 Port Speed 字段（bit13:10 -> 1=low 2=full 3=high 4=super
 //    5=superplus），据此填 Slot Context 的 Speed 字段与 EP0 默认最大包（FS/LS=8、HS=64、SS=512），
 //    再按"Address Device(BSR=1) -> 读 8 字节设备描述符 -> Address Device(BSR=0)"两步定址。
 //    PORTSC.PR -> 等 PORTSC.PRC 的握手用 MFINDEX 采样证明时间真的在走。
 //
 // 没验证到的点（如实记录）：
-//   * USB3 **SuperSpeed** 的真实链路：QEMU 的 usb-kbd / usb-storage 都是 USB 2.0 设备，只会挂到
-//     USB2 端口上 —— 代码按 SuperSpeed 走（speed 字段/EP0 MPS=512/SS EP 上下文），但没有真设备
-//     实测过，属于 GAP（见验收报告）。
+//   * USB3 SuperSpeed：现在**有实测**了 —— QEMU 的 usb-storage 就是 SuperSpeed 设备（挂在 USB3 端口，
+//     PORTSC 速度码 4、bMaxPacketSize0 报 9 是指数编码=512），存储全程（INQUIRY/CAPACITY/READ(10)）
+//     走的就是 SS 链路。没验证的只剩：SS 的 **Streams / Max Burst / 链路状态切换（U1/U2/U3）**。
 //   * 集线器（hub）、热插拔运行期枚举、多配置/多接口切换、USB 鼠标、带宽协商（xHCI 的
 //     Configure Endpoint 带宽请求）都没做：只认直接插在根端口的设备，拔出只打点不重新枚举。
 //   * 没有接 MSI/MSI-X/中断（全程轮询），没有挂起/恢复/休眠（U3 等链路状态）。
@@ -122,8 +126,13 @@ struct XhciTrb { uint64_t param; uint32_t status; uint32_t control; } __attribut
 #define XHCI_TRB_IOC     0x00000020u
 #define XHCI_TRB_TC      0x00000002u      // Link TRB 的 Toggle Cycle（bit1）
 #define XHCI_TRB_TYPE(t) ((uint32_t)(t) << 10)
+// Setup Stage：8 字节 Setup 包**内联**在 TRB 里（规范 6.4.1.1）——
+//   TRT（bit17:16）= 0/2/3 决定有没有数据阶段；**IDT（bit6）必须置 1**（否则 xHC 会把 TRB Pointer
+//   当"指向 Setup 包的内存地址"，而它其实是 Setup 包的位模式 → 控制传输永不完成、也不报错）。
+#define XHCI_TRB_TRT(t)  ((uint32_t)(t) << 16)
+#define XHCI_TRB_IDT     0x00000040u
+#define XHCI_TRB_DIR_IN  0x00010000u      // Data/Status Stage：方向位（bit16）
 #define XHCI_TRB_DIR_IN  0x00010000u      // Data/Status Stage：IN 方向（bit16）
-#define XHCI_TRB_TRT(t)  ((uint32_t)(t) << 16)  // Setup Stage：TRT（bit17:16）
 #define XHCI_TRB_BSR     0x00000200u      // Address Device：Block Set Address（bit9）
 #define XHCI_TRB_SLOT(s) ((uint32_t)(s) << 24)
 
@@ -168,7 +177,7 @@ struct XhciTrb { uint64_t param; uint32_t status; uint32_t control; } __attribut
 #define XHCI_SCRATCH_MAX  16u             // scratchpad 缓冲上限（QEMU 是 0；真机常见 0/1）
 
 // 数据页里的偏移（都在恒等映射的低内存页里，物理地址 = 指针）
-#define XHCI_OFF_SETUP    0x000u
+//   ★ Setup 包不再占内存：它**内联**在 Setup Stage TRB 里（见 xhci_control）
 #define XHCI_OFF_DESC     0x010u
 #define XHCI_OFF_REP0     0x110u
 #define XHCI_OFF_REP1     0x150u
@@ -219,7 +228,6 @@ static volatile XhciTrb* g_cmd_trbs = nullptr;
 static volatile XhciTrb* g_evt_trbs = nullptr;
 static uint32_t g_evt_idx = 0, g_evt_cycle = 1;
 
-static uint8_t*  g_setup = nullptr;        // 8 字节 SETUP 包
 static uint8_t*  g_desc  = nullptr;        // 256 字节描述符缓冲
 static uint8_t*  g_sector= nullptr;        // 512 字节扇区缓冲
 static uint8_t*  g_cbw   = nullptr;        // 32 字节 CBW
@@ -348,13 +356,19 @@ static inline uint32_t port_off(uint32_t n) { return XHCI_OP_PORTS + (n - 1u) * 
 static inline uint32_t port_rd(uint32_t n) { return op_rd32(port_off(n)); }
 static inline void     port_wr(uint32_t n, uint32_t v) { op_wr32(port_off(n), v); }
 
-// 门铃：DB0 = 命令环（值 0）；DB[slot] = 设备槽（值见文件头第 5 点：位序自探）
+// 门铃：DB0 = 命令环（值 0）；DB[slot] = 设备槽。★ 值里"DB Target（端点号 DCI）"的位序**实测过**：
+//   QEMU 11.1（`-trace usb_xhci_doorbell_write/ep_kick`）与 BIOS 自带的 xHCI 驱动都把 DCI 写在
+//   **低字节**（SeaBIOS 就是 `writel(DB + slot*4, ep)`；val=0x401 时 QEMU 踢的是 epid 1，说明它读低字节）。
+//   规范版写法是 DB Target 在 bits31:16。自探按"控制传输能不能完成"选：EP0 的 DCI=1，低字节写法=1、
+//   规范写法=0x10000 —— 两者对 EP0 可区分，所以探到的位序对非 EP0 端点（批量/中断）同样成立。
+//   （踩过：原先写的是 `1 | (dci<<8)`，EP0 恰好等效、键盘靠 QEMU 的 NAK 重试也能跑，但 U 盘的
+//    EP4 门铃被当成 EP1 —— 批量传输永远不启动，INQUIRY 超时。）
 static void xhci_db(uint32_t slot, uint32_t dci) {
     uint32_t v;
     switch (g_db_mode) {
-    case 1:  v = 1u << dci; break;
-    case 2:  v = 1u; break;
-    default: v = 1u | (dci << 8); break;
+    case 1:  v = dci << 16; break;                 // 规范：DB Target = bits31:16
+    case 2:  v = 1u; break;                        // 只要求"写非 0"的实现
+    default: v = dci; break;                       // QEMU/SeaBIOS 实测：目标在低字节
     }
     mmio_wr32(g_dboff + slot * 4u, v);
 }
@@ -661,14 +675,24 @@ static uint32_t xdefault_mps(uint32_t speed) {       // EP0 默认最大包
     }
 }
 
+// 环里"下一个要执行的 TRB"的物理地址 + DCS（= 环当前的消费 cycle）。
+//   ★ Address Device / Configure Endpoint 会把 xHC 的 dequeue **重置**成输入上下文里写的值，
+//     所以这里必须写"当前该执行的那一个"而不是环首：写环首会让硬件把已经执行过的旧 TRB 再执行
+//     一遍（踩过：Configure/Address 之后多出一个 "stray transfer evt"，旧控制传输被重放）。
+static uint64_t ring_deq(const XhciRing* r) {
+    return (uint64_t)(uintptr_t)&r->t[r->idx] | (uint64_t)(r->cycle & 1u);
+}
+
 static void fill_ep_ctx(uint8_t* base, int entry, uint32_t mps, uint32_t type,
-                        uint64_t ring_pa, uint32_t interval, uint32_t esit) {
+                        uint64_t ring_deq_pa, uint32_t interval, uint32_t esit) {
     uint32_t* e = inctx_dw(base, entry, 0);
+    // DP0 = Interval(7:0)；DP1 = MPS(31:16) | EP Type(5:3) | CErr(2:1，bit0 是保留位必须 0)
+    //   ★ 原来写的是 "| 3u"：CErr 落成 1、还把保留位 bit0 置了 1。
     e[0] = (interval & 0xFFu) << 16;
-    e[1] = (mps << 16) | (type << 3) | 3u;               // MPS(31:16) | EP Type(5:3) | CErr=3
-    e[2] = (uint32_t)(ring_pa & 0xFFFFFFFFu) | 1u;        // TR Dequeue Pointer + DCS=1
-    e[3] = (uint32_t)(ring_pa >> 32);
-    e[4] = (esit << 16) | 8u;                             // Max ESIT Payload Low | Average TRB Length
+    e[1] = (mps << 16) | (type << 3) | (3u << 1);
+    e[2] = ((uint32_t)ring_deq_pa & 0xFFFFFFF0u) | ((uint32_t)ring_deq_pa & 1u);   // TR Dequeue + DCS
+    e[3] = (uint32_t)(ring_deq_pa >> 32);
+    e[4] = (esit << 16) | 8u;                             // Max ESIT Payload(31:16，只对 SS 有意义) | Average TRB Length(15:0)
 }
 // 命令环（全局一份：命令是串行的，一次只提交一条并等它的完成事件）
 static XhciRing g_cmd_ring = { nullptr, 0, 1 };
@@ -683,40 +707,48 @@ static uint32_t xhci_cmd_addr_dev(XhciDev* d, uint32_t mps, bool bsr) {
     s[0] = (xspeed_code(d->speed) << 20) | (1u << 27);
     s[1] = (uint32_t)d->port << 16;
     fill_ep_ctx(g_p_inctx, 2, mps ? mps : xdefault_mps(d->speed), EPT_CONTROL,
-                (uint64_t)(uintptr_t)d->ep0.t, 0, 0);
+                ring_deq(&d->ep0), 0, 0);
     const uint64_t trb = ring_put(&g_cmd_ring, (uint64_t)(uintptr_t)g_p_inctx, 0,
                                   XHCI_TRB_TYPE(TRB_ADDRESS_DEV) | XHCI_TRB_SLOT(d->slot) |
                                   (bsr ? XHCI_TRB_BSR : 0u));
     return xhci_cmd_wait(trb, XHCI_CMD_TIMEOUT, nullptr, nullptr);
 }
 
-// Configure Endpoint：把 Slot（Context Entries = 最高的 DCI）+ EP0 + 该设备的 EP 全部带上。
-static uint32_t xhci_cmd_config_ep(XhciDev* d) {
+// Configure Endpoint 的一次尝试：Slot（Context Entries = 最高的 DCI）+ EP0（可选）+ 该设备的 EP。
+//   with_ep0 = 把 EP0 也放进 Add Context 列表（规范/Linux 的写法：EP0 上下文跟着更新，此时必须
+//   给一份**有效**的 EP0 上下文 —— 全 0 的 EP0 上下文会被 xHC 当 TRB Error）；
+//   with_ep0 = false 是 BIOS 自带 xHCI 驱动的写法（不动 EP0，只配新端点）。
+static uint32_t xhci_cmd_config_ep_try(XhciDev* d, bool with_ep0) {
     memset_64(g_p_inctx, 0, XHCI_CTX_BYTES);
     uint32_t* ic = inctx_dw(g_p_inctx, 0, 0);
     ic[7] = 1u;                                          // Configuration Value（SET_CONFIGURATION 的值）
-    uint32_t add = 0x3u;                                 // Slot + EP0
+    uint32_t add = with_ep0 ? 0x3u : 0x1u;               // Slot(A0) [+ EP0(A1)]
     uint32_t last = 1;
     uint32_t* s = inctx_dw(g_p_inctx, 1, 0);
     s[1] = (uint32_t)d->port << 16;
-
+    // ★ EP0 进了 Add Context 列表就必须**给一份有效上下文**：全 0 的 EP0 上下文（MPS=0/类型=0/
+    //   dequeue=0）是非法参数。MPS 用设备描述符里的值（与 Address Device 写进设备上下文的一致）。
+    if (with_ep0) {
+        fill_ep_ctx(g_p_inctx, 2, d->mps ? d->mps : 8u, EPT_CONTROL, ring_deq(&d->ep0), 0, 0);
+    }
     if (d->is_kbd && d->kbd_dci) {
         const uint32_t ivl = d->kbd_interval ? (uint32_t)(d->kbd_interval - 1u) : 0u;
+        // Max ESIT Payload 只对 SuperSpeed 端点有意义：HS/FS 端点写 0（与 QEMU 自带 xHCI 驱动一致）
         fill_ep_ctx(g_p_inctx, (int)d->kbd_dci + 1, d->kbd_mps, EPT_INT_IN,
-                    (uint64_t)(uintptr_t)d->ep_int.t, ivl, d->kbd_mps);
+                    ring_deq(&d->ep_int), ivl, 0);
         add |= 1u << d->kbd_dci;
         if (d->kbd_dci > last) last = d->kbd_dci;
     }
     if (d->is_msc) {
         if (d->in_dci) {
             fill_ep_ctx(g_p_inctx, (int)d->in_dci + 1, d->in_mps, EPT_BULK_IN,
-                        (uint64_t)(uintptr_t)d->ep_in.t, 0, 0);
+                        ring_deq(&d->ep_in), 0, 0);
             add |= 1u << d->in_dci;
             if (d->in_dci > last) last = d->in_dci;
         }
         if (d->out_dci) {
             fill_ep_ctx(g_p_inctx, (int)d->out_dci + 1, d->out_mps, EPT_BULK_OUT,
-                        (uint64_t)(uintptr_t)d->ep_out.t, 0, 0);
+                        ring_deq(&d->ep_out), 0, 0);
             add |= 1u << d->out_dci;
             if (d->out_dci > last) last = d->out_dci;
         }
@@ -728,6 +760,21 @@ static uint32_t xhci_cmd_config_ep(XhciDev* d) {
     return xhci_cmd_wait(trb, XHCI_CMD_TIMEOUT, nullptr, nullptr);
 }
 
+// 两条写法都试一遍（有界、最多两次命令）：先按规范带 EP0，cc 不是成功就退到 BIOS 的写法。
+// 打点只在"退到第二条"时出现（正常路径不多一行）。
+static uint32_t xhci_cmd_config_ep(XhciDev* d) {
+    const uint32_t cc = xhci_cmd_config_ep_try(d, true);
+    if (cc == XHCI_CC_SUCCESS) return cc;
+    const uint32_t cc2 = xhci_cmd_config_ep_try(d, false);
+    xlog_begin();
+    dbg64_str("[XHCI] config ep retry without EP0: first cc=");
+    dbg64_dec(cc);
+    dbg64_str(" second cc=");
+    dbg64_dec(cc2);
+    xlog_end();
+    return cc2;
+}
+
 // ==================== 传输 ====================
 // 控制传输（Setup + Data* + Status）。返回 0 = 成功；*got 拿数据阶段实际字节数。
 static int xhci_control(XhciDev* d, uint8_t rt, uint8_t req, uint16_t val, uint16_t idx,
@@ -735,17 +782,20 @@ static int xhci_control(XhciDev* d, uint8_t rt, uint8_t req, uint16_t val, uint1
     if (got) *got = 0;
     if (len > XHCI_CTL_BYTES) return -1;
     const bool in = (rt & 0x80u) != 0;
-    uint8_t* sb = g_setup;
-    sb[0] = rt; sb[1] = req;
-    sb[2] = (uint8_t)val; sb[3] = (uint8_t)(val >> 8);
-    sb[4] = (uint8_t)idx; sb[5] = (uint8_t)(idx >> 8);
-    sb[6] = (uint8_t)len; sb[7] = (uint8_t)(len >> 8);
     const uint32_t trt = (len == 0) ? 0u : (in ? 3u : 2u);
-
-    // SETUP：8 字节，TRT 决定有没有数据阶段
-    ring_put(&d->ep0, (uint64_t)(uintptr_t)sb, 8u,
-             XHCI_TRB_TYPE(TRB_SETUP) | XHCI_TRB_TRT(trt));
-    // 数据阶段：按 EP0 最大包切分（规范要求每个数据 TRB ≤ Max Packet Size），最后一包报事件
+    // ★ Setup Stage TRB：8 字节 Setup 包**内联**在 TRB 的 param 字段里，并且 **IDT(bit6) 必须置 1**
+    //   （规范 6.4.1.1：Setup 包不来自内存；IDT=0 时 xHC 会把 param 当"指向 Setup 包的内存地址"）。
+    //   踩过（这是原来记成"Transfer Event 不落事件环"那个 GAP 的真因）：老代码把 g_setup 的**地址**
+    //   填进去、IDT 也没置 —— xHC 于是把 0x0008000001000680（其实是被当成地址的 Setup 包位模式）
+    //   当内存地址去读，读不到东西也**不报错**：TRB 被取走、EP0 dequeue 照常前进、**事件永远不来**，
+    //   控制传输全部超时 → 描述符读不回来 → 枚举断在这一步。事件环本身一直是好的。
+    const uint64_t setup = (uint64_t)rt | ((uint64_t)req << 8) | ((uint64_t)val << 16) |
+                           ((uint64_t)idx << 32) | ((uint64_t)len << 48);
+    ring_put(&d->ep0, setup, 8u, XHCI_TRB_TYPE(TRB_SETUP) | XHCI_TRB_IDT | XHCI_TRB_TRT(trt));
+    // 数据阶段：按 EP0 最大包切分（规范要求每个数据 TRB ≤ Max Packet Size）；多包用 CH 串成一条 TD。
+    // ★ 数据阶段**不置 IOC**：一条控制传输只在 Status 阶段报一个事件（QEMU 自带的 xHCI 驱动/BIOS
+    //   就是这么写的，实测 QEMU 按 IOC 逐 TRB 报事件）；事件里的残留量报的是整条传输没传完的
+    //   字节数，短包照样算得出来（见下面 got 的算法）。
     uint8_t* dp = buf;
     uint32_t remain = len, last_len = 0;
     uint64_t pa_dlast = 0;
@@ -753,8 +803,7 @@ static int xhci_control(XhciDev* d, uint8_t rt, uint8_t req, uint16_t val, uint1
         const uint32_t mps = d->mps ? d->mps : 8u;
         uint32_t chunk = (remain < mps) ? remain : mps;
         uint32_t ctl = XHCI_TRB_TYPE(TRB_DATA) | (in ? XHCI_TRB_DIR_IN : 0u);
-        if (chunk == remain) ctl |= XHCI_TRB_IOC;         // 最后一个数据包：要事件（拿 residual）
-        else                 ctl |= XHCI_TRB_CH;          // 其余链在一起（数据阶段是一个 TD）
+        if (chunk != remain) ctl |= XHCI_TRB_CH;          // 多包数据阶段：串成一条 TD
         pa_dlast = ring_put(&d->ep0, (uint64_t)(uintptr_t)dp, chunk, ctl);
         last_len = chunk;
         dp += chunk; remain -= chunk;
@@ -772,7 +821,7 @@ static int xhci_control(XhciDev* d, uint8_t rt, uint8_t req, uint16_t val, uint1
     const uint64_t t0 = g_ticks64;
     const uint64_t want = ms_to_ticks64(XHCI_CTL_TIMEOUT);
     uint64_t spin = 0;
-    uint32_t n_ev = 0, last_cc = 0xFFFFu, last_st = 0;
+    uint32_t n_ev = 0, last_cc = 0xFFFFu, last_st = 0, res_st = 0;
     uint64_t last_pa = 0;
     for (;;) {
         XhciEvt ev;
@@ -780,13 +829,27 @@ static int xhci_control(XhciDev* d, uint8_t rt, uint8_t req, uint16_t val, uint1
             const uint32_t type = (ev.control >> 10) & 0x3Fu;
             if (type == EVT_TRANSFER) {
                 n_ev++; last_pa = ev.param; last_st = ev.status; last_cc = ev_cc(ev.status);
-                if (ev.param == pa_status) { hit_st = true; cc_st = ev_cc(ev.status); }
+                if (ev.param == pa_status) { hit_st = true; cc_st = ev_cc(ev.status); res_st = ev.status & 0xFFFFFFu; }
                 else if (pa_dlast && ev.param == pa_dlast) {
                     hit_dt = true; cc_dt = ev_cc(ev.status); res_dt = ev.status & 0xFFFFFFu;
                 } else xhci_dispatch(&ev);
             } else xhci_dispatch(&ev);
         }
-        if (hit_st || hit_dt) break;
+        if (hit_st || hit_dt) {
+            // ★ 一次性证据（自动验收断言的就是这一行）：Transfer Event **真的落进了事件环**、而且被
+            //   认出来配对上了 —— 这正是原来那个"Transfer Event 不落事件环"GAP 的判据。
+            static bool xfer_evt_logged = false;
+            if (!xfer_evt_logged) {
+                xfer_evt_logged = true;
+                xlog_begin();
+                dbg64_str("[XHCI] transfer evt ok idx=");
+                dbg64_dec(g_evt_idx);
+                dbg64_str(" seen=");
+                dbg64_dec(g_evt_seen);
+                xlog_end();
+            }
+            break;
+        }
         if ((g_ticks64 - t0) >= want || ++spin > 400000000ull) {
             // 排障：超时时把"我们等的是谁 / 收到过哪些 Transfer Event"打出来（有界，只在失败路径）
             xlog_begin();
@@ -808,8 +871,11 @@ static int xhci_control(XhciDev* d, uint8_t rt, uint8_t req, uint16_t val, uint1
     const uint32_t cc = hit_st ? cc_st : cc_dt;
     if (cc != XHCI_CC_SUCCESS && cc != XHCI_CC_SHORT_PKT) return -3;
     if (len > 0) {
+        // 状态阶段事件里的残留量 = **整条传输**没传完的字节数（规范 6.4.1.4 的 Residual 语义）；
+        // 数据阶段的事件（现在不会产生，保留兜底）报的是数据阶段的残留。优先用状态阶段。
         uint32_t out = len;
-        if (hit_dt) out = (uint32_t)((len - last_len) + ((last_len > res_dt) ? (last_len - res_dt) : 0u));
+        if (hit_st)      out = (res_st < len) ? (uint32_t)(len - res_st) : 0u;
+        else if (hit_dt) out = (uint32_t)((len - last_len) + ((last_len > res_dt) ? (last_len - res_dt) : 0u));
         if (got) *got = out;
     }
     return 0;
@@ -893,8 +959,16 @@ static bool xhci_port_reset(uint32_t n, uint32_t* speed_out) {
         if ((g_ticks64 - t0) >= want || ++spin > 400000000ull) break;
         nop_pause();
     }
-    const uint32_t mf1 = rt_rd32(XHCI_RT_MFINDEX);
+    uint32_t mf1 = rt_rd32(XHCI_RT_MFINDEX);
     if (!prc) return false;
+    // ★ QEMU 不模拟"复位 10ms"，PRC 可能在同一 MFINDEX tick 内就置起来（delta 读到 0 是**采样
+    //   相位问题**，不是时间没走）。要证明"时间真的在走"，就在需要时等到下一个 MFINDEX tick
+    //   再采样（MFINDEX 是 125us 一跳的自由计数器，等一拍开销 ≤125us；有界）。
+    if (mf1 == mf0) {
+        uint64_t s2 = 0;
+        while (rt_rd32(XHCI_RT_MFINDEX) == mf0 && s2 < 20000000ull) { s2++; nop_pause(); }
+        mf1 = rt_rd32(XHCI_RT_MFINDEX);
+    }
     port_wr(n, XHCI_PORTSC_CHANGE);                           // 写 1 清 PRC/CSC/WRC/OCC/PLC/CEC
     xdelay_ms(2);
     if (g_ports_seen == 0) {                                  // 一次性证据：MFINDEX 在走
@@ -1008,11 +1082,14 @@ static int xhci_enum_port(uint32_t port, uint32_t speed) {
         dbg64_dec(dd[7]);
         xlog_end();
         if (r8 == 0 && dd[7] != 0) {
-            mps = dd[7];
+            // ★ SuperSpeed 设备的 bMaxPacketSize0 是**指数**编码（9 = 512 字节），不能直接当 EP0 的
+            //   MPS 用 —— 踩过：U 盘报 9，EP0 上下文被写成 MPS=9，后面的传输全失败（INQUIRY 超时）。
+            mps = (speed >= 4u) ? 512u : dd[7];
             d->vendor  = (uint16_t)(dd[8] | ((uint16_t)dd[9] << 8));
             d->product = (uint16_t)(dd[10] | ((uint16_t)dd[11] << 8));
         }
     }
+
     // 3) Address Device（BSR=0：真正定址，地址 = Slot ID）
     cc = xhci_cmd_addr_dev(d, mps, false);
     if (cc != XHCI_CC_SUCCESS) {
@@ -1389,23 +1466,25 @@ int xhci64_init64() {
     dbg64_str(" ac64=");
     dbg64_dec(g_ac64);
     xlog_end();
-    g_found = true;
-
-    // ---- 3) Supported Protocol 扩展能力（如实列出 USB2/USB3 端口区间；只用于打点）----
+    g_found = true;                                     // ★ 主控认下来了（运行期轮询/状态查询都以它为准）
     // 端口寄存器组本身的偏移是规范固定的（0x400 + 0x10*(n-1)），所以这里不拿它当寻址依据。
-    for (uint32_t xecp = (hcc1 >> 16) & 0xFFFFu; xecp && xecp < 0x10000u; ) {
+    // ★ HCCPARAMS1.xECP 与每个扩展能力的 NEXT 都是 **dword 偏移**（规范 5.4.1.1 / 7.2）。
+    //   踩过：原来漏了 "<<" 2"，从偏移 8（= HCSPARAMS2 的值）开始走，第一个能力根本不是
+    //   Supported Protocol、NEXT=0 立刻退出 —— 于是 [XHCI] proto 这一行从来没打过。
+    //   Supported Protocol 的端口偏移/个数在能力的 **DW2**（原来错读成 DW1 = Name String）。
+    for (uint32_t xecp = (((hcc1 >> 16) & 0xFFFFu) << 2); xecp && xecp < 0x1000u; ) {
         const uint32_t dw0 = mmio_rd32(xecp);
         const uint32_t id = dw0 & 0xFFu;
         const uint32_t next = (dw0 >> 8) & 0xFFu;
         if (id == 2u) {                                     // Supported Protocol
-            const uint32_t dw1 = mmio_rd32(xecp + 4u);
+            const uint32_t dw2 = mmio_rd32(xecp + 8u);
             xlog_begin();
             dbg64_str("[XHCI] proto rev=");
             dbg64_dec((dw0 >> 24) & 0xFFu);
             dbg64_str(" portoff=0x");
-            xhex((dw1 >> 24) & 0xFFu, 2);
+            xhex(dw2 & 0xFFu, 2);
             dbg64_str(" ports=");
-            dbg64_dec((dw1 >> 16) & 0xFFu);
+            dbg64_dec((dw2 >> 8) & 0xFFu);
             xlog_end();
         }
         if (!next) break;
@@ -1433,7 +1512,6 @@ int xhci64_init64() {
     memset_64(g_p_bounce,0, PAGE_SIZE_64);
     g_cmd_trbs = (volatile XhciTrb*)(void*)(g_p_rings + 0x000u);      // 命令环（含 Link TRB）
     g_evt_trbs = (volatile XhciTrb*)(void*)(g_p_rings + 0x400u);      // 事件环（无 Link TRB）
-    g_setup   = g_p_data + XHCI_OFF_SETUP;
     g_desc    = g_p_data + XHCI_OFF_DESC;
     g_sector  = g_p_data + XHCI_OFF_SECTOR;
     g_cbw     = g_p_data + XHCI_OFF_CBW;
@@ -1488,12 +1566,12 @@ int xhci64_init64() {
     rt_wr32(XHCI_IR_ERSTSZ, 0);
     volatile uint32_t* erst = (volatile uint32_t*)(void*)(g_p_rings + 0x800u);
     *(volatile uint64_t*)(void*)erst = (uint64_t)(uintptr_t)g_evt_trbs;
-    erst[2] = XHCI_EVT_TRBS;                   // 段大小（TRB 个数；规范语义 —— 见下方 GAP 说明）
-    // ★ 未解的 GAP（如实记）：QEMU 下事件环只被写入前几个事件（Command Completion / Port Status
-    //   Change 都正常），**Transfer Event 全部收不到**（QEMU trace 显示 ep_kick/xfer_success/
-    //   queue_event 都发生了、设备上下文里的 EP0 dequeue 也在前进，但事件 TRB 没落进我的环）。
-    //   已排除：IR 寄存器偏移、ERST/ERDP 编程序列、ERDP.EHB 写法、门铃位序、上下文布局（CSZ）、
-    //   ERST 段大小的两种解释、kusb 轮询竞争。见测试报告。
+    erst[2] = XHCI_EVT_TRBS;                   // 段大小 = 段里 TRB 的**个数**（规范 6.5.2.3.1）
+    // ★ 这里原来是"未解 GAP"的现场记录：QEMU 下 Command Completion / Port Status Change 都能收到，
+    //   但 Transfer Event 一个都不来。**真因不在事件环**（中断器偏移/ERST 布局/ERDP/EHB 写序全都对，
+    //   usb_xhci_runtime_read/write 的 trace 逐条核对过）：是 Setup Stage TRB 的 8 字节 Setup 包
+    //   被写成了"内存地址"（见 xhci_control 里那段注释）—— 控制传输在设备那侧根本无法完成，
+    //   所以硬件压根没产生过 Transfer Event。地址一改对，事件立刻落环（见 tests/xhci64_test.py）。
     erst[3] = 0;
     __asm__ volatile("" ::: "memory");
     rt_wr64(XHCI_IR_ERSTBA, (uint64_t)(uintptr_t)erst);
