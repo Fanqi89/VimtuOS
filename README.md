@@ -7,24 +7,29 @@
 全部是本工程自己的 C++ / 汇编代码。
 它自带一张"三合一"安装盘（BIOS 光盘 / U 盘 / UEFI），安装界面与步骤照 Windows 10 做（去掉了输入产品密钥那一步）。
 
-> 版本 **0.4.0-beta17**（标签 `v0.4.0-beta17`）· 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
-> 状态（权威判据：`python tests/status_report.py`，本批实测）：**完成 64 / 部分 0 / 未做 0（共 64 项能力）**、
-> `--full` 的 `TESTS` 列表 **59** 个脚本、`Get-ChildItem tests\*.py` 实数 **71** 个脚本 ——
-> 本批（**批次 A1–A5**，里程碑 **M25–M29**）新增 11 项能力：**用户态绘图接口（fb_map/fb_flip/fb_present）**、
-> **用户态 C 运行时（自研最小 libc + clang/lld 交叉编译）**、**musl 静态程序在 ring3 真跑**、**自研 ld.so 动态链接**、
-> **Ring 3 shell（/bin/shell.bin 交付在系统卷）**、**Lua 5.4.7 + 用户态 gzip/gunzip**、**Ring 3 里的 TinyCC**、
-> **Intel HDA 声卡驱动**、**input_poll + 共享内存**、**信号真投递**、**自研 Ring 3 编辑器 /bin/edit**（逐项证据与边界见下文批次小节）。
-> 关键修复：`AT_PHNUM` 号错 / `DT_INIT_ARRAY` 没跑 / SSE 状态没保存（musl 三缺陷）、单字节 `write` ×113 烧光 5 s `wait4`
-> （tcc 链接 5.70 s → 4.53 s）、`input_poll` 侧的**任务 create+bind 抢占竞态**、用户态 #PF/#GP/#DE 以前会 PANIC（现在只杀进程）。
-> 全量验收（在本版构建产物上真跑）：`TESTS` **59 项 = 58 PASS / 1 FAIL / 0 TIMEOUT / 0 MISSING**；
+> 版本 **0.4.1-beta18**（标签 `v0.4.1-beta18`）· 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
+> 状态（权威判据：`python tests/status_report.py`，本批实测）：**完成 69 / 部分 0 / 未做 0（共 69 项能力）**、
+> `--full` 的 `TESTS` 列表 **64** 个脚本、`Get-ChildItem tests\*.py` 实数 **76** 个脚本 ——
+> 本批（**B4/B5 + A4-2a 收尾 + A5 收尾 + 驱动线 3**，里程碑 **M30–M34**）新增 5 项能力：**xHCI（USB 3.x）驱动**、
+> **raw 图标/logo 外置进系统卷（356,992 B）+ 四级兜底链**、**GNU Make 4.4.1 + tar + `sh -c`（ring3 里真编真打包）**、
+> **Wayland 基础骨架 + 最小合成器**、**virtio-gpu 2D + 显示后端切换**（逐项证据与边界见下文批次小节）。
+> 关键修复：**`unlink` 的栈泄漏** —— 删除文件时把**未清零的 128 B 栈缓冲**写进被删 inode 槽：既把内核栈字节泄漏到磁盘，
+> 又在卷里留下垃圾名（宿主造卷器解析该槽曾 `UnicodeDecodeError`）；现在删除/回收一律**先清零再落盘**，宿主侧解析实测
+> "被释放槽整槽全零、非零空槽 0、越界/非 ASCII 名 0"（同一夹具盘上 `rm` 前后的 inode 表逐槽比对）。
+> 另一处：**1024×768 下面板锚点越界**（`[PANEL64] selftest FAIL mask=1024`）—— 菜单右侧只剩 300 px < 通知面板 320 px 时，
+> 旧逻辑把面板翻到左侧再 `clamp`，结果压在开始菜单下 12 px；现在按屏宽**钳制面板宽度**（1280×800 逐字节保持原样）。
+> 核心集基线（在本版构建产物上真跑 **17 个脚本**，QEMU + VMware 两条路径）：**PASS 16 / FAIL 1（存量）/ TIMEOUT 0 / MISSING 0**；
 > **VMware**：BIOS 安装 E2E `vmware_install_test` **PASS**、EFI 安装 E2E `uefi64_install_test` **PASS**、
 > `ipc64_test --vmware` **65/65 PASS**；`vmrun list` = 0（没有 VM 挂着）。
-> 唯一 FAIL：`tmgr_proc_test` **38/39** —— UI"结束任务"点的 pid 已经不存在，内核**如实**返回 `-ESRCH(3)`
-> （`[UI] tmgr kill proc pid=26 … rc=-3`），断言要的是 `rc=0`；**判为 UI/测试侧缺陷，不是内核缺陷**（本批未修，越界改动）。
-> 体积：安装程序内核 **1,881,280 B**、系统内核 **3,689,744 B**（上限 4,096,000 B，**余量 406,256 B**）、
-> `loader64.bin` **4,010 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**（`Get-Item` 实读）。
-> ★ **如实**：本版镜像内嵌版本串仍是 `VimtuOS 0.3.4-beta16`（本批未改 `build64.sh` 的 `VIMTUOS_VERSION`），
-> 即"标签 `v0.4.0-beta17` ≠ 内嵌串 `0.3.4-beta16`"，这一项**未勾**（发布流程 §5）。
+> 唯一存量 FAIL：`panels64_test` **77/78** —— "日历今天强调色圆形高亮"像素断言（宿主侧用 Python 日历推格子坐标，
+> 2026-10-01 推出的格子中心采样到白底）；**`[PANEL64] selftest` 本身在 1024×768 与 1280×800 都是 `PASS mask=0`**，
+> 且 09-26 的旧基线（`baseline1.txt`）里这个脚本**同样 FAIL** —— 存量、与分辨率无关；面板锚点/日历格子几何不在本批改动范围。
+> 体积：安装程序内核 **1,545,584 B**、系统内核 **3,420,528 B**（三层预算：内核 ≤ 4,096,000 B ∧ 余量 ≥ 640 KiB = 655,360 B
+> ∧ ≤ 本批基线 3,418,352 B + 22,288 B；实测**余量 675,472 B**（扣掉预留 R 后还剩 **20,112 B**）、相对基线 **+2,176 B** ——
+> 即：**再涨 22,289 B 触发**，涨 22,288 B 刚好压线过）、`loader64.bin` **4,010 B**、`vimtu64-64.iso` **58,945,536 B**、
+> `vimtu64-64.img` **8,328,192 B**（`Get-Item` 实读）。
+> ★ **如实**：本版镜像内嵌串仍是 `VimtuOS 0.4.0-beta17`（本批**没有**改 `build64.sh` 的 `VIMTUOS_VERSION` —— 它不在本批允许改的路径里），
+> 即"标签 `v0.4.1-beta18` ≠ 内嵌串 `0.4.0-beta17`"，这一项**未勾**（发布流程 §5；修法与 beta15 同：改 `VIMTUOS_VERSION` 后重建）。
 
 ---
 
@@ -113,7 +118,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
 6. **自研 UEFI 引导（不用 gnu-efi）**：自造 PE32+ 桩（2.5KB）+ 平铺长模式引导器（36KB，链接到 72MB，绕过 EDK2 的 PE 校验）；**RSDP 经固定槽 0x7800 从固件配置表传给内核**。
 7. **一切自写工具链**：没有 mkfs.fat、没有 mtools —— FAT32 卷、ISO9660 解析与打包、GPT、LBA 回填、PE 摊平、字体子集化（**4 套 TTF**：西文/中文/终端等宽/缺字兜底）、图标生成、VAP64 打包，全是本仓库的 Python 脚本。
 8. **APIC / ACPI / SMP 都带"宁可不启用也不变砖"的回退**：拿不到 ACPI 就留 8259、启动 AP 全程有界超时、每个自检失败都整体回滚，降级路径都有串口证据。
-9. **每次改动都跑自动验收**：**56 个验收脚本**（`Get-ChildItem tests\*.py` 实数；`status_report.py --full` 的 `TESTS` 列表 45 个，本批新登记 `desktopops64_test` 65-66 条断言），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
+9. **每次改动都跑自动验收**：**76 个验收脚本**（`Get-ChildItem tests\*.py` 实数；`status_report.py --full` 的 `TESTS` 列表 **64** 个；本批新登记 `xhci64_test`(74 条断言)、`make64_test`(43)、`tar64_test`(32)、`wl64_test`(91)、`virtiogpu64_test`(36)），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
 
 ## 四、系统架构
 
@@ -127,7 +132,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
    （磁盘启动 = BIOS INT 13h 扩展读 AH=0x42；光盘 = ATAPI；U 盘 hybrid = 桩先搬好）
                              → 建页表（恒等 + 高半区直映）→ 进长模式 → 跳内核入口
 
-② 内核层（kernel/，114 文件 / 49,609 行）
+② 内核层（kernel/，135 文件 / 68,984 行）
    入口与基础设施
      kernel64.cpp      入口 / 自检 / 安装程序或系统两条启动路径 / 各子系统初始化顺序
      x86_64.cpp        GDT(8 项含用户段+TSS) / IDT / TSS / PIC / PIT(250Hz) / RTC
@@ -259,7 +264,7 @@ VMware 里也一样（**新建虚拟机时 `guestOS` 必须选 64 位：`other-6
 
 ```bash
 python tests/status_report.py          # 先看状态：哪些完成/部分/未做（带证据，秒级）
-python tests/status_report.py --full   # 再真跑 46 个验收脚本（约 6-8 分钟；本批新登记 icons64_test）
+python tests/status_report.py --full   # 再真跑 64 个验收脚本（约 6-8 分钟；本批新登记 5 个脚本）
 
 # 另有专项脚本（--full 列表之外，建议一起跑）；本批新增的 1 个已进 --full 列表，也可单跑：
 python tests/user64_test.py            # ring3 / GDT / 用户页权限
@@ -364,8 +369,14 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | M27 | **A3 musl 静态 + 自研动态链接**：musl 静态程序真进程独立 CR3 跑起来（修 `AT_PHNUM` / `DT_INIT_ARRAY` / SSE 三个真缺陷，`musl64_test` 85/85）；`user/ldso` 自研 `ld.so`（PT_INTERP + RELATIVE/GLOB_DAT/JUMP_SLOT + DT_NEEDED/DT_INIT*，`dynlink64_test` 90/90） | ✅ |
 | M28 | **A4 Ring 3 工具链**：shell `/bin/shell.bin` 交付在系统卷（内核只装载、+2,976 B，`sh64_test` 59/59）+ Lua 5.4.7（`lua64_test` 57/57）+ 用户态 gzip（互操作三证，`gzip64_test` 37/37）+ **Ring 3 里的 TinyCC**（窗口 1 MiB→16 MiB，`-c` 出 ET_REL / 链接出 ET_EXEC / run 逐字节，`tcc64_test` 66/66） | ✅ |
 | M29 | **A5 声音 + IPC + 信号 + 编辑器**：Intel HDA 驱动（DAC+Pin/48k16/BDL 环/音量静音，`hda64_test` 31/31，只能 QEMU）+ `input_poll(12)`/`shm_create(13)`/`shm_map(14)`（32 条事件队列丢最旧计数，`ipc64_test` QEMU 67 / VMware 65）+ 信号真投递（用户栈帧 + `rt_sigreturn`，用户态异常只杀进程，`sig64_test` 44/44）+ 自研 `/bin/edit`（`edit64_test` 33/33） | ✅ |
+| M30 | **xHCI（USB 3.x）驱动（批次 B4）**：PCI `0C0330` → 能力寄存器（`HCCPARAMS1`/`xECP`）→ 命令环 + **事件环 ERST** → `Enable Slot` / `Address Device` / `Configure Endpoint` → HID 键盘端到端打字（`[UI] menu open`）+ U 盘 `READ(10)`（与宿主 CRC 逐位相等）× 盘符；三个实测坑写进源码：**Setup TRB 8 字节必须内联 + IDT=1**、门铃 **DB Target 位序自探**、**xECP NEXT 是 dword 偏移**；`xhci64_test` **74/74** | ✅ |
+| M31 | **raw 图标/logo 外置进系统卷（批次 A4-2a 收尾）**：5 份位图（`/etc/logo.bin`、`/etc/icon_mypc.bin`、`/etc/icon_recycle.bin`、`/etc/icon_term.bin`、`/etc/icon_start.bin`）**合计 356,992 B** 全部搬进系统卷（内核 `3,726,496 → 3,379,104 B`），内核只留开始按钮的 24×24 mip（**2,304 B**）兜底；`/etc/logo.bin` 282 块走 **VimtuFS2 v4 二级间接块**；**四级兜底链全带打点**（卷文件 → 图标包 → TTF → 内置 mip） | ✅ |
+| M32 | **GNU Make 4.4.1 + tar + `sh -c`（批次 B5）**：`/bin/make`（装载驱动）+ `/lib/make.bin`（静态 musl，ring3 跑）→ `make all` 调 `/bin/tcc` 编出 **2,796 B 静态 ELF** 并跑通 `6*7=42`；`/bin/tar` 与**宿主 Python `tarfile` 双向互操作**（含 USTAR 子目录包 + `-tf`）；ring3 shell 加 `-c` 语义子集；`make64_test` **43/43**、`tar64_test` **32/32** | ✅ |
+| M33 | **Wayland 基础骨架（批次 A5 收尾）**：`wl_surface_create/attach/commit/damage/destroy` + `wl_seat` + `wl_display_dispatch` + **最小合成器**（**只有 commit 过的 surface 才上屏**、多 surface z 序、damage 局部提交、进程退出兜底回收）；`wl64_test` **91/91** | ✅ |
+| M34 | **virtio-gpu 2D + 显示后端切换（驱动线 3）**：PCI `0x1AF4:0x1050` + capability + `VIRTIO_F_VERSION_1` + 2D 命令集，**响应类型 0x1101**（0x1100 是 `OK_NODATA`）；传输语义坑：backing 是**紧凑块**，区域传输**必须整行宽**；启动期 `[FB64] backend=virtio-gpu-2d` / 无设备如实 `soft-lfb`；`virtiogpu64_test` **36/36** | ✅ |
+| — | **本批两处修复**：**① `unlink` 栈泄漏**（删除/回收 inode 槽前先清零：此前把未初始化的 128 B 栈缓冲写进槽 → 内核栈字节落盘 + 卷里垃圾名 → 宿主造卷器 `UnicodeDecodeError`；宿主侧解析实测"被释放槽整槽全零、非零空槽 0、非 ASCII/越界名 0"）；**② 1024×768 面板锚点**（`mask=1024`：右侧 300 px < 通知面板 320 px 时旧逻辑翻左侧并 clamp → 压在开始菜单下 12 px；改为按屏宽钳制宽度，且自检新增**虚拟分辨率 1024×768 + 1280×800 双向断言**：`[PANEL64] selftest PASS mask=0 w=1024 h=768 virt=1024x768,1280x800 ok`） | ✅ |
 
-### 批次 P6（上一批）：真机缺陷修复（含蓝屏根因）+ 外置图标包（真图标）
+### 批次 P6（上上批）：真机缺陷修复（含蓝屏根因）+ 外置图标包（真图标）
 
 **① 蓝屏根因**（用户真机/VM 实测：点"扫雷"或开始菜单"关机·重启"就蓝屏）
 
@@ -399,17 +410,84 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
   `[DOCK64] start icon src=vfs:/logo/kaisi.png size=46 ok=1`。内核区因此**全部交还内核**：
   LBA 9..8008 = 8,000 扇区 = **4,096,000 B 全部可用**（改动前图标包占 LBA 7497..8008，只能用 7,488 扇区）。
 
-**本批实读**（2026-10-01，`v0.4.0-beta17`）：能力项 **完成 64 / 部分 0 / 未做 0（共 64 项）**；
-`--full` 的 `TESTS` 列表 **59** 个脚本；`Get-ChildItem tests\*.py` 实数 **71 个脚本**；
-安装程序内核 `build64/kernel64.bin` **1,881,280 B**、系统内核 `build64/kernel64_os.bin` **3,689,744 B**
-（内核区硬上限 **4,096,000 B**，**余量 406,256 B** —— `Get-Item` 实读）、`loader64.bin` **4,010 B**、
-`build64/system.img` **4,133,376 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**。
-★ **版本串如实说明**：本版内核内嵌串仍是 `VimtuOS 0.3.4-beta16` —— 本批**没有改** `build64.sh` 的
-`VIMTUOS_VERSION`（本批只允许改文档与 `tests/status_report.py`），发布标签是 `v0.4.0-beta17`，
+**本版实读**（2026-10-01，`v0.4.1-beta18`）：能力项 **完成 69 / 部分 0 / 未做 0（共 69 项）**；
+`--full` 的 `TESTS` 列表 **64** 个脚本；`Get-ChildItem tests\*.py` 实数 **76 个脚本**；
+安装程序内核 `build64/kernel64.bin` **1,545,584 B**、系统内核 `build64/kernel64_os.bin` **3,420,528 B**
+（三层预算：内核区硬上限 **4,096,000 B** ∧ 余量 ≥ **640 KiB = 655,360 B** ∧ ≤ 本批基线 3,418,352 B + **22,288 B**；
+实测**余量 675,472 B**（扣预留 R 后还剩 20,112 B）、相对基线 **+2,176 B** —— **再涨 22,289 B 触发** —— `Get-Item` 实读）、
+`loader64.bin` **4,010 B**、`build64/system.img` **4,133,376 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**。
+★ **版本串如实说明**：本版内核内嵌串仍是 `VimtuOS 0.4.0-beta17`（`build64.sh` 的 `VIMTUOS_VERSION` **本批没改** —— 不在本批
+允许改的路径里；构建产物里实测该串**命中 4 次**，`0.4.1-beta18` **0 命中**），发布标签是 `v0.4.1-beta18`，
 **"镜像内嵌串 vs 标签"不一致这一项如实记录**（发布流程 §5 该勾未勾；修法与 beta15 同：改 `VIMTUOS_VERSION` 后重建）。
 
+### 批次 beta18（本批）：xHCI(USB 3.x) + 资源外置 + Make/tar + Wayland 骨架 + virtio-gpu 2D + 两处修复 —— `v0.4.1-beta18`
 
-### 批次 A1–A5（本批）：用户态化（绘图接口 / C 运行时 / musl / 动态链接 / shell / Lua / TinyCC）+ HDA 声卡 + 信号投递与编辑器 —— `v0.4.0-beta17`
+**① xHCI（USB 3.x）驱动（批次 B4）**：`kernel/xhci64.{h,cpp}` —— PCI class `0x0C0330` → BAR0 + 能力寄存器
+（`HCCPARAMS1`/`xECP`）→ 控制器复位 `HCRST` → **命令环 + 事件环（ERST）** + DCBAA/scratchpad → `Enable Slot` /
+`Address Device` / `Configure Endpoint` → HID 键盘与 USB 存储。**三个实测坑写进源码注释**：
+① **Setup TRB 的那 8 字节必须内联**（`IDT=1`），否则 xHC 把 TRB 指针当数据取、控制器侧直接卡死；
+② 门铃值里的 **DB Target（DCI）位序**资料互相矛盾 → 驱动**自探**（判据 = 第一条控制传输能否完成，`[XHCI] doorbell mode=<n>`）；
+③ **xECP NEXT 是 dword 偏移**（不是字节）；另：SuperSpeed 的 `bMaxPacketSize0` 是**指数编码**（9 → 512 字节）。
+实测串口原文：`[XHCI] pci 0:4.0 bar0=… caplen=… max_slots=… max_ports=…`、`[XHCI] transfer evt ok idx=… seen=…`、
+`[XHCI] device addr=1 speed=super mps=512`、HID 打字 → `[UI] menu open`、U 盘
+`[XHCI] msc READ(10) ok lba=0 count=1 bytes=512 crc=13EC26F0 head=…`（**与宿主侧独立算的 CRC 逐位相等**）、
+盘符 `[DRV64] letter=… disk=24 … fs=FAT32`；`tests/xhci64_test.py` **74/74**（QEMU 必须 `-device qemu-xhci`）。
+**边界**：无热插拔 / 无集线器 / USB3 实速不做吞吐测试 / 同一时刻只测一个设备；**USB 存储只读**。
+
+**② raw 图标/logo 外置进系统卷（批次 A4-2a 收尾）**：5 份位图 `/etc/logo.bin`(144,000) + `/etc/icon_mypc.bin`(65,536)
++ `/etc/icon_recycle.bin`(65,536) + `/etc/icon_term.bin`(65,536) + `/etc/icon_start.bin`(16,384) = **356,992 B** 全部搬出内核
+（**系统内核 3,726,496 → 3,379,104 B**），内核只留开始按钮的 **24×24 mip = 2,304 B**（裸卷兜底；`build64.sh` 里还有一条
+反断言：整份 `icon_start.bin` 一旦回到内核直接 ERROR）。`/etc/logo.bin` = 282 块 > 132 块 → 走 **VimtuFS2 v4 二级间接块**。
+**四级兜底链（每级都有打点）**：卷里的个体文件 `[IMG64] asset path=/etc/logo.bin src=vfs ok=1` →
+外置图标包 `[ICON64] load … src=vfs path=/etc/iconpack.bin` → 字体 TTF 回落 → 内核内置 mip `src=builtin:icon_start.bin`。
+**边界**：兜底链顺序固定（运行期不可配）；TTF 单字回落只覆盖 `∩/浏/渲` 三个实测缺字形的字。
+
+**③ GNU Make 4.4.1 + tar + `sh -c`（批次 B5）**：`/bin/make`（<64 KiB 装载驱动，mmap 后搬 `/lib/make.bin` 的段再 jmp）
++ `/lib/make.bin`（静态 musl，ring3 跑）+ `/bin/tar` + ring3 shell 新增 `-c`。实测：`make all` 调 `/bin/tcc`
+编出 **2,796 B 静态 ELF** 并跑通、输出逐字节等于 `vimtuos-make-demo: 6*7=42`；`run /bin/make -v` → `GNU Make 4.4.1`；
+**tar 与宿主 Python `tarfile` 双向互操作**（我们的包宿主逐成员逐字节读出；宿主 USTAR 包（含 `tree/sub/`）ring3 解开；
+`-tf` 列表一致）。**边界（如实）**：`sh -c` **支持** 引号 / `$X`/`${X}` 展开 / `#` 注释 / 内置命令间管道 / 裸命令名 `/bin` 兜底；
+**不支持** 命令替换 `$(…)`/`` `…` ``、算术/条件/循环/函数、通配符、后台 `&`、转义 `\`、**跨进程管道**；
+tar 只做 USTAR（无 GNU 长名扩展、无压缩、无增量）。`tests/make64_test.py` **43/43**、`tests/tar64_test.py` **32/32**。
+
+**④ Wayland 基础骨架（批次 A5 收尾）**：`kernel/wl64.{h,cpp}` —— `wl_surface_create/attach/commit/damage/destroy`
++ `wl_seat` + `wl_display_dispatch` + **最小合成器**：**只有 commit 过的 surface 才上屏**（画了不 commit → 屏幕逐像素不变）、
+多 surface **z 序**、**damage 局部提交**（截图差异区域 == 内核打出的 damage 矩形）、进程退出兜底回收。
+打点齐全：`[WL64] surface create|attach|commit|blit|composite|seat event|surface destroy|release|selftest`；`tests/wl64_test.py` **91/91**。
+**边界（如实）**：**没有 Unix socket / 没有 wire 协议编解码 / 没有 memfd / 没有 wl_buffer 生命周期与 release 事件 /
+没有帧回调 / 没有 DRM-KMS / 内核无 epoll / 不链 libwayland-client** —— 这是"骨架 + 最小合成器"，不是 Wayland 协议实现
+（逐条差距清单在 `docs/应用层与系统调用说明.md`）。
+
+**⑤ virtio-gpu（2D）+ 显示后端切换（驱动线 3）**：PCI **`0x1AF4:0x1050`**（现代非过渡）+ capability +
+`VIRTIO_F_VERSION_1` + 2D 命令集；**响应类型 `0x1101`**（`display_info` 成功是 0x1101，**0x1100 是 `OK_NODATA`**）。
+传输语义坑：backing 是**紧凑块**（stride = 响应给的 w，不带屏幕行距）→ 区域传输**必须整行宽**（rect.x 恒 0），
+否则像素逐步漂移。后端切换：`[FB64] backend=virtio-gpu-2d` / 无设备如实 `[VGPU] legacy interface only -> backend=soft-lfb`
+（LFB 软件路径保留为回退）。基准（本批原始实测，空载）：整屏 1280×800 **982 µs → 116 µs（8.5×）**、
+512×512 **247 µs → 18 µs（13.7×）**；**beta18 复测（同机并发跑核心集、宿主负载更高）**：整屏 **600 µs → 119 µs**、
+512² **259 µs → 81 µs**、128×128 **20 µs → 72 µs（反而更慢）** —— 绝对耗时随宿主负载变化，**交叉点实测比文档口径的
+“≥64×64”更靠上**，阈值按实测保守取。`tests/virtiogpu64_test.py` **36/36**（`-vga virtio` 与 `-vga std` 两套都跑）。
+**边界（如实）**：没有 3D/virgl、单一格式（XRGB8888）、`TRANSFER_FROM_HOST_2D` 对非 blob 的 2D 资源**不回写**
+（报告里如实标 `GAP`）、没有 cursor 平面 / 多输出、`reconfigure` 未实测。
+
+**⑥ 本批两处修复（都有回归断言）**：
+* **`unlink` 栈泄漏**（`kernel/vfs64.cpp` 的 `vfs64_unlink64`）：删除文件时把一个**未清零的 128 B 栈缓冲**交给
+  `inode_store()` 落盘 —— ① 内核栈字节泄漏到磁盘；② 卷里留下垃圾名（实测 `rec[0]=0xC8`、`namelen=0x34`），
+  宿主造卷器解析该槽会 `UnicodeDecodeError`。修法：删除/回收 inode 槽**先 `zero_bytes` 再落盘**
+  （`unlink64` 与 `rmdir64` 两条路径，`zero_bytes(empty, VFS64_INODE_BYTES_MAX)` 命中 2），零槽 =
+  干净"已释放"记录（`type=FREE(0)` + `namelen=0` + 保留区全 0，`inode_ok()` 认它）。
+  **宿主侧证据**：同一夹具盘上 `rm` 前后逐槽比对 —— 被删槽 `type=1 namelen=19 name='zc_unlink_probe.txt' size=5`
+  → **整槽 64 B 全零**；全卷 229 个空槽**全部全零**（非零空槽 0），**非 ASCII/越界名 0**；
+  `tests/status_report.py` 把这条做成可跑断言（源码层 + 字节层）。防御没删：`tools/tcc_pack_win.py` 的
+  残留槽过滤（`namelen` 越界 / 非 ASCII / UnicodeDecodeError 兜底）与**幽灵 inode** 判定仍在。
+* **1024×768 面板锚点**（`kernel/panels64.cpp`）：`[PANEL64] selftest FAIL mask=1024` 的算式 —— 1024 宽下
+  `sm_x=(1024-400)/2=312`、菜单右边缘 712、右侧可用 `1024-4-(712+8)=300 < NOTIF_W(320)`；旧逻辑把面板翻到左侧
+  （`312-8-320=-16`）再 `clamp` 到 4 → 面板 `4..324` 与菜单 `312..712` **重叠 12 px**，且"通知面板必须在菜单右边"
+  的断言必然不成立。修法：**按屏宽钳制**（优先侧放得下 = 旧行为逐字节不变；放不下就把宽度缩到该侧可用宽度，
+  同宽优先侧；下界 `PANEL64_MIN_W=208`），并在自检里加**虚拟分辨率断言**（1024×768 与 1280×800 的锚点/限界都验）。
+  **证据**：`[PANEL64] selftest PASS mask=0 w=1024 h=768 virt=1024x768,1280x800 ok`（`-vga virtio`）与
+  `… w=1280 h=800 …`（`-vga std`）。
+
+### 批次 A1–A5（上一批）：用户态化（绘图接口 / C 运行时 / musl / 动态链接 / shell / Lua / TinyCC）+ HDA 声卡 + 信号投递与编辑器 —— `v0.4.0-beta17`
 
 **这批把"用户态"从"能跑"推到"能干活"**：屏幕能由用户态自己画、程序能用 C 运行时写、musl 静态程序能跑、
 动态链接能跑、shell / Lua / TinyCC 都在 ring3 里跑、声卡能出声、进程能收信号、编辑器能编辑并保存。

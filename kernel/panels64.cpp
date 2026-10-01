@@ -148,19 +148,36 @@ static void clamp_panel64(int* x, int* y, int w, int h) {
     const int max_x = scr_w64() - 4 - w;                 // 不超出屏幕
     if (*x > max_x) *x = max_x;
 }
-// 右侧锚点：开始菜单右边 + gap；放不下就翻到左侧
-static void anchor_right64(int w, int* x) {
-    int sx = 0, sy = 0, sw = 0, sh = 0;
-    sm_rect64(&sx, &sy, &sw, &sh);
-    *x = sx + sw + THEME64_POP_GAP;
-    if (*x + w > scr_w64() - 4) *x = sx - THEME64_POP_GAP - w;
+// ★ 修复（1024×768：`[PANEL64] selftest FAIL mask=1024`）：水平锚点 = **随屏幕宽度正确钳制**的纯函数。
+//   旧逻辑（anchor_right64/anchor_left64）：优先侧放不下就整体翻到另一侧，翻过去再靠 clamp(x≥4) 兜底 ——
+//   在 1024×768 上会直接钻进开始菜单底下。具体计算（开始菜单：sm_w=THEME64_SM_W=400、水平居中）：
+//     1280×800：sm_x=(1280-400)/2=440、菜单右边=840、右侧可用=1280-4-(840+8)=428 ≥ NOTIF_W(320)
+//               → px=848，面板 848..1168 —— 这是旧行为，必须保持。
+//     1024×768：sm_x=(1024-400)/2=312、菜单右边=712、右侧可用=1024-4-(712+8)=**300 < NOTIF_W(320)**
+//               → 旧代码 px=312-8-320=-16 → clamp 到 4 → 面板 4..324 与菜单 312..712 **重叠 12 px**，
+//                 且 selftest 的"通知面板必须在菜单右边"(x ≥ sx+sw=712) 断言必然不成立 → mask |= 1024（实测就是它）。
+//   新逻辑：① 优先侧放得下 → 与旧行为**逐字节一致**（1280×800 全部走这一支）；
+//           ② 放不下 → 选更宽的一侧（同宽优先侧）并把**宽度缩到该侧可用宽度**（下界 PANEL64_MIN_W），
+//              保证"完全在屏内 + 不覆盖开始菜单"（1024×768 → NOTIF/SOUND 720..1020、NET 4..304）。
+#define PANEL64_MIN_W 208                       // 面板最小宽度（极端窄屏仍由 clamp_panel64 兜底）
+static void place_h64(int prefer_right, int w, int W, int sx, int sw, int* out_x, int* out_w) {
+    const int avail_r = W - 4 - (sx + sw + THEME64_POP_GAP);     // 菜单右侧可用宽度
+    const int avail_l = sx - THEME64_POP_GAP - 4;                // 菜单左侧可用宽度
+    if (prefer_right && w <= avail_r) { *out_x = sx + sw + THEME64_POP_GAP; *out_w = w; return; }
+    if (!prefer_right && w <= avail_l) { *out_x = sx - THEME64_POP_GAP - w; *out_w = w; return; }
+    const bool use_r = prefer_right ? (avail_r >= avail_l) : (avail_l > avail_r);
+    int ww = use_r ? avail_r : avail_l;
+    if (ww < PANEL64_MIN_W) ww = PANEL64_MIN_W;
+    *out_x = use_r ? (W - 4 - ww) : 4;
+    *out_w = ww;
 }
-// 左侧锚点：开始菜单左边 - gap；放不下就翻到右侧
-static void anchor_left64(int w, int* x) {
-    int sx = 0, sy = 0, sw = 0, sh = 0;
-    sm_rect64(&sx, &sy, &sw, &sh);
-    *x = sx - THEME64_POP_GAP - w;
-    if (*x < 4) *x = sx + sw + THEME64_POP_GAP;
+// 开始菜单几何的**镜像公式**（只给虚拟分辨率自检用）：在**实测分辨率**上会与 startmenu64_geom64()
+// 逐字段核对一次 —— 一旦开始菜单改成别的居中/贴 Dock 规则，自检会响亮失败而不是悄悄算错。
+static void sm_mirror64(int W, int H, int* x, int* y, int* w, int* h) {
+    if (x) *x = (W - THEME64_SM_W) / 2;
+    if (y) *y = (H - THEME64_DOCK_MARGIN - THEME64_DOCK_H) - THEME64_SM_GAP_DOCK - THEME64_SM_H;
+    if (w) *w = THEME64_SM_W;
+    if (h) *h = THEME64_SM_H;
 }
 
 int panels64_rect64(int which, int* x, int* y, int* w, int* h) {
@@ -169,17 +186,17 @@ int panels64_rect64(int which, int* x, int* y, int* w, int* h) {
     int px = 0, py = 0, pw = 0, ph = 0;
     if (which == PANEL64_NOTIF) {
         pw = THEME64_NOTIF_W; ph = THEME64_NOTIF_H;
-        anchor_right64(pw, &px);
+        place_h64(1, pw, scr_w64(), sx, sw, &px, &pw);     // ★ 修复：随屏宽钳制（放不下就缩宽，不翻到菜单底下）
         py = sy + THEME64_POP_GAP;                        // 竖向对齐开始菜单顶部
     } else if (which == PANEL64_SOUND) {
         pw = THEME64_SOUND_W; ph = THEME64_SOUND_H;
-        anchor_right64(pw, &px);
+        place_h64(1, pw, scr_w64(), sx, sw, &px, &pw);     // ★ 修复：同上
         int ix = 0, iy = 0, iw = 0, ih = 0;               // 锚在"声音"状态图标那一行
         startmenu64_status_rect64(1, &ix, &iy, &iw, &ih);
         py = iy + ih / 2 - ph / 2;
     } else if (which == PANEL64_NET) {
         pw = THEME64_NET_W; ph = THEME64_NET_H;
-        anchor_left64(pw, &px);
+        place_h64(0, pw, scr_w64(), sx, sw, &px, &pw);     // ★ 修复：同上（网络面板在菜单左边）
         int ix = 0, iy = 0, iw = 0, ih = 0;               // 锚在"网络"状态图标那一行
         startmenu64_status_rect64(0, &ix, &iy, &iw, &ih);
         py = iy - 10;
@@ -1996,7 +2013,11 @@ void panels64_init64() {
     if (st != 0) pl("selftest FAIL mask=", nullptr, (int64_t)st, " (anchors/limits)");
     else {
         dbg64_line_begin64();
-        dbg64_str("[PANEL64] selftest PASS mask=0");
+        dbg64_str("[PANEL64] selftest PASS mask=0 w=");
+        dbg64_dec((uint64_t)scr_w64());
+        dbg64_str(" h=");
+        dbg64_dec((uint64_t)scr_h64());
+        dbg64_str(" virt=1024x768,1280x800 ok");        // ★ 修复：两种分辨率的锚点/限界都验过（见 selftest 16384/32768 位）
         dbg64_nl();
         dbg64_line_end64();
     }
@@ -2041,6 +2062,31 @@ int panels64_selftest64() {
         if (x < sx + sw) fails |= 1024;
         panels64_rect64(PANEL64_NET, &x, &y, &w, &h);
         if (x + w > sx) fails |= 2048;
+    }
+
+    // ---- ★ 修复项自检（1024×768 mask=1024）：水平锚点在**两种分辨率**下都要"在屏内 + 不覆盖开始菜单" ----
+    {
+        int mx = 0, my = 0, mw = 0, mh = 0;        // ① 先在**实测分辨率**上核对镜像公式 == 真实开始菜单几何
+        sm_mirror64(W, scr_h64(), &mx, &my, &mw, &mh);
+        if (mx != sx || mw != sw || my != sy || mh != sh) fails |= 16384;
+        const int vw[2] = { 1024, 1280 };          // ② 虚拟分辨率 1024×768 与 1280×800
+        const int vh[2] = { 768, 800 };
+        const int rw3[3] = { THEME64_NOTIF_W, THEME64_SOUND_W, THEME64_NET_W };
+        const int pr3[3] = { 1, 1, 0 };            // 通知/声音优先菜单右侧、网络优先左侧
+        for (int k = 0; k < 2; k++) {
+            int vsx = 0, vsy = 0, vsw = 0, vsh = 0;
+            sm_mirror64(vw[k], vh[k], &vsx, &vsy, &vsw, &vsh);
+            const int vdt = vh[k] - THEME64_DOCK_MARGIN - THEME64_DOCK_H;      // 该分辨率下的 Dock 顶边
+            if (vsy < 4) fails |= 32768;                                        // 菜单本身在屏内
+            if (vsy + THEME64_POP_GAP + THEME64_NOTIF_H > vdt - 4) fails |= 32768;   // 通知面板不压 Dock
+            for (int i = 0; i < 3; i++) {
+                int x = 0, w = 0;
+                place_h64(pr3[i], rw3[i], vw[k], vsx, vsw, &x, &w);
+                if (w <= 0 || x < 4 || x + w > vw[k] - 4) fails |= 32768;       // 不越界
+                if (pr3[i] && x < vsx + vsw) fails |= 32768;                    // 通知/声音仍在菜单右边
+                if (!pr3[i] && x + w > vsx) fails |= 32768;                     // 网络仍在菜单左边
+            }
+        }
     }
     // 日期/星期换算样本
     if (weekday_ymd64(2026, 9, 23) != 3) fails |= 4096;

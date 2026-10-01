@@ -2550,6 +2550,11 @@ int vfs64_unlink64(const char* path) {
 
     const uint32_t parent = rd32(ino + VFS_I_PARENT);
     uint8_t empty[VFS64_INODE_BYTES_MAX];
+    // ★ 修复：**必须先清零再落盘**。此前这里直接把未初始化的 128 B 栈缓冲写进被删 inode 槽，
+    //   后果有两个：(1) 内核栈字节泄漏到磁盘；(2) 卷里留下垃圾名字（type 虽为 0，但 namelen/name 字段
+    //   是栈上的随机值）—— 宿主造卷器解析该槽时会 `UnicodeDecodeError`（实测 rec[0]=0xC8、namelen=0x34）。
+    //   清零后该槽 = 干净的"已释放"记录（type=FREE(0)、namelen=0、保留字段全 0，见 inode_ok()）。
+    zero_bytes(empty, VFS64_INODE_BYTES_MAX);
     if (!inode_store(idx, empty)) { log_op_fail("unlink64", "inode clear failed"); return -1; }
     touch_dir(parent, 0);
     return 0;

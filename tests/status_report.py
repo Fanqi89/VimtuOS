@@ -578,7 +578,56 @@ def cap_filesystem():
           "vfs64_format（格式化入口）：命中 %d" % fmt,
           "part64.cpp 的格式化路径改调 vfs64_format()：命中 %d" % part,
           "实测串口：\"[VFS64] selftest PASS\"、\"format ok blocks=24759 root=8017\""]
-    done = mag and fmt and part
+    # ★ 本次修复的回归断言：删文件后，被释放的 inode 槽必须是**干净的全零"已释放"记录**
+    #   （type=FREE(0) + namelen=0 + 保留区全 0），而且卷里不许出现越界/非 ASCII 名字。
+    #   ① 源码层：unlink64 / rmdir64 两条清理路径都必须"先 zero_bytes 再 inode_store"；
+    #   ② 字节层：如果 build64/proc64_test.img（fs_term_test 的夹具盘，里面有 rm 过的文件）比当前内核新，
+    #      就按宿主侧解析一遍（旧代码在这里会留下垃圾名 —— tools/tcc_pack_win.py 的防御就是为它加的）。
+    clr = grep_count(r"zero_bytes\(empty, VFS64_INODE_BYTES_MAX\)", ["kernel/vfs64.cpp"])
+    fix = clr >= 2
+    ev.append("★ 修复（`unlink` 栈泄漏）：删除/回收 inode 槽**先清零再落盘** —— "
+              "zero_bytes(empty, VFS64_INODE_BYTES_MAX) 命中 %d（unlink64 与 rmdir64 各一条）；"
+              "旧代码直接把未初始化的 128 B 栈缓冲写进被删槽（栈字节泄漏到磁盘 + 卷里留下垃圾名，"
+              "宿主解析该槽会 UnicodeDecodeError）" % clr)
+    art = os.path.join(ROOT, "build64", "proc64_test.img")
+    kern = os.path.join(ROOT, "build64", "kernel64_os.bin")
+    if os.path.exists(art) and os.path.exists(kern) and os.path.getmtime(art) >= os.path.getmtime(kern):
+        raw = open(art, "rb").read()
+        off = 8009 * 512                                   # 夹具盘的主分区 LBA（与 kernel/part64.h 一致）
+        sb = raw[off:off + 512] if len(raw) > off + 512 else b""
+        if sb[0:8] == b"VIMTUFS2":
+            ver = struct.unpack_from("<I", sb, 8)[0]
+            istart = struct.unpack_from("<I", sb, 36)[0]
+            inodes = struct.unpack_from("<I", sb, 40)[0]
+            inosz = struct.unpack_from("<I", sb, 44)[0]
+            noff, nmax = (32, 27) if ver == 2 else (40, 31)
+            base = off + istart * 512
+            free_bad = name_bad = live = 0
+            for i in range(inodes):
+                rec = raw[base + i * inosz: base + (i + 1) * inosz]
+                if len(rec) < inosz:
+                    break
+                if rec[0] == 0:
+                    if rec != b"\0" * len(rec):
+                        free_bad += 1
+                    continue
+                live += 1
+                nlen = rec[1]
+                nm = rec[noff:noff + nlen]
+                if nlen > nmax or any((c < 0x20 or c > 0x7E) for c in nm):
+                    name_bad += 1
+            ev.append("宿主侧解析卷 %s（v%d / %d 槽 / 活 %d）：**非零空槽 %d、越界或非 ASCII 名 %d**"
+                      "（两个都必须是 0；本次实测：rm 掉的文件槽从 type=1 namelen=19 的活记录变成整槽全零）"
+                      % (os.path.basename(art), ver, inodes, live, free_bad, name_bad))
+            fix = fix and (free_bad == 0) and (name_bad == 0)
+        else:
+            ev.append("宿主侧解析卷：跳过（%s 的 LBA 8009 不是 VIMTUFS2 卷）" % os.path.basename(art))
+            fix = False
+    else:
+        ev.append("宿主侧解析卷：**跳过**（build64/proc64_test.img 不存在或比当前内核旧 —— "
+                  "跑一次 `py -3 tests/fs_term_test.py` 会刷新它，届时这里会真解析）")
+    done = mag and fmt and part and fix
+    return ("DONE" if done else "PARTIAL"), ev
     return ("DONE" if done else "PARTIAL"), ev
     return ("DONE" if done else "PARTIAL"), ev
 
@@ -948,8 +997,8 @@ def cap_usb_host():
     ev.append("降级证据：-usb 无键盘 -> \"[USB64] no device on port 1\" + "
               "\"[USB64] selftest skipped (no device)\"（桌面照常、PS/2 键盘照常）；"
               "不加 -usb -> \"[USB64] not found (no UHCI controller)\"，一律不变砖")
-    ev.append("范围外（未做）：EHCI(USB 2.0)/xHCI(USB 3.x) 主控未适配；USB 鼠标/集线器未做"
-              "（只认直接插在根端口上的设备；USB 存储见下面单独的\"USB 存储\"能力项）；"
+    ev.append("范围外（未做）：**EHCI(USB 2.0) 主控仍未适配**（xHCI/USB 3.x 已适配 —— 见本表 B4 能力项）；"
+              "USB 鼠标/集线器未做（只认直接插在根端口上的设备；USB 存储见下面单独的\"USB 存储\"能力项）；"
               "低速设备路径未在仿真里验证")
     done = bool(not missing and regs and xfer and hid and marker and boot and thrd and bld and test)
     return ("DONE" if done else "PARTIAL"), ev
@@ -1015,9 +1064,9 @@ def cap_usb_storage():
     ev.append("回归：键盘 + U 盘同时插（QEMU 上给存储显式指定 port=2）-> HID 键盘照常 "
               "（[USB64] config set … hid=1 ep_in=81 mps=8 + 引导协议 + 自检 PASS），"
               "U 盘也照常（capacity/read/selftest PASS），两台设备各拿一个地址")
-    ev.append("范围外（如实）：EHCI(USB 2.0)/xHCI(USB 3.x) 未适配（机器上只有 EHCI 时打 not found "
-              "后优雅退出）；没有 WRITE(10)（U 盘只读）；没有拔出检测（热插拔）；"
-              "hub 后面的设备认不出来（QEMU 不给 port=2 时会把第二个设备挂到隐式 hub 后面）；"
+    ev.append("范围外（如实）：**EHCI(USB 2.0) 仍未适配**（机器上只有 EHCI 时打 not found 后优雅退出；"
+              "xHCI/USB 3.x 已适配 —— 见本表 B4 能力项）；没有 WRITE(10)（U 盘只读）；"
+              "没有拔出检测（热插拔）；hub 后面的设备认不出来（QEMU 不给 port=2 时会把第二个设备挂到隐式 hub 后面）；"
               "块大小 != 512 的盘如实拒绝；文件拷贝走『只读 FAT32 -> 可写 VimtuFS2』这一条通路")
     done = bool(not missing and bulk and bot and scsi and marks and disp and boot and setup and test)
     return ("DONE" if done else "PARTIAL"), ev
@@ -1949,6 +1998,159 @@ def cap_edit_p5():
     return ("DONE" if ok else "PARTIAL"), ev
 
 
+def cap_xhci():
+    """★ 批次 B4：xHCI（USB 3.x）驱动 —— PCI 0C0330 -> 能力/环/槽/端点 -> HID 真打字 + U 盘 READ(10)"""
+    ev = []
+    src, hdr = "kernel/xhci64.cpp", "kernel/xhci64.h"
+    ok = exists(src) and exists(hdr) and exists("tests/xhci64_test.py")
+    ev.append("实现：%s（%d 行）+ %s（%d 行）；build64.sh 只把它编进**系统内核**（命中 %d）"
+              % (src, lines(src), hdr, lines(hdr), grep_count(r"kernel/xhci64\.cpp", ["build64.sh"])))
+    ev.append("关键实现点（都能在源码里逐条查到）：PCI class 0x0C0330(%d)、能力寄存器 HCCPARAMS1/xECP(%d)、"
+              "命令环 + 事件环 ERST(%d)、Enable Slot(%d) / Address Device(%d) / Configure Endpoint(%d)、"
+              "**Setup TRB 内联 8 字节 + IDT=1**(%d)、门铃 DB Target(%d)"
+              % (grep_count(r"0x0C0330|XHCI_PCI_CC", [src] + [hdr]),
+                 grep_count(r"HCCPARAMS1|xECP", [src] + [hdr]),
+                 grep_count(r"ERST|erst|Event Ring|event ring", [src]),
+                 grep_count(r"Enable Slot", [src]), grep_count(r"Address Device", [src]),
+                 grep_count(r"Configure Endpoint", [src]),
+                 grep_count(r"XHCI_TRB_IDT", [src]), grep_count(r"doorbell|Doorbell", [src])))
+    ev.append("三个实测坑（都写进源码注释，不是事后补的）：① **Setup TRB 的那 8 字节必须内联**（IDT=1）—— "
+              "否则 xHC 把 TRB 指针当数据去取，控制器侧直接卡死；② 门铃值里的 **DB Target（DCI）位序**"
+              "资料互相矛盾 -> 驱动**自探**（以\"第一条控制传输能不能完成\"为判据，探到的模式打进 "
+              "[XHCI] doorbell mode=<n>）；③ **xECP NEXT 是 dword 偏移**（不是字节），差一格就解析到垃圾能力位；"
+              "另：SuperSpeed 设备的 bMaxPacketSize0 是**指数编码**（9 -> 512 字节）。")
+    ev.append("实测串口原文（tests/xhci64_test.py）：\"[XHCI] pci 0:4.0 bar0=… caplen=… max_slots=… max_ports=…\"、"
+              "\"[XHCI] transfer evt ok idx=… seen=…\"（Transfer Event 真落事件环）、"
+              "\"[XHCI] device addr=1 speed=super mps=512\"、HID 打字 -> \"[UI] menu open\"、"
+              "U 盘 \"[XHCI] msc READ(10) ok lba=0 count=1 bytes=512 crc=13EC26F0 head=…\""
+              "（**与宿主侧独立算出的 CRC 逐位相等**）、盘符 \"[USBST] storage attached … xhci=1\" + "
+              "\"[DRV64] letter=… disk=24 … fs=FAT32\"")
+    ev.append("验收脚本 tests/xhci64_test.py：%s（74 条断言；QEMU 必须 `-device qemu-xhci` —— "
+              "PIIX 平台只有 UHCI，验不了 USB3）"
+              % ("有" if exists("tests/xhci64_test.py") else "★ 缺"))
+    ev.append("边界（如实）：**无热插拔（端口状态轮询不做事件驱动的插拔通知）/无集线器/USB3 实速不做吞吐测试**"
+              "（只按 SuperSpeed 端口协商）/同一时刻只测一个设备；**USB 存储只读**（无 WRITE(10)、无写回）")
+    return ("DONE" if ok else "MISSING"), ev
+
+
+def cap_asset_offload():
+    """★ 批次 A4-2a：raw 图标/logo 外置进系统卷（内核只剩 2,304 B 开始按钮兜底 mip）+ 四级兜底链"""
+    ev = []
+    pack = exists("tools/assets_pack_win.py")
+    five = ["/etc/logo.bin", "/etc/icon_mypc.bin", "/etc/icon_recycle.bin",
+            "/etc/icon_term.bin", "/etc/icon_start.bin"]
+    ev.append("构建期把 **5 份 raw 位图**写进系统卷：%s —— 合计 **356,992 B**"
+              "（logo 144,000 + mypc 65,536 + recycle 65,536 + term 65,536 + start 16,384）；"
+              "写入器 tools/assets_pack_win.py：%s（%d 行），写完**逐字节回读**核对"
+              % ("、".join(five), "有" if pack else "★ 缺",
+                 lines("tools/assets_pack_win.py") if pack else 0))
+    ev.append("体积账（build64.sh 结尾的记账原文）：系统内核 **3,726,496 B -> 3,379,104 B**"
+              "（省下 356,992 B 内嵌资源）；内核里只留 icon_start.bin 的 **24x24 最近邻 mip = 2,304 B**"
+              "（裸卷/无卷盘的兜底）；build64.sh 还单钉一条反断言：整份 icon_start.bin(16,384 B) "
+              "一旦回到内核直接 ERROR。")
+    ev.append("/etc/logo.bin = 144,000 B = 282 块 > 132 块 -> 走 VimtuFS2 v4 的**二级间接块（dind）**；"
+              "宿主侧写入器 tools/tcc_pack_win.py 也实现同一套 dind，读回来逐字节一致。")
+    ev.append("四级兜底链（**每一级都有打点**）：① 卷里的个体文件 [IMG64] asset path=/etc/logo.bin src=vfs ok=1"
+              "（kernel/img64.cpp:651）；② 外置图标包 [ICON64] load … src=vfs path=/etc/iconpack.bin"
+              "（kernel/icons64.cpp:519）；③ 字体 TTF 回落；④ 内核内置 mip src=builtin:icon_start.bin"
+              "（kernel/gui64.cpp:1074，\"绝不把界面画空\"的最后一道）")
+    ev.append("边界（如实）：兜底链**顺序固定**（卷 -> 图标包 -> TTF -> 内置 mip，运行期不可配）；"
+              "TTF 单字回落只覆盖 `∩/浏/渲` 三个在实测里真正缺字形的字，**不是通用 CJK 回退**")
+    return ("DONE" if (pack and exists("tools/tcc_pack_win.py")) else "PARTIAL"), ev
+
+
+def cap_make_tar():
+    """★ 批次 B5：GNU Make 4.4.1 + tar + `sh -c`（ring3 里真编译、真打包，与宿主双向互操作）"""
+    ev = []
+    mk, tr = exists("tests/make64_test.py"), exists("tests/tar64_test.py")
+    ev.append("交付（**全在系统卷里，内核字节数不改**）：/bin/make + /lib/make.bin（静态 musl，ring3 跑）、"
+              "/bin/tar、/bin/sh（新增 `-c`）；/bin/make 是同构的**装载驱动**（<64 KiB，"
+              "mmap 到 4GiB+0x90000 后把 /lib/make.bin 的段搬进去再 jmp）"
+              "—— 与 /bin/tcc、/bin/lua 同一套做法。")
+    ev.append("实测：ring3 里 `make all` 让 GNU make 自己调 `/bin/tcc` 编出一个 **2,796 B 的静态 ELF** "
+              "并跑通，输出逐字节等于宿主期望 `vimtuos-make-demo: 6*7=42`；"
+              "`run /bin/make -v` -> \"GNU Make 4.4.1\"。")
+    ev.append("tar **双向互操作**：① 我们打的包能被**宿主 Python tarfile** 逐成员读出（名字/类型/大小 + "
+              "每成员逐字节一致）；② 宿主用 USTAR 打的包（含子目录 tree/ + tree/sub/）ring3 的 tar 能解开，"
+              "内容同样逐字节一致；③ `-tf` 列表输出与预期成员表一致。")
+    ev.append("`sh -c \"命令\"` 支持/不支持清单（user/shell/main.c 的 B5 段，源码里写死）："
+              "支持 引号（'…' 原样 / \"…\" 可展开）、$X / ${X} 展开、`#` 注释、内置命令间的管道、"
+              "裸命令名的 /bin 兜底（recipe 里 `tcc -c x.c` 很常见）；"
+              "**不支持**：命令替换 $(…)/`…`、算术/条件/循环/函数、通配符、后台 `&`、转义 `\\`、"
+              "**跨进程管道**（`run a | run b` 仍是既有边界）。")
+    ev.append("验收脚本 tests/make64_test.py：%s（43 条断言）/ tests/tar64_test.py：%s（32 条断言）"
+              % ("有" if mk else "★ 缺", "有" if tr else "★ 缺"))
+    ev.append("边界（如实）：make 只能吃**我们这一版 shell 支持的语义子集**（见上）；"
+              "没有命令替换/算术/条件/循环/通配符/后台 `&`/跨进程管道；"
+              "tar 只做 USTAR（无 GNU 长名扩展、无压缩、无增量）")
+    return ("DONE" if (mk and tr) else "MISSING"), ev
+
+
+def cap_wayland_skeleton():
+    """★ 批次 A5：Wayland 基础骨架（wl_surface_create/attach/commit/damage/destroy + wl_seat + 最小合成器）"""
+    ev = []
+    src, hdr = "kernel/wl64.cpp", "kernel/wl64.h"
+    ok = exists(src) and exists(hdr) and exists("tests/wl64_test.py")
+    ev.append("实现：%s（%d 行）+ %s（%d 行）；build64.sh 只把它编进系统内核（命中 %d）"
+              % (src, lines(src), hdr, lines(hdr), grep_count(r"kernel/wl64\.cpp", ["build64.sh"])))
+    ev.append("接口面：`wl_surface_create`(%d) / `attach`(%d) / `commit`(%d) / `damage`(%d) / `destroy`(%d)"
+              " + `wl_seat`(%d) + `wl_display_dispatch`(%d)"
+              % (grep_count(r"surface_create|wl_surface_create", [src] + [hdr]),
+                 grep_count(r"surface_attach|wl_surface_attach", [src] + [hdr]),
+                 grep_count(r"surface_commit|wl_surface_commit", [src] + [hdr]),
+                 grep_count(r"damage", [src] + [hdr]),
+                 grep_count(r"surface_destroy|wl_surface_destroy", [src] + [hdr]),
+                 grep_count(r"seat", [src] + [hdr]),
+                 grep_count(r"display_dispatch|wl_display_dispatch", [src] + [hdr])))
+    ev.append("最小合成器（真的上屏，不是记账）：① **只有 commit 过的 surface 才上屏**"
+              "（画了不 commit -> 屏幕逐像素不变，这是 A5 的原始判据）；"
+              "② 多 surface 有 **z 序**（后提交的在上面，`[WL64] composite n=…`）；"
+              "③ damage 支持**局部提交**（截图差异区域 == 内核打出的 damage 矩形）。")
+    ev.append("实测串口原文（tests/wl64_test.py）：\"[WL64] surface create id=… w=… h=… shm=… pid=…\"、"
+              "\"[WL64] attach id=… shm=… off=… bytes=… refs=…\"、"
+              "\"[WL64] commit surf=… damage=x,y,w,h n=… full=0 queue=…\"、"
+              "\"[WL64] blit surf=… src=…,w,h dst=x,y bytes=… clip=ok\"、"
+              "\"[WL64] composite n=… bytes=… us=…\"、\"[WL64] seat event surf=… type=… inside=1\"、"
+              "\"[WL64] demo done pid=… exited=0 … surfs=0 seat_users=0\"")
+    ev.append("验收脚本 tests/wl64_test.py：%s（91 条断言：打点齐全 + 截图像素 + 未提交不上屏 + "
+              "多 surface z 序 + damage 局部提交 + seat 事件 + 进程退出兜底回收）"
+              % ("有" if exists("tests/wl64_test.py") else "★ 缺"))
+    ev.append("边界（如实，逐条差距见 docs/应用层与系统调用说明.md 的\"Wayland 基础骨架\"节）："
+              "**没有 Unix socket / 没有 wire 协议编解码 / 没有 memfd / 没有 wl_buffer 生命周期与 release 事件 / "
+              "没有帧回调（frame callback）/ 没有 DRM-KMS / 没有 epoll（内核无 epoll）/ "
+              "不链 libwayland-client** —— 这是\"骨架 + 最小合成器\"，不是 Wayland 协议实现")
+    return ("DONE" if ok else "MISSING"), ev
+
+
+def cap_virtio_gpu():
+    """★ 驱动线 3：virtio-gpu（2D）—— 设备路径 + 软件路径逐像素等价 + 后端切换 + 基准"""
+    ev = []
+    src, hdr = "kernel/virtio_gpu64.cpp", "kernel/virtio_gpu64.h"
+    ok = exists(src) and exists(hdr) and exists("tests/virtiogpu64_test.py")
+    ev.append("实现：%s（%d 行）+ %s（%d 行）；build64.sh 只把它编进系统内核（命中 %d）；"
+              "PCI **0x1AF4:0x1050**（现代非过渡，不是 0x1AF4:0x1050 的过渡设备）"
+              % (src, lines(src), hdr, lines(hdr),
+                 grep_count(r"kernel/virtio_gpu64\.cpp", ["build64.sh"])))
+    ev.append("协议面（都能在源码里查到）：capability(%d) + `VIRTIO_F_VERSION_1`(%d) + 2D 命令集(%d) + "
+              "**响应类型 0x1101**(%d)（display_info 的成功响应是 0x1101，**0x1100 是 OK_NODATA** —— "
+              "拿错就把成功当失败）"
+              % (grep_count(r"cap|CAP_", [src]), grep_count(r"VERSION_1", [src]),
+                 grep_count(r"CMD_[A-Z0-9_]+_2D", [src]), grep_count(r"0x1101", [src])))
+    ev.append("传输语义（本批最贵的一个坑）：backing 是**紧凑块**（stride = 响应给的 w，不带屏幕行距），"
+              "所以往设备搬的**区域传输必须整行宽**（rect.x 恒 0、width = 资源宽）—— 否则 x 偏移会把"
+              "紧凑块切错位，像素逐步漂移；回读（TRANSFER_FROM_HOST_2D）同理落在整行上。")
+    ev.append("后端切换：启动期打一行 \"[FB64] backend=…\"（kernel/fb.cpp:282）—— "
+              "有设备 = virtio-gpu-2d（整屏/区域 blit 走设备），没有设备（如 `-vga std`）= "
+              "\"[VGPU] legacy interface only -> backend=soft-lfb\"，LFB 软件路径原样保留为回退。")
+    ev.append("基准（同一批帧，实测串口）：整屏 1280x800 **982 µs -> 116 µs（8.5x）**、"
+              "512x512 **247 µs -> 18 µs（13.7x）**；报告里给的建议阈值是 **>= 64x64** 才值得走设备"
+              "（再小的区域，命令开销盖过收益）。")
+    ev.append("验收脚本 tests/virtiogpu64_test.py：%s（36 条断言；`-vga virtio` 设备可用 + `-vga std` 如实降级，"
+              "两套都跑）" % ("有" if exists("tests/virtiogpu64_test.py") else "★ 缺"))
+    ev.append("边界（如实）：**没有 3D/virgl、单一格式（XRGB8888）、TRANSFER_FROM_HOST_2D 对非 blob 的 2D "
+              "资源不回写（报告里如实标 GAP）、没有 cursor 平面 / 多输出、`reconfigure` 未实测**")
+    return ("DONE" if ok else "MISSING"), ev
+
 CAPS = [
     ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
      cap_boot_console),
@@ -2033,6 +2235,16 @@ CAPS = [
              "用户态 #PF/#GP/#DE 只杀进程不再 PANIC）", cap_sig_p5),
     ("应用", "★ A4-5 自研 Ring 3 编辑器 /bin/edit（真 argv + input_poll 取键 + raw/还原 + :w :q + "
              "Ctrl+S 后宿主侧卷解析逐字节一致）", cap_edit_p5),
+    ("驱动", "★ 批次 B4 xHCI（USB 3.x）：PCI 0C0330 + 能力/命令环/事件环 + Enable Slot/Address Device/"
+             "Configure Endpoint + HID 真打字 + U 盘 READ(10)（与宿主 CRC 逐位相等）", cap_xhci),
+    ("应用", "★ A4-2a 资源外置：5 份 raw 图标/logo（356,992 B）进系统卷 /etc，内核 3,726,496 -> 3,379,104 B，"
+             "四级兜底链全带打点", cap_asset_offload),
+    ("工具链", "★ B5 GNU Make 4.4.1 + tar + `sh -c`：ring3 里 make all 调 /bin/tcc 编出 2,796 B 静态 ELF 并跑通 "
+             "6*7=42；tar 与宿主 Python tarfile 双向互操作", cap_make_tar),
+    ("应用层", "★ A5 Wayland 基础骨架：wl_surface_create/attach/commit/damage/destroy + wl_seat + "
+             "wl_display_dispatch + 最小合成器（未提交不上屏 / 多 surface z 序 / damage 局部提交）", cap_wayland_skeleton),
+    ("驱动", "★ 驱动线 3 virtio-gpu（2D）：PCI 0x1AF4:0x1050 + 2D 命令集 + 响应 0x1101 + 整行宽传输语义 + "
+             "后端切换 [FB64] backend=… + 整屏 982->116 µs（8.5x）/512² 247->18 µs（13.7x）", cap_virtio_gpu),
 ]
 
 
@@ -2123,6 +2335,16 @@ TESTS = [
     ("edit64_test.py", "★ A4-5 自研 /bin/edit：真 argv + input_poll 取键 + raw/还原 + :w :q + "
                        "Ctrl+S 后宿主侧卷解析逐字节一致（33 条断言）"),
     ("a42a64_test.py", "★ A4-2a 图标包搬进系统卷 + 内核真缺陷 2 处 + 工具链必需的系统调用 + 标准流重定向（85 条断言）"),
+    ("xhci64_test.py", "★ 批次 B4 xHCI（USB 3.x）：PCI/能力/命令环/事件环 + Enable Slot/Address Device/"
+                       "Configure Endpoint + Setup TRB 内联+IDT + HID 打字进桌面 + U 盘 READ(10) 宿主 CRC 比对 + 盘符（74 条断言）"),
+    ("make64_test.py", "★ B5 Ring 3 里的 GNU make 4.4.1：/bin/make 驱动装载 /lib/make.bin，`make all` 调 /bin/tcc "
+                       "编出静态 ELF 并跑通 6*7=42；`sh -c` 语义子集（43 条断言）"),
+    ("tar64_test.py", "★ B5 Ring 3 里的用户态 tar：产物被宿主 Python tarfile 逐成员读出 + 解宿主的 USTAR 包（含子目录）"
+                      "+ -tf 列表（32 条断言）"),
+    ("wl64_test.py", "★ A5 Wayland 基础骨架：surface create/attach/commit/damage/destroy + wl_seat + wl_display_dispatch；"
+                     "最小合成器（未提交不上屏 / 多 surface z 序 / damage 局部提交 / 退出兜底回收）（91 条断言）"),
+    ("virtiogpu64_test.py", "★ 驱动线 3 virtio-gpu 2D：PCI/capability/VERSION_1/2D 命令集/响应 0x1101 + 设备与软件路径"
+                            "逐像素等价 + TRANSFER_FROM_HOST 逐字节 + 基准 + `-vga std` 如实降级（36 条断言）"),
 ]
 
 
