@@ -919,10 +919,8 @@ bash tools/tar_build_win.sh "$BUILD"
 #     两个"最后一步"必须**串成一条链**（谁的步骤在后面，谁就读前一步的 --vol-in），
 #     否则后跑的那一步会用自己的卷覆盖 sysdisk.img、把前一步的文件丢掉。
 #     合并时的正确接法：把本步的 --vol-in 改成上一步的输出卷（或把本步整体后移）。
-if [ -f "$BUILD/drvdemo.elf" ]; then
-    "$PY" tools/drvdemo_pack_win.py --vol-in "$BUILD/tarvol.img" --vol-out "$BUILD/drvsvcvol.img" \
-          --drvdemo "$BUILD/drvdemo.elf" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
-fi
+# ★ 注意执行顺序：drvdemo.elf 要到后面（本文件"Ring 3 驱动服务骨架"那一段）才编出来，
+#   所以装卷这一步**放在那里**（见下面的 drvdemo_pack_win.py 调用），不能放在这里。
 # 同一条体积纪律：**内核二进制里不能出现 make/tar 的字节**（工具只从系统卷装载）。
 # 探针取每个文件中段的 64 字节（代码/数据混排的中段最稳）。
 "$PY" - "$BUILD/kernel64_os.bin" "$BUILD/make.bin" "$BUILD/make" "$BUILD/tar" "$BUILD/shell.bin" <<'PYEOF5B'
@@ -1253,6 +1251,10 @@ print("    断言 OK：系统内核 %d B 里搜不到 drvdemo.elf 的 64B 探针
       % (len(k), mid))
 PYEOFDRV
 echo "    /bin/drvdemo = $DRVDEMO_SZ B（静态 ELF64；由 tools/drvdemo_pack_win.py 装进系统卷）"
+if [ -f "$BUILD/drvdemo.elf" ] && [ -f "$BUILD/tarvol.img" ]; then
+    "$PY" tools/drvdemo_pack_win.py --vol-in "$BUILD/tarvol.img" --vol-out "$BUILD/drvsvcvol.img" \
+          --drvdemo "$BUILD/drvdemo.elf" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+fi
 
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
 "$PY" - "$BUILD/payload_hdr.bin" "$SYS_SECTORS" "$((PAYLOAD_LBA + 1))" <<'PYEOF'
