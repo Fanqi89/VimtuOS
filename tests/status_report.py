@@ -2151,6 +2151,167 @@ def cap_virtio_gpu():
               "资源不回写（报告里如实标 GAP）、没有 cursor 平面 / 多输出、`reconfigure` 未实测**")
     return ("DONE" if ok else "MISSING"), ev
 
+def cap_ring3_composer():
+    """★ B-wm：把"图形"搬到 Ring 3 —— 用户态合成器 /bin/wm + 两个真客户端（有合成器时内核一个像素都不合成）。
+
+    判据绑到"代码里真的这么做" + "端到端脚本真跑过"：
+      * 内核侧：kernel/wl64.{h,cpp} 的自有 ABI 22..26（wl_composer_get / wl_surface_export /
+        wl_surface_map / wl_surface_ack / wl_seat_post）+ kernel/syscall64.{h,cpp} 的分派 +
+        kernel/kernel64.cpp 启动期一行 wl64_wm64("/bin/wm.elf")；22..26 只有注册过的合成器能调
+        （别的进程 EPERM，无进程上下文也不许注册成功）。
+      * 用户态：user/wm/{wm.c,wmclock.c,wmpanel.c,wmabi.c,wmabi.h} —— /bin/wm 用 fb_map(9) 拿后备缓冲、
+        在用户态 blit/遮挡/alpha 混合（**只重画 damage**）、fb_flip(10) 上屏、input_poll(12) 命中测试后
+        用 26 号把事件投回客户端进程队列；两个真客户端 = 每 5 s 更新数字的时钟（只 damage 变化的字形）
+        + 鼠标可点按的交互面板（含 alpha=0x80 半透明条，验证混合路径）。
+      * 交付 = 系统卷文件（build64.sh 里"内核二进制搜不到 wm.elf 字节"的 64B 探针断言；build64/wm.elf 22,832 B）。
+      * 两条路并存：没有合成器注册时 A5 的内核内合成（[WL64] composite）逐条不变
+        （tests/wl64_test.py 91 项仍全过）；注册之后内核不再合成（验收按 [WL64] composer 行切段核对）。
+    """
+    ev = []
+    need = ["kernel/wl64.cpp", "kernel/wl64.h", "user/wm/wm.c", "user/wm/wmclock.c", "user/wm/wmpanel.c",
+            "user/wm/wmabi.c", "user/wm/wmabi.h", "tools/wm_pack_win.py", "tests/wm64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        ev.append("缺文件：%s" % ", ".join(miss))
+    abi = grep_count(r"wl64_composer_get64|wl64_surface_export64|wl64_surface_map64|wl64_surface_ack64|"
+                     r"wl64_seat_post64", ["kernel/wl64.cpp", "kernel/wl64.h"])
+    disp = grep_count(r"wl_composer_get|wl_surface_export|wl_surface_map|wl_surface_ack|wl_seat_post",
+                      ["kernel/syscall64.cpp", "kernel/syscall64.h"])
+    boot = grep_count(r"wl64_wm64\(", ["kernel/kernel64.cpp"])
+    ev.append("内核侧：自有 ABI 22..26（composer_get / surface_export / surface_map / surface_ack / seat_post）"
+              "命中 %d；syscall64 分派命中 %d；kernel64.cpp 启动期 wl64_wm64()：命中 %d" % (abi, disp, boot))
+    ev.append("用户态 /bin/wm：fb_map 拿后备缓冲 -> 用户态 blit/遮挡/alpha（只重画 damage）-> fb_flip 上屏 -> "
+              "input_poll 命中测试后 26 号回投；两个真客户端 wmclock（每 5s 更新数字）/ wmpanel（可点按 + 半透明条）")
+    ev.append("实测串口原文：\"[WL64] composer get rect=…\"（22 号把\"外部面板区\"交给合成器）、"
+              "\"[WL64] composer pid=… seat=1 gpu=0 backend=soft-lfb surfs=…\"、"
+              "\"[WM] frame us=… blend=…\"（用户态合成帧 + alpha 混合计数）、"
+              "\"[WM] blitpolicy gpu=0 min_px=4096 rect_px=.. path=soft\"")
+    ev.append("关键反证（合成真的搬走了）：注册合成器后**内核一个像素都不合成** —— 日志在 [WL64] composer 行处切段，"
+              "后半段 [WL64] composite 计数 = 0（测试打点 tail_composite=0）；\"没 commit 不上屏 / z 序 / damage 局部\""
+              "三条语义在用户态合成器里由 wm64_test 逐条按像素与日志断言")
+    ev.append("事件路由实测：\"[WL64] seatpost surf=4 pid=29\"（wm 在用户态命中测试后用 26 号投回目标进程队列；"
+              "内核外壳的 ring0 点击处理路径 0 新增行）")
+    ev.append("退出/交回实测：\"[WM] exit handback color=… px=64000 frames=…\" + "
+              "\"[WL64] composer release pid=… mode=internal\"（合成权交回内核、区域外逐字节不变、无 PANIC）；"
+              "客户端先退：\"[WL64] surface destroy … why=client\" + \"[SHM64] release … refs=0 freed_pages=15|8\""
+              "（页池回基线）")
+    ev.append("验收脚本 tests/wm64_test.py：%s（**77 项全过**：①fb_map+注册+内核不再合成 ②两块 surface 像素证据 + "
+              "alpha blend>0 ③damage 局部性（48x32 的 damage -> 面板内框外 0 px 差异）④z 序 ⑤用户态命中测试 + seatpost "
+              "⑥客户端退出资源回收 ⑦交回地盘 64,000 px + 区域外逐字节不变 ⑧无 enosys/无 FAILED ⑨性能与设备阈值）"
+              % ("有" if exists("tests/wm64_test.py") else "★ 缺"))
+    ev.append("（边界，如实：本批内核**净增 ≈ +8.1 KB**（wl64.o +7,280 B、syscall64 里 22..26 段 +752 B）——**非净减**，"
+              "回本靠搬家路线图第 1 步\"搬窗口绘制\"；`wm` 被 SIGKILL 的路径未单独注入（正常退出已实测，exit/kill 走同一条 "
+              "wl64_proc_release64）；**无真 Wayland 协议**（无 UDS / wire 编解码 / memfd / wl_buffer 生命周期与 release）；"
+              "**无设备 blit 的用户态路径**（有阈值打点，测试台恒 path=soft））")
+    done = bool(not miss and abi and disp and boot and exists("build64/wm.elf"))
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_devmap():
+    """★ 本批（设备映射）：pci_map_bar(48) + Ring 3 驱动服务骨架 /bin/drvdemo（只 MMIO、只 root、幂等、设备页不进页池）。
+
+    判据绑到"代码里真的这么做" + "端到端脚本真跑过"：
+      * kernel/pci64.{h,cpp}：0xCF8/0xCFC 配置空间 + BAR 解码（I/O vs MMIO、**64 位 BAR 读高 32 位**、
+        **写全 1 探真实大小并立刻还原 + 回读确认**）+ 8 条结果缓存。
+      * kernel/syscall64.{h,cpp}：号 48 的分发 + 实现（权限 -> out 指针 -> BAR 解码 -> 落地映射 -> 打点
+        [PCIMAP] bar/map/FAILED/deny）；错误码 -1 EPERM / -2 EFAULT / -3 EINVAL（含 I/O 端口 BAR）/ -4 ENOMEM /
+        -5 ENODEV；失败行有上限防刷屏；**只 root（euid==0）**且有进程上下文。
+      * kernel/proc64.{h,cpp}：每进程设备映射窗 **8 槽 × 256 KiB = 2 MiB**（紧贴 shm 窗下方，仍在用户窗口 PDPT[4] 内），
+        逐页 P|U|W|NX|**PCD**；**设备页不进页池**（退出/execve/fork/munmap 四条路径只清 PTE、绝不 page_free）；
+        幂等：同一个 (bdf,bar) 复用同一 VA/长度（内核打点 re=1）。
+      * user/svc/drvdemo.c：Ring 3 里读 HDA/xHCI 寄存器（按寄存器内容认设备，不写死型号表）+ **真实写**
+        SD0CTL.SRST（写-回读-清-回读）；tools/drvdemo_pack_win.py 装进系统卷 /bin/drvdemo（内核 0 字节）。
+    """
+    ev = []
+    need = ["kernel/pci64.cpp", "kernel/pci64.h", "kernel/proc64.cpp", "kernel/syscall64.cpp",
+            "user/svc/drvdemo.c", "tools/drvdemo_pack_win.py", "tests/drvsvc64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        ev.append("缺文件：%s" % ", ".join(miss))
+    bar = grep_count(r"pci64_bar_probe64|0xFFFFFFFFu|bar_index > 5u|PCI64_EINVAL64|PCI64_ENODEV64",
+                     ["kernel/pci64.cpp", "kernel/pci64.h"])
+    win = grep_count(r"DEV64_WINDOW|pci64_map|PCI64_SLOTS|PCD|mmio", ["kernel/proc64.cpp", "kernel/proc64.h"])
+    deny = grep_count(r"not-root|\[PCIMAP\] deny|euid", ["kernel/syscall64.cpp"])
+    ev.append("内核侧：BAR 解码（写全 1 探真实大小 + 立刻还原 + 回读确认 / 64 位 BAR 高 32 位 / I/O 端口 BAR 拒）"
+              "命中 %d；每进程设备映射窗（8 槽 × 256 KiB + P|U|W|NX|PCD + 设备页不进页池）命中 %d；"
+              "只 root 的权限检查命中 %d" % (bar, win, deny))
+    ev.append("实测串口原文：\"[PCIMAP] map pid=… bdf=0x… bar=0 pa=0x… len=… va=0x… pages=… u=1 re=0 b64=0 "
+              "pool_free=…\"（页表 u=1 = 用户可访问；len = BAR 真实大小；pa 与内核驱动自己的 bar0 打点一致；"
+              "re=1 = 幂等复用同一 VA）")
+    ev.append("用户态读寄存器 vs 内核打点**逐字段一致**：\"DRVDEMO hda regs gcap=0x4401 vmin=0 vmaj=1 …\" vs "
+              "\"[HDA64] ctrl … caps=0x4401 vmaj=1 vmin=0\"；\"DRVDEMO xhci caps caplen=0x40 ver=0x0100 "
+              "hcs1=0x08001040 max_slots=64 max_ports=8 csz=1 ac64=1\" vs \"[XHCI] pci …\"（内核说 port connected "
+              "speed=high 的端口，用户态 PORTSC CCS=1 且 PS=3）")
+    ev.append("真实写 + 共存：\"DRVDEMO hda op srst wr=0x1 rb=0x1 ok=1\" + \"DRVDEMO hda op clear wr=0x0 rb=0x0 ok=1 "
+              "sts_rdy=1\"（写-回读-清-回读）；其后内核 \"[HDA64] cmd audio playtone … ok=1\" 仍能播放 —— "
+              "用户态摸过设备之后系统没坏")
+    ev.append("错误码齐全（实测）：\"DRVDEMO neg noroot euid=… rc=-1\"、\"neg badbdf … rc=-5\"、\"neg iobar … rc=-3\"、"
+              "\"neg badbar … rc=-3\"、\"neg outptr rc=-2\"、越权 \"neg mmap_dev va=… rc=-12\" / \"neg munmap_dev va=… rc=-22\"；"
+              "退出回收：\"[PCIMAP] release pid=… slots=2 freed=0 (mmio, not page-pool) pool_free=…\"（页池水位不降）")
+    ev.append("验收脚本 tests/drvsvc64_test.py：%s（**71 项全过**：映射成功/VA 在设备窗内/页对齐/长度=真实 BAR 大小/"
+              "pa 与内核驱动一致/幂等/越权与负例/回收/无 PANIC/无 enosys/HDA 真实操作与内核共存）"
+              % ("有" if exists("tests/drvsvc64_test.py") else "★ 缺"))
+    ev.append("（边界，如实：**缺 DMA 映射 API / 中断投递 / 复位与所有权转移 / 共存摘除协议** —— 所以它只是\"骨架\"，"
+              "不是完整用户态驱动；BAR 物理地址 ≥ 4 GiB 直接 ENODEV；单 BAR ≤ 256 KiB（更大的返回 -ENOMEM）；"
+              "**无显式 unmap API**（没有 pci_unmap_bar，回收只在进程退出时发生））")
+    done = bool(not miss and bar and win and deny and exists("build64/drvdemo.elf"))
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_blob_offload():
+    """★ 本批（体积）：内嵌演示 blob 外置 —— 18 份 / 144,053 B 从内核搬到系统卷 + 「原始区」影子副本。
+
+    * 交付 = 系统卷文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检；内核里 blob 字节 **0**）；
+      影子副本 = system.img 的 LBA 7497 起「原始区」（空夹具盘/无卷盘时兜底）。
+    * 内核里只剩路径/偏移/长度表：18 条 × 16 B = 288 B（build64/demo64_blobtab.h，构建期生成）。
+    * 实测：系统内核 **3,436,080 -> 3,297,680 B**；余量 **659,920 -> 798,320 B**（三层预算见 tests/a42a64_test.py）。
+    * 构建期硬断言：18/18 份 blob 的「整份（≤4 KiB）/64B 高熵探针」在**两份内核二进制**里都搜不到
+      （build64.sh 的 PYDEMO64 段）—— 哪天有人把 blob 塞回内核，这里必红。
+    * 踩坑（真缺陷）：原设计按 loader 平铺加载的**物理地址**读原始区（LBA 7497 -> 物理 0x4A8000），
+      但内核 .bss 里的 33 MB fb 后备缓冲（物理 0x428000..0x23CC000）盖住了这段地址 —— 第一次跑 demo64 就在
+      ring3 入口 0x100000000 上 #UD（\"[SIG64] fault no=6\" + \"[PANIC] cpu exception 6\"）；
+      改为 kernel/demo64.cpp 首次调用用 ata64_read(0, LBA7497, n) **按 LBA 现读并缓存**（失败如实打点，
+      调用方只走\"系统卷\"路径）。
+    """
+    ev = []
+    need = ["kernel/demo64.cpp", "kernel/demo64.h", "tools/demo_pack_win.py",
+            "build64/demo64_blobtab.h", "build64/demo64_raw.bin"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        ev.append("缺文件：%s" % ", ".join(miss))
+    n_blob, raw_bytes, blob_sum = 0, 0, 0
+    if exists("build64/demo64_blobtab.h"):
+        tab = open("build64/demo64_blobtab.h", encoding="utf-8", errors="replace").read()
+        m = re.search(r"DEMO64_BLOB_COUNT\s+(\d+)", tab)
+        n_blob = int(m.group(1)) if m else 0
+        m = re.search(r"DEMO64_RAW_BYTES\s+(\d+)", tab)
+        raw_bytes = int(m.group(1)) if m else 0
+        blob_sum = sum(int(x) for x in re.findall(r",\s*(\d+)u\s*\}", tab))
+    pack = exists("tools/demo_pack_win.py")
+    bk = grep_count(r"DM_BLOB_COUNT|DEMO64_BLOB_COUNT|DEMO64_RAW_LBA|DEMO64_RAW_BYTES", ["build64.sh"])
+    ev.append("清单（tools/demo_pack_win.py 的 BLOBS 表）：**%d 份 / 合计 %d B**（原始区含对齐 %d B）；"
+              "内核里只有路径/偏移/长度表（%d 条 × 16 B = %d B，无一个字节 blob 本体）"
+              % (n_blob, blob_sum, raw_bytes, n_blob, n_blob * 16))
+    ev.append("交付：系统卷同名文件（构建期写入 + 逐字节回读自检）+ system.img LBA 7497「原始区」影子副本"
+              "（build64/demo64_raw.bin；build64.sh 两道越界断言：内核不许压过来、原始区不许越界）；"
+              "启动期装卷**幂等**：卷里已有 -> \"install skipped (exists)\"；没有 -> 从原始区取字节装进去；"
+              "找不到就如实 skipped，**绝不假装跑过**（kernel/kernel64.cpp / demo64.cpp 打点）")
+    ev.append("实测体积：系统内核 **3,436,080 -> 3,297,680 B**（-138,400 B）；余量 **659,920 -> 798,320 B**"
+              "（构建输出原文：\"系统内核 3,436,080 B -> … B；余量 … B = … KiB\"）；三层预算断言全过")
+    ev.append("构建期硬断言：**18/18** 份 blob 的「整份（≤4 KiB）/64B 高熵探针」在 kernel64.bin（安装内核）"
+              "与 kernel64_os.bin（系统内核）**两份**里都搜不到（build64.sh 的 PYDEMO64 段；高熵窗口是为了避免"
+              "纯零/同色中段的假命中）")
+    ev.append("★ 踩坑（真缺陷，修在 kernel/demo64.cpp）：按 loader 平铺加载的**物理地址**读原始区会被内核 .bss "
+              "的 33 MB fb 后备缓冲（物理 0x428000..0x23CC000）覆盖 -> 第一次跑 demo64 在 ring3 入口 "
+              "0x100000000 上 #UD（\"[SIG64] fault no=6\" + \"[PANIC] cpu exception 6\"）；"
+              "改按 LBA 7497 用 ata64_read() 现读并缓存（\".bss 覆盖\"这条教训已写进源码注释）")
+    ev.append("（边界，如实：**4 份\"直跑演示\"**（demo64 / hello_c / libctest_c / fbdemo）在挂卷之前跑 —— "
+              "字节从原始区取；真安装盘首次启动靠\"原始区装进空卷\"这条兜底（option b）；原始区上限 512 扇区 = "
+              "256 KiB（当前 144,129 B），放不下就得改布局；原始区读取失败时调用方只走系统卷路径、如实打点）")
+    done = bool(not miss and n_blob == 18 and blob_sum == 144053 and raw_bytes and bk)
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 CAPS = [
     ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
      cap_boot_console),
@@ -2245,6 +2406,17 @@ CAPS = [
              "wl_display_dispatch + 最小合成器（未提交不上屏 / 多 surface z 序 / damage 局部提交）", cap_wayland_skeleton),
     ("驱动", "★ 驱动线 3 virtio-gpu（2D）：PCI 0x1AF4:0x1050 + 2D 命令集 + 响应 0x1101 + 整行宽传输语义 + "
              "后端切换 [FB64] backend=… + 整屏 982->116 µs（8.5x）/512² 247->18 µs（13.7x）", cap_virtio_gpu),
+    ("应用", "★ B-wm Ring 3 合成器：用户态 /bin/wm（fb_map 拿后备缓冲 + 用户态 blit/遮挡/alpha + 只重画 damage + "
+             "fb_flip 上屏 + input_poll 命中测试后 26 号回投）+ 两个真客户端；有合成器时内核一个像素都不合成"
+             "（tail_composite=0）；内核本批 +8.1 KB 非净减", cap_ring3_composer),
+    ("驱动", "★ 用户态设备映射 pci_map_bar(48) + Ring 3 驱动服务骨架 /bin/drvdemo：只 MMIO、写全 1 探真实大小并还原、"
+             "64 位 BAR 读高 32 位、每进程 8 槽 × 256 KiB、P|U|W|NX|PCD、设备页不进页池、只 root、幂等、错误码齐全；"
+             "用户态读 HDA/xHCI 寄存器与内核打点逐字段一致 + 真实写 SD0CTL.SRST 后内核 audio playtone 仍 ok=1",
+     cap_devmap),
+    ("内核", "★ 内嵌演示 blob 外置：18 份 / 144,053 B -> 系统卷 + system.img LBA7497「原始区」影子副本；"
+             "内核里只剩路径/偏移/长度表（18×16 B），blob 字节 0；内核 3,436,080 -> 3,297,680 B、余量 798,320 B；"
+             "构建期 18/18 双内核高熵探针搜不到；踩坑：按物理地址读原始区被 .bss fb 后备缓冲覆盖 -> 改按 LBA 现读",
+     cap_blob_offload),
 ]
 
 
@@ -2345,6 +2517,13 @@ TESTS = [
                      "最小合成器（未提交不上屏 / 多 surface z 序 / damage 局部提交 / 退出兜底回收）（91 条断言）"),
     ("virtiogpu64_test.py", "★ 驱动线 3 virtio-gpu 2D：PCI/capability/VERSION_1/2D 命令集/响应 0x1101 + 设备与软件路径"
                             "逐像素等价 + TRANSFER_FROM_HOST 逐字节 + 基准 + `-vga std` 如实降级（36 条断言）"),
+    ("wm64_test.py", "★ B-wm Ring 3 合成器：/bin/wm 注册（[WL64] composer get rect=… / composer pid=… seat=1）+ 注册后内核不再合成"
+                     "（tail_composite=0）+ 两个客户端 surface 的像素与 alpha blend>0 + damage 局部性（面板内框外 0 px 差异）+ "
+                     "z 序 + 用户态命中测试后 [WL64] seatpost surf=4 pid=29 + 资源回收 refs=0/freed_pages=15|8 + "
+                     "[WM] exit handback px=64000 + composer release mode=internal（77 条断言）"),
+    ("drvsvc64_test.py", "★ 用户态设备映射 pci_map_bar(48) + Ring 3 驱动服务骨架 /bin/drvdemo：[PCIMAP] map u=1/pa 与内核 bar0 一致/"
+                         "len=BAR 真实大小/幂等 re=1 + 用户态 HDA/xHCI 寄存器与内核打点逐字段一致 + 真实写 SD0CTL.SRST（写-回读-清-回读）"
+                         "后内核 audio playtone 仍 ok=1 + 五种负例 + 越权 mmap/munmap 被拒 + 退出回收设备页不进页池（71 条断言）"),
 ]
 
 
