@@ -33,10 +33,10 @@
 #include "x86_64.h"         // ★ A3：g_ticks64（AT_RANDOM 的随机种子）
 #include "debug64.h"
 
-// 内嵌的 hello.elf（build64.sh：nasm -f elf64 -> ld.lld -static -> objcopy -I binary 嵌进系统内核）。
-// 符号名由 objcopy 按输入路径生成：_binary_build64_hello_elf_start/_end（从仓库根执行才稳定）。
-extern "C" const uint8_t _binary_build64_hello_elf_start[];
-extern "C" const uint8_t _binary_build64_hello_elf_end[];
+// ★ 本批（演示程序搬进系统卷）：hello.elf 的字节**不在内核里** ——
+//   交付 = 系统卷里的 /hello.elf（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
+//   启动期的"幂等装卷"只在卷里没有时从构建期"原始区"取字节（空夹具盘的情形，见 kernel/demo64.h）。
+#include "demo64.h"
 
 static const char ELF64_INSTALL_PATH64[] = "/hello.elf";
 
@@ -909,13 +909,14 @@ int elf64_run64(const char* path) {
     return rc;
 }
 
-// ==================== 幂等安装（内嵌 hello.elf -> VFS /hello.elf）====================
+// ==================== 幂等安装（hello.elf -> VFS /hello.elf；字节在卷/原始区）====================
 int elf64_install_builtin64(int drive, uint32_t part_lba) {
-    const uint32_t bytes = (uint32_t)(_binary_build64_hello_elf_end - _binary_build64_hello_elf_start);
-    // 先自校验内嵌映像（与运行时同一条解析路径），坏了就别往盘上写
+    uint32_t bytes = 0;
+    const uint8_t* blob = demo64_blob_find64(ELF64_INSTALL_PATH64, &bytes);
+    // 先自校验映像（与运行时同一条解析路径），坏了就别往盘上写
     Elf64Image64 img;
     uint64_t bad_va = 0;
-    if (elf64_parse64(_binary_build64_hello_elf_start, bytes, &img, &bad_va) != E64_OK) {
+    if (!blob || bytes == 0 || elf64_parse64(blob, bytes, &img, &bad_va) != E64_OK) {
         dbg64_line_begin64();
         dbg64_str("[ELF64] install FAILED reason=blob\n");
         dbg64_line_end64();
@@ -946,7 +947,7 @@ int elf64_install_builtin64(int drive, uint32_t part_lba) {
         dbg64_line_end64();
         return 0;
     }
-    const int w = vfs64_write_on64(sys, ELF64_INSTALL_PATH64, _binary_build64_hello_elf_start, (int)bytes);
+    const int w = vfs64_write_on64(sys, ELF64_INSTALL_PATH64, blob, (int)bytes);
     if (w != (int)bytes) {
         dbg64_line_begin64();
         dbg64_str("[ELF64] install FAILED reason=write\n");
@@ -1163,10 +1164,17 @@ int elf64_selftest64() {
     dbg64_nl();
     dbg64_line_end64();
 
-    // ---- bit10：内嵌 hello.elf 必须能解析（构建期产物与加载器同口径）----
+    // ---- bit10：交付给系统卷的 hello.elf 必须能解析（构建期产物与加载器同口径）----
+    //   ★ 本批：字节不在内核里了 —— 从构建期"原始区"取（见 kernel/demo64.h）；取不到就跳过
+    //     这一位（构建期已有"探针/回读"两道断言，不是运行期静默放过）。
     {
-        const uint32_t hb = (uint32_t)(_binary_build64_hello_elf_end - _binary_build64_hello_elf_start);
-        if (elf64_parse64(_binary_build64_hello_elf_start, hb, &img, &bad_va) != E64_OK) {
+        uint32_t hb = 0;
+        const uint8_t* hblob = demo64_blob_find64(ELF64_INSTALL_PATH64, &hb);
+        if (!hblob || hb == 0) {
+            dbg64_line_begin64();
+            dbg64_str("[ELF64] selftest bit10 skipped (no hello.elf in blob region)\n");
+            dbg64_line_end64();
+        } else if (elf64_parse64(hblob, hb, &img, &bad_va) != E64_OK) {
             fail |= 1024;
         } else {
             // hello.elf 用 user/hello_elf64.ld 的 SIZEOF_HEADERS 技巧，所以程序头表在映像里

@@ -3528,19 +3528,20 @@ static bool cmd_update(TerminalState* ts, const char* sub, const char* arg1) {
 // ---------- proc：proc64 真进程（list / run / kill）；`proc run spin` 用内嵌的 spin64.elf ----------
 // 为什么终端需要这条命令：启动期多进程演示跑完进程就走了，桌面起来时进程表为空；任务管理器
 //   进程页要显示"真进程"、且要能 kill，需要一个运行期可创建的**长命**进程（spin64.elf 永不退出）。
-extern "C" const uint8_t _binary_build64_spin64_elf_start[];
-extern "C" const uint8_t _binary_build64_spin64_elf_end[];
-extern "C" const uint8_t _binary_build64_filedemo64_elf_start[];
-extern "C" const uint8_t _binary_build64_filedemo64_elf_end[];
+// ★ 本批（演示程序搬进系统卷）：/spin.elf 与 /filedemo.elf 的字节**不在内核里** ——
+//   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
+//   空夹具盘时由这里从构建期"原始区"取字节装进卷（见 kernel/demo64.h）。
+#include "demo64.h"
 
-// 内嵌程序 -> VimtuFS2（幂等：已装过就跳过）。两个：长命 spin（proc run）与
-// filedemo（ring3 读文件演示：open "/t.txt" + read + write；见 user/filedemo64.asm）。
-static int term_install_blob64(const char* path, const uint8_t* start, const uint8_t* end, const char* tag) {
+// 保证一份交付在卷里存在（幂等）：已有就返回 0（开终端时**不打点**，保持老行为）；
+// 没有就从"原始区"取字节写进去，成功打一行 [TERM] install <path> bytes=<n> (<tag>)。
+static int term_install_blob64(const char* path, const char* tag) {
     uint32_t t = 0, sz = 0;
     if (vfs64_stat(path, &t, &sz) == 0) return 0;              // 幂等：已装过就跳过
-    const int len = (int)(end - start);
-    if (len <= 0) return -1;
-    const int rc = vfs64_write(path, start, len);
+    uint32_t len = 0;
+    const uint8_t* blob = demo64_blob_find64(path, &len);
+    if (!blob || len == 0) return -1;
+    const int rc = vfs64_write(path, blob, (int)len);
     if (rc < 0) return -1;
     dbg64_line_begin64();
     dbg64_str("[TERM] install ");
@@ -3554,14 +3555,12 @@ static int term_install_blob64(const char* path, const uint8_t* start, const uin
     return 0;
 }
 static int term_install_spin64() {
-    return term_install_blob64("/spin.elf", _binary_build64_spin64_elf_start,
-                               _binary_build64_spin64_elf_end, "long-lived proc target");
+    return term_install_blob64("/spin.elf", "long-lived proc target");
 }
 static int term_install_filedemo64() {
-    return term_install_blob64("/filedemo.elf", _binary_build64_filedemo64_elf_start,
-                               _binary_build64_filedemo64_elf_end, "ring3 file demo");
+    return term_install_blob64("/filedemo.elf", "ring3 file demo");
 }
-// 开终端时幂等安装内嵌程序（`run filedemo` / `proc run spin` 因此总是可用；没有卷时静默失败）
+// 开终端时保证两份交付在卷里（`run filedemo` / `proc run spin` 因此总是可用；没有卷时静默失败）
 static void term_install_builtins64() {
     (void)term_install_spin64();
     (void)term_install_filedemo64();

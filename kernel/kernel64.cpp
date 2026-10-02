@@ -72,32 +72,14 @@ uint32_t sig64_suppressed64();          // 打点预算节流统计（收尾打�
 #include "update64.h"    // update 子系统（标记 -> 应用 -> store/重启；不是真"升级包"，见其头文件）
 // ---- 文件资源管理器 / 此电脑（只进系统内核；外壳 gui64 的 app_mypc_open64 转调它）----
 #include "explorer64.h"  // "此电脑"+盘内浏览：纯逻辑自检在启动期跑一次（[EXPL] selftest PASS）
-// 用户态演示程序 blob：user/demo64.asm -> nasm 平铺二进制 -> objcopy 嵌入（见 build64.sh）。
-// 符号名由 objcopy 按输入路径生成：_binary_build64_user_demo64_bin_start/_end。
-extern "C" const uint8_t _binary_build64_user_demo64_bin_start[];
-extern "C" const uint8_t _binary_build64_user_demo64_bin_end[];
-// ★ A1：用户态绘图演示程序 blob（user/fbdemo.asm -> nasm -f bin -> objcopy 嵌入；见 build64.sh）。
-//   符号名同样由 objcopy 按输入路径生成：_binary_build64_user_fbdemo64_bin_start/_end。
-extern "C" const uint8_t _binary_build64_user_fbdemo64_bin_start[];
-extern "C" const uint8_t _binary_build64_user_fbdemo64_bin_end[];
-// ★ A2：**用 C 写**的用户程序 blob（user/apps/*.c -> user/build_user.sh 编成静态 ELF64 ->
-//   objcopy 平铺 blob 嵌进内核；见 build64.sh 的"用户程序交叉编译"段）。
-//   跑它们的入口是 user64_run_capp64()（代码页可写：C 程序有 .data/.bss，见 kernel/usermode64.cpp）。
-//   符号名同样由 objcopy 按输入路径生成：_binary_build64_user_<name>_bin_start/_end。
-extern "C" const uint8_t _binary_build64_user_hello_bin_start[];
-extern "C" const uint8_t _binary_build64_user_hello_bin_end[];
-extern "C" const uint8_t _binary_build64_user_libctest_bin_start[];
-extern "C" const uint8_t _binary_build64_user_libctest_bin_end[];
-extern "C" const uint8_t _binary_build64_user_fbdemo_bin_start[];
-extern "C" const uint8_t _binary_build64_user_fbdemo_bin_end[];
-// ★ A5 前置：/evshm.elf（user/apps/evshm_demo.c 编出的静态 ELF64，由 proc64.cpp 幂等装进
-//   系统卷再以真进程跑）。符号名由 objcopy 按输入路径生成：_binary_build64_evshm_elf_start/_end。
-extern "C" const uint8_t _binary_build64_evshm_elf_start[];
-extern "C" const uint8_t _binary_build64_evshm_elf_end[];
-// ★ A4-5：/sig64.elf（user/apps/sig64_demo.c 编出的静态 ELF64，由**本文件**的 sig64_demo64()
-//   幂等装进系统卷再以真进程跑）。符号名由 objcopy 按输入路径生成：_binary_build64_sig64_elf_*。
-extern "C" const uint8_t _binary_build64_sig64_elf_start[];
-extern "C" const uint8_t _binary_build64_sig64_elf_end[];
+// ★ 本批（演示程序搬进系统卷）：user_demo64.bin / user_fbdemo64.bin / user_hello.bin /
+//   user_libctest.bin / user_fbdemo.bin / evshm.elf / sig64.elf 这些**内嵌 blob 的字节已全部
+//   搬走**（构建期有"内核二进制里搜不到 64B 探针"断言）：
+//     * 交付：系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
+//       /evshm.elf 与 /sig64.elf 由 proc64/sig64 的启动期路径装进系统卷（见各自文件）；
+//     * 兜底：tools/demo_pack_win.py 生成的"原始区"（build64/demo64_raw.bin，构建期 dd 进
+//       system.img 的 LBA 7497 起）——只兜"卷里没有且是空夹具"这一情形，内核二进制里
+//       只有路径/偏移/长度表（kernel/demo64.h），字节数为 0。见 kernel/demo64.cpp 的说明。
 // ★ A2：跑哪个 fbdemo —— 0（默认）= C 版（user/apps/fbdemo.c）；1 = A1 的汇编版（user/fbdemo.asm）。
 //   由 build64.sh 按环境变量 VIMTU_USER_FBDEMO 定义（默认 c；=asm 时切回汇编版，二进制行为一致）。
 #ifndef VIMTU_USER_FBDEMO_ASM
@@ -111,6 +93,8 @@ extern "C" const uint8_t _binary_build64_sig64_elf_end[];
 #include "../bootinfo.h"
 #include "debug64.h"
 #include "memlayout64.h"
+// ★ 本批：演示程序 blob 的"原始区"偏移表（只有元数据；正常交付 = 系统卷里的文件）
+#include "demo64.h"
 
 #include "console64.h"   // ★ 批次 N：开机滚屏引导控制台（启动日志环形缓冲 + 回放 + dmesg）
 #include "rust64.h"      // ★ 项目路线（C + C++ + Rust）：Rust 模块 gui_rs 的 C 链接声明
@@ -209,13 +193,8 @@ static uint64_t read_cs64()  { uint64_t v; __asm__ volatile("mov %%cs, %0"  : "=
 //   [USER64] slotreuse round=<n> slot=<s> pid=<p> enter=ok
 //   [USER64] slotreuse PASS rounds=<n> slot=<s>      /  FAIL round=<n> reason=<k>
 #ifndef VIMTU_INSTALLER_MEDIA
-extern "C" const uint8_t _binary_build64_spin64_elf_start[];
-extern "C" const uint8_t _binary_build64_spin64_elf_end[];
-// ★ A3：内嵌的 musl 静态程序（tools/musl_build_win.sh 编出 build64/musl_hello.elf，
-//   build64.sh 里 objcopy -> build64/os/musl_hello_elf.o，符号名按输入路径生成）。
-//   体积代价见 build64.sh 里那段注释与 docs 的 "musl（A3 第一步）" 节。
-extern "C" const uint8_t _binary_build64_musl_hello_elf_start[];
-extern "C" const uint8_t _binary_build64_musl_hello_elf_end[];
+// ★ 本批：/spin.elf 与 /musl_hello.elf 的字节已搬走（系统卷交付 + 原始区兜底）：
+//   这里不再有 objcopy 出来的符号，只有 kernel/demo64.h 的路径查找。见本文件顶部的说明。
 
 // 任务表快照查询（-1 = 该任务已不在表里 = 槽已回收）
 static int k64_task_state_of64(uint32_t id) {
@@ -244,11 +223,13 @@ static uint32_t k64_proc_task_id64(int pid) {
 }
 
 static void ring3_slot_reuse_demo64(const char* path, int rounds) {
-    // 幂等安装内嵌 /spin.elf（与终端 `proc run spin` 用的是同一个 blob）
+    // 幂等安装 /spin.elf（与终端 `proc run spin` 用的是同一份交付）：卷里已有直接用；
+    // 没有（空夹具盘）就从构建期的"原始区"取字节装进去 —— 内核二进制里没有它的字节。
     uint32_t ty = 0, sz = 0;
     if (vfs64_stat(path, &ty, &sz) != 0) {
-        const int len = (int)(_binary_build64_spin64_elf_end - _binary_build64_spin64_elf_start);
-        if (len <= 0 || vfs64_write(path, _binary_build64_spin64_elf_start, len) < 0) {
+        uint32_t len = 0;
+        const uint8_t* blob = demo64_blob_find64(path, &len);
+        if (!blob || len == 0 || vfs64_write(path, blob, (int)len) < 0) {
             dbg64_line_begin64();
             dbg64_str("[USER64] slotreuse skipped (cannot install /spin.elf)\n");
             dbg64_line_end64();
@@ -347,8 +328,8 @@ static void ring3_slot_reuse_demo64(const char* path, int rounds) {
 // ==================== ★ A3：musl 静态程序（真进程 + ring3）====================
 // 怎么做（与 /hello.elf 那条"内嵌 blob -> 装进 VimtuFS2 -> 从盘上读出来跑"完全同一套路，
 // 但**跑法**升级成"真进程"）：
-//   1) 把内嵌的 musl ELF（objcopy 出的 _binary_build64_musl_hello_elf_*，由
-//      tools/musl_build_win.sh 产出）幂等装成 VimtuFS2 的 /musl_hello.elf；
+//   1) 把 musl 静态 ELF 幂等装成 VimtuFS2 的 /musl_hello.elf —— 字节来自系统卷/原始区
+//      （构建期不再内嵌进内核：正常路径 = 卷里已有；空夹具 = 原始区，见 kernel/demo64.h）；
 //   2) 用 proc64_create64 + proc64_start_elf64 建**真进程**（自己的 CR3/任务），由
 //      elf64_load_for_exec64 从**文件系统**读出来装载（打点 [ELF64] load … via=execve）；
 //   3) 有界等待它退出（Proc64Info.state == PROC64_EXITED），收尸 + 打点。
@@ -377,14 +358,15 @@ static int musl64_install64(const char* path) {
         dbg64_line_end64();
         return 0;
     }
-    const int len = (int)(_binary_build64_musl_hello_elf_end - _binary_build64_musl_hello_elf_start);
-    if (len <= 0) {
+    uint32_t len = 0;
+    const uint8_t* blob = demo64_blob_find64(path, &len);
+    if (!blob || len == 0) {
         dbg64_line_begin64();
         dbg64_str("[MUSL64] FAILED reason=blob-empty\n");
         dbg64_line_end64();
         return -1;
     }
-    if (vfs64_write(path, _binary_build64_musl_hello_elf_start, len) != len) {
+    if (vfs64_write(path, blob, (int)len) != (int)len) {
         dbg64_line_begin64();
         dbg64_str("[MUSL64] FAILED reason=install path=");
         dbg64_str(path);
@@ -487,19 +469,12 @@ static void musl64_demo64(const char* path) {
 }
 
 // ==================== ★ A3 下半：动态链接（PT_INTERP）+ FPU/xmm 上下文回归 ====================
-// 四份内嵌产物（build64.sh 里 objcopy 成 .o；符号名按输入路径生成）：
+// 四份产物（构建期不再 objcopy 进内核；交付 = 系统卷里的文件，字节由 tools/demo_pack_win.py
+// 写入 + 逐字节回读自检；空夹具盘则由启动期从"原始区"取字节装进卷 —— 见 kernel/demo64.h）：
 //   ldvimtu.so   我们的动态链接器（装到 /lib/ldvimtu.so）
 //   libfoo.so    演示共享库（装到 /lib/libfoo.so）
 //   dynhello.elf 动态主程序（装到 /dynhello.elf；PT_INTERP = /lib/ldvimtu.so）
 //   xmmsse.elf   FPU/xmm 回归程序（装到 /xmmsse.elf；两个进程同时跑）
-extern "C" const uint8_t _binary_build64_ldvimtu_so_start[];
-extern "C" const uint8_t _binary_build64_ldvimtu_so_end[];
-extern "C" const uint8_t _binary_build64_libfoo_so_start[];
-extern "C" const uint8_t _binary_build64_libfoo_so_end[];
-extern "C" const uint8_t _binary_build64_dynhello_elf_start[];
-extern "C" const uint8_t _binary_build64_dynhello_elf_end[];
-extern "C" const uint8_t _binary_build64_xmmsse_elf_start[];
-extern "C" const uint8_t _binary_build64_xmmsse_elf_end[];
 
 static const char DYNLINK_MAIN64[]  = "/dynhello.elf";
 static const char DYNLINK_LIBDIR64[] = "/lib";
@@ -507,17 +482,9 @@ static const char DYNLINK_INTERP64[] = "/lib/ldvimtu.so";
 static const char DYNLINK_LIB64[]   = "/lib/libfoo.so";
 static const char XMM64_PATH64[]    = "/xmmsse.elf";
 
-// 幂等安装一份内嵌 blob：已存在就 skipped (exists)；目录不存在先建（/lib）
-static int dynlink64_install_file64(const char* path, const uint8_t* p, const uint8_t* e, const char* what) {
-    const int len = (int)(e - p);
-    if (len <= 0) {
-        dbg64_line_begin64();
-        dbg64_str("[DYNLINK] FAILED reason=blob-empty file=");
-        dbg64_str(what);
-        dbg64_str("\n");
-        dbg64_line_end64();
-        return -1;
-    }
+// 幂等安装一份产物：卷里已存在就 skipped (exists)；没有就从"原始区"取字节装进去
+// （内核二进制里一个字节都没有这些产物 —— 见 kernel/demo64.h）。
+static int dynlink64_install_file64(const char* path, const char* what) {
     uint32_t ty = 0, sz = 0;
     if (vfs64_stat(path, &ty, &sz) == 0) {
         dbg64_line_begin64();
@@ -529,7 +496,17 @@ static int dynlink64_install_file64(const char* path, const uint8_t* p, const ui
         dbg64_line_end64();
         return 0;
     }
-    if (vfs64_write(path, p, len) != len) {
+    uint32_t len = 0;
+    const uint8_t* blob = demo64_blob_find64(path, &len);
+    if (!blob || len == 0) {
+        dbg64_line_begin64();
+        dbg64_str("[DYNLINK] FAILED reason=blob-empty file=");
+        dbg64_str(what);
+        dbg64_str("\n");
+        dbg64_line_end64();
+        return -1;
+    }
+    if (vfs64_write(path, blob, (int)len) != (int)len) {
         dbg64_line_begin64();
         dbg64_str("[DYNLINK] FAILED reason=write path=");
         dbg64_str(path);
@@ -551,9 +528,9 @@ static int dynlink64_install_file64(const char* path, const uint8_t* p, const ui
 static int dynlink64_install64() {
     (void)vfs64_mkdir64(DYNLINK_LIBDIR64);        // 已存在 -> 返回非 0，无所谓
     int rc = 0;
-    rc |= dynlink64_install_file64(DYNLINK_INTERP64, _binary_build64_ldvimtu_so_start, _binary_build64_ldvimtu_so_end, "ldvimtu.so");
-    rc |= dynlink64_install_file64(DYNLINK_LIB64, _binary_build64_libfoo_so_start, _binary_build64_libfoo_so_end, "libfoo.so");
-    rc |= dynlink64_install_file64(DYNLINK_MAIN64, _binary_build64_dynhello_elf_start, _binary_build64_dynhello_elf_end, "dynhello.elf");
+    rc |= dynlink64_install_file64(DYNLINK_INTERP64, "ldvimtu.so");
+    rc |= dynlink64_install_file64(DYNLINK_LIB64, "libfoo.so");
+    rc |= dynlink64_install_file64(DYNLINK_MAIN64, "dynhello.elf");
     return rc;
 }
 
@@ -663,7 +640,7 @@ static void fpu64_demo64(const char* path) {
         dbg64_line_end64();
         return;
     }
-    if (dynlink64_install_file64(p, _binary_build64_xmmsse_elf_start, _binary_build64_xmmsse_elf_end, "xmmsse.elf") != 0) return;
+    if (dynlink64_install_file64(p, "xmmsse.elf") != 0) return;
     if (!proc64_isolate64()) {
         dbg64_line_begin64();
         dbg64_str("[TASK64] fpu demo skipped (shared address space mode)\n");
@@ -723,12 +700,14 @@ static void fpu64_demo64(const char* path) {
 // 为什么在 kernel64.cpp：这两段是**启动期演示**（幂等装卷 + 建进程 + 有界等待 + 打点），
 //   与其它演示（/proc64.elf、/evshm.elf、/musl_hello.elf）同一条纪律：
 //   * 信号逻辑本身在 kernel/sig64.cpp；这里只负责"跑起来 + 看结果"；
-//   * /sig64.elf 的字节是**内嵌 blob**（objcopy，build64.sh 段），启动期幂等装进系统卷；
+//   * /sig64.elf 的字节**不在内核里**（交付 = 系统卷里的文件 /sig64.elf；空夹具盘时从
+//     构建期"原始区"取字节装进卷 —— 见 kernel/demo64.h）；
 //   * /bin/edit **不进内核镜像**（卷里的文件，tools/edit_pack_win.py 写的）—— 内核只按路径
 //     去卷里找，找不到就如实打一行 skipped（绝大多数夹具盘没有它）。
 static int sig64_install64(const char* path) {
-    const uint32_t bytes = (uint32_t)(_binary_build64_sig64_elf_end - _binary_build64_sig64_elf_start);
-    if (bytes < 64) { dbg64_str("[SIG64] install FAILED reason=blob\n"); return -1; }
+    uint32_t bytes = 0;
+    const uint8_t* blob = demo64_blob_find64(path, &bytes);
+    if (!blob || bytes < 64) { dbg64_str("[SIG64] install FAILED reason=blob\n"); return -1; }
     const int sys = vfs64_system_slot64();
     if (sys < 0) { dbg64_str("[SIG64] install FAILED reason=system-slot\n"); return -1; }
     uint32_t t = 0, sz = 0;
@@ -742,7 +721,7 @@ static int sig64_install64(const char* path) {
         dbg64_line_end64();
         return 0;
     }
-    const int w = vfs64_write_on64(sys, path, _binary_build64_sig64_elf_start, (int)bytes);
+    const int w = vfs64_write_on64(sys, path, blob, (int)bytes);
     if (w != (int)bytes) { dbg64_str("[SIG64] install FAILED reason=write\n"); return -1; }
     dbg64_line_begin64();
     dbg64_str("[SIG64] install ok path=");
@@ -947,6 +926,31 @@ static void rust64_boot_init64() {
     dbg64_line_end64();
 }
 
+// ==================== ★ 本批：直接跑的演示 blob（从"原始区"取字节）====================
+// 四份"直接跑"的演示程序（demo64 / hello_c / libctest_c / fbdemo）的字节已搬出内核二进制：
+// 交付 = 系统卷里的 /bin/*.bin（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
+// 启动期这里从构建期"原始区"取字节（见 kernel/demo64.h）—— 空夹具盘也照跑，找不到就如实 skipped。
+//   kind: 0 = user64_run_blob64（只读代码页，汇编版 demo64）
+//         1 = user64_run_capp64（可写代码页，C 版程序）
+//         2 = user64_run_fbdemo64（A1 汇编版绘图）
+//         3 = user64_run_fbdemo_capp64（A2 C 版绘图）
+static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
+    uint32_t sz = 0;
+    const uint8_t* b = demo64_blob_find64(path, &sz);
+    if (!b || sz == 0) {
+        dbg64_line_begin64();
+        dbg64_str("[USER64] demo skipped (no blob in raw region) path=");
+        dbg64_str(path);
+        dbg64_nl();
+        dbg64_line_end64();
+        return;
+    }
+    if (kind == 0)      (void)user64_run_blob64(b, sz, name);
+    else if (kind == 1) (void)user64_run_capp64(b, sz, name);
+    else if (kind == 2) (void)user64_run_fbdemo64(b, sz);
+    else                (void)user64_run_fbdemo_capp64(b, sz);
+}
+
 [[noreturn]] static void os_boot_path(const BootInfo* bi) {
     dbg64_str("[OS] booted from installed disk (system kernel, no installer)");
     dbg64_nl();
@@ -996,26 +1000,18 @@ static void rust64_boot_init64() {
     //   cr2=固件 PML4）。所以那种情况下**整段 ring3 演示跳过**并只打一行说明，绝不假装成功。
     if (user64_available64()) {
         (void)user64_selftest64();              // 用户页/帧/选择子自检 -> [USER64] selftest PASS
-        {
-            const uint64_t blob_sz = (uint64_t)(_binary_build64_user_demo64_bin_end -
-                                                _binary_build64_user_demo64_bin_start);
-            (void)user64_run_blob64(_binary_build64_user_demo64_bin_start, (uint32_t)blob_sz, "demo64");
-        }
+        // ★ 本批（演示程序搬进系统卷）：四份"直接跑"的演示程序（demo64 / hello_c / libctest_c /
+        //   fbdemo）的字节**不再内嵌**内核二进制 —— 交付 = 系统卷里的 /bin/*.bin
+        //   （tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；启动期这里按路径从
+        //   构建期"原始区"取字节跑（见 kernel/demo64.h，空夹具盘也照跑；坏/缺就如实 skipped）。
+        k64_run_raw_demo64("/bin/demo64.bin", "demo64", 0);
         // ---- ★ A2：**C 写的**用户程序（我们自己的最小 libc + 自有 ABI 包装）----
         //   位置：紧跟 demo64、在 fbdemo 之前 —— 两个程序只打串口证据、不碰屏幕，所以不会挤掉
         //   下面 fbdemo 的像素证据窗口（tests/fbmap64_test.py 按 [FBDEMO] 同步抓屏）。
         //   入口用 user64_run_capp64：C 程序有**可写**的 .data/.bss（errno / printf 行缓冲 /
         //   malloc 竞技场），必须把代码页映射成可写（见 kernel/usermode64.cpp 的说明）。
-        {
-            const uint64_t hello_sz = (uint64_t)(_binary_build64_user_hello_bin_end -
-                                                 _binary_build64_user_hello_bin_start);
-            (void)user64_run_capp64(_binary_build64_user_hello_bin_start, (uint32_t)hello_sz, "hello_c");
-        }
-        {
-            const uint64_t libc_sz = (uint64_t)(_binary_build64_user_libctest_bin_end -
-                                                _binary_build64_user_libctest_bin_start);
-            (void)user64_run_capp64(_binary_build64_user_libctest_bin_start, (uint32_t)libc_sz, "libctest_c");
-        }
+        k64_run_raw_demo64("/bin/hello_c.bin", "hello_c", 1);
+        k64_run_raw_demo64("/bin/libctest_c.bin", "libctest_c", 1);
         // ---- ★ A1/A2：用户态绘图演示（ring3 自己把画面画到屏幕上；内核只映射显存 + 提交区域）----
         //   位置：紧跟 demo64（同一个"用户窗口可用"分支）；顺序上在 app64/elf64/proc64 演示之前，
         //   这样启动期的像素证据（tests/fbmap64_test.py）落在屏幕还没被别的阶段重画的时候。
@@ -1024,19 +1020,11 @@ static void rust64_boot_init64() {
         //   ★ A2 起默认跑 **C 版**（user/apps/fbdemo.c，构建期编成 blob；见 build64.sh 的
         //     VIMTU_USER_FBDEMO 开关）；VIMTU_USER_FBDEMO_ASM=1 的构建改跑 A1 的汇编版
         //     （user/fbdemo.asm）。两版的可观测行为逐条一致（对照表见 user/apps/fbdemo.c 顶部）。
-        {
 #if VIMTU_USER_FBDEMO_ASM
-            const uint64_t fb_blob_sz = (uint64_t)(_binary_build64_user_fbdemo64_bin_end -
-                                                  _binary_build64_user_fbdemo64_bin_start);
-            (void)user64_run_fbdemo64(_binary_build64_user_fbdemo64_bin_start, (uint32_t)fb_blob_sz);
+        k64_run_raw_demo64("/bin/fbdemo64.bin", "fbdemo64", 2);
 #else
-            const uint64_t fb_blob_sz = (uint64_t)(_binary_build64_user_fbdemo_bin_end -
-                                                  _binary_build64_user_fbdemo_bin_start);
-            // C 版走同一个"关内核绘制 -> ring3 画屏 -> 恢复"的入口（user64_run_fbdemo_capp64 与
-            // user64_run_fbdemo64 的差别只有 blob 的代码页可写性，见 usermode64.cpp）。
-            (void)user64_run_fbdemo_capp64(_binary_build64_user_fbdemo_bin_start, (uint32_t)fb_blob_sz);
+        k64_run_raw_demo64("/bin/fbdemo_c.bin", "fbdemo_c", 3);
 #endif
-        }
     } else {
         dbg64_line_begin64();
         dbg64_str("[USER64] ring3 demos skipped (user window unavailable on this boot path)\n");

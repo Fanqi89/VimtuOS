@@ -16,10 +16,10 @@
 #include "ata64.h"      // 挂载前读 MBR，按安装器同一条规则找 type=0x07 分区
 #include "debug64.h"
 
-// 内嵌的 hello.vap（build64.sh：nasm -> tools/make_vap.py -> objcopy -I binary 嵌进内核）。
-// 符号名由 objcopy 按输入路径生成：_binary_build64_hello_vap_start/_end（从仓库根执行才稳定）。
-extern "C" const uint8_t _binary_build64_hello_vap_start[];
-extern "C" const uint8_t _binary_build64_hello_vap_end[];
+// ★ 本批（演示程序搬进系统卷）：hello.vap 的字节**不在内核里** ——
+//   交付 = 系统卷里的 /hello.vap（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
+//   启动期的"幂等装卷"只在卷里没有时从构建期"原始区"取字节（空夹具盘的情形，见 kernel/demo64.h）。
+#include "demo64.h"
 
 static const uint8_t VAP64_MAGIC64[8] = { 'V', 'A', 'P', '6', '4', 0, 0, 0 };
 static const char    VAP64_INSTALL_PATH64[] = "/hello.vap";
@@ -174,11 +174,12 @@ uint32_t app64_main_part_lba64(int drive) {
     return PART_MAIN_LBA;
 }
 
-// ==================== 安装器（幂等）====================
+// ==================== 安装器（幂等；字节在系统卷/原始区，不在内核里）====================
 int app64_install_builtin64(int drive, uint32_t part_lba) {
-    const uint32_t bytes = (uint32_t)(_binary_build64_hello_vap_end - _binary_build64_hello_vap_start);
+    uint32_t bytes = 0;
+    const uint8_t* blob = demo64_blob_find64(VAP64_INSTALL_PATH64, &bytes);
     Vap64FileInfo vi;
-    if (vap64_parse(_binary_build64_hello_vap_start, bytes, &vi) != VAP64_OK) {
+    if (!blob || bytes == 0 || vap64_parse(blob, bytes, &vi) != VAP64_OK) {
         dbg64_line_begin64();
         dbg64_str("[APP64] install FAILED reason=blob\n");
         dbg64_line_end64();
@@ -213,7 +214,7 @@ int app64_install_builtin64(int drive, uint32_t part_lba) {
         return 0;
     }
 
-    const int w = vfs64_write_on64(sys, VAP64_INSTALL_PATH64, _binary_build64_hello_vap_start, (int)bytes);
+    const int w = vfs64_write_on64(sys, VAP64_INSTALL_PATH64, blob, (int)bytes);
     if (w != (int)bytes) {
         dbg64_line_begin64();
         dbg64_str("[APP64] install FAILED reason=write\n");
@@ -389,15 +390,22 @@ int app64_selftest64() {
         if (vap64_parse(buf, n, &vi) != VAP64_OK) fail |= 16;
     }
 
-    // ---- bit5：内嵌 hello.vap 的头部自校验（名字/CRC/entry_offset/代码指针）----
+    // ---- bit5：交付给系统卷的 hello.vap 头部自校验（名字/CRC/entry_offset/代码指针）----
+    //   ★ 本批：字节不在内核里了 —— 从构建期"原始区"取（见 kernel/demo64.h）；取不到就跳过
+    //     这一位（构建期已有"探针/回读"两道断言）。
     {
-        const uint32_t blob_n = (uint32_t)(_binary_build64_hello_vap_end - _binary_build64_hello_vap_start);
-        if (vap64_parse(_binary_build64_hello_vap_start, blob_n, &vi) != VAP64_OK) {
+        uint32_t blob_n = 0;
+        const uint8_t* vblob = demo64_blob_find64(VAP64_INSTALL_PATH64, &blob_n);
+        if (!vblob || blob_n == 0) {
+            dbg64_line_begin64();
+            dbg64_str("[APP64] selftest bit5 skipped (no hello.vap in blob region)\n");
+            dbg64_line_end64();
+        } else if (vap64_parse(vblob, blob_n, &vi) != VAP64_OK) {
             fail |= 32;
         } else {
             if (!vap_bytes_eq(vi.name, (const uint8_t*)"hello", 6)) fail |= 32;
             if (vi.code_size == 0 || vi.entry_offset != VAP64_HEADER_SIZE64 + 6u) fail |= 32;
-            if (vi.code != _binary_build64_hello_vap_start + vi.entry_offset) fail |= 32;
+            if (vi.code != vblob + vi.entry_offset) fail |= 32;
             if (vap_crc32(vi.code, vi.code_size) != vi.code_crc) fail |= 32;
         }
     }

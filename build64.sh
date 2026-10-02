@@ -58,9 +58,11 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 #   -DPROC64_UEFI_CR3_EXPERIMENT=1。用法：VIMTU_EXTRA_CXXFLAGS=-DPROC64_UEFI_CR3_EXPERIMENT=1 bash build64.sh
 # ★ 版本号**唯一真源**（发布时只改这一行）：编译期宏 VIMTUOS_VERSION_STR 进两份内核，
 #   设置页"关于"（kernel/settings64.cpp）与串口打点都从这里取值（未定义时内核打 unknown）。
-# ★ 本批（版本串收口）：发布标签 v0.4.0-beta17 与镜像内嵌串**从此一致** —— 上一批的发布正文
-#   如实记录过"标签 0.4.0-beta17 vs 内嵌串 0.3.4-beta16"这一项未勾，改的就是这一行。
-VIMTUOS_VERSION="0.4.0-beta17"
+# ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
+#   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
+#   空夹具盘由构建期"原始区"（build64/demo64_raw.bin，写进 system.img 的 LBA 7497 起）兜底。
+#   内核二进制里只剩路径/偏移/长度表（kernel/demo64.h），本文件末尾有 64B 探针断言。
+VIMTUOS_VERSION="0.4.2-beta19"
 CXXFLAGS="$CXXFLAGS -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\""
 CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
 #
@@ -324,30 +326,25 @@ bash gui_rs/build_rs.sh
 
 echo "==> 用户态演示程序（真实 ring3 代码：nasm 平铺二进制 -> objcopy 嵌入内核）"
 # user/demo64.asm 是**用户态**程序（ring3，用 int 0x80 与内核通信），不是内核代码：
-#   nasm 出平铺二进制 -> objcopy 变 elf64 目标文件 -> 链进两份内核（成本很低）。
-#   符号名由 objcopy 的输入路径决定，usermode64.cpp 里按 _binary_build64_user_demo64_bin_* 引用。
+#   ★ 本批：nasm 只出平铺二进制 build64/user_demo64.bin —— **不再 objcopy 进内核**；
+#   交付 = 系统卷 /bin/demo64.bin（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检），
+#   空夹具盘由"原始区"兜底（见 kernel/demo64.h）。内核里一个字节都没有它的本体。
 $NASM -f bin user/demo64.asm -o "$BUILD/user_demo64.bin"
-$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/user_demo64.bin" "$BUILD/user_demo64.o"
-cp "$BUILD/user_demo64.o" "$BUILD/os/user_demo64.o"
-echo "==> A1 用户态绘图演示（ring3 自己画屏：nasm -f bin -> objcopy 嵌入内核）"
+echo "==> A1 用户态绘图演示（ring3 自己画屏：nasm -f bin -> 交付 = 系统卷 /bin/fbdemo64.bin）"
 # user/fbdemo.asm 是 ring3 程序，走 int 0x80 自有 ABI 的 fb_map(9) / fb_flip(10) / fb_present(11)：
-#   平铺二进制 -> objcopy -> 链进**两份**内核（安装介质内核也链，成本 ~2KB；调用点在系统内核的
-#   os_boot_path，见 kernel/kernel64.cpp 的 user64_run_fbdemo64()）。
-#   符号名由 objcopy 按输入路径生成：_binary_build64_user_fbdemo64_bin_*。
+#   平铺二进制**不内嵌内核**：交付 = 系统卷 /bin/fbdemo64.bin（调用点见 kernel/kernel64.cpp
+#   的 k64_run_raw_demo64；同时 /bin/fbdemo_c.bin 是默认的 C 版）。
 $NASM -f bin user/fbdemo.asm -o "$BUILD/user_fbdemo64.bin"
-$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/user_fbdemo64.bin" "$BUILD/user_fbdemo64.o"
-cp "$BUILD/user_fbdemo64.o" "$BUILD/os/user_fbdemo64.o"
 
 echo "==> ★ A2：用户态 **C** 程序交叉编译（我们自己的最小 libc + 自有 ABI 包装；clang + lld）"
 # 见 user/build_user.sh（编译/链接的全部细节与每条选项的理由都在那里）与
 # docs/应用层与系统调用说明.md 的"用户态 C 运行时（A2）"节。这里做两件事：
 #   1) 把 user/apps/*.c 编成 build64/user_<name>.elf（静态 ELF64）+ build64/user_<name>.bin（平铺 blob）；
-#   2) objcopy 成 elf64 目标文件，**只链进系统内核**（安装介质内核不跑这些程序，别为它们付体积）。
-# 符号名由 objcopy 按输入路径生成：_binary_build64_user_<name>_bin_start/_end。
-# ★ 体积纪律：默认三个 blob 合计 ~25KB（单条上限 8 页 = 32768B，见 user/build_user.sh 的 MAX_BLOB）；
-#   用户态代码只以内嵌 blob 的形式存在这一份，不额外拷进内核代码段。
+#   2) ★ 本批：**不再 objcopy 进内核** —— 交付 = 系统卷 /bin/<name>_c.bin（demo_pack_win.py 写入），
+#      空夹具盘由"原始区"兜底（见 kernel/demo64.h）。内核里一个字节都没有这些程序的本体。
+# ★ 体积纪律：单条上限 8 页 = 32768B（见 user/build_user.sh 的 MAX_BLOB）。
 # ★ 默认集：hello（hello world）、libctest（printf 子集 + malloc 压力）、fbdemo（C 版 A1 演示）；
-#   VIMTU_USER_FBDEMO=asm 时 fbdemo 换回 A1 汇编版（user/fbdemo.asm），C 版就不再链进内核。
+#   VIMTU_USER_FBDEMO=asm 时 fbdemo 换回 A1 汇编版（user/fbdemo.asm）。
 if [ "${VIMTU_USER_FBDEMO:-c}" = "asm" ]; then
     VIMTU_USER_APPS="${VIMTU_USER_APPS:-hello libctest}"
 else
@@ -355,11 +352,7 @@ else
 fi
 for app in $VIMTU_USER_APPS; do
     bash user/build_user.sh "$app" "$BUILD"
-done
-for app in $VIMTU_USER_APPS; do
-    $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/user_${app}.bin" "$BUILD/user_${app}_cblob.o"
-    cp "$BUILD/user_${app}_cblob.o" "$BUILD/os/"
-    echo "    内嵌 C 用户程序：user/apps/$app.c -> $BUILD/user_${app}.bin（$(stat -c%s "$BUILD/user_${app}.bin") B）"
+    echo "    演示程序（卷交付）：user/apps/$app.c -> $BUILD/user_${app}.bin（$(stat -c%s "$BUILD/user_${app}.bin") B）"
 done
 
 echo "==> ★ A4-1：ring3 shell（**交付 = 系统卷里的 /bin/shell.bin**，不内嵌内核）"
@@ -377,35 +370,26 @@ echo "==> ★ A3：musl 静态程序（third_party/musl 的 libc.a；编译/链�
 # 见 tools/musl_build_win.sh 与 docs/应用层与系统调用说明.md 的"musl（A3 第一步）"节：
 #   * 该脚本用 **musl 自己的头文件 + musl 的 lib/libc.a + 自写 _start + tools/musl_hello64.ld**
 #     链出 build64/musl_hello.elf（静态 ELF64，钉在用户窗口 4GiB 起、无 PT_INTERP/无重定位）；
-#   * 只内嵌进**系统内核**（安装介质内核不跑用户程序）；objcopy 的符号名按输入路径生成：
-#     _binary_build64_musl_hello_elf_start/_end（kernel/kernel64.cpp 引用，启动期装进 VimtuFS2
-#     再从盘上读出来、作为**真进程**进 ring3 —— 见 musl64_demo64）。
-# ★ 体积代价（如实记账）：内嵌进 kernel64_os.bin 的就是 musl_hello.elf 的全部字节
-#   （排在内核代码段之后的 .rodata 里，不进 .bss、不进安装程序内核）。实测约 30 KB 量级，
-#   构建输出里有精确值；内核上限仍是 4MB（KERNEL_SECTORS=8000），另受图标包区间约束。
+#   * ★ 本批：**不再内嵌进内核** —— 交付 = 系统卷 /musl_hello.elf（tools/demo_pack_win.py
+#     构建期写入 + 逐字节回读自检），空夹具盘由"原始区"兜底（见 kernel/demo64.h）。
+#     启动期由 kernel64.cpp 的 musl64_install64() 保证它在卷里，再从盘上读出来、作为
+#     **真进程**进 ring3 —— 见 musl64_demo64。
+# ★ 体积记账（本批）：这份 blob 已**不在** kernel64_os.bin 里（构建输出里有精确值）。
 bash tools/musl_build_win.sh "$BUILD/musl_hello.elf"
-# ★ A3 下半（体积）：**内嵌前**去掉符号表。内核装载器只按程序头表读 p_offset 拷字节，.symtab/
-#   .strtab/.shstrtab 一个字节都用不到 —— 但它们也是内嵌字节的一部分（musl 静态 ELF 的符号表
-#   约 9 KB）。本批要把动态链接三件套 + FPU 回归程序塞进**同一份**系统内核，而内核二进制已经顶到
-#   图标包区间的边界（build64.sh 结尾的断言）；这一步换来 ~9 KB 余量，行为零变化
-#   （musl64_test 只断言 16384 < install bytes < 65536，见 tools/musl_build_win.sh 里那份自检
-#   照旧跑在 strip **之前**：它只解析 ELF 头/程序头）。
+# ★ A3 下半（体积）：写卷前去掉符号表 —— 卷里那份只按程序头表装载，.symtab/.strtab/.shstrtab
+#   一个字节都用不到（musl 静态 ELF 的符号表约 9 KB）；musl64_test 只断言 16384 < size < 65536，
+#   tools/musl_build_win.sh 里那份自检照旧跑在 strip **之前**（它只解析 ELF 头/程序头）。
 $OBJCOPY --strip-all "$BUILD/musl_hello.elf"
-$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/musl_hello.elf" "$BUILD/os/musl_hello_elf.o"
-echo "    内嵌 musl 程序：$BUILD/musl_hello.elf = $(stat -c%s "$BUILD/musl_hello.elf") B（musl libc.a 静态链接；已 strip 符号表）"
+echo "    演示程序（卷交付）：$BUILD/musl_hello.elf = $(stat -c%s "$BUILD/musl_hello.elf") B（musl libc.a 静态链接；已 strip 符号表）"
 echo "==> ★ A3 下半：动态链接（我们自己的 ld.so + libfoo.so + dynhello.elf；构建期自检见脚本）"
 # 见 tools/dynlink_build_win.sh 与 docs/应用层与系统调用说明.md 的"A3 下半：动态链接"节：
 #   * 三份产物都**不塞进**用户窗口的 64KiB 装载区，而是启动期由内核幂等装进 VimtuFS2：
 #       /lib/ldvimtu.so（解释器） /lib/libfoo.so（共享库） /dynhello.elf（动态主程序）；
-#   * 只内嵌进**系统内核**（安装介质不跑用户程序）；objcopy 的符号名按输入路径生成：
-#       _binary_build64_ldvimtu_so_start / _binary_build64_libfoo_so_start /
-#       _binary_build64_dynhello_elf_start（kernel/kernel64.cpp 引用）。
-#   * 体积代价：三份合计约 45 KB（构建输出里有精确值）；FPU/xmm 回归程序再 ~5 KB。
+#   * ★ 本批：**不再内嵌进内核** —— 交付 = 系统卷里的 /lib/ldvimtu.so、/lib/libfoo.so、
+#     /dynhello.elf（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；空夹具盘由
+#     "原始区"兜底（见 kernel/demo64.h）。
 bash tools/dynlink_build_win.sh "$BUILD"
-for b in ldvimtu.so libfoo.so dynhello.elf; do
-    $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/$b" "$BUILD/os/$(echo "$b" | tr '.' '_').o"
-done
-echo "    内嵌动态链接产物：$(stat -c%s "$BUILD/ldvimtu.so") + $(stat -c%s "$BUILD/libfoo.so") + $(stat -c%s "$BUILD/dynhello.elf") = $(( $(stat -c%s "$BUILD/ldvimtu.so") + $(stat -c%s "$BUILD/libfoo.so") + $(stat -c%s "$BUILD/dynhello.elf") )) B"
+echo "    演示程序（卷交付）：$(stat -c%s "$BUILD/ldvimtu.so") + $(stat -c%s "$BUILD/libfoo.so") + $(stat -c%s "$BUILD/dynhello.elf") = $(( $(stat -c%s "$BUILD/ldvimtu.so") + $(stat -c%s "$BUILD/libfoo.so") + $(stat -c%s "$BUILD/dynhello.elf") )) B"
 
 echo "==> ★ A4-2b：TinyCC（**交付 = 系统卷里的 /tcc + /bin/tcc + /lib/tcc.bin**，内核里一个字节都不加）"
 # 为什么这样交付（内核区只剩 ~187 KB；tcc 是 280 KB 量级的编译器）：
@@ -436,36 +420,29 @@ bash tools/gzip_build_win.sh "$BUILD"
 echo "==> ★ A3 下半：FPU/xmm 上下文回归程序（user/xmmsse.asm；两个进程同时跑）"
 # 见 user/xmmsse.asm 顶部说明：同一份 ELF 起两个真进程、各自核对 16 个 xmm 是否被对方污染。
 # 链接脚本 user/xmmsse_elf64.ld（不是 hello_elf64.ld）：本程序只有 FPU 回归、没有段权限断言，
-# 而这段字节要**内嵌进系统内核**（objcopy），所以贴紧排布 + --strip-all —— 9456 B -> 约 2.3 KB。
+# 所以贴紧排布 + --strip-all —— 9456 B -> 约 2.3 KB。★ 本批：这份字节**不内嵌内核**，
+# 交付 = 系统卷 /xmmsse.elf（tools/demo_pack_win.py 写入 + 逐字节回读自检；空夹具盘走"原始区"）。
 # 安全性依据（装载器不做页同余检查、同页复用物理页）写在那个脚本的头部注释里。
 $NASM -f elf64 user/xmmsse.asm -o "$BUILD/xmmsse.o"
 $LD -m elf_x86_64 --strip-all -T user/xmmsse_elf64.ld -o "$BUILD/xmmsse.elf" "$BUILD/xmmsse.o"
-$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/xmmsse.elf" "$BUILD/xmmsse_elf.o"
-cp "$BUILD/xmmsse_elf.o" "$BUILD/os/"
-echo "    内嵌 FPU 回归程序：$BUILD/xmmsse.elf = $(stat -c%s "$BUILD/xmmsse.elf") B"
-echo "==> 可安装应用示例（VAP64：nasm -> tools/make_vap.py -> objcopy 嵌入系统内核）"
+echo "    演示程序（卷交付）：$BUILD/xmmsse.elf = $(stat -c%s "$BUILD/xmmsse.elf") B"
+echo "==> 可安装应用示例（VAP64：nasm -> tools/make_vap.py；交付 = 系统卷 /hello.vap）"
 # user/hello64.asm 是 ring3 程序；tools/make_vap.py 给它加 32B VAP64 头（含代码段 CRC32）；
-# objcopy 把整个 .vap 嵌进内核，app64.cpp 启动时把它装进 VimtuFS2 的 /hello.vap，再从盘上读出来跑。
-# 符号名由 objcopy 按输入路径生成：_binary_build64_hello_vap_start/_end（从仓库根执行才稳定）。
+# ★ 本批：整个 .vap **不内嵌内核**（app64.cpp 启动时保证它在 VimtuFS2 的 /hello.vap 里，
+# 再从盘上读出来跑；空夹具盘回落到构建期"原始区"）。
 
-echo "==> 多进程演示程序（批次 C：fork/execve/wait4/kill；只嵌进系统内核）"
+echo "==> 多进程演示程序（批次 C：fork/execve/wait4/kill；交付 = 系统卷文件）"
 # user/proc64.asm 是 ring3 程序，用 syscall 指令；链接脚本复用 user/hello_elf64.ld
 # （把映像钉在用户窗口 4GiB 起、低于 USER64_STACK_VA64 —— elf64.cpp 会拒绝越界的 PT_LOAD）。
-# proc64.cpp 幂等把它装成 VimtuFS2 的 /proc64.elf，再由 proc64_demo64() 以 init 进程跑起来。
-# 符号名由 objcopy 按输入路径生成：_binary_build64_proc64_elf_start/_end。
+# proc64.cpp 保证它装成 VimtuFS2 的 /proc64.elf，再由 proc64_demo64() 以 init 进程跑起来。
 $NASM -f elf64 user/proc64.asm -o "$BUILD/proc64.o"
 $LD -m elf_x86_64 --strip-all -T user/hello_elf64.ld -o "$BUILD/proc64.elf" "$BUILD/proc64.o"
-$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/proc64.elf" "$BUILD/proc64_elf.o"
-cp "$BUILD/proc64_elf.o" "$BUILD/os/"
-echo "==> pipe64：ring3 管道演示（批次 D：fork 后父子各持一端；只嵌**系统内核**）"
+echo "==> pipe64：ring3 管道演示（批次 D：fork 后父子各持一端；交付 = 系统卷文件）"
 # user/pipe64.asm 用 syscall 指令走 Linux ABI：pipe(22)/fork(57)/read(0)/write(1)/close(3)/
-# nanosleep(35)/wait4(61)/exit(60)。proc64.cpp 幂等把它装成 /pipe64.elf，再由
+# nanosleep(35)/wait4(61)/exit(60)。proc64.cpp 保证它装成 /pipe64.elf，再由
 # proc64_pipe_demo64() 当成一个真进程跑起来（fork 后子写父读）。
-# 符号名由 objcopy 按输入路径生成：_binary_build64_pipe64_elf_start/_end。
 $NASM -f elf64 user/pipe64.asm -o "$BUILD/pipe64.o"
 $LD -m elf_x86_64 --strip-all -T user/hello_elf64.ld -o "$BUILD/pipe64.elf" "$BUILD/pipe64.o"
-$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/pipe64.elf" "$BUILD/pipe64_elf.o"
-cp "$BUILD/pipe64_elf.o" "$BUILD/os/"
 
 echo "==> ★ A5 前置：/evshm.elf（用户态输入事件投递 + 共享内存缓冲演示；只嵌**系统内核**）"
 # user/apps/evshm_demo.c 用自研 user/lib 编成**静态 ELF64**（链接脚本 user/apps/evshm_demo.ld：
@@ -531,9 +508,7 @@ assert first_off == 0 and phoff + phnum * phentsize <= first_filesz, "程序头�
 assert len(d) <= 96 * 1024, "文件超过内核读盘缓冲 96 KiB"
 print("    evshm.elf 自检 OK：entry=0x%x phnum=%d segs=%d size=%d B" % (entry, phnum, nload, len(d)))
 PYEVSHM
-$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/evshm.elf" "$BUILD/evshm_elf.o"
-cp "$BUILD/evshm_elf.o" "$BUILD/os/"
-echo "    内嵌 /evshm.elf = $(stat -c%s "$BUILD/evshm.elf") B（静态 ELF64，装载区 4GiB；proc64.cpp 幂等装进系统卷）"
+echo "    演示程序（卷交付）：$BUILD/evshm.elf = $(stat -c%s "$BUILD/evshm.elf") B（静态 ELF64；proc64.cpp 保证它在系统卷 /evshm.elf 里）"
 
 echo "==> ★ A5：/wlclient.elf（Wayland 基础骨架的 ring3 客户端；只嵌**系统内核**）"
 # user/apps/wlclient.c 用自研 user/lib 编成**静态 ELF64**（链接脚本复用 user/apps/evshm_demo.ld：
@@ -662,52 +637,47 @@ PYWM
     echo "    /bin/$app.elf <- build64/$app.elf = $(stat -c%s "$BUILD/$app.elf") B（**不内嵌**，卷交付）"
 done
 
-echo "==> ★ A4-5：信号投递演示程序（user/apps/sig64_demo.c -> build64/sig64.elf -> **内嵌系统内核**）"
+echo "==> ★ A4-5：信号投递演示程序（user/apps/sig64_demo.c -> build64/sig64.elf -> **卷交付**）"
 # 交付方式与 /evshm.elf 完全同构（复用同一批 user/lib 目标文件 EVSHM_OBJS，只是多编一个 .c）：
-# 静态 ELF64（链接脚本 user/apps/evshm_demo.ld）-> objcopy 平铺字节嵌进**系统内核** ->
-# 启动期由 kernel64.cpp 的 sig64_demo64() 幂等装进系统卷 /sig64.elf -> 以**真进程**跑
-# （它要 fork + signal + wait4 + 用户态异常，blob 路径没有进程上下文）。
-# 体积记账：这份 blob 只进**系统内核**（安装介质内核不链 proc64/elf64，也没有这些演示）。
+# 静态 ELF64（链接脚本 user/apps/evshm_demo.ld）-> **不内嵌内核**；
+# 交付 = 系统卷 /sig64.elf（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检），
+# 空夹具盘由"原始区"兜底；启动期由 kernel64.cpp 的 sig64_demo64() 保证它装进系统卷再以
+# **真进程**跑（它要 fork + signal + wait4 + 用户态异常，blob 路径没有进程上下文）。
+# 体积记账（本批）：这份 blob 已**不在** kernel64_os.bin 里。
 SIG64_DIR="$BUILD/uapps/sig64"
 mkdir -p "$SIG64_DIR"
 clang $EVSHM_UCFLAGS -c user/apps/sig64_demo.c -o "$SIG64_DIR/sig64_demo.o"
 $LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/apps/evshm_demo.ld \
     -o "$BUILD/sig64.elf" $EVSHM_OBJS "$SIG64_DIR/sig64_demo.o"
-$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/sig64.elf" "$BUILD/sig64_elf.o"
-cp "$BUILD/sig64_elf.o" "$BUILD/os/"
-echo "    内嵌 /sig64.elf = $(stat -c%s "$BUILD/sig64.elf") B（静态 ELF64；kernel64.cpp 幂等装进系统卷再跑）"
+echo "    演示程序（卷交付）：$BUILD/sig64.elf = $(stat -c%s "$BUILD/sig64.elf") B（静态 ELF64；kernel64.cpp 保证它在系统卷 /sig64.elf 里）"
 $NASM -f bin user/hello64.asm -o "$BUILD/hello64.bin"
 "$PY" tools/make_vap.py "$BUILD/hello64.bin" "$BUILD/hello.vap" hello
-$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/hello.vap" "$BUILD/hello_vap64.o"
-cp "$BUILD/hello_vap64.o" "$BUILD/os/hello_vap64.o"
+echo "    /hello.vap = $(stat -c%s "$BUILD/hello.vap") B（**不内嵌**：交付 = 系统卷 /hello.vap）"
 
-echo "==> 真正的 ELF64 可执行程序（nasm -f elf64 -> ld.lld -T -> objcopy 嵌入系统内核）"
+echo "==> 真正的 ELF64 可执行程序（nasm -f elf64 -> ld.lld -T；交付 = 系统卷 /hello.elf）"
 # user/hello_elf64.asm 是 ring3 程序，用 **syscall 指令**（Linux ABI）与内核通信；
 # user/hello_elf64.ld 把映像钉在用户窗口（4GiB 起、低于 USER64_STACK_VA64）——
 # elf64.cpp 会拒绝越出用户窗口的 PT_LOAD，所以链接地址不能随便放。
-# 只嵌进**系统内核**：安装介质不带 ELF64 加载器（SRCS_OS 才有 kernel/elf64.cpp）。
-# 符号名由 objcopy 按输入路径生成：_binary_build64_hello_elf_start/_end（从仓库根执行才稳定）。
+# ★ 本批：**不内嵌内核**（安装介质不带 ELF64 加载器，系统内核也不再带它的字节）；
+# 空夹具盘由"原始区"兜底（见 kernel/demo64.h）。
 $NASM -f elf64 user/hello_elf64.asm -o "$BUILD/hello_elf64.o"
 $LD -m elf_x86_64 -T user/hello_elf64.ld -o "$BUILD/hello.elf" "$BUILD/hello_elf64.o"
-$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/hello.elf" "$BUILD/hello_elf64_elf.o"
-cp "$BUILD/hello_elf64_elf.o" "$BUILD/os/"
-
+echo "    /hello.elf = $(stat -c%s "$BUILD/hello.elf") B（**不内嵌**：交付 = 系统卷 /hello.elf）"
 echo "==> spin64：长命用户程序（终端 proc run 用；任务管理器进程页 / proc64 kill 的验证目标）"
-# user/spin64.asm 打印 pid 后每 1 秒 nanosleep，永不退出；只嵌进**系统内核**（终端在系统内核里）。
-# 符号名：_binary_build64_spin64_elf_start/_end（terminal64.cpp 的 `proc run spin` 用它装到 /spin.elf）。
+# user/spin64.asm 打印 pid 后每 1 秒 nanosleep，永不退出；★ 本批：**不内嵌内核** ——
+# 交付 = 系统卷 /spin.elf（tools/demo_pack_win.py 写入）；空夹具盘由"原始区"兜底，
+# terminal64.cpp 的 `proc run spin` 与启动期 slotreuse 演示共用这一份。
 $NASM -f elf64 user/spin64.asm -o "$BUILD/spin64.o"
 $LD -m elf_x86_64 --strip-all -T user/hello_elf64.ld -o "$BUILD/spin64.elf" "$BUILD/spin64.o"
-$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/spin64.elf" "$BUILD/spin64_elf.o"
-cp "$BUILD/spin64_elf.o" "$BUILD/os/"
+echo "    /spin.elf = $(stat -c%s "$BUILD/spin64.elf") B（**不内嵌**：交付 = 系统卷 /spin.elf）"
 
-echo "==> filedemo64：ring3 读文件演示（open /t.txt -> read -> write；只嵌**系统内核**）"
+echo "==> filedemo64：ring3 读文件演示（open /t.txt -> read -> write；交付 = 系统卷 /filedemo.elf）"
 # user/filedemo64.asm 用 syscall 指令走 Linux ABI：open(2)/read(0)/write(1)/close(3)/exit(60)。
-# 符号名：_binary_build64_filedemo64_elf_start/_end（terminal64.cpp 开终端时幂等装到 /filedemo.elf，
-# 终端 `run filedemo` 即可跑；批次 B 的 syscall open/read/close 接真 FD 层的证据）。
+# terminal64.cpp 开终端时保证它在卷里（终端 `run filedemo` 即可跑；批次 B 的 syscall
+# open/read/close 接真 FD 层的证据）。
 $NASM -f elf64 user/filedemo64.asm -o "$BUILD/filedemo64.o"
 $LD -m elf_x86_64 --strip-all -T user/hello_elf64.ld -o "$BUILD/filedemo64.elf" "$BUILD/filedemo64.o"
-$OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/filedemo64.elf" "$BUILD/filedemo64_elf.o"
-cp "$BUILD/filedemo64_elf.o" "$BUILD/os/"
+echo "    /filedemo.elf = $(stat -c%s "$BUILD/filedemo64.elf") B（**不内嵌**：交付 = 系统卷 /filedemo.elf）"
 
 echo "==> AP 跳板（SMP：nasm 平铺二进制 -> objcopy 嵌入**系统内核**）"
 # kernel/ap_trampoline64.asm 由 BSP 原字节拷到物理 0x8000，再由 SIPI（向量 0x08）拉起 AP：
@@ -718,20 +688,19 @@ $NASM -f bin kernel/ap_trampoline64.asm -o "$BUILD/ap_trampoline64.bin"
 $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 "$BUILD/ap_trampoline64.bin" "$BUILD/ap_trampoline64.o"
 cp "$BUILD/ap_trampoline64.o" "$BUILD/os/ap_trampoline64.o"
 echo "    AP 跳板 = $(stat -c%s "$BUILD/ap_trampoline64.bin") 字节（按 0x8000 汇编）"
+# ★ 本批（演示程序搬进系统卷）：不再有 user_fbdemo64.o —— 汇编版 fbdemo 的字节也走
+#   /bin/fbdemo64.bin（构建期装卷；VIMTU_USER_FBDEMO=asm 时内核从"原始区"取它来跑）。
+#   所以系统内核的链接行里这一项恒为空（保留变量名让链接行读起来还是同一套结构）。
+ASM_FBDEMO_OBJ=""
+echo "==> ★ 本批：演示程序 blob 打包（原始区 + 内核偏移表；内核里只有元数据，0 字节本体）"
+# 顺序：所有演示 blob 都已编完（上面）-> 拼"原始区"（dd 进 system.img 的内核区尾部）+ 生成
+# kernel/demo64.h 需要的偏移表 -> 编译 kernel/demo64.cpp。
+# ★ 只有这一个目标文件需要 -I"$BUILD"（它 include 构建期生成的 demo64_blobtab.h）。
+"$PY" tools/demo_pack_win.py --build "$BUILD" \
+      --raw "$BUILD/demo64_raw.bin" --header "$BUILD/demo64_blobtab.h"
+$CXX -c kernel/demo64.cpp -o "$BUILD/demo64.o" $CXXFLAGS -I"$BUILD"
+echo "      kernel/demo64.cpp -> $BUILD/demo64.o（路径/偏移/长度表；blob 本体 0 字节）"
 
-# ★ A4-1 的体积抵消（"删/搬等价量的内核代码"这条纪律）：默认配置（VIMTU_USER_FBDEMO=c）下，
-#   A1 的**汇编版** fbdemo blob（user_fbdemo64.bin = 1313 B）在系统内核里是**死字节** ——
-#   kernel64.cpp 只在 VIMTU_USER_FBDEMO_ASM=1 时引用 `_binary_build64_user_fbdemo64_bin_*`
-#   （见 kernel/kernel64.cpp 的 #if VIMTU_USER_FBDEMO_ASM 段），而 build64.sh 也只在 asm 配置下
-#   排除 C 版（VIMTU_USER_APPS）。本批把这份死字节从**系统内核**的链接行里去掉，正好用来抵消
-#   A4-1 的 ring3 shell 新增内核字节（见报告里的改前/改后对比）；asm 配置照旧包含它。
-#   安装介质内核的链接行**不动**（它没有图标包区间的体积约束）。
-ASM_FBDEMO_OBJ="$BUILD/os/user_fbdemo64.o"
-if [ "${VIMTU_USER_FBDEMO:-c}" = "asm" ]; then
-    :
-else
-    ASM_FBDEMO_OBJ=""
-fi
 echo "==> 链接两个内核"
 $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel64.o "$BUILD"/console64.o "$BUILD"/x86_64.o \
     "$BUILD"/fb.o "$BUILD"/font.o "$BUILD"/input.o "$BUILD"/input64.o "$BUILD"/mem64.o "$BUILD"/ata64.o "$BUILD"/part64.o "$BUILD"/setup64.o \
@@ -742,7 +711,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
     "$BUILD"/virtio_gpu64.o \
     "$BUILD"/display64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o \
-    "$BUILD"/user_demo64.o "$BUILD"/user_fbdemo64.o "$BUILD"/font_*_z.o "$BUILD"/icon_start_mini.o
+    "$BUILD"/demo64.o "$BUILD"/font_*_z.o "$BUILD"/icon_start_mini.o
 $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 
 $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
@@ -756,20 +725,15 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
     "$BUILD/os"/theme64.o "$BUILD/os"/gfx64.o "$BUILD/os"/img64.o \
     "$BUILD/os"/locklogin64.o "$BUILD/os"/userdb64.o \
-    "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o "$BUILD/os"/evshm_elf.o "$BUILD/os"/sig64_elf.o \
     "$BUILD/os"/wl64.o \
     "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o \
     "$BUILD/os"/icons64.o \
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
-    "$BUILD/os"/musl_hello_elf.o \
-    "$BUILD/os"/ldvimtu_so.o "$BUILD/os"/libfoo_so.o "$BUILD/os"/dynhello_elf.o "$BUILD/os"/xmmsse_elf.o \
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/hda64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
-    "$BUILD/os"/hello_vap64.o \
-    "$BUILD/os"/user_demo64.o $ASM_FBDEMO_OBJ "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
-    "$BUILD/os"/user_*_cblob.o \
+    "$BUILD"/demo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
     "$BUILD/os"/kaisi_png.o "$BUILD/os"/iconpack_bin.o
 $OBJCOPY -O binary "$BUILD/kernel64_os.elf" "$BUILD/kernel64_os.bin"
 
@@ -816,16 +780,11 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
         "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
         "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/cr3exp/proc64.o" \
-        "$BUILD/os"/hello_elf64_elf.o "$BUILD/os"/proc64_elf.o "$BUILD/os"/spin64_elf.o "$BUILD/os"/filedemo64_elf.o "$BUILD/os"/pipe64_elf.o "$BUILD/os"/evshm_elf.o "$BUILD/os"/sig64_elf.o \
         "$BUILD/os"/wl64.o \
-        "$BUILD/os"/musl_hello_elf.o \
-        "$BUILD/os"/ldvimtu_so.o "$BUILD/os"/libfoo_so.o "$BUILD/os"/dynhello_elf.o "$BUILD/os"/xmmsse_elf.o \
         "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/hda64.o \
         "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
-        "$BUILD/os"/hello_vap64.o \
-        "$BUILD/os"/user_demo64.o "$BUILD/os"/user_fbdemo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
-        "$BUILD/os"/user_*_cblob.o \
-        "$BUILD/os"/kaisi_png.o "$BUILD/os"/iconpack_bin.o   # ★ 收口修：图标包也是内嵌对象（与系统内核链接行一致，见上面第 306/706 行）
+        "$BUILD"/demo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
+        "$BUILD/os"/kaisi_png.o "$BUILD/os"/iconpack_bin.o   # ★ 收口修：图标包也是内嵌对象（与系统内核链接行一致）
     $OBJCOPY -O binary "$BUILD/kernel64_os_cr3exp.elf" "$BUILD/kernel64_os_cr3exp.bin"
     echo "实验内核 OK. $BUILD/kernel64_os_cr3exp.bin = $(stat -c%s "$BUILD/kernel64_os_cr3exp.bin") bytes"
 fi
@@ -835,6 +794,27 @@ dd if=/dev/zero of="$BUILD/system.img" bs=512 count="$SYS_SECTORS" status=none
 dd if="$BUILD/boot.bin"        of="$BUILD/system.img" conv=notrunc status=none
 dd if="$BUILD/loader64.bin"    of="$BUILD/system.img" seek=1 conv=notrunc status=none
 dd if="$BUILD/kernel64_os.bin" of="$BUILD/system.img" seek="$KERNEL_LBA" conv=notrunc status=none
+
+# ---- ★ 本批：演示程序 blob 的"原始区"（见 kernel/demo64.h / tools/demo_pack_win.py）----
+#   写进内核区尾部（LBA 7497 起）—— loader 会把整个内核区（LBA 9..8008）平铺加载到物理
+#   0x100000（BIOS 的 int13/atapi 与两条 UEFI 路径都是"读满 4MB"），所以内核按物理直映
+#   就能读到它；内核二进制里只有路径/偏移/长度表（0 字节 blob 本体）。
+#   两道断言：内核二进制末尾不许压到原始区起点；原始区不许越出内核区尾。
+DEMO64_RAW_LBA=7497
+DEMO64_RAW_BYTES=$(stat -c%s "$BUILD/demo64_raw.bin")
+KERNEL_OS_SECTORS=$(( (OSSZ + 511) / 512 ))
+DEMO64_RAW_SECTORS=$(( (DEMO64_RAW_BYTES + 511) / 512 ))
+if [ "$(( KERNEL_LBA + KERNEL_OS_SECTORS ))" -gt "$DEMO64_RAW_LBA" ]; then
+    echo "ERROR: 系统内核（$OSSZ B = $KERNEL_OS_SECTORS 扇区）压到演示程序原始区起点（LBA $DEMO64_RAW_LBA）" >&2
+    exit 1
+fi
+if [ "$DEMO64_RAW_SECTORS" -gt "$(( KERNEL_LBA + KERNEL_SECTORS - DEMO64_RAW_LBA ))" ]; then
+    echo "ERROR: 演示程序原始区 $DEMO64_RAW_BYTES B（$DEMO64_RAW_SECTORS 扇区）超出内核区尾部" >&2
+    exit 1
+fi
+dd if="$BUILD/demo64_raw.bin" of="$BUILD/system.img" seek="$DEMO64_RAW_LBA" conv=notrunc status=none
+DEMO64_RAW_PHYS=$((0x100000 + (DEMO64_RAW_LBA - KERNEL_LBA) * 512))
+echo "    演示程序原始区：$DEMO64_RAW_BYTES B -> system.img LBA $DEMO64_RAW_LBA 起（内核区尾部；内核侧按物理 0x$(printf '%X' "$DEMO64_RAW_PHYS") 直映读）"
 
 # ---- ★ A4-2a：图标包已**搬进 VimtuFS2 系统卷**（内核区尾部不再预留、也不再写入 dd）。----
 #      改动前：内核区尾部 LBA 7497..8008 被图标包区间占住 -> 系统内核只能用 7,488 扇区
@@ -862,14 +842,56 @@ echo "    内核区（图标包搬走后）：LBA $KERNEL_LBA..$((KERNEL_LBA + K
 echo "                            系统内核 $OSSZ B / $KERNEL_OS_SECTORS 扇区（余 $((KERNEL_AREA_BYTES - OSSZ)) B；改动前上限 7,488 扇区 = $((7488 * 512)) B）"
 echo "    图标包：$ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）**内嵌进系统内核** -> 启动期装进系统卷 /icons/pack.bin（运行期 src=vfs）"
 KERNEL_FREE_BYTES=$((KERNEL_AREA_BYTES - OSSZ))
-echo "    资源外置（本批）：5 份 raw 图标/logo 合计 356,992 B 搬进系统卷 /etc（tools/assets_pack_win.py）；"
-echo "                            系统内核 3,726,496 B -> $OSSZ B（省 356,992 B 内嵌资源，另加 2,304 B 开始按钮 mip）；"
-echo "                            余量 $KERNEL_FREE_BYTES B = $((KERNEL_FREE_BYTES / 1024)) KiB（本批目标 ≥ 700 KiB = 716,800 B）"
+echo "    演示程序外置（本批）：18 份演示 blob（合计 $DEMO64_RAW_BYTES B 含对齐）搬出内核二进制；"
+echo "                            交付 = 系统卷文件（tools/demo_pack_win.py 写入 + 逐字节回读自检）；"
+echo "                            空夹具兜底 = 内核区尾部的演示程序原始区（LBA $DEMO64_RAW_LBA 起，内核里只有偏移表）；"
+echo "                            系统内核 3,436,080 B -> $OSSZ B；余量 $KERNEL_FREE_BYTES B = $((KERNEL_FREE_BYTES / 1024)) KiB（本批目标 ≥ 750 KiB = 768,000 B）"
+
+# ★ 本批的硬证据：18 份演示 blob 在**两份内核二进制**里都搜不到
+#   （搬移是不是"真搬"就看这一条：哪天有人把 blob 塞回内核，这里必红）。
+#   探针取"高熵 64B 窗口"（扫全图挑不同字节值最多的窗口）—— 纯零/同色填充的中段探针
+#   会因为内核里本来就有大片同样字节而假命中（实测 hello.elf 的中段就是一片 0）；
+#   小文件（<= 4 KiB）直接查**整份文件**是否在内核里（最硬的一条）。
+"$PY" - <<'PYDEMO64'
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("demo_pack_win", "tools/demo_pack_win.py")
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+kernels = [("kernel64.bin（安装程序内核）", open("build64/kernel64.bin", "rb").read()),
+           ("kernel64_os.bin（系统内核）", open("build64/kernel64_os.bin", "rb").read())]
+bad = 0
+for path, name, _mode in m.BLOBS:
+    b = open(os.path.join("build64", name), "rb").read()
+    whole = len(b) <= 4096                       # 小文件：整份比对（比探针硬）
+    if whole:
+        probe, off, nv = b, 0, len(set(b))
+    else:
+        best_off, best_n = -1, -1
+        for off in range(0, max(1, len(b) - 64), 32):
+            win = b[off:off + 64]
+            n = len(set(win))
+            if n > best_n:
+                best_n, best_off = n, off
+        probe, off, nv = (b[best_off:best_off + 64], best_off, best_n) if best_off >= 0 else (b"", -1, -1)
+    ok = False
+    for kn, k in kernels:
+        hit = (probe in k) if probe else False
+        if whole:
+            hit = hit or (b in k)
+        if hit:
+            sys.stderr.write("ERROR: %s 里搜得到 %s 的%s（偏移 %d）—— 演示程序没搬干净\n"
+                             % (kn, name, "整份字节" if whole else "64B 高熵探针", off))
+            bad = 1
+    print("    断言 OK：%-22s %s（%s）在两份内核二进制里都搜不到"
+          % (name, "整份 %d B" % len(b) if whole else "64B 高熵探针@%-6d 不同字节值 %d" % (off, nv),
+             path))
+raise SystemExit(bad)
+PYDEMO64
 
 echo "==> ★ A4-1：带 /bin/shell.bin 的演示盘 + \"内核里没有 shell 字节\"断言"
 # system.img 已经装好 -> 把它 + MBR + 主分区（= 带 /bin/shell.bin 的 VimtuFS2 v4 卷）拼成
 # 一块能直接启动的盘：build64/sysdisk.img（验收脚本 tests/sh64_test.py 也用它做夹具）。
-# ★ A4-2b / A4-4：造盘 = **三步串起来**（每步都逐字节回读自检，谁都不重写别人那棵树）：
+# ★ A4-2b / A4-4：造盘 = **多步串起来**（每步都逐字节回读自检，谁都不重写别人那棵树）：
 #   1) tools/tcc_pack_win.py：同一块卷里装进 /bin/tcc（驱动）、/lib/tcc.bin（tcc 本体）、
 #      /tcc/**（libtcc1.a + 系统头 + crt/libc）、/tcc/demo/*.c、/hello（宿主版 tcc 产物）；
 #   2) tools/lua_pack_win.py：在那块卷上再加 /bin/lua + /lib/lua.bin + /tcc/demo/*.lua（★ A4-4a）；
@@ -1254,6 +1276,22 @@ echo "    /bin/drvdemo = $DRVDEMO_SZ B（静态 ELF64；由 tools/drvdemo_pack_w
 if [ -f "$BUILD/drvdemo.elf" ] && [ -f "$BUILD/tarvol.img" ]; then
     "$PY" tools/drvdemo_pack_win.py --vol-in "$BUILD/tarvol.img" --vol-out "$BUILD/drvsvcvol.img" \
           --drvdemo "$BUILD/drvdemo.elf" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+fi
+
+# ★ 本批（演示程序搬进系统卷）：卷链的**最后一步** —— 把 18 份演示程序写进同一块系统卷
+#   （/hello.elf、/musl_hello.elf、/sig64.elf、/evshm.elf、/lib/ldvimtu.so、/lib/libfoo.so、
+#    /dynhello.elf、/xmmsse.elf、/proc64.elf、/pipe64.elf、/spin.elf、/filedemo.elf、/hello.vap、
+#    /bin/demo64.bin、/bin/hello_c.bin、/bin/libctest_c.bin、/bin/fbdemo_c.bin、/bin/fbdemo64.bin），
+#   并用这卷重拼演示盘 build64/sysdisk.img（前面 drvdemo 那一步的产物一个字节不动：
+#   读 drvsvcvol.img -> 写 demovol.img）。
+#   工具写完**逐字节回读自检**；内核二进制里搜不到这些字节（上面那条 64B 探针断言）。
+echo "==> ★ 本批：演示程序写进系统卷（18 份；内核里 0 字节）+ 重拼 sysdisk.img"
+if [ -f "$BUILD/drvsvcvol.img" ]; then
+    "$PY" tools/demo_pack_win.py --build "$BUILD" --vol-in "$BUILD/drvsvcvol.img" \
+          --vol-out "$BUILD/demovol.img" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+else
+    echo "ERROR: 缺少 $BUILD/drvsvcvol.img（卷链上一步没跑成）—— 演示程序没装进系统卷" >&2
+    exit 1
 fi
 
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"

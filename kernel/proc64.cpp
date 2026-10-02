@@ -28,20 +28,14 @@
 #include "fd64.h"           // 批次 D：每进程 fd 表（fdtab）+ 引用计数对象（fork/execve/退出都要用）
 #include "memlayout64.h"    // ML64_PML4_PHYS（引导期页表自证用）
 #include "mem_64.h"         // page_alloc_64 / page_free_64 / PTE_*
-#include "debug64.h"
+#include "debug64.h"      // dbg64_* 打点
+#include "demo64.h"       // ★ 本批：演示程序 blob 的"原始区"查找（只有元数据，没有字节）
 
-// 内嵌的 /pipe64.elf（批次 D：ring3 pipe 演示 —— fork 后父子各持一端通信）
-extern "C" const uint8_t _binary_build64_pipe64_elf_start[];
-extern "C" const uint8_t _binary_build64_pipe64_elf_end[];
+// ★ 本批（演示程序搬进系统卷）：/proc64.elf、/pipe64.elf、/evshm.elf 的字节**不在内核里** ——
+//   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
+//   启动期的"幂等装卷"只在卷里没有时从构建期"原始区"取字节（空夹具盘的情形，见 kernel/demo64.h）。
 static const char PROC64_PIPE_PATH64[] = "/pipe64.elf";
-// 内嵌的 /proc64.elf（build64.sh：nasm -f elf64 -> ld.lld -static -> objcopy -I binary 嵌进系统内核）。
-extern "C" const uint8_t _binary_build64_proc64_elf_start[];
-extern "C" const uint8_t _binary_build64_proc64_elf_end[];
 static const char PROC64_PATH64[] = "/proc64.elf";
-
-// ★ A5 前置：内嵌的 /evshm.elf（ring3 演示：shm_create -> 画 -> fb_flip -> 循环 input_poll）
-extern "C" const uint8_t _binary_build64_evshm_elf_start[];
-extern "C" const uint8_t _binary_build64_evshm_elf_end[];
 static const char PROC64_EVSHM_PATH64[] = "/evshm.elf";
 
 // ---- errno（与 syscall64.cpp 的 Linux 号段同一套数值）----
@@ -1788,10 +1782,11 @@ int proc64_alarm_set64(int sec) {
     return prev;
 }
 
-// ==================== 内嵌 /proc64.elf 的幂等安装 ====================
+// ==================== /proc64.elf 的幂等安装（字节在系统卷/原始区，不在内核里）====================
 int proc64_install_builtin64(int drive, uint32_t part_lba) {
-    const uint32_t bytes = (uint32_t)(_binary_build64_proc64_elf_end - _binary_build64_proc64_elf_start);
-    if (bytes < 64 || !elf64_blob_ok64(_binary_build64_proc64_elf_start, bytes)) {
+    uint32_t bytes = 0;
+    const uint8_t* blob = demo64_blob_find64(PROC64_PATH64, &bytes);
+    if (!blob || bytes < 64 || !elf64_blob_ok64(blob, bytes)) {
         p64_log2("[PROC64] install FAILED reason=blob path=/proc64.elf", "");
         return -1;
     }
@@ -1814,7 +1809,7 @@ int proc64_install_builtin64(int drive, uint32_t part_lba) {
         dbg64_line_end64();
         return 0;
     }
-    const int w = vfs64_write_on64(sys, PROC64_PATH64, _binary_build64_proc64_elf_start, (int)bytes);
+    const int w = vfs64_write_on64(sys, PROC64_PATH64, blob, (int)bytes);
     if (w != (int)bytes) { p64_log2("[PROC64] install FAILED reason=", "write"); return -1; }
     dbg64_line_begin64();
     dbg64_str("[PROC64] install ok path=/proc64.elf bytes=");
@@ -1825,8 +1820,9 @@ int proc64_install_builtin64(int drive, uint32_t part_lba) {
     // ★ 批次 D：顺手把 ring3 pipe 演示程序（/pipe64.elf）也幂等装进去 —— 同一套"blob 校验 +
     //   幂等跳过 + 真写盘"的路径，避免再写一份几乎相同的函数。
     {
-        const uint32_t pbytes = (uint32_t)(_binary_build64_pipe64_elf_end - _binary_build64_pipe64_elf_start);
-        if (pbytes < 64 || !elf64_blob_ok64(_binary_build64_pipe64_elf_start, pbytes)) {
+        uint32_t pbytes = 0;
+        const uint8_t* pblob = demo64_blob_find64(PROC64_PIPE_PATH64, &pbytes);
+        if (!pblob || pbytes < 64 || !elf64_blob_ok64(pblob, pbytes)) {
             p64_log2("[PROC64] install FAILED reason=blob path=/pipe64.elf", "");
             return -1;
         }
@@ -1837,7 +1833,7 @@ int proc64_install_builtin64(int drive, uint32_t part_lba) {
             dbg64_nl();
             dbg64_line_end64();
         } else {
-            const int w2 = vfs64_write_on64(sys, PROC64_PIPE_PATH64, _binary_build64_pipe64_elf_start, (int)pbytes);
+            const int w2 = vfs64_write_on64(sys, PROC64_PIPE_PATH64, pblob, (int)pbytes);
             if (w2 != (int)pbytes) { p64_log2("[PROC64] install FAILED reason=", "write(/pipe64.elf)"); return -1; }
             dbg64_line_begin64();
             dbg64_str("[PROC64] install ok path=/pipe64.elf bytes=");
@@ -1908,10 +1904,12 @@ int proc64_pipe_demo64(const char* path) {
 //   -> 父进程 input_poll(12)（带 FOCUS|CAPTURE）循环收键鼠事件并计数。
 // 内核这侧只做：幂等装卷 + 建进程 + 有界等待 + 页池基线核对 + 收尾 + 打点。
 //
-// 幂等安装（与 /proc64.elf、/pipe64.elf 同一条路径：blob 校验 + 存在即跳过 + 真写盘）
+// 幂等安装（与 /proc64.elf、/pipe64.elf 同一条路径：blob 校验 + 存在即跳过 + 真写盘）；
+// 字节来自系统卷/构建期"原始区"（内核二进制里没有 —— 见 kernel/demo64.h）。
 int proc64_evshm_install64(int drive, uint32_t part_lba) {
-    const uint32_t bytes = (uint32_t)(_binary_build64_evshm_elf_end - _binary_build64_evshm_elf_start);
-    if (bytes < 64 || !elf64_blob_ok64(_binary_build64_evshm_elf_start, bytes)) {
+    uint32_t bytes = 0;
+    const uint8_t* blob = demo64_blob_find64(PROC64_EVSHM_PATH64, &bytes);
+    if (!blob || bytes < 64 || !elf64_blob_ok64(blob, bytes)) {
         p64_log2("[EVSHM] install FAILED reason=blob path=/evshm.elf", "");
         return -1;
     }
@@ -1929,7 +1927,7 @@ int proc64_evshm_install64(int drive, uint32_t part_lba) {
         dbg64_nl(); dbg64_line_end64();
         return 0;
     }
-    const int w = vfs64_write_on64(sys, PROC64_EVSHM_PATH64, _binary_build64_evshm_elf_start, (int)bytes);
+    const int w = vfs64_write_on64(sys, PROC64_EVSHM_PATH64, blob, (int)bytes);
     if (w != (int)bytes) { p64_log2("[EVSHM] install FAILED reason=", "write(/evshm.elf)"); return -1; }
     dbg64_line_begin64();
     dbg64_str("[EVSHM] install ok path=/evshm.elf bytes=");
