@@ -796,9 +796,9 @@ dd if="$BUILD/loader64.bin"    of="$BUILD/system.img" seek=1 conv=notrunc status
 dd if="$BUILD/kernel64_os.bin" of="$BUILD/system.img" seek="$KERNEL_LBA" conv=notrunc status=none
 
 # ---- ★ 本批：演示程序 blob 的"原始区"（见 kernel/demo64.h / tools/demo_pack_win.py）----
-#   写进内核区尾部（LBA 7497 起）—— loader 会把整个内核区（LBA 9..8008）平铺加载到物理
-#   0x100000（BIOS 的 int13/atapi 与两条 UEFI 路径都是"读满 4MB"），所以内核按物理直映
-#   就能读到它；内核二进制里只有路径/偏移/长度表（0 字节 blob 本体）。
+#   写进内核区尾部（LBA 7497 起）—— 内核 .bss（fb 的 33MB 后备缓冲）盖住了这段物理地址，
+#   所以 kernel/demo64.cpp 是**按 LBA 用 ata64_read 现读**（读一次缓存），不依赖"loader
+#   平铺进内存的那份"。内核二进制里只有路径/偏移/长度表（0 字节 blob 本体）。
 #   两道断言：内核二进制末尾不许压到原始区起点；原始区不许越出内核区尾。
 DEMO64_RAW_LBA=7497
 DEMO64_RAW_BYTES=$(stat -c%s "$BUILD/demo64_raw.bin")
@@ -813,8 +813,7 @@ if [ "$DEMO64_RAW_SECTORS" -gt "$(( KERNEL_LBA + KERNEL_SECTORS - DEMO64_RAW_LBA
     exit 1
 fi
 dd if="$BUILD/demo64_raw.bin" of="$BUILD/system.img" seek="$DEMO64_RAW_LBA" conv=notrunc status=none
-DEMO64_RAW_PHYS=$((0x100000 + (DEMO64_RAW_LBA - KERNEL_LBA) * 512))
-echo "    演示程序原始区：$DEMO64_RAW_BYTES B -> system.img LBA $DEMO64_RAW_LBA 起（内核区尾部；内核侧按物理 0x$(printf '%X' "$DEMO64_RAW_PHYS") 直映读）"
+echo "    演示程序原始区：$DEMO64_RAW_BYTES B -> system.img LBA $DEMO64_RAW_LBA 起（内核区尾部；内核侧按 LBA 用 ata64_read 现读）"
 
 # ---- ★ A4-2a：图标包已**搬进 VimtuFS2 系统卷**（内核区尾部不再预留、也不再写入 dd）。----
 #      改动前：内核区尾部 LBA 7497..8008 被图标包区间占住 -> 系统内核只能用 7,488 扇区

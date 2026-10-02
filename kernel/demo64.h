@@ -4,10 +4,9 @@
 //   演示程序的字节**不再内嵌进内核二进制**（构建期有 64B 探针断言）。正常交付路径是
 //   **系统卷里的同名文件**（tools/demo_pack_win.py 构建期写入，逐字节回读自检）；
 //   而"空夹具盘"（没有卷、或卷里还没有这些文件的盘）需要一个兜底 —— 原始区：
-//     * build64.sh 用 dd 把 build64/demo64_raw.bin 写进 system.img 的 LBA 7497 起；
-//     * loader 把整个内核区（LBA 9..8008 = 8000 扇区 = 4MB）平铺到物理 0x100000
-//       （BIOS 的 int13/atapi 路径与两条 UEFI 路径都是"读满 4MB"），所以内核按
-//       **物理直映**（0..4GB 恒等映射，见 linker64.ld 的说明）就能读到这些字节；
+//     * build64.sh 用 dd 把 build64/demo64_raw.bin 写进 system.img 的 LBA 7497 起
+//       （内核区尾部；loader 也会把这段平铺加载进内存，但内核 .bss —— fb 的 33MB 后备缓冲 ——
+//        盖住了这段物理地址，所以 kernel/demo64.cpp **按 LBA 用 ata64_read 现读**，读一次缓存）；
 //     * 内核二进制里只有构建期生成的偏移表（路径/偏移/长度），字节数为 0 —— 这就是"极小兜底"。
 //
 // ★ 本头文件**不** include 构建期生成的头（demo64_blobtab.h）—— 它只有 kernel/demo64.cpp

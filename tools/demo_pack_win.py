@@ -125,6 +125,8 @@ def do_raw(blobs, raw_path, header_path):
     lines.append("#pragma once")
     lines.append("")
     lines.append("#define DEMO64_RAW_LBA   %d" % DEMO64_RAW_LBA)
+    lines.append("#define DEMO64_RAW_BYTES %d" % off)
+    lines.append("#define DEMO64_RAW_MAX_BYTES %d" % DEMO64_RAW_MAX_BYTES)
     lines.append("#define DEMO64_BLOB_COUNT %d" % len(entries))
     lines.append("static const Demo64BlobEntry64 g_demo64_blobtab64[DEMO64_BLOB_COUNT] = {")
     for path, o, n in entries:
