@@ -23,6 +23,9 @@
          -> 桌面外壳响应（[UI] menu open / [APP] term opened）
          ※ QEMU 的 sendkey 在有 USB 键盘时**只发给 USB 键盘**（实测：`-trace input_event_key_qcode`
            配 `usb_xhci_fetch_trb`；没有 USB 键盘时才走 PS/2）—— 所以"打字"这条链路真的经过 xHCI。
+       * ★ 连续打字（30 键 = 6 条 `ls /`，事件数 > 64 = **跨事件环回卷**）：逐键 [XHCI] hid report
+         的按下/释放边沿都在，每条命令都落到终端（[TERM] cmd ls ok）—— "一次命令之后"不再失效；
+         全程 [XHCI] stray transfer evt = 0（事件环消费 cycle 回卷修复的判据）。键盘挂 xHCI。
        * [XHCI] selftest PASS + [GUI64] ready + kheart 心跳持续增长（kusb 不饿着桌面）
   2) ★ 存储：`-device qemu-xhci -device usb-kbd -device usb-storage`（键盘 + 一根 U 盘）
        * U 盘是 **SuperSpeed** 设备：[XHCI] device addr=1 speed=super mps=512（bMaxPacketSize0=9 是指数编码）
@@ -30,6 +33,9 @@
        * [XHCI] msc READ(10) ok lba=0 count=1 bytes=512 crc=XXXXXXXX head=<16 字节>
          —— **宿主侧逐字节核对**：crc/head 与宿主造的字节逐位比较（不是"看起来成功了"）
        * 盘符：[USBST] storage attached -> rescan … xhci=1、[DRV64] letter=** disk=24 … fs=FAT32
+       * ★ 键盘 + U 盘混跑（键盘就是 xHCI 那把）：先打 `ls /`（存储 I/O 之前可用）-> `vol <U 盘>` 切卷
+         -> `ls /` 读 U 盘 FAT 根目录（entries≥1 = 运行期 xHCI 批量读真跑了）-> 再打 `ls /`
+         （存储 I/O 之后键盘仍可用）；全程 [XHCI] stray transfer evt = 0。
        * U 盘镜像 CRC32 测试前后一致（谁都没写它：本批只读）
   3) 有主控没插设备：`-device qemu-xhci` -> [XHCI] no device on port N + selftest PASS，无 hid report
   4) 没有 xHCI：不加 `-device qemu-xhci` -> [XHCI] not found + selftest skipped，系统照常起桌面
@@ -79,6 +85,27 @@ STICK_TXT = b"xHCI stick (FAT32) read over USB 3.x BOT + SCSI READ(10)\n"
 
 FORBIDDEN = ["PANIC", "TRIPLE FAULT", "FAILED mask=", "frameprobe FAIL",
              "[XHCI] selftest FAIL", "[XHCI] enum FAILED"]
+
+# ---- 终端打字（QEMU sendkey；与 tests/sh64_test.py 同一套键名映射）----
+TYPED_NAMES = {
+    " ": "spc", "/": "slash", ".": "dot", "-": "minus", ">": "shift-dot",
+    "=": "equal", "_": "shift-minus", ":": "shift-semicolon",
+    "<": "shift-comma", "|": "shift-backslash",
+}
+# [XHCI] hid report key=XX 里的 XX = HID 用法码；`ls /` 这条命令用到的 5 个键
+KEY_USAGE = {"l": "0F", "s": "16", "spc": "2C", "slash": "38", "ret": "28"}
+
+
+def type_line(mon, text, per_key=0.35):
+    """逐键 sendkey 打一条终端命令（末尾回车）。键名映射与 sh64/dynlink 测试同一条口径。"""
+    for ch in text:
+        if ch in TYPED_NAMES:
+            mon.key(TYPED_NAMES[ch], wait=per_key)
+        elif ch.isalnum():
+            mon.key(ch, wait=per_key)
+        else:
+            raise ValueError("sendkey 不支持这个字符：%r" % ch)
+    mon.key("ret", wait=per_key + 0.2)
 
 
 def find_qemu(explicit=None):
@@ -370,6 +397,40 @@ def main():
           len(re.findall(r"\[XHCI\] ", log4)) >= 12, "行数=%d" % len(re.findall(r"\[XHCI\] ", log4)))
     for needle in FORBIDDEN:
         check("④ 主跑不得出现 %s" % needle, needle not in log4)
+
+    # ---- ④b ★ 连续打字（30 键 = 6 条 `ls /`；跨事件环 64 项回卷）全部生效 + 零 stray ----
+    #   为什么必须跨回卷：缺陷现象正是"一次命令之后"键盘失效 —— 事件环写满 64 项后消费 cycle
+    #   没翻转，第 65 个事件起全部不可见（还会重读旧条目、打出 stray）。6 条命令 = 30 次按键、
+    #   60+ 个 HID 报告 + 启动期 12 个事件 > 64，必然跨过回卷；任何一次丢键都会让计数少 1。
+    print("--- ④b 连续打字 30 键（6 条 `ls /`，跨事件环回卷）---")
+    mark1 = len(log4)
+    for _ in range(6):
+        type_line(mon, "ls /", per_key=0.35)
+        time.sleep(0.6)
+    log5 = slog()
+    win1 = log5[mark1:]
+    n_ok = len(re.findall(r"\[TERM\] cmd ls ok", win1))
+    check("④b★ 连续 6 条 `ls /` 全部被终端执行（30 键逐键生效）",
+          n_ok >= 6, "[TERM] cmd ls ok 行数=%d" % n_ok)
+    for name, usage in sorted(KEY_USAGE.items()):
+        n_dn = len(re.findall(r"\[XHCI\] hid report key=%s down=1" % usage, win1))
+        n_up = len(re.findall(r"\[XHCI\] hid report key=%s down=0" % usage, win1))
+        check("④b★ 键 %s（HID 0x%s）按下/释放各 %d 次都进了驱动" % (name, usage, 6),
+              n_dn >= 6 and n_up >= 6, "down=1 ×%d down=0 ×%d" % (n_dn, n_up))
+    n_rep = len(re.findall(r"\[XHCI\] hid report key=", win1))
+    check("④b★ 连打期间 HID 报告 ≥ 60（30 键 × 按下/释放；事件数 > 64 已跨回卷）",
+          n_rep >= 60, "报告行数=%d" % n_rep)
+    check("④b★ 连打期间零 [XHCI] stray transfer evt（事件环回卷修复的判据）",
+          "[XHCI] stray transfer evt" not in log5,
+          first_match(r"\[XHCI\] stray[^\r\n]*", log5))
+    n_menu0 = log5.count("[UI] menu open")
+    mon.key("meta_l", wait=1.3)
+    log6 = slog()
+    check("④b★ 连打之后键盘仍活：Win 键再次打开开始菜单（[UI] menu open 计数 +1）",
+          log6.count("[UI] menu open") > n_menu0,
+          "menu open %d -> %d" % (n_menu0, log6.count("[UI] menu open")))
+    hits = [n for n in FORBIDDEN if n in log6]
+    check("④b 连打后 FORBIDDEN 词表零命中", not hits, ("命中：" + ",".join(hits)) if hits else "")
     kill(proc)
 
     # ============================================================ 2) 存储（usb-storage on xHCI）
@@ -431,6 +492,70 @@ def main():
           m_let.group(0) if m_let else first_match(r"\[DRV64\] letter=[^\r\n]*", logm))
     for needle in FORBIDDEN:
         check("⑤ 存储跑不得出现 %s" % needle, needle not in logm)
+
+    # ---- ⑤b ★ xHCI 键盘 + 存储混跑：U 盘运行期读**前后**键盘都能打字 + 零 stray ----
+    #   ("存储操作之前" = 先打一条终端命令；"之后" = vol 切到 U 盘卷、真的读一次 FAT 根目录
+    #    （entries>=1 = 运行期 xHCI 批量传输），再打一条命令。)
+    print("--- ⑤b 键盘（xHCI）+ U 盘运行期读：读写前后都能打字 ---")
+    mon2 = Monitor(port2)
+    opened2 = False
+    for _ in range(6):
+        mon2.key("meta_l", wait=0.9)
+        mon2.key("1", wait=1.8)
+        if "[APP] term opened" in slog2():
+            opened2 = True
+            break
+    check("⑤b★ 存储跑里终端也能打开（键盘就是 xHCI 那把）", opened2,
+          first_match(r"\[APP\] term opened[^\r\n]*", slog2()))
+    if opened2 and m_let:
+        letter = m_let.group(1)
+        mark2 = len(slog2())
+        type_line(mon2, "ls /", per_key=0.35)          # 存储 I/O 之前：键盘先可用
+        dl = time.time() + 40
+        while time.time() < dl and not re.search(r"\[TERM\] cmd ls ok", slog2()[mark2:]):
+            time.sleep(0.3)
+        check("⑤b★ 存储 I/O 之前：`ls /` 被终端执行（键盘先可用）",
+              bool(re.search(r"\[TERM\] cmd ls ok", slog2()[mark2:])),
+              first_match(r"\[TERM\] cmd ls[^\r\n]*", slog2()[mark2:]))
+        # 切到 U 盘卷：vol <letter>（这条命令本身也要键盘逐键打进去）
+        mark3 = len(slog2())
+        type_line(mon2, "vol %s" % letter.lower(), per_key=0.35)
+        dl = time.time() + 40
+        while time.time() < dl and ("[VOL] switch letter=%s:" % letter) not in slog2()[mark3:]:
+            time.sleep(0.3)
+        check("⑤b★ 运行期切到 U 盘卷（[VOL] switch letter=%s:）" % letter,
+              ("[VOL] switch letter=%s:" % letter) in slog2()[mark3:],
+              first_match(r"\[VOL\] switch[^\r\n]*", slog2()[mark3:]))
+        # U 盘根目录（FAT32）：entries>=1/bytes>0 = 运行期真的走了 xHCI 批量读
+        mark4 = len(slog2())
+        type_line(mon2, "ls /", per_key=0.35)
+        dl = time.time() + 60
+        m_ent = None
+        while time.time() < dl:
+            m_ent = re.search(r"\[TERM\] cmd ls entries=(\d+) bytes=(\d+) path=/", slog2()[mark4:])
+            if m_ent and int(m_ent.group(1)) >= 1:
+                break
+            time.sleep(0.3)
+        check("⑤b★ U 盘运行期目录读（entries>=1 bytes>0 = xHCI 批量读真跑了）",
+              bool(m_ent) and int(m_ent.group(1)) >= 1 and int(m_ent.group(2)) > 0,
+              m_ent.group(0) if m_ent else first_match(r"\[TERM\] cmd ls entries=[^\r\n]*",
+                                                       slog2()[mark4:]))
+        # 存储 I/O 之后：再打一条命令，键盘仍生效
+        mark5 = len(slog2())
+        type_line(mon2, "ls /", per_key=0.35)
+        dl = time.time() + 40
+        while time.time() < dl and not re.search(r"\[TERM\] cmd ls ok", slog2()[mark5:]):
+            time.sleep(0.3)
+        check("⑤b★ 存储 I/O 之后：`ls /` 仍被终端执行（键盘在 U 盘读写后可用）",
+              bool(re.search(r"\[TERM\] cmd ls ok", slog2()[mark5:])),
+              first_match(r"\[TERM\] cmd ls[^\r\n]*", slog2()[mark5:]))
+        logm2 = slog2()
+        check("⑤b★ 键盘 + U 盘混跑全程零 [XHCI] stray transfer evt",
+              "[XHCI] stray transfer evt" not in logm2,
+              first_match(r"\[XHCI\] stray[^\r\n]*", logm2))
+        hits2 = [n for n in FORBIDDEN if n in logm2]
+        check("⑤b 混跑后 FORBIDDEN 词表零命中", not hits2,
+              ("命中：" + ",".join(hits2)) if hits2 else "")
     kill(proc2)
     stick_crc1 = zlib.crc32(open(stick, "rb").read()) & 0xFFFFFFFF
     check("⑤★ U 盘镜像测试前后 CRC32 完全一致（本批只读，谁都没写它）",
