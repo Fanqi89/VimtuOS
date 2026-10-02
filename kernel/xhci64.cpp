@@ -472,6 +472,15 @@ static bool evt_next(XhciEvt* ev) {
     ev->control = t->control;
     __asm__ volatile("" ::: "memory");
     g_evt_idx = (g_evt_idx + 1u) & (XHCI_EVT_TRBS - 1u);  // 事件环无 Link TRB：2 的幂掩码回卷
+    // ★ 消费 cycle 必须跟着回卷一起翻转（规范 4.9.1：消费完段里最后一个 TRB 后 CCS 翻转）。
+    //   踩过（这就是"一次命令之后键盘失效"的真因）：原来 g_evt_cycle 恒为 1；硬件写到第 65 个
+    //   事件时在 idx=0 用 cycle=0 落环 —— 消费者于是 (a) 先把环里**上一轮的旧条目**（cycle=1，
+    //   还没被覆盖的 idx 0..k）当成新事件重读，打出 7 条 EP0 完成事件 + 1 条旧 HID 事件的
+    //   "stray transfer evt"；(b) 读到第一个已被覆盖成 cycle=0 的槽就永远停止 —— 之后所有事件
+    //   都看不见，键盘彻底失效。证据：QEMU trace `usb_xhci_queue_event v 0, idx 0, ER_TRANSFER,
+    //   ..., c 0x01038000`（第 65 个事件、cycle 位 0）+ 串口里紧跟 49 条 hid report 之后的 8 条
+    //   stray（旧事件被重读：其中第 2 条 port status change 就是第 2 个事件的旧条目）。
+    if (g_evt_idx == 0u) g_evt_cycle ^= 1u;
     // ERDP 更新（见下面的说明：这里只在真的需要清 EHB 时才写 1）
     {
         const uint64_t erdp = rt_rd64(XHCI_IR_ERDP);
@@ -503,6 +512,13 @@ static void xhci_dispatch(const XhciEvt* ev) {
     const uint32_t slot = (ev->control >> 24) & 0xFFu;
     if (type == EVT_TRANSFER) {
         XhciDev* d = dev_by_slot(slot);
+        const uint32_t dci = (ev->control >> 16) & 0x1Fu;
+        // ★ 完成事件先按 **slot + DCI** 分流：控制/批量传输的完成事件由各自的同步等待按 TRB
+        //   地址配对（超时后迟到的事件在这里丢弃）；这里只认"本设备 HID 中断端点"的事件。
+        //   踩过：原来不区分端点，非 HID 的完成事件（EP0/批量迟到）也会被当成 `stray` 打点
+        //   —— 把"别类事件"误判；而真正的 HID 事件只有在 TRB 指针与已武装 TRB 不一致时才
+        //   算 stray（现在还有事件环消费 cycle 翻转兜底，正常情况下不会出现）。
+        if (d && (d->kbd_dci == 0u || dci != (uint32_t)d->kbd_dci)) return;
         // 对不上"HID 中断端点已武装的那个 TRB"的 Transfer Event：**如实打点**（有界）。
         // 为什么重要：这类事件如果被静默丢掉，现象就是"同步等待永远超时"（踩过：kusb 轮询
         // 提前把启动期枚举的完成事件消费掉了，硬件侧其实全都成功）。有这行就能一眼看出来。
