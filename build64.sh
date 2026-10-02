@@ -950,14 +950,20 @@ k = open(sys.argv[1], "rb").read()
 bad = 0
 for p in sys.argv[2:]:
     b = open(p, "rb").read()
-    mid = len(b) // 2
-    probe = b[mid:mid + 64]
-    if len(probe) < 64 or probe in k:
+    # 高熵探针：小文件（/bin/busybox 13 KB、bbwrap 4.7 KB）的中段是**对齐用的零字节**，
+    # 拿它当探针会假命中（内核里到处都是零）。所以扫全图挑"不同字节值最多"的 64B 窗口。
+    best_off, best_n = -1, -1
+    for off in range(0, max(1, len(b) - 64), 32):
+        n = len(set(b[off:off + 64]))
+        if n > best_n:
+            best_n, best_off = n, off
+    probe = b[best_off:best_off + 64]
+    if len(probe) == 64 and best_n >= 8 and probe in k:
         sys.stderr.write("ERROR: system kernel contains %s bytes (delivery must be a volume file)\n" % p)
         bad = 1
     else:
-        print("    断言 OK：系统内核 %d B 里搜不到 %s 的 64B 探针（偏移 %d）；它只从系统卷装载"
-              % (len(k), p.rsplit("/", 1)[-1], mid))
+        print("    断言 OK：系统内核 %d B 里搜不到 %s 的 64B 高熵探针（偏移 %d，不同字节值 %d）；"
+              "它只从系统卷装载" % (len(k), p.rsplit("/", 1)[-1], best_off, best_n))
 raise SystemExit(bad)
 PYEOF5B
 # 断言（两条，都是"资源真的搬走了"的硬证据）：
@@ -1055,14 +1061,20 @@ k = open(sys.argv[1], "rb").read()
 bad = 0
 for p in sys.argv[2:]:
     b = open(p, "rb").read()
-    mid = len(b) // 2
-    probe = b[mid:mid + 64]
-    if len(probe) < 64 or probe in k:
+    # 高熵探针：小文件（/bin/busybox 13 KB、bbwrap 4.7 KB）的中段是**对齐用的零字节**，
+    # 拿它当探针会假命中（内核里到处都是零）。所以扫全图挑"不同字节值最多"的 64B 窗口。
+    best_off, best_n = -1, -1
+    for off in range(0, max(1, len(b) - 64), 32):
+        n = len(set(b[off:off + 64]))
+        if n > best_n:
+            best_n, best_off = n, off
+    probe = b[best_off:best_off + 64]
+    if len(probe) == 64 and best_n >= 8 and probe in k:
         sys.stderr.write("ERROR: system kernel contains %s bytes (delivery must be a volume file)\n" % p)
         bad = 1
     else:
-        print("    断言 OK：系统内核 %d B 里搜不到 %s 的 64B 探针（偏移 %d）；它只从系统卷装载"
-              % (len(k), p.rsplit("/", 1)[-1], mid))
+        print("    断言 OK：系统内核 %d B 里搜不到 %s 的 64B 高熵探针（偏移 %d，不同字节值 %d）；"
+              "它只从系统卷装载" % (len(k), p.rsplit("/", 1)[-1], best_off, best_n))
 raise SystemExit(bad)
 PYEOF3
 
@@ -1292,6 +1304,42 @@ else
     echo "ERROR: 缺少 $BUILD/drvsvcvol.img（卷链上一步没跑成）—— 演示程序没装进系统卷" >&2
     exit 1
 fi
+
+# ★ 本批：**busybox（静态 musl）+ 装载驱动 + applet 包装程序 + 用户态目录索引** -> 系统卷。
+#   与前面几批同一条体积纪律：交付 = 系统卷里的文件，**内核镜像里一个字节都不加**；
+#   下面用三份交付物各自中段的 64B 探针在内核里搜一遍（搜到就构建失败）。
+#   卷链顺序：读上一步的 demovol.img（没有就退到 drvsvcvol.img / tarvol.img）-> busyboxvol.img，
+#   并用这卷重拼 sysdisk.img。
+echo "==> ★ 本批：busybox（Ring 3 日常工具集）构建 + 装进系统卷 + 重拼 sysdisk.img"
+bash tools/busybox_build_win.sh "$BUILD"
+BB_VOL_IN="$BUILD/demovol.img"
+[ -f "$BB_VOL_IN" ] || BB_VOL_IN="$BUILD/drvsvcvol.img"
+[ -f "$BB_VOL_IN" ] || BB_VOL_IN="$BUILD/tarvol.img"
+"$PY" tools/busybox_pack_win.py --vol-in "$BB_VOL_IN" --vol-out "$BUILD/busyboxvol.img" \
+      --busybox-bin "$BUILD/busybox.bin" --busybox-drv "$BUILD/busybox" --bbwrap "$BUILD/bbwrap" \
+      --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/busybox.bin" "$BUILD/busybox" "$BUILD/bbwrap" <<'PYEOFBB'
+import sys
+k = open(sys.argv[1], "rb").read()
+bad = 0
+for p in sys.argv[2:]:
+    b = open(p, "rb").read()
+    # 高熵探针：小文件（/bin/busybox 13 KB、bbwrap 4.7 KB）的中段是**对齐用的零字节**，
+    # 拿它当探针会假命中（内核里到处都是零）。所以扫全图挑"不同字节值最多"的 64B 窗口。
+    best_off, best_n = -1, -1
+    for off in range(0, max(1, len(b) - 64), 32):
+        n = len(set(b[off:off + 64]))
+        if n > best_n:
+            best_n, best_off = n, off
+    probe = b[best_off:best_off + 64]
+    if len(probe) == 64 and best_n >= 8 and probe in k:
+        sys.stderr.write("ERROR: system kernel contains %s bytes (delivery must be a volume file)\n" % p)
+        bad = 1
+    else:
+        print("    断言 OK：系统内核 %d B 里搜不到 %s 的 64B 高熵探针（偏移 %d，不同字节值 %d）；"
+              "它只从系统卷装载" % (len(k), p.rsplit("/", 1)[-1], best_off, best_n))
+raise SystemExit(bad)
+PYEOFBB
 
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
 "$PY" - "$BUILD/payload_hdr.bin" "$SYS_SECTORS" "$((PAYLOAD_LBA + 1))" <<'PYEOF'
