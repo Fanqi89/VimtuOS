@@ -45,6 +45,7 @@ struct Hda64Info {
     int      amp_mute_cap;          // 1 = 支持静音位（能力字 bit31）
     int      amp_gain_max;          // ★ 修复（①）：0 dB 对应的增益索引（= 100% 写入值；见 hda64.cpp 标定）
     int      volume;                // 当前音量 0..100（最后一次写入值）
+    int      amp_silence;           // ★ 修复（①）：静音时写的增益索引（码器实测的"静音点"；0 = 不用）
     int      muted;                 // 1 = 静音位已置
     uint32_t amp_rb;                // 最后一次 Get Amp Gain 回读（bit7 = mute）
     int      outs;                  // 检测到的输出源个数（0 个时下面 API 会如实返回 1 项说明）

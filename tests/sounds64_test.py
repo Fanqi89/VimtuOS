@@ -162,6 +162,59 @@ def wav_tail(path, max_seconds=12.0, since_off=0):
     pcm = pcm[:(len(pcm) // (2 * ch)) * (2 * ch)]        # 整帧
     return (rate, ch, pcm)
 
+def wav_peak_win(path, since_off):
+    """★ 修复（①）：窗口 [since_off, EOF) 内**整段峰值**（左声道）。
+
+    为什么需要它：修复增益映射后录音**真的有幅度**了，码器在停流后会把最后一个样本当 DC 保持住
+    （实测：一段音与下一段音之间不是真零），于是基于 10ms RMS 包络的"分段"会把相邻段并成一段
+    （wav_runs 的分段在幅度非零后不再可靠）。判定"这一段有没有出声/多大声"用整窗峰值最稳，
+    而且它天然涵盖"任何一点有声音" —— 对静音/音量档位的断言是更强而不是更弱。
+    """
+    hd = wav_record_header(path)
+    if not hd:
+        return 0
+    rate, ch, bits, data_off = hd
+    if bits != 16 or ch <= 0:
+        return 0
+    sz = os.path.getsize(path)
+    start = max(data_off, int(since_off))
+    if sz <= start:
+        return 0
+    with open(path, "rb") as f:
+        f.seek(start)
+        pcm = f.read(sz - start)
+    pcm = pcm[:(len(pcm) // (2 * ch)) * (2 * ch)]
+    peak = 0
+    for k in range(0, len(pcm) // (2 * ch)):
+        v = struct.unpack_from("<h", pcm, k * 2 * ch)[0]
+        a = -v if v < 0 else v
+        if a > peak:
+            peak = a
+    return peak
+
+def wav_settle(path, quiet=0.8, timeout=6.0):
+    """★ 修复（①）：等 wav 后端把已播放的音频**落盘**（文件长度在 quiet 秒内不再增长）再取偏移。
+
+    为什么必须等：QEMU 的 wav 后端写文件比"播放"滞后（实测上一档 100% 的尾巴会在下一档的偏移点
+    之后才落盘）；修复增益后尾巴**真的有幅度**（一万多），会把"静音/0%"阶段误判成有声。
+    """
+    t0 = time.time()
+    last, stable = -1, 0.0
+    while time.time() - t0 < timeout:
+        try:
+            sz = os.path.getsize(path)
+        except OSError:
+            sz = 0
+        if sz == last:
+            stable += 0.2
+            if stable >= quiet:
+                return sz
+        else:
+            stable = 0.0
+            last = sz
+        time.sleep(0.2)
+    return last
+
 
 def wav_runs(path, thr=8, blk_ms=10.0, gap_blocks=5, max_seconds=12.0, since_off=0):
     """把录音尾部的**左声道**做 10 ms RMS 包络，返回非静音区段 [(起块, 止块), …]
@@ -563,7 +616,7 @@ def main():
         time.sleep(0.8)
 
         n0 = len(vm.log())
-        off_a = os.path.getsize(vm.wav) if os.path.exists(vm.wav) else 0
+        off_a = wav_settle(vm.wav) if os.path.exists(vm.wav) else 0
         mon.type_line("elfrun /bin/sounder")
         got_demo = vm.wait_log("SOUNDER demo count=4", 60, since=n0)
         time.sleep(1.2)                      # 等 wav 后端把最后一段写进文件
@@ -658,7 +711,7 @@ def main():
                   len(dur_ratios) == 4 and all(0.5 <= r <= 1.4 for r in dur_ratios),
                   "比值=" + ",".join("%.2f" % r for r in dur_ratios))
         # ★ 修复（①）后的**客观幅度证据**：100% 音量下录音里 4 段有量级的样本（peak >= 3000）
-        maxpk_a = max((meas.get(n, (0, 0))[1] for n in SOUNDS), default=0)
+        maxpk_a = wav_peak_win(vm.wav, off_a)      # ★ 整窗峰值（分段在幅度非零后会被 DC 保持并段）
         check("② 100%% 音量下录音里 4 段**真的有幅度**（段峰值 max=%d >= 3000；素材峰值 %s）"
               % (maxpk_a, [host[n]["peak"] for n in SOUNDS]),
               maxpk_a >= 3000,
@@ -668,7 +721,11 @@ def main():
         print("=== ③ 静音（audio mute on）时播放不应出声 ===")
         mon.type_line("audio mute on")
         vm.wait_log("[HDA64] cmd audio mute applied=1 on=1", 20)
-        off_m = os.path.getsize(vm.wav)
+        # ★ 修复（①）：先用一段**静音下**的 playtone 把上一档（100%）的尾巴从 wav 后端推出去，
+        #   再取偏移 —— 否则窗口里会有上一档的满幅余音（实测会把"静音=无声"的断言误判成有声）。
+        mon.type_line("audio playtone 400")
+        time.sleep(0.8)
+        off_m = wav_settle(vm.wav)
         n1 = len(vm.log())
         mon.type_line("elfrun /bin/sounder")
         got_demo2 = vm.wait_log("SOUNDER demo count=4", 60, since=n1)
@@ -681,12 +738,12 @@ def main():
         check("③ 静音位真写进硬件（[HDA64] mute on=1 … bit=1，回读值 %s）"
               % (mute_rb.group(1) if mute_rb else "（无）"),
               mute_rb is not None and mute_rb.group(2) == "1")
-        loud_m = runs_loud(runs_m, det_m)
-        maxpk_m = max((run_peak(det_m[2], det_m[1], det_m[3], a, b) for a, b in (runs_m or [])), default=0)
-        check("③ 静音下录音里没有**新的有声区段**（峰值 >= 1000 的区段数 = 0）",
-              not loud_m,
-              "有声音段=%s；本阶段录音增量=%d B，最大峰值=%d（素材量级 6000..22000）"
-              % (loud_m if loud_m else "无", delta_m, maxpk_m))
+        # ★ 修复（①）：静音阶段用**整窗峰值**判定（分段法在幅度非零后会因 DC 保持并段；窗口起点=off_m，
+        #   不会把上一档 100% 的声音算进来）
+        maxpk_m = wav_peak_win(vm.wav, off_m)
+        check("③ 静音下录音里没有**新的有声区段**（本阶段整窗峰值 < 1000）",
+              maxpk_m < 1000,
+              "本阶段录音增量=%d B，整窗峰值=%d（素材量级 6000..22000）" % (delta_m, maxpk_m))
         mon.type_line("audio mute off")
         vm.wait_log("[HDA64] cmd audio mute applied=1 on=0", 20)
 
@@ -697,7 +754,7 @@ def main():
         vol100 = last(r"\[HDA64\] volume pct=100 step=(\d+)/(\d+) mute=(\d+) rb=(0x[0-9a-fA-F]+)", vm.log())
         mon.type_line("audio vol 50")
         vm.wait_log("[HDA64] cmd audio vol applied=1 pct=50", 20)
-        off_50 = os.path.getsize(vm.wav)
+        off_50 = wav_settle(vm.wav)
         n2 = len(vm.log())
         mon.type_line("elfrun /bin/sounder")
         vm.wait_log("SOUNDER demo count=4", 60, since=n2)
@@ -716,18 +773,19 @@ def main():
         check("④ 音量 50%% 下播放仍走完（录音增量 %d B，与 100%% 同量级）"
               % delta_50,
               delta_50 > 0 and 0.5 <= (delta_50 / exp_a if exp_a else 0) <= 1.8)
-        maxpk_50 = max((meas50[n][1] for n in meas50), default=0)
-        if runs_50 and meas50:
-            print("     音量 50%%：录音里量到 %d 个区段（peak 最大 %d）" % (len(runs_50), maxpk_50))
-        # ★ 修复（①）后的**幅度单调性**：100% > 50% > 静音（录音里量到的峰值）
+        maxpk_50 = wav_peak_win(vm.wav, off_50)     # ★ 整窗峰值（见 wav_peak_win 的说明）
+        print("     音量 50%%：本阶段整窗峰值 = %d" % maxpk_50)
+        # ★ 修复（①）后的**幅度单调性**：100% > 50% > 静音（都用整窗峰值）
         maxpk_100 = maxpk_a
-        check("④ 幅度单调 100%% > 50%%（peak %d > %d），且 100%% 有量级（>= 3000）"
+        check("④ 幅度单调 100%% > 50%%（整窗峰值 %d > %d），且 100%% 有量级（>= 3000）"
               % (maxpk_100, maxpk_50),
               maxpk_100 >= 3000 and maxpk_100 > maxpk_50)
 
         mon.type_line("audio vol 0")
         vm.wait_log("[HDA64] cmd audio vol applied=1 pct=0", 20)
-        off_0 = os.path.getsize(vm.wav)
+        mon.type_line("audio playtone 400")     # ★ 冲刷上一档（50%）的尾巴
+        time.sleep(0.8)
+        off_0 = wav_settle(vm.wav)
         n2b = len(vm.log())
         mon.type_line("elfrun /bin/sounder")
         vm.wait_log("SOUNDER demo count=4", 60, since=n2b)
@@ -737,10 +795,11 @@ def main():
         check("④ 音量 0：放大器写上静音位（pct=0 -> rb 的 bit7=1，回读 %s）"
               % (vol0.group(4) if vol0 else "?"),
               vol0 is not None and (int(vol0.group(4), 16) & 0x80) != 0)
-        loud_0 = runs_loud(runs_0, det_0)
-        maxpk_0 = max((run_peak(det_0[2], det_0[1], det_0[3], a, b) for a, b in (runs_0 or [])), default=0)
-        check("④ 音量 0：录音里没有有声区段（峰值 >= 1000）", not loud_0,
-              "有声音段=%s（原始区段 %s，最大峰值 %d）" % (loud_0 if loud_0 else "无", runs_0, maxpk_0))
+        maxpk_0 = wav_peak_win(vm.wav, off_0)       # ★ 整窗峰值（见 wav_peak_win）
+        check("④ 音量 0：录音里没有有声区段（本阶段整窗峰值 < 1000）", maxpk_0 < 1000,
+              "本阶段整窗峰值 %d" % maxpk_0)
+        check("④ 幅度单调 50%% > 0%%(静音)（整窗峰值 %d > %d）" % (maxpk_50, maxpk_0),
+              maxpk_50 > maxpk_0)
         mon.type_line("audio vol 100")
         vm.wait_log("[HDA64] cmd audio vol applied=1 pct=100", 20)
 
@@ -787,7 +846,7 @@ def main():
 
             n5 = len(vm.log())
             time.sleep(1.2)                     # 让后端把上一阶段写完，再取偏移
-            off_n = os.path.getsize(vm.wav)
+            off_n = wav_settle(vm.wav)
             mon.type_line("run /bin/sounder notify", per_key=0.12)
             vm.wait_log("SOUNDER play name=notify", 40, since=n5)
             m = last(r"SOUNDER play name=notify path=(\S+) rate=(\d+) ch=(\d+) bits=(\d+) frames=(\d+) "

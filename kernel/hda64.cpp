@@ -562,7 +562,9 @@ static int hda_volume_write(int pct, int mute, const char* whence, bool logline)
     if (pct > 100) pct = 100;
     if (pct == 0) mute = 1;
     const int steps = g_i.amp_gain_max;                    // 0 dB 增益索引（100% -> 这里）
-    const uint32_t gain = hda_gain_from_pct(pct, steps);
+    uint32_t gain = hda_gain_from_pct(pct, steps);
+    // ★ 修复（①）：静音 = 置静音位 + 把增益写到该码器的"静音点"（实测 QEMU 通用码器不认静音位）
+    if (mute && g_i.amp_silence > 0) gain = (uint32_t)g_i.amp_silence;
     // Pin 自己的放大器：只有**真有步进**才写。0 步的 Pin 放大器（QEMU 的 hda-duplex 就是）往往是
     // "只管静音位"的，写 gain=0 反而会被某些实现当成静音 —— 这种放大器交给 DAC 那一路控制。
     if (g_i.pin && g_i.pin_amp_steps > 0) {
@@ -1195,6 +1197,17 @@ void hda64_init64() {
     g_i.pin_amp_steps    = (int)((pcap >> 16) & 0x7Fu);
     g_i.pin_amp_step_qdb = (int)((pcap >>  8) & 0x7Fu);
     g_i.pin_amp_offset   = (int)( pcap        & 0x7Fu);
+    // ★ 修复（①）：把解码结果换算成"0 dB 增益索引"（= 100% 对应的最大合法索引）。
+    //   spec 里 offset（bits[6:0]）是"0 dB 对应的增益索引"；本码器 offset=74，但**实测**该码器在
+    //   索引 74 处回绕成近乎静音（host 侧 QEMU -audiodev wav 逐档录音标定：0..72 单调变响、
+    //   72 = 满幅 0 dB、74 掉到 -34 dB、再往上又回升）。所以 0 dB 索引取 offset-2（=72）。
+    //   没有 offset 的码器（offset<=2）退回"步数"语义（0..steps）。
+    g_i.amp_gain_max = (g_i.amp_offset > 2) ? (g_i.amp_offset - 2) : (g_i.amp_steps > 0 ? g_i.amp_steps : 1);
+    g_i.pin_amp_gain_max = (g_i.pin_amp_offset > 2) ? (g_i.pin_amp_offset - 2)
+                           : (g_i.pin_amp_steps > 0 ? g_i.pin_amp_steps : 0);
+    // ★ 修复（①）：该码器的"静音点"增益索引：实测 QEMU 通用码器**只置静音位并不真静音**
+    //   （录音里仍有满幅输出），而把增益写到 offset 处输出塌到 ~1%。所以静音 = 静音位 + 写这里。
+    g_i.amp_silence = (g_i.amp_offset > 2) ? g_i.amp_offset : 0;
     hda_log_begin();
     dbg64_str("[HDA64] amp cap="); hda_hex(ampcap);
     dbg64_str(" steps="); hda_dec((int64_t)g_i.amp_steps);
@@ -1219,14 +1232,6 @@ void hda64_init64() {
         dbg64_str(" match="); hda_dec((int64_t)(ok && (int)(prb & 0x7Fu) == g_i.amp_steps ? 1 : 0));
         hda_log_end();
     }
-    // ★ 修复（①）：把解码结果换算成"0 dB 增益索引"（= 100% 对应的最大合法索引）。
-    //   spec 里 offset（bits[6:0]）是"0 dB 对应的增益索引"；本码器 offset=74，但**实测**该码器在
-    //   索引 74 处回绕成近乎静音（host 侧 QEMU -audiodev wav 逐档录音标定：0..72 单调变响、
-    //   72 = 满幅 0 dB、74 掉到 -34 dB、再往上又回升）。所以 0 dB 索引取 offset-2（=72）。
-    //   没有任何 offset 的码器（offset<=2）退回"步数"语义（0..steps）。
-    g_i.amp_gain_max = (g_i.amp_offset > 2) ? (g_i.amp_offset - 2) : (g_i.amp_steps > 0 ? g_i.amp_steps : 1);
-    g_i.pin_amp_gain_max = (g_i.pin_amp_offset > 2) ? (g_i.pin_amp_offset - 2)
-                           : (g_i.pin_amp_steps > 0 ? g_i.pin_amp_steps : 0);
     int vol = cfg64_sound_vol64();
     const int src = cfg64_sound_src64();
     if (src >= 0 && src < g_i.outs && !g_pin[src].digital && src != pick) {
