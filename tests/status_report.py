@@ -2338,7 +2338,9 @@ def cap_jpeg():
         "RSTn %d / EXIF Orientation %d / 444·422·420 %d / 渐进式拒绝 %d" % (huff, idct, quant, sof, rst, exif, samp, prog),
         "实测串口原文：\"[JPEG64] selftest file=j03.jpg bytes=… rc=0 fmt=jpeg w=… h=… orient=… comps=… "
         "samp=420 rst=… fnv=… err=ok\" + 逐行像素 dump \"[JPEG64] px j03.jpg row=<y> w=<w> data=<RRGGBB…>\""
-        "（另有汇总行 \"[JPEG64] selftest files=6 fail=0 dump=1 ok=1\"；img64.cpp 里 %d 处打点）" % tag,
+        "（另有汇总行 \"[JPEG64] selftest files=<n> ok0=<k> err2_3=<m> other=<b> dump=<d> ok=1 rc=0\" —— "
+        "img64.cpp 里硬断言\"12 槽位齐全时必须 9 成功 + 3 明确错误码\"，tests/jpeg64_test.py 照它核对；"
+        "img64.cpp 里 %d 处打点）" % tag,
         "与宿主 Pillow 对照（tools/jpeg_make_testset.py 生成 12 张：纯色/渐变/文字/噪声 + 三种采样 + 3 张 EXIF "
         "+ 灰度 + 截断/渐进/损坏）：逐像素 **MAE ≤ 0.4、最大逐像素差 ≤ 3**，16×16 分块 MSE 同量级"
         "（阈值依据写在脚本头部：Pillow 走 libjpeg-turbo 的快速整数 IDCT + fancy upsampling，LSB 级差异必然）",
