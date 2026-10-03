@@ -623,6 +623,19 @@ static bool rasterize_glyph(FontFace* fc, uint32_t cp, uint8_t* bm, int* ox, int
     if (py0 > FONT_PX - 1) py0 = FONT_PX - 1;
     if (px1 < px0 || py1 < py0) return true;
     *ox = px0; *oy = py0; *w = px1 - px0 + 1; *h = py1 - py0 + 1;
+    // ★ P7a ④ 修复（文字渲染重叠错乱）：本函数是**累加**语义（同一字形的轮廓自重叠要靠
+    //   `old + a` 叠加覆盖率，见下面扫描线填充），所以填充前必须把目标位图的 bbox 区域清零。
+    //   调用方的位图缓冲是**复用**的，而且从来没被清过（本文件里没有任何 memset）：
+    //     * font_draw_glyph -> cur->cache[idx]：换字号（font_set_size64）把 cacheOk 全置 false
+    //       却没清位图 -> 重光栅化时把**旧字号的同一字形**叠进来（字变粗/重影）；
+    //     * lru_get_slot    -> fc->lru_bm[victim]：CJK LRU 槽换出后装的是**另一个字形**，
+    //       叠上来就是"上一个字残影"= 用户实测的偶发文字重叠错乱（取决于换出顺序，所以偶发）。
+    //   只清 bbox（下面填充只会写这个范围），不动别处、不改首次渲染的像素（fonts64 逐像素不变）。
+    for (int row = py0; row <= py1; row++) {
+        uint8_t* dst = bm + row * FONT_PX;
+        for (int xx = px0; xx <= px1; xx++) dst[xx] = 0;
+    }
+
 
     // 扫描线填充（偶奇规则）
     int32_t xs_cross[MAX_XS];
