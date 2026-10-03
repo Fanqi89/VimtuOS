@@ -1343,6 +1343,45 @@ for p in sys.argv[2:]:
 raise SystemExit(bad)
 PYEOFBB
 
+# ★ 本批（系统音效）：4 段**自合成** wav 素材 + 用户态播放器 /bin/sounder —— 不内嵌内核，卷交付。
+#   1) tools/sounds_gen.py 合成 48k/16/2 的 4 段素材（纯标准库、无随机数/无时间戳 = 逐字节可复现；
+#      全部自己合成 = 零第三方素材、零许可风险）；
+#   2) user/apps/sounder.c 自足（不 include 任何头、不链 user/lib —— 另一条线在改 user/lib 与
+#      user/shell，不依赖它们就不会被它们的中间态带崩），链接脚本复用 user/lib/user64.ld；
+#   3) 两者都只落 build64/，由 tools/sounder_pack_win.py 写进系统卷（/bin/sounder +
+#      /usr/share/sounds/*.wav，写完**逐字节回读自检**）：读上一步 busyboxvol.img -> soundvol.img，
+#      并用这卷重拼 sysdisk.img。
+#   同一条体积纪律：素材与播放器在内核二进制里必须搜不到（共享探针选择器 tools/probe64.py）。
+echo "==> ★ 本批：系统音效（4 段自合成素材 + /bin/sounder；内核里 0 字节）"
+"$PY" tools/sounds_gen.py --out-dir "$BUILD/sounds"
+SOUNDER_SZ=0
+clang --target=x86_64-unknown-none-elf -nostdinc -ffreestanding -nostdlib -fno-builtin \
+  -fno-stack-protector -fno-pic -fno-pie -fno-zero-initialized-in-bss -mcmodel=large -mno-red-zone \
+  -mno-sse -mno-sse2 -mno-mmx -mno-avx -fno-asynchronous-unwind-tables -fno-unwind-tables \
+  -ffunction-sections -fdata-sections -std=c11 -O2 -Wall -Wextra \
+  -c user/apps/sounder.c -o "$BUILD/sounder.o"
+$LD -m elf_x86_64 -T user/lib/user64.ld --gc-sections -o "$BUILD/sounder.elf" "$BUILD/sounder.o"
+SOUNDER_SZ=$(stat -c%s "$BUILD/sounder.elf")
+if [ "$SOUNDER_SZ" -gt 65536 ]; then
+    echo "ERROR: sounder.elf $SOUNDER_SZ B 超过 64KiB（用户窗口装载区上限）" >&2
+    exit 1
+fi
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" "$BUILD/sounder.elf" \
+      "$BUILD/sounds/startup.wav" "$BUILD/sounds/notify.wav" \
+      "$BUILD/sounds/click.wav" "$BUILD/sounds/error.wav"
+echo "    /bin/sounder = $SOUNDER_SZ B（静态 ELF64；由 tools/sounder_pack_win.py 装进系统卷）"
+SND_VOL_IN="$BUILD/busyboxvol.img"
+[ -f "$SND_VOL_IN" ] || SND_VOL_IN="$BUILD/demovol.img"
+[ -f "$SND_VOL_IN" ] || SND_VOL_IN="$BUILD/tarvol.img"
+if [ -f "$SND_VOL_IN" ] && [ -f "$BUILD/sounder.elf" ]; then
+    "$PY" tools/sounder_pack_win.py --vol-in "$SND_VOL_IN" --vol-out "$BUILD/soundvol.img" \
+          --sounder "$BUILD/sounder.elf" --sounds-dir "$BUILD/sounds" \
+          --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+else
+    echo "ERROR: 缺少 $SND_VOL_IN（卷链上一步没跑成）—— 音效没装进系统卷" >&2
+    exit 1
+fi
+
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
 "$PY" - "$BUILD/payload_hdr.bin" "$SYS_SECTORS" "$((PAYLOAD_LBA + 1))" <<'PYEOF'
 import struct, sys
