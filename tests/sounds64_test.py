@@ -602,13 +602,13 @@ def main():
             print("     客观证据（内核打点）：" + " | ".join(m.group(0) for m in snd[:4]))
 
         # ---- ② 录音：QEMU wav 后端**按实际播放的音频**增长（时长可量、可对照素材）----
-        # ★ 本机（QEMU 通用 HDA 码器）的**幅度**量不出素材的峰值：现有 hda64 驱动的
-        #   `hda_gain_from_pct()` 把码器放大器能力字里的"步数"当成了"每步 dB"（caps 0x80034a4a
-        #   -> steps=74/offset=74，真实 step size 在 bits[22:16]），于是 100% 写成 gain index 0，
-        #   在 offset=74 的码器上等于 -55.5 dB（实测整个录音 peak=0）。这**不是本批引入的**：
-        #   内核自己的启动自检音（hda64_selftest64 送的 1 kHz 方波）在同一个录音里同样是静音。
-        #   所以 ② 的客观证据用"录音字节增量 == 素材总时长 × 采样率 × 声道 × 2"（真实时间轴上
-        #   消耗了恰好这么多帧），并把录音里量到的区段数字如实打印出来。
+        # ★ 修复（①）：幅度现在**可量**了。根因与修法：hda64 的 hda_gain_from_pct() 原来把码器
+        #   放大器能力字（caps 0x80034a4a）的 bits[14:8] 当成"步数"、bits[6:0] 当成"每步 dB"，
+        #   于是 `audio vol 100` 写成 gain index 0（≈ 最大衰减），整条录音近静音（实测峰值 0..259，
+        #   连内核自己的启动自检音都无声）。现在按 HDA spec 解码（steps=bits[22:16]、
+        #   step_size=bits[14:8]、0dB 索引=offset=bits[6:0]），并用 host 侧逐档录音标定出该码器的
+        #   0 dB 增益索引（72）；100% 就落在它上面。下面同时断言"段峰值 >= 3000"与"时长比值"。
+        #   另外仍保留"录音字节增量 == 素材总时长 × 采样率 × 声道 × 2"的时间轴证据。
         print("=== ② 录音（-audiodev wav）：播放时长/字节与素材对照 ===")
         hdr = wav_record_header(vm.wav)
         rrate, rch = (hdr[0], hdr[1]) if hdr else (44100, 2)
@@ -657,9 +657,12 @@ def main():
             check("② 录音里的 4 段**时长**与素材相符（比值 0.5..1.4）",
                   len(dur_ratios) == 4 and all(0.5 <= r <= 1.4 for r in dur_ratios),
                   "比值=" + ",".join("%.2f" % r for r in dur_ratios))
-        print("     如实：幅度对照（素材峰值 %s）在本机码器上不可测——录音 peak=%s"
-              % ([host[n]["peak"] for n in SOUNDS],
-                 max((meas.get(n, (0, 0))[1] for n in SOUNDS), default=0)))
+        # ★ 修复（①）后的**客观幅度证据**：100% 音量下录音里 4 段有量级的样本（peak >= 3000）
+        maxpk_a = max((meas.get(n, (0, 0))[1] for n in SOUNDS), default=0)
+        check("② 100%% 音量下录音里 4 段**真的有幅度**（段峰值 max=%d >= 3000；素材峰值 %s）"
+              % (maxpk_a, [host[n]["peak"] for n in SOUNDS]),
+              maxpk_a >= 3000,
+              "meas=" + str({n: meas[n] for n in meas}))
 
         # ---- ③ 静音：同一程序播放 -> 录音里不应有新声音 ----
         print("=== ③ 静音（audio mute on）时播放不应出声 ===")
@@ -713,9 +716,14 @@ def main():
         check("④ 音量 50%% 下播放仍走完（录音增量 %d B，与 100%% 同量级）"
               % delta_50,
               delta_50 > 0 and 0.5 <= (delta_50 / exp_a if exp_a else 0) <= 1.8)
+        maxpk_50 = max((meas50[n][1] for n in meas50), default=0)
         if runs_50 and meas50:
-            print("     音量 50%%：录音里量到 %d 个区段（peak 最大 %d）"
-                  % (len(runs_50), max(meas50[n][1] for n in meas50)))
+            print("     音量 50%%：录音里量到 %d 个区段（peak 最大 %d）" % (len(runs_50), maxpk_50))
+        # ★ 修复（①）后的**幅度单调性**：100% > 50% > 静音（录音里量到的峰值）
+        maxpk_100 = maxpk_a
+        check("④ 幅度单调 100%% > 50%%（peak %d > %d），且 100%% 有量级（>= 3000）"
+              % (maxpk_100, maxpk_50),
+              maxpk_100 >= 3000 and maxpk_100 > maxpk_50)
 
         mon.type_line("audio vol 0")
         vm.wait_log("[HDA64] cmd audio vol applied=1 pct=0", 20)

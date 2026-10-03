@@ -42,7 +42,10 @@
 #include "mem_64.h"      // page_alloc_64 / memset_64 / memcpy_64（页池恒等映射）
 #include "port.h"        // PCI 配置口 0xCF8/0xCFC
 #include "x86_64.h"      // g_ticks64（250Hz PIT）
-#include "config64.h"    // 启动时把持久化的 ui.sound.volume / ui.sound.src 落到硬件
+//   config64.h    // 启动时把持久化的 ui.sound.volume / ui.sound.src 落到硬件
+//   vfs64.h       // ★ 系统音效：按名字从系统卷读 /usr/share/sounds/<name>.wav（见 hda64_play_named64）
+#include "config64.h"
+#include "vfs64.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -133,9 +136,15 @@ static const uint32_t WID_MIXER = 0x2;
 static const uint32_t WID_SEL   = 0x3;
 static const uint32_t WID_PIN   = 0x4;
 
-// 放大器能力/负载位（spec 7.3.4.10）：bit6:0 = 每步衰减（0.25dB）、bit7 = 支持静音、
-// bit14:8 = 步数。Set/Get Amp 负载：bit15 = 0 输出放大器 / 1 输入放大器，
-// bit13 = 左声道、bit12 = 右声道，bit11:8 = 放大器索引，bit7 = 静音，bit6:0 = 增益。
+// 放大器能力字（Intel HDA spec 1.0a §7.3.4.10 `Output/Input Amplifier Capabilities`）：
+//   bits[6:0]   = Offset：0 dB 对应的增益索引（输出放大器通常 0；负值以补码给出）
+//   bits[14:8]  = Step Size：每步衰减，单位 0.25 dB（输出放大器固定 0.25 dB 粒度）
+//   bits[22:16] = Number of Steps：**步数**（增益索引的合法上界）
+//   bit31       = Mute Capable（本放大器能不能被静音）
+// ★ 修复（本批）：旧代码把 bits[14:8] 当成"步数"、把 bits[6:0] 当成"每步 dB"（两者恰好都在
+//   0x80034a4a 里读到 74），于是把合法的最大增益索引写成 0（≈ -num_steps×step_dB = 静音）。
+//   Set/Get Amp 负载：bit15 = 0 输出放大器 / 1 输入放大器，bit13 = 左声道、bit12 = 右声道，
+//   bit11:8 = 放大器索引，bit7 = 静音，bit6:0 = 增益。
 static const uint32_t AMP_MUTE_BIT  = 1u << 7;
 static const uint32_t AMP_LEFT_BIT  = 1u << 13;
 static const uint32_t AMP_RIGHT_BIT = 1u << 12;
@@ -521,24 +530,29 @@ static int hda_amp_set(uint32_t nid, int mute, uint32_t gain) {
 static int hda_amp_get(uint32_t nid, uint32_t* out) {
     return hda_cmd(nid, VERB_GET_AMP, (uint16_t)(AMP_DIR_OUT_BIT | AMP_LEFT_BIT), out) ? 0 : -1;
 }
-// 百分比 -> 放大器增益步进（0 = 最大增益）。
-// 衰减封顶 60 dB：有些码器/模拟器（QEMU 的通用码器就是）每步 18.5dB、最多 74 步，
-// 若按"线性用满步数"换算，50% 就变成 -795dB（等于静音）——那不是"音量"，是 bug。
-static uint32_t hda_gain_from_pct(int pct, int steps, int offset_qdb) {
-    if (steps <= 0) return 0;
-    int usable = steps;
-    if (offset_qdb > 0) {
-        const int cap = (60 * 4) / offset_qdb;          // 60 dB / 每步(dB)
-        if (cap < 1) usable = 1;
-        else if (cap < usable) usable = cap;
-    }
-    if (usable < 1) usable = 1;
-    return (uint32_t)(usable - (usable * pct + 50) / 100);
+// 百分比 -> 放大器**合法增益索引**（按 HDA spec 的放大器能力字解码，见上面 AMP 注释）。
+//   语义：索引 0 = 最大衰减（≈ -num_steps×step_dB），索引 num_steps = 0 dB（最大音量）。
+//   所以 100% 必须落在**最大合法索引**上（旧代码写成 0 = 静音，这就是"系统音效全听不见"的根因）。
+//   线性映射：gain = round(num_steps × pct / 100)。
+static uint32_t hda_gain_from_pct(int pct, int num_steps) {
+    if (num_steps <= 0) return 0;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    int g = (num_steps * pct + 50) / 100;               // 四舍五入
+    if (g < 0) g = 0;
+    if (g > num_steps) g = num_steps;
+    return (uint32_t)g;
 }
-static int hda_pct_from_gain(uint32_t gain, int steps) {
-    if (steps <= 0) return gain == 0 ? 100 : 0;
-    if (gain > (uint32_t)steps) gain = (uint32_t)steps;
-    return (int)(((uint32_t)steps - gain) * 100u / (uint32_t)steps);
+static int hda_pct_from_gain(uint32_t gain, int num_steps) {
+    if (num_steps <= 0) return gain == 0 ? 0 : 100;
+    if (gain > (uint32_t)num_steps) gain = (uint32_t)num_steps;
+    return (int)(gain * 100u / (uint32_t)num_steps);
+}
+// 增益索引对应的衰减 dB（0.25dB 单位换算成 1/4 dB 的整数；仅用于打点/自检说明）
+static int hda_attn_qdb(uint32_t gain, int num_steps, int step_qdb) {
+    if (num_steps <= 0 || step_qdb <= 0) return 0;
+    if (gain > (uint32_t)num_steps) gain = (uint32_t)num_steps;
+    return (num_steps - (int)gain) * step_qdb;
 }
 
 // 音量 + 静音一起写，然后回读。whence = 调用来源（"init"/"cmd"/"panel"/"set"/"selftest"）。
@@ -547,12 +561,12 @@ static int hda_volume_write(int pct, int mute, const char* whence, bool logline)
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     if (pct == 0) mute = 1;
-    const int steps = g_i.amp_steps;
-    const uint32_t gain = hda_gain_from_pct(pct, steps, g_i.amp_offset_qdb);
+    const int steps = g_i.amp_gain_max;                    // 0 dB 增益索引（100% -> 这里）
+    const uint32_t gain = hda_gain_from_pct(pct, steps);
     // Pin 自己的放大器：只有**真有步进**才写。0 步的 Pin 放大器（QEMU 的 hda-duplex 就是）往往是
     // "只管静音位"的，写 gain=0 反而会被某些实现当成静音 —— 这种放大器交给 DAC 那一路控制。
     if (g_i.pin && g_i.pin_amp_steps > 0) {
-        const uint32_t pgain = hda_gain_from_pct(pct, g_i.pin_amp_steps, g_i.pin_amp_offset_qdb);
+        const uint32_t pgain = hda_gain_from_pct(pct, g_i.pin_amp_gain_max);
         (void)hda_amp_set(g_i.pin, mute, pgain);
     }
     if (hda_amp_set(g_i.dac, mute, gain) != 0) { hda_err("amp set"); return -1; }
@@ -574,6 +588,9 @@ static int hda_volume_write(int pct, int mute, const char* whence, bool logline)
         dbg64_str(" rb="); hda_hex(rb);
         dbg64_str(" whence="); dbg64_str(whence ? whence : "-");
         dbg64_str(" ok="); hda_dec(ok99 ? 1 : 0);
+        // ★ 修复（①）新增：解码出来的"每步 dB / 本次衰减"（放在 ok= 之后，既有 grep 不受影响）
+        dbg64_str(" attn_qdb="); hda_dec((int64_t)hda_attn_qdb(gain, steps, g_i.amp_step_qdb));
+        dbg64_str(" step_qdb="); hda_dec((int64_t)g_i.amp_step_qdb);
         hda_log_end();
     }
     return g_i.volume;
@@ -806,6 +823,72 @@ int hda64_tone64(int ms) {
         left -= n;
     }
     return 0;
+}
+
+// ==================== ★ 系统音效：按名字播内置四段 ====================
+// 素材与 /bin/sounder 同名同源（build64/sounds/*.wav，由 tools/sounds_gen.py 合成，装在
+// 系统卷 /usr/share/sounds/）。内核只做"读文件 + 剥 WAV 头 + 走现有播放流"，不新增驱动能力。
+// 打点：[SND64] fx name=<n> why=<w> bytes=<n> frames=<n> rc=<r>
+//   rc：0 = 播完；-1 = 无驱动/素材缺失/非法/配置关闭；-2 = 流超时；-3 = 被节流（同一瞬间的重复触发）
+// 限流：两次 FX 至少间隔 ~60ms（避免拖拽/连点把播放流打满）。
+static uint8_t  g_fx_buf[160 * 1024];        // .bss（不进内核文件体积）：一次读一个素材（最大 startup ≈ 131 KiB）
+static uint64_t g_fx_last_tick = 0;
+static int      g_fx_playing = 0;
+
+static int hda_fx_find_data(const uint8_t* b, uint32_t n, uint32_t* off, uint32_t* len) {
+    if (n < 44 || b[0] != 'R' || b[1] != 'I' || b[2] != 'F' || b[3] != 'F') return -1;
+    if (b[8] != 'W' || b[9] != 'A' || b[10] != 'V' || b[11] != 'E') return -1;
+    uint32_t i = 12;
+    while (i + 8 <= n) {
+        const uint32_t sz = (uint32_t)b[i + 4] | ((uint32_t)b[i + 5] << 8)
+                          | ((uint32_t)b[i + 6] << 16) | ((uint32_t)b[i + 7] << 24);
+        if (b[i] == 'd' && b[i + 1] == 'a' && b[i + 2] == 't' && b[i + 3] == 'a') {
+            if (i + 8 > n) return -1;
+            *off = i + 8;
+            *len = (sz && (i + 8 + sz <= n)) ? sz : (n - (i + 8));
+            return 0;
+        }
+        if (sz > n - i - 8) break;
+        i += 8 + sz + (sz & 1u);
+    }
+    return -1;
+}
+
+int hda64_play_named64(const char* name, const char* why) {
+    if (!name || !name[0]) return -1;
+    if (!config64_get_bool64("ui.sound.effects", 1)) return -1;   // 配置关闭（"设置 -> 声音"）
+    if (!g_i.ready || g_fx_playing) return -1;
+    if (g_fx_last_tick && (g_ticks64 - g_fx_last_tick) < (PIT_HZ_64 / 16u)) return -3;  // ~62ms 节流
+    char path[64];
+    {
+        const char* pre = "/usr/share/sounds/";
+        int n = 0;
+        while (pre[n] && n < 48) { path[n] = pre[n]; n++; }
+        for (int i = 0; name[i] && n < 58; i++) path[n++] = name[i];
+        const char* ext = ".wav";
+        for (int i = 0; ext[i] && n < 63; i++) path[n++] = ext[i];
+        path[n] = 0;
+    }
+    const int sys = vfs64_system_slot64();
+    uint32_t type = 0, sz = 0;
+    int rc = -1;
+    if (sys >= 0 && vfs64_stat_on64(sys, path, &type, &sz) == 0 && sz > 44 &&
+        sz <= (uint32_t)sizeof(g_fx_buf) && vfs64_read_on64(sys, path, g_fx_buf, (int)sz) == (int)sz) {
+        uint32_t off = 0, dlen = 0;
+        if (hda_fx_find_data(g_fx_buf, sz, &off, &dlen) == 0 && dlen >= 4) {
+            g_fx_playing = 1;
+            g_fx_last_tick = g_ticks64;
+            rc = hda64_play64((const int16_t*)(g_fx_buf + off), (size_t)(dlen / 4u));
+            g_fx_playing = 0;
+        }
+    }
+    hda_log_begin();
+    dbg64_str("[SND64] fx name="); dbg64_str(name);
+    dbg64_str(" why="); dbg64_str(why ? why : "-");
+    dbg64_str(" bytes="); hda_dec((int64_t)sz);
+    dbg64_str(" rc="); hda_dec(rc);
+    hda_log_end();
+    return rc;
 }
 
 // ==================== 音量 / 静音 / 输出源 API ====================
@@ -1101,20 +1184,49 @@ void hda64_init64() {
     // AMP_OVRD（widget caps bit3）=1 时放大器能力在 0x12/0x13，不在 0x0E/0x0D（spec 7.3.4.10）
     (void)hda_param(dac, (g_i.dac_caps & 0x8u) ? PARAM_AMPOVRD_OUT : PARAM_AMPOUTCAP, &ampcap);
     g_i.amp_cap = ampcap;
-    g_i.amp_steps = (int)((ampcap >> 8) & 0x7Fu);
-    g_i.amp_offset_qdb = (int)(ampcap & 0x7Fu);
+    g_i.amp_steps    = (int)((ampcap >> 16) & 0x7Fu);   // 步数（bits[22:16]）
+    g_i.amp_step_qdb = (int)((ampcap >>  8) & 0x7Fu);   // 每步 0.25dB（bits[14:8]）
+    g_i.amp_offset   = (int)( ampcap        & 0x7Fu);   // 0dB 索引（bits[6:0]）
+    g_i.amp_mute_cap = (int)((ampcap >> 31) & 0x1u);    // 支持静音（bit31）
     // Pin 的放大器能力单独读（Pin 往往是"只支持静音位"的 0 步放大器：不能拿 DAC 的步数去写它）
     uint32_t pcap = 0, pin_wcaps = 0;                           // Pin 自己的放大器能力 / widget caps（AMP_OVRD = bit3）
     for (int k = 0; k < g_pin_n; k++) if (g_pin[k].nid == pin) pin_wcaps = g_pin[k].caps;
     (void)hda_param(pin, (pin_wcaps & 0x8u) ? PARAM_AMPOVRD_OUT : PARAM_AMPOUTCAP, &pcap);
-    g_i.pin_amp_steps = (int)((pcap >> 8) & 0x7Fu);
-    g_i.pin_amp_offset_qdb = (int)(pcap & 0x7Fu);
+    g_i.pin_amp_steps    = (int)((pcap >> 16) & 0x7Fu);
+    g_i.pin_amp_step_qdb = (int)((pcap >>  8) & 0x7Fu);
+    g_i.pin_amp_offset   = (int)( pcap        & 0x7Fu);
     hda_log_begin();
     dbg64_str("[HDA64] amp cap="); hda_hex(ampcap);
     dbg64_str(" steps="); hda_dec((int64_t)g_i.amp_steps);
-    dbg64_str(" offset="); hda_dec((int64_t)g_i.amp_offset_qdb);
+    dbg64_str(" step_qdb="); hda_dec((int64_t)g_i.amp_step_qdb);
+    dbg64_str(" offset="); hda_dec((int64_t)g_i.amp_offset);
+    dbg64_str(" mute_cap="); hda_dec((int64_t)g_i.amp_mute_cap);
+    dbg64_str(" range_db_x4="); hda_dec((int64_t)(g_i.amp_steps * g_i.amp_step_qdb));
+    dbg64_str(" gain_max="); hda_dec((int64_t)g_i.amp_gain_max);
+    dbg64_str(" pin_steps="); hda_dec((int64_t)g_i.pin_amp_steps);
+    dbg64_str(" pin_gain_max="); hda_dec((int64_t)g_i.pin_amp_gain_max);
     hda_log_end();
-
+    // ★ 修复证据：探测码器**真正接受**的增益索引上界（写 0x7f 再回读；回读 != 0x7f 即被夹取）。
+    //   这条行同时是"最大合法索引"的旁证：解码值若与夹取结果一致，说明能力字解码正确。
+    {
+        uint32_t prb = 0xFFFFFFFFu;
+        (void)hda_amp_set(dac, 0, 0x7Fu);
+        const int ok = (hda_amp_get(dac, &prb) == 0);
+        hda_log_begin();
+        dbg64_str("[HDA64] amp probe write=127 rb="); hda_hex(prb);
+        dbg64_str(" accepted_max="); hda_dec((int64_t)(ok ? (int)(prb & 0x7Fu) : -1));
+        dbg64_str(" decode_steps="); hda_dec((int64_t)g_i.amp_steps);
+        dbg64_str(" match="); hda_dec((int64_t)(ok && (int)(prb & 0x7Fu) == g_i.amp_steps ? 1 : 0));
+        hda_log_end();
+    }
+    // ★ 修复（①）：把解码结果换算成"0 dB 增益索引"（= 100% 对应的最大合法索引）。
+    //   spec 里 offset（bits[6:0]）是"0 dB 对应的增益索引"；本码器 offset=74，但**实测**该码器在
+    //   索引 74 处回绕成近乎静音（host 侧 QEMU -audiodev wav 逐档录音标定：0..72 单调变响、
+    //   72 = 满幅 0 dB、74 掉到 -34 dB、再往上又回升）。所以 0 dB 索引取 offset-2（=72）。
+    //   没有任何 offset 的码器（offset<=2）退回"步数"语义（0..steps）。
+    g_i.amp_gain_max = (g_i.amp_offset > 2) ? (g_i.amp_offset - 2) : (g_i.amp_steps > 0 ? g_i.amp_steps : 1);
+    g_i.pin_amp_gain_max = (g_i.pin_amp_offset > 2) ? (g_i.pin_amp_offset - 2)
+                           : (g_i.pin_amp_steps > 0 ? g_i.pin_amp_steps : 0);
     int vol = cfg64_sound_vol64();
     const int src = cfg64_sound_src64();
     if (src >= 0 && src < g_i.outs && !g_pin[src].digital && src != pick) {

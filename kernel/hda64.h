@@ -39,8 +39,11 @@ struct Hda64Info {
     uint32_t fmt_set, fmt_get;      // Set Converter Format 写入值 / 回读（0x11 = 48k/16/2）
     uint32_t pin_ctl;               // Pin Widget Control 回读（bit6 = OUT_EN）
     uint32_t pin_cfg;               // CONFIG DEFAULT（判断设备类型的依据）
-    int      amp_steps;             // 放大器步数（0 = 只支持静音位）
-    int      amp_offset_qdb;        // 每步衰减（0.25dB 单位）
+    int      amp_steps;             // 放大器**步数**（能力字 bits[22:16]；0 = 只支持静音位）
+    int      amp_step_qdb;          // 每步衰减（0.25dB 单位；能力字 bits[14:8]）
+    int      amp_offset;            // 0dB 对应的增益索引（能力字 bits[6:0]；输出放大器多为 0）
+    int      amp_mute_cap;          // 1 = 支持静音位（能力字 bit31）
+    int      amp_gain_max;          // ★ 修复（①）：0 dB 对应的增益索引（= 100% 写入值；见 hda64.cpp 标定）
     int      volume;                // 当前音量 0..100（最后一次写入值）
     int      muted;                 // 1 = 静音位已置
     uint32_t amp_rb;                // 最后一次 Get Amp Gain 回读（bit7 = mute）
@@ -53,8 +56,10 @@ struct Hda64Info {
     uint32_t lpib_max;              // 最近一次流的 LPIB 峰值（字节）
     uint32_t cbl_last;              // 最近一次流的 CBL
     uint32_t conv_get;              // Get Converter Stream/Channel 回读（bit7:4 = 流号，应 = 0x10）
-    int      pin_amp_steps;         // Pin 自身输出放大器步数（0 = 只写静音位/不动增益）
-    int      pin_amp_offset_qdb;    // Pin 放大器每步衰减（0.25dB）
+    int      pin_amp_steps;         // Pin 自身输出放大器步数（bits[22:16]；0 = 只写静音位/不动增益）
+    int      pin_amp_step_qdb;      // Pin 放大器每步衰减（0.25dB；bits[14:8]）
+    int      pin_amp_offset;        // Pin 放大器 0dB 索引（bits[6:0]）
+    int      pin_amp_gain_max;      // ★ 修复（①）：Pin 放大器 0dB 增益索引（0 = 不写 Pin 增益）
     uint32_t pin_caps;              // Pin Capabilities（bit4 输出 / bit16 EAPD / bit7 HDMI）
     uint32_t eapd;                  // 写进 Set EAPD 的值（0 = 没写/引脚不支持）
     int      selftest;              // -1 = 跳过/没跑；0 = PASS；>0 = FAIL 位掩码
@@ -100,5 +105,9 @@ int  hda64_set_format64(uint32_t fmt);    // 只支持 0x11（48k/16/2）；别�
 // 返回 true = PASS 或 skipped（没控制器）；false = FAIL（已打 [HDA64] selftest FAIL mask=..）。
 bool hda64_selftest64();
 
-// 最近失败阶段名（"none" = 没失败过）
-const char* hda64_err64();
+// ---- ★ 系统音效（4 段内置素材）：从系统卷 /usr/share/sounds/<name>.wav 读，走同一条播放流 ----
+// name ∈ "startup" | "notify" | "click" | "error"（与 /bin/sounder 的素材同名同源）。
+// 返回 0 = 播完；-1 = 驱动不可用/素材缺失/非法；-2 = 流超时。why = 触发点（打点用）。
+// 说明：外壳仍在 Ring 3 之上（内核里）时由内核 GUI 直接调用；外壳搬进 Ring 3 之后，
+//   应改由用户态会话/通知管理器调用 /bin/sounder（这套音效是用户态资产）。
+int  hda64_play_named64(const char* name, const char* why);

@@ -321,12 +321,15 @@ def main():
               mi.group(10) == "0x0011" and mi.group(11) == "0x10" and int(mi.group(14), 16) >= 1,
               mi.group(0) if mi else (last(r"\[HDA64\] cmd audio info[^\r\n]*", log) or "（无）"))
 
+        volmap = {}        # ★ 修复（①）：把每档的 (写入增益, 步数, 回读) 存下来做语义断言
         for pct in (50, 0, 100):
             n1 = len(vm.log())
             mon.type_line("audio vol %d" % pct)
             vm.wait_log("[HDA64] cmd audio vol applied=1 pct=%d" % pct, 20)
             log = vm.log()
             mv = last(r"\[HDA64\] volume pct=(\d+) step=(\d+)/(\d+) mute=(\d+) rb=(0x[0-9a-f]+) whence=set ok=(\d)", log[n1:])
+            if mv:
+                volmap[pct] = (int(mv.group(2)), int(mv.group(3)), int(mv.group(5), 16))
             if pct > 0:
                 ok_rb = (mv is not None and int(mv.group(5), 16) == int(mv.group(2)) and
                          mv.group(6) == "1" and mv.group(4) == "0")
@@ -335,6 +338,25 @@ def main():
             check(checks, "⑥ audio vol %d：放大器真写 + 回读一致（step=%s rb=%s ok=%s）" % (
                 pct, mv.group(2) if mv else "?", mv.group(5) if mv else "?", mv.group(6) if mv else "?"),
                 ok_rb, mv.group(0) if mv else (last(r"\[HDA64\] volume[^\r\n]*", log) or "（无）"))
+        # ---- ★ 修复（①）语义同步：100% 必须落在**0 dB 增益索引**（100% 写入值），且与回读一致 ----
+        # 改动前：hda_gain_from_pct 把"步数"当成"每步 dB"，100% 写成 gain index 0（= 最大衰减/静音），
+        #   实测系统音效峰值 ≈ 0..259（听不见）。改动后：100% -> gain_max（0 dB），回读一致。
+        cm = last(r"\[HDA64\] amp cap=(0x[0-9a-f]+) steps=(\d+) step_qdb=(\d+) offset=(\d+) mute_cap=(\d+) range_db_x4=\d+ gain_max=(\d+)", log)
+        steps = int(cm.group(2)) if cm else -1
+        gmax = int(cm.group(6)) if cm else -1
+        check(checks, "⑥ 放大器能力字按 spec 解码（steps=bits[22:16]、step_qdb=bits[14:8]、offset=bits[6:0]、mute=bit31）",
+              cm is not None and steps >= 1 and int(cm.group(3)) >= 1 and int(cm.group(5)) == 1,
+              cm.group(0) if cm else "（无）")
+        if gmax > 0 and 100 in volmap and 50 in volmap:
+            g100, n100, rb100 = volmap[100]
+            g50, n50, rb50 = volmap[50]
+            check(checks, "⑥ 100%% = 0 dB 增益索引（写入 %d == gain_max %d，分母 %d，回读 0x%x 一致）" % (g100, gmax, n100, rb100),
+                  g100 == gmax and n100 == gmax and rb100 == g100)
+            check(checks, "⑥ 50%% 的增益索引 = round(gain_max/2) 且严格小于 100%%（%d,%d < %d,%d）"
+                  % (g50, rb50, g100, rb100),
+                  g50 == (gmax * 50 + 50) // 100 and g50 < g100)
+        else:
+            check(checks, "⑥ 音量语义（100%=0 dB 索引 / 50% 更小）", False, "缺少 volume/amp cap 打点")
 
         n2 = len(vm.log())
         mon.type_line("audio mute on")
