@@ -844,8 +844,249 @@ def main():
         else:
             check("双击 hello.elf", False, "根目录里没有找到 hello.elf 条目行")
 
-        # ==================== 阶段 9：日志卫生 ====================
-        print("=== 阶段 9：日志卫生 ===")
+        # ==================== 阶段 9：★ 布局自适应（①「布局写死 -> 内容不随尺寸变化」修复验收）====
+        # 验收口径（全部是串口打点 + 真像素，不靠肉眼）：
+        #   ① 缩放**前后**各一条 `[UI] exp layout client=WxH content=151,54 CWxCH cols=N rows=M …`，
+        #      断言 裁剪矩形 == 当前客户区派生值（content_w == client_w-151、content_h == client_h-76）；
+        #   ② 列数随宽度变化：cols == content_w // 96（格子宽）且缩放后列数**变大**；
+        #   ③ 内容相对窗口原点不偏移：导航分隔线 / 状态栏那条仍在同一客户区相对偏移上；
+        #   ④ 新多出来的那一条带**真的被应用画了**（内容白 + 边框），而不是只剩外壳的 client_bg(240,240,240)。
+        print("=== 阶段 9：布局自适应（①：裁剪区=客户区 / 列数随宽度 / 内容不偏移 / 新区域被画）===")
+        LAY_RE = re.compile(r"\[UI\] exp layout client=(\d+)x(\d+) content=(\d+),(\d+) (\d+)x(\d+) "
+                            r"cols=(\d+) rows=(\d+) view=(\S+) card_w=(\d+)")
+        CLIENT_BG = (240, 240, 240)      # theme64：外壳客户区底色（未画区域就是这个色）
+        C_STATUS = (245, 245, 245)       # explorer 状态栏底色
+
+        def layout_lines():
+            return [m.groups() for m in LAY_RE.finditer(vm.log())]
+
+        def lay(l):
+            return dict(client_w=int(l[0]), client_h=int(l[1]), cx=int(l[2]), cy=int(l[3]),
+                        cw=int(l[4]), ch=int(l[5]), cols=int(l[6]), rows=int(l[7]),
+                        view=l[8], card_w=int(l[9]))
+        def last(pat, text, flags=0):
+            hits = list(re.finditer(pat, text, flags))
+            return hits[-1] if hits else None
+
+
+        def calibrate_at(tx, ty, tries=4):
+            """在窗口内 (tx,ty) 点一下，用 explorer 自己的 click 打点量出落点误差（闭环）。"""
+            dxe = dye = 0
+            for i in range(tries):
+                blind_goto(mon, tx + dxe, ty + dye)
+                since_c = len(vm.log())
+                single_click_at(mon)
+                p = last_probe(vm, since_c)
+                if p is None:
+                    dxe = dye = 0
+                    continue
+                dxe, dye = tx - p[0], ty - p[1]
+                if abs(dxe) <= 4 and abs(dye) <= 4:
+                    return dxe, dye, i + 1
+            return dxe, dye, tries
+
+        ensure_window_on_top(vm, mon)
+
+        def raise_top():
+            """把 explorer 置顶：单击标题栏中部（不改几何、不触发菜单/控件）。
+
+            踩过的坑：样式化之后的下方区域会被**浮层**（开始菜单/弹窗）盖住 —— 那会让
+            "分隔线/状态栏还在不在"这类像素判定假失败。所以每次截图前先收掉浮层 + 点标题栏置顶。
+            """
+            mon.key("esc", wait=0.6)
+            blind_goto(mon, WIN_X + 300, WIN_Y + 12)
+            single_click_at(mon)
+            time.sleep(0.8)
+
+        raise_top()
+        n_before = len(vm.log())
+        before = layout_lines()
+        lay0 = lay(before[-1]) if before else None
+        if lay0 is None:
+            check("缩放前拿到 [UI] exp layout 打点", False, "（没有 [UI] exp layout 行）")
+        else:
+            check("缩放前：打点里的客户区 == 660x470 窗口的客户区 658x444",
+                  lay0["client_w"] == 658 and lay0["client_h"] == 444,
+                  "client=%dx%d" % (lay0["client_w"], lay0["client_h"]))
+            check("★ ① 裁剪矩形 == 当前客户区派生值（content=(151,54) 且 cw=client_w-151、ch=client_h-76）",
+                  lay0["cx"] == CONTENT_X and lay0["cy"] == CONTENT_Y
+                  and lay0["cw"] == lay0["client_w"] - CONTENT_X
+                  and lay0["ch"] == lay0["client_h"] - CONTENT_Y - STATUS_H,
+                  "content=%d,%d %dx%d（客户区 %dx%d）" % (lay0["cx"], lay0["cy"], lay0["cw"], lay0["ch"],
+                                                        lay0["client_w"], lay0["client_h"]))
+            check("缩放前列数 == cw/96（507/96 = 5 列）",
+                  lay0["cols"] == lay0["cw"] // ICON_CELL_W and lay0["cols"] == 5,
+                  "cols=%d cw=%d" % (lay0["cols"], lay0["cw"]))
+        shot_b = os.path.join(tmp, "layout_before.ppm")
+        check("缩放前截图", mon.shot(shot_b))
+        pxb = read_ppm(shot_b) if os.path.exists(shot_b) else None
+
+        # ---- 拖右边缘放大（QEMU monitor 真 PS/2 包：相对位移 + 闭环误差修正）----
+        # 为什么先"量误差"：monitor 只能发相对包，长距离盲走会因丢包偏差几十像素，而抓取带只有 6px。
+        # 先在窗口内离右边缘 20px 处点一下（explorer 自己的 click 打点给出真实落点），把误差带到边缘目标上。
+        # ★ 修（抖动）：guest 每包最多走 MOUSE_STEP_MAX=24px，原来只发 5 包（理论 +120px），在负载下
+        #   常常只走到 +48px -> "客户区变宽 >= 100px" 这条假失败。现在：
+        #   (1) 每轮用**当前**客户区宽重算右边缘（上一轮已经变宽后仍抓得准，不会误触发窗口移动）；
+        #   (2) 每轮发 12 包（理论 +288px），并按"'相对初始客户区已宽 >= 100px' 才停"判成功；
+        #   (3) 最多 4 轮。断言（>= 100px）一个字没改。
+        def cur_client_w():
+            m = last(r"\[UI\] exp layout client=(\d+)x", vm.log())
+            return int(m.group(1)) if m else 658
+
+        cw0 = cur_client_w()
+        grew, tried = False, 0
+        for attempt in range(4):
+            tried = attempt + 1
+            cw_now = cur_client_w()
+            if cw_now >= cw0 + 100:
+                grew = True
+                break
+            edge = WIN_X + (cw_now + 2) - 3         # 外框宽 = 客户区宽 + 2（BORDER 左右各 1）
+            dxe, dye, _n = calibrate_at(edge - 17, WIN_Y + WIN_H // 2)
+            tx, ty = edge + dxe, WIN_Y + WIN_H // 2 + dye
+            since_d = len(vm.log())
+            blind_goto(mon, tx, ty)
+            time.sleep(0.4)
+            mon.send("mouse_button 1", wait=0.4)
+            for _ in range(12):                     # 每包 guest 侧最多走 24px -> 最多 +288px
+                mon.send("mouse_move 100 0", wait=0.12)
+            time.sleep(0.3)
+            mon.send("mouse_button 0", wait=0.8)
+            time.sleep(1.0)
+        grew = grew or (cur_client_w() >= cw0 + 100)
+        check("右边缘拖拽缩放成立（[UI] win resize … client=…，尝试 %d 次）" % tried, grew,
+              "client_w %d -> %d" % (cw0, cur_client_w()))
+        rlog = vm.log()[n_before:]
+        # 窗口外框原点（像素判定的参照系）：**两次都取同一次拖拽的 resize 打点** ——
+        # "begin" 行 = 拖动前的外框；最后一条 "dir/end" 行 = 拖动后的外框。两者必然是同被拖的
+        # 那个窗口（explorer 主窗）。★ 旧 WIP 用 `[UI] win geom … app=7` 的最后一行，实测取到了
+        # **"文本预览"窗口**（它也是 APP_ID_MYPC=7，且 title 无空格所以能过 `title=\S+`）——
+        # 实测拿到 (820,430)（预览窗）而不是 explorer 的 (120,60)，于是锚点全扫在错误的位置上。
+        begins = re.findall(r"\[UI\] win resize begin dir=\S+ x=(\d+) y=(\d+) w=(\d+) h=(\d+)", rlog)
+        dirs = re.findall(r"\[UI\] win resize (?:dir|end) dir=\S+ x=(\d+) y=(\d+) w=(\d+) h=(\d+)", rlog)
+        mg0 = begins[0] if begins else None
+        mg1 = dirs[-1] if dirs else None
+        win0 = (int(mg0[0]), int(mg0[1])) if mg0 else (WIN_X, WIN_Y)
+        win1 = (int(mg1[0]), int(mg1[1])) if mg1 else win0
+        check("★ 缩放参照系：拖动前后的外框原点都取到（且都 == 脚本常量 (120,60)，resize 只改宽高）",
+              mg0 is not None and mg1 is not None and win0 == (WIN_X, WIN_Y) and win1 == win0,
+              "win0=%s win1=%s" % (win0, win1))
+        check("缩放帧打点含右边缘方向（dir=r）",
+              re.search(r"\[UI\] win resize dir=r x=\d+ y=\d+ w=\d+ h=\d+ client=\d+x\d+", rlog) is not None,
+              (re.search(r"\[UI\] win resize (begin|end|dir)[^\r\n]*", rlog).group(0)
+               if re.search(r"\[UI\] win resize", rlog) else "（无 [UI] win resize 行）"))
+        after = layout_lines()[len(before):]
+        lay1 = lay(after[-1]) if after else None
+        check("缩放后**重新打了一条** [UI] exp layout（重排真的发生）", lay1 is not None,
+              ("client=%dx%d content=%dx%d cols=%d" %
+               (lay1["client_w"], lay1["client_h"], lay1["cw"], lay1["ch"], lay1["cols"]))
+              if lay1 else "（没有新行）")
+        if lay0 and lay1:
+            check("★ ① 缩放后 裁剪矩形 == 新客户区派生值（cw=client_w-151、ch=client_h-76）",
+                  lay1["cw"] == lay1["client_w"] - CONTENT_X
+                  and lay1["ch"] == lay1["client_h"] - CONTENT_Y - STATUS_H,
+                  "client=%dx%d content=%d,%d %dx%d" % (lay1["client_w"], lay1["client_h"], lay1["cx"],
+                                                      lay1["cy"], lay1["cw"], lay1["ch"]))
+            check("★ ② 列数随宽度变化：宽 %d -> cols=%d；宽 %d -> cols=%d（列数 = cw/96）"
+                  % (lay0["client_w"], lay0["cols"], lay1["client_w"], lay1["cols"]),
+                  lay1["cols"] == lay1["cw"] // ICON_CELL_W and lay1["cols"] > lay0["cols"],
+                  "cols %d -> %d（cw %d -> %d）" % (lay0["cols"], lay1["cols"], lay0["cw"], lay1["cw"]))
+            check("缩放后客户区确实变宽（>= 100px）", lay1["client_w"] >= lay0["client_w"] + 100,
+                  "client_w %d -> %d" % (lay0["client_w"], lay1["client_w"]))
+        shot_a = os.path.join(tmp, "layout_after.ppm")
+        raise_top()                                     # 拖完再收浮层 + 点标题栏置顶，保证 after 帧是 explorer 自己的画面
+        settle_frames(vm, max(0, len(vm.log()) - 4))
+        check("缩放后截图", mon.shot(shot_a))
+        pxa = read_ppm(shot_a) if os.path.exists(shot_a) else None
+        if pxb and pxa and lay0 and lay1:
+            # ★ 修（工具侧 bug）：read_ppm 返回 (w, h, px)，下面所有 sample/rect_count 都要**宽度**当行跨；
+            #   原 WIP 写成 `_, w0, pb = pxb`（拿到的是高度 800）→ 所有取样按 800 的行跨算，
+            #   像素全看错位置：③ 锚点找不到（None/-4）、④ 数出来的白像素也是错的。这里改正并断言尺寸。
+            w0, h0, pb = pxb[0], pxb[1], pxb[2]
+            w1s, h1s, pa = pxa[0], pxa[1], pxa[2]
+            check("缩放前后截图都是 1280x800（像素判定的行跨 == 屏宽）",
+                  (w0, h0) == (1280, 800) and (w1s, h1s) == (w0, h0),
+                  "before=%dx%d after=%dx%d" % (w0, h0, w1s, h1s))
+            c_at = lambda px, xx, yy: tuple(sample(px, w0, xx, yy))     # noqa: E731
+
+            # 相对窗口原点的"锚点"扫描（不假设 client 相对外框偏 1px，只用外框原点当参照系）：
+            #   (a) 导航/内容分隔线：客户区里那条 1px 竖线（C_LINE）离外框左边的距离；
+            #   (b) 状态栏：客户区底部那条 22px 横带（C_STATUS，245）离外框上边的距离。
+            # 判据用"连续整列/整行命中数最强的那条"，不是"从窗口外第一个命中就返回"——后者会被
+            # 壁纸/窗口投影的单像素假命中骗到（原 WIP 实测分隔线被报成 -4px，即窗口左边的阴影）。
+            # 注意：这不是放水，反而是更严的判据（要求一条 >=150px 长的连续线，单点假命中过不了）。
+            def col_run(px, x, y0, y1, target, tol):
+                n = 0
+                for yy in range(y0, y1):
+                    if near(sample(px, w0, x, yy), target, tol):
+                        n += 1
+                return n
+
+            def row_run(px, y, x0, x1, target, tol):
+                n = 0
+                for xx in range(x0, x1):
+                    if near(sample(px, w0, xx, y), target, tol):
+                        n += 1
+                return n
+
+            def anchor_vline(px, wx, wy):
+                y0, y1 = wy + 100, wy + 400
+                best, bx = 0, None
+                for x in range(max(0, wx - 8), min(w0, wx + 260)):
+                    n = col_run(px, x, y0, y1, C_LINE, 14)
+                    if n > best:
+                        best, bx = n, x
+                return (bx - wx) if (bx is not None and best >= 150) else None
+
+            def anchor_status(px, wx, wy):
+                x0, x1 = wx + 5, min(w0, wx + 300)
+                best, by = 0, None
+                for y in range(wy + 380, min(h0, wy + 469)):
+                    n = row_run(px, y, x0, x1, C_STATUS, 4)
+                    if n > best:
+                        best, by = n, y
+                return (by - wy) if (by is not None and best >= 150) else None
+
+            sep_b, sep_a = anchor_vline(pb, win0[0], win0[1]), anchor_vline(pa, win1[0], win1[1])
+            st_b, st_a = anchor_status(pb, win0[0], win0[1]), anchor_status(pa, win1[0], win1[1])
+            tb_b = rect_count(pb, w0, win0[0], win0[1], win0[0] + lay0["cw"], win0[1] + 24, (247, 247, 247), tol=4)
+            tb_a = rect_count(pa, w0, win1[0], win1[1], win1[0] + lay1["cw"], win1[1] + 24, (247, 247, 247), tol=4)
+            print("      [信息] 可见性自查：工具栏底色像素 前=%d 后=%d；分隔线列颜色 前=%s 后=%s"
+                  % (tb_b, tb_a, c_at(pb, win0[0] + 160, win0[1] + 200), c_at(pa, win1[0] + 160, win1[1] + 200)))
+            print("      [信息] 相对外框原点的锚点：分隔线 前=%s 后=%s；状态栏 前=%s 后=%s（px）"
+                  % (sep_b, sep_a, st_b, st_a))
+            check("★ ③ 内容不偏移：导航/内容分隔线在外框左边 %s（缩放前）/ %s（缩放后）—— 同一相对偏移 ±2px"
+                  % (sep_b, sep_a),
+                  sep_b is not None and sep_a is not None and abs(sep_b - sep_a) <= 2 and 145 <= sep_b <= 160)
+            check("★ ③ 内容不偏移：状态栏在外框上边 %s（前）/ %s（后）—— 同一相对偏移 ±2px"
+                  % (st_b, st_a),
+                  st_b is not None and st_a is not None and abs(st_b - st_a) <= 2 and 440 <= st_b <= 452)
+            # ★ 修：新增区域的屏幕带必须**从旧内容区右界之后**起算（原 WIP 漏了 +CONTENT_X，
+            #   带子落回旧内容区里，测的就不是"新长出来的那一条"了）。正确的带子：
+            #   起点 = 外框左 + 1(BORDER) + CONTENT_X + 旧 content_w + 4；终点 = 同式 + 新 content_w - 8。
+            band_x0 = win1[0] + 1 + CONTENT_X + lay0["cw"] + 4    # 旧内容区右界之后
+            band_x1 = win1[0] + 1 + CONTENT_X + lay1["cw"] - 8    # 新内容区右界之内
+            band_y0 = win1[1] + 25 + CONTENT_Y + 40               # 避开预览窗口（它从客户区 y>=345 起）
+            band_y1 = win1[1] + 25 + CONTENT_Y + 280
+            if band_x1 - band_x0 >= 20:
+                white_a = rect_count(pa, w0, band_x0, band_y0, band_x1, band_y1, (255, 255, 255), tol=3)
+                bgc = rect_count(pa, w0, band_x0, band_y0, band_x1, band_y1, CLIENT_BG, tol=2)
+                white_b = rect_count(pb, w0, band_x0, band_y0, band_x1, band_y1, (255, 255, 255), tol=3)
+                tot = (band_x1 - band_x0) * (band_y1 - band_y0)
+                print("      [信息] 新区域带 x=[%d,%d) y=[%d,%d)：内容白 前=%d 后=%d；client_bg=%d"
+                      % (band_x0, band_x1, band_y0, band_y1, white_b, white_a, bgc))
+                check("★ ④ 新客户区右带被应用画了（内容白像素 %d / %d；外壳 client_bg 仅 %d）"
+                      % (white_a, tot, bgc), white_a > tot // 3 and white_a > bgc * 3,
+                      "band=%dx%d" % (band_x1 - band_x0, band_y1 - band_y0))
+                check("★ ④ 对照：缩放前同一屏幕区域不是内容白（窗口还没长到那里）",
+                      white_b < white_a and white_b < tot // 3,
+                      "white 前=%d 后=%d tot=%d" % (white_b, white_a, tot))
+            else:
+                check("★ ④ 新客户区右带宽度足够判定", False, "band_w=%d" % (band_x1 - band_x0))
+        else:
+            check("布局自适应的像素验收", False, "缺截图/打点")
+        # ==================== 阶段 10：日志卫生 ====================
+        print("=== 阶段 10：日志卫生 ===")
         final = vm.log()
         forbid("全程", final)
         check("文件管理器自检只 PASS 没 FAIL", "selftest FAIL" not in final)

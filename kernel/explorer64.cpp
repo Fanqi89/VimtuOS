@@ -50,12 +50,15 @@
 
 #define EXP_CONTENT_X (EXP_NAV_W + 1)                      // 151
 #define EXP_CONTENT_Y (EXP_TOOLBAR_H + EXP_ADDR_H)         // 54
-#define EXP_CONTENT_W (EXP_WIN_W - 2 - EXP_CONTENT_X)      // 507
-#define EXP_CONTENT_H (EXP_WIN_H - 25 - 1 - EXP_CONTENT_Y - EXP_STATUS_H)   // 368
+// ★ 修复（① 布局写死）：内容区宽高**不再**是编译期常量，而是随当前窗口客户区算（见
+//   exp_content_w64/exp_content_h64）。下面两个 _DEF 只是"没有窗口可用"时的兜底（= 660x470 的旧值）：
+//   旧值 EXP_CONTENT_W = EXP_WIN_W-2-EXP_CONTENT_X = 507，EXP_CONTENT_H = 444-54-22 = 368。
+#define EXP_CONTENT_W_DEF 507                              // (660-2-151) 兜底
+#define EXP_CONTENT_H_DEF 368                              // (444-54-22) 兜底
 
 #define EXP_CARD_TOP   (EXP_CONTENT_Y + 30)                // 84
 #define EXP_CARD_X     (EXP_CONTENT_X + 10)                // 161
-#define EXP_CARD_W     (EXP_CONTENT_W - 20)                // 487
+#define EXP_CARD_W_DEF (EXP_CONTENT_W_DEF - 20)            // 487（兜底；运行时用 exp_card_w64()）
 #define EXP_CARD_H     78
 #define EXP_CARD_GAP   10
 #define EXP_BAR_W      300
@@ -156,6 +159,38 @@ struct ExpNav {
 };
 
 static Window* g_win = nullptr;
+
+// ==================== ★ 修复（① 布局写死）：客户区自适应几何 ====================
+// 缺陷：内容区宽高是编译期常量（507x368 = 660x470 窗口的值），工具栏/状态栏按 EXP_WIN_W-2 铺，
+//       文件列表的裁剪矩形（exp_draw）也写死成常量 —— 于是拖边框把窗口放大后，多出来的区域
+//       只有外壳铺的 client_bg，应用一个像素都不画（"内容不随尺寸变化"）。
+// 修法：所有"随客户区变"的量都改成**按当前窗口客户区现算**（无窗口时退回旧常量），
+//       网格列数 = 内容宽/格子宽（至少 1）。每次重排打一行 [UI] exp layout 作为验收证据。
+static int exp_client_w64(void) {
+    const Window* w = g_win;
+    const int v = (w && w->client_w > 0) ? w->client_w : (EXP_WIN_W - 2);
+    return v > 0 ? v : 1;
+}
+static int exp_client_h64(void) {
+    const Window* w = g_win;
+    const int v = (w && w->client_h > 0) ? w->client_h : (EXP_WIN_H - 25 - 1);
+    return v > 0 ? v : 1;
+}
+static int exp_content_w64(void) {
+    int v = exp_client_w64() - EXP_CONTENT_X;
+    if (v < EXP_ICON_CELL_W) v = EXP_ICON_CELL_W;        // 至少一格宽 -> 列数 >= 1
+    return v;
+}
+static int exp_content_h64(void) {
+    int v = exp_client_h64() - EXP_CONTENT_Y - EXP_STATUS_H;
+    if (v < EXP_DET_ROW_H) v = EXP_DET_ROW_H;            // 至少一行高（导航/状态栏不能被挤掉）
+    return v;
+}
+static int exp_card_w64(void) {                          // 驱动器卡片宽（原来 = EXP_CONTENT_W - 20）
+    int v = exp_content_w64() - 20;
+    if (v < 60) v = 60;
+    return v;
+}
 static Window* g_prev_win = nullptr;
 
 static int  g_mode = 0;
@@ -861,7 +896,7 @@ static void exp_cell_rect(int i, int* x, int* y, int* w, int* h) {
     const int k = (i < 0) ? 0 : (i - g_scroll);
     if (k < 0) { *x = EXP_CONTENT_X; *y = EXP_CONTENT_Y; *w = EXP_ICON_CELL_W; *h = EXP_ICON_CELL_H; return; }
     if (g_view == 0) {
-        int cols = EXP_CONTENT_W / EXP_ICON_CELL_W;
+        int cols = exp_content_w64() / EXP_ICON_CELL_W;
         if (cols < 1) cols = 1;
         const int col = k % cols, row = k / cols;
         *x = EXP_CONTENT_X + col * EXP_ICON_CELL_W;
@@ -875,11 +910,11 @@ static void exp_cell_rect(int i, int* x, int* y, int* w, int* h) {
         *h = EXP_DET_ROW_H;
     }
     // 画到内容区外就钳回可见区最后一行（有界：绝不写到导航窗格/状态栏上）
-    if (*y + *h > EXP_CONTENT_Y + EXP_CONTENT_H - 2) {
-        *y = EXP_CONTENT_Y + EXP_CONTENT_H - 2 - *h;
+    if (*y + *h > EXP_CONTENT_Y + exp_content_h64() - 2) {
+        *y = EXP_CONTENT_Y + exp_content_h64() - 2 - *h;
         if (*y < EXP_CONTENT_Y) *y = EXP_CONTENT_Y;
     }
-    if (*x + *w > EXP_CONTENT_X + EXP_CONTENT_W - 2) *x = EXP_CONTENT_X + EXP_CONTENT_W - 2 - *w;
+    if (*x + *w > EXP_CONTENT_X + exp_content_w64() - 2) *x = EXP_CONTENT_X + exp_content_w64() - 2 - *w;
 }
 // 框选命中：条目单元格与框有交集就算命中（与桌面 selbox 的 icon_hits_sel 同思路）
 static bool exp_cell_hits_box(int i) {
@@ -1603,8 +1638,8 @@ static void exp_ctx_open_at(int cx, int cy, int blank, int item) {
     g_ctx_n = exp_ctx_count();
     int x = cx, y = cy;
     const int h = exp_ctx_height();
-    if (x + EXP_CTX_W > EXP_CONTENT_X + EXP_CONTENT_W - 2) x = EXP_CONTENT_X + EXP_CONTENT_W - 2 - EXP_CTX_W;
-    if (y + h > EXP_CONTENT_Y + EXP_CONTENT_H - 2) y = EXP_CONTENT_Y + EXP_CONTENT_H - 2 - h;
+    if (x + EXP_CTX_W > EXP_CONTENT_X + exp_content_w64() - 2) x = EXP_CONTENT_X + exp_content_w64() - 2 - EXP_CTX_W;
+    if (y + h > EXP_CONTENT_Y + exp_content_h64() - 2) y = EXP_CONTENT_Y + exp_content_h64() - 2 - h;
     if (x < EXP_CONTENT_X) x = EXP_CONTENT_X;
     if (y < EXP_CONTENT_Y) y = EXP_CONTENT_Y;
     g_ctx_x = x;
@@ -1714,11 +1749,11 @@ static void txt_clip(int x, int y, const char* s, uint32_t c, int maxw) { text_c
 
 // ==================== 绘制 ====================
 static int vis_rows(void) {
-    if (g_view == 1) return (EXP_CONTENT_H - 24) / EXP_DET_ROW_H;
-    return (EXP_CONTENT_H - 4) / EXP_ICON_CELL_H;
+    if (g_view == 1) return (exp_content_h64() - 24) / EXP_DET_ROW_H;
+    return (exp_content_h64() - 4) / EXP_ICON_CELL_H;
 }
 static int icon_cols(void) {
-    const int c = EXP_CONTENT_W / EXP_ICON_CELL_W;
+    const int c = exp_content_w64() / EXP_ICON_CELL_W;
     return c > 0 ? c : 1;
 }
 static int per_page(void) {
@@ -1762,7 +1797,7 @@ static int btn_id_at(int cx, int cy, int* crumb_idx) {
                 const int wk = tw(seg) + 14;
                 if (cx < x + wk) { if (crumb_idx) *crumb_idx = k + 1; return IDC_CRUMB; }
                 x += wk + 12;
-                if (x > EXP_CONTENT_X + EXP_CONTENT_W) break;   // 画不下就不再看（有界）
+                if (x > EXP_CONTENT_X + exp_content_w64()) break;   // 画不下就不再看（有界）
             }
         }
         return IDC_NONE;
@@ -1791,8 +1826,8 @@ static void crumb_activate(int k) {
 // 驱动卡片（图标 + 卷标(盘符) + 容量条 + "X 可用，共 Y"）
 static void draw_drive_card(const DriveInfo64* d, int cx0, int cy0, int selected) {
     const int x = EXP_CONTENT_X + cx0, y = EXP_CONTENT_Y + cy0;
-    frect(x, y, EXP_CARD_W, EXP_CARD_H, C_EXP_CARD);
-    drect(x, y, EXP_CARD_W, EXP_CARD_H, selected ? rgb(0, 120, 215) : C_EXP_LINE);
+    frect(x, y, exp_card_w64(), EXP_CARD_H, C_EXP_CARD);
+    drect(x, y, exp_card_w64(), EXP_CARD_H, selected ? rgb(0, 120, 215) : C_EXP_LINE);
     // 盘图标（几何：蓝灰盘体 + 面）
     frect(x + 12, y + 20, 34, 26, d->browsable ? rgb(120, 144, 176) : rgb(176, 176, 176));
     frect(x + 12, y + 26, 34, 8, rgb(232, 240, 250));
@@ -1808,7 +1843,7 @@ static void draw_drive_card(const DriveInfo64* d, int cx0, int cy0, int selected
     } else {
         e_strcpy(nm, d->name, (int)sizeof(nm));
     }
-    txt_clip(x + 58, y + 10, nm, name_fg, EXP_CARD_W - 70);
+    txt_clip(x + 58, y + 10, nm, name_fg, exp_card_w64() - 70);
     // 容量条
     const int bx = x + 58, by = y + 34;
     frect(bx, by, EXP_BAR_W, EXP_BAR_H, C_EXP_BAR_BG);
@@ -1848,7 +1883,7 @@ static void draw_drive_card(const DriveInfo64* d, int cx0, int cy0, int selected
         const char* why = (d->skip == DRV64_SKIP_ESP)
             ? gui64_tr("EFI System Partition (not browsable)", "EFI 系统分区（不浏览）")
             : gui64_tr("Unknown file system (not browsable)", "未识别文件系统（不浏览）");
-        txt_clip(x + 58, y + 52 + 18, why, C_EXP_DIM, EXP_CARD_W - 70);
+        txt_clip(x + 58, y + 52 + 18, why, C_EXP_DIM, exp_card_w64() - 70);
     }
 }
 
@@ -1887,7 +1922,7 @@ static void draw_item_icon(int x, int y, const Fs64Dirent64* d) {
 
 static void draw_content(void) {
     const int ax = EXP_CONTENT_X, ay = EXP_CONTENT_Y;
-    const int aw = EXP_CONTENT_W, ah = EXP_CONTENT_H;
+    const int aw = exp_content_w64(), ah = exp_content_h64();
     frect(ax, ay, aw, ah, rgb(255, 255, 255));
     if (g_mode == 0) {
         // ---- 此电脑：设备和驱动器 (N) ----
@@ -1978,8 +2013,8 @@ static bool exp_tb_enabled(int id) {
     return sel_count() > 0;                            // 复制/剪切/重命名/删除
 }
 static void draw_toolbar(void) {
-    frect(0, 0, EXP_WIN_W - 2, EXP_TOOLBAR_H, C_EXP_TOOLBAR);   // ★ 批次 J：铺满整行（第 2 组按钮也在这一行）
-    frect(0, EXP_TOOLBAR_H - 1, EXP_WIN_W - 2, 1, C_EXP_LINE);
+    frect(0, 0, exp_client_w64(), EXP_TOOLBAR_H, C_EXP_TOOLBAR);   // ★ 批次 J：铺满整行（第 2 组按钮也在这一行）
+    frect(0, EXP_TOOLBAR_H - 1, exp_client_w64(), 1, C_EXP_LINE);
     const char* labels[3];
     labels[0] = gui64_tr("File", "文件");
     labels[1] = gui64_tr("Computer", "计算机");
@@ -2029,7 +2064,7 @@ static void draw_addr(void) {
         else { for (int k = 0; k < 6; k++) frect(cx - 5 + k, cy + 4 - k, 11 - 2 * k, 1, gl); }
     }
     // 面包屑（白底 + 边框 + 每段一个可点区域）
-    const int bx = 96, bw = EXP_CONTENT_X + EXP_CONTENT_W - 96 - 6;
+    const int bx = 96, bw = EXP_CONTENT_X + exp_content_w64() - 96 - 6;
     frect(bx, y0 + 3, bw, EXP_ADDR_H - 6, C_EXP_ADDR);
     drect(bx, y0 + 3, bw, EXP_ADDR_H - 6, C_EXP_LINE);
     int x = bx + 7;
@@ -2059,7 +2094,7 @@ static void draw_addr(void) {
     }
 }
 static void draw_nav(void) {
-    const int nh = EXP_CONTENT_Y + EXP_CONTENT_H - (EXP_TOOLBAR_H + EXP_ADDR_H);
+    const int nh = EXP_CONTENT_Y + exp_content_h64() - (EXP_TOOLBAR_H + EXP_ADDR_H);
     frect(0, EXP_CONTENT_Y, EXP_NAV_W, nh, C_EXP_NAV);
     frect(EXP_NAV_W, EXP_CONTENT_Y, 1, nh, C_EXP_LINE);
     txt(8, EXP_CONTENT_Y + 6, gui64_tr("Quick access", "快速访问"), C_EXP_DIM);
@@ -2095,9 +2130,9 @@ static void draw_nav(void) {
     }
 }
 static void draw_status(void) {
-    const int y = EXP_CONTENT_Y + EXP_CONTENT_H;
-    frect(0, y, EXP_WIN_W - 2, EXP_STATUS_H, C_EXP_STATUS);
-    frect(0, y, EXP_WIN_W - 2, 1, C_EXP_LINE);
+    const int y = EXP_CONTENT_Y + exp_content_h64();
+    frect(0, y, exp_client_w64(), EXP_STATUS_H, C_EXP_STATUS);
+    frect(0, y, exp_client_w64(), 1, C_EXP_LINE);
     char buf[96];
     e_strcpy(buf, "", (int)sizeof(buf));
     if (g_mode == 1) {
@@ -2137,12 +2172,12 @@ static void draw_status(void) {
         e_strcpy(r, a, (int)sizeof(r));
         e_strcat(r, gui64_tr(" free of ", " 可用，共 "), (int)sizeof(r));
         e_strcat(r, b, (int)sizeof(r));
-        txt_clip(EXP_CONTENT_X + EXP_CONTENT_W - tw(r) - 6, y + 4, r, C_EXP_DIM, EXP_CONTENT_W);
+        txt_clip(EXP_CONTENT_X + exp_content_w64() - tw(r) - 6, y + 4, r, C_EXP_DIM, exp_content_w64());
     }
     // ★ 批次 J：操作提示（"再按一次 Delete 确认"等）—— 原来画在工具栏行，现在工具栏放了文件操作按钮，
     // 提示移到状态栏中段（红棕色，肉眼可见；自动验收按颜色像素判定"用户真的看到了提示"）。
     if (g_msg[0] && (int32_t)(ticks64() - g_msg_tick) < 0)
-        txt_clip(310, y + 4, g_msg, rgb(160, 60, 60), EXP_CONTENT_X + EXP_CONTENT_W - 316);
+        txt_clip(310, y + 4, g_msg, rgb(160, 60, 60), EXP_CONTENT_X + exp_content_w64() - 316);
 }
 static void draw_filemenu(void) {
     if (!g_menu_open) return;
@@ -2217,6 +2252,39 @@ static void draw_selbox(void) {
     frect(x0, y0, bw, bh, C_EXP_BOX_IN);
     drect(x0, y0, bw, bh, C_EXP_BOX_LINE);
 }
+// ★ 修复（①）证据行：客户区/内容区几何 + 网格列行数。只在**重排发生时**打（拖边框缩放会各打一行），
+//   验收脚本靠它拿"缩放前的列数"与"缩放后的列数"（列数随宽度变化）+ 裁剪矩形 = 客户区派生值。
+static void exp_log_layout64(const Window* w) {
+    static int last_cw = -1, last_ch = -1, last_cols = -1, last_rows = -1;
+    const int cw = w ? w->client_w : exp_client_w64();
+    const int ch = w ? w->client_h : exp_client_h64();
+    const int cols = icon_cols(), rows = vis_rows();
+    if (cw == last_cw && ch == last_ch && cols == last_cols && rows == last_rows) return;
+    last_cw = cw; last_ch = ch; last_cols = cols; last_rows = rows;
+    dbg64_line_begin64();
+    dbg64_str("[UI] exp layout client=");
+    dbg64_dec((uint64_t)cw);
+    dbg64_str("x");
+    dbg64_dec((uint64_t)ch);
+    dbg64_str(" content=");
+    dbg64_dec((uint64_t)EXP_CONTENT_X);
+    dbg64_str(",");
+    dbg64_dec((uint64_t)EXP_CONTENT_Y);
+    dbg64_str(" ");
+    dbg64_dec((uint64_t)exp_content_w64());
+    dbg64_str("x");
+    dbg64_dec((uint64_t)exp_content_h64());
+    dbg64_str(" cols=");
+    dbg64_dec((uint64_t)cols);
+    dbg64_str(" rows=");
+    dbg64_dec((uint64_t)rows);
+    dbg64_str(" view=");
+    dbg64_str(g_view ? "details" : "icons");
+    dbg64_str(" card_w=");
+    dbg64_dec((uint64_t)exp_card_w64());
+    dbg64_nl();
+    dbg64_line_end64();
+}
 static void exp_draw(Window* w) {
     g_ox = w->client_x;             // 客户区相对坐标 -> 屏幕坐标（见上面的绘制坐标约定）
     g_oy = w->client_y;
@@ -2248,7 +2316,11 @@ static void exp_draw(Window* w) {
         if (g_ctx_open) gui64_dirty(w->client_x + g_ctx_x, w->client_y + g_ctx_y, EXP_CTX_W, exp_ctx_height());
     }
     // 内容区（自己再设一次裁剪：内容不得溢出到导航窗格/状态栏）
-    fb_set_clip(w->client_x + EXP_CONTENT_X, w->client_y + EXP_CONTENT_Y, EXP_CONTENT_W, EXP_CONTENT_H);
+    // ★ 修复（①）：裁剪矩形 = **当前客户区**里的内容区（原来是编译期常量，放大窗口后多出来的
+    //   区域画不到 -> "内容不随尺寸变化"）。参数逐一取自 exp_content_w64()/h64()。
+    exp_log_layout64(w);
+    fb_set_clip(w->client_x + EXP_CONTENT_X, w->client_y + EXP_CONTENT_Y,
+                exp_content_w64(), exp_content_h64());
     draw_content();
     draw_selbox();                                     // ★ 批次 J：框选矩形（画在内容之上、菜单之下）
     fb_set_clip(w->client_x, w->client_y, w->client_w, w->client_h);
@@ -2266,7 +2338,7 @@ static void exp_draw(Window* w) {
 // ==================== 命中测试 / 点击 ====================
 static int hit_card(int cx, int cy) {
     if (g_mode != 0) return -1;
-    if (cx < EXP_CARD_X || cx >= EXP_CARD_X + EXP_CARD_W) return -1;
+    if (cx < EXP_CARD_X || cx >= EXP_CARD_X + exp_card_w64()) return -1;
     for (int i = g_scroll; i < g_drive_n; i++) {
         const int y = EXP_CARD_TOP + (i - g_scroll) * (EXP_CARD_H + EXP_CARD_GAP);
         if (cy >= y && cy < y + EXP_CARD_H) return i;
@@ -2277,7 +2349,7 @@ static int hit_card(int cx, int cy) {
 static int hit_item(int cx, int cy) {
     if (g_mode != 1) return -1;
     const int rx = cx - EXP_CONTENT_X, ry = cy - EXP_CONTENT_Y;
-    if (rx < 0 || ry < 0 || rx >= EXP_CONTENT_W || ry >= EXP_CONTENT_H) return -1;
+    if (rx < 0 || ry < 0 || rx >= exp_content_w64() || ry >= exp_content_h64()) return -1;
     if (g_view == 0) {
         if (ry < 2) return -1;
         const int cols = icon_cols();
@@ -2462,11 +2534,11 @@ static void exp_click(Window* w, int cx, int cy) {
     // 目录视图：滚动条 / 条目
     {
         const int rx = cx - EXP_CONTENT_X, ry = cy - EXP_CONTENT_Y;
-        if (g_items > per_page() && rx >= EXP_CONTENT_W - 12 && ry >= 0 && ry < EXP_CONTENT_H) {
+        if (g_items > per_page() && rx >= exp_content_w64() - 12 && ry >= 0 && ry < exp_content_h64()) {
             int s = g_scroll;
             if (ry < 14) s -= 1;                               // 上箭头
-            else if (ry > EXP_CONTENT_H - 14) s += 1;          // 下箭头
-            else if (ry < EXP_CONTENT_H / 2) s -= per_page();  // 上半页
+            else if (ry > exp_content_h64() - 14) s += 1;          // 下箭头
+            else if (ry < exp_content_h64() / 2) s -= per_page();  // 上半页
             else s += per_page();
             s = clamp_scroll_pure(s, g_items, per_page());
             if (s != g_scroll) {
@@ -2487,7 +2559,7 @@ static void exp_click(Window* w, int cx, int cy) {
             // 空白处：清选择 + **开始框选**（左键按下起框，由 on_tick 跟踪拖动/松开）
             sel_clear();
             g_sel = -1;
-            if (rx >= 0 && ry >= 0 && rx < EXP_CONTENT_W && ry < EXP_CONTENT_H) {
+            if (rx >= 0 && ry >= 0 && rx < exp_content_w64() && ry < exp_content_h64()) {
                 g_box_active = 1;
                 g_box_x0 = g_box_x1 = cx;
                 g_box_y0 = g_box_y1 = cy;
@@ -2657,7 +2729,7 @@ static void exp_click2(Window* w, int cx, int cy, int button) {
     if (button != 1) return;
     if (g_edit_mode != EXP_EDIT_NONE) return;            // 编辑中右键不弹菜单（先回车/Esc 收场）
     const int rx = cx - EXP_CONTENT_X, ry = cy - EXP_CONTENT_Y;
-    const bool in_content = (rx >= 0 && ry >= 0 && rx < EXP_CONTENT_W && ry < EXP_CONTENT_H);
+    const bool in_content = (rx >= 0 && ry >= 0 && rx < exp_content_w64() && ry < exp_content_h64());
     if (!in_content) { exp_ctx_close(); return; }
     g_props_open = 0;
     const int ii = hit_item(cx, cy);
