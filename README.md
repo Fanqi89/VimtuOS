@@ -7,7 +7,37 @@
 全部是本工程自己的 C++ / 汇编代码。
 它自带一张"三合一"安装盘（BIOS 光盘 / U 盘 / UEFI），安装界面与步骤照 Windows 10 做（去掉了输入产品密钥那一步）。
 
-> 版本 **0.4.2-beta19**（标签 `v0.4.2-beta19`）· 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
+> 版本 **0.4.3**（标签 `v0.4.3`；★ 本版起**不再带 `-beta` 后缀**）· 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
+> 状态（权威判据：`python tests/status_report.py`，本版实测）：**完成 80 / 部分 0 / 未做 0（共 80 项能力）**、
+> `--full` 的 `TESTS` 列表 **74** 个脚本、`Get-ChildItem tests\*.py` 实数 **89** 个脚本 ——
+> 本版（**里程碑 M38–M40**）新增 8 项能力：**JPEG 基线解码**（内核里真解 Huffman/DC-AC/反量化/整数 IDCT，
+> 444·422·420 + RSTn + EXIF Orientation 1..8；与 Pillow 逐像素 MAE ≤0.4 / 最大差 ≤3；渐进式如实返回 -2）、
+> **系统音效 + 音频 ABI 49 `audio_play`**（4 段自合成素材 + `/bin/sounder` + click/notify/error/startup 四个触发点）、
+> **任务管理器修复**（进程行 + task64 内核任务行 + 500ms tick 刷新 + 按行型分流 kill）、
+> **文字渲染重叠修复**（光栅化缓冲复用前清 bbox）、**explorer 布局自适应**（几何全按客户区现算）、
+> **锁屏帧尾 render 修复**、**应用窗口坐标口径修复**、**鼠标性能取证 + 灵敏度线性化**。
+> 关键真缺陷（逐条给根因）：**用户报的两条** —— ①**设置窗口内容不随窗口移动**（`settings64.cpp` 把客户区局部坐标
+> 当绝对坐标落笔；修后**窗框位移 = 内容位移 = (118,58)**、平移一致率 0.9999~1.0000，修前内容位移 (0,0)、一致率约 0.86）；
+> ②**锁定后锁屏上仍能看到 Dock/开始菜单**（`gui64.cpp` 帧尾早退没再判锁屏；修后逐区域同屏率 Dock **0.0003** /
+> 屏底 76px **0.3913** / 菜单 **0.0001**，VMware 1024×768 **0.0000 / 0.1889 / 0.0000**，判据 <0.5）。
+> 还有 **HDA 增益真 bug**（放大器能力字解码错 -> 100% 被写成最大衰减，系统音效全听不见；修后 1 kHz 自检
+> **peak=5836 / RMS=5755**、100% > 50% > 静音单调、100% 整窗峰值 21393；修复前 peak 0..259）、
+> **鼠标灵敏度非线性**（缩放结果写回驱动 -> 残差被二次缩放：1700→**1.600** / 800→**1.040** / 1500→**1.420** /
+> 2500→**3.010**；修后 **1.600 / 0.750 / 1.410 / 2.350**，与 sens/1000 偏差 ±6%）、
+> **交付物门禁假命中**（`build64/gzip` 偏移 21856 的 64B 是标准 CRC-32 表的一段，与 `vfs64.o` 里 1037 B 连续段相同
+> -> 旧门禁判"交付物泄漏"、构建在 ISO 组装前 exit 1；改共享探针选择器 `tools/probe64.py`）、
+> **EDIT64 演示把启动期拖成分钟级**（等键循环只有 120s 超时，实测 `[EDIT64] demo phase=a done ticks=30001` = 120.004s；
+> 改按"有没有按键驱动"提前退出）、**开机动画时长**（淡入 300 + 停留 600 + 淡出 300 = **1200ms** / 72 帧 + 任意键跳过）、
+> **最小化动画提速**（Token 化 **225 -> 140ms**）。
+> 体积：安装程序内核 **1,555,888 B**、系统内核 **3,374,784 B**（三层预算：内核 ≤ 4,096,000 B ∧ 余量 ≥ 640 KiB = 655,360 B
+> ∧ ≤ 基线 3,418,352 B + 22,288 B；实测**余量 721,216 B**、相对基线 **-43,568 B（净减）** —— **再涨 65,857 B 触发**）、
+> `loader64.bin` **4,010 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**（`Get-Item` 实读）。
+> ★ **发布流程 §2 第 1 条硬门禁已勾**：`build64.sh` 的 `VIMTUOS_VERSION="0.4.3"` == 本次标签 == 镜像内嵌串
+> （系统内核 `kernel64_os.bin` 里 `0.4.3` 命中 **5** 次、`VimtuOS 0.4.3` **4** 次、终端串 `VimtuOS Terminal v0.4.3` **1** 次；
+> 旧串 `0.4.2-beta19` 两份内核 **0** 次；安装程序内核不含 `0.4.x` 字面量 —— settings/terminal 只编进系统内核，实测 0 命中，如实标注）。
+>
+> ---
+> ★ 以下是**上一版 `v0.4.2-beta19` 的头条说明（历史存档，原文保留）**：
 > 状态（权威判据：`python tests/status_report.py`，本批实测）：**完成 72 / 部分 0 / 未做 0（共 72 项能力）**、
 > `--full` 的 `TESTS` 列表 **66** 个脚本、`Get-ChildItem tests\*.py` 实数 **78** 个脚本 ——
 > 本批（**里程碑 M35–M37**）新增 3 项能力：**Ring 3 合成器（用户态 `/bin/wm` + 两个真客户端；有合成器时内核一个像素都不合成）**、
@@ -114,7 +144,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
 6. **自研 UEFI 引导（不用 gnu-efi）**：自造 PE32+ 桩（2.5KB）+ 平铺长模式引导器（36KB，链接到 72MB，绕过 EDK2 的 PE 校验）；**RSDP 经固定槽 0x7800 从固件配置表传给内核**。
 7. **一切自写工具链**：没有 mkfs.fat、没有 mtools —— FAT32 卷、ISO9660 解析与打包、GPT、LBA 回填、PE 摊平、字体子集化（**4 套 TTF**：西文/中文/终端等宽/缺字兜底）、图标生成、VAP64 打包，全是本仓库的 Python 脚本。
 8. **APIC / ACPI / SMP 都带"宁可不启用也不变砖"的回退**：拿不到 ACPI 就留 8259、启动 AP 全程有界超时、每个自检失败都整体回滚，降级路径都有串口证据。
-9. **每次改动都跑自动验收**：**78 个验收脚本**（`Get-ChildItem tests\*.py` 实数；`status_report.py --full` 的 `TESTS` 列表 **66** 个；本批新登记 `wm64_test`(77 条断言)、`drvsvc64_test`(71)），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
+9. **每次改动都跑自动验收**：**89 个验收脚本**（`Get-ChildItem tests\*.py` 实数；`status_report.py --full` 的 `TESTS` 列表 **74** 个；本版新登记 `jpeg64_test`(79 条断言)、`sounds64_test`(44)、`soundsegs64_test`、`taskmgr64_test`(31)、`textstress64_test`、`mouseperf64_test`(25)、`textlock64_test`、`textwm64_test`），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
 
 ## 四、系统架构
 
@@ -186,7 +216,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
    build64.sh     唯一构建脚本（clang/lld/nasm/xorriso/Python）
    tools/*.py     自写打包/诊断：make_iso64 / make_esp / make_flat / make_vap / pe_info / fat_check
    gui_rs/build_rs.sh  Rust 侧构建：rustc（rustup shim 绝对路径，x86_64-unknown-none）-> gui_rs/gui_rs.o，只链进系统内核
-  tests/*.py     78 个 .py（本批新增 wm64_test / drvsvc64_test）：串口断言 + screendump 像素断言 + 目标盘字节断言
+  tests/*.py     89 个 .py（本版新增 jpeg64_test / sounds64_test / soundsegs64_test / taskmgr64_test / textstress64_test / mouseperf64_test / textlock64_test / textwm64_test）：串口断言 + screendump 像素断言 + 目标盘字节断言
 ```
 
 ## 五、快速开始
@@ -286,7 +316,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 
 ## 六、工程质量（这个项目最值得说的部分）
 
-* **78 个验收脚本**（`Get-ChildItem tests\*.py` 实数 **78**；其中 `status_report.py --full` 的 `TESTS` 列表长度实测 **66**；**本批（beta19）新登记 2 个脚本**：`wm64_test` **77/77**、`drvsvc64_test` **71/71**，**0 FAIL**）。以下为历史累计记录（P6 那批）：**icons64_test 50 条**（外置图标包：真图标加载/逐 kind 对照宿主清单/形状 IoU/主题跟随/两种坏法回落 + 开始按钮 VimtuFS2 真图），另有 **gui_modern64_test 159 条（连跑 2 次全绿；Dock 回弹判据改与机器帧率无关）**、**panels64_test 78 条**、**desktop64_test PASS**、**desktopops64_test 66 条（13 条 QEMU PS/2 注入零命中为 [skip]）**、**explorer64_test 71 条**、**fileops64_test 95 条**、**startmenu64_test 63 条**、**settings64_test 108 条**、**ui_extra64_test 51 条** —— 2026-09-26 实测：P6 那批 0 FAIL（六项真机缺陷修复 + 外置图标包），
+* **89 个验收脚本**（`Get-ChildItem tests\*.py` 实数 **89**；其中 `status_report.py --full` 的 `TESTS` 列表长度实测 **74**；**本版（v0.4.3）新登记 8 个脚本**：`jpeg64_test` **79/79**、`sounds64_test` **44**、`soundsegs64_test`、`taskmgr64_test` **31/31**、`textstress64_test`、`mouseperf64_test` **25/25**、`textlock64_test`、`textwm64_test`）。以下为历史累计记录（P6 那批）：**icons64_test 50 条**（外置图标包：真图标加载/逐 kind 对照宿主清单/形状 IoU/主题跟随/两种坏法回落 + 开始按钮 VimtuFS2 真图），另有 **gui_modern64_test 159 条（连跑 2 次全绿；Dock 回弹判据改与机器帧率无关）**、**panels64_test 78 条**、**desktop64_test PASS**、**desktopops64_test 66 条（13 条 QEMU PS/2 注入零命中为 [skip]）**、**explorer64_test 71 条**、**fileops64_test 95 条**、**startmenu64_test 63 条**、**settings64_test 108 条**、**ui_extra64_test 51 条** —— 2026-09-26 实测：P6 那批 0 FAIL（六项真机缺陷修复 + 外置图标包），
   并逐脚本复跑既有脚本 —— `usb64_test` 51、`fatread64_test` 61、`explorer64_test` 71、`fileops64_test` 95、
   `multivol64_test` 108、`fs_tree_test` 85、`bootlog64_test` 30、`boot64_assert`、`desktop64_test`、
   `install_flow_test`、`partition_ops_test`、`esp_install_test`、`disk_boot_test`、`iso64_install_test`、
@@ -376,9 +406,91 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | M35 | **Ring 3 合成器（批次 B-wm）**：内核 ABI **22..26**（`wl_composer_get` / `wl_surface_export` / `wl_surface_map` / `wl_surface_ack` / `wl_seat_post`，只有注册过的合成器能调）+ 启动期 `wl64_wm64("/bin/wm.elf")`；用户态 `/bin/wm` = `fb_map` 拿后备缓冲 → 用户态 blit/遮挡/alpha（只重画 damage）→ `fb_flip` 上屏 → `input_poll` 命中测试后用 26 号回投；两个真客户端 `wmclock`（每 5s 更新数字）/ `wmpanel`（可点按 + 半透明条）；**有合成器时内核一个像素都不合成**（按 `[WL64] composer` 行切段 `tail_composite=0`）；`wm64_test` **77/77** | ✅ |
 | M36 | **用户态设备映射 + 驱动服务骨架（批次 B-devmap）**：`pci_map_bar(48)`（0xCF8/0xCFC + BAR 解码：**写全 1 探真实大小并立刻还原 + 回读确认**、64 位 BAR 读高 32 位、I/O 端口 BAR 直接拒）+ 每进程设备映射窗 **8 槽 × 256 KiB**（`P|U|W|NX|PCD`、**设备页不进页池**、只 root、幂等、错误码 -1..-5）；Ring 3 `/bin/drvdemo` 读 HDA/xHCI 寄存器与内核打点**逐字段一致** + 真实写 `SD0CTL.SRST` 后内核 `audio playtone` 仍 `ok=1`；`drvsvc64_test` **71/71** | ✅ |
 | M37 | **内嵌演示 blob 外置（批次体积）**：18 份 / **144,053 B** 演示程序搬出内核二进制 → 交付 = 系统卷文件 + `system.img` LBA 7497「原始区」影子副本；内核里只剩路径/偏移/长度表（18×16 B）；**系统内核 3,436,080 → 3,297,680 B、余量 659,920 → 798,320 B**；构建期 **18/18**「整份（≤4 KiB）/64B 高熵探针在两份内核二进制里搜不到」硬断言 | ✅ |
+| M38 | **JPEG 基线解码（批次 P7a-JPEG）**：内核 `img64.cpp` 真解 Huffman/DC-AC/反量化/纯整数 IDCT + 444/422/420 + RSTn + EXIF Orientation 1..8；与宿主 Pillow 逐像素 MAE ≤0.4 / 最大差 ≤3（`j04 噪声 4:2:0` 0.377/3、`j01 纯色` 0.000/0）；渐进式如实 -2；`jpeg64_test` 79/79 | ✅ |
+| M39 | **系统音效 + 音频 ABI 49 `audio_play`（批次 P7a-snd）**：4 段自合成素材 + `/bin/sounder`（卷交付、内核 0 字节）+ 四个触发点；HDA 放大器能力字真 bug 修复后 1 kHz 自检 peak=5836/RMS=5755、100%(21393)>50%(10697)>静音(0)；分段录音 click 5669/1665@5.085s、notify 11667/3870@5.132s、error 21394/10536@5.271s（`sounds64_test` 44、`soundsegs64_test`） | ✅ |
+| M40 | **桌面/窗口缺陷大修（批次 P7a/P7b）**：任务管理器"看不到/结束不了运行中的程序"、文字渲染重叠（光栅化缓冲复用未清零）、explorer 布局写死、锁屏帧尾 render 漏判、设置页坐标口径、鼠标灵敏度非线性 —— 六条逐条给根因 + 逐像素/录音证据（`settings64_test` **111/111**、`mouseperf64_test` **25/25**、`a42a64_test` 连跑 3 次 **89/89**） | ✅ |
+
 | — | **本批两条真缺陷修复**：**① xHCI 事件环消费 cycle 未随回卷翻转**（第一圈后驱动看着"没有新事件" -> 一次命令后键盘失效；修法 = 回卷时翻转期望 cycle 位；回归 = `xhci64_test` 键盘连续打字 30 键（跨回卷）+ U 盘读写前后可用 + `stray=0`）；**② 按物理地址读「原始区」被内核 `.bss` 覆盖**（LBA 7497 -> 物理 `0x4A8000` 落在 33 MB fb 后备缓冲 `0x428000..0x23CC000` 里 -> ring3 入口 `0x100000000` `#UD` + `[PANIC] cpu exception 6`；修法 = `kernel/demo64.cpp` 按 LBA 用 `ata64_read` 现读并缓存） | ✅ |
 
-### 批次 beta19（本批）：Ring 3 合成器 + 设备映射（pci_map_bar/驱动骨架）+ 演示 blob 外置 + 两条真缺陷修复 —— `v0.4.2-beta19`
+### 批次 v0.4.3（本批）：桌面/窗口缺陷大修 + JPEG 解码 + 系统音效 + 任务管理器修复 —— `v0.4.3`（★ 不带 `-beta`）
+
+> 本版构建产物上的真跑：`a42a64_test` **连跑 3 次全绿 89/89**（含三层预算断言，实测 `kernel64_os.bin=3374784 B；余量 721216 B`）、
+> `mouseperf64_test` **25/25**、`settings64_test` **111/111**；其余脚本沿用本批已跑记录（`jpeg64_test` **79/79**、
+> `taskmgr64_test` **31/31**、`sounds64_test` **44**、`hda64_test` **34/34**、`tmgr_proc_test` 回归、`fonts64_test` **23**、
+> `textstress64_test`、`soundsegs64_test`、`desktop_p7a_test`）。跑完 `vmrun list` = **Total running VMs: 0**。
+
+**① JPEG 基线解码（`kernel/img64.cpp`）**：原先对 `FF D8` 只打 "jpeg not implemented in this batch" 返回 -2。
+本版补齐：Huffman（mincode/maxcode/valptr）、DC/AC 系数、反量化、**纯整数 IDCT**（scale=256 定点余弦表，与精确 IDCT
+对照最大 1 LSB / 平均 0.08 LSB）、YCbCr->RGB（libjpeg 同款 16.16 定点系数）、4:4:4 / 4:2:2 / 4:2:0（fancy 上采样）、
+RSTn 重启标记、EXIF Orientation 1..8。证据（`tests/jpeg64_test.py` **79/79**，12 张测试图装进 VimtuFS2 卷、内核真解码、
+与宿主 Pillow 逐像素对照）：`j04 噪声 4:2:0 + RSTn` MAE **0.377** / 最大差 **3**、`j03 文字 4:2:0` **0.231/3**、
+`j11 灰度(comps=1)` **0.017/1**、`j01 纯色 4:4:4` **0.000/0**、`j02 渐变 4:2:2` **0.029/3**；错误路径：截断 rc=3、
+渐进式 rc=2（`progressive jpeg (SOF2) unsupported`）、损坏 rc=3，无 PANIC。打点：`[JPEG64] selftest file=… rc=0 fmt=jpeg
+w=… h=… orient=… comps=… samp=444|422|420|gray rst=… fnv=…` + `[JPEG64] px <name> row=<y> w=<w> data=<RRGGBB…>`。
+**边界**：无渐进式 / 无算术编码 / 无 CMYK·Adobe APP14 反相 / 无 ICC / 无 12-bit；解码在**内核里**做，本版不加系统调用。
+
+**② 系统音效 + 音频 ABI 49 `audio_play`**：素材 4 段**自合成**（startup 0.700s / notify 0.150s / click 0.030s / error 0.250s，
+零第三方素材、零许可风险）+ 用户态播放器 `/bin/sounder`（卷交付、内核 0 字节）+ 四个触发点（`click` = mouse-press/sens-apply、
+`startup` = login-ok、`notify` = toast、`error` = settings-msg-error；`ui.sound.effects` 开关 + 两次 FX <62ms 节流 rc=-3）。
+**HDA 增益真 bug**：放大器能力字解码错（`caps=0x80034a4a` 下 100% 被写成 gain index 0 ≈ 最大衰减）-> 系统音效全听不见；
+按 HDA spec §7.3.4.10 解码（steps/step_size/offset/mute）并用录音标定 0 dB 索引（= 72；静音点 = offset = 74）。
+证据：修后 1 kHz 自检 **peak=5836 / RMS=5755**（修复前 peak 0..259）、100% **21393** > 50% **10697** > 静音 **0**；
+分段取证（`tests/soundsegs64_test.py`）`click 5669/1665@5.085s`、`notify 11667/3870@5.132s`、`error 21394/10536@5.271s`。
+**边界**：无混音 / 无多流并发（HDA 单流，一次一段）、无用户态 HDA 抢占；录音里"段出现时刻"是"有流才写盘"的时间轴；
+VMware 只给 sb16 -> HDA 只能 QEMU 验。
+
+**③ 任务管理器修复（P7b）**：根因 = `tm_build_rows()` **只扫 proc64 进程表**（而桌面/应用跑在 task64 任务里）-> 纯桌面下行数 0、
+选中行恒 -1、回车只提示"请先选择"；且只在鼠标/键盘事件后重画（新进程不出现）。修法 = 进程行 + task64 内核任务行（带 `kind`）+
+外壳 tick 每 **500ms** 让客户区失效一次 + 按行型分流 kill（`proc64_kill64` / `task_kill64`）。证据：`[UI] tmgr proc rows=5 total=5
+procs=0 tasks=5`（kmain/kheart/kwork/watchdog/kusb，与 `[TASK64] diag` 逐项一致）、`proc run spin` 后**未交互**即 `rows=6 total=1
+procs=1 tasks=5`、`[UI] tmgr kill proc pid=26 name=spin sig=9 rc=0` + `[PROC64] exit pid=26 code=137 cr3_released=1`、
+重复结束只回 -3（-ESRCH）。**边界**：无 CPU/内存排序、无优先级调整、无"结束进程树"；列表 500ms 节流刷新。
+
+**④ 文字渲染重叠错乱修复（P7a-④）**：根因 = `rasterize_glyph()` 是**累加**语义（同一字形轮廓自重叠要叠加覆盖率 `old + a`），
+而 ASCII 固定缓存与 CJK LRU 槽**复用位图却从不清零** -> 换字号叠上旧字号同一字形、LRU 换出叠上"上一个字的残影"（偶发）。
+修法 = 填充前清 **bbox**（只清 bbox，不动别处，首次渲染逐像素不变）。证据：`tests/textstress64_test.py` 加压
+（换字号 + 换主题搅动缓存）后逐帧比对**帧间差异 0**；`fonts64_test` **23** 条逐像素断言不变。
+**边界**：压力测试**无法强制** >256 次 CJK LRU 换出（脚本注释写明如何加压）。
+
+**⑤ explorer 布局自适应（P7a-①）**：内容区几何不再是编译期常量，全部按**当前客户区现算**。证据：`[UI] exp layout
+client=658x444 content=151,54 … cols=5 card_w=…` -> 拖右边缘后 `client=946x444 … cols=8 …`，裁剪区恒 =
+`client_w-151` × `client_h-76`；`explorer64_test` **89** 条。**边界**：仅 explorer64 曾有此病（terminal/taskmgr/sysmon 抽查无此病）。
+
+**⑥ 锁屏帧尾 render 修复（P7a-③）**：`gui64.cpp` 帧尾的早退没再判锁屏 -> 锁定当帧把桌面/窗口/Dock/开始菜单画在锁屏之上；
+修法 = 帧尾再判一次锁屏 + 锁定**立刻整屏重绘**。证据（逐区域同屏率，判据 **<0.5**）：QEMU Dock **0.0003** / 屏底 76px **0.3913** /
+开始菜单区 **0.0001**；VMware 1024×768 **0.0000 / 0.1889 / 0.0000**；对照组（桌面壁纸区、锁屏自己的数字时钟区）明显不同。
+脚本 `tests/textlock64_test.py`（VMware + VNC 三步真鼠标：开始菜单 -> 电源 -> 锁定）。
+
+**⑦ 应用窗口坐标口径修复（P7a-②）**：`settings64.cpp` 的 `page_*` / `draw_nav` 把**客户区局部坐标当屏幕绝对坐标**落笔
+（窗口一动只有 x/y 变、内容钉在旧屏幕坐标上，还被新客户区的裁剪矩形切掉一截）。修法 = 画导航条目 + 画页面期间把客户区原点
+加到落笔坐标上（`g_po_*`，`g_po_* = 0` 时与修复前逐像素一致）。证据：`tests/settings64_test.py` 第 7 段宿主侧逐像素 ——
+**窗框位移 = 应用自报客户区原点位移 = (118,58)**、平移一致率 **0.9999~1.0000**（修前内容位移 (0,0)、平移一致率约 0.86）。
+**边界**：修复只覆盖 settings64；坐标口径已写成约定（`docs/应用层与系统调用说明.md`「应用窗口坐标口径」节）。
+
+**⑧ 鼠标性能取证 + 灵敏度线性化（P7a-14）**：新增每秒一行 `[UI] perf sec=N ev=<k>/s fps=… rn=… redraw_us=… full=…/…
+full_pct=… mv=<dx>,<dy> cur=<x>,<y> sens=… tsc_mhz=…`。**灵敏度真缺陷**：缩放后的位置被**写回驱动** -> 上一帧的缩放残差被下一帧
+当成新位移再缩放一次（每步等效增益 1.6(1-κ+κ²)）；实测 1700→**1.600** / 800→**1.040** / 1500→**1.420** / 2500→**3.010**。
+修法 = 基准只认"写回的虚拟光标值"（`g_sens_virt_*`），缩放恰好作用一次（且与驱动同一个屏幕边界钳制）。
+修后实测四档（100 宿主计数/档）：**1700→160 px (1.600)**、**800→75 px (0.750)**、**1500→141 px (1.410)**、**2500→235 px (2.350)**，
+与 `sens/1000` 偏差全在 **±6%** 内（判据 ±10%），线性度 0.938~0.941（理论 0.941 = `input.cpp` 每包 `dx*17/10` 的整数截断）。
+证据（`tests/mouseperf64_test.py` **25/25**）：静置 **0/s**、移动风暴峰值 **26/s**、移动帧重绘 **5.5~121 ms**、
+移动帧**整屏重绘比例 0%**。**边界**：TCG（无 KVM）下重绘耗时波动大（给区间与中位数，不给单点）；**并发跑 QEMU 会触发 guest 看门狗**
+（测试台纪律：一次只跑一个 QEMU）。
+
+**⑨ 另外三条本批修复（真缺陷 / 构建）**：**交付物门禁假命中**（`build64/gzip` 偏移 21856 的 64 B 是标准 CRC-32 表的一段，
+与内核链接进来的 `build64/os/vfs64.o` 里 1037 B 连续段**字节相同** -> 旧门禁判"交付物泄漏"、构建在 ISO 组装前 exit 1；
+修法 = 新增 `tools/probe64.py` 共享探针选择器（整份文件判别力 / 探针不在内核 / 探针不在合法对象集合 / 对齐 1056 B 连续块四条判别），
+10 处门禁改走它，gzip 探针从 21856 换到 15456，并用"真把交付物灌进内核 -> exit 1"自证仍抓得住；另加
+`kernel/hda64_stub64.cpp` **weak** 空实现修安装程序内核链接失败：ready=0 / play=-1=ENODEV，如实报"无通路"绝不假装出声）、
+**EDIT64 演示把完整系统卷的启动期拖成分钟级**（`edit64_one64()` 的等键循环只有 120s 超时 -> phase a/b 各空等满，
+实测 `[EDIT64] demo phase=a done exited=0 ticks=30001` = **120.004s**、两相 240s，`[GUI64] ready` 看着"永不出现"；
+修法 = 用 `kbd_events64()` 判定"本相开始后 grace 秒内有无任何按键"，没人驱动就不再空等，打点新增 `driven=`/`keys=`）、
+**动画时长两处**（开机动画改为 淡入 **300ms** + 停留 **600ms** + 淡出 **300ms** = 总 **1200ms** / 72 帧 @60Hz + 任意键跳过，
+打点 `[UI] boot logo show frames=72 fade=ok src=… fadein_ms=300 hold_ms=600 fadeout_ms=300 target_ms=1200 drawn=… elapsed_ms=… skipped=…`；
+最小化与弹窗动画 **Token 化 225 -> 140ms**，`theme64_dur64(THEME64_MS_MINIMIZE)`；鼠标灵敏度原来还是**死键** —— 全仓没有一处调用
+`cfg64_set_mouse_sens64`，本版新增 `gui64_set_mouse_sens64()` 并在设置页"显示"页末尾接上"指针速度"滑块（0..100 ↔ 800..2500‰））。
+
+### 批次 beta19（上一批）：Ring 3 合成器 + 设备映射（pci_map_bar/驱动骨架）+ 演示 blob 外置 + 两条真缺陷修复 —— `v0.4.2-beta19`
 
 **① Ring 3 合成器（B-wm）：把"图形"搬到用户态（内核一个像素都不合成）**
 
@@ -429,7 +541,16 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 * **如实边界**：**4 份"直跑演示"**（demo64 / hello_c / libctest_c / fbdemo）在挂卷之前跑 —— 字节从原始区取；
   真安装盘首次启动靠"原始区装进空卷"这条兜底（option b）；原始区上限 512 扇区 = **256 KiB**（当前 144,129 B）。
 
-**本版实读**（2026-10-02，`v0.4.2-beta19`）：能力项 **完成 72 / 部分 0 / 未做 0（共 72 项）**；
+**本版实读**（2026-10-04，`v0.4.3`）：能力项 **完成 80 / 部分 0 / 未做 0（共 80 项）**；
+`--full` 的 `TESTS` 列表 **74** 个脚本；`Get-ChildItem tests\*.py` 实数 **89 个脚本**；
+安装程序内核 `build64/kernel64.bin` **1,555,888 B**、系统内核 `build64/kernel64_os.bin` **3,374,784 B**
+（三层预算：内核区硬上限 **4,096,000 B** ∧ 余量 ≥ **640 KiB = 655,360 B** ∧ ≤ 基线 3,418,352 B + **22,288 B**；
+实测**余量 721,216 B**（扣预留 R 后还剩 65,856 B）、相对基线 **-43,568 B（净减）** —— **再涨 65,857 B 触发**）。
+`loader64.bin` **4,010 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**（`Get-Item` 实读）。
+**版本串硬门禁**：`VIMTUOS_VERSION="0.4.3"` == 标签 == 镜像内嵌串（系统内核里 `0.4.3` 命中 **5** 次、`VimtuOS 0.4.3` **4** 次、
+终端串 `VimtuOS Terminal v0.4.3` **1** 次；旧串 `0.4.2-beta19` **0** 次；安装程序内核不含 `0.4.x` 字面量 —— settings/terminal 只编进系统内核）。
+
+**上一版实读**（2026-10-02，`v0.4.2-beta19`）：能力项 **完成 72 / 部分 0 / 未做 0（共 72 项）**；
 `--full` 的 `TESTS` 列表 **66** 个脚本；`Get-ChildItem tests\*.py` 实数 **78 个脚本**；
 安装程序内核 `build64/kernel64.bin` **1,552,880 B**、系统内核 `build64/kernel64_os.bin` **3,297,680 B**
 （三层预算：内核区硬上限 **4,096,000 B** ∧ 余量 ≥ **640 KiB = 655,360 B** ∧ ≤ 基线 3,418,352 B + **22,288 B**；

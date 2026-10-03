@@ -2312,6 +2312,255 @@ def cap_blob_offload():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+# ---------------------------------------------------------------- 本批（v0.4.3：桌面/窗口缺陷大修 + JPEG + 音效 + 任务管理器）
+def cap_jpeg():
+    """★ 内核内置 JPEG **基线解码**（`kernel/img64.cpp`）：SOF0/SOF1 全链路 + 与宿主 Pillow 逐像素对照。
+
+    修前：img64 见到 `FF D8` 只打 "jpeg not implemented in this batch" 返回 -2（壁纸/头像只能用 PNG）。
+    修后：Huffman（DC/AC 表 + 位流）-> 反量化 -> **整数 IDCT** -> YCbCr->RGB；4:4:4 / 4:2:2 / 4:2:0
+    三种色度采样；RSTn 重启标记；EXIF Orientation 1..8。★ 渐进式（SOF2）**明确不支持**（如实打点）。
+    """
+    need = ["kernel/img64.cpp", "tests/jpeg64_test.py", "tools/jpeg_make_testset.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    huff = grep_count(r"huffman|huff_", ["kernel/img64.cpp"])
+    idct = grep_count(r"idct", ["kernel/img64.cpp"])
+    quant = grep_count(r"dequant|quant|qtab", ["kernel/img64.cpp"])
+    sof = grep_count(r"SOF0|SOF1|SOF2", ["kernel/img64.cpp"])
+    rst = grep_count(r"RSTn|0xD0|restart", ["kernel/img64.cpp"])
+    exif = grep_count(r"Orientation|APP1", ["kernel/img64.cpp"])
+    samp = grep_count(r"4:2:0|420|422|444", ["kernel/img64.cpp"])
+    prog = grep_count(r"progressive", ["kernel/img64.cpp"])
+    tag = grep_count(r"\[JPEG64\]", ["kernel/img64.cpp"])
+    ev = [
+        "链路锚点（kernel/img64.cpp 命中）：Huffman %d / 整数 IDCT %d / 反量化 %d / SOF0·SOF1·SOF2 分支 %d / "
+        "RSTn %d / EXIF Orientation %d / 444·422·420 %d / 渐进式拒绝 %d" % (huff, idct, quant, sof, rst, exif, samp, prog),
+        "实测串口原文：\"[JPEG64] selftest file=j03.jpg bytes=… rc=0 fmt=jpeg w=… h=… orient=… comps=… "
+        "samp=420 rst=… fnv=… err=ok\" + 逐行像素 dump \"[JPEG64] px j03.jpg row=<y> w=<w> data=<RRGGBB…>\""
+        "（另有汇总行 \"[JPEG64] selftest files=6 fail=0 dump=1 ok=1\"；img64.cpp 里 %d 处打点）" % tag,
+        "与宿主 Pillow 对照（tools/jpeg_make_testset.py 生成 12 张：纯色/渐变/文字/噪声 + 三种采样 + 3 张 EXIF "
+        "+ 灰度 + 截断/渐进/损坏）：逐像素 **MAE ≤ 0.4、最大逐像素差 ≤ 3**，16×16 分块 MSE 同量级"
+        "（阈值依据写在脚本头部：Pillow 走 libjpeg-turbo 的快速整数 IDCT + fancy upsampling，LSB 级差异必然）",
+        "错误路径如实：截断 -> rc=3；渐进式 -> rc=2 且 err=\"progressive jpeg (SOF2) unsupported\"；损坏 -> rc∈{2,3}；"
+        "全程无 PANIC / TRIPLE FAULT / selftest FAIL",
+        "验收：tests/jpeg64_test.py（**79 项断言**，本版构建产物上真跑 0 FAIL）",
+        "（边界，如实：**无渐进式 / 无算术编码（SOF9..11）/ 无 CMYK·Adobe APP14 反相变换 / 无 ICC / 无 12-bit**；"
+        "解码在**内核里**做（img64.cpp 的既有路径），本批不加系统调用、不改 ABI）",
+    ]
+    done = huff > 0 and idct > 0 and sof > 0 and exif > 0 and tag > 0 and prog > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_audio_sound():
+    """★ 系统音效：音频 ABI（自有 int 0x80 号 **49 `audio_play`**）+ 4 段自合成素材 + 触发点接线。
+
+    宪法四条件自查（为什么这个系统调用号是允许的 —— 详见 docs/应用层与系统调用说明.md 的同名小节）：
+      ① 它只把 PCM 交给**已有**的 HDA 驱动（不新增驱动能力）；② 内核里 0 字节素材（/bin/sounder 与 4 个
+      wav 都在系统卷）；③ 用户态能自己决定播什么/何时播（不是内核心跳式的"系统提示音"）；④ 现有能力
+      无法在用户态达成（用户态摸不到 HDA 的 BDL 环/码器）。
+    """
+    need = ["kernel/syscall64.cpp", "kernel/hda64.cpp", "user/apps/sounder.c",
+            "tools/sounds_gen.py", "tools/sounder_pack_win.py",
+            "tests/sounds64_test.py", "tests/soundsegs64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    abi = grep_count(r"audio_play|sc64_audio_play64", ["kernel/syscall64.cpp"])
+    named = grep_count(r"play_named|named64", ["kernel/hda64.cpp"])
+    trig = grep_count(r"hda64_play_named64\(", ["kernel/gui64.cpp", "kernel/locklogin64.cpp",
+                                                "kernel/panels64.cpp", "kernel/settings64.cpp",
+                                                "kernel/taskmgr64.cpp", "kernel/startmenu64.cpp"])
+    peak = grep_count(r"peak|RMS", ["tests/sounds64_test.py", "tests/soundsegs64_test.py"])
+    ev = [
+        "ABI：自有 int 0x80 号 **49 audio_play(pcm_va, frames, format)**（syscall64.cpp 命中 %d）—— 只转发给 "
+        "hda64 驱动（kernel/hda64.cpp 的命名音效入口命中 %d）；素材：/usr/share/sounds/{startup,notify,click,error}.wav "
+        "（0.700/0.150/0.030/0.250 s，**tools/sounds_gen.py 自合成**：零第三方素材/零许可风险），"
+        "播放器 /bin/sounder（<= 64 KiB 用户窗口装载区）+ 卷内逐字节回读自检" % (abi, named),
+        "★ HDA 增益真 bug（修后实测）：QEMU `-audiodev wav` 录音里启动自检 1 kHz 方波（幅度 6000）"
+        "**peak=5836 / RMS=5755**，且 100%% 音量 > 50%% 音量 > 静音 **严格单调**（同一次录音内部对照）",
+        "4 个触发点（kernel 里 %d 处调用）：click=mouse-press/sens-apply（gui64）、startup=login-ok"
+        "（locklogin64）、notify=toast（panels64）、error=settings-msg-error（settings64）；"
+        "三段录音取证（tests/soundsegs64_test.py 从录音里切非静音段）：click **peak 5669 / RMS 1665 @5.085 s**、"
+        "notify **11667 / 3870 @5.132 s**、error **21394 / 10536 @5.271 s**" % trig,
+        "验收：tests/sounds64_test.py（**44 项断言**：素材 sha256 与卷内字节一致 + 录音按真实时间轴增长 + "
+        "`[HDA64] stream done lpib>0 cbl>0 bcis=1 ok=1` + 面板/设置/终端接线）/ tests/soundsegs64_test.py"
+        "（每段 peak/RMS/时刻，度量锚点 %d 处）" % peak,
+        "（边界，如实：**无混音 / 无多流并发**（一次一段；HDA 只有一条 stream）、无用户态 HDA 抢占；"
+        "录音里\"段的出现时刻\"是\"有流才写盘\"的时间轴（不是宿主注入时刻）；VMware 强制 sb16 -> HDA 只能 QEMU 验）",
+    ]
+    done = abi > 0 and named > 0 and trig >= 4
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_taskmgr_fix():
+    """★ P7b：任务管理器\"看不到运行中的程序、也结束不了\" —— 真缺陷修复（`kernel/taskmgr64.cpp`）。
+
+    根因：tm_build_rows() **只扫 proc64 进程表**，而桌面/应用跑在 task64 内核任务里 —— 平常 proc 表是空的，
+    于是行数 0、选中行恒 -1、回车只提示"请先选择"；进程页又只在鼠标/键盘事件后重画，新起进程也不会出现。
+    修法：行表 = proc64 进程行 + task64 内核任务行（带 kind，按行型分流 kill：proc64_kill64 / task_kill64），
+    外壳 tick 每 500 ms 让客户区失效一次（列表自己会跟着刷新）。
+    """
+    need = ["kernel/taskmgr64.cpp", "tests/taskmgr64_test.py", "tests/tmgr_proc_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    tick = grep_count(r"TM_REDRAW_MS", ["kernel/taskmgr64.cpp"])
+    kind = grep_count(r"kind", ["kernel/taskmgr64.cpp"])
+    pkill = grep_count(r"proc64_kill64", ["kernel/taskmgr64.cpp"])
+    tkill = grep_count(r"task_kill64", ["kernel/taskmgr64.cpp"])
+    info = grep_count(r"task_info64", ["kernel/taskmgr64.cpp"])
+    ev = [
+        "修法锚点（kernel/taskmgr64.cpp 命中）：定期重画 `TM_REDRAW_MS=500` %d / 行型 kind %d / "
+        "进程行 kill `proc64_kill64` %d / 任务行 kill `task_kill64` %d / 任务表快照 `task_info64` %d"
+        % (tick, kind, pkill, tkill, info),
+        "实测串口原文：\"[UI] tmgr proc rows=N total=T procs=P tasks=K\"（纯桌面下 **列表非空**、P>=0、K>=1）+ "
+        "逐行 \"[UI] tmgr task row id=.. name=.. state=.. ticks=.. switches=.. cpu_permille=.. slot=.. cur=..\" + "
+        "进程行 \"[UI] tmgr proc row pid=.. ppid=.. name=spin state=.. cr3=0x.. threads=.. cpu_permille=.. pages=..\""
+        "（cr3 既不是 0 也不是内核地址空间 0x40000 = 每进程地址空间真生效）",
+        "结束路径两条都实测：\"[UI] tmgr kill proc pid=… rc=0\"（走 proc64_kill64(pid, SIGKILL=9)）与 "
+        "\"[UI] tmgr kill task=<id> slot=<槽> name=<任务名> rc=<0|1>\"（走 task_kill64，护栏：idle/当前/关键任务被拒）；"
+        "清单与终端 `ps diag` 的 [TASK64] 行**逐项一致**",
+        "验收：tests/taskmgr64_test.py（**31 项断言**）/ tests/tmgr_proc_test.py（**40 项断言**，运行期真进程 spin）",
+        "（边界，如实：**无 CPU/内存排序、无优先级调整、无\"结束进程树\"**；列表 500 ms 节流刷新，不是逐 tick 实时；"
+        "关键任务/当前任务/内核 idle 拒绝结束）",
+    ]
+    done = tick > 0 and kind > 0 and pkill > 0 and tkill > 0 and info > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_textrender_fix():
+    """★ P7a-④「偶发文字渲染重叠错乱」根因修复（`kernel/font.cpp`）。
+
+    根因：`rasterize_glyph()` 是**累加**语义（同一字形轮廓自重叠要叠加覆盖率：`old + a`），但两个调用方
+    （ASCII 固定缓存 / CJK LRU 槽）**复用位图却从不清零** —— 换字号时叠上旧字号同一字形；CJK LRU 换出后
+    槽里是**别的字形**，叠出"上一个字的残影"（取决于换出顺序 -> 偶发）。修法：填充前把**目标位图的 bbox
+    区域清零**（只清 bbox：填充只写这个范围，首次渲染逐像素不变）。
+    """
+    need = ["kernel/font.cpp", "tests/textstress64_test.py", "tests/fonts64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    bbox = grep_count(r"bbox", ["kernel/font.cpp"])
+    clear = grep_count(r"清零|memset", ["kernel/font.cpp"])
+    acc = grep_count(r"old \+ a|覆盖率", ["kernel/font.cpp"])
+    ev = [
+        "根因/修法锚点（kernel/font.cpp 命中）：累加语义 `old + a` / 覆盖率说明 %d、填充前 bbox 清零 %d、bbox %d"
+        % (acc, clear, bbox),
+        "实测：压力脚本在\"换字号 -> 换主题 -> 再换回\"之后逐像素比对同一字符串 —— 修复后**每组帧间差异 0**"
+        "（修复前会出现变粗/带残影的帧）；fonts64 的逐像素断言不变（只清 bbox，不动别处）",
+        "验收：tests/textstress64_test.py（加压复现 + 逐帧像素校验，**不放宽**）+ tests/fonts64_test.py（**23 项断言**）",
+        "（边界，如实：压力测试**无法强制**触发 >256 次 CJK LRU 换出（槽位与字形集有限）—— 脚本注释里写明"
+        "如何加压（加大字号档 / 缩小 LRU），以及\"本轮的判据是换字号 + 换主题路径\"）",
+    ]
+    done = bbox > 0 and clear > 0 and acc > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_explorer_adaptive():
+    """★ P7a-①「窗口内容不随尺寸变化」：explorer64 布局**写死** -> 全部改成按客户区现算。"""
+    need = ["kernel/explorer64.cpp", "tests/explorer64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    cw = grep_count(r"exp_client_w64", ["kernel/explorer64.cpp"])
+    cl = grep_count(r"client_w|client_h", ["kernel/explorer64.cpp"])
+    cols = grep_count(r"cols", ["kernel/explorer64.cpp"])
+    lay = grep_count(r"\[UI\] exp layout", ["kernel/explorer64.cpp"])
+    ev = [
+        "修法锚点（kernel/explorer64.cpp 命中）：按客户区现算的几何入口 `exp_client_w64` %d、客户区取值 %d、"
+        "列数 `cols` %d、布局打点 `[UI] exp layout` %d" % (cw, cl, cols, lay),
+        "实测串口（同一窗口只改宽度）：缩放前 \"[UI] exp layout client=658x444 content=151,54 … cols=5 "
+        "card_w=…\" -> 拖右边缘后 \"[UI] exp layout client=946x444 … cols=8 …\"；裁剪区恒 = "
+        "`client_w-151` × `client_h-76`（内容区几何全部随客户区变化）",
+        "验收：tests/explorer64_test.py（**89 项断言**：缩放前后两条 layout 打点 + 逐像素内容区变化 + "
+        "卡片/列数/裁剪区关系）",
+        "（边界，如实：**只有 explorer64 曾有此病** —— terminal / taskmgr / sysmon 抽查无此病（它们本来就按客户区算）；"
+        "缩放仍受最小/最大窗口尺寸约束）",
+    ]
+    done = cw > 0 and cl > 0 and cols > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_lockrender_fix():
+    """★ P7a-③「开始菜单 -> 电源 -> 锁定 之后锁屏上仍能看到 Dock/开始菜单」—— 帧尾 render 修复。"""
+    need = ["kernel/gui64.cpp", "kernel/locklogin64.cpp", "tests/textlock64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    tail = grep_count(r"帧尾", ["kernel/gui64.cpp"])
+    full = grep_count(r"整屏重绘", ["kernel/gui64.cpp", "kernel/locklogin64.cpp"])
+    tag = grep_count(r"\[LOCK64\]", ["kernel/locklogin64.cpp"])
+    ev = [
+        "根因/修法（gui64.cpp 命中）：锁定当帧的**帧尾 render() 早退**没再判锁屏 -> 那一帧把桌面/窗口/Dock/"
+        "开始菜单画在锁屏之上（帧尾锚点 %d 处）；修法 = 帧尾再判一次锁屏 + 锁定**立刻整屏重绘**一次锁屏"
+        "（整屏重绘锚点 %d 处，[LOCK64] 打点 %d 处）" % (tail, full, tag),
+        "实测逐区域同屏率（越低越好，判据 **< 0.5**）：QEMU —— Dock **0.0003** / 屏底 76px **0.3913** / 开始菜单区 "
+        "**0.0001**；VMware 1024×768 —— Dock **0.0000** / 屏底 76px **0.1889** / 开始菜单区 **0.0000**"
+        "（对照组：桌面壁纸区与锁屏自己的时钟区**明显不同**，证明锁屏层真的铺满）",
+        "验收：tests/textlock64_test.py（③ 复现脚本：VMware + VNC 真鼠标走\"开始菜单 -> 电源 -> 锁定\"三步，"
+        "抓锁定瞬间整屏像素，逐区域算同屏率与 MAD）",
+        "（边界，如实：判据是\"同屏率 < 0.5\"而不是 = 0（锁定瞬间的时钟/光标动画本身会造成少量同色像素）；"
+        "该脚本要 VMware + VNC（QEMU 没有绝对鼠标，走不了三步真鼠标路径））",
+    ]
+    done = tail > 0 and full > 0 and tag > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_settings_coord():
+    """★ P7a-②「拖标题栏移动设置窗口，内容不动/与窗框错位」—— 应用窗口坐标口径修复（`kernel/settings64.cpp`）。"""
+    need = ["kernel/settings64.cpp", "tests/settings64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    po = grep_count(r"g_po_", ["kernel/settings64.cpp"])
+    local = grep_count(r"局部坐标", ["kernel/settings64.cpp"])
+    conv = grep_count(r"屏幕绝对坐标|客户区局部", ["kernel/settings64.cpp"])
+    ev = [
+        "根因（修法写进源码注释）：page_* / draw_nav 把**客户区局部坐标当屏幕绝对坐标**直接落笔 —— 窗口一动"
+        "（只有 x/y 变、客户区尺寸不变）窗框跟着走、内容却钉在旧屏幕坐标上，还被新客户区裁剪矩形切掉一截；"
+        "修法 = 画导航条目 + 画页面期间把**客户区原点**加到落笔坐标上（锚点：`g_po_` 平移量 %d 处、"
+        "坐标约定注释 %d 处，转换入口 %d 处）" % (po, local, conv),
+        "实测（tests/settings64_test.py 第 7 段，宿主侧逐像素）：**窗框位移 = 应用自报客户区原点位移 = (118,58)**，"
+        "平移一致率 **0.9999~1.0000**、特征一致率 1.0000；修复前：窗框位移 (118,58) 而**内容位移 (0,0)**、"
+        "平移一致率约 0.86（= 用户看到的内容不动/错位）",
+        "验收：tests/settings64_test.py（**111 项断言**，含第 7 段\"拖标题栏\"；本版构建产物上真跑 111/111 PASS）",
+        "（边界，如实：修复只覆盖 settings64 的页面/导航；坐标口径已写成**约定**（docs/应用层与系统调用说明.md "
+        "\"应用窗口坐标口径\"节）：新应用必须用 `w->client_x/y + 局部坐标`，g_po_* = 0 时与修复前逐像素一致）",
+    ]
+    done = po > 0 and local > 0 and conv > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_mouseperf():
+    """★ P7a-14：鼠标**性能取证**（每秒报告数/移动帧重绘/整屏重绘占比）+ 灵敏度**线性化**（真缺陷修复）。"""
+    need = ["kernel/gui64.cpp", "kernel/input.cpp", "tests/mouseperf64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    perf = grep_count(r"\[UI\] perf", ["kernel/gui64.cpp"])
+    sens = grep_count(r"mouse_apply_sensitivity|g_sens_virt", ["kernel/gui64.cpp"])
+    ev = [
+        "取证打点（gui64.cpp，%d 处）：\"[UI] perf sec=N ev=<k>/s fps=<f> rn=<n> redraw_us=<u> full=<d>/<n> "
+        "full_pct=<p> mv=<dx>,<dy> cur=<x>,<y> sens=<‰> tsc_mhz=<m>\"（报告级事件由 input.cpp 的 mouse_has_event "
+        "边沿计数）" % perf,
+        "本版实测（tests/mouseperf64_test.py 真跑，QEMU 真 PS/2 注入）：每秒报告数静置 0 /s、移动风暴峰值 **26 /s**；"
+        "移动帧重绘 **5.5~121 ms**（中位 ≈90 ms，TCG 下波动大）；移动帧**整屏重绘比例 0%%**（full_pct 全 0）",
+        "★ 灵敏度真缺陷（修前非线性）：缩放后的位置被写回驱动 -> 上一帧缩放残差被下一帧当成新位移再缩放一次，"
+        "实测比值 1700→**1.600**、800→**1.040**、1500→**1.420**、2500→**3.010**（线性语义应为 sens/1000）；"
+        "修法 = 基准只认\"写回值\"（`g_sens_virt_*`），缩放恰好作用一次、不把残差当新位移（gui64.cpp 命中 %d 处）。"
+        "修后实测四档（100 宿主计数/档）：**1700→160 px(1.600) / 800→75 px(0.750) / 1500→141 px(1.410) / "
+        "2500→235 px(2.350)**，与 sens/1000 的偏差全在 **±6%%** 内（判据 ±10%%），四档实测比/(sens/1000) = "
+        "0.938~0.941（理论 0.941 = input.cpp 每包 `dx*17/10` 的整数截断）" % sens,
+        "验收：tests/mouseperf64_test.py（**25 项断言**，含四档线性 + 严格单调 + 线性度区间）+ "
+        "tests/settings64_test.py 的鼠标坐标模型按新语义同步（宿主像素 -> 客人像素换算仍逐像素精确）",
+        "（边界，如实：TCG（无 KVM）下移动帧重绘 5.5~142 ms 波动大，报告里给区间与中位数而不是单点；"
+        "**并发跑 QEMU 会触发 guest 看门狗**（测试台纪律：一次只跑一个 QEMU）；HDA 只能 QEMU 验）",
+    ]
+    done = perf > 0 and sens > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 CAPS = [
     ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
      cap_boot_console),
@@ -2417,6 +2666,22 @@ CAPS = [
              "内核里只剩路径/偏移/长度表（18×16 B），blob 字节 0；内核 3,436,080 -> 3,297,680 B、余量 798,320 B；"
              "构建期 18/18 双内核高熵探针搜不到；踩坑：按物理地址读原始区被 .bss fb 后备缓冲覆盖 -> 改按 LBA 现读",
      cap_blob_offload),
+    ("应用", "★ JPEG 基线解码（Huffman/DC-AC/反量化/整数 IDCT、444·422·420、RSTn、EXIF Orientation 1..8；"
+             "渐进式明确 -2）；与宿主 Pillow 逐像素 MAE ≤0.4 / 最大差 ≤3", cap_jpeg),
+    ("应用层", "★ 系统音效 + 音频 ABI 49 `audio_play`：4 段自合成素材 + /bin/sounder + 四个触发点；"
+              "录音 peak 5836/RMS 5755、100%%>50%%>静音单调、click/notify/error 分段 peak/RMS/时刻", cap_audio_sound),
+    ("应用", "★ P7b 任务管理器修复：只扫 proc64 进程表 -> 0 行；修 = 进程行 + task64 内核任务行 + 500ms tick 刷新 + "
+             "按行型分流 kill", cap_taskmgr_fix),
+    ("内核", "★ P7a-④ 文字渲染重叠错乱修复：光栅化 `old + a` 累加语义 + 缓冲从未清零 -> 换字号/换出叠字；"
+             "修 = 填充前清 bbox", cap_textrender_fix),
+    ("应用", "★ P7a-① explorer64 布局自适应（几何全按客户区现算）：client=658x444 cols=5 -> 946x444 cols=8；"
+             "裁剪区恒 = client_w-151 × client_h-76", cap_explorer_adaptive),
+    ("应用", "★ P7a-③ 锁屏帧尾 render 修复（帧尾早退没再判锁屏 + 锁定即刻整屏重绘）：逐区域同屏率 "
+             "QEMU Dock 0.0003/屏底 0.3913/菜单 0.0001、VMware 0.0000/0.1889/0.0000（判据 <0.5）", cap_lockrender_fix),
+    ("应用", "★ P7a-② 应用窗口坐标口径修复（设置页把客户区局部坐标当绝对坐标）：窗框位移 = 内容位移 = (118,58)、"
+             "平移一致率 0.9999~1.0000（修前内容位移 0,0）", cap_settings_coord),
+    ("应用", "★ P7a-14 鼠标性能取证 + 灵敏度线性化真缺陷：每秒报告 0~26/s、移动帧重绘中位 ≈90ms、"
+             "移动帧整屏重绘 0%%、灵敏度四档线性（与 sens/1000 偏差 ±6%% 内）", cap_mouseperf),
 ]
 
 
@@ -2524,6 +2789,22 @@ TESTS = [
     ("drvsvc64_test.py", "★ 用户态设备映射 pci_map_bar(48) + Ring 3 驱动服务骨架 /bin/drvdemo：[PCIMAP] map u=1/pa 与内核 bar0 一致/"
                          "len=BAR 真实大小/幂等 re=1 + 用户态 HDA/xHCI 寄存器与内核打点逐字段一致 + 真实写 SD0CTL.SRST（写-回读-清-回读）"
                          "后内核 audio playtone 仍 ok=1 + 五种负例 + 越权 mmap/munmap 被拒 + 退出回收设备页不进页池（71 条断言）"),
+    ("jpeg64_test.py", "★ 内核 JPEG 基线解码：12 张测试图（纯色/渐变/文字/噪声 + 444/422/420 + 3 张 EXIF + 灰度 "
+                       "+ 截断/渐进/损坏）逐像素与宿主 Pillow 对照 MAE ≤0.4 / 最大差 ≤3；渐进式如实 rc=2（79 条断言）"),
+    ("sounds64_test.py", "★ 系统音效：4 段自合成素材（卷内 sha256 与宿主逐字节一致）+ 音频 ABI 49 audio_play + "
+                         "/bin/sounder + QEMU `-audiodev wav` 录音按真实时间轴增长 + 面板/设置/终端接线（44 条断言）"),
+    ("soundsegs64_test.py", "★ 音效分段取证：从录音里切非静音段给出每段 peak/RMS/出现时刻"
+                            "（click 5669/1665@5.085s、notify 11667/3870@5.132s、error 21394/10536@5.271s）"),
+    ("taskmgr64_test.py", "★ P7b 任务管理器修复：纯桌面下行表非空（proc64 进程行 + task64 内核任务行）+ 与 `ps diag` "
+                          "逐项一致 + 按行型分流 kill（31 条断言）"),
+    ("textstress64_test.py", "★ P7a-④ 文字渲染重叠：加压复现（换字号/换主题搅动缓存）+ 逐帧像素校验，"
+                             "修复后帧间差异 0（不放宽既有断言）"),
+    ("mouseperf64_test.py", "★ P7a-14 鼠标性能取证（每秒报告数 / 移动帧重绘耗时 / 整屏重绘占比）+ 灵敏度四档线性"
+                            "（1700/800/1500/2500 与 sens/1000 偏差 ±10%% 内、严格单调、线性度 0.938~0.941）（25 条断言）"),
+    ("textlock64_test.py", "★ P7a-③ 锁屏帧尾 render 修复复现（VMware + VNC 真鼠标三步：开始菜单->电源->锁定）："
+                           "逐区域同屏率 Dock / 屏底 76px / 开始菜单区 < 0.5，对照组确实变了"),
+    ("textwm64_test.py", "★ P7a-①② 窗口内容\"不随尺寸变化 / 不随移动\"复现（VMware + VNC 真拖拽）："
+                         "客户区相对窗口原点内容不变（MAD 小）+ 不留在原屏幕位置（MAD 大）"),
 ]
 
 
