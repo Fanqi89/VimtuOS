@@ -51,6 +51,9 @@
 #define THEME64_MS_NORMAL    225
 #define THEME64_MS_LARGE     330
 #define THEME64_MS_DOCK      260      // Dock 点击回弹
+#define THEME64_MS_MINIMIZE  140      // P7a-5：最小化飞向 Dock / 从 Dock 恢复的飞行时长
+                                      //   （原值 = THEME64_MS_NORMAL 225ms，实测"太慢"：225ms 里要等 14 帧；
+                                      //    140ms 落在 120–180ms 的"快而不跳"区间，Token 化后测试直接对齐本值）
 #define THEME64_EASE_C1       51      // cubic-bezier(0.2,0,0,1) 的第一控制点 x=0.2（*256）
 // ---- 字号（TrueType 面 2 = simhei）----
 #define THEME64_FS_NORMAL     14

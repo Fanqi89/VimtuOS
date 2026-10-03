@@ -170,7 +170,7 @@ static int  g_icon_drag_idx = -1;              // 正在拖动的图标（-1=无
 static int  g_icon_press_x = 0, g_icon_press_y = 0;            // 按下位置
 static int  g_icon_press_icon_x = 0, g_icon_press_icon_y = 0;  // 按下时的图标位置
 static bool g_icon_drag_moved = false;
-static bool g_start_icon_logged = false;
+// ★ 告警清理：g_start_icon_logged 已无任何引用（-Wextra unused-variable）—— 删掉变量本身，行为不变
 // 外壳自检期间（gui64_selftest 建/销临时窗口、来回切语言）不触发会话/配置钩子：
 // 那些临时窗口不是真实应用实例，自检的语言切换也不该写进持久化配置。
 static bool g_in_selftest = false;
@@ -260,7 +260,7 @@ static void mouse_apply_sensitivity() {
 // 帧率/忙占比统计
 static uint32_t g_frames = 0;
 static uint32_t g_fps = 0;
-static uint32_t g_fps_t0 = 0;
+// ★ 告警清理：g_fps_t0 已无任何引用（-Wextra unused-variable）—— 删掉变量本身，行为不变
 static uint32_t g_fps_count = 0;
 static uint64_t g_busy_cycles = 0, g_total_cycles = 0;
 static uint8_t  g_busy_pct = 0;
@@ -2838,7 +2838,7 @@ static void fly_begin64(Window* w) {
     FlyAnim* f = &g_fly[g_fly_n++];
     f->w = w;
     f->t0 = ticks64();
-    f->dur = (int)theme64_dur64(THEME64_MS_NORMAL);
+    f->dur = (int)theme64_dur64(THEME64_MS_MINIMIZE);      // P7a-5：Token 化（140ms；原 THEME64_MS_NORMAL 225ms）
     f->frame = 0;
     f->fx = w->x; f->fy = w->y; f->fw = w->w; f->fh = w->h;
     const int ipx = g_dock_icon;
@@ -2961,7 +2961,7 @@ static void pop_begin64(Window* w, const char* why) {
     if (!w) return;
     g_pop_w = w;
     g_pop_t0 = ticks64();
-    g_pop_dur = (int)theme64_dur64(THEME64_MS_NORMAL);
+    g_pop_dur = (int)theme64_dur64(THEME64_MS_MINIMIZE);   // P7a-5：与最小化飞行同一个 Token（原 MS_NORMAL 225ms）
     g_pop_frame = 0;
     dirty_add(w->x, w->y, w->w, w->h);
     dbg64_line_begin64();
@@ -3231,6 +3231,10 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
         g_lang_zh    = cfg64_lang_zh64() ? true : false;
         g_text_mirror = cfg64_text_mirror64() ? true : false;
         g_mouse_sens  = cfg64_mouse_sens64();
+        // ★ P7a-15（持久化审计）：字号原来**只有打开"设置 -> 字体"页那一步才应用**（settings64:3188），
+        //   重启后一直用默认 16px —— 这里是"读的顺序晚于使用"的典型：实测改了字号重启就回默认。
+        //   修法：与 lang/mirror/sens 同一处、在同一时机（算屏幕尺寸之前）从 config64 读回并应用。
+        font_set_size64(cfg64_font_size64());
         g_mouse_sens_off = (g_mouse_sens != 1700);
     }
     g_screen_w = fb_width();
@@ -3253,6 +3257,8 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
         dbg64_dec(g_text_mirror ? 1 : 0);
         dbg64_str(" sens=");
         dbg64_dec((uint64_t)g_mouse_sens);
+        dbg64_str(" font=");
+        dbg64_dec((uint64_t)cfg64_font_size64());   // P7a-15：字号是**启动期生效**的（见上面 font_set_size64）
         dbg64_str(" icon0=");
         dbg64_dec((uint64_t)deskpos_x64(0)); dbg64_str(","); dbg64_dec((uint64_t)deskpos_y64(0));
         dbg64_str(" icon1=");

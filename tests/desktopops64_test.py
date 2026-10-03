@@ -847,13 +847,19 @@ def main():
             time.sleep(0.3)
             mon.click(wait=1.1)
             time.sleep(1.8)
+            # ★ P7a-5（时长 Token 化）：动画时长不再是硬编码 225ms，而是从 **theme64.h 的 Token**
+            #   读出来的唯一真源。断言 = 运行期 dur == Token 值 ∧ Token 落在 120–180ms 的"更快但不跳"区间。
+            tok_min = int(re.search(r"#define\s+THEME64_MS_MINIMIZE\s+(\d+)",
+                                    open(os.path.join(ROOT, "kernel", "theme64.h"), encoding="utf-8").read()).group(1))
+            check("P7a-5：THEME64_MS_MINIMIZE（最小化/恢复飞行时长 Token）在 120–180ms 区间（当前 %dms）" % tok_min,
+                  120 <= tok_min <= 180, "THEME64_MS_MINIMIZE=%dms" % tok_min)
             fly = re.search(r"\[DOCK64\] minimize fly app=5 dock_idx=\d+ from=\d+,\d+ \d+x\d+ to=\d+,\d+ \d+x\d+ "
                             r"dur=(\d+)ms anim=scale\+fade", vm.log()[n1:])
-            soft("需求 6：最小化飞向 Dock（[DOCK64] minimize fly … dur=225ms anim=scale+fade + done）",
-                  fly is not None and fly.group(1) == "225" and
-                  re.search(r"\[DOCK64\] minimize fly done app=5 frames=\d+ anim=scale\+fade", vm.log()[n1:]) is not None,
-                  fly.group(0) if fly else (re.search(r"\[DOCK64\] minimize fly[^\r\n]*", vm.log()[n1:]) or [""])[0],
-                  "[DOCK64] minimize fly" in vm.log()[n1:])
+            soft("需求 6：最小化飞向 Dock（[DOCK64] minimize fly … dur=%dms anim=scale+fade + done；dur == Token）" % tok_min,
+                 fly is not None and fly.group(1) == str(tok_min) and
+                 re.search(r"\[DOCK64\] minimize fly done app=5 frames=\d+ anim=scale\+fade", vm.log()[n1:]) is not None,
+                 fly.group(0) if fly else (re.search(r"\[DOCK64\] minimize fly[^\r\n]*", vm.log()[n1:]) or [""])[0],
+                 "[DOCK64] minimize fly" in vm.log()[n1:])
             soft("需求 6：该应用在 Dock 出现小横杠（[DOCK64] minbar idx=6 … clickable=0 + hit=none）",
                   re.search(r"\[DOCK64\] minbar idx=6 x=\d+ y=\d+ w=\d+ h=3 color=#[0-9A-F]{6} clickable=0", vm.log()[n1:]) is not None and
                   re.search(r"\[DOCK64\] minbar hit_test idx=6 .* -> hit=none", vm.log()[n1:]) is not None,
@@ -863,8 +869,9 @@ def main():
             if dock6:
                 n2 = vm.n()
                 dock_click(6, r"restore pop app=5|\[UI\] hotkey", tries=4)
-                soft("需求 6：点 Dock 恢复最小化窗口（restore-last-min + restore pop dur=225ms scale0.88->1.00+opacity）",
-                     re.search(r"\[DOCK64\] restore pop app=5 dur=225ms anim=scale0\.88->1\.00\+opacity why=dock", vm.log()[n2:]) is not None,
+                soft("需求 6：点 Dock 恢复最小化窗口（restore-last-min + restore pop dur=%dms scale0.88->1.00+opacity）" % tok_min,
+                     re.search(r"\[DOCK64\] restore pop app=5 dur=%dms anim=scale0\.88->1\.00\+opacity why=dock" % tok_min,
+                               vm.log()[n2:]) is not None,
                      (re.search(r"\[DOCK64\] restore pop app=5[^\r\n]*", vm.log()[n2:]) or [""])[0],
                      re.search(r"\[DOCK64\] (press|restore pop)", vm.log()[n2:]) is not None)
                 n3 = vm.n()
