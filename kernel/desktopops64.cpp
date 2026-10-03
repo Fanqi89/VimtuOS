@@ -27,6 +27,11 @@
 #define DOPS_ICON_X0     24      // 默认位置（= config64 的 ui.icon*.x/y 默认值）
 #define DOPS_ICON_Y0     24
 #define DOPS_ICON_DY     84
+// ★ P7a-7：桌面网格（吸附 + 占用避让；与图标单元格同尺寸，改单元格=改网格）
+#define DOPS_GRID_W   DOPS_CELL_W
+#define DOPS_GRID_H   DOPS_CELL_H
+#define DOPS_GRID_X0  DOPS_ICON_X0
+#define DOPS_GRID_Y0  DOPS_ICON_Y0
 
 // ==================== 状态 ====================
 struct DeskItem { int kind; int x, y; };
@@ -37,6 +42,13 @@ static int      g_rec_n = 0;
 static char     g_set_cache[CFG64_STR_MAX];
 static uint32_t g_tick_div = 0;
 static int      g_rec_empty_logged = 0;      // "空回收站" 打点只在状态变化时打一次（防刷屏）
+// ★ P7a-9：桌面**多选集合**（Windows 方案；详见 desktopops64.h 的说明）。
+static int  g_sel[DESKOPS_MAX_ITEMS];
+static int  g_sel_n = 0;
+static int  g_sel_anchor = -1;                            // Shift 范围选锚点（最近一次单选的下标）
+static int  g_drag_base_x[DESKOPS_MAX_ITEMS];             // 组拖动：每个选中项的起点
+static int  g_drag_base_y[DESKOPS_MAX_ITEMS];
+static int  g_drag_active = 0;
 
 // 右键菜单
 struct DeskMenuItem { unsigned char id; const char* en; const char* zh; unsigned char enabled; const char* why; };
@@ -59,6 +71,67 @@ static const DeskMenuItem kMenu[] = {
 #define DOPS_MENU_ID_PERSON    5
 #define DOPS_MENU_ID_DISPLAY   6
 #define DOPS_MENU_ID_TERM      7
+// ★ P7a-8：当前打开的菜单用哪张条目表（桌面空白菜单 = kMenu；图标右键 = kIconMenu）
+static const DeskMenuItem* g_menu_tbl = kMenu;
+static int  g_menu_n = DOPS_MENU_N;
+static int  g_menu_icon = -1;                // >=0 = 图标右键菜单的目标项下标
+
+// ★ P7a-8：**针对某个桌面图标**的右键菜单（复用同一套菜单绘制/命中，只换条目表）
+static const DeskMenuItem kIconMenu[] = {
+    { 0, "Open",       "打开",   1, nullptr },
+    { 1, "Rename",     "重命名", 0, "no inline rename editor in this batch" },
+    { 2, "Delete",     "删除",   1, nullptr },
+    { 3, "Properties", "属性",   1, nullptr },
+};
+#define DOPS_ICONMENU_N ((int)(sizeof(kIconMenu) / sizeof(kIconMenu[0])))
+#define DOPS_ICONMENU_ID_OPEN   0
+#define DOPS_ICONMENU_ID_RENAME 1
+#define DOPS_ICONMENU_ID_DELETE 2
+#define DOPS_ICONMENU_ID_PROPS  3
+
+static void icon_menu_action(int idx) {
+    if (idx < 0 || idx >= DOPS_ICONMENU_N) return;
+    const DeskMenuItem& it = kIconMenu[idx];
+    const int target = g_menu_icon;
+    const int kind = (target >= 0 && target < g_n) ? g_items[target].kind : -1;
+    const char* done = "1";
+    const char* why = "";
+    if (!it.enabled) { done = "0"; why = it.why ? it.why : "disabled"; }
+    else {
+        switch (it.id) {
+            case DOPS_ICONMENU_ID_OPEN:
+                if (kind == DESKOPS_KIND_MYPC) app_mypc_open64();
+                else if (kind == DESKOPS_KIND_RECYCLE) app_recycle_open64();
+                else app_term_open64();
+                why = "opened";
+                break;
+            case DOPS_ICONMENU_ID_DELETE:
+                if (target >= 0) { (void)desktopops64_recycle_add64(target); why = "moved to recycle bin"; }
+                break;
+            case DOPS_ICONMENU_ID_PROPS:
+                why = "kind/pos reported by [DESK64] item line";
+                break;
+            default:
+                done = "0"; why = "not implemented";
+                break;
+        }
+    }
+    dbg64_line_begin64();
+    dbg64_str("[DESK64] icon menu action idx=");
+    dbg64_dec((uint64_t)target);
+    dbg64_str(" kind=");
+    dbg64_dec((uint64_t)(kind < 0 ? 0 : kind));
+    dbg64_str(" id=");
+    dbg64_dec((uint64_t)it.id);
+    dbg64_str(" name=");
+    dbg64_str(gui64_lang_zh() ? it.zh : it.en);
+    dbg64_str(" done=");
+    dbg64_str(done);
+    dbg64_str(" why=");
+    dbg64_str(why);
+    dbg64_nl();
+    dbg64_line_end64();
+}
 
 static int  g_menu_open = 0;
 static int  g_menu_x = 0, g_menu_y = 0, g_menu_w = 0, g_menu_h = 0;
@@ -163,6 +236,7 @@ static void apply_set(const char* s) {
         if (wr[a] > 7) continue;
         g_recycle[g_rec_n++] = wr[a];
     }
+    g_sel_n = 0; g_sel_anchor = -1;             // ★ P7a-9：集合重建 -> 选择集合作废
     set_cache_only();
 }
 
@@ -242,6 +316,184 @@ void desktopops64_set_pos64(int i, int x, int y) {
     if (g_items[i].kind <= 2) cfg64_set_icon64(g_items[i].kind, x, y);   // 既有键（跨重启）
 }
 
+// ==================== ★ P7a-7：网格吸附 + 占用避让 ====================
+void desktopops64_snap64(int* x, int* y) {
+    if (!x || !y) return;
+    int col = (*x - DOPS_GRID_X0 + DOPS_GRID_W / 2) / DOPS_GRID_W;
+    int row = (*y - DOPS_GRID_Y0 + DOPS_GRID_H / 2) / DOPS_GRID_H;
+    if (col < 0) col = 0;
+    if (row < 0) row = 0;
+    *x = DOPS_GRID_X0 + col * DOPS_GRID_W;
+    *y = DOPS_GRID_Y0 + row * DOPS_GRID_H;
+}
+static int grid_cols64(void) {
+    const int sw = gui64_screen_w();
+    int cols = (sw - DOPS_GRID_X0) / DOPS_GRID_W;
+    if (cols < 1) cols = 1;
+    return cols;
+}
+static int grid_rows64(void) {
+    const int sh = gui64_screen_h() - gui64_taskbar_h();
+    int rows = (sh - DOPS_GRID_Y0) / DOPS_GRID_H;
+    if (rows < 1) rows = 1;
+    return rows;
+}
+// 某格是否被"别的项"占用（除 except）
+static int cell_taken64(int except, int x, int y) {
+    for (int k = 0; k < g_n; k++) {
+        if (k == except) continue;
+        if (g_items[k].x == x && g_items[k].y == y) return 1;
+    }
+    return 0;
+}
+// 落点 -> 吸附到最近网格；该格被占则按"环"就近找最近空格（返回 1 = 避让过；-1 = 无目标项）
+int desktopops64_place64(int i, int x, int y, int* ox, int* oy) {
+    if (i < 0 || i >= g_n) return -1;
+    desktopops64_snap64(&x, &y);
+    int col = (x - DOPS_GRID_X0) / DOPS_GRID_W;
+    int row = (y - DOPS_GRID_Y0) / DOPS_GRID_H;
+    const int cols = grid_cols64(), rows = grid_rows64();
+    if (col < 0) col = 0; if (col >= cols) col = cols - 1;
+    if (row < 0) row = 0; if (row >= rows) row = rows - 1;
+    int avoid = 0;
+    if (cell_taken64(i, DOPS_GRID_X0 + col * DOPS_GRID_W, DOPS_GRID_Y0 + row * DOPS_GRID_H)) {
+        int best = -1, bc = col, br = row;
+        for (int ring = 1; ring <= 16 && best < 0; ring++) {
+            for (int dc = -ring; dc <= ring; dc++) {
+                for (int dr = -ring; dr <= ring; dr++) {
+                    if (dc != -ring && dc != ring && dr != -ring && dr != ring) continue;
+                    const int c = col + dc, r = row + dr;
+                    if (c < 0 || r < 0 || c >= cols || r >= rows) continue;
+                    if (cell_taken64(i, DOPS_GRID_X0 + c * DOPS_GRID_W, DOPS_GRID_Y0 + r * DOPS_GRID_H)) continue;
+                    const int d = dc * dc + dr * dr;
+                    if (best < 0 || d < best) { best = d; bc = c; br = r; }
+                }
+            }
+        }
+        col = bc; row = br; avoid = 1;
+    }
+    if (ox) *ox = DOPS_GRID_X0 + col * DOPS_GRID_W;
+    if (oy) *oy = DOPS_GRID_Y0 + row * DOPS_GRID_H;
+    return avoid;
+}
+void desktopops64_drop64(int i, int x, int y) {
+    if (i < 0 || i >= g_n) return;
+    int nx = x, ny = y;
+    const int avoid = desktopops64_place64(i, x, y, &nx, &ny);
+    g_items[i].x = nx; g_items[i].y = ny;
+    if (g_items[i].kind <= 2) cfg64_set_icon64(g_items[i].kind, nx, ny);
+    dbg64_line_begin64();
+    dbg64_str("[DESK64] snap idx=");
+    dbg64_dec((uint64_t)i);
+    dbg64_str(" from=");
+    dbg64_dec((uint64_t)x); dbg64_str(","); dbg64_dec((uint64_t)y);
+    dbg64_str(" to=");
+    dbg64_dec((uint64_t)nx); dbg64_str(","); dbg64_dec((uint64_t)ny);
+    dbg64_str(" grid=");
+    dbg64_dec((uint64_t)DOPS_GRID_W); dbg64_str("x"); dbg64_dec((uint64_t)DOPS_GRID_H);
+    dbg64_str(" origin=");
+    dbg64_dec((uint64_t)DOPS_GRID_X0); dbg64_str(","); dbg64_dec((uint64_t)DOPS_GRID_Y0);
+    dbg64_str(" avoid=");
+    dbg64_dec((uint64_t)(avoid > 0 ? 1 : 0));
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// ==================== ★ P7a-9：多选集合 + 组拖动 ====================
+int desktopops64_sel_count64(void) { return g_sel_n; }
+int desktopops64_is_selected64(int i) {
+    if (i < 0 || i >= g_n) return 0;
+    for (int k = 0; k < g_sel_n; k++) if (g_sel[k] == i) return 1;
+    return 0;
+}
+int desktopops64_sel_at64(int k) { return (k >= 0 && k < g_sel_n && g_sel[k] < g_n) ? g_sel[k] : -1; }
+static void sel_add(int i) {
+    if (i < 0 || i >= g_n || desktopops64_is_selected64(i)) return;
+    if (g_sel_n >= DESKOPS_MAX_ITEMS) return;
+    g_sel[g_sel_n++] = i;
+}
+static void sel_remove(int i) {
+    for (int k = 0; k < g_sel_n; k++) if (g_sel[k] == i) { g_sel[k] = g_sel[--g_sel_n]; return; }
+}
+void desktopops64_select_only64(int i) { g_sel_n = 0; sel_add(i); g_sel_anchor = i; }
+void desktopops64_select_toggle64(int i) {
+    if (desktopops64_is_selected64(i)) sel_remove(i);
+    else { sel_add(i); g_sel_anchor = i; }
+}
+void desktopops64_select_range64(int i) {
+    if (g_sel_anchor < 0 || g_sel_anchor >= g_n) { desktopops64_select_only64(i); return; }
+    g_sel_n = 0;
+    int a = g_sel_anchor, b = i;
+    if (a > b) { const int t = a; a = b; b = t; }
+    for (int k = a; k <= b; k++) sel_add(k);
+}
+void desktopops64_select_clear64(void) { g_sel_n = 0; g_sel_anchor = -1; }
+void desktopops64_select_rect64(void) {
+    g_sel_n = 0;
+    for (int i = 0; i < g_n; i++)
+        if (desktopops64_rect_hit64(i, g_sel_x0, g_sel_y0, g_sel_x1, g_sel_y1)) sel_add(i);
+}
+void desktopops64_drag_begin64(void) {
+    for (int i = 0; i < g_n; i++) { g_drag_base_x[i] = g_items[i].x; g_drag_base_y[i] = g_items[i].y; }
+    g_drag_active = 1;
+}
+int desktopops64_drag_group64(int dx, int dy) {
+    if (!g_drag_active) return 0;
+    int changed = 0;
+    const int sw = gui64_screen_w(), sh = gui64_screen_h() - gui64_taskbar_h();
+    for (int k = 0; k < g_sel_n; k++) {
+        const int i = g_sel[k];
+        if (i < 0 || i >= g_n) continue;
+        int nx = g_drag_base_x[i] + dx;
+        int ny = g_drag_base_y[i] + dy;
+        if (nx < 2) nx = 2;
+        if (ny < 2) ny = 2;
+        if (nx > sw - DOPS_CELL_W - 2) nx = sw - DOPS_CELL_W - 2;
+        if (ny > sh - DOPS_CELL_H) ny = sh - DOPS_CELL_H;
+        if (nx != g_items[i].x || ny != g_items[i].y) { g_items[i].x = nx; g_items[i].y = ny; changed = 1; }
+    }
+    return changed;
+}
+void desktopops64_drag_commit64(void) {
+    if (!g_drag_active) return;
+    g_drag_active = 0;
+    // 先把整组吸附到网格（保持组内相对位置），再逐项避让并持久化
+    for (int k = 0; k < g_sel_n; k++) {
+        const int i = g_sel[k];
+        if (i < 0 || i >= g_n) continue;
+        int nx = g_items[i].x, ny = g_items[i].y;
+        desktopops64_snap64(&nx, &ny);
+        const int sw = gui64_screen_w(), sh = gui64_screen_h() - gui64_taskbar_h();
+        if (nx < 2) nx = 2;
+        if (ny < 2) ny = 2;
+        if (nx > sw - DOPS_CELL_W - 2) nx = sw - DOPS_CELL_W - 2;
+        if (ny > sh - DOPS_CELL_H) ny = sh - DOPS_CELL_H;
+        g_items[i].x = nx; g_items[i].y = ny;
+    }
+    for (int k = 0; k < g_sel_n; k++) {
+        const int i = g_sel[k];
+        if (i < 0 || i >= g_n) continue;
+        int nx = g_items[i].x, ny = g_items[i].y;
+        const int avoid = desktopops64_place64(i, nx, ny, &nx, &ny);
+        g_items[i].x = nx; g_items[i].y = ny;
+        if (g_items[i].kind <= 2) cfg64_set_icon64(g_items[i].kind, nx, ny);
+        dbg64_line_begin64();
+        dbg64_str("[DESK64] snap idx=");
+        dbg64_dec((uint64_t)i);
+        dbg64_str(" to=");
+        dbg64_dec((uint64_t)nx); dbg64_str(","); dbg64_dec((uint64_t)ny);
+        dbg64_str(" grid=");
+        dbg64_dec((uint64_t)DOPS_GRID_W); dbg64_str("x"); dbg64_dec((uint64_t)DOPS_GRID_H);
+        dbg64_str(" origin=");
+        dbg64_dec((uint64_t)DOPS_GRID_X0); dbg64_str(","); dbg64_dec((uint64_t)DOPS_GRID_Y0);
+        dbg64_str(" avoid=");
+        dbg64_dec((uint64_t)(avoid > 0 ? 1 : 0));
+        dbg64_str(" group=1");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+}
+
 void desktopops64_clamp64(int x, int y) {
     for (int i = 0; i < g_n; i++) {
         if (g_items[i].x < 2) g_items[i].x = 2;
@@ -293,7 +545,7 @@ void desktopops64_draw_icons64(int selected) {
     for (int i = 0; i < g_n; i++) {
         const int x = g_items[i].x, y = g_items[i].y;
         const int k = g_items[i].kind;
-        if (selected == i)
+        if (selected == i || desktopops64_is_selected64(i))
             gfx64_fill_round64(x - 4, y - 4, DOPS_ICON_W + 8, DOPS_ICON_W + 20, THEME64_R_ICON, t->sel_bg, 255);
         if (k <= 2) {
             // 软件快捷方式：**简约圆角正方形**底板（主题渐变 + 1px 高光边）+ 真图标位图居中
@@ -317,6 +569,7 @@ void desktopops64_draw_icons64(int selected) {
 // ==================== 恢复默认桌面图标 ====================
 void desktopops64_restore_defaults64(const char* why) {
     g_n = 0;
+    g_sel_n = 0; g_sel_anchor = -1;             // ★ P7a-9：图标集合变化 -> 选择集合作废
     for (int k = 0; k <= 2; k++) {
         DeskItem it{};
         it.kind = k;
@@ -731,14 +984,14 @@ void desktopops64_recycle_reset64() {
 // ==================== 桌面右键菜单 ====================
 static void menu_measure(void) {
     int w = 0;
-    for (int i = 0; i < DOPS_MENU_N; i++) {
-        const int tw = p2ui_text_w64(gui64_lang_zh() ? kMenu[i].zh : kMenu[i].en);
+    for (int i = 0; i < g_menu_n; i++) {
+        const int tw = p2ui_text_w64(gui64_lang_zh() ? g_menu_tbl[i].zh : g_menu_tbl[i].en);
         if (tw > w) w = tw;
     }
     g_menu_w = w + THEME64_POP_PAD * 2 + 28;      // 28 = 左侧图标列（Token 组合出来的）
     if (g_menu_w < 180) g_menu_w = 180;
     if (g_menu_w > 320) g_menu_w = 320;
-    g_menu_h = DOPS_MENU_N * g_menu_item_h + THEME64_POP_PAD;
+    g_menu_h = g_menu_n * g_menu_item_h + THEME64_POP_PAD;
 }
 
 void desktopops64_menu_geom64(int* x, int* y, int* w, int* h) {
@@ -748,9 +1001,10 @@ void desktopops64_menu_geom64(int* x, int* y, int* w, int* h) {
     if (h) *h = g_menu_h;
 }
 int desktopops64_menu_is_open64() { return g_menu_open; }
-int desktopops64_menu_items64() { return DOPS_MENU_N; }
+int desktopops64_menu_items64() { return g_menu_n; }
 
-void desktopops64_menu_open64(int mx, int my) {
+// 打开菜单的公共几何/打点（两种菜单共用；调用方先设好 g_menu_tbl/g_menu_n/g_menu_icon）
+static void menu_do_open64(int mx, int my) {
     menu_measure();
     const int sw = gui64_screen_w(), sh = gui64_screen_h() - gui64_taskbar_h();
     int x = mx, y = my;
@@ -772,10 +1026,10 @@ void desktopops64_menu_open64(int mx, int my) {
     dbg64_str(" h=");
     dbg64_dec((uint64_t)g_menu_h);
     dbg64_str(" items=");
-    dbg64_dec((uint64_t)DOPS_MENU_N);
+    dbg64_dec((uint64_t)g_menu_n);
     {
         int en = 0;
-        for (int i = 0; i < DOPS_MENU_N; i++) if (kMenu[i].enabled) en++;
+        for (int i = 0; i < g_menu_n; i++) if (g_menu_tbl[i].enabled) en++;
         dbg64_str(" enabled=");
         dbg64_dec((uint64_t)en);
     }
@@ -784,27 +1038,44 @@ void desktopops64_menu_open64(int mx, int my) {
     dbg64_str(" r=");
     dbg64_dec((uint64_t)THEME64_POP_R);
     dbg64_str(" shadow=2 edge=1 (acrylic)");
+    if (g_menu_icon >= 0) { dbg64_str(" for=icon idx="); dbg64_dec((uint64_t)g_menu_icon); }
     dbg64_nl();
     dbg64_line_end64();
-    for (int i = 0; i < DOPS_MENU_N; i++) {
+    for (int i = 0; i < g_menu_n; i++) {
         dbg64_line_begin64();
         dbg64_str("[DESK64] menu item idx=");
         dbg64_dec((uint64_t)i);
         dbg64_str(" id=");
-        dbg64_dec((uint64_t)kMenu[i].id);
+        dbg64_dec((uint64_t)g_menu_tbl[i].id);
         dbg64_str(" name=");
-        dbg64_str(gui64_lang_zh() ? kMenu[i].zh : kMenu[i].en);
+        dbg64_str(gui64_lang_zh() ? g_menu_tbl[i].zh : g_menu_tbl[i].en);
         dbg64_str(" enabled=");
-        dbg64_dec((uint64_t)kMenu[i].enabled);
+        dbg64_dec((uint64_t)g_menu_tbl[i].enabled);
         dbg64_str(" y=");
         dbg64_dec((uint64_t)(g_menu_y + THEME64_POP_PAD / 2 + i * g_menu_item_h));
         dbg64_str(" h=");
         dbg64_dec((uint64_t)g_menu_item_h);
-        if (!kMenu[i].enabled) { dbg64_str(" why="); dbg64_str(kMenu[i].why ? kMenu[i].why : "n/a"); }
+        if (!g_menu_tbl[i].enabled) { dbg64_str(" why="); dbg64_str(g_menu_tbl[i].why ? g_menu_tbl[i].why : "n/a"); }
         dbg64_nl();
         dbg64_line_end64();
     }
 }
+void desktopops64_menu_open64(int mx, int my) {
+    g_menu_tbl = kMenu;
+    g_menu_n = DOPS_MENU_N;
+    g_menu_icon = -1;                 // 桌面空白菜单（无目标图标）
+    menu_do_open64(mx, my);
+}
+void desktopops64_icon_menu_open64(int idx, int mx, int my) {
+    if (idx < 0 || idx >= g_n) { desktopops64_menu_open64(mx, my); return; }
+    g_menu_tbl = kIconMenu;
+    g_menu_n = DOPS_ICONMENU_N;
+    g_menu_icon = idx;                // ★ P7a-8：绑定目标图标
+    // 选出该图标（右键 = 先选中再弹菜单，与 Windows 一致）
+    desktopops64_select_only64(idx);
+    menu_do_open64(mx, my);
+}
+int desktopops64_menu_target64() { return g_menu_icon; }
 
 void desktopops64_menu_close64(const char* why) {
     if (!g_menu_open) return;
@@ -823,8 +1094,8 @@ void desktopops64_menu_move64(int mx, int my) {
     int hov = -1;
     if (mx >= g_menu_x && mx < g_menu_x + g_menu_w && my >= g_menu_y && my < g_menu_y + g_menu_h) {
         hov = (my - g_menu_y - THEME64_POP_PAD / 2) / g_menu_item_h;
-        if (hov < 0 || hov >= DOPS_MENU_N) hov = -1;
-        else if (!kMenu[hov].enabled) hov = -1;      // 置灰项不参与高亮
+        if (hov < 0 || hov >= g_menu_n) hov = -1;
+        else if (!g_menu_tbl[hov].enabled) hov = -1;      // 置灰项不参与高亮
     }
     if (hov != g_menu_hover) {
         g_menu_hover = hov;
@@ -833,7 +1104,9 @@ void desktopops64_menu_move64(int mx, int my) {
 }
 
 static void menu_action(int idx) {
-    const DeskMenuItem& it = kMenu[idx];
+    // ★ P7a-8：图标右键菜单走**独立** id 空间（与桌面空白菜单不同），先分流。
+    if (g_menu_icon >= 0) { icon_menu_action(idx); return; }
+    const DeskMenuItem& it = g_menu_tbl[idx];
     const char* done = "1";
     const char* why = "";
     if (!it.enabled) {
@@ -914,7 +1187,7 @@ int desktopops64_menu_press64(int mx, int my, int button) {
     if (mx >= g_menu_x && mx < g_menu_x + g_menu_w && my >= g_menu_y && my < g_menu_y + g_menu_h) {
         const int idx = (my - g_menu_y - THEME64_POP_PAD / 2) / g_menu_item_h;
         desktopops64_menu_close64("action");
-        if (idx >= 0 && idx < DOPS_MENU_N) menu_action(idx);
+        if (idx >= 0 && idx < g_menu_n) menu_action(idx);
         return 1;
     }
     desktopops64_menu_close64("outside");     // 点外部关闭（需求）
@@ -924,10 +1197,11 @@ int desktopops64_menu_press64(int mx, int my, int button) {
 int desktopops64_menu_key64(uint8_t c) {
     if (!g_menu_open) return 0;
     if (c == 0x1B) { desktopops64_menu_close64("esc"); return 1; }
-    if (c == 0xFD) { g_menu_hover = (g_menu_hover <= 0) ? DOPS_MENU_N - 1 : g_menu_hover - 1; gui64_dirty(g_menu_x, g_menu_y, g_menu_w, g_menu_h); return 1; }
-    if (c == 0xFE) { g_menu_hover = (g_menu_hover + 1) % DOPS_MENU_N; gui64_dirty(g_menu_x, g_menu_y, g_menu_w, g_menu_h); return 1; }
+    if (c == 0xFD) { g_menu_hover = (g_menu_hover <= 0) ? g_menu_n - 1 : g_menu_hover - 1; gui64_dirty(g_menu_x, g_menu_y, g_menu_w, g_menu_h); return 1; }
+    if (c == 0xFE) { g_menu_hover = (g_menu_hover + 1) % g_menu_n; gui64_dirty(g_menu_x, g_menu_y, g_menu_w, g_menu_h); return 1; }
     if (c == '\n' || c == '\r') {
         const int idx = (g_menu_hover >= 0) ? g_menu_hover : 0;
+        if (idx >= g_menu_n) return 1;
         desktopops64_menu_close64("action");
         menu_action(idx);
         return 1;
@@ -942,16 +1216,16 @@ void desktopops64_menu_draw64() {
     // 亚克力 + 圆角 + 双层浅阴影 + 1px 高光边（p2ui_popup64 一次到位，数字全在 Token）
     p2ui_popup64(g_menu_x, g_menu_y, g_menu_w, g_menu_h, THEME64_POP_R, THEME64_POP_R,
                  t, t->client_bg, t->dark ? THEME64_A_POP_DARK : THEME64_A_POP);
-    for (int i = 0; i < DOPS_MENU_N; i++) {
+    for (int i = 0; i < g_menu_n; i++) {
         const int iy = g_menu_y + THEME64_POP_PAD / 2 + i * g_menu_item_h;
         if (i == g_menu_hover)
             gfx64_fill_round64(g_menu_x + 4, iy + 2, g_menu_w - 8, g_menu_item_h - 4,
                                THEME64_R_BUTTON, t->sel_bg, 110);
-        const uint32_t fg = kMenu[i].enabled ? t->text : t->text_dim;
+        const uint32_t fg = g_menu_tbl[i].enabled ? t->text : t->text_dim;
         const int ty = iy + (g_menu_item_h - p2ui_line_h64()) / 2;
         p2ui_text64(g_menu_x + THEME64_POP_PAD + 22, ty,
-                    zh ? kMenu[i].zh : kMenu[i].en, fg);
-        if (!kMenu[i].enabled) {
+                    zh ? g_menu_tbl[i].zh : g_menu_tbl[i].en, fg);
+        if (!g_menu_tbl[i].enabled) {
             // 置灰项打点提示（需求：做不到的项如实置灰并打点）—— 画一个小圆点做视觉标记
             p2ui_fill_circle64(g_menu_x + THEME64_POP_PAD + 10, iy + g_menu_item_h / 2, 3, fg, 200);
         } else {

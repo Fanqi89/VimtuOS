@@ -101,4 +101,30 @@ void desktopops64_selbox_rect64(int* x, int* y, int* w, int* h);
 int  desktopops64_selbox_count64();                      // 框内项数
 void desktopops64_selbox_draw64();                       // 玻璃：中间全透明 + 突出边缘
 
+// ---- ★ P7a-7：网格吸附 / 占用避让（桌面图标不再自由重叠）----
+//   snap：把自由落点吸到**最近的网格单元左上角**（网格 = 图标单元格 88x84，原点 = 默认位置 24,24）；
+//   place：吸附后若该格已被别的项占用，按"环"从近到远找最近空格（就近避让）；返回 1 = 避让过；
+//   drop：落点最终生效 = 吸附 + 避让 + 写内存/config（图标 0..2 用既有键）+ 打点 [DESK64] snap …。
+void desktopops64_snap64(int* x, int* y);
+int  desktopops64_place64(int i, int x, int y, int* ox, int* oy);
+void desktopops64_drop64(int i, int x, int y);
+
+// ---- ★ P7a-8：**针对某个桌面图标**的右键菜单（打开/重命名/删除/属性）----
+void desktopops64_icon_menu_open64(int idx, int mx, int my);
+int  desktopops64_menu_target64();                        // 当前菜单目标项下标（-1 = 桌面空白菜单）
+
+// ---- ★ P7a-9：多选集合 / 组拖动（Windows 方案）----
+//   单击 = 选中一个；Ctrl = 加选/反选；Shift = 范围选；框选 = 一组；按住任一已选图标 = 移动整组
+//   （组内相对位置保持）；单击空白 = 清除选择。
+int  desktopops64_sel_count64();
+int  desktopops64_is_selected64(int i);
+int  desktopops64_sel_at64(int k);                        // 第 k 个选中项下标（-1 = 越界）
+void desktopops64_select_only64(int i);
+void desktopops64_select_toggle64(int i);
+void desktopops64_select_range64(int i);
+void desktopops64_select_clear64(void);
+void desktopops64_select_rect64(void);                    // 按当前选择框矩形重算选中集合
+void desktopops64_drag_begin64(void);                     // 组拖动开始（记住每个选中项起点）
+int  desktopops64_drag_group64(int dx, int dy);           // 组拖动位移（相对起点）；1 = 有变化
+void desktopops64_drag_commit64(void);                    // 组拖动结束（逐项吸附+避让+持久化+打点）
 int  desktopops64_selftest64();
