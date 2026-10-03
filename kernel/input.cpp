@@ -151,12 +151,18 @@ static inline uint32_t kbd_ev_mods64() {
     return m;
 }
 
+// ★ 修复（③/⑤用）：按键事件计数。kbd_push 是"键码解码完成"的唯一出口（见下），
+//   所以在这里 +1 就是"有人按了键"的中性事实，与有没有消费者无关。
+static volatile uint32_t kbd_events = 0;
+uint32_t kbd_events64() { return kbd_events; }
+
 static void kbd_push(uint8_t c) {
     uint32_t next = (kbd_head + 1) % KBD_BUF_SIZE;
     if (next != kbd_tail) {
         kbd_buf[kbd_head] = c;
         kbd_head = next;
     }
+    kbd_events++;                 // ★ 修复：中性"有人按键"计数（③ 演示驱动判定 / ⑤ 任意键跳过）
     // ★ A5 前置：这是\"键码解码完成\"的**唯一出口**（普通字符 / 控制字符 / Esc / NAV_* /
     //   KBD_KEY_F2|DELETE|PAGEUP|PAGEDOWN 全都从这里出去）—— 事件层在这里生成 KEY_DOWN。
     //   纯修饰键（Shift/Ctrl/Alt/Caps）不走这里，所以它们不会产生按键事件（只进 mods）。

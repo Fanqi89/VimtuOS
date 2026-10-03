@@ -183,6 +183,7 @@ enum {
     CID_RES_DROP = 30, CID_ZOOM_100 = 31, CID_ZOOM_125 = 32, CID_ZOOM_150 = 33,
     CID_DISPLAY_APPLY = 34,
     CID_SND_VOL = 40, CID_SND_SPK = 41, CID_SND_HP = 42, CID_SND_MUTE = 43,
+    CID_MOUSE_SENS = 46,           // ★ 修复（④）：指针速度滑块（接 cfg64_set_mouse_sens64 + gui64_set_mouse_sens64）
     CID_PWR_SHUTDOWN = 50, CID_PWR_REBOOT = 51, CID_PWR_LOCK = 52,
     CID_DEF_ROW = 300,             // 300..319 = 4 个类型行 × 5 个应用项（默认应用页）
     CID_WALL_FIELD = 70, CID_WALL_APPLY = 71, CID_WALL_BUILTIN = 72, CID_WALL_PRESET = 73,
@@ -331,6 +332,10 @@ static bool hit(int x, int y, int w, int h, int px, int py) {
     return px >= x && px < x + w && py >= y && py < y + h;
 }
 
+// ★ 系统音效触发点（②）：**错误提示** -> error。设置页所有"失败/非法/未实现"提示都走
+//   msg_set(..., accent2)（错误语义色）—— 统一在这里判定并播内置 error 素材（打 [SND64] fx 行）。
+//   上屏文本与显示行为一字不变；判据 = 颜色，所以新增的错误提示自动接上。
+static bool msg_is_err(uint32_t col) { return col == tk64()->accent2; }
 // ==================== 消息行（操作结果，6 秒后消失） ====================
 static void msg_set(const char* s, uint32_t col) {
     int i = 0;
@@ -338,6 +343,7 @@ static void msg_set(const char* s, uint32_t col) {
     g_msg[i] = 0;
     g_msg_t0 = ticks64();
     g_msg_col = col;
+    if (msg_is_err(col)) (void)hda64_play_named64("error", "settings-msg-error");   // ★ ② error 触发点
 }
 static bool msg_fresh() { return g_msg[0] && (uint32_t)(ticks64() - g_msg_t0) < ms_to_ticks64(6000); }
 
@@ -1201,7 +1207,7 @@ static void page_display(const Lay* L, int x0, int y0) {
     page_title(L, x0 + L->cx, y0, zh ? "显示" : "Display",
                zh ? "分辨率 / 刷新率 / 缩放（全部实测）" : "Resolution / refresh / zoom (measured)");
     int y = L->card_y;
-    const int c1y = y, c1h = card_rows_h(L, 4);
+    const int c1y = y, c1h = card_rows_h(L, 5);   // ★ 修复（④）：显示页多一行"指针速度"
     card_begin(L, c1y, c1h);
     int ry = c1y + 12;
     // 1) 分辨率（下拉：6 个候选；字段永远显示实测值）
@@ -1273,6 +1279,28 @@ static void page_display(const Lay* L, int x0, int y0) {
                     g_hover == CID_DISPLAY_APPLY, g_press == CID_DISPLAY_APPLY);
         ctl_reg(P_DISPLAY, CID_DISPLAY_APPLY, CK_BUTTON, bx, ry + (L->row_h - bh) / 2, bw, bh);
         if (msg_fresh()) ui_text(L->card_x + 16, ry + (L->row_h - ui_h()) / 2, g_msg, g_msg_col);
+        ry += L->row_h;
+    }
+    // 5) ★ 修复（④）：指针速度（鼠标灵敏度）。接到 gui64_set_mouse_sens64 -> cfg64_set_mouse_sens64（持久化）
+    //    并让外壳**立即生效**（旧代码全仓没有一处调用 cfg64_set_mouse_sens64，改了也不生效）。
+    {
+        int rx = 0;
+        row_label(L, ry, zh ? "指针速度" : "Pointer speed",
+                  zh ? "鼠标灵敏度 800..2500 千分比（立即生效 + 持久化到 /store.a|b）"
+                     : "mouse sensitivity 800..2500 permille (live + persisted)", &rx);
+        Buf b; b_init(&b);
+        b_int(&b, gui64_get_mouse_sens64());
+        b_str(&b, " / 1700");
+        ui_text(rx - ui_w(b.b), ry + (L->row_h - ui_h()) / 2, b.b, t->text);
+        const int sw = 260, sx = rx - ui_w(b.b) - 16 - sw;
+        const int sy = ry + L->row_h / 2 - THEME64_PANEL_KNOB / 2;
+        // 滑轨 0..100 <-> 800..2500 千分比
+        const int cur = gui64_get_mouse_sens64();
+        int sv = (cur - 800) * 100 / 1700;
+        if (sv < 0) sv = 0;
+        if (sv > 100) sv = 100;
+        draw_slider(L, sx, sy, sw, sv, 100, g_hover == CID_MOUSE_SENS, g_drag == CID_MOUSE_SENS);
+        ctl_reg(P_DISPLAY, CID_MOUSE_SENS, CK_SLIDER, sx, ry + 6, sw, L->row_h - 12);
         ry += L->row_h;
     }
     // 卡片 2：设备规格摘要（[UI] settings specs 行的数据源）
@@ -2638,6 +2666,11 @@ static void slider_drag(int id, int x, int w, int mx) {
         case CID_SND_VOL:
             sound_set_vol(cv, "drag");
             break;
+        case CID_MOUSE_SENS: {                              // ★ 修复（④）：0..100 -> 800..2500 千分比
+            const int pm = 800 + cv * 17;                    // cv=0 -> 800, cv=100 -> 2500
+            gui64_set_mouse_sens64(pm);                      // 持久化 + 立即生效（gui64 里完成）
+            break;
+        }
         case CID_DOCK_LEN: {
             const int len = (cv <= 2) ? 0 : (320 + cv * 8);
             cfg64_set_dock_len64(len);
@@ -2725,6 +2758,10 @@ static void set_click(Window* w, int cx, int cy0) {
             g_drag = id;
             slider_drag(id, c->x, c->w, cx);
             sound_log_reason();
+            break;
+        case CID_MOUSE_SENS:                                 // ★ 修复（④）：按下即开始拖动（滑轨反算）
+            g_drag = id;
+            slider_drag(id, c->x, c->w, cx);
             break;
         case CID_SND_SPK: sound_set_src(0, "settings-click"); break;
         case CID_SND_HP:  sound_set_src(1, "settings-click"); break;

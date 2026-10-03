@@ -349,6 +349,8 @@ void panels64_notify64(int icon_kind, const char* title, const char* body) {
     dbg64_str(n.time);
     dbg64_nl();
     dbg64_line_end64();
+    // ★ 系统音效：通知 toast -> notify（用已有 hda64 驱动播内置素材；无驱动/关开关时静默）
+    (void)hda64_play_named64("notify", "toast");
 }
 int panels64_notif_count64() { return g_notif_n; }
 int panels64_notif_unread64() { return g_notif_unread; }

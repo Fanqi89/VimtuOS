@@ -47,6 +47,7 @@
 #include "settings64.h"      // ★ P3：设置页的启动期生效点（字体大小档 + 自定义渐变壁纸）
 #include "desktopops64.h"     // ★ P5：桌面右键菜单 / 玻璃选择框 / 回收站 / 桌面图标集合
 #include "icons64.h"         // ★ 本批：外置图标包（真图标）—— 内核里不含图标字节，见 icons64.h
+#include "hda64.h"            // ★ 系统音效：startup/click/error 触发点 + 开机动画之外的既有驱动
 
 // ★ 缺陷 6①：settings64.cpp 里的按用户偏好同步（theme/lock_mode）—— settings64.h 不在本批可改文件里，
 //   所以在这里给出声明（实现在 settings64.cpp）。
@@ -256,6 +257,28 @@ static void mouse_apply_sensitivity() {
     g_sens_rem_y -= sy * 1700;
     if (sx || sy) mouse_set_pos(rx - dx + sx, ry - dy + sy);
 }
+
+// ★ 修复（④）：灵敏度改动的**运行期生效**入口。设置应用改滑轨时调它 —— 一次搞定三件事：
+//   持久化（cfg64_set_mouse_sens64 写 config64/store64）、外壳实时生效（g_mouse_sens）、
+//   重置缩放基准（否则会把"改设置那一帧的位移"当成一次跳变）。
+//   旧行为：全仓没有一处调用 cfg64_set_mouse_sens64 —— 设置里怎么拖重启都不生效（本次修的就是它）。
+void gui64_set_mouse_sens64(int permille) {
+    cfg64_set_mouse_sens64(permille);                 // 钳制 800..2500 并落 store（持久化）
+    g_mouse_sens = cfg64_mouse_sens64();              // 以配置里的最终值为准
+    g_mouse_sens_off = (g_mouse_sens != 1700);
+    g_sens_base_x = g_sens_base_y = -1;
+    g_sens_rem_x = g_sens_rem_y = 0;
+    dbg64_line_begin64();
+    dbg64_str("[CONF64] mouse sens set to=");
+    dbg64_dec((uint64_t)g_mouse_sens);
+    dbg64_str(" permille scaling=");
+    dbg64_dec(g_mouse_sens_off ? 1 : 0);
+    dbg64_str(" (baseline 1700)");
+    hda64_play_named64("click", "sens-apply");        // 改动有即时反馈（系统音效触发点之一）
+    dbg64_nl();
+    dbg64_line_end64();
+}
+int gui64_get_mouse_sens64() { return g_mouse_sens; }
 
 // 帧率/忙占比统计
 static uint32_t g_frames = 0;
@@ -728,29 +751,56 @@ static void boot_logo_draw64(int a_scale, int* rx, int* ry, int* rw, int* rh) {
     font_select(face_save);
     *rx = fx - 8; *ry = fy - 8; *rw = s + 16; *rh = s + 16 + font_line_height() + 8;
 }
-// ==================== 开机 logo（淡入）====================
-// 桌面首帧之前跑：黑底 + 屏幕居中 logo（240x150 RGBA）；12 帧逐帧提高不透明度，帧间用 ticks64()
-// 节流到 ~60Hz，每帧只提交 logo 那一块小矩形。
+// ==================== 开机 logo（目标时长 1.2s：淡入 300ms + 停留 600ms + 淡出 300ms）====================
+// 桌面首帧之前跑：黑底 + 屏幕居中 logo（240x150 RGBA）。**P7a-6：目标时长**（用户反馈"出现 1 秒就进系统"）
+//   = 淡入 300ms + 停留 600ms + 淡出 300ms = 总 1200ms；~60Hz，每帧只提交 logo 那一块小矩形。
+//   任意键可跳过（与开机滚屏 con64 的"任意键"同语义；跳过后丢掉这一次输入）。
+//   顺序确认：开机滚屏（[CON64]）-> 本动画（[UI] boot logo show）-> 锁屏（[LOCK64] lock screen shown）。
 // ★ 本批（资源外置）：图不再内嵌 —— 从系统卷 /etc/logo.bin 读（见 logo_asset_rgba64）；读不到就用
 //   内置的 kaisi 图标 + 一行 "VimtuOS" 兜底（boot_logo_draw64），[UI] boot logo show 行里如实标出 src=。
 static void boot_logo_fade_in(void) {
-    const int frames = 12;
+    const int fin_ms = 300, hold_ms = 600, fout_ms = 300;   // P7a-6 目标：总 1200ms
+    const int n_in   = fin_ms  * 60 / 1000;                 // 18 帧
+    const int n_hold = hold_ms * 60 / 1000;                 // 36 帧
+    const int n_out  = fout_ms * 60 / 1000;                 // 18 帧
+    const int frames = n_in + n_hold + n_out;               // 72 帧 @60Hz
     fb_clear(rgb(0, 0, 0));
     fb_flip();
-    uint32_t next = ticks64();
+    const uint32_t k0 = kbd_events64();                     // 任意键跳过：只看**新的**按键
+    const uint32_t t0 = ticks64();
+    uint32_t next = t0;
+    int drawn = 0, skipped = 0;
     for (int f = 1; f <= frames; f++) {
         int guard = 0;   // 护栏：万一 PIT 停摆也不至于死在等待里
         while ((int32_t)(ticks64() - next) < 0 && ++guard < 2000000) __asm__ volatile("pause");
         next += PIT_HZ_64 / 60;
+        if (kbd_events64() != k0) { skipped = 1; break; }   // 任意键 -> 立即结束动画
+        int a;
+        if (f <= n_in)                    a = (f * 255) / n_in;                    // 淡入
+        else if (f <= n_in + n_hold)      a = 255;                                 // 停留
+        else                              a = ((frames - f + 1) * 255) / n_out;   // 淡出
+        if (a > 255) a = 255;
+        if (a < 0) a = 0;
         int rx = 0, ry = 0, rw = 0, rh = 0;
-        boot_logo_draw64(f * 255 / frames, &rx, &ry, &rw, &rh);
+        boot_logo_draw64(a, &rx, &ry, &rw, &rh);
         fb_flip_region(rx, ry, rw, rh);          // 只提交 logo 那块（区域由 boot_logo_draw64 回填）
+        drawn++;
     }
+    const uint32_t elapsed_ms = (uint32_t)((ticks64() - t0) * 1000u / PIT_HZ_64);
+    if (skipped) kbd_drain();                    // 与滚屏一致：跳过后丢掉这一次输入（别漏给桌面）
     dbg64_str("[UI] boot logo show frames=");
     dbg64_dec((uint64_t)frames);
     dbg64_str(" fade=ok src=");
     dbg64_str(g_logo_src_desc);
+    dbg64_str(" fadein_ms="); dbg64_dec((uint64_t)fin_ms);
+    dbg64_str(" hold_ms=");   dbg64_dec((uint64_t)hold_ms);
+    dbg64_str(" fadeout_ms="); dbg64_dec((uint64_t)fout_ms);
+    dbg64_str(" target_ms="); dbg64_dec((uint64_t)(fin_ms + hold_ms + fout_ms));
+    dbg64_str(" drawn=");     dbg64_dec((uint64_t)drawn);
+    dbg64_str(" elapsed_ms="); dbg64_dec((uint64_t)elapsed_ms);
+    dbg64_str(" skipped=");   dbg64_dec((uint64_t)skipped);
     dbg64_nl();
+    if (skipped) dbg64_str("[UI] boot logo skipped key=1 (any key ends the boot animation)\n");
 }
 
 // ★ 本批（资源外置）：**这里原来有 icon_src(kind)** —— 它直接返回内核内嵌的 3 张 128x128 RGBA 位图
@@ -2145,6 +2195,8 @@ static void press_in_client(Window* w, int mx, int my, int button) {
 }
 
 static void handle_mouse_press(int mx, int my, int button) {
+    // ★ 系统音效：按钮/图标点击 -> click（只对左键按下；用已有 hda64 驱动播内置素材，~30ms）
+    if (button == 0) (void)hda64_play_named64("click", "mouse-press");
     // ★ P2（最先）：设备 toast 关闭按钮 → 二级弹窗 → 开始菜单（层级栈：弹窗 > 菜单 > Dock/窗口/桌面）
     if (panels64_handle_mouse_press64(mx, my, button)) return;
     if (startmenu64_is_open64()) {
@@ -3353,7 +3405,7 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
         startmenu64_init64();
         panels64_init64();
     }
-    // ---- 开机 logo：桌面首帧之前先放一段黑底 + 居中 logo 的淡入（~12 帧 ≈ 200ms）----
+    // ---- 开机 logo（P7a-6 目标时长：淡入 300ms + 停留 600ms + 淡出 300ms = 1.2s，任意键跳过）----
     boot_logo_fade_in();
     // ---- ★ 本批（P1c）：锁屏 -> 登录（开机顺序：滚屏 -> 开机动画 -> 锁屏 -> 登录 -> 桌面）----
     // 这个调用**不返回**直到登录成功，所以下面的自检/首帧/[GUI64] ready（桌面出现）一定晚于

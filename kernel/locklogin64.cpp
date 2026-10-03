@@ -22,6 +22,7 @@
 #include "mem_64.h"
 #include "x86_64.h"
 #include "panic64.h"      // 看门狗心跳（锁屏循环里也要踢）
+#include "hda64.h"        // ★ 系统音效：解锁/开机完成 -> startup（用已有驱动播内置素材）
 
 // ==================== 打点（每类上限，防刷屏）====================
 enum { LK_LOG_LOCK = 0, LK_LOG_LOGIN, LK_LOG_ANIM, LK_LOG_ERR, LK_LOG_N };
@@ -1084,6 +1085,8 @@ static void do_login64(const char* how) {
         dbg64_str(" (session identity set; GUI user fixed)\n");
         dbg64_line_end64();
     }
+    // ★ 系统音效：开机/解锁完成 -> startup（后续锁屏解锁也走这里；用已有 hda64 驱动播内置素材）
+    (void)hda64_play_named64("startup", "login-ok");
 }
 
 // 尝试提交登录（按需弹密码框）

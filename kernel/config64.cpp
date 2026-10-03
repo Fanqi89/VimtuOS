@@ -122,6 +122,7 @@ static const Cfg64Def kDefs[] = {
     { "ui.grad.a",         CFG64_T_STR,  0,    "#5AA9F0" }, // 自定义渐变起点（#RRGGBB）
     { "ui.grad.b",         CFG64_T_STR,  0,    "#C9A7FF" }, // 自定义渐变终点（#RRGGBB）
     { "ui.sound.volume",   CFG64_T_INT,  42,   nullptr },   // 音量（无音频驱动：内存态 + 持久化，不写硬件）
+    { "ui.sound.effects",  CFG64_T_BOOL, 1,    nullptr },   // ★ 系统音效（startup/notify/click/error）开关：1=开
     { "ui.sound.src",      CFG64_T_INT,  0,    nullptr },   // 输出源 0=音箱 1=耳机（同上）
     { "ui.def.elf",        CFG64_T_STR,  0,    "term"    }, // 默认应用：.elf  -> 终端
     { "ui.def.vap",        CFG64_T_STR,  0,    "term"    }, //              .vap  -> 终端

@@ -125,6 +125,12 @@ bool        gui64_lang_zh();
 const char* gui64_tr(const char* en, const char* zh);
 void        gui64_set_lang_zh(bool zh);      // 设置页切换中/英
 
+// --- ★ 修复（④）：鼠标灵敏度（mouse.sens，千分比）--- 
+// set：持久化（cfg64_set_mouse_sens64 -> store64）+ 外壳**立即生效**（改缩放基准，不等重启）
+// get：设置页显示当前值（= 启动期从 config64 读回的那个 g_mouse_sens）
+void        gui64_set_mouse_sens64(int permille);
+int         gui64_get_mouse_sens64();
+
 uint32_t    gui64_fps();                     // 外壳实测帧率（性能页/系统监视器用）
 uint8_t     gui64_cpu_busy_pct();            // 外壳忙占比（性能页用）
 // --- 桌面图标预缩放缓存（preload64 在进桌面之前调用；draw 路径自动使用缓存）---
