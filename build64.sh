@@ -642,6 +642,71 @@ PYWM
     echo "    /bin/$app.elf <- build64/$app.elf = $(stat -c%s "$BUILD/$app.elf") B（**不内嵌**，卷交付）"
 done
 
+echo "==> ★ Ring 3 文字栈：/bin/fontdemo（用户态画字；**不内嵌**内核，卷交付）"
+# 交付纪律与 /bin/wm.elf、/wlclient.elf 完全相同：**内核二进制里一个字节都不加** ——
+#   源码 = user/apps/fontdemo.c + user/lib/font64.c（stb_truetype v1.26 单头文件，public domain/MIT）；
+#   产物只落 build64/fontdemo.elf，由 tools/fontdemo_pack_win.py 装进系统卷的 /bin/fontdemo.elf，
+#   字库（四份 TTF 子集）+ 合成器（/lib/wm.elf）也由那一步写进卷。
+# ★ font64.c 必须开 SSE：stb_truetype 是浮点代码，而 x86_64 的 float 返回值走 xmm 寄存器
+#   （-mno-sse 下编译器直接报 "SSE register return with SSE disabled"）。内核给 ring3 开了
+#   CR4.OSFXSR|OSXMMEXCPT、清了 CR0.EM/TS，并按任务 fxsave64/fxrstor64（kernel/task64.cpp:188-234），
+#   user/xmmsse.asm（fpu64_demo64）就是这条能力的回归证据。所以**只对这两份新文件**加 -msse -msse2，
+#   其余用户态运行时保持 -mno-sse 不变（既有字节级行为一个字不动）。
+FONTDEMO_DIR="$BUILD/uapps/fontdemo"
+mkdir -p "$FONTDEMO_DIR"
+FONTDEMO_OBJS=""
+for src in syscall.c string.c stdlib.c stdio.c wl.c; do
+    clang $EVSHM_UCFLAGS -c "user/lib/$src" -o "$FONTDEMO_DIR/lib_${src%.c}.o"
+    FONTDEMO_OBJS="$FONTDEMO_OBJS $FONTDEMO_DIR/lib_${src%.c}.o"
+done
+for src in crt0.S syscall.S; do
+    clang $EVSHM_ASFLAGS -c "user/lib/$src" -o "$FONTDEMO_DIR/lib_${src%.S}_asm.o"
+    FONTDEMO_OBJS="$FONTDEMO_OBJS $FONTDEMO_DIR/lib_${src%.S}_asm.o"
+done
+clang $EVSHM_UCFLAGS -msse -msse2 -c user/lib/font64.c -o "$FONTDEMO_DIR/font64.o"
+clang $EVSHM_UCFLAGS -msse -msse2 -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\" \
+      -c user/apps/fontdemo.c -o "$FONTDEMO_DIR/fontdemo.o"
+$LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/apps/evshm_demo.ld \
+    -o "$BUILD/fontdemo.elf" $FONTDEMO_OBJS "$FONTDEMO_DIR/font64.o" "$FONTDEMO_DIR/fontdemo.o"
+# 自检（判据与 evshm/wlclient/wm 完全相同：静态 ET_EXEC、PT_LOAD 落在 4GiB..4GiB+64KiB、
+# 无 PT_INTERP/PT_DYNAMIC、程序头表在首个 PT_LOAD 内、入口在某个段里、文件 <= 96 KiB）
+"$PY" - "$BUILD/fontdemo.elf" fontdemo <<'PYFONTDEMO'
+import struct, sys
+path, name = sys.argv[1], sys.argv[2]
+d = open(path, "rb").read()
+assert d[:4] == b"\x7fELF" and d[4] == 2 and d[5] == 1, "不是 ELF64 小端"
+etype, machine = struct.unpack_from("<HH", d, 16)
+assert etype == 2 and machine == 0x3E, "必须是 ET_EXEC / x86_64"
+entry = struct.unpack_from("<Q", d, 24)[0]
+phoff = struct.unpack_from("<Q", d, 32)[0]
+phentsize, phnum = struct.unpack_from("<H", d, 54)[0], struct.unpack_from("<H", d, 56)[0]
+assert phentsize == 56 and 0 < phnum <= 16, "程序头表不合法"
+LO, HI = 0x100000000, 0x100000000 + 0x10000
+segs, nload, first_off, first_filesz = [], 0, None, None
+for i in range(phnum):
+    p = phoff + i * phentsize
+    ptype = struct.unpack_from("<I", d, p)[0]
+    poff, pva, _ppa, pfsz, pmsz, _al = struct.unpack_from("<QQQQQQ", d, p + 8)
+    if ptype == 3:
+        raise SystemExit("ERROR: %s 出现 PT_INTERP（内核只做静态装载）" % name)
+    if ptype == 2:
+        raise SystemExit("ERROR: %s 出现 PT_DYNAMIC（静态链接不该有）" % name)
+    if ptype != 1:
+        continue
+    nload += 1
+    if first_off is None:
+        first_off, first_filesz = poff, pfsz
+    assert pmsz >= pfsz and poff + pfsz <= len(d), "%s 段文件范围越界" % name
+    assert pva >= LO and pva + pmsz <= HI, "%s PT_LOAD 越出装载区（va=0x%x memsz=0x%x）" % (name, pva, pmsz)
+    assert (pva + pmsz + 0xFFF) & ~0xFFF <= HI, "%s PT_LOAD 页对齐后压到用户栈区" % name
+    segs.append((pva, pmsz))
+assert nload and any(va <= entry < va + msz for va, msz in segs), "%s 入口不在任何 PT_LOAD 内" % name
+assert first_off == 0 and phoff + phnum * phentsize <= first_filesz, "%s 程序头表不在首个 PT_LOAD 内" % name
+assert len(d) <= 96 * 1024, "%s 文件超过内核读盘缓冲 96 KiB" % name
+print("    %s.elf 自检 OK：entry=0x%x phnum=%d segs=%d size=%d B" % (name, entry, phnum, nload, len(d)))
+PYFONTDEMO
+echo "    /bin/fontdemo.elf = $(stat -c%s "$BUILD/fontdemo.elf") B（**不内嵌**：由 tools/fontdemo_pack_win.py 装进系统卷）"
+
 echo "==> ★ A4-5：信号投递演示程序（user/apps/sig64_demo.c -> build64/sig64.elf -> **卷交付**）"
 # 交付方式与 /evshm.elf 完全同构（复用同一批 user/lib 目标文件 EVSHM_OBJS，只是多编一个 .c）：
 # 静态 ELF64（链接脚本 user/apps/evshm_demo.ld）-> **不内嵌内核**；
@@ -1238,6 +1303,25 @@ else
     exit 1
 fi
 
+
+# ★ 本批（Ring 3 文字栈）：卷链的**最后一步** —— 把 /bin/fontdemo.elf + 四份字库 + /lib/wm.elf
+#   写进同一块系统卷（读上一步 soundvol.img -> 写 fontvol.img），并用这卷重拼 sysdisk.img。
+#   字库来源 = 构建期子集 build/font_*.ttf（与内核用的是同一批，见 tools/fontdemo_pack_win.py 头部
+#   说明：全量 Fonts-open/*.ttf 是 10.6 MB，卷只有 12.67 MB、用户态 mmap 区只有 15.4 MiB）。
+#   ★ 合成器装成 /lib/wm.elf（**不是** /bin/wm.elf）：内核 wl64_wm64("/bin/wm.elf") 是在
+#     gui64_run 之前同步等待的（kernel/kernel64.cpp:1173），那时桌面/终端还没起来；卷里不放
+#     /bin/wm.elf，wm 由 /bin/fontdemo 在桌面期自己 fork+execve（见 user/apps/fontdemo.c 顶部）。
+echo "==> ★ Ring 3 文字栈：/bin/fontdemo + 四份字库 + /lib/wm.elf 装进系统卷"
+FONT_VOL_IN="$BUILD/soundvol.img"
+[ -f "$FONT_VOL_IN" ] || FONT_VOL_IN="$BUILD/busyboxvol.img"
+if [ -f "$FONT_VOL_IN" ] && [ -f "$BUILD/fontdemo.elf" ]; then
+    "$PY" tools/fontdemo_pack_win.py --vol-in "$FONT_VOL_IN" --vol-out "$BUILD/fontvol.img" \
+          --fontdemo "$BUILD/fontdemo.elf" --wm "$BUILD/wm.elf" --fonts-dir "$RES" \
+          --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+else
+    echo "ERROR: 缺少 $FONT_VOL_IN 或 $BUILD/fontdemo.elf —— 文字栈没装进系统卷" >&2
+    exit 1
+fi
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
 "$PY" - "$BUILD/payload_hdr.bin" "$SYS_SECTORS" "$((PAYLOAD_LBA + 1))" <<'PYEOF'
 import struct, sys
@@ -1254,6 +1338,13 @@ dd if=/dev/zero of="$IMG" bs=512 count="$IMAGE_SECTORS" status=none
 dd if="$BUILD/boot.bin"        of="$IMG" conv=notrunc status=none
 dd if="$BUILD/loader64.bin"    of="$IMG" seek=1 conv=notrunc status=none
 dd if="$BUILD/kernel64.bin"    of="$IMG" seek="$KERNEL_LBA" conv=notrunc status=none
+
+# ★ Ring 3 文字栈的同一条纪律：**内核二进制里不能出现 /bin/fontdemo.elf 与四份字库的字节**
+#   （演示程序只从系统卷装载；字库只从系统卷读）。探针 = tools/probe64.py（共享探针选择器）：
+#   中段 64 B 优先；判据见该文件头部注释 ⓪①②③④。
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid "$BUILD/fontdemo.elf"
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid \
+      "$RES/font_bahnschrift.ttf" "$RES/font_simhei.ttf" "$RES/font_mono.ttf" "$RES/font_fallback.ttf"
 dd if="$BUILD/payload_hdr.bin" of="$IMG" seek="$PAYLOAD_LBA" conv=notrunc status=none
 dd if="$BUILD/system.img"      of="$IMG" seek="$((PAYLOAD_LBA + 1))" conv=notrunc status=none
 
