@@ -257,8 +257,11 @@ for src in $SRCS_OS; do
     echo "      $src -> $BUILD/os/$base.o"
 done
 # --- 安装介质内核（跑安装程序）---
+#   kernel/hda64_stub64.cpp = **安装程序内核**的音频 ABI 弱兜底（syscall64.cpp 两份内核共用，
+#   而 hda64.cpp 只在系统内核那一遍编；见该文件头部注释）。weak 定义：以后谁把 hda64.o 也链进
+#   安装程序内核，强定义直接覆盖，这个文件自动变死代码。
 echo "    [安装程序内核]"
-for src in $SRCS_CORE kernel/ata64.cpp kernel/part64.cpp kernel/setup64.cpp kernel/vfs64.cpp; do
+for src in $SRCS_CORE kernel/ata64.cpp kernel/part64.cpp kernel/setup64.cpp kernel/vfs64.cpp kernel/hda64_stub64.cpp; do
     base="$(basename "${src%.cpp}")"
     $CXX -c "$src" -o "$BUILD/$base.o" $CXXFLAGS_INSTALLER
     echo "      $src -> $BUILD/$base.o"
@@ -709,7 +712,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
     "$BUILD"/fat64.o "$BUILD"/fs64.o "$BUILD"/drive64.o \
     "$BUILD"/bootx64_efi.o "$BUILD"/uefi64_bin.o \
     "$BUILD"/hwinfo64.o "$BUILD"/acpi64.o "$BUILD"/edid64.o "$BUILD"/vfs64.o "$BUILD"/fd64.o "$BUILD"/usermode64.o "$BUILD"/syscall64.o "$BUILD"/sig64.o "$BUILD"/pci64.o \
-    "$BUILD"/ahci64.o "$BUILD"/nvme64.o "$BUILD"/hwui64.o \
+    "$BUILD"/ahci64.o "$BUILD"/nvme64.o "$BUILD"/hwui64.o "$BUILD"/hda64_stub64.o \
     "$BUILD"/virtio_gpu64.o \
     "$BUILD"/display64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o \
@@ -850,43 +853,28 @@ echo "                            系统内核 3,436,080 B -> $OSSZ B；余量 $
 
 # ★ 本批的硬证据：18 份演示 blob 在**两份内核二进制**里都搜不到
 #   （搬移是不是"真搬"就看这一条：哪天有人把 blob 塞回内核，这里必红）。
-#   探针取"高熵 64B 窗口"（扫全图挑不同字节值最多的窗口）—— 纯零/同色填充的中段探针
-#   会因为内核里本来就有大片同样字节而假命中（实测 hello.elf 的中段就是一片 0）；
-#   小文件（<= 4 KiB）直接查**整份文件**是否在内核里（最硬的一条）。
+#   ★ 探针选择器 = tools/probe64.py（**共享探针**）：它排除了"两份二进制共享的公共数据表"
+#   造成的**假命中**（实测 build64/gzip 偏移 21856 的 64 B 是标准 CRC-32 表的一段，而内核
+#   链接进来的 build64/os/vfs64.o 里有一模一样的 1037 B —— 旧门禁在这里假红、把构建卡死）。
+#   判据见 tools/probe64.py 头部注释：⓪整份 ①不在内核 ②不在合法链接对象里 ③无候选即泄漏 ④连续 1056 B 块。
 "$PY" - <<'PYDEMO64'
-import importlib.util, os, sys
+import glob, importlib.util, os, sys
 spec = importlib.util.spec_from_file_location("demo_pack_win", "tools/demo_pack_win.py")
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
-kernels = [("kernel64.bin（安装程序内核）", open("build64/kernel64.bin", "rb").read()),
-           ("kernel64_os.bin（系统内核）", open("build64/kernel64_os.bin", "rb").read())]
+spec2 = importlib.util.spec_from_file_location("probe64", "tools/probe64.py")
+p64 = importlib.util.module_from_spec(spec2)
+spec2.loader.exec_module(p64)
 bad = 0
-for path, name, _mode in m.BLOBS:
-    b = open(os.path.join("build64", name), "rb").read()
-    whole = len(b) <= 4096                       # 小文件：整份比对（比探针硬）
-    if whole:
-        probe, off, nv = b, 0, len(set(b))
-    else:
-        best_off, best_n = -1, -1
-        for off in range(0, max(1, len(b) - 64), 32):
-            win = b[off:off + 64]
-            n = len(set(win))
-            if n > best_n:
-                best_n, best_off = n, off
-        probe, off, nv = (b[best_off:best_off + 64], best_off, best_n) if best_off >= 0 else (b"", -1, -1)
-    ok = False
-    for kn, k in kernels:
-        hit = (probe in k) if probe else False
-        if whole:
-            hit = hit or (b in k)
-        if hit:
-            sys.stderr.write("ERROR: %s 里搜得到 %s 的%s（偏移 %d）—— 演示程序没搬干净\n"
-                             % (kn, name, "整份字节" if whole else "64B 高熵探针", off))
-            bad = 1
-    print("    断言 OK：%-22s %s（%s）在两份内核二进制里都搜不到"
-          % (name, "整份 %d B" % len(b) if whole else "64B 高熵探针@%-6d 不同字节值 %d" % (off, nv),
-             path))
-raise SystemExit(bad)
+for label, kp, objs in (("kernel64.bin（安装程序内核）", "build64/kernel64.bin",
+                         sorted(set(glob.glob("build64/*.o")))),
+                        ("kernel64_os.bin（系统内核）", "build64/kernel64_os.bin", None)):
+    print("    内核 %s：" % label)
+    gate = p64.Gate(kp, objs)        # objs=None -> 默认 = build64/os/*.o + build64/*.o + gui_rs/gui_rs.o
+    for _path, name, _mode in m.BLOBS:
+        gate.check(os.path.join("build64", name))
+    bad |= gate.bad
+raise SystemExit(1 if bad else 0)
 PYDEMO64
 
 echo "==> ★ A4-1：带 /bin/shell.bin 的演示盘 + \"内核里没有 shell 字节\"断言"
@@ -945,61 +933,18 @@ bash tools/tar_build_win.sh "$BUILD"
 # ★ 注意执行顺序：drvdemo.elf 要到后面（本文件"Ring 3 驱动服务骨架"那一段）才编出来，
 #   所以装卷这一步**放在那里**（见下面的 drvdemo_pack_win.py 调用），不能放在这里。
 # 同一条体积纪律：**内核二进制里不能出现 make/tar 的字节**（工具只从系统卷装载）。
-# 探针取每个文件中段的 64 字节（代码/数据混排的中段最稳）。
-"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/make.bin" "$BUILD/make" "$BUILD/tar" "$BUILD/shell.bin" <<'PYEOF5B'
-import sys
-k = open(sys.argv[1], "rb").read()
-bad = 0
-for p in sys.argv[2:]:
-    b = open(p, "rb").read()
-    # 高熵探针：小文件（/bin/busybox 13 KB、bbwrap 4.7 KB）的中段是**对齐用的零字节**，
-    # 拿它当探针会假命中（内核里到处都是零）。所以扫全图挑"不同字节值最多"的 64B 窗口。
-    best_off, best_n = -1, -1
-    for off in range(0, max(1, len(b) - 64), 32):
-        n = len(set(b[off:off + 64]))
-        if n > best_n:
-            best_n, best_off = n, off
-    probe = b[best_off:best_off + 64]
-    if len(probe) == 64 and best_n >= 8 and probe in k:
-        sys.stderr.write("ERROR: system kernel contains %s bytes (delivery must be a volume file)\n" % p)
-        bad = 1
-    else:
-        print("    断言 OK：系统内核 %d B 里搜不到 %s 的 64B 高熵探针（偏移 %d，不同字节值 %d）；"
-              "它只从系统卷装载" % (len(k), p.rsplit("/", 1)[-1], best_off, best_n))
-raise SystemExit(bad)
-PYEOF5B
-# 断言（两条，都是"资源真的搬走了"的硬证据）：
-#   ① **整份文件**的字节在内核里搜不到（最硬的一条：objcopy 一塞回去就必红）；
-#   ② 再取一个**高熵探针**（扫全图挑"不同字节值最多"的 64B 窗口；纯色/透明区域的中段探针会因为
-#      内核里本来就有大片同色数据而假命中 —— 实测 logo_rgba.bin 的中段就是一片透明），要求也不在内核里。
-"$PY" - "$BUILD/kernel64_os.bin" build/logo_rgba.bin build/icon_mycomputer.bin \
-      build/icon_recyclebin.bin build/icon_terminal.bin <<'PYASSET'
-import sys
-k = open(sys.argv[1], "rb").read()
-bad = []
-for p in sys.argv[2:]:
-    b = open(p, "rb").read()
-    name = p.rsplit("/", 1)[-1]
-    if len(b) >= 64 and b in k:                       # ① 整份文件
-        bad.append(p)
-        sys.stderr.write("ERROR: 系统内核里含整份 %s（%d B）—— 资源没搬干净\n" % (name, len(b)))
-        continue
-    best_off, best_n = -1, -1                         # ② 高熵探针（32B 步长扫一遍）
-    for off in range(0, max(1, len(b) - 64), 32):
-        win = b[off:off + 64]
-        n = len(set(win))
-        if n > best_n:
-            best_n, best_off = n, off
-    probe = b[best_off:best_off + 64] if best_off >= 0 else b""
-    if len(probe) == 64 and best_n >= 8 and probe in k:
-        bad.append(p)
-        sys.stderr.write("ERROR: 系统内核里含 %s 的 64B 高熵探针（偏移 %d，不同字节值 %d）\n"
-                         % (name, best_off, best_n))
-    else:
-        print("    断言 OK：系统内核 %d B 里既没有 %s 整份字节，也没有它的 64B 高熵探针"
-              "（偏移 %d，不同字节值 %d）" % (len(k), name, best_off, best_n))
-raise SystemExit(1 if bad else 0)
-PYASSET
+# 探针 = tools/probe64.py（共享探针选择器；见该文件头部注释的 ⓪①②③④ 判据）。
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" \
+      "$BUILD/make.bin" "$BUILD/make" "$BUILD/tar" "$BUILD/shell.bin"
+# 断言（三条，都是"资源真的搬走了"的硬证据，判据见 tools/probe64.py 头部注释）：
+#   ⓪ **整份文件**的字节在内核里搜不到（最硬的一条：objcopy 一塞回去就必红）；
+#   ① 探针窗口不在内核里；④ 任一 1056 B 连续块也不在内核里（纯色/透明区域的块不算：
+#      判据要求块内不同字节值 >= 8 —— 实测 logo_rgba.bin 的中段就是一片透明）。
+#   ★ 为什么不再自己挑"最高熵 64B 窗口"：那个窗口可能是**两份二进制共享的公共数据表**
+#     （CRC-32 表等，实测 gzip@21856 就是），共享探针选择器会跳过落在合法链接对象里的窗口。
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" \
+      build/logo_rgba.bin build/icon_mycomputer.bin \
+      build/icon_recyclebin.bin build/icon_terminal.bin
 # 同样的纪律单独钉一遍 icon_start.bin（它的"内置兜底"只剩 24x24 mip = 2,304 B，
 #   64x64 原图必须只在卷里；否则这条搬移就是假的）。
 "$PY" - "$BUILD/kernel64_os.bin" build/icon_start.bin build/icon_start_mini.bin <<'PYASSET2'
@@ -1028,85 +973,26 @@ if not bad:
 raise SystemExit(bad)
 PYASSET2
 # 断言：内核二进制里**不能**出现 shell.bin 的字节（交付方式必须是"系统卷里的文件"）。
-# 探针取 shell 中段的 64 字节（ELF 头/入口附近的字节模式到处都是，中段最稳）。
-"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/shell.bin" <<'PYEOF'
-import sys
-k = open(sys.argv[1], "rb").read()
-s = open(sys.argv[2], "rb").read()
-mid = len(s) // 2
-probe = s[mid:mid + 64]
-if len(probe) < 64 or probe in k:
-    sys.stderr.write("ERROR: system kernel contains shell.bin bytes (delivery must be a volume file)\n")
-    raise SystemExit(1)
-print("    断言 OK：系统内核 %d B 里搜不到 shell.bin 的 64B 探针（偏移 %d）；shell 只从系统卷装载" % (len(k), mid))
-PYEOF
+# 探针 = tools/probe64.py（共享探针选择器；中段 64 B 优先，见该文件头部注释）。
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid "$BUILD/shell.bin"
 
 # ★ A4-2b 的同一条纪律：**内核二进制里不能出现 tcc 的字节**（tcc 只从系统卷 /lib/tcc.bin 装载）。
-# 探针取 tcc.bin 中段的 64 字节（ELF 头/入口附近的模式到处都是，中段最稳）。
-"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/tcc.bin" <<'PYEOF2'
-import sys
-k = open(sys.argv[1], "rb").read()
-t = open(sys.argv[2], "rb").read()
-mid = len(t) // 2
-probe = t[mid:mid + 64]
-if len(probe) < 64 or probe in k:
-    sys.stderr.write("ERROR: system kernel contains tcc.bin bytes (delivery must be a volume file)\n")
-    raise SystemExit(1)
-print("    断言 OK：系统内核 %d B 里搜不到 tcc.bin 的 64B 探针（偏移 %d）；tcc 只从系统卷装载" % (len(k), mid))
-PYEOF2
+# 探针 = tools/probe64.py（共享探针选择器；中段 64 B 优先）。
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid "$BUILD/tcc.bin"
 
 # ★ A4-4 的同一条纪律：**内核二进制里不能出现 Lua 与 gzip 的字节**（两者都只从系统卷装载；
-# 内核区只剩 ~187 KB，交付一律"卷里的文件"）。探针同样取中段 64 字节。
-"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/lua.bin" "$BUILD/gzip" <<'PYEOF3'
-import sys
-k = open(sys.argv[1], "rb").read()
-bad = 0
-for p in sys.argv[2:]:
-    b = open(p, "rb").read()
-    # 高熵探针：小文件（/bin/busybox 13 KB、bbwrap 4.7 KB）的中段是**对齐用的零字节**，
-    # 拿它当探针会假命中（内核里到处都是零）。所以扫全图挑"不同字节值最多"的 64B 窗口。
-    best_off, best_n = -1, -1
-    for off in range(0, max(1, len(b) - 64), 32):
-        n = len(set(b[off:off + 64]))
-        if n > best_n:
-            best_n, best_off = n, off
-    probe = b[best_off:best_off + 64]
-    if len(probe) == 64 and best_n >= 8 and probe in k:
-        sys.stderr.write("ERROR: system kernel contains %s bytes (delivery must be a volume file)\n" % p)
-        bad = 1
-    else:
-        print("    断言 OK：系统内核 %d B 里搜不到 %s 的 64B 高熵探针（偏移 %d，不同字节值 %d）；"
-              "它只从系统卷装载" % (len(k), p.rsplit("/", 1)[-1], best_off, best_n))
-raise SystemExit(bad)
-PYEOF3
+#   内核区只剩 ~187 KB，交付一律"卷里的文件"）。探针 = tools/probe64.py（共享探针选择器）：
+#   它会跳过"两份二进制共享的公共数据表"造成的假命中 —— 实测 gzip@21856 的 64 B 是标准 CRC-32 表
+#   的一段，而内核链接进来的 build64/os/vfs64.o 里有一模一样的 1037 B（旧门禁就在这里假红）。
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" "$BUILD/lua.bin" "$BUILD/gzip"
 
 # ★ A4-5 的同一条纪律：**内核二进制里不能出现编辑器 /bin/edit 的字节**（它只从系统卷装载）。
-# 探针取 build64/edit 中段的 64 字节（ELF 头/入口附近到处都是，中段最稳）。
-"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/edit" <<'PYEOF4'
-import sys
-k = open(sys.argv[1], "rb").read()
-e = open(sys.argv[2], "rb").read()
-mid = len(e) // 2
-probe = e[mid:mid + 64]
-if len(probe) < 64 or probe in k:
-    sys.stderr.write("ERROR: system kernel contains /bin/edit bytes (delivery must be a volume file)\n")
-    raise SystemExit(1)
-print("    断言 OK：系统内核 %d B 里搜不到 /bin/edit 的 64B 探针（偏移 %d）；编辑器只从系统卷装载" % (len(k), mid))
-PYEOF4
+#   探针 = tools/probe64.py（共享探针选择器；中段 64 B 优先）。
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid "$BUILD/edit"
 
 # ★ A5 的同一条纪律：**内核二进制里不能出现 /wlclient.elf 的字节**（它只从系统卷装载）。
-#   探针取 build64/wlclient.elf 中段的 64 字节（ELF 头/入口附近的字节模式到处都是，中段最稳）。
-"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/wlclient.elf" <<'PYEOF5'
-import sys
-k = open(sys.argv[1], "rb").read()
-w = open(sys.argv[2], "rb").read()
-mid = len(w) // 2
-probe = w[mid:mid + 64]
-if len(probe) < 64 or probe in k:
-    sys.stderr.write("ERROR: system kernel contains /wlclient.elf bytes (delivery must be a volume file)\n")
-    raise SystemExit(1)
-print("    断言 OK：系统内核 %d B 里搜不到 /wlclient.elf 的 64B 探针（偏移 %d）；客户端只从系统卷装载" % (len(k), mid))
-PYEOF5
+#   探针 = tools/probe64.py（共享探针选择器；中段 64 B 优先 → 不满足判据时退到通用候选）。
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid "$BUILD/wlclient.elf"
 
 echo "==> ★ A4-2a：ring3 系统调用探针（chdir/rename/rmdir/dup2/utime + execve 失败路径的真证据）"
 # 为什么源码由构建脚本生成：本批只允许改 kernel/*、build64.sh、tests/a42a64_test.py、docs —— user/
@@ -1272,19 +1158,8 @@ if [ "$DRVDEMO_SZ" -gt 65536 ]; then
     exit 1
 fi
 # 断言：内核二进制里**不能**出现 drvdemo 的字节（交付方式必须是"系统卷里的文件"）。
-# 探针取中段的 64 字节（ELF 头/入口附近的字节模式到处都是，中段最稳）。
-"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/drvdemo.elf" <<'PYEOFDRV'
-import sys
-k = open(sys.argv[1], "rb").read()
-d = open(sys.argv[2], "rb").read()
-mid = len(d) // 2
-probe = d[mid:mid + 64]
-if len(probe) < 64 or probe in k:
-    sys.stderr.write("ERROR: system kernel contains drvdemo.elf bytes (delivery must be a volume file)\n")
-    raise SystemExit(1)
-print("    断言 OK：系统内核 %d B 里搜不到 drvdemo.elf 的 64B 探针（偏移 %d）；它只从系统卷装载"
-      % (len(k), mid))
-PYEOFDRV
+# 探针 = tools/probe64.py（共享探针选择器；中段 64 B 优先）。
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid "$BUILD/drvdemo.elf"
 echo "    /bin/drvdemo = $DRVDEMO_SZ B（静态 ELF64；由 tools/drvdemo_pack_win.py 装进系统卷）"
 if [ -f "$BUILD/drvdemo.elf" ] && [ -f "$BUILD/tarvol.img" ]; then
     "$PY" tools/drvdemo_pack_win.py --vol-in "$BUILD/tarvol.img" --vol-out "$BUILD/drvsvcvol.img" \
@@ -1309,7 +1184,7 @@ fi
 
 # ★ 本批：**busybox（静态 musl）+ 装载驱动 + applet 包装程序 + 用户态目录索引** -> 系统卷。
 #   与前面几批同一条体积纪律：交付 = 系统卷里的文件，**内核镜像里一个字节都不加**；
-#   下面用三份交付物各自中段的 64B 探针在内核里搜一遍（搜到就构建失败）。
+#   下面用共享探针选择器（tools/probe64.py）把三份交付物在内核里各搜一遍（搜到就构建失败）。
 #   卷链顺序：读上一步的 demovol.img（没有就退到 drvsvcvol.img / tarvol.img）-> busyboxvol.img，
 #   并用这卷重拼 sysdisk.img。
 echo "==> ★ 本批：busybox（Ring 3 日常工具集）构建 + 装进系统卷 + 重拼 sysdisk.img"
@@ -1320,28 +1195,9 @@ BB_VOL_IN="$BUILD/demovol.img"
 "$PY" tools/busybox_pack_win.py --vol-in "$BB_VOL_IN" --vol-out "$BUILD/busyboxvol.img" \
       --busybox-bin "$BUILD/busybox.bin" --busybox-drv "$BUILD/busybox" --bbwrap "$BUILD/bbwrap" \
       --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
-"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/busybox.bin" "$BUILD/busybox" "$BUILD/bbwrap" <<'PYEOFBB'
-import sys
-k = open(sys.argv[1], "rb").read()
-bad = 0
-for p in sys.argv[2:]:
-    b = open(p, "rb").read()
-    # 高熵探针：小文件（/bin/busybox 13 KB、bbwrap 4.7 KB）的中段是**对齐用的零字节**，
-    # 拿它当探针会假命中（内核里到处都是零）。所以扫全图挑"不同字节值最多"的 64B 窗口。
-    best_off, best_n = -1, -1
-    for off in range(0, max(1, len(b) - 64), 32):
-        n = len(set(b[off:off + 64]))
-        if n > best_n:
-            best_n, best_off = n, off
-    probe = b[best_off:best_off + 64]
-    if len(probe) == 64 and best_n >= 8 and probe in k:
-        sys.stderr.write("ERROR: system kernel contains %s bytes (delivery must be a volume file)\n" % p)
-        bad = 1
-    else:
-        print("    断言 OK：系统内核 %d B 里搜不到 %s 的 64B 高熵探针（偏移 %d，不同字节值 %d）；"
-              "它只从系统卷装载" % (len(k), p.rsplit("/", 1)[-1], best_off, best_n))
-raise SystemExit(bad)
-PYEOFBB
+# 与前面几批同一条体积纪律（判据见 tools/probe64.py 头部注释）：三份交付物都必须"内核里搜不到"。
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" \
+      "$BUILD/busybox.bin" "$BUILD/busybox" "$BUILD/bbwrap"
 
 # ★ 本批（系统音效）：4 段**自合成** wav 素材 + 用户态播放器 /bin/sounder —— 不内嵌内核，卷交付。
 #   1) tools/sounds_gen.py 合成 48k/16/2 的 4 段素材（纯标准库、无随机数/无时间戳 = 逐字节可复现；
@@ -1414,16 +1270,6 @@ echo "启动安装介质: qemu-system-x86_64 -drive format=raw,file=$IMG -drive 
 echo "端到端安装测试: python tests/install_flow_test.py"
 
 # ★ B-wm 的同一条纪律：**内核二进制里不能出现 /bin/wm.elf 的字节**（它只从系统卷装载）。
-#   探针取 build64/wm.elf 中段的 64 字节（与 /wlclient.elf 的判据完全相同）。
-"$PY" - "$BUILD/kernel64_os.bin" "$BUILD/wm.elf" <<'PYEOF6'
-import sys
-k = open(sys.argv[1], "rb").read()
-w = open(sys.argv[2], "rb").read()
-mid = len(w) // 2
-probe = w[mid:mid + 64]
-if len(probe) < 64 or probe in k:
-    sys.stderr.write("ERROR: system kernel contains /bin/wm.elf bytes (delivery must be a volume file)\n")
-    raise SystemExit(1)
-print("    断言 OK：系统内核 %d B 里搜不到 /bin/wm.elf 的 64B 探针（偏移 %d）；合成器只从系统卷装载" % (len(k), mid))
-PYEOF6
+#   探针 = tools/probe64.py（共享探针选择器；中段 64 B 优先，与 /wlclient.elf 的判据完全相同）。
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid "$BUILD/wm.elf"
 
