@@ -50,17 +50,26 @@ static size_t m_str(char* d, const char* s) {
     while (s[n]) { d[n] = s[n]; n++; }
     return n;
 }
-static size_t m_dec(char* d, uint64_t v) {
+// width = 0 -> 自然宽度；width > 0 -> 零填充到定宽。
+// ★ 为什么要定宽（本批修复）：这个程序的输出会被内核重定向进文件、再由验收脚本按**字节数**核对
+//   （tests/a42a64_test.py 的 `cat /tmp/o.txt`、tests/musl64_test.py 的逐字节比对）。变宽字段
+//   （malloc 指针的十六进制、clock_gettime 的 sec/nsec 十进制）会让总字节数每次运行都抖
+//   （实测首跑 264 / 复跑 265），"总字节数"这类断言于是变成随机假红。定宽 = 同一份源码构建出的
+//   输出**逐字节确定**，总字节数只由源码里的模板决定。
+//   定宽取值都是**域宽**（不是魔法数）：指针 9 位（用户窗口恒在 0x100000000..0x1FFFFFFFF，
+//   即恒 9 位十六进制）、sec 4 位（≤9999s 足够任何一次启动/演示）、nsec 9 位（纳秒域满宽）。
+static size_t m_dec(char* d, uint64_t v, int width) {
     char t[24];
     int n = 0;
     if (v == 0) t[n++] = '0';
     while (v) { t[n++] = (char)('0' + (int)(v % 10u)); v /= 10u; }
+    while (n < width) t[n++] = '0';
     int k = 0;
     while (n > 0) d[k++] = t[--n];
     return (size_t)k;
 }
-static size_t m_hex(char* d, uint64_t v) {
-    char t[16];
+static size_t m_hex(char* d, uint64_t v, int width) {
+    char t[24];
     int n = 0;
     if (v == 0) t[n++] = '0';
     while (v) {
@@ -68,6 +77,7 @@ static size_t m_hex(char* d, uint64_t v) {
         t[n++] = (char)(r < 10u ? ('0' + (int)r) : ('a' + (int)(r - 10u)));
         v >>= 4;
     }
+    while (n < width) t[n++] = '0';
     int k = 0;
     while (n > 0) d[k++] = t[--n];
     return (size_t)k;
@@ -115,7 +125,7 @@ static int musl_app_main(int argc, char** argv, char** envp) {
     // ② argc / argv[0]：证明内核初始栈的 argc/argv 被 musl 读对了
     p = buf;
     p += m_str(p, "[MUSL] argc=");
-    p += m_dec(p, (uint64_t)(argc < 0 ? 0 : argc));
+    p += m_dec(p, (uint64_t)(argc < 0 ? 0 : argc), 0);        // 0 = 自然宽度（argc 恒 1 位，无需定宽）
     p += m_str(p, " argv0=");
     p += m_str(p, (argc > 0 && argv && argv[0]) ? argv[0] : "(null)");
     p += m_str(p, "\n");
@@ -136,9 +146,9 @@ static int musl_app_main(int argc, char** argv, char** envp) {
         if (ok) {
             p = buf;
             p += m_str(p, "[MUSL] malloc ok bytes=64+4096 a=0x");
-            p += m_hex(p, (uint64_t)(uintptr_t)a);
+            p += m_hex(p, (uint64_t)(uintptr_t)a, 9);         // 定宽 9 位（用户窗口恒 9 位十六进制）
             p += m_str(p, " b=0x");
-            p += m_hex(p, (uint64_t)(uintptr_t)b);
+            p += m_hex(p, (uint64_t)(uintptr_t)b, 9);
             p += m_str(p, "\n");
             m_out(buf, (size_t)(p - buf));
         } else {
@@ -156,9 +166,9 @@ static int musl_app_main(int argc, char** argv, char** envp) {
         if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
             p = buf;
             p += m_str(p, "[MUSL] clock_gettime ok sec=");
-            p += m_dec(p, (uint64_t)ts.tv_sec);
+            p += m_dec(p, (uint64_t)ts.tv_sec, 4);     // 定宽 4 位（启动/演示用，≤9999s）
             p += m_str(p, " nsec=");
-            p += m_dec(p, (uint64_t)ts.tv_nsec);
+            p += m_dec(p, (uint64_t)ts.tv_nsec, 9);    // 定宽 9 位（纳秒域满宽）
             p += m_str(p, "\n");
             m_out(buf, (size_t)(p - buf));
         } else {
@@ -200,7 +210,7 @@ static int musl_app_main(int argc, char** argv, char** envp) {
             p = buf;
             p += m_str(p, "[MUSL] errno FAILED fd=");
             if (fd >= 0) close(fd);
-            p += m_dec(p, (uint64_t)(fd < 0 ? (int64_t)errno : (int64_t)fd));
+            p += m_dec(p, (uint64_t)(fd < 0 ? (int64_t)errno : (int64_t)fd), 0);   // 0 = 自然宽度
             p += m_str(p, "\n");
             m_out(buf, (size_t)(p - buf));
         }

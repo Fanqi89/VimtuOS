@@ -394,10 +394,31 @@ def main():
     check("子程序在文件里写（子程序自己的输出没漏到控制台：这一段串口里没有 [MUSL] 行）",
           "[MUSL] hello from musl static ELF" not in run_log,
           "run 段长度=%d" % len(run_log))
+    # ---- ★ 与"打印位宽"无关的判据（缺陷：这里曾硬编码 total == 265）----
+    # 根因：user/apps/muslhello.c 里 malloc 指针（十六进制）与 clock_gettime 的 sec/nsec 是
+    #   **变宽**打印 —— 每次运行的指针值/秒/纳秒位数不同，/tmp/o.txt 的总字节数就会在 264/265
+    #   之间抖（硬编码单值 = 随机假红）。本批两头都修：
+    #   (a) 程序侧：muslhello 的关键字段改成**定宽**（指针 9 位十六进制 / sec 4 位 / nsec 9 位）；
+    #   (b) 测试侧：判据与位宽**解耦**（不用魔法数字）。
+    # 新判据（三条，互不替代；比"一个魔法数字"更强，不是放水）：
+    #   ① 每次运行内部自洽：(a) 终端 cat 报的 bytes == total 且 truncated=0（一次读完整文件）；
+    #      (b) "6 行文本各自的实际位宽 + 6 个换行"之和 == total —— 把字节数**绑在内容上**，
+    #        所以位宽怎么变都不会假过/假红（这一条在下面 shell 侧 cat 之后核，见 ⑤-模板/字节和）；
+    #   ② 逐行模板：6 行 [MUSL] 输出**逐行 fullmatch 正则模板**（固定字面量逐字节对上 +
+    #      变宽字段各归其位 + 行序钉死）—— 同样在 shell 侧 cat 之后核（终端 cat 的输出只画在
+    #      终端窗口里、**不落串口**，串口上能取到的文件内容只有 shell 的 cat）；
+    #   ③ 总量落在紧窗口 [250, 280]（一行至少 25 B，窗口远小于一行，仍能抓"整行少写/多写"）。
     type_line(mon, "cat /tmp/o.txt", per_key=0.12)
-    m = wait_re(r"\[TERM\] cmd cat path=/tmp/o\.txt bytes=(\d+) total=(\d+)", 40)
-    check("★ ⑤ 子进程的输出**真落进文件**（终端 cat /tmp/o.txt 报 total=265：musl 程序 6 行）",
-          m is not None and int(m.group(2)) == 265, (m.group(0) if m else "（缺 [TERM] cmd cat 行）"))
+    m = wait_re(r"\[TERM\] cmd cat path=/tmp/o\.txt bytes=(\d+) total=(\d+) truncated=(\d+)", 40)
+    nbytes = int(m.group(1)) if m else -1
+    ntotal = int(m.group(2)) if m else -1
+    ntrunc = int(m.group(3)) if m else -1
+    check("★ ⑤ 子进程的输出**真落进文件**（终端 cat /tmp/o.txt：bytes == total 且 truncated=0，"
+          "= 一次读完整文件；bytes=%d total=%d truncated=%d）" % (nbytes, ntotal, ntrunc),
+          m is not None and nbytes == ntotal and ntrunc == 0,
+          (m.group(0) if m else "（缺 [TERM] cmd cat 行）"))
+    check("★ ⑤ 输出总字节数落在紧窗口 [250, 280]（与打印位宽无关，不是硬编码单值）：total=%d"
+          % ntotal, m is not None and 250 <= ntotal <= 280, "total=%d" % ntotal)
 
     # ---------------- ④+⑤ ring3 探针：新系统调用 + dup2/execve 失败路径 ----------------
     # 探针在**终端**里用 elfrun 跑（真进程 + proc64 路径）；shell 只是普通的 ring3 程序，
@@ -508,7 +529,28 @@ def main():
         time.sleep(0.4)
     check("★ 端到端：`run /musl_hello.elf > /tmp/o.txt` 的字节被 shell 的 cat 读回（子程序 6 行都在）",
           not missing, "缺 %r；窗口 %d B" % (missing, len(cat_win)))
-    check("文件内容 = 子程序自身输出（终端 cat 已按字节数核对 total=265；这里 shell 侧逐行复核）",
+    # ★ 与"打印位宽"无关的两条硬判据都落在这一处（串口上能取到的**文件内容**只有 shell 这次 cat）：
+    #   ① 6 行逐行 fullmatch 正则模板（固定字面量逐字节 + 变宽字段各归其位 + 行序钉死）；
+    #   ② "6 行文本各自的实际位宽 + 6 个换行"之和 == 终端 cat 报的 total（把字节数绑在内容上）。
+    MUSL_LINE_TPL = [
+        r"\[MUSL\] hello from musl static ELF",
+        r"\[MUSL\] argc=1 argv0=/musl_hello\.elf",
+        r"\[MUSL\] malloc ok bytes=64\+4096 a=0x[0-9a-f]+ b=0x[0-9a-f]+",
+        r"\[MUSL\] clock_gettime ok sec=\d+ nsec=\d+",
+        r"\[MUSL\] getrandom ok len=16 hex=[0-9a-f]{32}",
+        r"\[MUSL\] errno ok ENOENT=2",
+    ]
+    musl_lines = re.findall(r"\[MUSL\][^\r\n]*", cat_win)   # [^\r\n]：\r\n 与 \n 两种行尾都算 1 个换行
+    tpl_ok = (len(musl_lines) == 6 and
+              all(re.fullmatch(t, s) for t, s in zip(MUSL_LINE_TPL, musl_lines)))
+    check("★ ⑤ 6 行输出**逐行对上正则模板**（行序 + 固定字面量逐字节 + 变宽字段各归其位；"
+          "抓到 %d 行）" % len(musl_lines), tpl_ok, "%r" % (musl_lines[:6],))
+    line_sum = sum(len(s) + 1 for s in musl_lines)          # +1 = 每行结尾的 '\n'
+    check("★ ⑤ 字节数**每次运行自洽**：6 行文本位宽之和 %d == 终端 cat 报的 total=%d"
+          "（与位宽无关，所以变宽也不会假过/假红）" % (line_sum, ntotal),
+          len(musl_lines) == 6 and line_sum == ntotal,
+          "行数=%d 之和=%d total=%d" % (len(musl_lines), line_sum, ntotal))
+    check("文件内容 = 子程序自身输出（shell 侧逐行复核 [MUSL] 行数 ≥ 6）",
           len(re.findall(r"\[MUSL\] ", cat_win)) >= 6)
 
     # ⑥b ring3 shell 自己的 `run ... > file`（任务书点名的那条缺口；user/ 由另一条线改）
