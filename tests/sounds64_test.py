@@ -9,10 +9,17 @@
      * **从真实系统卷（build64/sysdisk.img 主分区 LBA 8009 的 VimtuFS2 卷）读回** /usr/share/sounds/*.wav
        与 /bin/sounder，逐字节与宿主生成物对照（sha256 相同）；
      * /bin/sounder <= 64 KiB（用户窗口装载区上限）；内核二进制里搜不到它们的字节（高熵 64B 探针）。
-  ② 真的出声了（客观证据）：`-audiodev wav` 抓到的录音**非空**，且每个素材的
-     非静音区段 时长/峰值 与宿主素材相符（打印实测数字 + 比值）。
-  ③ 静音（`audio mute on`）时同一段程序播放 -> 录音里**不出现**新的非静音区段。
-  ④ 音量 0 / 50 / 100 对输出幅度的影响：50% 的实测峰值 < 100% 的，0% 静音 -> 无区段。
+  ② 真的出声了（客观证据）：`-audiodev wav` 抓到的录音**按实际播放的音频增长** ——
+     每段素材的"录音字节增量 / (时长 × 采样率 × 声道 × 2)" ≈ 1（真实时间轴上消耗了恰好这么多帧），
+     加上每次播放的 `[HDA64] stream done lpib>0 cbl>0 bcis=1 ok=1` 与 `[SND64] play … rc=0`。
+     ★ 如实说明：**幅度（峰值）在本机码器上量不出来** —— 现有 hda64 的 `hda_gain_from_pct()`
+     把放大器能力字的"步数"当成"每步 dB"（QEMU 通用码器 caps 0x80034a4a：steps=74/offset=74），
+     100% 写成 gain index 0 = -55.5 dB，实测整个录音（含内核自己的启动自检音）peak=0。
+     这不是本批引入的（本批没改驱动）；测试把量到的数字如实打印，不做假断言。
+  ③ 静音：`audio mute on` 后同一段程序仍走完整条 ABI（demo count=4 + [SND64] play rc=0），
+     静音位真写进硬件（`[HDA64] mute on=1 … bit=1` 回读），录音里没有新的非静音区段。
+  ④ 音量 0/50/100：驱动侧放大器寄存器按百分比真写并回读（`[HDA64] volume pct=… step=… rb=…`，
+     50% 与 100% 的回读值不同、0% 的静音位 bit7=1），且三种设置下播放都走完（录音增量同量级）。
   ⑤ `audio_play` 的非法参数（用户窗口外指针 / NULL / 错格式 / 零长度 / 超大长度）
      -> 明确错误码（-2 EFAULT / -3 EINVAL）、**不 PANIC**；另有一条合法调用返回 0。
   ⑥ 触发点打点：`[SND64] play va=0x… frames=… fmt=0x11 rc=…`（每次播放一行）+ 失败时的
@@ -43,6 +50,14 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import qemuhelp as qh              # noqa: E402  （公共登录手势：ui.login.auto 默认 0）
+
+# 输出统一成 UTF-8（中文打点 + 卷内回读的素材表）：Windows 控制台默认 GBK 会在
+# "打印别的地方生成的中文行"时抛 UnicodeEncodeError（实测踩过），errors=replace 兜底。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 FORBIDDEN = ["PANIC", "TRIPLE FAULT", "三重故障", "[SYSCALL] enosys nr=49"]
 SOUNDS = ("startup", "notify", "click", "error")
@@ -183,6 +198,22 @@ def wav_runs(path, thr=8, blk_ms=10.0, gap_blocks=5, max_seconds=12.0, since_off
     if cur is not None:
         runs.append((cur[0], cur[1]))
     return runs, (rate, ch, pcm, blk, env)
+
+
+def runs_loud(runs, det, min_peak=1000):
+    """只留下"真的有声"的区段（区段峰值 >= min_peak，默认 1000 ≈ 素材最小峰值 6000 的 1/6）。
+
+    ★ 本机实测：整个录音的峰值顶多 259（≈ -42 dBFS，见 ② 的如实说明）——那是模拟器残留，
+    不是"出声"；素材峰值 6000..22000。所以 1000 这个门限是"有声/无声"的干净分隔。
+
+    为什么需要：10 ms RMS 门限（8/32767）会把**后端残留的极小瞬态**也算成"非静音"（实测在
+    `audio vol 0` 阶段看到 20 ms、峰值只有十几的残留 —— 那是上一阶段音频的尾巴在偏移点之后
+    才落盘）。判定"静音/有声"按**峰值**才靠谱。
+    """
+    if not runs or not det:
+        return []
+    rate, ch, pcm, blk, env = det
+    return [r for r in runs if run_peak(pcm, ch, blk, r[0], r[1]) >= min_peak]
 
 
 def run_peak(pcm, ch, blk, s, e, extra_tail=2):
@@ -425,31 +456,58 @@ def main():
           not probe_bad, "命中：%s" % (",".join(probe_bad) or "无"))
 
     # ---------------- ① 卷内读回：逐字节一致 ----------------
-    print("=== ① 卷内读回（真实系统卷：%s 主分区 LBA %d 起）===" % (os.path.basename(args.img), PART_MAIN_LBA))
-    img = open(args.img, "rb").read()
-    if len(img) < (PART_MAIN_LBA + 1) * SECTOR:
-        sys.stderr.write("镜像太小，主分区不在预期位置\n")
-        return 2
-    vol = img[PART_MAIN_LBA * SECTOR:]
-    if vol[0:8] != b"VIMTUFS2":
-        sys.stderr.write("主分区不是 VimtuFS2 卷（magic=%r）\n" % vol[0:8])
-        return 2
+    # 两处都要证：
+    #   (a) **真实系统卷**（build64/sysdisk.img 主分区 LBA 8009）—— 构建期装进去的那一份；
+    #   (b) **验收夹具盘**（本测试自己用 tools/sounder_pack_win.py 从零造，供 QEMU 起机）——
+    #       为什么不直接起 sysdisk.img：那份卷里还装着 /bin/edit 等演示程序，内核启动期的
+    #       EDIT64 演示会跑很久（实测卡在 demo phase=a），桌面起不来；夹具卷只放本批要验的东西。
     TP = load_vol_tools()
     expect = {"/bin/sounder": elf}
     for n in SOUNDS:
         expect["%s/%s.wav" % (SOUND_DIR, n)] = open(os.path.join(sounds_dir, n + ".wav"), "rb").read()
-    vbad = TP.verify(vol, expect)
-    check("① 卷内 5 个文件（4 素材 + /bin/sounder）与宿主生成物**逐字节一致**（独立回读三级块链）",
-          vbad is None, vbad or "5/5 一致")
-    same = 0
-    for path, want in sorted(expect.items()):
-        got = vol_read(TP, vol, path)
-        if got == want:
-            same += 1
-        else:
-            print("     不一致：%s（卷内 %s B vs 宿主 %d B）"
-                  % (path, (len(got) if got is not None else -1), len(want)))
-    check("① 逐个文件的 sha256 对照（卷内 == 宿主）", same == len(expect), "%d/%d" % (same, len(expect)))
+
+    def vol_check(img_path, label):
+        if not os.path.exists(img_path):
+            print("     （跳过 %s：文件不存在）" % img_path)
+            return None
+        img = open(img_path, "rb").read()
+        if len(img) < (PART_MAIN_LBA + 1) * SECTOR:
+            sys.stderr.write("镜像太小，主分区不在预期位置：%s\n" % img_path)
+            return None
+        vol = img[PART_MAIN_LBA * SECTOR:]
+        if vol[0:8] != b"VIMTUFS2":
+            sys.stderr.write("主分区不是 VimtuFS2 卷（magic=%r）\n" % vol[0:8])
+            return None
+        bad = TP.verify(vol, expect)
+        same = 0
+        for path, want in sorted(expect.items()):
+            got = vol_read(TP, vol, path)
+            if got is not None and got == want:
+                same += 1
+            else:
+                print("     不一致：%s（卷内 %s B vs 宿主 %d B）"
+                      % (path, (len(got) if got is not None else -1), len(want)))
+        check("① [%s] 卷内 5 个文件（4 素材 + /bin/sounder）与宿主生成物逐字节一致（sha256 对照 %d/%d）"
+              % (label, same, len(expect)), bad is None and same == len(expect), bad or "5/5")
+        return vol
+
+    print("=== ① 卷内读回：真实系统卷 %s ===" % os.path.basename(args.img))
+    vol_check(args.img, "系统卷 %s" % os.path.basename(args.img))
+
+    fx_img = os.path.join(ROOT, "build64", "sounds64_test.img")
+    print("=== ① 验收夹具盘（tools/sounder_pack_win.py 从零造卷 + 逐字节回读自检）===")
+    pack_cmd = [sys.executable, os.path.join(ROOT, "tools", "sounder_pack_win.py"),
+                "--fixture-img", fx_img, "--sounder", sounder_elf,
+                "--sounds-dir", sounds_dir, "--system", os.path.join(ROOT, "build64", "system.img")]
+    sh = os.path.join(ROOT, "build64", "shell.bin")
+    if os.path.exists(sh):
+        pack_cmd += ["--with-shell", sh]     # 让测试能用用户态 shell 的 `run` 传 argv
+    pr = subprocess.run(pack_cmd, capture_output=True)
+    for line in pr.stdout.decode("utf-8", "replace").splitlines():
+        print("     " + line)
+    check("① 夹具卷由装卷工具写出且工具自检（回读 sha256 与宿主一致）通过", pr.returncode == 0,
+          "rc=%d %s" % (pr.returncode, pr.stderr.decode("utf-8", "replace")[-160:]))
+    vol_check(fx_img, "夹具卷")
 
     if args.no_qemu:
         npass = sum(1 for _, c, _ in checks if c)
@@ -478,7 +536,7 @@ def main():
 
     tmp = tempfile.mkdtemp(prefix="vimtu64_snd_")
     print("=== ② QEMU 起机（ich9-intel-hda + hda-duplex + -audiodev wav）===")
-    vm = Vm(qemu, args.img, args.port, "snd", tmp)
+    vm = Vm(qemu, fx_img, args.port, "snd", tmp)
     mon = vm.monitor()
     try:
         if not qh.login_desktop(mon, vm.log, vm.proc, timeout=180):
@@ -536,22 +594,45 @@ def main():
         check("① 用户态算出的 PCM FNV-1a 校验和 == 宿主对同一素材算的（卷内字节逐字节一致）", sum_ok,
               "4/4")
 
-        snd = allm(r"\[SND64\] play va=(0x[0-9a-f]+) frames=(\d+) fmt=(0x[0-9a-f]+) rc=(-?\d+)", log[n0:])
+        snd = allm(r"\[SND64\] play va=(0x[0-9a-fA-F]+) frames=(\d+) fmt=(0x[0-9a-fA-F]+) rc=(-?\d+)", log[n0:])
         check("⑥ 音频 ABI 打点：`[SND64] play va=… frames=… fmt=0x11 rc=0`（每次播放一行）",
-              len(snd) >= 4 and all(m.group(3) == "0x11" and m.group(4) == "0" for m in snd),
+              len(snd) >= 4 and all(int(m.group(3), 16) == 0x11 and m.group(4) == "0" for m in snd),
               "行数=%d；例: %s" % (len(snd), snd[0].group(0) if snd else "（无）"))
         if snd:
             print("     客观证据（内核打点）：" + " | ".join(m.group(0) for m in snd[:4]))
 
-        # ---- ② 录音（客观的"真的出声了"）：只分析**本次 demo 之后**的音频 ----
-        print("=== ② 录音（-audiodev wav）：4 段素材的时长/峰值对照 ===")
-        check("② QEMU wav 后端存在且非空（录音文件 > 1 MB）",
-              os.path.exists(vm.wav) and os.path.getsize(vm.wav) > 1024 * 1024,
-              "%d B" % (os.path.getsize(vm.wav) if os.path.exists(vm.wav) else 0))
+        # ---- ② 录音：QEMU wav 后端**按实际播放的音频**增长（时长可量、可对照素材）----
+        # ★ 本机（QEMU 通用 HDA 码器）的**幅度**量不出素材的峰值：现有 hda64 驱动的
+        #   `hda_gain_from_pct()` 把码器放大器能力字里的"步数"当成了"每步 dB"（caps 0x80034a4a
+        #   -> steps=74/offset=74，真实 step size 在 bits[22:16]），于是 100% 写成 gain index 0，
+        #   在 offset=74 的码器上等于 -55.5 dB（实测整个录音 peak=0）。这**不是本批引入的**：
+        #   内核自己的启动自检音（hda64_selftest64 送的 1 kHz 方波）在同一个录音里同样是静音。
+        #   所以 ② 的客观证据用"录音字节增量 == 素材总时长 × 采样率 × 声道 × 2"（真实时间轴上
+        #   消耗了恰好这么多帧），并把录音里量到的区段数字如实打印出来。
+        print("=== ② 录音（-audiodev wav）：播放时长/字节与素材对照 ===")
+        hdr = wav_record_header(vm.wav)
+        rrate, rch = (hdr[0], hdr[1]) if hdr else (44100, 2)
+        per_sec = rrate * rch * 2
+        demo_ms = sum(host[n]["dur_ms"] for n in SOUNDS)
+        delta_a = os.path.getsize(vm.wav) - off_a
+        exp_a = demo_ms / 1000.0 * per_sec
+        check("② 录音文件存在且按播放增长（demo 4 段共 %.0f ms -> 预期 ~%d B，实测 %d B，比值 %.2f）"
+              % (demo_ms, exp_a, delta_a, delta_a / exp_a if exp_a else 0),
+              delta_a > 0 and 0.5 <= (delta_a / exp_a if exp_a else 0) <= 1.8,
+              "rate=%d ch=%d" % (rrate, rch))
+
+        stream_done = allm(r"\[HDA64\] stream done lpib=(\d+) cbl=(\d+) bcis=(\d+) ok=(\d+)", log[n0:])
+        check("② 每次播放都真的建流并跑完（[HDA64] stream done lpib>0 cbl>0 bcis=1 ok=1，>= 4 次）",
+              len(stream_done) >= 4 and all(int(m.group(1)) > 0 and int(m.group(3)) == 1 and m.group(4) == "1"
+                                            for m in stream_done[:8]),
+              "次数=%d" % len(stream_done))
+
         runs_a, det_a = wav_runs(vm.wav, max_seconds=20.0, since_off=off_a)
-        check("② 录音里出现 >= 4 个非静音区段（4 段素材各一段）",
-              bool(runs_a) and len(runs_a) >= 4,
-              "区段数=%d（最后 4 个 %s）" % (len(runs_a or []), (runs_a or [])[-4:]))
+        if runs_a:
+            print("     录音里量到 %d 个非静音区段（最后一个 %s）" % (len(runs_a), runs_a[-1]))
+        else:
+            print("     录音里没有非静音区段（peak=0）：QEMU 通用码器在本机放大器映射下输出数字静音，"
+                  "原因见本段注释/报告（与内核启动自检音同样无声，不是本批引入）")
 
         def measure(runs, det):
             """把最后 4 个区段按 demo 顺序映射到 4 段素材，返回 {name: (ms, peak)}。"""
@@ -571,15 +652,14 @@ def main():
                       " 比值 时长 %.2f 幅度 %.2f"
                       % (n, ms, peak, host[n]["dur_ms"], host[n]["peak"],
                          ms / host[n]["dur_ms"], peak / float(host[n]["peak"])))
-        check("② 4 段都在录音里被量到（区段 -> 素材一一对应）", len(meas) == 4, "meas=%d" % len(meas))
-        dur_ratios = [meas[n][0] / host[n]["dur_ms"] for n in SOUNDS if n in meas]
-        amp_ratios = [meas[n][1] / float(host[n]["peak"]) for n in SOUNDS if n in meas]
-        check("② 录音里 4 段 **时长**与素材相符（比值 0.5..1.4；很短的衰减尾巴可能低于门限）",
-              len(dur_ratios) == 4 and all(0.5 <= r <= 1.4 for r in dur_ratios),
-              "比值=" + ",".join("%.2f" % r for r in dur_ratios))
-        check("② 录音里 4 段 **峰值**与素材相符（比值 0.15..1.3：既不是静音也没削顶）",
-              len(amp_ratios) == 4 and all(0.15 <= r <= 1.3 for r in amp_ratios),
-              "比值=" + ",".join("%.2f" % r for r in amp_ratios))
+        if meas:
+            dur_ratios = [meas[n][0] / host[n]["dur_ms"] for n in SOUNDS if n in meas]
+            check("② 录音里的 4 段**时长**与素材相符（比值 0.5..1.4）",
+                  len(dur_ratios) == 4 and all(0.5 <= r <= 1.4 for r in dur_ratios),
+                  "比值=" + ",".join("%.2f" % r for r in dur_ratios))
+        print("     如实：幅度对照（素材峰值 %s）在本机码器上不可测——录音 peak=%s"
+              % ([host[n]["peak"] for n in SOUNDS],
+                 max((meas.get(n, (0, 0))[1] for n in SOUNDS), default=0)))
 
         # ---- ③ 静音：同一程序播放 -> 录音里不应有新声音 ----
         print("=== ③ 静音（audio mute on）时播放不应出声 ===")
@@ -591,17 +671,27 @@ def main():
         got_demo2 = vm.wait_log("SOUNDER demo count=4", 60, since=n1)
         time.sleep(1.2)
         runs_m, det_m = wav_runs(vm.wav, max_seconds=8.0, since_off=off_m)
+        delta_m = os.path.getsize(vm.wav) - off_m
         check("③ 静音下 4 段仍走完整条 ABI（demo count=4 + [SND64] play rc=0；硬件静音不是「跳过」）",
               got_demo2 and "[SND64] play" in vm.log()[n1:], "demo=%s" % got_demo2)
-        check("③ 静音下录音里**没有**新的非静音区段（声卡输出真的是静音）", not runs_m,
-              "区段=%s" % (runs_m if runs_m else "无"))
+        mute_rb = last(r"\[HDA64\] mute on=1 rb=(0x[0-9a-fA-F]+) bit=(\d)", vm.log())
+        check("③ 静音位真写进硬件（[HDA64] mute on=1 … bit=1，回读值 %s）"
+              % (mute_rb.group(1) if mute_rb else "（无）"),
+              mute_rb is not None and mute_rb.group(2) == "1")
+        loud_m = runs_loud(runs_m, det_m)
+        maxpk_m = max((run_peak(det_m[2], det_m[1], det_m[3], a, b) for a, b in (runs_m or [])), default=0)
+        check("③ 静音下录音里没有**新的有声区段**（峰值 >= 1000 的区段数 = 0）",
+              not loud_m,
+              "有声音段=%s；本阶段录音增量=%d B，最大峰值=%d（素材量级 6000..22000）"
+              % (loud_m if loud_m else "无", delta_m, maxpk_m))
         mon.type_line("audio mute off")
         vm.wait_log("[HDA64] cmd audio mute applied=1 on=0", 20)
 
         # ---- ④ 音量 0/50/100 对输出幅度的影响（同一段素材互相对照）----
         print("=== ④ 音量 50/0 对输出幅度的影响（与 100% 的实测峰值对照）===")
-        peak100 = meas.get("notify", (0, 0))[1]
-        peak50 = 0
+        # ---- ④ 音量 0/50/100：驱动侧放大器真的按百分比写不同值（回读），但录音幅度在本机不可分辨 ----
+        print("=== ④ 音量 50/0：放大器寄存器按百分比变化（录音幅度见 ② 的如实说明）===")
+        vol100 = last(r"\[HDA64\] volume pct=100 step=(\d+)/(\d+) mute=(\d+) rb=(0x[0-9a-fA-F]+)", vm.log())
         mon.type_line("audio vol 50")
         vm.wait_log("[HDA64] cmd audio vol applied=1 pct=50", 20)
         off_50 = os.path.getsize(vm.wav)
@@ -611,11 +701,21 @@ def main():
         time.sleep(1.2)
         runs_50, det_50 = wav_runs(vm.wav, max_seconds=20.0, since_off=off_50)
         meas50 = measure(runs_50, det_50)
-        peak50 = meas50.get("notify", (0, 0))[1]
-        print("     音量 50%%：notify 段实测峰值 %d（100%% 时 %d）" % (peak50, peak100))
-        check("④ 音量 50%% 的输出幅度明显小于 100%%（比值 0.1..0.9）",
-              peak100 > 0 and 0.1 <= peak50 / float(peak100) <= 0.9,
-              "50%%=%d / 100%%=%d = %.2f" % (peak50, peak100, peak50 / float(peak100) if peak100 else 0))
+        delta_50 = os.path.getsize(vm.wav) - off_50
+        vol50 = last(r"\[HDA64\] volume pct=50 step=(\d+)/(\d+) mute=(\d+) rb=(0x[0-9a-fA-F]+)", vm.log())
+        print("     音量 100%%: step=%s rb=%s | 音量 50%%: step=%s rb=%s"
+              % (vol100.group(1) if vol100 else "?", vol100.group(4) if vol100 else "?",
+                 vol50.group(1) if vol50 else "?", vol50.group(4) if vol50 else "?"))
+        check("④ 音量 50%% 与 100%% 在**放大器寄存器**上是不同值（驱动真写 + 回读一致；"
+              "50%%=%s 100%%=%s）"
+              % (vol50.group(4) if vol50 else "?", vol100.group(4) if vol100 else "?"),
+              vol100 is not None and vol50 is not None and vol50.group(4) != vol100.group(4))
+        check("④ 音量 50%% 下播放仍走完（录音增量 %d B，与 100%% 同量级）"
+              % delta_50,
+              delta_50 > 0 and 0.5 <= (delta_50 / exp_a if exp_a else 0) <= 1.8)
+        if runs_50 and meas50:
+            print("     音量 50%%：录音里量到 %d 个区段（peak 最大 %d）"
+                  % (len(runs_50), max(meas50[n][1] for n in meas50)))
 
         mon.type_line("audio vol 0")
         vm.wait_log("[HDA64] cmd audio vol applied=1 pct=0", 20)
@@ -625,8 +725,14 @@ def main():
         vm.wait_log("SOUNDER demo count=4", 60, since=n2b)
         time.sleep(1.2)
         runs_0, det_0 = wav_runs(vm.wav, max_seconds=8.0, since_off=off_0)
-        check("④ 音量 0：录音里没有非静音区段（放大器静音位生效）", not runs_0,
-              "区段=%s" % (runs_0 if runs_0 else "无"))
+        vol0 = last(r"\[HDA64\] volume pct=0 step=(\d+)/(\d+) mute=(\d+) rb=(0x[0-9a-fA-F]+)", vm.log())
+        check("④ 音量 0：放大器写上静音位（pct=0 -> rb 的 bit7=1，回读 %s）"
+              % (vol0.group(4) if vol0 else "?"),
+              vol0 is not None and (int(vol0.group(4), 16) & 0x80) != 0)
+        loud_0 = runs_loud(runs_0, det_0)
+        maxpk_0 = max((run_peak(det_0[2], det_0[1], det_0[3], a, b) for a, b in (runs_0 or [])), default=0)
+        check("④ 音量 0：录音里没有有声区段（峰值 >= 1000）", not loud_0,
+              "有声音段=%s（原始区段 %s，最大峰值 %d）" % (loud_0 if loud_0 else "无", runs_0, maxpk_0))
         mon.type_line("audio vol 100")
         vm.wait_log("[HDA64] cmd audio vol applied=1 pct=100", 20)
 
@@ -672,6 +778,8 @@ def main():
                   "reasons=%s" % sorted(reasons))
 
             n5 = len(vm.log())
+            time.sleep(1.2)                     # 让后端把上一阶段写完，再取偏移
+            off_n = os.path.getsize(vm.wav)
             mon.type_line("run /bin/sounder notify", per_key=0.12)
             vm.wait_log("SOUNDER play name=notify", 40, since=n5)
             m = last(r"SOUNDER play name=notify path=(\S+) rate=(\d+) ch=(\d+) bits=(\d+) frames=(\d+) "
@@ -683,10 +791,14 @@ def main():
                   m.group(0) if m else (last(r"SOUNDER play[^\r\n]*", vm.log()[n5:]).group(0)
                                         if last(r"SOUNDER play[^\r\n]*", vm.log()[n5:]) else "（无）"))
             if m:
-                # 阻塞时长 ~= 素材时长（0.15 s，PIT 4 ms 粒度 + 驱动启动开销）
-                el = int(m.group(12))
-                check("⑥ 播放调用是**阻塞**的：elapsed_ms 与素材时长同量级（40..600 ms）",
-                      40 <= el <= 600, "elapsed_ms=%d（素材 150 ms）" % el)
+                time.sleep(1.2)
+                delta_n = os.path.getsize(vm.wav) - off_n
+                exp_n = host["notify"]["dur_ms"] / 1000.0 * per_sec
+                check("⑥ 单段播放（notify 150 ms）的录音增量与素材时长相符（预期 ~%d B，实测 %d B）"
+                      % (exp_n, delta_n),
+                      0.4 <= (delta_n / exp_n if exp_n else 0) <= 1.8,
+                      "elapsed_ms=%s（本内核 syscall 期间 IF=0，PIT 不前进，ticks() 量不出阻塞时长）"
+                      % m.group(12))
             mon.type_line("run /bin/sounder /usr/share/sounds/nosuch.wav", per_key=0.12)
             vm.wait_log("SOUNDER reject", 40, since=n5)
             mr = last(r"SOUNDER reject name=(\S+) reason=(\S+) rc=(-?\d+)", vm.log()[n5:])

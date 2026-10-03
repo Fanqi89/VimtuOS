@@ -93,11 +93,28 @@ int snd_main(long argc, char** argv);
 
 static const char* const g_names[4] = { "startup", "notify", "click", "error" };
 
-/* ==================== 最小输出（自有 ABI write(1) -> 串口 + 屏幕）==================== */
+/* ==================== 最小输出（自有 ABI write(1) -> 串口 + 屏幕）====================
+ * ★ 一行一次 write：内核为**每次** int 0x80 write(1) 打一行 `[SYSCALL] nr=1 …`，如果本程序
+ *   按 token 分多次 write，串口日志里我的那一行会被这些打点**从中间插断**（实测：
+ *   `SOUNDER demo count=` 后面跟一行 [SYSCALL]，再跟 `4`）—— 验收脚本按行 grep 就一条都匹配不到。
+ *   所以这里做行缓冲：攒到 '\n' 才 write 一次（同时把 syslog 打点数量从 ~30 降到 ~10）。 */
+#define OUTBUF_MAX 512
+static char g_out[OUTBUF_MAX];
+static u64  g_out_n = 0;
+
+static void out_flush(void) {
+    if (g_out_n) {
+        (void)sc3(1, 1, (i64)(u64)g_out, (i64)g_out_n);
+        g_out_n = 0;
+    }
+}
 static void out_str(const char* s) {
-    i64 n = 0;
-    while (s[n]) n++;
-    if (n) (void)sc3(1, 1, (i64)(u64)s, n);
+    while (*s) {
+        if (g_out_n >= OUTBUF_MAX - 1) out_flush();          /* 防溢出：先把已有的发出去 */
+        g_out[g_out_n++] = *s;
+        if (*s == '\n') out_flush();                        /* 一行一次 write(1) */
+        s++;
+    }
 }
 static void out_u64(u64 v) {
     char b[24];
@@ -271,7 +288,7 @@ static i64 play_path(const char* name, const char* path, u8* buf) {
     const u64 t0 = (u64)sc0(4);                             /* ticks()：250Hz PIT */
     const i64 rc = abi_play(w.pcm, frames, SND_FMT_48K16S2);
     const u64 t1 = (u64)sc0(4);
-    out_str("play name=");
+    out_str("SOUNDER play name=");
     out_str(name);
     ks(" path=", path);
     kv(" rate=", w.rate);
@@ -431,6 +448,7 @@ int snd_main(long argc, char** argv) {                    /* 外部链接：_sta
         out_str("\n");
         rc = (count == 4) ? 0 : 1;
     }
+    out_flush();                                            /* 确保最后一行已发出（正常路径都以 '\n' 收尾） */
     (void)sc1(2, (rc == 0) ? 0 : 1);                        /* exit(code)：0 = 全部成功 */
     return 0;
 }
