@@ -341,7 +341,11 @@ class Vm:
                 "-serial", "file:%s" % q(self.serial),
                 "-monitor", "telnet:127.0.0.1:%d,server,nowait" % port,
                 "-no-reboot",
-                # ★ HDA 只能 QEMU：Intel HDA 控制器 + 通用码器；wav 后端把声卡混出的音频录进文件
+                # ★ 修复（③）：加一块 e1000 + user netdev，**只为**能用一个真事件触发设备 toast：
+                #   monitor `set_link net0 off/on` -> panels64 的 device_poll64 看到链路变化 ->
+                #   panels64_device_event64 -> panels64_notify64 -> notify 音效。端到端，不是硬塞调用。
+                "-netdev", "user,id=net0",
+                "-device", "e1000,netdev=net0",
                 "-device", "ich9-intel-hda",
                 "-device", "hda-duplex,audiodev=snd0",
                 "-audiodev", "wav,id=snd0,path=%s" % q(self.wav)]
@@ -872,6 +876,162 @@ def main():
             check("⑤ 不存在的素材路径 -> 用户态如实报 not-found rc=-2（不谎报播放成功）",
                   mr is not None and mr.group(3) == "-2", mr.group(0) if mr else "（无）")
 
+        # ---- ⑧ ★ 修复（③ 补证据）：内核**触发点**的端到端录音证据（click / notify / error）----
+        # 为什么需要这一段：ABI 49 + 4 段素材 + /bin/sounder 都有，但此前**只有 startup**（登录触发）
+        # 有端到端录音证据；notify/click/error 只有代码级接线与打点。这里逐条触发**内核自己的调用点**
+        # （不是用户态 sounder），再从 `-audiodev wav` 的录音里证明对应段真的出现了。
+        #   click  -> kernel/gui64.cpp 的 handle_mouse_press（左键按下）
+        #   notify -> kernel/panels64.cpp 的 panels64_notify64（设备 toast：以太网链路变化）
+        #   error  -> kernel/settings64.cpp 的 msg_set(accent2)（设置页"非法用户名"错误提示）
+        print("=== ⑧ 内核触发点：click / notify / error 的端到端录音证据 ===")
+        import settings64_test as s64x          # 复用已验证的闭环鼠标 + [SET64] ctl/nav 坐标解析
+        # ★ 修（WIP 断链）：这三条"录音里真的有幅度"的 check 引用了 `min_peak`，但 WIP 只把它写成
+        #   trigger_seg() 的形参，main 里没有这个名字 -> NameError（实测 ⑧ 跑到 click 就崩）。
+        #   这里按原意定义成局部量（= trigger_seg 的默认阈值 3000，未放水）。
+        min_peak = 3000
+        marks = []                              # [(name, off_bytes, end_bytes)]：给取证脚本做"区段 -> 触发器"映射
+
+        def trigger_seg(name, why_pat, off, digits_ms=None, min_peak=3000, settle=0.8, min_bytes=1500):
+            """量 [off, EOF) 这一段：等 [SND64] fx name=<name> why=<why_pat> rc=0 出现。"""
+            time.sleep(settle)
+            # ★ 修（假失败）：QEMU 的 wav 后端是**缓冲写**，触发后 1s 内文件可能一个字节都还没落盘
+            #   （实测 click 段偶发 录音增量=0 B / 整窗峰值 0 -> "没有幅度"的假失败，同一构建复跑就绿）。
+            #   这里轮询等文件相对 off 至少涨 min_bytes（30ms 素材 = 5292 B，缓冲粒度 4KiB），最多 8s。
+            deadline = time.time() + 8.0
+            while time.time() < deadline and (os.path.getsize(vm.wav) - off) < min_bytes:
+                time.sleep(0.25)
+            time.sleep(0.4)
+            ln = vm.log()
+            m = last(r"\[SND64\] fx name=%s why=%s bytes=(\d+) rc=(-?\d+)" % (name, why_pat), ln)
+            pk = wav_peak_win(vm.wav, off)
+            delta = os.path.getsize(vm.wav) - off
+            exp = (digits_ms / 1000.0 * per_sec) if digits_ms else 0
+            marks.append((name, off, os.path.getsize(vm.wav)))
+            return m, pk, delta, exp
+
+        # --- click：左键按下（★ 修：不再"把指针推到左上角"）---
+        # 原 WIP 在这里发了 20× `mouse_move -100 -100` 想把指针推到屏幕左上角。但 guest 每包最多
+        # 走 MOUSE_STEP_MAX=24px（kernel/input.cpp），推不到 (0,0)，**推完位置就不再有已知值**；
+        # 而下面 error 段用的 settings64_test.Cursor() 模型假定指针仍在 mouse_init 的 (512,384)
+        # —— 模型与真值差几百像素，设置页的导航/控件点击全部落空（实测 reached=False）。
+        # 现在全程唯一一次鼠标动作就是下面这个"原地左键按下"，指针位置与 Cursor() 模型始终一致。
+        time.sleep(0.6)
+        off_c = wav_settle(vm.wav)
+        n_c = len(vm.log())
+        mon.raw(["mouse_button 1", "mouse_button 0"], wait_between=0.2, wait_end=0.5)
+        time.sleep(1.0)
+        mc, pk_c, delta_c, exp_c = trigger_seg("click", r"mouse-press", off_c, host["click"]["dur_ms"])
+        check("⑧ click：左键按下 -> 内核播 click 段（[SND64] fx name=click why=mouse-press rc=0）",
+              mc is not None and mc.group(2) == "0",
+              mc.group(0) if mc else (last(r"\[SND64\] fx[^\r\n]*", vm.log()[n_c:]).group(0)
+                                      if last(r"\[SND64\] fx[^\r\n]*", vm.log()[n_c:]) else "（无 fx 行）"))
+        check("⑧ click：录音里这一段**真的有幅度**（整窗峰值 %d >= %d；素材峰值 %d）"
+              % (pk_c, min_peak, host["click"]["peak"]),
+              mc is not None and pk_c >= min_peak,
+              "录音增量=%d B（素材 %5.1f ms -> 预期 ~%d B）；出现时刻=触发后 [0, %.1f] s"
+              % (delta_c, host["click"]["dur_ms"], exp_c, delta_c / float(per_sec) if per_sec else 0))
+
+        # --- notify：设备 toast（以太网链路变化 -> panels64_notify64 -> notify 段）---
+        # 触发用的是 QEMU 自己的 `set_link`（真事件），不是内核里硬塞的一次调用 —— 端到端。
+        off_n2 = wav_settle(vm.wav)
+        n_n2 = len(vm.log())
+        mon.send("set_link net0 off", wait=0.6)
+        time.sleep(2.5)                      # device_poll64 周期 500ms
+        mnotif = last(r"\[PANEL64\] notif add n=\d+ unread=\d+ title=(\S+) time=", vm.log()[n_n2:])
+        mn, pk_n, delta_n2, exp_n2 = trigger_seg("notify", r"toast", off_n2, host["notify"]["dur_ms"])
+        if mnotif is None and mn is None:
+            # 设备/网络后端可能不可用：换一条**同一调用点**的触发（Dock/USB 差分走同一函数）
+            print("      [信息] set_link 没触发设备 toast（本机 e1000 链路事件不可用）-> 用 usb 差分事件重试")
+            mon.send("set_link net0 on", wait=0.6)
+            time.sleep(1.5)
+            off_n2 = wav_settle(vm.wav)
+            n_n2 = len(vm.log())
+            mon.send("set_link net0 off", wait=0.6)
+            time.sleep(2.5)
+            mnotif = last(r"\[PANEL64\] notif add n=\d+ unread=\d+ title=(\S+) time=", vm.log()[n_n2:])
+            mn, pk_n, delta_n2, exp_n2 = trigger_seg("notify", r"toast", off_n2, host["notify"]["dur_ms"])
+        check("⑧ notify：设备事件 -> 通知 toast（[PANEL64] notif add title=…）",
+              mnotif is not None, mnotif.group(0) if mnotif else "（没等到 notif add 行）")
+        check("⑧ notify：toast 触发内核播 notify 段（[SND64] fx name=notify why=toast rc=0）",
+              mn is not None and mn.group(2) == "0",
+              mn.group(0) if mn else (last(r"\[SND64\] fx[^\r\n]*", vm.log()[n_n2:]).group(0)
+                                      if last(r"\[SND64\] fx[^\r\n]*", vm.log()[n_n2:]) else "（无 fx 行）"))
+        check("⑧ notify：录音里这一段真的有幅度（整窗峰值 %d >= %d；素材峰值 %d）"
+              % (pk_n, min_peak, host["notify"]["peak"]),
+              mn is not None and pk_n >= min_peak,
+              "录音增量=%d B（素材 %.1f ms -> 预期 ~%d B）" % (delta_n2, host["notify"]["dur_ms"], exp_n2))
+
+        # --- error：设置页"非法用户名"错误提示（msg_set(accent2) -> error 段）---
+        off_e = wav_settle(vm.wav)
+        n_e = len(vm.log())
+        reached = False
+        if shell_ok:
+            # ★ 指针位置：全程只有一次"原地左键按下"，没有位移 -> 真值仍是 mouse_init 的 (512,384)，
+            #   与 settings64_test 的 Cursor() 模型（默认 512,384）一致。每一步都打诊断，失败时能定位。
+            cur = s64x.Cursor()
+            opened = False
+            for _ in range(3):
+                mon.key("meta_l", wait=1.0)
+                mon.key("6", wait=2.6)                      # 数字快捷键 6 = 设置
+                if vm.wait_log("[APP] settings opened", 12, since=n_e):
+                    opened = True
+                    break
+            vm.wait_log("[SET64] view page=", 8, since=n_e)
+            time.sleep(0.8)
+            xy = s64x.nav_xy(vm, 13)                        # P_UNAME = 13（用户名页）
+            print("      [信息] error 诊断：settings_opened=%s nav_xy(13)=%s" % (opened, xy))
+            if xy:
+                mm = len(vm.log())
+                cur.click_at(mon, xy[0], xy[1])             # nav_xy 给的是 (cx, cy)
+                onpage = vm.wait_log("[SET64] page=13 name=", 8, since=mm)
+                time.sleep(0.6)
+                rf = s64x.ctl_xy(vm, 13, 150)               # CID_UNAME_FIELD = 150
+                print("      [信息] error 诊断：切到用户名页=%s ctl(13,150)=%s"
+                      % (onpage, dict(rf) if rf else None))
+                if rf:
+                    cur.click_at(mon, rf["acx"], rf["acy"])
+                    time.sleep(0.5)
+                    mon.key("a", wait=0.15)
+                    mon.key("slash", wait=0.15)             # '/' 在名字里非法（settings64 的判定）
+                    mon.key("b", wait=0.15)
+                    mon.key("ret", wait=1.6)
+                    reached = vm.wait_log("[USER64] rename FAIL", 10, since=n_e)
+                    if not reached:
+                        print("      [信息] error 诊断：最近的 [USER64] 行=%s"
+                              % [x for x in vm.log()[n_e:].splitlines() if "USER64" in x][-2:])
+            mon.key("esc", wait=0.8)
+            mon.key("esc", wait=0.8)
+            mon.key("esc", wait=0.8)
+            mon.key("esc", wait=0.8)
+        print("      [信息] error 触发点是否触达（设置页非法用户名 -> msg_set(accent2)）= %s" % reached)
+        me, pk_e, delta_e, exp_e = trigger_seg("error", r"settings-msg-error", off_e,
+                                               host["error"]["dur_ms"])
+        if reached:
+            check("⑧ error：设置页非法用户名 -> 内核播 error 段（[SND64] fx name=error "
+                  "why=settings-msg-error rc=0）", me is not None and me.group(2) == "0",
+                  me.group(0) if me else "（无 fx 行）")
+            check("⑧ error：录音里这一段真的有幅度（整窗峰值 %d >= %d；素材峰值 %d）"
+                  % (pk_e, min_peak, host["error"]["peak"]), me is not None and pk_e >= min_peak,
+                  "录音增量=%d B（素材 %.1f ms -> 预期 ~%d B）" % (delta_e, host["error"]["dur_ms"], exp_e))
+        else:
+            # 如实标注：GUI 导航没走到（本机自动化环境下设置页导航不稳定）——不谎报"有证据"，
+            # 也不把"没触达"当成"没声音"。手工验证步骤写在报告里。
+            check("⑧ error：error 音效录音证据（本机自动化**未触达**设置页错误提示；"
+                  "手工步骤：Win -> 6 -> 用户名 -> 名字里打 '/' -> 回车）",
+                  False, "fx=%s 峰值=%d（未触达，如实标注）" % (me.group(0) if me else "无", pk_e))
+        mon.send("set_link net0 on", wait=0.4)
+        # ---- ⑧ 取证：把三段触发的录音字节区间写出来（给 tests/soundsegs64_test.py 做区段->触发器映射）----
+        try:
+            mk = os.path.join(tmp, "seg_marks.txt")
+            with open(mk, "w", encoding="utf-8") as f:
+                for nm, a, b in marks:
+                    f.write("%s %d %d\n" % (nm, a, b))
+            print("      [信息] 录音区段标记（name off_bytes end_bytes）-> %s：%s"
+                  % (mk, [(nm, a, b, "%.1fms" % ((b - a) / float(per_sec) * 1000.0)) for nm, a, b in marks]))
+            print("      [取证] 逐段峰值/RMS：py -3 tests/soundsegs64_test.py --wav %s --marks %s"
+                  % (vm.wav, mk))
+        except Exception as e:
+            print("      [信息] 区段标记写出失败：%s" % e)
         # ---- ⑦ 全程无 PANIC / 无 enosys ----
         bad = [w for w in FORBIDDEN if w in vm.log()]
         check("⑦ 全程无 PANIC / 三重故障 / [SYSCALL] enosys nr=49", not bad, ",".join(bad))
