@@ -803,6 +803,13 @@ static void sig64_demo64(const char* path) {
 //   阶段 a：/etc/edit64_test.txt（小文件：改字符 -> Ctrl+S -> Ctrl+C -> Ctrl+S -> Ctrl+Q）
 //   阶段 b：/tcc/demo/edit1m.txt（1 MiB：只移动/翻页，不保存 -> 卷里那份必须逐字节不变）
 // 缺 /bin/edit 或测试文件就只打一行 skipped（**不假装跑过**）。
+// ★ 修复（③）：演示"有没有外部驱动"的判定。edit64 的钥匙是外部注键（QEMU monitor sendkey）。
+//   旧缺陷：没人注键时交互式编辑器（/bin/edit）一直等键，`edit64_one64` 的等待循环**只有
+//   120s 超时这一个退出条件** —— 于是完整系统卷上每一相都空等满 120s（a+b = 240s），
+//   启动期看起来"卡死在 [EDIT64] demo phase=a"（实测：phase a 30001 ticks = 120.004s）。
+//   修法：本相开始后 grace 秒内**没有任何按键** -> 判定"没人驱动"，不再空等（日志如实写 driven=0）；
+//   一旦收到过按键（edit64_test 的注键都在 1s 内到）就恢复原来的长超时行为，测试不受影响。
+static int g_edit64_driven = 0;
 static void edit64_one64(const char* bin, const char* file, const char* tag, uint32_t timeout_sec) {
     uint32_t t = 0, sz = 0;
     if (!bin || vfs64_stat(bin, &t, &sz) != 0) return;
@@ -826,11 +833,16 @@ static void edit64_one64(const char* bin, const char* file, const char* tag, uin
     dbg64_nl();
     dbg64_line_end64();
     const uint64_t t0 = g_ticks64;
+    const uint32_t k0 = kbd_events64();
+    const uint32_t grace_sec = 12u;     // 没人注键的宽限期（真注键在 ready 后 <1s 就到）
     int exited = 0;
     for (;;) {
         Sig64State64* st = proc64_sig_state_of64(pid);
         if (!st) { exited = 1; break; }
-        if ((g_ticks64 - t0) > (uint64_t)PIT_HZ_64 * (uint64_t)timeout_sec) break;
+        if (kbd_events64() != k0) g_edit64_driven = 1;     // 有外部注键 -> 正常演示
+        const uint64_t el = g_ticks64 - t0;
+        if (!g_edit64_driven && el > (uint64_t)PIT_HZ_64 * grace_sec) break;   // ★ 没人驱动：不空等满超时
+        if (el > (uint64_t)PIT_HZ_64 * (uint64_t)timeout_sec) break;
         task_sleep64(2);
     }
     if (!exited) (void)proc64_kill64(pid, 9);
@@ -842,6 +854,10 @@ static void edit64_one64(const char* bin, const char* file, const char* tag, uin
     dbg64_dec((uint64_t)exited);
     dbg64_str(" ticks=");
     dbg64_dec(g_ticks64 - t0);
+    dbg64_str(" driven=");
+    dbg64_dec((uint64_t)(g_edit64_driven ? 1 : 0));
+    dbg64_str(" keys=");
+    dbg64_dec((uint64_t)(kbd_events64() - k0));
     dbg64_nl();
     dbg64_line_end64();
 }
@@ -860,7 +876,13 @@ static void edit64_demo64(const char* bin) {
         dbg64_line_end64();
         return;
     }
+    g_edit64_driven = 0;
     edit64_one64(bin, "/etc/edit64_test.txt", "a", 120u);
+    if (!g_edit64_driven) {
+        // ★ 修复（③）：没人注键 -> 这不是"演示"，别把启动期拖成分钟级（原来两相各等满 120s）。
+        dbg64_str("[EDIT64] demo stopped (no input driver; interactive phase b skipped)\n");
+        return;
+    }
     edit64_one64(bin, "/tcc/demo/edit1m.txt", "b", 120u);
 }
 #endif
