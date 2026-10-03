@@ -186,8 +186,12 @@ static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
 #include "debug64.h"
 #include "fb.h"             // 屏幕输出（fb_draw_text / fb_flip_region）
 #include "proc64.h"         // 批次 C：进程/地址空间（fork/execve/wait4/kill/每进程 brk&mmap/FS 基址）
-// ★ 系统音效：音频 ABI（49 audio_play）**只转发**给这个驱动（不新增驱动能力）
-#include "hda64.h"          // hda64_play64 / hda64_ready64（音频 ABI 的唯一被调用方）
+// ★ 系统音效：音频 ABI（49 audio_play）**只转发**给 hda64 驱动（不新增驱动能力）。
+//   ★ hda64.cpp 只链进**系统内核**（安装介质内核的 SRCS 里没有它）—— 所以这里必须用**弱引用**
+//   + 空值检查（与 wl64_*/proc64_devmap64 同一套做法）。写成强引用会让安装介质内核链接失败
+//   （实测：`ld.lld: error: undefined symbol: hda64_ready64()`）。
+int hda64_ready64() __attribute__((weak));
+int hda64_play64(const int16_t* pcm, size_t frames) __attribute__((weak));
 
 // task64.cpp 提供（安装程序内核不链接它 -> weak 引用后按"没有调度器"处理）
 extern "C" void     task_sleep_ms64(uint32_t ms) __attribute__((weak));
@@ -1724,7 +1728,12 @@ static int64_t sc64_audio_play64(uint64_t pcm_va, uint64_t frames, uint64_t fmt)
         snd64_play_log64(pcm_va, frames, fmt, SND64_EFAULT64);
         return SND64_EFAULT64;
     }
-    if (!hda64_ready64()) {                                  // 没有控制器/通路没建立：如实 ENODEV，不假装出声
+    if (!hda64_ready64 || !hda64_ready64()) {                // 没有控制器/通路没建立/本内核没链驱动：如实 ENODEV
+        snd64_deny_log64("no-driver", SND64_ENODEV64);
+        snd64_play_log64(pcm_va, frames, fmt, SND64_ENODEV64);
+        return SND64_ENODEV64;
+    }
+    if (!hda64_play64) {
         snd64_deny_log64("no-driver", SND64_ENODEV64);
         snd64_play_log64(pcm_va, frames, fmt, SND64_ENODEV64);
         return SND64_ENODEV64;
