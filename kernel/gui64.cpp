@@ -288,6 +288,22 @@ static uint32_t g_fps_count = 0;
 static uint64_t g_busy_cycles = 0, g_total_cycles = 0;
 static uint8_t  g_busy_pct = 0;
 
+// ==================== ★ P7a-14 取证：每秒一行"性能 / 输入"打点 ====================
+// 为什么量在外壳里：鼠标**报告级**事件数、每帧重绘的 TSC 周期、整屏重绘占比，只有帧循环看得到。
+// 口径（都在这一处算清，避免逐帧打日志刷爆串口 / 干扰既有验收）：
+//   ev        本秒处理的鼠标**报告**数（input.cpp 的 mouse_has_event 边沿，消费后清零）
+//   rn        本秒 render() 次数（= 实际提交的帧数）；full = 其中脏矩形 >= 90% 屏面积的"整屏重绘"次数
+//   redraw_us 每次 render() 的平均耗时（TSC 周期 / 本秒实测 TSC 频率 -> µs）
+//   mv/cur    本秒客人侧指针累计位移 / 当前指针位置（px）—— 用来量"宿主位移 -> 客人位移"
+//   sens      mouse.sens（千分比；1700 = 驱动基线）
+static uint32_t g_perf_ev = 0;
+static uint64_t g_perf_rcyc = 0;
+static uint32_t g_perf_rn = 0;
+static uint32_t g_perf_full = 0;
+static uint32_t g_perf_mv_x = 0, g_perf_mv_y = 0;
+static uint64_t g_perf_tsc = 0;
+static uint32_t g_perf_sec = 0;
+
 static inline uint64_t rdtsc64() {
     uint32_t lo, hi;
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
@@ -2028,6 +2044,10 @@ static void render(void) {
     //   尺寸变化时画内容）→ 设置窗口内容每帧被抹成纯 240,240,240。见报告里的像素证据。）
     g_frames++;
     g_dirty_any = false;
+    // ★ P7a-14：本帧的取证计数（重绘耗时之和 / 是否整屏重绘）—— 每秒汇总成一行 [UI] perf
+    g_perf_rcyc += t1 - t0;
+    g_perf_rn++;
+    if ((int64_t)dw * dh >= (int64_t)g_screen_w * g_screen_h * 9 / 10) g_perf_full++;
     if (!g_load_done) {
         // ★ P5：窗口画完**两帧**才算"加载完"（保证至少一次光标判定能看到"加载中"，
         //   也保证转圈在慢机型上真的能被用户看到）
@@ -2348,6 +2368,8 @@ static void handle_mouse_press(int mx, int my, int button) {
 }
 
 static void handle_mouse(void) {
+    // ★ P7a-14：报告级事件计数（每个 PS/2 报告置位一次 mouse_has_data；这里消费一次算一个事件）
+    if (mouse_has_event()) { mouse_clear_event_flag(); g_perf_ev++; }
     mouse_apply_sensitivity();               // mouse.sens != 1700 时才动（默认路径零变化）
     const int mx = mouse_get_x(), my = mouse_get_y();
     const int btn = (int)mouse_get_buttons();
@@ -2357,6 +2379,9 @@ static void handle_mouse(void) {
     const bool rel_left = rel_left_evt || ((g_prev_btn & 1) && !(btn & 1));
     // 光标移动 -> 新旧两块脏区（标题栏三按钮要跟着重画：hover 高亮）
     if (mx != g_cur_x || my != g_cur_y) {
+        // ★ P7a-14：客人侧指针本秒累计位移（|Δ|，用来量"宿主位移 -> 客人位移"）
+        g_perf_mv_x += (mx > g_cur_x) ? (uint32_t)(mx - g_cur_x) : (uint32_t)(g_cur_x - mx);
+        g_perf_mv_y += (my > g_cur_y) ? (uint32_t)(my - g_cur_y) : (uint32_t)(g_cur_y - my);
         dirty_add(g_prev_cur_x - 6, g_prev_cur_y - 4, 24, 24);   // ★ P5：光标图案变大（转圈/对角箭头）
         dirty_add(g_cur_x - 6, g_cur_y - 4, 24, 24);
         dirty_title_buttons_at(g_cur_x, g_cur_y);
@@ -3533,7 +3558,20 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
                 if (explorer64_window64()) gui64_invalidate_window(explorer64_window64());
                 if (gui64_window_alive(g_about_win)) gui64_invalidate_window(g_about_win);
             }
-            if (g_dirty_any || g_first_frame) { g_first_frame = false; render(); }
+            // ★ 修复（②）：帧尾的 render() 必须**再判一次**锁屏。帧首那个 hook（见上面
+            //   locklogin64_active64() 的块）只覆盖"进帧时就已经锁着"的情况；若锁定是**本帧内**
+            //   被触发的（设置页/开始菜单的"锁定"项、终端 `loginctl lock`、快捷键），帧首看到的是
+            //   DESKTOP，于是这一行仍会把桌面/窗口/Dock/开始菜单画在**刚画好的锁屏之上**
+            //   —— 用户看到的就是"锁定后锁屏仍显示 Dock/开始菜单"的残留。
+            //   锁屏层自己每帧都会重画（locklogin64_tick64 -> paint64，含指针），所以这里整帧跳过渲染。
+            if (g_dirty_any || g_first_frame) {
+                g_first_frame = false;
+                if (locklogin64_active64()) {
+                    g_dirty_any = false;      // 锁屏期间桌面层一概不画（脏区直接丢弃，由锁屏层整屏/局部重绘接管）
+                } else {
+                    render();
+                }
+            }
         }
 
         // 每 500ms：算 CPU 占比 + 各窗口 CPU%
@@ -3552,12 +3590,69 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
                 w->cpu_cycles = 0;
             }
         }
-        // 每秒：帧率
+        // 每秒：帧率 + ★ P7a-14 性能/输入取证（前 60 秒每秒一行，之后停 —— 日志有界）
         if ((int32_t)(now - next_fps) >= 0) {
             next_fps = now + ms_to_ticks64(1000);
             g_fps = g_frames;
             g_frames = 0;
             g_fps_count++;
+            const uint64_t tsc_now = rdtsc64();
+            const uint64_t tsc_dt = (g_perf_tsc && tsc_now > g_perf_tsc) ? (tsc_now - g_perf_tsc) : 0;
+            g_perf_tsc = tsc_now;
+            g_perf_sec++;
+            if (g_perf_sec >= 2 && g_perf_sec <= 180) {   // 前 180 秒每秒一行，之后停（日志有界）
+                const uint32_t rn = g_perf_rn ? g_perf_rn : 1;
+                const uint64_t cyc_per_frame = g_perf_rcyc / rn;
+                // µs = 周期 / (周期每秒) * 1e6；TSC 频率就用本秒实测值（不写死任何机器常数）
+                const uint64_t us = (tsc_dt && cyc_per_frame < (uint64_t)1 << 40)
+                                        ? (cyc_per_frame * 1000000ull / tsc_dt) : 0;
+                const uint64_t tsc_mhz = tsc_dt / 1000000ull;
+                dbg64_line_begin64();
+                dbg64_str("[UI] perf sec=");
+                dbg64_dec((uint64_t)g_perf_sec);
+                dbg64_str(" ev=");
+                dbg64_dec((uint64_t)g_perf_ev);
+                dbg64_str("/s fps=");
+                dbg64_dec((uint64_t)g_fps);
+                dbg64_str(" rn=");
+                dbg64_dec((uint64_t)g_perf_rn);
+                dbg64_str(" redraw_us=");
+                dbg64_dec(us);
+                dbg64_str(" full=");
+                dbg64_dec((uint64_t)g_perf_full);
+                dbg64_str("/");
+                dbg64_dec((uint64_t)g_perf_rn);
+                dbg64_str(" full_pct=");
+                dbg64_dec((uint64_t)(g_perf_rn ? (g_perf_full * 100ull / g_perf_rn) : 0));
+                dbg64_str(" mv=");
+                dbg64_dec((uint64_t)g_perf_mv_x); dbg64_str(","); dbg64_dec((uint64_t)g_perf_mv_y);
+                dbg64_str(" cur=");
+                dbg64_dec((uint64_t)g_cur_x); dbg64_str(","); dbg64_dec((uint64_t)g_cur_y);
+                dbg64_str(" sens=");
+                dbg64_dec((uint64_t)g_mouse_sens);
+                dbg64_str(" tsc_mhz=");
+                dbg64_dec(tsc_mhz);
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+            g_perf_ev = 0; g_perf_rcyc = 0; g_perf_rn = 0; g_perf_full = 0;
+            g_perf_mv_x = 0; g_perf_mv_y = 0;
+            // ★ P7a-14 附带修：terminal 的 `set mouse.sens <n>` 只写 config64，**运行期不生效**
+            //   （gui64 只在启动读一次；文档/终端帮助里却把它列为即时示例，与 theme/lang 的
+            //   "外部改动即时生效"不一致）。这里每秒比对一次，改了就走与设置滑轨同一条生效路径
+            //   （同一个 cfg64 真源 + 重置缩放基准）。设置滑轨那条路（gui64_set_mouse_sens64）
+            //   写的就是同一个值，所以这里对它永远是 no-op。
+            {
+                const int cs = cfg64_mouse_sens64();
+                if (cs != g_mouse_sens) {
+                    gui64_set_mouse_sens64(cs);
+                    dbg64_line_begin64();
+                    dbg64_str("[CONF64] mouse sens applied from cfg=");
+                    dbg64_dec((uint64_t)g_mouse_sens);
+                    dbg64_str(" (terminal `set mouse.sens` / 外部改写 config64 -> 运行期生效)\n");
+                    dbg64_line_end64();
+                }
+            }
         }
         __asm__ volatile("pause");
     }

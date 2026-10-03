@@ -1437,6 +1437,26 @@ void locklogin64_lock64(const char* why) {
     enter_lock64("loginctl lock");
     locklogin64_tick_once64();
     (void)locklogin64_selftest64();
+    // ★ 修复（②）：锁定后**立刻整屏重绘一次锁屏**。原因是这一帧里 gui64 的帧尾本来还会 render()
+    //   一次（画桌面/窗口/Dock/开始菜单），而覆盖层（锁屏）原来只靠 ~300ms 的模糊动画结束帧才整屏
+    //   重画 —— 那之前屏幕上留下的就是"锁屏仍显示 Dock/开始菜单"的像素。现在：
+    //   (1) gui64 帧尾见到锁屏就整帧跳过渲染（见 kernel/gui64.cpp 的帧尾判定）；
+    //   (2) 这里立即整屏重画覆盖层，进锁屏的第一帧就是锁屏自己的画面（不等动画）。
+    g_overlay_valid = 0;
+    paint_full64();
+    if (lk_log_ok64(LK_LOG_LOCK)) {
+        dbg64_line_begin64();
+        dbg64_str("[LOCK64] lock repaint immediate full rect=");
+        dbg64_dec((uint64_t)fb_width());
+        dbg64_str("x");
+        dbg64_dec((uint64_t)fb_height());
+        dbg64_str(" blur=");
+        dbg64_dec((uint64_t)(g_blur_cur * LOCKLOGIN_BLUR_PX / 256));
+        dbg64_str("/");
+        dbg64_dec((uint64_t)LOCKLOGIN_BLUR_PX);
+        dbg64_str(" (no 300ms wait; desktop layer skipped this frame)\n");
+        dbg64_line_end64();
+    }
 }
 
 void locklogin64_init64() {
