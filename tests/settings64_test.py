@@ -44,7 +44,15 @@ import fs_tree_test as fst        # noqa: E402 （Python 侧 v3 卷夹具 + QEMU
 import proc64_test as p64         # noqa: E402 （find_qemu）
 
 FORBIDDEN = ("PANIC", "TRIPLE FAULT", "FAILED mask=", "selftest FAIL", "OOM:")
-SENS = 1.7                        # kernel/input.cpp：鼠标灵敏度 ×1.7
+# 鼠标（宿主位移 -> 客人位移）的口径常量：三个都由**内核源码**决定，不在这里调松
+#   DRIVER_GAIN = 17/10  （kernel/input.cpp：每包位移 ×17/10，**整数截断**）
+#   SENS_BASE   = 1700‰  （kernel/gui64.cpp：灵敏度缩放基线；==1700 时整条路径 off）
+#   SENS_TARGET = 1000   （文档语义：客人位移/宿主计数 = sens/1000）
+# 修后语义（按本批修复后的 kernel/gui64.cpp）：客人位移 = 驱动步进 × sens/1700，缩放只作用在
+#   一次位移增量上（余数留到下一帧）——1700 档例外（路径 off，逐字节同旧行为）。
+SENS_DRIVER_NUM, SENS_DRIVER_DEN = 17, 10
+SENS_BASE = 1700
+SENS = SENS_DRIVER_NUM / SENS_DRIVER_DEN   # 1.7 = 基线档实测的"宿主计数 -> 驱动像素"增益
 
 def build64_version():
     """版本号唯一真源：build64.sh 里的 VIMTUOS_VERSION（发布时只改那一处）。"""
@@ -265,11 +273,34 @@ def shift_rate(pa, pb, w, rect, dx, dy, thr=16):
 
 
 # ---------------------------------------------------------------------------
-# 鼠标（QEMU monitor 的 mouse_move 是相对量；内核 ×1.7 且每包最多 24px）
+# 鼠标（QEMU monitor 的 mouse_move 是相对量；驱动 ×1.7 且每包最多 24px；
+#       sens != 1700 时外壳再按 sens/1700 缩放**一次**，见 kernel/gui64.cpp）
 # ---------------------------------------------------------------------------
 class Cursor:
-    def __init__(self, x=512, y=384):        # = kernel/input.cpp mouse_init()
+    def __init__(self, x=512, y=384, sens=SENS_BASE):   # = kernel/input.cpp mouse_init()
         self.x, self.y = x, y
+        self.sens = sens
+        self.rem_x, self.rem_y = 0, 0
+
+    def set_sens(self, sens):
+        """同步 mouse.sens 变更：gui64 会把缩放余数与基准一起重置（kernel/gui64.cpp）。"""
+        self.sens = sens
+        self.rem_x, self.rem_y = 0, 0
+
+    def _scale(self, d, axis):
+        """gui64 的线性缩放：一次位移增量 ×sens/1700，余数留到下一帧（与内核同语义：
+        int 除法向零截断；sens == 1700 时内核整条路径直接返回）。"""
+        if self.sens == SENS_BASE:
+            return d
+        if axis == 0:
+            self.rem_x += d * self.sens
+            s = int(self.rem_x / SENS_BASE)
+            self.rem_x -= s * SENS_BASE
+        else:
+            self.rem_y += d * self.sens
+            s = int(self.rem_y / SENS_BASE)
+            self.rem_y -= s * SENS_BASE
+        return s
 
     def _step(self, mon, px, py, wait):
         cx = max(-14, min(14, int(px / SENS)))
@@ -277,8 +308,10 @@ class Cursor:
         if cx == 0 and cy == 0:
             return False
         mon.send("mouse_move %d %d" % (cx, cy), wait=wait)
-        self.x = max(0, min(1279, self.x + int(cx * 17 / 10)))
-        self.y = max(0, min(799, self.y + int(cy * 17 / 10)))
+        dx = self._scale(int(cx * SENS_DRIVER_NUM / SENS_DRIVER_DEN), 0)
+        dy = self._scale(int(cy * SENS_DRIVER_NUM / SENS_DRIVER_DEN), 1)
+        self.x = max(0, min(1279, self.x + dx))
+        self.y = max(0, min(799, self.y + dy))
         return True
 
     def goto(self, mon, tx, ty, wait=0.10):

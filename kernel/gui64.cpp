@@ -238,24 +238,51 @@ static void log_win_geom64(const Window* win, const char* tag);
 static bool g_text_mirror = false;      // ui.text_mirror：外壳 TrueType 文本水平镜像
 static int  g_mouse_sens = 1700;        // mouse.sens（千分比）：1700 = 驱动基线（默认不变）
 static bool g_mouse_sens_off = false;   // sens != 1700 才启用缩放（默认路径零行为变化）
-static int  g_sens_base_x = -1, g_sens_base_y = -1;   // 上一次看到的驱动位置
+static int  g_sens_base_x = -1, g_sens_base_y = -1;   // 上一次**写回驱动**的值（= g_sens_virt_*）
 static int  g_sens_rem_x = 0, g_sens_rem_y = 0;       // 缩放余数（避免整数除法丢位移）
+static int  g_sens_virt_x = 0, g_sens_virt_y = 0;     // 客人侧虚拟光标（缩放后的唯一真源）
 
-// 鼠标灵敏度：把驱动**本帧位移**按 sens/1700 缩放后写回驱动（绝对值写回，驱动的内部累加器不受影响）。
-// sens == 1700 时整个函数直接返回 —— 默认行为与改动前完全一致（既有鼠标验收不受影响）。
+// 鼠标灵敏度：把驱动**自上次写回以来累积的位移**按 sens/1700 缩放**恰好一次**，写回客人侧虚拟光标。
+// ★ 修复（非线性 / 二次缩放；实测 1700→1.600、800→1.040、1500→1.420、2500→3.010 px/宿主计数，
+//   而线性语义应为 sens/1000）：根因 = 基准取的是"从驱动**读回**的值"（旧代码 g_sens_base_x = rx）。
+//   驱动位置里已经含了上一帧写回去的缩放值，于是 dx = rx_new - rx_old 把上一帧的缩放残差当成
+//   **新位移**又缩放一次 —— 每步等效增益变成 1.6*(1-κ+κ²)（κ = sens/1700），κ 越大越离谱
+//   （2500 档实测 +20%）。
+//   修法：基准只认"我们**写回去**的值"（= virt）——于是 dx 恒等于驱动这段时间累积的**纯宿主位移**，
+//   缩放恰好一次 -> 比值 = 1.6 × sens/1700（1.6 而非 1.7 是 input.cpp 每包 `dx*17/10` 的整数截断；
+//   实测表见 tests/mouseperf64_test.py 的四档）。
+// sens == 1700 时整个函数直接返回 —— 默认路径与改动前逐字节一致（既有鼠标验收不受影响）。
 static void mouse_apply_sensitivity() {
     if (!g_mouse_sens_off) return;
     const int rx = mouse_get_x(), ry = mouse_get_y();
-    if (g_sens_base_x < 0) { g_sens_base_x = rx; g_sens_base_y = ry; return; }
-    const int dx = rx - g_sens_base_x, dy = ry - g_sens_base_y;
+    if (g_sens_base_x < 0) {                    // 首次（含刚改完 sens）：只建立基准，不动光标
+        g_sens_base_x = rx; g_sens_base_y = ry;
+        g_sens_virt_x = rx; g_sens_virt_y = ry;
+        return;
+    }
+    const int dx = rx - g_sens_base_x, dy = ry - g_sens_base_y;   // 纯宿主位移（自上次写回起）
     if (!dx && !dy) return;
-    g_sens_base_x = rx; g_sens_base_y = ry;
     g_sens_rem_x += dx * g_mouse_sens;
     g_sens_rem_y += dy * g_mouse_sens;
     const int sx = g_sens_rem_x / 1700, sy = g_sens_rem_y / 1700;
     g_sens_rem_x -= sx * 1700;
     g_sens_rem_y -= sy * 1700;
-    if (sx || sy) mouse_set_pos(rx - dx + sx, ry - dy + sy);
+    if (!sx && !sy) return;                     // 不足 1px：留在余数里，基准不动（下次接着算）
+    g_sens_virt_x += sx;
+    g_sens_virt_y += sy;
+    // 与驱动同一个边界（input.cpp 每包把位置钳在 [0, w-1]）：不钳的话 virt 会跑到屏外，
+    // 下一帧 dx 变成负数（幻影回移）—— 光标会贴边抖。
+    if (g_screen_w > 1) {
+        if (g_sens_virt_x < 0) g_sens_virt_x = 0;
+        else if (g_sens_virt_x > g_screen_w - 1) g_sens_virt_x = g_screen_w - 1;
+    }
+    if (g_screen_h > 1) {
+        if (g_sens_virt_y < 0) g_sens_virt_y = 0;
+        else if (g_sens_virt_y > g_screen_h - 1) g_sens_virt_y = g_screen_h - 1;
+    }
+    mouse_set_pos(g_sens_virt_x, g_sens_virt_y);
+    g_sens_base_x = g_sens_virt_x;              // ★ 基准 = 写回值（不是读回值 rx）
+    g_sens_base_y = g_sens_virt_y;
 }
 
 // ★ 修复（④）：灵敏度改动的**运行期生效**入口。设置应用改滑轨时调它 —— 一次搞定三件事：
@@ -266,7 +293,8 @@ void gui64_set_mouse_sens64(int permille) {
     cfg64_set_mouse_sens64(permille);                 // 钳制 800..2500 并落 store（持久化）
     g_mouse_sens = cfg64_mouse_sens64();              // 以配置里的最终值为准
     g_mouse_sens_off = (g_mouse_sens != 1700);
-    g_sens_base_x = g_sens_base_y = -1;
+    g_sens_base_x = g_sens_base_y = -1;              // -1 = 下一帧重建基准（virt 也跟着重取）
+    g_sens_virt_x = g_sens_virt_y = 0;
     g_sens_rem_x = g_sens_rem_y = 0;
     dbg64_line_begin64();
     dbg64_str("[CONF64] mouse sens set to=");

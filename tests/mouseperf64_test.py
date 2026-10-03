@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""⑤ P7a-14 取证（鼠标 / 重绘性能 + 灵敏度三档）—— QEMU，真 PS/2 注入 + 真串口打点。
+"""⑤ P7a-14 取证（鼠标 / 重绘性能 + 灵敏度四档线性）—— QEMU，真 PS/2 注入 + 真串口打点。
 
 量什么（全部来自内核自己的打点，不是宿主侧推测）：
   1) 每秒鼠标**报告**数        `[UI] perf sec=N ev=<k>/s`（input.cpp 每收一份报告置一次标志）
   2) 每次移动的重绘耗时 us/tick `redraw_us=`（render() 的 TSC 周期 / 本秒实测 TSC 频率）
   3) 整屏重绘比例              `full=<n>/<rn> full_pct=`（脏矩形 >= 90% 屏面积的帧占比）
-  4) 灵敏度 800/1500/2500‰      `cur=x,y` 前后差 = 客人位移；宿主位移由本脚本注入的
+  4) 灵敏度 1700/800/1500/2500‰  `cur=x,y` 前后差 = 客人位移；宿主位移由本脚本注入的
                                `mouse_move 5 0` × N 精确已知（N×5 个宿主计数）
-驱动基线的理论关系：客人位移/宿主计数 = 1.7(驱动 ×17/10) × sens/1700 = sens/1000。
+线性关系（修后）：客人位移/宿主计数 = 1.6 × sens/1700 = sens/1062.5（目标 sens/1000，恒 -5.9%）；
+  1.6 而不是 1.7 是 input.cpp 每包 `dx*17/10` 的整数截断（宿主 5 计数/包 -> 驱动 8px/包）。
+  修前那条非线性（缩放残差被二次缩放）的实测四档表见 docs/项目状态总览.md。
 
 为什么可信：注入是 QEMU monitor 的真 PS/2 包；客人位移取自内核每帧记录的指针位置；
 灵敏度用**文档里的终端命令** `cfg set mouse.sens <n>` 改（gui64 每秒比对 config64 -> 运行期生效）。
@@ -115,23 +117,29 @@ def main():
             check("静止基线：鼠标报告率低（ev=%d/s，未注入时不应有持续事件流）" % b["ev"],
                   b["ev"] < 120, "ev=%d/s" % b["ev"])
 
-        # ---- 灵敏度三档：宿主位移 -> 客人位移 ----
-        # 理论（见报告）：驱动基线 ×1.7（17/10）。**但 kernel/gui64.cpp 的灵敏度缩放是把缩放后的位置
-        # 写回驱动**，于是"上一帧缩放残差"会被下一帧当成新位移再缩放一次 —— 实测每 8px 的驱动步进
-        # 净走 8*(1-κ+κ²) px（κ = sens/1700：
-        #   κ=1(1700) -> 8px/步 = 1.60 px/宿主计数；κ=0.47(800) -> 6.0px/步 = 1.20；
-        #   κ=0.88(1500) -> 7.17px/步 = 1.434；κ=1.47(2500) -> 13.5px/步 = 2.71）。
-        # 这就是"实测比 != sens/1000"的原因：**它是内核现在的真实行为**，本脚本如实测出来，
-        # 并按 1.6*(1-κ+κ²) 这条模型给 ±35% 的带宽（不是把断言放水到无意义）。
+        # ---- 灵敏度四档：宿主位移 -> 客人位移 ----
+        # 修后语义（kernel/gui64.cpp 的 mouse_apply_sensitivity）：缩放只作用在**一次位移增量**上，
+        #   且基准取"我们**写回**驱动的值"（virt）而不是"从驱动**读回**的值"（rx）—— 于是
+        #   dx 恒等于驱动自上次写回以来累积的**纯宿主位移**，缩放恰好一次。
+        # 修前（本次修掉的真缺陷）：基准取读回值 -> 上一帧写回去的缩放残差被下一帧当成新位移
+        #   再缩放一次，每步等效增益 1.6*(1-κ+κ²)（κ = sens/1700）—— 实测 1700→1.600、
+        #   800→1.040、1500→1.420、2500→3.010 px/宿主计数（修前/修后四档表见
+        #   docs/项目状态总览.md）。
+        # 线性关系：客人位移/宿主计数 = 1.6 × sens/1700 = sens/1062.5 —— 目标就是文档语义的
+        #   sens/1000，差恒为 -5.9%（1.6 而非 1.7 是 input.cpp 每包 `dx*17/10` 的整数截断：
+        #   宿主 5 计数/包 -> 驱动 8px/包，8.5 被截成 8），所以判据取 **sens/1000 的 ±10%**
+        #   （比修前"按 1.6*(1-κ+κ²) 给 ±35%"紧得多）。
         def model_ratio(sens):
-            kappa = sens / 1700.0
-            return 1.6 * (1.0 - kappa + kappa * kappa)
+            return 1.6 * (sens / 1700.0)          # 精确模型：含驱动侧整数截断的线性关系
+
+        def target_ratio(sens):
+            return sens / 1000.0                  # 文档语义（驱动基线 ×1.7）
 
         L("")
         L("--- 灵敏度实测：每档注入 %d 包 × %d 宿主计数 = %d 宿主计数，读内核记录的前后指针位置 ---"
           % (args.packets, args.host_px, args.packets * args.host_px))
-        L("%-10s %-14s %-12s %-14s %-12s %-14s %s"
-          % ("sens(‰)", "模型比", "宿主位移", "客人位移实测", "实测比", "该秒 rn", "该秒 redraw_us"))
+        L("%-10s %-12s %-12s %-12s %-14s %-12s %s"
+          % ("sens(‰)", "目标比", "精确模型", "宿主位移", "客人位移实测", "实测比", "该秒 rn"))
         ratios = {}
         for sens in (1700, 800, 1500, 2500):
             nm = len(vm.log())
@@ -168,30 +176,34 @@ def main():
             ratio = guest / float(host)
             ratios[sens] = ratio
             move_secs = [perf_dict(g) for g in post[len(pre):]]
-            L("%-10d %-14.3f %-12d %-14d %-12.3f %-14s %s"
-              % (sens, model_ratio(sens), host, guest, ratio,
-                 [m["rn"] for m in move_secs], [m["us"] for m in move_secs]))
-            if sens == 1700:
-                check("★ 基线 sens=1700‰（驱动基线 ×1.7）：%d 宿主计数 -> %d 客人像素"
-                      "（模型 %.1f，±25%%）" % (host, guest, host * model_ratio(1700)),
-                      abs(guest - host * model_ratio(1700)) <= 0.25 * host * model_ratio(1700),
-                      "guest=%d 期望=%.1f" % (guest, host * model_ratio(1700)))
-            else:
-                check("★ sens=%d‰：%d 宿主计数 -> 客人 %d px（实测比 %.3f，模型 %.3f，±35%%）"
-                      % (sens, host, guest, ratio, model_ratio(sens)),
-                      guest > 0 and abs(ratio - model_ratio(sens)) <= 0.35 * model_ratio(sens),
-                      "ratio=%.3f 模型=%.3f" % (ratio, model_ratio(sens)))
+            L("%-10d %-12.3f %-12.3f %-12d %-14d %-12.3f %s"
+              % (sens, target_ratio(sens), model_ratio(sens), host, guest, ratio,
+                 [m["rn"] for m in move_secs]))
+            # 判据：实测比落在 **sens/1000 的 ±10%**（修前那条 1.6*(1-κ+κ²) 的 ±35% 宽容带已删掉 ——
+            # 修完是线性关系，不需要宽带了）。sens=1700 也走同一条判据（它是"灵敏度路径 off"的对照档，
+            # 目标同样是 1.7，实测恒为 1.600 = 驱动侧整数截断）。
+            check("★ sens=%d‰：%d 宿主计数 -> 客人 %d px（实测比 %.3f；目标 %.3f = sens/1000；"
+                  "精确模型 %.3f = 1.6×sens/1700；带宽 ±10%%）"
+                  % (sens, host, guest, ratio, target_ratio(sens), model_ratio(sens)),
+                  guest > 0 and abs(ratio - target_ratio(sens)) <= 0.10 * target_ratio(sens),
+                  "ratio=%.3f 目标=%.3f 期望区间=[%.1f, %.1f]"
+                  % (ratio, target_ratio(sens), 0.9 * host * target_ratio(sens),
+                     1.1 * host * target_ratio(sens)))
             check("sens=%d‰：该秒确实重绘了（rn>=1）" % sens,
                   bool(move_secs) and any(m["rn"] >= 1 for m in move_secs),
                   "rn=%s redraw_us=%s" % ([m["rn"] for m in move_secs], [m["us"] for m in move_secs]))
 
-        if all(s in ratios for s in (800, 1500, 2500)):
-            check("★ 三档灵敏度严格单调：800 < 1500 < 2500（%.3f < %.3f < %.3f px/宿主计数）"
-                  % (ratios[800], ratios[1500], ratios[2500]),
-                  ratios[800] < ratios[1500] < ratios[2500])
-            check("★ 三档与 1700 基线同向：800 < 1700 < 2500（%.3f < %.3f < %.3f）"
-                  % (ratios[800], ratios[1700], ratios[2500]),
-                  ratios[800] < ratios[1700] < ratios[2500])
+        if all(s in ratios for s in (800, 1500, 1700, 2500)):
+            check("★ 四档灵敏度严格单调：800 < 1500 < 1700 < 2500"
+                  "（%.3f < %.3f < %.3f < %.3f px/宿主计数）"
+                  % (ratios[800], ratios[1500], ratios[1700], ratios[2500]),
+                  ratios[800] < ratios[1500] < ratios[1700] < ratios[2500])
+            # 线性度（修前这条必红）：四档实测比与 sens/1000 的**比例**都应 ≈ 0.941（=1.6/1.7）
+            ks = [ratios[s] / target_ratio(s) for s in (1700, 800, 1500, 2500)]
+            check("★ 四档线性度：每档 实测比/(sens/1000) 都落在 [0.90, 0.98]（实测 %s；"
+                  "理论 0.941 = 驱动侧 ×17/10 的整数截断）"
+                  % ["%.3f" % k for k in ks],
+                  all(0.90 <= k <= 0.98 for k in ks))
         # ---- 移动风暴：连续注入，量"每秒事件数 / 每帧重绘耗时 / 整屏重绘占比" ----
         L("")
         L("--- 移动风暴：连续左右各 150 包（约 6s），取风暴窗口里的每秒打点 ---")
