@@ -306,15 +306,30 @@ static void log_num(const char* k, uint64_t v) { dbg64_str(k); dbg64_dec(v); dbg
 
 // ==================== Token 取值（唯一视觉来源） ====================
 static const Theme64Tokens* tk64() { return theme64_tokens64(); }
-static void ui_text(int x, int y, const char* s, uint32_t c) { p2ui_text64(x, y, s, c); }
+// ★ 修复（P7a-②「窗口内容不随窗口移动」）：页面/导航的绘制一律用**客户区局部坐标**
+//   （card_x / 导航条目 / 各控件都是从 (0,0) = 客户区左上角算起的），下面这几个绘制入口
+//   负责把局部坐标平移成屏幕绝对坐标。历史缺陷：page_* 与 draw_nav 的条目把局部坐标
+//   **当绝对坐标直接落笔** —— 窗口一动（只有 x/y 变、客户区尺寸没变）窗框跟着走、
+//   内容却钉在原来的屏幕坐标上，还被新客户区的裁剪矩形切掉一截，正是用户看到的
+//   "内容不随窗口移动 / 与窗框错位"。
+//   取值只在"画导航条目 + 画页面"期间非 0（见 set_draw）；客户区底、导航亚克力底、
+//   1px 分隔线、消息行、帧尾淡入这些本来就用绝对坐标，g_po_* = 0 时与修复前逐像素一致。
+static int g_po_x = 0, g_po_y = 0;               // 页面/导航局部坐标 -> 屏幕坐标的原点
+static inline int UIX(int x) { return x + g_po_x; }
+static inline int UIY(int y) { return y + g_po_y; }
+static void ui_text(int x, int y, const char* s, uint32_t c) { p2ui_text64(UIX(x), UIY(y), s, c); }
 static int  ui_w(const char* s) { return p2ui_text_w64(s); }
 static int  ui_h() { return p2ui_line_h64(); }
 static int  centered_x(int w, const char* s) { int tx = (w - ui_w(s)) / 2; return tx < 0 ? 0 : tx; }
-static void fill_r(int x, int y, int w, int h, int r, uint32_t c, int a) { gfx64_fill_round64(x, y, w, h, r, c, a); }
-static void stroke_r(int x, int y, int w, int h, int r, uint32_t c, int a) { gfx64_stroke_round64(x, y, w, h, r, c, a); }
+static void fill_r(int x, int y, int w, int h, int r, uint32_t c, int a) {
+    gfx64_fill_round64(UIX(x), UIY(y), w, h, r, c, a);
+}
+static void stroke_r(int x, int y, int w, int h, int r, uint32_t c, int a) {
+    gfx64_stroke_round64(UIX(x), UIY(y), w, h, r, c, a);
+}
 static void divider(int x, int y, int w) {
     const Theme64Tokens* t = tk64();
-    for (int i = 0; i < w; i++) gfx64_blend64(x + i, y, t->text_dim, 70);
+    for (int i = 0; i < w; i++) gfx64_blend64(UIX(x + i), UIY(y), t->text_dim, 70);
 }
 // 卡片：双层浅阴影（Token）+ 卡片透明度（Token A_CARD）+ 圆角（Token R_CARD）+ 1px 玻璃高光边。
 // ★ 性能硬约束（实测）：这里**不能**用 gfx64_glass64(layer=1) 那种"内容层逐像素毛玻璃"——
@@ -323,9 +338,9 @@ static void divider(int x, int y, int w) {
 //   所以卡片 = Token 的半透明填充 + 阴影 + 高光边（视觉上就是 Win11 的卡片；透明度/圆角/阴影全部走 Token）。
 static void card_rect(int x, int y, int w, int h) {
     const Theme64Tokens* t = tk64();
-    p2ui_shadow64(x, y, w, h, THEME64_R_CARD, t);
-    gfx64_fill_round64(x, y, w, h, THEME64_R_CARD, t->dark ? t->title_bg : 0xFFFFFFu, THEME64_A_CARD);
-    p2ui_stroke_mixed64(x, y, w, h, THEME64_R_CARD, THEME64_R_CARD,
+    p2ui_shadow64(UIX(x), UIY(y), w, h, THEME64_R_CARD, t);
+    gfx64_fill_round64(UIX(x), UIY(y), w, h, THEME64_R_CARD, t->dark ? t->title_bg : 0xFFFFFFu, THEME64_A_CARD);
+    p2ui_stroke_mixed64(UIX(x), UIY(y), w, h, THEME64_R_CARD, THEME64_R_CARD,
                         t->dark ? t->highlight : 0xFFFFFFu, THEME64_A_EDGE);
 }
 static bool hit(int x, int y, int w, int h, int px, int py) {
@@ -464,8 +479,8 @@ static void draw_switch(int x, int y, int on, bool hov, bool press) {
     if (press) { fill_r(x, y, w, h, r, press_tint(), 40); }
     const int kd = 16;
     const int kx = on ? (x + w - kd - 3) : (x + 3);
-    p2ui_fill_circle64(kx + kd / 2, y + h / 2, kd / 2, 0xFFFFFFu, 255);
-    p2ui_ring64(kx + kd / 2, y + h / 2, kd / 2, 1, t->win_frame, 120);
+    p2ui_fill_circle64(UIX(kx + kd / 2), UIY(y + h / 2), kd / 2, 0xFFFFFFu, 255);
+    p2ui_ring64(UIX(kx + kd / 2), UIY(y + h / 2), kd / 2, 1, t->win_frame, 120);
 }
 
 static void draw_button(int x, int y, int w, int h, const char* label, int style,
@@ -498,9 +513,9 @@ static void draw_slider(const Lay* L, int x, int y, int w, int v, int vmax, bool
     if (fw > 0) fill_r(x, cy - th / 2, fw, th, th / 2, t->accent, 255);      // 已选部分 = 强调色
     // 左小右大（Token 语义）：这里是直线轨道，粗细随值微调以体现"填充"
     const int kx = x + fw - kd / 2;
-    p2ui_fill_circle64(kx + (fw > 0 ? kd / 2 : kd / 2), cy, kd / 2 + (press ? 1 : 0),
+    p2ui_fill_circle64(UIX(kx + (fw > 0 ? kd / 2 : kd / 2)), UIY(cy), kd / 2 + (press ? 1 : 0),
                        press ? t->accent2 : t->accent, 255);
-    if (hov || press) p2ui_ring64(kx + kd / 2, cy, kd / 2 + 2, 1, t->accent, 120);
+    if (hov || press) p2ui_ring64(UIX(kx + kd / 2), UIY(cy), kd / 2 + 2, 1, t->accent, 120);
 }
 
 static void draw_field(int x, int y, int w, int h, const char* text, bool focused, bool hov) {
@@ -546,7 +561,7 @@ static void draw_drop(const Lay* L, int x, int y, int w, int h, const char* text
     if (g_press == CID_RES_DROP) fill_r(x, y, w, h, r, press_tint(), 45);
     stroke_r(x, y, w, h, r, open ? t->accent : t->win_frame, open ? 220 : THEME64_A_BORDER);
     ui_text(x + 10, y + (h - ui_h()) / 2, text, t->text);
-    for (int i = 0; i < 5; i++) fb_draw_hline(x + w - 20 - 4 + i, y + h / 2 - 2 + i, 9 - i * 2, t->text_dim);
+    for (int i = 0; i < 5; i++) fb_draw_hline(UIX(x + w - 20 - 4 + i), UIY(y + h / 2 - 2 + i), 9 - i * 2, t->text_dim);
     if (!open || g_drop != DROP_RES) return;
     // 展开列表：落在卡片内（下方优先）
     const int ih = 26;
@@ -581,7 +596,7 @@ static void draw_theme_tile(int x, int y, int w, int h, int theme_id) {
     if (hov && !sel) fill_r(x - 2, y - 2, w + 4, h + 4, THEME64_R_CARD + 2, t->sel_bg, 120);
     if (g_press == id) fill_r(x - 2, y - 2, w + 4, h + 4, THEME64_R_CARD + 2, press_tint(), 55);
     // 迷你窗口：壁纸渐变（当前主题 token 的 wall_a/wall_b —— 每个主题一组，切换后整片都变）
-    gfx64_grad_round64(x, y, w, h - 20, THEME64_R_CARD, t->wall_a, t->wall_b, 0, 255);
+    gfx64_grad_round64(UIX(x), UIY(y), w, h - 20, THEME64_R_CARD, t->wall_a, t->wall_b, 0, 255);
     // 标题栏条 + 客户区
     fill_r(x + 4, y + 4, w - 8, 12, 4, t->title_bg, 230);
     fill_r(x + 8, y + 20, w - 16, h - 44, 6, t->client_bg, 230);
@@ -592,11 +607,11 @@ static void draw_theme_tile(int x, int y, int w, int h, int theme_id) {
 static void draw_avatar(int cx, int cy, int d, int kind, bool sel, int cid) {
     const Theme64Tokens* t = tk64();
     const uint32_t base = (kind == 0) ? t->accent : (kind == 1 ? t->accent2 : t->grad_a);
-    if (sel) p2ui_fill_circle64(cx, cy, d / 2 + 4, t->accent, 110);
-    if (g_hover == cid) p2ui_ring64(cx, cy, d / 2 + 2, 2, t->accent, 160);
-    if (g_press == cid) p2ui_fill_circle64(cx, cy, d / 2, press_tint(), 40);
-    p2ui_fill_circle64(cx, cy, d / 2, base, 255);
-    p2ui_icon64(P2UI_ICON_PERSON, cx - d * 22 / 100, cy - d * 20 / 100, d * 44 / 100, 0xFFFFFFu, 235);
+    if (sel) p2ui_fill_circle64(UIX(cx), UIY(cy), d / 2 + 4, t->accent, 110);
+    if (g_hover == cid) p2ui_ring64(UIX(cx), UIY(cy), d / 2 + 2, 2, t->accent, 160);
+    if (g_press == cid) p2ui_fill_circle64(UIX(cx), UIY(cy), d / 2, press_tint(), 40);
+    p2ui_fill_circle64(UIX(cx), UIY(cy), d / 2, base, 255);
+    p2ui_icon64(P2UI_ICON_PERSON, UIX(cx - d * 22 / 100), UIY(cy - d * 20 / 100), d * 44 / 100, 0xFFFFFFu, 235);
 }
 
 // ==================== 分辨率 / 缩放（保留既有真行为） ====================
@@ -1178,9 +1193,11 @@ static void draw_nav(const Lay* L, int x0, int y0) {
 static void page_title(const Lay* L, int x0, int y0, const char* title, const char* sub) {
     const Theme64Tokens* t = tk64();
     (void)L;
+    // ★ 本函数收的是**屏幕绝对坐标**（page_* 调用处传 x0 + L->cx），所以这里不能走会加
+    //   客户区原点的 fill_r，直接用底层圆角填充。
     p2ui_text64(x0, y0 + 14, title, t->text);
     // 标题行 + 主题强调色下划（用 Token 圆角/透明度画一条短装饰）
-    fill_r(x0, y0 + 34, 42, 3, 2, t->accent, 255);
+    gfx64_fill_round64(x0, y0 + 34, 42, 3, 2, t->accent, 255);
     if (sub) p2ui_text64(x0 + 54, y0 + 16, sub, t->text_dim);
 }
 // 卡片起止：返回卡内第一行的 y（客户区局部）
@@ -1676,7 +1693,7 @@ static void page_color(const Lay* L, int x0, int y0) {
     const int pw = L->card_w - 32 - 150, ph = 40;
     const int px = L->card_x + 16, py = ry + 26;
     if (py + ph < y + c1h) {
-        gfx64_grad_round64(px, py, pw, ph, THEME64_R_BUTTON, va, vb, 1, 255);
+        gfx64_grad_round64(UIX(px), UIY(py), pw, ph, THEME64_R_BUTTON, va, vb, 1, 255);
         stroke_r(px, py, pw, ph, THEME64_R_BUTTON, t->win_frame, THEME64_A_BORDER);
         const int bw = 140, bh = 32;
         const int bx = L->card_x + L->card_w - 16 - bw;
@@ -2293,11 +2310,13 @@ static void page_about(const Lay* L, int x0, int y0) {
                zh ? "版本 / 驱动 / GPU 加速状态" : "version / drivers / GPU");
     if (g_hw_view) {
         // 内嵌硬件检查报告（与启动期那一页同一份 hwui64 内容）
-        const int px = x0 + L->card_x, py = y0 + L->card_y;
+        // ★ 局部坐标（和其它页一致）：draw_button 会自动加客户区原点；
+        //   hwui64_draw64 是外部渲染器、只吃绝对坐标，所以那里用 UIX/UIY 转一次。
+        const int px = L->card_x, py = L->card_y;
         const int pw = L->card_w, ph = L->ch - L->card_y - 52;
         const int n = hwui64_build64();
         const int back_w = 120, back_h = 30;
-        (void)hwui64_draw64(px + 8, py, pw - 16, ph - back_h - 8, 0);
+        (void)hwui64_draw64(UIX(px + 8), UIY(py), pw - 16, ph - back_h - 8, 0);
         const int bxx = px + pw - back_w - 10;
         const int byy = py + ph - back_h - 2;
         draw_button(bxx, byy, back_w, back_h, zh ? "返回" : "Back", 0, g_hover == CID_HW_BACK, g_press == CID_HW_BACK);
@@ -2537,9 +2556,13 @@ static void set_draw(Window* w) {
     //     应用内容被抹成纯色 —— 与 gui64 的脏矩形不清一起构成"应用窗口内容丢失"的两个成因）
     g_cl_x = x0;
     g_cl_y = y0;
-    // 客户区底：主题客户区底色（Token）；卡片再叠亚克力
+    // ★ 修复（P7a-②「窗口内容不随窗口移动」）：从这里到页面画完，g_po_* = 客户区原点；
+    //   页面/导航条目用的是**客户区局部坐标**，由 ui_text/fill_r/stroke_r/card_rect/divider
+    //   等绘制入口加上原点。窗口移动（尺寸不变）时 x0/y0 变、内容因此和窗框同步；
+    //   客户区底/导航亚克力底/1px 分隔线本来就用绝对坐标，不受影响。
+    g_po_x = x0;
+    g_po_y = y0;
     fb_fill_rect(x0, y0, cw, ch, t->client_bg);
-    // 左导航（亚克力）
     draw_nav(&L, x0, y0);
     // 右侧内容（带切页动效：位移 + 淡入）
     ctl_reset();
@@ -2550,7 +2573,9 @@ static void set_draw(Window* w) {
     {
         // 裁剪在动效期间只允许内容区重绘（避免位移画到导航上）
         fb_set_clip(ax, y0, aw, ch);
-        draw_page(&L, ax, y0 + dy);
+        draw_page(&L, x0, y0 + dy);
+        g_po_x = 0;                  // ★ 回到绝对坐标（取样打点/消息行/淡入都用绝对坐标）
+        g_po_y = 0;
         fb_set_clip(x0, y0, cw, ch);
         // 内容区绝对矩形（自动化按它裁剪像素比较；也是"切页后右侧内容变了"的取样区）。
         // 去重：同一页同一矩形只打一次（悬停/动效会重绘很多帧，不能每帧都写串口）。

@@ -120,6 +120,26 @@ def lum(c):
     return 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
 
 
+
+def view_origin(log, nav_w):
+    """最后一次 [SET64] view 行 -> 客户区原点的绝对坐标（窗口每移动一次都会重打一行）。"""
+    m = last(r"\[SET64\] view page=\d+ name=\S+ x=(\d+) y=(\d+)", log)
+    return (int(m.group(1)) - nav_w, int(m.group(2))) if m else None
+
+
+def drag_once(vm, x, y, dx, dy):
+    """按住标题栏拖 (dx,dy)。QEMU 的 PS/2 队列偶发丢"按键包"（移动包到齐、按下没到 -> 窗口不动），
+    所以"按下"发两次（中间在标题栏原地点一下是幂等的，不改变任何状态）；调用方用串口/像素判断有没有生效。"""
+    vm.cur.goto(vm.mon, x, y)
+    time.sleep(0.5)
+    vm.mon.send("mouse_button 1", wait=0.30)
+    vm.mon.send("mouse_button 0", wait=0.30)
+    vm.mon.send("mouse_button 1", wait=0.30)
+    vm.cur.goto(vm.mon, x + dx, y + dy)
+    time.sleep(0.4)
+    vm.mon.send("mouse_button 0", wait=0.5)
+    time.sleep(1.0)
+
 def region_diff(px1, px2, w, rect, step=3, thr=10):
     """两块 PPM 在 rect=(x,y,w,h) 里有多少取样点差异 > thr。"""
     x, y, rw, rh = rect
@@ -175,6 +195,73 @@ def save_shot(mon, path, wait=2.2, settle=2.0):
             time.sleep(0.2)
         time.sleep(1.2)
     return out
+
+
+# ---------------------------------------------------------------------------
+# ★ 缺陷 P7a-②「窗口内容不随窗口移动」的逐像素判定工具
+# ---------------------------------------------------------------------------
+def red_blob(px, w, h):
+    """设置窗口标题栏右上角的「关闭」按钮 = 唯一的红色块（gui64 按 w->x/y 画窗框）。
+
+    返回 (x0, y0, x1, y1, n) 或 None；只取 y < 500 的红色像素（Dock 在屏底，先排掉），
+    再按 x 间隔 40px 切簇取像素最多的那一簇 —— 用它量**窗框实际位移**（不靠串口自报）。
+    """
+    pts = []
+    for y in range(40, min(h, 500)):
+        row = y * w
+        for x in range(150, w):
+            o = (row + x) * 3
+            if px[o] > 140 and px[o + 1] < 90 and px[o + 2] < 90:
+                pts.append((x, y))
+    if not pts:
+        return None
+    xs = sorted(set(p[0] for p in pts))
+    groups = []
+    cur = [xs[0]]
+    for x in xs[1:]:
+        if x - cur[-1] <= 40:
+            cur.append(x)
+        else:
+            groups.append(cur)
+            cur = [x]
+    groups.append(cur)
+    best = None
+    for g in groups:
+        sel = [p for p in pts if g[0] <= p[0] <= g[-1]]
+        if best is None or len(sel) > best[4]:
+            best = (min(p[0] for p in sel), min(p[1] for p in sel),
+                    max(p[0] for p in sel), max(p[1] for p in sel), len(sel))
+    return best
+
+
+def shift_rate(pa, pb, w, rect, dx, dy, thr=16):
+    """A 的 rect 与 B 的同一矩形**平移 (dx,dy) 后**的逐像素一致率。
+
+    同时统计 A 侧「特征像素」（暗/彩色，即文字与控件）的一致率 —— 大片同色的客户区底色会把
+    总一致率抬得很高，特征像素一致率才真正证明"内容"跟着走了。
+    """
+    x0, y0, rw, rh = rect
+    tot = same = feat = fsame = 0
+    for y in range(y0, y0 + rh):
+        for x in range(x0, x0 + rw):
+            o = (y * w + x) * 3
+            c0 = (pa[o], pa[o + 1], pa[o + 2])
+            tot += 1
+            is_feat = ((c0[0] * 299 + c0[1] * 587 + c0[2] * 114) // 1000 < 170
+                       or max(c0) - min(c0) > 40)
+            bx, by = x + dx, y + dy
+            if bx < 0 or by < 0 or bx >= w:
+                continue
+            o2 = (by * w + bx) * 3
+            d = (abs(c0[0] - pb[o2]) + abs(c0[1] - pb[o2 + 1]) + abs(c0[2] - pb[o2 + 2]))
+            if d <= thr:
+                same += 1
+            if is_feat:
+                feat += 1
+                if d <= 24:
+                    fsame += 1
+    return dict(rate=same / tot if tot else 0.0,
+                feat_rate=fsame / feat if feat else 0.0, feat=feat, tot=tot)
 
 
 # ---------------------------------------------------------------------------
@@ -536,8 +623,13 @@ def main():
             d, tot = region_diff(px0, px1, w0, (v1["x"], v1["y"], v1["w"], v1["h"]))
             check("切页后右侧内容区确实变了（像素差 %d/%d 取样点）" % (d, tot), d > 40,
                   "rect=%d,%d %dx%d" % (v1["x"], v1["y"], v1["w"], v1["h"]))
-            nd, ntot = region_diff(px0, px1, w0, (0, v1["y"], 240, v1["h"] // 2))
-            check("左导航高亮跟着选中项走（导航区像素也变了 %d/%d）" % (nd, ntot), nd > 5, "")
+            # 左导航在**窗口内**（客户区左 240px）——[SET64] view 的 x = client_x + nav_w。
+            # 修复前导航条目被画在屏幕左上角（局部坐标当绝对坐标用），这里采样的正是那一块；
+            # 修复后必须按窗口内的导航矩形取样（同一断言，采样点落在真正的导航上）。
+            nav_x = v1["x"] - 240
+            nd, ntot = region_diff(px0, px1, w0, (nav_x, v1["y"], 240, v1["h"] // 2))
+            check("左导航高亮跟着选中项走（窗口内导航区像素也变了 %d/%d）" % (nd, ntot), nd > 5,
+                  "nav rect=(%d,%d) 240x%d" % (nav_x, v1["y"], v1["h"] // 2))
         else:
             check("切页像素对比（[SET64] view 矩形）", False, "缺 view 矩形/切页失败")
         click_ctl(vm, P_SOUND, CID_SND_VOL, checks, "第1遍-声音", frac=0.3, expect="[SET64] sound vol=")
@@ -744,6 +836,83 @@ def main():
             l1 = region_lum(pxaf, w0, DESK_STRIP)
             print("      [信息] 标题栏片 %d/%d；桌面片亮度 %.1f -> %.1f（如实记录，不作断言）"
                   % (d3, tot3, l0, l1))
+        # ---------- 7) ★ 缺陷 P7a-②：「窗口内容不随窗口移动」----------
+        # 用户口径：拖标题栏移动设置窗口时，内容留在旧坐标/与窗框错位。
+        # 判定：窗框位移用「关闭按钮红色块」的像素位移量（gui64 按 w->x/y 画窗框，不靠串口自报）；
+        #       内容位移用「A 客户区 vs B 客户区平移 (dx,dy)」的逐像素一致率 + 特征像素一致率。
+        #       修复前：内容位移=(0,0)（平移一致率约 0.86、特征一致率约 0.02）；修复后：== 窗框位移。
+        print("--- 7) ★ 拖标题栏移动设置窗口：内容位移必须 == 窗框位移（逐像素）---")
+        mv = last(r"\[SET64\] view page=\d+ name=\S+ x=(\d+) y=(\d+) w=(\d+) h=(\d+)", vm.log())
+        nvl = last(r"\[SET64\] layout client=\d+x\d+ nav=(\d+)", vm.log())
+        if mv and nvl:
+            nav_w = int(nvl.group(1))
+            cl_x, cl_y = int(mv.group(1)) - nav_w, int(mv.group(2))
+            cl_w, cl_h = nav_w + int(mv.group(3)), int(mv.group(4))
+            dxm, dym = 120, 60
+            # 先把指针停到标题栏（内容区不留 hover），抓 A 帧
+            vm.cur.goto(vm.mon, cl_x + 300, cl_y - 13)
+            time.sleep(1.0)
+            shot_m0 = save_shot(vm.mon, os.path.join(tmp, "move_before.ppm"))
+            _, _, pm0 = read_ppm(shot_m0)
+            b0 = red_blob(pm0, w0, h0)
+            # 拖动最多试 6 次：每次都用串口 [SET64] view 的客户区原点判断这次生效了多少（廉价、确定），
+            # 因为 QEMU 的 PS/2 队列偶发丢"按键包"（移动包都到了、按下那包没到 -> 窗口纹丝不动，实测 1/4 概率）。
+            # 抓取点 x 取窗口中部（标题栏整条都能拖，避开右侧三按钮）；y 从关闭按钮红色块反推（像素真值）。
+            got = [0, 0]
+            attempts = 0
+            while attempts < 6:
+                attempts += 1
+                o = view_origin(vm.log(), nav_w)
+                if not o:
+                    break
+                hy = (b0[1] + 5 + got[1]) if b0 else (o[1] - 13)
+                drag_once(vm, o[0] + 300, hy, dxm - got[0], dym - got[1])
+                o2 = view_origin(vm.log(), nav_w)
+                got = [o2[0] - cl_x, o2[1] - cl_y] if o2 else [0, 0]
+                print("      [信息] 第 %d 次拖动：窗口位移 = %d,%d（目标 %d,%d）"
+                      % (attempts, got[0], got[1], dxm, dym))
+                # 光标模型有 1~2px 量化误差：接近目标就停，别追死（追也追不到）
+                if abs(got[0] - dxm) <= 6 and abs(got[1] - dym) <= 4:
+                    break
+            shot_m1 = save_shot(vm.mon, os.path.join(tmp, "move_after.ppm"))
+            _, _, pm1 = read_ppm(shot_m1)
+            b1 = red_blob(pm1, w0, h0)
+            if b0 and b1:
+                fdx, fdy = b1[0] - b0[0], b1[1] - b0[1]
+                mv1 = last(r"\[SET64\] view page=\d+ name=\S+ x=(\d+) y=(\d+)", vm.log())
+                sdx = (int(mv1.group(1)) - nav_w) - cl_x if mv1 else None
+                sdy = int(mv1.group(2)) - cl_y if mv1 else None
+                print("      窗框位移(关闭按钮)=%d,%d  应用自报客户区原点位移=%s,%s" % (fdx, fdy, sdx, sdy))
+                moved = abs(fdx) >= 60 and abs(fdy) >= 30 and b0[4] == b1[4]
+                check("★ 拖标题栏后窗框真的移动了（关闭按钮 bbox 位移 %d,%d，红块 n=%d->%d）"
+                      % (fdx, fdy, b0[4], b1[4]), moved,
+                      "before=%s after=%s" % (b0[:4], b1[:4]))
+                # 内容区取样：A 客户区（底部留出 Dock 覆盖带 —— B 里那条带被 Dock 盖住，
+                # 与本缺陷无关；Dock 顶 = DOCK_STRIP[1]）。窗框没动时两条断言一律记 FAIL
+                # （否则 dx=dy=0 会拿同一帧自比、白过）。
+                rx, ry = cl_x + 2, cl_y + 2
+                rw_ = cl_w - 4
+                rh_ = min(cl_h - 4, max(120, DOCK_STRIP[1] - fdy - 4 - ry))
+                ms = shift_rate(pm0, pm1, w0, (rx, ry, rw_, rh_), fdx, fdy)
+                ss = shift_rate(pm0, pm1, w0, (rx, ry, rw_, rh_), 0, 0)
+                check("★ 移动后内容跟着窗框走（平移 %d,%d 一致率 %.4f >= 0.99，取样 %dx%d）"
+                      % (fdx, fdy, ms["rate"], rw_, rh_),
+                      moved and ms["rate"] >= 0.99,
+                      "不平移一致率（越大越像\"内容留在原地\"）=%.4f" % ss["rate"])
+                check("★ 移动后内容**特征**（文字/控件）也跟着走（一致率 %.4f >= 0.95，n=%d）"
+                      % (ms["feat_rate"], ms["feat"]),
+                      moved and ms["feat_rate"] >= 0.95,
+                      "特征像素不平移一致率=%.4f（修复前约 0.02）" % ss["feat_rate"])
+                # 拖回去（信息性，不断言；只让后续步骤回到原位置）
+                if moved:
+                    drag_once(vm, cl_x + 300 + fdx, b1[1] + 5, -fdx, -fdy)
+                    b2 = red_blob(read_ppm(save_shot(vm.mon, os.path.join(tmp, "move_back.ppm")))[2], w0, h0)
+                    print("      [信息] 拖回后关闭按钮 =%s（拖前 %s）" % (b2[:4] if b2 else None, b0[:4]))
+            else:
+                check("★ 移动判定：能定位设置窗口关闭按钮（红色块）", False,
+                      "before=%s after=%s" % (b0, b1))
+        else:
+            check("★ 移动判定：拿到 [SET64] view/layout 几何", False, "view=%s layout=%s" % (mv, nvl))
         flush_wait(vm)
     finally:
         vms[-1].stop()
