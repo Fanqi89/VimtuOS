@@ -186,6 +186,8 @@ static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
 #include "debug64.h"
 #include "fb.h"             // 屏幕输出（fb_draw_text / fb_flip_region）
 #include "proc64.h"         // 批次 C：进程/地址空间（fork/execve/wait4/kill/每进程 brk&mmap/FS 基址）
+// ★ 系统音效：音频 ABI（49 audio_play）**只转发**给这个驱动（不新增驱动能力）
+#include "hda64.h"          // hda64_play64 / hda64_ready64（音频 ABI 的唯一被调用方）
 
 // task64.cpp 提供（安装程序内核不链接它 -> weak 引用后按"没有调度器"处理）
 extern "C" void     task_sleep_ms64(uint32_t ms) __attribute__((weak));
@@ -1664,6 +1666,89 @@ static int64_t sc64_pci_map_bar64(uint64_t bdf, uint64_t bar_index, uint64_t out
     dbg64_line_end64();
     return 0;                                            // 用户可见：0 = 成功（复用也是 0）
 }
+// ==================== ★ 系统音效：audio_play（自有 ABI 49）====================
+// 语义/错误码/打点格式的唯一说明见 kernel/syscall64.h 的"系统音效"一段。这里只做四件事：
+//   ① 参数校验（格式 -> 长度 -> 用户缓冲范围 -> 驱动 -> 忙：顺序就是判错顺序）；
+//   ② **转发**给 hda64 已有的播放接口（hda64_play64：按 <=8KiB 分块、有界等待，绝不挂死）；
+//   ③ 把驱动的失败如实映射成错误码（-2 超时 -> -4 EAGAIN；-1 参数/驱动 -> -5 ENODEV）；
+//   ④ 打一行 [SND64]（两条各 64 行上限，防刷屏）。
+// 内核**不做混音、不选素材、不碰音量/静音/采样率/输出源** —— 那些策略全在用户态。
+static int          g_snd64_log_budget64  = 64;
+static int          g_snd64_deny_budget64 = 64;
+static volatile int g_snd64_busy64        = 0;     // 单流（SD0）驱动：同一时刻只允许一段流在跑
+static const char*  g_snd64_reason64      = "none";
+
+static void snd64_play_log64(uint64_t va, uint64_t frames, uint64_t fmt, int64_t rc) {
+    if (g_snd64_log_budget64 <= 0) return;
+    g_snd64_log_budget64--;
+    dbg64_line_begin64();
+    dbg64_str("[SND64] play va=0x");
+    dbg64_hex64(va);
+    dbg64_str(" frames=");
+    dbg64_dec(frames);
+    dbg64_str(" fmt=0x");
+    dbg64_hex64(fmt);
+    dbg64_str(" rc=");
+    if (rc < 0) { dbg64_str("-"); dbg64_dec((uint64_t)(-rc)); } else { dbg64_dec((uint64_t)rc); }
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+static void snd64_deny_log64(const char* reason, int64_t err) {
+    g_snd64_reason64 = reason;
+    if (g_snd64_deny_budget64 <= 0) return;
+    g_snd64_deny_budget64--;
+    dbg64_line_begin64();
+    dbg64_str("[SND64] deny reason=");
+    dbg64_str(reason);
+    dbg64_str(" err=");
+    dbg64_dec((uint64_t)(-err));
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+static int64_t sc64_audio_play64(uint64_t pcm_va, uint64_t frames, uint64_t fmt) {
+    if (fmt != (uint64_t)SND64_FMT_48K16S2) {
+        snd64_deny_log64("bad-fmt", SND64_EINVAL64);
+        snd64_play_log64(pcm_va, frames, fmt, SND64_EINVAL64);
+        return SND64_EINVAL64;
+    }
+    if (frames == 0 || frames > SND64_MAX_FRAMES64) {       // 长度闸门先于范围校验：frames*4 不可能溢出
+        snd64_deny_log64("bad-frames", SND64_EINVAL64);
+        snd64_play_log64(pcm_va, frames, fmt, SND64_EINVAL64);
+        return SND64_EINVAL64;
+    }
+    if (!user64_range_ok64(pcm_va, frames * 4u)) {           // 用户窗口内 + 逐页 present/U（内核地址一律拒）
+        snd64_deny_log64("bad-buf", SND64_EFAULT64);
+        syscall64_deny64(SYSCALL64_SND_NR64, pcm_va);
+        snd64_play_log64(pcm_va, frames, fmt, SND64_EFAULT64);
+        return SND64_EFAULT64;
+    }
+    if (!hda64_ready64()) {                                  // 没有控制器/通路没建立：如实 ENODEV，不假装出声
+        snd64_deny_log64("no-driver", SND64_ENODEV64);
+        snd64_play_log64(pcm_va, frames, fmt, SND64_ENODEV64);
+        return SND64_ENODEV64;
+    }
+    if (g_snd64_busy64) {
+        snd64_deny_log64("stream-busy", SND64_EAGAIN64);
+        snd64_play_log64(pcm_va, frames, fmt, SND64_EAGAIN64);
+        return SND64_EAGAIN64;
+    }
+    g_snd64_busy64 = 1;
+    const int drc = hda64_play64((const int16_t*)(uintptr_t)pcm_va, (size_t)frames);
+    g_snd64_busy64 = 0;
+    int64_t rc = 0;
+    if (drc == -2) {
+        rc = SND64_EAGAIN64;
+        snd64_deny_log64("stream-timeout", rc);
+    } else if (drc != 0) {
+        rc = SND64_ENODEV64;
+        snd64_deny_log64("no-driver", rc);
+    }
+    snd64_play_log64(pcm_va, frames, fmt, rc);
+    return rc;
+}
+
 
 
 
@@ -1977,6 +2062,12 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
     case 48:                                                    // pci_map_bar(bdf, bar, out_va, out_len)
         ret = sc64_pci_map_bar64(a1, a2, a3, r->r10);
         break;
+        break;
+    // ★ 本批：系统音效（49 audio_play）。语义/错误码/打点：kernel/syscall64.h 的那一段。
+    //   rdi=pcm_va / rsi=frames / rdx=format；只用三个参数（第 4 个参数 r10 不参与）。
+    //   内核**只校验 + 转发**给 hda64_play64；策略（素材/音量/静音/采样率/混音）全在用户态。
+    case 49:                                                    // audio_play(pcm_va, frames, format)
+        ret = sc64_audio_play64(a1, a2, a3);
         break;
 
     default:

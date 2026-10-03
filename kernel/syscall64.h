@@ -122,6 +122,22 @@
 //     [FB64] present pid=<n> w=<n> h=<n>
 //     [FB64] map FAILED pid=<n> reason=<...> err=<n>
 //   ★ 越界一律"夹取 or 拒绝"，绝不让用户参数直接进内核的绘制路径（不越界、不崩）。
+//   ==================== ★ 系统音效：音频 ABI（号 49 audio_play）====================
+//   目标：让 ring3 **真的能出声** —— 系统音效素材（/usr/share/sounds/*.wav，构建期由
+//   tools/sounds_gen.py 合成、tools/sounder_pack_win.py 装卷）在**用户态**解析成 PCM，再用这一号
+//   把"一段内存 PCM"交给**已有的** HDA 驱动播放。内核只做校验 + 转发：
+//   **不做混音、不选素材、不碰音量/静音/采样率/输出源**（那些策略全在用户态：/bin/sounder +
+//   既有 audio 命令/声音面板；采样率只有 hda64 那一种格式，见下）。
+//   49 audio_play(pcm_va, frames, format)
+//     rdi = pcm_va  用户态缓冲（16 位立体声交织；frames*4 字节，**只读**）
+//     rsi = frames  每声道采样数（1 .. SND64_MAX_FRAMES64 = 96000 = 2 秒，有界）
+//     rdx = format  只认 SND64_FMT_48K16S2 = 0x11（48kHz/16bit/2ch —— 与 hda64 的流格式逐位一致）
+//     -> 0 = 整段已送进控制器（按 <=8KiB 周期分块，阻塞到每块的流完成；驱动自己的等待有界，
+//            绝不挂死）；< 0 = 错误码（常量见本文件下面的"系统音效"段）。
+//   校验顺序 = 判错顺序（用户态可以按它写负例）：fmt -> frames -> 缓冲范围 -> 驱动 -> 忙。
+//   ★ 打点（自动验收 tests/sounds64_test.py grep，格式勿改；两条各 64 行上限防刷屏）：
+//     [SND64] play va=0x<hex> frames=<n> fmt=0x<hex> rc=<带符号整数>
+//     [SND64] deny reason=<bad-fmt|bad-frames|bad-buf|no-driver|stream-busy|stream-timeout> err=<n>
 //
 // ============================ 入口 2：syscall 指令（Linux x86_64 ABI）============================
 //   寄存器约定与 Linux 完全一致：rax = 调用号；rdi/rsi/rdx/r10/r8/r9 = 参数 1..6；
@@ -188,6 +204,16 @@ static const int64_t  PCIMAP64_ENOMEM64 = -4;   // 窗满 / BAR 比单槽大 / �
 static const int64_t  PCIMAP64_ENODEV64 = -5;   // 没有这个设备 / BAR 未实现 / 在恒等映射之外
 // pci_map_bar 的"复用"返回约定：rax = 0 = 新建映射；与内核对齐，用户拿到的一直是 0
 // （`re=1` 只是内核打点里的信息，不改变用户可见返回值）。
+// ==================== ★ 系统音效：音频 ABI（自有 ABI 49 audio_play）====================
+// 语义/校验顺序/打点格式的唯一说明见本文件上面那一段。这里只放**内核与用户程序共用的常量**
+// （号位 + 格式字 + 上限 + 错误码；用户程序按同一份约定取号/判错）。
+static const uint64_t SYSCALL64_SND_NR64 = 49;
+static const uint32_t SND64_FMT_48K16S2  = 0x11u;    // 48kHz/16bit/2ch（= hda64 的 Set Converter Format 值）
+static const uint64_t SND64_MAX_FRAMES64 = 96000u;   // 2 秒上限（48000 帧/秒）——一次调用有界阻塞的依据
+static const int64_t  SND64_EFAULT64 = -2;   // pcm_va 不是用户可读的 [va, va+frames*4)
+static const int64_t  SND64_EINVAL64 = -3;   // fmt != 0x11 / frames == 0 / frames > 上限
+static const int64_t  SND64_EAGAIN64 = -4;   // 单流驱动正忙（另一段流在跑）/ 流超时（驱动如实报错）
+static const int64_t  SND64_ENODEV64 = -5;   // 没有 HDA 控制器 / 通路没建立（hda64 not ready）
 // ==================== syscall 指令路径（给汇编入口 / usermode64 用）====================
 // 帧标记：syscall 指令路径的 int_no 槽填这个值（int 0x80 是 0x80）。改它必须同步
 // kernel/syscall_entry64.asm 的 %define FRAME_MARK。
