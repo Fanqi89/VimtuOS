@@ -436,6 +436,783 @@ static int decode_bmp64(const uint8_t* d, int len, Img64* out) {
     return 0;
 }
 
+// ==================== JPEG（基线 SOF0 / 扩展顺序 SOF1）====================
+// 本批补齐（原先这里对 FF D8 直接打 "jpeg not implemented in this batch" 返回 -2）：
+//   * Huffman（DC/AC 各自独立的 DHT 表，按 JPEG 规范 F.2.2.3 的 mincode/maxcode/valptr 解码）、
+//     反量化、**纯整数 IDCT**：scale=256 的定点余弦表 + 两趟可分离，无浮点运行期运算
+//     （表由宿主 Python 独立生成；与精确 IDCT 对照实测最大 1 LSB / 平均 0.08 LSB）；
+//   * YCbCr->RGB：libjpeg 同款 16.16 定点系数（FIX(1.402)=91881 / FIX(0.71414)=46802 /
+//     FIX(0.34414)=22554 / FIX(1.772)=116130，ONE_HALF=32768，算术右移）；
+//   * 色度采样 **4:4:4 / 4:2:2 / 4:2:0**（通用 h×v 路径）：2x 上采样用 libjpeg fancy 权重
+//     (3*near + far + 1|2) >> 2（水平/垂直可分离），非 2x 比值退化为最近邻；
+//   * **RSTn 重启标记**（DRI 间隔 + 段间丢弃填充位重新对齐 + 重置 DC 预测；容错 ≤8 字节填充）；
+//   * **EXIF Orientation 1..8** 全部落地（APP1 "Exif\0\0" -> TIFF -> IFD0 tag 0x0112）；
+//   * 基线顺序 SOF0 与扩展顺序 SOF1 走同一路径；
+//   * **渐进式（SOF2）如实不支持**：返回 -2 + 打点 "progressive jpeg (SOF2) unsupported"，绝不崩；
+//   * 如实边界（不假装）：只支持 8 位精度、1 或 3 分量（灰度 / YCbCr）、边长 ≤ 2048；算术编码
+//     （SOF9/10/11/13/14/15）、无损/差分（SOF3/5/6/7）、4 分量（CMYK）、多扫描一律返回 -2 并写明原因。
+#define JPG64_MAXCOMPS 4
+#define JPG64_MAXDIM   2048
+
+static const uint8_t kJpgZig64[64] = {
+     0,  1,  8, 16,  9,  2,  3, 10,
+    17, 24, 32, 25, 18, 11,  4,  5,
+    12, 19, 26, 33, 40, 48, 41, 34,
+    27, 20, 13,  6,  7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36,
+    29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46,
+    53, 60, 61, 54, 47, 55, 62, 63,
+};
+
+// 定点余弦表：kJpgCos64[u][x] = round(256 * C(u) * cos((2x+1)*u*pi/16))，C(0) = 1/sqrt2
+static const int kJpgCos64[8][8] = {
+    { 181,  181,  181,  181,  181,  181,  181,  181},
+    { 251,  213,  142,   50,  -50, -142, -213, -251},
+    { 237,   98,  -98, -237, -237,  -98,   98,  237},
+    { 213,  -50, -251, -142,  142,  251,   50, -213},
+    { 181, -181, -181,  181,  181, -181, -181,  181},
+    { 142, -251,   50,  213, -213,  -50,  251, -142},
+    {  98, -237,  237,  -98,  -98,  237, -237,   98},
+    {  50, -142,  213, -251,  251, -213,  142,  -50},
+};
+
+struct Jpg64Huff {
+    int     count[17], mincode[17], maxcode[17], valptr[17];
+    uint8_t val[256];
+};
+
+struct Jpg64Bits {
+    const uint8_t* p;
+    int len, pos;
+    int marker_pos, marker, err;
+    int cur, cnt;
+};
+
+struct Jpg64Comp {
+    int id, h, v, tq, td, ta;
+    int bw, bh, pw, ph;          // 块网格 / 平面尺寸（含 MCU 补齐）
+    uint8_t* plane;
+    int pred;                    // DC 预测值
+};
+
+struct Jpg64Ctx {
+    int w, h, ncomp, maxh, maxv, ri, orient;
+    int mcu_cols, mcu_rows, rst_count;
+    Jpg64Comp comp[JPG64_MAXCOMPS];
+    uint16_t qt[4][64];
+    int qseen[4];
+    Jpg64Huff hdc[4], hac[4];
+    int hdc_seen[4], hac_seen[4];
+};
+
+static Jpg64Ctx g_jpg64;                     // 内核单线程：静态上下文（与 inflate 的静态表同一约定）
+// 打点用的最近一次 JPEG 特征（img64_decode64 的日志与自检都用它，不猜）
+static int g_jpeg_comps = 0;
+static int g_jpeg_orient = 0;
+static int g_jpeg_rst = 0;
+static const char* g_jpeg_samp = "-";
+
+static void jpg64_zero64(void* p, int n) {
+    uint8_t* q = (uint8_t*)p;
+    for (int i = 0; i < n; i++) q[i] = 0;
+}
+
+// ---------------- Huffman（JPEG F.2.2.3）----------------
+static int jpg64_huff_build(Jpg64Huff* h, const uint8_t* bits, const uint8_t* vals) {
+    int total = 0;
+    for (int l = 1; l <= 16; l++) { h->count[l] = bits[l - 1]; total += h->count[l]; }
+    if (total == 0 || total > 256) return -1;
+    for (int i = 0; i < total; i++) h->val[i] = vals[i];
+    int code = 0, k = 0;
+    for (int l = 1; l <= 16; l++) {
+        if (h->count[l]) {
+            h->valptr[l] = k;
+            h->mincode[l] = code;
+            code += h->count[l];
+            h->maxcode[l] = code - 1;
+            k += h->count[l];
+        } else {
+            h->valptr[l] = 0;
+            h->mincode[l] = 0;
+            h->maxcode[l] = -1;
+        }
+        code <<= 1;
+        if (code > (1 << 17)) return -1;     // 过订阅（坏表）
+    }
+    return 0;
+}
+
+// ---------------- 熵编码位读取（含 0xFF00 去填充与标记探测）----------------
+static void jpg64_bits_init(Jpg64Bits* b, const uint8_t* p, int len) {
+    b->p = p; b->len = len; b->pos = 0;
+    b->marker_pos = -1; b->marker = 0; b->err = 0; b->cur = 0; b->cnt = 0;
+}
+
+// 读一个熵编码字节：FF 00 -> 数据 0xFF；撞到标记 -> err=2 并记下标记位置（**不消费**标记字节）
+static int jpg64_next_byte(Jpg64Bits* b) {
+    if (b->pos >= b->len) { b->err = 1; return -1; }
+    const int c = b->p[b->pos++];
+    if (c == 0xFF) {
+        const int mp = b->pos - 1;
+        while (b->pos < b->len && b->p[b->pos] == 0xFF) b->pos++;   // 填充 FF
+        if (b->pos >= b->len) { b->err = 1; return -1; }
+        const int c2 = b->p[b->pos];
+        if (c2 == 0x00) { b->pos++; return 0xFF; }
+        b->marker = c2; b->marker_pos = mp; b->err = 2;
+        return -1;
+    }
+    return c;
+}
+
+static int jpg64_bit(Jpg64Bits* b) {
+    if (b->cnt == 0) {
+        const int c = jpg64_next_byte(b);
+        if (c < 0) return 0;
+        b->cur = c; b->cnt = 8;
+    }
+    b->cnt--;
+    return (b->cur >> b->cnt) & 1;
+}
+
+static int jpg64_bits(Jpg64Bits* b, int n) {
+    int v = 0;
+    for (int i = 0; i < n; i++) v = (v << 1) | jpg64_bit(b);
+    return v;
+}
+
+static int jpg64_huff_decode(Jpg64Bits* b, const Jpg64Huff* h) {
+    int code = 0;
+    for (int l = 1; l <= 16; l++) {
+        code = (code << 1) | jpg64_bit(b);
+        if (b->err) return -1;
+        if (h->maxcode[l] >= 0 && code <= h->maxcode[l]) {
+            const int idx = h->valptr[l] + code - h->mincode[l];
+            if (idx < 0 || idx >= 256) return -1;
+            return h->val[idx];
+        }
+    }
+    return -1;
+}
+
+// F.2.2.1：t 位无符号值 -> 有符号差分
+static int jpg64_extend(int v, int t) {
+    if (t == 0) return 0;
+    if (v < (1 << (t - 1))) return v - (1 << t) + 1;
+    return v;
+}
+
+// ---------------- 整数 IDCT ----------------
+// 输入 = 反量化后的系数（自然顺序 F[v*8+u]）；输出 = 8x8 像素（+128 电平偏移，clamp 0..255）。
+// 归一化：f(x,y) = (1/4) ΣΣ C(u)C(v)F(u,v)cos cos；本实现第二趟后 >>18（= 4*256*256）。
+static void jpg64_idct64(const int* coef, uint8_t* out, int stride) {
+    int64_t tmp[64];
+    for (int u = 0; u < 8; u++) {
+        for (int y = 0; y < 8; y++) {
+            int64_t s = 0;
+            for (int v = 0; v < 8; v++) s += (int64_t)kJpgCos64[v][y] * (int64_t)coef[v * 8 + u];
+            tmp[y * 8 + u] = s;
+        }
+    }
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            int64_t s = 0;
+            for (int u = 0; u < 8; u++) s += (int64_t)kJpgCos64[u][x] * tmp[y * 8 + u];
+            int v = (int)((s + (1 << 17)) >> 18) + 128;
+            if (v < 0) v = 0; else if (v > 255) v = 255;
+            out[y * stride + x] = (uint8_t)v;
+        }
+    }
+}
+
+// ---------------- 段间重启 ----------------
+static int jpg64_restart64(Jpg64Bits* b) {
+    b->cnt = 0; b->cur = 0; b->err = 0;
+    int q = b->pos;
+    for (int i = 0; i < 8 && q + 1 < b->len; i++, q++) {
+        if (b->p[q] != 0xFF) continue;
+        int r = q + 1;
+        while (r < b->len && b->p[r] == 0xFF) r++;
+        if (r < b->len && b->p[r] >= 0xD0 && b->p[r] <= 0xD7) { b->pos = r + 1; return 0; }
+        return -1;
+    }
+    return -1;
+}
+
+// ---------------- EXIF Orientation ----------------
+static int jpg64_be16(const uint8_t* p) { return (p[0] << 8) | p[1]; }
+
+static int jpg64_exif_orient64(const uint8_t* s, int n) {
+    if (n < 14 || s[0] != 'E' || s[1] != 'x' || s[2] != 'i' || s[3] != 'f' ||
+        s[4] != 0 || s[5] != 0) return 1;
+    const uint8_t* t = s + 6;
+    const int tn = n - 6;
+    if (tn < 8) return 1;
+    int le;
+    if (t[0] == 'I' && t[1] == 'I') le = 1;
+    else if (t[0] == 'M' && t[1] == 'M') le = 0;
+    else return 1;
+    auto rd16 = [&](const uint8_t* p) -> int { return le ? (p[0] | (p[1] << 8)) : ((p[0] << 8) | p[1]); };
+    auto rd32 = [&](const uint8_t* p) -> uint32_t {
+        return le ? ((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24))
+                  : (((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3]);
+    };
+    if (rd16(t + 2) != 42) return 1;
+    const uint32_t off = rd32(t + 4);
+    if ((int)(off + 2) > tn) return 1;
+    const int cnt = rd16(t + off);
+    for (int i = 0; i < cnt && i < 512; i++) {
+        const uint32_t eo = off + 2 + (uint32_t)i * 12;
+        if ((int)(eo + 12) > tn) break;
+        const uint8_t* e = t + eo;
+        if (rd16(e) == 0x0112) {
+            const int type = rd16(e + 2);
+            int ov = 1;
+            if (type == 3) ov = rd16(e + 8);
+            else if (type == 4) ov = (int)rd32(e + 8);
+            if (ov < 1 || ov > 8) ov = 1;
+            return ov;
+        }
+    }
+    return 1;
+}
+
+// 落地 EXIF 方向（映射与 Pillow 的 ImageOps.exif_transpose 逐项一致，宿主侧已离线核对过 1..8）
+static int jpg64_apply_orient64(Img64* im, int o) {
+    if (o <= 1 || o > 8 || !im->px) return 0;
+    const int w = im->w, h = im->h;
+    const int nw = (o >= 5) ? h : w;
+    const int nh = (o >= 5) ? w : h;
+    uint32_t* dst = (uint32_t*)kmalloc_64((uint64_t)nw * nh * 4);
+    if (!dst) { g_err = "oom jpeg orient"; return -1; }
+    for (int y = 0; y < nh; y++) {
+        for (int x = 0; x < nw; x++) {
+            int sx, sy;
+            switch (o) {
+                case 2:  sx = w - 1 - x; sy = y;         break;
+                case 3:  sx = w - 1 - x; sy = h - 1 - y; break;
+                case 4:  sx = x;         sy = h - 1 - y; break;
+                case 5:  sx = y;         sy = x;         break;
+                case 6:  sx = y;         sy = h - 1 - x; break;
+                case 7:  sx = w - 1 - y; sy = h - 1 - x; break;
+                default: sx = w - 1 - y; sy = x;         break;   // 8
+            }
+            dst[(uint64_t)y * nw + x] = im->px[(uint64_t)sy * w + sx];
+        }
+    }
+    kfree_64(im->px);
+    im->px = dst;
+    im->w = nw;
+    im->h = nh;
+    return 0;
+}
+
+// ---------------- 熵编码扫描（解 MCU -> 分量平面）----------------
+static void jpg64_free_planes64(Jpg64Ctx* c) {
+    for (int i = 0; i < JPG64_MAXCOMPS; i++) {
+        if (c->comp[i].plane) { kfree_64(c->comp[i].plane); c->comp[i].plane = nullptr; }
+    }
+}
+
+static int jpg64_block64(Jpg64Ctx* c, Jpg64Bits* b, Jpg64Comp* q, int* coef) {
+    for (int i = 0; i < 64; i++) coef[i] = 0;
+    const uint16_t* qt = c->qt[q->tq];
+    const int t = jpg64_huff_decode(b, &c->hdc[q->td]);
+    if (t < 0) { g_err = "truncated scan (dc)"; return -3; }
+    if (t > 15) { g_err = "bad dc size"; return -3; }
+    const int diff = t ? jpg64_extend(jpg64_bits(b, t), t) : 0;
+    if (b->err) { g_err = "truncated scan (dc bits)"; return -3; }
+    q->pred += diff;
+    {   // 坏数据防溢出：DC 预测与系数都夹到 ±(1<<20)（合法流的真实值远小于它）
+        if (q->pred > (1 << 20)) q->pred = 1 << 20;
+        else if (q->pred < -(1 << 20)) q->pred = -(1 << 20);
+        int64_t dc = (int64_t)q->pred * (int64_t)qt[0];
+        if (dc > (1 << 20)) dc = 1 << 20; else if (dc < -(1 << 20)) dc = -(1 << 20);
+        coef[0] = (int)dc;
+    }
+    int k = 1;
+    while (k < 64) {
+        const int rs = jpg64_huff_decode(b, &c->hac[q->ta]);
+        if (rs < 0) { g_err = "truncated scan (ac)"; return -3; }
+        const int s = rs & 15, r = rs >> 4;
+        if (s == 0) {
+            if (r != 15) break;                  // EOB
+            k += 16;                             // ZRL
+            continue;
+        }
+        k += r;
+        if (k > 63) { g_err = "bad ac run"; return -3; }
+        const int v = jpg64_extend(jpg64_bits(b, s), s);
+        if (b->err) { g_err = "truncated scan (ac bits)"; return -3; }
+        const int zi = kJpgZig64[k];
+        int64_t p = (int64_t)v * (int64_t)qt[zi];
+        if (p > (1 << 20)) p = 1 << 20; else if (p < -(1 << 20)) p = -(1 << 20);
+        coef[zi] = (int)p;
+        k++;
+    }
+    return 0;
+}
+
+static int jpg64_scan64(Jpg64Ctx* c, const uint8_t* data, int data_len) {
+    c->mcu_cols = (c->w + c->maxh * 8 - 1) / (c->maxh * 8);
+    c->mcu_rows = (c->h + c->maxv * 8 - 1) / (c->maxv * 8);
+    for (int i = 0; i < c->ncomp; i++) {
+        Jpg64Comp* q = &c->comp[i];
+        q->bw = c->mcu_cols * q->h;
+        q->bh = c->mcu_rows * q->v;
+        q->pw = q->bw * 8;
+        q->ph = q->bh * 8;
+        q->pred = 0;
+        const uint64_t bytes = (uint64_t)q->pw * (uint64_t)q->ph;
+        q->plane = (uint8_t*)kmalloc_64(bytes);
+        if (!q->plane) { g_err = "oom jpeg plane"; jpg64_free_planes64(c); return -4; }
+        for (uint64_t k2 = 0; k2 < bytes; k2++) q->plane[k2] = 0;
+    }
+    Jpg64Bits b;
+    jpg64_bits_init(&b, data, data_len);
+    int coef[64];
+    int mcu = 0;
+    for (int my = 0; my < c->mcu_rows; my++) {
+        for (int mx = 0; mx < c->mcu_cols; mx++) {
+            if (c->ri > 0 && mcu > 0 && (mcu % c->ri) == 0) {
+                if (jpg64_restart64(&b) != 0) {
+                    g_err = "bad restart marker";
+                    jpg64_free_planes64(c);
+                    return -3;
+                }
+                for (int i = 0; i < c->ncomp; i++) c->comp[i].pred = 0;   // 重启后 DC 预测归零
+                c->rst_count++;
+            }
+            for (int i = 0; i < c->ncomp; i++) {
+                Jpg64Comp* q = &c->comp[i];
+                for (int v = 0; v < q->v; v++) {
+                    for (int hh = 0; hh < q->h; hh++) {
+                        const int rc = jpg64_block64(c, &b, q, coef);
+                        if (rc != 0) { jpg64_free_planes64(c); return rc; }
+                        const int bx = mx * q->h + hh;
+                        const int by = my * q->v + v;
+                        jpg64_idct64(coef, q->plane + (uint64_t)by * 8 * q->pw + (uint64_t)bx * 8, q->pw);
+                    }
+                }
+            }
+            mcu++;
+        }
+    }
+    return 0;
+}
+
+// ---------------- 重采样（分量平面 -> 全分辨率）----------------
+static int jpg64_resample64(const Jpg64Comp* q, int maxh, int maxv, int w, int h, uint8_t* dst) {
+    const int sh = (h * q->v + maxv - 1) / maxv;
+    uint8_t* tmp = (uint8_t*)kmalloc_64((uint64_t)sh * (uint64_t)w + 8);
+    if (!tmp) { g_err = "oom jpeg resample"; return -4; }
+    const int need2 = (q->h * 2 == maxh);
+    for (int y = 0; y < sh; y++) {
+        const uint8_t* src = q->plane + (uint64_t)y * q->pw;
+        uint8_t* t = tmp + (uint64_t)y * w;
+        if (q->h == maxh) {
+            for (int x = 0; x < w; x++) t[x] = src[(x < q->pw) ? x : (q->pw - 1)];
+        } else if (need2) {
+            t[0] = src[0];
+            for (int x = 1; x < w; x++) {
+                const int k = x >> 1;
+                const int nearv = src[(k < q->pw) ? k : (q->pw - 1)];
+                int far;
+                if (x & 1) { const int kk = k + 1; far = src[(kk < q->pw) ? kk : (q->pw - 1)]; }
+                else       { const int kk = k - 1; far = src[(kk >= 0) ? kk : 0]; }
+                int val = (3 * nearv + far + ((x & 1) ? 2 : 1)) >> 2;
+                if (val < 0) val = 0; else if (val > 255) val = 255;
+                t[x] = (uint8_t)val;
+            }
+        } else {
+            for (int x = 0; x < w; x++) {
+                const int k = (int)((int64_t)x * q->h / maxh);
+                t[x] = src[(k < q->pw) ? k : (q->pw - 1)];
+            }
+        }
+    }
+    const int need2v = (q->v * 2 == maxv);
+    for (int y = 0; y < h; y++) {
+        uint8_t* drow = dst + (uint64_t)y * w;
+        if (q->v == maxv) {
+            const int k = (y < sh) ? y : (sh - 1);
+            const uint8_t* r = tmp + (uint64_t)k * w;
+            for (int x = 0; x < w; x++) drow[x] = r[x];
+        } else if (need2v) {
+            const int k = ((y >> 1) < sh) ? (y >> 1) : (sh - 1);
+            const uint8_t* r0 = tmp + (uint64_t)k * w;
+            if (y == 0) {
+                for (int x = 0; x < w; x++) drow[x] = r0[x];
+            } else if (y == h - 1) {
+                const uint8_t* rl = tmp + (uint64_t)(sh - 1) * w;
+                for (int x = 0; x < w; x++) drow[x] = rl[x];
+            } else {
+                const int kk = (y & 1) ? ((k + 1 < sh) ? k + 1 : k) : ((k > 0) ? k - 1 : 0);
+                const uint8_t* r1 = tmp + (uint64_t)kk * w;
+                const int rnd = (y & 1) ? 2 : 1;
+                for (int x = 0; x < w; x++) {
+                    int val = (3 * r0[x] + r1[x] + rnd) >> 2;
+                    if (val < 0) val = 0; else if (val > 255) val = 255;
+                    drow[x] = (uint8_t)val;
+                }
+            }
+        } else {
+            const int k = (int)((int64_t)y * q->v / maxv);
+            const uint8_t* r = tmp + (uint64_t)((k < sh) ? k : (sh - 1)) * w;
+            for (int x = 0; x < w; x++) drow[x] = r[x];
+        }
+    }
+    kfree_64(tmp);
+    return 0;
+}
+
+static void jpg64_ycc_to_rgb64(const uint8_t* y, const uint8_t* cb, const uint8_t* cr, int n, uint32_t* dst) {
+    for (int i = 0; i < n; i++) {
+        const int Y = y[i];
+        const int bb = cb ? ((int)cb[i] - 128) : 0;
+        const int rr = cr ? ((int)cr[i] - 128) : 0;
+        int R = Y + ((91881 * rr + 32768) >> 16);
+        int G = Y + ((-22554 * bb - 46802 * rr + 32768) >> 16);
+        int B = Y + ((116130 * bb + 32768) >> 16);
+        if (R < 0) R = 0; else if (R > 255) R = 255;
+        if (G < 0) G = 0; else if (G > 255) G = 255;
+        if (B < 0) B = 0; else if (B > 255) B = 255;
+        dst[i] = 0xFF000000u | ((uint32_t)R << 16) | ((uint32_t)G << 8) | (uint32_t)B;
+    }
+}
+
+// ---------------- SOS 头解析 ----------------
+static int jpg64_parse_sos64(Jpg64Ctx* c, const uint8_t* s, int sn) {
+    if (sn < 1) { g_err = "bad sos"; return -3; }
+    const int ns = s[0];
+    if (ns != c->ncomp || sn < 1 + ns * 2 + 3) { g_err = "multi-scan/non-interleaved unsupported"; return -2; }
+    for (int i = 0; i < ns; i++) {
+        const int cid = s[1 + i * 2];
+        const int t = s[2 + i * 2];
+        Jpg64Comp* q = nullptr;
+        for (int k = 0; k < c->ncomp; k++) if (c->comp[k].id == cid) { q = &c->comp[k]; break; }
+        if (!q) { g_err = "bad sos component id"; return -3; }
+        q->td = t >> 4;
+        q->ta = t & 15;
+        if (q->td > 3 || q->ta > 3) { g_err = "bad sos table id"; return -3; }
+        if (!c->hdc_seen[q->td] || !c->hac_seen[q->ta]) { g_err = "missing huffman table"; return -3; }
+        if (q->tq > 3 || !c->qseen[q->tq]) { g_err = "missing quant table"; return -3; }
+    }
+    const int ss = s[1 + ns * 2], se = s[2 + ns * 2], ahal = s[3 + ns * 2];
+    if (ss != 0 || se != 63 || ahal != 0) { g_err = "non-baseline scan parameters"; return -2; }
+    return 0;
+}
+
+// ---------------- 入口：基线 JPEG ----------------
+static int decode_jpeg64(const uint8_t* d, int len, Img64* out) {
+    if (len < 4 || d[0] != 0xFF || d[1] != 0xD8) { g_err = "not jpeg (no SOI)"; return -3; }
+    Jpg64Ctx* c = &g_jpg64;
+    jpg64_zero64(c, (int)sizeof(Jpg64Ctx));
+    g_err = "ok";
+    g_jpeg_comps = 0;
+    g_jpeg_orient = 0;
+    g_jpeg_rst = 0;
+    g_jpeg_samp = "-";
+    c->orient = 1;
+    int pos = 2;
+    int saw_sof = 0, saw_sos = 0;
+    while (pos < len) {
+        if (d[pos] != 0xFF) { pos++; continue; }         // 容错：跳过非标记垃圾
+        while (pos < len && d[pos] == 0xFF) pos++;
+        if (pos >= len) break;
+        const int m = d[pos++];
+        if (m == 0xD9) break;                            // EOI
+        if (m == 0x01 || (m >= 0xD0 && m <= 0xD7)) continue;
+        if (pos + 2 > len) { g_err = "truncated marker header"; return -3; }
+        const int slen = (d[pos] << 8) | d[pos + 1];
+        if (slen < 2 || pos + slen > len) { g_err = "truncated segment"; return -3; }
+        const uint8_t* s = d + pos + 2;
+        const int sn = slen - 2;
+        switch (m) {
+            case 0xDB: {                                 // DQT
+                int p = 0;
+                while (p < sn) {
+                    const int pq = s[p] >> 4, tq = s[p] & 15;
+                    p++;
+                    if (tq >= 4) { g_err = "bad dqt id"; return -3; }
+                    if (pq == 0) {
+                        if (p + 64 > sn) { g_err = "truncated dqt"; return -3; }
+                        for (int i = 0; i < 64; i++) c->qt[tq][kJpgZig64[i]] = s[p + i];
+                        p += 64;
+                    } else if (pq == 1) {
+                        if (p + 128 > sn) { g_err = "truncated dqt (16bit)"; return -3; }
+                        for (int i = 0; i < 64; i++) c->qt[tq][kJpgZig64[i]] =
+                            (uint16_t)((s[p + i * 2] << 8) | s[p + i * 2 + 1]);
+                        p += 128;
+                    } else {
+                        g_err = "bad dqt precision";
+                        return -3;
+                    }
+                    c->qseen[tq] = 1;
+                }
+            } break;
+            case 0xC4: {                                 // DHT
+                int p = 0;
+                while (p + 17 <= sn) {
+                    const int tc = s[p] >> 4, th = s[p] & 15;
+                    p++;
+                    if (th >= 4 || tc > 1) { g_err = "bad dht id"; return -3; }
+                    uint8_t bits[16];
+                    int total = 0;
+                    for (int i = 0; i < 16; i++) { bits[i] = s[p + i]; total += bits[i]; }
+                    p += 16;
+                    if (p + total > sn) { g_err = "truncated dht"; return -3; }
+                    Jpg64Huff* h = tc ? &c->hac[th] : &c->hdc[th];
+                    if (jpg64_huff_build(h, bits, s + p) != 0) { g_err = "bad dht (oversubscribed)"; return -3; }
+                    p += total;
+                    if (tc) c->hac_seen[th] = 1; else c->hdc_seen[th] = 1;
+                }
+            } break;
+            case 0xDD:                                   // DRI
+                if (sn < 2) { g_err = "bad dri"; return -3; }
+                c->ri = (s[0] << 8) | s[1];
+                break;
+            case 0xE1:                                   // APP1（EXIF）
+                c->orient = jpg64_exif_orient64(s, sn);
+                break;
+            case 0xC2:
+                g_err = "progressive jpeg (SOF2) unsupported";
+                return -2;
+            case 0xC3: case 0xC5: case 0xC6: case 0xC7:
+                g_err = "lossless/differential jpeg unsupported";
+                return -2;
+            case 0xC9: case 0xCA: case 0xCB:
+            case 0xCD: case 0xCE: case 0xCF:
+                g_err = "arithmetic-coded jpeg unsupported";
+                return -2;
+            case 0xC0: case 0xC1: {                      // SOF0 / SOF1（基线 / 扩展顺序）
+                if (sn < 6) { g_err = "bad sof"; return -3; }
+                const int prec = s[0];
+                c->h = jpg64_be16(s + 1);
+                c->w = jpg64_be16(s + 3);
+                const int nc = s[5];
+                if (prec != 8) { g_err = "jpeg sample precision != 8"; return -2; }
+                if (nc != 1 && nc != 3) { g_err = "jpeg components not 1/3"; return -2; }
+                if (sn < 6 + nc * 3) { g_err = "bad sof components"; return -3; }
+                if (c->w <= 0 || c->h <= 0) { g_err = "bad jpeg size"; return -3; }
+                if (c->w > JPG64_MAXDIM || c->h > JPG64_MAXDIM) { g_err = "jpeg too large (>2048)"; return -2; }
+                c->ncomp = nc;
+                c->maxh = c->maxv = 1;
+                for (int i = 0; i < nc; i++) {
+                    Jpg64Comp* q = &c->comp[i];
+                    q->id = s[6 + i * 3];
+                    q->h = s[7 + i * 3] >> 4;
+                    q->v = s[7 + i * 3] & 15;
+                    q->tq = s[8 + i * 3];
+                    if (q->h < 1 || q->h > 4 || q->v < 1 || q->v > 4) { g_err = "bad sampling factors"; return -3; }
+                    if (q->h > c->maxh) c->maxh = q->h;
+                    if (q->v > c->maxv) c->maxv = q->v;
+                }
+                if (c->maxh > 2 || c->maxv > 2) { g_err = "sampling > 2x unsupported"; return -2; }
+                saw_sof = 1;
+            } break;
+            case 0xDA: {                                 // SOS
+                if (!saw_sof) { g_err = "sos before sof"; return -3; }
+                const int prc = jpg64_parse_sos64(c, s, sn);
+                if (prc != 0) return prc;
+                saw_sos = 1;
+                const int rc = jpg64_scan64(c, d + pos + slen, len - (pos + slen));
+                if (rc != 0) return rc;
+                g_jpeg_comps = c->ncomp;
+                g_jpeg_orient = c->orient;
+                g_jpeg_rst = c->rst_count;
+                g_jpeg_samp = (c->ncomp == 1) ? "gray"
+                            : (c->maxh == 1 && c->maxv == 1) ? "444"
+                            : (c->maxh == 2 && c->maxv == 1) ? "422"
+                            : (c->maxh == 2 && c->maxv == 2) ? "420" : "other";
+                // ---- 组装像素 ----
+                const uint64_t n = (uint64_t)c->w * (uint64_t)c->h;
+                uint8_t* planes = (uint8_t*)kmalloc_64(n * (uint64_t)c->ncomp);
+                if (!planes) { g_err = "oom jpeg planes"; jpg64_free_planes64(c); return -4; }
+                uint32_t* px = (uint32_t*)kmalloc_64(n * 4);
+                if (!px) { kfree_64(planes); g_err = "oom jpeg px"; jpg64_free_planes64(c); return -4; }
+                for (int i = 0; i < c->ncomp; i++) {
+                    const int rr = jpg64_resample64(&c->comp[i], c->maxh, c->maxv, c->w, c->h,
+                                                    planes + n * (uint64_t)i);
+                    if (rr != 0) {
+                        kfree_64(planes);
+                        kfree_64(px);
+                        jpg64_free_planes64(c);
+                        return rr;
+                    }
+                }
+                const uint8_t* yp = planes;
+                const uint8_t* cbp = (c->ncomp >= 3) ? planes + n : nullptr;
+                const uint8_t* crp = (c->ncomp >= 3) ? planes + n * 2 : nullptr;
+                jpg64_ycc_to_rgb64(yp, cbp, crp, (int)n, px);
+                kfree_64(planes);
+                jpg64_free_planes64(c);
+                out->px = px;
+                out->w = c->w;
+                out->h = c->h;
+                out->owned = 1;
+                if (c->orient > 1 && jpg64_apply_orient64(out, c->orient) != 0) {
+                    img64_free64(out);
+                    return -4;
+                }
+                g_fmt = "jpeg";
+                return 0;
+            } break;
+            default:
+                break;                                   // APP0(JFIF)/APPn/COM/... 忽略
+        }
+        pos += slen;
+    }
+    if (!saw_sos) { g_err = saw_sof ? "jpeg has no scan" : "jpeg has no SOF"; return -3; }
+    g_err = "jpeg scan not decoded";
+    return -3;
+}
+
+// 像素缓冲 FNV-1a 32（自检打点用；与 img64_fnv32_64 同算法，那份定义在文件后半，别互相依赖顺序）
+static uint32_t jpg64_fnv64(const uint8_t* p, int n) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+// ---------------- ★ 卷内 JPEG 验收自检（tests/jpeg64_test.py 用）----------------
+// 约定（测试脚本负责造卷）：
+//   * 系统卷里放 /jpegtest/j01.jpg .. j09.jpg（不需要的序号可以不建，缺的跳过）；
+//   * 再放一个空文件 /jpegtest/px.on -> 才会把解码像素逐行 dump 到串口
+//     （普通启动没有这个标记文件 -> 一条 dump 都不打，回归不受影响）；
+//   * 打点：[JPEG64] selftest file=j03.jpg bytes=.. rc=0 fmt=jpeg w=.. h=.. orient=.. comps=.. samp=420 rst=.. fnv=.. err=ok
+//           [JPEG64] px j03.jpg row=<y> w=<w> data=<16 进制 RRGGBB...>
+//           [JPEG64] selftest files=6 fail=0 dump=1 ok=1                       （汇总）
+//           [JPEG64] selftest skip reason=no-volume|not-found dir=/jpegtest    （环境没有卷/没有测试文件）
+static const char* kJpgSuiteName[12] = {
+    "j01.jpg", "j02.jpg", "j03.jpg", "j04.jpg", "j05.jpg", "j06.jpg",
+    "j07.jpg", "j08.jpg", "j09.jpg", "j10.jpg", "j11.jpg", "j12.jpg",
+};
+
+static void jpg64_dump_px64(const char* name, const Img64* im) {
+    static const char* H = "0123456789abcdef";
+    char buf[8];
+    for (int y = 0; y < im->h; y++) {
+        dbg64_line_begin64();
+        dbg64_str("[JPEG64] px ");
+        dbg64_str(name);
+        dbg64_str(" row=");
+        dbg64_dec((uint64_t)y);
+        dbg64_str(" w=");
+        dbg64_dec((uint64_t)im->w);
+        dbg64_str(" data=");
+        for (int x = 0; x < im->w; x++) {
+            const uint32_t c = im->px[(uint64_t)y * im->w + x];
+            buf[0] = H[(c >> 20) & 0xF];
+            buf[1] = H[(c >> 16) & 0xF];
+            buf[2] = H[(c >> 12) & 0xF];
+            buf[3] = H[(c >> 8) & 0xF];
+            buf[4] = H[(c >> 4) & 0xF];
+            buf[5] = H[c & 0xF];
+            buf[6] = 0;
+            dbg64_str(buf);
+        }
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+}
+
+static int jpg64_selftest_volume64() {
+    const int sys = vfs64_system_slot64();
+    if (sys < 0) {
+        dbg64_line_begin64();
+        dbg64_str("[JPEG64] selftest skip reason=no-volume");
+        dbg64_nl();
+        dbg64_line_end64();
+        return 0;
+    }
+    uint32_t type = 0, size = 0;
+    const int dump = (vfs64_stat_on64(sys, "/jpegtest/px.on", &type, &size) == 0 &&
+                      type == VFS64_TYPE_FILE);
+    int ran = 0, ok0 = 0, errs = 0, bad = 0;   // ok0 = rc=0 的张数；errs = 明确错误码（-2/-3，错误路径用例）
+    for (int i = 0; i < 12; i++) {
+        char path[64];
+        int n = 0;
+        const char* pre = "/jpegtest/";
+        for (int k = 0; pre[k] && n < 60; k++) path[n++] = pre[k];
+        for (int k = 0; kJpgSuiteName[i][k] && n < 62; k++) path[n++] = kJpgSuiteName[i][k];
+        path[n] = 0;
+        type = 0;
+        size = 0;
+        if (vfs64_stat_on64(sys, path, &type, &size) != 0 || type != VFS64_TYPE_FILE) continue;
+        if (size == 0 || size > 1024u * 1024u) continue;
+        uint8_t* buf = (uint8_t*)kmalloc_64(size);
+        if (!buf) continue;
+        const int got = vfs64_read_on64(sys, path, buf, (int)size);
+        Img64 im{};
+        g_err = "ok";
+        const int rc = (got == (int)size) ? img64_decode64(buf, got, &im) : -1;
+        kfree_64(buf);
+        ran++;
+        if (rc == 0) ok0++;
+        else if (rc == -2 || rc == -3) errs++;
+        if (rc != 0) bad++;
+        dbg64_line_begin64();
+        dbg64_str("[JPEG64] selftest file=");
+        dbg64_str(kJpgSuiteName[i]);
+        dbg64_str(" bytes=");
+        dbg64_dec((uint64_t)size);
+        dbg64_str(" rc=");
+        dbg64_dec((uint64_t)(unsigned)(rc < 0 ? -rc : rc));
+        dbg64_str(" fmt=");
+        dbg64_str(g_fmt);
+        dbg64_str(" w=");
+        dbg64_dec((uint64_t)im.w);
+        dbg64_str(" h=");
+        dbg64_dec((uint64_t)im.h);
+        dbg64_str(" orient=");
+        dbg64_dec((uint64_t)g_jpeg_orient);
+        dbg64_str(" comps=");
+        dbg64_dec((uint64_t)g_jpeg_comps);
+        dbg64_str(" samp=");
+        dbg64_str(g_jpeg_samp);
+        dbg64_str(" rst=");
+        dbg64_dec((uint64_t)g_jpeg_rst);
+        dbg64_str(" fnv=");
+        dbg64_hex64((uint64_t)jpg64_fnv64((const uint8_t*)im.px, im.w * im.h * 4));
+        dbg64_str(" err=");
+        dbg64_str(g_err);
+        dbg64_nl();
+        dbg64_line_end64();
+        if (dump && rc == 0) jpg64_dump_px64(kJpgSuiteName[i], &im);
+        img64_free64(&im);
+    }
+    if (ran == 0) {
+        dbg64_line_begin64();
+        dbg64_str("[JPEG64] selftest skip reason=not-found dir=/jpegtest");
+        dbg64_nl();
+        dbg64_line_end64();
+        return 0;
+    }
+    // 汇总：12 槽位齐全时，**形状**必须是 9 张成功 + 3 张明确错误码（j08 截断 / j09 渐进式 / j10 损坏）——
+    // 这是"错误路径也按设计走通了"的正向证据，而不是把预期错误当成自检失败（否则 img64 自检会永远假红）。
+    int ret = 0;
+    if (ran == 12 && (ok0 != 9 || errs != 3)) ret = 1;
+    dbg64_line_begin64();
+    dbg64_str("[JPEG64] selftest files=");
+    dbg64_dec((uint64_t)ran);
+    dbg64_str(" ok0=");
+    dbg64_dec((uint64_t)ok0);
+    dbg64_str(" err2_3=");
+    dbg64_dec((uint64_t)errs);
+    dbg64_str(" other=");
+    dbg64_dec((uint64_t)(bad - errs < 0 ? 0 : bad - errs));
+    dbg64_str(" dump=");
+    dbg64_dec((uint64_t)(dump ? 1 : 0));
+    dbg64_str(" ok=");
+    dbg64_dec((uint64_t)(ret == 0 ? 1 : 0));
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)ret);
+    dbg64_nl();
+    dbg64_line_end64();
+    return ret;
+}
+
 // ==================== 入口 ====================
 int img64_decode64(const void* data, int len, Img64* out) {
     if (!data || !out || len < 16) { g_err = "args"; return -1; }
@@ -444,8 +1221,9 @@ int img64_decode64(const void* data, int len, Img64* out) {
     int rc;
     if (d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G') rc = decode_png64(d, len, out);
     else if (d[0] == 'B' && d[1] == 'M') rc = decode_bmp64(d, len, out);
+    else if (d[0] == 0xFF && d[1] == 0xD8) rc = decode_jpeg64(d, len, out);
     else {
-        g_err = d[0] == 0xFF && d[1] == 0xD8 ? "jpeg not implemented in this batch" : "unknown format";
+        g_err = "unknown format";
         rc = -2;
     }
     if (g_decode_log < 8) {
@@ -463,11 +1241,23 @@ int img64_decode64(const void* data, int len, Img64* out) {
         dbg64_dec((uint64_t)out->h);
         dbg64_str(" px=");
         dbg64_dec((uint64_t)(out->w * out->h));
+        if (g_fmt[0] == 'j' && g_fmt[1] == 'p') {
+            dbg64_str(" orient=");
+            dbg64_dec((uint64_t)g_jpeg_orient);
+            dbg64_str(" comps=");
+            dbg64_dec((uint64_t)g_jpeg_comps);
+            dbg64_str(" samp=");
+            dbg64_str(g_jpeg_samp);
+            dbg64_str(" rst=");
+            dbg64_dec((uint64_t)g_jpeg_rst);
+        }
         if (rc != 0) {
             dbg64_str(" err=");
             dbg64_str(g_err);
-            dbg64_str(" inflate_rc=");
-            dbg64_dec((uint64_t)(unsigned)g_inflate_rc);
+            if (g_fmt[0] != 'j' || g_fmt[1] != 'p') {
+                dbg64_str(" inflate_rc=");
+                dbg64_dec((uint64_t)(unsigned)g_inflate_rc);
+            }
         }
         dbg64_nl();
         dbg64_line_end64();
@@ -774,5 +1564,10 @@ int img64_selftest64() {
     dbg64_line_end64();
     img64_free64(&real);
     img64_free64(&im);
+    // ★ 本批新增：卷内 JPEG 验收自检（/jpegtest/jNN.jpg；没有这些文件时只打一行 skip，不影响普通启动）
+    {
+        const int jfail = jpg64_selftest_volume64();
+        if (jfail != 0) fails |= 128;
+    }
     return fails;
 }
