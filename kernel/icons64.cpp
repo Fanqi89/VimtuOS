@@ -28,9 +28,13 @@
 //   会让卷根条目数 +1，把 fs_term_test 的"rm 之后 entries 恰好 -1"和 fd64 目录缓存（16 条上限）
 //   这类既有断言顶出边界（实测：用 /icons 时卷根被顶到 16 条、被截断）。所以复用 /etc。
 #define ICON64_PACK_VFS_PATH "/etc/iconpack.bin"
-// 构建期内嵌的图标包原始字节（build64.sh：cd $BUILD && objcopy -I binary iconpack.bin iconpack_bin.o）
-extern "C" const uint8_t _binary_iconpack_bin_start[];
-extern "C" const uint8_t _binary_iconpack_bin_end[];
+// ★ 本批（预算收口）：包的字节**不再内嵌内核**（原来是 objcopy 进来的 iconpack_bin.o，49,192 B ——
+//   占内核文件 1.4%）。两条来源都改成"从盘上现读"：
+//     ① 系统卷 /etc/iconpack.bin（正常交付路径：构建期由 tools/demo_pack_win.py 写进卷，src=vfs）；
+//     ② 原始区（同一份字节也作为 build64/demo64_raw.bin 的一个 blob 写在**内核区尾部 LBA**，
+//        内核按 LBA 现读进 .bss）—— 裸盘/空夹具没有卷时用它（src=raw），见 kernel/demo64.cpp。
+//   于是内核二进制里**一个图标字节都没有**（构建期探针门禁可证）。
+#include "demo64.h"          // demo64_blob_find64（原始区：图标包的盘上来源）
 
 #define ICON64_MAX_ENTRIES   256
 #define ICON64_CACHE_MAX     64
@@ -261,10 +265,14 @@ int icons64_init64() {
         uint32_t pty = 0, psz = 0;
         const int have = (vfs64_stat_on64(sys, ICON64_PACK_VFS_PATH, &pty, &psz) == 0 && pty == VFS64_TYPE_FILE);
         if (!have) {
-            const uint32_t blen = (uint32_t)(_binary_iconpack_bin_end - _binary_iconpack_bin_start);
-            if (blen >= ICON64_HDR_BYTES && blen <= ICON64_PACK_MAX_BYTES) {
+            /* ★ 本批（预算收口）：字节来自**原始区**（不再有内嵌 symbol）。demo64_blob_find64 返回
+             *   内核 .bss 里的原始区缓冲（按 LBA 现读一次，之后查表命中），把它写进卷是安全的。
+             *   裸盘/空夹具没有原始区时返回 0 -> 如实跳过，下面还有 LBA 兜底与程序化回落。 */
+            uint32_t blen = 0;
+            const uint8_t* pbytes = demo64_blob_find64(ICON64_PACK_VFS_PATH, &blen);
+            if (pbytes && blen >= ICON64_HDR_BYTES && blen <= ICON64_PACK_MAX_BYTES) {
                 panic64_watchdog_pause64();              // 写 49KB 到卷：长 I/O，别让看门狗误判
-                (void)img64_install_blob64(ICON64_PACK_VFS_PATH, _binary_iconpack_bin_start, blen,
+                (void)img64_install_blob64(ICON64_PACK_VFS_PATH, pbytes, blen,
                                            "build/iconpack.bin");
                 panic64_watchdog_unpause64();
             }
@@ -297,24 +305,22 @@ int icons64_init64() {
             }
         }
     }
-    // ---- 1a2) ★ 本批（资源外置）：**无卷盘（裸 system.img）直接用内嵌字节** ----
-    // 为什么需要：本轮把内核里三张 128x128 的 raw 桌面/ Dock 位图（各 65,536 B）搬进了系统卷
-    //   （/etc/icon_mypc.bin 等），裸 system.img 没有卷，取不到那三张位图了；而**图标包字节本来
-    //   就在内核里**（49,192 B，启动期要装进卷的那份），无卷时直接就地解析它 —— 桌面/Dock/开始菜单
-    //   照样是"真图标"，不必回落到程序化绘制。打点里 src=builtin 如实标出这条来源。
+    // ---- 1a2) ★ 本批（预算收口）：**无卷盘（裸 system.img）时从原始区读包** ----
+    // 为什么需要：内核里**不再有**包的字节（外置到原始区 + 系统卷），而裸 system.img 没有卷；
+    //   原始区在内核区尾部（构建期 dd 写入），demo64_blob_find64 按需把它读进 .bss 再按路径查表。
     // ★ **有卷**时不走这条路：卷里的包才是真源，坏包必须如实报 bad=/absent（tests/icons64_test.py
-    //   场景 ②(a)/(b) 钉的就是这个语义）—— 绝不拿内嵌副本把坏包"圆过去"。
+    //   场景 ②(a)/(b) 钉的就是这个语义）—— 绝不拿盘上副本把坏包"圆过去"。
     if (!g_pack && vfs64_system_slot64() < 0) {
-        const uint32_t blen = (uint32_t)(_binary_iconpack_bin_end - _binary_iconpack_bin_start);
-        if (blen >= ICON64_HDR_BYTES && blen <= ICON64_PACK_MAX_BYTES &&
-            ic_pack_ok(_binary_iconpack_bin_start, blen)) {
+        uint32_t blen = 0;
+        uint8_t* pbytes = (uint8_t*)demo64_blob_find64(ICON64_PACK_VFS_PATH, &blen);
+        if (pbytes && blen >= ICON64_HDR_BYTES && blen <= ICON64_PACK_MAX_BYTES &&
+            ic_pack_ok(pbytes, blen)) {
             int bad = 0;
-            uint8_t* p = (uint8_t*)_binary_iconpack_bin_start;   // .rodata：只读解析，绝不写回
-            if (ic_parse_pack(p, blen, &bad) == 0) {
-                g_pack = p;                                      // .rodata：不 kmalloc、不释放
+            if (ic_parse_pack(pbytes, blen, &bad) == 0) {
+                g_pack = pbytes;                                 // 原始区缓冲（.bss）：不 kmalloc、不释放
                 g_pack_drive = -1;
-                g_pack_lba = 0;                                  // 打点里 lba=0/drive=-1 = 不来自内核区 LBA
-                g_pack_src = "builtin";
+                g_pack_lba = 0;                                  // 打点里 lba=0 = "不是直接从某个盘 LBA 解析的"
+                g_pack_src = "raw";
                 g_pack_bad = bad;
             }
         }

@@ -311,15 +311,18 @@ PYFONTZ
 # OS 内核用同一批资源对象（直接复用）
 cp "$BUILD"/font_*_z.o "$BUILD"/icon_start_mini.o "$BUILD/os/"
 cp "$BUILD"/kaisi_png.o "$BUILD/os/"      # 只给系统内核（桌面用）
-# ★ A4-2a：**图标包搬进 VimtuFS2 系统卷** —— 包字节不再放在"内核区尾部（LBA 7497..8008）"，
-#   改成把 build/iconpack.bin 内嵌进**系统内核**（objcopy -> .rodata），启动期由 icons64 幂等
-#   装进系统卷的 /icons/pack.bin，之后一切加载都从**卷**里读（[ICON64] load … src=vfs）。
-#   为什么内嵌：安装器建出来的盘、测试夹具盘上"卷里的包"必须有个来源，而安装器侧不在本批可改范围；
-#   内嵌的代价只有 49 KB，换来的却是内核区从 7,488 扇区放宽到 **8,000 扇区**（+262,144 B）。
+# ★ 本批（预算收口，替代 A4-2a 的"内嵌"做法）：**图标包不再内嵌内核**。
+#   原来的做法：build/iconpack.bin 用 objcopy 编成 iconpack_bin.o 链进系统内核（49,192 B），
+#   启动期由 icons64 幂等装进系统卷。那 49 KB 就是本批内核越线（余量 648,928 B < R=655,360 B）的
+#   直接原因；而同一份字节**本来就要**写进系统卷和内核区尾部原始区 —— 于是改成：
+#     ① 交给 tools/demo_pack_win.py 当成第 19 个 blob：进原始区（内核按 LBA 现读，裸盘/空夹具兜底）
+#        + 进系统卷 /etc/iconpack.bin（正常交付路径，运行期 src=vfs）；
+#     ② kernel/icons64.cpp 的两条来源都改成 demo64_blob_find64()（原始区按需读进 .bss 再查表），
+#        内嵌 symbol 与 extern 全部删除 —— 内核二进制里一个图标字节都没有（下面的探针门禁自动覆盖，
+#        因为 BLOBS 里每一项都会被 gate.check() 断言"不得出现在内核里"）。
+#   内核净减 49,192 B（系统内核；build/iconpack.bin 仍要复制到 build64/ 供打包工具读取）。
 cp "$RES/iconpack.bin" "$BUILD/iconpack.bin"
-(cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 iconpack.bin iconpack_bin.o)
-cp "$BUILD/iconpack_bin.o" "$BUILD/os/"
-echo "    内嵌图标包（系统内核）：$RES/iconpack.bin = $(stat -c%s "$RES/iconpack.bin") B -> 启动期装进系统卷 /icons/pack.bin"
+echo "    图标包外置：$RES/iconpack.bin = $(stat -c%s "$RES/iconpack.bin") B -> 原始区 blob + 系统卷 /etc/iconpack.bin（内核里 0 字节）"
 
 echo "==> Rust 模块（gui_rs crate：设计 Token 表 + 主题配色计算；项目路线 C + C++ + Rust）"
 # 为什么单独一段：Rust 用 `rustc --target x86_64-unknown-none` 编成**可直接被 ld.lld 链接**
@@ -807,7 +810,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/netraw64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/hda64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD"/demo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
-    "$BUILD/os"/kaisi_png.o "$BUILD/os"/iconpack_bin.o
+    "$BUILD/os"/kaisi_png.o
 $OBJCOPY -O binary "$BUILD/kernel64_os.elf" "$BUILD/kernel64_os.bin"
 
 KBSZ=$(stat -c%s "$BUILD/kernel64.bin")
@@ -857,7 +860,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/hda64.o \
         "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
         "$BUILD"/demo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
-        "$BUILD/os"/kaisi_png.o "$BUILD/os"/iconpack_bin.o   # ★ 收口修：图标包也是内嵌对象（与系统内核链接行一致）
+        "$BUILD/os"/kaisi_png.o    # 图标包已外置（原始区 + 系统卷），不再是内嵌对象
     $OBJCOPY -O binary "$BUILD/kernel64_os_cr3exp.elf" "$BUILD/kernel64_os_cr3exp.bin"
     echo "实验内核 OK. $BUILD/kernel64_os_cr3exp.bin = $(stat -c%s "$BUILD/kernel64_os_cr3exp.bin") bytes"
 fi
@@ -888,16 +891,13 @@ fi
 dd if="$BUILD/demo64_raw.bin" of="$BUILD/system.img" seek="$DEMO64_RAW_LBA" conv=notrunc status=none
 echo "    演示程序原始区：$DEMO64_RAW_BYTES B -> system.img LBA $DEMO64_RAW_LBA 起（内核区尾部；内核侧按 LBA 用 ata64_read 现读）"
 
-# ---- ★ A4-2a：图标包已**搬进 VimtuFS2 系统卷**（内核区尾部不再预留、也不再写入 dd）。----
-#      改动前：内核区尾部 LBA 7497..8008 被图标包区间占住 -> 系统内核只能用 7,488 扇区
-#              （= 3,833,856 B；实测剩 272 B 余量）。
-#      改动后：这段区间**全部交还内核**（内核可用到 LBA 8008 = 8,000 扇区 = 4,096,000 B，
-#              +262,144 B)；图标包字节改由系统内核内嵌、启动期装进卷的 /icons/pack.bin
-#              （见上面 objcopy 段与 kernel/icons64.cpp 的 icpack 加载路径）。
-#      两道断言仍然保留（把"内核不许越界"钉死，只是边界从 LBA 7497 放宽到 8008）：
-#        ① 内嵌的包字节不能超过 icons64.h 的 ICON64_PACK_MAX_SECTORS 上限（卷里那份的大小上限）；
+# ---- ★ 本批（预算收口）：图标包的**字节一个都不在内核里**（原始区 blob + 系统卷文件两条来源）。----
+#      改动史：① 最早放"内核区尾部 LBA 7497..8008"-> ② A4-2a 改成内嵌系统内核（49,192 B，换来内核区
+#      从 7,488 扇区放宽到 8,000 扇区）-> ③ **本批**：内嵌那 49 KB 就是越线元凶（实测余量 648,928 B
+#      < R=655,360 B），于是改成"原始区 blob + 系统卷 /etc/iconpack.bin"，内核净减 49,192 B。
+#      两道断言仍然保留（把"内核不许越界"钉死）：
+#        ① 包字节不能超过 icons64.h 的 ICON64_PACK_MAX_SECTORS 上限（卷里那份的大小上限）；
 #        ② 系统内核不能长过内核区（LBA 9..8008）。
-ICONPACK_MAX_SECTORS=512                       # = kernel/icons64.h 的 ICON64_PACK_MAX_SECTORS
 ICONPACK_BYTES=$(stat -c%s "$RES/iconpack.bin")
 ICONPACK_SECTORS=$(( (ICONPACK_BYTES + 511) / 512 ))
 KERNEL_OS_SECTORS=$(( (OSSZ + 511) / 512 ))
@@ -910,13 +910,10 @@ if [ "$KERNEL_OS_SECTORS" -gt "$KERNEL_SECTORS" ]; then
     echo "ERROR: 系统内核（$OSSZ B = $KERNEL_OS_SECTORS 扇区）超出内核区 $KERNEL_SECTORS 扇区（$KERNEL_AREA_BYTES B）" >&2
     exit 1
 fi
-echo "    内核区（图标包搬走后）：LBA $KERNEL_LBA..$((KERNEL_LBA + KERNEL_SECTORS - 1)) = $KERNEL_SECTORS 扇区 = $KERNEL_AREA_BYTES B 全部可用；"
-echo "                            系统内核 $OSSZ B / $KERNEL_OS_SECTORS 扇区（余 $((KERNEL_AREA_BYTES - OSSZ)) B；改动前上限 7,488 扇区 = $((7488 * 512)) B）"
-echo "    图标包：$ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）**内嵌进系统内核** -> 启动期装进系统卷 /icons/pack.bin（运行期 src=vfs）"
 KERNEL_FREE_BYTES=$((KERNEL_AREA_BYTES - OSSZ))
-echo "    演示程序外置（本批）：18 份演示 blob（合计 $DEMO64_RAW_BYTES B 含对齐）搬出内核二进制；"
-echo "                            交付 = 系统卷文件（tools/demo_pack_win.py 写入 + 逐字节回读自检）；"
-echo "                            空夹具兜底 = 内核区尾部的演示程序原始区（LBA $DEMO64_RAW_LBA 起，内核里只有偏移表）；"
+echo "    内核区（图标包外置后）：LBA $KERNEL_LBA..$((KERNEL_LBA + KERNEL_SECTORS - 1)) = $KERNEL_SECTORS 扇区 = $KERNEL_AREA_BYTES B 全部可用；"
+echo "                            系统内核 $OSSZ B / $KERNEL_OS_SECTORS 扇区（余 $((KERNEL_AREA_BYTES - OSSZ)) B；改动前上限 7,488 扇区 = $((7488 * 512)) B）"
+echo "    图标包：$ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）**内核里 0 字节** -> 原始区 blob + 系统卷 /etc/iconpack.bin（运行期 src=vfs）"
 echo "                            系统内核 3,436,080 B -> $OSSZ B；余量 $KERNEL_FREE_BYTES B = $((KERNEL_FREE_BYTES / 1024)) KiB（本批目标 ≥ 750 KiB = 768,000 B）"
 
 # ★ 本批的硬证据：18 份演示 blob 在**两份内核二进制**里都搜不到

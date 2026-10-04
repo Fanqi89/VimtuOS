@@ -65,6 +65,11 @@ BLOBS = [
     ("/bin/libctest_c.bin", "user_libctest.bin",  0o655),
     ("/bin/fbdemo_c.bin",   "user_fbdemo.bin",    0o655),
     ("/bin/fbdemo64.bin",   "user_fbdemo64.bin",  0o655),
+    # ★ 本批（预算收口）：**图标包**也走这条外置路线 —— 它原来是内嵌进系统内核的 objcopy 对象
+    #   （49,192 B，占内核文件 1.4%），现在改成：① 进原始区（内核按 LBA 现读：裸盘/空夹具兜底）
+    #   ② 进系统卷 /etc/iconpack.bin（就是 kernel/icons64.cpp 运行期读的那份，src=vfs）。
+    #   于是内核里一个字节都不留，内核预算**净减 49,192 B**（构建期探针门禁可证）。
+    ("/etc/iconpack.bin",    "iconpack.bin",       0o644),
 ]
 
 
