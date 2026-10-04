@@ -35,3 +35,47 @@
 | `gui_rs/assets/icons/LICENSE` | https://raw.githubusercontent.com/twbs/icons/main/LICENSE | MIT/Apache-2.0 | `0fb3e11bd57e896c5a512afd64864d28a37de45d19835016c87ca1ad19ead969` |
 | `gui_rs/assets/fonts/MaterialIcons-Regular.ttf` | https://raw.githubusercontent.com/google/material-design-icons/master/font/MaterialIcons-Regular.ttf | MIT/Apache-2.0 | `ef149f08bdd2ff09a4e2c8573476b7b0f3fbb15b623954ade59899e7175bedda` |
 | `gui_rs/assets/fonts/LICENSE-MaterialIcons.txt` | https://raw.githubusercontent.com/google/material-design-icons/master/LICENSE | MIT/Apache-2.0 | `58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd` |
+| `gui_rs/assets/icons/system/archive.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/file-earmark-zip.svg | MIT | `e96540089a64af858a7442b807050a7f39f75de390fec2b6cd6bf53f3cb2d819` |
+| `gui_rs/assets/icons/apps/archive-mgr.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/file-zip.svg | MIT | `324ce65051e7524b45f1d166d62875248a926179b2c7c9473fdba3317b043399` |
+| `gui_rs/assets/icons/system/arrow-repeat.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/arrow-repeat.svg | MIT | `2705f6572d27f2330329a5f87e6d861065d221ee56d60870f60486d2ab747c85` |
+| `gui_rs/assets/icons/system/arrow-up.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/arrow-up.svg | MIT | `b6d86790781ac475d20f54ead8284e26baadd2fb867250455cf7aa7030bd7ce3` |
+| `gui_rs/assets/icons/system/audio.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/file-earmark-music.svg | MIT | `6cdce30d41fa3b32814d76b4c28671ffbc581def5c710669b2986b4115190858` |
+| `gui_rs/assets/icons/system/battery-charging.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/battery-charging.svg | MIT | `66ee6db89ccf770df02e242cd566b0e0eb7771518670f7c3b40271bae576165b` |
+| `gui_rs/assets/icons/system/bell-slash.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/bell-slash.svg | MIT | `5ba696e4677607e30e7fada2db3c1d451e672edc944efeb963817a8c024e6c21` |
+| `gui_rs/assets/icons/system/binary.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/file-binary.svg | MIT | `43d61cc8b32ba49325a092966ef6e9b140f717b172bf8b753d1c71b96038fc56` |
+| `gui_rs/assets/icons/system/calendar.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/calendar3.svg | MIT | `2c75e525ebf6ab088b305e8ad832808c6949f94bc8039b41418611d5c46dea96` |
+| `gui_rs/assets/icons/system/chevron-down.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/chevron-down.svg | MIT | `6c98af73d9cd64d0f4ae890c40566a436a1cc904af93c283e52111af2d4ba44c` |
+| `gui_rs/assets/icons/system/chevron-up.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/chevron-up.svg | MIT | `077ab410b6aefd5a064c0955c19a8f086fffaf5e08c7b6eea58f611cd15e8853` |
+| `gui_rs/assets/icons/system/clipboard.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/clipboard.svg | MIT | `b5cd78a6c86bcc0705555be880000908b81030acc7c9a616762d1edaacf71a98` |
+| `gui_rs/assets/icons/system/clock.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/clock.svg | MIT | `5089328eea73934d1bf98b30e2f111c983f1455243b06095b1454a36c462e7b2` |
+| `gui_rs/assets/icons/system/copy.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/files.svg | MIT | `d57b82c30feaaa70eb740732fe7b6be33f496903e8ef49267f03344c3bf50c89` |
+| `gui_rs/assets/icons/system/dash.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/dash.svg | MIT | `bef4ce3e81a16cb8e0b935d0b9c235c83be59f9f0db6665bb5b4efe1ecee5eaf` |
+| `gui_rs/assets/icons/system/disk.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/hdd-stack.svg | MIT | `85cbcca9c66ff7c4cd417f29fe5368e2625196f7e7cdc797b3c47fa78e36e1cc` |
+| `gui_rs/assets/icons/system/document.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/file-earmark-text.svg | MIT | `1c6745b3c4782b0af852b48c8ad180c9f9c635926d5c458dc333689b8c3c4831` |
+| `gui_rs/assets/icons/system/download.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/download.svg | MIT | `ef82782835351c43f0e41025888b00459268a767113d33524d4f8fbfe8008c16` |
+| `gui_rs/assets/icons/apps/editor.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/journal-text.svg | MIT | `72311fb829c2499196797bc4212bc36cc030e1ab9a42e327cc79475383a8bcc0` |
+| `gui_rs/assets/icons/system/executable.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/file-earmark-code.svg | MIT | `80b5d453ba2c70ed733a998e0a8b462eb9ff895b48f543ddc1819415106b7198` |
+| `gui_rs/assets/icons/system/file.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/file-earmark.svg | MIT | `00aa29cf6c7e47245a2d1ca06dda98da1085834dc6780043906745b48e3d0123` |
+| `gui_rs/assets/icons/system/folder.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/folder.svg | MIT | `2f7eadeca491fd75631de65102b3332fa57eff791b16058b428a537eb736f507` |
+| `gui_rs/assets/icons/system/folder-plus.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/folder-plus.svg | MIT | `bf339b833cb480f4255c8bd26f51e3f4b970935f555b8bc9f7b46880879a73fa` |
+| `gui_rs/assets/icons/system/fullscreen.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/fullscreen.svg | MIT | `c3ffb75a66bfaec3c6a00e332ef941ad984f11bcf3991208f2c22202dabdf501` |
+| `gui_rs/assets/icons/system/headphones.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/headphones.svg | MIT | `315ad592b90899fbaea5c8d55c1021bc1bb687f0d4bbb4caa5113c15132890ea` |
+| `gui_rs/assets/icons/system/house.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/house.svg | MIT | `81a689b3f1b0722f5168e97041dbe9b7da8cb61024c7b850dfc9f0683820fc19` |
+| `gui_rs/assets/icons/system/image.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/file-earmark-image.svg | MIT | `ab296674b3d6950ccc6b7ec94cb18e50867f1677beba6cff55f523575da3a7b5` |
+| `gui_rs/assets/icons/apps/image-viewer.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/images.svg | MIT | `340af1c711c2d2eb88f9c564e79c61dd7e2f87bc9546d6b1b339028683782603` |
+| `gui_rs/assets/icons/system/info-square.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/info-square.svg | MIT | `fe166ef6e8943cb7df1ae5b34e21d6460d5de80a87a9c9160b2d65ce0b6fc393` |
+| `gui_rs/assets/icons/system/list.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/list-ul.svg | MIT | `9934cbd5cc63ece4b6536cb80e0ddf8c7e768787a4f1f6948b9e636900e9b865` |
+| `gui_rs/assets/icons/system/pencil.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/pencil.svg | MIT | `890d0ad4a6d4a41ef2e7365596aac6910b3d19f772a4da85ff89129303a7979c` |
+| `gui_rs/assets/icons/apps/player.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/play-circle.svg | MIT | `6c16b498852eb031a793221a5c8e2fadc4b96eedcf6907ba11e28cb285744a93` |
+| `gui_rs/assets/icons/system/refresh-circle.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/arrow-clockwise.svg | MIT | `63a5cf9bd5c8e6b73ce6030a1c812a09ab97be8b1ff5aa0d5b33751bc415170c` |
+| `gui_rs/assets/icons/system/scissors.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/scissors.svg | MIT | `7719593c3d970d61063fc25e91dd637e94f2bd2a11a65d60c41f5dd23c7e482a` |
+| `gui_rs/assets/icons/system/shield.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/shield-lock.svg | MIT | `324147b00dff65505f7b65b671a31656216158f7111f1d59feaf34f2dd9b489d` |
+| `gui_rs/assets/icons/system/trash2.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/trash3.svg | MIT | `7fd272a8464f421697ec9eaf8ad3fd670f03fffe009a9269784617eecfd83b99` |
+| `gui_rs/assets/icons/system/upload.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/upload.svg | MIT | `7f04ead066f567749d3d67a2f69dbcc8aef6051dae86c38659e6a74f1ca9fdba` |
+| `gui_rs/assets/icons/system/user-avatar.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/person-circle.svg | MIT | `a485181163a8c91cd1c387d5ae73fe8fd3f84d9c8c5f43c291847f31bb89ee53` |
+| `gui_rs/assets/icons/system/video.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/file-earmark-play.svg | MIT | `57a82a5af0d44ebc5a8de4098d8fcf9e7d4d8ab3422a8b38ac9f4c9d97ab38b5` |
+| `gui_rs/assets/icons/system/wifi-off.svg` | https://raw.githubusercontent.com/twbs/icons/main/icons/wifi-off.svg | MIT | `1c3990b804510c490194e0666d232596bcdbb1d18bdbceb03173adfae24cf406` |
+
+<!-- ★ 以下 39 行由 SDK 图标扩充批次追加（同一生成契约：上游 raw URL + 逐文件 sha256；
+     仍全部来自 twbs/icons 的 MIT 素材，许可原文仍是本目录的 LICENSE）。
+     注意：tools/fetch_icons.py 只会写它自己那 30 个 SVG + 2 个字库，不会覆盖本批。 -->

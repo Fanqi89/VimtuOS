@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  sdk/software-template/icons/app-template.svg
+  —— VimtuOS 应用图标的**自绘示例**（无第三方素材；本仓库按 CC0-1.0 释出，可用作你自己应用的起点）。
+
+  为什么长这样（照着图标规范来）：
+    * **纯 fill 路径**：没有 stroke / filter / mask / <use> / <text> / 渐变 —— 本仓库自研光栅器
+      tools/svg2png.py 只支持这些子集，越界会**明确报错**（不静默画错）；
+    * 16x16 viewBox + 单一实色：运行期会把它当**掩码**（白 + alpha）按主题/应用调色板着色，
+      所以**别在 SVG 里烤死颜色**（fill="currentColor" 或纯白都行，这里写 #fff）；
+    * 形状在 16 px 下仍然清楚（内切方块 + 中心十字 = "通用应用"符号）。
+
+  用法：把它复制成 gui_rs/assets/icons/apps/<你的应用名>.svg，改形状后跑
+    py -3 sdk/software-template/tools/iconpack_ext.py --only <你的应用名> --no-vol
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="#fff">
+  <path d="M2 2h5v5H2zM9 2h5v5H9zM2 9h5v5H2z"/>
+  <path d="M10.5 8.5h2v2h2v2h-2v2h-2v-2h-2v-2h2z"/>
+</svg>
