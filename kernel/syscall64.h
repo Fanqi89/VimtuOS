@@ -214,6 +214,73 @@ static const int64_t  SND64_EFAULT64 = -2;   // pcm_va 不是用户可读的 [va
 static const int64_t  SND64_EINVAL64 = -3;   // fmt != 0x11 / frames == 0 / frames > 上限
 static const int64_t  SND64_EAGAIN64 = -4;   // 单流驱动正忙（另一段流在跑）/ 流超时（驱动如实报错）
 static const int64_t  SND64_ENODEV64 = -5;   // 没有 HDA 控制器 / 通路没建立（hda64 not ready）
+// ==================== ★ 本批：目录枚举 ABI（自有 ABI 50/51/52 dir_open/dir_read/dir_close）==========
+// 目标：ring3 的**目录枚举**看**实时**目录（本次开机里 mkdir/cp/tar 出来的文件），不再依赖构建期
+// 快照 /etc/vimtu.dirs。选它而不是 Linux getdents64(217) 的理由（报告里有逐条对照）：
+//   ① 内核**已有**的目录枚举能力是"游标式一条一条读"（vfs64/fd64 的目录句柄），这个 ABI 就是它的
+//      直通；getdents64 的"一次一大块 linux_dirent64"是另一套布局，本内核没有那个东西；
+//   ② busybox 走自有 ABI 不需要动它的 Linux 号段（217 在本项目文档里是被点名的**缺口**，
+//      补它会牵扯 open(O_DIRECTORY)/fd 语义，属于另一条线）；
+//   ③ 布局按本工具的实际需要定（名字 + 类型 + 大小 + mtime 一次拿全），用户态不用再 stat 一遍。
+// **只加校验 + 转发**：内核把每个调用转给 kernel/fd64.cpp 的既有**每进程目录 fd**
+//   （fd64_opendir64 / fd64_readdir64 / fd64_close64）—— 路径解析、**权限判定（vfs64 的 [PERM64]）**、
+//   卷身份、以及"进程退出 / execve 时随 fd 表一起回收"全部复用 fd64 的既有语义，**不加新策略**。
+// **策略留用户态**：排序 / 过滤 / 递归 / 格式化都在 user/busybox/vimtu_dirent.c（busybox 的
+//   opendir/readdir/closedir 落在它上面），内核这里不排序、不过滤、不递归。
+//
+// 50 dir_open(path)     rdi = 用户态 NUL 结尾的**绝对路径**（调用方先和 getcwd 拼好）
+//                       -> >= 3 = 目录句柄（**就是每进程 fd 表里的一个 fd**，从 3 起分配）
+//                          < 0  = -errno（明确错误码；与 fd64/vfs64 同一口径）：
+//                            -2  ENOENT   路径不存在（含卷上某一级缺 x 进不去）
+//                            -13 EACCES   权限拒绝（目录缺 r；vfs64 已打 [PERM64] deny）
+//                            -20 ENOTDIR  不是一个目录（指向普通文件）
+//                            -24 EMFILE   fd 表满
+//                            -30 EROFS / -1 EPERM 等按既有语义原样透传
+//           校验顺序 = 判错顺序：用户指针 -> 空路径(EINVAL) -> fd64 打开（路径/权限）-> 目录性。
+// 51 dir_read(fd, out, cap)  rdi = 句柄；rsi = 用户缓冲；rdx = 缓冲字节数（cap >= DIR64_BUF_MIN64）
+//                       -> > 0 = **本次写入的字节数**（缓冲里是 0..N 条连续记录）
+//                          0   = 枚举结束（EOF）
+//                          < 0 = -errno（-9 EBADF 句柄无效 / -14 EFAULT 指针 / -22 EINVAL cap 太小）
+//           记录布局（**紧凑、定长头 + 变长名字**；namelen 不含结尾 NUL，记录紧跟一条条排）：
+//             struct Dir64Ent64 {
+//                 uint16_t name_len;   // +0  名字字节数 0..VFS64_NAME_MAX(31)
+//                 uint8_t  kind;       // +2  DIR64_KIND_FILE64(1) / DIR64_KIND_DIR64(2)（= VFS64_TYPE_*）
+//                 uint8_t  rsvd;       // +3  0
+//                 uint32_t size;       // +4  字节数（目录 = 0）
+//                 uint32_t mtime;      // +8  vfs64 打包时间戳（0 = 未知）
+//                 char     name[];     // +12 名字 + 结尾 NUL（name_len + 1 字节）
+//             };                       // 记录长度 = 12 + name_len + 1（<= 44）
+// 52 dir_close(fd)      rdi = 句柄 -> 0 = 已释放（引用计数 -1）；< 0 = -EBADF（无效/非目录句柄）
+//           **回收语义与 fd 逐条一致**：句柄是 fd 表里的一个槽；进程退出 / fd 表销毁走
+//           fd64_table_close_all64（逐槽 close、引用计数 -1，归零才真正释放对象）-> **不泄漏**。
+//           execve **默认保留** fd（与 fd64.h 第 18 条一致，本内核没有 O_CLOEXEC）。
+//
+// 打点（自动验收 tests/dir64_test.py grep，格式勿改；成功 open / read / close 各自 <= 96 行、
+//   失败的 open 单独 <= 48 行 —— 拒绝证据不会被成功行淹没）：
+//   [DIR64] open path=<p> slot=<fd>
+//   [DIR64] open FAILED path=<p> err=<n>            （n = -errno 的绝对值）
+//   [DIR64] read slot=<fd> items=<n>                （n = 本批条数；items=0 = 枚举结束）
+//   [DIR64] close slot=<fd>
+//   [DIR64] close FAILED slot=<fd> err=<n>
+// 记录头（名字是变长的，紧跟其后；这里只描述定长部分，布局与上面注释逐字节一致）：
+struct Dir64Ent64 {
+    uint16_t name_len;   // +0
+    uint8_t  kind;       // +2  DIR64_KIND_FILE64 / DIR64_KIND_DIR64
+    uint8_t  rsvd;       // +3
+    uint32_t size;       // +4
+    uint32_t mtime;      // +8
+    char     name[1];    // +12 name_len 字节 + 结尾 NUL（记录总长 = 12 + name_len + 1）
+};
+// ★ 安装介质内核没有 ring3，也不会用到这三号；它们**不是 enosys 号**（不进 [SYSCALL] enosys 清单）。
+static const uint64_t SYSCALL64_DIR64_OPEN_NR64  = 50;
+static const uint64_t SYSCALL64_DIR64_READ_NR64  = 51;
+static const uint64_t SYSCALL64_DIR64_CLOSE_NR64 = 52;
+// 目录项类型（与 vfs64 的 VFS64_TYPE_FILE / VFS64_TYPE_DIR 同值，省一层映射）
+static const uint32_t DIR64_KIND_FILE64 = 1u;
+static const uint32_t DIR64_KIND_DIR64  = 2u;
+static const uint32_t DIR64_ENT_HDR64   = 12u;   // Dir64Ent64 的定长头字节数（name 从 +12 起）
+static const uint32_t DIR64_BUF_MIN64   = 64u;   // dir_read 接收的最小缓冲（够放下一条最长记录）
+static const uint32_t DIR64_ENT_MAX64   = 12u + 31u + 1u;   // 一条记录的最大字节数（名字上限 31）
 // ==================== syscall 指令路径（给汇编入口 / usermode64 用）====================
 // 帧标记：syscall 指令路径的 int_no 槽填这个值（int 0x80 是 0x80）。改它必须同步
 // kernel/syscall_entry64.asm 的 %define FRAME_MARK。

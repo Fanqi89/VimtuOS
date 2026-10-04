@@ -1758,6 +1758,162 @@ static int64_t sc64_audio_play64(uint64_t pcm_va, uint64_t frames, uint64_t fmt)
     return rc;
 }
 
+// ==================== ★ 本批：目录枚举 ABI（自有 int 0x80 号 50/51/52）====================
+// 语义 / 记录布局 / 错误码 / 回收承诺的唯一说明见 kernel/syscall64.h 的"目录枚举 ABI（50/51/52）"段。
+// 这里只做**校验 + 转发**：每一个调用都转给 kernel/fd64.cpp 的既有**每进程目录 fd**
+// （fd64_opendir64 / fd64_readdir64 / fd64_close64）—— 路径解析、权限判定（vfs64 的 [PERM64] deny）、
+// 卷身份、以及"进程退出 / execve 时随 fd 表回收"全部复用 fd64 的既有语义。**不加新策略**。
+// ★ 目录枚举要读盘 —— 与终端 cmd_ls / sh64_serve64 同款：长操作期间临时停表看门狗（panic64.cpp 只在
+//   系统内核里链，安装介质不链它 -> 弱引用 + 判空，与 hda64_ready64 同一套写法）。
+void panic64_watchdog_pause64()   __attribute__((weak));
+void panic64_watchdog_unpause64() __attribute__((weak));
+static uint32_t g_dir64_log_open64  = 0;
+static uint32_t g_dir64_log_openfail64 = 0;
+static uint32_t g_dir64_log_read64  = 0;
+static uint32_t g_dir64_log_close64 = 0;
+static const uint32_t DIR64_LOG_MAX64   = 96;    // 成功 open / read / close 各自的行数上限（防刷屏）
+static const uint32_t DIR64_LOG_FAIL64  = 48;    // 失败 open 的**独立**上限（拒绝证据不会被成功行淹没）
+static const uint32_t DIR64_MAX_BATCH64 = 32;    // 单次 dir_read 最多产出的条目数（有界）
+static uint8_t g_dir64_page64[1024];             // dir_read 的 bounce（先攒好，再一次性拷给用户）
+static void dir64_log_open64(const char* path, int slot, int err) {
+    if (err == 0) {
+        if (g_dir64_log_open64 >= DIR64_LOG_MAX64) return;
+        g_dir64_log_open64++;
+        dbg64_line_begin64();
+        dbg64_str("[DIR64] open path=");
+        dbg64_str(path);
+        dbg64_str(" slot=");
+        dbg64_dec((uint64_t)slot);
+    } else {
+        if (g_dir64_log_openfail64 >= DIR64_LOG_FAIL64) return;
+        g_dir64_log_openfail64++;
+        dbg64_line_begin64();
+        dbg64_str("[DIR64] open FAILED path=");
+        dbg64_str(path);
+        dbg64_str(" err=");
+        dbg64_dec((uint64_t)(-err));
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void dir64_log_read64(int slot, int items) {
+    if (g_dir64_log_read64 >= DIR64_LOG_MAX64) return;
+    g_dir64_log_read64++;
+    dbg64_line_begin64();
+    dbg64_str("[DIR64] read slot=");
+    dbg64_dec((uint64_t)slot);
+    dbg64_str(" items=");
+    dbg64_dec((uint64_t)items);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void dir64_log_close64(int slot, int err) {
+    if (g_dir64_log_close64 >= DIR64_LOG_MAX64) return;
+    g_dir64_log_close64++;
+    dbg64_line_begin64();
+    if (err == 0) {
+        dbg64_str("[DIR64] close slot=");
+        dbg64_dec((uint64_t)slot);
+    } else {
+        dbg64_str("[DIR64] close FAILED slot=");
+        dbg64_dec((uint64_t)slot);
+        dbg64_str(" err=");
+        dbg64_dec((uint64_t)(-err));
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+}
+// 50 dir_open(path)：-> 每进程目录 fd（>=3）或 -errno。
+static int64_t sc64_dir_open64(uint64_t path_va) {
+    char path[LX64_PATHR_MAX];
+    if (lx64_user_str64(path_va, path, (uint32_t)sizeof(path)) != 0) {
+        syscall64_deny64(SYSCALL64_DIR64_OPEN_NR64, path_va);
+        return -LX64_EFAULT;
+    }
+    if (path[0] == 0) { syscall64_deny64(SYSCALL64_DIR64_OPEN_NR64, path_va); return -LX64_EINVAL; }
+    if (panic64_watchdog_pause64) panic64_watchdog_pause64();       // 要读盘：临时停表（与终端 cmd_ls 同款）
+    const int fd = fd64_opendir64(path);            // 路径解析 + 权限判定都在 fd64/vfs64 的既有路径里
+    uint32_t ty = 0;                                // 只读打开的普通文件不是目录句柄 -> 明确 ENOTDIR
+    int64_t rc = (int64_t)fd;
+    if (fd >= 0 && (fd64_stat64(fd, &ty, nullptr) != 0 || ty != VFS64_TYPE_DIR)) {
+        (void)fd64_close64(fd);
+        rc = -LX64_ENOTDIR;
+    }
+    if (panic64_watchdog_unpause64) panic64_watchdog_unpause64();
+    dir64_log_open64(path, (rc >= 0) ? (int)rc : 0, (rc >= 0) ? 0 : (int)rc);
+    return rc;
+    return (int64_t)fd;
+}
+// 51 dir_read(fd, out, cap)：把**尽可能多**的目录项写进用户缓冲，返回写入字节数（0 = 枚举结束）。
+static int64_t sc64_dir_read64(uint64_t fd_va, uint64_t out_va, uint64_t cap_va) {
+    const int fd = (int)fd_va;
+    const uint32_t cap = (uint32_t)cap_va;
+    if (cap < DIR64_BUF_MIN64) { syscall64_deny64(SYSCALL64_DIR64_READ_NR64, cap_va); return -LX64_EINVAL; }
+    if (!user64_range_ok64(out_va, cap)) { syscall64_deny64(SYSCALL64_DIR64_READ_NR64, out_va); return -LX64_EFAULT; }
+    // 父目录的规范化绝对路径 + 卷号：只为了给每条记录填 mtime（stat 不到就填 0 = 未知，绝不假装）。
+    char parent[FD64_PATH_MAX];
+    int pvol = -1;
+    const bool have_parent = (fd64_where64(fd, &pvol, parent, (int)sizeof(parent)) == 0);
+    const uint32_t outcap = (cap < (uint32_t)sizeof(g_dir64_page64)) ? cap : (uint32_t)sizeof(g_dir64_page64);
+    uint32_t used = 0;
+    int items = 0;
+    int err = 0;
+    if (panic64_watchdog_pause64) panic64_watchdog_pause64();        // 要读盘：临时停表（与终端 cmd_ls 同款）
+    for (;;) {
+        if (used + DIR64_ENT_MAX64 > outcap) break;                  // 放不下下一条（按最长记录算）
+        if (items >= (int)DIR64_MAX_BATCH64) break;
+        char nm[FD64_NAME_MAX];
+        uint32_t ty = 0, sz = 0;
+        const int r = fd64_readdir64(fd, nm, (int)sizeof(nm), &ty, &sz);
+        if (r < 0) { err = r; break; }            // -errno（含 -EBADF / -ENOTDIR）
+        if (r == 0) break;                                           // 枚举结束
+        uint32_t nl = 0;
+        while (nl < (uint32_t)VFS64_NAME_MAX && nm[nl] != 0) nl++;
+        uint32_t mt = 0;
+        if (have_parent) {
+            char full[FD64_PATH_MAX + FD64_NAME_MAX + 2];
+            uint32_t f = 0;
+            for (uint32_t k = 0; parent[k] != 0 && f + 1u < (uint32_t)sizeof(full); k++) full[f++] = parent[k];
+            if (f == 0 || full[f - 1u] != '/') { if (f + 1u < (uint32_t)sizeof(full)) full[f++] = '/'; }
+            for (uint32_t k = 0; k < nl && f + 1u < (uint32_t)sizeof(full); k++) full[f++] = nm[k];
+            full[f] = 0;
+            Fs64Stat64 st;
+            if (fs64_stat64(pvol, full, &st) == 0) mt = st.mtime;     // 与 shell ls -l 同一口径
+        }
+        // 记录 = 定长头 12B + 名字 + NUL（逐字节写，避免对 struct 的跨界写/别名问题）
+        uint8_t* e = g_dir64_page64 + used;
+        e[0]  = (uint8_t)(nl & 0xFFu);                 e[1]  = (uint8_t)((nl >> 8) & 0xFFu);
+        e[2]  = (ty == VFS64_TYPE_DIR) ? (uint8_t)DIR64_KIND_DIR64 : (uint8_t)DIR64_KIND_FILE64;
+        e[3]  = 0u;
+        const uint32_t esz = (ty == VFS64_TYPE_DIR) ? 0u : sz;
+        e[4]  = (uint8_t)(esz & 0xFFu);        e[5]  = (uint8_t)((esz >> 8) & 0xFFu);
+        e[6]  = (uint8_t)((esz >> 16) & 0xFFu); e[7]  = (uint8_t)((esz >> 24) & 0xFFu);
+        e[8]  = (uint8_t)(mt & 0xFFu);         e[9]  = (uint8_t)((mt >> 8) & 0xFFu);
+        e[10] = (uint8_t)((mt >> 16) & 0xFFu); e[11] = (uint8_t)((mt >> 24) & 0xFFu);
+        for (uint32_t k = 0; k < nl; k++) e[DIR64_ENT_HDR64 + k] = (uint8_t)nm[k];
+        e[DIR64_ENT_HDR64 + nl] = 0u;
+        used += DIR64_ENT_HDR64 + nl + 1u;
+        items++;
+    }
+    if (panic64_watchdog_unpause64) panic64_watchdog_unpause64();
+    if (used != 0) lx64_copy_to_user64(out_va, g_dir64_page64, (uint64_t)used);
+    dir64_log_read64(fd, items);
+    if (err != 0) return (int64_t)err;           // 出错：把 -errno 原样给用户（已经读到的部分丢弃）
+    return (int64_t)used;                                            // 0 = 枚举结束（EOF）
+}
+// 52 dir_close(fd)：释放目录句柄（= fd64_close64；引用计数 -1，进程退出时随 fd 表一起回收）。
+static int64_t sc64_dir_close64(uint64_t fd_va) {
+    const int fd = (int)fd_va;
+    uint32_t ty = 0;
+    if (fd64_stat64(fd, &ty, nullptr) != 0 || ty != VFS64_TYPE_DIR) {   // 不是有效的（目录）句柄
+        dir64_log_close64(fd, -LX64_EBADF);
+        return -LX64_EBADF;
+    }
+    const int r = fd64_close64(fd);
+    dir64_log_close64(fd, r);
+    return (int64_t)r;
+}
+
 
 
 
@@ -2077,6 +2233,21 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
     //   内核**只校验 + 转发**给 hda64_play64；策略（素材/音量/静音/采样率/混音）全在用户态。
     case 49:                                                    // audio_play(pcm_va, frames, format)
         ret = sc64_audio_play64(a1, a2, a3);
+        break;
+
+    // ★ 本批：目录枚举 ABI（自有 int 0x80 号 50/51/52）。语义/布局/错误码/打点：kernel/syscall64.h。
+    //   内核**只校验 + 转发**给 fd64 的每进程目录 fd；策略（排序/过滤/递归）全在用户态
+    //   （user/busybox/vimtu_dirent.c）。这三号**不是 enosys 号**。
+    case 50:                                                    // dir_open(path)
+        ret = sc64_dir_open64(a1);
+        break;
+
+    case 51:                                                    // dir_read(fd, out, cap)
+        ret = sc64_dir_read64(a1, a2, a3);
+        break;
+
+    case 52:                                                    // dir_close(fd)
+        ret = sc64_dir_close64(a1);
         break;
 
     default:

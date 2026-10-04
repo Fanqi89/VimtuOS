@@ -66,7 +66,7 @@ FORBIDDEN = ["PANIC", "TRIPLE FAULT", "[ELF64] reject", "[BBDRV] FAIL"]
 #   51 getsockname / 52 getpeername / 53 socketpair / 54 setsockopt / 55 getsockopt
 #   （用户态没有 TCP/IP 栈）
 #   137 statfs（df）/ 99 sysinfo（free/uptime）
-#   217 getdents（目录枚举；已由用户态 /etc/vimtu.dirs 索引替代，见报告）
+#   217 getdents（Linux 号段仍无；本批新增**自有 ABI 50/51/52** 提供实时目录枚举，见报告）
 #   131 sigaltstack? 不涉及
 GAP_SYSCALLS = {
     41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55,
@@ -120,6 +120,29 @@ def read_guest_file(img_path, parts):
         _, rec = hit
         cur = hit[0]
     return TP._read_file(vol, rec, total)
+
+
+def host_volume_root(img_path):
+    """宿主侧**独立解析**卷根（用 tools/tcc_pack_win.py 的解析器）-> [(name, is_dir)]。
+
+    用途：给"ring3 看到的根目录 == 盘上真实的根目录"提供一条**不依赖任何串口文本**的证据。
+    注意：它读的是**当前**的盘镜像（测试跑过 QEMU 之后，开机新建的 /home /root /logo 等都在里面）。"""
+    TP = load_mod("tcc_pack_win", "tcc_pack_win.py")
+    d = open(img_path, "rb").read()
+    vol = d[PART_MAIN_LBA * SECTOR:TARGET_SECTORS * SECTOR]
+    inodes = struct.unpack_from("<I", vol, 40)[0]
+    out = []
+    for _i, nm, rec in TP._entries(vol, 0, inodes):
+        out.append((nm, rec[0] == 2))
+    return out
+
+
+def host_volume_children(img_path):
+    return set(nm for nm, _isdir in host_volume_root(img_path))
+
+
+def host_volume_dirs(img_path):
+    return set(nm for nm, isdir in host_volume_root(img_path) if isdir)
 
 
 class Session:
@@ -344,6 +367,76 @@ def main():
             n = text.find("@@", k + 1)
             return text[k + 1:n if n > 0 else len(text)]
 
+        def payload_lines(section):
+            """去掉内核/用户态打点行（以 '[' 开头）后的正文行。"""
+            if section is None:
+                return []
+            out = []
+            for ln in section.splitlines():
+                s = ln.rstrip("\r")
+                if s.strip() and not s.lstrip().startswith("["):
+                    out.append(s)
+            return out
+
+        def bb_names(section):
+            """busybox `ls` 的名字集合（fd 1 认 TIOCGWINSZ -> 多列输出 -> 按空白切 token）。"""
+            names = set()
+            for s in payload_lines(section):
+                names.update(s.split())
+            return names
+
+        def shell_ls_entries(section):
+            """shell 内建 `ls` 的条目：目录 '  name/'、文件 '  name  N bytes'。"""
+            dirs, files = set(), set()
+            for s in payload_lines(section):
+                mm = re.match(r"^\s+(\S+)/$", s)
+                if mm:
+                    dirs.add(mm.group(1))
+                    continue
+                mm = re.match(r"^\s+(\S+)\s+\d+\s+bytes$", s)
+                if mm:
+                    files.add(mm.group(1))
+            return dirs, files
+
+        def bb_ls_l_names(section):
+            """busybox `ls -l` 的条目（最后一段是名字）。"""
+            names = set()
+            for s in payload_lines(section):
+                parts = s.split()
+                if len(parts) >= 6:
+                    names.add(parts[-1])
+            return names
+
+        def split_ls_l(raw):
+            """busybox `ls -l` 的**卷内文件原文** -> (目录名集合, 文件名集合)。
+
+            只认"第一列是 10 字符 mode"的行（落盘文件里不会有内核打点，这条路径本来就是为此设计的）；
+            名字取行内**最后一段**——本移植的 ls -l 里 uid/gid 两列实测是空的（列数不固定）。"""
+            dirs, files = set(), set()
+            if not raw:
+                return dirs, files
+            for ln in raw.decode("utf-8", "replace").splitlines():
+                mm = re.match(r"^([-dl])[rwxsStT-]{9}\s", ln)
+                if mm and len(ln.split()) >= 6:
+                    (dirs if mm.group(1) == "d" else files).add(ln.split()[-1])
+            return dirs, files
+
+        def split_shell_ls(raw):
+            """shell 内建 `ls` 的**卷内文件原文** -> (目录名集合, 文件名集合)。
+            形态：目录 '  name/'、文件 '  name  N bytes'。"""
+            dirs, files = set(), set()
+            if not raw:
+                return dirs, files
+            for s in raw.decode("utf-8", "replace").splitlines():
+                mm = re.match(r"^\s+(\S+)/$", s)
+                if mm:
+                    dirs.add(mm.group(1))
+                    continue
+                mm = re.match(r"^\s+(\S+)\s+\d+\s+bytes$", s)
+                if mm:
+                    files.add(mm.group(1))
+            return dirs, files
+
         # --- 驱动 / 多入口 ---
         b = sess.run_cmd("run /bin/busybox", wait="applet not found", timeout=60)
         t = sess.text_since(b)
@@ -364,9 +457,10 @@ def main():
         ap = sess.text_since(base)
 
         m = marked(ap, "LS")
-        H("ls /tcc（走用户态目录索引）", m is not None and "demo" in m and "libtcc1.a" in m)
+        H("ls /tcc（★ 本批：ring3 实时目录枚举 ABI，不再是构建期快照）",
+          m is not None and "demo" in m and "libtcc1.a" in m)
         m = marked(ap, "LS_L")
-        H("ls -l /etc 有真权限/大小/时间列（vimtu.dirs 7038 B / Jan 1 00:00）",
+        H("ls -l /etc 有真权限/大小/时间列（正则只锁形态：mode/links/user/group/size/time/name）",
           m is not None and re.search(r"-rw-r--r--\s+1\s+\d+\s+\w+\s+\d+\s+[\d:]+\s+vimtu\.dirs", m) is not None)
         m = marked(ap, "CAT")
         H("cat 逐行原文（alpha..delta）",
@@ -395,7 +489,7 @@ def main():
         m = marked(ap, "HEXDUMP")
         H("hexdump -C 打出 00000000 偏移行", m is not None and "00000000" in m)
         m = marked(ap, "FIND")
-        H("find /tcc -name *.c（走用户态目录索引）", m is not None and "hello.c" in m)
+        H("find /tcc -name *.c（★ 本批：走实时目录枚举）", m is not None and "hello.c" in m)
         m = marked(ap, "FILES")
         H("cp/mv/rm/mkdir 都成功（无 Permission denied / Operation not permitted）",
           m is not None and "denied" not in m and "not permitted" not in m)
@@ -426,6 +520,76 @@ def main():
         H("busybox gzip -k 生成 lines.txt.gz（ls -l 看得到大小）",
           m is not None and "lines.txt.gz" in m and "cannot create" not in m)
 
+        # --- ★ 本批：**实时目录枚举** —— 新建的文件必须立刻可见（以前走构建期快照，看不到）---
+        #   ★ 做法：把 `ls` 的输出**重定向进卷里的文件**，再在宿主侧逐字节读回来判定。
+        #     为什么不直接读串口：内核打点与用户输出在串口上按字节交错，`@@MARKER` 行偶发被打点
+        #     插进中间（实测 LIVE_AFTER 那次），落盘回读没有这个问题。
+        def gm_file(parts):
+            raw = read_guest_file(img, parts)
+            if raw is None:
+                return None
+            return set(x.strip() for x in raw.decode("utf-8", "replace").splitlines() if x.strip())
+
+        live_before = gm_file(["tmp", "bb", "live_before.txt"])
+        live_after = gm_file(["tmp", "bb", "live_after.txt"])
+        live_after_rm = gm_file(["tmp", "bb", "live_after_rm.txt"])
+        live_find = payload_lines(marked(ap, "LIVE_FIND"))
+        H("★ live：`ls /tmp/bb`（创建前，落盘回读）不含 livebb.txt（%s 条）"
+          % (len(live_before) if live_before is not None else None),
+          live_before is not None and "livebb.txt" not in live_before)
+        H("★ live：`ls /tmp/bb`（**创建后立刻**，落盘回读）**含** livebb.txt（%s 条）"
+          % (len(live_after) if live_after is not None else None),
+          live_after is not None and "livebb.txt" in live_after)
+        H("★ live：find /tmp/bb -name livebb.txt 立刻命中（%s）" % (live_find[:1] or ""),
+          any("livebb.txt" in x for x in live_find))
+        H("★ live：rm 之后 `ls /tmp/bb`（落盘回读）不再有 livebb.txt",
+          live_after_rm is not None and "livebb.txt" not in live_after_rm)
+
+        # --- ★ 本批 ⑧：busybox `ls -l /` 与 shell 内建 `ls` 逐项一致 ---
+        #   两条独立证据：
+        #     ⑧-a `ls -l /`（busybox，落盘回读）的名字/类型集合 == **宿主侧**独立解析卷根得到的那一份；
+        #     ⑧-b busybox `ls -l /tcc` 与 shell `ls /tcc`（都落盘回读）名字 + 目录/文件判定逐项一致。
+        #   ★ 为什么 ⑧-b 用 /tcc 而不是 /：sh64 的"代列协议"是一条 512B 邮箱环流；列**根目录**
+        #     （本机 24 条）时实测会丢字节 -> shell 自己报 `ls: no reply from the terminal service`，
+        #     只打出前 6 条（原始证据见串口的 [SH64] drop / 这条报错）。这不是本批引入的，
+        #     但会让"逐字节"断言在根目录上变成测邮箱而不是测枚举，所以逐项比对放在 /tcc 上，
+        #     根目录的"枚举是否真"由 ⑧-a（宿主侧独立解析）负责，且**不削弱**。
+        sess.type_line("run /bin/busybox ls -l / > /tmp/bb/root_bb.txt", per_key=0.05)
+        time.sleep(6.0)
+        sess.type_line("run /bin/busybox ls -l /tcc > /tmp/bb/tcc_bb.txt", per_key=0.05)
+        time.sleep(5.0)
+        sess.type_line("ls /tcc > /tmp/bb/tcc_sh.txt", per_key=0.06)
+        time.sleep(6.0)
+        bb_raw = read_guest_file(img, ["tmp", "bb", "root_bb.txt"])
+        bb_dirs, bb_files = split_ls_l(bb_raw)
+        # 宿主侧独立解析卷根（同一块盘的**当前**状态：开机新建的 /home /root /logo ... 都在里面）
+        host_root = host_volume_children(img)
+        S("★ ⑧ 卷里 /tmp/bb/root_bb.txt = %s B" % (len(bb_raw) if bb_raw else None), True)
+        H("★ ⑧-a busybox `ls -l /` 与**宿主侧独立解析卷根**的名字集合逐项一致"
+          "（ring3 看到的根 = 盘上真实的根；busybox=%d / host=%d 条）"
+          % (len(bb_dirs | bb_files), len(host_root)),
+          bool(bb_dirs or bb_files) and (bb_dirs | bb_files) == host_root,
+          "只在一侧：%s" % sorted((bb_dirs | bb_files) ^ host_root)[:8])
+        H("★ ⑧-a 每个目录项的类型也对（busybox 'd…' 行 == 宿主侧目录集合）",
+          bb_dirs == host_volume_dirs(img),
+          "busybox dirs=%s" % sorted(bb_dirs)[:8])
+        bb_t_raw = read_guest_file(img, ["tmp", "bb", "tcc_bb.txt"])
+        sh_t_raw = read_guest_file(img, ["tmp", "bb", "tcc_sh.txt"])
+        t_dirs, t_files = split_ls_l(bb_t_raw)
+        s_dirs, s_files = split_shell_ls(sh_t_raw)
+        S("★ ⑧-b 卷里 /tmp/bb/tcc_bb.txt = %s B；/tmp/bb/tcc_sh.txt = %s B"
+          % (len(bb_t_raw) if bb_t_raw else None, len(sh_t_raw) if sh_t_raw else None), True)
+        H("★ ⑧-b `ls -l /tcc`(busybox) 与 `ls /tcc`(shell) 的**名字集合逐项一致**"
+          "（busybox=%d / shell=%d 条）" % (len(t_dirs | t_files), len(s_dirs | s_files)),
+          bool(t_dirs or t_files) and (t_dirs | t_files) == (s_dirs | s_files),
+          "只在一侧：%s" % sorted((t_dirs | t_files) ^ (s_dirs | s_files))[:8])
+        H("★ ⑧-b 排序后的名字列表**逐字节**一致：%s"
+          % (sorted(t_dirs | t_files),), sorted(t_dirs | t_files) == sorted(s_dirs | s_files))
+        H("★ ⑧-b 目录/文件判定一致（busybox 'd…' == shell 'name/'）", t_dirs == s_dirs,
+          "busybox dirs=%s；shell dirs=%s" % (sorted(t_dirs), sorted(s_dirs)))
+        S("★ ⑧ busybox `ls -l /` 原文（前 3 行）：%s" % (payload_lines(bb_raw.decode("utf-8", "replace")
+                                                                   if bb_raw else "")[:3],), True)
+
         # --- ③ 文本编辑：ed 改一行 + wq（宿主侧逐字节校验）---
         b = sess.run_cmd("run /bin/busybox sh /tmp/bb/edit.sh", wait="[EDIT] ed done", timeout=120)
         t = sess.text_since(b)
@@ -444,7 +608,7 @@ def main():
         H("组合链① ls -l /tcc/demo | grep hello | wc -l 的输出是 1",
           re.search(r"\| wc -l[^\n]*\n(?:[^\n]*\n){0,3}\s*1\s*\n", t) is not None, "")
         H("组合链② cat a | sed 's/x/y/' > b 后 cat b 得到 BETA", "BETA" in t)
-        H("组合链③ find + head（走目录索引）", "hello.c" in t)
+        H("组合链③ find + head（实时枚举）", "hello.c" in t)
 
         # --- ⑤ wget / ping 的 GAP（明确失败，不是 PANIC）---
         base = len(sess.log())

@@ -153,6 +153,21 @@ tar -tf /tmp/bb/a.tar
 echo '@@GZIP'
 gzip -k /tmp/bb/lines.txt
 ls -l /tmp/bb/lines.txt.gz
+# live directory enumeration: create a file, the very next ls must see it
+# (before this batch it came from the build-time snapshot and was invisible).
+echo '@@LIVE_BEFORE'
+rm -f /tmp/bb/livebb.txt
+ls /tmp/bb > /tmp/bb/live_before.txt
+echo '@@LIVE_CREATE'
+echo live-from-this-boot > /tmp/bb/livebb.txt
+echo '@@LIVE_AFTER'
+ls /tmp/bb > /tmp/bb/live_after.txt
+echo '@@LIVE_FIND'
+find /tmp/bb -name livebb.txt
+echo '@@LIVE_CLEAN'
+rm /tmp/bb/livebb.txt
+echo '@@LIVE_AFTER_RM'
+ls /tmp/bb > /tmp/bb/live_after_rm.txt
 echo '@@DONE'
 """
 
@@ -163,6 +178,84 @@ echo '@@WGET_RC' $?
 echo '@@PING'
 ping -c 1 127.0.0.1
 echo '@@PING_RC' $?
+"""
+
+# ★ 本批：目录枚举（live + 类型 + 大小 + mtime + 权限拒绝）。全在一个脚本里，带 @@MARKER 分段。
+#   每次运行的写/删都是**幂等**的（先 rm -f / rmdir，末尾再清干净），因为验收会反复跑、盘会被改。
+DIRS_SH = b"""# /tmp/bb/dirs.sh - live directory enumeration (checked by tests/dir64_test.py)
+rm -f /tmp/bb/live.txt
+rmdir /tmp/bb/livedir
+echo '@@LS_BEFORE'
+ls /tmp/bb
+echo '@@FIND_BEFORE'
+find /tmp/bb -name live.txt
+echo '@@CREATE'
+echo live-created-this-boot > /tmp/bb/live.txt
+echo '@@LS_AFTER'
+ls /tmp/bb
+echo '@@LS_L_AFTER'
+ls -l /tmp/bb/live.txt
+echo '@@FIND_AFTER'
+find /tmp/bb -name live.txt
+echo '@@CAT_AFTER'
+cat /tmp/bb/live.txt
+echo '@@DU_AFTER'
+du /tmp/bb/live.txt
+echo '@@MKDIR'
+mkdir /tmp/bb/livedir
+echo '@@LS_DIR_AFTER'
+ls /tmp/bb
+echo '@@FIND_TYPE'
+find /tmp/bb -name livedir -type d
+echo '@@RM'
+rm /tmp/bb/live.txt
+rmdir /tmp/bb/livedir
+echo '@@LS_AFTER_RM'
+ls /tmp/bb
+echo '@@FIND_AFTER_RM'
+find /tmp/bb -name live.txt
+echo '@@NOPERM_MK'
+mkdir /tmp/bb/noperm
+chmod 000 /tmp/bb/noperm
+echo '@@NOPERM_LS'
+ls /tmp/bb/noperm
+echo '@@NOPERM_RC' $?
+echo '@@NOPERM_RM'
+chmod 755 /tmp/bb/noperm
+rmdir /tmp/bb/noperm
+echo '@@DUMP_PREP'
+cp /tmp/bb/lines.txt /tmp/.dir64-dump
+echo '@@DUMP_TCC'
+ls /tcc
+echo '@@DUMP_TCC_L'
+ls -l /tcc
+echo '@@DUMP_DEMO'
+ls /tcc/demo
+echo '@@DUMP_DEMO_L'
+ls -l /tcc/demo
+echo '@@DUMP_CLEAN'
+rm /tmp/.dir64-dump
+echo '@@DONE'
+"""
+
+# ★ 本批：兜底（构建期快照 /etc/vimtu.dirs）。用 /tmp/.dir64-off 强制关闭新 ABI，
+#   再在 /tmp/bb 里新建一个文件：兜底列的是**构建期快照**，所以新文件**看不到**（这正是对照）。
+DIRFALL_SH = b"""# /tmp/bb/dirfall.sh - build-time snapshot fallback (checked by tests/dir64_test.py)
+rm -f /tmp/bb/fallnew.txt
+echo '@@FALL_PREP'
+cp /tmp/bb/lines.txt /tmp/.dir64-off
+echo '@@FALL_LS_TCC'
+ls /tcc
+echo '@@FALL_CREATE'
+echo fall > /tmp/bb/fallnew.txt
+echo '@@FALL_LS_TMP'
+ls /tmp/bb
+echo '@@FALL_FIND'
+find /tcc -name *.c
+echo '@@FALL_CLEAN'
+rm /tmp/bb/fallnew.txt
+rm /tmp/.dir64-off
+echo '@@DONE'
 """
 
 
@@ -177,6 +270,8 @@ def fixture_files():
         "/tmp/bb/uniq.sh": UNIQ_SH,
         "/tmp/bb/applets.sh": APPLETS_SH,
         "/tmp/bb/net.sh": NET_SH,
+        "/tmp/bb/dirs.sh": DIRS_SH,
+        "/tmp/bb/dirfall.sh": DIRFALL_SH,
     }
 
 

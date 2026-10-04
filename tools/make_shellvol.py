@@ -67,7 +67,18 @@ class Volume:
         self.total = total_sectors
         self.bm_bits = VFS_BITMAP_BLK_BITS
         self.bmn = (total_sectors + self.bm_bits - 1) // self.bm_bits
-        inodes = total_sectors // 64
+        # ★ 本批容量收口（先有实测证据才改）：inode 密度 总扇区/64 -> 总扇区/32（仍夹在
+        #   [16, VFS_MAX_INODES=512]）。为什么必须改：本批实测系统卷 24759 扇区 -> **386 个 inode**
+        #   在装完全部交付物后用掉 373（只剩 13 个空闲），而**开机自己**就要新建 11 个
+        #   （/etc/users.db、/home{,/vimtu{,/Desktop}}、/root{,/Desktop}、/store.a、/logo{,/kaisi.png}、
+        #   /kaisi.png、/etc/iconpack.bin）—— 开完机只剩 **2 个**空闲 inode，于是任何"在卷里新建文件"
+        #   的验收（busybox 的 tar/gzip/live 用例、fs_term / fd64 / fileops ...）都会撞
+        #   `[VFS64] write_stream64: no free inode` -> -ENOSPC（实测 busybox64_test 连第 4 个新文件都
+        #   建不出来）。密度翻倍后系统卷 = 上限 512（空闲 512-373 = 139，扣掉开机的 11 还有 128），
+        #   代价只是少 31 个数据块（约 16 KiB / 24654 块的 0.1%）。
+        #   口径说明：这只是**离线造卷工具**的容量参数，内核自己的 vfs64_format 仍按 /64；两者都只
+        #   在超级块里记真实值，内核挂载时只读超级块（<= VFS_MAX_INODES 即可），互不依赖。
+        inodes = total_sectors // 32
         inodes = max(16, min(VFS_MAX_INODES, inodes))
         self.inodes = inodes
         self.ino_blocks = (inodes + VFS_INODES_PER_BLK - 1) // VFS_INODES_PER_BLK

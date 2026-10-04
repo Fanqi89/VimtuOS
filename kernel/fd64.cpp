@@ -36,7 +36,16 @@ extern "C" void syscall64_console_write64(const char* buf, int len) __attribute_
 //   超上限时列表被**静默截断** —— 后创建的文件（例如 fs_term_test 的 /t.txt）会从 ls 里消失，
 //   于是"rm 之后 entries 恰好 -1"这类断言必然失败（实测 before=16 after=16）。提到 24 让卷根完整：
 //   每个缓存项 36 B × 4 个槽 ≈ 3.4 KB .bss，代价可忽略。
-#define FD64_DIR_CACHE 24
+// ★ 本批：容量 24 -> 64（先有证据的容量收口，口径与上面 16->24 那次完全一致）。
+//   证据：本批把 ring3 的目录枚举接到实时目录之后实测 —— **卷根已经有 26 条**（A3/P4/本批陆续把
+//   /home /root /logo /kaisi.png /store.a 在开机时装进卷根），24 的缓存把最后 2 条
+//   （`/kaisi.png`、`/store.a`）**静默截断**：`ls /` 里看不见它们，而宿主侧直接解析卷根能看见
+//   （tests/busybox64_test.py 的 ⑧-a 就是抓这个：busybox=24 / host=26）。64 让卷根（以及 /bin 77 条
+//   里的前 64 条）完整；代价 = 每个缓存项 36 B × 4 个槽 ≈ 9.2 KB **.bss**（不进内核镜像文件大小），
+//   仍然远小于真机上一遍全表扫描的开销。
+//   如实保留的边界：这仍是**有界缓存**（64 条），超过 64 条的目录依然会被截断（本批实测最大的
+//   目录 /tcc/include = 95 条 -> 只列前 64 条；shell 的 `ls` 走同一份缓存，两边口径一致）。
+#define FD64_DIR_CACHE 64         // ★ 本批：24 -> 64（证据见上面的注释；卷根 26 条必须完整列出）
 #define FD64_DIRC_MAX  4          // 目录缓存池（同时最多 4 个目录句柄有缓存）
 
 struct Pipe64 {
