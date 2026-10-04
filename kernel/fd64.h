@@ -18,9 +18,11 @@
 //       - execve：**默认保留**所有 fd（本内核没有实现 O_CLOEXEC，如实注明）；
 //       - close：引用计数 -1，归零才真正释放对象。
 //   * **O_APPEND(0x400)** 真实现：每次 write 都先定位到文件末尾（写后游标 = 末尾）。
-//   * **pipe(22)** 真实现：64 字节环形缓冲 + 两个 fd（读端/写端）。**没有阻塞语义**：
-//     写满返回短写（一点空间都没有 -> -EAGAIN）；读空且写端还开着 -> -EAGAIN，
-//     写端全关 -> 0（EOF）。fork 后父子各持一端即可通信。
+//   * **pipe(22)** 真实现：64 字节环形缓冲 + 两个 fd（读端/写端）。★ 本批：**默认阻塞**
+//     （POSIX 语义）—— 读空且写端还开着 -> 睡等（task_sleep64 -> task_yield64，不忙等，有界
+//     FD64_PIPE_WAIT_MS）；写满 -> 睡等到能全写完。`fcntl(72) F_SETFL O_NONBLOCK(0x800)`
+//     切回**非阻塞**（读空 -> -EAGAIN、写满 -> 短写/无空间 -> -EAGAIN）。写端全关 -> read 返回 0
+//     （EOF）；读端全关后 write -> -EPIPE（**不投递 SIGPIPE**，见下面的边界段）。fork 后父子各持一端即可通信。
 //   * 底层只有 vfs64（VimtuFS2）：路径形如 "/dir/sub/name"（也接受 "name" = 从根开始），
 //     大小写敏感、**支持多级路径**（v3 起；'.'/'..' 交给 vfs64 解析）、单文件 <= **8 MiB**
 //     （FD64_FILE_MAX = VFS64_MAX_FILE_BYTES；v2 旧卷仍是 67584 B，由 vfs64 按卷布局把关），
@@ -36,9 +38,10 @@
 //   * 目录句柄：fd64_opendir64 + fd64_readdir64（线性枚举，第一次重列目录后缓存 16 条）。
 //
 // 边界（如实写在文档里，别把没做的说成做了）：
-//   * 没有文件权限/属主；没有 O_CLOEXEC、fcntl(72)/F_DUPFD、非阻塞标志的完整语义；
+//   * 没有文件权限/属主；没有 O_CLOEXEC、F_DUPFD/F_GETFD/F_SETFD（fcntl 只做 F_GETFL/F_SETFL）；
 //   * 没有 select/poll/epoll、没有文件的 mmap、没有硬链接/符号链接；
-//   * pipe 没有阻塞/信号语义（见上），容量固定 64 B，最多 8 条同时在用；
+//   * pipe 容量固定 64 B，最多 8 条同时在用；等待**有界**（超时 -> 读 -EAGAIN / 写返回已写字节或
+//     -EAGAIN，绝不无限挂死）；没有 select/poll、**不投递 SIGPIPE**（读端全关的 write 只回 -EPIPE）；
 //   * 单文件上限 8 MiB（v2 卷 67584 B）：单次 read/write 的长度受调用方缓冲限制（推荐 ≤64KB/次）；
 //     没有 O_SYNC/mmap/直接 I/O；写失败（空间不足/超上限）是**部分写也没有**（先失败）。
 //   * ★ A4-2a 的 tty 对象**没有输入流**：read(tty) 立刻返回 0（本内核没有把键盘输入交给用户程序的
@@ -52,6 +55,8 @@
 //   [FD64] pipe read n=<n> data=<s>
 //   [FD64] dup old=<n> new=<n> refs=<n> path=<p>        （dup/dup2 共享对象；new <= 2 = 换标准流）
 //   [FD64] tty open fd=<n> path=/dev/console            （最小控制台 tty 对象）
+//   [FD64] pipe wait pid=<p> fd=<n> why=empty|full ticks=<t>   （发生阻塞等待时一行；t = 等待 tick 数）
+//   [FD64] fcntl fd=<n> setfl=0x<hex> ok=<0|1>          （F_GETFL/F_SETFL；ok=0 = -EINVAL/无效 fd）
 //   [FD64] selftest PASS / [FD64] selftest FAIL mask=<n>
 #pragma once
 #include <stdint.h>
@@ -63,7 +68,10 @@
 #define FD64_TABLE_MAX  20u          // fd 表池（16 进程 + 内核表 + 余量）
 #define FD64_OPEN_MAX   64u          // OpenFile64 对象池（引用计数，不按进程复制）
 #define FD64_PIPE_MAX   8u           // pipe 对象池（每条 64 B 环形缓冲）
-#define FD64_PIPE_BYTES 64u          // ★ pipe 容量（固定；没有阻塞语义，见文件头）
+#define FD64_PIPE_BYTES 64u          // ★ pipe 容量（固定 64 B；读/写默认**阻塞**，见文件头）
+// ★ 单次阻塞等待上限（毫秒；超时 -> 读 -EAGAIN / 写返回已写字节或 -EAGAIN）。走既有 task_sleep64
+//   （task_yield64 让出，不忙等）；没有调度器（安装介质内核）时退回非阻塞，如实。
+#define FD64_PIPE_WAIT_MS 5000u
 #define FD64_PATH_MAX   64u          // 路径缓冲：支持多级路径（"/apps/demo/file.txt" 这种）
 #define FD64_NAME_MAX   32u          // 目录项名字缓冲（与 vfs64_ls 的 [][32] 对齐；v3 名字上限 31）
 #define FD64_FILE_MAX   VFS64_MAX_FILE_BYTES   // ★ 批次 M：单文件上限 8 MiB（= VFS64_MAX_FILE_BYTES；
@@ -79,6 +87,7 @@
 #define FD64_O_TRUNC     0x0200u
 #define FD64_O_APPEND    0x0400u     // ★ 批次 D：真实现（每次写定位到末尾）
 #define FD64_O_DIRECTORY 0x10000u
+#define FD64_O_NONBLOCK  0x0800u     // ★ 本批：真实现（pipe 读空/写满立刻返回，不睡眠）
 
 // seek whence（与 Linux 对齐）
 #define FD64_SEEK_SET 0
@@ -99,8 +108,13 @@
 // 负错误码（= -errno；与 syscall64 的 LX64_* 同一口径）
 #define FD64_EPERM   1
 #define FD64_EAGAIN  11
+#define FD64_EPIPE   32   // ★ 本批：读端全关后的 write（**不投递 SIGPIPE**，如实）
 #define FD64_EROFS   30   // ★ 只读文件系统（FAT32 卷：打开写模式一律被拒）
 #define FD64_EACCES  13   // ★ P4：权限不足（vfs64 的 -EACCES 透传；与 LX64_EACCES 同值）
+// ★ 本批：fcntl(72) 的最小命令集（与 Linux 同值）与 F_SETFL 可接受的位。
+#define FD64_F_GETFL 3
+#define FD64_F_SETFL 4
+#define FD64_F_SETFL_MASK64 ((uint32_t)(FD64_O_NONBLOCK | FD64_O_APPEND))
 // 路径规范化：接受 "/dir/sub/name" 与 "dir/sub/name"（相对路径 = 从根开始）；折叠连续的 '/'、
 // 去掉结尾 '/'、去前导空白；".." **原样保留**（父目录语义由 vfs64 负责）；拒绝空串、'/'、控制字符、超长。
 // 成功返回 0 并把规范形式（含 '/' 前缀）写进 out；失败返回负错误码。
@@ -142,8 +156,17 @@ int fd64_dup64(int oldfd, int newfd);
 // 返回 0 = 已填入；-FD64_EBADF = fd 无效；-FD64_EINVAL = 缓冲太小。
 int fd64_where64(int fd, int* out_vol, char* path_out, int cap);
 
-// ==================== pipe（64 B 环形缓冲；无阻塞语义）====================
+// ★ 本批：fcntl(72) 的最小真实现（Linux 号段）：cmd = FD64_F_GETFL(3) -> 当前 flags（>= 0）；
+//   cmd = FD64_F_SETFL(4) -> 用 arg 的位改 flags（只认 FD64_F_SETFL_MASK64，其它位 -> -EINVAL）。
+// 错误：-FD64_EBADF（fd 无效）；-FD64_EINVAL（未知 cmd / 未知 flag）。状态在 OpenFile64.flags 里
+//   —— 与 Linux 一致：dup/fork 共享同一份状态（同一打开文件描述）。
+// 打点：[FD64] fcntl fd=<n> setfl=0x<hex> ok=<0|1>
+int fd64_fcntl64(int fd, int cmd, uint64_t arg);
+
+// ==================== pipe（64 B 环形缓冲；★ 本批：读/写默认阻塞）====================
 // 成功返回 0 并填入读端/写端两个 fd；失败返回负错误码（-EMFILE 池/fd 槽满）。
+// 语义见文件头：默认阻塞（有界等待，task_sleep64 让出）、F_SETFL O_NONBLOCK 切非阻塞、
+// 写端全关 -> read 0（EOF）、读端全关 -> write -EPIPE（不投递 SIGPIPE）。
 int fd64_pipe64(int* fd_r, int* fd_w);
 // 从**当前表**把 srcfd 的对象绑到**另一张表** dst 的 newfd 槽（内核启动外部进程时把 fd 交给子进程用：
 // 先在本表 open，再 dup 进子进程的表，然后 close 本表那份）。返回 newfd 或负错误码。

@@ -13,6 +13,7 @@
 #include "fd64.h"
 #include "fs64.h"     // ★ 批次 K：统一卷号 + 按卷类型分派（VimtuFS2 读写 / FAT32 只读）
 #include "debug64.h"
+#include "x86_64.h"  // ★ 本批：g_ticks64 / ms_to_ticks64（pipe 阻塞等待的刻度与上限）
 
 // ---- proc64 的弱引用：进程表（没有进程上下文 -> 返回 nullptr -> 用内核表）----
 // proc64.cpp 只在系统内核里链接（安装介质内核没有进程），所以这里必须弱引用 + 判空。
@@ -483,6 +484,42 @@ int fd64_close64(int fd) {
     return 0;
 }
 
+// ==================== fcntl（★ 本批：F_GETFL/F_SETFL 的最小真实现）====================
+// 状态放在 OpenFile64.flags 里（= 打开文件描述的状态；dup/fork 共享同一份，与 Linux 一致）。
+// F_SETFL 只认本内核**真能落地**的两个位：O_NONBLOCK(0x800) 与 O_APPEND(0x400)；
+// 任何未知位 -> -FD64_EINVAL（不装作认识）。其它 cmd -> -FD64_EINVAL（没有 F_DUPFD/F_GETFD 等，如实）。
+int fd64_fcntl64(int fd, int cmd, uint64_t arg) {
+    FdTable64* t = fd64_current_table64();
+    OpenFile64* of = fd64_slot_obj64(t, fd);
+    if (!of) return -FD64_EBADF;
+    int64_t r = -FD64_EINVAL;
+    uint32_t setfl = of->flags;
+    int ok = 0;
+    if (cmd == FD64_F_GETFL) {
+        r = (int64_t)of->flags;
+        ok = 1;
+    } else if (cmd == FD64_F_SETFL) {
+        const uint32_t want = (uint32_t)arg;
+        setfl = want;
+        if ((want & ~FD64_F_SETFL_MASK64) == 0) {
+            of->flags = (of->flags & ~FD64_F_SETFL_MASK64) | want;
+            of->append = (of->flags & FD64_O_APPEND) ? 1 : 0;   // O_APPEND 实时生效（既有语义）
+            r = 0;
+            ok = 1;
+        }
+    }
+    dbg64_line_begin64();
+    dbg64_str("[FD64] fcntl fd=");
+    dbg64_dec((uint64_t)fd);
+    dbg64_str(" setfl=0x");
+    dbg64_hex64((uint64_t)setfl);
+    dbg64_str(" ok=");
+    dbg64_dec((uint64_t)ok);
+    dbg64_nl();
+    dbg64_line_end64();
+    return (int)r;
+}
+
 // ==================== pipe ====================
 static Pipe64* fd64_pipe_alloc64() {
     for (uint32_t i = 0; i < FD64_PIPE_MAX; i++) {
@@ -493,42 +530,106 @@ static Pipe64* fd64_pipe_alloc64() {
     return nullptr;
 }
 
-// 读：读空且写端还开着 -> -EAGAIN（不阻塞）；写端全关 -> 0（EOF）
-static int fd64_pipe_read64(Pipe64* p, void* buf, int len) {
-    if (!p || !buf || len < 0) return -FD64_EFAULT;
-    const uint64_t fl = dbg64_irq_save64();
-    if (p->n == 0) {
-        const int eof = (p->writers == 0);
-        dbg64_irq_restore64(fl);
-        return eof ? 0 : -FD64_EAGAIN;
-    }
-    uint32_t want = (uint32_t)len;
-    if (want > p->n) want = p->n;
-    uint8_t* d = (uint8_t*)buf;
-    for (uint32_t i = 0; i < want; i++) {
-        d[i] = p->buf[p->rd];
-        p->rd = (p->rd + 1u) % FD64_PIPE_BYTES;
-    }
-    p->n -= want;
-    dbg64_irq_restore64(fl);
-    return (int)want;
+// ---------- ★ 本批：阻塞等待（POSIX 语义；O_NONBLOCK 时保留旧的即时返回行为）----------
+// 等待原语 = **既有**的 task_sleep_ms64（task_sleep64 -> task_yield64 -> sti; hlt，不忙等）。
+//   安装介质内核不链 task64.cpp -> 弱引用为 0 -> 那里退回非阻塞（-EAGAIN），如实（那里没有 ring3）。
+// 有界：单次等待 <= FD64_PIPE_WAIT_MS；超时后读 -EAGAIN、写返回已写字节（>0）或 -EAGAIN。
+// 可被打断：每一轮醒来重新检查管道条件 —— 写端全关（读 -> 0）、读端全关（写 -> -EPIPE）立即退出。
+extern "C" void task_sleep_ms64(uint32_t ms) __attribute__((weak));
+extern "C" int  proc64_current_pid64() __attribute__((weak));      // 等待打点里的 pid
+static void fd64_pipe_wait_log64(int fd, const char* why, uint64_t ticks) {
+    int pid = 0;
+    if (proc64_current_pid64) { const int p = proc64_current_pid64(); if (p > 0) pid = p; }
+    dbg64_line_begin64();
+    dbg64_str("[FD64] pipe wait pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_str(" fd=");
+    dbg64_dec((uint64_t)fd);
+    dbg64_str(" why=");
+    dbg64_str(why);
+    dbg64_str(" ticks=");
+    dbg64_dec(ticks);
+    dbg64_nl();
+    dbg64_line_end64();
 }
-// 写：写满返回**短写**（能塞多少塞多少）；一点空间都没有 -> -EAGAIN（不阻塞）
-static int fd64_pipe_write64(Pipe64* p, const void* buf, int len) {
+
+// 读：默认**阻塞**（空且写端还开着 -> 睡等）；O_NONBLOCK -> -EAGAIN（不睡）；写端全关 -> 0（EOF）
+static int fd64_pipe_read64(Pipe64* p, int fd, int nonblock, void* buf, int len) {
     if (!p || !buf || len < 0) return -FD64_EFAULT;
-    const uint64_t fl = dbg64_irq_save64();
-    const uint32_t room = FD64_PIPE_BYTES - p->n;
-    if (room == 0) { dbg64_irq_restore64(fl); return -FD64_EAGAIN; }
-    uint32_t want = (uint32_t)len;
-    if (want > room) want = room;
-    const uint8_t* s = (const uint8_t*)buf;
-    for (uint32_t i = 0; i < want; i++) {
-        p->buf[p->wr] = s[i];
-        p->wr = (p->wr + 1u) % FD64_PIPE_BYTES;
+    if (len == 0) return 0;                                    // POSIX：len=0 立刻返回 0（不睡）
+    const uint64_t wait_max = (uint64_t)ms_to_ticks64(FD64_PIPE_WAIT_MS);
+    int waited = 0;
+    uint64_t t0 = 0;
+    for (;;) {
+        const uint64_t fl = dbg64_irq_save64();
+        if (p->n > 0) {                                        // 有数据：立刻读走（可能短读）
+            uint32_t want = (uint32_t)len;
+            if (want > p->n) want = p->n;
+            uint8_t* d = (uint8_t*)buf;
+            for (uint32_t i = 0; i < want; i++) {
+                d[i] = p->buf[p->rd];
+                p->rd = (p->rd + 1u) % FD64_PIPE_BYTES;
+            }
+            p->n -= want;
+            dbg64_irq_restore64(fl);
+            if (waited) fd64_pipe_wait_log64(fd, "empty", g_ticks64 - t0);
+            return (int)want;
+        }
+        const int eof = (p->writers == 0);                     // 写端全关 = EOF（等待也算被打断）
+        dbg64_irq_restore64(fl);
+        if (eof) {
+            if (waited) fd64_pipe_wait_log64(fd, "empty", g_ticks64 - t0);
+            return 0;
+        }
+        if (nonblock) return -FD64_EAGAIN;                     // O_NONBLOCK：保留旧的 -EAGAIN 行为
+        if (!task_sleep_ms64) return -FD64_EAGAIN;             // 没有调度器：无处可等（如实）
+        if (!waited) { waited = 1; t0 = g_ticks64; }
+        if (g_ticks64 - t0 >= wait_max) {                      // 有界：超时后如实报 -EAGAIN
+            fd64_pipe_wait_log64(fd, "empty", g_ticks64 - t0);
+            return -FD64_EAGAIN;
+        }
+        task_sleep_ms64(1);
     }
-    p->n += want;
-    dbg64_irq_restore64(fl);
-    return (int)want;
+}
+// 写：默认**阻塞**直到全部写完（满 -> 睡等）；O_NONBLOCK -> 短写（写多少算多少；
+//     一点空间都没有 -> -EAGAIN）；读端全关 -> -EPIPE（**不投递 SIGPIPE**，如实，见 fd64.h 边界段）
+static int fd64_pipe_write64(Pipe64* p, int fd, int nonblock, const void* buf, int len) {
+    if (!p || !buf || len < 0) return -FD64_EFAULT;
+    if (len == 0) return 0;
+    const uint64_t wait_max = (uint64_t)ms_to_ticks64(FD64_PIPE_WAIT_MS);
+    const uint8_t* s = (const uint8_t*)buf;
+    uint32_t done = 0;                                         // 已写进环的字节数（阻塞模式下必须写满）
+    int waited = 0;
+    uint64_t t0 = 0;
+    for (;;) {
+        const uint64_t fl = dbg64_irq_save64();
+        const uint32_t room = FD64_PIPE_BYTES - p->n;
+        const int no_reader = (p->readers == 0);
+        if (!no_reader && room > 0) {
+            uint32_t want = (uint32_t)len - done;
+            if (want > room) want = room;
+            for (uint32_t i = 0; i < want; i++) {
+                p->buf[p->wr] = s[done + i];
+                p->wr = (p->wr + 1u) % FD64_PIPE_BYTES;
+            }
+            p->n += want;
+            done += want;
+        }
+        dbg64_irq_restore64(fl);
+        if (done >= (uint32_t)len) {                           // 全写完
+            if (waited) fd64_pipe_wait_log64(fd, "full", g_ticks64 - t0);
+            return (int)done;
+        }
+        if (no_reader) return (done > 0) ? (int)done : -FD64_EPIPE;   // 读端全关：EPIPE（不投 SIGPIPE）
+        if (nonblock) return (done > 0) ? (int)done : -FD64_EAGAIN;   // O_NONBLOCK：短写 / -EAGAIN
+        if (!task_sleep_ms64) return (done > 0) ? (int)done : -FD64_EAGAIN;   // 没有调度器：无处可等
+        if (!waited) { waited = 1; t0 = g_ticks64; }
+        if (g_ticks64 - t0 >= wait_max) {                      // 有界：超时后返回已写字节 / -EAGAIN
+            fd64_pipe_wait_log64(fd, "full", g_ticks64 - t0);
+            return (done > 0) ? (int)done : -FD64_EAGAIN;
+        }
+        task_sleep_ms64(1);
+    }
 }
 
 int fd64_pipe64(int* fd_r, int* fd_w) {
@@ -570,7 +671,7 @@ int fd64_pipe64(int* fd_r, int* fd_w) {
     dbg64_dec((uint64_t)fw);
     dbg64_str(" bytes=");
     dbg64_dec((uint64_t)FD64_PIPE_BYTES);
-    dbg64_str(" (non-blocking: full=short-write/empty=-EAGAIN)");
+    dbg64_str(" (blocking: full=wait/empty=wait; F_SETFL O_NONBLOCK=short-write/-EAGAIN)");
     dbg64_nl();
     dbg64_line_end64();
     return 0;
@@ -586,7 +687,8 @@ int fd64_read64(int fd, void* buf, int len) {
     if (of->kind == FD64_KIND_TTY) return 0;                    // ★ A4-2a：控制台 tty 没有输入流（如实 EOF）
     if (!buf || len < 0) return -FD64_EFAULT;
     if (of->kind == FD64_KIND_PIPE_R) {
-        const int n = fd64_pipe_read64(of->pipe, buf, len);
+        const int nonblock = (of->flags & FD64_O_NONBLOCK) ? 1 : 0;
+        const int n = fd64_pipe_read64(of->pipe, fd, nonblock, buf, len);
         if (n <= 0) return n;
         // 证据行（验收 grep）：[FD64] pipe read n=<n> data=<s>（最多 64 B，按原样打印）
         dbg64_line_begin64();
@@ -643,7 +745,10 @@ int fd64_write64(int fd, const void* buf, int len) {
     if (!of->writable) return -FD64_EBADF;
     if (!buf || len < 0) return -FD64_EFAULT;
     if (len == 0) return 0;
-    if (of->kind == FD64_KIND_PIPE_W) return fd64_pipe_write64(of->pipe, buf, len);
+    if (of->kind == FD64_KIND_PIPE_W) {
+        const int nonblock = (of->flags & FD64_O_NONBLOCK) ? 1 : 0;
+        return fd64_pipe_write64(of->pipe, fd, nonblock, buf, len);
+    }
     if (of->kind == FD64_KIND_TTY) {                          // ★ A4-2a：控制台 tty = 串口 + 屏幕
         if (syscall64_console_write64) syscall64_console_write64((const char*)buf, len);
         else for (int i = 0; i < len; i++) dbg64_putc(((const char*)buf)[i]);
@@ -1025,11 +1130,25 @@ int fd64_demo64() {
             dbg64_dec((wn == 9 && rn == 9) ? 1 : 0);
             dbg64_nl();
             dbg64_line_end64();
-            // 短写：容量 64 B，一次塞 100 B -> 只写进 64（不阻塞）
+            // ★ 本批：短写 / 空读 -EAGAIN 的非阻塞行为要用 **F_SETFL O_NONBLOCK** 才成立。
+            //   （pipe 默认阻塞：这里先切 O_NONBLOCK 再做"写满 = 短写、读空 = -EAGAIN"的断言，
+            //    两种语义各有证据；切回默认态由下面的 close + EOF 覆盖。）
+            const int st1 = fd64_fcntl64(w, FD64_F_SETFL, FD64_O_NONBLOCK);
+            const int st2 = fd64_fcntl64(r, FD64_F_SETFL, FD64_O_NONBLOCK);
+            const int st3 = fd64_fcntl64(w, FD64_F_SETFL, 0x100000u);   // 未知 flag -> -EINVAL（负例）
+            const int gf  = fd64_fcntl64(w, FD64_F_GETFL, 0);           // F_GETFL -> 当前 flags
             uint8_t big[100];
             for (int i = 0; i < 100; i++) big[i] = (uint8_t)('a' + (i % 26));
             const int sw = fd64_write64(w, big, 100);
+            if (st1 != 0 || st2 != 0 || st3 != -FD64_EINVAL || (gf & FD64_O_NONBLOCK) == 0) fail |= 8;
             if (sw != (int)FD64_PIPE_BYTES) fail |= 8;
+            dbg64_line_begin64();
+            dbg64_str("[FD64] demo pipe setfl=");
+            dbg64_dec((uint64_t)((st1 == 0 && st2 == 0 && st3 == -FD64_EINVAL) ? 1 : 0));
+            dbg64_str(" getfl_nonblock=");
+            dbg64_dec((uint64_t)((gf & FD64_O_NONBLOCK) ? 1 : 0));
+            dbg64_nl();
+            dbg64_line_end64();
             dbg64_line_begin64();
             dbg64_str("[FD64] demo pipe shortwrite=");
             dbg64_dec((uint64_t)(sw < 0 ? 0 : sw));
@@ -1041,7 +1160,7 @@ int fd64_demo64() {
             uint8_t sink[128];
             const int drain = fd64_read64(r, sink, 128);
             if (drain != (int)FD64_PIPE_BYTES) fail |= 8;
-            const int empty = fd64_read64(r, sink, 128);       // 写端还开着 -> -EAGAIN（不阻塞）
+            const int empty = fd64_read64(r, sink, 128);       // 写端还开着 + O_NONBLOCK -> -EAGAIN
             if (empty != -FD64_EAGAIN) fail |= 8;
             if (fd64_close64(w) != 0) fail |= 8;               // 写端关闭
             const int eof = fd64_read64(r, sink, 128);         // 写端全关 -> 0（EOF）
