@@ -59,6 +59,8 @@
 #include "port.h"        // inb/inw/inl + outb/outw/outl（32 位端口读写这里已有，不用另加内联汇编）
 #include "debug64.h"     // 串口打点（行锁 begin/end）
 #include "input.h"       // kbd_inject_scancode()：注入到 PS/2 同一条按键队列
+#include "drive64.h"     // ★ P8 热插拔：detect 之后 drive64_scan64() 重扫盘符表（既有那条路）
+#include "desktopops64.h"// ★ P8 热插拔：explorer64_rescan64() —— 资源管理器窗口自动刷新
 #include "memlayout64.h" // ★ 必须先于 mem_64.h（PAGE_SIZE_64 会撞）；ML64_KERNEL_VA_BASE 用它
 #include "mem_64.h"      // page_alloc_64 / memset_64（低内存恒等映射：物理地址即指针）
 #include "xhci64.h"     // ★ xHCI（USB 3.x）：kusb 轮询线程也要驱动它（task64.cpp 不改，见 usb64_poll64）
@@ -213,6 +215,11 @@ static uint8_t   g_toggle      = 0;          // 中断 IN 的 DATA toggle
 static uint64_t  g_hid_reports = 0;
 static uint64_t  g_key_events  = 0;
 static int       g_devices     = 0;
+// ★ P8：热插拔现场（每轮 poll 读 PORTSC 比对；角色按端口记，用来在拔出时清掉对应设备）
+static uint16_t  g_port_ccs    = 0;          // 上一轮各根端口的 CCS 位（bit0 = port1）
+static bool      g_hp_baseline = false;      // 第一轮只建立基线，不算"变化"
+static uint8_t   g_port_role[3] = { 0, 0, 0 };  // 0 = 本驱动没接管 / 1 = HID 键盘 / 2 = USB 存储
+static uint8_t   g_next_addr   = 1;          // 下一个要分配的 USB 地址（启动期与热插拔共用）
 
 // HID 报告的边沿检测状态（★ xHCI 批次：交给 UHCI/xHCI 共用的解析函数持有，见 usb64.h）
 static Usb64Hid64 g_hid_state  = { 0, { 0, 0, 0, 0, 0, 0 } };
@@ -287,6 +294,7 @@ struct Usb64Ctl64 {
 
 // 前置声明：控制/批量传输跑完要把中断 TD 重新挂回队列（定义在本文件后半，见 usb_arm_interrupt）
 static void usb_arm_interrupt();
+static void usb_hotplug_poll();          // ★ P8 热插拔检测（定义在文件后半段，poll 首行调用）
 // 有界忙等：用 PIT 计时（中断开着，别的任务/桌面照常被调度），再加硬自旋上界兜底。
 static void usb_delay_ms(uint32_t ms) {
     const uint64_t t0 = g_ticks64;
@@ -711,7 +719,10 @@ static void usb_arm_interrupt() {
     g_qh->element = td_phys(g_irq_td);                   // ★ 发布
     usb_barrier();
 }
+
 void usb64_poll64() {
+    // ★ P8：热插拔检测（每轮读一次 PORTSC 的 CCS/CSC；有变化才做复位/枚举/重扫）
+    usb_hotplug_poll();
     // ★ xHCI（USB 3.x）：**和 UHCI 共用 kusb 这一个轮询线程**（kernel/task64.cpp 不改）。
     //   两个主控各有独立的 DMA 结构/事件环/自旋锁，先后顺序互不影响：xhci64_init64() 在
     //   usb64_init64() 之后调用（见 kernel64.cpp），没有主控时 xhci64_poll64() 首行直接返回。
@@ -1543,6 +1554,104 @@ static void usb_selftest_log() {
     usb_log_end();
 }
 
+// ==================== ★ P8：USB 根端口热插拔检测（UHCI PORTSC 的 CCS/CSC）====================
+// 为什么放在 poll 里：kusb 内核线程每 ~12ms 调一次 usb64_poll64()，端口寄存器读取只是两次 inw ——
+//   代价可忽略，而且**不动 IRQ/不动 task64.cpp**（与既有"轮询而不是中断"的取舍一致）。
+// 检测规则：
+//   * 每轮把两个根端口的 **CCS（当前连接）** 合成一个位掩码，和上一轮比对；CSC/PEC 写 1 清（不让它堆着）；
+//   * 变化的端口：连接 -> 打 [USBST] attached port=<n>，做**和启动期同一条**端口复位 + 枚举路径
+//     （键盘走 HID 分支、U 盘走 BOT 分支）；拔出 -> 打 [USBST] detached port=<n> 并按端口角色清状态；
+//   * 存储"出现/消失"时触发**盘符重扫**：drive64_scan64()（＝启动期 USB 接入后重扫的同一个函数）
+//     + explorer64_rescan64()（打开的窗口自动刷新；正在浏览的盘被拔掉会退回"此电脑"并提示）。
+// 如实说明：地址只增不复用（插入次数多了会到 0x7F 上限，之后新设备不再枚举，只打点）；
+//   热插拔读/写盘与界面读盘符表之间没有全局锁（见报告的"没做到的"）。
+static void usb_hotplug_rescan(const char* why) {
+    dbg64_line_begin64();
+    dbg64_str("[USBST] storage ");
+    dbg64_str(why);
+    dbg64_str(" -> rescan drive letters (usb drives=");
+    dbg64_dec((uint64_t)(usb64_msc_count64() + xhci64_msc_count64()));
+    dbg64_str(")");
+    dbg64_nl();
+    dbg64_line_end64();
+    (void)drive64_scan64();
+    explorer64_rescan64("usb-hotplug");
+}
+
+static void usb_hotplug_poll() {
+    if (!g_found || !g_inited) return;
+    uint16_t mask = 0;
+    for (int i = 1; i <= g_ports && i <= 2; i++) {
+        const uint16_t reg = (i == 1) ? (uint16_t)UHCI_PORTSC1 : (uint16_t)UHCI_PORTSC2;
+        const uint16_t v = uhci_rd16(reg);
+        if (v & PORTSC_CCS) mask = (uint16_t)(mask | (uint16_t)(1u << (i - 1)));
+        if (v & (PORTSC_CSC | PORTSC_PEC)) {
+            // W1C：把变化位清掉（同时不碰 PR/SUSP/RD；bit15:13 必须写 0）
+            uhci_wr16(reg, (uint16_t)((v & ~(uint32_t)PORTSC_WZ) & ~(uint32_t)(PORTSC_PR | PORTSC_SUSP)));
+        }
+    }
+    if (!g_hp_baseline) { g_port_ccs = mask; g_hp_baseline = true; return; }
+    const uint16_t chg = (uint16_t)(mask ^ g_port_ccs);
+    if (chg == 0) return;
+    for (int i = 1; i <= g_ports && i <= 2; i++) {
+        const uint16_t bit = (uint16_t)(1u << (i - 1));
+        if ((chg & bit) == 0) continue;
+        const bool now = (mask & bit) != 0;
+        if (now) {
+            dbg64_line_begin64();
+            dbg64_str("[USBST] attached port=");
+            dbg64_dec((uint64_t)i);
+            dbg64_str(" (port status change: connect)");
+            dbg64_nl();
+            dbg64_line_end64();
+            bool low = false;
+            if (!usb_port_reset(i, &low)) {
+                dbg64_line_begin64();
+                dbg64_str("[USBST] attached port=");
+                dbg64_dec((uint64_t)i);
+                dbg64_str(" reset failed (device ignored, system keeps running)");
+                dbg64_nl();
+                dbg64_line_end64();
+                continue;
+            }
+            const bool hid_before = g_hid_present;
+            const bool msc_before = g_msc.present;
+            const uint8_t addr = (g_next_addr <= 0x7Fu) ? g_next_addr : 1u;
+            if (usb_enum_port(i, addr, low) == 0) {
+                if (g_next_addr <= 0x7Fu) g_next_addr++;
+                if (!hid_before && g_hid_present)      g_port_role[i] = 1;
+                else if (!msc_before && g_msc.present) g_port_role[i] = 2;
+                g_devices = (g_hid_present ? 1 : 0) + (g_msc.present ? 1 : 0);
+                if (!msc_before && g_msc.present) {
+                    (void)usb64_msc_selftest64();          // INQUIRY/TUR/CAPACITY/READ(10) + 越界探针
+                    usb_hotplug_rescan("attached");
+                }
+            }
+        } else {
+            dbg64_line_begin64();
+            dbg64_str("[USBST] detached port=");
+            dbg64_dec((uint64_t)i);
+            const uint8_t role = g_port_role[i];
+            g_port_role[i] = 0;
+            if (role == 1) {
+                g_hid_present = false; g_ready = false; g_addr = 0; g_ep_in = 0; g_ep_mps = 0;
+                dbg64_str(" (HID keyboard offline; PS/2 keyboard still works)");
+            } else if (role == 2) {
+                g_msc.present = false; g_msc.supported = false; g_msc.selftest_mask = 0;
+                g_msc.vendor[0] = 0; g_msc.product[0] = 0;
+                dbg64_str(" (USB storage offline; its drive letter is dropped by the rescan)");
+            } else {
+                dbg64_str(" (was not claimed by this driver)");
+            }
+            dbg64_nl();
+            dbg64_line_end64();
+            g_devices = (g_hid_present ? 1 : 0) + (g_msc.present ? 1 : 0);
+            if (role == 2) usb_hotplug_rescan("detached");
+        }
+    }
+    g_port_ccs = mask;
+}
+
 int usb64_init64() {
     if (g_inited) return g_ready ? 0 : -1;
     g_inited = true;
@@ -1667,8 +1776,8 @@ int usb64_init64() {
     //   地址按端口顺序分配（1、2…）；已经拿够角色（键盘/存储各一个）后，剩下的设备只复位不枚举
     //   （避免给不用的设备分配地址，也就不会出现"地址占着但没人管"的状态）。
     int      found = 0;
-    uint8_t  next_addr = 1;
     bool     any_connected = false;
+    g_next_addr = 1;                                      // ★ P8：地址游标是全局的（热插拔接着往后分配）
     for (int i = 1; i <= g_ports; i++) {
         const uint16_t reg = (i == 1) ? (uint16_t)UHCI_PORTSC1 : (uint16_t)UHCI_PORTSC2;
         const uint16_t v = uhci_rd16(reg);
@@ -1697,7 +1806,7 @@ int usb64_init64() {
         dbg64_str(" reset ok");
         usb_log_end();
 
-        if (found >= USB64_MAX_DEV || next_addr > 0x7Fu) {
+        if (found >= USB64_MAX_DEV || g_next_addr > 0x7Fu) {
             usb_log_begin();
             dbg64_str("[USB64] port ");
             dbg64_dec((uint64_t)i);
@@ -1705,7 +1814,17 @@ int usb64_init64() {
             usb_log_end();
             continue;
         }
-        if (usb_enum_port(i, next_addr, low) == 0) { found++; next_addr++; }
+        {
+            const bool hid_before = g_hid_present;
+            const bool msc_before = g_msc.present;
+            if (usb_enum_port(i, g_next_addr, low) == 0) {
+                found++;
+                g_next_addr++;
+                // ★ P8：记下这个端口被哪个角色接管（拔出时按角色清状态）
+                if (!hid_before && g_hid_present)      g_port_role[i] = 1;
+                else if (!msc_before && g_msc.present) g_port_role[i] = 2;
+            }
+        }
     }
     if (found == 0) {
         g_state = any_connected ? USB64_ST_ENUM_FAILED : USB64_ST_NO_DEVICE;

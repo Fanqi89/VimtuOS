@@ -36,6 +36,8 @@
 #include "config64.h"  // ★ P5：ui.explorer.show_system（系统分区默认隐藏 + 开关）
 #include "theme64.h"   // ★ P5：文件管理器地址栏的文本指针命中区用 Token 高度
 #include "elf64.h"
+#include "gfx64.h"      // ★ P8：选择应用打开对话框的圆角/半透明/双层阴影（Token 图形原语）
+#include "session64.h"  // ★ P8：应用清单（外壳按 APP_ID_* 登记的那一份 = 开始菜单/设置同一来源）
 
 // ==================== 几何常量（与脚本共享，勿乱改）====================
 #define EXP_WIN_X 120
@@ -205,6 +207,7 @@ static int  g_scroll = 0;             // 首个可见条目下标
 static int  g_items = 0;              // 当前目录条目数（完整计数）
 static Fs64Dirent64 g_ents[EXP_MAX_ITEMS];   // ★ 批次 K：统一目录项（VimtuFS2 与 FAT32 都走这一个结构）
 static bool g_ro = false;                     // ★ 当前卷是否只读（FAT32）—— 文件操作按钮/菜单的置灰依据
+static bool g_usb_rw = false;                 // ★ P8：当前卷是**可写的 U 盘 FAT32 卷**（同名覆盖写唯一入口）
 
 static DriveInfo64 g_drives[DRV64_MAX_ENTRIES];
 static int  g_drive_n = 0;
@@ -271,7 +274,9 @@ static int  g_box_x0 = 0, g_box_y0 = 0, g_box_x1 = 0, g_box_y1 = 0;
 // 复制缓冲（**分块**复制用的 64 KiB 主缓冲；单文件上限已经是 8 MiB，不可能再"整文件读进内存"）
 // ★ 批次 M：粘贴 = 逐块 fs64_read_range64(源) -> fs64_write_at64(目标)，缓冲区由这里给；
 //   复制大文件不再占大内存，而且**不会静默截断**（源变大/读失败都如实计入 skipped 并打点）。
+// ★ 批次 M：复制的分块缓冲（64 KiB）；★ P8：往 U 盘写时分块取 32 KiB（跟 fat64 的读回校验缓冲同量级）
 #define EXP_COPY_CHUNK 65536u
+#define EXP_FAT_WR_CHUNK 32768u
 static uint8_t g_copy_buf[EXP_COPY_CHUNK];
 
 // ==================== 小工具（内核里没有 libc）====================
@@ -607,7 +612,8 @@ static void exp_msg(const char* s) {
 
 // ★ 批次 K：在只读卷（FAT32）上尝试了写类操作 —— 统一打点（自动验收 grep），并给用户一句明确提示。
 // 上层（按钮/菜单）会先置灰；这里覆盖键盘快捷键/右键菜单等仍能触发到的路径，绝不静默。
-static void exp_roact(const char* op) {
+// ★ P8：reason != null 时追加 why=<原因>（U 盘上"新建文件没做"这类如实说明就走这条路）。
+static void exp_roact_reason(const char* op, const char* reason) {
     dbg64_line_begin64();
     dbg64_str("[UI] explorer roact op=");
     dbg64_str(op ? op : "?");
@@ -617,10 +623,16 @@ static void exp_roact(const char* op) {
         dbg64_str(lb);
     }
     dbg64_str(" fs=FAT32 ro=1 (read-only volume: not allowed)");
+    if (reason) {
+        dbg64_str(" why=");
+        dbg64_str(reason);
+    }
     dbg64_nl();
     dbg64_line_end64();
-    exp_msg(gui64_tr("Read-only volume (FAT32)", "只读卷（FAT32）"));
+    exp_msg(reason ? gui64_tr("Not supported on this volume yet", "该卷上这个操作还没做")
+                   : gui64_tr("Read-only volume (FAT32)", "只读卷（FAT32）"));
 }
+static void exp_roact(const char* op) { exp_roact_reason(op, nullptr); }
 
 
 // ==================== ★ 批次 J：文件操作打点（格式见 explorer64.h；行锁）====================
@@ -798,6 +810,18 @@ void explorer64_set_show_system64(int on, const char* why) {
     exp_scan_drives();                 // 立刻重扫：隐藏项随之变化
     if (g_win) gui64_invalidate_window(g_win);
 }
+static void exp_enter_thispc();            // 前向声明（热插拔：盘被拔掉后退回此电脑）
+static void exp_refresh_dir();             // 前向声明（热插拔：卷还在时自动重列目录）
+// ★ P8：把"当前卷可写"标记同步成 drive64 的实时值（真源 = fat64 的卷级开关，只有 U 盘为真）
+static void exp_refresh_writable_flags() {
+    g_usb_rw = false;
+    const char cur = drive64_current_letter64();
+    const int di = cur ? drive64_by_letter64(cur) : -1;
+    if (di < 0) return;
+    DriveInfo64 d;
+    if (drive64_info64(di, &d) != 0) return;
+    g_usb_rw = (d.usb_rw != 0);
+}
 void explorer64_rescan64(const char* why) {
     dbg64_line_begin64();
     dbg64_str("[EXPL64] rescan why=");
@@ -805,6 +829,26 @@ void explorer64_rescan64(const char* why) {
     dbg64_nl();
     dbg64_line_end64();
     exp_scan_drives();
+    // ★ P8（热插拔）：正在浏览的盘**被拔掉**了（盘符已不在新表里 / 不再可浏览）——退回"此电脑"并
+    //   给一句明确提示。绝不继续拿着已消失的卷读目录（那样只会一路报错），更不许崩。
+    if (g_mode == 1 && g_letter) {
+        const int di = drive64_by_letter64(g_letter);
+        DriveInfo64 d;
+        const bool alive = (di >= 0) && (drive64_info64(di, &d) == 0) && d.browsable;
+        if (!alive) {
+            char lb[3]; lb[0] = g_letter; lb[1] = ':'; lb[2] = 0;
+            dbg64_line_begin64();
+            dbg64_str("[EXPL64] browsed drive gone letter=");
+            dbg64_str(lb);
+            dbg64_str(" -> back to This PC (drive detached)");
+            dbg64_nl();
+            dbg64_line_end64();
+            exp_enter_thispc();
+            exp_msg(gui64_tr("The drive was removed", "该驱动器已被拔出"));
+            return;
+        }
+        exp_refresh_dir();                     // 卷还在：内容重列一次（插入/拔出后自动刷新）
+    }
 }
 
 // 目录内容刷新（游标分页扫描：完整计数 + 只缓存前 EXP_MAX_ITEMS 条）
@@ -934,6 +978,7 @@ static int exp_ensure_volume() {
     DriveInfo64 d;
     if (drive64_info64(di, &d) != 0 || !d.browsable) return -1;
     g_ro = d.readonly ? true : false;                     // ★ 只读卷（FAT32）：所有写操作都要被拦
+    g_usb_rw = (d.usb_rw != 0);                           // ★ P8：可写的 U 盘 FAT32 卷（同名覆盖写）
     if (fs64_current_vol64() != d.vol) {
         if (drive64_activate_letter64(g_letter) != 0) return -1;
     }
@@ -949,6 +994,7 @@ static void exp_refresh_dir() {
     Fs64Dirent64 one;                                   // ★ 批次 K：统一目录项（VimtuFS2 / FAT32 同一个结构）
     int guard = 0;
     g_ro = fs64_is_readonly64(-1) ? true : false;       // 当前卷是否只读（FAT32）—— 置灰/拦截的依据
+    exp_refresh_writable_flags();                       // ★ P8：可写的 U 盘 FAT32 卷标记（真源 drive64/fat64）
     for (;;) {
         const int r = fs64_list64(-1, g_path, &one, 1, &cursor);
         if (r <= 0) break;
@@ -1360,6 +1406,51 @@ static void exp_clip_set(int op) {          // 1 = 复制、2 = 剪切：把当�
     e_strcat(m, gui64_tr(" item(s)", " 项"), (int)sizeof(m));
     exp_msg(m);
 }
+// ==================== ★ P8：U 盘 FAT32 卷上的"就地覆盖写"（同名已存在）====================
+// 为什么需要它：fs64 对 FAT 卷一律 -FS64_EROFS（只读入口不变），而 U 盘现在是可写的 ——
+//   所以**只有这一条**路径直接用 fat64 的覆盖写 API，并且只认"目标名字已经存在"这一种情况。
+// 打点：[UI] explorer usbfat overwrite name=<n> bytes=<n> ok|FAILED reason=<...>
+static int exp_usbfat_overwrite(int svol, const char* sp, int dvol, const char* dp, const char* name) {
+    const int fatvol = dvol - FS64_VOL_FAT_BASE;
+    if (fatvol < 0) return -1;
+    Fs64Stat64 si;
+    if (fs64_stat64(svol, sp, &si) != 0 || si.type != VFS64_TYPE_FILE) {
+        dbg64_line_begin64();
+        dbg64_str("[UI] explorer usbfat overwrite name=");
+        dbg64_str(name ? name : "?");
+        dbg64_str(" FAILED reason=source-not-a-file");
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+    int rc = fat64_ow_begin64(fatvol, dp, (uint32_t)si.size);
+    uint32_t off = 0;
+    while (rc == 0 && off < si.size) {
+        uint32_t want = si.size - off;
+        if (want > EXP_FAT_WR_CHUNK) want = EXP_FAT_WR_CHUNK;      // 32KB：fat64 的读回校验缓冲同量级
+        uint32_t got = 0;
+        if (fs64_read_range64(svol, sp, off, g_copy_buf, want, &got) != 0 || got == 0) { rc = -1; break; }
+        uint32_t wr = 0;
+        if (fat64_ow_write64(fatvol, off, g_copy_buf, got, &wr) != 0 || wr != got) { rc = -1; break; }
+        off += got;
+    }
+    if (fat64_ow_commit64(fatvol, rc == 0 ? 1 : 0) != 0) rc = -1;
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer usbfat overwrite name=");
+    dbg64_str(name ? name : "?");
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)si.size);
+    if (rc == 0) {
+        dbg64_str(" ok (in place, FAT32 chain + directory entry updated, verified)");
+    } else {
+        dbg64_str(" FAILED (nothing left half-written on purpose; see [FAT64] lines)");
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+    if (rc == 0) exp_msg(gui64_tr("Overwrote the file on the USB drive", "已就地覆盖 U 盘上的文件"));
+    else exp_msg(gui64_tr("Failed to write the file to the USB drive", "写入 U 盘失败"));
+    return rc;
+}
 static void exp_paste() {
     if (g_clip_op == 0 || g_clip_n <= 0) {
         exp_msg(gui64_tr("Clipboard is empty", "剪贴板是空的"));
@@ -1367,7 +1458,7 @@ static void exp_paste() {
         return;
     }
     if (g_mode != 1) { exp_msg(gui64_tr("Open a folder first", "先进入一个文件夹")); return; }
-    if (g_ro) {                                                        // ★ 批次 K：只读卷不能被粘贴
+    if (g_ro && !g_usb_rw) {                                           // ★ 批次 K：只读卷不能被粘贴
         exp_roact("paste");                 // ★ 只读卷不能被粘贴
         exp_log_paste(0, g_path, g_clip_n);
         return;
@@ -1381,6 +1472,26 @@ static void exp_paste() {
         char nm[VFS64_NAME_MAX + 1];
         path_last_seg_pure(g_clip[i].path, nm, (int)sizeof(nm));
         if (!nm[0]) { skipped++; continue; }
+        // ★ P8：目标 = **可写的 U 盘 FAT32 卷** —— 只认"同名已存在 -> 就地覆盖写"这一种情况；
+        //   新建文件没做（如实 skipped + 打点 roact why=new-file-on-fat-not-implemented），绝不假装成功。
+        if (g_usb_rw) {
+            char dp0[VFS64_PATH_MAX];
+            exp_build_path(dp0, (int)sizeof(dp0), g_path, nm);
+            Fs64Stat64 ex;
+            if (fs64_stat64(dvol, dp0, &ex) == 0 && ex.type == VFS64_TYPE_FILE) {
+                if (exp_usbfat_overwrite(g_clip[i].vol, g_clip[i].path, dvol, dp0, nm) == 0) {
+                    e_strcpy(pasted[okn], g_clip[i].path, (int)sizeof(pasted[0]));
+                    pasted_vol[okn] = g_clip[i].vol;
+                    okn++;
+                } else {
+                    skipped++;
+                }
+            } else {
+                skipped++;
+                exp_roact_reason("paste", "new-file-on-fat-not-implemented");
+            }
+            continue;
+        }
         char uniq[VFS64_NAME_MAX + 1];
         if (exp_unique_name(uniq, (int)sizeof(uniq), dvol, g_path, nm) != 0) { skipped++; continue; }
         char dp[VFS64_PATH_MAX];
@@ -1679,6 +1790,251 @@ static void exp_ctx_activate(int k) {              // 菜单项动作（k = 下�
     else exp_props_show(item);
 }
 
+// ==================== ★ P8：选择应用打开（无法直接打开的文件）====================
+// 触发：双击/回车一个**不能直接运行/打开**的文件（exp_assoc == ASSOC_NONE —— 未知扩展名 / .exe / 二进制…）。
+// 数据源（复用既有清单，不新建表）：**session64 的应用表** —— 外壳按 gui64.h 的 APP_ID_* 登记的那一份
+//   （session64_app_ok64/app_name64），与开始菜单/设置里的应用清单是同一个来源。
+// 启动路径（复用既有，不新写执行器）：
+//   （1）内容可跑（VAP64/ELF）-> app64_run_any64()（elf64_run64/app64_launch64 的自动分派，终端 `run` 同一条）；
+//   （2）文本 -> 既有只读预览窗口 exp_open_preview()；
+//   （3）.exe/Windows PE（扩展名或 MZ 头）-> **明确"打开失败"**：VimtuOS 无法运行 Windows 可执行文件；
+//   （4）其它二进制 -> 如实"打开失败：没有能打开此类型的应用"。
+// 绝不静默失败、绝不 PANIC：每一步都有 [UI] explorer openwith … 打点 + 面板里的一行红字。
+// 视觉（Token）：gfx64_shadow64 双层阴影 + gfx64_fill_round64 半透明面板（THEME64_A_POP）+ 圆角描边。
+#define EXP_OW_LIST_MAX 9
+static int  g_ow_dlg = 0;                              // 1 = 对话框打开
+static char g_ow_name[VFS64_NAME_MAX + 1] = {0};
+static char g_ow_path[VFS64_PATH_MAX] = {0};
+static char g_ow_msg[96] = {0};                        // 失败提示（空 = 没有）
+static int  g_ow_ids[EXP_OW_LIST_MAX] = {0};           // 应用 id（来自 session64 应用表）
+static char g_ow_lab[EXP_OW_LIST_MAX][28] = {{0}};     // 显示名（同上）
+static int  g_ow_n = 0;
+static int  g_ow_sel = 0;
+static int  g_ow_hover = -1;
+static uint32_t g_ow_kind = 0;                         // 打开时的 VFS64_KIND_*（fs64 的判定，直接用）
+static int ow_w(void) { return 440; }
+static int ow_h(void) { const int n = (g_ow_n > 0) ? g_ow_n : 1; return 74 + n * 26 + 58; }
+static int ow_x(void) { return EXP_CONTENT_X + (exp_content_w64() - ow_w()) / 2; }
+static int ow_y(void) { const int v = EXP_CONTENT_Y + (exp_content_h64() - ow_h()) / 3; return v > EXP_CONTENT_Y ? v : EXP_CONTENT_Y; }
+static void ow_btn_rect(int which, int* bx, int* by, int* bw, int* bh) {
+    const int w = 92, h = 26;
+    const int y = ow_y() + ow_h() - h - 12;
+    *bw = w; *bh = h; *by = y;
+    *bx = (which == 0) ? (ow_x() + ow_w() - 2 * w - 20) : (ow_x() + ow_w() - w - 12);
+}
+// 扩展名是不是 Windows 可执行（大小写不敏感；只看这一段，不做别的解释）
+static bool ow_ext_win(const char* n) {
+    static const char* k[] = { "exe", "dll", "sys", "msi", "bat", "cmd", "com", "scr", "ocx" };
+    int len = e_strlen(n);
+    int dot = -1;
+    for (int i = len - 1; i > 0; i--) if (n[i] == '.') { dot = i; break; }
+    if (dot < 0) return false;
+    const char* e = n + dot + 1;
+    for (unsigned kk = 0; kk < sizeof(k) / sizeof(k[0]); kk++) {
+        const char* p = k[kk];
+        int i = 0;
+        for (; p[i] && e[i]; i++) {
+            char c = e[i];
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            if (c != p[i]) break;
+        }
+        if (p[i] == 0 && e[i] == 0) return true;
+    }
+    return false;
+}
+static void exp_openwith_begin(int item) {
+    if (item < 0 || item >= g_items || item >= EXP_MAX_ITEMS) return;
+    e_strcpy(g_ow_name, g_ents[item].name, (int)sizeof(g_ow_name));
+    exp_build_path(g_ow_path, (int)sizeof(g_ow_path), g_path, g_ents[item].name);
+    g_ow_msg[0] = 0;
+    g_ow_n = 0;
+    for (int id = 1; id <= SESS64_APPS_MAX && g_ow_n < EXP_OW_LIST_MAX; id++) {
+        if (!session64_app_ok64(id)) continue;
+        g_ow_ids[g_ow_n] = id;
+        e_strcpy(g_ow_lab[g_ow_n], session64_app_name64(id), (int)sizeof(g_ow_lab[0]));
+        g_ow_n++;
+    }
+    g_ow_sel = 0;
+    g_ow_kind = g_ents[item].kind;
+    g_ow_hover = -1;
+    g_ow_dlg = 1;
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer openwith name=");
+    dbg64_str(g_ow_name);
+    dbg64_str(" kind=");
+    dbg64_str(vfs64_kind_str64(g_ents[item].kind));
+    dbg64_str(" apps=");
+    dbg64_dec((uint64_t)g_ow_n);
+    dbg64_str(" (cannot be opened directly: choose an application)");
+    dbg64_nl();
+    dbg64_line_end64();
+    for (int i = 0; i < g_ow_n; i++) {                  // 清单本身也是证据（验收按这些行核对）
+        dbg64_line_begin64();
+        dbg64_str("[UI] explorer openwith app idx=");
+        dbg64_dec((uint64_t)i);
+        dbg64_str(" id=");
+        dbg64_dec((uint64_t)g_ow_ids[i]);
+        dbg64_str(" name=");
+        dbg64_str(g_ow_lab[i]);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+}
+static void exp_openwith_close(const char* why) {
+    g_ow_dlg = 0;
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer openwith close why=");
+    dbg64_str(why ? why : "-");
+    dbg64_nl();
+    dbg64_line_end64();
+    if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+}
+// 面板里的失败提示（同时把原文打进串口 —— 验收两条都有）
+static void exp_openwith_fail(const char* name, int app_id, const char* reason, const char* msg) {
+    e_strcpy(g_ow_msg, msg, (int)sizeof(g_ow_msg));
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer openwith FAILED name=");
+    dbg64_str(name ? name : "?");
+    dbg64_str(" app=");
+    dbg64_dec((uint64_t)(app_id >= 0 ? (uint32_t)app_id : 0u));
+    dbg64_str(" reason=");
+    dbg64_str(reason ? reason : "?");
+    dbg64_nl();
+    dbg64_line_end64();
+    if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+}
+// 选中一个应用 -> 打开（返回 0 = 真的打开了；-1 = 打开失败，提示留在面板里）
+static int exp_openwith_commit(void) {
+    if (!g_ow_dlg || g_ow_n <= 0) return -1;
+    const int app_id = g_ow_ids[g_ow_sel];
+    const char* app_name = g_ow_lab[g_ow_sel];
+    // ---- 头 8 字节（判定 Windows PE / VAP64 / ELF 用；读不到就按扩展名走）----
+    uint8_t hdr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t got = 0;
+    (void)fs64_read_range64(-1, g_ow_path, 0, hdr, 8, &got);
+    const bool mz = (got >= 2 && hdr[0] == 'M' && hdr[1] == 'Z');
+    const bool vap = (got >= 8 && hdr[0] == 'V' && hdr[1] == 'A' && hdr[2] == 'P' && hdr[3] == '6' && hdr[4] == '4');
+    const bool elf = (got >= 4 && hdr[0] == 0x7F && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F');
+    // ---- （3）Windows PE：**明确打开失败**（扩展名或 MZ 头都算）----
+    if (ow_ext_win(g_ow_name) || mz) {
+        exp_openwith_fail(g_ow_name, app_id, "win-pe",
+                          gui64_tr("Open failed: VimtuOS cannot run Windows executables",
+                                   "打开失败：VimtuOS 无法运行 Windows 可执行文件"));
+        exp_msg(gui64_tr("Open failed: not a VimtuOS executable", "打开失败：不是 VimtuOS 能运行的程序"));
+        return -1;
+    }
+    // ---- （1）内容可跑：走既有启动路径（app64_run_any64 = VAP64/ELF 自动分派）----
+    if (vap || elf) {
+        const int rc = app64_run_any64(g_ow_path);
+        dbg64_line_begin64();
+        dbg64_str("[UI] explorer openwith run name=");
+        dbg64_str(g_ow_name);
+        dbg64_str(" app=");
+        dbg64_dec((uint64_t)app_id);
+        dbg64_str(" appname=");
+        dbg64_str(app_name);
+        dbg64_str(" rc=");
+        dbg64_dec((uint64_t)(rc < 0 ? 0xFFFFFFFFu : (uint32_t)rc));
+        dbg64_str(" (existing launch path: app64_run_any64)");
+        dbg64_nl();
+        dbg64_line_end64();
+        if (rc == 0) {
+            exp_openwith_close("ran");
+            exp_msg(gui64_tr("Opened with the chosen application", "已用选中的应用打开"));
+            return 0;
+        }
+        exp_openwith_fail(g_ow_name, app_id, "run-failed",
+                          gui64_tr("Open failed: the program could not be started",
+                                   "打开失败：程序没能跑起来"));
+        return -1;
+    }
+    // ---- （2）文本：既有只读预览窗口 ----
+    const uint32_t nm_kind = vfs64_kind_by_name64(VFS64_TYPE_FILE, g_ow_name, (uint32_t)e_strlen(g_ow_name));
+    if (g_ow_kind == VFS64_KIND_TEXT || nm_kind == VFS64_KIND_TEXT) {
+        exp_open_preview(g_ow_path, g_ow_name);
+        dbg64_line_begin64();
+        dbg64_str("[UI] explorer openwith run name=");
+        dbg64_str(g_ow_name);
+        dbg64_str(" app=");
+        dbg64_dec((uint64_t)app_id);
+        dbg64_str(" appname=");
+        dbg64_str(app_name);
+        dbg64_str(" rc=0 (existing path: text preview)");
+        dbg64_nl();
+        dbg64_line_end64();
+        exp_openwith_close("preview");
+        return 0;
+    }
+    // ---- （4）其它：如实"没有能打开它的应用" ----
+    exp_openwith_fail(g_ow_name, app_id, "no-handler",
+                      gui64_tr("Open failed: no application can open this file",
+                               "打开失败：没有能打开此文件的应用"));
+    return -1;
+}
+static void draw_openwith(void) {
+    if (!g_ow_dlg) return;
+    const Theme64Tokens* tk = theme64_tokens64();
+    const int x = ow_x(), y = ow_y(), w = ow_w(), h = ow_h();
+    // 单次调用内部就是近/远两层（Token 阴影）—— 屏幕绝对坐标
+    gfx64_shadow64(g_ox + x, g_oy + y, w, h, THEME64_R_CARD, tk);
+    gfx64_fill_round64(g_ox + x, g_oy + y, w, h, THEME64_R_CARD, tk->client_bg, THEME64_A_POP);
+    gfx64_stroke_round64(g_ox + x, g_oy + y, w, h, THEME64_R_CARD, tk->accent, THEME64_A_BORDER);
+    text_clip(g_ox + x + 14, g_oy + y + 12, gui64_tr("Choose an app to open this file", "选择用来打开此文件的应用"),
+              tk->text, w - 28);
+    text_clip(g_ox + x + 14, g_oy + y + 32, g_ow_name, tk->text_dim, w - 28);
+    const int lx = x + 12, lw = w - 24;
+    for (int i = 0; i < g_ow_n; i++) {
+        const int ry = y + 54 + i * 26;
+        const bool sel = (i == g_ow_sel);
+        const bool hov = (i == g_ow_hover);
+        if (sel)      gfx64_fill_round64(g_ox + lx, g_oy + ry, lw, 24, THEME64_R_BUTTON, tk->accent, 96);
+        else if (hov) gfx64_fill_round64(g_ox + lx, g_oy + ry, lw, 24, THEME64_R_BUTTON, tk->accent, 40);
+        text_clip(g_ox + lx + 10, g_oy + ry + 5, g_ow_lab[i], sel ? tk->text : tk->text_dim, lw - 20);
+    }
+    if (g_ow_msg[0]) {
+        text_clip(g_ox + x + 14, g_oy + y + h - 44, g_ow_msg, rgb(190, 30, 30), w - 28);
+    }
+    for (int b = 0; b < 2; b++) {
+        int bx = 0, by = 0, bw = 0, bh = 0;
+        ow_btn_rect(b, &bx, &by, &bw, &bh);
+        const int alpha = (b == 0) ? 210 : 120;
+        gfx64_fill_round64(g_ox + bx, g_oy + by, bw, bh, THEME64_R_BUTTON,
+                           (b == 0) ? tk->accent : tk->client_bg, alpha);
+        gfx64_stroke_round64(g_ox + bx, g_oy + by, bw, bh, THEME64_R_BUTTON, tk->accent, THEME64_A_BORDER);
+        const char* lab = (b == 0) ? gui64_tr("Open", "打开") : gui64_tr("Cancel", "取消");
+        const int tw2 = tw(lab);
+        text(g_ox + bx + (bw - tw2) / 2, g_oy + by + 6, lab, (b == 0) ? rgb(255, 255, 255) : tk->text);
+    }
+}
+// 鼠标命中（客户区坐标，返回 1 = 已消费）：
+//   列表行 -> 选中；打开/取消按钮 -> 动作；面板内其它地方 -> 吃掉（不透传到内容区）
+static int exp_openwith_click(int cx, int cy) {
+    if (!g_ow_dlg) return 0;
+    const int x = ow_x(), y = ow_y(), w = ow_w(), h = ow_h();
+    const int lx = x + 12, lw = w - 24;
+    for (int i = 0; i < g_ow_n; i++) {
+        const int ry = y + 54 + i * 26;
+        if (cx >= lx && cx < lx + lw && cy >= ry && cy < ry + 24) {
+            if (g_ow_sel == i) { exp_openwith_commit(); }             // 再点已选中项 = 直接打开
+            else { g_ow_sel = i; if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win); }
+            return 1;
+        }
+    }
+    for (int b = 0; b < 2; b++) {
+        int bx = 0, by = 0, bw = 0, bh = 0;
+        ow_btn_rect(b, &bx, &by, &bw, &bh);
+        if (cx >= bx && cx < bx + bw && cy >= by && cy < by + bh) {
+            if (b == 0) { exp_openwith_commit(); }
+            else { exp_openwith_close("cancel-button"); exp_msg(gui64_tr("Cancelled", "已取消")); }
+            return 1;
+        }
+    }
+    if (cx >= x && cx < x + w && cy >= y && cy < y + h) return 1;     // 面板上其它处：吃掉
+    exp_openwith_close("click-outside");                              // 面板外：按取消处理（明确）
+    return 1;
+}
+
 // ==================== 打开条目（双击 / 回车 / 菜单"打开"）====================
 static void exp_open_item(int i) {
     if (i < 0 || i >= g_items || i >= EXP_MAX_ITEMS) return;
@@ -1732,10 +2088,12 @@ static void exp_open_item(int i) {
     dbg64_str(d->name);
     dbg64_str(" kind=");
     dbg64_str(kstr);
+    dbg64_str(" -> open-with dialog (choose an application)");
     dbg64_nl();
     dbg64_line_end64();
-    exp_msg(gui64_tr("There is no application associated with this file",
-                     "没有关联的应用打开此文件"));
+    // ★ P8：无关联类型 -> **不再只弹一句提示**，而是打开"选择应用打开"对话框
+    //   （清单来自 session64 应用表；失败/不支持在面板里明确报"打开失败"，见 exp_openwith_commit）。
+    exp_openwith_begin(i);
 }
 
 // ---- 绘制坐标约定（重要）：应用回调里一律用**窗口客户区相对坐标**画，这里统一加客户区原点偏移再落到屏幕
@@ -2331,6 +2689,7 @@ static void exp_draw(Window* w) {
     draw_props();                                      // ★ 批次 J：属性面板
     draw_ctxmenu();                                    // ★ 批次 J：右键菜单（最上层）
     draw_edit();                                       // ★ 批次 J：内联编辑框（菜单之上，避免被盖）
+    draw_openwith();                                   // ★ P8：选择应用打开（最上层；Token 阴影+圆角+半透明）
     draw_status();
     fb_set_clip(w->client_x, w->client_y, w->client_w, w->client_h);   // 把外壳的客户区裁剪还回去（勿 reset）
 }
@@ -2381,6 +2740,12 @@ static int hit_nav(int cx, int cy, int* out_kind) {
 
 static void exp_click(Window* w, int cx, int cy) {
     const int sx = w->client_x + cx, sy = w->client_y + cy;
+    // ★ P8：选择应用打开对话框打开时，鼠标事件先给它（面板内不穿透到内容区）
+    if (g_ow_dlg) {
+        exp_log_click(cx, cy, sx, sy, "openwith");
+        (void)exp_openwith_click(cx, cy);
+        return;
+    }
     int crumb = -1;
     int id = btn_id_at(cx, cy, &crumb);
     char hit[24];
@@ -2614,6 +2979,15 @@ static void exp_tick(Window* w);                       // ★ 批次 J：框选�
 static void exp_key(Window* w, char c) {
     (void)w;
     const unsigned char uc = (unsigned char)c;
+    // ★ P8：选择应用打开对话框打开时，键盘先给它（上/下选择、回车 = 打开、Esc = 取消）
+    if (g_ow_dlg) {
+        if (uc == 0x1B) { exp_openwith_close("esc"); exp_msg(gui64_tr("Cancelled", "已取消")); return; }
+        if (uc == '\n' || uc == '\r') { (void)exp_openwith_commit(); return; }
+        if (uc == 0xFD) { if (g_ow_n > 0) g_ow_sel = (g_ow_sel + g_ow_n - 1) % g_ow_n; }      // NAV_UP
+        else if (uc == 0xFE) { if (g_ow_n > 0) g_ow_sel = (g_ow_sel + 1) % g_ow_n; }         // NAV_DOWN
+        if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+        return;                                                                              // 其它键吃掉
+    }
     // ---- ★ 批次 J：内联编辑优先吃键（字符 / 退格 / 回车 / Esc）----
     if (g_edit_mode != EXP_EDIT_NONE) {
         if (uc == 0x1B) { exp_edit_cancel(); return; }                        // Esc = 取消
@@ -2753,7 +3127,8 @@ static void exp_close(Window* w) {
     g_edit_mode = EXP_EDIT_NONE;
     g_edit_item = -1;
     g_props_open = 0;
-    g_box_active = 0;
+    g_props_open = 0;
+    g_ow_dlg = 0;                                        // ★ P8：关窗时收掉"选择应用"对话框
     g_del_confirm = 0;
     sel_clear();
     dbg64_str("[APP] mypc closed");
@@ -2777,7 +3152,8 @@ void explorer64_open64() {
     g_props_open = 0;
     g_box_active = 0;
     g_del_confirm = 0;
-    sel_clear();
+    g_props_open = 0;
+    g_ow_dlg = 0;                                        // ★ P8：打开时也从干净状态开始
     g_win = gui64_create_window(gui64_tr("File Explorer - This PC", "文件资源管理器 - 此电脑"),
                                 EXP_WIN_X, EXP_WIN_Y, EXP_WIN_W, EXP_WIN_H,
                                 exp_draw, exp_key, exp_click, APP_ID_MYPC);

@@ -85,6 +85,8 @@ struct DriveInfo64 {
     bool     browsable;            // 是否可浏览（校验通过的 VimtuFS2 卷 / 校验通过的 FAT32 卷）
     bool     system;               // 是否系统盘/系统分区（C:）
     bool     readonly;             // ★ 只读卷（FAT32 = true；写/删/改名/建目录一律被拒）
+    uint8_t  usb_rw;               // ★ P8：U 盘上的 FAT32 卷且 fat64 的卷级可写开关已打开 = 1
+                                   //   （唯一能走"覆盖写已存在文件"的卷；0 = 一个字节都不写）
     uint32_t vol_version;          // VimtuFS2 卷版本（2 / 3）；非 VimtuFS2 = 0
     uint8_t  fskind;               // DRV64_FS_*
     uint8_t  skip;                 // DRV64_SKIP_*

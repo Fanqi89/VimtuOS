@@ -551,6 +551,7 @@ struct Fat64RVol {
     Fat64Info64 info;
     uint32_t    fat_cache_sector;
     uint8_t     fat_cache[FAT64_SECTOR];
+    uint8_t     writable;       // ★ P8：卷级可写开关（唯一入口 fat64_set_writable64，只给 USB 盘打开）
 };
 static Fat64RVol g_rvol[FAT64_VOL_MAX];
 
@@ -1095,6 +1096,460 @@ int fat64_read64(int vol, const char* path, void* buf, uint32_t max, uint32_t* o
     return fat64_read_range64(vol, path, 0, buf, max, out_len);
 }
 
+// ==================== ★ P8：USB 可写 —— 覆盖写已存在文件的内容（保持 FAT32 结构自洽）====================
+// 范围（如实写清）：**只覆盖已存在文件的字节内容**。**不做**：新建文件 / 新建目录 / 删除 / 改名 /
+//   格式化 / 回收站语义。上层（explorer）只对"同名已存在"的文件走这条路（见 kernel/explorer64.cpp）。
+// 盘上结构改哪几处（就这几处，别处一个字节都不动）：
+//   1) 数据簇：只改文件覆盖范围内的扇区（先按扇区读回来再改，读改写**不碰同簇里别的字节**）；
+//      每写一个扇区立刻**读回逐字节比对**（[FAT64] write verify FAILED … 是失败证据）；
+//   2) FAT 链：新内容更短 -> 多余簇置 0 回收、新的链尾置 EOC；更长 -> 从空闲项里分配并接链尾。
+//      FAT1 改完，两份 FAT 逐字节一致（mount 时验过的 mirr=1）就连 FAT2 一起改；
+//   3) 目录项：只改**起始簇**（偏移 20 高 16 位 + 偏移 26 低 16 位）与**文件长度**（偏移 28..31）。
+//      8.3 短名 / LFN 组 / 时间 / 属性一个字节都不动；
+//   4) 变短时**最后一簇的尾部补零**（不留旧文件尾巴），长度 0 时首簇改 0 并回收整条链；
+//   5) FSInfo：只更新 free 计数（FSInfo 无效时不动，如实保持 unknown）。
+// 门禁（只在 USB 盘上打开，见 drive64）：卷级可写开关 fat64_set_writable64()，没打开时
+//   rv_write()/rfat_set() 一律拒绝 —— 系统卷 / 内部盘 / ESP 的写路径**完全不变**。
+#define FAT64_OW_MAX_CLUSTERS 65536u      // 单次覆盖的簇数护栏（16MB / 512B = 32768 以内正常）
+static const uint32_t FAT64_OW_LOG_MAX = 32u;
+
+// 卷内写：**只有 writable 的卷能写**（其余一律拒绝，绝不写到只读卷/系统卷上）
+static bool rv_write(int vol, uint32_t vol_lba, uint32_t count, const uint8_t* data) {
+    if (vol < 0 || vol >= FAT64_VOL_MAX || !g_rvol[vol].used || !data || count == 0) return false;
+    Fat64RVol& v = g_rvol[vol];
+    if (!v.writable) return false;
+    if (count > v.info.total_sectors || vol_lba > v.info.total_sectors - count) return false;
+    if (v.ram) return ram_xfer(vol_lba, count, nullptr, data);
+    if (v.drive < 0) return false;
+    return ata64_write(v.drive, v.start_lba + vol_lba, count, data);
+}
+
+// 改一个 FAT 项（读改写一个扇区；FAT2 镜像；改完让只读 FAT 缓存失效）
+static bool rfat_set(int vol, uint32_t c, uint32_t val) {
+    Fat64RVol& v = g_rvol[vol];
+    if (!v.writable) return false;
+    if ((c + 1u) * 4u > v.info.fatsz * FAT64_SECTOR) return false;
+    const uint32_t off = c * 4u;
+    const uint32_t sec = v.info.reserved + off / FAT64_SECTOR;
+    const uint32_t o   = off % FAT64_SECTOR;
+    if (!rv_read(vol, sec, 1, g_rsec)) return false;
+    wr32(g_rsec + o, val & 0x0FFFFFFFu);
+    if (!rv_write(vol, sec, 1, g_rsec)) return false;
+    if (v.info.mirr == 1 && v.info.num_fats >= 2) {               // 两份 FAT 一致：镜像一起改
+        if (!rv_write(vol, sec + v.info.fatsz, 1, g_rsec)) return false;
+    }
+    v.fat_cache_sector = FAT64_RCACHE_INVALID;                    // ★ 只读缓存必须失效（否则走旧链）
+    return true;
+}
+
+// 簇链第 n 个簇（n = 0 是首簇）；链提前结束/坏链 -> false
+static bool chain_nth(int vol, uint32_t first, uint32_t n, uint32_t* out) {
+    if (first < 2) return false;
+    uint32_t c = first;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t nx = 0;
+        if (!rchain_next(vol, c, &nx) || nx == 0) return false;
+        c = nx;
+    }
+    *out = c;
+    return true;
+}
+// 数一条链有多少簇（>= 2 起算）；超过 cap 或坏链 -> 0xFFFFFFFF（调用方如实拒绝）
+static uint32_t chain_len(int vol, uint32_t first, uint32_t cap) {
+    if (first < 2) return 0;
+    uint32_t c = first, n = 1;
+    while (n < cap) {
+        uint32_t nx = 0;
+        if (!rchain_next(vol, c, &nx)) return 0xFFFFFFFFu;
+        if (nx == 0) return n;
+        c = nx;
+        n++;
+    }
+    return 0xFFFFFFFFu;
+}
+// 在目录 dir_cluster 里找**短名项**的物理位置（簇 + 簇内扇区号 + 扇区内偏移）；1 = 找到
+static int dir_find_slot(int vol, uint32_t dir_cluster, const char* name,
+                         uint32_t* out_c, uint32_t* out_s, uint32_t* out_o) {
+    if (!fat64_vol_used64(vol) || !name) return -1;
+    const uint32_t clusters = g_rvol[vol].info.clusters;
+    if (dir_cluster < 2 || dir_cluster > clusters + 1u) return -1;
+    Fat64Lfn64 lfn;
+    lfn_reset(&lfn);
+    uint32_t c = dir_cluster, guard = 0;
+    for (;;) {
+        const uint32_t clba = rcluster_lba(vol, c);
+        for (uint32_t s = 0; s < g_rvol[vol].info.spc; s++) {
+            if (!rv_read(vol, clba + s, 1, g_rsec)) { rlog_reject("dir: read failed"); return -1; }
+            for (uint32_t o = 0; o + 32u <= FAT64_SECTOR; o += 32u) {
+                const uint8_t* e = g_rsec + o;
+                if (e[0] == 0x00) return 0;
+                Fat64Entry64 ent;
+                if (dir_step(&lfn, e, &ent) == 1 && r_name_eq(ent.name, name)) {
+                    if (out_c) *out_c = c;
+                    if (out_s) *out_s = s;
+                    if (out_o) *out_o = o;
+                    return 1;
+                }
+            }
+        }
+        uint32_t nx = 0;
+        if (!rchain_next(vol, c, &nx)) return -1;
+        if (nx == 0) return 0;
+        c = nx;
+        if (++guard > FAT64_CHAIN_MAX) { rlog_reject("dir: chain too long"); return -1; }
+    }
+}
+// 在 FAT 里找 count 个空闲簇接到 tail 后面（tail = 0 时第一个就是新首簇）
+static bool ow_append_clusters(int vol, uint32_t tail, uint32_t count,
+                               uint32_t* out_first_new, uint32_t* out_tail) {
+    Fat64RVol& v = g_rvol[vol];
+    const uint32_t maxc = v.info.clusters + 1u;
+    const uint32_t per_sec = FAT64_SECTOR / 4u;
+    uint32_t scan = 2;
+    uint32_t cur = tail;
+    uint32_t first_new = 0;
+    for (uint32_t k = 0; k < count; k++) {
+        uint32_t found = 0;
+        for (uint32_t sec = 0; sec < v.info.fatsz && !found; sec++) {
+            if (!rv_read(vol, v.info.reserved + sec, 1, g_rsec)) return false;
+            for (uint32_t o = 0; o + 4u <= FAT64_SECTOR; o += 4u) {
+                const uint32_t c = sec * per_sec + o / 4u;
+                if (c < scan || c < 2 || c > maxc) continue;
+                if ((rd32(g_rsec + o) & 0x0FFFFFFFu) != 0) continue;
+                found = c;
+                break;
+            }
+        }
+        if (!found) return false;                        // 没有空闲簇 -> 如实失败（卷满）
+        if (!rfat_set(vol, found, FAT64_EOF)) return false;
+        if (cur >= 2 && !rfat_set(vol, cur, found)) return false;
+        if (!first_new) first_new = found;
+        cur = found;
+        scan = found + 1u;
+    }
+    if (out_first_new) *out_first_new = first_new;
+    if (out_tail) *out_tail = cur;
+    return true;
+}
+// FSInfo 的 free 计数（delta < 0 = 分配掉了 |delta| 个簇）
+static void ow_fsinfo_add(int vol, int delta) {
+    Fat64RVol& v = g_rvol[vol];
+    if (!v.info.fsinfo_ok || v.info.free_clusters == 0xFFFFFFFFu) return;
+    const uint32_t fs = v.info.fsinfo_sector;
+    if (fs == 0 || fs >= v.info.reserved) return;
+    if (!rv_read(vol, fs, 1, g_rcheck)) return;
+    uint32_t freec = rd32(g_rcheck + 488);
+    if (delta < 0) {
+        const uint32_t d = (uint32_t)(-delta);
+        freec = (freec >= d) ? (freec - d) : 0u;
+    } else {
+        freec += (uint32_t)delta;
+    }
+    if (freec > v.info.clusters) freec = v.info.clusters;
+    wr32(g_rcheck + 488, freec);
+    if (rv_write(vol, fs, 1, g_rcheck)) v.info.free_clusters = freec;
+}
+
+// 覆盖写会话（一次只有一个；begin -> write* -> commit）
+struct Fat64Ow64 {
+    bool     active;
+    int      vol;
+    uint32_t parent_cluster;        // 目录所在簇
+    uint32_t slot_c, slot_s, slot_o; // 短名目录项的位置（簇 / 簇内扇区号 / 扇区内偏移）
+    uint32_t len;                   // 新的文件长度
+    uint32_t first;                 // 新的首簇（len = 0 时为 0）
+    uint32_t need;                  // 需要的簇数
+};
+static Fat64Ow64 g_ow = { false, -1, 0, 0, 0, 0, 0, 0, 0 };
+static uint32_t  g_ow_logs = 0;
+static uint32_t  g_ow_fail_logs = 0;
+
+int fat64_set_writable64(int vol, int on, const char* why) {
+    if (!fat64_vol_used64(vol)) return -1;
+    const int want = on ? 1 : 0;
+    if (g_rvol[vol].writable != want) {
+        g_rvol[vol].writable = (uint8_t)want;
+        dbg64_line_begin64();
+        dbg64_str("[FAT64] writable vol=");
+        dbg64_dec((uint64_t)vol);
+        dbg64_str(" = ");
+        dbg64_dec((uint64_t)want);
+        dbg64_str(" why=");
+        dbg64_str(why ? why : "-");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    return 0;
+}
+int fat64_vol_writable64(int vol) {
+    if (!fat64_vol_used64(vol)) return 0;
+    return g_rvol[vol].writable ? 1 : 0;
+}
+
+int fat64_ow_begin64(int vol, const char* path, uint32_t len) {
+    if (g_ow.active) { rlog_reject("write: overwrite session already active"); return -1; }
+    if (!fat64_vol_used64(vol) || !path || !path[0]) return -1;
+    Fat64RVol& v = g_rvol[vol];
+    if (v.info.fat_type != FAT64_TYPE_32) { rlog_reject("write: only FAT32 volumes"); return -1; }
+    if (!v.writable) {
+        dbg64_line_begin64();
+        dbg64_str("[FAT64] write reject vol=");
+        dbg64_dec((uint64_t)vol);
+        dbg64_str(" (not writable: only USB volumes get the write path, see drive64)");
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+    if (len > FAT64_READ_MAX_BYTES) { rlog_reject("write: file too large (limit 16MB)"); return -1; }
+    Fat64Entry64 e;
+    if (resolve64(vol, path, &e, nullptr) != 0) { rlog_reject("write: path not found (new files are not implemented)"); return -1; }
+    if (e.attr & 0x10u) { rlog_reject("write: is a directory"); return -1; }
+    if (e.attr & 0x01u) { rlog_reject("write: file has the read-only attribute"); return -1; }
+    if (e.cluster < 2 && e.size != 0) { rlog_reject("write: bad first cluster"); return -1; }
+
+    // ---- 父目录簇 + 叶子名 ----
+    char parent[FAT64_NAME_MAX], leaf[FAT64_NAME_MAX];
+    int cut = -1, n = 0;
+    for (; path[n]; n++) if (path[n] == '/') cut = n;
+    {
+        int j = 0;
+        if (cut > 0) for (int i = 0; i < cut && j < (int)sizeof(parent) - 1; i++) parent[j++] = path[i];
+        parent[j] = 0;
+        int k = 0;
+        for (int i = cut + 1; i < n && k < (int)sizeof(leaf) - 1; i++) leaf[k++] = path[i];
+        leaf[k] = 0;
+    }
+    if (!leaf[0]) { rlog_reject("write: bad path"); return -1; }
+    uint32_t parent_cluster = v.info.root_cluster;
+    if (cut > 0) {
+        Fat64Entry64 de;
+        uint32_t dc = 0;
+        if (resolve64(vol, parent, &de, &dc) != 0) { rlog_reject("write: parent not found"); return -1; }
+        parent_cluster = dc;
+    }
+    uint32_t sc = 0, ss = 0, so = 0;
+    const int fsr = dir_find_slot(vol, parent_cluster, leaf, &sc, &ss, &so);
+    if (fsr < 0) return -1;
+    if (fsr == 0) { rlog_reject("write: directory entry not found"); return -1; }
+
+    // ---- 链容量整理：恰好 need 个簇（多回收 / 少分配）----
+    const uint32_t cb = v.info.cluster_bytes;
+    const uint32_t need = (len + cb - 1u) / cb;
+    if (need > FAT64_OW_MAX_CLUSTERS) { rlog_reject("write: too many clusters"); return -1; }
+    uint32_t first = e.cluster;
+    const uint32_t have = chain_len(vol, first, FAT64_OW_MAX_CLUSTERS + 1u);
+    if (have == 0xFFFFFFFFu) { rlog_reject("write: chain too long or broken"); return -1; }
+    uint32_t alloc = 0, freed = 0;
+    if (need > have) {
+        const uint32_t add = need - have;
+        uint32_t tail = 0;
+        if (have == 0) {
+            uint32_t nf = 0, nt = 0;
+            if (!ow_append_clusters(vol, 0, add, &nf, &nt)) { rlog_reject("write: no free cluster (volume full)"); return -1; }
+            first = nf;
+        } else {
+            if (!chain_nth(vol, first, have - 1u, &tail)) { rlog_reject("write: bad chain"); return -1; }
+            uint32_t nf = 0, nt = 0;
+            if (!ow_append_clusters(vol, tail, add, &nf, &nt)) { rlog_reject("write: no free cluster (volume full)"); return -1; }
+        }
+        alloc = add;
+        ow_fsinfo_add(vol, -(int)add);
+    } else if (need < have) {
+        // 变短/清空：第 need 个簇起全部回收（置 0），新的链尾（第 need-1 个）置 EOC。
+        // ★ 顺序要紧：**先算出 surplus 的首簇，再切断链**（切断后 chain_nth 就走到 EOC 了）。
+        uint32_t surplus_first = first;
+        if (need > 0) {
+            uint32_t new_tail = 0, sf = 0;
+            if (!chain_nth(vol, first, need - 1u, &new_tail)) { rlog_reject("write: bad chain"); return -1; }
+            if (!chain_nth(vol, first, need, &sf)) { rlog_reject("write: bad chain"); return -1; }
+            if (!rfat_set(vol, new_tail, FAT64_EOF)) return -1;
+            surplus_first = sf;
+        }
+        uint32_t c = surplus_first, guard = 0;
+        for (;;) {
+            uint32_t nx = 0;
+            if (!rchain_next(vol, c, &nx)) { rlog_reject("write: bad chain"); return -1; }
+            if (!rfat_set(vol, c, 0)) return -1;
+            freed++;
+            if (nx == 0) break;
+            c = nx;
+            if (++guard > FAT64_OW_MAX_CLUSTERS + 1u) { rlog_reject("write: chain too long"); return -1; }
+        }
+        if (need == 0) first = 0;
+        ow_fsinfo_add(vol, (int)freed);
+    }
+
+    // ---- 变短/清空后：最后一簇的尾部补零（不留旧内容）----
+    if (len > 0 && (len % cb) != 0 && first >= 2) {
+        uint32_t lc = 0;
+        if (!chain_nth(vol, first, need - 1u, &lc)) { rlog_reject("write: bad chain"); return -1; }
+        const uint32_t clba = rcluster_lba(vol, lc);
+        uint32_t from = len % cb;
+        while (from < cb) {
+            const uint32_t sec = from / FAT64_SECTOR;
+            const uint32_t so = from % FAT64_SECTOR;
+            uint32_t n2 = FAT64_SECTOR - so;
+            if (n2 > cb - from) n2 = cb - from;
+            if (sec >= v.info.spc) break;
+            if (!rv_read(vol, clba + sec, 1, g_rsec)) { rlog_reject("write: tail read failed"); return -1; }
+            for (uint32_t k = 0; k < n2; k++) g_rsec[so + k] = 0;
+            if (!rv_write(vol, clba + sec, 1, g_rsec)) { rlog_reject("write: tail write failed"); return -1; }
+            from += n2;
+        }
+    }
+
+    g_ow.active = true;
+    g_ow.vol = vol;
+    g_ow.parent_cluster = parent_cluster;
+    g_ow.slot_c = sc; g_ow.slot_s = ss; g_ow.slot_o = so;
+    g_ow.len = len;
+    g_ow.first = first;
+    g_ow.need = need;
+    if (g_ow_logs < FAT64_OW_LOG_MAX) {
+        g_ow_logs++;
+        dbg64_line_begin64();
+        dbg64_str("[FAT64] write begin vol=");
+        dbg64_dec((uint64_t)vol);
+        dbg64_str(" path=");
+        dbg64_str(path);
+        dbg64_str(" size=");
+        dbg64_dec((uint64_t)len);
+        dbg64_str(" clusters=");
+        dbg64_dec((uint64_t)need);
+        dbg64_str(" alloc=");
+        dbg64_dec((uint64_t)alloc);
+        dbg64_str(" freed=");
+        dbg64_dec((uint64_t)freed);
+        dbg64_str(" (new files/delete are NOT implemented)");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    return 0;
+}
+
+int fat64_ow_write64(int vol, uint32_t off, const void* data, uint32_t len, uint32_t* out_done) {
+    if (out_done) *out_done = 0;
+    if (!g_ow.active || vol != g_ow.vol || !data) return -1;
+    if (len == 0) return 0;
+    if (off > g_ow.len || len > g_ow.len - off) {                  // 越界：明确失败（不写任何字节）
+        rlog_reject("write: range out of file");
+        return -1;
+    }
+    Fat64RVol& v = g_rvol[vol];
+    if (!v.writable) { rlog_reject("write: volume became read-only"); return -1; }
+    const uint32_t cb = v.info.cluster_bytes;
+    const uint8_t* src = (const uint8_t*)data;
+    uint32_t done = 0, guard = 0;
+    while (done < len) {
+        const uint32_t pos = off + done;
+        const uint32_t idx = pos / cb;
+        const uint32_t within = pos % cb;
+        uint32_t c = 0;
+        if (!chain_nth(vol, g_ow.first, idx, &c)) { rlog_reject("write: chain ended early"); return -1; }
+        const uint32_t clba = rcluster_lba(vol, c);
+        uint32_t seg = cb - within;
+        if (seg > len - done) seg = len - done;
+        uint32_t s = 0;
+        while (s < seg) {
+            const uint32_t abs_off = within + s;
+            const uint32_t sec = abs_off / FAT64_SECTOR;
+            const uint32_t so = abs_off % FAT64_SECTOR;
+            uint32_t n2 = FAT64_SECTOR - so;
+            if (n2 > seg - s) n2 = seg - s;
+            if (sec >= v.info.spc) { rlog_reject("write: bad sector math"); return -1; }
+            if (!rv_read(vol, clba + sec, 1, g_rsec)) { rlog_reject("write: read-modify failed"); return -1; }
+            memcopy8(g_rsec + so, src + done + s, n2);
+            if (!rv_write(vol, clba + sec, 1, g_rsec)) { rlog_reject("write: I/O failed"); return -1; }
+            // ★ 写后读回：同一扇区立刻读回来逐字节比对（不一致 = 失败证据）
+            if (!rv_read(vol, clba + sec, 1, g_rcheck)) { rlog_reject("write verify: read-back failed"); return -1; }
+            if (memcmp_64(g_rcheck, g_rsec, FAT64_SECTOR) != 0) {
+                g_ow_fail_logs++;
+                dbg64_line_begin64();
+                dbg64_str("[FAT64] write verify FAILED lba=");
+                dbg64_dec((uint64_t)(clba + sec));
+                dbg64_str(" (read back after write, byte-for-byte)");
+                dbg64_nl();
+                dbg64_line_end64();
+                return -1;
+            }
+            s += n2;
+            if (++guard > FAT64_OW_MAX_CLUSTERS * 128u) { rlog_reject("write: guard"); return -1; }
+        }
+        done += seg;
+    }
+    if (out_done) *out_done = done;
+    return 0;
+}
+
+int fat64_ow_commit64(int vol, int ok) {
+    if (!g_ow.active || vol != g_ow.vol) return -1;
+    Fat64RVol& v = g_rvol[vol];
+    int rc = 0;
+    if (!ok) {
+        rc = -1;                                     // 放弃：FAT 链已按 need 整理过，内容可能只写了一半
+        dbg64_line_begin64();
+        dbg64_str("[FAT64] write abort vol=");
+        dbg64_dec((uint64_t)vol);
+        dbg64_str(" (partial content may remain; the directory entry was NOT updated)");
+        dbg64_nl();
+        dbg64_line_end64();
+    } else {
+        // ---- 目录项：只改起始簇 + 文件长度（8.3 名/LFN/时间/属性不动）----
+        const uint32_t clba = rcluster_lba(vol, g_ow.slot_c);
+        if (!rv_read(vol, clba + g_ow.slot_s, 1, g_rsec)) rc = -1;
+        else {
+            uint8_t* ent = g_rsec + g_ow.slot_o;
+            if (!(ent[0] == 0x00 || ent[0] == 0xE5)) {
+                wr16(ent + 20, (uint16_t)((g_ow.first >> 16) & 0xFFFF));
+                wr16(ent + 26, (uint16_t)(g_ow.first & 0xFFFF));
+                wr32(ent + 28, g_ow.len);
+                if (!rv_write(vol, clba + g_ow.slot_s, 1, g_rsec)) rc = -1;
+            } else {
+                rlog_reject("write: directory entry disappeared");
+                rc = -1;
+            }
+        }
+        if (rc == 0) {
+            dbg64_line_begin64();
+            dbg64_str("[FAT64] write commit vol=");
+            dbg64_dec((uint64_t)vol);
+            dbg64_str(" first_cluster=");
+            dbg64_dec((uint64_t)g_ow.first);
+            dbg64_str(" size=");
+            dbg64_dec((uint64_t)g_ow.len);
+            dbg64_str(" clusters=");
+            dbg64_dec((uint64_t)g_ow.need);
+            dbg64_str(" (data written + verified sector by sector)");
+            dbg64_nl();
+            dbg64_line_end64();
+        } else {
+            g_ow_fail_logs++;
+            dbg64_line_begin64();
+            dbg64_str("[FAT64] write commit FAILED vol=");
+            dbg64_dec((uint64_t)vol);
+            dbg64_str(" (directory entry not updated)");
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
+    (void)v;
+    g_ow.active = false;
+    g_ow.vol = -1;
+    return rc;
+}
+
+// 一次调用覆盖整个文件（数据在调用方缓冲里；≤ 16MB）。分块版本见 fat64_ow_*。
+int fat64_overwrite64(int vol, const char* path, const void* data, uint32_t len) {
+    if (len > 0 && !data) return -1;
+    if (fat64_ow_begin64(vol, path, len) != 0) return -1;
+    uint32_t done = 0;
+    if (len > 0 && fat64_ow_write64(vol, 0, data, len, &done) != 0) {
+        (void)fat64_ow_commit64(vol, 0);
+        return -1;
+    }
+    return fat64_ow_commit64(vol, 1);
+}
+
 // ---- 挂载（只读）----
 // 同 (drive,lba) 幂等复用；只挂 FAT32（FAT12/16 的 12/16 位 FAT 项本批不做，如实拒绝并写清类型）。
 int fat64_mount64(int drive, uint32_t lba, int* out_vol) {
@@ -1184,6 +1639,7 @@ static int fat64_mount_ram64(uint32_t sectors, int* out_vol) {
     v.used = true; v.ram = true; v.drive = -1; v.start_lba = 0;
     v.info = info;
     v.fat_cache_sector = FAT64_RCACHE_INVALID;
+    v.writable = 1;                       // ★ P8：内存卷（自检）可写 —— 真盘由 drive64 显式打开
     if (out_vol) *out_vol = slot;
     return 0;
 }

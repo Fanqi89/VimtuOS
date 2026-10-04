@@ -1325,6 +1325,60 @@ else
     echo "ERROR: 缺少 $FONT_VOL_IN 或 $BUILD/fontdemo.elf —— 文字栈没装进系统卷" >&2
     exit 1
 fi
+
+# ★ P9：**用户态网络栈**（/bin/netd）—— 内核侧只有 net_raw(53) 那条"原始帧收发"，DHCP/DNS/UDP/TCP
+#   全部在这里（user/net/netd.c，自足：不 include 任何头、不链 user/lib，与 /bin/sounder 同一条纪律）。
+#   为什么 -Os 而不是 -O2：内核 elf64 装载器把**主程序装载区**硬限在用户窗口低 64 KiB
+#   （kernel/elf64.cpp 的 e64_lo64/e64_hi64），-O2 对 1600 行代码会大量展开/向量化，实测
+#   netd.elf 111,760 B（越界），-Os 实测 39,768 B（PT_LOAD memsz 合计 32,361 B）—— 一个字节不越界。
+#   交付纪律同上：只落 build64/，由 tools/net_pack_win.py 写进系统卷（/bin/netd，写完逐字节回读自检），
+#   并用 probe64.py 确认内核二进制里搜不到它。
+echo "==> ★ P9：用户态网络栈 /bin/netd（int 0x80 号 53 net_raw 之上：ARP/IPv4/ICMP/UDP/DHCP/DNS/TCP）"
+NETD_SZ=0
+clang --target=x86_64-unknown-none-elf -nostdinc -ffreestanding -nostdlib -fno-builtin \
+  -fno-stack-protector -fno-pic -fno-pie -fno-zero-initialized-in-bss -mcmodel=large -mno-red-zone \
+  -mno-sse -mno-sse2 -mno-mmx -mno-avx -fno-asynchronous-unwind-tables -fno-unwind-tables \
+  -ffunction-sections -fdata-sections -std=c11 -Os -Wall -Wextra \
+  -c user/net/netd.c -o "$BUILD/netd.o"
+$LD -m elf_x86_64 -T user/lib/user64.ld --gc-sections -o "$BUILD/netd.elf" "$BUILD/netd.o"
+NETD_SZ=$(stat -c%s "$BUILD/netd.elf")
+# 主程序装载区硬上限（kernel/elf64.cpp）：PT_LOAD 必须落在 4GiB..4GiB+64KiB
+"$PY" - "$BUILD/netd.elf" <<'PYEOF'
+import struct, sys
+d = open(sys.argv[1], "rb").read()
+assert d[:4] == b"\x7fELF" and d[4] == 2 and d[5] == 1, "/bin/netd 不是 ELF64 小端"
+etype, machine = struct.unpack_from("<HH", d, 16)
+assert etype == 2 and machine == 0x3E, "/bin/netd 不是 ET_EXEC/x86_64"
+phoff = struct.unpack_from("<Q", d, 32)[0]
+phes, phn = struct.unpack_from("<H", d, 54)[0], struct.unpack_from("<H", d, 56)[0]
+lo, hi, segs = 0x100000000, 0x100000000 + 0x10000, []
+for i in range(phn):
+    o = phoff + i * phes
+    t = struct.unpack_from("<I", d, o)[0]
+    va = struct.unpack_from("<Q", d, o + 16)[0]
+    msz = struct.unpack_from("<Q", d, o + 40)[0]
+    assert t not in (2, 3), "/bin/netd 出现 PT_DYNAMIC/PT_INTERP"
+    if t == 1:
+        assert lo <= va and va + msz <= hi, \
+            "PT_LOAD 越出主程序装载区（va=%#x msz=%#x）" % (va, msz)
+        segs.append((va, msz))
+ent = struct.unpack_from("<Q", d, 24)[0]
+assert any(va <= ent < va + m for va, m in segs), "入口不在任何 PT_LOAD 内"
+assert len(d) <= 96 * 1024, "/bin/netd 超过内核读盘缓冲 96 KiB"
+print("    /bin/netd ELF 检查 OK：%d 个 PT_LOAD，memsz 合计 %d B（装载区 <= 65536 B）"
+      % (len(segs), sum(m for _, m in segs)))
+PYEOF
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" "$BUILD/netd.elf"
+echo "    /bin/netd = $NETD_SZ B（静态 ELF64；由 tools/net_pack_win.py 装进系统卷）"
+NET_VOL_IN="$BUILD/fontvol.img"
+[ -f "$NET_VOL_IN" ] || NET_VOL_IN="$BUILD/soundvol.img"
+if [ -f "$NET_VOL_IN" ] && [ -f "$BUILD/netd.elf" ]; then
+    "$PY" tools/net_pack_win.py --vol-in "$NET_VOL_IN" --vol-out "$BUILD/netvol.img" \
+          --netd "$BUILD/netd.elf" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+else
+    echo "ERROR: 缺少 $NET_VOL_IN 或 $BUILD/netd.elf —— 网络栈没装进系统卷" >&2
+    exit 1
+fi
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
 "$PY" - "$BUILD/payload_hdr.bin" "$SYS_SECTORS" "$((PAYLOAD_LBA + 1))" <<'PYEOF'
 import struct, sys

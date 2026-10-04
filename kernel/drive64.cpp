@@ -80,6 +80,7 @@ static void log_letter(const DriveInfo64& e) {
         dbg64_str(" fatvol=");
         dbg64_dec((uint64_t)e.fatvol);
     }
+    if (e.usb_rw) dbg64_str(" usb_rw=1");      // ★ P8：只有 U 盘上的 FAT32 卷会带这个标记
     dbg64_nl();
     dbg64_line_end64();
 }
@@ -230,7 +231,7 @@ int drive64_scan64() {
                     copy_str(e.fs, DRV64_FS_MAX, "FAT32");
                     copy_str(e.name, DRV64_NAME_MAX, (p[i].type == 0xEF) ? "EFI 系统分区" : "FAT32 卷");
                     e.browsable = true;
-                    e.readonly = true;
+                    e.readonly = true;                       // fs64 层仍然只读（写入口不变）
                     e.vol = fvol;
                     e.fatvol = (uint8_t)(fvol - FS64_VOL_FAT_BASE);
                     e.total_known = fv.total_known ? true : false;
@@ -238,6 +239,12 @@ int drive64_scan64() {
                     e.total_kb = fv.total_kb;
                     e.free_kb = fv.free_kb;
                     e.skip = DRV64_SKIP_NONE;
+                    // ★ P8：**只有 U 盘**（驱动器号 >= ATA64_USB_BASE）上的 FAT32 卷打开卷级可写开关。
+                    //   顺序就是安全边界：先 mount 成功 -> 再按"是不是 USB 盘"决定写不写 -> 记录到条目上。
+                    if (d >= ATA64_USB_BASE) {
+                        (void)fat64_set_writable64(e.fatvol, 1, "usb");
+                    }
+                    e.usb_rw = fat64_vol_writable64(e.fatvol) ? 1 : 0;
                 } else {
                     e.fskind = DRV64_FS_FAT32;
                     copy_str(e.fs, DRV64_FS_MAX, "FAT32(挂载失败)");
@@ -390,6 +397,11 @@ int drive64_info64(int i, DriveInfo64* out) {
             out->total_known = fv.total_known ? true : false;
             out->free_known = fv.free_known ? true : false;
             out->readonly = fv.readonly ? true : false;
+            // ★ P8：**可写**标记不走 fs64（fs64 对 FAT 一律只读），真源在 fat64 的卷级开关：
+            //   只有 drive64 对 U 盘打开过才有值。上层（explorer）拿它决定"同名覆盖写"这条独有路径。
+            if (fv.kind == FS64_KIND_FAT32 && out->fatvol != DRV64_SLOT_NONE) {
+                out->usb_rw = fat64_vol_writable64(out->fatvol) ? 1 : 0;
+            }
         }
     }
     return 0;

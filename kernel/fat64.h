@@ -91,7 +91,9 @@ int fat64_selftest64();
 //   挂载/校验 BPB -> 列目录（8.3 + VFAT 长名 LFN）-> 按簇链读文件。
 //
 // 支持范围（如实写清，别指望它是一般意义的 FAT 实现）：
-//   * **只读**：没有写/删/改名/建目录；上层（fs64/explorer/terminal/fd64）对 FAT 卷的写请求一律拒绝。
+//   * **本批（批次 K）只读**；★ P8 起**唯一的例外**：驱动器号 >= ATA64_USB_BASE（U 盘）上的 FAT32 卷，
+//     由 drive64 显式打开卷级可写开关（fat64_set_writable64）后可以**覆盖写已存在文件的内容**；
+//     **新建 / 删除 / 改名 / 建目录 / 格式化仍然没有**（上层对这些一律拒绝）。没打开开关的卷一个字节都不写。
 //   * 扇区固定 512B（BPB_BytsPerSec == 512，其它值拒绝）；每簇扇区数按 BPB 计算（1..128，含 U 盘常见的 8）；
 //   * 卷类型按**簇数**判定：< 4085 -> FAT12、4085..65524 -> FAT16、>= 65525 -> FAT32；
 //     本批**只挂载/浏览 FAT32**（FAT12/16 的簇链项是 12/16 位，本批不做；probe 仍会如实报出实际类型）。
@@ -111,6 +113,12 @@ int fat64_selftest64();
 //   [FAT64] mount vol=<n> lba=<n> clusters=<n> free=<n> fat_ok=1
 //   [FAT64] list path=<p> entries=<n> / [FAT64] read path=<p> size=<n> bytes=<n>
 //   [FAT64] reject <why>（坏 BPB / 坏链 / 越界 / 只支持 FAT32 等）
+//   ★ P8 写： [FAT64] writable vol=<n> = 1 why=usb
+//              [FAT64] write begin vol=<n> path=<p> size=<n> clusters=<n> alloc=<n> freed=<n> (new files/delete are NOT implemented)
+//              [FAT64] write commit vol=<n> first_cluster=<n> size=<n> clusters=<n> (data written + verified sector by sector)
+//              [FAT64] write abort vol=<n> … / [FAT64] write commit FAILED vol=<n> …
+//              [FAT64] write reject vol=<n> (not writable: only USB volumes get the write path, see drive64)
+//              [FAT64] write verify FAILED lba=<n> (read back after write, byte-for-byte)
 static const uint32_t FAT64_TYPE_12 = 12;    // 簇数 < 4085
 static const uint32_t FAT64_TYPE_16 = 16;    // 4085..65524
 static const uint32_t FAT64_TYPE_32 = 32;    // >= 65525
@@ -181,3 +189,24 @@ int fat64_read64(int vol, const char* path, void* buf, uint32_t max, uint32_t* o
 // 分块读：从文件偏移 off 读 len 字节（供大文件（如 4MB 的 KERNEL64.BIN）分块校验用）。
 // *out_got = 实际读到的字节数（到文件末尾会短读）；成功 0。
 int fat64_read_range64(int vol, const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got);
+
+// ==================== ★ P8：USB 可写 —— 覆盖写已存在文件的内容 ====================
+// 范围（如实）：只覆盖**已存在**普通文件的字节内容；新建文件 / 新建目录 / 删除 / 改名 / 格式化
+//   **都没有**（上层对这些一律拒绝并打点）。写了多少就立刻读回逐字节比对（扇区级校验）。
+//
+// 卷级可写开关（**唯一入口**）：drive64 只在"驱动器号 >= ATA64_USB_BASE（U 盘）的 FAT32 卷"上调用它。
+// 没打开的卷：rv_write()/rfat_set() 一律拒绝 —— 系统卷 / 内部盘 / ESP 的写路径完全不变。
+int fat64_set_writable64(int vol, int on, const char* why);
+int fat64_vol_writable64(int vol);                 // 1 = 这个卷现在可写
+
+// 覆盖写单个已存在文件（数据在调用方内存里，≤ 16MB；分块版本见下面三段式）。
+// 返回 0 = 全部写完并**逐扇区读回校验通过**、目录项（起始簇 + 长度）已更新；-1 = 失败（已打点）。
+int fat64_overwrite64(int vol, const char* path, const void* data, uint32_t len);
+
+// 三段式（大文件分块用；同一时刻只允许一个会话）：
+//   begin 定下新长度并整理簇链（多了回收 / 少了分配 / 变短时最后一簇尾部补零），
+//   write 按偏移写（越界 = 失败，不写任何字节；每扇区写完立刻读回比对），
+//   commit ok=1 更新目录项（起始簇 + 长度），ok=0 放弃（目录项不动，内容可能只写了一半 —— 如实打点）。
+int fat64_ow_begin64(int vol, const char* path, uint32_t len);
+int fat64_ow_write64(int vol, uint32_t off, const void* data, uint32_t len, uint32_t* out_done);
+int fat64_ow_commit64(int vol, int ok);

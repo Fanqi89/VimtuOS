@@ -1905,45 +1905,29 @@ static int64_t sc64_audio_play64(uint64_t pcm_va, uint64_t frames, uint64_t fmt)
 
 // ==================== ★ P9：原始帧收发 ABI（自有 int 0x80 号 53 net_raw）====================
 // 语义 / 错误码 / 打点格式 / 宪法四条件对照的唯一说明见 kernel/netraw64.h（一页纸）与
-// kernel/syscall64.h 的"net_raw（53）"段。本层只做三件事：
-//   ① op 合法性（0..3）-> 否则 -3 EINVAL + [SYSCALL] deny；
-//   ② **长度闸门**（用 netraw64.h 的 NETRAW64_* 常量：先夹住长度，再用它做范围校验 ——
-//      这样"超硬件口径"给的是 -6 EMSGSIZE，而不是被超大 len 拖去做无意义的整段页表检查，
-//      与 49 号"长度闸门先于范围校验"同款）；
-//   ③ 用户态缓冲的**范围校验**（user64_range_ok64：落在用户窗口内 + 已映射为用户页）-> 否则
-//      -2 EFAULT + [SYSCALL] deny，然后**转发**给 kernel/netraw64.cpp。
+// kernel/syscall64.h 的"net_raw（53）"段。本层只做两件事：
+//   ① op 合法性（0..3）与**用户态缓冲范围**校验（user64_range_ok64：落在用户窗口内 + 已映射为
+//      用户页）+ 长度闸门的**安全钳制**（超口径的长度不拿去做页表遍历，见下面的分支说明）；
+//   ② 按 op **转发**给 kernel/netraw64.cpp（长度/网卡口径的判定与 [NETRAW] deny 打点都在那里）。
 // 内核**不做协议解析**：帧里是什么（ARP/IPv4/DHCP/DNS/TCP…）本层一个字节都不看 —— 那些策略
 // 全在 ring3 的 /bin/netd。安装内核里 netraw64_* 是弱符号 0 -> 返回 -1 + deny（不假装成功）。
 static int64_t sc64_net_raw64(uint64_t op, uint64_t a2, uint64_t a3) {
     switch (op) {
     case NETRAW64_OP_TX:                                        // tx(frame_va, len)
-        if (a3 < (uint64_t)NETRAW64_TX_MIN) {
-            syscall64_deny64(53, a3);
-            return NETRAW64_EINVAL;
-        }
-        if (a3 > (uint64_t)NETRAW64_MTU) {
-            syscall64_deny64(53, a3);
-            return NETRAW64_EMSGSIZE;
-        }
-        if (!user64_range_ok64(a2, a3)) {
+    case NETRAW64_OP_RX: {                                      // rx(buf_va, cap)
+        /* ★ 长度口径的**唯一真源**在 kernel/netraw64.cpp（它按硬件口径判 -3 长度非法 / -6 超口径
+         *   并打 [NETRAW] deny 行）。本层只负责**用户态指针**这一件事：
+         *     * 0 < 长度 <= 硬件口径：按声明的长度做范围校验（越界 -> -2 EFAULT）；
+         *     * 长度 == 0：不碰指针，直接放行给 netraw64 判 -3（结构性非法）；
+         *     * 长度 > 硬件口径：**连指针都不碰**（绝不拿一个超大 len 去翻页表），
+         *       同样放行给 netraw64 判 -6。 */
+        const uint64_t hi = (op == NETRAW64_OP_TX) ? (uint64_t)NETRAW64_MTU : (uint64_t)NETRAW64_RX_MAX;
+        if (a3 != 0 && a3 <= hi && !user64_range_ok64(a2, a3)) {
             syscall64_deny64(53, a2);
             return NETRAW64_EFAULT;
         }
         break;
-    case NETRAW64_OP_RX:                                        // rx(buf_va, cap)
-        if (a3 < (uint64_t)NETRAW64_RX_MIN) {
-            syscall64_deny64(53, a3);
-            return NETRAW64_EINVAL;
-        }
-        if (a3 > (uint64_t)NETRAW64_RX_MAX) {
-            syscall64_deny64(53, a3);
-            return NETRAW64_EMSGSIZE;
-        }
-        if (!user64_range_ok64(a2, a3)) {
-            syscall64_deny64(53, a2);
-            return NETRAW64_EFAULT;
-        }
-        break;
+    }
     case NETRAW64_OP_MAC:                                       // mac(out_va)
         if (!user64_range_ok64(a2, 6)) {
             syscall64_deny64(53, a2);
