@@ -677,7 +677,9 @@ static int64_t lx64_fcntl64(uint64_t nr, uint64_t fd, uint64_t cmd, uint64_t arg
 //     FAT 没有 inode 概念 -> 0/0）。
 //   * f_type = 'VFS2'(0x32534656) / MSDOS_SUPER_MAGIC(0x4d44)；f_namelen = 31 / FAT64_NAME_MAX-1。
 // 错误码：-EFAULT（用户指针）/ -ENOENT（路径不存在、或 fd 没有卷：pipe/tty）/ -EACCES（vfs64 的 -13 透传）。
-// 打点：[FS64] statfs path=<p> bsize=<n> blocks=<n> bfree=<n>
+// 打点：[FS64] statfs path=<p> bsize=<n> blocks=<n> bfree=<n> files=<n> ffree=<n>
+//   （bsize/blocks/bfree 是指定格式；files/ffree 是**追加**的 inode 字段 —— 验收要拿它与
+//    宿主侧独立解析的 inode 表逐值比对，见 tests/statfs64_test.py）
 static const uint32_t LX64_STATFS_SIZE64 = 120;                  // x86_64 的 struct statfs = 120B
 static const uint64_t LX64_STATFS_MAGIC_VFS2_64 = 0x32534656ull; // 'VFS2'（VimtuFS2）
 static const uint64_t LX64_STATFS_MAGIC_FAT64  = 0x4d44ull;      // Linux 的 MSDOS_SUPER_MAGIC
@@ -723,6 +725,10 @@ static void lx64_statfs_log64(const char* path, const uint8_t* st) {
     dbg64_dec(lx64_rd64(st + 16));
     dbg64_str(" bfree=");
     dbg64_dec(lx64_rd64(st + 24));
+    dbg64_str(" files=");                                        // ★ 追加字段（验收要比 inode 表）
+    dbg64_dec(lx64_rd64(st + 40));
+    dbg64_str(" ffree=");
+    dbg64_dec(lx64_rd64(st + 48));
     dbg64_nl();
     dbg64_line_end64();
 }
@@ -1115,7 +1121,22 @@ static int64_t lx64_execve64(pt_regs64* r, uint64_t path_va, uint64_t argv_va, u
         }
     }
     argv[argc] = nullptr;
-    return proc64_execve64(r, path, argv, argc);
+    const int64_t rc = proc64_execve64(r, path, argv, argc);
+    if (rc == 0) {
+        // ★ 本批：execve **成功后**才按 FD_CLOEXEC 关 fd（Linux 语义；失败保留旧映像 = fd 也保留）。
+        //   这是 busybox ash 的管道写端"不被 exec 的子进程继承"能成立的前提（关了才会给读者 EOF）。
+        const int n = fd64_cloexec_close_current64();
+        if (n > 0) {
+            dbg64_line_begin64();
+            dbg64_str("[FD64] cloexec close n=");
+            dbg64_dec((uint64_t)n);
+            dbg64_str(" path=");
+            dbg64_str(path);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
+    return rc;
 }
 
 // ---- 61）wait4 ----

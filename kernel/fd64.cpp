@@ -89,6 +89,7 @@ struct FdTable64 {
     uint8_t     is_kernel;
     uint8_t     pad[2];
     OpenFile64* slot[FD64_MAX];      // nullptr = 空槽
+    uint32_t    cloexec;             // ★ 本批：每个**槽**的 FD_CLOEXEC 位（bit i = 槽 i 是 close-on-exec）
 };
 
 static FdTable64   g_tables[FD64_TABLE_MAX];
@@ -117,7 +118,7 @@ FdTable64* fd64_table_alloc64() {
         if (!g_tables[i].used) {
             FdTable64* t = &g_tables[i];
             for (uint32_t k = 0; k < FD64_MAX; k++) t->slot[k] = nullptr;
-            t->used = 1; t->is_kernel = 0;
+            t->used = 1; t->is_kernel = 0; t->cloexec = 0;
             return t;
         }
     }
@@ -149,17 +150,21 @@ static OpenFile64* fd64_of_alloc64() {
 // refs-1；归零才真释放（含目录缓存与 pipe 端）
 static void fd64_of_unref64(OpenFile64* of) {
     if (!of || !of->used) return;
-    if (of->refs > 1) { of->refs--; return; }
-    of->refs = 0;
+    // ★ 本批修正（真缺陷，实测抓到的）：管道两端的计数必须**每次释放都记账**。
+    //   老写法在 `refs > 1` 时直接 return，中间那次释放（例如 `dup2(pip[1],1)` 之后 close 掉原 fd，
+    //   或管线子进程退出时释放它那份拷贝）被吞掉 -> writers/readers 永远回不到 0 ->
+    //   读者等不到 EOF（读到 5s 超时 EAGAIN），或者过早看到 EOF（grep 少输出一行，实测 2 -> 1）。
+    //   现在：每次释放 -> 该端 -1、pipe 对象 refs -1；全部释放完（refs == 0）才 used = 0（池可复用）。
     if (of->pipe) {
         Pipe64* p = of->pipe;
         if (of->kind == FD64_KIND_PIPE_W) { if (p->writers) p->writers--; }
         else if (of->kind == FD64_KIND_PIPE_R) { if (p->readers) p->readers--; }
         if (p->refs) p->refs--;
-        // ★ 两端引用都归零才回收：只剩一端时对象保留（另一端的 EOF 语义要靠 writers/readers）
-        if (p->refs == 0) p->used = 0;
-        of->pipe = nullptr;
+        if (p->refs == 0) p->used = 0;                          // 两端都没人持有 -> 回收
     }
+    if (of->refs > 1) { of->refs--; return; }
+    of->refs = 0;
+    of->pipe = nullptr;
     if (of->dirc >= 0 && of->dirc < (int32_t)FD64_DIRC_MAX) {
         g_dirc[of->dirc].used = 0;
         g_dirc[of->dirc].count = 0;
@@ -184,11 +189,13 @@ static int fd64_table_put64(FdTable64* t, OpenFile64* of) {
     const int s = fd64_table_alloc_slot64(t);
     if (s < 0) return s;
     t->slot[s] = of;
+    t->cloexec &= ~(1u << (uint32_t)s);                         // 新 fd 默认不带 FD_CLOEXEC
     return s;
 }
 
 int fd64_table_clone64(FdTable64* dst, const FdTable64* src) {
     if (!dst || !dst->used || !src || !src->used) return -FD64_EINVAL;
+    dst->cloexec = src->cloexec;                       // ★ fork：FD_CLOEXEC 位随 fd 表一起继承（Linux 同）
     for (uint32_t i = 0; i < FD64_MAX; i++) {
         dst->slot[i] = src->slot[i];
         if (dst->slot[i]) {
@@ -210,6 +217,7 @@ void fd64_table_close_all64(FdTable64* t) {
         fd64_of_unref64(t->slot[i]);
         t->slot[i] = nullptr;
     }
+    t->cloexec = 0;
 }
 
 // ==================== 小工具 ====================
@@ -430,6 +438,7 @@ int fd64_open_on64(int vol, const char* path, uint32_t flags) {
 
     const int fd = fd64_table_put64(t, of);
     if (fd < 0) { fd64_of_unref64(of); return fd; }
+    if (flags & FD64_O_CLOEXEC) t->cloexec |= (1u << (uint32_t)fd);   // ★ O_CLOEXEC 落地（execve 时关）
 
     dbg64_line_begin64();
     dbg64_str("[FD64] open path=");
@@ -471,6 +480,7 @@ int fd64_close64(int fd) {
     OpenFile64* of = fd64_slot_obj64(t, fd);
     if (!of) return -FD64_EBADF;
     const uint32_t left = of->refs - 1u;                      // 打印"还剩几个引用"
+    t->cloexec &= ~(1u << (uint32_t)fd);                      // close 也清 FD_CLOEXEC 位
     t->slot[fd] = nullptr;
     fd64_of_unref64(of);
     dbg64_line_begin64();
@@ -484,10 +494,12 @@ int fd64_close64(int fd) {
     return 0;
 }
 
-// ==================== fcntl（★ 本批：F_GETFL/F_SETFL 的最小真实现）====================
-// 状态放在 OpenFile64.flags 里（= 打开文件描述的状态；dup/fork 共享同一份，与 Linux 一致）。
-// F_SETFL 只认本内核**真能落地**的两个位：O_NONBLOCK(0x800) 与 O_APPEND(0x400)；
-// 任何未知位 -> -FD64_EINVAL（不装作认识）。其它 cmd -> -FD64_EINVAL（没有 F_DUPFD/F_GETFD 等，如实）。
+// ==================== fcntl（★ 本批：F_GETFL/F_SETFL + F_GETFD/F_SETFD 的最小真实现）====================
+// 状态：F_GETFL/F_SETFL 的 flags 在 OpenFile64.flags（= 打开文件描述；dup/fork 共享同一份，与 Linux 一致）；
+//       FD_CLOEXEC 在 **FdTable64.cloexec** 里（= **每个 fd 槽**的属性，与 Linux 的 fd 表一致 —— 所以
+//       dup/dup2 到新槽会清掉它、fork 克隆整表会带过去、execve 成功后才按它关 fd）。
+// F_SETFL 只认本内核**真能落地**的两个位：O_NONBLOCK(0x800) 与 O_APPEND(0x400)；未知位 -> -FD64_EINVAL。
+// F_SETFD 只认 FD_CLOEXEC(1)；未知位 -> -FD64_EINVAL。其它 cmd（F_DUPFD 等）-> -FD64_EINVAL（没有，如实）。
 int fd64_fcntl64(int fd, int cmd, uint64_t arg) {
     FdTable64* t = fd64_current_table64();
     OpenFile64* of = fd64_slot_obj64(t, fd);
@@ -507,6 +519,19 @@ int fd64_fcntl64(int fd, int cmd, uint64_t arg) {
             r = 0;
             ok = 1;
         }
+    } else if (cmd == FD64_F_GETFD) {
+        r = (int64_t)((t->cloexec >> (uint32_t)fd) & 1u);
+        setfl = (uint32_t)r;
+        ok = 1;
+    } else if (cmd == FD64_F_SETFD) {
+        const uint32_t want = (uint32_t)arg;
+        setfl = want;
+        if ((want & ~(uint32_t)FD64_FD_CLOEXEC) == 0) {
+            if (want & FD64_FD_CLOEXEC) t->cloexec |= (1u << (uint32_t)fd);
+            else                        t->cloexec &= ~(1u << (uint32_t)fd);
+            r = 0;
+            ok = 1;
+        }
     }
     dbg64_line_begin64();
     dbg64_str("[FD64] fcntl fd=");
@@ -520,26 +545,47 @@ int fd64_fcntl64(int fd, int cmd, uint64_t arg) {
     return (int)r;
 }
 
+// ★ 本批：execve **成功之后**由 syscall64 调用：把当前 fd 表里所有打了 FD_CLOEXEC 的槽关掉
+// （Linux 语义：close-on-exec 的 fd 在新映像开始执行前关闭）。返回关掉的个数（打点用）。
+int fd64_cloexec_close_current64() {
+    FdTable64* t = fd64_current_table64();
+    if (!t || !t->used) return 0;
+    int n = 0;
+    for (uint32_t i = 0; i < FD64_MAX; i++) {
+        if (((t->cloexec >> i) & 1u) == 0) continue;
+        t->cloexec &= ~(1u << i);
+        OpenFile64* of = t->slot[i];
+        if (of) { t->slot[i] = nullptr; fd64_of_unref64(of); n++; }
+    }
+    return n;
+}
+
 // ==================== pipe ====================
+// ★ 本批修正（真缺陷，实测抓到的）：原实现**无条件**用 0 号槽（zero 掉再返回），于是第二条 pipe 会把
+//   第一条的环清零、把 writers/readers 重置 —— 前一条管道的读者永远等不到 EOF（读到 5s 超时 EAGAIN），
+//   写者的数据还会串进另一条管道（实测：`ls | grep | wc` 的输出跑进上一条 `echo hi | cat` 的落盘文件）。
+//   修法 = 找**空闲**槽（used == 0）；用完（两端的对象 refs 归零）时 fd64_of_unref64 会把 used 清 0。
 static Pipe64* fd64_pipe_alloc64() {
     for (uint32_t i = 0; i < FD64_PIPE_MAX; i++) {
+        if (g_pipes[i].used) continue;                  // 跳过在用的槽（池 8 条，满了 -> -EMFILE）
         fd64_zero(&g_pipes[i], (uint32_t)sizeof(Pipe64));
         g_pipes[i].used = 1;
         return &g_pipes[i];
     }
     return nullptr;
 }
-
 // ---------- ★ 本批：阻塞等待（POSIX 语义；O_NONBLOCK 时保留旧的即时返回行为）----------
 // 等待原语 = **既有**的 task_sleep_ms64（task_sleep64 -> task_yield64 -> sti; hlt，不忙等）。
 //   安装介质内核不链 task64.cpp -> 弱引用为 0 -> 那里退回非阻塞（-EAGAIN），如实（那里没有 ring3）。
 // 有界：单次等待 <= FD64_PIPE_WAIT_MS；超时后读 -EAGAIN、写返回已写字节（>0）或 -EAGAIN。
 // 可被打断：每一轮醒来重新检查管道条件 —— 写端全关（读 -> 0）、读端全关（写 -> -EPIPE）立即退出。
 extern "C" void task_sleep_ms64(uint32_t ms) __attribute__((weak));
-extern "C" int  proc64_current_pid64() __attribute__((weak));      // 等待打点里的 pid
-static void fd64_pipe_wait_log64(int fd, const char* why, uint64_t ticks) {
+int proc64_current_pid64() __attribute__((weak));      // 等待打点里的 pid（proc64.h 里是 C++ 链接名）
+static void fd64_pipe_wait_log64(int fd, const char* why, uint64_t ticks, const Pipe64* p) {
     int pid = 0;
-    if (proc64_current_pid64) { const int p = proc64_current_pid64(); if (p > 0) pid = p; }
+    if (proc64_current_pid64) { const int q = proc64_current_pid64(); if (q > 0) pid = q; }
+    const uint32_t w = p ? p->writers : 0;
+    const uint32_t rr = p ? p->readers : 0;
     dbg64_line_begin64();
     dbg64_str("[FD64] pipe wait pid=");
     dbg64_dec((uint64_t)pid);
@@ -549,6 +595,10 @@ static void fd64_pipe_wait_log64(int fd, const char* why, uint64_t ticks) {
     dbg64_str(why);
     dbg64_str(" ticks=");
     dbg64_dec(ticks);
+    dbg64_str(" writers=");                                    // ★ 追加字段：诊断"EOF 为什么没来"
+    dbg64_dec((uint64_t)w);
+    dbg64_str(" readers=");
+    dbg64_dec((uint64_t)rr);
     dbg64_nl();
     dbg64_line_end64();
 }
@@ -572,20 +622,20 @@ static int fd64_pipe_read64(Pipe64* p, int fd, int nonblock, void* buf, int len)
             }
             p->n -= want;
             dbg64_irq_restore64(fl);
-            if (waited) fd64_pipe_wait_log64(fd, "empty", g_ticks64 - t0);
+            if (waited) fd64_pipe_wait_log64(fd, "empty", g_ticks64 - t0, p);
             return (int)want;
         }
         const int eof = (p->writers == 0);                     // 写端全关 = EOF（等待也算被打断）
         dbg64_irq_restore64(fl);
         if (eof) {
-            if (waited) fd64_pipe_wait_log64(fd, "empty", g_ticks64 - t0);
+            if (waited) fd64_pipe_wait_log64(fd, "empty", g_ticks64 - t0, p);
             return 0;
         }
         if (nonblock) return -FD64_EAGAIN;                     // O_NONBLOCK：保留旧的 -EAGAIN 行为
         if (!task_sleep_ms64) return -FD64_EAGAIN;             // 没有调度器：无处可等（如实）
         if (!waited) { waited = 1; t0 = g_ticks64; }
         if (g_ticks64 - t0 >= wait_max) {                      // 有界：超时后如实报 -EAGAIN
-            fd64_pipe_wait_log64(fd, "empty", g_ticks64 - t0);
+            fd64_pipe_wait_log64(fd, "empty", g_ticks64 - t0, p);
             return -FD64_EAGAIN;
         }
         task_sleep_ms64(1);
@@ -617,7 +667,7 @@ static int fd64_pipe_write64(Pipe64* p, int fd, int nonblock, const void* buf, i
         }
         dbg64_irq_restore64(fl);
         if (done >= (uint32_t)len) {                           // 全写完
-            if (waited) fd64_pipe_wait_log64(fd, "full", g_ticks64 - t0);
+            if (waited) fd64_pipe_wait_log64(fd, "full", g_ticks64 - t0, p);
             return (int)done;
         }
         if (no_reader) return (done > 0) ? (int)done : -FD64_EPIPE;   // 读端全关：EPIPE（不投 SIGPIPE）
@@ -625,7 +675,7 @@ static int fd64_pipe_write64(Pipe64* p, int fd, int nonblock, const void* buf, i
         if (!task_sleep_ms64) return (done > 0) ? (int)done : -FD64_EAGAIN;   // 没有调度器：无处可等
         if (!waited) { waited = 1; t0 = g_ticks64; }
         if (g_ticks64 - t0 >= wait_max) {                      // 有界：超时后返回已写字节 / -EAGAIN
-            fd64_pipe_wait_log64(fd, "full", g_ticks64 - t0);
+            fd64_pipe_wait_log64(fd, "full", g_ticks64 - t0, p);
             return (done > 0) ? (int)done : -FD64_EAGAIN;
         }
         task_sleep_ms64(1);
@@ -838,7 +888,14 @@ static int fd64_bind_slot64(FdTable64* t, OpenFile64* src, int dst) {
         t->slot[dst] = nullptr;
         fd64_of_unref64(old);
     }
+    t->cloexec &= ~(1u << (uint32_t)dst);                     // ★ dup/dup2 到新槽：FD_CLOEXEC 不复制
     src->refs++;                                              // ★ 共享同一个对象（共享偏移）
+    if (src->pipe) {                                          // ★ 每个**槽**都记一份管道端引用（与 unref 对称）
+        Pipe64* p = src->pipe;
+        p->refs++;
+        if (src->kind == FD64_KIND_PIPE_W) p->writers++;
+        else if (src->kind == FD64_KIND_PIPE_R) p->readers++;
+    }
     t->slot[dst] = src;
     return dst;
 }
@@ -880,13 +937,7 @@ int fd64_dup_into64(FdTable64* dst, int srcfd, int newfd) {
     if (!src) return -FD64_EBADF;
     if (!dst || !dst->used) return -FD64_EINVAL;
     if (newfd < 0 || newfd >= (int)FD64_MAX) return -FD64_EBADF;
-    const int r = fd64_bind_slot64(dst, src, newfd);
-    Pipe64* p = src->pipe;
-    if (p) {                                                  // 与 fork 的引用记账一致（管道端计数）
-        p->refs++;
-        if (src->kind == FD64_KIND_PIPE_W) p->writers++;
-        else if (src->kind == FD64_KIND_PIPE_R) p->readers++;
-    }
+    const int r = fd64_bind_slot64(dst, src, newfd);           // 管道端引用记账在 bind 里（每个槽一份）
     return r;
 }
 
@@ -994,7 +1045,17 @@ static void fd64_demo_line64(const char* tag, int ok) {
     dbg64_nl();
     dbg64_line_end64();
 }
+// ★ 本批：fdtest 里有十几次读盘/写盘（12MB 的系统卷上实测 >5 秒），期间任务 0（桌面/终端）
+//   一直在本函数里 —— 必须**临时停表 GUI 看门狗**，否则 [WD64] stale>5000ms -> PANIC（实测踩过）。
+//   与 dir64 / 终端 cmd_ls / sh64_serve64 同一套写法（只在系统内核里链 -> 弱引用 + 判空）。
+void panic64_watchdog_pause64()   __attribute__((weak));
+void panic64_watchdog_unpause64() __attribute__((weak));
+struct Fd64WdtGuard64 {
+    Fd64WdtGuard64()  { if (panic64_watchdog_pause64) panic64_watchdog_pause64(); }
+    ~Fd64WdtGuard64() { if (panic64_watchdog_unpause64) panic64_watchdog_unpause64(); }
+};
 int fd64_demo64() {
+    Fd64WdtGuard64 wdt;                                        // 长读盘期间停表（见上）
     uint32_t ty = 0, sz = 0;
     if (vfs64_stat("/", &ty, &sz) != 0) {                      // 没卷：如实跳过
         dbg64_line_begin64();
@@ -1137,17 +1198,26 @@ int fd64_demo64() {
             const int st2 = fd64_fcntl64(r, FD64_F_SETFL, FD64_O_NONBLOCK);
             const int st3 = fd64_fcntl64(w, FD64_F_SETFL, 0x100000u);   // 未知 flag -> -EINVAL（负例）
             const int gf  = fd64_fcntl64(w, FD64_F_GETFL, 0);           // F_GETFL -> 当前 flags
+            // ★ FD_CLOEXEC 的往返（F_SETFD -> F_GETFD）：位在 fd 槽里，execve 成功后由
+            //   syscall64 调 fd64_cloexec_close_current64 关掉（Linux 语义）。
+            const int st4 = fd64_fcntl64(w, FD64_F_SETFD, FD64_FD_CLOEXEC);   // -> 0
+            const int gf2 = fd64_fcntl64(w, FD64_F_GETFD, 0);                 // -> 1
+            const int st5 = fd64_fcntl64(w, FD64_F_SETFD, 0);                 // -> 0（清掉）
             uint8_t big[100];
             for (int i = 0; i < 100; i++) big[i] = (uint8_t)('a' + (i % 26));
             const int sw = fd64_write64(w, big, 100);
             if (st1 != 0 || st2 != 0 || st3 != -FD64_EINVAL || (gf & FD64_O_NONBLOCK) == 0) fail |= 8;
+            if (st4 != 0 || gf2 != 1 || st5 != 0) fail |= 8;
             if (sw != (int)FD64_PIPE_BYTES) fail |= 8;
             dbg64_line_begin64();
             dbg64_str("[FD64] demo pipe setfl=");
             dbg64_dec((uint64_t)((st1 == 0 && st2 == 0 && st3 == -FD64_EINVAL) ? 1 : 0));
             dbg64_str(" getfl_nonblock=");
             dbg64_dec((uint64_t)((gf & FD64_O_NONBLOCK) ? 1 : 0));
+            dbg64_str(" fdcloexec=");
+            dbg64_dec((uint64_t)((st4 == 0 && gf2 == 1 && st5 == 0) ? 1 : 0));
             dbg64_nl();
+            dbg64_line_end64();
             dbg64_line_end64();
             dbg64_line_begin64();
             dbg64_str("[FD64] demo pipe shortwrite=");

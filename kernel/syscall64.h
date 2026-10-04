@@ -253,7 +253,7 @@ static const int64_t  SND64_ENODEV64 = -5;   // 没有 HDA 控制器 / 通路没
 // 52 dir_close(fd)      rdi = 句柄 -> 0 = 已释放（引用计数 -1）；< 0 = -EBADF（无效/非目录句柄）
 //           **回收语义与 fd 逐条一致**：句柄是 fd 表里的一个槽；进程退出 / fd 表销毁走
 //           fd64_table_close_all64（逐槽 close、引用计数 -1，归零才真正释放对象）-> **不泄漏**。
-//           execve **默认保留** fd（与 fd64.h 第 18 条一致，本内核没有 O_CLOEXEC）。
+//           execve 默认保留 fd，**但 FD_CLOEXEC 的会被关**（★ 本批起真实现，见 fd64.h 第 18 条与号 72）。
 //
 // 打点（自动验收 tests/dir64_test.py grep，格式勿改；成功 open / read / close 各自 <= 96 行、
 //   失败的 open 单独 <= 48 行 —— 拒绝证据不会被成功行淹没）：
@@ -283,24 +283,24 @@ static const uint32_t DIR64_BUF_MIN64   = 64u;   // dir_read 接收的最小缓�
 static const uint32_t DIR64_ENT_MAX64   = 12u + 31u + 1u;   // 一条记录的最大字节数（名字上限 31）
 // ==================== ★ 本批：Linux 号段 72 / 137 / 138（fcntl + statfs）====================
 // 这三个号是 **Linux x86_64 ABI**（syscall 指令路径），不是自有 int 0x80 号段。
-//   * 72 fcntl(fd, cmd, arg)：只做 F_GETFL(3)/F_SETFL(4)；F_SETFL 只认 O_NONBLOCK(0x800)/
-//     O_APPEND(0x400)，未知 cmd 或未知 flag -> -EINVAL；fd 无效 -> -EBADF。语义与状态放在
-//     kernel/fd64.h 的 fd64_fcntl64（OpenFile64.flags；dup/fork 共享）。打点 [FD64] fcntl ...
+//   * 72 fcntl(fd, cmd, arg)：F_GETFL(3)/F_SETFL(4)（只认 O_NONBLOCK/O_APPEND）、F_GETFD(1)/F_SETFD(2)
+//     （只认 FD_CLOEXEC=1 —— 位存在 fd 表槽里，execve **成功后**才按它关 fd，见 syscall64.cpp 的
+//     lx64_execve64 与 fd64_cloexec_close_current64）；未知 cmd 或未知 flag -> -EINVAL；fd 无效 -> -EBADF。
+//     F_SETFL 的状态在 kernel/fd64.h 的 fd64_fcntl64（OpenFile64.flags；dup/fork 共享）。打点 [FD64] fcntl ...
 //   * 137 statfs(path, struct statfs)：x86_64 的 struct statfs = **120 B**，字段偏移 = Linux
 //     （f_type +0、f_bsize +8、f_blocks +16、f_bfree +24、f_bavail +32、f_files +40、f_ffree +48、
 //     f_fsid +56、f_namelen +64、f_frsize +72、f_flags +80、f_spare +88..119）。
 //     数据来源（**既有统计，同刻**）：fs64_vol_info64 的 total_kb/free_kb（×2 = 512B 块，
 //     与 [DRV64] free_kb / vfs64 位图计数一致）+ vfs64_inode_stats_on64 的 inode 总数/空槽数。
 //     错误码：-EFAULT / -ENOENT / -EACCES（vfs64 的 -13 透传）。
-//     打点：[FS64] statfs path=<p> bsize=<n> blocks=<n> bfree=<n>
+//     打点：[FS64] statfs path=<p> bsize=<n> blocks=<n> bfree=<n> files=<n> ffree=<n>
 //   * 138 fstatfs(fd, struct statfs)：fd 版；fd64_where64 取（卷, 路径）后与 137 同一份填充；
 //     fd 是 pipe/tty（没有卷）-> -ENOENT（如实）；fd 无效 -> -EBADF。
 // 内核侧唯一实现点 = kernel/syscall64.cpp 的 lx64_fcntl64 / lx64_statfs64 / lx64_fstatfs64。
+// ==================== syscall 指令路径（给汇编入口 / usermode64 用）====================
 // 帧标记：syscall 指令路径的 int_no 槽填这个值（int 0x80 是 0x80）。改它必须同步
 // kernel/syscall_entry64.asm 的 %define FRAME_MARK。
 #define SYSCALL64_INSM_FRAME_MARK64 0x180ULL
-
-
 // LSTAR 的目标（kernel/syscall_entry64.asm）。syscall64_init_msr64() 把它写进 LSTAR。
 extern "C" void syscall64_insn_entry64();
 

@@ -15,7 +15,8 @@
 //         （串口 + 屏幕），read 立刻返回 0（本内核没有"给用户程序的键盘输入流"，如实），
 //         ioctl 认 TIOCGWINSZ/TCGETS/TCSETS（见 syscall64）；
 //       - fork：整张表**逐槽共享**（引用计数 +1），父子共享偏移；
-//       - execve：**默认保留**所有 fd（本内核没有实现 O_CLOEXEC，如实注明）；
+//       - execve：默认保留所有 fd，**除了**打了 FD_CLOEXEC 的（★ 本批真实现：F_SETFD/O_CLOEXEC
+//         置位 -> execve 成功后由 fd64_cloexec_close_current64 关掉；Linux 语义）；
 //       - close：引用计数 -1，归零才真正释放对象。
 //   * **O_APPEND(0x400)** 真实现：每次 write 都先定位到文件末尾（写后游标 = 末尾）。
 //   * **pipe(22)** 真实现：64 字节环形缓冲 + 两个 fd（读端/写端）。★ 本批：**默认阻塞**
@@ -38,7 +39,7 @@
 //   * 目录句柄：fd64_opendir64 + fd64_readdir64（线性枚举，第一次重列目录后缓存 16 条）。
 //
 // 边界（如实写在文档里，别把没做的说成做了）：
-//   * 没有文件权限/属主；没有 O_CLOEXEC、F_DUPFD/F_GETFD/F_SETFD（fcntl 只做 F_GETFL/F_SETFL）；
+//   * 没有文件权限/属主；fcntl 只做 F_GETFL/F_SETFL/F_GETFD/F_SETFD（没有 F_DUPFD；F_SETFD 只认 FD_CLOEXEC）；
 //   * 没有 select/poll/epoll、没有文件的 mmap、没有硬链接/符号链接；
 //   * pipe 容量固定 64 B，最多 8 条同时在用；等待**有界**（超时 -> 读 -EAGAIN / 写返回已写字节或
 //     -EAGAIN，绝不无限挂死）；没有 select/poll、**不投递 SIGPIPE**（读端全关的 write 只回 -EPIPE）；
@@ -55,7 +56,8 @@
 //   [FD64] pipe read n=<n> data=<s>
 //   [FD64] dup old=<n> new=<n> refs=<n> path=<p>        （dup/dup2 共享对象；new <= 2 = 换标准流）
 //   [FD64] tty open fd=<n> path=/dev/console            （最小控制台 tty 对象）
-//   [FD64] pipe wait pid=<p> fd=<n> why=empty|full ticks=<t>   （发生阻塞等待时一行；t = 等待 tick 数）
+//   [FD64] pipe wait pid=<p> fd=<n> why=empty|full ticks=<t> writers=<n> readers=<n>
+//        （发生阻塞等待时一行；ticks = 等待 tick 数；writers/readers = 等待那一刻两端的引用计数）
 //   [FD64] fcntl fd=<n> setfl=0x<hex> ok=<0|1>          （F_GETFL/F_SETFL；ok=0 = -EINVAL/无效 fd）
 //   [FD64] selftest PASS / [FD64] selftest FAIL mask=<n>
 #pragma once
@@ -71,7 +73,9 @@
 #define FD64_PIPE_BYTES 64u          // ★ pipe 容量（固定 64 B；读/写默认**阻塞**，见文件头）
 // ★ 单次阻塞等待上限（毫秒；超时 -> 读 -EAGAIN / 写返回已写字节或 -EAGAIN）。走既有 task_sleep64
 //   （task_yield64 让出，不忙等）；没有调度器（安装介质内核）时退回非阻塞，如实。
-#define FD64_PIPE_WAIT_MS 5000u
+//   实测口径：本内核的 ring3 程序装载（bbdrv 逐段拷贝 500KB 的 busybox.bin）单次可达数秒，
+//   5 秒会误伤**正常**管线（读者先起跑时 EAGAIN）—— 30 秒仍是有界 + 可被打断（关端立即退出）。
+#define FD64_PIPE_WAIT_MS 30000u
 #define FD64_PATH_MAX   64u          // 路径缓冲：支持多级路径（"/apps/demo/file.txt" 这种）
 #define FD64_NAME_MAX   32u          // 目录项名字缓冲（与 vfs64_ls 的 [][32] 对齐；v3 名字上限 31）
 #define FD64_FILE_MAX   VFS64_MAX_FILE_BYTES   // ★ 批次 M：单文件上限 8 MiB（= VFS64_MAX_FILE_BYTES；
@@ -87,6 +91,7 @@
 #define FD64_O_TRUNC     0x0200u
 #define FD64_O_APPEND    0x0400u     // ★ 批次 D：真实现（每次写定位到末尾）
 #define FD64_O_DIRECTORY 0x10000u
+#define FD64_O_CLOEXEC   0x080000u   // ★ 本批：真实现（execve 成功时按 FD_CLOEXEC 关这个 fd）
 #define FD64_O_NONBLOCK  0x0800u     // ★ 本批：真实现（pipe 读空/写满立刻返回，不睡眠）
 
 // seek whence（与 Linux 对齐）
@@ -112,8 +117,13 @@
 #define FD64_EROFS   30   // ★ 只读文件系统（FAT32 卷：打开写模式一律被拒）
 #define FD64_EACCES  13   // ★ P4：权限不足（vfs64 的 -EACCES 透传；与 LX64_EACCES 同值）
 // ★ 本批：fcntl(72) 的最小命令集（与 Linux 同值）与 F_SETFL 可接受的位。
+//   F_GETFD/F_SETFD 管 **FD_CLOEXEC(1)**：位存在 **fd 表槽**里（FdTable64.cloexec）；execve **成功**
+//   之后按它关 fd（Linux 语义）—— 这是 busybox ash「管道写端不该被 exec 的子进程继承」能成立的前提。
+#define FD64_F_GETFD 1
+#define FD64_F_SETFD 2
 #define FD64_F_GETFL 3
 #define FD64_F_SETFL 4
+#define FD64_FD_CLOEXEC 1u
 #define FD64_F_SETFL_MASK64 ((uint32_t)(FD64_O_NONBLOCK | FD64_O_APPEND))
 // 路径规范化：接受 "/dir/sub/name" 与 "dir/sub/name"（相对路径 = 从根开始）；折叠连续的 '/'、
 // 去掉结尾 '/'、去前导空白；".." **原样保留**（父目录语义由 vfs64 负责）；拒绝空串、'/'、控制字符、超长。
@@ -156,12 +166,17 @@ int fd64_dup64(int oldfd, int newfd);
 // 返回 0 = 已填入；-FD64_EBADF = fd 无效；-FD64_EINVAL = 缓冲太小。
 int fd64_where64(int fd, int* out_vol, char* path_out, int cap);
 
-// ★ 本批：fcntl(72) 的最小真实现（Linux 号段）：cmd = FD64_F_GETFL(3) -> 当前 flags（>= 0）；
-//   cmd = FD64_F_SETFL(4) -> 用 arg 的位改 flags（只认 FD64_F_SETFL_MASK64，其它位 -> -EINVAL）。
-// 错误：-FD64_EBADF（fd 无效）；-FD64_EINVAL（未知 cmd / 未知 flag）。状态在 OpenFile64.flags 里
-//   —— 与 Linux 一致：dup/fork 共享同一份状态（同一打开文件描述）。
+// ★ 本批：fcntl(72) 的最小真实现（Linux 号段）：
+//   FD64_F_GETFL(3) -> 当前 flags（>= 0）；FD64_F_SETFL(4) -> 改 flags（只认 FD64_F_SETFL_MASK64）。
+//   FD64_F_GETFD(1) -> FD_CLOEXEC 位（0/1）；FD64_F_SETFD(2) -> 设置/清除该位（只认 FD64_FD_CLOEXEC）。
+// 错误：-FD64_EBADF（fd 无效）；-FD64_EINVAL（未知 cmd / 未知 flag）。
+// 状态归属（与 Linux 一致）：flags 在 OpenFile64（打开文件描述，dup/fork 共享）；FD_CLOEXEC 在
+//   fd 表的槽位里（dup/dup2 到新槽会清掉、fork 带过去、execve 成功后才生效）。
 // 打点：[FD64] fcntl fd=<n> setfl=0x<hex> ok=<0|1>
 int fd64_fcntl64(int fd, int cmd, uint64_t arg);
+// ★ 本批：execve **成功之后**由 syscall64 调用：关掉当前表里所有 FD_CLOEXEC 的 fd。
+// 返回关掉的个数（0 = 没有被标记的 fd）。见 syscall64.cpp 的 lx64_execve64。
+int fd64_cloexec_close_current64();
 
 // ==================== pipe（64 B 环形缓冲；★ 本批：读/写默认阻塞）====================
 // 成功返回 0 并填入读端/写端两个 fd；失败返回负错误码（-EMFILE 池/fd 槽满）。
