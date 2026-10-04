@@ -67,10 +67,11 @@ VimtuOS（仓库 `Vimtu64`）是一个**x86_64 长模式、自研内核 + Waylan
 
 * 有：自有 ABI（`write/read/open/close/exit/getpid/ticks/sleep_ms/fb_map/fb_flip/input_poll/shm_*` +
   `wl_*` 窗口 + **`dir_open/dir_read/dir_close`(50/51/52) 实时目录枚举**）、Linux 兼容号段子集
-  （`open/lseek/stat/fstat/getcwd/unlink/fork/execve/wait4/mmap/pipe/ioctl`…）、静态 ELF64 与 VAP64 两种可执行格式、
+  （`open/lseek/stat/fstat/getcwd/unlink/fork/execve/wait4/mmap/pipe/ioctl/fcntl(72)`）+
+  **`statfs(137)/fstatfs(138)`（卷容量，`df` 因此可用）**、静态 ELF64 与 VAP64 两种可执行格式、
   跨进程共享内存、Ring 3 合成器、用户态字体栈（`user/lib/font64.h`）。
 * 没有（**当前事实**，逐条都有出处）：动态链接器只支持很窄的一种（`tools/dynlink_*`）；**没有** `/proc`、`/dev`、
-  符号链接/硬链接、`statfs`、`getdents`；**没有**信号里的停止类、线程、socket 走 fd；
+  符号链接/硬链接、`getdents`、mount 表 ABI（Linux 的 `/proc/mounts` 没有）；**没有**信号里的停止类、线程、socket 走 fd；
   **没有**包管理器/应用商店（见 §7）；`printf` **没有浮点**（见 §10）。
 
 ## 3. 开发环境（Windows + MSYS2）
@@ -140,7 +141,7 @@ C:\msys64\usr\bin\bash.exe -l -c "cd /c/Users/fanqi/Desktop/VimtuOS/Vimtu64 && b
 **如实边界**（`docs/应用层与系统调用说明.md` → `## musl（A3 第一步）：musl 静态程序真的在 ring3 跑起来了`、`## 10. 离 glibc 还差什么（如实清单）`）：
 * musl 静态构建要 SSE，Ring 3 入口已开 `CR4.OSFXSR/OSXMMEXCPT`；但**没有 xmm 上下文切换**
   （`switch64.asm` 不保存 xmm）—— 多进程同时用 SSE 会互相污染，这是**已知边界**；
-* `arch_prctl(ARCH_SET_FS)` 等少数调用走不到；`getdents`/`statfs` 不存在（见 §10）。
+* rch_prctl(ARCH_SET_FS) 等少数调用走不到；getdents 不存在、**没有 mount 表 ABI**（statfs(137)/fstatfs(138) 已实现、df 可用，见 §10）。
 
 ### 4.3 Rust（**现状：用户态 Rust 路线待定，如实写**）
 
@@ -452,7 +453,7 @@ sys.exit(0 if ok else 1)
 | 老卷/老路径怎么办？ | 兜底 = 构建期快照 **`/etc/vimtu.dirs`**（每行 `<目录>` TAB `<名字>`）。**它是上次构建的快照：本次开机新建的文件看不到**（`user/busybox/vimtu_dirent.c` 与 `dir64_test` 的⑥就是这条对照）。 |
 | 管道会阻塞吗？ | **默认阻塞（POSIX 语义）**，等待**有界**；可切非阻塞。最新状态（`kernel/fd64.h` 头部 + 库函数注释，提交 `73388f4` 那一批）：读空且写端还开着 → 睡眠等待（走既有 `task_sleep64` 让出，不忙等）；写满 → 睡等到能全写完；**单次等待上限 = `FD64_PIPE_WAIT_MS`(5000 ms)**，超时后读回 `-EAGAIN`、写返回已写字节（>0）或 `-EAGAIN` —— **绝不无限挂死**。要旧的非阻塞行为：`fcntl(72)` 的 `F_SETFL` 置 `O_NONBLOCK(0x800)`（`F_GETFL` 可读回；未知位/未知 cmd → `-EINVAL`）。管道容量固定 **64 B**（最多 8 条同时在用）；写端全关 → 读返回 0（EOF）；读端全关 → 写回 `-EPIPE` 且**不投递 `SIGPIPE`**；**没有** `select/poll`。 |
 | 有 `/proc` 吗？ | **没有**。也没 `/dev`。设备在 fd 层没有节点；想知道进程/任务用**内核**的 `proc`/`ps` 或终端 `proc list`（`docs/应用层与系统调用说明.md` → `## 附 A` 的 `A.3 proc`）。 |
-| `df` 能用吗？ | **`statfs(137)` 目前不存在**：`df` 会**明确失败**（非 0 退出，不是崩）。缺口在 `docs/内核边界与架构规则.md` 的缺口表（"ring3 没有 statfs(137)"那行）与 `docs/应用层与系统调用说明.md` 的对应说明里都标了 **GAP**。所以：卷容量现在只能靠**内核侧**终端 `df`（内核自己看超级块）。 |
+| `df` 能用吗？ | **能了**（已实现）：Linux 号段 **`statfs(137)` / `fstatfs(138)`** 都落地（返回 x86_64 的 120 B `struct statfs`：`f_bsize=512`/`f_blocks`/`f_bfree`/`f_bavail`/`f_files`/`f_ffree`/`f_namelen`…），端到端验收 `tests/statfs64_test.py` **12 条全过**，同刻真值对照：内核终端 `[TERM] cmd df blocks=24758 free=11100 files=27` 与 `[DRV64] letter=C: total_kb=12379 free_kb=5550` 一致。**如实边界**：本内核**没有 mount 表 ABI**，Linux 上 `/proc/mounts` 由内核提供、这里要靠夹具/卷里放一份 mtab 供 busybox `df` 枚举 —— 容量数字全部来自 `statfs`。 |
 | `printf` 支持哪些格式？ | `%s %c %d %i %u %x %X %p %%` + 长度修饰 `l/ll/z` + `-`/`0` 宽度；**没有 `%f/%e/%g`、没有精度、没有星号宽度**（遇到按字面输出，绝不假装算过 —— `user/lib/stdio.h` 头部）。要浮点自己定点化。 |
 | 单次读写上限？ | `write(1,…)` 单次 **1024 B**（`write()` 包装会自动分块）；`read` 单次 **4096 B**（`### 4.2` 的表）。 |
 | 单文件多大？ | **≤ 8 MiB（8,388,608 B）**（VimtuFS2 批次 M：4 直接块 + 一级间接 + **二级间接**）；v2 旧卷仍是 67,584 B。名字 ≤31 B、整条路径 ≤128 B、最多 16 段。 |
