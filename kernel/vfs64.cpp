@@ -2258,6 +2258,12 @@ int vfs64_free_on64(int slot, uint32_t* free_blocks, uint32_t* free_bytes, uint3
     if (!g.active) return on64_slot_unavailable("free", slot);
     return vfs64_free64(free_blocks, free_bytes, total_blocks);
 }
+// ★ 本批：inode 统计的按槽入口（statfs 用；只读、不改挂载状态，返回语义同上）。
+int vfs64_inode_stats_on64(int slot, uint32_t* files, uint32_t* ffree) {
+    Vfs64SlotGuard g(slot, true);
+    if (!g.active) return on64_slot_unavailable("inode_stats", slot);
+    return vfs64_inode_stats64(files, ffree);
+}
 // ★ P4：chmod/chown 的按槽入口（userdb64 给 /home/<user> 设属主/模式用；期间身份 = root）
 int vfs64_chmod_on64(int slot, const char* path, uint32_t mode) {
     Vfs64SlotGuard g(slot, true);
@@ -2789,6 +2795,21 @@ int vfs64_free64(uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_bl
     if (free_blocks) *free_blocks = n;
     if (free_bytes) *free_bytes = n * VFS64_BLOCK_BYTES;
     if (total_blocks) *total_blocks = g_data_blocks;
+    return 0;
+}
+
+// ★ 本批：inode 统计（只读；statfs(137) 的 f_files/f_ffree 用）。判定与 alloc_inode 同一口径。
+// 为什么放在这里（而不是各自数一遍）：分配器找空槽的逻辑在 alloc_inode；这里只**数**，不改状态。
+int vfs64_inode_stats64(uint32_t* files, uint32_t* ffree) {
+    if (!g_mounted) { log_op_fail("inode_stats64", "not mounted"); return -1; }
+    uint32_t used = 0;                                            // 1..count-1 里已用的 inode 数
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    for (uint32_t i = 1; i < g_inode_count; i++) {
+        if (!inode_load(i, ino)) { log_op_fail("inode_stats64", "inode read failed"); return -1; }
+        if (ino[VFS_I_TYPE] != VFS64_TYPE_FREE) used++;
+    }
+    if (files) *files = g_inode_count;                            // 0 号根目录算一个（与超级块口径一致）
+    if (ffree) *ffree = (g_inode_count > used + 1u) ? (g_inode_count - 1u - used) : 0u;
     return 0;
 }
 

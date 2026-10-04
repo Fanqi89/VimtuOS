@@ -281,7 +281,21 @@ static const uint32_t DIR64_KIND_DIR64  = 2u;
 static const uint32_t DIR64_ENT_HDR64   = 12u;   // Dir64Ent64 的定长头字节数（name 从 +12 起）
 static const uint32_t DIR64_BUF_MIN64   = 64u;   // dir_read 接收的最小缓冲（够放下一条最长记录）
 static const uint32_t DIR64_ENT_MAX64   = 12u + 31u + 1u;   // 一条记录的最大字节数（名字上限 31）
-// ==================== syscall 指令路径（给汇编入口 / usermode64 用）====================
+// ==================== ★ 本批：Linux 号段 72 / 137 / 138（fcntl + statfs）====================
+// 这三个号是 **Linux x86_64 ABI**（syscall 指令路径），不是自有 int 0x80 号段。
+//   * 72 fcntl(fd, cmd, arg)：只做 F_GETFL(3)/F_SETFL(4)；F_SETFL 只认 O_NONBLOCK(0x800)/
+//     O_APPEND(0x400)，未知 cmd 或未知 flag -> -EINVAL；fd 无效 -> -EBADF。语义与状态放在
+//     kernel/fd64.h 的 fd64_fcntl64（OpenFile64.flags；dup/fork 共享）。打点 [FD64] fcntl ...
+//   * 137 statfs(path, struct statfs)：x86_64 的 struct statfs = **120 B**，字段偏移 = Linux
+//     （f_type +0、f_bsize +8、f_blocks +16、f_bfree +24、f_bavail +32、f_files +40、f_ffree +48、
+//     f_fsid +56、f_namelen +64、f_frsize +72、f_flags +80、f_spare +88..119）。
+//     数据来源（**既有统计，同刻**）：fs64_vol_info64 的 total_kb/free_kb（×2 = 512B 块，
+//     与 [DRV64] free_kb / vfs64 位图计数一致）+ vfs64_inode_stats_on64 的 inode 总数/空槽数。
+//     错误码：-EFAULT / -ENOENT / -EACCES（vfs64 的 -13 透传）。
+//     打点：[FS64] statfs path=<p> bsize=<n> blocks=<n> bfree=<n>
+//   * 138 fstatfs(fd, struct statfs)：fd 版；fd64_where64 取（卷, 路径）后与 137 同一份填充；
+//     fd 是 pipe/tty（没有卷）-> -ENOENT（如实）；fd 无效 -> -EBADF。
+// 内核侧唯一实现点 = kernel/syscall64.cpp 的 lx64_fcntl64 / lx64_statfs64 / lx64_fstatfs64。
 // 帧标记：syscall 指令路径的 int_no 槽填这个值（int 0x80 是 0x80）。改它必须同步
 // kernel/syscall_entry64.asm 的 %define FRAME_MARK。
 #define SYSCALL64_INSM_FRAME_MARK64 0x180ULL

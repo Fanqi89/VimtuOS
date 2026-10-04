@@ -41,9 +41,10 @@
 //                           读路径就是 readv —— Lua 的脚本装载与 io.read 依赖它）。
 //   20   writev            真：fd∈{1,2}，最多 8 个 iovec；iovcnt 超限 -EINVAL。
 //   21   access            真（最小）：存在性检查（本内核没有权限模型 → mode 忽略，如实注明）。
-//   22   pipe / pipe2      **真实现（批次 D）**：fd64 的 64 B 环形缓冲 + 读端/写端两个 fd（写进
-//                           用户给的 int[2]）。**没有阻塞语义**：写满短写（无空间 -EAGAIN）、
-//                           读空且写端开着 -EAGAIN、写端全关读 0（EOF）。fork 后父子各持一端可通信。
+//   22   pipe / pipe2      **真实现（批次 D；★ 本批：默认阻塞）**：fd64 的 64 B 环形缓冲 + 读端/写端
+//                           两个 fd（写进用户给的 int[2]）。读空/写满默认**阻塞**（有界 5 秒，task_sleep64
+//                           让出，不忙等）；F_SETFL O_NONBLOCK 后读空 -EAGAIN / 写满短写；写端全关读 0（EOF）；
+//                           读端全关写 -EPIPE（不投递 SIGPIPE，如实）。fork 后父子各持一端可通信。
 //   24   sched_yield       真：task_yield64() 让出到下一个 tick；没有调度器时直接返回 0。
 //   32   dup               真（批次 D 修正语义）：fd64_dup64 —— 新旧 fd 指向**同一个打开文件对象**
 //                           （共享偏移游标），引用计数 +1；fd<3 → -EBADF。
@@ -65,6 +66,9 @@
 //   62   kill              部分：SIGKILL(9)/SIGTERM(15) → 立即终止（TERM 记退出码 143）；
 //                           其它信号"记录但不投递"；不允许自杀（-EINVAL，如实）。
 //   63   uname             真：写一份静态 struct utsname（6 x 65B）。
+//   72   fcntl             ★ 本批（最小真实现）：F_GETFL(3)/F_SETFL(4)—— 只认 O_NONBLOCK/O_APPEND，
+//                           未知 cmd/flag → -EINVAL；状态在 fd64 的打开文件对象里（dup/fork 共享）。
+//                           没有 F_DUPFD/F_GETFD/F_SETFD（如实）。
 //   74   fsync             **部分**：走到 0（本内核的 fd 只有只读缓存，没有脏数据要刷）。
 //   79   getcwd            真：把 "/" 写进用户 buf（len>=2）并返回 buf 指针。
 //   82   rename            真：同目录改名（A4-2a）；**跨目录移动**（A4-4b：改 inode 的 parent+name，
@@ -87,6 +91,12 @@
 //   231  exit_group        真：**结束整个进程**（本内核 1 进程 1 任务，等价于 exit 的进程级语义）。
 //   257  openat            open 的现代入口：dirfd 忽略（只支持 AT_FDCWD）；相对路径要求以 '/' 开头。
 //   318  getrandom         真（**非密码学安全**）：ticks + TSC + xorshift 伪随机，单次上限 256 字节。
+//   137  statfs            ★ 本批：按路径（走 fs64/vfs64 的存在性+权限判定，同刻卷统计）填 120B 的
+//                           struct statfs（x86_64）：f_type/f_bsize=512/f_blocks/f_bfree/f_bavail/
+//                           f_files/f_ffree/f_namelen/f_frsize；-ENOENT（不存在）/ -EACCES（权限）/
+//                           -EFAULT（指针）。打点：[FS64] statfs path=<p> bsize=<n> blocks=<n> bfree=<n>
+//   138  fstatfs           ★ 本批：fd 版（fd64_where64 取卷+路径后与 137 同一份填充）；pipe/tty
+//                           没有卷 -> -ENOENT（如实）；fd 非法 -> -EBADF。
 //
 //   其它所有号：**-ENOSYS(-38)** 并且同一个号只打一次 `[SYSCALL] enosys nr=<n>`（防刷屏）。
 //   已实现号里做不到的分支一律返回**具体负 errno**（-EBADF/-EFAULT/-EINVAL/-ENOMEM/...），
@@ -112,7 +122,7 @@
 //     打开文件对象（共享偏移）、execve 默认保留 fd、close 只是引用计数 -1；没有进程上下文
 //     （终端/桌面 = 任务 0、安装介质内核）时退回**内核表**。底层是 vfs64（VimtuFS2 单层目录）：
 //     路径只有 "/name"、单文件 <= 67584B、没有权限/子目录树；写是"整文件覆盖 + 立刻落盘"。
-//     O_APPEND 真实现；pipe(22) 真实现（64B 环形缓冲、无阻塞语义）。边界详见 kernel/fd64.h 与
+//     O_APPEND 真实现；pipe(22) 真实现（64B 环形缓冲，★ 本批起默认阻塞、F_SETFL O_NONBLOCK 可切）。边界详见 kernel/fd64.h 与
 //     docs/应用层与系统调用说明.md 的 fd 语义表。
 //   * glibc/发行版二进制**没有验证过**：PT_INTERP+动态链接器、完整 TLS/vDSO、真 futex、
 //     clone/线程、socket/网络 ABI、/proc 与 pty、uid/gid 权限模型大多不在这里。
@@ -646,6 +656,110 @@ static int64_t lx64_close64(uint64_t nr, uint64_t fd) {
     if (fd <= 2 && !fd64_slot_used64((int)fd)) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     const int r = fd64_close64((int)fd);
     if (r != 0) { syscall64_deny64(nr, fd); return r; }
+    return 0;
+}
+
+// ---- 72）fcntl ----（★ 本批：F_GETFL(3) / F_SETFL(4)；状态在 fd64 的 OpenFile64.flags 里，
+//   dup/fork 共享同一份，与 Linux 一致）。语义/错误码的唯一说明见 kernel/fd64.h 的 fd64_fcntl64。
+static int64_t lx64_fcntl64(uint64_t nr, uint64_t fd, uint64_t cmd, uint64_t arg) {
+    if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (fd <= 2 && !fd64_slot_used64((int)fd)) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    return (int64_t)fd64_fcntl64((int)fd, (int)cmd, arg);        // 负错误码 = -errno（同一口径）
+}
+
+// ---- 137）statfs / 138）fstatfs ----（★ 本批：Linux 兼容头字段；数据 = **既有**卷统计，同刻）
+// 为什么这样填（口径来源，全部既有、只读）：
+//   * f_bsize / f_frsize = 512 —— vfs64/fs64 的空闲块统计口径就是 512B 块（fs64.h 的 fs64_free64）。
+//   * f_blocks / f_bfree / f_bavail = fs64_vol_info64 的 total_kb×2 / free_kb×2（= 与 [DRV64] 的
+//     free_kb、vfs64 的空闲块位图计数**同刻**一致；free_known=0（FAT 的 FSInfo 无效）时 bfree/bavail = 0，
+//     如实当"未知"，不编数字）。
+//   * f_files / f_ffree = vfs64_inode_stats_on64（VimtuFS2 的超级块 inode 总数 / 空槽数；
+//     FAT 没有 inode 概念 -> 0/0）。
+//   * f_type = 'VFS2'(0x32534656) / MSDOS_SUPER_MAGIC(0x4d44)；f_namelen = 31 / FAT64_NAME_MAX-1。
+// 错误码：-EFAULT（用户指针）/ -ENOENT（路径不存在、或 fd 没有卷：pipe/tty）/ -EACCES（vfs64 的 -13 透传）。
+// 打点：[FS64] statfs path=<p> bsize=<n> blocks=<n> bfree=<n>
+static const uint32_t LX64_STATFS_SIZE64 = 120;                  // x86_64 的 struct statfs = 120B
+static const uint64_t LX64_STATFS_MAGIC_VFS2_64 = 0x32534656ull; // 'VFS2'（VimtuFS2）
+static const uint64_t LX64_STATFS_MAGIC_FAT64  = 0x4d44ull;      // Linux 的 MSDOS_SUPER_MAGIC
+static uint64_t lx64_rd64(const uint8_t* p) {                    // 打点用：读回已填好的字段
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--) v = (v << 8) | (uint64_t)p[i];
+    return v;
+}
+static void lx64_statfs_fill64(uint8_t* st, int vol) {
+    uint64_t type = LX64_STATFS_MAGIC_VFS2_64, namelen = VFS64_NAME_MAX;
+    uint64_t blocks = 0, bfree = 0, files = 0, ffree = 0;
+    Fs64Vol64 vi;
+    if (fs64_vol_info64(vol, &vi) == 0) {
+        blocks = vi.total_kb * 2u;                               // KB -> 512B 块
+        bfree  = vi.free_known ? (vi.free_kb * 2u) : 0u;         // 未知 -> 0（不编数字）
+        if (vi.kind == FS64_KIND_FAT32) {
+            type = LX64_STATFS_MAGIC_FAT64;
+            namelen = (uint64_t)FAT64_NAME_MAX - 1u;
+        } else if (vi.vfs_slot >= 0) {
+            uint32_t nf = 0, nfree = 0;
+            if (vfs64_inode_stats_on64(vi.vfs_slot, &nf, &nfree) == 0) { files = nf; ffree = nfree; }
+        }
+    }
+    for (uint32_t i = 0; i < LX64_STATFS_SIZE64; i++) st[i] = 0;
+    lx64_wr64(st + 0,  type);        // f_type
+    lx64_wr64(st + 8,  512);         // f_bsize（= 空闲块统计口径）
+    lx64_wr64(st + 16, blocks);      // f_blocks
+    lx64_wr64(st + 24, bfree);       // f_bfree
+    lx64_wr64(st + 32, bfree);       // f_bavail（没有 root 保留块）
+    lx64_wr64(st + 40, files);       // f_files
+    lx64_wr64(st + 48, ffree);       // f_ffree
+    lx64_wr64(st + 64, namelen);     // f_namelen
+    lx64_wr64(st + 72, 512);         // f_frsize
+    lx64_wr64(st + 80, 0);           // f_flags（本内核没有 ST_* 标志）
+}
+static void lx64_statfs_log64(const char* path, const uint8_t* st) {
+    dbg64_line_begin64();
+    dbg64_str("[FS64] statfs path=");
+    dbg64_str(path);
+    dbg64_str(" bsize=");
+    dbg64_dec(lx64_rd64(st + 8));
+    dbg64_str(" blocks=");
+    dbg64_dec(lx64_rd64(st + 16));
+    dbg64_str(" bfree=");
+    dbg64_dec(lx64_rd64(st + 24));
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static int64_t lx64_statfs64(uint64_t nr, uint64_t path_va, uint64_t st_va) {
+    char path[LX64_PATHR_MAX];
+    const int rr = lx64_resolve_path64(path_va, path, (uint32_t)sizeof(path));
+    if (rr != 0) { syscall64_deny64(nr, path_va); return rr; }
+    if (!user64_range_ok64(st_va, LX64_STATFS_SIZE64)) { syscall64_deny64(nr, st_va); return -LX64_EFAULT; }
+    const int vol = fs64_current_vol64();
+    Fs64Stat64 fst;
+    const int sr = fs64_stat64(vol, path, &fst);                 // 存在性 + 权限（vfs64 既有判定）
+    if (sr != 0) {
+        if (sr == -13) return -LX64_EACCES;
+        return -LX64_ENOENT;
+    }
+    uint8_t st[LX64_STATFS_SIZE64];
+    lx64_statfs_fill64(st, vol);
+    lx64_copy_to_user64(st_va, st, LX64_STATFS_SIZE64);
+    lx64_statfs_log64(path, st);
+    return 0;
+}
+static int64_t lx64_fstatfs64(uint64_t nr, uint64_t fd, uint64_t st_va) {
+    if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (fd <= 2 && !fd64_slot_used64((int)fd)) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    if (!user64_range_ok64(st_va, LX64_STATFS_SIZE64)) { syscall64_deny64(nr, st_va); return -LX64_EFAULT; }
+    int vol = -1;
+    char fpath[FD64_PATH_MAX];
+    const int wr = fd64_where64((int)fd, &vol, fpath, (int)sizeof(fpath));
+    if (wr == -FD64_EINVAL) return -LX64_ENOENT;                 // pipe/tty：没有卷可查（如实）
+    if (wr != 0) return (int64_t)wr;                             // -EBADF
+    Fs64Stat64 fst;
+    const int sr = fs64_stat64(vol, fpath, &fst);
+    if (sr != 0) return (sr == -13) ? -LX64_EACCES : -LX64_ENOENT;
+    uint8_t st[LX64_STATFS_SIZE64];
+    lx64_statfs_fill64(st, vol);
+    lx64_copy_to_user64(st_va, st, LX64_STATFS_SIZE64);
+    lx64_statfs_log64(fpath, st);
     return 0;
 }
 // ---- 5）fstat / 4）stat / 6）lstat（x86_64 的 struct stat = 144 字节，字段偏移见 Linux asm/stat.h）----
@@ -1963,7 +2077,10 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 61:  return lx64_wait4_64(a1, a2, a3);
     case 62:  return lx64_kill_wrap64(a1, a2);                     // ★ A4-5：真投递（含进程组/自杀）
     case 63:  return lx64_uname64(nr, a1);
+    case 72:  return lx64_fcntl64(nr, a1, a2, a3);                   // ★ 本批：F_GETFL/F_SETFL（初始 fd 标志）
     case 74:  return lx64_fsync64(a1);
+    case 137: return lx64_statfs64(nr, a1, a2);                       // ★ 本批：statfs(path, struct statfs)
+    case 138: return lx64_fstatfs64(nr, a1, a2);                      // ★ 本批：fstatfs(fd, struct statfs)
     case 79:  return lx64_getcwd64(nr, a1, a2);                       // 真：当前进程 cwd（★ A4-2a）
     case 80:  return lx64_chdir64(nr, a1);                           // ★ A4-2a：chdir(80)
     case 82:  return lx64_rename64(nr, a1, a2);                      // ★ A4-2a：rename(82)（同目录）

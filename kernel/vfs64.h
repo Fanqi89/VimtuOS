@@ -396,6 +396,13 @@ int  vfs64_list64_on64(int slot, const char* path, Vfs64Dirent64* out, int max, 
 int  vfs64_tree_dump64_on64(int slot, const char* path, int max_entries, int max_depth);
 int  vfs64_rename_on64(int slot, const char* old_path, const char* new_name);
 int  vfs64_free_on64(int slot, uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_blocks);
+// ★ 本批：inode 统计（**只读**，不分配、不改任何状态；statfs(137) 的 f_files/f_ffree 用）。
+//   *files = 超级块里的 inode 总槽数（0 号根目录算一个）；*ffree = 空槽数
+//   （判定与 alloc_inode 同一口径：VFS_I_TYPE == VFS64_TYPE_FREE）。
+//   代价 = 线性读一遍 inode 表（与 ls 的建缓存那次同款；inode 扇区有缓存）。
+//   返回 0 = 已填；-1 = 未挂载/槽空/inode 读失败。两个指针可传 nullptr。
+int  vfs64_inode_stats64(uint32_t* files, uint32_t* ffree);
+int  vfs64_inode_stats_on64(int slot, uint32_t* files, uint32_t* ffree);
 
 // ==================== v3/v4 新 API（多级路径）====================
 // 查属性（含 type/size/mtime/parent/nlink/kind/名字/**uid/gid/mode**）。返回 0 = 找到；
