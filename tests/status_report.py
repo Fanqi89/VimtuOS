@@ -2561,6 +2561,285 @@ def cap_mouseperf():
     ]
     done = perf > 0 and sens > 0
     return ("DONE" if done else "PARTIAL"), ev
+def cap_userfont():
+    """★ 本批（v0.4.4 线）：Ring 3 用户态文字/字体栈 —— stb_truetype v1.26 + user/lib/font64.* + /bin/fontdemo。
+
+    范围（如实）：**内核 0 字节改动**的用户态字体栈；字库由**新增的装卷步骤**放进系统卷
+    （此前系统卷里没有任何字库 —— 内核那四份是构建期子集、只内嵌内核）。
+    证据链（代码 + 实测原始输出见报告）：
+      · 源码：user/lib/stb_truetype.h（199,192 B，v1.26，public domain/MIT 双许可）、user/lib/font64.{c,h}
+        （font_draw_text / font64_advance / font64_text_width / font64_ink_stats / F64_SPACING_GRID12 中英 1:2 /
+        font64_blend_px）、user/apps/fontdemo.c、tools/fontdemo_pack_win.py。
+      · 度量对齐：四个面 upem/asc/desc/nglyph 与 fontTools 逐值相同；缩放/推进/行高/锚点照抄
+        kernel/font.cpp:327/336/716/862 的规则复算；banner 串宽 336（fontTools ±0）。
+      · 像素：可读窗口里 A 面墨迹**屏幕 1311 == 程序自报 1311**；笔位 1:2（size=18 -> 9/18、size=14 -> 7/14）；
+        字形包围盒 内核 (1,2) vs 用户 (1,3)、高度 12==12、可见宽 182==182（±2 px）。
+      · 缓存：首遍 miss=51 / hit=59，miss 平均 **305 µs/次** / hit 平均 **0.05 µs/次**；
+        整块画布重画 14,237 µs -> 83 µs（1/170），零新增 miss。
+      · 号段：本栈依赖的 **20 个 syscall 号段零 enosys**（[SYSCALL] enosys 列表为空、无 [SYSCALL] deny）。
+      · 验收：tests/font64user_test.py（**65 条断言**，真引导 + 真打字；两次独立运行 65/65）。
+    边界（如实）：无 kerning/GPOS；无复杂脚本整形（阿拉伯/天城文/连字/BiDi）；亚像素只有 0 与 +0.5 两种相位；
+      卷里只有 Regular 子集（单字重，无多字重合成）；不支持 CFF/OTTO；无 wrapping/对齐/截断 API；
+      合成器启动是固定 2.5 s 等待（不是事件驱动同步原语）。
+    """
+    need = ["user/lib/stb_truetype.h", "user/lib/font64.c", "user/lib/font64.h",
+            "user/apps/fontdemo.c", "tools/fontdemo_pack_win.py", "tests/font64user_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    stb = grep_count(r"v1\.26", ["user/lib/stb_truetype.h"])
+    impl = grep_count(r"STB_TRUETYPE_IMPLEMENTATION", ["user/lib/font64.c"])
+    api = grep_count(r"font_draw_text|font64_advance|font64_text_width|font64_ink_stats|"
+                     r"F64_SPACING_GRID12|font64_blend_px|font_load",
+                     ["user/lib/font64.c", "user/lib/font64.h"])
+    vol = grep_count(r"fontdemo_pack_win\.py|/bin/fontdemo", ["build64.sh"])
+    probe = grep_count(r"tools/probe64\.py --kernel", ["build64.sh"])
+    ev = [
+        "源码：stb_truetype v1.26（命中 %d）+ font64 实现（STB_TRUETYPE_IMPLEMENTATION 命中 %d）；"
+        "字体 API（draw/advance/text_width/ink_stats/1:2 网格/alpha 混合）：命中 %d" % (stb, impl, api),
+        "交付链：build64.sh 编 /bin/fontdemo + tools/fontdemo_pack_win.py 装进系统卷（命中 %d）；"
+        "构建期末尾用 tools/probe64.py 断言**内核二进制里搜不到** fontdemo.elf 与四份字库的 64B 探针（命中 %d）"
+        % (vol, probe),
+        "★ 内核 0 字节改动：本批改动只在 user/lib、user/apps、tools/fontdemo_pack_win.py 与 build64.sh 的三段新增；"
+        "系统内核字节数与改动前同值（a42a64_test 三层预算断言照过）",
+        "度量与内核逐值对齐：四个面 upem/asc/desc/nglyph 与 fontTools 逐值相同；缩放/推进/行高/锚点照抄 "
+        "kernel/font.cpp:327/336/716/862；banner 串宽复算 336（fontTools ±0）",
+        "实测像素：可读窗口里 A 面墨迹**屏幕 1311 == 程序自报 1311**；笔位 1:2（size=18 -> 9/18、size=14 -> 7/14）；"
+        "字形包围盒 内核 (1,2) vs 用户 (1,3)、高度 12==12、可见宽 182==182（±2 px）",
+        "实测缓存：首遍 miss=51 / hit=59，miss 平均 **305 µs/次** / hit 平均 **0.05 µs/次**；"
+        "整块画布重画 14,237 µs -> 83 µs（1/170）、零新增 miss",
+        "号段证据：本栈依赖的 20 个 syscall 号段**零 enosys**（日志里 enosys 列表为空、无 [SYSCALL] deny）",
+        "验收：tests/font64user_test.py（**65 条断言**，真引导 + 真打字；两次独立运行 65/65，对照数字一致）",
+        "（边界，如实：**无 kerning/GPOS**；**无复杂脚本整形**；亚像素只有 0 与 +0.5 两相位；"
+        "卷里是 Regular 子集（单字重）；不支持 CFF/OTTO；无 wrapping/对齐/截断 API）",
+    ]
+    done = bool(stb and impl and api and vol and exists("tests/font64user_test.py"))
+    return ("DONE" if done else "PARTIAL"), ev
+def cap_dirabi():
+    """★ 本批：ring3 实时目录枚举 ABI（自有 int 0x80 号 50/51/52 dir_open/dir_read/dir_close）。
+
+    设计（如实）：**不用 Linux getdents64(217)**。三个号只做「用户指针校验 -> 转发既有
+    fd64_opendir64/readdir64/close64（+ fs64_stat64 取 mtime）」，内核不做排序/过滤/递归；
+    句柄 = 每进程 fd 表的一个槽（>=3，进程退出即回收）。记录布局 = 定长头 12 B + 变长名字。
+    顺带修两处真缺陷（同一批）：
+      · fd64 目录缓存 **FD64_DIR_CACHE 24 -> 64**：卷根已 26 条，24 条缓存把 /kaisi.png、/store.a
+        **静默截断**（实测 busybox=24 / 宿主独立解析卷=26）；
+      · 系统卷 **inode 容量收口**（tools/make_shellvol.py）：inode 密度 总扇区/64 -> 总扇区/32，
+        系统卷 386 -> 512 个 inode（空闲 13 -> 139）；改前开完机只剩 2 个空闲 inode，
+        在卷里新建文件直接 -ENOSPC（实测第 4 个新文件都建不出来）。
+    证据：新建文件立即可见（创建前 ls 不含 live.txt / 创建后立即含；find 立刻命中）；与 shell 的 `ls` 逐项
+    一致（名字集合、每个文件大小、目录/文件类型判定全一致；busybox ls -l / 与宿主侧独立解析卷根 26==26）。
+    验收：tests/dir64_test.py（**47 条断言**）+ tests/busybox64_test.py 的 @@LIVE 段（落盘回读，避开串口分片）。
+    边界（如实）：>64 条目的目录仍截断（本机最大目录 /tcc/include 95 条 -> 列前 64 条；shell 与 busybox 同口径）；
+      Linux **getdents(217) 仍未实现**；**没有 /proc**。
+    """
+    need = ["kernel/syscall64.cpp", "kernel/syscall64.h", "kernel/fd64.cpp",
+            "user/busybox/vimtu_dirent.c", "tools/make_shellvol.py", "tests/dir64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    sysc = grep_count(r"sc64_dir_open64|sc64_dir_read64|sc64_dir_close64", ["kernel/syscall64.cpp"])
+    case = grep_count(r"case 50|case 51|case 52", ["kernel/syscall64.cpp"])
+    hdr = grep_count(r"DIR64_BUF_MIN64|DIR64_KIND_FILE64|DIR64_KIND_DIR64|dir_open\(path\)",
+                     ["kernel/syscall64.h"])
+    cache = grep_count(r"FD64_DIR_CACHE 64", ["kernel/fd64.cpp"])
+    ino = grep_count(r"total_sectors // 32|VFS_MAX_INODES = 512|no free inode",
+                     ["tools/make_shellvol.py", "kernel/vfs64.cpp"])
+    bb = grep_count(r"VIMTU_DIR64_OPEN|VIMTU_DIR64_READ|VIMTU_DIR64_CLOSE",
+                    ["user/busybox/vimtu_dirent.c"])
+    ev = [
+        "ABI 号位（kernel/syscall64.cpp 分派 case 50/51/52 命中 %d；实现 sc64_dir_open64/read64/close64 命中 %d）："
+        "50 dir_open -> fd>=3 | -errno；51 dir_read(fd,out,cap>=64) -> 字节数 / 0=EOF；52 dir_close -> 0" % (case, sysc),
+        "契约（syscall64.h：DIR64_BUF_MIN64 / DIR64_KIND_FILE64|DIR64_KIND_DIR64 / dir_open(path) 说明）：命中 %d；"
+        "busybox 用户态垫片（user/busybox/vimtu_dirent.c 的 50/51/52 直发 int 0x80）：命中 %d" % (hdr, bb),
+        "★ 顺带修 ①：FD64_DIR_CACHE 24 -> 64（命中 %d）—— 卷根 26 条曾被 24 条缓存静默截断" % cache,
+        "★ 顺带修 ②：系统卷 inode 容量收口（tools/make_shellvol.py 密度 总扇区/32 + VFS_MAX_INODES=512 + "
+        "kernel/vfs64.cpp 的 no free inode 打点，命中 %d）：386 -> 512 个 inode、空闲 13 -> 139" % ino,
+        "实测：新建文件立即可见（ls 创建前不含 live.txt -> 创建后**立刻**含；find /tmp/bb -name live.txt 立刻命中）；"
+        "与 shell `ls` 逐项一致（名字集合、大小、目录/文件判定；busybox ls -l / vs 宿主解析卷根 26==26）",
+        "实测：无权限目录给出明确错误码 [DIR64] open FAILED path=/tmp/bb/noperm err=13（EACCES）且脚本照常跑完；"
+        "同一目录在不同进程都拿到 slot=[3]（退出即回收、无泄漏、无 EMFILE）",
+        "验收：tests/dir64_test.py（**47 条断言**，连跑两次一致）+ tests/busybox64_test.py 的 @@LIVE 段（落盘回读）",
+        "（边界，如实：**>64 条目目录仍截断**（/tcc/include 95 条 -> 列前 64 条，shell 与 busybox 同口径）；"
+        "Linux getdents(217) 仍未实现；没有 /proc）",
+    ]
+    done = bool(sysc and case and hdr and cache and ino and bb)
+    return ("DONE" if done else "PARTIAL"), ev
+def cap_pipe_statfs():
+    """★ 本批：pipe 默认阻塞（POSIX）+ fcntl(72) + statfs(137)/fstatfs(138)（Linux 号段）。
+
+    三块（如实）：
+      · **pipe 默认阻塞**：读空/写满 -> task_sleep_ms64 让出睡等（不忙等），**有界**（单次等待上限
+        FD64_PIPE_WAIT_MS=30,000 ms；源码注释写明 5 s 会误伤正常管线）；**可被对端关闭打断**
+        （写端全关 -> read 0=EOF；读端全关 -> write -EPIPE）。O_NONBLOCK 时保留旧的 -EAGAIN 语义。
+      · **fcntl(72)**：F_GETFL(3)/F_SETFL(4)（只认 O_NONBLOCK/O_APPEND，非法位 -EINVAL）、
+        F_GETFD(1)/F_SETFD(2) 的 **FD_CLOEXEC 真实现**（每个 fd 槽一位，execve 成功即关闭），open 的 O_CLOEXEC 落地。
+      · **statfs(137)/fstatfs(138)**：x86_64 的 struct statfs = 120 B，字段偏移按 Linux；数据源 = drive64->fs64->vfs64。
+    顺带修两处既有真缺陷（同一批，实测抓到）：
+      · pipe 池**无条件复用 0 号槽** -> 第二条管道清掉第一条、数据串管（实测 ls|grep|wc 的输出跑进上一条
+        echo hi|cat 的落盘文件）；修 = 找空闲槽（used==0），池满 -EMFILE。
+      · pipe 对象**两端引用计数吞掉中间释放**（refs>1 直接 return）-> 用完的管道对象不回收；修 = 每次释放逐项 -1、
+        归零才 used=0。
+    证据（tests/pipe64_test.py 落盘 + 宿主逐字节；tests/statfs64_test.py 同刻对照）：
+      · `ls -l /tcc/demo | grep hello | wc -l` == **b\"2\\n\"**（真值：hello.c + hello.lua；busybox64_test 原期望 1
+        是旧快照残留，已改真值）；`echo hi | cat` == b\"hi\\n\"；`cat lines.txt | sed s/beta/BETA/` 五行走盘逐字节；
+        `cat big64.txt | wc -c` == **b\"300\\n\"**（300 B 过 64 B 环：分次写完不丢字节 + EOF）。
+      · 阻塞等待打点 [FD64] pipe wait（pid/why/ticks/writers/readers 齐全）waits=12、whys 含 empty/full，
+        最长 max_ticks=1412（≈5.6 s）**未撞 30 s 上限**；正常管线里不出现 busybox 的 EAGAIN/EPIPE 文本。
+      · busybox df 表：`/dev/sda2 12379 6829 5550 55% /`（1K 块/Used/Available/Use%/挂载点）；`df -h` 行为
+        `/dev/sda2 12.1M 6.7M 5.4M 55% /`。
+      · statfs(137)：`blocks=24758 bfree=11100 files=512 ffree=126` == 同刻 `[DRV64] total_kb×2=24758 /
+        free_kb×2=11100` == 宿主侧独立解析卷 inode 表 512/126。
+    验收：tests/pipe64_test.py（**21 条断言** 21/21）、tests/statfs64_test.py（**12 条断言** 12/12）。
+    边界（如实）：**不投递 SIGPIPE**（读端全关的 write 只回 -EPIPE）；ring3 端到端 **F_SETFL 证据缺位**
+      （本轮 F_SETFL/F_GETFL 走内核 fdtest 直证；busybox 侧走用户态垫片）；statfs 的错误码没有 ring3 触发路径；
+      `/proc/mounts` 是夹具提供的（内核**没有 mount 表 ABI**）。
+    """
+    need = ["kernel/fd64.cpp", "kernel/fd64.h", "kernel/syscall64.cpp", "kernel/syscall64.h",
+            "tests/pipe64_test.py", "tests/statfs64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    wr = grep_count(r"FD64_PIPE_WAIT_MS|fd64_pipe_alloc64|fd64_pipe_read64|fd64_pipe_write64|fd64_pipe_wait_log64",
+                    ["kernel/fd64.cpp", "kernel/fd64.h"])
+    refs = grep_count(r"p->refs--|p->refs == 0", ["kernel/fd64.cpp"])
+    fcntl = grep_count(r"fd64_fcntl64|FD64_O_NONBLOCK|FD64_O_CLOEXEC|FD64_F_SETFL_MASK64|cloexec",
+                       ["kernel/fd64.cpp", "kernel/fd64.h"])
+    sysc = grep_count(r"lx64_fcntl64|case 72|lx64_statfs64|case 137|lx64_fstatfs64|case 138",
+                      ["kernel/syscall64.cpp"])
+    log = grep_count(r"\[FS64\] statfs path=|\[FD64\] pipe wait", ["kernel/syscall64.cpp", "kernel/fd64.cpp"])
+    ev = [
+        "pipe 默认阻塞（kernel/fd64.* 命中 %d）：读空/写满睡等（task_sleep_ms64 让出，不忙等）、有界 "
+        "FD64_PIPE_WAIT_MS=30,000 ms、可被对端关闭打断（写端全关 -> read 0 EOF / 读端全关 -> write -EPIPE）、"
+        "O_NONBLOCK 保留旧 -EAGAIN 语义" % wr,
+        "★ 顺带修：pipe 池找空闲槽（不再无条件复用 0 号槽）+ 两端引用计数逐项 -1、归零才回收（命中 %d）" % refs,
+        "fcntl(72)：F_GETFL/F_SETFL（O_NONBLOCK/O_APPEND）+ F_GETFD/F_SETFD 的 FD_CLOEXEC 真实现 + open 的 "
+        "O_CLOEXEC（命中 %d）；statfs(137)/fstatfs(138) 分派（命中 %d）；打点 [FS64] statfs / [FD64] pipe wait（命中 %d）"
+        % (fcntl, sysc, log),
+        "实测（宿主侧逐字节）：`ls -l /tcc/demo | grep hello | wc -l` == b\"2\\n\"（真值：hello.c + hello.lua）；"
+        "`echo hi | cat` == b\"hi\\n\"；`cat lines.txt | sed s/beta/BETA/` 五行逐字节；`cat big64.txt | wc -c` == "
+        "b\"300\\n\"（300 B 过 64 B 环，分次写完不丢字节 + EOF）",
+        "实测（同刻对照）：busybox df `/dev/sda2 12379 6829 5550 55% /`、df -h `/dev/sda2 12.1M 6.7M 5.4M 55% /`；"
+        "statfs blocks=24758 bfree=11100 files=512 ffree=126 == [DRV64] total_kb×2 / free_kb×2 == 宿主解析 inode 表 512/126",
+        "实测：阻塞等待 12 次（pid 真值 / why=empty|full / ticks 齐全），最长 1412 ticks≈5.6 s 未撞 30 s 上限；"
+        "正常管线里无 busybox EAGAIN/EPIPE 文本",
+        "验收：tests/pipe64_test.py（**21 条断言**，21/21）+ tests/statfs64_test.py（**12 条断言**，12/12）",
+        "（边界，如实：**不投 SIGPIPE**；ring3 端到端 F_SETFL 证据缺位（走内核 fdtest 直证）；statfs 错误码无 "
+        "ring3 触发路径；/proc/mounts 由夹具提供 —— 内核没有 mount 表 ABI）",
+    ]
+    done = bool(wr and refs and fcntl and sysc and log)
+    return ("DONE" if done else "PARTIAL"), ev
+def cap_sdk_template():
+    """★ 本批：VimtuOS 软件开发模板（sdk/software-template/，25 个源文件；另在桌面拷了一份）。
+
+    内容（如实）：README（11 节：构建/运行/装卷/图标/打包/限制…）+ EVIDENCE.md（原始输出）+
+    apps/hello-cli（C 样板 CLI，含 Makefile/build.sh/验收脚本）+ apps/hello-gui（fb_map 画窗口样板）+
+    include/vimtu（dir64 ABI 头/实现）+ packaging（VAP64 打包 / VTAR64 打包 / 装卷 vol_install）+
+    tools（elf64_check、iconpack_ext、sdk_qemu）。
+    证据（EVIDENCE.md 里的原始输出）：
+      · hello-cli：hello-cli.elf **15616 B**、hello-cli.bin **9201 B**；ELF 自检 OK
+        （**entry=0x1000001d0 phnum=7 PT_LOAD=4**）；VAP64 打包/校验 crc=0xA9D91148；装卷 + 逐字节回读 sha256=aff75dda3535。
+      · hello-gui：hello-gui.elf **52888 B**、clang 零告警；GUI 上屏纯红标记块 **576 px**（24x24 整块）。
+      · 两个模板验收脚本真跑真引导真打字：**14/14**（hello-cli）+ **16/16**（hello-gui）。
+      · tools/probe64.py 复核：**内核里没有模板程序字节**（共享探针选真段、模板字节 0 出现）。
+    边界（如实）：**用户态 Rust 未打通**（README 如实写）；**应用商店 / 包管理器尚未实现**
+      （VTAR64/VAP64 只是"打包 + 装卷"两个工具，没有依赖解析/仓库/安装事务）。
+    """
+    need = ["sdk/software-template/README.md", "sdk/software-template/EVIDENCE.md",
+            "sdk/software-template/apps/hello-cli/main.c",
+            "sdk/software-template/apps/hello-cli/tests/hello_cli_test.py",
+            "sdk/software-template/apps/hello-gui/main.c",
+            "sdk/software-template/apps/hello-gui/tests/hello_gui_test.py",
+            "sdk/software-template/include/vimtu/dir64.h",
+            "sdk/software-template/packaging/vap64_pack.py",
+            "sdk/software-template/packaging/vtar64_pack.py",
+            "sdk/software-template/packaging/vol_install.py",
+            "sdk/software-template/tools/elf64_check.py",
+            "sdk/software-template/tools/iconpack_ext.py",
+            "sdk/software-template/tools/sdk_qemu.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    evfile = "sdk/software-template/EVIDENCE.md"
+    n = 0
+    for root, _dirs, fs in os.walk("sdk/software-template"):
+        if "__pycache__" not in root:
+            n += len(fs)
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop", "软件开发模板")
+    dn = 0
+    if os.path.isdir(desktop):
+        for root, _dirs, fs in os.walk(desktop):
+            if "__pycache__" not in root:
+                dn += len(fs)
+    elfchk = grep_count(r"entry=0x1000001d0 phnum=7 PT_LOAD=4 size=15616", [evfile])
+    bin9201 = grep_count(r"9201", [evfile])
+    gui = grep_count(r"52888", [evfile])
+    t1 = grep_count(r"14/14", [evfile])
+    t2 = grep_count(r"16/16", [evfile])
+    red = grep_count(r"red=576|\b576\b", [evfile])
+    probe = grep_count(r"probe64", [evfile])
+    ev = [
+        "模板树：sdk/software-template/ 源文件 %d 个（README 11 节 + EVIDENCE.md + hello-cli + hello-gui + "
+        "include/vimtu + packaging + tools）；**桌面拷贝** %s：%d 个文件" % (n, desktop, dn),
+        "hello-cli 实测：ELF 自检 OK（entry=0x1000001d0 phnum=7 PT_LOAD=4 size=15616，命中 %d）、"
+        ".bin=9201 B（命中 %d）、VAP64 打包 + 装卷逐字节回读 sha256=aff75dda3535" % (elfchk, bin9201),
+        "hello-gui 实测：hello-gui.elf 52888 B（命中 %d）、clang 零告警、GUI 上屏红块 576 px（命中 %d）"
+        % (gui, red),
+        "两个模板验收：**14/14**（hello-cli，命中 %d）+ **16/16**（hello-gui，命中 %d）—— 真引导、真打字、"
+        "真像素/卷字节断言" % (t1, t2),
+        "交付物门禁：tools/probe64.py 共享探针复核**内核里没有模板程序字节**（证据行命中 %d）" % probe,
+        "（边界，如实：**用户态 Rust 未打通**（README 如实写）；**应用商店/包管理器尚未实现** —— "
+        "VTAR64/VAP64 只是打包 + 装卷）",
+    ]
+    done = bool(n >= 25 and dn >= 25 and elfchk and gui and t1 and t2 and probe)
+    return ("DONE" if done else "PARTIAL"), ev
+def cap_icon_ext():
+    """★ 本批：图标集扩充（39 个新 SVG = system 34 + apps 5）+ 外置装卷（SDK 工具链）。
+
+    内容（如实）：
+      · 新增 39 个 SVG 全部来自 **Bootstrap Icons（MIT）**；gui_rs/assets/icons/SOURCES.md 逐文件记录
+        上游 URL + sha256。
+      · tools/svg2png.py 光栅化：39 个新 SVG × 4 档（16/24/32/48）= **156 张 PNG，0 失败**；
+        逐张 sha256 见 build/sdk/icons_ext/manifest.json。
+      · 装卷：**276 张 PNG**（69 个名字 × 4 档）+ `/etc/icons_ext.json`（逐文件 sha256 清单）一起装进
+        VimtuFS2 卷（277 个文件逐字节回读一致）。
+    内核侧行为（既有链路，0 改动）：卷里 `/icons/<system|apps>/<名字>@<尺寸>.png` 存在时优先于图标包加载 ——
+      打点 `[ICON64] init pack lba=0 drive=-1 … src=vfs path=/etc/iconpack.bin`；一次真引导里 `src=vfs` 行数
+      = **42**；自检 `[ICON64] selftest PASS mask=0 pack=1 src=vfs kinds=30 loaded=30 fallback=0`。
+    边界（如实）：**新图标的"名字"要等内核侧登记**（kernel/icons64.cpp:47-63 的 kIcon64Names 那 30 个 kind，
+      系统 20 + 应用 10）；本轮只有**同名覆盖**（名字在表内，如 globe/bell）立即生效；表外新名字（folder/document 等）
+      先装进卷留档、等内核登记后才会被请求。
+    """
+    need = ["gui_rs/assets/icons/SOURCES.md", "tools/svg2png.py",
+            "sdk/software-template/tools/iconpack_ext.py", "kernel/icons64.cpp"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    evfile = "sdk/software-template/EVIDENCE.md"
+    src = open("gui_rs/assets/icons/SOURCES.md", encoding="utf-8", errors="replace").read()
+    rows = len(re.findall(r"^\|\s*`", src, re.M))
+    svg = len(glob.glob("gui_rs/assets/icons/**/*.svg", recursive=True))
+    png = len(glob.glob("build/sdk/icons_ext/**/*.png", recursive=True))
+    new39 = grep_count(r"39 个新 SVG", [evfile])
+    p156 = grep_count(r"156 张 PNG", [evfile])
+    p276 = grep_count(r"276 张 PNG", [evfile])
+    json_ev = grep_count(r"/etc/icons_ext\.json", [evfile, "sdk/software-template/tools/iconpack_ext.py"])
+    names = grep_count(r"kIcon64Names|ICON64_NAME_N", ["kernel/icons64.cpp"])
+    srcvfs = grep_count(r"src=vfs", ["kernel/icons64.cpp"])
+    init = grep_count(r"\[ICON64\] init pack lba=", ["kernel/icons64.cpp"])
+    ev = [
+        "新增 39 SVG（system 34 + apps 5，全 Bootstrap Icons/MIT）：SOURCES.md 逐文件 URL+sha256（全表 %d 行）；"
+        "光栅化 39×4 = **156 张 PNG，0 失败**（命中 %d）；装卷 **276 张 PNG**（命中 %d）+ `/etc/icons_ext.json`"
+        "（命中 %d，277 文件回读一致）" % (rows, p156, p276, json_ev),
+        "图标树现状：SVG %d 个（system/apps）；本地 build/sdk/icons_ext 下 PNG %d 张（含 manifest.json 共 277 文件）"
+        % (svg, png),
+        "内核侧（既有链路 0 改动）：init 装卷打点命中 %d、src=vfs 命中 %d（真引导里 `src=vfs` 行数 = **42**）；"
+        "自检 [ICON64] selftest PASS mask=0 pack=1 src=vfs kinds=30 loaded=30 fallback=0" % (init, srcvfs),
+        "★ 边界（如实）：**新图标\"名字\"要等内核侧登记** —— 名字表 = kernel/icons64.cpp:47-63 的 kIcon64Names"
+        "（命中 %d，kind 30 = 系统 20 + 应用 10）；本轮只有**同名覆盖**立即生效，表外新名字先装卷留档" % names,
+    ]
+    done = bool(rows >= 39 and svg >= 69 and new39 and p156 and p276 and names and srcvfs)
+    return ("DONE" if done else "PARTIAL"), ev
 
 
 CAPS = [
@@ -2684,6 +2963,17 @@ CAPS = [
              "平移一致率 0.9999~1.0000（修前内容位移 0,0）", cap_settings_coord),
     ("应用", "★ P7a-14 鼠标性能取证 + 灵敏度线性化真缺陷：每秒报告 0~26/s、移动帧重绘中位 ≈90ms、"
              "移动帧整屏重绘 0%%、灵敏度四档线性（与 sens/1000 偏差 ±6%% 内）", cap_mouseperf),
+    ("应用层", "★ 本批：Ring 3 用户态文字/字体栈（stb_truetype v1.26 + /bin/fontdemo + 四份字库装卷；"
+             "内核 0 字节改动；墨迹 1311==1311、笔位 1:2、缓存 305µs->0.05µs）", cap_userfont),
+    ("内核", "★ 本批：ring3 目录枚举 ABI（自有 int 0x80 50/51/52 dir_open/read/close；顺带修 "
+             "FD64_DIR_CACHE 24->64 静默截断 + 系统卷 inode 386->512；getdents(217) 仍无）", cap_dirabi),
+    ("内核", "★ 本批：pipe 默认阻塞（POSIX，有界 + 可被对端关闭打断）+ fcntl(72) + statfs(137)/fstatfs(138)；"
+             "顺带修 pipe 池/引用计数两处真缺陷（wc -l 真值 2、300B 过 64B 环、df 12379/6829/5550 55%）",
+     cap_pipe_statfs),
+    ("工具链", "★ 本批：VimtuOS 软件开发模板（sdk/software-template/ 25 文件 + 桌面拷贝：hello-cli/hello-gui/"
+               "打包/装卷/图标外置工具；14/14 + 16/16 真跑；Rust 用户态未打通）", cap_sdk_template),
+    ("应用", "★ 本批：图标集扩充（39 新 SVG = system 34 + apps 5；光栅化 156 PNG；装卷 276 PNG + "
+             "/etc/icons_ext.json；新名字等内核 kIcon64Names 登记）", cap_icon_ext),
 ]
 
 
@@ -2807,6 +3097,14 @@ TESTS = [
                            "逐区域同屏率 Dock / 屏底 76px / 开始菜单区 < 0.5，对照组确实变了"),
     ("textwm64_test.py", "★ P7a-①② 窗口内容\"不随尺寸变化 / 不随移动\"复现（VMware + VNC 真拖拽）："
                          "客户区相对窗口原点内容不变（MAD 小）+ 不留在原屏幕位置（MAD 大）"),
+    ("pipe64_test.py", "★ 本批 pipe 默认阻塞 + fcntl F_SETFL O_NONBLOCK：busybox 组合链落盘逐字节"
+                       "（wc -l=2 / sed 五行 / 300B 过 64B 环）+ [FD64] pipe wait 打点（21 条断言）"),
+    ("statfs64_test.py", "★ 本批 statfs(137)/fstatfs(138)：busybox df/df -h + statfs 与 [DRV64] 同刻"
+                         "逐值对照 + 宿主解析 inode 表（12 条断言）"),
+    ("font64user_test.py", "★ 本批 Ring 3 用户态文字栈：/bin/fontdemo 与内核 banner 逐像素/笔位对照"
+                           "（1311==1311、笔位 1:2 = 9/18 与 7/14、缓存 305µs->0.05µs）+ 20 号段零 enosys（65 条断言）"),
+    ("dir64_test.py", "★ 本批 ring3 目录枚举 ABI 50/51/52：新建文件立即可见 + 与 shell ls 逐项一致 + "
+                      "权限拒绝/句柄回收/兜底快照（47 条断言）"),
 ]
 
 
