@@ -7,7 +7,40 @@
 全部是本工程自己的 C++ / 汇编代码。
 它自带一张"三合一"安装盘（BIOS 光盘 / U 盘 / UEFI），安装界面与步骤照 Windows 10 做（去掉了输入产品密钥那一步）。
 
-> 版本 **0.4.3**（标签 `v0.4.3`；★ 本版起**不再带 `-beta` 后缀**）· 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
+> 版本 **0.4.4**（标签 `v0.4.4`；★ 不带 `-beta` 后缀）· 目标平台 x86_64（长模式）· 许可 **GPL-3.0**（[LICENSE](LICENSE)）· 仓库 <https://github.com/Fanqi89/VimtuOS>
+> 状态（权威判据：`python tests/status_report.py`，本版实测）：**完成 85 / 部分 0 / 未做 0（共 85 项能力）**、
+> `--full` 的 `TESTS` 列表 **78** 个脚本、`Get-ChildItem tests\*.py` 实数 **93** 个脚本 ——
+> 本版（**里程碑 M41–M44**）新增 5 项能力：**Ring 3 用户态文字/字体栈**（`stb_truetype` **v1.26** + `user/lib/font64.*` +
+> `/bin/fontdemo`；**内核 0 字节改动**，字库由**新增的装卷步骤**放进系统卷）、**ring3 目录枚举 ABI**（自有 int 0x80
+> **50/51/52** `dir_open/dir_read/dir_close` + 顺带修 `FD64_DIR_CACHE` 24->64 静默截断与系统卷 inode 容量）、
+> **pipe 默认阻塞（POSIX）+ `fcntl(72)` + `statfs(137)/fstatfs(138)`**、**VimtuOS 软件开发模板（SDK）**、
+> **图标集扩充**（39 新 SVG = system 34 + apps 5，Bootstrap Icons/MIT）。
+> 实测证据（逐条数字）：用户态字体栈**屏幕墨迹 1311 == 程序自报 1311**、笔位 1:2（9/18、7/14）、
+> 缓存 miss **305 µs** -> hit **0.05 µs**、依赖的 **20 个 syscall 号段零 enosys**（`font64user_test` **65/65**）；
+> `ls -l /tcc/demo | grep hello | wc -l` == **b"2\n"**（真值 hello.c + hello.lua；`busybox64_test` 原期望 1 是旧快照残留、已改真值）、
+> `cat big64.txt | wc -c` == **b"300\n"**（300 B 过 64 B 环）、busybox `df` 行 `12379 6829 5550 55% /`、`df -h` 行 `12.1M 6.7M 5.4M`、
+> statfs `blocks=24758 bfree=11100 files=512 ffree=126` == 同刻 `[DRV64]` / 宿主解析 inode 表（`pipe64_test` **21/21**、`statfs64_test` **12/12**）；
+> 新建文件立即可见 + 与 shell `ls` 逐项一致（`dir64_test` **47/47**）；模板 hello-cli.elf **15616 B** / .bin **9201 B**、
+> ELF 自检 `entry=0x1000001d0 phnum=7 PT_LOAD=4`、hello-gui.elf **52888 B**、模板验收 **14/14 + 16/16**、GUI 上屏红块 **576 px**、
+> `probe64` 复核内核里**模板字节 0**；图标光栅化 39×4 = **156 PNG 全成功**、装卷 **276 PNG + `/etc/icons_ext.json`**（277 文件逐字节回读）。
+> 关键真缺陷（逐条根因）：**pipe 池无条件复用 0 号槽**（第二条管道清掉第一条并串数据 —— 实测 `ls|grep|wc` 输出跑进上一条
+> `echo hi|cat` 的落盘文件）、**pipe 对象两端引用计数吞掉中间释放**（refs>1 直接 return，用完不回收）、
+> **`FD64_DIR_CACHE` 24 条静默截断卷根 26 条**（`/kaisi.png`、`/store.a` 列不出来）、**系统卷 inode 容量不足**
+> （密度 总扇区/64 -> 总扇区/32：386 -> 512 个 inode、空闲 13 -> 139；改前开完机只剩 2 个空闲 inode，新建文件 -ENOSPC）。
+> 体积：安装程序内核 **1,572,080 B**、系统内核 **3,390,944 B**（三层预算：内核 ≤ 4,096,000 B ∧ 余量 ≥ 640 KiB = 655,360 B
+> ∧ ≤ 基线 3,418,352 B + 22,288 B；实测**余量 705,056 B**、相对基线 **-27,408 B（净减）** —— **再涨 49,697 B 触发**）、
+> `loader64.bin` **4,010 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**（`Get-Item` 实读）。
+> ★ **发布流程 §2 第 1 条硬门禁已勾**：`build64.sh` 的 `VIMTUOS_VERSION="0.4.4"` == 本次标签 == 镜像内嵌串
+> （系统内核 `kernel64_os.bin` 里 `0.4.4` 命中 **5** 次、`VimtuOS 0.4.4` **4** 次、终端串 `VimtuOS Terminal v0.4.4` **1** 次；
+> 旧串 `0.4.3` **0** 次；安装程序内核不含 `0.4.x` 字面量 —— settings/terminal 只编进系统内核，实测 0 命中，如实标注。
+> `[SET64] about version=VimtuOS 0.4.4 x86_64 build_tag=…` 与终端 `ver` 的 `VimtuOS Terminal v0.4.4 (64-bit long mode)` 都逐字节可检索）。
+> 如实边界：**字体栈**无 kerning/GPOS、无复杂脚本整形、仅 0/+0.5 亚像素、单字重子集；**目录 ABI** >64 条目截断
+> （`/tcc/include` 95 -> 前 64）、Linux `getdents(217)` 与 `/proc` 仍未实现；**pipe/fcntl/statfs** 不投 `SIGPIPE`、
+> ring3 端到端 F_SETFL 证据缺位（busybox 走用户态垫片）、statfs 错误码无 ring3 触发路径、`/proc/mounts` 由夹具提供；
+> **SDK** 用户态 Rust 未打通、应用商店/包管理器尚未实现（VTAR64/VAP64 只是打包 + 装卷）；**图标**新"名字"要等内核侧登记
+> （`kernel/icons64.cpp:47-63` 的 `kIcon64Names`），本轮只有同名覆盖立即生效。
+>
+> ★ 以下是**上一版 `v0.4.3` 的头条说明（历史存档，原文保留）**：
 > 状态（权威判据：`python tests/status_report.py`，本版实测）：**完成 80 / 部分 0 / 未做 0（共 80 项能力）**、
 > `--full` 的 `TESTS` 列表 **74** 个脚本、`Get-ChildItem tests\*.py` 实数 **89** 个脚本 ——
 > 本版（**里程碑 M38–M40**）新增 8 项能力：**JPEG 基线解码**（内核里真解 Huffman/DC-AC/反量化/整数 IDCT，
@@ -37,7 +70,7 @@
 > 旧串 `0.4.2-beta19` 两份内核 **0** 次；安装程序内核不含 `0.4.x` 字面量 —— settings/terminal 只编进系统内核，实测 0 命中，如实标注）。
 >
 > ---
-> ★ 以下是**上一版 `v0.4.2-beta19` 的头条说明（历史存档，原文保留）**：
+> ★ 以下是**更早一版 `v0.4.2-beta19` 的头条说明（历史存档，原文保留）**：
 > 状态（权威判据：`python tests/status_report.py`，本批实测）：**完成 72 / 部分 0 / 未做 0（共 72 项能力）**、
 > `--full` 的 `TESTS` 列表 **66** 个脚本、`Get-ChildItem tests\*.py` 实数 **78** 个脚本 ——
 > 本批（**里程碑 M35–M37**）新增 3 项能力：**Ring 3 合成器（用户态 `/bin/wm` + 两个真客户端；有合成器时内核一个像素都不合成）**、
@@ -144,7 +177,7 @@ ring3 用户态」的自研单体内核；它能装进硬盘、跑起自己的�
 6. **自研 UEFI 引导（不用 gnu-efi）**：自造 PE32+ 桩（2.5KB）+ 平铺长模式引导器（36KB，链接到 72MB，绕过 EDK2 的 PE 校验）；**RSDP 经固定槽 0x7800 从固件配置表传给内核**。
 7. **一切自写工具链**：没有 mkfs.fat、没有 mtools —— FAT32 卷、ISO9660 解析与打包、GPT、LBA 回填、PE 摊平、字体子集化（**4 套 TTF**：西文/中文/终端等宽/缺字兜底）、图标生成、VAP64 打包，全是本仓库的 Python 脚本。
 8. **APIC / ACPI / SMP 都带"宁可不启用也不变砖"的回退**：拿不到 ACPI 就留 8259、启动 AP 全程有界超时、每个自检失败都整体回滚，降级路径都有串口证据。
-9. **每次改动都跑自动验收**：**89 个验收脚本**（`Get-ChildItem tests\*.py` 实数；`status_report.py --full` 的 `TESTS` 列表 **74** 个；本版新登记 `jpeg64_test`(79 条断言)、`sounds64_test`(44)、`soundsegs64_test`、`taskmgr64_test`(31)、`textstress64_test`、`mouseperf64_test`(25)、`textlock64_test`、`textwm64_test`），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
+9. **每次改动都跑自动验收**：**93 个验收脚本**（`Get-ChildItem tests\*.py` 实数；`status_report.py --full` 的 `TESTS` 列表 **78** 个；本版（v0.4.4）新登记 `pipe64_test`(21 条断言)、`statfs64_test`(12)、`font64user_test`(65)、`dir64_test`(47)；上一版（v0.4.3）登记 `jpeg64_test`(79)、`sounds64_test`(44)、`soundsegs64_test`、`taskmgr64_test`(31)、`textstress64_test`、`mouseperf64_test`(25)、`textlock64_test`、`textwm64_test`），全部是"字节级 + 像素级 + 串口日志"三合一，而不是"看起来能跑"。
 
 ## 四、系统架构
 
@@ -316,7 +349,7 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 
 ## 六、工程质量（这个项目最值得说的部分）
 
-* **89 个验收脚本**（`Get-ChildItem tests\*.py` 实数 **89**；其中 `status_report.py --full` 的 `TESTS` 列表长度实测 **74**；**本版（v0.4.3）新登记 8 个脚本**：`jpeg64_test` **79/79**、`sounds64_test` **44**、`soundsegs64_test`、`taskmgr64_test` **31/31**、`textstress64_test`、`mouseperf64_test` **25/25**、`textlock64_test`、`textwm64_test`）。以下为历史累计记录（P6 那批）：**icons64_test 50 条**（外置图标包：真图标加载/逐 kind 对照宿主清单/形状 IoU/主题跟随/两种坏法回落 + 开始按钮 VimtuFS2 真图），另有 **gui_modern64_test 159 条（连跑 2 次全绿；Dock 回弹判据改与机器帧率无关）**、**panels64_test 78 条**、**desktop64_test PASS**、**desktopops64_test 66 条（13 条 QEMU PS/2 注入零命中为 [skip]）**、**explorer64_test 71 条**、**fileops64_test 95 条**、**startmenu64_test 63 条**、**settings64_test 108 条**、**ui_extra64_test 51 条** —— 2026-09-26 实测：P6 那批 0 FAIL（六项真机缺陷修复 + 外置图标包），
+* **93 个验收脚本**（`Get-ChildItem tests\*.py` 实数 **93**；其中 `status_report.py --full` 的 `TESTS` 列表长度实测 **78**；**本版（v0.4.4）新登记 4 个脚本**：`pipe64_test` **21/21**、`statfs64_test` **12/12**、`font64user_test` **65/65**、`dir64_test` **47/47**；上一版（v0.4.3）新登记 8 个：`jpeg64_test` **79/79**、`sounds64_test` **44**、`soundsegs64_test`、`taskmgr64_test` **31/31**、`textstress64_test`、`mouseperf64_test` **25/25**、`textlock64_test`、`textwm64_test`）。以下为历史累计记录（P6 那批）：**icons64_test 50 条**（外置图标包：真图标加载/逐 kind 对照宿主清单/形状 IoU/主题跟随/两种坏法回落 + 开始按钮 VimtuFS2 真图），另有 **gui_modern64_test 159 条（连跑 2 次全绿；Dock 回弹判据改与机器帧率无关）**、**panels64_test 78 条**、**desktop64_test PASS**、**desktopops64_test 66 条（13 条 QEMU PS/2 注入零命中为 [skip]）**、**explorer64_test 71 条**、**fileops64_test 95 条**、**startmenu64_test 63 条**、**settings64_test 108 条**、**ui_extra64_test 51 条** —— 2026-09-26 实测：P6 那批 0 FAIL（六项真机缺陷修复 + 外置图标包），
   并逐脚本复跑既有脚本 —— `usb64_test` 51、`fatread64_test` 61、`explorer64_test` 71、`fileops64_test` 95、
   `multivol64_test` 108、`fs_tree_test` 85、`bootlog64_test` 30、`boot64_assert`、`desktop64_test`、
   `install_flow_test`、`partition_ops_test`、`esp_install_test`、`disk_boot_test`、`iso64_install_test`、
@@ -409,10 +442,91 @@ python tests/screenshot64.py           # 抓一张桌面真机截图（PNG）
 | M38 | **JPEG 基线解码（批次 P7a-JPEG）**：内核 `img64.cpp` 真解 Huffman/DC-AC/反量化/纯整数 IDCT + 444/422/420 + RSTn + EXIF Orientation 1..8；与宿主 Pillow 逐像素 MAE ≤0.4 / 最大差 ≤3（`j04 噪声 4:2:0` 0.377/3、`j01 纯色` 0.000/0）；渐进式如实 -2；`jpeg64_test` 79/79 | ✅ |
 | M39 | **系统音效 + 音频 ABI 49 `audio_play`（批次 P7a-snd）**：4 段自合成素材 + `/bin/sounder`（卷交付、内核 0 字节）+ 四个触发点；HDA 放大器能力字真 bug 修复后 1 kHz 自检 peak=5836/RMS=5755、100%(21393)>50%(10697)>静音(0)；分段录音 click 5669/1665@5.085s、notify 11667/3870@5.132s、error 21394/10536@5.271s（`sounds64_test` 44、`soundsegs64_test`） | ✅ |
 | M40 | **桌面/窗口缺陷大修（批次 P7a/P7b）**：任务管理器"看不到/结束不了运行中的程序"、文字渲染重叠（光栅化缓冲复用未清零）、explorer 布局写死、锁屏帧尾 render 漏判、设置页坐标口径、鼠标灵敏度非线性 —— 六条逐条给根因 + 逐像素/录音证据（`settings64_test` **111/111**、`mouseperf64_test` **25/25**、`a42a64_test` 连跑 3 次 **89/89**） | ✅ |
+| M41 | **Ring 3 用户态文字/字体栈（批次 font64user）**：`stb_truetype` **v1.26** + `user/lib/font64.{c,h}` + `/bin/fontdemo`（卷交付）；**内核 0 字节改动**，字库由**新增装卷步骤**放进系统卷；度量与内核逐值对齐、屏幕墨迹 **1311==1311**、笔位 1:2（9/18、7/14）、缓存 miss **305 µs** -> hit **0.05 µs**；`font64user_test` **65/65** | ✅ |
+| M42 | **ring3 目录枚举 ABI（批次 dir64）**：自有 `int 0x80` **50/51/52** `dir_open/dir_read/dir_close`（只校验 + 转发既有 `fd64_opendir64/readdir64/close64`）；顺带修 **`FD64_DIR_CACHE` 24->64** 静默截断与**系统卷 inode 容量**（密度 总扇区/64 -> /32：386 -> 512 个 inode、空闲 13 -> 139）；`dir64_test` **47/47** | ✅ |
+| M43 | **pipe 默认阻塞 + `fcntl(72)` + `statfs(137)/fstatfs(138)`（批次 pipe/statfs）**：读空/写满睡等（有界 + 可被对端关闭打断）、`F_GETFL/F_SETFL`（`O_NONBLOCK`/`O_APPEND`）+ `FD_CLOEXEC` 真实现 + `O_CLOEXEC`；`statfs/fstatfs` 供 busybox `df`；顺带修 pipe 池 0 号槽与两端引用计数两处真缺陷；`pipe64_test` **21/21**、`statfs64_test` **12/12** | ✅ |
+| M44 | **软件开发模板（SDK）+ 图标集扩充（批次 sdk/icons-ext）**：`sdk/software-template/` **25 文件**（README 11 节/EVIDENCE/hello-cli/hello-gui/include/vimtu/packaging/tools）+ 桌面拷贝；hello-cli.elf **15616 B** / .bin **9201 B**、hello-gui.elf **52888 B**、模板验收 **14/14 + 16/16**、GUI 红块 **576 px**；新增 **39 SVG**（system 34 + apps 5，Bootstrap Icons/MIT）、光栅化 **156 PNG** 全成功、装卷 **276 PNG + `/etc/icons_ext.json`** | ✅ |
 
 | — | **本批两条真缺陷修复**：**① xHCI 事件环消费 cycle 未随回卷翻转**（第一圈后驱动看着"没有新事件" -> 一次命令后键盘失效；修法 = 回卷时翻转期望 cycle 位；回归 = `xhci64_test` 键盘连续打字 30 键（跨回卷）+ U 盘读写前后可用 + `stray=0`）；**② 按物理地址读「原始区」被内核 `.bss` 覆盖**（LBA 7497 -> 物理 `0x4A8000` 落在 33 MB fb 后备缓冲 `0x428000..0x23CC000` 里 -> ring3 入口 `0x100000000` `#UD` + `[PANIC] cpu exception 6`；修法 = `kernel/demo64.cpp` 按 LBA 用 `ata64_read` 现读并缓存） | ✅ |
 
-### 批次 v0.4.3（本批）：桌面/窗口缺陷大修 + JPEG 解码 + 系统音效 + 任务管理器修复 —— `v0.4.3`（★ 不带 `-beta`）
+### 批次 v0.4.4（本批）：管道阻塞语义 + statfs + 目录枚举 ABI + 用户态字体栈 + 软件开发模板(SDK) + 图标扩充 —— `v0.4.4`（★ 不带 `-beta`）
+
+> 本版构建产物上的真跑：`a42a64_test` **89/89**（含三层预算断言，实测 `kernel64_os.bin=3390944 B；余量 705056 B`）；
+> `status_report.py` 汇总 **完成 85 / 部分 0 / 未做 0（共 85 项）**，EXIT=0；新增的 4 个脚本逐个真跑
+> （`pipe64_test` **21/21**、`statfs64_test` **12/12**、`dir64_test` **47/47**、`font64user_test` **65/65**）。
+> 跑完 `vmrun list` = **Total running VMs: 0**。
+
+**① pipe 默认阻塞（POSIX）+ `fcntl(72)` + `statfs(137)/fstatfs(138)`（批次 pipe/statfs）**：先前 pipe 是"非阻塞 + 短写"，
+消费者不重试 -> `ls|grep|wc` 这类真管线拿不到数据。本版：读空 / 写满一律 `task_sleep_ms64` 让出睡等（不忙等），
+**有界**（单次等待上限 `FD64_PIPE_WAIT_MS=30,000 ms`；源码注释写明 5 s 会误伤正常管线）、**可被对端关闭打断**
+（写端全关 -> read 返回 0=EOF；读端全关 -> write 返回 `-EPIPE`）；`O_NONBLOCK` 保留旧的 `-EAGAIN` 语义。
+`fcntl(72)`：`F_GETFL(3)`/`F_SETFL(4)`（只认 `O_NONBLOCK`/`O_APPEND`，非法位 `-EINVAL`）+ `F_GETFD(1)`/`F_SETFD(2)` 的
+**`FD_CLOEXEC` 真实现**（每个 fd 槽一位；execve 成功后关闭），open 的 `O_CLOEXEC` 落地。
+`statfs(137)/fstatfs(138)`：x86_64 的 `struct statfs` = 120 B、字段偏移按 Linux；数据源 = `drive64`->`fs64`->`vfs64`（现数位图）。
+**顺带修两处真缺陷**：① **pipe 池无条件复用 0 号槽** —— 第二条管道把第一条清零并把数据串过去（实测 `ls|grep|wc` 的输出
+跑进上一条 `echo hi|cat` 的落盘文件）；修 = 找空闲槽（`used==0`），池满 `-EMFILE`。② **pipe 对象两端引用计数吞掉中间释放**
+（`refs>1` 直接 return）-> 用完的管道对象不回收；修 = 每次释放逐项 -1、归零才 `used=0`。
+证据（宿主侧逐字节 + 同刻对照）：`ls -l /tcc/demo | grep hello | wc -l` == **b"2\n"**（真值 hello.c + hello.lua）、
+`echo hi | cat` == b"hi\n"、`cat lines.txt | sed s/beta/BETA/` 五行逐字节、`cat big64.txt | wc -c` == **b"300\n"**
+（300 B 过 64 B 环：分次写完不丢字节 + EOF）；阻塞等待打点 12 次（pid 真值 / `why=empty|full` / ticks 齐全），
+最长 1412 ticks（≈5.6 s）未撞 30 s 上限；busybox `df` 行 `/dev/sda2 12379 6829 5550 55% /`、`df -h` 行 `12.1M 6.7M 5.4M`
+（= statfs `blocks=24758 bfree=11100` 的 1K 块 / 可用）；statfs 行 `blocks=24758 bfree=11100 files=512 ffree=126`
+== 同刻 `[DRV64] total_kb×2 / free_kb×2` == 宿主侧独立解析卷 inode 表 512/126。
+**边界（如实）**：**不投递 `SIGPIPE`**（读端全关的 write 只回 `-EPIPE`）；ring3 端到端 `F_SETFL` 证据缺位
+（本轮 `F_SETFL/F_GETFL` 走内核 `fdtest` 直证；busybox 侧走用户态垫片）；statfs 的错误码没有 ring3 触发路径；
+`/proc/mounts` 是夹具提供的（内核**没有 mount 表 ABI**）。
+
+**② ring3 目录枚举 ABI：自有 `int 0x80` 号 50/51/52（批次 dir64）**：`dir_open(path)` / `dir_read(fd,out,cap>=64)` /
+`dir_close(fd)` —— **不用 Linux `getdents64(217)`**；三个号只做"用户指针校验 -> 转发既有 `fd64_opendir64`/`readdir64`/`close64`
+（+ `fs64_stat64` 取 mtime）"，内核不做排序/过滤/递归（策略全在 `user/busybox/vimtu_dirent.c` + busybox 自己）；
+句柄 = 每进程 fd 表的一个槽（>=3，进程退出即回收）。记录布局 = 定长头 12 B（name_len/kind/size/mtime）+ 变长名字。
+**顺带修两处真缺陷**：① `fd64` 目录缓存 **`FD64_DIR_CACHE` 24 -> 64** —— 卷根已 26 条，24 条缓存把 `/kaisi.png`、`/store.a`
+**静默截断**（实测 busybox=24 / 宿主独立解析卷=26）；② **系统卷 inode 容量收口**（`tools/make_shellvol.py`：inode 密度
+总扇区/64 -> 总扇区/32）—— 系统卷 **386 -> 512 个 inode**（空闲 **13 -> 139**）；改前开完机只剩 2 个空闲 inode，
+在卷里新建文件直接 `-ENOSPC`（实测第 4 个新文件都建不出来）。
+证据：**新建文件立即可见**（`ls /tmp/bb` 创建前不含 `live.txt` -> 创建后**立刻**含，`find` 立刻命中）；与 shell 的 `ls` **逐项一致**
+（名字集合、每个文件大小、目录/文件类型判定全一致；busybox `ls -l /` 与宿主侧独立解析卷根 **26==26**）；
+无权限目录给出明确错误码 `[DIR64] open FAILED path=/tmp/bb/noperm err=13`（EACCES）且脚本照常跑完；同一目录在不同进程
+都拿到 `slot=[3]`（退出即回收、无泄漏、无 EMFILE）。`tests/dir64_test.py` **47/47**（连跑两次一致）+
+`tests/busybox64_test.py` 的 `@@LIVE` 段（落盘回读，避开串口分片）。**边界（如实）**：**>64 条目的目录仍截断**
+（本机最大目录 `/tcc/include` 95 条 -> 列前 64 条；shell 与 busybox 走同一份缓存、口径一致）；Linux **`getdents(217)` 仍未实现**；
+**没有 `/proc`**。
+
+**③ Ring 3 用户态文字/字体栈（批次 font64user）**：`user/lib/stb_truetype.h`（**v1.26**，public domain/MIT 双许可）
++ `user/lib/font64.{c,h}`（`font_draw_text` / `font64_advance` / `font64_text_width` / `font64_ink_stats` /
+中英 1:2 网格 `F64_SPACING_GRID12` / `font64_blend_px`）+ `/bin/fontdemo`（卷交付）+ `tools/fontdemo_pack_win.py`（装卷 + 逐字节回读）。
+**内核 0 字节改动**（改动只在 user/、tools/ 与 build64.sh 的三段新增）；字库此前**系统卷里一份都没有**，由**新增的装卷步骤**
+放进系统卷（与内核同批构建期子集，四份面；卷内 sha256 == 宿主 sha256）。
+证据：度量与内核**逐值对齐**（四个面 upem/asc/desc/nglyph 与 fontTools 逐值相同；缩放/推进/行高/锚点照抄
+`kernel/font.cpp:327/336/716/862`；banner 串宽复算 336 = fontTools ±0）；屏幕上的墨迹像素 **1311 == 程序自报 1311**；
+笔位 1:2（size=18 -> ASCII 9 / 汉字 18、size=14 -> 7/14）；字形包围盒 内核 (1,2) vs 用户 (1,3)、高度 12==12、可见宽 182==182（±2 px）；
+缓存首遍 miss=51 / hit=59，miss 平均 **305 µs/次** / hit 平均 **0.05 µs/次**，整块画布重画 **14,237 µs -> 83 µs**（1/170）、零新增 miss；
+依赖的 **20 个 syscall 号段零 enosys**（`[SYSCALL] enosys` 列表为空、无 `[SYSCALL] deny`）。`tests/font64user_test.py` **65/65**
+（真引导 + 真打字；两次独立运行对照数字一致）。**边界（如实）**：**无 kerning/GPOS**；**无复杂脚本整形**（阿拉伯/天城文/连字/BiDi）；
+亚像素只有 0 与 +0.5 两种相位；卷里是 Regular 子集（**单字重**，无多字重合成）；不支持 CFF/OTTO；无 wrapping/对齐/截断 API。
+
+**④ VimtuOS 软件开发模板（SDK）（批次 sdk）**：`sdk/software-template/` **25 个源文件**（README 11 节 + `EVIDENCE.md`（原始输出）+
+`apps/hello-cli`（C 样板 CLI：Makefile/build.sh/验收脚本）+ `apps/hello-gui`（`fb_map` 画窗口样板）+
+`include/vimtu`（dir64 ABI 头/实现）+ `packaging`（`vap64_pack` / `vtar64_pack` / `vol_install` 装卷）+
+`tools`（`elf64_check`、`iconpack_ext`、`sdk_qemu`）），另在桌面拷了一份（同 25 文件）。
+证据（`EVIDENCE.md` 原始输出）：hello-cli.elf **15616 B**、hello-cli.bin **9201 B**（8 页 blob）；
+ELF 自检 OK（**entry=0x1000001d0 phnum=7 PT_LOAD=4**）；VAP64 打包/校验 `crc=0xA9D91148`；装卷 + 逐字节回读 `sha256=aff75dda3535`；
+hello-gui.elf **52888 B**、clang 零告警、GUI 上屏纯红标记块 **576 px**（24×24 整块）；两个模板验收脚本真跑真引导真打字
+**14/14 + 16/16**；`tools/probe64.py` 复核**内核里没有模板程序字节**。**边界（如实）**：**用户态 Rust 未打通**（README 如实写）；
+**应用商店 / 包管理器尚未实现**（VTAR64/VAP64 只是"打包 + 装卷"两个工具，没有依赖解析/仓库/安装事务）。
+
+**⑤ 图标集扩充（批次 icons-ext）**：新增 **39 个 SVG**（`gui_rs/assets/icons/system/` 34 + `apps/` 5，全部 **Bootstrap Icons（MIT）**），
+`SOURCES.md` 逐文件记录上游 URL + sha256；`tools/svg2png.py` 光栅化 39 个新 SVG × 4 档（16/24/32/48）= **156 张 PNG，0 失败**
+（逐张 sha256 见 `build/sdk/icons_ext/manifest.json`）；装卷 **276 张 PNG**（69 个名字 × 4 档）+ `/etc/icons_ext.json`
+（逐文件 sha256 清单）一起装进 VimtuFS2 卷（**277 个文件逐字节回读一致**）。
+内核侧（既有链路 0 改动）：卷里 `/icons/<system|apps>/<名字>@<尺寸>.png` 存在时优先于图标包加载 ——
+`[ICON64] init pack lba=0 drive=-1 … src=vfs path=/etc/iconpack.bin`；一次真引导里 `src=vfs` 行数 = **42**；
+自检 `[ICON64] selftest PASS mask=0 pack=1 src=vfs kinds=30 loaded=30 fallback=0`。
+**边界（如实）**：**新图标的"名字"要等内核侧登记**（名字表 = `kernel/icons64.cpp:47-63` 的 `kIcon64Names` 那 30 个 kind，
+系统 20 + 应用 10）；本轮只有**同名覆盖**（名字在表内，如 globe/bell）立即生效；表外新名字（folder/document 等）
+先装进卷留档，等内核登记后才会被请求。
+
+### 批次 v0.4.3（上一批）：桌面/窗口缺陷大修 + JPEG 解码 + 系统音效 + 任务管理器修复 —— `v0.4.3`（★ 不带 `-beta`）
 
 > 本版构建产物上的真跑：`a42a64_test` **连跑 3 次全绿 89/89**（含三层预算断言，实测 `kernel64_os.bin=3374784 B；余量 721216 B`）、
 > `mouseperf64_test` **25/25**、`settings64_test` **111/111**；其余脚本沿用本批已跑记录（`jpeg64_test` **79/79**、
@@ -541,7 +655,17 @@ full_pct=… mv=<dx>,<dy> cur=<x>,<y> sens=… tsc_mhz=…`。**灵敏度真缺�
 * **如实边界**：**4 份"直跑演示"**（demo64 / hello_c / libctest_c / fbdemo）在挂卷之前跑 —— 字节从原始区取；
   真安装盘首次启动靠"原始区装进空卷"这条兜底（option b）；原始区上限 512 扇区 = **256 KiB**（当前 144,129 B）。
 
-**本版实读**（2026-10-04，`v0.4.3`）：能力项 **完成 80 / 部分 0 / 未做 0（共 80 项）**；
+**本版实读**（2026-10-04，`v0.4.4`）：能力项 **完成 85 / 部分 0 / 未做 0（共 85 项）**；
+`--full` 的 `TESTS` 列表 **78** 个脚本；`Get-ChildItem tests\*.py` 实数 **93 个脚本**；
+安装程序内核 `build64/kernel64.bin` **1,572,080 B**、系统内核 `build64/kernel64_os.bin` **3,390,944 B**
+（三层预算：内核区硬上限 **4,096,000 B** ∧ 余量 ≥ **640 KiB = 655,360 B** ∧ ≤ 基线 3,418,352 B + **22,288 B**；
+实测**余量 705,056 B**（扣预留 R 后还剩 49,696 B）、相对基线 **-27,408 B（净减）** —— **再涨 49,697 B 触发**）。
+`loader64.bin` **4,010 B**、`vimtu64-64.iso` **58,945,536 B**、`vimtu64-64.img` **8,328,192 B**（`Get-Item` 实读）。
+**版本串硬门禁**：`VIMTUOS_VERSION="0.4.4"` == 标签 == 镜像内嵌串（系统内核里 `0.4.4` 命中 **5** 次、`VimtuOS 0.4.4` **4** 次、
+终端串 `VimtuOS Terminal v0.4.4` **1** 次；旧串 `0.4.3` **0** 次；安装程序内核不含 `0.4.x` 字面量 —— settings/terminal 只编进系统内核）。
+本版构建产物上的真跑：`a42a64_test` **89/89**（三层预算全过）、`font64user_test` **65/65**、`dir64_test` **47/47**、
+`pipe64_test` **21/21**、`statfs64_test` **12/12**；`status_report.py` 汇总 **完成 85 / 部分 0 / 未做 0**（EXIT=0）。
+**上一版实读**（2026-10-04，`v0.4.3`）：能力项 **完成 80 / 部分 0 / 未做 0（共 80 项）**；
 `--full` 的 `TESTS` 列表 **74** 个脚本；`Get-ChildItem tests\*.py` 实数 **89 个脚本**；
 安装程序内核 `build64/kernel64.bin` **1,555,888 B**、系统内核 `build64/kernel64_os.bin` **3,374,784 B**
 （三层预算：内核区硬上限 **4,096,000 B** ∧ 余量 ≥ **640 KiB = 655,360 B** ∧ ≤ 基线 3,418,352 B + **22,288 B**；
@@ -550,7 +674,7 @@ full_pct=… mv=<dx>,<dy> cur=<x>,<y> sens=… tsc_mhz=…`。**灵敏度真缺�
 **版本串硬门禁**：`VIMTUOS_VERSION="0.4.3"` == 标签 == 镜像内嵌串（系统内核里 `0.4.3` 命中 **5** 次、`VimtuOS 0.4.3` **4** 次、
 终端串 `VimtuOS Terminal v0.4.3` **1** 次；旧串 `0.4.2-beta19` **0** 次；安装程序内核不含 `0.4.x` 字面量 —— settings/terminal 只编进系统内核）。
 
-**上一版实读**（2026-10-02，`v0.4.2-beta19`）：能力项 **完成 72 / 部分 0 / 未做 0（共 72 项）**；
+**更早一版实读**（2026-10-02，`v0.4.2-beta19`）：能力项 **完成 72 / 部分 0 / 未做 0（共 72 项）**；
 `--full` 的 `TESTS` 列表 **66** 个脚本；`Get-ChildItem tests\*.py` 实数 **78 个脚本**；
 安装程序内核 `build64/kernel64.bin` **1,552,880 B**、系统内核 `build64/kernel64_os.bin` **3,297,680 B**
 （三层预算：内核区硬上限 **4,096,000 B** ∧ 余量 ≥ **640 KiB = 655,360 B** ∧ ≤ 基线 3,418,352 B + **22,288 B**；
