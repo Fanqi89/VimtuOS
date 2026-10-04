@@ -453,7 +453,19 @@ def main():
         base = len(sess.log())
         sess.type_line("run /bin/busybox sh /tmp/bb/applets.sh", per_key=0.06)
         sess.wait_text("@@DONE", timeout=220, since=base)
-        time.sleep(2.0)
+        # ★ 本批：ash 的 waitforjob 走内核 wait4，而内核 wait4 是**有界 5 秒**（既有边界，
+        #   kernel/proc64.cpp），本内核装载一个 busybox applet（bbdrv 逐段拷贝 500KB）要数秒 ——
+        #   ash 会把 @@DONE 先打出来，前面几个 applet 的输出**还在路上**。所以这里轮询到
+        #   @@SED 段真的出现 DELTA（或超时）再取文本；不是放宽断言，是等证据到齐。
+        ap = ""
+        ap_deadline = time.time() + 180
+        while time.time() < ap_deadline:
+            ap = sess.text_since(base)
+            msed = marked(ap, "SED")
+            if msed is not None and "DELTA" in msed:
+                break
+            time.sleep(2.0)
+        time.sleep(1.0)
         ap = sess.text_since(base)
 
         m = marked(ap, "LS")
@@ -602,15 +614,61 @@ def main():
         sess.type_line("run /bin/busybox sh /tmp/bb/pipe.sh", per_key=0.06)
         sess.wait_text("@@", timeout=180, since=base)      # pipe.sh 用 [PIPE] 标记
         sess.wait_text("[PIPE] find", timeout=180, since=base)
-        time.sleep(4.0)
+        # ★ 本批：ash 的 waitforjob 走内核 wait4，而内核 wait4 是**有界 5 秒**（既有边界），
+        #   本内核装载一个 busybox applet（bbdrv 逐段拷贝 500KB）要数秒 —— 组合链的输出会迟于
+        #   [PIPE] find 标记到达，而且会被内核日志按 64B 分片打断。所以判据改成：
+        #   **按 [PIPE] 标记切段 + 只看用户态负载行**（跳过 '[' 行），轮询到该段的 wc -l 输出出现。
+        def pipe_section(text, tag):
+            seg, started = [], False
+            for ln in text.splitlines():
+                s = ln.rstrip("\r")
+                if not s.strip() or s.lstrip().startswith("["):
+                    continue
+                if s.startswith("[PIPE]"):
+                    if started:
+                        break
+                    started = s.startswith("[PIPE] " + tag)
+                    continue
+                if started:
+                    seg.append(s.strip())
+            return seg
+
+        # 组合链① 的 wc -l 输出"2"：负载行（跳过 '[' 行）里以 2 开头且后面不是数字；
+        # 窗口 = 从 `[PIPE] ls -l` 回显到 `[PIPE] find` 回显（chain① 的输出可能在标记之间落地，
+        # 也可能因为 ash 提前返回而晚到 —— 轮询到它出现为止）。
+        def chain1_ok(text):
+            w = text[text.find("[PIPE] ls -l"):]
+            k = w.find("[PIPE] find")
+            if k > 0:
+                w = w[:k]
+            hit2 = False
+            for ln in w.splitlines():
+                s = ln.rstrip("\r")
+                if not s.strip() or s.lstrip().startswith("["):
+                    continue
+                if re.match(r"^2(\D|$)", s.strip()):
+                    hit2 = True
+                    break
+            return hit2 and "hello.c" in w and "hello.lua" in w
+
+        t = ""
+        wc_deadline = time.time() + 300
+        while time.time() < wc_deadline:
+            t = sess.text_since(base)
+            if chain1_ok(t):
+                break
+            time.sleep(2.0)
+        time.sleep(1.0)
         t = sess.text_since(base)
         wc1 = marked(t.replace("[PIPE]", "@@"), "AFTER_WC")
         # ★ 修正（值错了，不是断言放宽）：/tcc/demo 里名字含 "hello" 的有**两条** —— hello.c 与
         #   hello.lua（tools/lua_pack_win.py 往 /tcc/demo 装 *.lua；宿主侧独立解析卷可复现，
         #   tests/pipe64_test.py 的宿主侧逐字节检查也是 b"2\n"）。原来写 1 是"/tcc/demo 只有 hello.c"
         #   那个旧快照的残留期望；blocking pipe 修好后整条链的输出不再丢，真值稳定为 2。
+        #   同段原始证据：grep 的输入（[FD64] pipe read 行）里必须同时出现 hello.c 与 hello.lua，
+        #   这才是"2 是两条而不是别的"的依据。
         H("组合链① ls -l /tcc/demo | grep hello | wc -l 的输出是 2（hello.c + hello.lua）",
-          re.search(r"\|\s*wc -l[^\n]*\n(?:[^\n]*\n){0,3}\s*2\s*\n", t) is not None, "")
+          chain1_ok(t), "")
         H("组合链② cat a | sed 's/x/y/' > b 后 cat b 得到 BETA", "BETA" in t)
         H("组合链③ find + head（实时枚举）", "hello.c" in t)
 
