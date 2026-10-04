@@ -202,6 +202,16 @@ static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
 //   （实测：`ld.lld: error: undefined symbol: hda64_ready64()`）。
 int hda64_ready64() __attribute__((weak));
 int hda64_play64(const int16_t* pcm, size_t frames) __attribute__((weak));
+// ★ P9：用户态网络栈的"原始帧收发"ABI（自有 int 0x80 号 53 net_raw）。语义/错误码/打点/宪法四
+//   条件对照的唯一权威 = kernel/netraw64.h（一页纸）+ 本文件头部的号段表。
+//   kernel/netraw64.cpp 只链进**系统内核**（build64.sh 的 SRCS_OS），安装介质内核不链它 ——
+//   所以这里与 hda64_*/wl64_* 同一套做法：**弱引用 + 判空**（符号为 0 -> 号 53 返回 -1 并打
+//   [SYSCALL] deny，绝不假装成功）。长度口径常量（NETRAW64_*）也来自这个头文件（唯一来源）。
+#include "netraw64.h"
+int64_t netraw64_tx64(uint64_t, uint64_t)   __attribute__((weak));
+int64_t netraw64_rx64(uint64_t, uint64_t)   __attribute__((weak));
+int64_t netraw64_mac64(uint64_t)            __attribute__((weak));
+int64_t netraw64_link64()                   __attribute__((weak));
 
 // task64.cpp 提供（安装程序内核不链接它 -> weak 引用后按"没有调度器"处理）
 extern "C" void     task_sleep_ms64(uint32_t ms) __attribute__((weak));
@@ -1893,6 +1903,72 @@ static int64_t sc64_audio_play64(uint64_t pcm_va, uint64_t frames, uint64_t fmt)
     return rc;
 }
 
+// ==================== ★ P9：原始帧收发 ABI（自有 int 0x80 号 53 net_raw）====================
+// 语义 / 错误码 / 打点格式 / 宪法四条件对照的唯一说明见 kernel/netraw64.h（一页纸）与
+// kernel/syscall64.h 的"net_raw（53）"段。本层只做三件事：
+//   ① op 合法性（0..3）-> 否则 -3 EINVAL + [SYSCALL] deny；
+//   ② **长度闸门**（用 netraw64.h 的 NETRAW64_* 常量：先夹住长度，再用它做范围校验 ——
+//      这样"超硬件口径"给的是 -6 EMSGSIZE，而不是被超大 len 拖去做无意义的整段页表检查，
+//      与 49 号"长度闸门先于范围校验"同款）；
+//   ③ 用户态缓冲的**范围校验**（user64_range_ok64：落在用户窗口内 + 已映射为用户页）-> 否则
+//      -2 EFAULT + [SYSCALL] deny，然后**转发**给 kernel/netraw64.cpp。
+// 内核**不做协议解析**：帧里是什么（ARP/IPv4/DHCP/DNS/TCP…）本层一个字节都不看 —— 那些策略
+// 全在 ring3 的 /bin/netd。安装内核里 netraw64_* 是弱符号 0 -> 返回 -1 + deny（不假装成功）。
+static int64_t sc64_net_raw64(uint64_t op, uint64_t a2, uint64_t a3) {
+    switch (op) {
+    case NETRAW64_OP_TX:                                        // tx(frame_va, len)
+        if (a3 < (uint64_t)NETRAW64_TX_MIN) {
+            syscall64_deny64(53, a3);
+            return NETRAW64_EINVAL;
+        }
+        if (a3 > (uint64_t)NETRAW64_MTU) {
+            syscall64_deny64(53, a3);
+            return NETRAW64_EMSGSIZE;
+        }
+        if (!user64_range_ok64(a2, a3)) {
+            syscall64_deny64(53, a2);
+            return NETRAW64_EFAULT;
+        }
+        break;
+    case NETRAW64_OP_RX:                                        // rx(buf_va, cap)
+        if (a3 < (uint64_t)NETRAW64_RX_MIN) {
+            syscall64_deny64(53, a3);
+            return NETRAW64_EINVAL;
+        }
+        if (a3 > (uint64_t)NETRAW64_RX_MAX) {
+            syscall64_deny64(53, a3);
+            return NETRAW64_EMSGSIZE;
+        }
+        if (!user64_range_ok64(a2, a3)) {
+            syscall64_deny64(53, a2);
+            return NETRAW64_EFAULT;
+        }
+        break;
+    case NETRAW64_OP_MAC:                                       // mac(out_va)
+        if (!user64_range_ok64(a2, 6)) {
+            syscall64_deny64(53, a2);
+            return NETRAW64_EFAULT;
+        }
+        break;
+    case NETRAW64_OP_LINK:                                      // link()
+        break;
+    default:                                                    // 未知 op
+        syscall64_deny64(53, op);
+        return NETRAW64_EINVAL;
+    }
+    if (netraw64_tx64 == nullptr) {                             // 安装内核：没有这一路
+        syscall64_deny64(53, op);
+        return -1;
+    }
+    switch (op) {
+    case NETRAW64_OP_TX:   return netraw64_tx64(a2, a3);
+    case NETRAW64_OP_RX:   return netraw64_rx64(a2, a3);
+    case NETRAW64_OP_MAC:  return netraw64_mac64(a2);
+    default:               return netraw64_link64();
+    }
+}
+
+
 // ==================== ★ 本批：目录枚举 ABI（自有 int 0x80 号 50/51/52）====================
 // 语义 / 记录布局 / 错误码 / 回收承诺的唯一说明见 kernel/syscall64.h 的"目录枚举 ABI（50/51/52）"段。
 // 这里只做**校验 + 转发**：每一个调用都转给 kernel/fd64.cpp 的既有**每进程目录 fd**
@@ -2386,6 +2462,13 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
 
     case 52:                                                    // dir_close(fd)
         ret = sc64_dir_close64(a1);
+        break;
+
+    // ★ P9：原始帧收发 ABI（自有 int 0x80 号 53 net_raw）。语义/错误码/打点：kernel/netraw64.h。
+    //   本号**不是 enosys 号**：它做校验 + 转发给 e1000 既有的收发（内核里没有协议解析；
+    //   DHCP/DNS/UDP/TCP/ARP 全在 ring3 的 /bin/netd）。安装内核里弱符号为 0 -> -1 + deny。
+    case 53:                                                    // net_raw(op, arg1, arg2)
+        ret = sc64_net_raw64(a1, a2, a3);
         break;
 
     default:

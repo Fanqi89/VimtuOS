@@ -138,6 +138,30 @@
 //   ★ 打点（自动验收 tests/sounds64_test.py grep，格式勿改；两条各 64 行上限防刷屏）：
 //     [SND64] play va=0x<hex> frames=<n> fmt=0x<hex> rc=<带符号整数>
 //     [SND64] deny reason=<bad-fmt|bad-frames|bad-buf|no-driver|stream-busy|stream-timeout> err=<n>
+//   ==================== ★ P9：原始帧收发 ABI（号 53 net_raw）====================
+//   目标：把 DHCP / DNS / UDP / TCP **全部做在 ring3** —— 内核只补一条"能收发一整帧以太网帧"
+//   的最小 ABI（用户态所必需的 ABI 补齐），**没有任何协议解析**。落点 = kernel/netraw64.{h,cpp}
+//   （只链进系统内核；安装内核里弱符号为 0 -> 返回 -1 并打 [SYSCALL] deny）。
+//   53 net_raw(op, arg1, arg2)
+//     rdi = op     0 = tx / 1 = rx / 2 = mac / 3 = link
+//     op=0 tx(frame_va, len)  发**一整帧**（不含 FCS；14 <= len <= 1514）-> 0 = 已交给硬件
+//     op=1 rx(buf_va, cap)    取**一帧**（**非阻塞**；14 <= cap <= 2048）
+//                             -> >0 = 拷贝到用户缓冲的字节数；-4 EAGAIN = 暂时没有帧
+//     op=2 mac(out_va)        写 6 字节 MAC 到用户缓冲 -> 0
+//     op=3 link()             链路查询（不给缓冲）-> 1 = up / 0 = down
+//   错误码（自有 ABI 的**小负数码**，与 48/49 同一张表）：-1 EPERM（保留/未使用）、
+//     -2 EFAULT（用户缓冲越界/未映射）、-3 EINVAL（op 未知 / tx len < 14 / rx cap < 14）、
+//     -4 EAGAIN（rx 无帧；tx 描述符有界等待超时）、-5 ENODEV（没有可用网卡）、
+//     -6 EMSGSIZE（tx len > 1514 / rx cap > 2048）。
+//   校验顺序 = 判错顺序：op -> 长度闸门 -> 用户缓冲范围 -> 网卡 -> 转发给 e1000 既有的收发。
+//   内核**不做**：ARP 应答、IP/ICMP/UDP/TCP 解析、过滤/路由/NAT、帧缓存、协议识别 ——
+//   那些全是 ring3 的策略（交付 = 系统卷里的 /bin/netd；内核里搜不到它的字节）。
+//   ★ 打点（自动验收 tests/netuser64_test.py grep，格式勿改；tx/rx 各 32 行上限防刷屏）：
+//     [NETRAW] tx bytes=<n> ok=<0|1> err=<signed> frames=<n>
+//     [NETRAW] rx bytes=<n> frames=<n>              （只在真收到帧时打；无帧不打，见 netraw64.h）
+//     [NETRAW] mac=<aa:bb:cc:dd:ee:ff> link=<up|down>
+//     [NETRAW] deny op=<n> reason=<bad-op|short|oversize|bad-buf|no-nic|tx-timeout> err=<n>
+//     [NETRAW] log cap reached tx=<n> rx=<n>
 //
 // ============================ 入口 2：syscall 指令（Linux x86_64 ABI）============================
 //   寄存器约定与 Linux 完全一致：rax = 调用号；rdi/rsi/rdx/r10/r8/r9 = 参数 1..6；
@@ -281,6 +305,27 @@ static const uint32_t DIR64_KIND_DIR64  = 2u;
 static const uint32_t DIR64_ENT_HDR64   = 12u;   // Dir64Ent64 的定长头字节数（name 从 +12 起）
 static const uint32_t DIR64_BUF_MIN64   = 64u;   // dir_read 接收的最小缓冲（够放下一条最长记录）
 static const uint32_t DIR64_ENT_MAX64   = 12u + 31u + 1u;   // 一条记录的最大字节数（名字上限 31）
+// ==================== ★ P9：net_raw（自有 ABI 53）============================
+// 语义 / 错误码 / 打点格式 / 宪法四条件对照的**唯一权威** = kernel/netraw64.h（一页纸）；
+// 这里是常量别名（号 + 错误码 + 长度口径"二次来源"），内核侧实现点 =
+//   * kernel/syscall64.cpp 的 sc64_net_raw64（op 校验 + 长度闸门 + 用户缓冲范围校验 + 转发）；
+//   * kernel/netraw64.cpp（长度/网卡校验 -> e1000_64 既有的 e1000_send64/e1000_recv64 + [NETRAW] 打点）。
+// ★ 它**不是 enosys 号**：安装内核里 netraw64_* 是弱符号 0 -> 返回 -1 并打 [SYSCALL] deny。
+static const uint64_t SYSCALL64_NETRAW_NR64 = 53;
+static const uint64_t NETRAW64_OP_TX64      = 0;   // tx(frame_va, len)
+static const uint64_t NETRAW64_OP_RX64      = 1;   // rx(buf_va, cap)：非阻塞
+static const uint64_t NETRAW64_OP_MAC64     = 2;   // mac(out_va)：写 6 字节
+static const uint64_t NETRAW64_OP_LINK64    = 3;   // link()：1 = up / 0 = down
+static const int64_t  NETRAW64_EPERM64    = -1;    // 保留（本号未使用）
+static const int64_t  NETRAW64_EFAULT64   = -2;    // 用户缓冲越界/未映射
+static const int64_t  NETRAW64_EINVAL64   = -3;    // op 未知 / tx len < 14 / rx cap < 14
+static const int64_t  NETRAW64_EAGAIN64   = -4;    // rx 无帧 / tx 描述符有界等待超时
+static const int64_t  NETRAW64_ENODEV64   = -5;    // 没有可用网卡
+static const int64_t  NETRAW64_EMSGSIZE64 = -6;    // tx len > 1514 / rx cap > 2048
+static const uint64_t NETRAW64_TX_MIN64   = 14;    // 以太网头
+static const uint64_t NETRAW64_MTU64      = 1514;  // 不含 FCS 的最大帧
+static const uint64_t NETRAW64_RX_MIN64   = 14;
+static const uint64_t NETRAW64_RX_MAX64   = 2048;  // e1000 单个 RX 缓冲
 // ==================== ★ 本批：Linux 号段 72 / 137 / 138（fcntl + statfs）====================
 // 这三个号是 **Linux x86_64 ABI**（syscall 指令路径），不是自有 int 0x80 号段。
 //   * 72 fcntl(fd, cmd, arg)：F_GETFL(3)/F_SETFL(4)（只认 O_NONBLOCK/O_APPEND）、F_GETFD(1)/F_SETFD(2)
