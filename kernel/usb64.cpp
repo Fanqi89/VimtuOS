@@ -39,18 +39,21 @@
 //      （USB64_BULK_TIMEOUT_MS = 600ms），超时/出错一律 abort 整条链，绝不挂死。
 //    * 一个 QH 同一时刻只能挂一条链 —— 所以传输期间中断 TD 不在队列上，传完立刻重新武装；
 //      传输与 kusb 的 poll 用自旋锁互斥（poll 是 try-lock，拿不到就下次再来，绝不阻塞）。
-//    * SCSI：INQUIRY / TEST UNIT READY / REQUEST SENSE / READ CAPACITY(10) / READ(10)；
-//      **只读**：没有 WRITE(10)（上层 ata64_write 对 USB 驱动器号直接返回失败并打点）。
-//    * 驱动器号接入见 kernel/ata64.h 的 ATA64_USB_BASE（24）：识别/读走本模块，
-//      上层（part64/drive64/vfs64/fs64/fat64/explorer64）一行都不用改。
+//    * SCSI：INQUIRY / TEST UNIT READY / REQUEST SENSE / READ CAPACITY(10) / READ(10) /
+//      ★ P8：WRITE(10) —— 同一套 BOT 语义（CBW 恒 DATA0、CSW 恒 DATA1、dCSWDataResidue != 0 = 失败）。
+//      ★ P8 的写路径**必须**在 usb64_msc_write64() 里做**写后读回校验**（同一 LBA 段读回逐字节比对），
+//      装不完整/读回不一致 -> 明确失败（绝不静默）；越界 LBA（lba + count > blocks）**在发命令前**拒绝。
+//    * 驱动器号接入见 kernel/ata64.h 的 ATA64_USB_BASE（24）：识别/读/★写走本模块，
 //
 // 没验证到的点（如实记录，见文件末）：
 //   * 低速（low-speed）设备：代码里按 PORTSC.LSDA 支持（TD 状态 LS 位 + 端口不使能时
 //     仍可枚举），但 QEMU 的 usb-kbd 是全速设备，**低速路径没有实机/仿真验证**。
 //   * 只识别**直接插在根端口**上的设备（没有 hub/地址分配多设备；最多 2 台：1 键盘 + 1 U 盘）。
-//   * 没做：EHCI(USB 2.0)/xHCI(USB 3.x) 主控、USB 鼠标、集线器、拔出检测（热插拔）、
-//     U 盘上的分区表解析（分区表由上层 part64/drive64 读，本模块只提供"按扇区读"）、
-//     块大小 ≠ 512 的盘（如实拒绝：打点后不暴露成块设备）、USB 存储的写。
+//   * 没做：EHCI(USB 2.0)/xHCI(USB 3.x) 主控、USB 鼠标、集线器、
+//     U 盘上的分区表解析（分区表由上层 part64/drive64 读，本模块只提供"按扇区读/写"）、
+//     块大小 ≠ 512 的盘（如实拒绝：打点后不暴露成块设备）、U 盘上的**新建/删除/格式化**（P8 只做覆盖写）。
+//  ★ P8（热插拔）：usb64_poll64() 每轮读 PORTSC 的 CCS/CSC —— 插入/拔出各打一行
+//     [USBST] attached/detached port=<n>，并由本文件触发盘符重扫（drive64_scan64 + explorer64_rescan64）。
 // ======================================================================
 #include "usb64.h"
 #include "port.h"        // inb/inw/inl + outb/outw/outl（32 位端口读写这里已有，不用另加内联汇编）
@@ -930,10 +933,12 @@ struct Usb64Msc64 {
     uint32_t csw_residue;      // dCSWDataResidue（应为 0；!= 0 = 数据阶段没搬完 -> 当失败）
     uint32_t dbg_data_got;     // 最近一次数据阶段实际搬到的字节数（诊断/排障）
     uint32_t tag;              // CBW/CSW 配对的 Tag（自增）
-    uint32_t blocks;           // 块数（= READ CAPACITY(10) 的"最后一个 LBA + 1"）
+    uint32_t blocks;           // 块数（= READ CAPACITY(10) 的“最后一个 LBA + 1”）
     uint32_t block_size;
     uint8_t  csw_status;       // 最近一次 CSW 状态字节
     uint32_t reads_ok, reads_fail;
+    uint32_t writes_ok, writes_fail;         // ★ P8：WRITE(10) 成功/失败计数
+    uint32_t wverify_ok, wverify_fail;       // ★ P8：写后读回校验（同一 LBA 段逐字节比对）
     int      last_reason;      // 见 usb64_msc_last_reason64()
     char     vendor[9];        // INQUIRY 的厂商（8 字节 + NUL）
     char     product[17];      // INQUIRY 的型号（16 字节 + NUL）
@@ -943,9 +948,11 @@ struct Usb64Msc64 {
 static Usb64Msc64 g_msc;
 static uint32_t   g_usbst_read_logs = 0;      // 成功读的打点上限（防刷屏；失败另有上限）
 static uint32_t   g_usbst_fail_logs = 0;
+static uint32_t   g_usbst_wlogs = 0;          // ★ P8：成功写的打点上限（含写后读回校验，共用同一上限）
+static uint32_t   g_usbst_wfail_logs = 0;     // ★ P8：写失败/越界的打点上限
 #define USBST_READ_LOG_MAX 128u
 #define USBST_FAIL_LOG_MAX 64u
-
+#define USBST_WRITE_LOG_MAX 64u
 static uint32_t msc_rd32be(const uint8_t* p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
@@ -1168,6 +1175,57 @@ static int usb_msc_read10_64(uint32_t lba, uint16_t count, uint8_t* buf) {
     }
     return 0;
 }
+// WRITE(10)(0x2A)：lba(4, 大端) @2..5、传输块数(2, 大端) @7..8；数据 = count × 512 字节（**主机 -> 设备**）。
+// BOT 语义与 READ(10) 完全同构（CBW 恒 DATA0、数据阶段从 DATA0 起逐包翻转、CSW 恒 DATA1；
+// CSW 状态 != 0 与 dCSWDataResidue != 0 都由 usb_bot64 统一判成失败 —— 与读同一条代码）。
+// 打点：[USBST] write lba=<n> count=<n> ok / [USBST] write FAILED lba=<n> count=<n> reason=<...>
+static int usb_msc_write10_64(uint32_t lba, uint16_t count, const uint8_t* buf) {
+    uint8_t cdb[16];
+    for (int i = 0; i < 16; i++) cdb[i] = 0;
+    cdb[0] = 0x2A;                                     // WRITE(10)
+    cdb[2] = (uint8_t)(lba >> 24); cdb[3] = (uint8_t)(lba >> 16);
+    cdb[4] = (uint8_t)(lba >> 8);  cdb[5] = (uint8_t)lba;
+    msc_wr16be(cdb + 7, count);
+    const uint32_t bytes = (uint32_t)count * 512u;
+    // usb_bot64 的 data 形参是 uint8_t*（OUT 阶段只**读**它，不写）—— 这里显式去掉 const，语义不变
+    const int r = usb_bot64(cdb, 10, false, bytes, (uint8_t*)(uintptr_t)buf);
+    if (r != 0) {
+        g_msc.writes_fail++;
+        if (g_usbst_wfail_logs < USBST_FAIL_LOG_MAX) {
+            g_usbst_wfail_logs++;
+            usb_log_begin();
+            dbg64_str("[USBST] write FAILED lba=");
+            dbg64_dec((uint64_t)lba);
+            dbg64_str(" count=");
+            dbg64_dec((uint64_t)count);
+            dbg64_str(" reason=");
+            dbg64_str(r > 0 ? "csw status" : usb_xfer_reason(r));
+            if (r > 0) {
+                dbg64_str(" csw=");
+                dbg64_dec((uint64_t)g_msc.csw_status);
+            }
+            dbg64_str(" residue=");
+            dbg64_dec((uint64_t)g_msc.csw_residue);
+            dbg64_str(" dir=out");
+            usb_log_end();
+            if (r > 0) usb_msc_log_sense64("write10");
+        }
+        return -1;
+    }
+    g_msc.writes_ok++;
+    if (g_usbst_wlogs < USBST_WRITE_LOG_MAX) {
+        g_usbst_wlogs++;
+        usb_log_begin();
+        dbg64_str("[USBST] write lba=");
+        dbg64_dec((uint64_t)lba);
+        dbg64_str(" count=");
+        dbg64_dec((uint64_t)count);
+        dbg64_str(" ok");
+        usb_log_end();
+    }
+    return 0;
+}
+
 // ==================== 枚举（一台设备）====================
 // 流程与改动前一致，只是从"只做第一台设备"变成"每台设备各做一遍"：
 //   GET_DESCRIPTOR(Device,8) -> SET_ADDRESS(addr) -> GET_DESCRIPTOR(Device,18)
@@ -1357,6 +1415,7 @@ static int usb_enum_port(int port_idx, uint8_t addr, bool low_speed) {
 //   bit1(2)  INQUIRY 失败          bit2(4)  READ CAPACITY 失败
 //   bit3(8)  TEST UNIT READY 失败  bit4(16) 块大小不是 512（本批只支持 512，如实拒绝）
 //   bit5(32) READ(10) LBA 0 失败   bit6(64) LBA 0 读回**全 0**（可疑：通路可能读到空数据）
+//   ★ P8 bit7(128) 越界/超容量写的**边界探针**没按预期被拒（写路径的守卫坏了才置位）
 static void usb_msc_probe() {
     uint32_t mask = 0;
     if (!g_msc.present) {
@@ -1405,6 +1464,24 @@ static void usb_msc_probe() {
             for (uint32_t i = 0; i < 512u; i++) if (g_msc_sec[i] != 0) { all0 = false; break; }
             if (all0) mask |= 64u;
         }
+    }
+
+    // ---- 5) ★ P8：越界/超容量写的**边界探针**（明确失败，且**不碰介质**）----
+    //   为什么放在这里：这两次调用走的是**与上层写完全同一条** usb64_msc_write64()（同一份范围判定），
+    //   但 lba 落在盘外，函数在发任何 SCSI 命令之前就返回 false —— 不写介质、不改盘上任何字节。
+    //   打点给自动验收 grep：[USBST] write-bounds probe …
+    if (mask == 0) {
+        const bool r1 = usb64_msc_write64(0, g_msc.blocks, 1, g_msc_sec);              // 第一个越界 LBA
+        const bool r2 = usb64_msc_write64(0, g_msc.blocks - 1u, 2u, g_msc_sec);        // 末扇区 + 1 = 超容量
+        usb_log_begin();
+        dbg64_str("[USBST] write-bounds probe blocks=");
+        dbg64_dec((uint64_t)g_msc.blocks);
+        dbg64_str(" lba=blocks rejected=");
+        dbg64_dec(r1 ? 0u : 1u);
+        dbg64_str(" lba=blocks-1 count=2 rejected=");
+        dbg64_dec(r2 ? 0u : 1u);
+        usb_log_end();
+        if (r1 || !r2) mask |= 128u;                                                    // 守卫坏了
     }
 
     // ★ supported = 探测全过：探测没过的盘**不暴露成块设备**（宁可如实说"没盘"，
@@ -1695,6 +1772,98 @@ bool usb64_msc_read64(int idx, uint32_t lba, uint32_t count, void* buf) {
         uint32_t n = count - done;
         if (n > USB64_MSC_MAX_SECTORS) n = USB64_MSC_MAX_SECTORS;
         if (usb_msc_read10_64(lba + done, (uint16_t)n, p) != 0) return false;
+        done += n;
+        p += n * 512u;
+    }
+    return true;
+}
+
+// ★ P8：按 512B 扇区**写**（ata64 的语义；一条 BOT 命令最多 8 扇区，多了自动分块）。两重把关：
+//   1) **越界/超容量先拒绝**：lba + count > blocks（READ CAPACITY(10) 报的总扇区数）在**发任何 SCSI
+//      命令之前**就返回 false 并打点（reason=range）—— 越界写碰不到介质，上层拿到的是明确的失败；
+//   2) **写后读回校验**：每一块写完立刻 READ(10) 回同一个 LBA 段，逐字节比对（memcmp_64）。
+//      不一致 -> 打 [USBST] write verify FAILED（首个不同字节的下标 + want/got）并返回 false。
+// 缓冲区（buf）必须恒等映射（与 read 同要求），长度 = count × 512。
+bool usb64_msc_write64(int idx, uint32_t lba, uint32_t count, const void* buf) {
+    if (idx != 0 || !g_msc.present || !g_msc.supported) return false;
+    if (count == 0) return true;
+    if (!buf) return false;
+    const uint8_t* p = (const uint8_t*)buf;
+    if (g_msc.block_size != 512u) {
+        usb_log_begin();
+        dbg64_str("[USBST] write FAILED reason=block-size (only 512B blocks are supported)");
+        usb_log_end();
+        g_msc.writes_fail++;
+        return false;
+    }
+    // ---- 1) 越界/超容量：先拒绝（不发命令、不碰介质）----
+    if (lba > g_msc.blocks || count > g_msc.blocks - lba) {
+        g_msc.writes_fail++;
+        if (g_usbst_wfail_logs < USBST_FAIL_LOG_MAX) {
+            g_usbst_wfail_logs++;
+            usb_log_begin();
+            dbg64_str("[USBST] write FAILED lba=");
+            dbg64_dec((uint64_t)lba);
+            dbg64_str(" count=");
+            dbg64_dec((uint64_t)count);
+            dbg64_str(" reason=range (out of capacity blocks=");
+            dbg64_dec((uint64_t)g_msc.blocks);
+            dbg64_str(")");
+            usb_log_end();
+        }
+        return false;
+    }
+    // ---- 2) 分块写 + 写后读回校验（同一 LBA 段逐字节比对）----
+    for (uint32_t done = 0; done < count; ) {
+        uint32_t n = count - done;
+        if (n > USB64_MSC_MAX_SECTORS) n = USB64_MSC_MAX_SECTORS;
+        if (usb_msc_write10_64(lba + done, (uint16_t)n, p) != 0) return false;
+        if (!g_bounce_page || usb_pa32(g_bounce_page) == 0) {          // 读回缓冲必须能 DMA
+            usb_log_begin();
+            dbg64_str("[USBST] write verify FAILED reason=no-verify-buffer");
+            usb_log_end();
+            g_msc.wverify_fail++;
+            return false;
+        }
+        if (usb_msc_read10_64(lba + done, (uint16_t)n, g_bounce_page) != 0) {
+            usb_log_begin();
+            dbg64_str("[USBST] write verify FAILED lba=");
+            dbg64_dec((uint64_t)(lba + done));
+            dbg64_str(" reason=readback");
+            usb_log_end();
+            g_msc.wverify_fail++;
+            return false;
+        }
+        const uint32_t nb = n * 512u;
+        if (memcmp_64(g_bounce_page, p, nb) != 0) {
+            uint32_t bad = 0;
+            while (bad < nb && g_bounce_page[bad] == p[bad]) bad++;
+            g_msc.wverify_fail++;
+            usb_log_begin();
+            dbg64_str("[USBST] write verify FAILED lba=");
+            dbg64_dec((uint64_t)(lba + done));
+            dbg64_str(" count=");
+            dbg64_dec((uint64_t)n);
+            dbg64_str(" at=");
+            dbg64_dec((uint64_t)bad);
+            dbg64_str(" want=");
+            usb_hex((uint32_t)p[bad], 2);
+            dbg64_str(" got=");
+            usb_hex((uint32_t)g_bounce_page[bad], 2);
+            usb_log_end();
+            return false;
+        }
+        g_msc.wverify_ok++;
+        if (g_usbst_wlogs < USBST_WRITE_LOG_MAX) {
+            g_usbst_wlogs++;
+            usb_log_begin();
+            dbg64_str("[USBST] write verify lba=");
+            dbg64_dec((uint64_t)(lba + done));
+            dbg64_str(" count=");
+            dbg64_dec((uint64_t)n);
+            dbg64_str(" ok (read back, byte-for-byte)");
+            usb_log_end();
+        }
         done += n;
         p += n * 512u;
     }

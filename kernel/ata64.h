@@ -17,7 +17,7 @@
 //   8..(8+N-1)    = AHCI 上第 1..N 块 **ATA 盘**（N = ahci64_count64()；AHCI 端口按端口号升序编号）
 //   4..7          = 保留空洞（不映射任何设备）—— 旧代码里的"0..3 循环"必须改成下面的槽位接口
 //   16..(16+M-1)  = NVMe 第 1..M 个**命名空间**（M = nvme64_count64()；见 kernel/nvme64.h）
-//   24..          = ★ 批次 O：USB 存储（U 盘，最多 1 个，Bulk-Only Transport + SCSI **只读**）
+//   24..          = ★ 批次 O：USB 存储（U 盘，最多 1 个，Bulk-Only Transport + SCSI；★ P8：**可写（覆盖写）**）
 // 上层（setup64 / part64 / vfs64 / store64 / drive64 / fs64 / fat64）拿到的驱动器号就是上面这套编号，
 // 读写/识别全部由本文件的 ata64_* 内部**分派**：≥ ATA64_USB_BASE 转 usb64_*，
 // ≥ ATA64_NVME_BASE 转 nvme64_*，≥ ATA64_AHCI_BASE 转 ahci64_*，其余走 PATA。
@@ -53,11 +53,14 @@ bool ata64_identify(int drive, DiskInfo* out);
 // 读写：PATA 侧 LBA28、count **任意**（内部按 ≤128 扇区分块 + 每块最多 3 次重试 —— ATA 的
 //   扇区计数寄存器只有 8 位，一条命令 >255 个扇区会被设备静默截断；见 ata64.cpp 的总说明）；
 //   AHCI 侧 LBA48、count ≤ 65536（按 128 扇区分块）；NVMe 侧 count 任意（按 128 扇区分块）。
-//   驱动器号分派：≥ ATA64_USB_BASE 走 usb64_msc_*（**只读**）、≥ ATA64_NVME_BASE 走 nvme64_*、
-//   ≥ ATA64_AHCI_BASE 走 ahci64_*。返回 false 表示出错。
+//   驱动器号分派：≥ ATA64_USB_BASE 走 usb64_msc_*/xhci64_msc_*（★ P8：UHCI 侧**可写**；
+//   xHCI 侧仍只读，如实拒绝并打点）、≥ ATA64_NVME_BASE 走 nvme64_*、≥ ATA64_AHCI_BASE 走 ahci64_*。
+//   返回 false 表示出错。
 bool ata64_read (int drive, uint32_t lba, uint32_t count, void* buf);
-// ★ 批次 O：USB 存储**本批只读** —— ata64_write() 对 USB 驱动器号**直接返回 false** 并打点
-//   （不假装成功：否则上层会以为文件写进去了）。
+// ★ 批次 O / ★ P8：USB 存储写入 —— 驱动器号 24.. 先看 UHCI（usb64）+ xHCI（xhci64）两段：
+//   * UHCI 段的 U 盘 -> usb64_msc_write64()（**真写**：WRITE(10) + 写后读回校验 + 越界拒绝）；
+//   * xHCI 段的 U 盘 -> 本批**仍只读**：直接返回 false 并打点（绝不假装成功）。
+//   非 USB 驱动器号走原来的 PATA/AHCI/NVMe 写路径（**一行都没改**，见函数体）。
 bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf);
 
 

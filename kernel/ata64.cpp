@@ -431,13 +431,47 @@ static bool ata_pio_write_once(int drive, uint32_t lba, uint32_t count, const vo
 }
 
 // WRITE 对外入口：分派 + 分块 + 每块重试（语义与改动前一致；>128 扇区不再被 8 位寄存器截断）
-// ★ 批次 O：USB 存储**本批只读** —— 驱动器号 24.. 一律**直接失败**并打点，绝不假装成功
-//   （否则上层会以为文件真的写进了 U 盘：FAT 卷本来也是只读的，这里再兜一层）。
+// ★ 批次 O / ★ P8：驱动器号 24.. 先按 UHCI（usb64）+ xHCI（xhci64）两段分派：
+//   * UHCI 段的 U 盘 -> usb64_msc_write64()（**真写**：BOT + WRITE(10) + 写后读回校验 + 越界拒绝）；
+//   * xHCI 段的 U 盘 -> 本批仍只读：直接返回 false 并打点（绝不假装成功）。
+//   非 USB 驱动器号：**原样**走 NVMe/AHCI/PATA 三条既有写路径（一行都没改）。
 bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf) {
 #ifdef ATA64_HAVE_USB64
+static uint32_t g_ata_usb_wlogs = 0;                 // [USBST] write drive=.. 成功行的打点上限（防刷屏）
     if (drive >= ATA64_USB_BASE) {
+        const int k = drive - ATA64_USB_BASE;
+        const int u = usb64_msc_count64();
+        if (k < u) {
+            const bool ok = usb64_msc_write64(k, lba, count, buf);
+            if (!ok) {
+                dbg64_line_begin64();
+                dbg64_str("[USBST] write FAILED drive=");
+                dbg64_dec((uint64_t)drive);
+                dbg64_str(" lba=");
+                dbg64_dec((uint64_t)lba);
+                dbg64_str(" count=");
+                dbg64_dec((uint64_t)count);
+                dbg64_str(" reason=");
+                dbg64_str(usb64_msc_last_reason64());
+                dbg64_nl();
+                dbg64_line_end64();
+            } else if (g_ata_usb_wlogs < 32u) {
+                g_ata_usb_wlogs++;
+                dbg64_line_begin64();
+                dbg64_str("[USBST] write drive=");
+                dbg64_dec((uint64_t)drive);
+                dbg64_str(" lba=");
+                dbg64_dec((uint64_t)lba);
+                dbg64_str(" count=");
+                dbg64_dec((uint64_t)count);
+                dbg64_str(" ok (UHCI BOT, verified)");
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+            return ok;
+        }
         dbg64_line_begin64();
-        dbg64_str("[USBST] write refused (USB storage is read-only in this batch) drive=");
+        dbg64_str("[USBST] write refused (xHCI storage is read-only in this batch) drive=");
         dbg64_dec((uint64_t)drive);
         dbg64_str(" lba=");
         dbg64_dec((uint64_t)lba);

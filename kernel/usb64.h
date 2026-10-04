@@ -1,4 +1,4 @@
-// usb64.h - USB 主机（UHCI / USB 1.1）+ HID 引导键盘 + **USB 存储（U 盘，只读）**
+// usb64.h - USB 主机（UHCI / USB 1.1）+ HID 引导键盘 + **USB 存储（U 盘，★ P8：可写）**
 //
 // 范围（这一版做了什么、没做什么，写清楚免得误会）：
 //   * 只驱动 **UHCI**（Intel 的 USB 1.1 主控）：PCI vendor=8086，device 见 usb64.cpp；
@@ -13,8 +13,9 @@
 //     input.cpp 的 kbd_inject_scancode()（同一套环形队列 + 修饰键 + WIN 键标志 +
 //     Ctrl+Shift+Esc 热键）。桌面外壳（gui64.cpp）一行都不用改。
 //   * USB 存储走 **BOT（Bulk-Only Transport）+ SCSI 子集**：INQUIRY / TEST UNIT READY /
-//     REQUEST SENSE / READ CAPACITY(10) / READ(10)。**本批只读**：没有 WRITE(10)、没有
-//     分区表解析、没有拔出检测（热插拔）。驱动器号接入见 kernel/ata64.h 的 ATA64_USB_BASE。
+//     REQUEST SENSE / READ CAPACITY(10) / READ(10) + **★ P8 WRITE(10)**（写后读回校验、
+//     越界/超容量在发命令前就拒绝；盘符接入见 kernel/ata64.h 的 ATA64_USB_BASE）。
+//     没做：分区表解析、新建/删除目录项、格式化。
 //
 // 串口打点（自动验收 tests/usb64_test.py / tests/usbstorage_test.py 靠这些行判定，
 // 改格式要同步改脚本）：
@@ -36,8 +37,12 @@
 //   [USBST] read lba=<n> count=<n> ok
 //   [USBST] read FAILED lba=<n> reason=<csw status|timeout|nak|block-size|no-device>
 //   [USBST] selftest PASS mask=0 | selftest FAIL mask=<n> | selftest skipped (no storage device)
-//   [USBST] write refused (USB storage is read-only in this batch) ...     （见 kernel/ata64.cpp）
-//   未做（如实）：拔出检测 "[USBST] detached" —— 本批没有热插拔/拔出检测。
+//   [USBST] write lba=<n> count=<n> ok
+//   [USBST] write verify lba=<n> count=<n> ok (read back, byte-for-byte)     （写后读回校验）
+//   [USBST] write FAILED lba=<n> count=<n> reason=<csw status|timeout|nak|range|block-size>[ …]
+//   [USBST] write verify FAILED lba=<n> count=<n> at=<字节> want=<hex> got=<hex>
+//   [USBST] write-bounds probe blocks=<n> lba=blocks rejected=1 lba=blocks-1 count=2 rejected=1
+//   [USBST] attached port=<n> / [USBST] detached port=<n>                     （★ P8 热插拔）
 #pragma once
 #include <stdint.h>
 
@@ -57,16 +62,22 @@ int usb64_selftest64();
 // 人类可读状态：init / not found / no device / enum failed / ready
 const char* usb64_state_str64();
 
-// ---- USB 存储（U 盘）：Bulk-Only Transport + SCSI 只读 ----
+// ---- USB 存储（U 盘）：Bulk-Only Transport + SCSI 读 + ★ P8 写 ----
 // 语义（如实）：
-//   * usb64_msc_count64() = 检测到的 USB 存储设备数（本批 0 或 1）；
+//   * usb64_msc_count64() = 检测到的 USB 存储设备数（最多 1）；
 //   * 每个"块" = READ CAPACITY(10) 报的 block_size，**只支持 512**（其它值如实拒绝，
 //     设备仍然枚举/打点，但不会暴露成块设备）；
-//   * usb64_msc_read64() 的 lba/count 单位是 **512 字节扇区**（= ata64 的语义），
-//     缓冲区必须恒等映射（内核 .bss/.data 或 page_alloc_64 的页）—— DMA 直接用它的物理地址。
+//   * usb64_msc_read64() / ★ usb64_msc_write64() 的 lba/count 单位是 **512 字节扇区**
+//     （= ata64 的语义），缓冲区必须恒等映射（内核 .bss/.data 或 page_alloc_64 的页）。
+//   * ★ P8 写路径的两条硬规则：
+//       1) **越界/超容量**（lba + count > blocks）在**发任何 SCSI 命令之前**就返回 false
+//          （打点 reason=range）—— 越界写碰不到介质；
+//       2) **写后读回校验**：每块（≤ 8 扇区）写完立刻 READ(10) 回同一 LBA 段、逐字节比对；
+//          不一致或读回失败都返回 false 并打点（[USBST] write verify FAILED …）。
 int  usb64_msc_count64();
 bool usb64_msc_info64(int idx, char* model, int model_cap, uint64_t* sectors_512);
 bool usb64_msc_read64(int idx, uint32_t lba, uint32_t count, void* buf);
+bool usb64_msc_write64(int idx, uint32_t lba, uint32_t count, const void* buf);   // ★ P8
 int  usb64_msc_selftest64();                 // 0 = 全过（没插 U 盘时也是 0 = 跳过）
 const char* usb64_msc_last_reason64();       // 最近一次失败原因（排障/打点用）
 
