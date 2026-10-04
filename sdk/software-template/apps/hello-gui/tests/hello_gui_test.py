@@ -22,13 +22,13 @@ import argparse
 import os
 import re
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SDK = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 ROOT = os.path.dirname(os.path.dirname(SDK))
 sys.path.insert(0, os.path.join(SDK, "tools"))
 import sdk_qemu as sq                                            # noqa: E402
-
 ELF = os.path.join(ROOT, "build64", "sdk", "hello-gui.elf")
 WM_ELF = os.path.join(ROOT, "build64", "wm.elf")
 FIXTURE = os.path.join(ROOT, "build64", "sdk", "hello_gui_test.img")
@@ -43,12 +43,27 @@ FORBIDDEN = ("PANIC", "TRIPLE FAULT")
 MARKER = (0xFF, 0x00, 0x00)
 
 
+def ensure_artifacts():
+    """缺产物就自己造（验收脚本要能**独立**跑起来）：hello-gui.elf 走 build.sh。"""
+    import subprocess
+    if not os.path.exists(ELF):
+        print("   缺 %s -> 先跑 build.sh" % ELF)
+        r = subprocess.run(["bash", os.path.join(os.path.dirname(HERE), "build.sh")],
+                           cwd=ROOT, capture_output=True)
+        if r.returncode != 0 or not os.path.exists(ELF):
+            raise RuntimeError("构建失败：%s" % r.stderr.decode("utf-8", "replace")[-300:])
+
+
 def prepare(verbose=True):
+    ensure_artifacts()
     srcs = [(ELF, "/bin/hello-gui.elf", 0o755), (WM_ELF, "/lib/wm.elf", 0o755)]
     for vpath, host in FONTS:
         srcs.append((host, vpath, 0o644))
-    srcs += sq.icon_srcs(verbose=verbose)          # 外置图标（/icons/**，证明"不进内核"那条路）
-    return sq.build_fixture(FIXTURE, srcs, verbose=verbose)
+    # ★ 只装内核**实际请求**的两档（system@24 / apps@48）：把启动期 PNG 解码量压到最小，
+    #   避免 QEMU + 并发负载把内核看门狗踩响（[PANIC64] stop=WATCHDOG_TIMEOUT）。
+    #   全尺寸（16/24/32/48）装卷的证据走 tools/iconpack_ext.py 那一步（默认 4 档）。
+    srcs += sq.icon_srcs(verbose=verbose, sizes=(24, 48))
+    return sq.build_fixture(FIXTURE, srcs, verbose=verbose)[0]
 
 
 def main():
@@ -70,11 +85,17 @@ def main():
         return bool(cond)
 
     print("=== 0) 夹具盘 ===")
-    for p in (ELF, WM_ELF, os.path.join(ROOT, "build64", "system.img")):
+    for p in (WM_ELF, os.path.join(ROOT, "build64", "system.img")):
         if not os.path.exists(p):
-            sys.stderr.write("缺少 %s（先跑 bash build64.sh 与 sdk 模板的 build.sh）\n" % p)
+            sys.stderr.write("缺少 %s（先跑 bash build64.sh）\n" % p)
             return 2
-    img = args.img or prepare()
+    img = args.img
+    if not img:
+        try:
+            img = prepare()                   # 内部会在缺 hello-gui.elf 时自动 build.sh
+        except Exception as e:
+            sys.stderr.write("夹具盘准备失败：%s\n" % e)
+            return 2
     check("夹具盘就绪", os.path.exists(img), img)
 
     qemu = sq.find_qemu(args.qemu)
@@ -117,16 +138,26 @@ def main():
               vm.wait_re(r"\[WL64\] surface create id=\d+ w=256 h=56", 20) is not None)
 
         print("=== 3) 上屏像素（抓屏找纯红标记块）===")
+        # 合成器从 fork 到注册实测 1.5~2 s，且表面只在 commit 后的一段窗口里在屏上（程序跑完会 destroy），
+        # 所以这里**连拍 5 张**（间隔 0.5 s）取最大计数 —— 判据不降级（仍然要求标记块真的出现在屏上），
+        # 只是不受"抓屏恰好落在两帧之间"的影响。每一张的实测值都打出来。
         ppm = os.path.join(tmp, "gui.ppm")
-        got = mon.shot(ppm)
+        got = False
         red = -1
-        if got:
-            w, h, px = sq.read_ppm(ppm)
-            red = sq.count_color(px, w, h, MARKER, tol=16)
-            print("   抓屏 %dx%d：纯红像素（容差 16）= %d" % (w, h, red))
+        shots = []
+        for k in range(5):
+            if mon.shot(ppm):
+                got = True
+                w, h, px = sq.read_ppm(ppm)
+                n = sq.count_color(px, w, h, MARKER, tol=16)
+                shots.append(n)
+                red = max(red, n)
+            if red >= 200:
+                break
+            time.sleep(0.5)
+        print("   抓屏 %d 张：纯红像素（容差 16）= %s（取最大 %d）" % (len(shots), shots, red))
         check("抓屏成功", got)
-        check("画面上有标记块像素（>=200，说明 surface 真的合成上屏）", red >= 200,
-              "red=%d" % red)
+        check("画面上有标记块像素（>=200，说明 surface 真的合成上屏）", red >= 200, "red=%d" % red)
 
         check("进程收尾（destroy + done）", vm.wait("[HELLO-GUI] done", 60))
         log = vm.log()
@@ -136,7 +167,8 @@ def main():
         check("三帧都提交成功（rc 全 0）",
               len(mf2) >= 3 and all(x[1] == "0" for x in mf2[:3]),
               "帧行 %d 条" % len(mf2))
-        ic = re.findall(r"\[ICON64\] load kind=(\S+) path=/icons/(\S+) src=vfs ok=1", log)
+        # 注意路径与 src= 之间还有 size=<n>：`[ICON64] load kind=x path=/icons/…@24.png size=24 src=vfs ok=1`
+        ic = re.findall(r"\[ICON64\] load kind=(\S+) path=(/icons/\S+?) size=\d+ src=vfs ok=1", log)
         check("外置图标被内核加载（[ICON64] load … src=vfs ok=1 至少 5 条）", len(ic) >= 5,
               "src=vfs 加载 %d 条，例如 %s" % (len(ic), ic[0][0] + " -> " + ic[0][1] if ic else "无"))
         check("全程无 PANIC / TRIPLE FAULT", not any(f in log for f in FORBIDDEN))

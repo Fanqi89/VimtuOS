@@ -116,8 +116,14 @@ def build_fixture(out_disk, extra_srcs, verbose=True):
     return out_disk, sizes
 
 
-def icon_srcs(only=None, verbose=True):
-    """用 tools/iconpack_ext.py 光栅化 gui_rs/assets/icons 下的 SVG，返回可装卷的 --src 列表。"""
+def icon_srcs(only=None, verbose=True, sizes=None):
+    """用 tools/iconpack_ext.py 光栅化 gui_rs/assets/icons 下的 SVG，返回可装卷的 --src 列表。
+
+    sizes: 只挑这些档（例如 (24, 48)）。★ 为什么要有这个参数：内核运行期只请求
+    系统图标 @24 / 应用图标 @48（`kernel/icons64.cpp:410` 的 want），把 4 档全装进夹具
+    会让启动期多做几百次 PNG 解码 —— 在 QEMU + 并发构建的机器上足以把内核看门狗
+    （`[PANIC64] stop=WATCHDOG_TIMEOUT`）踩响。**全尺寸装卷**用 `iconpack_ext.py`（默认 4 档）。
+    """
     ext = os.path.join(HERE, "iconpack_ext.py")
     out = os.path.join(ROOT, "build", "sdk", "icons_ext")
     args = [sys.executable, ext, "--no-vol"]
@@ -134,9 +140,14 @@ def icon_srcs(only=None, verbose=True):
         for fn in sorted(os.listdir(d)):
             if not fn.endswith(".png"):
                 continue
+            if sizes is not None:
+                m = re.search(r"@(\d+)\.png$", fn)
+                if not m or int(m.group(1)) not in sizes:
+                    continue
             srcs.append((os.path.join(d, fn), "/icons/%s/%s" % (sub, fn), 0o644))
     if verbose:
-        print("   外置图标：%d 个 PNG（-> /icons/<system|apps>/<名字>@<尺寸>.png）" % len(srcs))
+        print("   外置图标：%d 个 PNG（-> /icons/<system|apps>/<名字>@<尺寸>.png；sizes=%s）"
+              % (len(srcs), sizes if sizes else "全部"))
     return srcs
 
 
@@ -215,6 +226,10 @@ class Monitor:
             s.close()
         return True
 
+    # sendkey(name, wait)：给"打字"用（与仓库 tests/font64user_test.py 的 Monitor 同名同义）
+    def sendkey(self, name, wait=0.12):
+        return self.send("sendkey %s" % name, wait=wait)
+
     def key(self, name, wait=1.2):
         self.send("sendkey %s" % name, wait=wait)
 
@@ -234,15 +249,28 @@ class Monitor:
 
 
 def login_desktop(mon, vm, timeout=240):
-    """登录手势（与仓库 tests/qemuhelp.py 同一套：回车两次）。"""
-    mon.key("ret", wait=1.0)
-    mon.key("ret", wait=1.5)
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        if "[GUI64] ready" in vm.log():
-            return True
-        time.sleep(0.4)
-    return False
+    """登录手势 —— **复用仓库的那一份**（tests/qemuhelp.py），别自己拍一套。
+
+    为什么不自己发两次回车：登录界面必须**显式输入**才进桌面（`ui.login.auto` 默认 0），
+    而手势的第一步是"等锁屏真正可交互"（串口出现 `[LOCK64] bg blur ready`）；不等就打回车会打空。
+    """
+    try:
+        import qemuhelp as qh
+        qh.login_desktop(mon, lambda: vm.log(), proc=vm.proc, timeout=timeout)
+        return qh.wait_mark(lambda: vm.log(), qh.DESKTOP_READY, timeout, proc=vm.proc)
+    except ImportError:
+        # 兜底：没有 tests/qemuhelp.py 时用简化手势（等锁屏 -> 两次回车）
+        t0 = time.time()
+        while time.time() - t0 < timeout and "[LOCK64] bg blur ready" not in vm.log():
+            time.sleep(0.4)
+        mon.key("ret", wait=1.0)
+        mon.key("ret", wait=1.5)
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if "[GUI64] ready" in vm.log():
+                return True
+            time.sleep(0.4)
+        return False
 
 
 def open_terminal(mon, vm, tries=3):

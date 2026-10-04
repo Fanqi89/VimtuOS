@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """sdk/software-template/packaging/vtar64_pack.py - "类 deb/tar" 的**简单包骨架**（VimtuOS 侧自定义）
 

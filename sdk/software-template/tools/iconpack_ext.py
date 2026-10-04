@@ -130,6 +130,11 @@ def main(argv):
         print("     %-9s %-12s @%-3d %5d B sha256=%s"
               % (e["sub"], e["name"], e["size"], e["bytes"], e["sha256"][:16]))
 
+    man_path = os.path.join(OUT, "manifest.json")
+    with open(man_path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=1)
+    print("   清单（逐张 sha256）：%s" % man_path)
+
     if args.no_vol:
         print("== ② 跳过装卷（--no-vol）")
         return 0

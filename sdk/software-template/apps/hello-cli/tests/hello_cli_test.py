@@ -37,7 +37,27 @@ CONF_PATH = "/etc/hello.conf"
 FORBIDDEN = ("PANIC", "TRIPLE FAULT")
 
 
+
+def ensure_artifacts(verbose=True):
+    """缺产物就自己造（验收脚本要能**独立**跑起来）：ELF 走 build.sh，VAP 走 vap64_pack.py。"""
+    import subprocess
+    if not os.path.exists(ELF):
+        print("   缺 %s -> 先跑 build.sh" % ELF)
+        r = subprocess.run(["bash", os.path.join(os.path.dirname(HERE), "build.sh")],
+                           cwd=ROOT, capture_output=True)
+        if r.returncode != 0 or not os.path.exists(ELF):
+            raise RuntimeError("构建失败：%s" % r.stderr.decode("utf-8", "replace")[-300:])
+    if not os.path.exists(VAP):
+        print("   缺 %s -> 先跑 vap64_pack.py" % VAP)
+        r = subprocess.run(["py", "-3", os.path.join(SDK, "packaging", "vap64_pack.py"),
+                            os.path.join(ROOT, "build64", "sdk", "hello-cli.bin"), VAP, "hello-cli"],
+                           cwd=ROOT, capture_output=True)
+        if r.returncode != 0 or not os.path.exists(VAP):
+            raise RuntimeError("VAP64 打包失败：%s" % r.stderr.decode("utf-8", "replace")[-300:])
+
+
 def prepare(verbose=True):
+    ensure_artifacts(verbose)
     conf = os.path.join(ROOT, "build64", "sdk", "hello.conf")
     with open(conf, "wb") as f:
         f.write(CONF_TEXT)
@@ -46,8 +66,8 @@ def prepare(verbose=True):
         (VAP, "/apps/hello-cli/hello-cli.vap", 0o755),
         (conf, CONF_PATH, 0o644),
     ]
-    srcs += sq.icon_srcs(verbose=verbose)          # 顺便把外置图标也放卷里（列目录能看到 /icons）
-    return sq.build_fixture(FIXTURE, srcs, verbose=verbose)
+    # 夹具尽量小、启动快：CLI 演示不需要字库/图标（列目录看到的是基础卷 + /bin + /etc + /apps）
+    return sq.build_fixture(FIXTURE, srcs, verbose=verbose)[0]
 
 
 def main():
@@ -70,13 +90,16 @@ def main():
         return bool(cond)
 
     print("=== 0) 夹具盘 ===")
-    if not os.path.exists(ELF):
-        sys.stderr.write("缺少 %s（先跑 bash sdk/software-template/apps/hello-cli/build.sh）\n" % ELF)
-        return 2
     if not os.path.exists(os.path.join(ROOT, "build64", "system.img")):
         sys.stderr.write("缺少 build64/system.img（先跑 bash build64.sh）\n")
         return 2
-    img = args.img or prepare()
+    img = args.img
+    if not img:
+        try:
+            img = prepare()                    # 内部会在缺产物时自动 build.sh / vap64_pack.py
+        except Exception as e:
+            sys.stderr.write("夹具盘准备失败：%s\n" % e)
+            return 2
     check("夹具盘就绪", os.path.exists(img), img)
 
     qemu = sq.find_qemu(args.qemu)
@@ -113,13 +136,15 @@ def main():
         check("50/51/52 不在 enosys 清单里", all(("50" not in e and "51" not in e and "52" not in e)
                                                   for e in enosys), "enosys 行 %d 条" % len(enosys))
         ms = re.search(r"\[HELLO-CLI\] dir items=(\d+) dirs=(\d+) files=(\d+)", log)
-        check("枚举出目录/文件（items>0 且 dirs>=4）",
-              ms is not None and int(ms.group(1)) > 0 and int(ms.group(2)) >= 4,
+        # 阈值：基础卷（/bin + /etc）+ 我加的 /apps → 至少 3 个目录；条目数必须 > 0
+        check("枚举出目录/文件（items>0 且 dirs>=3）",
+              ms is not None and int(ms.group(1)) > 0 and int(ms.group(2)) >= 3,
               ms.group(0) if ms else "没等到")
         md = re.search(r"\[HELLO-CLI\] ent name=bin kind=dir", log)
         check("bin 被识别为目录（kind=dir）", md is not None, md.group(0) if md else "没等到")
         mc = re.search(r"\[HELLO-CLI\] conf path=/etc/hello.conf bytes=(\d+) text=\"([^\"]*)\"", log)
-        want_txt = CONF_TEXT.decode().strip()
+        # 程序把换行/回车/制表折成空格（日志一行一条），所以期望串也要这么折
+        want_txt = CONF_TEXT.decode().replace("\r", " ").replace("\n", " ").replace("\t", " ")
         check("读到 /etc/hello.conf 且字节数/内容一致",
               mc is not None and int(mc.group(1)) == len(CONF_TEXT) and mc.group(2) == want_txt,
               mc.group(0) if mc else "没等到")
