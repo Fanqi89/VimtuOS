@@ -951,6 +951,55 @@ def cap_network():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_netuser64():
+    """★ 本批（P9）：Ring 3 完整网络栈 —— 内核只有一条「原始帧收发」ABI（自有 int 0x80 号 53 net_raw）。
+
+    内核侧（kernel/netraw64.cpp）只做校验 + 转发给 e1000 既有的 e1000_send64/e1000_recv64，零协议解析；
+    DHCP/DNS/ARP/ICMP/UDP/TCP 与全部策略都在用户态 /bin/netd（交付 = 系统卷文件，内核里搜不到它的字节）。
+    """
+    need = ["kernel/netraw64.cpp", "kernel/netraw64.h", "user/net/netd.c",
+            "tests/netuser64_test.py"]
+    miss = [f for f in need if not exists(f)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    ops = grep_count(r"NETRAW64_OP_(TX|RX|MAC|LINK)", ["kernel/netraw64.h"])
+    nr53 = grep_count(r"case 53:", ["kernel/syscall64.cpp"])
+    up = grep_count(r"\[NET\] dns upstream ip=", ["user/net/netd.c"])
+    full = grep_count(r"udp rx from=|dns a name=|tcp accept from=", ["user/net/netd.c"])
+    entry = grep_count(r"NETRAW64_LOG_MAX64  = 128", ["kernel/netraw64.cpp"])
+    tst = exists("tests/netuser64_test.py")
+    ev = [
+        "kernel/netraw64.cpp %d 行：op 0..3（tx/rx/mac/link）+ 长度闸门 + 用户缓冲范围校验 + 转发给 e1000 "
+        "既有收发（零协议解析、不碰寄存器）；ABI 常量命中 %d"
+        % (lines("kernel/netraw64.cpp"), ops),
+        "user/net/netd.c %d 行：ARP / IPv4（校验和）/ ICMP echo / UDP / DHCP 四步 / DNS（A 记录 + 压缩指针 + "
+        "多答案 + TC 如实报错）/ TCP（三次握手 + 固定 RTO 重传 + FIN/RST + listen 回显两个方向）"
+        % lines("user/net/netd.c"),
+        "分派层 kernel/syscall64.cpp 的 case 53 命中 %d；[NETRAW] 打点预算 128/128/16/48（本批从 32/32/8/32 "
+        "提高：一次完整栈运行收发约 50 帧，32 行会把后面的帧证据整段截掉 -> 验收就再也拿不到「DNS/UDP/TCP 的"
+        "帧真的从这一号进出了」），预算常量命中 %d" % (nr53, entry),
+        "本批修掉的三个**真缺陷**（都是「以前假过 / 没暴露」的）：① dns_encode_name() 从不回填**最后一段**"
+        "的长度 -> 「example.com」被编成 7example 0 com 0（总长恰好仍是 13 字节，bytes=29 的自检看不出来）；"
+        "② dns_skip_name() 里有一份重复的推进（每个标签推进两次）-> 跳过问题段名字时偏移就已经错；"
+        "③ udp rx 打点写成 sum=0x0x…（out_hex32 自带 0x）-> 验收按文档格式 grep 不到，「收到回声」被误判成"
+        "「未出现」。前两个是 slirp 内置 DNS 从不回我们的包才一直没暴露的",
+        "新增（都在用户态）：dnsport= 配置 + dns= **配置优先于 DHCP**；证据行 "
+        "[NET] dns upstream ip=<ip>:<port> src=<conf|dhcp|default>（命中 %d）；逐帧丢弃证据 "
+        "[NET] drop what=… len=… sip=… dip=… proto=… sport=… dport=…（独立有界 24 行）" % up,
+        "验收：tests/netuser64_test.py **64/64 PASS（连跑两次）** —— DHCP 四步 4/4（10.0.2.15/24 + 网关 + DNS）；"
+        "DNS 应答 answers=2 / rcode=0 / tc=0，A 记录是**宿主真解析**的地址且名字走压缩指针（ptr=1 已改硬断言）；"
+        "UDP echo 64 B 逐字节一致 + 宿主侧独立证据；TCP 双向 64 B 三方逐字节一致 + hostfwd 反向回显；"
+        "客人自评 ok=28 fail=0 skip=0；无 PANIC / 无 enosys（端到端断言命中 %d）" % full,
+        "环境如实：本机 QEMU 的 **slirp 内置 DNS 不可用**（默认上游、显式 -netdev user,dns=127.0.0.1 两种配置"
+        "下都是 3 发查询、4.5 s 零应答）—— 验收夹具因此把上游指到宿主受控应答器（dns=/dnsport=）：客人侧行为"
+        "（按配置的服务器:端口发查询、解析应答报文）一点没变，只是上游变确定了",
+        "边界（如实）：内核极简 net64（ARP/ICMP）仍保留、只在启动期探测一次；ring3 栈不做 IPv4 分片/重组、"
+        "无拥塞控制 / 无 TIME_WAIT、DNS 只做 A 记录、不做 ARP 应答、**无线网卡未做**",
+    ]
+    done = bool(ops and nr53 and up and full and entry and tst)
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 def cap_usb_host():
     """USB 主机：完成 —— UHCI（USB 1.1）主控驱动 + HID 引导键盘，按键真的送到桌面外壳。
 
@@ -1682,10 +1731,10 @@ def cap_iconpack64():
     if miss:
         return "MISSING", ["缺文件：%s" % ", ".join(miss)]
     n = lines("kernel/icons64.cpp")
-    # 包位置（★ A4-2a 起为实况）：pack 已搬进 VimtuFS2 系统卷 -> /etc/iconpack.bin；构建期把
-    #   build/iconpack.bin 内嵌进**系统内核**，启动期 icons64_init64() 幂等写进卷再读回（src=vfs）。
-    #   老 LBA 路径仍保留 ICON64_PACK_LBA = (ML64_KERNEL_LBA + ML64_KERNEL_SECTORS) - ICON64_PACK_MAX_SECTORS
-    #   = (9 + 8000) - 512 = 7497，只作末位兜底（build64.sh 已不再往那里写）。
+    # 包位置（★ 本批起为实况）：pack 是**系统卷文件** /etc/iconpack.bin（构建期由 tools/demo_pack_win.py
+    #   写进卷；同一份字节同时作为原始区 blob 写在内核区尾部 LBA，内核按需 ata64_read 进 .bss 再查表）。
+    #   ★ 本批（预算收口）：原来那份 objcopy 内嵌对象 iconpack_bin.o（49,192 B）**已删除** —— 内核里
+    #   一个图标字节都没有（构建期门禁：BLOBS 里每一项都被 gate.check 断言不得出现在内核里）。
     ml = open("kernel/memlayout64.h", encoding="utf-8", errors="replace").read()
     k_lba = re.search(r"ML64_KERNEL_LBA\s*=\s*(\d+)", ml)
     k_sec = re.search(r"ML64_KERNEL_SECTORS\s*=\s*(\d+)", ml)
@@ -1702,9 +1751,9 @@ def cap_iconpack64():
     ev = [
         "kernel/icons64.cpp %d 行（统一图标层：读 pack -> img64 解码 -> 缓存 -> 按主题 palette 着色；"
         "取不到回落既有程序化绘制）；图标层符号命中 %d" % (n, drw),
-        "包位置/大小（★ A4-2a 实况）：pack = 系统卷文件 /etc/iconpack.bin（启动期由内核内嵌字节幂等"
-        "装入，读回打点 src=vfs path=/etc/iconpack.bin）；老 LBA 兜底常量 ICON64_PACK_LBA = %s"
-        "（= 9 + 8000 - 512，构建脚本已不再写入）；build/iconpack.bin = %d B；清单 entries=%d kind=%d"
+        "包位置/大小（★ 本批实况）：pack = 系统卷文件 /etc/iconpack.bin（构建期由 tools/demo_pack_win.py 写进"
+        "卷 + 同一份字节作原始区 blob 兜底；读回打点 src=vfs path=/etc/iconpack.bin）；老常量 "
+        "ICON64_PACK_LBA = %s（末位兜底，构建脚本不再写入）；build/iconpack.bin = %d B；清单 entries=%d kind=%d"
         % (lba_v if lba_v else "?", size, entries, kinds),
         "实测串口（开机首帧）：\"[ICON64] init pack lba=0 drive=-1 bytes=49192 entries=110 icons=30 "
         "bad=0 ok=1 fnv=… vfs_icons=0 src=vfs path=/etc/iconpack.bin\"",
@@ -2259,12 +2308,12 @@ def cap_devmap():
 
 
 def cap_blob_offload():
-    """★ 本批（体积）：内嵌演示 blob 外置 —— 18 份 / 144,053 B 从内核搬到系统卷 + 「原始区」影子副本。
+    """★ 本批（体积）：内嵌演示 blob 外置 —— 19 份 / 193,245 B 从内核搬到系统卷 + 「原始区」影子副本。
 
     * 交付 = 系统卷文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检；内核里 blob 字节 **0**）；
       影子副本 = system.img 的 LBA 7497 起「原始区」（空夹具盘/无卷盘时兜底）。
-    * 内核里只剩路径/偏移/长度表：18 条 × 16 B = 288 B（build64/demo64_blobtab.h，构建期生成）。
-    * 实测：系统内核 **3,436,080 -> 3,297,680 B**；余量 **659,920 -> 798,320 B**（三层预算见 tests/a42a64_test.py）。
+    * 内核里只剩路径/偏移/长度表：19 条 × 16 B = 304 B（build64/demo64_blobtab.h，构建期生成）。
+    * 实测（★ 本批预算收口后）：系统内核 **3,447,072 -> 3,397,824 B**；余量 **648,928 -> 698,176 B**（三层预算见 tests/a42a64_test.py）。
     * 构建期硬断言：18/18 份 blob 的「整份（≤4 KiB）/64B 高熵探针」在**两份内核二进制**里都搜不到
       （build64.sh 的 PYDEMO64 段）—— 哪天有人把 blob 塞回内核，这里必红。
     * 踩坑（真缺陷）：原设计按 loader 平铺加载的**物理地址**读原始区（LBA 7497 -> 物理 0x4A8000），
@@ -2296,19 +2345,20 @@ def cap_blob_offload():
               "（build64/demo64_raw.bin；build64.sh 两道越界断言：内核不许压过来、原始区不许越界）；"
               "启动期装卷**幂等**：卷里已有 -> \"install skipped (exists)\"；没有 -> 从原始区取字节装进去；"
               "找不到就如实 skipped，**绝不假装跑过**（kernel/kernel64.cpp / demo64.cpp 打点）")
-    ev.append("实测体积：系统内核 **3,436,080 -> 3,297,680 B**（-138,400 B）；余量 **659,920 -> 798,320 B**"
-              "（构建输出原文：\"系统内核 3,436,080 B -> … B；余量 … B = … KiB\"）；三层预算断言全过")
-    ev.append("构建期硬断言：**18/18** 份 blob 的「整份（≤4 KiB）/64B 高熵探针」在 kernel64.bin（安装内核）"
-              "与 kernel64_os.bin（系统内核）**两份**里都搜不到（build64.sh 的 PYDEMO64 段；高熵窗口是为了避免"
-              "纯零/同色中段的假命中）")
+    ev.append("实测体积（★ 本批预算收口那一次）：系统内核 **3,447,072 -> 3,397,824 B**（-49,248 B，就是图标包"
+              "不再内嵌的字节）；余量 **648,928 -> 698,176 B**（≥ 预留 R=655,360 B，扣预留后剩 42,816 B；"
+              "三层预算断言 tests/a42a64_test.py 89/89 PASS）")
+    ev.append("构建期硬断言：**19/19** 份 blob（含本批加入的图标包）的「整份（≤4 KiB）/64B 高熵探针」在 "
+              "kernel64.bin（安装内核）与 kernel64_os.bin（系统内核）**两份**里都搜不到（build64.sh 的 "
+              "PYDEMO64 段；高熵窗口是为了避免纯零/同色中段的假命中）")
     ev.append("★ 踩坑（真缺陷，修在 kernel/demo64.cpp）：按 loader 平铺加载的**物理地址**读原始区会被内核 .bss "
               "的 33 MB fb 后备缓冲（物理 0x428000..0x23CC000）覆盖 -> 第一次跑 demo64 在 ring3 入口 "
               "0x100000000 上 #UD（\"[SIG64] fault no=6\" + \"[PANIC] cpu exception 6\"）；"
               "改按 LBA 7497 用 ata64_read() 现读并缓存（\".bss 覆盖\"这条教训已写进源码注释）")
     ev.append("（边界，如实：**4 份\"直跑演示\"**（demo64 / hello_c / libctest_c / fbdemo）在挂卷之前跑 —— "
-              "字节从原始区取；真安装盘首次启动靠\"原始区装进空卷\"这条兜底（option b）；原始区上限 512 扇区 = "
+              "256 KiB（当前 193,321 B：18 份演示 blob + ★ 本批搬进来的图标包 49,192 B），放不下就得改布局；"
               "256 KiB（当前 144,129 B），放不下就得改布局；原始区读取失败时调用方只走系统卷路径、如实打点）")
-    done = bool(not miss and n_blob == 18 and blob_sum == 144053 and raw_bytes and bk)
+    done = bool(not miss and n_blob == 19 and blob_sum == 193245 and raw_bytes and bk)
     return ("DONE" if done else "PARTIAL"), ev
 
 
@@ -2891,6 +2941,8 @@ CAPS = [
     ("驱动", "硬件详情（CPU/PCI/磁盘）", cap_hwinfo),
     ("驱动", "ACPI 解析（RSDP→RSDT/XSDT→FADT/MADT/HPET/MCFG）", cap_acpi_parse),
     ("驱动", "网络（e1000 + ARP/ICMP）", cap_network),
+    ("网络", "★ 本批（P9）：Ring 3 完整网络栈（内核只有 net_raw(53) 一条原始帧收发 ABI；DHCP/DNS/ARP/ICMP/UDP/TCP 全在 /bin/netd）",
+     cap_netuser64),
     ("驱动", "USB 主机", cap_usb_host),
     ("存储", "★ USB 存储（U 盘只读，可从 U 盘拷应用）", cap_usb_storage),
     ("内核", "APIC 启用", cap_apic_enable),
