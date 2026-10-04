@@ -141,7 +141,7 @@ C:\msys64\usr\bin\bash.exe -l -c "cd /c/Users/fanqi/Desktop/VimtuOS/Vimtu64 && b
 **如实边界**（`docs/应用层与系统调用说明.md` → `## musl（A3 第一步）：musl 静态程序真的在 ring3 跑起来了`、`## 10. 离 glibc 还差什么（如实清单）`）：
 * musl 静态构建要 SSE，Ring 3 入口已开 `CR4.OSFXSR/OSXMMEXCPT`；但**没有 xmm 上下文切换**
   （`switch64.asm` 不保存 xmm）—— 多进程同时用 SSE 会互相污染，这是**已知边界**；
-* rch_prctl(ARCH_SET_FS) 等少数调用走不到；getdents 不存在、**没有 mount 表 ABI**（statfs(137)/fstatfs(138) 已实现、df 可用，见 §10）。
+* `arch_prctl(ARCH_SET_FS)` 等少数调用走不到；`getdents` 不存在、**没有 mount 表 ABI**（`statfs(137)/fstatfs(138)` 已实现、`df` 可用，见 §10）。
 
 ### 4.3 Rust（**现状：用户态 Rust 路线待定，如实写**）
 
