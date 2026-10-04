@@ -5,6 +5,8 @@
 // "写了一半"的 FAT 卷；卷表是 drive64 扫描时的登记快照 + 每次查询时的只读刷新。
 #include "fs64.h"
 #include "debug64.h"
+#include "ata64.h"          // ★ P8b：驱动器号 >= ATA64_USB_BASE（U 盘）的 FAT32 卷才按可写挂载
+#include "drive64.h"        // ★ P8b：[FAT64] rw mount 行要报盘符（fat64 那边查盘符表用）
 
 // ==================== 卷表 ====================
 static Fs64Vol64 g_vols[FS64_VOL_MAX];
@@ -98,6 +100,9 @@ int fs64_vol_info64(int vol, Fs64Vol64* out) {
     if (vol < 0) vol = fs64_current_vol64();
     if (vol < 0 || vol >= FS64_VOL_MAX || g_vols[vol].kind == FS64_KIND_NONE) return -1;
     Fs64Vol64& v = g_vols[vol];
+    // ★ P8b：可写的 FAT32 卷在**第一次被查询**时补打 [FAT64] rw mount 行（含盘符）——
+    //   挂载与"开写开关"都发生在盘符分配之前，那一刻还没有字母可用（见 fs64_mount_fat64 的说明）。
+    if (v.kind == FS64_KIND_FAT32 && !v.readonly) (void)fat64_rw_announce64(v.fat_slot);
     if (v.kind == FS64_KIND_VIMTUFS2) {
         (void)ensure_vfs64(v.vfs_slot);                       // 刷新容量（数据盘写盘后可用空间会变）
     } else {
@@ -128,7 +133,12 @@ int fs64_mount_fat64(int disk, uint32_t lba, Fs64Vol64* out) {
     Fs64Vol64& v = g_vols[vol];
     for (uint32_t i = 0; i < sizeof(v); i++) ((uint8_t*)&v)[i] = 0;
     v.kind = FS64_KIND_FAT32;
-    v.readonly = 1;
+    // ★ P8b：**只有 USB 盘（驱动器号 >= ATA64_USB_BASE）上的 FAT32 卷**按可写挂载（readonly=0）——
+    //   卷级写开关（唯一入口 fat64_set_writable64）就在这一步按"是不是 U 盘"打开；
+    //   固定盘 / ESP 上的 FAT32 一个字节都不变（readonly=1，写入口一律 -FS64_EROFS）。
+    //   盘符不在这里给（挂载发生在盘符分配之前）：最终状态由 [FAT64] rw mount 行 + [DRV64] letter= 行如实给出。
+    v.readonly = (disk >= ATA64_USB_BASE) ? 0 : 1;
+    if (v.readonly == 0) (void)fat64_set_writable64(fp, 1, "usb");
     v.disk = disk;
     v.start_lba = lba;
     v.vfs_slot = -1;
@@ -153,7 +163,8 @@ int fs64_mount_fat64(int disk, uint32_t lba, Fs64Vol64* out) {
         dbg64_dec(fi.clusters);
         dbg64_str(" spc=");
         dbg64_dec(fi.spc);
-        dbg64_str(" ro=1");
+        dbg64_str(" ro=");
+        dbg64_dec((uint64_t)v.readonly);
         dbg64_nl();
         dbg64_line_end64();
     }
@@ -411,7 +422,11 @@ int fs64_write_at64(int vol, const char* path, uint32_t off, const void* buf, ui
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "write_at", path); return -FS64_EROFS; }
-    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;          // FAT 只读（上面已拒），这里不会到
+    if (g_vols[v].kind == FS64_KIND_FAT32) {
+        // ★ P8b：可写的 FAT32 卷（只有 U 盘，见 fs64_mount_fat64）-> 多卷写层。
+        //   内部再按卷级 writable 门禁一次（fat64_vol_* 只认打开过开关的卷）。
+        return fat64_vol_write_at64(g_vols[v].fat_slot, path, off, buf, len);
+    }
     Fs64VfsScope64 sc(g_vols[v].vfs_slot);
     if (!sc.ok) return -1;
     return vfs64_write_at64(path, off, buf, len);
@@ -421,7 +436,12 @@ int fs64_write64(int vol, const char* path, const void* buf, int len) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "write", path); return -FS64_EROFS; }
-    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) {
+        // ★ P8b：可写的 FAT32 卷 = 整文件写（新建或覆盖；len = 0 = 建空文件 / 清空）。
+        //   fd64 的 O_CREAT（touch）与 O_TRUNC 都走这一条，语义与 vfs64 对齐。
+        if (len < 0) return -1;
+        return fat64_vol_write64(g_vols[v].fat_slot, path, buf, (uint32_t)len);
+    }
     Fs64VfsScope64 sc(g_vols[v].vfs_slot);
     if (!sc.ok) return -1;
     return vfs64_write64(path, buf, len);
@@ -430,7 +450,7 @@ int fs64_create64(int vol, const char* path) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "create", path); return -FS64_EROFS; }
-    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return fat64_vol_create64(g_vols[v].fat_slot, path);
     Fs64VfsScope64 sc(g_vols[v].vfs_slot);
     if (!sc.ok) return -1;
     return vfs64_create64(path);
@@ -439,7 +459,7 @@ int fs64_mkdir64(int vol, const char* path) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "mkdir", path); return -FS64_EROFS; }
-    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return fat64_vol_mkdir64(g_vols[v].fat_slot, path);
     Fs64VfsScope64 sc(g_vols[v].vfs_slot);
     if (!sc.ok) return -1;
     return vfs64_mkdir64(path);
@@ -448,7 +468,7 @@ int fs64_unlink64(int vol, const char* path) {
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "unlink", path); return -FS64_EROFS; }
-    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return fat64_vol_unlink64(g_vols[v].fat_slot, path);
     Fs64VfsScope64 sc(g_vols[v].vfs_slot);
     if (!sc.ok) return -1;
     return vfs64_unlink64(path);
@@ -557,9 +577,21 @@ int fs64_selftest64() {
         Fs64Stat64 st;
         if (fs64_stat64(cur, "/", &st) != 0) fails |= 1;
     }
-    // bit1：FAT 卷只读语义（只看 FAT 卷，绝不碰 VimtuFS2 的内容）
+    // bit1：FAT 卷的只读/可写语义（只看 FAT 卷，绝不碰 VimtuFS2 的内容）
+    //   ★ P8b：现在有两类 FAT32 卷 —— 固定盘/ESP（只读）与 U 盘（可写，见 fs64_mount_fat64）。
+    //   自检**只在只读卷上**做"写操作必须 -FS64_EROFS 且没有副作用"；可写卷只核对标记与
+    //   "坏路径被拒、没有副作用"（自检绝不在用户的 U 盘上建/删任何文件）。
     for (int v = FS64_VOL_FAT_BASE; v < FS64_VOL_MAX; v++) {
         if (g_vols[v].kind != FS64_KIND_FAT32) continue;
+        if (!g_vols[v].readonly) {
+            if (fat64_vol_writable64(g_vols[v].fat_slot) != 1) fails |= 2;       // 可写标记必须真的打开了
+            if (g_vols[v].disk < ATA64_USB_BASE) fails |= 2;                     // 可写只允许 U 盘
+            Fs64Stat64 st2;
+            if (fs64_stat64(v, "/__fs64test_tmp__/x.tmp", &st2) == 0) fails |= 2; // 父目录不存在 -> 查不到
+            if (fs64_write64(v, "/__fs64test_tmp__/x.tmp", "x", 1) == 0) fails |= 2;
+            if (fs64_stat64(v, "/__fs64test_tmp__/x.tmp", &st2) == 0) fails |= 2; // 失败必须没副作用
+            continue;
+        }
         if (fs64_write64(v, "/__fs64test.tmp", "x", 1) != -FS64_EROFS) fails |= 2;
         if (fs64_create64(v, "/__fs64test.tmp") != -FS64_EROFS) fails |= 2;
         if (fs64_mkdir64(v, "/__fs64test.dir") != -FS64_EROFS) fails |= 2;

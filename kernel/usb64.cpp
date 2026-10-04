@@ -1492,7 +1492,12 @@ static void usb_msc_probe() {
         dbg64_str(" lba=blocks-1 count=2 rejected=");
         dbg64_dec(r2 ? 0u : 1u);
         usb_log_end();
-        if (r1 || !r2) mask |= 128u;                                                    // 守卫坏了
+        // ★ P8b 修（**HEAD 上就有的缺陷**，不是本轮引入）：这两次调用都必须被**拒绝**（返回 false），
+        //   所以判据是 `r1 || r2`。原写法 `r1 || !r2` 把"正确拒绝"当成失败 —— 实测后果很重：
+        //   mask |= 128 -> g_msc.supported = false -> U 盘根本不暴露成块设备 -> 连 D: 盘符都没有
+        //   （串口证据：`[USBST] write-bounds probe … rejected=1 … rejected=1` 紧跟 `[USBST] selftest FAIL mask=128`
+        //    + `[USB64] selftest FAIL mask=256`，与下一行的打印自相矛盾）。
+        if (r1 || r2) mask |= 128u;                                                     // 守卫坏了（越界写被放行）
     }
 
     // ★ supported = 探测全过：探测没过的盘**不暴露成块设备**（宁可如实说"没盘"，

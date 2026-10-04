@@ -9,9 +9,15 @@
 // 是被验证过的，而不是靠人读代码；内存卷从页池临时取页（34MB），跑完就还回去。
 #include "fat64.h"
 #include "ata64.h"
+#include "drive64.h"        // ★ P8b：rw mount 行要报盘符（盘符表 = drive64；表里 fatvol 对上即本卷）
+#include "panic64.h"        // ★ P8b：U 盘写操作期间临时停表（单次写可能几百次 USB 传输）
 #include "debug64.h"
 #include "mem_64.h"          // page_alloc_64 / page_free_64（自检内存卷用）
 
+// ★ 安装程序内核**不链接** kernel/panic64.o（看门狗只在系统内核里）—— 与 fd64.cpp / syscall64.cpp 同一做法：
+//   把这两个符号声明成 **weak** 并判空调用（安装程序里就是"没有看门狗"这个事实，不是假装停表成功）。
+void panic64_watchdog_pause64()   __attribute__((weak));
+void panic64_watchdog_unpause64() __attribute__((weak));
 // ---------------- 卷状态（一次只操作一个卷） ----------------
 struct Fat64Chain { uint32_t start, count; };
 struct Fat64Dir   { char path[24]; uint32_t cluster; uint32_t next_slot; };
@@ -1110,6 +1116,17 @@ int fat64_read64(int vol, const char* path, void* buf, uint32_t max, uint32_t* o
 //   5) FSInfo：只更新 free 计数（FSInfo 无效时不动，如实保持 unknown）。
 // 门禁（只在 USB 盘上打开，见 drive64）：卷级可写开关 fat64_set_writable64()，没打开时
 //   rv_write()/rfat_set() 一律拒绝 —— 系统卷 / 内部盘 / ESP 的写路径**完全不变**。
+// 看门狗护栏（可重入）：U 盘上一次"找一个空闲簇"要读的 FAT 扇区数可能上百（卷满时要读完整份 FAT），
+// 每次 USB 传输 + 串口打点都是毫秒级 —— 实测"卷满 + 扫全表"会超过 5 秒的看门狗阈值（[WD64] watchdog fire
+// -> PANIC）。所以整个公开写操作期间临时停表，函数返回前恢复（panic64 的 pause 不是计数器，所以这里自己
+// 压一层深度 —— 例如 write_at 内部会调 create、explorer 的粘贴会连着调 ow_* 三段）。
+// 与 bigtest / ping 的既有做法一致：**长操作停表**，不是把看门狗关掉。
+static uint8_t g_rw_wd_depth = 0;
+struct Fat64RwGuard64 {
+    Fat64RwGuard64() { if (g_rw_wd_depth++ == 0 && panic64_watchdog_pause64) panic64_watchdog_pause64(); }
+    ~Fat64RwGuard64() { if (--g_rw_wd_depth == 0 && panic64_watchdog_unpause64) panic64_watchdog_unpause64(); }
+};
+
 #define FAT64_OW_MAX_CLUSTERS 65536u      // 单次覆盖的簇数护栏（16MB / 512B = 32768 以内正常）
 static const uint32_t FAT64_OW_LOG_MAX = 32u;
 
@@ -1287,6 +1304,7 @@ int fat64_vol_writable64(int vol) {
 }
 
 int fat64_ow_begin64(int vol, const char* path, uint32_t len) {
+    Fat64RwGuard64 wg;                              // 可能整链重排 + 扫 FAT：长操作停表
     if (g_ow.active) { rlog_reject("write: overwrite session already active"); return -1; }
     if (!fat64_vol_used64(vol) || !path || !path[0]) return -1;
     Fat64RVol& v = g_rvol[vol];
@@ -1428,6 +1446,7 @@ int fat64_ow_begin64(int vol, const char* path, uint32_t len) {
 }
 
 int fat64_ow_write64(int vol, uint32_t off, const void* data, uint32_t len, uint32_t* out_done) {
+    Fat64RwGuard64 wg;                              // 逐扇区 写+读回 可能是几百次 USB 传输
     if (out_done) *out_done = 0;
     if (!g_ow.active || vol != g_ow.vol || !data) return -1;
     if (len == 0) return 0;
@@ -1482,6 +1501,7 @@ int fat64_ow_write64(int vol, uint32_t off, const void* data, uint32_t len, uint
 }
 
 int fat64_ow_commit64(int vol, int ok) {
+    Fat64RwGuard64 wg;
     if (!g_ow.active || vol != g_ow.vol) return -1;
     Fat64RVol& v = g_rvol[vol];
     int rc = 0;
@@ -1550,6 +1570,705 @@ int fat64_overwrite64(int vol, const char* path, const void* data, uint32_t len)
     return fat64_ow_commit64(vol, 1);
 }
 
+// ==================== ★ P8b：rv_* 多卷层上的**完整写路径**（新建 / 覆盖 / 建目录 / 删除 / 截断）====================
+// ---- rw mount 行：盘符只有"扫完盘"才有，所以这里是**幂等 + 就近打**（第一次要用到盘符的地方）----
+//   几何全部取 g_rvol[vol].info，I/O 全部过 rv_read()/rv_write()（卷内 LBA 三重校验 + 只有 writable 能写），
+//   安装器的写路径与卷状态**一个字节都不改**。支持范围与打点见 kernel/fat64.h 的 P8b 段说明。
+static const uint32_t FAT64_RW_LOG_MAX = 32u;      // rw write / rw mkdir / rw truncate 成功行的打印上限
+static const uint32_t FAT64_RW_T_LOW   = ((uint32_t)12 << 11) | ((uint32_t)34 << 5) | 5u;    // 时间 12:34:10
+static const uint32_t FAT64_RW_T_HIGH  = ((uint32_t)26 << 9) | ((uint32_t)9 << 5) | 20u;     // 日期 2026-09-20
+static uint8_t  g_rw_announced[FAT64_VOL_MAX];
+static char     g_rw_announced_letter[FAT64_VOL_MAX];
+static uint8_t  g_rw_announce_busy = 0;            // 打 rw mount 行时要查盘符（-> fs64 -> 本卷），防重入
+static uint32_t g_rw_write_logs = 0;
+static uint32_t g_rw_mkdir_logs = 0;
+static uint32_t g_rw_aux_logs   = 0;
+static uint8_t  g_rw_zero[FAT64_SECTOR];           // 新建目录簇 / 写空洞用
+
+// ---- 打点 ----
+static void rlog_rw_fail(int vol, const char* op, const char* reason) {
+    dbg64_line_begin64();
+    dbg64_str("[FAT64] rw fail vol=");
+    dbg64_dec((uint64_t)(vol < 0 ? 0 : vol));
+    dbg64_str(" op=");
+    dbg64_str(op ? op : "-");
+    dbg64_str(" reason=");
+    dbg64_str(reason ? reason : "io");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void rlog_rw_verify_failed(int vol, const char* path, uint32_t at, uint8_t want, uint8_t got) {
+    dbg64_line_begin64();
+    dbg64_str("[FAT64] rw verify FAILED vol=");
+    dbg64_dec((uint64_t)(vol < 0 ? 0 : vol));
+    dbg64_str(" path=\"");
+    dbg64_str(path ? path : "?");
+    dbg64_str("\" at=");
+    dbg64_dec((uint64_t)at);
+    dbg64_str(" want=");
+    dbg64_hex64((uint64_t)want);
+    dbg64_str(" got=");
+    dbg64_hex64((uint64_t)got);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+// 逐字节比两块缓冲；不一致时打出**第一个不同字节**的文件偏移（at = 文件内的绝对字节号）
+static bool rw_cmp_log(int vol, const char* path, uint32_t at_base, const uint8_t* want, const uint8_t* got, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (want[i] != got[i]) { rlog_rw_verify_failed(vol, path, at_base + i, want[i], got[i]); return false; }
+    }
+    return true;
+}
+static void rlog_rw_mount(int vol, char letter) {
+    dbg64_line_begin64();
+    dbg64_str("[FAT64] rw mount vol=");
+    dbg64_dec((uint64_t)vol);
+    dbg64_str(" letter=");
+    char lb[3];
+    lb[0] = letter; lb[1] = ':'; lb[2] = 0;
+    dbg64_str(lb);
+    dbg64_str(" writable=1 clusters=");
+    dbg64_dec((uint64_t)g_rvol[vol].info.clusters);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void rlog_rw_write(int vol, const char* path, uint32_t len, uint32_t cluster, uint32_t nclusters) {
+    if (g_rw_write_logs >= FAT64_RW_LOG_MAX) return;
+    g_rw_write_logs++;
+    dbg64_line_begin64();
+    dbg64_str("[FAT64] rw write vol=");
+    dbg64_dec((uint64_t)vol);
+    dbg64_str(" path=\"");
+    dbg64_str(path ? path : "?");
+    dbg64_str("\" len=");
+    dbg64_dec((uint64_t)len);
+    dbg64_str(" cluster=");
+    dbg64_dec((uint64_t)cluster);
+    dbg64_str(" nclusters=");
+    dbg64_dec((uint64_t)nclusters);
+    dbg64_str(" verify=1");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void rlog_rw_mkdir(int vol, const char* path, uint32_t cluster) {
+    if (g_rw_mkdir_logs >= FAT64_RW_LOG_MAX) return;
+    g_rw_mkdir_logs++;
+    dbg64_line_begin64();
+    dbg64_str("[FAT64] rw mkdir vol=");
+    dbg64_dec((uint64_t)vol);
+    dbg64_str(" path=\"");
+    dbg64_str(path ? path : "?");
+    dbg64_str("\" cluster=");
+    dbg64_dec((uint64_t)cluster);
+    dbg64_str(" ok=1");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void rlog_rw_aux(int vol, const char* what, const char* path, uint32_t a, uint32_t b) {
+    if (g_rw_aux_logs >= FAT64_RW_LOG_MAX) return;
+    g_rw_aux_logs++;
+    dbg64_line_begin64();
+    dbg64_str("[FAT64] rw ");
+    dbg64_str(what);
+    dbg64_str(" vol=");
+    dbg64_dec((uint64_t)vol);
+    dbg64_str(" path=\"");
+    dbg64_str(path ? path : "?");
+    if (what[0] == 'u') {
+        dbg64_str("\" freed=");
+        dbg64_dec((uint64_t)a);
+        dbg64_str(" ok=1");
+    } else {
+        dbg64_str("\" len=");
+        dbg64_dec((uint64_t)a);
+        dbg64_str(" nclusters=");
+        dbg64_dec((uint64_t)b);
+        dbg64_str(" verify=1");
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// ---- rw mount 行：盘符只有"扫完盘"才有，所以这里是**幂等 + 就近打**（第一次要用到盘符的地方）----
+int fat64_rw_announce64(int vol) {
+    if (!fat64_vol_used64(vol) || !g_rvol[vol].writable) return -1;
+    if (g_rw_announce_busy) return -1;                          // ★ 防重入（查盘符会回调到 fs64 -> 这里）
+    g_rw_announce_busy = 1;
+    char letter = 0;
+    const int dn = drive64_count64();
+    for (int i = 0; i < dn && !letter; i++) {
+        DriveInfo64 d;
+        if (drive64_info64(i, &d) != 0) continue;
+        if (!d.present || d.fskind != DRV64_FS_FAT32) continue;
+        if ((int)d.fatvol != vol) continue;
+        if (d.letter) letter = d.letter;
+    }
+    g_rw_announce_busy = 0;
+    if (!letter) return -1;                                     // 还没分盘符：下次再来
+    if (g_rw_announced[vol] && g_rw_announced_letter[vol] == letter) return 0;
+    g_rw_announced[vol] = 1;
+    g_rw_announced_letter[vol] = letter;
+    rlog_rw_mount(vol, letter);
+    return 0;
+}
+
+// ---- 入口门禁：**只有 writable 的卷**能过（其它一律 ro，一个字节都不写）----
+static int rw_gate(int vol, const char* op, const char* path) {
+    if (!fat64_vol_used64(vol) || !path || !path[0]) { rlog_rw_fail(vol, op, "bad-path"); return -1; }
+    if (g_rvol[vol].info.fat_type != FAT64_TYPE_32) { rlog_rw_fail(vol, op, "bad-path"); return -1; }
+    if (!g_rvol[vol].writable) { rlog_rw_fail(vol, op, "ro"); return -1; }
+    (void)fat64_rw_announce64(vol);
+    return 0;
+}
+
+// ---- 路径：拆成"父目录簇 + 叶子名"（父目录必须已存在且是目录）----
+static int rw_split(int vol, const char* path, uint32_t* out_parent, char* leaf, int cap) {
+    if (!path || cap <= 0) return -1;
+    int cut = -1, n = 0;
+    for (; path[n]; n++) if (path[n] == '/') cut = n;
+    int k = 0;
+    for (int i = cut + 1; i < n && k < cap - 1; i++) leaf[k++] = path[i];
+    leaf[k] = 0;
+    if (!leaf[0]) return -1;
+    uint32_t parent = g_rvol[vol].info.root_cluster;
+    if (cut > 0) {
+        char pp[FAT64_NAME_MAX];
+        int j = 0;
+        for (int i = 0; i < cut && j < (int)sizeof(pp) - 1; i++) pp[j++] = path[i];
+        pp[j] = 0;
+        Fat64Entry64 de;
+        uint32_t dc = 0;
+        if (resolve64(vol, pp, &de, &dc) != 0) return -1;
+        if (!(de.attr & 0x10u)) return -1;
+        if (dc < 2) return -1;
+        parent = dc;
+    }
+    *out_parent = parent;
+    return 0;
+}
+
+// ---- 8.3 短名（**不写 LFN**：超长/含非法字符时按 FAT 老规矩落成 "BASE~N.EXT"）----
+static bool r83_ok(char c) {
+    if (c >= 'a' && c <= 'z') return true;
+    if (c >= 'A' && c <= 'Z') return true;
+    if (c >= '0' && c <= '9') return true;
+    static const char* ok = "$%'-_@~`!(){}^#&";
+    for (int i = 0; ok[i]; i++) if (c == ok[i]) return true;
+    return false;
+}
+static char r83_up(char c) { return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
+// suffix = 0：原名能直译就用原名；1..9："BASE~N" 变体（撞名/超 8.3/含非法字符时）。
+// 返回 1 = 得到名字，0 = 这个名字**根本无法**用 8.3 表示（空 / 以 '.' 开头 / 全是非法字符），
+//        -1 = 原名超 8.3（需要变体，调用方用 suffix >= 1 再来）。
+static int r83_build(const char* leaf, int suffix, uint8_t* out11) {
+    for (int i = 0; i < 11; i++) out11[i] = ' ';
+    const int n = r_strlen(leaf);
+    if (n <= 0) return 0;
+    int dot = -1;
+    for (int i = n - 1; i >= 0; i--) if (leaf[i] == '.') { dot = i; break; }
+    if (dot == 0) return 0;
+    const int blen = (dot < 0) ? n : dot;
+    char base[14];
+    int bn = 0, bad = 0;
+    for (int i = 0; i < blen; i++) {
+        const char c = leaf[i];
+        if (c == '.' || !r83_ok(c)) { bad = 1; continue; }      // 基线里出现第二个 '.' / 非法字符
+        if (bn < 12) base[bn++] = r83_up(c);
+    }
+    if (bn == 0) return 0;
+    char ext[5];
+    int en = 0;
+    if (dot > 0) {
+        for (int i = dot + 1; i < n; i++) {
+            const char c = leaf[i];
+            if (c == '.' || !r83_ok(c)) { bad = 1; continue; }
+            if (en < 4) ext[en++] = r83_up(c);
+        }
+    }
+    if (bn > 8 || en > 3) bad = 1;
+    if (bad && suffix <= 0) return -1;                          // 需要变体
+    if (bad || suffix > 0) {
+        if (bn > 6) bn = 6;
+        if (bn < 1) return 0;
+        base[bn++] = '~';
+        base[bn++] = (char)('0' + (suffix % 10));
+        if (en > 3) en = 3;
+    }
+    if (bn > 8 || en > 3) return 0;
+    for (int i = 0; i < bn; i++) out11[i] = (uint8_t)base[i];
+    for (int i = 0; i < en; i++) out11[8 + i] = (uint8_t)ext[i];
+    return 1;
+}
+static void r83_str(const uint8_t* n11, char* out) {             // 11 字节 -> "BASE.EXT"（给目录查找用）
+    int k = 0;
+    for (int i = 0; i < 8 && n11[i] != ' '; i++) out[k++] = (char)n11[i];
+    int e = 8;
+    while (e < 11 && n11[e] == ' ') e++;
+    if (e < 11) {
+        out[k++] = '.';
+        for (; e < 11; e++) out[k++] = (char)n11[e];
+    }
+    out[k] = 0;
+}
+// 挑一个**没被占用**的 8.3 名：原名 -> "BASE~1.EXT" … "BASE~9.EXT"
+static int rw_pick83(int vol, uint32_t parent, const char* leaf, uint8_t* out11) {
+    for (int s = 0; s <= 9; s++) {
+        const int r = r83_build(leaf, s, out11);
+        if (r == 0) return 0;
+        if (r < 0) continue;
+        char nm[16];
+        r83_str(out11, nm);
+        const int f = dir_find_slot(vol, parent, nm, nullptr, nullptr, nullptr);
+        if (f == 0) return 1;                                    // 没人用
+        if (f < 0) return -1;
+    }
+    return 0;                                                    // 10 个候选都撞名：如实失败
+}
+
+// ---- 目录里的空闲项 ----
+struct Fat64RwSlot { uint32_t c, s, o; uint8_t term; };
+static int dir_free_slot(int vol, uint32_t dir_cluster, Fat64RwSlot* out) {
+    if (!fat64_vol_used64(vol) || !out) return -1;
+    const uint32_t clusters = g_rvol[vol].info.clusters;
+    if (dir_cluster < 2 || dir_cluster > clusters + 1u) return -1;
+    uint32_t c = dir_cluster, guard = 0;
+    for (;;) {
+        const uint32_t clba = rcluster_lba(vol, c);
+        for (uint32_t s = 0; s < g_rvol[vol].info.spc; s++) {
+            if (!rv_read(vol, clba + s, 1, g_rsec)) { rlog_reject("rw dir: read failed"); return -1; }
+            for (uint32_t o = 0; o + 32u <= FAT64_SECTOR; o += 32u) {
+                const uint8_t f = g_rsec[o];
+                if (f == 0x00) { out->c = c; out->s = s; out->o = o; out->term = 1; return 1; }
+                if (f == 0xE5) { out->c = c; out->s = s; out->o = o; out->term = 0; return 1; }
+            }
+        }
+        uint32_t nx = 0;
+        if (!rchain_next(vol, c, &nx)) return -1;
+        if (nx == 0) return 0;                                   // 目录写满
+        c = nx;
+        if (++guard > FAT64_CHAIN_MAX) { rlog_reject("rw dir: chain too long"); return -1; }
+    }
+}
+static bool dir_tail_cluster(int vol, uint32_t dir_cluster, uint32_t* out_c) {
+    uint32_t c = dir_cluster;
+    for (;;) {
+        uint32_t nx = 0;
+        if (!rchain_next(vol, c, &nx)) return false;
+        if (nx == 0) { *out_c = c; return true; }
+        c = nx;
+    }
+}
+// ---- 簇链：分配（失败把自己分配的都回收）/ 回收（可选同步 FSInfo）----
+static uint32_t rw_release_chain(int vol, uint32_t first, uint32_t maxn, int fsinfo) {
+    if (first < 2) return 0;
+    uint32_t c = first, n = 0;
+    while (c >= 2 && n < maxn) {
+        uint32_t nx = 0;
+        if (!rchain_next(vol, c, &nx)) break;
+        if (!rfat_set(vol, c, 0)) break;
+        n++;
+        if (nx == 0) break;
+        c = nx;
+    }
+    if (n && fsinfo) ow_fsinfo_add(vol, (int)n);
+    return n;
+}
+static bool rw_alloc_chain(int vol, uint32_t count, uint32_t* out_first, uint32_t* out_tail) {
+    Fat64RVol& v = g_rvol[vol];
+    if (count == 0) { if (out_first) *out_first = 0; if (out_tail) *out_tail = 0; return true; }
+    const uint32_t maxc = v.info.clusters + 1u;
+    const uint32_t per_sec = FAT64_SECTOR / 4u;
+    uint32_t scan = 2, first = 0, tail = 0;
+    // ★ 批量扫：一次 rv_read 读 32 个 FAT 扇区（16KB = 4096 个表项，g_rbuf 装得下）。
+    //   为什么必须批量：走 USB 时"一扇区一次 READ(10)"在**卷满**时要读完整份 FAT（68874 簇 / 539 扇区），
+    //   实测会超过 5 秒的看门狗阈值（[WD64] watchdog fire -> PANIC）。批量后同样一次扫描只要 17 次传输。
+    const uint32_t batch = 32u;
+    for (uint32_t k = 0; k < count; k++) {
+        uint32_t found = 0;
+        for (uint32_t sec = 0; sec < v.info.fatsz && !found; sec += batch) {
+            uint32_t nsec = v.info.fatsz - sec;
+            if (nsec > batch) nsec = batch;
+            if (!rv_read(vol, v.info.reserved + sec, nsec, g_rbuf)) { rw_release_chain(vol, first, k, 0); return false; }
+            for (uint32_t o = 0; o + 4u <= nsec * FAT64_SECTOR; o += 4u) {
+                const uint32_t c = sec * per_sec + o / 4u;
+                if (c < scan || c < 2 || c > maxc) continue;
+                if ((rd32(g_rbuf + o) & 0x0FFFFFFFu) != 0) continue;
+                found = c;
+                break;
+            }
+        }
+        if (!found) { rw_release_chain(vol, first, k, 0); return false; }   // 卷满：**已分配的全回收**
+        if (!rfat_set(vol, found, FAT64_EOF)) { rw_release_chain(vol, first, k, 0); return false; }
+        if (tail >= 2 && !rfat_set(vol, tail, found)) { rw_release_chain(vol, first, k + 1u, 0); return false; }
+        if (!first) first = found;
+        tail = found;
+        scan = found + 1u;
+    }
+    if (out_first) *out_first = first;
+    if (out_tail) *out_tail = tail;
+    return true;
+}
+static bool rw_zero_cluster(int vol, uint32_t c) {
+    memzero8(g_rw_zero, FAT64_SECTOR);
+    const uint32_t clba = rcluster_lba(vol, c);
+    for (uint32_t s = 0; s < g_rvol[vol].info.spc; s++) {
+        if (!rv_write(vol, clba + s, 1, g_rw_zero)) return false;
+        if (!rv_read(vol, clba + s, 1, g_rcheck)) return false;
+        for (uint32_t k = 0; k < FAT64_SECTOR; k++) if (g_rcheck[k] != 0) return false;
+    }
+    return true;
+}
+// 目录链尾接一个新簇（新簇已清零）：1 = 成功，0 = 卷满，-1 = I/O
+static int dir_grow(int vol, uint32_t dir_cluster, Fat64RwSlot* out_slot) {
+    uint32_t nc = 0, nt = 0;
+    if (!rw_alloc_chain(vol, 1, &nc, &nt)) return 0;
+    if (!rw_zero_cluster(vol, nc)) { rw_release_chain(vol, nc, 1, 0); return -1; }
+    uint32_t last = 0;
+    if (!dir_tail_cluster(vol, dir_cluster, &last) || !rfat_set(vol, last, nc)) {
+        rw_release_chain(vol, nc, 1, 0);
+        return -1;
+    }
+    ow_fsinfo_add(vol, -1);
+    out_slot->c = nc; out_slot->s = 0; out_slot->o = 0; out_slot->term = 1;
+    return 1;
+}
+// 落一个 32 字节目录项（读改写一个扇区 + 写后读回比对）
+static bool rw_put_entry(int vol, const Fat64RwSlot& sl, const uint8_t* n11, uint8_t attr,
+                         uint32_t first_cluster, uint32_t size) {
+    const uint32_t clba = rcluster_lba(vol, sl.c);
+    if (!rv_read(vol, clba + sl.s, 1, g_rsec)) return false;
+    uint8_t ent[32];
+    memzero8(ent, 32);
+    for (int i = 0; i < 11; i++) ent[i] = n11[i];
+    ent[11] = attr;
+    ent[12] = 0;                                        // 不写 NT 大小写标志（见 fat64.h 的 P8b 说明）
+    wr16(ent + 14, (uint16_t)FAT64_RW_T_LOW);           // 创建时间
+    wr16(ent + 16, (uint16_t)FAT64_RW_T_HIGH);          // 创建日期
+    wr16(ent + 22, (uint16_t)FAT64_RW_T_LOW);           // 修改时间
+    wr16(ent + 24, (uint16_t)FAT64_RW_T_HIGH);          // 修改日期
+    wr16(ent + 20, (uint16_t)((first_cluster >> 16) & 0xFFFFu));
+    wr16(ent + 26, (uint16_t)(first_cluster & 0xFFFFu));
+    wr32(ent + 28, size);
+    memcopy8(g_rsec + sl.o, ent, 32);
+    // 吃掉 0x00 终止项时把本扇区剩下的部分清零：保证紧随其后的项仍然"未用"（读者遇 0x00 就停）
+    if (sl.term) for (uint32_t k = sl.o + 32u; k < FAT64_SECTOR; k++) g_rsec[k] = 0;
+    if (!rv_write(vol, clba + sl.s, 1, g_rsec)) return false;
+    if (!rv_read(vol, clba + sl.s, 1, g_rcheck)) return false;
+    return (memcmp_64(g_rcheck + sl.o, ent, 32) == 0);
+}
+// 数据写（新文件的簇链已在手）：逐扇区读回比对；文件末尾之后的簇内字节**补零**（不留旧垃圾）
+static bool rw_write_data(int vol, const char* path, uint32_t first, const uint8_t* src, uint32_t len) {
+    const uint32_t cb  = g_rvol[vol].info.cluster_bytes;
+    const uint32_t spc = g_rvol[vol].info.spc;
+    uint32_t c = first, base = 0;
+    for (;;) {
+        const uint32_t clba = rcluster_lba(vol, c);
+        for (uint32_t s = 0; s < spc; s++) {
+            const uint32_t at = base + s * FAT64_SECTOR;
+            for (uint32_t k = 0; k < FAT64_SECTOR; k++) {
+                g_rsec[k] = (at + k < len) ? src[at + k] : 0u;
+            }
+            if (!rv_write(vol, clba + s, 1, g_rsec)) { rlog_rw_fail(vol, "write", "io"); return false; }
+            if (!rv_read(vol, clba + s, 1, g_rcheck)) { rlog_rw_fail(vol, "write", "io"); return false; }
+            if (!rw_cmp_log(vol, path, at, g_rsec, g_rcheck, FAT64_SECTOR)) return false;
+        }
+        base += cb;
+        if (base >= len) break;
+        uint32_t nx = 0;
+        if (!rchain_next(vol, c, &nx) || nx == 0) { rlog_rw_fail(vol, "write", "io"); return false; }
+        c = nx;
+    }
+    return true;
+}
+// 提交后的**整文件**读回比对（走读路径：目录项 + 簇链 + 数据全都要对）
+static bool rw_verify_file(int vol, const char* path, const uint8_t* want, uint32_t len) {
+    Fat64Entry64 e;
+    if (resolve64(vol, path, &e, nullptr) != 0) { rlog_rw_fail(vol, "write", "io"); return false; }
+    if (e.size != len) {
+        rlog_rw_verify_failed(vol, path, len, (uint8_t)(len & 0xFFu), (uint8_t)(e.size & 0xFFu));
+        return false;
+    }
+    uint32_t off = 0;
+    while (off < len) {
+        uint32_t want_n = len - off;
+        if (want_n > sizeof(g_rbuf)) want_n = (uint32_t)sizeof(g_rbuf);
+        uint32_t got = 0;
+        if (fat64_read_range64(vol, path, off, g_rbuf, want_n, &got) != 0 || got != want_n) {
+            rlog_rw_fail(vol, "write", "io");
+            return false;
+        }
+        if (!rw_cmp_log(vol, path, off, want ? (want + off) : nullptr, g_rbuf, got)) return false;
+        off += got;
+    }
+    return true;
+}
+// 空间预检：需要扩链且**空闲簇不够**时提前拒绝（一个字节都不写、目录项不动）-> 1 = 继续，0 = no-space
+static int rw_space_ok(int vol, uint32_t cur_first, uint32_t new_len) {
+    const uint32_t cb = g_rvol[vol].info.cluster_bytes;
+    const uint32_t need = (new_len + cb - 1u) / cb;
+    if (need == 0) return 1;
+    const uint32_t have = (cur_first >= 2) ? chain_len(vol, cur_first, FAT64_RW_MAX_CLUSTERS + 1u) : 0;
+    if (have == 0xFFFFFFFFu) return 1;                       // 坏链：交给下游如实失败
+    if (need <= have) return 1;
+    const uint32_t freec = g_rvol[vol].info.free_clusters;
+    if (freec != 0xFFFFFFFFu && (need - have) > freec) return 0;
+    return 1;
+}
+// ---- fat64_vol_*：对外的六个写操作 ----
+int fat64_vol_create64(int vol, const char* path) {
+    Fat64RwGuard64 wg;                              // 长操作护栏（见 Fat64RwGuard64 说明）
+    if (rw_gate(vol, "write", path) != 0) return -1;
+    Fat64Entry64 e0;
+    if (resolve64(vol, path, &e0, nullptr) == 0) {            // 已存在：touch 语义（不动它）
+        if (e0.attr & 0x10u) { rlog_rw_fail(vol, "write", "bad-path"); return -1; }
+        return 0;
+    }
+    uint32_t parent = 0;
+    char leaf[FAT64_NAME_MAX];
+    if (rw_split(vol, path, &parent, leaf, (int)sizeof(leaf)) != 0) { rlog_rw_fail(vol, "write", "bad-path"); return -1; }
+    uint8_t n11[11];
+    const int pk = rw_pick83(vol, parent, leaf, n11);
+    if (pk <= 0) { rlog_rw_fail(vol, "write", pk < 0 ? "io" : "bad-path"); return -1; }
+    Fat64RwSlot sl;
+    const int fs = dir_free_slot(vol, parent, &sl);
+    if (fs == 0) {
+        const int g = dir_grow(vol, parent, &sl);
+        if (g <= 0) { rlog_rw_fail(vol, "write", g == 0 ? "no-space" : "io"); return -1; }
+    } else if (fs < 0) { rlog_rw_fail(vol, "write", "io"); return -1; }
+    if (!rw_put_entry(vol, sl, n11, 0x20u, 0u, 0u)) { rlog_rw_fail(vol, "write", "io"); return -1; }
+    rlog_rw_write(vol, path, 0, 0, 0);
+    return 0;
+}
+int fat64_vol_write64(int vol, const char* path, const void* data, uint32_t len) {
+    Fat64RwGuard64 wg;
+    if (rw_gate(vol, "write", path) != 0) return -1;
+    if (len > 0 && !data) { rlog_rw_fail(vol, "write", "io"); return -1; }
+    if (len > FAT64_READ_MAX_BYTES) { rlog_rw_fail(vol, "write", "bad-path"); return -1; }
+    Fat64Entry64 e0;
+    const bool exist = (resolve64(vol, path, &e0, nullptr) == 0);
+    if (exist && (e0.attr & 0x10u)) { rlog_rw_fail(vol, "write", "bad-path"); return -1; }
+    uint32_t parent = 0;
+    char leaf[FAT64_NAME_MAX];
+    if (rw_split(vol, path, &parent, leaf, (int)sizeof(leaf)) != 0) { rlog_rw_fail(vol, "write", "bad-path"); return -1; }
+    const uint32_t cb = g_rvol[vol].info.cluster_bytes;
+    const uint32_t need = (len + cb - 1u) / cb;
+    if (need > FAT64_RW_MAX_CLUSTERS) { rlog_rw_fail(vol, "write", "bad-path"); return -1; }
+    if (exist) {
+        // ---- 覆盖已存在文件：走 P8 的三段式（链容量整理 + 逐扇区读回），提交后再整文件读回 ----
+        if (!rw_space_ok(vol, e0.cluster, len)) { rlog_rw_fail(vol, "write", "no-space"); return -1; }
+        if (fat64_ow_begin64(vol, path, len) != 0) { rlog_rw_fail(vol, "write", "no-space"); return -1; }
+        if (len > 0) {
+            uint32_t done = 0;
+            if (fat64_ow_write64(vol, 0, data, len, &done) != 0 || done != len) {
+                (void)fat64_ow_commit64(vol, 0);
+                rlog_rw_fail(vol, "write", "io");
+                return -1;
+            }
+        }
+        if (fat64_ow_commit64(vol, 1) != 0) { rlog_rw_fail(vol, "write", "io"); return -1; }
+        if (!rw_verify_file(vol, path, (const uint8_t*)data, len)) return -1;
+        Fat64Entry64 e1;
+        (void)resolve64(vol, path, &e1, nullptr);
+        rlog_rw_write(vol, path, len, e1.cluster, need);
+        return 0;
+    }
+    // ---- 新建：先分配整条链（不够 = no-space，且**什么都没写**），再写数据，最后才落目录项 ----
+    uint8_t n11[11];
+    const int pk = rw_pick83(vol, parent, leaf, n11);
+    if (pk <= 0) { rlog_rw_fail(vol, "write", pk < 0 ? "io" : "bad-path"); return -1; }
+    Fat64RwSlot sl;
+    const int fs0 = dir_free_slot(vol, parent, &sl);          // 先确认有落目录项的地方（避免白分配）
+    if (fs0 < 0) { rlog_rw_fail(vol, "write", "io"); return -1; }
+    uint32_t first = 0, tail = 0;
+    if (need > 0) {
+        if (!rw_alloc_chain(vol, need, &first, &tail)) { rlog_rw_fail(vol, "write", "no-space"); return -1; }
+        if (!rw_write_data(vol, path, first, (const uint8_t*)data, len)) { rw_release_chain(vol, first, need, 0); return -1; }
+    }
+    int fs = fs0;
+    if (fs == 0) {
+        const int g = dir_grow(vol, parent, &sl);
+        if (g <= 0) { if (need) rw_release_chain(vol, first, need, 0); rlog_rw_fail(vol, "write", g == 0 ? "no-space" : "io"); return -1; }
+    }
+    if (!rw_put_entry(vol, sl, n11, 0x20u, first, len)) {
+        if (need) rw_release_chain(vol, first, need, 0);
+        rlog_rw_fail(vol, "write", "io");
+        return -1;
+    }
+    if (need) ow_fsinfo_add(vol, -(int)need);
+    if (!rw_verify_file(vol, path, (const uint8_t*)data, len)) return -1;
+    rlog_rw_write(vol, path, len, first, need);
+    return 0;
+}
+int fat64_vol_write_at64(int vol, const char* path, uint32_t off, const void* data, uint32_t len) {
+    Fat64RwGuard64 wg;
+    if (rw_gate(vol, "write", path) != 0) return -1;
+    if (len == 0) return 0;
+    if (!data) { rlog_rw_fail(vol, "write", "io"); return -1; }
+    Fat64Entry64 e0;
+    if (resolve64(vol, path, &e0, nullptr) != 0) {           // 不存在：先建空文件（fd64 的 O_CREAT 语义）
+        if (fat64_vol_create64(vol, path) != 0) return -1;
+        if (resolve64(vol, path, &e0, nullptr) != 0) { rlog_rw_fail(vol, "write", "io"); return -1; }
+    }
+    if (e0.attr & 0x10u) { rlog_rw_fail(vol, "write", "bad-path"); return -1; }
+    if (off > FAT64_READ_MAX_BYTES || len > FAT64_READ_MAX_BYTES - off) { rlog_rw_fail(vol, "write", "bad-path"); return -1; }
+    const uint32_t cb = g_rvol[vol].info.cluster_bytes;
+    const uint32_t cur = e0.size;
+    const uint32_t end = off + len;
+    const uint32_t want_size = (end > cur) ? end : cur;
+    if (want_size > cur && !rw_space_ok(vol, e0.cluster, want_size)) { rlog_rw_fail(vol, "write", "no-space"); return -1; }
+    if (fat64_ow_begin64(vol, path, want_size) != 0) { rlog_rw_fail(vol, "write", "no-space"); return -1; }
+    // 洞（off > cur）补零：不留旧簇里的垃圾
+    if (off > cur) {
+        uint32_t z = cur;
+        memzero8(g_rw_zero, FAT64_SECTOR);
+        while (z < off) {
+            uint32_t n = off - z;
+            if (n > FAT64_SECTOR) n = FAT64_SECTOR;
+            uint32_t done = 0;
+            if (fat64_ow_write64(vol, z, g_rw_zero, n, &done) != 0 || done != n) {
+                (void)fat64_ow_commit64(vol, 0);
+                rlog_rw_fail(vol, "write", "io");
+                return -1;
+            }
+            z += n;
+        }
+    }
+    uint32_t done = 0;
+    if (fat64_ow_write64(vol, off, data, len, &done) != 0 || done != len) {
+        (void)fat64_ow_commit64(vol, 0);
+        rlog_rw_fail(vol, "write", "io");
+        return -1;
+    }
+    if (fat64_ow_commit64(vol, 1) != 0) { rlog_rw_fail(vol, "write", "io"); return -1; }
+    // 提交后把**刚写的这一段**读回来逐字节比对（文件内绝对偏移）
+    {
+        uint32_t got = 0;
+        if (fat64_read_range64(vol, path, off, g_rbuf, len, &got) != 0 || got != len) {
+            rlog_rw_fail(vol, "write", "io");
+            return -1;
+        }
+        if (!rw_cmp_log(vol, path, off, (const uint8_t*)data, g_rbuf, len)) return -1;
+    }
+    Fat64Entry64 e1;
+    (void)resolve64(vol, path, &e1, nullptr);
+    rlog_rw_write(vol, path, end, e1.cluster, (want_size + cb - 1u) / cb);
+    return 0;
+}
+int fat64_vol_mkdir64(int vol, const char* path) {
+    Fat64RwGuard64 wg;
+    if (rw_gate(vol, "mkdir", path) != 0) return -1;
+    Fat64Entry64 e0;
+    if (resolve64(vol, path, &e0, nullptr) == 0) {            // 已存在：目录就幂等成功，文件算坏路径
+        if (e0.attr & 0x10u) { rlog_rw_mkdir(vol, path, e0.cluster); return 0; }
+        rlog_rw_fail(vol, "mkdir", "bad-path");
+        return -1;
+    }
+    uint32_t parent = 0;
+    char leaf[FAT64_NAME_MAX];
+    if (rw_split(vol, path, &parent, leaf, (int)sizeof(leaf)) != 0) { rlog_rw_fail(vol, "mkdir", "bad-path"); return -1; }
+    uint8_t n11[11];
+    const int pk = rw_pick83(vol, parent, leaf, n11);
+    if (pk <= 0) { rlog_rw_fail(vol, "mkdir", pk < 0 ? "io" : "bad-path"); return -1; }
+    Fat64RwSlot sl;
+    const int fs0 = dir_free_slot(vol, parent, &sl);
+    if (fs0 < 0) { rlog_rw_fail(vol, "mkdir", "io"); return -1; }
+    uint32_t nc = 0, nt = 0;
+    if (!rw_alloc_chain(vol, 1, &nc, &nt)) { rlog_rw_fail(vol, "mkdir", "no-space"); return -1; }
+    // 新目录簇：写 "."（自己）与 ".."（父；父 = 根时按规范写 0）
+    if (!rw_zero_cluster(vol, nc)) { rw_release_chain(vol, nc, 1, 0); rlog_rw_fail(vol, "mkdir", "io"); return -1; }
+    uint8_t dot11[11], dotdot11[11];
+    for (int i = 0; i < 11; i++) { dot11[i] = ' '; dotdot11[i] = ' '; }
+    dot11[0] = '.';
+    dotdot11[0] = '.'; dotdot11[1] = '.';
+    Fat64RwSlot sd; sd.c = nc; sd.s = 0; sd.o = 0; sd.term = 1;
+    Fat64RwSlot sd2; sd2.c = nc; sd2.s = 0; sd2.o = 32u; sd2.term = 1;
+    const uint32_t up = (parent == g_rvol[vol].info.root_cluster) ? 0u : parent;
+    if (!rw_put_entry(vol, sd, dot11, 0x10u, nc, 0u) ||
+        !rw_put_entry(vol, sd2, dotdot11, 0x10u, up, 0u)) {
+        rw_release_chain(vol, nc, 1, 0);
+        rlog_rw_fail(vol, "mkdir", "io");
+        return -1;
+    }
+    int fs = fs0;
+    if (fs == 0) {
+        const int g = dir_grow(vol, parent, &sl);
+        if (g <= 0) { rw_release_chain(vol, nc, 1, 0); rlog_rw_fail(vol, "mkdir", g == 0 ? "no-space" : "io"); return -1; }
+    }
+    if (!rw_put_entry(vol, sl, n11, 0x10u, nc, 0u)) {
+        rw_release_chain(vol, nc, 1, 0);
+        rlog_rw_fail(vol, "mkdir", "io");
+        return -1;
+    }
+    ow_fsinfo_add(vol, -1);
+    rlog_rw_mkdir(vol, path, nc);
+    return 0;
+}
+int fat64_vol_unlink64(int vol, const char* path) {
+    Fat64RwGuard64 wg;
+    if (rw_gate(vol, "unlink", path) != 0) return -1;
+    Fat64Entry64 e0;
+    uint32_t ec = 0;
+    if (resolve64(vol, path, &e0, &ec) != 0) { rlog_rw_fail(vol, "unlink", "bad-path"); return -1; }
+    if (e0.attr & 0x10u) { rlog_rw_fail(vol, "unlink", "bad-path"); return -1; }   // 目录删除本批不做
+    uint32_t parent = 0;
+    char leaf[FAT64_NAME_MAX];
+    if (rw_split(vol, path, &parent, leaf, (int)sizeof(leaf)) != 0) { rlog_rw_fail(vol, "unlink", "bad-path"); return -1; }
+    uint32_t sc = 0, ss = 0, so = 0;
+    const int fsr = dir_find_slot(vol, parent, leaf, &sc, &ss, &so);
+    if (fsr != 1) { rlog_rw_fail(vol, "unlink", "bad-path"); return -1; }
+    const uint32_t clba = rcluster_lba(vol, sc);
+    if (!rv_read(vol, clba + ss, 1, g_rsec)) { rlog_rw_fail(vol, "unlink", "io"); return -1; }
+    const uint32_t first = (uint32_t)e0.cluster;
+    g_rsec[so] = 0xE5u;                                       // 删除标记
+    for (int k = 20; k < 32; k++) g_rsec[so + k] = 0;          // 起始簇 / 长度清掉（不留给别人看）
+    if (!rv_write(vol, clba + ss, 1, g_rsec)) { rlog_rw_fail(vol, "unlink", "io"); return -1; }
+    if (!rv_read(vol, clba + ss, 1, g_rcheck)) { rlog_rw_fail(vol, "unlink", "io"); return -1; }
+    for (int k = 0; k < 32; k++) {
+        if (g_rcheck[so + k] != g_rsec[so + k]) {
+            rlog_rw_verify_failed(vol, path, (uint32_t)k, g_rsec[so + k], g_rcheck[so + k]);
+            return -1;
+        }
+    }
+    const uint32_t freed = rw_release_chain(vol, first, FAT64_RW_MAX_CLUSTERS + 1u, 1);
+    rlog_rw_aux(vol, "unlink", path, freed, 0);
+    return 0;
+}
+int fat64_vol_truncate64(int vol, const char* path, uint32_t len) {
+    Fat64RwGuard64 wg;
+    if (rw_gate(vol, "truncate", path) != 0) return -1;
+    if (len > FAT64_READ_MAX_BYTES) { rlog_rw_fail(vol, "truncate", "bad-path"); return -1; }
+    Fat64Entry64 e0;
+    if (resolve64(vol, path, &e0, nullptr) != 0) { rlog_rw_fail(vol, "truncate", "bad-path"); return -1; }
+    if (e0.attr & 0x10u) { rlog_rw_fail(vol, "truncate", "bad-path"); return -1; }
+    if (len > e0.size && !rw_space_ok(vol, e0.cluster, len)) { rlog_rw_fail(vol, "truncate", "no-space"); return -1; }
+    if (fat64_ow_begin64(vol, path, len) != 0) { rlog_rw_fail(vol, "truncate", "no-space"); return -1; }
+    if (fat64_ow_commit64(vol, 1) != 0) { rlog_rw_fail(vol, "truncate", "io"); return -1; }
+    Fat64Entry64 e1;
+    if (resolve64(vol, path, &e1, nullptr) != 0 || e1.size != len) {
+        rlog_rw_verify_failed(vol, path, len, (uint8_t)(len & 0xFFu), (uint8_t)(e1.size & 0xFFu));
+        return -1;
+    }
+    // 变短时最后一簇的**尾部必须全 0**（不留旧内容）——读回来逐字节确认
+    const uint32_t cb = g_rvol[vol].info.cluster_bytes;
+    if (len > 0 && (len % cb) != 0 && e1.cluster >= 2) {
+        const uint32_t from = len % cb;
+        uint32_t lc = e1.cluster;
+        if (!chain_nth(vol, e1.cluster, len / cb, &lc)) { rlog_rw_fail(vol, "truncate", "io"); return -1; }
+        const uint32_t clba2 = rcluster_lba(vol, lc);
+        for (uint32_t s = from / FAT64_SECTOR; s < g_rvol[vol].info.spc; s++) {
+            if (!rv_read(vol, clba2 + s, 1, g_rcheck)) { rlog_rw_fail(vol, "truncate", "io"); return -1; }
+            const uint32_t start = (s == from / FAT64_SECTOR) ? (from % FAT64_SECTOR) : 0u;
+            for (uint32_t k = start; k < FAT64_SECTOR; k++) {
+                if (g_rcheck[k] != 0) {
+                    rlog_rw_verify_failed(vol, path, s * FAT64_SECTOR + k, 0u, g_rcheck[k]);
+                    return -1;
+                }
+            }
+        }
+    }
+    rlog_rw_aux(vol, "truncate", path, len, (len + cb - 1u) / cb);
+    return 0;
+}
 // ---- 挂载（只读）----
 // 同 (drive,lba) 幂等复用；只挂 FAT32（FAT12/16 的 12/16 位 FAT 项本批不做，如实拒绝并写清类型）。
 int fat64_mount64(int drive, uint32_t lba, int* out_vol) {

@@ -209,4 +209,37 @@ int fat64_overwrite64(int vol, const char* path, const void* data, uint32_t len)
 //   commit ok=1 更新目录项（起始簇 + 长度），ok=0 放弃（目录项不动，内容可能只写了一半 —— 如实打点）。
 int fat64_ow_begin64(int vol, const char* path, uint32_t len);
 int fat64_ow_write64(int vol, uint32_t off, const void* data, uint32_t len, uint32_t* out_done);
+
+// ==================== ★ P8b：多卷 FAT32 的**完整可写层**（新建 / 覆盖 / 建目录 / 删除 / 截断）====================
+// 与上面 P8 的"覆盖写已存在文件"是同一层（都在多卷 rv_* 状态上），但补上了盘上结构的**增删**：
+//   空闲簇分配（FAT 链 + 两份 FAT 同步 + FSInfo free 计数）、目录项落盘（8.3 短名）、
+//   按簇写文件（越界/空间不足一律**有界失败**，绝不写一半）、truncate（链容量整理）、unlink（0xE5 + 回收）。
+// 安全边界（和 P8 完全一致）：**只有** fat64_set_writable64() 打开过的卷能写；其它卷（系统卷 / ESP /
+//   固定盘上的 FAT32）在这里一律 `[FAT64] rw fail … reason=ro` 且一个字节都不写。
+// 不做（如实写清，别指望它是一般意义的 FAT32 实现）：
+//   * **不写 LFN（0x0F 长名项）**：新名字超过 8.3 时按 FAT 的老规矩落成 "BASE~N.EXT" 短名
+//     （BASE = 前 6 个合法字符 + '~' + 1..9 撞名进位），读回来就是那个短名 —— 长名**本批没有实现**；
+//   * 不做改名 / 移动 / 递归删除 / 回收站 / 碎片整理；
+//   * 新项的日期时间用**固定值**（2026-09-20 12:34:10，与宿主侧构造器同口径）：本层不接 RTC 时区模型，
+//     时间在 FAT 上只用于显示，宁可写一个可复现的常数也不假装有一个真实的本地时间；
+//   * 单文件上限沿用 FAT64_READ_MAX_BYTES（16MB）；单次分配的簇数上限 FAT64_RW_MAX_CLUSTERS。
+// 打点（行锁；原文格式勿改）：
+//   [FAT64] rw mount vol=<n> letter=D: writable=1 clusters=<n>          （每卷一次；盘符变了会重打）
+//   [FAT64] rw write vol=<n> path="<p>" len=<n> cluster=<c> nclusters=<k> verify=1   （最多 32 行）
+//   [FAT64] rw mkdir vol=<n> path="<p>" cluster=<c> ok=1                （最多 32 行）
+//   [FAT64] rw truncate vol=<n> path="<p>" len=<n> nclusters=<k> verify=1
+//   [FAT64] rw unlink vol=<n> path="<p>" freed=<k> ok=1
+//   [FAT64] rw fail vol=<n> op=<write|mkdir|truncate|unlink> reason=<ro|no-space|bad-path|io>
+//   [FAT64] rw verify FAILED vol=<n> path="<p>" at=<字节> want=<hex> got=<hex>
+//     （每次写完**立刻读回逐字节比对**；上面这条 = 盘上真出错时的证据行，正常路径不会出现）
+// 注意：[FAT64] mount 行里的 ro=1 是**挂载那一刻**的状态（挂载发生在"这是不是 U 盘"判定之前），
+//   写开关由 fs64_mount_fat64（驱动器号 >= ATA64_USB_BASE 时）随后立刻打开 —— 最终状态看 rw mount 行。
+int fat64_rw_announce64(int vol);                 // 幂等：第一个需要盘符的地方把 rw mount 行打出来
+int fat64_vol_create64(int vol, const char* path);                              // 新建空文件（存在则无操作）
+int fat64_vol_write64(int vol, const char* path, const void* data, uint32_t len);  // 整文件写（新建或覆盖）
+int fat64_vol_write_at64(int vol, const char* path, uint32_t off, const void* data, uint32_t len);  // 按偏移写
+int fat64_vol_mkdir64(int vol, const char* path);                               // 新建目录（含 "." / ".."）
+int fat64_vol_unlink64(int vol, const char* path);                              // 删除文件（0xE5 + 回收簇链）
+int fat64_vol_truncate64(int vol, const char* path, uint32_t len);              // 截断到 len 字节（0 = 清空）
+static const uint32_t FAT64_RW_MAX_CLUSTERS = 65536u;   // 单次新建/覆盖的簇数护栏（16MB/512B = 32768 以内正常）
 int fat64_ow_commit64(int vol, int ok);

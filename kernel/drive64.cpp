@@ -75,7 +75,9 @@ static void log_letter(const DriveInfo64& e) {
     dbg64_dec(e.free_kb);
     dbg64_str(" slot=");                       // ★ 多卷：这个盘符落在哪个 vfs64 卷槽
     if (e.slot != DRV64_SLOT_NONE) dbg64_dec((uint64_t)e.slot); else dbg64_str("-");
-    if (e.readonly) dbg64_str(" ro=1");        // ★ 批次 K：FAT32 卷一律只读
+    if (e.fskind == DRV64_FS_FAT32 || e.readonly) dbg64_str(e.readonly ? " ro=1" : " ro=0");
+    // ★ P8b：FAT32 卷现在有**两种**状态（固定盘 / ESP = 只读；U 盘上的 = 可写，见 fs64_mount_fat64），
+    //   所以 FAT 条目一律**显式**打 ro=0|1；其它卷（VimtuFS2）保持旧行为（只在只读时打 ro=1）。
     if (e.fatvol != DRV64_SLOT_NONE) {
         dbg64_str(" fatvol=");
         dbg64_dec((uint64_t)e.fatvol);
@@ -231,7 +233,9 @@ int drive64_scan64() {
                     copy_str(e.fs, DRV64_FS_MAX, "FAT32");
                     copy_str(e.name, DRV64_NAME_MAX, (p[i].type == 0xEF) ? "EFI 系统分区" : "FAT32 卷");
                     e.browsable = true;
-                    e.readonly = true;                       // fs64 层仍然只读（写入口不变）
+                    // ★ P8b：**只有 U 盘（驱动器号 >= ATA64_USB_BASE）上的 FAT32 卷**可写 —— 与
+                    //   fs64_mount_fat64 的 readonly 口径是**同一个条件**（那边才是读写状态的唯一来源）。
+                    e.readonly = (d < ATA64_USB_BASE);
                     e.vol = fvol;
                     e.fatvol = (uint8_t)(fvol - FS64_VOL_FAT_BASE);
                     e.total_known = fv.total_known ? true : false;
@@ -612,7 +616,12 @@ int drive64_selftest64() {
             Fs64Vol64 fv;
             if (e.fatvol == DRV64_SLOT_NONE || e.vol < FS64_VOL_FAT_BASE) { fails |= 64; continue; }
             if (fs64_vol_info64(e.vol, &fv) != 0) { fails |= 64; continue; }
-            if (fv.kind != FS64_KIND_FAT32 || !fv.readonly) { fails |= 64; continue; }
+            if (fv.kind != FS64_KIND_FAT32) { fails |= 64; continue; }
+            // ★ P8b：FAT32 卷现在有只读（固定盘 / ESP）与可写（U 盘，磁盘号 >= ATA64_USB_BASE）两种
+            //   合法状态 —— 这条不变式改成更强的"**条目与 fs64 卷表必须一致**"，两种状态都要对得上；
+            //   同时可写状态只允许出现在 U 盘上（绝不因为在别的盘上挂错而变得可写）。
+            if ((fv.readonly ? 1 : 0) != (e.readonly ? 1 : 0)) { fails |= 64; continue; }
+            if (!fv.readonly && fv.disk < ATA64_USB_BASE) { fails |= 64; continue; }
             if (fv.disk != e.disk || fv.start_lba != e.start_lba) fails |= 64;
         } else {
             if (e.slot == DRV64_SLOT_NONE || e.slot >= (uint8_t)VFS64_SLOT_MAX) { fails |= 64; continue; }

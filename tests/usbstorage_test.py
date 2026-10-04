@@ -94,6 +94,9 @@ ELF_NAME = "STICKELF.ELF"                        # 8.3 短名（= build64/hello.
 DOCS_DIR = "docs"
 DOCS_NAME = "notes.txt"
 DOCS_TEXT = b"notes inside the USB stick\n"
+# ★ P8b：终端往 U 盘上写的那个文件（关掉 QEMU 后宿主侧逐字节核对）
+WR_NAME = "usbwr.txt"
+WR_TEXT = b"vimtu64-usbstorage-now-writable"
 ROOT_ITEMS = 4                                   # 3 个文件 + 1 个目录
 
 FORBIDDEN = ["PANIC", "TRIPLE FAULT", "FAILED mask=", "selftest FAIL", "OOM:",
@@ -104,13 +107,13 @@ FORBIDDEN = ["PANIC", "TRIPLE FAULT", "FAILED mask=", "selftest FAIL", "OOM:",
 # 宿主侧：造 U 盘（MBR + 真 FAT32）
 # ---------------------------------------------------------------------------
 def put_file(dev, data):
-    """按簇分配 + 写入（返回首簇）。簇大小按 dev.spc 算（这里 spc=1）。"""
+    """按簇分配 + 写入（返回 (首簇, 簇数)）。簇大小按 dev.spc 算（这里 spc=1）。"""
     per = dev.spc * SECTOR
     n = max(1, (len(data) + per - 1) // per)
     c = dev.alloc(n)
     for i in range(n):
         dev.write_cluster(c + i, data[i * per:(i + 1) * per])
-    return c
+    return c, n
 
 
 def make_usbstick(path):
@@ -122,16 +125,16 @@ def make_usbstick(path):
     vap = open(HELLO_VAP, "rb").read()
     elf = open(HELLO_ELF, "rb").read()
 
-    c_txt = put_file(dev, TXT_TEXT)
+    c_txt, n_txt = put_file(dev, TXT_TEXT)
     ents += dev.dir_entry(TXT_NAME, b"USBREA~1TXT", 0x20, c_txt, len(TXT_TEXT))
-    c_vap = put_file(dev, vap)
+    c_vap, n_vap = put_file(dev, vap)
     ents += dev.dir_entry(VAP_NAME, b"STICKAPPVAP", 0x20, c_vap, len(vap))
-    c_elf = put_file(dev, elf)
+    c_elf, n_elf = put_file(dev, elf)
     ents += dev.dir_entry(ELF_NAME, b"STICKELFELF", 0x20, c_elf, len(elf))
 
     # 子目录 docs/notes.txt
     c_docs = dev.alloc(1)
-    c_note = put_file(dev, DOCS_TEXT)
+    c_note, n_note = put_file(dev, DOCS_TEXT)
     dz = bytearray()
     dz += dev.short_entry(b".          ", 0x10, c_docs, 0)
     dz += dev.short_entry(b"..         ", 0x10, 0, 0)
@@ -155,7 +158,9 @@ def make_usbstick(path):
     with open(path, "wb") as f:
         f.write(bytes(full))
     return {"clusters": dev.clusters, "fatsz": dev.fatsz, "spc": dev.spc,
-            "blocks": STICK_SECTORS, "total_kb": STICK_TOTAL_KB,
+            "blocks": STICK_SECTORS, "total_kb": STICK_TOTAL_KB, "data_start": dev.data_start,
+            "map": {"root": (root, 1), "txt": (c_txt, n_txt), "vap": (c_vap, n_vap),
+                    "elf": (c_elf, n_elf), "docs": (c_docs, 1), "note": (c_note, n_note)},
             "vap": vap, "elf": elf, "txt": TXT_TEXT, "docs": DOCS_TEXT}
 
 
@@ -554,14 +559,20 @@ def main():
               m_mount is not None and int(m_mount.group(2)) == info["clusters"],
               m_mount.group(0) if m_mount else "（缺行）")
         m_letter = re.search(r"\[DRV64\] letter=D: disk=(\d+) part=(\d+) fs=FAT32 total_kb=(\d+) "
-                             r"free_kb=(\d+) slot=(\S+) ro=1 fatvol=(\d+)", log)
+                             r"free_kb=(\d+) slot=(\S+) ro=(\d) fatvol=(\d+)", log)
         # 注意 total_kb 是**卷容量**（按 BPB 的簇数 x 簇大小算）而不是整盘容量：
         #   clusters(68874) x 512B / 1024 = 34437 KB。整盘容量在 [USBST] capacity 那条断言里。
         vol_kb = info["clusters"] // 2
-        check("★ U 盘拿到盘符 D:（disk=24 part=1 fs=FAT32 total_kb=%d ro=1 fatvol=…）" % vol_kb,
+        # ★ P8b：U 盘上的 FAT32 = **可写卷** -> ro=0（固定盘/ESP 上的仍 ro=1，见 fs_tree/fatread 两个测试）
+        check("★ U 盘拿到盘符 D: 且是**可写卷**（disk=24 part=1 fs=FAT32 total_kb=%d ro=0 fatvol=…）" % vol_kb,
               m_letter is not None and int(m_letter.group(1)) == 24 and int(m_letter.group(2)) == 1
-              and int(m_letter.group(3)) == vol_kb and int(m_letter.group(4)) <= vol_kb,
+              and int(m_letter.group(3)) == vol_kb and int(m_letter.group(4)) <= vol_kb
+              and m_letter.group(6) == "0",
               m_letter.group(0) if m_letter else "（缺行）")
+        check("★ 写开关打开后的最终状态（[FAT64] rw mount vol=… letter=D: writable=1 clusters=%d）"
+              % info["clusters"],
+              re.search(r"\[FAT64\] rw mount vol=\d+ letter=D: writable=1 clusters=%d" % info["clusters"],
+                        log) is not None)
         check("[DRV64] selftest PASS（重扫后盘符表自洽）", "[DRV64] selftest PASS" in log)
         print("--- 1c) 文件管理器：此电脑 -> 双击 D: 卡片 -> U 盘根目录 ---")
         mon.key("meta_l", wait=1.0)
@@ -596,8 +607,9 @@ def main():
         check("双击 D: 卡片进入 U 盘（[UI] explorer enter letter=D: fatvol=… ok items=%d）"
               % ROOT_ITEMS, ok_enter)
         elog2 = vm.log()[since:]
-        check("★ 只读卷打点（[UI] explorer vol letter=D: fs=FAT32 ro=1 readonly …）",
-              re.search(r"\[UI\] explorer vol letter=D: fs=FAT32 ro=1", elog2) is not None)
+        check("★ 可写卷打点（[UI] explorer drive letter=D: fs=FAT32 … ro=0；只读卷才有 'vol … ro=1 readonly'）",
+              re.search(r"\[UI\] explorer drive letter=D: fs=FAT32 total_kb=%d free_kb=\d+ ro=0"
+                        % vol_kb, elog2) is not None)
         check("U 盘根目录列出 %d 项（[UI] explorer nav path=/ items=%d）" % (ROOT_ITEMS, ROOT_ITEMS),
               vm.wait_nav("/", ROOT_ITEMS, 20, since))
         check("★ 长名文件在列（item name=%s）" % TXT_NAME,
@@ -838,9 +850,44 @@ def main():
         stick_after = f.read()
     h0 = zlib.crc32(stick_before) & 0xFFFFFFFF
     h1 = zlib.crc32(stick_after) & 0xFFFFFFFF
-    check("★ U 盘镜像（%d 字节 = %.1fMB）测试前后 CRC32 相同（只读：谁都没写它）"
-          % (len(stick_before), len(stick_before) / 1048576.0), h0 == h1,
+    # ★ P8b：判据**改了，语义更强** —— 以前是"整根镜像字节不变"（只读），现在是：
+    #   ① 镜像**变了**（真的写了盘）② 原有文件的数据簇**逐字节未变** ③ 新文件内容逐字节对得上。
+    check("★ U 盘镜像（%d 字节 = %.1fMB）测试前后 CRC32 **已变化**（可写卷：真的写了盘）"
+          % (len(stick_before), len(stick_before) / 1048576.0), h0 != h1,
           "before=%08X after=%08X" % (h0, h1))
+    base_off = STICK_PART_LBA * SECTOR + info["data_start"] * SECTOR
+    changed = []
+    for nm, (c0, n) in info["map"].items():
+        if nm == "root":
+            continue
+        for k in range(n):
+            o = base_off + ((c0 - 2) + k) * SECTOR
+            if stick_before[o:o + SECTOR] != stick_after[o:o + SECTOR]:
+                changed.append((nm, k))
+    check("★★ 原有文件（长名文本 / .vap / .elf / docs/notes.txt）的数据簇**逐字节未变**",
+          not changed, "被改动=%s" % (changed[:6],))
+    ents = []
+    for i in range(16):
+        e = stick_after[base_off + i * 32:base_off + (i + 1) * 32]
+        if len(e) < 32 or e[0] == 0x00:
+            break
+        if e[0] == 0xE5 or e[11] == 0x0F:
+            continue
+        nm = e[0:8].decode("latin-1").rstrip(" ") + "." + e[8:11].decode("latin-1").rstrip(" ")
+        fc = struct.unpack_from("<H", e, 26)[0] | (struct.unpack_from("<H", e, 20)[0] << 16)
+        sz = struct.unpack_from("<I", e, 28)[0]
+        ents.append((nm, fc, sz))
+    got = [x for x in ents if x[0] == WR_NAME.upper()]
+    check("★ 宿主侧在 U 盘根目录里找到终端写的新文件 /%s（size=%d）" % (WR_NAME.upper(), len(WR_TEXT)),
+          len(got) == 1 and got[0][2] == len(WR_TEXT), str(ents))
+    if len(got) == 1:
+        off = base_off + (got[0][1] - 2) * SECTOR
+        data = stick_after[off:off + got[0][2]]
+        check("★★ /%s 的内容与客人写的**逐字节一致**（%d 字节）" % (WR_NAME.upper(), len(WR_TEXT)),
+              data == WR_TEXT, "盘上=%r" % data[:48])
+    check("★ 原有四个条目仍在根目录里（长名文本 / .vap / .elf / docs）",
+          all(any(x[0].startswith(n.split(".")[0][:6].upper()) for x in ents)
+              for n in (TXT_NAME, VAP_NAME, ELF_NAME, DOCS_DIR)), str([x[0] for x in ents]))
 
     if args.keep:
         print("[usbstorage] 串口：%s / %s / 截图：%s" % (serial, serial2, shot_ppm))
