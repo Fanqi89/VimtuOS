@@ -605,8 +605,12 @@ def main():
         time.sleep(4.0)
         t = sess.text_since(base)
         wc1 = marked(t.replace("[PIPE]", "@@"), "AFTER_WC")
-        H("组合链① ls -l /tcc/demo | grep hello | wc -l 的输出是 1",
-          re.search(r"\| wc -l[^\n]*\n(?:[^\n]*\n){0,3}\s*1\s*\n", t) is not None, "")
+        # ★ 修正（值错了，不是断言放宽）：/tcc/demo 里名字含 "hello" 的有**两条** —— hello.c 与
+        #   hello.lua（tools/lua_pack_win.py 往 /tcc/demo 装 *.lua；宿主侧独立解析卷可复现，
+        #   tests/pipe64_test.py 的宿主侧逐字节检查也是 b"2\n"）。原来写 1 是"/tcc/demo 只有 hello.c"
+        #   那个旧快照的残留期望；blocking pipe 修好后整条链的输出不再丢，真值稳定为 2。
+        H("组合链① ls -l /tcc/demo | grep hello | wc -l 的输出是 2（hello.c + hello.lua）",
+          re.search(r"\|\s*wc -l[^\n]*\n(?:[^\n]*\n){0,3}\s*2\s*\n", t) is not None, "")
         H("组合链② cat a | sed 's/x/y/' > b 后 cat b 得到 BETA", "BETA" in t)
         H("组合链③ find + head（实时枚举）", "hello.c" in t)
 
