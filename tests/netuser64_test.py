@@ -20,7 +20,14 @@
 
 网络：QEMU **用户模式网络**（-netdev user + e1000）。客人访问宿主用"宿主别名" 10.0.2.2：
    - UDP/TCP 回显服务 = 宿主 Python 线程（0.0.0.0 绑定，覆盖 127.0.0.1 与网卡地址两种映射）；
-   - 反方向用 hostfwd=（宿主 127.0.0.1:<hp> -> 客人 :<lport>）让宿主连进客人。
+   - **DNS 应答器** = 宿主 Python 线程（0.0.0.0:<空闲口> 的受控应答：返回**宿主真解析**的 A 记录 +
+     第二条假 A，名字用压缩指针 0xC00C）。为什么要受控：本机 QEMU 的 **slirp 内置 DNS 整个不可用**
+     —— 默认上游与显式 -netdev user,dns=127.0.0.1 两种配置下实测都是 3 发查询、4.5 s 零应答；换成
+     宿主别名上的普通 UDP 端口就立刻通。所以夹具用 /etc/netd.conf 的 dns=/dnsport=（**配置优先于
+     DHCP**）把上游指到本应答器：客人仍然真的查"配置的那个服务器:端口"、真的解析应答报文；
+   - 反方向用 hostfwd=（宿主 127.0.0.1:<hp> -> 客人 :<lport>）让宿主连进客人。宿主**等串口里出现
+     "[NET] tcp listen port=" 之后才连**（否则会在客人还没有监听端口时反复连接：slirp 把 SYN 重传给客人、
+     而客人真正接受时那条**宿主 socket 早已关掉** —— 回显打到空气里，这是夹具第一版的假失败根因）。
 客人侧配置写进夹具盘的 /etc/netd.conf（端口由本脚本挑空闲口 -> 顺带证明配置覆盖生效）。
 
 用法（必须用 Windows 原生 Python）：
@@ -83,6 +90,32 @@ def fnv1a32(b):
 
 PAT_FNV = fnv1a32(PATTERN)
 
+# ★ 夹具的 DNS 约定（成因见 HostServers._dns_server 的注释）：
+#   DNS_UPSTREAM = 客人该去查的"上游 DNS 服务器" —— 写进夹具 /etc/netd.conf 的 dns=（配置优先于
+#   DHCP 下发的值）。地址取 QEMU 的宿主别名 10.0.2.2：客人发给它的 UDP 由 slirp 中继到宿主的
+#   loopback 上的同一个端口（端口由本脚本挑空闲口 -> dnsport=），那里是本脚本的受控应答器。
+DNS_UPSTREAM = "10.0.2.2"
+#   第一条 A 记录 = 宿主真解析出来的地址；宿主自己解析不了时退回这个假地址（此时比对项降级为如实标注）
+DNS_FALLBACK_IP = "203.0.113.9"
+#   第二条 A 记录：TEST-NET-2 里的假地址（只为证明"多条 A 记录"的解析路径）
+DNS_ANSWER2 = "198.51.100.7"
+
+
+def watch_listen(vm, hs, since, timeout=240):
+    """把"客人开始 listen"这件事告诉宿主侧 hostfwd 客户端（消掉夹具的时序竞态）。
+
+    观测点就是串口里的 "[NET] tcp listen port=<n>"（netd 的 listen 步骤自己打的；格式见
+    user/net/netd.c 的打点段）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if "[NET] tcp listen port=" in vm.log()[since:]:
+            hs.listen_evt.set()
+            return True
+        if vm.proc.poll() is not None:
+            return False
+        time.sleep(0.3)
+    return False
+
 FORBIDDEN = ["PANIC", "TRIPLE FAULT", "[NET] netd aborted", "[NET] no net_raw MAC",
              "[ELF64] reject", "[NET] netd fatal"]
 
@@ -115,15 +148,19 @@ def load_mod(name, fname):
 
 # ============================ 宿主侧三个回显/客户端（线程，写一份宿主证据文件）============================
 class HostServers:
-    def __init__(self, tcp_port, udp_port, fwd_host_port, log_path):
+    def __init__(self, tcp_port, udp_port, fwd_host_port, log_path, dns_name, dns_ip, dns_port):
         self.tcp_port = tcp_port
         self.udp_port = udp_port
         self.fwd_host_port = fwd_host_port
         self.log_path = log_path
+        self.dns_name = dns_name
+        self.dns_ip = dns_ip                    # 第一条 A 记录（宿主真解析；解析不到时用 DNS_FALLBACK_IP）
+        self.dns_port = dns_port                # 应答器监听的端口（= 夹具 conf 里 dnsport= 的那个）
         self.stop = threading.Event()
+        self.listen_evt = threading.Event()     # 客人开始 listen 的信号（消掉 hostfwd 的时序竞态）
         self.threads = []
         self.lock = threading.Lock()
-        self.ev = {"tcp_srv": None, "udp_srv": None, "tcp_fwd": None}
+        self.ev = {"tcp_srv": None, "udp_srv": None, "tcp_fwd": None, "dns_srv": None}
 
     def log(self, line):
         with self.lock:
@@ -195,20 +232,26 @@ class HostServers:
         s.close()
 
     # ---- hostfwd 反方向：宿主主动连客人（客人 listen 后回显 64 B）----
-    # ★ 重试到**真的换到 64 B**为止：客人的 listen 步骤排在验收串的最后（起机 + 前面几步之后），
-    #   所以这里的连接会先失败/被忽略若干次；每次失败/超时都换一条新连接重来。
+    # ★ 必须等客人真的开始 listen 再连（信号 = 串口里的 "[NET] tcp listen port="）。
+    #   第一版夹具不等：客人的 listen 排在验收串最后，宿主于是反复连接；slirp 把这些 SYN 重传给客人
+    #   （客人在 DHCP 阶段按"目的地址不是我们"丢、之后按"不认识的连接"丢），而客人后来接受的那条连接
+    #   对应的**宿主 socket 早就关掉了** —— 回显打到空气里，宿主的证据行永远写不出来（假失败根因）。
     def _tcp_fwd_client(self):
-        deadline = time.time() + 240
+        if not self.listen_evt.wait(timeout=240):
+            self.log("HOST tcpfwd FAILED: 客人一直没 listen（240 s 超时）")
+            return
+        deadline = time.time() + 120
         attempt = 0
         while not self.stop.is_set() and time.time() < deadline:
             attempt += 1
             try:
-                c = socket.create_connection((TCP_FWD_HOST, self.fwd_host_port), timeout=3)
-            except OSError:
-                time.sleep(0.4)
+                c = socket.create_connection((TCP_FWD_HOST, self.fwd_host_port), timeout=5)
+            except OSError as e:
+                self.log("HOST tcpfwd attempt=%d connect-failed: %s" % (attempt, e))
+                time.sleep(0.5)
                 continue
             with c:
-                c.settimeout(8)
+                c.settimeout(10)
                 got = b""
                 try:
                     c.sendall(PATTERN)
@@ -219,18 +262,80 @@ class HostServers:
                         got += ch
                 except OSError as e:
                     self.log("HOST tcpfwd attempt=%d incomplete: %s" % (attempt, e))
-                    time.sleep(0.4)
+                    time.sleep(0.5)
                     continue
                 if got == PATTERN:
                     self.ev["tcp_fwd"] = got
                     self.log("HOST tcpfwd attempt=%d sent_sha=%s recv_len=%d recv_sha=%s pattern_ok=1"
                              % (attempt, PAT_SHA[:16], len(got), hashlib.sha256(got).hexdigest()[:16]))
                     return
-                time.sleep(0.4)
+                self.log("HOST tcpfwd attempt=%d short-read len=%d (重来)" % (attempt, len(got)))
+                time.sleep(0.5)
         self.log("HOST tcpfwd FAILED attempts=%d (客人没回显)" % attempt)
 
+    # ---- 受控 DNS 应答器（宿主 0.0.0.0:<dns_port>；客人经"宿主别名" 10.0.2.2 打过来）----
+    # 为什么要有它：本机 QEMU 的 **slirp 内置 DNS 整个不可用** —— 两种配置（默认上游、显式
+    #   -netdev user,dns=127.0.0.1）下实测都是：客人每次 3 发查询、4.5 s 一条应答都没有；
+    #   而把上游换成宿主别名 10.0.2.2 上的一个普通 UDP 端口（就是本应答器）时，同一个客人客户端
+    #   立刻拿到应答。也就是说那是模拟器/宿主环境的问题，不是客人栈的行为。
+    #   所以夹具用 /etc/netd.conf 的 dns=/dnsport= 把上游指到这里（**配置优先于 DHCP**，见
+    #   user/net/netd.c 的 cfg_apply_kv 注释）：客人仍然真的按"配置的 DNS 服务器:端口"发查询、
+    #   真的解析应答报文，而回来的 A 记录是**宿主真解析**出来的地址（本脚本 socket.gethostbyname
+    #   的结果），名字用 DNS **压缩指针** 0xC00C 编码，并且给两条 A（证明多答案解析）。
+    def _dns_server(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.bind(("0.0.0.0", self.dns_port))
+            s.settimeout(1.0)
+        except OSError as e:
+            self.log("HOST dns_srv FAIL bind 0.0.0.0:%d: %s" % (self.dns_port, e))
+            return
+        d = time.time() + 240
+        while not self.stop.is_set() and time.time() < d:
+            try:
+                q, addr = s.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            r = None
+            if len(q) >= 16:
+                qid, _fl, qd = struct.unpack_from(">HHH", q, 0)
+                o, bad = 12, False
+                while o < len(q) and q[o] != 0:
+                    if q[o] & 0xC0 or o + 1 + q[o] > len(q):
+                        bad = True
+                        break
+                    o += 1 + q[o]
+                o += 1
+                if qd == 1 and not bad and o + 4 <= len(q):
+                    question = q[12:o + 4]
+                    qtype = struct.unpack_from(">H", q, o)[0]
+                    qname = "?"                      # 把查询里的 QNAME 真解出来（证据里写我们**看到的**名字）
+                    if not bad:
+                        lb, o2 = [], 12
+                        while o2 < o - 1 and q[o2] != 0:
+                            ln = q[o2]
+                            lb.append(q[o2 + 1:o2 + 1 + ln].decode("ascii", "replace"))
+                            o2 += 1 + ln
+                        if lb:
+                            qname = ".".join(lb)
+                    body = b""
+                    for v in (self.dns_ip, DNS_ANSWER2):
+                        body += b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 300, 4) + socket.inet_aton(v)
+                    r = struct.pack(">HHHHHH", qid, 0x8180, 1, 2, 0, 0) + question + body
+                    self.ev["dns_srv"] = q
+                    self.log("HOST dns_srv from=%s:%d qid=0x%04x qname=%s qtype=%d results=%d a1=%s a2=%s "
+                             "ptr=1 rlen=%d" % (addr[0], addr[1], qid, qname, qtype, 2,
+                                                self.dns_ip, DNS_ANSWER2, len(r)))
+            if r is None:
+                self.log("HOST dns_srv malformed query len=%d (不回答)" % len(q))
+                continue
+            s.sendto(r, addr)
+        s.close()
+
     def start(self):
-        for fn in (self._tcp_echo_server, self._udp_echo_server, self._tcp_fwd_client):
+        for fn in (self._tcp_echo_server, self._udp_echo_server, self._dns_server, self._tcp_fwd_client):
             t = threading.Thread(target=fn, daemon=True)
             t.start()
             self.threads.append(t)
@@ -422,6 +527,7 @@ def main():
     guest_listen = free_port((tcp_port, udp_port))
     hfwd_host = free_port((tcp_port, udp_port, guest_listen))
     dns_name = "example.com"
+    dns_port = free_port((tcp_port, udp_port, guest_listen, hfwd_host), udp=True)
     host_ip = None
     try:
         host_ip = socket.gethostbyname(dns_name)
@@ -437,6 +543,8 @@ def main():
         f.write("udpport=%d\n" % udp_port)
         f.write("listenport=%d\n" % guest_listen)
         f.write("dnsname=%s\n" % dns_name)
+        f.write("dns=%s\n" % DNS_UPSTREAM)      # 显式指定 -> 覆盖 DHCP 下发的 DNS（⑧ 的断言要看这个）
+        f.write("dnsport=%d\n" % dns_port)      # 上游端口 = 宿主受控应答器（本机 slirp 内置 DNS 不可用）
     pack = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "net_pack_win.py"),
                            "--fixture-img", FIXTURE, "--from-vol", NETVOL, "--conf", conf,
                            "--netd", NETD_ELF, "--system", SYSTEM_IMG],
@@ -455,7 +563,8 @@ def main():
     # ==================== ③ 宿主服务（先起，客人在后面几步才用到） ====================
     print("== ③ 宿主 Python 回显服务（TCP %d / UDP %d / hostfwd %d -> 客人 :%d）=="
           % (tcp_port, udp_port, hfwd_host, guest_listen))
-    hs = HostServers(tcp_port, udp_port, hfwd_host, os.path.join(tmp, "host.log"))
+    hs = HostServers(tcp_port, udp_port, hfwd_host, os.path.join(tmp, "host.log"), dns_name,
+                     host_ip or DNS_FALLBACK_IP, dns_port)
     hs.start()
 
     # ==================== ④ QEMU：起机 -> 终端 -> elfrun /bin/netd ====================
@@ -479,6 +588,8 @@ def main():
         time.sleep(0.8)
         n0 = len(vm.log())
         vm.type_line("elfrun /bin/netd", per_key=0.05)
+        # ★ 宿主侧 hostfwd 客户端要等客人真的 listen 再连（信号 = 串口里的 listen 打点）。
+        threading.Thread(target=watch_listen, args=(vm, hs, n0), daemon=True).start()
         done = vm.wait_log("[NET] netd done", args.netd_timeout)
         check("④ `elfrun /bin/netd` 跑完整验收串（[NET] netd done，<= %d s）" % args.netd_timeout, done)
         time.sleep(0.6)
@@ -506,14 +617,14 @@ def main():
     # 用户态指针越界由分派层拦（[SYSCALL] deny nr=53）。两边都要有证据。
     check("⑤ [NETRAW] 长度口径被拦（短帧/超 MTU 的 deny 打点齐全）",
           all(re.search(p, log) for p in (
-              r"\[NETRAW\] deny op=0 reason=short err=3",
-              r"\[NETRAW\] deny op=0 reason=oversize err=6",
-              r"\[NETRAW\] deny op=1 reason=short err=3",
-              r"\[NETRAW\] deny op=1 reason=oversize err=6")))
+              r"\[NETRAW\] deny op=0 reason=short err=-3",
+              r"\[NETRAW\] deny op=0 reason=oversize err=-6",
+              r"\[NETRAW\] deny op=1 reason=short err=-3",
+              r"\[NETRAW\] deny op=1 reason=oversize err=-6")))
     ndeny = len(re.findall(r"\[SYSCALL\] deny nr=53", log))
     check("⑤ 坏指针被分派层拦下（[SYSCALL] deny nr=53 出现 %d 次：tx/rx/mac 各一类 + 未知 op）" % ndeny,
           ndeny >= 4, "出现 %d 次" % ndeny)
-    abi = re.findall(r"\[NET\] abi (\S+) rc=(-?\d+) expect=(-?\d+) ok=(\d)", seg)
+    abi = re.findall(r"\[NET\] abi (.+?) rc=(-?\d+) expect=(-?\d+) ok=(\d)", seg)
     check("⑤ 用户态 ABI 负例逐条对上（%d 条，全 ok=1）" % len(abi),
           len(abi) >= 9 and all(a[1] == a[2] and a[3] == "1" for a in abi),
           ("; ".join("%s rc=%s" % (a[0], a[1]) for a in abi[:4]) if abi else "未出现"))
@@ -536,6 +647,7 @@ def main():
           and (m.group(1) == "10.0.2.15" and m.group(2) == "255.255.255.0" and m.group(3) == "10.0.2.2"
                and m.group(4) == "10.0.2.3") if m else False,
           (m.group(0) if m else "无 ACK 行"))
+    ack_dns = m.group(4) if m else None      # DHCP 下发的 DNS（⑧ 用它证明"配置优先"真的生效）
 
     # ==================== ⑦ ARP + ICMP ====================
     print("== ⑦ ARP 缓存 + ICMP echo（ping 网关）==")
@@ -552,24 +664,48 @@ def main():
     check("⑦ ping 往返时间已量化（rtt_ms=… rc=0）", bool(m), m.group(0) if m else "未出现")
 
     # ==================== ⑧ DNS ====================
-    print("== ⑧ DNS（A 记录 / 压缩指针 / 多答案 / TC）==")
-    m = re.search(r"\[NET\] dns query id=0x([0-9a-f]+) name=(\S+) server=(\d+\.\d+\.\d+\.\d+) bytes=(\d+)", log)
-    check("⑧ DNS 查询已发出（含 id/名字/服务器 10.0.2.3/字节数）", bool(m), m.group(0) if m else "未出现")
+    print("== ⑧ DNS（A 记录 / 压缩指针 / 多答案）==")
+    m = re.search(r"\[NET\] dns query id=0x([0-9a-f]+) name=(\S+) server=(\d+\.\d+\.\d+\.\d+):(\d+) "
+                  r"bytes=(\d+)", log)
+    check("⑧ DNS 查询已发出（含 id/名字/服务器 %s:%d/字节数）" % (DNS_UPSTREAM, dns_port),
+          bool(m) and m.group(3) == DNS_UPSTREAM and int(m.group(4)) == dns_port,
+          m.group(0) if m else "未出现")
+    check("⑧ 查询的名字就是夹具配的那个（%s）" % dns_name, bool(m) and m.group(2) == dns_name,
+          m.group(0) if m else "未出现")
+    # ★ "配置优先"的证据：`dns upstream` 行自己报"上游是谁、按哪个来源选的"（conf/dhcp/default），
+    #   而 DHCP 下发的是 slirp 的 10.0.2.3 —— 两者地址不同，说明这条策略真的生效了（不是空谈）。
+    mu = re.search(r"\[NET\] dns upstream ip=(\d+\.\d+\.\d+\.\d+):(\d+) src=(conf|dhcp|default)", log)
+    check("⑧ 上游 DNS 有据可查且配置优先生效（src=conf，%s:%d，与 DHCP 下发的 %s 不同）"
+          % (DNS_UPSTREAM, dns_port, ack_dns),
+          bool(mu) and mu.group(1) == DNS_UPSTREAM and int(mu.group(2)) == dns_port
+          and mu.group(3) == "conf" and ack_dns is not None and ack_dns != mu.group(1),
+          mu.group(0) if mu else "未出现")
     mr = re.search(r"\[NET\] dns rx bytes=(\d+) rcode=(\d+) answers=(\d+) tc=(\d)", log)
-    check("⑧ DNS 收到应答且报文合法（rcode=0 tc=0 answers>=1）",
-          bool(mr) and mr.group(2) == "0" and mr.group(4) == "0" and int(mr.group(3)) >= 1,
+    check("⑧ DNS 收到应答且报文合法（rcode=0 tc=0 answers>=2 = 多答案解析）",
+          bool(mr) and mr.group(2) == "0" and mr.group(4) == "0" and int(mr.group(3)) >= 2,
           mr.group(0) if mr else "未出现")
     ans = re.findall(r"\[NET\] dns a name=(\S+) addr=(\d+\.\d+\.\d+\.\d+) ttl=(\d+) ptr=(\d)", log)
-    check("⑧ A 记录解析（多答案能力：%d 条）" % len(ans), len(ans) >= 1,
+    check("⑧ A 记录解析（多答案能力：%d 条）" % len(ans), len(ans) >= 2,
           "; ".join("%s ttl=%s ptr=%s" % (a[1], a[2], a[3]) for a in ans[:3]) or "未出现")
     if host_ip:
-        check("⑧ 客人解析到的 IP 与宿主解析一致（%s -> %s）" % (dns_name, host_ip),
+        check("⑧ 客人解析到的 IP 与宿主真解析一致（%s -> %s）" % (dns_name, host_ip),
               any(a[1] == host_ip for a in ans),
               ("客人: " + ", ".join(a[1] for a in ans)) if ans else "未出现")
     else:
-        soft("⑧ 宿主本身解析不了 %s —— DNS 步骤按『如实标注』处理" % dns_name, False)
-    soft("⑧ A 记录名使用了**压缩指针**（DNS 压缩指针路径真的走到了）",
-         any(a[3] == "1" for a in ans), "ptr 值：%s" % ([a[3] for a in ans] or "无"))
+        soft("⑧ 宿主本身解析不了 %s —— 第一条 A 用固定假地址，下面的比对按如实标注处理" % dns_name, False)
+    check("⑧ A 记录名走了**压缩指针**（应答器就是用 0xC00C 编的，客人必须解出来）",
+          len(ans) >= 2 and all(a[3] == "1" for a in ans[:2]), "ptr 值：%s" % ([a[3] for a in ans] or "无"))
+    hlog = ""
+    try:
+        hlog = open(os.path.join(tmp, "host.log"), encoding="utf-8").read()
+    except OSError:
+        pass
+    mh = re.search(r"HOST dns_srv from=\S+ qid=0x([0-9a-f]{4}) qname=(\S+) qtype=(\d+) results=(\d+) "
+                   r"a1=(\S+) a2=(\S+) ptr=(\d) rlen=(\d+)", hlog)
+    check("⑧ 宿主受控应答器独立证据（收到查询 %s，qtype=A -> 回 2 条 A + 压缩指针）" % dns_name,
+          bool(mh) and mh.group(2) == dns_name and mh.group(3) == "1" and mh.group(4) == "2"
+          and mh.group(5) == host_ip and mh.group(7) == "1" and int(mh.group(8)) > 0,
+          mh.group(0) if mh else "未出现")
 
     # ==================== ⑨ UDP echo ====================
     print("== ⑨ UDP echo（客人 -> 宿主 -> 客人，逐字节一致）==")
@@ -644,8 +780,8 @@ def main():
     check("⑫ ping 黑地址：报超时不崩",
           bool(re.search(r"\[NET\] icmp fail dst=10\.0\.2\.99 seq=99 rc=-2 reason=no-arp", log)))
     md = re.search(r"\[NET\] netd done mode=all ok=(\d+) fail=(\d+) skip=(\d+)", log)
-    check("⑫ 客人自评：fail=0（全过；skip 只可能是『没有外网 DNS』这一项）",
-          bool(md) and md.group(2) == "0", md.group(0) if md else "未出现")
+    check("⑫ 客人自评：fail=0 且 skip=0（宿主受控 DNS 应答器之后，『没有外网 DNS』不再是跳过项）",
+          bool(md) and md.group(2) == "0" and md.group(3) == "0", md.group(0) if md else "未出现")
     if md:
         print("     客人统计：ok=%s fail=%s skip=%s" % (md.group(1), md.group(2), md.group(3)))
     for bad in FORBIDDEN:
@@ -656,6 +792,15 @@ def main():
           "[SYSCALL] enosys" not in tail)
     check("⑫ 运行段里没有第二条 [NETRAW] log cap reached（打点上限没把证据淹没）",
           tail.count("[NETRAW] log cap reached") == 0, "出现 %d 次" % tail.count("[NETRAW] log cap reached"))
+    # 逐帧证据（[NET] drop what=…）：运行段里不该出现"目的地址不是我们"的 IPv4 帧 —— 夹具的 hostfwd
+    # 现在等客人 listen 之后才连，客人那时也早 DHCP 拿到地址了（第一版夹具的 20 条 not-for-us 全是这个
+    # 时序竞态：宿主在客人还没地址时反复连，slirp 把这些 SYN 重传给客人）。
+    check("⑫ 运行段里没有『目的地址不是我们』的帧（无误投、无抢包）",
+          "what=not-for-us" not in tail, "出现 %d 次" % tail.count("what=not-for-us"))
+    mo = re.search(r"\[NET\] netd done .*tx_frames=(\d+) rx_frames=(\d+) rx_other=(\d+) rx_bad=(\d+) "
+                   r"ip_frag_dropped=(\d+)", log)
+    check("⑫ 收包分类干净（rx_bad=0 且未处理帧 <= 8：只剩 slirp 偶尔的 ARP 请求之类）",
+          bool(mo) and mo.group(4) == "0" and int(mo.group(3)) <= 8, mo.group(0) if mo else "未出现")
 
     if args.keep:
         print("[netuser64] 串口日志：%s" % vm.serial)

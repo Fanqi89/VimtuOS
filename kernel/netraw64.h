@@ -38,11 +38,13 @@
 //     -6 EMSGSIZE 长度超硬件口径（tx len > 1514；rx cap > 2048）
 //
 // ============================ 打点（自动验收 grep；格式勿改）============================
-//   [NETRAW] tx bytes=<n> ok=<0|1> err=<signed> frames=<n>        （上限 32 行）
-//   [NETRAW] rx bytes=<n> frames=<n>                              （只在**真收到帧**时打；上限 32 行）
-//   [NETRAW] mac=<aa:bb:cc:dd:ee:ff> link=<up|down>               （mac/link 查询；上限 8 行）
-//   [NETRAW] deny op=<n> reason=<bad-op|short|oversize|bad-buf|no-nic> err=<n>   （上限 32 行）
+//   [NETRAW] tx bytes=<n> ok=<0|1> err=<signed> frames=<n>        （上限 128 行）
+//   [NETRAW] rx bytes=<n> frames=<n>                              （只在**真收到帧**时打；上限 128 行）
+//   [NETRAW] mac=<aa:bb:cc:dd:ee:ff> link=<up|down>               （mac/link 查询；上限 16 行）
+//   [NETRAW] deny op=<n> reason=<bad-op|short|oversize|bad-buf|no-nic> err=<signed>   （上限 48 行）
 //   [NETRAW] log cap reached tx=<n> rx=<n>                        （每类到上限时只打一次，防刷屏）
+//   上限为什么是 128/128：ring3 的完整栈（/bin/netd 一次运行）收发约 50 帧，原来 32 行会把后面的帧
+//   全部截掉 —— 验收就再也拿不到"DNS/UDP/TCP 的帧真的从这一号进出了"的打点。上限仍然有（防刷屏）。
 //   为什么不打 EAGAIN：ring3 的收包是**轮询**（每 10ms 一次），没有帧是最常见的状态，
 //   逐次打点会把串口刷满 —— 所以 rx 只在 bytes>0 时打，计数仍在（netraw64_stats64）。
 //

@@ -20,9 +20,10 @@
 #include <stdint.h>
 
 // ==================== 打点上限（防刷屏；单位 = 行）====================
-static const int NETRAW64_LOG_MAX64  = 32;    // tx / rx 各 32 行
-static const int NETRAW64_INFO_MAX64 = 8;     // mac / link 查询各 8 行
-static const int NETRAW64_DENY_MAX64 = 32;    // 拒绝 32 行
+static const int NETRAW64_LOG_MAX64  = 128;   // tx / rx 各 128 行（32 行时一次 ring3 完整栈运行 ~50 帧就把
+                                              //   后续帧的证据截断 —— 见 netuser64_test 的 log cap 断言）
+static const int NETRAW64_INFO_MAX64 = 16;    // mac / link 查询各 16 行
+static const int NETRAW64_DENY_MAX64 = 48;    // 拒绝 48 行
 
 static int g_nr64_tx_budget64   = NETRAW64_LOG_MAX64;
 static int g_nr64_rx_budget64   = NETRAW64_LOG_MAX64;

@@ -37,7 +37,8 @@
  *   [NET] udp tx dst=<ip>:<port> sport=<n> bytes=<n> sum=0x<hex>
  *         / udp rx from=<ip>:<port> bytes=<n> sum=0x<hex> match=<0|1> rtt_ms=<n>
  *         / udp timeout dst=.. ms=<n>
- *   [NET] dns query id=0x<hex> name=<n> server=<ip> / dns rx bytes=<n> rcode=<n> answers=<n> tc=<0|1>
+ *   [NET] dns query id=0x<hex> name=<n> server=<ip>:<port> / dns rx bytes=<n> rcode=<n> answers=<n> tc=<0|1>
+ *   [NET] dns upstream ip=<ip>:<port> src=<conf|dhcp|default>   （上游选择证据：配置优先 -> DHCP -> 缺省）
  *         / dns a name=<n> addr=<a.b.c.d> ttl=<n> ptr=<0|1> / dns fail reason=<timeout|tc|rcode|malformed|no-a>
  *   [NET] tcp connect dst=<ip>:<port> sport=<n>
  *         / tcp syn seq=0x<hex> -> sent / tcp syn retx n=<n> rto_ms=<n>
@@ -205,6 +206,38 @@ static void drop_log(const char* what, u32 ip) {
     if (ip) { out_str(" src="); out_ip(ip); }
     out_str("\n");
 }
+/* 未处理 / 坏包的**逐帧证据**（独立上限 24 行）：不与上面 12 行的校验丢弃预算抢额度。
+ * 为什么要有它：只打 src 的话，排障分不清"不是发给我们的"和"协议不支持"——这里把帧里现成的
+ * ether / sip / dip / proto / 端口 全打出来（纯字段转述，**没有**任何策略或协议解析）。 */
+static u32 g_dropf_log = 0;
+static void drop_ip_log(const char* what, const u8* p, u32 len) {
+    if (g_dropf_log >= 24u) return;
+    g_dropf_log++;
+    out_str("[NET] drop what="); out_str(what);
+    out_str(" len="); out_u64(len);
+    if (len >= 20u) {
+        out_str(" sip="); out_ip(rd_ip(p + 12));
+        out_str(" dip="); out_ip(rd_ip(p + 16));
+        out_str(" proto="); out_u64((u64)p[9]);
+        const u32 ihl = (u32)(p[0] & 0xFu) * 4u;
+        if (ihl >= 20u && ihl + 4u <= len) {
+            out_str(" sport="); out_u64((u64)rd16(p + ihl));
+            out_str(" dport="); out_u64((u64)rd16(p + ihl + 2u));
+        }
+    }
+    out_str("\n");
+}
+static void drop_frame_log(const char* what, const u8* f, u32 len) {
+    if (g_dropf_log >= 24u) return;
+    g_dropf_log++;
+    out_str("[NET] drop what="); out_str(what);
+    out_str(" len="); out_u64(len);
+    if (len >= 14u) {
+        out_str(" ether="); out_u64((u64)(((u32)f[12] << 8) | (u32)f[13]));
+        out_str(" dmac="); out_mac(f);
+    }
+    out_str("\n");
+}
 static u32 parse_ip(const char* s) {                    /* "10.0.2.2" -> u32；非法返回 0xFFFFFFFF */
     u32 v = 0, part = 0, n = 0;
     for (;;) {
@@ -232,6 +265,8 @@ typedef struct {
     u32 dns_name_off;          /* g_cfg.name[] 里的偏移 */
     u16 tcp_port, udp_port, listen_port;
     u16 dns_sport, udp_sport, tcp_sport;
+    u16 dns_port;              /* 上游 DNS 的**目的地端口**（缺省 53；验收夹具改成受控应答器的端口）*/
+    u8  dns_forced;            /* 配置里显式写了 dns= -> 优先于 DHCP 下发的 DNS（见下面 cfg_apply_kv）*/
     u32 arp_ms, ping_ms, dns_ms, udp_ms, tcp_ms, dhcp_ms, acks_wait_ms;
 } Cfg;
 static Cfg   g_cfg;
@@ -246,6 +281,7 @@ static void cfg_defaults(void) {
     g_cfg.udp_host = ip4(10, 0, 2, 2);
     g_cfg.tcp_port = 5555; g_cfg.udp_port = 5556; g_cfg.listen_port = 5555;
     g_cfg.dns_sport = 40000; g_cfg.udp_sport = 40002; g_cfg.tcp_sport = 40004;
+    g_cfg.dns_port = 53; g_cfg.dns_forced = 0;
     g_cfg.arp_ms = 800; g_cfg.ping_ms = 1200; g_cfg.dns_ms = 1500; g_cfg.udp_ms = 1200;
     g_cfg.tcp_ms = 2500; g_cfg.dhcp_ms = 2500; g_cfg.acks_wait_ms = 5000;
     g_cfg.dns_name_off = 0;
@@ -255,13 +291,14 @@ static void cfg_apply_kv(const char* k, const char* v) {
     if (ceq(k, "ip")) g_cfg.ip = parse_ip(v);
     else if (ceq(k, "mask")) g_cfg.mask = parse_ip(v);
     else if (ceq(k, "gw")) g_cfg.gw = parse_ip(v);
-    else if (ceq(k, "dns")) g_cfg.dns = parse_ip(v);
+    else if (ceq(k, "dns")) { g_cfg.dns = parse_ip(v); g_cfg.dns_forced = 1; }   /* 显式指定 = 优先 */
     else if (ceq(k, "tcphost")) g_cfg.tcp_host = parse_ip(v);
     else if (ceq(k, "udphost")) g_cfg.udp_host = parse_ip(v);
     else if (ceq(k, "tcpport")) g_cfg.tcp_port = (u16)parse_dec(v);
     else if (ceq(k, "udpport")) g_cfg.udp_port = (u16)parse_dec(v);
     else if (ceq(k, "listenport")) g_cfg.listen_port = (u16)parse_dec(v);
     else if (ceq(k, "dnssport")) g_cfg.dns_sport = (u16)parse_dec(v);
+    else if (ceq(k, "dnsport")) g_cfg.dns_port = (u16)parse_dec(v);   /* 上游 DNS 的目的端口（缺省 53）*/
     else if (ceq(k, "udpsport")) g_cfg.udp_sport = (u16)parse_dec(v);
     else if (ceq(k, "tcpsport")) g_cfg.tcp_sport = (u16)parse_dec(v);
     else if (ceq(k, "arpms")) g_cfg.arp_ms = parse_dec(v);
@@ -727,12 +764,18 @@ static int dhcp_bind(u32 ms_budget) {
     g_our_ip = req_ip ? req_ip : g_dhcp_offer_ip;
     g_mask = g_dhcp_msk ? g_dhcp_msk : ip4(255, 255, 255, 0);
     g_gw = g_dhcp_gw ? g_dhcp_gw : g_cfg.gw;
-    g_dns = g_dhcp_dns ? g_dhcp_dns : g_cfg.dns;
+    /* ★ 上游 DNS 的选择顺序：**配置里显式写了 dns= 就用它**（不管 DHCP 下发什么）-> 否则用 DHCP 的
+     *   -> 都没有才用缺省值。为什么要配置优先：QEMU/slirp 的"内置 DNS"在宿主侧解析器读不出来时会把
+     *   客人的查询**静默丢掉**（本机实测：3 次重发 4.5 s 全无应答），验收夹具因此把上游 DNS 指到宿主
+     *   的受控应答器；真实使用里这条也正好让用户能手动指定上游。 */
+    g_dns = (!g_cfg.dns_forced && g_dhcp_dns) ? g_dhcp_dns : g_cfg.dns;
     g_ip_src = 1;
     out_str("[NET] dhcp ack ip="); out_ip(g_our_ip);
     out_str(" mask="); out_ip(g_mask);
     out_str(" gw="); out_ip(g_gw);
-    out_str(" dns="); out_ip(g_dns);
+    /* 这一行描述的是"我们接受的这份 ACK"：dns 打的是 **DHCP 服务器在 option 6 里给的**那个地址
+     *   （不是生效值 —— 生效值由下面 dns_resolve 的 dns upstream 行如实报，两者可能不同：配置优先）。 */
+    out_str(" dns="); out_ip(g_dhcp_dns);
     out_str(" lease="); out_u64(g_dhcp_lease);
     out_str(" ms="); out_u64(now_ms() - t0); out_str("\n");
     out_str("[NET] dhcp bind ip="); out_ip(g_our_ip);
@@ -763,6 +806,13 @@ static int dns_encode_name(u8* out, u32 cap, const char* n) {
         out[o++] = (u8)c;
         lab++;
     }
+    /* ★ 最后一段的长度**也必须回填**：原实现只在遇到 '.' 时回填，于是没有尾点的普通名字
+     *   （"example.com"）最后一段的长度字节一直是 0 —— 编出来的 QNAME 是 `7example 0 com 0`，
+     *   总长还恰好是 13 字节，所以 "bytes=29" 这种自检看不出问题。slirp 的内置 DNS 从来不回我们的
+     *   查询（见 tests/netuser64_test.py 的记录），这个错一直没被暴露；换成宿主受控应答器后第一次
+     *   就现形：应答里的问题段被原样回显，客人解析答案时自然一条 A 都找不到（reason=no-a）。
+     *   空名/空段/超缓冲在上面已经 return 0。结尾带点（"a.b."）时 lab 为 0，长度已在 '.' 分支回填。 */
+    if (lab) out[o - lab - 1] = (u8)lab;
     if (o + 1u > cap) return 0;
     out[o++] = 0;                                   /* 根标签 */
     return (int)o;
@@ -786,9 +836,6 @@ static int dns_skip_name(const u8* m, u32 len, u32* off, int* ptr) {
         if (b == 0) return (int)(o + 1u);
         if ((b & 0xC0u) != 0) return -1;
         o += 1u + b;
-        if (b == 0) { return (int)(o + 1u); }
-        if ((b & 0xC0u) != 0) return -1;
-        o += 1u + b;
     }
 }
 static int dns_resolve(const char* name, u32 sport, u32 ms_budget, int* n_answers, int* used_ptr, u32* first_ip) {
@@ -806,22 +853,28 @@ static int dns_resolve(const char* name, u32 sport, u32 ms_budget, int* n_answer
     off = 12 + o;
     wr16(q + off, 1); off += 2;                             /* type A */
     wr16(q + off, 1); off += 2;                             /* class IN */
+    /* ★ 上游选择的证据行：既给验收断言，也给用户排障"我的 DNS 到底在问谁"（配置优先 -> DHCP -> 缺省）*/
+    out_str("[NET] dns upstream ip="); out_ip(g_dns);
+    out_str(":"); out_u64((u64)g_cfg.dns_port);
+    out_str(" src="); out_str(g_cfg.dns_forced ? "conf" : (g_dhcp_dns ? "dhcp" : "default"));
+    out_str("\n");
     out_str("[NET] dns query id="); out_hex64(g_dns_id);
     out_str(" name="); out_str(name);
     out_str(" server="); out_ip(g_dns);
+    out_str(":"); out_u64((u64)g_cfg.dns_port);
     out_str(" bytes="); out_u64(off); out_str("\n");
     u32 gen0 = g_udp_rx_gen;
-    const int rc = udp_send_to(g_dns, (u16)sport, 53, q, off);
+    const int rc = udp_send_to(g_dns, (u16)sport, (u16)g_cfg.dns_port, q, off);
     if (rc != 0) { out_str("[NET] dns fail reason=send rc="); out_signed(rc); out_str("\n"); return -2; }
     for (int attempt = 0; attempt < 3; attempt++) {          /* 一问一答；超时重发 2 次（有界）*/
         if (attempt) {
             out_str("[NET] dns retx n="); out_u64((u64)attempt);
             out_str(" bytes="); out_u64(off); out_str("\n");
             gen0 = g_udp_rx_gen;                            /* 重发前重新取基线 */
-            if (udp_send_to(g_dns, (u16)sport, 53, q, off) != 0) continue;
+            if (udp_send_to(g_dns, (u16)sport, (u16)g_cfg.dns_port, q, off) != 0) continue;
         }
         u16 dport = 0;
-        const int got = udp_wait(g_dns, 53, gen0, ms_budget, &dport);
+        const int got = udp_wait(g_dns, (u16)g_cfg.dns_port, gen0, ms_budget, &dport);
         (void)dport;
         if (got < 0) {
             if (attempt < 2) continue;
@@ -1130,7 +1183,7 @@ static void ipv4_handle(const u8* p, u32 len, const u8* src_mac) {
     const u32 sip = rd_ip(p + 12), dip = rd_ip(p + 16);
     const u8* pay = p + ihl;
     const u32 plen = total - ihl;
-    if (dip != g_our_ip && dip != 0xFFFFFFFFu) { g_rx_other++; drop_log("not-for-us", sip); return; }
+    if (dip != g_our_ip && dip != 0xFFFFFFFFu) { g_rx_other++; drop_ip_log("not-for-us", p, len); return; }
     if (proto == 1) {
         icmp_handle(pay, plen, (int)p[8], sip);
         return;
@@ -1251,7 +1304,8 @@ static void ipv4_handle(const u8* p, u32 len, const u8* src_mac) {
         }
         return;
     }
-    g_rx_other++;                                            /* 其它协议（ICMP/IGMP…）：不处理 */
+    g_rx_other++;                                            /* 其它协议（IGMP…）：不处理 */
+    drop_ip_log("proto-other", p, len);
 }
 static void arp_handle(const u8* p, u32 len) {
     if (len < 28u) { g_rx_bad++; return; }
@@ -1270,6 +1324,7 @@ static void arp_handle(const u8* p, u32 len) {
     /* ★ ring3 **不回应** ARP 请求（内核 net64 的既有行为不动）：这里只把对方记进缓存，
      *   如实标注"本栈不做 ARP 应答"（验收里也不会去 ping 自己）。 */
     g_rx_other++;
+    drop_frame_log("arp-request", p - 14u, len + 14u);        /* oper=1（请求）：只记证据，不回应 */
 }
 static void frame_handle(const u8* f, u32 len) {
     if (len < 14u) { g_rx_bad++; return; }
@@ -1277,11 +1332,12 @@ static void frame_handle(const u8* f, u32 len) {
     const u8* dmac = f;
     if (!memeq_n(dmac, g_mac, 6) && !memeq_n(dmac, g_bcast, 6) && !(dmac[0] & 0x01)) {
         g_rx_other++;                                        /* 不是给我们的单播 */
+        drop_frame_log("dmac-not-us", f, len);
         return;
     }
     if (type == 0x0806u) arp_handle(f + 14, len - 14u);
     else if (type == 0x0800u) ipv4_handle(f + 14, len - 14u, f + 6);
-    else g_rx_other++;                                       /* IPv6/LLDP/…：不管（如实）*/
+    else { g_rx_other++; drop_frame_log("ethertype-other", f, len); }   /* IPv6/LLDP/…：不管（如实）*/
 }
 static void poll_frames(u32 budget) {
     for (u32 i = 0; i < budget; i++) {
@@ -1448,7 +1504,7 @@ static void suite_full(u32 ms_total_budget) {
                 out_str(":"); out_u64(g_udp_rx_sport);
                 out_str(" dport="); out_u64(g_udp_rx_dport);
                 out_str(" bytes="); out_u64((u64)got);
-                out_str(" sum=0x"); out_hex32(g_udp_rx_sum & 0xFFFFFFFFu);
+                out_str(" sum="); out_hex32(g_udp_rx_sum & 0xFFFFFFFFu);
                 out_str(" match="); out_u64((u64)match);
                 out_str(" rtt_ms="); out_u64(now_ms() - u0);
                 out_str("\n");
