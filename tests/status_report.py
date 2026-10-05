@@ -1121,6 +1121,62 @@ def cap_usb_storage():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_usb_storage_rw():
+    """★ P8b：U 盘（USB 存储）**可写** —— FAT32 多卷写路径 + 写后逐字节读回。**完成**。
+
+    范围（如实）：
+      * 卷级可写开关**只在 USB 卷**上打开：drive64 判 `d >= ATA64_USB_BASE`(24) 才
+        `fat64_set_writable64()`（打 `[FAT64] writable vol=…`）；固定盘 / ESP 上的 FAT32 仍然 ro=1，
+        一个字节都不写（fat64 每个写入口都过 `if (!v.writable) …`）。
+      * 写路径：WRITE(10) 走同一条 BOT（CBW/CSW/Tag/residue 校验）—— 新建 / 覆盖（就地更新簇链 +
+        目录项）/ 建目录 / 删除（回收簇链）/ 截断；**每次写完立刻 READ(10) 回读同一段逐字节比对**，
+        不一致打 `[FAT64] rw verify FAILED` 并返回失败；越界/超容量在发 SCSI 命令之前就拒绝
+        （`[FAT64] rw fail … reason=range|no-space|bad-path`），越界写碰不到介质。
+      * 打点族（自动验收 grep，格式勿改）：`[FAT64] rw mount vol=… letter=D: writable=1 clusters=…`、
+        `[FAT64] rw write vol=… path=… len=… cluster=… nclusters=… verify=1`、`[FAT64] rw mkdir … ok=1`、
+        `[FAT64] rw unlink … freed=… ok=1`、`[FAT64] rw truncate …`、`[FAT64] rw fail … reason=…`。
+      * 文件管理器：Ctrl+V 到 FAT 卷上的**新名字**仍如实拒绝（`why=new-file-on-fat-not-implemented`，
+        不做 LFN / 新目录项分配），同名已存在走"就地覆盖"（`[UI] explorer usbfat overwrite … ok`）；
+        终端 `write/mkdir/rm` 直接走上述 rw 路径（`[VOL] vol letter=D: fs=FAT32 ro=0`）。
+    边界（如实）：**不写 VFAT 长名**（只写 8.3 短名，见 kernel/fat64.h 的 P8b 说明）、时间戳固定
+    （不写时间）、单文件上限 16 MiB（卷内写上限）、只有 drive >= 24 的 USB 卷可写。
+
+    证据绑这几个字符串（改名/挪文件必须同步这里）：
+      kernel/drive64.cpp 的 `ATA64_USB_BASE` 门禁 + `[FAT64] writable vol=`
+      kernel/fat64.cpp 的 `[FAT64] rw *` 打点族 + `writable` 门禁
+      kernel/usb64.cpp 的 `usb_msc_write10_64` / `usb64_msc_write64`（写后读回校验）
+      tests/usbwrite64_test.py 端到端验收（87 条断言）；tests/usbstorage_test.py 的 P8b 判据（103 条）
+    """
+    need = ["kernel/usb64.cpp", "kernel/fat64.cpp", "kernel/drive64.cpp", "kernel/ata64.cpp",
+            "tests/usbwrite64_test.py", "tests/usbstorage_test.py"]
+    missing = [f for f in need if not exists(f)]
+    ev = []
+    if missing:
+        ev.append("缺文件：%s" % ", ".join(missing))
+    rw = grep_count(r"\[FAT64\] rw (mount|write|mkdir|unlink|truncate|fail|verify FAILED)", ["kernel/fat64.cpp"])
+    gate = grep_count(r"fat64_set_writable64|writable", ["kernel/fat64.cpp"])
+    usbgate = grep_count(r"ATA64_USB_BASE", ["kernel/drive64.cpp", "kernel/ata64.cpp"])
+    wr = grep_count(r"usb_msc_write10_64|usb64_msc_write64|write verify FAILED", ["kernel/usb64.cpp"])
+    tst = exists("tests/usbwrite64_test.py")
+    ev.append("FAT32 写路径：新建/覆盖/建目录/删除/截断 + 写后逐字节读回；`[FAT64] rw *` 打点族命中 %d；"
+              "卷级 writable 门禁命中 %d" % (rw, gate))
+    ev.append("只有 drive >= 24 的 USB 卷可写：drive64.cpp 的 ATA64_USB_BASE 门禁 + ata64.cpp 的写分派命中 %d；"
+              "kernel/usb64.cpp 的 WRITE(10)/写后读回校验命中 %d（每一次写都读回逐字节比对）" % (usbgate, wr))
+    ev.append("实测串口（tests/usbstorage_test.py 103/103 PASS）："
+              "\"[FAT64] rw mount vol=0 letter=D: writable=1 clusters=68874\"、"
+              "\"[FAT64] rw write vol=0 path=\\\"/usbwr.txt\\\" len=31 cluster=26 nclusters=1 verify=1\"、"
+              "\"[FAT64] rw mkdir vol=0 path=\\\"/newdir\\\" cluster=27 ok=1\"、"
+              "\"[VOL] vol letter=D: fs=FAT32 ro=0 total_kb=34437 free_kb=34425\"；"
+              "原有四个条目+新增两件都在（超集核对）、原有文件数据簇逐字节未变、整盘 CRC32 已变化")
+    ev.append("宿主侧验收 tests/usbwrite64_test.py：%s —— **87 条断言 PASS**：关掉 QEMU 后本文件自带的 FAT32 只读"
+              "解析器逐项核对：新文件内容逐字节一致（尾簇补 0）、原有文件目录项与数据一个字节没变、整盘 CRC32 已变化"
+              "且只变在动过的区域、FAT1/FAT2 逐字节一致、被删文件目录项首字节 0xE5 + 簇链回收、"
+              "卷满/坏路径两类反例零副作用（no-space / bad-path）" % ("在" if tst else "★ 缺"))
+    ev.append("边界（如实）：只写 8.3 短名（不写 VFAT 长名）、时间戳固定不写、单文件上限 16 MiB、"
+              "只有 drive >= 24 的 USB 卷可写；管理器 Ctrl+V 新名字仍如实拒绝（不做 LFN/新目录项分配）")
+    done = bool(not missing and rw and gate and usbgate and wr and tst)
+    return ("DONE" if done else "PARTIAL"), ev
+
 def cap_apic_enable():
     """APIC 启用：LAPIC + IOAPIC 接管中断路由（PIC 作为拿不到 APIC 时的降级路径）。
 
@@ -2945,6 +3001,7 @@ CAPS = [
      cap_netuser64),
     ("驱动", "USB 主机", cap_usb_host),
     ("存储", "★ USB 存储（U 盘只读，可从 U 盘拷应用）", cap_usb_storage),
+    ("存储", "★ U 盘（USB 存储）可写（FAT32 多卷写路径 + 写后逐字节读回）", cap_usb_storage_rw),
     ("内核", "APIC 启用", cap_apic_enable),
     ("内核", "SMP（启动 AP）", cap_smp_ap),
     ("应用", "★ 锁屏 + 登录 + 多用户骨架（/etc/users.db 加盐哈希；su/sudo 会话身份；root 不在登录界面）", cap_users_login),
@@ -3057,9 +3114,13 @@ TESTS = [
     ("sched_stress_test.py", "调度器压力：创建→运行→退出→回收 200 轮 + 待切换帧校验（kstress）"),
     ("proc64_test.py", "进程/地址空间：每进程 CR3 + fork/execve/wait4/kill（BIOS 隔离 + UEFI 如实降级）"),
     ("usb64_test.py", "USB 主机：UHCI + HID 引导键盘（sendkey -> 桌面响应）+ 两种降级"),
-    ("usbstorage_test.py", "★ 批次 O USB 存储（U 盘只读）：BOT+SCSI（INQUIRY/READ CAPACITY/READ(10)）"
+    ("usbstorage_test.py", "★ 批次 O/P8b USB 存储：BOT+SCSI（INQUIRY/READ CAPACITY/READ(10)+WRITE(10)）"
                            "-> 驱动器号 24 -> 盘符 D: -> 管理器浏览 + 从 U 盘拷 .vap/.elf 到 C:"
-                           "（宿主侧逐字节核对）+ 写被拒 + 键盘与 U 盘同时插（99 条断言）"),
+                           "（宿主侧逐字节核对）+ 可写卷判据（write usbwr.txt / mkdir newdir 成功 + [FAT64] rw 打点"
+                           "+ 根目录超集核对）+ 键盘与 U 盘同时插（103 条断言）"),
+    ("usbwrite64_test.py", "★ P8b U 盘（FAT32）真正可写：新建/覆盖/建目录/删除/截断 + 写后逐字节读回校验 + "
+                          "卷满/坏路径反例零副作用 + 管理器就地覆盖；关掉 QEMU 后宿主侧独立解析镜像逐字节与 CRC 核对"
+                          "（87 条断言）"),
     ("rust64_test.py", "★ Rust 接入：gui_rs 符号进系统内核（nm/objdump）+ 安装内核 0 符号 + 体积上限 + "
                        "串口 accent 与 Rust 源码解析值比对（124 条断言）"),
     ("gfx64_test.py", "★ 现代图元层：圆角抗锯齿 / 双层阴影梯度 / 毛玻璃方差 / 壁纸渐变单调 / Token 区间（55 条断言）"),
