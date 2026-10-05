@@ -230,14 +230,24 @@ static int ic_parse_pack(uint8_t* p, uint32_t n, int* out_bad) {
 // 前向声明（init 里预热要用到，定义在下面）
 static const Img64* ic_bitmap(int kind, int want, const char** why);
 
-// 候选盘：系统盘（C: 所在驱动器）优先，其次 0 / 8 / 16 / 24（PATA / AHCI / NVMe / USB 的首盘）
+// ★ 本批修复：**真的挂着卷**的系统槽号；没有 = -1。
+//   为什么不能直接用 vfs64_system_slot64() >= 0：那个号会被"格式化过/自检 fake 后端"写成 0
+//   （实测：装完还没有卷的盘，启动期打了 "[VFS64] system slot=0 (set by format)"），
+//   于是"有系统卷"的判定是假的 -> 原始区兜底那条路被整段跳过（图标只剩程序化回落）。
+//   真判据 = 槽表里这个槽确实挂载着一个卷（vfs64_slot_used64）。
+static int ic_sys_slot64() {
+    const int s = vfs64_system_slot64();
+    if (s < 0 || !vfs64_slot_used64(s)) return -1;
+    return s;
+}
+
+// 候选盘：系统盘（C: 所在驱动器号）优先，其次 0 / 8 / 16 / 24（PATA / AHCI / NVMe / USB 的首盘）。
+// ★ 修复：系统盘这一档改成 kernel/drive64 的 drive64_system_disk64()（与 kernel/demo64.cpp 的
+//   "原始区按系统盘读"同一条口径）—— 盘符表和原始区读取不再各查各的。
 static int ic_candidate_drives(int* out, int cap) {
     int n = 0;
-    const int ci = drive64_by_letter64('C');
-    if (ci >= 0 && n < cap) {
-        DriveInfo64 info{};
-        if (drive64_info64(ci, &info) == 0 && info.disk >= 0) out[n++] = info.disk;
-    }
+    const int sys = drive64_system_disk64();
+    if (sys >= 0 && n < cap) out[n++] = sys;
     static const int extra[4] = { 0, 8, 16, 24 };
     for (int i = 0; i < 4 && n < cap; i++) {
         bool dup = false;
@@ -252,25 +262,57 @@ int icons64_init64() {
     g_tried = true;
     // ---- 0) 可选覆盖源的探测：系统卷里有没有 /icons 目录（没有就不做任何 VFS 探测，
     //         免得每个图标都留一行 not-found 噪声）----
-    if (vfs64_system_slot64() >= 0) {
+    const int sysslot = ic_sys_slot64();       // ★ 修复：真的挂着卷的系统槽（不是"登记过"的号）
+    if (sysslot >= 0) {
         Vfs64Info64 si{};
         if (vfs64_stat64("/icons", &si) == 0) g_vfs_icons = true;
+    } else {
+        // ★ 修复：没有真系统卷也要如实打一行（为什么下面走原始区/LBA 兜底）
+        dbg64_line_begin64();
+        dbg64_str("[ICON64] no mounted system volume (vfs system-slot=");
+        ic_put_dec(vfs64_system_slot64());
+        dbg64_str(" used=");
+        ic_put_dec((vfs64_system_slot64() >= 0 && vfs64_slot_used64(vfs64_system_slot64())) ? 1 : 0);
+        dbg64_str(") -> raw region fallback\n");
+        dbg64_line_end64();
     }
     int tried = 0, last = -1;                  // 打点用（两条来源共用；先声明，免得 goto 跳过初始化）
+    // ★ 修复：失败原因明细 —— 只在最终"没有任何来源"时打印，如实回答"哪几个盘试过、各自为什么失败"。
+    int     probed_d[5];
+    uint8_t probed_r[5];                       // 1=read 2=magic 3=size 4=alloc
+    int     probed_n = 0;
+    int     raw_read_ok = 0;                   // ★ 修复：按盘强制读原始区成功的次数（1a3 探测；打点用）
+    int     vfs_file = 0;                      // 系统卷里 /etc/iconpack.bin：0=不在 1=在但不可用 2=可按大小读
     // ---- 1) ★ A4-2a：**系统卷里的图标包**优先（这就是"图标包搬进 VimtuFS2 卷"的加载路径）----
     // 流程：卷里 /icons/pack.bin 不在（或大小对不上）-> 用**内核内嵌的字节**幂等装进卷
     //       -> 再从卷里读回来解析（src=vfs）。卷里没有 /icons 且没有内嵌字节 -> 走下面老路径。
-    if (vfs64_system_slot64() >= 0) {
-        const int sys = vfs64_system_slot64();
+    if (sysslot >= 0) {
+        const int sys = sysslot;
         uint32_t pty = 0, psz = 0;
         const int have = (vfs64_stat_on64(sys, ICON64_PACK_VFS_PATH, &pty, &psz) == 0 && pty == VFS64_TYPE_FILE);
+        // ★ 修复：**有卷但包不在/不可用不再是静默** —— 在"尝试装进卷"之前就把
+        //   "在不在、多大、哪个系统盘、接下来走哪条兜底"打清楚（修前这一档什么都不打）。
+        if (!have || psz < ICON64_HDR_BYTES || psz > ICON64_PACK_MAX_BYTES) {
+            dbg64_line_begin64();
+            dbg64_str("[ICON64] pack missing in system volume path=");
+            dbg64_str(ICON64_PACK_VFS_PATH);
+            dbg64_str(" present=");
+            ic_put_dec(have ? 1 : 0);
+            dbg64_str(" size=");
+            dbg64_dec((uint64_t)psz);
+            dbg64_str(" disk=");
+            ic_put_dec(drive64_system_disk64());
+            dbg64_str(" -> raw/lba fallback\n");
+            dbg64_line_end64();
+        }
         if (!have) {
             /* ★ 本批（预算收口）：字节来自**原始区**（不再有内嵌 symbol）。demo64_blob_find64 返回
              *   内核 .bss 里的原始区缓冲（按 LBA 现读一次，之后查表命中），把它写进卷是安全的。
              *   裸盘/空夹具没有原始区时返回 0 -> 如实跳过，下面还有 LBA 兜底与程序化回落。 */
             uint32_t blen = 0;
             const uint8_t* pbytes = demo64_blob_find64(ICON64_PACK_VFS_PATH, &blen);
-            if (pbytes && blen >= ICON64_HDR_BYTES && blen <= ICON64_PACK_MAX_BYTES) {
+            if (pbytes && blen >= ICON64_HDR_BYTES && blen <= ICON64_PACK_MAX_BYTES &&
+                ic_pack_ok(pbytes, blen)) {              // ★ 只装**看起来就是包**的字节（原始区被清零/读错盘时不污染卷）
                 panic64_watchdog_pause64();              // 写 49KB 到卷：长 I/O，别让看门狗误判
                 (void)img64_install_blob64(ICON64_PACK_VFS_PATH, pbytes, blen,
                                            "build/iconpack.bin");
@@ -278,8 +320,13 @@ int icons64_init64() {
             }
         }
         uint32_t ty2 = 0, sz2 = 0;
-        if (vfs64_stat_on64(sys, ICON64_PACK_VFS_PATH, &ty2, &sz2) == 0 && ty2 == VFS64_TYPE_FILE &&
-            sz2 >= ICON64_HDR_BYTES && sz2 <= ICON64_PACK_MAX_BYTES) {
+        const int stat2 = vfs64_stat_on64(sys, ICON64_PACK_VFS_PATH, &ty2, &sz2);
+        const bool usable = (stat2 == 0 && ty2 == VFS64_TYPE_FILE &&
+                             sz2 >= ICON64_HDR_BYTES && sz2 <= ICON64_PACK_MAX_BYTES);
+        if (usable) vfs_file = 2;
+        else if (stat2 == 0) vfs_file = 1;      // 在卷里，但类型/大小不对
+        else vfs_file = 0;                      // 卷里没有这个文件（原始区兜底安装也没成功）
+        if (usable) {
             const uint32_t sectors = (sz2 + 511u) / 512u;
             const uint32_t alloc = sectors * 512u;
             uint8_t* vbuf = (uint8_t*)kmalloc_64(alloc);
@@ -310,7 +357,7 @@ int icons64_init64() {
     //   原始区在内核区尾部（构建期 dd 写入），demo64_blob_find64 按需把它读进 .bss 再按路径查表。
     // ★ **有卷**时不走这条路：卷里的包才是真源，坏包必须如实报 bad=/absent（tests/icons64_test.py
     //   场景 ②(a)/(b) 钉的就是这个语义）—— 绝不拿盘上副本把坏包"圆过去"。
-    if (!g_pack && vfs64_system_slot64() < 0) {
+    if (!g_pack && sysslot < 0) {
         uint32_t blen = 0;
         uint8_t* pbytes = (uint8_t*)demo64_blob_find64(ICON64_PACK_VFS_PATH, &blen);
         if (pbytes && blen >= ICON64_HDR_BYTES && blen <= ICON64_PACK_MAX_BYTES &&
@@ -325,6 +372,42 @@ int icons64_init64() {
             }
         }
     }
+    // ---- 1a3) ★ 本批修复：**没有可挂载的系统卷**时，按盘探测"原始区里的图标包" ----
+    // 为什么需要：刚装完的盘（卷还没建）/卷坏了的盘上，drive64 给不出"系统盘"（没有盘符表），
+    //   demo64 的默认策略退回 drive 0 —— SATA/AHCI-only 机器上 drive 0 不存在，图标就丢了。
+    //   这里按 ata64 的枚举顺序逐盘强制读原始区，用**包自己的 magic + 条目 CRC** 判定命中
+    //   （ic_pack_ok + ic_parse_pack），所以读错盘绝不会被误当成包（读错盘的失败原因如实打点）；
+    //   全部失败就 demo64_raw_abandon64() 丢弃探测内容（别让后续调用误用别的盘的字节）。
+    if (!g_pack && sysslot < 0) {
+        const int dc = ata64_drive_count64();
+        int hit = -1;
+        for (int i = 0; i < dc; i++) {
+            const int d = ata64_slot_to_drive64(i);
+            if (d < 0) continue;
+            if (!demo64_raw_try_drive64(d)) continue;
+            raw_read_ok++;
+            uint32_t blen = 0;
+            const uint8_t* pb = demo64_blob_find64(ICON64_PACK_VFS_PATH, &blen);
+            if (pb && blen >= ICON64_HDR_BYTES && blen <= ICON64_PACK_MAX_BYTES && ic_pack_ok(pb, blen)) {
+                hit = d;
+                break;
+            }
+        }
+        if (hit >= 0) {
+            uint32_t blen = 0;
+            uint8_t* pb = (uint8_t*)demo64_blob_find64(ICON64_PACK_VFS_PATH, &blen);
+            int bad = 0;
+            if (pb && ic_parse_pack(pb, blen, &bad) == 0) {
+                g_pack = pb;                                     // 原始区缓冲（.bss）里那份（就是 hit 号盘）
+                g_pack_drive = hit;
+                g_pack_lba = 0;
+                g_pack_src = "raw";
+                g_pack_bad = bad;
+            }
+        } else {
+            demo64_raw_abandon64();
+        }
+    }
     // ---- 1b) 逐盘找图标包（老路径：内核区尾部 LBA；正常的系统盘 = C: 所在盘，退而求其次试 0/8/16/24）----
     if (!g_pack) {
     int cand[5];
@@ -333,16 +416,19 @@ int icons64_init64() {
         const int d = cand[i];
         tried++;
         last = d;
+        uint8_t why = 1;                                 // ★ 失败原因：1=read 2=magic 3=size 4=alloc
+        if (probed_n < 5) { probed_d[probed_n] = d; probed_r[probed_n] = why; probed_n++; }
         if (!ata64_read(d, ICON64_PACK_LBA, 1u, s_hdr)) continue;
-        if (!ic_pack_ok(s_hdr, sizeof(s_hdr))) continue;
+        if (!ic_pack_ok(s_hdr, sizeof(s_hdr))) { probed_r[probed_n - 1] = 2; continue; }
         const uint32_t total = ic_rd32(s_hdr + 16);
-        if (total < ICON64_HDR_BYTES || total > ICON64_PACK_MAX_BYTES) continue;
+        if (total < ICON64_HDR_BYTES || total > ICON64_PACK_MAX_BYTES) { probed_r[probed_n - 1] = 3; continue; }
         // ★ 整扇区读：磁盘读永远是 512 的整数倍，缓冲区必须按**扇区对齐后的大小**分配，
         //   否则 ata64_read 会写超出 total（包尾那不到 512 字节）—— 会踩坏堆。
         const uint32_t sectors = (total + 511u) / 512u;
         const uint32_t alloc = sectors * 512u;
         uint8_t* buf = (uint8_t*)kmalloc_64(alloc);
         if (!buf) {                                       // 内存不足：如实打点，之后全走回落
+            if (probed_n > 0) probed_r[probed_n - 1] = 4;
             dbg64_line_begin64();
             dbg64_str("[ICON64] init pack alloc FAILED bytes=");
             dbg64_dec(alloc);
@@ -352,11 +438,13 @@ int icons64_init64() {
         }
         mem_owner_set_64(MEM_OWNER_GUI_64);
         if (!ata64_read(d, ICON64_PACK_LBA, sectors, buf) || !ic_pack_ok(buf, total)) {
+            if (probed_n > 0) probed_r[probed_n - 1] = 1;
             kfree_64(buf);
             continue;
         }
         int bad = 0;
         if (ic_parse_pack(buf, total, &bad) != 0) {
+            if (probed_n > 0) probed_r[probed_n - 1] = 2;
             kfree_64(buf);
             continue;
         }
@@ -364,6 +452,7 @@ int icons64_init64() {
         g_pack_drive = d;
         g_pack_src = "lba";                              // 老路径：包还在内核区尾部（正常不该发生）
         g_pack_bad = bad;
+        probed_n = 0;                                    // 成功：失败明细作废（不再打"没有来源"）
         break;
     }
     }                                                    // if (!g_pack)：LBA 兜底扫描结束
@@ -378,7 +467,23 @@ pack_ready:
         dbg64_str(" last-drive=");
         ic_put_dec(last);
         dbg64_str(" vfs=");
-        ic_put_dec(vfs64_system_slot64() >= 0 ? 1 : 0);
+        ic_put_dec(sysslot >= 0 ? 1 : 0);
+        // ★ 修复：把"为什么没有"打全 —— 系统盘是哪个、卷里的包在不在、哪几个盘试过什么、还留了几个错。
+        dbg64_str(" sys-disk=");
+        ic_put_dec(drive64_system_disk64());
+        dbg64_str(" vfs-file=");
+        ic_put_dec(vfs_file);
+        dbg64_str(" probes=");
+        if (probed_n == 0) dbg64_str("-");
+        for (int i = 0; i < probed_n; i++) {
+            if (i != 0) dbg64_str(",");
+            ic_put_dec(probed_d[i]);
+            dbg64_str(":");
+            static const char* kProbeWhy64[5] = { "?", "read", "magic", "size", "alloc" };
+            dbg64_str(kProbeWhy64[probed_r[i] <= 4 ? probed_r[i] : 0]);
+        }
+        dbg64_str(" raw-reads=");
+        ic_put_dec(raw_read_ok);
         dbg64_str(" -> programmatic fallback stays");
         dbg64_nl();
         dbg64_line_end64();
