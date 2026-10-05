@@ -1121,6 +1121,43 @@ def cap_usb_storage():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_app_store():
+    """★ 本批（用户计划 ⑩）：应用商店 + 包管理器 —— `/bin/vpkg`（CLI）+ `/bin/store`（GUI 商店）；
+    能装自家 `.vap64` 与真 `.deb`（ar + control.tar.gz + data.tar.gz）。**全部 ring3，内核 0 字节**。"""
+    need = ["user/store/vpkg.c", "user/store/store.c", "user/store/vs_pkg.c",
+            "tools/store_pack_win.py", "tests/vpkg64_test.py"]
+    miss = [f for f in need if not exists(f)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    pkg = grep_count(r"install|remove|sha256", ["user/store/vs_pkg.c"])
+    deb = grep_count(r"deb|ar_|control|data.tar", ["user/store/vs_pkg.c"])
+    gui = grep_count(r"store|wm_|font64|install", ["user/store/store.c"])
+    pack = grep_count(r"vap64|deb|index", ["tools/store_pack_win.py"])
+    boot = grep_count(r"store_pack_win|build_store", ["build64.sh"])
+    ev = [
+        "user/store/ 9 文件（vs.h / vs_io.c / vs_gzip.c / vs_pkg.c / vpkg.c / store.c / demo_cli.c / demo_gui.c / "
+        "build_store.sh）：装/卸/sha256 命中 %d、deb 解析命中 %d、GUI 命中 %d" % (pkg, deb, gui),
+        "打包装卷：tools/store_pack_win.py（.vap64 复用 SDK vap64_pack；真 .deb 由宿主 Python 造；索引 "
+        "index.json）命中 %d；build64.sh 只加『装进系统卷』那一段（命中 %d），VIMTUOS_VERSION 与预算阈值未动"
+        % (pack, boot),
+        "验收 tests/vpkg64_test.py **82/82 PASS**：CLI install ok + `[HELLO-CLI] summary … rc=0` 真跑起来；"
+        "deb `deb control package=vpkg-debdemo` 装成功、维护者脚本 `maintainer scripts not supported`(rc=9)、"
+        "xz `only gzip is supported`(rc=10) 整包拒绝且零残留；GUI：像素断言 -> `hit=row sel=1` -> `hit=install` ->"
+        " `progress pct=100` -> `install ok` -> 第 2 行图标变绿 -> `hit=launch` -> `[DEMO-GUI] pid=29 done "
+        "frames=3`；关 QEMU 后宿主侧卷校验：`/bin/hello-cli` == payload 15616 B、deb data.tar、`installed.json` "
+        "记录与 files[]、卸载后文件消失；反例 hash rc=2 / depends rc=4 / installed rc=6 / space rc=5",
+        "内核代价 **0 字节**（kernel64_os.bin 仍 2,744,480 B）；回归 a42a64 89/89、sh64 59/59、gui_modern64 PASS；"
+        "调试期修掉四个真缺陷（vpkg 栈上大表 SIGSEGV(139)、内核 mkdir『已存在』非 -EEXIST、control 字段前导空格、"
+        "GUI 启动撞内核 fork 256 页上限 -> 改提前 fork 的 execve 助手 + pipe）",
+        "边界（如实）：deb 的 xz/bz2 与维护者脚本**整包拒绝**；依赖只解析一层；`update` 只比对提示不自动升级；"
+        "装系统目录要写权限（非 root 会话报专门错误码 `perm`，验收夹具用 `--writable-roots`）；另有既有的构建抖动"
+        "（`_subset_fonts.py` 子集 TTF 连跑两次 sha256 会变，同树两次构建可差 16~32 B，与内核无关，a42a64_test.py "
+        "自己也记着这条）",
+    ]
+    done = bool(pkg and deb and gui and pack and boot and exists("tests/vpkg64_test.py"))
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 def cap_usb_ehci():
     """★ 本批：EHCI（USB 2.0）主机控制器 —— UHCI / xHCI 之后第三个 USB 主控；EHCI 上的 U 盘**当盘用**：
     盘符、可读可写（写后读回 + 关 QEMU 后宿主侧逐字节）、热插拔。"""
@@ -3052,6 +3089,8 @@ CAPS = [
     ("存储", "★ U 盘（USB 存储）可写（FAT32 多卷写路径 + 写后逐字节读回）", cap_usb_storage_rw),
     ("存储", "★ 本批：EHCI（USB 2.0）主机控制器（U 盘当盘用：盘符/可读写/热插拔；三场景 116 断言）",
      cap_usb_ehci),
+    ("应用", "★ 本批（用户计划 ⑩）：应用商店 + 包管理器（/bin/vpkg CLI + /bin/store GUI；装自家 .vap64 与真 .deb；内核 0 字节；82 断言）",
+     cap_app_store),
     ("内核", "APIC 启用", cap_apic_enable),
     ("内核", "SMP（启动 AP）", cap_smp_ap),
     ("应用", "★ 锁屏 + 登录 + 多用户骨架（/etc/users.db 加盐哈希；su/sudo 会话身份；root 不在登录界面）", cap_users_login),
