@@ -1385,6 +1385,34 @@ else
     echo "ERROR: 缺少 $NET_VOL_IN 或 $BUILD/netd.elf —— 网络栈没装进系统卷" >&2
     exit 1
 fi
+
+# ============================================================================
+# ★ 本批（用户计划 ⑩）：**应用商店 + 包管理器** —— 全部用户态，内核 0 字节
+#   1) user/store/build_store.sh 编四个 ring3 程序（/bin/vpkg、/bin/store + 两个示例包载荷），
+#      并在脚本里复算"PT_LOAD 落在 4GiB..4GiB+64KiB"这条硬约束（与 kernel/elf64.cpp 同判据）；
+#   2) tools/store_pack_win.py --make-shipped 造**套件仓库**（两个 .vap64 用 SDK 的 vap64_pack、
+#      三个 .deb 是真 ar + control.tar.gz/data.tar.gz，含反例）+ index.json；
+#   3) 同一步把 /bin/vpkg、/bin/store、/opt/vpkg/index.json、/opt/vpkg/repo/* 写进系统卷
+#      （VimtuFS2 v4）并**逐字节回读自检**，拼出新的 build64/sysdisk.img；
+#   4) probe64.py 断言内核二进制里搜不到这四个程序的字节（交付 = 卷里的文件）。
+#   端到端验收：python tests/vpkg64_test.py（CLI / deb / GUI 三路 + 反例 + 宿主侧卷校验）。
+# ============================================================================
+echo "==> ★ 应用商店/包管理器：/bin/vpkg + /bin/store + /opt/vpkg 仓库（全用户态，内核 0 字节）"
+bash user/store/build_store.sh
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid \
+      "$BUILD/store/vpkg.elf" "$BUILD/store/store.elf" "$BUILD/store/demo_cli.elf" "$BUILD/store/demo_gui.elf"
+"$PY" tools/store_pack_win.py --make-shipped --repo-out "$BUILD/store/repo" \
+      --vpkg "$BUILD/store/vpkg.elf" --store "$BUILD/store/store.elf"
+STORE_VOL_IN="$BUILD/netvol.img"
+[ -f "$STORE_VOL_IN" ] || STORE_VOL_IN="$BUILD/fontvol.img"
+if [ -f "$STORE_VOL_IN" ] && [ -f "$BUILD/store/vpkg.elf" ] && [ -f "$BUILD/store/store.elf" ]; then
+    "$PY" tools/store_pack_win.py --vol-in "$STORE_VOL_IN" --vol-out "$BUILD/storevol.img" \
+          --vpkg "$BUILD/store/vpkg.elf" --store "$BUILD/store/store.elf" \
+          --repo "$BUILD/store/repo" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+else
+    echo "ERROR: 缺少 $STORE_VOL_IN 或 build64/store/*.elf —— 应用商店没装进系统卷" >&2
+    exit 1
+fi
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
 "$PY" - "$BUILD/payload_hdr.bin" "$SYS_SECTORS" "$((PAYLOAD_LBA + 1))" <<'PYEOF'
 import struct, sys
