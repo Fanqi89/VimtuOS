@@ -67,6 +67,10 @@ struct Vgpu64Info {
     uint64_t blits_dev, blits_soft;          // 区域提交走了设备/软件的次数（fb 侧每次提交都记）
     uint64_t selftest_dev_blits, selftest_soft_blits;
     const char* last_err;                    // 最近一次失败的阶段名（"none" = 没失败过）
+    // ★ ⑭ 交换链运行时统计（0 = 没开交换链）
+    uint32_t swap_frames;                    // 交换链块数
+    uint32_t swap_presents;                  // 整帧提交次数（真的走了设备）
+    uint32_t swap_flips;                     // SET_SCANOUT 翻页次数
 };
 
 // 初始化（幂等）：PCI 扫描 -> MEM/BUS MASTER -> capability -> 特性协商 -> DEVICE_STATUS ->
@@ -111,4 +115,20 @@ int  vgpu64_bench64();
 
 // 分辨率变化后的重配（RESOURCE_UNREF -> CREATE_2D -> ATTACH -> SET_SCANOUT -> 整屏 TRANSFER）。
 //   失败（或几何不支持）时**降级**：尝试把 scanout 交还 legacy VGA framebuffer + ready=0。
+
+// ==================== ★ 用户计划 ⑭：VSync + 交换链（GPU 整帧翻页）+ 故障注入 ====================
+// 语义：
+//   * 交换链 = **每块一个 resource**（第 0 块 = 既有 primary resource，绑后备缓冲起始页；第 k 块绑
+//     后备缓冲第 k 块首址起的页）。整帧提交 = TRANSFER_TO_HOST_2D(offset=0 整帧) + RESOURCE_FLUSH
+//     + SET_SCANOUT 翻页 —— 绘制永远不写"正在被扫描出的那一块内存"，因此屏幕上任一时刻只能是
+//     完整旧帧或完整新帧（宿主侧 screendump 抓不到中间态）。
+//   * 返回值一律**如实**：设备不可用/几何不匹配/任何一步失败 -> 0，调用方（kernel/fb.cpp）原样
+//     走软件路径并**继续出帧**（有界超时 + 有限次打点，绝不 PANIC）。
+int  vgpu64_swap_init64(int frames);                 // 建交换链；返回可用块数（>=2 才成立）
+int  vgpu64_swap_frames64();                         // 当前交换链块数
+int  vgpu64_present64(int slot, int w, int h);       // 整帧提交第 slot 块；1 = 走了设备
+// 故障注入（只由 fb.cpp 按 fw_cfg 配置调用；缺省全关 -> 既有行为一个字节不变）
+//   kind：0=none 1=timeout（命令强制超时失败）2=illegal（响应类型非法）3=gone（设备消失）
+//   after：第几条命令之后开始注入；注入次数有界（最多 8 条），命中后连续失败 -> 既有降级路径
+void vgpu64_set_inject64(int kind, uint32_t after);
 int  vgpu64_reconfigure64(int w, int h, int zoom);

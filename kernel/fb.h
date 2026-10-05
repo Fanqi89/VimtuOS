@@ -64,6 +64,26 @@ int  fb_kernel_paint_on64();
 //   **不受**内核绘制开关影响（这是用户程序自己的提交，不是内核在画）；坐标在此再夹一次。
 void fb_user_flip64(int x, int y, int w, int h);
 // 颜色辅助
+// ==================== ★ 用户计划 ⑭：VSync + 交换链 + 混合渲染（GPU 主 / CPU 次）====================
+// 定位与边界（先读）：
+//   * 交换链 = 后备缓冲切成的 N 块（2 或 3），**整帧提交**：屏幕上任一时刻只能是"完整旧帧"或
+//     "完整新帧"。设备路径（virtio-gpu 2D）用 **每块一个 resource + SET_SCANOUT 翻页** 实现 ——
+//     绘制永远不会写到"正在被扫描出的那一块内存"；软件路径（无设备/gpu=off）只能整帧写 LFB
+//     （Bochs VBE 没有页翻转原语 -> 如实标 in-place，可能被宿主扫描出中间态）。
+//   * **帧节拍**：有硬件垂直回扫信号（VGA ISR1 端口 0x3DA bit3）就用（如实标 mode=hw），
+//     否则用"按刷新率估计 + hlt/tick 粗睡 + rdtsc 自旋细等"的节拍器（如实标 mode=pace）。
+//   * **故障注入 / 降级**：vgpu64 侧有界超时 + 响应类型校验；注入（fw_cfg 配置）命中后
+//     驱动降级 soft-lfb，帧引擎继续用 CPU 路径出帧，绝不 PANIC。
+//   * 默认**零影响**：整块功能由 QEMU fw_cfg 的 opt/vimtu/vsync 配置串开启；没有该通道
+//     （真机/VMware/未配置）时 fb_vsync_run64() 一行不打、一个字节不改既有行为。
+int  fb_vsync_run64(void);          // 帧引擎（由 virtio_gpu64_bench64 末尾调用）；返回跑过的帧数
+int  fb_swap_enable64(int n);       // 开交换链（返回实际生效块数；<2 = 没开）
+int  fb_swap_count64();             // 当前交换链块数（1 = 没开）
+int  fb_swap_front64();             // 当前在屏上的块号
+int  fb_frame_present64();          // 整帧提交当前绘制块 -> 上屏；返回 1 = 走设备，0 = 软件
+const char* fb_vsync_mode64();      // "hw" / "pace" / "off"
+// 帧统计（验收脚本/设置页读取）：frames = 跑过的帧数，med/p95/jitter = 帧间隔（µs）
+void fb_vsync_stats64(uint64_t* frames, uint64_t* med_us, uint64_t* p95_us, uint64_t* jit_us);
 inline uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) {
     return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 }

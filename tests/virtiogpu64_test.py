@@ -214,6 +214,10 @@ def run_mode(qemu, img, vga, port, tmp, checks, expect_device):
             return
         m = last(r"\[G64\] fb render=(\d+)x(\d+) phys=(\d+)x(\d+) zoom=(\d+)", vm.log())
         fb_w, fb_h = (int(m.group(3)), int(m.group(4))) if m else (0, 0)
+        # ★ 用户计划 ⑭（VSync/交换链/帧引擎）：本脚本**不**传 -fw_cfg opt/vimtu/vsync，
+        #   所以帧引擎必须一行不打、既有启动路径零影响（详细验收见 tests/vsync64_test.py）。
+        check("无 vsync 配置时帧引擎零打点（没有 [VSYNC] 行）", last(r"\[VSYNC\]", vm.log()) is None,
+              (last(r"\[VSYNC\][^\r\n]*", vm.log()).group(0) if last(r"\[VSYNC\]", vm.log()) else "无（正确）"))
 
         if not expect_device:
             return run_no_device(vm, check)

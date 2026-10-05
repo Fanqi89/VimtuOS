@@ -168,6 +168,14 @@ static VgpuMemEntry* g_entries = nullptr;         // ATTACH_BACKING 的页表（
 static uint32_t   g_entries_cap = 0;
 static int        g_fails = 0;                    // 连续失败计数（到 VGPU_MAX_FAILS 就降级）
 static int        g_blit_logged = 0;
+static uint32_t   g_scanout_res = 0;                                   // ★ ⑭：当前 scanout 上的 resource id
+// ★ ⑭ 交换链（每块一个 resource；第 0 块 = primary g_i.res_id）
+#define VGPU_SWAP_MAX 3
+static uint32_t   g_swap_res[VGPU_SWAP_MAX] = { 0, 0, 0 };
+static uint32_t   g_swap_frames = 0;
+static VgpuMemEntry* g_sw_entries = nullptr;                           // 交换链 ATTACH_BACKING 的页表（复用）
+static uint32_t   g_sw_entries_cap = 0;
+static uint32_t   g_swap_presents = 0, g_swap_flips = 0;
 static uint32_t   g_res_w = 0, g_res_h = 0;       // resource 宽高（== 后备缓冲 stride 才合法）
 static int        g_scanout_on = 0;
 static const char* const VGPU_HEXL = "0123456789abcdef";
@@ -384,6 +392,38 @@ static void vgpu_notify0() {
     if (g_notify_pa) vwr16(g_notify_pa, 0);
 }
 
+// ==================== ★ ⑭ 故障注入（只由 fb.cpp 按 fw_cfg 配置调用；缺省全关）====================
+// 为什么要有它：验收要证明"设备路径出问题时会**自动降级**并且系统继续可用"。注入三条路：
+//   timeout  = 命令根本不完成（强制走有界超时分支）-> 连续失败 -> vgpu_disable -> 软件路径
+//   illegal  = 命令完成但响应类型非法（0x1BAD）-> 响应校验判失败 -> 同上
+//   gone     = 设备"消失"（命令被丢弃）-> 同上（reason 区分）
+// 注入次数**有界**（最多 8 条命令），因此最坏情况下也只是有限次失败后降级，不会无限打点/挂死。
+static int      g_inj_kind = 0;        // 0=none 1=timeout 2=illegal 3=gone
+static uint32_t g_inj_after = 0;       // 第几条命令之后开始注入
+static int      g_inj_left = 0;        // 还剩几条要注入
+static int      g_inj_logged = 0;
+void vgpu64_set_inject64(int kind, uint32_t after) {
+    g_inj_kind = kind;
+    g_inj_after = after;
+    g_inj_left = kind ? 8 : 0;
+    g_inj_logged = 0;
+}
+// 命中返回 kind（打点最多 3 行）；不命中返回 0
+static int vgpu_inject_hit64(void) {
+    if (!g_inj_kind || g_inj_left <= 0) return 0;
+    if (g_i.cmds < g_inj_after) return 0;
+    g_inj_left--;
+    if (g_inj_logged < 3) {
+        g_inj_logged++;
+        vgpu_log_begin();
+        vgpu_puts("[VGPU] INJECT kind="); vgpu_num((uint64_t)g_inj_kind);
+        vgpu_puts(" cmds="); vgpu_num(g_i.cmds);
+        vgpu_puts(" left="); vgpu_num((uint64_t)g_inj_left);
+        vgpu_log_end();
+    }
+    return g_inj_kind;
+}
+
 // 提交一条命令并**有界等待**它的 used 条目。cmd 必须是物理连续的一块（堆/静态都行）。
 // 返回 true = 设备消费了这条链（used.idx 前进）；g_resp 里按命令语义解释响应。
 static bool vgpu_cmd(const void* cmd, uint32_t cmd_len, const char* tag) {
@@ -404,6 +444,21 @@ static bool vgpu_cmd(const void* cmd, uint32_t cmd_len, const char* tag) {
     vgpu_notify0();
 
     g_i.cmds++;
+    // ★ ⑭ 故障注入：timeout/gone = 直接判失败（**有界**：不等待、不挂）；illegal = 命令照走，
+    //   但把响应类型改成非法值，由 vgpu_send 的响应校验判失败。
+    const int inj = vgpu_inject_hit64();
+    if (inj == 1 || inj == 3) {
+        g_i.cmd_timeouts++;
+        g_i.last_err = (inj == 1) ? "inject-timeout" : "inject-device-gone";
+        vgpu_log_begin();
+        vgpu_puts("[VGPU] cmd inject-fail type=");
+        vgpu_hex32(((const VgpuHdr*)cmd)->type);
+        vgpu_puts(" name="); vgpu_puts(tag);
+        vgpu_puts(" reason="); vgpu_puts(g_i.last_err);
+        vgpu_puts(" timeouts="); vgpu_num(g_i.cmd_timeouts);
+        vgpu_log_end();
+        return false;
+    }
     const uint64_t t0 = g_ticks64;
     uint32_t spin = 0;
     while (*g_used_idx == g_used_seen) {
@@ -427,6 +482,7 @@ static bool vgpu_cmd(const void* cmd, uint32_t cmd_len, const char* tag) {
     g_last_used_len = g_used[(uint16_t)(g_used_seen % g_qsize)].len;
     g_used_seen = *g_used_idx;
     if (g_i.isr_pa) (void)vrd32(g_i.isr_pa);                      // ★ 读 ISR = ack + 拉低 INTx
+    if (inj == 2) ((VgpuHdr*)g_resp)->type = 0x1BADu;             // ★ ⑭：注入非法响应类型
     return true;
 }
 
@@ -443,7 +499,21 @@ static void vgpu_cmd_log(uint32_t type, int used_ok) {
 static bool vgpu_send(const void* cmd, uint32_t len, int verbose) {
     const bool ok = vgpu_cmd(cmd, len, vgpu_cmd_name(((const VgpuHdr*)cmd)->type));
     if (verbose) vgpu_cmd_log(((const VgpuHdr*)cmd)->type, ok ? 1 : 0);
-    return ok;
+    if (!ok) return false;
+    // ★ ⑭ 响应类型校验：0x11xx = OK_*，0x1200..0x12FF = ERR_*（非法参数/资源不存在/不支持）。
+    //   这一批之前只等 used 条目、**不看响应类型** —— 设备"礼貌地拒绝"（坏矩形/坏 offset/坏 resource）
+    //   会被静默当成成功，上屏就是错的。现在把 ERR 当失败：调用方走软件路径 / 计入连续失败。
+    //   （0 长度 used 条目时 g_resp 全 0 -> 视为 OK，与既有容忍行为一致。）
+    const uint32_t rt = ((const VgpuHdr*)g_resp)->type;          // vgpu_resp_type() 在本函数之后定义
+    if (rt >= 0x1200u && rt < 0x1300u) {
+        g_i.last_err = "resp-err";
+        vgpu_log_begin();
+        vgpu_puts("[VGPU] resp ERR type="); vgpu_hex32(rt);
+        vgpu_puts(" name="); vgpu_puts(vgpu_cmd_name(((const VgpuHdr*)cmd)->type));
+        vgpu_log_end();
+        return false;
+    }
+    return true;
 }
 static uint32_t vgpu_resp_type() { return ((const VgpuHdr*)g_resp)->type; }
 
@@ -456,6 +526,7 @@ static void vgpu_scanout_off_internal() {
     c.scanout_id = 0; c.resource_id = 0;                          // resource_id = 0 = 关掉 scanout
     if (!vgpu_send(&c, sizeof(c), 0)) return;
     g_scanout_on = 0;
+    g_scanout_res = 0;
 }
 // 降级：把显示交还 legacy VGA framebuffer + ready=0（fb.cpp 那边随后原样走软件路径）
 static void vgpu_disable(const char* reason) {
@@ -463,6 +534,8 @@ static void vgpu_disable(const char* reason) {
     vgpu_scanout_off_internal();
     g_i.ready = 0;
     g_scanout_on = 0;
+    g_scanout_res = 0;
+    g_swap_frames = 0;                          // ★ ⑭：交换链一起失效（fb.cpp 随后走软件路径继续出帧）
     g_i.last_err = reason ? reason : "?";
     vgpu_log_begin();
     vgpu_puts("[VGPU] disable reason=");
@@ -470,18 +543,23 @@ static void vgpu_disable(const char* reason) {
     vgpu_log_end();
     fb_backend_log64("soft-lfb (device path disabled)");
 }
-static bool vgpu_set_scanout_internal() {
+// ★ ⑭：把指定 resource 设到 scanout 0 上（交换链翻页用）。rid = 0 = 关掉 scanout。
+static bool vgpu_set_scanout_res(uint32_t rid) {
     VgpuSetScanout s;
     memset_64(&s, 0, sizeof(s));
     s.hdr.type = VGPU_CMD_SET_SCANOUT;
     s.r.x = 0; s.r.y = 0; s.r.width = g_res_w; s.r.height = g_res_h;
-    s.scanout_id = 0; s.resource_id = g_i.res_id;
+    s.scanout_id = 0; s.resource_id = rid;
     if (!vgpu_send(&s, sizeof(s), 1)) return false;
+    g_scanout_on = (rid != 0) ? 1 : 0;
+    g_scanout_res = rid;
+    return true;
+}
+static bool vgpu_set_scanout_internal() {
     // 注（如实记录）：QEMU 的 virtio-vga 里 device 与 legacy VGA 共用同一个 console —— 早期 boot 里
     //   屏幕可能仍由 VGA 那一路驱动（见报告"没做到 / 环境说明"）；像素正确性由自检的
     //   TRANSFER_FROM_HOST_2D 回读逐字节证明（不依赖 host 的显示仲裁）。
-    g_scanout_on = 1;
-    return true;
+    return vgpu_set_scanout_res(g_i.res_id);
 }
 
 // ==================== 几何 ====================
@@ -771,19 +849,22 @@ const char* vgpu64_backend_name64() { return g_i.ready ? "virtio-gpu-2d" : "soft
 //   第 2 行读到的其实是"区域所在行里紧接区域右边的像素"——搬过去是错位数据（实测：资源里是花的）。
 //   只有 **r.width == resource 宽** 时紧凑块才与 stride 一致。因此区域 blit 一律搬
 //   "**整行宽的带**" rows [y, y+h)：多搬一点带宽，换来像素绝对正确（x 参数因此不再参与传输）。
-static bool vgpu_transfer_to_host(int x, int y, int w, int h) {
-    (void)x; (void)w;
+static bool vgpu_transfer_to_host_res(uint32_t rid, int y, int h) {
     VgpuTransfer2d t;
     memset_64(&t, 0, sizeof(t));
     t.hdr.type = VGPU_CMD_TRANSFER_TO_HOST_2D;
     t.r.x = 0; t.r.y = (uint32_t)y;
     t.r.width = g_res_w; t.r.height = (uint32_t)h;
     t.offset = (uint64_t)y * g_res_w * 4u;                        // 带的起点（backing 内字节偏移）
-    t.resource_id = g_i.res_id;
+    t.resource_id = rid;
     if (!vgpu_send(&t, sizeof(t), 0)) return false;
     g_i.transfers++;
     g_i.bytes_to_host += (uint64_t)g_res_w * (uint64_t)h * 4u;
     return true;
+}
+static bool vgpu_transfer_to_host(int x, int y, int w, int h) {
+    (void)x; (void)w;
+    return vgpu_transfer_to_host_res(g_i.res_id, y, h);
 }
 // TRANSFER_FROM_HOST_2D：把 resource 的 rect 回写进 backing 的 dst_off 处。本批只用它做自检的
 //   "设备像素" 证据（不依赖 host 显示仲裁）。
@@ -798,17 +879,18 @@ static bool vgpu_transfer_from_host(int x, int y, int w, int h, uint64_t dst_off
     return vgpu_send(&t, sizeof(t), 1);
 }
 
-static bool vgpu_flush(int x, int y, int w, int h) {
+static bool vgpu_flush_res(uint32_t rid, int x, int y, int w, int h) {
     VgpuResFlush f;
     memset_64(&f, 0, sizeof(f));
     f.hdr.type = VGPU_CMD_RESOURCE_FLUSH;
     f.r.x = (uint32_t)x; f.r.y = (uint32_t)y;
     f.r.width = (uint32_t)w; f.r.height = (uint32_t)h;
-    f.resource_id = g_i.res_id;
+    f.resource_id = rid;
     if (!vgpu_send(&f, sizeof(f), 0)) return false;
     g_i.flushes++;
     return true;
 }
+static bool vgpu_flush(int x, int y, int w, int h) { return vgpu_flush_res(g_i.res_id, x, y, w, h); }
 static void vgpu_blit_fail(const char* why) {
     if (++g_fails >= VGPU_MAX_FAILS) { vgpu_disable(why); g_fails = 0; return; }
     vgpu_log_begin();
@@ -846,10 +928,106 @@ int vgpu64_blit64(int x, int y, int w, int h) {
     return 1;
 }
 
+// 软件路径提交计数（fb.cpp 每次走 CPU 路径时告知）
 void vgpu64_note_soft_blit64(int x, int y, int w, int h) {
     (void)x; (void)y; (void)w; (void)h;
     g_i.blits_soft++;
 }
+
+int vgpu64_swap_frames64() { return (int)g_swap_frames; }
+
+// ★ ⑭ 交换链：每块一个 resource（第 0 块 = primary；第 k 块绑后备缓冲第 k 块首址起的物理页）。
+//   幂等；任何一步失败 -> 如实返回已建成的块数（<2 = 交换链不成立，调用方走软件路径）。
+int vgpu64_swap_init64(int frames) {
+    if (!g_i.ready || !g_scanout_on) return (int)g_swap_frames;
+    if (frames > VGPU_SWAP_MAX) frames = VGPU_SWAP_MAX;
+    if (frames < 2) return 0;
+    const uint32_t bytes = g_res_w * g_res_h * 4u;
+    const uint32_t entries = (bytes + PAGE_SIZE_64 - 1) / PAGE_SIZE_64;
+    const uint64_t base_pa = fb_surface_phys64(nullptr);
+    if (!base_pa || !bytes) return 0;
+    if (!g_sw_entries || g_sw_entries_cap < entries) {
+        if (g_sw_entries) { kfree_64(g_sw_entries); g_sw_entries = nullptr; g_sw_entries_cap = 0; }
+        g_sw_entries = (VgpuMemEntry*)kmalloc_64((uint64_t)entries * sizeof(VgpuMemEntry));
+        if (!g_sw_entries) { vgpu_err("swap entries alloc"); return 0; }
+        g_sw_entries_cap = entries;
+    }
+    g_swap_res[0] = g_i.res_id;
+    uint32_t made = 1;
+    for (int k = 1; k < frames; k++) {
+        const uint32_t rid = g_i.res_id + (uint32_t)k;
+        if (g_swap_res[k] == rid) { made = (uint32_t)k + 1; continue; }        // 幂等
+        for (uint32_t i = 0; i < entries; i++) {
+            g_sw_entries[i].addr = base_pa + (uint64_t)k * (uint64_t)bytes + (uint64_t)i * PAGE_SIZE_64;
+            g_sw_entries[i].length = PAGE_SIZE_64;
+            g_sw_entries[i].padding = 0;
+        }
+        VgpuCreate2d c2;
+        memset_64(&c2, 0, sizeof(c2));
+        c2.hdr.type = VGPU_CMD_RESOURCE_CREATE_2D;
+        c2.resource_id = rid; c2.format = VGPU_FORMAT_B8G8R8X8_UNORM;
+        c2.width = g_res_w; c2.height = g_res_h;
+        if (!vgpu_send(&c2, sizeof(c2), 0)) break;
+        const uint32_t alen = (uint32_t)(sizeof(VgpuAttach) + entries * sizeof(VgpuMemEntry));
+        VgpuAttach* at = (VgpuAttach*)kmalloc_64(alen);
+        if (!at) break;
+        memset_64(at, 0, sizeof(VgpuAttach));
+        at->hdr.type = VGPU_CMD_RESOURCE_ATTACH_BACKING;
+        at->resource_id = rid;
+        at->nr_entries = entries;
+        uint8_t* dst = (uint8_t*)at + sizeof(VgpuAttach);                // 页表紧跟命令结构
+        const uint8_t* src = (const uint8_t*)g_sw_entries;
+        for (uint32_t i = 0; i < entries * (uint32_t)sizeof(VgpuMemEntry); i++) dst[i] = src[i];
+        const bool ok = vgpu_send(at, alen, 0);
+        kfree_64(at);
+        if (!ok) break;
+        g_swap_res[k] = rid;
+        made = (uint32_t)k + 1;
+    }
+    g_swap_frames = (made >= 2) ? made : 0;
+    vgpu_log_begin();
+    vgpu_puts("[VGPU] swap frames="); vgpu_num((uint64_t)made);
+    vgpu_puts(" res=");
+    for (uint32_t k = 0; k < made; k++) {
+        vgpu_num(g_swap_res[k]);
+        if (k + 1 < made) vgpu_ch(',');
+    }
+    vgpu_puts(" bytes="); vgpu_num(bytes);
+    vgpu_puts(" base="); vgpu_hex64(base_pa);
+    vgpu_log_end();
+    for (int k = (int)made; k < VGPU_SWAP_MAX; k++) g_swap_res[k] = 0;
+    return (int)g_swap_frames;
+}
+
+// 整帧提交第 slot 块：TRANSFER_TO_HOST_2D（offset=0 整帧、整行宽）+ RESOURCE_FLUSH +
+//   （scanout 不在这一块时才）SET_SCANOUT 翻页。返回 1 = 真的走了设备。
+//   任何一步失败 -> 0 + 计入连续失败（到 VGPU_MAX_FAILS 就降级 soft-lfb，调用方继续出帧）。
+int vgpu64_present64(int slot, int w, int h) {
+    if (!g_i.ready || !g_scanout_on) return 0;
+    if (slot < 0 || slot >= (int)g_swap_frames) return 0;
+    const uint32_t rid = g_swap_res[slot];
+    if (!rid) return 0;
+    if (!vgpu_geom_ok()) {
+        if (!vgpu64_reconfigure64(fb_phys_width(), fb_phys_height(), fb_get_zoom())) return 0;
+        if (slot >= (int)g_swap_frames || g_swap_res[slot] != rid) return 0;   // 重配后交换链重建了
+    }
+    if (w > (int)g_res_w) w = (int)g_res_w;
+    if (h > (int)g_res_h) h = (int)g_res_h;
+    if (w <= 0 || h <= 0) return 0;
+    if (!vgpu_transfer_to_host_res(rid, 0, h)) { vgpu_blit_fail("present-transfer"); return 0; }
+    if (!vgpu_flush_res(rid, 0, 0, w, h))     { vgpu_blit_fail("present-flush");    return 0; }
+    if (g_scanout_res != rid) {
+        if (!vgpu_set_scanout_res(rid))       { vgpu_blit_fail("present-scanout");  return 0; }
+        g_swap_flips++;
+    }
+    g_swap_presents++;
+    g_i.swap_frames = g_swap_frames;
+    g_i.swap_presents = g_swap_presents;
+    g_i.swap_flips = g_swap_flips;
+    g_fails = 0;
+    return 1;
+}
+
 
 // ==================== fill / copy：2D 命令集没有这两个原语 -> 如实 CPU ====================
 int vgpu64_fill64(int x, int y, int w, int h, uint32_t color) {
@@ -912,10 +1090,24 @@ int vgpu64_copy64(int dx, int dy, int w, int h, int sx, int sy) {
 }
 
 // ==================== 分辨率/缩放变化后的重配 ====================
+// ★ ⑭：交换链的额外 resource 必须先 UNREF 掉（几何变了，旧的不能再翻页）。
+static void vgpu_swap_drop64(void) {
+    for (int k = 1; k < VGPU_SWAP_MAX; k++) {
+        if (!g_swap_res[k]) continue;
+        VgpuResId u;
+        memset_64(&u, 0, sizeof(u));
+        u.hdr.type = VGPU_CMD_RESOURCE_UNREF;
+        u.resource_id = g_swap_res[k];
+        (void)vgpu_send(&u, sizeof(u), 0);
+        g_swap_res[k] = 0;
+    }
+    g_swap_frames = 0;
+}
 int vgpu64_reconfigure64(int w, int h, int zoom) {
     if (!g_i.ready || !g_scanout_on) return 0;                     // 还没上过屏：交给初始流程
     if (zoom != 100 || w <= 0 || h <= 0) { vgpu_disable("zoom/resize unsupported"); return 0; }
     if ((int)g_res_w == w && (int)g_res_h == h) return 1;          // 几何没变
+    vgpu_swap_drop64();                                            // ★ ⑭：交换链失效（随后按需重建）
     {
         VgpuResId u;                                              // 先 UNREF 老 resource
         memset_64(&u, 0, sizeof(u));
@@ -1181,14 +1373,19 @@ static void vgpu_bench_case(const char* kind, int x, int y, int w, int h, int ru
 }
 
 int vgpu64_bench64() {
-    if (!g_i.ready || !g_scanout_on) return 0;
-    const int W = (int)g_res_w, H = (int)g_res_h;
-    const uint64_t cpt = g_cyc_per_tick ? g_cyc_per_tick : vgpu_cyc_per_tick();  // ★ init 已缓存（见上）
     int n = 0;
-    vgpu_bench_case("full", 0, 0, W, H, 5, cpt); n++;               // 整屏 flip（上屏主用例）
-    vgpu_bench_case("region", W / 4, H / 4, 512, 512, 5, cpt); n++; // 窗口搬移
-    vgpu_bench_case("region", W / 4, H / 4, 128, 128, 5, cpt); n++; // 局部重绘
-    vgpu_bench_case("region", W / 2, H / 2, 16, 16, 5, cpt); n++;   // 光标级小块（设备开销对照）
-    (void)vgpu64_blit64(0, 0, W, H);                                // 最后补一次整屏上屏
+    if (g_i.ready && g_scanout_on) {
+        const int W = (int)g_res_w, H = (int)g_res_h;
+        const uint64_t cpt = g_cyc_per_tick ? g_cyc_per_tick : vgpu_cyc_per_tick();  // ★ init 已缓存（见上）
+        vgpu_bench_case("full", 0, 0, W, H, 5, cpt); n++;               // 整屏 flip（上屏主用例）
+        vgpu_bench_case("region", W / 4, H / 4, 512, 512, 5, cpt); n++; // 窗口搬移
+        vgpu_bench_case("region", W / 4, H / 4, 128, 128, 5, cpt); n++; // 局部重绘
+        vgpu_bench_case("region", W / 2, H / 2, 16, 16, 5, cpt); n++;   // 光标级小块（设备开销对照）
+        (void)vgpu64_blit64(0, 0, W, H);                                // 最后补一次整屏上屏
+    }
+    // ★ ⑭：VSync + 交换链 + 混合渲染的帧引擎（自检/基准**之后**跑：不能在 selftest 之前动屏幕）。
+    //   只有 fw_cfg 里配了 demo=1 才真正跑；没配置时一行不打、直接返回（既有启动路径零影响）。
+    //   放在这一层（而不是 ready 的早退之后）是为了让"没有 virtio-gpu"的机器也能跑纯软件路径帧引擎。
+    (void)fb_vsync_run64();
     return n;
 }

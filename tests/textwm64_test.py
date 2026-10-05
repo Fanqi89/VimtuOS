@@ -217,6 +217,13 @@ def main():
     with tv.VMSession(vmx=args.vmx, keep=args.keep) as s:
         L("[env] 屏=%dx%d 冷启动到锁屏=%.1fs 桌面=%.1fs" %
           (s.vnc.w, s.vnc.h, s.boot_secs, getattr(s, "t_desktop", -1)))
+        # ★ 用户计划 ⑭：VMware 真屏（没有 QEMU fw_cfg -> 帧引擎必须**零打点**；同上零回归证据）
+        _vsl = s.log()
+        L("[env] 帧引擎打点=[VSYNC] 出现 %d 次（期望 0：VMware 无 fw_cfg 通道，功能默认关）" % _vsl.count("[VSYNC]"))
+        if _vsl.count("[VSYNC]") != 0:
+            results.append(("vsync-off", "log", "VSYNC_LINE_PRESENT"))
+        if "PANIC" in _vsl:
+            results.append(("panic", "log", "PANIC"))
         dg = s.dock_geom()
         L("[env] dock=%s" % dg)
         for name in names:
