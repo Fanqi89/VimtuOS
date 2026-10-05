@@ -1121,6 +1121,51 @@ def cap_usb_storage():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_usb_ehci():
+    """★ 本批：EHCI（USB 2.0）主机控制器 —— UHCI / xHCI 之后第三个 USB 主控；EHCI 上的 U 盘**当盘用**：
+    盘符、可读可写（写后读回 + 关 QEMU 后宿主侧逐字节）、热插拔。"""
+    need = ["kernel/ehci64.cpp", "kernel/ehci64.h", "tests/ehci64_test.py"]
+    miss = [f for f in need if not exists(f)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    reg = grep_count(r"ASYNCLISTADDR|PORTSC|USBCMD|USBSTS", ["kernel/ehci64.cpp"])
+    qh = grep_count(r"qtd|qh_|QH", ["kernel/ehci64.cpp"])
+    facade = grep_count(r"ehci64_msc_(count|read|write)64|ehci64_poll64", ["kernel/usb64.cpp"])
+    boot = grep_count(r"ehci64_init64\(", ["kernel/kernel64.cpp"])
+    test = exists("tests/ehci64_test.py")
+    ev = [
+        "kernel/ehci64.cpp %d 行（PCI class 0x0C/03/20 + BAR0 MMIO + HC 复位 + **异步调度 QH/qTD** + PORTSC "
+        "轮询 + companion 交还（PO=1）；寄存器命中 %d、QH/qTD 命中 %d）"
+        % (lines("kernel/ehci64.cpp"), reg, qh),
+        "门面接线：kernel/usb64.cpp 里 UHCI+EHCI 聚合成同一个 usb64_msc_*（命中 %d），驱动器号仍在 "
+        "ATA64_USB_BASE=24 段（24=UHCI、25=EHCI；ATA64_USB_MAX_DEVS 1->4），kernel64.cpp 启动期重扫把 EHCI "
+        "算进来（命中 %d）—— 于是 drive64/vfs64/fs64/fat64/资源管理器一路零改动" % (facade, boot),
+        "★ 本轮修掉两个**致命缺陷**（只有真 QEMU 联调才暴露）：① 端口复位照 Linux/SeaBIOS 顺序（PR=1 保持 "
+        "50ms -> **显式写 PR=0** -> 等 PED；旧代码等硬件自清，QEMU trace 实测 1,114,774 次 MMIO 读 PR 恒为 "
+        "0x1101 -> 启动链卡死在 ehci64_init64()）；② qTD 链原先发布在 QH 的 Current qTD（硬件拥有）字段，"
+        "overlay 的 Next qTD 留 TERM -> 控制器一条 qTD 都不执行（[EHCI] control req=06 FAILED timeout），"
+        "改后与 Linux struct ehci_qh_hw 逐字段一致；另修 PED 是 R/W（写 PORTSC 会关掉刚使能的端口）与 PO 在 "
+        "KEEP 掩码里导致交还伴随控制器是空操作",
+        "实测（纯 EHCI，无 UHCI 时如实降级 [USB64] not found）：[EHCI] reset ok / async qh=… qtds=32 / "
+        "[EHCI] port 1 reset ok speed=high ped=1 / device addr=1 mps=64 / [USBST] inquiry vendor=QEMU "
+        "product=QEMU HARDDISK / capacity blocks=72048 / [EHCI] selftest PASS mask=0；盘符 "
+        "[DRV64] letter=D: disk=24 part=1 fs=FAT32 … ro=0 usb_rw=1 + [FAT64] rw mount vol=0 writable=1；"
+        "写 [FAT64] rw write … verify=1 + [USBST] write verify lba=3174 count=1 ok (read back, byte-for-byte)",
+        "端到端（关 QEMU 后宿主侧解析 U 盘镜像）：新文件逐字节相等、原有文件数据与目录项一字节未变、"
+        "FAT1==FAT2、FSInfo free 与现场重数相等、**整盘 CRC32 ADF4EF02 -> BB029318**（变化扇区全落在 "
+        "FAT/FSInfo/根目录/新分配簇）；热插拔各一次（detach -> D: 消失；attach -> 重新枚举 + 盘符回来 + "
+        "资源管理器零改动刷新 [UI] explorer card idx=2 letter=D:）",
+        "验收：tests/ehci64_test.py **116/116 PASS**（三场景：只挂 EHCI / companion / 反例）+ 同批回归 "
+        "a42a64 89/89、usbstorage 103/103、usbwrite64 87/87、xhci64 91/91、iconboot64 51/51",
+        "边界（如实）：EHCI 上的 HID 键盘**未做**（只在 HS 端口做 BOT 存储；FS/LS 端口写 PO=1 交还伴随控制器，"
+        "而本驱动只识别少数 UHCI 型号，不驱动 ich9 伴随 UHCI）；QEMU 没有“注入坏 CRC”的开关，坏帧被拒用等价"
+        "形式覆盖（设备侧 CSW 拒写 + 越界探针 + 插拔期间有界失败），真机 USB 事务 CRC 错误未验；热插拔测试"
+        "**必须**用 `-blockdev node-name=stick`（用 `-drive …,id=` 会被 device_del 连后端一起销毁）",
+    ]
+    done = bool(reg and qh and facade and boot and test)
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 def cap_usb_storage_rw():
     """★ P8b：U 盘（USB 存储）**可写** —— FAT32 多卷写路径 + 写后逐字节读回。**完成**。
 
@@ -3002,6 +3047,8 @@ CAPS = [
     ("驱动", "USB 主机", cap_usb_host),
     ("存储", "★ USB 存储（U 盘只读，可从 U 盘拷应用）", cap_usb_storage),
     ("存储", "★ U 盘（USB 存储）可写（FAT32 多卷写路径 + 写后逐字节读回）", cap_usb_storage_rw),
+    ("存储", "★ 本批：EHCI（USB 2.0）主机控制器（U 盘当盘用：盘符/可读写/热插拔；三场景 116 断言）",
+     cap_usb_ehci),
     ("内核", "APIC 启用", cap_apic_enable),
     ("内核", "SMP（启动 AP）", cap_smp_ap),
     ("应用", "★ 锁屏 + 登录 + 多用户骨架（/etc/users.db 加盐哈希；su/sudo 会话身份；root 不在登录界面）", cap_users_login),
