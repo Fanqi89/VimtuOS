@@ -1269,26 +1269,32 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
     //   绝不改变启动流程）。只接管 **High-speed** 端口；PortOwner=1（伴随 UHCI/OHCI）的端口不抢，
     //   复位后 PED 没起来（FS/LS 设备）的端口写 PortOwner=1 交还伴随控制器。
     //   ★ **HID 键盘在 EHCI 上没做**（中断传输）：键盘由 UHCI/xHCI 覆盖，见 kernel/ehci64.h 顶部。
-    // ★ 未完成（本轮如实记录，下一步做，原因：本轮范围只到"接线 + 构建过"）：
-    //   ① EHCI 的存储设备**还没并进 usb64 的存储门面**（usb64_msc_* / ata64 的驱动器号 24..）——
-    //      现在它会枚举、探测、打 [EHCI]/[USBST] 自检行，但还**不暴露成盘符**；
-    //   ② 运行期热插拔轮询还没接进 usb64_poll64()（所以 ehci64_poll64() 目前不会被调用）；
-    //   ③ tests/ehci64_test.py 还没写。这三件是下一轮的内容（不是本驱动的漏做，见 ehci64.h 的实现范围）。
+    // ★ 本轮已完成（原来是"下一步做"的三条，现在都落地了，如实记录）：① EHCI 的存储设备已经**并进
+    //   usb64 的存储门面**（usb64_msc_* = UHCI + EHCI 聚合，驱动器号仍落在 24..；见 kernel/usb64.h）；
+    //   ② 运行期热插拔轮询已接进 usb64_poll64()（它调 ehci64_poll64()，并做"数量差分 -> 重扫盘符"）；
+    //   ③ tests/ehci64_test.py 已写（三场景：纯 EHCI / companion / 反例）。
     (void)ehci64_init64();
     // ---- ★ 批次 O：USB 存储（U 盘）接进来之后**重扫盘符表** ----
     // 为什么必须重扫：drive64_scan64() 上面（vfs64 挂载成功那条路径）已经跑过一次，那时 USB
     //   存储还没枚举（usb64_init64 排在 net64 之后）。重扫会把 U 盘上的 FAT32/VimtuFS2 卷按现有
-    //   规则识别 -> 只读挂载 -> 分配盘符（D:/E:…），容量/可用/只读标记全部由现有代码算出来。
+    //   规则识别 -> 挂载 -> 分配盘符（D:/E:…），容量/可用/只读标记全部由现有代码算出来。
+    // ★ 本轮：usb64_msc_count64() 现在是"UHCI + EHCI"的**门面计数**（见 kernel/usb64.h），所以
+    //   EHCI 上的 U 盘自然也被这一小段算进来 —— 打点里 uhci/ehci/xhci 分开报，排障时能看出盘挂在哪。
     // 幂等性：drive64_scan64() 对同一块盘/同一个卷复用已有的 vfs64 槽与 fs64 卷号（见其注释），
     //   所以重扫不会动 C: 的盘符、也不会把卷表撑爆；**没插 U 盘时整段跳过**（行为与改动前一致）。
     if (usb64_msc_count64() > 0 || xhci64_msc_count64() > 0) {
+        const int u = usb64_msc_uhci_count64();          // 只数 UHCI 那一段（门面计数 == uhci + ehci）
+        const int e = usb64_msc_count64() - u;           // EHCI 那一段
+        const int x = xhci64_msc_count64();
         dbg64_line_begin64();
         dbg64_str("[USBST] storage attached -> rescan drive letters (usb drives=");
-        dbg64_dec((uint64_t)(usb64_msc_count64() + xhci64_msc_count64()));
+        dbg64_dec((uint64_t)(u + e + x));
         dbg64_str(", uhci=");
-        dbg64_dec((uint64_t)usb64_msc_count64());
+        dbg64_dec((uint64_t)u);
+        dbg64_str(" ehci=");
+        dbg64_dec((uint64_t)e);
         dbg64_str(" xhci=");
-        dbg64_dec((uint64_t)xhci64_msc_count64());
+        dbg64_dec((uint64_t)x);
         dbg64_str(")\n");
         dbg64_line_end64();
         (void)drive64_scan64();

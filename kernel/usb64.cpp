@@ -64,6 +64,7 @@
 #include "memlayout64.h" // ★ 必须先于 mem_64.h（PAGE_SIZE_64 会撞）；ML64_KERNEL_VA_BASE 用它
 #include "mem_64.h"      // page_alloc_64 / memset_64（低内存恒等映射：物理地址即指针）
 #include "xhci64.h"     // ★ xHCI（USB 3.x）：kusb 轮询线程也要驱动它（task64.cpp 不改，见 usb64_poll64）
+#include "ehci64.h"     // ★ 本轮：EHCI（USB 2.0）—— 轮询 + **存储门面聚合**（usb64_msc_* 也覆盖它的 U 盘）
 #include "x86_64.h"      // g_ticks64 / ms_to_ticks64 / nop_pause()
 #include <stdint.h>
 #include <stddef.h>
@@ -297,6 +298,16 @@ struct Usb64Ctl64 {
 // 前置声明：控制/批量传输跑完要把中断 TD 重新挂回队列（定义在本文件后半，见 usb_arm_interrupt）
 static void usb_arm_interrupt();
 static void usb_hotplug_poll();          // ★ P8 热插拔检测（定义在文件后半段，poll 首行调用）
+static void usb_hotplug_rescan(const char* why);   // ★ 本轮：EHCI 出现/消失 -> 重扫盘符（同一条路）
+// ★ 本轮（EHCI）：门面的状态（零初始化 —— 见文件后半"门面状态"那一段的说明）。定义在这里是因为
+//   usb64_poll64()（本文件前半）就要用它们，而 g_msc 的定义在文件后半（放一起就编不过）。
+static int  g_ehci_msc_seen;             // 上一次采样的 EHCI 段可用块设备数
+static bool g_ehci_msc_armed;            // 基线是否已建立（等 ehci64_init64() 收尾）
+static int  g_msc_last_bus;              // 最近一次 read/write 落在哪一段（0 = UHCI，1 = EHCI）
+// ★ 本轮：门面（usb64_msc_*）是"UHCI + EHCI"聚合，索引会随**另一台主控**的盘增减而变；
+//   所以本文件内部的 UHCI 专有调用点（usb_msc_probe 的越界写探针）必须直接调下面这个
+//   **UHCI 专用**实现，而不是走门面 —— 探测期间 g_msc.supported=false，门面会把 idx 0 路由到 EHCI。
+static bool usb_msc_write_uhci64(uint32_t lba, uint32_t count, const void* buf);
 // 有界忙等：用 PIT 计时（中断开着，别的任务/桌面照常被调度），再加硬自旋上界兜底。
 static void usb_delay_ms(uint32_t ms) {
     const uint64_t t0 = g_ticks64;
@@ -735,6 +746,27 @@ void usb64_poll64() {
     //   两个主控各有独立的 DMA 结构/事件环/自旋锁，先后顺序互不影响：xhci64_init64() 在
     //   usb64_init64() 之后调用（见 kernel64.cpp），没有主控时 xhci64_poll64() 首行直接返回。
     xhci64_poll64();
+    // ★ 本轮：EHCI（USB 2.0）**同样和 UHCI/xHCI 共用 kusb 这一个轮询线程**（task64.cpp 不改）：
+    //   端口 CCS 变化 -> 复位/枚举/探测；拿不到传输锁直接返回（不阻塞、不挂死）。
+    //   初始化没收尾（g_hp_armed=0）时它首行就返回 —— 基线只在 ehci64_init64() 全部做完之后才建立。
+    ehci64_poll64();
+    // ★ 本轮：EHCI 上的存储"出现/消失" -> **重扫盘符**（与 UHCI 热插拔同一条路：drive64_scan64()
+    //   + explorer64_rescan64）。判据用**差分**而不是端口事件：
+    //     * 基线（g_ehci_msc_armed）必须等 ehci64_init64() 全部收尾才建立（见 ehci64_hotplug_ready64()）
+    //       —— P8b 教训：初始化没收尾就比对，会把刚枚举好的盘当成"新插入"，白扫一次；
+    //     * ehci64_poll64() 里的枚举/探测可能失败或重试（hotplug attach failed），那种中间态
+    //       **不重扫**（只有真的多/少了一块可用的盘才动盘符表）；已经配好的设备不会被重复枚举。
+    //   注意：这里只动**盘符表/界面**，不动 g_msc（那是 ehci64 自己的状态机）。
+    if (ehci64_hotplug_ready64()) {
+        const int now = ehci64_msc_count64();
+        if (!g_ehci_msc_armed) {
+            g_ehci_msc_armed = true;                     // ★ P8b：初始化完成后的**第一个**采样只当基线
+            g_ehci_msc_seen  = now;
+        } else if (now != g_ehci_msc_seen) {
+            g_ehci_msc_seen = now;
+            usb_hotplug_rescan(now > 0 ? "attached on EHCI" : "detached on EHCI");
+        }
+    }
     if (!g_ready || !g_irq_td) return;
     // ★ 批次 O：有传输在跑时（mass storage 的批量传输是同步自旋等待的）不碰队列 ——
     //   拿不到锁就"这次不重新武装"，下次轮询再来。绝不阻塞、绝不挂死。
@@ -972,6 +1004,13 @@ static uint32_t   g_usbst_wfail_logs = 0;     // ★ P8：写失败/越界的打
 #define USBST_READ_LOG_MAX 128u
 #define USBST_FAIL_LOG_MAX 64u
 #define USBST_WRITE_LOG_MAX 64u
+// ★ 本轮（EHCI）：门面的状态（定义在 poll 之前，因为 usb64_poll64() 要用它们）。
+//   g_ehci_msc_seen  = 上一次采样的"EHCI 段可用块设备数"；变化 -> 重扫盘符（与 UHCI 热插拔同一条路）。
+//   g_ehci_msc_armed = 基线是否已建立（**必须等 ehci64_init64() 全部收尾**：见 ehci64_hotplug_ready64()）。
+//   g_msc_last_bus   = 最近一次 usb64_msc_read64()/write64() 落在哪一段（0 = UHCI，1 = EHCI）——
+//                      usb64_msc_last_reason64() 用它取对应模块的原因字符串。
+//   为什么用差分而不是"端口事件直接触发"：ehci64_poll64() 内部会枚举 + 探测（可能失败/重试），
+//   只有"真的多/少了一块可用的盘"才需要动盘符表；失败的中途状态一律不重扫（P8b 纪律）。
 static uint32_t msc_rd32be(const uint8_t* p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
@@ -1486,12 +1525,15 @@ static void usb_msc_probe() {
     }
 
     // ---- 5) ★ P8：越界/超容量写的**边界探针**（明确失败，且**不碰介质**）----
-    //   为什么放在这里：这两次调用走的是**与上层写完全同一条** usb64_msc_write64()（同一份范围判定），
+    //   为什么放在这里：这两次调用走的是**与上层写完全同一条**判定（同一份范围判定），
     //   但 lba 落在盘外，函数在发任何 SCSI 命令之前就返回 false —— 不写介质、不改盘上任何字节。
+    //   ★ 本轮：这里调的是 **UHCI 专用**实现（usb_msc_write_uhci64），不是门面 usb64_msc_write64()：
+    //     门面按 idx 选主控，而探测期间 g_msc.supported=false（UHCI 段计数 = 0）—— 用门面会把 idx 0
+    //     路由到 EHCI 的盘上（那是**另一块盘**，探针就变成对着别的盘发越界命令了）。
     //   打点给自动验收 grep：[USBST] write-bounds probe …
     if (mask == 0) {
-        const bool r1 = usb64_msc_write64(0, g_msc.blocks, 1, g_msc_sec);              // 第一个越界 LBA
-        const bool r2 = usb64_msc_write64(0, g_msc.blocks - 1u, 2u, g_msc_sec);        // 末扇区 + 1 = 超容量
+        const bool r1 = usb_msc_write_uhci64(g_msc.blocks, 1, g_msc_sec);              // 第一个越界 LBA
+        const bool r2 = usb_msc_write_uhci64(g_msc.blocks - 1u, 2u, g_msc_sec);        // 末扇区 + 1 = 超容量
         usb_log_begin();
         dbg64_str("[USBST] write-bounds probe blocks=");
         dbg64_dec((uint64_t)g_msc.blocks);
@@ -1576,6 +1618,9 @@ static void usb_selftest_log() {
 //     （键盘走 HID 分支、U 盘走 BOT 分支）；拔出 -> 打 [USBST] detached port=<n> 并按端口角色清状态；
 //   * 存储"出现/消失"时触发**盘符重扫**：drive64_scan64()（＝启动期 USB 接入后重扫的同一个函数）
 //     + explorer64_rescan64()（打开的窗口自动刷新；正在浏览的盘被拔掉会退回"此电脑"并提示）。
+//   ★ 本轮：EHCI 上的存储出现/消失（ehci64_poll64 之后由 usb64_poll64 差分）也走**这一个**函数，
+//     why 传 "attached on EHCI" / "detached on EHCI" —— 打点形如
+//     [USBST] storage attached on EHCI -> rescan drive letters (usb drives=1)。
 // 如实说明：地址只增不复用（插入次数多了会到 0x7F 上限，之后新设备不再枚举，只打点）；
 //   热插拔读/写盘与界面读盘符表之间没有全局锁（见报告的"没做到的"）。
 static void usb_hotplug_rescan(const char* why) {
@@ -1923,13 +1968,23 @@ int      usb64_devices64()     { return g_devices; }
 uint64_t usb64_hid_reports64() { return g_hid_reports; }
 uint64_t usb64_key_events64()  { return g_key_events; }
 
-// ==================== USB 存储：对外只读接口（给 kernel/ata64.cpp 的驱动器号分派用）====================
+// ==================== USB 存储：对外接口（门面：UHCI + ★ EHCI；给 kernel/ata64.cpp 的驱动器号分派用）====
 // 只有"探测全过（supported）"的 U 盘才算一块可用的块设备 —— 如实拒绝而不是给一个读必失败的盘。
-int usb64_msc_count64() { return (g_msc.present && g_msc.supported) ? 1 : 0; }
+// ★ 本轮（EHCI）：这一套现在是**聚合门面**：idx 0..u-1 = UHCI 的盘，idx u..u+e-1 = EHCI（ehci64）的盘
+//   （见 kernel/usb64.h 顶部）。ata64 只按 idx 分派，**不需要知道盘挂在哪台主控上**；
+//   EHCI 那一段的语义（512B 块、越界拒绝、写后读回校验）与 UHCI **完全一致**（ehci64.cpp 里同一套）。
+//   EHCI 还没初始化时 ehci64_msc_count64() 恒为 0（静态状态全零），所以启动早期（usb64_init64 期间）
+//   门面自然只报 UHCI 的设备 —— 不会数到半初始化状态。
+static int msc_uhci_count() { return (g_msc.present && g_msc.supported) ? 1 : 0; }
+int usb64_msc_count64()  { return msc_uhci_count() + ehci64_msc_count64(); }
+int usb64_msc_uhci_count64() { return msc_uhci_count(); }   // 只数 UHCI 那一段（打点/排障用，只读）
 
 // 型号 = "厂商 + 空格 + 型号"（已去尾空格）；sectors_512 = 总扇区数（按 512B 换算）
 bool usb64_msc_info64(int idx, char* model, int model_cap, uint64_t* sectors_512) {
-    if (idx != 0 || !g_msc.present || !g_msc.supported) return false;
+    const int u = msc_uhci_count();
+    if (idx < 0) return false;
+    if (idx >= u) return ehci64_msc_info64(idx - u, model, model_cap, sectors_512);
+    if (!g_msc.present || !g_msc.supported) return false;
     if (model && model_cap > 0) {
         int o = 0;
         for (int i = 0; i < 8 && g_msc.vendor[i] && o < model_cap - 1; i++) model[o++] = g_msc.vendor[i];
@@ -1946,7 +2001,11 @@ bool usb64_msc_info64(int idx, char* model, int model_cap, uint64_t* sectors_512
 
 // 按 512B 扇区读（ata64 的语义）；一条 READ(10) 最多 8 个扇区（4KB），多了就自动分块。
 bool usb64_msc_read64(int idx, uint32_t lba, uint32_t count, void* buf) {
-    if (idx != 0 || !g_msc.present || !g_msc.supported) return false;
+    const int u = msc_uhci_count();
+    if (idx < 0) return false;
+    if (idx >= u) { g_msc_last_bus = 1; return ehci64_msc_read64(idx - u, lba, count, buf); }
+    g_msc_last_bus = 0;
+    if (!g_msc.present || !g_msc.supported) return false;
     if (count == 0) return true;
     uint8_t* p = (uint8_t*)buf;
     for (uint32_t done = 0; done < count; ) {
@@ -1965,8 +2024,18 @@ bool usb64_msc_read64(int idx, uint32_t lba, uint32_t count, void* buf) {
 //   2) **写后读回校验**：每一块写完立刻 READ(10) 回同一个 LBA 段，逐字节比对（memcmp_64）。
 //      不一致 -> 打 [USBST] write verify FAILED（首个不同字节的下标 + want/got）并返回 false。
 // 缓冲区（buf）必须恒等映射（与 read 同要求），长度 = count × 512。
+// ★ 本轮：对外门面只做"按 idx 选主控"，**UHCI 段的本体**在 usb_msc_write_uhci64()（下一段）。
 bool usb64_msc_write64(int idx, uint32_t lba, uint32_t count, const void* buf) {
-    if (idx != 0 || !g_msc.present || !g_msc.supported) return false;
+    const int u = msc_uhci_count();
+    if (idx < 0) return false;
+    if (idx >= u) { g_msc_last_bus = 1; return ehci64_msc_write64(idx - u, lba, count, buf); }
+    g_msc_last_bus = 0;
+    return usb_msc_write_uhci64(lba, count, buf);
+}
+
+// UHCI 段的本体（本体与改动前**逐字节相同**，只是从 usb64_msc_write64() 里搬过来 + 去掉 idx 判断）。
+static bool usb_msc_write_uhci64(uint32_t lba, uint32_t count, const void* buf) {
+    if (!g_msc.present || !g_msc.supported) return false;
     if (count == 0) return true;
     if (!buf) return false;
     const uint8_t* p = (const uint8_t*)buf;
@@ -2051,6 +2120,8 @@ bool usb64_msc_write64(int idx, uint32_t lba, uint32_t count, const void* buf) {
     return true;
 }
 
+// 自检：**只报 UHCI 那一段**（EHCI 有自己的 [EHCI] selftest / [USBST] selftest …(EHCI) 打点，
+// 谁在哪台主控上失败就报在谁那行；门面不把两段的掩码混成一个数 —— 混了就没法定位）。
 int usb64_msc_selftest64() {
     if (!g_msc.present) {
         usb_log_begin();
@@ -2062,7 +2133,11 @@ int usb64_msc_selftest64() {
     return (int)g_msc.selftest_mask;
 }
 
+// 最近一次失败的原因（按**最近一次 read/write 落在哪一段**取那一段的原因字符串）。
+// 为什么需要分派：ata64_write() 的失败打点用的是这个函数，而盘可能挂在 UHCI 或 EHCI 上 ——
+// 取错段会把 EHCI 的失败原因写成 UHCI 的（或反之），排障时会指错方向。
 const char* usb64_msc_last_reason64() {
+    if (g_msc_last_bus == 1) return ehci64_msc_last_reason64();
     switch (g_msc.last_reason) {
     case 0:  return "ok";
     case 1:  return "csw status";

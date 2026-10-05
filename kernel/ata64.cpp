@@ -207,7 +207,9 @@ static bool ata_wait_done_irq(int drive) {
 // ★ 顺序有讲究：先 PATA、再 AHCI、NVMe、最后 USB —— 与"驱动器号从小往大"一致，界面行序稳定。
 // USB 存储的"可用块设备"数量（**安装介质内核里恒为 0**：那份内核不链 usb64.cpp，
 // 见文件头/ata64.h 的说明 —— U 盘绝不会成为安装目标）。
-// ★ 统一分派（xHCI 批次）：驱动器号 24.. 的**顺序固定 = 先 UHCI（usb64）后 xHCI（xhci64）**。
+// ★ 统一分派（xHCI 批次 + ★ 本轮 EHCI）：驱动器号 24.. 的**顺序固定 = 先 UHCI（usb64）后 xHCI（xhci64）**；
+//   ★ 本轮起 usb64_msc_* 已经是"UHCI + EHCI"的**门面**（见 kernel/usb64.h），所以这里的
+//   `u = usb64_msc_count64()` 自然把两段都算进来，偏移量 u 也就是 xHCI 段的起点 —— 本文件**不用改**。
 //   为什么集中在这三个小函数里：驱动器号 -> 具体模块的映射只有一处，下面 ata64_identify /
 //   ata64_read 两个调用点都走它（write 只打"只读"点，不涉及模块），界面行序稳定。
 #ifdef ATA64_HAVE_USB64
@@ -431,9 +433,10 @@ static bool ata_pio_write_once(int drive, uint32_t lba, uint32_t count, const vo
 }
 
 // WRITE 对外入口：分派 + 分块 + 每块重试（语义与改动前一致；>128 扇区不再被 8 位寄存器截断）
-// ★ 批次 O / ★ P8：驱动器号 24.. 先按 UHCI（usb64）+ xHCI（xhci64）两段分派：
-//   * UHCI 段的 U 盘 -> usb64_msc_write64()（**真写**：BOT + WRITE(10) + 写后读回校验 + 越界拒绝）；
-//   * xHCI 段的 U 盘 -> 本批仍只读：直接返回 false 并打点（绝不假装成功）。
+// ★ 批次 O / ★ P8 / ★ 本轮（EHCI）：驱动器号 24.. 按"usb64 门面（UHCI + EHCI）" + xHCI 两段分派：
+//   * 门面段（usb64_msc_write64）-> UHCI 的 U 盘或 **EHCI 的 U 盘**（**真写**：BOT + WRITE(10) +
+//     写后读回校验 + 越界拒绝；由门面按索引选主控，见 kernel/usb64.cpp）；
+//   * xHCI 段（k >= usb64_msc_count64()）-> 本批仍只读：直接返回 false 并打点（绝不假装成功）。
 //   非 USB 驱动器号：**原样**走 NVMe/AHCI/PATA 三条既有写路径（一行都没改）。
 bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf) {
 #ifdef ATA64_HAVE_USB64
@@ -464,7 +467,7 @@ static uint32_t g_ata_usb_wlogs = 0;                 // [USBST] write drive=.. �
                 dbg64_dec((uint64_t)lba);
                 dbg64_str(" count=");
                 dbg64_dec((uint64_t)count);
-                dbg64_str(" ok (UHCI BOT, verified)");
+                dbg64_str(" ok (USB storage BOT, verified)");
                 dbg64_nl();
                 dbg64_line_end64();
             }

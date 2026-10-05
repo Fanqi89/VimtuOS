@@ -2,8 +2,8 @@
 //
 // 范围（这一版做了什么、没做什么，写清楚免得误会）：
 //   * 只驱动 **UHCI**（Intel 的 USB 1.1 主控）：PCI vendor=8086，device 见 usb64.cpp；
-//     EHCI（USB 2.0）/ xHCI（USB 3.x）**没有**实现 —— 机器上只有 EHCI 时本模块打
-//     "[USB64] not found" 后优雅退出（系统照常启动，桌面照常工作）。
+//     **EHCI（USB 2.0）在 kernel/ehci64.cpp、xHCI（USB 3.x）在 kernel/xhci64.cpp**（各自独立的主控驱动，
+//     本文件只管 UHCI）；机器上一种都没有时本模块打 "[USB64] not found" 后优雅退出（系统照常启动）。
 //   * 设备：**最多两台**——1 个 HID 引导键盘（bInterfaceClass=3 / SubClass=1）+ 1 个
 //     USB 存储（Class=8 / SubClass=6 / Protocol=0x50 = Bulk-Only Transport）。
 //     两台都插着时各自用独立地址（1、2）；第三种设备、集线器后面的设备仍认不出来。
@@ -43,6 +43,7 @@
 //   [USBST] write verify FAILED lba=<n> count=<n> at=<字节> want=<hex> got=<hex>
 //   [USBST] write-bounds probe blocks=<n> lba=blocks rejected=1 lba=blocks-1 count=2 rejected=1
 //   [USBST] attached port=<n> / [USBST] detached port=<n>                     （★ P8 热插拔）
+//   [USBST] storage attached/detached on EHCI -> rescan drive letters (usb drives=<n>)（★ 本轮：EHCI 热插拔）
 #pragma once
 #include <stdint.h>
 
@@ -63,24 +64,31 @@ int usb64_selftest64();
 const char* usb64_state_str64();
 
 // ---- USB 存储（U 盘）：Bulk-Only Transport + SCSI 读 + ★ P8 写 ----
+// ★ 本轮（EHCI）：这一套 `usb64_msc_*` 是 **U 盘存储的聚合门面** —— 同时覆盖
+//     **UHCI（本文件）与 EHCI（kernel/ehci64.cpp）** 两台主控上的块设备，索引顺序固定：
+//       idx 0 .. u-1   = UHCI 上的 U 盘（u = 本文件 UHCI 侧的可用块设备数，最多 1）
+//       idx u .. u+e-1 = EHCI 上的 U 盘（e = ehci64_msc_count64()，最多 1）
+//     调用方（kernel/ata64.cpp 的驱动器号 24.. 分派）只看 idx，**不需要知道盘挂在哪台主控上**；
+//     xHCI 段仍由 ata64 用 usb64_msc_count64() 作偏移直接调 xhci64_msc_*（顺序：UHCI、EHCI、xHCI）。
 // 语义（如实）：
-//   * usb64_msc_count64() = 检测到的 USB 存储设备数（最多 1）；
+//   * usb64_msc_count64() = UHCI + EHCI 上检测到的 USB 存储设备数（各最多 1，合计最多 2）；
+//     usb64_msc_uhci_count64() = 只数 UHCI 那一段（打点/排障用，不改任何状态）；
 //   * 每个"块" = READ CAPACITY(10) 报的 block_size，**只支持 512**（其它值如实拒绝，
 //     设备仍然枚举/打点，但不会暴露成块设备）；
 //   * usb64_msc_read64() / ★ usb64_msc_write64() 的 lba/count 单位是 **512 字节扇区**
 //     （= ata64 的语义），缓冲区必须恒等映射（内核 .bss/.data 或 page_alloc_64 的页）。
-//   * ★ P8 写路径的两条硬规则：
+//   * ★ P8 写路径的两条硬规则（两台主控同一条语义）：
 //       1) **越界/超容量**（lba + count > blocks）在**发任何 SCSI 命令之前**就返回 false
 //          （打点 reason=range）—— 越界写碰不到介质；
 //       2) **写后读回校验**：每块（≤ 8 扇区）写完立刻 READ(10) 回同一 LBA 段、逐字节比对；
 //          不一致或读回失败都返回 false 并打点（[USBST] write verify FAILED …）。
-int  usb64_msc_count64();
+int  usb64_msc_count64();                     // UHCI + EHCI 的可用块设备数（各最多 1，合计 ≤ 2）
+int  usb64_msc_uhci_count64();                // 只数 UHCI 那一段（打点/排障用；只读）
 bool usb64_msc_info64(int idx, char* model, int model_cap, uint64_t* sectors_512);
 bool usb64_msc_read64(int idx, uint32_t lba, uint32_t count, void* buf);
 bool usb64_msc_write64(int idx, uint32_t lba, uint32_t count, const void* buf);   // ★ P8
 int  usb64_msc_selftest64();                 // 0 = 全过（没插 U 盘时也是 0 = 跳过）
-const char* usb64_msc_last_reason64();       // 最近一次失败原因（排障/打点用）
-
+const char* usb64_msc_last_reason64();       // 最近一次失败原因（排障/打点用；按最近访问的那一段取）
 // ---- 只读统计（任务管理器/终端可用；不改任何状态）----
 int      usb64_ports64();         // 根端口数（0 = 没有主控）
 int      usb64_devices64();       // 已枚举成功的设备数（0 = 没有；键盘 + U 盘）

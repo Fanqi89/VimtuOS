@@ -17,7 +17,9 @@
 //   8..(8+N-1)    = AHCI 上第 1..N 块 **ATA 盘**（N = ahci64_count64()；AHCI 端口按端口号升序编号）
 //   4..7          = 保留空洞（不映射任何设备）—— 旧代码里的"0..3 循环"必须改成下面的槽位接口
 //   16..(16+M-1)  = NVMe 第 1..M 个**命名空间**（M = nvme64_count64()；见 kernel/nvme64.h）
-//   24..          = ★ 批次 O：USB 存储（U 盘，最多 1 个，Bulk-Only Transport + SCSI；★ P8：**可写（覆盖写）**）
+//   24..          = ★ 批次 O：USB 存储（U 盘；Bulk-Only Transport + SCSI；★ P8：**可写（覆盖写）**）。
+//                   ★ 本轮（EHCI）：这一段现在**同时装 UHCI（usb64）与 EHCI（ehci64）**的 U 盘
+//                   —— 顺序固定：先 UHCI、再 EHCI、最后 xHCI（见 kernel/ata64.cpp 的分派）。
 // 上层（setup64 / part64 / vfs64 / store64 / drive64 / fs64 / fat64）拿到的驱动器号就是上面这套编号，
 // 读写/识别全部由本文件的 ata64_* 内部**分派**：≥ ATA64_USB_BASE 转 usb64_*，
 // ≥ ATA64_NVME_BASE 转 nvme64_*，≥ ATA64_AHCI_BASE 转 ahci64_*，其余走 PATA。
@@ -28,8 +30,12 @@ static const int ATA64_NVME_BASE = 16;
 static const int ATA64_USB_BASE  = 24;      // ★ 批次 O：USB 存储（U 盘）
 // 按驱动器号开数组的调用点（setup64.cpp 的磁盘表）用这个"最大驱动器号 + 1"：
 //   NVMe 侧上限 = 8 个命名空间（与 kernel/nvme64.h 的 NVME64_MAX_NS 一致）；
-//   USB 侧上限 = 1 个 U 盘（USB64_MAX_DEV 里只留一个存储角色，见 kernel/usb64.h）。
-static const int ATA64_USB_MAX_DEVS = 1;
+//   USB 侧上限 = 4：UHCI 1 台（usb64 的存储角色）+ EHCI 1 台（ehci64 的存储角色）+
+//                 xHCI ≤ 2 台（xhci64；XHCI_MAX_DEV = 1 键盘 + 1 存储，见 kernel/xhci64.cpp）。
+//   ★ 本轮从 1 提到 4 的原因：EHCI 的 U 盘也落在 24.. 这一段，一台机器上可能同时存在
+//     "UHCI 的 U 盘（24）+ EHCI 的 U 盘（25）"，旧的 1 会让驱动器号 25 越出
+//     setup64.cpp 的 g_disks[] 边界（那个表**按 ATA64_MAX_DRIVE64 推导**，不需要另外手改）。
+static const int ATA64_USB_MAX_DEVS = 4;
 static const int ATA64_MAX_DRIVE64 = ATA64_USB_BASE + ATA64_USB_MAX_DEVS;
 
 // 枚举接口（**新代码用它，不要自己写 for (d=0; d<4; d++)**）：
