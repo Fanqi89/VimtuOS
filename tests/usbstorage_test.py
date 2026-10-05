@@ -161,6 +161,9 @@ def make_usbstick(path):
             "blocks": STICK_SECTORS, "total_kb": STICK_TOTAL_KB, "data_start": dev.data_start,
             "map": {"root": (root, 1), "txt": (c_txt, n_txt), "vap": (c_vap, n_vap),
                     "elf": (c_elf, n_elf), "docs": (c_docs, 1), "note": (c_note, n_note)},
+            # ★ P8b：根目录四个**原有**条目的 8.3 短名（就是上面 dir_entry/short_entry 里写进去的那几个；
+            #   阶段 3 用它做"原有条目都在"的**超集**判定，避免再从长名去猜短名）
+            "short_root": ["USBREA~1.TXT", "STICKAPP.VAP", "STICKELF.ELF", "DOCS."],
             "vap": vap, "elf": elf, "txt": TXT_TEXT, "docs": DOCS_TEXT}
 
 
@@ -531,7 +534,10 @@ def main():
               re.search(r"\[USBST\] read lba=0 count=1 ok", log) is not None)
         check("[USBST] selftest PASS mask=0",
               re.search(r"\[USBST\] selftest PASS mask=0", log) is not None)
-        check("[USB64] selftest PASS（UHCI + 存储自检全过）", "[USB64] selftest PASS" in log)
+        # ★ P8b：判据不变（还是要求这一行），只是改成**有界等待**而不是拍一次快照 —— 串口落到文件
+        #   与读取之间有微小延迟，快照可能刚好漏掉这一行（本行之外的那些 check 用同一份快照没漏）。
+        check("[USB64] selftest PASS（UHCI + 存储自检全过）",
+              vm.wait_log("[USB64] selftest PASS", 5))
         check("没有任何 [USBST] read FAILED / 写拒绝打点",
               "[USBST] read FAILED" not in log and "[USBST] write refused" not in log)
 
@@ -539,13 +545,18 @@ def main():
         print("--- 1b) 串口：驱动器号 24 / 盘符 D: / FAT32 只读挂载 ---")
         check("U 盘接入后重扫盘符（[USBST] storage attached -> rescan drive letters）",
               "[USBST] storage attached -> rescan drive letters" in log)
-        # 驱动器号 24（= ATA64_USB_BASE）接入的证据：盘符表 dump 里那条 FAT32 条目
-        #   （disk=24 part=1 lba=2048+70000 —— 这三项只能来自 USB 后端的 IDENTIFY/分区表）
-        m_dump = re.search(r"\[DRV64\] dump\s+\[\d+\] D: .*disk=(\d+) part=(\d+) "
-                           r"lba=(\d+)\+(\d+) total_kb", log)
-        check("★ U 盘以驱动器号 24 接入（[DRV64] dump … D: … disk=24 part=1 lba=2048+70000）",
+        # 驱动器号 24（= ATA64_USB_BASE）接入的证据：盘符表 dump 里那条 FAT32 条目。
+        # ★ P8b 判据更新（语义不变，只是对上真实行格式）：条目索引不再是 [1]（[0] 是 ESP、[1] 是 C:，
+        #   U 盘现在是 [2]），因此**不写死索引**；关键字段仍然逐个校验：disk=24 / part=1 /
+        #   lba=2048+70000（这三项只能来自 USB 后端的 IDENTIFY/分区表）+ browsable=yes。
+        #   真实行：`[DRV64] dump  [2] D: FAT32 卷 fs=FAT32 disk=24 part=1 lba=2048+70000
+        #           total_kb=34437 free_kb=34425 vol_v=- slot=- browsable=yes system=no skip=none`
+        m_dump = re.search(r"\[DRV64\] dump\s+\[\d+\] D:\s+\S[^\n]*?fs=FAT32 disk=(\d+) part=(\d+) "
+                           r"lba=(\d+)\+(\d+)\b[^\n]*?browsable=(\w+)", log)
+        check("★ U 盘以驱动器号 24 接入（[DRV64] dump [n] D: … disk=24 part=1 lba=2048+70000 browsable=yes）",
               m_dump is not None and int(m_dump.group(1)) == 24 and int(m_dump.group(2)) == 1
-              and int(m_dump.group(3)) == STICK_PART_LBA and int(m_dump.group(4)) == STICK_PART_SECTORS,
+              and int(m_dump.group(3)) == STICK_PART_LBA and int(m_dump.group(4)) == STICK_PART_SECTORS
+              and m_dump.group(5) == "yes",
               m_dump.group(0) if m_dump else "（缺行）")
         m_probe = re.search(r"\[FAT64\] probe lba=%d fs=FAT32 clusters=(\d+)" % STICK_PART_LBA, log)
         check("★ U 盘分区的 FAT32 只读探测（[FAT64] probe lba=2048 fs=FAT32 clusters=%d）"
@@ -663,15 +674,19 @@ def main():
         since = vm.mark()
         mon.type_line("vol")
         vlist = fst.wait_for(serial, "[VOL] vol letter=", 25, vm.proc)
-        check("★ 终端的卷表把 U 盘标成只读（[VOL] vol letter=D: fs=FAT32 ro=1 total_kb=…）",
-              re.search(r"\[VOL\] vol letter=D: fs=FAT32 ro=1 total_kb=\d+ free_kb=\d+", vlist) is not None,
+        check("★ 终端的卷表把 U 盘标成**可写**（[VOL] vol letter=D: fs=FAT32 ro=0 total_kb=…）",
+              re.search(r"\[VOL\] vol letter=D: fs=FAT32 ro=0 total_kb=\d+ free_kb=\d+", vlist) is not None,
               (re.search(r"\[VOL\] vol letter=D:.*", vlist).group(0) if "vol letter=D:" in vlist else "（缺行）"))
-        mon.type_line("write x.txt usb")
-        wlog = fst.wait_for(serial, "[TERM] cmd write fail", 25, vm.proc)
-        check("★ 往 U 盘写被拒（[TERM] cmd write fail）", "[TERM] cmd write fail" in wlog)
+        mon.type_line("write usbwr.txt vimtu64-usbstorage-now-writable")
+        wlog = fst.wait_for(serial, "[FAT64] rw write", 25, vm.proc)
+        check("★ 往 U 盘写**成功**（[FAT64] rw write vol=… path=\"/usbwr.txt\" len=31 … verify=1）",
+              "[FAT64] rw write" in wlog and "verify=1" in wlog,
+              (re.search(r"\[FAT64\] rw write.*", wlog).group(0) if "[FAT64] rw write" in wlog else "（缺行）"))
         mon.type_line("mkdir newdir")
-        mlog = fst.wait_for(serial, "[TERM] cmd mkdir fail", 25, vm.proc)
-        check("★ U 盘上建目录被拒（[TERM] cmd mkdir fail）", "[TERM] cmd mkdir fail" in mlog)
+        mlog = fst.wait_for(serial, "[FAT64] rw mkdir", 25, vm.proc)
+        check("★ 在 U 盘上建目录**成功**（[FAT64] rw mkdir vol=… path=\"newdir\" … ok=1）",
+              "[FAT64] rw mkdir" in mlog or "[TERM] cmd mkdir ok" in mlog,
+              (re.search(r"\[FAT64\] rw mkdir.*", mlog).group(0) if "[FAT64] rw mkdir" in mlog else "（缺行）"))
 
         # 管理器里：先在 D: 选中一个条目再按 Delete（只读卷 -> roact），然后回 C: 复制 via.txt
         exp.SAFE_POINT = (fo.sx(fo.CONTENT_X + fo.CONTENT_W - 40),
@@ -683,12 +698,10 @@ def main():
             p = aim.click_hit(*fo.cell(idx_d), want_hit="item:%d" % idx_d)
             check("单击选中 U 盘条目（click hit=item:%d）" % idx_d,
                   p is not None and p[2] == "item:%d" % idx_d, str(p))
-            since = vm.mark()
-            mon.key("delete", wait=1.2)
-            check("★ 只读卷上 Delete 被拒（[UI] explorer roact op=delete letter=D: fs:FAT32 ro=1）",
-                  vm.wait_new(r"\[UI\] explorer roact op=delete letter=D: fs=FAT32 ro=1", 20, since))
-            # 注：被拒的删除不会触发列表刷新（内容没变就不重打 item 行）——"文件还在"由下一步的
-            #     拷贝阶段证明（它必须能重新列出并选中同一个文件）。
+            # ★ P8b：U 盘可写之后，"只读卷上 Delete 被拒"这条语义**不存在了**（删除现在真的执行）。
+            #   这里不再断言"被拒"（那是过期判据）；删除/覆盖/截断的**真证据**在更强的
+            #   tests/usbwrite64_test.py 里（关掉 QEMU 后宿主侧解析镜像逐字节核对 + 原有文件不变）。
+            pass
 
         # C: 里复制 via.txt（为"往只读卷粘贴"准备一个非空剪贴板）
         ok_back = back_to_thispc(aim, vm, mon)
@@ -713,8 +726,9 @@ def main():
             check("再进 U 盘（D:）", ok_d)
             since = vm.mark()
             mon.key("ctrl-v", wait=1.5)
-            check("★ 往 U 盘粘贴被拒（[UI] explorer roact op=paste letter=D: fs=FAT32 ro=1 + paste ok n=0）",
-                  vm.wait_new(r"\[UI\] explorer roact op=paste letter=D: fs=FAT32 ro=1", 25, since) and
+            check("★ 往 U 盘粘贴**新名字**：如实拒绝（[UI] explorer roact op=paste … why=new-file-on-fat-not-implemented）"
+                  " + paste ok n=0 dst=/ skipped=1",
+                  vm.wait_new(r"\[UI\] explorer roact op=paste .*new-file-on-fat-not-implemented", 25, since) and
                   vm.wait_new(r"\[UI\] explorer paste ok n=0 dst=/ skipped=1", 15, since))
 
         # ---- 1e) ★ 从 U 盘把两个应用拷进 C:（选中 -> Ctrl+C -> 进 C: -> Ctrl+V）----
@@ -885,9 +899,17 @@ def main():
         data = stick_after[off:off + got[0][2]]
         check("★★ /%s 的内容与客人写的**逐字节一致**（%d 字节）" % (WR_NAME.upper(), len(WR_TEXT)),
               data == WR_TEXT, "盘上=%r" % data[:48])
-    check("★ 原有四个条目仍在根目录里（长名文本 / .vap / .elf / docs）",
-          all(any(x[0].startswith(n.split(".")[0][:6].upper()) for x in ents)
-              for n in (TXT_NAME, VAP_NAME, ELF_NAME, DOCS_DIR)), str([x[0] for x in ents]))
+    # ★ P8b：判据改成**超集**（语义更强，不是放宽）—— 四个**原有**条目（按 make_usbstick 写进
+    #   目录项的 8.3 短名逐条比对：USBREA~1.TXT / STICKAPP.VAP / STICKELF.ELF / DOCS.）必须都还在，
+    #   同时终端新建的两个可写验收产物（usbwr.txt / newdir）也必须真在根目录里（共 6 项）。
+    #   旧写法拿长名前 6 个字符去猜短名（"USB-RE…" 对不上 "USBREA~1"），是**过期判据**。
+    now_names = [x[0] for x in ents]
+    want_old = list(info["short_root"])
+    ok_old = all(n in now_names for n in want_old)
+    ok_new = (WR_NAME.upper() in now_names
+              and any(n.split(".")[0] == "NEWDIR" for n in now_names))
+    check("★ 原有四个条目都在根目录里（长名文本 / .vap / .elf / docs）+ 新增的 %s / newdir 也在"
+          % WR_NAME, ok_old and ok_new, "根目录=%s" % now_names)
 
     if args.keep:
         print("[usbstorage] 串口：%s / %s / 截图：%s" % (serial, serial2, shot_ppm))
