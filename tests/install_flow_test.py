@@ -18,6 +18,7 @@
 退出码：0 全部通过 / 1 有断言失败 / 2 环境问题
 """
 import argparse
+import re
 import os
 import socket
 import struct
@@ -320,6 +321,21 @@ def main():
     check("装好的系统走的是系统启动路径", "[OS] booted from installed disk" in boot)
     check("装好的系统就绪", "[OS] ready (idle)" in boot)
     check("装好的系统**没有**再进安装程序", "[SETUP]" not in boot and "entering setup wizard" not in boot)
+    # ★ 本批（图标"有时有有时没有"修复）：装好的系统盘第一次启动，图标必须真的在。
+    #   如实口径（本批实测）：安装只写 8073 扇区载荷，**主分区还没有 VimtuFS2 卷**
+    #   （离线读目标盘 LBA 8009 是 0）—— 此时图标包的来源只能是**原始区**（内核区尾部 LBA
+    #   7497 起，包在偏移 144144）：`[ICON64] init pack … src=raw`，逐 kind 的 load 打点
+    #   src=pack（包里的字节，不是程序化回落）；有卷的盘（演示/验收盘）才是 src=vfs。
+    #   修前：这一步在 PATA 上也被"假系统卷槽"挡住（原 code 判 vfs64_system_slot64()>=0
+    #   就跳过原始区），图标全是程序化回落 —— 这条断言钉的就是它。
+    #   卷里没有包的 PATA/AHCI 对照（src=vfs 正常路径 + 按系统盘读原始区）在 tests/iconboot64_test.py。
+    mi = re.search(r"\[ICON64\] init pack lba=(\d+) drive=(-?\d+) bytes=(\d+) entries=\d+ icons=\d+ "
+                   r"bad=(\d+) ok=(\d) fnv=[0-9a-f]+ vfs_icons=\d src=(vfs|raw)", boot)
+    check("装好后图标包可用（[ICON64] init pack … src=vfs|raw，bad=0 ok=1）",
+          mi is not None and mi.group(4) == "0" and mi.group(5) == "1" and mi.group(6) in ("vfs", "raw"),
+          mi.group(0) if mi else (re.search(r"\[ICON64\] init pack[^\r\n]*", boot) or ["（无）"])[0])
+    nload = len(re.findall(r"\[ICON64\] load kind=\S+ path=pack:\S+ size=\d+ src=\S+ ok=1", boot))
+    check("装好后逐 kind 真图标（[ICON64] load … ok=1 >= 25 条）", nload >= 25, "%d 条" % nload)
     print("--- 装好的系统串口尾部 ---")
     for l in [x for x in boot.splitlines() if x.strip()][-8:]:
         print("   | " + l[:150])
