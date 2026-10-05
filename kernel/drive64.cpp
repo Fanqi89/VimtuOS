@@ -502,6 +502,20 @@ int drive64_by_letter64(char letter) {
     return -1;
 }
 
+// ★ 修复：系统盘驱动器号（盘符表里 C: 条目的 disk；没扫过/没有 C: = -1）。
+//   用途见 kernel/demo64.cpp：原始区（内核区尾部）按"引导/系统盘优先"读。
+int drive64_system_disk64() {
+    for (int i = 0; i < g_count; i++) {
+        const DriveInfo64& e = g_entries[i];
+        if (e.present && e.browsable && e.system && e.disk >= 0) return e.disk;
+    }
+    for (int i = 0; i < g_count; i++) {
+        const DriveInfo64& e = g_entries[i];
+        if (e.present && e.browsable && e.letter == 'C' && e.disk >= 0) return e.disk;
+    }
+    return -1;
+}
+
 // ==================== 自检 ====================
 int drive64_selftest64() {
     int fails = 0;

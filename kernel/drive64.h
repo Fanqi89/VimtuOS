@@ -107,6 +107,13 @@ int  drive64_info64(int i, DriveInfo64* out);
 // 按盘符查条目下标（大写字母，'C'..）；找不到 / 该字母没分配返回 -1。
 int  drive64_by_letter64(char letter);
 
+// ★ 修复（图标/演示 blob 的"原始区"读取；见 kernel/demo64.cpp）：**系统盘驱动器号**。
+//   口径与 C: 一致：盘符表里 system = true 的条目（= C:）的 disk；还没有扫过盘符表 / 没有 C: 时返回 -1。
+//   为什么单独给一个访问器：demo64 只需要"驱动器号"这一个字段，走 drive64_info64 会顺带刷新容量
+//   （fs64 位图/FSInfo，可能触发 I/O），而原始区读取可能发生在盘符扫描之前的启动早期。
+//   不在这里做任何 fallback（不猜 0/8/16/24）—— 候选盘顺序由调用方决定并如实打点。
+int  drive64_system_disk64();
+
 // ★ 激活某个盘符对应的卷（= vfs64 的"当前卷"切过去）：0 = 成功；-1 = 没这个盘符 / 不可浏览 / 没占槽。
 // 打点：[DRV64] activate letter=D: slot=1 disk=1 lba=8192 ok（失败打 FAILED reason=...）。
 int  drive64_activate_letter64(char letter);
