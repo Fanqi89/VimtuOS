@@ -218,7 +218,9 @@ static int       g_devices     = 0;
 // ★ P8：热插拔现场（每轮 poll 读 PORTSC 比对；角色按端口记，用来在拔出时清掉对应设备）
 static uint16_t  g_port_ccs    = 0;          // 上一轮各根端口的 CCS 位（bit0 = port1）
 static bool      g_hp_baseline = false;      // 第一轮只建立基线，不算"变化"
+static bool      g_hp_armed    = false;      // ★ P8b：初始化收尾（usb_hotplug_arm）之前一律不比对
 static uint8_t   g_port_role[3] = { 0, 0, 0 };  // 0 = 本驱动没接管 / 1 = HID 键盘 / 2 = USB 存储
+static bool      g_enum_retry  = false;      // ★ P8b：热插拔**重新枚举**期间为 true（失败不冒充启动期枚举失败）
 static uint8_t   g_next_addr   = 1;          // 下一个要分配的 USB 地址（启动期与热插拔共用）
 
 // HID 报告的边沿检测状态（★ xHCI 批次：交给 UHCI/xHCI 共用的解析函数持有，见 usb64.h）
@@ -560,12 +562,18 @@ static int usb_control64(const Usb64Ctl64* c, uint8_t addr, uint8_t rt, uint8_t 
 // 注意：**不在这里改 g_state** —— 批次 O 起一台设备失败不代表整个主控失败（例如键盘枚举
 // 失败但 U 盘成功了），状态由 usb64_init64 在所有端口都试完后统一判定。
 static int usb_enum_fail(const char* stage, int rc) {
-    usb_log_begin();
-    dbg64_str("[USB64] enum FAILED stage=");
-    dbg64_str(stage);
-    dbg64_str(" rc=");
-    dbg64_dec((uint64_t)(uint32_t)(-rc));
-    usb_log_end();
+    // ★ P8b：热插拔的**重新枚举**失败（g_enum_retry）不打 [USB64] enum FAILED ——
+    //   这条打点的语义是"启动期没有可用设备"（由 usb64_init64 统一判定状态机），而一次
+    //   "对已经在工作的设备重新枚举"的失败既不代表主控失败、也不代表设备失败（设备还在跑），
+    //   如实情况由 [USBST] attached port=n … 那行说明；绝不能让重试失败把已工作的设备打成枚举失败。
+    if (!g_enum_retry) {
+        usb_log_begin();
+        dbg64_str("[USB64] enum FAILED stage=");
+        dbg64_str(stage);
+        dbg64_str(" rc=");
+        dbg64_dec((uint64_t)(uint32_t)(-rc));
+        usb_log_end();
+    }
     return -1;
 }
 
@@ -1585,6 +1593,8 @@ static void usb_hotplug_rescan(const char* why) {
 
 static void usb_hotplug_poll() {
     if (!g_found || !g_inited) return;
+    // ★ P8b：初始化还没收尾（基线还没由 usb_hotplug_arm 建立）之前一律不比对 —— 见其说明。
+    if (!g_hp_armed) return;
     uint16_t mask = 0;
     for (int i = 1; i <= g_ports && i <= 2; i++) {
         const uint16_t reg = (i == 1) ? (uint16_t)UHCI_PORTSC1 : (uint16_t)UHCI_PORTSC2;
@@ -1595,7 +1605,7 @@ static void usb_hotplug_poll() {
             uhci_wr16(reg, (uint16_t)((v & ~(uint32_t)PORTSC_WZ) & ~(uint32_t)(PORTSC_PR | PORTSC_SUSP)));
         }
     }
-    if (!g_hp_baseline) { g_port_ccs = mask; g_hp_baseline = true; return; }
+    if (!g_hp_baseline) { g_port_ccs = mask; g_hp_baseline = true; return; }   // 兜底（正常路径 arm 已设过）
     const uint16_t chg = (uint16_t)(mask ^ g_port_ccs);
     if (chg == 0) return;
     for (int i = 1; i <= g_ports && i <= 2; i++) {
@@ -1603,6 +1613,15 @@ static void usb_hotplug_poll() {
         if ((chg & bit) == 0) continue;
         const bool now = (mask & bit) != 0;
         if (now) {
+            // ★ P8b：端口上还是**本驱动已经在用**的那台设备（角色还在、设备还在线）—— 不重复复位/枚举。
+            //   多一次复位会让正在工作的设备短暂离开总线：BOT 传输刚要开始时被复位，重枚举的第一个
+            //   控制传输（GET_DESCRIPTOR 8 字节）就会失败 —— 这正是"多余的 [USB64] enum FAILED
+            //   stage=get-device-8"的来源，而设备其实没有任何变化。存储最多重扫一次盘符（幂等）。
+            const uint8_t role = g_port_role[i];
+            if ((role == 1 && g_hid_present) || (role == 2 && g_msc.present)) {
+                if (role == 2) usb_hotplug_rescan("attached(already-configured)");
+                continue;
+            }
             dbg64_line_begin64();
             dbg64_str("[USBST] attached port=");
             dbg64_dec((uint64_t)i);
@@ -1622,7 +1641,10 @@ static void usb_hotplug_poll() {
             const bool hid_before = g_hid_present;
             const bool msc_before = g_msc.present;
             const uint8_t addr = (g_next_addr <= 0x7Fu) ? g_next_addr : 1u;
-            if (usb_enum_port(i, addr, low) == 0) {
+            g_enum_retry = true;                     // ★ P8b：重新枚举失败不冒充"启动期没有可用设备"
+            const int enum_rc = usb_enum_port(i, addr, low);
+            g_enum_retry = false;
+            if (enum_rc == 0) {
                 if (g_next_addr <= 0x7Fu) g_next_addr++;
                 if (!hid_before && g_hid_present)      g_port_role[i] = 1;
                 else if (!msc_before && g_msc.present) g_port_role[i] = 2;
@@ -1631,6 +1653,14 @@ static void usb_hotplug_poll() {
                     (void)usb64_msc_selftest64();          // INQUIRY/TUR/CAPACITY/READ(10) + 越界探针
                     usb_hotplug_rescan("attached");
                 }
+            } else {
+                // ★ P8b：如实打一行（且只打这一行）；已经在工作的设备/盘符/状态机一律不动。
+                dbg64_line_begin64();
+                dbg64_str("[USBST] attached port=");
+                dbg64_dec((uint64_t)i);
+                dbg64_str(" enum failed (device ignored, system keeps running)");
+                dbg64_nl();
+                dbg64_line_end64();
             }
         } else {
             dbg64_line_begin64();
@@ -1652,6 +1682,31 @@ static void usb_hotplug_poll() {
             dbg64_line_end64();
             g_devices = (g_hid_present ? 1 : 0) + (g_msc.present ? 1 : 0);
             if (role == 2) usb_hotplug_rescan("detached");
+        }
+    }
+    g_port_ccs = mask;
+}
+
+// ==================== ★ P8b：热插拔基线（初始化收尾时建立一次）====================
+// 为什么需要：kusb 内核线程在 usb64_init64() **执行期间**就会调 usb64_poll64()（线程先建好、调度器一开就跑）。
+//   如果那时就按 CCS 比对，会踩两种半初始化状态：
+//     (a) g_ports 还是 0 -> 掩码恒为 0，等端口枚举做完，刚接管的设备被误判成"新插入"；
+//     (b) 端口复位/枚举只做了一半，读到的是中间态。
+//   两种都会对**已经枚举好、正在工作**的 U 盘再走一遍复位 + 枚举；BOT 传输正要开始时被复位，
+//   重枚举的第一个控制传输（GET_DESCRIPTOR 8 字节）失败 —— 刷出一条假的 [USB64] enum FAILED
+//   （rc=4294967295），把明明可用的设备打成"枚举失败"。
+// 做法：初始化收尾时把**当前** CCS 记成基线、把 CSC/PEC 写 1 清掉（上电时的"变化"不再当事件），
+//   并置 g_hp_armed —— poll 的比对从此只反映初始化之后真正发生的插入/拔出。
+static void usb_hotplug_arm() {
+    if (!g_found || g_ports <= 0) return;
+    uint16_t mask = 0;
+    for (int i = 1; i <= g_ports && i <= 2; i++) {
+        const uint16_t reg = (i == 1) ? (uint16_t)UHCI_PORTSC1 : (uint16_t)UHCI_PORTSC2;
+        const uint16_t v = uhci_rd16(reg);
+        if (v & PORTSC_CCS) mask = (uint16_t)(mask | (uint16_t)(1u << (i - 1)));
+        if (v & (PORTSC_CSC | PORTSC_PEC)) {
+            // W1C：清掉启动期接线留下的变化位（不碰 PR/SUSP；bit15:13 必须写 0）
+            uhci_wr16(reg, (uint16_t)((v & ~(uint32_t)PORTSC_WZ) & ~(uint32_t)(PORTSC_PR | PORTSC_SUSP)));
         }
     }
     g_port_ccs = mask;
@@ -1836,6 +1891,7 @@ int usb64_init64() {
         if (!any_connected) {
             // （"no device on port n" 已经在上面逐端口打过了）
         }
+        usb_hotplug_arm();                 // ★ P8b：没设备也要建立基线（之后插进来的才算"新插入"）
         usb_selftest_log();
         return any_connected ? -3 : -2;
     }
@@ -1846,6 +1902,7 @@ int usb64_init64() {
     (void)usb64_msc_selftest64();          // 没插 U 盘时打 skipped；探测结果在这里打
 
     // ---- 8) 状态：有键盘就当"ready"（HID 中断端点已武装）；只插 U 盘也算 ready ----
+    usb_hotplug_arm();                     // ★ P8b：枚举/探测都做完了才建立热插拔基线（避免把刚枚举好的设备当成新插入）
     g_state = USB64_ST_READY;
     usb_selftest_log();
     return g_hid_present ? 0 : -1;
