@@ -20,7 +20,8 @@
 //     READ(10) + **WRITE(10)**）。语义与 usb64_msc_* **完全一致**（见 kernel/usb64.h）：
 //     写后读回逐字节校验、**读/写都做越界拒绝**（读越界在本驱动里也提前拒绝，见 .cpp 说明）、
 //     块大小只支持 512。驱动器号接入 kernel/ata64.h 的 ATA64_USB_BASE（24..）——
-//     与 UHCI 的 U 盘共用同一段驱动器号，顺序：**先 UHCI（usb64）后 EHCI**，最后 xHCI。
+//     ★ 本轮：**经 kernel/usb64.cpp 的 usb64_msc_* 门面**接入（门面 = UHCI + EHCI 聚合，
+//     索引顺序：UHCI(0..u-1)、EHCI(u..u+e-1)，之后才是 xHCI；见 kernel/usb64.h）。
 //
 // 串口打点（自动验收 tests/ehci64_test.py 靠这些行判定，改格式要同步改脚本）：
 //   [EHCI] not found                                       （没有 EHCI 主控 -> 优雅降级）
@@ -44,9 +45,12 @@
 //   [USBST] inquiry vendor=.. product=.. rmb=<0|1>
 //   [USBST] capacity blocks=<n> block_size=<n> bytes=<n> cap_mb=<n>[ cap_gb=<x.yy>]
 //   [USBST] read lba=<n> count=<n> ok / read FAILED lba=<n> count=<n> reason=<..>
-//   [USBST] write lba=<n> count=<n> ok / write verify lba=<n> count=<n> ok (read back, byte-for-byte)
-//   [USBST] write FAILED lba=<n> count=<n> reason=<..>
-//   [USBST] read-bounds probe blocks=<n> lba=blocks rejected=1 lba=blocks-1 count=2 rejected=1
+//   [USBST] write lba=<n> count=<n> ok / write FAILED lba=<n> count=<n> reason=<..>
+//   [USBST] write verify lba=<n> count=<n> ok (read back, byte-for-byte)
+//   [USBST] write-bounds probe blocks=<n> lba=blocks rejected=1 lba=blocks-1 count=2 rejected=1
+//     （★ 越界的**写**边界探针；两次都必须被拒绝且不碰介质 —— 与 UHCI 同一条纪律）
+//   [USBST] read-bounds probe blocks=<n> …（越界的**读**边界探针；同上）
+//   [USBST] storage attached on EHCI -> rescan drive letters (usb drives=<n>)   （★ 门面在 kernel/usb64.cpp 里打）
 #pragma once
 #include <stdint.h>
 
@@ -57,13 +61,23 @@ int ehci64_init64();
 
 // 轮询一次：看根端口有没有插拔（CCS 变化），有就重枚举。由 kusb 内核线程**经 usb64_poll64()** 调用
 // （task64.cpp 不改）。函数自身不做阻塞等待：拿不到传输锁就直接返回，下次再来。
+// ★ P8b 纪律（与 UHCI 同一条）：① 基线（g_port_ccs/g_hp_armed）只在 ehci64_init64() **全部收尾之后**
+//   建立 —— poll 在 arm 之前直接返回，不会把刚枚举好的设备当成"新插入"；② 端口上还是本驱动**已经在用**
+//   的设备（g_msc.present）时**不复位、不重枚举**（多一次复位会让正在工作的设备离开总线）；
+//   ③ 热插拔重试失败只打 [EHCI] hotplug … attach failed（不冒充 [EHCI] enum FAILED / [USB64] enum FAILED）。
 void ehci64_poll64();
 
 // 位掩码自检：0 = 全过。没找到主控 / 没插设备时返回 0（属合法降级，不算失败）。
 // bit0 = 复位/内存结构没建起来；bit1 = 控制器没在跑（USBCMD.RS 读回 0）；bit2 = 端口数不合理；
 // bit3 = ASYNCLISTADDR 读回不对；bit4 = 有端口设备但一台也没就绪；bit5 = U 盘枚举到了但 BOT 探测没过；
-// bit6 = 越界读的**边界探针**没按预期被拒（读路径的守卫坏了才置位）。
+// bit6 = 越界读的**边界探针**没按预期被拒（读路径的守卫坏了才置位）；
+// bit7 = 越界写的**边界探针**没按预期被拒（写路径的守卫坏了才置位；与 UHCI 的 bit7 同义）。
 int ehci64_selftest64();
+
+// ★ 运行期热插拔的基线是否已经建立（= ehci64_init64() 全部收尾完成）。
+// 给门面（kernel/usb64.cpp）用来**在初始化完成之后**才建立"EHCI 存储数量变化 -> 重扫盘符"的基线：
+// 返回 false 之前一律不当事件（与 P8b 的教训同一条：初始化没收尾就比对会踩半初始化状态）。
+bool ehci64_hotplug_ready64();
 
 // 人类可读状态：init / not found / no device / enum failed / ready
 const char* ehci64_state_str64();

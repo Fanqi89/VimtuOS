@@ -176,8 +176,13 @@ struct EhciQh {
 #define EHCI_MSC_MAX_DATA    (EHCI_MSC_MAX_SECTORS * 512u)
 // 超时（有界）
 #define EHCI_CTL_TIMEOUT_MS  300u
+// 超时（有界）
+#define EHCI_CTL_TIMEOUT_MS  300u
 #define EHCI_BULK_TIMEOUT_MS 800u
 #define EHCI_RESET_SPINS     2000000u
+// ★ 复位后等 PED 的**自旋次数上界**（除 100ms 时间上界外的第二道保险：时间基准万一看不到进展，
+//   也绝不挂死 —— 5 万次 MMIO 读约等于 1~2 s，够用且不会把启动链拖住）。
+#define EHCI_PED_SPINS       50000u
 #define EHCI_CTL_BUF_BYTES   256u
 #define EHCI_MAX_PORTS       16
 
@@ -307,9 +312,25 @@ static inline void     op_wr32(uint32_t off, uint32_t v) { mm_wr32(g_caplen + of
 static inline uint32_t port_off(uint32_t n) { return EHCI_OP_PORTSC + (n - 1u) * EHCI_PORT_STRIDE; }
 static inline uint32_t port_rd(uint32_t n) { return op_rd32(port_off(n)); }
 // 写 PORTSC：只回写"我们愿意保留的 RW 位" + 指定的 W1C 位；RO 位一律写 0。
+// ★ 注意 PORTSC 的 **PED（bit2）是 R/W**：写 0 = **关闭端口**。所以"清变化位"这类写入**必须**把
+//   当前 PED 原样写回，否则刚复位好的高速端口会被自己关掉（下面 port_clear_changes 专门做这件事）。
 static inline void port_wr(uint32_t n, uint32_t v) {
     const uint32_t cur = port_rd(n);
     op_wr32(port_off(n), (cur & EHCI_PSC_KEEP) | (v & ~EHCI_PSC_KEEP));
+}
+
+// 清 PORTSC 的 W1C 变化位（CSC/PEDC/OCC/LSC），**保留 PED**（参上：写 0 会关端口）。
+// 热插拔轮询与启动期"清掉上电时的变化位"都用它 —— 不动正在工作的那个已使能端口。
+static inline void port_clear_changes(uint32_t n) {
+    const uint32_t cur = port_rd(n);
+    port_wr(n, (cur & EHCI_PSC_PED) | EHCI_PSC_CSC | EHCI_PSC_PEDC | EHCI_PSC_OCC | EHCI_PSC_LSC);
+}
+
+// ★ 把端口交还伴随控制器：写 PO=1（PO 在 port_wr 的 KEEP 里会被换成当前值，所以这里直接写寄存器）。
+//   保留 PP / 中断指示 / 唤醒位；PED 写 0（本驱动没使能过它，规范也要求交还前不用它）。
+static inline void port_give_to_companion(uint32_t n) {
+    const uint32_t cur = port_rd(n);
+    op_wr32(port_off(n), (cur & (EHCI_PSC_PP | EHCI_PSC_IND_MASK | EHCI_PSC_WK_MASK)) | EHCI_PSC_PO);
 }
 
 
@@ -458,13 +479,21 @@ static int ehci_exec_chain(volatile EhciQtd* first, volatile EhciQtd* last,
     g_qh->hlp    = qh_pa | EHCI_QH_TYPE_QH;                    // 自环：异步表就这一个 QH
     g_qh->epchar = epchar | EHCI_QH_EC_H;                      // ★ H 位：Head of Reclamation List
     g_qh->epcap  = epcap;
-    // 清覆盖区（顺序：先 next/alt/buf/token，最后 cur = 第一条 qTD —— 这才是"发布点"）
-    g_qh->next  = EHCI_QTD_TERM;
+    // 清覆盖区（顺序：先 alt/buf/token，**最后**发布 next = 第一条 qTD —— 这才是"发布点"）。
+    // ★ 布局（与 EHCI 1.0 §3.6 / Linux struct ehci_qh_hw **逐字段一致**，本轮修）：
+    //     0x00 hlp 0x04 epchar 0x08 epcap
+    //     0x0C cur   = **Current qTD Pointer（硬件拥有：控制器写它，软件不写）**
+    //     0x10 next  = **overlay Next qTD Pointer（软件把第一条 qTD 写在这里）** ← 发布点
+    //     0x14 alt 0x18 token 0x1C buf[5]
+    //   旧代码把第一条 qTD 写进 `cur`（硬件拥有字段）、把 `next` 留在 TERM —— 控制器于是认为
+    //   "这条链没有 qTD 可执行"：QH 被取到（USBSTS.ASS=1）但一条 qTD 都没跑，软件等超时
+    //   （实测串口：`[EHCI] control req=06 FAILED (timeout) tok=00000000 sts=00008000`）。
     g_qh->alt   = EHCI_QTD_TERM;
     g_qh->token = 0;
     for (int i = 0; i < 5; i++) g_qh->buf[i] = 0;
+    g_qh->cur   = 0;                                           // 硬件拥有字段：软件只清 0（不发布 qTD）
     __asm__ volatile("" ::: "memory");
-    g_qh->cur   = (uint32_t)(uintptr_t)first;
+    g_qh->next  = (uint32_t)(uintptr_t)first;                 // ★ 发布：overlay 的 Next qTD Pointer
     __asm__ volatile("" ::: "memory");
 
     op_wr32(EHCI_OP_ASYNCLISTADDR, qh_pa);
@@ -481,14 +510,17 @@ static int ehci_exec_chain(volatile EhciQtd* first, volatile EhciQtd* last,
         const uint32_t sts = op_rd32(EHCI_OP_USBSTS);
         const uint32_t tok = g_qh->token;
         const uint32_t cur = g_qh->cur;
-        const bool nothing_in_flight = !(tok & EHCI_QTD_ACTIVE);
+        const bool nothing_in_flight = !(tok & EHCI_QTD_ACTIVE) && !(last->token & EHCI_QTD_ACTIVE);
         if ((sts & EHCI_STS_USBINT) && nothing_in_flight) { done = true; break; }
-        if (nothing_in_flight && (cur == EHCI_QTD_TERM || cur == (uint32_t)(uintptr_t)last)) { done = true; break; }
+        if (nothing_in_flight && (cur == EHCI_QTD_TERM || cur == (uint32_t)(uintptr_t)last ||
+                                  cur == (uint32_t)(uintptr_t)first)) { done = true; break; }
         if ((g_ticks64 - t0) >= want || ++spin > 400000000ull) break;
         nop_pause();
     }
 
-    const uint32_t tok = g_qh->token;
+    // ★ 结果读**最后一条 qTD 本体**（硬件把状态/residue 写回 qTD，Linux 也是读这里）；
+    //   只有在"链根本没走到最后一条"（它还 ACTIVE）时才退回读 overlay 的 token。
+    const uint32_t tok = (last->token & EHCI_QTD_ACTIVE) ? g_qh->token : last->token;
     const uint32_t sts = op_rd32(EHCI_OP_USBSTS);
     op_wr32(EHCI_OP_USBSTS, sts & (EHCI_STS_USBINT | EHCI_STS_USBERR | EHCI_STS_PCD | EHCI_STS_FLR | EHCI_STS_HSE));
     async_sched_off();
@@ -691,28 +723,41 @@ static void port_log(uint32_t n, uint32_t v) {
 }
 
 // 复位一个端口（只在 owner=0 且 CCS=1 时调用）。返回 true = PED 置起来（高速链路就绪）。
-// 流程（EHCI 1.0 §4.2.4）：写 PORTSC.PR=1 -> 等 PR 自清（有界）-> 等 PED（有界）。
-// 复位前后都把 CSC/PEDC 这类 W1C 位清掉；**不碰 FPR/SUSP**。
+// 流程（EHCI 1.0 §4.2.4 + Linux ehci-hub.c / ehci_reset_port 同款，**这一步本轮才修对**）：
+//   1) 端口电源：PP=0 就先打开（**不看 PPC** —— PPC=0 表示 PP 恒为 1，读 0 就补写一次，不吃亏）；
+//   2) PR=1 **保持 50ms**（规范要求 ≥10ms）—— 不是"写一下等它自清"；
+//   3) **显式写 PR=0**（复位结束；高速设备这一步之后由控制器置 PED）。
+//      ★ 实测（QEMU 11.1 usb-ehci + PORTSC trace）：**控制器不会自清 PR** —— 旧代码"等 PR 自清"
+//      的循环（200 万次 MMIO 读）永远等不到，整条启动链就卡在 ehci64_init64() 里
+//      （串口停在 `[EHCI] port 1 owner=0 speed=full ccs=1`，其它线程照常跑，无 PANIC）。
+//      规范的顺序是软件**自己**把 PR 写回 0，SeaBIOS/Linux 都这么做。
+//   4) 等 PED（高速设备复位后才被使能）：**双上界** —— 时间 100ms + 自旋次数上界（有界，绝不挂死）；
+//      旧代码固定 10 万次 nop_pause（≈ 几毫秒）会误判成"不是高速设备"，把 U 盘交还伴随控制器。
+//   5) 清变化位时**保留 PED**（见 port_clear_changes —— 写 0 会把刚使能的端口关掉）。
+// **不碰 FPR/SUSP**。
 static bool port_reset(uint32_t n, uint32_t* out_v) {
     uint32_t v = port_rd(n);
     if (out_v) *out_v = v;
     if ((v & EHCI_PSC_PO) || !(v & EHCI_PSC_CCS)) return false;
-    if (g_ppc && !(v & EHCI_PSC_PP)) {                       // 有端口电源控制就先把电打开
+    if (!(v & EHCI_PSC_PP)) {                                // 端口电源（PPC=0 时按规范 PP 恒为 1，读 0 就补写一次）
         port_wr(n, EHCI_PSC_PP);
         edelay_ms(20);
     }
-    port_wr(n, EHCI_PSC_PR | EHCI_PSC_CSC | EHCI_PSC_PEDC);  // 开始复位 + 清变化位
-    for (uint32_t i = 0; i < EHCI_RESET_SPINS; i++) {        // 等 PR 自清
-        v = port_rd(n);
-        if (!(v & EHCI_PSC_PR)) break;
-        nop_pause();
+    port_wr(n, EHCI_PSC_PR | EHCI_PSC_CSC | EHCI_PSC_PEDC);  // PR=1 开始复位（PED 写 0：复位前先关端口）
+    edelay_ms(50);                                           // 规范要求 PR 至少保持 10ms；与 Linux 同款取 50ms
+    port_wr(n, EHCI_PSC_CSC | EHCI_PSC_PEDC);                // ★ 显式写 PR=0（不等自清）
+    {                                                        // 等 PED（高速设备才会置起来）
+        const uint64_t t0 = g_ticks64;
+        const uint64_t want = ms_to_ticks64(100);
+        uint32_t spins = 0;
+        for (;;) {
+            v = port_rd(n);
+            if (v & EHCI_PSC_PED) break;
+            if ((g_ticks64 - t0) >= want || ++spins > EHCI_PED_SPINS) break;   // ★ 双上界
+            nop_pause();
+        }
     }
-    for (uint32_t i = 0; i < 100000u; i++) {                 // 等 PED（高速设备才会置起来）
-        v = port_rd(n);
-        if (v & EHCI_PSC_PED) break;
-        nop_pause();
-    }
-    port_wr(n, EHCI_PSC_CSC | EHCI_PSC_PEDC);                // 清变化位（不动 PR/PED）
+    port_clear_changes(n);                                   // 清变化位（★ PED 原样保留）
     if (out_v) *out_v = v;
     return (v & EHCI_PSC_PED) != 0;
 }
@@ -1186,6 +1231,26 @@ static void msc_probe() {
         elog_end();
         if (r1 || r2) mask |= 64u;                            // 守卫坏了（越界读被放行）
     }
+    // ★ 越界写的**边界探针**（与 UHCI 的 write-bounds probe 完全同一条纪律，位号也一致 = bit7）：
+    //   两次调用走的是与上层写**同一条** ehci64_msc_write64()（同一份范围判定），lba 落在盘外 ->
+    //   在发任何 SCSI 命令之前就返回 false：不写介质、不改盘上任何字节（场景 ③ 的"盘镜像 CRC 不变"靠它）。
+    //   注意：必须在 supported 置 true 之前调用 —— ehci64_msc_write64() 里带 supported 守卫，
+    //   所以这里先临时把 supported 置 true（探针自己的范围判定与 supported 无关；下面会按 mask 重设）。
+    if (mask == 0) {
+        g_msc.supported = true;                               // 只为让探针走进"范围判定"那一层
+        const bool w1 = ehci64_msc_write64(0, g_msc.blocks, 1, g_sector);
+        const bool w2 = ehci64_msc_write64(0, g_msc.blocks - 1u, 2u, g_sector);
+        g_msc.supported = false;
+        elog_begin();
+        dbg64_str("[USBST] write-bounds probe blocks=");
+        dbg64_dec((uint64_t)g_msc.blocks);
+        dbg64_str(" lba=blocks rejected=");
+        dbg64_dec(w1 ? 0u : 1u);
+        dbg64_str(" lba=blocks-1 count=2 rejected=");
+        dbg64_dec(w2 ? 0u : 1u);
+        elog_end();
+        if (w1 || w2) mask |= 128u;                           // 守卫坏了（越界写被放行）
+    }
     g_msc.supported = (mask == 0);
     g_msc.selftest_mask = mask;
     elog_begin();
@@ -1210,7 +1275,7 @@ static void ehci_scan_ports_boot() {
         port_log(n, v);
         if (v & EHCI_PSC_PO) continue;                        // 伴随控制器的端口：不抢
         if (!(v & EHCI_PSC_CCS)) {
-            port_wr(n, EHCI_PSC_CSC);                         // 清变化位（不留挂起）
+            port_clear_changes(n);                            // 清变化位（不留挂起；★ 保留 PED —— 别关掉正在用的端口）
             continue;
         }
         g_conn_seen++;
@@ -1218,7 +1283,7 @@ static void ehci_scan_ports_boot() {
         const bool ped = port_reset(n, &rv);
         if (!ped) {
             // 复位后 PED 没起来 = 设备不是高速：写 PortOwner=1 交还伴随控制器（本驱动只做高速）。
-            port_wr(n, EHCI_PSC_PO);
+            port_give_to_companion(n);                        // ★ 真正交还（见 port_give_to_companion）
             elog_begin();
             dbg64_str("[EHCI] port ");
             dbg64_dec((uint64_t)n);
@@ -1425,7 +1490,7 @@ int ehci64_init64() {
     for (uint32_t n = 1; n <= g_ports && n <= EHCI_MAX_PORTS; n++) {
         const uint32_t v = port_rd(n);
         if (v & EHCI_PSC_CCS) g_port_ccs |= (1u << (n - 1u));
-        if (v & (EHCI_PSC_CSC | EHCI_PSC_PEDC | EHCI_PSC_OCC | EHCI_PSC_LSC)) port_wr(n, 0);
+        if (v & (EHCI_PSC_CSC | EHCI_PSC_PEDC | EHCI_PSC_OCC | EHCI_PSC_LSC)) port_clear_changes(n);
     }
     g_hp_armed = true;                                        // ★ P8b：到这之后端口变化才算"新插入"
     g_state = g_msc.supported ? EHCI_ST_READY : (g_conn_seen ? EHCI_ST_ENUM_FAILED : EHCI_ST_NO_DEVICE);
@@ -1441,7 +1506,7 @@ void ehci64_poll64() {
     for (uint32_t n = 1; n <= g_ports && n <= EHCI_MAX_PORTS; n++) {
         const uint32_t v = port_rd(n);
         if (v & EHCI_PSC_CCS) mask |= (1u << (n - 1u));
-        if (v & (EHCI_PSC_CSC | EHCI_PSC_PEDC | EHCI_PSC_OCC | EHCI_PSC_LSC)) port_wr(n, 0);
+        if (v & (EHCI_PSC_CSC | EHCI_PSC_PEDC | EHCI_PSC_OCC | EHCI_PSC_LSC)) port_clear_changes(n);
     }
     if (mask == g_port_ccs) { ehci_lock_release(); return; }
     const uint32_t chg = mask ^ g_port_ccs;
@@ -1463,11 +1528,23 @@ void ehci64_poll64() {
             }
             continue;
         }
+        // ★ P8b：端口上还是本驱动**已经在用**的那台设备（g_msc.present = 存储在线、配置还在生效）
+        //   —— **不复位、不重枚举**（多一次复位会让正在工作的设备短暂离开总线：BOT 传输刚要开始时被
+        //   复位，重枚举的第一个控制传输就会失败）。本驱动只处理一台存储，所以直接跳过；
+        //   盘符由门面（usb64_poll64 的差分）看到"数量没变"而不重扫 —— 幂等，不需要额外动作。
+        if (g_msc.present) {
+            elog_begin();
+            dbg64_str("[EHCI] port ");
+            dbg64_dec((uint64_t)n);
+            dbg64_str(" attached (already-configured usb storage kept as-is; no re-reset/re-enum)");
+            elog_end();
+            continue;
+        }
         // 插入：与启动期同一条 复位 -> 枚举 -> 探测 路径；**失败不冒充整机枚举失败**
         uint32_t rv = 0;
         const bool ped = port_reset(n, &rv);
         if (!ped) {
-            port_wr(n, EHCI_PSC_PO);
+            port_give_to_companion(n);                        // ★ 真正交还（见 port_give_to_companion）
             elog_begin();
             dbg64_str("[EHCI] port ");
             dbg64_dec((uint64_t)n);
@@ -1482,7 +1559,6 @@ void ehci64_poll64() {
         dbg64_dec((uint64_t)n);
         dbg64_str(" attached speed=high reset ok");
         elog_end();
-        if (g_msc.present) continue;                          // 已经有一台存储：不重复枚举
         const int rc = ehci_enum_storage(1);
         if (rc != 0) {
             if (g_hp_retry_fail_logs < 8u) {
@@ -1519,6 +1595,10 @@ int ehci64_selftest64() {
     if (!g_found) return (int)g_selftest_mask;                // 没主控 = 合法降级（正常是 0）
     return (int)g_selftest_mask;
 }
+
+// ★ 给门面（kernel/usb64.cpp）用：热插拔基线是否已经建立（= ehci64_init64() 全部收尾完成）。
+//   语义：返回 false 时门面**不比对** EHCI 的存储数量 —— 启动期（init 还没跑完 / 还没 arm）一律不当事件。
+bool ehci64_hotplug_ready64() { return g_hp_armed; }
 
 // ==================== USB 存储：对外接口（给 usb64 门面 / ata64 分派用）====================
 int ehci64_msc_count64() { return (g_msc.present && g_msc.supported) ? 1 : 0; }
