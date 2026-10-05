@@ -51,6 +51,7 @@
 #include "wl64.h"
 #include "usb64.h"      // USB 主机：UHCI + HID 引导键盘（只进系统内核；按键注入 PS/2 同一队列）
 #include "xhci64.h"     // ★ xHCI（USB 3.x）+ HID 键盘 + USB 存储（只进系统内核，同 usb64）
+#include "ehci64.h"     // ★ EHCI（USB 2.0）+ USB 存储（可写）；只进系统内核，同 usb64/xhci64
 #include "apic64.h"    // LAPIC + IOAPIC 接管中断路由（只进系统内核；拿不到就留在 PIC）
 #include "smp64.h"     // SMP：启动 AP（INIT-SIPI-SIPI + 低端跳板；只进系统内核）
 // ---- 本轮移植的四个子系统（都只进系统内核，见 build64.sh 的 SRCS_OS）----
@@ -1004,6 +1005,15 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
     }
     // ---- ATA：注册/打开 IRQ14，之后读写走中断驱动等待 + 超时回退轮询（只读自检不写盘）----
     ata64_init64();
+#ifndef VIMTU_INSTALLER_MEDIA
+    // ---- ★ 本批（内核预算）：中文面（font_simhei_z = 733,584 B）外置后的**第一装载点** ----
+    // 位置讲究：就在 ata64_init64() 之后 —— 从这一行起磁盘可读（原始区 blob 走 ata64_read），
+    //   而**下一行之后的屏幕（display64/控制台/桌面）就会画中文**，所以中文面必须在这里就位。
+    // 取不到（引导盘不是 PATA-0 之类）不算失败：下面 vfs 起来之后还有第二个装载点会重试，
+    //   两个点都取不到才由 font_external_give_up64() 如实认输（[FONT64] cjk_ext_na=1，不 PANIC）。
+    // 安装程序内核**不编这段**（它内嵌四份字体，向导在磁盘/卷成型前就要画中文）。
+    (void)font_external_load64();
+#endif
     // ---- 运行期显示层：模式清单（0x7400）+ 0x3DA 实测刷新率 + 与 EDID 首选时序对比 + 自检 ----
     // 位置：fb_init() 已经在 kmain 里跑过（本函数只读 fb 的物理分辨率兜底），g_ticks64 已在走；
     // 放在 task_start64() 之前 —— 探测本身不需要调度器，跑完再上线。
@@ -1253,6 +1263,18 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
     //   互不干扰；都是"找不到主控/没插设备只打点"的优雅降级）。运行期轮询同样归 kusb 线程
     //   （task64.cpp 不改：usb64_poll64() 里会调 xhci64_poll64()）。
     (void)xhci64_init64();
+    // ---- ★ EHCI（USB 2.0，kernel/ehci64.cpp）：USB 存储（BOT/SCSI，★ 可写）----
+    // 位置：**xhci64_init64() 之后**（三台主控各自独立：先后顺序只决定驱动器号/设备数的排列，
+    //   互不干扰；都是"找不到主控 / 没插设备 / 枚举失败只打点并返回负值"的优雅降级 —— 绝不 PANIC、
+    //   绝不改变启动流程）。只接管 **High-speed** 端口；PortOwner=1（伴随 UHCI/OHCI）的端口不抢，
+    //   复位后 PED 没起来（FS/LS 设备）的端口写 PortOwner=1 交还伴随控制器。
+    //   ★ **HID 键盘在 EHCI 上没做**（中断传输）：键盘由 UHCI/xHCI 覆盖，见 kernel/ehci64.h 顶部。
+    // ★ 未完成（本轮如实记录，下一步做，原因：本轮范围只到"接线 + 构建过"）：
+    //   ① EHCI 的存储设备**还没并进 usb64 的存储门面**（usb64_msc_* / ata64 的驱动器号 24..）——
+    //      现在它会枚举、探测、打 [EHCI]/[USBST] 自检行，但还**不暴露成盘符**；
+    //   ② 运行期热插拔轮询还没接进 usb64_poll64()（所以 ehci64_poll64() 目前不会被调用）；
+    //   ③ tests/ehci64_test.py 还没写。这三件是下一轮的内容（不是本驱动的漏做，见 ehci64.h 的实现范围）。
+    (void)ehci64_init64();
     // ---- ★ 批次 O：USB 存储（U 盘）接进来之后**重扫盘符表** ----
     // 为什么必须重扫：drive64_scan64() 上面（vfs64 挂载成功那条路径）已经跑过一次，那时 USB
     //   存储还没枚举（usb64_init64 排在 net64 之后）。重扫会把 U 盘上的 FAT32/VimtuFS2 卷按现有
@@ -1284,6 +1306,16 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
     // ---- 批次 A 后半：update 标记检查 + preload 预热（都在进桌面之前）----
     // 顺序：update 先查（有 pending 会应用 -> store/ring log -> /update.done -> 自动软重启，不返回）；
     //       没有 pending 就照常往下走，然后 preload 预热字形/图标（打点带 rdtsc64 实测证据）。
+#ifndef VIMTU_INSTALLER_MEDIA
+    // ---- ★ 本批（预算）：中文面外置的**第二装载点**（vfs/store 都已经起来）+ 如实收尾 ----
+    // 为什么要有第二个点：第一点在 ata64_init64() 之后，那时盘符扫描还没做
+    //   （demo64 的原始区读取优先用"系统盘"，判不出来才退回 drive 0）——引导盘不是 PATA-0 的档
+    //   在第一点会失败，这里重试一次（幂等：已经就绪就直接返回 0）。
+    // 两个点都没成 -> font_external_give_up64()：中文面缺席（缺字占位），
+    //   [FONT64] faces=… cjk=0 + cjk_ext_na=1 —— **不是失败**，系统照常进桌面。
+    // 位置必须在 preload64_run64() 之前：字形预光栅化要按"中文面在不在"来决定预热什么。
+    if (font_external_load64() != 0) font_external_give_up64();
+#endif
     (void)update64_check64();
     (void)preload64_run64();
     // ---- UEFI 运行期 CR3 实验（编译期开关，默认关；见 docs/UEFI地址空间实验报告.md）----

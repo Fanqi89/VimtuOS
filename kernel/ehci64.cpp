@@ -312,9 +312,6 @@ static inline void port_wr(uint32_t n, uint32_t v) {
     op_wr32(port_off(n), (cur & EHCI_PSC_KEEP) | (v & ~EHCI_PSC_KEEP));
 }
 
-static void e_delay_us(uint32_t us) {
-    for (uint32_t i = 0; i < us; i++) for (volatile int k = 0; k < 50; k++) { }
-}
 
 // ==================== PCI（0xCF8/0xCFC；与 usb64/xhci64 同一套做法）====================
 static uint32_t epci_rd32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off) {
@@ -440,9 +437,6 @@ static void async_sched_off() {
         nop_pause();
     }
     // 超时不阻塞：只是少了一次"安全确认"，下面的写回仍按发布顺序做。
-}
-static void async_sched_on(const uint8_t* head, uint32_t n) {   // 占位：语义在 exec 里
-    (void)head; (void)n;
 }
 
 // 一条 qTD 链的执行：返回 0 = 完成（可用 *status 判断错误位），-1 = 超时或控制器没跑。
@@ -627,7 +621,7 @@ static int ehci_bulk(uint8_t addr, uint8_t ep, uint16_t mps, bool in, uint8_t* t
 
     const uint32_t epchar = (uint32_t)(addr & 0x7Fu) | ((uint32_t)(ep & 0x0Fu) << 8) |
                             ((uint32_t)mps_u << EHCI_QH_EC_MPS_SHIFT) | EHCI_QH_EC_SPEED_HIGH |
-                            ((toggle && *toggle) ? EHCI_QH_EC_DTC : EHCI_QH_EC_DTC);
+                            EHCI_QH_EC_DTC;                            // DTC=1：toggle 由软件维护
     // DTC=1：toggle 由软件维护（见文件头"Bulk-Only Transport 的 toggle 语义"）
     const uint32_t epcap = 0x01u;
     const bool dt1 = (toggle && *toggle);
@@ -881,22 +875,34 @@ static void wr32le(uint8_t* p, uint32_t v) {
 }
 static void wr16be(uint8_t* p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
 
-// REQUEST SENSE(0x03)：出错时读 18 字节 SENSE 并把 key/asc/ascq 打进串口
+// 前置声明：sense 自己也是一条 BOT 命令（定义在下面，见 ehci_bot）
+static int ehci_bot(uint8_t* cdb, uint8_t cdb_len, bool dir_in, uint32_t data_len, uint8_t* data);
+// REQUEST SENSE(0x03)：出错时读 18 字节 SENSE 并把 key/asc/ascq 打进串口（定位用）。
+// ★ 递归保护：sense 自己失败时**不再**套一层 sense（否则会互相递归）。
+static bool g_in_sense = false;
 static void msc_log_sense(const char* what) {
+    if (g_in_sense) return;
+    g_in_sense = true;
     uint8_t cdb[16];
-    const uint16_t mps = g_msc.mps_in;
     for (int i = 0; i < 16; i++) cdb[i] = 0;
     cdb[0] = 0x03;
     cdb[4] = 18;
     memset_64(g_scratch, 0, 18);
-    uint32_t got = 0;
-    uint8_t tg = 0;
-    const int r = ehci_bulk(g_msc.addr, g_msc.ep_out, g_msc.mps_out, false, &tg, g_cbw, BOT_CBW_LEN, &got);
-    (void)r; (void)mps;
+    const int r = ehci_bot(cdb, 6, true, 18, g_scratch);
+    g_in_sense = false;
     elog_begin();
     dbg64_str("[USBST] sense after=");
     dbg64_str(what);
-    dbg64_str(" (EHCI: sense 只在 CSW 报错后有界尝试)");
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)(r < 0 ? 99u : (uint32_t)r));
+    if (r == 0 && g_scratch[0] == 0x70u) {                    // 固定格式 SENSE 数据
+        dbg64_str(" key=");
+        ehex((uint32_t)(g_scratch[2] & 0x0Fu), 1);
+        dbg64_str(" asc=");
+        ehex(g_scratch[12], 2);
+        dbg64_str(" ascq=");
+        ehex(g_scratch[13], 2);
+    }
     elog_end();
 }
 

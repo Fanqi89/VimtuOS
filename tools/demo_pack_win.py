@@ -38,10 +38,25 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SECTOR = 512
 
 # ★ 原始区在内核区里的起始 LBA（内核区 = LBA 9..8008，见 memlayout64.h / loader64.asm）。
-#   7497 是图标包搬走前的老位置；留 7488 个扇区（3,833,856 B）给内核二进制 —— 构建期有断言。
-DEMO64_RAW_LBA = 7497
-# 原始区在卷里的字节上限（LBA 7497..8008 = 512 扇区 = 262,144 B）。
-DEMO64_RAW_MAX_BYTES = 512 * SECTOR
+#   ★ 本批（内核预算）**从 7497 前移到 6096**：中文面字体的 deflate blob（font_simhei.z = 733,584 B）
+#   也搬进原始区（见下面的 RAW_EXTRA），原始区必须够大。
+#   实测内容 = 926,928 B（演示 blob 193,344 + 字体 733,584 + 对齐）= 1,811 扇区，
+#   上限 (8008-6096) = 1,912 扇区 = 978,944 B（留 ~27 KB 余量给以后的 blob）；
+#   系统内核（外置后约 2.73 MB = 5,340 扇区，LBA 9..5348）离它还有 ~750 扇区余量 ——
+#   构建期仍有两道断言把"内核不许压到原始区"钉死。
+DEMO64_RAW_LBA = 6096
+# 原始区在内核区里的字节上限（LBA 6096..8008 = 1,912 扇区 = 978,944 B）。
+DEMO64_RAW_MAX_BYTES = (8008 - DEMO64_RAW_LBA) * SECTOR
+
+# ★ 本批（内核预算）：**中文面字体只在原始区**（raw-only：**不**写系统卷）。
+#   为什么必须是原始区：所有验收夹具盘都是"build64/system.img 的字节 + 一块**空**卷"
+#   （见 tests/fs_tree_test.make_small_system_disk / tests/proc64_test.prepare_fixture）——
+#   卷里的 /Fonts-open/*.ttf **只在全量演示盘（sysdisk.img）里存在**，而**原始区随 system.img
+#   原样出现在每一个夹具盘里**，所以它才是"夹具无关"的交付位置（与图标包/演示 blob 同一条纪律）。
+#   kernel/font.cpp 的 font_external_load64() 先查这里，再退到系统卷里那份可读 TTF。
+RAW_EXTRA = [
+    ("/etc/font_simhei.z", "font_simhei.z", 0o644),
+]
 
 # (卷内路径, build64/ 下的文件名, vfs mode)
 # 前 13 个是"内核启动期装进卷再从盘上跑"的那批；后 5 个是直接跑的 blob —— 它们的卷内路径是
@@ -214,7 +229,21 @@ def main():
         blobs = read_blobs(args.build)
         do_vol(blobs, args.vol_in, args.vol_out, args.system, args.disk, args.target_sectors)
     if args.raw:
+        # ★ 本批（内核预算）：原始区 = BLOBS（演示程序 + 图标包）+ **RAW_EXTRA**（中文面字体的
+        #   deflate blob，只进原始区、**不进卷**）。为什么只进原始区：夹具盘都是"system.img 字节
+        #   + 空卷"，卷里的字体只在全量演示盘里有；原始区随 system.img 出现在每个夹具盘里。
         blobs = read_blobs(args.build)
+        for path, name, mode in RAW_EXTRA:
+            fp = os.path.join(args.build, name)
+            if not os.path.exists(fp):
+                sys.stderr.write("缺少原始区额外资源：%s（先编出 %s）\n" % (fp, name))
+                return 2
+            with open(fp, "rb") as f:
+                d = f.read()
+            if len(d) == 0:
+                sys.stderr.write("原始区额外资源是空文件：%s\n" % fp)
+                return 2
+            blobs.append((path, name, mode, d))
         do_raw(blobs, args.raw, args.header)
     return 0
 

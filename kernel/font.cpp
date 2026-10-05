@@ -12,6 +12,8 @@
 #include "font.h"
 #include "fb.h"
 #include "debug64.h"     // [FONT64] 打点（行锁：dbg64_line_begin64/end64）
+#include "demo64.h"      // ★ 中文面外置：原始区 blob 读取（demo64_blob_find64，见本文件顶部取舍说明）
+#include "vfs64.h"       // ★ 中文面外置的第二来源：系统卷里可读的 /Fonts-open/NotoSansSC-Regular.ttf
 #include <stdint.h>
 
 #define FONT64_LOG_N 16  // [FONT64] fallback hit / glyph miss 的去重表大小（同一码点只打一行）
@@ -28,10 +30,25 @@
 //   体积账（实测）：1,164,272 B -> 755,944 B，**省 408,328 B**（内核 4,037,328 -> 3,629,000 B）。
 //   解压缓冲放 .bss：objcopy -O binary 只收 PROGBITS，.bss **不进 kernel64_os.bin**；页池从 128MB
 //   起（见 kernel/mem64.cpp 顶部），内核 .bss 本来就含 33MB 后备缓冲，这 ~1.3MB 不影响内存账。
+// ★ 本批（内核预算）：**中文面（face 1）改成"可外置"** —— 系统内核不再链 font_simhei_z.o，
+//   它的符号是 **weak**：没链进来时地址读回 0，font_init() 就把它标成"外置待装载"
+//   （见下面的 g_cjk_ext_*），运行期由 font_external_load64() 从**原始区**（夹具无关的交付位置，
+//   见 tools/demo_pack_win.py 的 RAW_EXTRA）把同一份 deflate blob 读回来解到 .bss。
+//   为什么这样搬（取舍，如实写清）：
+//     * font_init() 在 kmain 的图形栈初始化里就要用 —— 那时**磁盘/vfs 都还没起来**
+//       （os_boot_path 里的 ata64_init64 更晚），所以**启动必需的三个面（西文/等宽/兜底 = 24,216 B）
+//       必须仍在内核里**（引导日志/早期屏幕就是靠它们画的，ASCII 一个字都不能少）；
+//     * 中文面（733,584 B）是唯一的大块：它只在**中文界面**里用得到，而那些界面全部在
+//       os_boot_path 的磁盘/vfs 起来之后（桌面/终端/向导）。所以它可以是"磁盘可用后立刻装载"的 ——
+//       装载点见 kernel64.cpp 的 ata64_init64() 之后那一行（那一行之后才有屏幕画中文）；
+//     * 装载失败（裸盘无原始区、也没卷）**不是失败**：那一档仍然启动，只是中文面缺席
+//       （[FONT64] faces=… cjk=0 + selftest 里与中文面相依的三项如实标 na），绝不 PANIC、绝不假装成功。
+//   安装程序内核照旧内嵌四份（build64.sh 里安装程序链接行的 font_*_z.o 通配不动）——
+//   它的向导在磁盘/卷成型之前就要画中文。
 extern "C" const uint8_t _binary_font_bahnschrift_z_start[];
 extern "C" const uint8_t _binary_font_bahnschrift_z_end[];
-extern "C" const uint8_t _binary_font_simhei_z_start[];
-extern "C" const uint8_t _binary_font_simhei_z_end[];
+extern "C" const uint8_t _binary_font_simhei_z_start[] __attribute__((weak));
+extern "C" const uint8_t _binary_font_simhei_z_end[]   __attribute__((weak));
 extern "C" const uint8_t _binary_font_mono_z_start[];
 extern "C" const uint8_t _binary_font_mono_z_end[];
 extern "C" const uint8_t _binary_font_fallback_z_start[];
@@ -46,6 +63,14 @@ static uint8_t g_font_ram_ascii[FONT_RAM_ASCII_CAP];
 static uint8_t g_font_ram_cjk[FONT_RAM_CJK_CAP];
 static uint8_t g_font_ram_mono[FONT_RAM_MONO_CAP];
 static uint8_t g_font_ram_fall[FONT_RAM_FALL_CAP];
+
+// ==================== ★ 中文面外置：状态（见上面 extern 段的取舍说明）====================
+//   pending  = 外置且还没装载（系统内核、还没到装载点）
+//   resolved = 已经"解决"（装载成功，或确认取不到 —— 之后不再重试、selftest 照常打点）
+static bool g_cjk_ext_pending  = false;   // 中文面 = 外置待装载
+static bool g_cjk_ext_resolved = false;   // 已装载成功 或 已确认取不到
+static bool g_cjk_ext_tried    = false;   // 已经尝试过（每次装载点只试一次）
+static bool g_selftest_hold    = false;   // font_selftest 被推迟（避免在中文面还没装载时报 cjk=0）
 
 // ---------- raw deflate 解压（stored / fixed / dynamic 三种块）----------
 // 算法与 user/gzip/gzip.c 的 inflate 同源（那份在宿主侧与 Python zlib 做过逐字节互操作，
@@ -418,6 +443,14 @@ void font_init() {
     uint32_t total_raw = 0, total_z = 0;
     int failed = 0;
     for (int i = 0; i < FONT_FACE_COUNT; i++) {
+        // ★ 中文面外置（系统内核没链 font_simhei_z.o，符号是 weak）：标成"待装载"，
+        //   不算 failed、也不在这里打 cjk=0 —— 由 font_external_load64() 在磁盘起来后解决。
+        if (i == FONT_FACE_CJK && blobs[i].zs == nullptr) {
+            g_cjk_ext_pending  = true;
+            g_cjk_ext_resolved = false;
+            face_init(&g_face[i], blobs[i].ram, blobs[i].ram);      // 空：font_ok=false（等外置装载）
+            continue;
+        }
         total_z += (uint32_t)(blobs[i].ze - blobs[i].zs);
         uint32_t n = 0;
         if (font_unpack64(blobs[i].zs, blobs[i].ze, blobs[i].ram, blobs[i].cap, &n) != 0) {
@@ -432,15 +465,103 @@ void font_init() {
     // 打点（体积账的实测证据：raw = 解出来的 TTF 总字节，packed = 内核里内嵌的压缩字节）
     dbg64_line_begin64();
     dbg64_str(failed ? "[FONT64] inflate FAIL faces=" : "[FONT64] inflate ok faces=");
-    dbg64_dec((uint64_t)(FONT_FACE_COUNT - failed));
+    // ★ 中文面外置时 faces= 只数"真的在核里解出来的面"（外置那面由 ext=1 表达，别把 4 报成 3 或反过来）
+    dbg64_dec((uint64_t)(FONT_FACE_COUNT - failed - (g_cjk_ext_pending ? 1 : 0)));
     dbg64_str(" raw=");
     dbg64_dec(total_raw);
+    if (g_cjk_ext_pending) dbg64_str(" ext=1(cjk)");
     dbg64_str(" packed=");
     dbg64_dec(total_z);
     dbg64_str(" saved=");
     dbg64_dec(total_raw > total_z ? (uint64_t)(total_raw - total_z) : 0);
     dbg64_nl();
     dbg64_line_end64();
+    if (g_cjk_ext_pending) {
+        // 如实打点：中文面是外置的、还没装载（装载点 = kernel64.cpp 里磁盘/卷起来之后那两行）。
+        // 这里**不**打 cjk=0 / FAIL —— 那不是失败，只是"还没到装载点"。
+        dbg64_line_begin64();
+        dbg64_str("[FONT64] cjk face external pending (not embedded; load point = after disk/vfs ready)\n");
+        dbg64_line_end64();
+    }
+}
+
+// ==================== ★ 中文面外置装载（幂等；kernel64.cpp 在磁盘/vfs 起来之后调用）====================
+// 两个来源，按"夹具无关"的优先级：
+//   ① **原始区 blob**（/etc/font_simhei.z，deflate：8B 小端未压缩长度 + raw deflate）——
+//      夹具盘都是"system.img 的字节 + 空卷"，只有原始区在每个夹具盘里都有（见 tools/demo_pack_win.py）；
+//   ② 系统卷里的**可读 TTF**（/Fonts-open/NotoSansSC-Regular.ttf）—— 全量演示盘（sysdisk.img）里有，
+//      用户自建卷里没有；UEFI/ESP 夹具这种"引导盘不是 system.img"的档只能走这条。
+// 两个都取不到 = 中文面缺席（g_cjk_ext_resolved=true 后不再重试；selftest 照常打点、与中文面相依的
+// 三项如实标 na）—— 系统照常启动，绝不 PANIC、绝不假装成功。
+#define FONT_CJK_RAW_PATH "/etc/font_simhei.z"
+#define FONT_CJK_VFS_PATH "/Fonts-open/NotoSansSC-Regular.ttf"
+
+static int font_cjk_apply64(const uint8_t* src, uint32_t src_len, bool deflated, const char* what) {
+    if (!src || src_len < 16u) return -1;
+    uint32_t n = 0;
+    if (deflated) {
+        if (font_unpack64(src, src + src_len, g_font_ram_cjk, FONT_RAM_CJK_CAP, &n) != 0) return -1;
+    } else {
+        if (src_len > FONT_RAM_CJK_CAP) return -1;
+        if (!(src[0] == 0x00u && src[1] == 0x01u && src[2] == 0x00u && src[3] == 0x00u)) return -1;   // TTF magic
+        for (uint32_t i = 0; i < src_len; i++) g_font_ram_cjk[i] = src[i];   // 已是可读 TTF：拷进同一块 .bss 面缓冲
+        n = src_len;
+    }
+    if (n < 1024u) return -1;
+    face_init(&g_face[FONT_FACE_CJK], g_font_ram_cjk, g_font_ram_cjk + n);
+    dbg64_line_begin64();
+    dbg64_str("[FONT64] cjk external load src=");
+    dbg64_str(what);
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)n);
+    dbg64_str(" face_ok=");
+    dbg64_dec(g_face[FONT_FACE_CJK].font_ok ? 1u : 0u);
+    dbg64_nl();
+    dbg64_line_end64();
+    return g_face[FONT_FACE_CJK].font_ok ? 0 : -1;
+}
+
+// 返回 0 = 中文面已就绪；1 = 这次没成功（可能是"磁盘还没起来"，可再调）；2 = 已确认取不到（不再重试）
+int font_external_load64() {
+    if (!g_cjk_ext_pending) return 0;                       // 内嵌（安装程序内核 / 老构建）：什么都不用做
+    if (g_face[FONT_FACE_CJK].font_ok) { g_cjk_ext_resolved = true; return 0; }
+    if (g_cjk_ext_resolved) return 2;                       // 已确认取不到：不再磨盘
+    g_cjk_ext_tried = true;
+
+    // ① 原始区 blob（defalte；夹具无关）
+    {
+        uint32_t zlen = 0;
+        const uint8_t* z = demo64_blob_find64(FONT_CJK_RAW_PATH, &zlen);
+        if (z && font_cjk_apply64(z, zlen, true, "raw") == 0) { g_cjk_ext_resolved = true; if (g_selftest_hold) font_selftest(); return 0; }
+    }
+    // ② 系统卷里的可读 TTF
+    {
+        const int sys = vfs64_system_slot64();
+        if (sys >= 0 && vfs64_slot_used64(sys)) {
+            uint32_t ty = 0, sz = 0;
+            if (vfs64_stat_on64(sys, FONT_CJK_VFS_PATH, &ty, &sz) == 0 && ty == VFS64_TYPE_FILE &&
+                sz > 1024u && sz <= FONT_RAM_CJK_CAP) {
+                const int got = vfs64_read_on64(sys, FONT_CJK_VFS_PATH, g_font_ram_cjk, (int)sz);
+                if (got > 1024 && font_cjk_apply64(g_font_ram_cjk, (uint32_t)got, false, "vfs") == 0) {
+                    g_cjk_ext_resolved = true;
+                    if (g_selftest_hold) font_selftest();
+                    return 0;
+                }
+            }
+        }
+    }
+    return 1;                                               // 这次没到手（下次装载点还可以再试）
+}
+
+// 装载点收尾：两个装载点（早/晚）都跑完还是取不到 —— 如实把中文面标成"缺席"，
+// 让 selftest 能打点（cjk=0 + 与中文面相依的三项标 na）。语义："不假装成功、也不假装失败"。
+void font_external_give_up64() {
+    if (!g_cjk_ext_pending || g_cjk_ext_resolved) return;
+    g_cjk_ext_resolved = true;
+    dbg64_line_begin64();
+    dbg64_str("[FONT64] cjk face unavailable (no raw blob and no volume font): CJK will render as boxes; not a failure)\n");
+    dbg64_line_end64();
+    if (g_selftest_hold) font_selftest();
 }
 
 void font_select(int face) {
@@ -888,13 +1009,20 @@ bool font_draw_glyph_cp(int x, int y, uint32_t cp, uint32_t fg) {
     if (cp < FONT_CACHE_N) return font_draw_glyph(x, y, (char)cp, fg);
     FontFace* fc = font_resolve_cp(cp);
     if (!fc) {
-        g_glyph_miss++;
-        if (font64_log_once(g_miss_logged, &g_miss_logged_n, cp)) {
-            dbg64_line_begin64();
-            dbg64_str("[FONT64] glyph miss cp=0x");
-            font64_hex4(cp);
-            dbg64_nl();
-            dbg64_line_end64();
+        // ★ 中文面外置的**过渡窗口**（kmain 的"屏幕硬件检查报告"等早期屏幕早于第一个装载点）：
+        //   这里的缺字**不计入** [FONT64] glyph miss —— 计数的语义是"四个面都没有这个码点
+        //   （字体覆盖缺陷）"，而这一档是"中文面还没装载"（装载点之后照常计数）。否则每次启动
+        //   都会报一屏假缺字（实测：硬件报告那屏的汉字），把"覆盖缺陷"这条信号淹掉。
+        const bool transition = (g_cjk_ext_pending && !g_cjk_ext_resolved);
+        if (!transition) {
+            g_glyph_miss++;
+            if (font64_log_once(g_miss_logged, &g_miss_logged_n, cp)) {
+                dbg64_line_begin64();
+                dbg64_str("[FONT64] glyph miss cp=0x");
+                font64_hex4(cp);
+                dbg64_nl();
+                dbg64_line_end64();
+            }
         }
         font_draw_missing_box(x, y, fg);
         return false;
@@ -1032,7 +1160,19 @@ static int face_adv_px(FontFace* fc, uint32_t cp) {
 }
 
 void font_selftest() {
+    // ★ 中文面外置：**还没到装载点**（磁盘/vfs 没起来）—— 推迟这份打点，别把"还没装载"报成 cjk=0/FAIL。
+    //   装载点（font_external_load64 / font_external_give_up64）解决之后会回调这里补打点。
+    if (g_cjk_ext_pending && !g_cjk_ext_resolved) {
+        g_selftest_hold = true;
+        dbg64_line_begin64();
+        dbg64_str("[FONT64] selftest held (cjk face external; waiting for disk/vfs load point)\n");
+        dbg64_line_end64();
+        return;
+    }
     uint32_t mask = 0;
+    // ★ 中文面"外置但确认取不到"（裸盘没原始区、卷里也没字体）= **不适用**，不是失败：
+    //   与中文面相依的三项（bit0 全四面 / bit1 中英 1:2 / bit2 查询链）按 na 记，下面的打点里会写出 na=1。
+    const bool cjk_na = (g_cjk_ext_pending && g_cjk_ext_resolved && !g_face[FONT_FACE_CJK].font_ok);
     dbg64_line_begin64();
     dbg64_str("[FONT64] faces=");
     dbg64_dec(FONT_FACE_COUNT);
@@ -1040,17 +1180,20 @@ void font_selftest() {
     dbg64_str(" cjk=");      dbg64_dec(g_face[FONT_FACE_CJK].font_ok ? 1 : 0);
     dbg64_str(" mono=");     dbg64_dec(g_face[FONT_FACE_MONO].font_ok ? 1 : 0);
     dbg64_str(" fallback="); dbg64_dec(g_face[FONT_FACE_FALLBACK].font_ok ? 1 : 0);
+    dbg64_str(" cjk_ext_na="); dbg64_dec(cjk_na ? 1u : 0u);
     dbg64_nl();
     dbg64_line_end64();
 
-    // bit0：四个面都加载成功
+    // bit0：四个面都加载成功（中文面外置取不到时按 na 通过）
     int loaded = 0;
     for (int f = 0; f < FONT_FACE_COUNT; f++) if (g_face[f].font_ok) loaded++;
     if (loaded == FONT_FACE_COUNT) mask |= 1;
+    else if (cjk_na && loaded == FONT_FACE_COUNT - 1) mask |= 1;       // na
     // bit1：等宽面 ASCII 宽 *2 == 中文面汉字宽（中英 1:2；终端就是按这个混排的）
     int ma = face_adv_px(&g_face[FONT_FACE_MONO], (uint32_t)'A');
     int ca = face_adv_px(&g_face[FONT_FACE_CJK], 0x4E00u);
     if (ma > 0 && ca == ma * 2) mask |= 2;
+    else if (cjk_na) mask |= 2;                                       // na（这一项与中文面相依）
     dbg64_line_begin64();
     dbg64_str("[FONT64] mono ascii="); dbg64_dec((uint64_t)ma);
     dbg64_str(" cjk=");                dbg64_dec((uint64_t)ca);
@@ -1066,6 +1209,7 @@ void font_selftest() {
     }
     cur = &g_face[FONT_FACE_ASCII];
     if (chain_ok) mask |= 4;
+    else if (cjk_na) mask |= 4;                                       // na（查询链的判据是"落到中文面"）
     // bit3：兜底面命中 —— 只在前三个面缺席、由 Unifont 补的码点（界面/终端字面量里出现，见 _subset_fonts.py）
     static const uint32_t fb_cand[] = { 0x2229u, 0x6D4Fu, 0x6E32u };   // ∩ / 浏 / 渲
     bool fb_ok = false;

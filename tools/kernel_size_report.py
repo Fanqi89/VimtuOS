@@ -26,7 +26,7 @@
 分类（任务书 ① 项点名的三类 + 其余）：
   * GUI 专用：gui64/panels64/startmenu64/locklogin64/explorer64/theme64/gfx64/img64
               -> 未来搬 Ring 3 的目标
-  * 驱动：ata64/ahci64/nvme64/usb64/xhci64/hda64/e1000_64/virtio_gpu64
+  * 驱动：ata64/ahci64/nvme64/usb64/xhci64/ehci64/hda64/e1000_64/virtio_gpu64
               -> 未来"模块化 / 用户态驱动"的目标
   * 核心：mem64/task64/proc64/vfs64/fs64/fd64/elf64/syscall64
               -> 应保留
@@ -60,7 +60,7 @@ COUNTED = (".text", ".rodata", ".data")     # 计入"内核体积"的节（.bss 
 
 GUI_OBJS = {"gui64", "panels64", "startmenu64", "locklogin64",
             "explorer64", "theme64", "gfx64", "img64"}
-DRIVER_OBJS = {"ata64", "ahci64", "nvme64", "usb64", "xhci64", "hda64",
+DRIVER_OBJS = {"ata64", "ahci64", "nvme64", "usb64", "xhci64", "ehci64", "hda64",
                "e1000_64", "virtio_gpu64"}
 CORE_OBJS = {"mem64", "task64", "proc64", "vfs64", "fs64", "fd64", "elf64", "syscall64"}
 # 其余"桌面外壳应用"（也属于"将来可搬"的候选，但不在任务书点名的 GUI 八个里）

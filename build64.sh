@@ -135,7 +135,7 @@ SRCS_SYS="kernel/sysstate64.cpp kernel/config64.cpp kernel/session64.cpp kernel/
 # ★ P9：kernel/netraw64.cpp（原始帧收发 ABI 53 的落点）**只进系统内核** —— 它用的是 e1000_64
 #   既有的收发；安装介质内核没有网卡路径也不跑 ring3，syscall64.cpp 对它用弱引用（那里返回 -1
 #   并打 [SYSCALL] deny）。netraw64.cpp 与 net64.cpp 一样排在这里（不进 SRCS_CORE）。
-SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/proc64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/netraw64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp kernel/xhci64.cpp kernel/hda64.cpp kernel/wl64.cpp"
+SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/proc64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/netraw64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp kernel/xhci64.cpp kernel/ehci64.cpp kernel/hda64.cpp kernel/wl64.cpp"
 # ★ A5：kernel/wl64.cpp（Wayland 基础骨架：surface/commit/seat + 最小合成器）**只进系统内核** ——
 #   它要用 proc64 的 shm 对象表（读共享缓冲的物理页）与 fb 的提交路径；安装介质内核不链它，
 #   syscall64.cpp 对 15..21 号用弱引用（那里返回 -1 并打 [SYSCALL] deny，不假装成功）。
@@ -308,8 +308,15 @@ PYFONTZ
 #   （24x24 = 2,304 B；裸 system.img 无卷时用，符号 _binary_icon_start_mini_bin_start/_end）。
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 icon_start_mini.bin icon_start_mini.o)
 (cd "$BUILD" && $OBJCOPY -I binary -O elf64-x86-64 -B i386:x86-64 kaisi.png kaisi_png.o)
-# OS 内核用同一批资源对象（直接复用）
-cp "$BUILD"/font_*_z.o "$BUILD"/icon_start_mini.o "$BUILD/os/"
+# ★ 本批（内核预算）：OS 内核**只复用三份小字体对象**（西文/等宽/兜底 = "启动必需的最小字形"：
+#   kmain 的图形栈在**磁盘可用之前**就要用它们画引导日志），中文面（font_simhei_z = 733,584 B）
+#   **不再内嵌进系统内核** —— 它搬进"原始区"blob（tools/demo_pack_win.py 的 RAW_EXTRA，
+#   见那里的说明：夹具盘都有原始区、卷里的字体只在全量演示盘里），运行期由
+#   kernel/font.cpp 的 font_external_load64() 读回 + 解压到 .bss（见 font.cpp 顶部的时机说明）。
+#   ★ 安装程序内核**仍然内嵌四份**（它走的是 setup 向导，磁盘/卷在向导里才成型；见下面安装程序
+#   内核链接行的 "$BUILD"/font_*_z.o 通配 —— 那一行故意不动）。
+cp "$BUILD"/font_bahnschrift_z.o "$BUILD"/font_mono_z.o "$BUILD"/font_fallback_z.o \
+   "$BUILD"/icon_start_mini.o "$BUILD/os/"
 cp "$BUILD"/kaisi_png.o "$BUILD/os/"      # 只给系统内核（桌面用）
 # ★ 本批（预算收口，替代 A4-2a 的"内嵌"做法）：**图标包不再内嵌内核**。
 #   原来的做法：build/iconpack.bin 用 objcopy 编成 iconpack_bin.o 链进系统内核（49,192 B），
@@ -807,7 +814,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
-    "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/netraw64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/hda64.o \
+    "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/netraw64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/ehci64.o "$BUILD/os"/hda64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD"/demo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
     "$BUILD/os"/kaisi_png.o
@@ -857,7 +864,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
         "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/cr3exp/proc64.o" \
         "$BUILD/os"/wl64.o \
-        "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/hda64.o \
+        "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/ehci64.o "$BUILD/os"/hda64.o \
         "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
         "$BUILD"/demo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
         "$BUILD/os"/kaisi_png.o    # 图标包已外置（原始区 + 系统卷），不再是内嵌对象
@@ -876,7 +883,9 @@ dd if="$BUILD/kernel64_os.bin" of="$BUILD/system.img" seek="$KERNEL_LBA" conv=no
 #   所以 kernel/demo64.cpp 是**按 LBA 用 ata64_read 现读**（读一次缓存），不依赖"loader
 #   平铺进内存的那份"。内核二进制里只有路径/偏移/长度表（0 字节 blob 本体）。
 #   两道断言：内核二进制末尾不许压到原始区起点；原始区不许越出内核区尾。
-DEMO64_RAW_LBA=7497
+# ★ 本批（内核预算）：原始区起点从 7497 **前移到 6096**（中文面字体的 deflate blob 也在这里，
+#   见 tools/demo_pack_win.py 的 RAW_EXTRA / DEMO64_RAW_LBA）。上限随之变成 8008-6096 = 1,912 扇区。
+DEMO64_RAW_LBA=6096
 DEMO64_RAW_BYTES=$(stat -c%s "$BUILD/demo64_raw.bin")
 KERNEL_OS_SECTORS=$(( (OSSZ + 511) / 512 ))
 DEMO64_RAW_SECTORS=$(( (DEMO64_RAW_BYTES + 511) / 512 ))
