@@ -33,6 +33,7 @@ static uint8_t g_demo64_raw64[DEMO64_RAW_MAX_BYTES];
 static int g_demo64_raw_state64 = 0;      // 0 = 还没读；1 = 已读；-1 = 当前候选盘配置试满 MAX 次仍失败
 static uint8_t g_demo64_raw_tries64 = 0;  // ★ 修复：对"当前候选配置"已尝试的次数（失败不永久缓存的依据）
 static int g_demo64_raw_syskey64 = -2;    // ★ 修复：上次尝试时的"系统盘签名"（-2 = 还没试过；-1 = 系统盘未知）
+static int g_demo64_raw_src64 = -1;       // ★ 本批：当前缓冲**来自哪块盘**（-1 = 没有可用缓冲）
 
 #define DEMO64_RAW_MAX_TRIES 4            // 同一候选盘配置最多试几次（之后每次调用直接返回失败，不再打盘）
 
@@ -74,6 +75,7 @@ static int d64_ensure_raw64(void) {
         if (ata64_read(cand[i], (uint32_t)DEMO64_RAW_LBA, secs, g_demo64_raw64)) { used = cand[i]; break; }
     }
     const bool ok = (used >= 0);
+    g_demo64_raw_src64 = ok ? used : -1;              // ★ 本批：来源盘（打点/验收对齐用）
     if (ok) {
         g_demo64_raw_state64 = 1;
     } else if (g_demo64_raw_tries64 >= DEMO64_RAW_MAX_TRIES) {
@@ -137,6 +139,7 @@ int demo64_raw_try_drive64(int drive) {
     if (drive < 0 || DEMO64_RAW_BYTES == 0 || secs > (DEMO64_RAW_MAX_BYTES / 512u)) return 0;
     if (!ata64_read(drive, (uint32_t)DEMO64_RAW_LBA, secs, g_demo64_raw64)) return 0;
     g_demo64_raw_state64 = 1;                          // 缓冲可用（就是这块盘）
+    g_demo64_raw_src64 = drive;                        // ★ 本批：来源盘
     g_demo64_raw_syskey64 = drive64_system_disk64();
     dbg64_line_begin64();
     dbg64_str("[DEMO64] raw probe drive=");
@@ -152,5 +155,32 @@ int demo64_raw_try_drive64(int drive) {
 
 void demo64_raw_abandon64(void) {
     g_demo64_raw_state64 = -1;                         // 丢弃：后续调用不再"用"这份内容
+    g_demo64_raw_src64 = -1;                           // ★ 本批：来源盘作废（不再声称来自哪块盘）
     g_demo64_raw_syskey64 = drive64_system_disk64();
+}
+
+// ==================== ★ 本批：来源盘查询 + 只读元数据（见 kernel/demo64.h）====================
+int demo64_raw_drive64(void) {
+    return (g_demo64_raw_state64 > 0) ? g_demo64_raw_src64 : -1;
+}
+
+int demo64_blob_meta64(const char* path, uint32_t* out_lba, uint32_t* out_skip,
+                       uint32_t* out_size, uint32_t* out_max_secs) {
+    if (!path || !out_lba || !out_skip || !out_size || !out_max_secs) return -1;
+    if (DEMO64_RAW_BYTES == 0) return -1;
+    for (uint32_t i = 0; i < (uint32_t)DEMO64_BLOB_COUNT; i++) {
+        const Demo64BlobEntry64* e = &g_demo64_blobtab64[i];
+        if (!d64_streq64(e->path, path)) continue;
+        if (e->size == 0) return -1;
+        if ((uint64_t)e->off + (uint64_t)e->size > (uint64_t)DEMO64_RAW_BYTES) return -1;   // 表项越界：如实拒绝
+        const uint32_t first_sec = e->off / 512u;                 // blob 起点所在扇区（原始区内的相对扇区号）
+        const uint32_t raw_total  = ((uint32_t)DEMO64_RAW_BYTES + 511u) / 512u;
+        if (first_sec >= raw_total) return -1;
+        *out_lba      = (uint32_t)DEMO64_RAW_LBA + first_sec;
+        *out_skip     = e->off - first_sec * 512u;
+        *out_size     = e->size;
+        *out_max_secs = raw_total - first_sec;                    // 钳在原始区内：绝不越读
+        return 0;
+    }
+    return -1;
 }

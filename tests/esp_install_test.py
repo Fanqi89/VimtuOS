@@ -538,7 +538,9 @@ def main():
     stub_ref = open(STUB, "rb").read()
     uefi_ref = open(UEFI64, "rb").read()
     kern_ref = open(OS_KERNEL, "rb").read()
-    # ★ 自 P6 起内核区**尾部**（LBA 7497..8008）有外置图标包（build64.sh 写进 system.img）：
+    # ★ 自 3d1ff31 起内核区**尾部**（LBA 6096.. 的"原始区"）装的是外置 blob：中文面字体
+    #   /etc/font_simhei.z + 18 份演示程序 + 图标包（原来 LBA 7497 起的单独图标包位置已作废；
+    #   build64.sh 把 build64/demo64_raw.bin dd 进 system.img，位置/大小见 build64/demo64_blobtab.h）。
     #   安装器写入 ESP 的 KERNEL64.BIN 是**内核区整块**（LBA 9..8008 = 4,096,000 B），不是
     #   "kernel64_os.bin + 补零"。独立来源 = build64/system.img 的同一区间（大小 + 逐字节）。
     with open(os.path.join(BUILD, "system.img"), "rb") as f:

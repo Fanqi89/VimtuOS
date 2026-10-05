@@ -12,8 +12,16 @@
 #include "font.h"
 #include "fb.h"
 #include "debug64.h"     // [FONT64] 打点（行锁：dbg64_line_begin64/end64）
-#include "demo64.h"      // ★ 中文面外置：原始区 blob 读取（demo64_blob_find64，见本文件顶部取舍说明）
+//   ★ 中文面外置有两个来源（顺序即优先级，见本文件"中文面外置装载"段）：
+//     ① 原始区 blob（demo64_blob_find64 = 系统盘/0 优先；都不行再**按 ata64 枚举逐盘有界探测**，
+//        这就是 3d1ff31 回归的修复点 —— 第一装载点在盘符扫描**之前**，AHCI-only 机器上没有"系统盘"）；
+//     ② 系统卷里的可读 TTF（/Fonts-open/NotoSansSC-Regular.ttf）
+#include "demo64.h"      // ★ 中文面外置：原始区 blob 读取/元数据（demo64_blob_find64 / demo64_blob_meta64）
+#include "ata64.h"       // ★ 按盘探测：ata64_drive_count64 / ata64_slot_to_drive64 / ata64_read
+#include "drive64.h"     // ★ 探测的第一候选：drive64_system_disk64()（C:/系统卷所在驱动器号）
+//     ③ 中文面外置的取值判据（三个来源共用）：长度头 + 完整解压 + TTF 表/cmap 真有汉字（见 font_cjk_apply64）
 #include "vfs64.h"       // ★ 中文面外置的第二来源：系统卷里可读的 /Fonts-open/NotoSansSC-Regular.ttf
+#include "mem_64.h"      // ★ 探测缓冲（~734KB，一次 kmalloc / 用完 kfree；不常驻内存）
 #include <stdint.h>
 
 #define FONT64_LOG_N 16  // [FONT64] fallback hit / glyph miss 的去重表大小（同一码点只打一行）
@@ -41,6 +49,14 @@
 //     * 中文面（733,584 B）是唯一的大块：它只在**中文界面**里用得到，而那些界面全部在
 //       os_boot_path 的磁盘/vfs 起来之后（桌面/终端/向导）。所以它可以是"磁盘可用后立刻装载"的 ——
 //       装载点见 kernel64.cpp 的 ata64_init64() 之后那一行（那一行之后才有屏幕画中文）；
+//       ★ 如实边界：**早于这个装载点**的屏幕（kmain 的"屏幕硬件检查报告"那 ~5 秒）里的汉字
+//       仍是缺字占位（那一段本来就只有 ASCII 面，且这段过渡期的缺字不计入 glyph miss，见
+//       font_draw_glyph_cp 的 transition 注释）—— 本批修的是"装载点之后仍然拿不到"。
+//       ★ 本批修复（3d1ff31 回归）：第一装载点在**盘符扫描之前**跑，AHCI-only 机器上
+//       drive64 给不出"系统盘"，而字体 blob 就在引导盘（AHCI 编号 = drive 8）上 ——
+//       老代码只试"系统盘 / drive 0" -> 拿不到 -> 中文全是缺字。修法 = 与图标包同源的
+//       **按 ata64 枚举逐盘有界探测**（判据是 blob 自己的长度头+完整解压+TTF cmap 有汉字，
+//       见下面"按盘探测"段），有界、失败如实打点、绝不 PANIC、失败不永久缓存。
 //     * 装载失败（裸盘无原始区、也没卷）**不是失败**：那一档仍然启动，只是中文面缺席
 //       （[FONT64] faces=… cjk=0 + selftest 里与中文面相依的三项如实标 na），绝不 PANIC、绝不假装成功。
 //   安装程序内核照旧内嵌四份（build64.sh 里安装程序链接行的 font_*_z.o 通配不动）——
@@ -485,18 +501,46 @@ void font_init() {
     }
 }
 
-// ==================== ★ 中文面外置装载（幂等；kernel64.cpp 在磁盘/vfs 起来之后调用）====================
-// 两个来源，按"夹具无关"的优先级：
-//   ① **原始区 blob**（/etc/font_simhei.z，deflate：8B 小端未压缩长度 + raw deflate）——
-//      夹具盘都是"system.img 的字节 + 空卷"，只有原始区在每个夹具盘里都有（见 tools/demo_pack_win.py）；
-//   ② 系统卷里的**可读 TTF**（/Fonts-open/NotoSansSC-Regular.ttf）—— 全量演示盘（sysdisk.img）里有，
+// ==================== ★ 中文面外置装载（幂等；kernel64.cpp 在两个装载点调用）====================
+// 三步来源，顺序即优先级：
+//   ① **原始区 blob 的常规候选**（/etc/font_simhei.z，deflate：8B 小端未压缩长度 + raw deflate）——
+//      demo64_blob_find64 的候选 = [系统盘（C: 所在盘）, drive 0]；盘符扫描完成之后这一档就够；
+//   ② ★ 本批修复：**按 ata64 枚举逐盘有界探测**同一段原始区（与 kernel/icons64.cpp 的 1a3 同源）——
+//      第一装载点跑在**盘符扫描之前**：AHCI-only 机器上 drive64 给不出"系统盘"，候选只剩 drive 0
+//      （不存在）-> ① 必然失败，而字体 blob 就在引导盘（AHCI 编号 = drive 8）上（同一启动稍后
+//      图标通路实测 [DEMO64] raw probe drive=8 loaded）。这就是 3d1ff31 引入的回归 ——
+//      中文面外置之后多了"到磁盘上找 blob"这条路，而它当时只会试系统盘/0；
+//   ③ 系统卷里的**可读 TTF**（/Fonts-open/NotoSansSC-Regular.ttf）—— 全量演示盘（sysdisk.img）里有，
 //      用户自建卷里没有；UEFI/ESP 夹具这种"引导盘不是 system.img"的档只能走这条。
-// 两个都取不到 = 中文面缺席（g_cjk_ext_resolved=true 后不再重试；selftest 照常打点、与中文面相依的
-// 三项如实标 na）—— 系统照常启动，绝不 PANIC、绝不假装成功。
+// 三个都取不到 = 中文面缺席（font_external_give_up64 后 g_cjk_ext_resolved=true 不再重试；
+// selftest 照常打点、与中文面相依的三项如实标 na）—— 系统照常启动，绝不 PANIC、绝不假装成功。
+// 取舍（装载点为什么留在"盘符扫描之前"，如实写清）：那一行之后屏幕就开始画中文（引导日志回放/
+//   display64/桌面），挪到扫描之后会让这一整段继续只有缺字占位；而按盘探测本身是有界的（见下，
+//   每盘最坏 1 扇区预筛 + 一次大读，整轮次数有上限），代价可接受。**如实边界**：更早的那屏
+//   "屏幕硬件检查报告"（kmain 里约 5 秒）仍然只有 ASCII 面 —— 它的汉字是缺字占位，且这段过渡期
+//   的缺字不计入 glyph miss（见 font_draw_glyph_cp 的 transition 注释）。本批修的是"装载点之后
+//   仍然拿不到"，不是那屏。
 #define FONT_CJK_RAW_PATH "/etc/font_simhei.z"
 #define FONT_CJK_VFS_PATH "/Fonts-open/NotoSansSC-Regular.ttf"
 
-static int font_cjk_apply64(const uint8_t* src, uint32_t src_len, bool deflated, const char* what) {
+// ---- ★ 本批修复：按盘探测的有界性/纪律 ----
+//   * 探测次数 = ata64 枚举槽数（上限 ATA64_MAX_DRIVE64）；每盘最坏 = 1 扇区预筛 + 一次 blob 长度的大读；
+//   * 整轮探测次数上限 FONT_CJK_PROBE_MAX_ROUNDS（两个装载点各一轮）；但**失败不缓存**：系统盘从
+//     "未知"变"已知"（盘符扫描完成）会重开一轮（与 demo64/icons64 修正后的做法一致）；
+//   * 失败如实打点（[FONT64] cjk raw probe …），绝不 PANIC；
+//   * 不用 demo64_raw_try_drive64()：它会把"当前原始区缓冲 = 某块盘"写进 demo64 的状态，而图标通路
+//     的 1a2/1a3 靠这份状态决定 src=/来源盘（tests/iconboot64_test.py ④ 钉的就是这个语义）；字体装载
+//     早于图标，借用会把图标的来源盘从"探测到的 8"改成"1a2 的 -1"。所以这里只用元数据
+//     （demo64_blob_meta64）+ 自带缓冲读，读完即 kfree，demo64 的缓冲/状态一个字节都不动。
+#define FONT_CJK_PROBE_MAX_ROUNDS 2
+static uint8_t g_cjk_probe_rounds64 = 0;    // 已完成的整轮探测次数
+static int     g_cjk_probe_syskey64 = -2;   // 上一轮探测时的系统盘签名（-2=还没探过；-1=系统盘未知）
+
+// 把一份"blob 字节"（deflate 或已解压的 TTF）装成中文面。判据（三个来源共用，绝不把读错盘/半截数据
+// 当成功）：长度头 + 完整解压（font_unpack64：长度不符/坏表一律失败）-> face_init（TTF 头/表/cmap）
+// -> cmap 里**真的有汉字**（U+4E00）。drive = 这份字节来自哪块盘（-1 = 不涉及盘，例如卷里的文件），
+// 只用于打点与验收对齐"来源盘"。
+static int font_cjk_apply64(const uint8_t* src, uint32_t src_len, bool deflated, const char* what, int drive) {
     if (!src || src_len < 16u) return -1;
     uint32_t n = 0;
     if (deflated) {
@@ -509,16 +553,96 @@ static int font_cjk_apply64(const uint8_t* src, uint32_t src_len, bool deflated,
     }
     if (n < 1024u) return -1;
     face_init(&g_face[FONT_FACE_CJK], g_font_ram_cjk, g_font_ram_cjk + n);
+    // 判据最后一段：解出来的必须真是一份**带汉字**的 TTF（U+4E00 在 cmap 里且有字形）。
+    // 不满足 = 这份字节不是中文面字体（读错盘/别的东西冒充）：把面复位成"空"再如实报失败。
+    bool glyph_ok = g_face[FONT_FACE_CJK].font_ok;
+    if (glyph_ok) {
+        const uint16_t g0 = cmap_lookup(&g_face[FONT_FACE_CJK], 0x4E00u);
+        glyph_ok = (g0 != 0 && g0 < g_face[FONT_FACE_CJK].numGlyphs);
+        if (!glyph_ok) face_init(&g_face[FONT_FACE_CJK], g_font_ram_cjk, g_font_ram_cjk);   // 空面
+    }
     dbg64_line_begin64();
     dbg64_str("[FONT64] cjk external load src=");
     dbg64_str(what);
+    dbg64_str(" drive=");
+    if (drive >= 0) dbg64_dec((uint64_t)drive); else dbg64_str("-1");
     dbg64_str(" bytes=");
     dbg64_dec((uint64_t)n);
     dbg64_str(" face_ok=");
-    dbg64_dec(g_face[FONT_FACE_CJK].font_ok ? 1u : 0u);
+    dbg64_dec(glyph_ok ? 1u : 0u);
     dbg64_nl();
     dbg64_line_end64();
-    return g_face[FONT_FACE_CJK].font_ok ? 0 : -1;
+    return glyph_ok ? 0 : -1;
+}
+
+// 从一块盘读原始区里的字体 blob（连 8B 长度头一起读）。成功返回缓冲基址（调用方 kfree_64），
+// 并写出 blob 在缓冲里的偏移/长度；失败（读不到 / 原始区放不下 / 长度头不像）返回 nullptr。
+static uint8_t* font_cjk_raw_read64(int drive, uint32_t* out_off, uint32_t* out_len) {
+    uint32_t lba = 0, skip = 0, size = 0, max_secs = 0;
+    if (demo64_blob_meta64(FONT_CJK_RAW_PATH, &lba, &skip, &size, &max_secs) != 0) return nullptr;
+    if (size < 16u || skip + 8u > 512u) return nullptr;              // 8B 长度头必须落在第一个扇区里
+    const uint32_t need = skip + size;                               // 从 lba 起到 blob 末尾的字节数
+    uint32_t secs = (need + 511u) / 512u;
+    if (secs > max_secs) secs = max_secs;                            // 钳在原始区内：绝不越读原始区之外
+    if ((uint64_t)skip + (uint64_t)size > (uint64_t)secs * 512u) return nullptr;
+    // 预筛：先只读 1 个扇区，判据与 font_unpack64 的头部检查**同一套**（want != 0 && want <= 容量、
+    // 高 4 字节为 0）。读错盘/空盘/被清零的原始区在这一步就被挡下，不会引出 ~734KB 的大读。
+    uint8_t hdr[512];
+    if (!ata64_read(drive, lba, 1u, hdr)) return nullptr;
+    const uint32_t want = (uint32_t)hdr[skip] | ((uint32_t)hdr[skip + 1u] << 8) |
+                          ((uint32_t)hdr[skip + 2u] << 16) | ((uint32_t)hdr[skip + 3u] << 24);
+    for (uint32_t i = 4; i < 8; i++) if (hdr[skip + i] != 0) return nullptr;
+    if (want == 0 || want > FONT_RAM_CJK_CAP) return nullptr;
+    uint8_t* buf = (uint8_t*)kmalloc_64((uint64_t)secs * 512u);
+    if (!buf) {
+        dbg64_line_begin64();
+        dbg64_str("[FONT64] cjk raw probe drive=");
+        dbg64_dec((uint64_t)drive);
+        dbg64_str(" skipped: alloc FAILED bytes=");
+        dbg64_dec((uint64_t)secs * 512u);
+        dbg64_nl();
+        dbg64_line_end64();
+        return nullptr;
+    }
+    mem_owner_set_64(MEM_OWNER_KERNEL_64);
+    if (!ata64_read(drive, lba, secs, buf)) { kfree_64(buf); return nullptr; }
+    *out_off = skip;
+    *out_len = size;
+    return buf;
+}
+
+// 逐盘有界探测（一轮）。返回 1 = 命中并装载成功；0 = 这一轮没有（已如实打点）。
+static int font_cjk_probe_round64(int round) {
+    const int dc = ata64_drive_count64();
+    int slots = 0, reads = 0, hit = -1;
+    for (int i = 0; i < dc; i++) {
+        const int d = ata64_slot_to_drive64(i);
+        if (d < 0) continue;
+        slots++;
+        uint32_t boff = 0, blen = 0;
+        uint8_t* buf = font_cjk_raw_read64(d, &boff, &blen);
+        if (!buf) continue;
+        reads++;
+        const int rc = font_cjk_apply64(buf + boff, blen, true, "raw", d);
+        kfree_64(buf);
+        if (rc == 0) { hit = d; break; }
+    }
+    dbg64_line_begin64();
+    dbg64_str("[FONT64] cjk raw probe round=");
+    dbg64_dec((uint64_t)round);
+    dbg64_str(" slots=");
+    dbg64_dec((uint64_t)slots);
+    dbg64_str(" raw_reads=");
+    dbg64_dec((uint64_t)reads);
+    if (hit >= 0) {
+        dbg64_str(" hit=drive ");
+        dbg64_dec((uint64_t)hit);
+        dbg64_nl();
+    } else {
+        dbg64_str(" hit=none (判据=长度头+完整解压+TTF cmap 汉字; 失败不缓存: 系统盘变已知或下一装载点会重试)\n");
+    }
+    dbg64_line_end64();
+    return hit >= 0 ? 1 : 0;
 }
 
 // 返回 0 = 中文面已就绪；1 = 这次没成功（可能是"磁盘还没起来"，可再调）；2 = 已确认取不到（不再重试）
@@ -528,13 +652,33 @@ int font_external_load64() {
     if (g_cjk_ext_resolved) return 2;                       // 已确认取不到：不再磨盘
     g_cjk_ext_tried = true;
 
-    // ① 原始区 blob（defalte；夹具无关）
+    // ① 原始区 blob 的常规候选（defalte；系统盘优先，判不出来退回 drive 0）
     {
         uint32_t zlen = 0;
         const uint8_t* z = demo64_blob_find64(FONT_CJK_RAW_PATH, &zlen);
-        if (z && font_cjk_apply64(z, zlen, true, "raw") == 0) { g_cjk_ext_resolved = true; if (g_selftest_hold) font_selftest(); return 0; }
+        if (z && font_cjk_apply64(z, zlen, true, "raw", demo64_raw_drive64()) == 0) {
+            g_cjk_ext_resolved = true;
+            if (g_selftest_hold) font_selftest();
+            return 0;
+        }
     }
-    // ② 系统卷里的可读 TTF
+    // ② ★ 本批修复：按 ata64 枚举逐盘有界探测（判据见 font_cjk_apply64；有界/如实/不缓存在上面注释里）
+    {
+        const int syskey = drive64_system_disk64();         // -1 = 系统盘还不知道（盘符扫描还没做）
+        if (syskey != g_cjk_probe_syskey64) {               // 线索变了（扫描完成）-> 重开一轮
+            g_cjk_probe_rounds64 = 0;
+            g_cjk_probe_syskey64 = syskey;
+        }
+        if (g_cjk_probe_rounds64 < FONT_CJK_PROBE_MAX_ROUNDS) {
+            g_cjk_probe_rounds64++;
+            if (font_cjk_probe_round64(g_cjk_probe_rounds64) == 1) {
+                g_cjk_ext_resolved = true;
+                if (g_selftest_hold) font_selftest();
+                return 0;
+            }
+        }
+    }
+    // ③ 系统卷里的可读 TTF
     {
         const int sys = vfs64_system_slot64();
         if (sys >= 0 && vfs64_slot_used64(sys)) {
@@ -542,7 +686,7 @@ int font_external_load64() {
             if (vfs64_stat_on64(sys, FONT_CJK_VFS_PATH, &ty, &sz) == 0 && ty == VFS64_TYPE_FILE &&
                 sz > 1024u && sz <= FONT_RAM_CJK_CAP) {
                 const int got = vfs64_read_on64(sys, FONT_CJK_VFS_PATH, g_font_ram_cjk, (int)sz);
-                if (got > 1024 && font_cjk_apply64(g_font_ram_cjk, (uint32_t)got, false, "vfs") == 0) {
+                if (got > 1024 && font_cjk_apply64(g_font_ram_cjk, (uint32_t)got, false, "vfs", -1) == 0) {
                     g_cjk_ext_resolved = true;
                     if (g_selftest_hold) font_selftest();
                     return 0;

@@ -24,8 +24,13 @@
      夹具写入后独立回读自检）-> 如实打点 `init pack absent`（含 sys-disk/probes/raw-reads 明细）
      + 每个 kind 打 fallback reason=no-pack + Dock 图标位置仍有墨迹（程序化兜底），**不崩/无 PANIC**
   ④ 装机路径：安装介质（IDE index0）-> AHCI 目标盘走完安装（[INSTALL] 完成）-> **只挂 AHCI 盘**
-     重启 -> `[LM] disk boot via INT 13h` + 目标盘原始区逐字节 = build64/demo64_raw.bin
-     + `[ICON64] init pack … bad=0 ok=1` + 逐 kind ok=1 + 像素（真图标上屏）
+    重启 -> `[LM] disk boot via INT 13h` + 目标盘原始区逐字节 = build64/demo64_raw.bin
+    + `[ICON64] init pack … bad=0 ok=1` + 逐 kind ok=1 + 像素（真图标上屏）
+    ★ 中文面字体回归（本文件本批新增）：同一档（AHCI-only + 没有已挂载系统卷 + 盘上有原始区）
+    断言 `[FONT64] cjk external load src=raw drive=<非 0>`（与 [DEMO64] raw probe 的来源盘一致）
+    + `faces=… cjk=1 cjk_ext_na=0` + `selftest PASS mask=0x…1F` + 终端 banner 的中文行
+    **有真字形墨迹**（最大游程 >= 12px = 整格汉字）且与 ① PATA 正常场景**逐像素一致**
+    （③ 无中文面档作为对照：缺字占位、游程 < 12px —— 证明这条证据不是恒真）。
 
 退出码：0 = 全通过；1 = 有断言失败；2 = 环境问题
 用法：py -3 tests\\iconboot64_test.py [--qemu 路径] [--port 5688] [--keep] [--skip-install]
@@ -64,8 +69,88 @@ PACK_FILE = "/etc/iconpack.bin"
 BLOB_TAB = os.path.join(ROOT, "build64", "demo64_blobtab.h")
 RAW_BIN = os.path.join(ROOT, "build64", "demo64_raw.bin")
 PACK_BIN_RAW = os.path.join(ROOT, "build64", "iconpack.bin")
+FONT_Z = os.path.join(ROOT, "build64", "font_simhei.z")      # 中文面外置 blob（原始区 /etc/font_simhei.z 的真源）
+
+def read_font_z():
+    """中文面 deflate blob（原始区里 /etc/font_simhei.z 的那份字节）的事实：返回 (解出字节数, 压缩字节数)。
+    与 read_blobtab 同一纪律：期望**从生成物读**，不写死（字体子集一变，这里的期望自动跟上）。"""
+    with open(FONT_Z, "rb") as f:
+        b = f.read()
+    if len(b) < 16:
+        raise RuntimeError("build64/font_simhei.z 太小（先跑 bash build64.sh）")
+    want = int.from_bytes(b[:8], "little")
+    if not (0 < want <= 1200 * 1024):
+        raise RuntimeError("build64/font_simhei.z 的长度头不自洽：%d" % want)
+    return want, len(b)
 
 
+ # ==================== 终端 banner 的中文行：像素/墨迹工具（阈值口径与 fonts64_test/ict 同一套）====================
+ # 终端是**第一个**打开的窗口 -> 客户区原点 (17,41)（(16,16) + 1px 边框 + 24px 标题栏，与 fonts64_test 同口径）。
+ # banner 第一行 = "VimtuOS Terminal v… (64-bit long mode)"（ASCII）；第二行 = gui64_tr("type 'help' for commands",
+ # "输入 help 查看命令") —— 语言默认 zh（config64 的 ui.lang 默认 1），所以第二行就是**已知的中文串**：
+ # 真字形 = 整格汉字（最大墨水游程 >= 12px）；中文面缺席时是 10x12 的空心缺字方框（游程 <= 10px、墨迹更少）。
+TERM_CX, TERM_CY = 17, 41
+
+
+def banner_cjk_xy():
+    """banner 第二行（中文）的取样左上角：行 y = 41+4+16，行高 16px。"""
+    return TERM_CX + 4, TERM_CY + 4 + 16
+
+
+def open_terminal(vm, mon):
+    """开始菜单 -> 终端（最多 3 次手势）。返回是否拿到 [APP] term opened。"""
+    for _ in range(3):
+        mon.key("meta_l", wait=0.9)
+        mon.key("1", wait=1.8)
+        if vm.wait_log("[APP] term opened", 12):
+            return True
+    return False
+
+
+def shot_ppm(mon, tmp, tag):
+    """抓一帧 PPM：返回 (w, h, px)（smt.read_ppm 口径：px = 3 字节/像素的原始字节）。"""
+    SHOT_SEQ[0] += 1
+    shot = os.path.join(tmp, "%s%d.ppm" % (tag, SHOT_SEQ[0]))
+    if not mon.shot(shot):
+        return None
+    return smt.read_ppm(shot)
+
+
+def region_ink(px, w, x0, y0, nx, ny, thresh=60):
+    """区域墨迹：任一通道 > thresh 记为墨迹（bg_max=60，与 fonts64_test/ict 同口径）。
+    返回 (墨迹像素数, 单行最长连续墨迹游程 px)。"""
+    ink = 0
+    best = cur = 0
+    for j in range(ny):
+        cur = 0
+        for i in range(nx):
+            r, g, b = ict.sample(px, w, x0 + i, y0 + j)
+            if r > thresh or g > thresh or b > thresh:
+                ink += 1
+                cur += 1
+                if cur > best:
+                    best = cur
+            else:
+                cur = 0
+    return ink, best
+
+
+def region_diff_frac(pa, wa, pb, wb, x0, y0, nx, ny, thresh=24):
+    """两张截图同一区域的不同像素比例，允许 ±2px 抖动（取最佳对齐的最小差异）。"""
+    best = None
+    for dy in (-2, -1, 0, 1, 2):
+        for dx in (-2, -1, 0, 1, 2):
+            diff = 0
+            for j in range(ny):
+                for i in range(nx):
+                    ra = ict.sample(pa, wa, x0 + i, y0 + j)
+                    rb = ict.sample(pb, wb, x0 + i + dx, y0 + j + dy)
+                    if ict.dist(ra, rb) > thresh:
+                        diff += 1
+            f = diff / float(nx * ny)
+            if best is None or f < best:
+                best = f
+    return best
 def q(p):
     return p.replace("\\", "/")
 
@@ -179,6 +264,8 @@ def count_loads(log):
     return len(re.findall(r"\[ICON64\] load kind=\S+ path=pack:\S+ size=\d+ src=vfs ok=1", log))
 
 SHOT_SEQ = [0]      # screendump 文件名必须是纯 ASCII（QEMU monitor 的路径参数不接受非 ASCII）
+REF_CJK = [None]    # ① PATA 正常场景的 banner 中文行测量 (w, px, ink, max_run)：④ 的"一致/接近"参照
+CTRL_CJK = [None]   # ③ 无中文面档的同一测量：④-vs-③ 的对照（证明这条证据不是恒真）
 
 
 def main():
@@ -191,7 +278,8 @@ def main():
 
     for need, why in ((SYSTEM_IMG, "先跑 bash build64.sh"), (PACK_BIN, "先跑 bash build64.sh"),
                       (BLOB_TAB, "先跑 bash build64.sh"), (RAW_BIN, "先跑 bash build64.sh"),
-                      (PACK_BIN_RAW, "先跑 bash build64.sh"), (MANIFEST, "先跑 bash build64.sh")):
+                      (PACK_BIN_RAW, "先跑 bash build64.sh"), (MANIFEST, "先跑 bash build64.sh"),
+                      (FONT_Z, "先跑 bash build64.sh")):
         if not os.path.exists(need):
             sys.stderr.write("缺少 %s（%s）\n" % (need, why))
             return 2
@@ -200,6 +288,9 @@ def main():
     raw_secs = (raw_bytes + 511) // 512
     hello_off = blobs["/hello.elf"][0]
     rawoff_pack, rawlen_pack = blobs[PACK_FILE]
+    font_raw_len, font_zip_len = read_font_z()   # 中文面解出字节数 = [FONT64] … bytes= 的期望（从生成物读）
+    print("     （中文面 blob：解出 %d B / deflate %d B —— [FONT64] cjk external load 的 bytes= 按它断言）"
+          % (font_raw_len, font_zip_len))
     qemu = smt.find_qemu(args.qemu)
     if not qemu:
         sys.stderr.write("找不到 qemu-system-x86_64\n")
@@ -272,6 +363,26 @@ def main():
         check("%s Dock #1(我的电脑) 区域仍有墨迹（>=60 像素）" % tag, ink >= 60,
               "ink=%d/%d" % (ink, n * n))
 
+    def scene_term_banner_cjk(vm, mon, tag):
+        """开终端 -> 抓帧 -> 量 banner 第二行（= gui64_tr("type 'help' for commands", "输入 help 查看命令")，
+        默认 zh）的墨迹。返回 (w, px, ink, max_run)；终端没打开/打不到帧返回 None。"""
+        if not open_terminal(vm, mon):
+            check("%s 打开终端（[APP] term opened）" % tag, False, "（开始菜单 -> 1 未打开）")
+            return None
+        check("%s 打开终端（[APP] term opened）" % tag, True)
+        time.sleep(1.2)
+        g = shot_ppm(mon, tmp, "term")
+        if not g:
+            check("%s 抓到终端截图" % tag, False, "screendump 失败")
+            return None
+        w, h, px = g
+        x0, y0 = banner_cjk_xy()
+        if x0 + 420 > w or y0 + 16 > h:
+            check("%s 终端 banner 中文行在屏内" % tag, False, "屏幕 %dx%d x0=%d y0=%d" % (w, h, x0, y0))
+            return None
+        ink, run = region_ink(px, w, x0, y0, 420, 16)
+        return (w, px, ink, run)
+
     # =============================================================
     print("=== ① PATA 对照：卷里没有包 -> 原始区（drive 0）装进卷 -> src=vfs + 真图标上屏 ===")
     img1 = make_nopack_fixture(tmp, "nopack_pata.img", raw_lba, raw_secs)
@@ -299,6 +410,11 @@ def main():
               nl1 == len(kinds), "%d 条" % nl1)
         if up:
             scene_pixel_desktop(vm1, mon1, log1, "①")
+            REF_CJK[0] = scene_term_banner_cjk(vm1, mon1, "①")
+            if REF_CJK[0]:
+                check("① 中文 banner 行有真字形墨迹（ink>=150 且最大墨水游程 >= 11px = 整格汉字）",
+                      REF_CJK[0][2] >= 150 and REF_CJK[0][3] >= 11,
+                      "ink=%d max_run=%d" % (REF_CJK[0][2], REF_CJK[0][3]))
         check("① 无 PANIC/TRIPLE FAULT", "PANIC" not in log1 and "TRIPLE FAULT" not in log1)
     finally:
         vm1.close()
@@ -369,6 +485,14 @@ def main():
               re.search(r"\[ICON64\] init pack lba=", log3) is None)
         if up:
             scene_pixel_dock_mypc(vm3, mon3, log3, "③")
+            CTRL_CJK[0] = scene_term_banner_cjk(vm3, mon3, "③")
+            if CTRL_CJK[0]:
+                # ③ = 卷里没有包 + 原始区被清零（也没有卷内字体）-> 中文面缺席 = 缺字占位。
+                # 这条是**对照**：它必须与 ① 的真字形明显不同，否则 ④ 的墨迹断言就是恒真的。
+                check("③ 对照（无中文面）：同一段中文是缺字占位（游程 <= 10px 且墨迹少于 ①）",
+                      CTRL_CJK[0][3] <= 10 and (REF_CJK[0] is None or CTRL_CJK[0][2] < REF_CJK[0][2]),
+                      "③ ink=%d max_run=%d；① ink=%s" % (CTRL_CJK[0][2], CTRL_CJK[0][3],
+                      REF_CJK[0][2] if REF_CJK[0] else "（缺）"))
         check("③ 无 PANIC/TRIPLE FAULT", "PANIC" not in log3 and "TRIPLE FAULT" not in log3)
     finally:
         vm3.close()
@@ -450,8 +574,44 @@ def main():
             nl4 = len(re.findall(r"\[ICON64\] load kind=\S+ path=pack:\S+ size=\d+ src=\S+ ok=1", log_b))
             check("④ 逐 kind 真图标（[ICON64] load … ok=1 = %d 条）" % len(kinds),
                   nl4 == len(kinds), "%d 条" % nl4)
+            # ★ 本批（3d1ff31 回归：中文面字体外置后，AHCI-only + 没有已挂载系统卷时拿不到 blob）：
+            #   修后这一档必须在**第一装载点**就按盘探测装好中文面 —— 逐行断言，不只看"没有 FAIL"。
+            mf4 = re.search(r"\[FONT64\] cjk external load src=raw drive=(-?\d+) bytes=(\d+) face_ok=(\d)", log_b)
+            check("④ ★ 中文面外置按盘探测装载（src=raw、来源盘非 0 且与 [DEMO64] 探测盘一致、face_ok=1、"
+                  "bytes=%d = 字体 blob 解出长度）" % font_raw_len,
+                  mf4 is not None and mf4.group(1) != "0" and mf4.group(3) == "1"
+                  and int(mf4.group(2)) == font_raw_len and (mpb is None or mf4.group(1) == mpb.group(1)),
+                  mf4.group(0) if mf4 else (re.search(r"\[FONT64\] cjk external load[^\r\n]*", log_b) or ["（无）"])[0])
+            check("④ 中文面就位（[FONT64] faces=4 ascii=1 cjk=1 mono=1 fallback=1 cjk_ext_na=0）",
+                  "[FONT64] faces=4 ascii=1 cjk=1 mono=1 fallback=1 cjk_ext_na=0" in log_b,
+                  (re.search(r"\[FONT64\] faces=[^\r\n]*", log_b) or ["（无）"])[0])
+            check("④ 四面自检全过（[FONT64] selftest PASS mask=0x000000000000001F —— 修前是 cjk=0 + FAIL mask=0xF）",
+                  "[FONT64] selftest PASS mask=0x000000000000001F" in log_b,
+                  (re.search(r"\[FONT64\] selftest (PASS|FAIL)[^\r\n]*", log_b) or ["（无）"])[0])
+            check("④ 没有「中文面取不到」（[FONT64] cjk face unavailable 不出现 —— 修前就是这一行）",
+                  "[FONT64] cjk face unavailable" not in log_b)
+            check("④ 没有缺字占位（[FONT64] glyph miss 不出现）",
+                  re.search(r"\[FONT64\] glyph miss cp=0x", log_b) is None,
+                  "；".join(re.findall(r"\[FONT64\] glyph miss[^\r\n]*", log_b)[:4]))
             if up:
                 scene_pixel_desktop(vmb, mon_b, log_b, "④")
+                got4 = scene_term_banner_cjk(vmb, mon_b, "④")
+                if got4:
+                    check("④ 中文 banner 行有真字形墨迹（ink>=150 且最大墨水游程 >= 11px = 整格汉字）",
+                          got4[2] >= 150 and got4[3] >= 11, "ink=%d max_run=%d" % (got4[2], got4[3]))
+                    if REF_CJK[0]:
+                        ref = REF_CJK[0]
+                        check("④ 与 PATA 正常场景（①）的墨迹一致/接近（|Δink| <= max(40, 25%%×①ink)）",
+                              abs(got4[2] - ref[2]) <= max(40, int(ref[2] * 0.25)),
+                              "④=%d ①=%d（Δ=%d）" % (got4[2], ref[2], got4[2] - ref[2]))
+                        diff = region_diff_frac(ref[1], ref[0], got4[1], got4[0],
+                                                *banner_cjk_xy(), 420, 16)
+                        check("④ 同一段中文与 ① 逐像素一致（±2px 最佳对齐后差异 <= 2%%）",
+                              diff is not None and diff <= 0.02,
+                              "diff=%.2f%%（±2px 最佳对齐）" % (100.0 * (9.99 if diff is None else diff)))
+                    if CTRL_CJK[0]:
+                        check("④ 的中文行与 ③ 缺字占位档明显不同（墨迹更多；证明这条证据不是恒真）",
+                              got4[2] > CTRL_CJK[0][2], "④=%d ③=%d" % (got4[2], CTRL_CJK[0][2]))
             check("④ 无 PANIC/TRIPLE FAULT", "PANIC" not in log_b and "TRIPLE FAULT" not in log_b)
         finally:
             vmb.close()

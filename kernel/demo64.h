@@ -41,4 +41,23 @@ const uint8_t* demo64_blob_find64(const char* path, uint32_t* out_size);
 // 为什么由调用方校验：原始区本身没有 magic（第一个 blob 就是 /hello.elf 的字节），
 // 但"要找的东西"（例如图标包 /etc/iconpack.bin）自带 magic+CRC —— 只有调用方知道判据。
 int  demo64_raw_try_drive64(int drive);
+// 当前原始区缓冲**来自哪块盘**（-1 = 还没有可用缓冲 / 已被丢弃）。
+// 打点与验收据此对齐"来源盘"（例如 [FONT64] cjk external load … drive=N 必须与这里的实际来源一致）。
+int demo64_raw_drive64(void);
+
+// ==================== ★ 本批（中文面字体"按盘探测"）：只读元数据、不动状态 ====================
+// kernel/font.cpp 的中文面按盘探测需要知道"字体 blob 在原始区里的位置"，但它**不能**借用
+// demo64_raw_try_drive64()：那条口子会把"当前缓冲 = 某块盘"写进 demo64 的状态，而图标通路的
+// 1a2/1a3 正是靠这份状态决定 src=/来源盘（tests/iconboot64_test.py ④ 钉的就是这个语义）；
+// 字体装载发生在图标之前，借用会让图标的来源盘从"探测到的 8"变成"1a2 的 -1"。
+// 所以这里只给元数据，调用方自己读、自己校验（读错盘的判据由调用方的内容校验负责）。
+// 成功返回 0 并写出：
+//   *out_lba        = blob 所在**扇区**的 LBA（blob 起点不一定扇区对齐，见 *out_skip）
+//   *out_skip       = 该扇区到 blob 起点的字节偏移（0..511）
+//   *out_size       = blob 字节数
+//   *out_max_secs   = 从 *out_lba 起到**原始区末尾**还能读的扇区数（调用方据此把读钳在原始区内，
+//                     绝不越读原始区之外的字节）
+// 未知路径 / 表项越界 / 原始区为空 -> -1（**不动**原始区缓冲与状态）。
+int demo64_blob_meta64(const char* path, uint32_t* out_lba, uint32_t* out_skip,
+                       uint32_t* out_size, uint32_t* out_max_secs);
 void demo64_raw_abandon64(void);
