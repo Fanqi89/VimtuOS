@@ -437,7 +437,10 @@ def _grab_line(log, needle):
 # --------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--qemu", default=os.environ.get("VIMTU_QEMU", "qemu-system-x86_64"))
+    _qg = next((_p for _p in (r"C:\Program Files\qemu\qemu-system-x86_64.exe",
+                              r"C:\Program Files (x86)\qemu\qemu-system-x86_64.exe") if os.path.exists(_p)),
+               "qemu-system-x86_64")
+    ap.add_argument("--qemu", default=os.environ.get("VIMTU_QEMU", _qg))
     ap.add_argument("--img", default=os.path.join(ROOT, "build64", "sysdisk.img"))
     ap.add_argument("--only", default="all", choices=["all", "tear", "gpuoff", "degrade", "regress"])
     ap.add_argument("--shots", type=int, default=32, help="撕裂用例最少抓多少张（规范要求 >=30）")
