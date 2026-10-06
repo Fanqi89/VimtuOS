@@ -458,8 +458,9 @@ def main():
         check("①c `run %s` 能跑起来（%d B；内核读盘上限 %d B）"
               % (v, items["static_musl_big"]["size"], lim["elf_max_file_bytes"]),
               "[LXBIG]" in seg, raw(seg))
-        check("[缺口跟踪] ①c 的失败原因 = 内核 96 KiB 读盘缓冲（kernel/elf64.h:80）",
-              REASON_SIZE in seg, raw(seg))
+        check("[缺口已修] ①c 不再撞读盘上限（无 reason=size；%d B 走**按段分块**读盘）"
+              % items["static_musl_big"]["size"],
+              REASON_SIZE not in seg and "[ELF64] load path=" in seg and "layout=1" in seg, raw(seg))
 
         # ================= ② 动态 musl =================
         print("--- ② 动态 musl（PT_INTERP=%s，卷里已装 %d KB 的 ld-musl）---"
@@ -469,9 +470,10 @@ def main():
         segs["dyn"] = seg
         check("② `run %s` 打印它自己的固定串（= 动态链接真的跑起来）" % v,
               man["marks"]["dyn"] in seg, raw(seg))
-        check("[缺口跟踪] ② 的失败点 = 解释器读盘上限（ld-musl %d B > %d B）"
-              % (items["musl_ldso"]["size"], lim["elf_max_file_bytes"]),
-              REASON_INTERP_SIZE in seg or "interp reject" in seg, raw(seg))
+        check("[缺口已修] ② 的解释器真的装进来了（ld-musl %d B；[ELF64] interp path=… base=…，无 interp reject）"
+              % items["musl_ldso"]["size"],
+              REASON_INTERP_SIZE not in seg and "interp reject" not in seg and
+              "[ELF64] interp path=/lib/ld-musl-x86_64.so.1 base=" in seg, raw(seg))
 
         print("--- ②b 同一个程序 + 真 glibc 解释器（%s，%d KB）---"
               % (items["glibc_ldso"]["vol"], items["glibc_ldso"]["size"] // 1024))
@@ -479,9 +481,10 @@ def main():
         seg = run_prog(v, want=man["marks"]["dyn"])
         segs["dyn_gnu"] = seg
         check("②b `run %s` 打印它自己的固定串" % v, man["marks"]["dyn"] in seg, raw(seg))
-        check("[缺口跟踪] ②b 的失败点 = 解释器读盘上限（glibc 解释器 %d B > %d B）"
-              % (items["glibc_ldso"]["size"], lim["elf_max_file_bytes"]),
-              REASON_INTERP_SIZE in seg or "interp reject" in seg, raw(seg))
+        check("[缺口已修] ②b 的真 glibc 解释器被内核装载（ld-linux %d B，无 interp reject）"
+              % items["glibc_ldso"]["size"],
+              REASON_INTERP_SIZE not in seg and "interp reject" not in seg and
+              "[ELF64] interp path=/lib64/ld-linux-x86-64.so.2 base=" in seg, raw(seg))
 
         # ================= ⑤ 长路径（execve 路径缓冲 32 B）=================
         print("--- ⑤ 同一个二进制换个 38 字节的长路径（内核 execve 路径缓冲只有 32 B）---")
@@ -490,9 +493,9 @@ def main():
         segs["longpath"] = seg
         check("⑤ `run %s`（%d 字符）能进 execve 并跑起来" % (v, len(v)),
               man["marks"]["dyn"] in seg, raw(seg))
-        check("[缺口跟踪] ⑤ 的失败点 = 内核 execve(59) 的路径缓冲 32 B"
-              "（kernel/syscall64.cpp:579 LX64_PATH_MAX；> 31 字节 = deny + EFAULT）",
-              ("deny nr=59" in seg and "FFFFFFFFFFFFFFF2" in seg), raw(seg))
+        check("[缺口已修] ⑤ 的路径缓冲放宽到 128 B（无 deny nr=59；39 字符路径真的进了 execve）",
+              "deny nr=59" not in seg and
+              "[ELF64] load path=/lxcorpus/dynhello-with-a-long-name.elf" in seg, raw(seg))
 
         # ================= ③ 真发行版（Debian PIE + glibc）=================
         print("--- ③ 真发行版程序：Debian hello 的 /usr/bin/hello（PIE + glibc）---")
@@ -501,8 +504,8 @@ def main():
         segs["gnu"] = seg
         check("③ `run %s` 打印 \"Hello, world!\"（真发行版二进制能跑）" % v,
               "Hello, world!" in seg, raw(seg))
-        check("[缺口跟踪] ③ 的失败点 = 主程序装载区间（4GiB..4GiB+64KiB、base=0、无 load bias）",
-              REASON_WINDOW in seg, raw(seg))
+        check("[缺口已修] ③ 的 PIE 主程序按**程序头布局 + load bias**装载（无 outside-user-window）",
+              REASON_WINDOW not in seg and "[ELF64] load path=/lxcorpus/gnuhello" in seg, raw(seg))
 
         # ================= ④ 真 .deb 通过 /bin/vpkg =================
         print("--- ④ 真 .deb：原样 xz / gzip（带 Depends）/ gzip（去 Depends）---")
@@ -540,8 +543,9 @@ def main():
         segs["deb_run"] = seg
         check("④ **装出来的程序真能跑**（run %s 打印 \"Hello, world!\"）" % v,
               "Hello, world!" in seg, raw(seg))
-        check("[缺口跟踪] ④ 跑不动的失败点与 ③ 同一处（主程序装载区间）",
-              REASON_WINDOW in seg or REASON_SIZE in seg, raw(seg))
+        check("[缺口已修] ④ 装出来的程序走同一条装载路径（无 outside-user-window / reason=size）",
+              REASON_WINDOW not in seg and REASON_SIZE not in seg and
+              "[ELF64] load path=/usr/bin/hello" in seg, raw(seg))
 
         log = vm.log()
         for needle in PANIC_MARKERS:

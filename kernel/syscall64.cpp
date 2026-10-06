@@ -146,7 +146,7 @@ int  proc64_current_pid64()                  __attribute__((weak));
 int  proc64_current_ppid64()                 __attribute__((weak));
 int  proc64_exe_path64(char*, uint32_t)      __attribute__((weak));
 uint64_t proc64_brk64(uint64_t)              __attribute__((weak));
-int64_t  proc64_mmap64(uint64_t, uint64_t, uint64_t)      __attribute__((weak));
+int64_t  proc64_mmap64(uint64_t, uint64_t, uint64_t, uint64_t, int, uint64_t) __attribute__((weak));
 int64_t  proc64_munmap64(uint64_t, uint64_t)              __attribute__((weak));
 int64_t  proc64_mprotect64(uint64_t, uint64_t, uint64_t)  __attribute__((weak));
 int64_t  proc64_fork64(pt_regs64*)                        __attribute__((weak));
@@ -576,7 +576,10 @@ static int lx64_user_str64(uint64_t uva, char* out, uint32_t cap) {
 //   * open/read/close/lseek/fstat/dup/fsync 全部转调 fd64_*；
 //   * 终端文件命令与 ring3 系统调用因此看到**同一张表**（如实边界见 fd64.h）；
 //   * 读不到 offset 原语的限制由 fd64 内部处理（它读整文件到自己的缓冲再切片）。
-static const uint32_t LX64_PATH_MAX = 32;       // 老限制（单层路径）：保留给 readlink 等旧调用点
+// ★ 本批：路径缓冲 32 -> 128（= VFS64_PATH_MAX）。老值 32 让**所有 ≥31 字符的路径**在 execve 上
+//   直接 `[SYSCALL] deny nr=59` + EFAULT（实测：/lxcorpus/dynhello-with-a-long-name.elf = 38 字符）。
+//   同一个常量下面还有 readlink 等旧调用点，一起放宽（它们本来也按 VFS64_PATH_MAX 设计）。
+static const uint32_t LX64_PATH_MAX = 128;
 // ★ A4-2a：路径解析缓冲 —— 相对路径要拼上 cwd，最长 = VFS64_PATH_MAX(128)。
 static const uint32_t LX64_PATHR_MAX = 128;
 static const uint32_t LX64_READ_MAX = 4096;     // 单次 read 上限（fd64 内部读整文件，这里只限制拷贝量）
@@ -838,27 +841,111 @@ static int64_t lx64_lseek64(uint64_t nr, uint64_t fd, int64_t off, uint64_t when
     return r;
 }
 
-// ---- 9）mmap：用户窗口内的 bump 分配器 ----
-static uint64_t g_lx_mmap_next64 = 0;
-static int64_t lx64_mmap64(uint64_t len, uint64_t flags, uint64_t addr) {
+// ---- 9）mmap：用户窗口内的**首适配**分配器（★ 本批：匿名 + **文件映射** + MAP_FIXED 语义）----
+// 支持（Linux 号段/位值）：
+//   MAP_SHARED(0x01) / MAP_PRIVATE(0x02) / MAP_FIXED(0x10) / MAP_ANONYMOUS(0x20)
+//   MAP_FIXED_NOREPLACE(0x100000)（占用时 -EEXIST，与 Linux 同 —— glibc 的 ld.so 靠它做重试）
+// 语义（如实，见报告边界）：
+//   * **文件映射**（fd >= 0 且没有 MAP_ANONYMOUS）：把文件 [off, off+len) 按页**读进**新页 ——
+//     这就是 MAP_PRIVATE 的正确落地（读私有副本）。MAP_SHARED 文件映射（要写回文件）**不支持**，
+//     返回 -EINVAL；超出文件末尾的页按 0 填充（Linux 是 SIGBUS，这里更宽 —— 如实写明）。
+//   * MAP_FIXED：目标区间若已映射，先逐页解除映射并回收物理页（Linux 语义 = 丢弃旧内容）；
+//     落进 DEV/SHM 窗（设备 BAR / shm 共享页）一律拒绝，绝不回收那些页。
+//   prot 位 = PROT_READ(1)/PROT_WRITE(2)/PROT_EXEC(4)：**先按 P|W|U 映射并写内容、最后按 prot 收紧**
+//   （与 elf64.cpp 的做法同一个理由：CR0.WP=1 时 ring0 也写不了只读页）。
+static void    lx64_mmap_apply_prot64(uint64_t va, uint64_t len, uint64_t prot);
+static uint64_t g_lx_mmap_next64 = 0;         // 非进程模式（引导期/UEFI 降级）的 mmap 起点提示
+static int64_t lx64_mmap64(uint64_t len, uint64_t flags, uint64_t addr, uint64_t prot, int fd, uint64_t off) {
     if (len == 0) return -LX64_EINVAL;
-    uint64_t n = (len + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
-    if (g_lx_mmap_next64 == 0) g_lx_mmap_next64 = USER64_MMAP_VA64;
-    uint64_t va;
-    if (flags & 0x10u) {                                       // MAP_FIXED：按调用方给的地址
-        va = addr & ~((uint64_t)PAGE_SIZE_64 - 1);
-    } else {
-        va = (g_lx_mmap_next64 + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
+    const uint64_t n = (len + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
+    const uint64_t win_top = USER64_CODE_VA64 + USER64_WINDOW_BYTES64;
+    const bool anon = (flags & 0x20u) != 0 || fd < 0;   // ★ fd<0 也算匿名（Linux 同：-1 + 无 ANONYMOUS 仍当匿名）
+    const bool fixed = (flags & 0x10u) != 0;
+    const bool noreplace = (flags & 0x100000u) != 0;
+    if (!anon && fd >= 0) {
+        if (flags & 0x1u) return -LX64_EINVAL;               // MAP_SHARED 文件映射：不支持写回
+    } else if (!anon) {
+        return -LX64_EINVAL;                                 // 既没 fd 也没 ANONYMOUS
     }
-    if (va < USER64_MMAP_VA64 || va > USER64_CODE_VA64 + USER64_WINDOW_BYTES64) return -LX64_ENOMEM;
-    if (n > (USER64_CODE_VA64 + USER64_WINDOW_BYTES64) - va) return -LX64_ENOMEM;
+    if (n > USER64_WINDOW_BYTES64) return -LX64_ENOMEM;
+
+    // ---- 落点 ----
+    uint64_t va = 0;
+    if (fixed) {
+        va = addr & ~((uint64_t)PAGE_SIZE_64 - 1);
+        if (va < USER64_MMAP_VA64 || n > win_top - va) return -LX64_ENOMEM;
+    } else {
+        const uint64_t hint = addr & ~((uint64_t)PAGE_SIZE_64 - 1);
+        if (hint >= USER64_MMAP_VA64 && user64_find_free64(hint, n) == hint) va = hint;
+        else va = user64_find_free64(g_lx_mmap_next64 ? g_lx_mmap_next64 : USER64_MMAP_VA64, n);
+        if (va == 0) return -LX64_ENOMEM;
+    }
+    // DEV/SHM 映射窗：里面是设备 BAR / shm 对象页，绝不能被 mmap 覆盖（回收会污染页池）
+    if (va + n > USER64_LOADER_BIG_TOP_VA64) return -LX64_ENOMEM;
+
+    // ---- MAP_FIXED 的"丢弃旧内容" + NOREPLACE 的 EEXIST ----
+    if (fixed) {
+        for (uint64_t a = va; a < va + n; a += PAGE_SIZE_64) {
+            if (user64_page_is_user_ok64(a)) {
+                if (noreplace) return -LX64_EEXIST;
+                const uint64_t ph = user64_unmap_page64(a);
+                if (ph) page_free_64((void*)(uintptr_t)ph);
+            }
+        }
+    }
+
     for (uint64_t a = va; a < va + n; a += PAGE_SIZE_64) {
         uint64_t phys = 0;
-        if (!user64_map_page64(a, PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64, 1, &phys)) return -LX64_ENOMEM;
+        if (!user64_map_page64(a, PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64, 1, &phys)) {
+            for (uint64_t b = va; b < a; b += PAGE_SIZE_64) {          // 回滚
+                const uint64_t ph = user64_unmap_page64(b);
+                if (ph) page_free_64((void*)(uintptr_t)ph);
+            }
+            user64_paging_sync64();
+            return -LX64_ENOMEM;
+        }
     }
     user64_paging_sync64();
+
+    // ---- 文件内容：按页读进来（MAP_PRIVATE 的读副本）----
+    if (!anon && fd >= 0) {
+        int vol = -1;
+        char path[FD64_PATH_MAX];
+        if (fd64_where64(fd, &vol, path, (int)sizeof(path)) != 0) {
+            for (uint64_t b = va; b < va + n; b += PAGE_SIZE_64) {
+                const uint64_t ph = user64_unmap_page64(b);
+                if (ph) page_free_64((void*)(uintptr_t)ph);
+            }
+            user64_paging_sync64();
+            return -LX64_EBADF;
+        }
+        for (uint64_t k = 0; k < n; k += PAGE_SIZE_64) {
+            uint32_t got = 0;
+            uint8_t* dstp = (uint8_t*)(uintptr_t)(va + k);
+            if (fs64_read_range64(vol, path, (uint32_t)(off + k), dstp, (uint32_t)PAGE_SIZE_64, &got) != 0) {
+                got = 0;                                        // 读失败/到 EOF：这一页按 0（见函数头边界）
+            }
+            for (uint32_t b = got; b < PAGE_SIZE_64; b++) dstp[b] = 0;
+            if (got < PAGE_SIZE_64) break;                      // 到文件末尾：剩下的页保持 0
+        }
+    }
+
+    lx64_mmap_apply_prot64(va, n, prot);                        // 最后按 prot 收紧（可写/可执行位）
     if (va + n > g_lx_mmap_next64) g_lx_mmap_next64 = va + n;
     return (int64_t)va;
+}
+
+// ---- 9b）mmap 的 prot 落地：只把 PROT_EXEC 真落地（不加 NX），PROT_WRITE 不强制 ----
+// ★ 如实边界：本内核的 mmap 历来给的就是**可写页**，自有动态链接器（user/libs/ldvimtu.so）
+//   依赖这条（实测：按 prot 真收紧成只读之后，ldvimtu 在装载 libfoo.so 阶段就停了）。
+//   而 musl/glibc 的动态链接器需要的是"库的 .text 可执行"（这里真落地）；
+//   写回文件（MAP_SHARED）本来就不支持（-EINVAL）。
+static void lx64_mmap_apply_prot64(uint64_t va, uint64_t len, uint64_t prot) {
+    const uint64_t f = PTE_USER_64 | PTE_WRITE_64
+                     | ((prot & 4u) ? 0u : PTE_NX_64);
+    const uint64_t n = (len + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
+    for (uint64_t a = va; a < va + n; a += PAGE_SIZE_64) user64_remap_flags64(a, f);
+    user64_paging_sync64();
 }
 
 // ---- 10）mprotect：逐页改叶子权限（PROT_READ=1 / WRITE=2 / EXEC=4）----
@@ -978,7 +1065,7 @@ static int64_t lx64_writev64(uint64_t nr, uint64_t fd, uint64_t iov_va, uint64_t
     if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     if (fd == 0) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     if (iovcnt == 0) return 0;
-    if (iovcnt > 8) { syscall64_deny64(nr, iovcnt); return -LX64_EINVAL; }
+    if (iovcnt > 64) { syscall64_deny64(nr, iovcnt); return -LX64_EINVAL; }
     if (!user64_range_ok64(iov_va, iovcnt * 16)) { syscall64_deny64(nr, iov_va); return -LX64_EFAULT; }
     int64_t total = 0;
     for (uint64_t i = 0; i < iovcnt; i++) {
@@ -1001,7 +1088,7 @@ static int64_t lx64_writev64(uint64_t nr, uint64_t fd, uint64_t iov_va, uint64_t
 static int64_t lx64_readv64(uint64_t nr, uint64_t fd, uint64_t iov_va, uint64_t iovcnt) {
     if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     if (iovcnt == 0) return 0;
-    if (iovcnt > 8) { syscall64_deny64(nr, iovcnt); return -LX64_EINVAL; }
+    if (iovcnt > 64) { syscall64_deny64(nr, iovcnt); return -LX64_EINVAL; }
     if (!user64_range_ok64(iov_va, iovcnt * 16)) { syscall64_deny64(nr, iov_va); return -LX64_EFAULT; }
     int64_t total = 0;
     for (uint64_t i = 0; i < iovcnt; i++) {
@@ -1070,9 +1157,14 @@ static int64_t lx64_brk_disp64(uint64_t addr) {
     if (lx64_per_proc_mm64()) return (int64_t)proc64_brk64(addr);
     return lx64_brk64(addr);
 }
-static int64_t lx64_mmap_disp64(uint64_t len, uint64_t flags, uint64_t addr) {
-    if (lx64_per_proc_mm64()) return proc64_mmap64(len, flags, addr);
-    return lx64_mmap64(len, flags, addr);
+static int64_t lx64_mmap_disp64(uint64_t len, uint64_t flags, uint64_t addr, uint64_t prot,
+                                int fd, uint64_t off) {
+    if (lx64_per_proc_mm64()) return proc64_mmap64(len, flags, addr, prot, fd, off);
+    return lx64_mmap64(len, flags, addr, prot, fd, off);
+}
+// 兼容老调用点（纯匿名映射：没有文件 fd）
+static int64_t lx64_mmap_disp64(uint64_t len, uint64_t flags, uint64_t addr, uint64_t prot) {
+    return lx64_mmap_disp64(len, flags, addr, prot, -1, 0);
 }
 static int64_t lx64_mprotect_disp64(uint64_t addr, uint64_t len, uint64_t prot) {
     if (lx64_per_proc_mm64()) return proc64_mprotect64(addr, len, prot);
@@ -1205,6 +1297,32 @@ static int64_t lx64_stat_path64(uint64_t nr, uint64_t path_va, uint64_t st_va) {
     lx64_fill_stat64_ex(st, mode, si.size, si.uid, si.gid);
     lx64_copy_to_user64(st_va, st, 144);
     return 0;
+}
+
+// ---- 17）pread64（★ 本批新增）：从文件偏移 off 读 len 字节，**不动** fd 的游标 ----
+// 为什么必须有它：动态链接器（musl 的 map_library）读 ELF 头/程序头表用的是 pread；
+// glibc 的 ld.so 也有 pread 路径。老实现没有这个号 -> `[SYSCALL] enosys nr=17`。
+// 落地：fd -> (统一卷号, 规范化路径)（fd64_where64）-> fs64_read_range64（按偏移分块读）——
+// 与 fd64 的普通 read 走同一套底层原语，但**不**碰 OpenFile64.off（Linux 语义）。
+static int64_t lx64_pread64(uint64_t nr, uint64_t fd_va, uint64_t buf, uint64_t len, uint64_t off) {
+    const int fd = (int)fd_va;
+    if (len == 0) return 0;
+    if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd_va); return -LX64_EBADF; }
+    if (fd <= 2 && !fd64_slot_used64(fd)) { syscall64_deny64(nr, fd_va); return -LX64_EBADF; }
+    if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
+    if (len > LX64_READ_MAX) len = LX64_READ_MAX;
+    int vol = -1;
+    char path[FD64_PATH_MAX];
+    if (fd64_where64(fd, &vol, path, (int)sizeof(path)) != 0) {
+        syscall64_deny64(nr, fd_va);
+        return -LX64_EINVAL;                         // pipe/tty 之类没有偏移语义（Linux 是 -ESPIPE）
+    }
+    uint32_t got = 0;
+    if (fs64_read_range64(vol, path, (uint32_t)off, (void*)(uintptr_t)buf, (uint32_t)len, &got) != 0) {
+        syscall64_deny64(nr, fd_va);
+        return -LX64_EIO;
+    }
+    return (int64_t)got;                             // 到 EOF 返回短读（Linux 同）
 }
 // ---- 21）access：真按 r/w/x 判定（★ P4；FAT/旧卷没有权限模型 -> 恒允许）----
 // ★ A4-2a：接受相对路径。
@@ -2132,8 +2250,10 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 5:   return lx64_fstat64(nr, a1, a2);
     case 6:   return lx64_stat_path64(nr, a1, a2);                 // lstat：同上（无符号链接）
     case 8:   return lx64_lseek64(nr, a1, (int64_t)a2, a3);
-    case 9:   return lx64_mmap_disp64(a2, a4, a1);                 // arch 无关：len/prot/flags/...
-    case 10:  return lx64_mprotect_disp64(a1, a2, a3);
+    case 9:   return lx64_mmap_disp64(a2, a4, a1, a3, (int)(int32_t)a5, a6);   // mmap(addr,len,prot,flags,fd,off)
+    case 10:  return lx64_mprotect_disp64(a1, a2, a3);              // ★ 本批：这条 case 被我自己的编辑误删过（glibc 的 RELRO mprotect 因此拿到 -ENOSYS）
+    case 17:  return lx64_pread64(nr, a1, a2, a3, a4);              // ★ 本批：pread64(fd,buf,len,off)
+    case 262: return lx64_stat_path64(nr, a2, a3);                  // ★ 本批：newfstatat(dirfd,path,buf,flags)
     case 11:  return lx64_munmap_disp64(a1, a2);                   // ★ 收口：这条 case 在 A4-4 的 WIP 里被误删 —— musl/libc 的 munmap 会掉进 default -> [SYSCALL] enosys nr=11（musl64_test/dynlink64_test 的"不得出现 enosys"断言必失败）。恢复。
     case 12:  return lx64_brk_disp64(a1);                           // brk
     case 13:  return lx64_rt_sigaction64(a1, a2, a3, a4);          // ★ A4-5：真注册（handler/restorer/mask）

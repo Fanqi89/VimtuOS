@@ -73,12 +73,16 @@ DEB_LIBC6_FALLBACK = DEB_BASE + "/g/glibc/libc6_2.36-9+deb12u14_amd64.deb"
 
 # 内核侧硬约束（**只读引用**，唯一真源在 kernel/；这里只用于报告/自检，别当权威）
 KLIMITS = {
-    "elf_max_file_bytes": 96 * 1024,              # kernel/elf64.h:80 ELF64_MAX_FILE_BYTES64
-    "main_lo": 0x100000000,                       # kernel/elf64.cpp:75 e64_lo64
-    "main_hi": 0x100010000,                       # kernel/elf64.cpp:76 e64_hi64（64 KiB 窗口）
-    "interp_lo": 0x100090000,                     # USER64_MMAP_VA64
-    "interp_top": 0x100100000,                    # USER64_INTERP_TOP_VA64
-    "max_phdr": 16,                               # ELF64_MAX_PHDR64
+    # ★ 本批（按段读盘）后的真实口径，逐条对应 kernel/elf64.h + [ELF64] read 打点：
+    "elf_max_file_bytes": 8 * 1024 * 1024,         # ELF64_MAX_FILE_BYTES64 = FS 上限（**拒绝门限**，
+                                                   #   不再是读盘缓冲容量；老值 96 KiB 是整份读时代）
+    "elf_read_chunk": 16384,                       # ELF64_READ_CHUNK64（[ELF64] read … chunk=）
+    "main_lo": 0x100000000,                        # 老装载区（ET_EXEC / 小 PIE）
+    "main_hi": 0x100010000,                        # 老装载区上界 = USER64_STACK_VA64（64 KiB）
+    "interp_lo": 0x100090000,                      # USER64_MMAP_VA64（解释器窗下沿）
+    "interp_top": 0x100100000,                     # USER64_INTERP_TOP_VA64（小解释器窗上沿）
+    "loader_big_top": 0x100DC0000,                 # USER64_LOADER_BIG_TOP_VA64（大解释器/映像/mmap 上界）
+    "max_phdr": 16,                                # ELF64_MAX_PHDR64
     "vfs_max_file_bytes": 8 * 1024 * 1024,
 }
 
@@ -262,7 +266,7 @@ BIG_C = r"""/* ①c 静态 musl，但**故意 > 96 KiB**（kernel/elf64.h:80 的
  */
 #include <stdint.h>
 #include <unistd.h>
-static const char mark[] = "[LXBIG] hello (should never print)\n";
+static const char mark[] = "[LXBIG] hello from 425 KB static musl ELF\n";
 #include "big_blob.h"
 extern int __libc_start_main(int (*main)(int, char**, char**), int argc, char** argv,
                             void (*init_dummy)(void), void (*fini_dummy)(void),
@@ -283,9 +287,13 @@ static void lx_start_c(uint64_t* sp) {
     _exit(127);
 }
 static int lx_main(int argc, char** argv, char** envp) {
-    /* 用 argc 算下标（编译期折不掉）引用一下，别被 --gc-sections 丢掉 */
+    /* 用 argc 算下标（编译期折不掉）引用一下 big_blob —— --gc-sections 下这是它留下的理由 */
+    /* ★ 本批：标记改成"跑起来就打印" —— 老版本写成"应该在装之前就被 reason=size 拒掉"，
+       所以条件故意不成立（永远不打）。现在内核真能把 425 KB 的映像按段读进来跑起来，
+       就用这份标记证明"真跑起来了"；同时读一下 big_blob（--gc-sections 下这是它留下的理由）。 */
     unsigned i = (unsigned)argc & (sizeof(big_blob) - 1u);
-    if (big_blob[i] == 0x7f) write(1, mark, sizeof(mark) - 1);
+    if (big_blob[i] == 0x00) return 1;
+    write(1, mark, sizeof(mark) - 1);
     (void)argv; (void)envp;
     return 0;
 }
@@ -315,6 +323,20 @@ def build_static_hello():
     with open(os.path.join(SRC, "bighello.c"), "w", encoding="utf-8", newline="\n") as f:
         f.write(BIG_C)
     gen_big_blob(os.path.join(SRC, "big_blob.h"))
+    # ★ 本批：bighello 的 .rodata 有 ~411 KB —— 老装载区（4GiB..4GiB+64KiB）装不下，而且它
+    #   会压到内核**固定**的栈/brk/邮箱/自检页（4GiB+64KiB..4GiB+576KiB）、以及 mmap 区。
+    #   所以这份**夹具**改用一份"把映像放到 4GiB+8MiB"的链接脚本：内核按 ET_EXEC 的 p_vaddr
+    #   原样装载（bias=0），落在窗口里的程序映像窗（mmap 起点之上、DEV/SHM 窗之下）。
+    #   注意：这不是放宽断言 —— 文件仍是 425,608 B（>96 KiB，仍要真从盘上按段分块读进来跑），
+    #   只是"一个 416 KB 的映像该放在哪"这个夹具侧的落点选择。
+    ld_src = os.path.join(ROOT, "tools", "musl_hello64.ld")
+    with open(ld_src, encoding="utf-8") as f:
+        ld_txt = f.read()
+    ld_big = ld_txt.replace("0x0000000100000000", "0x0000000100800000")
+    if ld_big == ld_txt:
+        raise RuntimeError("链接脚本里没找到 0x0000000100000000（tools/musl_hello64.ld 变了吗？）")
+    with open(os.path.join(SRC, "musl_hello64_big.ld"), "w", encoding="utf-8", newline="\n") as f:
+        f.write(ld_big)
     script = """
 MUSL="third_party/musl"
 INC="-nostdinc -isystem $MUSL/include -isystem $MUSL/arch/x86_64 -isystem $MUSL/arch/generic -isystem $MUSL/obj/include"
@@ -324,12 +346,14 @@ LIBC_A="$MUSL/lib/libc.a"
 [ -f "$LIBC_A" ] || { echo "缺 $LIBC_A（先跑 bash build64.sh）"; exit 2; }
 echo "    musl 静态库：$LIBC_A（$(stat -c%s "$LIBC_A") B）"
 for n in stathello bighello; do
+  LD=tools/musl_hello64.ld
+  if [ "$n" = bighello ]; then LD=build64/lxcorpus/src/musl_hello64_big.ld; fi
   clang --target=x86_64-linux-gnu $CF -c "build64/lxcorpus/src/$n.c" -o "build64/lxcorpus/.obj/$n.o"
   # 链接顺序与 musl 的规格一致：自写 _start 在程序对象里 -> 程序 -> libc.a
   ld.lld -m elf_x86_64 -static --gc-sections -z noexecstack \\
-         -T tools/musl_hello64.ld -o "build64/lxcorpus/$n.elf" \\
+         -T "$LD" -o "build64/lxcorpus/$n.elf" \\
          "build64/lxcorpus/.obj/$n.o" "$LIBC_A"
-  echo "    ① $n.elf = $(stat -c%s "build64/lxcorpus/$n.elf") B"
+  echo "    ① $n.elf = $(stat -c%s "build64/lxcorpus/$n.elf") B（LD=$LD）"
 done
 """
     run_bash("01_static", script)
@@ -383,6 +407,44 @@ static int lx_main(int argc, char** argv, char** envp) {
 """
 
 
+# ★ 本批：ld-musl 自举缺的 3 个编译器运行时助手（说明写在生成出来的文件头里）。
+MUSL_CRT_HELPERS_C = r"""/* musl_crt_helpers.c（由 tools/lxcorpus_build.py 生成；别手改 build64 里的副本）
+ * ---------------------------------------------------------------------------
+ * 为什么存在：musl 的复数源码（src/complex/*.c）在编译时会生成对编译器运行时助手
+ * __muldc3 / __mulsc3 / __mulxc3 的**外部引用**（gcc/clang 都会发）。
+ * musl 自己的 Makefile 链接 libc.so 时由 libgcc 提供这三个符号；本脚本手工用 ld.lld
+ * 链接（没有 libgcc），于是它们变成 libc.so / ld-musl 自己的**未定义动态符号** ——
+ * ld-musl 装载**自己**时报（实测原文）：
+ *     Error relocating /lib/ld-musl-x86_64.so.1: __muldc3: symbol not found
+ * 然后 _exit(127)，于是任何"动态 musl 程序"都跑不起来。
+ *
+ * 这里给出**简单形式**的实现（real = a*c - b*d、imag = a*d + b*c）：
+ *   * 只有**真的调用复数乘法**时才会走到这里；本仓库的语料/demo 都不调用，
+ *     它们只需要"符号存在"；
+ *   * 如实标注边界：C99 附录 G 的 Inf*0 = NaN 之类边角情形**没有**按 libgcc 的完整
+ *     规则重算（libgcc 的 __muldc3 有四十多行专门处理它）。真实构建里这三个符号
+ *     来自 libgcc/compiler-rt，不是 libc 的一部分。
+ */
+double _Complex __muldc3(double a, double b, double c, double d) {
+    double _Complex z;
+    __real__ z = a * c - b * d;
+    __imag__ z = a * d + b * c;
+    return z;
+}
+float _Complex __mulsc3(float a, float b, float c, float d) {
+    float _Complex z;
+    __real__ z = a * c - b * d;
+    __imag__ z = a * d + b * c;
+    return z;
+}
+long double _Complex __mulxc3(long double a, long double b, long double c, long double d) {
+    long double _Complex z;
+    __real__ z = a * c - b * d;
+    __imag__ z = a * d + b * c;
+    return z;
+}
+"""
+
 def musl_shared_objs():
     """"obj/src/**/*.lo + obj/compat/**/*.lo + obj/ldso/{dlstart,dynlink}.lo"
     —— 与 musl 自己的 Makefile 同一口径（LOBJS + LDSO_OBJS）。返回相对 musl 目录的路径。"""
@@ -401,6 +463,9 @@ def musl_shared_objs():
 
 def build_musl_shared(reuse=False):
     spec = musl_shared_objs()
+    os.makedirs(SRC, exist_ok=True)
+    with open(os.path.join(SRC, "musl_crt_helpers.c"), "w", encoding="utf-8", newline="\n") as f:
+        f.write(MUSL_CRT_HELPERS_C)
     if len(spec) < 100:
         return None, "musl 的 PIC 目标文件（obj/**/*.lo）只有 %d 个 —— 先在 third_party/musl 里编一遍" % len(spec)
     objs = os.path.join(OUT, "musl_libc_objs.rsp")
@@ -414,9 +479,20 @@ def build_musl_shared(reuse=False):
         #   （$(CC) ... -nostdlib -shared -Wl,-e,_dlstart -o lib/libc.so $(LOBJS) $(LDSO_OBJS)）。
         run_bash("02_musl_shared", """
 cd third_party/musl
-OBJS=$(cygpath -w "$(pwd)/../.." 2>/dev/null || true)
+# ★ 本批：ld-musl（= libc.so）自己有 3 个**由编译器内置函数产生**的外部引用：
+#   __muldc3 / __mulsc3 / __mulxc3（_Complex 乘法的 libgcc 助手）。musl 的 Makefile 靠
+#   libgcc 提供它们；本脚本手工 ld.lld 链接（没有 libgcc）时它们成了**未定义动态符号**，
+#   于是 ld-musl 装载**自己**时报 `Error relocating /lib/ld-musl-x86_64.so.1: __muldc3:
+#   symbol not found` 并 _exit(127)（实测：动态 musl 程序 thus 跑不起来）。
+#   这里补一个只含这 3 个**简单形式**实现的 .o（见 musl_crt_helpers.c 的说明），
+#   只为让这条自举路径成立 —— 不是"改断言"，是补上真实构建里由 libgcc 提供的那部分。
+clang --target=x86_64-linux-gnu -O2 -fPIC -fno-builtin -c \\
+      "../../build64/lxcorpus/src/musl_crt_helpers.c" \\
+      -o "../../build64/lxcorpus/.obj/musl_crt_helpers.o"
 ld.lld -m elf_x86_64 -shared -e _dlstart -soname libc.so -z noexecstack \\
-       -o "../../build64/lxcorpus/libc.so" "@../../build64/lxcorpus/musl_libc_objs.rsp"
+       -o "../../build64/lxcorpus/libc.so" \\
+       "../../build64/lxcorpus/.obj/musl_crt_helpers.o" \\
+       "@../../build64/lxcorpus/musl_libc_objs.rsp"
 """)
     b = open(dst, "rb").read()
     inf = elf_info(b)
@@ -462,9 +538,9 @@ CF="$INC -O2 -fPIC -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unw
 L="build64/lxcorpus/libs"
 mkdir -p build64/lxcorpus/.obj
 clang --target=x86_64-linux-gnu $CF -c build64/lxcorpus/src/dynhello.c -o build64/lxcorpus/.obj/dynhello.o
-for spec in "dynhello.elf:/lib/ld-musl-x86_64.so.1" "dynhello_gnuinterp.elf:/lib64/ld-linux-x86-64.so.2"; do
+for spec in "dynhello.elf:/lib/ld-musl-x86_64.so.1"; do
   out="${spec%%:*}"; interp="${spec##*:}"
-  # 主程序必须钉在 4GiB（kernel/elf64.cpp:75 的 e64_lo64；base=0、没有 load bias）
+  # 主程序钉在 4GiB（自研程序的老装载区；ET_EXEC: bias=0、按 p_vaddr 原样装）
   ld.lld -m elf_x86_64 -no-pie --image-base 0x100000000 -e _start -z noexecstack \\
          --allow-shlib-undefined \\
          --dynamic-linker "$interp" \\
@@ -488,6 +564,43 @@ done
                  "OK" if ok else "★ 自检失败"))
         if not ok:
             raise RuntimeError("%s 的 PT_INTERP/PT_DYNAMIC 自检失败" % out)
+
+
+def build_dyn_hello_glibc(libc6_path, ldso_host):
+    """②b：**同一份源码**（build_dyn_hello 编出来的 dynhello.o）改用 **glibc 运行时**链接：
+      DT_NEEDED = libc.so.6、PT_INTERP = /lib64/ld-linux-x86-64.so.2。
+    为什么不再用"musl 程序 + glibc 解释器"：那条路在**任何** Linux 上都跑不起来 ——
+    musl 的 libc.so **自己就是它的动态链接器**（要由自己的 _dlstart 做自举初始化），
+    glibc 的 ld-linux 把它当普通库装载之后，程序调到的 __libc_start_main 是 musl 的，
+    而 musl 的内部 globals/GOT 从没被初始化 -> 实测在 musl 的 __libc_start_main 里 #PF
+    （cr2=0、rip 落在 libc.so 的 .text 里）。这是两个运行时互斥，不是内核缺陷。
+    改成 glibc 运行时后：内核那条路（PT_INTERP 真解释器装载 -> 库映射 -> 重定位 ->
+    AT_ENTRY 进 ring3）逐条不变，而且**真能跑出标记**（DYN_MARK）。
+    编译用 musl 头文件（同一份源码），链接用 Debian 的 libc.so.6（同一份源码、换运行时）。"""
+    if not os.path.exists(libc6_path) or not os.path.exists(ldso_host):
+        return False, "缺 glibc 运行时（%s / %s）" % (libc6_path, ldso_host)
+    obj = os.path.join(OUT, ".obj", "dynhello.o")
+    if not os.path.exists(obj):
+        return False, "缺 %s（先跑 build_dyn_hello）" % obj
+    out_host = os.path.join(OUT, "dynhello_gnuinterp.elf")
+    run_bash("03b_dynhello_glibc", """
+export MSYS2_ARG_CONV_EXCL='*'
+ld.lld -m elf_x86_64 -no-pie --image-base 0x100000000 -e _start -z noexecstack \\
+       --allow-shlib-undefined \\
+       --dynamic-linker /lib64/ld-linux-x86-64.so.2 \\
+       -o "build64/lxcorpus/dynhello_gnuinterp.elf" \\
+       build64/lxcorpus/.obj/dynhello.o "build64/lxcorpus/rt64/libc.so.6"
+echo "    ②b dynhello_gnuinterp.elf = $(stat -c%s build64/lxcorpus/dynhello_gnuinterp.elf) B（glibc 运行时）"
+""")
+    cur = patch_interp(out_host, "/lib64/ld-linux-x86-64.so.2")
+    inf = elf_info(open(out_host, "rb").read())
+    ok = (inf["interp"] == "/lib64/ld-linux-x86-64.so.2" and inf["dynamic"] and
+          inf["phdr_in_first_load"] and "libc.so.6" in (inf["needed"] or []))
+    print("    ②b PT_INTERP 修正 %r -> %r（dynamic=%s needed=%s %s）"
+          % (cur, inf["interp"], inf["dynamic"], inf["needed"], "OK" if ok else "★ 自检失败"))
+    if not ok:
+        raise RuntimeError("②b 的 PT_INTERP/DT_NEEDED 自检失败（needed=%s）" % inf["needed"])
+    return True, None
 
 
 # ===========================================================================
@@ -739,6 +852,15 @@ def main():
         item("musl_libc_so", "② musl 共享 libc", os.path.join(OUT, "libc.so"),
              "/lib/libc.so", "0755", "lib", "lib", "动态 hello 的 DT_NEEDED（%s）" % sinfo["note"],
              None, "n/a")
+        # ★ 本批：再把**同一份** musl libc.so 放一份到 /lib/x86_64-linux-gnu/libc.so。
+        #   为什么：②b（同一个动态 hello + **真 glibc 解释器**）里，控制权在 ld-linux 手上，
+        #   它按 ELF 的 DT_NEEDED（"libc.so"，musl 的 soname）去默认搜索路径找 —— 而 glibc 的
+        #   默认路径是 /lib/x86_64-linux-gnu 与 /usr/lib/x86_64-linux-gnu（实测它就找了这两个），
+        #   不含 /lib。放这一份之后 ld-linux 能找到并按 soname 装载它。
+        item("musl_libc_alias", "② musl 共享 libc（glibc 搜索路径别名）", os.path.join(OUT, "libc.so"),
+             "/lib/x86_64-linux-gnu/libc.so", "0755", "lib", "lib",
+             "同一份字节；只为让 glibc 的 ld-linux 在**它的**默认路径里找到 soname=libc.so（②b）",
+             None, "n/a")
     try:
         build_dyn_hello()
     except RuntimeError as ex:
@@ -747,11 +869,7 @@ def main():
         item("musl_dyn", "② 动态 musl 程序", os.path.join(OUT, "dynhello.elf"),
              "/lxcorpus/dynhello.elf", "0755", "exe", "run",
              "PT_INTERP=/lib/ld-musl-x86_64.so.1", DYN_MARK, "fail")
-    if os.path.exists(os.path.join(OUT, "dynhello_gnuinterp.elf")):
-        item("gnu_interp_probe", "②b 动态程序 + glibc 解释器", os.path.join(OUT, "dynhello_gnuinterp.elf"),
-             "/lxcorpus/dynglibc.elf", "0755", "exe", "run",
-             "同一个程序，PT_INTERP 换成 /lib64/ld-linux-x86-64.so.2：把内核带到「解释器」那一步",
-             DYN_MARK, "fail")
+    # ②b 的条目在 ③ 之后登记（它要用 Debian 的 libc.so.6 链接，见 build_dyn_hello_glibc）
     if os.path.exists(os.path.join(OUT, "dynhello.elf")):
         # ★ ⑤：**路径长度**这一条单独测 —— 内核 execve(59) 的路径缓冲只有 32 B
         #   （kernel/syscall64.cpp:579 LX64_PATH_MAX = 32；lx64_user_str64 要求 NUL 在 31 字节内），
@@ -775,6 +893,18 @@ def main():
         item("glibc_libc6", "③ glibc 共享 libc", os.path.join(OUT, "rt64", "libc.so.6"),
              "/lib/x86_64-linux-gnu/libc.so.6", "0755", "lib", "lib",
              "glibc 的默认搜索路径 /lib/x86_64-linux-gnu（没有 /etc/ld.so.cache）", None, "n/a")
+        # ---- ②b：同一份源码、glibc 运行时（PT_INTERP=ld-linux + DT_NEEDED=libc.so.6）----
+        ok_b, err_b = build_dyn_hello_glibc(os.path.join(OUT, "rt64", "libc.so.6"),
+                                            os.path.join(OUT, "rt64", "ld-linux-x86-64.so.2"))
+        if err_b:
+            problems.append("②b 的 glibc 运行时动态 hello：%s" % err_b)
+        elif os.path.exists(os.path.join(OUT, "dynhello_gnuinterp.elf")):
+            item("gnu_interp_probe", "②b 同一份源码 + glibc 运行时（真 ld-linux）",
+                 os.path.join(OUT, "dynhello_gnuinterp.elf"), "/lxcorpus/dynglibc.elf",
+                 "0755", "exe", "run",
+                 "同一份 dynhello.c；DT_NEEDED=libc.so.6 + PT_INTERP=/lib64/ld-linux-x86-64.so.2"
+                 "（为什么不是 musl 程序 + glibc 解释器：见 build_dyn_hello_glibc 的说明）",
+                 DYN_MARK, "fail")
 
     # ---- ④ 真 .deb（/bin/vpkg）-----------------------------------------
     print("== ④ 真 .deb（Debian 原样 xz + 宿主重压 gzip）==")

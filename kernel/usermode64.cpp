@@ -471,6 +471,29 @@ uint64_t user64_page_flags64(uint64_t va) {
 
 int user64_page_is_user_ok64(uint64_t va) { return u64_page_is_user64(va) ? 1 : 0; }
 
+// ★ 本批（Linux 应用）：首适配地找连续空闲区间（见 usermode64.h 的说明）。
+//   实现要点（为什么这样写）：
+//     * 逐页问页表（u64_page_is_user64）而不是查"记账表" —— 映射的真实来源是页表，
+//       映像/解释器/上一轮 mmap 留下的页都能被如实看见；
+//     * 页表页本身不限量（u64_walk64 会按需建中间层），所以只是读，不分配；
+//     * 上界停在 DEV/SHM 窗下沿（它们里面的页是设备 BAR/shm 共享页，绝不能当成"空闲"）。
+uint64_t user64_find_free64(uint64_t hint, uint64_t bytes) {
+    if (bytes == 0) return 0;
+    const uint64_t n = (bytes + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1);
+    const uint64_t top = USER64_LOADER_BIG_TOP_VA64;
+    uint64_t a = (hint >= USER64_MMAP_VA64) ? ((hint + PAGE_SIZE_64 - 1) & ~((uint64_t)PAGE_SIZE_64 - 1))
+                                            : USER64_MMAP_VA64;
+    if (a < USER64_MMAP_VA64) a = USER64_MMAP_VA64;
+    while (a + n <= top) {
+        uint64_t b = a;
+        while (b < a + n && !u64_page_is_user64(b)) b += PAGE_SIZE_64;
+        if (b >= a + n) return a;                            // 整段都空
+        a = b + PAGE_SIZE_64;                                // 撞到已映射页：从它后面接着找
+    }
+    if (hint > USER64_MMAP_VA64) return user64_find_free64(0, bytes);   // 从 hint 起没找到：从头再找一遍
+    return 0;
+}
+
 // ==================== EFER.NXE ====================
 static void u64_enable_nxe64() {
     uint32_t lo = 0, hi = 0;

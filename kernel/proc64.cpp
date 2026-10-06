@@ -26,6 +26,7 @@
 #include "vfs64.h"          // /proc64.elf 的安装与读取
 #include "syscall64.h"      // SYSCALL64_INSM_FRAME_MARK64（execve 改帧时保持入口标记）
 #include "fd64.h"           // 批次 D：每进程 fd 表（fdtab）+ 引用计数对象（fork/execve/退出都要用）
+#include "fs64.h"           // ★ 本批：mmap 的文件映射按偏移读（fs64_read_range64 / 统一卷分派）
 #include "memlayout64.h"    // ML64_PML4_PHYS（引导期页表自证用）
 #include "mem_64.h"         // page_alloc_64 / page_free_64 / PTE_*
 #include "debug64.h"      // dbg64_* 打点
@@ -49,6 +50,9 @@ static const int64_t P64_ENOMEM  = 12;
 static const int64_t P64_EFAULT  = 14;
 static const int64_t P64_EINVAL  = 22;
 static const int64_t P64_ENOSYS  = 38;
+// ★ 本批：mmap 的文件映射/占位语义要用（与 fd64/syscall64 同一口径）
+static const int64_t P64_EBADF   = 9;
+static const int64_t P64_EEXIST  = 17;
 
 // 这三个 errno 目前没有调用点，但它们是**对外承诺的错误码表**的一部分（与 syscall64 同口径）；
 // static_assert 钉住取值，同时消掉 -Wextra 的"未被引用"告警（本文件要求零告警）。
@@ -159,7 +163,7 @@ static inline uint64_t p64_rd_cr364() { uint64_t v; __asm__ volatile("mov %%cr3,
 static inline uint64_t p64_align_up64(uint64_t v) { return (v + 0xFFFULL) & ~0xFFFULL; }
 static inline bool p64_canonical64(uint64_t v) { return ((v >> 47) == 0) || ((v >> 47) == 0x1FFFFULL); }
 // ★ A5 前置：关中断/恢复（"任务 create + 绑定进程"必须原子，见 proc64_start_elf64/fork 的说明）。
-//   为什么不用 task64 的现成助手：那里没有导出；这里只需要保存 RFLAGS.IF 并在之后恢复，
+int64_t  proc64_mmap64(uint64_t len, uint64_t flags, uint64_t addr, uint64_t prot, int fd, uint64_t off);
 //   与 mem64.cpp 的同名助手同一套写法（pushfq/popfq + cli/sti）。
 static inline uint64_t p64_irq_save64() {
     uint64_t f = 0;
@@ -1584,28 +1588,53 @@ uint64_t proc64_brk64(uint64_t addr) {
     return addr;
 }
 
-int64_t proc64_mmap64(uint64_t len, uint64_t flags, uint64_t addr) {
+// ★ 本批：与 syscall64 的 lx64_mmap64 同语义（匿名 + **文件映射** + MAP_FIXED/NOREPLACE + 首适配），
+//   只是分配起点用**每进程**的 p->mmap_next，并且明确拒绝压到 DEV/SHM 映射窗上。
+//   prot 的处理同一条口径：先 P|W|U 写内容，最后按 prot 收紧（CR0.WP=1 时 ring0 写不了只读页）。
+int64_t proc64_mmap64(uint64_t len, uint64_t flags, uint64_t addr, uint64_t prot, int fd, uint64_t off) {
     Proc64* p = p64_current64();
     if (!p) return -P64_ENOSYS;
     if (len == 0) return -P64_EINVAL;
     if (len > USER64_WINDOW_BYTES64) return -P64_ENOMEM;
     const uint64_t n = p64_align_up64(len);
-    uint64_t va;
-    if (flags & 0x10u) va = p64_page64(addr);                            // MAP_FIXED
-    else va = p64_align_up64(p->mmap_next ? p->mmap_next : USER64_MMAP_VA64);
-    if (va < USER64_MMAP_VA64) return -P64_ENOMEM;
-    if (n > (USER64_CODE_VA64 + USER64_WINDOW_BYTES64) - va) return -P64_ENOMEM;
-    // ★ A5 前置：mmap 不许落进 shm 映射窗（那一段的页帧属于 shm 对象，被 mmap 覆盖会
-    //   变成\"进程自己的页\"，退出时就会被 page_free —— 把共享页还回页池）。
-    if (va + n > SHM64_WINDOW_VA64 && va < SHM64_WINDOW_VA64 + SHM64_WINDOW_BYTES64) {
-        return -P64_ENOMEM;
+    const bool anon = (flags & 0x20u) != 0 || fd < 0;   // ★ fd<0 也算匿名（Linux 同）
+    const bool fixed = (flags & 0x10u) != 0;
+    const bool noreplace = (flags & 0x100000u) != 0;
+    if (!anon && fd >= 0) {
+        if (flags & 0x1u) return -P64_EINVAL;                 // MAP_SHARED 文件映射：不支持写回
+    } else if (!anon) {
+        return -P64_EINVAL;
     }
 
-    // ★ 本批：设备 BAR 映射窗同理（里面是 MMIO 物理地址，被 mmap 覆盖会被当成进程自己的页回收）。
-    if (va + n > DEV64_WINDOW_VA64 && va < DEV64_WINDOW_VA64 + DEV64_WINDOW_BYTES64) {
-        return -P64_ENOMEM;
+    uint64_t va = 0;
+    if (fixed) {
+        va = p64_page64(addr);
+        if (va < USER64_MMAP_VA64) return -P64_ENOMEM;
+    } else {
+        const uint64_t hint = p64_page64(addr);
+        if (hint >= USER64_MMAP_VA64 && user64_find_free64(hint, n) == hint) va = hint;
+        else va = user64_find_free64(p->mmap_next ? p->mmap_next : USER64_MMAP_VA64, n);
+        if (va == 0) return -P64_ENOMEM;
     }
-    uint32_t made = 0;
+    if (n > (USER64_CODE_VA64 + USER64_WINDOW_BYTES64) - va) return -P64_ENOMEM;
+    // ★ A5 前置：mmap 不许落进 shm 映射窗（那一段的页帧属于 shm 对象，被 mmap 覆盖会
+    //   变成"进程自己的页"，退出时就会被 page_free —— 把共享页还回页池）。
+    if (va + n > SHM64_WINDOW_VA64 && va < SHM64_WINDOW_VA64 + SHM64_WINDOW_BYTES64) return -P64_ENOMEM;
+    // ★ 本批：设备 BAR 映射窗同理；DEV/SHM 窗以上的窗口顶区一律不分配。
+    if (va + n > DEV64_WINDOW_VA64 && va < DEV64_WINDOW_VA64 + DEV64_WINDOW_BYTES64) return -P64_ENOMEM;
+    if (va + n > USER64_LOADER_BIG_TOP_VA64) return -P64_ENOMEM;
+
+    // MAP_FIXED：先丢弃旧内容（Linux 语义）；NOREPLACE：占用就 -EEXIST（给 ld.so 重试用）
+    if (fixed) {
+        for (uint64_t a = va; a < va + n; a += PAGE_SIZE_64) {
+            if (user64_page_is_user_ok64(a)) {
+                if (noreplace) return -P64_EEXIST;
+                const uint64_t ph = user64_unmap_page64(a);
+                if (ph) page_free_64((void*)(uintptr_t)ph);
+            }
+        }
+        user64_paging_sync64();
+    }
     for (uint64_t a = va; a < va + n; a += PAGE_SIZE_64) {
         uint64_t phys = 0;
         if (!user64_map_page64(a, PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64, 1, &phys)) {
@@ -1615,16 +1644,43 @@ int64_t proc64_mmap64(uint64_t len, uint64_t flags, uint64_t addr) {
                 if (ph) page_free_64((void*)(uintptr_t)ph);
             }
             user64_paging_sync64();
-            (void)made;
             return -P64_ENOMEM;
         }
-        made++;
     }
     user64_paging_sync64();
+
+    // 文件映射：按页从盘上读进来（MAP_PRIVATE 的读副本；末尾不足的页按 0 补齐）
+    if (!anon && fd >= 0) {
+        int vol = -1;
+        char path[FD64_PATH_MAX];
+        if (fd64_where64(fd, &vol, path, (int)sizeof(path)) != 0) {
+            for (uint64_t b = va; b < va + n; b += PAGE_SIZE_64) {
+                const uint64_t ph = user64_unmap_page64(b);
+                if (ph) page_free_64((void*)(uintptr_t)ph);
+            }
+            user64_paging_sync64();
+            return -P64_EBADF;
+        }
+        for (uint64_t k = 0; k < n; k += PAGE_SIZE_64) {
+            uint32_t got = 0;
+            uint8_t* dstp = (uint8_t*)(uintptr_t)(va + k);
+            if (fs64_read_range64(vol, path, (uint32_t)(off + k), dstp, (uint32_t)PAGE_SIZE_64, &got) != 0) got = 0;
+            for (uint32_t b = got; b < PAGE_SIZE_64; b++) dstp[b] = 0;
+            if (got < PAGE_SIZE_64) break;
+        }
+    }
+
+    // prot 落地（★ 与 syscall64 的 lx64_mmap_apply_prot64 同一口径：只把 PROT_EXEC 真落地，
+    //   PROT_WRITE 不强制 —— 本内核的 mmap 历来给可写页，自有 ldvimtu 依赖这条）。
+    {
+        const uint64_t f = PTE_USER_64 | PTE_WRITE_64
+                         | ((prot & 4u) ? 0u : PTE_NX_64);
+        for (uint64_t a = va; a < va + n; a += PAGE_SIZE_64) user64_remap_flags64(a, f);
+        user64_paging_sync64();
+    }
     if (va + n > p->mmap_next) p->mmap_next = va + n;
     return (int64_t)va;
 }
-
 int64_t proc64_munmap64(uint64_t addr, uint64_t len) {
     if (len == 0) return 0;
     const uint64_t n = p64_align_up64(len);
@@ -2109,6 +2165,8 @@ int proc64_selftest64() {
     if (DEV64_WINDOW_VA64 + DEV64_WINDOW_BYTES64 != SHM64_WINDOW_VA64) fail |= 8;      // 紧贴不重叠
     if (SHM64_WINDOW_VA64 + SHM64_WINDOW_BYTES64 != USER64_CODE_VA64 + USER64_WINDOW_BYTES64) fail |= 8;
     if (DEV64_WINDOW_VA64 < USER64_MMAP_VA64 + USER64_MMAP_MIN_BYTES64) fail |= 8;     // 不压 mmap 区
+    // ★ 本批：ELF 映像/mmap/大解释器的**可用上界**必须正好等于 DEV 窗下沿（usermode64.h）
+    if (USER64_LOADER_BIG_TOP_VA64 != DEV64_WINDOW_VA64) fail |= 8;
     if (USER64_WINDOW_BYTES64 > (1ULL << 30)) fail |= 8;
     if (USER64_MMAP_VA64 < USER64_BRK_VA64 + USER64_BRK_BYTES64) fail |= 8;
     if (USER64_MMAP_VA64 + USER64_MMAP_MIN_BYTES64 > USER64_CODE_VA64 + USER64_WINDOW_BYTES64) fail |= 8;

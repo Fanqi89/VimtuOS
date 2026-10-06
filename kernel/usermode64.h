@@ -49,6 +49,14 @@ static const uint64_t USER64_MMAP_MIN_BYTES64 = 64ULL * 1024ULL;      // mmap �
 //   而 tests/dynlink64_test.py 把解释器基址的落点上界钉在 4GiB+1MiB（本批不动那条验收断言）。
 //   固定下来 = 解释器地址与放大前逐字节相同；窗口放大只抬高 mmap 区的上界。
 static const uint64_t USER64_INTERP_TOP_VA64 = 0x0000000100100000ULL; // 4GiB+1MiB（与放大前的窗口顶重合）
+// ★ 本批（Linux 应用）：**大解释器 / 大映像**能用的窗口上界 = 窗口顶 - (DEV 窗 2MiB + SHM 窗 256KiB)。
+//   为什么不是窗口顶：窗口顶那 2.25 MiB 被 proc64.h 的 DEV64_WINDOW_VA64 / SHM64_WINDOW_VA64 占着
+//   （里面是设备 BAR 与 shm 共享页 —— 被 ELF 映像或 mmap 覆盖会变成"进程自己的页"，退出时整片
+//   还回页池，症状极难查）。所以**映像/库/大解释器的可用上界**停在 DEV 窗下沿。
+//   实测：musl 的 ld-musl-x86_64.so.1（span 0xBA000 = 762 KiB）在老的 448 KiB 解释器窗里放不下，
+//   落到这里（base = 本值 - span）；glibc 的 ld-linux（span 0x35000 = 212 KiB）仍走老窗（4GiB+1MiB）。
+static const uint64_t USER64_LOADER_BIG_TOP_VA64 =
+    0x0000000100000000ULL + 16ULL * 1024ULL * 1024ULL - (2ULL * 1024ULL * 1024ULL + 256ULL * 1024ULL); // 4GiB+0xDC0000
 
 // ★ A1：用户态**帧缓冲映射区**（5GiB 起，上限 40MiB —— 4K 后备缓冲 3840x2160x4 = 33MiB）。
 //   为什么单开一块、而不是放进上面那个用户窗口：
@@ -140,6 +148,13 @@ void     user64_paging_sync64();
 int      user64_page_is_user_ok64(uint64_t va);
 // 读叶子 PTE 的**标志位**（0 = 没有映射；物理地址不外泄）。自检/调试用。
 uint64_t user64_page_flags64(uint64_t va);
+// ★ 本批（Linux 应用）：在用户窗口里找一个**连续 bytes 字节全未映射**的空闲区间（首适配）。
+//   为什么要它：mmap 的 bump 分配器遇到"中间已经被映像/解释器占住"的地址只会浪费/撞车；
+//   动态链接器（musl 的 map_library 用 MAP_PRIVATE 文件映射整块库）需要一块**连续**的虚地址。
+//   hint = 期望起点（0 = 从 USER64_MMAP_VA64 起）；扫描上界 = USER64_LOADER_BIG_TOP_VA64
+//   （DEV/SHM 窗下沿：那两段不许被 mmap/映像覆盖，见本文件上面的说明）。
+//   返回 0 = 找不到（窗口里没有这么大的连续空洞）；否则返回页对齐的起点。
+uint64_t user64_find_free64(uint64_t hint, uint64_t bytes);
 
 // ==================== A1：用户态绘图（映射显存 + 提交区域）====================
 // 把**指定物理页**映射成用户页（共享映射：显存/后备缓冲）。与 user64_map_page64 的区别：
