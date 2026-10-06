@@ -8,7 +8,7 @@
  *   本文件从初始栈读 auxv，然后：
  *     1) **自定位**：用 AT_BASE 找到自己的 PT_DYNAMIC，应用自己的 R_X86_64_RELATIVE；
  *     2) 找主程序的 PT_DYNAMIC / PT_NEEDED，按 DT_NEEDED **递归加载 .so**
- *        （open/read/mmap(MAP_FIXED)/mprotect，段权限逐页分开：R|X / R|W）；
+ *        （open/read + **整块** mmap(MAP_FIXED) 后逐段读入 / mprotect，段权限逐页分开：R|X / R|W）；
  *     3) 重定位：R_X86_64_RELATIVE（必须）、R_X86_64_GLOB_DAT / JUMP_SLOT（必须）、
  *        R_X86_64_64；符号解析顺序 = **主程序优先 -> 依赖加载顺序 -> 弱符号**；
  *     4) 调用各对象的 DT_INIT / DT_INIT_ARRAY（依赖先于依赖者，主程序最后）；
@@ -89,7 +89,9 @@ static i64 ld_read(i64 fd, void* b, u64 n) { return sys6(0, (u64)fd, (u64)b, n, 
 static i64 ld_lseek(i64 fd, u64 off)     { return sys6(8, (u64)fd, off, 0 /*SEEK_SET*/, 0, 0, 0); }
 static i64 ld_mmap_fixed(u64 va, u64 len) {
     /* prot 被本内核忽略（mmap 总是映射成 RW+U+NX），随后用 mprotect 收紧；
-       flags = MAP_PRIVATE(2) | MAP_FIXED(0x10) | MAP_ANONYMOUS(0x20)。 */
+       flags = MAP_PRIVATE(2) | MAP_FIXED(0x10) | MAP_ANONYMOUS(0x20)。
+       ★ 调用点必须**每个对象只调一次**（整块 span）：Linux 的 MAP_FIXED 语义是"先丢弃旧映射"，
+       同一页映第二次会把上一次写进去的内容整页清掉（见 ld_load_so64 的回归说明）。 */
     return sys6(9, va, len, 3, 0x32, (u64)-1, 0);
 }
 static i64 ld_mprotect(u64 va, u64 len, u64 prot) { return sys6(10, va, len, prot, 0, 0, 0); }
@@ -381,13 +383,24 @@ static int ld_load_so64(const char* name) {
     ld_strcpy_n(o->name, name, sizeof(o->name));
     o->base = base;
 
-    /* ---- 逐段：MAP_FIXED（RW）+ 读文件 + 清 .bss ---- */
+    /* ---- 整对象**一次** MAP_FIXED（base .. base+span），再逐段读文件 + 清 .bss ----
+     * ★ 回归修复（2026-10-06，对应内核 0b68742 把 mmap(9) 的 MAP_FIXED 改成**真 Linux 语义**
+     *   "先丢弃旧映射再映"）：原来这里是**逐段**各调一次 MAP_FIXED —— 而多个段的 p_vaddr
+     *   经常落在**同一页**（链接器只保证 p_offset ≡ p_vaddr (mod 4096)，不保证段独占页）。
+     *   旧内核的 MAP_FIXED 遇到"这一页已经映射好"就复用同一物理页（内容不动），所以逐段
+     *   "映射一页 -> 读这一段进去" 的写法看起来能用；一旦 MAP_FIXED 按 Linux 语义真丢弃旧页，
+     *   同一页的第二次/第三次 MAP_FIXED 就把**刚读进去**的前几个段整页清成 0。
+     *   实测（libfoo.so，span=2 页）：页 0 被段 2/3 各再 MAP_FIXED 一次 -> 丢掉 ELF 头/.dynsym/.
+     *   dynstr；页 1 被段 5（p_filesz=0, p_memsz=8）再 MAP_FIXED 一次 -> 丢掉整个 .dynamic
+     *   （va 0x1030）。于是 ld_fill_obj64 看不到 DT_SYMTAB/DT_STRTAB：
+     *     [LDSO] FAIL obj: no symtab/strtab -> exit 127（[DYNLINK] FAILED reason=code）
+     *   修法：**整块映一次**（也是 musl/glibc 的 ld.so 的做法 —— 先整块 map，再逐段读进来），
+     *   段内偏移照旧按 p_offset 读；整块映射天然覆盖段间空洞（段间空洞按 Linux 是 0 填，这里
+     *   是没写过的新页，也是 0）。不打内核补丁、不改内核的 mmap 语义。 */
+    if (ld_mmap_fixed(base, span) != (i64)base) ld_fail("so: mmap");
     for (u32 i = 0; i < eh->e_phnum; i++) {
         const Phdr* ph = ld_phdr_at(eh, (u64)(unsigned long)(hdr), i, 56);
         if (!ph || ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
-        const u64 va0 = base + (ph->p_vaddr & ~0xFFFUL);
-        const u64 va1 = base + ((ph->p_vaddr + ph->p_memsz + 0xFFFUL) & ~0xFFFUL);
-        if (ld_mmap_fixed(va0, va1 - va0) != (i64)va0) ld_fail("so: mmap");
         if (ph->p_filesz) {
             ld_lseek(fd, ph->p_offset);
             const i64 n = ld_read(fd, (void*)(base + ph->p_vaddr), ph->p_filesz);
