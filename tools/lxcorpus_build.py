@@ -916,32 +916,33 @@ def main():
         items.append({"id": "deb_real_xz", "class": "④ 真 deb（原样 xz）", "host": deb_xz,
                       "vol": "/opt/vpkg/repo/" + os.path.basename(deb_xz), "mode": "0644",
                       "kind": "deb", "pkg": "hello-xz", "payload": "/usr/bin/hello",
-                      "expect": "install", "today": "fail",
-                      "note": "Debian bookworm 原样包：control/data.tar.xz —— /bin/vpkg 只支持 gzip",
+                      "expect": "install", "today": "run",
+                      "note": "Debian bookworm 原样包：control/data.tar.xz —— xz/LZMA2 真解（vs_xz.c）"
+                              "；data.tar 解出 256000 B / 49 个文件，装完 /usr/bin/hello 真跑",
                       "expect_out": None, "size": os.path.getsize(deb_xz),
                       "sha256": sha256_of(open(deb_xz, "rb").read())})
         items.append({"id": "deb_real_gz_dep", "class": "④ 真 deb（gzip 重压，控制文件带 Depends）",
                       "host": deb_gz, "vol": "/opt/vpkg/repo/" + os.path.basename(deb_gz),
                       "mode": "0644", "kind": "deb", "pkg": "hello-dep",
-                      "payload": "/usr/bin/hello", "expect": "install", "today": "fail",
-                      "note": "同一份 payload + gzip：control 里的 `Depends: libc6 (>= 2.34)` 挡住安装"
-                              "（/var/lib/vpkg 里没有 libc6 这个包 —— 发行版包的依赖模型缺口）",
+                      "payload": "/usr/bin/hello", "expect": "install", "today": "run",
+                      "note": "同一份 payload + gzip：control 里的 `Depends: libc6 (>= 2.14)` 由 "
+                              "/etc/vpkg/provides 的**见证路径**（/lib/x86_64-linux-gnu/libc.so.6）满足",
                       "expect_out": "Hello, world!", "size": os.path.getsize(deb_gz),
                       "sha256": sha256_of(open(deb_gz, "rb").read())})
         items.append({"id": "deb_real_gz", "class": "④ 真 deb（gzip 重压 + 去掉 Depends）",
                       "host": deb_ok, "vol": "/opt/vpkg/repo/" + os.path.basename(deb_ok),
                       "mode": "0644", "kind": "deb", "pkg": "hello",
-                      "payload": "/usr/bin/hello", "expect": "install+run", "today": "run-fail",
+                      "payload": "/usr/bin/hello", "expect": "install+run", "today": "run",
                       "note": "宿主把 xz 重压成 gzip 并删掉 Depends 行；data.tar 仍有 49 个条目"
-                              "（> vpkg 的 VS_FILES_MAX=12 -> rc=8 VS_E_FORMAT）",
+                              "（VS_FILES_MAX=4096，全部落盘）",
                       "expect_out": "Hello, world!", "size": os.path.getsize(deb_ok),
                       "sha256": sha256_of(open(deb_ok, "rb").read()),
                       "payload_sha256": sha256_of(g["gnuhello"]) if g else None})
         items.append({"id": "deb_real_min", "class": "④ 真 deb（gzip + 去 Depends + 只留 1 个文件）",
                       "host": deb_min, "vol": "/opt/vpkg/repo/" + os.path.basename(deb_min),
                       "mode": "0644", "kind": "deb", "pkg": "hello-min",
-                      "payload": "/usr/bin/hello", "expect": "install+run", "today": "run-fail",
-                      "note": "同一份 Debian payload，剥到 vpkg 能吞下的最小形态（只为把「装」与「跑」分开测）",
+                      "payload": "/usr/bin/hello", "expect": "install+run", "today": "run",
+                      "note": "同一份 Debian payload，只留 1 个文件的最小形态（作「装」与「跑」的对照）",
                       "expect_out": "Hello, world!", "size": os.path.getsize(deb_min),
                       "sha256": sha256_of(open(deb_min, "rb").read()),
                       "payload_sha256": sha256_of(g["gnuhello"]) if g else None})
