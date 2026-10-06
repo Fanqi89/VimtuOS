@@ -130,6 +130,14 @@ def percentile(vals, p):
     return s[i]
 
 
+# ★ 修（实测缺陷）：screendump 的**文件名必须 ASCII** —— QEMU 是原生 Windows 程序，按 ANSI(GBK)
+#   落盘；Python 拿 Unicode 路径去 stat 会永远找不到文件（实测：中文 tag 的用例 300 s 抓 0 张，
+#   纯 ASCII tag 的用例 32 张/1 s）。中文只留在断言文案里，文件名走 file_tag()。
+def file_tag(tag):
+    import re as _re
+    t = _re.sub(r"[^0-9A-Za-z._=+-]", "_", tag)
+    return t or "shot"
+
 # --------------------------------------------------------------------------- QEMU 壳
 class Vm:
     def __init__(self, qemu, img, vga, port, tmp, cfg):
@@ -292,10 +300,13 @@ def run_tear(qemu, img, tmp, cfg_str, vga, expect_gpu, n_shots, ck, tag):
         max_span = 0.0
         t0 = time.time()
         i = 0
-        while len(shots) < n_shots and time.time() - t0 < 300:
+        # ★ 修：①文件名走 ASCII（见 file_tag）；②截图之间留 ~0.12 s —— screendump 会短暂暂停
+        #   客户机，贴着连拍时帧号几乎不动，"≥3 个不同帧号"会变成假失败；③循环条件带上
+        #   "≥3 个不同帧号"，否则 32 张连拍可能只覆盖 1~2 帧。
+        while (len(shots) < n_shots or len(set(frames_seen)) < 3) and time.time() - t0 < 300:
             if "[VSYNC] demo done" in vm.log():
                 break
-            sh = vm.shot("%s_%03d" % (tag, i))
+            sh = vm.shot("%s_%03d" % (file_tag(tag), i))
             i += 1
             if sh is None:
                 continue
@@ -308,8 +319,15 @@ def run_tear(qemu, img, tmp, cfg_str, vga, expect_gpu, n_shots, ck, tag):
                 frames_seen.append(f)
             dt = time.time() - t0
             if len(shots) % 8 == 0:
-                print("    ... 抓了 %d 张（%.1fs，最新 frame=%s）" % (len(shots), dt, f))
+                print("    ... 抓了 %d 张（%.1fs，最新 frame=%s，不同帧号=%d）"
+                      % (len(shots), dt, f, len(set(frames_seen))))
+            time.sleep(0.12)
         max_span = time.time() - t0
+        # ★ 修：`[VSYNC] stats` / `[VSYNC] bench` 只在引擎**跑满 frames 帧之后**才打；实测引擎
+        #   真实速率远低于 30 fps 的名义节拍（screendump 还会暂停客户机），截图循环结束时通常
+        #   还没跑完 -> 这里按有界上限等它收尾，否则 stats/bench 必然"未命中"（假失败）。
+        if "[VSYNC] stats" not in vm.log():
+            vm.wait_log("[VSYNC] stats", 420)
         log = vm.log()
         ck.ch("%s 演示窗口内抓到 >= %d 张（实际 %d 张，%.1fs）" % (tag, n_shots, len(shots), max_span),
               len(shots) >= n_shots, "shots=%d" % len(shots))
@@ -423,7 +441,10 @@ def main():
     ap.add_argument("--img", default=os.path.join(ROOT, "build64", "sysdisk.img"))
     ap.add_argument("--only", default="all", choices=["all", "tear", "gpuoff", "degrade", "regress"])
     ap.add_argument("--shots", type=int, default=32, help="撕裂用例最少抓多少张（规范要求 >=30）")
-    ap.add_argument("--frames", type=int, default=1500, help="帧引擎跑多少帧（演示窗口长度）")
+    ap.add_argument("--frames", type=int, default=600,
+                    help="帧引擎跑多少帧（演示窗口长度）。实测引擎真实速率 ~3~6 帧/秒（30 fps 只是"
+                         "节拍目标；TCG 下每帧整帧提交本身就是毫秒级），1500 帧要 5~8 分钟，"
+                         "默认降到 600（约 2~3 分钟/用例，仍远超 ④ 要求的降级后 >=60 帧）")
     ap.add_argument("--fps", type=int, default=30, help="目标刷新率（TCG 下 30 更现实；如实报告）")
     ap.add_argument("--inj-at", type=int, default=150, help="第几条 virtio-gpu 命令后注入")
     ap.add_argument("--keep", action="store_true")
