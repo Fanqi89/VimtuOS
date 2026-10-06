@@ -573,18 +573,28 @@ static uint32_t fb64_fwcfg_rd32(void) {               // fw_cfg 的数字字段�
     return v;
 }
 static int g_fwcfg_variant = -1;                      // -1 = 还没探测出来
-static int fb64_fwcfg_sel_try(int variant, uint16_t sel) {
+// ★ 真缺陷修复（本批修订）：原来"选条目"和"读目录条目数（4B）"是同一个函数 —— 于是**每选一次
+//   都会从数据口吃掉前 4 字节**。对目录（0x0019）这正好是条目数（本意），但对**一般文件**就是
+//   文件的前 4 个字节：配置串 "demo=1;bufs=2;…" 的前 4 字节 "demo" 被吃掉 ->
+//   fb64_cfg_find("demo") 在整个串里都找不到 -> `[VSYNC] cfg present but demo=0` ->
+//   **帧引擎在任何机器上都起不来**（①~④ 的实测数据一个都拿不到；实测：加 4 字节前缀
+//   "xxxx;demo=1;…" 就正常起来 —— 那就是本缺陷的硬证据）。
+//   现在拆开："只切换"与"切换+读条目数"，探测/读目录走后者（语义不变），读一般文件走前者。
+static void fb64_fwcfg_sel_write(int variant, uint16_t sel) {
     switch (variant) {
         case 0: outb(0x510, (uint8_t)(sel >> 8)); outb(0x510, (uint8_t)(sel & 0xFF)); break;
         case 1: outb(0x510, (uint8_t)(sel & 0xFF)); outb(0x510, (uint8_t)(sel >> 8)); break;
         case 2: outw(0x510, (uint16_t)((sel << 8) | (sel >> 8))); break;
         default: outw(0x510, sel); break;
     }
+}
+static int fb64_fwcfg_sel_try(int variant, uint16_t sel) {
+    fb64_fwcfg_sel_write(variant, sel);
     const uint32_t cnt = fb64_fwcfg_rd32();           // 目录首 4 字节 = 条目数（大端）
     return (cnt >= 1 && cnt <= 64) ? (int)cnt : -1;
 }
 static void fb64_fwcfg_select(uint16_t sel) {         // 用已确定的那种写法选条目
-    (void)fb64_fwcfg_sel_try(g_fwcfg_variant, sel);
+    fb64_fwcfg_sel_write(g_fwcfg_variant, sel);       // ★ 不读数据口：第 0 字节 = 文件第 0 字节
 }
 // 探测：返回 1 = 找到可用的写法（g_fwcfg_variant 固定下来），0 = 这台机器没有可读的 fw_cfg
 static int fb64_fwcfg_probe(void) {
