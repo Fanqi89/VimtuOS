@@ -534,6 +534,11 @@ def main():
         checks.append((name, bool(cond)))
         print("  [%s] %s%s" % ("PASS" if cond else "FAIL", name, ("  " + detail) if detail else ""))
 
+    def ev(seg, n=220):
+        """失败时给人看的证据：这一段串口日志压成一行、取尾部（本脚本没有 linuxapp64 的 raw）。"""
+        t = " | ".join(x.strip() for x in seg.splitlines() if x.strip())
+        return t[-n:]
+
     print("=== Vimtu64 应用商店 + 包管理器 acceptance（CLI / deb / GUI + 反例 + 宿主侧卷校验）===")
     try:
         index = prepare_fixture(spw)
@@ -609,11 +614,22 @@ def main():
         check("② 坏哈希不许落盘（没有 install ok / 没有 write）",
               "[VPKG] install ok" not in seg and "[VPKG] install file path=/bin/brokenpkg" not in seg)
 
-        # ---- ③ 反例 2：缺依赖（gui-demo 依赖 hello-cli）----
+        # ---- ③ 反例 2：缺依赖（gui-demo 依赖 hello-cli）+ --force-depends 必须**显式**才跳过 ----
         got, seg = run(vm, mon, "/bin/vpkg install gui-demo", "[VPKG] done cmd=install rc=4")
-        check("③ 反例：缺依赖被拒（rc=4 + depends ... state=missing）",
-              got and "depends name=gui-demo on=hello-cli state=missing" in seg
-              and "ERROR code=depends" in seg)
+        refused = (got and "depends name=gui-demo on=hello-cli state=missing" in seg
+                   and "ERROR code=depends" in seg and "--force-depends" in seg
+                   and "state=forced" not in seg and "depends force=1" not in seg)
+        # 显式给 --force-depends：必须装成功，并且**逐条**标注 state=forced（不许静默跳过）
+        got2, seg2 = run(vm, mon, "/bin/vpkg install gui-demo --force-depends",
+                         "[VPKG] install ok name=gui-demo")
+        check("③ 缺依赖被拒（rc=4 + state=missing + 提示 --force-depends，且不给开关绝不静默跳过）；"
+              "**显式**给 --force-depends 后才跳过并逐条标注 state=forced",
+              refused and got2 and "depends force=1" in seg2
+              and "depends name=gui-demo on=hello-cli state=forced" in seg2
+              and "[VPKG] install ok name=gui-demo" in seg2
+              and "[VPKG] done cmd=install rc=0" in seg2, ev(seg) + " || " + ev(seg2))
+        # 卸掉，让后面 ⑥/⑩/⑪ 的状态与原来完全一致
+        run(vm, mon, "/bin/vpkg remove gui-demo", "[VPKG] remove ok name=gui-demo")
 
         # ---- ④ 反例 3：空间不足（2 MiB payload vs 1.6 MB 卷）----
         got, seg = run(vm, mon, "/bin/vpkg install spacehog", "[VPKG] done cmd=install rc=5", timeout=90)
@@ -668,10 +684,17 @@ def main():
         check("⑧ 被拒的 deb 零残留（没有 install file / 没有 install ok）",
               "[VPKG] install file path=/usr/share/baddeb" not in seg and "[VPKG] install ok" not in seg)
 
-        # ---- ⑨ 反例：xz 压缩的 deb 明确拒绝 ----
-        got, seg = run(vm, mon, "/bin/vpkg install xzdeb", "[VPKG] done cmd=install rc=10")
-        check("⑨ 反例：xz 压缩的 deb 明确拒绝（rc=10 + 压缩格式原文）",
-              got and "deb compression control=" in seg and "ERROR code=xz" in seg)
+        # ---- ⑨ xz 压缩的 deb：这一批**真解得开**了（xz 容器 + LZMA2，之前是 rc=10 整包拒绝）----
+        got, seg = run(vm, mon, "/bin/vpkg install xzdeb", "[VPKG] install ok name=xzdeb")
+        check("⑨ xz 的 deb 真装上了（control/data.tar.xz 都解出 + 解码打点 + 文件落盘 + rc=0）",
+              got and "deb compression control=xz data=xz" in seg
+              and "deb xz member=control.tar.xz in=" in seg
+              and "deb xz member=data.tar.xz in=" in seg
+              and "deb written files=" in seg
+              and "[VPKG] install file path=/usr/share/xzdeb/y.txt " in seg
+              and "[VPKG] done cmd=install rc=0" in seg and "rc=10" not in seg, ev(seg))
+        # 装进来的 xzdeb 立刻卸掉：⑪ 的"/usr/share/xzdeb 零残留"因此仍是一条**真断言**
+        run(vm, mon, "/bin/vpkg remove xzdeb", "[VPKG] remove ok name=xzdeb")
 
         logA = vm.log()
         for needle in PANIC_MARKERS:

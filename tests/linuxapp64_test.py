@@ -17,6 +17,7 @@
                                         （卷里也装了真的 glibc 2.36 解释器）——把内核带到"解释器那一步"
   ③  /lxcorpus/gnuhello                 Debian bookworm 的 hello 包里的真 /usr/bin/hello（PIE + glibc）
   ④  /opt/vpkg/repo/*.deb               Debian 原样的 .deb（xz）/ gzip 重压（带 Depends）/ gzip（去 Depends）
+                                        / gzip（去 Depends + 只留 1 个文件）
   ⑤  /lxcorpus/dynhello-with-a-long-name.elf
                                         同一个二进制换成长路径：内核 execve(59) 的路径缓冲只有 32 B
                                         （kernel/syscall64.cpp:579 LX64_PATH_MAX）→ deny + EFAULT
@@ -33,7 +34,11 @@
 用法（**必须 Windows 原生 Python**；MSYS2 的 python 会让 QEMU 检测失败）：
     py -3 tools/lxcorpus_build.py         # 先造语料（一次即可；产物在 build64/lxcorpus/）
     py -3 tests\\linuxapp64_test.py [--qemu PATH] [--keep] [--no-qemu]
-退出码：0 = 全过（**今天不可能**，除非缺口都修了）；1 = 有断言失败（= 缺口清单）；2 = 环境问题。
+退出码：0 = 全过（**这一批之后应当 36/36**）；1 = 有断言失败（= 缺口清单）；2 = 环境问题。
+★ 这一批（deb 链路补齐）把 ④ 的三条"缺口跟踪"断言**收紧**成成功断言，并新增两条证据：
+  * 装完**完整包**（原样 xz、49 条目 data.tar）之后当场 `run /usr/bin/hello` 打印 Hello, world!；
+  * 关 QEMU 后宿主侧用**独立的** lzma/tarfile 解析那个原样 .deb，逐字节核对每个 payload 条目。
+  （断言只增不减/只紧不松：条数仍是 36，没有一条放松或删除。）
 
 ★ 本脚本不含任何"为了变绿"的写法：每条 FAIL 都打印"想要什么 / 实际拿到什么 / 内核原话"。
 """
@@ -41,6 +46,10 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import gzip
+import io
+import lzma
+import tarfile
 import os
 import re
 import shutil
@@ -308,6 +317,35 @@ def vol_read(tp, vol, path):
     return None
 
 
+def deb_payload_files(path):
+    """宿主侧**独立**解析一个 .deb 的 data.tar.{xz,gz}（用 Python 自己的 lzma/gzip/tarfile，
+    与客人里 /bin/vpkg 的实现毫无共享代码）：返回 {卷内相对路径: 字节}（只取常规文件）。
+    用途：关 QEMU 之后逐字节核对"包管理器到底把包的 payload 原样写进卷没有"。"""
+    blob = open(path, "rb").read()
+    if blob[:8] != b"!<arch>\n":
+        raise RuntimeError("%s 不是 ar 归档" % path)
+    members, off = {}, 8
+    while off + 60 <= len(blob):
+        h = blob[off:off + 60]
+        nm = h[0:16].decode("ascii").split("/")[0].strip()
+        sz = int(h[48:58].decode("ascii").strip() or "0")
+        members[nm] = blob[off + 60:off + 60 + sz]
+        off = off + 60 + sz + (sz & 1)
+    for key in ("data.tar.xz", "data.tar.gz"):
+        if key not in members:
+            continue
+        raw = lzma.decompress(members[key]) if key.endswith("xz") else gzip.decompress(members[key])
+        out = {}
+        with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+            for ti in tf.getmembers():
+                if not ti.isfile():
+                    continue
+                nm = ti.name[2:] if ti.name.startswith("./") else ti.name
+                out[nm] = tf.extractfile(ti).read()
+        return out
+    raise RuntimeError("%s 里没有 data.tar.{xz,gz}" % path)
+
+
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -511,25 +549,46 @@ def main():
         print("--- ④ 真 .deb：原样 xz / gzip（带 Depends）/ gzip（去 Depends）---")
         seg = run_shell_line("/bin/vpkg install hello-xz", "[VPKG] done cmd=install")
         segs["deb_xz"] = seg
-        check("④ 发行版**原样** .deb（control/data.tar.xz）能被 /bin/vpkg 装上",
-              "[VPKG] install ok" in seg and "[VPKG] done cmd=install rc=0" in seg, raw(seg))
-        check("[缺口跟踪] ④ 的失败点 = vpkg 只支持 gzip（xz 整包拒绝 rc=10）",
-              "deb compression control=xz data=xz" in seg and "rc=10" in seg, raw(seg))
+        check("④ 发行版**原样** .deb（control/data.tar.xz）能被 /bin/vpkg 装上"
+              "（xz 解码打点 + 49 个条目 + 全部落盘）",
+              "[VPKG] install ok" in seg and "[VPKG] done cmd=install rc=0" in seg
+              and "deb compression control=xz data=xz" in seg
+              and "deb xz member=control.tar.xz in=" in seg
+              and "deb xz member=data.tar.xz in=" in seg
+              and "deb stats files=49 dirs=94" in seg
+              and "[VPKG] install file path=/usr/bin/hello " in seg, raw(seg))
+        check("[缺口已修] ④ 的两段 xz 真的解开了（成员 in/out 打点对上真包："
+              "control 1868->10240、data 54072->256000；不再有 rc=10/only gzip）",
+              "deb xz member=control.tar.xz in=1868 out=10240" in seg
+              and "deb xz member=data.tar.xz in=54072 out=256000" in seg
+              and "rc=10" not in seg and "only gzip is supported" not in seg, raw(seg))
+
+        # ★ 新增证据（完整包就地跑）：装完**原样 xz 包**之后，它的 /usr/bin/hello 当场跑一遍 ——
+        #   不是只看"install ok"，而是真 fork/exec 那个被包管理器写进卷的程序。
+        seg_run_full = run_prog(items["deb_real_xz"]["payload"], want="Hello, world!", timeout=70)
+        segs["deb_run_full"] = seg_run_full
 
         seg = run_shell_line("/bin/vpkg install hello-dep", "[VPKG] done cmd=install")
         segs["deb_dep"] = seg
         check("④ gzip 重压但**保留 control 里的 Depends** 的 .deb 能装上"
               "（Debian hello 声明 Depends: libc6 (>= 2.34)）",
-              "[VPKG] install ok" in seg and "[VPKG] done cmd=install rc=0" in seg, raw(seg))
-        check("[缺口跟踪] ④ 的失败点 = 依赖模型（本地库里没有 libc6 -> rc=4 depends missing）",
-              "rc=4" in seg and "depends missing=libc6" in seg, raw(seg))
+              "[VPKG] install ok" in seg and "[VPKG] done cmd=install rc=0" in seg
+              and "depends name=hello on=libc6 state=ok via=provides witness=/lib/x86_64-linux-gnu/libc.so.6" in seg,
+              raw(seg))
+        check("[缺口已修] ④ 的缺失依赖由 **provides 表（带见证路径）** 满足，不是被跳过"
+              "（state=ok via=provides；没有 rc=4 / depends missing / state=forced）",
+              "state=ok via=provides" in seg and "rc=4" not in seg
+              and "deb depends missing=" not in seg and "state=forced" not in seg, raw(seg))
 
         seg = run_shell_line("/bin/vpkg install hello", "[VPKG] done cmd=install")
         segs["deb_gz"] = seg
         check("④ 去 Depends 但仍带**完整 data.tar（49 个条目）**的 .deb 能装上",
               "[VPKG] install ok" in seg and "[VPKG] done cmd=install rc=0" in seg, raw(seg))
-        check("[缺口跟踪] ④ 的失败点 = 包管理器文件表上限（VS_FILES_MAX=12 -> rc=8）",
-              "deb files=49 cap=12" in seg and "rc=8" in seg, raw(seg))
+        check("[缺口已修] ④ 的文件数上限（VS_FILES_MAX 12 -> 4096）：49 个条目全部落盘、"
+              "预扫与落盘对账（deb stats files=49 / deb written files=49），不再 rc=8",
+              "deb stats files=49 dirs=94" in seg and "cap=4096" in seg
+              and "deb written files=49 bytes=" in seg and "rc=8" not in seg
+              and "[VPKG] install ok" in seg, raw(seg))
 
         seg = run_shell_line("/bin/vpkg install hello-min", "[VPKG] done cmd=install")
         segs["deb_min"] = seg
@@ -541,8 +600,9 @@ def main():
         v = items["deb_real_min"]["payload"]
         seg = run_prog(v, want="Hello, world!")
         segs["deb_run"] = seg
-        check("④ **装出来的程序真能跑**（run %s 打印 \"Hello, world!\"）" % v,
-              "Hello, world!" in seg, raw(seg))
+        check("④ **装出来的程序真能跑**（run %s 打印 \"Hello, world!\"；"
+              "上面那份**完整包**装完也当场跑出同样一行）" % v,
+              "Hello, world!" in seg and "Hello, world!" in seg_run_full, raw(seg))
         check("[缺口已修] ④ 装出来的程序走同一条装载路径（无 outside-user-window / reason=size）",
               REASON_WINDOW not in seg and REASON_SIZE not in seg and
               "[ELF64] load path=/usr/bin/hello" in seg, raw(seg))
@@ -572,11 +632,17 @@ def main():
             check("⑩ 卷上 %s 与语料逐字节一致（%d B）" % (e["vol"], e["size"]),
                   got is not None and sha256_of(e["host"]) == hashlib.sha256(got).hexdigest(),
                   "卷上 %s" % (len(got) if got is not None else "没找到"))
-        # ④ 装出来的 /usr/bin/hello 必须 == 语料里的 Debian hello（证明"装"是真装）
+        # ④ 装出来的 /usr/bin/hello 必须 == 语料里的 Debian hello（证明"装"是真装）；
+        # ★ 这一批再收紧：**完整原样 xz 包**（49 条目 data.tar）的每个 payload 条目
+        #   都要在卷上逐字节一致 —— 宿主侧用 Python 的 lzma/tarfile 独立解包比对。
         gnu = open(items["glibc_bin"]["host"], "rb").read()
         got = vol_read(tp, vol, "/usr/bin/hello")
-        check("⑩ vpkg 真把 Debian 的 /usr/bin/hello 写进了卷（%d B，与语料逐字节一致）" % len(gnu),
-              got == gnu, "卷上 %s" % (len(got) if got is not None else "没找到"))
+        full = deb_payload_files(items["deb_real_xz"]["host"])
+        bad = [p for p, b in sorted(full.items()) if vol_read(tp, vol, "/" + p) != b]
+        check("⑩ vpkg 真把 Debian 的 /usr/bin/hello 写进了卷（%d B，与语料逐字节一致）；"
+              "原样 xz 包的 %d 个 payload 条目也逐字节一致" % (len(gnu), len(full)),
+              got == gnu and len(full) == 49 and not bad,
+              ("卷上 %s；不一致 %s" % (len(got) if got is not None else "没找到", bad[:3])))
     except Exception as ex:                                    # noqa: BLE001
         check("⑩ 宿主侧卷解析跑通", False, str(ex)[:200])
     except Exception as ex:                                    # noqa: BLE001
@@ -584,10 +650,11 @@ def main():
 
     # ---------- 证据与汇总 ----------
     print("--- 各类的内核串口原文（截断）---")
-    for k in ("stat", "big", "dyn", "dyn_gnu", "longpath", "gnu", "deb_xz", "deb_dep", "deb_run"):
+    for k in ("stat", "big", "dyn", "dyn_gnu", "longpath", "gnu", "deb_xz", "deb_run_full",
+              "deb_dep", "deb_run"):
         if k in segs:
             print("   [%s] %s" % (k, raw(segs[k])))
-    print("--- 缺口清单（今天 FAIL 的断言 = 要修的事）---")
+    print("--- 缺口清单（FAIL 的断言 = 还没修的事）---")
     for name, c in checks:
         if not c:
             print("   [!] " + name)
