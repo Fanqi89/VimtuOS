@@ -533,17 +533,30 @@ static bool vgpu_send(const void* cmd, uint32_t len, int verbose) {
     //   （见 VgpuAttach 上方的说明 + 编译期 static_assert）。这里仍不把 ERR 判死的原因：attach
     //   失败必然被后续 SET_SCANOUT / TRANSFER 的严格校验连锁判失败（[VGPU] disable reason=…），
     //   证据面不增，只让"init 阶段就自杀"的回归面变大。
+    //   ★ 修（本批实测）：上面这条"只认 ERR_*"还不够 —— 故障注入 illegal 把响应类型改成 0x1BAD
+    //   （**既不是 OK 也不是 ERR_***）时，上一版会把它**静默当成成功**：帧引擎照常翻页、永远不降级
+    //   （tests/vsync64_test.py 的 inject=illegal 用例因此 4 条断言全 FAIL：没有 [VGPU] disable、
+    //   没有 [VSYNC] degrade、cpu_frames=0）。设备回一个我们不认识的类型同样是"不能假装成功"。
+    //   现在：严格三条命令必须见到 **0x1100 = OK_NODATA**，其它一律判失败并如实打点
+    //   （[VGPU] resp BAD type=0x1bad name=…），与 ERR_* 走同一条降级路径。
     const uint32_t ctype = ((const VgpuHdr*)cmd)->type;
     const uint32_t rt = ((const VgpuHdr*)g_resp)->type;          // vgpu_resp_type() 在本函数之后定义
+    const int strict = (ctype == VGPU_CMD_TRANSFER_TO_HOST_2D || ctype == VGPU_CMD_RESOURCE_FLUSH ||
+                        ctype == VGPU_CMD_SET_SCANOUT);
     if (rt >= 0x1200u && rt < 0x1300u) {
-        const int strict = (ctype == VGPU_CMD_TRANSFER_TO_HOST_2D || ctype == VGPU_CMD_RESOURCE_FLUSH ||
-                            ctype == VGPU_CMD_SET_SCANOUT);
         vgpu_log_begin();
         vgpu_puts("[VGPU] resp ERR type="); vgpu_hex32(rt);
         vgpu_puts(" name="); vgpu_puts(vgpu_cmd_name(ctype));
         vgpu_puts(strict ? " -> fail" : " (tolerated)");
         vgpu_log_end();
         if (strict) { g_i.last_err = "resp-err"; return false; }
+    } else if (strict && rt != VGPU_RESP_OK_NODATA) {
+        vgpu_log_begin();
+        vgpu_puts("[VGPU] resp BAD type="); vgpu_hex32(rt);
+        vgpu_puts(" name="); vgpu_puts(vgpu_cmd_name(ctype));
+        vgpu_log_end();
+        g_i.last_err = "resp-bad";
+        return false;
     }
     return true;
 }
