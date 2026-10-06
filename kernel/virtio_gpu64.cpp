@@ -130,8 +130,21 @@ struct __attribute__((packed)) VgpuResFlush {
 struct __attribute__((packed)) VgpuTransfer2d {
     VgpuHdr hdr; VgpuRect r; uint64_t offset; uint32_t resource_id; uint32_t padding;
 };
+// ★ 真缺陷修复（QEMU 11.1.0 实测，2026-xx 本批）：spec 的 struct virtio_gpu_resource_attach_backing
+//   是 hdr(24) + resource_id(4) + nr_entries(4) = **32 字节**。原来这里多了一个 padding[2]（8 字节），
+//   于是页表被放到命令缓冲的 **40** 字节偏移，而 QEMU 从 **32** 字节处读 mem_entry：
+//       ents[0].addr   = 我们的 padding（= 0）
+//       ents[0].length = 我们第一条 mem_entry 的 addr 低 32 位（= 0x003a8000 = 3.8MB）
+//   dma_memory_map(0, 0x3a8000) 会横跨 0xA0000 的 VGA MMIO 洞 -> 映射失败。QEMU 宿主侧原文：
+//       virtio_gpu_create_mapping_iov: failed to map MMIO memory for element 0
+//   设备于是回 ERR_UNSPEC（0x1200 = ERR_*）-> resource **没有 backing** -> SET_SCANOUT /
+//   TRANSFER_TO_HOST_2D / RESOURCE_FLUSH 全线 ERR -> 设备路径在启动期就把自己关掉
+//   （"[FB64] backend=soft-lfb (device path disabled)"）—— 也就是说 **GPU 合成从来没真正可用过**。
+//   ★ 注意：backing 地址本身**一直是物理地址**（[VGPU] res … backing=0x3a8000 与
+//     [FB64] map pa=0x3A8000 互相印证），不是高半区 VA —— 缺陷纯在命令结构布局上。
+//   修法 = **去掉那 8 字节**，命令缓冲与 spec 逐字节一致。下面的 static_assert 防止复发。
 struct __attribute__((packed)) VgpuAttach {
-    VgpuHdr hdr; uint32_t resource_id; uint32_t nr_entries; uint32_t padding[2];
+    VgpuHdr hdr; uint32_t resource_id; uint32_t nr_entries;
 };
 struct __attribute__((packed)) VgpuDisplayOne {
     VgpuRect r; uint32_t enabled; uint32_t flags;
@@ -139,6 +152,17 @@ struct __attribute__((packed)) VgpuDisplayOne {
 struct __attribute__((packed)) VgpuRespDisplayInfo {
     VgpuHdr hdr; VgpuDisplayOne pmodes[16];
 };
+// 布局自检（编译期，零运行时开销）：与 virtio spec 5.7.6 的命令/响应结构逐字节一致。
+//   VgpuAttach 是这条真缺陷的直接受害者（见上面的说明），其余几条一并钉死。
+static_assert(sizeof(VgpuHdr) == 24, "VgpuHdr != 24");
+static_assert(sizeof(VgpuCreate2d) == 40, "VgpuCreate2d != 40");
+static_assert(sizeof(VgpuAttach) == 32, "VgpuAttach != 32 (spec: hdr24+res_id4+nr_entries4)");
+static_assert(sizeof(VgpuMemEntry) == 16, "VgpuMemEntry != 16");
+static_assert(sizeof(VgpuResId) == 32, "VgpuResId != 32");
+static_assert(sizeof(VgpuSetScanout) == 48, "VgpuSetScanout != 48");
+static_assert(sizeof(VgpuResFlush) == 48, "VgpuResFlush != 48");
+static_assert(sizeof(VgpuTransfer2d) == 56, "VgpuTransfer2d != 56");
+static_assert(sizeof(VgpuRespDisplayInfo) == 408, "VgpuRespDisplayInfo != 408");
 // virtqueue（spec 2.6.6：split virtqueue 的经典布局）
 struct __attribute__((packed)) VgpuDesc {
     uint64_t addr; uint32_t len; uint16_t flags; uint16_t next;
@@ -503,10 +527,12 @@ static bool vgpu_send(const void* cmd, uint32_t len, int verbose) {
     // ★ ⑭ 响应类型校验：0x11xx = OK_*，0x1200..0x12FF = ERR_*（非法参数/资源不存在/不支持）。
     //   这一批之前只等 used 条目、**不看响应类型** —— 设备"礼貌地拒绝"会被静默当成成功。
     //   **作用域收口（重要）**：只有"帧引擎上屏真正依赖"的三条命令把 ERR 判成失败
-    //   （TRANSFER_TO_HOST_2D / RESOURCE_FLUSH / SET_SCANOUT）—— 实测 QEMU 11 对
-    //   RESOURCE_ATTACH_BACKING 会回 ERR_UNSPEC（guest_errors: failed to map MMIO memory for
-    //   element 0），那是**既有缺陷**：以前被静默吞掉；现在如实打一行 ERR 但**不改**既有
-    //   容忍行为（否则设备路径会在 init 就被自己关掉，回归面变大）。
+    //   （TRANSFER_TO_HOST_2D / RESOURCE_FLUSH / SET_SCANOUT）。
+    //   RESOURCE_ATTACH_BACKING **保持"打点但容忍"**：它曾经是**真缺陷**（VgpuAttach 多 8 字节
+    //   padding -> QEMU 把 ents[0] 读成 addr=0 / len=0x3a8000 -> ERR_UNSPEC 0x1200），本批已修
+    //   （见 VgpuAttach 上方的说明 + 编译期 static_assert）。这里仍不把 ERR 判死的原因：attach
+    //   失败必然被后续 SET_SCANOUT / TRANSFER 的严格校验连锁判失败（[VGPU] disable reason=…），
+    //   证据面不增，只让"init 阶段就自杀"的回归面变大。
     const uint32_t ctype = ((const VgpuHdr*)cmd)->type;
     const uint32_t rt = ((const VgpuHdr*)g_resp)->type;          // vgpu_resp_type() 在本函数之后定义
     if (rt >= 0x1200u && rt < 0x1300u) {
