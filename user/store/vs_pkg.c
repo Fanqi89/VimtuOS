@@ -1345,12 +1345,15 @@ int vs_remove(const char* tag, const char* name) {
         char dir[VS_FILE_MAX];
         vs_strcpy(dir, (int)sizeof(dir), fp);
         for (;;) {
-            int cut = -1, slashes = 0;
-            for (int k = 0; k < (int)vs_strlen(dir); k++) if (dir[k] == '/') { cut = k; slashes++; }
-            if (cut <= 0 || slashes < 3) break;                 /* /a/b/c 起步才算"包自己的目录" */
-            dir[cut] = 0;
+            int cut = -1;
+            for (int k = 0; k < (int)vs_strlen(dir); k++) if (dir[k] == '/') cut = k;
+            if (cut <= 0) break;
+            dir[cut] = 0;                                  /* 去掉最后一级，看**目标**目录 */
+            int slashes = 0;
+            for (int k = 0; dir[k]; k++) if (dir[k] == '/') slashes++;
+            if (slashes < 3) break;                        /* 目标至少 /a/b/c（别碰 /usr、/usr/share） */
             const int dr = (int)__v64_syscall(84 /*rmdir*/, (long)(unsigned long)dir, 0, 0, 0, 0);
-            if (dr != 0) break;                                /* 非空 / 不存在：到此为止 */
+            if (dr != 0) break;                            /* 非空 / 不存在：到此为止 */
             vs_log(tag, "remove dir path=%s rc=0\n", dir);
             rmdirs++;
         }
