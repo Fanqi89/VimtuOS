@@ -1,0 +1,21 @@
+LZMA SDK / LZMA2 decoder -- license statement
+=============================================
+
+The files in this directory that carry an "Igor Pavlov : Public domain" line
+in their header (7zTypes.h, LzmaDec.h, LzmaDec.c, Lzma2Dec.h, Lzma2Dec.c)
+are from the LZMA SDK, which is **public domain**:
+
+    LZMA SDK is placed in the public domain.
+      -- Igor Pavlov, LZMA SDK (README in the SDK root, and in every file
+         header: "2018-02-28 : Igor Pavlov : Public domain")
+
+Public domain means: no copyright, no license text required, no attribution
+required.  We keep the upstream headers (including the author line) untouched
+and document origin/version in README.vimtu64.md purely so a reader can
+verify what is inside.
+
+Precomp.h in this directory is **not** from the SDK: it is a one-line
+replacement written for this repository (see the file header for why).
+
+No third-party code here is copyleft, so nothing changes for the rest of
+VimtuOS (see the repository root LICENSE).

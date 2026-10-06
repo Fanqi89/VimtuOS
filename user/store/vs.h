@@ -6,9 +6,12 @@
  *               sha256 + 错误码文案 + 小工具（十六进制/十进制）
  *   vs_gzip.c   gzip/DEFLATE 解压（**同一实现**：逐段抄自 user/gzip/gzip.c 的 inflate，
  *               见该文件头部；不是"另起一套"）
+ *   vs_xz.c     xz 容器 + LZMA2 解压（**只给 deb 路**；解码核 = third_party/lzma 的
+ *               LzmaDec/Lzma2Dec，公共领域；xz 容器解析在本文件里，见它的"如实边界"）
  *   vs_pkg.c    仓库索引 /opt/vpkg/index.json、已装库 /var/lib/vpkg/installed.json、
- *               .vap64（kernel/app64.h 布局）与 .deb（ar + control.tar.gz + data.tar.gz）
- *               的解析与安装/卸载引擎（CLI 与 GUI **共用同一份**）
+ *               .vap64（kernel/app64.h 布局）与 .deb（ar + control.tar.{gz,xz} +
+ *               data.tar.{gz,xz}）的解析与安装/卸载引擎（CLI 与 GUI **共用同一份**）+
+ *               依赖模型（已装库 + /etc/vpkg/provides + 仓库索引，见该文件的"依赖模型"）
  *   vpkg.c      /bin/vpkg 命令行（list / info / install / remove / search / update）
  *   store.c     /bin/store GUI 商店（/lib/wm.elf 合成器 + shm surface + user/lib/font64.h）
  *
@@ -36,7 +39,7 @@
 #define VS_E_NOTINST   7    /* 没装过（卸载/更新时） */
 #define VS_E_FORMAT    8    /* 包容器坏（VAP64 头/ar/tar/gzip） */
 #define VS_E_SCRIPTS   9    /* deb 带维护者脚本（preinst/postinst/prerm/postrm） */
-#define VS_E_XZ       10    /* deb 用 xz 压缩（本实现不支持） */
+#define VS_E_XZ       10    /* xz 解不开：不支持的 xz 特性（多块/BCJ/校验）或容器坏 */
 #define VS_E_NOTFOUND 11    /* 仓库/已装库里没有这个名字 */
 #define VS_E_IO       12    /* 读写失败 */
 #define VS_E_NOMEM    13    /* mmap/缓冲不够 */
@@ -44,7 +47,8 @@
 
 const char* vs_err_name(int code);      /* "hash" / "depends" / ...（日志与退出码都用它） */
 
-/* ---------------- 上限（全部静态分配；用户窗口只有 16 MiB） ---------------- */
+/* ---------------- 上限（★ 大表一律 mmap：本仓库一律 -fno-zero-initialized-in-bss，
+ *    静态大表会落进 .data（文件里）把 64 KiB 主程序装载区顶爆，见 vs_pkg.c 的体积说明） ---------------- */
 #define VS_MAX_PKGS     8         /* 索引/已装库最多几条（超出如实报错，不静默截断） */
 #define VS_NAME_MAX     32        /* VimtuFS2 名字上限 31 + NUL */
 #define VS_VER_MAX      16
@@ -53,8 +57,16 @@ const char* vs_err_name(int code);      /* "hash" / "depends" / ...（日志与�
 #define VS_FILE_MAX     128
 #define VS_DESC_MAX     72
 #define VS_SUM_MAX      56
-#define VS_DEPENDS_MAX  2         /* 依赖解析深度：一层（见 vs_pkg.c 的如实边界） */
-#define VS_FILES_MAX    12        /* 一个包最多记几个落盘文件 */
+/* 依赖条数上限：一层解析、不递归（真发行版包的 Depends 一般 1~5 条） */
+#define VS_DEPENDS_MAX  8
+/* 一个包最多有几个落盘文件（真包的量级：Debian hello 的 data.tar = 49 个文件，
+ * libc6 = 285 个；12 条是"装不下真包"的硬伤，这里放到 4096） */
+#define VS_FILES_MAX    4096
+/* 落盘清单池：**所有**已装包的 files[] 共用（8 个包 × 平均 1024 条 = 8192 条够用；
+ * 池满如实报 VS_E_NOMEM，不静默截断）。表本体在 mmap 区，见 vs_pkg.c 的 vs_file_pool。 */
+#define VS_FILE_POOL_MAX 8192
+/* provides 表最多几条（/etc/vpkg/provides 每行：<包名> <见证路径>） */
+#define VS_PROVIDES_MAX 8
 #define VS_KEY_MAX      24
 
 #define VS_REPO_DIR     "/opt/vpkg/repo"
@@ -66,6 +78,7 @@ const char* vs_err_name(int code);      /* "hash" / "depends" / ...（日志与�
 #define VS_LIB_DIR      "/lib"
 #define VS_WM_PATH      "/lib/wm.elf"          /* Ring 3 合成器（内核只认 /bin/wm.elf，桌面期由客户端 fork） */
 #define VS_WM_ALT_PATH  "/bin/wm.elf"
+#define VS_PROVIDES_PATH "/etc/vpkg/provides"   /* provides 表（宿主侧由 store_pack_win.py 装卷） */
 
 /* 安装/卸载一次的日志前缀：CLI = "VPKG"，GUI = "STORE"（两份证据长一样，便于对账） */
 #define VS_TAG_CLI      "VPKG"
@@ -92,8 +105,11 @@ struct VsInstalled {              /* /var/lib/vpkg/installed.json 里的一条 *
     char  type[VS_TYPE_MAX];
     int   bytes;
     char  sha256[65];
+    char  src[VS_NAME_MAX];       /* 来源身份：索引里的名字（直接给文件时 = 文件名派生的名字）。
+                                   * "已装"判定按它，不按上面那个 control 的 Package 名 ——
+                                   * 同一个 Debian 包在仓库里可以有多个打包形态（见 vs_install ⑥）。 */
     int   nfiles;
-    char  files[VS_FILES_MAX][VS_FILE_MAX];
+    int   files_off;              /* 落盘清单从 vs_file_pool 的第几条开始（见 vs_inst_file） */
 };
 
 /* ---------------- vs_io.c ---------------- */
@@ -135,6 +151,13 @@ void vs_sha256_final(struct VsSha256* s, char out_hex65[65]);
 int  vs_gunzip(const unsigned char* in, int n, unsigned char* out, int outcap, int* out_len);
 unsigned int vs_crc32(const unsigned char* p, int n);
 
+/* ---------------- vs_xz.c（xz 容器 + LZMA2；解码核 = third_party/lzma，公共领域） ---------------- */
+/* 解一个 **单块** xz 流到 out（outcap 上限）；成功写 *out_len 并返回 VS_OK。
+ * 失败：VS_E_XZ（不支持的 xz 特性）/ VS_E_FORMAT（容器或数据坏）/
+ *       VS_E_NOMEM（产物超 outcap、概率表 mmap 失败）。原因都按 member/at/reason 打点。 */
+int  vs_unxz(const char* tag, const char* member, const unsigned char* in, int n,
+             unsigned char* out, int outcap, int* out_len);
+
 /* ---------------- mmap（Linux 号段 9）：大缓冲一律走它，静态缓冲保持小 ---------------- */
 void* vs_mmap(int len);
 void* vs_malloc_stub(int len);       /* = vs_mmap（没有 free：本次运行期的如实边界） */
@@ -151,14 +174,25 @@ int  vs_db_find(const struct VsInstalled* a, int n, const char* name);
 
 /* 安装/卸载（CLI 与 GUI 共用；tag = "VPKG" / "STORE"，日志前缀）。
  * arg 可以是索引里的名字，也可以是 /path/x.vap64 或 /path/x.deb（含 '/' 时按文件走）。
+ * force_depends = 1 时**只为这一条命令**跳过缺失依赖（CLI 的 --force-depends 显式打开；
+ *   GUI 一律 0）。跳过会逐条打 state=forced，绝不静默。
  * 返回 VS_OK 或 VS_E_*；返回值同时决定 CLI 的退出码（非 0 = 失败）。 */
-int  vs_install(const char* tag, const char* arg, int do_progress);
+int  vs_install(const char* tag, const char* arg, int do_progress, int force_depends);
 int  vs_remove(const char* tag, const char* name);
 int  vs_list(const char* tag);                       /* 仓库 + 安装状态 */
 int  vs_info(const char* tag, const char* name);
 int  vs_search(const char* tag, const char* kw);
 int  vs_update(const char* tag);                     /* 按索引版本重装不一致的包 */
 
+/* ---- 落盘文件清单（哪个包装了哪些文件；卸载/信息按它办事）----
+ * 字符串池在 mmap 区（见 vs_pkg.c 的 vs_file_pool），记录里只存"从第几条开始"+"条数"。
+ * 为什么不把 files[VS_FILES_MAX][VS_FILE_MAX] 放进结构体：那是 512 KiB/条、8 条 = 4 MiB
+ * （吃光 mmap 区与 GUI 窗口），而且 vs_install 里那份 rec 会变成 **512 KiB 的栈对象**
+ * —— 用户栈只有 16 KiB（本文件 vs_pkg.c 的体积注释里记着踩过的那个坑）。 */
+const char* vs_inst_file(const struct VsInstalled* p, int k);   /* NULL = 越界 */
+int  vs_inst_file_add(struct VsInstalled* p, const char* path); /* 0 = 成功；VS_E_NOMEM = 池满 */
+void vs_inst_files_reset(void);                                 /* 读库前清池（vs_db_load 自己会调） */
+int  vs_inst_files_used(void);                                  /* 池里已用几条（日志/诊断） */
 /* 已装库的微内存缓存（GUI 每次重画要用；避免每帧读盘） */
 int  vs_cached_installed(struct VsInstalled* out, int cap, int* n);
 int  vs_cached_repo(struct VsPkg* out, int cap, int* n);

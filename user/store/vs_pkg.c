@@ -8,13 +8,23 @@
  * ② 已装库：/var/lib/vpkg/installed.json（**本程序自己写**）：每条记 name/version/arch/type/bytes/
  *    sha256 + files[]（落盘文件清单，卸载就按它删）。格式故意做成"字符串数组"，两边都好解。
  * ③ 安装引擎：.vap64 = kernel/app64.h 的布局（32B 头 + 名字 + code），payload = code 段；
- *    .deb = ar 归档 + control.tar.gz + data.tar.gz。**如实边界**（都返回专门错误码，不假装成功）：
+ *    .deb = ar 归档 + control.tar.{gz,xz} + data.tar.{gz,xz}。**如实边界**（都返回专门错误码，
+ *    不假装成功 —— 这一批把 xz 从"整包拒绝"改成了"真解"，边界因此整体挪到下面这几条）：
  *      * deb 带维护者脚本（preinst/postinst/prerm/postrm）-> VS_E_SCRIPTS，整包拒绝；
- *      * deb 用 xz（control.tar.xz / data.tar.xz）-> VS_E_XZ，整包拒绝；
+ *      * xz：支持**单块**、**单个 LZMA2 过滤器**、CRC32/none 校验的流（vs_xz.c + third_party/lzma）；
+ *        多块流 / BCJ·Delta 过滤器 / CRC64·SHA-256（只跳过校验）-> VS_E_XZ，原因逐条打点；
+ *        解出来的 tar 上限 4 MiB（与 gzip 路同口径）-> 超了 VS_E_NOMEM；
  *      * deb 里的符号链接条目 -> VS_E_FORMAT（VimtuOS 没有符号链接，见 SDK README 第 10 节的 FAQ）；
- *      * 依赖解析**一层**：查已装库里的名字，不递归、不做版本区间（如实写在报告里）；
+ *      * 依赖解析**一层**（不递归、**不做版本区间**，只比名字）：查三条 —
+ *        ① 已装库 /var/lib/vpkg/installed.json；② /etc/vpkg/provides（**每行必须带见证路径**，
+ *        stat 得到才算提供，没证据的声明一律不认）；③ 仓库索引（**只用来打 in_repo=1 提示**，
+ *        不算满足）。缺依赖报 VS_E_DEPENDS 并提示 --force-depends；--force-depends 必须**显式**给，
+ *        逐条打 state=forced（见下面的"依赖模型"一节）；
+ *      * 落盘文件清单放 mmap 池（vs_file_pool，VS_FILE_POOL_MAX 条），结构体里只存偏移：
+ *        真包一个就几十~几百个文件（hello=49、libc6=285），上限 VS_FILES_MAX=4096；
  *      * 文件权限：内核的 open(O_CREAT) 不带 mode（lx64_open64 只吃 flags），新文件一律 0644；
  *        可执行靠"内核 ELF 加载器只要 r 权限"这条既有事实（本报告如实写）。
+ *      * 依赖、文件清单、权限这三条的**具体实现位置**都在本文件里，注释里逐条写了"为什么"。
  */
 #include <stdio.h>
 #include <string.h>
@@ -224,6 +234,7 @@ static int parse_inst_object(struct Js* j, struct VsInstalled* p) {
         else if (vs_streq(key, "type"))    { if (js_str(j, p->type, VS_TYPE_MAX) < 0) return VS_E_FORMAT; }
         else if (vs_streq(key, "bytes"))   { if (js_num(j, &p->bytes) != 0) return VS_E_FORMAT; }
         else if (vs_streq(key, "sha256"))  { if (js_str(j, p->sha256, 65) < 0) return VS_E_FORMAT; }
+        else if (vs_streq(key, "index_name")) { if (js_str(j, p->src, VS_NAME_MAX) < 0) return VS_E_FORMAT; }
         else if (vs_streq(key, "files")) {
             js_ws(j);
             if (j->i >= j->n || j->s[j->i] != '[') return VS_E_FORMAT;
@@ -234,11 +245,10 @@ static int parse_inst_object(struct Js* j, struct VsInstalled* p) {
                 if (j->i < j->n && j->s[j->i] == ',') { j->i++; continue; }
                 char f[VS_FILE_MAX];
                 if (js_str(j, f, (int)sizeof(f)) < 0) return VS_E_FORMAT;
-                if (p->nfiles < VS_FILES_MAX) {
-                    vs_strcpy(p->files[p->nfiles], VS_FILE_MAX, f);
-                    p->nfiles++;
-                } else {
-                    return VS_E_FORMAT;
+                if (vs_inst_file_add(p, f) != 0) {
+                    vs_log(VS_TAG, "installed json files pool full used=%d cap=%d\n",
+                           vs_inst_files_used(), VS_FILE_POOL_MAX);
+                    return VS_E_NOMEM;                  /* 池满：如实报，不静默截断 */
                 }
             }
         }
@@ -248,7 +258,11 @@ static int parse_inst_object(struct Js* j, struct VsInstalled* p) {
 
 int vs_db_load(const char* path, struct VsInstalled* out, int cap, int* n) {
     *n = 0;
-    const int bufsz = 64 * 1024;
+    /* ★ 读库 = 重建"已装包 + 它的文件清单"：池先清空（池是全局共用的，见 vs_file_pool）。
+     * 缓冲 256 KiB（原来是 64 KiB）：真包的 files[] 长（libc6 = 285 条 → 单条记录 ~14 KB），
+     * 4~5 条记录就把 64 KiB 撑满了。 */
+    vs_inst_files_reset();
+    const int bufsz = 256 * 1024;
     unsigned char* buf = (unsigned char*)vs_mmap(bufsz);
     if (!buf) return VS_E_NOMEM;
     const int len = vs_read_file(path, buf, bufsz - 1);
@@ -279,7 +293,9 @@ int vs_db_load(const char* path, struct VsInstalled* out, int cap, int* n) {
 }
 
 int vs_db_write(const char* path, const struct VsInstalled* in, int n, int* out_bytes) {
-    const int bufsz = 32 * 1024;
+    /* 256 KiB（原来是 32 KiB）：真包的 files[] 长，8 条记录 + 每条几百个路径会超 32 KiB。
+     * 仍然**有界**：装不下就如实 VS_E_NOMEM（不写半截文件）。 */
+    const int bufsz = 256 * 1024;
     char* buf = (char*)vs_mmap(bufsz);
     if (!buf) return VS_E_NOMEM;
     int o = 0;
@@ -291,9 +307,11 @@ int vs_db_write(const char* path, const struct VsInstalled* in, int n, int* out_
                     "\n  {\"name\":\"%s\",\"version\":\"%s\",\"arch\":\"%s\",\"type\":\"%s\","
                     "\"bytes\":%d,\"sha256\":\"%s\",\"files\":[",
                     p->name, p->version, p->arch, p->type, p->bytes, p->sha256);
-        for (int k = 0; k < p->nfiles; k++)
-            o += vs_fmt(buf + o, bufsz - o, "%s\"%s\"", k ? "," : "", p->files[k]);
-        o += vs_fmt(buf + o, bufsz - o, "]}");
+        for (int k = 0; k < p->nfiles; k++) {
+            const char* f = vs_inst_file(p, k);
+            o += vs_fmt(buf + o, bufsz - o, "%s\"%s\"", k ? "," : "", f ? f : "");
+        }
+        o += vs_fmt(buf + o, bufsz - o, "],\"index_name\":\"%s\"}", p->src);
         if (o > bufsz - 512) return VS_E_NOMEM;              /* 有界：超了就如实失败 */
     }
     o += vs_fmt(buf + o, bufsz - o, "\n]}\n");
@@ -683,6 +701,135 @@ static struct VsInstalled* scratch_inst(void) {
     return p;
 }
 
+/* ==================== 落盘清单池（**一律 mmap**，见 vs.h 的说明） ====================
+ * 为什么是"池"而不是结构体里的数组：真包一个就几十~几百个文件，
+ *   `char files[4096][128]` 放进 struct VsInstalled 就是 **512 KiB/条**（8 条 4 MiB），
+ *   而且 vs_install 里那份 `struct VsInstalled rec;` 会变成 **512 KiB 的栈对象**
+ *   —— 用户栈只有 16 KiB（本文件上面那段注释里记着第一轮 26 条红就是撞的这个）。
+ * 池是**全局共用**的：vs_db_load() 从头重建（先 reset），装新包时往后追加。
+ * 池满 = 如实 VS_E_NOMEM（**不静默截断**：截断的 files[] 会让卸载漏文件）。 */
+static char (*g_file_pool)[VS_FILE_MAX];        /* 指针版：不放 .data（-fno-zero-initialized-in-bss） */
+static int g_file_used;
+
+static char (*file_pool(void))[VS_FILE_MAX] {
+    if (!g_file_pool)
+        g_file_pool = (char (*)[VS_FILE_MAX])vs_mmap((int)sizeof(char[VS_FILE_MAX]) * VS_FILE_POOL_MAX);
+    return g_file_pool;
+}
+
+void vs_inst_files_reset(void) { g_file_used = 0; }
+int  vs_inst_files_used(void)  { return g_file_used; }
+
+const char* vs_inst_file(const struct VsInstalled* p, int k) {
+    if (!p || !g_file_pool || k < 0 || k >= p->nfiles) return (const char*)0;
+    const int idx = p->files_off + k;
+    if (idx < 0 || idx >= VS_FILE_POOL_MAX) return (const char*)0;
+    return g_file_pool[idx];
+}
+
+int vs_inst_file_add(struct VsInstalled* p, const char* path) {
+    if (!p || !path || !path[0]) return VS_E_PATH;
+    if (p->nfiles == 0) p->files_off = g_file_used;      /* 这条记录从池里第几格开始 */
+    if (p->nfiles >= VS_FILES_MAX) return VS_E_NOMEM;    /* 单包上限（VS_FILES_MAX） */
+    if (g_file_used >= VS_FILE_POOL_MAX) return VS_E_NOMEM;
+    if (!file_pool()) return VS_E_NOMEM;
+    vs_strcpy(g_file_pool[g_file_used], VS_FILE_MAX, path);
+    g_file_used++;
+    p->nfiles++;
+    return VS_OK;
+}
+
+/* ==================== 依赖模型（★ 如实划线） ====================
+ * 三条来源，逐条查、逐条打点（详见 vs.h 的"如实边界"与报告）：
+ *   ① 已装库 /var/lib/vpkg/installed.json 里真有这个名字      -> state=ok via=installed
+ *   ② provides 表 /etc/vpkg/provides 里有名字**且见证路径真在卷上**
+ *                                                            -> state=ok via=provides witness=…
+ *      ★ 为什么必须带"见证路径"：在文件里写一行 "libc6" 只是**声明**，不是证据。
+ *        本程序只认"卷上真有那个文件"的声明（例如 libc6 -> /lib/x86_64-linux-gnu/libc.so.6）；
+ *        声明了但文件不在 = 打 `provides … path=… missing` 并当**没提供**处理。
+ *   ③ 仓库索引 /opt/vpkg/index.json 里有这个名字 -> **不算满足**，只打 in_repo=1
+ *      （让人知道"该装哪个包"；vpkg64_test ③ 那两条反例正靠它把"缺依赖"钉住）。
+ * 版本区间（`Depends: libc6 (>= 2.34)`）**不解析**：只比名字（如实边界，写在报告里）。
+ * --force-depends：**显式给才生效**；缺失的依赖逐条打 state=forced（绝不静默跳过）。 */
+struct VsProvides { char name[VS_NAME_MAX]; char witness[VS_FILE_MAX]; };
+
+/* 一次安装用到的三张表 + force 开关（打包传，别散成十个参数） */
+struct VsCtx {
+    const struct VsInstalled* inst; int ninst;
+    const struct VsPkg*       repo; int nrepo;
+    const struct VsProvides*  pv;   int npv;
+    int force;
+};
+
+static int provides_load(const char* tag, struct VsProvides* out, int cap, int* n) {
+    *n = 0;
+    const int bufsz = 8 * 1024;
+    unsigned char* buf = (unsigned char*)vs_mmap(bufsz);
+    if (!buf) return VS_E_NOMEM;
+    const int len = vs_read_file(VS_PROVIDES_PATH, buf, bufsz - 1);
+    if (len < 0) {                                   /* 没有这张表：0 条，不是错误 */
+        vs_log(tag, "provides load path=%s entries=0 (no such file)\n", VS_PROVIDES_PATH);
+        return VS_OK;
+    }
+    buf[len] = 0;
+    int i = 0, cnt = 0, bad = 0;
+    while (i < len) {
+        int e = i;
+        while (e < len && buf[e] != '\n') e++;
+        char line[VS_FILE_MAX + VS_NAME_MAX + 8];
+        int l = 0;
+        for (int k = i; k < e && l < (int)sizeof(line) - 1; k++) line[l++] = (char)buf[k];
+        line[l] = 0;
+        i = e + 1;
+        if (!line[0] || line[0] == '#' || line[0] == ' ' || line[0] == '\r') continue;
+        char nm[VS_NAME_MAX], wit[VS_FILE_MAX];
+        int a = 0, b = 0;
+        while (line[a] && line[a] != ' ' && line[a] != '\t' && a < VS_NAME_MAX - 1) { nm[a] = line[a]; a++; }
+        nm[a] = 0;
+        while (line[a] == ' ' || line[a] == '\t') a++;
+        while (line[a] && line[a] != ' ' && line[a] != '\t' && line[a] != '\r' && b < VS_FILE_MAX - 1)
+            wit[b++] = line[a++];
+        wit[b] = 0;
+        if (!nm[0] || !wit[0]) { bad++; continue; }  /* 没带见证路径的行：不认（下面计数） */
+        if (cnt >= cap) { bad++; continue; }
+        vs_strcpy(out[cnt].name, VS_NAME_MAX, nm);
+        vs_strcpy(out[cnt].witness, VS_FILE_MAX, wit);
+        cnt++;
+    }
+    *n = cnt;
+    vs_log(tag, "provides load path=%s entries=%d ignored=%d cap=%d\n",
+           VS_PROVIDES_PATH, cnt, bad, cap);
+    return VS_OK;
+}
+static int dep_check(const char* tag, const struct VsCtx* cx, const char* pkg, const char* dep,
+                     int* forced_out) {
+    if (forced_out) *forced_out = 0;
+    if (vs_db_find(cx->inst, cx->ninst, dep) >= 0) {
+        vs_log(tag, "depends name=%s on=%s state=ok via=installed\n", pkg, dep);
+        return 1;
+    }
+    for (int i = 0; i < cx->npv; i++) {
+        if (!vs_streq(cx->pv[i].name, dep)) continue;
+        if (vs_exists(cx->pv[i].witness)) {
+            vs_log(tag, "depends name=%s on=%s state=ok via=provides witness=%s\n",
+                   pkg, dep, cx->pv[i].witness);
+            return 1;
+        }
+        vs_log(tag, "provides name=%s path=%s missing (declared without evidence)\n",
+               dep, cx->pv[i].witness);
+    }
+    const int in_repo = (vs_index_find(cx->repo, cx->nrepo, dep) >= 0) ? 1 : 0;
+    if (cx->force) {
+        if (forced_out) *forced_out = 1;
+        vs_log(tag, "depends name=%s on=%s state=forced in_repo=%d "
+                    "(--force-depends: dependency check skipped)\n", pkg, dep, in_repo);
+        return 1;
+    }
+    vs_log(tag, "depends name=%s on=%s state=missing in_repo=%d\n", pkg, dep, in_repo);
+    vs_log(tag, "install %s first\n", dep);
+    return 0;
+}
+
 /* ==================== 安装：.vap64 分支 ==================== */
 static int install_vap64(const char* tag, const struct VsPkg* p, const unsigned char* file, int flen,
                          struct VsInstalled* rec) {
@@ -727,21 +874,26 @@ static int install_vap64(const char* tag, const struct VsPkg* p, const unsigned 
     vs_log(tag, "install file path=%s bytes=%d\n", share, flen);
 
     vs_strcpy(rec->name, VS_NAME_MAX, p->name);
+    vs_strcpy(rec->src, VS_NAME_MAX, p->name);
     vs_strcpy(rec->version, VS_VER_MAX, p->version);
     vs_strcpy(rec->arch, VS_ARCH_MAX, p->arch);
     vs_strcpy(rec->type, VS_TYPE_MAX, "vap64");
     rec->bytes = v.code_size;
     vs_strcpy(rec->sha256, 65, p->sha256);
     rec->nfiles = 0;
-    vs_strcpy(rec->files[rec->nfiles++], VS_FILE_MAX, target);
-    vs_strcpy(rec->files[rec->nfiles++], VS_FILE_MAX, share);
+    rec->nfiles = 0;
+    if (vs_inst_file_add(rec, target) != 0 || vs_inst_file_add(rec, share) != 0) {
+        vs_log(tag, "installed files pool full used=%d cap=%d\n",
+               vs_inst_files_used(), VS_FILE_POOL_MAX);
+        return VS_E_NOMEM;
+    }
     return VS_OK;
 }
 
 #ifndef VS_STORE_GUI
 /* ==================== 安装：.deb 分支 ==================== */
 static int install_deb(const char* tag, const struct VsPkg* p, const unsigned char* file, int flen,
-                       const struct VsInstalled* inst, int ninst, struct VsInstalled* rec) {
+                       const struct VsCtx* cx, struct VsInstalled* rec) {
     struct DebInfo di;
     for (int i = 0; i < (int)sizeof(di); i++) ((unsigned char*)&di)[i] = 0;
     int nctl = 0, ndata = 0;
@@ -751,24 +903,32 @@ static int install_deb(const char* tag, const struct VsPkg* p, const unsigned ch
         vs_log(tag, "deb members control=%d data=%d\n", nctl, ndata);
         return VS_E_FORMAT;
     }
-    if (di.control_xz || di.data_xz || di.control_bz2 || di.data_bz2) {
-        vs_log(tag, "deb compression control=%s data=%s (only gzip is supported)\n",
-               di.control_xz ? "xz" : (di.control_bz2 ? "bz2" : "gz"),
-               di.data_xz ? "xz" : (di.data_bz2 ? "bz2" : "gz"));
+    /* 只认 gzip / xz：bzip2 不在本批范围内（zstd 同理）——如实拒绝，不假装成功 */
+    if (di.control_bz2 || di.data_bz2) {
+        vs_log(tag, "deb compression control=%s data=%s (bzip2 is not supported)\n",
+               di.control_bz2 ? "bz2" : (di.control_xz ? "xz" : "gz"),
+               di.data_bz2 ? "bz2" : (di.data_xz ? "xz" : "gz"));
         return VS_E_XZ;
     }
+    vs_log(tag, "deb compression control=%s data=%s\n",
+           di.control_xz ? "xz" : "gz", di.data_xz ? "xz" : "gz");
 
     const int cbufsz = 256 * 1024;
+    const int dbufsz = 4 * 1024 * 1024;        /* 与 gzip 路同口径：control/data.tar 各自上限 */
     unsigned char* cbuf = (unsigned char*)vs_mmap(cbufsz);
-    unsigned char* dbuf = (unsigned char*)vs_mmap(4 * 1024 * 1024);
+    unsigned char* dbuf = (unsigned char*)vs_mmap(dbufsz);
     if (!cbuf || !dbuf) return VS_E_NOMEM;
 
+    /* ① control.tar.{gz,xz}：xz 走 vs_xz.c（LZMA2），gzip 还是 vs_gunzip */
     int clen = 0;
-    if (vs_gunzip(file + di.control_off, di.control_size, cbuf, cbufsz, &clen) != 0) {
+    if (di.control_xz) {
+        rc = vs_unxz(tag, "control.tar.xz", file + di.control_off, di.control_size, cbuf, cbufsz, &clen);
+        if (rc != VS_OK) return rc;
+    } else if (vs_gunzip(file + di.control_off, di.control_size, cbuf, cbufsz, &clen) != 0) {
         vs_log(tag, "control.tar.gz inflate FAILED bytes=%d\n", di.control_size);
         return VS_E_FORMAT;
     }
-    /* ① control.tar：先看维护者脚本（**整包拒绝**），再解 Depends */
+    /* ①.1 control.tar：先看维护者脚本（**整包拒绝**），再记 control 字段与 Depends */
     int off = 0;
     char nm[192];
     struct TarEnt e;
@@ -791,21 +951,30 @@ static int install_deb(const char* tag, const struct VsPkg* p, const unsigned ch
         vs_log(tag, "maintainer scripts not supported\n");
         return VS_E_SCRIPTS;
     }
-    /* control 里声明的依赖：与索引里的 depends 一并检查（一层） */
+    /* ①.2 control 里声明的依赖：与索引里的 depends 走**同一条**判定（已装库 + provides + repo 提示） */
+    int nmiss = 0, nforced = 0;
     for (int i = 0; i < di.ndep; i++) {
-        if (vs_db_find(inst, ninst, di.depends[i]) < 0) {
-            vs_log(tag, "deb depends missing=%s\n", di.depends[i]);
-            return VS_E_DEPENDS;
-        }
+        int forced = 0;
+        if (!dep_check(tag, cx, di.pkg[0] ? di.pkg : p->name, di.depends[i], &forced)) nmiss++;
+        else if (forced) nforced++;
+    }
+    if (nmiss > 0) {
+        vs_log(tag, "deb depends missing=%d of=%d (see depends … state=missing above)\n", nmiss, di.ndep);
+        log_err(tag, VS_E_DEPENDS, "missing dependency (install it first, or pass --force-depends to skip)");
+        return VS_E_DEPENDS;
     }
 
     vs_log(tag, "progress pct=35\n");
+    /* ② data.tar.{gz,xz} */
     int dlen = 0;
-    if (vs_gunzip(file + di.data_off, di.data_size, dbuf, 4 * 1024 * 1024, &dlen) != 0) {
-        vs_log(tag, "data.tar.gz inflate FAILED bytes=%d cap=%d\n", di.data_size, 4 * 1024 * 1024);
+    if (di.data_xz) {
+        rc = vs_unxz(tag, "data.tar.xz", file + di.data_off, di.data_size, dbuf, dbufsz, &dlen);
+        if (rc != VS_OK) return rc;
+    } else if (vs_gunzip(file + di.data_off, di.data_size, dbuf, dbufsz, &dlen) != 0) {
+        vs_log(tag, "data.tar.gz inflate FAILED bytes=%d cap=%d\n", di.data_size, dbufsz);
         return VS_E_FORMAT;
     }
-    /* ①.5 预扫：总字节数（空间检查的依据）+ 路径合法性 + 不支持的类型 */
+    /* ②.5 预扫：总字节数（空间检查的依据）+ 路径合法性 + 不支持的类型 + **文件数统计** */
     long long total = 0;
     int nfiles = 0, ndirs = 0;
     off = 0;
@@ -823,11 +992,14 @@ static int install_deb(const char* tag, const struct VsPkg* p, const unsigned ch
         total += e.size;
         tar_skip(&off, e.size);
     }
+    /* ★ 文件数/字节统计（"装得下真包"的证据；老版本在 12 条上把真包全拒了） */
+    vs_log(tag, "deb stats files=%d dirs=%d payload=%d archive=%d cap=%d\n",
+           nfiles, ndirs, (int)total, flen, VS_FILES_MAX);
     if (nfiles > VS_FILES_MAX) {
         vs_log(tag, "deb files=%d cap=%d\n", nfiles, VS_FILES_MAX);
         return VS_E_FORMAT;
     }
-    /* ② 空间检查：payload 全部字节 + 归档副本 + 32 KiB 余量 */
+    /* ③ 空间检查：payload 全部字节 + 归档副本 + 32 KiB 余量 */
     const long long need = total + flen + 32 * 1024;
     const long long freeb = vs_free_bytes("/");
     vs_log(tag, "space need=%d free=%d dirs=%d files=%d payload=%d\n",
@@ -835,10 +1007,11 @@ static int install_deb(const char* tag, const struct VsPkg* p, const unsigned ch
     if (freeb < 0) return VS_E_IO;
     if (freeb < need) return VS_E_SPACE;
 
-    /* ③ 落盘 */
+    /* ④ 落盘 */
     vs_log(tag, "progress pct=55\n");
     off = 0;
-    int wf = 0;                      /* 本分支落盘的文件数（只用于诊断日志） */
+    int wf = 0;                      /* 真落盘的文件数（与预扫的 nfiles 对账） */
+    long long wbytes = 0;
     while (tar_next(dbuf, dlen, &off, &e, nm, (int)sizeof(nm)) == 1) {
         char full[VS_FILE_MAX];
         vs_fmt(full, (int)sizeof(full), "/%s", tar_strip(nm));
@@ -866,12 +1039,22 @@ static int install_deb(const char* tag, const struct VsPkg* p, const unsigned ch
         char h[65];
         sha256_of(dbuf + off, e.size, h);
         vs_log(tag, "install file path=%s bytes=%d sha256=%s\n", full, e.size, h);
-        if (rec->nfiles < VS_FILES_MAX) vs_strcpy(rec->files[rec->nfiles++], VS_FILE_MAX, full);
+        if (vs_inst_file_add(rec, full) != 0) {              /* 池满/单包超 4096：如实报，不截断 */
+            vs_log(tag, "installed files pool full used=%d cap=%d files=%d\n",
+                   vs_inst_files_used(), VS_FILE_POOL_MAX, rec->nfiles);
+            return VS_E_NOMEM;
+        }
         tar_skip(&off, e.size);
         wf++;
+        wbytes += e.size;
+    }
+    vs_log(tag, "deb written files=%d bytes=%d archive=%d\n", wf, (int)wbytes, flen);
+    if (wf != nfiles) {                                      /* 预扫与落盘必须对得上 */
+        vs_log(tag, "deb written files=%d != scanned files=%d\n", wf, nfiles);
+        return VS_E_FORMAT;
     }
     vs_log(tag, "progress pct=80\n");
-    /* ④ 归档副本（与 .vap64 同一约定：包本体留在 /usr/share/<name>/） */
+    /* ⑤ 归档副本（与 .vap64 同一约定：包本体留在 /usr/share/<name>/） */
     char shdir[VS_FILE_MAX], share[VS_FILE_MAX];
     const char* self = (di.pkg[0] ? di.pkg : p->name);
     vs_fmt(shdir, (int)sizeof(shdir), "/usr/share/%s", self);
@@ -881,22 +1064,25 @@ static int install_deb(const char* tag, const struct VsPkg* p, const unsigned ch
     {   const int wr = vs_write_file(share, file, flen);
         if (wr != 0) return io_code_of(wr); }
     vs_log(tag, "install file path=%s bytes=%d\n", share, flen);
-    if (rec->nfiles < VS_FILES_MAX) vs_strcpy(rec->files[rec->nfiles++], VS_FILE_MAX, share);
+    if (vs_inst_file_add(rec, share) != 0) return VS_E_NOMEM;
 
-    if (wf < 0) vs_log(tag, "internal: wf=%d\n", wf);       /* wf 只做诊断（占用即已读） */
     vs_strcpy(rec->name, VS_NAME_MAX, self);
+    vs_strcpy(rec->src, VS_NAME_MAX, p->name);
     vs_strcpy(rec->version, VS_VER_MAX, di.ver[0] ? di.ver : p->version);
     vs_strcpy(rec->arch, VS_ARCH_MAX, di.arch[0] ? di.arch : p->arch);
     vs_strcpy(rec->type, VS_TYPE_MAX, "deb");
-    rec->bytes = (int)total;
+    rec->bytes = (int)wbytes;
     vs_strcpy(rec->sha256, 65, p->sha256);
+    if (nforced > 0) vs_log(tag, "deb depends forced=%d (state=forced: dependency check skipped)\n", nforced);
     return VS_OK;
 }
 #endif  /* !VS_STORE_GUI：deb 的安装分支也只编进 /bin/vpkg（见文件头与本段说明） */
 
 /* ==================== 安装（总入口） ==================== */
-int vs_install(const char* tag, const char* arg, int do_progress) {
+int vs_install(const char* tag, const char* arg, int do_progress, int force_depends) {
     (void)do_progress;
+    if (force_depends)                       /* --force-depends：显式给才有这一行（见 vs.h 与文件头） */
+        vs_log(tag, "depends force=1 (--force-depends: missing deps are skipped and logged per line)\n");
     if (!arg || !arg[0]) {
         log_err(tag, VS_E_PATH, "empty package name");
         return VS_E_PATH;
@@ -907,10 +1093,10 @@ int vs_install(const char* tag, const char* arg, int do_progress) {
     for (int i = 0; i < (int)sizeof(pkg); i++) ((unsigned char*)&pkg)[i] = 0;
     char src[VS_FILE_MAX];
     int from_index = 0;
+    struct VsPkg* const repo = scratch_repo();          /* 索引表：安装全程共用（依赖判定也要它） */
+    int nrepo = 0;
     {
-        struct VsPkg* const repo = scratch_repo();
     if (!repo) return VS_E_NOMEM;
-        int nrepo = 0;
         const int rc = vs_index_load(VS_INDEX_PATH, repo, VS_MAX_PKGS, &nrepo);
         if (rc != VS_OK && vs_find(arg, "/") < 0) {
             log_err(tag, rc == VS_E_NOTFOUND ? VS_E_NOTFOUND : rc,
@@ -1007,23 +1193,42 @@ int vs_install(const char* tag, const char* arg, int do_progress) {
         log_err(tag, VS_E_IO, "installed database is corrupt");
         return VS_E_IO;
     }
+    /* ★ "已装"的判定用**来源身份（index_name）**，不是 control 里的 Package 名 ——
+     *   理由（如实写在这里，也写在报告里）：同一个 Debian 包在仓库里可以有**几个变体**
+     *   （夹具就是：原样 xz / gzip 重压 / 去 Depends / 只留一个文件，control 里都写着 Package: hello）。
+     *   按 Package 名判"已装"会让第二个变体被 rc=6 挡住，而按索引名判就允许"同一 payload 的
+     *   不同打包形态分别装"；反例（真的重复装同一个包）仍然 rc=6 —— vpkg64_test ⑤ 就是那条。
+     *   DB 里 name 仍是 control 的 Package 名（依赖按它查），另存 index_name 作为身份。 */
     for (int i = 0; i < ninst; i++) {
-        if (vs_streq(inst[i].name, pkg.name)) {
-            vs_log(tag, "already installed name=%s version=%s\n", inst[i].name, inst[i].version);
+        const char* key = inst[i].src[0] ? inst[i].src : inst[i].name;   /* 老 DB 没有 src：退回 name */
+        if (vs_streq(key, pkg.name)) {
+            vs_log(tag, "already installed name=%s version=%s index_name=%s\n",
+                   inst[i].name, inst[i].version, key);
             log_err(tag, VS_E_INSTALLED, "package already installed (remove it first)");
             return VS_E_INSTALLED;
         }
     }
 
-    /* ---- ⑥ 依赖（一层） ---- */
+    /* ---- ⑥ 依赖（一层 + provides 表 + 仓库提示；--force-depends 显式才跳过） ----
+     * 三条来源与逐条打点见 dep_check()；这里把三张表 + force 开关打成一份 VsCtx 传下去。 */
+    struct VsProvides* const pv = (struct VsProvides*)vs_mmap((int)sizeof(struct VsProvides) * VS_PROVIDES_MAX);
+    if (!pv) return VS_E_NOMEM;
+    int npv = 0;
+    {   const int pr = provides_load(tag, pv, VS_PROVIDES_MAX, &npv);
+        if (pr != VS_OK) return pr; }
+    struct VsCtx cx;
+    cx.inst = inst;  cx.ninst = ninst;
+    cx.repo = repo;  cx.nrepo = nrepo;
+    cx.pv   = pv;    cx.npv   = npv;
+    cx.force = force_depends;
+    int nforced = 0;
     for (int i = 0; i < pkg.ndep; i++) {
-        if (vs_db_find(inst, ninst, pkg.depends[i]) < 0) {
-            vs_log(tag, "depends name=%s on=%s state=missing\n", pkg.name, pkg.depends[i]);
-            vs_log(tag, "install %s first\n", pkg.depends[i]);
-            log_err(tag, VS_E_DEPENDS, "missing dependency");
+        int forced = 0;
+        if (!dep_check(tag, &cx, pkg.name, pkg.depends[i], &forced)) {
+            log_err(tag, VS_E_DEPENDS, "missing dependency (install it first, or pass --force-depends to skip)");
             return VS_E_DEPENDS;
         }
-        vs_log(tag, "depends name=%s on=%s state=ok\n", pkg.name, pkg.depends[i]);
+        if (forced) nforced++;
     }
 
     /* ---- ⑦ 大小 / sha256（索引声明必须与盘上文件一致） ---- */
@@ -1064,9 +1269,10 @@ int vs_install(const char* tag, const char* arg, int do_progress) {
         rc = install_vap64(tag, &pkg, file, flen, &rec);
 #ifndef VS_STORE_GUI
     } else if (vs_streq(pkg.type, "deb")) {
-        rc = install_deb(tag, &pkg, file, flen, inst, ninst, &rec);
+        rc = install_deb(tag, &pkg, file, flen, &cx, &rec);
 #else
     } else if (vs_streq(pkg.type, "deb")) {
+        (void)cx;            /* GUI 版不编 deb 分支：消掉 -Wunused（build_store.sh 带 -Werror） */
         vs_log(tag, "deb install: delegate to /bin/vpkg (this build has no inflate/ar/tar)\n");
         log_err(tag, VS_E_FORMAT, "deb needs the vpkg CLI in this build");
         return VS_E_FORMAT;
@@ -1094,8 +1300,8 @@ int vs_install(const char* tag, const char* arg, int do_progress) {
     }
     vs_log(tag, "db write path=%s entries=%d bytes=%d\n", VS_DB_PATH, ninst, dbbytes);
     vs_log(tag, "progress pct=100\n");
-    vs_log(tag, "install ok name=%s version=%s type=%s files=%d bytes=%d\n",
-           rec.name, rec.version, rec.type, rec.nfiles, rec.bytes);
+    vs_log(tag, "install ok name=%s version=%s type=%s files=%d bytes=%d forced=%d\n",
+           rec.name, rec.version, rec.type, rec.nfiles, rec.bytes, nforced);
     vs_cache_drop();
     return VS_OK;
 }
@@ -1120,11 +1326,34 @@ int vs_remove(const char* tag, const char* name) {
         log_err(tag, VS_E_NOTINST, "package is not installed");
         return VS_E_NOTINST;
     }
-    int removed = 0;
+    int removed = 0, rmdirs = 0;
     for (int i = 0; i < inst[idx].nfiles; i++) {
-        const int ur = vs_unlink(inst[idx].files[i]);
-        vs_log(tag, "remove file path=%s rc=%d\n", inst[idx].files[i], ur);
+        const char* fp = vs_inst_file(&inst[idx], i);
+        const int ur = vs_unlink(fp ? fp : "");
+        vs_log(tag, "remove file path=%s rc=%d\n", fp ? fp : "(null)", ur);
         if (ur == 0) removed++;
+    }
+    /* ★ 卸载也要把**本包自己的空目录**收干净：内核**有** rmdir（Linux 号段 84，
+     *   kernel/syscall64.cpp:1536，非空回 -ENOTEMPTY），所以"零残留"这条能真做到。
+     *   做法：文件都删完之后，对每个落盘文件从**它所在目录往上**逐级试 rmdir，
+     *   某一级失败就停（说明还有别人的文件 / 已经到底）；
+     *   只 rmdir **深度 >= 3** 的目录（例如 /usr/share/<pkg>），绝不去碰 /usr、/usr/share、
+     *   /bin 这些系统目录；失败的尝试**不打日志**（噪声），真删掉的那一级打一行证据。 */
+    for (int i = 0; i < inst[idx].nfiles; i++) {
+        const char* fp = vs_inst_file(&inst[idx], i);
+        if (!fp) continue;
+        char dir[VS_FILE_MAX];
+        vs_strcpy(dir, (int)sizeof(dir), fp);
+        for (;;) {
+            int cut = -1, slashes = 0;
+            for (int k = 0; k < (int)vs_strlen(dir); k++) if (dir[k] == '/') { cut = k; slashes++; }
+            if (cut <= 0 || slashes < 3) break;                 /* /a/b/c 起步才算"包自己的目录" */
+            dir[cut] = 0;
+            const int dr = (int)__v64_syscall(84 /*rmdir*/, (long)(unsigned long)dir, 0, 0, 0, 0);
+            if (dr != 0) break;                                /* 非空 / 不存在：到此为止 */
+            vs_log(tag, "remove dir path=%s rc=0\n", dir);
+            rmdirs++;
+        }
     }
     /* 从 DB 里删掉这一条（后面的往前挪） */
     for (int i = idx; i + 1 < ninst; i++) inst[i] = inst[i + 1];
@@ -1136,7 +1365,7 @@ int vs_remove(const char* tag, const char* name) {
         return VS_E_IO;
     }
     vs_log(tag, "db write path=%s entries=%d bytes=%d\n", VS_DB_PATH, ninst, dbbytes);
-    vs_log(tag, "remove ok name=%s files=%d entries=%d\n", name, removed, ninst);
+    vs_log(tag, "remove ok name=%s files=%d dirs=%d entries=%d\n", name, removed, rmdirs, ninst);
     vs_cache_drop();
     return VS_OK;
 }
@@ -1194,8 +1423,10 @@ int vs_info(const char* tag, const char* name) {
     if (k >= 0) {
         vs_log(tag, "info installed=yes version=%s type=%s bytes=%d files=%d path=%s\n",
                inst[k].version, inst[k].type, inst[k].bytes, inst[k].nfiles, VS_DB_PATH);
-        for (int f = 0; f < inst[k].nfiles; f++)
-            vs_log(tag, "info file path=%s\n", inst[k].files[f]);
+        for (int f = 0; f < inst[k].nfiles; f++) {
+            const char* fp = vs_inst_file(&inst[k], f);
+            vs_log(tag, "info file path=%s\n", fp ? fp : "(null)");
+        }
     } else {
         vs_log(tag, "info installed=no\n");
     }

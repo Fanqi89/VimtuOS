@@ -43,14 +43,25 @@ $CC -nostdinc -ffreestanding -fno-pic -fno-pie -ffunction-sections -fdata-sectio
     -c user/lib/syscall.S -o "$OBJ/syscall.S.o"
 LIB_OBJS="$OBJ/syscall.c.o $OBJ/string.c.o $OBJ/stdlib.c.o $OBJ/stdio.c.o $OBJ/crt0.o $OBJ/syscall.S.o"
 
-# CLI 版引擎对象（含 deb 的 ar/tar/gzip：只有 /bin/vpkg 带这段）
-for f in user/store/vs_io.c user/store/vs_gzip.c user/store/vs_pkg.c; do
-    o="$OBJ/$(basename "$f").o"
-    $CC $CFLAGS_COMMON $CFLAGS_NOSSE -c "$f" -o "$o"
-done
-VS_OBJS="$OBJ/vs_io.c.o $OBJ/vs_gzip.c.o $OBJ/vs_pkg.c.o"
-
-# GUI 版（-DVS_STORE_GUI **不编** deb 的 inflate/ar/tar）——★ 全部用 -Os：
+# ---- CLI 版引擎对象（含 deb 的 ar/tar/gzip/**xz**：只有 /bin/vpkg 带这段）----
+# ★ 体积（kernel/elf64.cpp 的 64 KiB PT_LOAD 硬约束，本脚本末尾自检）：
+#   这一批把 xz 解码核（third_party/lzma，~12 KB 机器码）+ vs_xz.c 编进 /bin/vpkg 之后，
+#   装载区从"余 18 KB"变成"只剩 2 KB 出头"，所以 **整个 CLI 版都改 -Os**
+#   （4 个引擎对象 + vpkg.c；-O2 会再涨 ~6 KB，直接越界）。
+#   行为完全一样，只是代码更小；GUI 版本来就是 -Os。
+VSFLAGS="$CFLAGS_COMMON $CFLAGS_NOSSE -Os -I third_party/lzma"
+$CC $VSFLAGS -c user/store/vs_io.c   -o "$OBJ/vs_io.c.o"
+$CC $VSFLAGS -c user/store/vs_gzip.c -o "$OBJ/vs_gzip.c.o"
+$CC $VSFLAGS -c user/store/vs_xz.c   -o "$OBJ/vs_xz.c.o"
+$CC $VSFLAGS -c user/store/vs_pkg.c  -o "$OBJ/vs_pkg.c.o"
+# ★ vendored 解码核（third_party/lzma：Igor Pavlov，public domain；见那里的 README/LICENSE）：
+#   编进 /bin/vpkg，用 -w 关掉上游代码的风格告警（本仓库自己的文件仍然 -Wall -Wextra -Werror）。
+VWFLAGS="$VSFLAGS -w"
+$CC $VWFLAGS -c third_party/lzma/LzmaDec.c  -o "$OBJ/lzma-LzmaDec.c.o"
+$CC $VWFLAGS -c third_party/lzma/Lzma2Dec.c -o "$OBJ/lzma-Lzma2Dec.c.o"
+VS_OBJS="$OBJ/vs_io.c.o $OBJ/vs_gzip.c.o $OBJ/vs_xz.c.o $OBJ/vs_pkg.c.o \
+ $OBJ/lzma-LzmaDec.c.o $OBJ/lzma-Lzma2Dec.c.o"
+# ---- GUI 版（-DVS_STORE_GUI **不编** deb 的 inflate/ar/tar/xz）——★ 全部用 -Os：
 #   256x60 窗口 + stb_truetype（font64）已经把 64 KiB 主程序装载区吃满，只能靠体积换功能。
 #   GUI 对 deb 走 `/bin/vpkg install <name>` 子进程（同一份引擎），见 vs_pkg.c 与 store.c 的说明。
 for f in user/store/vs_io.c user/store/vs_gzip.c user/store/vs_pkg.c; do
@@ -60,7 +71,7 @@ done
 VS_OBJS_GUI="$OBJ/gui-vs_io.c.o $OBJ/gui-vs_gzip.c.o $OBJ/gui-vs_pkg.c.o"
 
 # ---- ① /bin/vpkg（命令行）----
-$CC $CFLAGS_COMMON $CFLAGS_NOSSE -c user/store/vpkg.c -o "$OBJ/vpkg.o"
+$CC $CFLAGS_COMMON $CFLAGS_NOSSE -Os -c user/store/vpkg.c -o "$OBJ/vpkg.o"
 $LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/apps/evshm_demo.ld \
     -o "$BUILD/vpkg.elf" $OBJ/vpkg.o $VS_OBJS $LIB_OBJS
 

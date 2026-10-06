@@ -55,6 +55,24 @@ VPKG_VOL = "/bin/vpkg"
 STORE_VOL = "/bin/store"
 REPO_VOL = "/opt/vpkg/repo"
 INDEX_VOL = "/opt/vpkg/index.json"
+PROVIDES_VOL = "/etc/vpkg/provides"                 # provides 表：/bin/vpkg 的依赖模型用它
+
+# provides 表默认内容（**每行必须带一条见证路径**：只有那个文件真在卷上，/bin/vpkg 才认这条声明；
+# 见 user/store/vs_pkg.c 的"依赖模型"）。下面这条 libc6 只有在镜像里真的装了 glibc 共享库
+# （例如 tests/linuxapp64_test.py 的 lxcorpus 夹具盘）时才作数；普通系统卷上它是**惰性**的
+# （/bin/vpkg 会打 `provides … path=… missing` 并当没提供）。
+PROVIDES_DEFAULT = (
+    "# /etc/vpkg/provides - 本镜像\"已经提供\"的发行版包名（/bin/vpkg 的依赖模型读它）\n"
+    "#\n"
+    "# 每行： <包名> <见证路径>\n"
+    "#   * 包名 = Debian 的包名（`Depends:` 里出现的那个名字）；\n"
+    "#   * 见证路径 = 卷上**必须真的存在**的文件：stat 得到才算数（\"声明\"不等于\"证据\"），\n"
+    "#     没带见证路径的行一律不认；\n"
+    "#   * '#' 开头的行是注释。\n"
+    "#\n"
+    "# libc6：Debian bookworm 的 glibc 2.36（ld-linux + libc.so.6）。镜像里没装它时不生效。\n"
+    "libc6 /lib/x86_64-linux-gnu/libc.so.6\n"
+)
 
 
 def load_mod(name, path):
@@ -448,6 +466,8 @@ def main():
     ap.add_argument("--store", default=None, help="build64/store/store.elf")
     ap.add_argument("--repo", default=None, help="仓库目录（含 index.json）")
     ap.add_argument("--src", action="append", default=None, help="额外文件 <宿主>:<卷内>:<模式>")
+    ap.add_argument("--provides", default=None,
+                    help="provides 表（默认 = 本工具内置那份；装到 /etc/vpkg/provides）")
     ap.add_argument("--extra-dir", default=None, help="（夹具）把目录内容装到 /opt/vpkg/extra/")
     ap.add_argument("--writable-roots", action="store_true",
                     help="（夹具）把 /bin /usr/share /var 等目录预建成 0777：桌面会话是 **uid 1000**，"
@@ -514,6 +534,15 @@ def main():
     files = collect_files(args)
     if files is None:
         return 2
+    # ★ provides 表：装到 /etc/vpkg/provides（--provides 可给一份自己的；默认见 PROVIDES_DEFAULT）
+    if args.provides:
+        pb = open(args.provides, "rb").read()
+        print("    %-16s = %d B（--provides）" % (PROVIDES_VOL, len(pb)))
+    else:
+        pb = PROVIDES_DEFAULT.encode("utf-8")
+        print("    %-16s = %d B（内置默认：%d 行，见 tools/store_pack_win.py）"
+              % (PROVIDES_VOL, len(pb), len(PROVIDES_DEFAULT.strip().splitlines())))
+    files[PROVIDES_VOL] = (pb, 0o644)
     for path in sorted(files):
         vol.put(path, files[path][0], mode=files[path][1])
     out = vol.finish()

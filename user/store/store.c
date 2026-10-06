@@ -331,7 +331,7 @@ static int do_install(void) {
     int is_deb = 0;
     for (int i = 0; i < g_nrepo; i++)
         if (vs_streq(g_repo[i].name, name) && vs_streq(g_repo[i].type, "deb")) is_deb = 1;
-    const int rc = is_deb ? install_deb_via_cli(name) : vs_install(VS_TAG_GUI, name, 1);
+    const int rc = is_deb ? install_deb_via_cli(name) : vs_install(VS_TAG_GUI, name, 1, 0 /* 不跳过依赖 */);
     if (rc == VS_OK) {
         vs_strcpy(g_status_msg, 48, "installed ok");
         g_status = 1;
@@ -367,8 +367,10 @@ static void launch_clicked_pkg(void) {
     int have = 0;
     const int iv = installed_version_of(name);
     if (iv >= 0) {
-        for (int f = 0; f < g_inst[iv].nfiles; f++)
-            if (vs_streq(g_inst[iv].files[f], path)) have = 1;
+        for (int f = 0; f < g_inst[iv].nfiles; f++) {
+            const char* fp = vs_inst_file(&g_inst[iv], f);
+            if (fp && vs_streq(fp, path)) have = 1;
+        }
     }
     if (!have) {
         vs_log(VS_TAG_GUI, "launch name=%s path=%s state=not-installed\n", name, path);
@@ -406,11 +408,15 @@ static void launch_clicked_pkg(void) {
 int main(void) {
     printf("[STORE] ver=1 pid=%d\n", getpid());
 
-    /* ---- ① 仓库 / 已装库（读一次，后面用缓存）---- */
-    refresh_tables();
-    printf("[STORE] repo packages=%d installed=%d page=1/%d\n", g_nrepo, g_ninst, total_pages());
-
-    /* ---- ② 合成器：先看哪个路径在（/lib/wm.elf 优先；内核只认 /bin/wm.elf）---- */
+    /* ---- ① 合成器：先看哪个路径在（/lib/wm.elf 优先；内核只认 /bin/wm.elf）----
+     * ★ 顺序很重要：**fork 必须发生在任何"大" mmap 之前**。kernel/proc64.cpp 的 fork 是
+     *   "整页物理复制"，上限 PROC64_FORK_MAX_PAGES = 256 页（≈1 MiB）；本进程后面要 mmap
+     *   索引 64 KiB + 已装库 256 KiB + 落盘清单池（VS_FILE_POOL_MAX，1 MiB）+ 字体光栅 1 MiB，
+     *   随便哪一个都让"fork 时整页复制"越界。实测（这一批把清单池做进 vs_pkg 之后）：
+     *     [PROC64] fork FAILED reason=copy-or-limit parent-name=sh64
+     *     [STORE] wm path=/lib/wm.elf pid=-1          ← 合成器起不来，整条 GUI 路全红
+     *   所以：**先在"只有 ELF + 栈"的时候把合成器和启动助手 fork 出来**，再去读表/读字体。
+     *   （这也是本文件下面 start_launcher 那条注释的同一条理由，只是原来只照顾了字体。） */
     const char* wm = VS_WM_PATH;
     if (!vs_exists(wm)) {
         if (vs_exists(VS_WM_ALT_PATH)) wm = VS_WM_ALT_PATH;
@@ -434,8 +440,12 @@ int main(void) {
     }
     printf("[STORE] wm path=%s pid=%d\n", wm, wmpid);
 
-    /* ---- ②.5 启动助手：必须在 font64 的 1 MiB 光栅区**之前** fork（理由见 start_launcher）---- */
+    /* ---- ①.5 启动助手：同样必须在上面那些 mmap 之前 fork（理由见 start_launcher）---- */
     (void)start_launcher();
+
+    /* ---- ② 仓库 / 已装库（读一次，后面用缓存）---- */
+    refresh_tables();
+    printf("[STORE] repo packages=%d installed=%d page=1/%d\n", g_nrepo, g_ninst, total_pages());
 
     vimtu64_sleep_ms(2500);            /* 合成器要映射 33 MB 后备缓冲 + 标定 rdtsc（SDK 模板同款）*/
 
