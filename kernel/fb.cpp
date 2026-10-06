@@ -562,24 +562,45 @@ static int fb64_irqs_on(void) {                       // hlt 只在 IF=1 时用�
 }
 
 // ---------- ⑭-1 配置通道：fw_cfg 文件目录（键 0x19）+ 一条字符串文件 ----------
-static void fb64_fwcfg_sel(uint16_t sel) {            // 16 位**大端**选择器
-    outb(0x510, (uint8_t)(sel >> 8));
-    outb(0x510, (uint8_t)(sel & 0xFF));
-}
+// 【实测踩坑】selector 是"大端 16 位"，但 0x510/0x511 两个字节里低字节在 0x511（与数据口
+// 重叠）；QEMU 11 对"两次 8 位写"的解释跟老版本/文档写法不一定一致（本批第一次实测就没读到
+// 目录：读回的条目数越界 -> 直接放弃 -> 帧引擎一行不打）。所以这里**四种写法都试一遍**，
+// 谁能让目录条目数落到 1..64 就固定用它（每种只读 4 字节，有界，绝不挂）。
 static uint8_t fb64_fwcfg_rd8(void) { return inb(0x511); }
 static uint32_t fb64_fwcfg_rd32(void) {               // fw_cfg 的数字字段一律大端
     uint32_t v = 0;
     for (int i = 0; i < 4; i++) v = (v << 8) | (uint32_t)fb64_fwcfg_rd8();
     return v;
 }
+static int g_fwcfg_variant = -1;                      // -1 = 还没探测出来
+static int fb64_fwcfg_sel_try(int variant, uint16_t sel) {
+    switch (variant) {
+        case 0: outb(0x510, (uint8_t)(sel >> 8)); outb(0x510, (uint8_t)(sel & 0xFF)); break;
+        case 1: outb(0x510, (uint8_t)(sel & 0xFF)); outb(0x510, (uint8_t)(sel >> 8)); break;
+        case 2: outw(0x510, (uint16_t)((sel << 8) | (sel >> 8))); break;
+        default: outw(0x510, sel); break;
+    }
+    const uint32_t cnt = fb64_fwcfg_rd32();           // 目录首 4 字节 = 条目数（大端）
+    return (cnt >= 1 && cnt <= 64) ? (int)cnt : -1;
+}
+static void fb64_fwcfg_select(uint16_t sel) {         // 用已确定的那种写法选条目
+    (void)fb64_fwcfg_sel_try(g_fwcfg_variant, sel);
+}
+// 探测：返回 1 = 找到可用的写法（g_fwcfg_variant 固定下来），0 = 这台机器没有可读的 fw_cfg
+static int fb64_fwcfg_probe(void) {
+    for (int v = 0; v < 4; v++) {
+        if (fb64_fwcfg_sel_try(v, 0x0019) > 0) { g_fwcfg_variant = v; return 1; }
+    }
+    return 0;
+}
 // 找一条名字匹配的文件（name = "opt/vimtu/vsync"）。返回 1 = 找到（*sel/*size 填好）。
-// 有界：条目数上界 64、每条固定 64 字节 -> 最多 64 次；没有 fw_cfg 时第一次读就是 0xFF.. -> 直接退出。
+// 有界：条目数上界 64、每条固定 64 字节 -> 最多 64 次。
 static int fb64_fwcfg_find(const char* name, uint16_t* sel, uint32_t* size) {
-    fb64_fwcfg_sel(0x0019);
-    const uint32_t cnt = fb64_fwcfg_rd32();
-    if (cnt == 0 || cnt > 64) return 0;
-    for (uint32_t i = 0; i < cnt; i++) {
-        const uint32_t sz = fb64_fwcfg_rd32();
+    if (g_fwcfg_variant < 0 && !fb64_fwcfg_probe()) return 0;
+    const int cnt = fb64_fwcfg_sel_try(g_fwcfg_variant, 0x0019);
+    if (cnt < 1) return 0;
+    for (int i = 0; i < cnt; i++) {
+        const uint32_t sz = fb64_fwcfg_rd32();                   // 文件长度（大端）
         const uint16_t s = (uint16_t)(((uint32_t)fb64_fwcfg_rd8() << 8) | (uint32_t)fb64_fwcfg_rd8());
         (void)fb64_fwcfg_rd8(); (void)fb64_fwcfg_rd8();          // reserved（2B）
         char nm[56];
@@ -601,7 +622,7 @@ static void fb64_cfg_load(void) {
     uint16_t sel = 0; uint32_t sz = 0;
     if (!fb64_fwcfg_find("opt/vimtu/vsync", &sel, &sz)) return;
     if (sz == 0 || sz > sizeof(g_vs_cfg) - 1) return;
-    fb64_fwcfg_sel(sel);
+    fb64_fwcfg_select(sel);
     int n = 0;
     for (uint32_t i = 0; i < sz; i++) {
         const char c = (char)fb64_fwcfg_rd8();

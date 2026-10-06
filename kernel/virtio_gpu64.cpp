@@ -501,17 +501,23 @@ static bool vgpu_send(const void* cmd, uint32_t len, int verbose) {
     if (verbose) vgpu_cmd_log(((const VgpuHdr*)cmd)->type, ok ? 1 : 0);
     if (!ok) return false;
     // ★ ⑭ 响应类型校验：0x11xx = OK_*，0x1200..0x12FF = ERR_*（非法参数/资源不存在/不支持）。
-    //   这一批之前只等 used 条目、**不看响应类型** —— 设备"礼貌地拒绝"（坏矩形/坏 offset/坏 resource）
-    //   会被静默当成成功，上屏就是错的。现在把 ERR 当失败：调用方走软件路径 / 计入连续失败。
-    //   （0 长度 used 条目时 g_resp 全 0 -> 视为 OK，与既有容忍行为一致。）
+    //   这一批之前只等 used 条目、**不看响应类型** —— 设备"礼貌地拒绝"会被静默当成成功。
+    //   **作用域收口（重要）**：只有"帧引擎上屏真正依赖"的三条命令把 ERR 判成失败
+    //   （TRANSFER_TO_HOST_2D / RESOURCE_FLUSH / SET_SCANOUT）—— 实测 QEMU 11 对
+    //   RESOURCE_ATTACH_BACKING 会回 ERR_UNSPEC（guest_errors: failed to map MMIO memory for
+    //   element 0），那是**既有缺陷**：以前被静默吞掉；现在如实打一行 ERR 但**不改**既有
+    //   容忍行为（否则设备路径会在 init 就被自己关掉，回归面变大）。
+    const uint32_t ctype = ((const VgpuHdr*)cmd)->type;
     const uint32_t rt = ((const VgpuHdr*)g_resp)->type;          // vgpu_resp_type() 在本函数之后定义
     if (rt >= 0x1200u && rt < 0x1300u) {
-        g_i.last_err = "resp-err";
+        const int strict = (ctype == VGPU_CMD_TRANSFER_TO_HOST_2D || ctype == VGPU_CMD_RESOURCE_FLUSH ||
+                            ctype == VGPU_CMD_SET_SCANOUT);
         vgpu_log_begin();
         vgpu_puts("[VGPU] resp ERR type="); vgpu_hex32(rt);
-        vgpu_puts(" name="); vgpu_puts(vgpu_cmd_name(((const VgpuHdr*)cmd)->type));
+        vgpu_puts(" name="); vgpu_puts(vgpu_cmd_name(ctype));
+        vgpu_puts(strict ? " -> fail" : " (tolerated)");
         vgpu_log_end();
-        return false;
+        if (strict) { g_i.last_err = "resp-err"; return false; }
     }
     return true;
 }
