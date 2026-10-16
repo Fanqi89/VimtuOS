@@ -323,11 +323,17 @@ def run_tear(qemu, img, tmp, cfg_str, vga, expect_gpu, n_shots, ck, tag):
                       % (len(shots), dt, f, len(set(frames_seen))))
             time.sleep(0.12)
         max_span = time.time() - t0
-        # ★ 修：`[VSYNC] stats` / `[VSYNC] bench` 只在引擎**跑满 frames 帧之后**才打；实测引擎
-        #   真实速率远低于 30 fps 的名义节拍（screendump 还会暂停客户机），截图循环结束时通常
-        #   还没跑完 -> 这里按有界上限等它收尾，否则 stats/bench 必然"未命中"（假失败）。
+        # ★ 修（实测口径）：`[VSYNC] stats` / `[VSYNC] bench` 只在引擎**跑满 frames 帧之后**才打，
+        #   而 TCG 下这套引擎的**真实**速率远低于名义节拍 —— 实测 `frames=600` 在**没有** screendump
+        #   干扰时也要 **≈330 s**（0.55 s/帧 ≈ 1.8 fps）；截图循环还会暂停客户机，只会更慢。
+        #   原来的 420 s 上限就**卡在边缘** -> bufs=2 / bufs=3 两个 tear 例里随机哪一个"未命中"
+        #   （被记成"bufs=2 例缺 bench 行"的那个 1 FAIL，根因是这个**上限过紧**，不是内核少打行）。
+        #   这里：① 上限提到 900 s；② **bench 也要等**（它在 stats 之后，中间还有整帧拷回 0 号块
+        #   + 10 次 present 基准）。断言强度一个字没变：bench 行必须真的出现。
         if "[VSYNC] stats" not in vm.log():
-            vm.wait_log("[VSYNC] stats", 420)
+            vm.wait_log("[VSYNC] stats", 900)
+        if "[VSYNC] bench" not in vm.log():
+            vm.wait_log("[VSYNC] bench", 900)
         log = vm.log()
         ck.ch("%s 演示窗口内抓到 >= %d 张（实际 %d 张，%.1fs）" % (tag, n_shots, len(shots), max_span),
               len(shots) >= n_shots, "shots=%d" % len(shots))
