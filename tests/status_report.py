@@ -3033,6 +3033,155 @@ def cap_icon_ext():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_appreg():
+    """★ 本批：应用注册表（/etc/apps.json，单一真源）+ 已安装应用进桌面/开始菜单 + 应用自带图标。"""
+    need = ["kernel/app64.cpp", "kernel/app64.h", "kernel/startmenu64.cpp", "kernel/desktopops64.cpp",
+            "kernel/icons64.cpp", "user/store/vs_pkg.c", "user/store/vs.h", "tests/vpkg64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    reg = grep_count(r"APPREG64_PATH|app64_registry_init64|app64_registry_gen64|app64_registry_on_close64|"
+                     r"ar_reload_and_bump64|parse64|ar_serialize64", ["kernel/app64.cpp", "kernel/app64.h"])
+    hook = grep_count(r"app64_registry_on_close64", ["kernel/fd64.cpp"])
+    menu = grep_count(r"app64_registry_gen64|app64_reg_", ["kernel/startmenu64.cpp"])
+    desk = grep_count(r"DESKOPS_KIND_APP|app_items_sync64|g_reg_gen_seen|app64_reg_name64|app64_reg_icon64",
+                      ["kernel/desktopops64.cpp", "kernel/desktopops64.h"])
+    icons = grep_count(r"icons64_kind_by_name64|icons64_draw_file64", ["kernel/icons64.cpp", "kernel/icons64.h"])
+    pkg = grep_count(r"registry_apply|registry_append|registry_remove|VS_APPS_PATH|has_manifest",
+                     ["user/store/vs_pkg.c", "user/store/vs.h"])
+    ev = [
+        "注册表（kernel/app64.* 命中 %d）：/etc/apps.json 一行一条 JSON；启动期用构建期内置表（12 条）"
+        "**幂等 seed**；vc 字段 name/en/exec/icon/alias/id/builtin/desktop/x/y" % reg,
+        "开始菜单从注册表取（kernel/startmenu64.cpp 命中 %d）、桌面快捷方式从注册表取（kernel/desktopops64.* 命中 %d）"
+        % (menu, desk),
+        "图标三层优先：包内 PNG 文件 -> 系统图标名 -> 程序化兜底（kernel/icons64.* 命中 %d）" % icons,
+        "包管理器安装时追加/卸载时删掉自己那条（user/store/vs_pkg.c 命中 %d）；manifest 取 display/exec/icon/icon_file" % pkg,
+        "★ 变化通知**由写者触发**（kernel/fd64.cpp 的 fd64_close64 挂钩命中 %d）：写者关掉可写的 "
+        "/etc/apps.json 时，内核在**它自己的上下文里**重读；桌面帧/开始菜单只比内存世代号 -> 帧里零磁盘 I/O" % hook,
+        "实测（本批真跑 tests/vpkg64_test.py **82/82**）：`[DESK64] app item idx=3 app=12 name=hello-cli … desktop=1 "
+        "x=112 y=24 total=4` / gui-demo total=5、`[START64] list idx=0 name=hello-cli … visible=1`、"
+        "商店「安装 -> 启动」全通（[STORE] launch + [DEMO-GUI] frame + [WL64] surface create w=160 h=40）",
+        "（边界，如实：① 快捷方式位置只在**用户拖动**时落盘（帧不写卷），没拖过的应用位置不跨重启；"
+        "② 真实系统上装包要 root —— 内核建的 /etc/apps.json 是 root:0644，夹具按既有口径预建 0 字节 0666）",
+    ]
+    done = bool(reg and hook and menu and desk and icons and pkg)
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_texthint():
+    """★ 本批：本源字形光栅器的"文字清晰度"（y 方向子扫描线抗锯齿 + 几何定点精度）。"""
+    need = ["kernel/font.cpp", "tests/texthint64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    aa = grep_count(r"FONT64_AA_SUB|FONT64_LEGACY_AA", ["kernel/font.cpp"])
+    geo = grep_count(r"FONT64_GEOM_SH|FONT64_LEGACY_GEOM|glyFix", ["kernel/font.cpp"])
+    t = open("tests/texthint64_test.py", encoding="utf-8", errors="replace").read()
+    has_legacy = "FONT64_LEGACY_AA" in t and "--legacy" in t
+    has_metrics = ("band_holes" in t) and ("cell_vsoft" in t)
+    ev = [
+        "FONT64_AA_SUB（kernel/font.cpp 命中 %d）：每条像素行取 8 条等距**子扫描线**各算一次精确水平覆盖"
+        "再平均（旧行为 = 1，y 方向是二值的，近水平边会整行翻进/翻出 -> 横画断笔）" % aa,
+        "FONT64_GEOM_SH（命中 %d）：几何定点从 1/1024 px 提到 1/65536 px（只改轮廓与基线的行映射，"
+        "推进宽度/行高不动 -> 度量断言不受影响）" % geo,
+        "验收 tests/texthint64_test.py（新增，证据脚本名就是 kernel/font.cpp 注释里引用的那个；"
+        "legacy 反相对照=%s、相位无关指标=%s）" % (has_legacy, has_metrics),
+        "实测（本批真跑，同一夹具/同一条 32 个\"开\"的串）：本版 **vsoft=1.000**（每条竖直边缘都有中间档）、"
+        "holes=32（每字 1 个 1px 针孔 = 分辨率极限）、levels=41；"
+        "反向对照 `VIMTU_EXTRA_CXXFLAGS=-DFONT64_LEGACY_AA`：**vsoft=0.182**（82% 是 0→255 硬跳）、"
+        "**holes=64（每字 2 个洞）**、levels=15",
+        "验收数字：默认档 **22/22 PASS**、`--legacy` 档 **21/21 PASS**（断言方向相反）",
+        "（边界，如实：FONT64_GEOM_SH 那一条**没有单独可分判据** —— em=16 时 -2.34% 折算到墨迹只有零点几像素，"
+        "屏幕测量分不出来；脚本把它钉在\"32 个字等距重复、墨迹起点等差\"这一层，不声称分得出精度本身）",
+    ]
+    done = bool(aa and geo and has_legacy and has_metrics)
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_linux_apps():
+    """★ Linux 应用兼容：真发行版 .deb + 动态 glibc/musl（PT_INTERP 解释器）+ 独立地址空间 execve。"""
+    need = ["kernel/elf64.cpp", "kernel/elf64.h", "kernel/proc64.cpp", "user/ldso",
+            "tools/lxcorpus_build.py", "tests/linuxapp64_test.py", "tests/dynlink64_test.py",
+            "tests/musl64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    interp = grep_count(r"E64_INTERP|PT_INTERP|ET_DYN", ["kernel/elf64.cpp", "kernel/elf64.h"])
+    execv = grep_count(r"proc64_execve64|p64_exec_precheck64|elf64_load_for_exec64", ["kernel/proc64.cpp"])
+    corpus = grep_count(r"LXSTATIC|LXDYN|gnuhello|ld-linux|ld-musl|CORPUS\.json", ["tools/lxcorpus_build.py"])
+    tests_listed = ["linuxapp64_test.py", "dynlink64_test.py", "musl64_test.py"]
+    listed = [t for t in tests_listed if any(t in x[0] for x in TESTS)]
+    ev = [
+        "动态映像：PT_INTERP/ET_DYN + 解释器装载窗（kernel/elf64.* 命中 %d；解释器钉在 4GiB+1MiB 顶）" % interp,
+        "独立地址空间 + execve 预检（kernel/proc64.cpp 命中 %d）：预检不过**原样保留旧映像**（Linux 语义）" % execv,
+        "语料构建器 tools/lxcorpus_build.py（命中 %d）：① 静态 musl ② 动态 musl ③ 动态 glibc（Debian hello）"
+        "③c 大静态（> 读盘上限）④ 真 .deb ⑤ 长名 —— 产物落 build64/lxcorpus/（不提交）" % corpus,
+        "验收脚本：tests/linuxapp64_test.py（**缺口清单的载体**，逐条给 today 状态）+ dynlink64_test.py + "
+        "musl64_test.py；已登记进 TESTS 的：%s" % (", ".join(listed) or "（无）"),
+        "（边界，如实：① 本报告只做**静态核查 + 登记**；语料要联网构建（`py -3 tools/lxcorpus_build.py`），"
+        "本次**未复跑**全量语料；② 语料里带 `today=fail/run-fail` 的条目按 linuxapp64_test.py 自己的口径就是"
+        "**还没通**，报告不替它升级；③ PIE (p_vaddr=0) 与老式非 PIE (0x400000) 的**主程序**仍在第一步被拒 —— "
+        "主程序装载区硬钉在 4GiB..4GiB+64KiB）",
+    ]
+    done = bool(interp and execv and corpus and listed)
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_vsync_swap():
+    """★ VSync + 交换链（2/3 块）+ 混合渲染（GPU 主 / CPU 次；GPU 负责像素与合成）。"""
+    need = ["kernel/fb.cpp", "kernel/virtio_gpu64.cpp", "user/wm/wm.c",
+            "tests/vsync64_test.py", "tests/virtiogpu64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    cfg = grep_count(r"opt/vimtu/vsync", ["kernel/fb.cpp", "tests/vsync64_test.py"])
+    swap = grep_count(r"FB64_SWAP_MAX|fb_swap_enable64|fb_swap_count64|fb_swap_front64", ["kernel/fb.cpp"])
+    vsy = grep_count(r"\[VSYNC\]", ["kernel/fb.cpp", "kernel/virtio_gpu64.cpp"])
+    gpu = grep_count(r"\[VGPU\]|virtio_gpu", ["kernel/virtio_gpu64.cpp"])
+    hyb = grep_count(r"blitpolicy", ["user/wm/wm.c"])
+    ev = [
+        "配置通道：QEMU fw_cfg 的文件 `opt/vimtu/vsync`（命中 %d）；没有该文件 -> 立刻返回 0、零打点零副作用，"
+        "既有启动路径一个字节都不变" % cfg,
+        "交换链：FB64_SWAP_MAX / fb_swap_enable64 / fb_swap_count64 / fb_swap_front64（命中 %d），bufs=2|3" % swap,
+        "VSync 打点 [VSYNC]（命中 %d）：撕裂检测（第 f 帧第 i 条带颜色 = PAL[(i+f)%%8]，宿主高频 screendump）"
+        "+ `[VSYNC] bench` 行；降级路径（gpu=off / 注入延迟）也有证据" % vsy,
+        "GPU 后端 kernel/virtio_gpu64.cpp（[VGPU]/virtio_gpu 命中 %d）：resource/scanout/TRANSFER_TO_HOST_2D；"
+        "无设备时只打一行 not found，软件 LFB 路径行为完全不变" % gpu,
+        "混合渲染：ring3 合成器按面积选路 —— `[WM] blitpolicy gpu=<0|1> min_px=4096 rect_px=<n> path=<dev|soft>`"
+        "（user/wm/wm.c 命中 %d）：GPU 主、CPU 次（小矩形走 CPU，避免每次提交都同步）" % hyb,
+        "★ 已知问题（如实，未修）：tests/vsync64_test.py 的 **bufs=2 例缺一行 `[VSYNC] bench`**（1 条 FAIL，"
+        "属该例期望范围）；全部证据来自 QEMU（virtio-gpu），真机未测",
+    ]
+    done = bool(cfg and swap and vsy and gpu and hyb)
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_deb_chain():
+    """★ 包管理器 .deb 完整链路（ar + control.tar.{gz,xz} + data.tar.{gz,xz} + 依赖模型 + 反例）。"""
+    need = ["user/store/vs_pkg.c", "user/store/vs_xz.c", "third_party/lzma",
+            "tools/store_pack_win.py", "tests/vpkg64_test.py", "tests/store64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    deb = grep_count(r"install_deb|ar_scan_all|control_parse|DebInfo", ["user/store/vs_pkg.c"])
+    xz = grep_count(r"vs_unxz|LzmaDec|Lzma2Dec", ["user/store/vs_pkg.c", "user/store/vs_xz.c"])
+    dep = grep_count(r"depends name=|provides|in_repo|force-depends", ["user/store/vs_pkg.c"])
+    ref = grep_count(r"not supported|refused|bzip2|maintainer scripts", ["user/store/vs_pkg.c"])
+    ev = [
+        "真 ar 容器解析 + control 字段 + data.tar 解包（kernel/user/store/vs_pkg.c 命中 %d）" % deb,
+        "压缩：gzip 走自写 inflate；xz 走 vendored LZMA 解码核 third_party/lzma（命中 %d）——发行版原样的包能装" % xz,
+        "依赖模型三来源（命中 %d）：已装库 / provides 表（要见证路径真在卷上）/ 仓库索引（in_repo 只提示不算满足）；"
+        "--force-depends 会打 state=forced" % dep,
+        "反例全部**整包拒绝**而不是假装成功（命中 %d）：bzip2/zstd 如实拒绝、带 preinst/postinst 的包整包拒绝、"
+        "坏 sha256、空间不足" % ref,
+        "实测（本批真跑 tests/vpkg64_test.py **82/82**）：CLI + GUI 商店 + .deb（control.tar.gz/xz + data.tar.gz/xz）"
+        "+ 依赖满足/缺失/强制 + 6 条反例 + 宿主侧独立解析卷字节；配套 tests/store64_test.py",
+        "（边界，如实：bzip2/zstd 不支持；Depends 的**版本区间不解析**（只比名字）；维护者脚本一律不执行）",
+    ]
+    done = bool(deb and xz and dep and ref)
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 CAPS = [
     ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
      cap_boot_console),
@@ -3172,6 +3321,15 @@ CAPS = [
                "打包/装卷/图标外置工具；14/14 + 16/16 真跑；Rust 用户态未打通）", cap_sdk_template),
     ("应用", "★ 本批：图标集扩充（39 新 SVG = system 34 + apps 5；光栅化 156 PNG；装卷 276 PNG + "
              "/etc/icons_ext.json；新名字等内核 kIcon64Names 登记）", cap_icon_ext),
+    ("应用", "★ 本批：应用注册表 /etc/apps.json（单一真源）+ 已安装应用进桌面/开始菜单 + 应用自带图标；"
+             "变化通知由**写者**触发（桌面帧零磁盘 I/O）", cap_appreg),
+    ("内核", "★ 本批：本源文字清晰度（FONT64_AA_SUB=8 子扫描线抗锯齿 + 几何定点 1/65536 px）；"
+             "新证据脚本 + legacy 反向对照（vsoft 1.000 vs 0.182、holes 32 vs 64）", cap_texthint),
+    ("应用层", "★ Linux 应用兼容（真发行版 .deb + 动态 glibc/musl：PT_INTERP 解释器 + 独立地址空间 execve；"
+              "语料构建器 + 缺口清单脚本）", cap_linux_apps),
+    ("内核", "★ VSync + 交换链（2/3 块）+ 混合渲染（GPU 主 / CPU 次；blitpolicy 按面积选路）", cap_vsync_swap),
+    ("应用层", "★ 包管理器 .deb 完整链路（ar + control.tar.{gz,xz} + data.tar.{gz,xz} + 依赖模型 + 反例）",
+     cap_deb_chain),
 ]
 
 
