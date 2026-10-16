@@ -276,8 +276,15 @@ static int g_em_px = FONT_SIZE_PX;    // 当前 em 高度（font_set_size64 改�
 //   ① FONT64_AA_SUB：每条像素行取**多少条子扫描线**（y 方向抗锯齿）。
 //      旧行为 = 1：整行只在像素中心取一条扫描线，y 方向是**二值**的 —— 判据 `yc < ylo || yc >= yhi`
 //      在**近水平边**（汉字横画的上/下边、曲线的平坦段）上会因为 1/1024 px 的量化抖动
-//      整行翻进/翻出 -> 实测横画中间出现 0 覆盖的**断笔空洞**（宿主侧逐像素证据：
-//      tests/texthint64_test.py 的 gaps 指标；em=16 的"开"字横画一行里 2 个洞），
+//      整行翻进/翻出 -> 实测横画中间出现 0 覆盖的**断笔空洞**。
+//      ★ 证据脚本已落地并实测（tests/texthint64_test.py，同一个夹具 + 同一条 32 个"开"的串）：
+//          本版（AA_SUB=8）：vsoft = 1.000（每条竖直边缘都有中间档）、holes = 32（每字 1 个
+//                            1px 针孔 = 分辨率极限）、levels = 41；
+//          反向对照（VIMTU_EXTRA_CXXFLAGS=-DFONT64_LEGACY_AA，即下行 AA_SUB=1）：
+//                            vsoft = 0.182（82% 的边缘是 0→255 硬跳）、**holes = 64（每字 2 个洞，
+//                            就是这里说的"开字横画 2 个洞"）**、levels = 15。
+//          复现：bash build64.sh && py -3 tests/texthint64_test.py
+//                VIMTU_EXTRA_CXXFLAGS=-DFONT64_LEGACY_AA bash build64.sh && py -3 tests/texthint64_test.py --legacy
 //      而且 0.5px 级的横细画会被整行点满 255（比参考渲染更"胖"）。
 //      新行为 = 8：行内 8 条等距子扫描线各算一次**精确水平覆盖**再取平均 —— y 方向拿到
 //      8 档覆盖率（配合水平精确覆盖，实际档位远多于 8 档，见 uv/lv 指标），横边不再整行翻出。
@@ -941,7 +948,8 @@ static bool rasterize_glyph(FontFace* fc, uint32_t cp, uint8_t* bm, int* ox, int
     // ★ 本轮（"文字渲染不够清晰"）：每条像素行取 FONT64_AA_SUB 条**子扫描线**（y 方向等距，
     //   落在行内的 1/(2K), 3/(2K), … 处），每条子扫描线算一次**精确水平覆盖**（与旧代码同一条公式，
     //   只是定点从 1/1024 换成 1/65536），把 K 条的结果取平均写回 bm。
-    //   为什么必须这样（实测证据见 tests/texthint64_test.py 的 legacy 对照与 gaps/vstep 指标）：
+    //   为什么必须这样（实测证据见 tests/texthint64_test.py 的 **vsoft / holes** 两个指标与它的
+    //   `--legacy` 反向对照：本版 vsoft=1.000 / holes=32 vs 旧版 0.182 / 64）：
     //     * 旧代码整行只判一次 `yc < ylo || yc >= yhi` —— y 方向是**二值**的：近水平边
     //       （汉字横画上下边、曲线的平坦段）只要 1/1024 px 的量化抖动让 yc 翻出边界，整行就是 0，
     //       实测横画中间出现 0 覆盖的**空洞/断笔**（em=16 的"开"字一行里 2 个 0）；
