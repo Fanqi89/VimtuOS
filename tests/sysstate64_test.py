@@ -668,7 +668,12 @@ def main():
     m3 = re.search(r"\[CONF64\] init carrier=vfs slot=\S+ keys=(\d+)", log2)
     check("第二遍从 VFS 载体读到键（keys >= 1）", bool(m3) and int(m3.group(1)) >= 1,
           m3.group(0) if m3 else "未出现")
-    ma = re.search(r"\[CONF64\] apply lang=\S+ zoom=\d+ mirror=\d+ sens=\d+ icon0=(\d+),(\d+)", log2)
+    # ★ 修脚本（判据与事实不符时先修脚本）：gui64.cpp 的 [CONF64] apply 行在 sens= 与 icon0= 之间
+    #   多了一个 `font=` 字段（批次 P7a-15 起），旧正则要求 `sens=\d+ icon0=` **紧邻** -> 恒不匹配
+    #   （实测报"未出现"）。这里改成"四个字段都要在、允许中间插别的字段"，断言强度一个字没放宽：
+    #   仍然要求 icon0 的两个数字 == 第一遍拖动后的落点。
+    ma = re.search(r"\[CONF64\] apply [^\n]*?lang=\S+[^\n]*?zoom=\d+[^\n]*?mirror=\d+[^\n]*?sens=\d+"
+                   r"[^\n]*?icon0=(\d+),(\d+)", log2)
     check("第二遍桌面读到的图标位置 = 第一遍拖动后的位置",
           bool(ma) and fx is not None and int(ma.group(1)) == fx and int(ma.group(2)) == fy,
           (ma.group(0) if ma else "未出现") + (" (期望 icon0=%s,%s)" % (fx, fy)))

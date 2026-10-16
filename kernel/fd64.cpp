@@ -18,6 +18,12 @@
 // ---- proc64 的弱引用：进程表（没有进程上下文 -> 返回 nullptr -> 用内核表）----
 // proc64.cpp 只在系统内核里链接（安装介质内核没有进程），所以这里必须弱引用 + 判空。
 extern "C" FdTable64* proc64_fdtab_of_current64() __attribute__((weak));
+// ★ 应用注册表挂钩（weak：安装介质内核不链 app64.cpp）：谁**关闭了可写的 /etc/apps.json**，
+//   就在**它自己的上下文里**重读一遍内核内存表 —— 这是注册表"外部改动"的**唯一**通知路径。
+//   为什么不让桌面帧轮询读盘：vfs64 不可重入（会读到半截/别人的字节），而且长 I/O 会冻住
+//   鼠标/键盘（IRQ1/IRQ12 在关中断的窗口里全丢）；两条都在 tests/vpkg64_test.py 里实测踩到，
+//   详见 kernel/app64.cpp 的 app64_registry_on_close64 函数头。
+void app64_registry_on_close64(const char* path, int writable) __attribute__((weak));
 // ★ A4-2a：控制台 tty 对象的 write 要"串口 + 屏幕"，那部分实现留在 syscall64（弱的：
 //   没有它也能编译/链接 —— 那时退回只写串口，绝不静默丢字节）。
 extern "C" void syscall64_console_write64(const char* buf, int len) __attribute__((weak));
@@ -482,6 +488,9 @@ int fd64_close64(int fd) {
     const uint32_t left = of->refs - 1u;                      // 打印"还剩几个引用"
     t->cloexec &= ~(1u << (uint32_t)fd);                      // close 也清 FD_CLOEXEC 位
     t->slot[fd] = nullptr;
+    // ★ 写者关闭了 /etc/apps.json -> 让 app64 在**它自己的上下文里**重读一遍注册表
+    //   （见上面的弱声明与 kernel/app64.cpp 的说明）。必须在 unref 之前：对象可能被释放。
+    if (of->writable && app64_registry_on_close64) app64_registry_on_close64(of->path, 1);
     fd64_of_unref64(of);
     dbg64_line_begin64();
     dbg64_str("[FD64] close fd=");

@@ -42,7 +42,7 @@ static int      g_recycle[DESKOPS_RECYCLE_MAX];
 static int      g_rec_n = 0;
 static char     g_set_cache[CFG64_STR_MAX];
 static uint32_t g_tick_div = 0;
-static uint32_t g_reg_div  = 0;   // ★ 注册表抽查的独立分频（1 秒一次；说明见 desktopops64_tick64）
+static uint32_t g_reg_gen_seen = 0;  // ★ 已消化的注册表世代号（纯内存比较；说明见 desktopops64_tick64）
 static int      g_rec_empty_logged = 0;      // "空回收站" 打点只在状态变化时打一次（防刷屏）
 // ★ P7a-9：桌面**多选集合**（Windows 方案；详见 desktopops64.h 的说明）。
 static int  g_sel[DESKOPS_MAX_ITEMS];
@@ -338,6 +338,7 @@ void desktopops64_init64() {
     cfg64_desktop_icons64(buf, (int)sizeof(buf));
     apply_set(buf);
     (void)app_items_sync64();          // ★ 用户安装的应用（注册表 desktop=1）-> 桌面快捷方式
+    g_reg_gen_seen = app64_registry_gen64();   // 启动期这一遍已经消化过了（见 desktopops64_tick64）
     log_set_line("[DESK64] init");
     log_items();
 }
@@ -345,14 +346,19 @@ void desktopops64_init64() {
 // 每帧（约 4Hz 抽查）：终端 `cfg set ui.desktop.icons 1,2` / 设置页按钮改了配置 -> 实时同步桌面；
 // ★ 同一处也抽查应用注册表：/bin/vpkg 刚装完的应用 -> desktop=1 条目 -> 桌面上自动出现快捷方式。
 //
-// ★★ 本轮修正（实测缺陷）：注册表抽查**必须低频**。它要在磁盘上真读一遍 /etc/apps.json
-//    （vfs64_stat + 整文件读 -> VFS -> ATA），而这一条原来跟配置抽查一样挂在 15 tick（≈60 ms）
-//    的节拍上 = **16 次/秒的磁盘读**。实测后果：装包时磁盘抖一下（[ATA64] irq14 timeout
-//    -> fallback to polling）就把**桌面帧**拖过 5 秒 -> `[WD64] watchdog fire`（source=gui64-frame）
-//    -> `[PANIC64] stop=WATCHDOG_TIMEOUT`，整台机器停在蓝屏（vpkg64_test 三次里两次这样挂）。
-//    改成 **≈1 秒抽一次**（16 × 15 tick = 240 tick）：对"刚装的应出现在桌面"这种交互完全够
-//    （用户装完包再看桌面本来就 >1 秒），而磁盘读从 16 Hz 降到 1 Hz。
-//    配置抽查仍是 15 tick（纯内存比较，零 I/O），所以 `cfg set` 的实时性一个字没变。
+// ★★ 注册表变化：这里**只比较一个内存世代号**，一次磁盘 I/O 都没有。
+//    变化的**唯一**来源是"有人关闭了可写的 /etc/apps.json"（/bin/vpkg 装/卸应用，或内核自己
+//    改快捷方式位置/桌面标志）—— 内核在那一刻已经于**写者自己的上下文里**重读过一遍了
+//    （kernel/fd64.cpp 的 fd64_close64 挂钩 -> app64_registry_on_close64，见 kernel/app64.h）。
+//
+//    为什么不是"帧里轮询读盘"（原来是这么写的，两个真缺陷都实测踩到）：
+//      ① **vfs64 不可重入**：帧读注册表时若 /bin/vpkg 正在装包，会读到半截/别人的字节
+//         （实测 `[APPREG64] app idx=13 … exec=/usr/share/gui-demo/gui-dem8\u0004G…`），
+//         还让 execve 预检读到非 ELF 头（`[PROC64] execve FAILED … rc=22 reason=precheck`）；
+//      ② 为了把帧里那一小段做成原子而**关中断**同样不行：ATA 一旦走"IRQ14 超时 -> 回退轮询"，
+//         一次读要 1 秒以上，那 1 秒里 IRQ1/IRQ12 全丢 -> 鼠标/键盘失灵（实测：商店装完包之后
+//         再也点不动，"启动"按钮一次都没命中 `hit=launch`）。
+//    现在的写法：帧零 I/O，只有一次整数比较（配置抽查仍是 15 tick 的纯内存比较，实时性不变）。
 int desktopops64_tick64() {
     if (++g_tick_div < 15) return 0;
     g_tick_div = 0;
@@ -364,21 +370,9 @@ int desktopops64_tick64() {
         log_set_line("[DESK64] set changed");
         changed = 1;
     }
-    if (++g_reg_div >= 16) {                           // ★ ≈1 秒一次（见上面的实测说明）
-        g_reg_div = 0;
-        // ★★ 这一段要进 vfs64（读 /etc/apps.json）—— 而 **vfs64 不是可重入的**：它此刻可能
-        //    正被"装包中的 /bin/vpkg"用着。实测后果是**读到别人的字节 / 半截内容**：
-        //      `[APPREG64] app idx=13 … exec=/usr/share/gui-demo/gui-dem8\u0004G…`（半截+垃圾），
-        //      并且会让 [PROC64] execve 的预检读到非 ELF 头 -> rc=22 reason=precheck。
-        //    单核上**关中断**就足以把这一小段做成原子的（IRQ0 不再抢占 = 没有别的任务能进
-        //    vfs64）；vfs64 自身不睡也不 hlt，ATA 在 IF=0 下自动走轮询回退（ata64_irqs_on），
-        //    所以不会死等。窗口 = 一次注册表读（KB 级），且只在内容真变了时才重解析。
-        //    如实边界：这是**单核口径**的原子性；SMP 上 AP 目前是 cli;hlt，桌面只跑在 BSP，
-        //    所以当前成立；将来看 AP 真干活要换成一把真正的 vfs64 锁。
-        const uint64_t fl = dbg64_irq_save64();
-        if (app64_registry_refresh64()) changed = 1;   // vpkg 装/卸了应用 -> 注册表变了
-        if (app_items_sync64()) changed = 1;           // 幂等：没变化时返回 0
-        dbg64_irq_restore64(fl);
+    if (app64_registry_gen64() != g_reg_gen_seen) {
+        g_reg_gen_seen = app64_registry_gen64();
+        if (app_items_sync64()) changed = 1;           // 幂等：没变化时返回 0（纯内存）
     }
     return changed;
 }

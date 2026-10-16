@@ -123,9 +123,15 @@ int app64_selftest64();
 // 启动期/首次使用时确保注册表就绪（内置表进内存 + 卷里有文件就解析/幂等写出）。
 // 返回注册表里的应用条数（>= 内置条数；没有任何卷时 = 内置条数）。
 int  app64_registry_init64();
-// 每帧/每几帧抽查：卷里的 /etc/apps.json 变了（vpkg 装/卸应用）就重新解析。
-// 返回 1 = 内容变了（调用方应重画/重建快捷方式），0 = 没变。
+// ★ 变化通知（**不要**在桌面帧里轮询读盘：vfs64 不可重入 + 长 I/O 会冻住鼠标，
+//   两条都在 tests/vpkg64_test.py 里实测踩到过，说明见 kernel/app64.cpp 的函数头）：
+//   * 外部改动（/bin/vpkg 装/卸）由 kernel/fd64.cpp 的 fd64_close64 在**写者自己的上下文**里
+//     调 app64_registry_on_close64(path, writable) 触发重读；
+//   * 调用方（桌面帧 / 开始菜单）只比较内存里的 app64_registry_gen64()，变了才重建视图。
+// app64_registry_refresh64() 保留但**不再读盘**（只为兼容旧调用点，现在恒返回 0）。
 int  app64_registry_refresh64();
+// fd64 close 挂钩（weak 链接：安装介质内核不链 app64.cpp）。path 是刚关闭的文件路径。
+void app64_registry_on_close64(const char* path, int writable);
 uint32_t app64_registry_gen64();          // 每次内容变化 +1（调用方用它做去重）
 int  app64_registry_count64();
 const char* app64_reg_name64(int i);

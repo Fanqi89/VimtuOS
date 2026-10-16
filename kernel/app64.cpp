@@ -648,7 +648,11 @@ static int ar_write64(const char* why) {
     dbg64_nl();
     dbg64_line_end64();
     g_apps_dirty = false;
-    return wr == n ? 0 : -1;
+    // ★ 世代号：**内核自己**改了内存表（位置/桌面标志/seed）也要 +1，桌面帧/开始菜单
+    //   靠它判断"要不要重建视图"；外部改动（/bin/vpkg）走 app64_registry_on_close64。
+    const int ok64 = (wr == n) ? 1 : 0;
+    if (ok64) g_apps_gen++;
+    return ok64 ? 0 : -1;
 }
 
 static void ar_seed64() {
@@ -807,32 +811,46 @@ int app64_registry_init64() {
     return g_apps_n;
 }
 
-int app64_registry_refresh64() {
-    if (!g_apps_tried) return app64_registry_init64();
-    if (g_apps_dirty) return 0;                 // 自己有未落盘的改动：先别用盘上版本盖掉
+// ==================== ★ 外部改动（/bin/vpkg 装/卸）的通知入口 ====================
+// 为什么**不是**"桌面帧每秒轮询一次"（原设计，实测两条都真发生、都修在这里）：
+//   ① 轮询要**真读盘**（stat + 整文件读），而 **vfs64 不可重入**（没有锁）——与"正在装包的
+//      /bin/vpkg"并发时读到半截/别人的字节：实测
+//      `[APPREG64] app idx=13 … exec=/usr/share/gui-demo/gui-dem8\u0004G…`，
+//      并让 execve 预检读到非 ELF 头（`[PROC64] execve FAILED … rc=22 reason=precheck`）。
+//   ② 把这一段包成"关中断原子段"也不行：ATA 一旦走"IRQ14 超时 -> 回退轮询"，一次读要 1 秒以上
+//      —— 那 1 秒里 IRQ1/IRQ12 全丢，鼠标/键盘直接失灵（实测：商店装完包之后再点不动，
+//      "启动"按钮一次都没命中 `hit=launch`）。
+// 正解：**由写者触发**。谁关闭了可写的 /etc/apps.json，内核就在**它自己的上下文里**重读一遍
+//       （那正是它刚写完的时刻，天然与它自己的 VFS 写串行）——见 kernel/fd64.cpp 的
+//       fd64_close64 挂钩。桌面帧/开始菜单只比较一个**内存里**的世代号（app64_registry_gen64），
+//       一次磁盘 I/O 都没有。
+static bool ar_same64(const char* a, const char* b) {
+    if (!a || !b) return false;
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
+// 重读一遍卷里的注册表；内容真变了就重建内存表 + 世代号 +1。返回 1 = 内存表变了。
+// 调用者只有两个：启动期、以及**刚刚写完 /etc/apps.json 的那个进程**（fd64 close 挂钩）。
+static int ar_reload_and_bump64(const char* why) {
     const int sys = ar_sys_slot64();
     if (sys < 0) return 0;
-    // ★ 下面这几步要**真读盘**（stat + 整文件读 -> VFS -> ATA）：临时停表 GUI 看门狗
-    //   （与 terminal64 的 cmd_ls / fd64 的 Fd64WdtGuard64 同款）。实测：一旦 ATA 走
-    //   "IRQ14 超时 -> 回退轮询"，每次事务 ≈160 ms，一次注册表读就能把 5 秒心跳预算吃光
-    //   -> [WD64] watchdog fire -> [PANIC64] stop=WATCHDOG_TIMEOUT（source=gui64-frame）。
-    //   调用方（桌面帧 desktopops64_tick64 / 开始菜单）本来就在心跳路径上，长 I/O 不是"卡死"。
+    // 要真读盘：临时停表（与 terminal64 的 cmd_ls / fd64 同款）。关键：这里的调用者**不是**
+    // 桌面帧，所以停表不会冻住鼠标/键盘。
     int full = 0;
     uint32_t fnv = 0;
-    {
-        panic64_watchdog_pause64();
-        uint32_t type = 0, size = 0;
-        if (vfs64_stat_on64(sys, APPREG64_PATH, &type, &size) == 0 &&
-            size > 0 && size <= (uint32_t)sizeof(g_apps_file)) {
-            full = vfs64_read_on64(sys, APPREG64_PATH, g_apps_file, (int)sizeof(g_apps_file));
-            if (full > 0) fnv = ar_fnv(g_apps_file, (uint32_t)full);
-        }
-        panic64_watchdog_unpause64();
+    panic64_watchdog_pause64();
+    uint32_t type = 0, size = 0;
+    if (vfs64_stat_on64(sys, APPREG64_PATH, &type, &size) == 0 &&
+        size > 0 && size <= (uint32_t)sizeof(g_apps_file)) {
+        full = vfs64_read_on64(sys, APPREG64_PATH, g_apps_file, (int)sizeof(g_apps_file));
+        if (full > 0) fnv = ar_fnv(g_apps_file, (uint32_t)full);
     }
+    panic64_watchdog_unpause64();
     if (full <= 0) return 0;
-    if (fnv == g_apps_fnv) return 0;
-    int lines = 0, ok = 1;
-    lines = ar_parse64(g_apps_file, full, &ok);
+    if (fnv == g_apps_fnv) return 0;             // 内容没变（例如只是又写了一遍同样的表）
+    int ok = 1;
+    const int lines = ar_parse64(g_apps_file, full, &ok);
     g_apps_fnv = fnv;
     g_apps_gen++;
     dbg64_line_begin64();
@@ -844,11 +862,28 @@ int app64_registry_refresh64() {
     ar_put_dec(g_apps_n);
     dbg64_str(" gen=");
     ar_put_dec((int)g_apps_gen);
-    dbg64_str(" (user install/remove observed)");
+    dbg64_str(" why=");
+    dbg64_str(why ? why : "-");
     dbg64_nl();
     dbg64_line_end64();
     ar_log_all64("[APPREG64] app");
     return 1;
+}
+
+// ★ 挂钩点：fd64_close64 在**写者自己的上下文**里调到它（path = 刚关闭的文件）。
+void app64_registry_on_close64(const char* path, int writable) {
+    if (!writable || !path) return;
+    if (!ar_same64(path, APPREG64_PATH)) return;
+    if (!g_apps_tried) { (void)app64_registry_init64(); return; }
+    if (g_apps_dirty) return;                    // 内核自己有未落盘的改动：别用盘上版本盖掉
+    (void)ar_reload_and_bump64("close-writer");
+}
+
+// 兼容旧调用点：**不再主动读盘**（变化一律由写者触发）。桌面帧/开始菜单请用
+// app64_registry_gen64() 比世代号 —— 那是纯内存比较。
+int app64_registry_refresh64() {
+    if (!g_apps_tried) return app64_registry_init64();
+    return 0;
 }
 
 uint32_t app64_registry_gen64() { return g_apps_gen; }
