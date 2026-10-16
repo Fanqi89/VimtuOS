@@ -529,7 +529,18 @@ def main():
                         ("/usr", 0o777), ("/usr/share", 0o777), ("/var", 0o777),
                         ("/var/lib", 0o777), ("/var/lib/vpkg", 0o777)):
             vol.mkdirs(d, mode=mode)
+        # ★ 应用注册表 /etc/apps.json：**内核启动时自己建它**（kernel/app64.cpp 的 ar_write64
+        #   "seed-builtin"：属主 = 当时的凭证 = root、模式 = 0644）。那样 uid=1000 的会话往后
+        #   一条都追加不进去 —— 实测 [PERM64] deny op=access path=/etc/apps.json uid=1000
+        #   mode=0644 need=w + [VPKG] registry append rc=-13（包管理器据此如实报 perm）。
+        #   夹具这里**预建一份 0 字节的 0666**：内核启动时写的是**已存在的 inode**（模式/属主不变），
+        #   于是 uid=1000 的会话能走完"装包 -> 追加注册表 -> 开始菜单/桌面看得见"这条真链路。
+        #   **0 字节很关键**：内核读不到内容才会把内置表 seed 进去（文件有内容就只解析文件，
+        #   内核内置的那 12 条会全丢）—— 见 kernel/app64.cpp 的 ar_reload64。
+        #   与上面那些目录同理：真实系统上装包本来就要 root。
+        vol.put("/etc/apps.json", b"", mode=0o666)
         print("    夹具：/bin /usr/share /var 等目录预建成 0777（非 root 会话可写）")
+        print("    夹具：/etc/apps.json 预建成 0 字节 0666（内核启动往这个 inode 写内置表，模式不变）")
 
     files = collect_files(args)
     if files is None:

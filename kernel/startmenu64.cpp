@@ -22,6 +22,7 @@
 #include "e1000_64.h"       // 以太网真实链路（网络图标：有线 = 以太网）
 #include "mem_64.h"
 #include "icons64.h"        // ★ 本批：外置图标包（真图标）；取不到就回落下面的程序化线性图标
+#include "app64.h"          // ★ 应用注册表（/etc/apps.json）：开始菜单的应用列表从它构建
 
 // ==================== 小工具（内核里没有 libc）====================
 static int s_len(const char* s) { int n = 0; while (s && s[n]) n++; return n; }
@@ -478,26 +479,100 @@ void p2ui_icon64(int kind, int x, int y, int size, uint32_t c, int a) {
     }
 }
 
-// ==================== 应用表（搜索 + 固定网格）====================
-// ★ 本批（真图标）：icon64 = 外置图标包里的应用 kind（>0 时优先画真图标；0 = 没有）
-struct SmApp64 { int app_id; int icon_kind; int icon64; const char* zh; const char* en; const char* alias; };
-static const SmApp64 kApps[] = {
-    { APP_ID_TERM,     P2UI_ICON_MONITOR, ICON64_A_TERMINAL, "终端",       "Terminal",      "term shell console" },
-    { APP_ID_MYPC,     P2UI_ICON_MONITOR, ICON64_A_MYPC,     "我的电脑",   "My Computer",   "mypc computer explorer files" },
-    { APP_ID_SETTINGS, P2UI_ICON_GEAR,    ICON64_A_SETTINGS, "设置",       "Settings",      "settings cfg control" },
-    { APP_ID_CALC,     P2UI_ICON_PLUS,    ICON64_A_CALC,     "计算器",     "Calculator",    "calc calculator" },
-    { APP_ID_MINES,    P2UI_ICON_PLUS,    ICON64_A_MINES,    "扫雷",       "Minesweeper",   "mines mine game" },
-    { APP_ID_TMGR,     P2UI_ICON_MONITOR, ICON64_A_TMGR,     "任务管理器", "Task Manager",  "tmgr taskmgr process" },
-    { APP_ID_MONITOR,  P2UI_ICON_MONITOR, ICON64_A_MONITOR,  "系统监视器", "System Monitor","monitor perf" },
-    { APP_ID_ABOUT,    P2UI_ICON_PERSON,  ICON64_A_ABOUT,    "关于",       "About VimtuOS", "about version" },
-    { APP_ID_RECYCLE,  P2UI_ICON_CLOSE,   ICON64_A_RECYCLE,  "回收站",     "Recycle Bin",   "recycle trash bin" },
+// ==================== 应用列表（**从注册表构建**；见 kernel/app64.h）====================
+// ★ 本批（应用注册表）：不再有硬编码的应用表 —— 开始菜单的每一项都来自 /etc/apps.json：
+//   * 固定网格（2 列 × 4 行）= 注册表**前 8 条**（构建期内置的应用，顺序与老固定项逐项一致）；
+//   * 左侧"全部应用"列表 = 注册表的**全部**条目（用户用 /bin/vpkg 装的排在前面，一眼看到），
+//     可滚轮滚动、点击启动；每项画自己的图标（见 sm_draw_app_icon64：文件图标 -> 系统图标名 -> 程序化）。
+//   * 搜索（中/英/别名）同样遍历注册表。
+struct SmView64 {
+    int         reg;            // 注册表下标
+    const char* zh;             // 显示名
+    const char* en;             // 英文名（搜索/回显）
+    const char* alias;          // 搜索别名
+    const char* exec;           // "builtin:..." 或卷内路径
+    const char* icon;           // 系统图标名 或 "/..." 卷内 PNG
+    int         id;             // APP_ID_*（内置）；-1 = 用户应用
+    int         desktop;        // 1 = 用户装的时候勾了"建桌面快捷方式"
 };
-#define SM_APP_N ((int)(sizeof(kApps) / sizeof(kApps[0])))
-// 默认固定网格 2 列 × 4 行（8 个）
-static const int kPinned[THEME64_SM_TILE_COLS * THEME64_SM_TILE_ROWS] = {
-    0, 1, 2, 3, 4, 5, 6, 7
-};
-#define SM_PINNED_N 8
+static SmView64 g_view[APPREG64_MAX];
+static int      g_view_n = 0;
+static uint32_t g_logged_gen = 0xFFFFFFFFu;  // 上次把"应用列表/固定网格"写进日志时的 gen
+static uint32_t g_view_gen = 0xFFFFFFFFu;    // 上次同步的注册表 gen
+static int      g_list_top = 0;              // "全部应用"列表的滚动起点（行）
+
+// 固定网格 = 前 8 条（2 列 × 4 行）；不足 8 条时按实际条数
+static int sm_pinned_n64() {
+    const int want = THEME64_SM_TILE_COLS * THEME64_SM_TILE_ROWS;
+    return g_view_n < want ? g_view_n : want;
+}
+
+// 注册表 -> 视图快照（gen 变了才重建；用户装/卸应用后由 app64_registry_refresh64 推进 gen）
+static void sm_sync_apps64() {
+    const uint32_t gen = app64_registry_gen64();
+    if (gen == g_view_gen) return;
+    g_view_gen = gen;
+    g_view_n = 0;
+    const int n = app64_registry_count64();
+    // 用户安装的应用（desktop=1 的那批先列；同一批里按注册表顺序）排在前面：新装的就在最上面
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < n && g_view_n < APPREG64_MAX; i++) {
+            const int is_user = app64_reg_builtin64(i) ? 0 : 1;
+            if ((pass == 0) != (is_user == 1)) continue;
+            SmView64& v = g_view[g_view_n++];
+            v.reg = i;
+            v.zh = app64_reg_name64(i);
+            v.en = app64_reg_en64(i);
+            v.alias = app64_reg_alias64(i);
+            v.exec = app64_reg_exec64(i);
+            v.icon = app64_reg_icon64(i);
+            v.id = app64_reg_id64(i);
+            v.desktop = app64_reg_desktop64(i);
+        }
+    }
+    if (g_list_top > g_view_n) g_list_top = 0;
+}
+
+// 图标（三层优先级，与任务要求一一对应）：
+//   ① 应用自带图标文件（注册表 icon 以 '/' 开头，vpkg 从包装进 /usr/share/<app>/icon.png）
+//   ② 系统图标名（kIcon64Names，内置应用）
+//   ③ 程序化绘制（p2ui 线性图标，兜底；绝不允许空）
+static int sm_icon_kind64(const SmView64& a) {
+    if (a.icon && a.icon[0] == '/') return -1;          // 文件来源：不走 kind
+    return icons64_kind_by_name64(a.icon);
+}
+static void sm_draw_app_icon64(const SmView64& a, int x, int y, int size, int alpha) {
+    if (a.icon && a.icon[0] == '/' && icons64_draw_file64(a.icon, x, y, size, alpha) == 0) return;
+    const int kind = sm_icon_kind64(a);
+    const uint32_t pal = (kind > 0) ? icons64_app_color64(kind) : rgb(255, 255, 255);
+    if (kind > 0 && icons64_draw_kind64(kind, x, y, size, pal, alpha) == 0) return;
+    // ③ 程序化兜底：同一个"加号"线性图标（不认识的名字也有一张图，不会空）
+    p2ui_icon64(P2UI_ICON_PLUS, x, y, size, pal, alpha);
+}
+
+// 每项给日志/命中用的稳定编号：内置 = APP_ID_*（与老打点一致）；用户应用 = 100 + 视图下标
+static int sm_app_no64(int view_idx) {
+    if (view_idx < 0 || view_idx >= g_view_n) return -1;
+    const int id = g_view[view_idx].id;
+    return id >= 0 ? id : 100 + view_idx;
+}
+// 启动一项（开始菜单的固定格 / 列表 / 搜索结果都走这里；最终走 gui64 的注册表启动入口）
+static void sm_launch_view64(int view_idx, const char* via) {
+    if (view_idx < 0 || view_idx >= g_view_n) return;
+    SmView64& a = g_view[view_idx];
+    dbg64_line_begin64();
+    dbg64_str("[START64] launch app=");
+    dbg64_dec((uint64_t)(a.id >= 0 ? a.id : 100 + view_idx));
+    dbg64_str(" via=");
+    dbg64_str(via);
+    dbg64_str(" name=");
+    dbg64_str(a.en);
+    dbg64_str(" exec=");
+    dbg64_str(a.exec);
+    dbg64_nl();
+    dbg64_line_end64();
+    (void)app_launch_exec64(a.exec, via);
+}
 
 // ==================== 状态 ====================
 static bool g_open = false;
@@ -557,6 +632,24 @@ static int tile_y64(int idx) { return grid_y64() + (idx / THEME64_SM_TILE_COLS) 
 static int result_x64() { return sm_x() + THEME64_SM_PAD; }
 static int result_y64() { return content_top64(); }
 static int result_w64() { return sm_w() - THEME64_SM_PAD * 2; }
+
+// ---- ★ "全部应用"列表（左侧；固定网格在右侧，二者不重叠）----
+// 布局：content_top 那一行画"全部应用 (N)"标题；下面每行 28px（THEME64_SM_SROW）：
+// 图标 18px + 应用名。行数由可用高度决定；滚轮滚动（g_list_top = 起始行）。
+static int list_x64() { return sm_x() + THEME64_SM_PAD; }
+static int list_y64() { return content_top64() + p2ui_line_h64() + 6; }
+static int list_w64() { return grid_x64() - 8 - list_x64(); }
+static int list_h64() { return user_row_y64() - 8 - list_y64(); }
+static int list_rows64() { const int r = list_h64() / THEME64_SM_SROW; return r > 0 ? r : 1; }
+static int list_max_top64() { const int m = g_view_n - list_rows64(); return m > 0 ? m : 0; }
+static int list_row_rect64(int vis_row, int* x, int* y, int* w, int* h) {
+    if (vis_row < 0 || vis_row >= list_rows64()) return 0;
+    if (x) *x = list_x64();
+    if (y) *y = list_y64() + vis_row * THEME64_SM_SROW;
+    if (w) *w = list_w64();
+    if (h) *h = THEME64_SM_SROW - 2;
+    return 1;
+}
 static int pm_x64() { return sm_x() + sm_w() - THEME64_SM_PAD - THEME64_PM_W; }
 static int pm_h64() { return THEME64_PM_ROW * 3 + 8 * 2; }
 static int pm_y64() { return power_y64() - 8 - pm_h64(); }
@@ -611,7 +704,7 @@ int startmenu64_settings_rect64(int* x, int* y, int* w, int* h) {
     return 1;
 }
 int startmenu64_tile_rect64(int idx, int* x, int* y, int* w, int* h) {
-    if (idx < 0 || idx >= SM_PINNED_N) return 0;
+    if (idx < 0 || idx >= THEME64_SM_TILE_COLS * THEME64_SM_TILE_ROWS) return 0;
     if (x) *x = tile_x64(idx);
     if (y) *y = tile_y64(idx);
     if (w) *w = THEME64_SM_TILE_W - 8;
@@ -803,6 +896,21 @@ void startmenu64_init64() {
     g_geom_logged = false;
     g_grid_logged = false;
     g_open = false;
+    g_list_top = 0;
+    g_view_n = 0;
+    g_view_gen = 0xFFFFFFFFu;
+    sm_sync_apps64();              // 应用列表 = 注册表（单一真源）
+    {
+        dbg64_line_begin64();
+        dbg64_str("[START64] apps n=");
+        dbg64_dec((uint64_t)g_view_n);
+        dbg64_str(" src=registry path=/etc/apps.json gen=");
+        dbg64_dec((uint64_t)app64_registry_gen64());
+        dbg64_str(" pinned=");
+        dbg64_dec((uint64_t)sm_pinned_n64());
+        dbg64_nl();
+        dbg64_line_end64();
+    }
     time_refresh64(true);
     net_state_refresh64();
     log_init64();
@@ -816,11 +924,12 @@ void startmenu64_init64() {
     }
 }
 
-// ==================== 搜索 ====================
+// ==================== 搜索（遍历注册表应用列表）====================
 static void search_update64(const char* why) {
+    sm_sync_apps64();
     g_hits = 0;
-    for (int i = 0; i < SM_APP_N && g_hits < 8; i++) {
-        const SmApp64& a = kApps[i];
+    for (int i = 0; i < g_view_n && g_hits < 8; i++) {
+        const SmView64& a = g_view[i];
         if (s_has_icase(a.zh, g_query) || s_has_icase(a.en, g_query) || s_has_icase(a.alias, g_query))
             g_hit_app[g_hits++] = i;
     }
@@ -832,9 +941,9 @@ static void search_update64(const char* why) {
         dbg64_str(" hits=");
         dbg64_dec((uint64_t)g_hits);
         dbg64_str(" first=");
-        dbg64_str(g_hits ? kApps[g_hit_app[0]].en : "-");
+        dbg64_str(g_hits ? g_view[g_hit_app[0]].en : "-");
         dbg64_str(" (app=");
-        if (g_hits) dbg64_dec((uint64_t)kApps[g_hit_app[0]].app_id);
+        if (g_hits) dbg64_dec((uint64_t)sm_app_no64(g_hit_app[0]));
         else dbg64_str("-");
         dbg64_str(") why=");
         dbg64_str(why);
@@ -881,6 +990,9 @@ void startmenu64_open64(const char* why) {
     g_hits = 0;
     g_hit_sel = 0;
     g_pm_open = false;
+    // ★ 应用注册表：打开时重新同步（用户刚用 /bin/vpkg 装的应用立刻能在这里看到）
+    sm_sync_apps64();
+    if (g_view_gen != g_logged_gen) g_grid_logged = false;
     g_opened_t0 = ticks64();
     time_refresh64(true);
     net_state_refresh64();
@@ -935,13 +1047,72 @@ void startmenu64_open64(const char* why) {
     }
     if (!g_grid_logged) {
         g_grid_logged = true;
+        // ★ 应用列表（注册表）总览：n = 全部应用数 / pinned = 固定网格条数 / list = 左侧列表几何
+        dbg64_line_begin64();
+        dbg64_str("[START64] apps n=");
+        dbg64_dec((uint64_t)g_view_n);
+        dbg64_str(" src=registry path=/etc/apps.json gen=");
+        dbg64_dec((uint64_t)g_view_gen);
+        dbg64_str(" rows=");
+        dbg64_dec((uint64_t)list_rows64());
+        dbg64_str(" top=");
+        dbg64_dec((uint64_t)g_list_top);
+        dbg64_str(" x=");
+        dbg64_dec((uint64_t)list_x64());
+        dbg64_str(" y=");
+        dbg64_dec((uint64_t)list_y64());
+        dbg64_str(" w=");
+        dbg64_dec((uint64_t)list_w64());
+        dbg64_str(" h=");
+        dbg64_dec((uint64_t)list_h64());
+        dbg64_nl();
+        dbg64_line_end64();
+        for (int i = 0; i < g_view_n; i++) {
+            const SmView64& a = g_view[i];
+            const int vis = (i >= g_list_top && i < g_list_top + list_rows64()) ? 1 : 0;
+            int x = 0, y = 0, w = 0, h = 0;
+            if (vis) list_row_rect64(i - g_list_top, &x, &y, &w, &h);
+            dbg64_line_begin64();
+            dbg64_str("[START64] list idx=");
+            dbg64_dec((uint64_t)i);
+            dbg64_str(" app=");
+            dbg64_dec((uint64_t)(a.id >= 0 ? a.id : 100 + i));
+            dbg64_str(" name=");
+            dbg64_str(a.zh);
+            dbg64_str(" en=");
+            dbg64_str(a.en);
+            dbg64_str(" exec=");
+            dbg64_str(a.exec);
+            dbg64_str(" icon=");
+            dbg64_str(a.icon && a.icon[0] ? a.icon : "-");
+            dbg64_str(" kind=");
+            dbg64_dec((uint64_t)sm_icon_kind64(a));
+            dbg64_str(" file=");
+            dbg64_dec((uint64_t)((a.icon && a.icon[0] == '/') ? 1 : 0));
+            dbg64_str(" desktop=");
+            dbg64_dec((uint64_t)a.desktop);
+            dbg64_str(" visible=");
+            dbg64_dec((uint64_t)vis);
+            if (vis) {
+                dbg64_str(" x=");
+                dbg64_dec((uint64_t)x);
+                dbg64_str(" y=");
+                dbg64_dec((uint64_t)y);
+                dbg64_str(" w=");
+                dbg64_dec((uint64_t)w);
+                dbg64_str(" h=");
+                dbg64_dec((uint64_t)h);
+            }
+            dbg64_nl();
+            dbg64_line_end64();
+        }
         dbg64_line_begin64();
         dbg64_str("[START64] grid cols=");
         dbg64_dec((uint64_t)THEME64_SM_TILE_COLS);
         dbg64_str(" rows=");
         dbg64_dec((uint64_t)THEME64_SM_TILE_ROWS);
         dbg64_str(" n=");
-        dbg64_dec((uint64_t)SM_PINNED_N);
+        dbg64_dec((uint64_t)sm_pinned_n64());
         dbg64_str(" tile=");
         dbg64_dec((uint64_t)THEME64_SM_TILE_W);
         dbg64_str("x");
@@ -952,15 +1123,15 @@ void startmenu64_open64(const char* why) {
         dbg64_dec((uint64_t)grid_y64());
         dbg64_nl();
         dbg64_line_end64();
-        for (int i = 0; i < SM_PINNED_N; i++) {
+        for (int i = 0; i < sm_pinned_n64(); i++) {
             int x = 0, y = 0, w = 0, h = 0;
             startmenu64_tile_rect64(i, &x, &y, &w, &h);
-            const SmApp64& a = kApps[kPinned[i]];
+            const SmView64& a = g_view[i];
             dbg64_line_begin64();
             dbg64_str("[START64] tile idx=");
             dbg64_dec((uint64_t)i);
             dbg64_str(" app=");
-            dbg64_dec((uint64_t)a.app_id);
+            dbg64_dec((uint64_t)a.id);
             dbg64_str(" name=");
             dbg64_str(a.zh);          // 中文名没有空格：日志 token 好切（英文名带空格留给 en= 字段）
             dbg64_str(" en=");
@@ -1027,6 +1198,7 @@ void startmenu64_open64(const char* why) {
         dbg64_nl();
         dbg64_line_end64();
         g_user_logged = true;
+        g_logged_gen = g_view_gen;
     }
 }
 void startmenu64_close64(const char* why) {
@@ -1125,28 +1297,57 @@ static void draw_status64() {
 
 static void draw_tile64(int idx, bool hover) {
     const Theme64Tokens* t = theme64_tokens64();
+    if (idx < 0 || idx >= g_view_n) return;
     int x = 0, y = 0, w = 0, h = 0;
     startmenu64_tile_rect64(idx, &x, &y, &w, &h);
     if (hover)
         p2ui_fill_mixed64(x, y, w, h, THEME64_R_BUTTON, THEME64_R_BUTTON, t->accent, 46);
-    const SmApp64& a = kApps[kPinned[idx]];
+    const SmView64& a = g_view[idx];
     const int isz = THEME64_SM_TILE_ICON;
     const int ix = x + (w - isz) / 2, iy = y + 6;
-    // 图标：圆角方块渐变底 + 线性图标（统一线性风格）
+    // 图标：圆角方块渐变底 + 应用自己的图标（注册表来源；见 sm_draw_app_icon64 的三层优先级）
     p2ui_fill_mixed64(ix, iy, isz, isz, THEME64_R_ICON, THEME64_R_ICON, t->grad_a, 235);
-    // ★ 本批（真图标）：应用图标走外置图标包（应用专属亮色，在渐变底板上也清楚）；
-    //   取不到就回落"线性图标 + 白色"
-    if (a.icon64 > 0 &&
-        icons64_draw_kind64(a.icon64, ix + 4, iy + 4, isz - 8,
-                            icons64_app_color64(a.icon64), 235) == 0) {
-        // 已画真图标
-    } else {
-        p2ui_icon64(a.icon_kind, ix + 4, iy + 4, isz - 8, rgb(255, 255, 255), 235);
-    }
+    sm_draw_app_icon64(a, ix + 4, iy + 4, isz - 8, 235);
     const char* nm = p2ui_text_w64(a.zh) <= w - 6 ? a.zh : a.en;
     const int tw = p2ui_text_w64(nm), lh = p2ui_line_h64();
     p2ui_text64(x + (w - tw) / 2, iy + isz + 4, nm, t->dark ? t->text : rgb(32, 32, 32));
     (void)lh;
+}
+
+// ★ "全部应用"列表：左侧一列（标题 + 每行 图标/名字）。用户安装的应用排在最前面（新装的立刻可见）。
+static void draw_list64() {
+    const Theme64Tokens* t = theme64_tokens64();
+    char hdr[40];
+    s_copy(hdr, "全部应用 (", (int)sizeof(hdr));
+    {
+        char b[8];
+        u_dec(b, (uint64_t)g_view_n);
+        s_cat(hdr, b, (int)sizeof(hdr));
+        s_cat(hdr, ")", (int)sizeof(hdr));
+    }
+    p2ui_text64(list_x64(), list_y64() - p2ui_line_h64() - 6, hdr, t->text_dim);
+    const int rows = list_rows64();
+    for (int r = 0; r < rows; r++) {
+        const int i = g_list_top + r;
+        if (i < 0 || i >= g_view_n) break;
+        int x = 0, y = 0, w = 0, h = 0;
+        list_row_rect64(r, &x, &y, &w, &h);
+        if (g_hover == 40 + r)
+            p2ui_fill_mixed64(x, y, w, h, THEME64_R_BUTTON, THEME64_R_BUTTON, t->accent, 46);
+        const SmView64& a = g_view[i];
+        sm_draw_app_icon64(a, x + 4, y + (h - 18) / 2, 18, 255);
+        const int lh = p2ui_line_h64();
+        p2ui_text64(x + 28, y + (h - lh) / 2, a.zh, t->dark ? t->text : rgb(24, 26, 32));
+    }
+    // 滚动条（列表比可视行多时；细条，颜色跟随主题）
+    if (g_view_n > rows) {
+        const int track_h = rows * THEME64_SM_SROW;
+        int bar_h = track_h * rows / g_view_n;
+        if (bar_h < 16) bar_h = 16;
+        const int max_top = list_max_top64();
+        const int bar_y = list_y64() + (max_top > 0 ? (track_h - bar_h) * g_list_top / max_top : 0);
+        p2ui_fill_mixed64(list_x64() + list_w64() - 3, bar_y, 3, bar_h, 2, 2, t->accent, 150);
+    }
 }
 
 static void draw_menu64() {
@@ -1209,7 +1410,7 @@ static void draw_menu64() {
             p2ui_text64(sx + 30, sy + (THEME64_SM_SEARCH_H - lh) / 2, "搜索", rgb(255, 255, 255));
         }
     }
-    // 5) 内容：有输入时结果优先；无输入时固定网格（2 列 × 4 行，偏右）
+    // 5) 内容：有输入时结果优先；无输入时 = 左侧"全部应用"列表 + 右侧固定网格（2 列 × 4 行）
     const int cy0 = my + (content_top64() - sm_y());
     if (g_query[0]) {
         if (g_hits == 0) {
@@ -1221,12 +1422,18 @@ static void draw_menu64() {
                 ry = my + (ry - sm_y());
                 if (i == g_hit_sel)
                     p2ui_fill_mixed64(rx, ry, rw, rh, THEME64_R_BUTTON, THEME64_R_BUTTON, t->accent, 60);
-                const SmApp64& a = kApps[g_hit_app[i]];
-                // ★ 本批（真图标）：搜索结果行里用真图标但**着主题线色**（浅色行底上要看得清）
-                if (!(a.icon64 > 0 &&
-                      icons64_draw_kind64(a.icon64, rx + 6, ry + (rh - 18) / 2, 18,
-                                          p2ui_icon_color64(t), 255) == 0)) {
-                    p2ui_icon64(a.icon_kind, rx + 6, ry + (rh - 18) / 2, 18, p2ui_icon_color64(t), 255);
+                const SmView64& a = g_view[g_hit_app[i]];
+                // 结果行里图标着**主题线色**（浅色行底上要看得清）；取不到就程序化兜底
+                {
+                    const int k = sm_icon_kind64(a);
+                    if (!(k > 0 && icons64_draw_kind64(k, rx + 6, ry + (rh - 18) / 2, 18,
+                                                      p2ui_icon_color64(t), 255) == 0)) {
+                        if (!(a.icon && a.icon[0] == '/' &&
+                              icons64_draw_file64(a.icon, rx + 6, ry + (rh - 18) / 2, 18, 255) == 0)) {
+                            p2ui_icon64(P2UI_ICON_PLUS, rx + 6, ry + (rh - 18) / 2, 18,
+                                        p2ui_icon_color64(t), 255);
+                        }
+                    }
                 }
                 const int lh = p2ui_line_h64();
                 p2ui_text64(rx + 32, ry + (rh - lh) / 2, a.zh, t->dark ? t->text : rgb(24, 26, 32));
@@ -1235,7 +1442,8 @@ static void draw_menu64() {
             }
         }
     } else {
-        for (int i = 0; i < SM_PINNED_N; i++) draw_tile64(i, g_hover == 10 + i);
+        draw_list64();                      // ★ 全部应用（左列；注册表全量）
+        for (int i = 0; i < sm_pinned_n64(); i++) draw_tile64(i, g_hover == 10 + i);
     }
     // 6) 左下角：小圆形用户头像 + 用户名
     {
@@ -1323,7 +1531,16 @@ static int hit_item64(int mx, int my) {
             if (in_rect64(mx, my, x, y, w, h)) return 20 + i;
         }
     } else {
-        for (int i = 0; i < SM_PINNED_N; i++) {
+        // ★ 左侧"全部应用"列表（40+行号）优先于右侧固定网格：列表与网格不重叠，顺序无所谓
+        const int rows = list_rows64();
+        for (int r = 0; r < rows; r++) {
+            const int i = g_list_top + r;
+            if (i < 0 || i >= g_view_n) break;
+            int x = 0, y = 0, w = 0, h = 0;
+            list_row_rect64(r, &x, &y, &w, &h);
+            if (in_rect64(mx, my, x, y, w, h)) return 40 + r;
+        }
+        for (int i = 0; i < sm_pinned_n64(); i++) {
             int x = 0, y = 0, w = 0, h = 0;
             startmenu64_tile_rect64(i, &x, &y, &w, &h);
             if (in_rect64(mx, my, x, y, w, h)) return 10 + i;
@@ -1358,6 +1575,7 @@ static const char* item_name64(int item) {
     if (item == 7) return "power";
     if (item == 8) return "settings";
     if (item == 29) return "powermenu";
+    if (item >= 40) return "applist";        // ★ 左侧"全部应用"列表行
     if (item >= 30) return "poweritem";
     if (item >= 20) return "result";
     if (item >= 10) return "tile";
@@ -1471,22 +1689,30 @@ int startmenu64_handle_mouse_press64(int mx, int my, int button) {
         else if (g_pm_anim == 1) { sys_reboot64(); }
         else { g_pm_open = false; locklogin64_lock64("start64"); }
         return 1;
-    }
     if (item >= 20 && item < 20 + 8) {           // 搜索结果
         const int i = item - 20;
         if (i < g_hits) {
-            const SmApp64& a = kApps[g_hit_app[i]];
+            const int view = g_hit_app[i];
             startmenu64_close64("launch");
-            startmenu64_launch64(a.app_id, "result");
+            sm_launch_view64(view, "result");
         }
         return 1;
     }
-    if (item >= 10 && item < 10 + SM_PINNED_N) { // 固定网格
-        const SmApp64& a = kApps[kPinned[item - 10]];
-        startmenu64_close64("launch");
-        startmenu64_launch64(a.app_id, "tile");
+    if (item >= 40) {                            // ★ 左侧"全部应用"列表行 -> 启动（与双击同一入口）
+        const int view = g_list_top + (item - 40);
+        if (view >= 0 && view < g_view_n) {
+            startmenu64_close64("launch");
+            sm_launch_view64(view, "applist");
+        }
         return 1;
     }
+    if (item >= 10 && item < 10 + sm_pinned_n64()) { // 固定网格
+        startmenu64_close64("launch");
+        sm_launch_view64(item - 10, "tile");
+        return 1;
+    }
+    return 1;
+}
     return 1;
 }
 
@@ -1533,6 +1759,26 @@ int startmenu64_wheel64(int dz) {
         dirty_menu64(0);
         return 1;
     }
+    // ★ 无输入时：滚轮滚"全部应用"列表（顶部/底部夹取；打点便于验收）
+    if (!g_query[0] && g_view_n > list_rows64()) {
+        const int old = g_list_top;
+        g_list_top += (dz > 0 ? -1 : 1);
+        if (g_list_top < 0) g_list_top = 0;
+        if (g_list_top > list_max_top64()) g_list_top = list_max_top64();
+        if (g_list_top != old) {
+            dirty_menu64(0);
+            dbg64_line_begin64();
+            dbg64_str("[START64] list scroll top=");
+            dbg64_dec((uint64_t)g_list_top);
+            dbg64_str(" n=");
+            dbg64_dec((uint64_t)g_view_n);
+            dbg64_str(" rows=");
+            dbg64_dec((uint64_t)list_rows64());
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        return 1;
+    }
     return 0;
 }
 
@@ -1541,11 +1787,14 @@ int startmenu64_handle_key64(uint8_t c) {
     if (c == 0x1B) {                             // ESC：先关电源二级菜单，再关开始菜单（两级退出）
         if (g_pm_open) {
             g_pm_open = false;
-            dirty_pm64();
-            dbg64_line_begin64();
-            dbg64_str("[START64] esc level=2 close=power-menu");
-            dbg64_nl();
-            dbg64_line_end64();
+    if (c == '\n' || c == '\r') {                // 回车 -> 启动第一个命中
+        if (g_query[0] && g_hits > 0) {
+            const int view = g_hit_app[g_hit_sel < g_hits ? g_hit_sel : 0];
+            startmenu64_close64("search-enter");
+            sm_launch_view64(view, "search-enter");
+        }
+        return 1;
+    }
             return 1;
         }
         startmenu64_close64("esc");
@@ -1562,9 +1811,9 @@ int startmenu64_handle_key64(uint8_t c) {
     }
     if (c == '\n' || c == '\r') {                // 回车 -> 启动第一个命中
         if (g_query[0] && g_hits > 0) {
-            const SmApp64& a = kApps[g_hit_app[g_hit_sel < g_hits ? g_hit_sel : 0]];
+            const int view = g_hit_app[g_hit_sel < g_hits ? g_hit_sel : 0];
             startmenu64_close64("search-enter");
-            startmenu64_launch64(a.app_id, "search-enter");
+            sm_launch_view64(view, "search-enter");
         }
         return 1;
     }
@@ -1632,13 +1881,17 @@ int startmenu64_selftest64() {
     if (THEME64_SM_R_TOP != 24 || THEME64_SM_R_BOTTOM != 10) fails |= 4;
     if (sm_y() < 0) fails |= 8;
     if (sm_x() < 0 || sm_x() + sm_w() > W) fails |= 16;
-    // 2) 固定网格 2 列 × 4 行，且不越出菜单/不压 Dock
+    // 2) 固定网格 2 列 × 4 行，且不越出菜单/不压 Dock（网格内容 = 注册表前 8 条）
     if (THEME64_SM_TILE_COLS != 2 || THEME64_SM_TILE_ROWS != 4) fails |= 32;
-    for (int i = 0; i < SM_PINNED_N; i++) {
-        int x = 0, y = 0, w = 0, h = 0;
-        startmenu64_tile_rect64(i, &x, &y, &w, &h);
-        if (x < sm_x() || x + w > sm_x() + sm_w() || y + h > sm_y() + sm_h()) fails |= 64;
-        if (y + h > dock_top64()) fails |= 128;
+    {
+        int n = sm_pinned_n64();
+        if (n > THEME64_SM_TILE_COLS * THEME64_SM_TILE_ROWS) n = THEME64_SM_TILE_COLS * THEME64_SM_TILE_ROWS;
+        for (int i = 0; i < n; i++) {
+            int x = 0, y = 0, w = 0, h = 0;
+            startmenu64_tile_rect64(i, &x, &y, &w, &h);
+            if (x < sm_x() || x + w > sm_x() + sm_w() || y + h > sm_y() + sm_h()) fails |= 64;
+            if (y + h > dock_top64()) fails |= 128;
+        }
     }
     // 3) 搜索框在顶部偏右、在菜单内
     {
@@ -1668,15 +1921,16 @@ int startmenu64_selftest64() {
         startmenu64_settings_rect64(&x, &y, &w, &h);
         if (x + w > power_x64()) fails |= 8192;                 // 设置按钮在电源按钮左边
     }
-    // 6) 搜索匹配（名字：中/英/别名，大小写不敏感）
     {
         const char* q = "calc";
         int hit = -1;
-        for (int i = 0; i < SM_APP_N; i++)
-            if (s_has_icase(kApps[i].zh, q) || s_has_icase(kApps[i].en, q) || s_has_icase(kApps[i].alias, q)) { hit = i; break; }
-        if (hit < 0 || kApps[hit].app_id != APP_ID_CALC) fails |= 16384;
-        if (!s_has_icase(kApps[0].zh, "终端")) fails |= 32768;
-        if (!s_has_icase(kApps[0].en, "TERM")) fails |= 65536;
+        sm_sync_apps64();
+        for (int i = 0; i < g_view_n; i++)
+            if (s_has_icase(g_view[i].zh, q) || s_has_icase(g_view[i].en, q) ||
+                s_has_icase(g_view[i].alias, q)) { hit = i; break; }
+        if (hit < 0 || g_view[hit].id != APP_ID_CALC) fails |= 16384;
+        if (g_view_n == 0 || !s_has_icase(g_view[0].zh, "终端")) fails |= 32768;
+        if (g_view_n == 0 || !s_has_icase(g_view[0].en, "TERM")) fails |= 65536;
     }
     // 7) 日历/星期换算（与时区无关的固定样本）
     if (weekday_ymd64(2026, 9, 23) != 3) fails |= 131072;       // 2026-09-23 = 星期三

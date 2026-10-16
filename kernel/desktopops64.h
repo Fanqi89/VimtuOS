@@ -44,6 +44,11 @@
 #define DESKOPS_KIND_RECYCLE   1
 #define DESKOPS_KIND_TERM      2
 #define DESKOPS_KIND_FOLDER    3     // 用户"新建文件夹"（3..7 共 5 个槽）
+#define DESKOPS_KIND_APP       8     // ★ 应用注册表来的桌面快捷方式（用户用 /bin/vpkg 装的应用；
+                                     //   名字/图标/exec 全在注册表里，见 kernel/app64.h）
+                                     //   注意：它不写进 ui.desktop.icons 的集合字符串（那是 0..7 的
+                                     //   内置项）；快捷方式的有无由注册表的 desktop 标志决定，
+                                     //   位置写回注册表（跨重启持久化）。
 
 #define DESKOPS_MAX_ITEMS      8     // 桌面项上限（3 内置 + 5 文件夹）
 #define DESKOPS_RECYCLE_MAX    8     // 回收站内容上限
@@ -54,6 +59,8 @@ int  desktopops64_tick64();      // 每帧：外部改 config（终端 `cfg set 
 
 // ---- 桌面项 ----
 int  desktopops64_count64();
+void desktopops64_set_pos64(int i, int x, int y);        // 拖动结束落点（写 config64 / 应用则写注册表）
+int  desktopops64_app64(int i);                          // 第 i 项是应用快捷方式时 -> 注册表下标；否则 -1
 int  desktopops64_kind64(int i);
 const char* desktopops64_name64(int i);
 void desktopops64_pos64(int i, int* x, int* y);

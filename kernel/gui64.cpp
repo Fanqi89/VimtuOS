@@ -47,6 +47,9 @@
 #include "settings64.h"      // ★ P3：设置页的启动期生效点（字体大小档 + 自定义渐变壁纸）
 #include "desktopops64.h"     // ★ P5：桌面右键菜单 / 玻璃选择框 / 回收站 / 桌面图标集合
 #include "icons64.h"         // ★ 本批：外置图标包（真图标）—— 内核里不含图标字节，见 icons64.h
+#include "app64.h"            // ★ 应用注册表（/etc/apps.json）+ VAP64 启动器（app_launch_exec64 用）
+#include "vfs64.h"            // 启动前读文件头判 ELF/VAP64
+#include "proc64.h"           // 用户应用以**真进程**跑（create + start_elf）
 #include "hda64.h"            // ★ 系统音效：startup/click/error 触发点 + 开机动画之外的既有驱动
 
 // ★ 缺陷 6①：settings64.cpp 里的按用户偏好同步（theme/lock_mode）—— settings64.h 不在本批可改文件里，
@@ -2227,6 +2230,105 @@ void app_about_open64() {
 // 这里保留 app_recycle_open64 这个应用契约入口（[APP] recycle opened 打点也在那边打）。
 void app_recycle_open64() { desktopops64_recycle_open64(); }
 
+// ==================== ★ 应用注册表启动入口（开始菜单 / 桌面快捷方式共用）====================
+// 谁调用：startmenu64（固定格/全部应用列表/搜索结果）与 desktopops64（双击/右键打开）。
+// 分派（见 kernel/app64.h 的注册表说明）：
+//   * "builtin:<短名>" -> 既有窗口应用契约入口（app_*_open64），与其它入口行为一致；
+//   * "/..." 且文件头是 ELF   -> **真进程**（proc64 create + start_elf；GUI 不等它，pid 进日志）；
+//   * "/..." 且文件头是 VAP64 -> app64_launch64（平铺代码段进 ring3；同步跑完，rc 进日志）；
+//   * 其它 / 文件不在          -> 如实失败并打点（绝不假装成功）。
+static int la_eq64(const char* a, const char* b) {
+    int i = 0;
+    while (a[i] && a[i] == b[i]) i++;
+    return a[i] == b[i] ? 1 : 0;
+}
+int app_launch_exec64(const char* exec, const char* via) {
+    const char* v = via ? via : "-";
+    if (!exec || !exec[0]) return -1;
+    if (exec[0] != '/') {                                   // builtin:<短名>
+        const char* name = exec;
+        for (int i = 0; exec[i]; i++) if (exec[i] == ':') { name = exec + i + 1; break; }
+        int rc = 0;
+        if      (la_eq64(name, "term"))     app_term_open64();
+        else if (la_eq64(name, "mypc"))     app_mypc_open64();
+        else if (la_eq64(name, "settings")) app_settings_open64();
+        else if (la_eq64(name, "calc"))     app_calc_open64();
+        else if (la_eq64(name, "mines"))    app_mines_open64();
+        else if (la_eq64(name, "tmgr"))     app_tmgr_open64();
+        else if (la_eq64(name, "monitor"))  app_monitor_open64();
+        else if (la_eq64(name, "about"))    app_about_open64();
+        else if (la_eq64(name, "recycle"))  app_recycle_open64();
+        else { rc = -1; }
+        dbg64_line_begin64();
+        dbg64_str("[APPREG64] launch exec=");
+        dbg64_str(exec);
+        dbg64_str(" via=");
+        dbg64_str(v);
+        dbg64_str(" kind=window rc=");
+        dbg64_dec((uint64_t)(rc < 0 ? 1 : 0));
+        dbg64_str(rc < 0 ? " (unknown builtin)" : "");
+        dbg64_nl();
+        dbg64_line_end64();
+        return rc;
+    }
+    // 卷里的程序：按**文件头魔数**分派（与 app64_run_any64 同口径）
+    uint8_t head[8];
+    if (vfs64_read64(exec, head, 8) != 8) {
+        dbg64_line_begin64();
+        dbg64_str("[APPREG64] launch FAILED exec=");
+        dbg64_str(exec);
+        dbg64_str(" via=");
+        dbg64_str(v);
+        dbg64_str(" reason=read\n");
+        dbg64_line_end64();
+        return -1;
+    }
+    const int is_elf  = (head[0] == 0x7F && head[1] == 'E' && head[2] == 'L' && head[3] == 'F');
+    const int is_vap  = (head[0] == 'V' && head[1] == 'A' && head[2] == 'P' && head[3] == '6' &&
+                         head[4] == '4' && head[5] == 0 && head[6] == 0 && head[7] == 0);
+    if (is_elf && proc64_isolate64()) {                     // 真进程：GUI 不阻塞
+        int pid = proc64_create64("app", 0);
+        int rc = -1;
+        if (pid > 0) rc = proc64_start_elf64(pid, exec);
+        if (rc != 0 && pid > 0 && proc64_find64(pid)) proc64_destroy64(pid);
+        dbg64_line_begin64();
+        dbg64_str("[APPREG64] launch exec=");
+        dbg64_str(exec);
+        dbg64_str(" via=");
+        dbg64_str(v);
+        dbg64_str(" kind=elf pid=");
+        dbg64_dec((uint64_t)(pid > 0 ? pid : 0));
+        dbg64_str(" rc=");
+        dbg64_dec((uint64_t)(rc == 0 ? 0 : 1));
+        dbg64_str(rc == 0 ? " (real process)" : " FAILED");
+        dbg64_nl();
+        dbg64_line_end64();
+        return rc == 0 ? 0 : -1;
+    }
+    const int rc = (is_elf || is_vap) ? app64_run_any64(exec) : -1;
+    if (!is_elf && !is_vap) {
+        dbg64_line_begin64();
+        dbg64_str("[APPREG64] launch FAILED exec=");
+        dbg64_str(exec);
+        dbg64_str(" via=");
+        dbg64_str(v);
+        dbg64_str(" reason=format\n");
+        dbg64_line_end64();
+        return -1;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[APPREG64] launch exec=");
+    dbg64_str(exec);
+    dbg64_str(" via=");
+    dbg64_str(v);
+    dbg64_str(is_elf ? " kind=elf" : " kind=vap64");
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)(rc == 0 ? 0 : 1));
+    dbg64_str(" (shared-address-space mode; synchronous)\n");
+    dbg64_line_end64();
+    return rc;
+}
+
 // ★ 缺陷 1：老开始菜单的**动作分派**（menu_activate）与**开关**（menu_toggle）整体删除。
 //   新开始菜单的应用启动 / 关机·重启·锁定都在 kernel/startmenu64.cpp（固定网格 / 搜索 / 电源菜单），
 //   走的是同一个 app_*_open64 / sys_reboot64 / sys_shutdown64 契约入口，所以行为语义不变。
@@ -2551,6 +2653,18 @@ static void handle_mouse(void) {
                     dbg64_nl();
                     if (kind == DESKOPS_KIND_MYPC) app_mypc_open64();
                     else if (kind == DESKOPS_KIND_RECYCLE) app_recycle_open64();
+                    else if (kind == DESKOPS_KIND_APP) {
+                        // ★ 用户安装的应用快捷方式：双击 -> 注册表里的 exec（与开始菜单同一入口）
+                        const int reg = desktopops64_app64(i);
+                        if (reg >= 0) {
+                            dbg64_str("[DESK64] dblclick app=");
+                            dbg64_dec((uint64_t)reg);
+                            dbg64_str(" exec=");
+                            dbg64_str(app64_reg_exec64(reg));
+                            dbg64_nl();
+                            (void)app_launch_exec64(app64_reg_exec64(reg), "desktop-dblclick");
+                        }
+                    }
                     else app_term_open64();
                     g_icon_sel = -1;
                     g_icon_last_tick = 0;
@@ -3351,6 +3465,10 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
     g_icon_drag_idx = -1;
     g_icon_drag_moved = false;
     // ★ P5：桌面图标集合（项/位置/回收站内容）由 desktopops64 从 config64 载入
+    // ---- ★ 应用注册表（/etc/apps.json，构建期内置 + vpkg 用户应用追加）----
+    // 必须在 desktopops64_init64 之前：桌面快捷方式（用户安装的应用）从注册表建。
+    (void)app64_registry_init64();
+    (void)app64_reg_selftest64();
     desktopops64_init64();
     {
         dbg64_line_begin64();

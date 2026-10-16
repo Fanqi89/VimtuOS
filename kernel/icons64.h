@@ -112,3 +112,11 @@ uint32_t icons64_app_color64(int kind);
 int icons64_selftest64();
 // 打点：[ICON64] dump ...（每条 kind 一行的加载/回落统计；预算内）
 void icons64_dump64();
+
+// ---- ★ 注册表驱动的图标（内置用系统图标名 / 用户应用用包里的 PNG）----
+// 系统图标名 -> kind（名字表见上面的 kIcon64Names；-1 = 不认识，调用方走程序化兜底）
+int icons64_kind_by_name64(const char* name);
+// 直接画**卷里**的 PNG（注册表 icon 以 '/' 开头时的路径，例如 /usr/share/<app>/icon.png）：
+//   返回 0 = 已画；-1 = 取不到/解码失败（调用方回落系统图标名 -> 程序化绘制）。
+// 这是"图标的三种来源"里的第 ① 层（应用自带图标文件），按路径缓存。
+int icons64_draw_file64(const char* vfs_path, int x, int y, int size, int alpha);

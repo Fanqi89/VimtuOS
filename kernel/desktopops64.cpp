@@ -19,7 +19,8 @@
 #include "config64.h"
 #include "debug64.h"
 #include "x86_64.h"
-
+#include "icons64.h"          // ★ 应用快捷方式的图标：包里的系统图标 / 注册表里的 PNG 文件
+#include "app64.h"            // ★ 应用注册表（/etc/apps.json）：桌面快捷方式的单一真源
 // ---- 桌面图标单元格（与 gui64.cpp 的 ICON_W/ICON_CELL_W/ICON_CELL_H 一致）----
 #define DOPS_ICON_W      48
 #define DOPS_CELL_W      88
@@ -34,13 +35,14 @@
 #define DOPS_GRID_Y0  DOPS_ICON_Y0
 
 // ==================== 状态 ====================
-struct DeskItem { int kind; int x, y; };
+struct DeskItem { int kind; int app; int x, y; };   // app = 注册表下标（kind == DESKOPS_KIND_APP 时有效）
 static DeskItem g_items[DESKOPS_MAX_ITEMS];
 static int      g_n = 0;
 static int      g_recycle[DESKOPS_RECYCLE_MAX];
 static int      g_rec_n = 0;
 static char     g_set_cache[CFG64_STR_MAX];
 static uint32_t g_tick_div = 0;
+static uint32_t g_reg_div  = 0;   // ★ 注册表抽查的独立分频（1 秒一次；说明见 desktopops64_tick64）
 static int      g_rec_empty_logged = 0;      // "空回收站" 打点只在状态变化时打一次（防刷屏）
 // ★ P7a-9：桌面**多选集合**（Windows 方案；详见 desktopops64.h 的说明）。
 static int  g_sel[DESKOPS_MAX_ITEMS];
@@ -102,6 +104,19 @@ static void icon_menu_action(int idx) {
             case DOPS_ICONMENU_ID_OPEN:
                 if (kind == DESKOPS_KIND_MYPC) app_mypc_open64();
                 else if (kind == DESKOPS_KIND_RECYCLE) app_recycle_open64();
+                else if (kind == DESKOPS_KIND_APP) {
+                    // ★ 应用快捷方式：走注册表启动入口（与开始菜单同一条路）
+                    if (target >= 0) {
+                        dbg64_line_begin64();
+                        dbg64_str("[DESK64] icon menu open app=");
+                        dbg64_dec((uint64_t)g_items[target].app);
+                        dbg64_str(" exec=");
+                        dbg64_str(app64_reg_exec64(g_items[target].app));
+                        dbg64_nl();
+                        dbg64_line_end64();
+                        (void)app_launch_exec64(app64_reg_exec64(g_items[target].app), "desktop-menu");
+                    }
+                }
                 else app_term_open64();
                 why = "opened";
                 break;
@@ -166,6 +181,45 @@ static const char* item_name(int kind) {
     if (kind == DESKOPS_KIND_RECYCLE) return gui64_tr("Recycle Bin", "回收站");
     if (kind == DESKOPS_KIND_TERM)    return gui64_tr("Terminal", "终端");
     return gui64_tr("New folder", "新建文件夹");
+}
+
+// ★ 应用快捷方式的名字：注册表里那条（用户应用显示名）；内置项仍按 kind 翻译
+static const char* item_name_of(const DeskItem& it) {
+    if (it.kind == DESKOPS_KIND_APP) {
+        const char* n = app64_reg_name64(it.app);
+        return (n && n[0]) ? n : gui64_tr("Application", "应用");
+    }
+    return item_name(it.kind);
+}
+
+// ★ 应用快捷方式同步：桌面项 = 内置集合（config）+ 注册表里 desktop=1 的用户应用。
+//   返回 1 = 有变化（调用方重绘）。位置：注册表里有就用；否则挑第一个空格并写回注册表。
+static int app_items_sync64();
+static int app_item_at64(int reg);
+// 第一个空闲网格单元（不含任何项）
+static void first_free_cell64(int* ox, int* oy) {
+    for (int r = 0; r < 32; r++) {
+        for (int c = 0; c < 32; c++) {
+            const int x = DOPS_GRID_X0 + c * DOPS_GRID_W;
+            const int y = DOPS_GRID_Y0 + r * DOPS_GRID_H;
+            const int sw = gui64_screen_w(), sh = gui64_screen_h() - gui64_taskbar_h();
+            if (sw > 0 && x > sw - DOPS_CELL_W - 2) continue;
+            if (sh > 0 && y > sh - DOPS_CELL_H) continue;
+            int taken = 0;
+            for (int k = 0; k < g_n; k++) if (g_items[k].x == x && g_items[k].y == y) { taken = 1; break; }
+            if (!taken) { *ox = x; *oy = y; return; }
+        }
+    }
+    *ox = DOPS_ICON_X0; *oy = DOPS_ICON_Y0;
+}
+// 注册表下标 -> 画图标（三层优先级，与开始菜单同一条口径：文件 -> 系统图标名 -> 程序化）
+static void draw_app_shortcut_icon64(int reg, int x, int y, int size) {
+    const char* icon = app64_reg_icon64(reg);
+    if (icon && icon[0] == '/' && icons64_draw_file64(icon, x, y, size, 255) == 0) return;
+    const int kind = icons64_kind_by_name64(icon);
+    const uint32_t pal = (kind > 0) ? icons64_app_color64(kind) : rgb(255, 255, 255);
+    if (kind > 0 && icons64_draw_kind64(kind, x, y, size, pal, 255) == 0) return;
+    p2ui_icon64(P2UI_ICON_PLUS, x, y, size, pal, 255);
 }
 
 // ==================== 持久化（ui.desktop.icons = "桌面集合|回收站集合"）====================
@@ -248,7 +302,7 @@ static void log_items(void) {
         dbg64_str(" kind=");
         dbg64_dec((uint64_t)g_items[i].kind);
         dbg64_str(" name=");
-        dbg64_str(item_name(g_items[i].kind));
+        dbg64_str(item_name_of(g_items[i]));
         dbg64_str(" x=");
         dbg64_dec((uint64_t)g_items[i].x);
         dbg64_str(" y=");
@@ -283,26 +337,56 @@ void desktopops64_init64() {
     char buf[CFG64_STR_MAX];
     cfg64_desktop_icons64(buf, (int)sizeof(buf));
     apply_set(buf);
+    (void)app_items_sync64();          // ★ 用户安装的应用（注册表 desktop=1）-> 桌面快捷方式
     log_set_line("[DESK64] init");
     log_items();
 }
 
-// 每帧（约 4Hz 抽查）：终端 `cfg set ui.desktop.icons 1,2` / 设置页按钮改了配置 -> 实时同步桌面
+// 每帧（约 4Hz 抽查）：终端 `cfg set ui.desktop.icons 1,2` / 设置页按钮改了配置 -> 实时同步桌面；
+// ★ 同一处也抽查应用注册表：/bin/vpkg 刚装完的应用 -> desktop=1 条目 -> 桌面上自动出现快捷方式。
+//
+// ★★ 本轮修正（实测缺陷）：注册表抽查**必须低频**。它要在磁盘上真读一遍 /etc/apps.json
+//    （vfs64_stat + 整文件读 -> VFS -> ATA），而这一条原来跟配置抽查一样挂在 15 tick（≈60 ms）
+//    的节拍上 = **16 次/秒的磁盘读**。实测后果：装包时磁盘抖一下（[ATA64] irq14 timeout
+//    -> fallback to polling）就把**桌面帧**拖过 5 秒 -> `[WD64] watchdog fire`（source=gui64-frame）
+//    -> `[PANIC64] stop=WATCHDOG_TIMEOUT`，整台机器停在蓝屏（vpkg64_test 三次里两次这样挂）。
+//    改成 **≈1 秒抽一次**（16 × 15 tick = 240 tick）：对"刚装的应出现在桌面"这种交互完全够
+//    （用户装完包再看桌面本来就 >1 秒），而磁盘读从 16 Hz 降到 1 Hz。
+//    配置抽查仍是 15 tick（纯内存比较，零 I/O），所以 `cfg set` 的实时性一个字没变。
 int desktopops64_tick64() {
     if (++g_tick_div < 15) return 0;
     g_tick_div = 0;
+    int changed = 0;
     char buf[CFG64_STR_MAX];
     cfg64_desktop_icons64(buf, (int)sizeof(buf));
-    if (s_eq(buf, g_set_cache)) return 0;
-    apply_set(buf);
-    log_set_line("[DESK64] set changed");
-    return 1;
+    if (!s_eq(buf, g_set_cache)) {
+        apply_set(buf);
+        log_set_line("[DESK64] set changed");
+        changed = 1;
+    }
+    if (++g_reg_div >= 16) {                           // ★ ≈1 秒一次（见上面的实测说明）
+        g_reg_div = 0;
+        // ★★ 这一段要进 vfs64（读 /etc/apps.json）—— 而 **vfs64 不是可重入的**：它此刻可能
+        //    正被"装包中的 /bin/vpkg"用着。实测后果是**读到别人的字节 / 半截内容**：
+        //      `[APPREG64] app idx=13 … exec=/usr/share/gui-demo/gui-dem8\u0004G…`（半截+垃圾），
+        //      并且会让 [PROC64] execve 的预检读到非 ELF 头 -> rc=22 reason=precheck。
+        //    单核上**关中断**就足以把这一小段做成原子的（IRQ0 不再抢占 = 没有别的任务能进
+        //    vfs64）；vfs64 自身不睡也不 hlt，ATA 在 IF=0 下自动走轮询回退（ata64_irqs_on），
+        //    所以不会死等。窗口 = 一次注册表读（KB 级），且只在内容真变了时才重解析。
+        //    如实边界：这是**单核口径**的原子性；SMP 上 AP 目前是 cli;hlt，桌面只跑在 BSP，
+        //    所以当前成立；将来看 AP 真干活要换成一把真正的 vfs64 锁。
+        const uint64_t fl = dbg64_irq_save64();
+        if (app64_registry_refresh64()) changed = 1;   // vpkg 装/卸了应用 -> 注册表变了
+        if (app_items_sync64()) changed = 1;           // 幂等：没变化时返回 0
+        dbg64_irq_restore64(fl);
+    }
+    return changed;
 }
 
 // ==================== 桌面项访问 ====================
 int desktopops64_count64() { return g_n; }
 int desktopops64_kind64(int i) { return (i >= 0 && i < g_n) ? g_items[i].kind : -1; }
-const char* desktopops64_name64(int i) { return (i >= 0 && i < g_n) ? item_name(g_items[i].kind) : "?"; }
+const char* desktopops64_name64(int i) { return (i >= 0 && i < g_n) ? item_name_of(g_items[i]) : "?"; }
 void desktopops64_pos64(int i, int* x, int* y) {
     if (i < 0 || i >= g_n) { if (x) *x = 0; if (y) *y = 0; return; }
     if (x) *x = g_items[i].x;
@@ -314,6 +398,11 @@ void desktopops64_set_pos64(int i, int x, int y) {
     if (i < 0 || i >= g_n) return;
     g_items[i].x = x; g_items[i].y = y;
     if (g_items[i].kind <= 2) cfg64_set_icon64(g_items[i].kind, x, y);   // 既有键（跨重启）
+    else if (g_items[i].kind == DESKOPS_KIND_APP)                        // ★ 应用快捷方式：位置写注册表
+        (void)app64_reg_set_pos64(g_items[i].app, x, y);
+}
+int desktopops64_app64(int i) {
+    return (i >= 0 && i < g_n && g_items[i].kind == DESKOPS_KIND_APP) ? g_items[i].app : -1;
 }
 
 // ==================== ★ P7a-7：网格吸附 + 占用避让 ====================
@@ -382,6 +471,7 @@ void desktopops64_drop64(int i, int x, int y) {
     const int avoid = desktopops64_place64(i, x, y, &nx, &ny);
     g_items[i].x = nx; g_items[i].y = ny;
     if (g_items[i].kind <= 2) cfg64_set_icon64(g_items[i].kind, nx, ny);
+    else if (g_items[i].kind == DESKOPS_KIND_APP) (void)app64_reg_set_pos64(g_items[i].app, nx, ny);
     dbg64_line_begin64();
     dbg64_str("[DESK64] snap idx=");
     dbg64_dec((uint64_t)i);
@@ -397,6 +487,115 @@ void desktopops64_drop64(int i, int x, int y) {
     dbg64_dec((uint64_t)(avoid > 0 ? 1 : 0));
     dbg64_nl();
     dbg64_line_end64();
+}
+
+// ==================== ★ 应用快捷方式（注册表 desktop=1）====================
+static int app_item_at64(int reg) {
+    for (int i = 0; i < g_n; i++)
+        if (g_items[i].kind == DESKOPS_KIND_APP && g_items[i].app == reg) return i;
+    return -1;
+}
+static int app_items_sync64() {
+    int changed = 0;
+    const int n = app64_registry_count64();
+    // ① 注册表里 desktop=0 / 已经没有了 -> 从桌面移除
+    for (int i = 0; i < g_n;) {
+        if (g_items[i].kind != DESKOPS_KIND_APP) { i++; continue; }
+        const int reg = g_items[i].app;
+        if (reg >= 0 && reg < n && app64_reg_desktop64(reg)) { i++; continue; }
+        dbg64_line_begin64();
+        dbg64_str("[DESK64] app remove idx=");
+        dbg64_dec((uint64_t)i);
+        dbg64_str(" app=");
+        dbg64_dec((uint64_t)reg);
+        dbg64_str(" reason=registry-desktop-0\n");
+        dbg64_line_end64();
+        for (int k = i; k + 1 < g_n; k++) g_items[k] = g_items[k + 1];
+        g_n--;
+        changed = 1;
+    }
+    // ② 注册表里 desktop=1 但桌面上还没有 -> 追加（用户装的应用默认在这里出现）
+    for (int reg = 0; reg < n; reg++) {
+        if (!app64_reg_desktop64(reg)) continue;
+        if (app_item_at64(reg) >= 0) continue;
+        if (g_n >= DESKOPS_MAX_ITEMS) {
+            dbg64_line_begin64();
+            dbg64_str("[DESK64] app item skip app=");
+            dbg64_dec((uint64_t)reg);
+            dbg64_str(" reason=desktop-full items=");
+            dbg64_dec((uint64_t)g_n);
+            dbg64_str(" cap=");
+            dbg64_dec((uint64_t)DESKOPS_MAX_ITEMS);
+            dbg64_nl();
+            dbg64_line_end64();
+            break;
+        }
+        DeskItem it{};
+        it.kind = DESKOPS_KIND_APP;
+        it.app = reg;
+        int x = 0, y = 0;
+        app64_reg_pos64(reg, &x, &y);
+        if (x <= 0 && y <= 0) {                       // 还没定过位置：只挑第一个空格（**不写盘**，见下）
+            // ★★ 这里**绝不能写回注册表**（实测踩到的真缺陷）：桌面帧与"/bin/vpkg 正在装包"
+            //   是并发的，两边都进 vfs64 —— 而 vfs64 不是可重入的（没有锁）。原先这里调
+            //   app64_reg_set_pos64() 会在**装包那一刻**真写一遍 /etc/apps.json，与 vpkg 的
+            //   VFS 写互相踩，实测后果有两个（tests/vpkg64_test.py 第 2 遍 GUI 装包抓到）：
+            //     ① 注册表被**读成半截**：`[APPREG64] app idx=12 … exec=builtin\u0002 icon=-`
+            //        （半截 JSON），因为帧正好读在 vpkg 重写文件的中途；
+            //     ② 更严重：vpkg 刚 vs_mkdir_p() 建出来的 /usr/share/gui-demo **没了** ——
+            //        紧接着的写文件报 `[VFS64] write: bad path` + `[FD64] open FAILED … rc=28`。
+            //   所以：**帧只读内存，位置只在用户真拖动时落盘**
+            //   （desktopops64_drop64 / drag_commit64 / set_pos64，那是用户动作，不在装包并发窗口里）。
+            //   代价：用户装完应用后、还没拖过它之前，快捷方式位置不跨重启 —— 如实边界，写在报告里。
+            first_free_cell64(&x, &y);
+        }
+        // 该格被别人占了（用户拖动过）-> 就近避让；只改内存，用户没拖就不改盘
+        {
+            const int cols = grid_cols64(), rows = grid_rows64();
+            if (cell_taken64(-1, x, y)) {
+                int best = -1, bc = 0, br = 0;
+                const int c0 = (x - DOPS_GRID_X0) / DOPS_GRID_W, r0 = (y - DOPS_GRID_Y0) / DOPS_GRID_H;
+                for (int ring = 1; ring <= 16 && best < 0; ring++) {
+                    for (int dc = -ring; dc <= ring; dc++) {
+                        for (int dr = -ring; dr <= ring; dr++) {
+                            if (dc != -ring && dc != ring && dr != -ring && dr != ring) continue;
+                            const int c = c0 + dc, r = r0 + dr;
+                            if (c < 0 || r < 0 || c >= cols || r >= rows) continue;
+                            const int cx = DOPS_GRID_X0 + c * DOPS_GRID_W;
+                            const int cy = DOPS_GRID_Y0 + r * DOPS_GRID_H;
+                            if (cell_taken64(-1, cx, cy)) continue;
+                            const int d = dc * dc + dr * dr;
+                            if (best < 0 || d < best) { best = d; bc = c; br = r; }
+                        }
+                    }
+                }
+                if (best >= 0) { x = DOPS_GRID_X0 + bc * DOPS_GRID_W; y = DOPS_GRID_Y0 + br * DOPS_GRID_H; }
+            }
+        }
+        it.x = x; it.y = y;
+        g_items[g_n++] = it;
+        changed = 1;
+        dbg64_line_begin64();
+        dbg64_str("[DESK64] app item idx=");
+        dbg64_dec((uint64_t)(g_n - 1));
+        dbg64_str(" app=");
+        dbg64_dec((uint64_t)reg);
+        dbg64_str(" name=");
+        dbg64_str(item_name_of(it));
+        dbg64_str(" exec=");
+        dbg64_str(app64_reg_exec64(reg));
+        dbg64_str(" icon=");
+        dbg64_str(app64_reg_icon64(reg)[0] ? app64_reg_icon64(reg) : "-");
+        dbg64_str(" desktop=1 x=");
+        dbg64_dec((uint64_t)x);
+        dbg64_str(" y=");
+        dbg64_dec((uint64_t)y);
+        dbg64_str(" total=");
+        dbg64_dec((uint64_t)g_n);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    return changed;
 }
 
 // ==================== ★ P7a-9：多选集合 + 组拖动 ====================
@@ -477,6 +676,7 @@ void desktopops64_drag_commit64(void) {
         const int avoid = desktopops64_place64(i, nx, ny, &nx, &ny);
         g_items[i].x = nx; g_items[i].y = ny;
         if (g_items[i].kind <= 2) cfg64_set_icon64(g_items[i].kind, nx, ny);
+        else if (g_items[i].kind == DESKOPS_KIND_APP) (void)app64_reg_set_pos64(g_items[i].app, nx, ny);
         dbg64_line_begin64();
         dbg64_str("[DESK64] snap idx=");
         dbg64_dec((uint64_t)i);
@@ -552,10 +752,16 @@ void desktopops64_draw_icons64(int selected) {
             gfx64_grad_round64(x, y, DOPS_ICON_W, DOPS_ICON_W, THEME64_R_ICON, t->grad_a, t->grad_b, 1, 255);
             gui64_draw_icon_kind64(x + 4, y + 4, k);     // 40x40 位图落在 48 的圆角底板内
             gfx64_stroke_round64(x, y, DOPS_ICON_W, DOPS_ICON_W, THEME64_R_ICON, rgb(255, 255, 255), THEME64_A_EDGE);
+        } else if (k == DESKOPS_KIND_APP) {
+            // ★ 用户安装的应用：同一块"简约圆角正方形"底板 + **应用自己的图标**
+            //   （注册表 icon：包里的 PNG / 系统图标名 / 程序化兜底，见 draw_app_shortcut_icon64）
+            gfx64_grad_round64(x, y, DOPS_ICON_W, DOPS_ICON_W, THEME64_R_ICON, t->grad_a, t->grad_b, 1, 255);
+            draw_app_shortcut_icon64(g_items[i].app, x + 4, y + 4, DOPS_ICON_W - 8);
+            gfx64_stroke_round64(x, y, DOPS_ICON_W, DOPS_ICON_W, THEME64_R_ICON, rgb(255, 255, 255), THEME64_A_EDGE);
         } else {
             draw_folder_glyph64(x, y, DOPS_ICON_W, t);
         }
-        const char* nm = item_name(k);
+        const char* nm = item_name_of(g_items[i]);
         const int tw = p2ui_text_w64(nm);
         int tx = x + (DOPS_ICON_W - tw) / 2;
         if (tx < 0) tx = 0;
@@ -610,6 +816,34 @@ int desktopops64_recycle_add64(int icon_idx) {
     if (icon_idx < 0 || icon_idx >= g_n) return 0;
     const int kind = g_items[icon_idx].kind;
     if (kind == DESKOPS_KIND_RECYCLE) return 0;                 // 回收站自己不能被拖进去
+    // ★ 应用快捷方式（注册表来的）：进回收站 = **把快捷方式从桌面删掉**（注册表 desktop=0）。
+    //   如实边界：注册表里没有"快捷方式本体"的副本，所以回收站不保留它（不假装能恢复）；
+    //   应用本体还在（开始菜单照旧能启动），重新装/重新登记就会再出现。
+    if (kind == DESKOPS_KIND_APP) {
+        const int reg = g_items[icon_idx].app;
+        const int done = (app64_reg_set_desktop64(reg, 0) == 0) ? 1 : 0;
+        const char* nm = item_name_of(g_items[icon_idx]);
+        for (int i = icon_idx; i + 1 < g_n; i++) g_items[i] = g_items[i + 1];
+        g_n--;
+        g_rec_confirm = -1;
+        dbg64_line_begin64();
+        dbg64_str("[RECYCLE64] add kind=");
+        dbg64_dec((uint64_t)kind);
+        dbg64_str(" name=");
+        dbg64_str(nm);
+        dbg64_str(" n=");
+        dbg64_dec((uint64_t)g_rec_n);
+        dbg64_str(" desktop=");
+        dbg64_dec((uint64_t)g_n);
+        dbg64_str(" app=");
+        dbg64_dec((uint64_t)reg);
+        dbg64_str(" shortcut-removed=");
+        dbg64_dec((uint64_t)done);
+        dbg64_str(" (uninstall keeps the app; registry desktop=0)\n");
+        dbg64_line_end64();
+        gui64_invalidate();
+        return done;
+    }
     if (g_rec_n >= DESKOPS_RECYCLE_MAX) return 0;
     g_recycle[g_rec_n++] = kind;
     for (int i = icon_idx; i + 1 < g_n; i++) g_items[i] = g_items[i + 1];

@@ -24,15 +24,32 @@ SECTIONS {
         *(.ltext)
         *(.ltext.*)
     }
-
-    .rodata : ALIGN(4096) {
+    /* ★ 段对齐（本批：给 /bin/vpkg、/bin/store 的应用注册表代码腾装载区）
+     *   只放宽 **.rodata / .bss**（ALIGN(4096) -> ALIGN(16)）；**.data 保持 ALIGN(4096)**
+     *   —— 那一条是 W^X 的机制，不是浪费，见下面"为什么 .data 必须保持页对齐"。
+     *   为什么原来浪费：内核的**主程序**装载窗是硬的 64 KiB（kernel/elf64.cpp 的
+     *   e64_lo64/e64_hi64），而 .rodata 紧跟在 .text 后面；.rodata 再来一条页对齐，
+     *   等于在 .text 尾部**白扔最多 4 KiB**，还会把 .data 再顶高一页。
+     *   实测（同一份 /bin/vpkg 代码）：.rodata 从 0x10000d000 退到 0x10000c060（省 4006 B），
+     *   PT_LOAD 的 memsz 合计 59595 B 一个字节没变，但 .data 因此回到 0x10000f000
+     *   （旧布局 .data@0x100010000 正好 == e64_hi64，被内核装载器直接拒）；
+     *   /bin/store 同理：.rodata 0x10000e000 -> 0x10000d5e0、.data 0x100010000 -> 0x10000f000。
+     *   为什么 `.data` 必须保持页对齐（W^X，本批实测踩过）：段贴在一起后，**小程序**的
+     *   .text 尾部（可执行）会和紧随其后的 .data（可写）落在**同一个 4 KiB 页**里 ——
+     *   内核按页取权限并集（kernel/elf64.cpp），那一页就变成 RWX。本批第一版把 .data 也
+     *   放宽到 ALIGN(16)，立刻被 user/store/build_store.sh 新增的"没有一页同时 W 与 X"
+     *   断言抓到（build64/store/demo_cli.elf page=0x100001000）。所以 .data 的页对齐留着。
+     *   对既有验收的影响：相关脚本（busybox/tcc/lua/tar/gzip/netuser…）只断言
+     *   "PT_LOAD 落在 4GiB..+64KiB"，没有一条钉死具体 p_vaddr（已 grep tests/*.py 复核），
+     *   所以这条改动不动任何断言。 */
+    .rodata : ALIGN(16) {
         *(.rodata)
         *(.rodata.*)
         *(.lrodata)
         *(.lrodata.*)
     }
 
-    .data : ALIGN(4096) {
+    .data : ALIGN(4096) {       /* ★ 页对齐是 W^X 的机制（实测：放宽就出 RWX 页），别动 */
         *(.data)
         *(.data.*)
         *(.ldata)
@@ -41,7 +58,7 @@ SECTIONS {
         *(.got.plt)
     }
 
-    .bss : ALIGN(4096) {
+    .bss : ALIGN(16) {
         *(.bss)
         *(.bss.*)
         *(.lbss)

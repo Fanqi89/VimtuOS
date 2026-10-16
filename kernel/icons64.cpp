@@ -793,3 +793,95 @@ void icons64_dump64() {
         dbg64_line_end64();
     }
 }
+
+
+// ==================== ★ 用户应用图标：卷里的 PNG 文件 ====================
+// 注册表里 icon 以 '/' 开头 = 卷内 PNG 路径（/bin/vpkg 装用户应用时把包里的图标写到
+// /usr/share/<name>/icon.png 并登记这个路径）。三层优先级（任务要求）：
+//   ① 应用自带图标文件（本函数）② 系统图标名（icons64_kind_by_name64 + draw_kind64）
+//   ③ 程序化绘制（调用方兜底）。
+// 缓存按路径；解码走 img64_load_vfs64（PNG/BMP 都行）。失败一律返回 -1 并打点，
+// 调用方去走 ②/③ —— 绝不允许"缺文件把界面画空"。
+#define ICON64_FILE_CACHE_MAX 12
+#define ICON64_FILE_PATH_MAX  128
+struct Icon64FileCache { int used; char path[ICON64_FILE_PATH_MAX]; Img64 im; };
+static Icon64FileCache g_fcache[ICON64_FILE_CACHE_MAX];
+static int g_fcache_n = 0;
+static int g_file_load_budget = 64;
+
+static int ic_find_eq64(const char* a, const char* b) {
+    int i = 0;
+    while (a[i] && a[i] == b[i]) i++;
+    return a[i] == b[i] ? 1 : 0;
+}
+
+// 系统图标名 -> kind（-1 = 不认识；调用方走程序化兜底）
+int icons64_kind_by_name64(const char* name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < ICON64_NAME_N; i++)
+        if (ic_find_eq64(name, kIcon64Names[i].name)) return kIcon64Names[i].kind;
+    return -1;
+}
+
+static Icon64FileCache* ic_fcache_find(const char* path) {
+    for (int i = 0; i < g_fcache_n; i++)
+        if (g_fcache[i].used && ic_find_eq64(g_fcache[i].path, path)) return &g_fcache[i];
+    return nullptr;
+}
+
+static void ic_log_user(const char* tag, const char* path, const char* why) {
+    if (g_file_load_budget <= 0) return;
+    g_file_load_budget--;
+    dbg64_line_begin64();
+    dbg64_str("[ICON64] user ");
+    dbg64_str(tag);
+    dbg64_str(" path=");
+    dbg64_str(path ? path : "-");
+    if (why) { dbg64_str(" reason="); dbg64_str(why); }
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+int icons64_draw_file64(const char* vfs_path, int x, int y, int size, int alpha) {
+    if (!vfs_path || vfs_path[0] != '/' || size <= 0 || alpha <= 0) return -1;
+    Icon64FileCache* c = ic_fcache_find(vfs_path);
+    if (!c) {
+        if (g_fcache_n >= ICON64_FILE_CACHE_MAX) { ic_log_user("fallback", vfs_path, "cache-full"); return -1; }
+        c = &g_fcache[g_fcache_n];
+        Img64 im{};
+        mem_owner_set_64(MEM_OWNER_GUI_64);
+        if (img64_load_vfs64(vfs_path, &im) != 0) {
+            ic_log_user("fallback", vfs_path, "no-file-or-decode");
+            return -1;
+        }
+        c->used = 1;
+        ic_strcpy(c->path, vfs_path, ICON64_FILE_PATH_MAX);
+        c->im = im;
+        g_fcache_n++;
+        ic_log_user("load", vfs_path, nullptr);
+    }
+    const Img64* im = &c->im;
+    for (int j = 0; j < size; j++) {
+        const int sy = (int)((int64_t)j * im->h / size);
+        for (int i = 0; i < size; i++) {
+            const int sx = (int)((int64_t)i * im->w / size);
+            const uint32_t px = im->px[(uint64_t)sy * (uint64_t)im->w + (uint64_t)sx];
+            int a = (int)((px >> 24) & 0xFFu);
+            if (a == 0) continue;
+            if (alpha < 255) a = a * alpha / 255;
+            if (a <= 0) continue;
+            const int dx = x + i, dy = y + j;
+            if (dx < 0 || dy < 0 || dx >= fb_width() || dy >= fb_height()) continue;
+            if (a >= 252) {
+                fb_putpixel(dx, dy, 0xFF000000u | (px & 0xFFFFFFu));
+            } else {
+                const uint32_t bg = fb_get_pixel(dx, dy);
+                const uint32_t r = (((px >> 16) & 0xFFu) * (uint32_t)a + ((bg >> 16) & 0xFFu) * (uint32_t)(255 - a)) / 255u;
+                const uint32_t g = (((px >> 8) & 0xFFu) * (uint32_t)a + ((bg >> 8) & 0xFFu) * (uint32_t)(255 - a)) / 255u;
+                const uint32_t b = ((px & 0xFFu) * (uint32_t)a + (bg & 0xFFu) * (uint32_t)(255 - a)) / 255u;
+                fb_putpixel(dx, dy, 0xFF000000u | (r << 16) | (g << 8) | b);
+            }
+        }
+    }
+    return 0;
+}

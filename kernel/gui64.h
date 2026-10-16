@@ -169,6 +169,11 @@ void app_mypc_open64();
 void app_about_open64();
 void app_recycle_open64();
 
+// ★ 应用注册表启动入口（实现见 gui64.cpp；kernel/app64.cpp 只做注册表读写）：
+//   exec = "builtin:<短名>" 或卷内路径（ELF/VAP64 按文件头分派，见函数注释）。
+//   开始菜单与桌面快捷方式都走这一条路（"一处登记、各入口同一行为"）。
+int app_launch_exec64(const char* exec, const char* via);
+
 // ==================== 桌面外壳主入口 ====================
 // 由 kernel64.cpp 的已安装系统启动路径调用（不返回）。内部会：
 //   初始化外壳状态 -> 注册内置窗口 -> 跑消息循环（输入分发 + 脏矩形重绘）。

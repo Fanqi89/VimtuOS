@@ -272,13 +272,35 @@ static int g_em_px = FONT_SIZE_PX;    // 当前 em 高度（font_set_size64 改�
 #define MAX_EDGES 4096        // 扁平化后最大线段数
 #define MAX_XS 1024           // 每行最多交点
 
+// ★ 本轮（"文字渲染不够清晰"）：覆盖率的两条修法（都可**编译期**退回旧行为做反向对照；默认必须是新的）
+//   ① FONT64_AA_SUB：每条像素行取**多少条子扫描线**（y 方向抗锯齿）。
+//      旧行为 = 1：整行只在像素中心取一条扫描线，y 方向是**二值**的 —— 判据 `yc < ylo || yc >= yhi`
+//      在**近水平边**（汉字横画的上/下边、曲线的平坦段）上会因为 1/1024 px 的量化抖动
+//      整行翻进/翻出 -> 实测横画中间出现 0 覆盖的**断笔空洞**（宿主侧逐像素证据：
+//      tests/texthint64_test.py 的 gaps 指标；em=16 的"开"字横画一行里 2 个洞），
+//      而且 0.5px 级的横细画会被整行点满 255（比参考渲染更"胖"）。
+//      新行为 = 8：行内 8 条等距子扫描线各算一次**精确水平覆盖**再取平均 —— y 方向拿到
+//      8 档覆盖率（配合水平精确覆盖，实际档位远多于 8 档，见 uv/lv 指标），横边不再整行翻出。
+//   ② FONT64_GEOM_LO：几何定点的精度。旧行为 = 1/1024 px（scaleFix = em*1024/upem 对 upem=1000
+//      的字面**截断**成 em*1.024 的整数，em=16 时 16 vs 16.384 = -2.34% 的**字形尺度误差**，
+//      em=12/18 同样 -2.3%）；本项目的四份字体 upem 都是 1000（兜底面 1024），所以这条对每个字都生效。
+//      新行为 = 1/65536 px（误差 -0.06%），**只改字形轮廓几何与基线行映射**：
+//      推进宽度 advPx / 行高 / 缓存键一个字节都不动（度量不变，布局断言不受影响）。
+#ifdef FONT64_LEGACY_AA
+#define FONT64_AA_SUB 1        // 反向对照：旧的"每行一条像素中心扫描线"
+#else
+#define FONT64_AA_SUB 8
+#endif
+#define FONT64_GEOM_SH 16      // 几何定点小数位（1/65536 px）
+
 struct FontFace {
     const uint8_t* F;
     uint32_t Fsize;
     bool font_ok;
     uint16_t unitsPerEm;
-    int32_t  scaleFix;        // FONT_PX*1024 / unitsPerEm（1/1024 px 定点）
-    int32_t  ascFix;          // ascender * scaleFix
+    int32_t  scaleFix;        // ★度量用：FONT_PX*1024 / unitsPerEm（1/1024 px 定点；advPx 由它算，**不变**）
+    int32_t  glyFix;          // ★几何用：em*65536 / unitsPerEm（1/65536 px；只给字形轮廓/基线行映射）
+    int32_t  ascFix;          // ascender * glyFix（1/65536 px；基线相对锚点顶的行位置）
     uint16_t numGlyphs;
     uint16_t indexToLocFormat;
     uint32_t offHead, offHhea, offHmtx, offMaxp, offLoca, offGlyf, offCmap;
@@ -367,7 +389,15 @@ static void face_metrics(FontFace* fc) {
     const int16_t asc = be16s(fc->F + fc->offHhea + 4);
     fc->scaleFix = (g_em_px * 1024) / fc->unitsPerEm;
     if (fc->scaleFix < 1) fc->scaleFix = 1;
-    fc->ascFix = (int32_t)asc * fc->scaleFix;
+    // ★ 几何定点（1/65536 px）：只服务**字形轮廓缩放 + 基线行映射**（advPx 仍用 scaleFix，度量不变）
+#ifdef FONT64_LEGACY_GEOM
+    fc->glyFix = (int32_t)fc->scaleFix << (FONT64_GEOM_SH - 10);   // 反向对照：旧行为（1/1024 截断的尺度）
+#else
+    fc->glyFix = (int32_t)((((int64_t)g_em_px << FONT64_GEOM_SH) + fc->unitsPerEm / 2) / fc->unitsPerEm);
+#endif
+    if (fc->glyFix < 1) fc->glyFix = 1;
+    fc->ascFix = (int32_t)((int64_t)asc * fc->glyFix);
+    if (fc->ascFix < 0) fc->ascFix = 0;
     if (!fc->cmap4) return;                       // cmap 还没解析：只算 scale
     for (int i = 0; i < FONT_CACHE_N; i++) {
         uint16_t g = cmap_lookup(fc, (uint16_t)i);
@@ -812,10 +842,11 @@ static bool rasterize_glyph(FontFace* fc, uint32_t cp, uint8_t* bm, int* ox, int
         v = ys[i];
     }
 
-    // 缩放为 1/1024 px 定点
+    // 缩放为 1/65536 px 定点（★ 本轮：几何精度从 1/1024 提到 1/65536 —— 见 FONT64_GEOM_SH 的说明；
+    // 只影响字形轮廓，推进宽度/行高不受影响）
     for (uint16_t i = 0; i < nPts; i++) {
-        xs[i] = xs[i] * fc->scaleFix;
-        ys[i] = ys[i] * fc->scaleFix;
+        xs[i] = xs[i] * fc->glyFix;
+        ys[i] = ys[i] * fc->glyFix;
     }
 
     // 逐轮廓构建（从最后一个 on 点开始，含隐式中点）
@@ -864,7 +895,7 @@ static bool rasterize_glyph(FontFace* fc, uint32_t cp, uint8_t* bm, int* ox, int
 
     if (ne == 0) return true;
 
-    // 边表 bbox（1/1024 px）
+    // 边表 bbox（1/65536 px）
     int32_t minX = INT32_MAX, maxX = -INT32_MAX, minY = INT32_MAX, maxY = -INT32_MAX;
     for (int i = 0; i < ne; i++) {
         int32_t a = ex0[i], b = ex1[i];
@@ -880,12 +911,17 @@ static bool rasterize_glyph(FontFace* fc, uint32_t cp, uint8_t* bm, int* ox, int
     }
     // 像素 bbox（钳制到 0..FONT_PX-1）。
     // 注意：字形坐标 y 向上为正（TrueType 原点在基线），行号必须从 ascFix 换算：
-    //   yc = ascFix - row*1024 - 512  →  row = (ascFix - y - 512) >> 10
-    int px0 = (int)(minX >> 10); if (px0 < 0) px0 = 0;
-    int px1 = (int)((maxX + 1023) >> 10); if (px1 > FONT_PX - 1) px1 = FONT_PX - 1;
-    int py0 = (int)((fc->ascFix - maxY - 512) >> 10); if (py0 < 0) py0 = 0;
-    int py1 = (int)((fc->ascFix - minY - 512) >> 10); if (py1 > FONT_PX - 1) py1 = FONT_PX - 1;
+    //   （旧）yc = ascFix - row*1024 - 512  →  row = (ascFix - y - 512) >> 10
+    //   （新）yc = ascFix - row*65536 - 32768  →  row = (ascFix - y - 32768) >> 16
+    // ★ 本轮：子扫描线不再只在**像素中心**（第 32768 个 1/65536），最上一/最下一档可以落在
+    //   中心之外，所以行范围保守地各外扩一行（多出来的那一行覆盖率恒为 0，只是让 blit 多跑一行，
+    //   屏幕像素不受影响；oy/h 与行范围一起变，绘制位置 = y + oy 依旧对齐）。
+    int px0 = (int)(minX >> FONT64_GEOM_SH); if (px0 < 0) px0 = 0;
+    int px1 = (int)((maxX + 65535) >> FONT64_GEOM_SH); if (px1 > FONT_PX - 1) px1 = FONT_PX - 1;
+    int py0 = (int)((fc->ascFix - maxY - 32768) >> FONT64_GEOM_SH) - 1; if (py0 < 0) py0 = 0;
+    int py1 = (int)((fc->ascFix - minY - 32768) >> FONT64_GEOM_SH) + 1; if (py1 > FONT_PX - 1) py1 = FONT_PX - 1;
     if (py0 > FONT_PX - 1) py0 = FONT_PX - 1;
+    if (py1 < 0) py1 = 0;
     if (px1 < px0 || py1 < py0) return true;
     *ox = px0; *oy = py0; *w = px1 - px0 + 1; *h = py1 - py0 + 1;
     // ★ P7a ④ 修复（文字渲染重叠错乱）：本函数是**累加**语义（同一字形的轮廓自重叠要靠
@@ -901,50 +937,77 @@ static bool rasterize_glyph(FontFace* fc, uint32_t cp, uint8_t* bm, int* ox, int
         for (int xx = px0; xx <= px1; xx++) dst[xx] = 0;
     }
 
-
-    // 扫描线填充（偶奇规则）
+    // 扫描线填充（偶奇规则）。
+    // ★ 本轮（"文字渲染不够清晰"）：每条像素行取 FONT64_AA_SUB 条**子扫描线**（y 方向等距，
+    //   落在行内的 1/(2K), 3/(2K), … 处），每条子扫描线算一次**精确水平覆盖**（与旧代码同一条公式，
+    //   只是定点从 1/1024 换成 1/65536），把 K 条的结果取平均写回 bm。
+    //   为什么必须这样（实测证据见 tests/texthint64_test.py 的 legacy 对照与 gaps/vstep 指标）：
+    //     * 旧代码整行只判一次 `yc < ylo || yc >= yhi` —— y 方向是**二值**的：近水平边
+    //       （汉字横画上下边、曲线的平坦段）只要 1/1024 px 的量化抖动让 yc 翻出边界，整行就是 0，
+    //       实测横画中间出现 0 覆盖的**空洞/断笔**（em=16 的"开"字一行里 2 个 0）；
+    //     * 反过来，0.5 px 高的细横画只要"点中"就整行 255（比参考渲染更胖），而相邻字号一换
+    int32_t acc[FONT_PX];        // 本行的覆盖率和（跨子扫描线相加）
+    int32_t sub_acc[FONT_PX];    // 单条子扫描线的覆盖率（内部叠加 + 饱和 255 = 旧语义）
     int32_t xs_cross[MAX_XS];
     for (int row = py0; row <= py1; row++) {
-        int32_t yc = fc->ascFix - ((int32_t)row * 1024 + 512);   // 像素中心在字形坐标系的 y
-        int nxs = 0;
-        for (int i = 0; i < ne; i++) {
-            int32_t y0 = ey0[i], y1 = ey1[i];
-            if (y0 == y1) continue;
-            // 判断 yc 是否在 [min(y0,y1), max(y0,y1)) 内；
-            // 注意：插值必须用原始 y0/y1（不交换坐标，否则 x 会算错）
-            int32_t ylo = (y0 < y1) ? y0 : y1;
-            int32_t yhi = (y0 > y1) ? y0 : y1;
-            if (yc < ylo || yc >= yhi) continue;
-            int32_t dx = ex1[i] - ex0[i];
-            int32_t x = ex0[i] + (yc - y0) * dx / (y1 - y0);
-            if (nxs < MAX_XS) xs_cross[nxs++] = x;
-        }
-        // 排序（插入排序，交点通常很少）
-        for (int i = 1; i < nxs; i++) {
-            int32_t key = xs_cross[i];
-            int j = i - 1;
-            while (j >= 0 && xs_cross[j] > key) { xs_cross[j + 1] = xs_cross[j]; j--; }
-            xs_cross[j + 1] = key;
-        }
-        for (int k = 0; k + 1 < nxs; k += 2) {
-            int32_t xa = xs_cross[k], xb = xs_cross[k + 1];
-            int x0 = (int)((xa + 1023) >> 10);  // ceil：第一个被覆盖像素
-            int x1 = (int)(xb >> 10);           // floor：最后一个可能被覆盖像素
-            if (x0 < 0) x0 = 0;
-            if (x1 > FONT_PX - 1) x1 = FONT_PX - 1;
-            for (int xx = x0; xx <= x1; xx++) {
-                // 覆盖率灰度：像素 [xx*1024, (xx+1)*1024) 与 [xa,xb) 的交集长度 → 0..255
-                int32_t p0 = (int32_t)xx * 1024;
-                int32_t p1 = p0 + 1024;
-                int32_t cs = (xa > p0) ? xa : p0;
-                int32_t ce = (xb < p1) ? xb : p1;
-                if (ce > cs) {
-                    int a = (int)((ce - cs) * 255 / 1024);
-                    int old = bm[row * FONT_PX + xx] + a;
-                    if (old > 255) old = 255;
-                    bm[row * FONT_PX + xx] = (uint8_t)old;
+        for (int xx = 0; xx < FONT_PX; xx++) acc[xx] = 0;
+        for (int sub = 0; sub < FONT64_AA_SUB; sub++) {
+            for (int xx = 0; xx < FONT_PX; xx++) sub_acc[xx] = 0;
+            // 子扫描线中心：1/65536 px 定点（sub=0 且 K=1 时正是 32768 = 旧的"像素中心"）
+            const int32_t off = (int32_t)(((int64_t)65536 * (2 * sub + 1)) / (2 * FONT64_AA_SUB));
+            const int32_t yc = fc->ascFix - ((int32_t)row * 65536 + off);
+            int nxs = 0;
+            for (int i = 0; i < ne; i++) {
+                int32_t y0 = ey0[i], y1 = ey1[i];
+                if (y0 == y1) continue;
+                // 判断 yc 是否在 [min(y0,y1), max(y0,y1)) 内；
+                // 注意：插值必须用原始 y0/y1（不交换坐标，否则 x 会算错）
+                int32_t ylo = (y0 < y1) ? y0 : y1;
+                int32_t yhi = (y0 > y1) ? y0 : y1;
+                if (yc < ylo || yc >= yhi) continue;
+                int32_t dx = ex1[i] - ex0[i];
+                // ★ 64 位中间量：几何定点提到 1/65536 后 (yc-y0)*dx 会到 ~1e12，必须用 int64
+                int32_t x = ex0[i] + (int32_t)(((int64_t)(yc - y0) * dx) / (y1 - y0));
+                if (nxs < MAX_XS) xs_cross[nxs++] = x;
+            }
+            // 排序（插入排序，交点通常很少）
+            for (int i = 1; i < nxs; i++) {
+                int32_t key = xs_cross[i];
+                int j = i - 1;
+                while (j >= 0 && xs_cross[j] > key) { xs_cross[j + 1] = xs_cross[j]; j--; }
+                xs_cross[j + 1] = key;
+            }
+            for (int k = 0; k + 1 < nxs; k += 2) {
+                int32_t xa = xs_cross[k], xb = xs_cross[k + 1];
+                int x0 = (int)((xa + 65535) >> FONT64_GEOM_SH);  // ceil：第一个被覆盖像素
+                int x1 = (int)(xb >> FONT64_GEOM_SH);            // floor：最后一个可能被覆盖像素
+                if (x0 < 0) x0 = 0;
+                if (x1 > FONT_PX - 1) x1 = FONT_PX - 1;
+                for (int xx = x0; xx <= x1; xx++) {
+                    // 覆盖率灰度：像素 [xx*65536, (xx+1)*65536) 与 [xa,xb) 的交集长度 → 0..255
+                    int32_t p0 = (int32_t)xx << FONT64_GEOM_SH;
+                    int32_t p1 = p0 + 65536;
+                    int32_t cs = (xa > p0) ? xa : p0;
+                    int32_t ce = (xb < p1) ? xb : p1;
+                    if (ce > cs) {
+                        int a = (int)(((ce - cs) * 255) >> FONT64_GEOM_SH);
+                        // ★ 饱和在**单条子扫描线内部**（旧语义：同一字形的自重叠轮廓要叠加），
+                        //   子扫描线之间在下面相加（不饱和）—— 这样 K 条的平均值才是真平均，
+                        //   不会因为先饱和再平均把笔画整体压暗（宿主自检量到过：压暗到 1/K）。
+                        int old = sub_acc[xx] + a;
+                        if (old > 255) old = 255;
+                        sub_acc[xx] = old;
+                    }
                 }
             }
+            for (int xx = 0; xx < FONT_PX; xx++) acc[xx] += sub_acc[xx];
+        }
+        uint8_t* dst = bm + row * FONT_PX;
+        for (int xx = px0; xx <= px1; xx++) {
+            // 平均（四舍五入）；FONT64_AA_SUB==1 时就是 acc 原值 -> 与旧行为逐像素一致
+            int v = acc[xx];
+            if (FONT64_AA_SUB > 1) v = (v + FONT64_AA_SUB / 2) / FONT64_AA_SUB;
+            dst[xx] = (uint8_t)v;
         }
     }
     return true;

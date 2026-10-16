@@ -79,6 +79,9 @@ const char* vs_err_name(int code);      /* "hash" / "depends" / ...（日志与�
 #define VS_WM_PATH      "/lib/wm.elf"          /* Ring 3 合成器（内核只认 /bin/wm.elf，桌面期由客户端 fork） */
 #define VS_WM_ALT_PATH  "/bin/wm.elf"
 #define VS_PROVIDES_PATH "/etc/vpkg/provides"   /* provides 表（宿主侧由 store_pack_win.py 装卷） */
+#define VS_APPS_PATH    "/etc/apps.json"       /* ★ 应用注册表（单一真源）：kernel/app64.h 是格式真源；
+                                                *   安装/卸载时 /bin/vpkg 追加/删掉自己那一条 */
+#define VS_APPS_MAX     (128 * 1024)           /* 注册表读取上限（mmap 缓冲；超了如实报 io） */
 
 /* 安装/卸载一次的日志前缀：CLI = "VPKG"，GUI = "STORE"（两份证据长一样，便于对账） */
 #define VS_TAG_CLI      "VPKG"
@@ -96,8 +99,20 @@ struct VsPkg {                    /* 仓库索引里的一条（= 一份可安�
     char  sha256[65];
     int   ndep;
     char  depends[VS_DEPENDS_MAX][VS_NAME_MAX];
+    /* ---- ★ 应用注册表（/etc/apps.json）：包 manifest（见 kernel/app64.h）----
+     * 索引里的 "manifest": { ... } 对象 -- 打包期由 tools/store_pack_win.py 从 spec 写；
+     * 安装时 /bin/vpkg 把这几项写进注册表（开始菜单 + 桌面快捷方式都读它）：
+     *   display   = 开始菜单显示名（空 -> 用包名）
+     *   exec      = 执行路径（vap64 留空 = /usr/share/<name>/<name>.vap64；deb 可给 App-Exec:）
+     *   icon      = 系统图标名（kernel/icons64.h 的 kIcon64Names；例如 "terminal"）
+     *   icon_file = 随包发的图标文件（相对 /opt/vpkg/repo；安装时抄成 /usr/share/<name>/icon.png）
+     * has_manifest = 1 表示索引里确实带了 manifest 对象（没带也能装，只是不进注册表 —— 如实边界）。*/
+    char  display[VS_NAME_MAX];
+    char  exec[VS_FILE_MAX];
+    char  icon[VS_NAME_MAX];
+    char  icon_file[VS_FILE_MAX];
+    int   has_manifest;
 };
-
 struct VsInstalled {              /* /var/lib/vpkg/installed.json 里的一条 */
     char  name[VS_NAME_MAX];
     char  version[VS_VER_MAX];

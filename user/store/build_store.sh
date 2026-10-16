@@ -11,7 +11,11 @@
 #   * 静态 ELF64（ET_EXEC），PT_LOAD 必须落在 4GiB..4GiB+64KiB（内核装载器硬约束，
 #     见 kernel/elf64.cpp 的 e64_lo64/e64_hi64；本脚本自己按程序头表复算这条）；
 #   * **font64.c 必须开 SSE**（stb_truetype 是浮点代码），其余一律 -mno-sse*；
-#   * 产物只落 build64/：由 tools/store_pack_win.py 装进系统卷（内核里一个字节都没有）。
+#   * 产物只落 build64/：由 tools/store_pack_win.py 装进系统卷（内核里一个字节都没有）；
+#   * 链接脚本 = **user/store/store64.ld**（本目录专用）。与 user/apps/evshm_demo.ld 只有一处
+#     差别：`.data` 也放宽到 ALIGN(16)。共享那份的 `.data : ALIGN(4096)` 是 **W^X 的机制**
+#     （小程序会让 .text 与 .data 同页 -> RWX），所以那里不动；本目录这份靠**下面那条
+#     "没有一页同时 W 与 X"的硬断言**兜底。为什么要放宽（实测数字）写在 store64.ld 头部。
 #
 # 用法：bash user/store/build_store.sh           （或由 build64.sh 调用）
 set -e
@@ -72,14 +76,14 @@ VS_OBJS_GUI="$OBJ/gui-vs_io.c.o $OBJ/gui-vs_gzip.c.o $OBJ/gui-vs_pkg.c.o"
 
 # ---- ① /bin/vpkg（命令行）----
 $CC $CFLAGS_COMMON $CFLAGS_NOSSE -Os -c user/store/vpkg.c -o "$OBJ/vpkg.o"
-$LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/apps/evshm_demo.ld \
+$LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/store/store64.ld \
     -o "$BUILD/vpkg.elf" $OBJ/vpkg.o $VS_OBJS $LIB_OBJS
 
 # ---- ② /bin/store（GUI：合成器客户端 + font64；-Os 换体积）----
 $CC $CFLAGS_COMMON $CFLAGS_NOSSE -Os -c user/lib/wl.c -o "$OBJ/wl.o"
 $CC $CFLAGS_COMMON -msse -msse2 -Os -c user/lib/font64.c -o "$OBJ/font64.o"
 $CC $CFLAGS_COMMON $CFLAGS_NOSSE -DVS_STORE_GUI -Os -c user/store/store.c -o "$OBJ/store.o"
-$LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/apps/evshm_demo.ld \
+$LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/store/store64.ld \
     -o "$BUILD/store.elf" $OBJ/store.o $VS_OBJS_GUI $OBJ/wl.o $OBJ/font64.o $LIB_OBJS
 
 # ---- ③④ 示例包载荷（.vap64 的 payload；ELF 且 <= 32768 B）----
@@ -101,23 +105,37 @@ for path in sys.argv[1:]:
     assert etype == 2 and machine == 0x3E, "%s 不是 ET_EXEC/x86_64" % path
     phoff = struct.unpack_from("<Q", d, 32)[0]
     phes, phn = struct.unpack_from("<H", d, 54)[0], struct.unpack_from("<H", d, 56)[0]
-    segs = []
+    segs = []                                            # [(va, p_memsz, p_flags)]，W^X 护栏要用
     for i in range(phn):
         o = phoff + i * phes
         t = struct.unpack_from("<I", d, o)[0]
+        fl = struct.unpack_from("<I", d, o + 4)[0]      # p_flags：PF_X=1 / PF_W=2 / PF_R=4
         va = struct.unpack_from("<Q", d, o + 16)[0]
         msz = struct.unpack_from("<Q", d, o + 40)[0]
         assert t not in (2, 3), "%s 出现 PT_DYNAMIC/PT_INTERP" % path
         if t == 1:
             assert lo <= va and va + msz <= hi, \
                 "%s PT_LOAD 越出主程序装载区（va=%#x msz=%#x <= %#x）" % (path, va, msz, hi - lo)
-            segs.append((va, msz))
+            segs.append((va, msz, fl))
     ent = struct.unpack_from("<Q", d, 24)[0]
-    assert any(va <= ent < va + m for va, m in segs), "%s 入口不在任何 PT_LOAD 内" % path
+    assert any(va <= ent < va + m for va, m, _f in segs), "%s 入口不在任何 PT_LOAD 内" % path
+    # ★ W^X 护栏（user/store/store64.ld 把 .data 的对齐放宽到 16 之后，这条是**它的验证**）：
+    #   段贴在一起之后，小程序的 .text 尾部（可执行）与紧随其后的 .data（可写）可能落在
+    #   **同一个 4 KiB 页**里 —— 内核按页取权限并集（kernel/elf64.cpp），那一页会变成 RWX。
+    #   所以逐产物证明"没有任何一页同时 W 与 X"；内核页大小固定 4096（kernel/usermode64.h）。
+    #   实测：共享脚本（.data 仍 ALIGN(4096)）下 demo_cli.elf 是安全的；本目录这份放宽后四个
+    #   产物仍然安全 —— 本断言就是证据（真被破坏时构建直接失败，不是"大概没事"）。
+    wp, xp = set(), set()
+    for pv, pm, pf in segs:
+        for pg in range(pv // 4096, (pv + pm - 1) // 4096 + 1):
+            if pf & 2: wp.add(pg)
+            if pf & 1: xp.add(pg)
+    bad = sorted(wp & xp)
+    assert not bad, "%s 有页同时 W 与 X（W^X 被破坏）page=%#x" % (path, bad[0] * 4096)
     assert len(d) <= 96 * 1024, "%s 超过内核读盘缓冲 96 KiB" % path
     print("    %-42s %7d B  PT_LOAD=%d memsz=%d B（装载区 <= 65536）"
-          % (path.replace("\\", "/"), len(d), len(segs), sum(m for _v, m in segs)))
-    assert sum(m for _v, m in segs) <= 0x10000, "%s PT_LOAD memsz 超过 64 KiB" % path
+          % (path.replace("\\", "/"), len(d), len(segs), sum(s[1] for s in segs)))
+    assert sum(s[1] for s in segs) <= 0x10000, "%s PT_LOAD memsz 超过 64 KiB" % path
 PYEOF
 
 echo "==> ★ 应用商店/包管理器：四个产物都在 build64/store/（不内嵌内核；由 tools/store_pack_win.py 装卷）"

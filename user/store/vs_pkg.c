@@ -181,6 +181,30 @@ static int parse_pkg_object(struct Js* j, struct VsPkg* p) {
                 }
             }
         }
+        else if (vs_streq(key, "manifest")) {
+            /* ★ 包 manifest（对象）：display / exec / icon / icon_file（见 vs.h 与 kernel/app64.h） */
+            js_ws(j);
+            if (j->i >= j->n || j->s[j->i] != '{') return VS_E_FORMAT;
+            j->i++;
+            p->has_manifest = 1;
+            for (;;) {
+                js_ws(j);
+                if (j->i >= j->n) return VS_E_FORMAT;
+                if (j->s[j->i] == '}') { j->i++; break; }
+                if (j->s[j->i] == ',') { j->i++; continue; }
+                char mk[VS_KEY_MAX];
+                if (js_str(j, mk, (int)sizeof(mk)) < 0) return VS_E_FORMAT;
+                js_ws(j);
+                if (j->i >= j->n || j->s[j->i] != ':') return VS_E_FORMAT;
+                j->i++;
+                js_ws(j);
+                if (vs_streq(mk, "display"))        { if (js_str(j, p->display, VS_NAME_MAX) < 0) return VS_E_FORMAT; }
+                else if (vs_streq(mk, "exec"))      { if (js_str(j, p->exec, VS_FILE_MAX) < 0) return VS_E_FORMAT; }
+                else if (vs_streq(mk, "icon"))      { if (js_str(j, p->icon, VS_NAME_MAX) < 0) return VS_E_FORMAT; }
+                else if (vs_streq(mk, "icon_file")) { if (js_str(j, p->icon_file, VS_FILE_MAX) < 0) return VS_E_FORMAT; }
+                else if (js_skip_value(j) != 0) return VS_E_FORMAT;
+            }
+        }
         else if (js_skip_value(j) != 0) return VS_E_FORMAT;
     }
 }
@@ -438,6 +462,10 @@ struct DebInfo {
     char arch[VS_ARCH_MAX];
     int  ndep;
     char depends[VS_DEPENDS_MAX][VS_NAME_MAX];
+    /* ★ control 里的可选 manifest 字段（见下面 control_parse；缺失也能装） */
+    char disp[VS_NAME_MAX];                        /* Name: 显示名 */
+    char icon[VS_FILE_MAX];                        /* Icon: 图标路径（data.tar 内相对路径） */
+    char appexec[VS_FILE_MAX];                     /* App-Exec: 执行路径（data.tar 内相对路径） */
 };
 
 static int ar_scan_all(const unsigned char* b, int n, struct DebInfo* di, int* nctl, int* ndata) {
@@ -552,6 +580,14 @@ static int copy_trim(char* dst, int cap, const char* src) {
     dst[n] = 0;
     return n;
 }
+
+/* ==================== ★ 包 manifest 的"文件内"形态：control 字段 ====================
+ * .vap64 没有容器（32B 头 + 名字 + 代码），manifest 来自仓库索引；.deb 有真 control 文件，
+ * 于是这里额外认三个**可选**字段（不是 Debian 标准字段，我们的扩展；都缺失也能装，只是不进注册表）：
+ *   Name:      显示名（开始菜单用）
+ *   Icon:      图标路径（data.tar 里的相对路径，例如 usr/share/<pkg>/icon.png；装完按卷内绝对路径登记）
+ *   App-Exec:  执行路径（data.tar 里的相对路径或绝对路径；缺 = 不进注册表 —— deb 没有"可执行入口"的标准字段）
+ * ---- 字段落在 control_parse 里（DebInfo 加了 icon/appexec/disp 三个缓冲）---- */
 static int control_parse(const unsigned char* b, int n, struct DebInfo* di, int want_scripts) {
     char line[160];
     int li = 0;
@@ -605,6 +641,96 @@ static int io_code_of(int rc) { return (rc == -13) ? VS_E_PERM : VS_E_IO; }
 
 static void log_err(const char* tag, int code, const char* msg) {
     vs_log(tag, "ERROR code=%s msg=\"%s\"\n", vs_err_name(code), msg);
+}
+
+/* ==================== ★ 应用注册表（/etc/apps.json）====================
+ * 格式真源 = kernel/app64.h（一行一条 JSON 对象的 JSONL 子集）。这里只做两件事：
+ *   ① 安装成功后**追加/覆盖**自己那一条（builtin=0、desktop=1 -> 桌面自动出现快捷方式）；
+ *   ② 卸载时**删掉**自己那一条（顺带把用户装的其他条目原样保留）。
+ * 读写方式：整份读进 mmap 缓冲（VS_APPS_MAX 有界）-> 逐行过滤 + 追加 -> 整份写回。
+ * 内核（开始菜单/桌面快捷方式）读同一份；构建期的内置条目由内核启动时幂等写入。 */
+static int reg_put_esc(char* dst, int o, int cap, const char* s) {
+    if (o < cap - 1) dst[o++] = '"';
+    for (int i = 0; s && s[i] && o < cap - 2; i++) {
+        const char c = s[i];
+        if (c == '"' || c == '\\') { dst[o++] = '\\'; dst[o++] = c; }
+        else if ((unsigned char)c < 0x20) dst[o++] = ' ';
+        else dst[o++] = c;
+    }
+    if (o < cap - 1) dst[o++] = '"';
+    return o;
+}
+/* 这一行是不是 name/exec 对应的条目？按 "name":"X" / "exec":"Y" 精确匹配（不误伤别的行） */
+static int reg_line_is(const char* line, int len, const char* name, const char* exec) {
+    struct Js j;
+    j.s = line; j.i = 0; j.n = len;
+    char v[VS_FILE_MAX];
+    if (name && name[0]) {
+        j.i = 0;
+        if (js_find_key(&j, "name")) { if (js_str(&j, v, (int)sizeof(v)) >= 0 && vs_streq(v, name)) return 1; }
+    }
+    if (exec && exec[0]) {
+        j.i = 0;
+        if (js_find_key(&j, "exec")) { if (js_str(&j, v, (int)sizeof(v)) >= 0 && vs_streq(v, exec)) return 1; }
+    }
+    return 0;
+}
+/* name / display / exec / icon / desktop:
+ *   remove = 1 只删（name/exec 任一匹配即删）；remove = 0 先删同名的再加一条新的。
+ * 返回 VS_OK / VS_E_IO / VS_E_NOMEM。 */
+static int registry_apply(const char* tag, const char* name, const char* display, const char* exec,
+                          const char* icon, int desktop, int remove) {
+    unsigned char* buf = (unsigned char*)vs_mmap(VS_APPS_MAX);
+    if (!buf) return VS_E_NOMEM;
+    const int got = vs_read_file(VS_APPS_PATH, buf, VS_APPS_MAX - 1);
+    const int have = (got > 0) ? got : 0;                 /* 文件不在 = 空表（不是错误） */
+    if (got > 0) buf[have] = 0;
+    char* out = (char*)vs_mmap(VS_APPS_MAX);
+    if (!out) return VS_E_NOMEM;
+    int o = 0, kept = 0, dropped = 0;
+    int i = 0;
+    while (i < have) {
+        int e = i;
+        while (e < have && buf[e] != '\n') e++;
+        const int ln = e - i;
+        const int blank = (ln <= 0) || ((char)buf[i] == '\r');
+        if (!blank && !reg_line_is((const char*)buf + i, ln, name, exec)) {
+            if (o + ln + 1 >= VS_APPS_MAX) return VS_E_NOMEM;
+            for (int k = 0; k < ln; k++) out[o++] = (char)buf[i + k];
+            out[o++] = '\n';
+            kept++;
+        } else if (!blank) {
+            dropped++;
+        }
+        i = e + 1;
+    }
+    if (!remove) {
+        if (o + 512 >= VS_APPS_MAX) return VS_E_NOMEM;
+        o += vs_fmt(out + o, VS_APPS_MAX - o, "{\"name\":");
+        o = reg_put_esc(out, o, VS_APPS_MAX, (display && display[0]) ? display : name);
+        o += vs_fmt(out + o, VS_APPS_MAX - o, ",\"en\":");
+        o = reg_put_esc(out, o, VS_APPS_MAX, name);
+        o += vs_fmt(out + o, VS_APPS_MAX - o, ",\"exec\":");
+        o = reg_put_esc(out, o, VS_APPS_MAX, exec ? exec : "");
+        o += vs_fmt(out + o, VS_APPS_MAX - o, ",\"icon\":");
+        o = reg_put_esc(out, o, VS_APPS_MAX, icon ? icon : "");
+        o += vs_fmt(out + o, VS_APPS_MAX - o, ",\"alias\":\"\",\"id\":-1,\"builtin\":0,\"desktop\":%d,\"x\":0,\"y\":0}\n",
+                    desktop ? 1 : 0);
+    }
+    const int wr = vs_write_file(VS_APPS_PATH, (const unsigned char*)out, o);
+    if (wr != 0) {
+        vs_log(tag, "registry %s path=%s rc=%d\n", remove ? "remove" : "append", VS_APPS_PATH, wr);
+        /* ★ 如实分码：-13(EACCES) -> VS_E_PERM（"装系统文件要 root"），其余算 io。
+         *   实测触发场景：内核启动时以 root 建了 /etc/apps.json(0644)，uid=1000 的会话
+         *   追加不进去 —— 见 tools/store_pack_win.py 的 --writable-roots 说明。 */
+        return io_code_of(wr);
+    }
+    /* 一行日志（自动验收 grep）：[VPKG] registry append path=/etc/apps.json name=.. display=.. exec=.. icon=.. desktop=1 entries=N */
+    vs_log(tag, "registry %s path=%s name=%s display=%s exec=%s icon=%s desktop=%d kept=%d dropped=%d bytes=%d\n",
+           remove ? "remove" : "append", VS_APPS_PATH, name ? name : "-",
+           (display && display[0]) ? display : name, exec ? exec : "-", (icon && icon[0]) ? icon : "-",
+           remove ? 0 : (desktop ? 1 : 0), kept, dropped, o);
+    return VS_OK;
 }
 
 /* ==================== 仓库/已装库缓存（GUI 每帧都要用） ====================
@@ -873,6 +999,42 @@ static int install_vap64(const char* tag, const struct VsPkg* p, const unsigned 
     }
     vs_log(tag, "install file path=%s bytes=%d\n", share, flen);
 
+    /* ★ 应用注册表：把包装进 /usr/share/<name>/icon.png（manifest.icon_file）并追加一条 */
+    char icon_vfs[VS_FILE_MAX];
+    char exec_vfs[VS_FILE_MAX];
+    icon_vfs[0] = 0;
+    vs_fmt(exec_vfs, (int)sizeof(exec_vfs), "%s", share);      /* 默认执行 = 包本体（app64_launch64 认头） */
+    if (p->has_manifest && p->exec[0]) vs_strcpy(exec_vfs, VS_FILE_MAX, p->exec);
+    if (p->has_manifest && p->icon_file[0]) {
+        char srcicon[VS_FILE_MAX];
+        char dsticon[VS_FILE_MAX];
+        vs_fmt(srcicon, (int)sizeof(srcicon), "%s/%s", VS_REPO_DIR, p->icon_file);
+        vs_fmt(dsticon, (int)sizeof(dsticon), "/usr/share/%s/icon.png", p->name);
+        unsigned char* ib = (unsigned char*)vs_mmap(32 * 1024);
+        const int il = ib ? vs_read_file(srcicon, ib, 32 * 1024) : -1;
+        if (il > 0 && vs_write_file(dsticon, ib, il) == 0) {
+            vs_strcpy(icon_vfs, VS_FILE_MAX, dsticon);
+            vs_log(tag, "manifest icon path=%s bytes=%d src=%s\n", dsticon, il, srcicon);
+            if (vs_inst_file_add(rec, dsticon) != 0) {
+                vs_log(tag, "installed files pool full used=%d cap=%d\n",
+                       vs_inst_files_used(), VS_FILE_POOL_MAX);
+                return VS_E_NOMEM;
+            }
+        } else {
+            vs_log(tag, "manifest icon missing path=%s rc=%d (fallback: no icon file)\n", srcicon, il);
+        }
+    }
+    if (!icon_vfs[0] && p->has_manifest && p->icon[0]) vs_strcpy(icon_vfs, VS_FILE_MAX, p->icon);
+    {
+        const int rr = registry_apply(tag, p->name,
+                                      (p->has_manifest && p->display[0]) ? p->display : p->name,
+                                      exec_vfs, icon_vfs, 1, 0);
+        if (rr != VS_OK) {
+            vs_log(tag, "registry append FAILED name=%s rc=%d\n", p->name, rr);
+            return rr;                                          /* 注册表写不进去 = 装不完整，如实失败 */
+        }
+    }
+
     vs_strcpy(rec->name, VS_NAME_MAX, p->name);
     vs_strcpy(rec->src, VS_NAME_MAX, p->name);
     vs_strcpy(rec->version, VS_VER_MAX, p->version);
@@ -880,8 +1042,6 @@ static int install_vap64(const char* tag, const struct VsPkg* p, const unsigned 
     vs_strcpy(rec->type, VS_TYPE_MAX, "vap64");
     rec->bytes = v.code_size;
     vs_strcpy(rec->sha256, 65, p->sha256);
-    rec->nfiles = 0;
-    rec->nfiles = 0;
     if (vs_inst_file_add(rec, target) != 0 || vs_inst_file_add(rec, share) != 0) {
         vs_log(tag, "installed files pool full used=%d cap=%d\n",
                vs_inst_files_used(), VS_FILE_POOL_MAX);

@@ -85,3 +85,61 @@ int app64_run_any64(const char* path);
 //   bit4 名字边界（0 / >24 / 无 NUL 拒绝；23 字符可接受）
 //   bit5 内嵌 hello.vap 的头部自校验（magic/版本/名字/CRC/entry_offset）
 int app64_selftest64();
+
+// ==================== ★ 应用注册表（/etc/apps.json，单一真源）====================
+// "有哪些应用、叫什么、执行什么、图标是什么"只有**一处**登记 —— 这个文件：
+//   * **内置应用**的条目在**构建期**编译进内核（下面的 kBuiltinApps64，见 app64.cpp）；
+//     启动期 / 首次读注册表时**幂等**写进 /etc/apps.json（文件不存在/卷里没有时只留在内存，
+//     保证裸 system.img 上开始菜单仍列全部内置应用）。
+//   * **用户安装的应用**由 /bin/vpkg 在安装时**追加**一条（从包 manifest 取
+//     display/exec/icon；见 user/store/vs_pkg.c 的 registry_append）。写盘 = VimtuFS2 真落盘，
+//     重启后 vpkg 的条目与桌面快捷方式位置都还在。
+//   * 内核读：开始菜单（kernel/startmenu64.cpp）与桌面（kernel/desktopops64.cpp）都从
+//     app64_registry_* 取；桌面上快捷方式的位置也写回这里（app64_registry_set_pos64）。
+//
+// 文件格式（UTF-8，一行一条 JSON 对象；内核侧解析器是"找键 -> 取引号串/整数"的小扫描器，
+// 不引第三方库；字段顺序由写方固定，读方按 key 找，所以顺序不敏感）：
+//   {"name":"终端","en":"Terminal","exec":"builtin:term","icon":"terminal",
+//    "alias":"term shell console","id":3,"builtin":1,"desktop":0,"x":0,"y":0}
+//   name    = 显示名（可空 -> 用 en）
+//   en      = 英文名（开始菜单/搜索用）
+//   exec    = "builtin:<窗口应用短名>" 或卷内可执行文件路径（ELF / .vap64 都行，
+//             按**文件头魔数**分派，见 gui64 的 app_launch_exec64）
+//   icon    = 系统图标名（kIcon64Names 里的名字，见 kernel/icons64.h）或 "/..." 卷内 PNG 路径；
+//             取不到 -> 程序化兜底（绝不空）
+//   alias   = 搜索别名（空格分隔）
+//   id      = 内置窗口应用 id（APP_ID_*）；用户应用写 -1
+//   builtin = 1 = 构建期内置；0 = 用户安装
+//   desktop = 1 = 桌面上自动建了快捷方式（用户安装默认 1；内置默认 0，不往桌面塞）
+//   x/y     = 桌面快捷方式位置（网格吸附后的左上角；0,0 = 还没定，由桌面模块挑第一个空格）
+#define APPREG64_PATH        "/etc/apps.json"
+#define APPREG64_MAX         24
+#define APPREG64_NAME_MAX    32
+#define APPREG64_EXEC_MAX    96
+#define APPREG64_ICON_MAX    96
+#define APPREG64_ALIAS_MAX   48
+#define APPREG64_FILE_MAX    8192
+
+// 启动期/首次使用时确保注册表就绪（内置表进内存 + 卷里有文件就解析/幂等写出）。
+// 返回注册表里的应用条数（>= 内置条数；没有任何卷时 = 内置条数）。
+int  app64_registry_init64();
+// 每帧/每几帧抽查：卷里的 /etc/apps.json 变了（vpkg 装/卸应用）就重新解析。
+// 返回 1 = 内容变了（调用方应重画/重建快捷方式），0 = 没变。
+int  app64_registry_refresh64();
+uint32_t app64_registry_gen64();          // 每次内容变化 +1（调用方用它做去重）
+int  app64_registry_count64();
+const char* app64_reg_name64(int i);
+const char* app64_reg_en64(int i);
+const char* app64_reg_exec64(int i);
+const char* app64_reg_icon64(int i);
+const char* app64_reg_alias64(int i);
+int  app64_reg_id64(int i);               // APP_ID_*；用户应用 = -1
+int  app64_reg_builtin64(int i);
+int  app64_reg_desktop64(int i);
+void app64_reg_pos64(int i, int* x, int* y);
+// 桌面快捷方式：改 desktop 标志 / 写回位置（整表重写 /etc/apps.json，跨重启持久化）
+int  app64_reg_set_desktop64(int i, int on);
+int  app64_reg_set_pos64(int i, int x, int y);
+// 按 exec 找（-1 = 没有）
+int  app64_reg_find_exec64(const char* exec);
+int  app64_reg_selftest64();
