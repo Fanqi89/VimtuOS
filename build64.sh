@@ -64,7 +64,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
 #   空夹具盘由构建期"原始区"（build64/demo64_raw.bin，写进 system.img 的 LBA 7497 起）兜底。
 #   内核二进制里只剩路径/偏移/长度表（kernel/demo64.h），本文件末尾有 64B 探针断言。
-VIMTUOS_VERSION="0.5.0"     # ★ 本版：大窗口 shm 2 MiB + /bin/browser（ring3 真窗口浏览器：HTML 子集排版 + 滚动）
+VIMTUOS_VERSION="0.5.1"     # ★ 本版：/bin/browser 补 wl_seat_get（键盘焦点+指针捕获）—— 点击翻页 / ESC 退出实测通过
 CXXFLAGS="$CXXFLAGS -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\""
 CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
 #

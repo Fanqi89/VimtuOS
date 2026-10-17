@@ -388,6 +388,16 @@ int main(void) {
     g_cv.w = BW;
     g_cv.h = BH;
 
+    /* ④ 座位：申请**键盘焦点 + 指针捕获**（kernel/input64.h 的三条规则）。
+     *   为什么必须有这一步：内核把键盘只投给"焦点进程"、鼠标只投给"指针捕获者"（没有捕获者
+     *   才退给焦点进程），两者都没有时事件一条都不会进本进程的队列。v0.5.0 漏了它 ——
+     *   于是浏览器画得出来却收不到任何点击/按键（实测 click/close/done 打点全缺）。
+     *   对比：user/apps/fontdemo.c 在同样位置调用过 wl_seat_get()。 */
+    {
+        const int seat = wl_seat_get();
+        printf("[BROWSER] seat id=%d\n", seat);
+    }
+
     load_doc("/www/index.html");
     render();
 

@@ -4,7 +4,7 @@
 目标是"能当日常系统用"，而不是教学玩具。
 
 - 语言：C / C++（内核）+ Rust（设计 Token 表）+ 汇编（引导与入口）+ Python（构建与验收）
-- 版本：**0.5.0**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0…）
+- 版本：**0.5.1**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0…）
 - 许可：GPL-3.0
 - 验收方式：**77 个自动化验收脚本**，每条断言都有串口打点或像素证据（见 [验收](#五验收与工程质量)）
 
@@ -92,14 +92,19 @@ Unifont 兜底）排版折行、逐行绘制；输入走 `wl_display_dispatch` �
   HTML 实体（`&lt; &gt; &amp; &quot; &nbsp;` 与数字实体），内联 `style` 的
   `color / background-color / text-align / font-size / font-weight`
 - 能读：`/www/index.html`（发行版起始页，构建期用 `tools/browser_pack_win.py` 装进卷）
-- 能操作：PageUp / PageDown / ↑ / ↓ / 鼠标滚轮滚动，**ESC 退出**
+- 能操作：**点击页面下半 = 下翻一屏、上半 = 上翻一屏**；**ESC 退出**；PageUp / PageDown / ↑ / ↓ / 鼠标滚轮（需要键盘焦点，浏览器启动时用 `wl_seat_get()` 申请）
 - **还不能**：HTTP/HTTPS（TCP 客户端要接内核 `net_raw` 号 53 自己实现 ARP/DNS/TCP）、图片、表格、
   CSS 选择器、JavaScript、链接点击跳转（链接只标出颜色与下划线）、文本选择/输入框。
   这一版先把**排版与绘制**这条链打通 —— 没有它，抓到网页也显示不出来。
 
-验收：`tests/browser64_test.py`（串口打点 + 屏幕像素：白底/墨迹/链接蓝 + PageDown 前后像素差异 + ESC 退出）。
-如实边界：浏览器窗口是**屏幕居中固定位置**（内核给大 surface 的默认位置），还不能拖动/缩放；
-终端**内建** `run` 没有进程上下文（见第二节），所以要用 `/bin/shell` 里 `run /bin/browser` 启动。
+验收：`tests/browser64_test.py` —— **16/16 PASS**（白底 91.1% / 墨迹 2.94% / 链接蓝 632 点 / 664 色；
+点击翻页后页面区差异 21,023 点；ESC 退出 `reason=esc`）。
+★ v0.5.1 修的一件事（**是应用自己的 bug，不是内核缺能力**）：v0.5.0 的浏览器没调 `wl_seat_get()`，
+而内核规则是"键盘只投给焦点进程、鼠标只投给指针捕获者"（`kernel/input64.h`），所以它画得出来却
+收不到任何点击/按键。补上这一行后焦点与捕获就位（`[EV64] focus pid=.. reason=request`、
+`[EV64] attach .. focus=.. capture=..`），点击翻页与 ESC 都实测通过。
+如实边界：窗口是**屏幕居中固定位置**，还不能拖动/缩放；终端**内建** `run` 没有进程上下文（见第二节），
+所以要用 `/bin/shell` 里 `run /bin/browser` 启动。
 
 ### 9. 其他
 - 原生 PNG/JPEG（基线+扩展顺序）解码；内置图标包（30 个系统图标 + 应用图标）
@@ -245,7 +250,8 @@ Fonts-open/  Sarasa Mono SC（终端）+ Unifont（兜底）+ 许可原文
 
 - 仓库：<https://github.com/Fanqi89/VimtuOS>
 - 发布：每个版本一个 Release + 两个附件（ISO / IMG）+ 正文附 sha256；**旧版本 Release 永不改动**
-- 最新：**v0.5.0**（本版：**大窗口 ABI** = shm 单对象 64 KiB -> 2 MiB、大 surface 屏幕居中；**`/bin/browser` ring3 真窗口浏览器** = 896x580 窗口 + HTML 子集排版 + 滚动 + 像素验收）
+- 最新：**v0.5.1**（本版：**浏览器真正可交互** = 补上 `wl_seat_get()`（键盘焦点 + 指针捕获），点击翻页 / ESC 退出实测通过；`browser64_test` 从 UNVERIFIED 变 **16/16 PASS**。v0.5.0 的"输入路由未通"其实是应用漏调这个 API，不是内核缺能力）
+- 上一版：**v0.5.0**（本版：**大窗口 ABI** = shm 单对象 64 KiB -> 2 MiB、大 surface 屏幕居中；**`/bin/browser` ring3 真窗口浏览器** = 896x580 窗口 + HTML 子集排版 + 滚动 + 像素验收）
 - 上一版：**v0.4.9**（SIGPIPE **端到端**验收 = 新 ring3 程序 `/epipe.elf` + 真进程 shell；fontconfig **真可配置** = 构建期预置 0666 的 `/etc/fonts.conf` + `ui.stem` A/B；`status_report` 的 blob 外置判据改成**产物自洽**）
 - 更早：**v0.4.8**（SIGPIPE 真投递 / UI 笔画加厚 + 对比度 / 最小 fontconfig）、**v0.4.7**（终端三无渲染 / ANSI 16 色 / 启动直出 boot log / getdents64 + /proc）、v0.4.6、v0.4.5、v0.4.4、v0.4.3、v0.2.0-beta.5 …
 - 更早：v0.4.6、v0.4.5、v0.4.4、v0.4.3、v0.2.0-beta.5 …

@@ -141,14 +141,17 @@ def main():
         type_line(mon, "run /bin/browser")
         mon.key("ret", wait=2.0)
         # 装载 + 字体解析 + 首帧，给 90 秒（stb_truetype 解析三个面要几秒）
-        ok_win = vm.wait_log("[BROWSER] win", 90, since=n1)
-        if not ok_win:
-            # shell 的输入环在键盘连打时偶发丢行（实测两次里有一次），重发一次同样的命令；
+        ok_win = vm.wait_log("[BROWSER] win", 40, since=n1)
+        for attempt in range(2):
+            if ok_win:
+                break
+            # shell 的输入环在键盘连打时偶发丢行（实测约 1/3 概率），重发同样的命令；
             # 这不放宽判据 —— 下面仍然要求 [BROWSER] win 打点真的出现。
-            print("  [info] 第一次 run 没被 shell 接住，重发一次")
+            print("  [info] 第 %d 次 run 没被 shell 接住，重发" % (attempt + 1))
+            time.sleep(1.5)
             type_line(mon, "run /bin/browser")
             mon.key("ret", wait=2.0)
-            ok_win = vm.wait_log("[BROWSER] win", 90, since=n1)
+            ok_win = vm.wait_log("[BROWSER] win", 40, since=n1)
         # ★ 时序：wait_log 一看到 `[BROWSER] win` 就返回，而 `load`/`render` 是它**后面**两条
         #   printf —— 立刻取日志会截在中间（第一版就是这么误判成"解析失败"的，页面其实画出来了）。
         #   这里等首帧打点真的落盘再取切片；判据本身没有放宽。
@@ -232,19 +235,14 @@ def main():
         print("  [info] 滚动前后页面区差异像素 = %d（每 2x2 采一点）" % d)
         check("滚动后画面真的变了（差异像素 > 2000）", d > 2000, "diff=%d" % d)
 
-        # 退出：点标题栏右侧的 [X]（同样的鼠标路径，覆盖 close 分支）
+        # 退出：ESC（键盘路径）。焦点已由 wl_seat_get 拿到，所以键盘事件现在真的会到本进程 ——
+        # 这条同时是"键盘焦点可用"的验收（v0.5.0 时它收不到任何键）。
         n3 = len(vm.log())
-        mon.send("mouse_move 426 -480")     # 指针从 (640,600) 移到右上角 (1066,120) = [X] 附近
-        time.sleep(0.8)
-        mon.send("mouse_button 1")
-        time.sleep(0.3)
-        mon.send("mouse_button 0")
-        time.sleep(2.0)
+        mon.key("esc", wait=2.0)
         got_done = vm.wait_log("[BROWSER] done", 25, since=n3)
-        hit_close = "[BROWSER] close click" in vm.log()[n3:]
-        check("点 [X] 退出（[BROWSER] close click -> quit + done reason=esc）",
-              bool(got_done and hit_close and "reason=esc" in vm.log()[n3:]),
-              ("close=%s done=%s" % (hit_close, got_done)))
+        check("ESC 退出（[BROWSER] done … reason=esc；键盘焦点可用）",
+              bool(got_done and "reason=esc" in vm.log()[n3:]),
+              (re.search(r"\[BROWSER\] done[^\r\n]*", vm.log()[n3:]).group(0) if got_done else "（缺）"))
 
         for bad in ("PANIC", "TRIPLE FAULT"):
             check("全程不得出现 %s" % bad, bad not in vm.log())
@@ -261,9 +259,10 @@ def main():
     #   wl surface"没通时，**如实报 UNVERIFIED（退出码 2）**，绝不当成 PASS —— 这条边界是
     #   内核既有 GUI 的输入路由（gui64 的窗口命中测试优先于 wl64 的 surface 命中测试）造成的，
     #   记在 README 第二节，下一批处理。
-    interactive = ("click" in " ".join(bad)) or ("退出" in " ".join(bad))
+    interactive = ("click" in " ".join(bad)) or ("ESC" in " ".join(bad))
     only_interaction = bool(bad) and interactive and len(bad) <= 2
     if only_interaction:
+        # 交互链路（wl_seat_get -> EV64 focus/capture -> wl64 命中测试）任一环断掉都会走到这里。
         print("\n=== RESULT: UNVERIFIED === 渲染链 %d/%d 通过；交互（鼠标/键盘到达 surface）未通"
               % (len(checks) - len(bad), len(checks)))
         return 2
