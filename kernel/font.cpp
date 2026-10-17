@@ -1175,17 +1175,36 @@ int font_text_width(const char* s) {
 //   阈值 128/255（约 50% 覆盖）：与经典点阵字体的"该点亮/该点灭"同一口径。
 //   这样终端屏幕上只有两种颜色（前景/背景），不会出现任何中间灰 —— 正是"无抗锯齿"的判据。
 static int g_mono_noaa = 0;
+static int g_stem_pct = 100;      // v0.4.8：UI 抗锯齿的笔画加厚百分比（100 = 原样）
+static int g_ui_aa = 1;           // v0.4.8：UI 是否抗锯齿
 #define FONT64_MONO_THRESHOLD 128
 
 void font_set_mono64(int on) { g_mono_noaa = on ? 1 : 0; }
 int  font_mono64() { return g_mono_noaa; }
 
+void font_set_stem64(int pct) {
+    if (pct < 100) pct = 100;
+    if (pct > 160) pct = 160;
+    g_stem_pct = pct;
+    for (int f = 0; f < FONT_FACE_COUNT; f++) {      // 覆盖率变了 -> 位图缓存作废
+        for (int i = 0; i < FONT_CACHE_N; i++) g_face[f].cacheOk[i] = false;
+        for (int i = 0; i < FONT_LRU_N; i++) g_face[f].lru_key[i] = 0;
+    }
+}
+int  font_stem64() { return g_stem_pct; }
+void font_set_ui_aa64(int on) { g_ui_aa = on ? 1 : 0; }
+int  font_ui_aa64() { return g_ui_aa; }
+
 // 抗锯齿混合：fg 按 alpha(0-255) 与后备缓冲背景混合（g_mono_noaa=1 时退化为纯色阈值）
 static inline void draw_blend(int x, int y, uint32_t fg, int a) {
     if (a <= 0) return;
-    if (g_mono_noaa) {                       // 终端：非黑即白（无 AA / 无次像素）
+    if (g_mono_noaa || !g_ui_aa) {           // 终端（三无）/ 或 fontconfig 让 UI 也走单色
         if (a >= FONT64_MONO_THRESHOLD) fb_putpixel(x, y, fg);
         return;
+    }
+    if (g_stem_pct != 100) {                 // ★ v0.4.8 笔画加厚：覆盖率放大（边缘更实、笔画更厚）
+        a = a * g_stem_pct / 100;
+        if (a > 255) a = 255;
     }
     if (a >= 255) { fb_putpixel(x, y, fg); return; }
     uint32_t bg = fb_get_pixel(x, y);

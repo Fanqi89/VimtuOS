@@ -3381,6 +3381,8 @@ TESTS = [
     ("fs_term_test.py", "终端真文件系统：write/ls/df/ring3 读 + 冷启动第二遍 cat 跨重启读回 + rm"),
     ("fonts64_test.py", "四个字体面：[FONT64] faces/selftest/中英 1:2/兜底命中 + 终端等宽像素（ASCII 8px 半格）"),
     ("texthint64_test.py", "★ 本源文字清晰度（fixture 内注入一行 32 个汉字 + 宿主逐像素 + 反向对照）"),
+    ("fontq64_test.py", "★ v0.4.8 UI 字体质量：笔画加厚(stem) + 正文/次要文字对比度(WCAG 比) + 笔画核心占比 + 终端不受污染"),
+    ("sigpipe64_test.py", "★ v0.4.8 管道断开 -> SIGPIPE 真投递（端到端；环境拉不起 ring3 shell 时报 UNVERIFIED，不算绿）"),
     ("term_render64_test.py", "★ v0.4.7 终端三无渲染：像素级证明「无抗锯齿」(中间灰=0)+「无次像素」+ 纯黑底/纯白字 +"
                               " ANSI 16 色表 + 度量驱动整数行距；并断言启动不再显示硬件报告页、直出滚动英文 boot log"),
     ("fd64_test.py", "批次 D FD 语义：每进程 fd 表 + dup 共享游标 + fork 继承 + O_APPEND + pipe 环回"),

@@ -136,6 +136,10 @@ int64_t sig64_sys_kill64(int pid, int sig);          // case 62：解析单个/�
 // r 必须是"即将返回用户态"的帧：r->cs == SEL64_UCODE 才会投递（内核帧直接返回）。
 // where = "syscall" / "irq" / "fault"（打点用）。
 void sig64_deliver64(pt_regs64* r, const char* where);
+// ★ v0.4.8：内核内部"给当前进程置一个未决信号"。用于管道 EPIPE -> SIGPIPE（Linux 语义：
+//   写端发现读端全关时，write 返回 -EPIPE **并**投递 SIGPIPE；默认动作 = 终止，退出码 128+13=141）。
+//   没有进程上下文（任务 0 / 安装介质内核）时什么都不做；handler 是 SIG_IGN 时不置位（Linux 同）。
+void sig64_raise64(int sig);
 // ★ 必须是 extern "C"：x86_64.cpp 的异常路径用**弱引用**取它（安装介质内核不链 sig64.cpp），
 //   弱符号按 C 名解析 —— 若这里是 C++ 名字（_Z19sig64_user_fault64mP9pt_regs64），弱引用永远
 //   解析不到、静默变成 0（症状：用户态 #PF/#GP 照旧 [PANIC]，本模块一行都进不来 —— 实测踩过）。

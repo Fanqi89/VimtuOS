@@ -64,7 +64,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
 #   空夹具盘由构建期"原始区"（build64/demo64_raw.bin，写进 system.img 的 LBA 7497 起）兜底。
 #   内核二进制里只剩路径/偏移/长度表（kernel/demo64.h），本文件末尾有 64B 探针断言。
-VIMTUOS_VERSION="0.4.7"     # ★ 本版：应用注册表 + 已安装应用进桌面/开始菜单 + 本源文字清晰度 + 本批收尾 8 项真缺陷
+VIMTUOS_VERSION="0.4.8"     # ★ 本版：应用注册表 + 已安装应用进桌面/开始菜单 + 本源文字清晰度 + 本批收尾 8 项真缺陷
 CXXFLAGS="$CXXFLAGS -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\""
 CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
 #
@@ -135,7 +135,7 @@ SRCS_SYS="kernel/sysstate64.cpp kernel/config64.cpp kernel/session64.cpp kernel/
 # ★ P9：kernel/netraw64.cpp（原始帧收发 ABI 53 的落点）**只进系统内核** —— 它用的是 e1000_64
 #   既有的收发；安装介质内核没有网卡路径也不跑 ring3，syscall64.cpp 对它用弱引用（那里返回 -1
 #   并打 [SYSCALL] deny）。netraw64.cpp 与 net64.cpp 一样排在这里（不进 SRCS_CORE）。
-SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/proc64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/netraw64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp kernel/xhci64.cpp kernel/ehci64.cpp kernel/hda64.cpp kernel/wl64.cpp"
+SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/fontcfg64.cpp kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/proc64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/netraw64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp kernel/xhci64.cpp kernel/ehci64.cpp kernel/hda64.cpp kernel/wl64.cpp"
 # ★ A5：kernel/wl64.cpp（Wayland 基础骨架：surface/commit/seat + 最小合成器）**只进系统内核** ——
 #   它要用 proc64 的 shm 对象表（读共享缓冲的物理页）与 fb 的提交路径；安装介质内核不链它，
 #   syscall64.cpp 对 15..21 号用弱引用（那里返回 -1 并打 [SYSCALL] deny，不假装成功）。
@@ -799,7 +799,7 @@ $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 
 $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
     gui_rs/gui_rs.o \
-    "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
+    "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/fontcfg64.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
     "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o \
     "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
     "$BUILD/os"/virtio_gpu64.o \
@@ -849,7 +849,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
     $LD -m elf_x86_64 -o "$BUILD/kernel64_os_cr3exp.elf" kernel/linker64.ld \
         "$BUILD/cr3exp/kernel64.o" "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
         gui_rs/gui_rs.o \
-        "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
+        "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/fontcfg64.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
         "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o \
         "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
         "$BUILD/os"/virtio_gpu64.o \

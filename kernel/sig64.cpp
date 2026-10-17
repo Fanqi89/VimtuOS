@@ -317,6 +317,26 @@ static int sig64_kill_current64(int sig, pt_regs64* r, const char* why) {
     return proc64_sig_die_current64(sig, r);
 }
 
+// ★ v0.4.8：内核内部 raise（当前进程）。只置未决位 —— 真正投递仍发生在"返回用户态"时
+//   （sig64_deliver64），所以 handler / SIG_IGN / 默认动作三条路径与 kill 类信号完全一致。
+void sig64_raise64(int sig) {
+    if (sig <= 0 || sig >= SIG64_NSIG) return;
+    if (!proc64_sig_state_current64) return;
+    Sig64State64* st = proc64_sig_state_current64();
+    if (!st) return;                                   // 任务 0 / 无进程上下文：不产生信号
+    if (st->handler[sig] == SIG64_IGN64) return;       // 忽略：不置未决位（Linux 同）
+    st->pending |= (1ULL << sig);
+    dbg64_line_begin64();
+    dbg64_str("[SIG64] raise pid=");
+    dbg64_dec((uint64_t)(uint32_t)(proc64_current_pid64 ? proc64_current_pid64() : -1));
+    dbg64_str(" sig=");
+    dbg64_dec((uint64_t)sig);
+    dbg64_str(" src=pipe-epipe pending=0x");
+    dbg64_hex64(st->pending);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
 void sig64_deliver64(pt_regs64* r, const char* where) {
     if (!r || r->cs != SEL64_UCODE) return;              // 只投"即将回用户态"的帧
     if (!proc64_sig_state_current64) return;

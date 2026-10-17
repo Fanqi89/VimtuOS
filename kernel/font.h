@@ -70,6 +70,18 @@ int  font_mono64();                        // 当前开关（诊断/验收打点
 // 单元格高度（像素）= 当前面 (ascender - descender) 的实测高度，下限 em、上限 FONT_PX-2。
 // 终端用它做**行距**：取最大度量才不会把 'g' 的下半截或汉字上下边缘切掉。
 int  font_cell_height64();
+
+// ==================== ★ v0.4.8：笔画加厚（stem darkening）+ UI 抗锯齿开关 ====================
+// 用户反馈"字体显示不平滑、不够清晰、颜色过浅"。终端那套"非黑即白"不能用在 UI 上（UI 要平滑），
+// 所以这里换另一条路子：**把抗锯齿的覆盖率整体放大**（经典 stem darkening）——
+// 笔画的核心像素更快到 255、边缘过渡也更"实"，肉眼就是"笔画变厚、字变清楚"。
+//   覆盖率 a -> min(255, a * pct / 100)；pct=100 表示不改（与旧版逐像素一致）。
+// ★ 只影响 UI 的抗锯齿路径；终端走单色阈值分支（font_set_mono64），完全不受影响。
+void font_set_stem64(int pct);        // 100 = 原样；建议 110..140；越界自动夹到 100..160
+int  font_stem64();
+// UI 是否抗锯齿：0 = 连 UI 也走单色阈值（fontconfig 里 ui.antialias = off 时）
+void font_set_ui_aa64(int on);
+int  font_ui_aa64();
 // 返回：0 = 中文面就绪（或本来就在内核里）；1 = 这次没到手（可以再调）；2 = 已确认取不到（不再重试）。
 int  font_external_load64();
 void font_external_give_up64();

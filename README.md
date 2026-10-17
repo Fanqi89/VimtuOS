@@ -4,7 +4,7 @@
 目标是"能当日常系统用"，而不是教学玩具。
 
 - 语言：C / C++（内核）+ Rust（设计 Token 表）+ 汇编（引导与入口）+ Python（构建与验收）
-- 版本：**0.4.7**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0…）
+- 版本：**0.4.8**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0…）
 - 许可：GPL-3.0
 - 验收方式：**77 个自动化验收脚本**，每条断言都有串口打点或像素证据（见 [验收](#五验收与工程质量)）
 
@@ -57,11 +57,18 @@
 - 颜色：背景纯黑 `#000000`、正文纯白 `#FFFFFF`、**标准 ANSI 16 色**（`ESC[…m`，含亮青 `#00FFFF` / 亮红 `#FF0000`），全部 100% 不透明
 - 字体：Sarasa Mono SC（终端等宽）+ Unifont（缺字兜底）—— 构建期子集化，许可原文在 `docs/fonts/`
 
+**UI 侧（非终端）另一套策略**：要平滑、要厚、要够黑。v0.4.8 起由最小 fontconfig 管：
+`/etc/fonts.conf`（`key = value`）里的 `ui.stem`（笔画加厚百分比，默认 120）与 `ui.antialias`（on/off）
+在启动时作用到抗锯齿路径；实测设置页正文对比度 **16.46:1**、次要文字 **9.41:1**（WCAG AAA 是 7:1）。
+★ 如实边界：不是真 fontconfig（无 `<match>/<test>/<edit>` 规则引擎、无字体扫描/枚举，只能在内嵌 4 个面里选）；
+`/etc` 属 root，普通会话写不进配置，内核会打 `src=default(seed-denied)` 并用内置默认值 —— 要定制就在镜像构建里预置该文件。
+
 ### 7. Linux 兼容（syscall 指令路径）
 覆盖 **56 个调用号**，其中真实现包括：`read/write/open/close/stat/fstat/lseek/mmap/mprotect/munmap/brk/
 ioctl/readv/writev/access/pipe(sleep 阻塞)/dup/dup2/nanosleep/getpid/fork/execve/wait4/kill/uname/fcntl/
 rename/mkdir/rmdir/unlink/getcwd/clock_gettime/exit_group/openat/getrandom/statfs/fstatfs/arch_prctl/
 **getdents64(217)**/setuid/setgid/getuid/geteuid/getgid/getppid/set_tid_address/readlink`，
+并在 `write` 路径上按 Linux 语义投递 **SIGPIPE**（管道读端全关 -> `-EPIPE` + 默认动作退出 141），
 并新增**最小 `/proc`**（`/proc/version`、`/proc/self/{status,cmdline,exe}`）。
 已跑通：musl 静态程序、自有动态链接器、Lua、TCC、gzip、tar、make。
 边界（重要）：**socket 家族（41-44）未实现**、`clone` 线程不支持、信号只记录不投递、glibc 二进制未验证 —— 详见第二节。
@@ -80,7 +87,7 @@ rename/mkdir/rmdir/unlink/getcwd/clock_gettime/exit_group/openat/getrandom/statf
 这一节比上一节更重要：下列每一条都是**当前代码里确实没有**的东西，别当成"大概支持"。
 
 ### 内核 / 进程
-- ❌ **信号投递**：`rt_sigaction/rt_sigprocmask` 只记录，`rt_sigreturn` 直接 `-ENOSYS`（没有用户栈信号帧）
+- ⚠️ **信号**：投递是**真实现**（用户栈信号帧 + `rt_sigreturn`；用户态 #PF/#GP/#DE 只杀进程、不 PANIC；v0.4.8 起管道 EPIPE 也投 **SIGPIPE**）；边界 = 无 `siginfo`/`sigaltstack`/`SA_RESTART`/实时信号排队/作业控制
 - ❌ **线程**：`clone` 只支持 fork 语义，`CLONE_VM/THREAD` → `-ENOSYS`；**没有 futex**
 - ❌ **swap / 页换出**：内存不足直接 `-ENOMEM`
 - ❌ **COW**：`fork` 整页物理复制
@@ -202,7 +209,8 @@ Fonts-open/  Sarasa Mono SC（终端）+ Unifont（兜底）+ 许可原文
 
 - 仓库：<https://github.com/Fanqi89/VimtuOS>
 - 发布：每个版本一个 Release + 两个附件（ISO / IMG）+ 正文附 sha256；**旧版本 Release 永不改动**
-- 最新：**v0.4.7**（本版：终端三无渲染 / ANSI 16 色 / 启动直出 boot log / getdents64 + /proc / 图标签名）
+- 最新：**v0.4.8**（本版：SIGPIPE 真投递 / UI 笔画加厚 + 对比度 / 最小 fontconfig）
+- 上一版：**v0.4.7**（终端三无渲染 / ANSI 16 色 / 启动直出 boot log / getdents64 + /proc / 图标签名）
 - 更早：v0.4.6、v0.4.5、v0.4.4、v0.4.3、v0.2.0-beta.5 …
 
 发布流程见 [docs/发布流程.md](docs/发布流程.md)；逐批历史见 [docs/开发历程.md](docs/开发历程.md)。

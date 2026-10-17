@@ -64,7 +64,8 @@
 #include "userdb64.h"
 // ---- 批次 A 后半的两个子系统（同样只进系统内核；os_boot_path 里注册 + 跑）----
 #include "preload64.h"   // 字形/图标预热（进桌面之前跑一轮，带 rdtsc64 实测证据）
-#include "sig64.h"       // ★ A4-5：信号投递（selftest / tty-int 自检 / 进程信号状态查询）
+#include "sig64.h"          // ★ A4-5：信号投递（selftest / tty-int 自检 / 进程信号状态查询）
+#include "fontcfg64.h"      // v0.4.8：最小 fontconfig（/etc/fonts.conf -> 笔画加厚 / UI AA）
 uint32_t sig64_suppressed64();          // 打点预算节流统计（收尾打一行）
 // ---- Intel HDA 声卡（kernel/hda64.cpp；只进系统内核，与 net64/usb64 同一批）----
 //   class 0x0403 + BAR0 MMIO + CORB/RIRB + AFG->DAC->Pin + SD0 播放流；全程轮询。
@@ -1329,6 +1330,10 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
     //   [FONT64] faces=… cjk=0 + cjk_ext_na=1 —— **不是失败**，系统照常进桌面。
     // 位置必须在 preload64_run64() 之前：字形预光栅化要按"中文面在不在"来决定预热什么。
     if (font_external_load64() != 0) font_external_give_up64();
+    // ★ v0.4.8：最小 fontconfig —— 读 /etc/fonts.conf（缺了就幂等种一份默认），
+    //   把"笔画加厚 / UI 抗锯齿开关"落到字体层。位置：中文面就绪之后、preload 预热之前
+    //   （预热要按最终的字形位图来做）。卷不可写时 seed 失败也**只打点**，绝不影响启动。
+    (void)fontcfg64_init64();
 #endif
     (void)update64_check64();
     (void)preload64_run64();

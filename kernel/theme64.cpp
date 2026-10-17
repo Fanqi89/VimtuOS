@@ -21,8 +21,8 @@ static const Theme64Tokens kThemes[THEME64_THEME_COUNT] = {
         rgb(238, 240, 243),                 // title_bg_ina
         rgb(32, 32, 32),                    // title_txt
         rgb(240, 240, 240),                 // client_bg（内容卡片底色；老验收依赖 240,240,240）
-        rgb(32, 32, 32),                    // text
-        rgb(104, 108, 116),                 // text_dim
+        rgb(20, 20, 20),                    // text（v0.4.8：用户反馈"颜色过浅"，加深以提对比度）
+        rgb(84, 88, 96),                   // text_dim（v0.4.8：加深；对白底对比度 约 6.6:1 -> 9.4:1）
         rgb(0, 120, 215),                   // accent（Win11 蓝）
         rgb(16, 110, 190),                  // accent2
         rgb(0, 120, 215),                   // sel_bg（桌面图标选中）

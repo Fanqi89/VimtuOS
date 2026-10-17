@@ -18,6 +18,8 @@
 // ---- proc64 的弱引用：进程表（没有进程上下文 -> 返回 nullptr -> 用内核表）----
 // proc64.cpp 只在系统内核里链接（安装介质内核没有进程），所以这里必须弱引用 + 判空。
 extern "C" FdTable64* proc64_fdtab_of_current64() __attribute__((weak));
+// ★ v0.4.8：SIGPIPE 投递（weak：安装介质内核不链 sig64.cpp，这里自然为 0 -> 只回 EPIPE）
+void sig64_raise64(int sig) __attribute__((weak));
 // ★ 应用注册表挂钩（weak：安装介质内核不链 app64.cpp）：谁**关闭了可写的 /etc/apps.json**，
 //   就在**它自己的上下文里**重读一遍内核内存表 —— 这是注册表"外部改动"的**唯一**通知路径。
 //   为什么不让桌面帧轮询读盘：vfs64 不可重入（会读到半截/别人的字节），而且长 I/O 会冻住
@@ -651,7 +653,7 @@ static int fd64_pipe_read64(Pipe64* p, int fd, int nonblock, void* buf, int len)
     }
 }
 // 写：默认**阻塞**直到全部写完（满 -> 睡等）；O_NONBLOCK -> 短写（写多少算多少；
-//     一点空间都没有 -> -EAGAIN）；读端全关 -> -EPIPE（**不投递 SIGPIPE**，如实，见 fd64.h 边界段）
+//     一点空间都没有 -> -EAGAIN）；读端全关 -> -EPIPE **并投递 SIGPIPE**（v0.4.8 起；见 fd64.h）
 static int fd64_pipe_write64(Pipe64* p, int fd, int nonblock, const void* buf, int len) {
     if (!p || !buf || len < 0) return -FD64_EFAULT;
     if (len == 0) return 0;
@@ -679,7 +681,13 @@ static int fd64_pipe_write64(Pipe64* p, int fd, int nonblock, const void* buf, i
             if (waited) fd64_pipe_wait_log64(fd, "full", g_ticks64 - t0, p);
             return (int)done;
         }
-        if (no_reader) return (done > 0) ? (int)done : -FD64_EPIPE;   // 读端全关：EPIPE（不投 SIGPIPE）
+        if (no_reader) {
+            // ★ v0.4.8（用户点名"管道断开不投递 SIGPIPE"）：Linux 语义 = write 返回 -EPIPE **并且**
+            //   投递 SIGPIPE（默认动作终止，退出码 141）。这里置未决位，真正投递在返回用户态时发生
+            //   （sig64_deliver64），所以带 handler 的程序能捕获、忽略它的按 Linux 继续跑。
+            if (sig64_raise64) sig64_raise64(13 /* SIGPIPE */);
+            return (done > 0) ? (int)done : -FD64_EPIPE;
+        }
         if (nonblock) return (done > 0) ? (int)done : -FD64_EAGAIN;   // O_NONBLOCK：短写 / -EAGAIN
         if (!task_sleep_ms64) return (done > 0) ? (int)done : -FD64_EAGAIN;   // 没有调度器：无处可等
         if (!waited) { waited = 1; t0 = g_ticks64; }
