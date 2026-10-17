@@ -2122,7 +2122,7 @@ def cap_ipc_p5():
               "\"[EV64] drops … suppressed=…\"、\"[EV64] poll pid=… got=… pend=… drops=…\"，kernel/input64.h:11/46-49）")
     ev.append("焦点/捕获：事件只投给**前台**进程（焦点窗口所属进程），鼠标按下时坐标捕获到该进程 —— "
               "kernel/proc64.h:218 起 + input64 的路由；失焦事件如实清空/不投")
-    ev.append("共享内存：对象表 8 个对象 × 单对象 ≤16 页（64 KiB）= 每进程映射窗 4 槽 × 64 KiB = 256 KiB"
+    ev.append("共享内存：对象表 8 个对象 × 单对象 ≤512 页（2 MiB，v0.5.0 起；原 16 页/64 KiB）= 每进程映射窗 4 槽 × 2 MiB = 8 MiB"
               "（kernel/proc64.h:243-248 / proc64.cpp:219）；**fork 继承句柄、退出回收**（shm64_drop_all64，"
               "proc64.cpp:288/897/941/1285 四条路径都调）")
     ev.append("实测串口原文：\"[SHM64] create id=… pages=…\"、\"[SHM64] map id=… va=0x… len=…\"、"
@@ -3423,6 +3423,7 @@ TESTS = [
     ("texthint64_test.py", "★ 本源文字清晰度（fixture 内注入一行 32 个汉字 + 宿主逐像素 + 反向对照）"),
     ("fontq64_test.py", "★ v0.4.8 UI 字体质量：笔画加厚(stem) + 正文/次要文字对比度(WCAG 比) + 笔画核心占比 + 终端不受污染"),
     ("sigpipe64_test.py", "★ v0.4.8 管道断开 -> SIGPIPE 真投递（端到端；环境拉不起 ring3 shell 时报 UNVERIFIED，不算绿）"),
+    ("browser64_test.py", "★ v0.5.0 ring3 真窗口浏览器：大 surface(896x580/shm 2MiB) + HTML 子集排版 + 屏幕像素（白底/墨迹/链接蓝）+ PageDown 滚动 + ESC 退出"),
     ("term_render64_test.py", "★ v0.4.7 终端三无渲染：像素级证明「无抗锯齿」(中间灰=0)+「无次像素」+ 纯黑底/纯白字 +"
                               " ANSI 16 色表 + 度量驱动整数行距；并断言启动不再显示硬件报告页、直出滚动英文 boot log"),
     ("fd64_test.py", "批次 D FD 语义：每进程 fd 表 + dup 共享游标 + fork 继承 + O_APPEND + pipe 环回"),

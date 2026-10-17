@@ -112,8 +112,12 @@ static const uint32_t WL64_PANEL_BOTTOM64 = 84;   // 距屏幕下边缘（Dock 7
 // 用内联函数而不是 static const 数组：头文件被多个 TU 包含，未使用的数组可能触发 -Wunused-const-variable。
 static inline uint32_t wl64_slot_dx64(uint32_t slot) { return (slot & 1u) ? 112u : 16u; }
 static inline uint32_t wl64_slot_dy64(uint32_t slot) { return (slot & 1u) ?  88u : 16u; }
-static const uint32_t WL64_MAX_PIXELS64   = 16384;        // 单 surface 像素上限（= 64KiB 缓冲 / 4B）
-static const uint32_t WL64_MAX_FRAMES64   = 16;           // = proc64.h 的 SHM64_MAX_PAGES64
+// ★ v0.5.0（大窗口）：单 surface 像素上限 16384 -> **524288**（= 2 MiB 缓冲 / 4B = 896x585 级别），
+//   帧表长度跟随 shm 单对象页数上限（512 页）。旧值 16384 像素 = 128x128 —— 浏览器/办公套件这类
+//   真窗口根本放不下。为什么只放到 2 MiB：每进程 shm 映射窗是 4 槽 x 单槽，窗总大小必须留在
+//   用户窗口（16 MiB）里且不压到设备映射窗/代码段（见 proc64.h 的布局注释）。
+static const uint32_t WL64_MAX_PIXELS64   = 524288;       // 单 surface 像素上限（= 2MiB 缓冲 / 4B）
+static const uint32_t WL64_MAX_FRAMES64   = 512;          // = proc64.h 的 SHM64_MAX_PAGES64
 
 // 像素格式（与 A1 的 Fb64Info.format 同一口径）
 static const uint32_t WL64_FORMAT_XRGB888864 = 0;

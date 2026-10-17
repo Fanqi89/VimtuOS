@@ -90,7 +90,7 @@ struct Ev64Event {
 #define V64_KEY_PAGEDOWN   0xF7u
 
 /* 单对象上限（= kernel/proc64.h 的 SHM64_MAX_PAGES64 * 4KiB） */
-#define V64_SHM_MAX_BYTES  (64u * 1024u)
+#define V64_SHM_MAX_BYTES  (2u * 1024u * 1024u)   /* v0.5.0：内核 SHM64_MAX_PAGES64 16 -> 512（= 2 MiB），大窗口要用 */
 
 /* ---------------- ★ A5 前置：包装（user/lib/syscall.c） ----------------
  * poll_event(out, max, flags)：out != NULL 时最多取 max 条事件（40 B/条）并返回条数；

@@ -74,7 +74,7 @@ DRVDEMO_PATH = "/bin/drvdemo"
 # ---- 与内核常量逐位一致（kernel/proc64.h / usermode64.h）----
 USER64_CODE_VA64 = 0x0000000100000000
 USER64_WINDOW_BYTES64 = 16 * 1024 * 1024          # 4GiB..4GiB+16MiB
-SHM_WINDOW_BYTES64 = 256 * 1024                   # 顶部 256 KiB（SHM64 窗）
+SHM_WINDOW_BYTES64 = 8 * 1024 * 1024                    # v0.5.0：顶部 8 MiB（SHM64 窗 = 4 槽 x 2 MiB；大窗口用）
 DEV_SLOTS = 8
 DEV_SLOT_BYTES = 256 * 1024
 DEV_WINDOW_BYTES = DEV_SLOTS * DEV_SLOT_BYTES     # 2 MiB

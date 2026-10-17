@@ -64,7 +64,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
 #   空夹具盘由构建期"原始区"（build64/demo64_raw.bin，写进 system.img 的 LBA 7497 起）兜底。
 #   内核二进制里只剩路径/偏移/长度表（kernel/demo64.h），本文件末尾有 64B 探针断言。
-VIMTUOS_VERSION="0.4.9"     # ★ 本版：SIGPIPE 端到端验收（/epipe.elf + 真进程 shell）+ fontconfig 真正可配置（/etc/fonts.conf 0666 + stem A/B）
+VIMTUOS_VERSION="0.5.0"     # ★ 本版：大窗口 shm 2 MiB + /bin/browser（ring3 真窗口浏览器：HTML 子集排版 + 滚动）
 CXXFLAGS="$CXXFLAGS -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\""
 CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
 #
@@ -921,6 +921,16 @@ echo "    演示程序原始区：$DEMO64_RAW_BYTES B -> system.img LBA $DEMO64_
 ICONPACK_BYTES=$(stat -c%s "$RES/iconpack.bin")
 ICONPACK_SECTORS=$(( (ICONPACK_BYTES + 511) / 512 ))
 KERNEL_OS_SECTORS=$(( (OSSZ + 511) / 512 ))
+#
+# ★ v0.5.0 修（真缺陷）：ICONPACK_MAX_SECTORS 一直**没有赋值** —— `[ "$X" -gt "" ]` 让 bash 报
+#   "line 925: [: : integer expected" 并把 if 判成假，于是"图标包不能超过卷里那份上限"这条断言
+#   **静默失效**（构建日志里一直有这行报错，但没人管）。值从唯一真源 kernel/icons64.h 取，
+#   不在脚本里写死第二份。
+ICONPACK_MAX_SECTORS=$(sed -n 's/^#define[[:space:]]*ICON64_PACK_MAX_SECTORS[[:space:]]*\([0-9][0-9]*\).*/\1/p' kernel/icons64.h | head -1)
+if [ -z "$ICONPACK_MAX_SECTORS" ]; then
+    echo "ERROR: 从 kernel/icons64.h 取不到 ICON64_PACK_MAX_SECTORS（断言不能静默失效）" >&2
+    exit 1
+fi
 KERNEL_AREA_BYTES=$(( KERNEL_SECTORS * 512 ))
 if [ "$ICONPACK_SECTORS" -gt "$ICONPACK_MAX_SECTORS" ]; then
     echo "ERROR: 图标包 $ICONPACK_BYTES B（$ICONPACK_SECTORS 扇区）超过 icons64.h 的 ICON64_PACK_MAX_SECTORS=$ICONPACK_MAX_SECTORS" >&2
@@ -1422,6 +1432,29 @@ if [ -f "$STORE_VOL_IN" ] && [ -f "$BUILD/store/vpkg.elf" ] && [ -f "$BUILD/stor
           --repo "$BUILD/store/repo" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 else
     echo "ERROR: 缺少 $STORE_VOL_IN 或 build64/store/*.elf —— 应用商店没装进系统卷" >&2
+    exit 1
+fi
+
+# ============================================================================
+# ★ v0.5.0：/bin/browser（浏览器）—— 全用户态，内核 0 字节
+#   1) user/browser/build_browser.sh 编 html.c + browser.c + user/lib（font64 必须开 SSE），
+#      并自检 PT_LOAD 落在 4GiB..4GiB+64KiB、没有 PT_INTERP（kernel/elf64.cpp 的硬门槛）；
+#   2) tools/browser_pack_win.py 把 /bin/browser 与 /www/index.html 写进卷、**逐字节回读**，
+#      再拼出新的 build64/sysdisk.img（卷链继续往下走）。
+#   端到端验收：python tests/browser64_test.py
+# ============================================================================
+echo "==> ★ 浏览器：/bin/browser + /www/index.html（全用户态，内核 0 字节）"
+bash user/browser/build_browser.sh "$BUILD"
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid "$BUILD/browser.elf"
+echo "==> 浏览器装卷"
+BROWSER_VOL_IN="$BUILD/storevol.img"
+[ -f "$BROWSER_VOL_IN" ] || BROWSER_VOL_IN="$BUILD/fontvol.img"
+if [ -f "$BROWSER_VOL_IN" ] && [ -f "$BUILD/browser.elf" ]; then
+    "$PY" tools/browser_pack_win.py --vol-in "$BROWSER_VOL_IN" --vol-out "$BUILD/browservol.img" \
+          --browser "$BUILD/browser.elf" --htdocs user/browser/www \
+          --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+else
+    echo "ERROR: 缺少 $BROWSER_VOL_IN 或 build64/browser.elf —— 浏览器没装进系统卷" >&2
     exit 1
 fi
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"

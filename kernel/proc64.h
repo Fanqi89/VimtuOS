@@ -240,12 +240,19 @@ extern "C" void* proc64_evq_of_current64();             // nullptr = 当前不�
 // ★ 如实边界（别把没做的说成做了）：没有 mmap 文件语义（没有 fd、没有 offset 分页共享的
 //   文件后端）、没有跨进程同步原语（锁/信号量/futex）、没有 shm_unlink/权限位；引用计数也
 //   只在\"进程退出/execve\"上递减，没有显式 close 系统调用。
+// ★ v0.5.0（大窗口）：单槽 64 KiB -> **2 MiB**、单对象 16 页 -> **512 页**。
+//   为什么必须放大：浏览器/办公套件这类**真窗口**应用要 896x560 = 501,760 像素 = 2,007,040 B 的
+//   缓冲，而旧上限（64 KiB = 16384 像素 = 128x128）连一个像样的对话框都放不下 —— 那不是"应用写得
+//   不好"，是内核A BI 的上限在挡路。放大后映射窗 = 4 槽 x 2 MiB = 8 MiB，仍在用户窗口（16 MiB）内，
+//   设备映射窗紧贴它下方（2 MiB），代码/栈/堆都在 4GiB+64KiB 起的一段 —— 三者互不重叠。
+//   如实边界：仍**不是**按需分配 VA（槽位固定 4 个），单对象上限 2 MiB；更大的窗口要么拆多对象、
+//   要么以后把映射窗改成动态分配（记在 docs/应用层与系统调用说明.md）。
 static const uint32_t SHM64_SLOTS64       = 4;                                   // 每进程最多 4 个映射窗
-static const uint64_t SHM64_SLOT_BYTES64  = 64ULL * 1024ULL;                     // 单窗 = 单对象上限
-static const uint64_t SHM64_WINDOW_BYTES64 = SHM64_SLOTS64 * SHM64_SLOT_BYTES64; // 256 KiB
+static const uint64_t SHM64_SLOT_BYTES64  = 2ULL * 1024ULL * 1024ULL;            // 单窗 = 单对象上限 = 2 MiB
+static const uint64_t SHM64_WINDOW_BYTES64 = SHM64_SLOTS64 * SHM64_SLOT_BYTES64; // 8 MiB
 static const uint64_t SHM64_WINDOW_VA64   = USER64_CODE_VA64 + USER64_WINDOW_BYTES64 - SHM64_WINDOW_BYTES64;
 static const uint32_t SHM64_HANDLES64     = 4;                                   // 每进程句柄表槽数
-static const uint32_t SHM64_MAX_PAGES64   = 16;                                  // 单对象页数上限（= 64 KiB）
+static const uint32_t SHM64_MAX_PAGES64   = 512;                                 // 单对象页数上限（= 2 MiB）
 
 // 错误码（负数；口径与 A1 的 fb_map / EV64_* 一致）
 static const int64_t SHM64_EPERM64  = -1;   // 没有进程上下文 / 本进程没有这个对象的句柄

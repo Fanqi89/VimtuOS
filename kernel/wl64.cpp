@@ -243,6 +243,22 @@ static void wl64_layout64() {
 // 槽位 -> 屏幕位置（surface 创建时定死；组合器策略，见 wl64.h 第 6 条）
 static void wl64_place64(Wl64Surface* s, uint32_t slot) {
     s->slot = slot % WL64_MAX_SLOTS64;
+    // ★ v0.5.0（大窗口）：放不进槽位的 surface 改为**屏幕居中**。
+    //   槽位是给 256x60 这类小面板设计的（右下角 320x200 面板区里两块故意重叠），把 896x560 的
+    //   浏览器窗口塞进槽位会算到屏幕外 —— 用户看到的是"窗口不出现"（wm 合成时整块被裁掉）。
+    //   判定用**尺寸**而不是创建序号：小 surface 的既有布局一个像素都不变（store / fontdemo /
+    //   wmclock 的验收按 [WL64] surface create … pos=x,y 断言，不受这条影响）。
+    {
+        const int fw = fb_width(), fh = fb_height();
+        if (fw > 0 && fh > 0 &&
+            ((int)s->w > (int)wl64_slot_dx64(1) || (int)s->h > (int)wl64_slot_dy64(1))) {
+            const int cx = (fw - (int)s->w) / 2;
+            const int cy = (fh - (int)s->h) / 2;
+            s->x = (cx > 0) ? cx : 0;
+            s->y = (cy > 0) ? cy : 0;
+            return;
+        }
+    }
     s->x = g_wl64_px64 + (int)wl64_slot_dx64(s->slot);
     s->y = g_wl64_py64 + (int)wl64_slot_dy64(s->slot);
 }
@@ -292,8 +308,16 @@ static uint32_t wl64_blit64(Wl64Surface* s, uint32_t* dst, int dw, int dh) {
     // ---- 2) 裁剪：surface 矩形 ----
     if (!wl64_rect_isect64(&rx, &ry, &rw, &rh, 0, 0, (int)s->w, (int)s->h)) return 0;
     int dxr = rx + s->x, dyr = ry + s->y, dwr = rw, dhr = rh;
-    // ---- 3) 裁剪：可见区域（面板）----
-    if (!wl64_rect_isect64(&dxr, &dyr, &dwr, &dhr, g_wl64_px64, g_wl64_py64, g_wl64_pw64, g_wl64_ph64)) return 0;
+    // ---- 3) 裁剪：可见区域 ----
+    // ★ v0.5.0（大窗口）：**大 surface 的可见区 = 整屏**，小 surface 仍是右下角面板区。
+    //   为什么：面板区（320x200）是给 256x60 这类小面板设计的；896x580 的浏览器窗口套进去会被
+    //   裁成一条（实测 dst=948,516 只写 97,440 B，屏幕上只看得到右下角一小块）。判定用**尺寸**
+    //   而不是 id/序号 —— 小 surface 的合成路径一个像素都不变（store / fontdemo / wmclock 不变）。
+    int vis_x = g_wl64_px64, vis_y = g_wl64_py64, vis_w = g_wl64_pw64, vis_h = g_wl64_ph64;
+    if ((int)s->w > (int)WL64_PANEL_W64 || (int)s->h > (int)WL64_PANEL_H64) {
+        vis_x = 0; vis_y = 0; vis_w = dw; vis_h = dh;
+    }
+    if (!wl64_rect_isect64(&dxr, &dyr, &dwr, &dhr, vis_x, vis_y, vis_w, vis_h)) return 0;
     // ---- 4) 裁剪：屏幕 ----
     if (!wl64_rect_isect64(&dxr, &dyr, &dwr, &dhr, 0, 0, dw, dh)) return 0;
     // 局部坐标随之平移（源矩形与目标矩形要对齐）
@@ -312,7 +336,7 @@ static uint32_t wl64_blit64(Wl64Surface* s, uint32_t* dst, int dw, int dh) {
             Wl64Surface* h = &g_wl64_surfs[i];
             if (!h->used || !h->content || h->id <= id_self) continue;
             int hx = h->x, hy = h->y, hw = (int)h->w, hh = (int)h->h;
-            if (!wl64_rect_isect64(&hx, &hy, &hw, &hh, g_wl64_px64, g_wl64_py64, g_wl64_pw64, g_wl64_ph64)) continue;
+            if (!wl64_rect_isect64(&hx, &hy, &hw, &hh, vis_x, vis_y, vis_w, vis_h)) continue;
             if (sy < hy || sy >= hy + hh) continue;
             cov[ncov][0] = hx;
             cov[ncov][1] = hx + hw;
@@ -415,7 +439,7 @@ static void wl64_free_surface64(Wl64Surface* s, const char* why) {
     int refs_after = 0;
     const int32_t old = s->shm_id;
     if (old) {
-        uint64_t tmp[WL64_MAX_FRAMES64];
+        static uint64_t tmp[WL64_MAX_FRAMES64];   // ★ v0.5.0：512 条 = 4 KiB，栈上放不下 -> 静态（单线程调用，非重入）
         uint32_t pages = 0, refs = 0;
         (void)proc64_shm_release_id64(old, 0);          // pid=0：组合器（kernel/wl64.cpp）持有的引用
         if (proc64_shm_view64((uint32_t)old, tmp, WL64_MAX_FRAMES64, &pages, &refs) == 0) {
@@ -570,7 +594,7 @@ int64_t wl64_surface_attach64(uint64_t surf, uint64_t shm_id, uint64_t offset) {
         wl64_end64();
         return WL64_ENOENT64;
     }
-    uint64_t tmp[WL64_MAX_FRAMES64];
+    static uint64_t tmp[WL64_MAX_FRAMES64];       // ★ v0.5.0：同上（512 条，栈放不下）
     uint32_t pages = 0, refs = 0;
     if (proc64_shm_view64((uint32_t)shm_id, tmp, WL64_MAX_FRAMES64, &pages, &refs) != 0) return WL64_ENOENT64;
     if (offset & 3u) return WL64_EINVAL64;                       // 像素必须 4 字节对齐
@@ -882,7 +906,7 @@ int64_t wl64_surface_export64(uint64_t idx, uint64_t out_uptr) {
     info.shm_bytes = s->shm_bytes;
     info.refs = 0;
     if (s->shm_id) {
-        uint64_t tmp[WL64_MAX_FRAMES64];
+        static uint64_t tmp[WL64_MAX_FRAMES64];   // ★ v0.5.0：同上（512 条，栈放不下）
         uint32_t pages = 0, refs = 0;
         if (proc64_shm_view64((uint32_t)s->shm_id, tmp, WL64_MAX_FRAMES64, &pages, &refs) == 0) info.refs = refs;
     }
@@ -1047,8 +1071,8 @@ int wl64_selftest64() {
     if (offsetof(Wl64SeatEvent, ev) != 0 || offsetof(Wl64SeatEvent, seat) != 40 ||
         offsetof(Wl64SeatEvent, surf) != 44 || offsetof(Wl64SeatEvent, sx) != 48 ||
         offsetof(Wl64SeatEvent, inside) != 56) fail |= 1;
-    if (WL64_MAX_PIXELS64 * 4u != 65536u) fail |= 1;                  // = shm 单对象上限
-    if (WL64_MAX_FRAMES64 != SHM64_MAX_PAGES64) fail |= 1;
+    if ((uint64_t)WL64_MAX_PIXELS64 * 4u != SHM64_SLOT_BYTES64) fail |= 1;   // = shm 单对象上限（v0.5.0：2 MiB）
+    if (WL64_MAX_FRAMES64 != SHM64_MAX_PAGES64) fail |= 1;                   // = 512 页
     if (WL64_MAX_SLOTS64 < 2) fail |= 1;                             // 要能演示重叠
     if (wl64_slot_dx64(0) >= wl64_slot_dx64(1)) fail |= 1;            // 槽位 1 在槽位 0 右边（重叠的前提）
     if (wl64_slot_dy64(0) >= wl64_slot_dy64(1)) fail |= 1;
