@@ -31,12 +31,13 @@ $CC $CFLAGS_COMMON $CFLAGS_NOSSE -Os -c user/lib/wl.c -o "$OBJ/wl.o"
 $CC $CFLAGS_COMMON -msse -msse2 -Os -c user/lib/font64.c -o "$OBJ/font64.o"
 LIB_OBJS="$OBJ/syscall.o $OBJ/string.o $OBJ/stdlib.o $OBJ/stdio.o $OBJ/crt0.o $OBJ/syscallS.o"
 
-echo "==> /bin/browser：编译 html.c + browser.c"
+echo "==> /bin/browser：编译 html.c + browser.c + net.c"
 $CC $CFLAGS_COMMON $CFLAGS_NOSSE -Os -c user/browser/html.c    -o "$OBJ/html.o"
+$CC $CFLAGS_COMMON $CFLAGS_NOSSE -Os -c user/browser/net.c     -o "$OBJ/net.o"
 $CC $CFLAGS_COMMON $CFLAGS_NOSSE -Os -c user/browser/browser.c -o "$OBJ/browser.o"
 
 $LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/store/store64.ld \
-    -o "$BUILD/browser.elf" "$OBJ/browser.o" "$OBJ/html.o" "$OBJ/wl.o" "$OBJ/font64.o" $LIB_OBJS
+    -o "$BUILD/browser.elf" "$OBJ/browser.o" "$OBJ/html.o" "$OBJ/net.o" "$OBJ/wl.o" "$OBJ/font64.o" $LIB_OBJS
 
 SIZE=$(stat -c%s "$BUILD/browser.elf")
 echo "    /bin/browser = $SIZE B（静态 ELF64；交付 = 系统卷 /bin/browser）"

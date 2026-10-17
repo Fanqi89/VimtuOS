@@ -34,6 +34,7 @@
 #include <wl.h>
 #include <font64.h>
 #include "html.h"
+#include "net.h"
 
 /* user/lib/syscall.c 里有 open() 的定义，但没有头声明（只有 write/read/close 在 unistd.h） */
 int open(const char* path, int flags, ...);
@@ -77,6 +78,7 @@ static char*            g_src;
 static int  g_scroll = 0, g_page_h = 0, g_lines = 0;
 static int  g_dirty = 1, g_frames = 0;
 static char g_url[64] = "/www/index.html";
+static int  g_src_len_override = 0;     /* load_error_page() 生成的字节数（0 = 不覆盖） */
 
 /* 内置欢迎页（卷里没有 /www/index.html 时用） */
 static const char kWelcome[] =
@@ -325,9 +327,59 @@ static void render(void) {
     g_dirty = 0;
 }
 
+/* 大小写不敏感的前缀判断（"http://"） */
+static int starts_ci(const char* s, const char* pre) {
+    int i = 0;
+    for (; pre[i]; i++) {
+        char a = s[i], b = pre[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+/* 内置错误页（HTTP 抓不下来时显示，绝不假装成功） */
+static void load_error_page(const char* url, int code) {
+    int n = 0;
+    const char* a = "<html><head><title>加载失败</title></head><body><h2>加载失败</h2><p>URL: ";
+    while (a[n] && n < 400) { g_src[n] = a[n]; n++; }
+    for (int i = 0; url[i] && n < 800; i++) g_src[n++] = url[i];
+    const char* b = "</p><p>原因码: ";
+    for (int i = 0; b[i] && n < 900; i++) g_src[n++] = b[i];
+    if (code < 0) { g_src[n++] = '-'; code = -code; }
+    { char d[12]; int k = 0; if (code == 0) d[k++] = '0';
+      while (code > 0) { d[k++] = (char)('0' + code % 10); code /= 10; }
+      while (k) g_src[n++] = d[--k]; }
+    const char* c = "</p><p>（浏览器只支持 http://；网络不可达、DNS 失败、TCP 超时都会到这里）</p></body></html>";
+    for (int i = 0; c[i] && n < (int)H_MAX_TEXT - 2; i++) g_src[n++] = c[i];
+    g_src[n] = 0;
+    g_src_len_override = n;
+}
+
 static void load_doc(const char* path) {
     int bytes = -1, rc = 0;
-    if (path && path[0]) bytes = read_file(path, g_src, H_MAX_TEXT);
+    g_src_len_override = 0;
+    if (path && path[0] && starts_ci(path, "http://")) {
+        /* ★ v0.5.2：真 HTTP。net_http_get 自己打 [BNET] … 行（url/dns/tcp/get/FAIL）。 */
+        int status = 0, got = 0;
+        const int nrc = net_http_get(path, g_src, H_MAX_TEXT - 1, &status, &got);
+        str_copy(g_url, path, 64);
+        if (nrc == 0 && got > 0) {
+            g_src[got] = 0;
+            bytes = got;
+            printf("[BROWSER] http ok status=%d bytes=%d\n", status, got);
+            /* 状态码非 2xx 时给页面加一行提示（内容仍照常渲染） */
+            if (status < 200 || status >= 300) rc = -4;
+        } else {
+            printf("[BROWSER] http FAIL rc=%d status=%d got=%d\n", nrc, status, got);
+            load_error_page(path, nrc ? nrc : -5);
+            bytes = g_src_len_override;
+            rc = nrc ? nrc : -5;
+        }
+    } else if (path && path[0]) {
+        bytes = read_file(path, g_src, H_MAX_TEXT);
+    }
     if (bytes <= 0) {
         int n = 0;
         while (kWelcome[n] && n < H_MAX_TEXT - 1) { g_src[n] = kWelcome[n]; n++; }
@@ -335,8 +387,9 @@ static void load_doc(const char* path) {
         bytes = n;
         str_copy(g_url, "builtin:index", 64);
         rc = -2;
-    } else {
-        str_copy(g_url, path, 64);
+    } else if (!starts_ci(path ? path : "", "http://")) {
+        /* 本地文件：URL 就是路径；HTTP 那条分支已经自己填过 g_url，别再覆盖 */
+        str_copy(g_url, path ? path : "-", 64);
     }
     g_doc.textpool = (char*)(g_arena + 128 * 1024);
     g_doc.blocks   = (struct HBlock*)(g_arena + 128 * 1024 + H_MAX_TEXT + 1024);
@@ -351,7 +404,10 @@ static void load_doc(const char* path) {
 }
 
 /* ==================== 主 ==================== */
-int main(void) {
+int main(int argc, char** argv) {
+    /* ★ v0.5.2：启动 URL —— `run /bin/browser <url>`（shell 的 run 支持 argv）；
+     *   没有参数就还是发行版起始页 /www/index.html。 */
+    const char* start_url = (argc > 1 && argv && argv[1] && argv[1][0]) ? argv[1] : "/www/index.html";
     g_arena = (unsigned char*)mmap(0, ARENA_BYTES, 3 /*RW*/, 0x22 /*PRIVATE|ANON*/, -1, 0);
     if (!g_arena) {
         printf("[BROWSER] FAILED arena mmap\n");
@@ -398,7 +454,7 @@ int main(void) {
         printf("[BROWSER] seat id=%d\n", seat);
     }
 
-    load_doc("/www/index.html");
+    load_doc(start_url);
     render();
 
     int reason = 0;
