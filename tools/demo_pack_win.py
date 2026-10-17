@@ -87,6 +87,13 @@ BLOBS = [
     ("/etc/iconpack.bin",    "iconpack.bin",       0o644),
 ]
 
+# ★ v0.4.9：**只进卷、不进原始区**的程序。原始区是"空夹具盘兜底"，而这几份只有在有卷的盘上
+#   才有意义（epipe 要在终端里 `run`，读的就是卷里的 ELF64；空夹具盘跑不出 pipe 现场）。
+#   单独一张表的好处：demo64_blobtab.h 的份数/偏移表与内核区预留**一个字节都不动**。
+VOL_ONLY = [
+    ("/epipe.elf",          "epipe.elf",          0o755),
+]
+
 
 def _load_tcc_pack():
     path = os.path.join(HERE, "tcc_pack_win.py")
@@ -99,10 +106,10 @@ def _load_tcc_pack():
 TP = _load_tcc_pack()
 
 
-def read_blobs(build_dir, want_paths=None):
+def read_blobs(build_dir, want_paths=None, extra=()):
     """读全部（或指定的）blob 文件；缺文件/空文件 -> 抛 SystemExit(2)。"""
     out = []
-    for path, name, mode in BLOBS:
+    for path, name, mode in list(BLOBS) + list(extra):
         if want_paths is not None and path not in want_paths:
             continue
         fp = os.path.join(build_dir, name)
@@ -226,7 +233,7 @@ def main():
         return 2
 
     if args.vol_out:
-        blobs = read_blobs(args.build)
+        blobs = read_blobs(args.build, extra=VOL_ONLY)
         do_vol(blobs, args.vol_in, args.vol_out, args.system, args.disk, args.target_sectors)
     if args.raw:
         # ★ 本批（内核预算）：原始区 = BLOBS（演示程序 + 图标包）+ **RAW_EXTRA**（中文面字体的

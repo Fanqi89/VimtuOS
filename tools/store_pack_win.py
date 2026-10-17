@@ -57,6 +57,26 @@ REPO_VOL = "/opt/vpkg/repo"
 INDEX_VOL = "/opt/vpkg/index.json"
 PROVIDES_VOL = "/etc/vpkg/provides"                 # provides 表：/bin/vpkg 的依赖模型用它
 
+# ★ v0.4.9：/etc/fonts.conf 的**发行版默认**（0666）。为什么必须在构建期预置：内核
+#   kernel/fontcfg64.cpp 的 fontcfg64_init64() 读不到文件时会自己种一份，但那份是运行期
+#   写进去的 —— 属主 = 当时的凭证、模式 = 内核默认，普通会话（uid=1000）改不动；而且裸
+#   system.img（不带 VimtuFS2 卷）连"写"都做不到，只能退化 src=default(seed-denied)。
+#   这里预置一份 0666：① 内核启动即 `src=file`（真有盘上配置）；② 用户/夹具能直接改它
+#   并**重启生效**，这是 fontconfig 这项能力"可配置"的唯一可验收形态。
+#   内容必须与 kernel/fontcfg64.cpp 的 kDefaultConf 保持一致（改一处要同步另一处）。
+FONTS_CONF_VOL = "/etc/fonts.conf"
+FONTS_CONF_DEFAULT = (
+    "# VimtuOS fontconfig (minimal) - 由内核首次启动时种下，可自由修改，重启生效\n"
+    "# 角色 -> 字体面；字体文件是构建期子集并内嵌的 4 个面，运行期不能换文件\n"
+    "ui.family       = Noto Sans\n"
+    "ui.stem         = 120\n"
+    "ui.antialias    = on\n"
+    "mono.family     = Sarasa Mono SC\n"
+    "mono.mode       = mono\n"
+    "cjk.family      = Noto Sans SC\n"
+    "fallback.family = Unifont\n"
+)
+
 # provides 表默认内容（**每行必须带一条见证路径**：只有那个文件真在卷上，/bin/vpkg 才认这条声明；
 # 见 user/store/vs_pkg.c 的"依赖模型"）。下面这条 libc6 只有在镜像里真的装了 glibc 共享库
 # （例如 tests/linuxapp64_test.py 的 lxcorpus 夹具盘）时才作数；普通系统卷上它是**惰性**的
@@ -529,6 +549,8 @@ def main():
                         ("/usr", 0o777), ("/usr/share", 0o777), ("/var", 0o777),
                         ("/var/lib", 0o777), ("/var/lib/vpkg", 0o777)):
             vol.mkdirs(d, mode=mode)
+        print("    夹具：/etc/fonts.conf 预建成 0666（内容 = 发行版默认；uid=1000 的会话改得动）")
+        vol.put(FONTS_CONF_VOL, FONTS_CONF_DEFAULT.encode("utf-8"), mode=0o666)
         # ★ 应用注册表 /etc/apps.json：**内核启动时自己建它**（kernel/app64.cpp 的 ar_write64
         #   "seed-builtin"：属主 = 当时的凭证 = root、模式 = 0644）。那样 uid=1000 的会话往后
         #   一条都追加不进去 —— 实测 [PERM64] deny op=access path=/etc/apps.json uid=1000
@@ -554,6 +576,12 @@ def main():
         print("    %-16s = %d B（内置默认：%d 行，见 tools/store_pack_win.py）"
               % (PROVIDES_VOL, len(pb), len(PROVIDES_DEFAULT.strip().splitlines())))
     files[PROVIDES_VOL] = (pb, 0o644)
+    # ★ v0.4.9：/etc/fonts.conf —— **发行版默认**（每次都预置，与是否为夹具无关）。用 setdefault：
+    #   调用方（夹具/发行版打包）自带一份就尊重它，不覆盖。放进 files 表 -> 走下面统一的
+    #   vol.put + verify_vol，落盘后逐字节回读校验。
+    files.setdefault(FONTS_CONF_VOL, (FONTS_CONF_DEFAULT.encode("utf-8"), 0o666))
+    print("    %-16s = %d B（发行版默认；0666 -> 普通会话可改，内核启动读它 = src=file）"
+          % (FONTS_CONF_VOL, len(files[FONTS_CONF_VOL][0])))
     for path in sorted(files):
         vol.put(path, files[path][0], mode=files[path][1])
     out = vol.finish()

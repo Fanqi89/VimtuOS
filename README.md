@@ -4,7 +4,7 @@
 目标是"能当日常系统用"，而不是教学玩具。
 
 - 语言：C / C++（内核）+ Rust（设计 Token 表）+ 汇编（引导与入口）+ Python（构建与验收）
-- 版本：**0.4.8**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0…）
+- 版本：**0.4.9**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0…）
 - 许可：GPL-3.0
 - 验收方式：**77 个自动化验收脚本**，每条断言都有串口打点或像素证据（见 [验收](#五验收与工程质量)）
 
@@ -57,11 +57,16 @@
 - 颜色：背景纯黑 `#000000`、正文纯白 `#FFFFFF`、**标准 ANSI 16 色**（`ESC[…m`，含亮青 `#00FFFF` / 亮红 `#FF0000`），全部 100% 不透明
 - 字体：Sarasa Mono SC（终端等宽）+ Unifont（缺字兜底）—— 构建期子集化，许可原文在 `docs/fonts/`
 
-**UI 侧（非终端）另一套策略**：要平滑、要厚、要够黑。v0.4.8 起由最小 fontconfig 管：
+**UI 侧（非终端）另一套策略**：要平滑、要厚、要够黑。v0.4.8 起由最小 fontconfig 管，
 `/etc/fonts.conf`（`key = value`）里的 `ui.stem`（笔画加厚百分比，默认 120）与 `ui.antialias`（on/off）
 在启动时作用到抗锯齿路径；实测设置页正文对比度 **16.46:1**、次要文字 **9.41:1**（WCAG AAA 是 7:1）。
+**v0.4.9 起它是真的可配置**：镜像构建期就预置一份 `0666` 的 `/etc/fonts.conf`（`tools/store_pack_win.py`），
+所以内核启动打的是 `[FONTCFG] applied src=file keys=7 stem=120`（不是内置默认），普通会话也改得动。
+实测 A/B（只改这一行 `ui.stem` 120 -> 160，同一块设置页客户区）：笔画核心像素 **0.35% -> 0.64%**，
+正文对比度仍是 16.46:1 —— 见 `tests/fontq64_test.py`（17/17 PASS）。
 ★ 如实边界：不是真 fontconfig（无 `<match>/<test>/<edit>` 规则引擎、无字体扫描/枚举，只能在内嵌 4 个面里选）；
-`/etc` 属 root，普通会话写不进配置，内核会打 `src=default(seed-denied)` 并用内置默认值 —— 要定制就在镜像构建里预置该文件。
+改配置要**重启生效**（没有 inotify / 运行期重载）；裸 `system.img`（不带 VimtuFS2 卷）上仍然是内置默认 +
+`src=default(seed-denied)`，因为那里没有可写的文件系统。
 
 ### 7. Linux 兼容（syscall 指令路径）
 覆盖 **56 个调用号**，其中真实现包括：`read/write/open/close/stat/fstat/lseek/mmap/mprotect/munmap/brk/
@@ -71,7 +76,10 @@ rename/mkdir/rmdir/unlink/getcwd/clock_gettime/exit_group/openat/getrandom/statf
 并在 `write` 路径上按 Linux 语义投递 **SIGPIPE**（管道读端全关 -> `-EPIPE` + 默认动作退出 141），
 并新增**最小 `/proc`**（`/proc/version`、`/proc/self/{status,cmdline,exe}`）。
 已跑通：musl 静态程序、自有动态链接器、Lua、TCC、gzip、tar、make。
-边界（重要）：**socket 家族（41-44）未实现**、`clone` 线程不支持、信号只记录不投递、glibc 二进制未验证 —— 详见第二节。
+ 边界（重要）：**socket 家族（41-44）未实现**、`clone` 线程不支持、无 futex、glibc 二进制未验证 —— 详见第二节。
+  （★ v0.4.9 更正：这里原来写着"信号只记录不投递"，那是 v0.4.4 之前的旧状态；信号从 A4-5 起就是**真投递**
+   —— 用户栈信号帧 + `rt_sigreturn`，v0.4.8 起管道 EPIPE 也投 `SIGPIPE`，v0.4.9 有了端到端验收
+   `tests/sigpipe64_test.py`（`[SIG64] raise … sig=13` + `default action … exit=141`，12/12 PASS）。）
 
 ### 8. 其他
 - 原生 PNG/JPEG（基线+扩展顺序）解码；内置图标包（30 个系统图标 + 应用图标）
@@ -88,6 +96,14 @@ rename/mkdir/rmdir/unlink/getcwd/clock_gettime/exit_group/openat/getrandom/statf
 
 ### 内核 / 进程
 - ⚠️ **信号**：投递是**真实现**（用户栈信号帧 + `rt_sigreturn`；用户态 #PF/#GP/#DE 只杀进程、不 PANIC；v0.4.8 起管道 EPIPE 也投 **SIGPIPE**）；边界 = 无 `siginfo`/`sigaltstack`/`SA_RESTART`/实时信号排队/作业控制
+- ⚠️ **终端内建 `run` 没有进程上下文**（v0.4.9 实测确认，未修）：终端里 `run /path.elf` 走
+  `kernel/elf64.cpp` 的 `user64_enter_at64`（"当前任务直接进 ring3"的同步模型），**不创建 `Proc64`**。
+  后果：`p64_current64() == nullptr` —— fd 表退回内核表（`pipe`/读写照常可用），但**信号状态不存在**，
+  所以该程序收不到任何信号（管道读端全关时 `write` 仍正确返回 `-EPIPE`，可 `SIGPIPE` 没有任何
+  pending 位可置，实测 `/epipe.elf` 打出 `SURVIVED`）。**真进程**路径没有这个问题：`/bin/shell`
+  的 `run PATH` 走 `fork(57)+execve(59)+wait4(61)`，子进程有独立 `Proc64`，
+  实测 `[SIG64] raise pid=28 sig=13 src=pipe-epipe` -> `[SIG64] default action pid=28 sig=13 exit=141`。
+  想跑出完整 Linux 语义，就在 shell 里 `run`，不要用终端内建的那条。
 - ❌ **线程**：`clone` 只支持 fork 语义，`CLONE_VM/THREAD` → `-ENOSYS`；**没有 futex**
 - ❌ **swap / 页换出**：内存不足直接 `-ENOMEM`
 - ❌ **COW**：`fork` 整页物理复制
@@ -209,8 +225,9 @@ Fonts-open/  Sarasa Mono SC（终端）+ Unifont（兜底）+ 许可原文
 
 - 仓库：<https://github.com/Fanqi89/VimtuOS>
 - 发布：每个版本一个 Release + 两个附件（ISO / IMG）+ 正文附 sha256；**旧版本 Release 永不改动**
-- 最新：**v0.4.8**（本版：SIGPIPE 真投递 / UI 笔画加厚 + 对比度 / 最小 fontconfig）
-- 上一版：**v0.4.7**（终端三无渲染 / ANSI 16 色 / 启动直出 boot log / getdents64 + /proc / 图标签名）
+- 最新：**v0.4.9**（本版：SIGPIPE **端到端**验收 = 新 ring3 程序 `/epipe.elf` + 真进程 shell；fontconfig **真可配置** =
+  构建期预置 0666 的 `/etc/fonts.conf` + `ui.stem` A/B 实测；`status_report` 的 blob 外置判据改成**产物自洽**）
+- 上一版：**v0.4.8**（SIGPIPE 真投递 / UI 笔画加厚 + 对比度 / 最小 fontconfig）；更早：**v0.4.7**（终端三无渲染 / ANSI 16 色 / 启动直出 boot log / getdents64 + /proc / 图标签名）
 - 更早：v0.4.6、v0.4.5、v0.4.4、v0.4.3、v0.2.0-beta.5 …
 
 发布流程见 [docs/发布流程.md](docs/发布流程.md)；逐批历史见 [docs/开发历程.md](docs/开发历程.md)。

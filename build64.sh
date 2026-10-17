@@ -64,7 +64,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
 #   空夹具盘由构建期"原始区"（build64/demo64_raw.bin，写进 system.img 的 LBA 7497 起）兜底。
 #   内核二进制里只剩路径/偏移/长度表（kernel/demo64.h），本文件末尾有 64B 探针断言。
-VIMTUOS_VERSION="0.4.8"     # ★ 本版：应用注册表 + 已安装应用进桌面/开始菜单 + 本源文字清晰度 + 本批收尾 8 项真缺陷
+VIMTUOS_VERSION="0.4.9"     # ★ 本版：SIGPIPE 端到端验收（/epipe.elf + 真进程 shell）+ fontconfig 真正可配置（/etc/fonts.conf 0666 + stem A/B）
 CXXFLAGS="$CXXFLAGS -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\""
 CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
 #
@@ -733,6 +733,17 @@ clang $EVSHM_UCFLAGS -c user/apps/sig64_demo.c -o "$SIG64_DIR/sig64_demo.o"
 $LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/apps/evshm_demo.ld \
     -o "$BUILD/sig64.elf" $EVSHM_OBJS "$SIG64_DIR/sig64_demo.o"
 echo "    演示程序（卷交付）：$BUILD/sig64.elf = $(stat -c%s "$BUILD/sig64.elf") B（静态 ELF64；kernel64.cpp 保证它在系统卷 /sig64.elf 里）"
+echo "==> ★ v0.4.9：SIGPIPE 端到端自证程序（user/apps/epipe.c -> build64/epipe.elf -> **卷交付**）"
+# 为什么单开一个程序：v0.4.8 的内核已经在"读端全关的写路径"上置了 SIGPIPE 未决位，但验收
+# 一直卡在**造不出 EPIPE 现场**上（那份夹具盘没有 VimtuFS2 卷 -> 没有 /bin/shell.bin -> `sh`
+# 起不来 -> `yes | head -1` 跑不了）。单进程自己关掉读端再写，是同一件事的最小现场。
+# 交付 = 系统卷 /epipe.elf（tools/demo_pack_win.py 写入 + 逐字节回读），终端 `run /epipe.elf`。
+EPIPE_DIR="$BUILD/uapps/epipe"
+mkdir -p "$EPIPE_DIR"
+clang $EVSHM_UCFLAGS -c user/apps/epipe.c -o "$EPIPE_DIR/epipe.o"
+$LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/apps/evshm_demo.ld \
+    -o "$BUILD/epipe.elf" $EVSHM_OBJS "$EPIPE_DIR/epipe.o"
+echo "    /epipe.elf = $(stat -c%s "$BUILD/epipe.elf") B（静态 ELF64；交付 = 系统卷 /epipe.elf）"
 $NASM -f bin user/hello64.asm -o "$BUILD/hello64.bin"
 "$PY" tools/make_vap.py "$BUILD/hello64.bin" "$BUILD/hello.vap" hello
 echo "    /hello.vap = $(stat -c%s "$BUILD/hello.vap") B（**不内嵌**：交付 = 系统卷 /hello.vap）"

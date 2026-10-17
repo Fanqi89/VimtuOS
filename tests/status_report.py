@@ -2449,60 +2449,98 @@ def cap_devmap():
 
 
 def cap_blob_offload():
-    """★ 本批（体积）：内嵌演示 blob 外置 —— 20 份 / 926,829 B（含后加入的图标包与外置中文面字体）搬到
-    「原始区」影子副本（LBA 6096 起，926,928 B），并同步进系统卷；内核里只有路径/偏移/长度表。
+    """★ 内嵌演示 blob 外置 —— 演示程序 + 图标包 + 外置中文字体搬到「原始区」影子副本
+    （system.img 的 LBA 7497 起）并同步进系统卷；内核里只有路径/偏移/长度表。
 
     * 交付 = 系统卷文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检；内核里 blob 字节 **0**）；
-      影子副本 = system.img 的 LBA 7497 起「原始区」（空夹具盘/无卷盘时兜底）。
-    * 内核里只剩路径/偏移/长度表：20 条 × 16 B = 320 B（build64/demo64_blobtab.h，构建期生成）。
-    * 实测（预算收口那次）：3,447,072 -> 3,397,824 B；**此后中文面字体也外置，当前系统内核 2,744,480 B、
-      余量 1,351,520 B**（三层预算见 tests/a42a64_test.py）。
-    * 构建期硬断言：18/18 份 blob 的「整份（≤4 KiB）/64B 高熵探针」在**两份内核二进制**里都搜不到
+      影子副本 = 空夹具盘 / 无卷盘时兜底。
+    * 内核里只剩路径/偏移/长度表：n 条 × 16 B（build64/demo64_blobtab.h，构建期生成）。
+    * 构建期硬断言：每份 blob 的「整份（≤4 KiB）/64B 高熵探针」在**两份内核二进制**里都搜不到
       （build64.sh 的 PYDEMO64 段）—— 哪天有人把 blob 塞回内核，这里必红。
     * 踩坑（真缺陷）：原设计按 loader 平铺加载的**物理地址**读原始区（LBA 7497 -> 物理 0x4A8000），
       但内核 .bss 里的 33 MB fb 后备缓冲（物理 0x428000..0x23CC000）盖住了这段地址 —— 第一次跑 demo64 就在
-      ring3 入口 0x100000000 上 #UD（\"[SIG64] fault no=6\" + \"[PANIC] cpu exception 6\"）；
+      ring3 入口 0x100000000 上 #UD（"[SIG64] fault no=6" + "[PANIC] cpu exception 6"）；
       改为 kernel/demo64.cpp 首次调用用 ata64_read(0, LBA7497, n) **按 LBA 现读并缓存**（失败如实打点，
-      调用方只走\"系统卷\"路径）。
+      调用方只走"系统卷"路径）。
+    * ★ v0.4.9 判据修正（是换更硬的判据，不是放宽）：原来 done 条件里钉着"份数 == 20 且合计字节数
+      == 926829" —— 那是某个历史时点的常数，字体面/图标包一换尺寸整条就掉成 PARTIAL，报出来的是
+      "产物变了"而不是"能力丢了"。现在钉在**产物自洽**上：表里每一条 (path, off, len) 必须
+      ① 偏移 16 字节对齐且严格递增、② 落在原始区文件范围内、③ len 等于 build64/ 里那个源文件的
+      **当前**字节数；并且 demo64_raw.bin 的实际大小 == 表里的 RAW_BYTES。塞错字节、漏装一份、
+      表过期，任意一条都会红。
     """
+    import importlib.util
     ev = []
     need = ["kernel/demo64.cpp", "kernel/demo64.h", "tools/demo_pack_win.py",
             "build64/demo64_blobtab.h", "build64/demo64_raw.bin"]
     miss = [x for x in need if not exists(x)]
     if miss:
         ev.append("缺文件：%s" % ", ".join(miss))
-    n_blob, raw_bytes, blob_sum = 0, 0, 0
+    n_blob, raw_bytes, blob_sum, entries, tab = 0, 0, 0, [], ""
     if exists("build64/demo64_blobtab.h"):
-        tab = open("build64/demo64_blobtab.h", encoding="utf-8", errors="replace").read()
+        with open("build64/demo64_blobtab.h", encoding="utf-8", errors="replace") as fh:
+            tab = fh.read()
         m = re.search(r"DEMO64_BLOB_COUNT\s+(\d+)", tab)
         n_blob = int(m.group(1)) if m else 0
         m = re.search(r"DEMO64_RAW_BYTES\s+(\d+)", tab)
         raw_bytes = int(m.group(1)) if m else 0
-        blob_sum = sum(int(x) for x in re.findall(r",\s*(\d+)u\s*\}", tab))
+        entries = [(a, int(b), int(c)) for a, b, c in
+                   re.findall(r'\{\s*"([^"]+)",\s*(\d+)u,\s*(\d+)u\s*\}', tab)]
+        blob_sum = sum(ln for _p, _o, ln in entries)
     pack = exists("tools/demo_pack_win.py")
     bk = grep_count(r"DM_BLOB_COUNT|DEMO64_BLOB_COUNT|DEMO64_RAW_LBA|DEMO64_RAW_BYTES", ["build64.sh"])
+    raw_real = os.path.getsize("build64/demo64_raw.bin") if exists("build64/demo64_raw.bin") else -1
+
+    # 表 <- 源文件：每条的 len 必须等于 build64/ 里那个源文件的**当前**大小
+    size_map = {}
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "demo_pack_win", os.path.join(ROOT, "tools", "demo_pack_win.py"))
+        dp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dp)
+        for path, name, _mode in list(dp.BLOBS) + list(getattr(dp, "RAW_EXTRA", [])):
+            fp = os.path.join("build64", name)
+            if exists(fp):
+                size_map[path] = os.path.getsize(fp)
+    except Exception as exc:                      # 表读不出来就如实报，不当成通过
+        ev.append("（读 tools/demo_pack_win.py 清单失败：%s）" % exc)
+    mism = [p for p, _o, ln in entries if size_map.get(p) != ln]
+    aligned = bool(entries) and all(o % 16 == 0 for _p, o, _l in entries)
+    inrange = bool(entries) and all(o + l <= raw_bytes for _p, o, l in entries)
+    monotonic = len(entries) > 1 and all(entries[i][1] < entries[i + 1][1]
+                                         for i in range(len(entries) - 1))
     ev.append("清单（tools/demo_pack_win.py 的 BLOBS 表）：**%d 份 / 合计 %d B**（原始区含对齐 %d B）；"
               "内核里只有路径/偏移/长度表（%d 条 × 16 B = %d B，无一个字节 blob 本体）"
               % (n_blob, blob_sum, raw_bytes, n_blob, n_blob * 16))
+    ev.append("产物自洽（v0.4.9 判据）：表内 %d 条 / 解析出 %d 条、偏移 16B 对齐=%s、严格递增=%s、"
+              "全在原始区范围内=%s、原始区文件实际 %d B == 表 RAW_BYTES %d B（%s）、"
+              "与 build64/ 源文件长度不符 %d 条%s"
+              % (n_blob, len(entries), aligned, monotonic, inrange, raw_real, raw_bytes,
+                 "一致" if raw_real == raw_bytes else "不一致", len(mism),
+                 ("（%s）" % ", ".join(mism[:4])) if mism else ""))
     ev.append("交付：系统卷同名文件（构建期写入 + 逐字节回读自检）+ system.img LBA 7497「原始区」影子副本"
               "（build64/demo64_raw.bin；build64.sh 两道越界断言：内核不许压过来、原始区不许越界）；"
               "启动期装卷**幂等**：卷里已有 -> \"install skipped (exists)\"；没有 -> 从原始区取字节装进去；"
               "找不到就如实 skipped，**绝不假装跑过**（kernel/kernel64.cpp / demo64.cpp 打点）")
-    ev.append("实测体积（★ 本批预算收口那一次）：系统内核 **3,447,072 -> 3,397,824 B**（-49,248 B，就是图标包"
-              "不再内嵌的字节）；余量 **648,928 -> 698,176 B**（≥ 预留 R=655,360 B，扣预留后剩 42,816 B；"
-              "三层预算断言 tests/a42a64_test.py 89/89 PASS）")
-    ev.append("构建期硬断言：**19/19** 份 blob（含本批加入的图标包）的「整份（≤4 KiB）/64B 高熵探针」在 "
+    ksz = os.path.getsize("build64/kernel64_os.bin") if exists("build64/kernel64_os.bin") else 0
+    isz = os.path.getsize("build64/kernel64.bin") if exists("build64/kernel64.bin") else 0
+    ev.append("实测体积（v0.4.9 本批实测）：系统内核 **%d B** / 上限 4,096,000 B / 余量 **%d B**；"
+              "安装内核 **%d B**（三层预算断言 tests/a42a64_test.py）"
+              % (ksz, 4096000 - ksz, isz))
+    ev.append("构建期硬断言：**%d/%d** 份 blob 的「整份（≤4 KiB）/64B 高熵探针」在 "
               "kernel64.bin（安装内核）与 kernel64_os.bin（系统内核）**两份**里都搜不到（build64.sh 的 "
-              "PYDEMO64 段；高熵窗口是为了避免纯零/同色中段的假命中）")
+              "PYDEMO64 段；高熵窗口是为了避免纯零/同色中段的假命中）" % (n_blob, n_blob))
     ev.append("★ 踩坑（真缺陷，修在 kernel/demo64.cpp）：按 loader 平铺加载的**物理地址**读原始区会被内核 .bss "
               "的 33 MB fb 后备缓冲（物理 0x428000..0x23CC000）覆盖 -> 第一次跑 demo64 在 ring3 入口 "
               "0x100000000 上 #UD（\"[SIG64] fault no=6\" + \"[PANIC] cpu exception 6\"）；"
               "改按 LBA 7497 用 ata64_read() 现读并缓存（\".bss 覆盖\"这条教训已写进源码注释）")
     ev.append("（边界，如实：**4 份\"直跑演示\"**（demo64 / hello_c / libctest_c / fbdemo）在挂卷之前跑 —— "
-              "放不下就得改布局（当前原始区 = LBA 6096 起、**926,928 B**：中文面字体（外置，733,584 B 净荷，"
-              "RAW_EXTRA 放最前）+ 18 份演示 blob + 图标包 49,192 B；表里共 20 条）；原始区读取失败时调用方只走"
-              "256 KiB（当前 144,129 B），放不下就得改布局；原始区读取失败时调用方只走系统卷路径、如实打点）")
-    done = bool(not miss and n_blob == 20 and blob_sum == 926829 and raw_bytes and bk)
+              "它们的数据来自原始区，放不下就得改布局；当前原始区 = LBA 7497 起、%d B（外置中文字体走 "
+              "RAW_EXTRA、放最前；其余 %d 份演示程序 + 图标包）；原始区读取失败时调用方只走系统卷路径、"
+              "如实打点，不假装跑过）" % (raw_bytes, n_blob))
+    done = bool(not miss and pack and n_blob >= 20 and n_blob == len(entries) and blob_sum > 0
+                and raw_real == raw_bytes and raw_bytes > 0 and aligned and monotonic and inrange
+                and not mism and bk)
     return ("DONE" if done else "PARTIAL"), ev
 
 
@@ -3293,9 +3331,11 @@ CAPS = [
              "64 位 BAR 读高 32 位、每进程 8 槽 × 256 KiB、P|U|W|NX|PCD、设备页不进页池、只 root、幂等、错误码齐全；"
              "用户态读 HDA/xHCI 寄存器与内核打点逐字段一致 + 真实写 SD0CTL.SRST 后内核 audio playtone 仍 ok=1",
      cap_devmap),
-    ("内核", "★ 内嵌演示 blob 外置：18 份 / 144,053 B -> 系统卷 + system.img LBA7497「原始区」影子副本；"
-             "内核里只剩路径/偏移/长度表（18×16 B），blob 字节 0；内核 3,436,080 -> 3,297,680 B、余量 798,320 B；"
-             "构建期 18/18 双内核高熵探针搜不到；踩坑：按物理地址读原始区被 .bss fb 后备缓冲覆盖 -> 改按 LBA 现读",
+    ("内核", "★ 内嵌演示 blob 外置：20 份 / 920,813 B -> 系统卷 + system.img LBA7497「原始区」影子副本；"
+             "内核里只剩路径/偏移/长度表（20×16 B = 320 B），blob 字节 0；系统内核 2,860,160 B / 上限 4,096,000 B"
+             "（余量 1,235,840 B）、安装内核 1,647,584 B；产物自洽判据 = 表偏移对齐+递增+不越界+每份长度等于"
+             "build64/ 源文件当前字节数；构建期 20/20 双内核高熵探针搜不到；踩坑：按物理地址读原始区被 .bss "
+             "fb 后备缓冲覆盖 -> 改按 LBA 现读",
      cap_blob_offload),
     ("应用", "★ JPEG 基线解码（Huffman/DC-AC/反量化/整数 IDCT、444·422·420、RSTn、EXIF Orientation 1..8；"
              "渐进式明确 -2）；与宿主 Pillow 逐像素 MAE ≤0.4 / 最大差 ≤3", cap_jpeg),
