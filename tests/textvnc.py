@@ -904,8 +904,14 @@ class VMSession:
                 "w": int(g[4]), "h": int(g[5]), "cx": int(g[6]), "cy": int(g[7])}
 
     def win_geom(self, title_part, tag=None):
-        """最近一条 [UI] win geom 打点（tag=new/set/fit）。"""
-        pat = r"\[UI\] win geom tag=(\S+) title=(\S+) app=(\d+) x=(-?\d+) y=(-?\d+) " \
+        """最近一条 [UI] win geom 打点（tag=new/set/fit）。
+
+        ★ 修（v0.4.6）：标题里**带空格**（"终端 - vimtu64"、"文件资源管理器 - 此电脑"），
+          原来用 `title=(\\S+)` 会在空格处截断、整行匹配失败 ⇒ 打点明明有、这里恒返回 None，
+          表现为"窗口开了但测试找不到"。改用非贪婪 `.*?` 一直吃到 ` app=` 之前。
+          先例：tests/texthint64_test.py 早就是 `title=.*? app=` 口径。
+        """
+        pat = r"\[UI\] win geom tag=(\S+) title=(.*?) app=(\d+) x=(-?\d+) y=(-?\d+) " \
               r"w=(\d+) h=(\d+) client=(\d+)x(\d+)"
         last = None
         for m in re.finditer(pat, self.log()):
@@ -959,6 +965,34 @@ class VMSession:
                 if g:
                     return g
             time.sleep(0.4)
+
+    def open_menu_app(self, digit, title_part, timeout=25, tries=3):
+        """用开始菜单的**数字快捷键**开应用：Win 键 -> 数字 1..8 -> 等 [UI] win geom。
+
+        为什么不再用 Dock 鼠标路径（kernel/startmenu64.cpp 的 kDigitApp 就是这套语义）：
+          ① Dock 走的是**真鼠标闭环**（VMSession 注入宿主 rel 事件，客人单包上限 24px），
+             5 个应用 × 每次拖拽在 TCG/VMware 上都不稳定 —— 实测 textwm64 4/4 OPEN_FAIL；
+          ② 数字键是纯键盘事件，链路只有"Win -> 数字"，与几何/缩放/DPI 全无关。
+        语义：1=终端 2=我的电脑(文件资源管理器) 3=系统监视器 4=计算器
+              5=扫雷 6=设置 7=任务管理器 8=关于
+        键盘走 VNC KeyEvent（VMSession 上的入口是 self.vnc.tap，VMSession 自己没有 key()）。
+        """
+        for _attempt in range(1, tries + 1):
+            before = len(re.findall(r"\[UI\] win geom", self.log()))
+            self.vnc.tap("super", gap=1.2)     # Win 键 = X11 Super_L(0xFFEB)；KEYSYM 里叫 super
+            self.vnc.tap(str(digit), gap=1.0)
+            t0 = time.time()
+            got = None
+            while time.time() - t0 < timeout:
+                if len(re.findall(r"\[UI\] win geom", self.log())) > before:
+                    got = self.win_geom(title_part)
+                    if got:
+                        break
+                time.sleep(0.4)
+            if got:
+                return got
+            # 菜单没接住（按键丢了/菜单没开）：先确保菜单关掉，再试一次
+            self.vnc.tap("esc", gap=0.6)
         return None
 
     def close_all_windows(self, tries=3):

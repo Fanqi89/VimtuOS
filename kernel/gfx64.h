@@ -48,6 +48,11 @@ int   gfx64_wall_src_w64();
 int   gfx64_wall_src_h64();
 const char* gfx64_wall_src_desc64();                     // "builtin" / "vfs:/wallpaper.png" ...
 void  gfx64_wall_invalidate64();                         // 主题/模式/源/分辨率变了 → 下次绘制重建
+// ★ 只让"内容层玻璃模糊缓存"失效（不动壁纸面）：窗口 打开/关闭/移动/改尺寸 后必须调。
+//   缓存的键只有 (x,y,w,h,r)，**不含底层内容**；不清就会把"窗口还在时"的模糊结果贴到
+//   关窗后的画面上（残影），并让"同一画面重画逐像素一致"不再成立
+//   （实测 tests/textstress64_test.py：基准帧与循环帧差 0.91、循环之间还分两种稳定态）。
+void  gfx64_blur_invalidate64();
 void  gfx64_wall_draw64(int x, int y, int w, int h);      // 把壁纸画进后备缓冲（只动这个矩形）
 const char* gfx64_wall_last_geom64();                    // 最近一次 [GFX64] wall 打点原文（验收用）
 

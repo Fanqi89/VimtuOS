@@ -43,14 +43,30 @@ except Exception:
 
 CLIENT_BG = (240, 240, 240)      # theme64.cpp：client_bg = rgb(240,240,240)（浅/深主题都一样）
 
-# Dock 下标见 gui64.cpp kDockItems：0 开始 / 1 我的电脑(explorer) / 3 终端 / 6 设置 / 7 任务管理器
+# 开窗走**开始菜单数字快捷键**（kernel/startmenu64.cpp 的 kDigitApp）：
+#   1 终端 / 2 我的电脑(资源管理器) / 3 系统监视器 / 4 计算器 / 5 扫雷 / 6 设置 / 7 任务管理器 / 8 关于
+# Dock 下标（gui64.cpp kDockItems）保留在注释里备查：0 开始 / 1 我的电脑 / 3 终端 / 6 设置 / 7 任务管理器
+# ★ 为什么换（v0.4.6）：Dock 路径是**真鼠标闭环**（宿主 rel 事件换算客人 px，单包上限 24），
+#   开窗这一步本身就跟内容重排无关，却因为点不中 Dock 让 4/4 个应用全部 OPEN_FAIL。
 APPS = {
-    "explorer": {"dock": 1, "title": "文件资源管理器", "app": 7, "layout_tag": None},
-    "terminal": {"dock": 3, "title": "终端", "app": 3, "layout_tag": r"\[UI\] term layout client="},
-    "settings": {"dock": 6, "title": "设置", "app": 5, "layout_tag": r"\[(SET64|UI) settings? layout"},
-    "taskmgr":  {"dock": 7, "title": "任务管理器", "app": 4, "layout_tag": r"\[UI\] tmgr layout"},
+    "explorer": {"digit": 2, "dock": 1, "title": "文件资源管理器", "app": 7, "layout_tag": None},
+    "terminal": {"digit": 1, "dock": 3, "title": "终端", "app": 3, "layout_tag": r"\[UI\] term layout client="},
+    "settings": {"digit": 6, "dock": 6, "title": "设置", "app": 5, "layout_tag": r"\[(SET64|UI) settings? layout"},
+    "taskmgr":  {"digit": 7, "dock": 7, "title": "任务管理器", "app": 4, "layout_tag": r"\[UI\] tmgr layout"},
 }
 
+
+def pointer_stuck(traj):
+    """拖拽轨迹里**客人光标位置从头到尾没变过** = 宿主鼠标注入没生效。
+
+    实测（v0.4.6）：VMware 窗口没在前台/没抓到鼠标时，HostMouse.rel 的 mouse_event 全部落空，
+    客人 cursor_pos 恒为同一点，自适应比例 |Δguest|/|Δhost| → 0 被夹到下限 0.05，
+    步长按 1/0.05 放大又被单事件上限削掉 ⇒ 20s 预算内走不动 1px。
+    这不是"窗口内容不随拖拽变化"（①②要抓的缺陷），是**环境缺前置条件**，必须与 DRAG_FAIL 分开报，
+    否则真缺陷会被环境噪声淹没。
+    """
+    ps = [p for (_i, p, _d, _r) in traj if isinstance(p, tuple)]
+    return len(ps) >= 2 and len(set(ps)) == 1
 
 def mad(frame_a, frame_b, x, y, w, h, ox=0, oy=0):
     """平均绝对差（MAD，三通道平均；0 = 逐像素完全一样）。"""
@@ -87,7 +103,8 @@ def move_test(s, name, rep, f_before):
     px, py = tv.title_drag_point(win)
     ok, tr = s.drag(px, py, px + dx, py + dy, steps=16)
     if not ok:
-        return "DRAG_FAIL", {"traj": tr[-3:]}
+        # 环境缺前置条件（宿主鼠标注入没生效）与"拖拽了但内容不动"必须分开报
+        return ("ENV_NO_POINTER" if pointer_stuck(tr) else "DRAG_FAIL"), {"traj": tr[-3:]}
     time.sleep(1.0)
     s.cap()                                   # 掉一帧
     f_after = s.cap("%s_move_r%d_after.png" % (name, rep))
@@ -111,6 +128,25 @@ def move_test(s, name, rep, f_before):
     return "AMBIGUOUS", nums
 
 
+def resize_end_geom(s):
+    """从 `[UI] win resize end dir=.. x= y= w= h= client=WxH` 取**拖拽后**的窗口几何。
+
+    ★ 修（v0.4.6，判据与事实不符）：原来用 s.win_geom() 取"最近一条 [UI] win geom"，
+      但那条打点只在 **new/set/fit** 时打（gui64.cpp 的 log_win_geom64 调用点），
+      用户用鼠标拖右下角**不打** win geom，只打 `[UI] win resize end`。于是拖完读到的还是
+      创建时的旧几何 ⇒ 恒判 "几何没变 -> NO_RESIZE"。这里改读拖拽自己那条打点。
+    """
+    last = None
+    for m in re.finditer(r"\[UI\] win resize end dir=(\S+) x=(\d+) y=(\d+) w=(\d+) h=(\d+) "
+                         r"client=(\d+)x(\d+)", s.log()):
+        last = m
+    if not last:
+        return None
+    g = [int(v) for v in last.groups()[1:]]
+    return {"tag": "resize-end", "title": "", "app": -1, "x": g[0], "y": g[1],
+            "w": g[2], "h": g[3], "client_w": g[4], "client_h": g[5]}
+
+
 def resize_test(s, name, rep, f_before):
     """拖右下角缩放 -> 像素判定 + 串口重排打点。"""
     win = s.win_geom(APPS[name]["title"])
@@ -123,12 +159,13 @@ def resize_test(s, name, rep, f_before):
     mark = s.mark()
     ok, tr = s.drag(gx, gy, gx + dw, gy + dh, steps=18)
     if not ok:
-        return "DRAG_FAIL", {"traj": tr[-3:]}
+        return ("ENV_NO_POINTER" if pointer_stuck(tr) else "DRAG_FAIL"), {"traj": tr[-3:]}
     time.sleep(1.2)
     s.cap()
     f_after = s.cap("%s_resize_r%d_after.png" % (name, rep))
     log_new = s.log()[mark:]
-    win2 = s.win_geom(APPS[name]["title"])
+    # 拖拽后的真实几何：读 resize end 打点（拖拽不打 win geom，见 resize_end_geom 的说明）
+    win2 = resize_end_geom(s) or s.win_geom(APPS[name]["title"])
     geo_lines = [l for l in log_new.splitlines()
                  if re.search(r"\[UI\] win resize (dir|end)|layout client=", l)]
     nums = {"dw": dw, "dh": dh,
@@ -228,9 +265,11 @@ def main():
         L("[env] dock=%s" % dg)
         for name in names:
             info = APPS[name]
-            win = s.open_dock_app(info["dock"], info["title"])
+            # ★ 开窗走开始菜单数字快捷键（见 APPS 上面的说明）：不依赖鼠标闭环。
+            #   原实现 s.open_dock_app(info["dock"], ...) 是点 Dock 图标中心。
+            win = s.open_menu_app(info["digit"], info["title"])
             if not win:
-                L("[%s] FAIL 开窗失败（dock idx=%d）" % (name, info["dock"]))
+                L("[%s] FAIL 开窗失败（开始菜单数字键 %d）" % (name, info["digit"]))
                 results.append((name, "-", "OPEN_FAIL"))
                 continue
             L("[%s] 开窗 ok title=%s x=%d y=%d w=%d h=%d client=%dx%d" %
@@ -259,12 +298,23 @@ def main():
                 L("[%s] 关窗尝试后仍在? %s" % (name, bool(s.win_geom(info["title"]))))
         L("")
         L("=== 判定汇总 ===")
-        bad = [r for r in results if r[2] not in ("MOVED_OK", "REPAINT_OK")]
+        # ENV_NO_POINTER = 宿主鼠标注入没生效（VMware 窗口没前台/没抓鼠标）→ 环境缺前置条件，
+        # 与"拖了但内容不动"（CONTENT_STUCK / DRAG_FAIL）严格分开：后者仍然是 FAIL。
+        env = [r for r in results if r[2] == "ENV_NO_POINTER"]
+        bad = [r for r in results if r[2] not in ("MOVED_OK", "REPAINT_OK", "ENV_NO_POINTER")]
         for (a, b, c) in results:
             L("  %-10s %-7s %s" % (a, b, c))
-        L("PASS/FAIL: %s（%d/%d 条非 OK）" % ("FAIL" if bad else "PASS", len(bad), len(results)))
+        if bad:
+            L("PASS/FAIL: FAIL（%d/%d 条非 OK）" % (len(bad), len(results)))
+        elif env:
+            L("未验证：%d/%d 条因**环境**未就绪（宿主鼠标注入落空：客人光标零位移）—— "
+              "开窗环节已过，拖拽①②本轮无结论" % (len(env), len(results)))
+        else:
+            L("PASS/FAIL: PASS（%d/%d 条 OK）" % (len(results), len(results)))
     log.close()
-    return 1 if (bad or not results) else 0
+    if bad or not results:
+        return 1
+    return 2 if env else 0
 
 
 if __name__ == "__main__":

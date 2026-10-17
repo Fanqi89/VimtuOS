@@ -900,13 +900,17 @@ int gfx64_wall_src_h64() { return g_wallh; }
 const char* gfx64_wall_src_desc64() { return g_wall_desc; }
 const char* gfx64_wall_last_geom64() { return g_wall_geom; }
 
-void gfx64_wall_invalidate64() {
-    g_surface_valid = false;
-    // 内容层模糊缓存与壁纸面绑定 → 一起失效
+void gfx64_blur_invalidate64() {
     for (int i = 0; i < GFX64_BLUR_SLOTS; i++) {
         if (g_blur_cache[i].used && g_blur_cache[i].buf) kfree_64(g_blur_cache[i].buf);
         g_blur_cache[i] = Gfx64BlurEnt{};
     }
+}
+
+void gfx64_wall_invalidate64() {
+    g_surface_valid = false;
+    // 内容层模糊缓存与壁纸面绑定 → 一起失效
+    gfx64_blur_invalidate64();
 }
 
 static const char* mode_name64(int m) {

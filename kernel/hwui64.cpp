@@ -695,6 +695,11 @@ int hwui64_show64(uint32_t ms) {
     dbg64_dec(elapsed_ms);
     dbg64_str(" skipped=");
     dbg64_dec((uint64_t)(skipped ? 1 : 0));
+    // ★ cjk=：这一页画字的那一刻，中文面是否已就绪（1 = 报告里的汉字是真字形；0 = 全是缺字方框）。
+    //   修「冷启动 5 秒缺字屏」之前这里是 0（报告页画在中文面装载点之前）；现在是 1。
+    //   tests/ahci64_test.py 直接断言 cjk=1 —— 回归到 0 就说明展示时机又被挪回去了。
+    dbg64_str(" cjk=");
+    dbg64_dec((uint64_t)font_cjk_ready64());
     dbg64_nl();
     dbg64_line_end64();
     return skipped;

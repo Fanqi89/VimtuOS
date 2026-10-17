@@ -235,6 +235,30 @@ def main():
 
         def shot(name):
             return mon.shot(os.path.join(outdir, name))
+        def settle(name, box, tries=8, gap=0.7):
+            """抓帧直到**画面静止**才算数：连续两帧在 box 内逐像素相同。
+
+            为什么需要它（本批 ④ 判据与事实不符，先修脚本 —— 判据强度一个字没动）：
+              开始菜单打开带 fade + translateY 动效（kernel/startmenu64.cpp 1356-1366），
+              而 TCG 下整屏重绘一次约 490 ms（串口实测 [UI] perf fps=2 redraw_us≈499000），
+              于是在动效结束前抓帧会拿到"中间态"：实测 6 个循环里有 5 帧彼此 max|d|=0，
+              另一帧与它们差 0.1035（1 级灰度）、基准帧差 0.9106 —— 这不是"重画不确定"，
+              而是"抓到了不同时刻的画面"。
+            返回 (帧元组, 静止所需的额外抓帧次数)；次数 = -1 表示**连续 tries 帧都不静止**，
+            那才是真不确定性，调用方按 FAIL 报（绝不放宽）。
+            """
+            prev = None
+            tup = None
+            for i in range(tries):
+                tup = shot(name if i == 0 else name.replace(".ppm", ".s%d.ppm" % i))
+                if tup is None:
+                    return None, -1
+                a = frame_arr(tup)
+                if prev is not None and max_diff(prev, a, box)[0] == 0:
+                    return tup, i
+                prev = a
+                time.sleep(gap)
+            return tup, -1
 
         def sm_box():
             m = re.search(r"\[START64\] geom x=(\d+) y=(\d+) w=(\d+) h=(\d+)", vm.log())
@@ -255,21 +279,35 @@ def main():
             x, y, w = int(m.group(3)), int(m.group(4)), int(m.group(5))
             return (x + 6, y + 4, min(w - 100, 320), 18)     # 标题文字那一条（避开右侧三按钮）
 
-        # ---- 基准帧 ----
+        # ---- 基准帧（等画面静止再抓；判据强度不变，见 settle 的注释）----
         mon.key("meta_l", 1.2)                               # Win：打开开始菜单
-        time.sleep(0.8)
-        base_sm = shot("sm_base.ppm")
+        time.sleep(0.6)
+        box_sm = sm_box()
+        if not box_sm:
+            L("FAIL 开始菜单几何缺失（[START64] geom 打点没出现）")
+            return 1
+        base_sm, st_sm = settle("sm_base.ppm", box_sm)
+        A_sm = frame_arr(base_sm) if base_sm is not None else None
         mon.key("esc", 0.8)
         mon.key("ctrl-shift-esc", 1.6)                       # 任务管理器（中文标题 + 大量中文标签）
-        time.sleep(1.2)
-        base_tm = shot("tm_base.ppm")
-        box_sm, box_tm = sm_box(), tm_title_box()
-        L("[base] 开始菜单区域=%s  任务管理器标题带=%s" % (box_sm, box_tm))
-        if base_sm is None or base_tm is None or not box_sm or not box_tm:
-            L("FAIL 基准帧/几何缺失（sm=%s tm=%s）" % (box_sm, box_tm))
+        time.sleep(0.8)
+        box_tm = tm_title_box()
+        if not box_tm:
+            L("FAIL 任务管理器标题带几何缺失（[UI] win geom app=4 打点没出现）")
             return 1
-        A_sm, A_tm = frame_arr(base_sm), frame_arr(base_tm)
+        base_tm, st_tm = settle("tm_base.ppm", box_tm)
+        A_tm = frame_arr(base_tm) if base_tm is not None else None
+        L("[base] 开始菜单区域=%s 静止帧=%d  任务管理器标题带=%s 静止帧=%d"
+          % (box_sm, st_sm, box_tm, st_tm))
+        if base_sm is None or base_tm is None:
+            L("FAIL 基准帧抓取失败")
+            return 1
         mon.key("esc", 1.0)                                  # 关任务管理器
+        if st_sm < 0 or st_tm < 0:
+            # 连续 8 帧都不一样 = 画面真的不静止（这才是④要抓的缺陷）—— 如实失败，不放宽
+            L("FAIL 基准帧画面不静止（settle 重试用尽）：开始菜单=%d 任务管理器=%d"
+              % (st_sm, st_tm))
+            ok = False
 
         for cyc in range(1, args.cycles + 1):
             # ---- 搅动 CJK 字形缓存（**只有这一条路会在运行期换出 LRU 槽**）----
@@ -284,13 +322,15 @@ def main():
                 mon.key("esc", 0.7)
             # ---- 采集（与基准同样的姿态与顺序）----
             mon.key("ctrl-shift-esc", 1.6)
-            time.sleep(1.0)
-            cur_tm = shot("tm_%d.ppm" % cyc)
+            time.sleep(0.8)
+            cur_tm, cst_tm = settle("tm_%d.ppm" % cyc, box_tm)
+            F_tm = frame_arr(cur_tm) if cur_tm is not None else None
             mon.key("esc", 1.0)
             sm_mark = len(vm.log())
             mon.key("meta_l", 1.2)
-            time.sleep(0.8)
-            cur_sm = shot("sm_%d.ppm" % cyc)
+            time.sleep(0.6)
+            cur_sm, cst_sm = settle("sm_%d.ppm" % cyc, box_sm)
+            F_sm = frame_arr(cur_sm) if cur_sm is not None else None
             menu_open = "[START64] open why=" in vm.log()[sm_mark:]
             mon.key("esc", 0.8)
             if cur_sm is None or cur_tm is None:
@@ -300,10 +340,15 @@ def main():
             if not menu_open:
                 L("[cycle %d] 开始菜单没能打开（按键丢了）—— 本轮不计入断言" % cyc)
                 continue
-            d_sm, f_sm = max_diff(A_sm, frame_arr(cur_sm), box_sm)
-            d_tm, f_tm = max_diff(A_tm, frame_arr(cur_tm), box_tm)
+            if cst_sm < 0 or cst_tm < 0:
+                L("[cycle %d] FAIL 画面不静止（settle 重试用尽）：开始菜单=%d 任务管理器=%d"
+                  % (cyc, cst_sm, cst_tm))
+                ok = False
+                continue
+            d_sm, f_sm = max_diff(A_sm, F_sm, box_sm)
+            d_tm, f_tm = max_diff(A_tm, F_tm, box_tm)
             L("[cycle %d] 开始菜单区域 max|d|=%3d 差异像素=%.4f | 任务管理器标题带 max|d|=%3d 差异像素=%.4f"
-              % (cyc, d_sm, f_sm, d_tm, f_tm))
+              " （静止帧 +%d/+%d）" % (cyc, d_sm, f_sm, d_tm, f_tm, cst_sm, cst_tm))
             if d_sm != 0 or d_tm != 0:
                 ok = False
         L("PASS/FAIL: %s（逐像素确定 = %s）" % ("PASS" if ok else "FAIL", ok))

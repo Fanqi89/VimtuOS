@@ -586,6 +586,7 @@ static int  g_hit_app[8];
 static int  g_hit_sel = 0;
 static int  g_hover = -1;                    // 当前悬停项（-1 = 无；用于高亮与验收打点）
 static uint32_t g_opened_t0 = 0;
+static int  g_anim_extra = 0;               // 打开动效结束后还要补画几帧终态（见 startmenu64_tick64）
 static int  g_geom_logged = false;
 static int  g_grid_logged = false;
 static int  g_hover_budget = 60;
@@ -994,6 +995,9 @@ void startmenu64_open64(const char* why) {
     sm_sync_apps64();
     if (g_view_gen != g_logged_gen) g_grid_logged = false;
     g_opened_t0 = ticks64();
+    // 动效结束后再补画 3 帧终态（dy=0 / al=255）：TCG 下整屏重绘 ~490ms 一帧，
+    // 靠"再多推 2 个 4ms tick"根本赶不上一帧，终态就永远落不了屏（见 tick 里的说明）。
+    g_anim_extra = 3;
     time_refresh64(true);
     net_state_refresh64();
     status_log64(false);          // 首次打开时把 声音/中英/未读角标 的状态与几何写进日志
@@ -1689,6 +1693,7 @@ int startmenu64_handle_mouse_press64(int mx, int my, int button) {
         else if (g_pm_anim == 1) { sys_reboot64(); }
         else { g_pm_open = false; locklogin64_lock64("start64"); }
         return 1;
+    }
     if (item >= 20 && item < 20 + 8) {           // 搜索结果
         const int i = item - 20;
         if (i < g_hits) {
@@ -1711,8 +1716,6 @@ int startmenu64_handle_mouse_press64(int mx, int my, int button) {
         sm_launch_view64(item - 10, "tile");
         return 1;
     }
-    return 1;
-}
     return 1;
 }
 
@@ -1787,17 +1790,17 @@ int startmenu64_handle_key64(uint8_t c) {
     if (c == 0x1B) {                             // ESC：先关电源二级菜单，再关开始菜单（两级退出）
         if (g_pm_open) {
             g_pm_open = false;
-    if (c == '\n' || c == '\r') {                // 回车 -> 启动第一个命中
-        if (g_query[0] && g_hits > 0) {
-            const int view = g_hit_app[g_hit_sel < g_hits ? g_hit_sel : 0];
-            startmenu64_close64("search-enter");
-            sm_launch_view64(view, "search-enter");
-        }
-        return 1;
-    }
+            // ★ 修（v0.4.6）：原来这里被打断 —— 一段"回车 -> 启动第一个命中"的代码被误插进
+            //   if (g_pm_open) 块内（它与 1811 处的那份完全重复），把本级的**打点**挤掉了：
+            //   ESC 第一级从此不再打 [START64] esc level=2 close=power-menu，验收恒 FAIL。
+            //   现在按"两级退出"的原语义恢复：这一级只收电源二级菜单，开始菜单留着。
+            dbg64_line_begin64();
+            dbg64_str("[START64] esc level=2 close=power-menu");
+            dbg64_nl();
+            dbg64_line_end64();
             return 1;
         }
-        startmenu64_close64("esc");
+        startmenu64_close64("esc");              // 第二级：连开始菜单一起关（打 close why=esc）
         return 1;
     }
     if (c == 0x08) {                             // 退格
@@ -1862,10 +1865,22 @@ void startmenu64_tick64() {
     }
     net_state_refresh64();
     status_log64(false);                 // 声音/中英/未读角标变化时打点（角标 = 红点/数字）
-    // 打开动效：动效期间每帧重画菜单
+    // 打开动效：动效期间每帧重画菜单；动效结束后**再补画 3 帧终态**。
+    // ★ 修（v0.4.6，两处都真）：原来只在 `elapsed < dur` 时标脏 ——
+    //   ① 终态那一帧（al=255 / dy=0）因此从来没被画过，菜单最后停在 el 略小于 dur 的那帧
+    //      （al≈253~254、dy=1px）。肉眼几乎看不出，但"同一画面重画逐像素一致"因此不成立：
+    //      实测 tests/textstress64_test.py 基准帧（登录后第一次开菜单）与循环帧整块差
+    //      1~2 级灰度、max|d|=216，而位置/布局完全一致（亮度突变点逐个相同）。
+    //   ② 先试过"dur 之后多推 2 个 tick(4ms)"—— 在 TCG 上整屏重绘 ~490ms 一帧，2 tick 根本
+    //      赶不上一帧，终态照样落不了屏。所以改成**按帧数**补：g_anim_extra 由打开处置 3，
+    //      每 tick 消耗一次，保证不管帧率多低，终态都真被画出来 3 次。
     const int dur = (int)theme64_dur64(THEME64_MS_NORMAL);
-    if (dur > 0 && (uint32_t)(int32_t)(ticks64() - g_opened_t0) < ms_to_ticks64((uint32_t)dur))
+    if (dur > 0 && (uint32_t)(int32_t)(ticks64() - g_opened_t0) < ms_to_ticks64((uint32_t)dur)) {
         dirty_menu64(0);
+    } else if (g_anim_extra > 0) {
+        g_anim_extra--;
+        dirty_menu64(0);
+    }
 }
 
 // ==================== 自检（纯逻辑）====================

@@ -801,8 +801,22 @@ def main():
         since_details = len(vm.log())
         hit_ok, det = aim_click(vm, mon, tx, ty, "card:%d" % idx_c, label="C: 卡片（details）")
         check("详细信息视图下再进 C:（精确移动 + 双击）", hit_ok, det)
-        vlog = fst.wait_for(serial, "view=details", 20, vm.proc)
-        mvd = re.findall(r"\[UI\] explorer nav path=/ items=(\d+) view=details", vlog)
+        # ★ 修（v0.4.6，判据与事实不符 -> 先修脚本，断言强度不降）：串口里这两行的**先后**是
+        #   先 `[UI] explorer view=details rows=2`（切视图），点进 C: 之后才写
+        #   `[UI] explorer nav path=/ items=19 view=details`。原来 wait_for 的 needle 是
+        #   "view=details"，命中前者就立刻返回快照，于是这里恒查不到后面那条 nav 行 -> 恒 FAIL
+        #   （实测串口：4379 行 vs 4529/4551 行）。改成**直接等 nav 行本身**出现。
+        vlog = ""
+        mvd = []
+        _t0 = time.time()
+        while time.time() - _t0 < 20:
+            vlog = fst.slog(serial)
+            mvd = re.findall(r"\[UI\] explorer nav path=/ items=(\d+) view=details", vlog)
+            if mvd:
+                break
+            if vm.proc is not None and vm.proc.poll() is not None:
+                break
+            time.sleep(0.4)
         check("详细信息视图的 nav 打点（view=details items=<n>）", bool(mvd), mvd[-1] if mvd else "（缺行）")
         # 同上：先等外壳把"详细信息视图"这一屏重画过，再截图
         settle_frames(vm, since_details)

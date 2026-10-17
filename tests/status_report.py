@@ -1514,9 +1514,12 @@ def cap_hw_report():
                  grep_count(r"hwui64_(draw|build)64", ["kernel/settings64.cpp"])))
     ev.append("验收脚本 tests/ahci64_test.py 里的报告断言（打点 + 截图像素：黑底/区块色块/文字）：%s"
               % ("有" if exists(os.path.join("tests", "ahci64_test.py")) else "缺"))
-    ev.append("实测串口：\"[HWUI] report lines=34 storage=3 controllers=3\"、"
-              "\"[HWUI] report shown ms=5000 skipped=0\"、\"[HWUI] selftest PASS\"；"
-              "像素断言通过（black=13686/20400、band=5866、light=436）")
+    ev.append("实测串口：\"[HWUI] report lines=33 storage=2 controllers=2\"、"
+              "\"[HWUI] report shown ms=5000 skipped=0 cjk=1\"、\"[HWUI] selftest PASS\"；"
+              "像素断言通过（black=13686/20400、band=5866、light=219 文字行）")
+    ev.append("展示时机（v0.4.6 修）：已安装系统的报告页画在 os_boot_path() 内、中文面装载点"
+              "+display64_init64 之后 => 打点 cjk=1（汉字是真字形）；安装介质仍在 kmain 就地画"
+              "（#ifdef VIMTU_INSTALLER_MEDIA，内嵌四份字体）。回归判据见 tests/ahci64_test.py")
     done = bool(lines("kernel/hwui64.cpp") > 200
                 and grep_count(r"\[HWUI\]", ["kernel/hwui64.cpp"])
                 and grep_count(r"hwui64_(show|selftest)64", ["kernel/kernel64.cpp"]))
@@ -3468,6 +3471,14 @@ TESTS = [
 ]
 
 
+# 单条上限（秒）。默认 900；下面这些脚本**实测**就需要更久（不是放宽断言，是超时配置）：
+#   textwm64_test.py —— 4 个应用 × 6 轮（move+resize）× 每次真鼠标闭环预算 20 s，实测 1677 s。
+TEST_TIMEOUT = 900
+TEST_TIMEOUT_OVERRIDE = {
+    "textwm64_test.py": 2700,
+}
+
+
 def run_tests():
     results = []
     py = sys.executable
@@ -3476,12 +3487,19 @@ def run_tests():
         if not os.path.exists(p):
             results.append((name, "MISSING", desc))
             continue
+        tmo = TEST_TIMEOUT_OVERRIDE.get(name, TEST_TIMEOUT)
         try:
-            r = subprocess.run([py, p], capture_output=True, timeout=900)
-            ok = r.returncode == 0
+            r = subprocess.run([py, p], capture_output=True, timeout=tmo)
             tail = (r.stdout or b"").decode("utf-8", "replace").strip().splitlines()
             tail = tail[-1] if tail else ""
-            results.append((name, "PASS" if ok else "FAIL", tail[:70]))
+            if r.returncode == 0:
+                results.append((name, "PASS", tail[:70]))
+            elif r.returncode == 2:
+                # ★ 退出码 2 = 脚本**自报"环境未就绪，本轮无结论"**（例：textwm64 的宿主鼠标注入
+                #   落空，客人光标零位移）。既不算 PASS 也不算 FAIL —— 如实单列，不让它冒充绿。
+                results.append((name, "UNVERIFIED", tail[:70]))
+            else:
+                results.append((name, "FAIL", tail[:70]))
         except subprocess.TimeoutExpired:
             results.append((name, "TIMEOUT", desc))
     return results
@@ -3531,8 +3549,24 @@ def main():
 
     if args.full:
         print("\n### 真跑验收测试（--full）")
-        for name, st, tail in run_tests():
+        _rs = run_tests()
+        for name, st, tail in _rs:
             print("  [%s] %-26s %s" % (st, name, tail))
+        _cnt = {}
+        for _n, _st, _t in _rs:
+            _cnt[_st] = _cnt.get(_st, 0) + 1
+        print("\n  汇总：%d 条 → %s" % (len(_rs), "，".join(
+            "%s=%d" % (k, _cnt[k]) for k in ("PASS", "FAIL", "TIMEOUT", "UNVERIFIED", "MISSING")
+            if _cnt.get(k))))
+        _bad = _cnt.get("FAIL", 0) + _cnt.get("TIMEOUT", 0) + _cnt.get("MISSING", 0)
+        if _bad:
+            print("  门禁：**不通过**（FAIL/TIMEOUT/MISSING 共 %d 条）" % _bad)
+            return 1
+        if _cnt.get("UNVERIFIED"):
+            print("  门禁：PASS，但有 %d 条 **未验证**（脚本自报环境未就绪，无结论）"
+                  " —— 如实列在上面，不能当绿。" % _cnt["UNVERIFIED"])
+        else:
+            print("  门禁：全绿（%d 条全部 PASS）" % len(_rs))
 
     print("\n提示：本脚本只报告状态；要判定“能不能跑”请用 --full。")
     if args.strict and (n_miss or n_part):

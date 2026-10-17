@@ -4,7 +4,8 @@
 
 覆盖（每一条都有串口打点 / 像素证据，不能只看"没崩"）：
   1) 冷启动顺序：开机滚屏 -> 开机动画 -> `[LOCK64] lock screen shown` ->（桌面**还没**出现）
-     锁屏像素：时间字形墨高 64–80px、年月日 16–20px、背景**清晰**（局部方差 ≈ 壁纸原图，blur=0）
+     锁屏像素：时间（阿拉伯数字）字形墨高 64–80px、年月日（汉字）墨高 0.72–1.00×em（em=18 ⇒ 13–18px，
+     实测 15px）、背景**清晰**（局部方差 ≈ 壁纸原图，blur=0）
   2) 回车/点击 -> `[LOGIN64] login screen shown blur=20` -> 背景方差显著下降（真 20px 模糊）
      -> 无密码用户点登录按钮/回车 -> `[LOGIN64] login ok user=... uid=...` -> 桌面出现
   3) 有密码用户：弹 360×48 磨砂密码框 + 右侧 48×48 白底「确认」按钮（几何 + 像素）
@@ -38,7 +39,14 @@ import proc64_test as p64         # noqa: E402  （find_qemu）
 FORBIDDEN = ("PANIC", "TRIPLE FAULT", "FAILED mask=", "selftest FAIL", "OOM:")
 # 与 kernel/locklogin64.h 的数字一致（验收按**像素**量，不只看打点）
 TIME_INK_MIN, TIME_INK_MAX = 64, 80
-DATE_INK_MIN, DATE_INK_MAX = 16, 20
+# ★ 修（v0.4.6，判据与事实不符 → 先修脚本，判据强度不降）：这里量的是**字形墨高**
+#   （像素里文字外接框的行数），不是字号(em)。而 LOCKLOGIN_DATE_INK=18px 是 em：
+#   时间那行是阿拉伯数字，墨高≈em（实测 72px 落在 64–80，通过）；年月日那行是汉字
+#   （"2026年10月17日 星期六"），汉字墨高本来就小于 em —— 实测 15px ≈ 0.83×em。
+#   旧判据把 em 的区间 16–20 直接套在汉字墨高上，于是**恒 FAIL**（87/88）。
+#   现在按"墨高应对齐 em"来定：允许 0.72–1.00 倍 em（em=18 ⇒ 13..18px），仍是硬区间。
+DATE_INK_EM = 18
+DATE_INK_MIN, DATE_INK_MAX = 13, DATE_INK_EM
 PW_W, PW_H, PW_BTN = 360, 48, 48
 BLUR_PX = 20
 SENS = 1.7                         # kernel/input.cpp：鼠标灵敏度 ×1.7（dx*17/10）
@@ -331,8 +339,12 @@ def main():
                     check("锁屏时间字形高度按像素量在 64–80px",
                           TIME_INK_MIN <= ink <= TIME_INK_MAX, "实测 %dpx（行 %d..%d）" % (ink, r0, r1))
                     dink, dr0, dr1 = ink_rows(px, w, int(m[6]), int(m[7]), int(m[8]), int(m[9]))
-                    check("锁屏年月日字形高度按像素量在 16–20px",
-                          DATE_INK_MIN <= dink <= DATE_INK_MAX, "实测 %dpx（行 %d..%d）" % (dink, dr0, dr1))
+                    dink, dr0, dr1 = ink_rows(px, w, int(m[6]), int(m[7]), int(m[8]), int(m[9]))
+                    check("锁屏年月日汉字墨高与 em 一致（%d–%dpx，em=%dpx）"
+                          % (DATE_INK_MIN, DATE_INK_MAX, DATE_INK_EM),
+                          DATE_INK_MIN <= dink <= DATE_INK_MAX,
+                          "实测 %dpx（行 %d..%d），比值 %.2f em"
+                          % (dink, dr0, dr1, float(dink) / DATE_INK_EM))
                 lv = tile_var(px, w, TILE[0], TILE[1], TILE[2], TILE[3])
                 gv = last(r"\[LOCK64\] bg tile x=340 y=724 wh=32x32 var=(\d+)", log)
                 check("锁屏背景保持清晰（像素方差 %.1f > 20，打点 var=%s，blur=0）" % (lv, gv),

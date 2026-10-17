@@ -457,6 +457,9 @@ Window* gui64_create_window(const char* title, int x, int y, int w, int h,
     z_push_front(win);
     gui64_set_active(win);
     dirty_add(win->x, win->y, win->w, win->h);
+    // ★ 玻璃/亚克力模糊缓存只按矩形做键、不校验底层内容 —— 窗口出现后必须清，
+    //   否则菜单/面板会把"窗口还不在时"的模糊结果贴上来（textstress64 实测的 1 级差来源）。
+    gfx64_blur_invalidate64();
     // ★ P5：窗口刚建出来 = "程序加载中" —— 光标移到它上面会变成转圈（[INPUT64] cursor shape=wait）
     g_load_w = win;
     g_load_done = false;         // ★ P5：新窗口还没画完第一帧 -> 光标移到它上面是转圈
@@ -472,7 +475,16 @@ void gui64_destroy_window(Window* w) {
     int i = win_index(w);
     if (i < 0 || !g_used[i]) return;
     const int w_app = (int)w->app_id;         // 销毁后 app_id 会留在槽里，但语义上属于"已关"
-    dirty_add(w->x, w->y, w->w, w->h);
+    // ★ 修（v0.4.6）：旧位置的脏区要**连阴影一起**擦。原来只脏 (x,y,w,h)，远层阴影
+    //   （blur/ dy 见 THEME64_SH_F_*）露在窗口外那一圈擦不到 —— 关窗后窗框没了、阴影留在
+    //   壁纸上（与 P7a-4 的拖动残影同一类）。口径与 render()/拖动结束处一致。
+    //   实测证据：tests/textstress64_test.py 的"菜单外壁纸右下"区域 base 与循环帧 max=34、
+    //   差异像素 13.5%，而同一帧干净区域（左上）max=0。
+    dirty_add(w->x - (THEME64_SH_F_BLUR * 2 + 4), w->y - (THEME64_SH_F_BLUR * 2 + 4),
+              w->w + (THEME64_SH_F_BLUR * 2 + 4) * 2,
+              w->h + (THEME64_SH_F_BLUR * 2 + 4) * 2 + THEME64_SH_F_DY);
+    // 原窗口矩形也保留（阴影口径已覆盖，这里不重复加）
+    gfx64_blur_invalidate64();                // 同上：窗口消失后，缓存里那份模糊已经过期
     if (w->on_close) w->on_close(w);          // 应用在这里释放 userdata（外壳绝不代劳）
     z_unlink(w);
     w->next = nullptr;
@@ -2795,6 +2807,8 @@ static void handle_mouse(void) {
             g_drag = DRAG_NONE;
             g_resize_dir = 0;
             g_drag_w = nullptr;
+            // 拖拽/缩放结束：窗口几何定了，模糊缓存里那份（拖动中的）结果一律作废
+            gfx64_blur_invalidate64();
         }
     }
     // ★ P5：动效推进（Dock 窗口列表 / 最小化飞行 / 恢复弹出）+ 光标形状（按命中区域切换）

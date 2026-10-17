@@ -753,6 +753,11 @@ void font_select(int face) {
 
 int font_face_count() { return FONT_FACE_COUNT; }
 
+// ★ 只读：中文面此刻能否画汉字（见 font.h）。缺字方框的唯一成因就是它为 false 且非内嵌。
+int font_cjk_ready64() {
+    return g_face[FONT_FACE_CJK].font_ok ? 1 : 0;
+}
+
 // ★ 只读：当前面（console64 的引导日志画完之后把面恢复回去；不改渲染语义）
 int font_current_face() {
     for (int f = 0; f < FONT_FACE_COUNT; f++) if (cur == &g_face[f]) return f;

@@ -404,7 +404,16 @@ static i64 mode_selftest(u8* buf) {
 
 /* ==================== 主逻辑（argv 由 _start 传进来）==================== */
 int snd_main(long argc, char** argv) {                    /* 外部链接：_start 的汇编直接 call 它 */
-    const i64 va = lx6(9 /*mmap*/, 0, SND_BUF_BYTES, 3 /*READ|WRITE*/, 0, 0, 0);
+    // ★ 修（v0.4.6）：这里原来传的是 flags=0 / fd=0 —— 内核的 anon 判定是
+    //   `(flags & MAP_ANONYMOUS) || fd < 0`（kernel/syscall64.cpp 的 lx64_mmap64），
+    //   所以 flags=0 **不是**匿名映射，它被当成"把 fd 0 当文件映射进来"。fd 0 在进程里
+    //   打开着就侥幸成功（读不出内容 → 全 0 页），没打开就 -EBADF/-ENOMEM →
+    //   走到下面这个 no-mem 分支立刻退出。本轮全量回归实测就是这个：
+    //   `SOUNDER reject name=unknown reason=no-mem rc=-2`，紧接着 18 条断言连锁失败
+    //   （[SND64] play 行数=0、sounder list 0 行、录音 0 B……）。
+    //   正确写法 = Linux 的 MAP_PRIVATE(0x2) | MAP_ANONYMOUS(0x20) + fd=-1。
+    const i64 va = lx6(9 /*mmap*/, 0, SND_BUF_BYTES, 3 /*READ|WRITE*/,
+                       0x2 /*MAP_PRIVATE*/ | 0x20 /*MAP_ANONYMOUS*/, -1 /*fd*/, 0 /*off*/);
     if (va < 0) {
         print_reject("unknown", "no-mem", SND_E_EFAULT);
         return 1;

@@ -332,6 +332,13 @@ def main():
     check("启动期真的显示了报告页（[HWUI] report shown ms=… skipped=0|1）",
           re.search(r"\[HWUI\] report shown ms=\d+ skipped=[01]", log) is not None,
           (re.search(r"\[HWUI\] report shown[^\r\n]*", log).group(0) if "[HWUI] report shown" in log else "缺"))
+    # ★ 冷启动缺字屏的**回归判据**（本批修）：报告页里全是汉字标题/字段名，画的那一刻中文面
+    #   没就绪就会全部走 font_draw_missing_box（方框）。修之前这一页画在 os_boot_path 的中文面
+    #   装载点之前 ⇒ cjk=0；现在画在装载点 + display64_init64 之后 ⇒ cjk=1。
+    #   这条断言比"看截图里有没有方框"硬：它读的是绘制瞬间的真实状态。
+    check("报告页画字时中文面已就绪（[HWUI] report shown … cjk=1，否则整页汉字是方框）",
+          re.search(r"\[HWUI\] report shown ms=\d+ skipped=[01] cjk=1", log) is not None,
+          (re.search(r"\[HWUI\] report shown[^\r\n]*", log).group(0) if "[HWUI] report shown" in log else "缺"))
     check("报告自检 PASS（[HWUI] selftest PASS）", "[HWUI] selftest PASS" in log)
     check("报告含存储区块的控制器统计（controllers = PATA+AHCI+NVMe）",
           re.search(r"\[HWUI\] report lines=\d+ storage=\d+ controllers=[1-9]\d*", log) is not None)
