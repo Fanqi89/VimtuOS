@@ -679,7 +679,14 @@ static int ar_parse64(const uint8_t* buf, int n, int* ok) {
     if (ok) *ok = 1;
     ar_seed64();
     int i = 0, lines = 0;
-    char line[APPREG64_FILE_MAX];
+    // ★ 修（v0.4.6）：这里原来是 `char line[APPREG64_FILE_MAX]`（= 8192 B 的**栈帧**）。
+    //   本函数不止在启动期（任务 0 的 16 KB 内核栈）被调用 —— `app64_registry_on_close64`
+    //   是挂在 **close 系统调用**上的，而 syscall 入口的栈只有 4 KB（task64.cpp 的
+    //   t->syscall_kstack = stack_top - 0x1000）⇒ 一旦 vpkg 关掉 /etc/apps.json 走到这里就是
+    //   确定的栈溢出，会静默踩坏相邻内核数据（不是 panic，更难查）。改成模块级静态缓冲。
+    //   安全性：注册表读写本来就不是可重入的（g_apps64 是全局表），调用点只有"启动期一次"
+    //   与"写者 close 自己的上下文"，不会并发进来。
+    static char line[APPREG64_FILE_MAX];
     while (i < n) {
         const int used = ar_line64((const char*)buf + i, n - i, line, (int)sizeof(line));
         i += used;

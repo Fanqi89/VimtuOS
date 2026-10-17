@@ -1790,6 +1790,9 @@ int startmenu64_handle_key64(uint8_t c) {
     if (c == 0x1B) {                             // ESC：先关电源二级菜单，再关开始菜单（两级退出）
         if (g_pm_open) {
             g_pm_open = false;
+            // ★ 连带修：`dirty_pm64()` 当时也一起被删了 —— 电源二级菜单收起后不重绘，
+            //   菜单体上会留一块电源菜单的残影（本批验收没抓到，因为脚本只看打点）。
+            dirty_pm64();
             // ★ 修（v0.4.6）：原来这里被打断 —— 一段"回车 -> 启动第一个命中"的代码被误插进
             //   if (g_pm_open) 块内（它与 1811 处的那份完全重复），把本级的**打点**挤掉了：
             //   ESC 第一级从此不再打 [START64] esc level=2 close=power-menu，验收恒 FAIL。
