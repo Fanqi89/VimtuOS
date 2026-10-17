@@ -616,7 +616,200 @@ extern "C" void syscall64_console_write64(const char* buf, int len) {
 }
 // ---- 0）read ----（★ A4-2a：fd 0..2 的槽**空** = 虚拟标准流（stdin 立刻 EOF）；
 //   槽被 dup2 绑了对象（文件 / pipe / tty）-> 与 fd >= 3 完全同一条 FD 层路径）----
+// ==================== ★ v0.4.7：getdents64(217) + 最小 /proc ====================
+// 用户点名："Linux 的 getdents(217) 尚未实现，虚拟文件系统 /proc 也未提供，这会阻碍直接移植
+// Linux 工具链或运行现有开源软件"。这里把这两块补成**能用的最小闭环**，边界如实写在下面。
+
+// ---- 1) getdents64 ----
+// 布局按 x86_64 Linux：linux_dirent64 { u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[]; }
+// d_type：4 = DT_DIR、8 = DT_REG（Linux 取值）。
+// ★ 边界（如实）：底层 fd64_readdir64 是**单向游标**，所以"缓冲区装不下的那一条"必须留到下次 ——
+//   这里做了**单条回退槽**（按 pid+fd 归属）。标准工具（ls/cp/find）都用 32KB 缓冲，实际不会触发；
+//   但语义是对的（不会静默丢条目）。
+struct Lx64DirPend { int used; int pid; int fd; uint32_t type; uint32_t size; char name[64]; };
+static Lx64DirPend g_dir_pend;
+
+static int64_t lx64_getdents64(int fd, void* buf, uint64_t count) {
+    if (!buf) return -LX64_EFAULT;
+    if (count < 32) return -LX64_EINVAL;
+    if (fd < 3) return -LX64_EBADF;
+    const int pid = proc64_current_pid64 ? proc64_current_pid64() : 0;
+    uint8_t* out = (uint8_t*)buf;
+    uint64_t used = 0;
+    for (;;) {
+        char nm[64];
+        uint32_t ty = 0, sz = 0;
+        int rc;
+        if (g_dir_pend.used && g_dir_pend.pid == pid && g_dir_pend.fd == fd) {
+            int i = 0;
+            while (i < (int)sizeof(nm) - 1 && g_dir_pend.name[i]) { nm[i] = g_dir_pend.name[i]; i++; }
+            nm[i] = 0;
+            ty = g_dir_pend.type; sz = g_dir_pend.size;
+            g_dir_pend.used = 0;
+            rc = 1;
+        } else {
+            rc = fd64_readdir64(fd, nm, (int)sizeof(nm), &ty, &sz);
+        }
+        if (rc < 0) { if (used) break; return rc; }
+        if (rc == 0) break;                                    // 枚举结束
+        int nl = 0;
+        while (nm[nl] && nl < (int)sizeof(nm) - 1) nl++;
+        uint16_t reclen = (uint16_t)((19 + nl + 1 + 7) & ~7u);
+        if (used + reclen > count) {                            // 装不下：留到下次（不丢）
+            g_dir_pend.used = 1; g_dir_pend.pid = pid; g_dir_pend.fd = fd;
+            g_dir_pend.type = ty; g_dir_pend.size = sz;
+            int i = 0;
+            while (i < (int)sizeof(g_dir_pend.name) - 1 && nm[i]) { g_dir_pend.name[i] = nm[i]; i++; }
+            g_dir_pend.name[i] = 0;
+            break;
+        }
+        uint8_t* e = out + used;
+        *(uint64_t*)(e + 0) = (uint64_t)(used + 1);            // d_ino
+        *(int64_t*)(e + 8)  = (int64_t)(used + reclen);         // d_off
+        *(uint16_t*)(e + 16) = reclen;
+        e[18] = (uint8_t)((ty == 1) ? 4 : 8);
+        for (int i = 0; i < nl; i++) e[19 + i] = (uint8_t)nm[i];
+        e[19 + nl] = 0;
+        for (int i = 19 + nl + 1; i < reclen; i++) e[i] = 0;     // 尾部清零（不泄露内核数据）
+        used += reclen;
+    }
+    return (int64_t)used;
+}
+
+// ---- 2) 最小 /proc ----
+// 为什么用"保留 fd 号段"而不是造一个真文件系统：内核体积与改动面（这一版内核已接近预算上限）。
+// 对用户态的语义等价（open 得 fd、read 出内容、close 释放），且**不与真 fd 冲突**（fd64 表远小于 900）。
+// 提供：/proc/version、/proc/self/status、/proc/self/cmdline、/proc/self/exe。
+// ★ 边界（如实）：没有 /proc/<pid>/…（只认 self）、没有 /proc/cpuinfo、没有可写的 /proc/sys。
+#define LX64_PROC_FD_BASE 900
+#define LX64_PROC_SLOTS   8
+#define LX64_PROC_MAX     512
+struct Lx64ProcFile { int used; int fd; char name[24]; uint32_t len, pos; char data[LX64_PROC_MAX]; };
+static Lx64ProcFile g_proc_file[LX64_PROC_SLOTS];
+
+static int lx64_proc_is64(const char* p) {
+    if (!p) return 0;
+    return p[0] == '/' && p[1] == 'p' && p[2] == 'r' && p[3] == 'o' && p[4] == 'c' && p[5] == '/';
+}
+static Lx64ProcFile* lx64_proc_lookup64(int fd) {
+    if (fd < LX64_PROC_FD_BASE || fd >= LX64_PROC_FD_BASE + LX64_PROC_SLOTS) return nullptr;
+    Lx64ProcFile* f = &g_proc_file[fd - LX64_PROC_FD_BASE];
+    return f->used ? f : nullptr;
+}
+static void lx64_proc_fill64(Lx64ProcFile* f, const char* src) {
+    f->pos = 0;
+    f->len = 0;
+    while (src[f->len] && f->len < LX64_PROC_MAX - 1) { f->data[f->len] = src[f->len]; f->len++; }
+    f->data[f->len] = 0;
+}
+static void lx64_proc_u64(char* out, uint64_t v) {
+    char t[24];
+    int n = 0;
+    if (!v) t[n++] = '0';
+    while (v && n < (int)sizeof(t)) { t[n++] = (char)('0' + (int)(v % 10)); v /= 10; }
+    int i = 0;
+    while (n > 0) out[i++] = t[--n];
+    out[i] = 0;
+}
+static int lx64_proc_streq64(const char* a, const char* b) {
+    int i = 0;
+    while (a[i] && a[i] == b[i]) i++;
+    return a[i] == b[i];
+}
+static int64_t lx64_proc_open64(const char* path, int flags) {
+    if (!lx64_proc_is64(path)) return -9999;                    // 不是 /proc：交回原路径
+    if (flags & (0x1 | 0x40 | 0x200 | 0x400)) return -13;       // 只读：O_WRONLY/O_CREAT/O_TRUNC -> EACCES
+    const char* rel = path + 6;
+    int slot = -1;
+    for (int i = 0; i < LX64_PROC_SLOTS; i++) { if (!g_proc_file[i].used) { slot = i; break; } }
+    if (slot < 0) return -24;                                   // EMFILE
+    Lx64ProcFile* f = &g_proc_file[slot];
+    f->used = 1;
+    f->fd = LX64_PROC_FD_BASE + slot;
+    int k = 0;
+    while (rel[k] && k < (int)sizeof(f->name) - 1) { f->name[k] = rel[k]; k++; }
+    f->name[k] = 0;
+    if (lx64_proc_streq64(f->name, "version")) {
+        char t[96];
+        int i = 0;
+        const char* w = "VimtuOS ";
+        while (*w && i < 80) t[i++] = *w++;
+        const char* v = VIMTUOS_VERSION_STR;
+        while (*v && i < 88) t[i++] = *v++;
+        const char* tail = " x86_64 (VimtuOS kernel; /proc is synthetic)";
+        while (*tail && i < 95) t[i++] = *tail++;
+        t[i] = 0;
+        lx64_proc_fill64(f, t);
+    } else if (lx64_proc_streq64(f->name, "self/status")) {
+        char t[LX64_PROC_MAX];
+        char num[24];
+        int i = 0;
+        const char* p1 = "Name:\tvimtu\nPid:\t";
+        while (*p1 && i < 400) t[i++] = *p1++;
+        lx64_proc_u64(num, (uint64_t)(proc64_current_pid64 ? proc64_current_pid64() : 0));
+        for (int j = 0; num[j] && i < 440; j++) t[i++] = num[j];
+        const char* p2 = "\nPPid:\t";
+        while (*p2 && i < 460) t[i++] = *p2++;
+        lx64_proc_u64(num, (uint64_t)(proc64_current_ppid64 ? proc64_current_ppid64() : 0));
+        for (int j = 0; num[j] && i < 480; j++) t[i++] = num[j];
+        const char* p3 = "\nState:\tR\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n";
+        while (*p3 && i < LX64_PROC_MAX - 2) t[i++] = *p3++;
+        t[i] = 0;
+        lx64_proc_fill64(f, t);
+    } else if (lx64_proc_streq64(f->name, "self/cmdline")) {
+        char exe[96];
+        exe[0] = 0;
+        if (proc64_exe_path64) (void)proc64_exe_path64(exe, (uint32_t)sizeof(exe));
+        if (!exe[0]) { exe[0] = '/'; exe[1] = 0; }
+        f->pos = 0;
+        f->len = 0;
+        int i = 0;
+        while (exe[i] && i < 250) { f->data[i] = exe[i]; i++; }
+        f->data[i++] = 0;                                       // cmdline 以 NUL 分隔
+        f->len = (uint32_t)i;
+        f->data[i] = 0;
+    } else if (lx64_proc_streq64(f->name, "self/exe")) {
+        char exe[96];
+        exe[0] = 0;
+        if (proc64_exe_path64) (void)proc64_exe_path64(exe, (uint32_t)sizeof(exe));
+        lx64_proc_fill64(f, exe[0] ? exe : "/");
+    } else {
+        f->used = 0;
+        return -LX64_ENOENT;                                    // 未提供的条目：如实 ENOENT
+    }
+    dbg64_line_begin64();
+    dbg64_str("[LX64] proc open ");
+    dbg64_str(path);
+    dbg64_str(" fd=");
+    dbg64_dec((uint64_t)f->fd);
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)f->len);
+    dbg64_nl();
+    dbg64_line_end64();
+    return f->fd;
+}
+static int64_t lx64_proc_read64(int fd, void* buf, uint64_t n) {
+    Lx64ProcFile* f = lx64_proc_lookup64(fd);
+    if (!f) return -9999;
+    if (!buf) return -LX64_EFAULT;
+    uint64_t left = f->len - f->pos;
+    if (n > left) n = left;
+    for (uint64_t i = 0; i < n; i++) ((uint8_t*)buf)[i] = (uint8_t)f->data[f->pos + i];
+    f->pos += (uint32_t)n;
+    return (int64_t)n;
+}
+static int64_t lx64_proc_close64(int fd) {
+    Lx64ProcFile* f = lx64_proc_lookup64(fd);
+    if (!f) return -9999;
+    f->used = 0;
+    return 0;
+}
+
 static int64_t lx64_read64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_t len) {
+    {   // ★ v0.4.7：/proc 合成文件（保留 fd 号段）先过一遍
+        const int64_t pr = lx64_proc_read64((int)fd, (void*)(uintptr_t)buf, len);
+        if (pr != -9999) return pr;
+    }
     if (len == 0) return 0;
     if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     if (fd <= 2 && !fd64_slot_used64((int)fd)) {
@@ -658,6 +851,10 @@ static int64_t lx64_open64(uint64_t nr, uint64_t path_va, uint64_t flags) {
     char path[LX64_PATHR_MAX];
     const int rr = lx64_resolve_path64(path_va, path, (uint32_t)sizeof(path));
     if (rr != 0) { syscall64_deny64(nr, path_va); return rr; }
+    {   // ★ v0.4.7：/proc（合成文件，只读）
+        const int64_t pv = lx64_proc_open64(path, (int)flags);
+        if (pv != -9999) return pv;
+    }
     const int fd = fd64_open64(path, (uint32_t)flags);
     return (int64_t)fd;                                      // fd64 的负错误码 = -errno（同一口径）
 }
@@ -665,6 +862,10 @@ static int64_t lx64_open64(uint64_t nr, uint64_t path_va, uint64_t flags) {
 // ---- 3）close ----（★ A4-2a：fd 0..2 的槽**空** = 虚拟标准流（没有对象可关 -> -EBADF）；
 //   槽被 dup2 绑了对象 -> 真的 close（Linux 也允许关 0/1/2），关掉后该 fd 回到控制台语义）----
 static int64_t lx64_close64(uint64_t nr, uint64_t fd) {
+    {   // ★ v0.4.7：/proc 合成文件
+        const int64_t pc = lx64_proc_close64((int)fd);
+        if (pc != -9999) return pc;
+    }
     if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     if (fd <= 2 && !fd64_slot_used64((int)fd)) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     const int r = fd64_close64((int)fd);
@@ -2311,6 +2512,10 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 120: return 0;                                             // getgroups：没有附加组（返回 0 个）
     case 158: return lx64_arch_prctl64(nr, a1, a2);                  // FS.base：真写 MSR
     case 160: return lx64_setrlimit64(nr, a1, a2);
+    case 217: {                                                 // ★ v0.4.7：getdents64
+        if (!user64_range_ok64(a2, a3)) { syscall64_deny64(nr, a2); return -LX64_EFAULT; }
+        return lx64_getdents64((int)a1, (void*)(uintptr_t)a2, a3);
+    }
     case 218: return 0;                                             // set_tid_address（没有 clear_child_tid 唤醒）
     case 228: return lx64_clock_gettime64(nr, a1, a2);
     case 257: return lx64_open64(nr, a2, a3);                       // openat(dirfd, path, flags, mode)

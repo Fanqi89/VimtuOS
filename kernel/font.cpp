@@ -1171,9 +1171,22 @@ int font_text_width(const char* s) {
     return w;
 }
 
-// 抗锯齿混合：fg 按 alpha(0-255) 与后备缓冲背景混合
+// ★ v0.4.7 终端"三无"：g_mono=1 时这里**不再混合**，掩码覆盖率过阈值就画纯前景色。
+//   阈值 128/255（约 50% 覆盖）：与经典点阵字体的"该点亮/该点灭"同一口径。
+//   这样终端屏幕上只有两种颜色（前景/背景），不会出现任何中间灰 —— 正是"无抗锯齿"的判据。
+static int g_mono_noaa = 0;
+#define FONT64_MONO_THRESHOLD 128
+
+void font_set_mono64(int on) { g_mono_noaa = on ? 1 : 0; }
+int  font_mono64() { return g_mono_noaa; }
+
+// 抗锯齿混合：fg 按 alpha(0-255) 与后备缓冲背景混合（g_mono_noaa=1 时退化为纯色阈值）
 static inline void draw_blend(int x, int y, uint32_t fg, int a) {
     if (a <= 0) return;
+    if (g_mono_noaa) {                       // 终端：非黑即白（无 AA / 无次像素）
+        if (a >= FONT64_MONO_THRESHOLD) fb_putpixel(x, y, fg);
+        return;
+    }
     if (a >= 255) { fb_putpixel(x, y, fg); return; }
     uint32_t bg = fb_get_pixel(x, y);
     uint8_t fr = (fg >> 16) & 0xFF, fgc = (fg >> 8) & 0xFF, fgb = fg & 0xFF;
@@ -1182,6 +1195,18 @@ static inline void draw_blend(int x, int y, uint32_t fg, int a) {
     uint8_t g = (uint8_t)((fgc * a + bgc * (255 - a)) / 255);
     uint8_t b = (uint8_t)((fgb * a + bgb * (255 - a)) / 255);
     fb_putpixel(x, y, 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b);
+}
+
+// 单元格高度：取当前面 (ascender - descender) 的实测像素高度（不裁切的唯一正确做法）。
+int font_cell_height64() {
+    const FontFace* fc = cur;
+    if (!fc || !fc->font_ok || !fc->unitsPerEm || !fc->offHhea) return g_em_px;
+    const int16_t asc = be16s(fc->F + fc->offHhea + 4);
+    const int16_t dsc = be16s(fc->F + fc->offHhea + 6);
+    int h = (int)(((int32_t)(asc - dsc) * fc->glyFix) >> FONT64_GEOM_SH);
+    if (h < g_em_px) h = g_em_px;            // 度量偏小的字体：至少 em 高
+    if (h > FONT_PX - 2) h = FONT_PX - 2;    // 光栅化缓冲上限（绝不能越界）
+    return h;
 }
 
 bool font_draw_glyph(int x, int y, char c, uint32_t fg) {

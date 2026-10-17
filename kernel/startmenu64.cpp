@@ -1466,7 +1466,10 @@ static void draw_menu64() {
         p2ui_fill_mixed64(sx, sy, 96, 34, THEME64_R_BUTTON, THEME64_R_BUTTON, t->dock_bg,
                           (t->dark ? 200 : 220) + (hov ? 20 : 0));
         p2ui_stroke_mixed64(sx, sy, 96, 34, THEME64_R_BUTTON, THEME64_R_BUTTON, 0xFFFFFFu, THEME64_A_EDGE);
-        p2ui_icon64(P2UI_ICON_GEAR, sx + 8, sy + 8, 18, p2ui_icon_color64(t), 255);
+        // ★ v0.4.7（用户报"有像素齿轮"）：这里原来用 p2ui_icon64 的**程序化齿轮**（逐像素画齿），
+        //   小尺寸下锯齿明显。改成优先用图标包里的真 PNG（icons64 的 gear@24），拿不到才退回程序化。
+        if (icons64_draw_kind64(ICON64_K_GEAR, sx + 8, sy + 8, 18, p2ui_icon_color64(t), 255) != 0)
+            p2ui_icon64(P2UI_ICON_GEAR, sx + 8, sy + 8, 18, p2ui_icon_color64(t), 255);
         const int lh = p2ui_line_h64();
         p2ui_text64(sx + 32, sy + (34 - lh) / 2, "设置", p2ui_icon_color64(t));
         const int px = power_x64(), py = my + (power_y64() - sm_y());

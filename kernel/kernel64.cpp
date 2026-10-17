@@ -1021,12 +1021,12 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
     display64_init64();
     (void)display64_selftest64();
 #ifndef VIMTU_INSTALLER_MEDIA
-    // ★ 修「冷启动 5 秒缺字屏」（配套 kmain 里那段注释）：硬件检查报告页挪到**这里**才画。
-    //   此刻三个前置条件都满足了：① 中文面第一个装载点（本函数 1015 行）已经跑过；
-    //   ② display64 刚初始化（报告里的显示区块是真值）；③ fb/font/kbd/mouse 在 kmain 里早跑完了。
-    //   位置仍早于 task_start64() —— 与"调度器还没上线时等 5 秒"的既有语义一致。
-    //   安装介质内核不编这一行（它上面就地画，见 kmain 里的 #ifdef）。
-    (void)hwui64_show64(5000);
+    // ★ v0.4.7（用户要求）：**不再显示硬件检查报告页**。启动时直接进"滚动的英文 Kernel Boot Log"
+    //   （con64_boot_screen64 在 os_boot_path 末尾回放 dmesg）。硬件报告仍然存在，只是不再挡在
+    //   启动路径上：设置页 -> 关于 -> 硬件检查报告里随时能看（hwui64_draw64），安装介质里也照旧画
+    //   （kmain 的 #ifdef VIMTU_INSTALLER_MEDIA：装系统时那 5 秒诊断是需要的）。
+    //   自检保留（纯逻辑，不刷屏）：它验的是"报告内容自洽"，与"要不要展示"无关。
+    (void)hwui64_selftest64();
 #endif
     // 调度器上线：任务 0 = 本流程（桌面消息循环），另建 kheart/kwork/ksum 三个内核线程。
     // 必须放在 gui64_run 之前 —— 之后不再返回。

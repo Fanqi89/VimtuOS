@@ -112,8 +112,32 @@
 #define TERM_MAX_INST    4          // 多开上限（照 32 位；第 5 次只激活最新的）
 #define TERM_CHAR_SCALE  2          // 格高基准（8x8 × 2 = 16px；ASCII 字形现在来自等宽面 TTF）
 #define TERM_CELL_W      (8 * TERM_CHAR_SCALE)      // 一个**汉字格**宽（像素）= 16
-#define TERM_HALF_W      (TERM_CELL_W / 2)          // 半格 = ASCII 推进宽度 8px（等宽面 ASCII 宽 = 汉字宽/2）
-#define TERM_CELL_H      (8 * TERM_CHAR_SCALE)      // 字符格高（像素）= 16
+#define TERM_HALF_W      (TERM_CELL_W / 2)          // 规范基准：半格 8px（em=16 时的期望值）
+// ★ v0.4.7：真正的半格/整格宽度由**字体度量**在运行期定（整数 px），因为 UI 字号档
+//   可以是 14/16/18，而格子必须与字形同步缩放，否则"格 16px、字形 18px"会互相压行。
+//   默认值就是规范的 8/16；只有用户把 UI 字号改离 16 时才会变（仍然是整数，绝无小数缩放）。
+static int g_term_half = TERM_HALF_W;
+static inline int term_half(void) { return g_term_half; }
+static inline int term_cellw(void) { return g_term_half * 2; }
+// ★ v0.4.7「三无」改造：行高不再写死 16，而是**取字体度量**（ascender-descender 的最大值）。
+//   规范原文："分配格子高度时，要取中英文字体度量（Metrics）的最大高度，确保字母 g 的
+//   下半部分和汉字的上下边缘都不会被切掉"。Sarasa Mono SC 在 em=16 时度量 > 16（见
+//   tests/term64_test.py 的实测），按 16 会切字，所以以度量为准、下限 16、上限 20（FONT_PX 限制）。
+//   ★ 仍然是**整数像素**（无缩放原则）：不出现 16.5px 这种值。
+#define TERM_CELL_H_STATIC  (8 * TERM_CHAR_SCALE)   // 规范基准值（度量下限）
+static int g_term_cell_h = TERM_CELL_H_STATIC;
+static inline int term_ch(void) { return g_term_cell_h; }
+static void term_cell_h_init(void) {
+    font_select(FONT_FACE_MONO);                 // 终端字符面（Sarasa Mono SC 子集）
+    int half = font_glyph_advance(' ');          // ASCII 推进 = 半格（中英 2:1 的落地值）
+    if (half < 4) half = 4;
+    if (half > 16) half = 16;
+    g_term_half = half;
+    int h = font_cell_height64();                // 度量：ascender - descender
+    if (h < TERM_CELL_H_STATIC) h = TERM_CELL_H_STATIC;
+    if (h > 20) h = 20;
+    g_term_cell_h = h;
+}
 #define TERM_COLS_MAX    256        // 内容缓冲列上限（8px 单位：1920 宽最大化 = 240 列，留余量）
 #define TERM_ROWS_MAX    72         // 内容缓冲行上限
 #define TERM_COLS_MIN    20         // 排版列下限（8px 单位 = 10 个汉字格）
@@ -131,7 +155,16 @@
 
 // 配色照 32 位：黑底 + 浅灰字 + 绿色块状光标（绿底黑字）
 #define TERM_BG      rgb(0x00, 0x00, 0x00)
-#define TERM_FG      rgb(0xE0, 0xE0, 0xE0)
+#define TERM_FG      rgb(0xFF, 0xFF, 0xFF)   // ★ 规范：正文纯白 #FFFFFF（原 #E0E0E0 偏灰）
+// ★ 标准 ANSI 16 色（规范："使用标准的 ANSI 16 色"）。取值满足规范点名的两条：
+//   亮青 #00FFFF（[ OK ] 用）、亮红 #FF0000（错误用）；索引 7 纯白 #FFFFFF。
+//   全部 alpha=255（规范"绝无 Alpha 透明通道"）。
+static const uint32_t kTermAnsi16[16] = {
+    0xFF000000u, 0xFFAA0000u, 0xFF00AA00u, 0xFFAA5500u,
+    0xFF0000AAu, 0xFFAA00AAu, 0xFF00AAAAu, 0xFFFFFFFFu,
+    0xFF555555u, 0xFFFF0000u, 0xFF55FF55u, 0xFFFFFF55u,
+    0xFF5555FFu, 0xFFFF55FFu, 0xFF00FFFFu, 0xFFFFFFFFu
+};
 #define TERM_CUR     rgb(0x00, 0xC0, 0x00)
 #define TERM_CURFG   rgb(0x00, 0x00, 0x00)
 
@@ -145,6 +178,10 @@
 // 每窗口一份：一次 kmalloc = 结构 + 内容缓冲（cells 指向结构之后）
 struct TerminalState {
     uint16_t* cells;                 // 内容缓冲：码点网格（0 = 空），行距固定 TERM_COLS_MAX
+    uint8_t*  attrs;                 // ★ v0.4.7：每格颜色属性（0 = 默认前景；否则 0x40|idx|bold<<4）
+    uint8_t   attr;                  // 当前 SGR 前景属性（写新字符时带进格子）
+    uint8_t   esc;                   // ESC 序列状态机：0 无 / 1 已见 ESC / 2 已见 CSI
+    int       sgr;                   // 正在解析的 SGR 参数值
     int   cols, rows;                // 当前排版列/行（由客户区尺寸推导）
     int   cur_r, cur_c;              // 光标（内容坐标）
     char  cmdline[TERM_CMD_MAX];     // 当前命令行（可打印 ASCII）
@@ -390,10 +427,34 @@ static void ts_detach(TerminalState* ts) {
 static inline void ts_cell_set(TerminalState* ts, int r, int c, uint16_t cp) {
     if (r < 0 || r >= TERM_ROWS_MAX || c < 0 || c >= TERM_COLS_MAX) return;
     ts->cells[r * TERM_COLS_MAX + c] = cp;
+    ts->attrs[r * TERM_COLS_MAX + c] = cp ? ts->attr : 0;   // 空格不带颜色（底色恒黑）
+}
+
+// ---- SGR（ESC [ … m）：只做"标准 ANSI 16 色"这一档，够用且可验收 ----
+static void term_sgr_apply(TerminalState* ts, int v) {
+    int idx = ts->attr & 0x0F;
+    int bold = (ts->attr & 0x10) ? 1 : 0;
+    if (v == 0)  { ts->attr = 0; return; }                    // 复位
+    if (v == 1)  { bold = 1; }                                // 加粗 = 亮色
+    else if (v == 22) { bold = 0; }
+    else if (v == 39) { ts->attr = 0; return; }               // 默认前景
+    else if (v >= 30 && v <= 37) { idx = v - 30; }            // 基本 8 色
+    else if (v >= 90 && v <= 97) { idx = (v - 90) + 8; }      // 亮色 8 色
+    else return;                                              // 其它属性：忽略（不假装支持）
+    ts->attr = (uint8_t)(0x40 | (idx & 0x0F) | (bold ? 0x10 : 0));
+}
+
+// 属性 -> 前景色（0 = 默认纯白）
+static inline uint32_t term_attr_fg(uint8_t a) {
+    if (!(a & 0x40)) return TERM_FG;
+    int idx = (a & 0x0F) + ((a & 0x10) ? 8 : 0);              // bold -> 亮色
+    if (idx < 0 || idx > 15) idx = 15;
+    return kTermAnsi16[idx];
 }
 
 static void ts_clear(TerminalState* ts) {
-    for (int i = 0; i < TERM_BUF_MAX; i++) ts->cells[i] = 0;
+    for (int i = 0; i < TERM_BUF_MAX; i++) { ts->cells[i] = 0; ts->attrs[i] = 0; }
+    ts->attr = 0;                    // 清屏同时复位 SGR（与 xterm 一致）
     ts->cur_r = 0;
     ts->cur_c = 0;
 }
@@ -410,13 +471,13 @@ static void ts_dirty_row(TerminalState* ts, int row) {
     Window* w = ts ? ts->win : nullptr;
     if (!w || !w->visible) return;
     if (row < 0 || row >= ts->rows) return;
-    gui64_dirty(w->client_x, w->client_y + TERM_PAD_Y + row * TERM_CELL_H, w->client_w, TERM_CELL_H);
+    gui64_dirty(w->client_x, w->client_y + TERM_PAD_Y + row * term_ch(), w->client_w, term_ch());
 }
 
 // 排版尺寸：客户区放得下的列/行（不钳制；列的单位是 8px 半格 = 等宽面 ASCII 推进宽度）
 static void ts_fit(Window* w, int* cols, int* rows) {
-    int c = (w->client_w - TERM_PAD_X) / TERM_HALF_W;
-    int r = (w->client_h - TERM_PAD_Y) / TERM_CELL_H;
+    int c = (w->client_w - TERM_PAD_X) / term_half();
+    int r = (w->client_h - TERM_PAD_Y) / term_ch();
     if (c < 0) c = 0;
     if (r < 0) r = 0;
     *cols = c;
@@ -447,11 +508,13 @@ static void ts_reflow(TerminalState* ts, int cols, int rows) {
     for (int r = 0; r < TERM_ROWS_MAX; r++) {
         uint16_t* row = ts->cells + r * TERM_COLS_MAX;
         if (r >= rows || r >= old_r) {                 // 超出新行数 / 新出现的行：整行清空
-            for (int c = 0; c < TERM_COLS_MAX; c++) row[c] = 0;
+            uint8_t* rowa = ts->attrs + r * TERM_COLS_MAX;
+            for (int c = 0; c < TERM_COLS_MAX; c++) { row[c] = 0; rowa[c] = 0; }
             continue;
         }
         int keep_c = (old_c < cols) ? old_c : cols;    // 列方向：保留 c < min(old_c, cols)
-        for (int c = keep_c; c < TERM_COLS_MAX; c++) row[c] = 0;
+        uint8_t* rowa = ts->attrs + r * TERM_COLS_MAX;
+        for (int c = keep_c; c < TERM_COLS_MAX; c++) { row[c] = 0; rowa[c] = 0; }
     }
     ts->cols = cols;
     ts->rows = rows;
@@ -488,10 +551,13 @@ static void ts_scroll(TerminalState* ts) {
     for (int r = 1; r < ts->rows; r++) {
         uint16_t* dst = ts->cells + (r - 1) * TERM_COLS_MAX;
         const uint16_t* src = ts->cells + r * TERM_COLS_MAX;
-        for (int c = 0; c < ts->cols; c++) dst[c] = src[c];
+        uint8_t* dsta = ts->attrs + (r - 1) * TERM_COLS_MAX;
+        const uint8_t* srca = ts->attrs + r * TERM_COLS_MAX;
+        for (int c = 0; c < ts->cols; c++) { dst[c] = src[c]; dsta[c] = srca[c]; }
     }
     uint16_t* last = ts->cells + (ts->rows - 1) * TERM_COLS_MAX;
-    for (int c = 0; c < ts->cols; c++) last[c] = 0;
+    uint8_t* lasta = ts->attrs + (ts->rows - 1) * TERM_COLS_MAX;
+    for (int c = 0; c < ts->cols; c++) { last[c] = 0; lasta[c] = 0; }
 }
 
 // 换行（到底行则滚动）
@@ -518,7 +584,7 @@ static int term_adv(uint32_t cp) {
 static int term_unit() {
     font_select(FONT_FACE_MONO);
     int w = font_glyph_advance(' ');
-    return (w > 0) ? w : TERM_HALF_W;
+    return (w > 0) ? w : term_half();
 }
 
 // 客户区可用的横向像素（排版/换行用）
@@ -543,6 +609,21 @@ static int ts_row_px(TerminalState* ts, int r, int c) {
 // 写一个码点：按该实例当前 cols/rows 与**像素宽度**裁剪与滚动，并只标脏受影响的区域
 static void ts_putc(TerminalState* ts, uint32_t cp) {
     if (!ts || !ts->used || ts->cols < 1 || ts->rows < 1) return;
+    // ★ v0.4.7：ANSI 转义（只认 CSI … m）。终端输出里出现的 ESC 序列必须被**吃掉**，
+    //   绝不能当普通字符画到屏幕上（否则彩色输出会变成乱码方块）。
+    if (cp == 0x1B) { ts->esc = 1; ts->sgr = 0; return; }
+    if (ts->esc == 1) { ts->esc = (cp == (uint32_t)'[') ? 2 : 0; ts->sgr = 0; return; }
+    if (ts->esc == 2) {
+        if (cp >= (uint32_t)'0' && cp <= (uint32_t)'9') {
+            ts->sgr = ts->sgr * 10 + (int)(cp - (uint32_t)'0');
+            if (ts->sgr > 999) ts->sgr = 999;
+            return;
+        }
+        if (cp == (uint32_t)';') { term_sgr_apply(ts, ts->sgr); ts->sgr = 0; return; }
+        if (cp == (uint32_t)'m') { term_sgr_apply(ts, ts->sgr); ts->sgr = 0; ts->esc = 0; return; }
+        ts->esc = 0; ts->sgr = 0;      // 其它 CSI 终结符：整个序列丢弃（不实现光标定位等）
+        return;
+    }
     int r0 = ts->cur_r;
     bool scrolled = false;
     if (cp == (uint32_t)'\n') {
@@ -614,11 +695,15 @@ static void ts_puts_pad(TerminalState* ts, const char* s, int width) {
 // ★ 与旧版的区别：旧版 ASCII 走内建 8x8 位图字体（fb_draw_char ×2 = 16x16），
 //   现在整格都用等宽面 TrueType —— 于是"中英 1:2"是字体自己的度量：ASCII 8px、汉字 16px。
 static void term_draw_cell(int x, int y, int w, uint16_t cp, uint32_t fg, uint32_t bg) {
-    if (bg != TERM_BG || w != TERM_CELL_W) fb_fill_rect(x, y, w, TERM_CELL_H, bg);
+    if (bg != TERM_BG || w != term_cellw()) fb_fill_rect(x, y, w, term_ch(), bg);
     if (cp < 0x20) return;
+    // ★ 三无：单色掩码（无抗锯齿 / 无次像素）；字号固定 16px（无缩放，不跟随 UI 字号档）。
+    //   规范："19. 终端文字非黑即白"、"整格当单色掩码贴屏"。
+    font_set_mono64(1);
     font_select(FONT_FACE_MONO);                 // 终端字符格的字体面
     if (cp < 0x7F) font_draw_glyph(x, y + TERM_MONO_DY, (char)cp, fg);
     else           font_draw_glyph_cp(x, y + TERM_ZH_DY, (uint32_t)cp, fg);
+    font_set_mono64(0);                          // 立刻交还 UI 的抗锯齿路径
 }
 
 static void term_draw(Window* w) {
@@ -641,24 +726,26 @@ static void term_draw(Window* w) {
     int right = x0 + cw;                                  // 右侧像素裁剪（变宽网格：整行宽度按推进累加）
     for (int r = 0; r < dr; r++) {
         const uint16_t* row = ts->cells + r * TERM_COLS_MAX;
-        int ty = y0 + TERM_PAD_Y + r * TERM_CELL_H;
+        int ty = y0 + TERM_PAD_Y + r * term_ch();
         int tx = x0 + TERM_PAD_X;
         for (int c = 0; c < dc; c++) {
             uint16_t cp = row[c];
             int adv = (cp >= 0x20) ? term_adv((uint32_t)cp) : term_unit();
             if (tx >= right) break;
-            if (cp >= 0x20) term_draw_cell(tx, ty, adv, cp, TERM_FG, TERM_BG);
+            if (cp >= 0x20)
+                term_draw_cell(tx, ty, adv, cp,
+                               term_attr_fg(ts->attrs[r * TERM_COLS_MAX + c]), TERM_BG);
             tx += adv;
         }
     }
     // 光标：块状光标（绿底黑字），宽度 = 该格码点的推进宽度（ASCII 半格 / 汉字整格），不依赖 '_' 字形
     if (w->active && ts->cur_r >= 0 && ts->cur_r < dr && ts->cur_c >= 0 && ts->cur_c < dc) {
         int cx = x0 + TERM_PAD_X + ts_row_px(ts, ts->cur_r, ts->cur_c);
-        int cy = y0 + TERM_PAD_Y + ts->cur_r * TERM_CELL_H;
+        int cy = y0 + TERM_PAD_Y + ts->cur_r * term_ch();
         uint16_t cp = ts->cells[ts->cur_r * TERM_COLS_MAX + ts->cur_c];
         int adv = (cp >= 0x20) ? term_adv((uint32_t)cp) : term_unit();
         if (cx < right) {
-            fb_fill_rect(cx, cy, adv, TERM_CELL_H, TERM_CUR);
+            fb_fill_rect(cx, cy, adv, term_ch(), TERM_CUR);
             if (cp >= 0x20) term_draw_cell(cx, cy, adv, cp, TERM_CURFG, TERM_CUR);
         }
     }
@@ -5165,13 +5252,19 @@ static void term_tick(Window* w) {
 // ==================== 实例创建 / 打开 / 重置 ====================
 static TerminalState* ts_new(Window* win) {
     int off = (int)((sizeof(TerminalState) + 1) & ~(size_t)1);      // cells 的起点（2 字节对齐）
-    uint64_t bytes = (uint64_t)off + (uint64_t)TERM_BUF_MAX * sizeof(uint16_t);
+    // ★ v0.4.7：一次分配里放两块缓冲 —— cells（2B/格）后面接 attrs（1B/格，颜色）
+    uint64_t bytes = (uint64_t)off + (uint64_t)TERM_BUF_MAX * sizeof(uint16_t)
+                    + (uint64_t)TERM_BUF_MAX;
     int prev = mem_owner_get_64();
     mem_owner_set_64(MEM_OWNER_TERMINAL_64);      // 归属记账：任务管理器/内存归属统计
     TerminalState* ts = (TerminalState*)kmalloc_64(bytes);
     mem_owner_set_64(prev);
     if (!ts) return nullptr;
     ts->cells = (uint16_t*)((char*)ts + off);
+    ts->attrs = (uint8_t*)((char*)ts + off + (size_t)TERM_BUF_MAX * sizeof(uint16_t));
+    ts->attr = 0;
+    ts->esc = 0;
+    ts->sgr = 0;
     ts->cols = 0;
     ts->rows = 0;
     ts->cur_r = 0;
@@ -5181,13 +5274,15 @@ static TerminalState* ts_new(Window* win) {
     ts->win = win;
     ts->inst = 0;
     ts->used = false;
-    for (int i = 0; i < TERM_BUF_MAX; i++) ts->cells[i] = 0;
+    for (int i = 0; i < TERM_BUF_MAX; i++) { ts->cells[i] = 0; ts->attrs[i] = 0; }
+    term_cell_h_init();              // 行高按字体度量定（幂等；每次建实例都复核一遍）
     return ts;
 }
 
 static void term_init_once() {
     if (g_inited) return;
     g_inited = true;
+    term_cell_h_init();            // ★ 先按字体度量定格子（进程内首次打开终端之前就要有值）
     for (int i = 0; i < TERM_MAX_INST; i++) { g_inst[i] = nullptr; g_win[i] = nullptr; g_inst_no[i] = 0; }
     g_count = 0;
     g_next_inst = 1;
@@ -5217,8 +5312,8 @@ void app_term_open64() {
     }
 
     // 目标客户区 = 默认 60x40 个**汉字格**（120x40 个半格；像素尺寸与旧版 60x40 位图格完全一致）
-    int cw  = TERM_DEF_COLS * TERM_HALF_W + TERM_PAD_X;
-    int chh = TERM_DEF_ROWS * TERM_CELL_H + TERM_PAD_Y;
+    int cw  = TERM_DEF_COLS * term_half() + TERM_PAD_X;
+    int chh = TERM_DEF_ROWS * term_ch() + TERM_PAD_Y;
     int W = gui64_screen_w(), H = gui64_screen_h();
     int off = (g_count % TERM_MAX_INST) * 24;      // 级联摆放，避免完全重叠
     int px = 16 + off, py = 16 + off;
@@ -5237,8 +5332,8 @@ void app_term_open64() {
     }
     int dw = win->w - win->client_w;  if (dw < 0) dw = 0;
     int dh = win->h - win->client_h;  if (dh < 0) dh = 0;
-    gui64_set_min_size(win, TERM_COLS_MIN * TERM_CELL_W + TERM_PAD_X + dw,
-                            TERM_ROWS_MIN * TERM_CELL_H + TERM_PAD_Y + dh);
+    gui64_set_min_size(win, TERM_COLS_MIN * term_cellw() + TERM_PAD_X + dw,
+                            TERM_ROWS_MIN * term_ch() + TERM_PAD_Y + dh);
     gui64_fit_window_to_client(win, cw, chh);      // 把客户区精确设成 60x40 格
 
     // 摆到屏内
