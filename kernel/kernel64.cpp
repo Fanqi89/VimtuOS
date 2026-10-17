@@ -1020,6 +1020,14 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
     // 边界：运行期 DDC 再探测**不做**（理由见 display64.h），打点里如实写 skipped。
     display64_init64();
     (void)display64_selftest64();
+#ifndef VIMTU_INSTALLER_MEDIA
+    // ★ 修「冷启动 5 秒缺字屏」（配套 kmain 里那段注释）：硬件检查报告页挪到**这里**才画。
+    //   此刻三个前置条件都满足了：① 中文面第一个装载点（本函数 1015 行）已经跑过；
+    //   ② display64 刚初始化（报告里的显示区块是真值）；③ fb/font/kbd/mouse 在 kmain 里早跑完了。
+    //   位置仍早于 task_start64() —— 与"调度器还没上线时等 5 秒"的既有语义一致。
+    //   安装介质内核不编这一行（它上面就地画，见 kmain 里的 #ifdef）。
+    (void)hwui64_show64(5000);
+#endif
     // 调度器上线：任务 0 = 本流程（桌面消息循环），另建 kheart/kwork/ksum 三个内核线程。
     // 必须放在 gui64_run 之前 —— 之后不再返回。
     task_start64();
@@ -1558,7 +1566,19 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     //      这样"存储/显示"区块在安装程序枚举磁盘之前就有真值。
     // 展示时长 5 秒（规格要求"约 5 秒"），任意键提前结束；打点见 hwui64_show64。
     (void)hwui64_selftest64();
+#ifdef VIMTU_INSTALLER_MEDIA
+    // 安装介质：四份字体**内嵌**，就地画（向导在卷成型之前就要画中文）
     (void)hwui64_show64(5000);
+#else
+    // ★ 修「冷启动 5 秒缺字屏」：已安装系统**不在这里画报告页**。
+    //   原因：中文面（face 1）是**外置**的，两个装载点都在 os_boot_path() 里（1015 / 1323），
+    //   而本行在 os_boot_path() **之前** —— 画的那一刻 face 1 必然没就绪，报告页里的汉字全走
+    //   font_draw_missing_box() 的 1px 空心方框（这就是那 5 秒"缺字屏"；仓库在 font.h:52 把
+    //   它记成"如实边界"，本批真的修掉）。
+    //   现在改到 os_boot_path() 里、**中文面装载点 + display64 初始化之后**再画（见那里一行）。
+    //   5 秒、任意键跳过、[HWUI] report shown 打点语义一个字不变；报告内容仍由本行的
+    //   hwui64_selftest64() 构建（所以 [HWUI] report lines= 的位置也不变）。
+#endif
 
 #ifdef VIMTU_INSTALLER_MEDIA
     // 安装介质**不显示开机滚屏引导控制台**（有意为之）：

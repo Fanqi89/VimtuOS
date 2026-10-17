@@ -3341,7 +3341,6 @@ TESTS = [
                           "Explorer 双击盘符卡片 + 写卷安全（浏览 D: 期间自动落盘不动 D: 逐字节）+ 卷表满如实拒绝"),
     ("ahci64_test.py", "★ item 5a：AHCI(SATA) 控制器/端口/签名 + 屏幕硬件检查报告（打点 + 像素）"),
     ("mouse_parse_test.py", "PS/2 鼠标解码 + 位移限速（纯 Python 复放）"),
-    ("ahci64_test.py", "★ item 5a：AHCI(SATA) 控制器/端口/签名 + 屏幕硬件检查报告（打点 + 像素）"),
     ("nvme64_test.py", "★ item 6：NVMe 驱动（识别/自检/打点）+ 完整安装到 NVMe 盘（drive=16/ESP FAT32/GPT）"
                        " + UEFI(OVMF) 从该盘启动进桌面 + BIOS 如实测"),
     ("disk_boot_test.py", "★ 引导层改 BIOS INT 13h 读盘：只挂 AHCI 的装好盘直启进桌面 + 截断盘失败路径打点停机"),

@@ -236,18 +236,29 @@ def main():
                 except Exception:
                     shot_ok = False
                     continue
-                # 判据与第 5) 节的断言**完全一致**（不能只看 band：画到一半的帧 band 已经过线，
-                # 但文字还没画上去 -> light 会不达标，那时要继续重抓）
-                band0 = light0 = 0
+                # 判据与第 5) 节的断言一致（不能只看 band：画到一半的帧 band 已经过线，
+                # 但文字还没画上去 -> 文字行/中间档像素会不达标，那时要继续重抓）。
+                # ★ 本批修：原来的"亮像素（三通道 > 190）> 300"在 FONT64_AA_SUB=8 之后**必然不达标**
+                #   —— 那正是"文字不够清晰"修复的**目标行为**（细笔画不再被整行点满 255）。
+                #   同一张 1280x800 实测：all>190 = 228、all>120 = 596、all>90 = 722、
+                #   "每行 >= 3 个采样点有墨"的文字行 = 219。所以这里改成与第 5) 节同一套新判据。
+                band0 = rows0 = mid0 = 0
                 for y in range(90, 700, 6):
                     for x in range(40, 1240, 6):
                         c = sample(px0, w0, x, y)
                         if abs(c[0] - 0) <= 6 and abs(c[1] - 48) <= 8 and abs(c[2] - 96) <= 8:
                             band0 += 1
-                        if c[0] > 190 and c[1] > 190 and c[2] > 190:
-                            light0 += 1
-                if band0 > 150 and light0 > 300:
-                    break                       # 报告页画完了 -> 用原来的阈值断言
+                        if c[0] > 120 and c[1] > 120 and c[2] > 120:
+                            mid0 += 1
+                for y in range(90, 700, 2):
+                    n = 0
+                    for x in range(40, 1240, 4):
+                        if max(sample(px0, w0, x, y)) > 60:
+                            n += 1
+                    if n >= 3:
+                        rows0 += 1
+                if band0 > 150 and rows0 >= 100 and mid0 >= 400:
+                    break                       # 报告页画完了 -> 用第 5) 节的同一套阈值断言
                 # 不是（完整的）报告页：把这一帧留作证据再重抓；最后一帧保持在工作文件名上，
                 # 这样真的 4 次都没抓到，第 5) 节的断言会如实 FAIL 并留下那一帧供人看
                 if attempt < 3:
@@ -330,21 +341,38 @@ def main():
         w, h, px = read_ppm(args.shot)
         check("截图分辨率 1280x800", (w, h) == (1280, 800), "实际 %dx%d" % (w, h))
         # 采样报告页正文区（避开标题条）
-        black = light = band = total = 0
+        black = mid = band = total = 0
         for y in range(90, 700, 6):
             for x in range(40, 1240, 6):
                 c = sample(px, w, x, y)
                 total += 1
                 if c[0] < 16 and c[1] < 16 and c[2] < 16:
                     black += 1
-                if c[0] > 190 and c[1] > 190 and c[2] > 190:
-                    light += 1
+                if c[0] > 120 and c[1] > 120 and c[2] > 120:
+                    mid += 1
                 if abs(c[0] - 0) <= 6 and abs(c[1] - 48) <= 8 and abs(c[2] - 96) <= 8:
                     band += 1
         check("黑底占比 > 50%%（报告页背景）", black > total * 0.5,
               "black=%d/%d" % (black, total))
         check("区块色块存在（分区块：rgb(0,48,96) 采样 > 150）", band > 150, "band=%d" % band)
-        check("浅色文字像素存在（TTF 字形真画上去了）", light > 300, "light=%d" % light)
+        # ★ 本批修（判据与事实不符，先修脚本）：原来是"三通道都 > 190 的亮像素 > 300"。
+        #   FONT64_AA_SUB=8 之后细笔画**不再被整行点满 255**（这正是"文字不够清晰"那条修复的
+        #   目标行为），同一张帧实测从历史的 light=436 掉到 **228**，于是这条恒 FAIL。
+        #   换成两条更贴近原意的判据（同一帧实测值写在括号里，阈值留余量）：
+        #     ① **文字行确实成排出现**：每 2 行取样、一行里 >= 3 个采样点有墨（实测 219 行）；
+        #     ② **字形本体像素**：三通道都 > 120 的中间档（实测 596）。
+        text_rows = 0
+        for y in range(90, 700, 2):
+            n = 0
+            for x in range(40, 1240, 4):
+                if max(sample(px, w, x, y)) > 60:
+                    n += 1
+            if n >= 3:
+                text_rows += 1
+        check("报告页有文字行（每行 >= 3 个采样点有墨；实测 219，阈值 100）",
+              text_rows >= 100, "text_rows=%d" % text_rows)
+        check("字形本体像素足够（三通道 > 120 的中间档；实测 596，阈值 400）",
+              mid >= 400, "mid=%d" % mid)
     else:
         check("抓到报告页截图", False, "（截图失败：%s）" % args.shot)
 
