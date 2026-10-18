@@ -4,7 +4,7 @@
 目标是"能当日常系统用"，而不是教学玩具。
 
 - 语言：C / C++（内核）+ Rust（设计 Token 表）+ 汇编（引导与入口）+ Python（构建与验收）
-- 版本：**0.5.2**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0…）
+- 版本：**0.5.3**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0…）
 - 许可：GPL-3.0
 - 验收方式：**77 个自动化验收脚本**，每条断言都有串口打点或像素证据（见 [验收](#五验收与工程质量)）
 
@@ -111,7 +111,29 @@ Unifont 兜底）排版折行、逐行绘制；输入走 `wl_display_dispatch` �
 如实边界：窗口是**屏幕居中固定位置**，还不能拖动/缩放；终端**内建** `run` 没有进程上下文（见第二节），
 所以要用 `/bin/shell` 里 `run /bin/browser` 启动。
 
-### 9. 其他
+### 9. 办公套件（v0.5.3 起）
+
+`/bin/office` 是**三合一**的 ring3 办公套件（一个进程、一套窗口外壳，复用 `/bin/browser` 验证过的
+shm + wl_surface + `wl_seat_get()` + font64 排版）：
+
+- **文档**：纯文本行编辑（行缓冲 + 行索引、UTF-8 按字节移动但插入/删除对齐字符边界），
+  方向键/PageUp/PageDown/Home 移动，直接敲字插入、Backspace 删除；
+- **表格**：8 列 × 20 行的**定点整数**网格，公式引擎在 `user/office/calc.c`（独立验收）：
+  `=1+2*3`、`=A1+B1*2`、`=SUM(A1:A3)`、括号与一元负号；**环引用按拓扑检测**并显示 `#CIRC`
+  （另有 `#DIV0/#SYNTAX/#REF/#OVER`）；Tab/方向键移动、Enter 下移；
+- **演示**：3 页 × 8 行（标题 + 要点），左右键切换，`F5` 进入**放映**（白底大字、点击/空格翻页、ESC 返回）；
+- **保存**：`Ctrl+S` 手动保存；**切模式（F2 循环）与退出时自动落盘** —— 文件是自定义纯文本
+  （`/tmp/doc.vwd`、`/tmp/sheet.vts`、`/tmp/deck.vpt`），不兼容任何外部格式。
+
+实测（`tests/office64_test.py` **15/15 PASS**）：窗口 896×580 `map=0`；文档打字到 `col=14`；
+切模式时 `[OFFICE] save mode=doc bytes=263 rc=263`，**宿主侧独立解析卷**读回 `/tmp/doc.vwd`
+含敲进去的标记串；表格 `=1+2*3 -> value=7 err=0`、`=A1+1 -> value=#CIRC err=-2`；
+编辑区墨迹 3.15%；ESC 退出 `reason=esc`。
+
+如实边界：文档**没有富文本/图片/表格内嵌/输入法**（键盘只给 ASCII）；表格**没有小数、函数库、
+跨表引用**，除法是整数除法；演示只有 3 页固定文本；`.vwd/.vts/.vpt` 都是自己的格式。
+
+### 10. 其他
 - 原生 PNG/JPEG（基线+扩展顺序）解码；内置图标包（30 个系统图标 + 应用图标）
 - 系统音效（4 段自合成素材 + `/bin/sounder` 用户态播放器，音频 ABI 49）
 - ring3 网络栈：`/bin/netd`（DHCP / DNS / TCP / UDP / ARP / ICMP，e1000 驱动在 ring0）
@@ -255,7 +277,8 @@ Fonts-open/  Sarasa Mono SC（终端）+ Unifont（兜底）+ 许可原文
 
 - 仓库：<https://github.com/Fanqi89/VimtuOS>
 - 发布：每个版本一个 Release + 两个附件（ISO / IMG）+ 正文附 sha256；**旧版本 Release 永不改动**
-- 最新：**v0.5.2**（本版：**浏览器真的能上网** = `/bin/browser` 接内核 `net_raw`（号 53）自己实现 ARP/DNS/TCP + `HTTP/1.0 GET`；宿主 `http.server` -> 客人 `10.0.2.2`，`status=200 bytes=300` 与宿主页逐字节一致、屏幕墨迹 1.17%、不可达端口如实失败；`browser_http64_test` **12/12 PASS**）
+- 最新：**v0.5.3**（本版：**办公套件 `/bin/office`** = 文档/表格/演示三合一，8×20 定点整数公式引擎（四则/引用/SUM/环检测 `#CIRC`），切模式与退出自动落盘，宿主侧独立解析卷读回标记串；`office64_test` **15/15 PASS**）
+- 上一版：**v0.5.2**（本版：**浏览器真的能上网** = `/bin/browser` 接内核 `net_raw`（号 53）自己实现 ARP/DNS/TCP + `HTTP/1.0 GET`；宿主 `http.server` -> 客人 `10.0.2.2`，`status=200 bytes=300` 与宿主页逐字节一致、屏幕墨迹 1.17%、不可达端口如实失败；`browser_http64_test` **12/12 PASS**）
 - 上一版：**v0.5.1**（本版：**浏览器真正可交互** = 补上 `wl_seat_get()`（键盘焦点 + 指针捕获），点击翻页 / ESC 退出实测通过；`browser64_test` 从 UNVERIFIED 变 **16/16 PASS**。v0.5.0 的"输入路由未通"其实是应用漏调这个 API，不是内核缺能力）
 - 上一版：**v0.5.0**（本版：**大窗口 ABI** = shm 单对象 64 KiB -> 2 MiB、大 surface 屏幕居中；**`/bin/browser` ring3 真窗口浏览器** = 896x580 窗口 + HTML 子集排版 + 滚动 + 像素验收）
 - 上一版：**v0.4.9**（SIGPIPE **端到端**验收 = 新 ring3 程序 `/epipe.elf` + 真进程 shell；fontconfig **真可配置** = 构建期预置 0666 的 `/etc/fonts.conf` + `ui.stem` A/B；`status_report` 的 blob 外置判据改成**产物自洽**）

@@ -64,7 +64,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
 #   空夹具盘由构建期"原始区"（build64/demo64_raw.bin，写进 system.img 的 LBA 7497 起）兜底。
 #   内核二进制里只剩路径/偏移/长度表（kernel/demo64.h），本文件末尾有 64B 探针断言。
-VIMTUOS_VERSION="0.5.2"     # ★ 本版：/bin/browser 接入真实网络（net_raw 号 53：ARP/DNS/TCP + HTTP/1.0），从宿主 HTTP 服务器抓页并渲染
+VIMTUOS_VERSION="0.5.3"     # ★ 本版：办公套件 /bin/office（文档/表格/演示三合一 + 8x20 定点整数公式引擎：四则/引用/SUM/环检测）
 CXXFLAGS="$CXXFLAGS -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\""
 CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
 #
@@ -1455,6 +1455,26 @@ if [ -f "$BROWSER_VOL_IN" ] && [ -f "$BUILD/browser.elf" ]; then
           --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 else
     echo "ERROR: 缺少 $BROWSER_VOL_IN 或 build64/browser.elf —— 浏览器没装进系统卷" >&2
+    exit 1
+fi
+
+# ============================================================================
+# ★ v0.5.3：/bin/office（办公套件：文档/表格/演示）—— 全用户态，内核 0 字节
+#   1) user/office/build_office.sh 编 office.c + calc.c + user/lib，自检 PT_LOAD / 无 PT_INTERP；
+#   2) tools/office_pack_win.py 把 /bin/office 写进卷并逐字节回读，再拼 sysdisk.img。
+#   端到端验收：python tests/office64_test.py
+# ============================================================================
+echo "==> ★ 办公套件：/bin/office（全用户态，内核 0 字节）"
+bash user/office/build_office.sh "$BUILD"
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid "$BUILD/office.elf"
+echo "==> 办公套件装卷"
+OFFICE_VOL_IN="$BUILD/browservol.img"
+[ -f "$OFFICE_VOL_IN" ] || OFFICE_VOL_IN="$BUILD/storevol.img"
+if [ -f "$OFFICE_VOL_IN" ] && [ -f "$BUILD/office.elf" ]; then
+    "$PY" tools/office_pack_win.py --vol-in "$OFFICE_VOL_IN" --vol-out "$BUILD/officevol.img" \
+          --office "$BUILD/office.elf" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+else
+    echo "ERROR: 缺少 $OFFICE_VOL_IN 或 build64/office.elf —— 办公套件没装进系统卷" >&2
     exit 1
 fi
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
