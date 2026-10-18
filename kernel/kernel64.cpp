@@ -1539,6 +1539,9 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     vgpu64_init64();
     (void)vgpu64_selftest64();
     (void)vgpu64_bench64();
+    // ★ v0.5.5：硬件光标平面（fw_cfg `cursor=1` 才开；缺省走软件光标，既有像素行为不变）。
+    //   放在 bench 之后：此时 scanout 已经设好、几何也已确认，光标位图才可能被设备真正扫描出去。
+    (void)fb_cursor_run64();
 
     font_init();
     dbg64_str("[G64] font faces=");

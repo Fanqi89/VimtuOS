@@ -77,6 +77,9 @@ void fb_user_flip64(int x, int y, int w, int h);
 //   * 默认**零影响**：整块功能由 QEMU fw_cfg 的 opt/vimtu/vsync 配置串开启；没有该通道
 //     （真机/VMware/未配置）时 fb_vsync_run64() 一行不打、一个字节不改既有行为。
 int  fb_vsync_run64(void);          // 帧引擎（由 virtio_gpu64_bench64 末尾调用）；返回跑过的帧数
+// ★ v0.5.5：硬件光标平面（fw_cfg `cursor=1` 打开，缺省关 = 软件光标，既有像素行为不变）。
+//   返回 1 = 设备接管光标；0 = 软件光标（未配置 / 无设备 / 队列建不起来，打点说明原因）。
+int  fb_cursor_run64(void);
 int  fb_swap_enable64(int n);       // 开交换链（返回实际生效块数；<2 = 没开）
 int  fb_swap_count64();             // 当前交换链块数（1 = 没开）
 int  fb_swap_front64();             // 当前在屏上的块号

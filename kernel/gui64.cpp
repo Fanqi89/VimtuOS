@@ -23,6 +23,7 @@
 
 #include "gui64.h"
 #include "fb.h"
+#include "virtio_gpu64.h"   // ★ v0.5.5：硬件光标平面（cursor_on / cursor_move）
 #include "font.h"
 #include "input.h"
 #include "debug64.h"
@@ -1954,6 +1955,22 @@ static void cur_line64(int x0, int y0, int x1, int y1, uint32_t c) {
     }
 }
 static void draw_cursor(void) {
+    // ★ v0.5.5：硬件光标平面接管时**不再画软件光标**（否则两层叠加：设备那层在扫描出画面的
+    //   最后一步叠加，软件这层会留在后备缓冲里，两把箭头同时出现）。
+    //   这条打点是验收的证据链：`software-skip` 出现 = 屏幕上的光标不可能是软件画的，
+    //   配合 `[VGPU] cursor on` / `cursor move … dev=1` 就构成"设备真的在画"的完整链条。
+    if (vgpu64_cursor_on64()) {
+        static int skip_logged = 0;
+        if (skip_logged < 3) {
+            skip_logged++;
+            dbg64_line_begin64();
+            dbg64_str("[VGPU] cursor software-skip (hardware plane owns the pointer) n=");
+            dbg64_dec((uint64_t)skip_logged);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        return;
+    }
     static const char* cur[] = {
         "X          ", "XX         ", "X.X        ", "X..X       ", "X...X      ",
         "X....X     ", "X.....X    ", "X......X   ", "X.......X  ", "X........X ",
@@ -2532,6 +2549,10 @@ static void handle_mouse(void) {
         g_cur_x = mx; g_cur_y = my;
         dirty_add(mx - 6, my - 4, 24, 24);
     }
+    // ★ v0.5.5：硬件光标平面接管时把位置直接告诉设备（MOVE_CURSOR）。
+    //   软件路径**一个字节不变**：没开硬件光标时这是空操作（vgpu64_cursor_on64() == 0 立即返回），
+    //   上面的脏区照旧 —— 也就是说这条只是"多一条把坐标送出去的支路"，不改任何绘制逻辑。
+    if (vgpu64_cursor_on64()) vgpu64_cursor_move64(g_cur_x, g_cur_y);
     // 按下（边沿）
     if (mouse_button_pressed(0)) { mouse_consume_pressed(0); handle_mouse_press(mx, my, 0); }
     if (mouse_button_pressed(1)) { mouse_consume_pressed(1); handle_mouse_press(mx, my, 1); }

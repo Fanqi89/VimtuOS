@@ -132,3 +132,18 @@ int  vgpu64_present64(int slot, int w, int h);       // 整帧提交第 slot 块
 //   after：第几条命令之后开始注入；注入次数有界（最多 8 条），命中后连续失败 -> 既有降级路径
 void vgpu64_set_inject64(int kind, uint32_t after);
 int  vgpu64_reconfigure64(int w, int h, int zoom);
+
+// ==================== ★ v0.5.5：硬件光标平面（virtio-gpu queue 1）====================
+// 语义（先说边界，避免误解）：
+//   * 光标平面 = **一条独立的 virtqueue（queue 1）+ 一个 64x64 B8G8R8A8 resource**，由设备在
+//     扫描出画面的最后一步叠加到屏幕上。它省掉的是"软件光标每移动一格就让那块区域重新合成
+//     并整屏 TRANSFER"的成本（[UI] perf 里 redraw_us 的大头）。
+//   * **只有一张位图**（64x64，热点 = 0,0）。本仓库的软件光标有 6 种形状（箭头/移动/文本/转圈/
+//     缩放），硬件平面**画不出形状切换** —— 所以它是一个**可选加速**（fw_cfg `cursor=1` 打开，
+//     缺省关闭），不是软件光标的完全替代。开启时由调用方负责不再画软件光标（否则两层叠加）。
+//   * 任何一步失败（队列建不起来 / resource 创建被拒 / 命令超时）-> 只把 cursor_on 置 0 并打点
+//     `[VGPU] cursor disable reason=.. -> cursor=soft`，**不降级主显示路径**（ready 保持不变）。
+//     理由：光标是锦上添花，不能因为它把整帧设备路径关掉。
+int  vgpu64_cursor_enable64();                       // 1 = 硬件光标已接管；0 = 用软件光标（打点说明原因）
+int  vgpu64_cursor_on64();                           // 1 = 当前由设备画光标
+void vgpu64_cursor_move64(int x, int y);             // 移动热点到屏幕坐标（未启用时是空操作）

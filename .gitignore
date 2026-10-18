@@ -40,6 +40,8 @@ build/
 *.o
 vimtu64-64.iso
 vimtu64-64.img
+# v0.5.5：日常数据盘（16 MB，构建产物；只在不存在时初始化，里面是用户数据，绝不进仓）
+vimtu64-64-disk.img
 # 资源中间产物（根目录 _*.py 生成）
 build/*.ttf
 build/*.bin

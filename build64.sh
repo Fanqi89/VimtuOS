@@ -64,7 +64,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
 #   空夹具盘由构建期"原始区"（build64/demo64_raw.bin，写进 system.img 的 LBA 7497 起）兜底。
 #   内核二进制里只剩路径/偏移/长度表（kernel/demo64.h），本文件末尾有 64B 探针断言。
-VIMTUOS_VERSION="0.5.4"     # ★ 本版：浏览器/办公套件进应用注册表（桌面图标 + 开始菜单），点开即 fork+execve 真进程
+VIMTUOS_VERSION="0.5.5"     # ★ 本版：数据持久化体检（NOT-PERSISTENT 开机告警 + 持久数据盘解耦）+ virtio-gpu 硬件光标平面（queue 1）
 CXXFLAGS="$CXXFLAGS -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\""
 CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
 #
@@ -1505,6 +1505,21 @@ dd if="$BUILD/system.img"      of="$IMG" seek="$((PAYLOAD_LBA + 1))" conv=notrun
 
 echo "Image  OK. $IMG = $(stat -c%s "$IMG") bytes"
 echo "          载荷：LBA $PAYLOAD_LBA(头) + $((PAYLOAD_LBA + 1))..$((PAYLOAD_LBA + SYS_SECTORS))（$SYS_SECTORS 扇区）"
+
+# ★ 持久数据盘（v0.5.5）：与构建产物**解耦**，只初始化一次，之后重建绝不覆盖。
+#   为什么必须单独一块：build64/sysdisk.img 是**构建产物**——本脚本的每一批 pack 都会用
+#   "--disk sysdisk.img" 重拼它，跑一次 build64.sh 就把里面用户的文档/设置清成模板。
+#   用户若就拿 sysdisk.img 当日常盘用，"重启（= 我又构建了一版）数据就丢"是必然的，
+#   而不是内核写盘坏了（实测 vfs/config 写入都能跨重启存活，见 tests/persist64_test.py）。
+#   规则：文件已存在就**原样保留**并如实打印大小；不存在才从本次 sysdisk.img 初始化一次。
+PERSIST_IMG=vimtu64-64-disk.img
+if [ -f "$PERSIST_IMG" ]; then
+  echo "==> 持久数据盘 保留 $PERSIST_IMG（$(stat -c%s "$PERSIST_IMG") 字节，内含用户数据，本次不覆盖）"
+else
+  cp "$BUILD/sysdisk.img" "$PERSIST_IMG"
+  echo "==> 持久数据盘 初始化 $PERSIST_IMG（从 $BUILD/sysdisk.img 复制一次；此后重建不再覆盖）"
+fi
+echo "    日常使用（单盘，开箱即持久化）: qemu-system-x86_64 -drive format=raw,file=$PERSIST_IMG -m 512 -vga std -serial stdio"
 
 echo "==> 生成 UEFI 的 ESP 镜像（FAT32 48MB，含 BOOTX64.EFI + 内核 + 载荷）"
 "$PY" tools/make_esp.py "$BUILD/esp.img" "$BUILD/BOOTX64.EFI" "$BUILD/kernel64.bin" "$BUILD/system.img" "$BUILD/UEFI64.BIN"

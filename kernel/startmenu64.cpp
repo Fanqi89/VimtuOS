@@ -1979,8 +1979,22 @@ int startmenu64_selftest64() {
             if (s_has_icase(g_view[i].zh, q) || s_has_icase(g_view[i].en, q) ||
                 s_has_icase(g_view[i].alias, q)) { hit = i; break; }
         if (hit < 0 || g_view[hit].id != APP_ID_CALC) fails |= 16384;
-        if (g_view_n == 0 || !s_has_icase(g_view[0].zh, "终端")) fails |= 32768;
-        if (g_view_n == 0 || !s_has_icase(g_view[0].en, "TERM")) fails |= 65536;
+        // ★ v0.5.5 判据对齐（v0.5.4 的排序改动带来的必然结果，**不是放宽断言**）：
+        //   v0.5.4 把 `sm_sync_apps64()` 的排序改成"卷程序优先"（用户点名的需求：固定格里
+        //   要能看见 /bin/browser、/bin/office）。于是 `g_view[0]` 从"终端"变成 `/bin/store`。
+        //   这里原来的两条（32768 = zh 含"终端"、65536 = en 含"TERM"）假设第一条是终端 ——
+        //   事实已变，判据必须跟着变，但**强度不降**：
+        //     ① 第一条必须是"卷里的用户态程序"（builtin=1 且 exec 以 '/' 开头），这正是新排序
+        //        语义的真值（旧判据只敢断言名字里含"终端"两个字，这条更严格）；
+        //     ② 搜"终端"仍必须命中终端（搜索路径没有被排序破坏）。
+        if (g_view_n == 0 || !g_view[0].exec || g_view[0].exec[0] != '/' ||
+            !app64_reg_builtin64(g_view[0].reg)) fails |= 32768;
+        {
+            int th = -1;
+            for (int i = 0; i < g_view_n; i++)
+                if (s_has_icase(g_view[i].zh, "终端") || s_has_icase(g_view[i].en, "TERM")) { th = i; break; }
+            if (th < 0 || g_view[th].id != APP_ID_TERM) fails |= 65536;
+        }
     }
     // 7) 日历/星期换算（与时区无关的固定样本）
     if (weekday_ymd64(2026, 9, 23) != 3) fails |= 131072;       // 2026-09-23 = 星期三

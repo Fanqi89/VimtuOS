@@ -188,11 +188,18 @@ shm + wl_surface + `wl_seat_get()` + font64 排版）：
 - ❌ 日志（journaling）/ 快照 / 配额 / ACL / 符号链接
 - ❌ ext4 / NTFS（读不了 Windows 盘）
 - ⚠️ 写文件是"整文件覆盖 + 立刻落盘"，单文件上限 67584 B（fd 层）
+- ⚠️ **持久化只认 VimtuFS2 主分区**：载体不是卷时（单盘跑安装介质 / 盘上没有 `type=0x07` 分区）
+  改动只活在内存里。v0.5.5 起开机滚屏会打印 `[CONF64] WARN NOT-PERSISTENT …`，不再让用户靠猜。
+  `build64/sysdisk.img` 是**构建产物**（每次 `build64.sh` 重拼），日常请用 `vimtu64-64-disk.img`
+  （构建脚本只在它不存在时初始化一次）。实测 `tests/persist64_test.py` 14/14 PASS。
 
 ### 图形
 - ❌ 真 **Wayland 线协议**：现在的 `wl64` 是**内核自定义 surface ABI**（create/attach/damage/commit/export/ack），
   没有 xdg_shell / libwayland / 协议 XML → Linux 图形程序不能直接用
-- ❌ GPU 通用加速：virtio-gpu 只做 2D 上屏（flip/blit），**合成仍在 CPU**；无 DRM/KMS、无 3D
+- ⚠️ GPU 通用加速：virtio-gpu 只做 2D 上屏（flip/blit），**合成仍在 CPU**；无 DRM/KMS、无 3D。
+  硬件光标平面（queue 1，v0.5.5）已实现但**默认关闭**（`fw_cfg cursor=1` 才开）：软件光标有 6 种形状，
+  硬件平面只有一张 64×64 位图 —— 打开后形状切换就没有了。另外 QEMU 的 cursor 平面**不进
+  scanout surface**，所以 `screendump` 抓不到它（验收改为让设备回读位图逐字节比对）。
 - ❌ 硬件视频解码、HiDPI 完整适配、**输入法（中文 IME）**
 
 ### 硬件 / 安全
@@ -248,11 +255,26 @@ bash build64.sh        # 产出 vimtu64-64.iso / .img，0 error 才算过
 
 ### 跑起来（QEMU）
 ```bash
-# 安装：ISO 当光盘 + 一块空盘当目标盘
+# ① 日常使用（单盘、开箱即用、**改的东西重启还在**）
+qemu-system-x86_64 -m 512 -vga std -drive format=raw,file=vimtu64-64-disk.img
+# ② 安装到自己的盘：ISO 当光盘 + 一块空盘当目标盘
 qemu-system-x86_64 -m 512 -cdrom vimtu64-64.iso \
   -drive format=raw,file=target.img -boot order=d -vga std
 # 装完重启即进系统（默认用户 vimtu，无口令；锁屏回车两次进桌面）
 ```
+
+> **哪块盘才会持久化**（v0.5.5 起开机日志直接告诉你）：只有**带 VimtuFS2 主分区（MBR type=0x07）**
+> 的盘才真落盘。三块盘的定位别混：
+> - `vimtu64-64.img` = **安装介质**（引导链 + 安装程序 + 载荷）。单盘启动会进安装向导，
+>   它自己**不是**数据盘 —— 拿它当日常盘用，改动重启就回到出厂。
+> - `build64/sysdisk.img` = **构建产物**。每跑一次 `build64.sh` 都会被各批 pack 重拼
+>   （"重启（= 我又构建了一版）数据就丢"的真相就是这条）。
+> - `vimtu64-64-disk.img` = **日常数据盘**（推荐）。构建脚本只在**它不存在时**从 sysdisk.img
+>   初始化一次，之后重建**绝不覆盖**。
+>
+> 载体不是 VimtuFS2 卷时，开机滚屏与串口会打印
+> `[CONF64] WARN NOT-PERSISTENT carrier=… reason=no-vimtufs2-volume -> changes in this session will be LOST on restart`。
+> 实测：`tests/persist64_test.py`（同一块盘连续起两次）**14/14 PASS**。
 
 ---
 

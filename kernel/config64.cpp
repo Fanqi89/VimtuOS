@@ -225,6 +225,22 @@ void config64_init64() {
     dbg64_nl();
     dbg64_line_end64();
 
+    // ★ 持久化体检（v0.5.5）：只有 carrier=vfs（VimtuFS2 系统卷里的 /store.a|b）才真能把改动
+    //   写回盘。没有卷时（单盘启动安装介质、或盘上没有 type=0x07 的 VimtuFS2 主分区）本次会话
+    //   的所有改动只活在内存里 —— **重启回到出厂**。这条打点故意放在 init 里而不是等第一次
+    //   flush：用户需要**开机滚屏就能看见**，而不是事后猜"设置怎么又没了"。
+    if (!c_eq(store64_carrier64(), "vfs")) {
+        dbg64_line_begin64();
+        dbg64_str("[CONF64] WARN NOT-PERSISTENT carrier=");
+        dbg64_str(store64_carrier64());
+        dbg64_str(" reason=no-vimtufs2-volume -> changes in this session will be LOST on restart");
+        dbg64_nl();
+        dbg64_str("         要持久化：装到一块空盘（安装程序建 type=0x07 VimtuFS2 主分区），");
+        dbg64_str("或用发布物里的 vimtu64-64-disk.img 启动");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+
     for (int i = 0; i < n; i++) {
         if (store64_entry64(i, k, (int)sizeof(k), v, (int)sizeof(v)) != 0) continue;
         if (!c_starts(k, "cfg.") || !k[4]) continue;

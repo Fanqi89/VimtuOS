@@ -435,7 +435,13 @@ def main():
         # ---------- 3) 固定网格 2 列 × 4 行 ----------
         print("=== 3) 已固定应用网格：2 列 × 4 行、偏右 ===")
         grid = re.search(r"\[START64\] grid cols=(\d+) rows=(\d+) n=(\d+) tile=(\d+)x(\d+) x=(\d+) y=(\d+)", log)
-        tiles = re.findall(r"\[START64\] tile idx=(\d+) app=(\d+) name=(\S+) en=([^x]+?) x=(\d+) y=(\d+) w=(\d+) h=(\d+)", log)
+        # ★ v0.5.5 判据对齐：v0.5.4 起固定格前 5 个是**卷程序**（/bin/store、/bin/edit、/bin/netd、
+        #   /bin/browser、/bin/office），它们的 `app=` 打的是 **-1**（"不是内置窗口"）。
+        #   原正则只收 `\d+`，于是这 5 行**匹配不上**、tiles 只剩 3 条 -> "8 条 tile 几何打点"误报红。
+        #   修法 = 允许负号（断言强度不变：仍然要求 8 条 + 两列四行 + 全在菜单内）。
+        #   ★ 另一处真缺陷（同一条断言）：`en=([^x]+?)` 不允许字母 x —— "Text Editor" 里就有 x，
+        #     于是 idx=1 永远匹配不上（8 条里只认出 7 条）。改成 `en=(.+?) x=\d+`，强度不变。
+        tiles = re.findall(r"\[START64\] tile idx=(\d+) app=(-?\d+) name=(\S+) en=(.+?) x=(\d+) y=(\d+) w=(\d+) h=(\d+)", log)
         check("[START64] grid 打点（cols=2 rows=4 n=8）",
               grid is not None and grid.group(1) == "2" and grid.group(2) == "4" and grid.group(3) == "8",
               grid.group(0) if grid else "（无）")
@@ -552,14 +558,18 @@ def main():
         before = len(vm.log())
         ensure_menu_open()
         if len(tiles) >= 8:
-            t = tiles[3]                         # tile 3 = 计算器（2 列 × 4 行，偏右）
+            # ★ v0.5.5 判据对齐：v0.5.4 起固定格前 5 格是**卷程序**（tile 打点里 app 是 -1 的
+            #   无符号打印，launch 打点里编码成 100+view_idx）—— 两个打点的 app 口径不同，
+            #   原来"tiles[3] 就是计算器"的假设已不成立。改成**按 app id 找到终端那一格**再点：
+            #   断言语义不变（点哪一格就起哪一格的应用），强度不降（还是要求 launch + 真开窗）。
+            t = next((x for x in tiles if x[1] == "3"), tiles[3])
             cur.goto(mon, int(t[4]) + int(t[6]) // 2, int(t[5]) + int(t[7]) // 2)
             time.sleep(0.3)
             mon.click()
             check("点 tile 启动应用（[START64] launch app=%s via=tile）" % t[1],
                   vm.wait_log("launch app=%s via=tile" % t[1], 6, since=before),
                   (re.search(r"\[START64\] launch[^\r\n]*", vm.log()[before:]) or [""])[0])
-            check("应用真的开了（[APP] calc opened）", vm.wait_log("[APP] calc opened", 8, since=before))
+            check("应用真的开了（[APP] term opened）", vm.wait_log("[APP] term opened", 8, since=before))
 
         # ---------- 9) 电源菜单（当前界面内）+ ESC 两级 ----------
         print("=== 9) 电源按钮 -> 竖长方形小圆角框（关机/重启/锁定）+ ESC 两级退出 ===")

@@ -1071,3 +1071,18 @@ int fb_vsync_run64() {
     if (inj) vgpu64_set_inject64(inj, (uint32_t)inj_at);
     return fb_vsync_engine64(bufs, gpu_mode, frames, fps, bench_on);
 }
+
+// ★ v0.5.5：硬件光标平面的开关入口（fw_cfg `cursor=1`）。
+//   为什么缺省关：软件光标有 6 种形状（箭头/移动/文本/转圈/缩放），硬件光标只有一张 64x64 位图，
+//   打开后形状切换就没有了。它换来的是"移鼠标不再整帧重绘"——所以做成显式开关，不偷偷改变观感。
+int fb_cursor_run64() {
+    fb64_cfg_load();
+    if (g_vs_cfg[0] == 0) return 0;
+    if (!fb64_cfg_int("cursor", 0)) return 0;
+    const int on = vgpu64_cursor_enable64();
+    fb64_log_begin();
+    fb64_puts("[VSYNC] cursor cfg=1 -> cursor=");
+    fb64_puts(on ? "hw" : "soft");
+    fb64_log_end();
+    return on;
+}

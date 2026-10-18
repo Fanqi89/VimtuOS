@@ -296,6 +296,12 @@ static const uint32_t DEV64_SLOTS64        = 8;                                 
 static const uint64_t DEV64_SLOT_BYTES64   = 256ULL * 1024ULL;                    // 单槽 = 单 BAR 上限
 static const uint64_t DEV64_WINDOW_BYTES64 = DEV64_SLOTS64 * DEV64_SLOT_BYTES64;  // 2 MiB
 static const uint64_t DEV64_WINDOW_VA64    = SHM64_WINDOW_VA64 - DEV64_WINDOW_BYTES64;
+// ★ v0.5.5：把"映像/大解释器可用上界 == DEV 窗下沿"钉成**编译期**断言。
+//   为什么必须钉：v0.5.0 把 SHM 窗从 256 KiB 放大到 8 MiB 时，usermode64.h 里那条上界式子
+//   没跟着改（仍减 256 KiB），于是映像/mmap 的上界越过了设备窗与 shm 窗 7.75 MiB。
+//   运行期自检（proc64_selftest64 的 bit3）抓得到，但只有真跑起来才会红 —— 编译期钉住更早。
+static_assert(USER64_LOADER_BIG_TOP_VA64 == DEV64_WINDOW_VA64,
+              "USER64_LOADER_BIG_TOP_VA64 必须等于 DEV64_WINDOW_VA64（改 SHM/DEV 窗大小要同步改它）");
 
 // 把**一段物理 MMIO**（phys..phys+map_len，页对齐）按用户可读写/不可执行映射进**当前进程**，
 // *out_va_uptr 写回用户 VA；返回 0 = 新建映射、1 = **幂等复用**（同一个 bdf+bar 之前映射过，

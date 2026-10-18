@@ -49,14 +49,19 @@ static const uint64_t USER64_MMAP_MIN_BYTES64 = 64ULL * 1024ULL;      // mmap �
 //   而 tests/dynlink64_test.py 把解释器基址的落点上界钉在 4GiB+1MiB（本批不动那条验收断言）。
 //   固定下来 = 解释器地址与放大前逐字节相同；窗口放大只抬高 mmap 区的上界。
 static const uint64_t USER64_INTERP_TOP_VA64 = 0x0000000100100000ULL; // 4GiB+1MiB（与放大前的窗口顶重合）
-// ★ 本批（Linux 应用）：**大解释器 / 大映像**能用的窗口上界 = 窗口顶 - (DEV 窗 2MiB + SHM 窗 256KiB)。
-//   为什么不是窗口顶：窗口顶那 2.25 MiB 被 proc64.h 的 DEV64_WINDOW_VA64 / SHM64_WINDOW_VA64 占着
+// ★ 本批（Linux 应用）：**大解释器 / 大映像**能用的窗口上界 = DEV 窗下沿
+//   = 窗口顶 - (SHM 窗 8 MiB + DEV 窗 2 MiB)。
+//   为什么不是窗口顶：窗口顶那 10 MiB 被 proc64.h 的 DEV64_WINDOW_VA64 / SHM64_WINDOW_VA64 占着
 //   （里面是设备 BAR 与 shm 共享页 —— 被 ELF 映像或 mmap 覆盖会变成"进程自己的页"，退出时整片
 //   还回页池，症状极难查）。所以**映像/库/大解释器的可用上界**停在 DEV 窗下沿。
-//   实测：musl 的 ld-musl-x86_64.so.1（span 0xBA000 = 762 KiB）在老的 448 KiB 解释器窗里放不下，
-//   落到这里（base = 本值 - span）；glibc 的 ld-linux（span 0x35000 = 212 KiB）仍走老窗（4GiB+1MiB）。
+//   ★ 真缺陷修复（v0.5.5）：这里原来写的是 `16MiB - (2MiB + 256KiB)` —— 那是 **v0.5.0 之前**
+//     的 SHM 窗大小。v0.5.0 把 SHM 窗放大到 8 MiB（SLOT 2MiB × 4 槽）之后，这条式子仍按 256 KiB
+//     算，于是本值比真正的 DEV 窗下沿**高 7.75 MiB**：映像/mmap 的上界越过了设备窗与 shm 窗。
+//     proc64 的自检 bit3（`selftest FAIL mask=8`）一直抓得到，但只有跑 tests/explorer64_test.py
+//     这一类会读自检结果的用例才看得见 —— 属于"红灯挂着没人看"。修法 = 按 8 MiB 重算。
 static const uint64_t USER64_LOADER_BIG_TOP_VA64 =
-    0x0000000100000000ULL + 16ULL * 1024ULL * 1024ULL - (2ULL * 1024ULL * 1024ULL + 256ULL * 1024ULL); // 4GiB+0xDC0000
+    0x0000000100000000ULL + 16ULL * 1024ULL * 1024ULL
+    - (8ULL * 1024ULL * 1024ULL + 2ULL * 1024ULL * 1024ULL); // = 4GiB+0x600000 = DEV64_WINDOW_VA64
 
 // ★ A1：用户态**帧缓冲映射区**（5GiB 起，上限 40MiB —— 4K 后备缓冲 3840x2160x4 = 33MiB）。
 //   为什么单开一块、而不是放进上面那个用户窗口：

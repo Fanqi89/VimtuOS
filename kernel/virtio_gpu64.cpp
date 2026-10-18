@@ -203,6 +203,8 @@ static uint32_t   g_swap_presents = 0, g_swap_flips = 0;
 static uint32_t   g_res_w = 0, g_res_h = 0;       // resource 宽高（== 后备缓冲 stride 才合法）
 static int        g_scanout_on = 0;
 static const char* const VGPU_HEXL = "0123456789abcdef";
+// ★ v0.5.5：硬件光标（queue 1）——实现在文件末尾，前面的 init 要调用它
+static bool vgpu_cursor_queue_setup();
 
 static const char* vgpu_cmd_name(uint32_t t) {
     switch (t) {
@@ -706,16 +708,18 @@ static bool vgpu_status_step() {
     g_i.device_status = st;
     if (!(st & VGPU_ST_FEATURES_OK)) { vgpu_err("FEATURES_OK not set"); return false; }
     if (!vgpu_queue0_setup()) return false;
-    // 队列 1（cursor queue）：只报告大小，**不启用**（本批不做鼠标平面；见报告"没做到"）
+    // 队列 1（cursor queue）：v0.5.5 起**真建队列**（硬件光标平面用）。建不起来不影响主路径：
+    //   vgpu_cursor_queue_setup 只把 g_c_ready 留 0，后面 vgpu64_cursor_enable64 会如实回退软件光标。
     {
         vcfg_w16(VCFG_QUEUE_SEL, 1);
         const uint16_t sz1 = vcfg_r16(VCFG_QUEUE_SIZE);
         g_i.queue1_size = sz1;
+        vcfg_w16(VCFG_QUEUE_SEL, 0);
+        const bool cq = vgpu_cursor_queue_setup();
         vgpu_log_begin();
         vgpu_puts("[VGPU] queue1 size="); vgpu_num(sz1);
-        vgpu_puts(" (cursor; not enabled)");
+        vgpu_puts(cq ? " (cursor; ready)" : " (cursor; not available)");
         vgpu_log_end();
-        vcfg_w16(VCFG_QUEUE_SEL, 0);
     }
     vcfg_w8(VCFG_DEV_STATUS, (uint8_t)(VGPU_ST_ACK | VGPU_ST_DRIVER | VGPU_ST_FEATURES_OK | VGPU_ST_DRIVER_OK));
     g_i.device_status = vcfg_r8(VCFG_DEV_STATUS);
@@ -1423,6 +1427,7 @@ int vgpu64_bench64() {
         const int W = (int)g_res_w, H = (int)g_res_h;
         const uint64_t cpt = g_cyc_per_tick ? g_cyc_per_tick : vgpu_cyc_per_tick();  // ★ init 已缓存（见上）
         vgpu_bench_case("full", 0, 0, W, H, 5, cpt); n++;               // 整屏 flip（上屏主用例）
+        vgpu_bench_case("rect512", W / 2 - 256, H / 2 - 256, 512, 512, 5, cpt); n++;  // ★ v0.5.5 居中 512x512
         vgpu_bench_case("region", W / 4, H / 4, 512, 512, 5, cpt); n++; // 窗口搬移
         vgpu_bench_case("region", W / 4, H / 4, 128, 128, 5, cpt); n++; // 局部重绘
         vgpu_bench_case("region", W / 2, H / 2, 16, 16, 5, cpt); n++;   // 光标级小块（设备开销对照）
@@ -1433,4 +1438,298 @@ int vgpu64_bench64() {
     //   放在这一层（而不是 ready 的早退之后）是为了让"没有 virtio-gpu"的机器也能跑纯软件路径帧引擎。
     (void)fb_vsync_run64();
     return n;
+}
+
+// ==================== ★ v0.5.5：硬件光标平面（virtio-gpu queue 1）====================
+// 设计边界见 virtio_gpu64.h。这里只记两处**不可省**的细节（QEMU 11.1 实测口径）：
+//   1) cursor 命令走的是**独立的 virtqueue**，通知值 = **队列号 1**（主队列写 0）。写错 = 设备
+//      永远不看这条链 -> 每条命令都吃满有界超时（会被上层当成"设备坏了"，其实是我们自己写错）。
+//   2) cursor 命令**没有响应数据**（设备 push 时 used.len = 0），所以这里只等 used.idx 前进，
+//      **不校验 resp.type**：拿上一命令的旧响应字节判成败会误判。
+#define VGPU_CMD_UPDATE_CURSOR      0x0300u
+#define VGPU_CMD_MOVE_CURSOR        0x0301u
+#define VGPU_FORMAT_B8G8R8A8_UNORM  1u
+#define VGPU_CURSOR_RES_ID          0x100u     // 与 primary(1) / 交换链(2..) 都不撞
+#define VGPU_CURSOR_SIDE            64
+#define VGPU_CURSOR_PAGES           4          // 64*64*4 = 16384 B = 4 页
+
+struct __attribute__((packed)) VgpuCursorPos {
+    uint32_t scanout_id, x, y, padding;
+};
+struct __attribute__((packed)) VgpuUpdateCursor {
+    VgpuHdr hdr; VgpuCursorPos pos; uint32_t resource_id, hot_x, hot_y, padding;
+};
+static_assert(sizeof(VgpuUpdateCursor) == 56,
+              "VgpuUpdateCursor != 56 (spec: hdr24 + pos16 + resource4 + hot_x4 + hot_y4 + pad4)");
+
+static VgpuDesc*  g_c_desc = nullptr;
+static uint16_t*  g_c_avail = nullptr;
+static volatile uint16_t* g_c_used_idx = nullptr;
+static volatile VgpuUsedElem* g_c_used = nullptr;
+static uint16_t   g_c_qsize = 0;
+static uint16_t   g_c_used_seen = 0;
+static uint64_t   g_c_notify_pa = 0;
+static int        g_c_ready = 0;                // 队列 1 建起来了
+static int        g_cursor_on = 0;              // 设备在画光标
+static uint64_t   g_cursor_moves = 0;
+static int        g_cursor_fails = 0;
+static uint8_t*   g_cursor_px = nullptr;        // 4 页（不要求物理连续）
+static uint8_t*   g_cursor_page_va[VGPU_CURSOR_PAGES] = { nullptr, nullptr, nullptr, nullptr };
+static VgpuMemEntry g_cursor_ent[VGPU_CURSOR_PAGES];
+
+// 位图：白色实心箭头 + 1px 黑边（B8G8R8A8_UNORM）；热点 = 左上角 (0,0)，与软件光标的尖一致。
+//   为什么用"简单箭头"而不是复用软件光标的 6 种形状：硬件平面只有**一张位图**，
+//   本批只做箭头（形状切换仍由软件路径负责，见头文件边界说明）。
+static void vgpu_cursor_bitmap(uint8_t* px) {
+    memset_64(px, 0, (uint64_t)VGPU_CURSOR_SIDE * VGPU_CURSOR_SIDE * 4u);
+    for (int y = 0; y < 27; y++) {
+        for (int x = 0; x < 27; x++) {
+            const int d = x + y;                                   // 斜边：x + y = 23
+            int inside = (d <= 23) ? 1 : 0;
+            if (x >= 7 && x <= 12 && y >= 12 && y <= 26) inside = 1;   // 箭头的柄
+            if (!inside) continue;
+            const int edge = (d >= 22) || (x == 0) || (y == 0) ||
+                             (x >= 7 && x <= 12 && (y == 12 || y == 26));
+            uint8_t* p = px + ((uint64_t)y * VGPU_CURSOR_SIDE + (uint64_t)x) * 4u;
+            if (edge) { p[0] = 0x00; p[1] = 0x00; p[2] = 0x00; }
+            else      { p[0] = 0xFF; p[1] = 0xFF; p[2] = 0xFF; }
+            p[3] = 0xFF;
+        }
+    }
+}
+
+// 建队列 1（cursor queue）。与队列 0 的唯一区别：选择子 = 1、大小上限 64、通知地址独立。
+static bool vgpu_cursor_queue_setup() {
+    g_c_ready = 0;
+    vcfg_w16(VCFG_QUEUE_SEL, 1);
+    uint16_t sz = vcfg_r16(VCFG_QUEUE_SIZE);
+    if (!sz) return false;                                       // 设备没声明 cursor 队列
+    if (sz > 64) { vcfg_w16(VCFG_QUEUE_SIZE, 64); sz = vcfg_r16(VCFG_QUEUE_SIZE); }
+    if (sz < 2) return false;
+    void* desc  = page_alloc_64();
+    void* avail = page_alloc_64();
+    void* used  = page_alloc_64();
+    if (!desc || !avail || !used) return false;
+    if ((uint64_t)16 * sz > PAGE_SIZE_64) return false;
+    memset_64(desc, 0, PAGE_SIZE_64);
+    memset_64(avail, 0, PAGE_SIZE_64);
+    memset_64(used, 0, PAGE_SIZE_64);
+    g_c_desc = (VgpuDesc*)desc;
+    g_c_avail = (uint16_t*)avail;
+    g_c_used_idx = (volatile uint16_t*)((uint8_t*)used + 2);
+    g_c_used = (volatile VgpuUsedElem*)((uint8_t*)used + 4);
+    g_c_qsize = sz;
+    g_c_used_seen = 0;
+    vcfg_w64(VCFG_QUEUE_DESC,   vgpu_phys(desc));
+    vcfg_w64(VCFG_QUEUE_DRIVER, vgpu_phys(avail));
+    vcfg_w64(VCFG_QUEUE_DEVICE, vgpu_phys(used));
+    vcfg_w16(VCFG_QUEUE_MSIX_VEC, 0);
+    vcfg_w16(VCFG_QUEUE_ENABLE, 1);
+    const uint16_t noff = vcfg_r16(VCFG_QUEUE_NOTIFY_OFF);
+    g_c_notify_pa = g_i.notify_pa + (uint64_t)noff * (uint64_t)g_i.notify_off_mul;
+    vcfg_w16(VCFG_QUEUE_SEL, 0);
+    g_c_ready = 1;
+    return true;
+}
+
+// 提交一条 cursor 命令到队列 1：单描述符（命令本身），**无响应缓冲**。
+//   有界等待 used.idx 前进（比主队列更短：光标不能拖住帧循环）。失败只记一次打点。
+static bool vgpu_cursor_cmd(const void* cmd, uint32_t len, const char* tag) {
+    if (!g_c_ready || !g_c_desc || !g_i.ready) return false;
+    g_c_desc[0].addr  = vgpu_phys(cmd);
+    g_c_desc[0].len   = len;
+    g_c_desc[0].flags = 0;                                       // 只读、非链式
+    g_c_desc[0].next  = 0;
+    const uint16_t slot = (uint16_t)(g_c_avail[1] % g_c_qsize);
+    g_c_avail[2 + slot] = 0;
+    __asm__ volatile("mfence" ::: "memory");
+    g_c_avail[1] = (uint16_t)(g_c_avail[1] + 1);
+    __asm__ volatile("mfence" ::: "memory");
+    if (g_c_notify_pa) vwr16(g_c_notify_pa, 1);                   // ★ 通知值 = 队列号 1
+    const uint64_t t0 = g_ticks64;
+    uint32_t spin = 0;
+    while (*g_c_used_idx == g_c_used_seen) {
+        if (g_ticks64 - t0 > (uint64_t)(VGPU_CMD_TICKS / 5u) || ++spin > (VGPU_CMD_SPIN / 8u)) {
+            vgpu_log_begin();
+            vgpu_puts("[VGPU] cursor cmd timeout name="); vgpu_puts(tag);
+            vgpu_puts(" used="); vgpu_num(*g_c_used_idx);
+            vgpu_puts(" seen="); vgpu_num(g_c_used_seen);
+            vgpu_log_end();
+            if (g_i.isr_pa) (void)vrd32(g_i.isr_pa);
+            return false;
+        }
+        __asm__ volatile("pause");
+    }
+    g_c_used_seen = *g_c_used_idx;
+    if (g_i.isr_pa) (void)vrd32(g_i.isr_pa);
+    return true;
+}
+
+int vgpu64_cursor_on64() { return g_cursor_on; }
+
+static void vgpu_cursor_off(const char* why) {
+    g_cursor_on = 0;
+    g_i.last_err = why;
+    vgpu_log_begin();
+    vgpu_puts("[VGPU] cursor disable reason=");
+    vgpu_puts(why);
+    vgpu_puts(" -> cursor=soft");
+    vgpu_log_end();
+}
+
+int vgpu64_cursor_enable64() {
+    if (g_cursor_on) return 1;
+    if (!g_i.ready) { vgpu_cursor_off("no-device"); return 0; }
+    if (!g_c_ready) { vgpu_cursor_off("no-cursor-queue"); return 0; }
+
+    // ---- 1) 位图（4 页，每页一条 mem_entry：不要求物理连续）----
+    if (!g_cursor_px) {
+        for (int i = 0; i < VGPU_CURSOR_PAGES; i++) {
+            void* p = page_alloc_64();
+            if (!p) { vgpu_cursor_off("cursor pages"); return 0; }
+            g_cursor_page_va[i] = (uint8_t*)p;
+            g_cursor_ent[i].addr = vgpu_phys(p);
+            g_cursor_ent[i].length = (uint32_t)PAGE_SIZE_64;
+            g_cursor_ent[i].padding = 0;
+        }
+        g_cursor_px = g_cursor_page_va[0];
+        // 位图跨 4 页：按"页内偏移"逐页画。
+        //   ★ 16 KB 位图**绝不能放栈上**（内核栈小，v0.5.0 在 wl64 上踩过一次栈数组爆栈）：
+        //     位图缓冲用 static；页的写入地址用 page_alloc_64 返回的**虚拟地址**（PA==VA 的页池，
+        //     但不依赖这条性质 —— mem_entry 里填的是 vgpu_phys 之后的物理地址）。
+        static uint8_t s_cursor_bmp[VGPU_CURSOR_SIDE * VGPU_CURSOR_SIDE * 4];
+        vgpu_cursor_bitmap(s_cursor_bmp);
+        for (int i = 0; i < VGPU_CURSOR_PAGES; i++) {
+            uint8_t* dst = g_cursor_page_va[i];
+            memset_64(dst, 0, PAGE_SIZE_64);
+            const uint32_t base = (uint32_t)i * (uint32_t)PAGE_SIZE_64;
+            for (uint32_t k = 0; k < (uint32_t)PAGE_SIZE_64; k++)
+                dst[k] = s_cursor_bmp[base + k];
+        }
+    }
+
+    // ---- 2) RESOURCE_CREATE_2D（64x64 B8G8R8A8）----
+    {
+        VgpuCreate2d c;
+        memset_64(&c, 0, sizeof(c));
+        c.hdr.type = VGPU_CMD_RESOURCE_CREATE_2D;
+        c.resource_id = VGPU_CURSOR_RES_ID;
+        c.format = VGPU_FORMAT_B8G8R8A8_UNORM;
+        c.width = VGPU_CURSOR_SIDE;
+        c.height = VGPU_CURSOR_SIDE;
+        if (!vgpu_send(&c, sizeof(c), 0)) { vgpu_cursor_off("create-2d"); return 0; }
+    }
+    // ---- 3) ATTACH_BACKING（4 条 mem_entry，紧跟 32B 命令头）----
+    {
+        struct __attribute__((packed)) {
+            VgpuAttach a; VgpuMemEntry e[VGPU_CURSOR_PAGES];
+        } cmd;
+        memset_64(&cmd, 0, sizeof(cmd));
+        cmd.a.hdr.type = VGPU_CMD_RESOURCE_ATTACH_BACKING;
+        cmd.a.resource_id = VGPU_CURSOR_RES_ID;
+        cmd.a.nr_entries = VGPU_CURSOR_PAGES;
+        for (int i = 0; i < VGPU_CURSOR_PAGES; i++) cmd.e[i] = g_cursor_ent[i];
+        if (!vgpu_send(&cmd, sizeof(cmd), 0)) { vgpu_cursor_off("attach-backing"); return 0; }
+    }
+    // ---- 4) TRANSFER_TO_HOST_2D（整块 64x64）----
+    {
+        VgpuTransfer2d c;
+        memset_64(&c, 0, sizeof(c));
+        c.hdr.type = VGPU_CMD_TRANSFER_TO_HOST_2D;
+        c.r.x = 0; c.r.y = 0; c.r.width = VGPU_CURSOR_SIDE; c.r.height = VGPU_CURSOR_SIDE;
+        c.offset = 0;
+        c.resource_id = VGPU_CURSOR_RES_ID;
+        if (!vgpu_send(&c, sizeof(c), 0)) { vgpu_cursor_off("transfer"); return 0; }
+    }
+    //   为什么必须有这一步（v0.5.5 实测教训）：screendump 抓的是 scanout surface，
+    //   QEMU 的 cursor 平面是**交给前端显示的第 4 层**，不进 surface —— 所以"截图里没有箭头"
+    //   既可能是没实现，也可能是它按规范工作。靠截图判不了。
+    //   ★ 本批实测：QEMU 11.1 对 **cursor resource** 的 TRANSFER_FROM_HOST_2D 一律回
+    //     `resp ERR type=0x1200 (ERR_UNSPEC)`（在普通 resource 上同一条命令是 OK 的）——
+    //     也就是"让设备把 cursor 位图吐回来"这条路在 QEMU 上走不通。
+    //     所以这里**如实降级**：设备回读成功 -> src=device（最强证据）；失败 -> src=self（只证明
+    //     我们的 backing 写入正确），两种情况都**不连累光标功能**（UPDATE/MOVE 自己会被 used 验证）。
+    {
+        VgpuTransfer2d c;
+        memset_64(&c, 0, sizeof(c));
+        c.hdr.type = VGPU_CMD_TRANSFER_FROM_HOST_2D;
+        c.r.x = 0; c.r.y = 0; c.r.width = VGPU_CURSOR_SIDE; c.r.height = VGPU_CURSOR_SIDE;
+        c.offset = 0;
+        c.resource_id = VGPU_CURSOR_RES_ID;
+        int from_dev = 0;
+        if (vgpu_send(&c, sizeof(c), 0) && vgpu_resp_type() == VGPU_RESP_OK_NODATA) from_dev = 1;
+        static uint8_t s_rb[VGPU_CURSOR_SIDE * VGPU_CURSOR_SIDE * 4];    // 16 KB（.bss，不进栈）
+        static uint8_t s_exp[VGPU_CURSOR_SIDE * VGPU_CURSOR_SIDE * 4];
+        for (int i = 0; i < VGPU_CURSOR_PAGES; i++) {
+            const uint8_t* src = g_cursor_page_va[i];
+            const uint32_t base = (uint32_t)i * (uint32_t)PAGE_SIZE_64;
+            for (uint32_t k = 0; k < (uint32_t)PAGE_SIZE_64; k++) s_rb[base + k] = src[k];
+        }
+        vgpu_cursor_bitmap(s_exp);
+        uint32_t diff = 0, white = 0, black = 0;
+        for (uint32_t k = 0; k < (uint32_t)sizeof(s_rb); k++)
+            if (s_rb[k] != s_exp[k]) diff++;
+        for (uint32_t p = 0; p < (uint32_t)(VGPU_CURSOR_SIDE * VGPU_CURSOR_SIDE); p++) {
+            const uint8_t* q = s_rb + p * 4u;
+            if (q[3] != 0xFFu) continue;
+            if (q[0] == 0xFFu && q[1] == 0xFFu && q[2] == 0xFFu) white++;
+            else if (q[0] == 0x00u && q[1] == 0x00u && q[2] == 0x00u) black++;
+        }
+        vgpu_log_begin();
+        vgpu_puts("[VGPU] cursor verify bytes="); vgpu_num((uint64_t)sizeof(s_rb));
+        vgpu_puts(" diff="); vgpu_num((uint64_t)diff);
+        vgpu_puts(" white="); vgpu_num((uint64_t)white);
+        vgpu_puts(" black="); vgpu_num((uint64_t)black);
+        vgpu_puts(diff ? " match=0" : " match=1");
+        vgpu_puts(from_dev ? " src=device" : " src=self");
+        vgpu_log_end();
+        if (diff) { vgpu_cursor_off("cursor-verify"); return 0; }
+        if (!white || !black) { vgpu_cursor_off("cursor-bitmap-empty"); return 0; }
+    }
+    // ---- 5) UPDATE_CURSOR（先把光标摆到 (0,0)，之后由 move 驱动）----
+    {
+        VgpuUpdateCursor c;
+        memset_64(&c, 0, sizeof(c));
+        c.hdr.type = VGPU_CMD_UPDATE_CURSOR;
+        c.pos.scanout_id = 0;
+        c.pos.x = 0; c.pos.y = 0;
+        c.resource_id = VGPU_CURSOR_RES_ID;
+        c.hot_x = 0; c.hot_y = 0;
+        if (!vgpu_cursor_cmd(&c, sizeof(c), "UPDATE_CURSOR")) { vgpu_cursor_off("update-cursor"); return 0; }
+    }
+    g_cursor_on = 1;
+    g_cursor_fails = 0;
+    g_cursor_moves = 0;
+    vgpu_log_begin();
+    vgpu_puts("[VGPU] cursor on res="); vgpu_num(VGPU_CURSOR_RES_ID);
+    vgpu_puts(" "); vgpu_num(VGPU_CURSOR_SIDE);
+    vgpu_puts("x"); vgpu_num(VGPU_CURSOR_SIDE);
+    vgpu_puts(" fmt=b8g8r8a8 hot=0,0 queue=1 sz="); vgpu_num(g_c_qsize);
+    vgpu_log_end();
+    return 1;
+}
+
+void vgpu64_cursor_move64(int x, int y) {
+    if (!g_cursor_on) return;
+    VgpuUpdateCursor c;
+    memset_64(&c, 0, sizeof(c));
+    c.hdr.type = VGPU_CMD_MOVE_CURSOR;
+    c.pos.scanout_id = 0;
+    c.pos.x = (uint32_t)(x < 0 ? 0 : x);
+    c.pos.y = (uint32_t)(y < 0 ? 0 : y);
+    if (!vgpu_cursor_cmd(&c, sizeof(c), "MOVE_CURSOR")) {
+        // 光标命令失败**不降级主路径**：连续 3 次失败才关掉光标平面（回软件光标）
+        if (++g_cursor_fails >= 3) vgpu_cursor_off("move-timeout");
+        return;
+    }
+    g_cursor_fails = 0;
+    g_cursor_moves++;
+    // 打点预算：前 3 次 + 之后每 64 次一条（鼠标每秒几十次，全打会刷爆串口）
+    if (g_cursor_moves <= 3 || (g_cursor_moves & 0x3Fu) == 0) {
+        vgpu_log_begin();
+        vgpu_puts("[VGPU] cursor move x="); vgpu_num((uint64_t)c.pos.x);
+        vgpu_puts(" y="); vgpu_num((uint64_t)c.pos.y);
+        vgpu_puts(" dev=1 moves="); vgpu_num(g_cursor_moves);
+        vgpu_log_end();
+    }
 }
