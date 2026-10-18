@@ -2271,6 +2271,73 @@ static int la_eq64(const char* a, const char* b) {
     while (a[i] && a[i] == b[i]) i++;
     return a[i] == b[i] ? 1 : 0;
 }
+// ==================== ★ v0.5.7：应用装载从 GUI 帧线程挪到独立内核任务 ====================
+// 真缺陷（实测，用户报"点了浏览器/办公套件/编辑器不弹窗、没有界面"）：
+//   `app_launch_exec64` 原来在 **GUI 帧线程里同步**调 proc64_start_elf64 装载 ELF。点浏览器时串口原文：
+//       [PROC64] create pid=27 name=app ...
+//       [WD64] watchdog fire stale=5200ms timeout=5000ms
+//       [PANIC64] stop=WATCHDOG_TIMEOUT detail=0000000000001450 state=RUNNING
+//   也就是**装载那 5.2 秒里 GUI 一帧都画不出来、一次都没喂狗** -> 看门狗把系统打成蓝屏，
+//   之后所有点击当然都没反应。用户看到的现象就是"没有 UI、点了不弹窗"。
+//   为什么 shell 里的 `run /bin/browser` 没这个问题：shell 是**另一个任务**，GUI 帧在并行跑并喂狗。
+// 修法：launch 只把"要启动什么"放进单槽队列，由 **appload 内核任务**在帧外做 create+load；
+//   GUI 帧立刻返回继续渲染/喂狗。装载完新进程进 READY，下一帧就被 GUI 正常服务。
+//   顺带把真实装载耗时打进串口（`load_ms=`），以后性能回归有数可查。
+int  task_create64(const char* name, void (*entry)(void*), void* arg);   // kernel/task64.h
+void task_sleep64(uint32_t ms);
+#define APPLOAD_VIA_MAX 24
+static char g_aload_exec[PROC64_PATH_MAX];
+static char g_aload_via[APPLOAD_VIA_MAX];
+static volatile int g_aload_pending = 0;
+static int g_aload_task = -1;
+
+static void appload_copy(char* d, const char* s, int cap) {
+    int i = 0;
+    if (!d || cap <= 0) return;
+    if (s) { for (; i < cap - 1 && s[i]; i++) d[i] = s[i]; }
+    d[i] = 0;
+}
+
+static void appload_task(void* arg) {
+    (void)arg;
+    for (;;) {
+        if (!g_aload_pending) { task_sleep64(2); continue; }
+        char exec[PROC64_PATH_MAX], via[APPLOAD_VIA_MAX];
+        appload_copy(exec, g_aload_exec, PROC64_PATH_MAX);
+        appload_copy(via, g_aload_via, APPLOAD_VIA_MAX);
+        g_aload_pending = 0;
+        const uint64_t t0 = ticks64();
+        int pid = proc64_create64("app", 0);
+        int rc = -1;
+        if (pid > 0) rc = proc64_start_elf64(pid, exec);
+        if (rc != 0 && pid > 0 && proc64_find64(pid)) proc64_destroy64(pid);
+        const uint64_t dt = (ticks64() - t0) * (uint64_t)TICK_MS_64;
+        dbg64_line_begin64();
+        dbg64_str("[APPREG64] launch exec=");
+        dbg64_str(exec);
+        dbg64_str(" via=");
+        dbg64_str(via);
+        dbg64_str(" kind=elf pid=");
+        dbg64_dec((uint64_t)(pid > 0 ? pid : 0));
+        dbg64_str(" rc=");
+        dbg64_dec((uint64_t)(rc == 0 ? 0 : 1));
+        dbg64_str(rc == 0 ? " load_ms=" : " FAILED load_ms=");
+        dbg64_dec(dt);
+        dbg64_str(" lookup_hits=");
+        dbg64_dec((uint64_t)vfs64_lookup_cache_hits64());
+        dbg64_str(" (appload task; GUI frame not blocked)");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+}
+
+static void appload_push(const char* exec, const char* via) {
+    appload_copy(g_aload_exec, exec, PROC64_PATH_MAX);
+    appload_copy(g_aload_via, via ? via : "-", APPLOAD_VIA_MAX);
+    g_aload_pending = 1;
+    if (g_aload_task < 0) g_aload_task = task_create64("appload", appload_task, nullptr);
+}
+
 int app_launch_exec64(const char* exec, const char* via) {
     const char* v = via ? via : "-";
     if (!exec || !exec[0]) return -1;
@@ -2315,24 +2382,17 @@ int app_launch_exec64(const char* exec, const char* via) {
     const int is_elf  = (head[0] == 0x7F && head[1] == 'E' && head[2] == 'L' && head[3] == 'F');
     const int is_vap  = (head[0] == 'V' && head[1] == 'A' && head[2] == 'P' && head[3] == '6' &&
                          head[4] == '4' && head[5] == 0 && head[6] == 0 && head[7] == 0);
-    if (is_elf && proc64_isolate64()) {                     // 真进程：GUI 不阻塞
-        int pid = proc64_create64("app", 0);
-        int rc = -1;
-        if (pid > 0) rc = proc64_start_elf64(pid, exec);
-        if (rc != 0 && pid > 0 && proc64_find64(pid)) proc64_destroy64(pid);
+    if (is_elf && proc64_isolate64()) {                     // 真进程：**交给 appload 内核任务**，GUI 帧不阻塞
+        appload_push(exec, v);
         dbg64_line_begin64();
         dbg64_str("[APPREG64] launch exec=");
         dbg64_str(exec);
         dbg64_str(" via=");
         dbg64_str(v);
-        dbg64_str(" kind=elf pid=");
-        dbg64_dec((uint64_t)(pid > 0 ? pid : 0));
-        dbg64_str(" rc=");
-        dbg64_dec((uint64_t)(rc == 0 ? 0 : 1));
-        dbg64_str(rc == 0 ? " (real process)" : " FAILED");
+        dbg64_str(" kind=elf queued=1 (appload task; GUI frame not blocked)");
         dbg64_nl();
         dbg64_line_end64();
-        return rc == 0 ? 0 : -1;
+        return 0;
     }
     const int rc = (is_elf || is_vap) ? app64_run_any64(exec) : -1;
     if (!is_elf && !is_vap) {

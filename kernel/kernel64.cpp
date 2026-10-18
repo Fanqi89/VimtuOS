@@ -1605,3 +1605,22 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     os_boot_path(bi);
 #endif
 }
+
+// ==================== ★ v0.5.7：ELF 装载分块之间的让出点 ====================
+// kernel/elf64.cpp 里 `e64_read_at64()` 每读 4 KiB 就调一次这个钩子（那边是**弱符号**，默认空）。
+// 为什么必须有：内核任务之间**非抢占** —— appload 任务装载 /bin/browser（60 KB）实测 5.6 秒，
+//   期间如果一次都不让出，GUI 帧（任务 0）就画不了、也喂不了看门狗，
+//   `[WD64] watchdog fire stale=5200ms timeout=5000ms` 直接把系统打成蓝屏
+//   （这正是用户报的"点浏览器/办公套件不弹窗、没有界面"）。
+// 为什么判断 IF：不能在关中断/中断上下文里 yield（会睡死）。只有可抢占时才真让一个 tick。
+#ifndef VIMTU_INSTALLER_MEDIA
+void elf64_yield64() {
+    uint64_t fl = 0;
+    __asm__ volatile("pushfq; popq %0" : "=r"(fl));
+    if (fl & 0x200ULL) task_yield64();
+}
+#else
+// 安装程序内核没有调度器（不链 kernel/task64.cpp）：保持弱符号的空行为即可 ——
+// 安装向导是单线程同步流程，装载时本来就没人需要被让出。
+void elf64_yield64() { }
+#endif

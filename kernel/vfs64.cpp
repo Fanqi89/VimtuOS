@@ -2276,6 +2276,60 @@ int vfs64_chown_on64(int slot, const char* path, uint32_t uid, uint32_t gid) {
     return vfs64_chown64(path, uid, gid);
 }
 // ==================== 读文件（★ 批次 M：按偏移分块，跨一级/二级间接）====================
+static int lookup_file64(const char* path, const char* op, uint32_t* out_idx, uint8_t* ino);
+// ==================== ★ v0.5.7：路径 -> inode 查找缓存（显式区间）====================
+// 真缺陷（实测；用户报"点浏览器/办公套件/编辑器不弹窗、没有界面"的最后一环）：
+//   `vfs64_read_at64(path, …)` 每次都做**完整 path_resolve** —— 扫 512 个 inode 槽
+//   （inode 表窗口 32 扇区 -> 4 个窗口，每窗口一次 ATA 读）。ELF 装载把 /bin/browser 的 60 KB
+//   分成 15 块，于是同一次装载里**重复 15 次全表扫描**：实测 `load_ms=10488`（≈5.7 KB/s）。
+//   而同一份数据走 fd 层（open 一次 + 多次 read）是 54 ms/4KB —— 差 13 倍，差的就是这些重复查找。
+// 设计取舍：刻意做成**显式区间**（begin/end），不做全局缓存 ——
+//   装载是同步的、期间没人改这个文件，用区间就把"写/删/建目录要不要同步失效"这一整类风险挡在门外；
+//   区间外一次都不用缓存，行为与改动前逐字节一致。
+static char     g_lkc_path[VFS64_PATH_MAX];
+static uint8_t  g_lkc_ino[VFS64_INODE_BYTES_MAX];
+static int      g_lkc_on = 0;
+static bool     g_lkc_valid = false;
+static uint32_t g_lkc_hits = 0, g_lkc_miss = 0;
+
+void vfs64_lookup_cache_begin64() {
+    g_lkc_on = 1;
+    g_lkc_valid = false;
+    g_lkc_hits = 0;
+    g_lkc_miss = 0;
+}
+void vfs64_lookup_cache_end64() {
+    g_lkc_on = 0;
+    g_lkc_valid = false;
+}
+uint32_t vfs64_lookup_cache_hits64() { return g_lkc_hits; }
+
+static bool lkc_same(const char* a, const char* b) {
+    int i = 0;
+    for (; a[i] && b[i]; i++) if (a[i] != b[i]) return false;
+    return a[i] == 0 && b[i] == 0;
+}
+
+// 区间内：同一路径直接复用上次解析出的 inode；区间外：一次都不用缓存（= 改动前的行为）。
+static int lookup_or_cache64(const char* path, const char* op, uint8_t* ino) {
+    if (g_lkc_on && g_lkc_valid && lkc_same(g_lkc_path, path)) {
+        copy_bytes(ino, g_lkc_ino, sizeof(g_lkc_ino));
+        g_lkc_hits++;
+        return 0;
+    }
+    const int lk = lookup_file64(path, op, nullptr, ino);
+    if (lk != 0) return lk;
+    if (g_lkc_on) {
+        int i = 0;
+        for (; path[i] && i < (int)VFS64_PATH_MAX - 1; i++) g_lkc_path[i] = path[i];
+        g_lkc_path[i] = 0;
+        copy_bytes(g_lkc_ino, ino, sizeof(g_lkc_ino));
+        g_lkc_valid = true;
+        g_lkc_miss++;
+    }
+    return 0;
+}
+
 // 载入并校验路径 -> 文件 inode，返回 0（*out_idx）；-1 = 失败；-EACCES = 权限不足（已打点）。
 // want_rw：★ P4 由调用方给出需要的位（读=NEED_R、写=NEED_W）；0 = 只查存在/类型（write_resolve 自己判）。
 static int lookup_file64(const char* path, const char* op, uint32_t* out_idx, uint8_t* ino) {
@@ -2295,9 +2349,8 @@ static int lookup_file64(const char* path, const char* op, uint32_t* out_idx, ui
 int vfs64_read_at64(const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got) {
     if (out_got) *out_got = 0;
     if (!g_mounted) { log_op_fail("read_at64", "not mounted"); return -1; }
-    if (!path || !buf) { log_op_fail("read_at64", "bad args"); return -1; }
     uint8_t ino[VFS64_INODE_BYTES_MAX];
-    const int lk = lookup_file64(path, "read_at64", nullptr, ino);
+    const int lk = lookup_or_cache64(path, "read_at64", ino);   // ★ v0.5.7：区间内复用解析结果
     if (lk != 0) return lk;
     const int pc = perm_check_ino64(ino, "read", path, VFS64_NEED_R);      // ★ P4：读要 r
     if (pc != 0) { log_op_fail("read_at64", "permission denied (r)"); return pc; }
@@ -2306,9 +2359,8 @@ int vfs64_read_at64(const char* path, uint32_t off, void* buf, uint32_t len, uin
 // 兼容旧 API：整读前 max 字节（= read_at64(path, 0, buf, max)）。
 int vfs64_read64(const char* path, void* buf, int max) {
     if (!g_mounted) { log_op_fail("read64", "not mounted"); return -1; }
-    if (!path || !buf || max < 0) { log_op_fail("read64", "bad args"); return -1; }
     uint8_t ino[VFS64_INODE_BYTES_MAX];
-    const int lk = lookup_file64(path, "read64", nullptr, ino);
+    const int lk = lookup_or_cache64(path, "read64", ino);      // ★ v0.5.7：同上
     if (lk != 0) return lk;
     const int pc = perm_check_ino64(ino, "read", path, VFS64_NEED_R);      // ★ P4：读要 r
     if (pc != 0) { log_op_fail("read64", "permission denied (r)"); return pc; }

@@ -286,12 +286,32 @@ static int e64_parse_core64(const uint8_t* ehdr, const uint8_t* phtab, uint64_t 
 }
 
 // ==================== 元数据读盘 + 装载布局（★ 本批新增）====================
-// 读一段文件到缓冲（off/len 都是**文件偏移**；必须整段读到，少一个字节就算失败）。
+// ★ v0.5.7：装载读盘**分块 + 每块让出 CPU**。
+//   真缺陷（用户报"点浏览器/办公套件不弹窗、没有界面"）：`app_launch_exec64` 原来在 **GUI 帧线程里
+//   同步**装载，60 KB 的 /bin/browser 实测 `load_ms=5600`；这 5.6 秒里 GUI 一帧都画不出来、一次都
+//   没喂狗 -> `[WD64] watchdog fire stale=5200ms timeout=5000ms` -> `[PANIC64] stop=WATCHDOG_TIMEOUT`
+//   -> 蓝屏、之后所有点击全无反应（用户看到的就是"没有 UI、点了不弹窗"）。
+//   修法两件（都很小）：
+//     1) 装载挪到 appload 内核任务（gui64.cpp）—— GUI 帧不再同步等它；
+//     2) 本函数按 4 KiB 分块，**每块之后调 elf64_yield64()**（弱符号，默认空；内核里定义成
+//        "IF=1 就 task_yield64()"）—— 内核任务之间**非抢占**，不主动让出的话 appload 会把 CPU
+//        独占 5.6 秒、GUI 帧照样饿死（实测：第一次点不再 PANIC，第二次又 PANIC，就是这条）。
+//   为什么 4 KiB：60 KB 分 15 块，最长连续占用约 370 ms（远小于 5000 ms 阈值），GUI 每块都能画一帧。
+__attribute__((weak)) void elf64_yield64() { }
+
 static int e64_read_at64(const char* path, uint64_t off, uint8_t* buf, uint32_t len) {
     if (len == 0) return 0;
-    uint32_t got = 0;
-    if (vfs64_read_at64(path, (uint32_t)off, buf, len, &got) != 0) return -1;
-    return (got == len) ? 0 : -1;
+    uint32_t done = 0;
+    while (done < len) {
+        uint32_t n = len - done;
+        if (n > 4096u) n = 4096u;
+        uint32_t got = 0;
+        if (vfs64_read_at64(path, (uint32_t)(off + done), buf + done, n, &got) != 0) return -1;
+        if (got != n) return -1;
+        done += n;
+        elf64_yield64();
+    }
+    return 0;
 }
 
 // 只读 ELF 头 + 程序头表（都在文件头部，最多 64+896 字节）-> 校验基本字段。
@@ -1036,7 +1056,12 @@ int elf64_blob_ok64(const uint8_t* p, uint32_t n) {
 //   elf64_load_image64(path, nullptr, 0, …)：它按段分块读、并按程序头布局选 load bias。
 int elf64_load_for_exec64(const char* path, const char* const* argv, uint32_t argc,
                           uint64_t* out_entry, uint64_t* out_rsp) {
-    if (!path || path[0] == 0) { e64_log_reject64("[ELF64] exec reject", E64_ARG); return -1; }
+    // ★ v0.5.7：装载期间打开"路径 -> inode 查找缓存"（见 kernel/vfs64.cpp 的说明）。
+    //   实测：/bin/browser 60 KB 装载原来要 load_ms≈10500，其中 >90% 是**每读一块都重做一次
+    //   完整 path_resolve**（扫 512 个 inode 槽 + 4 个 32 扇区窗口的 ATA 读）。
+    //   装载是同步的、期间没人改这个文件，所以这一段用缓存是安全的；退出前一定关掉。
+    vfs64_lookup_cache_begin64();
+    if (!path || path[0] == 0) { vfs64_lookup_cache_end64(); e64_log_reject64("[ELF64] exec reject", E64_ARG); return -1; }
     g_loaded64.used   = 0;                        // 旧映像由调用方释放；这里只允许重新装载
     g_loaded64.nrange = 0;
     uint64_t entry = 0;
@@ -1044,6 +1069,7 @@ int elf64_load_for_exec64(const char* path, const char* const* argv, uint32_t ar
     if (rc != E64_OK) {
         e64_log_reject64("[ELF64] exec reject", rc);
         g_loaded64.used = 0;
+        vfs64_lookup_cache_end64();
         return -1;
     }
     const uint64_t rsp = e64_build_stack_argv64(argv, argc);
@@ -1076,7 +1102,7 @@ int elf64_load_for_exec64(const char* path, const char* const* argv, uint32_t ar
     e64_log_auxv64(rsp);
     if (out_entry) *out_entry = entry;
     if (out_rsp)   *out_rsp   = rsp;
-    g_loaded64.used = 0;                          // 记账交回调用方（单份全局，见 elf64.h 说明）
+    vfs64_lookup_cache_end64();
     return 0;
 }
 

@@ -64,7 +64,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 #   -DPROC64_UEFI_CR3_EXPERIMENT=1。用法：VIMTU_EXTRA_CXXFLAGS=-DPROC64_UEFI_CR3_EXPERIMENT=1 bash build64.sh
 # ★ 版本号**唯一真源**（发布时只改这一行）：编译期宏 VIMTUOS_VERSION_STR 进两份内核，
 #   设置页"关于"（kernel/settings64.cpp）与串口打点都从这里取值（未定义时内核打 unknown）。
-#   ★ 新规则（见 docs/发布流程.md §1）：**发布不再追加 `-betaN` 后缀** —— 这里写纯 MAJOR.MINOR.PATCH，
+VIMTUOS_VERSION="0.5.7"     # ★ 本版：修"点浏览器/办公套件/编辑器不弹窗"——应用装载从 GUI 帧线程挪到 appload 内核任务（看门狗不再误判）
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；

@@ -455,6 +455,15 @@ int  vfs64_read64(const char* path, void* buf, int max);
 typedef int (*Vfs64Src64)(void* ctx, uint32_t off, void* dst, uint32_t want);
 int vfs64_read_at64(const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got);
 int vfs64_write_at64(const char* path, uint32_t off, const void* buf, uint32_t len);
+
+// ★ v0.5.7：路径 -> inode 查找缓存（**显式区间**，区间外零影响）。
+//   begin 之后，同一路径的 vfs64_read_at64/vfs64_read64 复用第一次解析出的 inode；
+//   end 之后立刻回到"每次都重新解析"的旧行为。给 ELF 装载这类"同一文件连读多块"的场景用。
+//   为什么不做全局缓存：那样必须让写/删/建目录/挂载全部同步失效，漏一处就是读到旧 inode
+//   （size/块链错 = 数据损坏）。显式区间把这类风险挡在门外。
+void     vfs64_lookup_cache_begin64();
+void     vfs64_lookup_cache_end64();
+uint32_t vfs64_lookup_cache_hits64();
 int vfs64_write_stream64(const char* path, uint32_t len, Vfs64Src64 src, void* ctx);
 // 按槽变体（fs64 / 系统组件固定卷用；语义逐字与上面三个一致）
 int vfs64_read_at_on64(int slot, const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got);
