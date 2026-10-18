@@ -42,6 +42,68 @@ KERNEL_CD_BYTES = 8000 * 512          # loader 固定读 4MB（KERNEL_SECTORS �
 PAYLOAD_SECTORS = 8073                # 系统镜像扇区数（512B 单位）
 BOOT_LOAD_SECTORS = 4                 # El Torito 引导镜像占几个 512B 扇区（桩 1536B → 3，取 4）
 
+# ==================== v0.5.6：层级式目录结构 ====================
+# 光盘布局（与 Windows / Ubuntu 安装盘同构）：
+#   /BOOT/CDISO.BIN       BIOS El Torito 引导桩（xorriso -b 指向这里）
+#   /BOOT/LOADER64.BIN    实模式准备 + 进长模式 + 64 位 ATA 读内核
+#   /BOOT/KERNEL64.BIN    安装程序内核（补零到 4MB，loader 定长读）
+#   /SYSTEM/SYSTEM.IMG    系统载荷（装进硬盘的那份完整磁盘映像）
+#   /EFI/BOOT/BOOTX64.EFI UEFI 引导桩（与 ESP 分区里同一份）
+#   /EFI/BOOT/UEFI64.BIN  平铺长模式引导器（同上）
+#   /README.TXT /VERSION  介质自述与版本串
+# ESP 分区（El Torito 的 0xEF 项指向它）内部仍是标准布局：
+#   \\EFI\\BOOT\\BOOTX64.EFI + \\UEFI64.BIN + \\KERNEL64.BIN + \\SYSTEM.IMG
+ISO_DIRS = ("BOOT", "SYSTEM", "EFI")
+
+VIMTU_README = """\
+VimtuOS %(ver)s  --  installation media
+
+Layout of this disc (hierarchical, same shape as Windows/Ubuntu install media):
+
+  /BOOT/CDISO.BIN         BIOS El Torito boot stub
+  /BOOT/LOADER64.BIN      real-mode prep + long mode + ATA loader
+  /BOOT/KERNEL64.BIN      installer kernel (padded to 4 MiB)
+  /SYSTEM/SYSTEM.IMG      system payload (the complete disk image written to the target disk)
+  /EFI/BOOT/BOOTX64.EFI   UEFI boot stub (same file as inside the ESP partition)
+  /EFI/BOOT/UEFI64.BIN    flat long-mode loader
+  /VERSION                version string
+  /README.TXT             this file
+
+The ESP partition (El Torito entry type 0xEF) holds the standard layout:
+  \\EFI\\BOOT\\BOOTX64.EFI, \\UEFI64.BIN, \\KERNEL64.BIN, \\SYSTEM.IMG
+
+How to install (the installer needs TWO disks: this media + one empty target disk):
+
+  qemu-system-x86_64 -m 512 -cdrom vimtu64-64.iso \\
+    -drive format=raw,file=target.img -boot order=d -vga std
+
+  # after install, boot the target disk:
+  qemu-system-x86_64 -m 512 -drive format=raw,file=target.img -vga std
+
+Daily use (single disk, already installed, changes survive reboot):
+  qemu-system-x86_64 -m 512 -vga std -drive format=raw,file=vimtu64-64-disk.img
+
+Boot notes:
+  * BIOS      : El Torito (-b BOOT/CDISO.BIN), or the hybrid MBR for USB/HDD images.
+  * UEFI      : El Torito entry 0xEF -> FAT32 ESP -> \\EFI\\BOOT\\BOOTX64.EFI.
+  * The boot chain reads absolute LBAs patched into the image (VMLD/VMKN/VMSY),
+    it does NOT search this directory tree by name -- so moving files between
+    folders changes nothing at boot time as long as the packer re-patches them.
+"""
+
+
+def vimtuos_version():
+    """从 build64.sh 的 VIMTUOS_VERSION 读版本号（唯一真源）。读不到就写 unknown。"""
+    try:
+        with open(os.path.join(ROOT, "build64.sh"), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith("VIMTUOS_VERSION="):
+                    return s.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return "unknown"
+
 ESP_IMG = os.path.join(BUILD, "esp.img")     # tools/make_esp.py 生成的 FAT32 ESP（48MB）
 ESP_PARTNO = 2                               # GPT 里第 2 分区 = ESP
 
@@ -67,7 +129,12 @@ def msys(p):
 
 
 def iso_dir_records(img, lba, size):
-    """解析一个目录 extent，返回 [(name, lba, size)]。"""
+    """解析一个目录 extent，返回 [(name, lba, size, is_dir)]。
+
+    ★ v0.5.6：多了 is_dir —— 目录结构从**扁平**改成**层级**（/boot、/system、/EFI）之后，
+      回填 LBA 要在树上走，必须能认出一个条目是不是子目录（ISO9660 目录记录 flags bit1）。
+      顺带跳过 "."/".."（它们恒为 0x00/0x01 名字，会让递归原地打转）。
+    """
     data = img[lba * 2048: lba * 2048 + size]
     out = []
     off = 0
@@ -81,25 +148,80 @@ def iso_dir_records(img, lba, size):
             break
         ext_lba = struct.unpack_from("<I", rec, 2)[0]
         ext_len = struct.unpack_from("<I", rec, 10)[0]
+        flags = rec[25]
         name_len = rec[32]
         name = rec[33:33 + name_len].decode("ascii", "replace")
-        out.append((name, ext_lba, ext_len))
+        if name not in ("\x00", "\x01"):
+            out.append((name, ext_lba, ext_len, bool(flags & 0x02)))
         off += ln
     return out
 
 
-def iso_find_file(img, want):
+def iso_norm(name):
+    """ISO9660 名字 -> 可比较的名字：去掉 ';1' 版本号与结尾的 '.'（目录名常写成 'BOOT.'）。"""
+    base = name.split(";")[0].upper()
+    return base.rstrip(".")
+
+
+def vimtuos_version():
+    """从 build64.sh 的 VIMTUOS_VERSION 读版本号（唯一真源）。读不到就写 unknown。
+
+    注意：那一行后面常跟一句中文注释（`VIMTUOS_VERSION="0.5.6"   # ★ …`），
+    所以只取引号里的内容 —— 直接 split("=") 会把注释一起读进来（ASCII 写盘时会炸）。
+    """
+    try:
+        with open(os.path.join(ROOT, "build64.sh"), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if not s.startswith("VIMTUOS_VERSION="):
+                    continue
+                v = s.split("=", 1)[1].strip()
+                if v[:1] in ('"', "'"):
+                    q = v[0]
+                    end = v.find(q, 1)
+                    return v[1:end] if end > 0 else v[1:]
+                return v.split()[0]
+    except OSError:
+        pass
+    return "unknown"
+
+
+def iso_find_path(img, path):
+    """按**层级路径**在 ISO 里找一个文件（"BOOT/LOADER64.BIN"），返回 (lba, size)。
+
+    为什么要有它：以前所有东西都摊在根目录（CDISO.BIN/LOADER64.BIN/KERNEL64.BIN/SYSTEM.IMG），
+    只能扫根。改成树状之后要一层层走（PVD 的根目录 -> BOOT -> …）。
+    查找路径与**引导无关**：引导链（BIOS El Torito 桩 / loader64 / UEFI 的 BOOTX64.EFI）
+    读的是**回填进镜像的绝对 LBA**（VMLD/VMKN/VMSY 补丁点），不按文件名找。所以改目录结构
+    只影响构建期这条查找，回填对上了引导就照旧。
+    """
     pvd = img[16 * 2048: 17 * 2048]
     if pvd[0] != 1 or pvd[1:6] != b"CD001":
         raise RuntimeError("ISO9660 主卷描述符不对")
     root = pvd[156:156 + 34]
-    root_lba = struct.unpack_from("<I", root, 2)[0]
-    root_len = struct.unpack_from("<I", root, 10)[0]
-    for name, lba, size in iso_dir_records(img, root_lba, root_len):
-        base = name.split(";")[0].upper()
-        if base == want.upper():
-            return lba, size
-    raise RuntimeError("ISO 里找不到文件 %s" % want)
+    cur_lba = struct.unpack_from("<I", root, 2)[0]
+    cur_len = struct.unpack_from("<I", root, 10)[0]
+    parts = [p for p in path.replace("\\", "/").split("/") if p]
+    for i, part in enumerate(parts):
+        hit = None
+        for name, lba, size, is_dir in iso_dir_records(img, cur_lba, cur_len):
+            if iso_norm(name) == part.upper():
+                hit = (lba, size, is_dir)
+                break
+        if not hit:
+            raise RuntimeError("ISO 里找不到 %s（在 %s 这一层）"
+                               % (path, "/".join(parts[:i]) or "根目录"))
+        if i == len(parts) - 1:
+            return hit[0], hit[1]
+        if not hit[2]:
+            raise RuntimeError("ISO 路径 %s：%s 不是目录" % (path, part))
+        cur_lba, cur_len = hit[0], hit[1]
+    raise RuntimeError("ISO 路径为空")
+
+
+def iso_find_file(img, want):
+    """兼容入口：按根目录里的扁平文件名找（保留给旧调用者/人工排查）。"""
+    return iso_find_path(img, want)
 
 
 def patch_dword(img, magic, value, what):
@@ -309,35 +431,74 @@ def main():
             print("缺少 build64/%s（先跑 build64.sh 的汇编/内核部分）" % f)
             return 2
 
-    # ---- 暂存目录 ----
+    # ---- 暂存目录（★ v0.5.6：扁平 -> 层级式树状结构，与 Windows / Ubuntu 安装盘同构）----
+    #   /BOOT/        CDISO.BIN（BIOS El Torito 引导桩）+ LOADER64.BIN + KERNEL64.BIN
+    #   /SYSTEM/      SYSTEM.IMG（系统载荷 = 装进硬盘的那份完整磁盘映像）
+    #   /EFI/BOOT/    BOOTX64.EFI + UEFI64.BIN（与 ESP 分区里同一份，让光盘目录与发行版一致）
+    #   /README.TXT   介质自述（三种引导方式 + 安装步骤）
+    #   /VERSION      版本串
+    #   ★ 与引导的关系：引导链读的是**回填进镜像的绝对 LBA**（VMLD/VMKN/VMSY 补丁点），
+    #     不按文件名/路径查找 —— 所以目录层级只是"外观与可维护性"，改了不会动引导，
+    #     唯一要多做的是构建期这条查找要能在树上走（见 iso_find_path）。
     if os.path.exists(STAGE):
         shutil.rmtree(STAGE)
-    os.makedirs(STAGE)
-    shutil.copyfile(os.path.join(BUILD, "cdiso.bin"), os.path.join(STAGE, "CDISO.BIN"))
-    shutil.copyfile(os.path.join(BUILD, "loader64.bin"), os.path.join(STAGE, "LOADER64.BIN"))
+    d_boot = os.path.join(STAGE, "BOOT")
+    d_sys = os.path.join(STAGE, "SYSTEM")
+    d_efi = os.path.join(STAGE, "EFI", "BOOT")
+    for d in (d_boot, d_sys, d_efi):
+        os.makedirs(d)
+    shutil.copyfile(os.path.join(BUILD, "cdiso.bin"), os.path.join(d_boot, "CDISO.BIN"))
+    shutil.copyfile(os.path.join(BUILD, "loader64.bin"), os.path.join(d_boot, "LOADER64.BIN"))
 
     kpath = os.path.join(BUILD, "kernel64.bin")
     ksize = os.path.getsize(kpath)
-    with open(os.path.join(STAGE, "KERNEL64.BIN"), "wb") as out, open(kpath, "rb") as f:
+    with open(os.path.join(d_boot, "KERNEL64.BIN"), "wb") as out, open(kpath, "rb") as f:
         shutil.copyfileobj(f, out)
         pad = KERNEL_CD_BYTES - ksize
         if pad > 0:
             out.write(b"\0" * pad)
-    shutil.copyfile(os.path.join(BUILD, "system.img"), os.path.join(STAGE, "SYSTEM.IMG"))
+    shutil.copyfile(os.path.join(BUILD, "system.img"), os.path.join(d_sys, "SYSTEM.IMG"))
+
+    # 光盘里也放一份 EFI 目录（内容与 ESP 分区一模一样）：用户/工具在光盘上就能看到
+    # "EFI/BOOT/BOOTX64.EFI" 这个标准路径。UEFI 真正引导走的是 El Torito 的 0xEF 项
+    # （指向 ESP 分区），这两份互不冲突。
+    efi_boot_sz = uefi_sz = 0
+    for src, dst, tag in (("BOOTX64.EFI", "BOOTX64.EFI", "efi_boot"),
+                          ("UEFI64.BIN", "UEFI64.BIN", "uefi")):
+        p = os.path.join(BUILD, src)
+        if os.path.exists(p):
+            shutil.copyfile(p, os.path.join(d_efi, dst))
+            if tag == "efi_boot":
+                efi_boot_sz = os.path.getsize(p)
+            else:
+                uefi_sz = os.path.getsize(p)
+
+    # 介质自述与版本串（纯 ASCII：光盘在任何系统上都不会显示成乱码）
+    ver = vimtuos_version()
+    with open(os.path.join(STAGE, "VERSION"), "w", encoding="ascii", newline="\n") as f:
+        f.write("VimtuOS %s\n" % ver)
+    with open(os.path.join(STAGE, "README.TXT"), "w", encoding="ascii", newline="\r\n") as f:
+        f.write(VIMTU_README % {"ver": ver})
 
     loader_size = os.path.getsize(os.path.join(BUILD, "loader64.bin"))
     stub_size = os.path.getsize(os.path.join(BUILD, "cdiso.bin"))
-    payload_bytes = os.path.getsize(os.path.join(STAGE, "SYSTEM.IMG"))
-    print("  ISO 暂存：CDISO=%d B, LOADER64=%d B, KERNEL64=%d B(补零后), SYSTEM.IMG=%d B"
-          % (stub_size, loader_size, KERNEL_CD_BYTES, payload_bytes))
+    payload_bytes = os.path.getsize(os.path.join(d_sys, "SYSTEM.IMG"))
+    print("  ISO 暂存（层级）：BOOT/CDISO=%d B, BOOT/LOADER64=%d B, BOOT/KERNEL64=%d B(补零后), "
+          "SYSTEM/SYSTEM.IMG=%d B" % (stub_size, loader_size, KERNEL_CD_BYTES, payload_bytes))
+    if efi_boot_sz or uefi_sz:
+        print("  ISO 暂存（层级）：EFI/BOOT/BOOTX64.EFI=%d B, EFI/BOOT/UEFI64.BIN=%d B"
+              % (efi_boot_sz, uefi_sz))
+    print("  ISO 暂存（层级）：VERSION + README.TXT（VimtuOS %s）" % ver)
 
     has_esp = os.path.exists(ESP_IMG)
     esp_bytes = os.path.getsize(ESP_IMG) if has_esp else 0
 
     # ---- xorriso 打包（BIOS El Torito + UEFI El Torito + 附加 ESP 分区）----
+    #   -b 的路径跟着新层级走（BOOT/CDISO.BIN）；Joliet + Rock Ridge 让 Windows/Linux 看到
+    #   与暂存目录一致的名字（老 ISO9660 主卷仍是 8.3 大写，任何固件都能读）。
     args = [xo, "-as", "mkisofs", "-o", msys(ISO),
-            "-b", "CDISO.BIN", "-no-emul-boot", "-boot-load-size", str(BOOT_LOAD_SECTORS),
-            "-V", "VIMTU64", "-quiet"]
+            "-b", "BOOT/CDISO.BIN", "-no-emul-boot", "-boot-load-size", str(BOOT_LOAD_SECTORS),
+            "-J", "-R", "-V", "VIMTU64", "-quiet"]
     if has_esp:
         args += ["-eltorito-alt-boot",
                  "-e", "--interval:appended_partition_%d:all::" % ESP_PARTNO,
@@ -356,12 +517,23 @@ def main():
     # ---- 回填 LBA、写 MBR / GPT ----
     with open(ISO, "r+b") as f:
         img = bytearray(f.read())
-        ll, ls = iso_find_file(img, "LOADER64.BIN")
-        kl, ks = iso_find_file(img, "KERNEL64.BIN")
-        sl, ss = iso_find_file(img, "SYSTEM.IMG")
-        cl, cs = iso_find_file(img, "CDISO.BIN")
-        print("  ISO9660：CDISO@%d(%d) LOADER64@%d(%d) KERNEL64@%d(%d) SYSTEM.IMG@%d(%d)"
+        # ★ v0.5.6：按**层级路径**找（回填用的 LBA 与目录层级无关，只要找到同一个文件）
+        ll, ls = iso_find_path(img, "BOOT/LOADER64.BIN")
+        kl, ks = iso_find_path(img, "BOOT/KERNEL64.BIN")
+        sl, ss = iso_find_path(img, "SYSTEM/SYSTEM.IMG")
+        cl, cs = iso_find_path(img, "BOOT/CDISO.BIN")
+        print("  ISO9660（层级）：BOOT/CDISO@%d(%d) BOOT/LOADER64@%d(%d) "
+              "BOOT/KERNEL64@%d(%d) SYSTEM/SYSTEM.IMG@%d(%d)"
               % (cl, cs, ll, ls, kl, ks, sl, ss))
+        # 目录树自检：把**镜像里真实存在**的层级打印出来（不是暂存目录的，是解析 ISO 得到的）
+        try:
+            for p in ("BOOT/CDISO.BIN", "BOOT/LOADER64.BIN", "BOOT/KERNEL64.BIN",
+                      "SYSTEM/SYSTEM.IMG", "EFI/BOOT/BOOTX64.EFI", "EFI/BOOT/UEFI64.BIN",
+                      "README.TXT", "VERSION"):
+                lba, size = iso_find_path(img, p)
+                print("    [ok] /%s @LBA %d (%d B)" % (p, lba, size))
+        except RuntimeError as e:
+            print("    警告：目录树自检未通过：%s" % e)
 
         # 光盘路径（2048B 单位）
         patch_dword(img, b"VMLD", ll, "光盘：loader 起始扇区")

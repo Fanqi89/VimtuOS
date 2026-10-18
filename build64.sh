@@ -6,6 +6,12 @@
 #   2) build64/kernel64_os.bin  装进硬盘的**系统**内核（不带该宏 -> 走系统启动路径）
 #   3) build64/system.img       系统镜像载荷（= 装进硬盘的完整磁盘映像，8073 扇区）
 #      以及 vimtu64-64.img      安装介质：引导链 + 安装程序 + 载荷（system.img）
+#      以及 vimtu64-64.iso      安装光盘（层级式目录，v0.5.6 起）：
+#        /BOOT/CDISO.BIN（BIOS El Torito 桩）+ LOADER64.BIN + KERNEL64.BIN
+#        /SYSTEM/SYSTEM.IMG（系统载荷） /EFI/BOOT/{BOOTX64.EFI,UEFI64.BIN}
+#        /README.TXT /VERSION
+#        引导链读回填的绝对 LBA（VMLD/VMKN/VMSY…），**不按文件名查找** —— 所以目录层级
+#        只影响构建期查找（tools/make_iso64.py 的 iso_find_path），不动引导。
 #
 # 镜像布局（必须与 kernel/memlayout64.h、boot/loader64.asm 三方一致）：
 #   LBA 0            : boot.bin        （512B MBR）
@@ -64,7 +70,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
 #   空夹具盘由构建期"原始区"（build64/demo64_raw.bin，写进 system.img 的 LBA 7497 起）兜底。
 #   内核二进制里只剩路径/偏移/长度表（kernel/demo64.h），本文件末尾有 64B 探针断言。
-VIMTUOS_VERSION="0.5.5"     # ★ 本版：数据持久化体检（NOT-PERSISTENT 开机告警 + 持久数据盘解耦）+ virtio-gpu 硬件光标平面（queue 1）
+VIMTUOS_VERSION="0.5.6"     # ★ 本版：ISO 目录结构扁平 -> 层级式（/BOOT /SYSTEM /EFI + README/VERSION），三种引导实测通过
 CXXFLAGS="$CXXFLAGS -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\""
 CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
 #

@@ -276,6 +276,22 @@ qemu-system-x86_64 -m 512 -cdrom vimtu64-64.iso \
 > `[CONF64] WARN NOT-PERSISTENT carrier=… reason=no-vimtufs2-volume -> changes in this session will be LOST on restart`。
 > 实测：`tests/persist64_test.py`（同一块盘连续起两次）**14/14 PASS**。
 
+> **安装光盘的目录结构**（v0.5.6 起是层级式，和 Windows / Ubuntu 安装盘同构）：
+> ```
+> /BOOT/CDISO.BIN           BIOS El Torito 引导桩
+> /BOOT/LOADER64.BIN        实模式准备 + 进长模式 + ATA loader
+> /BOOT/KERNEL64.BIN        安装程序内核（补零到 4 MiB）
+> /SYSTEM/SYSTEM.IMG        系统载荷（装进目标盘的完整磁盘映像）
+> /EFI/BOOT/BOOTX64.EFI     UEFI 引导桩（与 ESP 分区内同一份）
+> /EFI/BOOT/UEFI64.BIN      平铺长模式引导器
+> /README.TXT  /VERSION     介质自述与版本串
+> ```
+> ESP 分区（El Torito 0xEF 项指向它）内部仍是标准布局：
+> `\EFI\BOOT\BOOTX64.EFI` + `\UEFI64.BIN` + `\KERNEL64.BIN` + `\SYSTEM.IMG`。
+> **改目录不影响引导**：引导链读的是回填进镜像的绝对 LBA（`VMLD/VMKN/VMSY` 补丁点），
+> 不按文件名查找。三种引导（BIOS 光盘 / UEFI 光盘 / hybrid 硬盘·U 盘）实测都在
+> `tests/iso64_layout_test.py` 里：**25/25 PASS**。
+
 ---
 
 ## 五、验收与工程质量
