@@ -3426,6 +3426,7 @@ TESTS = [
     ("browser64_test.py", "★ v0.5.0 ring3 真窗口浏览器：大 surface(896x580/shm 2MiB) + HTML 子集排版 + 屏幕像素（白底/墨迹/链接蓝）+ PageDown 滚动 + ESC 退出"),
     ("browser_http64_test.py", "★ v0.5.2 浏览器真联网：net_raw 号 53 上的 ARP/TCP + HTTP/1.0 GET（宿主 python http.server，客人经 slirp 10.0.2.2），status/字节数与宿主页逐字节一致 + 屏幕墨迹 + 不可达端口如实失败"),
     ("office64_test.py", "★ v0.5.3 办公套件 /bin/office：三模式窗口 + 文档打字(col=14) + 切模式自动落盘（宿主侧独立解析卷读到标记串）+ 表格 =1+2*3->7 / =A1+1->#CIRC + ESC 退出"),
+    ("apps64_test.py", "★ v0.5.4 浏览器/办公套件进应用注册表：[APPREG64] 两条 exec=/bin/browser|office + builtin=14 + builtin=1/desktop=1 + 宿主侧解析卷确认两个 ELF 在盘上"),
     ("term_render64_test.py", "★ v0.4.7 终端三无渲染：像素级证明「无抗锯齿」(中间灰=0)+「无次像素」+ 纯黑底/纯白字 +"
                               " ANSI 16 色表 + 度量驱动整数行距；并断言启动不再显示硬件报告页、直出滚动英文 boot log"),
     ("fd64_test.py", "批次 D FD 语义：每进程 fd 表 + dup 共享游标 + fork 继承 + O_APPEND + pipe 环回"),

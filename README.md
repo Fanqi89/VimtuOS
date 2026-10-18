@@ -4,7 +4,7 @@
 目标是"能当日常系统用"，而不是教学玩具。
 
 - 语言：C / C++（内核）+ Rust（设计 Token 表）+ 汇编（引导与入口）+ Python（构建与验收）
-- 版本：**0.5.3**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0…）
+- 版本：**0.5.4**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0…）
 - 许可：GPL-3.0
 - 验收方式：**77 个自动化验收脚本**，每条断言都有串口打点或像素证据（见 [验收](#五验收与工程质量)）
 
@@ -133,7 +133,22 @@ shm + wl_surface + `wl_seat_get()` + font64 排版）：
 如实边界：文档**没有富文本/图片/表格内嵌/输入法**（键盘只给 ASCII）；表格**没有小数、函数库、
 跨表引用**，除法是整数除法；演示只有 3 页固定文本；`.vwd/.vts/.vpt` 都是自己的格式。
 
-### 10. 其他
+### 10. 应用注册表里的浏览器与办公套件（v0.5.4 起）
+
+`/bin/browser` 与 `/bin/office` 都进了**应用注册表**（`kernel/app64.cpp` 的 `kBuiltinApps64`）：
+桌面图标与开始菜单里能看到「浏览器」「办公套件」，点开走 `fork+execve` **真进程**
+（所以它们的 `shm` / `wl_surface` / `wl_seat_get()` 都能用），与 `/bin/store`、`/bin/edit` 同一条路径。
+
+★ 为什么它们是**预装应用**而不是"商店里可安装的包"（如实）：`.vap64` 的载荷上限是 **32 KiB**
+（`tools/store_pack_win.py` 的 `build_repo()` 里硬断言 `32768 + 64`），而 `browser.elf` **60,816 B**、
+`office.elf` **49,712 B** 都超了。要把它们做成"可下载包"，得先把 `.vap64` 的装载缓冲放大
+（`kernel/app64.h` + `vs_pkg.c` + `make_vap.py`）—— 这是下一批的事。
+
+实测（`tests/apps64_test.py`）：注册表打点 `[APPREG64] app … exec=/bin/browser` /
+`… exec=/bin/office`，`entries=… builtin=**14**`（原 12 + 2），两条都是 `builtin=1 desktop=1`；
+宿主侧独立解析卷确认 `/bin/browser`、`/bin/office` 都是 ELF 且在盘上。
+
+### 11. 其他
 - 原生 PNG/JPEG（基线+扩展顺序）解码；内置图标包（30 个系统图标 + 应用图标）
 - 系统音效（4 段自合成素材 + `/bin/sounder` 用户态播放器，音频 ABI 49）
 - ring3 网络栈：`/bin/netd`（DHCP / DNS / TCP / UDP / ARP / ICMP，e1000 驱动在 ring0）
@@ -277,7 +292,8 @@ Fonts-open/  Sarasa Mono SC（终端）+ Unifont（兜底）+ 许可原文
 
 - 仓库：<https://github.com/Fanqi89/VimtuOS>
 - 发布：每个版本一个 Release + 两个附件（ISO / IMG）+ 正文附 sha256；**旧版本 Release 永不改动**
-- 最新：**v0.5.3**（本版：**办公套件 `/bin/office`** = 文档/表格/演示三合一，8×20 定点整数公式引擎（四则/引用/SUM/环检测 `#CIRC`），切模式与退出自动落盘，宿主侧独立解析卷读回标记串；`office64_test` **15/15 PASS**）
+- 最新：**v0.5.4**（本版：**浏览器 / 办公套件进应用注册表** = 桌面图标 + 开始菜单可见，点开 fork+execve 真进程；`builtin=14`；`apps64_test` **10/10**；如实说明 `.vap64` 32 KiB 上限使它们只能做预装应用）
+- 上一版：**v0.5.3**（本版：**办公套件 `/bin/office`** = 文档/表格/演示三合一，8×20 定点整数公式引擎（四则/引用/SUM/环检测 `#CIRC`），切模式与退出自动落盘，宿主侧独立解析卷读回标记串；`office64_test` **15/15 PASS**）
 - 上一版：**v0.5.2**（本版：**浏览器真的能上网** = `/bin/browser` 接内核 `net_raw`（号 53）自己实现 ARP/DNS/TCP + `HTTP/1.0 GET`；宿主 `http.server` -> 客人 `10.0.2.2`，`status=200 bytes=300` 与宿主页逐字节一致、屏幕墨迹 1.17%、不可达端口如实失败；`browser_http64_test` **12/12 PASS**）
 - 上一版：**v0.5.1**（本版：**浏览器真正可交互** = 补上 `wl_seat_get()`（键盘焦点 + 指针捕获），点击翻页 / ESC 退出实测通过；`browser64_test` 从 UNVERIFIED 变 **16/16 PASS**。v0.5.0 的"输入路由未通"其实是应用漏调这个 API，不是内核缺能力）
 - 上一版：**v0.5.0**（本版：**大窗口 ABI** = shm 单对象 64 KiB -> 2 MiB、大 surface 屏幕居中；**`/bin/browser` ring3 真窗口浏览器** = 896x580 窗口 + HTML 子集排版 + 滚动 + 像素验收）

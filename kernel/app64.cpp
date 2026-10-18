@@ -466,6 +466,13 @@ static const AppRegRec64 kBuiltinApps64[] = {
     { "商店",       "App Store",      "/bin/store",       "plus",        "store shop vpkg appstore",      -1,              1, 0, 0, 0 },
     { "文本编辑器", "Text Editor",    "/bin/edit",        "files",       "edit editor text file tcc",     -1,              1, 0, 0, 0 },
     { "网络工具",   "Network Tools",  "/bin/netd",        "globe",       "netd network dhcp dns tcp",     -1,              1, 0, 0, 0 },
+    // ★ v0.5.4：两个 ring3 大应用（浏览器 / 办公套件）也进注册表 —— 桌面图标 + 开始菜单可见，
+    //   点开就是 fork+execve 真进程（有进程上下文，所以它们的 shm/wl_surface/wl_seat_get 都能用）。
+    //   为什么**不是**商店里的 .vap64：那个格式的载荷上限是 32 KiB（tools/store_pack_win.py 的
+    //   build_repo 里硬断言 32768+64），而 browser.elf 60,816 B、office.elf 49,712 B 都超了 ——
+    //   它们是**预装应用**，不是可下载包。这条边界写在 README 与 docs 里。
+    { "浏览器",     "Browser",        "/bin/browser",      "globe",       "browser web http html www",     -1,              1, 0, 0, 0 },
+    { "办公套件",   "Office",         "/bin/office",       "files",       "office doc sheet slides word excel", -1,          1, 0, 0, 0 },
 };
 #define APPREG64_BUILTIN_N ((int)(sizeof(kBuiltinApps64) / sizeof(kBuiltinApps64[0])))
 
