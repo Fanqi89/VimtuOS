@@ -64,13 +64,17 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 #   -DPROC64_UEFI_CR3_EXPERIMENT=1。用法：VIMTU_EXTRA_CXXFLAGS=-DPROC64_UEFI_CR3_EXPERIMENT=1 bash build64.sh
 # ★ 版本号**唯一真源**（发布时只改这一行）：编译期宏 VIMTUOS_VERSION_STR 进两份内核，
 #   设置页"关于"（kernel/settings64.cpp）与串口打点都从这里取值（未定义时内核打 unknown）。
-VIMTUOS_VERSION="0.5.7"     # ★ 本版：修"点浏览器/办公套件/编辑器不弹窗"——应用装载从 GUI 帧线程挪到 appload 内核任务（看门狗不再误判）
+# ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
+#   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
+#   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
+VIMTUOS_VERSION="0.5.8"     # ★ 本版：根目录规范化 —— /Wallpapers（预设壁纸）+ /Avatars（预设头像）分开；壁纸放行 JPEG
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
 #   空夹具盘由构建期"原始区"（build64/demo64_raw.bin，写进 system.img 的 LBA 7497 起）兜底。
+[ "$(grep -c '^VIMTUOS_VERSION=' "$0")" -eq 1 ] || {
+  echo "ERROR: VIMTUOS_VERSION 在本脚本里定义了多次（唯一真源被覆盖，内核版本串会错）" >&2; exit 1; }
 #   内核二进制里只剩路径/偏移/长度表（kernel/demo64.h），本文件末尾有 64B 探针断言。
-VIMTUOS_VERSION="0.5.6"     # ★ 本版：ISO 目录结构扁平 -> 层级式（/BOOT /SYSTEM /EFI + README/VERSION），三种引导实测通过
 CXXFLAGS="$CXXFLAGS -DVIMTUOS_VERSION_STR=\"$VIMTUOS_VERSION\""
 CXXFLAGS="$CXXFLAGS ${VIMTU_EXTRA_CXXFLAGS:-}"
 #
@@ -387,6 +391,10 @@ echo "==> ★ A4-1：ring3 shell（**交付 = 系统卷里的 /bin/shell.bin**�
 #      /etc/sh64hello.txt + /tmp(0777)）-> $BUILD/shellvol.img（写完会逐字节回读自检）；
 #   3) 系统镜像装完之后，同一条命令再把它放进演示/验收盘的主分区（LBA 8009）
 #      -> $BUILD/sysdisk.img；内核二进制里**不含** shell 的字节（后面有一条断言）。
+# ★ v0.5.8：先生成"预设头像 + 内置示例壁纸"（build64/presets/），再由 make_shellvol 打进卷内的
+#   /Wallpapers（壁纸）与 /Avatars（头像）——**两个目录分开**，这是用户点名的根目录规范。
+#   用户自己的壁纸放 res/wallpapers/，会被同一条命令一起写进 /Wallpapers/。
+$PY tools/make_presets.py --out "$BUILD/presets"
 bash user/shell/build_shell.sh "$BUILD"
 $PY tools/make_shellvol.py --shell "$BUILD/shell.bin" --vol "$BUILD/shellvol.img"
 
@@ -1483,6 +1491,13 @@ else
     echo "ERROR: 缺少 $OFFICE_VOL_IN 或 build64/office.elf —— 办公套件没装进系统卷" >&2
     exit 1
 fi
+echo "==> ★ v0.5.8：系统预设头像 / 预设壁纸写进卷（/Avatars + /Wallpapers，两个独立目录）"
+# 为什么放在**链尾**：卷链上第一个 pack 步骤是从"原始区"重建卷的，make_shellvol 里加的
+# /Wallpapers、/Avatars 传不下来（实测：shellvol.img 有、所有后续 *vol.img 都没有）。
+# 所以预设必须在最后一步单独追加一次；这一步的产物直接就是 sysdisk.img。
+"$PY" tools/presets_pack_win.py --vol-in "$BUILD/officevol.img" \
+      --vol-out "$BUILD/presetsvol.img" \
+      --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
 "$PY" - "$BUILD/payload_hdr.bin" "$SYS_SECTORS" "$((PAYLOAD_LBA + 1))" <<'PYEOF'
 import struct, sys

@@ -89,6 +89,7 @@
 #include "gfx64.h"           // 圆角 + 阴影 + 毛玻璃 + 壁纸适应模式
 #include "startmenu64.h"     // P2 UI 工具箱（混合圆角/亚克力/线性图标/文本）+ 开始菜单几何
 #include "img64.h"           // PNG/BMP 解码（壁纸 / 头像）
+#include "vfs64.h"           // ★ v0.5.8：/Wallpapers、/Avatars 目录枚举（预设壁纸 / 预设头像）
 #include "edid64.h"          // 显示器 EDID（刷新率/名字/尺寸）：只读
 #include "display64.h"       // 运行期显示层（模式清单/实测刷新率来源）
 #include "net64.h"           // e1000 状态 + 收发计数 + 静态 IP 配置
@@ -757,6 +758,104 @@ void settings64_sync_user_prefs64(int theme_id, int lock_mode) {
     if (theme_id < 0 && lock_mode < 0) return;
     set_cur_user_theme64(theme_id, lock_mode);
 }
+// ==================== ★ v0.5.8：预设壁纸 / 预设头像（扫目录循环切换）====================
+// 目录规范（用户点名）：/Wallpapers = 预设壁纸、/Avatars = 预设头像，**两者分开**。
+// 改动前两个"预设"按钮都写死 /logo/kaisi.png —— 同一个文件既是壁纸又是头像，语义混在一起，
+static void avatar_apply(const char* src, bool from_file);   // 定义在后面（头像一节）
+// 用户放进 /Wallpapers 的图根本选不到。现在按目录枚举（只收图片扩展名）、按 inode 顺序
+// （= 打包时的写入顺序 = 文件名字典序）**循环**切换；壁纸落 ui.wall.path、头像落 users.db。
+#define PRESET_MAX 32
+static void wall_set_path(const char* path);      // 定义在后面（见"墙纸"一节）
+
+static bool preset_is_image64(const char* n) {
+    return s_ends_ci(n, ".png") || s_ends_ci(n, ".jpg") ||
+           s_ends_ci(n, ".jpeg") || s_ends_ci(n, ".bmp");
+}
+
+// 枚举目录里的图片名（有界：最多 256 条扫描 / 最多 max 条返回）。
+static int preset_collect64(const char* dir, char names[][VFS64_NAME_MAX + 1], int max) {
+    int n = 0;
+    uint32_t cur = 0;
+    for (int guard = 0; guard < 256; guard++) {
+        Vfs64Dirent64 de{};
+        if (vfs64_list64(dir, &de, 1, &cur) <= 0) break;
+        if (de.kind == VFS64_KIND_DIR) continue;
+        if (!preset_is_image64(de.name)) continue;
+        if (n >= max) break;
+        int i = 0;
+        for (; de.name[i] && i < (int)VFS64_NAME_MAX; i++) names[n][i] = de.name[i];
+        names[n][i] = 0;
+        n++;
+    }
+    return n;
+}
+
+static void preset_join64(const char* dir, const char* nm, char* out, int cap) {
+    int i = 0;
+    for (; dir[i] && i < cap - 2; i++) out[i] = dir[i];
+    if (i < cap - 1) out[i++] = '/';
+    for (int k = 0; nm[k] && i < cap - 1; k++) out[i++] = nm[k];
+    out[i] = 0;
+}
+
+// 壁纸：点一次换下一张（目录为空时如实报错，不假装成功）
+static void wall_preset_cycle() {
+    static char names[PRESET_MAX][VFS64_NAME_MAX + 1];
+    const int n = preset_collect64("/Wallpapers", names, PRESET_MAX);
+    if (n <= 0) {
+        logln("[SET64] wall preset ok=0 reason=no-presets dir=/Wallpapers");
+        msg_set(gui64_lang_zh() ? "没有任何预设壁纸（/Wallpapers 为空）"
+                                : "no preset wallpapers (/Wallpapers is empty)", tk64()->accent2);
+        return;
+    }
+    char cur[CFG64_STR_MAX];
+    cfg64_wall_path64(cur, (int)sizeof(cur));
+    int idx = 0;
+    for (int i = 0; i < n; i++) {
+        char p[CFG64_STR_MAX];
+        preset_join64("/Wallpapers", names[i], p, (int)sizeof(p));
+        if (s_eq(cur, p)) { idx = (i + 1) % n; break; }
+    }
+    char p[CFG64_STR_MAX];
+    preset_join64("/Wallpapers", names[idx], p, (int)sizeof(p));
+    dbg64_line_begin64();
+    dbg64_str("[SET64] wall preset idx="); dbg64_dec((uint64_t)idx);
+    dbg64_str(" n="); dbg64_dec((uint64_t)n);
+    dbg64_str(" name="); dbg64_str(names[idx]);
+    dbg64_nl();
+    dbg64_line_end64();
+    wall_set_path(p);                       // 它负责解码校验 + 持久化 + 打点
+}
+
+// 头像：同样按 /Avatars 循环（与壁纸分目录，不再借用 /logo/kaisi.png）
+static void avatar_preset_cycle() {
+    static char names[PRESET_MAX][VFS64_NAME_MAX + 1];
+    const int n = preset_collect64("/Avatars", names, PRESET_MAX);
+    if (n <= 0) {
+        logln("[SET64] avatar preset ok=0 reason=no-presets dir=/Avatars");
+        msg_set(gui64_lang_zh() ? "没有任何预设头像（/Avatars 为空）"
+                                : "no preset avatars (/Avatars is empty)", tk64()->accent2);
+        return;
+    }
+    char cur[CFG64_STR_MAX];
+    cfg64_avatar_path64(cur, (int)sizeof(cur));
+    int idx = 0;
+    for (int i = 0; i < n; i++) {
+        char p[CFG64_STR_MAX];
+        preset_join64("/Avatars", names[i], p, (int)sizeof(p));
+        if (s_eq(cur, p)) { idx = (i + 1) % n; break; }
+    }
+    char p[CFG64_STR_MAX];
+    preset_join64("/Avatars", names[idx], p, (int)sizeof(p));
+    dbg64_line_begin64();
+    dbg64_str("[SET64] avatar preset idx="); dbg64_dec((uint64_t)idx);
+    dbg64_str(" n="); dbg64_dec((uint64_t)n);
+    dbg64_str(" name="); dbg64_str(names[idx]);
+    dbg64_nl();
+    dbg64_line_end64();
+    avatar_apply(p, true);                  // 它负责解码校验 + 写 users.db + 打点
+}
+
 static void avatar_apply(const char* src, bool from_file) {
     char path[USERDB64_PATH_MAX];
     int i = 0;
@@ -764,15 +863,18 @@ static void avatar_apply(const char* src, bool from_file) {
     path[i] = 0;
     const User64Entry* cu = cur_user();
     const char* name = cu ? cu->name : "-";
-    if (from_file && (s_ends_ci(path, ".jpg") || s_ends_ci(path, ".jpeg") || s_ends_ci(path, ".gif"))) {
-        // 诚实报错：img64 只实现 PNG/BMP
+    // ★ v0.5.8：JPEG **放行** —— img64 的 decode_jpeg64 早已实现（渐进式/420/422/444 子采样，
+    //   有 tests/jpeg64_test.py 守着），这条"jpeg/gif not implemented (png/bmp only)"是**过时**的
+    //   拒绝分支：用户自己提供头像/壁纸绝大多数是 jpg，被它挡在门外。只留 GIF 明确拒绝。
+    if (from_file && s_ends_ci(path, ".gif")) {
         dbg64_line_begin64();
         dbg64_str("[USER64] avatar FAIL user="); dbg64_str(name);
         dbg64_str(" src="); dbg64_str(path);
-        dbg64_str(" reason=jpeg/gif not implemented (img64: png/bmp only)");
+        dbg64_str(" reason=gif not implemented");
         dbg64_nl();
         dbg64_line_end64();
-        msg_set(gui64_lang_zh() ? "JPEG/GIF 未实现（只支持 PNG/BMP）" : "JPEG/GIF not implemented (PNG/BMP only)",
+        msg_set(gui64_lang_zh() ? "GIF 未实现（支持 PNG/JPEG/BMP）"
+                                : "GIF not implemented (PNG/JPEG/BMP supported)",
                 tk64()->accent2);
         return;
     }
@@ -2838,9 +2940,10 @@ static void set_click(Window* w, int cx, int cy0) {
         case CID_WALL_BUILTIN:
             wall_set_path("");
             break;
-        case CID_WALL_PRESET:
-            wall_set_path("/logo/kaisi.png");
-            break;
+    case CID_WALL_PRESET:
+        // ★ v0.5.8：按 /Wallpapers 循环，不再写死 /logo/kaisi.png（壁纸与头像混用同一个文件）
+        wall_preset_cycle();
+        break;
         // ---- 颜色 ----
         case CID_GRAD_ON:
             wall_grad_toggle(cfg64_grad_on64() ? 0 : 1);
@@ -2919,9 +3022,10 @@ static void set_click(Window* w, int cx, int cy0) {
         case CID_AVATAR_APPLY:
             avatar_apply(g_focus == CID_AVATAR_FIELD ? g_input : "", true);
             break;
-        case CID_AVATAR_PRESET:
-            avatar_apply("/logo/kaisi.png", true);
-            break;
+    case CID_AVATAR_PRESET:
+        // ★ v0.5.8：按 /Avatars 循环（与壁纸分目录）
+        avatar_preset_cycle();
+        break;
         case CID_UNAME_FIELD:
             focus_begin(id, "");
             break;

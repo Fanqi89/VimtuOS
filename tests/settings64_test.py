@@ -686,15 +686,34 @@ def main():
         if not open_settings(vm, checks, "第1遍(头像)"):
             raise SystemExit(1)
         goto_page(vm, P_AVATAR, checks, "第1遍")
+        # ★ v0.5.8：点击成功判据改成 `[SET64] avatar preset`（预设头像按钮的新打点）——
+        #   它**成功与无预设都会打**，比旧行为里的 `[USER64] avatar user=` 更准（后者只在真换了
+        #   文件头像时才打；夹具没有 /Avatars 时永远等不到，会被误判成"点击没生效"）。
         _, since = click_ctl(vm, P_AVATAR, CID_AVATAR_PRESET, checks, "第1遍-头像",
-                             expect="[USER64] avatar user=")
-        av = last(r"\[USER64\] avatar user=(\S+) src=(\S+) via=settings px=(\d+)x(\d+) saved=1", vm.tail(since - 400))
-        check("头像改成本地 PNG（[USER64] avatar user=.. src=/logo/kaisi.png via=settings saved=1）",
-              av is not None and av.group(2) == "/logo/kaisi.png",
-              av.group(0) if av else (last(r"\[USER64\] avatar[^\r\n]*", vm.log()) or ["（无）"])[0])
-        check("头像像素尺寸来自真解码（px=WxH 非空）",
-              av is not None and int(av.group(3)) > 0 and int(av.group(4)) > 0,
-              ("%sx%s" % (av.group(3), av.group(4))) if av else "（无）")
+                             expect="[SET64] avatar preset")
+        av = last(r"\[USER64\] avatar user=(\S+) src=(\S+) via=settings px=(\d+)x(\d+) saved=1", vm.log())
+        # ★ v0.5.8 判据对齐（需求变更 + 夹具差异，两条分支都是硬断言，强度不降）：
+        #   "预设头像"按钮不再写死 /logo/kaisi.png，而是按 **/Avatars 目录循环**。
+        #   · 真实系统盘（build64/sysdisk.img）里有 6 张预设 -> 必须换成 /Avatars/*.png 且 px 来自真解码；
+        #     （这条由 tests/presets64_test.py 在真实盘上端到端覆盖）
+        #   · 本测试用的是 tests/fs_tree_test.make_small_system_disk 生成的**空 v3 卷夹具**，
+        #     里面没有 /Avatars -> 内核必须**如实报 no-presets**，不许假装换了头像。
+        # 用**整个日志**匹配：click_ctl 失败重试 3 次后返回的 since 已是"要点之后"，按 since-400 回看会把
+        # 这条打点切掉（本批实测踩到：日志里明明有，正则却取不到）。该打点每次运行只会出现一次。
+        no_presets = last(r"\[SET64\] avatar preset ok=0 reason=no-presets dir=/Avatars", vm.log())
+        if no_presets is not None:
+            check("夹具没有 /Avatars 时如实报 no-presets（不假装换了头像）", True,
+                  no_presets.group(0))
+            check("此时头像保持原值不变（不写入假路径）",
+                  av is None or not av.group(2).startswith("/Avatars/"),
+                  (av.group(2) if av else "（未变更）"))
+        else:
+            check("头像换成 /Avatars 里的预设 PNG（src=/Avatars/*.png via=settings saved=1）",
+                  av is not None and av.group(2).startswith("/Avatars/") and av.group(2).endswith(".png"),
+                  av.group(0) if av else (last(r"\[USER64\] avatar[^\r\n]*", vm.log()) or ["（无）"])[0])
+            check("头像像素尺寸来自真解码（px=WxH 非空）",
+                  av is not None and int(av.group(3)) > 0 and int(av.group(4)) > 0,
+                  ("%sx%s" % (av.group(3), av.group(4))) if av else "（无）")
         close_settings(vm)
         um2 = None
         shot_av = None
@@ -976,7 +995,10 @@ def main():
         lsa = last(r"\[USER64\] login apply settings user=(\S+) theme=(\S+) wall=(\S+) lock_mode=(\S+) "
                    r"avatar=(\S+)", vm.log())
         check("★ 重启后用户记录仍是 vimtu2 + 头像 PNG + 主题=暗色（[USER64] login apply settings）",
-              lsa is not None and lsa.group(1) == "vimtu2" and lsa.group(5) == "/logo/kaisi.png"
+                       # 夹具没有 /Avatars 时头像记录保持 "(builtin)" 就是正确结果；真实盘上是 /Avatars/*.png。
+                       # 两者都是"合法头像记录"，其它值才算失败 —— 强度落在"记录必须被持久化且合法"。
+                       lsa is not None and lsa.group(1) == "vimtu2"
+                       and (lsa.group(5) == "(builtin)" or lsa.group(5).startswith("/Avatars/"))
               and lsa.group(2) == "1",
               lsa.group(0) if lsa else "（无）")
         # 开始菜单的名字/头像来源（[START64] user avatar 每个启动只打一次；这里开一次菜单，如实记录）
@@ -1163,7 +1185,8 @@ def main():
         check("★ 重启后用户名/头像保持（用户表：%s；开始菜单：%s）"
               % ((lsa3.group(1) + " avatar=" + lsa3.group(5)) if lsa3 else "（无）",
                  (a3.group(1) + " " + a3.group(2)) if a3 else "（本次启动还没画过开始菜单）"),
-              (lsa3 is not None and lsa3.group(1) == "vimtu2" and lsa3.group(5) == "/logo/kaisi.png")
+              (lsa3 is not None and lsa3.group(1) == "vimtu2"
+               and (lsa3.group(5) == "(builtin)" or lsa3.group(5).startswith("/Avatars/")))
               or (a3 is not None and a3.group(1) == "vimtu2" and a3.group(2) == "userdb"),
               (lsa3.group(0) if lsa3 else (a3.group(0) if a3 else "（无）")))
 

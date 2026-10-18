@@ -188,6 +188,12 @@ shm + wl_surface + `wl_seat_get()` + font64 排版）：
 - ❌ 日志（journaling）/ 快照 / 配额 / ACL / 符号链接
 - ❌ ext4 / NTFS（读不了 Windows 盘）
 - ⚠️ 写文件是"整文件覆盖 + 立刻落盘"，单文件上限 67584 B（fd 层）
+- ✅ **根目录的预设资源目录**（v0.5.8）：`/Wallpapers/` = 预设壁纸、`/Avatars/` = 预设头像，
+  **两者分开**。内置 3 张示例壁纸（代码画的 1024×768 PNG）+ 6 张代码画的 128×128 圆形头像；
+  想加自己的壁纸：把图丢进仓库的 `res/wallpapers/`（png/jpg/jpeg/bmp），重建后就在 `/Wallpapers/` 里，
+  设置页"预设壁纸"按钮会按文件名顺序循环切换。壁纸支持 **JPEG**（`decode_jpeg64`）。
+- ⚠️ 系统卷约 12 MB：`/Wallpapers` 里的图**单张建议 ≤ 1 MB**（大图会把卷塞满）；
+  运行时不能直接往只读系统卷里拷图，要经 `res/wallpapers/` + 重建。GIF 不支持。
 - ⚠️ **持久化只认 VimtuFS2 主分区**：载体不是卷时（单盘跑安装介质 / 盘上没有 `type=0x07` 分区）
   改动只活在内存里。v0.5.5 起开机滚屏会打印 `[CONF64] WARN NOT-PERSISTENT …`，不再让用户靠猜。
   `build64/sysdisk.img` 是**构建产物**（每次 `build64.sh` 重拼），日常请用 `vimtu64-64-disk.img`

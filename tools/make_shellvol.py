@@ -44,6 +44,7 @@ VFS_BITMAP_BLK_BITS = 4096
 VFS_MAX_INODES = 512
 VFS_DIRECT_BLOCKS = 4
 VFS_INDIRECT_PTRS = 128
+VFS_DIND_CHILDREN = 128                                  # 二级间接块里的一级间接块个数（v4；见 kernel/vfs64.h）
 VFS_MAX_FILE_BLOCKS = 16384                              # 8 MiB 上限（v4）
 VFS_MAX_FILE_BLOCKS_L1 = VFS_DIRECT_BLOCKS + VFS_INDIRECT_PTRS   # 132：再往上需要二级间接块
 
@@ -152,9 +153,12 @@ class Volume:
         nblk = (len(data) + SECTOR - 1) // SECTOR
         if nblk > VFS_MAX_FILE_BLOCKS:
             raise ValueError("文件超过 VimtuFS2 上限（%d > %d 块）" % (nblk, VFS_MAX_FILE_BLOCKS))
-        if nblk > VFS_MAX_FILE_BLOCKS_L1:
-            raise ValueError("本离线写入器只做 直接块+一级间接（<= %d 块 = %d B）；本文件 %d 块"
-                             % (VFS_MAX_FILE_BLOCKS_L1, VFS_MAX_FILE_BLOCKS_L1 * SECTOR, nblk))
+        # ★ v0.5.8：**补上二级间接块（dind）**。原来这里只做"直接块 + 一级间接"（<= 132 块
+        #   = 67,584 B），于是用户提供的大壁纸 / 大图直接 ValueError 报错 —— 而"预设壁纸由用户
+        #   提供"必然是大图（1920x1080 的 jpg 常见 200~800 KB）。v4 卷的 inode 早在 rec[71] 就有
+        #   dind 字段（_mk_inode 一直会写），只是这条离线写入路径没构造它。
+        #   块序与 kernel/vfs64.cpp 的 read_at_inode 一致：direct[0..3] -> ind[0..127] ->
+        #   dind[0][0..127] -> dind[1][0..127] -> …
         blocks = []
         for i in range(nblk):
             blk = self._alloc_blk()
@@ -165,12 +169,26 @@ class Volume:
         ref = {"direct": blocks[:VFS_DIRECT_BLOCKS]}
         rest = blocks[VFS_DIRECT_BLOCKS:]
         if rest:
-            if len(rest) > VFS_INDIRECT_PTRS:
-                raise ValueError("间接块装不下（%d 个）" % len(rest))
+            take = min(len(rest), VFS_INDIRECT_PTRS)
             ind = self._alloc_blk()
             for i in range(VFS_INDIRECT_PTRS):
-                self._wr32(ind, 4 * i, rest[i] if i < len(rest) else 0)
+                self._wr32(ind, 4 * i, rest[i] if i < take else 0)
             ref["ind"] = ind
+            rest = rest[take:]
+        if rest:
+            if len(rest) > VFS_DIND_CHILDREN * VFS_INDIRECT_PTRS:
+                raise ValueError("二级间接块装不下（%d 个）" % len(rest))
+            dind = self._alloc_blk()
+            for c in range(VFS_DIND_CHILDREN):
+                seg = rest[c * VFS_INDIRECT_PTRS:(c + 1) * VFS_INDIRECT_PTRS]
+                if not seg:
+                    self._wr32(dind, 4 * c, 0)
+                    continue
+                child = self._alloc_blk()
+                for i in range(VFS_INDIRECT_PTRS):
+                    self._wr32(child, 4 * i, seg[i] if i < len(seg) else 0)
+                self._wr32(dind, 4 * c, child)
+            ref["dind"] = dind
         if kind is None:
             kind = KIND_ELF if data[:4] == b"\x7fELF" else KIND_TEXT
         ino = self.next_ino
@@ -257,11 +275,23 @@ def verify(vol_bytes, expect_files):
         if ind:
             for k in range(VFS_INDIRECT_PTRS):
                 blocks.append(struct.unpack_from("<I", vol_bytes, ind * SECTOR + 4 * k)[0])
+        # ★ v0.5.8：二级间接块（dind 在 inode 偏移 71，见 kernel/vfs64.h 的 v3/v4 布局）。
+        #   没有这一段，verify 就读不了 >67,584 B 的文件 —— 而预设壁纸正好是这种。
+        dind = struct.unpack_from("<I", rec, 71)[0]
+        if dind:
+            for c in range(VFS_DIND_CHILDREN):
+                child = struct.unpack_from("<I", vol_bytes, dind * SECTOR + 4 * c)[0]
+                if not child:
+                    continue
+                for k in range(VFS_INDIRECT_PTRS):
+                    blocks.append(struct.unpack_from("<I", vol_bytes, child * SECTOR + 4 * k)[0])
         data = bytearray()
         for b in blocks:
             if len(data) >= size:
                 break
-            if b == 0 or b >= total:
+            if b == 0:
+                continue                     # 间接块未用满的占位（不该出现在数据区，防御）
+            if b >= total:
                 raise ValueError("块号越界：%d" % b)
             data += vol_bytes[b * SECTOR:(b + 1) * SECTOR]
         return bytes(data[:size])
@@ -301,6 +331,55 @@ def _mbr_entry(bootable, ptype, start, sectors):
     return e
 
 
+# ==================== ★ v0.5.8：系统预设头像 / 预设壁纸（两个独立目录）====================
+# 用户点名需求：根目录里要有**分开**的两个目录放"系统预设头像"和"预设壁纸"。
+#   /Wallpapers/  预设背景图 —— 内置示例由 tools/make_presets.py 生成；
+#                 用户把自己的图丢进 res/wallpapers/ 就会一起进卷（png/jpg/jpeg/bmp）。
+#   /Avatars/     预设头像 —— 代码画的 6 张 PNG（渐变圆底 + 白色几何标记）。
+# 为什么分两个目录：以前壁纸和头像**都指 /logo/kaisi.png**（设置里两个"预设"按钮都写死这条
+# 路径），语义混在一起；分开放才能各自枚举 / 各自切换。
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+
+def _read_images(d, want_prefix=None):
+    """读目录里的图片（按名字排序）；want_prefix 非空时只收该前缀。"""
+    out = []
+    if not os.path.isdir(d):
+        return out
+    for f in sorted(os.listdir(d)):
+        if not f.lower().endswith(IMAGE_EXTS):
+            continue
+        if want_prefix and not f.startswith(want_prefix):
+            continue
+        p = os.path.join(d, f)
+        if not os.path.isfile(p):
+            continue
+        out.append((f, open(p, "rb").read()))
+    return out
+
+
+def preset_wallpapers():
+    """壁纸 = 内置示例（build64/presets/wall-*.png）+ 用户投放（res/wallpapers/*）。"""
+    builtin = _read_images(os.path.join(REPO, "build64", "presets"), "wall-")
+    user = _read_images(os.path.join(REPO, "res", "wallpapers"))
+    seen = set()
+    out = []
+    for name, data in builtin + user:
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((name, data))
+    return out
+
+
+def preset_avatars():
+    """头像 = build64/presets/avatar-*.png（代码画）。"""
+    return _read_images(os.path.join(REPO, "build64", "presets"), "avatar-")
+
+
 def build_volume(shell_bytes, hello_text, total_sectors):
     vol = Volume(total_sectors)
     bin_ino = vol.mkdir("bin", parent=0, mode=0o755)
@@ -308,6 +387,11 @@ def build_volume(shell_bytes, hello_text, total_sectors):
     vol.mkdir("tmp", parent=0, mode=0o777)               # 世界可写：任何会话身份都能在里面 mkdir/写文件
     vol.write_file("shell.bin", shell_bytes, parent=bin_ino, mode=0o755)
     vol.write_file("sh64hello.txt", hello_text, parent=etc_ino, mode=0o644)
+    # ★ v0.5.8：/Wallpapers 与 /Avatars **不在这里写**。
+    #   卷链上第一个 pack 步骤是从"原始区"重建卷的，本函数写进去的东西传不下去
+    #   （实测：shellvol.img 里有 /Wallpapers，所有后续 *vol.img 都没有）。
+    #   预设由**链尾**的 tools/presets_pack_win.py 单独追加（它是最后写 sysdisk.img 的步骤）。
+    #   本文件只保留 preset_wallpapers()/preset_avatars() 这两个"读源目录"的助手供它复用。
     return vol.finish()
 
 
@@ -350,6 +434,8 @@ def main():
     vol_sectors = args.vol_sectors if not args.disk else (args.target_sectors - PART_MAIN_LBA)
     vol_bytes = build_volume(shell_bytes, hello_text, vol_sectors)
     expect = {"/bin/shell.bin": shell_bytes, "/etc/sh64hello.txt": hello_text}
+    # ★ v0.5.8：预设壁纸/头像**不在这里自检** —— 本卷不再写它们（链上传不下去），
+    #   由链尾的 tools/presets_pack_win.py 追加并自带逐字节回读自检（含 dind 大图）。
     bad = verify(vol_bytes, expect)
     if bad:
         sys.stderr.write("卷自检失败：%s\n" % bad)
