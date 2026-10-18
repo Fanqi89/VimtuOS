@@ -143,6 +143,20 @@ def main():
 
         # 只认**应用注册表自己的**自检行（"selftest FAIL" 是通用串，别的模块也可能出现）
         m_st = re.search(r"\[APPREG64\] selftest (\w+) mask=(\d+) builtin=(\d+)", log)
+        # ★ 用户点名的"开始菜单里进不去"：固定网格只有 2x4=8 格，必须确认这两项落在**格子里**
+        #   （而不是藏在"全部应用"列表要滚动才能看到）。打点来自 startmenu64.cpp 的 sm_sync_apps64()。
+        m_grid = re.search(r"\[START64\] grid apps=(\d+) cells=(\d+) ([^\r\n]*)", log)
+        grid_execs = [t.strip() for t in m_grid.group(3).split("|")] if m_grid else []
+        check("开始菜单固定格（2x4）里有 /bin/browser", "/bin/browser" in grid_execs,
+              " | ".join(grid_execs) if grid_execs else "（缺 [START64] grid 行）")
+        check("开始菜单固定格（2x4）里有 /bin/office", "/bin/office" in grid_execs,
+              " | ".join(grid_execs) if grid_execs else "（缺 [START64] grid 行）")
+        check("固定格 8 格里卷程序排在最前（store/edit/netd/browser/office）",
+              bool(m_grid and grid_execs and grid_execs[0].startswith("/bin/")
+                   and "/bin/browser" in grid_execs and "/bin/office" in grid_execs),
+              "%d 项 / %d 格" % (int(m_grid.group(1)) if m_grid else 0,
+                                int(m_grid.group(2)) if m_grid else 0))
+
         check("应用注册表自检 PASS 且 mask=0（exec 唯一/图标非空等断言仍成立）",
               bool(m_st and m_st.group(1) == "PASS" and m_st.group(2) == "0"),
               m_st.group(0) if m_st else "（缺 [APPREG64] selftest 行）")

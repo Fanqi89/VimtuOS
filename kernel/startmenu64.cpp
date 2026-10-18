@@ -514,11 +514,23 @@ static void sm_sync_apps64() {
     g_view_gen = gen;
     g_view_n = 0;
     const int n = app64_registry_count64();
-    // 用户安装的应用（desktop=1 的那批先列；同一批里按注册表顺序）排在前面：新装的就在最上面
-    for (int pass = 0; pass < 2; pass++) {
+    // ★ v0.5.4（用户点名"开始菜单里进不去浏览器/办公套件"）：排序改成**三档**。
+    //   固定网格只有 THEME64_SM_TILE_COLS x ROWS = 2x4 = **8 格**，而内置窗口就有 9 个 ——
+    //   以前只按"用户应用优先 / 其余按注册表顺序"，于是卷程序（/bin/store、/bin/edit、
+    //   /bin/netd、/bin/browser、/bin/office）全排在 12 条内置之后，**固定格里永远看不到**，
+    //   只能去"全部应用"列表滚动找（实测就是这个现象）。
+    //   现在：① 卷程序（builtin=1 且 id<0，即真正的"应用"）② 用户安装的（builtin=0）
+    //         ③ 内置窗口（builtin=1 且 id>=0）。前 5 格 = 商店/编辑器/网络工具/浏览器/办公套件。
+    for (int pass = 0; pass < 3; pass++) {
         for (int i = 0; i < n && g_view_n < APPREG64_MAX; i++) {
-            const int is_user = app64_reg_builtin64(i) ? 0 : 1;
-            if ((pass == 0) != (is_user == 1)) continue;
+            const int is_builtin = app64_reg_builtin64(i) ? 1 : 0;
+            // 卷程序 = 内置表里 exec 以 '/' 开头的那批（/bin/store、/bin/browser、/bin/office…）。
+            // 不用 id 判（打点里 id 的十进制打印不可靠，实测 -1 显示成 0）；exec 前缀是**语义真值**。
+            const char* exi = app64_reg_exec64(i);
+            const int is_volapp  = (is_builtin && exi && exi[0] == '/') ? 1 : 0;
+            const int is_user    = (is_builtin == 0) ? 1 : 0;
+            const int bucket = is_volapp ? 0 : (is_user ? 1 : 2);
+            if (bucket != pass) continue;
             SmView64& v = g_view[g_view_n++];
             v.reg = i;
             v.zh = app64_reg_name64(i);
@@ -531,6 +543,23 @@ static void sm_sync_apps64() {
         }
     }
     if (g_list_top > g_view_n) g_list_top = 0;
+    // ★ v0.5.4：把"固定网格里到底是哪几个"打出来（THEME64_SM_TILE_COLS x ROWS = 2x4 = 8 格）。
+    //   验收脚本按这一行断言 /bin/browser、/bin/office 真的落在固定格里，而不是藏在
+    //   "全部应用"列表要滚动才能看到 —— 这就是用户报的"开始菜单里进不去"。
+    {
+        const int cells = (int)(THEME64_SM_TILE_COLS * THEME64_SM_TILE_ROWS);
+        dbg64_line_begin64();
+        dbg64_str("[START64] grid apps=");
+        dbg64_dec((uint64_t)g_view_n);
+        dbg64_str(" cells=");
+        dbg64_dec((uint64_t)cells);
+        for (int i = 0; i < cells && i < g_view_n; i++) {
+            dbg64_str(i ? " | " : " ");
+            dbg64_str(g_view[i].exec ? g_view[i].exec : "?");
+        }
+        dbg64_nl();
+        dbg64_line_end64();
+    }
 }
 
 // 图标（三层优先级，与任务要求一一对应）：

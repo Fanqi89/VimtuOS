@@ -138,6 +138,7 @@ shm + wl_surface + `wl_seat_get()` + font64 排版）：
 `/bin/browser` 与 `/bin/office` 都进了**应用注册表**（`kernel/app64.cpp` 的 `kBuiltinApps64`）：
 桌面图标与开始菜单里能看到「浏览器」「办公套件」，点开走 `fork+execve` **真进程**
 （所以它们的 `shm` / `wl_surface` / `wl_seat_get()` 都能用），与 `/bin/store`、`/bin/edit` 同一条路径。
+开始菜单的固定网格是 2×4=**8 格**，排序为"卷程序 → 用户安装的 → 内置窗口"，所以这两项就在**第 4、5 格**（实测 `[START64] grid apps=14 cells=8 /bin/store | /bin/edit | /bin/netd | /bin/browser | /bin/office | …`）。
 
 ★ 为什么它们是**预装应用**而不是"商店里可安装的包"（如实）：`.vap64` 的载荷上限是 **32 KiB**
 （`tools/store_pack_win.py` 的 `build_repo()` 里硬断言 `32768 + 64`），而 `browser.elf` **60,816 B**、
