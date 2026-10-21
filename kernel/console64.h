@@ -19,10 +19,19 @@
 //   [CON64] ring init bytes=<n> lines=<n> text_max=<n>   环形缓冲就绪（bytes=容量，lines=按最大行长的行数容量）
 //   [CON64] screen ready cols=<n> rows=<n>               屏幕控制台几何（等宽面 8px/字符）
 //   [CON64] replay lines=<n> dropped=<n> ms=<n>         回放完成（lines=本次真的画上去的行数）
+//   [CON64] follow bottom=<0|1> rows=<n> drawn=<n> newest_row=<n> pending=<n> flushed=<n> replayed=<n>
+//                                                       ★ 回放收口（auto-follow）：bottom=1 表示屏上最后一行
+//                                                         就是最新那条日志（pending 已清空、上屏行数==min(replayed,rows)）；
+//                                                         flushed=最后不足一批、由收口补画的行数
+//   [CON64] follow live bottom=<0|1> rows=<n> drawn=<n> pending=<n> flushed=<n>   实时阶段/退出前的收口
 //   [CON64] live lines=<n> drawn=<n>                    进入实时追加模式（n=当前缓冲行数）
 //   [CON64] skip key=1                                  用户在回放期间按键 -> 立即结束（不停留）
 //   [CON64] verbose=0 skipped lines=<n>                 boot.verbose=0：不画屏（缓冲/dmesg 照常）
 //   [CON64] selftest PASS mask=0x0                      / FAIL mask=0x<hex>
+//   [CON64] flush selftest lines=<n> flushed=<n> pending=<n> last_row_matches=<0|1>
+//                                                       ★ 收口自检（确定性覆盖"最后不足一批"）：
+//                                                         把缓冲最后 3 行再走一遍 pend->flush，并逐字符
+//                                                         核对"屏上最后一行 == 最后塞进去的那一行"
 //   [CON64] dmesg lines=<n> head=<n> dropped=<n>        终端 dmesg：缓冲规模
 //   [CON64] dmesg[<i>] <[    0.000000] 行正文>          终端 dmesg 的串口证据（有界：头尾各若干行）
 //   [CON64] boot verbose=on|off persisted=<0|1>         终端 `boot verbose on|off`

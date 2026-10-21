@@ -97,6 +97,8 @@ struct Con64Scr {
     uint8_t  pend_lv[CON64_SCROLL_BATCH];
     char     pend_text[CON64_SCROLL_BATCH][CON64_TEXT_MAX + 8];
     int      pend_n;
+    // ★ 最后一次**真的画到屏上**的那一行正文（收口自检/auto-follow 证据用：逐字符核对）
+    char     last_drawn[CON64_TEXT_MAX + 8];
 };
 
 static Con64Scr g_scr64;
@@ -106,6 +108,21 @@ static bool con64_pre64(const char* s, const char* pre) {
     if (!s || !pre) return false;
     while (*pre) { if (*s++ != *pre++) return false; }
     return true;
+}
+
+// 整串相等（收口自检用：核对"屏上最后一行 == 最后画进去的那一行"）
+static bool con64_streq64(const char* a, const char* b) {
+    if (!a || !b) return false;
+    while (*a && *b) { if (*a++ != *b++) return false; }
+    return (*a == 0 && *b == 0);
+}
+
+// 拷贝一行正文（bounds 内，末尾补 NUL）
+static void con64_copy64(char* dst, int max, const char* src) {
+    int i = 0;
+    if (!dst || max < 2) return;
+    if (src) { while (src[i] && i < max - 1) { dst[i] = src[i]; i++; } }
+    dst[i] = 0;
 }
 
 int con64_classify64(const char* s) {
@@ -494,6 +511,35 @@ static void con64_scr_scroll64(int dy) {
     }
 }
 
+// ★ 把"攒着还没上屏"的行立即补画到屏底 —— auto-follow（自动跟到底部）的收口。
+//   回放是按 CON64_SCROLL_BATCH 行一批滚的：攒满一批才整体上移一次。最后不足一批的
+//   1..CON64_SCROLL_BATCH-1 行会留在 g_scr64.pend_* 里；不收口的话屏幕上停的是
+//   "倒数第 8~2 行"，**最新的几行永远不出现**（用户看到的就是"日志没跟到底部"）。
+//   返回本次真的补画的行数（0 = 没有待画行）。
+static int con64_scr_flush64() {
+    if (!g_scr64.active || g_scr64.pend_n <= 0 || g_scr64.rows <= 0) return 0;
+    const int n = (g_scr64.pend_n > g_scr64.rows) ? g_scr64.rows : g_scr64.pend_n;
+    con64_scr_scroll64(n);                              // 整体上移 n 行，腾出底下 n 行
+    for (int k = 0; k < n; k++) {
+        const int row = g_scr64.rows - n + k;
+        const int y = g_scr64.top_y + row * g_scr64.line_h;
+        con64_scr_clear_line64(y, g_scr64.region_w);
+        char st[40];
+        if (con64_stamp64(g_scr64.pend_tick[k], st, (int)sizeof st) > 0) {
+            font_select(FONT_FACE_MONO);
+            font_draw_text(g_scr64.ts_x, y, st, CON64_C_STAMP);
+        }
+        g_scr64.row_ink[row] =
+            (uint8_t)(CON64_STAMP_CHARS + 1 +
+                      con64_draw_text64(g_scr64.text_x, y, g_scr64.pend_text[k],
+                                        con64_level_color64(g_scr64.pend_lv[k])));
+        con64_copy64(g_scr64.last_drawn, (int)sizeof g_scr64.last_drawn, g_scr64.pend_text[k]);
+    }
+    g_scr64.pend_n = 0;
+    fb_flip_region(0, g_scr64.top_y, g_scr64.region_w, g_scr64.region_h);
+    return n;
+}
+
 // 画一行（含时间戳），并按 batch 批量滚屏：屏满时先攒 batch-1 行，再整体上移 batch 行后一次画上
 // （保证屏上不丢行；batch=1 = 逐行滚，实时阶段用）
 static void con64_scr_put64(uint64_t tick, int level, const char* text, int batch) {
@@ -512,6 +558,9 @@ static void con64_scr_put64(uint64_t tick, int level, const char* text, int batc
             g_scr64.pend_n++;
             return;
         }
+        // ★ 实时阶段（batch=1）：先把回放留下的待画行收口，再单行滚。否则下面
+        //   `row = rows - dy + k`（dy=1）会把它们画到 rows-1 之外 —— 越界/屏外。
+        if (batch == 1 && g_scr64.pend_n > 0) con64_scr_flush64();
         const int dy = (batch > 1) ? (g_scr64.pend_n + 1) : 1;   // 一次上移这么多行
         con64_scr_scroll64(dy);
         scrolled = true;
@@ -541,6 +590,7 @@ static void con64_scr_put64(uint64_t tick, int level, const char* text, int batc
     }
     const int cols = con64_draw_text64(g_scr64.text_x, y, text, con64_level_color64(level));
     g_scr64.row_ink[row] = (uint8_t)(CON64_STAMP_CHARS + 1 + cols);
+    con64_copy64(g_scr64.last_drawn, (int)sizeof g_scr64.last_drawn, text);
     if (g_scr64.drawn < g_scr64.rows) g_scr64.drawn++;
     if (scrolled) fb_flip_region(0, g_scr64.top_y, g_scr64.region_w, g_scr64.region_h);
     else          fb_flip_region(0, y, g_scr64.region_w, g_scr64.line_h);
@@ -671,6 +721,10 @@ int con64_boot_screen64(int verbose) {
         }
         if (g_scr64.skip) break;
     }
+    // ★ 自动跟到底部（用户要求）：回放是按批滚的，最后不足一批的 1..BATCH-1 行还在
+    //   g_scr64.pend_* 里 —— 必须补画上屏，否则屏幕上停的是"倒数第 8~2 行"，
+    //   **最新的几行永远不出现**。
+    const int tail_flushed = con64_scr_flush64();
     const uint64_t replay_ms = (uint64_t)(g_ticks64 - t0) * (uint64_t)TICK_MS_64;
     dbg64_line_begin64();
     dbg64_str("[CON64] replay lines=");
@@ -681,6 +735,74 @@ int con64_boot_screen64(int verbose) {
     dbg64_dec(replay_ms);
     dbg64_nl();
     dbg64_line_end64();
+
+    // ★ auto-follow 证据行（有界一行，验收脚本 grep）：屏上**最后一行**必须就是最新那条日志。
+    //   bottom=1 是内核自己算的不变量：待画行已收口(pending=0) 且 上屏行数 == min(回放行数, 行数)。
+    //   flushed = 本次由收口补画的行数（修前这些行永远不出现，见上面的注释）。
+    {
+        const int expect_drawn = (replayed < g_scr64.rows) ? replayed : g_scr64.rows;
+        const int bottom_ok = (g_scr64.pend_n == 0 && g_scr64.drawn == expect_drawn) ? 1 : 0;
+        const int newest_row = (expect_drawn > 0) ? (expect_drawn - 1) : 0;
+        dbg64_line_begin64();
+        dbg64_str("[CON64] follow bottom=");
+        dbg64_dec((uint64_t)bottom_ok);
+        dbg64_str(" rows=");
+        dbg64_dec((uint64_t)g_scr64.rows);
+        dbg64_str(" drawn=");
+        dbg64_dec((uint64_t)g_scr64.drawn);
+        dbg64_str(" newest_row=");
+        dbg64_dec((uint64_t)newest_row);
+        dbg64_str(" pending=");
+        dbg64_dec((uint64_t)g_scr64.pend_n);
+        dbg64_str(" flushed=");
+        dbg64_dec((uint64_t)tail_flushed);
+        dbg64_str(" replayed=");
+        dbg64_dec((uint64_t)replayed);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+
+    // ---- ★ 收口自检（确定性覆盖"最后不足一批"这条路径）----
+    //   为什么需要它：默认启动的余数恰好是 0（实测 replayed=63、rows=39 -> (63-39)%8=0），
+    //   真实回放**根本不会**触发收口 —— 那样"修好了没有"就只能靠读代码。这里把缓冲里的
+    //   **最后 3 行**再走一遍 pend_* -> con64_scr_flush64()，然后逐字符核对
+    //   "屏上最后一行 == 最后塞进去的那一行"（g_scr64.last_drawn）。
+    //   屏上效果：最后 3 行日志在控制台末尾重复一次，紧接着就进 logo/登录（没有停留阶段）。
+    {
+        const int have2 = con64_buffered_lines64();
+        int took = 0;
+        char want[CON64_TEXT_MAX + 8];
+        want[0] = 0;
+        g_scr64.pend_n = 0;
+        for (int back = 3; back >= 1; back--) {                 // 从旧到新塞，最后塞的是最新一行
+            const int idx = have2 - back;
+            if (idx < 0) continue;
+            uint64_t tk = 0; int lv = CON64_LV_INFO;
+            char lb2[CON64_TEXT_MAX + 8];
+            if (con64_line64(idx, &tk, &lv, lb2, (int)sizeof lb2) <= 0) continue;
+            const int j = g_scr64.pend_n;
+            g_scr64.pend_tick[j] = tk;
+            g_scr64.pend_lv[j] = (uint8_t)lv;
+            con64_copy64(g_scr64.pend_text[j], CON64_TEXT_MAX + 8, lb2);
+            g_scr64.pend_n++;
+            took++;
+            con64_copy64(want, (int)sizeof want, lb2);
+        }
+        const int flushed2 = con64_scr_flush64();
+        const int match = (took > 0 && flushed2 == took &&
+                           con64_streq64(g_scr64.last_drawn, want)) ? 1 : 0;
+        dbg64_line_begin64();
+        dbg64_str("[CON64] flush selftest lines=");
+        dbg64_dec((uint64_t)took);
+        dbg64_str(" flushed=");
+        dbg64_dec((uint64_t)flushed2);
+        dbg64_str(" pending=");
+        dbg64_dec((uint64_t)g_scr64.pend_n);
+        dbg64_str(" last_row_matches=");
+        dbg64_dec((uint64_t)match);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
 
     // ---- 实时追加模式（停留期间新来的打点继续画）----
     g_scr64.shown_total = (int)g_ring64.total;
@@ -696,6 +818,22 @@ int con64_boot_screen64(int verbose) {
     //   用户要求："跑完后不停留直接进桌面"。此处刻意**没有**停留阶段；
     //   想让屏幕停住看日志的话，进系统后用终端 `dmesg` 看完整日志。
     con64_scr_drain64();
+    // ★ 实时行也要收口：drain 用 batch=1（逐行滚），但回放若被按键打断，pend 里可能还有
+    //   待画行 —— 这里再收一次，保证退出时屏上最后一行同样是最新那条日志。
+    const int live_flushed = con64_scr_flush64();
+    dbg64_line_begin64();
+    dbg64_str("[CON64] follow live bottom=");
+    dbg64_dec((uint64_t)(g_scr64.pend_n == 0 ? 1 : 0));
+    dbg64_str(" rows=");
+    dbg64_dec((uint64_t)g_scr64.rows);
+    dbg64_str(" drawn=");
+    dbg64_dec((uint64_t)g_scr64.drawn);
+    dbg64_str(" pending=");
+    dbg64_dec((uint64_t)g_scr64.pend_n);
+    dbg64_str(" flushed=");
+    dbg64_dec((uint64_t)live_flushed);
+    dbg64_nl();
+    dbg64_line_end64();
     g_scr64.active = 0;
     if (g_scr64.skip) {
         dbg64_line_begin64();

@@ -603,6 +603,13 @@ void gui64_flip_window(Window* w) {
 int     gui64_screen_w()        { return g_screen_w; }
 int     gui64_screen_h()        { return g_screen_h; }
 int     gui64_taskbar_h()       { return TASKBAR_H; }
+// ★ Dock 顶边（窗口默认尺寸的上限边界）：Dock 在窗口之后绘制（覆盖层），窗口压到它下面
+//   就会被盖住 —— 终端最后 1~2 行日志因此看不见（v0.5.9 实测：client=964x724、窗口底 765、
+//   Dock 顶 724 -> 最底两行被 Dock 遮住）。这里给出 Dock 顶边，让应用自己把默认高度收在上面。
+int     gui64_dock_top64() {
+    int top = g_screen_h - DOCK_MARGIN - DOCK_H;
+    return (top > 0) ? top : 0;
+}
 Window* gui64_top_window()      { return g_z; }
 bool    gui64_click_is_right()  { return g_click_right; }
 int     gui64_window_count() {

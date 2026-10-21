@@ -46,6 +46,9 @@
 //   [TASK] kill id=N ok                  kill <id> 成功（终端的 kill 只走 task_kill64 真路径）
 //   [APP64] run cmd path=<p> rc=<n>      run <name> 的命令打点（走 app64_launch64 真路径）
 //   [STORE64] cmd <dump|get|set|flush> ...  store 命令打点（走 kernel/store64.cpp 真路径）
+//   [TERM64] dmesg follow bottom=<0|1> lines=N rows=R cursor_row=R-1 newest_row=R-2
+//                                       ★ dmesg 的 auto-follow 证据：输出超过一屏时，最新一条日志
+//                                         停在屏底（bottom=1 = 真的滚到底了，不是只画了前几行）
 //
 // 【Shell 命令】32 位能实现、且 64 位有对应子系统的**全部**实现；**没有"尚未支持"的命令了**
 //   （批次 A 后半把最后两条桩 update / preload 接成真实现；终端新增 proc 命令管理 proc64 真进程）。
@@ -3374,6 +3377,30 @@ static void cmd_dmesg(TerminalState* ts) {
         ts_puts(ts, lb);
         ts_putc(ts, (uint32_t)'\n');
     }
+    // ★ 自动跟到底部（用户要求）：正文超过一屏时，最新一条日志必须停在屏底。
+    //   终端没有回看缓冲，输出只能靠"满行就滚"呈现 —— 这里把"光标最终落在哪一行"打成
+    //   证据（有界一行），验收脚本据此断言"输出真的滚到了底部"，并用屏幕像素做交叉验证。
+    //   newest_row = 最新一条日志所在的网格行（每行都以 '\n' 收尾，所以它在光标上方一行）。
+    {
+        const int printed = n + 1;                      // 统计行 + n 条日志
+        const int at_bottom = (printed > ts->rows && ts->cur_r == ts->rows - 1) ? 1 : 0;
+        const int newest_row = (ts->cur_r > 0) ? (ts->cur_r - 1) : 0;
+        dbg64_line_begin64();
+        dbg64_str("[TERM64] dmesg follow bottom=");
+        dbg64_dec((uint64_t)at_bottom);
+        dbg64_str(" lines=");
+        dbg64_dec((uint64_t)n);
+        dbg64_str(" rows=");
+        dbg64_dec((uint64_t)ts->rows);
+        dbg64_str(" cursor_row=");
+        dbg64_dec((uint64_t)ts->cur_r);
+        dbg64_str(" cursor_col=");
+        dbg64_dec((uint64_t)ts->cur_c);
+        dbg64_str(" newest_row=");
+        dbg64_dec((uint64_t)newest_row);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
     con64_dmesg_dump_serial64(16, 16);      // 串口证据（有界）
 }
 
@@ -5342,6 +5369,32 @@ void app_term_open64() {
     if (px < 0) px = 0;
     if (py < 0) py = 0;
     if (px != win->x || py != win->y) gui64_set_geom(win, px, py, win->client_w, win->client_h);
+
+    // ★ 默认高度必须留在 Dock 之上（v0.5.9）：Dock 是**最后绘制的覆盖层**，压在窗口上面。
+    //   60x40 汉字格的默认客户区 = 724px 高，窗口底 765 > Dock 顶 724 —— 最底两行日志
+    //   明明画了却被 Dock 盖住（用户看到的"日志没跟到底部"）。这里按 Dock 顶边收一次行数。
+    {
+        const int dock_top = gui64_dock_top64();
+        const int extra_h  = win->h - win->client_h;      // 标题栏 + 边框（固定开销）
+        const int max_ch   = dock_top - win->y - extra_h - 2;
+        if (dock_top > 0 && max_ch > TERM_ROWS_MIN * term_ch() + TERM_PAD_Y &&
+            win->client_h > max_ch) {
+            int rows_fit = (max_ch - TERM_PAD_Y) / term_ch();
+            if (rows_fit < TERM_ROWS_MIN) rows_fit = TERM_ROWS_MIN;
+            gui64_fit_window_to_client(win, cw, rows_fit * term_ch() + TERM_PAD_Y);
+            dbg64_line_begin64();
+            dbg64_str("[UI] term fit above dock client_h=");
+            dbg64_dec((uint64_t)win->client_h);
+            dbg64_str(" rows=");
+            dbg64_dec((uint64_t)rows_fit);
+            dbg64_str(" win_bottom=");
+            dbg64_dec((uint64_t)(win->y + win->h));
+            dbg64_str(" dock_top=");
+            dbg64_dec((uint64_t)dock_top);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
 
     TerminalState* ts = ts_new(win);
     if (!ts) {

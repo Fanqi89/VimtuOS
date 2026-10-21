@@ -109,6 +109,9 @@ void    gui64_dirty(int x, int y, int w, int h);
 int     gui64_screen_w();
 int     gui64_screen_h();
 int     gui64_taskbar_h();
+// ★ Dock 顶边 y：Dock 是最后绘制的覆盖层，压在窗口上面 —— 窗口默认尺寸必须留在它之上，
+//   否则终端最后 1~2 行日志被 Dock 盖住（"日志跟到底部"却看不见）。0 = 没有 Dock。
+int     gui64_dock_top64();
 // （★ 缺陷 1：老朋友 gui64_start_menu_open() 已随老开始菜单一起删除 —— 用
 //   kernel/startmenu64.h 的 startmenu64_is_open64() 查询"开始菜单是否打开"。）
 Window* gui64_top_window();

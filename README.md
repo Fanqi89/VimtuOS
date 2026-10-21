@@ -56,6 +56,9 @@
 - 网格：ASCII 8px / 汉字 16px（**中英 2:1**），行高取字体度量最大值（不裁 `g` 的下半截）
 - 颜色：背景纯黑 `#000000`、正文纯白 `#FFFFFF`、**标准 ANSI 16 色**（`ESC[…m`，含亮青 `#00FFFF` / 亮红 `#FF0000`），全部 100% 不透明
 - 字体：Sarasa Mono SC（终端等宽）+ Unifont（缺字兜底）—— 构建期子集化，许可原文在 `docs/fonts/`
+- ★ **自动跟到底部（v0.5.9）**：正文超过一屏时一直滚到最后一行（`[TERM64] dmesg follow bottom=1`）；
+  终端窗口默认高度按 **Dock 顶边**收口（`[UI] term fit above dock client_h=670 rows=37 win_bottom=712 dock_top=724`），
+  否则最底两行会被 Dock 盖住。**边界**：没有回看缓冲（scrollback）—— 只能看到最后一屏，`dmesg` 的正文上限就是窗口行数。
 
 **UI 侧（非终端）另一套策略**：要平滑、要厚、要够黑。v0.4.8 起由最小 fontconfig 管，
 `/etc/fonts.conf`（`key = value`）里的 `ui.stem`（笔画加厚百分比，默认 120）与 `ui.antialias`（on/off）
