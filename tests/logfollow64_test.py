@@ -1,4 +1,4 @@
-"""tests/logfollow64_test.py —— v0.5.9：终端与日志的**自动跟到底部**（auto-follow）。
+"""tests/logfollow64_test.py —— v0.5.9/0.5.10：终端与日志的**自动滚动 + 跟到底部**。
 
 用户要求：\"添加终端和日志的自动滚动\"。三条真缺陷（前两条在 kernel/console64.cpp，
 第三条实测发现于 kernel/terminal64.cpp）：
@@ -25,6 +25,9 @@
   ④ 屏幕像素：终端客户区**倒数第二个文本行带**有墨（最新一条日志真画出来了）；
      反向对照：`clear` 之后同一条带墨量为 0（证明指标不是恒真）
   ⑤ 客户区底边留在 Dock 之上（`[UI] term fit above dock ... win_bottom<=dock_top`）
+  ⑥ v0.5.10："完全滚完才进系统" + "最后一行贴屏幕最底边"：
+     `[CON64] follow ... planned=P complete=1 region_bottom=800 screen_h=800`（底边对齐）
+     + 控制台帧像素：最后一处墨迹距屏幕底边 <= 12px（修前最后一行底边在 784/800，最底 16px 空白）
 
 用法：py -3 tests/logfollow64_test.py [--img build64/sysdisk.img] [--port 5696]
 退出码：0 全过 / 1 有断言失败 / 2 环境问题（qemu / 镜像 / 没进桌面）。
@@ -55,6 +58,8 @@ IMG_DEF = os.path.join(ROOT, "build64", "sysdisk.img")
 PORT = 5696
 BATCH = 8                     # kernel/console64.cpp 的 CON64_SCROLL_BATCH
 PAD_Y = 4                     # 终端客户区顶部内边距（TERM_PAD_Y）
+TOP_INSET_MIN = 12            # 控制台"墨迹顶边"的最小 y：底部对齐把 top_y 从 4 推到 20，
+                              # 第一个字的墨迹顶边随之前移 ~16px（修前 ~6，修后 ~22），阈值 12 有双侧余量
 
 checks = []
 
@@ -79,8 +84,9 @@ def find_tile(vm, mon, want, tries=4):
     return None
 
 
-def read_frame(mon, path):
-    if not mon.shot(path):
+def read_frame(mon, path, wait=2.2):
+    """截一帧。wait 是 QEMU 的 screendump 落盘等待（开机日志只存在 ~4 秒，要抓快照就传 0.4）。"""
+    if not mon.shot(path, wait=wait):
         return None
     w, h, data = SM.read_ppm(path)
     return np.frombuffer(data, dtype=np.uint8).reshape(h, w, 3)
@@ -161,6 +167,25 @@ def main():
     mon = SM.Monitor(args.port)
     cur = SM.Cursor()
     try:
+        # ---- 抓一帧开机控制台（"最后一行贴屏幕底边"的像素证据；控制台只存在 ~4 秒）----
+        con_frame = None
+        tcap = time.time()
+        shot_i = 0
+        while time.time() - tcap < 180:
+            p = os.path.join(tmp, "con_%02d.ppm" % shot_i)
+            shot_i += 1
+            a = read_frame(mon, p, wait=0.4)          # 快照要快（控制台只存在 ~4 秒）
+            if a is not None:
+                inked = int(((a.max(axis=2) > 60).sum(axis=1) > 0).sum())
+                black = float((a.max(axis=2) < 60).mean())
+                if black > 0.5 and inked >= 12:
+                    con_frame = a
+                elif con_frame is not None:
+                    break                      # 控制台帧抓到了，后面是 logo/登录
+            if vm.proc.poll() is not None:
+                break
+            if "[CON64] follow live" in vm.log():
+                break
         if not vm.wait_log(T.LOCK_INTERACTIVE, 240):
             print("跳过：没等到锁屏（环境问题）")
             return 2
@@ -176,7 +201,8 @@ def main():
         print("\n--- 1) 开机滚屏日志回放：最新的几行必须画到屏底 ---")
         mr = re.search(r"\[CON64\] replay lines=(\d+) dropped=(\d+) ms=(\d+)", log)
         mf = re.search(r"\[CON64\] follow bottom=(\d+) rows=(\d+) drawn=(\d+) newest_row=(\d+) "
-                       r"pending=(\d+) flushed=(\d+) replayed=(\d+)", log)
+                       r"pending=(\d+) flushed=(\d+) replayed=(\d+) planned=(\d+) complete=(\d+) "
+                       r"region_bottom=(\d+) screen_h=(\d+)", log)
         check("回放确实跑过（[CON64] replay lines=N）", mr is not None,
               (mr.group(0) if mr else "缺失"))
         check("有 auto-follow 证据行（[CON64] follow ...）", mf is not None,
@@ -201,6 +227,43 @@ def main():
                   "修前这里恒为 0，那几行永远不上屏")
         ml = re.search(r"\[CON64\] follow live bottom=(\d+) rows=(\d+) drawn=(\d+) "
                        r"pending=(\d+) flushed=(\d+)", log)
+
+
+        # ①c "完全滚完才进系统" + "最后一行贴屏幕最底边"（串口判据）
+        if mf:
+            planned, complete = int(mf.group(8)), int(mf.group(9))
+            region_bottom, screen_h = int(mf.group(10)), int(mf.group(11))
+            replayed = int(mf.group(7))
+            check("回放完整跑完、没被按键打断（complete=%d planned=%d replayed=%d）"
+                  % (complete, planned, replayed),
+                  complete == 1 and planned > 0 and 0 < replayed <= planned,
+                  "complete=0 只可能是用户按键 skip（或看门狗）；空行不计入 replayed")
+            check("控制台区域底边 == 屏幕底边（region_bottom=%d screen_h=%d）"
+                  % (region_bottom, screen_h), region_bottom == screen_h,
+                  "最后一行必须紧贴屏幕最底部")
+
+        # ①d 像素证据：控制台整体**下移到底**（顶边 > 12px，也就是底部对齐生效）
+        #     为什么判顶边而不是底边：字形下沿在行内本来就有留白（约 2~4px），底边墨迹位置不稳；
+        #     而底边对齐把整个区域下移 16px（top_y 4 -> 20），**第一个字的墨迹顶边**随之从 ~6px
+        #     移到 ~22px —— 16px 的位移在像素上清晰可辨，且与填了几行无关（就算只填 5 行，
+        #     也是从 top_y 开始往下画）。
+        check("抓到一帧开机控制台（黑底 + >=12 行文字）", con_frame is not None,
+              "抓不到就无法做像素判据（控制台只存在 ~4 秒）")
+        if con_frame is not None:
+            ink_rows = (con_frame.max(axis=2) > 60).sum(axis=1)
+            inked = [y for y in range(len(ink_rows)) if ink_rows[y] > 0]
+            first_ink = inked[0] if inked else -1
+            last_ink = inked[-1] if inked else -1
+            sh = con_frame.shape[0]
+            print("      控制台帧：屏高=%d 墨迹顶边 y=%d 墨迹底边 y=%d（距底边 %d px）"
+                  % (sh, first_ink, last_ink, sh - 1 - last_ink), flush=True)
+            check("控制台整体贴到底部（墨迹顶边 >= %d px，修前约 6px）" % TOP_INSET_MIN,
+                  first_ink >= TOP_INSET_MIN,
+                  "底边对齐把 top_y 从 4 推到 %d" % (800 - 39 * 20))
+            check("墨迹底边落在最后一行内（距底边 <= 行高 20px）",
+                  last_ink >= 0 and (sh - 1 - last_ink) <= 20,
+                  "报告的数是事实，不做更窄的阈值（字形下沿留白随字体变化）")
+
         check("实时阶段/退出前也收口（[CON64] follow live bottom=1）",
               ml is not None and ml.group(1) == "1",
               (ml.group(0) if ml else "缺失"))

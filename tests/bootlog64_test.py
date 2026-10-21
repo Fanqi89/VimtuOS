@@ -260,6 +260,12 @@ def main():
         mlfb = re.search(r"\[LM64\] LFB addr=([0-9A-F]+) size=\d+x\d+ bpp=\d+ pitch=(\d+)", log)
         lfb = int(mlfb.group(1), 16) if mlfb else 0
         pitch = int(mlfb.group(2)) if mlfb else 0
+        # 控制台顶边（v0.5.10 起底部对齐：top_y = screen_h - rows*line_h，实测 800-39*20=20）
+        cons_top = 4
+        if m:
+            cons_top = 800 - int(m.group(2)) * int(m.group(3))
+            if cons_top < 0:
+                cons_top = 0
         t_pix0 = time.time()
         while time.time() - t_pix0 < 16:
             fn = os.path.join(tmp, "con_%02d.ppm" % len(frames))
@@ -274,10 +280,16 @@ def main():
             prof = row_profile(px, w, h)
             frames.append((time.time() - t_pix0, w, h, px, prof))
             # ★ 滚动证据：QEMU 在 -display none 下的显示表面会给**过期**帧（实测滞后 1~2s），
-            #   所以这里同时直读 vram（monitor `xp`，就是屏上像素）：控制台第 1 行文字（y=4..24）
-            #   里的第 7 个像素行在不同时刻内容不同 => 屏上内容真的在上移。
+            #   所以这里同时直读 vram（monitor `xp`，就是屏上像素）。
+            #   v0.5.10 起控制台**底边对齐**（top_y = screen_h - rows*line_h = 20，原来固定 4），
+            #   所以采样行不能再写死成第 7 行 —— 这里按打点算出的顶边往下取几个像素行，
+            #   只要其中出现时间戳色 / 正文色就说明"字真的写进帧缓冲"。
             if lfb and pitch and len(vram_samples) < 12:
-                vals = xp_words(port1, lfb + 7 * pitch, 24)
+                rows_scan = [cons_top + k for k in (0, 1, 10, 11)]
+                vals = []
+                for ry in rows_scan:
+                    if ry >= 0:
+                        vals += xp_words(port1, lfb + ry * pitch, 24)
                 if vals:
                     vram_samples.append([v.lower() for v in vals])
             if len(frames) >= 16:

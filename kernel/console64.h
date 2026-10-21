@@ -17,9 +17,11 @@
 //
 // 串口打点（自动验收 grep，格式勿改；行锁保证不被抢占的行插进去）：
 //   [CON64] ring init bytes=<n> lines=<n> text_max=<n>   环形缓冲就绪（bytes=容量，lines=按最大行长的行数容量）
-//   [CON64] screen ready cols=<n> rows=<n>               屏幕控制台几何（等宽面 8px/字符）
+//   [CON64] screen ready cols=<n> rows=<n> line_h=<n> adv=<n> region_bottom=<n> screen_h=<n>
+//                                                       ★ 屏幕控制台几何（等宽面 8px/字符）；控制台**底边对齐**：
+//                                                         region_bottom == screen_h（最后一行紧贴屏幕最底部）
 //   [CON64] replay lines=<n> dropped=<n> ms=<n>         回放完成（lines=本次真的画上去的行数）
-//   [CON64] follow bottom=<0|1> rows=<n> drawn=<n> newest_row=<n> pending=<n> flushed=<n> replayed=<n>
+//   [CON64] follow bottom=<0|1> rows=<n> drawn=<n> newest_row=<n> pending=<n> flushed=<n> replayed=<n> planned=<n> complete=<0|1> region_bottom=<n> screen_h=<n>
 //                                                       ★ 回放收口（auto-follow）：bottom=1 表示屏上最后一行
 //                                                         就是最新那条日志（pending 已清空、上屏行数==min(replayed,rows)）；
 //                                                         flushed=最后不足一批、由收口补画的行数

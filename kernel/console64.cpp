@@ -640,14 +640,22 @@ int con64_boot_screen64(int verbose) {
     g_scr64.text_x = CON64_MARGIN_X + CON64_STAMP_CHARS * g_scr64.adv + g_scr64.adv;
     if (W > 0 && g_scr64.line_h > 0) {
         g_scr64.cols = (W - g_scr64.text_x - CON64_MARGIN_X) / g_scr64.adv;
-        g_scr64.rows = (H - CON64_MARGIN_Y - 2) / g_scr64.line_h;
+        // ★ 底部对齐（用户要求："日志的最后与屏幕最底部挨着"）：行数取能塞进屏的最大值，
+        //   顶边由底边反推 —— top_y = H - rows*line_h，所以最后一行**紧贴屏幕最底边**。
+        //   旧算法 rows=(H-4-2)/line_h=39 且 top_y=4，最后一行底边在 784 / 屏高 800 ——
+        //   屏幕最底 16px 是空白，看起来"没滚到底"。
+        g_scr64.cols = (W - g_scr64.text_x - CON64_MARGIN_X) / g_scr64.adv;
+        g_scr64.rows = (H - CON64_MARGIN_Y) / g_scr64.line_h;
     }
     if (g_scr64.cols < 1) g_scr64.cols = 0;
     if (g_scr64.rows < 1) g_scr64.rows = 0;
+    if (g_scr64.rows > CON64_ROWS_MAX) g_scr64.rows = CON64_ROWS_MAX;
+    if (g_scr64.rows > 0) g_scr64.top_y = H - g_scr64.rows * g_scr64.line_h;   // 底边对齐
+    if (g_scr64.top_y < CON64_MARGIN_Y) g_scr64.top_y = CON64_MARGIN_Y;
     g_scr64.region_w = g_scr64.text_x + g_scr64.cols * g_scr64.adv + CON64_MARGIN_X;
     if (g_scr64.region_w > W) g_scr64.region_w = W;
-    g_scr64.region_h = g_scr64.rows * g_scr64.line_h + 2;
-    if (g_scr64.region_h > H) g_scr64.region_h = H;
+    g_scr64.region_h = H - g_scr64.top_y;                 // 一直画到屏幕底边
+    if (g_scr64.region_h < 0) g_scr64.region_h = 0;
 
     dbg64_line_begin64();
     dbg64_str("[CON64] screen ready cols=");
@@ -658,6 +666,11 @@ int con64_boot_screen64(int verbose) {
     dbg64_dec((uint64_t)g_scr64.line_h);
     dbg64_str(" adv=");
     dbg64_dec((uint64_t)g_scr64.adv);
+    // ★ 底部对齐证据（验收 grep）：region_bottom 必须 == screen_h（最后一行贴屏幕最底边）
+    dbg64_str(" region_bottom=");
+    dbg64_dec((uint64_t)(g_scr64.top_y + g_scr64.rows * g_scr64.line_h));
+    dbg64_str(" screen_h=");
+    dbg64_dec((uint64_t)fb_height());
     dbg64_nl();
     dbg64_line_end64();
 
@@ -758,6 +771,17 @@ int con64_boot_screen64(int verbose) {
         dbg64_dec((uint64_t)tail_flushed);
         dbg64_str(" replayed=");
         dbg64_dec((uint64_t)replayed);
+        // ★ "完全滚完才进系统"的证据：planned = 本次计划回放的行数（含空行），replayed = 真的画上屏的行数
+        //   （空行没有可画的内容，不计入）；complete = **回放没有被按键打断**（skip=0）。
+        //   底部对齐的 region_bottom 必须 == screen_h。
+        dbg64_str(" planned=");
+        dbg64_dec((uint64_t)planned);
+        dbg64_str(" complete=");
+        dbg64_dec((uint64_t)(g_scr64.skip ? 0 : 1));
+        dbg64_str(" region_bottom=");
+        dbg64_dec((uint64_t)(g_scr64.top_y + g_scr64.rows * g_scr64.line_h));
+        dbg64_str(" screen_h=");
+        dbg64_dec((uint64_t)fb_height());
         dbg64_nl();
         dbg64_line_end64();
     }
