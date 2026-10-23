@@ -1545,11 +1545,27 @@ echo "          载荷：LBA $PAYLOAD_LBA(头) + $((PAYLOAD_LBA + 1))..$((PAYLOA
 #   而不是内核写盘坏了（实测 vfs/config 写入都能跨重启存活，见 tests/persist64_test.py）。
 #   规则：文件已存在就**原样保留**并如实打印大小；不存在才从本次 sysdisk.img 初始化一次。
 PERSIST_IMG=vimtu64-64-disk.img
-if [ -f "$PERSIST_IMG" ]; then
-  echo "==> 持久数据盘 保留 $PERSIST_IMG（$(stat -c%s "$PERSIST_IMG") 字节，内含用户数据，本次不覆盖）"
-else
+PERSIST_VER="$PERSIST_IMG.ver"          # 记录这块日常盘是用哪个版本初始化的
+if [ ! -f "$PERSIST_IMG" ]; then
   cp "$BUILD/sysdisk.img" "$PERSIST_IMG"
+  echo "$VIMTUOS_VERSION" > "$PERSIST_VER"
   echo "==> 持久数据盘 初始化 $PERSIST_IMG（从 $BUILD/sysdisk.img 复制一次；此后重建不再覆盖）"
+else
+  OLD_VER=$(cat "$PERSIST_VER" 2>/dev/null || echo "unknown")
+  if [ "$OLD_VER" = "$VIMTUOS_VERSION" ]; then
+    echo "==> 持久数据盘 保留 $PERSIST_IMG（$(stat -c%s "$PERSIST_IMG") 字节，版本 $OLD_VER 与本版一致，内含用户数据，不覆盖）"
+  else
+    # ★ v0.5.11 起：日常盘**跟随版本**。旧逻辑"存在就永不覆盖"导致用户永远在跑老系统
+    #   （实测：2026-10-18 建的盘还是 v0.5.5，里面没有 /Wallpapers，也缺 v0.5.7/0.5.10/0.5.11 的修复）。
+    #   这里把旧盘**改名备份**（数据一个字节都不删，可用 -drive 挂第二块盘读回来），再用本版 sysdisk 重建。
+    BAK="$PERSIST_IMG.$OLD_VER.bak"
+    if [ -e "$BAK" ]; then BAK="$PERSIST_IMG.$OLD_VER.$(date +%Y%m%d%H%M%S).bak"; fi
+    mv "$PERSIST_IMG" "$BAK"
+    cp "$BUILD/sysdisk.img" "$PERSIST_IMG"
+    echo "$VIMTUOS_VERSION" > "$PERSIST_VER"
+    echo "==> 持久数据盘 升级：旧盘（$OLD_VER，$(stat -c%s "$BAK") 字节）已备份为 $BAK"
+    echo "    再用本版（$VIMTUOS_VERSION）sysdisk 重建 $PERSIST_IMG —— 旧盘里的数据仍可用 -drive 挂成第二块盘读回"
+  fi
 fi
 echo "    日常使用（单盘，开箱即持久化）: qemu-system-x86_64 -drive format=raw,file=$PERSIST_IMG -m 512 -vga std -serial stdio"
 
