@@ -278,8 +278,8 @@ qemu-system-x86_64 -m 512 -cdrom vimtu64-64.iso \
 # 装完重启即进系统（默认用户 vimtu，无口令；锁屏回车两次进桌面）
 ```
 
-> **哪块盘才会持久化**（v0.5.5 起开机日志直接告诉你）：只有**带 VimtuFS2 主分区（MBR type=0x07）**
-> 的盘才真落盘。三块盘的定位别混：
+> **哪块盘才会持久化**（开机日志直接告诉你）：只有**带 VimtuFS2 主分区（MBR type=0x07）**的盘才真落盘。
+> 三块盘的定位别混：
 > - `vimtu64-64.img` = **安装介质**（引导链 + 安装程序 + 载荷）。单盘启动会进安装向导，
 >   它自己**不是**数据盘 —— 拿它当日常盘用，改动重启就回到出厂。
 > - `build64/sysdisk.img` = **构建产物**。每跑一次 `build64.sh` 都会被各批 pack 重拼
@@ -290,6 +290,27 @@ qemu-system-x86_64 -m 512 -cdrom vimtu64-64.iso \
 > 载体不是 VimtuFS2 卷时，开机滚屏与串口会打印
 > `[CONF64] WARN NOT-PERSISTENT carrier=… reason=no-vimtufs2-volume -> changes in this session will be LOST on restart`。
 > 实测：`tests/persist64_test.py`（同一块盘连续起两次）**14/14 PASS**。
+
+> **★ 用 ISO 装到硬盘的朋友注意（v0.5.11 修的严重缺陷）**
+> v0.5.10 及更早：安装器只把 **8073 扇区**（MBR+引导+内核）写进目标盘，**12 MiB 的文件系统卷没装进去**。
+> 装好的盘启动时会打 `[VFS64] mount FAILED reason=magic -> mount_system FAILED` 与
+> `[CONF64] WARN NOT-PERSISTENT`，于是**所有修改都写不进去**（桌面图标位置/壁纸/主题/用户名/密码/
+> 新建文件夹全部重启即丢），点应用也打不开（`/bin/*` 在卷里，卷没装上）。
+> **v0.5.11 起**：载荷 = 完整磁盘映像（`8009 + 24759 = 32768` 扇区，含卷），安装器打印
+> `[INSTALL] 完成：已写 32768 扇区`，装好的盘 LBA 8009 直接就是 `VIMTUFS2` 卷头。
+> **所以：请用 v0.5.11 或更新的 ISO 重装一次**，旧 ISO 装出来的盘永远存不住东西。
+> 验收：`tests/install_persist64_test.py`（装到 8G 盘 → 改设置/建目录 → 关机重启）**10/10 PASS**：
+> `[VFS64] mount_system slot=0 drive=0 start=8009`、`[CONF64] flush ok via=vfs`、
+> 重启后 `[CONF64] load ui.theme=3`、宿主侧解析卷仍能读到 `/home/vimtu/pdata`。
+
+> **卷有多大 / 为什么 8G 盘只有 12 MiB 可用？**
+> 现在交付的卷是 **12 MiB**（`8009 + 24759 扇区`，构建期 `SYS_SECTORS` 决定），
+> 主分区本身覆盖整盘（8G 盘上是 `8009 + 16670870`），但**文件系统只用了最前面的 12 MiB**，
+> 其余空间暂时闲置 —— 扩卷（安装时按分区大小重建卷）是下一项工作。`df` 看到的就是这 12 MiB。
+
+> **关机请走正常关机**（系统"关机"按钮 / QEMU monitor `quit`）。
+> 直接 `kill` QEMU 可能丢掉写缓存里最后几块 —— 这也是"关机就丢"的另一半原因。
+> QEMU 想要更稳可以加 `-drive format=raw,file=…,cache=writethrough`（写穿，立刻落盘）。
 
 > **安装光盘的目录结构**（v0.5.6 起是层级式，和 Windows / Ubuntu 安装盘同构）：
 > ```
@@ -326,22 +347,716 @@ py -3 tests/<模块>_test.py                   # 单跑一条
 
 ---
 
-## 六、目录结构（顶层）
+## 六、完整目录树
+
+> 下面是**仓库全量目录树**：主树列到目录级，`kernel/` `tests/` `tools/` `user/` `docs/` 等
+> 大目录的文件清单在折叠块里（点开就是完整清单）。
+> **不含构建产物**：`build64/`、`vimtu64-64.iso`、`vimtu64-64.img`、`vimtu64-64-disk.img`、
+> `LOG.txt`、`.pi/`（本地工作目录）。`tests/` 现有 **115** 个验收脚本。
 
 ```
-boot/        BIOS/UEFI 引导（MBR、loader64、El Torito、hybrid MBR）
-kernel/      内核（~90 个 .cpp：调度/内存/进程/文件/图形/驱动/GUI 外壳）
-user/        用户态程序（shell、explorer、编辑器、商店、网络栈…）与自有 lib
-gui_rs/      Rust：设计 Token（颜色/圆角/动效）真源
-tools/       构建期工具（字体/图标/ISO/ESP/探针/打包）
-tests/       77 个验收脚本（Python，串口 + 像素 + 宿主侧独立校验）
-docs/        设计说明、发布流程、开发历程、字体许可
-Fonts/       Noto Sans 静态字重（西文/中文）
-Fonts-open/  Sarasa Mono SC（终端）+ Unifont（兜底）+ 许可原文
+├── Fonts/   (2 项，见下方折叠清单)
+├── Fonts-open/   (4 项，见下方折叠清单)
+├── boot/   (6 项，见下方折叠清单)
+├── build/   (2 项，见下方折叠清单)
+├── docs/   (21 项，见下方折叠清单)
+├── gui_rs/   (4 项，见下方折叠清单)
+├── kernel/   (146 项，见下方折叠清单)
+├── legacy32/   (11 项，见下方折叠清单)
+├── logo/
+│   ├── kaisi.png
+│   └── logo.png
+├── res/   (1 项，见下方折叠清单)
+├── sdk/   (1 项，见下方折叠清单)
+├── tests/   (115 项，见下方折叠清单)
+├── third_party/   (6 项，见下方折叠清单)
+├── tools/   (49 项，见下方折叠清单)
+├── user/   (27 项，见下方折叠清单)
+├── .gitattributes
+├── .gitignore
+├── FONTS.md
+├── LICENSE
+├── LOG.txt
+├── README.md
+├── _make_icons.py
+├── _make_logo.py
+├── _make_start_icon.py
+├── _otf2ttf.py
+├── _subset_fonts.py
+├── _subsetsimhei.py
+├── ahci_report.ppm
+├── ahci_report.ppm.retry0.ppm
+├── ahci_report.ppm.retry1.ppm
+├── ahci_report.ppm.retry2.ppm
+├── bootinfo.h
+├── build64.sh
+├── build_uefi.sh
+└── 构建与运行说明.md
 ```
+
+<details><summary><b>boot/</b> — 1 个子目录 / 5 个文件</summary>
+
+```
+├── efi/
+    ├── efi.h
+    ├── efi_main.c
+    ├── enter64.asm
+    ├── jump64.asm
+    ├── probe_main.c
+    ├── stub.c
+    └── uefi64.c
+├── boot.asm
+├── cdiso.asm
+├── hybrid_mbr.asm
+├── loader64.asm
+└── loader64_atapi.inc
+```
+</details>
+
+<details><summary><b>docs/</b> — 3 个子目录 / 18 个文件</summary>
+
+```
+├── fonts/
+    ├── OFL-NotoSans.txt
+    ├── OFL-NotoSansSC.txt
+    ├── OFL-NotoSerif.txt
+    ├── OFL-Sarasa.txt
+    └── UNIFONT-LICENSE.txt
+├── screenshots/  (22 项)
+├── shots/  (37 项)
+├── 64位升级验证记录.md
+├── ISO安装介质说明.md
+├── UEFI地址空间实验报告.md
+├── UEFI引导说明.md
+├── VMware验证指南.md
+├── VimtuOS系统介绍.md
+├── 中断调试记录.md
+├── 内核边界与架构规则.md
+├── 发布流程.md
+├── 字体许可说明.md
+├── 安装程序说明.md
+├── 应用层与系统调用说明.md
+├── 开发历程.md
+├── 引导链架构.md
+├── 桌面栈移植说明.md
+├── 真机验证指南.md
+├── 重启与任务管理器设计.md
+└── 项目状态总览.md
+```
+</details>
+
+<details><summary><b>kernel/</b> — 0 个子目录 / 146 个文件</summary>
+
+```
+├── acpi64.cpp
+├── acpi64.h
+├── ahci64.cpp
+├── ahci64.h
+├── ap_trampoline64.asm
+├── apic64.cpp
+├── apic64.h
+├── app64.cpp
+├── app64.h
+├── ata64.cpp
+├── ata64.h
+├── calc64.cpp
+├── config64.cpp
+├── config64.h
+├── console64.cpp
+├── console64.h
+├── debug64.h
+├── demo64.cpp
+├── demo64.h
+├── desktopops64.cpp
+├── desktopops64.h
+├── display64.cpp
+├── display64.h
+├── drive64.cpp
+├── drive64.h
+├── e1000_64.cpp
+├── e1000_64.h
+├── edid64.cpp
+├── edid64.h
+├── ehci64.cpp
+├── ehci64.h
+├── elf64.cpp
+├── elf64.h
+├── entry64.asm
+├── explorer64.cpp
+├── explorer64.h
+├── fat64.cpp
+├── fat64.h
+├── fb.cpp
+├── fb.h
+├── fd64.cpp
+├── fd64.h
+├── font.cpp
+├── font.h
+├── font8x8.h
+├── fontcfg64.cpp
+├── fontcfg64.h
+├── fs64.cpp
+├── fs64.h
+├── gfx64.cpp
+├── gfx64.h
+├── gui64.cpp
+├── gui64.h
+├── hda64.cpp
+├── hda64.h
+├── hda64_stub64.cpp
+├── hwinfo64.cpp
+├── hwinfo64.h
+├── hwui64.cpp
+├── hwui64.h
+├── icons64.cpp
+├── icons64.h
+├── img64.cpp
+├── img64.h
+├── input.cpp
+├── input.h
+├── input64.cpp
+├── input64.h
+├── isr_dbg64.asm
+├── isr_out64.asm
+├── isr_probe64.asm
+├── isr_stubs64.asm
+├── kernel64.cpp
+├── linker64.ld
+├── locklogin64.cpp
+├── locklogin64.h
+├── mem64.cpp
+├── mem_64.h
+├── memlayout64.h
+├── mines64.cpp
+├── net64.cpp
+├── net64.h
+├── netraw64.cpp
+├── netraw64.h
+├── nvme64.cpp
+├── nvme64.h
+├── panels64.cpp
+├── panels64.h
+├── panic64.cpp
+├── panic64.h
+├── part64.cpp
+├── part64.h
+├── pci64.cpp
+├── pci64.h
+├── port.h
+├── preload64.cpp
+├── preload64.h
+├── proc64.cpp
+├── proc64.h
+├── rust64.h
+├── session64.cpp
+├── session64.h
+├── settings64.cpp
+├── settings64.h
+├── setup64.cpp
+├── setup64.h
+├── setup64_keys.h
+├── sig64.cpp
+├── sig64.h
+├── smp64.cpp
+├── smp64.h
+├── startmenu64.cpp
+├── startmenu64.h
+├── store64.cpp
+├── store64.h
+├── switch64.asm
+├── syscall64.cpp
+├── syscall64.h
+├── syscall_entry64.asm
+├── sysstate64.cpp
+├── sysstate64.h
+├── task64.cpp
+├── task64.h
+├── taskmgr64.cpp
+├── terminal64.cpp
+├── theme64.cpp
+├── theme64.h
+├── uefi_gop.h
+├── update64.cpp
+├── update64.h
+├── usb64.cpp
+├── usb64.h
+├── userdb64.cpp
+├── userdb64.h
+├── usermode64.cpp
+├── usermode64.h
+├── vfs64.cpp
+├── vfs64.h
+├── virtio_gpu64.cpp
+├── virtio_gpu64.h
+├── wl64.cpp
+├── wl64.h
+├── x86_64.cpp
+├── x86_64.h
+├── xhci64.cpp
+└── xhci64.h
+```
+</details>
+
+<details><summary><b>res/</b> — 1 个子目录 / 0 个文件</summary>
+
+```
+└── wallpapers/
+    ├── 1.jpeg
+    └── README.md
+```
+</details>
+
+<details><summary><b>tests/</b> — 0 个子目录 / 115 个文件</summary>
+
+```
+├── a42a64_test.py
+├── ahci64_test.py
+├── apic64_test.py
+├── app64_test.py
+├── apps64_test.py
+├── bigfile64_test.py
+├── boot64_assert.py
+├── bootlog64_test.py
+├── browser64_test.py
+├── browser_http64_test.py
+├── busybox64_test.py
+├── clicklaunch64_test.py
+├── desktop64_test.py
+├── desktop_p7a_test.py
+├── desktopops64_test.py
+├── dir64_test.py
+├── disk_boot_test.py
+├── display64_test.py
+├── display_runtime_test.py
+├── drvsvc64_test.py
+├── dynlink64_test.py
+├── edit64_test.py
+├── ehci64_test.py
+├── elf64_test.py
+├── esp_install_test.py
+├── explorer64_test.py
+├── fatread64_test.py
+├── fbmap64_test.py
+├── fd64_test.py
+├── fileops64_test.py
+├── font64user_test.py
+├── fontq64_test.py
+├── fonts64_test.py
+├── fs_term_test.py
+├── fs_tree_test.py
+├── gfx64_test.py
+├── gpucursor64_test.py
+├── gui_modern64_test.py
+├── gzip64_test.py
+├── hda64_test.py
+├── iconboot64_test.py
+├── icons64_test.py
+├── install_flow_test.py
+├── install_persist64_test.py
+├── ipc64_test.py
+├── iso64_install_test.py
+├── iso64_layout_test.py
+├── iso64_usb_test.py
+├── jpeg64_test.py
+├── linuxapp64_test.py
+├── locklogin64_test.py
+├── logfollow64_test.py
+├── lua64_test.py
+├── make64_test.py
+├── mouse_parse_test.py
+├── mouseperf64_test.py
+├── multivol64_test.py
+├── musl64_test.py
+├── net64_test.py
+├── netuser64_test.py
+├── nvme64_test.py
+├── office64_test.py
+├── panels64_test.py
+├── partition_ops_test.py
+├── perm64_test.py
+├── persist64_test.py
+├── pipe64_test.py
+├── preload_update_test.py
+├── presets64_test.py
+├── proc64_test.py
+├── qemuhelp.py
+├── rust64_test.py
+├── sched_stress_test.py
+├── screen64_probe.py
+├── screenshot64.py
+├── settings64_test.py
+├── sh64_test.py
+├── sig64_test.py
+├── sigpipe64_test.py
+├── smp64_test.py
+├── sounds64_test.py
+├── soundsegs64_test.py
+├── startmenu64_test.py
+├── statfs64_test.py
+├── status_report.py
+├── store64_test.py
+├── sysstate64_test.py
+├── tar64_test.py
+├── taskmgr64_test.py
+├── tcc64_test.py
+├── term_render64_test.py
+├── texthint64_test.py
+├── textlock64_test.py
+├── textstress64_test.py
+├── textvnc.py
+├── textwm64_test.py
+├── tmgr_proc_test.py
+├── uefi64_install_test.py
+├── uefi_cr3_experiment_test.py
+├── ui_extra64_test.py
+├── usb64_test.py
+├── usb_boot_both_fw_test.py
+├── usbstorage_test.py
+├── usbwrite64_test.py
+├── user64_test.py
+├── userlib64_test.py
+├── virtiogpu64_test.py
+├── vmware_install_test.py
+├── vmware_make_vm.py
+├── vmware_mouse_probe.py
+├── vpkg64_test.py
+├── vsync64_test.py
+├── wl64_test.py
+├── wm64_test.py
+└── xhci64_test.py
+```
+</details>
+
+<details><summary><b>tools/</b> — 2 个子目录 / 47 个文件</summary>
+
+```
+├── i686-elf/
+    ├── bin/
+    ├── i686-elf/
+    ├── include/
+    ├── lib/
+    ├── libexec/
+    └── share/
+├── nasm/
+    ├── LICENSE
+    ├── nasm.exe
+    └── ndisasm.exe
+├── assets_pack_win.py
+├── browser_pack_win.py
+├── busybox_build_win.sh
+├── busybox_pack_win.py
+├── demo_pack_win.py
+├── drvdemo_pack_win.py
+├── dynlink_build_win.sh
+├── dynlink_check_win.py
+├── dynlink_payload_win.py
+├── edit_pack_win.py
+├── fat_check.py
+├── fetch_icons.py
+├── fontdemo_pack_win.py
+├── gzip_build_win.sh
+├── gzip_pack_win.py
+├── jpeg_make_testset.py
+├── kernel_size_report.py
+├── lua_build_win.sh
+├── lua_pack_win.py
+├── lxcorpus_build.py
+├── make_asset_images.py
+├── make_build_win.sh
+├── make_esp.py
+├── make_flat.py
+├── make_iconpack.py
+├── make_iso64.py
+├── make_pack_win.py
+├── make_presets.py
+├── make_shellvol.py
+├── make_vap.py
+├── musl_build_win.sh
+├── musl_hello64.ld
+├── net_pack_win.py
+├── office_pack_win.py
+├── payload_embed_win.py
+├── pe_info.py
+├── presets_pack_win.py
+├── probe64.py
+├── sounder_pack_win.py
+├── sounds_gen.py
+├── store_pack_win.py
+├── svg2png.py
+├── tar_build_win.sh
+├── tar_pack_win.py
+├── tcc_build_win.sh
+├── tcc_pack_win.py
+└── wm_pack_win.py
+```
+</details>
+
+<details><summary><b>user/</b> — 15 个子目录 / 12 个文件</summary>
+
+```
+├── apps/  (16 项)
+├── browser/
+    ├── www/
+    ├── browser.c
+    ├── build_browser.sh
+    ├── html.c
+    ├── html.h
+    ├── net.c
+    └── net.h
+├── busybox/
+    ├── bb_config.py
+    ├── bbdrv.c
+    ├── bbdrv64.ld
+    ├── bbdrv_start.S
+    ├── bbstart.S
+    ├── bbstart.c
+    ├── bbwrap.c
+    ├── bbwrap64.ld
+    ├── bbwrap_start.S
+    ├── busybox64.ld
+    ├── vimtu_dirent.c
+    └── vimtu_fcntl.c
+├── gzip/
+    ├── gzip.c
+    ├── gzip64.ld
+    └── gzip_start.S
+├── ldso/
+    ├── ldso.c
+    ├── ldso.ld
+    ├── ldso_start.S
+    └── libfoo.ld
+├── lib/  (27 项)
+├── lua/
+    ├── demo/
+    ├── a44probe.c
+    ├── lua64.ld
+    ├── lua_compat.c
+    ├── lua_start.S
+    ├── lua_start.c
+    ├── luadrv.c
+    ├── luadrv64.ld
+    └── luadrv_start.S
+├── make/
+    ├── demo/
+    ├── make64.ld
+    ├── make_start.S
+    ├── make_start.c
+    ├── makedrv.c
+    ├── makedrv64.ld
+    └── makedrv_start.S
+├── net/
+    └── netd.c
+├── office/
+    ├── build_office.sh
+    ├── calc.c
+    ├── calc.h
+    └── office.c
+├── shell/
+    ├── abi.c
+    ├── abi.h
+    ├── build_shell.sh
+    ├── main.c
+    ├── sh64.h
+    └── shell64.ld
+├── store/
+    ├── build_store.sh
+    ├── demo_cli.c
+    ├── demo_gui.c
+    ├── store.c
+    ├── store64.ld
+    ├── vpkg.c
+    ├── vs.h
+    ├── vs_gzip.c
+    ├── vs_io.c
+    ├── vs_pkg.c
+    └── vs_xz.c
+├── svc/
+    └── drvdemo.c
+├── tar/
+    ├── tar64.c
+    ├── tar64.ld
+    ├── tar_start.S
+    └── tar_start.c
+├── wm/
+    ├── wm.c
+    ├── wmabi.c
+    ├── wmabi.h
+    ├── wmclock.c
+    └── wmpanel.c
+├── build_user.sh
+├── demo64.asm
+├── fbdemo.asm
+├── filedemo64.asm
+├── hello64.asm
+├── hello_elf64.asm
+├── hello_elf64.ld
+├── pipe64.asm
+├── proc64.asm
+├── spin64.asm
+├── xmmsse.asm
+└── xmmsse_elf64.ld
+```
+</details>
+
+<details><summary><b>Fonts/</b> — 0 个子目录 / 2 个文件</summary>
+
+```
+├── OFL-NotoSans.txt
+└── fms_metadata.xml
+```
+</details>
+
+<details><summary><b>Fonts-open/</b> — 0 个子目录 / 4 个文件</summary>
+
+```
+├── OFL-NotoSans.txt
+├── OFL-NotoSansSC.txt
+├── OFL-Sarasa.txt
+└── UNIFONT-LICENSE.txt
+```
+</details>
+
+<details><summary><b>build/</b> — 2 个子目录 / 0 个文件</summary>
+
+```
+├── icons/
+    ├── apps/
+    ├── system/
+    └── manifest.json
+└── sdk/
+    └── icons_ext/
+```
+</details>
+
+<details><summary><b>gui_rs/</b> — 2 个子目录 / 2 个文件</summary>
+
+```
+├── assets/
+    ├── fonts/
+    ├── icons/
+    ├── images/
+    └── README.md
+├── src/
+    ├── lib.rs
+    ├── panic.rs
+    ├── theme.rs
+    └── tokens.rs
+├── Cargo.toml
+└── build_rs.sh
+```
+</details>
+
+<details><summary><b>legacy32/</b> — 10 个子目录 / 1 个文件</summary>
+
+```
+├── artifacts/
+    ├── build/
+    └── vimtu64.vmdk
+├── boot/
+    ├── _loader64_lm.part.asm.txt
+    ├── install.asm
+    ├── loader
+    └── loader.asm
+├── build32.sh/
+    └── build.sh
+├── dev/  (109 项)
+├── docs32/
+    ├── COMPLETE_ISO_SOLUTION.md
+    ├── FINAL_SOLUTION.md
+    ├── FIX_SUMMARY.md
+    ├── ISO_GENERATION_FIX.md
+    ├── ISO_README.md
+    ├── SYSTEM_FIX_REPORT.md
+    ├── TEST_PLAN.md
+    ├── find_iso_tools.txt
+    ├── fix_fonttools.txt
+    ├── help_cn.txt
+    ├── upgrade_plan.md
+    ├── 启动脚本修复报告.md
+    ├── 启动脚本说明.md
+    └── 构建与运行说明（32位时代）.md
+├── kernel/  (61 项)
+├── prototype/
+    ├── boot.asm
+    ├── combined.asm
+    ├── font.h
+    ├── interrupts.cpp
+    ├── io.asm
+    ├── io.s
+    ├── kernel.cpp
+    ├── keyboard.asm
+    ├── linker.ld
+    ├── loader.asm
+    └── vga.cpp
+├── scripts/
+    ├── _patch_install_iso.py
+    ├── build.ps1
+    ├── build.sh.backup
+    ├── create_iso.ps1
+    ├── create_iso_with_full_path.sh
+    ├── create_iso_with_xorriso.sh
+    ├── get-pip.py
+    ├── install_tools.ps1
+    ├── install_tools_en.ps1
+    ├── run.sh
+    ├── run_vimtu64.bat
+    ├── test_iso_build.sh
+    └── 重新生成ISO.sh
+├── uefi/
+    ├── efi/
+    ├── UEFI_INTEGRATION.md
+    ├── UEFI_INTEGRATION_COMPLETE.md
+    ├── build_uefi.sh
+    ├── screenshot.png
+    └── test_uefi.sh
+├── vmware32vm/
+    ├── README.md
+    ├── Vimtu64-0.scoreboard
+    ├── Vimtu64-1.scoreboard
+    ├── Vimtu64-2.scoreboard
+    ├── Vimtu64-install.vmx
+    ├── Vimtu64.scoreboard
+    ├── Vimtu64.vmsd
+    ├── Vimtu64.vmx
+    ├── Vimtu64.vmxf
+    ├── install-disk-flat.vmdk
+    ├── install-disk.vmdk
+    └── nvram
+└── README.md
+```
+</details>
+
+<details><summary><b>third_party/</b> — 6 个子目录 / 0 个文件</summary>
+
+```
+├── busybox/
+    ├── busybox-1.36.1/
+    ├── LICENSE
+    ├── README.vimtu64.md
+    └── busybox-1.36.1.tar.bz2
+├── lua/
+    ├── lua-5.4.7/
+    └── README-vimtu64-a4.md
+├── lzma/
+    ├── 7zTypes.h
+    ├── LICENSE
+    ├── Lzma2Dec.c
+    ├── Lzma2Dec.h
+    ├── LzmaDec.c
+    ├── LzmaDec.h
+    ├── Precomp.h
+    └── README.vimtu64.md
+├── make/
+    ├── make-4.4.1/
+    └── README.vimtu64-b5.md
+├── musl/  (22 项)
+└── tcc/
+    ├── tcc-0.9.27/
+    └── README.vimtu64-a4b.md
+```
+</details>
 
 ---
-
 ## 七、开源与发布
 
 - 仓库：<https://github.com/Fanqi89/VimtuOS>

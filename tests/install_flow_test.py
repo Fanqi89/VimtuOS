@@ -273,6 +273,23 @@ def main():
           "长度 %d" % len(os_ref))
     check("目标盘上的内核**不是**安装程序内核", kern_disk != ins_ref[:len(kern_disk)])
 
+    # ★ v0.5.11：装好的目标盘**必须带 VimtuFS2 卷**（否则系统卷 mount 失败 -> 一切修改重启即丢）
+    MAGIC = b"VIMTUFS2"
+    vol_head = read_at(args.target, 8009, 64)
+    check("目标盘 LBA8009 = VimtuFS2 卷头（magic + version 4）",
+          vol_head[:8] == MAGIC, repr(vol_head[:8]))
+    check("卷头 version 字段 = 4（与 sysdisk 一致）",
+          len(vol_head) >= 12 and int.from_bytes(vol_head[8:12], "little") == 4,
+          "version=%d" % (int.from_bytes(vol_head[8:12], "little") if len(vol_head) >= 12 else -1))
+    src_disk = os.path.join(ROOT, "build64", "sysdisk.img")
+    if os.path.exists(src_disk):
+        with open(src_disk, "rb") as f:
+            f.seek(8009 * 512)
+            ref = f.read(64 * 1024)
+        got = read_at(args.target, 8009, len(ref))
+        check("目标盘主分区前 64 KiB 与 build64/sysdisk.img 逐字节一致（卷真的装进去了）",
+              got == ref, "%d B" % len(ref))
+
     print("=== 5) 单独启动装好的硬盘（验证真的能开机）===")
     boot_log = os.path.join(os.path.dirname(args.target) or ".", "installed_boot.log")
     if os.path.exists(boot_log):
@@ -321,6 +338,18 @@ def main():
     check("装好的系统走的是系统启动路径", "[OS] booted from installed disk" in boot)
     check("装好的系统就绪", "[OS] ready (idle)" in boot)
     check("装好的系统**没有**再进安装程序", "[SETUP]" not in boot and "entering setup wizard" not in boot)
+    # ★ v0.5.11：装好的盘必须**挂上系统卷**（本批修的真缺陷：之前装完主分区没有卷，
+    #   mount_system 失败 -> 一切写入失改 -> 重启即丢）。三条硬判据：
+    #     ① 有 [VFS64] mount 成功，且**没有** mount_system FAILED
+    #     ② 没有 [CONF64] WARN NOT-PERSISTENT（否则说明载体不是 VimtuFS2 卷）
+    #     ③ 图标包来源是 vfs（卷真的可读；无卷时才会退回原始区 src=raw）
+    check("装好的系统挂上了 VimtuFS2 系统卷（[VFS64] mount_system ok，无 FAILED）",
+          "mount_system FAILED" not in boot and re.search(r"\[VFS64\] mount ok", boot) is not None,
+          (re.search(r"\[VFS64\] mount_system[^\r\n]*", boot) or
+           re.search(r"\[VFS64\] mount ok[^\r\n]*", boot) or ["（无）"])[0])
+    check("装好的系统**不是** NOT-PERSISTENT（[CONF64] WARN NOT-PERSISTENT 必须缺席）",
+          "NOT-PERSISTENT" not in boot,
+          (re.search(r"\[CONF64\][^\r\n]*PERSISTENT[^\r\n]*", boot) or ["（无，正确）"])[0])
     # ★ 本批（图标"有时有有时没有"修复）：装好的系统盘第一次启动，图标必须真的在。
     #   如实口径（本批实测）：安装只写 8073 扇区载荷，**主分区还没有 VimtuFS2 卷**
     #   （离线读目标盘 LBA 8009 是 0）—— 此时图标包的来源只能是**原始区**（内核区尾部 LBA

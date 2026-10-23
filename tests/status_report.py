@@ -3519,6 +3519,12 @@ TESTS = [
     ("logfollow64_test.py", "★ v0.5.9 终端与日志自动跟到底部：开机滚屏日志回放**收口**（尾部 1..7 行补画上屏，"
                             "flushed == (replayed-rows)%8）+ 实时阶段收口 + 终端 dmesg 输出滚到底"
                             "（[TERM64] dmesg follow bottom=1）+ 屏幕像素（最新一行真在屏底）与 clear 反向对照"),
+    ("install_persist64_test.py", "★ v0.5.11 装到硬盘后真能持久化：ISO/安装介质装到 8G 盘 -> 目标盘 LBA8009 是 "
+                                  "VIMTUFS2 卷头 -> mount_system ok 且无 NOT-PERSISTENT -> mkdir+cfg save 落盘"
+                                  "（flush ok via=vfs）-> 正常关机重启 -> ui.theme=3 读回 + 宿主侧解析卷仍有 "
+                                  "/home/vimtu/pdata（10 条断言）"),
+    ("install_flow_test.py", "★ 端到端安装（含 v0.5.11 新增硬判据：目标盘带 VimtuFS2 卷/version=4、主分区前 "
+                             "64 KiB 与 sysdisk 逐字节一致、装好启动 mount_system ok 且非 NOT-PERSISTENT）"),
 ]
 
 

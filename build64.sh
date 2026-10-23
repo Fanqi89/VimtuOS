@@ -67,7 +67,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.5.10"    # ★ 本版：开机日志自动滚动 —— 控制台底边对齐（最后一行贴屏幕最底部）+ 完整滚完才进系统
+VIMTUOS_VERSION="0.5.11"    # ★ 本版：装到硬盘后**真能持久化**（安装载荷并入 VimtuFS2 卷，修"重启就丢"）
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
@@ -1498,6 +1498,17 @@ echo "==> ★ v0.5.8：系统预设头像 / 预设壁纸写进卷（/Avatars + /
 "$PY" tools/presets_pack_win.py --vol-in "$BUILD/officevol.img" \
       --vol-out "$BUILD/presetsvol.img" \
       --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+echo "==> ★ v0.5.11：把数据分区（VimtuFS2 卷）**并入安装载荷** system.img"
+# ★ 真缺陷（本批修）：system.img 原来只切了前 8073 扇区（MBR+引导+内核+64 扇区裸槽），
+#   卷留在 sysdisk.img 的 8009 起 —— 于是用 ISO/安装介质**装到硬盘后目标盘 LBA 8009 是空字节**：
+#     [VFS64] mount FAILED reason=magic -> mount_system FAILED
+#     [CONF64] WARN NOT-PERSISTENT carrier=raw reason=no-vimtufs2-volume
+#   结果装好的系统一切修改（图标位置/壁纸/主题/用户名/密码/新建文件夹）重启即丢。
+#   修法：载荷 = 完整磁盘映像（8009 + 卷扇区），安装器原样写盘 -> 目标盘自带卷。
+"$PY" tools/payload_embed_win.py --disk "$BUILD/sysdisk.img" --system "$BUILD/system.img" \
+      --parts-lba 8009 --out-sectors "$BUILD/sys_sectors.txt"
+SYS_SECTORS=$(cat "$BUILD/sys_sectors.txt")
+IMAGE_SECTORS=$((PAYLOAD_LBA + 1 + SYS_SECTORS))
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"
 "$PY" - "$BUILD/payload_hdr.bin" "$SYS_SECTORS" "$((PAYLOAD_LBA + 1))" <<'PYEOF'
 import struct, sys
