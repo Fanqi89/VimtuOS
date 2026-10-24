@@ -21,7 +21,7 @@
 | BIOS 光盘 / U 盘 / 裸盘 | ✅ MBR + El Torito + hybrid ISO；INT 13h 读盘（含 SATA/AHCI） |
 | UEFI | ✅ 两段式（极小 PE 桩 + 平铺长模式引导器），OVMF 与 VMware EFI 双通 |
 | 分区表 | ✅ MBR + GPT（含安装到 GPT 盘、盘尾备份 GPT） |
-| 安装程序 | ✅ Win10 风格向导；新建/删除/格式化分区**真实写盘**（v0.5.14 起 GPT 盘也打对表、删除/格式化**两步确认**）；进度百分比；装完自动重启 |
+| 安装程序 | ✅ Win10 风格向导；新建/删除/格式化分区**真实写盘**（v0.5.14 起 GPT 盘也打对表、删除/格式化**两步确认**）；**装完系统卷 = 分区大小**（v0.5.15，实测 100 GiB 盘装出 `total=209608854` 块且 378 个文件逐字节可读）；进度百分比；装完自动重启 |
 | 交付物 | `vimtu64-64.iso`（三合一安装盘）、`vimtu64-64.img`（裸盘介质） |
 
 ### 2. 内核
@@ -312,7 +312,18 @@ qemu-system-x86_64 -m 512 -cdrom vimtu64-64.iso \
 > `[VFS64] mount_system slot=0 drive=0 start=8009`、`[CONF64] flush ok via=vfs`、
 > 重启后 `[CONF64] load ui.theme=3`、宿主侧解析卷仍能读到 `/home/vimtu/pdata`。
 
-> **系统卷有多大？（v0.5.13 起 = 主分区有多大，卷就多大）**
+> **系统卷有多大？（v0.5.15 起 = 主分区多大，卷就多大，而且文件真能读）**
+> 安装收尾会把卷**按主分区大小重建**：重算布局（`bmn = ceil(total/4096)`）→ 把 inode 区 + 数据区
+> 整体后移 → **把 inode 与各级间接块里的绝对块号一起平移 Δ**（v0.5.15 修；只搬数据会让每个文件
+> 都指向错位的数据）→ 按旧位图重建新位图 → 重写超级块。安装日志给出两行证据：
+> `[INSTALL] volume grow ok moved=24751 total=209608854`（100 GiB 盘 = 102348 MiB 卷）与
+> `[INSTALL] volume grow relocate delta=51168 inodes=373 indirect_blocks=261`。
+> 验收口径是"宿主侧独立解析卷"：`total` 必须等于主分区扇区数、载荷里 378 个文件必须逐字节一致、
+> 所有 inode CRC 自洽、文件用到的块在位图里都已用（`tests/volreloc64_test.py`：8 GiB 全量 +
+> 100 GiB 窗口，32 条断言）。
+> 边界：安装器走 PATA（LBA28 ≤ 128 GiB）；首次挂载 100 GiB 卷要读完 26 MB 位图（约 36 s，进桌面
+> 比 8 GiB 慢约 1 分钟）；**inode 上限仍是 512**（空间大 ≠ 文件个数多）；旧盘不会自动长大。
+>
 > 安装收尾会把卷**按主分区大小重建**：重算布局（`bmn = ceil(total/4096)`）→ 把 inode 区 + 数据区
 > 整体后移 → 按旧位图重建新位图 → 重写超级块。安装日志会打
 > `[INSTALL] volume grow ok moved=24751 total=16670870`，装好的 8 GiB 盘上 `df`/`[VFS64] mount ok`
@@ -389,7 +400,7 @@ py -3 tests/<模块>_test.py                   # 单跑一条
 │   └── logo.png
 ├── res/   (1 项，见下方折叠清单)
 ├── sdk/   (1 项，见下方折叠清单)
-├── tests/   (116 项，见下方折叠清单)
+├── tests/   (117 项，见下方折叠清单)
 ├── third_party/   (6 项，见下方折叠清单)
 ├── tools/   (49 项，见下方折叠清单)
 ├── user/   (27 项，见下方折叠清单)
@@ -695,6 +706,7 @@ py -3 tests/<模块>_test.py                   # 单跑一条
 ├── panels64_test.py
 ├── partmgr64_test.py
 ├── partition_ops_test.py
+├── volreloc64_test.py
 ├── perm64_test.py
 ├── persist64_test.py
 ├── pipe64_test.py

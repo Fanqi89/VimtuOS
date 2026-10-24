@@ -224,9 +224,19 @@ def main():
         open_terminal(log_of(serial_a), mon, serial_a)
         time.sleep(1.0)
     check("终端真的收到了键盘输入（[TERM] cmd）", typed_ok)
+    # ★ 判据收严：登录时已经有过一次 flush（ui.login.last），所以不能只等"出现过 flush"，
+    #   必须等**这一次 cfg save 之后新出现**的 flush —— 否则会在 save 还没被处理时就 quit，
+    #   主题根本没落盘（本批踩到：第二次启动读不到 ui.theme=3）。
+    n_flush_before = log_of(serial_a).count("[CONF64] flush ok")
     type_line(mon, "cfg set ui.theme 3")
     type_line(mon, "cfg save")
-    ok_flush = wait_in(serial_a, "[CONF64] flush ok", 90)
+    ok_flush = False
+    t_flush = time.time()
+    while time.time() - t_flush < 120:
+        if log_of(serial_a).count("[CONF64] flush ok") > n_flush_before:
+            ok_flush = True
+            break
+        time.sleep(0.5)
     log_a2 = log_of(serial_a)
     check("设置真落盘（[CONF64] flush ok via=vfs）", ok_flush,
           (re.search(r"\[CONF64\] flush ok[^\r\n]*", log_a2) or ["缺失"])[0])

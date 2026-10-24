@@ -690,7 +690,27 @@ static int sb_verify(const uint8_t* sb, Vfs64SbGeo* geo) {
 //   盘卡片 / 每次写的空间预检都走这里。QEMU TCG 下单次事务 = 命令 + IRQ14/DRQ 等待（hlt）+ PIO，
 //   实测十几毫秒 —— 它和 inode 全表扫描一起把"进盘符"那一帧顶过看门狗 5s（见 g_ino_win 的说明）。
 // ★ v0.5.13：8 -> 64 扇区。8 GiB 卷的位图是 4096 个扇区，按 8 扇区一个事务要 512 次（QEMU TCG 下首次挂载要十几秒）；64 扇区 = 32 KiB，只需 64 次。
-#define VFS64_BM_CHUNK_SEC 64u
+// ★ v0.5.15：逐字节 popcount 表（数"已用"位数）。原来在内层循环里逐位测试 ——
+//   100 GiB 卷一张位图 = 51,175 扇区 = 2 亿个位，一次全扫要 70~80 s（实测）。
+static const uint8_t k_pop8[256] = {
+    0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
+    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
+    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
+    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+    3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+    1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5,
+    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+    3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+    2, 3, 3, 4, 3, 4, 4, 5, 3, 4, 4, 5, 4, 5, 5, 6,
+    3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+    3, 4, 4, 5, 4, 5, 5, 6, 4, 5, 5, 6, 5, 6, 6, 7,
+    4, 5, 5, 6, 5, 6, 6, 7, 5, 6, 6, 7, 6, 7, 7, 8
+};
+#define VFS64_BM_CHUNK_SEC 64u    // 空闲统计用（保持 64 扇区：大卷上主要成本是数据量本身）
 static bool count_free_at(int drive, uint32_t base_lba, uint32_t bitmap_start, uint32_t bitmap_blocks,
                           uint32_t blocks, uint32_t data_start, uint32_t* out) {
     static uint8_t bm[VFS64_BM_CHUNK_SEC * VFS64_SECTOR_BYTES];   // 只在这里用；FS 操作串行、不重入
@@ -699,15 +719,26 @@ static bool count_free_at(int drive, uint32_t base_lba, uint32_t bitmap_start, u
         uint32_t c = bitmap_blocks - m;
         if (c > VFS64_BM_CHUNK_SEC) c = VFS64_BM_CHUNK_SEC;
         if (!dev_read_at(drive, base_lba + bitmap_start + m, c, bm)) return false;
+        bool beyond = false;
         for (uint32_t s = 0; s < c; s++) {
             const uint8_t* sec = bm + (uint64_t)s * VFS64_SECTOR_BYTES;
-            for (uint32_t k = 0; k < VFS64_BITMAP_BLK_BITS; k++) {
-                const uint32_t blk = (m + s) * VFS64_BITMAP_BLK_BITS + k;
-                if (blk < data_start || blk >= blocks) continue;
-                if ((sec[k >> 3] & (uint8_t)(1u << (k & 7u))) == 0) free_n++;
+            const uint32_t base_blk = (m + s) * VFS64_BITMAP_BLK_BITS;
+            if (base_blk >= blocks) { beyond = true; break; }        // 这一扇区之后全在卷外
+            uint32_t lo = 0, hi = VFS64_BITMAP_BLK_BITS;
+            if (base_blk < data_start) lo = data_start - base_blk;   // 头部（超级块/位图/inode）不算空闲
+            if (base_blk + hi > blocks) hi = blocks - base_blk;
+            for (uint32_t k = lo; k < hi; ) {
+                if ((k & 7u) == 0u && k + 8u <= hi) {                // 整字节：查表（8 位一次）
+                    free_n += (uint32_t)(8u - (uint32_t)k_pop8[sec[k >> 3]]);
+                    k += 8u;
+                } else {                                              // 边界上的零头：逐位
+                    if ((sec[k >> 3] & (uint8_t)(1u << (k & 7u))) == 0) free_n++;
+                    k++;
+                }
             }
         }
         m += c;
+        if (beyond) break;
     }
     *out = free_n;
     return true;
@@ -720,7 +751,7 @@ static bool count_free_at(int drive, uint32_t base_lba, uint32_t bitmap_start, u
 // 阈值（[WD64] watchdog fire -> PANIC64 stop=WATCHDOG_TIMEOUT，tests/multivol64_test.py 阶段 3 实测）。
 // 语义不变：位图**只在** bitmap_set / alloc_block / vfs64_format 里被改，这三处一律让缓存失效；
 // 因此缓存里的数字永远等于"最后一次改位图之后的真实空闲块数"（宁可多数一遍，绝不给旧数字）。
-#define VFS64_FREECACHE_N 4
+#define VFS64_FREECACHE_N 8      // v0.5.15：4 -> 8（多卷 + 自检卷并存，别把系统卷挤掉）
 struct Vfs64FreeEnt {
     bool     used;
     uint32_t gen;
@@ -728,14 +759,38 @@ struct Vfs64FreeEnt {
     uint32_t lba, bitmap_start, bitmap_blocks, blocks, data_start, free_blocks;
 };
 static Vfs64FreeEnt g_freecache[VFS64_FREECACHE_N];
-static uint32_t g_freegen  = 1u;      // 代次：任何位图写入都 +1 -> 旧条目自动失效
+static uint32_t g_freegen  = 1u;      // 代次：只用于回绕时整表作废（不再"任何位图写入就全局作废"）
 static uint32_t g_freerot  = 0;       // 简单轮转淘汰
-static void free_cache_bump() {
-    if (++g_freegen == 0u) {          // 回绕：整表作废（不会误命中）
-        g_freegen = 1u;
-        for (int i = 0; i < VFS64_FREECACHE_N; i++) { g_freecache[i].used = false; g_freecache[i].gen = 0; }
+// ★ v0.5.15：缓存失效改成**按几何**（盘号 + 起始 LBA）。
+//   旧实现用全局代次：任何卷（哪怕是自检里 64 块的小卷）format/mount 一次，就把**所有**
+//   卷的空闲数缓存一起作废 —— 100 GiB 系统卷下一次写盘又要重扫 26 MB 位图（实测 31 s/次），
+//   启动里各处自检轮流 format 小卷，于是 100 GiB 桌面就绪从 44 s 拖到 148 s。
+static void cur_free_invalidate();       // 前置声明：当前卷专用槽（定义在下方）
+static void cur_free_adjust(int delta);
+
+static void free_cache_drop(int drive, uint32_t base_lba) {
+    for (int i = 0; i < VFS64_FREECACHE_N; i++) {
+        Vfs64FreeEnt& e = g_freecache[i];
+        if (e.used && e.drive == drive && e.lba == base_lba) { e.used = false; e.gen = 0; }
     }
+    cur_free_invalidate();               // 这条卷被格式化/重挂了：当前卷的计数也不能再用
 }
+// ★ v0.5.15：位图变化时**就地维护**缓存里的空闲块数，而不是把缓存作废。
+//   不作废的理由：每写一个块都会调 bitmap_set -> 若作废，下一次写盘的"空预检"就得把整张
+//   位图重扫一遍（100 GiB 卷实测 72~80 s/次）。±1 是精确的：位确实从 0 变 1 / 1 变 0。
+static void free_cache_adjust(int delta) {
+    for (int i = 0; i < VFS64_FREECACHE_N; i++) {
+        Vfs64FreeEnt& e = g_freecache[i];
+        if (!e.used || e.gen != g_freegen) continue;
+        if (e.drive != g_drive || e.lba != g_start || e.bitmap_start != g_bitmap_start ||
+            e.bitmap_blocks != g_bitmap_blocks || e.blocks != g_blocks ||
+            e.data_start != g_data_start) continue;
+        if (delta < 0) { if (e.free_blocks > 0u) e.free_blocks--; }
+        else e.free_blocks++;
+    }
+    cur_free_adjust(delta);              // 当前卷专用槽同步 ±1
+}
+
 // 带缓存的位图统计（键 = 卷几何，含盘号 + 起始 LBA；换盘/换卷/被写都会自然失效）
 static bool count_free_cached64(int drive, uint32_t base_lba, uint32_t bitmap_start, uint32_t bitmap_blocks,
                                 uint32_t blocks, uint32_t data_start, uint32_t* out) {
@@ -759,8 +814,43 @@ static bool count_free_cached64(int drive, uint32_t base_lba, uint32_t bitmap_st
     return true;
 }
 // 已在挂载状态里的卷：等价于用当前几何调用带缓存的那个
+// ★ v0.5.15：**当前卷空闲数的专用槽**（不参与轮转淘汰）。
+//   为什么必须单列一条：4 条轮转表会被启动里的自检卷/配置卷挤掉系统卷那条，之后每次写盘的
+//   "空预检"都要重扫整张位图（8 GiB ≈4 s / 100 GiB ≈36 s），连续几次就撞 20 s 看门狗蓝屏
+//   （实测 [WD64] watchdog fire stale=20180ms -> PANIC64 WATCHDOG_TIMEOUT detail=20180）。
+static bool     g_cf_valid  = false;
+static int      g_cf_drive  = -1;
+static uint32_t g_cf_lba    = 0;
+static uint32_t g_cf_blocks = 0;
+static uint32_t g_cf_data   = 0;
+static uint32_t g_cf_bmn    = 0;
+static uint32_t g_cf_val    = 0;
+
+static void cur_free_invalidate() { g_cf_valid = false; }
+static void cur_free_adjust(int delta) {
+    if (!g_cf_valid) return;
+    if (delta < 0) { if (g_cf_val > 0u) g_cf_val--; }
+    else g_cf_val++;
+}
+
 static bool count_free_blocks(uint32_t* out) {
-    return count_free_cached64(g_drive, g_start, g_bitmap_start, g_bitmap_blocks, g_blocks, g_data_start, out);
+    if (g_cf_valid && g_cf_drive == g_drive && g_cf_lba == g_start &&
+        g_cf_blocks == g_blocks && g_cf_data == g_data_start && g_cf_bmn == g_bitmap_blocks) {
+        if (out) *out = g_cf_val;
+        return true;
+    }
+    uint32_t n = 0;
+    if (!count_free_at(g_drive, g_start, g_bitmap_start, g_bitmap_blocks, g_blocks, g_data_start, &n))
+        return false;
+    g_cf_valid = true;
+    g_cf_drive = g_drive;
+    g_cf_lba = g_start;
+    g_cf_blocks = g_blocks;
+    g_cf_data = g_data_start;
+    g_cf_bmn = g_bitmap_blocks;
+    g_cf_val = n;
+    if (out) *out = n;
+    return true;
 }
 
 // ==================== 块读写 / 位图 ====================
@@ -784,28 +874,57 @@ static bool bitmap_set(uint32_t blk, bool used) {
     if (m >= g_bitmap_blocks) { log_bad_block(blk); return false; }
     if (!dev_read(g_start + g_bitmap_start + m, 1, g_sec)) return false;
     const uint8_t mask = (uint8_t)(1u << (k & 7u));
+    const bool was = (g_sec[k >> 3] & mask) != 0;
     if (used) g_sec[k >> 3] |= mask;
     else      g_sec[k >> 3] &= (uint8_t)~mask;
     if (!dev_write(g_start + g_bitmap_start + m, 1, g_sec)) return false;
-    free_cache_bump();                     // 位图变了 -> 空闲块数缓存失效
+    if (was != used) free_cache_adjust(used ? -1 : +1);   // 就地 ±1（不再作废缓存）
     return true;
 }
 
 // 分配一个数据区空闲块：置位并返回块号；没有空闲返回 0（块 0 是超级块，永远已用，可当失败哨兵）。
-static uint32_t alloc_block() {
-    for (uint32_t m = 0; m < g_bitmap_blocks; m++) {
-        if (!dev_read(g_start + g_bitmap_start + m, 1, g_sec)) return 0;
-        for (uint32_t k = 0; k < VFS64_BITMAP_BLK_BITS; k++) {
-            const uint32_t blk = m * VFS64_BITMAP_BLK_BITS + k;
-            if (blk < g_data_start || blk >= g_blocks) continue;
-            if ((g_sec[k >> 3] & (uint8_t)(1u << (k & 7u))) != 0) continue;
-            g_sec[k >> 3] |= (uint8_t)(1u << (k & 7u));
-            if (!dev_write(g_start + g_bitmap_start + m, 1, g_sec)) return 0;
-            free_cache_bump();             // 位图变了 -> 空闲块数缓存失效
+// ★ v0.5.15：记住"上次分配到哪里"，并按 64 扇区（32 KiB）成块读位图。
+//   旧实现每次从位图第 0 扇区逐扇区扫 —— 卷越大越慢（100 GiB 上每次分配都要多读十几扇区，
+//   批量写一个文件被放大成几十次扫）。
+static uint32_t g_alloc_hint = 0;
+
+// 在 [begin, end) 里找第一个空闲数据块；找到就置位并返回块号，找不到返回 0。
+static uint32_t alloc_scan(uint32_t begin, uint32_t end) {
+    // ★ v0.5.15 踩坑：这里一度按 256 扇区（128 KiB）成块读位图 —— 单次分配就要读 128 KiB，
+    //   一个 16 KiB 落盘（32 块）就是 4 MB 位图读（ATA PIO 实测 ~0.7 MB/s ≈ 6 s），
+    //   叠加主题切换自己的写盘直接撞 20 s 看门狗（[WD64] watchdog fire stale=20152ms）。
+    //   分配路径恢复"按扇区读"：每找一个块只多读 512 B；hint 仍然保留（不再从第 0 扇区扫）。
+    static uint8_t sec[VFS64_SECTOR_BYTES];
+    if (begin < g_data_start) begin = g_data_start;
+    if (end > g_blocks) end = g_blocks;
+    if (begin >= end) return 0;
+    uint32_t sec0 = begin / VFS64_BITMAP_BLK_BITS;
+    uint32_t sec_end = (end + VFS64_BITMAP_BLK_BITS - 1u) / VFS64_BITMAP_BLK_BITS;
+    if (sec_end > g_bitmap_blocks) sec_end = g_bitmap_blocks;
+    for (; sec0 < sec_end; sec0++) {
+        if (!dev_read(g_start + g_bitmap_start + sec0, 1, sec)) return 0;
+        const uint32_t base = sec0 * VFS64_BITMAP_BLK_BITS;
+        uint32_t k0 = 0;
+        if (base < begin) k0 = begin - base;
+        for (uint32_t k = k0; k < VFS64_BITMAP_BLK_BITS; k++) {
+            const uint32_t blk = base + k;
+            if (blk >= end || blk >= g_blocks) break;
+            if ((sec[k >> 3] & (uint8_t)(1u << (k & 7u))) != 0) continue;
+            sec[k >> 3] |= (uint8_t)(1u << (k & 7u));
+            if (!dev_write(g_start + g_bitmap_start + sec0, 1, sec)) return 0;
+            g_alloc_hint = blk + 1;
+            free_cache_adjust(-1);              // 就地 -1（不再作废缓存）
             return blk;
         }
     }
     return 0;
+}
+
+static uint32_t alloc_block() {
+    if (g_alloc_hint < g_data_start || g_alloc_hint >= g_blocks) g_alloc_hint = g_data_start;
+    uint32_t b = alloc_scan(g_alloc_hint, g_blocks);          // 先从上次位置往后找
+    if (b == 0) b = alloc_scan(g_data_start, g_alloc_hint);   // 再回卷扫前面
+    return b;
 }
 
 // ==================== inode 读写 / 校验 ====================
@@ -1775,7 +1894,8 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
         return -1;
     }
 
-    free_cache_bump();                     // 格式化刚写完位图 -> 空闲块数缓存作废
+    free_cache_drop(drive, start_lba);      // 只有**这个卷**的空闲数缓存作废（新卷）
+    g_alloc_hint = 0;                      // 分配起点也归零（新卷）
     g_mounted = true;
     dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] format ok blocks=");
@@ -1840,7 +1960,8 @@ int vfs64_mount(int drive, uint32_t start_lba) {
     geom_apply(geo);
     g_mounted = true;
 
-    free_cache_bump();                     // 新挂载：旧几何可能被别的卷用过，缓存一律作废
+    free_cache_drop(g_drive, g_start);      // 只有**这个卷**的缓存作废（别的卷不受影响）
+    g_alloc_hint = 0;                      // 分配起点归零（换卷后不能沿用旧 hint）
     uint32_t free_blocks = 0;
     if (!count_free_blocks(&free_blocks)) {
         log_mount_fail("bitmap");
@@ -1884,7 +2005,8 @@ int vfs64_probe_volume64(int drive, uint32_t start_lba, Vfs64VolInfo64* out) {
     Vfs64SbGeo geo;
     if (sb_verify(sec, &geo) != SB_OK) return -1;
     uint32_t free_blocks = 0;
-    const bool ok = count_free_at(drive, start_lba, geo.bitmap_start, geo.bitmap_blocks,
+    // ★ v0.5.15：同样走缓存（探测一个卷不该把整张 26 MB 位图读一遍）
+    const bool ok = count_free_cached64(drive, start_lba, geo.bitmap_start, geo.bitmap_blocks,
                                   geo.blocks, geo.data_start, &free_blocks);
     if (!ok) return -1;
     if (out) {
@@ -2088,9 +2210,11 @@ void vfs64_slots_dump64() {
         dbg64_dec((uint64_t)i);
         if (!g_vol[i].mounted) { dbg64_str(" used=no"); dbg64_nl(); dbg64_line_end64(); continue; }
         uint32_t free_blocks = 0;
-        const bool freed = count_free_at(g_vol[i].drive, g_vol[i].start, g_vol[i].bitmap_start,
-                                         g_vol[i].bitmap_blocks, g_vol[i].blocks,
-                                         g_vol[i].data_start, &free_blocks);
+        // ★ v0.5.15：走**缓存**。这里原来绕过缓存直接全扫位图，100 GiB 卷上每次打印一次
+        // `[VFS64] slot=...` 就要重扫 26 MB（实测 36 s，正好卡在启动路径上）。
+        const bool freed = count_free_cached64(g_vol[i].drive, g_vol[i].start, g_vol[i].bitmap_start,
+                                               g_vol[i].bitmap_blocks, g_vol[i].blocks,
+                                               g_vol[i].data_start, &free_blocks);
         dbg64_str(" used=yes drive=");
         dbg64_dec((uint64_t)g_vol[i].drive);
         dbg64_str(" start=");

@@ -944,6 +944,22 @@ static uint32_t pg_crc32(const uint8_t* b, uint32_t n) {
 #define PG_SB_CRC_LEN 60u
 
 // 返回 1 = 扩容成功；0 = 无需扩容（盘太小/已够大）；-1 = 失败（保持原卷可用）
+// 把一个"块号数组块"（一级间接块，或二级间接块里的子块）里的绝对块号整体平移 delta。
+// 只动落在旧数据区 [data_old, old_total) 的号；0 = 空槽不动。没有改动就不写盘。
+static bool pg_patch_ptr_block64(int drive, uint32_t base_lba, uint32_t blk,
+                                 uint32_t data_old, uint32_t old_total, uint32_t delta,
+                                 uint32_t* counter) {
+    if (!ata64_read(drive, base_lba + blk, 1, g_sec)) return false;
+    bool dirty = false;
+    for (uint32_t i = 0; i < VFS64_INDIRECT_PTRS; i++) {
+        const uint32_t v = rd32(g_sec + i * 4);
+        if (v >= data_old && v < old_total) { wr32(g_sec + i * 4, v + delta); dirty = true; }
+    }
+    if (!dirty) return true;
+    if (counter) (*counter)++;
+    return ata64_write(drive, base_lba + blk, 1, g_sec);
+}
+
 static int part_volume_grow64(int drive, uint32_t base_lba, uint32_t main_sectors) {
     static const char magic[8] = { 'V','I','M','T','U','F','S','2' };
     if (!ata64_read(drive, base_lba, 1, g_sec)) return -1;
@@ -1009,7 +1025,24 @@ static int part_volume_grow64(int drive, uint32_t base_lba, uint32_t main_sector
         moved += n;
     }
 
-    // ---- 2) 位图清零（新位图区比旧的大，原先是数据区的一部分，必须清 0 = 空闲）----
+    // ---- 2) 旧位图**先读进内存**，再动新位图 ----
+    //   ★ 踩坑（v0.5.13 的实现在这里顺序错了）：先把新位图区 [1, 1+bmn_new) 整体清零，
+    //     然后才"按旧位图平移"去读旧位图 —— 而旧位图正好落在被清零的那段里
+    //     （旧卷 12 MiB -> 旧位图 = 扇区 1..7）。结果读到的全是 0，"哪些块被占用"整个丢了：
+    //     装完 free 比正确值还多，数据块随时会被新分配覆盖。
+    if (old_bmn > 32u) {
+        dbg64_line_begin64();
+        dbg64_str("[INSTALL] volume grow skipped: 旧位图过大 bmn=");
+        dbg64_dec(old_bmn);
+        dbg64_str("（上限 32 扇区 = 16 KiB，即旧卷 <= 128 MiB）");
+        dbg64_nl();
+        dbg64_line_end64();
+        return 0;
+    }
+    static uint8_t g_bm_old[32 * 512];
+    if (!ata64_read(drive, base_lba + 1u, old_bmn, g_bm_old)) return -1;
+
+    // ---- 2b) 清空新位图（多出来的部分原先是数据区）----
     memzero(g_io, sizeof(g_io));
     for (uint32_t i = 0; i < bmn_new; i += INSTALL_CHUNK_SECTORS) {
         uint32_t c = bmn_new - i;
@@ -1017,59 +1050,60 @@ static int part_volume_grow64(int drive, uint32_t base_lba, uint32_t main_sector
         if (!ata64_write(drive, base_lba + 1u + i, c, g_io)) return -1;
     }
 
-    // ---- 3) 位图重建：头部（0..data_new-1）已用；数据区按旧位图平移；卷外（>= new_total）已用 ----
-    //   逐位操作需要读-改-写位图扇区；先把"数据区涉及的位图扇区"窗口读进来处理。
+    // ---- 3a) 头部（块 0..data_new-1）全部置"已用" ----
     const uint32_t bm_bit = VFS64_BITMAP_BLK_BITS;
-    // 3a) 头部整扇区：块 0..data_new-1 全 1（data_new 通常 << bm_bit，一个扇区够，但按通用写）
     {
-        uint32_t full = data_new / bm_bit;                 // 整扇区都是 1 的部分
-        uint32_t rem = data_new % bm_bit;                  // 末尾扇区里前 rem 位是 1
-        for (uint32_t i = 0; i < full && i < INSTALL_CHUNK_SECTORS; i++) {
-            // 一次最多 128 扇区：0xFF 填满
-            for (uint32_t k = 0; k < INSTALL_CHUNK_SECTORS; k++) memzero(g_io + k * 512, 512);
-            uint32_t c = full - i;
+        const uint32_t full = data_new / bm_bit;            // 整扇区都是 1 的部分
+        const uint32_t rem = data_new % bm_bit;             // 末尾扇区里前 rem 位是 1
+        for (uint32_t done = 0; done < full;) {
+            uint32_t c = full - done;
             if (c > INSTALL_CHUNK_SECTORS) c = INSTALL_CHUNK_SECTORS;
-            for (uint32_t k = 0; k < c; k++) {
-                for (uint32_t b = 0; b < 512; b++) g_io[k * 512 + b] = 0xFF;
-            }
-            if (!ata64_write(drive, base_lba + 1u + i, c, g_io)) return -1;
-            i += c - 1;
+            for (uint32_t k = 0; k < c * 512u; k++) g_io[k] = 0xFF;
+            if (!ata64_write(drive, base_lba + 1u + done, c, g_io)) return -1;
+            done += c;
         }
         if (rem) {
             if (!ata64_read(drive, base_lba + 1u + full, 1, g_sec)) return -1;
             for (uint32_t b = 0; b < rem / 8u; b++) g_sec[b] = 0xFF;
-            uint32_t left = rem % 8u;
+            const uint32_t left = rem % 8u;
             if (left) g_sec[rem / 8u] = (uint8_t)((1u << left) - 1u);
             if (!ata64_write(drive, base_lba + 1u + full, 1, g_sec)) return -1;
         }
     }
-    // 3b) 数据区：把旧位图的每一位映射到新块号（新块 = data_new + (旧块 - data_old)）
+
+    // ---- 3b) 旧位图 -> 新位图：新块号 = data_new + (旧块号 - data_old) ----
+    //   逐个旧"已用"位处理，按新位图扇区聚合成一次读-改-写（保留 3a 刚置上的头部位）。
     {
         const uint32_t old_datan = old_total - data_old;
-        uint32_t handled = 0;
-        while (handled < old_datan) {
-            // 处理旧位图里对应"旧块 [data_old+handled, ...)" 的一段（一个位图扇区 = 4096 块）
-            const uint32_t old_blk0 = data_old + handled;
-            const uint32_t old_bm_sec = old_blk0 / bm_bit;              // 旧位图扇区号
-            const uint32_t off_in_sec = old_blk0 % bm_bit;
-            uint32_t take = bm_bit - off_in_sec;
-            if (take > old_datan - handled) take = old_datan - handled;
-            if (!ata64_read(drive, base_lba + 1u + old_bm_sec, 1, g_sec)) return -1;
-            for (uint32_t j = 0; j < take; j++) {
-                const uint32_t bit_old = off_in_sec + j;
-                if (!(g_sec[bit_old / 8u] & (uint8_t)(1u << (bit_old % 8u)))) continue;   // 旧：空闲
-                const uint32_t new_blk = data_new + handled + j;
-                if (new_blk >= new_total) continue;                                      // 卷外不动
-                const uint32_t bm_sec = 1u + new_blk / bm_bit;                           // 绝对扇区号（卷内）
-                const uint32_t bit = new_blk % bm_bit;
-                if (!ata64_read(drive, base_lba + bm_sec, 1, g_sec)) return -1;
-                g_sec[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
-                if (!ata64_write(drive, base_lba + bm_sec, 1, g_sec)) return -1;
+        uint32_t cur_sec = 0xFFFFFFFFu;
+        uint32_t marked = 0;
+        for (uint32_t j = 0; j < old_datan; j++) {
+            if (!(g_bm_old[j / 8u] & (uint8_t)(1u << (j % 8u)))) continue;    // 旧：空闲
+            const uint32_t nb = data_new + j;
+            if (nb >= new_total) continue;
+            const uint32_t sec = nb / bm_bit;
+            const uint32_t bit = nb % bm_bit;
+            if (sec != cur_sec) {
+                if (cur_sec != 0xFFFFFFFFu) {
+                    if (!ata64_write(drive, base_lba + 1u + cur_sec, 1, g_sec)) return -1;
+                }
+                cur_sec = sec;
+                if (!ata64_read(drive, base_lba + 1u + sec, 1, g_sec)) return -1;
             }
-            handled += take;
+            g_sec[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
+            marked++;
         }
+        if (cur_sec != 0xFFFFFFFFu) {
+            if (!ata64_write(drive, base_lba + 1u + cur_sec, 1, g_sec)) return -1;
+        }
+        dbg64_line_begin64();
+        dbg64_str("[INSTALL] volume grow bitmap rebuilt used_data_blocks=");
+        dbg64_dec(marked);
+        dbg64_nl();
+        dbg64_line_end64();
     }
-    // 3c) 卷外（>= new_total）的位必须置 1：分配器永不发放
+
+    // ---- 3c) 卷外（>= new_total）的位必须置 1：分配器永不发放 ----
     {
         const uint32_t bm_sec = 1u + new_total / bm_bit;
         const uint32_t bit = new_total % bm_bit;
@@ -1080,7 +1114,91 @@ static int part_volume_grow64(int drive, uint32_t base_lba, uint32_t main_sector
         }
     }
 
-    // ---- 4) 重写超级块 ----
+    // ---- 3d) v0.5.15：**重定位块号** ----
+    //   inode 的 d0..d3 / ind / dind 里存的是**绝对块号**；整段后移 Δ 之后它们全过期。
+    //   v0.5.13 只搬数据、没改指针 —— 装完卷大小对了，但每个文件都指向错位的数据
+    //   （实测 [VFS64] BAD block=... not in data area、skip corrupt inode reason=ind range、
+    //     /hello.elf /proc64.elf 等全找不到、桌面起不来）。
+    //   这里把每个 inode 的指针、以及它引用的一级/二级间接块内容一起平移 Δ。
+    {
+        const uint32_t delta = ino_new - old_ino;
+        const uint32_t inodes_per_blk = 512u / 128u;         // v3/v4：128 B/个 -> 4 个/块
+        uint32_t ino_fixed = 0, ptr_fixed = 0;
+        static uint8_t g_dind[512];
+        for (uint32_t b = 0; b < ino_blocks; b += 16u) {
+            uint32_t c = ino_blocks - b;
+            if (c > 16u) c = 16u;                            // 16 块 = 8 KiB = 64 个 inode
+            if (!ata64_read(drive, base_lba + ino_new + b, c, g_io)) return -1;
+            bool dirty = false;
+            const uint32_t nin = c * inodes_per_blk;
+            for (uint32_t k = 0; k < nin; k++) {
+                uint8_t* rec = g_io + k * 128u;
+                if (rec[0] != 1 && rec[0] != 2) continue;     // 空槽 / 未知类型：不动
+                bool touched = false;
+                for (int d = 0; d < 4; d++) {
+                    const uint32_t v = rd32(rec + 8 + d * 4);
+                    if (v >= data_old && v < old_total) { wr32(rec + 8 + d * 4, v + delta); touched = true; }
+                }
+                const uint32_t ind = rd32(rec + 24);
+                if (ind >= data_old && ind < old_total) { wr32(rec + 24, ind + delta); touched = true; }
+                const uint32_t dind = rd32(rec + 71);
+                if (dind >= data_old && dind < old_total) { wr32(rec + 71, dind + delta); touched = true; }
+                if (!touched) continue;
+                ino_fixed++;
+                dirty = true;
+            }
+            if (!dirty) continue;
+            // 改了指针的 inode 必须重算 CRC32（覆盖 [0,124)）—— 否则整卷被判定为坏 inode
+            for (uint32_t k = 0; k < nin; k++) {
+                uint8_t* rec = g_io + k * 128u;
+                if (rec[0] != 1 && rec[0] != 2) continue;
+                wr32(rec + 124, pg_crc32(rec, 124));
+            }
+            if (!ata64_write(drive, base_lba + ino_new + b, c, g_io)) return -1;
+        }
+        // 间接块：inode 里的 ind/dind 已经换成新块号，直接按新块号去改内容
+        for (uint32_t b = 0; b < ino_blocks; b += 16u) {
+            uint32_t c = ino_blocks - b;
+            if (c > 16u) c = 16u;
+            if (!ata64_read(drive, base_lba + ino_new + b, c, g_io)) return -1;
+            const uint32_t nin = c * inodes_per_blk;
+            for (uint32_t k = 0; k < nin; k++) {
+                const uint8_t* rec = g_io + k * 128u;
+                if (rec[0] != 1 && rec[0] != 2) continue;
+                const uint32_t ind = rd32(rec + 24);
+                if (ind) {
+                    if (!pg_patch_ptr_block64(drive, base_lba, ind, data_old, old_total, delta, &ptr_fixed))
+                        return -1;
+                }
+                const uint32_t dind = rd32(rec + 71);
+                if (!dind) continue;
+                if (!ata64_read(drive, base_lba + dind, 1, g_dind)) return -1;
+                bool d2 = false;
+                for (uint32_t i = 0; i < VFS64_INDIRECT_PTRS; i++) {
+                    const uint32_t ch = rd32(g_dind + i * 4);
+                    if (ch >= data_old && ch < old_total) { wr32(g_dind + i * 4, ch + delta); d2 = true; }
+                }
+                if (d2 && !ata64_write(drive, base_lba + dind, 1, g_dind)) return -1;
+                for (uint32_t i = 0; i < VFS64_INDIRECT_PTRS; i++) {
+                    const uint32_t ch = rd32(g_dind + i * 4);
+                    if (!ch) continue;
+                    if (!pg_patch_ptr_block64(drive, base_lba, ch, data_old, old_total, delta, &ptr_fixed))
+                        return -1;
+                }
+            }
+        }
+        dbg64_line_begin64();
+        dbg64_str("[INSTALL] volume grow relocate delta=");
+        dbg64_dec(delta);
+        dbg64_str(" inodes=");
+        dbg64_dec(ino_fixed);
+        dbg64_str(" indirect_blocks=");
+        dbg64_dec(ptr_fixed);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+
+    // ---- 5) 重写超级块 ----
     if (!ata64_read(drive, base_lba, 1, g_sec)) return -1;
     wr32(g_sec + PG_O_TOTAL, new_total);
     wr32(g_sec + PG_O_BITMAP, 1u);
