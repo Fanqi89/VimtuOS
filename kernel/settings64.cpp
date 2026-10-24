@@ -761,11 +761,11 @@ void settings64_sync_user_prefs64(int theme_id, int lock_mode) {
 // ==================== ★ v0.5.8：预设壁纸 / 预设头像（扫目录循环切换）====================
 // 目录规范（用户点名）：/Wallpapers = 预设壁纸、/Avatars = 预设头像，**两者分开**。
 // 改动前两个"预设"按钮都写死 /logo/kaisi.png —— 同一个文件既是壁纸又是头像，语义混在一起，
-static void avatar_apply(const char* src, bool from_file);   // 定义在后面（头像一节）
+static int  avatar_apply(const char* src, bool from_file);    // 定义在后面（头像一节）；1=应用成功
 // 用户放进 /Wallpapers 的图根本选不到。现在按目录枚举（只收图片扩展名）、按 inode 顺序
 // （= 打包时的写入顺序 = 文件名字典序）**循环**切换；壁纸落 ui.wall.path、头像落 users.db。
 #define PRESET_MAX 32
-static void wall_set_path(const char* path);      // 定义在后面（见"墙纸"一节）
+static int  wall_set_path(const char* path);      // 定义在后面（见"墙纸"一节）；1=应用成功
 
 static bool preset_is_image64(const char* n) {
     return s_ends_ci(n, ".png") || s_ends_ci(n, ".jpg") ||
@@ -790,6 +790,15 @@ static int preset_collect64(const char* dir, char names[][VFS64_NAME_MAX + 1], i
     return n;
 }
 
+// 预设张数缓存：-1 = 还没数过（切到对应页 / 每次点完预设就作废重数）。
+// 为什么缓存：preset_collect64 是逐条 vfs64_list64，放在每帧绘制里会把帧时间拖长。
+static int g_wall_n = -1;
+static int g_av_n   = -1;
+static int preset_count64(const char* dir) {
+    static char names[PRESET_MAX][VFS64_NAME_MAX + 1];
+    return preset_collect64(dir, names, PRESET_MAX);
+}
+
 static void preset_join64(const char* dir, const char* nm, char* out, int cap) {
     int i = 0;
     for (; dir[i] && i < cap - 2; i++) out[i] = dir[i];
@@ -810,21 +819,42 @@ static void wall_preset_cycle() {
     }
     char cur[CFG64_STR_MAX];
     cfg64_wall_path64(cur, (int)sizeof(cur));
-    int idx = 0;
+    int start = 0;
     for (int i = 0; i < n; i++) {
         char p[CFG64_STR_MAX];
         preset_join64("/Wallpapers", names[i], p, (int)sizeof(p));
-        if (s_eq(cur, p)) { idx = (i + 1) % n; break; }
+        if (s_eq(cur, p)) { start = i; break; }
     }
-    char p[CFG64_STR_MAX];
-    preset_join64("/Wallpapers", names[idx], p, (int)sizeof(p));
+    // ★ v0.5.16：从"当前这张的下一张"开始，最多试 n 张，**第一张真正应用成功的**生效。
+    //   旧实现挑中一张就调 wall_set_path 然后结束 —— 只要那张解不开（例如 jpg 被过时闸门挡住），
+    //   cfg 里的路径不变，下一次点击又挑中同一张：按钮表现成完全没反应。
+    g_wall_n = n;
+    for (int k = 1; k <= n; k++) {
+        const int idx = (start + k) % n;
+        char p[CFG64_STR_MAX];
+        preset_join64("/Wallpapers", names[idx], p, (int)sizeof(p));
+        dbg64_line_begin64();
+        dbg64_str("[SET64] wall preset try idx="); dbg64_dec((uint64_t)idx);
+        dbg64_str("/"); dbg64_dec((uint64_t)n);
+        dbg64_str(" name="); dbg64_str(names[idx]);
+        dbg64_nl();
+        dbg64_line_end64();
+        if (wall_set_path(p)) {             // 它负责解码校验 + 持久化 + 打点
+            dbg64_line_begin64();
+            dbg64_str("[SET64] wall preset idx="); dbg64_dec((uint64_t)idx);
+            dbg64_str(" n="); dbg64_dec((uint64_t)n);
+            dbg64_str(" name="); dbg64_str(names[idx]);
+            dbg64_str(" applied=1\n");
+            dbg64_line_end64();
+            return;
+        }
+    }
     dbg64_line_begin64();
-    dbg64_str("[SET64] wall preset idx="); dbg64_dec((uint64_t)idx);
-    dbg64_str(" n="); dbg64_dec((uint64_t)n);
-    dbg64_str(" name="); dbg64_str(names[idx]);
+    dbg64_str("[SET64] wall preset ok=0 reason=all-failed n="); dbg64_dec((uint64_t)n);
     dbg64_nl();
     dbg64_line_end64();
-    wall_set_path(p);                       // 它负责解码校验 + 持久化 + 打点
+    msg_set(gui64_lang_zh() ? "预设壁纸都读不出来（串口有每张的 ok=0 原因）"
+                            : "no preset wallpaper could be loaded", tk64()->accent2);
 }
 
 // 头像：同样按 /Avatars 循环（与壁纸分目录，不再借用 /logo/kaisi.png）
@@ -839,24 +869,42 @@ static void avatar_preset_cycle() {
     }
     char cur[CFG64_STR_MAX];
     cfg64_avatar_path64(cur, (int)sizeof(cur));
-    int idx = 0;
+    int start = 0;
     for (int i = 0; i < n; i++) {
         char p[CFG64_STR_MAX];
         preset_join64("/Avatars", names[i], p, (int)sizeof(p));
-        if (s_eq(cur, p)) { idx = (i + 1) % n; break; }
+        if (s_eq(cur, p)) { start = i; break; }
     }
-    char p[CFG64_STR_MAX];
-    preset_join64("/Avatars", names[idx], p, (int)sizeof(p));
+    g_av_n = n;
+    for (int k = 1; k <= n; k++) {
+        const int idx = (start + k) % n;
+        char p[CFG64_STR_MAX];
+        preset_join64("/Avatars", names[idx], p, (int)sizeof(p));
+        dbg64_line_begin64();
+        dbg64_str("[SET64] avatar preset try idx="); dbg64_dec((uint64_t)idx);
+        dbg64_str("/"); dbg64_dec((uint64_t)n);
+        dbg64_str(" name="); dbg64_str(names[idx]);
+        dbg64_nl();
+        dbg64_line_end64();
+        if (avatar_apply(p, true)) {        // 它负责解码校验 + 写 users.db + 打点
+            dbg64_line_begin64();
+            dbg64_str("[SET64] avatar preset idx="); dbg64_dec((uint64_t)idx);
+            dbg64_str(" n="); dbg64_dec((uint64_t)n);
+            dbg64_str(" name="); dbg64_str(names[idx]);
+            dbg64_str(" applied=1\n");
+            dbg64_line_end64();
+            return;
+        }
+    }
     dbg64_line_begin64();
-    dbg64_str("[SET64] avatar preset idx="); dbg64_dec((uint64_t)idx);
-    dbg64_str(" n="); dbg64_dec((uint64_t)n);
-    dbg64_str(" name="); dbg64_str(names[idx]);
+    dbg64_str("[SET64] avatar preset ok=0 reason=all-failed n="); dbg64_dec((uint64_t)n);
     dbg64_nl();
     dbg64_line_end64();
-    avatar_apply(p, true);                  // 它负责解码校验 + 写 users.db + 打点
+    msg_set(gui64_lang_zh() ? "预设头像都读不出来（串口有每张的原因）"
+                            : "no preset avatar could be loaded", tk64()->accent2);
 }
 
-static void avatar_apply(const char* src, bool from_file) {
+static int avatar_apply(const char* src, bool from_file) {
     char path[USERDB64_PATH_MAX];
     int i = 0;
     for (; src[i] && i < (int)sizeof(path) - 1; i++) path[i] = src[i];
@@ -876,7 +924,7 @@ static void avatar_apply(const char* src, bool from_file) {
         msg_set(gui64_lang_zh() ? "GIF 未实现（支持 PNG/JPEG/BMP）"
                                 : "GIF not implemented (PNG/JPEG/BMP supported)",
                 tk64()->accent2);
-        return;
+        return 0;
     }
     int w = 0, h = 0;
     if (from_file) {
@@ -890,7 +938,7 @@ static void avatar_apply(const char* src, bool from_file) {
             dbg64_line_end64();
             msg_set(gui64_lang_zh() ? "头像读取失败（路径不存在或格式不支持）"
                                     : "avatar load failed (missing or unsupported)", tk64()->accent2);
-            return;
+            return 0;
         }
         w = im.w; h = im.h;
         img64_free64(&im);
@@ -902,13 +950,22 @@ static void avatar_apply(const char* src, bool from_file) {
     dbg64_str(" src="); dbg64_str(path);
     dbg64_str(" via=settings px="); dbg64_dec((uint64_t)w); dbg64_str("x"); dbg64_dec((uint64_t)h);
     dbg64_str(" saved="); dbg64_dec((uint64_t)(rc == 0 ? 1 : 0));
-    dbg64_str(" persisted=1");
+    // ★ v0.5.16：persisted 按**真实**结果打（原来无条件写 persisted=1，保存失败也照样说成功）
+    dbg64_str(" persisted="); dbg64_dec((uint64_t)(rc == 0 ? 1 : 0));
+    if (rc != 0) dbg64_str(" reason=users.db-save-failed");
     dbg64_nl();
     dbg64_line_end64();
+    if (rc != 0) {
+        msg_set(gui64_lang_zh() ? "头像没能写进 /etc/users.db（重启后会丢）"
+                                : "avatar NOT persisted (users.db save failed)", tk64()->accent2);
+        gui64_invalidate();
+        return 0;
+    }
     cfg64_set_avatar_path64(from_file ? path : "");
     msg_set(gui64_lang_zh() ? "头像已更新（写入 /etc/users.db）" : "avatar updated (/etc/users.db)",
             tk64()->accent);
     gui64_invalidate();
+    return 1;
 }
 static void user_rename(const char* newname) {
     const User64Entry* cu = cur_user();
@@ -954,16 +1011,30 @@ static void user_rename(const char* newname) {
     for (; newname[k] && k < USERDB64_NAME_MAX - 1; k++) e->name[k] = newname[k];
     e->name[k] = 0;
     const int rc = userdb64_save64();
+    // ★ v0.5.16：改名后立刻把"上次登录用户"也换成新名 —— 锁屏/登录界面默认选中的就是它，
+    //   不同步的话重启后一眼看到的还是旧名字（用户就会说"改完又变回去了"）。
+    if (rc == 0) {
+        config64_set_str64("ui.login.last", e->name);
+        (void)config64_flush64();
+    }
     dbg64_line_begin64();
-    dbg64_str("[USER64] rename ok from="); dbg64_str(old);
+    dbg64_str("[USER64] rename "); dbg64_str(rc == 0 ? "ok" : "FAIL");
+    dbg64_str(" from="); dbg64_str(old);
     dbg64_str(" to="); dbg64_str(newname);
     dbg64_str(" via=settings home="); dbg64_str(e->home);
     dbg64_str(" (unchanged; usermod -l semantics) saved="); dbg64_dec((uint64_t)(rc == 0 ? 1 : 0));
-    dbg64_str(" persisted=1");
+    // 原来这里无条件打 persisted=1：保存失败时日志在说谎
+    dbg64_str(" persisted="); dbg64_dec((uint64_t)(rc == 0 ? 1 : 0));
+    if (rc != 0) dbg64_str(" reason=users.db-save-failed");
     dbg64_nl();
     dbg64_line_end64();
-    msg_set(gui64_lang_zh() ? "用户名已更新（/etc/users.db；开始菜单/登录界面同步）"
-                            : "user name updated (start menu / login follow)", tk64()->accent);
+    if (rc != 0) {
+        msg_set(gui64_lang_zh() ? "用户名没能写进 /etc/users.db（重启后会恢复原名）"
+                                : "rename NOT persisted (users.db save failed)", tk64()->accent2);
+    } else {
+        msg_set(gui64_lang_zh() ? "用户名已更新（/etc/users.db；锁屏/开始菜单同步）"
+                                : "user name updated (lock screen / start menu follow)", tk64()->accent);
+    }
     gui64_invalidate();
 }
 static void user_password_apply(const char* pw) {
@@ -1094,7 +1165,13 @@ static void wall_grad_toggle(int on) {
     }
     gui64_invalidate();
 }
-static void wall_set_path(const char* path) {
+// 返回 1 = 真的换了壁纸并持久化；0 = 没换（原因已打点 + 界面给提示）。
+// ★ v0.5.16 修复：这里原来有 `if (s_ends_ci(p,".jpg")||".jpeg"||".gif") -> ok=0
+//   reason=jpeg/gif not implemented (img64: png/bmp only)` —— 那是 **v0.5.8 之前的过时闸门**：
+//   img64 的 decode_jpeg64 早就实现了（baseline SOF0/SOF1，4:4:4/4:2:2/4:2:0），头像那条路
+//   （avatar_apply）当初已经放开，**唯独壁纸这条路把它留下了**。后果：/Wallpapers 里只要
+//   有一张 jpg，点"预设壁纸"就永远失败（而且失败后不前进 -> 按钮看着像死的）。
+static int wall_set_path(const char* path) {
     char p[CFG64_STR_MAX];
     int i = 0;
     for (; path[i] && i < (int)sizeof(p) - 1; i++) p[i] = path[i];
@@ -1106,23 +1183,25 @@ static void wall_set_path(const char* path) {
         logln("[SET64] wall path=(empty) ok=1 src=builtin persisted=1");
         msg_set(gui64_lang_zh() ? "已恢复内置壁纸" : "built-in wallpaper restored", tk64()->accent);
         gui64_invalidate();
-        return;
+        return 1;
     }
-    if (s_ends_ci(p, ".jpg") || s_ends_ci(p, ".jpeg") || s_ends_ci(p, ".gif")) {
+    // 只留 GIF 明确拒绝（img64 没有 GIF 解码器）；PNG/JPEG/BMP 一律交给 img64 判。
+    if (s_ends_ci(p, ".gif")) {
         dbg64_str("[SET64] wall path="); dbg64_str(p);
-        dbg64_str(" ok=0 reason=jpeg/gif not implemented (img64: png/bmp only)\n");
-        msg_set(gui64_lang_zh() ? "JPEG/GIF 未实现（只支持 PNG/BMP）" : "JPEG/GIF not implemented",
+        dbg64_str(" ok=0 reason=gif not implemented (img64: png/jpeg/bmp)\n");
+        msg_set(gui64_lang_zh() ? "GIF 未实现（支持 PNG/JPEG/BMP）"
+                                : "GIF not implemented (PNG/JPEG/BMP)",
                 tk64()->accent2);
-        return;
+        return 0;
     }
     Img64 im{};
     if (img64_load_vfs64(p, &im) != 0) {
         dbg64_str("[SET64] wall path="); dbg64_str(p);
         dbg64_str(" ok=0 reason="); dbg64_str(img64_last_err64());
         dbg64_nl();
-        msg_set(gui64_lang_zh() ? "壁纸读取失败（路径不存在或格式不支持）"
-                                : "wallpaper load failed", tk64()->accent2);
-        return;
+        msg_set(gui64_lang_zh() ? "壁纸读取失败：路径不存在 / 格式不支持 / 图太大（上限 2048px）"
+                                : "wallpaper load failed (missing / unsupported / >2048px)", tk64()->accent2);
+        return 0;
     }
     const int w = im.w, h = im.h;
     const int rc = gfx64_wall_set_source64(im.px, im.w, im.h, 1, "vfs:wallpaper");
@@ -1137,6 +1216,7 @@ static void wall_set_path(const char* path) {
     dbg64_line_end64();
     msg_set(gui64_lang_zh() ? "壁纸已更新" : "wallpaper updated", tk64()->accent);
     gui64_invalidate();
+    return (rc == 0) ? 1 : 0;
 }
 
 // ==================== 声音（真驱动 kernel/hda64.cpp；拿不到 = 内存态 + driver absent） ====================
@@ -1709,7 +1789,8 @@ static void page_wall(const Lay* L, int x0, int y0) {
         // 路径输入框 + 应用
         int rx = 0;
         row_label(L, ry, zh ? "图片路径" : "Image path",
-                  zh ? "PNG/BMP（JPEG 未实现，会如实报错）" : "PNG/BMP (JPEG not implemented)", &rx);
+                  zh ? "PNG / JPEG / BMP（VimtuFS2 路径；GIF 未实现）"
+                     : "PNG / JPEG / BMP (GIF not implemented)", &rx);
         const int fh = 32, fw = 300;
         const int fx = rx - 120 - 10 - fw;
         const int fy = ry + (L->row_h - fh) / 2;
@@ -1730,13 +1811,22 @@ static void page_wall(const Lay* L, int x0, int y0) {
                     g_hover == CID_WALL_BUILTIN, g_press == CID_WALL_BUILTIN);
         ctl_reg(P_WALL, CID_WALL_BUILTIN, CK_BUTTON, bx, ry + (L->row_h - bh) / 2, bw, bh);
         bx += bw + 10;
-        draw_button(bx, ry + (L->row_h - bh) / 2, 220, bh, zh ? "用 /logo/kaisi.png" : "Use /logo/kaisi.png", 0,
+        // ★ v0.5.16：按钮文字改成真话。原来写"用 /logo/kaisi.png"，可动作早在 v0.5.8 就变成
+        //   "循环 /Wallpapers" —— 用户在界面上**找不到预设壁纸**，点它还会因为过时的 JPEG 闸门
+        //   永远失败。张数直接显示出来。
+        if (g_wall_n < 0) g_wall_n = preset_count64("/Wallpapers");
+        Buf lb; b_init(&lb);
+        b_str(&lb, zh ? "预设壁纸（/Wallpapers，" : "Presets (/Wallpapers, ");
+        b_int(&lb, g_wall_n);
+        b_str(&lb, zh ? " 张）" : ")");
+        draw_button(bx, ry + (L->row_h - bh) / 2, 260, bh, lb.b, 0,
                     g_hover == CID_WALL_PRESET, g_press == CID_WALL_PRESET);
-        ctl_reg(P_WALL, CID_WALL_PRESET, CK_BUTTON, bx, ry + (L->row_h - bh) / 2, 220, bh);
+        ctl_reg(P_WALL, CID_WALL_PRESET, CK_BUTTON, bx, ry + (L->row_h - bh) / 2, 260, bh);
         ry += L->row_h;
     }
     ui_text(L->card_x + 16, ry + 4,
-            zh ? "适应模式（填充/适应/拉伸/平铺/居中/跨屏）在「壁纸适应模式」页设置；本页只管图片来源。"
+            zh ? "「预设壁纸」= 循环 /Wallpapers 里的图（PNG/JPEG/BMP，换一次存一次）；"
+                 "适应模式在「壁纸适应模式」页。"
                : "fit mode lives on the 'Wallpaper fit' page.",
             t->text_dim);
 }
@@ -2223,7 +2313,8 @@ static void page_avatar(const Lay* L, int x0, int y0) {
     {
         int rx = 0;
         row_label(L, ry, zh ? "本地图片路径" : "Local image path",
-                  zh ? "PNG/BMP（VimtuFS2 路径）；JPEG 未实现，会如实报错" : "PNG/BMP; JPEG not implemented", &rx);
+                  zh ? "PNG / JPEG / BMP（VimtuFS2 路径；GIF 未实现）"
+                     : "PNG / JPEG / BMP (GIF not implemented)", &rx);
         const int fh = 32, fw = 300;
         const int fx = rx - 240 - 10 - fw;
         const int fy = ry + (L->row_h - fh) / 2;
@@ -2234,15 +2325,21 @@ static void page_avatar(const Lay* L, int x0, int y0) {
         draw_button(rx - 120 - 10 - bw, fy, bw, fh, zh ? "应用" : "Apply", 1,
                     g_hover == CID_AVATAR_APPLY, g_press == CID_AVATAR_APPLY);
         ctl_reg(P_AVATAR, CID_AVATAR_APPLY, CK_BUTTON, rx - 120 - 10 - bw, fy, bw, fh);
-        draw_button(rx - 120, fy, 120, fh, zh ? "用内置图" : "Use PNG", 0,
+        // ★ v0.5.16：文字改成真话（动作是"循环 /Avatars"，不是 /logo/kaisi.png）
+        if (g_av_n < 0) g_av_n = preset_count64("/Avatars");
+        Buf ab; b_init(&ab);
+        b_str(&ab, zh ? "预设头像（" : "Presets (");
+        b_int(&ab, g_av_n);
+        b_str(&ab, zh ? " 张）" : ")");
+        draw_button(rx - 180, fy, 180, fh, ab.b, 0,
                     g_hover == CID_AVATAR_PRESET, g_press == CID_AVATAR_PRESET);
-        ctl_reg(P_AVATAR, CID_AVATAR_PRESET, CK_BUTTON, rx - 120, fy, 120, fh);
+        ctl_reg(P_AVATAR, CID_AVATAR_PRESET, CK_BUTTON, rx - 180, fy, 180, fh);
         ry += L->row_h;
     }
     if (msg_fresh()) ui_text(L->card_x + 16, ry, g_msg, g_msg_col);
     else ui_text(L->card_x + 16, ry,
-                 zh ? "提示：「用内置图」= /logo/kaisi.png（外壳装进 VimtuFS2 的真 PNG，158x158）"
-                    : "tip: /logo/kaisi.png is a real PNG installed by the shell",
+                 zh ? "提示：「预设头像」= 循环 /Avatars 里的图（写入 /etc/users.db，重启后仍在）"
+                    : "tip: presets cycle /Avatars (saved into /etc/users.db)",
                  t->text_dim);
 }
 
@@ -3020,7 +3117,9 @@ static void set_click(Window* w, int cx, int cy0) {
             focus_begin(id, "");
             break;
         case CID_AVATAR_APPLY:
-            avatar_apply(g_focus == CID_AVATAR_FIELD ? g_input : "", true);
+            // ★ v0.5.16：不再要求"焦点还在输入框"——点"应用"时焦点可能已经移开，
+            //   旧写法会拿空字符串去应用，表现成"点了没反应"。
+            (void)avatar_apply(g_input, true);
             break;
     case CID_AVATAR_PRESET:
         // ★ v0.5.8：按 /Avatars 循环（与壁纸分目录）
@@ -3030,7 +3129,18 @@ static void set_click(Window* w, int cx, int cy0) {
             focus_begin(id, "");
             break;
         case CID_UNAME_APPLY:
-            user_rename(g_focus == CID_UNAME_FIELD ? g_input : "");
+            // ★ v0.5.16：不再"只有焦点还在输入框才提交"。用户点"改名"时焦点常常已经移开，
+            //   旧写法提交空串 -> invalid-name -> 名字没变，而界面上只闪一句小字，
+            //   表现就是"改了用户名，重启后还是旧的"。
+            if (!g_input[0]) {
+                dbg64_line_begin64();
+                dbg64_str("[USER64] rename FAIL reason=empty-input (先在上面输入框里打新名字)\n");
+                dbg64_line_end64();
+                msg_set(gui64_lang_zh() ? "请先在上面的输入框里输入新用户名，再点「改名」"
+                                        : "type the new name in the field first", tk64()->accent2);
+                break;
+            }
+            user_rename(g_input);
             break;
         case CID_PW_FIELD:
             focus_begin(id, "");
@@ -3107,7 +3217,7 @@ static void set_click(Window* w, int cx, int cy0) {
     if (id >= CID_AVATAR_BASE && id < CID_AVATAR_BASE + 3) {
         Buf b; b_init(&b);
         b_str(&b, "builtin:"); b_int(&b, id - CID_AVATAR_BASE);
-        avatar_apply(b.b, false);
+        (void)avatar_apply(b.b, false);
     }
     gui64_invalidate();
 }
@@ -3136,7 +3246,7 @@ static void set_key(Window* w, char c) {
             g_focus = -1;
             if (id == CID_WALL_FIELD) wall_set_path(g_input);
             else if (id == CID_GRAD_A_FIELD || id == CID_GRAD_B_FIELD) grad_apply(id == CID_GRAD_A_FIELD ? "a" : "b");
-            else if (id == CID_AVATAR_FIELD) avatar_apply(g_input, true);
+            else if (id == CID_AVATAR_FIELD) (void)avatar_apply(g_input, true);
             else if (id == CID_UNAME_FIELD) user_rename(g_input);
             else if (id == CID_PW_FIELD) {
                 char pw[64];

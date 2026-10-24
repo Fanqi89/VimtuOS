@@ -3539,6 +3539,9 @@ TESTS = [
                                   "/home/vimtu/pdata（10 条断言）"),
     ("install_flow_test.py", "★ 端到端安装（含 v0.5.11 新增硬判据：目标盘带 VimtuFS2 卷/version=4、主分区前 "
                              "64 KiB 与 sysdisk 逐字节一致、装好启动 mount_system ok 且非 NOT-PERSISTENT）"),
+    ("presets_user64_test.py", "★ v0.5.16 设置里真点：预设壁纸（JPEG 放行 + 循环不卡死 + 持久化）、"
+                               "预设头像（写 users.db + 重启仍在）、改用户名（空输入明确报错 / 改名 ok+persisted=1 / "
+                               "重启后 userdb 与锁屏都是新名字）"),
     ("volreloc64_test.py", "★ v0.5.15 装完「系统卷 = 分区大小」且文件内容真能读：8 GiB raw（全量）与 "
                             "100 GiB qcow2（盘首 64 MiB 窗口）两个目标盘，宿主侧独立解析卷 —— "
                             "total == 主分区扇区数、378 个载荷文件全部存在且 sha256 逐字节一致、"

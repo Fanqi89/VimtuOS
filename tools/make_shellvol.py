@@ -360,6 +360,44 @@ def _read_images(d, want_prefix=None):
     return out
 
 
+# 内核 img64 的解码上限（img64.cpp 的 "jpeg too large (>2048)" / png 同理）：装进卷里的
+# 预设壁纸必须是内核能解的尺寸，否则设置里点"预设壁纸"会如实报错而**用不了**（实测踩到）。
+WALL_MAX_PX = 2048
+
+
+def _fit_image(name, data, limit=WALL_MAX_PX):
+    """超过 limit 的图按比例缩到 limit 以内（保持原格式与宽高比）。
+
+    返回 (name, data, info)。info=None 表示没动；否则是 (w, h, nw, nh) 便于构建日志核对。
+    没有 Pillow 时**原样返回**（脚本不因此失败；那种情况下超大图会在运行时被如实拒绝）。
+    """
+    try:
+        import io as _io
+        from PIL import Image
+    except Exception:
+        return name, data, None
+    try:
+        im = Image.open(_io.BytesIO(data))
+        w, h = im.size
+        if max(w, h) <= limit:
+            return name, data, None
+        sc = limit / float(max(w, h))
+        nw, nh = max(1, int(w * sc + 0.5)), max(1, int(h * sc + 0.5))
+        im2 = im if im.mode in ("RGB", "L") else im.convert("RGB")
+        im2 = im2.resize((nw, nh), Image.LANCZOS)
+        out = _io.BytesIO()
+        low = name.lower()
+        if low.endswith((".jpg", ".jpeg")):
+            im2.save(out, "JPEG", quality=88, optimize=True)
+        elif low.endswith(".png"):
+            im2.save(out, "PNG", optimize=True)
+        else:
+            im2.save(out, "BMP")
+        return name, out.getvalue(), (w, h, nw, nh)
+    except Exception:
+        return name, data, None
+
+
 def preset_wallpapers():
     """壁纸 = 内置示例（build64/presets/wall-*.png）+ 用户投放（res/wallpapers/*）。"""
     builtin = _read_images(os.path.join(REPO, "build64", "presets"), "wall-")
@@ -371,6 +409,10 @@ def preset_wallpapers():
         if key in seen:
             continue
         seen.add(key)
+        name, data, info = _fit_image(name, data)
+        if info:
+            print("    [wallpaper fit] %s %dx%d -> %dx%d（内核解码上限 %d）"
+                  % (name, info[0], info[1], info[2], info[3], WALL_MAX_PX))
         out.append((name, data))
     return out
 
