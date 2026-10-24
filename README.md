@@ -38,9 +38,15 @@
 - 盘符层：PATA/AHCI/NVMe 每块盘 → 分区 → fs 识别 → `C:` / `D:` …
 
 ### 4. 桌面（UI）
-- 设置里的**预设壁纸/预设头像**（v0.5.16 起真能用）：按钮显示张数，点一次循环一张并立刻持久化；
-  壁纸支持 **PNG / JPEG / BMP**（JPEG 走内核 `decode_jpeg64`，上限 2048px，超限如实拒绝）；
-  `res/wallpapers/` 里超限的图在**打包期**按上限等比缩小（构建日志 `[wallpaper fit] …`）
+- 设置里的**预设壁纸/预设头像**（v0.5.16 起真能用）：按钮显示张数，点一次循环一张并立刻持久化
+  - 源目录（构建期打进卷，改完要**重新构建**才会进系统）：
+    - `build64/presets/` —— 内置预设：`avatar-01..06.png`（预设头像，构建期由 `tools/make_presets.py` 生成）+ `wall-*.png`（内置示例壁纸）
+    - `res/wallpapers/` —— **你自己放的壁纸**（png/jpg/jpeg/bmp；非图片按扩展名忽略）
+  - 卷内落点：`/Avatars/`（头像）、`/Wallpapers/`（壁纸，两种来源合并）
+  - 支持 **PNG / JPEG / BMP**（JPEG 走内核 `decode_jpeg64`）；内核解码上限 **2048px**，
+    超限的图在**打包期**按上限等比缩小（构建日志 `[wallpaper fit] 1.jpeg 2649x1600 -> 2048x1237`），
+    运行时再遇到超限图会如实拒绝并提示上限
+  - 逐文件核对：`py -3 tests/presets_audit64_test.py`（秒级，不跑 QEMU）
 - 设置里的**改用户名**（v0.5.16 起真落盘）：写 `/etc/users.db` 并同步 `ui.login.last`，
   重启后用户表与锁屏都是新名字；空输入会明确提示（不再静默失败）
 - Windows 11 风格：Token 化设计（Rust 生成）、毛玻璃、大圆角、双层浅阴影、居中 Dock
@@ -405,7 +411,7 @@ py -3 tests/<模块>_test.py                   # 单跑一条
 │   └── logo.png
 ├── res/   (1 项，见下方折叠清单)
 ├── sdk/   (1 项，见下方折叠清单)
-├── tests/   (118 项，见下方折叠清单)
+├── tests/   (119 项，见下方折叠清单)
 ├── third_party/   (6 项，见下方折叠清单)
 ├── tools/   (49 项，见下方折叠清单)
 ├── user/   (27 项，见下方折叠清单)
@@ -716,6 +722,7 @@ py -3 tests/<模块>_test.py                   # 单跑一条
 ├── persist64_test.py
 ├── pipe64_test.py
 ├── preload_update_test.py
+├── presets_audit64_test.py
 ├── presets_user64_test.py
 ├── presets64_test.py
 ├── proc64_test.py
