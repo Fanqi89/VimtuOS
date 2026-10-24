@@ -520,7 +520,7 @@ static void avatar_draw64(int cx, int cy, int d, const User64Entry* e, int avata
         if (!c->tried) {
             c->tried = 1;
             Img64 im{};
-            if (img64_load_vfs64(e->avatar, &im) == 0) {
+            if (img64_load_vfs_fit64(e->avatar, 256, &im) == 0) {
                 c->rgba = (uint8_t*)kmalloc_64((uint64_t)d * d * 4);
                 if (c->rgba) {
                     img64_scale64(&im, (uint32_t*)c->rgba, d, d);

@@ -929,7 +929,8 @@ static int avatar_apply(const char* src, bool from_file) {
     int w = 0, h = 0;
     if (from_file) {
         Img64 im{};
-        if (img64_load_vfs64(path, &im) != 0) {
+        // ★ v0.5.17：解码期缩放到 256（头像最大只显示 128px）——任意分辨率都能用
+        if (img64_load_vfs_fit64(path, 256, &im) != 0) {
             dbg64_line_begin64();
             dbg64_str("[USER64] avatar FAIL user="); dbg64_str(name);
             dbg64_str(" src="); dbg64_str(path);
@@ -962,6 +963,7 @@ static int avatar_apply(const char* src, bool from_file) {
         return 0;
     }
     cfg64_set_avatar_path64(from_file ? path : "");
+    (void)config64_flush64();          // ★ 同上：立刻落盘
     msg_set(gui64_lang_zh() ? "头像已更新（写入 /etc/users.db）" : "avatar updated (/etc/users.db)",
             tk64()->accent);
     gui64_invalidate();
@@ -1195,18 +1197,22 @@ static int wall_set_path(const char* path) {
         return 0;
     }
     Img64 im{};
-    if (img64_load_vfs64(p, &im) != 0) {
+    // ★ v0.5.17：解码期缩放到 2048（桌面只用到屏幕尺寸）——任意分辨率都能当壁纸
+    if (img64_load_vfs_fit64(p, 2048, &im) != 0) {
         dbg64_str("[SET64] wall path="); dbg64_str(p);
         dbg64_str(" ok=0 reason="); dbg64_str(img64_last_err64());
         dbg64_nl();
-        msg_set(gui64_lang_zh() ? "壁纸读取失败：路径不存在 / 格式不支持 / 图太大（上限 2048px）"
-                                : "wallpaper load failed (missing / unsupported / >2048px)", tk64()->accent2);
+        msg_set(gui64_lang_zh() ? "壁纸读取失败：路径不存在 / 格式不支持（支持 PNG/JPEG/BMP；上限 16384px、32MP、单文件 24MB）"
+                                : "wallpaper load failed (png/jpeg/bmp; max 16384px / 32MP / 24MB)", tk64()->accent2);
         return 0;
     }
     const int w = im.w, h = im.h;
     const int rc = gfx64_wall_set_source64(im.px, im.w, im.h, 1, "vfs:wallpaper");
     img64_free64(&im);
-    if (rc == 0) cfg64_set_wall_path64(p);
+    if (rc == 0) {
+        cfg64_set_wall_path64(p);
+        (void)config64_flush64();      // ★ 立刻落盘：用户设完壁纸就可能关机
+    }
     dbg64_line_begin64();
     dbg64_str("[SET64] wall path="); dbg64_str(p);
     dbg64_str(" ok="); dbg64_dec((uint64_t)(rc == 0 ? 1 : 0));

@@ -202,6 +202,7 @@ def main():
                 m = re.findall(r"\[SET64\] wall path=(/Wallpapers/[^\s]+) ok=1", log_of(serial))
                 walls.append(m[-1] if m else None)
                 btn = ctl_center(log_of(serial), P_WALL, CID_WALL_PRESET) or btn
+        time.sleep(3.0)          # 串口落盘有 1~3 s 延迟：等最后一次点击的日志写出来再采
         log1 = log_of(serial)
         check("点「预设壁纸」真的应用成功（[SET64] wall path=/Wallpapers/... ok=1）",
               walls and walls[0] is not None, str(walls[0]))
@@ -289,9 +290,10 @@ def main():
         check("锁屏默认选中的也是新名字（ui.login.last 跟随）",
               re.search(r"\[LOGIN64\] login screen shown[^\r\n]*user=%s" % NEWNAME, log4) is not None,
               (re.search(r"\[LOGIN64\] login screen shown[^\r\n]*user=\S+", log4) or [""])[0].strip()[:110])
-        check("重启后头像仍是预设图（[IMG64] load path=/Avatars/… ok=1）",
-              re.search(r"\[IMG64\] load path=/Avatars/\S+ ok=1", log4) is not None,
-              (re.search(r"\[IMG64\] load path=/Avatars/\S+[^\r\n]*", log4) or [""])[0].strip()[:110])
+        # v0.5.17 起头像走"解码期缩放"入口，打点前缀变成 `[IMG64] load fit … max=256`
+        check("重启后头像仍是预设图（[IMG64] load fit path=/Avatars/… max=256 ok=1）",
+              re.search(r"\[IMG64\] load fit path=/Avatars/\S+ max=256 ok=1", log4) is not None,
+              (re.search(r"\[IMG64\] load fit path=/Avatars/\S+[^\r\n]*", log4) or [""])[0].strip()[:120])
         check("重启后壁纸仍是预设文件（[SET64] boot apply ... wall=… 或 [GFX64] init … src=vfs:wallpaper）",
               re.search(r"wall=/Wallpapers/|src=vfs:wallpaper", log4) is not None,
               (re.search(r"\[SET64\] boot apply[^\r\n]*", log4) or [""])[0].strip()[:110])

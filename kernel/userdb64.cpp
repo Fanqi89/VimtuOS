@@ -965,7 +965,8 @@ static void apply_user_settings64(const User64Entry* e) {
     }
     if (e->wall[0]) {
         Img64 im{};
-        if (img64_load_vfs64(e->wall, &im) == 0) {
+        // ★ v0.5.17：解码期缩放（桌面只用屏幕尺寸）
+        if (img64_load_vfs_fit64(e->wall, 2048, &im) == 0) {
             const int rc = gfx64_wall_set_source64(im.px, im.w, im.h, 1, "vfs:user-wall");
             img64_free64(&im);
             if (log_ok64(LOGK_LOGIN)) {

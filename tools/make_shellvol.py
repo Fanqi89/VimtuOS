@@ -362,7 +362,9 @@ def _read_images(d, want_prefix=None):
 
 # 内核 img64 的解码上限（img64.cpp 的 "jpeg too large (>2048)" / png 同理）：装进卷里的
 # 预设壁纸必须是内核能解的尺寸，否则设置里点"预设壁纸"会如实报错而**用不了**（实测踩到）。
-WALL_MAX_PX = 2048
+# ★ v0.5.17：内核改成**解码期缩放**后，打包期不再缩用户图（保留原图质量）。
+#   这里留一个大上限当护栏：只有病态尺寸（>16384px）才会在打包时等比缩小。
+WALL_MAX_PX = 16384
 
 
 def _fit_image(name, data, limit=WALL_MAX_PX):

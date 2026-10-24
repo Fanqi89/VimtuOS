@@ -3636,7 +3636,7 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
         bool loaded = false;
         if (wpath[0]) {
             Img64 wim{};
-            if (img64_load_vfs64(wpath, &wim) == 0) {
+            if (img64_load_vfs_fit64(wpath, 2048, &wim) == 0) {
                 loaded = (gfx64_wall_set_source64(wim.px, wim.w, wim.h, 1, "vfs:wallpaper") == 0);
                 img64_free64(&wim);
             }

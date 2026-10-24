@@ -12,9 +12,8 @@
   ① 卷里 `/Avatars/` 正好等于 `build64/presets/avatar-*.png`：文件数、字节、尺寸一致；
   ② 卷里 `/Wallpapers/` 正好等于 `build64/presets/wall-*.png` + `res/wallpapers/*`：
      文件数一致、没有多余项；未超限的图**逐字节一致**；
-  ③ 任何进卷的图，最长边必须 **<= 2048**（内核 img64 的解码上限；超限的图在**打包期**按上限等比
-     缩小，构建日志会打 `[wallpaper fit] …`）。修前 `res/wallpapers/1.jpeg` = 2649x1600，
-     被内核如实拒绝（`[SET64] wall path=… ok=0 reason=jpeg too large (>2048)`）；
+  ③ 任何进卷的图，最长边必须 **<= 16384**（内核边长硬上限）。v0.5.17 起内核在**解码期抽样**，
+     所以打包期**不再缩图**（`res/wallpapers/1.jpeg` 2649x1600 原样进卷，运行时抽到 2048）；
   ④ 非图片文件（如 res/wallpapers/README.md）**不得**进卷。
 
 用法：py -3 tests/presets_audit64_test.py
@@ -34,7 +33,8 @@ USERWALL = os.path.join(ROOT, "res", "wallpapers")
 VOL = os.path.join(ROOT, "build64", "sysdisk.img")
 MAIN_LBA = 8009
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
-MAX_PX = 2048           # 与 kernel/img64.cpp 的解码上限一致
+MAX_PX = 16384          # ★ v0.5.17：内核改解码期抽样后，卷里可以放原始分辨率的图
+                        #   （打包期不再缩图；16384 是内核的边长硬上限）
 
 ok = True
 
@@ -137,6 +137,9 @@ def main():
     same = [n for n in want_wp if n in got_wp and n in walls_builtin and got_wp[n] == walls_builtin[n]]
     check("内置壁纸逐字节一致（%d 张）" % len(walls_builtin), len(same) == len(walls_builtin),
           "一致 %d/%d" % (len(same), len(walls_builtin)))
+    same_u = [n for n in walls_user if n in got_wp and got_wp[n] == walls_user[n]]
+    check("用户壁纸也逐字节一致（v0.5.17 起打包期不再缩图；%d 张）" % len(walls_user),
+          len(same_u) == len(walls_user), "一致 %d/%d" % (len(same_u), len(walls_user)))
 
     # ③ 尺寸上限 + 来源记录
     over = []

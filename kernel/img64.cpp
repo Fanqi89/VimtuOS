@@ -10,6 +10,7 @@
 //       报告里如实标注；解码入口已按格式分派，后续补一个 JPEG 分支即可。
 #include "img64.h"
 #include "vfs64.h"
+#include "panic64.h"      // ★ v0.5.17：大图解码期间喂看门狗（长操作不等于死锁）
 #include "mem_64.h"
 #include "debug64.h"
 
@@ -121,11 +122,54 @@ static int inflate_fixed_tables() {
     return 0;
 }
 
-// 解压（raw deflate；out_len = 期望输出字节数）
-static int inflate_raw64(const uint8_t* in, int in_len, uint8_t* out, int out_len) {
+// ==================== ★ v0.5.17：inflate 输出汇（流式）====================
+// 目标：解码"任意分辨率"的 PNG 时，内存只跟**一行**和**目标尺寸**有关，不跟原图面积有关。
+//   * 直接模式（row_bytes == 0）：老行为，顺序写 out（最多 cap 字节）；
+//   * 行模式（row_bytes > 0）：把输出切成 row_bytes 长的行，每凑满一行回调 on_row。
+// deflate 的回溯距离上限是 32 KiB，所以历史只留一个 32 KiB 环形窗 —— 与图像面积无关。
+struct InflateSink64 {
+    uint8_t* out;
+    int      cap;
+    int      have;          // 已产生的输出字节数（两种模式都计）
+    int      row_bytes;     // 0 = 直接模式
+    void   (*on_row)(void* ctx, const uint8_t* row, int y);
+    void*    ctx;
+    int      y;
+    uint8_t* rowbuf;
+    int      rowfill;
+};
+static uint8_t g_infl_win[32768];
+static int     g_infl_wpos = 0;
+static int     g_infl_whave = 0;
+
+static inline void infl_push64(InflateSink64* s, uint8_t v) {
+    g_infl_win[g_infl_wpos] = v;
+    g_infl_wpos = (g_infl_wpos + 1) & 32767;
+    g_infl_whave++;
+    if (s->row_bytes) {
+        s->rowbuf[s->rowfill++] = v;
+        if (s->rowfill == s->row_bytes) {
+            s->rowfill = 0;
+            if (s->on_row) s->on_row(s->ctx, s->rowbuf, s->y);
+            s->y++;
+        }
+    } else if (s->have < s->cap) {
+        s->out[s->have] = v;
+    }
+    s->have++;
+}
+static inline uint8_t infl_back64(int dist) {
+    return g_infl_win[(g_infl_wpos - dist) & 32767];
+}
+
+// 解压（raw deflate）。expected_out = 期望输出字节数（决定何时停止写入；行模式下不受限）。
+static int inflate_core64(const uint8_t* in, int in_len, InflateSink64* s, int expected_out) {
+    const int out_len = expected_out;
+    const int have0 = s->have;
     BitRd64 b{in, in_len, 0, 0, 0, 0};
-    int have = 0;
+    int have = 0;                       // 相对本次调用已产出的字节数（与 g_infl_whave 同步增长）
     int last = 0;
+    (void)have0;
     while (!last) {
         last = br_bits(&b, 1);
         const int type = br_bits(&b, 2);
@@ -139,8 +183,9 @@ static int inflate_raw64(const uint8_t* in, int in_len, uint8_t* out, int out_le
             if (((len ^ 0xFFFF) & 0xFFFF) != nlen) return 3;
             if (b.pos + len > b.len) return 4;
             for (int i = 0; i < len; i++) {
-                if (have >= out_len) break;
-                out[have++] = b.p[b.pos + i];
+                if (!s->row_bytes && have >= out_len) break;
+                infl_push64(s, b.p[b.pos + i]);
+                have++;
             }
             b.pos += len;
         } else if (type == 1 || type == 2) {
@@ -181,12 +226,13 @@ static int inflate_raw64(const uint8_t* in, int in_len, uint8_t* out, int out_le
                 if (huff_build(&g_len_h, lens, hlit) != 0) return 12;
                 if (huff_build(&g_dist_h, lens + hlit, hdist) != 0) return 13;
             }
-            // 解符号
             for (;;) {
                 const int sym = huff_decode(&b, &g_len_h);
                 if (sym < 0) return 14;
                 if (sym < 256) {
-                    if (have < out_len) out[have++] = (uint8_t)sym;
+                    if (!s->row_bytes && have >= out_len) continue;    // 老语义：超出就丢弃但仍解析
+                    infl_push64(s, (uint8_t)sym);
+                    have++;
                 } else if (sym == 256) {
                     break;
                 } else {
@@ -196,10 +242,10 @@ static int inflate_raw64(const uint8_t* in, int in_len, uint8_t* out, int out_le
                     const int ds = huff_decode(&b, &g_dist_h);
                     if (ds < 0 || ds >= 30) return 16;
                     const int d = kDistBase[ds] + br_bits(&b, kDistExtra[ds]);
-                    if (d > have) return 17;
+                    if (d > g_infl_whave) return 17;
                     for (int i = 0; i < l; i++) {
-                        if (have >= out_len) break;
-                        out[have] = out[have - d];
+                        if (!s->row_bytes && have >= out_len) break;
+                        infl_push64(s, infl_back64(d));
                         have++;
                     }
                     if (b.err) return 18;
@@ -210,6 +256,19 @@ static int inflate_raw64(const uint8_t* in, int in_len, uint8_t* out, int out_le
         }
     }
     return 0;
+}
+
+// 老接口：一次性写进 out（PNG 的小图路径、其它调用方都还用它）
+static int inflate_raw64(const uint8_t* in, int in_len, uint8_t* out, int out_len) {
+    InflateSink64 s{};
+    s.out = out;
+    s.cap = out_len;
+    s.have = 0;
+    s.row_bytes = 0;
+    g_infl_wpos = 0;
+    g_infl_whave = 0;
+    const int rc = inflate_core64(in, in_len, &s, out_len);
+    return rc;
 }
 
 // ==================== PNG ====================
@@ -383,6 +442,218 @@ static int decode_png64(const uint8_t* data, int len, Img64* out) {
     return 0;
 }
 
+// ==================== ★ v0.5.17：PNG 流式 + 抽样解码（任意分辨率）====================
+// decode_png64 的写法是"先 kmalloc(w*h*channels) 装整幅 inflate 结果，再逐行反滤波"：
+//   8000x6000 的 RGB PNG 光 raw 就 144 MB（512 MB 的虚拟机直接 OOM）。
+// 这里改成：inflate 输出按**行**回调，只保留 2 行（上一行 / 当前行）做 PNG 反滤波，
+// 然后每隔 decim 行、每隔 decim 列取一个样点写进目标缓冲 —— 内存只跟"一行 + 目标尺寸"有关。
+#define IMG64_MAX_SIDE   16384                       // 边长硬上限（防整数溢出/病态文件）
+#define IMG64_MAX_PIXELS (32u * 1000u * 1000u)       // 32 MP 上限（源像素数；超出如实报错）
+
+struct PngRow64 {
+    int w, h, channels, bd, ct, stride, bpp, decim, tw;
+    const uint8_t* plte;
+    int plte_n;
+    const uint8_t* trns;
+    int trns_n;
+    uint32_t* px;
+    uint8_t*  prev;
+    uint8_t*  cur;
+    uint32_t* rowpx;
+    int bad;
+};
+
+static void png_row_sink64(void* cv, const uint8_t* row, int y) {
+    PngRow64* c = (PngRow64*)cv;
+    if (c->bad) return;
+    if ((y & 63) == 0) panic64_watchdog_kick64();     // ★ 24 MP PNG 解码要十几秒：喂狗（在推进，不是死锁）
+    const int ft = row[0];
+    const uint8_t* src = row + 1;
+    uint8_t* cur = c->cur;
+    const uint8_t* prev = c->prev;
+    const int stride = c->stride, bpp = c->bpp;
+    if (ft == 0) {
+        for (int i = 0; i < stride; i++) cur[i] = src[i];
+    } else if (ft == 1) {
+        for (int i = 0; i < stride; i++) cur[i] = (uint8_t)(src[i] + (i >= bpp ? cur[i - bpp] : 0));
+    } else if (ft == 2) {
+        for (int i = 0; i < stride; i++) cur[i] = (uint8_t)(src[i] + prev[i]);
+    } else if (ft == 3) {
+        for (int i = 0; i < stride; i++) {
+            const int left = (i >= bpp) ? cur[i - bpp] : 0;
+            cur[i] = (uint8_t)(src[i] + ((left + prev[i]) >> 1));
+        }
+    } else if (ft == 4) {
+        for (int i = 0; i < stride; i++) {
+            const int a = (i >= bpp) ? cur[i - bpp] : 0;
+            const int b2 = prev[i];
+            const int cc = (i >= bpp) ? prev[i - bpp] : 0;
+            const int p = a + b2 - cc;
+            const int pa = p > a ? p - a : a - p;
+            const int pb = p > b2 ? p - b2 : b2 - p;
+            const int pc = p > cc ? p - cc : cc - p;
+            int pr;
+            if (pa <= pb && pa <= pc) pr = a;
+            else if (pb <= pc) pr = b2;
+            else pr = cc;
+            cur[i] = (uint8_t)(src[i] + pr);
+        }
+    } else {
+        c->bad = 1;
+        return;
+    }
+    if ((y % c->decim) == 0) {
+        png_expand_row(cur, c->w, c->channels, c->bd, c->plte, c->trns, c->trns_n, c->rowpx);
+        const int ty = y / c->decim;
+        if (ty < c->h) {
+            uint32_t* d = c->px + (uint64_t)ty * (uint64_t)c->tw;
+            for (int x = 0; x < c->tw; x++) {
+                int sx = x * c->decim;
+                if (sx >= c->w) sx = c->w - 1;
+                d[x] = c->rowpx[sx];
+            }
+        }
+    }
+    // 本行成为"上一行"（交换缓冲，省一次整行拷贝）
+    uint8_t* t = c->prev;
+    c->prev = c->cur;
+    c->cur = t;
+    (void)src;
+}
+
+// max_side > 0 时按它等比缩小（只用解码期抽样，不整幅解码）
+static int decode_png_fit64(const uint8_t* data, int len, int max_side, Img64* out) {
+    if (len < 8 || data[0] != 0x89 || data[1] != 'P' || data[2] != 'N' || data[3] != 'G') return -3;
+    int w = 0, h = 0, bd = 0, ct = 0, interlace = 0;
+    const uint8_t* plte = nullptr;
+    int plte_n = 0;
+    const uint8_t* trns = nullptr;
+    int trns_n = 0;
+    uint8_t* idat = nullptr;
+    int idat_len = 0;
+    int pos = 8;
+    bool saw_ihdr = false;
+    while (pos + 8 <= len) {
+        const int clen = (int)be32(data + pos);
+        const uint8_t* type = data + pos + 4;
+        const uint8_t* cdata = data + pos + 8;
+        if (clen < 0 || pos + 12 + clen > len) break;
+        if (type[0] == 'I' && type[1] == 'H' && type[2] == 'D' && type[3] == 'R') {
+            if (clen < 13) return -3;
+            w = (int)be32(cdata);
+            h = (int)be32(cdata + 4);
+            bd = cdata[8];
+            ct = cdata[9];
+            interlace = cdata[12];
+            saw_ihdr = true;
+        } else if (type[0] == 'P' && type[1] == 'L' && type[2] == 'T' && type[3] == 'E') {
+            plte = cdata;
+            plte_n = clen / 3;
+        } else if (type[0] == 't' && type[1] == 'R' && type[2] == 'N' && type[3] == 'S') {
+            trns = cdata;
+            trns_n = clen;
+        } else if (type[0] == 'I' && type[1] == 'D' && type[2] == 'A' && type[3] == 'T') {
+            if (idat_len == 0) idat = (uint8_t*)kmalloc_64((uint64_t)clen);
+            else                idat = (uint8_t*)krealloc_64(idat, (uint64_t)(idat_len + clen));
+            if (!idat) { g_err = "oom idat"; return -4; }
+            for (int i = 0; i < clen; i++) idat[idat_len + i] = cdata[i];
+            idat_len += clen;
+        } else if (type[0] == 'I' && type[1] == 'E' && type[2] == 'N' && type[3] == 'D') {
+            break;
+        }
+        pos += 12 + clen;
+    }
+    if (!saw_ihdr || w <= 0 || h <= 0 || w > IMG64_MAX_SIDE || h > IMG64_MAX_SIDE) {
+        if (idat) kfree_64(idat);
+        g_err = "bad ihdr (side limit)";
+        return -3;
+    }
+    if ((uint32_t)w * (uint32_t)h > IMG64_MAX_PIXELS) {
+        if (idat) kfree_64(idat);
+        g_err = "image too large (>32MP)";
+        return -2;
+    }
+    if (interlace) { if (idat) kfree_64(idat); g_err = "interlace unsupported"; return -2; }
+    if (!idat) { g_err = "no idat"; return -3; }
+    int channels;
+    switch (ct) {
+        case 0: channels = 1; break;
+        case 2: channels = 3; break;
+        case 3: channels = 1; break;
+        case 4: channels = 2; break;
+        case 6: channels = 4; break;
+        default: kfree_64(idat); g_err = "bad colortype"; return -3;
+    }
+    if (ct == 3 && bd == 16) { kfree_64(idat); g_err = "bad palette depth"; return -3; }
+    if (ct != 3 && bd != 8 && bd != 16) { kfree_64(idat); g_err = "bad bitdepth"; return -3; }
+    const int bpp = (channels * bd + 7) / 8 ? (channels * bd + 7) / 8 : 1;
+    if (bpp > 8) { kfree_64(idat); g_err = "bpp"; return -3; }
+    const int stride = (w * channels * bd + 7) / 8;
+    // 采样因子：只在解码期抽（1/2、1/4、…），不是"先解完再缩"
+    int decim = 1;
+    if (max_side > 0) {
+        const int m = (w > h) ? w : h;
+        while (m / decim > max_side && decim < 64) decim *= 2;
+    }
+    const int tw = (w + decim - 1) / decim;
+    const int th = (h + decim - 1) / decim;
+    uint32_t* px = (uint32_t*)kmalloc_64((uint64_t)tw * (uint64_t)th * 4);
+    if (!px) { kfree_64(idat); g_err = "oom px"; return -4; }
+    PngRow64 c{};
+    c.w = w; c.h = th; c.channels = channels; c.bd = bd; c.ct = ct;
+    c.stride = stride; c.bpp = bpp; c.decim = decim; c.tw = tw;
+    c.plte = plte; c.plte_n = plte_n; c.trns = trns; c.trns_n = trns_n;
+    c.px = px;
+    c.prev = (uint8_t*)kmalloc_64((uint64_t)stride + 8);
+    c.cur = (uint8_t*)kmalloc_64((uint64_t)stride + 8);
+    c.rowpx = (uint32_t*)kmalloc_64((uint64_t)w * 4);
+    uint8_t* rowbuf = (uint8_t*)kmalloc_64((uint64_t)stride + 8);
+    if (!c.prev || !c.cur || !c.rowpx || !rowbuf) {
+        if (c.prev) kfree_64(c.prev);
+        if (c.cur) kfree_64(c.cur);
+        if (c.rowpx) kfree_64(c.rowpx);
+        if (rowbuf) kfree_64(rowbuf);
+        kfree_64(px);
+        kfree_64(idat);
+        g_err = "oom rows";
+        return -4;
+    }
+    for (int i = 0; i < stride + 8; i++) { c.prev[i] = 0; c.cur[i] = 0; }
+    InflateSink64 sink{};
+    sink.row_bytes = stride + 1;                  // PNG 每行 = 1 字节滤波类型 + stride
+    sink.on_row = png_row_sink64;
+    sink.ctx = &c;
+    sink.rowbuf = rowbuf;
+    sink.rowfill = 0;
+    sink.y = 0;
+    int zoff = 0;
+    if (idat_len > 2 && (idat[0] & 0x0F) == 8 && ((((int)idat[0] << 8) | idat[1]) % 31) == 0) zoff = 2;
+    const int expect = (stride + 1) * h;
+    const int rc = inflate_core64(idat + zoff, idat_len - zoff, &sink, expect);
+    kfree_64(idat);
+    kfree_64(rowbuf);
+    kfree_64(c.cur);
+    kfree_64(c.prev);
+    kfree_64(c.rowpx);
+    if (rc != 0) { kfree_64(px); g_err = "inflate failed"; g_inflate_rc = rc; return -3; }
+    if (c.bad) { kfree_64(px); g_err = "bad filter"; return -3; }
+    out->px = px;
+    out->w = tw;
+    out->h = th;
+    out->owned = 1;
+    g_fmt = "png";
+    if (decim > 1) {
+        dbg64_line_begin64();
+        dbg64_str("[IMG64] fit png src=");
+        dbg64_dec((uint64_t)w); dbg64_str("x"); dbg64_dec((uint64_t)h);
+        dbg64_str(" decim="); dbg64_dec((uint64_t)decim);
+        dbg64_str(" -> "); dbg64_dec((uint64_t)tw); dbg64_str("x"); dbg64_dec((uint64_t)th);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    return 0;
+}
+
 // ==================== BMP（BI_RGB 未压缩）====================
 static int decode_bmp64(const uint8_t* d, int len, Img64* out) {
     if (len < 54) return -3;
@@ -498,6 +769,7 @@ struct Jpg64Comp {
 
 struct Jpg64Ctx {
     int w, h, ncomp, maxh, maxv, ri, orient;
+    int decim;                   // ★ v0.5.17：解码期降采样因子（1/2/4/8；1 = 全尺寸）
     int mcu_cols, mcu_rows, rst_count;
     Jpg64Comp comp[JPG64_MAXCOMPS];
     uint16_t qt[4][64];
@@ -621,6 +893,33 @@ static void jpg64_idct64(const int* coef, uint8_t* out, int stride) {
             int v = (int)((s + (1 << 17)) >> 18) + 128;
             if (v < 0) v = 0; else if (v > 255) v = 255;
             out[y * stride + x] = (uint8_t)v;
+        }
+    }
+}
+
+// ★ v0.5.17：把 8x8 块按 decim 求平均后写进（缩小后的）分量平面。
+//   decim=1 等价于原来的整块写入；2/4/8 分别得到 4x4 / 2x2 / 1x1 个样点（等于只保留低频）。
+//   这样做的好处：内存按**缩小后**的平面分配 —— 8000x6000 的 JPEG 也只要几百 KB 平面，
+//   而不是 48 MB（px）+ 144 MB（planes）。
+static void jpg64_idct_put_dec64(const int* coef, uint8_t* plane, int stride, int decim,
+                                 int bx, int by) {
+    if (decim <= 1) {
+        jpg64_idct64(coef, plane + (uint64_t)(by * 8) * stride + (uint64_t)(bx * 8), stride);
+        return;
+    }
+    uint8_t blk[64];
+    jpg64_idct64(coef, blk, 8);
+    const int d = decim;
+    const int nout = 8 / d;
+    for (int yy = 0; yy < nout; yy++) {
+        for (int xx = 0; xx < nout; xx++) {
+            int sum = 0;
+            for (int j = 0; j < d; j++) {
+                const int row = (yy * d + j) * 8 + xx * d;
+                for (int i = 0; i < d; i++) sum += blk[row + i];
+            }
+            plane[(uint64_t)(by * nout + yy) * stride + (uint64_t)(bx * nout + xx)] =
+                (uint8_t)(sum / (d * d));
         }
     }
 }
@@ -760,8 +1059,11 @@ static int jpg64_scan64(Jpg64Ctx* c, const uint8_t* data, int data_len) {
         Jpg64Comp* q = &c->comp[i];
         q->bw = c->mcu_cols * q->h;
         q->bh = c->mcu_rows * q->v;
-        q->pw = q->bw * 8;
-        q->ph = q->bh * 8;
+        const int fullpw = q->bw * 8;
+        const int fullph = q->bh * 8;
+        const int d = (c->decim > 0) ? c->decim : 1;
+        q->pw = (fullpw + d - 1) / d;          // ★ 缩小后的平面宽（resample 直接按它取样本）
+        q->ph = (fullph + d - 1) / d;
         q->pred = 0;
         const uint64_t bytes = (uint64_t)q->pw * (uint64_t)q->ph;
         q->plane = (uint8_t*)kmalloc_64(bytes);
@@ -791,11 +1093,13 @@ static int jpg64_scan64(Jpg64Ctx* c, const uint8_t* data, int data_len) {
                         if (rc != 0) { jpg64_free_planes64(c); return rc; }
                         const int bx = mx * q->h + hh;
                         const int by = my * q->v + v;
-                        jpg64_idct64(coef, q->plane + (uint64_t)by * 8 * q->pw + (uint64_t)bx * 8, q->pw);
+                        jpg64_idct_put_dec64(coef, q->plane, q->pw,
+                                             (c->decim > 0) ? c->decim : 1, bx, by);
                     }
                 }
             }
             mcu++;
+            if ((mcu & 255) == 0) panic64_watchdog_kick64();   // ★ 大 JPEG 解码期间喂狗
         }
     }
     return 0;
@@ -904,10 +1208,11 @@ static int jpg64_parse_sos64(Jpg64Ctx* c, const uint8_t* s, int sn) {
 }
 
 // ---------------- 入口：基线 JPEG ----------------
-static int decode_jpeg64(const uint8_t* d, int len, Img64* out) {
+static int decode_jpeg64(const uint8_t* d, int len, Img64* out, int decim) {
     if (len < 4 || d[0] != 0xFF || d[1] != 0xD8) { g_err = "not jpeg (no SOI)"; return -3; }
     Jpg64Ctx* c = &g_jpg64;
     jpg64_zero64(c, (int)sizeof(Jpg64Ctx));
+    c->decim = (decim > 0) ? decim : 1;          // ★ v0.5.17：解码期降采样
     g_err = "ok";
     g_jpeg_comps = 0;
     g_jpeg_orient = 0;
@@ -995,7 +1300,16 @@ static int decode_jpeg64(const uint8_t* d, int len, Img64* out) {
                 if (nc != 1 && nc != 3) { g_err = "jpeg components not 1/3"; return -2; }
                 if (sn < 6 + nc * 3) { g_err = "bad sof components"; return -3; }
                 if (c->w <= 0 || c->h <= 0) { g_err = "bad jpeg size"; return -3; }
-                if (c->w > JPG64_MAXDIM || c->h > JPG64_MAXDIM) { g_err = "jpeg too large (>2048)"; return -2; }
+                if (c->w > IMG64_MAX_SIDE || c->h > IMG64_MAX_SIDE ||
+                    (uint32_t)c->w * (uint32_t)c->h > IMG64_MAX_PIXELS) {
+                    g_err = "image too large (side>16384 or >32MP)";
+                    return -2;
+                }
+                // 全尺寸解码（decim=1）仍守原来的 2048 上限：那是"整幅进内存"的路径。
+                if (c->decim <= 1 && (c->w > JPG64_MAXDIM || c->h > JPG64_MAXDIM)) {
+                    g_err = "jpeg too large (>2048)";
+                    return -2;
+                }
                 c->ncomp = nc;
                 c->maxh = c->maxv = 1;
                 for (int i = 0; i < nc; i++) {
@@ -1025,14 +1339,17 @@ static int decode_jpeg64(const uint8_t* d, int len, Img64* out) {
                             : (c->maxh == 1 && c->maxv == 1) ? "444"
                             : (c->maxh == 2 && c->maxv == 1) ? "422"
                             : (c->maxh == 2 && c->maxv == 2) ? "420" : "other";
-                // ---- 组装像素 ----
-                const uint64_t n = (uint64_t)c->w * (uint64_t)c->h;
+                // ---- 组装像素（★ v0.5.17：尺寸按 decim 缩小）----
+                const int dsc = (c->decim > 0) ? c->decim : 1;
+                const int ws = (c->w + dsc - 1) / dsc;
+                const int hs = (c->h + dsc - 1) / dsc;
+                const uint64_t n = (uint64_t)ws * (uint64_t)hs;
                 uint8_t* planes = (uint8_t*)kmalloc_64(n * (uint64_t)c->ncomp);
                 if (!planes) { g_err = "oom jpeg planes"; jpg64_free_planes64(c); return -4; }
                 uint32_t* px = (uint32_t*)kmalloc_64(n * 4);
                 if (!px) { kfree_64(planes); g_err = "oom jpeg px"; jpg64_free_planes64(c); return -4; }
                 for (int i = 0; i < c->ncomp; i++) {
-                    const int rr = jpg64_resample64(&c->comp[i], c->maxh, c->maxv, c->w, c->h,
+                    const int rr = jpg64_resample64(&c->comp[i], c->maxh, c->maxv, ws, hs,
                                                     planes + n * (uint64_t)i);
                     if (rr != 0) {
                         kfree_64(planes);
@@ -1048,9 +1365,18 @@ static int decode_jpeg64(const uint8_t* d, int len, Img64* out) {
                 kfree_64(planes);
                 jpg64_free_planes64(c);
                 out->px = px;
-                out->w = c->w;
-                out->h = c->h;
+                out->w = ws;
+                out->h = hs;
                 out->owned = 1;
+                if (dsc > 1) {
+                    dbg64_line_begin64();
+                    dbg64_str("[IMG64] fit jpeg src=");
+                    dbg64_dec((uint64_t)c->w); dbg64_str("x"); dbg64_dec((uint64_t)c->h);
+                    dbg64_str(" decim="); dbg64_dec((uint64_t)dsc);
+                    dbg64_str(" -> "); dbg64_dec((uint64_t)ws); dbg64_str("x"); dbg64_dec((uint64_t)hs);
+                    dbg64_nl();
+                    dbg64_line_end64();
+                }
                 if (c->orient > 1 && jpg64_apply_orient64(out, c->orient) != 0) {
                     img64_free64(out);
                     return -4;
@@ -1066,6 +1392,30 @@ static int decode_jpeg64(const uint8_t* d, int len, Img64* out) {
     if (!saw_sos) { g_err = saw_sof ? "jpeg has no scan" : "jpeg has no SOF"; return -3; }
     g_err = "jpeg scan not decoded";
     return -3;
+}
+
+// ★ v0.5.17：只扫 SOF 取宽高（给"先算 decim 再解码"用；不解码、不分配）
+static bool jpg64_probe_size64(const uint8_t* d, int len, int* out_w, int* out_h) {
+    if (len < 4 || d[0] != 0xFF || d[1] != 0xD8) return false;
+    int pos = 2;
+    while (pos + 4 <= len) {
+        if (d[pos] != 0xFF) { pos++; continue; }
+        while (pos < len && d[pos] == 0xFF) pos++;
+        if (pos >= len) break;
+        const int m = d[pos++];
+        if (m == 0xD9 || m == 0xDA) break;
+        if (pos + 2 > len) break;
+        const int slen = (d[pos] << 8) | d[pos + 1];
+        if (slen < 2 || pos + slen > len) break;
+        if (m == 0xC0 || m == 0xC1) {                  // SOF0 / SOF1（基线 / 扩展顺序）
+            if (slen < 7) break;
+            *out_h = (d[pos + 3] << 8) | d[pos + 4];
+            *out_w = (d[pos + 5] << 8) | d[pos + 6];
+            return (*out_w > 0 && *out_h > 0);
+        }
+        pos += slen;
+    }
+    return false;
 }
 
 // 像素缓冲 FNV-1a 32（自检打点用；与 img64_fnv32_64 同算法，那份定义在文件后半，别互相依赖顺序）
@@ -1214,6 +1564,178 @@ static int jpg64_selftest_volume64() {
 }
 
 // ==================== 入口 ====================
+// ==================== ★ v0.5.17：BMP 抽样解码（任意分辨率；BMP 未压缩，按行/列抽）====================
+static int decode_bmp_fit64(const uint8_t* d, int len, int max_side, Img64* out) {
+    if (len < 54) return -3;
+    const uint32_t off = (uint32_t)d[10] | ((uint32_t)d[11] << 8) | ((uint32_t)d[12] << 16) | ((uint32_t)d[13] << 24);
+    const uint32_t hdr = (uint32_t)d[14] | ((uint32_t)d[15] << 8) | ((uint32_t)d[16] << 16) | ((uint32_t)d[17] << 24);
+    if (hdr < 40) return -2;
+    const int32_t w = (int32_t)((uint32_t)d[18] | ((uint32_t)d[19] << 8) | ((uint32_t)d[20] << 16) | ((uint32_t)d[21] << 24));
+    const int32_t hraw = (int32_t)((uint32_t)d[22] | ((uint32_t)d[23] << 8) | ((uint32_t)d[24] << 16) | ((uint32_t)d[25] << 24));
+    const int bpp = d[28] | (d[29] << 8);
+    const uint32_t comp = (uint32_t)d[30] | ((uint32_t)d[31] << 8);
+    if (w <= 0 || w > IMG64_MAX_SIDE || hraw == 0 || comp != 0) return -2;
+    const int topdown = hraw < 0;
+    const int h = topdown ? -hraw : hraw;
+    if (h <= 0 || h > IMG64_MAX_SIDE) return -2;
+    if ((uint32_t)w * (uint32_t)h > IMG64_MAX_PIXELS) { g_err = "image too large (>32MP)"; return -2; }
+    if (bpp != 8 && bpp != 24 && bpp != 32) return -2;
+    const uint8_t* pal = d + 14 + hdr;
+    int pal_n = 0;
+    if (bpp == 8) {
+        const uint32_t used = (uint32_t)d[46] | ((uint32_t)d[47] << 8) | ((uint32_t)d[48] << 16) | ((uint32_t)d[49] << 24);
+        pal_n = used ? (int)used : 256;
+        if (len < 14 + (int)hdr + pal_n * 4) return -3;
+    }
+    const int row_bytes = ((w * bpp + 31) / 32) * 4;
+    if ((int)off + row_bytes * h > len) return -3;
+    int decim = 1;
+    if (max_side > 0) {
+        const int m = (w > h) ? w : h;
+        while (m / decim > max_side && decim < 64) decim *= 2;
+    }
+    const int tw = (w + decim - 1) / decim;
+    const int th = (h + decim - 1) / decim;
+    uint32_t* px = (uint32_t*)kmalloc_64((uint64_t)tw * (uint64_t)th * 4);
+    if (!px) { g_err = "oom bmp"; return -4; }
+    for (int ty = 0; ty < th; ty++) {
+        int sy = ty * decim;
+        if (sy >= h) sy = h - 1;
+        if (!topdown) sy = h - 1 - sy;
+        if ((ty & 63) == 0) panic64_watchdog_kick64();
+        const uint8_t* row = d + off + (uint64_t)sy * row_bytes;
+        uint32_t* dst = px + (uint64_t)ty * tw;
+        for (int tx = 0; tx < tw; tx++) {
+            int sx = tx * decim;
+            if (sx >= w) sx = w - 1;
+            if (bpp == 24) {
+                dst[tx] = 0xFF000000u | ((uint32_t)row[sx * 3 + 2] << 16) |
+                          ((uint32_t)row[sx * 3 + 1] << 8) | row[sx * 3];
+            } else if (bpp == 32) {
+                dst[tx] = ((uint32_t)row[sx * 4 + 3] << 24) | ((uint32_t)row[sx * 4 + 2] << 16) |
+                          ((uint32_t)row[sx * 4 + 1] << 8) | row[sx * 4];
+                if (((dst[tx] >> 24) & 0xFF) == 0) dst[tx] |= 0xFF000000u;
+            } else {
+                const int idx = row[sx];
+                if (idx >= pal_n) { dst[tx] = 0xFF000000u; continue; }
+                const uint8_t* p = pal + idx * 4;
+                dst[tx] = 0xFF000000u | ((uint32_t)p[2] << 16) | ((uint32_t)p[1] << 8) | p[0];
+            }
+        }
+    }
+    out->px = px;
+    out->w = tw;
+    out->h = th;
+    out->owned = 1;
+    g_fmt = "bmp";
+    return 0;
+}
+
+// ==================== ★ v0.5.17：任意分辨率解码入口 ====================
+// max_side > 0：结果的最长边 <= max_side（用**解码期抽样**，内存只跟目标尺寸有关）。
+// max_side == 0：等价于 img64_decode64（全尺寸，仍守各格式原有上限）。
+int img64_decode_fit64(const void* data, int len, int max_side, Img64* out) {
+    if (!data || !out || len < 16) { g_err = "args"; return -1; }
+    out->px = nullptr; out->w = out->h = 0; out->owned = 0;
+    const uint8_t* d = (const uint8_t*)data;
+    if (d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G')
+        return decode_png_fit64(d, len, max_side, out);
+    if (d[0] == 'B' && d[1] == 'M')
+        return decode_bmp_fit64(d, len, max_side, out);
+    if (d[0] == 0xFF && d[1] == 0xD8) {
+        int w = 0, h = 0;
+        int decim = 1;
+        if (max_side > 0 && jpg64_probe_size64(d, len, &w, &h)) {
+            const int m = (w > h) ? w : h;
+            // ★ 只能到 1/8：JPEG 的一个 DCT 块就是 8x8，再大的因子会让 8/d == 0（平面写不进东西 ->
+            //   整幅黑图）。这也是 libjpeg 的上限；更小用一次 img64_scale64 收尾。
+            while (m / decim > max_side && decim < 8) decim *= 2;
+        }
+        const int rc = decode_jpeg64(d, len, out, decim);
+        if (rc != 0) return rc;
+        if (max_side > 0 && (out->w > max_side || out->h > max_side)) {
+            const int mx = (out->w > out->h) ? out->w : out->h;
+            const int tw = (int)((int64_t)out->w * max_side / mx);
+            const int th = (int)((int64_t)out->h * max_side / mx);
+            uint32_t* dst = (uint32_t*)kmalloc_64((uint64_t)tw * (uint64_t)th * 4);
+            if (!dst) { img64_free64(out); g_err = "oom scale"; return -4; }
+            img64_scale64(out, dst, tw, th);
+            img64_free64(out);
+            out->px = dst;
+            out->w = tw;
+            out->h = th;
+            out->owned = 1;
+        }
+        return 0;
+    }
+    g_err = "unknown format";
+    return -2;
+}
+
+// 从系统卷读文件后按 fit 解码。文件大小上限比 img64_load_vfs64（4 MB）放大到 24 MB：
+// "任意分辨率"的图（例如 6000x4000 的 PNG）压缩后就可能十几 MB。
+int img64_load_vfs_fit64(const char* path, int max_side, Img64* out) {
+    if (!path || !path[0]) return -1;
+    uint32_t type = 0, size = 0;
+    if (vfs64_system_slot64() < 0 ||
+        vfs64_stat_on64(vfs64_system_slot64(), path, &type, &size) != 0) {
+        dbg64_line_begin64();
+        dbg64_str("[IMG64] load fit skip path=");
+        dbg64_str(path);
+        dbg64_str(" reason=not-found ok=0");
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+    if (size == 0 || size > 24u * 1024 * 1024) {
+        dbg64_line_begin64();
+        dbg64_str("[IMG64] load fit skip path=");
+        dbg64_str(path);
+        dbg64_str(" reason=size size=");
+        dbg64_dec((uint64_t)size);
+        dbg64_nl();
+        dbg64_line_end64();
+        g_err = "file too large (>24MB)";
+        return -1;
+    }
+    uint8_t* buf = (uint8_t*)kmalloc_64(size);
+    if (!buf) { g_err = "oom file"; return -1; }
+    const int got = vfs64_read_on64(vfs64_system_slot64(), path, buf, (int)size);
+    if (got <= 0) {
+        kfree_64(buf);
+        dbg64_line_begin64();
+        dbg64_str("[IMG64] load fit skip path=");
+        dbg64_str(path);
+        dbg64_str(" reason=read-failed");
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+    const int rc = img64_decode_fit64(buf, got, max_side, out);
+    kfree_64(buf);
+    dbg64_line_begin64();
+    dbg64_str("[IMG64] load fit path=");
+    dbg64_str(path);
+    dbg64_str(" max=");
+    dbg64_dec((uint64_t)(max_side > 0 ? max_side : 0));
+    if (rc == 0) {
+        dbg64_str(" ok=1 bytes=");
+        dbg64_dec((uint64_t)got);
+        dbg64_str(" fmt=");
+        dbg64_str(g_fmt);
+        dbg64_str(" ");
+        dbg64_dec((uint64_t)out->w);
+        dbg64_str("x");
+        dbg64_dec((uint64_t)out->h);
+    } else {
+        dbg64_str(" ok=0 err=");
+        dbg64_str(g_err);
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+    return rc;
+}
+
 int img64_decode64(const void* data, int len, Img64* out) {
     if (!data || !out || len < 16) { g_err = "args"; return -1; }
     out->px = nullptr; out->w = out->h = 0; out->owned = 0;
@@ -1221,7 +1743,7 @@ int img64_decode64(const void* data, int len, Img64* out) {
     int rc;
     if (d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G') rc = decode_png64(d, len, out);
     else if (d[0] == 'B' && d[1] == 'M') rc = decode_bmp64(d, len, out);
-    else if (d[0] == 0xFF && d[1] == 0xD8) rc = decode_jpeg64(d, len, out);
+    else if (d[0] == 0xFF && d[1] == 0xD8) rc = decode_jpeg64(d, len, out, 1);
     else {
         g_err = "unknown format";
         rc = -2;

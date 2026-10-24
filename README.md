@@ -43,9 +43,11 @@
     - `build64/presets/` —— 内置预设：`avatar-01..06.png`（预设头像，构建期由 `tools/make_presets.py` 生成）+ `wall-*.png`（内置示例壁纸）
     - `res/wallpapers/` —— **你自己放的壁纸**（png/jpg/jpeg/bmp；非图片按扩展名忽略）
   - 卷内落点：`/Avatars/`（头像）、`/Wallpapers/`（壁纸，两种来源合并）
-  - 支持 **PNG / JPEG / BMP**（JPEG 走内核 `decode_jpeg64`）；内核解码上限 **2048px**，
-    超限的图在**打包期**按上限等比缩小（构建日志 `[wallpaper fit] 1.jpeg 2649x1600 -> 2048x1237`），
-    运行时再遇到超限图会如实拒绝并提示上限
+  - 支持 **PNG / JPEG / BMP**，且**任意分辨率**（v0.5.17 起）：内核在**解码期抽样** ——
+    PNG 用流式 inflate 逐行降采样（32 KiB 历史窗 + 2 行反滤波）、JPEG 按 DCT 块 d×d 求平均
+    （d≤8，再小用一次缩放收尾）、BMP 逐行/列抽样；**内存只跟目标尺寸有关**，与源分辨率无关
+  - 上限：边长 ≤ 16384、源像素 ≤ 32 MP、单文件 ≤ 24 MB（超出如实拒绝并提示）；
+    打包期**不再缩图**（原图进卷，质量保住）；24 MP 级大图解码在 QEMU TCG 下约十几秒
   - 逐文件核对：`py -3 tests/presets_audit64_test.py`（秒级，不跑 QEMU）
 - 设置里的**改用户名**（v0.5.16 起真落盘）：写 `/etc/users.db` 并同步 `ui.login.last`，
   重启后用户表与锁屏都是新名字；空输入会明确提示（不再静默失败）
@@ -411,7 +413,7 @@ py -3 tests/<模块>_test.py                   # 单跑一条
 │   └── logo.png
 ├── res/   (1 项，见下方折叠清单)
 ├── sdk/   (1 项，见下方折叠清单)
-├── tests/   (119 项，见下方折叠清单)
+├── tests/   (120 项，见下方折叠清单)
 ├── third_party/   (6 项，见下方折叠清单)
 ├── tools/   (49 项，见下方折叠清单)
 ├── user/   (27 项，见下方折叠清单)
@@ -722,6 +724,7 @@ py -3 tests/<模块>_test.py                   # 单跑一条
 ├── persist64_test.py
 ├── pipe64_test.py
 ├── preload_update_test.py
+├── imgfit64_test.py
 ├── presets_audit64_test.py
 ├── presets_user64_test.py
 ├── presets64_test.py

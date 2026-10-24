@@ -3539,6 +3539,7 @@ TESTS = [
                                   "/home/vimtu/pdata（10 条断言）"),
     ("install_flow_test.py", "★ 端到端安装（含 v0.5.11 新增硬判据：目标盘带 VimtuFS2 卷/version=4、主分区前 "
                              "64 KiB 与 sysdisk 逐字节一致、装好启动 mount_system ok 且非 NOT-PERSISTENT）"),
+    ("imgfit64_test.py", "★ v0.5.17 任意分辨率壁纸/头像（解码期抽样）：6000x4000 PNG 当壁纸 -> decim=4 得 1500x1000；5000x3333 JPEG 当头像 -> 256x170、当壁纸 -> 1250x833；重启后仍按缩小尺寸加载，无 OOM / PANIC"),
     ("presets_audit64_test.py", "★ 预设资源「源目录 -> 卷内路径」逐文件核对（秒级、不跑 QEMU）："
                                  "build64/presets/avatar-*.png -> /Avatars、（build64/presets/wall-*.png + "
                                  "res/wallpapers/*）-> /Wallpapers，逐字节一致、无多余项、非图片不进卷、"
