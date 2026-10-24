@@ -340,12 +340,20 @@ def cap_installer_ui():
 
 
 def cap_partition_ops():
-    ok = exists("kernel/part64.cpp") and exists("tests/partition_ops_test.py")
-    ev = ["part64.cpp %d 行；partition_ops_test.py %d 行" % (lines("kernel/part64.cpp"),
-                                                             lines("tests/partition_ops_test.py"))]
+    ok = (exists("kernel/part64.cpp") and exists("tests/partition_ops_test.py")
+          and exists("tests/partmgr64_test.py"))
+    ev = ["part64.cpp %d 行；partition_ops_test.py %d 行；partmgr64_test.py %d 行"
+          % (lines("kernel/part64.cpp"), lines("tests/partition_ops_test.py"),
+             lines("tests/partmgr64_test.py"))]
     for k, label in ((r"part_create|创建", "新建"), (r"part_delete|删除", "删除"),
                      (r"format|格式化", "格式化")):
         ev.append("%s 相关命中 %d 处" % (label, grep_count(k, ["kernel/part64.cpp"])))
+    # ★ v0.5.14：删除/格式化必须按"表"走（MBR 项 vs GPT 项），否则在 GPT 盘上会删错项、
+    #   格式化还会把 LBA1 的主 GPT 头清零（实测记录在 tests/partmgr64_test.py 头部）。
+    ev.append("GPT 原语命中 %d 处（part_gpt_locate64/entry64/delete_entry64/wipe64）"
+              % grep_count(r"part_gpt_(locate|entry|delete_entry|wipe)64", ["kernel/part64.cpp"]))
+    ev.append("统一动作命中 %d 处（part_delete_partition64 / part_format_partition64）"
+              % grep_count(r"part_(delete|format)_partition64", ["kernel/part64.cpp"]))
     return ("DONE" if ok else "MISSING"), ev
 
 
@@ -3388,7 +3396,10 @@ TESTS = [
                        " + UEFI(OVMF) 从该盘启动进桌面 + BIOS 如实测"),
     ("disk_boot_test.py", "★ 引导层改 BIOS INT 13h 读盘：只挂 AHCI 的装好盘直启进桌面 + 截断盘失败路径打点停机"),
     ("install_flow_test.py", "端到端安装 + 装完单独启动（引导层走 BIOS INT 13h）"),
-    ("partition_ops_test.py", "新建/格式化/删除 真实写盘"),
+    ("partition_ops_test.py", "新建/格式化/删除 真实写盘（两步确认；MBR 盘）"),
+    ("partmgr64_test.py", "★ v0.5.14 GPT 盘与双份分区表盘的 删除/格式化：删除必须打在用户选的"
+                          "那张表的那个项上（GPT 项清零+两份头 CRC 重算、LBA1/0xEE 保护项完好、"
+                          "ESP 拒格式化、删后抹首扇区）"),
     ("screen64_probe.py", "安装界面像素验收"),
     ("iso64_install_test.py", "ISO 光盘引导端到端"),
     ("iso64_usb_test.py", "U 盘 hybrid 端到端"),

@@ -76,6 +76,65 @@ bool part_delete_entry(int drive, int index);
 // 格式化：把分区首部若干扇区清零；主分区还会写入一个占位超级块 "VIMTUFS1"
 bool part_format_partition(int drive, const PartInfo& p, int index);
 
+// ==================== v0.5.14：分区表来源 + 统一删除/格式化 ====================
+// 为什么需要这一层（真缺陷，实测记录在 tests/partmgr64_test.py）：
+//   界面上的"分区 N"这一行可能来自 **MBR**，也可能来自 **GPT**（带保护性 0xEE 项的盘
+//   以 GPT 项为准，见 setup64.cpp 的 probe_disk）。v0.5.13 及以前的删除/格式化只按
+//   **MBR 项号** 去写盘，在 GPT 盘上实测：
+//     * 选中 GPT 分区 1（LBA 2048）按"删除" -> 清掉的是 MBR 第 2 项（用户没选它）；
+//     * 按"格式化" -> 按 MBR 保护性 0xEE 项的 start=1/sectors=整盘 去清零 LBA1..64，
+//       **把主 GPT 头和项数组抹了**，而用户选的那个分区一个字节都没动。
+enum PartSrc { PART_SRC_MBR = 0, PART_SRC_GPT = 1 };
+
+// 一次删除/格式化的目标（界面按行填好，内核按它写盘；几何以内核重读的表为准）
+struct PartTarget {
+    int      src;        // PART_SRC_MBR / PART_SRC_GPT
+    int      index;      // 该表内的 0-based 项号
+    uint32_t start;      // 分区起始 LBA（MBR 表才是权威，GPT 会重新读）
+    uint32_t sectors;    // 分区扇区数
+    uint8_t  mbr_type;   // 仅 MBR：类型码（0x07 主分区 / 0xEF 引导 / 0x0C FAT32 …）
+    bool     gpt_esp;    // 仅 GPT：类型 = EFI 系统分区
+    bool     gpt_basic;  // 仅 GPT：类型 = Microsoft Basic Data
+};
+
+// GPT 位置：主头在 LBA1，备份头在盘尾；本系统装好的盘 LBA1 是 loader，只有备份头
+struct GptLoc {
+    bool     valid;
+    bool     primary;      // true = LBA1 主头；false = 盘尾备份头
+    uint32_t hdr_lba;      // 头所在 LBA
+    uint32_t ent_lba;      // 项数组起始 LBA
+    int      ent_count;
+    int      ent_size;
+};
+struct GptEntryInfo {
+    bool     used;
+    bool     is_esp;       // 类型 = EFI 系统分区
+    bool     is_basic;     // 类型 = Microsoft Basic Data
+    uint64_t first;        // 起始 LBA
+    uint64_t last;         // 结束 LBA（含）
+};
+
+// 定位 GPT（主头优先且要过头 CRC 自检；否则退到盘尾备份头）
+bool part_gpt_locate64(int drive, uint32_t disk_sectors, GptLoc* out);
+// 读第 index 项
+bool part_gpt_entry64(int drive, const GptLoc& loc, int index, GptEntryInfo* out);
+// 清掉第 index 项：项数组重写 + 项数组 CRC + 头 CRC 全部重算；主/备两份都清
+bool part_gpt_delete_entry64(int drive, uint32_t disk_sectors, int index);
+// 抹掉盘上所有 GPT 头（新建分区表之前调用，避免"删了分区但盘尾 GPT 还描述着它"）
+bool part_gpt_wipe64(int drive, uint32_t disk_sectors);
+
+// ---- 统一动作（安装界面只调这两个）----
+// 删除：按 src 清对应表的项；**另一张表里描述同一段**的项也一并清掉（我们自己的安装盘
+//       是 MBR 项 + 盘尾 GPT 双份），最后抹掉该分区首扇区（删掉的卷不该再被当卷挂上）。
+bool part_delete_partition64(int drive, uint32_t disk_sectors, const PartTarget& t);
+// 格式化：按 src/类型选文件系统 —— 主数据分区 / GPT basic data -> 真 VimtuFS2；
+//         EFI 系统分区（盘尾 ESP 或 GPT ESP）-> 拒绝（抹了 UEFI 就起不来）；
+//         其余 -> 清首 64 扇区。
+//   返回 0 = OK；-1 = 参数/读盘失败；-2 = 受保护（EFI 系统分区）。
+//   fs_out 回填 "VimtuFS2" / "blank" / "refused-esp"。
+int  part_format_partition64(int drive, uint32_t disk_sectors, const PartTarget& t,
+                             char* fs_out, int fs_cap);
+
 // ---- 安装：把载荷整盘复制到目标盘 ----
 // 分块进行，便于主循环按块推进进度（不是阻塞式一把梭，界面才不会假死）
 struct InstallJob {

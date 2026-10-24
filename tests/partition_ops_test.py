@@ -10,13 +10,16 @@
      这样"格式化只是假装"会被当场拆穿：格式化后那些扇区必须变成全 0。
   2) 启动安装介质 + 目标盘，通过 QEMU monitor 注入按键：
        回车×4（语言→现在安装→许可→安装类型→磁盘页）→ n（新建）
-      → f（格式化 引导分区 P1）→ ↓ → f（格式化 主分区 P2，会写 VimtuFS2 真超级块）
-       → d（删除 P2）→ ↓↓↓ → d（删除 P1）
+      → f,f（格式化 引导分区 P1）→ ↓ → f,f（格式化 主分区 P2，会写 VimtuFS2 真超级块）
+       → ↑ → d,d（删除 P1）
+     注意：v0.5.14 起 删除/格式化 都是**两步确认**（第一次按只武装、第二次才写盘），
+     所以每个动作按两下同一个键 —— 这是动作语义变了，不是放宽断言。
   3) 串口断言每一步的日志（含 drive/index/start/sectors 等具体数值）
   4) 直接解析目标盘字节断言：
        * P1 首 64 扇区被清零（垃圾 0xA5 没了）
        * P2 首扇区 = VimtuFS2 真超级块（magic "VIMTUFS2" + 版本/几何 + CRC32 + 55AA）
-       * 删除后 MBR 里两项的 16 字节全 0，签名仍是 55AA
+       * 删除后 MBR 里第 1 项 16 字节全 0（只删了 P1），第 2 项仍是 0x07/8009，
+         签名仍是 55AA —— "删一个不该动另一个"是一条硬判据
 
 退出码：0 全过 / 1 有断言失败 / 2 环境问题
 """
@@ -143,19 +146,21 @@ def run_wizard(qemu, target, serial_log, port, dwell=1.3):
         # 回车×4：语言 -> 现在安装 -> 许可 -> 安装类型 -> 磁盘与分区
         for _ in range(4):
             mon.key("ret", wait=dwell)
+        def twice(key, label, wait=dwell + 0.7):
+            """两步确认动作：同键按两下（第一下武装，第二下真写盘）。"""
+            print("[partops] %s  %s" % (key, label))
+            mon.key(key, wait=wait)
+            mon.key(key, wait=wait)
+
         print("[partops] n   新建分区（写引导分区 + 主分区）")
         mon.key("n", wait=dwell + 0.7)
-        print("[partops] f   格式化引导分区 P1（应把预填的 0xA5 清成 0）")
-        mon.key("f", wait=dwell + 0.7)
-        print("[partops] down 选中 P2，f 格式化主分区（应写 VimtuFS2 真超级块）")
+        twice("f", "格式化引导分区 P1（应把预填的 0xA5 清成 0）")
+        print("[partops] down 选中 P2")
         mon.key("down", wait=dwell)
-        mon.key("f", wait=dwell + 0.7)
-        print("[partops] d   删除 P2（应清掉 MBR 第 2 项）")
-        mon.key("d", wait=dwell + 0.7)
-        # 删除后向导会把光标停在**同一块盘**的第一个分区上（见 setup64.cpp 的删除分支），
-        # 所以删完 P2 直接按 d 就是在删 P1，不需要再按方向键。
-        print("[partops] d   删除 P1（光标已在 P1 上；应清掉 MBR 第 1 项）")
-        mon.key("d", wait=dwell + 0.7)
+        twice("f", "格式化主分区 P2（应写 VimtuFS2 真超级块）")
+        print("[partops] up   选回 P1")
+        mon.key("up", wait=dwell)
+        twice("d", "删除 P1（两步确认；应清掉 MBR 第 1 项）")
         time.sleep(2)
     finally:
         if proc.poll() is None:
@@ -209,15 +214,21 @@ def main():
 
     print("=== 3) 串口断言 ===")
     check("新建分区表 OK", "[PART] 新建分区表 OK drive=1 boot=9+8000" in log)
-    check("格式化引导分区 P1（index=1 start=9）",
-          "[PART] 格式化 OK drive=1 index=1 start=9" in log)
-    check("格式化主分区 P2（index=2 start=8009）",
-          "[PART] 格式化 OK drive=1 index=2 start=8009" in log)
-    check("删除分区项 index=2（P2）", "[PART] 删除分区 OK drive=1 index=2" in log)
-    check("删除分区项 index=1（P1）", "[PART] 删除分区 OK drive=1 index=1" in log)
-    # 现在注入的按键序列：ret×4 + n + f + down + f + d + d = 10
-    # （删除后光标停回同一块盘的第一个分区，所以删 P1 不需要再按方向键）
-    check("按键全部到达向导", log.count("[SETUP] key=") >= 10,
+    check("格式化引导分区 P1（table=mbr index=1 start=9 fs=blank）",
+          "[PART] 格式化 OK drive=1 table=mbr index=1 start=9 sectors=8000 fs=blank" in log)
+    check("格式化主分区 P2（table=mbr index=2 start=8009 fs=VimtuFS2）",
+          "[PART] 格式化 OK drive=1 table=mbr index=2 start=8009 sectors=24759 fs=VimtuFS2" in log)
+    check("删除分区项 index=1（P1，含首扇区抹除 wiped=1）",
+          "[PART] 删除分区 OK drive=1 table=mbr index=1 start=9 sectors=8000 wiped=1" in log)
+    # 两步确认的"武装"打点：格式化两次、删除一次
+    check("两步确认：格式化武装过 2 次",
+          log.count("[SETUP] 格式化待确认") == 2,
+          "武装行数=%d" % log.count("[SETUP] 格式化待确认"))
+    check("两步确认：删除武装过 1 次",
+          log.count("[SETUP] 删除待确认") == 1,
+          "武装行数=%d" % log.count("[SETUP] 删除待确认"))
+    # 现在注入的按键序列：ret×4 + n + f,f + down + f,f + up + d,d = 13
+    check("按键全部到达向导", log.count("[SETUP] key=") >= 13,
           "key 行数=%d" % log.count("[SETUP] key="))
     print("--- 串口里的 PART 行 ---")
     for l in log.splitlines():
@@ -263,8 +274,10 @@ def main():
     check("MBR 签名仍为 55AA", mbr[510] == 0x55 and mbr[511] == 0xAA)
     e1 = mbr[446:462]
     e2 = mbr[462:478]
-    check("MBR 第 1 项已被删除（16 字节全 0）", e1 == b"\0" * 16, e1.hex())
-    check("MBR 第 2 项已被删除（16 字节全 0）", e2 == b"\0" * 16, e2.hex())
+    check("MBR 第 1 项（引导分区）已被删除（16 字节全 0）", e1 == b"\0" * 16, e1.hex())
+    check("MBR 第 2 项（主分区）保留：type=0x07 start=8009（删一个不动另一个）",
+          e2[4] == 0x07 and struct.unpack_from("<I", e2, 8)[0] == PART_MAIN_LBA,
+          "type=0x%02X start=%d" % (e2[4], struct.unpack_from("<I", e2, 8)[0]))
 
     print("=== RESULT: %s ===" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1

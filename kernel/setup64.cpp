@@ -31,6 +31,7 @@ static const uint32_t C_BTN     = 0xFF0078D7;   // 主按钮
 static const uint32_t C_BTN_HI  = 0xFF1E90FF;   // 主按钮悬停
 static const uint32_t C_BTN_DIS = 0xFF4A6B8A;   // 主按钮禁用
 static const uint32_t C_WHITE   = 0xFFFFFFFF;
+static const uint32_t C_WARN    = 0xFFFFD166;   // ★ v0.5.14：确认提示/操作结果（琥珀色）
 
 // ==================== 小工具 ====================
 static inline int imin(int a, int b) { return a < b ? a : b; }
@@ -108,6 +109,11 @@ struct PartEntry {
     uint32_t sectors;       // 扇区数
     char     label[40];     // 显示名（EFI 系统分区 / Microsoft 保留 / 基本数据分区 …）
     bool     is_gpt;
+    // ★ v0.5.14：删除/格式化必须知道"这一行来自哪张表、是什么类型" ——
+    //   否则在 GPT 盘上会按 MBR 项号去写盘（实测会把 LBA1 的主 GPT 头清零）。
+    int      src;           // PART_SRC_MBR / PART_SRC_GPT
+    bool     is_esp;        // EFI 系统分区（GPT 类型 GUID，或盘尾那个 0xEF 项）
+    bool     is_basic;      // 主数据分区（GPT Microsoft Basic Data / MBR 0x07）
 };
 
 struct DiskEntry {
@@ -179,6 +185,37 @@ static void str_append_size(char*& d, uint64_t sectors, int max) {
     }
 }
 
+// ==================== v0.5.14：两步确认 + 底部状态行 ====================
+// 一次鼠标误点就把分区抹掉是不能接受的（Win10 安装程序也会弹确认框）。这里的做法
+// 与"同一个键按两下"等价：第一次按/点 -> 武装（按钮变成"确认删除"/"确认格式化"，
+// 底部给出目标分区号）；再按一次同一个键 / 再点同一个按钮 -> 才真写盘。
+// Esc、换选中行、换页、按刷新都会取消武装。
+static int  g_pending_act = 0;      // 0 = 没有待确认动作；12 = 删除；13 = 格式化
+static int  g_pending_row = -1;     // 武装时选中的行
+static char g_status[96];           // 底部状态行：上一步的结果或失败原因
+
+static void status_clear() { g_status[0] = 0; }
+static void status_set(const char* a) {
+    char* d = g_status;
+    *d = 0;
+    str_append(d, a, 84);
+}
+static void status_set_op(const char* verb, int part_no, const char* tail) {
+    char* d = g_status;
+    *d = 0;
+    str_append(d, verb, 40);
+    str_append_u64(d, (uint64_t)part_no, 4);
+    str_append(d, tail, 40);
+}
+static void confirm_cancel(const char* why) {
+    if (g_pending_act == 0) return;
+    g_pending_act = 0;
+    g_pending_row = -1;
+    dbg64_str("[SETUP] 确认已取消 reason=");
+    dbg64_str(why);
+    dbg64_nl();
+}
+
 // 把 GPT 类型 GUID 归类成可读名字
 static void gpt_type_name(const uint8_t* guid, char* out, int cap) {
     // ESP: C12A7328-F81F-11D2-BA4B-00A0C93EC93B
@@ -194,6 +231,19 @@ static void gpt_type_name(const uint8_t* guid, char* out, int cap) {
     if (is_esp)      str_append(d, "EFI 系统分区", cap);
     else if (is_msr) str_append(d, "Microsoft 保留分区", cap);
     else             str_append(d, "基本数据分区", cap);
+}
+
+// v0.5.14：GPT 项的类型标志（删除/格式化按类型选动作，不能只看"是不是 0x07"）
+static void gpt_type_flags(const uint8_t* guid, bool* is_esp, bool* is_basic) {
+    static const uint8_t esp[16]   = {0x28,0x73,0x2A,0xC1,0x1F,0xF8,0xD2,0x11,0xBA,0x4B,0x00,0xA0,0xC9,0x3E,0xC9,0x3B};
+    static const uint8_t basic[16] = {0xA2,0xA0,0xD0,0xEB,0xE5,0xB9,0x33,0x44,0x87,0xC0,0x68,0xB6,0xB7,0x26,0x99,0xC7};
+    bool e2 = true, b2 = true;
+    for (int i = 0; i < 16; i++) {
+        if (guid[i] != esp[i]) e2 = false;
+        if (guid[i] != basic[i]) b2 = false;
+    }
+    if (is_esp) *is_esp = e2;
+    if (is_basic) *is_basic = b2;
 }
 
 // 读取一块磁盘的分区表（MBR，或保护性 MBR 指向的 GPT）
@@ -251,6 +301,10 @@ static void probe_disk(int idx) {
                 str_append(dp, hex, 3);
                 str_append(dp, ")", 2);
             }
+            p.src = PART_SRC_MBR;
+            // 盘尾那个 0xEF 是安装器建的 ESP（真 FAT32，UEFI 靠它引导）
+            p.is_esp = (type == 0xEF && p.start > PART_BOOT_LBA + PART_BOOT_SECS - 1);
+            p.is_basic = (type == 0x07);
         }
         dk.has_mbr = true;
     }
@@ -282,6 +336,8 @@ static void probe_disk(int idx) {
             p.start = (uint32_t)first;
             p.sectors = (last >= first) ? (uint32_t)(last - first + 1) : 0;
             gpt_type_name(e, p.label, 36);
+            gpt_type_flags(e, &p.is_esp, &p.is_basic);
+            p.src = PART_SRC_GPT;
         }
     }
 }
@@ -371,6 +427,7 @@ static void build_rows() {
             str_append_u64(q, (uint64_t)(i + 1), 4);
             str_append(q, ": ", 4);
             str_append(q, g_disks[d].parts[i].label, 40);
+            if (g_disks[d].parts[i].src == PART_SRC_GPT) str_append(q, " [GPT]", 8);
             str_append(q, "   ", 4);
             str_append_size(q, g_disks[d].parts[i].sectors, 20);
             used += g_disks[d].parts[i].sectors;
@@ -508,19 +565,36 @@ static void draw_disk_page() {
     }
 
     // 按钮行（对齐 Win10：刷新 / 新建 / 删除 / 格式化）
+    // ★ v0.5.14：删除/格式化走**两步确认**（见 g_pending_act 的说明）。
     const int by = list_y + list_h + 24;
+    const bool row_ok  = (g_row_sel >= 0 && g_row_sel < g_row_count);
+    const bool part_selected = (row_ok && g_rows[g_row_sel].selectable);
+    const bool arm_del = (g_pending_act == 12 && g_pending_row == g_row_sel);
+    const bool arm_fmt = (g_pending_act == 13 && g_pending_row == g_row_sel);
     push_button(80,  by, 140, 48, "刷新",   10, false, true);
-    push_button(240, by, 140, 48, "新建",   11, false, g_row_sel >= 0);
-    push_button(400, by, 140, 48, "删除",   12, false, g_row_sel >= 0 && g_rows[g_row_sel].selectable);
-    push_button(560, by, 160, 48, "格式化", 13, false, g_row_sel >= 0 && g_rows[g_row_sel].selectable);
+    push_button(240, by, 140, 48, "新建",   11, false, row_ok);
+    push_button(400, by, 160, 48, arm_del ? "确认删除"   : "删除",
+                12, arm_del, part_selected);
+    push_button(580, by, 180, 48, arm_fmt ? "确认格式化" : "格式化",
+                13, arm_fmt, part_selected);
 
-    const bool part_selected = (g_row_sel >= 0 && g_row_sel < g_row_count && g_rows[g_row_sel].selectable);
     push_button(fb_width() - 260, fb_height() - 92, 200, 56,
                 part_selected ? "安装系统" : "下一步", 1, true, part_selected);
     push_button(fb_width() - 460, fb_height() - 92, 180, 56, "上一步", 2, false, true);
-    ui_text(80, fb_height() - 76, part_selected
-                ? "已选择分区：点右下角\"安装系统\"开始安装"
-                : "选择一个分区后，右下角会出现\"安装系统\"", C_DIM);
+    if (arm_del || arm_fmt) {
+        char buf[128]; char* q = buf; *q = 0;
+        str_append(q, arm_del ? "确认删除 分区 " : "确认格式化 分区 ", 24);
+        str_append_u64(q, (uint64_t)(g_rows[g_row_sel].part + 1), 4);
+        str_append(q, arm_del ? "（再按一次 D 或点\"确认删除\"；Esc 取消）"
+                               : "（再按一次 F 或点\"确认格式化\"；Esc 取消）", 64);
+        ui_text(80, fb_height() - 76, buf, C_WARN);
+    } else if (g_status[0]) {
+        ui_text(80, fb_height() - 76, g_status, C_WARN);
+    } else {
+        ui_text(80, fb_height() - 76, part_selected
+                    ? "已选择分区：点右下角\"安装系统\"开始安装（删除/格式化需按两次确认）"
+                    : "选择一个分区后可 删除/格式化；\"新建\"会重新初始化所选磁盘的分区表", C_DIM);
+    }
 }
 
 static const char* kStageText[5] = {
@@ -577,14 +651,19 @@ static void draw_page() {
 }
 
 // ---- 安装动作（下一批接真实写盘；界面已能走到这些按钮上）----
-static void part_refresh() { enumerate_disks(); build_rows(); }
+static void part_refresh() {
+    confirm_cancel("refresh");
+    enumerate_disks();
+    build_rows();
+}
 // 自动创建分区表 + 引导分区 + 主分区（GPT：保护性 MBR + ESP + MSR + 主分区）
 static bool part_create_auto(int drive, int row_hint);
 static bool part_delete(int drive, int part_index);
-static bool part_format(int drive, int part_index);
+static int  part_format(int drive, int part_index, char* fs, int fs_cap);
 static void install_begin(int drive, int part_index);
 // ==================== 事件与主循环 ====================
 static void go_page(SetupPage p) {
+    confirm_cancel("page");
     g_st.page = p;
     g_st.dirty = true;
     dbg64_str("[SETUP] page=");
@@ -617,7 +696,7 @@ static void on_button(int id) {
                 }
             }
             if (id == 2) go_page(PAGE_TYPE);
-            if (id == 10) { part_refresh(); g_st.dirty = true; }
+            if (id == 10) { part_refresh(); status_clear(); g_st.dirty = true; }
             if (id == 11) {                       // 新建：写引导分区 + 主分区
                 const int d = (g_row_sel >= 0 && g_row_sel < g_row_count) ? g_rows[g_row_sel].drive : -1;
                 if (part_create_auto(d, g_row_sel)) {
@@ -628,28 +707,91 @@ static void on_button(int id) {
                 }
                 g_st.dirty = true;
             }
-            if (id == 12) {                       // 删除：清掉 MBR 里对应的分区项
-                const int d = (g_row_sel >= 0 && g_row_sel < g_row_count) ? g_rows[g_row_sel].drive : -1;
-                if (g_row_sel >= 0 && g_row_sel < g_row_count &&
-                    part_delete(g_rows[g_row_sel].drive, g_rows[g_row_sel].part)) {
-                    part_refresh();
-                    // 删除后把光标停回**同一块盘**：优先它的第一个分区，否则它的标题行。
-                    // 这样连续删除/格式化不用重新找盘，而且绝不会飘到安装介质盘上去
-                    // （行索引在 refresh 后会变，所以按 drive 重找，不能沿用旧索引）。
-                    int sel = -1;
-                    for (int i = 0; i < g_row_count; i++)
-                        if (g_rows[i].selectable && g_rows[i].drive == d) { sel = i; break; }
-                    if (sel < 0)
+            if (id == 12) {                       // 删除分区（两步确认）
+                const int row = g_row_sel;
+                if (row < 0 || row >= g_row_count || !g_rows[row].selectable) {
+                    g_st.dirty = true;
+                    break;
+                }
+                const int d = g_rows[row].drive;
+                const int part_no = g_rows[row].part + 1;
+                if (!(g_pending_act == 12 && g_pending_row == row)) {
+                    g_pending_act = 12;
+                    g_pending_row = row;
+                    status_clear();
+                    dbg64_str("[SETUP] 删除待确认 drive=");
+                    dbg64_dec(d);
+                    dbg64_str(" part=");
+                    dbg64_dec(part_no);
+                    dbg64_str(g_disks[d].parts[g_rows[row].part].is_gpt ? " table=gpt" : " table=mbr");
+                    dbg64_nl();
+                } else {
+                    g_pending_act = 0;
+                    g_pending_row = -1;
+                    if (part_delete(d, g_rows[row].part)) {
+                        status_set_op("已删除 分区 ", part_no, "（分区表已同步，首扇区已抹）");
+                        part_refresh();
+                        // 删除后把光标停回**同一块盘**：优先它的第一个分区，否则它的标题行。
+                        // 这样连续删除/格式化不用重新找盘，而且绝不会飘到安装介质盘上去
+                        // （行索引在 refresh 后会变，所以按 drive 重找，不能沿用旧索引）。
+                        int sel = -1;
                         for (int i = 0; i < g_row_count; i++)
-                            if (g_rows[i].part == -1 && g_rows[i].drive == d) { sel = i; break; }
-                    if (sel < 0) sel = (g_row_count > 0) ? 0 : -1;
-                    g_row_sel = sel;
+                            if (g_rows[i].selectable && g_rows[i].drive == d) { sel = i; break; }
+                        if (sel < 0)
+                            for (int i = 0; i < g_row_count; i++)
+                                if (g_rows[i].part == -1 && g_rows[i].drive == d) { sel = i; break; }
+                        if (sel < 0) sel = (g_row_count > 0) ? 0 : -1;
+                        g_row_sel = sel;
+                    } else {
+                        status_set_op("无法删除 分区 ", part_no, "（见串口 [PART] 行）");
+                    }
                 }
                 g_st.dirty = true;
             }
-            if (id == 13) {                       // 格式化：清分区首部（主分区写占位超级块）
-                if (part_format(g_rows[g_row_sel].drive, g_rows[g_row_sel].part)) {
-                    part_refresh();
+            if (id == 13) {                       // 格式化分区（两步确认）
+                const int row = g_row_sel;
+                if (row < 0 || row >= g_row_count || !g_rows[row].selectable) {
+                    g_st.dirty = true;
+                    break;
+                }
+                const int d = g_rows[row].drive;
+                const int part_no = g_rows[row].part + 1;
+                if (!(g_pending_act == 13 && g_pending_row == row)) {
+                    g_pending_act = 13;
+                    g_pending_row = row;
+                    status_clear();
+                    dbg64_str("[SETUP] 格式化待确认 drive=");
+                    dbg64_dec(d);
+                    dbg64_str(" part=");
+                    dbg64_dec(part_no);
+                    dbg64_str(g_disks[d].parts[g_rows[row].part].is_gpt ? " table=gpt" : " table=mbr");
+                    dbg64_nl();
+                } else {
+                    g_pending_act = 0;
+                    g_pending_row = -1;
+                    const int keep = row;
+                    char fs[24];
+                    fs[0] = 0;
+                    const int rc = part_format(d, g_rows[row].part, fs, (int)sizeof(fs));
+                    if (rc == 0) {
+                        char* q = g_status;
+                        *q = 0;
+                        str_append(q, "已格式化 分区 ", 24);
+                        str_append_u64(q, (uint64_t)part_no, 4);
+                        str_append(q, " -> ", 6);
+                        str_append(q, fs, 20);
+                        part_refresh();
+                        // 格式化不动分区表，把光标停回同一行
+                        if (keep < g_row_count && g_rows[keep].selectable) g_row_sel = keep;
+                    } else if (rc == -2) {
+                        char* q = g_status;
+                        *q = 0;
+                        str_append(q, "无法格式化 分区 ", 26);
+                        str_append_u64(q, (uint64_t)part_no, 4);
+                        str_append(q, "：EFI 系统分区受保护（UEFI 引导卷）", 60);
+                    } else {
+                        status_set_op("格式化失败 分区 ", part_no, "（见串口 [PART] 行）");
+                    }
                 }
                 g_st.dirty = true;
             }
@@ -675,7 +817,8 @@ static void handle_key(uint8_t ch) {
     dbg64_str("[SETUP] key=0x");
     dbg64_hex64(ch);                                   // 便于自动验收：确认按键真的到达向导
     dbg64_nl();
-    if (ch == 0x1B) {                                  // Esc = 上一步
+    if (ch == 0x1B) {                                  // Esc = 取消武装 / 上一步
+        if (g_pending_act != 0) { confirm_cancel("esc"); g_st.dirty = true; return; }
         if (g_st.page > PAGE_LANG) go_page((SetupPage)(g_st.page - 1));
         return;
     }
@@ -683,6 +826,7 @@ static void handle_key(uint8_t ch) {
         if (g_st.page == PAGE_LANG) { g_st.lang = 0; g_st.dirty = true; }
         else if (g_st.page == PAGE_DISK && g_row_count > 0) {
             g_row_sel = (g_row_sel <= 0) ? g_row_count - 1 : g_row_sel - 1;
+            confirm_cancel("sel");
             g_st.dirty = true;
         }
         return;
@@ -691,6 +835,7 @@ static void handle_key(uint8_t ch) {
         if (g_st.page == PAGE_LANG) { g_st.lang = 1; g_st.dirty = true; }
         else if (g_st.page == PAGE_DISK && g_row_count > 0) {
             g_row_sel = (g_row_sel < 0 || g_row_sel + 1 >= g_row_count) ? 0 : g_row_sel + 1;
+            confirm_cancel("sel");
             g_st.dirty = true;
         }
         return;
@@ -740,6 +885,7 @@ static void handle_mouse_click(int mx, int my) {
             const int idx = (my - list_y - 8) / 34;
             if (idx >= 0 && idx < g_row_count && idx < list_h / 34) {
                 g_row_sel = idx;
+                confirm_cancel("sel");
                 g_st.dirty = true;
             }
         }
@@ -759,18 +905,6 @@ static uint32_t row_disk_sectors(int drive) {
     return (drive >= 0 && drive < kDiskSlots) ? g_disks[drive].sectors : 0;   // ★ 含 AHCI 盘（8..）
 }
 
-// 取出该行对应的分区信息（MBR 里的第 part 项，1-based）
-static bool row_part_info(int drive, int part, PartInfo* out) {
-    if (drive < 0 || part < 0) return false;
-    static uint8_t sec[512];
-    if (!ata64_read_sector(drive, 0, sec)) return false;
-    PartInfo p[4];
-    part_parse_mbr(sec, p);
-    if (part >= 4 || !p[part].used) return false;
-    *out = p[part];
-    return true;
-}
-
 // 新建：写入标准布局（引导分区 + 主分区）
 static bool part_create_auto(int drive, int row_hint) {
     (void)row_hint;
@@ -785,15 +919,33 @@ static bool part_create_auto(int drive, int row_hint) {
     return ok;
 }
 
-static bool part_delete(int drive, int part_index) {
-    if (drive < 0 || part_index < 0) return false;
-    return part_delete_entry(drive, part_index + 1);      // 界面是 0-based，MBR 项是 1-based
+// 把"界面这一行"翻译成写盘目标：**必须带上它是 MBR 项还是 GPT 项** ——
+// 老实现只给 MBR 项号，在 GPT 盘上会删错项、格式化还会把 LBA1 的主 GPT 头清零
+// （实测记录见 tests/partmgr64_test.py）。
+static bool row_part_target(int drive, int part_index, PartTarget* t) {
+    if (!t || drive < 0 || drive >= kDiskSlots) return false;
+    if (part_index < 0 || part_index >= g_disks[drive].part_count) return false;
+    const PartEntry& e = g_disks[drive].parts[part_index];
+    t->src       = e.src;
+    t->index     = part_index;
+    t->start     = e.start;
+    t->sectors   = e.sectors;
+    t->mbr_type  = e.type;
+    t->gpt_esp   = e.is_esp;
+    t->gpt_basic = e.is_basic;
+    return true;
 }
 
-static bool part_format(int drive, int part_index) {
-    PartInfo p;
-    if (!row_part_info(drive, part_index, &p)) return false;
-    return part_format_partition(drive, p, part_index + 1);
+static bool part_delete(int drive, int part_index) {
+    PartTarget t;
+    if (!row_part_target(drive, part_index, &t)) return false;
+    return part_delete_partition64(drive, row_disk_sectors(drive), t);
+}
+
+static int part_format(int drive, int part_index, char* fs, int fs_cap) {
+    PartTarget t;
+    if (!row_part_target(drive, part_index, &t)) return -1;
+    return part_format_partition64(drive, row_disk_sectors(drive), t, fs, fs_cap);
 }
 
 static void install_begin(int drive, int part_index) {

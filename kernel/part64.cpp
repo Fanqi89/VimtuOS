@@ -156,8 +156,10 @@ bool part_create_standard(int drive, uint32_t disk_sectors) {
     // 已有分区就拒绝（避免覆盖别人的分区表；界面上会提示先删除）
     PartInfo p[4];
     part_parse_mbr(g_sec, p);
+    // 保护性 0xEE 项不是一个真分区（它是 GPT 盘在 MBR 里的占位），不算"已有分区" ——
+    // 否则把一块原来装过 Windows 的盘删空之后仍然新建不了分区表。
     int existing = 0;
-    for (int i = 0; i < 4; i++) if (p[i].used) existing++;
+    for (int i = 0; i < 4; i++) if (p[i].used && p[i].type != 0xEE) existing++;
     if (existing > 0) {
         dbg64_str("[PART] 该磁盘已有分区，新建被拒绝 existing=");
         dbg64_dec(existing);
@@ -165,6 +167,12 @@ bool part_create_standard(int drive, uint32_t disk_sectors) {
         return false;
     }
 
+    // ★ v0.5.14：新建 = 重新初始化分区表 -> 旧 GPT（主/备头）一并抹掉。
+    //   不抹的话"删掉分区再新建"会留下盘尾 GPT 仍然描述着旧分区，UEFI 起来照样按它
+    //   找 ESP（表现：分区删了、盘好像还认得）。
+    if (part_gpt_wipe64(drive, disk_sectors)) {
+        if (!ata64_read_sector(drive, 0, g_sec)) return false;   // g_sec 刚才被 wipe 用掉了
+    }
     build_standard_table(g_sec, disk_sectors);
     if (!ata64_write_sector(drive, 0, g_sec)) return false;
 
@@ -288,6 +296,376 @@ static void gpt_put_entry(uint8_t* ents, int idx, const uint8_t type[16], const 
     }
     int i = 0;
     while (name[i] && i < 36) { e[56 + i * 2] = (uint8_t)name[i]; i++; }   // UTF-16LE（ASCII 高位 0）
+}
+
+// ==================== v0.5.14：GPT 定位 / 读项 / 清项 ====================
+// 为什么需要这一层（真缺陷，见 tests/partmgr64_test.py 的实测）：界面上的"分区 N"
+// 可能来自 GPT；而旧实现只按 MBR 项号写盘，在 GPT 盘上会删错项、甚至把 LBA1 的
+// 主 GPT 头清零。这里把"表"显式化：界面给 src+index，内核重读表拿真实几何。
+static uint64_t rd64(const uint8_t* p) {
+    return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
+}
+static bool eq16(const uint8_t* a, const uint8_t* b) {
+    for (int i = 0; i < 16; i++) if (a[i] != b[i]) return false;
+    return true;
+}
+static void copy_str(char* d, int cap, const char* s) {
+    if (!d || cap <= 0) { return; }
+    int i = 0;
+    while (s[i] && i < cap - 1) { d[i] = s[i]; i++; }
+    d[i] = 0;
+}
+
+// 头自检：magic + 头大小 92 + 头 CRC。只认 magic 会把被别的工具写坏的盘当好盘，
+// 然后照着垃圾项数组去删分区 —— 判据必须包括 CRC。
+// ★ 踩坑记录（本版实测）：头 CRC 的定义是"把 HeaderCRC32 字段置 0 后对 92 字节求
+//   CRC32"。第一版没清零就直接算，于是**所有合法 GPT 头都被判成坏头**（表现：
+//   "[PART] 删除失败：这块盘上没有可用的 GPT"，虽然盘上的头完全正常）。
+static bool gpt_hdr_ok64(const uint8_t* h_in) {
+    uint8_t h[92];
+    for (int i = 0; i < 92; i++) h[i] = h_in[i];
+    const uint32_t stored = rd32(h + 16);
+    h[16] = 0; h[17] = 0; h[18] = 0; h[19] = 0;
+    if (!(h[0] == 'E' && h[1] == 'F' && h[2] == 'I' && h[3] == ' ')) return false;
+    if (rd32(h + 12) != 92) return false;
+    return stored == part_crc32(h, 92);
+}
+
+// 读指定 LBA 上的 GPT 头（主头 LBA1 / 备份头 盘尾）
+static bool gpt_locate_at64(int drive, uint32_t lba, uint32_t disk_sectors,
+                            bool primary, GptLoc* out) {
+    if (out) out->valid = false;
+    if (!out || !ata64_read_sector(drive, lba, g_sec)) return false;
+    if (!gpt_hdr_ok64(g_sec)) return false;
+    const uint32_t ent_lba = rd32(g_sec + 72);
+    const int cnt = (int)rd32(g_sec + 80);
+    const int sz  = (int)rd32(g_sec + 84);
+    if (sz != 128 || cnt <= 0 || cnt > 1024) return false;
+    if (ent_lba < 2 || ent_lba >= disk_sectors) return false;
+    out->valid = true;
+    out->primary = primary;
+    out->hdr_lba = lba;
+    out->ent_lba = ent_lba;
+    out->ent_count = cnt;
+    out->ent_size = sz;
+    return true;
+}
+
+bool part_gpt_locate64(int drive, uint32_t disk_sectors, GptLoc* out) {
+    if (!out) return false;
+    out->valid = false;
+    if (drive < 0 || disk_sectors < 40) return false;
+    if (gpt_locate_at64(drive, 1, disk_sectors, true, out)) return true;
+    return gpt_locate_at64(drive, disk_sectors - 1, disk_sectors, false, out);
+}
+
+// 项数组整段读进 g_io（128 项 * 128B = 16KB < 64KB）
+static bool gpt_read_entries64(int drive, const GptLoc& loc, int* out_bytes) {
+    const int bytes = loc.ent_count * loc.ent_size;
+    if (bytes <= 0 || bytes > (int)sizeof(g_io)) return false;
+    const uint32_t secs = (uint32_t)((bytes + 511) / 512);
+    if (!ata64_read(drive, loc.ent_lba, secs, g_io)) return false;
+    if (out_bytes) *out_bytes = bytes;
+    return true;
+}
+
+// 把 g_io 里的项数组写回，并重算项数组 CRC 与头 CRC（MyLBA/AlternateLBA 一律不动）
+static bool gpt_write_entries64(int drive, const GptLoc& loc, int bytes) {
+    const uint32_t secs = (uint32_t)((bytes + 511) / 512);
+    if (!ata64_write(drive, loc.ent_lba, secs, g_io)) return false;
+    if (!ata64_read_sector(drive, loc.hdr_lba, g_sec)) return false;
+    if (!gpt_hdr_ok64(g_sec)) return false;
+    wr32(g_sec + 88, part_crc32(g_io, bytes));
+    wr32(g_sec + 16, 0);
+    wr32(g_sec + 16, part_crc32(g_sec, 92));
+    return ata64_write_sector(drive, loc.hdr_lba, g_sec);
+}
+
+bool part_gpt_entry64(int drive, const GptLoc& loc, int index, GptEntryInfo* out) {
+    if (!out || !loc.valid || index < 0 || index >= loc.ent_count) return false;
+    int bytes = 0;
+    if (!gpt_read_entries64(drive, loc, &bytes)) return false;
+    const uint8_t* e = g_io + (uint32_t)index * (uint32_t)loc.ent_size;
+    bool nonzero = false;
+    for (int i = 0; i < 16; i++) if (e[i]) { nonzero = true; break; }
+    out->used = nonzero;
+    out->is_esp = nonzero && eq16(e, GPT_TYPE_ESP);
+    out->is_basic = nonzero && eq16(e, GPT_TYPE_BASIC);
+    out->first = nonzero ? rd64(e + 32) : 0;
+    out->last  = nonzero ? rd64(e + 40) : 0;
+    return true;
+}
+
+static bool gpt_clear_at64(int drive, const GptLoc& loc, int index, uint32_t* out_first) {
+    int bytes = 0;
+    if (!gpt_read_entries64(drive, loc, &bytes)) return false;
+    uint8_t* e = g_io + (uint32_t)index * (uint32_t)loc.ent_size;
+    if (out_first) *out_first = (uint32_t)rd64(e + 32);
+    memzero(e, (uint32_t)loc.ent_size);
+    return gpt_write_entries64(drive, loc, bytes);
+}
+
+bool part_gpt_delete_entry64(int drive, uint32_t disk_sectors, int index) {
+    GptLoc loc;
+    if (!part_gpt_locate64(drive, disk_sectors, &loc)) return false;
+    if (index < 0 || index >= loc.ent_count) return false;
+    GptEntryInfo gi;
+    if (!part_gpt_entry64(drive, loc, index, &gi) || !gi.used) return false;
+    const uint32_t first = (uint32_t)gi.first;
+    bool ok = gpt_clear_at64(drive, loc, index, 0);
+    // 另一份（主/备按规范逐项镜像 -> 同号项就是要清的那一项）
+    const uint32_t other_lba = loc.primary ? (disk_sectors - 1) : 1u;
+    GptLoc other;
+    if (other_lba != loc.hdr_lba &&
+        gpt_locate_at64(drive, other_lba, disk_sectors, !loc.primary, &other)) {
+        const bool ok2 = gpt_clear_at64(drive, other, index, 0);
+        if (!ok2) ok = false;
+        dbg64_str("[PART] GPT 另一份项数组同步清理 ent_lba=");
+        dbg64_dec(other.ent_lba);
+        dbg64_str(ok2 ? " ok" : " FAIL");
+        dbg64_nl();
+    }
+    dbg64_str("[PART] GPT 删除项 index=");
+    dbg64_dec(index);
+    dbg64_str(" start=");
+    dbg64_dec(first);
+    dbg64_nl();
+    return ok;
+}
+
+// 抹掉盘上所有 GPT 头（新建分区表前调用）。只清**确实定位到**的头，不盲写 LBA1 ——
+// LBA1 在本系统的布局里是 loader64.bin，盲写会把安装介质自己的引导链打断。
+bool part_gpt_wipe64(int drive, uint32_t disk_sectors) {
+    if (drive < 0 || disk_sectors < 40) return false;
+    bool wiped = false;
+    GptLoc loc;
+    if (gpt_locate_at64(drive, 1, disk_sectors, true, &loc)) {
+        memzero(g_sec, 512);
+        if (ata64_write_sector(drive, 1, g_sec)) {
+            wiped = true;
+            dbg64_str("[PART] 抹掉主 GPT 头 lba=1");
+            dbg64_nl();
+        }
+    }
+    if (gpt_locate_at64(drive, disk_sectors - 1, disk_sectors, false, &loc)) {
+        memzero(g_sec, 512);
+        if (ata64_write_sector(drive, disk_sectors - 1, g_sec)) {
+            wiped = true;
+            dbg64_str("[PART] 抹掉备份 GPT 头 lba=");
+            dbg64_dec(disk_sectors - 1);
+            dbg64_nl();
+        }
+    }
+    return wiped;
+}
+
+// MBR 里"起点和这一段相同"的项清掉（我们自己的安装盘是 MBR 项 + 盘尾 GPT 双份）。
+// 保护性 0xEE 项**永远不动** —— 清掉它 MBR 固件就再也解析不了这块盘。
+static bool mbr_clear_by_start64(int drive, uint32_t start, char* out_type, int cap) {
+    (void)out_type; (void)cap;
+    if (!ata64_read_sector(drive, 0, g_sec)) return false;
+    PartInfo p[4];
+    part_parse_mbr(g_sec, p);
+    bool changed = false;
+    for (int i = 0; i < 4; i++) {
+        if (!p[i].used || p[i].start != start || p[i].type == 0xEE) continue;
+        memzero(g_sec + 446 + i * 16, 16);
+        changed = true;
+        dbg64_str("[PART] MBR 同段项同步清理 index=");
+        dbg64_dec(i + 1);
+        dbg64_nl();
+    }
+    if (!changed) return false;
+    g_sec[510] = 0x55;
+    g_sec[511] = 0xAA;
+    return ata64_write_sector(drive, 0, g_sec);
+}
+
+bool part_delete_partition64(int drive, uint32_t disk_sectors, const PartTarget& t) {
+    if (drive < 0 || disk_sectors == 0) return false;
+    uint32_t start = t.start;
+    uint32_t sectors = t.sectors;
+    bool ok = false;
+    if (t.src == PART_SRC_GPT) {
+        GptLoc loc;
+        if (!part_gpt_locate64(drive, disk_sectors, &loc)) {
+            dbg64_str("[PART] 删除失败：这块盘上没有可用的 GPT（主/备头都没过 CRC 自检）drive=");
+            dbg64_dec(drive);
+            dbg64_nl();
+            return false;
+        }
+        GptEntryInfo gi;
+        if (!part_gpt_entry64(drive, loc, t.index, &gi) || !gi.used) {
+            dbg64_str("[PART] 删除失败：GPT 项不存在 index=");
+            dbg64_dec(t.index);
+            dbg64_nl();
+            return false;
+        }
+        start = (uint32_t)gi.first;
+        sectors = (gi.last >= gi.first) ? (uint32_t)(gi.last - gi.first + 1) : 0;
+        ok = part_gpt_delete_entry64(drive, disk_sectors, t.index);
+        mbr_clear_by_start64(drive, start, 0, 0);
+    } else {
+        if (t.index < 0 || t.index > 3) return false;
+        if (!ata64_read_sector(drive, 0, g_sec)) return false;
+        PartInfo p[4];
+        part_parse_mbr(g_sec, p);
+        if (!p[t.index].used) {
+            dbg64_str("[PART] 删除失败：MBR 项不存在 index=");
+            dbg64_dec(t.index + 1);
+            dbg64_nl();
+            return false;
+        }
+        if (p[t.index].type == 0xEE) {
+            dbg64_str("[PART] 删除失败：保护性 MBR 项（0xEE）不是真分区 index=");
+            dbg64_dec(t.index + 1);
+            dbg64_nl();
+            return false;
+        }
+        start = p[t.index].start;
+        sectors = p[t.index].sectors;
+        memzero(g_sec + 446 + t.index * 16, 16);
+        g_sec[510] = 0x55;
+        g_sec[511] = 0xAA;
+        ok = ata64_write_sector(drive, 0, g_sec);
+        // GPT（主或备）里描述同一段的那一项也清掉，否则"删了分区，盘尾 GPT 还留着它"
+        GptLoc loc;
+        if (part_gpt_locate64(drive, disk_sectors, &loc)) {
+            for (int i = 0; i < loc.ent_count; i++) {
+                GptEntryInfo gi;
+                if (!part_gpt_entry64(drive, loc, i, &gi) || !gi.used) continue;
+                if ((uint32_t)gi.first != start) continue;
+                if (!part_gpt_delete_entry64(drive, disk_sectors, i)) ok = false;
+                break;
+            }
+        }
+    }
+    // 抹掉被删分区的首扇区：旧超级块/引导记录留着，别的工具仍会把它当成一个活卷
+    uint32_t wiped = 0;
+    if (ok && sectors) {
+        memzero(g_io, 512);
+        if (ata64_write_sector(drive, start, g_io)) wiped = 1;
+    }
+    dbg64_str("[PART] 删除分区 OK drive=");
+    dbg64_dec(drive);
+    dbg64_str(t.src == PART_SRC_GPT ? " table=gpt index=" : " table=mbr index=");
+    dbg64_dec(t.index + 1);
+    dbg64_str(" start=");
+    dbg64_dec(start);
+    dbg64_str(" sectors=");
+    dbg64_dec(sectors);
+    dbg64_str(" wiped=");
+    dbg64_dec(wiped);
+    dbg64_nl();
+    return ok;
+}
+
+int part_format_partition64(int drive, uint32_t disk_sectors, const PartTarget& t,
+                            char* fs_out, int fs_cap) {
+    copy_str(fs_out, fs_cap, "");
+    if (drive < 0 || disk_sectors == 0) return -1;
+    const bool gpt = (t.src == PART_SRC_GPT);
+    uint32_t start = t.start;
+    uint32_t sectors = t.sectors;
+    uint8_t mtype = t.mbr_type;
+    bool is_esp = t.gpt_esp;
+    bool is_basic = t.gpt_basic;
+    if (gpt) {
+        GptLoc loc;
+        GptEntryInfo gi;
+        if (!part_gpt_locate64(drive, disk_sectors, &loc) ||
+            !part_gpt_entry64(drive, loc, t.index, &gi) || !gi.used) {
+            dbg64_str("[PART] 格式化失败：读不到 GPT 项 index=");
+            dbg64_dec(t.index);
+            dbg64_nl();
+            return -1;
+        }
+        start = (uint32_t)gi.first;
+        sectors = (gi.last >= gi.first) ? (uint32_t)(gi.last - gi.first + 1) : 0;
+        is_esp = gi.is_esp;
+        is_basic = gi.is_basic;
+    } else {
+        if (t.index < 0 || t.index > 3) return -1;
+        if (!ata64_read_sector(drive, 0, g_sec)) return -1;
+        PartInfo p[4];
+        part_parse_mbr(g_sec, p);
+        if (!p[t.index].used) {
+            dbg64_str("[PART] 格式化失败：MBR 项不存在 index=");
+            dbg64_dec(t.index + 1);
+            dbg64_nl();
+            return -1;
+        }
+        if (p[t.index].type == 0xEE) {
+            copy_str(fs_out, fs_cap, "refused-protective");
+            dbg64_str("[PART] 拒绝格式化保护性 MBR 项（0xEE 不是真分区）index=");
+            dbg64_dec(t.index + 1);
+            dbg64_nl();
+            return -2;
+        }
+        start = p[t.index].start;
+        sectors = p[t.index].sectors;
+        mtype = p[t.index].type;
+        // 盘尾那个 0xEF 是安装器建的 ESP（真 FAT32）——抹了 UEFI 就起不来
+        if (mtype == 0xEF && start > PART_BOOT_LBA + PART_BOOT_SECS - 1) is_esp = true;
+    }
+    if (sectors == 0) {
+        dbg64_str("[PART] 格式化失败：分区扇区数为 0 index=");
+        dbg64_dec(t.index + 1);
+        dbg64_nl();
+        return -1;
+    }
+    if (is_esp) {
+        copy_str(fs_out, fs_cap, "refused-esp");
+        dbg64_str("[PART] 拒绝格式化 EFI 系统分区（UEFI 引导卷）start=");
+        dbg64_dec(start);
+        dbg64_nl();
+        return -2;
+    }
+    // 清分区首部 64 扇区（抹掉旧引导记录/超级块；不整盘擦，避免等待过久）
+    uint32_t n = (sectors < 64) ? sectors : 64;
+    memzero(g_io, sizeof(g_io));
+    for (uint32_t i = 0; i < n; i += INSTALL_CHUNK_SECTORS) {
+        uint32_t c = n - i;
+        if (c > INSTALL_CHUNK_SECTORS) c = INSTALL_CHUNK_SECTORS;
+        if (!ata64_write(drive, start + i, c, g_io)) {
+            dbg64_str("[PART] 格式化失败：清首部写盘失败 lba=");
+            dbg64_dec(start + i);
+            dbg64_nl();
+            return -1;
+        }
+    }
+    // 真文件系统：主数据分区（MBR 0x07 / GPT Microsoft Basic Data）-> VimtuFS2；
+    //               FAT32 类分区（MBR 0x0B/0x0C/0x0E 且够大）-> FAT32；其余只清首部。
+    const char* fs = "blank";
+    if (gpt ? is_basic : (mtype == 0x07)) {
+        if (vfs64_format(drive, start, sectors) != 0) {
+            copy_str(fs_out, fs_cap, "FAILED");
+            dbg64_str("[PART] 格式化失败：VimtuFS2 建卷未成功 start=");
+            dbg64_dec(start);
+            dbg64_nl();
+            return -1;
+        }
+        fs = "VimtuFS2";
+    } else if (!gpt && (mtype == 0x0B || mtype == 0x0C || mtype == 0x0E)) {
+        if (fat64_format64(drive, start, sectors) == 0) {
+            fs = "FAT32";
+        } else {
+            fs = "blank";          // 分区太小装不下 FAT32：如实降级（fat64 自己会打 reject 行）
+        }
+    }
+    copy_str(fs_out, fs_cap, fs);
+    dbg64_str("[PART] 格式化 OK drive=");
+    dbg64_dec(drive);
+    dbg64_str(gpt ? " table=gpt index=" : " table=mbr index=");
+    dbg64_dec(t.index + 1);
+    dbg64_str(" start=");
+    dbg64_dec(start);
+    dbg64_str(" sectors=");
+    dbg64_dec(sectors);
+    dbg64_str(" fs=");
+    dbg64_str(fs);
+    dbg64_nl();
+    return 0;
 }
 
 // 写备份 GPT：项数组在第 (总扇区-33) LBA，头在最后一个 LBA
