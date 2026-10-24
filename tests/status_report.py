@@ -3519,6 +3519,9 @@ TESTS = [
     ("logfollow64_test.py", "★ v0.5.9 终端与日志自动跟到底部：开机滚屏日志回放**收口**（尾部 1..7 行补画上屏，"
                             "flushed == (replayed-rows)%8）+ 实时阶段收口 + 终端 dmesg 输出滚到底"
                             "（[TERM64] dmesg follow bottom=1）+ 屏幕像素（最新一行真在屏底）与 clear 反向对照"),
+    ("termcjk64_test.py", "★ v0.5.12 终端汉字缺字修复：单色阈值按码点切换（ASCII 128 / 汉字 96）—— "
+                           "banner 6 个汉字墨点 312->423、笔画断裂 4-连通分量 80->53，并守 中英 1:2 / "
+                           "[FONT64] selftest PASS / 无 PANIC（17 条断言）"),
     ("install_persist64_test.py", "★ v0.5.11 装到硬盘后真能持久化：ISO/安装介质装到 8G 盘 -> 目标盘 LBA8009 是 "
                                   "VIMTUFS2 卷头 -> mount_system ok 且无 NOT-PERSISTENT -> mkdir+cfg save 落盘"
                                   "（flush ok via=vfs）-> 正常关机重启 -> ui.theme=3 读回 + 宿主侧解析卷仍有 "

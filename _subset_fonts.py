@@ -44,6 +44,17 @@ UI_SYMBOLS = "×÷±√…▾▪◄▲▼·°℃①②③④⑤⑥⑦⑧⑨⑩¥
 CHARS_UI = CHARS_ASCII + UI_SYMBOLS
 CJK_PUNCT = "×÷±√…▾▪·°℃①②③④⑤⑥⑦⑧⑨⑩“”‘’《》【】！？，。：；、（）"
 # face 2：终端等宽 —— ASCII + 制表符/框线 + 块元素 + 几何图形 + 方向箭头 + 终端常用标点
+#   ★ v0.5.12 实测结论：**不要把汉字收进 face 2**（试过、已回退，别再走这条路）。
+#     起因：终端汉字原来落到 face 1（Noto Sans SC，比例字体、笔画细），16px 单色掩码
+#     （终端"三无"、阈值 128 = 覆盖率 50%）下 1px 笔画整条判死 -> 屏幕"缺笔画/缺字"。
+#     试法：把 GB2312 一级 3755 字收进 face 2（Sarasa Mono SC）—— 笔画确实变粗，但：
+#       ① 体积：font_mono.ttf 30,344 -> 1,057,576 B（压缩 690,825 B），系统内核 3,569,376 B
+#          **越过演示/字体原始区起点（LBA 6096）**，构建直接拒绝（内核预算 <= 3,116,544 B）；
+#       ② 只收"终端字面量里的字"（约 500 个）体积可接受，但实测屏幕上汉字**字形错位**
+#          （'查' 只剩右下角、'令' 画成 '查' 的形状）且 [FONT64] selftest 的查询链判据失败。
+#     最终修法（零体积、零副作用）：终端按码点切换单色阈值 —— ASCII 128 / **汉字 96**，
+#       见 kernel/font.cpp 的 FONT64_MONO_THRESHOLD_CJK 与 kernel/terminal64.cpp 的 term_draw_cell。
+
 CHARS_MONO = (CHARS_ASCII
               + "".join(chr(c) for c in range(0x2500, 0x25A0))
               + "".join(chr(c) for c in range(0x25A0, 0x2600))
@@ -61,7 +72,6 @@ def gb2312_level1():
             except UnicodeDecodeError:
                 pass
     return "".join(out)
-
 
 def cjk_chars():
     """face 1 需求表：ASCII + GB2312 一级汉字（3755 字）+ 中文标点。

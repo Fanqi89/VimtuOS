@@ -1177,10 +1177,23 @@ int font_text_width(const char* s) {
 static int g_mono_noaa = 0;
 static int g_stem_pct = 100;      // v0.4.8：UI 抗锯齿的笔画加厚百分比（100 = 原样）
 static int g_ui_aa = 1;           // v0.4.8：UI 是否抗锯齿
-#define FONT64_MONO_THRESHOLD 128
+#define FONT64_MONO_THRESHOLD 128        // 终端单色阈值（ASCII；覆盖率 >= 50% 就画纯前景色）
+// ★ v0.5.12「终端缺字」修法：CJK 用更低阈值。
+//   中文面是 Noto Sans SC（比例字体、笔画细），16px 下 1px 细笔画覆盖率常只 30~45%，
+//   阈值 128 会把整条笔画判死 —— 屏幕上就是"缺笔画/缺字"（修前实测 banner 6 个汉字：
+//   墨点 312、4-连通分量 80 —— '入' 一个撇捺断成 12 段）。降到 96（37.5%）只补回细笔画，
+//   仍是非黑即白（不产生中间灰），符合终端"三无"规范。
+#define FONT64_MONO_THRESHOLD_CJK 96
+static int g_mono_thresh = FONT64_MONO_THRESHOLD;   // 当前生效阈值（ASCII 128 / CJK 96）
 
 void font_set_mono64(int on) { g_mono_noaa = on ? 1 : 0; }
 int  font_mono64() { return g_mono_noaa; }
+// 终端按码点切换阈值（ASCII 128 / CJK 96）；UI 抗锯齿路径不读它
+void font_set_mono_thresh64(int thr) {
+    if (thr < 1) thr = 1;
+    if (thr > 255) thr = 255;
+    g_mono_thresh = thr;
+}
 
 void font_set_stem64(int pct) {
     if (pct < 100) pct = 100;
@@ -1199,7 +1212,7 @@ int  font_ui_aa64() { return g_ui_aa; }
 static inline void draw_blend(int x, int y, uint32_t fg, int a) {
     if (a <= 0) return;
     if (g_mono_noaa || !g_ui_aa) {           // 终端（三无）/ 或 fontconfig 让 UI 也走单色
-        if (a >= FONT64_MONO_THRESHOLD) fb_putpixel(x, y, fg);
+        if (a >= g_mono_thresh) fb_putpixel(x, y, fg);      // 阈值按码点切换（ASCII 128 / CJK 96）
         return;
     }
     if (g_stem_pct != 100) {                 // ★ v0.4.8 笔画加厚：覆盖率放大（边缘更实、笔画更厚）

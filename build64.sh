@@ -67,7 +67,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.5.11"    # ★ 本版：装到硬盘后**真能持久化**（安装载荷并入 VimtuFS2 卷，修"重启就丢"）
+VIMTUOS_VERSION="0.5.12"    # ★ 本版：终端缺字修复（等宽面收 GB2312 一级汉字，终端汉字笔画不再被判死）
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
@@ -1545,14 +1545,17 @@ echo "          载荷：LBA $PAYLOAD_LBA(头) + $((PAYLOAD_LBA + 1))..$((PAYLOA
 #   而不是内核写盘坏了（实测 vfs/config 写入都能跨重启存活，见 tests/persist64_test.py）。
 #   规则：文件已存在就**原样保留**并如实打印大小；不存在才从本次 sysdisk.img 初始化一次。
 PERSIST_IMG=vimtu64-64-disk.img
-PERSIST_VER="$PERSIST_IMG.ver"          # 记录这块日常盘是用哪个版本初始化的
+# ★ sidecar = "<版本> <sysdisk 的 sha256>"：同一版本号重建（开发期）也要跟随，
+#   否则"我改完内核、版本号没变，日常盘还是老内核"（实测踩过：字体回退被 old disk 掩盖）。
+PERSIST_STAMP="$VIMTUOS_VERSION $(sha256sum "$BUILD/sysdisk.img" | cut -d" " -f1)"
+PERSIST_VER="$PERSIST_IMG.ver"          # 记录这块日常盘是用哪个版本/哪次构建初始化的
 if [ ! -f "$PERSIST_IMG" ]; then
   cp "$BUILD/sysdisk.img" "$PERSIST_IMG"
-  echo "$VIMTUOS_VERSION" > "$PERSIST_VER"
+  echo "$PERSIST_STAMP" > "$PERSIST_VER"
   echo "==> 持久数据盘 初始化 $PERSIST_IMG（从 $BUILD/sysdisk.img 复制一次；此后重建不再覆盖）"
 else
   OLD_VER=$(cat "$PERSIST_VER" 2>/dev/null || echo "unknown")
-  if [ "$OLD_VER" = "$VIMTUOS_VERSION" ]; then
+  if [ "$OLD_VER" = "$PERSIST_STAMP" ]; then
     echo "==> 持久数据盘 保留 $PERSIST_IMG（$(stat -c%s "$PERSIST_IMG") 字节，版本 $OLD_VER 与本版一致，内含用户数据，不覆盖）"
   else
     # ★ v0.5.11 起：日常盘**跟随版本**。旧逻辑"存在就永不覆盖"导致用户永远在跑老系统
@@ -1562,7 +1565,7 @@ else
     if [ -e "$BAK" ]; then BAK="$PERSIST_IMG.$OLD_VER.$(date +%Y%m%d%H%M%S).bak"; fi
     mv "$PERSIST_IMG" "$BAK"
     cp "$BUILD/sysdisk.img" "$PERSIST_IMG"
-    echo "$VIMTUOS_VERSION" > "$PERSIST_VER"
+    echo "$PERSIST_STAMP" > "$PERSIST_VER"
     echo "==> 持久数据盘 升级：旧盘（$OLD_VER，$(stat -c%s "$BAK") 字节）已备份为 $BAK"
     echo "    再用本版（$VIMTUOS_VERSION）sysdisk 重建 $PERSIST_IMG —— 旧盘里的数据仍可用 -drive 挂成第二块盘读回"
   fi

@@ -72,3 +72,8 @@ desktop.ini
 
 # 验收/调试日志一律不进仓（含 esp_pata_uefi.log 这类）
 *.log
+
+# v0.5.11+：日常盘的升级备份与版本 sidecar（本机文件，不进仓库）
+vimtu64-64-disk.img.bak
+vimtu64-64-disk.img.*.bak
+vimtu64-64-disk.img.ver

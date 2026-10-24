@@ -59,11 +59,19 @@
 - ★ **自动跟到底部（v0.5.9）**：正文超过一屏时一直滚到最后一行（`[TERM64] dmesg follow bottom=1`）；
   终端窗口默认高度按 **Dock 顶边**收口（`[UI] term fit above dock client_h=670 rows=37 win_bottom=712 dock_top=724`），
   否则最底两行会被 Dock 盖住。**边界**：没有回看缓冲（scrollback）—— 只能看到最后一屏，`dmesg` 的正文上限就是窗口行数。
+- ★ **终端汉字不会"缺字/缺笔画"（v0.5.12）**：终端按码点切换单色阈值 —— ASCII 用 128（覆盖率 50%）、
+  **汉字用 96（37.5%）**。中文面是 Noto Sans SC（比例字体、笔画细），16px 下 1px 笔画覆盖率常只
+  30~45%，阈值 128 会把整条横/竖/撇捺判死（看起来就是缺笔画）。实测 banner 第二行 6 个汉字：
+  墨点 **312 → 423**（+36%）、笔画断裂（4-连通分量）**80 → 53**（-34%）；仍是纯黑/纯白二值，
+  `[FONT64] selftest PASS`、中英 1:2 不变。验收：`tests/termcjk64_test.py`（17/17）。
+  （**没有**把汉字塞进等宽面：实测体积 30 KB → 1.06 MB 会越过内核原始区闸门，且屏幕上字形错位 ——
+  细节记在 `_subset_fonts.py` 的结论注释里。）
 
 **UI 侧（非终端）另一套策略**：要平滑、要厚、要够黑。v0.4.8 起由最小 fontconfig 管，
 `/etc/fonts.conf`（`key = value`）里的 `ui.stem`（笔画加厚百分比，默认 120）与 `ui.antialias`（on/off）
 在启动时作用到抗锯齿路径；实测设置页正文对比度 **16.46:1**、次要文字 **9.41:1**（WCAG AAA 是 7:1）。
 **v0.4.9 起它是真的可配置**：镜像构建期就预置一份 `0666` 的 `/etc/fonts.conf`（`tools/store_pack_win.py`），
+
 所以内核启动打的是 `[FONTCFG] applied src=file keys=7 stem=120`（不是内置默认），普通会话也改得动。
 实测 A/B（只改这一行 `ui.stem` 120 -> 160，同一块设置页客户区）：笔画核心像素 **0.35% -> 0.64%**，
 正文对比度仍是 16.46:1 —— 见 `tests/fontq64_test.py`（17/17 PASS）。
@@ -75,6 +83,7 @@
 覆盖 **56 个调用号**，其中真实现包括：`read/write/open/close/stat/fstat/lseek/mmap/mprotect/munmap/brk/
 ioctl/readv/writev/access/pipe(sleep 阻塞)/dup/dup2/nanosleep/getpid/fork/execve/wait4/kill/uname/fcntl/
 rename/mkdir/rmdir/unlink/getcwd/clock_gettime/exit_group/openat/getrandom/statfs/fstatfs/arch_prctl/
+
 **getdents64(217)**/setuid/setgid/getuid/geteuid/getgid/getppid/set_tid_address/readlink`，
 并在 `write` 路径上按 Linux 语义投递 **SIGPIPE**（管道读端全关 -> `-EPIPE` + 默认动作退出 141），
 并新增**最小 `/proc`**（`/proc/version`、`/proc/self/{status,cmdline,exe}`）。

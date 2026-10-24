@@ -170,6 +170,10 @@ static const uint32_t kTermAnsi16[16] = {
 };
 #define TERM_CUR     rgb(0x00, 0xC0, 0x00)
 #define TERM_CURFG   rgb(0x00, 0x00, 0x00)
+// ★ v0.5.12：终端单色阈值（ASCII / 汉字）。汉字的 1px 笔画在 16px 下覆盖率常 <50%，
+//   用 128 会把整条笔画判死（"缺字"）；96 = 37.5%，只补回细笔画，仍是非黑即白。
+#define TERM_MONO_THRESHOLD_ASCII 128
+#define TERM_MONO_THRESHOLD_CJK    96
 
 // 批次 B：终端文件命令**不再用 ramfs** —— 全部走 kernel/fd64.cpp 的 FD 层（底层 VimtuFS2）。
 // 限制（帮助里也如实写）：**路径是多级的**（"/dir/sub/name"，v3 目录树起；单段 ≤31B、整条 ≤128B、≤16 层）、
@@ -704,8 +708,18 @@ static void term_draw_cell(int x, int y, int w, uint16_t cp, uint32_t fg, uint32
     //   规范："19. 终端文字非黑即白"、"整格当单色掩码贴屏"。
     font_set_mono64(1);
     font_select(FONT_FACE_MONO);                 // 终端字符格的字体面
-    if (cp < 0x7F) font_draw_glyph(x, y + TERM_MONO_DY, (char)cp, fg);
-    else           font_draw_glyph_cp(x, y + TERM_ZH_DY, (uint32_t)cp, fg);
+    // ★ v0.5.12 终端缺字修法：ASCII 用 128（覆盖率 50%），**汉字用 96（37.5%）**。
+    //   中文面是 Noto Sans SC（笔画细），16px 下 1px 笔画覆盖率常只 30~45%，阈值 128 会整条判死 ——
+    //   屏幕上看就是"缺笔画/缺字"（修前 banner 6 个汉字：墨点 312、4-连通分量 80）。
+    //   仍是纯黑/纯白二值（不产生中间灰），符合终端"三无"规范。
+    if (cp < 0x7F) {
+        font_set_mono_thresh64(TERM_MONO_THRESHOLD_ASCII);
+        font_draw_glyph(x, y + TERM_MONO_DY, (char)cp, fg);
+    } else {
+        font_set_mono_thresh64(TERM_MONO_THRESHOLD_CJK);
+        font_draw_glyph_cp(x, y + TERM_ZH_DY, (uint32_t)cp, fg);
+    }
+    font_set_mono_thresh64(TERM_MONO_THRESHOLD_ASCII);   // 复位（下一位可能是 ASCII）
     font_set_mono64(0);                          // 立刻交还 UI 的抗锯齿路径
 }
 

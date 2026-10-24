@@ -65,7 +65,8 @@ uint32_t font_glyph_miss_count();    // 四个面都画不出来的码点数（�
 // 这三条只对"终端"生效：设置/桌面等 UI 仍走抗锯齿路径（用户明确要求"除终端外"要平滑）。
 // 实现方式是在 draw_blend 里加一个阈值分支 —— 字形栅格化/缓存/查询链一个字都不改，
 // 所以终端与 UI 共用同一份字形数据，只有"怎么落到屏幕上"不同。
-void font_set_mono64(int on);              // 1 = 单色（终端）；0 = 抗锯齿（UI，默认）
+void font_set_mono64(int on);
+void font_set_mono_thresh64(int thr);        // ★ v0.5.12：终端单色阈值（ASCII 128 / 汉字 96）              // 1 = 单色（终端）；0 = 抗锯齿（UI，默认）
 int  font_mono64();                        // 当前开关（诊断/验收打点用）
 // 单元格高度（像素）= 当前面 (ascender - descender) 的实测高度，下限 em、上限 FONT_PX-2。
 // 终端用它做**行距**：取最大度量才不会把 'g' 的下半截或汉字上下边缘切掉。
