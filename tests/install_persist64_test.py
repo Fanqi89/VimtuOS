@@ -164,7 +164,8 @@ def main():
         return 2
     for key in ("ret", "ret", "ret", "ret", "n", "ret"):
         mon.key(key, wait=2.0)
-    done = wait_in(serial_i, "[INSTALL] 完成：已写", 240)
+    # ★ v0.5.13：安装收尾还会"按主分区扩容卷"（搬 12 MiB 数据），等 [SETUP] 安装完成 才算真结束
+    done = wait_in(serial_i, "[SETUP] 安装完成", 600)
     log_i = log_of(serial_i)
     check("安装完成（[INSTALL] 完成：已写 N 扇区）", done,
           (re.search(r"\[INSTALL\] 完成：已写[^\r\n]*", log_i) or ["缺失"])[0])
@@ -196,16 +197,36 @@ def main():
     check("装好的系统挂上了系统卷（[VFS64] mount ok，无 mount_system FAILED）",
           "mount_system FAILED" not in log_a and "[VFS64] mount ok" in log_a,
           (re.search(r"\[VFS64\] mount_system[^\r\n]*|\[VFS64\] mount ok[^\r\n]*", log_a) or ["缺失"])[0])
+    # ★ v0.5.13：卷必须按主分区大小扩容（8G 盘不再只有 12 MiB）
+    # ★ 取所有 mount ok 里最大的 blocks（系统卷）：安装器内核自己还会挂 32/64 块的小配置卷
+    blocks = max([int(x) for x in re.findall(r"\[VFS64\] mount ok blocks=(\d+) inodes=", log_a)] or [0])
+    need = (4 * 1024 * 1024 * 1024) // 512          # >= 4 GiB
+    check("系统卷按主分区扩容（blocks=%d >= %d，即 >= 4 GiB）" % (blocks, need),
+          blocks >= need, "卷 = %.2f GiB" % (blocks * 512.0 / (1024 ** 3)))
+    mgrow = re.search(r"\[INSTALL\] volume grow ok moved=(\d+) total=(\d+)", log_i)
+    check("安装时打印了扩容证据（[INSTALL] volume grow ok）", mgrow is not None,
+          (mgrow.group(0) if mgrow else "缺失"))
     check("不是 NOT-PERSISTENT（载体真是 VimtuFS2 卷）", "NOT-PERSISTENT" not in log_a,
           (re.search(r"\[CONF64\][^\r\n]*NOT-PERSISTENT[^\r\n]*", log_a) or ["（无，正确）"])[0])
     if not open_terminal(log_a, mon, serial_a):
         print("  打不开终端")
         proc.kill()
         return 1
-    type_line(mon, "mkdir /home/vimtu/pdata")
+    # ★ 8 GiB 卷首次挂载要扫位图（首启偏慢），打字前先确认终端真的拿到了键。
+    #   判据：第一条命令后出现 [TERM] cmd；没出现就重新点一次终端再打。
+    typed_ok = False
+    for attempt in range(3):
+        type_line(mon, "mkdir /home/vimtu/pdata")
+        if wait_in(serial_a, "[TERM] cmd", 25):
+            typed_ok = True
+            break
+        print("      终端没收到键（第 %d 次），重新点一次终端" % (attempt + 1), flush=True)
+        open_terminal(log_of(serial_a), mon, serial_a)
+        time.sleep(1.0)
+    check("终端真的收到了键盘输入（[TERM] cmd）", typed_ok)
     type_line(mon, "cfg set ui.theme 3")
     type_line(mon, "cfg save")
-    ok_flush = wait_in(serial_a, "[CONF64] flush ok", 60)
+    ok_flush = wait_in(serial_a, "[CONF64] flush ok", 90)
     log_a2 = log_of(serial_a)
     check("设置真落盘（[CONF64] flush ok via=vfs）", ok_flush,
           (re.search(r"\[CONF64\] flush ok[^\r\n]*", log_a2) or ["缺失"])[0])

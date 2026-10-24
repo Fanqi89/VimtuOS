@@ -689,7 +689,8 @@ static int sb_verify(const uint8_t* sb, Vfs64SbGeo* geo) {
 //   为什么必须改：128MB 卷的位图是 39 个扇区，一扇区一次 ATA 事务就是 39 次；而 df / 资源管理器每张
 //   盘卡片 / 每次写的空间预检都走这里。QEMU TCG 下单次事务 = 命令 + IRQ14/DRQ 等待（hlt）+ PIO，
 //   实测十几毫秒 —— 它和 inode 全表扫描一起把"进盘符"那一帧顶过看门狗 5s（见 g_ino_win 的说明）。
-#define VFS64_BM_CHUNK_SEC 8u
+// ★ v0.5.13：8 -> 64 扇区。8 GiB 卷的位图是 4096 个扇区，按 8 扇区一个事务要 512 次（QEMU TCG 下首次挂载要十几秒）；64 扇区 = 32 KiB，只需 64 次。
+#define VFS64_BM_CHUNK_SEC 64u
 static bool count_free_at(int drive, uint32_t base_lba, uint32_t bitmap_start, uint32_t bitmap_blocks,
                           uint32_t blocks, uint32_t data_start, uint32_t* out) {
     static uint8_t bm[VFS64_BM_CHUNK_SEC * VFS64_SECTOR_BYTES];   // 只在这里用；FS 操作串行、不重入

@@ -531,6 +531,203 @@ bool part_install_begin(InstallJob* job, uint32_t payload_lba, int dst_drive, ui
     return true;
 }
 
+
+// ==================== ★ v0.5.13：安装后把卷按主分区大小扩容 ====================
+// 背景（用户报告）：用 ISO 装到 8G 盘，主分区覆盖整盘，但**系统卷只有 12 MiB**
+//   （载荷里的卷是构建期按 16MB 模板生成的）。这里在安装收尾把卷"长大"到主分区大小。
+// 为什么不用改盘格式：VimtuFS2 的布局是"位图紧跟超级块、inode 区紧跟位图、数据区紧跟 inode 区"，
+//   所以扩容必须**重排**：新 bmn = ceil(new_total/4096)、新 data = 1+bmn+ceil(inon/4)。
+//   数据块整体后移（新位置永远 >= 旧位置 -> 从后往前搬，不会自覆盖），位图按旧位图平移重建，
+//   最后重写超级块（version 仍是 4，内核与 mount 校验完全不用改）。
+static uint32_t pg_crc32(const uint8_t* b, uint32_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < n; i++) {
+        c ^= b[i];
+        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(c & 1u)));
+    }
+    return ~c;
+}
+
+// 超级块字段偏移（与 kernel/vfs64.cpp 的 VFS_O_* 一致；这里复制一份，避免暴露内部常量）
+#define PG_O_MAGIC   0u
+#define PG_O_VERSION 8u
+#define PG_O_TOTAL   20u
+#define PG_O_ROOT    24u
+#define PG_O_BITMAP  28u
+#define PG_O_BITMAPN 32u
+#define PG_O_INODE   36u
+#define PG_O_INODEN  40u
+#define PG_O_INOSZ   44u
+#define PG_O_DATA    48u
+#define PG_O_DATAN   52u
+#define PG_O_FLAGS   56u
+#define PG_O_CRC     60u
+#define PG_O_SIG     510u
+#define PG_SB_CRC_LEN 60u
+
+// 返回 1 = 扩容成功；0 = 无需扩容（盘太小/已够大）；-1 = 失败（保持原卷可用）
+static int part_volume_grow64(int drive, uint32_t base_lba, uint32_t main_sectors) {
+    static const char magic[8] = { 'V','I','M','T','U','F','S','2' };
+    if (!ata64_read(drive, base_lba, 1, g_sec)) return -1;
+    for (int i = 0; i < 8; i++) if (g_sec[PG_O_MAGIC + i] != (uint8_t)magic[i]) return 0;   // 没有卷：不动
+    if (pg_crc32(g_sec, PG_SB_CRC_LEN) != rd32(g_sec + PG_O_CRC)) return -1;
+    const uint32_t ver = rd32(g_sec + PG_O_VERSION);
+    if (ver != 4u && ver != 3u) return 0;                       // 只处理 v3/v4（v2 太老，不动）
+    const uint32_t old_total = rd32(g_sec + PG_O_TOTAL);
+    const uint32_t old_bmn = rd32(g_sec + PG_O_BITMAPN);
+    const uint32_t old_ino = rd32(g_sec + PG_O_INODE);   // inode 区起点（随 bmn 变）
+    const uint32_t inon = rd32(g_sec + PG_O_INODEN);
+    const uint32_t data_old = rd32(g_sec + PG_O_DATA);
+    if (old_total == 0 || old_bmn == 0 || data_old == 0 || data_old >= old_total) return -1;
+    if (inon == 0 || inon > VFS64_MAX_INODES) return -1;
+
+    uint32_t new_total = main_sectors;
+    if (new_total <= old_total + 4096u) return 0;               // 盘没比卷大多少：不值得搬
+    const uint32_t bmn_new = (new_total + VFS64_BITMAP_BLK_BITS - 1u) / VFS64_BITMAP_BLK_BITS;
+    const uint32_t ino_blocks = (inon + VFS64_INODES_PER_BLK - 1u) / VFS64_INODES_PER_BLK;
+    const uint32_t ino_new = 1u + bmn_new;
+    const uint32_t data_new = ino_new + ino_blocks;
+    if (data_new >= new_total) return 0;
+    if (data_new <= data_old) return 0;                         // 理论上必真（bmn 只增）
+
+    dbg64_line_begin64();
+    dbg64_str("[INSTALL] volume grow total=");
+    dbg64_dec(old_total);
+    dbg64_str("->");
+    dbg64_dec(new_total);
+    dbg64_str(" data=");
+    dbg64_dec(data_old);
+    dbg64_str("->");
+    dbg64_dec(data_new);
+    dbg64_str(" inode=");
+    dbg64_dec(old_ino);
+    dbg64_str("->");
+    dbg64_dec(ino_new);
+    dbg64_str(" bmn=");
+    dbg64_dec(old_bmn);
+    dbg64_str("->");
+    dbg64_dec(bmn_new);
+    dbg64_nl();
+    dbg64_line_end64();
+
+    // ---- 1) **inode 区 + 数据区**整体后移 ----
+    //   ★ 关键：新布局里 inode 区起点从 old_ino(=1+bmn_old) 变成 ino_new(=1+bmn_new)，
+    //     只搬数据区会让 inode 区留在原位（现在属于位图区）—— 卷能过 magic/CRC/几何校验，
+    //     但根目录 inode 读到的是垃圾 -> mount_system FAILED（本批踩过：扩容后 NOT-PERSISTENT）。
+    //   inode 区长度不变（inon 未变、每块 4 个 inode），所以 inode 区和数据区可以当成
+    //   **一整段 [old_ino, old_total)** 平移 (ino_new - old_ino) 块。
+    //   新位置恒 >= 旧位置 -> 从后往前搬，不会自覆盖。
+    if (old_ino == 0 || old_ino >= old_total) return -1;
+    uint32_t moved = 0;
+    uint32_t blk = old_total;
+    while (blk > old_ino) {
+        uint32_t n = blk - old_ino;
+        if (n > INSTALL_CHUNK_SECTORS) n = INSTALL_CHUNK_SECTORS;
+        const uint32_t src = old_ino + (blk - old_ino) - n;      // 本批起始旧块
+        const uint32_t dst = ino_new + (blk - old_ino) - n;      // 对应新块
+        if (!ata64_read(drive, base_lba + src, n, g_io)) return -1;
+        if (!ata64_write(drive, base_lba + dst, n, g_io)) return -1;
+        blk -= n;
+        moved += n;
+    }
+
+    // ---- 2) 位图清零（新位图区比旧的大，原先是数据区的一部分，必须清 0 = 空闲）----
+    memzero(g_io, sizeof(g_io));
+    for (uint32_t i = 0; i < bmn_new; i += INSTALL_CHUNK_SECTORS) {
+        uint32_t c = bmn_new - i;
+        if (c > INSTALL_CHUNK_SECTORS) c = INSTALL_CHUNK_SECTORS;
+        if (!ata64_write(drive, base_lba + 1u + i, c, g_io)) return -1;
+    }
+
+    // ---- 3) 位图重建：头部（0..data_new-1）已用；数据区按旧位图平移；卷外（>= new_total）已用 ----
+    //   逐位操作需要读-改-写位图扇区；先把"数据区涉及的位图扇区"窗口读进来处理。
+    const uint32_t bm_bit = VFS64_BITMAP_BLK_BITS;
+    // 3a) 头部整扇区：块 0..data_new-1 全 1（data_new 通常 << bm_bit，一个扇区够，但按通用写）
+    {
+        uint32_t full = data_new / bm_bit;                 // 整扇区都是 1 的部分
+        uint32_t rem = data_new % bm_bit;                  // 末尾扇区里前 rem 位是 1
+        for (uint32_t i = 0; i < full && i < INSTALL_CHUNK_SECTORS; i++) {
+            // 一次最多 128 扇区：0xFF 填满
+            for (uint32_t k = 0; k < INSTALL_CHUNK_SECTORS; k++) memzero(g_io + k * 512, 512);
+            uint32_t c = full - i;
+            if (c > INSTALL_CHUNK_SECTORS) c = INSTALL_CHUNK_SECTORS;
+            for (uint32_t k = 0; k < c; k++) {
+                for (uint32_t b = 0; b < 512; b++) g_io[k * 512 + b] = 0xFF;
+            }
+            if (!ata64_write(drive, base_lba + 1u + i, c, g_io)) return -1;
+            i += c - 1;
+        }
+        if (rem) {
+            if (!ata64_read(drive, base_lba + 1u + full, 1, g_sec)) return -1;
+            for (uint32_t b = 0; b < rem / 8u; b++) g_sec[b] = 0xFF;
+            uint32_t left = rem % 8u;
+            if (left) g_sec[rem / 8u] = (uint8_t)((1u << left) - 1u);
+            if (!ata64_write(drive, base_lba + 1u + full, 1, g_sec)) return -1;
+        }
+    }
+    // 3b) 数据区：把旧位图的每一位映射到新块号（新块 = data_new + (旧块 - data_old)）
+    {
+        const uint32_t old_datan = old_total - data_old;
+        uint32_t handled = 0;
+        while (handled < old_datan) {
+            // 处理旧位图里对应"旧块 [data_old+handled, ...)" 的一段（一个位图扇区 = 4096 块）
+            const uint32_t old_blk0 = data_old + handled;
+            const uint32_t old_bm_sec = old_blk0 / bm_bit;              // 旧位图扇区号
+            const uint32_t off_in_sec = old_blk0 % bm_bit;
+            uint32_t take = bm_bit - off_in_sec;
+            if (take > old_datan - handled) take = old_datan - handled;
+            if (!ata64_read(drive, base_lba + 1u + old_bm_sec, 1, g_sec)) return -1;
+            for (uint32_t j = 0; j < take; j++) {
+                const uint32_t bit_old = off_in_sec + j;
+                if (!(g_sec[bit_old / 8u] & (uint8_t)(1u << (bit_old % 8u)))) continue;   // 旧：空闲
+                const uint32_t new_blk = data_new + handled + j;
+                if (new_blk >= new_total) continue;                                      // 卷外不动
+                const uint32_t bm_sec = 1u + new_blk / bm_bit;                           // 绝对扇区号（卷内）
+                const uint32_t bit = new_blk % bm_bit;
+                if (!ata64_read(drive, base_lba + bm_sec, 1, g_sec)) return -1;
+                g_sec[bit / 8u] |= (uint8_t)(1u << (bit % 8u));
+                if (!ata64_write(drive, base_lba + bm_sec, 1, g_sec)) return -1;
+            }
+            handled += take;
+        }
+    }
+    // 3c) 卷外（>= new_total）的位必须置 1：分配器永不发放
+    {
+        const uint32_t bm_sec = 1u + new_total / bm_bit;
+        const uint32_t bit = new_total % bm_bit;
+        if (bm_sec < 1u + bmn_new) {
+            if (!ata64_read(drive, base_lba + bm_sec, 1, g_sec)) return -1;
+            for (uint32_t k = bit; k < bm_bit; k++) g_sec[k / 8u] |= (uint8_t)(1u << (k % 8u));
+            if (!ata64_write(drive, base_lba + bm_sec, 1, g_sec)) return -1;
+        }
+    }
+
+    // ---- 4) 重写超级块 ----
+    if (!ata64_read(drive, base_lba, 1, g_sec)) return -1;
+    wr32(g_sec + PG_O_TOTAL, new_total);
+    wr32(g_sec + PG_O_BITMAP, 1u);
+    wr32(g_sec + PG_O_BITMAPN, bmn_new);
+    wr32(g_sec + PG_O_INODE, ino_new);
+    wr32(g_sec + PG_O_DATA, data_new);
+    wr32(g_sec + PG_O_DATAN, new_total - data_new);
+    wr32(g_sec + PG_O_FLAGS, 0u);
+    wr32(g_sec + PG_O_CRC, pg_crc32(g_sec, PG_SB_CRC_LEN));
+    g_sec[PG_O_SIG] = 0x55; g_sec[PG_O_SIG + 1] = 0xAA;
+    if (!ata64_write(drive, base_lba, 1, g_sec)) return -1;
+
+    dbg64_line_begin64();
+    dbg64_str("[INSTALL] volume grow ok moved=");
+    dbg64_dec(moved);
+    dbg64_str(" total=");
+    dbg64_dec(new_total);
+    dbg64_str(" (");
+    dbg64_dec((uint64_t)new_total / 2048u);
+    dbg64_str(" MiB)");
+    dbg64_nl();
+    dbg64_line_end64();
+    return 1;
+}
+
 int part_install_step(InstallJob* job) {
     if (!job->active || job->done || job->failed) return job->failed ? -1 : 1;
 
@@ -552,6 +749,25 @@ int part_install_step(InstallJob* job) {
             dbg64_str("[INSTALL] esp skipped (disk too small) sectors=");
             dbg64_dec(job->write_table_at);
             dbg64_nl();
+        }
+        // ★ v0.5.13：把卷按主分区大小扩容（8G 盘不再只有 12 MiB 卷）。
+        //   必须在写 GPT 之前做：这里要知道主分区扇区数（有 ESP 时主分区到 esp-1 为止）。
+        {
+            uint32_t esp_start = 0, esp_sectors = 0, esp_main_secs = 0;
+            uint32_t main_secs;
+            if (part_esp_geometry64(job->write_table_at, &esp_start, &esp_sectors, &esp_main_secs))
+                main_secs = esp_main_secs;
+            else
+                main_secs = (job->write_table_at > PART_MAIN_LBA) ? (job->write_table_at - PART_MAIN_LBA) : 0;
+            if (main_secs > PART_MAIN_LBA) {
+                const int gr = part_volume_grow64(job->dst_drive, PART_MAIN_LBA, main_secs);
+                if (gr < 0) {
+                    dbg64_line_begin64();
+                    dbg64_str("[INSTALL] volume grow FAILED (keep original volume)");
+                    dbg64_nl();
+                    dbg64_line_end64();
+                }
+            }
         }
         if (!part_write_gpt64(job->dst_drive, job->write_table_at)) { job->failed = true; return -1; }
         job->active = false;
