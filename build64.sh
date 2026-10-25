@@ -67,7 +67,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.7.3"     # ★ P2 第二批：epoll_create1/ctl/wait（fd 层实现 + VFS 自检）
+VIMTUOS_VERSION="0.7.4"     # ★ P2 第三批：Linux socket 层（AF_INET，TCP 客户端 + UDP）
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
@@ -132,6 +132,8 @@ SRCS_DESKTOP="$SRCS_DESKTOP kernel/startmenu64.cpp kernel/panels64.cpp"
 # ★ 本批（真图标）：kernel/icons64.cpp = 统一图标层（读系统镜像里的外置图标包 -> img64 解码 -> 缓存
 #   -> 按主题 palette 着色上屏；取不到就回落既有程序化绘制）。**只进系统内核**（安装介质不带桌面）。
 SRCS_DESKTOP="$SRCS_DESKTOP kernel/icons64.cpp"
+#   ★ v0.7.4（P2 第三批）：sock64 = Linux socket 层（AF_INET，TCP 客户端 + UDP），只进系统内核
+SRCS_DESKTOP="$SRCS_DESKTOP kernel/sock64.cpp"
 #  ★ 本批（P5：桌面交互细节）：desktopops64（桌面右键菜单 / 玻璃选择框 / 回收站 / 桌面图标集合，
 #   以及设置页那一处最小入口的两个后端）。**只进系统内核**（安装介质没有桌面外壳）。
 SRCS_DESKTOP="$SRCS_DESKTOP kernel/desktopops64.cpp"
@@ -826,6 +828,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     gui_rs/gui_rs.o \
     "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/fontcfg64.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
     "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o \
+    "$BUILD/os"/sock64.o \
     "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
     "$BUILD/os"/virtio_gpu64.o \
     "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \

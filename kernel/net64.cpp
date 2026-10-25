@@ -20,6 +20,10 @@
 //   [NET64] selftest PASS / FAIL mask=<n>
 //   [NET64] no link / arp timeout (tx=<n> rx=<n> dropped=<n>)      （优雅跳过用）
 #include "net64.h"
+#include "sock64.h"
+// ★ v0.7.4：socket 层仅在系统内核（安装程序内核没有 net64/sock64 的实现组合）：弱引用，缺了就当作丢弃
+void sock64_rx64(uint8_t proto, uint32_t src_ip, const uint8_t* payload, int len) __attribute__((weak));       // ★ v0.7.4：TCP/UDP 上行分发
+
 #include "e1000_64.h"
 #include "debug64.h"
 #include "mem_64.h"
@@ -321,7 +325,13 @@ static void n64_handle_ip(const uint8_t* p, int len, const uint8_t* src_mac) {
     Net64IpView ip;
     if (n64_parse_ip(p, len, &ip) != 0) { g_dropped++; return; }
     if (ip.dst != NET64_IP_LOCAL64) { g_dropped++; return; }   // 不是发给我们的
-    if (ip.proto != 1) { g_dropped++; return; }                // 只处理 ICMP
+    // ★ v0.7.4（P2 第三批）：TCP(6)/UDP(17) 上行交给 socket 层（sock64）
+    if (ip.proto == 6 || ip.proto == 17) {
+        if (sock64_rx64) sock64_rx64(ip.proto, ip.src, ip.payload, ip.payload_len);
+        else g_dropped++;                                  // 没有 socket 层（安装内核）：如实计丢弃
+        return;
+    }
+    if (ip.proto != 1) { g_dropped++; return; }                // 其它协议：丢弃并计数
     if (ip.payload_len < 8) { g_dropped++; return; }           // ICMP 头都不全
 
     const uint8_t* icmp = ip.payload;

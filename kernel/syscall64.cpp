@@ -134,6 +134,7 @@
 #include "usermode64.h"     // user64_range_ok64 / user64_exit_to_kernel64 / 用户窗口常量
 #include "vfs64.h"          // Linux open/read 走真实文件系统
 #include "fd64.h"           // 批次 B：FD 层（open/read/write/close/lseek/fstat/dup 的公共底座）
+#include "sock64.h"         // ★ v0.7.4（P2 第三批）：Linux socket 层（AF_INET）
 #include "input64.h"        // ★ A5 前置：自有 ABI 12 的落点 ev64_poll64（事件队列/焦点/背压）
 #include "fs64.h"           // ★ P4：统一卷分派（stat/access/chmod/chown 按当前卷 + 权限判定）
 
@@ -2040,6 +2041,103 @@ static int64_t lx64_select64(uint64_t nr, uint64_t nfds, uint64_t rd_va, uint64_
 // ---- \u2605 v0.7.3\uff08P2 \u7b2c\u4e8c\u6279\uff09\uff1a291 epoll_create1 / 233 epoll_ctl / 232 epoll_wait ----
 // struct epoll_event \u5728 x86_64 \u4e0a\u662f **packed 12 \u5b57\u8282**\uff08uint32 events + uint64 data\uff09\uff0c
 // \u6240\u4ee5\u8fd9\u91cc\u6309\u5b57\u8282\u624b\u5199\u5e8f\u5217\u5316\uff0c\u4e0d\u80fd\u76f4\u63a5\u7528\u7ed3\u6784\u4f53\u8d4b\u503c\uff08\u4f1a\u5bf9\u9f50\u5230 16 \u5b57\u8282\uff09\u3002
+// ==================== \u2605 v0.7.4\uff08P2 \u7b2c\u4e09\u6279\uff09\uff1aLinux socket ====================
+// handle \u4e0d\u8fdb fd \u8868\uff08= SOCK64_FD_BASE + idx\uff0c\u4e0e epoll \u540c\u4e00\u7b56\u7565\uff09\u3002
+// \u5b9e\u5982\u8fb9\u754c\uff1asocket handle \u4e0d\u80fd\u76f4\u63a5\u4e22\u7ed9 poll/select\uff08\u90a3\u91cc\u6309 fd \u8868\u67e5\uff09\u3002
+#ifndef VIMTU_INSTALLER_MEDIA      // 安装程序内核不带 socket 层（无网络）：实现与 case 都不编
+static int64_t lx64_socket64(uint64_t nr, uint64_t dom, uint64_t type, uint64_t proto) {
+    (void)nr; (void)proto;
+    if (dom != 2u) return -97;                                // -EAFNOSUPPORT\uff08\u53ea\u652f\u6301 AF_INET\uff09
+    const int t = (int)(type & 0xFu);                          // \u53bb\u6389 SOCK_NONBLOCK/CLOEXEC \u4f4d
+    const int h = sock64_create64(t == 1 ? SOCK64_T_TCP : (t == 2 ? SOCK64_T_UDP : 0));
+    if (h < 0) return -24;                                    // -EMFILE\uff08\u5b9e\u4f8b\u7528\u5c3d\uff09
+    return (int64_t)h;
+}
+
+// sockaddr_in\uff1afamily(2) port(2, \u7f51\u7edc\u5e8f) addr(4, \u7f51\u7edc\u5e8f)
+static int lx64_sockaddr_in64(uint64_t nr, uint64_t va, uint32_t* ip_out, uint16_t* port_out) {
+    if (!va) return -LX64_EFAULT;
+    if (!user64_range_ok64(va, 16)) { syscall64_deny64(nr, va); return -LX64_EFAULT; }
+    const uint8_t* p = (const uint8_t*)(uintptr_t)va;
+    if (((uint16_t)p[0] | ((uint16_t)p[1] << 8)) != 2u) return -97;
+    if (ip_out) {
+        uint32_t ip = 0;
+        for (int i = 0; i < 4; i++) ip |= (uint32_t)p[4 + i] << (8 * i);
+        *ip_out = ip;
+    }
+    if (port_out) *port_out = (uint16_t)(((uint16_t)p[2] << 8) | p[3]);
+    return 0;
+}
+
+static int64_t lx64_connect_s64(uint64_t nr, uint64_t fd, uint64_t va, uint64_t len) {
+    (void)len;
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    const int rc = lx64_sockaddr_in64(nr, va, &ip, &port);
+    if (rc != 0) return rc;
+    const int c = sock64_connect64((int)fd, ip, port, 3000);
+    if (c == 0) return 0;
+    return (c == -2) ? -110 : -111;                           // ETIMEDOUT / ECONNREFUSED
+}
+
+static int64_t lx64_sendto_s64(uint64_t nr, uint64_t fd, uint64_t buf_va, uint64_t len,
+                               uint64_t flags, uint64_t addr_va, uint64_t addr_len) {
+    (void)flags; (void)addr_len;
+    if (!user64_range_ok64(buf_va, len)) { syscall64_deny64(nr, buf_va); return -LX64_EFAULT; }
+    if (addr_va) {
+        uint32_t ip = 0;
+        uint16_t port = 0;
+        const int rc = lx64_sockaddr_in64(nr, addr_va, &ip, &port);
+        if (rc != 0) return rc;
+        sock64_sendto_target64((int)fd, ip, port);
+    }
+    const int n = sock64_send64((int)fd, (const void*)(uintptr_t)buf_va, (int)len);
+    return n < 0 ? -32 : (int64_t)n;                          // -EPIPE
+}
+
+static int64_t lx64_recvfrom_s64(uint64_t nr, uint64_t fd, uint64_t buf_va, uint64_t len,
+                                 uint64_t flags, uint64_t addr_va, uint64_t addr_len_va) {
+    (void)flags;
+    if (!user64_range_ok64(buf_va, len)) { syscall64_deny64(nr, buf_va); return -LX64_EFAULT; }
+    const int n = sock64_recv64((int)fd, (void*)(uintptr_t)buf_va, (int)len, 3000);
+    if (n < 0) return -104;                                   // -ECONNRESET
+    if (addr_va) {                                            // \u56de\u586b\u6e90\u5730\u5740\uff08UDP\uff09
+        uint32_t ip = 0;
+        uint16_t port = 0;
+        if (sock64_getname64((int)fd, &ip, &port, 1) == 0 && user64_range_ok64(addr_va, 16)) {
+            uint8_t* q = (uint8_t*)(uintptr_t)addr_va;
+            q[0] = 2; q[1] = 0;
+            q[2] = (uint8_t)(port >> 8); q[3] = (uint8_t)port;
+            for (int i = 0; i < 4; i++) q[4 + i] = (uint8_t)(ip >> (8 * i));
+            for (int i = 8; i < 16; i++) q[i] = 0;
+            if (addr_len_va && user64_range_ok64(addr_len_va, 4))
+                *((uint32_t*)(uintptr_t)addr_len_va) = 16u;
+        }
+    }
+    return (int64_t)n;
+}
+
+static int64_t lx64_sockname_s64(uint64_t nr, uint64_t fd, uint64_t va, uint64_t len_va, int peer) {
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    if (sock64_getname64((int)fd, &ip, &port, peer) != 0) return -88;   // -ENOTSOCK
+    if (va) {
+        if (!user64_range_ok64(va, 16)) { syscall64_deny64(nr, va); return -LX64_EFAULT; }
+        uint8_t* q = (uint8_t*)(uintptr_t)va;
+        q[0] = 2; q[1] = 0;
+        q[2] = (uint8_t)(port >> 8); q[3] = (uint8_t)port;
+        for (int i = 0; i < 4; i++) q[4 + i] = (uint8_t)(ip >> (8 * i));
+        for (int i = 8; i < 16; i++) q[i] = 0;
+    }
+    if (len_va && user64_range_ok64(len_va, 4)) *((uint32_t*)(uintptr_t)len_va) = 16u;
+    return 0;
+}
+
+static int64_t lx64_sock_close64(uint64_t fd) {
+    return sock64_close64((int)fd) == 0 ? 0 : -88;
+}
+#endif  // VIMTU_INSTALLER_MEDIA
+
 static int64_t lx64_epoll_create1_64(uint64_t nr, uint64_t flags) {
     (void)nr; (void)flags;
     const int ep = fd64_epoll_create64();
@@ -2738,6 +2836,20 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 232: return lx64_epoll_wait_64(nr, a1, a2, a3, a4);      // ★ v0.7.3：epoll_wait
     case 233: return lx64_epoll_ctl_64(nr, a1, a2, a3, a4);       // ★ v0.7.3：epoll_ctl(ADD/DEL/MOD)
     case 291: return lx64_epoll_create1_64(nr, a1);              // ★ v0.7.3：epoll_create1
+#ifndef VIMTU_INSTALLER_MEDIA
+    case 41:  return lx64_socket64(nr, a1, a2, a3);              // ★ v0.7.4：socket(AF_INET)
+    case 42:  return lx64_connect_s64(nr, a1, a2, a3);           // ★ v0.7.4：connect（TCP 三次握手）
+    case 43:  return -95;                                        // ★ v0.7.4：accept 不支持（仅客户端）
+    case 44:  return lx64_sendto_s64(nr, a1, a2, a3, a4, a5, a6); // ★ v0.7.4：sendto / send
+    case 45:  return lx64_recvfrom_s64(nr, a1, a2, a3, a4, a5, a6); // ★ v0.7.4：recvfrom / recv
+    case 48:  return lx64_sock_close64(a1);                       // ★ v0.7.4：shutdown ≈ close
+    case 49:  return -95;                                        // ★ v0.7.4：bind 暂不支持
+    case 50:  return -95;                                        // ★ v0.7.4：listen 不支持
+    case 51:  return lx64_sockname_s64(nr, a1, a2, a3, 0);        // ★ v0.7.4：getsockname
+    case 52:  return lx64_sockname_s64(nr, a1, a2, a3, 1);        // ★ v0.7.4：getpeername
+    case 54:  return 0;                                          // ★ v0.7.4：setsockopt 接受并忽略
+    case 55:  return 0;                                          // ★ v0.7.4：getsockopt 接受并忽略
+#endif  // VIMTU_INSTALLER_MEDIA
     case 270: return lx64_ppoll64(nr, a1, a2, a3, a4, a5);         // ★ v0.7.1：pselect6 ≈ ppoll（忽略 sigmask）
     case 271: return lx64_ppoll64(nr, a1, a2, a3, a4, a5);         // ★ v0.7.1：ppoll
     case 37:  return lx64_alarm64(a1);                              // 只记录，不投递 SIGALRM

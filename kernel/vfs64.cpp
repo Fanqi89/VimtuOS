@@ -30,6 +30,7 @@
 #include "x86_64.h"          // rtc_get_date64 / rtc_get_time64（mtime 用）
 #include "part64.h"          // 只读常量（PART_MAIN_LBA / PartInfo）；**不调用** part64 的函数
 #include "fd64.h"            // ★ v0.7.1（P2）：fd64_ready64（poll/select 的就绪判断）自检用
+int sock64_selftest64(void) __attribute__((weak));   // ★ v0.7.4：socket 层自检（仅系统内核提供）
 
 __attribute__((weak)) bool ata64_read (int drive, uint32_t lba, uint32_t count, void* buf);
 __attribute__((weak)) bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf);
@@ -3900,6 +3901,9 @@ int vfs64_selftest64() {
             if (!eok) ok = false;
             dbg64_str(" epoll=");
             dbg64_str(eok ? "IN+data ok" : "FAIL");
+            // ★ v0.7.4（P2 第三批）：socket 层纯逻辑自检（handle / 状态机 / 校验和算法；不发包）
+            // ★ v0.7.4：socket 层自检——**弱引用**：安装程序内核不带 sock64（无网络层），缺了就跳过
+            if (sock64_selftest64 && sock64_selftest64() != 0) ok = false;
             if (!rok) ok = false;
             dbg64_nl();
             dbg64_line_end64();
