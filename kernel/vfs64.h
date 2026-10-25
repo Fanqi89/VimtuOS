@@ -191,6 +191,7 @@ int vfs64_perm_fields64();
 #define VFS64_S_IFMT           0170000u     // 类型掩码
 #define VFS64_S_IFREG          0100000u     // 普通文件
 #define VFS64_S_IFDIR          0040000u     // 目录
+#define VFS64_S_IFLNK          0120000u     // ★ v0.7.0：符号链接（Linux 同值）
 #define VFS64_S_IRWXU          0000700u
 #define VFS64_S_IRWXG          0000070u
 #define VFS64_S_IRWXO          0000007u
@@ -247,6 +248,10 @@ uint32_t vfs64_max_file_bytes64();
 #define VFS64_TYPE_FREE        0u
 #define VFS64_TYPE_FILE        1u
 #define VFS64_TYPE_DIR         2u
+// ★ v0.7.0（P1 Linux 兼容）：符号链接。目标字符串存在**第一个数据块**里（不补 NUL），
+//   inode 的 size 就是目标长度（<= 511）。这样不需要改卷格式版本：type 字段本来就有余量，
+//   老内核会把它当未知类型拒绝（配套升级，不假装兼容）。
+#define VFS64_TYPE_LINK        3u
 
 // 类型判定（磁盘字段 kind；供 UI 直接显示，判定规则见 vfs64.cpp 的 vfs64_kind_of_data64）
 #define VFS64_KIND_NONE        0u   // 未知/未判定
@@ -315,6 +320,9 @@ uint32_t vfs64_now64();
 // 打包值 -> 字符串：ymd 至少 11 B（"YYYY-MM-DD"）、hms 至少 9 B（"HH:MM:SS"）；0 -> "0000-00-00"/"00:00:00"
 void     vfs64_time_str64(uint32_t packed, char* ymd, int ymd_cap, char* hms, int hms_cap);
 // 按内容 + 名字判定类型（写文件时就调用，结果存进 inode 的 kind 字段）
+// ★ v0.7.0：符号链接（Linux symlink/readlink 的落地）
+int vfs64_symlink64(const char* target, const char* linkpath);      // 0 = 成功
+int vfs64_readlink64(const char* path, char* buf, int cap);         // 返回目标长度（不补 NUL）；-1 = 不是链接/失败
 uint32_t vfs64_kind_of_data64(const void* data, uint32_t len, const char* name, uint32_t name_len);
 // 只按类型 + 名字判定（读 v2 卷/没有内容时用；保守：只认扩展名）
 uint32_t vfs64_kind_by_name64(uint32_t type, const char* name, uint32_t name_len);

@@ -972,7 +972,7 @@ static bool inode_store(uint32_t idx, const uint8_t* in) {
 // 空槽（type=0）不校验 CRC —— 格式化后它就是全 0。
 static bool inode_ok(const uint8_t* b, const char** why) {
     const uint8_t t = b[VFS_I_TYPE];
-    if (t > VFS64_TYPE_DIR) { *why = "type"; return false; }
+    if (t > VFS64_TYPE_LINK) { *why = "type"; return false; }   // ★ v0.7.0：3 = 符号链接
     if (b[VFS_I_NAMELEN] > g_lay->name_max) { *why = "namelen"; return false; }
     if (rd16(b + VFS_I_RSVD) != 0) { *why = "reserved"; return false; }
     if (t == VFS64_TYPE_FREE) return true;
@@ -980,6 +980,7 @@ static bool inode_ok(const uint8_t* b, const char** why) {
     // ★ 批次 M：上限按**当前卷布局**算（v3/v4 = 8 MiB、v2 = 67584）—— 不能拿 v3 的上限去放行 v2 的 inode。
     const uint32_t lim = (g_lay->dind_off != 0) ? VFS64_MAX_FILE_BYTES : VFS64_MAX_FILE_BYTES_V2;
     if (t == VFS64_TYPE_FILE && rd32(b + VFS_I_SIZE) > lim) { *why = "size"; return false; }
+    if (t == VFS64_TYPE_LINK && rd32(b + VFS_I_SIZE) > 511u) { *why = "link-size"; return false; }
     if (g_lay->version == VFS64_VERSION || g_lay->version == VFS64_VERSION_V3) {
         if (b[VFS_I3_RSVD2] != 0) { *why = "rsvd2"; return false; }
         // 保留区起点：v3 从 75 起（权限字段的位置也是保留区，必须全 0）；v4 从 81 起
@@ -989,7 +990,9 @@ static bool inode_ok(const uint8_t* b, const char** why) {
         if (g_lay->version == VFS64_VERSION) {
             // ★ P4：v4 的权限三字段必须自洽（uid/gid 任意；mode 的类型位必须与 type 对得上、权限位 ≤ 0777）
             const uint32_t um = (uint32_t)rd16(b + VFS_I4_MODE);
-            const uint32_t want_ifmt = (t == VFS64_TYPE_DIR) ? VFS64_S_IFDIR : VFS64_S_IFREG;
+            // ★ v0.7.0：type=3（符号链接）对应 S_IFLNK
+            const uint32_t want_ifmt = (t == VFS64_TYPE_DIR) ? VFS64_S_IFDIR
+                                     : (t == VFS64_TYPE_LINK) ? VFS64_S_IFLNK : VFS64_S_IFREG;
             if ((um & VFS64_S_IFMT) != want_ifmt) { *why = "mode type"; return false; }
             if ((um & ~(VFS64_S_IFMT | VFS64_S_IRWX)) != 0) { *why = "mode bits"; return false; }
         }
@@ -1630,15 +1633,64 @@ static int path_resolve_raw(const char* path, bool want_parent,
                             uint32_t* out_ino, uint32_t* out_parent, char* out_name, uint32_t* out_nlen);
 
 // 所有 VFS 入口都从这里过：新路径优先，失败回退旧路径（旧卷 / 夹具卷继续工作）
+// 取 path 的父目录（写进 out）；没有父（"/x"）时给 "/"
+static void path_parent64(const char* path, char* out, uint32_t cap) {
+    uint32_t n = alias_slen64(path);
+    while (n > 1 && path[n - 1] == '/') n--;
+    uint32_t cut = n;
+    while (cut > 0 && path[cut - 1] != '/') cut--;
+    if (cut == 0) { if (cap > 1) { out[0] = '.'; out[1] = 0; } return; }
+    uint32_t m = cut - 1;                                  // 去掉末尾 '/'
+    if (m == 0) m = 1;                                     // 根
+    if (m + 1 > cap) m = cap - 1;
+    for (uint32_t i = 0; i < m; i++) out[i] = path[i];
+    out[m] = 0;
+}
+
+// ★ v0.7.0：跟随**最后一级**符号链接（最多 8 层）。为什么只跟最后一级：
+//   目录级别名（/bin -> /usr/bin 那种）已经由上面的 kPathAlias 映射层覆盖；
+//   而 Linux 真正高频的是文件级链接（/usr/lib/libc.so -> libc.so.6、/etc/xxx -> ...），
+//   只跟最后一级就能覆盖它们，且实现小、把风险关在 40 行里。
+//   want_parent = true 时不跟随（创建/重命名的父目录解析必须看到真实层级）。
 static int path_resolve(const char* path, bool want_parent,
                         uint32_t* out_ino, uint32_t* out_parent, char* out_name, uint32_t* out_nlen) {
     char alias_buf[VFS64_PATH_MAX + 1];
     const char* p = vfs64_alias_path64(path, alias_buf, (uint32_t)sizeof(alias_buf));
-    if (p != path) {
-        const int rc = path_resolve_raw(p, want_parent, out_ino, out_parent, out_name, out_nlen);
-        if (rc == 0) return 0;
+    char cur[VFS64_PATH_MAX + 1];
+    {
+        uint32_t i = 0;
+        for (; p[i] && i < VFS64_PATH_MAX; i++) cur[i] = p[i];
+        cur[i] = 0;
     }
-    return path_resolve_raw(path, want_parent, out_ino, out_parent, out_name, out_nlen);
+    for (int depth = 0; depth < 8 && !want_parent; depth++) {
+        uint32_t idx = 0;
+        const int rc = path_resolve_raw(cur, false, &idx, nullptr, nullptr, nullptr);
+        if (rc != 0) return rc;
+        uint8_t ino[VFS64_INODE_BYTES_MAX];
+        if (!inode_load(idx, ino)) return -1;
+        if (ino[VFS_I_TYPE] != VFS64_TYPE_LINK) break;      // 已落到真实条目
+        const uint32_t n = rd32(ino + VFS_I_SIZE);
+        const uint32_t b0 = rd32(ino + VFS_I_D0);
+        if (n == 0 || n > 511u || !blk_ok_data(b0) || !blk_read(b0, g_sec)) return -1;
+        char tgt[VFS64_PATH_MAX + 1];
+        if (n > VFS64_PATH_MAX) return -1;
+        for (uint32_t k = 0; k < n; k++) tgt[k] = (char)g_sec[k];
+        tgt[n] = 0;
+        if (tgt[0] == '/') {                                // 绝对目标：整条替换
+            uint32_t i = 0;
+            for (; tgt[i] && i < VFS64_PATH_MAX; i++) cur[i] = tgt[i];
+            cur[i] = 0;
+        } else {                                            // 相对目标：父目录 + "/" + 目标
+            char par[VFS64_PATH_MAX + 1];
+            path_parent64(cur, par, (uint32_t)sizeof(par));
+            uint32_t i = 0;
+            for (; par[i] && i < VFS64_PATH_MAX; i++) cur[i] = par[i];
+            if (i == 0 || cur[i - 1] != '/') { if (i < VFS64_PATH_MAX) cur[i++] = '/'; }
+            for (uint32_t k = 0; tgt[k] && i < VFS64_PATH_MAX; k++) cur[i++] = tgt[k];
+            cur[i] = 0;
+        }
+    }
+    return path_resolve_raw(cur, want_parent, out_ino, out_parent, out_name, out_nlen);
 }
 
 static int path_resolve_raw(const char* path, bool want_parent,
@@ -2767,6 +2819,91 @@ int vfs64_create64(const char* path) {
 
 // ==================== 建目录 / 删除 ====================
 // 建目录（多级：父目录必须存在）。★ P4：父目录需要 w+x；新目录属主 = 当前 euid，模式 = 0777 & ~umask。
+// ==================== ★ v0.7.0：符号链接 ====================
+// 目标字符串放第一个数据块（<= 511 B），inode.size = 目标长度；不解析、不跟随。
+int vfs64_symlink64(const char* target, const char* linkpath) {
+    if (!g_mounted) { log_op_fail("symlink", "not mounted"); return -1; }
+    if (!target || !linkpath || !target[0]) { log_op_fail("symlink", "bad args"); return -1; }
+    const uint32_t tlen = alias_slen64(target);
+    if (tlen == 0 || tlen > 511u) { log_op_fail("symlink", "target too long"); return -1; }
+    // linkpath 必须**不存在**（Linux 语义：EEXIST）
+    uint32_t idx = 0;
+    if (path_resolve(linkpath, false, &idx, nullptr, nullptr, nullptr) == 0) {
+        log_op_fail("symlink", "dest exists");
+        return -1;
+    }
+    // 父目录 + 新名字
+    uint32_t par = 0, nlen = 0;
+    char nm[VFS64_NAME_MAX + 1];
+    // 注意：path_resolve(want_parent) 对“要新建”返回 **1**（0=已存在、<0=错误），
+    // 与 write_resolve64 同一口径（实测踩过：把 1 当失败就报 "parent missing"）。
+    const int pr = path_resolve(linkpath, true, &idx, &par, nm, &nlen);
+    if (pr < 0 || nlen == 0) { log_op_fail("symlink", "parent missing"); return -1; }
+    uint8_t pino[VFS64_INODE_BYTES_MAX];
+    if (!inode_load(par, pino)) return -1;
+    if (pino[VFS_I_TYPE] != VFS64_TYPE_DIR) { log_op_fail("symlink", "parent not dir"); return -1; }
+    const int pc = perm_check_ino64(pino, "symlink", linkpath, VFS64_NEED_W | VFS64_NEED_X);
+    if (pc != 0) { log_op_fail("symlink", "permission denied"); return pc; }
+
+    // ★ 真缺陷（自检抓到）：必须先分配 inode 槽，否则 idx 还是 0 ->
+    //   新 inode 会写到**根目录**上（把根目录覆盖掉），而链接本身从未存入任何有效槽位。
+    uint32_t slot = 0;
+    if (!alloc_inode(&slot)) { log_op_fail("symlink", "no free inode"); return -1; }
+    uint32_t blk = 0;
+    if (!alloc_track(&blk)) { log_op_fail("symlink", "no free block"); return -1; }
+    zero_bytes(g_sec, VFS64_SECTOR_BYTES);
+    copy_bytes(g_sec, (const uint8_t*)target, tlen);
+    if (!dev_write(g_start + blk, 1, g_sec)) { bitmap_set(blk, false); log_op_fail("symlink", "write failed"); return -1; }
+
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    zero_bytes(ino, VFS64_INODE_BYTES_MAX);
+    ino[VFS_I_TYPE] = (uint8_t)VFS64_TYPE_LINK;
+    ino[VFS_I_NAMELEN] = (uint8_t)nlen;
+    copy_bytes(ino + g_lay->name_off, (const uint8_t*)nm, nlen);
+    wr32(ino + VFS_I_PARENT, par);
+    wr32(ino + VFS_I_SIZE, tlen);
+    wr32(ino + VFS_I_D0, blk);
+    if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
+    if (g_lay->nlink_off != 0) wr16(ino + g_lay->nlink_off, 1);
+    if (g_lay->uid_off != 0) {                               // uid/gid/mode（S_IFLNK | 0777）
+        wr16(ino + g_lay->uid_off, (uint16_t)g_cred.euid);
+        wr16(ino + g_lay->gid_off, (uint16_t)g_cred.egid);
+        wr16(ino + g_lay->mode_off, (uint16_t)new_mode64(VFS64_S_IFLNK | 0777u));
+    }
+    wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
+    if (!inode_store(slot, ino)) {
+        bitmap_set(blk, false);
+        log_op_fail("symlink", "inode commit failed");
+        return -1;
+    }
+    touch_dir(par, 0);
+    dbg64_line_begin64();
+    dbg64_str("[VFS64] symlink ok target="); dbg64_str(target);
+    dbg64_str(" -> "); dbg64_str(linkpath);
+    dbg64_str(" bytes="); dbg64_dec((uint64_t)tlen);
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+
+// 读符号链接目标（**不跟随**）；返回字节数（不补 NUL），不是链接/失败返回 -1
+int vfs64_readlink64(const char* path, char* buf, int cap) {
+    if (!g_mounted || !path || !buf || cap <= 0) return -1;
+    char abuf[VFS64_PATH_MAX + 1];
+    const char* p = vfs64_alias_path64(path, abuf, (uint32_t)sizeof(abuf));
+    uint32_t idx = 0;
+    if (path_resolve_raw(p, false, &idx, nullptr, nullptr, nullptr) != 0) return -1;
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    if (!inode_load(idx, ino)) return -1;
+    if (ino[VFS_I_TYPE] != VFS64_TYPE_LINK) return -1;
+    const uint32_t n = rd32(ino + VFS_I_SIZE);
+    const uint32_t b0 = rd32(ino + VFS_I_D0);
+    if (n == 0 || n > 511u || !blk_ok_data(b0) || !blk_read(b0, g_sec)) return -1;
+    uint32_t k = 0;
+    for (; k < n && k < (uint32_t)cap; k++) buf[k] = (char)g_sec[k];
+    return (int)k;
+}
+
 int vfs64_mkdir64(const char* path) {
     if (!g_mounted) { log_op_fail("mkdir64", "not mounted"); return -1; }
     if (!path) { log_op_fail("mkdir64", "bad args"); return -1; }
@@ -3698,6 +3835,20 @@ int vfs64_selftest64() {
         step = 1;
         if (vfs64_mkdir64("/perm") != 0) ok = false;
         if (ok && vfs64_write64("/perm/f.txt", "hello", 5) != 5) ok = false;
+        // ★ v0.7.0（P1）：符号链接——建 -> readlink -> 打开时跟随（Linux 兼容的地基）
+        if (ok) {
+            if (vfs64_symlink64("/perm/f.txt", "/perm/lnk") != 0) {
+                ok = false; log_line("symlink: create FAIL");
+            } else {
+                char lb[64];
+                const int ln = vfs64_readlink64("/perm/lnk", lb, (int)sizeof(lb));
+                char rb[16];
+                const int rn = vfs64_read64("/perm/lnk", rb, (int)sizeof(rb));
+                if (ln != 11 || lb[0] != "/"[0]) { ok = false; log_line("symlink: readlink FAIL"); }
+                else if (rn != 5 || rb[0] != "h"[0]) { ok = false; log_line("symlink: follow FAIL"); }
+                else log_line("symlink: create/readlink/follow PASS");
+            }
+        }
         if (ok && (vfs64_stat64("/perm", &pinfo) != 0 || pinfo.uid != 0 || pinfo.gid != 0 ||
                    (pinfo.mode & VFS64_S_IRWX) != 0755u || (pinfo.mode & VFS64_S_IFMT) != VFS64_S_IFDIR)) {
             ok = false;

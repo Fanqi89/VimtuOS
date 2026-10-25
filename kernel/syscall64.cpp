@@ -1630,7 +1630,16 @@ static int64_t lx64_readlink64(uint64_t nr, uint64_t path_va, uint64_t buf_va, u
                        path[4] == 'c' && path[5] == '/' && path[6] == 's' && path[7] == 'e' &&
                        path[8] == 'l' && path[9] == 'f' && path[10] == '/' && path[11] == 'e' &&
                        path[12] == 'x' && path[13] == 'e' && path[14] == 0)) {
-        return -LX64_ENOENT;                              // 只有 /proc/self/exe 有值（其它如实拒绝）
+        // ★ v0.7.0（P1）：不是 /proc/self/exe -> 试 VFS 里的符号链接
+        //   Linux 语义：不是符号链接 -> EINVAL；目标比 size 长 -> 截断返回（不报错）。
+        char tgt2[LX64_PATHR_MAX];
+        const int tl = vfs64_readlink64(path, tgt2, (int)sizeof(tgt2));
+        if (tl < 0) return -LX64_EINVAL;
+        uint32_t tkc = (uint32_t)tl;
+        if (tkc > (uint32_t)size) tkc = (uint32_t)size;
+        if (!user64_range_ok64(buf_va, tkc)) { syscall64_deny64(nr, buf_va); return -LX64_EFAULT; }
+        lx64_copy_to_user64(buf_va, tgt2, (int)tkc);
+        return (int64_t)tkc;
     }
     uint32_t n = 0;
     while (exe[n] && n + 1u < (uint32_t)size) n++;
@@ -1655,6 +1664,39 @@ static int64_t lx64_fs_mutate64(uint64_t nr, uint64_t path_va, int is_mkdir) {
     __asm__ volatile("cli" ::: "memory");
     g_lx_vfs_busy64 = 0;
     return rc == 0 ? 0 : -LX64_ENOENT;
+}
+
+// ---- ★ v0.7.0（P1）：88）symlink / 86）link ----
+// 为什么 P1 先做这两个：跑真实 Linux 程序（含包管理器）时，`/usr/lib/libc.so -> libc.so.6`
+// 这种**文件级符号链接**是硬需求；而 VimtuFS2 以前只有 FILE/DIR 两种 inode 类型，建不出来。
+// 现在卷格式加了 type=3（目标字符串存第一个数据块），VFS 侧 `path_resolve` 会跟随**最后一级**
+// 符号链接（最多 8 层）——目录级别名由路径映射层负责，所以这里不需要展开中间段。
+static int64_t lx64_symlink64(uint64_t nr, uint64_t tgt_va, uint64_t link_va) {
+    char tgt[LX64_PATHR_MAX];
+    char lnk[LX64_PATHR_MAX];
+    if (lx64_user_str64(tgt_va, tgt, (uint32_t)sizeof(tgt)) != 0) { syscall64_deny64(nr, tgt_va); return -LX64_EFAULT; }
+    const int rr = lx64_resolve_path64(link_va, lnk, (uint32_t)sizeof(lnk));
+    if (rr != 0) { syscall64_deny64(nr, link_va); return rr; }
+    if (!tgt[0]) return -LX64_ENOENT;
+    if (g_lx_vfs_busy64) return -LX64_EBUSY;
+    g_lx_vfs_busy64 = 1;
+    __asm__ volatile("sti" ::: "memory");
+    const int rc = vfs64_symlink64(tgt, lnk);
+    __asm__ volatile("cli" ::: "memory");
+    g_lx_vfs_busy64 = 0;
+    return rc == 0 ? 0 : -LX64_EACCES;
+}
+
+// 86）link：VimtuFS2 的目录项**内嵌在 inode 里**（一个 inode 只有一个名字），所以不支持硬链接。
+// 如实拒绝 + 打点，不假装成功 —— 假装成功会让程序以为两个名字共享同一份内容。
+static int64_t lx64_link64(uint64_t nr, uint64_t old_va, uint64_t new_va) {
+    (void)old_va; (void)new_va;
+    dbg64_line_begin64();
+    dbg64_str("[SYSCALL] link unsupported (VimtuFS2 inode carries its own name) nr=");
+    dbg64_dec(nr);
+    dbg64_nl();
+    dbg64_line_end64();
+    return -LX64_EPERM;
 }
 
 // ==================== ★ A4-2a：工具链必需的新系统调用 ====================
@@ -2491,6 +2533,8 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 87:  return lx64_fs_mutate64(nr, a1, 0);                    // unlink：真写盘（★ A4-2a 误删过一次，已恢复）
     case 132: return lx64_utime64(nr, a1, a2);                       // ★ A4-2a：utime(132)
     case 89:  return lx64_readlink64(nr, a1, a2, a3);                // 只对 /proc/self/exe 有值
+    case 88:  return lx64_symlink64(nr, a1, a2);              // ★ v0.7.0：symlink(target, linkpath)
+    case 86:  return lx64_link64(nr, a1, a2);                 // ★ v0.7.0：硬链接不支持（如实 -EPERM）
     case 96:  return lx64_gettimeofday64(nr, a1, a2);
     case 97:  return lx64_getrlimit64(nr, a1, a2);
     case 90:  return lx64_chmod_path64(a1, a2);                     // ★ P4：chmod(path, mode)
