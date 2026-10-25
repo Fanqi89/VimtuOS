@@ -382,6 +382,7 @@ def vol_read(vol_bytes, path):
     """**独立**按卷格式把文件读回来（直接块 -> ind -> dind）。"""
     total = struct.unpack_from("<I", vol_bytes, 20)[0]
     inodes = struct.unpack_from("<I", vol_bytes, 40)[0]
+    path = TP.alias_vol_path(path)      # ★ v0.6.0 落点映射（调用方写的还是旧路径）
     parts = [p for p in path.split("/") if p]
     cur = 0
     for k, part in enumerate(parts):

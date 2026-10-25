@@ -36,6 +36,24 @@
 - **VimtuFS2 v4**：目录树、权限（uid/gid/mode）、mtime、kind
 - FAT32：只读浏览（含 VFAT 长名）+ **U 盘可写**（新建/覆盖/建目录/删除/截断 + 写后读回校验）
 - 盘符层：PATA/AHCI/NVMe 每块盘 → 分区 → fs 识别 → `C:` / `D:` …
+- **系统卷目录布局**（v0.6.0 重排：系统级集中 + Linux 分类）
+  ```
+  /                       根只留入口
+  ├── System/             ← 系统级集中（Windows 的 C:\Windows 类比）
+  │   ├── fonts/          字体（原 /Fonts + /Fonts-open）
+  │   ├── icons/          图标包（原 /etc/iconpack.bin、icon_*.bin、logo.bin）
+  │   └── themes/         wallpapers/（系统预设壁纸）、avatars/（预设头像）
+  ├── usr/
+  │   ├── bin/            程序（原 /bin，84 个）
+  │   ├── lib/            库（原 /lib；tcc 在 /usr/lib/tcc）
+  │   └── share/          demo/、www/、sounds/
+  ├── etc/  home/<用户>/Pictures/  var/vpkg/  tmp/
+  ```
+  你**自己放壁纸**的目录是 `/home/<用户>/Pictures`（开机自动建，"预设壁纸"按钮会把它和
+  `/System/themes/wallpapers` 一起枚举）；**内核**不在这棵树上 —— 它在盘上 LBA 9..8008 的裸扇区
+  （BIOS 引导读裸扇区，不认文件系统），另有一份在 ESP 分区 `EFI/BOOT/KERNEL64.BIN`。
+  旧路径（`/bin`、`/Fonts`、`/Wallpapers` 等）由内核的路径映射层自动重定向并**失败回退**，
+  所以旧脚本/旧夹具卷继续能跑。新旧盘并存：**想要新布局要重装**（旧盘里的文件还在旧位置）。
 
 ### 4. 桌面（UI）
 - 设置里的**预设壁纸/预设头像**（v0.5.16 起真能用）：按钮显示张数，点一次循环一张并立刻持久化

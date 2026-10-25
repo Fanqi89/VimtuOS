@@ -1542,8 +1542,107 @@ static int find_child(uint32_t dir, const char* name, uint32_t nlen, uint32_t* o
 //            —— 只有 want_parent=true 时才会返回 1；
 //      -1  = 非法路径 / 中间分量不存在 / 读盘失败（已打点）；
 //      -EACCES = ★ P4：某一级目录缺 x（进不去，已打 [PERM64] deny 行）。
+// ==================== ★ v0.6.0：系统卷目录重排的兼容映射 ====================
+// 真实布局（用户要求"系统级集中 + Linux 分类"）：
+//   /System/fonts/       原 /Fonts + /Fonts-open
+//   /System/icons/       原 /etc/iconpack.bin、/etc/icon_*.bin、/etc/logo.bin、逐张图标 PNG
+//   /System/themes/      wallpapers/（系统预设壁纸）、avatars/（预设头像）
+//   /usr/bin/            原 /bin（84 个程序）
+//   /usr/lib/            原 /lib（/tcc -> /usr/lib/tcc）
+//   /usr/share/          demo/（原根目录 13 个演示程序）、www/（原 /www）、sounds/（不变）
+//   /var/vpkg/           原 /opt/vpkg
+//   /etc /home /root /tmp  不变
+//
+// 语义（都有测试守着）：
+//   * 前缀项（from 以 '/' 结尾）同时匹配 "/bin" 与 "/bin/ls"；
+//   * 精确项（如 "/hello.elf"）要求整条路径相等 —— 表里顺序即优先级，长串在前；
+//   * 写路径也走映射：往 "/bin/foo" 写就是往 "/usr/bin/foo" 写；
+//   * **新路径优先，失败回退原路径**：夹具卷（自建、没有 /usr/bin）继续按旧布局工作，
+//     不然 tests/ 里几十个夹具测试会集体失败 —— 那是把测试改坏，不是修好；
+//   * 映射后超长就放弃映射（按原路径处理），不静默截断。
+static const struct { const char* from; const char* to; } kPathAlias[] = {
+    // ---- 精确项：根目录那 13 个散落演示文件 -> /usr/share/demo ----
+    { "/musl_hello.elf",  "/usr/share/demo/musl_hello.elf" },
+    { "/dynhello.elf",    "/usr/share/demo/dynhello.elf" },
+    { "/filedemo.elf",    "/usr/share/demo/filedemo.elf" },
+    { "/proc64.elf",      "/usr/share/demo/proc64.elf" },
+    { "/pipe64.elf",      "/usr/share/demo/pipe64.elf" },
+    { "/xmmsse.elf",      "/usr/share/demo/xmmsse.elf" },
+    { "/evshm.elf",       "/usr/share/demo/evshm.elf" },
+    { "/sig64.elf",       "/usr/share/demo/sig64.elf" },
+    { "/epipe.elf",       "/usr/share/demo/epipe.elf" },
+    { "/hello.vap",       "/usr/share/demo/hello.vap" },
+    { "/hello.elf",       "/usr/share/demo/hello.elf" },
+    { "/spin.elf",        "/usr/share/demo/spin.elf" },
+    { "/hello",           "/usr/share/demo/hello" },
+    // ---- 精确项：/etc 里的打包资源 -> /System/icons ----
+    { "/etc/iconpack.bin",    "/System/icons/iconpack.bin" },
+    { "/etc/icon_mypc.bin",   "/System/icons/icon_mypc.bin" },
+    { "/etc/icon_term.bin",   "/System/icons/icon_term.bin" },
+    { "/etc/icon_start.bin",  "/System/icons/icon_start.bin" },
+    { "/etc/icon_recycle.bin", "/System/icons/icon_recycle.bin" },
+    { "/etc/logo.bin",        "/System/icons/logo.bin" },
+    // ---- 前缀项（长串在前）----
+    { "/Fonts-open/",  "/System/fonts/" },
+    { "/make-demo/",   "/usr/share/demo/make-demo/" },
+    { "/opt/vpkg/",    "/var/vpkg/" },
+    { "/Fonts/",       "/System/fonts/" },
+    { "/icons/",       "/System/icons/" },
+    { "/www/",         "/usr/share/www/" },
+    { "/tcc/",         "/usr/lib/tcc/" },
+    { "/bin/",         "/usr/bin/" },
+    { "/lib/",         "/usr/lib/" },
+};
+#define K_ALIAS_N ((uint32_t)(sizeof(kPathAlias) / sizeof(kPathAlias[0])))
+
+static uint32_t alias_slen64(const char* s) { uint32_t n = 0; while (s && s[n]) n++; return n; }
+
+// path -> buf（重写后的路径）；不命中直接返回原指针（零拷贝）
+static const char* vfs64_alias_path64(const char* path, char* buf, uint32_t cap) {
+    if (!path || path[0] != '/') return path;
+    for (uint32_t a = 0; a < K_ALIAS_N; a++) {
+        const char* from = kPathAlias[a].from;
+        const char* to   = kPathAlias[a].to;
+        const uint32_t fn = alias_slen64(from);
+        uint32_t cn = fn;
+        while (cn > 0 && from[cn - 1] == '/') cn--;      // from 末尾 '/' 不参与比较
+        if (cn == 0 || cn > VFS64_PATH_MAX) continue;
+        bool hit = true;
+        for (uint32_t k = 0; k < cn; k++) if (path[k] != from[k]) { hit = false; break; }
+        if (!hit) continue;
+        if (path[cn] != 0 && path[cn] != '/') continue;   // 整段匹配（/lib 不命中 /libfoo）
+        uint32_t tn = alias_slen64(to);
+        if (path[cn] == 0) while (tn > 0 && to[tn - 1] == '/') tn--;
+        uint32_t out = 0;
+        if (tn + 1 >= cap) return path;
+        for (uint32_t k = 0; k < tn; k++) buf[out++] = to[k];
+        for (const char* s = path + cn; *s; s++) {
+            if (out + 1 >= cap) return path;
+            buf[out++] = *s;
+        }
+        buf[out] = 0;
+        return buf;
+    }
+    return path;
+}
+
+static int path_resolve_raw(const char* path, bool want_parent,
+                            uint32_t* out_ino, uint32_t* out_parent, char* out_name, uint32_t* out_nlen);
+
+// 所有 VFS 入口都从这里过：新路径优先，失败回退旧路径（旧卷 / 夹具卷继续工作）
 static int path_resolve(const char* path, bool want_parent,
                         uint32_t* out_ino, uint32_t* out_parent, char* out_name, uint32_t* out_nlen) {
+    char alias_buf[VFS64_PATH_MAX + 1];
+    const char* p = vfs64_alias_path64(path, alias_buf, (uint32_t)sizeof(alias_buf));
+    if (p != path) {
+        const int rc = path_resolve_raw(p, want_parent, out_ino, out_parent, out_name, out_nlen);
+        if (rc == 0) return 0;
+    }
+    return path_resolve_raw(path, want_parent, out_ino, out_parent, out_name, out_nlen);
+}
+
+static int path_resolve_raw(const char* path, bool want_parent,
+                            uint32_t* out_ino, uint32_t* out_parent, char* out_name, uint32_t* out_nlen) {
     if (!path) { log_path_bad("null", path); return -1; }
     uint32_t total = 0;
     while (path[total] != 0) total++;

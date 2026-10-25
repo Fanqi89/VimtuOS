@@ -369,6 +369,17 @@ static void ensure_dir64(const char* path) {
 static void ensure_user_dirs64(const User64Entry* e) {
     ensure_dir64(e->home);
     ensure_dir64(e->desktop);
+    // ★ v0.6.0：/home/<user>/Pictures —— 用户自己放壁纸/图片的地方
+    //   （系统预设壁纸已移到 /System/themes/wallpapers，那里是只读的）
+    {
+        char pics[USERDB64_PATH_MAX];
+        int i = 0;
+        for (; e->home[i] && i < USERDB64_PATH_MAX - 10; i++) pics[i] = e->home[i];
+        const char* t = "/Pictures";
+        for (int k = 0; t[k] && i < USERDB64_PATH_MAX - 1; k++) pics[i++] = t[k];
+        pics[i] = 0;
+        ensure_dir64(pics);
+    }
     apply_home_perm64(e);                                  // ★ P4：属主 = 用户、0700（默认私有）
 }
 

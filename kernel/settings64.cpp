@@ -825,14 +825,79 @@ static void preset_join64(const char* dir, const char* nm, char* out, int cap) {
     out[i] = 0;
 }
 
+// ==================== ★ v0.6.0：壁纸/头像的新落点 ====================
+// 用户要求"系统级文件集中 + 像 Linux 那样分类"，所以：
+//   系统预设壁纸 = /System/themes/wallpapers（只读，构建期打进卷）
+//   用户自己的图 = /home/<user>/Pictures（可写）—— "预设壁纸"按钮枚举**两者并集**
+//   系统预设头像 = /System/themes/avatars
+// 旧路径 /Wallpapers、/Avatars 由内核映射层指到这两个系统目录（见 kernel/vfs64.cpp 的 kPathAlias），
+// 所以旧脚本/旧习惯仍然能读到系统预设，但**新图请放 Pictures**（系统目录是只读的）。
+#define WALL_SYS_DIR64   "/System/themes/wallpapers"
+#define AVATAR_SYS_DIR64 "/System/themes/avatars"
+
+static void preset_pics_dir64(char* out, int cap) {
+    const User64Entry* u = cur_user();
+    const char* home = (u && u->home[0]) ? u->home : "/home/vimtu";
+    int i = 0;
+    for (; home[i] && i < cap - 10; i++) out[i] = home[i];
+    const char* t = "/Pictures";
+    for (int k = 0; t[k] && i < cap - 1; k++) out[i++] = t[k];
+    out[i] = 0;
+}
+
+// 两个目录的并集（a 在前；同名去重）
+static int preset_collect2(const char* a, const char* b, char names[][VFS64_NAME_MAX + 1], int max) {
+    static char tmp[PRESET_MAX][VFS64_NAME_MAX + 1];
+    int n = preset_collect64(a, names, max);
+    const int m = preset_collect64(b, tmp, PRESET_MAX);
+    for (int i = 0; i < m && n < max; i++) {
+        bool dup = false;
+        for (int k = 0; k < n; k++) if (s_eq(names[k], tmp[i])) { dup = true; break; }
+        if (dup) continue;
+        int j = 0;
+        for (; tmp[i][j] && j < (int)VFS64_NAME_MAX; j++) names[n][j] = tmp[i][j];
+        names[n][j] = 0;
+        n++;
+    }
+    return n;
+}
+
+// 名字 -> 真实路径：用户 Pictures 优先，其次系统目录
+static void preset_resolve64(const char* nm, const char* sysdir, char* out, int cap) {
+    char pic[CFG64_STR_MAX];
+    preset_pics_dir64(pic, (int)sizeof(pic));
+    preset_join64(pic, nm, out, cap);
+    Vfs64Info64 inf{};
+    if (vfs64_stat64(out, &inf) == 0) return;
+    preset_join64(sysdir, nm, out, cap);
+}
+
+// 壁纸张数（Pictures ∪ 系统预设），带与单目录同口径的诊断打点
+static int preset_count_wall64(void) {
+    static char names[PRESET_MAX][VFS64_NAME_MAX + 1];
+    char pics[CFG64_STR_MAX];
+    preset_pics_dir64(pics, (int)sizeof(pics));
+    const int n = preset_collect2(pics, WALL_SYS_DIR64, names, PRESET_MAX);
+    dbg64_line_begin64();
+    dbg64_str("[SET64] preset scan wall dirs="); dbg64_str(pics);
+    dbg64_str(" + "); dbg64_str(WALL_SYS_DIR64);
+    dbg64_str(" n="); dbg64_dec((uint64_t)n);
+    dbg64_nl();
+    dbg64_line_end64();
+    return n;
+}
+
 // 壁纸：点一次换下一张（目录为空时如实报错，不假装成功）
 static void wall_preset_cycle() {
     static char names[PRESET_MAX][VFS64_NAME_MAX + 1];
-    const int n = preset_collect64("/Wallpapers", names, PRESET_MAX);
+    char pics[CFG64_STR_MAX];
+    preset_pics_dir64(pics, (int)sizeof(pics));
+    const int n = preset_collect2(pics, WALL_SYS_DIR64, names, PRESET_MAX);
     if (n <= 0) {
-        logln("[SET64] wall preset ok=0 reason=no-presets dir=/Wallpapers");
-        msg_set(gui64_lang_zh() ? "没有任何预设壁纸（/Wallpapers 为空）"
-                                : "no preset wallpapers (/Wallpapers is empty)", tk64()->accent2);
+        logln("[SET64] wall preset ok=0 reason=no-presets dirs=Pictures+System/themes/wallpapers");
+        msg_set(gui64_lang_zh() ? "没有任何壁纸（Pictures 与 /System/themes/wallpapers 都为空）"
+                                : "no wallpapers (Pictures and /System/themes/wallpapers are empty)",
+                tk64()->accent2);
         return;
     }
     char cur[CFG64_STR_MAX];
@@ -840,7 +905,7 @@ static void wall_preset_cycle() {
     int start = 0;
     for (int i = 0; i < n; i++) {
         char p[CFG64_STR_MAX];
-        preset_join64("/Wallpapers", names[i], p, (int)sizeof(p));
+        preset_resolve64(names[i], WALL_SYS_DIR64, p, (int)sizeof(p));
         if (s_eq(cur, p)) { start = i; break; }
     }
     // ★ v0.5.16：从"当前这张的下一张"开始，最多试 n 张，**第一张真正应用成功的**生效。
@@ -850,7 +915,7 @@ static void wall_preset_cycle() {
     for (int k = 1; k <= n; k++) {
         const int idx = (start + k) % n;
         char p[CFG64_STR_MAX];
-        preset_join64("/Wallpapers", names[idx], p, (int)sizeof(p));
+        preset_resolve64(names[idx], WALL_SYS_DIR64, p, (int)sizeof(p));
         dbg64_line_begin64();
         dbg64_str("[SET64] wall preset try idx="); dbg64_dec((uint64_t)idx);
         dbg64_str("/"); dbg64_dec((uint64_t)n);
@@ -878,11 +943,11 @@ static void wall_preset_cycle() {
 // 头像：同样按 /Avatars 循环（与壁纸分目录，不再借用 /logo/kaisi.png）
 static void avatar_preset_cycle() {
     static char names[PRESET_MAX][VFS64_NAME_MAX + 1];
-    const int n = preset_collect64("/Avatars", names, PRESET_MAX);
+    const int n = preset_collect64(AVATAR_SYS_DIR64, names, PRESET_MAX);
     if (n <= 0) {
-        logln("[SET64] avatar preset ok=0 reason=no-presets dir=/Avatars");
-        msg_set(gui64_lang_zh() ? "没有任何预设头像（/Avatars 为空）"
-                                : "no preset avatars (/Avatars is empty)", tk64()->accent2);
+        logln("[SET64] avatar preset ok=0 reason=no-presets dir=/System/themes/avatars");
+        msg_set(gui64_lang_zh() ? "没有任何预设头像（/System/themes/avatars 为空）"
+                                : "no preset avatars (/System/themes/avatars is empty)", tk64()->accent2);
         return;
     }
     char cur[CFG64_STR_MAX];
@@ -890,14 +955,14 @@ static void avatar_preset_cycle() {
     int start = 0;
     for (int i = 0; i < n; i++) {
         char p[CFG64_STR_MAX];
-        preset_join64("/Avatars", names[i], p, (int)sizeof(p));
+        preset_join64(AVATAR_SYS_DIR64, names[i], p, (int)sizeof(p));
         if (s_eq(cur, p)) { start = i; break; }
     }
     g_av_n = n;
     for (int k = 1; k <= n; k++) {
         const int idx = (start + k) % n;
         char p[CFG64_STR_MAX];
-        preset_join64("/Avatars", names[idx], p, (int)sizeof(p));
+        preset_join64(AVATAR_SYS_DIR64, names[idx], p, (int)sizeof(p));
         dbg64_line_begin64();
         dbg64_str("[SET64] avatar preset try idx="); dbg64_dec((uint64_t)idx);
         dbg64_str("/"); dbg64_dec((uint64_t)n);
@@ -1838,7 +1903,7 @@ static void page_wall(const Lay* L, int x0, int y0) {
         // ★ v0.5.16：按钮文字改成真话。原来写"用 /logo/kaisi.png"，可动作早在 v0.5.8 就变成
         //   "循环 /Wallpapers" —— 用户在界面上**找不到预设壁纸**，点它还会因为过时的 JPEG 闸门
         //   永远失败。张数直接显示出来。
-        if (g_wall_n < 0) g_wall_n = preset_count64("/Wallpapers");
+        if (g_wall_n < 0) g_wall_n = preset_count_wall64();
         Buf lb; b_init(&lb);
         b_str(&lb, zh ? "预设壁纸（/Wallpapers，" : "Presets (/Wallpapers, ");
         b_int(&lb, g_wall_n);
@@ -2350,7 +2415,7 @@ static void page_avatar(const Lay* L, int x0, int y0) {
                     g_hover == CID_AVATAR_APPLY, g_press == CID_AVATAR_APPLY);
         ctl_reg(P_AVATAR, CID_AVATAR_APPLY, CK_BUTTON, rx - 120 - 10 - bw, fy, bw, fh);
         // ★ v0.5.16：文字改成真话（动作是"循环 /Avatars"，不是 /logo/kaisi.png）
-        if (g_av_n < 0) g_av_n = preset_count64("/Avatars");
+        if (g_av_n < 0) g_av_n = preset_count64(AVATAR_SYS_DIR64);
         Buf ab; b_init(&ab);
         b_str(&ab, zh ? "预设头像（" : "Presets (");
         b_int(&ab, g_av_n);

@@ -135,6 +135,61 @@ class Volume2(SV.Volume):
 # 同一套公式，本类继承 Volume2 就是为了共用），所以这里把装进来的字节覆盖回去、从位图重建
 # "已用块"集合、再按空闲 inode 槽继续分配 —— 不需要动格式里的任何一个字段定义。
 # ---------------------------------------------------------------------------
+# ==================== ★ v0.6.0：系统卷目录重排的落点映射 ====================
+# 与 kernel/vfs64.cpp 的 kPathAlias 一一对应。所有 pack 脚本都通过 VolumeEdit 写卷，
+# 所以这里做一次映射，20 多个 tools/*_pack_win.py 的字面落点**一行都不用改**。
+VOL_ALIAS = [
+    # ---- 精确项：根目录那 13 个散落演示文件 -> /usr/share/demo（与 kernel/vfs64.cpp 表一致）----
+    ("/musl_hello.elf", "/usr/share/demo/musl_hello.elf"),
+    ("/dynhello.elf",   "/usr/share/demo/dynhello.elf"),
+    ("/filedemo.elf",   "/usr/share/demo/filedemo.elf"),
+    ("/proc64.elf",     "/usr/share/demo/proc64.elf"),
+    ("/pipe64.elf",     "/usr/share/demo/pipe64.elf"),
+    ("/xmmsse.elf",     "/usr/share/demo/xmmsse.elf"),
+    ("/evshm.elf",      "/usr/share/demo/evshm.elf"),
+    ("/sig64.elf",      "/usr/share/demo/sig64.elf"),
+    ("/epipe.elf",      "/usr/share/demo/epipe.elf"),
+    ("/hello.vap",      "/usr/share/demo/hello.vap"),
+    ("/hello.elf",      "/usr/share/demo/hello.elf"),
+    ("/spin.elf",       "/usr/share/demo/spin.elf"),
+    ("/hello",          "/usr/share/demo/hello"),
+    ("/etc/iconpack.bin",     "/System/icons/iconpack.bin"),
+    ("/etc/icon_mypc.bin",    "/System/icons/icon_mypc.bin"),
+    ("/etc/icon_term.bin",    "/System/icons/icon_term.bin"),
+    ("/etc/icon_start.bin",   "/System/icons/icon_start.bin"),
+    ("/etc/icon_recycle.bin", "/System/icons/icon_recycle.bin"),
+    ("/etc/logo.bin",         "/System/icons/logo.bin"),
+    ("/Fonts-open/",          "/System/fonts/"),
+    ("/make-demo/",           "/usr/share/demo/make-demo/"),
+    ("/opt/vpkg/",            "/var/vpkg/"),
+    ("/Wallpapers/",          "/System/themes/wallpapers/"),
+    ("/Avatars/",             "/System/themes/avatars/"),
+    ("/Fonts/",               "/System/fonts/"),
+    ("/icons/",               "/System/icons/"),
+    ("/www/",                 "/usr/share/www/"),
+    ("/tcc/",                 "/usr/lib/tcc/"),
+    ("/bin/",                 "/usr/bin/"),
+    ("/lib/",                 "/usr/lib/"),
+]
+
+
+def alias_vol_path(path):
+    """旧落点 -> 新落点；不命中原样返回。"""
+    if not path or not path.startswith("/"):
+        return path
+    for frm, to in VOL_ALIAS:
+        cn = len(frm.rstrip("/"))
+        if path[:cn] != frm[:cn]:
+            continue
+        if len(path) > cn and path[cn] != "/":
+            continue
+        rest = path[cn:]
+        if not rest:
+            return to.rstrip("/")
+        return to + rest.lstrip("/") if to.endswith("/") else to + rest
+    return path
+
+
 class VolumeEdit(Volume2):
     def load(self, img):
         """把一块已存在的卷镜像装进来（几何/超级块原样保留；只重建分配器状态）。"""
@@ -161,6 +216,7 @@ class VolumeEdit(Volume2):
 
     def find_dir(self, path):
         """按路径找目录 inode（\"/\" 也认）；找不到返回 None。"""
+        path = alias_vol_path(path)      # ★ v0.6.0 落点映射
         cur = 0
         for part in [p for p in path.split("/") if p]:
             hit = None
@@ -180,6 +236,7 @@ class VolumeEdit(Volume2):
 
     def mkdirs(self, path, mode=0o755):
         """逐级建目录（已存在就复用）；返回最后一级目录的 inode。"""
+        path = alias_vol_path(path)      # ★ v0.6.0 落点映射
         cur = self.find_dir("/")
         if cur is None:
             raise ValueError("卷里没有根目录（img 不是 VimtuFS2 卷？）")
@@ -204,6 +261,7 @@ class VolumeEdit(Volume2):
 
     def put(self, path, data, mode=0o644, kind=None):
         """把 data 写到卷里 path（父目录自动建）；返回写入的 inode 号。"""
+        path = alias_vol_path(path)      # ★ v0.6.0 落点映射
         parts = [p for p in path.split("/") if p]
         if not parts:
             raise ValueError("put 的路径不能是根：%r" % path)
@@ -333,6 +391,8 @@ def verify(vol, expect_files):
     total = struct.unpack_from("<I", vol, 20)[0]
     inodes = struct.unpack_from("<I", vol, 40)[0]
     for path, want in expect_files.items():
+        # ★ v0.6.0：校验路径也走落点映射（调用方仍写旧路径 /bin/…，卷里已经在新位置）
+        path = alias_vol_path(path)
         parts = [p for p in path.split("/") if p]
         cur = 0
         for k, part in enumerate(parts):
@@ -394,7 +454,9 @@ def main():
     vol = Volume2(vol_sectors)
 
     # ---- A4-1 原有的那棵树（与 make_shellvol.py 的 build_volume 逐条一致）----
-    bin_ino = vol.mkdir("bin", parent=0, mode=0o755)
+    # ★ v0.6.0：/bin -> /usr/bin、/lib -> /usr/lib、/tcc -> /usr/lib/tcc（用户要求像 Linux 那样分类）
+    usr_ino = vol.mkdir("usr", parent=0, mode=0o755)
+    bin_ino = vol.mkdir("bin", parent=usr_ino, mode=0o755)
     etc_ino = vol.mkdir("etc", parent=0, mode=0o755)
     vol.mkdir("tmp", parent=0, mode=0o777)
     hello_text = args.hello_text.replace("\\n", "\n").encode("utf-8")
@@ -407,12 +469,12 @@ def main():
     # ---- A4-2b：/bin/tcc（装载驱动）+ /lib/tcc.bin（tcc 本体）----
     vol.write_file("tcc", bin_tcc, parent=bin_ino, mode=0o755)
     expect["/bin/tcc"] = bin_tcc
-    lib_ino = vol.mkdir("lib", parent=0, mode=0o755)
+    lib_ino = vol.mkdir("lib", parent=usr_ino, mode=0o755)
     vol.write_file("tcc.bin", tcc_bytes, parent=lib_ino, mode=0o755)
     expect["/lib/tcc.bin"] = tcc_bytes
 
     # ---- A4-2b：/tcc（libtcc1.a + 系统头 + crt/libc）----
-    tcc_ino = vol.mkdir("tcc", parent=0, mode=0o755)
+    tcc_ino = vol.mkdir("tcc", parent=lib_ino, mode=0o755)      # /usr/lib/tcc
     tcc_lib_ino = vol.mkdir("lib", parent=tcc_ino, mode=0o755)
     tcc_inc_ino = vol.mkdir("include", parent=tcc_ino, mode=0o755)
     tcc_demo_ino = vol.mkdir("demo", parent=tcc_ino, mode=0o755)
@@ -459,8 +521,11 @@ def main():
         expect["/tcc/demo/" + f] = b
     if args.hello and os.path.exists(args.hello):
         b = open(args.hello, "rb").read()
-        vol.write_file("hello", b, parent=0, mode=0o755)
-        expect["/hello"] = b
+        # ★ v0.6.0：根目录不再散落演示文件 -> /usr/share/demo/hello
+        share_ino = vol.mkdir("share", parent=usr_ino, mode=0o755)
+        demo_ino = vol.mkdir("demo", parent=share_ino, mode=0o755)
+        vol.write_file("hello", b, parent=demo_ino, mode=0o755)
+        expect["/usr/share/demo/hello"] = b
 
     vol_bytes = vol.finish()
     bad = verify(vol_bytes, expect)

@@ -115,23 +115,25 @@ def main():
     walls_builtin = src_dir(PRESETS, "wall-")
     walls_user = src_dir(USERWALL)
     v = Vol(VOL, MAIN_LBA)
-    got_av = vol_files(v, "Avatars")
-    got_wp = vol_files(v, "Wallpapers")
+    # ★ v0.6.0：目录重排后预设落在 /System/themes/{avatars,wallpapers}
+    #   （vol_files 是按父目录名匹配，所以这里传目录名本身）
+    got_av = vol_files(v, "avatars")
+    got_wp = vol_files(v, "wallpapers")
 
     print("源：build64/presets 头像 %d、内置壁纸 %d；res/wallpapers 用户壁纸 %d"
           % (len(avatars), len(walls_builtin), len(walls_user)))
-    print("卷：/Avatars %d 个、/Wallpapers %d 个（total=%d 块）"
+    print("卷：/System/themes/avatars %d 个、/System/themes/wallpapers %d 个（total=%d 块）"
           % (len(got_av), len(got_wp), v.total))
 
     # ① 头像
-    check("卷内 /Avatars 文件集合与 build64/presets/avatar-*.png 一致",
+    check("卷内 /System/themes/avatars 文件集合与 build64/presets/avatar-*.png 一致",
           set(got_av) == set(avatars), "卷=%s" % sorted(got_av))
     bad = [n for n in avatars if n in got_av and got_av[n] != avatars[n]]
     check("头像逐字节一致（%d 张）" % len(avatars), not bad, "不一致：%s" % bad)
 
     # ② 壁纸（内置 + 用户）
     want_wp = set(walls_builtin) | set(walls_user)
-    check("卷内 /Wallpapers 文件集合 = 内置 wall-*.png + res/wallpapers/*",
+    check("卷内 /System/themes/wallpapers 文件集合 = 内置 wall-*.png + res/wallpapers/*",
           set(got_wp) == want_wp,
           "缺=%s 多=%s" % (sorted(want_wp - set(got_wp)), sorted(set(got_wp) - want_wp)))
     same = [n for n in want_wp if n in got_wp and n in walls_builtin and got_wp[n] == walls_builtin[n]]

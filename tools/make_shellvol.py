@@ -41,7 +41,7 @@ VFS_VERSION = 4
 VFS_INODE_BYTES = 128
 VFS_INODES_PER_BLK = 4
 VFS_BITMAP_BLK_BITS = 4096
-VFS_MAX_INODES = 512
+VFS_MAX_INODES = 2048                                   # ★ v0.6.0：512 -> 2048（见 kernel/vfs64.h 的说明）
 VFS_DIRECT_BLOCKS = 4
 VFS_INDIRECT_PTRS = 128
 VFS_DIND_CHILDREN = 128                                  # 二级间接块里的一级间接块个数（v4；见 kernel/vfs64.h）
@@ -79,7 +79,11 @@ class Volume:
         #   代价只是少 31 个数据块（约 16 KiB / 24654 块的 0.1%）。
         #   口径说明：这只是**离线造卷工具**的容量参数，内核自己的 vfs64_format 仍按 /64；两者都只
         #   在超级块里记真实值，内核挂载时只读超级块（<= VFS_MAX_INODES 即可），互不依赖。
-        inodes = total_sectors // 32
+        # ★ v0.6.0：系统卷**直接给满**（2048），不再按 total/32 夹。原因是接下来要把图标包
+        #   （/System/icons）拆成单个 PNG、并把根目录重排成 /System + /usr/bin + /var 的布局，
+        #   512 个 inode 根本不够（实测装完只剩 108 个空闲）。
+        #   代价：inode 表 128 -> 512 扇区（+192 KB），数据区少 384 块（-192 KB），可接受。
+        inodes = VFS_MAX_INODES
         inodes = max(16, min(VFS_MAX_INODES, inodes))
         self.inodes = inodes
         self.ino_blocks = (inodes + VFS_INODES_PER_BLK - 1) // VFS_INODES_PER_BLK
@@ -426,7 +430,10 @@ def preset_avatars():
 
 def build_volume(shell_bytes, hello_text, total_sectors):
     vol = Volume(total_sectors)
-    bin_ino = vol.mkdir("bin", parent=0, mode=0o755)
+    # ★ v0.6.0：/bin -> /usr/bin（用户要求"像 Linux 那样分类"）。
+    #   注意：本文件的 Volume 类**不继承** tcc_pack_win.VolumeEdit，所以这里要显式建两级。
+    usr_ino = vol.mkdir("usr", parent=0, mode=0o755)
+    bin_ino = vol.mkdir("bin", parent=usr_ino, mode=0o755)
     etc_ino = vol.mkdir("etc", parent=0, mode=0o755)
     vol.mkdir("tmp", parent=0, mode=0o777)               # 世界可写：任何会话身份都能在里面 mkdir/写文件
     vol.write_file("shell.bin", shell_bytes, parent=bin_ino, mode=0o755)
@@ -477,14 +484,14 @@ def main():
 
     vol_sectors = args.vol_sectors if not args.disk else (args.target_sectors - PART_MAIN_LBA)
     vol_bytes = build_volume(shell_bytes, hello_text, vol_sectors)
-    expect = {"/bin/shell.bin": shell_bytes, "/etc/sh64hello.txt": hello_text}
+    expect = {"/usr/bin/shell.bin": shell_bytes, "/etc/sh64hello.txt": hello_text}
     # ★ v0.5.8：预设壁纸/头像**不在这里自检** —— 本卷不再写它们（链上传不下去），
     #   由链尾的 tools/presets_pack_win.py 追加并自带逐字节回读自检（含 dind 大图）。
     bad = verify(vol_bytes, expect)
     if bad:
         sys.stderr.write("卷自检失败：%s\n" % bad)
         return 1
-    print("    卷自检 OK：/bin/shell.bin = %d B（逐字节回读一致）/ /etc/sh64hello.txt = %d B / /tmp(0777) / 卷 %d 扇区"
+    print("    卷自检 OK：/usr/bin/shell.bin = %d B（逐字节回读一致）/ /etc/sh64hello.txt = %d B / /tmp(0777) / 卷 %d 扇区"
           % (len(shell_bytes), len(hello_text), vol_sectors))
 
     if args.vol:

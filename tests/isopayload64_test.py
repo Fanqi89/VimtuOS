@@ -165,10 +165,11 @@ def main():
           "VMYB=%s，实际 %d" % (vmyb, sys_len))
 
     # ③ 卷里两个预设目录都在，且都有图
-    for d in ("Wallpapers", "Avatars"):
+    # ★ v0.6.0：预设搬到了 /System/themes/{wallpapers,avatars}
+    for d in ("wallpapers", "avatars"):
         ch = vol_children(blob, d)
         imgs = [n for n in (ch or []) if n.lower().endswith(IMG_EXTS)]
-        check("ISO 载荷卷里有 /%s 且至少 1 张图" % d, bool(imgs),
+        check("ISO 载荷卷里有 /System/themes/%s 且至少 1 张图" % d, bool(imgs),
               "%s（共 %d 项）" % (imgs, len(ch or [])))
 
     # ④ 与 hybrid 硬盘介质（VIMTUPAY 头）一致

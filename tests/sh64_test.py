@@ -399,7 +399,9 @@ def main():
     #   内容与格式仍是逐字节比对（每个必需条目行必须**整行**出现），只去掉次序/相邻假设。
     want_ls_root = "sh64:/$ ls /\n/:\n"
     root_list = wait_listing(want_ls_root, 25)
-    want_root_entries = ["  bin/", "  etc/", "  tmp/"]
+    # ★ v0.6.0：/bin 搬到 /usr/bin（用户要求像 Linux 那样分类；根目录现在是
+    #   /System /usr /etc /home /var /tmp）。判据强度不变：仍然要求这三项都出现。
+    want_root_entries = ["  usr/", "  etc/", "  tmp/"]
     root_lines = root_list.splitlines() if root_list is not None else []
     check("ls /：逐字节（提示符 + 回显 + \"/:\" 头 + 必需条目行；条目次序无关 —— 次序由内核枚举决定）",
           root_list is not None and all(e in root_lines for e in want_root_entries),

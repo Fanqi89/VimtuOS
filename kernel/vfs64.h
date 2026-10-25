@@ -164,7 +164,13 @@
 #define VFS64_MAX_FILE_BYTES   (VFS64_MAX_FILE_BLOCKS * VFS64_BLOCK_BYTES)   // 8388608
 #define VFS64_MAX_FILE_BYTES_V2 67584u      // v2 卷（inode 没有 dind 字段）的上限：4 + 128 块
 #define VFS64_READ_CHUNK_BYTES 4096u        // ★ 推荐分块大小（上层一次读/写这么多；见 fd64/explorer）
-#define VFS64_MAX_INODES       512u         // inode 总数上限（v3/v4 格式化上限；v2 卷历史上最多 256）
+// ★ v0.6.0：512 -> 2048。512 个 inode 在装完全部交付物后只剩 108 个空闲，而"把图标包
+//   （/System/icons）拆成单个 PNG"要再多 280 个左右 —— 先放开上限，再搬目录。
+//   为什么不取 4096：inode 表大小 = inodes/4 扇区（512 -> 128、2048 -> 512、4096 -> 1024），
+//   列目录要扫全表，按 ATA PIO 实测 0.72 MB/s 折算 64KB≈89ms / 256KB≈356ms / 512KB≈730ms。
+//   2048 已留 3 倍余量（现用 404 + 图标 280 + 目录 10 ≈ 700）。
+//   旧卷（inon=512）仍然能挂：挂载只校验 inon <= VFS64_MAX_INODES。
+#define VFS64_MAX_INODES       2048u        // inode 总数上限（v3/v4 格式化上限；v2 卷历史上最多 256）
 #define VFS64_BITMAP_BLK_BITS  4096u        // 512B * 8
 #define VFS64_MIN_BLOCKS       32u          // 格式化下限（16KB 分区）
 #define VFS64_PATH_MAX         128u         // 整条路径字节上限
