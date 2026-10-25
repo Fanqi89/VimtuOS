@@ -1978,16 +1978,20 @@ static void draw_cursor(void) {
         }
         return;
     }
+    // ★ 标准箭头位图（16 行）：X = 深色描边、'.' = 白色填充、空格 = 透明。
+    //   踩过的坑：这里原先是 **19 行**，row16..18（"X......X"/"X.......X"/"X........X"）是把
+    //   row7..9 又抄了一遍 —— 于是箭头底部多出一块与三角**不相连**的白块，屏幕上就是
+    //   "鼠标箭头渲染不对/断了一截"。箭头只能到 row15 为止。
     static const char* cur[] = {
         "X          ", "XX         ", "X.X        ", "X..X       ", "X...X      ",
         "X....X     ", "X.....X    ", "X......X   ", "X.......X  ", "X........X ",
         "X.....XXXXX", "X..X..X    ", "X.X.X..X   ", "XX..X..X   ", "X....X..X  ",
-        "X.....X..X ", "X......X   ", "X.......X  ", "X........X "
+        "X.....X..X "
     };
     const uint32_t black = rgb(0, 0, 0), white = rgb(255, 255, 255);
     const int shape = mouse_get_cursor64();
     if (shape == MOUSE_CUR_ARROW || shape == MOUSE_CUR_MOVE) {
-        const int rows = 19;
+        const int rows = 16;                     // ★ v0.5.19：19 -> 16（位图只有 16 行有内容）
         for (int j = 0; j < rows; j++) {
             const char* r = cur[j];
             for (int i = 0; r[i]; i++) {

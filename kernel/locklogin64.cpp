@@ -615,14 +615,22 @@ static void cursor64(void) {
     const Theme64Tokens* t = theme64_tokens64();
     const uint32_t fill = t->highlight;        // 白箭头
     const uint32_t edge = t->text;             // 深色描边（浅色背景上也看得见）
-    for (int r = 0; r < 12; r++) {
-        const int w = (r < 7) ? (r / 2 + 1) : 3;
-        for (int i = 0; i < w; i++) putpx64(g_cur_x + i, g_cur_y + r, fill);
+    // ★ v0.5.19：换成与桌面同一张标准箭头位图（X = 描边、'.' = 填充）。
+    //   旧版按"每行宽度 (r<7 ? r/2+1 : 3)"画，得到的是上窄下宽的"锤子"，
+    //   而且只有左边和顶部有描边 —— 右侧/底部直接是白块压背景，看起来像渲染坏掉。
+    static const char* cur[] = {
+        "X          ", "XX         ", "X.X        ", "X..X       ", "X...X      ",
+        "X....X     ", "X.....X    ", "X......X   ", "X.......X  ", "X........X ",
+        "X.....XXXXX", "X..X..X    ", "X.X.X..X   ", "XX..X..X   ", "X....X..X  ",
+        "X.....X..X "
+    };
+    for (int j = 0; j < 16; j++) {
+        const char* r = cur[j];
+        for (int i = 0; r[i]; i++) {
+            if (r[i] == ' ') break;
+            putpx64(g_cur_x + i, g_cur_y + j, (r[i] == 'X') ? edge : fill);
+        }
     }
-    for (int r = 0; r < 12; r++) putpx64(g_cur_x - 1, g_cur_y + r, edge);
-    for (int i = 0; i < 4; i++) putpx64(g_cur_x + i, g_cur_y - 1, edge);
-    for (int i = 0; i < 5; i++) putpx64(g_cur_x + i, g_cur_y + 6, edge);
-    putpx64(g_cur_x + 3, g_cur_y + 11, edge);
 }
 
 // ==================== 时间 ====================
