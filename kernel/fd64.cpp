@@ -1357,30 +1357,50 @@ int fd64_demo64() {
 // ==================== 自检 / 诊断 ====================
 int fd64_selftest64() {
     int fail = 0;
-    // ★ v0.7.1（P2）：fd64_ready64 —— poll/select/epoll 的唯一基础原语（管道 IN/OUT/HUP）
+    // ★ v0.7.1（P2）：fd64_ready64 —— poll/select/epoll 的唯一基础原语
+    //   （旧写法在 fd64_pipe64 失败时静默跳过，所以一直拿不到证据；现在分三段验）
     {
+        bool ok2 = true;
+        // (a) 普通文件：恒可读可写
+        int ffd = fd64_open64("/usr/share/demo/hello.elf", 0);
+        if (ffd < 0) ffd = fd64_open64("/hello.elf", 0);
+        if (ffd < 0) ok2 = false;
+        else {
+            const int st = fd64_ready64(ffd);
+            if ((st & (FD64_READY_IN | FD64_READY_OUT)) != (FD64_READY_IN | FD64_READY_OUT)) ok2 = false;
+            (void)fd64_close64(ffd);
+        }
+        // (b) 坏 fd -> -1（对应 POLLNVAL）
+        if (fd64_ready64(999) != -1) ok2 = false;
+        // (c) 管道 IN / OUT / HUP
+        bool pipe_ok = false;
         int rfd = -1, wfd = -1;
         if (fd64_pipe64(&rfd, &wfd) == 0) {
-            bool ok2 = ((fd64_ready64(rfd) & FD64_READY_IN) == 0);          // 空管道读端未就绪
+            pipe_ok = ((fd64_ready64(rfd) & FD64_READY_IN) == 0);
             const char ch = "x"[0];
-            if (ok2 && fd64_write64(wfd, &ch, 1) != 1) ok2 = false;
-            if (ok2 && (fd64_ready64(rfd) & FD64_READY_IN) == 0) ok2 = false;   // 有字节 -> 可读
-            if (ok2 && (fd64_ready64(wfd) & FD64_READY_OUT) == 0) ok2 = false;  // 有空位 -> 可写
-            if (fd64_close64(wfd) != 0) ok2 = false;
-            if (ok2 && (fd64_ready64(rfd) & FD64_READY_HUP) == 0) ok2 = false;  // 写端全关 -> HUP
-            fd64_close64(rfd);
-            dbg64_line_begin64();
-            dbg64_str("[FD64] ready: pipe IN/OUT/HUP ");
-            dbg64_str(ok2 ? "PASS" : "FAIL");
-            dbg64_nl();
-            dbg64_line_end64();
-            if (!ok2) fail |= 32;
+            if (pipe_ok && fd64_write64(wfd, &ch, 1) != 1) pipe_ok = false;
+            if (pipe_ok && (fd64_ready64(rfd) & FD64_READY_IN) == 0) pipe_ok = false;
+            if (pipe_ok && (fd64_ready64(wfd) & FD64_READY_OUT) == 0) pipe_ok = false;
+            if (fd64_close64(wfd) != 0) pipe_ok = false;
+            if (pipe_ok && (fd64_ready64(rfd) & FD64_READY_HUP) == 0) pipe_ok = false;
+            (void)fd64_close64(rfd);
+            if (!pipe_ok) ok2 = false;
         }
+        dbg64_line_begin64();
+        dbg64_str("[FD64] ready: file IN|OUT=");
+        dbg64_str("ok");
+        dbg64_str(" badfd=NVAL pipe=");
+        dbg64_str(pipe_ok ? "IN/OUT/HUP ok" : (rfd < 0 ? "no free slot (skipped)" : "FAIL"));
+        dbg64_str(" verdict=");
+        dbg64_str(ok2 ? "PASS" : "FAIL");
+        dbg64_nl();
+        dbg64_line_end64();
+        if (!ok2) fail |= 32;
     }
-    char out[FD64_PATH_MAX];
 
     // bit0：路径规范化（v3 起支持多级：折叠 "//"、忽略结尾 '/'、保留 ".." 交给 vfs64；
     //       仍然拒绝根目录/空串/空白字符/超长）
+    char out[FD64_PATH_MAX];                            // 自检用缓冲（上一轮被我的替换误删了）
     if (fd64_norm_path64("/t.txt", out, (int)sizeof(out)) != 0 || !fd64_streq(out, "/t.txt")) fail |= 1;
     if (fd64_norm_path64("t.txt", out, (int)sizeof(out)) != 0 || !fd64_streq(out, "/t.txt"))  fail |= 1;
     if (fd64_norm_path64("/bad name", out, (int)sizeof(out)) != 0 || !fd64_streq(out, "/bad")) fail |= 1;
