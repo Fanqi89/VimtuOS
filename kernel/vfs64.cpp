@@ -29,6 +29,7 @@
 #include "ata64.h"
 #include "x86_64.h"          // rtc_get_date64 / rtc_get_time64（mtime 用）
 #include "part64.h"          // 只读常量（PART_MAIN_LBA / PartInfo）；**不调用** part64 的函数
+#include "fd64.h"            // ★ v0.7.1（P2）：fd64_ready64（poll/select 的就绪判断）自检用
 
 __attribute__((weak)) bool ata64_read (int drive, uint32_t lba, uint32_t count, void* buf);
 __attribute__((weak)) bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf);
@@ -3847,6 +3848,39 @@ int vfs64_selftest64() {
                 if (ln != 11 || lb[0] != "/"[0]) { ok = false; log_line("symlink: readlink FAIL"); }
                 else if (rn != 5 || rb[0] != "h"[0]) { ok = false; log_line("symlink: follow FAIL"); }
                 else log_line("symlink: create/readlink/follow PASS");
+        // ★ v0.7.1（P2）：fd 就绪判断（poll/select/epoll 的基础）——放在 fake 盘自检里，
+        //   因为它一定会执行（不依赖桌面启动路径，也不会被 ring3 演示的崩溃挡住）。
+        if (ok) {
+            bool rok = true;
+            int ffd = fd64_open64("/perm/f.txt", 0);
+            if (ffd < 0) rok = false;
+            else {
+                const int st = fd64_ready64(ffd);
+                if ((st & (FD64_READY_IN | FD64_READY_OUT)) != (FD64_READY_IN | FD64_READY_OUT)) rok = false;
+                (void)fd64_close64(ffd);
+            }
+            if (fd64_ready64(999) != -1) rok = false;              // 坏 fd -> POLLNVAL
+            bool pok = false;
+            int prfd = -1, pwfd = -1;
+            if (fd64_pipe64(&prfd, &pwfd) == 0) {
+                pok = ((fd64_ready64(prfd) & FD64_READY_IN) == 0);
+                const char ch = "z"[0];
+                if (pok && fd64_write64(pwfd, &ch, 1) != 1) pok = false;
+                if (pok && (fd64_ready64(prfd) & FD64_READY_IN) == 0) pok = false;
+                if (pok && (fd64_ready64(pwfd) & FD64_READY_OUT) == 0) pok = false;
+                if (fd64_close64(pwfd) != 0) pok = false;
+                if (pok && (fd64_ready64(prfd) & FD64_READY_HUP) == 0) pok = false;
+                (void)fd64_close64(prfd);
+            }
+            dbg64_line_begin64();
+            dbg64_str("[VFS64] poll-ready: file=");
+            dbg64_str(rok ? "IN|OUT ok" : "FAIL");
+            dbg64_str(" badfd=NVAL pipe=");
+            dbg64_str(pok ? "IN/OUT/HUP ok" : (prfd < 0 ? "no-slot" : "FAIL"));
+            if (!rok) ok = false;
+            dbg64_nl();
+            dbg64_line_end64();
+        }
             }
         }
         if (ok && (vfs64_stat64("/perm", &pinfo) != 0 || pinfo.uid != 0 || pinfo.gid != 0 ||
