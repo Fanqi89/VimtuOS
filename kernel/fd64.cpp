@@ -1355,6 +1355,122 @@ int fd64_demo64() {
 }
 
 // ==================== 自检 / 诊断 ====================
+// ★ v0.7.3：epoll/poll 的轮询睡眠与时间基准（fd64.cpp 原本没有这两样）
+extern "C" void task_sleep_ms64(uint32_t ms) __attribute__((weak));
+extern volatile uint64_t g_ticks64;                          // PIT tick（syscall64.cpp 里定义）
+#ifndef PIT_HZ_64
+#define PIT_HZ_64 250u
+#endif
+static void fd64_sleep_1ms64(void) {
+    if (task_sleep_ms64) task_sleep_ms64(1);
+    else {
+        const uint64_t until = g_ticks64 + 1;
+        uint64_t g = 0;
+        while (g_ticks64 < until && ++g < 200000u) __asm__ volatile("hlt");
+    }
+}
+
+// ==================== ★ v0.7.3（P2 第二批）：epoll ====================
+// 语义按 Linux：ADD/DEL/MOD + wait 返回就绪事件（events 只报"关心位 | ERR | HUP"）。
+// 等待同样是**轮询式**（本内核没有等待队列）：每 1 ms 重扫一遍自己的兴趣集，有就绪就返回。
+// 边界（如实）：handle 不进 fd 表（= FD64_EPOLL_BASE + idx），所以不能把 epoll fd 再塞进 poll/select；
+//   单个实例最多 16 个兴趣 fd、同时最多 8 个实例。
+struct EpItem64 { int32_t fd; uint32_t events; uint64_t data; };
+struct Ep64 { uint8_t used; uint8_t n; EpItem64 it[FD64_EP_ITEMS]; };
+static Ep64 g_eps[FD64_EP_MAX];
+
+static Ep64* ep_of64(int ep) {
+    const int i = ep - FD64_EPOLL_BASE;
+    if (i < 0 || i >= FD64_EP_MAX) return nullptr;
+    if (!g_eps[i].used) return nullptr;
+    return &g_eps[i];
+}
+
+int fd64_epoll_create64(void) {
+    for (int i = 0; i < FD64_EP_MAX; i++) {
+        if (g_eps[i].used) continue;
+        g_eps[i].used = 1;
+        g_eps[i].n = 0;
+        for (int k = 0; k < FD64_EP_ITEMS; k++) { g_eps[i].it[k].fd = -1; g_eps[i].it[k].events = 0; g_eps[i].it[k].data = 0; }
+        dbg64_line_begin64();
+        dbg64_str("[FD64] epoll create ep="); dbg64_dec((uint64_t)(FD64_EPOLL_BASE + i));
+        dbg64_nl();
+        dbg64_line_end64();
+        return FD64_EPOLL_BASE + i;
+    }
+    return -1;                                              // 实例用尽
+}
+
+int fd64_epoll_ctl64(int ep, int op, int fd, uint32_t events, uint64_t data) {
+    Ep64* e = ep_of64(ep);
+    if (!e) return -1;
+    if (fd < 0) return -1;
+    int slot = -1;
+    for (int k = 0; k < (int)e->n; k++) if (e->it[k].fd == fd) { slot = k; break; }
+    if (op == 1) {                                          // ADD
+        if (slot >= 0) return -1;                           // EEXIST
+        if (e->n >= FD64_EP_ITEMS) return -1;               // 兴趣集满（有界，如实拒绝）
+        slot = e->n++;
+        e->it[slot].fd = fd;
+        e->it[slot].events = events;
+        e->it[slot].data = data;
+        return 0;
+    }
+    if (op == 2) {                                          // DEL
+        if (slot < 0) return -1;                            // ENOENT
+        for (int k = slot; k + 1 < (int)e->n; k++) e->it[k] = e->it[k + 1];
+        e->n--;
+        e->it[e->n].fd = -1;
+        return 0;
+    }
+    if (op == 3) {                                          // MOD
+        if (slot < 0) return -1;
+        e->it[slot].events = events;
+        e->it[slot].data = data;
+        return 0;
+    }
+    return -1;                                              // EINVAL
+}
+
+int fd64_epoll_wait64(int ep, uint32_t* ev_out, uint64_t* data_out, int max, uint64_t timeout_ms) {
+    Ep64* e = ep_of64(ep);
+    if (!e || !ev_out || !data_out || max <= 0) return -1;
+    const uint64_t t0 = g_ticks64;
+    for (;;) {
+        int cnt = 0;
+        for (int k = 0; k < (int)e->n && cnt < max; k++) {
+            const int st = fd64_ready64((int)e->it[k].fd);
+            uint32_t ev = 0;
+            if (st < 0) ev = 0x0008u;                       // EPOLLERR
+            else {
+                if (st & FD64_READY_IN)  ev |= 0x0001u;     // EPOLLIN
+                if (st & FD64_READY_OUT) ev |= 0x0004u;     // EPOLLOUT
+                if (st & FD64_READY_HUP) ev |= 0x0010u;     // EPOLLHUP
+            }
+            ev &= (e->it[k].events | 0x0018u);              // 只报"关心的 | ERR | HUP"
+            if (!ev) continue;
+            ev_out[cnt] = ev;
+            data_out[cnt] = e->it[k].data;
+            cnt++;
+        }
+        if (cnt) return cnt;
+        if (timeout_ms == 0) return 0;
+        if (timeout_ms != 0xFFFFFFFFull) {
+            const uint64_t el = (g_ticks64 - t0) * 1000u / PIT_HZ_64;
+            if (el >= timeout_ms) return 0;
+        }
+        fd64_sleep_1ms64();
+    }
+}
+
+int fd64_epoll_close64(int ep) {
+    Ep64* e = ep_of64(ep);
+    if (!e) return -1;
+    e->used = 0;
+    e->n = 0;
+    return 0;
+}
+
 int fd64_selftest64() {
     int fail = 0;
     // ★ v0.7.1（P2）：fd64_ready64 —— poll/select/epoll 的唯一基础原语

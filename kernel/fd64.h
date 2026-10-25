@@ -197,6 +197,20 @@ int fd64_dup_into64(FdTable64* dst, int srcfd, int newfd);
 #define FD64_READY_OUT  2
 #define FD64_READY_HUP  4
 int fd64_ready64(int fd);
+
+// ★ v0.7.3（P2 第二批）：epoll —— Linux 的 epoll_create1/ctl/wait。
+//   放在 FD 层（不是 syscall 层）是为了让 VFS 自检能直接验证（syscall 层实现是 static）。
+//   handle = 1000 + 实例下标（Linux 的 fd 只是句柄；它不进 fd 表，所以 poll(epfd) 会用不到，
+//   如实记录为边界）。op：1=ADD 2=DEL 3=MOD。
+#define FD64_EP_MAX     8
+#define FD64_EP_ITEMS   16
+#define FD64_EPOLL_BASE 1000
+int fd64_epoll_create64(void);
+int fd64_epoll_ctl64(int ep, int op, int fd, uint32_t events, uint64_t data);
+// 返回就绪条数；ev_out/data_out 由调用方给（容量 max）
+int fd64_epoll_wait64(int ep, uint32_t* ev_out, uint64_t* data_out, int max, uint64_t timeout_ms);
+int fd64_epoll_close64(int ep);
+
 int fd64_slot_used64(int fd);
 // 1 = 当前表的槽 fd 绑的是"控制台 tty"对象（ioctl 认 TIOCGWINSZ/TCGETS/TCSETS）。
 int fd64_slot_is_tty64(int fd);

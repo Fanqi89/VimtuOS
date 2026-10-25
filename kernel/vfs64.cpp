@@ -3877,6 +3877,29 @@ int vfs64_selftest64() {
             dbg64_str(rok ? "IN|OUT ok" : "FAIL");
             dbg64_str(" badfd=NVAL pipe=");
             dbg64_str(pok ? "IN/OUT/HUP ok" : (prfd < 0 ? "no-slot" : "FAIL"));
+            // ★ v0.7.3：epoll —— 建实例 -> 注册 pipe 读端 -> 写 1 字节 -> wait 必须得到 1 条 EPOLLIN + data
+            bool eok = true;
+            const int ep = fd64_epoll_create64();
+            int erfd = -1, ewfd = -1;
+            if (ep <= 0) eok = false;
+            if (eok && fd64_pipe64(&erfd, &ewfd) != 0) eok = false;
+            if (eok && fd64_epoll_ctl64(ep, 1, erfd, 0x0001u, 0xAABBCCDDull) != 0) eok = false;
+            if (eok) {
+                const char zz = "q"[0];
+                if (fd64_write64(ewfd, &zz, 1) != 1) eok = false;
+            }
+            if (eok) {
+                uint32_t evs[4];
+                uint64_t ds[4];
+                const int nn = fd64_epoll_wait64(ep, evs, ds, 4, 50);
+                if (nn != 1 || (evs[0] & 0x0001u) == 0 || ds[0] != 0xAABBCCDDull) eok = false;
+            }
+            if (erfd >= 0) (void)fd64_close64(erfd);
+            if (ewfd >= 0) (void)fd64_close64(ewfd);
+            if (ep > 0) (void)fd64_epoll_close64(ep);
+            if (!eok) ok = false;
+            dbg64_str(" epoll=");
+            dbg64_str(eok ? "IN+data ok" : "FAIL");
             if (!rok) ok = false;
             dbg64_nl();
             dbg64_line_end64();

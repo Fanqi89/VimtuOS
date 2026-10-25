@@ -2037,6 +2037,45 @@ static int64_t lx64_select64(uint64_t nr, uint64_t nfds, uint64_t rd_va, uint64_
     return r;
 }
 
+// ---- \u2605 v0.7.3\uff08P2 \u7b2c\u4e8c\u6279\uff09\uff1a291 epoll_create1 / 233 epoll_ctl / 232 epoll_wait ----
+// struct epoll_event \u5728 x86_64 \u4e0a\u662f **packed 12 \u5b57\u8282**\uff08uint32 events + uint64 data\uff09\uff0c
+// \u6240\u4ee5\u8fd9\u91cc\u6309\u5b57\u8282\u624b\u5199\u5e8f\u5217\u5316\uff0c\u4e0d\u80fd\u76f4\u63a5\u7528\u7ed3\u6784\u4f53\u8d4b\u503c\uff08\u4f1a\u5bf9\u9f50\u5230 16 \u5b57\u8282\uff09\u3002
+static int64_t lx64_epoll_create1_64(uint64_t nr, uint64_t flags) {
+    (void)nr; (void)flags;
+    const int ep = fd64_epoll_create64();
+    if (ep < 0) return -24;                                   // -EMFILE\uff08\u5b9e\u4f8b\u7528\u5c3d\uff09
+    return (int64_t)ep;
+}
+
+static int64_t lx64_epoll_ctl_64(uint64_t nr, uint64_t ep, uint64_t op, uint64_t fd, uint64_t ev_va) {
+    uint32_t events = 0;
+    uint64_t data = 0;
+    if (ev_va) {
+        if (!user64_range_ok64(ev_va, 12)) { syscall64_deny64(nr, ev_va); return -LX64_EFAULT; }
+        const uint8_t* p = (const uint8_t*)(uintptr_t)ev_va;
+        for (int i = 0; i < 4; i++) events |= (uint32_t)p[i] << (8 * i);
+        for (int i = 0; i < 8; i++) data |= (uint64_t)p[4 + i] << (8 * i);
+    }
+    const int rc = fd64_epoll_ctl64((int)ep, (int)op, (int)fd, events, data);
+    return rc == 0 ? 0 : -LX64_EINVAL;
+}
+
+static int64_t lx64_epoll_wait_64(uint64_t nr, uint64_t ep, uint64_t ev_va, uint64_t maxev, uint64_t timeout_ms) {
+    if (maxev == 0 || maxev > FD64_EP_ITEMS) return -LX64_EINVAL;
+    if (!user64_range_ok64(ev_va, maxev * 12)) { syscall64_deny64(nr, ev_va); return -LX64_EFAULT; }
+    uint32_t evs[FD64_EP_ITEMS];
+    uint64_t ds[FD64_EP_ITEMS];
+    const int n = fd64_epoll_wait64((int)ep, evs, ds, (int)maxev, timeout_ms);
+    if (n < 0) return -LX64_EINVAL;
+    uint8_t* p = (uint8_t*)(uintptr_t)ev_va;
+    for (int k = 0; k < n; k++) {
+        uint8_t* q = p + (uint32_t)k * 12u;
+        for (int i = 0; i < 4; i++) q[i] = (uint8_t)(evs[k] >> (8 * i));
+        for (int i = 0; i < 8; i++) q[4 + i] = (uint8_t)(ds[k] >> (8 * i));
+    }
+    return n;
+}
+
 // ---- 202）futex(uaddr, op, val, timeout, uaddr2, val3) ----
 static int64_t lx64_futex64(uint64_t nr, uint64_t uaddr, uint64_t op, uint64_t val,
                             uint64_t timeout_va, uint64_t uaddr2, uint64_t val3) {
@@ -2696,6 +2735,9 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 7:   return lx64_poll64(nr, a1, a2, a3);                  // ★ v0.7.1：poll(fds,nfds,ms)
     case 23:  return lx64_select64(nr, a1, a2, a3, a4, a5);        // ★ v0.7.1：select（nfds<=64）
     case 202: return lx64_futex64(nr, a1, a2, a3, a4, a5, a6);     // ★ v0.7.1：futex（轮询式等待）
+    case 232: return lx64_epoll_wait_64(nr, a1, a2, a3, a4);      // ★ v0.7.3：epoll_wait
+    case 233: return lx64_epoll_ctl_64(nr, a1, a2, a3, a4);       // ★ v0.7.3：epoll_ctl(ADD/DEL/MOD)
+    case 291: return lx64_epoll_create1_64(nr, a1);              // ★ v0.7.3：epoll_create1
     case 270: return lx64_ppoll64(nr, a1, a2, a3, a4, a5);         // ★ v0.7.1：pselect6 ≈ ppoll（忽略 sigmask）
     case 271: return lx64_ppoll64(nr, a1, a2, a3, a4, a5);         // ★ v0.7.1：ppoll
     case 37:  return lx64_alarm64(a1);                              // 只记录，不投递 SIGALRM
