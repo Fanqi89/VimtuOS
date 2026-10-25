@@ -39,7 +39,14 @@ XORRISO_CANDIDATES = [
 ]
 
 KERNEL_CD_BYTES = 8000 * 512          # loader 固定读 4MB（KERNEL_SECTORS 个 512B 扇区）
-PAYLOAD_SECTORS = 8073                # 系统镜像扇区数（512B 单位）
+PAYLOAD_SECTORS = 8073                # ★ 仅历史默认值，**不再作为回填值**：
+#   真值一律按 /SYSTEM/SYSTEM.IMG 的实际字节数推导（见下面 vmss 那处）。
+#   踩过的坑（v0.5.18 修）：v0.5.11 把数据分区并进 system.img 后，载荷从 8073 扇区长到
+#   32768 扇区，但这个常量没跟着改 -> 回填进引导桩的 VMSS 仍是 8073 -> loader64 只从光盘
+#   读 4.13MB -> 安装器也只拷 4.13MB -> 目标盘卷从 LBA 8009 起只有 64 扇区有效，
+#   inode 表后段全丢（/Wallpapers、/Avatars、链尾打包的一切）。
+#   为什么一直没被发现：hybrid 硬盘介质（vimtu64-64.img）走的是 payload_embed_win.py 写的
+#   VIMTUPAY 头（扇区数正确），只有 ISO 光盘引导这条路读 VMSS。
 BOOT_LOAD_SECTORS = 4                 # El Torito 引导镜像占几个 512B 扇区（桩 1536B → 3，取 4）
 
 # ==================== v0.5.6：层级式目录结构 ====================
@@ -540,7 +547,16 @@ def main():
         patch_dword(img, b"VMLB", loader_size, "loader 字节数")
         patch_dword(img, b"VMKN", kl, "光盘：内核起始扇区")
         patch_dword(img, b"VMSY", sl, "光盘：载荷起始扇区")
-        patch_dword(img, b"VMSS", PAYLOAD_SECTORS, "载荷扇区数")
+        # ★ v0.5.18：载荷扇区数按**真实文件大小**回填（旧版用硬编码 PAYLOAD_SECTORS=8073）。
+        #   两个引导桩都读 [0x0F10]：loader64 用它决定从光盘读多少到 0x04000000，
+        #   安装器用它决定把多少扇区拷进目标盘。少一个字节就是"装出来的系统缺文件"。
+        if payload_bytes % 512:
+            sys.stderr.write("ERROR: SYSTEM.IMG 字节数 %d 不是 512 的整数倍\n" % payload_bytes)
+            raise SystemExit(1)
+        vmss = payload_bytes // 512
+        if vmss != PAYLOAD_SECTORS:
+            print("     载荷扇区数 %d（历史常量 %d 已过时，按真实大小回填）" % (vmss, PAYLOAD_SECTORS))
+        patch_dword(img, b"VMSS", vmss, "载荷扇区数")
         # 硬盘/U 盘路径（512B 单位 = 2048B 单位 × 4）
         patch_dword(img, b"VML9", ll * 4, "硬盘：loader 起始扇区")
         patch_dword(img, b"VMK9", kl * 4, "硬盘：内核起始扇区")

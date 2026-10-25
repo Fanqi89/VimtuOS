@@ -794,9 +794,27 @@ static int preset_collect64(const char* dir, char names[][VFS64_NAME_MAX + 1], i
 // 为什么缓存：preset_collect64 是逐条 vfs64_list64，放在每帧绘制里会把帧时间拖长。
 static int g_wall_n = -1;
 static int g_av_n   = -1;
+// ★ 让这两个缓存**可以被作废**：旧版只在第一次绘制设置页时数一次，之后永远用缓存值 ——
+//   要是那一刻系统卷还没挂上（或枚举临时失败），界面就永久显示 "0 张"，没有任何自愈路径。
+//   现在每次进入/切换设置页都重数（见 draw_settings 里的 view page 去重块）。
+static void preset_invalidate64() { g_wall_n = -1; g_av_n = -1; }
 static int preset_count64(const char* dir) {
     static char names[PRESET_MAX][VFS64_NAME_MAX + 1];
-    return preset_collect64(dir, names, PRESET_MAX);
+    const int n = preset_collect64(dir, names, PRESET_MAX);
+    // 打点：只在真扫描时写（缓存命中不走这里）。用户报 "/Wallpapers, 0 张" 时，
+    // 这一行能一眼区分 "目录不存在 / 不是目录 / 里面没有图片" 三种情况。
+    const char* why = "ok";
+    Vfs64Info64 inf{};
+    if (vfs64_stat64(dir, &inf) != 0) why = "dir-missing";
+    else if (inf.type != VFS64_TYPE_DIR) why = "not-a-dir";
+    else if (n == 0) why = "no-images";
+    dbg64_line_begin64();
+    dbg64_str("[SET64] preset scan dir="); dbg64_str(dir);
+    dbg64_str(" n="); dbg64_dec((uint64_t)n);
+    dbg64_str(" verdict="); dbg64_str(why);
+    dbg64_nl();
+    dbg64_line_end64();
+    return n;
 }
 
 static void preset_join64(const char* dir, const char* nm, char* out, int cap) {
@@ -2787,6 +2805,7 @@ static void set_draw(Window* w) {
         static int vp = -1, vx = -1, vy = -1, vw = -1, vh = -1;
         if (vp != g_page || vx != ax || vy != y0 || vw != aw || vh != ch) {
             vp = g_page; vx = ax; vy = y0; vw = aw; vh = ch;
+            preset_invalidate64();      // ★ 进入/切换设置页 -> 重数预设壁纸/头像张数
             dbg64_line_begin64();
             dbg64_str("[SET64] view page="); dbg64_dec((uint64_t)g_page);
             dbg64_str(" name="); dbg64_str(kPages[g_page].key);

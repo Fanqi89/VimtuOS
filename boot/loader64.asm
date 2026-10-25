@@ -1399,7 +1399,8 @@ lm64_in64:
     ; PACKET 命令当场回 ABRT（实测 st=0x41 / err=0x04）。loader 里的 ATAPI 通路
     ; 已经证明能连续读 4MB，所以载荷也走它，安装程序只做"内存 -> 目标盘"。
     ; （loader 有 4096 字节硬上限，这里不打印额外消息；进度点由 atapi64_read 打）
-    movzx eax, word [0x0F10]        ; 载荷扇区数（512B 单位）
+    mov eax, dword [0x0F10]         ; 载荷扇区数（512B 单位）
+                                    ; ★ v0.5.18：原先是 movzx eax, word —— 载荷 >= 32MiB 截断
     add eax, 3
     shr eax, 2                      ; 换算成光盘扇区（2048B）并向上取整
     mov ebx, eax

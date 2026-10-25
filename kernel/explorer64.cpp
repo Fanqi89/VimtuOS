@@ -2100,7 +2100,6 @@ static void exp_open_item(int i) {
 //      （外壳的约定：fb_* 用屏幕绝对坐标；见 kernel/gui64.h 的"窗口内容绘制约定"）。----
 static void frect(int x, int y, int w, int h, uint32_t c) { fb_fill_rect(g_ox + x, g_oy + y, w, h, c); }
 static void drect(int x, int y, int w, int h, uint32_t c) { fb_draw_rect(g_ox + x, g_oy + y, w, h, c); }
-static void vline(int x, int y, int h, uint32_t c) { fb_draw_vline(g_ox + x, g_oy + y, h, c); }
 static void px(int x, int y, uint32_t c) { fb_putpixel(g_ox + x, g_oy + y, c); }
 static void txt(int x, int y, const char* s, uint32_t c) { text(g_ox + x, g_oy + y, s, c); }
 static void txt_clip(int x, int y, const char* s, uint32_t c, int maxw) { text_clip(g_ox + x, g_oy + y, s, c, maxw); }
@@ -2256,8 +2255,17 @@ static void draw_item_icon(int x, int y, const Fs64Dirent64* d) {
     } else if (d->kind == VFS64_KIND_VAP) {                // VAP64：蓝方块 + 播放三角
         frect(x + 2, y + 3, s - 4, s - 6, rgb(0, 120, 215));
         drect(x + 2, y + 3, s - 4, s - 6, rgb(0, 80, 150));
-        for (int i = 0; i < 10; i++)
-            vline(x + 12 + i, y + 12 - i / 2, 1 + i, rgb(255, 255, 255));
+        // ★ 修复：旧版用 vline 逐列拼"播放三角"，但每列的起点和长度**同向增长**
+        //   （top = 12 - i/2 越来越靠上、len = 1 + i 同时越来越长）-> 右端被钉在 x+19 一条竖边、
+        //   左端收成尖，实测画出来是"左尖右平"的反向色块，屏幕上就像一个画歪的鼠标箭头。
+        //   改成逐行画水平线：左竖边对齐、宽度按到中线的距离收窄 -> 真正的实心 ▶。
+        {
+            const int th = 14;                 // 三角高（= 宽），在 32px 图标里居中
+            for (int j = 0; j < th; j++) {
+                const int d = (j < th / 2) ? (th / 2 - 1 - j) : (j - th / 2);
+                frect(x + 9, y + 9 + j, th - 2 * d, 1, rgb(255, 255, 255));
+            }
+        }
     } else if (d->kind == VFS64_KIND_ELF) {                // ELF64：绿方块 + ">_"
         frect(x + 2, y + 3, s - 4, s - 6, rgb(40, 150, 90));
         drect(x + 2, y + 3, s - 4, s - 6, rgb(24, 100, 60));

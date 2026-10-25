@@ -176,8 +176,7 @@ start:
     mov word [0x0F06], 0
     mov dword [0x0F08], HIGH_KERNEL
     mov dword [0x0F0C], HIGH_PAYLOAD
-    mov ax, [vmss_val]
-    movzx eax, ax
+    mov eax, [vmss_val]             ; ★ v0.5.18：原先是 movzx eax, word —— 载荷 >= 32MiB 会被截断
     mov [0x0F10], eax
     mov dword [0x0F14], 0
 
@@ -422,7 +421,8 @@ vmkn_val:   dd 0
 vmsy_lba:   db "VMSY"               ; 光盘：载荷起始扇区
 vmsy_val:   dd 0
 vmss_secs:  db "VMSS"               ; 载荷扇区数（512B 单位）
-vmss_val:   dd 8073
+vmss_val:   dd 8073                 ; ★ 只是默认值：构建期由 make_iso64.py 按 SYSTEM.IMG 真实大小回填
+                                    ;   （v0.5.18 起是 32768，不是 8073 —— 详见 make_iso64.py 的注释）
 vml9_lba:   db "VML9"               ; 硬盘：loader 起始扇区（512B 单位）
 vml9_val:   dd 0
 vmk9_lba:   db "VMK9"               ; 硬盘：内核起始扇区（512B 单位）
