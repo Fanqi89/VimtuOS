@@ -187,6 +187,31 @@ static OpenFile64* fd64_slot_obj64(const FdTable64* t, int fd) {
     if (fd < 0 || fd >= (int)FD64_MAX) return nullptr;
     return t->slot[fd];
 }
+// ★ v0.7.1（P2）：就绪查询（poll/select/epoll 的基础）——实现放在这里是因为它要用
+//   fd64_slot_obj64 与 Pipe64 的内部字段（n / writers / readers），别处看不到。
+int fd64_ready64(int fd) {
+    FdTable64* t = fd64_current_table64();
+    OpenFile64* of = fd64_slot_obj64(t, fd);
+    if (!of) return -1;
+    if (of->kind == FD64_KIND_PIPE_R) {
+        Pipe64* p = of->pipe;
+        if (!p) return -1;
+        int r = 0;
+        if (p->n > 0) r |= FD64_READY_IN;
+        if (p->writers == 0) r |= FD64_READY_IN | FD64_READY_HUP;    // EOF 可读
+        return r;
+    }
+    if (of->kind == FD64_KIND_PIPE_W) {
+        Pipe64* p = of->pipe;
+        if (!p) return -1;
+        int r = 0;
+        if (p->n < FD64_PIPE_BYTES) r |= FD64_READY_OUT;
+        if (p->readers == 0) r |= FD64_READY_OUT | FD64_READY_HUP;   // 没人读：写会 -EPIPE
+        return r;
+    }
+    return FD64_READY_IN | FD64_READY_OUT;      // 文件 / 目录 / tty
+}
+
 static int fd64_table_alloc_slot64(FdTable64* t) {
     if (!t) return -FD64_EMFILE;
     for (uint32_t i = FD64_STDIO_MAX; i < FD64_MAX; i++) if (!t->slot[i]) return (int)i;
@@ -1332,6 +1357,26 @@ int fd64_demo64() {
 // ==================== 自检 / 诊断 ====================
 int fd64_selftest64() {
     int fail = 0;
+    // ★ v0.7.1（P2）：fd64_ready64 —— poll/select/epoll 的唯一基础原语（管道 IN/OUT/HUP）
+    {
+        int rfd = -1, wfd = -1;
+        if (fd64_pipe64(&rfd, &wfd) == 0) {
+            bool ok2 = ((fd64_ready64(rfd) & FD64_READY_IN) == 0);          // 空管道读端未就绪
+            const char ch = "x"[0];
+            if (ok2 && fd64_write64(wfd, &ch, 1) != 1) ok2 = false;
+            if (ok2 && (fd64_ready64(rfd) & FD64_READY_IN) == 0) ok2 = false;   // 有字节 -> 可读
+            if (ok2 && (fd64_ready64(wfd) & FD64_READY_OUT) == 0) ok2 = false;  // 有空位 -> 可写
+            if (fd64_close64(wfd) != 0) ok2 = false;
+            if (ok2 && (fd64_ready64(rfd) & FD64_READY_HUP) == 0) ok2 = false;  // 写端全关 -> HUP
+            fd64_close64(rfd);
+            dbg64_line_begin64();
+            dbg64_str("[FD64] ready: pipe IN/OUT/HUP ");
+            dbg64_str(ok2 ? "PASS" : "FAIL");
+            dbg64_nl();
+            dbg64_line_end64();
+            if (!ok2) fail |= 32;
+        }
+    }
     char out[FD64_PATH_MAX];
 
     // bit0：路径规范化（v3 起支持多级：折叠 "//"、忽略结尾 '/'、保留 ".." 交给 vfs64；

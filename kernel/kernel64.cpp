@@ -1337,6 +1337,10 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
 #endif
     (void)update64_check64();
     (void)preload64_run64();
+    // ★ v0.7.1（P2）：桌面路径也跑一次 FD 层自检。
+    //   为什么：它之前只在安装介质那条启动路径调（kernel64.cpp:1203 的分支），
+    //   于是"装好的盘"上 poll/select 的 fd 就绪判断没有任何运行时证据。
+    (void)fd64_selftest64();
     // ---- UEFI 运行期 CR3 实验（编译期开关，默认关；见 docs/UEFI地址空间实验报告.md）----
     // 位置：gui64_run 之前建一个**延迟 5 秒**的内核任务 —— 它跑的时候 [GUI64] ready 已经打出来了，
     //   所以即使 VMware EFI 下 mov cr3 真的触发复位，"桌面起来了"这条证据也已经留在串口里。

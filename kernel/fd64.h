@@ -189,6 +189,14 @@ int fd64_dup_into64(FdTable64* dst, int srcfd, int newfd);
 
 // ==================== 标准流槽（A4-2a）====================
 // 1 = 当前表的槽 fd（0..31）绑着真实对象（则这个 fd 必须走本层，而不是 syscall64 的控制台语义）。
+// ★ v0.7.1（P2）：fd 就绪查询 —— poll/select/epoll 的唯一基础原语。
+//   返回位掩码：FD64_READY_IN / _OUT / _HUP；0 = 都没就绪；-1 = 坏 fd（Linux 的 POLLNVAL）。
+//   pipe 读端就绪 = 有字节 或 写端全关；写端就绪 = 还有空间 或 读端全关。
+//   文件/目录/tty 一律视为可读写（VFS 是同步的，不会阻塞）。
+#define FD64_READY_IN   1
+#define FD64_READY_OUT  2
+#define FD64_READY_HUP  4
+int fd64_ready64(int fd);
 int fd64_slot_used64(int fd);
 // 1 = 当前表的槽 fd 绑的是"控制台 tty"对象（ioctl 认 TIOCGWINSZ/TCGETS/TCSETS）。
 int fd64_slot_is_tty64(int fd);

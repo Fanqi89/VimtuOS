@@ -1901,6 +1901,187 @@ static int64_t lx64_nanosleep64(uint64_t nr, uint64_t req_va, uint64_t rem_va) {
     }
     return 0;
 }
+// ==================== ★ v0.7.1（P2）：futex + poll/select ====================
+// 为什么是"轮询式等待"：本内核没有等待队列（task_sleep 是按 tick 唤醒扫描），
+//   所以 FUTEX_WAIT / poll 用"每 1 ms 重查一次条件 + 有界超时"实现。
+//   语义正确（值变了/有数据了就返回），代价是最多 1 ms 的唤醒延迟；不是忙等。
+//   如实边界：FUTEX_WAKE 返回 val（"唤醒了 val 个"），而实际被唤醒的是轮询者 —— 打点里写明。
+static const int64_t  LX64_POLLIN64   = 0x0001;
+static const int64_t  LX64_POLLOUT64  = 0x0004;
+static const int64_t  LX64_POLLERR64  = 0x0008;
+static const int64_t  LX64_POLLHUP64  = 0x0010;
+static const int64_t  LX64_POLLNVAL64 = 0x0020;
+static const int64_t  LX64_ETIMEDOUT64 = 110;
+
+struct Lx64PollFd64 { int32_t fd; int16_t events; int16_t revents; };
+
+static void lx64_sleep_1ms64() {
+    if (task_sleep_ms64) task_sleep_ms64(1);
+    else {
+        const uint64_t until = g_ticks64 + 1;
+        uint64_t g = 0;
+        while (g_ticks64 < until && ++g < 200000u) __asm__ volatile("hlt");
+    }
+}
+
+// pf 指向**用户内存**（已过 range 检查）；返回就绪条数
+static int64_t lx64_poll_core64(Lx64PollFd64* pf, uint32_t nfds, uint64_t timeout_ms) {
+    const uint64_t t0 = g_ticks64;
+    for (;;) {
+        int ready = 0;
+        for (uint32_t i = 0; i < nfds; i++) {
+            const int32_t fd = pf[i].fd;
+            int32_t rev = 0;
+            if (fd >= 0) {
+                const int st = fd64_ready64((int)fd);
+                if (st < 0) rev = (int32_t)LX64_POLLNVAL64;
+                else {
+                    if (st & FD64_READY_IN)  rev |= (int32_t)LX64_POLLIN64;
+                    if (st & FD64_READY_OUT) rev |= (int32_t)LX64_POLLOUT64;
+                    if (st & FD64_READY_HUP) rev |= (int32_t)LX64_POLLHUP64;
+                }
+                rev &= (int32_t)(pf[i].events | LX64_POLLERR64 | LX64_POLLHUP64 | LX64_POLLNVAL64);
+            }
+            pf[i].revents = (int16_t)rev;
+            if (rev) ready++;
+        }
+        if (ready) return ready;
+        if (timeout_ms == 0) return 0;
+        if (timeout_ms != 0xFFFFFFFFull) {
+            const uint64_t el_ms = (g_ticks64 - t0) * 1000u / PIT_HZ_64;
+            if (el_ms >= timeout_ms) return 0;
+        }
+        lx64_sleep_1ms64();
+    }
+}
+
+// ---- 7）poll(fds, nfds, timeout_ms) ----
+static int64_t lx64_poll64(uint64_t nr, uint64_t fds_va, uint64_t nfds, uint64_t timeout_ms) {
+    if (nfds > 64u) return -LX64_EINVAL;                 // 有界：> 64 个 fd 直接拒（不静默截断）
+    if (nfds == 0) {
+        if (timeout_ms) lx64_sleep_1ms64();              // poll(nullptr,0,ms) = sleep(ms)
+        return 0;
+    }
+    if (!user64_range_ok64(fds_va, nfds * sizeof(Lx64PollFd64))) { syscall64_deny64(nr, fds_va); return -LX64_EFAULT; }
+    const int64_t r = lx64_poll_core64((Lx64PollFd64*)(uintptr_t)fds_va, (uint32_t)nfds, timeout_ms);
+    return r;
+}
+
+// ---- 271）ppoll(fds, nfds, timespec*, sigmask, sigsetsize) ----
+static int64_t lx64_ppoll64(uint64_t nr, uint64_t fds_va, uint64_t nfds, uint64_t ts_va,
+                            uint64_t sm_va, uint64_t sm_size) {
+    (void)sm_va; (void)sm_size;                          // 本内核不投递信号：sigmask 忽略（如实）
+    uint64_t ms = 0xFFFFFFFFull;
+    if (ts_va) {
+        if (!user64_range_ok64(ts_va, 16)) { syscall64_deny64(nr, ts_va); return -LX64_EFAULT; }
+        const uint8_t* p = (const uint8_t*)(uintptr_t)ts_va;
+        uint64_t sec = 0, nsec = 0;
+        for (int i = 0; i < 8; i++) { sec |= (uint64_t)p[i] << (8 * i); nsec |= (uint64_t)p[8 + i] << (8 * i); }
+        ms = sec * 1000u + nsec / 1000000u;
+        if (ms > 600000u) ms = 600000u;                  // 有界 10 分钟
+    }
+    return lx64_poll64(nr, fds_va, nfds, ms);
+}
+
+// ---- 23）select(nfds, rd, wr, ex, timeval*)，只支持 nfds <= 64（fd_set 前 64 位）----
+static int64_t lx64_select64(uint64_t nr, uint64_t nfds, uint64_t rd_va, uint64_t wr_va,
+                             uint64_t ex_va, uint64_t tv_va) {
+    (void)ex_va;                                         // 异常集合忽略（Linux 上基本不用）
+    if (nfds > 64u) {
+        dbg64_line_begin64();
+        dbg64_str("[SYSCALL] select nfds>64 -> EINVAL nfds=");
+        dbg64_dec(nfds);
+        dbg64_nl();
+        dbg64_line_end64();
+        return -LX64_EINVAL;                             // 有界，不静默忽略高位
+    }
+    uint64_t rd = 0, wr = 0;
+    if (rd_va) {
+        if (!user64_range_ok64(rd_va, 8)) { syscall64_deny64(nr, rd_va); return -LX64_EFAULT; }
+        for (int i = 0; i < 8; i++) rd |= (uint64_t)((const uint8_t*)(uintptr_t)rd_va)[i] << (8 * i);
+    }
+    if (wr_va) {
+        if (!user64_range_ok64(wr_va, 8)) { syscall64_deny64(nr, wr_va); return -LX64_EFAULT; }
+        for (int i = 0; i < 8; i++) wr |= (uint64_t)((const uint8_t*)(uintptr_t)wr_va)[i] << (8 * i);
+    }
+    uint64_t ms = 0xFFFFFFFFull;
+    if (tv_va) {
+        if (!user64_range_ok64(tv_va, 16)) { syscall64_deny64(nr, tv_va); return -LX64_EFAULT; }
+        const uint8_t* p = (const uint8_t*)(uintptr_t)tv_va;
+        uint64_t sec = 0, us = 0;
+        for (int i = 0; i < 8; i++) { sec |= (uint64_t)p[i] << (8 * i); us |= (uint64_t)p[8 + i] << (8 * i); }
+        ms = sec * 1000u + us / 1000u;
+        if (ms > 600000u) ms = 600000u;
+    }
+    Lx64PollFd64 pf[64];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < (uint32_t)nfds && n < 64u; i++) {
+        int16_t ev = 0;
+        if ((rd >> i) & 1u) ev |= (int16_t)LX64_POLLIN64;
+        if ((wr >> i) & 1u) ev |= (int16_t)LX64_POLLOUT64;
+        if (!ev) continue;
+        pf[n].fd = (int32_t)i; pf[n].events = ev; pf[n].revents = 0;
+        n++;
+    }
+    const int64_t r = lx64_poll_core64(pf, n, ms);
+    // 回写 fd_set（就绪的位保留，其余清 0）
+    uint64_t orr = 0, owr = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        if (!pf[k].revents) continue;
+        const uint32_t fd = (uint32_t)pf[k].fd;
+        if (pf[k].revents & (LX64_POLLIN64 | LX64_POLLHUP64)) orr |= 1ull << fd;
+        if (pf[k].revents & LX64_POLLOUT64) owr |= 1ull << fd;
+    }
+    if (rd_va) for (int i = 0; i < 8; i++) ((uint8_t*)(uintptr_t)rd_va)[i] = (uint8_t)(orr >> (8 * i));
+    if (wr_va) for (int i = 0; i < 8; i++) ((uint8_t*)(uintptr_t)wr_va)[i] = (uint8_t)(owr >> (8 * i));
+    return r;
+}
+
+// ---- 202）futex(uaddr, op, val, timeout, uaddr2, val3) ----
+static int64_t lx64_futex64(uint64_t nr, uint64_t uaddr, uint64_t op, uint64_t val,
+                            uint64_t timeout_va, uint64_t uaddr2, uint64_t val3) {
+    (void)uaddr2; (void)val3;
+    const uint32_t cmd = (uint32_t)(op & 0x7Fu);
+    if (!user64_range_ok64(uaddr, 4)) { syscall64_deny64(nr, uaddr); return -LX64_EFAULT; }
+    volatile int32_t* a = (volatile int32_t*)(uintptr_t)uaddr;
+    if (cmd == 0) {                                      // FUTEX_WAIT
+        if (*a != (int32_t)val) return -LX64_EAGAIN;
+        uint64_t ms = 0xFFFFFFFFull;
+        if (timeout_va) {
+            if (!user64_range_ok64(timeout_va, 16)) { syscall64_deny64(nr, timeout_va); return -LX64_EFAULT; }
+            const uint8_t* p = (const uint8_t*)(uintptr_t)timeout_va;
+            uint64_t sec = 0, nsec = 0;
+            for (int i = 0; i < 8; i++) { sec |= (uint64_t)p[i] << (8 * i); nsec |= (uint64_t)p[8 + i] << (8 * i); }
+            ms = sec * 1000u + nsec / 1000000u;
+            if (ms > 600000u) ms = 600000u;
+        }
+        const uint64_t t0 = g_ticks64;
+        for (;;) {
+            if (*a != (int32_t)val) return 0;            // 值变了：被"唤醒"
+            if (ms != 0xFFFFFFFFull) {
+                const uint64_t el = (g_ticks64 - t0) * 1000u / PIT_HZ_64;
+                if (el >= ms) return -LX64_ETIMEDOUT64;
+            }
+            if (ms == 0) return -LX64_ETIMEDOUT64;
+            lx64_sleep_1ms64();
+        }
+    }
+    if (cmd == 1) {                                      // FUTEX_WAKE
+        static int budget = 8;
+        if (budget > 0) {
+            budget--;
+            dbg64_line_begin64();
+            dbg64_str("[SYSCALL] futex WAKE n=");
+            dbg64_dec(val);
+            dbg64_str(" (polling waiters: 它们看到值变化后自己退出等待)");
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        return (int64_t)val;
+    }
+    return -LX64_ENOSYS;
+}
+
 static int64_t lx64_pause64() {
     // pause(2) 在 Linux 上是"睡到收到信号"。本内核不投递信号，所以永远等不到 ——
     // 有界等待 1 秒后如实返回 -EINTR（"被信号打断"），绝不死等。
@@ -2512,6 +2693,11 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 33:  return lx64_dup2_64(a1, a2);
     case 34:  return lx64_pause64();                                // 有界等待后 -EINTR（如实）
     case 35:  return lx64_nanosleep64(nr, a1, a2);
+    case 7:   return lx64_poll64(nr, a1, a2, a3);                  // ★ v0.7.1：poll(fds,nfds,ms)
+    case 23:  return lx64_select64(nr, a1, a2, a3, a4, a5);        // ★ v0.7.1：select（nfds<=64）
+    case 202: return lx64_futex64(nr, a1, a2, a3, a4, a5, a6);     // ★ v0.7.1：futex（轮询式等待）
+    case 270: return lx64_ppoll64(nr, a1, a2, a3, a4, a5);         // ★ v0.7.1：pselect6 ≈ ppoll（忽略 sigmask）
+    case 271: return lx64_ppoll64(nr, a1, a2, a3, a4, a5);         // ★ v0.7.1：ppoll
     case 37:  return lx64_alarm64(a1);                              // 只记录，不投递 SIGALRM
     case 39:  return lx64_getpid64();
     case 56:  return lx64_clone64(nr, r, a1);                        // 只支持 flags=0/SIGCHLD
