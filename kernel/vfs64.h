@@ -401,6 +401,9 @@ int  vfs64_stat_on64(int slot, const char* path, uint32_t* type, uint32_t* size)
 int  vfs64_read_on64(int slot, const char* path, void* buf, int max);
 int  vfs64_write_on64(int slot, const char* path, const void* buf, int len);
 int  vfs64_mkdir_on64(int slot, const char* path);
+// ★ v0.7.8：逐级建目录（把 path 的**父路径**全部建出来；已存在当成功）。
+//   空卷/夹具卷上装自带 blob 时用：kPathAlias 映射后的父链（如 /usr/share/demo）可能还没建过。
+int  vfs64_mkdirs_on64(int slot, const char* path);
 int  vfs64_create_on64(int slot, const char* path);
 int  vfs64_unlink_on64(int slot, const char* path);
 int  vfs64_rmdir_on64(int slot, const char* path);
@@ -436,6 +439,7 @@ int  vfs64_closedir64(int handle);
 
 // 建目录（**多级**：父目录必须已存在，否则 -1 + 打点）
 int  vfs64_mkdir64(const char* path);
+int  vfs64_mkdirs64(const char* path);            // 当前卷：逐级建 path 的父目录（幂等）
 
 // 建空文件（父目录必须存在；已存在且是文件 = 返回 0 幂等；是目录 = -1）
 int  vfs64_create64(const char* path);

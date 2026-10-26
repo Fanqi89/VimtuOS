@@ -6,7 +6,7 @@
   A) 启动期（内核自己跑的 ring3 pipe 演示，见 kernel/proc64.cpp 的 proc64_pipe_demo64）：
      1) [PROC64] install ok path=/pipe64.elf              —— 幂等装进 VimtuFS2
      2) [PROC64] fork ... fds=2 fds_shared=1              —— **fork 继承整张 fd 表**（逐槽共享对象）
-     3) [FD64] pipe r=.. w=.. bytes=64                    —— pipe(22) 真实现（64B 环形缓冲）
+     3) [FD64] pipe r=.. w=.. bytes=4096                  —— pipe(22) 真实现（64B 环形缓冲）
      4) [FD64] pipe read n=18 data=PIPE-OK-FROM-CHILD     —— 子写父读的**环回数据**
      5) pipe64: child wrote n=.. / pipe64: parent read n=.. / PIPE-OK-FROM-CHILD
         （用户程序的输出会被每个 write 的 [SYSCALL] insn 日志打断，所以按片段断言）
@@ -20,7 +20,7 @@
         —— O_APPEND：先 lseek 到 0 再写，内容仍然追加到末尾（写后偏移 = 末尾）
     10) [FD64] demo pipe n=9 data=PIPE-RING ok=1 + [FD64] pipe read n=9 data=PIPE-RING
         —— pipe 环回（内核侧）
-    11) [FD64] demo pipe shortwrite=64/100 (ring=64)     —— 写满 = 短写（不阻塞）
+    11) [FD64] demo pipe shortwrite=4096/4160 (ring=4096) —— 写满 = 短写（不阻塞）
     12) [FD64] demo pipe empty=1011 (1000+EAGAIN) eof=0  —— 读空 = -EAGAIN；写端全关 = 0（EOF）
     13) [FD64] demo forkinherit ... same_object=1 refs_plus1=1 survived_child_exit=1
         —— fork 的 fd 语义：克隆整张表 = 逐槽共享同一个对象 + 引用计数 +1；"子进程退出"后原对象还在
@@ -241,8 +241,8 @@ def main():
           "[FD64] pipe read n=9 data=PIPE-RING" in log)
     check("pipe 环回（demo 行）：[FD64] demo pipe n=9 data=PIPE-RING ok=1",
           "[FD64] demo pipe n=9 data=PIPE-RING ok=1" in log)
-    check("pipe 短写（满 = 64 B）：[FD64] demo pipe shortwrite=64/100 (ring=64)",
-          "[FD64] demo pipe shortwrite=64/100 (ring=64)" in log)
+    check("pipe 短写（满 = 4096 B）：[FD64] demo pipe shortwrite=4096/4160 (ring=4096)",
+          "[FD64] demo pipe shortwrite=4096/4160 (ring=4096)" in log)
     check("pipe 空读（写端还开着）= -EAGAIN、写端全关后读 = 0（EOF）",
           "[FD64] demo pipe empty=1011 (1000+EAGAIN) eof=0" in log)
 

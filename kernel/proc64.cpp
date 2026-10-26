@@ -1877,6 +1877,8 @@ int proc64_install_builtin64(int drive, uint32_t part_lba) {
         dbg64_line_end64();
         return 0;
     }
+    // ★ v0.7.8：空卷/夹具卷上映射后的父链（/usr/share/demo）可能还没建过 → 先补齐
+    if (vfs64_mkdirs_on64(sys, PROC64_PATH64) != 0) { p64_log2("[PROC64] install FAILED reason=", "mkdirs"); return -1; }
     const int w = vfs64_write_on64(sys, PROC64_PATH64, blob, (int)bytes);
     if (w != (int)bytes) { p64_log2("[PROC64] install FAILED reason=", "write"); return -1; }
     dbg64_line_begin64();
@@ -1901,6 +1903,8 @@ int proc64_install_builtin64(int drive, uint32_t part_lba) {
             dbg64_nl();
             dbg64_line_end64();
         } else {
+            // ★ v0.7.8：同上（父链）
+            if (vfs64_mkdirs_on64(sys, PROC64_PIPE_PATH64) != 0) { p64_log2("[PROC64] install FAILED reason=", "mkdirs(/pipe64.elf)"); return -1; }
             const int w2 = vfs64_write_on64(sys, PROC64_PIPE_PATH64, pblob, (int)pbytes);
             if (w2 != (int)pbytes) { p64_log2("[PROC64] install FAILED reason=", "write(/pipe64.elf)"); return -1; }
             dbg64_line_begin64();
@@ -1995,6 +1999,8 @@ int proc64_evshm_install64(int drive, uint32_t part_lba) {
         dbg64_nl(); dbg64_line_end64();
         return 0;
     }
+    // ★ v0.7.8：同上（父链）
+    if (vfs64_mkdirs_on64(sys, PROC64_EVSHM_PATH64) != 0) { p64_log2("[EVSHM] install FAILED reason=", "mkdirs"); return -1; }
     const int w = vfs64_write_on64(sys, PROC64_EVSHM_PATH64, blob, (int)bytes);
     if (w != (int)bytes) { p64_log2("[EVSHM] install FAILED reason=", "write(/evshm.elf)"); return -1; }
     dbg64_line_begin64();

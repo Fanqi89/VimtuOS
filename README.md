@@ -257,8 +257,11 @@ shm + wl_surface + `wl_seat_get()` + font64 排版）：
   -> 追写 `/var/lib/dpkg/status`）、payload 真落地（终端 `cat` 读到 **47 B**）、`dpkg -l` 从状态文件读回记录、
   `apt update` 如实报“当前未启用”。安装需要 root：终端先 `sudo -i`（P4 权限检查会如实拒绝
   uid=1000 建 `/usr/share/...` —— 这是 POSIX 语义，不是缺陷）。
-  ★ 性能边界（如实）：本内核的 pipe **只有 64 B 容量**，所以 tar↔gunzip 的 10 KB 填充要走 160 次
-  64 B 往返，`dpkg -i` 实测要 **~25-30 s**（所以终端 `run` 的有界等待从 20 s 放到 120 s）。
+  ★ 性能边界（如实，v0.7.8 实测）：pipe 容量已从 64 B 提到 **4096 B**（POSIX PIPE_BUF，
+  `kernel/fd64.h` 的 `FD64_PIPE_BYTES`）。同一次 `dpkg -i` 切片里 `[FD64] pipe wait` 从旧容量下的成百上
+  千次降到 **2 次**；但整次 `dpkg -i` 仍要 **~20 s**（v0.7.7 为 25-30 s）—— 剩下的成本不在
+  pipe：该切片里有 119 条 `[SYSCALL]` 打点、12 次 fork+ELF 装载（tar/gunzip 子进程）与写盘，
+  且每条系统调用都要写一行串口日志（调试构建的固有成本）。
 - ⚠️ **glibc / 发行版二进制**：动态映像（`PT_INTERP` + 独立地址空间 `execve`）已实现，
   验收脚本 `tests/dynlink64_test.py` / `tests/musl64_test.py` 覆盖；但 `/proc`、`/sys`、pty、
   完整 TLS/vDSO 仍缺 -> **常见发行版二进制整体跑不起来**，别当成"能跑 Debian 程序"。

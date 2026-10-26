@@ -8,10 +8,10 @@
        echo hi | cat > out_echo.txt              -> "hi\\n"
        ls -l /tcc/demo | grep hello | wc -l      -> "2\\n"（★ 真值：名字含 hello 的有 hello.c 与 hello.lua）
        cat lines.txt | sed s/beta/BETA/ > b      -> BETA 已替换、不残留 beta（5 行）
-       cat big64.txt | wc -c                     -> "300\\n"（300B 过 64B 环：分次写完不丢字节 + EOF）
+       cat big64.txt | wc -c                     -> "9000\\n"（9000B 过 4096B 环：分次写完不丢字节 + EOF）
   ② 内核侧 fdtest（与 syscall 72 同一实现 fd64_fcntl64）：
        F_SETFL O_NONBLOCK 生效（setfl=1 / getfl_nonblock=1 / fdcloexec=1）；
-       非阻塞短写=64/100、空读=-EAGAIN（旧语义保留）；F_SETFD/F_GETFD 的 FD_CLOEXEC 往返。
+       非阻塞短写=4096/4160、空读=-EAGAIN（旧语义保留）；F_SETFD/F_GETFD 的 FD_CLOEXEC 往返。
   ③ 阻塞等待打点 [FD64] pipe wait ...（pid 真值、why=empty|full、ticks、writers/readers），
      且**没有**撞 30s 有界上限；正常管线里不出现 busybox 的 EAGAIN/EPIPE 报错文本。
   ④ 结构性前提：pipe 池按**空闲槽**分配（原实现无条件复用 0 号槽 —— 实测第二条管道会把第一条
@@ -59,7 +59,7 @@ TYPED_NAMES = {
     "<": "shift-comma", "|": "shift-backslash", "(": "shift-9", ")": "shift-0",
 }
 
-BIG64 = (b"0123456789" * 30)                      # 300 B（> 64 B 环容量：必须分次写完）
+BIG64 = (b"0123456789" * 900)                      # 9000 B（> 4096 B 环容量：必须分次写完）
 PIPE2 = b"""# /tmp/bb/pipe2.sh - tests/pipe64_test.py fixture (blocking pipe chains)
 echo '@@P_ECHO'
 echo hi | cat > /tmp/bb/out_echo.txt
@@ -188,6 +188,7 @@ class Session:
         ]
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.mon = qh.Monitor(mport)
+        self.mport = mport                                  # ★ v0.7.8：鼠标点击要用 startmenu64_test.Monitor（相对鼠标驱动）
         qh.login_desktop(self.mon, self.log, self.proc, timeout=min(timeout, 180))
         self.wait("[GUI64] ready", timeout)
         self.open_terminal()
@@ -218,15 +219,46 @@ class Session:
         self.mon.key("ret", wait=per_key + 0.2)
 
     def open_terminal(self):
-        for _ in range(6):
-            if "[APP] term opened" in self.log():
-                break
-            self.mon.key("ret", wait=1.6)
-            self.mon.key("ret", wait=1.6)
-            time.sleep(1.0)
-            self.mon.key("meta_l", wait=1.8)
-            self.mon.key("1", wait=2.4)
-        self.wait("[APP] term opened", 20)
+        # ★ v0.7.8：改走 **Dock 的终端图标**（不再按 meta_l 开开始菜单）。
+        #   实测原因：开始菜单一次要装 14 个图标（每个从卷装载 ~1.4 s）→ 单帧 >20 s
+        #   → `[WD64] watchdog fire stale=20044ms` + `[PANIC64] stop=WATCHDOG_TIMEOUT`（本次实测两连都碰上）。
+        #   Dock 图标不重绘列表，单次点击就能开终端（dpkg64_test 已用同一路径）。判据不变。
+        hit = None
+        t0 = time.time()
+        while time.time() - t0 < 90 and not hit:
+            for mm in re.finditer(r"\[DOCK64\] item idx=(\d+) app=(-?\d+) name=\S+ x=(\d+) y=(\d+) "
+                                  r"w=(\d+) h=(\d+) cx=(\d+) cy=(\d+)", self.log()):
+                if mm.group(2) == "3":                 # app=3 = 终端
+                    hit = mm
+                    break
+            if not hit:
+                time.sleep(1.0)
+        if hit:
+            import startmenu64_test as SM
+            sm = SM.Monitor(self.mport)                     # 同一个 HMP 端口，但带 mouse_move/mouse_button
+            # ★ v0.7.8：实测单次点击不一定开窗（日志里 `[DOCK64] hover idx=3` 已发生但没有
+            #   `[APP] term opened`）→ 最多试 4 次（每次都重新从已知位置定位光标再点）。
+            for _try in range(4):
+                if "[APP] term opened" in self.log():
+                    break
+                cur = SM.Cursor()                           # 初始光标 = 客户机初始位置 (512,384)
+                cur.goto(sm, int(hit.group(7)), int(hit.group(8)))
+                cur.settle(sm)
+                time.sleep(0.4)
+                sm.click()
+                t1 = time.time()
+                while time.time() - t1 < 12:
+                    if "[APP] term opened" in self.log():
+                        break
+                    if "[PANIC64] stop=" in self.log():
+                        break
+                    time.sleep(0.5)
+                if "[APP] term opened" in self.log():
+                    break
+                cur.goto(sm, 640, 400)                      # 先离开 dock 再回去（让 hover 重算）
+                cur.settle(sm)
+                time.sleep(0.6)
+        self.wait("[APP] term opened", 60)
 
     def close(self, keep=False):
         self.proc.kill()
@@ -300,8 +332,8 @@ def main():
               "（fail 时见 [PERM64]/[FD64] open FAILED 行）")
         check("F_SETFL O_NONBLOCK 生效：setfl=1 / getfl_nonblock=1 / fdcloexec=1",
               re.search(r"\[FD64\] demo pipe setfl=1 getfl_nonblock=1 fdcloexec=1", t) is not None, "")
-        check("非阻塞短写/空读（旧语义保留）：shortwrite=64/100 + empty=1011",
-              "[FD64] demo pipe shortwrite=64/100 (ring=64)" in t and
+        check("非阻塞短写/空读（旧语义保留）：shortwrite=4096/4160 + empty=1011",
+              "[FD64] demo pipe shortwrite=4096/4160 (ring=4096)" in t and
               "[FD64] demo pipe empty=1011 (1000+EAGAIN) eof=0" in t, "")
         check("fcntl 打点：F_SETFL O_NONBLOCK ok=1 / 未知 flag ok=0 / F_SETFD FD_CLOEXEC ok=1",
               re.search(r"\[FD64\] fcntl fd=\d+ setfl=0x0*800 ok=1", t) is not None and
@@ -338,9 +370,9 @@ def main():
         sed_out = wait_guest_file(img, ["tmp", "bb", "pipe2out.txt"], sed_want, check_t)
         check("宿主侧 /tmp/bb/pipe2out.txt（cat | sed s/beta/BETA/ > b）逐字节 == 期望 5 行",
               sed_out == sed_want, repr(sed_out))
-        full_out = wait_guest_file(img, ["tmp", "bb", "out_full.txt"], b"300\n", check_t)
-        check("宿主侧 /tmp/bb/out_full.txt == b'300\\n'（300B 过 64B 环：分次写完不丢字节 + EOF）",
-              full_out == b"300\n", repr(full_out))
+        full_out = wait_guest_file(img, ["tmp", "bb", "out_full.txt"], b"9000\n", check_t)
+        check("宿主侧 /tmp/bb/out_full.txt == b'9000\\n'（9000B 过 4096B 环：分次写完不丢字节 + EOF）",
+              full_out == b"9000\n", repr(full_out))
 
         # ---- 阻塞等待证据（含 pid/两端计数）----
         waits = re.findall(r"\[FD64\] pipe wait pid=(\d+) fd=(\d+) why=(\w+) ticks=(\d+) "
@@ -349,7 +381,7 @@ def main():
               len(waits) >= 2, "waits=%d" % len(waits))
         check("等待打点的 pid 是真进程号（>0，不是 0/缺失）",
               any(int(w[0]) > 0 for w in waits), "pids=%s" % sorted(set(w[0] for w in waits))[:6])
-        check("写 300B 过 64B 环必然出现 why=full（满 -> 阻塞等待 -> 继续写）",
+        check("写 9000B 过 4096B 环必然出现 why=full（满 -> 阻塞等待 -> 继续写）",
               any(w[2] == "full" for w in waits), "whys=%s" % [w[2] for w in waits])
         max_ticks = max((int(w[3]) for w in waits), default=0)
         check("等待**没有**撞 30s 有界上限（ticks 远小于 7500 = 30s@250Hz）",

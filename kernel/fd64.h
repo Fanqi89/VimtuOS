@@ -69,8 +69,10 @@
 #define FD64_TTY_PATH   "/dev/console"   // ★ 最小"控制台 tty"对象的路径（"/dev/tty" 也认）
 #define FD64_TABLE_MAX  20u          // fd 表池（16 进程 + 内核表 + 余量）
 #define FD64_OPEN_MAX   64u          // OpenFile64 对象池（引用计数，不按进程复制）
-#define FD64_PIPE_MAX   8u           // pipe 对象池（每条 64 B 环形缓冲）
-#define FD64_PIPE_BYTES 64u          // ★ pipe 容量（固定 64 B；读/写默认**阻塞**，见文件头）
+#define FD64_PIPE_MAX   8u           // pipe 对象池（每条 FD64_PIPE_BYTES = 4096 B 环形缓冲，静态 32 KB）
+#define FD64_PIPE_BYTES 4096u        // ★ pipe 容量（POSIX PIPE_BUF = 4096 B；读/写默认**阻塞**，见文件头）
+//   ★ v0.7.8：64 → 4096。旧值下 `dpkg -i` 要 25-30 s（每次 read(512) 只能拿 64 B，且每次唤醒按 tick）；
+//   4096 是 Linux 的 PIPE_BUF（原子写上限），吞吐量提一个量级。
 // ★ 单次阻塞等待上限（毫秒；超时 -> 读 -EAGAIN / 写返回已写字节或 -EAGAIN）。走既有 task_sleep64
 //   （task_yield64 让出，不忙等）；没有调度器（安装介质内核）时退回非阻塞，如实。
 //   实测口径：本内核的 ring3 程序装载（bbdrv 逐段拷贝 500KB 的 busybox.bin）单次可达数秒，

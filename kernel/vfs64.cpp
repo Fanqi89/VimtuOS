@@ -1654,10 +1654,9 @@ static void path_parent64(const char* path, char* out, uint32_t cap) {
 //   而 Linux 真正高频的是文件级链接（/usr/lib/libc.so -> libc.so.6、/etc/xxx -> ...），
 //   只跟最后一级就能覆盖它们，且实现小、把风险关在 40 行里。
 //   want_parent = true 时不跟随（创建/重命名的父目录解析必须看到真实层级）。
-static int path_resolve(const char* path, bool want_parent,
-                        uint32_t* out_ino, uint32_t* out_parent, char* out_name, uint32_t* out_nlen) {
-    char alias_buf[VFS64_PATH_MAX + 1];
-    const char* p = vfs64_alias_path64(path, alias_buf, (uint32_t)sizeof(alias_buf));
+// ★ v0.7.0：单次解析（不做别名映射，也不回退）—— 路径 p 已经是“要真正去查的那条”。
+static int path_resolve_once64(const char* p, bool want_parent,
+                               uint32_t* out_ino, uint32_t* out_parent, char* out_name, uint32_t* out_nlen) {
     char cur[VFS64_PATH_MAX + 1];
     {
         uint32_t i = 0;
@@ -1693,6 +1692,20 @@ static int path_resolve(const char* path, bool want_parent,
         }
     }
     return path_resolve_raw(cur, want_parent, out_ino, out_parent, out_name, out_nlen);
+}
+// ★ v0.7.8：上面那条注释早就承诺“新路径优先，失败回退旧路径”，但**代码里一直没实现**：
+//   夹具卷（tests 自建的空卷，只有根 inode）上 /usr/share/demo 不存在 → 映射后的 /hello.elf、
+//   /hello.vap、/musl_hello.elf、/xmmsse.elf、/spin.elf … 全部“父目录不存在”写失败（实测
+//   `[PROC64] install FAILED reason=write` → proc64_test 27/65）。现在就在这里实现：
+//   * 映射后的路径**结构性失败**（-1：找不到 / 父不是目录 / 都是坏名）时，用**原路径**再解析一次；
+//   * -EACCES **不回退**（权限拒绝不该被“换个路径重试”绕过）；没命中别名的直接返回（零开销）。
+static int path_resolve(const char* path, bool want_parent,
+                        uint32_t* out_ino, uint32_t* out_parent, char* out_name, uint32_t* out_nlen) {
+    char alias_buf[VFS64_PATH_MAX + 1];
+    const char* p = vfs64_alias_path64(path, alias_buf, (uint32_t)sizeof(alias_buf));
+    const int rc = path_resolve_once64(p, want_parent, out_ino, out_parent, out_name, out_nlen);
+    if (rc != -1 || p == path) return rc;
+    return path_resolve_once64(path, want_parent, out_ino, out_parent, out_name, out_nlen);
 }
 
 static int path_resolve_raw(const char* path, bool want_parent,
@@ -2948,13 +2961,74 @@ int vfs64_mkdir64(const char* path) {
 }
 int vfs64_mkdir(const char* path) { return vfs64_mkdir64(path); }
 
+// ==================== ★ v0.7.8：逐级建目录（父链）====================
+// 为什么需要（实测缺陷）：kPathAlias 把 "/proc64.elf" 映射成 "/usr/share/demo/proc64.elf"；
+//   而 tests 自建的"夹具卷"（刚格式化的 16 MB，只有根 inode）上 /usr、/usr/share、/usr/share/demo
+//   都不存在 → vfs64_write 的 write_resolve64 报 "component not found" →
+//   `[PROC64] install FAILED reason=write` → demo 全部 skipped（proc64_test 27/65 的根因）。
+// 语义：
+//   * 建的是 path 的**父路径**（不含最后一级文件名），逐段从根往下建；
+//   * **幂等**：已存在当成功（只以"那一级现在确实是目录"为判据，不看 mkdir 的返回码）；
+//   * 先按**别名映射后**的路径算父链 —— 否则 "/proc64.elf" 的父链是空的（根下），什么也建不出来；
+//   * 逐级用 vfs64_mkdir64（每级也会走同一套 path_resolve），不绕过权限/布局校验。
+// 返回 0 = 父链已就绪；-1 = 建不出来（已打点）。
+static int mkdirs_core64(const char* path) {
+    if (!path || path[0] != '/') return -1;
+    char buf[VFS64_PATH_MAX + 1];
+    {
+        char abuf[VFS64_PATH_MAX + 1];
+        const char* p = vfs64_alias_path64(path, abuf, (uint32_t)sizeof(abuf));
+        uint32_t i = 0;
+        for (; p[i] != 0 && i < VFS64_PATH_MAX; i++) buf[i] = p[i];
+        buf[i] = 0;
+        if (i == 0) return -1;
+    }
+    uint32_t n = 0;
+    while (buf[n] != 0) n++;
+    while (n > 1 && buf[n - 1] == '/') n--;                  // 去掉末尾分隔符
+    uint32_t cut = n;                                        // 父路径长度（不含最后一级名）
+    while (cut > 0 && buf[cut - 1] != '/') cut--;
+    if (cut > 0) cut--;
+    for (uint32_t i = 1; i <= cut; i++) {
+        if (buf[i] != '/') continue;                         // 只在该级的 '/' 处截断
+        const char save = buf[i];
+        buf[i] = 0;
+        uint32_t type = 0, size = 0;
+        int bad = 0;
+        if (vfs64_stat(buf, &type, &size) == 0) {
+            if (type != VFS64_TYPE_DIR) bad = 1;             // 同名但不是目录：建不下去
+        } else if (vfs64_mkdir64(buf) != 0) {
+            // mkdir 失败也可能只是"已经存在"（并发/竞态）—— 只认"现在是不是目录"
+            if (vfs64_stat(buf, &type, &size) != 0 || type != VFS64_TYPE_DIR) bad = 1;
+        }
+        buf[i] = save;
+        if (bad) return -1;
+    }
+    return 0;
+}
+int vfs64_mkdirs64(const char* path) {
+    if (!g_mounted) { log_op_fail("mkdirs64", "not mounted"); return -1; }
+    return mkdirs_core64(path);
+}
+int vfs64_mkdirs_on64(int slot, const char* path) {
+    Vfs64SlotGuard g(slot, true);
+    if (!g.active) return on64_slot_unavailable("mkdirs", slot);
+    return mkdirs_core64(path);
+}
+
 // 删除普通文件。★ P4：删除只要**父目录 w+x**（Linux 不在删的时候看文件本身的权限）。
 int vfs64_unlink64(const char* path) {
     if (!g_mounted) { log_op_fail("unlink64", "not mounted"); return -1; }
     if (!path) { log_op_fail("unlink64", "bad args"); return -1; }
 
+    // ★ v0.7.8：unlink 必须删**链接本身**，不能跟随最后一级符号链接（POSIX unlink(2)）。
+    //   之前走的是"跟随最后一级"的 path_resolve；实测后果：unlink("/perm/lnk")（lnk -> f.txt）
+    //   把 **f.txt 删了、链接还在** → 清理时 `path component not found path=/perm/f.txt` +
+    //   rmdir 报 `directory not empty`；悬空链接则根本删不掉。现在用 path_resolve_raw（**不跟随**）。
     uint32_t idx = 0;
-    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    char uabuf[VFS64_PATH_MAX + 1];
+    const char* upath = vfs64_alias_path64(path, uabuf, (uint32_t)sizeof(uabuf));
+    const int pr = path_resolve_raw(upath, false, &idx, nullptr, nullptr, nullptr);
     if (pr != 0) {
         if (pr == -VFS64_EACCES) return -VFS64_EACCES;
         log_op_fail("unlink64", "not found");
@@ -2987,8 +3061,11 @@ int vfs64_rmdir64(const char* path) {
     if (!g_mounted) { log_op_fail("rmdir64", "not mounted"); return -1; }
     if (!path) { log_op_fail("rmdir64", "bad args"); return -1; }
 
+    // ★ v0.7.8：rmdir 也不跟随最后一级符号链接（POSIX：对链接 rmdir 要 ENOTDIR，不能删掉目标目录）。
     uint32_t idx = 0;
-    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    char rabuf[VFS64_PATH_MAX + 1];
+    const char* rpath = vfs64_alias_path64(path, rabuf, (uint32_t)sizeof(rabuf));
+    const int pr = path_resolve_raw(rpath, false, &idx, nullptr, nullptr, nullptr);
     if (pr != 0) {
         if (pr == -VFS64_EACCES) return -VFS64_EACCES;
         log_op_fail("rmdir64", "not found");
@@ -3986,9 +4063,15 @@ int vfs64_selftest64() {
         // ★ 清理前必须回到原凭证：/perm 是 root 的（这个时刻 cred 还是 1234，删不掉）
         vfs64_set_cred64(cred0.uid, cred0.gid, cred0.euid, cred0.egid);
         (void)vfs64_umask64(umask0);
+        // ★ v0.7.8：**符号链接也要清掉**。之前只删 u.txt/f.txt，/perm/lnk 留在里面
+        //   → rmdir64("/perm") 报 `directory not empty` → 根目录多一项 → 后面的 bit2 断言
+        //   `根条目数 n == 3` 失败（实测 `[VFS64] selftest FAIL mask=4`、`ls entries=4`）。
+        //   修在清理端（不改断言），并**新增一条"清理干净"自检**：没清干净就报 step=8，不再转移成别处的奇怪失败。
+        (void)vfs64_unlink64("/perm/lnk");
         (void)vfs64_unlink64("/perm/u.txt");
         (void)vfs64_unlink64("/perm/f.txt");
         (void)vfs64_rmdir64("/perm");
+        if (ok && vfs64_stat64("/perm", &pinfo) == 0) ok = false;   // 清理干净性自检
         if (ok) {
             dbg64_line_begin64();               // ★ 行原子
             dbg64_str("[VFS64] perm selftest ok owner/mode/other/root/chmod/chown/umask=1");

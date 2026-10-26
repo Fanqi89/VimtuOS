@@ -3669,6 +3669,8 @@ static int term_install_blob64(const char* path, const char* tag) {
     uint32_t len = 0;
     const uint8_t* blob = demo64_blob_find64(path, &len);
     if (!blob || len == 0) return -1;
+    // ★ v0.7.8：空卷上映射后的父链（/usr/share/demo）可能还没建过 → 先补齐
+    if (vfs64_mkdirs64(path) != 0) return -1;
     const int rc = vfs64_write(path, blob, (int)len);
     if (rc < 0) return -1;
     dbg64_line_begin64();

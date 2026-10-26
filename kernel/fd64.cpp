@@ -67,6 +67,10 @@ struct Pipe64 {
     uint8_t  buf[FD64_PIPE_BYTES];
 };
 
+// ★ v0.7.8：pipe 容量提到 4096 后，"写满 = 短写"自检要写 > 4096 B。
+//   放在**文件级静态区**（不进内核栈、也不用堆）：4 KB+ 放栈上在这个内核里历史上就压穿过栈。
+static uint8_t g_sel_pipe_buf64[FD64_PIPE_BYTES + 64u];
+
 struct OpenFile64 {
     uint32_t refs;            // 引用计数（fd 槽数；close/进程退出各 -1）
     uint32_t flags;           // 打开时的 flags（原样存下，打点/诊断用）
@@ -1245,9 +1249,9 @@ int fd64_demo64() {
             const int st4 = fd64_fcntl64(w, FD64_F_SETFD, FD64_FD_CLOEXEC);   // -> 0
             const int gf2 = fd64_fcntl64(w, FD64_F_GETFD, 0);                 // -> 1
             const int st5 = fd64_fcntl64(w, FD64_F_SETFD, 0);                 // -> 0（清掉）
-            uint8_t big[100];
-            for (int i = 0; i < 100; i++) big[i] = (uint8_t)('a' + (i % 26));
-            const int sw = fd64_write64(w, big, 100);
+            const int wn2 = (int)sizeof(g_sel_pipe_buf64);        // = 容量 + 64（一定 > 容量，才能验"写满 = 短写"）
+            for (int i = 0; i < wn2; i++) g_sel_pipe_buf64[i] = (uint8_t)('a' + (i % 26));
+            const int sw = fd64_write64(w, g_sel_pipe_buf64, wn2);
             if (st1 != 0 || st2 != 0 || st3 != -FD64_EINVAL || (gf & FD64_O_NONBLOCK) == 0) fail |= 8;
             if (st4 != 0 || gf2 != 1 || st5 != 0) fail |= 8;
             if (sw != (int)FD64_PIPE_BYTES) fail |= 8;
@@ -1264,13 +1268,15 @@ int fd64_demo64() {
             dbg64_line_begin64();
             dbg64_str("[FD64] demo pipe shortwrite=");
             dbg64_dec((uint64_t)(sw < 0 ? 0 : sw));
-            dbg64_str("/100 (ring=");
+            dbg64_str("/");
+            dbg64_dec((uint64_t)sizeof(g_sel_pipe_buf64));
+            dbg64_str(" (ring=");
             dbg64_dec((uint64_t)FD64_PIPE_BYTES);
             dbg64_str(")");
             dbg64_nl();
             dbg64_line_end64();
-            uint8_t sink[128];
-            const int drain = fd64_read64(r, sink, 128);
+            uint8_t* sink = g_sel_pipe_buf64;                     // 不用栈缓冲（同一块静态区）
+            const int drain = fd64_read64(r, sink, (int)sizeof(g_sel_pipe_buf64));
             if (drain != (int)FD64_PIPE_BYTES) fail |= 8;
             const int empty = fd64_read64(r, sink, 128);       // 写端还开着 + O_NONBLOCK -> -EAGAIN
             if (empty != -FD64_EAGAIN) fail |= 8;
