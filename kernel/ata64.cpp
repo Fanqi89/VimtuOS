@@ -113,6 +113,25 @@ static bool ata_wait_drq(int drive) {
     return false;
 }
 
+// 前置声明（定义在下面的"等 DRQ（IRQ 优先）"一节；本函数超时要回退到它）
+static bool ata_wait_drq_irq(int drive);
+// ★ v0.7.9：同一条 PIO 命令**内部跨扇区**的 DRQ 等待——**有界自旋**。
+//   为什么（实测）：之前每个扇区都走 ata_wait_drq_irq()，那会 hlt 到下一个 PIT 到来（>=4ms）。
+//   32 扇区的 inode 表窗口读取实测 ~80ms，而一次路径解析要 48 次窗口重填
+//   → 每个图标从卷装载 ~3.6s → 开始菜单一帧 >20s → 看门狗蓝屏。
+//   安全性：命令的**第一个**扇区仍走原路径（IRQ 优先 + 160ms 兜底 + 轮询回退）；
+//   这里只自旋很小的上限（约 2ms 的 inb 次数），超时就回退到原等待——
+//   所以最坏情况与改动前完全一样，绝不挂死、绝不误判成功。
+static bool ata_wait_drq_fast(int drive) {
+    const uint16_t io = base_port(drive);
+    for (uint32_t spin = 0; spin < 20000; spin++) {
+        const uint8_t st = inb((uint16_t)(io + 7));
+        if (st & 0x01) { ata64_dbg_reason = 2; return false; }   // ERR
+        if (st & 0x08) return true;                              // DRQ 已就绪
+    }
+    return ata_wait_drq_irq(drive);              // 慢设备：回退到原路径（含轮询回退）
+}
+
 // 状态快查：1=DRQ 就绪、-1=ERR、0=还没好。读主状态寄存器会清设备中断请求。
 static inline int ata64_check_drq64(int drive) {
     const uint8_t st = inb((uint16_t)(base_port(drive) + 7));
@@ -365,7 +384,9 @@ static bool ata_pio_read_once(int drive, uint32_t lba, uint32_t count, void* buf
 
     uint16_t* p = (uint16_t*)buf;
     for (uint32_t s = 0; s < count; s++) {
-        if (!ata_wait_drq_irq(drive)) {
+        // ★ v0.7.9：第一个扇区等命令完成（IRQ），后续扇区只等 DRQ（微秒级自旋）
+        const bool drq_ok = (s == 0) ? ata_wait_drq_irq(drive) : ata_wait_drq_fast(drive);
+        if (!drq_ok) {
             ata64_dbg_err = inb((uint16_t)(io + 1));
             return false;
         }
@@ -422,7 +443,9 @@ static bool ata_pio_write_once(int drive, uint32_t lba, uint32_t count, const vo
 
     const uint16_t* p = (const uint16_t*)buf;
     for (uint32_t s = 0; s < count; s++) {
-        if (!ata_wait_drq_irq(drive)) return false;
+        // ★ v0.7.9：同读路径（第一个扇区 IRQ，其后有界自旋）
+        const bool drq_ok = (s == 0) ? ata_wait_drq_irq(drive) : ata_wait_drq_fast(drive);
+        if (!drq_ok) return false;
         for (int i = 0; i < 256; i++) outw(io, *p++);
         ata_delay(drive);
         // 最后一个扇区之后由下面统一等 flush

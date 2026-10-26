@@ -1841,8 +1841,16 @@ int img64_install_blob64(const char* path, const uint8_t* data, uint32_t len, co
     return wr == (int)len ? 0 : -1;
 }
 
+// ★ v0.7.9 诊断：rdtsc（周期数，用 perf 行的 tsc_mhz 折算成 us）
+static inline uint64_t img_rdtsc64(void) {
+    uint32_t lo = 0, hi = 0;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
 int img64_load_vfs64(const char* path, Img64* out) {
     if (!path || !path[0]) return -1;
+    const uint64_t t0 = img_rdtsc64();
+    const uint32_t fill0 = vfs64_ino_fill_count64();
     uint32_t type = 0, size = 0;
     if (vfs64_system_slot64() < 0 ||
         vfs64_stat_on64(vfs64_system_slot64(), path, &type, &size) != 0) {
@@ -1864,7 +1872,9 @@ int img64_load_vfs64(const char* path, Img64* out) {
         dbg64_line_end64();
         return -1;
     }
+    const uint64_t t1 = img_rdtsc64();              // stat 完
     uint8_t* buf = (uint8_t*)kmalloc_64(size);
+
     if (!buf) { g_err = "oom file"; return -1; }
     const int got = vfs64_read_on64(vfs64_system_slot64(), path, buf, (int)size);
     if (got <= 0) {
@@ -1877,7 +1887,9 @@ int img64_load_vfs64(const char* path, Img64* out) {
         dbg64_line_end64();
         return -1;
     }
+    const uint64_t t2 = img_rdtsc64();              // read 完
     const int rc = img64_decode64(buf, got, out);
+    const uint64_t t3 = img_rdtsc64();              // decode 完
     kfree_64(buf);
     if (rc == 0) {
         dbg64_line_begin64();
@@ -1891,6 +1903,14 @@ int img64_load_vfs64(const char* path, Img64* out) {
         dbg64_dec((uint64_t)out->w);
         dbg64_str("x");
         dbg64_dec((uint64_t)out->h);
+        dbg64_str(" cyc_stat=");
+        dbg64_dec(t1 - t0);
+        dbg64_str(" cyc_read=");
+        dbg64_dec(t2 - t1);
+        dbg64_str(" cyc_dec=");
+        dbg64_dec(t3 - t2);
+        dbg64_str(" fills=");
+        dbg64_dec((uint64_t)(vfs64_ino_fill_count64() - fill0));
         dbg64_str(" (from VimtuFS2 system volume)");
         dbg64_nl();
         dbg64_line_end64();

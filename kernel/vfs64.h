@@ -440,6 +440,7 @@ int  vfs64_closedir64(int handle);
 // 建目录（**多级**：父目录必须已存在，否则 -1 + 打点）
 int  vfs64_mkdir64(const char* path);
 int  vfs64_mkdirs64(const char* path);            // 当前卷：逐级建 path 的父目录（幂等）
+uint32_t vfs64_ino_fill_count64(void);            // ★ v0.7.9 诊断：inode 窗口累计重填次数
 
 // 建空文件（父目录必须存在；已存在且是文件 = 返回 0 幂等；是目录 = -1）
 int  vfs64_create64(const char* path);

@@ -216,7 +216,12 @@ static uint32_t g_ptrs[VFS64_INDIRECT_PTRS];          // 释放/搬运时用的 
 //   为什么：inode 表是平表，列一次目录必须扫完 512 个槽；一扇区一次 ATA 事务时"进盘符"一帧要
 //   256+ 次事务（TCG 下每次十几毫秒）-> [WD64] watchdog fire -> PANIC64 stop=WATCHDOG_TIMEOUT
 //   （tests/multivol64_test.py 阶段 3 实测）。窗口化后全表扫描 = 4 次事务，读的字节完全一样。
-#define VFS64_INO_WIN_SEC 32u
+// ★ v0.7.9：32 扇区（128 个 inode）-> **512 扇区（= 2048 个 128B inode，整张表）**。
+//   实测：inode 表是平表，find_child() 必须扫完整张表；32 扇区一窗时一次全扫 = 16 次重填，
+//   一条图标路径（3~4 个分量）= 48 次重填 → 每个图标 ~3.6s。改成整表一窗后，
+//   首次访问读一整张表（两条 ATA 命令），之后所有查找都在 RAM 里（写盘仍会使它失效）。
+//   代价：.bss +240 KB（内核文件体积不变），与“一次路径解析读 768 KB”相比完全值得。
+#define VFS64_INO_WIN_SEC 512u
 static uint8_t  g_ino_win[VFS64_INO_WIN_SEC * VFS64_SECTOR_BYTES] __attribute__((aligned(16)));
 // ★ 批次 M：大文件（二级间接）用的工作镜像与记账（都只在一次文件操作内有效，操作串行、不重入）
 static uint8_t  g_l1[VFS64_SECTOR_BYTES];             // 一级间接块镜像（inode->ind）
@@ -233,6 +238,12 @@ static int      g_ino_cache_slot  = -1;               // ★ 缓存键 = (slot, 
 static int      g_ino_cache_drive = -1;
 static uint32_t g_ino_win_base    = 0xFFFFFFFFu;      // 窗口首扇区（inode 表内相对块号）
 static uint32_t g_ino_win_count   = 0;                // 窗口里有效扇区数（表尾不足一窗时更少）
+static inline uint64_t vfs_rdtsc64(void) {
+    uint32_t lo = 0, hi = 0;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}// ★ v0.7.9 诊断：窗口填充次数（检验“平表全扫 = 多次窗口重填”这个假设）
+static uint32_t g_ino_fill64      = 0;
 static bool     g_ino_cache_valid = false;
 
 static Vfs64Geom g_vol[VFS64_SLOT_MAX];               // 卷槽表（0 号槽 = 系统卷）
@@ -284,12 +295,26 @@ static bool ino_cache_fill(int drive, uint32_t rel_blk) {
     uint32_t base = rel_blk - (rel_blk % VFS64_INO_WIN_SEC);
     uint32_t n = ino_blocks - base;
     if (n > VFS64_INO_WIN_SEC) n = VFS64_INO_WIN_SEC;
+    const uint64_t f0 = vfs_rdtsc64();
     if (!dev_read_at(drive, g_start + g_inode_start + base, n, g_ino_win)) return false;
+    const uint64_t f1 = vfs_rdtsc64();
+    if (g_ino_fill64 < 4) {                     // ★ v0.7.9 诊断：前 4 次填充打成本（防刷屏）
+        dbg64_line_begin64();
+        dbg64_str("[VFS64] ino fill base=");
+        dbg64_dec((uint64_t)base);
+        dbg64_str(" n=");
+        dbg64_dec((uint64_t)n);
+        dbg64_str(" cyc=");
+        dbg64_dec(f1 - f0);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
     g_ino_win_base  = base;
     g_ino_win_count = n;
     g_ino_cache_slot  = g_cur_slot;                      // 记下**卷身份**，不只是 LBA
     g_ino_cache_drive = drive;
     g_ino_cache_valid = true;
+    g_ino_fill64++;
     return true;
 }
 
@@ -572,9 +597,24 @@ static bool dev_read_at(int drive, uint32_t abs_lba, uint32_t count, void* buf) 
     }
     return true;
 }
-static bool dev_write_at(int drive, uint32_t abs_lba, uint32_t count, const void* buf) {
+// ★ v0.7.9：失效条件收窄为“写到的扇区范围**与 inode 表重叠**”。
+//   为什么（实测）：之前是“任何写盘都失效”。inode 窗口从 32 扇区改成整张表（512 扇区 = 256 KB）后，
+//   写一个数据块或位图扇区就要多读 256 KB → `dpkg -i` 实测从 20.5s 变成 32.9s。
+//   位图区 / 数据区 / 超级块与 inode 表**永不重叠**（各自的起始与长度都在卷几何里），所以这条收窄可证明安全；
+//   真正改 inode 扇区的地方（format / 自检注入 / 任何经 dev_write 的裸写）仍然会失效。
+static void ino_cache_invalidate_on_overlap64(uint32_t abs_lba, uint32_t count) {
+    if (!g_ino_cache_valid || !g_lay) return;
+    const uint32_t ino_lo = g_start + g_inode_start;
+    const uint32_t ino_blocks = (g_inode_count + g_lay->inodes_per_blk - 1u) / g_lay->inodes_per_blk;
+    const uint32_t ino_hi = ino_lo + ino_blocks;
+    if (abs_lba >= ino_hi) return;                       // 在表之后：不重叠
+    if (abs_lba + count <= ino_lo) return;               // 在表之前：不重叠
+    ino_cache_invalidate();
+}
+static bool dev_write_at(int drive, uint32_t abs_lba, uint32_t count, const void* buf,
+                         bool keep_ino_cache = false) {
     if (count == 0) return true;
-    ino_cache_invalidate();             // 任何写盘都让 inode 扇区缓存失效（宁可多读，绝不给旧字节）
+    if (!keep_ino_cache) ino_cache_invalidate_on_overlap64(abs_lba, count);
     if (g_fake_active) {
         if ((uint64_t)abs_lba + count > VFS64_FAKE_SECTORS) {
             dbg64_str("[VFS64] fake-disk range fail lba=");
@@ -966,8 +1006,9 @@ static bool inode_store(uint32_t idx, const uint8_t* in) {
     uint8_t* sec = g_ino_win + (uint64_t)(rel - g_ino_win_base) * VFS64_SECTOR_BYTES;
     copy_bytes(sec + off, in, g_lay->inode_bytes);
     // 只写这一扇区（窗口里别的 inode 字节原样不动）；写完全表失效：以后要用就重读
-    if (!dev_write(g_start + blk, 1, sec)) { ino_cache_invalidate(); return false; }
-    ino_cache_invalidate();
+    // ★ v0.7.9：成功写盘后**不再失效**——新字节已经在窗口里了（上一步 copy_bytes），
+    //   RAM 副本与磁盘一致；失效只会把 256 KB 重读一遍（写密集场景实测多花 12 s）。
+    if (!dev_write_at(g_drive, g_start + blk, 1, sec, true)) { ino_cache_invalidate(); return false; }
     return true;
 }
 // 结构合法性：类型/名字长度/保留字段/CRC/大小/（v3/v4）时间与保留区/（v4）权限字段。
@@ -2960,6 +3001,9 @@ int vfs64_mkdir64(const char* path) {
     return 0;
 }
 int vfs64_mkdir(const char* path) { return vfs64_mkdir64(path); }
+
+// ★ v0.7.9 诊断用：inode 窗口累计重填次数（只读，不改任何状态）。
+uint32_t vfs64_ino_fill_count64(void) { return g_ino_fill64; }
 
 // ==================== ★ v0.7.8：逐级建目录（父链）====================
 // 为什么需要（实测缺陷）：kPathAlias 把 "/proc64.elf" 映射成 "/usr/share/demo/proc64.elf"；
