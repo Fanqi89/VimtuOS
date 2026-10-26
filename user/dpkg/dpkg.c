@@ -163,7 +163,13 @@ static int ar_extract(const char* deb, const char* outdir, char* ctl_name, u32 c
     }
     int rc = 0;
     char hdr[60];
-    static char io[32768];
+    // ★ v0.7.6（真缺陷）：静态缓冲总量必须让 .bss 进得下 execve 的
+//   **64 KiB 主程序窗口**（上界 = 4 GiB + 64 KiB = 用户栈起点 0x100010000）。
+//   原来 io[32768] + 4096 + 8192 + 16384 + 16384 = 77824 B，.bss 一直压到 0x100017000 ->
+//   装载器直接拒：`[ELF64] exec reject segment va=0000000100000000 reason=overlaps-user-region`，
+//   于是 dpkg/apt 根本起不来。现在总量 40960 B（.bss 结束 0x10000E000，留 8 KiB 余）。
+//   代价（如实）：ar 流拷贝从 32 KiB/次 降到 16 KiB/次（只影响掐速度）。
+static char io[16384];
     for (;;) {
         const i64 n = f_read(fd, hdr, 60);
         if (n == 0) break;                                  /* 正常结束 */
@@ -272,7 +278,7 @@ static int status_append(const char* pkg, const char* ver, const char* deb_path)
 static void status_list(void) {
     const i64 fd = f_open(STATUS_PATH, O_RDONLY, 0);
     if (fd < 0) { out("dpkg: 还没有安装任何包（" STATUS_PATH " 不存在）\n"); return; }
-    static char buf[8192];
+    static char buf[4096];                                // 状态文件列表（每包 ~120 B，4 KiB 约 34 个包）
     const i64 n = f_read(fd, buf, (i64)sizeof(buf) - 1);
     f_close(fd);
     if (n <= 0) { out("dpkg: 还没有安装任何包\n"); return; }
@@ -317,12 +323,17 @@ static void status_list(void) {
 static int status_remove(const char* pkg) {
     const i64 fd = f_open(STATUS_PATH, O_RDONLY, 0);
     if (fd < 0) { out("dpkg: 没有安装记录\n"); return -1; }
-    static char buf[16384];
+    static char buf[8192];
     const i64 n = f_read(fd, buf, (i64)sizeof(buf) - 1);
+    if (n >= (i64)sizeof(buf) - 1) {                      // 如实拒绝，不静默截断状态文件
+        out("dpkg: /var/lib/dpkg/status 太大（本工具缓冲 8 KiB），请先手工清理\n");
+        f_close(fd);
+        return -1;
+    }
     f_close(fd);
     if (n <= 0) return -1;
     buf[n] = 0;
-    static char keep[16384];
+    static char keep[8192];
     keep[0] = 0;
     char* p = buf;
     char para[2048];

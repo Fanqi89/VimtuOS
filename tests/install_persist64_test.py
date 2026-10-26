@@ -105,7 +105,7 @@ def start(qemu, args, serial, port):
 
 
 def type_line(mon, text, per=0.13):
-    km = {" ": "spc", "/": "slash", ".": "dot", "-": "minus"}
+    km = {" ": "spc", "/": "slash", ".": "dot", "-": "minus", "_": "shift-minus"}
     for ch in text:
         mon.key(km.get(ch, ch), wait=per)
     mon.key("ret", wait=1.0)

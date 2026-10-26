@@ -3413,6 +3413,9 @@ TESTS = [
     ("smp64_test.py", "SMP：启动 AP（-smp 2/4）+ 单核/无 ACPI 降级（AP 自己打在线行）"),
     ("sched_stress_test.py", "调度器压力：创建→运行→退出→回收 200 轮 + 待切换帧校验（kstress）"),
     ("proc64_test.py", "进程/地址空间：每进程 CR3 + fork/execve/wait4/kill（BIOS 隔离 + UEFI 如实降级）"),
+    ("taskexit64_test.py", "★ v0.7.6 真缺陷：任务 exit 不再跳飞（#UD rip=0x47）—— 任务内核栈 16->32KB + "
+                           "蹦床 jmp 到静态保存的返回地址；带卷启动无 [PANIC] cpu exception / "
+                           "wait4 拿到子进程号 / 桌面能起来"),
     ("usb64_test.py", "USB 主机：UHCI + HID 引导键盘（sendkey -> 桌面响应）+ 两种降级"),
     ("usbstorage_test.py", "★ 批次 O/P8b USB 存储：BOT+SCSI（INQUIRY/READ CAPACITY/READ(10)+WRITE(10)）"
                            "-> 驱动器号 24 -> 盘符 D: -> 管理器浏览 + 从 U 盘拷 .vap/.elf 到 C:"

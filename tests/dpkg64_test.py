@@ -35,6 +35,44 @@ def q(p):
     return p.replace("\\", "/")
 
 
+def open_terminal_dock(log_fn, mon, timeout=90):
+    """从 **Dock 的终端图标** 开终端（不用开始菜单）。
+
+    为什么要这条路径（实测原因）：这块演示盘的每个图标从卷里装载要 ~1.4 s
+    （`[ICON64] load … ok=1` 相邻两行隔 1 秒多），而开始菜单一开就要装 14 个图标 ——
+    单次 GUI 帧迭代 >20 s，直接触发 20 s 看门狗蓝屏（`[PANIC64] stop=WATCHDOG_TIMEOUT`）。
+    Dock 图标只有 9 个且不重绘列表，1 次点击就能开终端，是本构建下唯一稳的入口。
+    """
+    import re
+    import time
+    deadline = time.time() + timeout
+    hit = None
+    while time.time() < deadline and not hit:
+        for mm in re.finditer(r"\[DOCK64\] item idx=(\d+) app=(-?\d+) name=\S+ x=(\d+) y=(\d+) "
+                              r"w=(\d+) h=(\d+) cx=(\d+) cy=(\d+)", log_fn()):
+            if mm.group(2) == "3":                    # app=3 = 终端
+                hit = mm
+                break
+        if not hit:
+            time.sleep(1.0)
+    if not hit:
+        return False
+    cur = SM.Cursor()
+    cur.goto(mon, int(hit.group(7)), int(hit.group(8)))
+    cur.settle(mon)
+    time.sleep(0.3)
+    mon.click()
+    t0 = time.time()
+    while time.time() - t0 < 60:
+        lg = log_fn()
+        if "[APP] term opened" in lg:
+            return True
+        if "[PANIC64] stop=" in lg:
+            print("  （开窗期间看门狗蓝屏：%s）" % ([x[:90] for x in re.findall(r"\[PANIC64\] stop=[^\n]*", lg)][:1],))
+            return False
+        time.sleep(0.5)
+    return False
+
 def check(name, cond, detail=""):
     global ok
     ok = ok and bool(cond)
@@ -76,11 +114,16 @@ def main():
         os.remove(serial)
     proc, mon = start(["-drive", "format=raw,file=%s" % q(DISK), "-boot", "order=c"], serial, PORT)
     try:
-        if not qh.wait_desktop(mon, lambda: log_of(serial), proc, timeout=400):
+        # ★ 登录手势的超时给够：这块演示盘启动要跑完整套自检（proc64/pipe/evshm 6s hold/musl/
+        #   dynlink），实测到桌面 ≈ 204 s；原来默认 login_timeout=180 会让"等锁屏"超时、
+        #   于是根本不按键，白等 400 s 报"起不到桌面"（实测踩过）。
+        if not qh.wait_desktop(mon, lambda: log_of(serial), proc, timeout=400, login_timeout=460):
             print("起不到桌面")
             return 2
-        P.open_terminal(log_of(serial), mon, serial)
-        time.sleep(1.0)
+        if not open_terminal_dock(lambda: log_of(serial), mon):
+            print("终端开不出来（Dock 图标路径）")
+            return 2
+        time.sleep(1.5)
 
         # A. --version
         P.type_line(mon, "run /usr/bin/dpkg --version")
@@ -89,7 +132,7 @@ def main():
         check("A. dpkg --version 起得来", "dpkg 0.7.5 (vimtu-dpkg" in log)
 
         # B. 安装真 .deb
-        P.type_line(mon, "run /usr/bin/dpkg -i /usr/share/dpkg/test-vimtu_1.0.deb")
+        P.type_line(mon, "run /usr/bin/dpkg -i /usr/share/dpkg/test-vimtu-1.0.deb")
         time.sleep(8.0)
         log = log_of(serial)
         check("B. dpkg -i 装成功（ar+control+tar+status 全过）",

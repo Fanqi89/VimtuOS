@@ -32,7 +32,11 @@ enum Task64State : uint32_t {
 
 static const int      TASK64_MAX         = 16;
 static const int      TASK64_NAME_MAX    = 16;
-static const uint32_t TASK64_STACK_BYTES = 16 * 1024;   // 每任务 16KB 内核栈（内核堆分配）
+// ★ v0.7.6：16KB -> 32KB。真缺陷实测：16KB 栈里 SYSCALL 处理器只有
+//   0x2000-0x1000-0xD0 = 0xF30（≈3.9KB）可用，而 execve -> VFS -> 磁盘读链路实测要
+//   ≈4.5KB，直接把"从 ring3 回来"的返回地址压成 0x40 -> exit 时跳飞
+//   （[PANIC] cpu exception 6 rip=0x47）。翻倍后处理器有 12080B、入口侧 C 栈 16KB。
+static const uint32_t TASK64_STACK_BYTES = 32 * 1024;   // 每任务 32KB 内核栈（内核堆分配）
 static const uint32_t TASK64_SLICE_TICKS = 2;           // 时间片 = 2 tick = 8ms
 
 // 任务信息快照（任务管理器 / terminal ps 用；纯值拷贝，不暴露内部指针）

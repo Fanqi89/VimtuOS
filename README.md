@@ -215,20 +215,56 @@ shm + wl_surface + `wl_seat_get()` + font64 排版）：
   的 `run PATH` 走 `fork(57)+execve(59)+wait4(61)`，子进程有独立 `Proc64`，
   实测 `[SIG64] raise pid=28 sig=13 src=pipe-epipe` -> `[SIG64] default action pid=28 sig=13 exit=141`。
   想跑出完整 Linux 语义，就在 shell 里 `run`，不要用终端内建的那条。
-- ❌ **线程**：`clone` 只支持 fork 语义，`CLONE_VM/THREAD` → `-ENOSYS`；**没有 futex**
+- ⚠️ **线程**：`clone` 只支持 fork 语义，`CLONE_VM/THREAD` → `-ENOSYS`。futex(202) 从 v0.7.1 起**有**
+  WAIT/WAKE，但实现是"轮询式等待"（本内核没有等待队列，1 ms 重查一次）—— 语义对、有界超时，
+  代价是唤醒最多慢 1 ms；**并发与优先级继承未验证**。所以 pthread 还是跑不起来（缺 `CLONE_THREAD`）
 - ❌ **swap / 页换出**：内存不足直接 `-ENOMEM`
 - ❌ **COW**：`fork` 整页物理复制
 - ❌ **ASLR**：映像地址确定
 - ❌ 内核模块加载（单体内核）
 - ⚠️ UEFI 路径下无地址空间隔离（`fork/execve/wait4` 全 `-ENOSYS`，串口如实标注）
+- ✅ **v0.7.6 修的真缺陷：任务 exit 会跳飞成 `#UD rip=0x47`**（v0.7.1~v0.7.5 一直存在，
+  v0.7.5 的发版检查才拦下）。根因是**任务内核栈几何**：16 KB 栈里 SYSCALL 处理器只有
+  `0x2000-0x1000-0xD0 = 0xF30`（≈3.9 KB），而 `execve -> VFS -> 磁盘读`（`dev_read_at -> ata_wait_*`）
+  实测压到 `stack_top-0x22A0`（处理器侧 4.5 KB），正好盖住"从 ring3 回来"的返回地址槽
+  —— gdb 写观察点抓到 `push` 把它写成 `0x40`，`ret` 弹出去就跳飞。
+  修法：① 每任务栈 **16 KB -> 32 KB**、入口预留 **0x2000 -> 0x4000**（处理器可用深度 12,080 B，
+  入口侧 C 栈仍有 16 KB）；② 蹦床 `user64_resume_tramp64` 改成 **jmp 到静态保存区里的返回地址**
+  （不再从可能被压穿的内核栈 `ret`）；③ 退出前打一行
+  `[USER64] exit resume rsp=.. ret=.. verdict=ok|bad`，不是内核代码地址就不回蹦床。
+  实测：`tests/taskexit64_test.py` **6/6 PASS**、`verdict=ok` **23/23** 条、
+  `[PROC64] exit pid=4 code=0` + `wait4 pid=4 status=0`（修前是 `wait4 TIMEOUT pid=4`、
+  用户看到 `pid=4294967285` = `-EAGAIN`），带卷启动第一次真正进桌面；内核 +720 B。
 
 ### Linux 兼容
-- ❌ **socket(41)/connect(42)/accept(43)/sendto(44)** —— 任何 Linux 网络程序（curl/浏览器）都跑不了
-- ❌ 部分：`lstat`（无符号链接）、`readlink`（只认 `/proc/self/exe`）、`getrlimit/setrlimit`（无配额）
-- ❌ glibc / 发行版二进制**未验证**（`/proc`、`/sys`、pty、完整 TLS/vDSO 都缺）
+- ⚠️ **socket**（v0.7.4）：`socket/connect/sendto/recvfrom/send/recv/shutdown/getsockname/getpeername`
+  已实现，TCP 走三次握手 + PSH/ACK 分片（1460 B）、`close` 发 FIN，UDP 收发可用；
+  **`accept`(43) / `bind`(49) / `listen`(50) 如实返回 `-EOPNOTSUPP`**（没有服务端）。
+  ★ 如实边界：**从未真连过一次网络** —— 只有纯逻辑自检
+  `[SOCK64] selftest PASS (client-only: TCP connect/send/recv/close + UDP; no listen/accept)`。
+  另外 socket 句柄是 `200+idx`、**不在 fd 表里**，所以 `poll/select`/`epoll` 看不到它。
+- ✅ **poll/select 家族**（v0.7.1）：`poll(7)`/`ppoll(271)`/`pselect6(270)`/`select(23)`（`nfds<=64`）+
+  `epoll_create1/ctl/wait`（291/233/232）—— 就绪判断实测
+  `[VFS64] poll-ready: file=IN|OUT ok badfd=NVAL pipe=IN/OUT/HUP ok`、`epoll=IN+data ok`。
+- ✅ **符号链接**（v0.7.0）：`symlink(88)`/`readlink(89)` 可用（`VFS64_TYPE_LINK`，只跟随**最后一级**、
+  最多 8 层，目标 <=511 B），实测 `[VFS64] symlink: create/readlink/follow PASS`；
+  **`link(86)` 硬链接仍 `-EPERM`**（VimtuFS2 的目录项内嵌在 inode 里，要支持得升卷格式）。
+- ⚠️ **dpkg / apt**（v0.7.5 起，用户态兼容工具，**不是** Debian 二进制）：同命令、同 `.deb` 容器、同
+  `/var/lib/dpkg/status`。容器解析 = `ar` + `control.tar.gz` + `data.tar.gz`（**xz / zstd 成员如实拒绝**，
+  这条链上没有解码器；带 `preinst/postinst` 的包整包拒绝）。
+  ★ **v0.7.6 实测状态（如实，逐条）**：`dpkg --version` / `dpkg -l` / `apt update`（如实报"当前未启用"）
+  **已通过**；`dpkg -i` **仍未通过** —— 它能起来、能解 ar、能 fork+exec `/usr/bin/tar -x -z`（argv 真传到了，
+  `[PROC64] execve path=/usr/bin/tar … argc=7`），tar 又 fork `/bin/gunzip` 并从管道读到了 control.tar 头与内容，
+  但最后 `tar: gunzip child failed for /tmp/dpkg-work/control.tar.gz`：gunzip 被 **SIGPIPE（141）** 打死（序列：
+  tar 先 `close fd=3` -> gunzip 再 write 得 EPIPE -> SIGPIPE）。这一层还没修，`tests/dpkg64_test.py` 当前是
+  **A/D/E PASS、B/C FAIL**（不把它当成能装包）。
+- ⚠️ **glibc / 发行版二进制**：动态映像（`PT_INTERP` + 独立地址空间 `execve`）已实现，
+  验收脚本 `tests/dynlink64_test.py` / `tests/musl64_test.py` 覆盖；但 `/proc`、`/sys`、pty、
+  完整 TLS/vDSO 仍缺 -> **常见发行版二进制整体跑不起来**，别当成"能跑 Debian 程序"。
+- ❌ 部分：`lstat`、`getrlimit/setrlimit`（无配额）
 
 ### 文件系统
-- ❌ 日志（journaling）/ 快照 / 配额 / ACL / 符号链接
+- ❌ 日志（journaling）/ 快照 / 配额 / ACL（符号链接 v0.7.0 起**已有**，见上面"Linux 兼容"）
 - ❌ ext4 / NTFS（读不了 Windows 盘）
 - ⚠️ 写文件是"整文件覆盖 + 立刻落盘"，单文件上限 67584 B（fd 层）
 - ✅ **根目录的预设资源目录**（v0.5.8）：`/Wallpapers/` = 预设壁纸、`/Avatars/` = 预设头像，

@@ -100,7 +100,15 @@ void user64_force_available64(int on) {
 //     * in_ring3 也变成按槽位的位图（多进程时"我这一帧该不该改写"只能问自己）。
 // extern "C"：汇编块按名字引用（见下面 user64_enter64/user64_resume_tramp64）。
 static const int U64_CTX_MAX = 20;                 // >= TASK64_MAX(16)，留几个兜底槽
-struct User64Ctx64 { uint64_t rsp, rbx, rbp, r12, r13, r14, r15; };
+// ★ v0.7.6：末尾加 ret —— 进 ring3 时的返回地址也存进**静态**保存区。
+//   为什么必须（真缺陷，断点级实测）：原来蹦床靠 `ret` 从内核栈里弹返回地址，
+//   而 exit 之前处理器链可能已经压穿了"入口帧"那块栈：实测子进程
+//   execve /hello.elf  时 dev_read_at 的序言 push（r15=0x20 r14=0 r13=0x20 r12=0 rbx=0x40）
+//   + ata_wait_* 的 pushf/push rbp 落在入口 rsp 那个槽上 —— 弹出来是 0x40，直接跳飞
+//   （[PANIC] cpu exception 6 rip=0x47）。放静态区就与栈深度彻底解耦。
+struct User64Ctx64 { uint64_t rsp, rbx, rbp, r12, r13, r14, r15, ret; };
+// 任何"回内核"的返回地址都必须 >= 这个值（kernel/linker64.ld 的链接基址）
+static const uint64_t U64_KERNEL_TEXT_LO64 = 0xFFFFFFFF80100000ULL;
 static User64Ctx64 g_user64_ctx64[U64_CTX_MAX];
 extern "C" uint64_t g_user64_ctxp64 = (uint64_t)(uintptr_t)&g_user64_ctx64[0];  // 当前任务的保存区
 extern "C" uint64_t g_user64_exit_code64 = 0;  // 最近一次用户 exit(code) 的 code（蹦床写进 rax）
@@ -193,7 +201,9 @@ extern "C" void user64_slot_release64(int slot) {
 // ==================== 进出 ring3 的汇编桥 ====================
 // 只能写在文件作用域的 asm 块里：这两段是"半个函数"的跳转目标，C++ 表达不出来。
 //   user64_enter64(rdi = 目标帧)：保存内核继续点（rsp + callee-saved）后跳 task_switch_iret64。
-//   user64_resume_tramp64       ：复位栈/寄存器后 ret，回到 user64_run_blob64 的调用点。
+//   user64_resume_tramp64       ：复位栈/寄存器后 jmp 到静态保存区里的返回地址
+//                                 （v0.7.6 起不再从内核栈 ret），回到 user64_run_blob64 /
+//                                 user64_enter_frame64 的调用点。
 __asm__(
 ".text\n"
 ".globl user64_enter64\n"
@@ -207,7 +217,10 @@ __asm__(
 "    movq %r13, 32(%rax)\n"
 "    movq %r14, 40(%rax)\n"
 "    movq %r15, 48(%rax)\n"
-"    movq %rsp, 0(%rax)\n"                      // rsp 最后写（rax 被上面用掉；帧里的 rax 另行弹出）
+"    movq (%rsp), %rcx\n"                       // ★ v0.7.6：返回地址存进**静态**保存区
+"    movq %rcx, 56(%rax)\n"
+"    leaq 8(%rsp), %rcx\n"                      // 弹掉返回地址后的 rsp（= call 已返回 的状态）
+"    movq %rcx, 0(%rax)\n"                      // rsp 最后写（rax 被上面用掉；帧里的 rax 另行弹出）
 "    jmp task_switch_iret64\n"                  // 不返回：按 rdi 指向的帧 iretq（可切到 ring3）
 ".size user64_enter64, .-user64_enter64\n"
 ".globl user64_resume_tramp64\n"
@@ -224,9 +237,10 @@ __asm__(
 "    movq 32(%rax), %r13\n"
 "    movq 40(%rax), %r14\n"
 "    movq 48(%rax), %r15\n"
+"    movq 56(%rax), %rcx\n"                      // ★ v0.7.6：返回地址取自静态保存区（不再从栈里 ret）
 "    movq g_user64_exit_code64(%rip), %rax\n"    // 返回值 = 退出码（C 侧同时用返回值，见 enter_at64）
 "    sti\n"                                      // 栈已复位，可以开中断
-"    ret\n"                                      // [rsp] = user64_enter64 的返回地址
+"    jmp *%rcx\n"                                // 等价于 ret，但内核栈被压穿也不受影响
 ".size user64_resume_tramp64, .-user64_resume_tramp64\n"
 );
 
@@ -541,6 +555,21 @@ int user64_range_ok64(uint64_t va, uint64_t len) {
 int user64_exit_to_kernel64(pt_regs64* r, uint64_t code) {
     if (!r || !u64_in_ring3_get64()) return 0;              // 本任务不在 ring3：按普通返回处理
     u64_ctx_bind64();                                       // 蹦床读的就是它（IF=0，期间不会被换走）
+    // ★ v0.7.6：蹦床改成 jmp 到 ctx.ret（不再从内核栈 ret），这里把它打印出来并核对。
+    //   它是"阈值下跳飞"的唯一防线：不是内核代码地址就不回蹦床。
+    {
+        const uint64_t* c = (const uint64_t*)(uintptr_t)g_user64_ctxp64;
+        const uint64_t rs = c[0], ra = c[7];
+        const int ok = (rs != 0) && (ra >= U64_KERNEL_TEXT_LO64);
+        dbg64_line_begin64();
+        dbg64_str("[USER64] exit resume rsp=0x");
+        dbg64_hex64(rs);
+        dbg64_str(" ret=0x");
+        dbg64_hex64(ra);
+        dbg64_str(ok ? " verdict=ok\n" : " verdict=bad (no kernel return addr)\n");
+        dbg64_line_end64();
+        if (!ok) return 0;                                  // 宁可把 exit 当普通调用返回，也不跳飞
+    }
     g_user64_exit_code64 = code;
     r->rip    = (uint64_t)(uintptr_t)user64_resume_tramp64; // 内核蹦床
     r->cs     = SEL64_KCODE;                                // 0x08：同特权级 iretq（只弹 3 个字）

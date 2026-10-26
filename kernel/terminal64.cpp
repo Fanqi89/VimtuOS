@@ -4432,7 +4432,8 @@ static bool cmd_shell(TerminalState* ts, const char* arg1);
 //   4) 子进程的 write(1) 因此落进文件；它的 stdout **不再**是内核控制台。
 // 如实边界：只做一次 `>` / `>>` / `<`（不做管道、不做 `2>`）；失败一律报错，绝不静默忽略。
 static bool term_run_redir64(TerminalState* ts, const char* path, const char* out_file, int append,
-                             const char* in_file) {
+                             const char* in_file, const char* const* argv = nullptr,
+                             uint32_t argc = 0) {
     if (!proc64_isolate64()) {
         ts_puts(ts, "run: shared address space mode -> no per-process fds (redirection unsupported)\n");
         return false;
@@ -4476,9 +4477,13 @@ static bool term_run_redir64(TerminalState* ts, const char* path, const char* ou
         int kout = -1, kin = -1;
         if (ofd >= 0) kout = fd64_dup64(ofd, 1);
         if (ifd >= 0) kin = fd64_dup64(ifd, 0);
-        if (kout != 1) rc = -6;
+        // ★ v0.7.6（真缺陷）：没有 `>` 时 ofd<0、kout 保持 -1，原来这行无条件
+        //   把 rc 置成 -6，于是「无重定向」的路径（包括 `run X < in` 和本次新加的带 argv）全部失败。
+        if (ofd >= 0 && kout != 1) rc = -6;
         if (rc == -1 && ifd >= 0 && kin != 0) rc = -7;
-        if (rc == -1 && proc64_start_elf64(pid, path) == 0) {
+        // ★ v0.7.6：有 argv 就走「真 argv」那个入口（A4-5 已实现），没有就一字不改走老路。
+        if (rc == -1 && ((argc > 0) ? proc64_start_elf64_argv64(pid, path, argv, argc)
+                                    : proc64_start_elf64(pid, path)) == 0) {
             rc = -2;
             const uint64_t t0 = g_ticks64;
             for (;;) {
@@ -4684,6 +4689,13 @@ static void shell_exec(TerminalState* ts, const char* line) {
             char rout[80], rin[80];
             int append = 0, have_redir = 0, redir_bad = 0;
             rout[0] = 0; rin[0] = 0;
+            // ★ v0.7.6：`run PATH ARG...` —— 余下 token 原样当子进程的 argv[1..]。
+            //   为什么必须（真缺失）：dpkg / apt 这类工具全靠参数（`--version` / `-i FILE`），
+            //   原来这里一律报 "unsupported argument"，于是它们根本起不来。
+            //   argv[0] = 解析后的绝对路径（与 `run PATH` 单参时子进程看到的一致）。
+            static char run_argv_buf[8][72];
+            const char* run_argv[9];
+            uint32_t run_argc = 0;
             {
                 const char* rp = skip_ws(args2);                 // args2 = 第 1 个参数之后的原文
                 if (rp[0] == '>' || rp[0] == '<') {
@@ -4698,12 +4710,34 @@ static void shell_exec(TerminalState* ts, const char* line) {
                         ok = false;
                     }
                 } else if (rp[0]) {
-                    ts_puts(ts, "run: unsupported argument (only '> FILE' / '>> FILE' / '< FILE')\n");
-                    redir_bad = 1;
-                    ok = false;
+                    run_argv[0] = path;                          // argv[0] = 可执行文件路径
+                    run_argc = 1;
+                    const char* q = rp;
+                    while (*q && run_argc < 8) {
+                        q = grab_token(q, run_argv_buf[run_argc], 72);
+                        run_argv[run_argc] = run_argv_buf[run_argc];
+                        run_argc++;
+                        q = skip_ws(q);
+                    }
+                    run_argv[run_argc] = nullptr;
+                    dbg64_line_begin64();
+                    dbg64_str("[TERM] run argv path=");
+                    dbg64_str(path);
+                    dbg64_str(" argc=");
+                    dbg64_dec((uint64_t)run_argc);
+                    dbg64_str(" a1=");
+                    dbg64_str(run_argc > 1 ? run_argv[1] : "-");
+                    dbg64_str(" a2=");
+                    dbg64_str(run_argc > 2 ? run_argv[2] : "-");
+                    dbg64_nl();
+                    dbg64_line_end64();
                 }
             }
-            if (have_redir && !redir_bad) {
+            if (!have_redir && !redir_bad && run_argc > 1) {
+                ok = term_run_redir64(ts, path, nullptr, 0, nullptr, run_argv, run_argc);
+                ts_puts(ts, ok ? gui64_tr("run: ok (with args)\n", "run: 成功（带参数）\n")
+                               : gui64_tr("run: failed (see serial log)\n", "run: 失败（见串口日志）\n"));
+            } else if (have_redir && !redir_bad) {
                 ok = term_run_redir64(ts, path, rout, append, rin);
                 ts_puts(ts, ok ? gui64_tr("run: ok (redirected)\n", "run: 成功（已重定向）\n")
                                : gui64_tr("run: failed (see serial log)\n", "run: 失败（见串口日志）\n"));

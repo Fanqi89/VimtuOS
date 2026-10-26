@@ -121,8 +121,13 @@ static volatile uint64_t g_work_iters  = 0;
 //   所以从 0x80000 向下使用的这块栈不会碰到引导流程正在用的栈。
 static const uint64_t TASK64_TASK0_RSP0 = 0x80000;
 // 新任务的**内核 C 栈预留**（见 task_build_frame）：顶部留给 ring3 中断帧（0xD0）与
-// SYSCALL 专用栈（0x1000），C 执行栈从 stack_top - 0x2000 起（16KB 栈里剩 8KB 给 C）。
-static const uint64_t TASK64_ENTRY_RSP_RESERVE = 0x2000;
+// SYSCALL 专用栈（0x1000），C 执行栈从 stack_top - 0x4000 起。
+// ★ v0.7.6（真缺陷，指令级实测）：原来预留 0x2000 —— 于是 SYSCALL 处理器只有
+//   0x2000-0x1000-0xD0 = 0xF30（≈3.9KB）可用。而 execve -> VFS -> 磁盘读
+//   （dev_read_at -> ata_wait_drq_irq / ata_wait_done_irq）实测压到 stack_top-0x22A0（≈8.7KB），
+//   处理器侧用了 4.5KB —— 正好盖住"从 ring3 回来"的返回地址槽，子进程 exit 后
+//   ret 到 0x40 跳飞（[PANIC] cpu exception 6 rip=0x47）。预留 0x4000 后处理器有 12080B。
+static const uint64_t TASK64_ENTRY_RSP_RESERVE = 0x4000;
 
 static inline uint64_t task_rsp0_of(const Task64* t) {
     return t->stack_top ? t->stack_top : TASK64_TASK0_RSP0;
@@ -360,10 +365,11 @@ static uint64_t task_build_frame(uint64_t stack_top) {
     // ★ 任务的**内核 C 栈从 stack_top - TASK64_ENTRY_RSP_RESERVE 开始**（不是 stack_top）：
     //   rsp0 = stack_top，ring3 的中断帧压在 [stack_top-0xD0, stack_top)；若入口函数直接用
     //   stack_top 向下，它的栈帧就会和中断帧**重叠**（本模块踩过：proc64 的子进程从 ring3
-    //   回来时 ret 到 0x3 —— 栈顶那几个字被中断帧覆盖了）。留 8KB：
-    //     顶部 0x0000..0x0D0  ring3 中断帧（rsp0 = stack_top）
-    //         0x1000        SYSCALL 入口专用栈顶（帧在它下方 0xD0 内，见 task_create_ex64）
-    //         0x2000 起      任务自己的内核 C 执行栈（向下生长）
+    //   回来时 ret 到 0x3 —— 栈顶那几个字被中断帧覆盖了）。留 16KB（32KB 栈）：
+    //     顶部 0x0000..0x0D0   ring3 中断帧（rsp0 = stack_top）
+    //         0x1000         SYSCALL 入口专用栈顶（帧在它下方 0xD0 内，见 task_create_ex64）
+    //         0x10D0..0x4000 SYSCALL 处理器可用深度（≈12KB；磁盘读链路实测 4.5KB）
+    //         0x4000 起       任务自己的内核 C 执行栈（向下生长，剩 16KB）
     f->rsp    = stack_top - TASK64_ENTRY_RSP_RESERVE;          // 同特权级 iretq 不弹 rsp，这里给出真正的起点
     f->ss     = 0x10;
     return base;

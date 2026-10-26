@@ -5,7 +5,7 @@
 落点：
   /usr/bin/dpkg        build64/dpkg 的字节（v0.7.5 起 /bin 由内核映射到 /usr/bin）
   /usr/bin/apt         同一份字节（argv[0] 里含 "apt" 时走 apt 前端）
-  /usr/share/dpkg/test-vimtu_1.0.deb
+  /usr/share/dpkg/test-vimtu-1.0.deb
                        构建期现场生成的**真 .deb**（ar + control.tar.gz + data.tar.gz），
                        内容是 /usr/share/vimtu-dpkg-test/hello.txt —— 用来验收 `dpkg -i` 真能装。
 用法：
@@ -37,6 +37,33 @@ def ar_member(name, data):
     if len(data) & 1:
         out += b"\n"
     return out
+
+
+def image_top(exe):
+    """ELF64：所有 PT_LOAD 的 (p_vaddr + p_memsz) 按页对齐后取最大值。
+
+    为什么看 memsz 而不是文件大小：.bss 不进文件，但它占目标地址空间
+    —— v0.7.5 就是 .bss 76 KiB 越过了 execve 的 64 KiB 主程序窗口，
+    装载器报 `overlaps-user-region`，dpkg/apt 根本起不来。
+    """
+    if len(exe) < 64:
+        return 0
+    phoff = int.from_bytes(exe[0x20:0x28], "little")
+    phentsize = int.from_bytes(exe[0x36:0x38], "little")
+    phnum = int.from_bytes(exe[0x38:0x3A], "little")
+    top = 0
+    for i in range(phnum):
+        o = phoff + i * phentsize
+        if o + 56 > len(exe):
+            break
+        if int.from_bytes(exe[o:o + 4], "little") != 1:      # PT_LOAD
+            continue
+        vaddr = int.from_bytes(exe[o + 16:o + 24], "little")
+        memsz = int.from_bytes(exe[o + 40:o + 48], "little")
+        if memsz == 0:
+            continue
+        top = max(top, (vaddr + memsz + 0xFFF) & ~0xFFF)
+    return top
 
 
 def make_deb():
@@ -95,11 +122,23 @@ def main():
     if exe[:4] != b"\x7fELF":
         sys.stderr.write("%s 不是 ELF\n" % args.dpkg)
         return 2
+    # ★ v0.7.6（真缺陷门禁）：主程序映像必须能进 execve 的 **64 KiB 主程序窗口**。
+    #   上界 = 4 GiB + 64 KiB = 0x100010000（= 用户栈起点 USER64_STACK_VA64）。
+    top = image_top(exe)
+    limit = 0x100010000
+    print("    映像最高地址 = 0x%X（PT_LOAD vaddr+memsz 页对齐）；窗口上界 = 0x%X，余量 %d B"
+          % (top, limit, limit - top))
+    if top > limit:
+        sys.stderr.write("ERROR: dpkg 映像越过 64 KiB 主程序窗口（0x%X > 0x%X），"
+                         "execve 会拒载（overlaps-user-region）\n" % (top, limit))
+        return 1
     deb, body = make_deb()
     files = {
         "/usr/bin/dpkg": (exe, 0o755),
         "/usr/bin/apt": (exe, 0o755),                     # 同一份字节：argv[0] 决定前端
-        "/usr/share/dpkg/test-vimtu_1.0.deb": (deb, 0o644),
+        # ★ v0.7.6：名字仅用 `-` / `.`。QEMU sendkey 没有下划线，实测 `test-vimtu_1.0.deb`
+    #   在终端里会变成 `test-vimtu1.0.deb`（下划线被吞）-> dpkg -i 找不到文件。
+    "/usr/share/dpkg/test-vimtu-1.0.deb": (deb, 0o644),
     }
     print("    dpkg=%d B（同一份字节也装成 apt）；测试 .deb=%d B（内容 %d B 落到 %s）"
           % (len(exe), len(deb), len(body), CTRL_PATH))
