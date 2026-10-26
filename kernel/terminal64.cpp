@@ -4495,7 +4495,7 @@ static bool term_run_redir64(TerminalState* ts, const char* path, const char* ou
                 }
                 if (st == (int)PROC64_EXITED) { rc = 0; break; }   // 退出即"跑完了"；退出码在 code=
                 if (st < 0) break;
-                if (g_ticks64 - t0 >= (uint64_t)PIT_HZ_64 * 20u) break;         // 有界等待
+                if (g_ticks64 - t0 >= (uint64_t)PIT_HZ_64 * 120u) break;   /* ★ v0.7.7：20s -> 120s（实测 dpkg -i 要 ~20-30s；期间看门狗已 pause） */         // 有界等待
                 task_sleep64(2);
             }
             if (rc == -2) { (void)proc64_kill64(pid, 9); }                      // 超时：杀掉
@@ -4796,7 +4796,7 @@ static void shell_exec(TerminalState* ts, const char* line) {
                         }
                         if (st == (int)PROC64_EXITED) { exited = 1; rc = (code == 0) ? 0 : -1; break; }
                         if (st < 0) break;                         // 进程没了
-                        if (g_ticks64 - t0 >= (uint64_t)PIT_HZ_64 * 20u) break;
+                        if (g_ticks64 - t0 >= (uint64_t)PIT_HZ_64 * 120u) break;   /* ★ v0.7.7：20s -> 120s（实测 dpkg -i 要 ~20-30s；期间看门狗已 pause） */
                         task_sleep64(2);
                     }
                     if (!exited) { (void)proc64_kill64(pid, 9); rc = -1; }

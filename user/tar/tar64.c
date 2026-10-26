@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <signal.h>      /* SIGPIPE（v0.7.7：判子进程是否被 SIGPIPE 打死） */
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -522,10 +523,32 @@ int main(int argc, char** argv) {
     if (fd < 0) err2("cannot open archive ", archive);
     do_list_or_extract(fd, mode == 'x');
     if (pid > 0) {
+        /* ★ v0.7.7（真缺陷，dpkg -i 卡在这里很久）：关掉读端，并把
+         *   "解压子进程被 SIGPIPE 打死(141)" 当**正常收尾**。
+         *   为什么：do_list_or_extract 读到 tar 的"两块全零"结束标记就停，而 gzip 流通常
+         *   还带 10240 字节块对齐的尾随填充（Python tarfile / GNU tar 都会补）。这时 gunzip
+         *   剩余的 write 拿到 EPIPE -> 被 SIGPIPE 打死，完全正常（读端已关）。
+         *   旧代码只看 !WIFEXITED 就报 "gunzip child failed"，于是 dpkg -i 永远装不上。
+         *   ★ 也曾试过"把管道读空到 EOF"：实测不行 —— 每次 read 只拿到 64B、
+         *   每次管道等待 ~13 tick，整个填充读完要数秒，直接超过内核 wait4 的 5s 上限
+         *   （串口现场：[PROC64] wait4 TIMEOUT pid=29）。 */
         int st = 0;
         close(fd);
-        if (waitpid(pid, &st, 0) < 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
-            err2("gunzip child failed for ", archive);
+        if (waitpid(pid, &st, 0) < 0)
+            err2("gunzip child wait failed for ", archive);
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+            /* ★ v0.7.7："对端不再读"的正常收尾要同时认**两种编码**：
+             *   ① POSIX：WIFSIGNALED && WTERMSIG==SIGPIPE；
+             *   ② **本内核**：wait4 把信号致死编码成"正常退出 + 退出码 128+sig"
+             *      （串口：[PROC64] wait4 pid=6 status=36608 raw_code=143 by_sig=15）。
+             *      这时 WIFEXITED 为真、WEXITSTATUS==141，上面那个 POSIX 判据永远不会命中。 */
+            if ((WIFSIGNALED(st) && WTERMSIG(st) == SIGPIPE) ||
+                (WIFEXITED(st) && WEXITSTATUS(st) == 128 + SIGPIPE)) {
+                /* benign：对端不再读，解压器被 SIGPIPE 收尾 */
+            } else {
+                err2("gunzip child failed for ", archive);
+            }
+        }
     } else if (!to_stdout) {
         close(fd);
     }

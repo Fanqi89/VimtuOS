@@ -60,7 +60,8 @@ static_assert(P64_EPERM == 1 && P64_EINTR == 4 && P64_EFAULT == 14, "P64_* 错�
 
 // ---- 规模/超时常量 ----
 static const uint32_t PROC64_FORK_MAX_PAGES    = 256;   // fork 整页复制的页数上限（≈1MiB）
-static const int      PROC64_WAIT_TIMEOUT_SEC  = 5;     // wait4 有界等待（防挂死）
+static const int      PROC64_WAIT_TIMEOUT_SEC  = 5;     // ★ v0.7.7：不再是 wait4 的否决阈值，
+//   而是"长等待证据"的打点阈值（阻塞式 wait4 一直等到子进程退出，与 Linux 一致）
 static const int      PROC64_DEMO_TIMEOUT_SEC  = 12;    // 启动期演示的有界等待
 static const int      PROC64_PIPE_TIMEOUT_SEC  = 12;    // pipe 演示的有界等待（同一口径）
 static const int      PROC64_EVSHM_TIMEOUT_SEC = 90;
@@ -1516,11 +1517,22 @@ int64_t proc64_wait4(int pid, int* status_out, uint32_t options) {
 
     if (c->state != PROC64_EXITED) {
         if (options & 1u) return 0;                        // WNOHANG
+        // ★ v0.7.7（真缺陷 / Linux 兼容）：**阻塞式 wait4 不能有固定超时**。
+        //   原来 5 秒就返回 -EAGAIN（PROC64_WAIT_TIMEOUT_SEC），于是任何"子进程跑超过 5 秒"
+        //   的正常用法都会失败：实测 `dpkg -i` 解 data.tar 就撞上——
+        //     [PROC64] wait4 TIMEOUT pid=31 (child not exited) -> dpkg 判"解 data 失败"
+        //     （7 秒后 [PROC64] exit pid=31 code=0，其实它成功了）。
+        //   真正的 Linux wait4 根本没有超时；这里去掉上限，但超过 5 秒仍打**一行证据**
+        //   （慢等待要看得见，但不当错误）。循环里父进程仍是 SLEEP + 2ms 轮询，
+        //   CPU 交给子进程，GUI 帧循环与看门狗不受影响。
         const uint64_t t0 = g_ticks64;
+        int longwait_logged = 0;
         while (c->state != PROC64_EXITED) {
-            if (g_ticks64 - t0 > (uint64_t)PIT_HZ_64 * (uint64_t)PROC64_WAIT_TIMEOUT_SEC) {
-                p64_log31("[PROC64] wait4 TIMEOUT pid=", (uint64_t)target, " (child not exited)");
-                return -P64_EAGAIN;
+            if (!longwait_logged &&
+                (g_ticks64 - t0) > (uint64_t)PIT_HZ_64 * (uint64_t)PROC64_WAIT_TIMEOUT_SEC) {
+                longwait_logged = 1;
+                p64_log31("[PROC64] wait4 long-wait pid=", (uint64_t)target,
+                          " (>5s; Linux blocks until exit)");
             }
             if (par) par->state = PROC64_SLEEP;
             task_sleep_ms64(2);

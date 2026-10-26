@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """tests/dpkg64_test.py - ★ v0.7.5：用户态 dpkg/apt 真能装 .deb（端到端，真点终端真跑）
 
@@ -15,6 +15,7 @@
 退出码：0 全过 / 1 断言失败 / 2 环境问题
 """
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -125,6 +126,16 @@ def main():
             return 2
         time.sleep(1.5)
 
+        # A0. 先提权：装包要写 /usr/share（root:0755），桌面会话是 uid=1000，
+        #     内核的 P4 权限检查会**如实拒绝**非属主建目录 ——
+        #     实测现场：[PERM64] deny op=mkdir path=/usr/share/vimtu-dpkg-test uid=1000 ... need=wx owner=0:0
+        P.type_line(mon, "sudo -i")
+        time.sleep(2.5)
+        log = log_of(serial)
+        check("A0. sudo -i 提权成功（装包要有 root 权限，这是 POSIX 语义不是缺陷）",
+              "[TERM] cmd sudo ok" in log,
+              "（找到：%r）" % ([x[:60] for x in log.splitlines() if "[TERM] cmd sudo" in x] or [""]))
+
         # A. --version
         P.type_line(mon, "run /usr/bin/dpkg --version")
         time.sleep(3.0)
@@ -132,27 +143,62 @@ def main():
         check("A. dpkg --version 起得来", "dpkg 0.7.5 (vimtu-dpkg" in log)
 
         # B. 安装真 .deb
+        #    ★ 判据用**纯 ASCII 的两条硬证据**：① 终端对这次 `run` 判 ok；② dpkg 这个进程 code=0 退出。
+        #      （不拿 "已安装 …" 这类中文成功消息当判据：它会被内核日志插花，而且失败时消息完全不同。）
+        before_ok = log.count("[TERM] cmd run ok")
         P.type_line(mon, "run /usr/bin/dpkg -i /usr/share/dpkg/test-vimtu-1.0.deb")
-        time.sleep(8.0)
+        # dpkg -i 实测要 ~25-30 s（本内核 pipe 只有 64 B，tar/gunzip 的 10 KB 填充走 160 次往返），
+        # 终端 run 的上限是 120 s —— 所以这里**轮询**等证据行，别用固定 sleep（踩过：等 10 s 就判失败）。
+        pid_i = None
+        code0 = False
+        deadline = time.time() + 150
+        while time.time() < deadline:
+            log = log_of(serial)
+            seg_i = log.find("[TERM] run argv path=/usr/bin/dpkg argc=3")
+            pids = re.findall(r"\[PROC64\] create pid=(\d+) name=run", log[seg_i:]) if seg_i >= 0 else []
+            pid_i = pid_i or (pids[0] if pids else None)
+            code0 = pid_i is not None and ("[PROC64] exit pid=%s code=0" % pid_i) in log
+            if code0 and log.count("[TERM] cmd run ok") > before_ok:
+                break
+            time.sleep(3.0)
         log = log_of(serial)
-        check("B. dpkg -i 装成功（ar+control+tar+status 全过）",
-              "已安装 vimtu-dpkg-test 1.0" in log,
-              "（日志里最后一处 dpkg: 行：%r）" %
-              (([l for l in log.splitlines() if "dpkg:" in l] or [""])[-1][:120]))
+        after_ok = log.count("[TERM] cmd run ok")
+        check("B. dpkg -i 走完并成功退出（run ok + 进程 exit code=0）",
+              after_ok > before_ok and code0,
+              "run_ok %d->%d  dpkg pid=%s exit0=%s" % (before_ok, after_ok, pid_i, code0))
 
-        # C. payload 真的落地
+        # C. payload 真的落地（cat 的内容只进窗口，不进串口；用终端自己打的证据行判定）
         P.type_line(mon, "cat /usr/share/vimtu-dpkg-test/hello.txt")
-        time.sleep(4.0)
-        log = log_of(serial)
-        check("C. .deb 里的文件真的落到文件系统",
-              "hello from a real .deb installed by vimtu-dpkg" in log)
+        mc = None
+        deadline = time.time() + 30
+        while time.time() < deadline and mc is None:
+            mc = re.search(r"\[TERM\] cmd cat path=/usr/share/vimtu-dpkg-test/hello\.txt bytes=(\d+)",
+                           log_of(serial))
+            if mc is None:
+                time.sleep(1.0)
+        check("C. .deb 里的文件真的落到文件系统（终端 cat 读到它）",
+              mc is not None and int(mc.group(1)) > 0,
+              "bytes=%s" % (mc.group(1) if mc else "缺证据行"))
 
         # D. 状态文件读回
+        #    ★ 判据绑在**这次** `dpkg -l` 的切片上：它的输出走 fd 1 = 内核控制台（串口），
+        #      所以"切片里出现包名 + 这次进程 exit 0"就是状态文件读回的真证据。
+        #      （直接全日志 grep "vimtu-dpkg-test" 会被 cat 的命令行路径撞成假阳性 —— 踩过。）
         P.type_line(mon, "run /usr/bin/dpkg -l")
-        time.sleep(4.0)
-        log = log_of(serial)
-        check("D. dpkg -l 列出已安装包", "vimtu-dpkg-test" in log)
-
+        dl = None
+        deadline = time.time() + 60
+        while time.time() < deadline and dl is None:
+            lg = log_of(serial)
+            seg_l = lg.find("[TERM] run argv path=/usr/bin/dpkg argc=2 a1=-l")
+            if seg_l >= 0:
+                ps = re.findall(r"\[PROC64\] create pid=(\d+) name=run", lg[seg_l:])
+                if ps and ("[PROC64] exit pid=%s code=0" % ps[0]) in lg and \
+                   "vimtu-dpkg-test" in lg[seg_l:]:
+                    dl = ps[0]
+            if dl is None:
+                time.sleep(1.5)
+        check("D. dpkg -l 从状态文件读回安装记录（切片内出现包名 + exit 0）", dl is not None,
+              "pid=%s" % dl)
         # E. apt 远程仓库如实拒绝
         P.type_line(mon, "run /usr/bin/apt update")
         time.sleep(4.0)

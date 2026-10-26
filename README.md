@@ -252,12 +252,13 @@ shm + wl_surface + `wl_seat_get()` + font64 排版）：
 - ⚠️ **dpkg / apt**（v0.7.5 起，用户态兼容工具，**不是** Debian 二进制）：同命令、同 `.deb` 容器、同
   `/var/lib/dpkg/status`。容器解析 = `ar` + `control.tar.gz` + `data.tar.gz`（**xz / zstd 成员如实拒绝**，
   这条链上没有解码器；带 `preinst/postinst` 的包整包拒绝）。
-  ★ **v0.7.6 实测状态（如实，逐条）**：`dpkg --version` / `dpkg -l` / `apt update`（如实报"当前未启用"）
-  **已通过**；`dpkg -i` **仍未通过** —— 它能起来、能解 ar、能 fork+exec `/usr/bin/tar -x -z`（argv 真传到了，
-  `[PROC64] execve path=/usr/bin/tar … argc=7`），tar 又 fork `/bin/gunzip` 并从管道读到了 control.tar 头与内容，
-  但最后 `tar: gunzip child failed for /tmp/dpkg-work/control.tar.gz`：gunzip 被 **SIGPIPE（141）** 打死（序列：
-  tar 先 `close fd=3` -> gunzip 再 write 得 EPIPE -> SIGPIPE）。这一层还没修，`tests/dpkg64_test.py` 当前是
-  **A/D/E PASS、B/C FAIL**（不把它当成能装包）。
+  ★ **v0.7.7 实测状态（如实，逐条）**：`tests/dpkg64_test.py` **6/6 PASS** —— `dpkg --version`、
+  **`dpkg -i <真 .deb>` 装成功**（ar 解包 + control.tar.gz 解出 -> 读 `./control` -> data.tar.gz 解到 `/`
+  -> 追写 `/var/lib/dpkg/status`）、payload 真落地（终端 `cat` 读到 **47 B**）、`dpkg -l` 从状态文件读回记录、
+  `apt update` 如实报“当前未启用”。安装需要 root：终端先 `sudo -i`（P4 权限检查会如实拒绝
+  uid=1000 建 `/usr/share/...` —— 这是 POSIX 语义，不是缺陷）。
+  ★ 性能边界（如实）：本内核的 pipe **只有 64 B 容量**，所以 tar↔gunzip 的 10 KB 填充要走 160 次
+  64 B 往返，`dpkg -i` 实测要 **~25-30 s**（所以终端 `run` 的有界等待从 20 s 放到 120 s）。
 - ⚠️ **glibc / 发行版二进制**：动态映像（`PT_INTERP` + 独立地址空间 `execve`）已实现，
   验收脚本 `tests/dynlink64_test.py` / `tests/musl64_test.py` 覆盖；但 `/proc`、`/sys`、pty、
   完整 TLS/vDSO 仍缺 -> **常见发行版二进制整体跑不起来**，别当成"能跑 Debian 程序"。
