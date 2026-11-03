@@ -8,6 +8,7 @@
 //   * render() 里窗口之后 -> startmenu64_draw64()（再之后是 panels64_draw64）
 //   * handle_mouse_press/handle_mouse/handle_keyboard -> startmenu64_handle_*（面板优先，见 gui64.cpp）
 #include "startmenu64.h"
+#include "dock64.h"          // ★ v0.8.0：应用图标的右键上下文菜单（固定/关闭窗口）
 #include "panels64.h"
 
 #include "gui64.h"          // 应用启动入口 / gui64_dirty / 屏尺寸
@@ -1619,10 +1620,35 @@ static const char* item_name64(int item) {
 }
 
 // ==================== 输入 ====================
+// ★ v0.8.0：按**几何**找出点到的应用图标（固定网格 / 搜索结果），返回视图下标；-1 = 没点到应用
+static int sm_view_at64(int mx, int my) {
+    if (!g_open) return -1;
+    for (int i = 0; i < sm_pinned_n64(); i++) {
+        int x = 0, y = 0, w = 0, h = 0;
+        startmenu64_tile_rect64(i, &x, &y, &w, &h);
+        if (in_rect64(mx, my, x, y, w, h)) return i;
+    }
+    for (int i = 0; i < g_hits; i++) {
+        int x = 0, y = 0, w = 0, h = 0;
+        startmenu64_result_rect64(i, &x, &y, &w, &h);
+        if (in_rect64(mx, my, x, y, w, h)) return g_hit_app[i];
+    }
+    return -1;
+}
+
 int startmenu64_handle_mouse_press64(int mx, int my, int button) {
     if (!g_open) return 0;
     const bool inside = in_rect64(mx, my, sm_x(), sm_y(), sm_w(), sm_h());
     const int item = hit_item64(mx, my);
+    // ★ v0.8.0（需求）：右键应用图标 -> 上下文菜单（固定/取消固定 + 关闭窗口/关闭所有窗口）
+    if (button == 1) {
+        const int view = sm_view_at64(mx, my);
+        if (view >= 0) {
+            dockmenu64_open_for_app64(sm_app_no64(view), -1, mx, my);
+            return 1;
+        }
+        return inside ? 1 : 0;
+    }
     if (button != 0) return inside ? 1 : 0;
     if (item < 0) {
         // 点菜单外部：关菜单（不消费，让点击继续落到桌面，与老菜单语义一致）

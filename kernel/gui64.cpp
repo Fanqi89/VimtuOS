@@ -22,6 +22,7 @@
 //      否则会和应用自己的回收逻辑双释放（kfree_64 会拦住并刷日志）。
 
 #include "gui64.h"
+#include "dock64.h"      // ★ v0.8.0：Dock 运行时列表 + 上下文菜单公开 API
 #include "fb.h"
 #include "virtio_gpu64.h"   // ★ v0.5.5：硬件光标平面（cursor_on / cursor_move）
 #include "font.h"
@@ -455,6 +456,8 @@ Window* gui64_create_window(const char* title, int x, int y, int w, int h,
     if (win->x < 0) win->x = 0;
     recompute_client(win);
     g_used[slot] = true;
+    // ★ v0.8.0（需求）：窗口创建 -> 向 Dock 发事件（window_id/app_id/title），Dock 动态加一个运行图标
+    if (!g_in_selftest) dock64_on_window_create64(slot, app_id, win->title);
     z_push_front(win);
     gui64_set_active(win);
     dirty_add(win->x, win->y, win->w, win->h);
@@ -475,6 +478,8 @@ Window* gui64_create_window(const char* title, int x, int y, int w, int h,
 void gui64_destroy_window(Window* w) {
     int i = win_index(w);
     if (i < 0 || !g_used[i]) return;
+    // ★ v0.8.0（需求）：窗口关闭 -> 通知 Dock 按 window_id 移除对应运行图标（不影响固定图标）
+    if (!g_in_selftest) dock64_on_window_close64(i);
     const int w_app = (int)w->app_id;         // 销毁后 app_id 会留在槽里，但语义上属于"已关"
     // ★ 修（v0.4.6）：旧位置的脏区要**连阴影一起**擦。原来只脏 (x,y,w,h)，远层阴影
     //   （blur/ dy 见 THEME64_SH_F_*）露在窗口外那一圈擦不到 —— 关窗后窗框没了、阴影留在
@@ -625,6 +630,11 @@ Window* gui64_window_at(int i) {
         k++;
     }
     return nullptr;
+}
+// ★ v0.8.0：按窗口槽取（= Dock 运行项的 window_id）。与 gui64_window_at（z 序下标）不同。
+Window* gui64_window_by_id64(int id) {
+    if (id < 0 || id >= MAX_WINS || !g_used[id]) return nullptr;
+    return &g_wins[id];
 }
 int gui64_app_windows(int app_id) {
     int n = 0;
@@ -1150,29 +1160,45 @@ static void power_anim_screen(const char* txt, const char* log_tag) {
 // ★ 缺陷 1：老开始菜单（menu_toggle/draw_menu/menu_activate/g_menu_open）**整体删除**——
 //   Win 键与 Dock 开始按钮现在都只操作 startmenu64 的新开始菜单（见 handle_keyboard / dock_press64）。
 
-#define DOCK_ITEMS 9
-// ★ 本批（真图标）：icon64 = 外置图标包里的应用 kind（>0 时优先画真图标；-1 = 没有对应图标）
-struct DockItem64 { int app_id; int icon_kind; int icon64; const char* en; const char* zh; };
-static const DockItem64 kDockItems[DOCK_ITEMS] = {
-    { APP_ID_NONE,     -1, -1,                 "Start",          "开始" },     // 最左固定开始按钮（真图 logo/kaisi.png，不许换）
-    { APP_ID_MYPC,      0, ICON64_A_MYPC,      "My Computer",    "我的电脑" },
-    { APP_ID_RECYCLE,   1, ICON64_A_RECYCLE,   "Recycle Bin",    "回收站" },
-    { APP_ID_TERM,      2, ICON64_A_TERMINAL,  "Terminal",       "终端" },
-    { APP_ID_CALC,     -1, ICON64_A_CALC,      "Calculator",     "计算器" },
-    { APP_ID_MINES,    -1, ICON64_A_MINES,     "Minesweeper",    "扫雷" },
-    { APP_ID_SETTINGS, -1, ICON64_A_SETTINGS,  "Settings",       "设置" },
-    { APP_ID_TMGR,     -1, ICON64_A_TMGR,      "Task Manager",   "任务管理器" },
-    { APP_ID_MONITOR,  -1, ICON64_A_MONITOR,   "System Monitor", "系统监视器" },
+// ==================== ★ v0.8.0：Dock = **运行时动态列表** ====================
+// 需求要点（原文）：固定图标在左、运行图标在右；固定列表**持久化**（首次的默认固定项也写进持久化，
+//   渲染逻辑里不再硬编码）；窗口**创建/关闭向 Dock 发事件**，每窗口一个运行图标（不合并）；
+//   宽度 = max(默认正常宽度, 内容宽度)；右键 Dock 图标 / 开始菜单应用图标 → 上下文菜单。
+// 列表元素对应需求里的 TaskbarItem：app_id / window_id / title / icon / kind / is_running。
+#define DOCK_MAX          32         // 运行时列表上限（开始按钮 + 固定 + 运行）
+#define DOCK_RUN_MAX      16         // 运行项上限（不合并窗口：每窗口一项）
+#define DOCK_DEFAULT_N    9          // 默认正常宽度对应的项数（开始 + 8 个默认固定；**只用于宽度下限**）
+#define DOCK_PINS_PATH64  "/etc/dock.conf"
+enum { DOCK_KIND_START = 0, DOCK_KIND_PIN = 1, DOCK_KIND_RUN = 2 };
+
+struct DockItem64 {
+    int  kind;        // DOCK_KIND_*
+    int  app_id;
+    int  win_id;      // RUN：窗口槽（= window_id）；其他 -1
+    int  icon_kind;   // 图标包 kind（>=0；-1 = 无）
+    int  icon64;      // ICON64_A_*（icons64_draw_kind64 的 kind）
+    char title[32];   // 显示名（RUN 用窗口标题；PIN/START 用注册表名）
 };
+
+static DockItem64 g_dock[DOCK_MAX];
+static int  g_dock_n = 0;
+// 固定列表（顺序 = 显示顺序；持久化到 /etc/dock.conf）与运行列表（按添加顺序；不持久化）
+static int  g_pins[DOCK_MAX];   static int g_pins_n = 0;
+static bool g_pins_loaded = false;
+struct DockRun64 { int win_id; int app_id; char title[32]; };
+static DockRun64 g_runs[DOCK_RUN_MAX]; static int g_runs_n = 0;
 
 static int  g_dock_x = 0, g_dock_y = 0, g_dock_w = 0, g_dock_h = DOCK_H;
 static int  g_dock_icon = THEME64_DOCK_ICON, g_dock_gap = THEME64_DOCK_GAP;
 static int  g_dock_pressed = -1;            // 当前按下的项（-1 = 无）
 static int  g_dock_hover = -1;              // 悬停项
-static int  g_dock_scale[DOCK_ITEMS];       // 当前缩放（256 = 100%）
-static int  g_dock_shift[DOCK_ITEMS];       // 当前横向让位（px）
+static int  g_dock_scale[DOCK_MAX];         // 当前缩放（256 = 100%）
+static int  g_dock_shift[DOCK_MAX];         // 当前横向让位（px）
 static int  g_dock_clock_x = 0, g_dock_clock_w = CLOCK_W;
 static bool g_dock_geom_logged = false;
+// ★ v0.8.0：列表变化（开/关窗口、固定/取消固定）后要**重新打** geom + item 行（验收靠它定位），但有上限防刷屏
+static int  g_dock_geom_dumps  = 0;
+#define DOCK_GEOM_DUMPS_MAX 48
 static int  g_dock_log_budget = 220;         // [DOCK64] press/bounce/minbar 行上限（防刷屏）
 static int  g_dock_bounce_total = 0;
 // 点击回弹动画状态
@@ -1283,6 +1309,228 @@ static void dock_start_icon_init64() {
     dock_log_start64();
 }
 
+// ==================== ★ v0.8.0：Dock 列表数据层（元信息 / 持久化 / 构建）====================
+// 应用名与图标**全部来自注册表**（/etc/apps.json，app64_reg_*）：Dock 渲染里不写死任何应用名，
+//   新增应用只要在注册表里就能被固定。取不到就如实落回"app"+无图标（界面不空、不假造）。
+static int dock_reg_index64(int app_id) {
+    if (app_id == APP_ID_NONE) return -1;
+    const int n = app64_registry_count64();
+    for (int i = 0; i < n; i++) if (app64_reg_id64(i) == app_id) return i;
+    return -1;
+}
+static void dock_app_title64(int app_id, char* out, int cap) {
+    if (cap <= 0) return;
+    out[0] = 0;
+    const int r = dock_reg_index64(app_id);
+    const char* s = nullptr;
+    if (r >= 0) s = g_lang_zh ? app64_reg_name64(r) : app64_reg_en64(r);
+    if (!s || !s[0]) s = (r >= 0) ? app64_reg_name64(r) : "app";
+    if (!s) s = "app";
+    int n = 0;
+    for (; s[n] && n < cap - 1; n++) out[n] = s[n];
+    out[n] = 0;
+}
+// 返回 icons64 kind（>=0；-1 = 无）；*out_kind = 老的内置 128x128 位图下标（0..2；-1 = 无）
+static int dock_app_icon_of64(int app_id, int* out_kind) {
+    if (out_kind) *out_kind = -1;
+    const int r = dock_reg_index64(app_id);
+    if (r < 0) return -1;
+    const int k = icons64_kind_by_name64(app64_reg_icon64(r));
+    if (out_kind) {
+        if (k == ICON64_A_MYPC) *out_kind = 0;
+        else if (k == ICON64_A_RECYCLE) *out_kind = 1;
+        else if (k == ICON64_A_TERMINAL) *out_kind = 2;
+    }
+    return k;
+}
+// 默认固定项（**只在首次初始化时**写进持久化文件，之后一律以文件为准）
+static const int kDockDefaultPins64[] = {
+    APP_ID_MYPC, APP_ID_RECYCLE, APP_ID_TERM, APP_ID_CALC,
+    APP_ID_MINES, APP_ID_SETTINGS, APP_ID_TMGR, APP_ID_MONITOR
+};
+
+static void dock_pins_log64(const char* src) {
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] pins src=");
+    dbg64_str(src);
+    dbg64_str(" n=");
+    dbg64_dec((uint64_t)g_pins_n);
+    dbg64_str(" path=");
+    dbg64_str(DOCK_PINS_PATH64);
+    dbg64_str(" ids=");
+    for (int i = 0; i < g_pins_n; i++) {
+        if (i) dbg64_str(",");
+        dbg64_dec((uint64_t)g_pins[i]);
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static void dock_pins_save64() {
+    char buf[256];
+    int n = 0;
+    const char* head = "# VimtuOS dock pinned apps (order = left to right)";
+    for (int i = 0; head[i] && n < (int)sizeof(buf) - 2; i++) buf[n++] = head[i];
+    buf[n++] = '\n';
+    for (int i = 0; i < g_pins_n; i++) {
+        const char* k = "pinned=";
+        for (int j = 0; k[j] && n < (int)sizeof(buf) - 8; j++) buf[n++] = k[j];
+        int v = g_pins[i];
+        char d[8];
+        int dn = 0;
+        if (v == 0) d[dn++] = '0';
+        while (v > 0 && dn < 7) { d[dn++] = (char)('0' + v % 10); v /= 10; }
+        while (dn > 0 && n < (int)sizeof(buf) - 2) buf[n++] = d[--dn];
+        buf[n++] = '\n';
+    }
+    buf[n] = 0;
+    // ★ v0.8.0：用 **系统卷 + root 身份** 写（`_on64`）。
+    //   为何：登录后当前凭证是 uid=1000，而 /etc 属于 root 0755 → 普通写会 -EACCES，
+    //   实测就是"取消固定后没写进盘、重启又变回 8 个"。
+    const int sys = vfs64_system_slot64();
+    const int w = (sys >= 0) ? vfs64_write_on64(sys, DOCK_PINS_PATH64, buf, n)
+                             : vfs64_write64(DOCK_PINS_PATH64, buf, n);
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] pins save n=");
+    dbg64_dec((uint64_t)g_pins_n);
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)n);
+    dbg64_str(" ok=");
+    dbg64_dec((uint64_t)(w == n ? 1 : 0));
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static bool dock_pins_load64() {
+    g_pins_loaded = true;
+    g_pins_n = 0;
+    char buf[512];
+    const int sys = vfs64_system_slot64();
+    const int got = (sys >= 0) ? vfs64_read_on64(sys, DOCK_PINS_PATH64, buf, (int)sizeof(buf) - 1)
+                               : vfs64_read64(DOCK_PINS_PATH64, buf, (int)sizeof(buf) - 1);
+    if (got <= 0) {
+        const int dn = (int)(sizeof(kDockDefaultPins64) / sizeof(kDockDefaultPins64[0]));
+        for (int i = 0; i < dn && g_pins_n < DOCK_MAX; i++) g_pins[g_pins_n++] = kDockDefaultPins64[i];
+        dock_pins_save64();
+        dock_pins_log64("seed");
+        return true;
+    }
+    buf[got] = 0;
+    for (int i = 0; i < got; ) {
+        while (i < got && (buf[i] == '\n' || buf[i] == '\r' || buf[i] == ' ' || buf[i] == '\t')) i++;
+        if (i >= got) break;
+        if (buf[i] == '#') { while (i < got && buf[i] != '\n') i++; continue; }
+        const bool is_pin = (i + 6 < got) && buf[i] == 'p' && buf[i + 1] == 'i' && buf[i + 2] == 'n' &&
+                            buf[i + 3] == 'n' && buf[i + 4] == 'e' && buf[i + 5] == 'd' && buf[i + 6] == '=';
+        if (is_pin) {
+            i += 7;
+            int v = 0, any = 0;
+            while (i < got && buf[i] >= '0' && buf[i] <= '9') { v = v * 10 + (int)(buf[i] - '0'); i++; any = 1; }
+            if (any && v > 0 && g_pins_n < DOCK_MAX) g_pins[g_pins_n++] = v;
+            while (i < got && buf[i] != '\n') i++;
+            continue;
+        }
+        while (i < got && buf[i] != '\n') i++;      // 无法识别的行：如实忽略（不猜）
+    }
+    dock_pins_log64("file");
+    return true;
+}
+static int dock_pin_index64(int app_id) {
+    for (int i = 0; i < g_pins_n; i++) if (g_pins[i] == app_id) return i;
+    return -1;
+}
+static bool dock_is_pinned64(int app_id) { return dock_pin_index64(app_id) >= 0; }
+static int  dock_run_index64(int win_id) {
+    for (int i = 0; i < g_runs_n; i++) if (g_runs[i].win_id == win_id) return i;
+    return -1;
+}
+// 列表构建：[0] = 开始，接着固定（持久化顺序），最后运行（添加顺序）
+static void dock_list_build64() {
+    int n = 0;
+    DockItem64* it = &g_dock[n++];
+    it->kind = DOCK_KIND_START; it->app_id = APP_ID_NONE; it->win_id = -1;
+    it->icon_kind = -1; it->icon64 = -1; it->title[0] = 0;
+    for (int i = 0; i < g_pins_n && n < DOCK_MAX; i++) {
+        DockItem64* p = &g_dock[n++];
+        p->kind = DOCK_KIND_PIN; p->app_id = g_pins[i]; p->win_id = -1;
+        p->icon64 = dock_app_icon_of64(p->app_id, &p->icon_kind);
+        dock_app_title64(p->app_id, p->title, (int)sizeof(p->title));
+    }
+    for (int i = 0; i < g_runs_n && n < DOCK_MAX; i++) {
+        DockItem64* r = &g_dock[n++];
+        r->kind = DOCK_KIND_RUN; r->app_id = g_runs[i].app_id; r->win_id = g_runs[i].win_id;
+        r->icon64 = dock_app_icon_of64(r->app_id, &r->icon_kind);
+        int k = 0;
+        for (; g_runs[i].title[k] && k < (int)sizeof(r->title) - 1; k++) r->title[k] = g_runs[i].title[k];
+        r->title[k] = 0;
+        if (!r->title[0]) dock_app_title64(r->app_id, r->title, (int)sizeof(r->title));
+    }
+    g_dock_n = n;
+}
+static void dock_rebuild64();
+static void dock_pin_set64(int app_id, int on) {
+    if (app_id == APP_ID_NONE) return;
+    const int at = dock_pin_index64(app_id);
+    if (on && at < 0) {
+        if (g_pins_n >= DOCK_MAX - 1) return;
+        g_pins[g_pins_n++] = app_id;
+    } else if (!on && at >= 0) {
+        for (int i = at; i + 1 < g_pins_n; i++) g_pins[i] = g_pins[i + 1];   // 后面的固定项依次向左补位
+        g_pins_n--;
+    } else {
+        return;                                        // 状态没变：不写盘、不打点
+    }
+    dock_pins_save64();                                // 固定/取消固定 **立即保存**
+    dock_pins_log64(on ? "pin" : "unpin");
+    dock_rebuild64();
+}
+static void dock_run_add64(int win_id, int app_id, const char* title) {
+    if (dock_run_index64(win_id) >= 0) return;         // 幂等
+    if (g_runs_n >= DOCK_RUN_MAX) {
+        dbg64_line_begin64();
+        dbg64_str("[DOCK64] run-add skipped (full) win=");
+        dbg64_dec((uint64_t)win_id);
+        dbg64_nl();
+        dbg64_line_end64();
+        return;
+    }
+    DockRun64* r = &g_runs[g_runs_n++];
+    r->win_id = win_id; r->app_id = app_id;
+    int k = 0;
+    if (title) for (; title[k] && k < (int)sizeof(r->title) - 1; k++) r->title[k] = title[k];
+    r->title[k] = 0;
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] run-add win=");
+    dbg64_dec((uint64_t)win_id);
+    dbg64_str(" app=");
+    dbg64_dec((uint64_t)app_id);
+    dbg64_str(" running=");
+    dbg64_dec((uint64_t)g_runs_n);
+    dbg64_str(" title=");
+    dbg64_str(r->title[0] ? r->title : "-");
+    dbg64_nl();
+    dbg64_line_end64();
+    dock_rebuild64();
+}
+static void dock_run_del64(int win_id) {
+    const int at = dock_run_index64(win_id);
+    if (at < 0) return;
+    const int app = g_runs[at].app_id;
+    for (int i = at; i + 1 < g_runs_n; i++) g_runs[i] = g_runs[i + 1];
+    g_runs_n--;
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] run-del win=");
+    dbg64_dec((uint64_t)win_id);
+    dbg64_str(" app=");
+    dbg64_dec((uint64_t)app);
+    dbg64_str(" running=");
+    dbg64_dec((uint64_t)g_runs_n);
+    dbg64_nl();
+    dbg64_line_end64();
+    dock_rebuild64();
+}
+// 窗口事件入口（gui64_create_window / gui64_destroy_window 调）
+void dock64_on_window_create64(int win_id, int app_id, const char* title) { dock_run_add64(win_id, app_id, title); }
+void dock64_on_window_close64(int win_id) { dock_run_del64(win_id); }
+
 // 第 i 项的**基准**左边界（不含悬停让位）
 static int dock_item_x64(int i) {
     return g_dock_x + THEME64_DOCK_PAD + i * (g_dock_icon + g_dock_gap);
@@ -1295,16 +1543,25 @@ static void dock_geom_init64() {
     g_dock_h = DOCK_H;
     g_dock_icon = cfg64_dock_icon64();
     g_dock_gap = cfg64_dock_gap64();
+    // ★ v0.8.0：固定列表来自**持久化**（首次 seed 默认项并写盘）；运行项来自窗口事件
+    if (!g_pins_loaded) dock_pins_load64();
+    dock_list_build64();
+    // 宽度规则（需求原文）：默认正常宽度是**下限**；内容更宽才变宽，图标变少最窄只回到默认宽度
     const int len_cfg = cfg64_dock_len64();
-    g_dock_w = g_dock_icon * DOCK_ITEMS + g_dock_gap * (DOCK_ITEMS - 1) + THEME64_DOCK_PAD * 2;
-    if (len_cfg > 0) g_dock_w = len_cfg;
+    //   默认正常宽度 = 设置里显式给的 dock.len（>0），否则按**默认固定项数**算出来（不读运行时项数）
+    const int def_w = (len_cfg > 0) ? len_cfg
+                                  : (g_dock_icon * DOCK_DEFAULT_N + g_dock_gap * (DOCK_DEFAULT_N - 1) + THEME64_DOCK_PAD * 2);
+    const int n = (g_dock_n > 0) ? g_dock_n : 1;
+    const int content_w = g_dock_icon * n + g_dock_gap * (n - 1) + THEME64_DOCK_PAD * 2;
+    g_dock_w = (content_w > def_w) ? content_w : def_w;
     if (g_dock_w > g_screen_w - 32) g_dock_w = g_screen_w - 32;
     g_dock_x = (g_screen_w - g_dock_w) / 2;                       // 水平居中
     g_dock_y = g_screen_h - DOCK_MARGIN - g_dock_h;               // 离屏幕底边 16px
     g_dock_clock_w = CLOCK_W;
     g_dock_clock_x = g_screen_w - DOCK_MARGIN - g_dock_clock_w;
-    for (int i = 0; i < DOCK_ITEMS; i++) { g_dock_scale[i] = 256; g_dock_shift[i] = 0; }
-    if (g_dock_geom_logged) return;
+    for (int i = 0; i < DOCK_MAX; i++) { g_dock_scale[i] = 256; g_dock_shift[i] = 0; }
+    if (g_dock_geom_dumps >= DOCK_GEOM_DUMPS_MAX) return;   // ★ v0.8.0：每次列表变化都重打（有上限）
+    g_dock_geom_dumps++;
     g_dock_geom_logged = true;
     dbg64_line_begin64();
     dbg64_str("[DOCK64] geom x=");
@@ -1322,7 +1579,7 @@ static void dock_geom_init64() {
     dbg64_str(" gap=");
     dbg64_dec((uint64_t)g_dock_gap);
     dbg64_str(" items=");
-    dbg64_dec((uint64_t)DOCK_ITEMS);
+    dbg64_dec((uint64_t)g_dock_n);
     dbg64_str(" margin=");
     dbg64_dec((uint64_t)DOCK_MARGIN);
     dbg64_str(" center=1 screen=");
@@ -1331,14 +1588,15 @@ static void dock_geom_init64() {
     dbg64_dec((uint64_t)g_screen_h);
     dbg64_nl();
     dbg64_line_end64();
-    for (int i = 0; i < DOCK_ITEMS; i++) {
+    for (int i = 0; i < g_dock_n; i++) {
         dbg64_line_begin64();
         dbg64_str("[DOCK64] item idx=");
         dbg64_dec((uint64_t)i);
         dbg64_str(" app=");
-        dbg64_dec((uint64_t)kDockItems[i].app_id);
+        dbg64_dec((uint64_t)g_dock[i].app_id);
         dbg64_str(" name=");
-        dbg64_str(g_lang_zh ? kDockItems[i].zh : kDockItems[i].en);
+        dbg64_str(g_dock[i].kind == DOCK_KIND_START ? (g_lang_zh ? "开始" : "Start") :
+                  (g_dock[i].title[0] ? g_dock[i].title : "-"));
         dbg64_str(" x=");
         dbg64_dec((uint64_t)dock_item_x64(i));
         dbg64_str(" y=");
@@ -1351,6 +1609,12 @@ static void dock_geom_init64() {
         dbg64_dec((uint64_t)(dock_item_x64(i) + g_dock_icon / 2));
         dbg64_str(" cy=");
         dbg64_dec((uint64_t)(g_dock_y + g_dock_h / 2));
+        // ★ v0.8.0：运行时列表的额外信息放**行尾**（保持老前缀格式，既有正则不受影响）
+        dbg64_str(" kind=");
+        dbg64_str(g_dock[i].kind == DOCK_KIND_START ? "start" :
+                  (g_dock[i].kind == DOCK_KIND_PIN ? "pinned" : "running"));
+        dbg64_str(" win=");
+        dbg64_dec((uint64_t)(g_dock[i].win_id < 0 ? 0 : g_dock[i].win_id));
         dbg64_nl();
         dbg64_line_end64();
     }
@@ -1375,18 +1639,19 @@ static void dock_geom_init64() {
 //   不动任何既有绘制逻辑；只有设置页会调它（gui64.h 里没有声明，设置页自己 extern 声明）。
 void gui64_dock_reload64() {
     g_dock_geom_logged = false;
+    g_dock_geom_dumps = 0;                  // ★ v0.8.0：设置页改完要重新打一次（计数归零）
     dock_geom_init64();
     gui64_invalidate();
 }
 
 // 目标缩放/让位：悬停项 120%（Token），紧邻两项 104% 且向外让位
 static void dock_targets64(int* tgt_scale, int* tgt_shift) {
-    for (int i = 0; i < DOCK_ITEMS; i++) { tgt_scale[i] = 256; tgt_shift[i] = 0; }
+    for (int i = 0; i < DOCK_MAX; i++) { tgt_scale[i] = 256; tgt_shift[i] = 0; }
     if (g_dock_hover < 0) return;
     const int hi = g_dock_hover;
     tgt_scale[hi] = 256 * THEME64_DOCK_HOVER_PCT / 100;
     const int grow = g_dock_icon * (THEME64_DOCK_HOVER_PCT - 100) / 100;   // 悬停多出来的宽度
-    for (int i = 0; i < DOCK_ITEMS; i++) {
+    for (int i = 0; i < g_dock_n; i++) {
         if (i == hi) continue;
         if (i == hi - 1 || i == hi + 1) {
             const int d = (i < hi) ? -1 : 1;
@@ -1399,10 +1664,10 @@ static void dock_targets64(int* tgt_scale, int* tgt_shift) {
 // 每帧推进 Dock 动效（悬停缩放/让位 + 点击回弹）；返回 1 = 画面有变化（需要重画 Dock 区）
 static int dock_anim_tick64() {
     int changed = 0;
-    int tgt_scale[DOCK_ITEMS], tgt_shift[DOCK_ITEMS];
+    int tgt_scale[DOCK_MAX], tgt_shift[DOCK_MAX];
     dock_targets64(tgt_scale, tgt_shift);
     const int reduce = theme64_reduce_motion64();
-    for (int i = 0; i < DOCK_ITEMS; i++) {
+    for (int i = 0; i < g_dock_n; i++) {
         if (reduce) {                                  // 减少动画：0ms / 1 帧到位
             if (g_dock_scale[i] != tgt_scale[i] || g_dock_shift[i] != tgt_shift[i]) changed = 1;
             g_dock_scale[i] = tgt_scale[i];
@@ -1499,7 +1764,7 @@ static int dock_hit64(int mx, int my, int* on_clock) {
         if (on_clock) *on_clock = 1;
         return -1;
     }
-    for (int i = 0; i < DOCK_ITEMS; i++) {
+    for (int i = 0; i < g_dock_n; i++) {
         const int cx = dock_item_draw_x64(i) + g_dock_icon / 2;
         const int w = g_dock_icon * g_dock_scale[i] / 256;
         const int h = w;
@@ -1508,6 +1773,37 @@ static int dock_hit64(int mx, int my, int* on_clock) {
     }
     return -1;
 }
+
+// ==================== ★ v0.8.0：dock64 公开 API（上下文菜单/UI 工具用）====================
+static void dock_rebuild64() {
+    dock_geom_init64();                 // 重算列表（固定+运行）与宽度/位置
+    gui64_invalidate();
+}
+int  dock64_count64() { return g_dock_n; }
+int  dock64_kind64(int i) { return (i >= 0 && i < g_dock_n) ? g_dock[i].kind : -1; }
+int  dock64_app64(int i) { return (i >= 0 && i < g_dock_n) ? g_dock[i].app_id : -1; }
+int  dock64_win64(int i) { return (i >= 0 && i < g_dock_n) ? g_dock[i].win_id : -1; }
+const char* dock64_title64(int i) {
+    if (i < 0 || i >= g_dock_n) return "";
+    return g_dock[i].title[0] ? g_dock[i].title : "";
+}
+int  dock64_is_pinned64(int app_id) { return dock_is_pinned64(app_id) ? 1 : 0; }
+int  dock64_pin_count64() { return g_pins_n; }
+int  dock64_run_count64() { return g_runs_n; }
+void dock64_pin_set64(int app_id, int on) { dock_pin_set64(app_id, on); }
+int  dock64_app_windows64(int app_id) { return gui64_app_windows(app_id); }
+void dock64_close_window64(int win_id) {
+    Window* w = gui64_window_by_id64(win_id);
+    if (w) gui64_destroy_window(w);
+}
+void dock64_close_app_windows64(int app_id) { (void)gui64_close_app(app_id); }
+void dock64_geom64(int* x, int* y, int* w, int* h) {
+    if (x) *x = g_dock_x;
+    if (y) *y = g_dock_y;
+    if (w) *w = g_dock_w;
+    if (h) *h = g_dock_h;
+}
+int  dock64_hit64(int mx, int my) { return dock_hit64(mx, my, nullptr); }
 
 // 某应用当前窗口数 / 是否全部最小化
 static void dock_app_state64(int app_id, int* nwin, int* nvis, int* all_min) {
@@ -1538,8 +1834,8 @@ static void dock_open_app64(int app_id) {
     }
 }
 
-static void dock_press64(int idx) {
-    if (idx < 0 || idx >= DOCK_ITEMS) return;
+static void dock_press64(int idx, int button, int mx, int my) {
+    if (idx < 0 || idx >= g_dock_n) return;
     // 点击回弹：减少动画时 0ms（1 帧到位）
     g_dock_bounce_idx = idx;
     g_dock_bounce_t0 = ticks64();
@@ -1548,6 +1844,11 @@ static void dock_press64(int idx) {
     g_dock_bounce_peak = 0;                     // 峰值跟踪清零（每次点击独立）
     g_dock_bounce_dy = 0;
     g_dock_bounce_total++;
+    // ★ v0.8.0（需求）：右键 Dock 图标 -> 上下文菜单（固定/取消固定 + 关闭窗口）
+    if (button == 1) {
+        dockmenu64_open_for_dock64(idx, mx, my);
+        return;
+    }
     if (idx == 0) {
         // 需求：本批点开始按钮只需要"被按下 + 打点"（真正的开始菜单是 P2）。
         // 老开始菜单仍可开（Win 键或此项），既有验收与用户习惯不被打断。
@@ -1561,7 +1862,36 @@ static void dock_press64(int idx) {
         startmenu64_toggle64();
         return;
     }
-    const int app = kDockItems[idx].app_id;
+    // ★ v0.8.0：RUN 项（一窗口一项）——点它就是点那个窗口；PIN 项保持原来的应用级语义
+    if (g_dock[idx].kind == DOCK_KIND_RUN) {
+        Window* rw = gui64_window_by_id64(g_dock[idx].win_id);
+        const char* ract = "run-gone";
+        int rn = 0;
+        if (rw) {
+            if (rw->minimized) { rw->minimized = false; gui64_set_active(rw); pop_begin64(rw, "dock"); ract = "run-restore"; }
+            else if (!rw->active) { gui64_set_active(rw); dirty_add(rw->x, rw->y, rw->w, rw->h); ract = "run-activate"; }
+            else { rw->minimized = true; fly_begin64(rw); gui64_invalidate(); ract = "run-minimize"; }
+            rn = 1;
+        }
+        if (g_dock_log_budget > 0) {
+            g_dock_log_budget--;
+            dbg64_line_begin64();
+            dbg64_str("[DOCK64] press idx=");
+            dbg64_dec((uint64_t)idx);
+            dbg64_str(" app=");
+            dbg64_dec((uint64_t)g_dock[idx].app_id);
+            dbg64_str(" action=");
+            dbg64_str(ract);
+            dbg64_str(" wins=");
+            dbg64_dec((uint64_t)rn);
+            dbg64_str(" win=");
+            dbg64_dec((uint64_t)g_dock[idx].win_id);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        return;
+    }
+    const int app = g_dock[idx].app_id;
     int n = 0, vis = 0, mn = 0;
     dock_app_state64(app, &n, &vis, &mn);
     const char* action = "open";
@@ -1657,8 +1987,8 @@ static void dock_draw_one64(int idx, int cx, int icon_px, int hovered, const The
         }
         return;
     }
-    const int kind = kDockItems[idx].icon_kind;
-    const int app64 = kDockItems[idx].icon64;
+    const int kind = g_dock[idx].icon_kind;
+    const int app64 = g_dock[idx].icon64;
     // ★ 本批（真图标）：Dock 上的应用图标统一走"圆角渐变底 + 外置图标包里的真图标"；
     //   包缺失/解码失败 -> 落回下面的预缩放缓存（包或卷里 /etc/icon_*.bin 的 48x48）/ 渐变底 + 首字母
     //   （界面不会空）。（不先问 icons64_available64：让"取不到"这条路真的走到 icons64 里打
@@ -1692,7 +2022,7 @@ static void dock_draw_one64(int idx, int cx, int icon_px, int hovered, const The
     gfx64_grad_round64(x, y, icon_px, icon_px, THEME64_R_ICON, c0, c1, 1, 255);
     gfx64_stroke_round64(x, y, icon_px, icon_px, THEME64_R_ICON, rgb(255, 255, 255), 90);
     // 中心字母（8x8 位图字体；图标 >=40px 时 scale 3 ≈ 24px）
-    const char* nm = g_lang_zh ? kDockItems[idx].zh : kDockItems[idx].en;
+    const char* nm = g_dock[idx].title[0] ? g_dock[idx].title : (g_lang_zh ? "应用" : "App");
     char ch = nm[0];
     if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
     const int sc = icon_px >= 40 ? 3 : 2;
@@ -1730,13 +2060,18 @@ static void draw_dock(void) {
     gfx64_glass64(g_dock_clock_x, g_dock_y, g_dock_clock_w, g_dock_h, THEME64_R_DOCK, 0,
                   t->dock_bg, alpha, t->dock_border, THEME64_A_BORDER, t);
     // 3) 图标 + 运行中小圆点 / 最小化小横杠
-    for (int i = 0; i < DOCK_ITEMS; i++) {
+    for (int i = 0; i < g_dock_n; i++) {
         const int cx = dock_item_draw_x64(i) + g_dock_icon / 2;
         const int icon_px = g_dock_icon * g_dock_scale[i] / 256;
         dock_draw_one64(i, cx, icon_px, g_dock_hover == i, t);
         if (i == 0) continue;
         int n = 0, vis = 0, mn = 0;
-        dock_app_state64(kDockItems[i].app_id, &n, &vis, &mn);
+        if (g_dock[i].kind == DOCK_KIND_RUN) {
+            Window* rw = gui64_window_by_id64(g_dock[i].win_id);   // 运行项：看这一个窗口
+            if (rw && rw->visible) { n = 1; vis = 1; mn = rw->minimized ? 1 : 0; }
+        } else {
+            dock_app_state64(g_dock[i].app_id, &n, &vis, &mn);
+        }
         if (n > 0) {
             const int bw = g_dock_icon * THEME64_DOCK_BAR_PCT / 100;   // 小横杠宽 = 图标宽 40%
             const int by = g_dock_y + g_dock_h - 5;
@@ -2099,6 +2434,7 @@ static void render(void) {
     desktopops64_menu_draw64();  // ★ P5：桌面右键菜单
     // ★ P2：开始菜单（窗口之上）→ 四个二级弹窗/设备 toast（更靠前）
     startmenu64_draw64();
+    dockmenu64_draw64();         // ★ v0.8.0：Dock/开始菜单图标的右键上下文菜单（最靠前）
     // ★ 缺陷 P7a-11：指针必须画在**所有**面板之上（二级菜单/通知/音量/网络弹层原本盖住指针）。
     //   旧顺序是 startmenu -> draw_cursor -> panels，弹层覆盖光标区域时就把指针吞了。
     panels64_draw64();
@@ -2449,6 +2785,8 @@ static void handle_mouse_press(int mx, int my, int button) {
     if (button == 0) (void)hda64_play_named64("click", "mouse-press");
     // ★ P2（最先）：设备 toast 关闭按钮 → 二级弹窗 → 开始菜单（层级栈：弹窗 > 菜单 > Dock/窗口/桌面）
     if (panels64_handle_mouse_press64(mx, my, button)) return;
+    // ★ v0.8.0：Dock/开始菜单右键菜单在最上层（点菜单行 = 执行；点外面 = 关闭并吐掉这一次点击）
+    if (dockmenu64_press64(mx, my, button)) return;
     if (startmenu64_is_open64()) {
         int sx = 0, sy = 0, sw = 0, sh = 0;
         startmenu64_geom64(&sx, &sy, &sw, &sh);
@@ -2467,7 +2805,7 @@ static void handle_mouse_press(int mx, int my, int button) {
         const int idx = dock_hit64(mx, my, &on_clock);
         if (idx >= 0) {
             g_dock_pressed = idx;
-            dock_press64(idx);
+            dock_press64(idx, button, mx, my);
             dirty_add(g_dock_x, g_dock_y, g_dock_w, g_dock_h);
             return;
         }
@@ -2631,6 +2969,7 @@ static void handle_mouse(void) {
     // ★ P2：二级弹窗/开始菜单的悬停 + 拖动（音量滑块 / 日历左右拖切月 / WiFi 滚动条）
     panels64_handle_mouse_move64(mx, my, btn);
     startmenu64_handle_mouse_move64(mx, my, btn);
+    dockmenu64_move64(mx, my);          // ★ v0.8.0：上下文菜单悬停高亮
     // ★ P5：桌面右键菜单的悬停高亮（菜单开着时鼠标移动换行；模块内部去重 + 只脏菜单矩形）
     if (desktopops64_menu_is_open64()) desktopops64_menu_move64(mx, my);
     // ★ P2：滚轮（PS/2 4 字节包的 Z；弹窗优先，其次开始菜单搜索列表）
@@ -2987,6 +3326,7 @@ static void handle_keyboard(void) {
         // ★ P2：二级弹窗优先吃键（ESC 一级）→ 开始菜单（ESC 二级 + 数字快捷键）→ ★ P5 桌面右键菜单
         //   （老菜单那一整段"上下选/回车/数字"的分支已随老菜单一起删除）
         if (panels64_handle_key64(c)) continue;
+        if (dockmenu64_key64(c)) continue;   // ★ v0.8.0：右键菜单打开时先吃键（Up/Down/Enter/ESC）
         if (startmenu64_handle_key64(c)) continue;
         if (desktopops64_menu_key64(c)) continue;
         // 归一化回车：应用两种都认，但统一成 '\n' 更省心（保留原码给终端也无妨）
@@ -3125,9 +3465,12 @@ static void fly_snapshot64(const Window* w) {
     g_fly_snap_ok = true;
 }
 
-// 找一个应用在 Dock 里的下标（-1 = 没固定）
+// 找一个应用在 Dock 里的下标（★ v0.8.0：优先**运行项**，其次固定项；-1 = 不在 Dock 上）
 static int dock_index_of_app64(int app_id) {
-    for (int i = 1; i < DOCK_ITEMS; i++) if (kDockItems[i].app_id == app_id) return i;
+    for (int i = 1; i < g_dock_n; i++)
+        if (g_dock[i].kind == DOCK_KIND_RUN && g_dock[i].app_id == app_id) return i;
+    for (int i = 1; i < g_dock_n; i++)
+        if (g_dock[i].kind == DOCK_KIND_PIN && g_dock[i].app_id == app_id) return i;
     return -1;
 }
 
@@ -3339,8 +3682,13 @@ static void pop_tick64(void) {
 // ---- Dock 悬停窗口列表（同一应用多窗口：可选择恢复"指定窗口"；一应用只有一根小横杠）----
 static void winlist_collect64(int idx, Window** out, int* n) {
     *n = 0;
-    if (idx <= 0 || idx >= DOCK_ITEMS) return;
-    const int app = kDockItems[idx].app_id;
+    if (idx <= 0 || idx >= g_dock_n) return;
+    if (g_dock[idx].kind == DOCK_KIND_RUN) {          // ★ v0.8.0：运行项 = 就是这一个窗口
+        Window* w = gui64_window_by_id64(g_dock[idx].win_id);
+        if (w && w->visible) out[(*n)++] = w;
+        return;
+    }
+    const int app = g_dock[idx].app_id;
     for (int i = 0; i < MAX_WINS; i++) {
         if (!g_used[i]) continue;
         Window* w = &g_wins[i];

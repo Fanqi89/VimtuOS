@@ -231,7 +231,7 @@ void gfx64_stroke_round64(int x, int y, int w, int h, int r, uint32_t c, int a) 
 // mask 以 1/2 分辨率生成（ds=2）：阴影是低频渐变，最近邻放大肉眼无差，写入带宽省 3/4。
 // ★ P2：开始菜单/四个弹窗/toast/电源按钮/头像再多 5 种 (w,h,r) 键 —— 6 槽会互相淘汰
 //   （每帧重建阴影 mask，实测帧率掉到 1~2Hz）。纯缓存，加槽不改变任何绘制结果。
-#define GFX64_SH_SLOTS 10
+#define GFX64_SH_SLOTS 24      // ★ v0.8.0：10 -> 24。Dock 宽度随图标数变化（每种宽度是一个键）+ 多窗口
 struct Gfx64ShMask {
     bool     used;
     int      w, h, r;
@@ -630,7 +630,7 @@ static void box_blur_buf64(uint32_t* buf, int w, int h, int r) {
 }
 
 // 区域模糊（内容层玻璃用；结果进 LRU 缓存）
-#define GFX64_BLUR_SLOTS 8
+#define GFX64_BLUR_SLOTS 24    // ★ v0.8.0：8 -> 24。Dock 宽度随图标数变化 + 多窗口/弹窗：8 个槽会抖动到“每帧重算模糊”
 struct Gfx64BlurEnt {
     bool used;
     int  x, y, w, h, r;

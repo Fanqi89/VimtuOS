@@ -67,7 +67,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.7.9"     # ★ v0.7.9：图标/目录装载 3.6s -> ~30ms（inode 整表窗口 + ATA 跨扇区自旋），开始菜单不再看门狗蓝屏
+VIMTUOS_VERSION="0.8.0"     # ★ v0.8.0：Dock 改成运行时动态列表（固定项持久化 + 运行项随窗口增删 + 右键上下文菜单）
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
@@ -129,6 +129,8 @@ SRCS_DESKTOP="$SRCS_DESKTOP kernel/locklogin64.cpp kernel/userdb64.cpp"
 #   + P2 UI 工具箱：混合圆角/亚克力/线性图标）与 panels64（通知/声音/网络/日历 + 通知列表 + 设备 toast）。
 #   **只进系统内核**（安装介质没有桌面外壳，保持它的 4MB 预算不被这批代码吃掉）。
 SRCS_DESKTOP="$SRCS_DESKTOP kernel/startmenu64.cpp kernel/panels64.cpp"
+# ★ v0.8.0：dockmenu64 = Dock/开始菜单图标的右键上下文菜单（**只进系统内核**）
+SRCS_DESKTOP="$SRCS_DESKTOP kernel/dockmenu64.cpp"
 # ★ 本批（真图标）：kernel/icons64.cpp = 统一图标层（读系统镜像里的外置图标包 -> img64 解码 -> 缓存
 #   -> 按主题 palette 着色上屏；取不到就回落既有程序化绘制）。**只进系统内核**（安装介质不带桌面）。
 SRCS_DESKTOP="$SRCS_DESKTOP kernel/icons64.cpp"
@@ -839,7 +841,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/theme64.o "$BUILD/os"/gfx64.o "$BUILD/os"/img64.o \
     "$BUILD/os"/locklogin64.o "$BUILD/os"/userdb64.o \
     "$BUILD/os"/wl64.o \
-    "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o \
+    "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o "$BUILD/os"/dockmenu64.o \
     "$BUILD/os"/icons64.o \
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
@@ -888,7 +890,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
         "$BUILD/os"/theme64.o "$BUILD/os"/gfx64.o "$BUILD/os"/img64.o \
         "$BUILD/os"/locklogin64.o "$BUILD/os"/userdb64.o \
-        "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o \
+        "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o "$BUILD/os"/dockmenu64.o \
         "$BUILD/os"/icons64.o \
         "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
         "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \

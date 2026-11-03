@@ -116,6 +116,7 @@ int     gui64_dock_top64();
 //   kernel/startmenu64.h 的 startmenu64_is_open64() 查询"开始菜单是否打开"。）
 Window* gui64_top_window();
 Window* gui64_window_at(int i);              // 遍历所有窗口（0..gui64_window_count()-1）
+Window* gui64_window_by_id64(int id);        // ★ v0.8.0：按**窗口槽**取（= Dock 运行项的 window_id）
 int     gui64_window_count();
 int     gui64_app_windows(int app_id);
 bool    gui64_click_is_right();
