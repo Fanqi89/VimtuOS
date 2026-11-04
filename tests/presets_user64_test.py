@@ -57,6 +57,10 @@ TGT = os.path.join(WORK, "target8g.img")
 PORT = 5597
 NEWNAME = "neo"
 
+# 预设壁纸/头像的目录根（v0.6.0 目录重排后的真位置；旧 /Wallpapers、/Avatars 由内核
+# kPathAlias 映射到这两个系统目录，所以**新旧都接受**）。判据强度不变：仍要求真文件 + ok=1。
+PRESET_ROOT_RE_WALL = r"(?:/Wallpapers|/System/themes/wallpapers)"
+PRESET_ROOT_RE_AVA  = r"(?:/Avatars|/System/themes/avatars)"
 P_WALL, P_AVATAR, P_UNAME = 5, 12, 13
 CID_WALL_PRESET, CID_AVATAR_PRESET = 73, 147
 CID_UNAME_FIELD, CID_UNAME_APPLY = 150, 151
@@ -199,24 +203,25 @@ def main():
                 cur.goto(mon, btn[0], btn[1])
                 mon.click(wait=3.0)
                 time.sleep(2.0)
-                m = re.findall(r"\[SET64\] wall path=(/Wallpapers/[^\s]+) ok=1", log_of(serial))
+                m = re.findall(r"\[SET64\] wall path=(" + PRESET_ROOT_RE_WALL + r"/[^\s]+) ok=1", log_of(serial))
                 walls.append(m[-1] if m else None)
                 btn = ctl_center(log_of(serial), P_WALL, CID_WALL_PRESET) or btn
         time.sleep(3.0)          # 串口落盘有 1~3 s 延迟：等最后一次点击的日志写出来再采
         log1 = log_of(serial)
-        check("点「预设壁纸」真的应用成功（[SET64] wall path=/Wallpapers/... ok=1）",
+        check("点「预设壁纸」真的应用成功（[SET64] wall path=/System/themes/wallpapers|/Wallpapers … ok=1）",
               walls and walls[0] is not None, str(walls[0]))
         check("预设壁纸循环不卡死（第二次点换成另一张）",
               len(walls) >= 2 and walls[1] is not None and walls[1] != walls[0],
               "%s -> %s" % (walls[0] if walls else "?", walls[1] if len(walls) > 1 else "?"))
-        check("应用的是 /Wallpapers 里的文件", bool(walls) and walls[0] and walls[0].startswith("/Wallpapers/"),
+        check("应用的是预设壁纸目录里的文件（/System/themes/wallpapers 或 /Wallpapers）",
+              bool(walls) and walls[0] and walls[0].startswith(("/Wallpapers/", "/System/themes/wallpapers/")),
               str(walls[0] if walls else ""))
         check("壁纸应用打点带 applied=1（成功路径）",
               re.search(r"\[SET64\] wall preset idx=\d+ n=\d+ name=\S+ applied=1", log1) is not None)
         # ★ 用户自己的 JPEG 壁纸（/Wallpapers/1.jpeg）也必须能用：修前被一条过时的
         #   "jpeg/gif not implemented (img64: png/bmp only)" 闸门挡住，而 img64 其实早就能解 JPEG。
-        check("JPEG 壁纸也能应用（[SET64] wall path=/Wallpapers/1.jpeg ok=1）",
-              re.search(r"\[SET64\] wall path=/Wallpapers/1\.jpeg ok=1", log1) is not None,
+        check("JPEG 壁纸也能应用（[SET64] wall path=…/1.jpeg ok=1）",
+              re.search(r"\[SET64\] wall path=" + PRESET_ROOT_RE_WALL + r"/1\.jpeg ok=1", log1) is not None,
               "已应用：%s" % [w for w in walls if w])
 
         # ---- B. 预设头像 ----
@@ -232,7 +237,7 @@ def main():
             mon.click(wait=3.0)
             time.sleep(2.0)
         log2 = log_of(serial)
-        m = re.search(r"\[USER64\] avatar user=\S+ src=(/Avatars/\S+) via=settings px=\d+x\d+ "
+        m = re.search(r"\[USER64\] avatar user=\S+ src=(" + PRESET_ROOT_RE_AVA + r"/\S+) via=settings px=\d+x\d+ "
                       r"saved=1 persisted=1", log2)
         check("点「预设头像」写入 users.db 且 persisted=1", m is not None,
               (m.group(0) if m else "缺失"))
@@ -291,11 +296,11 @@ def main():
               re.search(r"\[LOGIN64\] login screen shown[^\r\n]*user=%s" % NEWNAME, log4) is not None,
               (re.search(r"\[LOGIN64\] login screen shown[^\r\n]*user=\S+", log4) or [""])[0].strip()[:110])
         # v0.5.17 起头像走"解码期缩放"入口，打点前缀变成 `[IMG64] load fit … max=256`
-        check("重启后头像仍是预设图（[IMG64] load fit path=/Avatars/… max=256 ok=1）",
-              re.search(r"\[IMG64\] load fit path=/Avatars/\S+ max=256 ok=1", log4) is not None,
-              (re.search(r"\[IMG64\] load fit path=/Avatars/\S+[^\r\n]*", log4) or [""])[0].strip()[:120])
+        check("重启后头像仍是预设图（[IMG64] load fit path=…/Avatars… max=256 ok=1）",
+              re.search(r"\[IMG64\] load fit path=" + PRESET_ROOT_RE_AVA + r"/\S+ max=256 ok=1", log4) is not None,
+              (re.search(r"\[IMG64\] load fit path=" + PRESET_ROOT_RE_AVA + r"/\S+[^\r\n]*", log4) or [""])[0].strip()[:120])
         check("重启后壁纸仍是预设文件（[SET64] boot apply ... wall=… 或 [GFX64] init … src=vfs:wallpaper）",
-              re.search(r"wall=/Wallpapers/|src=vfs:wallpaper", log4) is not None,
+              re.search(r"wall=" + PRESET_ROOT_RE_WALL + r"/|src=vfs:wallpaper", log4) is not None,
               (re.search(r"\[SET64\] boot apply[^\r\n]*", log4) or [""])[0].strip()[:110])
         check("全程无 PANIC", "PANIC" not in log4)
         mon.send("quit", wait=1.5)

@@ -642,6 +642,14 @@ static uint32_t g_blur_stamp = 0;
 static uint32_t g_blur_hit = 0, g_blur_miss = 0;
 static uint32_t g_blur_miss_log = 0;
 
+// ★ v0.8.0 排查：把两个缓存的命中/缺失计数读出（reset 时清零）。
+void gfx64_perf_stats64(uint32_t* blur_hit, uint32_t* blur_miss, uint32_t* sh_hit, uint32_t* sh_miss, int reset) {
+    if (blur_hit)  *blur_hit  = g_blur_hit;
+    if (blur_miss) *blur_miss = g_blur_miss;
+    if (sh_hit)    *sh_hit    = g_sh_hit;
+    if (sh_miss)   *sh_miss   = g_sh_miss;
+    if (reset) { g_blur_hit = 0; g_blur_miss = 0; g_sh_hit = 0; g_sh_miss = 0; }
+}
 static uint32_t* panel_blur64(int x, int y, int w, int h, int r) {
     for (int i = 0; i < GFX64_BLUR_SLOTS; i++)
         if (g_blur_cache[i].used && g_blur_cache[i].x == x && g_blur_cache[i].y == y &&

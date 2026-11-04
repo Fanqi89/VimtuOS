@@ -164,10 +164,28 @@ static int mixed_cov64(int i, int j, int w, int h, int rt, int rb) {
     return 255;
 }
 
+// ★ v0.8.0 修：循环范围与当前裁剪框求交。被跳过的像素 gfx64_blend64 本来就会丢弃
+//   （绝对坐标落在裁剪框外），所以**像素结果逐点不变**，只是不再白算那么多遍 isqrt。
+static inline void p2_loop_box64(int x, int y, int w, int h, int* i0, int* j0, int* i1, int* j1) {
+    int cx, cy, cw, ch;
+    fb_get_clip64(&cx, &cy, &cw, &ch);
+    *i0 = 0; *j0 = 0; *i1 = w; *j1 = h;
+    const int kx0 = cx - x, ky0 = cy - y, kx1 = cx + cw - x, ky1 = cy + ch - y;
+    if (kx0 > *i0) *i0 = kx0;
+    if (ky0 > *j0) *j0 = ky0;
+    if (kx1 < *i1) *i1 = kx1;
+    if (ky1 < *j1) *j1 = ky1;
+    if (*i0 < 0) *i0 = 0;
+    if (*j0 < 0) *j0 = 0;
+    if (*i1 > w) *i1 = w;
+    if (*j1 > h) *j1 = h;
+}
+
 void p2ui_fill_mixed64(int x, int y, int w, int h, int rt, int rb, uint32_t c, int a) {
     if (w <= 0 || h <= 0 || a <= 0) return;
-    for (int j = 0; j < h; j++)
-        for (int i = 0; i < w; i++) {
+    int i0, j0, i1, j1; p2_loop_box64(x, y, w, h, &i0, &j0, &i1, &j1);
+    for (int j = j0; j < j1; j++)
+        for (int i = i0; i < i1; i++) {
             const int cov = mixed_cov64(i, j, w, h, rt, rb);
             if (cov <= 0) continue;
             gfx64_blend64(x + i, y + j, c, a * cov / 255);
@@ -181,8 +199,9 @@ void p2ui_acrylic_mixed64(int x, int y, int w, int h, int rt, int rb, uint32_t t
     int bw = 0, bh = 0;
     // 背景层：**预模糊壁纸**（模糊只算过一次，Token 半径 THEME64_BLUR_BACKDROP）
     const uint32_t* back = gfx64_wall_blur64(&bw, &bh);
-    for (int j = 0; j < h; j++) {
-        for (int i = 0; i < w; i++) {
+    int i0, j0, i1, j1; p2_loop_box64(x, y, w, h, &i0, &j0, &i1, &j1);
+    for (int j = j0; j < j1; j++) {
+        for (int i = i0; i < i1; i++) {
             const int cov = mixed_cov64(i, j, w, h, rt, rb);
             if (cov <= 0) continue;
             const int sx = x + i, sy = y + j;
@@ -196,8 +215,9 @@ void p2ui_acrylic_mixed64(int x, int y, int w, int h, int rt, int rb, uint32_t t
 
 void p2ui_stroke_mixed64(int x, int y, int w, int h, int rt, int rb, uint32_t c, int a) {
     if (w <= 2 || h <= 2 || a <= 0) return;
-    for (int j = 0; j < h; j++)
-        for (int i = 0; i < w; i++) {
+    int i0, j0, i1, j1; p2_loop_box64(x, y, w, h, &i0, &j0, &i1, &j1);
+    for (int j = j0; j < j1; j++)
+        for (int i = i0; i < i1; i++) {
             const int outer = mixed_cov64(i, j, w, h, rt, rb);
             if (outer <= 0) continue;
             const int inner = mixed_cov64(i - 1, j - 1, w - 2, h - 2,

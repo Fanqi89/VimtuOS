@@ -151,8 +151,16 @@ static Window*  g_z = nullptr;              // z 序链表：头 = 最前
 static int      g_screen_w = 0, g_screen_h = 0;
 static bool     g_lang_zh = true;
 static bool     g_click_right = false;
-static int      g_dirty_x0, g_dirty_y0, g_dirty_x1, g_dirty_y1;   // 半开区间
+static int      g_dirty_x0, g_dirty_y0, g_dirty_x1, g_dirty_y1;   // 半开区间（= 当前要画的那一块）
 static bool     g_dirty_any = false;
+// ★ v0.8.0 修：后续待画的脏块（当前块画完再一块一块画，中间不丢输入）。
+//   为什么：原来只有**一个包围盒**，"开始菜单左上角时间"与"Dock 右下角时钟"在同一秒内
+//   都被弄脏时会合成 824x491（屏幕 39%）的巨块：实测一次重绘 ~490ms，
+//   期间 PS/2 鼠标队列会溢出 -> 点击丢失（startmenu64_test 的 10 条点击用例就这么挂的）。
+#define DIRTY_PEND_MAX 4
+static int g_pend_x0[DIRTY_PEND_MAX], g_pend_y0[DIRTY_PEND_MAX];
+static int g_pend_x1[DIRTY_PEND_MAX], g_pend_y1[DIRTY_PEND_MAX];
+static int g_pend_n = 0;
 static int      g_cur_x = 0, g_cur_y = 0, g_prev_cur_x = -1, g_prev_cur_y = -1;
 static bool     g_first_frame = true;
 
@@ -344,6 +352,17 @@ static inline uint64_t rdtsc64() {
 }
 
 // ==================== 脏矩形 ====================
+// 某个图层包围盒是否与**当前**脏区相交（不相交 = 该图层整段可以跳过，像素结果不变）
+static inline bool rect_hit64(int x, int y, int w, int h) {
+    return !(x >= g_dirty_x1 || y >= g_dirty_y1 || x + w <= g_dirty_x0 || y + h <= g_dirty_y0);
+}
+// 开始菜单包围盒：菜单本体 + 远层阴影 68px + 电源二级菜单向上弹出（实测 pm 面板高 ~140）
+static bool sm_box_hit64() {
+    int mx = 0, my = 0, mw = 0, mh = 0;
+    startmenu64_geom64(&mx, &my, &mw, &mh);
+    return rect_hit64(mx - 72, my - 220, mw + 144, mh + 292);
+}
+static void dirty_coalesce64();     // 把后面队列里与前面（含当前块）相交的块合并
 static void dirty_add(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
     int x1 = x + w, y1 = y + h;
@@ -355,12 +374,114 @@ static void dirty_add(int x, int y, int w, int h) {
     if (!g_dirty_any) {
         g_dirty_x0 = x; g_dirty_y0 = y; g_dirty_x1 = x1; g_dirty_y1 = y1;
         g_dirty_any = true;
-    } else {
+        return;
+    }
+    // ★ v0.8.0：**相交才合并**。不相交就排到后面的队列（分次重绘），
+    //   避免把屏幕两头的小块合成一个大包围盒。
+    if (!(x >= g_dirty_x1 || y >= g_dirty_y1 || x1 <= g_dirty_x0 || y1 <= g_dirty_y0)) {
         if (x < g_dirty_x0) g_dirty_x0 = x;
         if (y < g_dirty_y0) g_dirty_y0 = y;
         if (x1 > g_dirty_x1) g_dirty_x1 = x1;
         if (y1 > g_dirty_y1) g_dirty_y1 = y1;
+        dirty_coalesce64();
+        return;
     }
+    for (int i = 0; i < g_pend_n; i++) {
+        if (x >= g_pend_x1[i] || y >= g_pend_y1[i] || x1 <= g_pend_x0[i] || y1 <= g_pend_y0[i]) continue;
+        if (x < g_pend_x0[i]) g_pend_x0[i] = x;
+        if (y < g_pend_y0[i]) g_pend_y0[i] = y;
+        if (x1 > g_pend_x1[i]) g_pend_x1[i] = x1;
+        if (y1 > g_pend_y1[i]) g_pend_y1[i] = y1;
+        dirty_coalesce64();
+        return;
+    }
+    if (g_pend_n < DIRTY_PEND_MAX) {
+        g_pend_x0[g_pend_n] = x;  g_pend_y0[g_pend_n] = y;
+        g_pend_x1[g_pend_n] = x1; g_pend_y1[g_pend_n] = y1;
+        g_pend_n++;
+        return;
+    }
+    // 队列满：并进"面积增量最小"的那一块（宁可多画小块，不画漏）
+    {
+        int best = -1, best_grow = 0;
+        for (int i = 0; i <= g_pend_n; i++) {
+            const int bx0 = (i < g_pend_n) ? g_pend_x0[i] : g_dirty_x0;
+            const int by0 = (i < g_pend_n) ? g_pend_y0[i] : g_dirty_y0;
+            const int bx1 = (i < g_pend_n) ? g_pend_x1[i] : g_dirty_x1;
+            const int by1 = (i < g_pend_n) ? g_pend_y1[i] : g_dirty_y1;
+            const int nx0 = (x < bx0) ? x : bx0, ny0 = (y < by0) ? y : by0;
+            const int nx1 = (x1 > bx1) ? x1 : bx1, ny1 = (y1 > by1) ? y1 : by1;
+            const int grow = (nx1 - nx0) * (ny1 - ny0) - (bx1 - bx0) * (by1 - by0);
+            if (best < 0 || grow < best_grow) { best = i; best_grow = grow; }
+        }
+        if (best == g_pend_n) {
+            if (x < g_dirty_x0) g_dirty_x0 = x;
+            if (y < g_dirty_y0) g_dirty_y0 = y;
+            if (x1 > g_dirty_x1) g_dirty_x1 = x1;
+            if (y1 > g_dirty_y1) g_dirty_y1 = y1;
+        } else {
+            if (x < g_pend_x0[best]) g_pend_x0[best] = x;
+            if (y < g_pend_y0[best]) g_pend_y0[best] = y;
+            if (x1 > g_pend_x1[best]) g_pend_x1[best] = x1;
+            if (y1 > g_pend_y1[best]) g_pend_y1[best] = y1;
+        }
+        dirty_coalesce64();
+    }
+}
+// 合并：任意两块相交就并成一块（O(n^2)、n <= 4，很便宜）
+static void dirty_coalesce64() {
+    bool again = true;
+    while (again) {
+        again = false;
+        // 队列内部
+        for (int i = 0; i < g_pend_n && !again; i++) {
+            for (int j = i + 1; j < g_pend_n; j++) {
+                if (g_pend_x0[i] >= g_pend_x1[j] || g_pend_y0[i] >= g_pend_y1[j] ||
+                    g_pend_x1[i] <= g_pend_x0[j] || g_pend_y1[i] <= g_pend_y0[j]) continue;
+                if (g_pend_x0[j] < g_pend_x0[i]) g_pend_x0[i] = g_pend_x0[j];
+                if (g_pend_y0[j] < g_pend_y0[i]) g_pend_y0[i] = g_pend_y0[j];
+                if (g_pend_x1[j] > g_pend_x1[i]) g_pend_x1[i] = g_pend_x1[j];
+                if (g_pend_y1[j] > g_pend_y1[i]) g_pend_y1[i] = g_pend_y1[j];
+                for (int k = j; k + 1 < g_pend_n; k++) {
+                    g_pend_x0[k] = g_pend_x0[k + 1]; g_pend_y0[k] = g_pend_y0[k + 1];
+                    g_pend_x1[k] = g_pend_x1[k + 1]; g_pend_y1[k] = g_pend_y1[k + 1];
+                }
+                g_pend_n--;
+                again = true;
+                break;
+            }
+        }
+        if (again) continue;
+        // 队列 vs 当前块
+        for (int j = 0; j < g_pend_n; j++) {
+            if (g_pend_x0[j] >= g_dirty_x1 || g_pend_y0[j] >= g_dirty_y1 ||
+                g_pend_x1[j] <= g_dirty_x0 || g_pend_y1[j] <= g_dirty_y0) continue;
+            if (g_pend_x0[j] < g_dirty_x0) g_dirty_x0 = g_pend_x0[j];
+            if (g_pend_y0[j] < g_dirty_y0) g_dirty_y0 = g_pend_y0[j];
+            if (g_pend_x1[j] > g_dirty_x1) g_dirty_x1 = g_pend_x1[j];
+            if (g_pend_y1[j] > g_dirty_y1) g_dirty_y1 = g_pend_y1[j];
+            for (int k = j; k + 1 < g_pend_n; k++) {
+                g_pend_x0[k] = g_pend_x0[k + 1]; g_pend_y0[k] = g_pend_y0[k + 1];
+                g_pend_x1[k] = g_pend_x1[k + 1]; g_pend_y1[k] = g_pend_y1[k + 1];
+            }
+            g_pend_n--;
+            again = true;
+            break;
+        }
+    }
+}
+// 一块画完：把下一块装进当前槽；没有就清 g_dirty_any（= 本轮脏区全部提交完）
+static void dirty_next64() {
+    if (g_pend_n <= 0) { g_dirty_any = false; return; }
+    g_dirty_x0 = g_pend_x0[0]; g_dirty_y0 = g_pend_y0[0];
+    g_dirty_x1 = g_pend_x1[0]; g_dirty_y1 = g_pend_y1[0];
+    for (int k = 0; k + 1 < g_pend_n; k++) {
+        g_pend_x0[k] = g_pend_x0[k + 1]; g_pend_y0[k] = g_pend_y0[k + 1];
+        g_pend_x1[k] = g_pend_x1[k + 1]; g_pend_y1[k] = g_pend_y1[k + 1];
+    }
+    g_pend_n--;
+    g_dirty_any = true;
+    dirty_coalesce64();       // 新当前块与剩下块相交就并（少画一次）
 }
 void gui64_dirty(int x, int y, int w, int h) { dirty_add(x, y, w, h); }
 void gui64_invalidate() { dirty_add(0, 0, g_screen_w, g_screen_h); }
@@ -1685,11 +1806,17 @@ static int dock_anim_tick64() {
             g_dock_scale[i] += ds * step / 256;
             changed = 1;
         }
-        if (dsh > -1 && dsh < 1) {
+        // ★ v0.8.0 修：这里原来是 `g_dock_shift[i] += dsh / 3;`，而收敛分支只认 dsh == 0
+        //   → dsh = -2 时 -2/3 截断为 0：让位永远停在 2px，`changed = 1` 每帧都成立，
+        //   Dock 每帧重画（实测 idle 13~15fps、开开始菜单 2fps）。
+        //   修法：步长至少 1px（向目标方向）+ |dsh| <= 1 直接落到目标。
+        if (dsh > -2 && dsh < 2) {
             if (dsh != 0) changed = 1;
             g_dock_shift[i] = tgt_shift[i];
         } else {
-            g_dock_shift[i] += dsh / 3;
+            int st = dsh / 3;
+            if (st == 0) st = (dsh > 0) ? 1 : -1;   // 不能留在 0 步长上（否则永远到不了目标）
+            g_dock_shift[i] += st;
             changed = 1;
         }
     }
@@ -2386,24 +2513,39 @@ static void draw_cursor(void) {
     if (!hz && !vt && !d1) cur_line64(cx - 5, cy + 5, cx + 5, cy - 5, white);
 }
 
+// ★ v0.8.0 排查：render() 分段耗时（rdtsc）—— 每秒汇总成一行 [UI] rseg。
+//   它只读 rdtsc（~30 周期），不改任何绘制结果；用来把"帧时间 490ms"
+//   拆成 壁纸/阴影/窗口/Dock/开始菜单/其它/提交 七段。
+static uint64_t g_rseg_cyc[7];
+static uint32_t g_rseg_n;        // 本秒帧数
+static uint64_t g_rseg_max;      // 本秒单帧最大总耗时（周期）
+static uint64_t g_rseg_amax;     // 本秒单帧最大脏区面积（px）—— 证明脐块合并已消失
+static inline void rseg64(int i, uint64_t* ts) {
+    const uint64_t n = rdtsc64();
+    g_rseg_cyc[i] += n - *ts;
+    *ts = n;
+}
 // 全部图层按脏矩形裁剪重绘，然后只提交脏矩形
 static void render(void) {
     const uint64_t t0 = rdtsc64();
     const int x0 = g_dirty_x0, y0 = g_dirty_y0, x1 = g_dirty_x1, y1 = g_dirty_y1;
     const int dw = x1 - x0, dh = y1 - y0;
-    if (dw <= 0 || dh <= 0) { g_dirty_any = false; return; }
+    if (dw <= 0 || dh <= 0) { dirty_next64(); return; }
 
+    uint64_t ts = rdtsc64();      // ★ v0.8.0 排查：分段计时起点
     fb_set_clip(x0, y0, dw, dh);
     draw_desktop_bg(x0, y0, x1, y1);
     draw_icons();
     // ★ P5：鼠标左键拖出的**玻璃选择框**（框内全透明、只有突出边缘；桌面层、窗口之下）
     desktopops64_selbox_draw64();
+    rseg64(0, &ts);
     // Dock 双层阴影：脏区压到它的包围盒就补画（壁纸/图标已画完，窗口还没画 → 层次正确）
     {
         int bx, by, bw, bh;
         dock_shadow_box64(&bx, &by, &bw, &bh);
         if (!(bx >= x1 || by >= y1 || bx + bw <= x0 || by + bh <= y0)) draw_dock_shadow();
     }
+    rseg64(1, &ts);
     // 窗口从底到顶画：先把 z 序反转
     Window* stack[MAX_WINS];
     int n = 0;
@@ -2428,19 +2570,34 @@ static void render(void) {
             draw_window(w);
         }
     }
+    rseg64(2, &ts);
     fly_draw64();                // ★ P5：最小化飞向 Dock 的缩略图（窗口之上、Dock 之下）
-    draw_dock();                 // ★ 本批：Windows 11 风格 Dock（替换老 32px 任务栏）
+    // ★ v0.8.0 修：Dock 面板 / 右下角时钟片都没和脏区相交就整段跳过。
+    //   为什么：draw_dock() 会把 9 个图标 + 两块毛玻璃 + 两个阴影全重画一遍，只有落在裁剪框内的像素真正写进去；
+    //   实测（[UI] rseg）一帧 35ms，而开始菜单开着时每帧还会多算上它。外扩 12/14px 是悬停放大(120%)、
+    //   点击回弹(±10px)与 hover 底色(±4px) 的最大溢出量。
+    if (rect_hit64(g_dock_x - 12, g_dock_y - 14, g_dock_w + 24, g_dock_h + 28) ||
+        rect_hit64(g_dock_clock_x - 12, g_dock_y - 14, g_dock_clock_w + 24, g_dock_h + 28))
+        draw_dock();                 // ★ 本批：Windows 11 风格 Dock（替换老 32px 任务栏）
     winlist_draw64();            // ★ P5：Dock 悬停窗口列表
     desktopops64_menu_draw64();  // ★ P5：桌面右键菜单
+    rseg64(3, &ts);
     // ★ P2：开始菜单（窗口之上）→ 四个二级弹窗/设备 toast（更靠前）
-    startmenu64_draw64();
+    // ★ v0.8.0 修：开始菜单也是"整块重画"（实测一帧 sm=280ms，其中 ≈219 个字形）。
+    //   脏区跟菜单框（含阴影 72px）+电源二级菜单（向上）都不相交时就不画。
+    if (!startmenu64_is_open64() || sm_box_hit64()) startmenu64_draw64();
     dockmenu64_draw64();         // ★ v0.8.0：Dock/开始菜单图标的右键上下文菜单（最靠前）
+    rseg64(4, &ts);
     // ★ 缺陷 P7a-11：指针必须画在**所有**面板之上（二级菜单/通知/音量/网络弹层原本盖住指针）。
     //   旧顺序是 startmenu -> draw_cursor -> panels，弹层覆盖光标区域时就把指针吞了。
     panels64_draw64();
     draw_cursor();               // ★ P5：按形状画指针（箭头/文本/转圈/缩放）
+    rseg64(5, &ts);
     fb_reset_clip();
     fb_flip_region(x0, y0, dw, dh);
+    rseg64(6, &ts);
+    { const uint64_t tot = rdtsc64() - t0; if (tot > g_rseg_max) g_rseg_max = tot; g_rseg_n++;
+      const uint64_t ar = (uint64_t)dw * (uint64_t)dh; if (ar > g_rseg_amax) g_rseg_amax = ar; }
 
     const uint64_t t1 = rdtsc64();
     g_busy_cycles += t1 - t0;
@@ -2450,7 +2607,7 @@ static void render(void) {
     //   壁纸重铺 + 每个窗口重铺 client_bg，而应用自己的重绘是有条件的（settings64 只在
     //   尺寸变化时画内容）→ 设置窗口内容每帧被抹成纯 240,240,240。见报告里的像素证据。）
     g_frames++;
-    g_dirty_any = false;
+    dirty_next64();      // ★ v0.8.0：还有待画块就接着画（下一轮主循环，中间照常处理输入）
     // ★ P7a-14：本帧的取证计数（重绘耗时之和 / 是否整屏重绘）—— 每秒汇总成一行 [UI] perf
     g_perf_rcyc += t1 - t0;
     g_perf_rn++;
@@ -4167,6 +4324,7 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
             if (g_dirty_any || g_first_frame) {
                 g_first_frame = false;
                 if (locklogin64_active64()) {
+                    g_pend_n = 0;
                     g_dirty_any = false;      // 锁屏期间桌面层一概不画（脏区直接丢弃，由锁屏层整屏/局部重绘接管）
                 } else {
                     render();
@@ -4234,6 +4392,50 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
                 dbg64_dec(tsc_mhz);
                 dbg64_nl();
                 dbg64_line_end64();
+                // ★ v0.8.0 排查：上一秒内 render() 各段累计耗时（us）+ 两个缓存的命中率
+                {
+                    const uint64_t d = tsc_dt ? tsc_dt : 1;
+                    uint32_t bh = 0, bm = 0, sh = 0, sm = 0;
+                    gfx64_perf_stats64(&bh, &bm, &sh, &sm, 1);
+                    static const char* NM7[7] = {" bg=", " shdw=", " win=", " dock=", " sm=", " misc=", " flip="};
+                    dbg64_line_begin64();
+                    dbg64_str("[UI] rseg sec=");
+                    dbg64_dec((uint64_t)g_perf_sec);
+                    dbg64_str(" n=");
+                    dbg64_dec((uint64_t)g_rseg_n);
+                    for (int i = 0; i < 7; i++) {
+                        dbg64_str(NM7[i]);
+                        dbg64_dec(g_rseg_cyc[i] * 1000000ull / d);
+                    }
+                    dbg64_str(" maxtot=");
+                    dbg64_dec(g_rseg_max * 1000000ull / d);
+                    dbg64_str(" bh=");
+                    dbg64_dec((uint64_t)bh);
+                    dbg64_str(" bm=");
+                    dbg64_dec((uint64_t)bm);
+                    dbg64_str(" sh=");
+                    dbg64_dec((uint64_t)sh);
+                    dbg64_str(" shm=");      // 阴影 mask 缓存未命中数（与上面分段里的 " sm=" 开始菜单耗时分清）
+                    dbg64_dec((uint64_t)sm);
+                    dbg64_str(" fr=");
+                    {
+                        uint32_t frs = 0, fdr = 0;
+                        font64_perf_stats64(&frs, &fdr, 1);
+                        dbg64_dec((uint64_t)frs);
+                        dbg64_str("/");
+                        dbg64_dec((uint64_t)fdr);
+                    }
+                    dbg64_str(" amax=");
+                    dbg64_dec((uint64_t)g_rseg_amax);
+                    dbg64_str(" dw=");
+                    dbg64_dec((uint64_t)g_dock_w);
+                    dbg64_str(" items=");
+                    dbg64_dec((uint64_t)g_dock_n);
+                    dbg64_nl();
+                    dbg64_line_end64();
+                    for (int i = 0; i < 7; i++) g_rseg_cyc[i] = 0;
+                    g_rseg_n = 0; g_rseg_max = 0; g_rseg_amax = 0;
+                }
             }
             g_perf_ev = 0; g_perf_rcyc = 0; g_perf_rn = 0; g_perf_full = 0;
             g_perf_mv_x = 0; g_perf_mv_y = 0;

@@ -1026,6 +1026,15 @@ static bool rasterize_glyph(FontFace* fc, uint32_t cp, uint8_t* bm, int* ox, int
     return true;
 }
 
+// ★ v0.8.0 排查计数器：光栅化次数 / 字形绘制次数
+static uint32_t g_font_raster64 = 0;
+static uint32_t g_font_draw64   = 0;
+void font64_perf_stats64(uint32_t* raster, uint32_t* draws, int reset) {
+    if (raster) *raster = g_font_raster64;
+    if (draws)  *draws  = g_font_draw64;
+    if (reset) { g_font_raster64 = 0; g_font_draw64 = 0; }
+}
+
 // ---------------- CJK LRU 缓存 ----------------
 // 返回槽索引（-1=失败），key 缓存命中时直接复用
 static int lru_get_slot(FontFace* fc, uint32_t cp) {
@@ -1044,6 +1053,7 @@ static int lru_get_slot(FontFace* fc, uint32_t cp) {
     }
     // 光栅化到 victim
     int ox, oy, w, h;
+    g_font_raster64++;
     if (!rasterize_glyph(fc, cp, fc->lru_bm[victim], &ox, &oy, &w, &h)) return -1;
     fc->lru_key[victim] = cp;
     fc->lruOX[victim] = ox; fc->lruOY[victim] = oy;
@@ -1268,6 +1278,18 @@ bool font_draw_glyph(int x, int y, char c, uint32_t fg) {
     return true;
 }
 
+// ★ v0.8.0 修：整格字形都在裁剪框外 -> 直接跳过（不查 LRU、不逐像素混合）。
+//   为什么：render() 每个图层都把自己整块内容重画一遍，只有裁剪框内的像素真正写进去；
+//   TCG 下每个汉字 ≈ 1.3ms，开始菜单一帧 219 个字形 ≈ 280ms（[UI] rseg sm=）。
+//   加了这条之后重绘开销才真正与脏区成正比。字形矩形用 em 保守估（绝不会把要画的字跳掉）。
+static inline bool font_glyph_culled64(int x, int y) {
+    int cx, cy, cw, ch;
+    fb_get_clip64(&cx, &cy, &cw, &ch);
+    const int xe = x + g_em_px;
+    const int ye = y + g_em_px * 2;
+    return (xe <= cx || x >= cx + cw || ye <= cy || y >= cy + ch);
+}
+
 // 缺字占位：四个面都没有这个码点时画一个 1px 空心方框（并计数 + 打点，见 font_draw_glyph_cp）
 static void font_draw_missing_box(int x, int y, uint32_t fg) {
     int w = g_em_px - 6, h = g_em_px - 4;
@@ -1283,6 +1305,8 @@ static void font_draw_missing_box(int x, int y, uint32_t fg) {
 
 // 按 Unicode 码点绘制（CJK 走 LRU 缓存；查询链：当前面 -> 中文面 -> 兜底面；都没有 = 缺字占位）
 bool font_draw_glyph_cp(int x, int y, uint32_t cp, uint32_t fg) {
+    g_font_draw64++;
+    if (font_glyph_culled64(x, y)) return true;      // ★ v0.8.0：裁剪框外不画（结果不变）
     if (cp < FONT_CACHE_N) return font_draw_glyph(x, y, (char)cp, fg);
     FontFace* fc = font_resolve_cp(cp);
     if (!fc) {

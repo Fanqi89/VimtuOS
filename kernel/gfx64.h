@@ -67,7 +67,11 @@ void gfx64_shadow64(int x, int y, int w, int h, int r, const Theme64Tokens* t);
 void gfx64_glass64(int x, int y, int w, int h, int r, int layer, uint32_t tint, int alpha,
                    uint32_t border_color, int border_alpha, const Theme64Tokens* t);
 const uint32_t* gfx64_wall_surface64(int* w, int* h);   // 铺好的整屏壁纸面（只读）
-const uint32_t* gfx64_wall_blur64(int* w, int* h);      // 墙纸模糊一次的结果（背景层玻璃的 backdrop）
+const uint32_t* gfx64_wall_blur64(int* w, int* h);
+
+// ★ v0.8.0 排查：毛玻璃区域缓存 / 阴影 mask 缓存的命中率（自上次 reset 起）。
+//   reset != 0 时读完就清零（每秒一次的分段打点用）。纯计数，不改任何绘制。
+void gfx64_perf_stats64(uint32_t* blur_hit, uint32_t* blur_miss, uint32_t* sh_hit, uint32_t* sh_miss, int reset);      // 墙纸模糊一次的结果（背景层玻璃的 backdrop）
 
 // 圆角裁切：把 (x,y,w,h,r) 的“圆角外”像素用 backdrop 采样覆盖回来（方形客户区做圆角窗口用）
 void gfx64_corner_cut64(int x, int y, int w, int h, int r, int layer);

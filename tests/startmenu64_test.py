@@ -182,6 +182,65 @@ class Cursor:
         self.goto(mon, self.x + px, self.y + py, wait)
 
 
+def _cur_and_count(log):
+    """最后一条 [UI] perf 里的 cur=X,Y（客户机自报的真实光标位置）+ perf 行数。"""
+    m = None
+    for mm in re.finditer(r"\[UI\] perf[^\n]*cur=(\d+),(\d+)", log):
+        m = mm
+    if m is None:
+        return None, log.count("[UI] perf")
+    return (int(m.group(1)), int(m.group(2))), log.count("[UI] perf")
+
+
+def goto_exact(mon, cur, log_fn, x, y, passes=2, tol=8):
+    """把光标送到 (x,y)，**确认到位**再返回（判据 = 客户机自报的 cur=X,Y）。
+
+    为什么要闭环：Cursor 只按相对位移跟踪，客户机裁边/丢包会累积偏移（本次实测偏 57px，
+    点击落到 Dock 的"我的电脑"而不是开始按钮）。
+    为什么要等**新的** perf 行：串口 -serial file: 有 1~3s 落盘延迟，拿旧样本反馈会越走越偏。
+    """
+    for _ in range(passes):
+        pos, n0 = _cur_and_count(log_fn())
+        if pos is not None:
+            cur.x, cur.y = pos
+            if abs(x - pos[0]) <= tol and abs(y - pos[1]) <= tol:
+                return True
+        cur.goto(mon, x, y)
+        cur.settle(mon)
+        t0 = time.time()
+        while time.time() - t0 < 5.0:            # 等客户机打出一条**新的** perf 行
+            if log_fn().count("[UI] perf") > n0:
+                break
+            time.sleep(0.25)
+    pos, _ = _cur_and_count(log_fn())
+    if pos is not None:
+        cur.x, cur.y = pos
+        return abs(x - pos[0]) <= tol + 6 and abs(y - pos[1]) <= tol + 6
+    return False
+
+
+def dock_start_center(log):
+    """开始按钮的**当前**中心（屏幕绝对坐标）。
+
+    Dock 是 v0.8.0 的运行时动态列表：开窗口 -> 多一个运行项 -> Dock 变宽并重新居中
+    （实测 geom x=294 w=691 items=12 时开始按钮 cx 从 412 挪到 326）。
+    所以这个坐标**不能**当常量缓存，每次点之前都要从最新打点重算。
+    打点来源：[DOCK64] item idx=0 … cx= cy=（没有就按 geom 的 x/y 用公式算：x+PAD(9)+23、y+30）。
+    """
+    m = None
+    for mm in re.finditer(r"\[DOCK64\] item idx=0 app=\d+ name=\S+ x=\d+ y=\d+ w=\d+ h=\d+ " 
+                         r"cx=(\d+) cy=(\d+)", log):
+        m = mm
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    g = None
+    for mm in re.finditer(r"\[DOCK64\] geom x=(\d+) y=(\d+) w=(\d+) h=(\d+)", log):
+        g = mm
+    if g:
+        return int(g.group(1)) + 32, int(g.group(2)) + 30
+    return 412, 754
+
+
 class Vm:
     def __init__(self, qemu, img, port, name="vimtu-start64", workdir=None):
         self.qemu, self.img, self.port = qemu, img, port
@@ -290,13 +349,16 @@ def main():
         time.sleep(0.6)
         mon.shot(os.path.join(tmp, "base.ppm"))
         cur = Cursor()
-        start_cx, start_cy = (int(it0.group(5)), int(it0.group(6))) if it0 else (412, 754)
+        # ★ 开始按钮坐标从最新打点读（Dock 会随运行项变宽并重新居中）
+        start_cx, start_cy = dock_start_center(vm.log())
 
         def ensure_menu_open():
             # 点开始按钮直到 [START64] open why=start-button 出现（丢点击时重试）
             for _ in range(3):
                 n0 = len(vm.log())
-                cur.goto(mon, start_cx, start_cy)
+                # ★ 每次重算：上一次尝试可能开了/关了窗口，Dock 宽度与居中位置都变了
+                scx, scy = dock_start_center(vm.log())
+                goto_exact(mon, cur, vm.log, scx, scy)
                 time.sleep(0.35)
                 mon.click()
                 if vm.wait_log("[START64] open why=start-button", 5, since=n0):
@@ -304,12 +366,12 @@ def main():
             return False
 
         if it0:
-            cur.goto(mon, int(it0.group(5)), int(it0.group(6)))
+            goto_exact(mon, cur, vm.log, int(it0.group(5)), int(it0.group(6)))
             time.sleep(0.4)
             mon.click()
             got_open = vm.wait_log("[START64] open why=start-button", 6, since=len(log))
             if not got_open:                      # 按键/点击偶发丢失：重试一次
-                cur.goto(mon, int(it0.group(5)), int(it0.group(6)))
+                goto_exact(mon, cur, vm.log, int(it0.group(5)), int(it0.group(6)))
                 time.sleep(0.4)
                 mon.click()
                 got_open = vm.wait_log("[START64] open why=start-button", 6, since=len(log))
@@ -540,7 +602,7 @@ def main():
         if sb:
             rx = gx + 16 + 60
             ry = int(sb.group(2)) + 34 + 12 + 12
-            cur.goto(mon, rx, ry)
+            goto_exact(mon, cur, vm.log, rx, ry)
             time.sleep(0.3)
             mon.click()
             check("点结果行启动（[START64] launch app=3 via=result + [APP] term opened）",
@@ -563,7 +625,7 @@ def main():
             #   原来"tiles[3] 就是计算器"的假设已不成立。改成**按 app id 找到终端那一格**再点：
             #   断言语义不变（点哪一格就起哪一格的应用），强度不降（还是要求 launch + 真开窗）。
             t = next((x for x in tiles if x[1] == "3"), tiles[3])
-            cur.goto(mon, int(t[4]) + int(t[6]) // 2, int(t[5]) + int(t[7]) // 2)
+            goto_exact(mon, cur, vm.log, int(t[4]) + int(t[6]) // 2, int(t[5]) + int(t[7]) // 2)
             time.sleep(0.3)
             mon.click()
             check("点 tile 启动应用（[START64] launch app=%s via=tile）" % t[1],
@@ -597,7 +659,7 @@ def main():
             opened = False
             for _ in range(3):
                 since_pm = len(vm.log())
-                cur.goto(mon, pxx + int(pwr.group(3)) // 2, pyy + int(pwr.group(3)) // 2)
+                goto_exact(mon, cur, vm.log, pxx + int(pwr.group(3)) // 2, pyy + int(pwr.group(3)) // 2)
                 time.sleep(0.3)
                 mon.click()
                 st = None
@@ -646,7 +708,7 @@ def main():
         ensure_menu_open()
         st = re.search(r"\[START64\] settings x=(\d+) y=(\d+)", vm.log())
         if pwr and st:
-            cur.goto(mon, int(st.group(1)) + 48, int(st.group(2)) + 17)
+            goto_exact(mon, cur, vm.log, int(st.group(1)) + 48, int(st.group(2)) + 17)
             time.sleep(0.3)
             mon.click()
             check("点设置先关开始菜单（close why=settings）+ 打点 settings open (menu closed first)",
@@ -661,7 +723,7 @@ def main():
         print("=== 11) 点菜单外部关闭 ===")
         before = len(vm.log())
         ensure_menu_open()
-        cur.goto(mon, 120, 200)                  # 桌面左上空白（远离菜单/弹窗）
+        goto_exact(mon, cur, vm.log, 120, 200)                  # 桌面左上空白（远离菜单/弹窗）
         time.sleep(0.3)
         mon.click()
         check("点菜单外部 -> close why=click-outside",

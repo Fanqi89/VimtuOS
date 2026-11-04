@@ -100,5 +100,8 @@ int font_prewarm_ascii();                  // 当前 face：ASCII 32..126
 int font_prewarm_ascii_all();              // 全部 4 个 face 的 ASCII
 int font_prewarm_text(const char* utf8);   // UTF-8 串里出现的所有字形（自动走查询链选 face）
 int font_cache_used();                     // 已缓存的字形总数（诊断/UI）
-int font_lru_capacity();                   // 每 face 的 CJK LRU 槽数（预加载自检用）
+int font_lru_capacity();
+// ★ v0.8.0 排查：字形光栅化次数 / 字形绘制次数（reset != 0 时读完清零）。
+//   用来判断"每帧都在重新光栅化 CJK 字形"（＝LRU 没命中，帧时间会爆）。纯计数。
+void font64_perf_stats64(uint32_t* raster, uint32_t* draws, int reset);                   // 每 face 的 CJK LRU 槽数（预加载自检用）
 int font_cache_capacity();                 // 缓存容量上限
