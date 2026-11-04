@@ -3502,7 +3502,7 @@ TESTS = [
     ("gpu64_test.py", "★ v0.9.4 通用 GPU 层（P1）：显示类 PCI class 0x03 枚举 + 厂商识别（intel/amd/nvidia/unknown）"
                       " + BAR 真实窗口（写全 1 回读法）+ mem-decode/bus-master 回读 + 三家只读身份探测 + [GPU] 报告；"
                       "四种图形后端（-vga std / virtio / qxl / 双 secondary-vga）各冷启动一次，未知厂商如实降级、"
-                      "桌面照常 ready（114 条断言）"),
+                      "桌面照常 ready（114 条断言）；另有一次性 VMware 取证脚本 gpu64_vmware_probe.py（9 条断言，不进门禁）"),
     ("wm64_test.py", "★ B-wm Ring 3 合成器：/bin/wm 注册（[WL64] composer get rect=… / composer pid=… seat=1）+ 注册后内核不再合成"
                      "（tail_composite=0）+ 两个客户端 surface 的像素与 alpha blend>0 + damage 局部性（面板内框外 0 px 差异）+ "
                      "z 序 + 用户态命中测试后 [WL64] seatpost surf=4 pid=29 + 资源回收 refs=0/freed_pages=15|8 + "
