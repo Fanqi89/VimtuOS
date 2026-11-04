@@ -17,6 +17,7 @@
 #include "fb.h"
 // ★ 驱动线 3：virtio-gpu 2D 驱动（显示后端；两份内核都链 —— 安装程序的向导画面也走同一条上屏路径）
 #include "virtio_gpu64.h"
+#include "gpu64.h"          // ★ v0.9.4：通用 GPU 层（P1）—— 枚举/厂商识别/BAR/命令寄存器/只读探测
 #include "font.h"
 #include "input.h"
 // ---- 硬件清单 / ACPI 平台表 / VimtuFS2 文件系统：两份内核都链接（只读探测 + 内存假盘自检）----
@@ -1597,6 +1598,10 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     //   （软件路径截图 / 设 scanout + 同一图案走设备 / 只改请求区域）各保持 2.5s 供验收抓帧，
     //   （软件路径截图 / 设 scanout + 同一图案走设备 / 只改请求区域）各保持 2.5s 供验收抓帧，
     //   随后 bench 打设备 vs 软件的 rdtsc 中位数（见 [VGPU] bench 行）。
+    // ★ v0.9.4（通用 GPU 层 P1）：在 fb_init 之后、vgpu64_init64 之前枚举显示类设备。
+    //   位置讲究：本层探 BAR 窗口时会临时改设备的地址译码（几微秒），此时桌面还没画、
+    //   引导控制台也还在早期 —— 风险最小。它只读身份寄存器 + 打 [GPU] 报告，不接管 scanout。
+    gpu64_init64();
     vgpu64_init64();
     // ★ v0.9.2：默认**静默**接管显示（只设 scanout，一个测试像素都不画）。
     //   三段图案自检（一整屏 LCG 彩色图案 + 三段各保持 2.5~3s）和 bench（连翻整屏）改成

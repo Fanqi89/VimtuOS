@@ -3499,6 +3499,10 @@ TESTS = [
                      "最小合成器（未提交不上屏 / 多 surface z 序 / damage 局部提交 / 退出兜底回收）（91 条断言）"),
     ("virtiogpu64_test.py", "★ 驱动线 3 virtio-gpu 2D：PCI/capability/VERSION_1/2D 命令集/响应 0x1101 + 设备与软件路径"
                             "逐像素等价 + TRANSFER_FROM_HOST 逐字节 + 基准 + `-vga std` 如实降级（36 条断言）"),
+    ("gpu64_test.py", "★ v0.9.4 通用 GPU 层（P1）：显示类 PCI class 0x03 枚举 + 厂商识别（intel/amd/nvidia/unknown）"
+                      " + BAR 真实窗口（写全 1 回读法）+ mem-decode/bus-master 回读 + 三家只读身份探测 + [GPU] 报告；"
+                      "四种图形后端（-vga std / virtio / qxl / 双 secondary-vga）各冷启动一次，未知厂商如实降级、"
+                      "桌面照常 ready（114 条断言）"),
     ("wm64_test.py", "★ B-wm Ring 3 合成器：/bin/wm 注册（[WL64] composer get rect=… / composer pid=… seat=1）+ 注册后内核不再合成"
                      "（tail_composite=0）+ 两个客户端 surface 的像素与 alpha blend>0 + damage 局部性（面板内框外 0 px 差异）+ "
                      "z 序 + 用户态命中测试后 [WL64] seatpost surf=4 pid=29 + 资源回收 refs=0/freed_pages=15|8 + "
