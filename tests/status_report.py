@@ -1609,13 +1609,13 @@ def cap_fileops_ui():
 # -------------------------------------------------------------------------------- ★ 批次 N
 def cap_boot_console():
     """★ 开机滚屏引导控制台（boot console + dmesg）：dbg64 唯一出口镜像 -> 16 KiB 环形缓冲
-    -> fb/font 就绪后回放（黑底 + 等宽面 + 时间戳 + FAIL/WARN 着色 + 滚屏）-> 有界停留/按键跳过
+    -> fb/font 就绪后回放（黑底 + 等宽面 + 时间戳 + FAIL/WARN 着色 + 滚屏）-> 有界回放；v0.9.1 起**不可跳过**（按键被吞掉，回放必须走完）
     -> 终端 `dmesg` 回看 + `boot verbose on|off` 持久化开关。"""
     if not (exists("kernel/console64.cpp") and exists("kernel/console64.h")):
         return "MISSING", ["kernel/console64.cpp/.h 不存在（没有引导控制台）"]
     sink = grep_count(r"dbg64_set_sink64|g_dbg64_sink64", ["kernel/debug64.h", "kernel/console64.cpp"])
     ring = grep_count(r"CON64_RING_BYTES|CON64_TEXT_MAX|CON64_HEAD_LINES", ["kernel/console64.h"])
-    marks = grep_count(r"\[CON64\] (ring init|screen ready|replay|live|skip key|selftest|dmesg|boot verbose|verbose=0)",
+    marks = grep_count(r"\[CON64\] (ring init|screen ready|replay|live|skip disabled|selftest|dmesg|boot verbose|verbose=0)",
                        ["kernel/console64.cpp", "kernel/terminal64.cpp"])
     call = grep_count(r"con64_boot_screen64|con64_init64|con64_rehook64",
                       ["kernel/kernel64.cpp", "kernel/console64.cpp"])
@@ -1625,12 +1625,12 @@ def cap_boot_console():
     shot = exists("docs/screenshots/bootlog64.png")
     ev = ["唯一出口镜像：dbg64_putc -> sink 钩子（既有打点零改动）：命中 %d" % sink,
           "16 KiB 环形缓冲（含行内上限/头部保留行常量）：命中 %d" % ring,
-          "[CON64] 打点（ring init / screen ready / replay / live / skip key / selftest / dmesg / boot verbose）：命中 %d" % marks,
+          "[CON64] 打点（ring init / screen ready / replay / live / skip disabled / selftest / dmesg / boot verbose）：命中 %d" % marks,
           "调用点（kmain64 最早 init + BSS 清零后重挂 + 向导/桌面之前 boot_screen）：命中 %d" % call,
           "boot.verbose（config64 默认表 + 启动读 + 终端 `boot verbose on|off` 持久化）：命中 %d" % cfg,
-          "屏幕绘制原语（等宽面 + 字形绘制 + 任意键跳过 + 脏区提交）：命中 %d" % keys,
+          "屏幕绘制原语（等宽面 + 字形绘制 + 按键吞掉即**不可跳过** + 脏区提交）：命中 %d" % keys,
           "端到端脚本 tests/bootlog64_test.py：%s（30 条断言：串口打点 / 黑底像素 / 行间距 / vram 直读滚动证据 / "
-          "按键跳过 / dmesg 早期行 / 冷启动 verbose=0 不回放）" % ("存在" if test else "缺失"),
+          "不可跳过（连按回车也走完整段）/ dmesg 早期行 / 冷启动 verbose=0 不回放）" % ("存在" if test else "缺失"),
           "截图 docs/screenshots/bootlog64.png：%s" % ("有" if shot else "缺")]
     done = sink and ring and marks and call and cfg and keys and test and shot
     return ("DONE" if done else "PARTIAL"), ev

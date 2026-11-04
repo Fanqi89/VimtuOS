@@ -874,13 +874,22 @@ static void fade_in_lock64(int ms) {
     for (uint64_t i = 0; i < npx; i++) px[i] = 0xFF000000u;
     fb_flip();                                // 冷场（全黑）
     const uint32_t t0 = ticks64();
-    const int steps = 16;                     // 正好对应 4x4 Bayer 的 16 级
+    // ★ v0.9.2：16 步 -> 8 步。用户要求的降级方案是"全屏叠加黑色遮罩、每次按 ~10% 透明度步进"；
+    //   这里用等价的低开销实现：4x4 Bayer 有序抖动，每一步把**再 12.5% 的像素**从黑场揭示出来
+    //   （step 覆盖率 12.5% -> 25% -> ... -> 100%）。每个像素全程只写一次，总写入量 = 1 屏；
+    //   步数减半 = 提交次数减半（每步一次 fb_flip，全屏提交是本函数最贵的部分）。
+    const int steps = 8;                      // 12.5%/步（≈ 用户要求的 10% 步进）
     for (int k = 1; k <= steps; k++) {
         panic64_watchdog_kick64();
+        const int thr0 = (k - 1) * 16 / steps;    // 这一步新揭示的 Bayer 等级区间 [thr0, thr1)
+        const int thr1 = k * 16 / steps;
         int rowmask[4];
         for (int r = 0; r < 4; r++) {
             int m = 0;
-            for (int j = 0; j < 4; j++) if (kBootBayer4[r * 4 + j] == (k - 1)) m |= (1 << j);
+            for (int j = 0; j < 4; j++) {
+                const int lv = kBootBayer4[r * 4 + j];
+                if (lv >= thr0 && lv < thr1) m |= (1 << j);
+            }
             rowmask[r] = m;
         }
         for (int y = 0; y < h; y++) {
@@ -914,7 +923,9 @@ static void fade_in_lock64(int ms) {
         dbg64_dec((uint64_t)ms);
         dbg64_str(" ms=");
         dbg64_dec((uint64_t)dt);
-        dbg64_str(" pattern=bayer-4x4 (lock screen revealed from black after the boot animation)");
+        dbg64_str(" pattern=bayer-4x4 pct=");
+        dbg64_dec((uint64_t)(100 / steps));
+        dbg64_str(" (lock screen revealed from black after the boot animation)");
         dbg64_nl();
         dbg64_line_end64();
     }
@@ -1470,7 +1481,7 @@ void locklogin64_run64() {
     g_hold_flip = 1;
     paint_full64();                  // 画进后备缓冲（清晰背景 + 大号时间），此刻不提交
     g_hold_flip = 0;
-    fade_in_lock64(480);
+    fade_in_lock64(500);        // ★ v0.9.2：8 步 x ~62ms（比 16 步省一半全屏提交）
     // 20px 背景模糊**算一次**缓存起来（QEMU TCG 下要几百 ms）——放在首帧之后，
     // 锁屏先可见；登录时（清晰->模糊）直接用缓存，动画才跑得动。
     ensure_blur64();

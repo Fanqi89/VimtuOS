@@ -609,6 +609,30 @@ static bool vgpu_set_scanout_internal() {
     return vgpu_set_scanout_res(g_i.res_id);
 }
 
+// ★ v0.9.2：静默接管显示（用户要求：进锁屏之前屏上绝对不允许出现任何彩色测试图案）。
+//   只做一件事：把 resource 设到 scanout 0 上 —— 一个像素都不画。
+//   为什么需要它：老流程靠 vgpu64_selftest64() 顺手把 scanout 打开，而那个自检要先画一整屏
+//     LCG 图案 + 三段各保持 2.5~3s（给验收脚本 screendump 用）—— 那正是用户看到的"彩色测试图"。
+//   边界（如实）：这条路上"设备 blit 的像素正确性"没有逐点回读证明。证明改为
+//     （a）每一帧都真的走设备：[UI] rseg 的 flip= 计数；（b）opt-in 的三段自检仍可随时复核像素。
+static bool vgpu_geom_ok();      // 前向声明（下面 vgpu64_enable_quiet64 用它）
+
+int vgpu64_enable_quiet64() {
+    if (!g_i.ready) return 0;
+    if (!vgpu_geom_ok()) return 0;
+    if (!vgpu_set_scanout_internal()) return 0;
+    vgpu_log_begin();
+    vgpu_puts("[VGPU] scanout quiet w=");
+    vgpu_num(g_res_w);
+    vgpu_puts(" h=");
+    vgpu_num(g_res_h);
+    vgpu_puts(" draw=0 res=");
+    vgpu_num(g_i.res_id);
+    vgpu_puts(" (device scanout without painting any test pattern)");
+    vgpu_log_end();
+    return 1;
+}
+
 // ==================== 几何 ====================
 // 设备路径成立的几何条件：zoom=100 且 resource 宽高 == 后备缓冲 stride（= fb_width()）
 //   且 == 物理分辨率。任一条不满足 -> 设备路径不能用（否则像素会错位）。

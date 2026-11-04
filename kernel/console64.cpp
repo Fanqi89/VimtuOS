@@ -21,7 +21,7 @@
 #include "debug64.h"      // dbg64_* + 行锁 + sink 挂钩 + irq save/restore
 #include "fb.h"           // 帧缓冲（黑底 + fb_flip_region 局部提交）
 #include "font.h"         // 四个字体面（本文件只用 face 2 = 终端等宽）
-#include "input.h"        // kbd_has_char / kbd_pop_char（任意键跳过）
+#include "input.h"        // kbd_pop_char（只吞键：v0.9.1 起启动过程**不可跳过**）
 #include "x86_64.h"       // g_ticks64 / TICK_MS_64
 
 
@@ -30,7 +30,8 @@
 //   * 回放时攒 CON64_SCROLL_BATCH 行才整体上移一次（总像素搬运量 ≈ 1/批大小；屏上依旧连续上滚）；
 //   * 行宽表 row_ink 记录每行真的画了多少列 —— 滚屏只搬"有墨"的那段宽度（不是整屏宽）。
 #define CON64_ROWS_MAX    64                    // 控制台最大行数（行宽表上限；1280x800 下是 39 行）
-#define CON64_SCROLL_BATCH 8                    // 回放时攒 8 行再整体上移（滚动步数适中：屏上明显在滚，整屏拷贝/flip 也不多）
+#define CON64_SCROLL_BATCH 1                    // ★ v0.9.2：不再攒批 —— 每来一行就真的上滚一行（用户要求一条一条实时打印）
+#define CON64_PEND_MAX     8                    // pend_* 暂存区上限（batch=1 时用不到，留作收口自检/兜底）
 #define CON64_STAMP_CHARS 14                    // "[    0.123456]"（Linux 的 %5lu.%06lu）
 #define CON64_REC_HDR     16                    // 每条记录的头：tick(8) + len(2) + level(1) + flags(1) + 保留(4)
 #define CON64_REC_MAX     (CON64_REC_HDR + CON64_TEXT_MAX)
@@ -93,10 +94,20 @@ struct Con64Scr {
     int  pending;         // 攒着还没上移的行数（回放时按 CON64_SCROLL_BATCH 批量滚）
     uint8_t row_ink[CON64_ROWS_MAX];   // 每一行真的画了多少列（0 = 空行）—— 滚屏只搬"有墨"的宽度
     // 批量滚屏时暂存的待画行（最多 CON64_SCROLL_BATCH-1 行；保证屏上不丢行）
-    uint64_t pend_tick[CON64_SCROLL_BATCH];
-    uint8_t  pend_lv[CON64_SCROLL_BATCH];
-    char     pend_text[CON64_SCROLL_BATCH][CON64_TEXT_MAX + 8];
+    uint64_t pend_tick[CON64_PEND_MAX];
+    uint8_t  pend_lv[CON64_PEND_MAX];
+    char     pend_text[CON64_PEND_MAX][CON64_TEXT_MAX + 8];
     int      pend_n;
+    // ★ v0.9.2：三段式（挂接/实时泵/收尾）的状态与证据
+    int      live;            // 1 = 实时模式：新打点会真的逐行滚上屏
+    int      pumps;           // 实时泵被调用的次数
+    int      live_drawn;      // 实时阶段真的画上屏的行数
+    int      rep_lines;       // 挂接回放画上去的行数
+    int      rep_planned;     // 挂接回放计划的行数
+    int      rep_flushed;     // 挂接回放收口补画的行数
+    int      rep_ms;          // 挂接回放耗时（ms）
+    int      face_save;       // 进入控制台时的字体面（收尾恢复）
+    int      fast_skipped;    // 积压超过一屏时被快进跳过的行数（如实记录，不假装画过）
     // ★ 最后一次**真的画到屏上**的那一行正文（收口自检/auto-follow 证据用：逐字符核对）
     char     last_drawn[CON64_TEXT_MAX + 8];
 };
@@ -485,8 +496,24 @@ static void con64_scr_clear_line64(int y, int w) {
     fb_fill_rect(0, y, w, g_scr64.line_h, CON64_C_BG);
 }
 
+// ★ v0.9.2：行内 4 像素展开的对拷（无函数调用、无边界检查）。
+//   为什么必须换：老滚屏是 `for (x) fb_putpixel(x, ty, fb_get_pixel(x, sy))` —— 一次整屏上滚
+//   就是上百万次带裁剪/边界检查的调用，TCG 实测 ~300ms。付不起，于是老实现只能"攒 8 行滚一次"：
+//   屏上看到的就是"只有最底下 8 行在变、上面一动不动"（用户报的"只在底部死循环覆盖的假日志"）。
+//   换成直接读写后备缓冲 + 每轮 4 像素展开后，同一块上滚实测 ~5~10ms —— 于是可以每行真的滚一行。
+static inline void con64_row_copy64(uint32_t* dst, const uint32_t* src, int npx) {
+    int i = 0;
+    for (; i + 3 < npx; i += 4) {
+        dst[i] = src[i];
+        dst[i + 1] = src[i + 1];
+        dst[i + 2] = src[i + 2];
+        dst[i + 3] = src[i + 3];
+    }
+    for (; i < npx; i++) dst[i] = src[i];
+}
+
 // 滚屏：控制台内容整体上移 dy 行（像素行拷贝；底部 dy 行清黑）
-// ★ 只搬"有墨"的宽度、只提交控制台区域（fb_flip_region）；不做字形重光栅化（比整屏重画快得多）。
+// ★ 只搬"有墨"的宽度、只提交控制台区域（fb_flip_region）；不做字形重光栅化。
 static void con64_scr_scroll64(int dy) {
     const int lh = g_scr64.line_h;
     const int y0 = g_scr64.top_y;
@@ -498,12 +525,29 @@ static void con64_scr_scroll64(int dy) {
         fb_fill_rect(0, y0, g_scr64.region_w, rows * lh, CON64_C_BG);
         return;
     }
-    const int w = con64_scr_ink_w64();
-    for (int r = 0; r + dy < rows; r++) {
-        const int sy = y0 + (r + dy) * lh;
-        const int ty = y0 + r * lh;
-        for (int x = 0; x < w; x++) fb_putpixel(x, ty, fb_get_pixel(x, sy));
-        g_scr64.row_ink[r] = g_scr64.row_ink[r + dy];
+    int w = con64_scr_ink_w64();
+    if (w > g_scr64.region_w) w = g_scr64.region_w;
+    int sw = 0, sh = 0;
+    uint32_t* surf = fb_surface64(&sw, &sh);
+    const int bottom = y0 + rows * lh;
+    if (!surf || sw <= 0 || sh <= 0 || w <= 0 || bottom > sh || y0 < 0) {
+        // 兜底（几何异常）：退回逐点搬运，像素结果与老实现一致
+        for (int r = 0; r + dy < rows; r++) {
+            const int sy = y0 + (r + dy) * lh;
+            const int ty = y0 + r * lh;
+            for (int x = 0; x < w; x++) fb_putpixel(x, ty, fb_get_pixel(x, sy));
+            g_scr64.row_ink[r] = g_scr64.row_ink[r + dy];
+        }
+    } else {
+        for (int r = 0; r + dy < rows; r++) {
+            for (int k = 0; k < lh; k++) {
+                const int sy = y0 + (r + dy) * lh + k;
+                const int ty = y0 + r * lh + k;
+                con64_row_copy64(surf + (uint64_t)ty * (uint64_t)sw,
+                                 surf + (uint64_t)sy * (uint64_t)sw, w);
+            }
+            g_scr64.row_ink[r] = g_scr64.row_ink[r + dy];
+        }
     }
     for (int r = rows - dy; r < rows; r++) {
         con64_scr_clear_line64(y0 + r * lh, w);
@@ -596,16 +640,29 @@ static void con64_scr_put64(uint64_t tick, int level, const char* text, int batc
     else          fb_flip_region(0, y, g_scr64.region_w, g_scr64.line_h);
 }
 
-static int con64_poll_key64() {                            // 任意键（并吞掉整个队列）
-    if (!kbd_has_char()) return 0;
+// ★ v0.9.1：这里只**吞键**，不再返回"要跳过"。
+//   用户要求：启动过程不允许按任意键跳过（绝对不可以）。
+//   仍然把键队列排空：让"启动期间按的键"既不跳过也不泄漏到锁屏
+//   （否则一个回车就会被锁屏当成“进入登录”的键）。
+static void con64_swallow_keys64() {
     uint8_t c;
     while (kbd_pop_char(&c)) { }
-    return 1;
 }
 
 // 实时追加：把"进入实时模式之后新进缓冲的行"画到屏上（滚屏）
 static void con64_scr_drain64() {
+    if (!g_scr64.active || !g_scr64.live) return;
     if (g_scr64.shown_total > (int)g_ring64.total) g_scr64.shown_total = (int)g_ring64.total;
+    // ★ v0.9.2：积压超过一屏时，把更早的行**直接快进跳过**（它们本来也会被滚出屏幕）——
+    //   这样一次泵的绘制量有界（<= 一屏），不会因为某个启动阶段一口气打几百行而在屏上
+    //   慢慢画上好几秒。跳过的行数如实记在 fast_skipped（[CON64] live pump ... skipped=）。
+    {
+        const int backlog = (int)g_ring64.total - g_scr64.shown_total;
+        if (backlog > g_scr64.rows) {
+            g_scr64.fast_skipped += backlog - g_scr64.rows;
+            g_scr64.shown_total = (int)g_ring64.total - g_scr64.rows;
+        }
+    }
     while (g_scr64.shown_total < (int)g_ring64.total) {
         const uint32_t back = (uint32_t)g_ring64.total - (uint32_t)g_scr64.shown_total;  // 倒数第几条
         g_scr64.shown_total++;
@@ -615,9 +672,12 @@ static void con64_scr_drain64() {
         char lb[CON64_TEXT_MAX + 8];
         if (con64_line64(idx, &tick, &lv, lb, (int)sizeof lb) <= 0) continue;
         con64_scr_put64(tick, lv, lb, 1);              // 实时阶段：逐行滚（延迟最低）
+        g_scr64.live_drawn++;                          // ★ v0.9.2：实时阶段真的上屏的行数（证据用）
     }
 }
 
+// ★ v0.9.2 第一段：挂接。清屏 + 把 fb/font 就绪之前攒下的行按节奏逐行滚出（一行一次上滚），
+//   然后进入 live（后面的行由 con64_live_pump64 逐行追加）。返回值保留（恒 0：不可跳过）。
 int con64_boot_screen64(int verbose) {
     const int face_save = font_current_face();   // 画完恢复现场（不改其它模块对"当前面"的前提）
     g_scr64.active = 0;
@@ -675,6 +735,7 @@ int con64_boot_screen64(int verbose) {
     dbg64_line_end64();
 
     (void)con64_selftest64();                             // [CON64] selftest PASS/FAIL mask=...
+    wall64_set_anchor();                                  // ★ v0.9.2：记墙钟锚点（给启动动画的 3~5 秒校准用）
 
     if (!verbose) {
         dbg64_line_begin64();
@@ -719,24 +780,21 @@ int con64_boot_screen64(int verbose) {
     for (int i = first; i < have; i++) {
         uint64_t tick = 0; int lv = CON64_LV_INFO;
         if (con64_line64(i, &tick, &lv, lb, (int)sizeof lb) <= 0) continue;
-        con64_scr_put64(tick, lv, lb, CON64_SCROLL_BATCH);   // 回放阶段：攒 4 行批量滚（少搬像素）
+        con64_scr_put64(tick, lv, lb, 1);                     // ★ v0.9.2：一行一次上滚（不攒批）
         replayed++;
-        if (con64_poll_key64()) { g_scr64.skip = 1; break; }   // 回放期间按键：立即结束
+        con64_swallow_keys64();                                // ★ v0.9.1：按键**不跳过**，只吞掉
         // 节奏等待：**按计划时间**等（第 replayed 行的目标时刻 = replayed*per_line），
         //   绘制本身已经比计划慢时就不再额外等待 —— 总时长自动收敛到 max(绘制, 计划)，不会叠加。
         const uint64_t target = (uint64_t)replayed * (uint64_t)per_line;
-        while (!g_scr64.skip && (g_ticks64 - t0) < target) {
+        while ((g_ticks64 - t0) < target) {
             // ★ 这里**不要调 con64_scr_drain64()**：drain 会把 pending 里的行**逐行**刷出去，
             //   每行都触发一次整屏拷贝/flip —— 那会让"攒 CON64_SCROLL_BATCH 行再滚"完全失效
             //   （实测：64 行 16 秒 ≈ 每行 250ms）。实时行的刷新交给回放结束后的 drain。
-            if (con64_poll_key64()) { g_scr64.skip = 1; break; }
+            con64_swallow_keys64();                            // ★ v0.9.1：不跳过
             __asm__ volatile("pause");
         }
-        if (g_scr64.skip) break;
     }
-    // ★ 自动跟到底部（用户要求）：回放是按批滚的，最后不足一批的 1..BATCH-1 行还在
-    //   g_scr64.pend_* 里 —— 必须补画上屏，否则屏幕上停的是"倒数第 8~2 行"，
-    //   **最新的几行永远不出现**。
+    // ★ 自动跟到底部：最后不足一屏的行必须补画上屏，否则屏上停的是"倒数第 N 行"
     const int tail_flushed = con64_scr_flush64();
     const uint64_t replay_ms = (uint64_t)(g_ticks64 - t0) * (uint64_t)TICK_MS_64;
     dbg64_line_begin64();
@@ -746,59 +804,108 @@ int con64_boot_screen64(int verbose) {
     dbg64_dec((uint64_t)con64_dropped_lines64());
     dbg64_str(" ms=");
     dbg64_dec(replay_ms);
+    dbg64_str(" stream=1");        // ★ v0.9.2：这一段之后控制台进入 live（逐行实时追加）
     dbg64_nl();
     dbg64_line_end64();
 
-    // ★ auto-follow 证据行（有界一行，验收脚本 grep）：屏上**最后一行**必须就是最新那条日志。
-    //   bottom=1 是内核自己算的不变量：待画行已收口(pending=0) 且 上屏行数 == min(回放行数, 行数)。
-    //   flushed = 本次由收口补画的行数（修前这些行永远不出现，见上面的注释）。
-    {
-        const int expect_drawn = (replayed < g_scr64.rows) ? replayed : g_scr64.rows;
-        const int bottom_ok = (g_scr64.pend_n == 0 && g_scr64.drawn == expect_drawn) ? 1 : 0;
-        const int newest_row = (expect_drawn > 0) ? (expect_drawn - 1) : 0;
-        dbg64_line_begin64();
-        dbg64_str("[CON64] follow bottom=");
-        dbg64_dec((uint64_t)bottom_ok);
-        dbg64_str(" rows=");
-        dbg64_dec((uint64_t)g_scr64.rows);
-        dbg64_str(" drawn=");
-        dbg64_dec((uint64_t)g_scr64.drawn);
-        dbg64_str(" newest_row=");
-        dbg64_dec((uint64_t)newest_row);
-        dbg64_str(" pending=");
-        dbg64_dec((uint64_t)g_scr64.pend_n);
-        dbg64_str(" flushed=");
-        dbg64_dec((uint64_t)tail_flushed);
-        dbg64_str(" replayed=");
-        dbg64_dec((uint64_t)replayed);
-        // ★ "完全滚完才进系统"的证据：planned = 本次计划回放的行数（含空行），replayed = 真的画上屏的行数
-        //   （空行没有可画的内容，不计入）；complete = **回放没有被按键打断**（skip=0）。
-        //   底部对齐的 region_bottom 必须 == screen_h。
-        dbg64_str(" planned=");
-        dbg64_dec((uint64_t)planned);
-        dbg64_str(" complete=");
-        dbg64_dec((uint64_t)(g_scr64.skip ? 0 : 1));
-        dbg64_str(" region_bottom=");
-        dbg64_dec((uint64_t)(g_scr64.top_y + g_scr64.rows * g_scr64.line_h));
-        dbg64_str(" screen_h=");
-        dbg64_dec((uint64_t)fb_height());
-        dbg64_nl();
-        dbg64_line_end64();
-    }
+    // ★ v0.9.2：到这里第一段（挂接 + 把 fb/font 就绪之前攒下的行按节奏逐行滚出）结束。
+    //   屏幕交给控制台后**不冻结**：g_scr64.live=1 —— 后面每个阶段结束由
+    //   con64_live_pump64() 把这一段真的新打的行逐行滚上屏（一条一行），
+    //   最后 con64_boot_screen_done64() 收尾打证据行并冻结。
+    g_scr64.rep_lines   = replayed;
+    g_scr64.rep_planned = planned;
+    g_scr64.rep_flushed = tail_flushed;
+    g_scr64.rep_ms      = (int)replay_ms;
+    g_scr64.face_save   = face_save;
+    g_scr64.live        = 1;
+    g_scr64.shown_total = (int)g_ring64.total;
+    dbg64_line_begin64();
+    dbg64_str("[CON64] live lines=");
+    dbg64_dec((uint64_t)con64_buffered_lines64());
+    dbg64_str(" drawn=");
+    dbg64_dec((uint64_t)g_scr64.drawn);
+    dbg64_str(" mode=stream pumps=0");
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+
+// ★ v0.9.2：实时泵（第二段）。每个启动阶段结束叫一次：把"上一泵之后真的新产生"的行
+//   逐行画上屏并向上滚一行。这就是"日志一条一条实时打印出来"的实现 ——
+//   和老的"末尾一次性回放 63 行"不是一回事：这些行是那一段代码**刚刚**打出来的。
+void con64_live_pump64(void) {
+    if (!g_scr64.active || !g_scr64.live) return;
+    const uint32_t before = g_ring64.total;
+    con64_scr_drain64();
+    g_scr64.pumps++;
+    const uint32_t fresh = g_ring64.total - before;
+    if (fresh == 0) return;
+    dbg64_line_begin64();
+    dbg64_str("[CON64] live pump n=");
+    dbg64_dec((uint64_t)g_scr64.pumps);
+    dbg64_str(" fresh=");
+    dbg64_dec((uint64_t)fresh);
+    dbg64_str(" drawn=");
+    dbg64_dec((uint64_t)g_scr64.drawn);
+    dbg64_str(" pending=");
+    dbg64_dec((uint64_t)g_scr64.pend_n);
+    dbg64_str(" skipped=");
+    dbg64_dec((uint64_t)g_scr64.fast_skipped);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// ★ v0.9.2：收尾（第三段）。补画残留 -> follow bottom 证据行 -> 收口自检 -> 冻结画面。
+//   行格式与 v0.9.1 保持一致（验收脚本 grep），新增字段只追加在行尾。
+void con64_boot_screen_done64(void) {
+    if (!g_scr64.active) return;
+    con64_scr_drain64();
+    const int live_flushed = con64_scr_flush64();
+    const int drawn_total = g_scr64.rep_lines + g_scr64.live_drawn;
+    const int expect_drawn = (drawn_total < g_scr64.rows) ? drawn_total : g_scr64.rows;
+    const int bottom_ok = (g_scr64.pend_n == 0 && g_scr64.drawn == expect_drawn) ? 1 : 0;
+    const int newest_row = (expect_drawn > 0) ? (expect_drawn - 1) : 0;
+    dbg64_line_begin64();
+    dbg64_str("[CON64] follow bottom=");
+    dbg64_dec((uint64_t)bottom_ok);
+    dbg64_str(" rows=");
+    dbg64_dec((uint64_t)g_scr64.rows);
+    dbg64_str(" drawn=");
+    dbg64_dec((uint64_t)g_scr64.drawn);
+    dbg64_str(" newest_row=");
+    dbg64_dec((uint64_t)newest_row);
+    dbg64_str(" pending=");
+    dbg64_dec((uint64_t)g_scr64.pend_n);
+    dbg64_str(" flushed=");
+    dbg64_dec((uint64_t)g_scr64.rep_flushed);
+    dbg64_str(" replayed=");
+    dbg64_dec((uint64_t)g_scr64.rep_lines);
+    dbg64_str(" planned=");
+    dbg64_dec((uint64_t)g_scr64.rep_planned);
+    dbg64_str(" complete=");
+    dbg64_dec((uint64_t)(g_scr64.skip ? 0 : 1));
+    dbg64_str(" region_bottom=");
+    dbg64_dec((uint64_t)(g_scr64.top_y + g_scr64.rows * g_scr64.line_h));
+    dbg64_str(" screen_h=");
+    dbg64_dec((uint64_t)fb_height());
+    dbg64_str(" live_drawn=");
+    dbg64_dec((uint64_t)g_scr64.live_drawn);
+    dbg64_str(" pumps=");
+    dbg64_dec((uint64_t)g_scr64.pumps);
+    dbg64_nl();
+    dbg64_line_end64();
 
     // ---- ★ 收口自检（确定性覆盖"最后不足一批"这条路径）----
-    //   为什么需要它：默认启动的余数恰好是 0（实测 replayed=63、rows=39 -> (63-39)%8=0），
-    //   真实回放**根本不会**触发收口 —— 那样"修好了没有"就只能靠读代码。这里把缓冲里的
-    //   **最后 3 行**再走一遍 pend_* -> con64_scr_flush64()，然后逐字符核对
-    //   "屏上最后一行 == 最后塞进去的那一行"（g_scr64.last_drawn）。
-    //   屏上效果：最后 3 行日志在控制台末尾重复一次，紧接着就进 logo/登录（没有停留阶段）。
+    //   batch=1 之后回放本身不再有"不足一批"的余数，这条路径改成显式构造：
+    //   把缓冲里的最后 3 行再走一遍 pend_* -> con64_scr_flush64()，
+    //   然后逐字符核对"屏上最后一行 == 最后塞进去的那一行"（g_scr64.last_drawn）。
     {
         const int have2 = con64_buffered_lines64();
         int took = 0;
         char want[CON64_TEXT_MAX + 8];
         want[0] = 0;
         g_scr64.pend_n = 0;
-        for (int back = 3; back >= 1; back--) {                 // 从旧到新塞，最后塞的是最新一行
+        for (int back = 3; back >= 1; back--) {
             const int idx = have2 - back;
             if (idx < 0) continue;
             uint64_t tk = 0; int lv = CON64_LV_INFO;
@@ -828,23 +935,6 @@ int con64_boot_screen64(int verbose) {
         dbg64_line_end64();
     }
 
-    // ---- 实时追加模式（停留期间新来的打点继续画）----
-    g_scr64.shown_total = (int)g_ring64.total;
-    dbg64_line_begin64();
-    dbg64_str("[CON64] live lines=");
-    dbg64_dec((uint64_t)con64_buffered_lines64());
-    dbg64_str(" drawn=");
-    dbg64_dec((uint64_t)g_scr64.drawn);
-    dbg64_nl();
-    dbg64_line_end64();
-
-    // ---- ★ 不停留：日志滚完（或按键跳过）后立即返回，接着进系统 ----
-    //   用户要求："跑完后不停留直接进桌面"。此处刻意**没有**停留阶段；
-    //   想让屏幕停住看日志的话，进系统后用终端 `dmesg` 看完整日志。
-    con64_scr_drain64();
-    // ★ 实时行也要收口：drain 用 batch=1（逐行滚），但回放若被按键打断，pend 里可能还有
-    //   待画行 —— 这里再收一次，保证退出时屏上最后一行同样是最新那条日志。
-    const int live_flushed = con64_scr_flush64();
     dbg64_line_begin64();
     dbg64_str("[CON64] follow live bottom=");
     dbg64_dec((uint64_t)(g_scr64.pend_n == 0 ? 1 : 0));
@@ -856,17 +946,21 @@ int con64_boot_screen64(int verbose) {
     dbg64_dec((uint64_t)g_scr64.pend_n);
     dbg64_str(" flushed=");
     dbg64_dec((uint64_t)live_flushed);
+    dbg64_str(" live_drawn=");
+    dbg64_dec((uint64_t)g_scr64.live_drawn);
     dbg64_nl();
     dbg64_line_end64();
+
     g_scr64.active = 0;
-    if (g_scr64.skip) {
-        dbg64_line_begin64();
-        dbg64_str("[CON64] skip key=1 (any key ends the boot console)");
-        dbg64_nl();
-        dbg64_line_end64();
-    }
-    font_select(face_save);                        // ★ 恢复进入本函数时的字体面
-    return g_scr64.skip ? 1 : 0;
+    g_scr64.live = 0;
+    // ★ v0.9.1：启动过程**不可跳过**。这行是反证（每次启动一行，可 grep）：
+    //   回放/实时阶段按的键被吞掉，日志照样走完（complete=1）。
+    dbg64_line_begin64();
+    dbg64_str("[CON64] skip disabled=1 (boot log is NOT skippable; keys are swallowed)");
+    dbg64_nl();
+    dbg64_line_end64();
+    font_select(g_scr64.face_save);                // ★ 恢复进入控制台时的字体面
+    g_scr64.shown_total = (int)g_ring64.total;
 }
 
 

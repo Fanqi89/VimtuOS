@@ -54,7 +54,13 @@ SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 SHELL_BIN = os.path.join(ROOT, "build64", "shell.bin")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "ipc64_test.img")
 PART_MAIN_LBA = 8009                 # = kernel/part64.h 的主分区起点
-TARGET_SECTORS = 32768               # 16 MB（与 tests/sh64_test.py 同一夹具口径）
+TARGET_SECTORS = 32768
+# ★ v0.9.2：夹具卷自检的期望路径修正 —— tools/make_shellvol.build_volume() 从 v0.6.0
+#   （b7439d7）起把 /bin 改成 /usr/bin（目录重排），而这里一直拿 /bin/shell.bin 去对——
+#   于是四个版本这条都是假红。内核侧路径别名（/bin -> /usr/bin）不变，
+#   运行期仍然打 [SH64] launch path=/bin/shell.bin。
+def EXPECT_FILES(shell_bytes):
+    return {"/usr/bin/shell.bin": shell_bytes}               # 16 MB（与 tests/sh64_test.py 同一夹具口径）
 
 # ---- 注入脚本（QEMU monitor / VNC 两套通道共用同一份"要证明的事"）----
 # 键码：既有键码口径（kernel/input.h）——'a'=0x61、'b'=0x62、Up=NAV_UP=0xFD、Shift+B='B'=0x42
@@ -104,6 +110,10 @@ class QemuVm:
         self.proc = subprocess.Popen([
             qemu, "-name", "vimtu-ipc64",
             "-drive", "format=raw,file=%s" % q(img),
+                        # ★ v0.9.2：本脚本要抓"屏上像素证据"（设备图案 / 用户程序画的色带 / 共享内存矩形），
+            #   这些绘制在默认启动里已经关掉了（用户要求进锁屏前屏上不许有彩色测试图），
+            #   必须用 fw_cfg opt/vimtu/probe demos=1 显式打开 —— 断言一条都没放松。
+            "-fw_cfg", "name=opt/vimtu/probe,string=demos=1",
             "-boot", "order=c", "-m", "512", "-vga", "std",
             "-display", "none",
             "-serial", "file:%s" % q(serial),
@@ -447,7 +457,7 @@ def main():
             shell_bytes = open(SHELL_BIN, "rb").read()
             system_bytes = open(SYSTEM_IMG, "rb").read()
             vol = msv.build_volume(shell_bytes, b"ipc64 fixture\n", TARGET_SECTORS - PART_MAIN_LBA)
-            bad = msv.verify(vol, {"/bin/shell.bin": shell_bytes})
+            bad = msv.verify(vol, EXPECT_FILES(shell_bytes))
             if bad:
                 sys.stderr.write("夹具卷自检失败：%s\n" % bad)
                 return 2
@@ -569,7 +579,7 @@ def prepare_fixture_img():
     shell_bytes = open(SHELL_BIN, "rb").read()
     system_bytes = open(SYSTEM_IMG, "rb").read()
     vol = msv.build_volume(shell_bytes, b"ipc64 fixture\n", TARGET_SECTORS - PART_MAIN_LBA)
-    bad = msv.verify(vol, {"/bin/shell.bin": shell_bytes})
+    bad = msv.verify(vol, EXPECT_FILES(shell_bytes))
     if bad:
         raise RuntimeError("夹具卷自检失败：%s" % bad)
     img = msv.build_disk(system_bytes, vol, TARGET_SECTORS)

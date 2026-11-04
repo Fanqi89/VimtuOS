@@ -88,7 +88,16 @@ void con64_dmesg_dump_serial64(int first_n, int last_n);
 //   5) 有界停留 CON64_STAY_MS（任意键立即结束）。
 // verbose=0：不画屏，只打 [CON64] verbose=0 skipped（缓冲/dmesg 照常工作）。
 // 返回 1 = 用户按了键跳过。
+// ★ v0.9.2 三段式（用户要求：日志必须一条一条实时打印、必须真的向上翻卷）：
+//   ① con64_boot_screen64()：挂接 —— 算几何 + 清黑 + 把 fb/font 就绪**之前**就攒下的行
+//      按节奏**逐行**滚出（一行一次上滚，不再攒 8 行批量滚）；之后控制台进入 live 状态。
+//   ② con64_live_pump64()：实时泵 —— os_boot_path 每个阶段结束叫一次，把这一段**真的刚产生**
+//      的打点逐行滚上屏。
+//   ③ con64_boot_screen_done64()：收尾 —— 补画残留 + 打 follow/live/skip 证据行 + 冻结画面。
+//   verbose=0：不画屏（只打 [CON64] verbose=0 skipped；缓冲/dmesg 照常）。
 int con64_boot_screen64(int verbose);
+void con64_live_pump64(void);
+void con64_boot_screen_done64(void);
 
 // ==================== 自检 ====================
 // 返回失败掩码（0 = PASS）。打点 [CON64] selftest PASS mask=0x0 / FAIL mask=0x<hex>。

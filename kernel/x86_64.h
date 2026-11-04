@@ -91,6 +91,14 @@ uint64_t gdt_entry_raw64(int index);     // 自检/调试用：GDT 第 index 项
 #define PIT_HZ_64    250
 #define TICK_MS_64   (1000 / PIT_HZ_64)     // 4ms
 void pit_init64(uint32_t freq_hz);
+// ==================== ★ v0.9.2：墙钟锚点（给"启动动画必须 3~5 秒"做校准）====================
+// 为什么需要：本内核的时长都以 PIT tick 计（250 Hz）。实测 TCG 里虚拟 PIT 比宿主墙钟快约 1.9 倍
+//   （开机到动画开始约 30 个墙钟秒、却走掉约 57 个 guest 秒），于是"按 tick 数出来的 4000 ms"
+//   在屏上只有约 2.1 秒 —— 这就是用户报的"残缺动画瞬间闪过"。
+// 做法：boot 早期调 wall64_set_anchor() 记 RTC 秒 + tick；之后 wall64_ratio_x1000() 用
+//   (tick 差 / RTC 秒差) 返回"每个墙钟秒对应多少 guest 毫秒"（原生 ~1000，TCG ~1900，0 = 未知）。
+void wall64_set_anchor(void);
+int  wall64_ratio_x1000(void);
 extern volatile uint64_t g_ticks64;         // 自启动以来的 tick 数
 extern volatile uint64_t g_irq_total64;     // 中断总数（任务管理器性能页用）
 

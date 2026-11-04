@@ -280,6 +280,37 @@ static void idt_diag_dump() {
 }
 
 // ==================== PIT（IRQ0，250Hz）====================
+// ==================== ★ v0.9.2：墙钟锚点（RTC）====================
+// 判据为什么要它：用户要求"启动动画必须完整播放 3~5 秒"。按 PIT tick 算得到的 4000 ms 在 TCG 下
+//   只有 ~2.1 个墙钟秒（虚拟时钟比墙钟快 ~1.9 倍），屏上看起来就是"瞬间闪过"。
+//   这里用 RTC（QEMU/VMware 的 RTC 都来自宿主时间）当墙钟基准，算出一个换算系数。
+// 边界（如实）：RTC 只有 1 秒精度，所以窗口越短误差越大；这里要求 >= 2 秒窗口，
+//   并且只接受 300..8000 这种合理区间，其余一律返回 0（= 未知，调用方按 1000 走，即老行为）。
+static uint32_t g_wall_rtc0 = 0;
+static uint64_t g_wall_tick0 = 0;
+static int      g_wall_anchor_ok = 0;
+
+void wall64_set_anchor(void) {
+    int hh = 0, mm = 0, ss = 0;
+    rtc_get_time64(&hh, &mm, &ss);
+    g_wall_rtc0 = (uint32_t)(hh * 3600 + mm * 60 + ss);
+    g_wall_tick0 = g_ticks64;
+    g_wall_anchor_ok = 1;
+}
+
+int wall64_ratio_x1000(void) {
+    if (!g_wall_anchor_ok) return 0;
+    int hh = 0, mm = 0, ss = 0;
+    rtc_get_time64(&hh, &mm, &ss);
+    const uint32_t now_s = (uint32_t)(hh * 3600 + mm * 60 + ss);
+    const uint32_t ds = (now_s + 86400u - g_wall_rtc0) % 86400u;
+    const uint64_t dt_ms = (uint64_t)(g_ticks64 - g_wall_tick0) * (uint64_t)TICK_MS_64;
+    if (ds < 2 || dt_ms == 0) return 0;
+    const uint64_t rps = dt_ms / (uint64_t)ds;
+    if (rps < 300 || rps > 8000) return 0;
+    return (int)rps;
+}
+
 void pit_init64(uint32_t freq_hz) {
     if (freq_hz == 0) freq_hz = PIT_HZ_64;
     uint32_t div = 1193182u / freq_hz;

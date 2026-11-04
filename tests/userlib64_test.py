@@ -88,6 +88,10 @@ class Vm:
         self.proc = subprocess.Popen([
             qemu, "-name", name,
             "-drive", "format=raw,file=%s" % q(img),
+                        # ★ v0.9.2：本脚本要抓"屏上像素证据"（设备图案 / 用户程序画的色带 / 共享内存矩形），
+            #   这些绘制在默认启动里已经关掉了（用户要求进锁屏前屏上不许有彩色测试图），
+            #   必须用 fw_cfg opt/vimtu/probe demos=1 显式打开 —— 断言一条都没放松。
+            "-fw_cfg", "name=opt/vimtu/probe,string=demos=1",
             "-boot", "order=c", "-m", "512", "-vga", "std",
             "-display", "none",
             "-serial", "file:%s" % q(serial),

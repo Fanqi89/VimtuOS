@@ -145,6 +145,10 @@ class Vm:
         self.proc = subprocess.Popen([
             qemu, "-name", "vimtu-vgpu-%s" % vga,
             "-drive", "format=raw,file=%s" % img,
+                        # ★ v0.9.2：本脚本要抓"屏上像素证据"（设备图案 / 用户程序画的色带 / 共享内存矩形），
+            #   这些绘制在默认启动里已经关掉了（用户要求进锁屏前屏上不许有彩色测试图），
+            #   必须用 fw_cfg opt/vimtu/probe demos=1 显式打开 —— 断言一条都没放松。
+            "-fw_cfg", "name=opt/vimtu/probe,string=demos=1",
             "-boot", "order=c", "-m", "512", "-vga", vga,
             "-display", "none", "-serial", "file:%s" % self.serial,
             "-monitor", "telnet:127.0.0.1:%d,server,nowait" % port,
@@ -385,9 +389,12 @@ def run_device(vm, check, fb_w, fb_h):
     check("① virtqueue 0（控制队列）建好：size/desc/avail/used 都是真物理地址（非 0）",
           mq is not None and int(mq.group(1)) >= 8 and mq.group(5) != "0" and mq.group(6) != "0"
           and mq.group(7) != "0" and mq.group(4) == "0", mq.group(0) if mq else "缺")
-    mq1 = last(r"\[VGPU\] queue1 size=(\d+) \(cursor; not enabled\)", log)
-    check("① cursor 队列如实只报告不启用（[VGPU] queue1 size=… (cursor; not enabled)）",
-          mq1 is not None, mq1.group(0) if mq1 else "缺")
+    # ★ v0.9.2：这条断言从 v0.5.5（8b3b852）起就不成立了 —— 那一版把打印从
+    #   "queue1 size=16 (cursor; not enabled)" 改成了 "(cursor; ready)"（队列真的建起来了），
+    #   而测试没跟着改 → 四个版本的"假红"。现在按**事实**断言（强度不减：仍要 size + 队列名 + 真实状态）。
+    mq1 = last(r"\[VGPU\] queue1 size=(\d+) \(cursor; (?:ready|not available)\)", log)
+    check("① cursor 队列按真实状态报告（[VGPU] queue1 size=… (cursor; ready|not available)）",
+          mq1 is not None and int(mq1.group(1)) > 0, mq1.group(0) if mq1 else "缺")
     ds = last(r"\[VGPU\] ready backend=virtio-gpu-2d scanout=pending status=0x(\S+)", log)
     check("① DEVICE_STATUS 走到 DRIVER_OK（ACK|DRIVER|FEATURES_OK|DRIVER_OK = 0xf）",
           ds is not None and ds.group(1).endswith("f"), ds.group(0) if ds else "缺")

@@ -283,6 +283,12 @@ def main():
     vm = Vm(qemu, [disk], serial1, fst.free_port(), "Vimtu64-locklogin1")
     lv = 0.0
     try:
+        # ★ v0.9.1（用户要求「绝对不可以跳过」）：启动日志/启动动画期间连按回车，
+        #   动画仍然必须走满 3~5 秒、且按键不能泄漏成锁屏上的"进登录"。
+        vm.wait("[BOOT64] anim start", 150)
+        for _ in range(4):
+            vm.mon.key("ret", wait=0.15)
+            time.sleep(0.2)
         log = vm.wait("[LOCK64] lock screen shown", 150)
         check("开机后先出现锁屏（[LOCK64] lock screen shown）", log is not None)
         if log is None:
@@ -302,19 +308,42 @@ def main():
             bootlog = vm.log()
             m_anim = re.search(r"\[BOOT64\] anim start target_ms=(\d+) fin_ms=\d+ hold_ms=\d+ fout_ms=\d+ "
                                r"dots=(\d+) rev_ms=(\d+) src=(\S+)", bootlog)
-            check("启动动画打点（[BOOT64] anim start target_ms=4000 dots=12 rev_ms=1200）",
-                  m_anim is not None and int(m_anim.group(1)) == 4000 and
-                  int(m_anim.group(2)) == 12 and int(m_anim.group(3)) == 1200,
-                  m_anim.group(0) if m_anim else "（缺）")
-            m_done = re.search(r"\[BOOT64\] anim done frames=(\d+) elapsed_ms=(\d+) skipped=(\d+)", bootlog)
-            el_anim = int(m_done.group(2)) if m_done else -1
-            check("★ 启动动画实测时长落在 3~5 秒（需求区间；elapsed_ms=%d）" % el_anim,
-                  m_done is not None and 3000 <= el_anim <= 5000 and int(m_done.group(1)) > 0 and
-                  int(m_done.group(3)) == 0,
+            m_anim_line = re.search(r"\[BOOT64\] anim start[^\r\n]*", bootlog)
+            check("启动动画打点（dots=5 rev_ms=1200 + wall_target_ms=4000；target_ms 是墙钟校准后的 guest 预算）",
+                  m_anim is not None and int(m_anim.group(2)) == 5 and int(m_anim.group(3)) == 1200 and
+                  m_anim_line is not None and "wall_target_ms=4000" in m_anim_line.group(0),
+                  m_anim_line.group(0)[:160] if m_anim_line else "（缺）")
+            # ★ v0.9.2（用户要求：logo 正下方**一排 5 个**小圆点做波浪）
+            check("★ 启动动画是一排 5 点波浪（layout=row + wave_ms/ dot_r/ gap/ bounce 字段齐全）",
+                  m_anim_line is not None and "layout=row" in m_anim_line.group(0) and
+                  re.search(r"wave_ms=\d+ dot_r=\d+ gap=\d+ bounce=\d+", m_anim_line.group(0)) is not None,
+                  m_anim_line.group(0)[:170] if m_anim_line else "（缺）")
+            # ★ v0.9.2：时长判据改成**真实墙钟**（TCG 下虚拟 PIT 比墙钟快 ~1.9 倍，
+            #   按 tick 算的"4 秒"在屏上只有 ~2.1 秒 —— 用户报的"瞬间闪过"就是这个）。
+            #   wall_ms = elapsed_ms * 1000 / rps，rps 由 RTC 锚点实测得出（打点里带）。
+            m_done = re.search(r"\[BOOT64\] anim done frames=(\d+) elapsed_ms=(\d+) wall_ms=(\d+) rps=(\d+)"
+                               r"[^\n]*skipped=(\d+)", bootlog)
+            wall_anim = int(m_done.group(3)) if m_done else -1
+            check("★ 启动动画实测**墙钟**时长落在 3~5 秒（需求区间；wall_ms=%d）" % wall_anim,
+                  m_done is not None and 3000 <= wall_anim <= 5000 and int(m_done.group(1)) > 0 and
+                  int(m_done.group(5)) == 0,
                   m_done.group(0) if m_done else "（缺）")
+            # ★ v0.9.1（用户要求「绝对不可以跳过」）：动画期间连按回车也不许提前结束
+            m_show = re.search(r"\[UI\] boot logo show frames=\d+ fade=ok[^\n]*skippable=(\d)[^\n]*wall_ms=(\d+)",
+                               bootlog)
+            check("★ 启动动画不可跳过：按了 4 次回车仍走满（[UI] boot logo show … skippable=0）",
+                  m_show is not None and m_show.group(1) == "0" and 3000 <= int(m_show.group(2)) <= 5000,
+                  m_show.group(0)[:110] if m_show else "（缺 skippable=0 字段）")
+            check("★ 启动动画没有被按键打断（不存在 '[BOOT64] anim skipped'）",
+                  "[BOOT64] anim skipped" not in bootlog,
+                  "%d 次" % bootlog.count("[BOOT64] anim skipped"))
+            check("★ 启动日志也不可跳过（[CON64] skip disabled=1，且没有 [CON64] skip key=1）",
+                  "[CON64] skip disabled=1" in bootlog and "[CON64] skip key=1" not in bootlog,
+                  (re.search(r"\[CON64\] skip[^\r\n]*", bootlog) or "（缺）").group(0)
+                  if re.search(r"\[CON64\] skip[^\r\n]*", bootlog) else "（缺）")
             m_fade = re.search(r"\[BOOT64\] fade in steps=(\d+) target_ms=(\d+) ms=(\d+) pattern=bayer-4x4", bootlog)
-            check("★ 启动动画 -> 锁屏的淡入打点（[BOOT64] fade in steps=16 … pattern=bayer-4x4）",
-                  m_fade is not None and int(m_fade.group(1)) == 16 and int(m_fade.group(3)) > 0,
+            check("★ 启动动画 -> 锁屏的淡入打点（[BOOT64] fade in steps=8 … pattern=bayer-4x4）",
+                  m_fade is not None and int(m_fade.group(1)) == 8 and int(m_fade.group(3)) > 0,
                   m_fade.group(0) if m_fade else "（缺）")
             if m_done and m_fade:
                 check("★ 顺序：动画结束 -> 淡入 -> 锁屏（日志位置严格递增）",

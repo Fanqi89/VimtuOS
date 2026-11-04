@@ -889,6 +889,18 @@ static void edit64_demo64(const char* bin) {
 }
 #endif
 
+// ★ v0.9.2：启动屏"能不能画测试图/跑绘图演示"的总开关。
+//   用户要求（原文）："进入锁屏前，屏幕上绝对不允许出现任何旧的彩色测试图！"
+//   因此这些**只在验收时需要**的东西改成 opt-in：唯一的开启途径是 QEMU 里显式给
+//   fw_cfg 文件 opt/vimtu/probe 且带 demos=1（tests/*.py 用）；真机 / VMware / 默认启动
+//   一律 0 —— virtio-gpu 只"静默接管显示"（不画图案）、ring3 绘图演示不跑、控制台照常滚。
+//
+//   开关只影响"画什么"，不影响"打什么"：所有打点行仍然是验收判据。
+static int boot_probe64() {
+    static int cached = -1;
+    if (cached < 0) cached = fb64_fwcfg_flag64("opt/vimtu/probe", "demos", 0) ? 1 : 0;
+    return cached;
+}
 #ifndef VIMTU_INSTALLER_MEDIA
 // ==================== Rust 模块（gui_rs crate）：设计 Token + 主题配色 ====================
 // 位置与理由：
@@ -1028,10 +1040,17 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
     //   （kmain 的 #ifdef VIMTU_INSTALLER_MEDIA：装系统时那 5 秒诊断是需要的）。
     //   自检保留（纯逻辑，不刷屏）：它验的是"报告内容自洽"，与"要不要展示"无关。
     (void)hwui64_selftest64();
+    // ==================== ★ v0.9.2：真·启动控制台（屏上第一段）====================
+    //   用户要求：进锁屏之前屏上只允许出现"黑底白字的真控制台日志（逐行上滚）+ 启动动画 + 过渡"。
+    //   位置：中文面已装载（font_external_load64）+ 显示层就绪（display64_init64）+ 等宽面可用之后，
+    //     调度器和 ring3 演示**之前** —— 从这里起，后面每个阶段打出来的行都是**真的刚产生**的，
+    //     由 con64_live_pump64() 逐行滚上屏（一条一行，不再"末尾一次性回放/攒 8 行批量滚"）。
+    //   probe 模式（验收脚本要抓像素）下不画控制台：屏留给像素证据。
 #endif
     // 调度器上线：任务 0 = 本流程（桌面消息循环），另建 kheart/kwork/ksum 三个内核线程。
     // 必须放在 gui64_run 之前 —— 之后不再返回。
     task_start64();
+    con64_live_pump64();          // ★ v0.9.2 实时泵：把调度器上线的日志滚上屏
     // ---- 用户态（ring3）+ int 0x80：启动期跑一次真实用户程序（M3 起点）----
     // 位置有讲究：必须在 task_start64() 之后（调度器在线：TSS.rsp0 由它维护，用户程序
     // 也能被 PIT 抢占），且在 gui64_run() 之前（那之后不再返回）；跑完必须还能进桌面。
@@ -1061,11 +1080,20 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
         //   ★ A2 起默认跑 **C 版**（user/apps/fbdemo.c，构建期编成 blob；见 build64.sh 的
         //     VIMTU_USER_FBDEMO 开关）；VIMTU_USER_FBDEMO_ASM=1 的构建改跑 A1 的汇编版
         //     （user/fbdemo.asm）。两版的可观测行为逐条一致（对照表见 user/apps/fbdemo.c 顶部）。
+        // ★ v0.9.2：这两个演示就是"用户程序在屏上画一条彩色带"（tests/fbmap64_test.py 的像素证据），
+        //   用户要求进锁屏之前屏上不许有任何彩色测试图 -> 改成 opt-in（probe=1 才跑）。
+        if (boot_probe64()) {
 #if VIMTU_USER_FBDEMO_ASM
-        k64_run_raw_demo64("/bin/fbdemo64.bin", "fbdemo64", 2);
+            k64_run_raw_demo64("/bin/fbdemo64.bin", "fbdemo64", 2);
 #else
-        k64_run_raw_demo64("/bin/fbdemo_c.bin", "fbdemo_c", 3);
+            k64_run_raw_demo64("/bin/fbdemo_c.bin", "fbdemo_c", 3);
 #endif
+        } else {
+            dbg64_line_begin64();
+            dbg64_str("[FBDEMO] skipped reason=boot-screen-policy probe=0 (no test band on the boot screen)");
+            dbg64_nl();
+            dbg64_line_end64();
+        }
     } else {
         dbg64_line_begin64();
         dbg64_str("[USER64] ring3 demos skipped (user window unavailable on this boot path)\n");
@@ -1150,7 +1178,15 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
                     dbg64_line_end64();
                 }
                 (void)proc64_evshm_install64(app_drive, app_lba);   // 幂等：把 /evshm.elf 装进系统卷
-                (void)proc64_evshm_demo64("/evshm.elf");            // shm_create/map + fb_flip + input_poll
+                // ★ v0.9.2：这个演示会往屏上画一个矩形再 fb_flip（ipc64/userlib64 的像素证据）-> opt-in
+                if (boot_probe64()) {
+                    (void)proc64_evshm_demo64("/evshm.elf");        // shm_create/map + fb_flip + input_poll
+                } else {
+                    dbg64_line_begin64();
+                    dbg64_str("[EVSHM] demo skipped reason=boot-screen-policy probe=0 (nothing is drawn on the boot screen)");
+                    dbg64_nl();
+                    dbg64_line_end64();
+                }
                 // ---- 批次 B：缺陷回归 —— kill 掉 ring3 进程后复用同一任务槽，必须还能进 ring3 ----
                 // 位置在 proc64 演示之后、gui64_run 之前（跑完必须还能进桌面）；只走 BIOS 路径
                 // （UEFI 下用户窗口不可用，上面这一整块已经被 user64_available64() 挡在外面）。
@@ -1234,6 +1270,7 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
         }
     }
     store64_dump64();
+    con64_live_pump64();          // ★ v0.9.2 实时泵：VFS/卷/store 这一段的日志
     // ---- 系统配置 / 会话策略 / 状态机 / 看门狗（本轮移植：config64 + session64 + sysstate64 + panic64）----
     // 顺序有讲究：
     //   1) config64_init64()：**必须在 store64_init64() 之后**（它读 store64 里 "cfg." 前缀的键）；
@@ -1242,6 +1279,21 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
     //      -> STARTING；RUNNING 由 gui64 的桌面首帧推进（见 kernel/gui64.cpp 主循环）；
     //   4) panic64_init64()：建看门狗任务（需要 task_start64() 已经跑过），桌面首帧时武装。
     config64_init64();
+    // ==================== ★ v0.9.2：真·启动控制台（屏上第一段）====================
+    //   用户要求：进锁屏之前屏上只允许出现"黑底白字的真控制台日志（逐行上滚）+ 启动动画 + 过渡"。
+    //   位置：config64 就绪之后（boot.verbose 这个**持久化**开关必须真读得到 —— 早于 store64/config64
+    //     调用的话，终端里 oot verbose off 会静默失效，这一步是踩过的坑）、调度器/设备演示之前。
+    //   挂接时把 fb/font 就绪之前攒下的行逐行滚出（一行一次上滚），之后每个阶段结束由
+    //   con64_live_pump64() 把这一段**真的刚产生**的行逐行滚上屏。
+    //   probe 模式（验收脚本要抓像素）下不画控制台：屏留给像素证据。
+    if (boot_probe64()) {
+        dbg64_line_begin64();
+        dbg64_str("[CON64] screen skipped reason=probe-mode (demos=1 keeps the screen for pixel evidence)");
+        dbg64_nl();
+        dbg64_line_end64();
+    } else {
+        (void)con64_boot_screen64(config64_get_bool64("boot.verbose", 1));
+    }
     session64_init64();
     // ★ 本批（P1c）：多用户骨架（/etc/users.db + /home/<用户> + root 隐藏记录 + 引导用户）。
     //   位置讲究：必须在 vfs64 挂载系统卷之后（写 /etc/users.db）、config64_init64() 之后
@@ -1318,6 +1370,7 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
     // 自检会送一段已知 PCM（120ms 1kHz 方波）并断言控制器侧 LPIB/BCIS 前进（[HDA64] selftest PASS）。
     hda64_init64();
     (void)hda64_selftest64();
+    con64_live_pump64();          // ★ v0.9.2 实时泵：声卡/输入这一段的日志
     // ---- 批次 A 后半：update 标记检查 + preload 预热（都在进桌面之前）----
     // 顺序：update 先查（有 pending 会应用 -> store/ring log -> /update.done -> 自动软重启，不返回）；
     //       没有 pending 就照常往下走，然后 preload 预热字形/图标（打点带 rdtsc64 实测证据）。
@@ -1337,6 +1390,7 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
 #endif
     (void)update64_check64();
     (void)preload64_run64();
+    con64_live_pump64();          // ★ v0.9.2 实时泵：用户态/设备这一段的日志
     // ★ v0.7.1（P2）：桌面路径也跑一次 FD 层自检。
     //   为什么：它之前只在安装介质那条启动路径调（kernel64.cpp:1203 的分支），
     //   于是"装好的盘"上 poll/select 的 fd 就绪判断没有任何运行时证据。
@@ -1352,12 +1406,15 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
     // 位置：所有启动期工作之后、开机滚屏之前 —— 这样 [RUST64] 行会进 boot console 的
     //   回放缓冲（屏上也能看到），并且**在进桌面之前**就证明"Rust 真的在跑"。
     rust64_boot_init64();
+    con64_live_pump64();          // ★ v0.9.2 实时泵：Rust 模块这一段的日志
     // ==================== 开机滚屏引导控制台（批次 N）====================
     // 位置：所有启动期工作之后、gui64_run 之前 —— 也就是"进桌面之前"屏上跑一遍这次启动真的
     //   跑出来的内核日志（回放缓冲 + 实时追加），停 CON64_STAY_MS 或按任意键，然后进桌面。
     // 开关：config64 的 boot.verbose（默认 1；终端 `boot verbose on|off` 持久化到 store64）。
     //   关掉时只打 [CON64] verbose=0 skipped，缓冲/dmesg 照常。
-    (void)con64_boot_screen64(config64_get_bool64("boot.verbose", 1));
+    // ★ v0.9.2：控制台的第三段（收尾）—— 补画残留 + 打 follow/live/skip 证据行 + 冻结画面。
+    //   挂接早在 os_boot_path 开头就做完了（见上面 con64_boot_screen64 的调用点）。
+    con64_boot_screen_done64();
     gui64_run(bi);          // 不返回：进入桌面消息循环
 }
 #endif
@@ -1541,8 +1598,18 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     //   （软件路径截图 / 设 scanout + 同一图案走设备 / 只改请求区域）各保持 2.5s 供验收抓帧，
     //   随后 bench 打设备 vs 软件的 rdtsc 中位数（见 [VGPU] bench 行）。
     vgpu64_init64();
-    (void)vgpu64_selftest64();
-    (void)vgpu64_bench64();
+    // ★ v0.9.2：默认**静默**接管显示（只设 scanout，一个测试像素都不画）。
+    //   三段图案自检（一整屏 LCG 彩色图案 + 三段各保持 2.5~3s）和 bench（连翻整屏）改成
+    //   opt-in —— 它们正是用户报的"开机先闪一下彩色撕裂测试图"。
+    if (boot_probe64()) {
+        (void)vgpu64_selftest64();
+        (void)vgpu64_bench64();
+    } else if (!vgpu64_enable_quiet64()) {
+        dbg64_line_begin64();
+        dbg64_str("[VGPU] scanout quiet skipped (device not ready / geom mismatch; soft LFB path stays)");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
     // ★ v0.5.5：硬件光标平面（fw_cfg `cursor=1` 才开；缺省走软件光标，既有像素行为不变）。
     //   放在 bench 之后：此时 scanout 已经设好、几何也已确认，光标位图才可能被设备真正扫描出去。
     (void)fb_cursor_run64();

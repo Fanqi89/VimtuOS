@@ -112,6 +112,9 @@ int  vgpu64_selftest64();
 // 基准（rdtsc 实测，多轮取中位数）：整屏 flip 与若干区域大小在**设备路径 vs 软件路径**下的耗时。
 //   只在设备可用时跑（返回值 = 跑过的用例数；0 = 没跑）。打点见 [VGPU] bench ...
 int  vgpu64_bench64();
+// ★ v0.9.2：静默接管显示（只设 scanout，一个测试像素都不画）。默认启动路径用它；
+//   三段图案自检 + bench 改成 opt-in（fw_cfg opt/vimtu/probe 带 demos=1）。返回 1 = 已接管。
+int  vgpu64_enable_quiet64();
 
 // 分辨率变化后的重配（RESOURCE_UNREF -> CREATE_2D -> ATTACH -> SET_SCANOUT -> 整屏 TRANSFER）。
 //   失败（或几何不支持）时**降级**：尝试把 scanout 交还 legacy VGA framebuffer + ready=0。

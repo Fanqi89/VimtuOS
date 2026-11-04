@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>VimtuOS v0.9.2 启动过程取证</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:28px 32px 60px; background:#0d1117; color:#c9d1d9;
+         font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; }
+  h1 { font-size:22px; margin:0 0 6px; color:#e6edf3; }
+  .sub { color:#8b949e; font-size:13px; margin-bottom:22px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(420px,1fr)); gap:22px; }
+  figure { margin:0; background:#161b22; border:1px solid #21262d; border-radius:10px; overflow:hidden; }
+  figure img { display:block; width:100%; height:auto; background:#000; }
+  figcaption { padding:10px 14px 14px; font-size:13px; line-height:1.55; }
+  figcaption b { color:#e6edf3; }
+  code { background:#0d1117; border:1px solid #21262d; border-radius:5px;
+         padding:1px 5px; font-size:12px; color:#79c0ff; word-break:break-all; }
+  .note { margin-top:22px; font-size:13px; color:#8b949e; line-height:1.7; }
+</style>
+</head>
+<body>
+<h1>VimtuOS v0.9.2 — 启动过程取证（QEMU 实跑，1280×800）</h1>
+<div class="sub">同一台 QEMU、同一次冷启动连拍：控制台日志 → 启动动画 → 淡出到黑 → 锁屏。图片来自 QEMU <code>screendump</code>，未做任何修饰。</div>
+
+<div class="grid">
+  <figure>
+    <img src="01_console.png" alt="boot console">
+    <figcaption><b>1. 真日志控制台（黑底等宽字 + 行首时间戳）</b><br>
+      每一行都是一次真实上滚（<code>CON64_SCROLL_BATCH 8 → 1</code>），滚屏改成后备缓冲直接字搬运后单次 ~5–10ms，
+      才付得起“一行一滚”。屏上这一刻是启动末尾，日志正在被实时泵上来。</figcaption>
+  </figure>
+  <figure>
+    <img src="02_anim_a.png" alt="boot animation early">
+    <figcaption><b>2. 启动动画（前段）：屏幕正中 logo + 正下方一排 5 点</b><br>
+      <code>dots=5 dot_r=6 gap=34 bounce=6 layout=row</code>；最亮的那颗点还会上跳 6px。
+      此时亮的是右边几颗，波浪正在往左走。</figcaption>
+  </figure>
+  <figure>
+    <img src="03_anim_b.png" alt="boot animation late">
+    <figcaption><b>3. 启动动画（后段）：同一排点，亮的换成了另一颗</b><br>
+      两张图相隔 ~2.4 秒，点阵亮度分布不同 = 波浪真的在动。动画墙钟时长实测
+      <code>wall_ms=4002 rps=1574</code>（需求 3~5 秒）。</figcaption>
+  </figure>
+  <figure>
+    <img src="04_fadeout_black.png" alt="fade out to black">
+    <figcaption><b>4. 动画淡出到纯黑（过渡的第一半）</b><br>
+      末尾 400ms logo/点按 alpha 降到 0，画面上只剩纯黑 —— 紧接着锁屏从黑场里按 8 步（≈12.5%/步）
+      揭示出来（<code>[BOOT64] fade in steps=8 … pct=12</code>）。</figcaption>
+  </figure>
+  <figure>
+    <img src="05_lock.png" alt="lock screen">
+    <figcaption><b>5. 锁屏接管（过渡结束）</b><br>
+      <code>[LOCK64] lock screen shown … blur_bg=0 why=boot</code>。整个启动过程屏上**没有**任何彩色测试图：
+      <code>[VGPU] scanout quiet</code> / <code>[FBDEMO] skipped</code> / <code>[EVSHM] demo skipped</code>。</figcaption>
+  </figure>
+</div>
+
+<div class="note">
+  串口硬证据（同一次启动）：<br>
+  <code>[CON64] replay lines=64 dropped=2404 ms=3840 stream=1</code><br>
+  <code>[CON64] follow bottom=1 rows=39 drawn=39 pending=0 replayed=64 planned=64 complete=1 region_bottom=800 screen_h=800 live_drawn=106 pumps=3</code><br>
+  <code>[BOOT64] anim start target_ms=6294 fin_ms=629 hold_ms=5036 fout_ms=629 dots=5 rev_ms=1200 … layout=row skippable=0 rps=1574 wall_target_ms=4000</code><br>
+  <code>[BOOT64] anim done frames=224 elapsed_ms=6300 wall_ms=4002 rps=1574 skipped=0</code><br>
+  <code>[BOOT64] fade in steps=8 target_ms=500 ms=824 pattern=bayer-4x4 pct=12</code><br>
+  <code>[CON64] skip disabled=1 (boot log is NOT skippable; keys are swallowed)</code>
+  <br>墙钟**独立量测**（不靠内核自报）：连拍时间戳 —— 画面从控制台切到黑场 ≈42.7 s，
+  动画最后一帧有内容 ≈45.5 s、46.3 s 已全黑 ⇒ 动画约 3.6 s 墙钟（含首尾淡入淡出）。
+</div>
+</body>
+</html>

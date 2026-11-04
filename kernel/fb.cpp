@@ -660,6 +660,40 @@ static int fb64_cfg_int(const char* key, int def) {
     while (*p >= '0' && *p <= '9') { v = v * 10 + (int)(*p - '0'); p++; any = 1; }
     return any ? v : def;
 }
+// ==================== ★ v0.9.2：通用 fw_cfg 开关 ====================
+// 与 fb64_cfg_load() 的区别：那个只认死文件名 opt/vimtu/vsync（帧引擎专用）。这里按文件名查，
+// 让"启动期屏上测试图/演示"之类的东西也能用 fw_cfg 做 opt-in —— 判据是**显式配置才开**，
+// 没有该文件一律返回 def（默认 0 = 关）。每次调用重读（只在启动早期/验收路径调，条目数上界 64，成本有界）。
+int fb64_fwcfg_flag64(const char* file, const char* key, int def) {
+    uint16_t sel = 0; uint32_t sz = 0;
+    char buf[192];
+    if (!fb64_fwcfg_find(file, &sel, &sz)) return def;
+    if (sz == 0 || sz > sizeof(buf) - 1) return def;
+    fb64_fwcfg_select(sel);
+    int n = 0;
+    for (uint32_t i = 0; i < sz; i++) {
+        const char c = (char)fb64_fwcfg_rd8();
+        if (!c) break;
+        buf[n++] = c;
+    }
+    buf[n] = 0;
+    const int kl = fb64_strlen(key);
+    const char* p = buf;
+    while (*p) {
+        int m = 1;
+        for (int i = 0; i < kl; i++) if (p[i] != key[i]) { m = 0; break; }
+        if (m && p[kl] == '=') {
+            p += kl + 1;
+            int v = 0, any = 0;
+            while (*p >= '0' && *p <= '9') { v = v * 10 + (int)(*p - '0'); p++; any = 1; }
+            return any ? v : def;
+        }
+        while (*p && *p != ';') p++;
+        if (*p == ';') p++;
+    }
+    return def;
+}
+
 static int fb64_cfg_str(const char* key, const char* val) {      // 值到 ';' 或串尾为止
     const char* p = fb64_cfg_find(key);
     if (!p) return 0;

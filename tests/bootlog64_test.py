@@ -15,7 +15,9 @@
      * 黑底 + 文本行：非黑像素占比在 0.5%~25% 之间；>= 12 行有文字带；
      * 行间距均匀：文字带中心间距 ≈ 20px（line_h）；
      * 滚动证据：两帧里同一位置的文字行内容不同（屏上内容在动），并报告"上移 k 行"的最佳匹配。
-  C. 跳过（第二遍启动）：滚屏期间注入一个按键 -> [CON64] skip key=1，随后 [GUI64] ready 出现。
+  C. 不可跳过（第二遍启动，v0.9.1 需求「绝对不可以跳过」）：滚屏期间连按回车 ->
+     [CON64] skip disabled=1 出现、旧的 [CON64] skip key=1 **必须不存在**、回放仍走完整段
+     （replay lines>=10 且 complete=1），随后 [GUI64] ready 照常出现。
   D. dmesg：终端里跑 `dmesg` -> 串口出现 [CON64] dmesg lines= 与 [CON64] dmesg[i] 前缀的
      早期行（[LM64] ENTERED LONG MODE 那一行）；屏幕上终端区域出现十几行正文（像素，有界重试）。
   E. 持久化开关（第三遍冷启动同一块镜像）：`boot verbose off` -> [CON64] boot verbose=off persisted=1；
@@ -423,30 +425,36 @@ def main():
         fstq.kill(proc)
 
     # ==================================================================
-    # 第二遍：滚屏期间按键跳过 + boot verbose off（持久化）
+    # 第二遍：滚屏期间按键**不跳过**（v0.9.1 需求：绝对不可以跳过）+ boot verbose off（持久化）
     # ==================================================================
     serial2 = os.path.join(tmp, "boot2.log")
     port2 = fstq.free_port()
     proc2, mon2 = fstq.boot_installed(qemu, [img], serial2, port2, "Vimtu64-bootlog2")
     try:
-        print("=== 5) 跳过：滚屏期间注入一个按键 -> [CON64] skip key=1 ===")
+        print("=== 5) 不可跳过：滚屏期间连按按键 -> 日志仍要走完整段回放 ===")
         wait_mark(serial2, "[CON64] screen ready", 90, proc2, step=0.05)
-        skip_seen = False
-        for _ in range(10):
-            if "[GUI64] ready" in wait_mark(serial2, "[CON64] screen ready", 0.1, proc2):
-                break
+        for _ in range(6):                     # 回放窗口 ~4s：连按 6 次回车，绝不能把它打断
             mon2.key("ret", wait=0.15)
-            if "[CON64] skip key=1" in wait_mark(serial2, "[CON64] skip key=1", 0.6, proc2, step=0.05):
-                skip_seen = True
-                break
-            time.sleep(0.25)
-        log2 = wait_mark(serial2, "[CON64] skip key=1", 6, proc2, step=0.1)
-        skip_seen = skip_seen or ("[CON64] skip key=1" in log2)
-        check("[CON64] skip key=1（任意键立即结束引导控制台）", skip_seen,
-              (re.search(r"\[CON64\] (skip|replay|live)[^\r\n]*", log2) or re.search(r"$^", log2)).group(0))
+            time.sleep(0.2)
+        # ★ v0.9.2：[CON64] skip disabled=1 现在打在**收尾**（con64_boot_screen_done64），而控制台
+        #   挂接点在 config64 就绪之后、收尾在启动末尾（实测 100~150 s），所以等待窗口放宽。
+        log2 = wait_mark(serial2, "[CON64] skip disabled=1", 200, proc2, step=0.1)
+        # ★ 判据（强度比旧版更高：旧版只要"被打断"，现在要"打不断 + 走完整段 + 不泄漏按键"）
+        m_rep = re.search(r"\[CON64\] replay lines=(\d+) dropped=(\d+) ms=(\d+)", log2)
+        m_skipd = re.search(r"\[CON64\] skip disabled[^\r\n]*", log2)
+        check("★ 启动日志不可跳过：[CON64] skip disabled=1 出现（按键被吞掉）",
+              "[CON64] skip disabled=1" in log2,
+              m_skipd.group(0) if m_skipd else "（缺）")
+        check("★ 连按回车也没有出现旧的跳过打点（[CON64] skip key=1 必须不存在）",
+              "[CON64] skip key=1" not in log2,
+              "%d 次" % log2.count("[CON64] skip key=1"))
+        check("★ 回放走完整段（[CON64] replay lines>=10 且 complete=1）",
+              m_rep is not None and int(m_rep.group(1)) >= 10 and
+              re.search(r"\[CON64\] follow bottom=1 .*complete=1", log2) is not None,
+              (m_rep.group(0) if m_rep else "（缺 replay 行）"))
         qh.login_desktop(mon2, serial2, proc2, timeout=150)   # ★ 登录手势（显式回车两次）
         log2 = wait_mark(serial2, "[GUI64] ready", 90, proc2, step=0.15)
-        check("跳过之后**继续**既有流程（[GUI64] ready）", "[GUI64] ready" in log2)
+        check("按键没有把流程带歪：照常进桌面（[GUI64] ready）", "[GUI64] ready" in log2)
         if fstq.open_terminal(mon2, serial2, proc2):
             time.sleep(0.8)
             mon2.type_line("boot verbose off", per_key=0.12)
@@ -468,9 +476,10 @@ def main():
     proc3, mon3 = fstq.boot_installed(qemu, [img], serial3, fstq.free_port(), "Vimtu64-bootlog3")
     try:
         print("=== 6) 第三遍冷启动：boot.verbose=0 -> 跳过滚屏，仍进桌面 ===")
-        log3 = wait_mark(serial3, "[CON64] verbose=0 skipped", 90, proc3, step=0.15)
+        log3 = wait_mark(serial3, "[CON64] verbose=0 skipped", 200, proc3, step=0.15)
+        _m_v0 = re.search(r"\[CON64\] verbose=0[^\r\n]*", log3)
         check("[CON64] verbose=0 skipped（关掉的开关真的生效）", "[CON64] verbose=0 skipped" in log3,
-              (re.search(r"\[CON64\] verbose=0[^\r\n]*", log3) or re.search(r"$^", log3)).group(0))
+              _m_v0.group(0) if _m_v0 else "（缺）")
         qh.login_desktop(mon3, serial3, proc3, timeout=150)   # ★ 登录手势（显式回车两次）
         log3 = wait_mark(serial3, "[GUI64] ready", 90, proc3, step=0.15)
         check("第三遍仍正常进桌面（[GUI64] ready）", "[GUI64] ready" in log3)
