@@ -137,6 +137,13 @@ def vimtufs3_format(buf, start_lba, total_sectors):
     struct.pack_into("<I", sb, 60, zlib.crc32(bytes(sb[:60])) & 0xFFFFFFFF)
     sb[510], sb[511] = 0x55, 0xAA
     o = start_lba * SECTOR
+    # ★ 先把这整段可管区域清零：格式化必须与“调用者是否已经清过”无关。
+    #   为什么：make_small_system_disk() 是**先把 build64/system.img 整块拷进来**再格式化，
+    #   那块区域里原来躺着真 v4 卷的 inode 表（uid/gid/mode 在 75/77/79）；
+    #   v3 把 [75,124) 当保留区（要求全 0）-> 挂上后每个 inode 都被判
+    #   `[VFS64] skip corrupt inode=N reason=rsvd3`，于是 /etc 一个字节都写不进去。
+    #   （实测：79 条 rsvd3 + `write_stream64: no free inode` + slot=none + 28,377 条 flush failed）
+    buf[o:o + total_sectors * SECTOR] = b"\0" * (total_sectors * SECTOR)
     buf[o:o + SECTOR] = sb
 
     for m in range(bitmap_blocks):
@@ -148,7 +155,7 @@ def vimtufs3_format(buf, start_lba, total_sectors):
         p = (start_lba + bitmap_start + m) * SECTOR
         buf[p:p + SECTOR] = bm
 
-    # inode 区：整个缓冲区已经是 0（空槽就是全 0），只写 0 号根目录 inode
+    # inode 区：上面已经整段清零（空槽 = 全 0），这里只写 0 号根目录 inode
     root = bytearray(128)
     root[0] = 2                                   # VFS64_TYPE_DIR
     root[1] = 0                                   # namelen（根目录无名）

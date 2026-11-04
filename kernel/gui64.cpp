@@ -4029,13 +4029,20 @@ int gui64_selftest() {
     // 8) 菜单表完整性
     // 8) ★ 缺陷 1：老菜单表（menu_zh/menu_en/MENU_ITEMS）已删除 —— 检查位保留但不参与失败判定；
     //    新开始菜单的条目/几何自检在 startmenu64_selftest64()（[START64] selftest PASS）。
-    // 9) 脏矩形并集
+    // 9) 脏矩形：★ v0.8.0 起的契约 = **相交才合并、不相交排队**（最多 4 块）。
+    //    为什么改契约：原来只一个包围盒，开始菜单时间与 Dock 时钟在同一秒内都脏会合成
+    //    824x491（屏 39%）的巨块，一次重绘 ~490ms（实测）。现在分成多块逐次画。
     g_dirty_any = false;
+    g_pend_n = 0;
     gui64_dirty(10, 10, 20, 20);
-    gui64_dirty(40, 30, 10, 10);
-    if (!g_dirty_any || g_dirty_x0 != 10 || g_dirty_y0 != 10 || g_dirty_x1 != 50 || g_dirty_y1 != 40)
+    if (!g_dirty_any || g_dirty_x0 != 10 || g_dirty_y0 != 10 || g_dirty_x1 != 30 || g_dirty_y1 != 30)
         fails |= 16384;
+    gui64_dirty(40, 30, 10, 10);          // 不相交 -> 排队，当前框不变
+    if (g_pend_n != 1 || g_dirty_x1 != 30 || g_dirty_y1 != 30) fails |= 16384;
+    gui64_dirty(25, 25, 10, 10);          // 与当前框相交 -> 并进当前框
+    if (g_dirty_x1 != 35 || g_dirty_y1 != 35 || g_dirty_x0 != 10 || g_dirty_y0 != 10) fails |= 16384;
     g_dirty_any = false;
+    g_pend_n = 0;
 
     dbg64_str("[GUI64] selftest ");
     dbg64_str(fails == 0 ? "PASS" : "FAIL");

@@ -66,6 +66,8 @@ def build64_version():
 # ---- 页面 id（与 kernel/settings64.cpp 的 P_* 一一对应）----
 P_DISPLAY, P_SOUND, P_POWER, P_DEFAPP = 0, 1, 2, 3
 P_THEME, P_WALL, P_COLOR, P_FIT, P_DOCK, P_FONT = 4, 5, 6, 7, 8, 9
+# 预设头像目录根（v0.6.0 目录重排后的真位置；旧 /Avatars 由内核 kPathAlias 映射，一并接受）
+AVA = r"(?:/Avatars|/System/themes/avatars)"
 P_ETH, P_WIFI, P_AVATAR, P_UNAME, P_PASSWD, P_ABOUT = 10, 11, 12, 13, 14, 15
 # ---- 控件 id（与 kernel/settings64.cpp 的 CID_* 一一对应）----
 CID_THEME_TILE0 = 1               # 磁贴：CID_THEME_TILE0 + 主题 id
@@ -700,16 +702,17 @@ def main():
         #     里面没有 /Avatars -> 内核必须**如实报 no-presets**，不许假装换了头像。
         # 用**整个日志**匹配：click_ctl 失败重试 3 次后返回的 since 已是"要点之后"，按 since-400 回看会把
         # 这条打点切掉（本批实测踩到：日志里明明有，正则却取不到）。该打点每次运行只会出现一次。
-        no_presets = last(r"\[SET64\] avatar preset ok=0 reason=no-presets dir=/Avatars", vm.log())
+        no_presets = last(r"\[SET64\] avatar preset ok=0 reason=no-presets dir=" + AVA, vm.log())
         if no_presets is not None:
             check("夹具没有 /Avatars 时如实报 no-presets（不假装换了头像）", True,
                   no_presets.group(0))
             check("此时头像保持原值不变（不写入假路径）",
-                  av is None or not av.group(2).startswith("/Avatars/"),
+                  av is None or not av.group(2).startswith(("/Avatars/", "/System/themes/avatars/")),
                   (av.group(2) if av else "（未变更）"))
         else:
-            check("头像换成 /Avatars 里的预设 PNG（src=/Avatars/*.png via=settings saved=1）",
-                  av is not None and av.group(2).startswith("/Avatars/") and av.group(2).endswith(".png"),
+            check("头像换成预设目录里的 PNG（src=/System/themes/avatars|/Avatars *.png via=settings saved=1）",
+                  av is not None and av.group(2).startswith(("/Avatars/", "/System/themes/avatars/")) and
+                  av.group(2).endswith(".png"),
                   av.group(0) if av else (last(r"\[USER64\] avatar[^\r\n]*", vm.log()) or ["（无）"])[0])
             check("头像像素尺寸来自真解码（px=WxH 非空）",
                   av is not None and int(av.group(3)) > 0 and int(av.group(4)) > 0,
