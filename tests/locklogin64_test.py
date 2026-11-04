@@ -295,6 +295,38 @@ def main():
             check("开机滚屏 -> 开机动画 -> 锁屏（[UI] boot logo show 在锁屏前）",
                   "[UI] boot logo show" in log and
                   log.find("[UI] boot logo show") < log.find("[LOCK64] lock screen shown"))
+
+            # ★ v0.9.0：启动过程三段的**实测**判据（用户需求：真日志滚屏 -> 3~5 秒启动动画 -> 淡出淡入 -> 锁屏）
+            #   注意：上面那个 `log` 是**到 lock screen shown 为止的切片**，而淡入打点在其后 -> 这几条必须用全量 vm.log()。
+            vm.wait("[BOOT64] fade in steps=", 30)   # 串口 -serial file: 落盘有 1~3s 延迟，必须先等到这一行
+            bootlog = vm.log()
+            m_anim = re.search(r"\[BOOT64\] anim start target_ms=(\d+) fin_ms=\d+ hold_ms=\d+ fout_ms=\d+ "
+                               r"dots=(\d+) rev_ms=(\d+) src=(\S+)", bootlog)
+            check("启动动画打点（[BOOT64] anim start target_ms=4000 dots=12 rev_ms=1200）",
+                  m_anim is not None and int(m_anim.group(1)) == 4000 and
+                  int(m_anim.group(2)) == 12 and int(m_anim.group(3)) == 1200,
+                  m_anim.group(0) if m_anim else "（缺）")
+            m_done = re.search(r"\[BOOT64\] anim done frames=(\d+) elapsed_ms=(\d+) skipped=(\d+)", bootlog)
+            el_anim = int(m_done.group(2)) if m_done else -1
+            check("★ 启动动画实测时长落在 3~5 秒（需求区间；elapsed_ms=%d）" % el_anim,
+                  m_done is not None and 3000 <= el_anim <= 5000 and int(m_done.group(1)) > 0 and
+                  int(m_done.group(3)) == 0,
+                  m_done.group(0) if m_done else "（缺）")
+            m_fade = re.search(r"\[BOOT64\] fade in steps=(\d+) target_ms=(\d+) ms=(\d+) pattern=bayer-4x4", bootlog)
+            check("★ 启动动画 -> 锁屏的淡入打点（[BOOT64] fade in steps=16 … pattern=bayer-4x4）",
+                  m_fade is not None and int(m_fade.group(1)) == 16 and int(m_fade.group(3)) > 0,
+                  m_fade.group(0) if m_fade else "（缺）")
+            if m_done and m_fade:
+                check("★ 顺序：动画结束 -> 淡入 -> 锁屏（日志位置严格递增）",
+                      bootlog.find("[BOOT64] anim done") < bootlog.find("[BOOT64] fade in") and
+                      bootlog.find("[LOCK64] lock screen shown") < bootlog.find("[BOOT64] fade in"),
+                      "anim@%d lock@%d fade@%d" % (bootlog.find("[BOOT64] anim done"),
+                                                   bootlog.find("[LOCK64] lock screen shown"),
+                                                   bootlog.find("[BOOT64] fade in")))
+            m_scr = re.search(r"\[CON64\] (replay lines=\d+|screen ready)", bootlog)
+            check("启动日志是第一段（[CON64] 回放/控制台就绪 在 [UI] boot logo show 之前）",
+                  m_scr is not None and 0 <= bootlog.find(m_scr.group(0)) < bootlog.find("[UI] boot logo show"),
+                  m_scr.group(0) if m_scr else "（缺）")
             # 锁屏首帧画完才有 [LOCK64] lock text 行：等它再取截图/盒子（首帧画在 "lock screen shown" 之后）
             vm.wait("[LOCK64] lock text", 60)
             log = vm.log()

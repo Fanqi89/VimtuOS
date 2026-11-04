@@ -266,19 +266,20 @@ def main():
             cons_top = 800 - int(m.group(2)) * int(m.group(3))
             if cons_top < 0:
                 cons_top = 0
+        # ★ v0.9.0 夹具修正（判据一个字没改）：**先连拍、后分析**。
+        #   原来每帧当场 read_ppm + row_profile（1.0M 像素的 Python 分析约 0.5~1s），
+        #   实测 5 帧要 16s（3s+/帧），而引导控制台只在屏上 ~4s（`[CON64] replay … ms=3796`）——
+        #   于是经常一帧都抓不到（实测 con_00/con_01 墨 0.18%/0.49% = 只有几行，con_02 已经是黑场）。
+        #   现在：循环里只 screendump（约 0.6s/帧），拍完再统一 read_ppm + row_profile 分类。
+        shots = []                        # (t, path)
+        vram_samples = []                 # 直读 vram 同一行像素的多次采样（滚动证据）
         t_pix0 = time.time()
         while time.time() - t_pix0 < 16:
-            fn = os.path.join(tmp, "con_%02d.ppm" % len(frames))
+            fn = os.path.join(tmp, "con_%02d.ppm" % len(shots))
             if not screendump(mon, fn):
-                time.sleep(0.2)
+                time.sleep(0.05)
                 continue
-            try:
-                w, h, px = read_ppm(fn)
-            except Exception as exc:                        # noqa: BLE001
-                print("    [warn] 帧解析失败：%s" % exc)
-                continue
-            prof = row_profile(px, w, h)
-            frames.append((time.time() - t_pix0, w, h, px, prof))
+            shots.append((time.time() - t_pix0, fn))
             # ★ 滚动证据：QEMU 在 -display none 下的显示表面会给**过期**帧（实测滞后 1~2s），
             #   所以这里同时直读 vram（monitor `xp`，就是屏上像素）。
             #   v0.5.10 起控制台**底边对齐**（top_y = screen_h - rows*line_h = 20，原来固定 4），
@@ -292,12 +293,18 @@ def main():
                         vals += xp_words(port1, lfb + ry * pitch, 24)
                 if vals:
                     vram_samples.append([v.lower() for v in vals])
-            if len(frames) >= 16:
+            if len(shots) >= 24:
                 break
-            cons = [fr for fr in frames if console_frame(fr[1], fr[2], fr[3], fr[4])]
-            if len(cons) >= 4:
-                break
-            time.sleep(0.15)
+            time.sleep(0.05)
+        for t_shot, fn in shots:
+            try:
+                w, h, px = read_ppm(fn)
+            except Exception as exc:                        # noqa: BLE001
+                print("    [warn] 帧解析失败：%s" % exc)
+                continue
+            prof = row_profile(px, w, h)
+            frames.append((t_shot, w, h, px, prof))
+        print("    [info] 连拍 %d 帧（%.1fs 内），逐帧分析后挑选控制台帧" % (len(frames), time.time() - t_pix0))
         cons = [fr for fr in frames if console_frame(fr[1], fr[2], fr[3], fr[4])]
         check("抓到 >= 1 帧控制台帧（黑底 + >= %d 行文字带；控制台只出现一次，显示表面还会滞后）" % MIN_BANDS,
               len(cons) >= 1,

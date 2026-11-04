@@ -788,6 +788,8 @@ static int g_overlay_valid = 0;                  // 1 = 覆盖层已经画在当
 static int g_paint_ms_budget = 6;
 static uint32_t g_lock_paint_n = 0;
 
+// ★ v0.9.0：1 = paint64 只画不提交（启动动画 -> 锁屏淡入时先把锁屏画进后备缓冲）
+static int g_hold_flip = 0;
 static void paint64(int px, int py, int pw, int ph) {
     int fw = 0, fh = 0;
     g_fb = fb_surface64(&fw, &fh);
@@ -828,7 +830,8 @@ static void paint64(int px, int py, int pw, int ph) {
     }
     cursor64();
     fb_reset_clip();
-    fb_flip_region(g_cx0, g_cy0, g_cx1 - g_cx0, g_cy1 - g_cy0);
+    if (!g_hold_flip) fb_flip_region(g_cx0, g_cy0, g_cx1 - g_cx0, g_cy1 - g_cy0);
+    // ★ v0.9.0：淡入期间 g_hold_flip=1（只画不提交），由 fade_in_lock64() 统一提交帧
     // 帧耗时证据（前 6 次整屏绘制；QEMU TCG 下的真实性能）
     const uint32_t ms = (uint32_t)((ticks64() - t0) * 1000u / PIT_HZ_64);
     if (g_paint_ms_budget > 0 && (g_cx1 - g_cx0) >= g_fw / 2) {
@@ -847,6 +850,71 @@ static void paint64(int px, int py, int pw, int ph) {
         dbg64_dec((uint64_t)(g_blur_cur * LOCKLOGIN_BLUR_PX / 256));
         dbg64_str("/");
         dbg64_dec((uint64_t)LOCKLOGIN_BLUR_PX);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+}
+
+// ★ v0.9.0：启动动画 -> 锁屏的**淡入**（从黑场里浮出真正的锁屏画面）
+//   需求：启动动画淡出 -> 锁屏界面淡入。上一段（gui64 的 boot_logo_fade_in）末尾已把画面拉黑。
+//   做法：① 先"只画不提交"地把锁屏画进后备缓冲（paint64 受 g_hold_flip 控制）；
+//        ② 快照一份；③ 整屏拉黑提交（冷场）；④ 按 4x4 Bayer 有序抖动分 16 步
+//        把快照逐像素"揭示"出来（每个像素全程只写一次，总搬运量 = 1 个全屏）。
+//   为什么不用"每帧按亮度乘"：那要每帧读+乘+写整屏（1.0M px），TCG 下一帧就几百 ms。
+//   证据：[BOOT64] fade in steps=16 target_ms=… ms=… pattern=bayer-4x4
+static const uint8_t kBootBayer4[16] = { 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
+static void fade_in_lock64(int ms) {
+    int w = 0, h = 0;
+    uint32_t* px = fb_surface64(&w, &h);
+    if (!px || w <= 0 || h <= 0) return;
+    const uint64_t npx = (uint64_t)w * (uint64_t)h;
+    uint32_t* snap = (uint32_t*)kmalloc_64(npx * 4u);
+    if (!snap) { fb_flip(); return; }        // 分配不到：直接显示（如实不假装有淡入）
+    for (uint64_t i = 0; i < npx; i++) snap[i] = px[i];
+    for (uint64_t i = 0; i < npx; i++) px[i] = 0xFF000000u;
+    fb_flip();                                // 冷场（全黑）
+    const uint32_t t0 = ticks64();
+    const int steps = 16;                     // 正好对应 4x4 Bayer 的 16 级
+    for (int k = 1; k <= steps; k++) {
+        panic64_watchdog_kick64();
+        int rowmask[4];
+        for (int r = 0; r < 4; r++) {
+            int m = 0;
+            for (int j = 0; j < 4; j++) if (kBootBayer4[r * 4 + j] == (k - 1)) m |= (1 << j);
+            rowmask[r] = m;
+        }
+        for (int y = 0; y < h; y++) {
+            const int m = rowmask[y & 3];
+            if (!m) continue;
+            uint32_t* row = px + (uint64_t)y * w;
+            const uint32_t* srow = snap + (uint64_t)y * w;
+            for (int x = 0; x < w; x += 4) {
+                if (m & 1) row[x] = srow[x];
+                if ((m & 2) && x + 1 < w) row[x + 1] = srow[x + 1];
+                if ((m & 4) && x + 2 < w) row[x + 2] = srow[x + 2];
+                if ((m & 8) && x + 3 < w) row[x + 3] = srow[x + 3];
+            }
+        }
+        fb_flip();
+        const uint32_t want = (uint32_t)ms * (uint32_t)k / (uint32_t)steps;
+        for (;;) {                            // 摊到 ms 上（落后就不等）
+            const uint32_t el = (uint32_t)((uint64_t)(ticks64() - t0) * 1000u / PIT_HZ_64);
+            if (el >= want) break;
+            panic64_watchdog_kick64();
+            __asm__ volatile("pause");
+        }
+    }
+    kfree_64(snap);
+    const uint32_t dt = (uint32_t)((uint64_t)(ticks64() - t0) * 1000u / PIT_HZ_64);
+    if (lk_log_ok64(LK_LOG_LOCK)) {
+        dbg64_line_begin64();
+        dbg64_str("[BOOT64] fade in steps=");
+        dbg64_dec((uint64_t)steps);
+        dbg64_str(" target_ms=");
+        dbg64_dec((uint64_t)ms);
+        dbg64_str(" ms=");
+        dbg64_dec((uint64_t)dt);
+        dbg64_str(" pattern=bayer-4x4 (lock screen revealed from black after the boot animation)");
         dbg64_nl();
         dbg64_line_end64();
     }
@@ -1397,7 +1465,12 @@ void locklogin64_run64() {
     g_prev_cur_x = g_cur_x; g_prev_cur_y = g_cur_y;
     g_state = LOCKLOGIN_STATE_LOCK;
     enter_lock64("boot");
-    paint_full64();                  // 先把锁屏画出来（清晰背景 + 大号时间）
+    // ★ v0.9.0：启动动画淡出 -> 锁屏淡入。先把锁屏**画进后备缓冲但不提交**（g_hold_flip），
+    //   再交给 fade_in_lock64() 从黑场逐像素揭示（见该函数上面的说明与 [BOOT64] fade in 打点）。
+    g_hold_flip = 1;
+    paint_full64();                  // 画进后备缓冲（清晰背景 + 大号时间），此刻不提交
+    g_hold_flip = 0;
+    fade_in_lock64(480);
     // 20px 背景模糊**算一次**缓存起来（QEMU TCG 下要几百 ms）——放在首帧之后，
     // 锁屏先可见；登录时（清晰->模糊）直接用缓存，动画才跑得动。
     ensure_blur64();

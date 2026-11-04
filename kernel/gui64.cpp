@@ -949,56 +949,140 @@ static void boot_logo_draw64(int a_scale, int* rx, int* ry, int* rw, int* rh) {
     font_select(face_save);
     *rx = fx - 8; *ry = fy - 8; *rw = s + 16; *rh = s + 16 + font_line_height() + 8;
 }
-// ==================== 开机 logo（目标时长 1.2s：淡入 300ms + 停留 600ms + 淡出 300ms）====================
-// 桌面首帧之前跑：黑底 + 屏幕居中 logo（240x150 RGBA）。**P7a-6：目标时长**（用户反馈"出现 1 秒就进系统"）
-//   = 淡入 300ms + 停留 600ms + 淡出 300ms = 总 1200ms；~60Hz，每帧只提交 logo 那一块小矩形。
-//   任意键可跳过（与开机滚屏 con64 的"任意键"同语义；跳过后丢掉这一次输入）。
-//   顺序确认：开机滚屏（[CON64]）-> 本动画（[UI] boot logo show）-> 锁屏（[LOCK64] lock screen shown）。
-// ★ 本批（资源外置）：图不再内嵌 —— 从系统卷 /etc/logo.bin 读（见 logo_asset_rgba64）；读不到就用
-//   内置的 kaisi 图标 + 一行 "VimtuOS" 兜底（boot_logo_draw64），[UI] boot logo show 行里如实标出 src=。
+// ==================== ★ v0.9.0：开机动画（Windows 11 风格：居中 logo + 环形点阵转圈，3~5 秒）====================
+// 需求（用户原文）：启动日志自动滚动（**真日志**，kernel/console64.cpp 回放）-> 启动动画（Win11 风格、
+//   logo 是我们的、3~5 秒）-> 淡出淡入过渡 -> 锁屏。本函数是第二段：
+//   * 黑底 + 屏幕居中 logo（来源顺序不变：卷里 /etc/logo.bin -> 内置 kaisi 图标 + 一行 "VimtuOS"）；
+//   * logo 下方 12 个点排成环形、整环匀速转（约 1.2s 一圈），头部最亮、尾部渐暗 —— Win11 观感；
+//   * 时长按 **elapsed_ms** 推进（不是帧数）：TCG 下帧率不稳也不会跑出 3~5 秒；实测值打在 elapsed_ms=，
+//     不是声称；
+//   * 末尾 300ms 把画面淡到全黑 = "启动动画淡出"；紧跟的"锁屏淡入"在 kernel/locklogin64.cpp 的
+//     fade_in_lock64()（先只画不提交、快照，再用 4x4 Bayer 抖动把真正的锁屏画面逐像素揭示出来）；
+//   * 任意键跳过（与开机滚屏同语义；跳过后 kbd_drain() 吞掉这次输入，别漏给桌面）。
+// 打点（前缀原样保留，新字段追加在行尾）：
+//   [BOOT64] anim start target_ms=4000 fin_ms=300 hold_ms=3400 fout_ms=300 dots=12 rev_ms=1200 src=…
+//   [UI] boot logo show frames=N fade=ok src=… fadein_ms=… hold_ms=… fadeout_ms=… target_ms=… drawn=N
+//        elapsed_ms=N skipped=K style=win11-dots dots=12 dot_r=4 rev_ms=1200
+//   [BOOT64] anim done frames=N elapsed_ms=N skipped=K
+
+// 整数 sin/cos（度 -> -1024..1024）：Bhaskara 近似，误差 < 0.2%，内核里不引 libm。
+//   sin(d°) ≈ 4d(180-d) / (40500 - d(180-d))，0 <= d <= 180
+static int boot_sin1024_64(int deg) {
+    deg %= 360;
+    if (deg < 0) deg += 360;
+    int sign = 1;
+    if (deg > 180) { deg -= 180; sign = -1; }
+    const int v = 4 * deg * (180 - deg);
+    const int d = 40500 - deg * (180 - deg);
+    const int r = (v * 1024 + d / 2) / d;
+    return sign * r;
+}
+static int boot_cos1024_64(int deg) { return boot_sin1024_64(deg + 90); }
+
 static void boot_logo_fade_in(void) {
-    const int fin_ms = 300, hold_ms = 600, fout_ms = 300;   // P7a-6 目标：总 1200ms
-    const int n_in   = fin_ms  * 60 / 1000;                 // 18 帧
-    const int n_hold = hold_ms * 60 / 1000;                 // 36 帧
-    const int n_out  = fout_ms * 60 / 1000;                 // 18 帧
-    const int frames = n_in + n_hold + n_out;               // 72 帧 @60Hz
+    const int fin_ms = 300, hold_ms = 3400, fout_ms = 300;     // 总 4000ms（需求 3~5s）
+    const int total_ms = fin_ms + hold_ms + fout_ms;
+    const int DOTS = 12, REV_MS = 1200, DOT_R = 4, RING_R = 22;
     fb_clear(rgb(0, 0, 0));
     fb_flip();
+    const int cx = g_screen_w / 2, cy = g_screen_h / 2;
+    // 两个"每帧要重画的框"：logo 框（含兜底文字）与转圈框；只清这两块 + 提交它们的并集。
+    const int lbx = cx - 140, lby = cy - 110, lbw = 280, lbh = 200;
+    const int scx = cx, scy = cy + 92;
+    const int sbx = scx - RING_R - DOT_R - 2, sby = scy - RING_R - DOT_R - 2;
+    const int sbw = 2 * (RING_R + DOT_R + 2), sbh = sbw;
+    const int ux = (lbx < sbx) ? lbx : sbx;
+    const int uy = (lby < sby) ? lby : sby;
+    const int ux1 = ((lbx + lbw) > (sbx + sbw)) ? (lbx + lbw) : (sbx + sbw);
+    const int uy1 = ((lby + lbh) > (sby + sbh)) ? (lby + lbh) : (sby + sbh);
+
     const uint32_t k0 = kbd_events64();                     // 任意键跳过：只看**新的**按键
+    dbg64_line_begin64();
+    dbg64_str("[BOOT64] anim start target_ms=");
+    dbg64_dec((uint64_t)total_ms);
+    dbg64_str(" fin_ms=");  dbg64_dec((uint64_t)fin_ms);
+    dbg64_str(" hold_ms="); dbg64_dec((uint64_t)hold_ms);
+    dbg64_str(" fout_ms="); dbg64_dec((uint64_t)fout_ms);
+    dbg64_str(" dots=");    dbg64_dec((uint64_t)DOTS);
+    dbg64_str(" rev_ms=");  dbg64_dec((uint64_t)REV_MS);
+    dbg64_str(" src=");     dbg64_str(g_logo_src_desc);
+    dbg64_str(" (log 回放 -> 本动画 -> 淡出 -> 锁屏淡入)");
+    dbg64_nl();
+    dbg64_line_end64();
+
     const uint32_t t0 = ticks64();
     uint32_t next = t0;
-    int drawn = 0, skipped = 0;
-    for (int f = 1; f <= frames; f++) {
-        int guard = 0;   // 护栏：万一 PIT 停摆也不至于死在等待里
-        while ((int32_t)(ticks64() - next) < 0 && ++guard < 2000000) __asm__ volatile("pause");
-        next += PIT_HZ_64 / 60;
+    int frames = 0, drawn = 0, skipped = 0;
+    for (;;) {
+        const uint32_t now = ticks64();
+        const uint32_t el_ms = (uint32_t)((uint64_t)(now - t0) * 1000u / PIT_HZ_64);
+        if ((int)el_ms >= total_ms) break;
+        if ((int32_t)(now - next) < 0) { __asm__ volatile("pause"); continue; }
+        next += PIT_HZ_64 / 60;                             // 60Hz 节拍（落后就丢帧，不补）
+        panic64_watchdog_kick64();
         if (kbd_events64() != k0) { skipped = 1; break; }   // 任意键 -> 立即结束动画
         int a;
-        if (f <= n_in)                    a = (f * 255) / n_in;                    // 淡入
-        else if (f <= n_in + n_hold)      a = 255;                                 // 停留
-        else                              a = ((frames - f + 1) * 255) / n_out;   // 淡出
+        if ((int)el_ms < fin_ms)                     a = (int)(el_ms * 255u / (uint32_t)fin_ms);
+        else if ((int)el_ms < fin_ms + hold_ms)      a = 255;
+        else a = (int)((uint32_t)(total_ms - (int)el_ms) * 255u / (uint32_t)fout_ms);
         if (a > 255) a = 255;
         if (a < 0) a = 0;
-        int rx = 0, ry = 0, rw = 0, rh = 0;
-        boot_logo_draw64(a, &rx, &ry, &rw, &rh);
-        fb_flip_region(rx, ry, rw, rh);          // 只提交 logo 那块（区域由 boot_logo_draw64 回填）
+        // 1) 清两块（黑底）
+        fb_fill_rect(lbx, lby, lbw, lbh, rgb(0, 0, 0));
+        fb_fill_rect(sbx, sby, sbw, sbh, rgb(0, 0, 0));
+        // 2) logo（alpha = a；来源与兜底都在 boot_logo_draw64 里）
+        {
+            int rx = 0, ry = 0, rw = 0, rh = 0;
+            boot_logo_draw64(a, &rx, &ry, &rw, &rh);
+        }
+        // 3) 环形点阵：整环匀速转，头部最亮、尾部渐暗
+        const int rot = (int)((el_ms * 360u) / (uint32_t)REV_MS) % 360;
+        for (int i = 0; i < DOTS; i++) {
+            const int ang = (rot + i * (360 / DOTS)) % 360;
+            const int px = scx + (RING_R * boot_cos1024_64(ang)) / 1024;
+            const int py = scy + (RING_R * boot_sin1024_64(ang)) / 1024;
+            const int da = a * (255 - i * 18) / 255;         // i = 0 是头部（最亮）
+            if (da <= 0) continue;
+            gfx64_fill_round64(px - DOT_R, py - DOT_R, DOT_R * 2, DOT_R * 2, DOT_R,
+                               rgb(232, 238, 248), da);
+        }
+        fb_flip_region(ux, uy, ux1 - ux, uy1 - uy);          // 只提交这两块
+        frames++;
         drawn++;
     }
-    const uint32_t elapsed_ms = (uint32_t)((ticks64() - t0) * 1000u / PIT_HZ_64);
-    if (skipped) kbd_drain();                    // 与滚屏一致：跳过后丢掉这一次输入（别漏给桌面）
+    const uint32_t elapsed_ms = (uint32_t)((uint64_t)(ticks64() - t0) * 1000u / PIT_HZ_64);
+    if (skipped) {
+        kbd_drain();                    // 与滚屏一致：跳过后丢掉这一次输入（别漏给桌面）
+        fb_clear(rgb(0, 0, 0));
+        fb_flip();                      // 跳过也要落到黑场，交给后面的锁屏淡入
+    }
+    dbg64_line_begin64();
     dbg64_str("[UI] boot logo show frames=");
     dbg64_dec((uint64_t)frames);
     dbg64_str(" fade=ok src=");
     dbg64_str(g_logo_src_desc);
-    dbg64_str(" fadein_ms="); dbg64_dec((uint64_t)fin_ms);
-    dbg64_str(" hold_ms=");   dbg64_dec((uint64_t)hold_ms);
+    dbg64_str(" fadein_ms=");  dbg64_dec((uint64_t)fin_ms);
+    dbg64_str(" hold_ms=");    dbg64_dec((uint64_t)hold_ms);
     dbg64_str(" fadeout_ms="); dbg64_dec((uint64_t)fout_ms);
-    dbg64_str(" target_ms="); dbg64_dec((uint64_t)(fin_ms + hold_ms + fout_ms));
-    dbg64_str(" drawn=");     dbg64_dec((uint64_t)drawn);
+    dbg64_str(" target_ms=");  dbg64_dec((uint64_t)total_ms);
+    dbg64_str(" drawn=");      dbg64_dec((uint64_t)drawn);
     dbg64_str(" elapsed_ms="); dbg64_dec((uint64_t)elapsed_ms);
-    dbg64_str(" skipped=");   dbg64_dec((uint64_t)skipped);
+    dbg64_str(" skipped=");    dbg64_dec((uint64_t)skipped);
+    dbg64_str(" style=win11-dots dots="); dbg64_dec((uint64_t)DOTS);
+    dbg64_str(" dot_r=");      dbg64_dec((uint64_t)DOT_R);
+    dbg64_str(" rev_ms=");     dbg64_dec((uint64_t)REV_MS);
     dbg64_nl();
-    if (skipped) dbg64_str("[UI] boot logo skipped key=1 (any key ends the boot animation)\n");
+    dbg64_line_end64();
+    dbg64_line_begin64();
+    dbg64_str("[BOOT64] anim done frames=");
+    dbg64_dec((uint64_t)frames);
+    dbg64_str(" elapsed_ms=");
+    dbg64_dec((uint64_t)elapsed_ms);
+    dbg64_str(" skipped=");
+    dbg64_dec((uint64_t)skipped);
+    dbg64_nl();
+    dbg64_line_end64();
+    if (skipped) dbg64_str("[BOOT64] anim skipped key=1 (any key ends the boot animation)\n");
 }
 
 // ★ 本批（资源外置）：**这里原来有 icon_src(kind)** —— 它直接返回内核内嵌的 3 张 128x128 RGBA 位图

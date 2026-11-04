@@ -192,12 +192,26 @@ def _cur_and_count(log):
     return (int(m.group(1)), int(m.group(2))), log.count("[UI] perf")
 
 
-def goto_exact(mon, cur, log_fn, x, y, passes=2, tol=8):
+def _wait_perf_lines(log_fn, n0, want=2, timeout=8.0):
+    """等客户机再打出 want 条 [UI] perf 行（每行 1s 一条；串口 -serial file: 另有 1~3s 落盘延迟）。"""
+    t0 = time.time()
+    goal = n0 + want
+    while time.time() - t0 < timeout:
+        if log_fn().count("[UI] perf") >= goal:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def goto_exact(mon, cur, log_fn, x, y, passes=3, tol=8):
     """把光标送到 (x,y)，**确认到位**再返回（判据 = 客户机自报的 cur=X,Y）。
 
-    为什么要闭环：Cursor 只按相对位移跟踪，客户机裁边/丢包会累积偏移（本次实测偏 57px，
+    为什么要闭环：Cursor 只按相对位移跟踪，客户机裁边/丢包会累积偏移（实测偏 57px，
     点击落到 Dock 的"我的电脑"而不是开始按钮）。
     为什么要等**新的** perf 行：串口 -serial file: 有 1~3s 落盘延迟，拿旧样本反馈会越走越偏。
+    为什么每次要等**两条**：客户机鼠标位移有累加器（kernel/input.cpp 的 MOUSE_ACC_MAX=96px），
+    最后一包发完它还会继续滑最多 96px。只等一条 perf 行会在"还在滑"时读数 —— 实测目标 805
+    却落到 895，把点电源按钮点成了"点菜单外面"。等两条（≈2s）后累加器已排空，再校正才准。
     """
     for _ in range(passes):
         pos, n0 = _cur_and_count(log_fn())
@@ -207,11 +221,7 @@ def goto_exact(mon, cur, log_fn, x, y, passes=2, tol=8):
                 return True
         cur.goto(mon, x, y)
         cur.settle(mon)
-        t0 = time.time()
-        while time.time() - t0 < 5.0:            # 等客户机打出一条**新的** perf 行
-            if log_fn().count("[UI] perf") > n0:
-                break
-            time.sleep(0.25)
+        _wait_perf_lines(log_fn, n0, 2)
     pos, _ = _cur_and_count(log_fn())
     if pos is not None:
         cur.x, cur.y = pos
