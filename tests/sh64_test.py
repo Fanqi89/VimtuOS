@@ -53,7 +53,11 @@ PART_MAIN_LBA = 8009               # = kernel/part64.h 的主分区起点
 TARGET_SECTORS = 32768             # 16 MB
 SECTOR = 512
 
-SHELL_PATH = "/bin/shell.bin"
+# ★ v0.9.5：这个常量用于**宿主侧卷内路径核对**（tools/make_shellvol.py 的 verify），必须写**卷里真实的路径**。
+#   v0.6.0 把根目录重排成 /usr/bin 之后，make_shellvol.build_volume() 只建 /usr/bin/shell.bin（不再建 /bin）；
+#   内核那侧打点仍然是 `[SH64] launch path=/bin/shell.bin`（宏 SH64_PATH64 没改，靠 vfs64 的路径别名
+#   "/bin/" -> "/usr/bin/" 新路径优先、失败回退原路径命中）—— 两件事别混：**卷里的路径** vs **内核请求的路径**。
+SHELL_PATH = "/usr/bin/shell.bin"
 HELLO_TXT = "/etc/sh64hello.txt"
 HELLO_BYTES = b"VimtuOS A4-1 ring3 shell: /etc/sh64hello.txt byte test\n"
 

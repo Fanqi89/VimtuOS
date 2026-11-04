@@ -384,34 +384,55 @@ def _read_file(vol, rec, total):
     return bytes(data[:size])
 
 
+def _verify_one(vol, path, want, total, inodes):
+    """按**卷里的字面路径**走一遍：逐级找名字，最后逐字节比对。返回 None = 通过。"""
+    parts = [p for p in path.split("/") if p]
+    cur = 0
+    for k, part in enumerate(parts):
+        hit = None
+        for i, nm, rec in _entries(vol, cur, inodes):
+            if nm == part:
+                hit = (i, rec)
+                break
+        if not hit:
+            return "卷里找不到 /" + "/".join(parts[:k + 1])
+        ino, rec = hit
+        if k == len(parts) - 1:
+            got = _read_file(vol, rec, total)
+            if got != want:
+                return "%s 读回的字节不一致（%d vs %d B）" % (path, len(got), len(want))
+        else:
+            if rec[0] != 2:
+                return "/%s 不是目录" % "/".join(parts[:k + 1])
+            cur = ino
+    return None
+
+
 def verify(vol, expect_files):
-    """expect_files: {路径: 字节}；逐级走名字，最后逐字节比对。"""
+    """expect_files: {路径: 字节}；逐级走名字，最后逐字节比对。
+
+    ★ v0.9.5（真缺陷修复，不是放宽断言）：路径解析按**内核同一套规则**——先试新落点
+      （alias_vol_path），找不到再**回退旧路径**。kernel/vfs64.cpp 的 kPathAlias 注释原文：
+      "新路径优先，失败回退原路径：夹具卷（自建、没有 /usr/bin）继续按旧布局工作"。
+      先前这里只做映射、不回退，于是"卷里只有 /bin/…"的自建夹具被误报成
+      `卷里找不到 /usr` —— 实测 lua64/make64/tcc64/tar64 四个脚本在**夹具阶段**就整体失败
+      （一条真正的被测能力都没跑到）。字节比对强度没变：两个落点都要求逐字节一致。
+    """
     if vol[0:8] != b"VIMTUFS2":
         return "超级块 magic 不对"
     total = struct.unpack_from("<I", vol, 20)[0]
     inodes = struct.unpack_from("<I", vol, 40)[0]
     for path, want in expect_files.items():
-        # ★ v0.6.0：校验路径也走落点映射（调用方仍写旧路径 /bin/…，卷里已经在新位置）
-        path = alias_vol_path(path)
-        parts = [p for p in path.split("/") if p]
-        cur = 0
-        for k, part in enumerate(parts):
-            hit = None
-            for i, nm, rec in _entries(vol, cur, inodes):
-                if nm == part:
-                    hit = (i, rec)
-                    break
-            if not hit:
-                return "卷里找不到 /" + "/".join(parts[:k + 1])
-            ino, rec = hit
-            if k == len(parts) - 1:
-                got = _read_file(vol, rec, total)
-                if got != want:
-                    return "%s 读回的字节不一致（%d vs %d B）" % (path, len(got), len(want))
-            else:
-                if rec[0] != 2:
-                    return "/%s 不是目录" % "/".join(parts[:k + 1])
-                cur = ino
+        newp = alias_vol_path(path)
+        err = _verify_one(vol, newp, want, total, inodes)
+        if err is None:
+            continue
+        if newp != path:                                  # 新落点没有 -> 回退旧路径（与内核一致）
+            err2 = _verify_one(vol, path, want, total, inodes)
+            if err2 is None:
+                continue
+            return err2
+        return err
     return None
 
 

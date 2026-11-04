@@ -175,19 +175,31 @@ def read_guest_file(img_path, parts):
         return None
     total = struct.unpack_from("<I", vol, 20)[0]
     inodes = struct.unpack_from("<I", vol, 40)[0]
-    cur = 0
-    rec = None
-    for part in parts:
-        hit = None
-        for i, nm, r in TP._entries(vol, cur, inodes):
-            if nm == part:
-                hit = (i, r)
-                break
-        if not hit:
-            return None
-        _, rec = hit
-        cur = hit[0]
-    return TP._read_file(vol, rec, total)
+    # ★ v0.9.5：按**内核的同一套规则**找文件 —— 先试新落点（tools/tcc_pack_win.py 的 alias_vol_path：
+    #   /bin/ -> /usr/bin/、/lib/ -> /usr/lib/、/tcc/ -> /usr/lib/tcc/ …），找不到再回退到调用方
+    #   写的**旧路径**。kernel/vfs64.cpp 的 kPathAlias 就是这么标的："新路径优先，失败回退原路径"。
+    #   先前这里只走字面旧路径，而 lua_pack 那一步写的是新落点 -> 实测三条"从夹具盘卷里读回"
+    #   全部读成 0 字节（假红）。
+    def _walk(cand):
+        cur = 0
+        rec = None
+        for part in cand:
+            hit = None
+            for i, nm, r in TP._entries(vol, cur, inodes):
+                if nm == part:
+                    hit = (i, r)
+                    break
+            if not hit:
+                return None
+            _, rec = hit
+            cur = hit[0]
+        return TP._read_file(vol, rec, total)
+
+    new_parts = [p for p in TP.alias_vol_path("/" + "/".join(parts)).split("/") if p]
+    got = _walk(new_parts)
+    if got is None and new_parts != parts:
+        got = _walk(parts)
+    return got
 
 
 def prepare_fixture():

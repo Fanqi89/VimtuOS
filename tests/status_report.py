@@ -1653,7 +1653,7 @@ def cap_users_login():
           "锁屏打点：命中 %d；登录界面/模糊动画打点：命中 %d" % (lk, lg),
           "用户库/口令打点：命中 %d；加盐哈希（sha256/salt）：命中 %d" % (us, hk),
           "终端命令（useradd/passwd/whoami/sudo/loginctl 等）：命中 %d" % cmd,
-          "验收脚本 tests/locklogin64_test.py：%s（88 条断言：锁屏字号 72/18px、背景清晰 vs 登录后模糊 20px、"
+          "验收脚本 tests/locklogin64_test.py：%s（104 条断言：锁屏字号 72/18px、背景清晰 vs 登录后模糊 20px、"
           "密码框 360x48 + 确认 48x48、ESC 反向动画 20→0、软重启后仍锁屏、两用户桌面互不可见、su/sudo/exit）"
           % ("有" if tst else "★ 缺"),
           "实测串口：\"[LOCK64] lock screen shown … blur_bg=0 why=boot\"、\"[LOGIN64] login ok user=vimtu uid=1000 via=click\"、"
@@ -3456,7 +3456,7 @@ TESTS = [
                           "删除两段确认（非空目录如实被拒）+ 新建文件夹 + 框选/Ctrl+A 多选 + 工具栏按钮 + "
                           "跨卷 C:→D: 粘贴（宿主侧解析 D: 卷字节）+ 属性面板 + 错误路径（95 条断言）"),
     ("locklogin64_test.py", "★ P1c 锁屏/登录/多用户：时间 72px/年月日 18px、背景清晰→登录后模糊 20px(250-350ms)、"
-                            "头像与密码框/确认按钮像素、ESC 返回、重启仍锁屏、两用户桌面隔离、su/sudo/exit（88 条断言）"),
+                            "头像与密码框/确认按钮像素、ESC 返回、重启仍锁屏、两用户桌面隔离、su/sudo/exit + ★ v0.9.5 两段过渡的专用断言（104 条断言）"),
     ("startmenu64_test.py", "★ P2 开始菜单：居中/离 Dock 11px/上圆角 24 下 10/搜索启动/2×4 固定网格/状态区线性图标/电源菜单/ESC 两级退出（58 条断言）"),
     ("panels64_test.py", "★ P2 四弹窗：通知(角标/空态)+声音(滑块百分比/输出源/如实未接驱动)+网络(WiFi 如实空态+以太网区固定)+日历(7×6/滚轮·方向键·PageUp/PageDown/今天/年份面板)+设备 toast 滑入滑出（78 条断言）"),
     ("perm64_test.py", "★ P4 权限：卷 v4(uid/gid/mode)+owner/group/other rwx 真拦截(root 绕过)+su/sudo 真提权+chmod/chown/umask+ls -l（95 条断言，含 v3 旧卷兼容）"),

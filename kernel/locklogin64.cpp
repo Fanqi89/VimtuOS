@@ -544,7 +544,11 @@ static void trans_lock_to_login64(void) {
     g_bg_zoom256 = 269;                              // 登录状态：背景钉在 1.05（第二段从这里往回缩）
     const int wall_ms = trans64_dt_ms(&tr);
     const int all_ms = (int)((uint64_t)(ticks64() - t_all) * 1000u / (uint64_t)PIT_HZ_64);
-    if (lk_log_ok64(LK_LOG_ANIM)) {
+    // ★ v0.9.5：这一行是**一次性汇总**（每次 锁屏->登录 只打一条），原先挂在 lk_log_ok64(LK_LOG_ANIM) 的
+    //   每类上限（48 条）下 —— 而 LK_LOG_ANIM 同时被 60ms 一次的 `[LOGIN64] blur anim` 采样消耗，
+    //   于是"第二段过渡/第二次启动起"这一行就被预算吃光、静默消失，验收脚本 grep 不到 -> 断言假红。
+    //   汇总行不该受"防刷屏上限"管：它本来就是有界的（一次过渡一条）。采样那一条仍然受上限管（见上面）。
+    {
         dbg64_line_begin64();
         dbg64_str("[LOGIN64] trans seg=lock2login target_ms=");
         dbg64_dec((uint64_t)LOCKLOGIN_ANIM_MS);

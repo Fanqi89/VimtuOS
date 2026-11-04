@@ -431,6 +431,44 @@ def main():
                   log is not None,
                   (re.search(r"\[LOGIN64\] login ok[^\r\n]*", vm.log()) or re.search(r"$^", vm.log())).group(0))
             check("桌面出现（[GUI64] ready 在 login ok 之后）", vm.wait("[GUI64] ready", 30) is not None)
+            # ---- ★ v0.9.5：两段过渡的**专用断言**（v0.9.3 当批没进测试，因为 [LOGIN64] trans 汇总行被
+            #      lk_log_ok64(LK_LOG_ANIM) 的每类上限吃光 -> grep 不到 -> 断言假红。v0.9.5 已把那一行
+            #      从"防刷屏上限"里摘出来（一次性汇总本来就有界），所以这里可以真的钉住它。）----
+            m_t1 = re.search(r"\[LOGIN64\] trans seg=lock2login target_ms=(\d+) wall_ms=(\d+) guest_ms=(\d+) "
+                             r"rps=(\d+) frames=(\d+) zoom=(\d+)\.\.(\d+) box=(\d+)\.\.(\d+) snap=(\d) "
+                             r"flip=full1x", vm.log())
+            check("★ 锁屏->登录 的过渡汇总行真的打出来了（[LOGIN64] trans seg=lock2login）",
+                  m_t1 is not None,
+                  (re.search(r"\[LOGIN64\] trans[^\r\n]*", vm.log()) or re.search(r"$^", vm.log())).group(0))
+            if m_t1:
+                tgt, wall, fr, zv0, zv1, bx0, bx1, snap = (int(m_t1.group(i)) for i in (1, 2, 5, 6, 7, 8, 9, 10))
+                check("★ 第一段目标 300ms / 真跑了帧 / 墙钟有界（target_ms=300，1 <= frames 且 0 < wall_ms < 5000）",
+                      tgt == 300 and fr >= 1 and 0 < wall < 5000,
+                      "target_ms=%d wall_ms=%d frames=%d（TCG 下会超目标，如实记录不放松）" % (tgt, wall, fr))
+                check("★ 第一段的几何真的在动（zoom %d..%d / box %d..%d，snap=%d）" % (zv0, zv1, bx0, bx1, snap),
+                      (zv0, zv1, bx0, bx1) == (100, 105, 95, 100) and snap == 1,
+                      "zoom=%d..%d box=%d..%d snap=%d" % (zv0, zv1, bx0, bx1, snap))
+            m_t2 = re.search(r"\[GUI64\] trans seg=login2desk target_ms=(\d+) wall_ms=(\d+) rps=(\d+) frames=(\d+) "
+                             r"layers=desk\(zoom (\d+)\.\.(\d+) alpha (\d+)\.\.(\d+)\)"
+                             r"\+chrome\(delay_ms=(\d+) up_px=(\d+)\)"
+                             r"\+login\(fade_ms=(\d+) up_px=(\d+)\) login_layer=(\d) flip=full1x", vm.log())
+            check("★ 登录->桌面 的过渡汇总行真的打出来了（[GUI64] trans seg=login2desk）",
+                  m_t2 is not None,
+                  (re.search(r"\[GUI64\] trans[^\r\n]*", vm.log()) or re.search(r"$^", vm.log())).group(0))
+            if m_t2:
+                g = [int(m_t2.group(i)) for i in range(1, 14)]
+                check("★ 第二段目标 400ms / 真跑了帧 / 墙钟有界（target_ms=400，1 <= frames 且 0 < wall_ms < 5000）",
+                      g[0] == 400 and g[3] >= 1 and 0 < g[1] < 5000,
+                      "target_ms=%d wall_ms=%d frames=%d" % (g[0], g[1], g[3]))
+                check("★ 第二段三层参数与实现一致（desk 105..100 alpha 0..256 / chrome 100ms+18px / login 200ms+24px / 登录层在场）",
+                      g[4:12] == [105, 100, 0, 256, 100, 18, 200, 24] and g[12] == 1,
+                      "desk=%d..%d alpha=%d..%d chrome=%d/%d login=%d/%d login_layer=%d"
+                      % (g[4], g[5], g[6], g[7], g[8], g[9], g[10], g[11], g[12]))
+            if m_t1 and m_t2:
+                check("★ 两段的先后顺序正确（lock2login 在 login2desk 之前）",
+                      vm.log().find("[LOGIN64] trans seg=lock2login") < vm.log().find("[GUI64] trans seg=login2desk"),
+                      "lock2login@%d login2desk@%d"
+                      % (vm.log().find("[LOGIN64] trans seg=lock2login"), vm.log().find("[GUI64] trans seg=login2desk")))
             check("GUI 身份写入用户表（[USER64] login ok name=vimtu ... gui=vimtu euid=1000）",
                   bool(log) and bool(re.search(r"\[USER64\] login ok name=vimtu uid=1000 home=/home/vimtu "
                                                r"desktop=/home/vimtu/Desktop gui=vimtu euid=1000", log)))

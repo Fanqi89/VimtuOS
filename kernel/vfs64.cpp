@@ -3999,6 +3999,14 @@ int vfs64_selftest64() {
             dbg64_str(rok ? "IN|OUT ok" : "FAIL");
             dbg64_str(" badfd=NVAL pipe=");
             dbg64_str(pok ? "IN/OUT/HUP ok" : (prfd < 0 ? "no-slot" : "FAIL"));
+            dbg64_nl();
+            dbg64_line_end64();
+            // ★ v0.9.5 真缺陷（tests/sh64_test.py 的"日志切原样自检"抓到的）：上面这条 [VFS64] 行原本
+            //   **没有先收行**就往下跑 epoll 自检，而 fd64_epoll_create64()/sock64_selftest64() 自己也会打
+            //   `[FD64] epoll create …` / `[SOCK64] …` —— 行锁仍是外层那一层（begin 嵌套只加深度、不发换行），
+            //   于是那两行被**并进这一条**里。串口实测长这样：
+            //     `[VFS64] poll-ready: file=IN|OUT ok badfd=NVAL pipe=IN/OUT/HUP ok[FD64] epoll create ep=1000`
+            //   修法：先在 pipe 字段后收行，下面每个自检各打各的行，最后再来一条汇总行（epoll=/sock=/file=）。
             // ★ v0.7.3：epoll —— 建实例 -> 注册 pipe 读端 -> 写 1 字节 -> wait 必须得到 1 条 EPOLLIN + data
             bool eok = true;
             const int ep = fd64_epoll_create64();
@@ -4020,12 +4028,18 @@ int vfs64_selftest64() {
             if (ewfd >= 0) (void)fd64_close64(ewfd);
             if (ep > 0) (void)fd64_epoll_close64(ep);
             if (!eok) ok = false;
-            dbg64_str(" epoll=");
-            dbg64_str(eok ? "IN+data ok" : "FAIL");
             // ★ v0.7.4（P2 第三批）：socket 层纯逻辑自检（handle / 状态机 / 校验和算法；不发包）
             // ★ v0.7.4：socket 层自检——**弱引用**：安装程序内核不带 sock64（无网络层），缺了就跳过
-            if (sock64_selftest64 && sock64_selftest64() != 0) ok = false;
+            int sok = 1;
+            if (sock64_selftest64 && sock64_selftest64() != 0) { ok = false; sok = 0; }
             if (!rok) ok = false;
+            dbg64_line_begin64();                 // ★ v0.9.5：汇总单独一条（上面两个自检已各打各的行）
+            dbg64_str("[VFS64] poll-ready extra epoll=");
+            dbg64_str(eok ? "IN+data ok" : "FAIL");
+            dbg64_str(" sock=");
+            dbg64_str(sok ? "ok" : "FAIL");
+            dbg64_str(" file=");
+            dbg64_str(rok ? "ok" : "FAIL");
             dbg64_nl();
             dbg64_line_end64();
         }
