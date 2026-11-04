@@ -68,5 +68,9 @@ const char* locklogin64_state_name64();
 int  locklogin64_active64();                // 1 = 锁屏/登录层正在显示（桌面外壳不该画窗口）
 // gui64 主循环的 hook：状态 != DESKTOP 时由本层接管（返回 1 = 本帧已被消费）
 int  locklogin64_tick64();
+// ★ v0.9.3：把"登录层"（登录框那一块：画好 UI 的快照 + 同一区域纯背景的快照）交给 gui64
+//   做第二段过渡（登录层淡出 + 向上平移）。返回 1 = 有快照。
+int locklogin64_layer64(const uint32_t** snap, const uint32_t** bg,
+                        int* x, int* y, int* w, int* h);
 // 纯逻辑自检（几何/动效区间/用户列表过滤；不建窗口、不碰盘）
 int  locklogin64_selftest64();

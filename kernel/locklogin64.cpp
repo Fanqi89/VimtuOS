@@ -10,6 +10,7 @@
 //   4) 头像（内置程序化 3 种 / VimtuFS2 图片）/ 亚克力面板 / 登录按钮 / 密码框
 //   5) 状态机（LOCK -> LOGIN -> DESKTOP）+ 输入 + 每帧 tick
 #include "locklogin64.h"
+#include "trans64.h"      // ★ v0.9.3：统一状态机 + delta_time 时间轴（两段过渡共用）
 #include "userdb64.h"
 #include "theme64.h"
 #include "gfx64.h"
@@ -364,6 +365,203 @@ static inline uint32_t lerp256_64(uint32_t s, uint32_t b, int a) {
     return 0xFF000000u | (((sr * ia + br * au) >> 8) << 16) |
                          (((sg * ia + bg * au) >> 8) << 8) |
                           ((sb * ia + bb * au) >> 8);
+}
+
+// ==================== ★ v0.9.3：锁屏 -> 登录 的过渡（300ms / ease-out / delta_time）====================
+// 用户需求原文（第一段）："在锁屏按任意键触发。用 300 毫秒（ease-out），让背景壁纸从清晰平滑过渡到
+//   模糊，且壁纸从 1.0 轻微放大到 1.05（模拟镜头拉近失焦）；同时登录框从 0.95 放大到 1.0 并淡入。"
+// 底层要求（原文）："① 严禁实时计算模糊：模糊必须预先生成清晰/模糊两张静态纹理，动画期间仅做透明度
+//   交叉混合；② 强制双缓冲同步：所有动画图层在后台缓冲区整帧画完，再 Swap Buffers 一次性提交。"
+// 落地方式（对着上面三条逐一交代）：
+//   * 模糊**不是**实时算的：模糊面在 ensure_blur64() 里一次性生成（g_blur，登录期间复用），
+//     本函数的每一帧只做 sharp/blur 两张静态纹理的 lerp（交叉混合）；
+//   * 每帧把"背景 + 登录框"整帧画进后备缓冲，最后只调**一次** fb_flip()（全屏提交），
+//     动画期间**不**提交任何局部矩形 —— 这就是"杜绝局部撕裂"的做法；
+//   * 时间轴由 trans64.h 的统一状态机驱动（delta_time 来自 RTC 校准的墙钟，不是数帧）。
+static void paint_login64(void);          // 前向声明（本块在它的定义之前）
+static int g_bg_zoom256 = 256;          // 背景采样缩放：256 = 1.00（锁屏）；269 = 1.05（登录）
+static uint32_t* g_lg_snap = nullptr;   // 登录框区域：画好 UI 的快照
+static uint32_t* g_lg_bg = nullptr;     // 同一区域：只有背景（用来做"哪些像素是 UI"的判据）
+static int g_lg_sx, g_lg_sy, g_lg_sw, g_lg_sh;
+
+// 从两张静态壁纸纹理里按 zoom 采样 + 按 a 交叉混合，铺满整屏后备缓冲（2x2 块采样：低频图肉眼无差）
+static void bg_zoom_full64(int zoom256, int a256) {
+    int sw = 0, sh = 0;
+    const uint32_t* sharp = wall_surface64(&sw, &sh);
+    const uint32_t* blur = (g_blur_ok && g_blur) ? g_blur : nullptr;
+    const Theme64Tokens* t = theme64_tokens64();
+    const int W = g_fw, H = g_fh;
+    if (!sharp || sw <= 0 || sh <= 0) {
+        for (uint64_t i = 0; i < (uint64_t)W * H; i++) g_fb[i] = t->desktop_base;
+        return;
+    }
+    int a = a256 < 0 ? 0 : (a256 > 256 ? 256 : a256);
+    if (zoom256 < 200) zoom256 = 200;
+    if (zoom256 > 330) zoom256 = 330;
+    // 端点走精确路径（像素与平时完全一致，验收截图不受影响）
+    if (zoom256 == 256 && sw == W && sh == H && (a <= 0 || !blur) ) {
+        for (int j = 0; j < H; j++) {
+            const uint32_t* src = sharp + (uint64_t)j * sw;
+            uint32_t* dst = g_fb + (uint64_t)j * W;
+            for (int i = 0; i < W; i++) dst[i] = src[i];
+        }
+        return;
+    }
+    if (zoom256 == 256 && sw == W && sh == H && a >= 256 && blur) {
+        for (int j = 0; j < H; j++) {
+            const uint32_t* src = blur + (uint64_t)j * sw;
+            uint32_t* dst = g_fb + (uint64_t)j * W;
+            for (int i = 0; i < W; i++) dst[i] = src[i];
+        }
+        return;
+    }
+    const int blocks = (a > 0 && a < 256) ? 2 : 1;
+    const int hc = H / 2, wc = W / 2;
+    for (int y = 0; y < H; y += blocks) {
+        int sy = (int)(((int64_t)(y - hc) * 256) / zoom256) + hc;
+        if (sy < 0) sy = 0;
+        if (sy >= sh) sy = sh - 1;
+        const uint32_t* srow = sharp + (uint64_t)sy * sw;
+        const uint32_t* brow = blur ? (blur + (uint64_t)sy * sw) : nullptr;
+        for (int x = 0; x < W; x += blocks) {
+            int sx = (int)(((int64_t)(x - wc) * 256) / zoom256) + wc;
+            if (sx < 0) sx = 0;
+            if (sx >= sw) sx = sw - 1;
+            uint32_t c = srow[sx];
+            if (brow && a > 0) c = lerp256_64(c, brow[sx], a);
+            for (int j = 0; j < blocks && y + j < H; j++) {
+                uint32_t* drow = g_fb + (uint64_t)(y + j) * W;
+                for (int i = 0; i < blocks && x + i < W; i++) drow[x + i] = c;
+            }
+        }
+    }
+}
+
+// 把登录框快照按 zoom/alpha/dy 合成上去：**只画 UI 像素**（snap 与 bg 不同的地方），
+//   所以不会出现"一块背景补丁"（背景由 bg_zoom_full64 负责）。
+static void layer_draw64(int dy, int zoom256, int a256) {
+    if (!g_lg_snap || !g_lg_bg || a256 <= 0) return;
+    if (zoom256 < 200) zoom256 = 200;
+    const int dw = g_lg_sw * zoom256 / 256;
+    const int dh = g_lg_sh * zoom256 / 256;
+    const int cx = g_lg_sx + g_lg_sw / 2;
+    const int cy = g_lg_sy + g_lg_sh / 2;
+    const int x0 = cx - dw / 2, y0 = cy - dh / 2 + dy;
+    const int a = a256 > 256 ? 256 : a256;
+    for (int j = 0; j < dh; j++) {
+        const int yy = y0 + j;
+        if (yy < 0 || yy >= g_fh) continue;
+        const int sy = j * 256 / zoom256;
+        if (sy < 0 || sy >= g_lg_sh) continue;
+        const uint32_t* srow = g_lg_snap + (uint64_t)sy * g_lg_sw;
+        const uint32_t* brow = g_lg_bg + (uint64_t)sy * g_lg_sw;
+        uint32_t* drow = g_fb + (uint64_t)yy * g_fw;
+        for (int i = 0; i < dw; i++) {
+            const int xx = x0 + i;
+            if (xx < 0 || xx >= g_fw) continue;
+            const int sx = i * 256 / zoom256;
+            if (sx < 0 || sx >= g_lg_sw) continue;
+            const uint32_t sp = srow[sx];
+            if (sp == brow[sx]) continue;                  // 这个像素就是背景：不画（也不做缩放补丁）
+            drow[xx] = a >= 256 ? sp : lerp256_64(drow[xx], sp, a);
+        }
+    }
+}
+
+// 取登录框区域的两张快照（UI / 纯背景）。返回 1 = 成功
+static int layer_snap_take64(void) {
+    const int bx = g_geo.hole_x, by = g_geo.hole_y;
+    const int bw = g_geo.hole_w, bh = g_geo.hole_h;
+    if (bx < 0 || by < 0 || bw <= 0 || bh <= 0 || bx + bw > g_fw || by + bh > g_fh) return 0;
+    const uint64_t bytes = (uint64_t)bw * (uint64_t)bh * 4u;
+    if (!g_lg_snap) g_lg_snap = (uint32_t*)kmalloc_64(bytes);
+    if (!g_lg_bg)   g_lg_bg   = (uint32_t*)kmalloc_64(bytes);
+    if (!g_lg_snap || !g_lg_bg) return 0;
+    g_lg_sx = bx; g_lg_sy = by; g_lg_sw = bw; g_lg_sh = bh;
+    // ① 只铺背景（模糊 20px + zoom 1.05 = 过渡终点那一帧的背景）
+    bg_zoom_full64(269, 256);
+    for (int j = 0; j < bh; j++)
+        for (int i = 0; i < bw; i++)
+            g_lg_bg[(uint64_t)j * bw + i] = g_fb[(uint64_t)(by + j) * g_fw + (bx + i)];
+    // ② 把登录 UI 画进这一块（裁剪到框内），再快照
+    fb_set_clip(bx, by, bw, bh);
+    paint_login64();
+    fb_reset_clip();
+    for (int j = 0; j < bh; j++)
+        for (int i = 0; i < bw; i++)
+            g_lg_snap[(uint64_t)j * bw + i] = g_fb[(uint64_t)(by + j) * g_fw + (bx + i)];
+    return 1;
+}
+
+// 第一段过渡：锁屏（清晰 1.00）-> 登录（模糊 20px，1.05），登录框 0.95->1.00 淡入。300ms。
+static void trans_lock_to_login64(void) {
+    ensure_blur64();
+    g_blur_cur = 0;
+    g_bg_zoom256 = 256;
+    const uint64_t t_all = ticks64();
+    int snap_ok = layer_snap_take64();
+    Trans64 tr;
+    trans64_begin(&tr, LOCKLOGIN_ANIM_MS);          // 需求 250~350ms（取 300）
+    int last_p = -1, frames = 0, last_log_t = -1;
+    for (;;) {
+        const int p = trans64_p256(&tr);
+        const int done = trans64_done(&tr);
+        if (p != last_p) {
+            g_blur_cur = p;                          // 0..256：sharp -> blur 的交叉混合系数
+            const int zoom = 256 + (13 * p) / 256;   // 1.00 -> 1.05（镜头拉近）
+            bg_zoom_full64(zoom, p);
+            if (snap_ok) {
+                const int box_zoom = 243 + (13 * p) / 256;   // 0.95 -> 1.00
+                layer_draw64(0, box_zoom, p);
+            }
+            fb_flip();                               // ★ 整帧一次提交（不提交局部矩形 -> 不撕裂）
+            frames++;
+            last_p = p;
+            // 沿用 v0.9.0 的采样打点格式（[LOGIN64] blur anim dir=in t=… v=0..20），60ms 一条
+            const int dtms = trans64_dt_ms(&tr);
+            if (lk_log_ok64(LK_LOG_ANIM) && (last_log_t < 0 || dtms - last_log_t >= 60 || done)) {
+                last_log_t = dtms;
+                dbg64_line_begin64();
+                dbg64_str("[LOGIN64] blur anim dir=in t=");
+                dbg64_dec((uint64_t)dtms);
+                dbg64_str(" v=");
+                dbg64_dec((uint64_t)(p * LOCKLOGIN_BLUR_PX / 256));
+                dbg64_str(" p256=");
+                dbg64_dec((uint64_t)p);
+                dbg64_str(" zoom=");
+                dbg64_dec((uint64_t)zoom);
+                dbg64_str(" box=");
+                dbg64_dec((uint64_t)(243 + (13 * p) / 256));
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+        }
+        if (done && p >= 256) break;
+        panic64_watchdog_kick64();
+        __asm__ volatile("pause");
+    }
+    g_blur_cur = 256;
+    g_bg_zoom256 = 269;                              // 登录状态：背景钉在 1.05（第二段从这里往回缩）
+    const int wall_ms = trans64_dt_ms(&tr);
+    const int all_ms = (int)((uint64_t)(ticks64() - t_all) * 1000u / (uint64_t)PIT_HZ_64);
+    if (lk_log_ok64(LK_LOG_ANIM)) {
+        dbg64_line_begin64();
+        dbg64_str("[LOGIN64] trans seg=lock2login target_ms=");
+        dbg64_dec((uint64_t)LOCKLOGIN_ANIM_MS);
+        dbg64_str(" wall_ms=");
+        dbg64_dec((uint64_t)wall_ms);
+        dbg64_str(" guest_ms=");
+        dbg64_dec((uint64_t)all_ms);
+        dbg64_str(" rps=");
+        dbg64_dec((uint64_t)tr.rps);
+        dbg64_str(" frames=");
+        dbg64_dec((uint64_t)frames);
+        dbg64_str(" zoom=100..105 box=95..100 snap=");
+        dbg64_dec((uint64_t)snap_ok);
+        dbg64_str(" flip=full1x (double-buffered; no partial submit)");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
 }
 
 // 画背景矩形（清晰/模糊按 g_blur_cur 插值）
@@ -1095,7 +1293,9 @@ static void enter_login64(const char* why) {
     g_pw[0] = 0;
     g_pw_fail = 0;
     ensure_blur64();
-    anim_start64(g_blur_cur, 256, 1);
+    // ★ v0.9.3：锁屏 -> 登录 改成 300ms 的过渡（背景 清晰->模糊 + 1.00->1.05，登录框 0.95->1.00 淡入）。
+    //   老路径是 anim_start64(...) 由主循环逐帧增量重绘 + 局部提交（会撕裂/看起来像硬切），已由
+    //   trans_lock_to_login64() 取代：整帧画完后**一次** fb_flip()，时长按 delta_time 走墙钟。
     g_overlay_valid = 0;                     // 界面换了（锁屏->登录）：覆盖层必须重画
     const User64Entry* u = sel_user64();
     if (lk_log_ok64(LK_LOG_LOGIN)) {
@@ -1116,6 +1316,7 @@ static void enter_login64(const char* why) {
         dbg64_line_end64();
     }
     log_userlist64();
+    trans_lock_to_login64();                 // ★ v0.9.3：300ms 过渡（阻塞；结束即登录界面就绪）
     if (u && !u->avatar[0] && lk_log_ok64(LK_LOG_LOGIN)) {
         dbg64_line_begin64();
         dbg64_str("[LOCK64] avatar user=");
@@ -1129,6 +1330,7 @@ static void enter_login64(const char* why) {
 
 static void back_to_lock64(const char* why) {
     g_state = LOCKLOGIN_STATE_LOCK;
+    g_bg_zoom256 = 256;                    // ★ v0.9.3：回锁屏 -> 背景缩放复位到 1.00（同一动画反向）
     g_overlay_valid = 0;                   // 回锁屏：覆盖层（面板+大号时间）必须重画
     g_pw_active = 0;
     g_pw_len = 0;
@@ -1580,6 +1782,19 @@ const char* locklogin64_state_name64() {
 int locklogin64_active64() { return g_state != LOCKLOGIN_STATE_DESKTOP; }
 
 // gui64 主循环的 hook：状态 != DESKTOP 时由本层接管（返回 1 = 本帧已被消费）
+// ★ v0.9.3：把登录层快照交给 gui64（第二段过渡要把登录层淡出/上移）
+int locklogin64_layer64(const uint32_t** snap, const uint32_t** bg,
+                        int* x, int* y, int* w, int* h) {
+    if (!g_lg_snap || !g_lg_bg || g_lg_sw <= 0 || g_lg_sh <= 0) return 0;
+    if (snap) *snap = g_lg_snap;
+    if (bg)   *bg = g_lg_bg;
+    if (x) *x = g_lg_sx;
+    if (y) *y = g_lg_sy;
+    if (w) *w = g_lg_sw;
+    if (h) *h = g_lg_sh;
+    return 1;
+}
+
 int locklogin64_tick64() {
     if (g_state == LOCKLOGIN_STATE_DESKTOP) return 0;
     locklogin64_tick_once64();

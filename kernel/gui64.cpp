@@ -22,7 +22,10 @@
 //      否则会和应用自己的回收逻辑双释放（kfree_64 会拦住并刷日志）。
 
 #include "x86_64.h"      // ★ v0.9.2：wall64_ratio_x1000()（动画时长的墙钟校准）
+#include "trans64.h"     // ★ v0.9.3：统一状态机 + delta_time 时间轴
 #include "gui64.h"
+// ★ v0.9.3：1 = render() 只画不提交（登录->桌面过渡期间由 desktop_transition64() 统一整帧提交）
+static int g_hold_flip_anim = 0;
 #include "dock64.h"      // ★ v0.8.0：Dock 运行时列表 + 上下文菜单公开 API
 #include "fb.h"
 #include "virtio_gpu64.h"   // ★ v0.5.5：硬件光标平面（cursor_on / cursor_move）
@@ -2716,7 +2719,7 @@ static void render(void) {
     draw_cursor();               // ★ P5：按形状画指针（箭头/文本/转圈/缩放）
     rseg64(5, &ts);
     fb_reset_clip();
-    fb_flip_region(x0, y0, dw, dh);
+    if (!g_hold_flip_anim) fb_flip_region(x0, y0, dw, dh);   // ★ v0.9.3：过渡里整帧画完再统一提交
     rseg64(6, &ts);
     { const uint64_t tot = rdtsc64() - t0; if (tot > g_rseg_max) g_rseg_max = tot; g_rseg_n++;
       const uint64_t ar = (uint64_t)dw * (uint64_t)dh; if (ar > g_rseg_amax) g_rseg_amax = ar; }
@@ -2740,6 +2743,177 @@ static void render(void) {
         g_load_paints++;
         if (g_load_paints >= 2) g_load_done = true;
     }
+}
+
+// ==================== ★ v0.9.3：登录 -> 桌面 的过渡（400ms / ease-out / delta_time）====================
+// 用户需求原文（第二段）："总时长 400 毫秒（ease-out），登录层在前 200 毫秒内淡出并向上平移退场；
+//   桌面层（壁纸、Dock、图标）从 1.05 缩小到 1.0 且透明度从 0 变为 1（与登录层退场重叠进行），
+//   其中 Dock 和图标需延迟 100 毫秒再触发上浮和淡入。"
+// 底层要求：① 不在动画里算模糊（模糊面用 gfx64_wall_blur64() 的**预算好**纹理，动画只做交叉混合）；
+//   ② 所有图层在后台缓冲整帧画完 → **一次** fb_flip()（动画期间 render() 不提交局部矩形）。
+// 时间轴：trans64.h 的统一状态机（delta_time 来自 RTC 校准的墙钟）。
+static int g_desk_trans_logged = 0;
+
+static inline uint32_t tgl64(uint32_t b, uint32_t f, int a) {
+    const uint32_t ia = (uint32_t)(256 - a), au = (uint32_t)a;
+    return 0xFF000000u |
+           (((((f >> 16) & 0xFFu) * au + ((b >> 16) & 0xFFu) * ia) >> 8) << 16) |
+           (((((f >> 8) & 0xFFu) * au + ((b >> 8) & 0xFFu) * ia) >> 8) << 8) |
+            (((f & 0xFFu) * au + (b & 0xFFu) * ia) >> 8);
+}
+
+// 把"层"（snap，配一份纯背景 bg 用来区分 UI 像素）按 zoom/alpha/dy 合成到后备缓冲
+static void trans_layer_blit64b(uint32_t* fb, int W, int H,
+                                const uint32_t* snap, const uint32_t* bg,
+                                int lx, int ly, int lw, int lh,
+                                int dy, int zoom256, int a256) {
+    if (!snap || !bg || a256 <= 0 || lw <= 0 || lh <= 0) return;
+    if (zoom256 < 200) zoom256 = 200;
+    const int dw = lw * zoom256 / 256, dh = lh * zoom256 / 256;
+    const int x0 = lx + (lw - dw) / 2, y0 = ly + (lh - dh) / 2 + dy;
+    const int a = a256 > 256 ? 256 : a256;
+    for (int j = 0; j < dh; j++) {
+        const int yy = y0 + j;
+        if (yy < 0 || yy >= H) continue;
+        const int sy = j * 256 / zoom256;
+        if (sy < 0 || sy >= lh) continue;
+        const uint32_t* srow = snap + (uint64_t)sy * lw;
+        const uint32_t* brow = bg + (uint64_t)sy * lw;
+        uint32_t* drow = fb + (uint64_t)yy * W;
+        for (int i = 0; i < dw; i++) {
+            const int xx = x0 + i;
+            if (xx < 0 || xx >= W) continue;
+            const int sx = i * 256 / zoom256;
+            if (sx < 0 || sx >= lw) continue;
+            const uint32_t sp = srow[sx];
+            if (sp == brow[sx]) continue;              // 背景像素：不画（否则留下缩放补丁）
+            drow[xx] = a >= 256 ? sp : tgl64(drow[xx], sp, a);
+        }
+    }
+}
+
+static void desktop_transition64(void) {
+    int W = 0, H = 0;
+    uint32_t* fb = fb_surface64(&W, &H);
+    if (!fb || W <= 0 || H <= 0) return;
+    const Theme64Tokens* th = theme64_tokens64();
+
+    // ---- ① 预生成"桌面层"静态纹理：整屏画一遍（不提交）----
+    g_hold_flip_anim = 1;
+    fb_clear(th->desktop_base);
+    gui64_invalidate();
+    render();
+    g_hold_flip_anim = 0;
+    const uint64_t npx = (uint64_t)W * (uint64_t)H;
+    uint32_t* desk = (uint32_t*)kmalloc_64(npx * 4u);
+    if (!desk) { fb_clear(th->desktop_base); gui64_invalidate(); render(); return; }   // 分不到：硬切（如实降级）
+    for (uint64_t i = 0; i < npx; i++) desk[i] = fb[i];
+
+    // ---- ② 模糊面（预算好的）与登录层快照 ----
+    int bw = 0, bh = 0;
+    const uint32_t* blurw = gfx64_wall_blur64(&bw, &bh);
+    if (!blurw || bw <= 0 || bh <= 0) { blurw = desk; bw = W; bh = H; }
+    const uint32_t* lsnap = nullptr; const uint32_t* lbg = nullptr;
+    int lx = 0, ly = 0, lw = 0, lh = 0;
+    const int have_layer = locklogin64_layer64(&lsnap, &lbg, &lx, &ly, &lw, &lh);
+
+    // ---- ③ Dock/图标 延迟层（延迟 100ms 后上浮 18px + 淡入）----
+    int cx0 = g_dock_x - 18, cy0 = g_dock_y - 20;
+    int cx1 = g_dock_x + g_dock_w + 18, cy1 = g_dock_y + g_dock_h + 26;
+    if (cx0 < 0) cx0 = 0;
+    if (cy0 < 0) cy0 = 0;
+    if (cx1 > W) cx1 = W;
+    if (cy1 > H) cy1 = H;
+    const int chrome_ok = (cx1 > cx0 && cy1 > cy0);
+
+    Trans64 tr;
+    trans64_begin(&tr, 400);
+    const int DELAY_MS = 100, LOGIN_OUT_MS = 200;
+    const int rps = tr.rps;
+    int frames = 0, last_p = -1;
+    for (;;) {
+        const int p = trans64_p256(&tr);
+        const int dt = trans64_dt_ms(&tr);
+        if (p != last_p || frames == 0) {
+            const int dz = 269 - (13 * p) / 256;       // 桌面层 1.05 -> 1.00
+            const int da = p;                          // 桌面层透明度 0 -> 256
+            const int blocks = (da > 0 && da < 256) ? 2 : 1;
+            const int wc = W / 2, hc = H / 2;
+            for (int y = 0; y < H; y += blocks) {
+                int syb = (int)(((int64_t)(y - hc) * 256) / 269) + hc;
+                if (syb < 0) syb = 0;
+                if (syb >= bh) syb = bh - 1;
+                int syd = (int)(((int64_t)(y - hc) * 256) / dz) + hc;
+                if (syd < 0) syd = 0;
+                if (syd >= H) syd = H - 1;
+                const uint32_t* brow = blurw + (uint64_t)syb * bw;
+                const uint32_t* drow = desk + (uint64_t)syd * W;
+                for (int x = 0; x < W; x += blocks) {
+                    int sxb = (int)(((int64_t)(x - wc) * 256) / 269) + wc;
+                    if (sxb < 0) sxb = 0;
+                    if (sxb >= bw) sxb = bw - 1;
+                    int sxd = (int)(((int64_t)(x - wc) * 256) / dz) + wc;
+                    if (sxd < 0) sxd = 0;
+                    if (sxd >= W) sxd = W - 1;
+                    const uint32_t c = (da >= 256) ? drow[sxd] : tgl64(brow[sxb], drow[sxd], da);
+                    for (int j = 0; j < blocks && y + j < H; j++) {
+                        uint32_t* o = fb + (uint64_t)(y + j) * W;
+                        for (int i = 0; i < blocks && x + i < W; i++) o[x + i] = c;
+                    }
+                }
+            }
+            // Dock/图标：延迟 100ms，上浮 18px -> 0 并淡入
+            if (chrome_ok && dt >= DELAY_MS) {
+                int cp = (dt - DELAY_MS) * 256 / (400 - DELAY_MS);
+                if (cp > 256) cp = 256;
+                const int dy = 18 - (18 * cp) / 256;
+                for (int y = cy0; y < cy1; y++) {
+                    const int sy = y - dy;
+                    if (sy < cy0 || sy >= cy1) continue;
+                    const uint32_t* srow = desk + (uint64_t)sy * W;
+                    uint32_t* drow = fb + (uint64_t)y * W;
+                    for (int x = cx0; x < cx1; x++) {
+                        const uint32_t sp = srow[x];
+                        drow[x] = (cp >= 256) ? sp : tgl64(drow[x], sp, cp);
+                    }
+                }
+            }
+            // 登录层：前 200ms 淡出 + 向上平移 24px
+            if (have_layer && dt < LOGIN_OUT_MS) {
+                int outp = dt * 256 / LOGIN_OUT_MS;
+                if (outp > 256) outp = 256;
+                trans_layer_blit64b(fb, W, H, lsnap, lbg, lx, ly, lw, lh, -(24 * outp) / 256, 256, 256 - outp);
+            }
+            fb_flip();                                  // ★ 整帧一次提交（不撕裂）
+            frames++;
+            last_p = p;
+        }
+        if (trans64_done(&tr) && p >= 256) break;
+        panic64_watchdog_kick64();
+        __asm__ volatile("pause");
+    }
+    kfree_64(desk);
+    const int wall_ms = trans64_dt_ms(&tr);
+    if (!g_desk_trans_logged) {
+        g_desk_trans_logged = 1;
+        dbg64_line_begin64();
+        dbg64_str("[GUI64] trans seg=login2desk target_ms=400 wall_ms=");
+        dbg64_dec((uint64_t)wall_ms);
+        dbg64_str(" rps=");
+        dbg64_dec((uint64_t)rps);
+        dbg64_str(" frames=");
+        dbg64_dec((uint64_t)frames);
+        dbg64_str(" layers=desk(zoom 105..100 alpha 0..256)+chrome(delay_ms=100 up_px=18)+login(fade_ms=200 up_px=24)");
+        dbg64_str(" login_layer=");
+        dbg64_dec((uint64_t)have_layer);
+        dbg64_str(" flip=full1x (double-buffered; no partial submit)");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    // 收尾：画一帧"真实"桌面（与原路径逐像素一致）
+    fb_clear(th->desktop_base);
+    gui64_invalidate();
+    render();
 }
 
 // ==================== 内置轻量窗口 ====================
@@ -4323,6 +4497,7 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
     // "[LOCK64] lock screen shown"。安装介质内核不链 locklogin64（见 build64.sh），
     // 所以安装向导路径上不会出现锁屏。
     locklogin64_run64();
+    desktop_transition64();   // ★ v0.9.3：登录 -> 桌面 400ms 过渡
 
 
     g_in_selftest = true;          // 自检里的临时窗口 / 语言来回切 不触发会话与配置钩子
