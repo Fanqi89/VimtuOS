@@ -225,6 +225,29 @@ def run_case(qemu, img, tag, vga, extra, expect_vendor, expect_gpus, expect_mmio
         check("④ cmd_on == gpus（mem-decode + bus-master 回读为 1）", cmd_on == gpus, "cmd_on=%d" % cmd_on)
         check("④ extra == 0（GPU64_MAX64 没溢出）", extra == 0, "extra=%d" % extra)
 
+        # ---------- ④b ★ v0.9.8：帧缓冲来源 + 页表只读走查 ----------
+        # 新增行：[FB64] fb source=<vbe|gop> addr=0x… w=… h=… pitch=… hi4g=… pt=… pt_last=… usable=…
+        # 它回答三件事：这台机器走哪条上屏路、帧缓冲在哪、
+        # 页表里这块显存到底能不能写（不能写就 usable=0，一律不碰屏）。
+        # 注意：db g64_hex64 打的是**大写**十六进制（LIKE 00000000FD000000），所以地址类要收 A-F。
+        mfbs = last("[[]FB64[]] fb source=([a-z]+) addr=0x([0-9a-fA-F]+) w=([0-9]+) h=([0-9]+) "
+                    "pitch=([0-9]+) hi4g=([0-9]) pt=([a-z]+) pt_last=([a-z]+) usable=([0-9])",
+                    vm.log())
+        if check("④b 打点 [FB64] fb source=… 出现且字段齐全", mfbs is not None,
+                 mfbs.group(0) if mfbs else "缺/格式不符"):
+            check("④b 本夹具是 BIOS 启动 -> source=vbe（UEFI 下必须是 gop）",
+                  mfbs.group(1) == "vbe", "source=%s" % mfbs.group(1))
+            check("④b 帧缓冲尺寸与 [GPU] scan 的 fb 一致",
+                  (int(mfbs.group(3)), int(mfbs.group(4))) == (fbw, fbh),
+                  "%sx%s vs %dx%d" % (mfbs.group(3), mfbs.group(4), fbw, fbh))
+            check("④b VBE LFB 在 4GiB 以内（hi4g=0）", mfbs.group(6) == "0",
+                  "hi4g=%s addr=0x%s" % (mfbs.group(6), mfbs.group(2)))
+            check("④b 页表走查：首末页都可写（pt=rw pt_last=rw）",
+                  mfbs.group(7) == "rw" and mfbs.group(8) == "rw",
+                  "pt=%s pt_last=%s" % (mfbs.group(7), mfbs.group(8)))
+            check("④b usable=1（页表判定通过才出帧；0 时一律不碰屏）",
+                  mfbs.group(9) == "1", "usable=%s" % mfbs.group(9))
+
         # ---------- ② 每张卡的 dev 行 ----------
         devs = list(re.finditer(
             r"\[GPU\] dev idx=(\d+) bdf=([0-9a-f]{2}:[0-9a-f]{2}\.[0-9]) vendor=([0-9a-f]{4}) "
@@ -261,6 +284,26 @@ def run_case(qemu, img, tag, vga, extra, expect_vendor, expect_gpus, expect_mmio
             check("③ 未知厂商的 idx=%s 如实 skipped reason=no-safe-probe" % d.group(1),
                   ("[GPU] probe vendor=unknown idx=%s skipped reason=no-safe-probe" % d.group(1))
                   in vm.log(), "vendor=%s" % d.group(3))
+
+        # ---------- ③b ★ v0.9.8：驱动分派 + **统一的安全回退** ----------
+        # 本夹具的卡全是未知厂商（1234/1af4/1b36），所以每张卡都必须走
+        #   status=none fallback=no-touch —— 不写一个厂商寄存器、不接管 scanout。
+        # （AMD 0x1002 与 NVIDIA 0x10de 在真机上走的就是同一段代码，本文件验不了；
+        #   这里用未知厂商证明“没专属驱动时什么都不动”这条路径。）
+        # driver 行在 [GPU] report 之后才出：先等 Intel 自检那行落盘，保证前面的行都到齐了
+        # （串口有 1~3 s 落盘延迟，不等就是抢跑）。
+        vm.wait_log("[INTEL] selftest ", 60)
+        drv = list(re.finditer(r"\[GPU\] driver vendor=(\w+) idx=(\d+) status=none fallback=no-touch reason=(\S+)",
+                               vm.log()))
+        check("③b 每张卡都有一行 [GPU] driver（数量 == gpus）", len(drv) == gpus,
+              "行数 %d / gpus %d" % (len(drv), gpus))
+        for d in drv:
+            check("③b idx=%s 未知厂商走统一回退 reason=unknown-vendor" % d.group(2),
+                  d.group(1) == "unknown" and d.group(3) == "unknown-vendor", d.group(0))
+        check("③b 没有卡被误报成 status=safe-probe（本夹具没有 Intel/AMD/NVIDIA）",
+              "status=safe-probe" not in vm.log(), "")
+        check("③b 没有 Intel 设备 -> [INTEL] selftest skipped reason=no-intel-device",
+              "[INTEL] selftest skipped reason=no-intel-device" in vm.log(), "")
 
         # ---------- ⑤ 打点位置（gpu64_init64 必须先于 vgpu64_init64）----------
         log = vm.log()

@@ -34,3 +34,12 @@ __attribute__((weak)) const char* gpu64_vendor_name64(uint16_t pci_vendor) {
     (void)pci_vendor;
     return "unknown";               // 不编造厂商名
 }
+
+// ★ v0.9.8：P3 Intel 初步驱动（kernel/intel_gpu64.cpp）同样**只进系统内核**。gpu64.cpp 会调
+//   intel64_probe64()/intel64_selftest64()，而 gpu64.cpp 自己也不在安装程序内核里 —— 所以这两条
+//   严格来说不会被引用。仍然给 weak 兜底：万一将来有人只把 gpu64.cpp 加进安装内核，链接期
+//   会立刻炸，而这里让它"编得过、且如实返回没有 Intel 驱动"，与上面几条同一个套路。
+//   语义：没有任何新功能、没有策略、不假装有卡（一律返回 0 = 没接管 / 跳过自检）。
+__attribute__((weak)) int intel64_probe64(const Gpu64Dev64* d) { (void)d; return 0; }
+__attribute__((weak)) int intel64_selftest64(void) { return 0; }
+__attribute__((weak)) int intel64_mode64(void) { return 0; }   // 0 = INTEL64_MODE64_SAFE

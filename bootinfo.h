@@ -20,6 +20,15 @@ struct BootInfo {
     uint32_t edid_addr;    // 0x24 EDID 缓冲地址（VBE/DDC 4F15 读到的 128 字节）
     uint16_t edid_size;    // 0x28 EDID 长度（通常 128）
     uint16_t edid_ok;      // 0x2A 1 = EDID 读取成功
+    // ---- ★ v0.9.8：帧缓冲地址的**高 32 位**与来源（只在尾部追加，老字段与 magic 一个没动）----
+    // 为什么必须加：UEFI 的 GOP 帧缓冲在**大显存卡**上常被固件放到 4GiB 以上（RTX 3080 这类
+    //   "Above 4G Decoding" 机器尤其如此）。老结构只有 32 位的 lfb_addr，真机上会被截断成
+    //   一个不存在的地址 —— 写进去就是 #PF/黑屏。拼法：pa = lfb_addr | (lfb_addr_hi << 32)。
+    // 兼容性：BIOS loader（VBE）显式写 0（VBE LFB 一定在 4GiB 以内），行为与改动前完全一致。
+    uint32_t lfb_addr_hi;  // 0x2C 帧缓冲物理地址高 32 位（0 = 4GiB 以内）
+    uint8_t  fb_source;    // 0x30 0 = VBE(BIOS loader) / 1 = GOP(UEFI loader)
+    uint8_t  fb_flags;     // 0x31 bit0 = 1 表示 lfb 物理地址 > 4GiB（信息位，不改变语义）
+    uint16_t fb_rsvd;      // 0x32 保留（一律 0，给下一批留位）
 } __attribute__((packed));
 
 // 一个可用显示模式（loader 的 VBE 探测结果，真实值，非硬编码）

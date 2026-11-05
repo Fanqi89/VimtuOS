@@ -37,6 +37,17 @@ uint32_t* fb_surface64(int* w, int* h);               // 后备缓冲基址（32
 //   "k=v;k=v" 串解析，返回 key 的整数值；文件不存在/键不存在 -> 返回 def。
 //   用途：把"启动期屏上测试图/演示"做成 opt-in（默认关），验收脚本显式打开。
 int fb64_fwcfg_flag64(const char* file, const char* key, int def);
+// ★ v0.9.8：同一个通道的**字符串**版（枚举型开关必须用它，例如 opt/vimtu/gpu 的 mode=intel_safe）。
+//   返回 1 = 找到；0 = 没有该文件/该键（out 置空）。有界：条目数上界 64、值长度上界 cap-1。
+int fb64_fwcfg_str64(const char* file, const char* key, char* out, int cap);
+// ★ v0.9.8：帧缓冲**来源与可用性**（真机取证 + [GPU] 报告复用，别在别处再推导一次）。
+//   source  = "vbe"（BIOS loader 设的 VBE 模式）/ "gop"（UEFI loader 交来的 GOP 帧缓冲）；
+//   lfb_phys= 64 位物理基址（GOP 帧缓冲可能 > 4GiB，所以必须是 64 位，不能沿用 32 位接口）；
+//   usable  = 1 才允许出帧。0 表示"当前页表下这块显存不可写"，此时 fb_* 一律不碰屏
+//             （宁可停在固件画面上，也不 #PF/黑屏 —— 这是真机验收的硬要求）。
+const char* fb64_source_name64(void);
+uint64_t fb64_lfb_phys64(void);
+int fb64_lfb_usable64(void);
 uint32_t fb_get_pixel(int x, int y);
 // ★ 驱动线 3：直接读 **LFB**（物理显存）里的像素 —— 软件路径的产物在这里，设备路径的产物在
 //   resource 里。自检里的"设备 vs 软件逐字节等价"拿这一份和 TRANSFER_FROM_HOST_2D 回读的那份比。

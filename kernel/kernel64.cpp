@@ -1465,7 +1465,9 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
 
     // 5) 图形模式参数（M1 的 fb 模块要靠它建帧缓冲）
     dbg64_str("[LM64] LFB addr=");
-    dbg64_hex64(bi->lfb_addr);
+    // ★ v0.9.8：打印**完整 64 位**帧缓冲物理地址（低 32 位在老字段、高 32 位在新增的 lfb_addr_hi）。
+    //   UEFI GOP 在大显存卡上会把帧缓冲放到 4GiB 以上，只打低 32 位会看到一个假地址。
+    dbg64_hex64((uint64_t)bi->lfb_addr | ((uint64_t)bi->lfb_addr_hi << 32));
     dbg64_str(" size=");
     dbg64_dec(bi->width); dbg64_str("x"); dbg64_dec(bi->height);
     dbg64_str(" bpp="); dbg64_dec(bi->bpp);

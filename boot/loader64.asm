@@ -611,6 +611,11 @@ write_bootinfo:
     mov al, [edid_ok]
     mov ah, 0
     mov [0x102A], ax               ; EDID 有效标志
+    ; ★ v0.9.8：BootInfo 尾部新增字段必须**显式清零** —— 这段低内存（0x1000）不是保证为零的，
+    ;   不清就会把上一次运行留下的字节当成"帧缓冲高 32 位/来源"，真机上可能拼出野地址。
+    ;   BIOS/VBE 路径：VBE LFB 一定在 4GiB 以内，所以高 32 位 = 0、来源 = 0(vbe)。
+    mov dword [0x102C], 0          ; lfb_addr_hi
+    mov dword [0x1030], 0          ; fb_source / fb_flags / fb_rsvd 一起清
     ret
 
 ; ============================================================================

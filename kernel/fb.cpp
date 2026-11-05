@@ -9,7 +9,9 @@
 #include "debug64.h"     // fb_backend_log64() 的 [FB64] 打点
 #include "x86_64.h"        // ★ ⑭：g_ticks64 / TICK_MS_64（帧节拍的粗睡眠/标定基准）
 
-static uint32_t fb_addr = 0;
+static uint64_t fb_addr = 0;          // LFB 物理地址（★ v0.9.8：64 位 —— GOP 帧缓冲可能在 4GiB 以上）
+static uint8_t  fb_source = 0;        // 0 = VBE(BIOS loader) / 1 = GOP(UEFI loader)
+static int      fb_usable = 1;        // 0 = 当前页表下这块显存不可写 -> 一律不碰屏（绝不黑屏）
 static int fb_w = 0, fb_h = 0;
 static int fb_pitch = 0;
 static uint8_t fb_bpp = 32;
@@ -131,13 +133,87 @@ bool fb_set_mode(int w, int h) {
     return true;
 }
 
+// ==================== ★ v0.9.8：帧缓冲来源 + 页表只读走查 ====================
+// 背景（真机验收的直接原因）：UEFI 路径下内核**跑在固件页表上**（boot/efi/uefi64.c 不替换
+// CR3，只往固件 PML4 里挂了一条高半区映射）。而 GOP 帧缓冲的窗口是**固件**在启动 GOP 时
+// 建的 —— 在大显存卡上（RTX 3080 这类 "Above 4G Decoding" 机器）这个窗口经常落在 4GiB
+// 以上，而且固件未必把它标成可写。老代码有两处会直接翻车：
+//   ① BootInfo 只有 32 位的 lfb_addr，高地址会被截断 -> 拼命往一个野地址写；
+//   ② 就算地址对了，页表里若没有这个窗口/是只读，第一笔写就是 #PF（随后 panic 再写屏 ->
+//      三重故障 -> **黑屏**）。
+// 对策：地址拼成 64 位（见 fb_init），并且**先只读走查页表**，确认首末页都可写才出帧；
+//   不可用就整块不碰（`fb_usable = 0`），屏幕停在固件画面上 —— 宁可没画面，也不黑屏。
+#define FB64_PA_MASK 0x000FFFFFFFFFF000ull
+
+// 只读走查当前 CR3（恒等映射）下 pa 这一页的映射状态。
+//   返回 0 = 未映射 / 1 = 已映射但只读 / 2 = 已映射且可写。**一个页表项都不写。**
+static int fb64_pt_state64(uint64_t pa) {
+    uint64_t cr3 = 0;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    const uint64_t* l4 = (const uint64_t*)(uintptr_t)(cr3 & FB64_PA_MASK);
+    const uint64_t e4 = l4[(pa >> 39) & 511u];
+    if (!(e4 & 1u)) return 0;
+    // 写权限要**每一级**都允许：CR0.WP=1 时 ring0 写只读页同样 #PF。
+    int wr = (e4 & 2u) ? 1 : 0;
+    const uint64_t* l3 = (const uint64_t*)(uintptr_t)(e4 & FB64_PA_MASK);
+    const uint64_t e3 = l3[(pa >> 30) & 511u];
+    if (!(e3 & 1u)) return 0;
+    if (!(e3 & 2u)) wr = 0;
+    if (e3 & 0x80u) return 1 + wr;                       // 1 GiB 大页
+    const uint64_t* l2 = (const uint64_t*)(uintptr_t)(e3 & FB64_PA_MASK);
+    const uint64_t e2 = l2[(pa >> 21) & 511u];
+    if (!(e2 & 1u)) return 0;
+    if (!(e2 & 2u)) wr = 0;
+    if (e2 & 0x80u) return 1 + wr;                       // 2 MiB 大页
+    const uint64_t* l1 = (const uint64_t*)(uintptr_t)(e2 & FB64_PA_MASK);
+    const uint64_t e1 = l1[(pa >> 12) & 511u];
+    if (!(e1 & 1u)) return 0;
+    if (!(e1 & 2u)) wr = 0;
+    return 1 + wr;
+}
+
+const char* fb64_source_name64(void) { return fb_source == 1 ? "gop" : "vbe"; }
+uint64_t fb64_lfb_phys64(void) { return fb_addr; }
+int fb64_lfb_usable64(void) { return fb_usable; }
+
+// 一行来源打点（纯 ASCII，新行；老行一律没动）。真机取证就靠它回答
+// "这张卡上到底走的哪条路、地址是多少、固件有没有把这块显存映射成可写"。
+__attribute__((noinline)) static void fb64_log_source64(int st_first, int st_last) {
+    dbg64_line_begin64();
+    dbg64_str("[FB64] fb source="); dbg64_str(fb64_source_name64());
+    dbg64_str(" addr=0x");          dbg64_hex64(fb_addr);
+    dbg64_str(" w=");               dbg64_dec((uint64_t)fb_w);
+    dbg64_str(" h=");               dbg64_dec((uint64_t)fb_h);
+    dbg64_str(" pitch=");           dbg64_dec((uint64_t)fb_pitch);
+    dbg64_str(" hi4g=");            dbg64_putc(fb_addr > 0xFFFFFFFFull ? '1' : '0');
+    dbg64_str(" pt=");
+    dbg64_str(st_first == 0 ? "unmapped" : (st_first == 1 ? "ro" : "rw"));
+    dbg64_str(" pt_last=");
+    dbg64_str(st_last == 0 ? "unmapped" : (st_last == 1 ? "ro" : "rw"));
+    dbg64_str(" usable=");          dbg64_putc(fb_usable ? '1' : '0');
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
 void fb_init(const BootInfo* bi) {
-    fb_addr = bi->lfb_addr;
+    // ★ 64 位拼法：低 32 位在老字段里（老内核照旧能读），高 32 位在新字段里（BIOS loader 显式写 0）。
+    fb_addr   = (uint64_t)bi->lfb_addr | ((uint64_t)bi->lfb_addr_hi << 32);
+    fb_source = (bi->fb_source == 1) ? 1 : 0;            // 只认 1 = GOP，其余一律当 VBE（默认路径）
     fb_w = bi->width;
     fb_h = bi->height;
     fb_bpp = bi->bpp;
     fb_pitch = bi->pitch;
     if (fb_pitch == 0) fb_pitch = fb_w * 4;
+    // 页表只读走查：首末页都可写才允许出帧（理由见上面那段注释）。
+    int s0 = 0, s1 = 0;
+    if (fb_addr && fb_w > 0 && fb_h > 0) {
+        const uint64_t span = (uint64_t)fb_h * (uint64_t)fb_pitch;
+        s0 = fb64_pt_state64(fb_addr);
+        s1 = fb64_pt_state64(fb_addr + span - 1u);
+        fb_usable = (s0 == 2 && s1 == 2) ? 1 : 0;
+    } else {
+        fb_usable = 0;                                    // 没有帧缓冲：不出帧，也不崩
+    }
     backbuf = backbuf_storage;
     // 清零后备缓冲
     uint32_t n = (uint32_t)fb_w * fb_h;
@@ -145,6 +221,7 @@ void fb_init(const BootInfo* bi) {
     g_render_w = fb_w;
     g_render_h = fb_h;
     g_zoom = 100;
+    fb64_log_source64(s0, s1);
 }
 
 int fb_width() { return g_render_w ? g_render_w : fb_w; }
@@ -166,7 +243,7 @@ void fb_set_zoom(int pct) {
 
 // 后备缓冲 -> LFB（整帧提交）：共享实现（内核侧 fb_flip 与 A1 的 fb_user_flip64 都走它）
 static void fb_flip_all64() {
-    if (!backbuf || !fb_addr) return;
+    if (!backbuf || !fb_addr || !fb_usable) return;
     // ★ 驱动线 3：设备路径优先。virtio-gpu 2D 可用时整屏也用**一个区域**提交：
     //   TRANSFER_TO_HOST_2D(整屏) + RESOURCE_FLUSH —— 不再让 CPU 逐像素写 LFB。
     //   返回 0（没有设备/几何不匹配/超时）就原样往下走既有软件路径（这一条是硬要求）。
@@ -221,7 +298,7 @@ void fb_flip() {
 // 后备缓冲 -> LFB（仅提交指定区域；用于光标等局部更新，避免整帧 3MB 拷贝拖慢跟手）
 // 共享实现：fb_flip_region（内核侧，受开关影响）与 fb_user_flip64（用户态提交，不受影响）都用它。
 static void fb_blit_region64(int x, int y, int w, int h) {
-    if (!backbuf || !fb_addr) return;
+    if (!backbuf || !fb_addr || !fb_usable) return;
     if (g_zoom != 100) { fb_flip_all64(); return; }   // 缩放时无法局部映射，退化整帧
     // ★ 驱动线 3：设备路径优先（TRANSFER_TO_HOST_2D + RESOURCE_FLUSH 只搬脏矩形）。
     //   真走了设备就直接返回；否则（无设备/降级/超时）原样走下面的软件路径。
@@ -288,7 +365,7 @@ void fb_backend_log64(const char* backend) {
 
 // 强制走软件路径的区域提交：**不看后端**（设备自检要的就是"软件路径的屏幕内容"）。
 void fb_soft_flip_region64(int x, int y, int w, int h) {
-    if (!backbuf || !fb_addr) return;
+    if (!backbuf || !fb_addr || !fb_usable) return;
     if (g_zoom != 100) { fb_flip_all64(); return; }
     if (x < 0) x = 0;
     if (y < 0) y = 0;
@@ -664,11 +741,18 @@ static int fb64_cfg_int(const char* key, int def) {
 // 与 fb64_cfg_load() 的区别：那个只认死文件名 opt/vimtu/vsync（帧引擎专用）。这里按文件名查，
 // 让"启动期屏上测试图/演示"之类的东西也能用 fw_cfg 做 opt-in —— 判据是**显式配置才开**，
 // 没有该文件一律返回 def（默认 0 = 关）。每次调用重读（只在启动早期/验收路径调，条目数上界 64，成本有界）。
-int fb64_fwcfg_flag64(const char* file, const char* key, int def) {
+// ★ v0.9.8：按文件名查 fw_cfg 文件、取 key= 之后到 ';' 为止的**字符串值**，写进 out（含结尾 0）。
+//   返回 1 = 找到；0 = 没有该文件/该键（*out 一律置空，调用方据此回退到默认值）。
+//   为什么需要它：`opt/vimtu/gpu` 的开关是 `mode=intel_safe` 这种**枚举串**，不是整数；
+//   老的 fb64_fwcfg_flag64() 只认数字，硬套会把它读成 def，等于开关失灵。
+//   有界：条目数上界 64、文件长度上界 191、值长度上界 cap-1。
+int fb64_fwcfg_str64(const char* file, const char* key, char* out, int cap) {
+    if (!out || cap <= 0) return 0;
+    out[0] = 0;
     uint16_t sel = 0; uint32_t sz = 0;
     char buf[192];
-    if (!fb64_fwcfg_find(file, &sel, &sz)) return def;
-    if (sz == 0 || sz > sizeof(buf) - 1) return def;
+    if (!fb64_fwcfg_find(file, &sel, &sz)) return 0;
+    if (sz == 0 || sz > sizeof(buf) - 1) return 0;
     fb64_fwcfg_select(sel);
     int n = 0;
     for (uint32_t i = 0; i < sz; i++) {
@@ -684,14 +768,27 @@ int fb64_fwcfg_flag64(const char* file, const char* key, int def) {
         for (int i = 0; i < kl; i++) if (p[i] != key[i]) { m = 0; break; }
         if (m && p[kl] == '=') {
             p += kl + 1;
-            int v = 0, any = 0;
-            while (*p >= '0' && *p <= '9') { v = v * 10 + (int)(*p - '0'); p++; any = 1; }
-            return any ? v : def;
+            int o = 0;
+            while (*p && *p != ';' && o < cap - 1) out[o++] = *p++;
+            out[o] = 0;
+            return 1;
         }
         while (*p && *p != ';') p++;
         if (*p == ';') p++;
     }
-    return def;
+    return 0;
+}
+
+// 整数版（v0.9.2 起的老接口）：改成复用上面的字符串版，省掉一份重复的扫描代码。
+int fb64_fwcfg_flag64(const char* file, const char* key, int def) {
+    char v[24];
+    if (!fb64_fwcfg_str64(file, key, v, (int)sizeof(v))) return def;
+    int n = 0, any = 0;
+    while (v[n] >= '0' && v[n] <= '9') { n++; any = 1; }
+    if (!any) return def;
+    int out = 0;
+    for (int i = 0; i < n; i++) out = out * 10 + (int)(v[i] - '0');
+    return out;
 }
 
 static int fb64_cfg_str(const char* key, const char* val) {      // 值到 ';' 或串尾为止
@@ -735,7 +832,7 @@ int fb_swap_enable64(int n) {
 
 // 软件路径整帧提交：**原地**写 LFB（Bochs VBE 没有页翻转原语；宿主扫描可能看到中间态 -> 如实标）
 static void fb64_present_soft(int slot) {
-    if (!fb_addr) return;
+    if (!fb_addr || !fb_usable) return;
     uint32_t* src = g_sw_slot[slot];
     if (!src) return;
     const int w = fb_w, h = fb_h;

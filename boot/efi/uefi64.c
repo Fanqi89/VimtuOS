@@ -86,6 +86,10 @@ typedef struct {
     u32 magic; u32 lfb_addr; u16 width; u16 height; u8 bpp; u8 pad; u16 pitch;
     u32 mem_entries; u32 mem_map_addr; u32 kernel_size;
     u16 mode_num; u16 mode_count; u32 mode_list; u32 edid_addr; u16 edid_size; u16 edid_ok;
+    // ★ v0.9.8：与 bootinfo.h 一字不差的尾部字段（帧缓冲高 32 位 + 来源）。
+    //   真机上 GOP 帧缓冲可能在 4GiB 以上（大显存卡 + Above 4G Decoding），
+    //   只有低 32 位会被截断成野地址 -> 内核写进去就是 #PF/黑屏。
+    u32 lfb_addr_hi; u8 fb_source; u8 fb_flags; u16 fb_rsvd;
 } __attribute__((packed)) BootInfo;
 
 // EFI 配置表项（UEFI 2.x，24 字节）：EFI_GUID + 表指针。EDK2 下表指针就是物理地址。
@@ -162,7 +166,16 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
     BootInfo* bi = (BootInfo*)BOOT_INFO_ADDR;
     mem_zero(bi, sizeof(*bi));
     bi->magic       = 0x41555231;                 // 'AUR1'
-    bi->lfb_addr    = (u32)gop->Mode->FrameBufferBase;
+    // ★ v0.9.8：帧缓冲**高 32 位也要交过去**（真机上 GOP 帧缓冲常在 4GiB 以上）。
+    //   老行为是 (u32) 强转 —— 高地址卡上等于把一个野地址交给内核，写进去就是 #PF/黑屏。
+    //   低 32 位仍写老字段 lfb_addr（老内核照旧可用），高 32 位写新字段，来源标 gop。
+    {
+        const u64 fbb = gop->Mode->FrameBufferBase;
+        bi->lfb_addr    = (u32)(fbb & 0xFFFFFFFFull);
+        bi->lfb_addr_hi = (u32)(fbb >> 32);
+        bi->fb_source   = 1;                       // 1 = GOP
+        bi->fb_flags    = (fbb > 0xFFFFFFFFull) ? 1 : 0;
+    }
     bi->width       = (u16)mi->HorizontalResolution;
     bi->height      = (u16)mi->VerticalResolution;
     bi->bpp         = 32;
@@ -218,9 +231,17 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
             ser_str("U:medium desc kind=0 (no payload: installed disk)\n");
         }
     }
-    ser_str("U:bootinfo lfb="); ser_hex(bi->lfb_addr);
-    ser_str(" res="); ser_dec(bi->width); ser_str("x"); ser_dec(bi->height);
-    ser_str(" pitch="); ser_dec(bi->pitch); ser_str("\n");
+    // ★ v0.9.8：这一行把**交给内核的 64 位帧缓冲地址**完整打出来（真机取证用）。
+    //   老读法（lfb= 低 32 位）保留在行首，新字段只追加在行尾，任何既有断言都不受影响。
+    {
+        const u64 fbp = ((u64)bi->lfb_addr_hi << 32) | (u64)bi->lfb_addr;
+        ser_str("U:bootinfo lfb="); ser_hex(bi->lfb_addr);
+        ser_str(" res="); ser_dec(bi->width); ser_str("x"); ser_dec(bi->height);
+        ser_str(" pitch="); ser_dec(bi->pitch);
+        ser_str(" lfb64="); ser_hex(fbp);
+        ser_str(" src=gop hi="); ser_dec(bi->fb_flags ? 1 : 0);
+        ser_str("\n");
+    }
 
     // ---- 页表：为"内核搬高半区"建映射 ----
     // ★ 关键决策（实测驱动）：**不替换固件的页表，只往它当前活动的 PML4 里加一项**。

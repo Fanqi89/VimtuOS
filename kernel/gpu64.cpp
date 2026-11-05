@@ -2,7 +2,9 @@
 //
 // 这个文件负责回答一个问题：**这台机器的显卡叫什么、窗口有多大、能不能被我们碰**。
 // 它不画一个像素，也不接管 scanout（边界见 gpu64.h）。三家厂商的"原生"驱动（模式设置、显存管理、
-// 命令提交、2D/3D 加速）是 P2(AMD) / P3(Intel) / P4(NVIDIA)，这里只打地基。
+// 命令提交、2D/3D 加速）按期走：P2 = AMD（SMU/DCN，**用户手上没有 AMD 卡，已明确跳过**）、
+// P3 = Intel（display engine / GTT，**本批已开初步驱动**，见 kernel/intel_gpu64.cpp）、
+// P4 = NVIDIA（nouveau 路线，法律风险最高，**本批不做**）。P1 只是它们共同的地基。
 //
 // ==================== 为什么复用 kernel/pci64.cpp 而不是再写一份 0xCF8/0xCFC ====================
 // 项目里已经有 7 份各驱动私有的 PCI 访问器（apci_/epci_/hpci_/npci_/…），互不可见；而 kernel/pci64.cpp
@@ -40,11 +42,18 @@
 //   [GPU] report gpus=1 known=0 unknown=1 probed=0 skipped=1 mmio_ok=1 cmd_on=1 extra=0
 //         accel=none-not-implemented
 //
-//   ★ backend=vbe 是**事实**而不是口味：本项目的 loader（boot/loader64.asm）唯一的上屏路径就是
-//     VBE 模式 + LFB，BootInfo 也只带 lfb_addr/mode_num（bootinfo.h）；UEFI GOP 那条路（kernel/
-//     uefi_gop.h）还没有接进内核。等哪天真接了 GOP，这一格才可能出现 gop。
+//   ★ backend= 是**事实**而不是口味：值来自 kernel/fb.cpp 的 fb64_source_name64() ——
+//     "vbe" = BIOS loader（boot/loader64.asm）设的 VBE 模式 + LFB；
+//     "gop" = UEFI loader（boot/efi/uefi64.c）交来的 GOP 帧缓冲（v0.9.8 起高 32 位也一并交过来）。
+//   两家的上屏路径都在 fb.cpp 里，本文件只读它、不改它。
+//
+//   ★ v0.9.8 新增两类行（都在既有行之后，不动老前缀）：
+//     [GPU] driver vendor=<intel|amd|nvidia|unknown> idx=<n> status=safe-probe mode=readonly
+//     [GPU] driver vendor=<amd|nvidia|unknown> idx=<n> status=none fallback=no-touch reason=<...>
+//     [INTEL] …（见 kernel/intel_gpu64.cpp 文件头）
 #include "gpu64.h"
 #include "pci64.h"
+#include "intel_gpu64.h"   // ★ v0.9.8：P3 Intel 初步驱动（本文件只负责"分派"，不搬它的实现）
 #include "debug64.h"
 #include "fb.h"          // fb_phys_width / fb_phys_height（只用于报告行）
 #include "port.h"        // inl/outl/inw/outw（0xCF8/0xCFC 配置口）
@@ -293,7 +302,10 @@ void gpu64_init64(void) {
     ga_puts(" known=");           ga_num(g_known);
     ga_puts(" unknown=");         ga_num(g_unknown);
     ga_puts(" fb=");              ga_num((uint64_t)fb_phys_width()); ga_ch('x'); ga_num((uint64_t)fb_phys_height());
-    ga_puts(" backend=vbe");
+    // ★ v0.9.8：如实写**这次真的用的**上屏路径（vbe = BIOS loader 设的 VBE 模式 /
+    //   gop = UEFI loader 交来的 GOP 帧缓冲）。原来这里硬编码 vbe —— 接了 GOP 之后
+    //   那句话就成了假话，而真机取证最需要的恰恰是"这台机器走的是哪条路"。
+    ga_puts(" backend="); ga_puts(fb64_source_name64());
     ga_end();
 
     // ---- 3) 每张卡：身份 + 窗口 + 命令寄存器，然后一条厂商探测结论 ----
@@ -373,6 +385,31 @@ void gpu64_init64(void) {
     ga_puts(" extra=");              ga_num(g_extra);
     ga_puts(" accel=none-not-implemented");
     ga_end();
+
+    // ---- 5) ★ v0.9.8：驱动分派 + **统一的安全回退**（用户要求 4/5 的代码落点）----
+    // 只有 Intel 有初步驱动（P3：只读探测 + GTT 采样）。**AMD / NVIDIA / 未知厂商走同一段代码**：
+    // 不写一个厂商寄存器、不接管 scanout、上屏继续走既有那条路（VBE 或 GOP）。
+    // 这条纪律就是"绝对不黑屏"——没有专属驱动时我们**什么都不动**。
+    //   ★ 特意不为 NVIDIA 和 AMD 各写一份：用户的要求就是两家逻辑一模一样；写两份迟早会走偏。
+    for (uint32_t i = 0; i < g_n; i++) {
+        const Gpu64Dev64* p = &g_dev[i];
+        const int handled = (p->vendor_tag == GPU64_VENDOR64_INTEL) ? intel64_probe64(p) : 0;
+        ga_begin();
+        ga_puts("[GPU] driver vendor="); ga_puts(gpu64_vendor_name64(p->vendor));
+        ga_puts(" idx=");                ga_num(p->index);
+        if (handled) {
+            ga_puts(" status=safe-probe mode=readonly");      // P3 初版：只读，不接管显示
+        } else {
+            ga_puts(" status=none fallback=no-touch reason=");
+            if (p->vendor_tag == GPU64_VENDOR64_UNKNOWN)    ga_puts("unknown-vendor");
+            else if (p->vendor_tag == GPU64_VENDOR64_INTEL) ga_puts("mode-off");
+            else                                            ga_puts("no-dedicated-driver");
+        }
+        ga_end();
+    }
+    // 自检：没有 Intel 设备时也要留下"这条路径被走到了"的证据（真机取证要能区分
+    //   "没有核显"与"驱动根本没跑"）。
+    intel64_selftest64();
 }
 
 // ==================== 对外查询 ====================

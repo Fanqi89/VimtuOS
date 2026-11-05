@@ -81,6 +81,8 @@ typedef struct {
     u32 magic; u32 lfb_addr; u16 width; u16 height; u8 bpp; u8 pad; u16 pitch;
     u32 mem_entries; u32 mem_map_addr; u32 kernel_size;
     u16 mode_num; u16 mode_count; u32 mode_list; u32 edid_addr; u16 edid_size; u16 edid_ok;
+    // v0.9.8：与 bootinfo.h 同步的尾部字段（帧缓冲高 32 位 + 来源），见 boot/efi/uefi64.c
+    u32 lfb_addr_hi; u8 fb_source; u8 fb_flags; u16 fb_rsvd;
 } __attribute__((packed)) BootInfo;
 
 // 内存映射缓冲：UEFI 的内存描述符每项 40 字节，几百项也就几 KB，8KB 足够。
@@ -165,7 +167,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st) {
     BootInfo* bi = (BootInfo*)BOOT_INFO_ADDR;
     mem_zero(bi, sizeof(*bi));
     bi->magic       = 0x41555231;                 // 'AUR1'
-    bi->lfb_addr    = (u32)gop->Mode->FrameBufferBase;
+    // v0.9.8：帧缓冲高 32 位一起交给内核（真机上 GOP 帧缓冲可能在 4GiB 以上）
+    bi->lfb_addr    = (u32)(gop->Mode->FrameBufferBase & 0xFFFFFFFFull);
+    bi->lfb_addr_hi = (u32)(gop->Mode->FrameBufferBase >> 32);
+    bi->fb_source   = 1;
+    bi->fb_flags    = (gop->Mode->FrameBufferBase > 0xFFFFFFFFull) ? 1 : 0;
     bi->width       = (u16)mi->HorizontalResolution;
     bi->height      = (u16)mi->VerticalResolution;
     bi->bpp         = (u8)bpp;
