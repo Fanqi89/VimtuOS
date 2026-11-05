@@ -233,6 +233,78 @@ __attribute__((noinline)) static void in_gtt_scan64(uint64_t gtt_pa, uint32_t of
 
 static uint32_t g_intel_devs = 0;                        // 跑过几张 Intel 卡（selftest 用）
 
+// ==================== ★ v0.9.10：GTT 映射（写 PTE + 回读校验 + 立刻还原）====================
+// 边界（先读清楚，这是本文件里**唯一**会写厂商 MMIO/GTT 的地方）：
+//   * 只在 opt/vimtu/gpu 的 `mode=intel` 下被调用；默认 `mode=intel_safe` 只读，绝不走到这里。
+//   * 只写**当前无效**的 GTT 表项；写完逐项回读校验，然后**立刻写回无效并还页** ——
+//     "写 -> 读 -> 还原"全在同一次调用里完成。
+//   * 绝不碰任何有效表项（那是显示引擎正在用的缓冲），绝不碰 pipe/plane 寄存器。
+//   为什么这一步值得存在：接管要往 GTT 里放我们自己的帧缓冲。如果连"写一条 PTE 能不能生效"都没在
+//   真机上验过，那接管就是在猜。这个自检把"能不能"变成一行可核对的日志。
+//
+// GTT 表项格式（gen6+ 统一 8 字节）：bit0 = valid，bits 12.. 是物理页号。
+void* page_alloc_64();                 // 页池（实现见 kernel/mem64.cpp；只声明，理由同 fb.cpp）
+void page_free_64(void* p);
+
+static uint32_t in_gtt_find_run64(uint64_t gtt_pa, uint32_t off, uint32_t scan, uint32_t pages) {
+    uint32_t run = 0, start = 0;
+    for (uint32_t i = 0; i < scan; i++) {
+        const uint64_t e = *(volatile uint64_t*)(uintptr_t)(gtt_pa + (uint64_t)off + (uint64_t)i * 8u);
+        if (e & 1ull) { run = 0; continue; }
+        if (!run) start = i;
+        if (++run >= pages) return start;
+    }
+    return 0xFFFFFFFFu;
+}
+
+// 返回 1 = 全链路验证通过（找到空段、写入生效、回读一致、还原干净）。
+static int in_gtt_selftest64(uint64_t gtt_pa, uint32_t off, uint32_t size, uint32_t scan) {
+    const uint32_t pages = 4;
+    if (!gtt_pa || size < (uint64_t)off + (uint64_t)scan * 8u) return 0;
+    in_begin();
+    in_puts("[INTEL] gtt map ");
+    const uint32_t start = in_gtt_find_run64(gtt_pa, off, scan, pages);
+    if (start == 0xFFFFFFFFu) {
+        in_puts("selftest skipped reason=no-free-run");
+        in_end();
+        return 0;
+    }
+    uint64_t phys[8];
+    uint32_t got = 0;
+    for (; got < pages; got++) {
+        phys[got] = (uint64_t)(uintptr_t)page_alloc_64();
+        if (!phys[got]) break;
+    }
+    if (got < pages) {                                  // 页池不够：把已拿的还回去，如实 skipped
+        for (uint32_t i = 0; i < got; i++) page_free_64((void*)(uintptr_t)phys[i]);
+        in_puts("selftest skipped reason=no-pool-page");
+        in_end();
+        return 0;
+    }
+    volatile uint64_t* gtt = (volatile uint64_t*)(uintptr_t)(gtt_pa + (uint64_t)off);
+    for (uint32_t i = 0; i < pages; i++)                // ① 写 PTE（指向我们自己的页池页）
+        gtt[start + i] = (phys[i] & 0x000FFFFFFFFFF000ull) | 1ull;
+    __asm__ volatile("mfence" : : : "memory");
+    int wok = 1;                                        // ② 逐项回读校验
+    for (uint32_t i = 0; i < pages; i++) {
+        const uint64_t e = gtt[start + i];
+        if (!(e & 1ull) || (e & 0x000FFFFFFFFFF000ull) != (phys[i] & 0x000FFFFFFFFFF000ull)) wok = 0;
+    }
+    for (uint32_t i = 0; i < pages; i++) gtt[start + i] = 0;    // ③ 立刻还原成"无效"
+    __asm__ volatile("mfence" : : : "memory");
+    int rok = 1;                                        // ④ 回读确认真的还原了
+    for (uint32_t i = 0; i < pages; i++) if (gtt[start + i] & 1ull) rok = 0;
+    for (uint32_t i = 0; i < pages; i++) page_free_64((void*)(uintptr_t)phys[i]);   // ⑤ 还页
+    const int ok = (wok && rok) ? 1 : 0;
+    in_puts("selftest start="); in_num(start);
+    in_puts(" pages=");         in_num(pages);
+    in_puts(" write=1 readback="); in_ch(wok ? '1' : '0');
+    in_puts(" restored=");      in_ch(rok ? '1' : '0');
+    in_puts(" ok=");            in_ch(ok ? '1' : '0');
+    in_end();
+    return ok;
+}
+
 int intel64_probe64(const Gpu64Dev64* d) {
     if (!d || d->vendor_tag != GPU64_VENDOR64_INTEL) return 0;
     if (intel64_mode64() == INTEL64_MODE64_OFF) return 0;     // 配置要求不碰 -> 走统一回退
@@ -297,6 +369,10 @@ int intel64_probe64(const Gpu64Dev64* d) {
     in_puts(" phys_first="); in_hex(first);
     in_gtt_scan64(b2.phys, (uint32_t)off_main, 4096);
     in_end();
+
+    // ★ v0.9.10：只有 mode=intel 才允许写 GTT（默认 intel_safe 只读）
+    if (intel64_mode64() == INTEL64_MODE64_FULL)
+        in_gtt_selftest64(b2.phys, (uint32_t)off_main, (uint32_t)b2.size, 4096u);
 
     // ---- 3) 本批次边界（每次都说清楚，免得日后误读成"驱动做完了"）----
     in_begin();

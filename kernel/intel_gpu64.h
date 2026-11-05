@@ -19,7 +19,8 @@
 // ==================== 开关（fw_cfg）====================
 //   文件 `opt/vimtu/gpu`，串 `k=v;k=v`，键 `mode`：
 //     mode=intel_safe （默认；没有该文件/没有该键/值不认识 都是它）  只读探测 + GTT 采样
-//     mode=intel      预留给下一批（**本批仍然只读**，只是把 requested 如实打出来）
+//     mode=intel      允许**写 GTT**（仅限一项：`[INTEL] gtt map selftest` —— 只写当前无效的表项，
+//                     写完逐项回读校验并**立刻写回无效并还页**）；仍然**不**接管 scanout
 //     mode=off        完全不碰 Intel 卡（驱动行会写 reason=disabled-by-config）
 #pragma once
 #include <stdint.h>
@@ -27,7 +28,7 @@
 
 // intel64_mode64() 的取值
 static const int INTEL64_MODE64_SAFE = 0;   // intel_safe（默认）
-static const int INTEL64_MODE64_FULL = 1;   // intel（本批仍只读）
+static const int INTEL64_MODE64_FULL = 1;   // intel（允许 GTT 写入自检，仍不接管 scanout）
 static const int INTEL64_MODE64_OFF  = 2;   // off
 
 // 对一张 Intel 显示设备做只读探测（打 [INTEL] 行）。

@@ -251,6 +251,54 @@ static int fb64_remap64(uint64_t pa, uint64_t bytes) {
     return made;
 }
 
+// 把**已存在、恒等映射、但只读**的映射升级为可写（只动 RW 位，不动地址与页大小）。
+// 为什么需要：固件完全可能把帧缓冲映射成只读（UEFI BootServices 阶段常见）。这时地址对、映射在，
+//   但 ring0 写下去仍然 #PF —— 光"补缺的项"救不了，必须把 RW 位打开。
+// 与 fb64_remap64 的区别：那个只新增、不需要 invlpg；这里改的是**已存在**的映射，
+//   所以每个改过的页都要 invlpg（TLB 里可能已经缓存了只读项）。
+// 返回升级的页数；0 = 没什么可升级的（本来就可写 / 大页 / 非恒等 / 未映射）。
+static int fb64_upgrade_ro64(uint64_t pa, uint64_t bytes) {
+    if (!pa || !bytes) return 0;
+    uint64_t cr3 = 0;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t* l4 = (uint64_t*)(uintptr_t)(cr3 & FB64_PA_MASK);
+    const uint64_t first = pa & ~(FB64_2MB - 1ull);
+    const uint64_t last  = (pa + bytes + FB64_2MB - 1ull) & ~(FB64_2MB - 1ull);
+    const uint64_t cr0 = fb64_cr0_get64();
+    const uint64_t cr0_nw = cr0 & ~0x10000ull;
+    int up = 0;
+    for (uint64_t chunk = first; chunk < last; chunk += FB64_2MB) {
+        const uint64_t e4 = l4[(chunk >> 39) & 511u];
+        if (!(e4 & 1u)) continue;
+        const uint64_t* l3 = (const uint64_t*)(uintptr_t)(e4 & FB64_PA_MASK);
+        const uint64_t e3 = l3[(chunk >> 30) & 511u];
+        if (!(e3 & 1u)) continue;
+        if (e3 & 0x80u) continue;                    // 1 GiB 大页：要拆分才能改，本层**不做**（如实跳过）
+        uint64_t* l2 = (uint64_t*)(uintptr_t)(e3 & FB64_PA_MASK);
+        const uint64_t i2 = (chunk >> 21) & 511u;
+        const uint64_t e2 = l2[i2];
+        if (!(e2 & 1u)) continue;                    // 没映射 -> 交给 fb64_remap64
+        if (e2 & 0x80u) {                            // 2 MiB 大页
+            if ((e2 & FB64_PA_MASK) != chunk) continue;      // 不是恒等映射：不猜，跳过
+            if (e2 & 2u) continue;                           // 本来就可写
+            fb64_cr0_set64(cr0_nw); l2[i2] = e2 | 2u; fb64_cr0_set64(cr0);
+            __asm__ volatile("invlpg (%0)" : : "r"((void*)(uintptr_t)chunk) : "memory");
+            up++;
+        } else {                                     // 4 KiB 页表
+            uint64_t* l1 = (uint64_t*)(uintptr_t)(e2 & FB64_PA_MASK);
+            for (uint32_t k = 0; k < 512u; k++) {
+                const uint64_t e1 = l1[k];
+                if (!(e1 & 1u) || (e1 & 2u)) continue;
+                if ((e1 & FB64_PA_MASK) != (chunk + (uint64_t)k * 4096ull)) continue;   // 非恒等：跳过
+                fb64_cr0_set64(cr0_nw); l1[k] = e1 | 2u; fb64_cr0_set64(cr0);
+                __asm__ volatile("invlpg (%0)" : : "r"((void*)(uintptr_t)(chunk + (uint64_t)k * 4096ull)) : "memory");
+                up++;
+            }
+        }
+    }
+    return up;
+}
+
 // 自检：在**一段确定未映射**的地址上真走一遍"补映射 -> 走查确认 -> 原样抹掉并还页"，
 //   证明"往当前页表里写项"这条路在当前固件（BIOS 页表 / UEFI 固件页表）下真的可用。
 //   候选判据：走查结果为空（= 现在这块地址根本不可用）。于是三种情况都覆盖到：
@@ -284,6 +332,23 @@ static int fb64_remap_selftest64(void) {
     const uint64_t cr0_nw = cr0 & ~0x10000ull;
     const int made = fb64_remap64(cand, FB64_2MB);
     const int st = fb64_pt_state64(cand);
+    // ---- v0.9.10：再把刚建的那条 2 MiB 项**故意改成只读**，验证 RO->RW 升级路径 ----
+    // 这一步在 QEMU 里可以真跑（我们就是在改自己的页表），所以它不是"纸面能力"。
+    uint64_t* pd = nullptr;
+    {
+        const uint64_t e4 = l4[q4];
+        const uint64_t* p3 = (const uint64_t*)(uintptr_t)(e4 & FB64_PA_MASK);
+        const uint64_t e3 = (e4 & 1u) ? p3[q3] : 0;
+        pd = (uint64_t*)(uintptr_t)(e3 & FB64_PA_MASK);
+    }
+    int st_ro = 0, up = 0, st_up = 0;
+    if (pd) {
+        fb64_cr0_set64(cr0_nw); pd[q2] = cand | 0x81u; fb64_cr0_set64(cr0);   // P|PS，清 RW
+        __asm__ volatile("invlpg (%0)" : : "r"((void*)(uintptr_t)cand) : "memory");
+        st_ro = fb64_pt_state64(cand);                 // 期望 1 = ro
+        up    = fb64_upgrade_ro64(cand, FB64_2MB);     // 期望 >=1
+        st_up = fb64_pt_state64(cand);                 // 期望 2 = rw
+    }
     // ---- 复原：逆序只拆我们建的那一层，并把新建的页表页还回去 ----
     fb64_cr0_set64(cr0_nw);
     if (!(e4_before & 1u)) {
@@ -303,11 +368,14 @@ static int fb64_remap_selftest64(void) {
         fb64_cr0_set64(cr0);
     }
     const int st2 = fb64_pt_state64(cand);
-    const int ok = (st == 2 && made > 0 && st2 == 0) ? 1 : 0;
+    const int ok = (st == 2 && made > 0 && st_ro == 1 && up > 0 && st_up == 2 && st2 == 0) ? 1 : 0;
     dbg64_line_begin64();
     dbg64_str("[FB64] remap selftest pa=0x"); dbg64_hex64(cand);
     dbg64_str(" made=");      dbg64_dec((uint64_t)made);
     dbg64_str(" walk=");      dbg64_str(st == 2 ? "rw" : (st == 1 ? "ro" : "unmapped"));
+    dbg64_str(" ro_walk=");   dbg64_str(st_ro == 1 ? "ro" : (st_ro == 2 ? "rw" : "unmapped"));
+    dbg64_str(" upgrade=");   dbg64_dec((uint64_t)up);
+    dbg64_str(" rw_walk=");   dbg64_str(st_up == 2 ? "rw" : (st_up == 1 ? "ro" : "unmapped"));
     dbg64_str(" restored=");  dbg64_putc(st2 == 0 ? '1' : '0');
     dbg64_str(" ok=");        dbg64_putc(ok ? '1' : '0');
     dbg64_nl(); dbg64_line_end64();
@@ -324,7 +392,7 @@ static int fb64_fbtest_remap64(void) {
 
 // 一行来源打点（纯 ASCII，新行；老行一律没动）。真机取证就靠它回答
 // "这张卡上到底走的哪条路、地址是多少、固件有没有把这块显存映射成可写"。
-__attribute__((noinline)) static void fb64_log_source64(int st_first, int st_last, int remapped) {
+__attribute__((noinline)) static void fb64_log_source64(int st_first, int st_last, int remapped, int upgraded) {
     dbg64_line_begin64();
     dbg64_str("[FB64] fb source="); dbg64_str(fb64_source_name64());
     dbg64_str(" addr=0x");          dbg64_hex64(fb_addr);
@@ -338,6 +406,7 @@ __attribute__((noinline)) static void fb64_log_source64(int st_first, int st_las
     dbg64_str(st_last == 0 ? "unmapped" : (st_last == 1 ? "ro" : "rw"));
     dbg64_str(" usable=");          dbg64_putc(fb_usable ? '1' : '0');
     dbg64_str(" remap=");           dbg64_dec((uint64_t)remapped);   // 自补了几页 2MiB
+    dbg64_str(" upgrade=");         dbg64_dec((uint64_t)upgraded);   // RO->RW 升级了几页
     dbg64_nl();
     dbg64_line_end64();
 }
@@ -355,6 +424,7 @@ void fb_init(const BootInfo* bi) {
     // 补完再走查一次 —— 仍然不可用就 fb_usable=0（不碰屏）。理由见上面那段注释。
     int s0 = 0, s1 = 0;
     int remapped = 0;
+    int upgraded = 0;
     if (fb_addr && fb_w > 0 && fb_h > 0) {
         const uint64_t span = (uint64_t)fb_h * (uint64_t)fb_pitch;
         s0 = fb64_pt_state64(fb_addr);
@@ -362,6 +432,12 @@ void fb_init(const BootInfo* bi) {
         fb_usable = (s0 == 2 && s1 == 2) ? 1 : 0;
         if (!fb_usable) {                                 // ★ v0.9.9：缺映射就自己补
             remapped = fb64_remap64(fb_addr, span);
+            s0 = fb64_pt_state64(fb_addr);
+            s1 = fb64_pt_state64(fb_addr + span - 1u);
+            fb_usable = (s0 == 2 && s1 == 2) ? 1 : 0;
+        }
+        if (!fb_usable) {                                 // ★ v0.9.10：映射在但只读 -> 升级 RW
+            upgraded = fb64_upgrade_ro64(fb_addr, span);
             s0 = fb64_pt_state64(fb_addr);
             s1 = fb64_pt_state64(fb_addr + span - 1u);
             fb_usable = (s0 == 2 && s1 == 2) ? 1 : 0;
@@ -376,7 +452,7 @@ void fb_init(const BootInfo* bi) {
     g_render_w = fb_w;
     g_render_h = fb_h;
     g_zoom = 100;
-    fb64_log_source64(s0, s1, remapped);
+    fb64_log_source64(s0, s1, remapped, upgraded);
     // 夹具/取证开关：opt/vimtu/gpu 的 fbtest=remap -> 真跑一遍页表自补自检
     if (fb64_fbtest_remap64()) fb64_remap_selftest64();
 }

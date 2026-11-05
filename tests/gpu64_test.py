@@ -232,7 +232,7 @@ def run_case(qemu, img, tag, vga, extra, expect_vendor, expect_gpus, expect_mmio
         # 注意：db g64_hex64 打的是**大写**十六进制（LIKE 00000000FD000000），所以地址类要收 A-F。
         mfbs = last("[[]FB64[]] fb source=([a-z]+) addr=0x([0-9a-fA-F]+) w=([0-9]+) h=([0-9]+) "
                     "pitch=([0-9]+) hi4g=([0-9]) pt=([a-z]+) pt_last=([a-z]+) usable=([0-9]) "
-                    "remap=([0-9]+)",
+                    "remap=([0-9]+) upgrade=([0-9]+)",
                     vm.log())
         if check("④b 打点 [FB64] fb source=… 出现且字段齐全", mfbs is not None,
                  mfbs.group(0) if mfbs else "缺/格式不符"):
@@ -250,16 +250,23 @@ def run_case(qemu, img, tag, vga, extra, expect_vendor, expect_gpus, expect_mmio
                   mfbs.group(9) == "1", "usable=%s" % mfbs.group(9))
             check("④b 本夹具帧缓冲本来就是映射好的 -> remap=0（不该乱补页表）",
                   mfbs.group(10) == "0", "remap=%s" % mfbs.group(10))
+            check("④b 本夹具没有只读页需要升级 -> upgrade=0", mfbs.group(11) == "0",
+                  "upgrade=%s" % mfbs.group(11))
         if tag == "remap":
             # ★ v0.9.9：页表自补自检真的跑了一遍并复原
             mrs = last("[[]FB64[]] remap selftest pa=0x([0-9a-fA-F]+) made=([0-9]+) walk=([a-z]+) "
-                       "restored=([0-9]) ok=([0-9])", vm.log())
+                       "ro_walk=([a-z]+) upgrade=([0-9]+) rw_walk=([a-z]+) restored=([0-9]) ok=([0-9])",
+                       vm.log())
             if check("④b-remap 自检行出现（[FB64] remap selftest …）", mrs is not None,
                      mrs.group(0) if mrs else "缺/格式不符"):
                 check("④b-remap 新增了页表项（made>=1）", int(mrs.group(2)) >= 1, "made=%s" % mrs.group(2))
                 check("④b-remap 补完走查确认可写（walk=rw）", mrs.group(3) == "rw", "walk=%s" % mrs.group(3))
-                check("④b-remap 自检把新增项抹掉了（restored=1）", mrs.group(4) == "1", "restored=%s" % mrs.group(4))
-                check("④b-remap 自检结论 ok=1", mrs.group(5) == "1", "ok=%s" % mrs.group(5))
+                check("④b-remap 故意改成只读后走查确实是 ro（ro_walk=ro）", mrs.group(4) == "ro",
+                      "ro_walk=%s" % mrs.group(4))
+                check("④b-remap RO->RW 升级真的生效（upgrade>=1）", int(mrs.group(5)) >= 1, "upgrade=%s" % mrs.group(5))
+                check("④b-remap 升级后走查可写（rw_walk=rw）", mrs.group(6) == "rw", "rw_walk=%s" % mrs.group(6))
+                check("④b-remap 自检把新增项抹掉了（restored=1）", mrs.group(7) == "1", "restored=%s" % mrs.group(7))
+                check("④b-remap 自检结论 ok=1", mrs.group(8) == "1", "ok=%s" % mrs.group(8))
 
         # ---------- ② 每张卡的 dev 行 ----------
         devs = list(re.finditer(
