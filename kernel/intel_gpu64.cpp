@@ -8,6 +8,12 @@
 //           alt_off=0x200000 alt_valid=0 phys_first=0x12345000
 //   [INTEL] gtt bar=2 absent reason=no-bar2
 //   [INTEL] gtt bar=2 phys=0x… size=0x… skipped reason=small-window|above-4g-unmapped
+//   [INTEL] pipe a conf=0x… dsl=0x… on=1 htotal=0x… vtotal=0x… pipesrc=0x… hactive=… vactive=…
+//   [INTEL] plane a ctrl=0x… on=1 fmt=6 stride=5120 surf=0x… linoff=0x… tileoff=0x…
+//   [INTEL] plan takeover=not-yet frame_match=1 need=gtt-framebuffer,plane-programming readonly=1
+//   [INTEL] pipe snapshot skipped reason=no-reg-window
+//   （上面三行是 v0.9.9 新增：接管前的**只读**证据链；GTT 行的行尾还多一个
+//     alloc=readonly scan=4096 free_run_start=… free_run_len=… 的空闲段扫描结果）
 //   [INTEL] mode=intel-safe requested=intel_safe readonly=1 scanout=none vendor_writes=0
 //   [INTEL] selftest ok intel_devs=1 readonly=1
 //   [INTEL] selftest skipped reason=no-intel-device
@@ -136,6 +142,95 @@ __attribute__((noinline)) static uint32_t in_gtt_valid(uint64_t pa, int n, uint6
     return cnt;
 }
 
+// ==================== ★ v0.9.9：显示引擎只读快照（接管前的证据链）====================
+// 目的很窄：把**固件现在把 pipe / plane 编成了什么样**如实读出来，好回答"接管前还差什么"。
+// 边界不变：**全是读**。本批不写 pipe/plane/DPLL，也不碰 GTT 表项。
+//
+// 偏移来源：Intel 显示引擎（gen4+ 起的 pipe/plane 寄存器布局在 gen9/gen9.5 上沿用），
+//   我们只取**公开且稳定**的那一组；不确定位域含义的寄存器一律只打原始值，
+//   不硬解释（宁可少说，也不给真机一个"看起来对"的结论）。
+//     0x60000/0x60008/0x6000C/0x60014  HTOTAL/HSYNC/VTOTAL/VSYNC (pipe A)
+//     0x6001C                          PIPESRC_A（源尺寸）
+//     0x70000 / 0x70008                PIPEA_DSL / PIPEA_CONF（bit31 = pipe enable）
+//     0x70180 / 0x70188 / 0x7019C      DSPACNTR（bit31 使能，bits29:26 格式）/ DSPASTRIDE / DSPASURF
+//     0x70184 / 0x701A4                DSPALINOFF / DSPATILEOFF
+__attribute__((noinline)) static uint32_t in_reg32(uint64_t base, uint64_t size, uint64_t off) {
+    if (!base || off + 4ull > size) return 0xFFFFFFFFu;   // 窗口外一律当"读不到"，绝不解引用
+    return *(volatile uint32_t*)(uintptr_t)(base + off);
+}
+
+__attribute__((noinline)) static void in_pipe_snapshot64(const Gpu64Dev64* d) {
+    // BAR0 至少要覆盖到 0x701A8 才敢读（多数核显寄存器窗口是 512 KiB，远超它）
+    if (!d->bar0_ok || d->bar0_size < 0x701A8ull) {
+        in_begin();
+        in_puts("[INTEL] pipe snapshot skipped reason=no-reg-window");
+        in_end();
+        return;
+    }
+    const uint64_t b = d->bar0_phys, sz = d->bar0_size;
+    const uint32_t htotal = in_reg32(b, sz, 0x60000u);
+    const uint32_t vtotal = in_reg32(b, sz, 0x6000Cu);
+    const uint32_t pipesrc = in_reg32(b, sz, 0x6001Cu);
+    const uint32_t conf   = in_reg32(b, sz, 0x70008u);
+    const uint32_t dsl    = in_reg32(b, sz, 0x70000u);
+    const uint32_t ctrl   = in_reg32(b, sz, 0x70180u);
+    const uint32_t stride = in_reg32(b, sz, 0x70188u);
+    const uint32_t surf   = in_reg32(b, sz, 0x7019Cu);
+    const uint32_t linoff = in_reg32(b, sz, 0x70184u);
+    const uint32_t tioff  = in_reg32(b, sz, 0x701A4u);
+
+    // 已编程的显示模式：HTOTAL/VTOTAL 的低 12 位是"active-1"（这是 gen2 起没变过的布局）
+    const uint32_t hactive = (htotal & 0xFFFu) + 1u;
+    const uint32_t vactive = (vtotal & 0xFFFu) + 1u;
+    in_begin();
+    in_puts("[INTEL] pipe a conf=");   in_hex(conf);
+    in_puts(" dsl=");                  in_hex(dsl);
+    in_puts(" on=");                   in_ch((char)('0' + ((conf >> 31) & 1u)));
+    in_puts(" htotal=");               in_hex(htotal);
+    in_puts(" vtotal=");               in_hex(vtotal);
+    in_puts(" pipesrc=");              in_hex(pipesrc);
+    in_puts(" hactive=");              in_num(hactive);
+    in_puts(" vactive=");              in_num(vactive);
+    in_end();
+
+    in_begin();
+    in_puts("[INTEL] plane a ctrl=");  in_hex(ctrl);
+    in_puts(" on=");                   in_ch((char)('0' + ((ctrl >> 31) & 1u)));
+    in_puts(" fmt=");                  in_num((ctrl >> 26) & 0xFu);   // bits29:26 像素格式码
+    in_puts(" stride=");               in_num(stride & 0x7FFFFu);
+    in_puts(" surf=");                 in_hex(surf);
+    in_puts(" linoff=");               in_hex(linoff);
+    in_puts(" tileoff=");              in_hex(tioff);
+    in_end();
+
+    // 与**我们的**帧缓冲几何对一下：相等说明"接管时只要把 plane 指到我们的缓冲"；
+    // 不等说明接管还得连带把 pipe timing 一起重编（工作量和风险都不一样，必须先知道）。
+    in_begin();
+    in_puts("[INTEL] plan takeover=not-yet");
+    in_puts(" frame_match=");
+    in_ch((char)('0' + ((hactive == (uint32_t)fb_phys_width() &&
+                         vactive == (uint32_t)fb_phys_height()) ? 1u : 0u)));
+    in_puts(" need=gtt-framebuffer,plane-programming");
+    in_puts(" readonly=1");
+    in_end();
+}
+
+// GTT 空闲段扫描（**只读**）：前 scan 项里最长的一段"全 invalid"。接管时要往 GTT 里放我们自己的
+// 帧缓冲，就需要知道哪儿是空的。这里只报告，不分配、不写。
+__attribute__((noinline)) static void in_gtt_scan64(uint64_t gtt_pa, uint32_t off, uint32_t scan) {
+    uint32_t run = 0, best = 0, best_at = 0, cur = 0;
+    for (uint32_t i = 0; i < scan; i++) {
+        const uint64_t e = *(volatile uint64_t*)(uintptr_t)(gtt_pa + (uint64_t)off + (uint64_t)i * 8u);
+        if (e & 1ull) { run = 0; continue; }
+        if (!run) cur = i;
+        run++;
+        if (run > best) { best = run; best_at = cur; }
+    }
+    in_puts(" alloc=readonly scan="); in_num(scan);
+    in_puts(" free_run_start=");      in_num(best_at);
+    in_puts(" free_run_len=");        in_num(best);
+}
+
 static uint32_t g_intel_devs = 0;                        // 跑过几张 Intel 卡（selftest 用）
 
 int intel64_probe64(const Gpu64Dev64* d) {
@@ -156,6 +251,9 @@ int intel64_probe64(const Gpu64Dev64* d) {
     in_puts(" bar0=");
     if (d->bar0_ok) in_hex(d->bar0_phys); else in_puts("none");
     in_end();
+
+    // ---- 1b) 显示引擎只读快照（接管前的证据链，见 in_pipe_snapshot64 注释）----
+    in_pipe_snapshot64(d);
 
     // ---- 2) BAR2 = GTTMMADR（GTT 表窗口）----
     // 与 gpu64.cpp 探 BAR0 同一个做法：关中断、探完立刻还原（pci64 内部会回读确认）。
@@ -197,6 +295,7 @@ int intel64_probe64(const Gpu64Dev64* d) {
     in_puts(" alt_off=");   in_hex((uint64_t)off_alt);
     in_puts(" alt_valid="); in_num(v_alt);
     in_puts(" phys_first="); in_hex(first);
+    in_gtt_scan64(b2.phys, (uint32_t)off_main, 4096);
     in_end();
 
     // ---- 3) 本批次边界（每次都说清楚，免得日后误读成"驱动做完了"）----

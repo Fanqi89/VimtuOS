@@ -231,7 +231,8 @@ def run_case(qemu, img, tag, vga, extra, expect_vendor, expect_gpus, expect_mmio
         # 页表里这块显存到底能不能写（不能写就 usable=0，一律不碰屏）。
         # 注意：db g64_hex64 打的是**大写**十六进制（LIKE 00000000FD000000），所以地址类要收 A-F。
         mfbs = last("[[]FB64[]] fb source=([a-z]+) addr=0x([0-9a-fA-F]+) w=([0-9]+) h=([0-9]+) "
-                    "pitch=([0-9]+) hi4g=([0-9]) pt=([a-z]+) pt_last=([a-z]+) usable=([0-9])",
+                    "pitch=([0-9]+) hi4g=([0-9]) pt=([a-z]+) pt_last=([a-z]+) usable=([0-9]) "
+                    "remap=([0-9]+)",
                     vm.log())
         if check("④b 打点 [FB64] fb source=… 出现且字段齐全", mfbs is not None,
                  mfbs.group(0) if mfbs else "缺/格式不符"):
@@ -247,6 +248,18 @@ def run_case(qemu, img, tag, vga, extra, expect_vendor, expect_gpus, expect_mmio
                   "pt=%s pt_last=%s" % (mfbs.group(7), mfbs.group(8)))
             check("④b usable=1（页表判定通过才出帧；0 时一律不碰屏）",
                   mfbs.group(9) == "1", "usable=%s" % mfbs.group(9))
+            check("④b 本夹具帧缓冲本来就是映射好的 -> remap=0（不该乱补页表）",
+                  mfbs.group(10) == "0", "remap=%s" % mfbs.group(10))
+        if tag == "remap":
+            # ★ v0.9.9：页表自补自检真的跑了一遍并复原
+            mrs = last("[[]FB64[]] remap selftest pa=0x([0-9a-fA-F]+) made=([0-9]+) walk=([a-z]+) "
+                       "restored=([0-9]) ok=([0-9])", vm.log())
+            if check("④b-remap 自检行出现（[FB64] remap selftest …）", mrs is not None,
+                     mrs.group(0) if mrs else "缺/格式不符"):
+                check("④b-remap 新增了页表项（made>=1）", int(mrs.group(2)) >= 1, "made=%s" % mrs.group(2))
+                check("④b-remap 补完走查确认可写（walk=rw）", mrs.group(3) == "rw", "walk=%s" % mrs.group(3))
+                check("④b-remap 自检把新增项抹掉了（restored=1）", mrs.group(4) == "1", "restored=%s" % mrs.group(4))
+                check("④b-remap 自检结论 ok=1", mrs.group(5) == "1", "ok=%s" % mrs.group(5))
 
         # ---------- ② 每张卡的 dev 行 ----------
         devs = list(re.finditer(
@@ -337,14 +350,17 @@ CASES = {
     "virtio": ("virtio", [], 1),
     "qxl":    ("qxl",    [], 1),
     "multi":  ("std",    ["-device", "secondary-vga", "-device", "secondary-vga"], 3),
+    # ★ v0.9.9：fbtest=remap 让内核启动时真跑一遍"页表自补自检"（补一条 PD 项 -> 走查确认 -> 抹掉），
+    #   这是本批唯一能在模拟器上**端到端**验证的页表写入路径。
+    "remap":  ("std",    ["-fw_cfg", "name=opt/vimtu/gpu,string=fbtest=remap"], 1),
 }
-EXPECT_VENDOR = {"std": "1234", "virtio": "1af4", "qxl": "1b36", "multi": "1234"}
+EXPECT_VENDOR = {"std": "1234", "virtio": "1af4", "qxl": "1b36", "multi": "1234", "remap": "1234"}
 # 第一张卡 BAR0 的形状 —— 期望值来自**实测**（不是猜的，第一版就猜错过一次）：
 #   std    : -vga std  -> Bochs VGA，bar0=0xfd000000 size=16777216 mmio=ok
 #   virtio : -vga virtio -> virtio-gpu，bar0=0xfe000000 size=8388608 mmio=ok（★ 我一开始猜"BAR0 是 I/O BAR"，
 #            实测打脸：过渡型 virtio-vga 的 BAR0 就是 legacy VGA 的 LFB 窗口）
 #   qxl / multi 的实测值见下面的 EXPECT_MMIO（首次跑完填的）
-EXPECT_MMIO = {"std": "ok", "virtio": "ok", "qxl": "ok", "multi": "ok"}
+EXPECT_MMIO = {"std": "ok", "virtio": "ok", "qxl": "ok", "multi": "ok", "remap": "ok"}
 
 
 def main():
@@ -362,7 +378,7 @@ def main():
         print("环境问题：找不到系统盘映像：%s（先跑 bash build64.sh）" % args.img)
         return 2
 
-    want = [t for t in (args.only.split(",") if args.only else ["std", "virtio", "qxl", "multi"]) if t]
+    want = [t for t in (args.only.split(",") if args.only else ["std", "virtio", "qxl", "multi", "remap"]) if t]
     for t in want:
         if t not in CASES:
             print("环境问题：未知夹具 %s（可选 %s）" % (t, ",".join(CASES)))

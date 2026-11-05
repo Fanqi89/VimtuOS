@@ -176,9 +176,155 @@ const char* fb64_source_name64(void) { return fb_source == 1 ? "gop" : "vbe"; }
 uint64_t fb64_lfb_phys64(void) { return fb_addr; }
 int fb64_lfb_usable64(void) { return fb_usable; }
 
+// ==================== ★ v0.9.9：帧缓冲页表**自补** ====================
+// 为什么需要：UEFI 下帧缓冲的映射是**固件**建的。v0.9.8 的只读走查发现"没映射/只读"时只会
+// 让 fb_usable=0（不黑屏，但也没画面）。本批升一级：**缺的映射我们自己补**，补完**重新走查
+// 确认**，确认不了仍然 fb_usable=0 —— 也就是"能补就补，补不成还是不碰屏"。
+//
+// 三条硬纪律：
+//   ① **只补缺的**：任何已存在的页表项（4 KiB / 2 MiB / 1 GiB，也不管读写位）一律**不动**，
+//      把风险限制在"新增"这一种动作上。
+//   ② 新页表页来自内核页池（page_alloc_64，物理即虚拟的恒等映射），**先清零再用**。
+//   ③ 写页表包在"临时清 CR0.WP"的窗口里（EDK2 把固件页表页标成只读，直接写会 #PF；这与
+//      boot/efi/uefi64.c 挂高半区映射是同一个手法），写完立刻恢复**完整 CR0**。
+//   只新增"原本不存在"的项 -> 不需要 invlpg（boot/efi/uefi64.c 里有同样的实测记录）。
+// 页池分配（实现见 kernel/mem64.cpp）。这里**只声明这一个函数**：直接 include mem_64.h
+// 会连带 <stddef.h>，与本项目的 freestanding 头文件布局冲突（已有已知噪音），为一个符号不值得。
+void* page_alloc_64();
+void page_free_64(void* p);
+
+#define FB64_2MB 0x200000ull
+
+static inline uint64_t fb64_cr0_get64(void) {
+    uint64_t v; __asm__ volatile("mov %%cr0, %0" : "=r"(v)); return v;
+}
+static inline void fb64_cr0_set64(uint64_t v) {
+    __asm__ volatile("mov %0, %%cr0" : : "r"(v) : "memory");
+}
+static void fb64_page_zero64(uint64_t pa) {            // -nostdlib：自己清
+    volatile uint64_t* p = (volatile uint64_t*)(uintptr_t)pa;
+    for (uint32_t i = 0; i < 512u; i++) p[i] = 0;
+}
+
+// 为物理区间 [pa, pa+bytes) 补齐恒等映射（2 MiB 大页）。返回**新补的 2 MiB 页数**；
+// 0 = 没补（已存在 / 补不了）。绝不改动已存在的项。
+static int fb64_remap64(uint64_t pa, uint64_t bytes) {
+    if (!pa || !bytes) return 0;
+    uint64_t cr3 = 0;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t* l4 = (uint64_t*)(uintptr_t)(cr3 & FB64_PA_MASK);
+    const uint64_t first = pa & ~(FB64_2MB - 1ull);
+    const uint64_t last  = (pa + bytes + FB64_2MB - 1ull) & ~(FB64_2MB - 1ull);
+    const uint64_t cr0 = fb64_cr0_get64();
+    const uint64_t cr0_nw = cr0 & ~0x10000ull;         // 清 CR0.WP(bit16)
+    int made = 0;
+    for (uint64_t chunk = first; chunk < last; chunk += FB64_2MB) {
+        const uint64_t i4 = (chunk >> 39) & 511u;
+        uint64_t* l3 = nullptr;
+        if (!(l4[i4] & 1u)) {
+            const uint64_t p = (uint64_t)(uintptr_t)page_alloc_64();
+            if (!p) break;
+            fb64_page_zero64(p);
+            fb64_cr0_set64(cr0_nw); l4[i4] = p | 0x3u; fb64_cr0_set64(cr0);   // P|RW
+            l3 = (uint64_t*)(uintptr_t)p;
+        } else {
+            l3 = (uint64_t*)(uintptr_t)(l4[i4] & FB64_PA_MASK);
+        }
+        const uint64_t i3 = (chunk >> 30) & 511u;
+        uint64_t* l2 = nullptr;
+        if (!(l3[i3] & 1u)) {
+            const uint64_t p = (uint64_t)(uintptr_t)page_alloc_64();
+            if (!p) break;
+            fb64_page_zero64(p);
+            fb64_cr0_set64(cr0_nw); l3[i3] = p | 0x3u; fb64_cr0_set64(cr0);   // PD
+            l2 = (uint64_t*)(uintptr_t)p;
+        } else if (l3[i3] & 0x80u) {
+            continue;                                  // 1 GiB 大页盖着：不改，交给走查判定
+        } else {
+            l2 = (uint64_t*)(uintptr_t)(l3[i3] & FB64_PA_MASK);
+        }
+        const uint64_t i2 = (chunk >> 21) & 511u;
+        if (l2[i2] & 1u) continue;                     // 已存在（含 2 MiB 大页）：**不动**
+        fb64_cr0_set64(cr0_nw); l2[i2] = chunk | 0x83u; fb64_cr0_set64(cr0);  // P|RW|PS
+        made++;
+    }
+    return made;
+}
+
+// 自检：在**一段确定未映射**的地址上真走一遍"补映射 -> 走查确认 -> 原样抹掉并还页"，
+//   证明"往当前页表里写项"这条路在当前固件（BIOS 页表 / UEFI 固件页表）下真的可用。
+//   候选判据：走查结果为空（= 现在这块地址根本不可用）。于是三种情况都覆盖到：
+//     PML4 项缺 -> 建 PDPT 页；PDPT 项缺 -> 建 PD 页；只缺 2 MiB 项 -> 只加一项。
+//   复原按"逆序只拆我们建的那一层"，并把新建的页表页**还回页池**；找不到候选就如实 skipped。
+//   ★ 全程不读写那段地址本身（只碰页表项），所以对真机无害。
+static int fb64_remap_selftest64(void) {
+    uint64_t cr3 = 0;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t* l4 = (uint64_t*)(uintptr_t)(cr3 & FB64_PA_MASK);
+    uint64_t cand = 0;
+    for (uint64_t a = 0x3E0000000ull, n = 0; n < 4096u; n++, a += FB64_2MB) {
+        if (fb64_pt_state64(a) == 0) { cand = a; break; }   // 当前不可用 = 命中
+    }
+    if (!cand) {
+        dbg64_line_begin64();
+        dbg64_str("[FB64] remap selftest skipped reason=no-unmapped-window");
+        dbg64_nl(); dbg64_line_end64();
+        return 0;
+    }
+    const uint64_t q4 = (cand >> 39) & 511u;
+    const uint64_t q3 = (cand >> 30) & 511u;
+    const uint64_t q2 = (cand >> 21) & 511u;
+    const uint64_t e4_before = l4[q4];
+    uint64_t e3_before = 0;
+    if (e4_before & 1u) {
+        const uint64_t* p3 = (const uint64_t*)(uintptr_t)(e4_before & FB64_PA_MASK);
+        e3_before = p3[q3];
+    }
+    const uint64_t cr0 = fb64_cr0_get64();
+    const uint64_t cr0_nw = cr0 & ~0x10000ull;
+    const int made = fb64_remap64(cand, FB64_2MB);
+    const int st = fb64_pt_state64(cand);
+    // ---- 复原：逆序只拆我们建的那一层，并把新建的页表页还回去 ----
+    fb64_cr0_set64(cr0_nw);
+    if (!(e4_before & 1u)) {
+        const uint64_t p = l4[q4] & FB64_PA_MASK;
+        l4[q4] = 0;
+        fb64_cr0_set64(cr0);
+        if (p) page_free_64((void*)(uintptr_t)p);
+    } else if (!(e3_before & 1u)) {
+        uint64_t* p3 = (uint64_t*)(uintptr_t)(e4_before & FB64_PA_MASK);
+        const uint64_t p = p3[q3] & FB64_PA_MASK;
+        p3[q3] = 0;
+        fb64_cr0_set64(cr0);
+        if (p) page_free_64((void*)(uintptr_t)p);
+    } else {
+        uint64_t* p2 = (uint64_t*)(uintptr_t)(e3_before & FB64_PA_MASK);
+        p2[q2] = 0;
+        fb64_cr0_set64(cr0);
+    }
+    const int st2 = fb64_pt_state64(cand);
+    const int ok = (st == 2 && made > 0 && st2 == 0) ? 1 : 0;
+    dbg64_line_begin64();
+    dbg64_str("[FB64] remap selftest pa=0x"); dbg64_hex64(cand);
+    dbg64_str(" made=");      dbg64_dec((uint64_t)made);
+    dbg64_str(" walk=");      dbg64_str(st == 2 ? "rw" : (st == 1 ? "ro" : "unmapped"));
+    dbg64_str(" restored=");  dbg64_putc(st2 == 0 ? '1' : '0');
+    dbg64_str(" ok=");        dbg64_putc(ok ? '1' : '0');
+    dbg64_nl(); dbg64_line_end64();
+    return ok;
+}
+
+// fw_cfg 测试开关：opt/vimtu/gpu 的 fbtest=remap -> 启动时跑一次上面的自检。
+// 只用于夹具/真机取证（默认不跑，日志保持干净）。
+static int fb64_fbtest_remap64(void) {
+    char v[16];
+    if (!fb64_fwcfg_str64("opt/vimtu/gpu", "fbtest", v, (int)sizeof(v))) return 0;
+    return (v[0] == 'r' && v[1] == 'e' && v[2] == 'm' && v[3] == 'a' && v[4] == 'p') ? 1 : 0;
+}
+
 // 一行来源打点（纯 ASCII，新行；老行一律没动）。真机取证就靠它回答
 // "这张卡上到底走的哪条路、地址是多少、固件有没有把这块显存映射成可写"。
-__attribute__((noinline)) static void fb64_log_source64(int st_first, int st_last) {
+__attribute__((noinline)) static void fb64_log_source64(int st_first, int st_last, int remapped) {
     dbg64_line_begin64();
     dbg64_str("[FB64] fb source="); dbg64_str(fb64_source_name64());
     dbg64_str(" addr=0x");          dbg64_hex64(fb_addr);
@@ -191,6 +337,7 @@ __attribute__((noinline)) static void fb64_log_source64(int st_first, int st_las
     dbg64_str(" pt_last=");
     dbg64_str(st_last == 0 ? "unmapped" : (st_last == 1 ? "ro" : "rw"));
     dbg64_str(" usable=");          dbg64_putc(fb_usable ? '1' : '0');
+    dbg64_str(" remap=");           dbg64_dec((uint64_t)remapped);   // 自补了几页 2MiB
     dbg64_nl();
     dbg64_line_end64();
 }
@@ -204,13 +351,21 @@ void fb_init(const BootInfo* bi) {
     fb_bpp = bi->bpp;
     fb_pitch = bi->pitch;
     if (fb_pitch == 0) fb_pitch = fb_w * 4;
-    // 页表只读走查：首末页都可写才允许出帧（理由见上面那段注释）。
+    // 页表只读走查：首末页都可写才允许出帧；不可用就**试着自补**（只新增缺的项），
+    // 补完再走查一次 —— 仍然不可用就 fb_usable=0（不碰屏）。理由见上面那段注释。
     int s0 = 0, s1 = 0;
+    int remapped = 0;
     if (fb_addr && fb_w > 0 && fb_h > 0) {
         const uint64_t span = (uint64_t)fb_h * (uint64_t)fb_pitch;
         s0 = fb64_pt_state64(fb_addr);
         s1 = fb64_pt_state64(fb_addr + span - 1u);
         fb_usable = (s0 == 2 && s1 == 2) ? 1 : 0;
+        if (!fb_usable) {                                 // ★ v0.9.9：缺映射就自己补
+            remapped = fb64_remap64(fb_addr, span);
+            s0 = fb64_pt_state64(fb_addr);
+            s1 = fb64_pt_state64(fb_addr + span - 1u);
+            fb_usable = (s0 == 2 && s1 == 2) ? 1 : 0;
+        }
     } else {
         fb_usable = 0;                                    // 没有帧缓冲：不出帧，也不崩
     }
@@ -221,7 +376,9 @@ void fb_init(const BootInfo* bi) {
     g_render_w = fb_w;
     g_render_h = fb_h;
     g_zoom = 100;
-    fb64_log_source64(s0, s1);
+    fb64_log_source64(s0, s1, remapped);
+    // 夹具/取证开关：opt/vimtu/gpu 的 fbtest=remap -> 真跑一遍页表自补自检
+    if (fb64_fbtest_remap64()) fb64_remap_selftest64();
 }
 
 int fb_width() { return g_render_w ? g_render_w : fb_w; }
