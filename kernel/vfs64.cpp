@@ -3072,7 +3072,18 @@ int vfs64_unlink64(const char* path) {
     uint32_t idx = 0;
     char uabuf[VFS64_PATH_MAX + 1];
     const char* upath = vfs64_alias_path64(path, uabuf, (uint32_t)sizeof(uabuf));
-    const int pr = path_resolve_raw(upath, false, &idx, nullptr, nullptr, nullptr);
+    int pr = path_resolve_raw(upath, false, &idx, nullptr, nullptr, nullptr);
+    // ★ v0.9.6 真缺陷修复（make64_test 的 `make clean` 断言抓到的）：
+    //   v0.7.8 为"不跟随最后一级符号链接"把这里从 path_resolve 换成了 path_resolve_raw，
+    //   顺手把**回退旧路径**丢了 —— 于是 unlink 只用别名后的新落点去解析。
+    //   串口实测（旧布局夹具卷里 /make-demo/hello 真的存在）：
+    //     [VFS64] path component not found path=/usr/share/demo/make-demo//hello
+    //     [VFS64] unlink64: not found          -> rm: failed /make-demo/hello (err=2=ENOENT)
+    //   而项目对整个 VFS 的承诺是"新路径优先，失败回退原路径"（见 path_resolve 上方注释），
+    //   unlink 不该是唯一的例外。修法：结构性失败（非 -EACCES）就用**原路径**再解析一次。
+    if (pr != 0 && pr != -VFS64_EACCES && upath != path) {
+        pr = path_resolve_raw(path, false, &idx, nullptr, nullptr, nullptr);
+    }
     if (pr != 0) {
         if (pr == -VFS64_EACCES) return -VFS64_EACCES;
         log_op_fail("unlink64", "not found");
@@ -3109,7 +3120,12 @@ int vfs64_rmdir64(const char* path) {
     uint32_t idx = 0;
     char rabuf[VFS64_PATH_MAX + 1];
     const char* rpath = vfs64_alias_path64(path, rabuf, (uint32_t)sizeof(rabuf));
-    const int pr = path_resolve_raw(rpath, false, &idx, nullptr, nullptr, nullptr);
+    int pr = path_resolve_raw(rpath, false, &idx, nullptr, nullptr, nullptr);
+    // ★ v0.9.6：与 unlink64 同一处缺陷（v0.7.8 换成 path_resolve_raw 时丢了"回退原路径"）——
+    //   rmdir 在旧布局的夹具卷上同样会 ENOTDIR/ENOENT 假失败。这里补回同一个回退。
+    if (pr != 0 && pr != -VFS64_EACCES && rpath != path) {
+        pr = path_resolve_raw(path, false, &idx, nullptr, nullptr, nullptr);
+    }
     if (pr != 0) {
         if (pr == -VFS64_EACCES) return -VFS64_EACCES;
         log_op_fail("rmdir64", "not found");

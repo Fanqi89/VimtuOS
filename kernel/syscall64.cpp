@@ -343,6 +343,10 @@ static void syscall64_enosys_once64(uint64_t nr) {
 
 // ==================== 屏幕输出（write 用）====================
 // 串口走 dbg64_putc（同时写 debugcon），屏幕走 8x8 内置字体 + 局部提交。
+// ★ v0.9.5：串口输出统一走"按行原子"的 syscall64_serial_linewise64()（实现在下面 lx64_console_out64
+//   上方；这里先声明，因为 int 0x80 的 write 路径在它之前）。理由见那份实现的注释：逐字符裸写会被
+//   抢占切成半行、再被内核日志劈开（实测 `… -j2 al[SHM64] …`）。
+static void syscall64_serial_linewise64(const char* p, uint64_t len);
 // 只画一行（覆盖上一次的内容）：用户态日志很短，够证明"输出到了屏幕"。
 static void syscall64_screen_puts64(const char* s, uint64_t n) {
     if (fb_width() <= 0) return;                     // 还没建帧缓冲（理论上不会）
@@ -367,7 +371,7 @@ static int64_t syscall64_write64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_
     if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -1; }
 
     const char* p = (const char*)(uintptr_t)buf;                     // 已校验：是用户页，ring0 可读
-    for (uint64_t i = 0; i < len; i++) dbg64_putc(p[i]);
+    syscall64_serial_linewise64(p, len);                             // ★ v0.9.5：按行原子（原来逐字符裸写）
     syscall64_screen_puts64(p, len);
     return (int64_t)len;
 }
@@ -608,8 +612,31 @@ static int lx64_resolve_path64(uint64_t path_va, char* out, uint32_t cap) {
 static uint8_t g_lx_readbuf64[LX64_READ_MAX];
 // ★ A4-2a：控制台输出 = 串口（总是）+ 屏幕（fd 1 才画；fd 2 = 只串口，与旧行为一致）。
 //   fd64 的"控制台 tty"对象通过下面的 extern "C" 钩子复用同一份实现（弱符号，见 fd64.cpp）。
+// ★ v0.9.5 真缺陷修复（make64_test 的 `-j2` 断言抓到）：客人的 stdout 原来是**逐字符**直接
+//   `dbg64_putc`，既不取行锁、也挡不住抢占 —— 任务可能在一条输出行的**中间**被 PIT 切走、
+//   内核顺手打一条日志，串口上就成了"半行 + 内核行 + 半行"。实测截下来长这样：
+//     `… -j2 al[SHM64] inherit pid=37 from=24 held=0 refs_plus=1`
+//   （本应是 `run: /bin/make -C /make-demo -j2 all`，`al` 与 `l` 被劈开）。
+//   修法：**按行发** —— 每行 `dbg64_line_begin64()`（= cli + 行锁）-> 写这一行 -> 放锁。
+//   关中断窗口被压到"一行"（通常 < 200 字符 ≈ 1 ms），比"整次 write 都关中断"安全得多；
+//   这也是项目里既有的"行原子"约定（见 kernel/debug64.h 顶部说明）。
+static void syscall64_serial_linewise64(const char* p, uint64_t len) {
+    uint64_t i = 0;
+    while (i < len) {
+        uint64_t j = i;
+        while (j < len && p[j] != '\n') j++;
+        const bool has_nl = (j < len);
+        dbg64_line_begin64();
+        for (uint64_t k = i; k < j; k++) dbg64_putc(p[k]);
+        if (has_nl) dbg64_putc('\n');
+        dbg64_line_end64();
+        i = has_nl ? (j + 1u) : j;
+    }
+}
+// ★ A4-2a：控制台输出 = 串口（总是）+ 屏幕（fd 1 才画；fd 2 = 只串口，与旧行为一致）。
+//   fd64 的"控制台 tty"对象通过下面的 extern "C" 钩子复用同一份实现（弱符号，见 fd64.cpp）。
 static void lx64_console_out64(const char* p, uint64_t len, bool screen) {
-    for (uint64_t i = 0; i < len; i++) dbg64_putc(p[i]);
+    syscall64_serial_linewise64(p, len);      // ★ v0.9.5：换成按行原子的版本（见上）
     if (screen) syscall64_screen_puts64(p, len);
 }
 extern "C" void syscall64_console_write64(const char* buf, int len) {
