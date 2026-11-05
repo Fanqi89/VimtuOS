@@ -243,15 +243,21 @@ static void wl64_layout64() {
 // 槽位 -> 屏幕位置（surface 创建时定死；组合器策略，见 wl64.h 第 6 条）
 static void wl64_place64(Wl64Surface* s, uint32_t slot) {
     s->slot = slot % WL64_MAX_SLOTS64;
-    // ★ v0.5.0（大窗口）：放不进槽位的 surface 改为**屏幕居中**。
-    //   槽位是给 256x60 这类小面板设计的（右下角 320x200 面板区里两块故意重叠），把 896x560 的
-    //   浏览器窗口塞进槽位会算到屏幕外 —— 用户看到的是"窗口不出现"（wm 合成时整块被裁掉）。
-    //   判定用**尺寸**而不是创建序号：小 surface 的既有布局一个像素都不变（store / fontdemo /
-    //   wmclock 的验收按 [WL64] surface create … pos=x,y 断言，不受这条影响）。
+    // ★ v0.5.0（大窗口）+ ★ v0.9.7（判据修正）：比**面板区**大的 surface 改为**屏幕居中**。
+    //   面板区是给 256x60 这类小面板设计的（右下角 320x200 里两块故意重叠），把 896x560 的浏览器
+    //   窗口塞进槽位会被裁成一条 —— 所以"大"的要居中。
+    //   ★ v0.9.7 真缺陷修复（wl64_test / wm64_test 的像素断言抓到的）：这里原来的判据是
+    //     "比**槽位偏移**大就算大 surface"（wl64_slot_dx64(1)=112 / dy=88），于是 160x96 的 wmclock
+    //     与 128x64 的 wmpanel 都被判成"大" -> 走屏幕居中（实测 rects=(560,352)/(576,368)），
+    //     而 wl64_blit64 又把小 surface 的可见区裁到右下角外部面板区（948,516,320,200）
+    //     -> 交集为空 -> 一个像素都不画（屏幕纯黑）+ `[WM] frame … blends=[0,0]`。
+    //   正确判据要和 blit 的裁剪判据**同一把尺子**：比面板（320x200）大才算大 surface。
     {
         const int fw = fb_width(), fh = fb_height();
-        if (fw > 0 && fh > 0 &&
-            ((int)s->w > (int)wl64_slot_dx64(1) || (int)s->h > (int)wl64_slot_dy64(1))) {
+        // 面板还没算好（panel_ok=0）时按常量判（布局前创建的 surface 才不会全被当成"大"）
+        const int pw_ = g_wl64_panel_ok64 ? (int)g_wl64_pw64 : (int)WL64_PANEL_W64;
+        const int ph_ = g_wl64_panel_ok64 ? (int)g_wl64_ph64 : (int)WL64_PANEL_H64;
+        if (fw > 0 && fh > 0 && ((int)s->w > pw_ || (int)s->h > ph_)) {
             const int cx = (fw - (int)s->w) / 2;
             const int cy = (fh - (int)s->h) / 2;
             s->x = (cx > 0) ? cx : 0;
