@@ -29,7 +29,7 @@
 ;     0xE00..   实模式栈（SS=0，SP=0x8F00，向下生长）
 ; ============================================================================
 %define SMP64_TRAMPOLINE_PHYS   0x8000      ; SMP64_TRAMPOLINE_PHYS
-%define SMP64_OFF_GDTR          0x40        ; SMP64_OFF_GDTR
+%define SMP64_OFF_GDTR          0x50        ; SMP64_OFF_GDTR
 %define SMP64_OFF_PM32          0x60        ; SMP64_OFF_PM32
 %define SMP64_OFF_LM64          0xC0        ; SMP64_OFF_LM64
 %define SMP64_OFF_SHARED        0x800       ; SMP64_OFF_SHARED
@@ -50,7 +50,8 @@
 %define S_FLAGPTR    0x40      ; u64 本 AP 的在线标志字节指针（内核高半区）
 %define S_COUNTPTR   0x48      ; u64 在线原子计数指针（内核高半区）
 %define S_GDT        0x50      ; u8[64] 临时 GDT（BSP 的 GDT + index3 = 32 位代码段）
-%define S_IDTR       0x90      ; u8[10] BSP 的 IDTR（AP 也装上：出异常能看到原因）
+%define S_IDTR       0x90      ; u8[10]
+%define S_STAGE      0xA0      ; u32 ★ v0.9.11：AP 进度面包屑（0=AN未进来/1=16位/2=pm32/3=lm64）      ; u8[10] BSP 的 IDTR（AP 也装上：出异常能看到原因）
 
 ; ★ 共享块各字段的**页内绝对地址** = 页基址 + 块偏移 + 字段偏移。
 ;   踩坑记录：早期漏了 +SMP64_TRAMPOLINE_PHYS，于是跳板去读 0x0820（低端垃圾）当 CR4、
@@ -71,6 +72,7 @@
 %define P_GDT        (P_SBLOCK + S_GDT)
 %define P_IDTR       (P_SBLOCK + S_IDTR)
 %define P_GDT_COPY   (P_BASE + SMP64_OFF_GDT_COPY)
+%define P_STAGE      (P_SBLOCK + S_STAGE)
 
 [bits 16]
 [org SMP64_TRAMPOLINE_PHYS]
@@ -83,6 +85,7 @@ smp64_trampoline_start:
     mov ss, ax
     mov sp, SMP64_RM_STACK_TOP      ; 自己的实模式栈（页内 0x8E00..0x8F00，见布局）
     cld
+    mov byte [P_STAGE], 1           ; ★ 面包屑 1：AP 真的执行到了我们的 16 位代码
 
     ; 8259 全掩码：AP 这条路径不接 PIC 中断（BSP 已经是 LAPIC+IOAPIC 模式，
     ; 这里只是把 AP 本地的 PIC 屏蔽位也钉死，免得将来谁把 IMR 放开）
@@ -93,6 +96,9 @@ smp64_trampoline_start:
     ; A20：fast gate（端口 0x92 bit1）。QEMU/SeaBIOS/UEFI 下 A20 本来就开着，
     ; 这里只是"若需要"的兜底；只置 bit1，不动 bit0（bit0 是 fast reset）。
     in al, 0x92
+    and al, 0xFE                    ; ★ v0.9.11：bit0 = fast reset！读回值可能已经是 1，
+                                    ;   先把它清掉再置 bit1（A20），
+                                    ;   否则这一句就直接把整机复位（= 三重故障复位的表现）
     or al, 0x02
     out 0x92, al
 
@@ -123,6 +129,7 @@ smp64_gdtr:
     times (SMP64_OFF_PM32 - ($ - $$)) db 0xCC
 [bits 32]
 smp64_pm32:
+    mov byte [P_STAGE], 2           ; ★ 面包屑 2：已进 32 位保护模式（段选择子均可用）
     mov ax, 0x10                    ; 内核数据段（与 BSP 同一个选择子）
     mov ds, ax
     mov es, ax
@@ -154,6 +161,8 @@ smp64_pm32:
     times (SMP64_OFF_LM64 - ($ - $$)) db 0xCC
 [bits 64]
 smp64_lm64:
+    mov eax, P_STAGE                ; 64 位模式下不能用绝对寻址，走寄存器间接
+    mov byte [rax], 3       ; ★ 面包屑 3：已进 64 位长模式（分页已开）
     ; ★ 用**自己的**栈：共享块里的 per-AP 栈顶（BSP 用 page_alloc_64 分配的 16KB）
     mov eax, P_RSP
     mov rsp, [rax]

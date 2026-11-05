@@ -29,7 +29,7 @@
 static const uint32_t SMP64_TRAMPOLINE_PHYS = 0x8000;   // 也 = SIPI 向量 << 12
 static const uint32_t SMP64_SIPI_VECTOR     = 0x08;     // SIPI 向量：CS=0x0800, IP=0
 // 页内固定偏移（必须与 ap_trampoline64.asm 的 %define 一致；自检会读回核对）
-static const uint32_t SMP64_OFF_GDTR        = 0x40;     // dw limit=63, dd base=0x8C00
+static const uint32_t SMP64_OFF_GDTR        = 0x50;     // dw limit=63, dd base=0x8C00
 static const uint32_t SMP64_OFF_PM32        = 0x60;     // 32 位保护模式段
 static const uint32_t SMP64_OFF_LM64        = 0xC0;     // 64 位入口桩
 static const uint32_t SMP64_OFF_SHARED      = 0x800;    // 共享数据块
@@ -50,7 +50,10 @@ static const uint32_t SMP64_S_RSP      = 0x38;   // u64 本 AP 的内核栈顶�
 static const uint32_t SMP64_S_FLAGPTR  = 0x40;   // u64 本 AP 在线标志的指针
 static const uint32_t SMP64_S_COUNTPTR = 0x48;   // u64 在线原子计数指针
 static const uint32_t SMP64_S_GDT      = 0x50;   // u8[64] 临时 GDT（AP 拷到 0x8C00）
-static const uint32_t SMP64_S_IDTR     = 0x90;   // u8[10] BSP 的 IDTR（AP 也 lidt）
+static const uint32_t SMP64_S_IDTR     = 0x90;
+// ★ v0.9.11：AP 进度面包屑（跳板在 16 位/pm32/lm64 各写一次）。超时时把它打出来：
+//   0 = AP 根本没跑到我们的代码（SIPI/缓存问题），1/2/3 = 跑到哪一段才出事。
+static const uint32_t SMP64_S_STAGE    = 0xA0;   // u8（实际占 4 字节，按 u32 写）   // u8[10] BSP 的 IDTR（AP 也 lidt）
 static const uint32_t SMP64_SHARED_MAGIC = 0x54504D53u;  // 'SMPT'（小端）
 
 // ==================== 规模/超时 ====================
@@ -58,6 +61,9 @@ static const uint32_t SMP64_MAX_AP          = 8;        // 最多启动多少个
 static const uint32_t SMP64_AP_STACK_PAGES  = 4;        // 每核 4 页 = 16KB 内核栈
 static const uint32_t SMP64_AP_STACK_BYTES  = SMP64_AP_STACK_PAGES * 4096u;
 static const uint32_t SMP64_AP_ONLINE_TIMEOUT_MS = 500; // 每个 AP 的有界等待（g_ticks64 计时）
+// ★ v0.9.11：SIPI 重发次数。AMD 上'丢 SIPI'比 Intel 常见（尤其是负载重/虚拟化下），
+//   所以每次 SIPI 之后都查一次在线标志，没起来就再发。
+static const uint32_t SMP64_SIPI_ATTEMPTS = 5;
 
 // ==================== 接口 ====================
 // BSP 侧启动流程（幂等；任何前置条件不满足都优雅返回 0，绝不挂死、绝不变砖）：

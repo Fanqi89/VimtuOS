@@ -154,6 +154,10 @@ struct Smp64Shared64 {
     volatile uint64_t count_ptr;    // 0x48
     volatile uint8_t  gdt[64];      // 0x50（AP 从这里 rep movsb 到 0x8C00）
     volatile uint8_t  idtr[10];     // 0x90（BSP 的 IDTR，AP 也 lidt）
+    volatile uint8_t  pad_9a[6];    // 0x9A 对齐到 0xA0
+    // ★ v0.9.11：AP 进度面包屑（跳板写：1=16位段跑到 / 2=pm32 / 3=lm64）。
+    //   它让"超时"变成可定位的结论：0 = AP 根本没跑到我们的代码。
+    volatile uint8_t  stage;        // 0xA0
 } __attribute__((packed));
 static_assert(offsetof(Smp64Shared64, cr3)       == SMP64_S_CR3,       "共享块布局漂了");
 static_assert(offsetof(Smp64Shared64, cr0)       == SMP64_S_CR0,       "共享块布局漂了");
@@ -165,6 +169,7 @@ static_assert(offsetof(Smp64Shared64, flag_ptr)  == SMP64_S_FLAGPTR,   "共享�
 static_assert(offsetof(Smp64Shared64, count_ptr) == SMP64_S_COUNTPTR,  "共享块布局漂了");
 static_assert(offsetof(Smp64Shared64, gdt)       == SMP64_S_GDT,       "共享块布局漂了");
 static_assert(offsetof(Smp64Shared64, idtr)      == SMP64_S_IDTR,      "共享块布局漂了");
+static_assert(offsetof(Smp64Shared64, stage)     == SMP64_S_STAGE,     "共享块布局漂了（stage）");
 static_assert(sizeof(Smp64Shared64) <= SMP64_OFF_GDT_COPY - SMP64_OFF_SHARED, "共享块溢出页布局");
 
 static Smp64Shared64* smp64_shared64() {
@@ -256,21 +261,79 @@ static int smp64_collect_apic_ids64(uint32_t bsp_id, uint32_t* out, int out_max)
     return n;
 }
 
+// ★ v0.9.11：把平台身份打出来（AMD / Intel / 其他）。这一行让"为什么 AMD 不行"这种问题
+//   在日志里自带上下文，不用反推。
+static void smp64_log_vendor64(void) {
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    char v[13];
+    for (int i = 0; i < 4; i++) v[i]     = (char)((b >> (8 * i)) & 0xFF);
+    for (int i = 0; i < 4; i++) v[4 + i] = (char)((d >> (8 * i)) & 0xFF);
+    for (int i = 0; i < 4; i++) v[8 + i] = (char)((c >> (8 * i)) & 0xFF);
+    v[12] = 0;
+    for (int i = 0; i < 12; i++) if ((unsigned char)v[i] < 0x20 || (unsigned char)v[i] > 0x7E) v[i] = '?';
+    dbg64_line_begin64();
+    dbg64_str("[SMP] cpu vendor="); dbg64_str(v);
+    dbg64_str(" cpus=");            dbg64_dec((uint64_t)acpi_cpu_count64());
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
 // ==================== 有界延时/等待 ====================
 // 用 g_ticks64（PIT 250Hz -> 4ms/tick）计时；**再叠一个硬自旋上界**：万一 tick 不涨
 // （IF=0 之类），也不允许挂死启动。ticks/serial 两路都不依赖任何新硬件。
-static void smp64_delay_ms64(uint32_t ms) {
-    const uint64_t ticks = ((uint64_t)ms + TICK_MS_64 - 1) / TICK_MS_64;
-    const uint64_t start = g_ticks64;
-    for (uint64_t spin = 0;; spin++) {
-        if (g_ticks64 - start >= ticks) return;
-        if (spin > 600000000ull) return;                      // 兜底：绝不挂死
-        __asm__ volatile("pause");
-    }
-}
+// ★ v0.9.11：旧的「只看 tick」延时已删（IF=0 时 tick 不涨 -> 实际间隔远短于标称值），
+//   现在统一用下面的 smp64_delay_min_ms64()（TSC 下限 + tick 双保险）。
 // 微秒级：PIT 只有 4ms 粒度，用端口 I/O 做粗延时（QEMU/真机每次 outb 都是 ~us 量级）。
 static void smp64_delay_us64(uint32_t us) {
     for (uint32_t i = 0; i < us; i++) io_wait64();
+}
+
+// ==================== ★ v0.9.11：AMD 兼容修复（缓存刷写 / 时序下限）====================
+// 背景：交叉测试发现 **AMD + VMware 多核直接三重故障复位，Intel 正常**。
+//   MADT / LAPIC 地址一直是读表来的（没有写死 Intel 地址），问题在**时序与缓存**这两件事上：
+//   ① 跳板代码 / 共享块 / GDT 拷贝源是 BSP 通过**缓存**写进 0x8000 页的，发 INIT
+//     之前**没有刷缓存**。AP 从 INIT 出来时 CR0.CD=1（缓存关闭），它读的是**内存**；
+//     若 BSP 的脏行还没写回，AP 读到的就是 0x8000 那块**旧内容**（SeaBIOS 跳板区残留）
+//     → 执行垃圾指令 → 实模式没有 IDT → 三重故障 → **整机复位**。
+//     Intel MP / AMD 文档都明确要求「发 INIT 前刷 cache」。
+//     修：拷完跳板、以及**每次**写共享块之后，都做 clflush 全页 + wbinvd + mfence。
+//   ② INIT 后的 10ms 只用 g_ticks64 计时；一旦 IF=0（tick 不涨）就退化成一次有界自旋，
+//     实际间隔可能远短于 10ms，而 AMD 的 AP 唤醒时序比 Intel 挑 → 后续 SIPI 被丢。
+//     修：给延时加 **TSC 下限**（按 ≤6.5GHz 折算，保证真的等够）。
+static inline void smp64_mfence64()  { __asm__ volatile("mfence"  : : : "memory"); }
+static inline void smp64_wbinvd64()  { __asm__ volatile("wbinvd"  : : : "memory"); }
+static inline uint64_t smp64_rdtsc64() {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+// 整页 clflush（64 字节/行）
+static void smp64_clflush_page64(uint64_t pa) {
+    for (uint64_t o = 0; o < 4096ull; o += 64ull)
+        __asm__ volatile("clflush (%0)" : : "r"((void*)(uintptr_t)(pa + o)) : "memory");
+}
+// 把跳板页（含跳板代码 + 共享块 + GDT 拷贝源）真正写到内存里：
+//   clflush 逐行 → wbinvd （把所有核的缓存都刷回）→ mfence。少这一步，AP 就可能读到旧字节。
+static void smp64_flush_trampoline64() {
+    smp64_mfence64();
+    smp64_clflush_page64(SMP64_TRAMPOLINE_PHYS);
+    smp64_wbinvd64();
+    smp64_mfence64();
+}
+// 至少等 ms 毫秒：同时看 TSC 与 tick，两者任一达标才返回（有界上限防挂死）。
+//   TSC 折算按最坏 6.5GHz：慢机器上会等得更久（安全方向），快机器上刚好达标。
+static void smp64_delay_min_ms64(uint32_t ms) {
+    const uint64_t need_cyc = (uint64_t)ms * 6500000ull;
+    const uint64_t need_tick = ((uint64_t)ms + TICK_MS_64 - 1) / TICK_MS_64;
+    const uint64_t t0 = smp64_rdtsc64();
+    const uint64_t k0 = g_ticks64;
+    for (uint64_t spin = 0;; spin++) {
+        if (smp64_rdtsc64() - t0 >= need_cyc) return;
+        if (g_ticks64 - k0 >= need_tick) return;
+        if (spin > 900000000ull) return;
+        __asm__ volatile("pause");
+    }
 }
 
 // 读 ICR 的低位（含"投递中"bit12）——写 ICR 前必须等它清零
@@ -286,6 +349,9 @@ static void smp64_send_ipi64(uint32_t dest_apic_id, uint32_t icr_low) {
     smp64_lapic_w32(LAPIC64_ICR_HIGH, (uint32_t)((dest_apic_id & 0xFFu) << 24));
     smp64_lapic_w32(LAPIC64_ICR_LOW, icr_low);
     __asm__ volatile("" ::: "memory");
+    // ★ v0.9.11：写完也要等投递完成。否则下一条 IPI（尤其是紧跟的 SIPI）
+    //   在 AMD 上很容易被丢（Intel 实现宽容一些）。有界，绝不挂死。
+    (void)smp64_icr_idle64();
 }
 
 // ==================== 准备：跳板 + 共享块 + 每核栈 ====================
@@ -323,6 +389,8 @@ static void smp64_write_shared_block64(uint32_t index, uint32_t apic_id, uint64_
     sh->flag_ptr    = (uint64_t)(uintptr_t)smp64_flag_ptr64(index);
     sh->count_ptr   = (uint64_t)(uintptr_t)smp64_count_ptr64();
     smp64_sidt((void*)sh->idtr);
+    sh->stage = 0;                              // ★ 每个 AP 开始前把面包屑清零
+    smp64_flush_trampoline64();                 // ★ 必须：不刷缓存，AP 可能读到旧字节
 }
 
 // 每核栈：尽量 16KB（4 页连续）；分配器给了非连续页就重试几次，仍不行就退化成 1 页
@@ -388,6 +456,7 @@ static int smp64_prepare64(int ap_n, const uint32_t* apic_ids) {
     // 共享块先按第一个 AP 填好（每个 AP 启动前会再刷新 index/apic_id/rsp）
     smp64_fill_gdt64(smp64_shared64()->gdt);
     smp64_write_shared_block64(1, g_aps[1].apic_id, g_aps[1].stack_top);
+    smp64_flush_trampoline64();                 // ★ 跳板与 GDT 拷贝源落盘后再刷一次
     return fails;
 }
 
@@ -433,6 +502,7 @@ int smp64_selftest64() {
     if (sh->rsp == 0 || (sh->rsp & 0xFull) != 0) fails |= 0x04;
     if (sh->index == 0 || sh->index > (uint32_t)g_ap_n) fails |= 0x04;
     if (sh->flag_ptr != (uint64_t)(uintptr_t)smp64_flag_ptr64(sh->index)) fails |= 0x04;
+    if (sh->stage != 0) fails |= 0x04;                 // ★ v0.9.11：起跑前面包屑必须是 0
     if (sh->count_ptr != (uint64_t)(uintptr_t)smp64_count_ptr64()) fails |= 0x04;
     if (*(const volatile uint16_t*)(const void*)sh->idtr == 0) fails |= 0x04;     // IDTR limit
     {
@@ -518,24 +588,32 @@ static bool smp64_start_ap64(int index) {
     dbg64_nl();
     dbg64_line_end64();
 
-    // 3) 标准启动序列（Intel MP / ACPI 的做法）：
-    //    INIT assert(0x4500) -> 10ms -> INIT deassert(0x8500) -> 200us
-    //    -> SIPI(0x4600|vector) -> 200us -> SIPI 再一次（给还没起来的第二次机会）
+    // 3) 启动序列（★ v0.9.11 按 AMD 要求加固）：
+    //    INIT assert(0x4500) -> **至少 10ms**（TSC 下限） -> INIT deassert(0x8500) -> 200us
+    //    -> SIPI -> 200us -> 查在线标志；没起来就**重发**（最多 SMP64_SIPI_ATTEMPTS 次）
     smp64_send_ipi64(ap.apic_id, 0x00004500u);                       // INIT assert（level）
-    smp64_delay_ms64(10);
+    smp64_delay_min_ms64(10);                                        // ★ 不再只靠 tick
     smp64_send_ipi64(ap.apic_id, 0x00008500u);                       // INIT deassert
     smp64_delay_us64(200);
-    smp64_send_ipi64(ap.apic_id, 0x00004600u | SMP64_SIPI_VECTOR);   // SIPI #1
-    smp64_delay_us64(200);
-    smp64_send_ipi64(ap.apic_id, 0x00004600u | SMP64_SIPI_VECTOR);   // SIPI #2
+    bool up = false;
+    for (int attempt = 1; attempt <= (int)SMP64_SIPI_ATTEMPTS && !up; attempt++) {
+        smp64_send_ipi64(ap.apic_id, 0x00004600u | SMP64_SIPI_VECTOR);
+        smp64_delay_us64(200);
+        up = (*(volatile uint8_t*)(uintptr_t)smp64_flag_ptr64(index)) != 0;
+        if (up) break;
+        smp64_delay_min_ms64(2);                                     // 给跳板一点真实时间
+        up = (*(volatile uint8_t*)(uintptr_t)smp64_flag_ptr64(index)) != 0;
+    }
 
     // 4) 有界等待：这段**一行日志都不打**（AP 打完自己那行才会置在线标志；见文件顶部 ②）
+    if (up) return true;
     if (smp64_wait_ap_online64(index, SMP64_AP_ONLINE_TIMEOUT_MS)) return true;
 
     dbg64_line_begin64();
     dbg64_str("[SMP] ap id=");
     dbg64_dec(ap.apic_id);
-    dbg64_str(" timeout");
+    dbg64_str(" timeout stage=");                 // ★ v0.9.11：AP 跑到哪一段了（0 = 根本没跑到我们的代码）
+    dbg64_dec((uint64_t)smp64_shared64()->stage);
     dbg64_nl();
     dbg64_line_end64();
     return false;
@@ -560,6 +638,8 @@ int smp64_init64() {
         dbg64_line_end64();
         return 0;
     }
+
+    smp64_log_vendor64();
 
     // ---- 阶段 1：只读探测（不通过就一个寄存器都不写）----
     g_lapic_base = smp64_rdmsr64(MSR64_IA32_APIC_BASE) & 0xFFFFF000ull;
