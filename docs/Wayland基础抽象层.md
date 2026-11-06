@@ -99,3 +99,58 @@ py -3 tests\drm64_test.py            # 串口断言 + 头文件逐值比对 + �
 [DRM] map handle=<n> va=0x<hex> pages=<n> phys=0x<hex> u=1
 [DRMDEMO] ... （ring3 验收程序的 14 行，见 user/apps/drmdemo.c 文件头）
 ```
+
+---
+
+## 附录 A（v0.9.13）：用户态兼容层的进度与"剩下多远"的精确差值
+
+### A.1 已经有的
+
+* `user/lib/libdrm_compat.h` —— **libdrm 风格的封装**（`libdrm_open` / `libdrm_mode_get_resources` /
+  `libdrm_mode_get_connector` / `libdrm_mode_create_dumb` / `libdrm_mode_map_dumb` /
+  `libdrm_mode_page_flip` / `libdrm_wait_vblank` / `libdrm_mode_destroy_dumb` / `libdrm_bad_cmd`），
+  全部 `static inline` 跑在 `kernel/drm64.h` 那套 ioctl 上；**编译已通过**（被 `/bin/drmdemo` 的
+  构建包含，产出 14,040 B 不变 = 没有把演示改坏）。
+  定位写得很清楚：**今天叫"用法兼容"，不是"二进制兼容"** —— 真 libdrm 本体仍不能用它。
+* `user/lib/drm64.{h,c}` —— 4 个薄封装（open / ioctl / evdev open / evdev read）。
+* `kernel/drm64.cpp` 的 11 个 ioctl + evdev 门面（v0.9.12 已验收 32/32）。
+
+### A.2 做到"真 libdrm 能编能跑"还差多少（逐个 struct 的实测差值）
+
+我们的实现与 Linux `drm.h` 的差异**只在 4 处 struct 尺寸**（其余 7 个已经一致）。按
+`DRM64_IOWR(nr,type) = (3<<30)|(sizeof(type)<<16)|('d'<<8)|nr` 编码：
+
+| ioctl | 我们现在 | Linux `drm.h` | 差 | 要做的事 |
+| --- | --- | --- | --- | --- |
+| `DRM_IOCTL_VERSION` | sizeof=60 → `0xC03C6400` | sizeof=**56** → `0xC0386400` | -4 | 把 `name/date/desc` 改成 Linux 的 `size_t len + char* ptr` 形式（含拷出到用户指针） |
+| `MODE_GETCRTC` | 108 → `0xC06C64A1` | **104** → `0xC06864A1` | -4 | `drm_mode_modeinfo` 的 `hskew/vscan` 位置与 `clock` 类型对齐 |
+| `WAIT_VBLANK` | 40 → `0xC028643A` | **24** → `0xC018643A` | -16 | 改成 `u64 type; u64 sequence; union{u64 tval; struct{u32 sec,usec;} }`（去掉我们多出来的字段） |
+| `CRTC_GET_SEQUENCE` | 40 → `0xC028643B` | **24** → `0xC018643B` | -16 | 改成 `u32 crtc_id; u32 active; u64 sequence; u64 ns` |
+| `GET_CAP` / `GETRESOURCES` / `GETCONNECTOR` / `CREATE_DUMB` / `MAP_DUMB` / `DESTROY_DUMB` / `PAGE_FLIP` | 16 / 64 / 80 / 32 / 16 / 4 / 24 | **相同** | 0 | 只需核对字段名 |
+
+> 一句话：**再有一批就能把"用法兼容"变成"二进制兼容"**，全部集中在 `kernel/drm64.h` +
+> `user/lib/drm64.h` 两个文件与那 4 个 struct；改完 `tests/drm64_test.py` 的双头文件逐值比对
+> 会立刻报出任何漂移（它本来就是干这个的）。
+
+### A.3 还完全没做的（按"跑 wlroots"的依赖顺序）
+
+1. **`MODE_ADDFB2` / `MODE_SETCRTC` / `MODE_ATOMIC` + `MODE_GETPLANE` 的属性系统** —— wlroots 的
+   DRM 后端走 atomic commit；我们现在只有 `PAGE_FLIP` + dumb buffer，**没有 fb 对象与属性**。
+2. **GBM + EGL/GLES**（Mesa）—— 没有它，wlroots 的渲染器只能用 pixman（软件），那就退化成
+   "能用但没有 GPU 加速"；而 EGL 需要一整套 `eglGetPlatformDisplay`/`EGLImage`/`dma-buf` 导入。
+3. **`dma-buf` 与 fence**：本批用"内核把同一批物理页挂进调用方页表"的等价实现（跨进程共享还没有），
+   wlroots 的 buffer 交接需要**可跨进程传递**的 handle（`PRIME_HANDLE_TO_FD`）。
+4. **libinput 精简适配**：evdev 门面已能用（`/dev/input/event0|1` + `EVIOCGBIT`），但 libinput 还要
+   `udev`（设备枚举、`/sys`）、`EPOLLIN|EPOLLOUT` 语义（我们有 epoll）、以及 `libevdev` 那一层的
+   `EVIOCGRAB`/`EVIOCSABS` 等 ioctl。
+5. **`done` 语义**：`dumb buffer` 的 fd 生命周期（进程异常退出未 DESTROY 会占页）—— 需要在
+   `proc64` 的进程回收里加一个 hook（本批未做，风险点在"动 proc64 会牵动全部进程测试"）。
+6. **真双缓冲交替**：演示目前是"同一帧缓冲连续两次 flip + 两次 wait_vblank"，两块 dumb 交替还没做。
+
+### A.4 建议的下一批顺序
+
+1. A.2 的 4 个 struct 对齐（小、可测、解锁 libdrm 本体）；
+2. `ADDFB2` + `SETCRTC` + `GETPLANE`（解锁 wlroots 的**非 atomic** 路径）；
+3. `proc64` 的 fd 回收 hook（解 A.3.5）；
+4. `dma-buf` 跨进程（解 A.3.3）；
+5. atomic commit（解 A.3.1）→ 到这一步 wlroots 的 DRM 后端才真正有戏。
