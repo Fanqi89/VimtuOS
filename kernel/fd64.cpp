@@ -29,6 +29,9 @@ void app64_registry_on_close64(const char* path, int writable) __attribute__((we
 // ★ A4-2a：控制台 tty 对象的 write 要"串口 + 屏幕"，那部分实现留在 syscall64（弱的：
 //   没有它也能编译/链接 —— 那时退回只写串口，绝不静默丢字节）。
 extern "C" void syscall64_console_write64(const char* buf, int len) __attribute__((weak));
+// ★ v0.9.12：/dev/input/event0|1 的 read 走它（DRM/evdev 的实现在 kernel/drm64.cpp）。
+//   弱引用：安装介质内核不链 drm64.cpp -> 这里为 0 -> read 返回 -ENOSYS（不假装有输入）。
+int64_t evdev64_read64(int which, void* ubuf, uint64_t len) __attribute__((weak));
 
 // ==================== 对象 ====================
 #define FD64_KIND_FREE 0
@@ -37,6 +40,9 @@ extern "C" void syscall64_console_write64(const char* buf, int len) __attribute_
 #define FD64_KIND_PIPE_R 3
 #define FD64_KIND_PIPE_W 4
 #define FD64_KIND_TTY  5      // ★ A4-2a：最小"控制台 tty"对象（open("/dev/console") -> 它）
+// ★ v0.9.12：DRM / evdev 两个设备特判（号位与 kernel/fd64.h 的 FD64_KIND_DRM/EVDEV 一致）
+#define FD64_KIND_DRM   6     // /dev/dri/card0（ioctl 认 kernel/drm64.h 的命令）
+#define FD64_KIND_EVDEV 7     // /dev/input/event0|1（read 出 struct input_event）
 // 目录句柄的**一次扫描缓存**：vfs64_ls 每次都要线性扫 inode 表（每个 inode 一次读盘），
 // 逐条 readdir 各扫一遍在真机上要数秒（会把 GUI 看门狗饿到）。所以第一次 readdir 时列一次、
 // 缓存进对象，之后 O(1)。
@@ -81,6 +87,7 @@ struct OpenFile64 {
     uint8_t  kind;            // FD64_KIND_*
     uint8_t  writable;        // 1 = O_WRONLY/O_RDWR
     uint8_t  append;          // 1 = O_APPEND（每次写定位到末尾）
+    uint8_t  dev_which;       // ★ v0.9.12：evdev 的 which（0 = event0 键盘 / 1 = event1 鼠标）
     char     path[FD64_PATH_MAX];
     int32_t  dirc;            // 目录缓存池下标（-1 = 无）
     Pipe64*  pipe;            // pipe 对象（kind = PIPE_R/PIPE_W）
@@ -370,6 +377,44 @@ static int fd64_is_tty_path64(const char* path) {
     for (int i = 0; i < 4; i++) if (fd64_streq(path, P[i])) return 1;
     return 0;
 }
+// ★ v0.9.12：/dev/dri/card0 与 /dev/input/event0|1 是**设备特判对象**（与 /dev/console 同一套做法：
+//   不查盘、不建文件）。命中返回 kind（FD64_KIND_DRM / FD64_KIND_EVDEV），并把 evdev 的 which
+//   写进 *which_out（0 = event0 键盘 / 1 = event1 鼠标）；不命中返回 0。
+static int fd64_dev_path64(const char* path, int* which_out) {
+    if (which_out) *which_out = 0;
+    if (!path) return 0;
+    static const char* const D[2] = { FD64_DRM_PATH, "dev/dri/card0" };
+    for (int i = 0; i < 2; i++) if (fd64_streq(path, D[i])) return FD64_KIND_DRM;
+    static const char* const E0[2] = { FD64_EVDEV0_PATH, "dev/input/event0" };
+    static const char* const E1[2] = { FD64_EVDEV1_PATH, "dev/input/event1" };
+    for (int i = 0; i < 2; i++) if (fd64_streq(path, E0[i])) { if (which_out) *which_out = 0; return FD64_KIND_EVDEV; }
+    for (int i = 0; i < 2; i++) if (fd64_streq(path, E1[i])) { if (which_out) *which_out = 1; return FD64_KIND_EVDEV; }
+    return 0;
+}
+// 设备特判对象的 open：不查盘、不建文件，只分配一个 OpenFile64（与 fd64_tty_open64 同一套写法）。
+static int fd64_dev_open64(const char* path, uint32_t flags, int kind, int which) {
+    FdTable64* t = fd64_current_table64();
+    OpenFile64* of = fd64_of_alloc64();
+    if (!of) return -FD64_EMFILE;
+    of->flags = flags;
+    of->vol = -1;
+    of->kind = (uint8_t)kind;
+    of->dev_which = (uint8_t)which;
+    of->writable = 0;                                  // 两个设备都不接受 write（见 fd64_write64）
+    of->append = 0;
+    of->off = 0;
+    { uint32_t i = 0; for (; path[i] && i + 1u < FD64_PATH_MAX; i++) of->path[i] = path[i]; of->path[i] = 0; }
+    const int fd = fd64_table_put64(t, of);
+    if (fd < 0) { fd64_of_unref64(of); return fd; }
+    dbg64_line_begin64();
+    dbg64_str("[FD64] dev open fd="); dbg64_dec((uint64_t)fd);
+    dbg64_str(" path="); dbg64_str(path);
+    dbg64_str(" kind="); dbg64_dec((uint64_t)kind);
+    if (kind == FD64_KIND_EVDEV) { dbg64_str(" which="); dbg64_dec((uint64_t)which); }
+    dbg64_nl();
+    dbg64_line_end64();
+    return fd;
+}
 // ★ 多卷：按**显式统一卷号**打开（系统组件要固定系统卷时用这个变体；终端/ring3 用默认入口 = 当前卷）。
 // 只读卷（FAT32）上带写意图（WRONLY/RDWR/CREAT/TRUNC/APPEND）的打开在这里就被拒，返回 -FD64_EROFS。
 // ★ A4-2a："/dev/console" / "/dev/tty" 是**最小控制台 tty 对象**（不查盘、不建文件）。
@@ -398,6 +443,12 @@ static int fd64_tty_open64(uint32_t flags) {
 }
 int fd64_open_on64(int vol, const char* path, uint32_t flags) {
     if (fd64_is_tty_path64(path)) return fd64_tty_open64(flags);
+    // ★ v0.9.12：设备特判（不查盘、不建文件）—— 位置在 tty 之后、真正查盘之前
+    {
+        int which = 0;
+        const int dk = fd64_dev_path64(path, &which);
+        if (dk) return fd64_dev_open64(path, flags, dk, which);
+    }
     if (flags & (FD64_O_WRONLY | FD64_O_RDWR | FD64_O_CREAT | FD64_O_TRUNC | FD64_O_APPEND)) {
         if (fs64_is_readonly64(vol)) {
             dbg64_line_begin64();
@@ -781,6 +832,14 @@ int fd64_read64(int fd, void* buf, int len) {
     if (of->kind == FD64_KIND_DIR) return -FD64_EISDIR;
     if (of->kind == FD64_KIND_PIPE_W) return -FD64_EBADF;       // 写端不能读
     if (of->kind == FD64_KIND_TTY) return 0;                    // ★ A4-2a：控制台 tty 没有输入流（如实 EOF）
+    // ★ v0.9.12：DRM 只走 ioctl（没有任何 read 语义）；evdev 的 read 出 struct input_event。
+    //   两者都在这里分派，**不改**文件/pipe/tty 的既有分支。
+    if (of->kind == FD64_KIND_DRM) return -FD64_EINVAL;
+    if (of->kind == FD64_KIND_EVDEV) {
+        if (!buf || len < 0) return -FD64_EFAULT;
+        if (!evdev64_read64) return -FD64_ENOSYS;               // 安装介质内核：没有这条通道（不假装有）
+        return (int)evdev64_read64((int)of->dev_which, buf, (uint64_t)len);
+    }
     if (!buf || len < 0) return -FD64_EFAULT;
     if (of->kind == FD64_KIND_PIPE_R) {
         const int nonblock = (of->flags & FD64_O_NONBLOCK) ? 1 : 0;
@@ -838,6 +897,17 @@ int fd64_write64(int fd, const void* buf, int len) {
     if (!of) return -FD64_EBADF;
     if (of->kind == FD64_KIND_DIR) return -FD64_EISDIR;
     if (of->kind == FD64_KIND_PIPE_R) return -FD64_EBADF;       // 读端不能写
+    // ★ v0.9.12：DRM / evdev 都是只读设备面（不接受 write）：如实 -EINVAL 并打一条 deny。
+    if (of->kind == FD64_KIND_DRM || of->kind == FD64_KIND_EVDEV) {
+        dbg64_line_begin64();
+        dbg64_str("[FD64] deny fd="); dbg64_dec((uint64_t)fd);
+        dbg64_str(" op=write dev=");
+        dbg64_str(of->kind == FD64_KIND_DRM ? "drm" : "evdev");
+        dbg64_str(" err="); dbg64_dec((uint64_t)FD64_EINVAL);
+        dbg64_nl();
+        dbg64_line_end64();
+        return -FD64_EINVAL;
+    }
     if (!of->writable) return -FD64_EBADF;
     if (!buf || len < 0) return -FD64_EFAULT;
     if (len == 0) return 0;
@@ -994,6 +1064,19 @@ int fd64_slot_used64(int fd) {
 int fd64_slot_is_tty64(int fd) {
     OpenFile64* of = fd64_slot_obj64(fd64_current_table64(), fd);
     return (of && of->kind == FD64_KIND_TTY) ? 1 : 0;
+}
+// ★ v0.9.12：fd -> 设备特判类型（0 = 不是设备 / FD64_KIND_DRM / FD64_KIND_EVDEV）。
+//   *which_out（可空）= evdev 的 which（0 = event0 键盘 / 1 = event1 鼠标）。
+int fd64_slot_dev_kind64(int fd, int* which_out) {
+    if (which_out) *which_out = 0;
+    OpenFile64* of = fd64_slot_obj64(fd64_current_table64(), fd);
+    if (!of) return 0;
+    if (of->kind == FD64_KIND_DRM) return FD64_KIND_DRM;
+    if (of->kind == FD64_KIND_EVDEV) {
+        if (which_out) *which_out = (int)of->dev_which;
+        return FD64_KIND_EVDEV;
+    }
+    return 0;
 }
 void fd64_log_slot64(int fd, const char* tag) {
     OpenFile64* of = fd64_slot_obj64(fd64_current_table64(), fd);

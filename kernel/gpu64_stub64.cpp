@@ -43,3 +43,15 @@ __attribute__((weak)) const char* gpu64_vendor_name64(uint16_t pci_vendor) {
 __attribute__((weak)) int intel64_probe64(const Gpu64Dev64* d) { (void)d; return 0; }
 __attribute__((weak)) int intel64_selftest64(void) { return 0; }
 __attribute__((weak)) int intel64_mode64(void) { return 0; }   // 0 = INTEL64_MODE64_SAFE
+
+// ★ v0.9.12：kernel/drm64.cpp（DRM/KMS + evdev 门面）同样**只进系统内核**（见 build64.sh：
+//   它要 proc64 的进程/页表面、fb 的后备缓冲物理页、virtio-gpu 的传输路径 —— 安装介质里
+//   一样都没有）。syscall64.cpp / fd64.cpp 对这几条是 weak 引用：这里给空实现，让
+//   "哪天有人把 drm64.cpp 也加进安装内核"时链接期立刻能过；语义上一律如实失败/空操作，
+//   **不假装有 DRM、也不假装能读输入事件**。
+__attribute__((weak)) void drm64_init64(void) {}
+__attribute__((weak)) int  drm64_selftest64(void) { return -1; }        // -1 = 这台内核没有 DRM 门面
+__attribute__((weak)) int  drm64_ioctl64(uint64_t, uint64_t, uint64_t) { return -25; }   // -ENOTTY
+__attribute__((weak)) int64_t evdev64_read64(int, void*, uint64_t) { return -38; }       // -ENOSYS
+__attribute__((weak)) int  evdev64_ioctl64(int, uint64_t, uint64_t) { return -25; }      // -ENOTTY
+__attribute__((weak)) int  drm64_demo64(const char*) { return 0; }                       // 没有演示

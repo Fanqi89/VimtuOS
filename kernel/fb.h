@@ -100,6 +100,13 @@ int  fb_swap_count64();             // 当前交换链块数（1 = 没开）
 int  fb_swap_front64();             // 当前在屏上的块号
 int  fb_frame_present64();          // 整帧提交当前绘制块 -> 上屏；返回 1 = 走设备，0 = 软件
 const char* fb_vsync_mode64();      // "hw" / "pace" / "off"
+// ★ v0.9.12：DRM/KMS 门面的 vblank 原语复用入口（实现就是下面那对既有函数，不新增逻辑）：
+//   probe 返回 1 = 硬件垂直回扫信号可信（edges/ms = 一轮 200 ms 的实测值）；
+//   wait  返回 1 = 等到一次回扫起点（有界 2 tick = 8 ms，超时如实返回 0）。
+//   为什么要这层薄包装：fb64_vblank_probe/fb64_vblank_wait 是 fb.cpp 的 static 函数，
+//   kernel/drm64.cpp 要用它们（DRM 的 WAIT_VBLANK / CRTC_GET_SEQUENCE）。
+int fb64_vblank_probe_export64(uint64_t* edges_out, uint64_t* ms_out);
+int fb64_vblank_wait_export64(void);
 // 帧统计（验收脚本/设置页读取）：frames = 跑过的帧数，med/p95/jitter = 帧间隔（µs）
 void fb_vsync_stats64(uint64_t* frames, uint64_t* med_us, uint64_t* p95_us, uint64_t* jit_us);
 inline uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) {

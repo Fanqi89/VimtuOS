@@ -117,6 +117,19 @@
 #define FD64_EAGAIN  11
 #define FD64_EPIPE   32   // ★ 本批：读端全关后的 write（**不投递 SIGPIPE**，如实）
 #define FD64_EROFS   30   // ★ 只读文件系统（FAT32 卷：打开写模式一律被拒）
+#define FD64_ENOSYS  38   // ★ v0.9.12：这台内核里那条通道不存在（例如安装介质内核没有 evdev 实现）
+// ★ v0.9.12：**设备特判路径**（与 /dev/console 同一套做法：不查盘、不建文件，open 命中就给对应 kind）。
+//   DRM = /dev/dri/card0（DRM/KMS 门面，ioctl(16) 认 kernel/drm64.h 的命令）；
+//   EVDEV = /dev/input/event0（键盘）/ event1（鼠标）：read 出 struct input_event、ioctl 认
+//   EVIOCGNAME/EVIOCGVERSION/EVIOCGBIT。write 一律 -EINVAL 并打一条 [FD64] deny。
+//   ★ 注意：DRM/EVDEV 的 kind **号位**（6/7）与 fd64.cpp 内部的 FD64_KIND_* 同一套值；
+//     fd64_slot_dev_kind64() 就是对外的查询入口（返回 0 / 6 / 7）。
+#define FD64_DRM_PATH        "/dev/dri/card0"
+#define FD64_EVDEV0_PATH     "/dev/input/event0"
+#define FD64_EVDEV1_PATH     "/dev/input/event1"
+#define FD64_KIND_DRM        6      // = kernel/drm64.h 的 DRM 门面
+#define FD64_KIND_EVDEV      7      // = kernel/drm64.h 的 evdev 门面
+
 #define FD64_EACCES  13   // ★ P4：权限不足（vfs64 的 -EACCES 透传；与 LX64_EACCES 同值）
 // ★ 本批：fcntl(72) 的最小命令集（与 Linux 同值）与 F_SETFL 可接受的位。
 //   F_GETFD/F_SETFD 管 **FD_CLOEXEC(1)**：位存在 **fd 表槽**里（FdTable64.cloexec）；execve **成功**
@@ -214,6 +227,12 @@ int fd64_epoll_wait64(int ep, uint32_t* ev_out, uint64_t* data_out, int max, uin
 int fd64_epoll_close64(int ep);
 
 int fd64_slot_used64(int fd);
+// ★ v0.9.12：这个 fd 是不是**设备特判**对象（DRM / evdev）。
+//   返回 0 = 不是（普通文件/目录/pipe/tty）；FD64_KIND_DRM(6) = /dev/dri/card0；
+//   FD64_KIND_EVDEV(7) = /dev/input/event0|1。*which_out（可空）= evdev 的 which：
+//   0 = event0（键盘）/ 1 = event1（鼠标）；DRM 与非 evdev 一律写 0。
+//   给 syscall64 的 ioctl(16) / read 分派用（fd 类型 -> drm64_ioctl64 / evdev64_ioctl64）。
+int fd64_slot_dev_kind64(int fd, int* which_out);
 // 1 = 当前表的槽 fd 绑的是"控制台 tty"对象（ioctl 认 TIOCGWINSZ/TCGETS/TCSETS）。
 int fd64_slot_is_tty64(int fd);
 // 把 fd 的"是谁"写成一行串口证据（仅当槽已绑对象；用于 dup2 重定向的证据链）。

@@ -18,6 +18,7 @@
 // ★ 驱动线 3：virtio-gpu 2D 驱动（显示后端；两份内核都链 —— 安装程序的向导画面也走同一条上屏路径）
 #include "virtio_gpu64.h"
 #include "gpu64.h"          // ★ v0.9.4：通用 GPU 层（P1）—— 枚举/厂商识别/BAR/命令寄存器/只读探测
+#include "drm64.h"          // ★ v0.9.12：DRM/KMS + evdev 门面（只进系统内核；安装介质核心里是 weak 兜底）
 #include "font.h"
 #include "input.h"
 // ---- 硬件清单 / ACPI 平台表 / VimtuFS2 文件系统：两份内核都链接（只读探测 + 内存假盘自检）----
@@ -1227,6 +1228,13 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
                 //   交付纪律同 /wlclient.elf：**卷里的文件**（夹具写 /bin/wm.elf + /etc/wm_probe）；
                 //   没有它就只打一行 [WL64] wm skipped，不进桌面之后也不改变任何行为。
                 (void)wl64_wm64("/bin/wm.elf");
+                // ---- ★ v0.9.12：DRM/KMS + evdev 的 ring3 验收程序（/bin/drmdemo.elf）----
+                //   内核只负责按卷里的路径把它当**真进程**跑起来 + 有界等待（实现在
+                //   kernel/drm64.cpp 的 drm64_demo64）。触发条件 = 卷里有 /etc/drm64_probe
+                //   （与 /etc/wl64_probe、/etc/wm_probe 同一套夹具约定）：默认启动不多画一个像素、
+                //   不多建一个进程。位置：整段 ring3 演示的**最后**（多建/多收一个进程的演示排
+                //   最后最不容易搅动前面那些脚本的断言）。
+                (void)drm64_demo64("/bin/drmdemo.elf");
 
             } else {
                 proc64_init64();                                 // 仍然打点：mode=shared（如实）
@@ -1620,6 +1628,16 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     // ★ v0.5.5：硬件光标平面（fw_cfg `cursor=1` 才开；缺省走软件光标，既有像素行为不变）。
     //   放在 bench 之后：此时 scanout 已经设好、几何也已确认，光标位图才可能被设备真正扫描出去。
     (void)fb_cursor_run64();
+    // ★ v0.9.12：DRM/KMS + evdev 内核门面（ring3 通过 /dev/dri/card0、/dev/input/event* 用它）。
+    //   位置的三个理由：
+    //     1) **必须在 fb_init 之后**：模式枚举/呈现要用 fb 的既有几何与后备缓冲物理页；
+    //     2) **必须在 vgpu64_init64 + 上面那段 scanout 设置之后**：混合呈现要在"有设备/没设备"
+    //        已成定局时才判定 path=gpu|path=cpu（判定结果就是 vgpu64_blit64 的返回值，不猜）；
+    //     3) **必须在 font_init/桌面之前**：自检会翻一帧测试图案然后再把开机画面翻回来
+    //        （[DRM] selftest / [DRM] present 两行留在串口里），此时屏上还没有别的内容。
+    //   自检失败**不算**启动失败：只在串口留 [DRM] selftest FAIL reason=... 一行，系统照常起。
+    drm64_init64();
+    (void)drm64_selftest64();
 
     font_init();
     dbg64_str("[G64] font faces=");

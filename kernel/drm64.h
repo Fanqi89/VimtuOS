@@ -1,0 +1,330 @@
+// drm64.h - ★ v0.9.12：DRM/KMS 内核门面 + evdev（输入设备）门面（**唯一真源**）
+//
+// ============================ 这一层是什么 / 不是什么 ============================
+// 目标：让 ring3 程序能 open("/dev/dri/card0")、open("/dev/input/event0|1")，用 ioctl(16)
+//   枚举显示模式、建一块 CPU 可写的 "dumb buffer"、把它 page-flip 上屏、等一次 vblank，
+//   并读键鼠原始事件 —— 也就是"Wayland 所需的内核态抽象层"的**最小可验证子集**。
+// **不是** libdrm / libinput / GBM / EGL / wlroots：那些是下一批的用户态兼容层（见
+//   docs/Wayland基础抽象层.md 的"下一批计划"）。本层刻意只做内核态门面。
+//
+// ============================ ABI 纪律（读之前先看这四条） ============================
+//   1) **本文件是唯一真源**。用户侧 user/lib/drm64.h 是同一份数值/结构的拷贝，
+//      改任一侧必须同步另一侧（tests/drm64_test.py 会逐值比对两份头文件）。
+//   2) ioctl 号沿用 Linux DRM 的"方向 + size + 'd' + nr"编码风格（DRM64_IOWR），
+//      但 size 用**我们自己的 struct 尺寸** —— 本批**不做**与真实 drm.h 的逐字节兼容。
+//   3) 所有结构体 packed、字段顺序写死（并各有一条 static_assert 钉住 sizeof）。
+//   4) 不支持的命令/尺寸越界/没有硬件：一律返回 Linux 负数 errno（-EINVAL/-ENOTTY/
+//      -ENOMEM/-ENOSYS），并打点说明。**绝不假装成功**。
+//
+// ============================ dumb buffer 到底怎么让 ring3 可写 ============================
+// （这是全批最关键的一条，写在这里免得以后重新推一遍）
+//   * CREATE_DUMB 用 **page_alloc_64() 逐页分配**（不要求物理连续：页帧表存在内核状态里，
+//     "跨页安全"的拷贝由 drm64.cpp 的 d64_copy64 负责）。ring3 拿不到内核页。
+//   * MAP_DUMB 把这些**物理页逐页挂进当前进程的页表**，用的是既有原语
+//     user64_map_phys_page64()（kernel/usermode64.h），窗口 = **A1 的帧缓冲映射区**
+//     USER64_FB_VA64（5GiB，PDPT[5]）的后半段：
+//         [USER64_FB_VA64 + 8MiB, USER64_FB_VA64 + 40MiB) = 4 个槽 × 8 MiB
+//     为什么是这块窗：它与 fb_map(9) 的后备缓冲映射**同一个窗**（前半段 8 MiB 归后备缓冲），
+//     而 proc64 的进程回收**只走 PDPT[4]**（用户窗口），不碰 PDPT[5] —— 于是这些页
+//     不会被当成"进程自己的页"还回页池（那是双重释放，症状极难查）。
+//   * MAP_DUMB 的 `offset` 出参 = 这块缓冲在当前进程里的**用户 VA**（Linux 那边是 mmap
+//     的文件偏移；我们没有文件 mmap，如实说明这是本内核的语义差异），`size`/`pitch`
+//     由 CREATE_DUMB 的同一个结构体带回。
+//   * **不新增 syscall 号**：只用既有 ioctl(16) + 既有页映射原语。
+//   * page-flip 时内核**不需要**用户映射：它直接按 phys 走 0..4GiB 恒等直映读这块缓冲
+//     （与 fb.cpp 读 LFB、gpu64.cpp 读 BAR 是同一种写法）—— 所以 kernel 侧自检
+//     （没有进程上下文）与 ring3 走的是同一条呈现路径。
+//   * 如实边界：dumb buffer 与"创建它的进程"绑定（slot 记 owner pid）。进程异常退出且
+//     没 DESTROY_DUMB，那块页会一直占着（**有界**：4 槽 × <=8 MiB），再次 CREATE_DUMB
+//     在该槽仍是 used 时返回 -ENOMEM 并打点。真 KMS 的 fd 生命周期管理是下一批的事。
+//
+// ============================ 混合呈现（CPU 光栅化 + GPU 传输）============================
+//   CPU 做光栅化（ring3 在 dumb buffer 里画）；内核 page_flip 只做**传输与扫描输出**，
+//   复用既有两条路径（一个字节的新"上屏"代码都没有）：
+//     ① 先把 dumb buffer 逐行拷进**内核后备缓冲**（fb_surface64()，这是既有的绘制目标）；
+//     ② 上屏：vgpu64_blit64(x,y,w,h) 成功 -> path=gpu（virtio-gpu 2D：TRANSFER_TO_HOST_2D
+//        + RESOURCE_FLUSH，扫描输出在设备侧）；返回 0（没有设备 / 降级 / 超时）->
+//        fb_soft_flip_region64(x,y,w,h) -> path=cpu（CPU 逐行写 LFB）。
+//   两条都是既有函数，本层**不碰任何厂商 GPU 寄存器**（只读安全）。
+//
+// ============================ 串口打点（自动验收 grep，格式勿改）============================
+//   [DRM] init crtc=1 connectors=1 fbs=4 dumb_max=4 vblank=<hw|soft>
+//   [DRM] vblank mode=<hw|soft> edges=<n> ms=<n>
+//   [DRM] create handle=<n> w=<n> h=<n> pitch=<n> size=<n> pages=<n>
+//   [DRM] create FAILED reason=<reason> err=<n>
+//   [DRM] map handle=<n> va=0x<hex> pages=<n> phys=0x<hex> u=<0|1>
+//   [DRM] map FAILED handle=<n> reason=<reason> err=<n>
+//   [DRM] destroy handle=<n> pages=<n> freed=<n> free_pages=<n>
+//   [DRM] present id=<n> path=gpu|cpu bytes=<n> seq=<n>
+//   [DRM] present FAILED id=<n> reason=<reason> err=<n>
+//   [DRM] wait_vblank seq=<n> mode=<hw|soft> ticks=<n>
+//   [DRM] verify bars=<n> ok=<0|1>                        （自检：buffer 内容 = 写进去的图案）
+//   [DRM] selftest dumb=ok flip=ok vblank=<n> mode=<hw|soft> ok=1
+//   [DRM] selftest FAIL reason=<reason> ok=0
+//   [DRMDEMO] …（ring3 验收程序自己打，见 user/apps/drmdemo.c）
+//   [EVDEV] read which=<n> n=<n>                          （有预算地打，防刷屏）
+//   [EVDEV] read FAILED which=<n> reason=<reason> err=<n>
+//   [EVDEV] ioctl which=<n> req=0x<hex> ok=0 err=25          （不认识的请求：-ENOTTY）
+//   [EVDEV] ioctl which=<n> req=0x<hex> name=<s>             （EVIOCGNAME 成功：回写的设备名）
+//   [EVDEV] ioctl which=<n> req=0x<hex> bits=0x<hex>          （EVIOCGBIT 成功：事件类型位图）
+//
+// ============================ 头文件包含纪律 ============================
+//   kernel/drm64.h 只被 kernel/drm64.cpp、kernel/fd64.cpp、kernel/syscall64.cpp、
+//   kernel/kernel64.cpp 引用；用户侧那份是独立拷贝（不包含本文件）。
+#pragma once
+#include <stdint.h>
+
+// ==================== ioctl 编码（Linux DRM 风格，size 用我们的 struct）====================
+#define DRM64_IOC_NRBITS64   8
+#define DRM64_IOC_TYPEBITS64 8
+#define DRM64_IOC_SIZEBITS64 14
+#define DRM64_IOC_DIRBITS64  2
+#define DRM64_IOC_NONE64     0u
+#define DRM64_IOC_WRITE64    1u
+#define DRM64_IOC_READ64     2u
+#define DRM64_IOC_BASE64     ((uint32_t)'d')      // 0x64：与 Linux DRM 同一个基字符
+// dir(W|R) << 30 | size << 16 | 'd' << 8 | nr     —— 与 Linux _IOWR 的位序完全一致
+#define DRM64_IOWR(nr, type) \
+    ((uint32_t)((DRM64_IOC_READ64 | DRM64_IOC_WRITE64) << 30) | \
+     ((uint32_t)sizeof(type) << 16) | (DRM64_IOC_BASE64 << 8) | ((uint32_t)(nr) & 0xFFu))
+
+// ---- 支持的 nr（Linux DRM 的编号风格；只列本批实现了的）----
+#define DRM64_NR_VERSION           0x00u
+#define DRM64_NR_GET_CAP           0x0cu
+#define DRM64_NR_WAIT_VBLANK       0x3au
+#define DRM64_NR_CRTC_GET_SEQUENCE 0x3bu
+#define DRM64_NR_MODE_GETRESOURCES 0xA0u
+#define DRM64_NR_MODE_GETCRTC      0xA1u
+#define DRM64_NR_MODE_GETCONNECTOR 0xA7u
+#define DRM64_NR_MODE_PAGE_FLIP    0xB0u
+#define DRM64_NR_MODE_CREATE_DUMB  0xB2u
+#define DRM64_NR_MODE_MAP_DUMB     0xB3u
+#define DRM64_NR_MODE_DESTROY_DUMB 0xB4u
+
+// ==================== 上限（如实小于等于；越界一律 -EINVAL）====================
+#define DRM64_MAX_DUMB64       4u        // 同时存在的 dumb buffer 数（= 用户映射窗槽数）
+#define DRM64_MAX_CONNECTOR64  4u        // connector 数（实际只有 1 个：HDMI-A-1）
+#define DRM64_MAX_CRTC64       1u        // CRTC 数（本内核只有一块屏）
+#define DRM64_MAX_PLANE64      2u        // plane 数（primary + cursor，本批只实现 primary）
+#define DRM64_DUMB_MAX_BYTES64 (8ull * 1024ull * 1024ull)   // 单块上限 8 MiB（1080p@32bpp 够用）
+#define DRM64_DUMB_MAX_PAGES64 2048u                        // = DRM64_DUMB_MAX_BYTES64 / 4KiB
+#define DRM64_DUMB_MAX_STRIDE64 8192u                       // 单行字节上限（w <= 2048 @32bpp）
+#define DRM64_DUMB_MAX_HEIGHT64 4096u
+#define DRM64_DEV_NAME64       "vimtu-drm"
+#define DRM64_DEV_DATE64       "20250101"
+#define DRM64_DEV_DESC64       "Vimtu64 DRM/KMS minimal facade (dumb buffers + page flip + vblank)"
+#define DRM64_CONNECTOR_NAME64 "HDMI-A-1"
+// CRTC / connector / encoder 的 id 从 1 开始（0 = 没有）；fb id 与 dumb handle 同一套号。
+#define DRM64_CRTC_ID64        1u
+#define DRM64_CONNECTOR_ID64   1u
+#define DRM64_ENCODER_ID64     1u
+// 用户映射窗（见文件头）：A1 的 FB 区后半段，4 槽 × 8 MiB
+#define DRM64_UVA_BASE_OFFSET64 (8ull * 1024ull * 1024ull)  // USER64_FB_VA64 + 8 MiB
+#define DRM64_UVA_SLOT_BYTES64  (8ull * 1024ull * 1024ull)
+
+// ==================== 错误码（Linux errno 的正值；函数返回它的相反数）====================
+#define DRM64_EPERM64   1
+#define DRM64_EIO64     5
+#define DRM64_ENOMEM64  12
+#define DRM64_EFAULT64  14
+#define DRM64_EBUSY64   16
+#define DRM64_ENODEV64  19
+#define DRM64_EINVAL64  22
+#define DRM64_ENOTTY64  25
+#define DRM64_ENOSYS64  38
+
+// ==================== 结构体（全部 packed；字段顺序 = ABI，别动）====================
+// ① VERSION：短字符串由内核写进用户缓冲（name/date/desc 是**用户指针**，长度含结尾 NUL）。
+struct __attribute__((packed)) Drm64Version {
+    int32_t  version_major;      // +0   = 1
+    int32_t  version_minor;      // +4   = 0
+    int32_t  version_patchlevel; // +8   = 0
+    uint64_t name_len;           // +12  in/out：name 缓冲字节数（写入含 NUL 的实际长度）
+    uint64_t name;               // +20  用户缓冲指针（"vimtu-drm"）
+    uint64_t date_len;           // +28  in/out：date 缓冲字节数
+    uint64_t date;               // +36  用户缓冲指针（"20250101"）
+    uint64_t desc_len;           // +44  in/out：desc 缓冲字节数
+    uint64_t desc;               // +52  用户缓冲指针（一行说明）
+};                               // = 60 B
+static_assert(sizeof(Drm64Version) == 60, "Drm64Version 必须是 60 B（ioctl 号靠它）");
+
+// ② GET_CAP：只支持 DRM_CAP_DUMB_BUFFER(1) 与 DRM_CAP_VBLANK(2)（值 1 = 支持）。
+struct __attribute__((packed)) Drm64GetCap {
+    uint64_t capability;         // +0  in：1 = DUMB_BUFFER / 2 = VBLANK
+    uint64_t value;              // +8  out：1 = 支持 / 0 = 不支持
+};                               // = 16 B
+static_assert(sizeof(Drm64GetCap) == 16, "Drm64GetCap 必须是 16 B");
+
+// ③ GETRESOURCES：两个方向用同一个结构（count_* 是 in/out；ptr 是用户数组指针）。
+struct __attribute__((packed)) Drm64ModeResources {
+    uint64_t fb_id_ptr;          // +0   用户 u32 数组（fb id）
+    uint64_t crtc_id_ptr;        // +8   用户 u32 数组（crtc id）
+    uint64_t connector_id_ptr;   // +16  用户 u32 数组（connector id）
+    uint64_t encoder_id_ptr;     // +24  用户 u32 数组（encoder id）
+    uint32_t count_fbs;          // +32  in/out
+    uint32_t count_crtcs;        // +36  in/out
+    uint32_t count_connectors;   // +40  in/out
+    uint32_t count_encoders;     // +44  in/out
+    uint32_t min_width;          // +48  out
+    uint32_t max_width;          // +52  out
+    uint32_t min_height;         // +56  out
+    uint32_t max_height;         // +60  out
+};                               // = 64 B
+static_assert(sizeof(Drm64ModeResources) == 64, "Drm64ModeResources 必须是 64 B");
+
+// ③-b 显示模式（name 在结构**最前**，与 Linux 的 drm_mode_modeinfo 不同 —— 我们自己定，
+//     因为本批不做与真实 drm.h 的逐字节兼容）。
+struct __attribute__((packed)) Drm64ModeMode {
+    char     name[32];           // +0   "<w>x<h>"（NUL 结尾）
+    uint32_t clock;              // +32  kHz（按 60 Hz 估计，如实标注为估计值）
+    uint16_t hdisplay;           // +36
+    uint16_t hsync_start;        // +38
+    uint16_t hsync_end;          // +40
+    uint16_t htotal;             // +42
+    uint16_t vdisplay;           // +44
+    uint16_t vsync_start;        // +46
+    uint16_t vsync_end;          // +48
+    uint16_t vtotal;             // +50
+    uint32_t hskew;              // +52
+    uint32_t vscan;              // +56
+    uint32_t vrefresh;           // +60  Hz（估计值）
+    uint32_t flags;              // +64  0
+    uint32_t type;               // +68  0 = 非首选之外的普通模式（本批恒 0）
+};                               // = 72 B
+static_assert(sizeof(Drm64ModeMode) == 72, "Drm64ModeMode 必须是 72 B");
+
+// ④ GETCRTC：读当前 CRTC 状态（1 个 CRTC）。
+struct __attribute__((packed)) Drm64ModeCrtc {
+    uint64_t       set_connectors_ptr;  // +0   用户 u32 数组（out）
+    uint32_t       count_connectors;    // +8   in/out
+    uint32_t       crtc_id;             // +12  out = 1
+    uint32_t       fb_id;               // +16  out = 当前在屏的 dumb handle（0 = 没有）
+    uint32_t       x;                   // +20  out = 0
+    uint32_t       y;                   // +24  out = 0
+    uint32_t       gamma_size;          // +28  out = 0（没有 gamma LUT）
+    uint32_t       mode_valid;          // +32  out = 1
+    Drm64ModeMode  mode;                // +36  out = 当前模式
+};                                      // = 108 B
+static_assert(sizeof(Drm64ModeCrtc) == 108, "Drm64ModeCrtc 必须是 108 B");
+
+// ⑤ GETCONNECTOR：1 个 connector（HDMI-A-1，status=connected）。
+struct __attribute__((packed)) Drm64ModeConnector {
+    uint64_t encoders_ptr;       // +0   用户 u32 数组
+    uint64_t modes_ptr;          // +8   用户 Drm64ModeMode 数组
+    uint64_t props_ptr;          // +16  用户 u32 数组（本批恒 0 个属性）
+    uint64_t prop_values_ptr;    // +24  用户 u64 数组（本批恒 0 个）
+    uint32_t count_modes;        // +32  in/out
+    uint32_t count_props;        // +36  in/out（恒 0）
+    uint32_t count_encoders;     // +40  in/out
+    uint32_t encoder_id;         // +44  out = 1
+    uint32_t connector_id;       // +48  out = 1
+    uint32_t connector_type;     // +52  out = 11（DRM_MODE_CONNECTOR_HDMIA）
+    uint32_t connector_type_id;  // +56  out = 1
+    uint32_t connection;         // +60  out = 1（connected）
+    uint32_t mm_width;           // +64  out = 0（没有 EDID 物理尺寸时如实 0）
+    uint32_t mm_height;          // +68  out = 0
+    uint32_t subpixel;           // +72  out = 0（unknown）
+    uint32_t pad;                // +76
+};                               // = 80 B
+static_assert(sizeof(Drm64ModeConnector) == 80, "Drm64ModeConnector 必须是 80 B");
+
+// ⑥ CREATE_DUMB（bpp 只支持 32；pitch = width*4；handle = 1..4）
+struct __attribute__((packed)) Drm64ModeCreateDumb {
+    uint32_t height;             // +0   in
+    uint32_t width;              // +4   in
+    uint32_t bpp;                // +8   in（必须是 32）
+    uint32_t flags;              // +12  必须 0
+    uint32_t handle;             // +16  out（1..DRM64_MAX_DUMB64）
+    uint32_t pitch;              // +20  out（= width*4）
+    uint64_t size;               // +24  out（= pitch*height）
+};                               // = 32 B
+static_assert(sizeof(Drm64ModeCreateDumb) == 32, "Drm64ModeCreateDumb 必须是 32 B");
+
+// ⑦ MAP_DUMB：**offset 是本内核的用户 VA**（语义差异，见文件头；Linux 那边是文件偏移）。
+struct __attribute__((packed)) Drm64ModeMapDumb {
+    uint32_t handle;   // +0  in
+    uint32_t pad;      // +4
+    uint64_t offset;   // +8  out = 这块缓冲在当前进程里的用户 VA（0 = 没有映射）
+};                     // = 16 B
+static_assert(sizeof(Drm64ModeMapDumb) == 16, "Drm64ModeMapDumb 必须是 16 B");
+
+// ⑧ DESTROY_DUMB
+struct __attribute__((packed)) Drm64ModeDestroyDumb {
+    uint32_t handle;   // +0  in
+};                     // = 4 B
+static_assert(sizeof(Drm64ModeDestroyDumb) == 4, "Drm64ModeDestroyDumb 必须是 4 B");
+
+// ⑨ PAGE_FLIP：fb_id 就是 dumb handle；同步翻转（返回 0 = 已上屏并等过一次 vblank）
+struct __attribute__((packed)) Drm64ModePageFlip {
+    uint32_t crtc_id;    // +0   in（必须是 1）
+    uint32_t fb_id;      // +4   in（dumb handle）
+    uint32_t flags;      // +8   必须 0（没有异步翻页 / 事件）
+    uint32_t reserved;   // +12
+    uint64_t user_data;  // +16  原样带回（本批不回任何事件，仅日志）
+};                       // = 24 B
+static_assert(sizeof(Drm64ModePageFlip) == 24, "Drm64ModePageFlip 必须是 24 B");
+
+// ⑩ WAIT_VBLANK：request = 1 = "等下一个 vblank"；0 = 只读序列号
+struct __attribute__((packed)) Drm64WaitVblank {
+    uint64_t request;     // +0   in：1 = wait / 0 = query
+    uint64_t sequence;    // +8   out：当前 vblank 序列号（单调递增）
+    uint64_t tval_sec;    // +16  out：tick 换算的秒
+    uint64_t tval_usec;   // +24  out：微秒（4 ms tick 粒度，如实）
+    uint32_t crtc_id;     // +32  in
+    uint32_t flags;       // +36  out：1 = 用了硬件回扫 / 0 = 软兜底
+};                        // = 40 B
+static_assert(sizeof(Drm64WaitVblank) == 40, "Drm64WaitVblank 必须是 40 B");
+
+// ⑪ CRTC_GET_SEQUENCE
+struct __attribute__((packed)) Drm64CrtcSeq {
+    uint32_t crtc_id;     // +0   in
+    uint32_t flags;       // +4   out：1 = 硬件回扫可用
+    uint64_t sequence;    // +8   out
+    uint64_t ns;          // +16  out：sequence 对应的纳秒（tick 粒度，如实）
+    uint64_t tval_sec;    // +24  out
+    uint64_t tval_usec;   // +32  out
+};                        // = 40 B
+static_assert(sizeof(Drm64CrtcSeq) == 40, "Drm64CrtcSeq 必须是 40 B");
+
+// ==================== evdev ABI ====================
+// 24 B，与 Linux x86_64 的 struct input_event 同尺寸（时间戳 2×u64 + 2×u16 + i32）。
+struct __attribute__((packed)) InputEvent64 {
+    uint64_t sec;     // +0
+    uint64_t usec;    // +8
+    uint16_t type;    // +16  EV_*
+    uint16_t code;    // +18  键码 / REL_* 轴号 / BTN_*
+    int32_t  value;   // +20
+};                    // = 24 B
+static_assert(sizeof(InputEvent64) == 24, "InputEvent64 必须是 24 B（与 Linux 同尺寸）");
+
+#define EV64_SYN 0u
+#define EV64_KEY 1u
+#define EV64_REL 2u
+#define EV64_ABS 3u
+// 本批的键码口径 = 既有 input64.h 的键码（可打印 ASCII / 控制字符 / NAV_* 扩展），
+// 鼠标键位用 Linux BTN_* 的低位（左 0x110 / 右 0x111 / 中 0x112 不做映射，直接用掩码：
+//   0x1 = 左、0x2 = 右、0x4 = 中，与 EV64_BTN_* 一致 —— 如实说明这不是 Linux 的 BTN_*）。
+#define EV64_REL_X      0u
+#define EV64_REL_Y      1u
+#define EV64_REL_WHEEL  8u
+#define EVDEV64_MAX_EVENTS64 32u     // 单次 read 最多返回的事件数（= 进程队列容量）
+
+// ioctl（Linux evdev 的编码，size 位是"缓冲区字节数"，见 _IOC 的 size 语义）
+#define EVDEV64_IOCTL_ID64 0x80084506u        // EVIOCGNAME(len)  (len 由调用方填进 size 位)
+#define EVDEV64_IOCTL_VER64    0x80044501u    // EVIOCGVERSION
+#define EVDEV64_IOCTL_BIT64    0x80084520u    // EVIOCGBIT(0, len)：支持的事件类型位图
+
+// ==================== 函数声明 ====================
+// DRM 门面：syscall64.cpp 的 ioctl(16) 在 fd 是 DRM 设备时调它。返回 0 / 负数 errno。
+int drm64_ioctl64(uint64_t cmd, uint64_t arg, uint64_t pid);
+// evdev 门面：which = 0（event0 = 键盘）/ 1（event1 = 鼠标）。
+int evdev64_ioctl64(int which, uint64_t cmd, uint64_t arg);
+// evdev read：把事件队列里的原始事件转换成 InputEvent64 写进 ubuf（**调用方保证指针可用**：
+//   Linux read 路径传的是用户 VA，自有 ABI 7 号传的是内核 staging 缓冲 —— 两种都是
+//   "当前 CR3 下可写的指针"，所以这里不再做用户范围校验，校验在 syscall64/fd64 那层）。
+int64_t evdev64_read64(int which, void* ubuf, uint64_t len);
+void drm64_init64(void);
+int drm64_selftest64(void);
+// 可选的启动期 ring3 验收程序（有界等待；没有 /bin/drmdemo.elf 或没有 /etc/drm64_probe
+// 时只打一行 skipped）。放在 kernel64.cpp 的 ring3 演示段末尾调用。
+int drm64_demo64(const char* path);

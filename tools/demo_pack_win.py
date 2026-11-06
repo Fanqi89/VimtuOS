@@ -92,6 +92,13 @@ BLOBS = [
 #   单独一张表的好处：demo64_blobtab.h 的份数/偏移表与内核区预留**一个字节都不动**。
 VOL_ONLY = [
     ("/epipe.elf",          "epipe.elf",          0o755),
+    # ★ v0.9.12：DRM/KMS + evdev 的 ring3 验收程序（真进程；kernel/drm64.cpp 的 drm64_demo64
+    #   按卷里的路径装载它）。为什么只进卷、不进原始区：
+    #     ① 它只在有 /etc/drm64_probe 的夹具盘上跑（默认启动一个像素都不画、一个进程都不建），
+    #        而 probe 文件本身就只在卷里 —— "空夹具盘兜底"对它没有意义；
+    #     ② 原始区（LBA 6096..8008）的余量要留给字体/演示 blob，13 KB 的 ELF 不值得占。
+    #   文件名 user_drmdemo.elf 是 user/build_user.sh 的产物（VIMTU_USER_APPS 默认集里有 drmdemo）。
+    ("/bin/drmdemo.elf",    "user_drmdemo.elf",  0o755),
 ]
 
 

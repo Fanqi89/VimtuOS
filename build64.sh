@@ -67,7 +67,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.9.11"    # ★ v0.9.11：AMD 多核修复（INIT 前刷缓存 + TSC 时序下限 + SIPI 重发 + A20 保护 + AP 面包屑）
+VIMTUOS_VERSION="0.9.12"    # ★ v0.9.12：Wayland 基础抽象层 —— DRM/KMS + evdev 内核门面（dumb buffer + page flip + vblank + 混合呈现）
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
@@ -158,6 +158,12 @@ SRCS_OS="$SRCS_OS kernel/gpu64.cpp"
 #   同样**只进系统内核**（安装介质不需要它）。必须在 gpu64.cpp 之后加：gpu64.cpp 调
 #   intel64_probe64()/intel64_selftest64()，两个文件一起进出，不能只加一个。
 SRCS_OS="$SRCS_OS kernel/intel_gpu64.cpp"
+# ★ v0.9.12：kernel/drm64.cpp（DRM/KMS + evdev 内核门面）**只进系统内核** —— 它要用
+#   proc64 的进程/页表（把 dumb buffer 的物理页挂进调用方地址空间）、fb 的后备缓冲物理页与
+#   vgpu64_blit64（混合呈现的 GPU 传输路径）；安装介质里这些全都没有。两份内核的 syscall64/fd64
+#   对 drm64_ioctl64/evdev64_* 用弱引用，安装内核那侧落到 kernel/gpu64_stub64.cpp 的空实现
+#   （一律 -ENOTTY/-ENOSYS，不假装成功）。
+SRCS_OS="$SRCS_OS kernel/drm64.cpp"
 # ★ A5：kernel/wl64.cpp（Wayland 基础骨架：surface/commit/seat + 最小合成器）**只进系统内核** ——
 #   它要用 proc64 的 shm 对象表（读共享缓冲的物理页）与 fb 的提交路径；安装介质内核不链它，
 #   syscall64.cpp 对 15..21 号用弱引用（那里返回 -1 并打 [SYSCALL] deny，不假装成功）。
@@ -388,8 +394,11 @@ echo "==> ★ A2：用户态 **C** 程序交叉编译（我们自己的最小 li
 if [ "${VIMTU_USER_FBDEMO:-c}" = "asm" ]; then
     VIMTU_USER_APPS="${VIMTU_USER_APPS:-hello libctest}"
 else
-    VIMTU_USER_APPS="${VIMTU_USER_APPS:-hello libctest fbdemo}"
+    VIMTU_USER_APPS="${VIMTU_USER_APPS:-hello libctest fbdemo drmdemo}"
 fi
+# ★ v0.9.12：drmdemo（DRM/KMS + evdev 的 ring3 验收程序）进默认集 —— 产物是
+#   build64/user_drmdemo.elf（真进程跑，由 kernel/drm64.cpp 的 drm64_demo64 装载）；
+#   交付 = 系统卷 /bin/drmdemo.elf（tools/demo_pack_win.py 的 VOL_ONLY，逐字节回读自检）。
 for app in $VIMTU_USER_APPS; do
     bash user/build_user.sh "$app" "$BUILD"
     echo "    演示程序（卷交付）：user/apps/$app.c -> $BUILD/user_${app}.bin（$(stat -c%s "$BUILD/user_${app}.bin") B）"
@@ -848,7 +857,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
     "$BUILD/os"/theme64.o "$BUILD/os"/gfx64.o "$BUILD/os"/img64.o \
     "$BUILD/os"/locklogin64.o "$BUILD/os"/userdb64.o \
-    "$BUILD/os"/wl64.o \
+    "$BUILD/os"/wl64.o "$BUILD/os"/drm64.o \
     "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o "$BUILD/os"/dockmenu64.o \
     "$BUILD/os"/icons64.o \
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
@@ -903,8 +912,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
         "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
         "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/cr3exp/proc64.o" \
-        "$BUILD/os"/wl64.o \
-        "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/ehci64.o "$BUILD/os"/hda64.o \
+        "$BUILD/os"/wl64.o "$BUILD/os"/drm64.o \
         "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
         "$BUILD"/demo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
         "$BUILD/os"/kaisi_png.o    # 图标包已外置（原始区 + 系统卷），不再是内嵌对象

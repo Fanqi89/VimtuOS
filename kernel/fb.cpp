@@ -1163,6 +1163,16 @@ static int fb64_vblank_wait(void) {
     }
     return 1;
 }
+// ★ v0.9.12：DRM/KMS 门面的复用入口（薄的转发，逻辑仍在本文件的 static 函数里 ——
+//   一处实现，两个调用方：既有的 vsync 帧引擎 + 新的 kernel/drm64.cpp）。
+int fb64_vblank_probe_export64(uint64_t* edges_out, uint64_t* ms_out) {
+    uint64_t e = 0, ms = 0;
+    const int r = fb64_vblank_probe(&e, &ms);
+    if (edges_out) *edges_out = e;
+    if (ms_out)    *ms_out = ms;
+    return r;
+}
+int fb64_vblank_wait_export64(void) { return fb64_vblank_wait(); }
 // 节拍器：粗等用 hlt 睡到"还剩 1 ms"，细等用 rdtsc 自旋（对齐到目标时刻）
 static void fb64_wait_until(uint64_t deadline_cyc) {
     if (fb64_irqs_on()) {

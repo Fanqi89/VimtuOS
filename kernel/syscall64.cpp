@@ -171,6 +171,10 @@ int  proc64_chdir64(const char*)                          __attribute__((weak));
 // ★ 本批：设备 BAR 映射的落地（proc64.cpp 的设备映射窗；安装内核不链 proc64.cpp -> 0 -> 号 48
 //   返回 -1 并打 [SYSCALL] deny —— 安装介质里根本没有 ring3，这条只是防御性写法）。
 int64_t proc64_devmap64(uint32_t, uint32_t, uint64_t, uint64_t, uint64_t)  __attribute__((weak));
+// ★ v0.9.12：DRM/KMS + evdev 门面（kernel/drm64.cpp，**只进系统内核**）。安装介质内核不链它
+//   -> weak 为 0 -> ioctl(16) 对这两个设备返回 -ENOTTY（不假装成功）。
+int     drm64_ioctl64(uint64_t, uint64_t, uint64_t)                 __attribute__((weak));
+int     evdev64_ioctl64(int, uint64_t, uint64_t)                    __attribute__((weak));
 // ★ 本批：凭证查询（root 判定用；同上，安装内核为 0 -> 当"拿不到凭证"处理=拒绝）
 int     proc64_get_cred64(uint32_t*, uint32_t*, uint32_t*, uint32_t*)       __attribute__((weak));
 // ★ 本批：BAR 解码（kernel/pci64.cpp，**两份内核都链**它，所以这里是强引用而不是弱引用）
@@ -1286,6 +1290,22 @@ static int64_t lx64_ioctl64(uint64_t nr, uint64_t fd, uint64_t req, uint64_t arg
     if (fd <= 2 && !fd64_slot_used64((int)fd)) return lx64_tty_ioctl64(nr, req, arg);
     if (fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     if (fd64_slot_is_tty64((int)fd)) return lx64_tty_ioctl64(nr, req, arg);
+    // ★ v0.9.12：设备特判（**在 tty 分支之后**，既有 tty/文件/pipe 的行为一个字节都不动）。
+    //   /dev/dri/card0 -> drm64_ioctl64（枚举模式 / dumb buffer / page flip / vblank）；
+    //   /dev/input/event0|1 -> evdev64_ioctl64（EVIOCGNAME / EVIOCGVERSION / EVIOCGBIT）。
+    //   两个落点都是 weak：安装介质内核不链 drm64.cpp -> 落到最后的 -ENOTTY（不假装成功）。
+    {
+        int which = 0;
+        const int dk = fd64_slot_dev_kind64((int)fd, &which);
+        if (dk == FD64_KIND_DRM) {
+            if (!drm64_ioctl64) return -LX64_ENOTTY;
+            return (int64_t)drm64_ioctl64(req, arg, (uint64_t)sc64_fb_pid64());
+        }
+        if (dk == FD64_KIND_EVDEV) {
+            if (!evdev64_ioctl64) return -LX64_ENOTTY;
+            return (int64_t)evdev64_ioctl64(which, req, arg);
+        }
+    }
     return -LX64_ENOTTY;
 }
 

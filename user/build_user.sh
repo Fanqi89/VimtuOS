@@ -37,7 +37,7 @@ set -e
 
 cd "$(dirname "$0")/.."                     # 仓库根
 ROOT="$(pwd)"
-LIBSRC_NAMES="syscall.c string.c stdlib.c stdio.c fb.c"
+LIBSRC_NAMES="syscall.c string.c stdlib.c stdio.c fb.c drm64.c"   # ★ v0.9.12 加 drm64.c（DRM/KMS + evdev 薄封装）
 LIB_S="crt0.S syscall.S"
 LDSCRIPT="user/lib/user64.ld"
 MAX_BLOB=$((8 * 4096))
