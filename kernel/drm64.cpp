@@ -92,6 +92,12 @@ static uint32_t g_fb_on_screen = 0;         // 在屏的 fb id（0 = 没有；le
 static uint32_t g_crtc_active = 0;
 // 上一次呈现用的矩形（plane 的 SRC_/CRTC_ 属性就以它为当前值）
 static uint32_t g_last_x = 0, g_last_y = 0, g_last_w = 0, g_last_h = 0;
+// ★ v0.9.17：脏矩形（DIRTYFB 累计；半开区间 [x0,x1) × [y0,y1)）—— 2D 加速的实际来源：
+//   一次提交只把这部分搬给设备/写进 LFB，而不是整屏 3 MB。
+static uint32_t g_dmg_valid = 0;
+static uint32_t g_dmg_x0 = 0, g_dmg_y0 = 0, g_dmg_x1 = 0, g_dmg_y1 = 0;
+// 双缓冲交替的证据：上一帧在屏上的 handle + 交替次数
+static uint32_t g_flip_last = 0, g_flip_count = 0;
 // IN_FORMATS blob（自己在 init 里按 Linux 的 drm_format_modifier_blob 拼出来）
 static uint8_t  g_informats_primary[64];
 static uint32_t g_informats_primary_len = 0;
@@ -318,19 +324,31 @@ static int d64_present_rect64(Drm64Dumb* d, uint32_t x, uint32_t y, uint32_t w, 
     if (cw > (uint32_t)bw - x) cw = (uint32_t)bw - x;
     if (ch > (uint32_t)bh - y) ch = (uint32_t)bh - y;
     if (cw == 0u || ch == 0u) return -1;
-    // ① CPU 侧：把 ring3 画好的 dumb buffer 逐行拷进内核后备缓冲（既有的绘制目标）
-    for (uint32_t r = 0; r < ch; r++) {
-        d64_copy64(d, (uint64_t)r * (uint64_t)d->stride,
-                   bb + (uint64_t)(y + r) * (uint64_t)bw + x, cw * 4u, 0);
+    // ★ v0.9.17：有脏矩形就只处理脏矩形（与请求矩形求交）。这就是 2D 加速的落点：
+    //   virtio-gpu 的 2D 命令集只有 TRANSFER/FLUSH（没有 blit/fill），能省的只有"搬运量"。
+    uint32_t r0 = 0, r1 = ch, cx = x, cwid = cw;
+    if (g_dmg_valid) {
+        if (g_dmg_y0 > y) r0 = g_dmg_y0 - y;
+        if (g_dmg_y1 < y + ch) r1 = g_dmg_y1 - y;
+        if (g_dmg_x0 > x) { cwid -= (g_dmg_x0 - x); cx = g_dmg_x0; }
+        if (g_dmg_x1 < x + cw) cwid = g_dmg_x1 - cx;
+        if (r0 >= r1 || cwid == 0u) { r0 = 0; r1 = ch; cx = x; cwid = cw; }   // 脏矩形落在外面：退回整块
     }
-    const int dev = d64_present_backbuf64((int)x, (int)y, (int)cw, (int)ch);
+    const uint32_t crows = r1 - r0;
+    // ① CPU 侧：把 ring3 画好的 dumb buffer 逐行拷进内核后备缓冲（既有的绘制目标）
+    for (uint32_t r = r0; r < r1; r++) {
+        d64_copy64(d, (uint64_t)r * (uint64_t)d->stride + (uint64_t)(cx - x) * 4ull,
+                   bb + (uint64_t)(y + r) * (uint64_t)bw + cx, cwid * 4u, 0);
+    }
+    g_dmg_valid = 0;                                        // 脏矩形一次性消费
+    const int dev = d64_present_backbuf64((int)cx, (int)(y + r0), (int)cwid, (int)crows);
     d64_begin();
     d64_puts("[DRM] present id="); d64_num(d->id);
     d64_puts(dev ? " path=gpu bytes=" : " path=cpu bytes=");
-    d64_num((uint64_t)cw * 4ull * (uint64_t)ch);
+    d64_num((uint64_t)cwid * 4ull * (uint64_t)crows);
     d64_puts(" seq="); d64_num(g_seq);
-    d64_puts(" x="); d64_num(x); d64_puts(" y="); d64_num(y);
-    d64_puts(" w="); d64_num(cw); d64_puts(" h="); d64_num(ch);
+    d64_puts(" x="); d64_num(cx); d64_puts(" y="); d64_num(y + r0);
+    d64_puts(" w="); d64_num(cwid); d64_puts(" h="); d64_num(crows);
     d64_end();
     // 属性面的"当前值"跟着刷新（plane 的 SRC_/CRTC_ 就报这些）
     g_last_x = x; g_last_y = y; g_last_w = cw; g_last_h = ch;
@@ -621,6 +639,16 @@ static int d64_ioctl_page_flip64(uint64_t arg) {
     d64_puts(" seq="); d64_num(g_seq);
     d64_puts(" path="); d64_puts(path ? "gpu" : "cpu");
     d64_end();
+    // ★ v0.9.17：双缓冲交替的证据（两块 dumb 轮换时 alt=1，连续同一块 alt=0）
+    {
+        const uint32_t prev = g_flip_last;
+        const uint32_t alt = (prev != 0u && prev != d->id) ? 1u : 0u;
+        g_flip_last = d->id;
+        if (alt) g_flip_count++;
+        d64_begin(); d64_puts("[DRM] flip a="); d64_num(prev);
+        d64_puts(" b="); d64_num(d->id); d64_puts(" alt="); d64_num(alt);
+        d64_puts(" n="); d64_num(g_flip_count); d64_end();
+    }
     return 0;
 }
 
@@ -1219,6 +1247,54 @@ static int d64_ioctl_objsetprop64(uint64_t arg) {
     return 0;
 }
 
+// ---- DIRTYFB（★ v0.9.17）：累计脏矩形，之后的 PAGE_FLIP 只搬这部分 ----
+static int d64_ioctl_dirtyfb64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeFbDirty))) return -DRM64_EFAULT64;
+    Drm64ModeFbDirty f;
+    d64_urd64(arg, &f, sizeof(Drm64ModeFbDirty));
+    if (f.flags != 0u) return d64_fail64("[DRM] dirty", "flags", -DRM64_EINVAL64);
+    if (f.num_clips == 0u || f.num_clips > DRM64_MAX_CLIPS64)
+        return d64_fail64("[DRM] dirty", "num_clips", -DRM64_EINVAL64);
+    if (!f.clips_ptr || !user64_range_ok64(f.clips_ptr, f.num_clips * 8u))
+        return d64_fail64("[DRM] dirty", "clips", -DRM64_EFAULT64);
+    Drm64Fb* fb = nullptr;
+    Drm64Dumb* d = d64_fb_resolve64(f.fb_id, &fb);
+    if (!d) return d64_fail64("[DRM] dirty", "no-such-fb", -DRM64_EINVAL64);
+    uint32_t x0 = 0xFFFFFFFFu, y0 = 0xFFFFFFFFu, x1 = 0, y1 = 0;
+    for (uint32_t i = 0; i < f.num_clips; i++) {
+        Drm64ClipRect c;
+        d64_urd64(f.clips_ptr + (uint64_t)i * 8ull, &c, 8u);
+        if (c.x1 > c.x2) { const uint16_t s = c.x1; c.x1 = c.x2; c.x2 = s; }
+        if (c.y1 > c.y2) { const uint16_t s = c.y1; c.y1 = c.y2; c.y2 = s; }
+        uint32_t ax = c.x1, ay = c.y1, bx = c.x2, by = c.y2;
+        if (ax > d->w) ax = d->w;
+        if (bx > d->w) bx = d->w;
+        if (ay > d->h) ay = d->h;
+        if (by > d->h) by = d->h;
+        if (bx <= ax || by <= ay) continue;                 // 空矩形：跳过
+        if (ax < x0) x0 = ax;
+        if (ay < y0) y0 = ay;
+        if (bx > x1) x1 = bx;
+        if (by > y1) y1 = by;
+    }
+    if (x1 <= x0 || y1 <= y0) return d64_fail64("[DRM] dirty", "empty-clips", -DRM64_EINVAL64);
+    if (g_dmg_valid) {                                      // 与已有脏矩形取并集
+        if (x0 > g_dmg_x0) x0 = g_dmg_x0;
+        if (y0 > g_dmg_y0) y0 = g_dmg_y0;
+        if (x1 < g_dmg_x1) x1 = g_dmg_x1;
+        if (y1 < g_dmg_y1) y1 = g_dmg_y1;
+    }
+    g_dmg_x0 = x0; g_dmg_y0 = y0; g_dmg_x1 = x1; g_dmg_y1 = y1;
+    g_dmg_valid = 1u;
+    d64_begin(); d64_puts("[DRM] dirty fb="); d64_num(f.fb_id);
+    d64_puts(" clips="); d64_num(f.num_clips);
+    d64_puts(" dmg="); d64_num(x0); d64_ch(','); d64_num(y0);
+    d64_ch(','); d64_num(x1 - x0); d64_ch(','); d64_num(y1 - y0);
+    d64_puts(" bytes="); d64_num((uint64_t)(x1 - x0) * 4ull * (uint64_t)(y1 - y0));
+    d64_end();
+    return 0;
+}
+
 // ---- ATOMIC ----
 static int d64_ioctl_atomic64(uint64_t arg) {
     if (!user64_range_ok64(arg, sizeof(Drm64ModeAtomic))) return -DRM64_EFAULT64;
@@ -1286,6 +1362,7 @@ int drm64_ioctl64(uint64_t cmd, uint64_t arg, uint64_t pid) {
     case DRM64_IOWR(DRM64_NR_MODE_OBJ_GETPROPS, Drm64ModeObjGetProps): return d64_ioctl_objgetprops64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_OBJ_SETPROP, Drm64ModeObjSetProp): return d64_ioctl_objsetprop64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_ATOMIC, Drm64ModeAtomic):        return d64_ioctl_atomic64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_DIRTYFB, Drm64ModeFbDirty):      return d64_ioctl_dirtyfb64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_GETPLANERES, Drm64ModeGetPlaneRes): return d64_ioctl_getplaneres64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_GETPLANE, Drm64ModeGetPlane):    return d64_ioctl_getplane64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_PAGE_FLIP, Drm64ModePageFlip):   return d64_ioctl_page_flip64(arg);
@@ -1463,6 +1540,8 @@ void drm64_init64(void) {
     g_presents = 0;
     g_crtc_active = 0;
     g_last_x = g_last_y = g_last_w = g_last_h = 0;
+    g_dmg_valid = 0; g_dmg_x0 = g_dmg_y0 = g_dmg_x1 = g_dmg_y1 = 0;
+    g_flip_last = 0; g_flip_count = 0;
     for (uint32_t i = 0; i < DRM64_MAX_USERBLOB64; i++) g_userblob_len[i] = 0u;
     d64_build_informats64();                     // IN_FORMATS blob（Linux 的 drm_format_modifier_blob 布局）
     g_ev_pending_n = 0;

@@ -2300,7 +2300,7 @@ def cap_drm_kms():
               "`/dev/console` 同一套做法，命中 %d）；`ioctl(16)` 在 tty 分支**之后**按 fd 类型分派 —— "
               "既有 ABI 号（wl64 15–21/22–26、fb 9/10/11、pci 48）一个都没动"
               % grep_count(r"FD64_DRM_PATH|FD64_EVDEV0_PATH|FD64_EVDEV1_PATH", ["kernel/fd64.h"]))
-    ev.append("**24 个 ioctl 号与 Linux `include/uapi/drm/drm.h` 逐值相等**：VERSION `0xC0406400` / "
+    ev.append("**25 个 ioctl 号与 Linux `include/uapi/drm/drm.h` 逐值相等**：VERSION `0xC0406400` / "
               "GET_CAP `0xC010640C` / GETRESOURCES `0xC04064A0` / GETCRTC `0xC06864A1` / SETCRTC `0xC06864A2` / "
               "GETENCODER `0xC01464A6` / GETCONNECTOR `0xC05064A7` / GETPROPERTY `0xC04064AA` / GETPROPBLOB `0xC01064AC` / "
               "ADDFB `0xC01C64AD` / ADDFB2 `0xC06864AE` / PAGE_FLIP `0xC01864B0` / CREATE_DUMB `0xC02064B2` / "
@@ -2338,7 +2338,13 @@ def cap_drm_kms():
               "\"[DRM] release pid=… fbs=1 pages=4 free_pages=…\"、"
               "\"[DRMDEMO] version major=1 minor=0 patch=0 name=vimtu-drm\"、\"[DRMDEMO] paint … probe=0xffffffff\"、"
               "\"[DRMDEMO] addfb2 badfmt rc=-22\"（反例）、\"[DRMDEMO] badcmd rc=-25\"（未知 ioctl）")
-    ev.append("验收脚本 tests/drm64_test.py：%s（**65 条断言**：两份头文件逐值 + 24 个号与 Linux 逐个相等 + 内核自检 "
+    ev.append("**2D 加速（v0.9.17）**：`MODE_DIRTYFB`（Linux `0xB1`）+ 脏矩形并集 -> 提交只搬脏矩形 —— "
+              "实测整屏 3,145,728 B 降到 **32,768 B**（96 倍）；双缓冲 A/B 交替有 `[DRM] flip … alt=1` 证据")
+    ev.append("**3D（virgl）通路（v0.9.17）**：`kernel/vgpu3d64.cpp` 协商 `VIRTIO_GPU_F_VIRGL` + "
+              "`GET_CAPSET_INFO`（主机真有 virgl 时 `capset id=1 size=308`）+ `CTX_CREATE`/`RESOURCE_CREATE_3D`/"
+              "`SUBMIT_3D`/`TRANSFER_FROM_HOST_3D` 全部被设备接受；但**出图 UNVERIFIED**（host `vrend` 对 "
+              "`BIND_OBJECT` 回 22，六种编码逐轮试过）—— 如实标 UNVERIFIED，不假装成功（见 docs/2D与3D加速.md）")
+    ev.append("验收脚本 tests/drm64_test.py：%s（**74 条断言**：两份头文件逐值 + 25 个号与 Linux 逐个相等 + 内核自检 "
               "+ 混合呈现 + ring3 真能写 + fb 对象/SETCRTC/plane + 属性/blob/atomic（含 TEST_ONLY 与两个反例）"
               "+ 回收 hook 顺序 + 桌面照旧 + 禁止项）"
               % ("有" if exists("tests/drm64_test.py") else "★ 缺"))
@@ -3395,7 +3401,7 @@ CAPS = [
              "6*7=42；tar 与宿主 Python tarfile 双向互操作", cap_make_tar),
     ("应用层", "★ A5 Wayland 基础骨架：wl_surface_create/attach/commit/damage/destroy + wl_seat + "
              "wl_display_dispatch + 最小合成器（未提交不上屏 / 多 surface z 序 / damage 局部提交）", cap_wayland_skeleton),
-    ("应用层", "★ DRM/KMS 内核门面 + evdev 设备面：24 个 ioctl 号与 Linux `drm.h` 逐值相等（VERSION 0xC0406400 … "
+    ("应用层", "★ DRM/KMS 内核门面 + evdev 设备面：25 个 ioctl 号与 Linux `drm.h` 逐值相等（VERSION 0xC0406400 … "
              "DESTROYPROPBLOB 0xC00464BE）+ ring3 可写 dumb buffer + 混合呈现（path=gpu 走 virtio-gpu 2D / path=cpu 写 LFB）"
              "+ ADDFB/ADDFB2/SETCRTC/GETPLANE + 14 个属性的属性系统与 blob + MODE_ATOMIC（TEST_ONLY 不落像素）"
              "+ 进程回收 hook",
@@ -3565,9 +3571,9 @@ TESTS = [
                        "编出静态 ELF 并跑通 6*7=42；`sh -c` 语义子集（43 条断言）"),
     ("tar64_test.py", "★ B5 Ring 3 里的用户态 tar：产物被宿主 Python tarfile 逐成员读出 + 解宿主的 USTAR 包（含子目录）"
                       "+ -tf 列表（32 条断言）"),
-    ("drm64_test.py", "★ DRM/KMS 内核门面 + evdev：24 个 ioctl 号与 Linux drm.h 逐值相等 + ring3 可写 dumb buffer "
+    ("drm64_test.py", "★ DRM/KMS 内核门面 + evdev：25 个 ioctl 号与 Linux drm.h 逐值相等 + ring3 可写 dumb buffer "
                        "+ 混合呈现 path=gpu|cpu + ADDFB2/SETCRTC/GETPLANE + 属性/blob/MODE_ATOMIC（TEST_ONLY 不落像素）"
-                       "+ 进程回收 hook + 桌面照旧（65 条断言）"),
+                       "+ 2D 脏矩形（3,145,728 B -> 32,768 B）+ 进程回收 hook + 桌面照旧（74 条断言）"),
     ("wl64_test.py", "★ A5 Wayland 基础骨架：surface create/attach/commit/damage/destroy + wl_seat + wl_display_dispatch；"
                      "最小合成器（未提交不上屏 / 多 surface z 序 / damage 局部提交 / 退出兜底回收）（91 条断言）"),
     ("virtiogpu64_test.py", "★ 驱动线 3 virtio-gpu 2D：PCI/capability/VERSION_1/2D 命令集/响应 0x1101 + 设备与软件路径"

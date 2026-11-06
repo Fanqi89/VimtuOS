@@ -75,6 +75,7 @@
 #define DRM64_NR_MODE_CREATEBLOB   0xBDu
 #define DRM64_NR_MODE_DESTROYBLOB  0xBEu
 #define DRM64_NR_MODE_PAGE_FLIP    0xB0u
+#define DRM64_NR_MODE_DIRTYFB      0xB1u
 #define DRM64_NR_MODE_GETPLANE     0xB5u
 #define DRM64_NR_MODE_GETPLANERES  0xB6u
 #define DRM64_NR_MODE_CREATE_DUMB  0xB2u
@@ -439,6 +440,22 @@ struct Drm64ModeDestroyBlob {
     uint32_t blob_id;          /* +0   in */
 };                             /* = 4 B（= Linux drm_mode_destroy_blob） */
 DRM64_STATIC_ASSERT(sizeof(struct Drm64ModeDestroyBlob) == 4, "Drm64ModeDestroyBlob 必须是 4 B（= Linux drm_mode_destroy_blob）");
+
+/* ㉔ DIRTYFB（= Linux struct drm_mode_fb_dirty_cmd，24 B）：告诉内核哪些矩形变了，
+ *   之后的 PAGE_FLIP 只传这部分（2D 加速的真实来源：搬运量变小）。 */
+struct Drm64ModeFbDirty {
+    uint32_t fb_id;              /* +0   in（dumb handle 或 fb id） */
+    uint32_t flags;              /* +4   必须 0 */
+    uint32_t color;              /* +8   fbdev 仿真用；本内核忽略 */
+    uint32_t num_clips;          /* +12  in */
+    uint64_t clips_ptr;          /* +16  用户 u16[4] 数组 */
+};                               /* = 24 B（= Linux drm_mode_fb_dirty_cmd） */
+DRM64_STATIC_ASSERT(sizeof(struct Drm64ModeFbDirty) == 24, "Drm64ModeFbDirty 必须是 24 B（= Linux drm_mode_fb_dirty_cmd）");
+struct Drm64ClipRect {
+    uint16_t x1, y1, x2, y2;     /* = Linux struct drm_clip_rect（8 B） */
+};
+DRM64_STATIC_ASSERT(sizeof(struct Drm64ClipRect) == 8, "Drm64ClipRect 必须是 8 B（= Linux drm_clip_rect）");
+#define DRM64_MAX_CLIPS64 8u
 
 /* ==================== evdev ABI ==================== */
 /* 24 B，与 Linux x86_64 的 struct input_event 同尺寸（时间戳 2×u64 + 2×u16 + i32）。 */

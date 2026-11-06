@@ -76,6 +76,8 @@
 //   [DRM] blob create id=<n> len=<n> / blob read id=<n> len=<n>
 //   [DRM] atomic objs=<n> props=<n> flags=0x<hex> test=<0|1> path=<gpu|cpu|none> active=<0|1>
 //   [DRM] atomic FAILED reason=<reason> err=<n>
+//   [DRM] dirty fb=<n> clips=<n> dmg=<x>,<y>,<w>,<h>          （★ v0.9.17：脏矩形累计）
+//   [DRM] flip a=<id> b=<id> alt=<0|1> dmg=<x>,<y>,<w>,<h>     （★ v0.9.17：双缓冲交替）
 //   [DRM] verify bars=<n> ok=<0|1>                        （自检：buffer 内容 = 写进去的图案）
 //   [DRM] selftest dumb=ok flip=ok vblank=<n> mode=<hw|soft> ok=1
 //   [DRM] selftest FAIL reason=<reason> ok=0
@@ -127,6 +129,7 @@
 #define DRM64_NR_MODE_CREATEBLOB   0xBDu
 #define DRM64_NR_MODE_DESTROYBLOB  0xBEu
 #define DRM64_NR_MODE_PAGE_FLIP    0xB0u
+#define DRM64_NR_MODE_DIRTYFB      0xB1u
 #define DRM64_NR_MODE_GETPLANE     0xB5u
 #define DRM64_NR_MODE_GETPLANERES  0xB6u
 #define DRM64_NR_MODE_CREATE_DUMB  0xB2u
@@ -504,6 +507,24 @@ struct Drm64ModeDestroyBlob {
     uint32_t blob_id;          // +0   in（只对用户 blob 有效；固定 blob 拒绝）
 };                             // = 4 B（= Linux drm_mode_destroy_blob）
 static_assert(sizeof(Drm64ModeDestroyBlob) == 4, "Drm64ModeDestroyBlob 必须是 4 B（= Linux drm_mode_destroy_blob）");
+
+// ㉔ DIRTYFB（= Linux struct drm_mode_fb_dirty_cmd，24 B）：告诉内核"这块 fb 的哪些矩形变了"，
+//   之后的 PAGE_FLIP 就**只把这部分**传给设备/写进 LFB —— 2D 加速的实际来源就是这个
+//   （virtio-gpu 2D 没有 blit/fill 命令，能省的只有"搬运量"）。
+//   clips = 若干 struct drm_clip_rect { u16 x1, y1, x2, y2; }（8 B 一条，最多 8 条）。
+struct Drm64ModeFbDirty {
+    uint32_t fb_id;              // +0   in（dumb handle 或 fb id）
+    uint32_t flags;              // +4   必须 0
+    uint32_t color;              // +8   in（fbdev 仿真用；本内核忽略，如实记录）
+    uint32_t num_clips;          // +12  in
+    uint64_t clips_ptr;          // +16  用户 u16[4] 数组
+};                               // = 24 B（= Linux drm_mode_fb_dirty_cmd）
+static_assert(sizeof(Drm64ModeFbDirty) == 24, "Drm64ModeFbDirty 必须是 24 B（= Linux drm_mode_fb_dirty_cmd）");
+struct Drm64ClipRect {
+    uint16_t x1, y1, x2, y2;     // = Linux struct drm_clip_rect（8 B）
+};
+static_assert(sizeof(Drm64ClipRect) == 8, "Drm64ClipRect 必须是 8 B（= Linux drm_clip_rect）");
+#define DRM64_MAX_CLIPS64 8u
 
 // ==================== evdev ABI ====================
 // 24 B，与 Linux x86_64 的 struct input_event 同尺寸（时间戳 2×u64 + 2×u16 + i32）。

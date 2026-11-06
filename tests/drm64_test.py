@@ -104,6 +104,8 @@ STRUCT_NAMES = [
     "Drm64ModeGetEncoder", "Drm64ModeGetProperty", "Drm64ModeGetBlob",
     "Drm64ModeObjGetProps", "Drm64ModeObjSetProp", "Drm64ModeAtomic",
     "Drm64ModeCreateBlob", "Drm64ModeDestroyBlob",
+    # ★ v0.9.17：2D 加速（脏矩形）
+    "Drm64ModeFbDirty", "Drm64ClipRect",
 ]
 
 
@@ -203,6 +205,8 @@ LINUX_DRM_ABI = [
     ("DRM64_NR_MODE_ATOMIC",       "Drm64ModeAtomic",      0xBC,  56, 0xC03864BC),
     ("DRM64_NR_MODE_CREATEBLOB",   "Drm64ModeCreateBlob",  0xBD,  16, 0xC01064BD),
     ("DRM64_NR_MODE_DESTROYBLOB",  "Drm64ModeDestroyBlob", 0xBE,   4, 0xC00464BE),
+    # ★ v0.9.17：2D 加速（脏矩形）
+    ("DRM64_NR_MODE_DIRTYFB",      "Drm64ModeFbDirty",     0xB1,  24, 0xC01864B1),
 ]
 
 
@@ -511,6 +515,11 @@ def main():
             (r"\[DRMDEMO\] after_atomic plane_fb=256 crtc_fb=256 valid=1 rc=0/0",
              "提交后 GETPLANE/GETCRTC 报同一个 fb"),
             (r"\[DRMDEMO\] blob_destroy id=768 rc=0", "DESTROYBLOB rc=0"),
+            (r"\[DRMDEMO\] dirtyfb badflags rc=-22", "DIRTYFB 反例（flags）-> -22"),
+            (r"\[DRMDEMO\] dirtyfb handle=\d+ clips=1 rc=0", "DIRTYFB rc=0"),
+            (r"\[DRMDEMO\] flip_b rc=0", "双缓冲 flip_b"),
+            (r"\[DRMDEMO\] flip_a rc=0", "双缓冲 flip_a"),
+            (r"\[DRMDEMO\] dumb_b handle=\d+ rc=0/0", "第二块 dumb（双缓冲的 B 块）"),
         ]
         stage_ok = vm.wait("[DRMDEMO] done", args.timeout)
         log = vm.log()
@@ -600,6 +609,22 @@ def main():
         else:
             check("④ TEST_ONLY 没落像素（它之后到真提交之间只多 1 次 present = 提交自己那次）", False,
                   "找不到 test=1/test=0 两行")
+
+        # ---------- ④-d ★ v0.9.17：2D 加速（脏矩形只搬该搬的）----------
+        check("④ [DRM] dirty 记下脏矩形（clips=1 dmg=0,0,128,64 bytes=32768）",
+              re.search(r"\[DRM\] dirty fb=\d+ clips=1 dmg=0,0,128,64 bytes=32768", log) is not None,
+              (re.search(r"\[DRM\] dirty[^\r\n]*", log).group(0)
+               if re.search(r"\[DRM\] dirty[^\r\n]*", log) else "缺 dirty 行"))
+        pres = re.findall(r"\[DRM\] present id=(\d+) path=(gpu|cpu) bytes=(\d+)", log)
+        small = [int(b) for _i, _p, b in pres if int(b) == 32768]
+        check("④ 脏矩形那次提交只搬 32 KiB（整屏是 3,145,728 B —— 2D 加速的实际收益）",
+              len(small) >= 1, "各次 bytes=%s" % [int(b) for _i, _p, b in pres][:8])
+        check("④ 双缓冲交替被内核记录下来（[DRM] flip … alt=1 出现 2 次）",
+              len(re.findall(r"\[DRM\] flip a=\d+ b=\d+ alt=1", log)) >= 2,
+              (re.search(r"\[DRM\] flip[^\r\n]*", log).group(0)
+               if re.search(r"\[DRM\] flip[^\r\n]*", log) else "缺 flip 行"))
+        check("④ 反例：DIRTYFB 的 flags 非 0 -> [DRM] dirty FAILED reason=flags err=22",
+              re.search(r"\[DRM\] dirty FAILED reason=flags err=22", log) is not None)
 
         # ---------- ⑤ 桌面照旧 + 屏幕取证 ----------
         try:

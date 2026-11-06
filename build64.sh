@@ -67,7 +67,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.9.16"    # ★ v0.9.16：DRM 属性系统 + blob + atomic commit（24 个 ioctl 与 Linux 逐值相等）
+VIMTUOS_VERSION="0.9.17"    # ★ v0.9.17：2D 加速（脏矩形只搬该搬的）+ 3D virgl 通路自检
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
@@ -158,6 +158,10 @@ SRCS_OS="$SRCS_OS kernel/gpu64.cpp"
 #   同样**只进系统内核**（安装介质不需要它）。必须在 gpu64.cpp 之后加：gpu64.cpp 调
 #   intel64_probe64()/intel64_selftest64()，两个文件一起进出，不能只加一个。
 SRCS_OS="$SRCS_OS kernel/intel_gpu64.cpp"
+# ★ v0.9.17：kernel/vgpu3d64.cpp = virtio-gpu 的 **3D（virgl）通路**自检（capset + ctx +
+#   RESOURCE_CREATE_3D + SUBMIT_3D + TRANSFER_FROM_HOST_3D + 逐像素核对）。只进系统内核；
+#   virtio_gpu64.cpp（SRCS_CORE，两份内核都有）对 vgpu3d_selftest64 用**弱引用**，安装内核跳过。
+SRCS_OS="$SRCS_OS kernel/vgpu3d64.cpp"
 # ★ v0.9.12：kernel/drm64.cpp（DRM/KMS + evdev 内核门面）**只进系统内核** —— 它要用
 #   proc64 的进程/页表（把 dumb buffer 的物理页挂进调用方地址空间）、fb 的后备缓冲物理页与
 #   vgpu64_blit64（混合呈现的 GPU 传输路径）；安装介质里这些全都没有。两份内核的 syscall64/fd64
@@ -851,7 +855,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o "$BUILD/os"/gpu64.o "$BUILD/os"/intel_gpu64.o \
     "$BUILD/os"/sock64.o \
     "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
-    "$BUILD/os"/virtio_gpu64.o \
+    "$BUILD/os"/virtio_gpu64.o "$BUILD/os"/vgpu3d64.o \
     "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
     "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o "$BUILD/os"/explorer64.o \
     "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \
@@ -901,7 +905,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/fontcfg64.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
         "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o "$BUILD/os"/gpu64.o "$BUILD/os"/intel_gpu64.o \
         "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
-        "$BUILD/os"/virtio_gpu64.o \
+        "$BUILD/os"/virtio_gpu64.o "$BUILD/os"/vgpu3d64.o \
         "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
         "$BUILD/os"/terminal64.o "$BUILD/os"/settings64.o "$BUILD/os"/taskmgr64.o "$BUILD/os"/explorer64.o \
         "$BUILD/os"/sysstate64.o "$BUILD/os"/config64.o "$BUILD/os"/session64.o "$BUILD/os"/panic64.o \

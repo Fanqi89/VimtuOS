@@ -382,6 +382,59 @@ int main(int argc, char** argv, char** envp) {
             printf("[DRMDEMO] blob_destroy id=%u rc=%d\n", (unsigned)db.blob_id, (int)drc);
         }
     }
+    /* ---- ⑨-g ★ v0.9.17：2D 加速 —— 脏矩形（DIRTYFB）+ 双缓冲交替 ----
+     *   两块 dumb 轮换：只有第一次整块上传，之后**只搬脏矩形**。
+     *   证据：内核 [DRM] dirty / [DRM] present ... bytes=<小> / [DRM] flip ... alt=1。 ---- */
+    {
+        struct Drm64ModeCreateDumb b2;
+        for (unsigned i = 0; i < sizeof(b2); i++) ((char*)&b2)[i] = 0;
+        b2.height = dh; b2.width = dw; b2.bpp = 32;
+        long r1 = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_CREATE_DUMB, struct Drm64ModeCreateDumb), &b2);
+        struct Drm64ModeMapDumb mb;
+        for (unsigned i = 0; i < sizeof(mb); i++) ((char*)&mb)[i] = 0;
+        mb.handle = b2.handle;
+        long r2 = (r1 == 0) ? drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_MAP_DUMB, struct Drm64ModeMapDumb), &mb) : -1;
+        printf("[DRMDEMO] dumb_b handle=%u rc=%d/%d\n", (unsigned)b2.handle, (int)r1, (int)r2);
+        if (r1 == 0 && r2 == 0 && mb.offset != 0 && b2.pitch == cd.pitch) {
+            uint32_t* p2 = (uint32_t*)(uintptr_t)mb.offset;
+            const unsigned sp2 = (unsigned)(b2.pitch / 4u);
+            for (unsigned y = 0; y < dh; y++) {
+                uint32_t* row = p2 + (size_t)y * (size_t)sp2;
+                for (unsigned x = 0; x < dw; x++) {
+                    unsigned b = x / DRMDEMO_BARW;
+                    if (b > 7u) b = 7u;
+                    row[x] = BARS[7u - b];              /* B 块反色，肉眼可辨双缓冲 */
+                }
+            }
+            /* 反例：flags 必须 0 */
+            struct Drm64ClipRect cr;
+            cr.x1 = 0; cr.y1 = 0; cr.x2 = 128; cr.y2 = 64;
+            struct Drm64ModeFbDirty dpf;
+            for (unsigned i = 0; i < sizeof(dpf); i++) ((char*)&dpf)[i] = 0;
+            dpf.fb_id = b2.handle; dpf.num_clips = 1; dpf.clips_ptr = (uint64_t)(uintptr_t)&cr;
+            dpf.flags = 1;
+            long d0 = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_DIRTYFB, struct Drm64ModeFbDirty), &dpf);
+            printf("[DRMDEMO] dirtyfb badflags rc=%d\n", (int)d0);
+            dpf.flags = 0;
+            long d1 = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_DIRTYFB, struct Drm64ModeFbDirty), &dpf);
+            printf("[DRMDEMO] dirtyfb handle=%u clips=1 rc=%d\n", (unsigned)b2.handle, (int)d1);
+            /* 翻到 B：这次只该搬 128x64 = 32 KiB */
+            struct Drm64ModePageFlip pf2;
+            for (unsigned i = 0; i < sizeof(pf2); i++) ((char*)&pf2)[i] = 0;
+            pf2.crtc_id = DRM64_CRTC_ID64; pf2.fb_id = b2.handle;
+            long f1 = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_PAGE_FLIP, struct Drm64ModePageFlip), &pf2);
+            printf("[DRMDEMO] flip_b rc=%d\n", (int)f1);
+            /* 再翻回 A（没有脏矩形 -> 整块 3 MiB） */
+            pf.fb_id = cd.handle;
+            long f2 = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_PAGE_FLIP, struct Drm64ModePageFlip), &pf);
+            printf("[DRMDEMO] flip_a rc=%d\n", (int)f2);
+            struct Drm64ModeDestroyDumb db2;
+            db2.handle = b2.handle;
+            long r3 = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_DESTROY_DUMB, struct Drm64ModeDestroyDumb), &db2);
+            printf("[DRMDEMO] destroy_dumb_b rc=%d\n", (int)r3);
+        }
+    }
+
     /* ---- ⑨-e ★ v0.9.15：**故意不销毁**的一块 dumb（64x64，占 4 页）----
      *   它不 DESTROY_DUMB 就退出，靠内核的进程回收 hook 收走 ——
      *   串口应出现 [DRM] release pid=<本进程> fbs=1 pages=4，页池水位回原位。 ---- */

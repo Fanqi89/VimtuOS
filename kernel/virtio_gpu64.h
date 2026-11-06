@@ -91,6 +91,20 @@ const char* vgpu64_backend_name64();
 // 区域上屏：TRANSFER_TO_HOST_2D(脏矩形) + RESOURCE_FLUSH(脏矩形)。
 //   返回 1 = **真的走了设备**（已上屏）；0 = 设备不可用/几何不匹配/超时（调用方走软件路径）。
 //   坐标会被夹到当前渲染分辨率内；w/h <= 0 直接返回 0。
+// ★ v0.9.17：3D（virgl）通路用的薄口子（实现见 virtio_gpu64.cpp 末尾；只做转发）
+int      vgpu64_has_virgl64(void);            // 1 = 设备/主机给了 VIRTIO_GPU_F_VIRGL
+uint64_t vgpu64_phys_ex64(const void* p);
+int      vgpu64_cmd_ex64(const void* cmd, uint32_t len);   // 1 = 设备消费了这条链
+uint32_t vgpu64_resp_type_ex64(void);
+int      vgpu64_resp_copy_ex64(void* dst, uint32_t cap);
+uint32_t vgpu64_resp_len_ex64(void);
+uint64_t vgpu64_alloc_page_ex64(void);        // 页池一页（已清零）；0 = 失败
+void     vgpu64_free_page_ex64(uint64_t pa);
+uint32_t vgpu64_res_id_ex64(void);            // 当前 2D 资源 id（3D 自检挑号时避开）
+int      vgpu64_ready_ex64(void);
+// 3D 自检（定义在 kernel/vgpu3d64.cpp；安装介质内核不链它 -> 弱引用判空）
+int      vgpu3d_selftest64(void);
+
 int  vgpu64_blit64(int x, int y, int w, int h);
 // 区域填充：**2D 命令集没有 fill 原语**（只有 TRANSFER/FLUSH）—— CPU 填后备缓冲后由 blit 上屏。
 //   返回 1 = 设备做的填充（本批恒为 0，如实），0 = CPU 填充（打点 [VGPU] fill ... dev=0）。

@@ -694,19 +694,24 @@ static bool vgpu_caps_parse() {
     return true;
 }
 
+// ★ v0.9.17：3D 自检的弱声明（安装介质内核不链 kernel/vgpu3d64.cpp -> 判空跳过）
+int vgpu3d_selftest64(void) __attribute__((weak));
+
 static bool vgpu_features_negotiate() {
     vcfg_w32(VCFG_DEV_FEAT_SEL, 0);
     g_i.feat_dev_lo = vcfg_r32(VCFG_DEV_FEAT);
     vcfg_w32(VCFG_DEV_FEAT_SEL, 1);
     g_i.feat_dev_hi = vcfg_r32(VCFG_DEV_FEAT);
-    // ★ 只接受我们真能处理的位：VIRGL/EDID/UUID/BLOB/CONTEXT_INIT 一律不置位；
-    //   高 32 位只留 VIRTIO_F_VERSION_1（现代 virtio 1.0+ 的设备必需）。
-    const uint32_t ok_lo = 0;
+    // ★ 只接受我们真能处理的位。★ v0.9.17：VIRGL 从"一律拒"改成"设备给了就收" ——
+    //   `VIRTIO_GPU_F_VIRGL` 是 3D（virgl）命令通路的前提；收了它不影响 2D（
+    //   RESOURCE_CREATE_2D / TRANSFER_TO_HOST_2D / FLUSH 照旧）。设备没给（`-vga std`、
+    //   普通 `virtio-gpu-pci`）就还是 0，3D 自检会如实 skipped。
+    //   EDID/UUID/BLOB/CONTEXT_INIT 仍然一律不置位（我们不用它们）。
+    const uint32_t ok_lo = (g_i.feat_dev_lo & VGPU_F_VIRGL);
     const uint32_t ok_hi = (g_i.feat_dev_hi & VGPU_F_VERSION_1_HI);
     if (!ok_hi) { vgpu_err("no VIRTIO_F_VERSION_1"); return false; }
-    const uint32_t rejected_lo = g_i.feat_dev_lo & (VGPU_F_VIRGL | VGPU_F_EDID |
-                                                    VGPU_F_RESOURCE_UUID | VGPU_F_RESOURCE_BLOB |
-                                                    VGPU_F_CONTEXT_INIT);
+    const uint32_t rejected_lo = g_i.feat_dev_lo & (VGPU_F_EDID | VGPU_F_RESOURCE_UUID |
+                                                    VGPU_F_RESOURCE_BLOB | VGPU_F_CONTEXT_INIT);
     vcfg_w32(VCFG_DRV_FEAT_SEL, 0); vcfg_w32(VCFG_DRV_FEAT, ok_lo);
     vcfg_w32(VCFG_DRV_FEAT_SEL, 1); vcfg_w32(VCFG_DRV_FEAT, ok_hi);
     g_i.feat_ok_lo = ok_lo; g_i.feat_ok_hi = ok_hi;
@@ -904,6 +909,9 @@ void vgpu64_init64() {
     }
     if (!vgpu_resource_setup(fb_phys_width(), fb_phys_height())) { vgpu_disable("resource"); return; }
     vgpu_log_begin();
+    // ★ v0.9.17：3D（virgl）通路自检（只在设备给了 VIRGL 时做；实现见 kernel/vgpu3d64.cpp）。
+    //   弱符号：安装介质内核不链 vgpu3d64.cpp，那边直接跳过。
+    if (vgpu3d_selftest64) (void)vgpu3d_selftest64();
     vgpu_puts("[VGPU] ready backend=virtio-gpu-2d scanout=pending status=");
     vgpu_hex32((uint32_t)g_i.device_status);
     vgpu_log_end();
@@ -1757,3 +1765,33 @@ void vgpu64_cursor_move64(int x, int y) {
         vgpu_log_end();
     }
 }
+
+// ==================== ★ v0.9.17：给 3D（virgl）通路开的薄口子 ====================
+// 为什么单开这组：3D 自检（kernel/vgpu3d64.cpp）要用**同一条 virtqueue**、同一套页池与
+// 物理地址转换，但不想把 virgl 的命令编码塞进本文件（本文件是 2D 路径，回归面已经很大）。
+// 这些函数只做转发，不做任何策略判断。
+int vgpu64_has_virgl64(void) { return (g_i.feat_ok_lo & VGPU_F_VIRGL) ? 1 : 0; }
+uint64_t vgpu64_phys_ex64(const void* p) { return vgpu_phys(p); }
+int vgpu64_cmd_ex64(const void* cmd, uint32_t len) {
+    return vgpu_cmd(cmd, len, vgpu_cmd_name(((const VgpuHdr*)cmd)->type)) ? 1 : 0;
+}
+uint32_t vgpu64_resp_type_ex64(void) { return ((const VgpuHdr*)g_resp)->type; }
+// 把响应的前 cap 字节拷出来（3D 要读 capset_info 的字段；返回 1 = 拷了）
+int vgpu64_resp_copy_ex64(void* dst, uint32_t cap) {
+    if (!dst || cap == 0u || cap > sizeof(g_resp)) return 0;
+    const uint8_t* s = (const uint8_t*)g_resp;
+    uint8_t* d = (uint8_t*)dst;
+    for (uint32_t i = 0; i < cap; i++) d[i] = s[i];
+    return 1;
+}
+uint32_t vgpu64_resp_len_ex64(void) { return g_last_used_len; }
+uint64_t vgpu64_alloc_page_ex64(void) {
+    void* p = page_alloc_64();
+    if (!p) return 0;
+    uint64_t* z = (uint64_t*)p;
+    for (uint32_t i = 0; i < (uint32_t)(PAGE_SIZE_64 / 8u); i++) z[i] = 0;
+    return (uint64_t)(uintptr_t)p;
+}
+void vgpu64_free_page_ex64(uint64_t pa) { if (pa) page_free_64((void*)(uintptr_t)pa); }
+uint32_t vgpu64_res_id_ex64(void) { return g_i.res_id; }
+int vgpu64_ready_ex64(void) { return g_i.ready ? 1 : 0; }
