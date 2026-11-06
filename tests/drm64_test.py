@@ -110,6 +110,8 @@ STRUCT_NAMES = [
     "Drm64ModeFbDirty", "Drm64ClipRect",
     # ★ v0.9.20：PRIME 跨进程 + 事件投递
     "Drm64PrimeHandle", "Drm64EventVblank",
+    # ★ v0.9.21：evdev 的绝对轴（= Linux struct input_absinfo）
+    "InputAbsInfo64",
 ]
 
 
@@ -527,6 +529,9 @@ def main():
             (r"\[DRMDEMO\] flip_b rc=0", "双缓冲 flip_b"),
             (r"\[DRMDEMO\] flip_a rc=0", "双缓冲 flip_a"),
             (r"\[DRMDEMO\] dumb_b handle=\d+ rc=0/0", "第二块 dumb（双缓冲的 B 块）"),
+            (r"\[DRMDEMO\] libevdev name=vimtu-mouse absx=24 min=0 max=\d+ grab=0/0 types=0x7",
+             "libevdev 适配层（名字/绝对轴/独占）"),
+            (r"\[DRMDEMO\] gbm bo handle=\d+ 64x64 stride=256 probe=0x5afe1234", "GBM 建出真 BO 并读写像素"),
         ]
         stage_ok = vm.wait("[DRMDEMO] done", args.timeout)
         log = vm.log()
@@ -690,6 +695,37 @@ def main():
               "[DRMDEMO] event badflag rc=-22" in log, "")
         check("④ 同步语义没退化：不带 flag 的 PAGE_FLIP 仍然 rc=0",
               "[DRMDEMO] event sync_flip rc=0" in log, "")
+
+        # ---------- ④-f ★ v0.9.21：evdev 的 grab/abs（libinput 的 evdev 后端要的）+ GBM 分配层 ----------
+        check("④ EVIOCGRAB 走通（req=0x40044590：先 grab=1 再 grab=0，Linux 号逐值相等）",
+              re.search(r"\[EVDEV\] ioctl which=1 req=0x40044590 grab=1 pid=\d+", log) is not None and
+              re.search(r"\[EVDEV\] ioctl which=1 req=0x40044590 grab=0 pid=\d+", log) is not None,
+              (re.search(r"\[EVDEV\] ioctl[^\r\n]*grab=[01][^\r\n]*", log).group(0)
+               if re.search(r"\[EVDEV\] ioctl[^\r\n]*grab=[01]", log) else "缺 EVIOCGRAB 行"))
+        gab = re.search(r"\[EVDEV\] ioctl which=1 req=0xc0184500 abs=0 min=0 max=(\d+)", log)
+        check("④ EVIOCGABS(ABS_X) 走通（req=0xc0184500，区间 = 0..屏宽-1）",
+              gab is not None and int(gab.group(1)) >= 639,
+              (gab.group(0) if gab else "缺 EVIOCGABS 行"))
+        check("④ libevdev 适配层真读内核（[EVDEV] ioctl … name= / bits= / abs= 三类都出现过）",
+              re.search(r"\[EVDEV\] ioctl[^\r\n]*name=vimtu-mouse", log) is not None and
+              re.search(r"\[EVDEV\] ioctl[^\r\n]*bits=0x", log) is not None and
+              gab is not None, "")
+        gb = re.search(r"\[DRMDEMO\] gbm bo handle=(\d+) 64x64 stride=256 probe=0x5afe1234", log)
+        check("④ GBM 的 BO 就是 DRM dumb（handle 由 CREATE_DUMB 给出，像素读写自证）",
+              gb is not None and int(gb.group(1)) >= 1,
+              (gb.group(0) if gb else "缺 gbm bo 行"))
+        ms = re.search(r"\[DRMDEMO\] gbm surface n=2 front=(\d+)/(\d+) stride=128 rc=0", log)
+        check("④ GBM 双缓冲 surface 轮换到两块**不同** BO（front 两次不一样）",
+              ms is not None and ms.group(1) != ms.group(2),
+              (ms.group(0) if ms else "缺 gbm surface 行"))
+        # 头文件层面：ABS 结构 24 B（= Linux input_absinfo），两份头文件都要有这条断言
+        abi = []
+        for pth, user_side in ((os.path.join(ROOT, "kernel", "drm64.h"), False),
+                               (os.path.join(ROOT, "user", "lib", "drm64.h"), True)):
+            sz = _sizeof_asserts(pth, user_side)
+            abi.append(sz.get("InputAbsInfo64"))
+        check("④ sizeof(InputAbsInfo64) == 24 且两份头文件一致（= Linux struct input_absinfo）",
+              abi[0] == 24 and abi[1] == 24, "kernel=%s user=%s" % (abi[0], abi[1]))
 
         # ---------- ⑤ 桌面照旧 + 屏幕取证 ----------
         try:

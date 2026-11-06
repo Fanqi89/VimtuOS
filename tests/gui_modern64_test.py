@@ -515,7 +515,14 @@ def main():
         # ---- 本段真图证据（默认的 build64/system.img 是**裸**镜像：没有 VimtuFS2 卷 -> 必须如实走内置兜底）----
         si = re.search(r"\[DOCK64\] start icon src=(\S+) size=(\d+) ok=(\d)", log)
         check("开始按钮打点（[DOCK64] start icon ...）", si is not None, si.group(0) if si else "（无）")
-        bare = os.path.abspath(args.img) == os.path.abspath(os.path.join(ROOT, "build64", "system.img"))
+        # ★ v0.9.21：原来用**路径相等**判断"裸镜像"（args.img == build64/system.img）。但真源判据是
+        #   "客户机到底有没有挂到 VimtuFS2 系统卷" —— system.img 本身也可能带卷，路径相等推不出"没有卷"，
+        #   实测就红过一次（镜像上已有卷，判据却还在要求内置兜底）。现在按**串口证据**判定，
+        #   并把路径信息打出来便于排查。判据本身没有放宽：带卷时仍然要求"真图 install/load 都在"。
+        had_vol = "(from VimtuFS2 system volume)" in log
+        bare = not had_vol
+        print("      [info] args.img=%s had_volume=%d -> 走%s 分支"
+              % (args.img, 1 if had_vol else 0, "裸镜像" if bare else "带卷"))
         if bare:
             check("裸 system.img（无 VimtuFS2 卷）：开始按钮如实用内置兜底图（不假装从盘上读）",
                   si is not None and si.group(1) == "builtin:icon_start.bin" and si.group(3) == "1",
@@ -1015,6 +1022,9 @@ def main():
                 mon1 = vm1.wait_monitor()
                 login_desktop(vm1, mon1)       # ★ 缺陷 4：显式输入才进桌面
                 check("夹具盘进桌面（[GUI64] ready）", vm1.wait_ready(120))
+                # ★ v0.9.21：装图/读图发生在**进桌面之后**（dock_start_icon_init64），原来这里立刻读
+                #   L1，偶发读不到 [IMG64] load 行（实测红过一次）。先有界等到这条证据再断言。
+                vm1.wait_log("[IMG64] load path=/logo/kaisi.png", 90)
                 L1 = vm1.log()
                 inst = re.search(r"\[IMG64\] install path=/logo/kaisi\.png bytes=(\d+) written=(\d+) ok=(\d) src=(\S+)", L1)
                 check("启动期把内嵌真 PNG 幂等装进 VimtuFS2 系统卷（/logo/kaisi.png ok=1）",
@@ -1025,8 +1035,11 @@ def main():
                 check("兜底路径 /kaisi.png 也装了（同一份字节）",
                       inst2 is not None and inst2.group(3) == "1" and inst2.group(1) == str(len(png_src)),
                       inst2.group(0) if inst2 else "（无）")
+                # ★ v0.9.21：这条正则过期了 —— 内核后来在 bytes/fmt 之后插了
+                #   cyc_stat/cyc_read/cyc_dec/fills 这些实测字段，"(from VimtuFS2 system volume)" 不再紧跟 WxH，
+                #   于是这条断言永远是"（无）"。改成允许中间有其它字段（判据不变：ok=1 + 字节数 + 尺寸 + 来源）。
                 load = re.search(r"\[IMG64\] load path=/logo/kaisi\.png ok=1 bytes=(\d+) fmt=png "
-                                 r"(\d+)x(\d+) \(from VimtuFS2 system volume\)", L1)
+                                 r"(\d+)x(\d+)[^\r\n]*\(from VimtuFS2 system volume\)", L1)
                 check("从 VimtuFS2 系统卷读真图（[IMG64] load path=/logo/kaisi.png ok=1）",
                       load is not None and load.group(1) == str(len(png_src)) and
                       (int(load.group(2)), int(load.group(3))) == png_dim,

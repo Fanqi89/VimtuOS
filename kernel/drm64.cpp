@@ -1616,6 +1616,12 @@ int drm64_ioctl64(uint64_t cmd, uint64_t arg, uint64_t pid) {
 // 为什么要有这个"待取"小缓冲（8 条）：事件队列是**每进程一份**、键鼠混在一起，而
 // /dev/input/event0 只该给键盘事件、event1 只给鼠标事件。过滤时不能把不属于本设备的
 // 事件丢掉（那是静默丢事件），所以非本设备的先放进这里，下一次另一台设备的 read 先取它们。
+// ★ v0.9.21：evdev 的独占（EVIOCGRAB）与绝对轴（EVIOCGABS/EVIOCSABS）
+//   grab 存"持有者 pid"（0 = 没人独占）。别的进程 read 这台设备时如实 -EBUSY ——
+//   本内核没有多客户端 evdev 分发，所以"grab 后别人读不到"这件事只能这样落地。
+static int32_t          g_ev_grab_pid[2] = { 0, 0 };
+static InputAbsInfo64   g_ev_abs[2][EVDEV64_MAX_ABS64];
+static uint32_t         g_ev_abs_n[2] = { 0u, 0u };
 static Ev64Event g_ev_pending[8];
 static uint32_t  g_ev_pending_n = 0;
 static uint32_t  g_ev_reads = 0;              // 打点预算（前 8 条 + 每 64 条一条）
@@ -1663,6 +1669,16 @@ int64_t evdev64_read64(int which, void* ubuf, uint64_t len) {
         d64_begin(); d64_puts("[EVDEV] read FAILED which="); d64_num((uint64_t)(which < 0 ? 0 : which));
         d64_puts(" reason=buf-too-small err="); d64_num(DRM64_EINVAL64); d64_end();
         return -DRM64_EINVAL64;
+    }
+    {
+        const int w = (which == 1) ? 1 : 0;
+        const int32_t holder = g_ev_grab_pid[w];
+        if (holder != 0 && holder != (int32_t)proc64_current_pid64()) {
+            d64_begin(); d64_puts("[EVDEV] read FAILED which="); d64_num((uint64_t)w);
+            d64_puts(" reason=grabbed-by-pid "); d64_num((uint64_t)holder);
+            d64_puts(" err="); d64_num(DRM64_EBUSY64); d64_end();
+            return -DRM64_EBUSY64;
+        }
     }
     Ev64Queue* q = ev64_current_queue64();
     if (!q) {                                          // 没有进程上下文 = 这条通道不存在（不假装有）
@@ -1754,6 +1770,59 @@ int evdev64_ioctl64(int which, uint64_t cmd, uint64_t arg) {
         d64_begin(); d64_puts("[EVDEV] ioctl which="); d64_num((uint64_t)(which < 0 ? 0 : which));
         d64_puts(" req=0x"); d64_hex(cmd); d64_puts(" bits=0x"); d64_hex((uint64_t)bits[0]); d64_end();
         return (int)w;
+    } else if (base == (EVDEV64_IOCTL_GRAB64 & 0xC000FFFFu)) {                      // EVIOCGRAB
+        const uint32_t w = (which == 1) ? 1u : 0u;
+        if (!user64_range_ok64(arg, 4u)) return -DRM64_EFAULT64;
+        int32_t want = 0;
+        d64_urd64(arg, &want, 4u);
+        const int32_t me = (int32_t)proc64_current_pid64();
+        int32_t got = 0;
+        if (want != 0) {
+            if (g_ev_grab_pid[w] != 0 && g_ev_grab_pid[w] != me) {
+                d64_begin(); d64_puts("[EVDEV] ioctl which="); d64_num((uint64_t)w);
+                d64_puts(" grab FAILED reason=busy holder="); d64_num((uint64_t)g_ev_grab_pid[w]);
+                d64_puts(" err="); d64_num(DRM64_EBUSY64); d64_end();
+                return -DRM64_EBUSY64;
+            }
+            g_ev_grab_pid[w] = me; got = 1;
+        } else {
+            if (g_ev_grab_pid[w] == me) g_ev_grab_pid[w] = 0;
+            got = 0;
+        }
+        d64_begin(); d64_puts("[EVDEV] ioctl which="); d64_num((uint64_t)w);
+        d64_puts(" req="); d64_hex(cmd); d64_puts(" grab="); d64_num((uint64_t)got);
+        d64_puts(" pid="); d64_num((uint64_t)(me < 0 ? 0 : me)); d64_end();
+        return 0;
+    } else if ((base & 0xFFFFFFF8u) == 0xC0004500u) {                                // EVIOCGABS(axis)
+        const uint32_t w = (which == 1) ? 1u : 0u;
+        const uint32_t axis = base & 7u;
+        if (axis >= EVDEV64_MAX_ABS64 || axis >= g_ev_abs_n[w]) return -DRM64_EINVAL64;
+        if (!user64_range_ok64(arg, sizeof(InputAbsInfo64))) return -DRM64_EFAULT64;
+        d64_uwr64(arg, &g_ev_abs[w][axis], sizeof(InputAbsInfo64));
+        d64_begin(); d64_puts("[EVDEV] ioctl which="); d64_num((uint64_t)w);
+        d64_puts(" req="); d64_hex(cmd); d64_puts(" abs="); d64_num((uint64_t)axis);
+        d64_puts(" min="); d64_num((uint64_t)g_ev_abs[w][axis].minimum);
+        d64_puts(" max="); d64_num((uint64_t)g_ev_abs[w][axis].maximum); d64_end();
+        return (int)sizeof(InputAbsInfo64);
+    } else if ((base & 0xFFFFFFF8u) == 0x400045C0u) {                                // EVIOCSABS(axis)
+        const uint32_t w = (which == 1) ? 1u : 0u;
+        const uint32_t axis = base & 7u;
+        if (axis >= EVDEV64_MAX_ABS64 || axis >= g_ev_abs_n[w]) return -DRM64_EINVAL64;
+        if (!user64_range_ok64(arg, sizeof(InputAbsInfo64))) return -DRM64_EFAULT64;
+        InputAbsInfo64 in;
+        d64_urd64(arg, &in, sizeof(InputAbsInfo64));
+        // 只接受合法区间（min < max），越界如实 -EINVAL —— 不悄悄改成"看起来能用"
+        if (in.minimum >= in.maximum) {
+            d64_begin(); d64_puts("[EVDEV] ioctl which="); d64_num((uint64_t)w);
+            d64_puts(" sabs FAILED reason=range err="); d64_num(DRM64_EINVAL64); d64_end();
+            return -DRM64_EINVAL64;
+        }
+        g_ev_abs[w][axis] = in;
+        d64_begin(); d64_puts("[EVDEV] ioctl which="); d64_num((uint64_t)w);
+        d64_puts(" req="); d64_hex(cmd); d64_puts(" sabs abs="); d64_num((uint64_t)axis);
+        d64_puts(" min="); d64_num((uint64_t)in.minimum);
+        d64_puts(" max="); d64_num((uint64_t)in.maximum); d64_end();
+        return (int)sizeof(InputAbsInfo64);
     } else {
         d64_begin(); d64_puts("[EVDEV] ioctl which="); d64_num((uint64_t)(which < 0 ? 0 : which));
         d64_puts(" req=0x"); d64_hex(cmd); d64_puts(" ok=0 err="); d64_num(DRM64_ENOTTY64); d64_end();
@@ -1783,6 +1852,17 @@ void drm64_init64(void) {
     d64_build_informats64();                     // IN_FORMATS blob（Linux 的 drm_format_modifier_blob 布局）
     g_ev_pending_n = 0;
     g_ev_reads = 0;
+    // ★ v0.9.21：绝对轴默认区间 = 屏幕几何（ABS_X/ABS_Y）；键盘没有绝对轴（n=0 -> EVIOCGABS 如实 -EINVAL）
+    g_ev_grab_pid[0] = 0; g_ev_grab_pid[1] = 0;
+    g_ev_abs_n[0] = 0u;
+    g_ev_abs_n[1] = EVDEV64_MAX_ABS64;
+    for (uint32_t a = 0; a < EVDEV64_MAX_ABS64; a++) {
+        for (uint32_t k = 0; k < sizeof(InputAbsInfo64); k++) ((uint8_t*)&g_ev_abs[1][a])[k] = 0;
+        g_ev_abs[1][a].minimum = 0;
+        g_ev_abs[1][a].maximum = (a == EVDEV64_ABS_X64)
+            ? (int32_t)(fb_phys_width() > 0 ? fb_phys_width() - 1 : 0)
+            : (int32_t)(fb_phys_height() > 0 ? fb_phys_height() - 1 : 0);
+    }
     // 模式的唯一计算点（几何此后不会变；GETCRTC / GETCONNECTOR 直接拷 g_mode64）
     d64_fill_mode64((uint32_t)fb_phys_width(), (uint32_t)fb_phys_height());
     // 垂直回扫：复用 fb.cpp 的既有探针（200 ms 实测一轮；25..300 Hz 才算可信）

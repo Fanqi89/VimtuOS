@@ -15,6 +15,9 @@
  *   [DRMDEMO] badcmd rc=-25                                  ← 未知 ioctl 必须 -ENOTTY（反例）
  *   [DRMDEMO] evdev open fd=<n> name=vimtu-keyboard
  *   [DRMDEMO] evdev read n=<n> ...  或  [DRMDEMO] evdev read skipped rc=<n>
+ *   [DRMDEMO] libevdev name=<s> absx=<rc> min=<n> max=<n> grab=<rc>/<rc> types=0x<hex>
+ *   [DRMDEMO] gbm bo handle=<n> <w>x<h> stride=<n> probe=0x<hex>
+ *   [DRMDEMO] gbm surface n=2 front=<i>/<j> stride=<n> rc=0
  *   [DRMDEMO] destroy_dumb handle=<n> rc=0
  *   [DRMDEMO] done ok=1
  *
@@ -33,6 +36,8 @@
 #include <errno.h>
 #include "vimtu64.h"
 #include "drm64.h"
+#include "libevdev_compat.h"   /* ★ v0.9.21：libevdev 精简适配（grab / 绝对轴 / 事件流） */
+#include "gbm_compat.h"        /* ★ v0.9.21：GBM 分配层（dumb + PRIME 之上的最小封装） */
 
 /* 固定色表：与 kernel/drm64.cpp 的 D64_BARS 逐值一致（便于人工对屏/比对） */
 static const uint32_t BARS[8] = {
@@ -567,6 +572,61 @@ int main(int argc, char** argv, char** envp) {
                 printf("[DRMDEMO] evdev read skipped rc=%d (empty queue)\n", (int)got);
             }
             (void)poll_event((struct Ev64Event*)0, 0, V64_EV_FLAG_RELEASE);
+        }
+    }
+
+    /* ---- ⑮ ★ v0.9.21：libevdev 精简适配（libinput 的 evdev 后端要的这几条）----
+     *   证据：内核侧 [EVDEV] ioctl … abs=0 min=0 max=<屏宽-1>（EVIOCGABS）与 grab=1/0（EVIOCGRAB）。 ---- */
+    {
+        const int mfd = evdev64_open(1);                 /* event1 = 鼠标（有 REL/ABS） */
+        struct libevdev* lev = 0;
+        const int nrc = (mfd >= 0) ? libevdev_new_from_fd(mfd, &lev) : -1;
+        if (nrc == 0 && lev) {
+            struct InputAbsInfo64 ai;
+            for (unsigned i = 0; i < sizeof(ai); i++) ((char*)&ai)[i] = 0;
+            const int arc = libevdev_get_abs_info(lev, EVDEV64_ABS_X64, &ai);
+            const int g1 = libevdev_grab(lev, LIBEVDEV_GRAB);       /* EVIOCGRAB = 1 */
+            const int g0 = libevdev_grab(lev, LIBEVDEV_UNGRAB);     /* EVIOCGRAB = 0 */
+            printf("[DRMDEMO] libevdev name=%s absx=%d min=%d max=%d grab=%d/%d types=0x%lx\n",
+                   libevdev_get_name(lev), arc, (int)ai.minimum, (int)ai.maximum,
+                   g1, g0, (unsigned long)lev->evbits);
+            libevdev_free(lev);
+        } else {
+            printf("[DRMDEMO] libevdev open FAILED rc=%d\n", nrc);
+        }
+    }
+
+    /* ---- ⑯ ★ v0.9.21：GBM 分配层（真 BO / 真映射 / 双缓冲轮换；**EGL/GLES 仍未做**）----
+     *   证据：内核侧 [DRM] create/map/destroy 行（gbm_bo_create 就是 CREATE_DUMB + MAP_DUMB）。 ---- */
+    {
+        struct gbm_device* gdev = gbm_create_device(fd);
+        if (!gdev) {
+            printf("[DRMDEMO] gbm device FAILED\n");
+        } else {
+            struct gbm_bo* bo = gbm_bo_create(gdev, 64u, 64u, GBM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT);
+            if (bo) {
+                volatile uint32_t* p = (volatile uint32_t*)gbm_bo_map(bo);
+                if (p) p[0] = 0x5AFE1234u;
+                const unsigned probe = p ? (unsigned)p[0] : 0u;
+                printf("[DRMDEMO] gbm bo handle=%u %ux%u stride=%u probe=0x%x\n",
+                       (unsigned)gbm_bo_get_handle(bo), (unsigned)gbm_bo_get_width(bo),
+                       (unsigned)gbm_bo_get_height(bo), (unsigned)gbm_bo_get_stride(bo), probe);
+                gbm_bo_destroy(gdev, bo);
+            } else {
+                printf("[DRMDEMO] gbm bo FAILED (dumb 槽位不够或格式不支持)\n");
+            }
+            struct gbm_surface* gs = gbm_surface_create(gdev, 32u, 32u, GBM_FORMAT_XRGB8888,
+                                                        GBM_BO_USE_SCANOUT);
+            if (gs) {
+                const unsigned h1 = (unsigned)gbm_bo_get_handle(gbm_surface_lock_front_buffer(gs));
+                const unsigned h2 = (unsigned)gbm_bo_get_handle(gbm_surface_lock_front_buffer(gs));
+                printf("[DRMDEMO] gbm surface n=%d front=%u/%u stride=%u rc=0\n",
+                       gs->n, h1, h2, (unsigned)gbm_bo_get_stride(gs->bo[0]));
+                gbm_surface_destroy(gs);
+            } else {
+                printf("[DRMDEMO] gbm surface FAILED\n");
+            }
+            gbm_device_destroy(gdev);
         }
     }
 

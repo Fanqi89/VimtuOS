@@ -525,6 +525,29 @@ DRM64_STATIC_ASSERT(sizeof(struct InputEvent64) == 24, "InputEvent64 必须是 2
 #define EVDEV64_IOCTL_ID64     0x80084506u    /* EVIOCGNAME(len)（len 由调用方填进 size 位） */
 #define EVDEV64_IOCTL_VER64    0x80044501u    /* EVIOCGVERSION */
 #define EVDEV64_IOCTL_BIT64    0x80084520u    /* EVIOCGBIT(0, len)：支持的事件类型位图 */
+
+// ==================== ★ v0.9.21：evdev 的 grab / abs 三件套 ====================
+// Linux `include/uapi/linux/input.h` 的同一套编码（size 位 = struct 尺寸），逐值相等：
+//   EVIOCGRAB      = _IOW('E', 0x90, int)          = 0x40044590
+//   EVIOCGABS(ax)  = _IOR('E', 0x40+ax, absinfo)   = 0xC01845<40+ax>
+//   EVIOCSABS(ax)  = _IOW('E', 0xC0+ax, absinfo)   = 0x401845<C0+ax>
+// 为什么需要：libinput 的 evdev 后端**必须**能 grab（独占设备）与读绝对轴范围，
+//   否则 wlroots 的 libinput 后端拿到鼠标后无法拿到"屏幕坐标 → 绝对轴"的映射区间。
+#define EVDEV64_IOCTL_GRAB64       0x40044590u
+#define EVDEV64_IOCTL_GABS64(axis) (0xC0184500u + ((uint32_t)(axis) & 7u))
+#define EVDEV64_IOCTL_SABS64(axis) (0x401845C0u + ((uint32_t)(axis) & 7u))
+#define EVDEV64_ABS_X64            0u
+#define EVDEV64_ABS_Y64            1u
+#define EVDEV64_MAX_ABS64          2u
+struct __attribute__((packed)) InputAbsInfo64 {
+    int32_t value;       // +0   当前值（本内核不跟踪，如实置 0）
+    int32_t minimum;     // +4   ABS_X: 0 / ABS_Y: 0
+    int32_t maximum;     // +8   = 屏幕宽-1 / 高-1（鼠标绝对轴的真实区间）
+    int32_t fuzz;        // +12  恒 0（没有硬件去抖）
+    int32_t flat;        // +16  恒 0
+    int32_t resolution;  // +20  恒 0
+};                      // = 24 B（= Linux struct input_absinfo）
+DRM64_STATIC_ASSERT(sizeof(struct InputAbsInfo64) == 24, "InputAbsInfo64 必须是 24 B（= Linux input_absinfo）");
 /* EVIOCGNAME(len) / EVIOCGBIT(ev, len) 的具体命令字：在基值上按 len 填 size 位 */
 #define EVDEV64_IOCGNAME(len)  (0x80080000u | (((uint32_t)(len) & 0x3FFFu) << 16) | 0x4506u)
 #define EVDEV64_IOCGBIT(ev, len) \

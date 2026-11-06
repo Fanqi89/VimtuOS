@@ -1700,7 +1700,17 @@ static void dock_list_build64() {
         p->icon64 = dock_app_icon_of64(p->app_id, &p->icon_kind);
         dock_app_title64(p->app_id, p->title, (int)sizeof(p->title));
     }
+    int merged = 0;
     for (int i = 0; i < g_runs_n && n < DOCK_MAX; i++) {
+        // ★ v0.9.21（用户实测缺陷，必须修）：**固定项与运行状态合并**。
+        //   原来这里无条件"每窗口一项"，于是点**已固定**的图标（如"设置"）启动后，
+        //   Dock 在最右边又长出一个同应用的运行图标（固定 1 个 + 运行 1 个 = 重复）。
+        //   现在：该应用已经固定在 Dock 上 -> **不再为它生成运行项**，运行状态归固定项自己：
+        //   * 小横条：draw_dock 对 PIN 项走 dock_app_state64(app)（应用级，多窗口共用一根）；
+        //   * 点击：dock_press64 的 PIN 分支已经按"恢复/置前/最小化"处理该应用的全部窗口；
+        //   * 悬停窗口列表：winlist_collect64 的 PIN 分支列出该应用的所有窗口。
+        //   于是 App ID 匹配就合并到左边那个固定图标上（用户要求原文）。
+        if (dock_is_pinned64(g_runs[i].app_id)) { merged++; continue; }
         DockItem64* r = &g_dock[n++];
         r->kind = DOCK_KIND_RUN; r->app_id = g_runs[i].app_id; r->win_id = g_runs[i].win_id;
         r->icon64 = dock_app_icon_of64(r->app_id, &r->icon_kind);
@@ -1710,6 +1720,18 @@ static void dock_list_build64() {
         if (!r->title[0]) dock_app_title64(r->app_id, r->title, (int)sizeof(r->title));
     }
     g_dock_n = n;
+    // 合并打点（验收用）：只在真的合并时出现，且有预算防刷屏
+    if (merged > 0 && g_dock_log_budget > 0) {
+        g_dock_log_budget--;
+        dbg64_line_begin64();
+        dbg64_str("[DOCK64] merge pinned_runs=");
+        dbg64_dec((uint64_t)merged);
+        dbg64_str(" items=");
+        dbg64_dec((uint64_t)g_dock_n);
+        dbg64_str(" dedup=1");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
 }
 static void dock_rebuild64();
 static void dock_pin_set64(int app_id, int on) {
@@ -1752,6 +1774,9 @@ static void dock_run_add64(int win_id, int app_id, const char* title) {
     dbg64_dec((uint64_t)g_runs_n);
     dbg64_str(" title=");
     dbg64_str(r->title[0] ? r->title : "-");
+    // ★ v0.9.21：行尾补 merged=<0|1> —— 1 = 该应用已固定，运行状态合并到固定图标（不新增图标）
+    dbg64_str(" merged=");
+    dbg64_dec((uint64_t)(dock_is_pinned64(app_id) ? 1 : 0));
     dbg64_nl();
     dbg64_line_end64();
     dock_rebuild64();

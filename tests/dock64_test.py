@@ -283,48 +283,69 @@ def main():
         runs = re.findall(r"\[DOCK64\] run-add win=(\d+) app=3 running=(\d+)", log)
         check("⑤ 三次窗口创建都发到 Dock（[DOCK64] run-add win=… app=3 running=1/2/3）",
               len(runs) >= 3 and runs[-1][1] == "3", "runs=%s" % runs[-3:])
+        # ★ v0.9.21（用户实测缺陷，"右侧又长出一个重复图标"）：终端是默认固定项，
+        #   开 3 个窗口后 Dock 上**不允许**再出现运行图标 —— 运行状态合并到那个固定图标上。
+        merged = re.findall(r"\[DOCK64\] run-add win=\d+ app=3 running=(\d+) title=[^\n]* merged=(\d)", log)
+        check("⑥ 三次 run-add 都标了 merged=1（该应用已固定 -> 运行状态归固定项）",
+              len(merged) >= 3 and all(m[1] == "1" for m in merged[-3:]),
+              "merged=%s" % (merged[-3:],))
+        all_mg = re.findall(r"\[DOCK64\] merge pinned_runs=(\d+) items=(\d+) dedup=1", log)
+        mmg = all_mg[-1] if all_mg else None
+        check("⑥ 内核侧有合并打点（最后一次 [DOCK64] merge pinned_runs=3 items=9 dedup=1）",
+              mmg is not None and mmg[0] == "3" and mmg[1] == "9",
+              ("pinned_runs=%s items=%s" % (mmg[0], mmg[1])) if mmg else "缺 [DOCK64] merge 行")
         items = dock_items(log)
         ritems = [it for it in items if it["kind"] == "running" and it["app"] == 3]
-        check("⑥ Dock 上真的出现 3 个独立运行项（不合并同一应用多窗口）",
-              len(ritems) == 3, "running_app3=%d win_ids=%s" % (len(ritems), [it["win"] for it in ritems]))
-        check("⑦ 运行项紧挨在固定项右侧连续排列（x 递增且间隔 = icon+gap）",
-              len(ritems) == 3 and all(ritems[i + 1]["x"] > ritems[i]["x"] for i in range(len(ritems) - 1)),
-              "xs=%s" % [it["x"] for it in ritems])
+        pitem = [it for it in items if it["kind"] == "pinned" and it["app"] == 3]
+        check("⑥ **Dock 上 app=3 只有那 1 个固定图标**（右侧不再长出重复图标）",
+              len(ritems) == 0 and len(pitem) == 1,
+              "running=%d pinned=%d" % (len(ritems), len(pitem)))
         g1 = geom(log)
-        check("⑧ 图标变多 -> Dock 自适应变宽（w > 默认 520）",
-              g1 is not None and int(g1.group(3)) > 520, g1.group(0) if g1 else "无")
+        check("⑦ 面板项数不变（items=9）：合并后不新增图标",
+              g1 is not None and int(g1.group(8)) == 9, g1.group(0) if g1 else "无")
+        check("⑧ 面板宽度不变（w=520，不因运行而变宽）",
+              g1 is not None and int(g1.group(3)) == 520, g1.group(0) if g1 else "无")
 
-        # 关掉中间那个运行项（右键 -> 关闭窗口）
-        print("=== 3) 右键运行图标 -> 关闭窗口（只移除该 window_id）===", flush=True)
-        mid = ritems[1]
-        right_click_dock(mon, mid)
+        # 关掉一个窗口（合并之后 Dock 上只有那一个固定图标，右键它 -> 关闭窗口）
+        print("=== 3) 右键固定图标（运行中）-> 关闭窗口（只移除该 window_id）===", flush=True)
+        right_click_dock(mon, pitem[0])
         wait_mark(lambda: log_of(serial), "menu open owner=dock", 20, proc)
         log = log_of(serial)
-        mo = re.search(r"\[DOCK64\] menu open owner=dock app=3 win=(\d+) pinned=(\d) rows=(\d+) items=([\w,-]+)", log)
-        check("⑨ 右键运行图标弹出菜单（已固定+运行中 -> unpin 与 close-win 同时存在）",
-              mo is not None and "unpin" in mo.group(4) and "close-win" in mo.group(4),
+        mo = re.search(r"\[DOCK64\] menu open owner=dock app=3 win=- pinned=(\d) rows=(\d+) items=([\w,-]+)", log)
+        check("⑨ 右键那个固定图标弹出菜单（已固定 + 运行中 -> unpin 与 close-all 同时存在）",
+              mo is not None and mo.group(1) == "1" and "unpin" in mo.group(3) and "close-all" in mo.group(3),
               mo.group(0) if mo else "无")
         # ★ 菜单操作用**键盘**：每按一次 Down 下移一行（默认选中第 0 行），Enter 执行。
         #   为何不用鼠标：客户机开菜单时只有 2fps（redraw_us≈500ms），相对鼠标事件会拖影，
         #   实测点击会落在菜单外面（menu close why=outside）。人用键盘也更顺手。
         if mo is not None:
-            items_l = mo.group(4).split(",")
-            steps = items_l.index("close-win") if "close-win" in items_l else 0
+            items_l = mo.group(3).split(",")
+            steps = items_l.index("close-all") if "close-all" in items_l else 0
             for _k in range(steps):
                 mon.key("down", wait=0.5)
             mon.key("ret", wait=0.8)
-        wait_mark(lambda: log_of(serial), "act=close-win", 20, proc)
+        wait_mark(lambda: log_of(serial), "act=close-all", 20, proc)
         log = log_of(serial)
-        act = re.search(r"\[DOCK64\] menu act[^\n]* act=close-win[^\n]* running_n=(\d+)", log)
-        check("⑩ 关闭窗口只移除对应运行项（running_n 从 3 变 2）",
-              act is not None and act.group(1) == "2", act.group(0) if act else "无")
-        check("⑪ 关闭窗口**不**取消固定（pinned_after 仍是 1）",
-              re.search(r"act=close-win[^\n]*pinned_after=1", log) is not None, "")
+        act = re.search(r"\[DOCK64\] menu act[^\n]* act=close-all[^\n]* running_n=(\d+)", log)
+        check("⑩ 关掉该应用的全部窗口后运行项归零（running_n=0）",
+              act is not None and act.group(1) == "0", act.group(0) if act else "无")
+        check("⑪ 关窗口**不**取消固定（pinned_after 仍是 1）",
+              re.search(r"act=close-all[^\n]*pinned_after=1", log) is not None, "")
         items = dock_items(log)
         left = [it for it in items if it["kind"] == "running" and it["app"] == 3]
-        check("⑫ 另外两个窗口的运行图标仍在（win_id 不同）",
-              len(left) == 2 and all(it["win"] != mid["win"] for it in left),
-              "left=%s removed=%s" % ([it["win"] for it in left], mid["win"]))
+        pleft = [it for it in items if it["kind"] == "pinned" and it["app"] == 3]
+        check("⑫ 窗口全关之后仍是那 1 个固定图标、没有运行图标",
+              len(left) == 0 and len(pleft) == 1,
+              "running=%s pinned=%d" % ([it["win"] for it in left], len(pleft)))
+
+        # 再开一个终端：**仍然固定**，所以还是 merged=1（合并语义不变），但这次有 1 个窗口在跑 ——
+        # 后面的"取消固定不关窗口"才有意义（running_n 必须是 1 而不是 0）。
+        open_term_from_start()
+        wait_mark(lambda: log_of(serial), "app=3 running=1 title=", 40, proc)
+        log = log_of(serial)
+        mz = re.findall(r"\[DOCK64\] run-add win=\d+ app=3 running=\d+ title=[^\n]* merged=(\d)", log)
+        check("⑬ 取消固定之前再开终端：仍是 merged=1（窗口有，但图标还是那 1 个固定图标）",
+              len(mz) >= 1 and mz[-1] == "1", "merged=%s" % (mz[-3:] if mz else "无",))
 
         # 右键固定图标 -> 取消固定
         print("=== 4) 右键固定图标 -> 取消固定（立即持久化）===", flush=True)
@@ -348,8 +369,8 @@ def main():
             ua = re.search(r"\[DOCK64\] menu act[^\n]* act=unpin[^\n]*pinned_after=0[^\n]*pinned_n=(\d+) running_n=(\d+)", log)
             check("⑭ 取消固定生效（pinned_after=0、pinned_n 从 8 变 7）",
                   ua is not None and ua.group(1) == "7", ua.group(0) if ua else "无")
-            check("⑮ 取消固定**不关窗口**（running_n 仍是 2）",
-                  ua is not None and ua.group(2) == "2", "")
+            check("⑮ 取消固定**不关窗口**（running_n 仍是 1）",
+                  ua is not None and ua.group(2) == "1", "")
             check("⑯ 固定/取消固定立即写盘（[DOCK64] pins save … ok=1）",
                   re.search(r"\[DOCK64\] pins save n=7 bytes=\d+ ok=1", log) is not None, "")
             items = dock_items(log)
@@ -360,6 +381,12 @@ def main():
             check("⑱ 取消固定后 app=3 不再出现在固定区（只剩运行项）",
                   all(it["app"] != 3 or it["kind"] == "running" for it in items),
                   "app3=%s" % [(it["kind"], it["idx"]) for it in items if it["app"] == 3])
+            # 反方向：取消固定之后，**同一个正在跑的窗口**立刻从"合并"变成"运行图标"
+            items = dock_items(log)
+            r3 = [it for it in items if it["app"] == 3]
+            check("⑲ 反方向成立：取消固定后 app=3 出现在**运行区**（kind=running，不再合并）",
+                  len(r3) == 1 and all(it["kind"] == "running" for it in r3),
+                  "app3=%s" % [(it["kind"], it["win"]) for it in items if it["app"] == 3])
     finally:
         proc.kill()
         try:
