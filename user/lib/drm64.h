@@ -6,9 +6,11 @@
  *
  * 与内核侧完全一致的部分（照抄）：
  *   * ioctl 号：DRM64_IOWR(nr, type) = dir(W|R)<<30 | sizeof(type)<<16 | 'd'<<8 | nr
- *     （沿用 Linux DRM 的编码风格，但 size 用**我们的** struct 尺寸；本批不做与真实 drm.h
- *      的逐字节兼容）
- *   * 结构体：全部 packed、字段顺序固定（每个都在内核侧有 sizeof 断言）
+ *     v0.9.14 起 11 个号的数值与 Linux `include/uapi/drm/drm.h` **逐个相等**，
+ *     结构体 sizeof 也与 Linux 逐字节相同（version 64 / modeinfo 68 / crtc 104 /
+ *     wait_vblank 24 / crtc_get_sequence 24）—— 下一批接真实 libdrm 不用再改 ABI。
+ *   * 结构体：全部 packed（Drm64Version 除外，它靠自然对齐拿到 Linux 的 4 B padding），
+ *     字段顺序固定，每个都有一条 sizeof 断言
  *   * 上限：4 个 dumb buffer / 4 个 connector / 1 个 CRTC / 2 个 plane（越界 -EINVAL）
  *   * evdev：struct input_event64 = 24 B（与 Linux x86_64 的 struct input_event 同尺寸）
  *
@@ -98,19 +100,20 @@
 #define DRM64_ENOSYS64  38
 
 /* ==================== 结构体（全部 packed；字段顺序 = ABI，别动）==================== */
-/* ① VERSION：短字符串由内核写进用户缓冲（name/date/desc 是**用户指针**，长度含结尾 NUL）。 */
-struct __attribute__((packed)) Drm64Version {
+/* ① VERSION（= Linux struct drm_version，64 B）：不 packed，+12..15 那 4 B padding 是 Linux 的布局。 */
+struct Drm64Version {
     int32_t  version_major;      /* +0   = 1 */
     int32_t  version_minor;      /* +4   = 0 */
     int32_t  version_patchlevel; /* +8   = 0 */
-    uint64_t name_len;           /* +12  in/out：name 缓冲字节数（写入含 NUL 的实际长度） */
-    uint64_t name;               /* +20  用户缓冲指针（"vimtu-drm"） */
-    uint64_t date_len;           /* +28  in/out：date 缓冲字节数 */
-    uint64_t date;               /* +36  用户缓冲指针（"20250101"） */
-    uint64_t desc_len;           /* +44  in/out：desc 缓冲字节数 */
-    uint64_t desc;               /* +52  用户缓冲指针（一行说明） */
-};                               /* = 60 B */
-DRM64_STATIC_ASSERT(sizeof(struct Drm64Version) == 60, "Drm64Version 必须是 60 B");
+                                 /* +12  padding（自然对齐，勿加字段） */
+    uint64_t name_len;           /* +16  in/out：name 缓冲字节数（写入含 NUL 的实际长度） */
+    uint64_t name;               /* +24  用户缓冲指针（"vimtu-drm"） */
+    uint64_t date_len;           /* +32  in/out：date 缓冲字节数 */
+    uint64_t date;               /* +40  用户缓冲指针（"20250101"） */
+    uint64_t desc_len;           /* +48  in/out：desc 缓冲字节数 */
+    uint64_t desc;               /* +56  用户缓冲指针（一行说明） */
+};                               /* = 64 B（= Linux drm_version） */
+DRM64_STATIC_ASSERT(sizeof(struct Drm64Version) == 64, "Drm64Version 必须是 64 B（= Linux drm_version）");
 
 /* ② GET_CAP：只支持 DRM_CAP_DUMB_BUFFER(1) 与 DRM_CAP_VBLANK(2)（值 1 = 支持）。 */
 struct __attribute__((packed)) Drm64GetCap {
@@ -136,27 +139,27 @@ struct __attribute__((packed)) Drm64ModeResources {
 };                               /* = 64 B */
 DRM64_STATIC_ASSERT(sizeof(struct Drm64ModeResources) == 64, "Drm64ModeResources 必须是 64 B");
 
-/* ③-b 显示模式（name 在结构**最前**，与 Linux 的 drm_mode_modeinfo 不同 —— 我们自己定）。 */
+/* ③-b 显示模式（= Linux struct drm_mode_modeinfo，68 B —— name[32] 在最后） */
 struct __attribute__((packed)) Drm64ModeMode {
-    char     name[32];           /* +0   "<w>x<h>"（NUL 结尾） */
-    uint32_t clock;              /* +32  kHz（按 60 Hz 估计，如实标注为估计值） */
-    uint16_t hdisplay;           /* +36 */
-    uint16_t hsync_start;        /* +38 */
-    uint16_t hsync_end;          /* +40 */
-    uint16_t htotal;             /* +42 */
-    uint16_t vdisplay;           /* +44 */
-    uint16_t vsync_start;        /* +46 */
-    uint16_t vsync_end;          /* +48 */
-    uint16_t vtotal;             /* +50 */
-    uint32_t hskew;              /* +52 */
-    uint32_t vscan;              /* +56 */
-    uint32_t vrefresh;           /* +60  Hz（估计值） */
-    uint32_t flags;              /* +64  0 */
-    uint32_t type;               /* +68  0 = 非首选之外的普通模式（本批恒 0） */
-};                               /* = 72 B */
-DRM64_STATIC_ASSERT(sizeof(struct Drm64ModeMode) == 72, "Drm64ModeMode 必须是 72 B");
+    uint32_t clock;              /* +0   kHz（按 60 Hz 估计，如实标注为估计值） */
+    uint16_t hdisplay;           /* +4 */
+    uint16_t hsync_start;        /* +6 */
+    uint16_t hsync_end;          /* +8 */
+    uint16_t htotal;             /* +10 */
+    uint16_t hskew;              /* +12  恒 0 */
+    uint16_t vdisplay;           /* +14 */
+    uint16_t vsync_start;        /* +16 */
+    uint16_t vsync_end;          /* +18 */
+    uint16_t vtotal;             /* +20 */
+    uint16_t vscan;              /* +22  恒 0 */
+    uint32_t vrefresh;           /* +24  Hz（估计值） */
+    uint32_t flags;              /* +28  0 */
+    uint32_t type;               /* +32  0 = 非首选之外的普通模式（本批恒 0） */
+    char     name[32];           /* +36  "<w>x<h>"（NUL 结尾） */
+};                               /* = 68 B（= Linux drm_mode_modeinfo） */
+DRM64_STATIC_ASSERT(sizeof(struct Drm64ModeMode) == 68, "Drm64ModeMode 必须是 68 B（= Linux drm_mode_modeinfo）");
 
-/* ④ GETCRTC：读当前 CRTC 状态（1 个 CRTC）。 */
+/* ④ GETCRTC（= Linux struct drm_mode_crtc，104 B）：读当前 CRTC 状态（1 个 CRTC）。 */
 struct __attribute__((packed)) Drm64ModeCrtc {
     uint64_t       set_connectors_ptr;  /* +0   用户 u32 数组（out） */
     uint32_t       count_connectors;    /* +8   in/out */
@@ -166,9 +169,9 @@ struct __attribute__((packed)) Drm64ModeCrtc {
     uint32_t       y;                   /* +24  out = 0 */
     uint32_t       gamma_size;          /* +28  out = 0（没有 gamma LUT） */
     uint32_t       mode_valid;          /* +32  out = 1 */
-    struct Drm64ModeMode  mode;         /* +36  out = 当前模式 */
-};                                      /* = 108 B */
-DRM64_STATIC_ASSERT(sizeof(struct Drm64ModeCrtc) == 108, "Drm64ModeCrtc 必须是 108 B");
+    struct Drm64ModeMode  mode;         /* +36  out = 当前模式（68 B） */
+};                                      /* = 104 B（= Linux drm_mode_crtc） */
+DRM64_STATIC_ASSERT(sizeof(struct Drm64ModeCrtc) == 104, "Drm64ModeCrtc 必须是 104 B（= Linux drm_mode_crtc）");
 
 /* ⑤ GETCONNECTOR：1 个 connector（HDMI-A-1，status=connected）。 */
 struct __attribute__((packed)) Drm64ModeConnector {
@@ -227,27 +230,26 @@ struct __attribute__((packed)) Drm64ModePageFlip {
 };                       /* = 24 B */
 DRM64_STATIC_ASSERT(sizeof(struct Drm64ModePageFlip) == 24, "Drm64ModePageFlip 必须是 24 B");
 
-/* ⑩ WAIT_VBLANK：request = 1 = "等下一个 vblank"；0 = 只读序列号 */
+/* ⑩ WAIT_VBLANK（= Linux union drm_wait_vblank 的 reply 布局，24 B）
+ *   in  : type 的 bit0 = 1（DRM_VBLANK_RELATIVE）= 等下一个 vblank；0 = 只读序列号
+ *   out : type 原样回显、sequence = 当前序列号、tval_sec/tval_usec = tick 换算的时间
+ *   注意：没有 crtc_id 字段（Linux 用 type 的高位带 CRTC 选择；本内核只有 1 个 CRTC，不校验）。 */
 struct __attribute__((packed)) Drm64WaitVblank {
-    uint64_t request;     /* +0   in：1 = wait / 0 = query */
-    uint64_t sequence;    /* +8   out：当前 vblank 序列号（单调递增） */
-    uint64_t tval_sec;    /* +16  out：tick 换算的秒 */
-    uint64_t tval_usec;   /* +24  out：微秒（4 ms tick 粒度，如实） */
-    uint32_t crtc_id;     /* +32  in */
-    uint32_t flags;       /* +36  out：1 = 用了硬件回扫 / 0 = 软兜底 */
-};                        /* = 40 B */
-DRM64_STATIC_ASSERT(sizeof(struct Drm64WaitVblank) == 40, "Drm64WaitVblank 必须是 40 B");
+    uint32_t type;        /* +0   in：1 = 等下一个 vblank / 0 = 只读；out：回显 */
+    uint32_t sequence;    /* +4   in：相对偏移（本批只用 0）；out：实际序列号 */
+    int64_t  tval_sec;    /* +8   out：tick 换算的秒 */
+    int64_t  tval_usec;   /* +16  out：微秒（4 ms tick 粒度，如实） */
+};                        /* = 24 B（= Linux drm_wait_vblank_reply） */
+DRM64_STATIC_ASSERT(sizeof(struct Drm64WaitVblank) == 24, "Drm64WaitVblank 必须是 24 B（= Linux union drm_wait_vblank）");
 
-/* ⑪ CRTC_GET_SEQUENCE */
+/* ⑪ CRTC_GET_SEQUENCE（= Linux struct drm_crtc_get_sequence，24 B） */
 struct __attribute__((packed)) Drm64CrtcSeq {
-    uint32_t crtc_id;     /* +0   in */
-    uint32_t flags;       /* +4   out：1 = 硬件回扫可用 */
-    uint64_t sequence;    /* +8   out */
-    uint64_t ns;          /* +16  out：sequence 对应的纳秒（tick 粒度，如实） */
-    uint64_t tval_sec;    /* +24  out */
-    uint64_t tval_usec;   /* +32  out */
-};                        /* = 40 B */
-DRM64_STATIC_ASSERT(sizeof(struct Drm64CrtcSeq) == 40, "Drm64CrtcSeq 必须是 40 B");
+    uint32_t crtc_id;      /* +0   in */
+    uint32_t active;       /* +4   out：1 = vblank 由硬件扫描驱动 / 0 = 软兜底 */
+    uint64_t sequence;     /* +8   out：当前序列号 */
+    uint64_t sequence_ns;  /* +16  out：sequence 对应的纳秒（tick 粒度，如实） */
+};                         /* = 24 B（= Linux drm_crtc_get_sequence） */
+DRM64_STATIC_ASSERT(sizeof(struct Drm64CrtcSeq) == 24, "Drm64CrtcSeq 必须是 24 B（= Linux drm_crtc_get_sequence）");
 
 /* ==================== evdev ABI ==================== */
 /* 24 B，与 Linux x86_64 的 struct input_event 同尺寸（时间戳 2×u64 + 2×u16 + i32）。 */

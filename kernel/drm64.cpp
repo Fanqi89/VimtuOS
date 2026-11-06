@@ -498,15 +498,13 @@ static int d64_ioctl_wait_vblank64(uint64_t arg) {
     if (!user64_range_ok64(arg, sizeof(Drm64WaitVblank))) return -DRM64_EFAULT64;
     Drm64WaitVblank v;
     d64_urd64(arg, &v, sizeof(Drm64WaitVblank));
-    if (v.crtc_id != DRM64_CRTC_ID64) {
-        v.sequence = g_seq; d64_uwr64(arg, &v, sizeof(Drm64WaitVblank));
-        return -DRM64_EINVAL64;
-    }
+    // v0.9.14：Linux union drm_wait_vblank 语义 —— type 的 bit0（DRM_VBLANK_RELATIVE）= 等下一帧，
+    // 0 = 只读序列号；这个 union 里**没有 crtc_id**（Linux 用 type 的高位带 CRTC 选择，
+    // 而本内核只有 1 个 CRTC），所以不再校验 CRTC，也不再回写 crtc_id。
     uint64_t hw = 0;
-    if (v.request != 0ull) hw = (uint64_t)d64_vblank_wait64();
+    if (v.type & 1u) hw = (uint64_t)d64_vblank_wait64();
     v.sequence = g_seq;
-    { uint64_t ts = 0, tu = 0; d64_time64(&ts, &tu); v.tval_sec = ts; v.tval_usec = tu; }
-    v.flags = (uint32_t)(hw ? 1u : 0u);
+    { uint64_t ts = 0, tu = 0; d64_time64(&ts, &tu); v.tval_sec = (int64_t)ts; v.tval_usec = (int64_t)tu; }
     d64_uwr64(arg, &v, sizeof(Drm64WaitVblank));
     d64_begin(); d64_puts("[DRM] wait_vblank seq="); d64_num(v.sequence);
     d64_puts(hw ? " mode=hw ticks=" : " mode=soft ticks="); d64_num(g_ticks64); d64_end();
@@ -518,11 +516,14 @@ static int d64_ioctl_crtc_seq64(uint64_t arg) {
     Drm64CrtcSeq s;
     d64_urd64(arg, &s, sizeof(Drm64CrtcSeq));
     if (s.crtc_id != DRM64_CRTC_ID64) return -DRM64_EINVAL64;
+    uint64_t ts = 0, tu = 0;
+    d64_time64(&ts, &tu);
     s.sequence = g_seq;
-    s.flags = (uint32_t)(g_vblank_hw ? 1u : 0u);
-    { uint64_t ts = 0, tu = 0; d64_time64(&ts, &tu); s.tval_sec = ts; s.tval_usec = tu; }
-    s.ns = s.tval_sec * 1000000000ull + s.tval_usec * 1000ull;
+    s.sequence_ns = ts * 1000000000ull + tu * 1000ull;   // tick 粒度（4 ms），如实
+    s.active = (uint32_t)(g_vblank_hw ? 1u : 0u);        // 1 = 硬件扫描驱动 / 0 = 软兜底
     d64_uwr64(arg, &s, sizeof(Drm64CrtcSeq));
+    d64_begin(); d64_puts("[DRM] crtc_seq active="); d64_num(s.active);
+    d64_puts(" seq="); d64_num(s.sequence); d64_end();
     return 0;
 }
 

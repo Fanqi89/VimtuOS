@@ -162,15 +162,21 @@ int main(int argc, char** argv, char** envp) {
     rc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_PAGE_FLIP, struct Drm64ModePageFlip), &pf);
     printf("[DRMDEMO] page_flip handle=%u rc=%d\n", (unsigned)pf.fb_id, (int)rc);
 
-    /* ---- ⑨ WAIT_VBLANK ---- */
+    /* ---- ⑨ CRTC_GET_SEQUENCE（拿 active = 硬件回扫是否真可用，纯只读）---- */
+    struct Drm64CrtcSeq cs;
+    for (unsigned i = 0; i < sizeof(cs); i++) ((char*)&cs)[i] = 0;
+    cs.crtc_id = DRM64_CRTC_ID64;
+    long rc_seq = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_CRTC_GET_SEQUENCE, struct Drm64CrtcSeq), &cs);
+    printf("[DRMDEMO] crtc_seq active=%u seq=%llu ns=%llu rc=%d\n",
+           (unsigned)cs.active, (unsigned long long)cs.sequence,
+           (unsigned long long)cs.sequence_ns, (int)rc_seq);
+
+    /* ---- ⑨-b WAIT_VBLANK（Linux 语义：type 的 bit0 = 等下一帧）---- */
     struct Drm64WaitVblank wv;
-    wv.request = 1; wv.sequence = 0; wv.tval_sec = 0; wv.tval_usec = 0;
-    wv.crtc_id = DRM64_CRTC_ID64; wv.flags = 0;
+    wv.type = 1; wv.sequence = 0; wv.tval_sec = 0; wv.tval_usec = 0;
     rc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_WAIT_VBLANK, struct Drm64WaitVblank), &wv);
     printf("[DRMDEMO] wait_vblank seq=%lu hw=%u rc=%d\n",
-
-
-           (unsigned long)wv.sequence, (unsigned)wv.flags, (int)rc);
+           (unsigned long)wv.sequence, (unsigned)cs.active, (int)rc);
 
     /* ---- 连续第二帧：同一帧缓冲再翻一次 + 再等一次 vblank。
      *   真正的双缓冲要两块 dumb 交替（下一批配合 buffer 生命周期做），
@@ -180,7 +186,7 @@ int main(int argc, char** argv, char** envp) {
         if (rc != 0) { printf("[DRMDEMO] page_flip#%d FAILED rc=%d\n", f + 2, (int)rc); }
         struct Drm64WaitVblank wv2;
         for (unsigned k = 0; k < sizeof(wv2); k++) ((char*)&wv2)[k] = 0;
-        wv2.crtc_id = 1; wv2.request = 1;
+        wv2.type = 1;
         rc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_WAIT_VBLANK, struct Drm64WaitVblank), &wv2);
         printf("[DRMDEMO] flip_vblank#%d seq=%llu rc=%d\n", f + 2, (unsigned long long)wv2.sequence, (int)rc);
     }

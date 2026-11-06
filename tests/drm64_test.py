@@ -5,6 +5,9 @@
 要证明的事（每条都有串口/宿主侧字节证据）：
   ① **两份头文件逐值一致**：kernel/drm64.h 与 user/lib/drm64.h 的 `#define` 数值 +
      每个结构体的字段序列完全相同（ABI 只有一个真源，拷贝必须同步）。
+  ①b **ioctl 号与 Linux `include/uapi/drm/drm.h` 逐个相等**（v0.9.14 新增的判据）：
+     11 个号 = `_IOWR('d', nr, sizeof(struct))`；sizeof 必须是 Linux 的 64/16/64/104/80/32/
+     16/4/24/24/24 —— 三重核对（#define 的 nr、两个头文件的 sizeof 断言、算出来的号 vs 字面值）。
   ② 内核自检：`[DRM] selftest dumb=ok flip=ok vblank=<n> mode=<hw|soft> ok=1`
      （建 dumb -> 写测试图案 -> 内核读回核对 [DRM] verify ok=1 -> page flip -> 等 vblank ->
        把开机画面翻回来 -> 销毁）。自检**不改变**开机画面（快照翻回）。
@@ -166,6 +169,81 @@ def check_headers(problems):
     return len(k_def), len(STRUCT_NAMES)
 
 
+# Linux `include/uapi/drm/drm.h` 的参考值（nr 宏名, 结构体名, nr, sizeof(struct), ioctl 号）
+# ioctl 号 = _IOWR('d', nr, size) = (3<<30) | (size<<16) | (0x64<<8) | nr
+LINUX_DRM_ABI = [
+    ("DRM64_NR_VERSION",           "Drm64Version",        0x00,  64, 0xC0406400),
+    ("DRM64_NR_GET_CAP",           "Drm64GetCap",         0x0C,  16, 0xC010640C),
+    ("DRM64_NR_MODE_GETRESOURCES", "Drm64ModeResources",  0xA0,  64, 0xC04064A0),
+    ("DRM64_NR_MODE_GETCRTC",      "Drm64ModeCrtc",       0xA1, 104, 0xC06864A1),
+    ("DRM64_NR_MODE_GETCONNECTOR", "Drm64ModeConnector",  0xA7,  80, 0xC05064A7),
+    ("DRM64_NR_MODE_CREATE_DUMB",  "Drm64ModeCreateDumb", 0xB2,  32, 0xC02064B2),
+    ("DRM64_NR_MODE_MAP_DUMB",     "Drm64ModeMapDumb",    0xB3,  16, 0xC01064B3),
+    ("DRM64_NR_MODE_DESTROY_DUMB", "Drm64ModeDestroyDumb", 0xB4,  4, 0xC00464B4),
+    ("DRM64_NR_MODE_PAGE_FLIP",    "Drm64ModePageFlip",   0xB0,  24, 0xC01864B0),
+    ("DRM64_NR_WAIT_VBLANK",       "Drm64WaitVblank",     0x3A,  24, 0xC018643A),
+    ("DRM64_NR_CRTC_GET_SEQUENCE", "Drm64CrtcSeq",        0x3B,  24, 0xC018643B),
+]
+
+
+def _sizeof_asserts(path, user_side):
+    """读出每个结构体的 sizeof 断言值：这是 ABI 的第二道锁（第一道是字段序列）。"""
+    text = _strip_comments(open(path, "r", encoding="utf-8", errors="replace").read())
+    if user_side:
+        pat = r"DRM64_STATIC_ASSERT\(\s*sizeof\(\s*(?:struct\s+)?(\w+)\s*\)\s*==\s*(\d+)"
+    else:
+        pat = r"static_assert\(\s*sizeof\(\s*(?:struct\s+)?(\w+)\s*\)\s*==\s*(\d+)"
+    return {m.group(1): int(m.group(2)) for m in re.finditer(pat, text)}
+
+
+def check_linux_abi(problems):
+    """★ 与 Linux drm.h 的判据（v0.9.14 新增，只许加强）：
+       ioctl 号的 size 位就是 sizeof(struct)，所以 sizeof 与 Linux 相等 ⇒ DRM64_IOWR(nr, type)
+       算出来的号必然等于 Linux 的 _IOWR('d', nr, size)。这里三重核对：
+         a) 头文件 #define 的 nr 值
+         b) 两份头文件里 sizeof 断言的数值（内核 static_assert / 用户 DRM64_STATIC_ASSERT）
+         c) 用 (3<<30)|(sizeof<<16)|('d'<<8)|nr 算出来的号 vs Linux 字面值
+    """
+    KP = os.path.join(ROOT, "kernel", "drm64.h")
+    UP = os.path.join(ROOT, "user", "lib", "drm64.h")
+    k_def, _ = parse_header(KP)
+    k_sz = _sizeof_asserts(KP, False)
+    u_sz = _sizeof_asserts(UP, True)
+    n = 0
+    for nrname, stname, nr, size, num in LINUX_DRM_ABI:
+        n += 1
+        v = k_def.get(nrname)
+        if v is None:
+            problems.append("内核侧缺 #define %s" % nrname)
+        else:
+            try:
+                got_nr = int(v.rstrip("uU"), 16) & 0xFF
+            except ValueError:
+                problems.append("%s 的值 %r 不是十六进制" % (nrname, v))
+                got_nr = -1
+            if got_nr != nr:
+                problems.append("%s = %s（Linux nr = 0x%02x）" % (nrname, v, nr))
+        for side, tbl in (("内核", k_sz), ("用户", u_sz)):
+            got = tbl.get(stname)
+            if got is None:
+                problems.append("%s侧没有 sizeof(%s) 的断言" % (side, stname))
+            elif got != size:
+                problems.append("%s侧 sizeof(%s) = %d（Linux = %d）" % (side, stname, got, size))
+        calc = (3 << 30) | (size << 16) | (0x64 << 8) | nr
+        if calc != num:
+            problems.append("ioctl(%s) 的 Linux 参考值算错：0x%08X / 期望 0x%08X" % (nrname, calc, num))
+        msz = k_sz.get(stname)
+        if msz is not None and ((3 << 30) | (msz << 16) | (0x64 << 8) | nr) != num:
+            problems.append("DRM64_IOWR(%s, %s) = 0x%08X（Linux = 0x%08X）"
+                            % (nrname, stname, (3 << 30) | (msz << 16) | (0x64 << 8) | nr, num))
+    # ioctl 表之外、但 Linux 也有同名布局的：evdev 的 struct input_event
+    for nm, size in (("InputEvent64", 24),):
+        for side, tbl in (("内核", k_sz), ("用户", u_sz)):
+            if tbl.get(nm) != size:
+                problems.append("%s侧 sizeof(%s) = %r（Linux = %d）" % (side, nm, tbl.get(nm), size))
+    return n
+
+
 # ---------------------------------------------------------------------------
 # 夹具
 # ---------------------------------------------------------------------------
@@ -325,6 +403,11 @@ def main():
     check("① 两份 drm64.h 逐值一致（%d 个 #define + %d 个结构体字段序列）" % (ndef, nst),
           not problems, "；".join(problems[:3]))
 
+    abi_problems = []
+    nabi = check_linux_abi(abi_problems)
+    check("①b %d 个 ioctl 号与 Linux drm.h 逐值相等（sizeof 逐字节相同，含 InputEvent64）" % nabi,
+          not abi_problems, "；".join(abi_problems[:4]))
+
     qemu = find_qemu(args.qemu)
     if not qemu:
         print("环境问题：找不到 qemu-system-x86_64")
@@ -386,6 +469,7 @@ def main():
             (r"\[DRMDEMO\] getconnector id=1 connected=1 mode=\d+x\d+", "getconnector connected=1"),
             (r"\[DRMDEMO\] create_dumb handle=\d+ \d+x\d+@32 pitch=\d+ size=\d+", "create_dumb"),
             (r"\[DRMDEMO\] map_dumb handle=\d+ va=0x[0-9a-f]+", "map_dumb va="),
+            (r"\[DRMDEMO\] crtc_seq active=[01] seq=\d+ ns=\d+ rc=0", "crtc_seq active/seq/ns"),
             (r"\[DRMDEMO\] paint bars=8 barw=64 va=0x[0-9a-f]+ probe=0x[0-9a-f]+", "paint bars=8"),
             (r"\[DRMDEMO\] page_flip handle=\d+ rc=0", "page_flip rc=0"),
             (r"\[DRMDEMO\] wait_vblank seq=\d+ hw=[01] rc=0", "wait_vblank"),

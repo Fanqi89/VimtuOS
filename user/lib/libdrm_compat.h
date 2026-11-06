@@ -3,11 +3,10 @@
  * 定位（先读，别误期待）：
  *   * 这一层是**名字与用法**对齐 libdrm（`drmModeGetResources` / `drmModeCreateDumbBuffer` /
  *     `drmModePageFlip` / `drmWaitVBlank` …），底层仍是我们自洽的 `kernel/drm64.h` 那套 ioctl。
- *     也就是说：**今天是"用法兼容"，不是"二进制兼容"** —— 真 libdrm 本体要跑起来还差
- *     "struct 尺寸与 drm.h 逐字节一致"（差值见 docs/Wayland基础抽象层.md 的表）。
- *   * 为什么不直接抄 libdrm 的 struct：那要求 VERSION/GETCRTC/WAIT_VBLANK/GET_SEQUENCE 四处
- *     struct 布局与 Linux 一字不差（含 `__kernel_size_t` + 用户指针），属于一次独立的、需要
- *     真 libdrm 源码做对照的改造。这一层先把"调用形态"固定下来，下一批替换实现即可。
+ *     v0.9.14 起：11 个 ioctl 号与 5 个结构体的 sizeof 与 Linux `include/uapi/drm/drm.h`
+ *     **逐字节一致**（tests/drm64_test.py 的 ①b 逐号钉住），所以"号 + 布局"这层已经兼容了。
+ *   * 还差的（本文件不做）：ADDFB2/SETCRTC/GETPLANE 属性系统、atomic commit、GBM+EGL/GLES、
+ *     dma-buf 跨进程，以及 Linux 的 `mmap` 语义（我们的 MAP_DUMB 直接返回一块用户 VA）。
  *
  * 用法（与 libdrm 一样：先拿资源，再建 buffer，最后 flip + 等 vblank）：
  *
@@ -132,8 +131,7 @@ static inline int libdrm_mode_page_flip(int fd, uint32_t fb_id, uint64_t user_da
 static inline int libdrm_wait_vblank(int fd, uint64_t* seq_out) {
     struct Drm64WaitVblank wv;
     for (unsigned i = 0; i < sizeof(wv); i++) ((char*)&wv)[i] = 0;
-    wv.crtc_id = DRM64_CRTC_ID64;
-    wv.request = 1;
+    wv.type = 1;                 /* DRM_VBLANK_RELATIVE：等下一个 vblank */
     const long rc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_WAIT_VBLANK, struct Drm64WaitVblank), &wv);
     if (rc < 0) return (int)rc;
     if (seq_out) *seq_out = wv.sequence;

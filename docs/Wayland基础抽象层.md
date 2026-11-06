@@ -109,13 +109,32 @@ py -3 tests\drm64_test.py            # 串口断言 + 头文件逐值比对 + �
 * `user/lib/libdrm_compat.h` —— **libdrm 风格的封装**（`libdrm_open` / `libdrm_mode_get_resources` /
   `libdrm_mode_get_connector` / `libdrm_mode_create_dumb` / `libdrm_mode_map_dumb` /
   `libdrm_mode_page_flip` / `libdrm_wait_vblank` / `libdrm_mode_destroy_dumb` / `libdrm_bad_cmd`），
-  全部 `static inline` 跑在 `kernel/drm64.h` 那套 ioctl 上；**编译已通过**（被 `/bin/drmdemo` 的
-  构建包含，产出 14,040 B 不变 = 没有把演示改坏）。
-  定位写得很清楚：**今天叫"用法兼容"，不是"二进制兼容"** —— 真 libdrm 本体仍不能用它。
+  全部 `static inline` 跑在 `kernel/drm64.h` 那套 ioctl 上；**编译已验证**（v0.9.14 用一个假 TU
+  复验：`COMPAT_OK`）。
+  ★ v0.9.14 起：11 个 ioctl 号与 5 个 struct 的 sizeof 与 Linux `drm.h` **逐字节一致**，所以"号 + 布局"
+  这层已经兼容；还差的是属性系统 / atomic commit / GBM / dma-buf / `mmap` 语义（见 A.3）。
 * `user/lib/drm64.{h,c}` —— 4 个薄封装（open / ioctl / evdev open / evdev read）。
 * `kernel/drm64.cpp` 的 11 个 ioctl + evdev 门面（v0.9.12 已验收 32/32）。
 
-### A.2 做到"真 libdrm 能编能跑"还差多少（逐个 struct 的实测差值）
+### A.2 与 Linux `drm.h` 的差值：**已归零**（v0.9.14）
+
+上一版这张表是"还差多少"；现在它是**历史记录**（左列是 v0.9.12 的值，右边是本版值 = Linux 值）：
+
+| ioctl | v0.9.12 的 sizeof → 号 | v0.9.14 = Linux | 本批怎么改的 |
+| --- | --- | --- | --- |
+| `DRM_IOCTL_VERSION` | 60 → `0xC03C6400` | **64 → `0xC0406400`** | 去掉 `packed`；+12..15 的 4 B padding 靠自然对齐（Linux 就是这样） |
+| `MODE_GETCRTC` | 108 → `0xC06C64A1` | **104 → `0xC06864A1`** | `drm_mode_modeinfo` 68：`clock` 在前、`name[32]` 在后、`hskew/vscan` 归位 |
+| `WAIT_VBLANK` | 40 → `0xC028643A` | **24 → `0xC018643A`** | `u32 type; u32 sequence; i64 tval_sec; i64 tval_usec`（**没有 crtc_id**） |
+| `CRTC_GET_SEQUENCE` | 40 → `0xC028643B` | **24 → `0xC018643B`** | `u32 crtc_id; u32 active; u64 sequence; u64 sequence_ns` |
+| 其余 7 个（`GET_CAP`/`GETRESOURCES`/`GETCONNECTOR`/`CREATE_DUMB`/`MAP_DUMB`/`DESTROY_DUMB`/`PAGE_FLIP`） | 16/64/80/32/16/4/24 | **不变（本来就一致）** | 只核对了字段名 |
+
+判据：`tests/drm64_test.py` 的 **①b** 把 11 个号逐个钉死 —— 数据来源是**两份头文件里的 sizeof 断言**，
+所以改 sizeof 就等于改号，漂一个就红；另有一条 `[DRMDEMO] crtc_seq` 的 ring3 断言（共 34 条）。
+
+### A.2.1 旧表（v0.9.13 的"还差多少"，保留作为对照）
+
+> （表里"要做的事"一列是**当时的推断**；实际落地以 A.5 为准 —— 例如 `WAIT_VBLANK` 的 `type/sequence`
+> 是 **u32** 不是 u64，`drm_version` 是 **64** 字节不是 56。）
 
 我们的实现与 Linux `drm.h` 的差异**只在 4 处 struct 尺寸**（其余 7 个已经一致）。按
 `DRM64_IOWR(nr,type) = (3<<30)|(sizeof(type)<<16)|('d'<<8)|nr` 编码：
@@ -147,7 +166,7 @@ py -3 tests\drm64_test.py            # 串口断言 + 头文件逐值比对 + �
    `proc64` 的进程回收里加一个 hook（本批未做，风险点在"动 proc64 会牵动全部进程测试"）。
 6. **真双缓冲交替**：演示目前是"同一帧缓冲连续两次 flip + 两次 wait_vblank"，两块 dumb 交替还没做。
 
-### A.4.1 ★ 下一批的完整动手清单（ABI 逐字节对齐）
+### A.4.1 ✅ 已在 v0.9.14 落地 —— 保留原始动手清单作为对照
 
 四个 struct 必须**一次改完、一次构建**（改一半会让 `kernel/drm64.cpp` 编译不过）：
 
@@ -176,8 +195,9 @@ WAIT_VBLANK        0xC018643A   (24)
 CRTC_GET_SEQUENCE  0xC018643B   (24)
 ```
 
-改完后的验收：`drm64_test` 双头文件逐值比对 + Linux 参考值断言全绿，`/bin/drmdemo` 输出不变（
-`version name=vimtu-drm`、`wait_vblank seq=N`）。
+改完后的验收（**本批实测**）：`drm64_test` 双头文件逐值比对 + Linux 参考值断言全绿 —— **34/34**；
+`/bin/drmdemo` 的阶段行齐全，新增 `[DRMDEMO] crtc_seq active=0 seq=2 ns=34852000000 rc=0`
+（QEMU TCG 下 `active=0` = 软兜底，如实）。
 
 ### A.4 建议的下一批顺序
 
@@ -186,3 +206,16 @@ CRTC_GET_SEQUENCE  0xC018643B   (24)
 3. `proc64` 的 fd 回收 hook（解 A.3.5）；
 4. `dma-buf` 跨进程（解 A.3.3）；
 5. atomic commit（解 A.3.1）→ 到这一步 wlroots 的 DRM 后端才真正有戏。
+
+### A.5 v0.9.14 的落地记录（这一节是"已做"，不是计划）
+
+* 7 个文件同一改动：`kernel/drm64.h`、`kernel/drm64.cpp`（`wait_vblank` / `crtc_seq` 两处实现）、
+  `user/lib/drm64.h`、`user/apps/drmdemo.c`、`user/lib/libdrm_compat.h`、`tests/drm64_test.py`、版本号。
+* `drm_version` 从 `packed` 改成**自然对齐**（packed 不插 padding，会永远停在 60 字节）。
+* `WAIT_VBLANK` 的 `crtc_id` 校验**删除**（Linux 的 union 里没有这个字段），等待语义 = `type & 1`。
+* `CRTC_GET_SEQUENCE` 的 `flags→active`、`ns→sequence_ns`，`tval_*` 删除。
+* 判据加强 + 反例控制（把参考表改回 `VERSION=56` 会报 3 条）。
+* 实测：`drm64_test` **34/34**、`wl64_test` **91/91**、`gpu64_test --only std` **40/40**、
+  `status_report` **94/0/0**；内核 **3,042,224 B**（闸门 3,116,544，余量 74,320）。
+* 仍然没做（下一批，按 A.4）：`ADDFB2`/`SETCRTC`/`GETPLANE` → `proc64` 回收 hook → dma-buf 跨进程 →
+  atomic commit → GBM+EGL/GLES。
