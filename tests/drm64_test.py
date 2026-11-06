@@ -98,6 +98,8 @@ STRUCT_NAMES = [
     "Drm64ModeCrtc", "Drm64ModeConnector", "Drm64ModeCreateDumb",
     "Drm64ModeMapDumb", "Drm64ModeDestroyDumb", "Drm64ModePageFlip",
     "Drm64WaitVblank", "Drm64CrtcSeq", "InputEvent64",
+    # ★ v0.9.15：fb 对象 / plane
+    "Drm64ModeFbCmd2", "Drm64ModeFbCmd", "Drm64ModeGetPlaneRes", "Drm64ModeGetPlane",
 ]
 
 
@@ -176,11 +178,16 @@ LINUX_DRM_ABI = [
     ("DRM64_NR_GET_CAP",           "Drm64GetCap",         0x0C,  16, 0xC010640C),
     ("DRM64_NR_MODE_GETRESOURCES", "Drm64ModeResources",  0xA0,  64, 0xC04064A0),
     ("DRM64_NR_MODE_GETCRTC",      "Drm64ModeCrtc",       0xA1, 104, 0xC06864A1),
+    ("DRM64_NR_MODE_SETCRTC",      "Drm64ModeCrtc",       0xA2, 104, 0xC06864A2),
     ("DRM64_NR_MODE_GETCONNECTOR", "Drm64ModeConnector",  0xA7,  80, 0xC05064A7),
+    ("DRM64_NR_MODE_ADDFB",        "Drm64ModeFbCmd",      0xAD,  28, 0xC01C64AD),
+    ("DRM64_NR_MODE_ADDFB2",       "Drm64ModeFbCmd2",     0xAE, 104, 0xC06864AE),
     ("DRM64_NR_MODE_CREATE_DUMB",  "Drm64ModeCreateDumb", 0xB2,  32, 0xC02064B2),
     ("DRM64_NR_MODE_MAP_DUMB",     "Drm64ModeMapDumb",    0xB3,  16, 0xC01064B3),
     ("DRM64_NR_MODE_DESTROY_DUMB", "Drm64ModeDestroyDumb", 0xB4,  4, 0xC00464B4),
     ("DRM64_NR_MODE_PAGE_FLIP",    "Drm64ModePageFlip",   0xB0,  24, 0xC01864B0),
+    ("DRM64_NR_MODE_GETPLANE",     "Drm64ModeGetPlane",   0xB5,  32, 0xC02064B5),
+    ("DRM64_NR_MODE_GETPLANERES",  "Drm64ModeGetPlaneRes", 0xB6, 16, 0xC01064B6),
     ("DRM64_NR_WAIT_VBLANK",       "Drm64WaitVblank",     0x3A,  24, 0xC018643A),
     ("DRM64_NR_CRTC_GET_SEQUENCE", "Drm64CrtcSeq",        0x3B,  24, 0xC018643B),
 ]
@@ -473,6 +480,11 @@ def main():
             (r"\[DRMDEMO\] paint bars=8 barw=64 va=0x[0-9a-f]+ probe=0x[0-9a-f]+", "paint bars=8"),
             (r"\[DRMDEMO\] page_flip handle=\d+ rc=0", "page_flip rc=0"),
             (r"\[DRMDEMO\] wait_vblank seq=\d+ hw=[01] rc=0", "wait_vblank"),
+            (r"\[DRMDEMO\] plane_res n=2 ids=1,2 rc=0", "plane_res n=2 ids=1,2"),
+            (r"\[DRMDEMO\] plane id=1 crtc=1 fb=\d+ formats=2 fmt0=0x34325258 rc=0", "plane fmt0=XRGB8888"),
+            (r"\[DRMDEMO\] addfb2 fb=\d+ handle=\d+ rc=0", "addfb2 rc=0"),
+            (r"\[DRMDEMO\] setcrtc crtc=1 fb=\d+ rc=0", "setcrtc rc=0"),
+            (r"\[DRMDEMO\] leak_dumb handle=\d+ pages_hint=4 rc=0", "leak_dumb（故意不销毁）"),
         ]
         stage_ok = vm.wait("[DRMDEMO] done", args.timeout)
         log = vm.log()
@@ -496,6 +508,33 @@ def main():
               re.search(r"\[DRMDEMO\] evdev read (n=\d+|skipped rc=-?\d+)", log) is not None)
         check("④ [DRMDEMO] destroy_dumb rc=0", re.search(r"\[DRMDEMO\] destroy_dumb handle=\d+ rc=0", log) is not None)
         check("④ 验收程序跑完：[DRMDEMO] done ok=1", "[DRMDEMO] done ok=1" in log, "")
+
+        # ---------- ④-b ★ v0.9.15：fb 对象 / SETCRTC / plane / 进程回收 hook ----------
+        check("④ [DRM] addfb2 内核侧建 fb 成功（fmt=xrgb8888，fb id 从 0x100 起）",
+              re.search(r"\[DRM\] addfb2 fb=\d+ handle=\d+ w=\d+ h=\d+ pitch=\d+ fmt=xrgb8888", log) is not None,
+              (re.search(r"\[DRM\] addfb2[^\r\n]*", log).group(0)
+               if re.search(r"\[DRM\] addfb2[^\r\n]*", log) else "缺内核侧 addfb2 行"))
+        check("④ 反例：ADDFB2 的 NV12 被如实拒绝 -> [DRMDEMO] addfb2 badfmt rc=-22",
+              "[DRMDEMO] addfb2 badfmt rc=-22" in log,
+              (re.search(r"\[DRMDEMO\] addfb2 badfmt[^\r\n]*", log).group(0)
+               if re.search(r"\[DRMDEMO\] addfb2 badfmt[^\r\n]*", log) else "缺 badfmt 行"))
+        check("④ [DRM] setcrtc 用 fb id 上屏（mode=ok + path=gpu|cpu）",
+              re.search(r"\[DRM\] setcrtc crtc=1 fb=\d+ x=0 y=0 mode=ok path=(gpu|cpu)", log) is not None,
+              (re.search(r"\[DRM\] setcrtc[^\r\n]*", log).group(0)
+               if re.search(r"\[DRM\] setcrtc[^\r\n]*", log) else "缺 setcrtc 行"))
+        check("④ [DRM] plane 报告 primary 正在扫出的 fb（formats=2）",
+              re.search(r"\[DRM\] plane id=1 crtc=1 fb=\d+ formats=2", log) is not None)
+        rel = re.search(r"\[DRM\] release pid=(\d+) fbs=(\d+) pages=(\d+) free_pages=(\d+)", log)
+        check("④ 进程回收 hook 真收走了没 DESTROY 的那块 dumb（[DRM] release … fbs>=1 pages>=1）",
+              rel is not None and int(rel.group(2)) >= 1 and int(rel.group(3)) >= 1,
+              (rel.group(0) if rel else "没等到 [DRM] release —— hook 没跑"))
+        if rel is not None:
+            i_done = log.find("[DRMDEMO] done ok=1")
+            i_rel = log.find(rel.group(0))
+            check("④ release 发生在 [DRMDEMO] done **之后**（= 退出 hook，不是显式 destroy）",
+                  i_done >= 0 and i_rel > i_done, "done@%d release@%d" % (i_done, i_rel))
+        else:
+            check("④ release 发生在 [DRMDEMO] done **之后**（= 退出 hook，不是显式 destroy）", False, "缺 release 行")
 
         # ---------- ⑤ 桌面照旧 + 屏幕取证 ----------
         try:

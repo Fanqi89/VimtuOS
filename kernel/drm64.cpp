@@ -73,6 +73,19 @@ static int        g_inited = 0;
 static int        g_vblank_hw = 0;          // 1 = 硬件垂直回扫可用（0 = 软兜底）
 static uint8_t    g_rowbuf[DRM64_DUMB_MAX_STRIDE64];   // 自检/图案用的行缓冲（.bss，8 KiB）
 
+// ==================== fb 对象表（ADDFB / ADDFB2）====================
+// 为什么单独一张表：Linux 里 fb id 与 dumb handle 是**两套号**（libdrm 的 drmModeAddFB2()
+// 拿 dumb handle 建 fb，之后 SetCrtc/PageFlip 一律用 fb id）。我们把 fb 做成"dumb handle 的
+// 薄包装"—— 不复制像素、不改 dumb 语义，只是多一层对象号（0x100 起，与 1..4 的 handle 不撞）。
+struct Drm64Fb {
+    uint32_t used;
+    uint32_t id;        // = DRM64_FB_ID_BASE64 + 槽号
+    uint32_t handle;    // 底层 dumb handle
+    uint32_t w, h, pitch, format;
+};
+static Drm64Fb  g_fb[DRM64_MAX_FB64];
+static uint32_t g_fb_on_screen = 0;         // 在屏的 fb id（0 = 没有；legacy 直接翻 dumb 时也是 0）
+
 // ==================== 跨页安全的拷贝（dumb buffer <-> 连续内存）====================
 // to_buf=1：连续内存 -> dumb buffer（ring3 之后会读到的就是这份内容）
 // to_buf=0：dumb buffer -> 连续内存（呈现时拷进内核后备缓冲）
@@ -171,13 +184,41 @@ static int d64_create64(uint32_t w, uint32_t h, uint32_t bpp, uint32_t* out) {
     return 0;
 }
 
-static int d64_destroy64(uint32_t handle) {
+// dumb 被销毁时，**引用它的 fb 必须一起消失** —— 否则那个 fb id 会指向已经还给页池的
+// 物理页（后面 AddFB2/SetCrtc 拿它就会把任意内存显示到屏上）。这条是"两个对象生命周期
+// 必须绑在一起"的唯一落点。
+static Drm64Fb* d64_find_fb64(uint32_t fb_id) {
+    if (fb_id < DRM64_FB_ID_BASE64) return nullptr;
+    const uint32_t slot = fb_id - DRM64_FB_ID_BASE64;
+    if (slot >= DRM64_MAX_FB64) return nullptr;
+    return g_fb[slot].used ? &g_fb[slot] : nullptr;
+}
+
+static void d64_drop_fb_of_handle64(uint32_t handle) {
+    for (uint32_t i = 0; i < DRM64_MAX_FB64; i++) {
+        Drm64Fb* f = &g_fb[i];
+        if (!f->used || f->handle != handle) continue;
+        if (g_fb_on_screen == f->id) g_fb_on_screen = 0;
+        for (uint32_t k = 0; k < sizeof(Drm64Fb); k++) ((uint8_t*)f)[k] = 0;
+    }
+}
+
+// 真正释放（**无日志**）：返回还回页池的页数。ioctl DESTROY_DUMB 与进程回收 hook 共用。
+static uint32_t d64_free_slot64(uint32_t handle) {
     Drm64Dumb* d = d64_find64(handle);
-    if (!d) return -DRM64_EINVAL64;
+    if (!d) return 0u;
     const uint32_t pages = d->pages;
     d64_free_pages64(d);
     for (uint32_t k = 0; k < sizeof(Drm64Dumb); k++) ((uint8_t*)d)[k] = 0;
-    if (g_handle_on_screen == handle) g_handle_on_screen = 0;
+    if (g_handle_on_screen == handle) { g_handle_on_screen = 0; g_fb_on_screen = 0; }
+    d64_drop_fb_of_handle64(handle);
+    return pages;
+}
+
+static int d64_destroy64(uint32_t handle) {
+    Drm64Dumb* d = d64_find64(handle);
+    if (!d) return -DRM64_EINVAL64;
+    const uint32_t pages = d64_free_slot64(handle);
     d64_begin();
     d64_puts("[DRM] destroy handle="); d64_num(handle);
     d64_puts(" pages="); d64_num(pages);
@@ -215,30 +256,37 @@ static uint64_t d64_map_uva64(uint32_t slot, Drm64Dumb* d) {
 }
 
 // 上屏的统一入口（GPU 2D 传输优先，否则 CPU 写 LFB）—— 定义在 vblank 段之后
-static int d64_present_backbuf64(int w, int h);
+static int d64_present_backbuf64(int x, int y, int w, int h);
 // ==================== 呈现（CPU 光栅化 + GPU 传输）====================
-// 返回 1 = 走了 virtio-gpu 2D（path=gpu）/ 0 = CPU 写 LFB（path=cpu）/ -1 = 没有可用的屏。
-static int d64_present_dumb64(Drm64Dumb* d) {
+// 把 dumb buffer 贴到 CRTC 的 (x,y)：返回 1 = 走了 virtio-gpu 2D（path=gpu）/
+// 0 = CPU 写 LFB（path=cpu）/ -1 = 没有可用的屏（或完全落在屏外）。
+// ★ v0.9.15：加了 (x,y) —— Linux 的 SETCRTC 有 x/y 两个字段（wlroots 虽传 0,0，但语义要真）。
+static int d64_present_at64(Drm64Dumb* d, uint32_t x, uint32_t y) {
     int bw = 0, bh = 0;
     uint32_t* bb = fb_surface64(&bw, &bh);
     if (!bb || bw <= 0 || bh <= 0) return -1;
+    if (x >= (uint32_t)bw || y >= (uint32_t)bh) return -1;
     uint32_t cw = d->w, ch = d->h;
-    if (cw > (uint32_t)bw) cw = (uint32_t)bw;
-    if (ch > (uint32_t)bh) ch = (uint32_t)bh;
+    if (cw > (uint32_t)bw - x) cw = (uint32_t)bw - x;
+    if (ch > (uint32_t)bh - y) ch = (uint32_t)bh - y;
     if (cw == 0u || ch == 0u) return -1;
     // ① CPU 侧：把 ring3 画好的 dumb buffer 逐行拷进内核后备缓冲（既有的绘制目标）
-    for (uint32_t y = 0; y < ch; y++) {
-        d64_copy64(d, (uint64_t)y * (uint64_t)d->stride, bb + (uint64_t)y * (uint64_t)bw, cw * 4u, 0);
+    for (uint32_t r = 0; r < ch; r++) {
+        d64_copy64(d, (uint64_t)r * (uint64_t)d->stride,
+                   bb + (uint64_t)(y + r) * (uint64_t)bw + x, cw * 4u, 0);
     }
-    const int dev = d64_present_backbuf64((int)cw, (int)ch);
+    const int dev = d64_present_backbuf64((int)x, (int)y, (int)cw, (int)ch);
     d64_begin();
     d64_puts("[DRM] present id="); d64_num(d->id);
     d64_puts(dev ? " path=gpu bytes=" : " path=cpu bytes=");
     d64_num((uint64_t)cw * 4ull * (uint64_t)ch);
     d64_puts(" seq="); d64_num(g_seq);
+    d64_puts(" x="); d64_num(x); d64_puts(" y="); d64_num(y);
     d64_end();
     return dev ? 1 : 0;
 }
+// (0,0) 那条老路径（page_flip / 自检共用）
+static int d64_present_dumb64(Drm64Dumb* d) { return d64_present_at64(d, 0u, 0u); }
 
 // ==================== vblank（硬件回扫优先，软兜底）====================
 // 返回 1 = 用了硬件回扫 / 0 = 软兜底。序列号（g_seq）在这里单调 +1。
@@ -261,11 +309,11 @@ static int d64_vblank_wait64(void) {
     d64_puts(" spin="); d64_num((uint64_t)spin); d64_puts(" seq="); d64_num(g_seq); d64_end();
     return hw;
 }
-// 把后备缓冲的 [0,0,w,h) 提交上屏：GPU 2D 传输优先，否则 CPU 写 LFB（page_flip 与自检还原共用）。
+// 把后备缓冲的 [x,y,w,h) 提交上屏：GPU 2D 传输优先，否则 CPU 写 LFB（page_flip 与自检还原共用）。
 // 返回 1 = 走了设备 / 0 = CPU。
-__attribute__((noinline)) static int d64_present_backbuf64(int w, int h) {
-    const int dev = vgpu64_blit64(0, 0, w, h);
-    if (!dev) fb_soft_flip_region64(0, 0, w, h);
+__attribute__((noinline)) static int d64_present_backbuf64(int x, int y, int w, int h) {
+    const int dev = vgpu64_blit64(x, y, w, h);
+    if (!dev) fb_soft_flip_region64(x, y, w, h);
     g_presents++;
     return dev;
 }
@@ -342,19 +390,29 @@ static int d64_ioctl_getcap64(uint64_t arg) {
     return 0;
 }
 
-// 当前可用的 fb id 列表（= 活着的 dumb handle；本内核 fb == dumb buffer）
+// 当前可用的 fb id 列表：先列 ADDFB/ADDFB2 建出来的 fb 对象；
+// 一个 fb 都没有时退回"活着的 dumb handle"（legacy 路径 —— v0.9.12 的行为，别破坏它）。
 static uint32_t d64_fb_list64(uint32_t* out, uint32_t cap) {
     uint32_t n = 0;
+    for (uint32_t i = 0; i < DRM64_MAX_FB64 && n < cap; i++) if (g_fb[i].used) out[n++] = g_fb[i].id;
+    if (n > 0u) return n;
     for (uint32_t i = 0; i < DRM64_MAX_DUMB64 && n < cap; i++) if (g_dumb[i].used) out[n++] = g_dumb[i].id;
     return n;
+}
+
+// fb id -> 底层 dumb（fb 对象优先，其次把 fb_id 当 dumb handle = legacy）
+static Drm64Dumb* d64_fb_resolve64(uint32_t fb_id, Drm64Fb** fb_out) {
+    Drm64Fb* f = d64_find_fb64(fb_id);
+    if (fb_out) *fb_out = f;
+    return d64_find64(f ? f->handle : fb_id);
 }
 
 static int d64_ioctl_getresources64(uint64_t arg) {
     if (!user64_range_ok64(arg, sizeof(Drm64ModeResources))) return -DRM64_EFAULT64;
     Drm64ModeResources r;
     d64_urd64(arg, &r, sizeof(Drm64ModeResources));
-    uint32_t fbs[DRM64_MAX_DUMB64];
-    const uint32_t nf = d64_fb_list64(fbs, DRM64_MAX_DUMB64);
+    uint32_t fbs[DRM64_MAX_FB64 + DRM64_MAX_DUMB64];
+    const uint32_t nf = d64_fb_list64(fbs, DRM64_MAX_FB64 + DRM64_MAX_DUMB64);
     // crtc / connector / encoder 都是 1 个（如实）
     const uint32_t ncr = DRM64_MAX_CRTC64, ncn = 1u, nen = 1u;
     if ((r.count_fbs && r.count_fbs < nf) || (r.count_crtcs && r.count_crtcs < ncr) ||
@@ -387,7 +445,8 @@ static int d64_ioctl_getcrtc64(uint64_t arg) {
     Drm64ModeCrtc c;
     d64_urd64(arg, &c, sizeof(Drm64ModeCrtc));
     c.crtc_id = DRM64_CRTC_ID64;
-    c.fb_id = g_handle_on_screen;
+    // 在屏的是谁：走过 ADDFB/ADDFB2 就是 fb id；legacy 直接翻 dumb 就是 dumb handle
+    c.fb_id = g_fb_on_screen ? g_fb_on_screen : g_handle_on_screen;
     c.x = 0; c.y = 0; c.gamma_size = 0; c.mode_valid = 1;
     c.mode = g_mode64;
     c.count_connectors = 1u;
@@ -475,7 +534,8 @@ static int d64_ioctl_page_flip64(uint64_t arg) {
         d64_num(f.crtc_id); d64_puts(" err="); d64_num(DRM64_EINVAL64); d64_end();
         return -DRM64_EINVAL64;
     }
-    Drm64Dumb* d = d64_find64(f.fb_id);
+    Drm64Fb* fb = nullptr;
+    Drm64Dumb* d = d64_fb_resolve64(f.fb_id, &fb);          // fb 对象优先，其次当 dumb handle
     if (!d) { d64_begin(); d64_puts("[DRM] page_flip FAILED reason=no-such-fb id="); d64_num(f.fb_id); d64_puts(" err="); d64_num(DRM64_EINVAL64); d64_end(); return -DRM64_EINVAL64; }
     const int path = d64_present_dumb64(d);
     if (path < 0) {
@@ -484,6 +544,7 @@ static int d64_ioctl_page_flip64(uint64_t arg) {
         return -DRM64_ENODEV64;
     }
     g_handle_on_screen = d->id;
+    g_fb_on_screen = fb ? fb->id : 0u;
     (void)d64_vblank_wait64();                                       // "翻转后等一次 vblank"（同步语义）
     d64_begin();
     d64_puts("[DRM] page_flip crtc="); d64_num(DRM64_CRTC_ID64);
@@ -527,6 +588,189 @@ static int d64_ioctl_crtc_seq64(uint64_t arg) {
     return 0;
 }
 
+// ==================== v0.9.15：fb 对象 / SETCRTC / plane ====================
+// 建 fb 成功返回 0 并把 fb id 写进 *out；失败返回负 errno（调用方负责打点）。
+static int d64_fb_new64(Drm64Dumb* d, uint32_t w, uint32_t h, uint32_t fmt, uint32_t* out) {
+    int slot = -1;
+    for (uint32_t i = 0; i < DRM64_MAX_FB64; i++) if (!g_fb[i].used) { slot = (int)i; break; }
+    if (slot < 0) return -DRM64_ENOMEM64;
+    Drm64Fb* f = &g_fb[slot];
+    for (uint32_t k = 0; k < sizeof(Drm64Fb); k++) ((uint8_t*)f)[k] = 0;
+    f->used = 1u;
+    f->id = DRM64_FB_ID_BASE64 + (uint32_t)slot;
+    f->handle = d->id; f->w = w; f->h = h; f->pitch = d->stride; f->format = fmt;
+    *out = f->id;
+    return 0;
+}
+
+__attribute__((noinline)) static int d64_fail64(const char* tag, const char* why, int err) {
+    d64_begin(); d64_puts(tag); d64_puts(" FAILED reason="); d64_puts(why);
+    d64_puts(" err="); d64_num((uint64_t)(err < 0 ? -err : err)); d64_end();
+    return err;
+}
+
+// ADDFB2（= drmModeAddFB2）：四个 plane 只支持 handles[0]（其余必须 0），modifier 必须 0。
+static int d64_ioctl_addfb2_64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeFbCmd2))) return -DRM64_EFAULT64;
+    Drm64ModeFbCmd2 f;
+    d64_urd64(arg, &f, sizeof(Drm64ModeFbCmd2));
+    if (f.flags != 0u) return d64_fail64("[DRM] addfb2", "flags", -DRM64_EINVAL64);
+    if (f.pixel_format != DRM64_FORMAT_XRGB8888 && f.pixel_format != DRM64_FORMAT_ARGB8888)
+        return d64_fail64("[DRM] addfb2", "format", -DRM64_EINVAL64);          // 例如 NV12 —— 如实拒绝
+    if (f.handles[1] || f.handles[2] || f.handles[3])
+        return d64_fail64("[DRM] addfb2", "multi-plane", -DRM64_EINVAL64);
+    if (f.offsets[0] != 0u) return d64_fail64("[DRM] addfb2", "offset", -DRM64_EINVAL64);
+    if (f.modifier[0] || f.modifier[1] || f.modifier[2] || f.modifier[3])
+        return d64_fail64("[DRM] addfb2", "modifier", -DRM64_EINVAL64);
+    Drm64Dumb* d = d64_find64(f.handles[0]);
+    if (!d) return d64_fail64("[DRM] addfb2", "handle", -DRM64_EINVAL64);
+    if (f.width == 0u || f.height == 0u || f.width > d->w || f.height > d->h)
+        return d64_fail64("[DRM] addfb2", "size", -DRM64_EINVAL64);
+    if (f.pitches[0] != d->stride) return d64_fail64("[DRM] addfb2", "pitch", -DRM64_EINVAL64);
+    const int rc = d64_fb_new64(d, f.width, f.height, f.pixel_format, &f.fb_id);
+    if (rc != 0) return d64_fail64("[DRM] addfb2", "no-free-slot", rc);
+    d64_uwr64(arg, &f, sizeof(Drm64ModeFbCmd2));
+    d64_begin(); d64_puts("[DRM] addfb2 fb="); d64_num(f.fb_id);
+    d64_puts(" handle="); d64_num(f.handles[0]);
+    d64_puts(" w="); d64_num(f.width); d64_puts(" h="); d64_num(f.height);
+    d64_puts(" pitch="); d64_num(f.pitches[0]);
+    d64_puts(f.pixel_format == DRM64_FORMAT_ARGB8888 ? " fmt=argb8888" : " fmt=xrgb8888");
+    d64_end();
+    return 0;
+}
+
+// ADDFB（legacy，= drmModeAddFB）：bpp 只支持 32、depth 只支持 24/32。
+static int d64_ioctl_addfb_64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeFbCmd))) return -DRM64_EFAULT64;
+    Drm64ModeFbCmd f;
+    d64_urd64(arg, &f, sizeof(Drm64ModeFbCmd));
+    if (f.bpp != 32u || (f.depth != 24u && f.depth != 32u))
+        return d64_fail64("[DRM] addfb", "bpp/depth", -DRM64_EINVAL64);
+    Drm64Dumb* d = d64_find64(f.handle);
+    if (!d) return d64_fail64("[DRM] addfb", "handle", -DRM64_EINVAL64);
+    if (f.width == 0u || f.height == 0u || f.width > d->w || f.height > d->h)
+        return d64_fail64("[DRM] addfb", "size", -DRM64_EINVAL64);
+    if (f.pitch != d->stride) return d64_fail64("[DRM] addfb", "pitch", -DRM64_EINVAL64);
+    uint32_t newid = 0;                                             // 别取 packed 成员的地址
+    const int rc = d64_fb_new64(d, f.width, f.height, DRM64_FORMAT_XRGB8888, &newid);
+    if (rc != 0) return d64_fail64("[DRM] addfb", "no-free-slot", rc);
+    f.fb_id = newid;
+    d64_uwr64(arg, &f, sizeof(Drm64ModeFbCmd));
+    d64_begin(); d64_puts("[DRM] addfb fb="); d64_num(f.fb_id);
+    d64_puts(" handle="); d64_num(f.handle);
+    d64_puts(" w="); d64_num(f.width); d64_puts(" h="); d64_num(f.height);
+    d64_puts(" pitch="); d64_num(f.pitch); d64_puts(" bpp="); d64_num(f.bpp);
+    d64_end();
+    return 0;
+}
+
+// 关屏（SETCRTC 的 fb_id = 0）：把后备缓冲整屏填黑再提交一次 —— 不假装"关了"其实还亮着。
+__attribute__((noinline)) static int d64_blank64(void) {
+    int bw = 0, bh = 0;
+    uint32_t* bb = fb_surface64(&bw, &bh);
+    if (!bb || bw <= 0 || bh <= 0) return -1;
+    for (int y = 0; y < bh; y++) {
+        uint32_t* row = bb + (uint64_t)y * (uint64_t)bw;
+        for (int x = 0; x < bw; x++) row[x] = 0u;
+    }
+    (void)d64_present_backbuf64(0, 0, bw, bh);
+    return 0;
+}
+
+// SETCRTC（= drmModeSetCrtc）：fb_id = 0 关屏；mode_valid = 1 时校验模式（只有一种，换分辨率 -EINVAL）。
+static int d64_ioctl_setcrtc64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeCrtc))) return -DRM64_EFAULT64;
+    Drm64ModeCrtc c;
+    d64_urd64(arg, &c, sizeof(Drm64ModeCrtc));
+    if (c.crtc_id != 0u && c.crtc_id != DRM64_CRTC_ID64)
+        return d64_fail64("[DRM] setcrtc", "crtc", -DRM64_EINVAL64);
+    if (c.fb_id == 0u) {
+        if (d64_blank64() != 0) return d64_fail64("[DRM] setcrtc", "no-framebuffer", -DRM64_ENODEV64);
+        g_handle_on_screen = 0; g_fb_on_screen = 0;
+        d64_begin(); d64_puts("[DRM] setcrtc off crtc="); d64_num(DRM64_CRTC_ID64); d64_end();
+        return 0;
+    }
+    Drm64Fb* fb = nullptr;
+    Drm64Dumb* d = d64_fb_resolve64(c.fb_id, &fb);
+    if (!d || (fb && (fb->w > d->w || fb->h > d->h)))
+        return d64_fail64("[DRM] setcrtc", "no-such-fb", -DRM64_EINVAL64);
+    if (c.mode_valid) {
+        // 本内核只有 1 块屏 1 个模式：要求换分辨率就如实拒绝（不假装 modeset 成功）
+        if (c.mode.hdisplay != g_mode64.hdisplay || c.mode.vdisplay != g_mode64.vdisplay)
+            return d64_fail64("[DRM] setcrtc", "mode-unsupported", -DRM64_EINVAL64);
+    }
+    const int path = d64_present_at64(d, c.x, c.y);
+    if (path < 0) return d64_fail64("[DRM] setcrtc", "no-framebuffer", -DRM64_ENODEV64);
+    g_handle_on_screen = d->id;
+    g_fb_on_screen = fb ? fb->id : 0u;
+    d64_begin(); d64_puts("[DRM] setcrtc crtc="); d64_num(DRM64_CRTC_ID64);
+    d64_puts(" fb="); d64_num(c.fb_id);
+    d64_puts(" x="); d64_num(c.x); d64_puts(" y="); d64_num(c.y);
+    d64_puts(c.mode_valid ? " mode=ok" : " mode=n/a");
+    d64_puts(path ? " path=gpu" : " path=cpu");
+    d64_end();
+    return 0;
+}
+
+// GETPLANERESOURCES：本内核恒 2 个 plane（primary 1 / cursor 2）。
+static int d64_ioctl_getplaneres64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeGetPlaneRes))) return -DRM64_EFAULT64;
+    Drm64ModeGetPlaneRes r;
+    d64_urd64(arg, &r, sizeof(Drm64ModeGetPlaneRes));
+    if (r.plane_id_ptr && r.count_planes >= 1u) {
+        if (!user64_range_ok64(r.plane_id_ptr, 8u)) return -DRM64_EFAULT64;
+        d64_uwr32(r.plane_id_ptr, DRM64_PLANE_PRIMARY_ID64);
+        if (r.count_planes >= 2u) d64_uwr32(r.plane_id_ptr + 4ull, DRM64_PLANE_CURSOR_ID64);
+    }
+    r.count_planes = 2u;
+    d64_uwr64(arg, &r, sizeof(Drm64ModeGetPlaneRes));
+    return 0;
+}
+
+// GETPLANE：plane 1 = primary（真的在扫出），plane 2 = cursor（只报告，本内核不改光标硬件）。
+static int d64_ioctl_getplane64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeGetPlane))) return -DRM64_EFAULT64;
+    Drm64ModeGetPlane p;
+    d64_urd64(arg, &p, sizeof(Drm64ModeGetPlane));
+    if (p.plane_id != DRM64_PLANE_PRIMARY_ID64 && p.plane_id != DRM64_PLANE_CURSOR_ID64)
+        return d64_fail64("[DRM] getplane", "no-such-plane", -DRM64_EINVAL64);
+    const uint32_t fmt[2] = { DRM64_FORMAT_XRGB8888, DRM64_FORMAT_ARGB8888 };
+    if (p.format_type_ptr && p.count_format_types >= 1u) {
+        if (!user64_range_ok64(p.format_type_ptr, 8u)) return -DRM64_EFAULT64;
+        d64_uwr32(p.format_type_ptr, fmt[0]);
+        if (p.count_format_types >= 2u) d64_uwr32(p.format_type_ptr + 4ull, fmt[1]);
+    }
+    const uint32_t on_screen = g_fb_on_screen ? g_fb_on_screen : g_handle_on_screen;
+    p.crtc_id = DRM64_CRTC_ID64;
+    p.fb_id = (p.plane_id == DRM64_PLANE_PRIMARY_ID64) ? on_screen : 0u;
+    p.possible_crtcs = 1u;
+    p.gamma_size = 0u;
+    p.count_format_types = 2u;
+    d64_uwr64(arg, &p, sizeof(Drm64ModeGetPlane));
+    d64_begin(); d64_puts("[DRM] plane id="); d64_num(p.plane_id);
+    d64_puts(" crtc="); d64_num(p.crtc_id); d64_puts(" fb="); d64_num(p.fb_id);
+    d64_puts(" formats="); d64_num(p.count_format_types); d64_end();
+    return 0;
+}
+
+// 进程回收 hook（proc64 以弱符号调用；安装介质内核没有本 TU -> nullptr 跳过）。
+// 原来：进程异常退出且没 DESTROY_DUMB，那块页会永久占着（有界但会耗光 4 个槽）。
+extern "C" void drm64_proc_release64(int pid) {
+    if (pid <= 0) return;
+    uint32_t fbs = 0, pages = 0;
+    for (uint32_t i = 0; i < DRM64_MAX_DUMB64; i++) {
+        Drm64Dumb* d = &g_dumb[i];
+        if (!d->used || d->owner != (uint32_t)pid) continue;
+        const uint32_t id = d->id;
+        pages += d64_free_slot64(id);
+        fbs++;
+    }
+    if (fbs == 0u) return;
+    d64_begin(); d64_puts("[DRM] release pid="); d64_num((uint64_t)pid);
+    d64_puts(" fbs="); d64_num(fbs); d64_puts(" pages="); d64_num(pages);
+    d64_puts(" free_pages="); d64_num(page_count_free_64()); d64_end();
+}
+
 int drm64_ioctl64(uint64_t cmd, uint64_t arg, uint64_t pid) {
     switch (cmd) {
     case DRM64_IOWR(DRM64_NR_VERSION, Drm64Version):               return d64_ioctl_version64(arg);
@@ -542,6 +786,11 @@ int drm64_ioctl64(uint64_t cmd, uint64_t arg, uint64_t pid) {
         d64_urd64(arg, &x, sizeof(Drm64ModeDestroyDumb));
         return d64_destroy64(x.handle);
     }
+    case DRM64_IOWR(DRM64_NR_MODE_SETCRTC, Drm64ModeCrtc):        return d64_ioctl_setcrtc64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_ADDFB, Drm64ModeFbCmd):          return d64_ioctl_addfb_64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_ADDFB2, Drm64ModeFbCmd2):        return d64_ioctl_addfb2_64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_GETPLANERES, Drm64ModeGetPlaneRes): return d64_ioctl_getplaneres64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_GETPLANE, Drm64ModeGetPlane):    return d64_ioctl_getplane64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_PAGE_FLIP, Drm64ModePageFlip):   return d64_ioctl_page_flip64(arg);
     case DRM64_IOWR(DRM64_NR_WAIT_VBLANK, Drm64WaitVblank):        return d64_ioctl_wait_vblank64(arg);
     case DRM64_IOWR(DRM64_NR_CRTC_GET_SEQUENCE, Drm64CrtcSeq):     return d64_ioctl_crtc_seq64(arg);
@@ -710,6 +959,9 @@ void drm64_init64(void) {
         for (uint32_t k = 0; k < sizeof(Drm64Dumb); k++) ((uint8_t*)&g_dumb[i])[k] = 0;
     }
     g_handle_on_screen = 0;
+    g_fb_on_screen = 0;
+    for (uint32_t i = 0; i < DRM64_MAX_FB64; i++)
+        for (uint32_t k = 0; k < sizeof(Drm64Fb); k++) ((uint8_t*)&g_fb[i])[k] = 0;
     g_seq = 0;
     g_presents = 0;
     g_ev_pending_n = 0;
@@ -818,7 +1070,7 @@ int drm64_selftest64(void) {
         if (bb) {
             for (uint32_t y = 0; y < h; y++) d64_rows64(bb + (uint64_t)y * (uint64_t)bw,
                                                         g_snapbuf + (uint64_t)y * w, w);
-            (void)d64_present_backbuf64((int)w, (int)h);
+            (void)d64_present_backbuf64(0, 0, (int)w, (int)h);
         }
         g_handle_on_screen = 0;
     }
@@ -861,12 +1113,23 @@ int drm64_demo64(const char* path) {
     }
     d64_begin(); d64_puts("[DRMDEMO] start pid="); d64_num((uint64_t)pid);
     d64_puts(" path="); d64_puts(p); d64_puts(" pool_free="); d64_num(page_count_free_64()); d64_end();
-    // 有界等待（60 s）：演示最多等一次 vblank + 一次输入事件，正常情况下 1~2 s 结束
+    // 有界等待（60 s）：演示最多等一次 vblank + 一次输入事件，正常情况下 1~2 s 结束。
+    // ★ v0.9.15 修的真缺陷：原来用 proc64_find64(pid) 轮询 —— **僵尸进程也算"存在"**
+    //   （EXITED 之后还要等父进程 wait4 才消失），于是每一轮都白等满 60 s（实测 ticks=15005），
+    //   而且 alive=1 的结论是错的。改成 WNOHANG 轮询 proc64_wait4()：既能看到"已退出"，也顺手收尸。
     const uint64_t t0 = g_ticks64;
-    while (proc64_find64(pid) && (g_ticks64 - t0) < (uint64_t)PIT_HZ_64 * 60ull) task_sleep64(2);
-    const int alive = proc64_find64(pid) ? 1 : 0;
-    if (alive) (void)proc64_kill64(pid, 9);
-    if (proc64_find64(pid)) proc64_destroy64(pid);
+    int wst = 0;
+    int64_t wp = 0;
+    while ((g_ticks64 - t0) < (uint64_t)PIT_HZ_64 * 60ull) {
+        wp = proc64_wait4(pid, &wst, 1u);                 // 1 = WNOHANG（0 = 还在跑）
+        if (wp != 0) break;                              // = pid：已收尸；< 0：没有这个子进程
+        task_sleep64(2);
+    }
+    const int alive = (wp == (int64_t)pid) ? 0 : 1;      // 到点还没收 = 真还活着
+    if (alive) {
+        (void)proc64_kill64(pid, 9);
+        if (proc64_find64(pid)) proc64_destroy64(pid);
+    }
     d64_begin(); d64_puts("[DRMDEMO] done pid="); d64_num((uint64_t)pid);
     d64_puts(" alive="); d64_num((uint64_t)alive);
     d64_puts(" ticks="); d64_num(g_ticks64 - t0);

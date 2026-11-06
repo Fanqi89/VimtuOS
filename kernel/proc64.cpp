@@ -135,6 +135,9 @@ extern "C" FdTable64* proc64_fdtab_of_current64();
 //   与 ev64_proc_release64 同一条纪律。为什么不在 proc64.h 里声明：头文件被多个 TU 包含，
 //   弱属性一旦与 wl64.h 的强声明在同一个 TU 里重复，编译期会为属性不一致告警（本文件要求零告警）。
 extern "C" void wl64_proc_release64(int pid) __attribute__((weak));
+// ★ v0.9.15：DRM 的 dumb buffer 回收（同一套弱引用纪律：安装介质内核不链 drm64.cpp）。
+//   不加这个 hook 的话，进程异常退出且没 DESTROY_DUMB，那块页会永久占着（4 槽 × <=8 MiB）。
+extern "C" void drm64_proc_release64(int pid) __attribute__((weak));
 // 引导期状态（proc64_init64 探测一次）
 static uint64_t g_boot_cr364   = 0;      // 内核地址空间（引导期页表根）
 static void p64_publish_cred64(Proc64* p);           // ★ P4：凭证发布（定义在 create 之后）
@@ -1027,6 +1030,7 @@ void proc64_destroy64(int pid) {
     ev64_proc_release64((int)p->pid);
     // ★ A5：Wayland 组合器的 surface/引用回收（弱引用：没有这个模块时按 nullptr 跳过）
     if (wl64_proc_release64) wl64_proc_release64((int)p->pid);
+    if (drm64_proc_release64) drm64_proc_release64((int)p->pid);
     if (p->pdpt_phys || p->pml4_phys) {
         p64_release_area64(p);
         if (p->pdpt_phys) page_free_64((void*)(uintptr_t)p->pdpt_phys);
@@ -1074,6 +1078,7 @@ static void p64_exit64(Proc64* p, uint32_t code, uint32_t sig) {
     ev64_proc_release64((int)p->pid);
     // ★ A5：Wayland 组合器的 surface/引用回收（与上面同一条：弱引用 + 判空）
     if (wl64_proc_release64) wl64_proc_release64((int)p->pid);
+    if (drm64_proc_release64) drm64_proc_release64((int)p->pid);
     ev64_reset64(&p->evq);
     p->cr3       = 0;
     p->exit_code = code & 0xFFu;

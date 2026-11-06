@@ -2284,6 +2284,62 @@ def cap_make_tar():
     return ("DONE" if (mk and tr) else "MISSING"), ev
 
 
+def cap_drm_kms():
+    """★ v0.9.15：DRM/KMS 内核门面 + evdev 设备面（Wayland 的内核态基础抽象层）"""
+    ev = []
+    src, hdr = "kernel/drm64.cpp", "kernel/drm64.h"
+    usrc, uhdr = "user/lib/drm64.c", "user/lib/drm64.h"
+    fake = "user/lib/libdrm_compat.h"
+    ok = (exists(src) and exists(hdr) and exists(usrc) and exists(uhdr) and exists(fake)
+          and exists("tests/drm64_test.py") and exists("user/apps/drmdemo.c"))
+    ev.append("实现：%s（%d 行）+ %s（%d 行）；用户侧 %s / %s；build64.sh 只把它编进系统内核"
+              "（`kernel/drm64.cpp` 命中 %d）"
+              % (src, lines(src), hdr, lines(hdr), usrc, uhdr,
+                 grep_count(r"kernel/drm64\.cpp", ["build64.sh"])))
+    ev.append("设备面：`/dev/dri/card0` + `/dev/input/event0|1` 是**设备特判**（不查盘、不建文件，与 "
+              "`/dev/console` 同一套做法，命中 %d）；`ioctl(16)` 在 tty 分支**之后**按 fd 类型分派 —— "
+              "既有 ABI 号（wl64 15–21/22–26、fb 9/10/11、pci 48）一个都没动"
+              % grep_count(r"FD64_DRM_PATH|FD64_EVDEV0_PATH|FD64_EVDEV1_PATH", ["kernel/fd64.h"]))
+    ev.append("**16 个 ioctl 号与 Linux `include/uapi/drm/drm.h` 逐值相等**：VERSION `0xC0406400` / "
+              "GET_CAP `0xC010640C` / GETRESOURCES `0xC04064A0` / GETCRTC `0xC06864A1` / SETCRTC `0xC06864A2` / "
+              "GETCONNECTOR `0xC05064A7` / ADDFB `0xC01C64AD` / ADDFB2 `0xC06864AE` / PAGE_FLIP `0xC01864B0` / "
+              "CREATE_DUMB `0xC02064B2` / MAP_DUMB `0xC01064B3` / DESTROY_DUMB `0xC00464B4` / GETPLANE `0xC02064B5` / "
+              "GETPLANERES `0xC01064B6` / WAIT_VBLANK `0xC018643A` / CRTC_GET_SEQUENCE `0xC018643B`；"
+              "对应 struct 的 sizeof 也逐字节相同（64/16/64/104/104/80/28/104/24/32/16/4/32/16/24/24）。"
+              "**判据不是硬编码表**：tests/drm64_test.py 的 ①b 用两份头文件里的 sizeof 断言反算 ioctl 号 —— "
+              "改 sizeof 就等于改号，漂一个就红（另有反例控制：故意写回 VERSION=56 会报 3 条）")
+    ev.append("dumb buffer 怎么让 ring3 **真能写**：`CREATE_DUMB` 用 `page_alloc_64()` 逐页分配（不要求物理连续），"
+              "`MAP_DUMB` 把**同一批物理页**挂进调用方页表（`user64_map_phys_page64`，窗口 = `USER64_FB_VA64` 后半段 "
+              "4 槽 × 8 MiB，在 PDPT[5]，**进程回收只走 PDPT[4]** 所以不会被当成进程自己的页还回池）；"
+              "`MAP_DUMB.offset` 返回那块用户 VA（Linux 那边是 mmap 偏移 —— 语义差异如实写在头文件里）")
+    ev.append("**混合呈现（CPU 光栅化 + GPU 传输）**：ring3 直接写 dumb buffer；内核 page_flip/setcrtc 只做"
+              "传输与扫描输出 —— 先逐行拷进既有后备缓冲，再 `vgpu64_blit64()`（virtio-gpu 2D：TRANSFER_TO_HOST_2D "
+              "+ RESOURCE_FLUSH）→ `path=gpu`；返回 0 就 `fb_soft_flip_region64()` 写 LFB → `path=cpu`。"
+              "本层**不碰任何厂商 GPU 寄存器**")
+    ev.append("**fb 对象面（v0.9.15）**：`ADDFB` / `ADDFB2` 建 fb（fb id 从 0x100 起，与 1..4 的 dumb handle "
+              "是两套号）+ `SETCRTC`（fb_id=0 = 真清屏；换分辨率如实 -EINVAL）+ `GETPLANERESOURCES`/`GETPLANE`"
+              "（primary 1 / cursor 2，format 表 = XRGB8888/ARGB8888）；dumb 被销毁时引用它的 fb **一起消失**"
+              "（否则 fb id 会指向已还给池的物理页）")
+    ev.append("**进程回收 hook（v0.9.15）**：`proc64` 的 exit/destroy 两处按弱符号调 "
+              "`drm64_proc_release64(pid)`，把该 pid 名下没 DESTROY 的 dumb 全部收走 —— 原来进程异常退出会"
+              "永久占页（4 槽 × <=8 MiB）；弱引用保证安装介质内核（不链 drm64.cpp）判空跳过")
+    ev.append("实测串口原文（tests/drm64_test.py）：\"[DRM] selftest dumb=ok flip=ok vblank=… mode=hw|soft ok=1\"、"
+              "\"[DRM] verify bars=8 ok=1\"、\"[DRM] present id=… path=gpu|cpu bytes=… seq=… x=0 y=0\"、"
+              "\"[DRM] addfb2 fb=256 handle=1 w=… h=… pitch=… fmt=xrgb8888\"、"
+              "\"[DRM] setcrtc crtc=1 fb=256 x=0 y=0 mode=ok path=cpu\"、\"[DRM] plane id=1 crtc=1 fb=256 formats=2\"、"
+              "\"[DRM] release pid=… fbs=1 pages=4 free_pages=…\"、"
+              "\"[DRMDEMO] version major=1 minor=0 patch=0 name=vimtu-drm\"、\"[DRMDEMO] paint … probe=0xffffffff\"、"
+              "\"[DRMDEMO] addfb2 badfmt rc=-22\"（反例）、\"[DRMDEMO] badcmd rc=-25\"（未知 ioctl）")
+    ev.append("验收脚本 tests/drm64_test.py：%s（**45 条断言**：两份头文件逐值 + 16 个号与 Linux 逐个相等 + 内核自检 "
+              "+ 混合呈现 + ring3 真能写 + fb 对象/SETCRTC/plane + 回收 hook 顺序 + 桌面照旧 + 禁止项）"
+              % ("有" if exists("tests/drm64_test.py") else "★ 缺"))
+    ev.append("边界（如实）：**没有** dma-buf/fence 跨进程传递、**没有** atomic commit（`MODE_ATOMIC`）、"
+              "**没有** GBM + EGL/GLES（要 Mesa）、**没有** gamma/EDID/多 CRTC、"
+              "`MAP_DUMB` 返回用户 VA 而不是 mmap 偏移（语义差异）、光标 plane 只报告不接管硬件、"
+              "vblank 在无回扫硬件时是**软兜底**（如实打 `mode=soft`）")
+    return ("DONE" if ok else "MISSING"), ev
+
+
 def cap_wayland_skeleton():
     """★ 批次 A5：Wayland 基础骨架（wl_surface_create/attach/commit/damage/destroy + wl_seat + 最小合成器）"""
     ev = []
@@ -3330,6 +3386,10 @@ CAPS = [
              "6*7=42；tar 与宿主 Python tarfile 双向互操作", cap_make_tar),
     ("应用层", "★ A5 Wayland 基础骨架：wl_surface_create/attach/commit/damage/destroy + wl_seat + "
              "wl_display_dispatch + 最小合成器（未提交不上屏 / 多 surface z 序 / damage 局部提交）", cap_wayland_skeleton),
+    ("应用层", "★ DRM/KMS 内核门面 + evdev 设备面：16 个 ioctl 号与 Linux `drm.h` 逐值相等（VERSION 0xC0406400 … "
+             "GETPLANERES 0xC01064B6）+ ring3 可写 dumb buffer（MAP_DUMB 挂同一批物理页）+ 混合呈现 "
+             "（path=gpu 走 virtio-gpu 2D / path=cpu 写 LFB）+ ADDFB/ADDFB2/SETCRTC/GETPLANE + 进程回收 hook",
+     cap_drm_kms),
     ("驱动", "★ 驱动线 3 virtio-gpu（2D）：PCI 0x1AF4:0x1050 + 2D 命令集 + 响应 0x1101 + 整行宽传输语义 + "
              "后端切换 [FB64] backend=… + 整屏 982->116 µs（8.5x）/512² 247->18 µs（13.7x）", cap_virtio_gpu),
     ("应用", "★ B-wm Ring 3 合成器：用户态 /bin/wm（fb_map 拿后备缓冲 + 用户态 blit/遮挡/alpha + 只重画 damage + "
@@ -3495,6 +3555,8 @@ TESTS = [
                        "编出静态 ELF 并跑通 6*7=42；`sh -c` 语义子集（43 条断言）"),
     ("tar64_test.py", "★ B5 Ring 3 里的用户态 tar：产物被宿主 Python tarfile 逐成员读出 + 解宿主的 USTAR 包（含子目录）"
                       "+ -tf 列表（32 条断言）"),
+    ("drm64_test.py", "★ DRM/KMS 内核门面 + evdev：16 个 ioctl 号与 Linux drm.h 逐值相等 + ring3 可写 dumb buffer "
+                       "+ 混合呈现 path=gpu|cpu + ADDFB2/SETCRTC/GETPLANE + 进程回收 hook + 桌面照旧（45 条断言）"),
     ("wl64_test.py", "★ A5 Wayland 基础骨架：surface create/attach/commit/damage/destroy + wl_seat + wl_display_dispatch；"
                      "最小合成器（未提交不上屏 / 多 surface z 序 / damage 局部提交 / 退出兜底回收）（91 条断言）"),
     ("virtiogpu64_test.py", "★ 驱动线 3 virtio-gpu 2D：PCI/capability/VERSION_1/2D 命令集/响应 0x1101 + 设备与软件路径"

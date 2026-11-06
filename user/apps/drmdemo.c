@@ -191,6 +191,76 @@ int main(int argc, char** argv, char** envp) {
         printf("[DRMDEMO] flip_vblank#%d seq=%llu rc=%d\n", f + 2, (unsigned long long)wv2.sequence, (int)rc);
     }
 
+    /* ---- ⑨-c ★ v0.9.15：plane 枚举（wlroots 的非 atomic 路径先走这两步）---- */
+    {
+        uint32_t planes[2];
+        struct Drm64ModeGetPlaneRes pr;
+        for (unsigned i = 0; i < sizeof(pr); i++) ((char*)&pr)[i] = 0;
+        pr.plane_id_ptr = (uint64_t)(uintptr_t)planes;
+        pr.count_planes = 2;
+        long prc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_GETPLANERES, struct Drm64ModeGetPlaneRes), &pr);
+        printf("[DRMDEMO] plane_res n=%u ids=%u,%u rc=%d\n", (unsigned)pr.count_planes,
+               (unsigned)planes[0], (unsigned)(pr.count_planes > 1u ? planes[1] : 0u), (int)prc);
+
+        struct Drm64ModeGetPlane pl;
+        uint32_t fmts[2];
+        for (unsigned i = 0; i < sizeof(pl); i++) ((char*)&pl)[i] = 0;
+        fmts[0] = 0; fmts[1] = 0;
+        pl.plane_id = planes[0];
+        pl.format_type_ptr = (uint64_t)(uintptr_t)fmts;
+        pl.count_format_types = 2;
+        long plc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_GETPLANE, struct Drm64ModeGetPlane), &pl);
+        printf("[DRMDEMO] plane id=%u crtc=%u fb=%u formats=%u fmt0=0x%x rc=%d\n",
+               (unsigned)pl.plane_id, (unsigned)pl.crtc_id, (unsigned)pl.fb_id,
+               (unsigned)pl.count_format_types, (unsigned)fmts[0], (int)plc);
+    }
+
+    /* ---- ⑨-d ★ v0.9.15：ADDFB2 建 fb 对象 -> SETCRTC 用 fb id 上屏（libdrm 的正路）---- */
+    {
+        struct Drm64ModeFbCmd2 fb2;
+        for (unsigned i = 0; i < sizeof(fb2); i++) ((char*)&fb2)[i] = 0;
+        fb2.width = dw; fb2.height = dh;
+        fb2.pixel_format = DRM64_FORMAT_XRGB8888;
+        fb2.handles[0] = cd.handle;
+        fb2.pitches[0] = cd.pitch;
+        long arc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_ADDFB2, struct Drm64ModeFbCmd2), &fb2);
+        printf("[DRMDEMO] addfb2 fb=%u handle=%u rc=%d\n",
+               (unsigned)fb2.fb_id, (unsigned)fb2.handles[0], (int)arc);
+
+        /* 反例：NV12（0x3231564E）本内核不支持 -> 必须 -EINVAL(-22)，不假装成功 */
+        struct Drm64ModeFbCmd2 bad;
+        for (unsigned i = 0; i < sizeof(bad); i++) ((char*)&bad)[i] = 0;
+        bad.width = dw; bad.height = dh;
+        bad.pixel_format = 0x3231564Eu;
+        bad.handles[0] = cd.handle;
+        bad.pitches[0] = cd.pitch;
+        long brc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_ADDFB2, struct Drm64ModeFbCmd2), &bad);
+        printf("[DRMDEMO] addfb2 badfmt rc=%d\n", (int)brc);
+
+        if (arc == 0) {
+            struct Drm64ModeCrtc sc;
+            for (unsigned i = 0; i < sizeof(sc); i++) ((char*)&sc)[i] = 0;
+            sc.crtc_id = DRM64_CRTC_ID64;
+            sc.fb_id = fb2.fb_id;
+            sc.mode_valid = 1;
+            sc.mode = mode;                  /* 用 getconnector 拿到的那唯一一个模式 */
+            long src = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_SETCRTC, struct Drm64ModeCrtc), &sc);
+            printf("[DRMDEMO] setcrtc crtc=1 fb=%u rc=%d\n", (unsigned)sc.fb_id, (int)src);
+        }
+    }
+
+    /* ---- ⑨-e ★ v0.9.15：**故意不销毁**的一块 dumb（64x64，占 4 页）----
+     *   它不 DESTROY_DUMB 就退出，靠内核的进程回收 hook 收走 ——
+     *   串口应出现 [DRM] release pid=<本进程> fbs=1 pages=4，页池水位回原位。 ---- */
+    {
+        struct Drm64ModeCreateDumb leak;
+        leak.height = 64; leak.width = 64; leak.bpp = 32; leak.flags = 0;
+        leak.handle = 0; leak.pitch = 0; leak.size = 0;
+        long lrc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_CREATE_DUMB, struct Drm64ModeCreateDumb), &leak);
+        printf("[DRMDEMO] leak_dumb handle=%u pages_hint=%lu rc=%d\n",
+               (unsigned)leak.handle, (unsigned long)(leak.size / 4096u), (int)lrc);
+    }
+
     /* ---- ⑩ 反例：未知 ioctl 必须 -ENOTTY(-25)（不假装成功）---- */
     rc = drm64_ioctl(fd, 0xDEADBEEFul, &cd);
     printf("[DRMDEMO] badcmd rc=%d\n", (int)rc);

@@ -62,6 +62,14 @@
 //   [DRM] present FAILED id=<n> reason=<reason> err=<n>
 //   [DRM] wait_vblank seq=<n> mode=<hw|soft> ticks=<n>
 //   [DRM] crtc_seq active=<0|1> seq=<n>                    （v0.9.14 新增）
+//   [DRM] addfb2 fb=<n> handle=<n> w=<n> h=<n> pitch=<n> fmt=<xrgb8888|argb8888>
+//   [DRM] addfb  fb=<n> handle=<n> w=<n> h=<n> pitch=<n> bpp=<n>      （legacy ADDFB）
+//   [DRM] addfb2 FAILED reason=<reason> err=<n>
+//   [DRM] setcrtc crtc=<n> fb=<n> x=<n> y=<n> mode=<ok|n/a> path=<gpu|cpu>
+//   [DRM] setcrtc off crtc=<n>                              （fb_id = 0：清屏）
+//   [DRM] setcrtc FAILED reason=<reason> err=<n>
+//   [DRM] plane id=<n> crtc=<n> fb=<n> formats=<n>
+//   [DRM] release pid=<n> fbs=<n> pages=<n> free_pages=<n>  （进程回收 hook 收走的 dumb）
 //   [DRM] verify bars=<n> ok=<0|1>                        （自检：buffer 内容 = 写进去的图案）
 //   [DRM] selftest dumb=ok flip=ok vblank=<n> mode=<hw|soft> ok=1
 //   [DRM] selftest FAIL reason=<reason> ok=0
@@ -99,8 +107,13 @@
 #define DRM64_NR_CRTC_GET_SEQUENCE 0x3bu
 #define DRM64_NR_MODE_GETRESOURCES 0xA0u
 #define DRM64_NR_MODE_GETCRTC      0xA1u
+#define DRM64_NR_MODE_SETCRTC      0xA2u
 #define DRM64_NR_MODE_GETCONNECTOR 0xA7u
+#define DRM64_NR_MODE_ADDFB        0xADu
+#define DRM64_NR_MODE_ADDFB2       0xAEu
 #define DRM64_NR_MODE_PAGE_FLIP    0xB0u
+#define DRM64_NR_MODE_GETPLANE     0xB5u
+#define DRM64_NR_MODE_GETPLANERES  0xB6u
 #define DRM64_NR_MODE_CREATE_DUMB  0xB2u
 #define DRM64_NR_MODE_MAP_DUMB     0xB3u
 #define DRM64_NR_MODE_DESTROY_DUMB 0xB4u
@@ -122,6 +135,15 @@
 #define DRM64_CRTC_ID64        1u
 #define DRM64_CONNECTOR_ID64   1u
 #define DRM64_ENCODER_ID64     1u
+// ★ v0.9.15：fb 对象（ADDFB/ADDFB2）与 plane。fb id 与 dumb handle **不是同一套号**
+//   （Linux 也是这样）：fb id 从 0x100 起，dumb handle 是 1..4 —— 两者不会撞。
+#define DRM64_MAX_FB64         8u
+#define DRM64_FB_ID_BASE64     0x100u
+#define DRM64_PLANE_PRIMARY_ID64 1u          // primary plane（真的能上屏）
+#define DRM64_PLANE_CURSOR_ID64  2u          // cursor plane（只报告，不改）
+// 只支持这两个 fourcc（= Linux DRM_FORMAT_XRGB8888 / DRM_FORMAT_ARGB8888），其余如实 -EINVAL
+#define DRM64_FORMAT_XRGB8888  0x34325258u
+#define DRM64_FORMAT_ARGB8888  0x34325241u
 // 用户映射窗（见文件头）：A1 的 FB 区后半段，4 槽 × 8 MiB
 #define DRM64_UVA_BASE_OFFSET64 (8ull * 1024ull * 1024ull)  // USER64_FB_VA64 + 8 MiB
 #define DRM64_UVA_SLOT_BYTES64  (8ull * 1024ull * 1024ull)
@@ -291,6 +313,53 @@ struct __attribute__((packed)) Drm64CrtcSeq {
 };                         // = 24 B（= Linux drm_crtc_get_sequence）
 static_assert(sizeof(Drm64CrtcSeq) == 24, "Drm64CrtcSeq 必须是 24 B（= Linux drm_crtc_get_sequence）");
 
+// ⑫ ADDFB2（= Linux struct drm_mode_fb_cmd2，**104 B**：注意 +68 的 modifier[4] 要对齐到 8，
+//   所以这个结构**不能 packed** —— packed 会给出 100 B，ioctl 号就错成 0xC06464AE）
+struct Drm64ModeFbCmd2 {
+    uint32_t fb_id;              // +0   out = 0x100..0x107
+    uint32_t width;              // +4   in
+    uint32_t height;             // +8   in
+    uint32_t pixel_format;       // +12  in：只认 XRGB8888 / ARGB8888
+    uint32_t flags;              // +16  必须 0
+    uint32_t handles[4];         // +20  in：handles[0] = dumb handle（其余必须 0）
+    uint32_t pitches[4];         // +36  in：pitches[0] 必须等于该 dumb 的 stride
+    uint32_t offsets[4];         // +52  in：offsets[0] 必须 0
+    uint64_t modifier[4];        // +72  in：必须全 0（没有 tiling/modifier）
+};                               // = 104 B（= Linux drm_mode_fb_cmd2）
+static_assert(sizeof(Drm64ModeFbCmd2) == 104, "Drm64ModeFbCmd2 必须是 104 B（= Linux drm_mode_fb_cmd2）");
+
+// ⑬ ADDFB（legacy；= Linux struct drm_mode_fb_cmd，28 B）
+struct __attribute__((packed)) Drm64ModeFbCmd {
+    uint32_t fb_id;              // +0   out
+    uint32_t width;              // +4   in
+    uint32_t height;             // +8   in
+    uint32_t pitch;              // +12  in（必须等于 dumb 的 stride）
+    uint32_t bpp;                // +16  in（必须是 32）
+    uint32_t depth;              // +20  in（24 或 32）
+    uint32_t handle;             // +24  in（dumb handle）
+};                               // = 28 B（= Linux drm_mode_fb_cmd）
+static_assert(sizeof(Drm64ModeFbCmd) == 28, "Drm64ModeFbCmd 必须是 28 B（= Linux drm_mode_fb_cmd）");
+
+// ⑭ GETPLANERESOURCES（= Linux struct drm_mode_get_plane_res，**16 B**：u64 + u32 要对齐到 8，
+//   所以也不能 packed —— packed 会给 12 B）
+struct Drm64ModeGetPlaneRes {
+    uint64_t plane_id_ptr;       // +0   用户 u32 数组
+    uint32_t count_planes;       // +8   in/out（本内核恒 2）
+};                               // = 16 B（= Linux drm_mode_get_plane_res）
+static_assert(sizeof(Drm64ModeGetPlaneRes) == 16, "Drm64ModeGetPlaneRes 必须是 16 B（= Linux drm_mode_get_plane_res）");
+
+// ⑮ GETPLANE（= Linux struct drm_mode_get_plane，32 B）
+struct Drm64ModeGetPlane {
+    uint32_t plane_id;           // +0   in（1 = primary / 2 = cursor）
+    uint32_t crtc_id;            // +4   out
+    uint32_t fb_id;              // +8   out = 该 plane 正在扫出的 fb（0 = 没有）
+    uint32_t possible_crtcs;     // +12  out = 位掩码（本内核恒 1）
+    uint32_t gamma_size;         // +16  out = 0（没有 gamma LUT）
+    uint32_t count_format_types; // +20  in/out（本内核恒 2）
+    uint64_t format_type_ptr;    // +24  用户 u32 数组（fourcc）
+};                               // = 32 B（= Linux drm_mode_get_plane）
+static_assert(sizeof(Drm64ModeGetPlane) == 32, "Drm64ModeGetPlane 必须是 32 B（= Linux drm_mode_get_plane）");
+
 // ==================== evdev ABI ====================
 // 24 B，与 Linux x86_64 的 struct input_event 同尺寸（时间戳 2×u64 + 2×u16 + i32）。
 struct __attribute__((packed)) InputEvent64 {
@@ -328,6 +397,10 @@ int evdev64_ioctl64(int which, uint64_t cmd, uint64_t arg);
 //   Linux read 路径传的是用户 VA，自有 ABI 7 号传的是内核 staging 缓冲 —— 两种都是
 //   "当前 CR3 下可写的指针"，所以这里不再做用户范围校验，校验在 syscall64/fd64 那层）。
 int64_t evdev64_read64(int which, void* ubuf, uint64_t len);
+// ★ v0.9.15：进程回收 hook（proc64 的 p64_exit64 / proc64_destroy64 里以**弱符号**方式调用，
+//   与 wl64_proc_release64 同一套纪律：安装介质内核不链 drm64.cpp，那边判空跳过）。
+//   作用：把该 pid 名下的 dumb buffer 全部收走（原来进程异常退出不 DESTROY_DUMB 就永久占页）。
+extern "C" void drm64_proc_release64(int pid);
 void drm64_init64(void);
 int drm64_selftest64(void);
 // 可选的启动期 ring3 验收程序（有界等待；没有 /bin/drmdemo.elf 或没有 /etc/drm64_probe

@@ -153,6 +153,9 @@ py -3 tests\drm64_test.py            # 串口断言 + 头文件逐值比对 + �
 
 ### A.3 还完全没做的（按"跑 wlroots"的依赖顺序）
 
+> ★ v0.9.14 把 A.2 的 4 处 struct 差值清零；★ **v0.9.15 把下面的第 1 条（ADDFB2/SETCRTC/GETPLANE）
+> 与第 5 条（dumb 的 fd 生命周期 / 进程回收）做完了** —— 详见 A.6。剩下的是 2/3/4/6。
+
 1. **`MODE_ADDFB2` / `MODE_SETCRTC` / `MODE_ATOMIC` + `MODE_GETPLANE` 的属性系统** —— wlroots 的
    DRM 后端走 atomic commit；我们现在只有 `PAGE_FLIP` + dumb buffer，**没有 fb 对象与属性**。
 2. **GBM + EGL/GLES**（Mesa）—— 没有它，wlroots 的渲染器只能用 pixman（软件），那就退化成
@@ -219,3 +222,34 @@ CRTC_GET_SEQUENCE  0xC018643B   (24)
   `status_report` **94/0/0**；内核 **3,042,224 B**（闸门 3,116,544，余量 74,320）。
 * 仍然没做（下一批，按 A.4）：`ADDFB2`/`SETCRTC`/`GETPLANE` → `proc64` 回收 hook → dma-buf 跨进程 →
   atomic commit → GBM+EGL/GLES。
+
+### A.6 v0.9.15 的落地记录（属性面 + 回收 hook，已做）
+
+**新增的五个 ioctl（号与 struct 都与 Linux `drm.h` 逐个/逐字节一致）**
+
+| ioctl | nr | sizeof | 号 | 说明 |
+| --- | --- | --- | --- | --- |
+| `MODE_SETCRTC` | 0xA2 | 104 | `0xC06864A2` | 复用 `drm_mode_crtc`；`fb_id=0` = 真清屏；`x/y` 生效 |
+| `MODE_ADDFB` | 0xAD | 28 | `0xC01C64AD` | legacy（`drm_mode_fb_cmd`） |
+| `MODE_ADDFB2` | 0xAE | 104 | `0xC06864AE` | 只认 XRGB8888/ARGB8888，单 plane，`modifier=0`；NV12 如实 `-EINVAL` |
+| `MODE_GETPLANERESOURCES` | 0xB6 | 16 | `0xC01064B6` | 恒 2 个 plane（primary/cursor） |
+| `MODE_GETPLANE` | 0xB5 | 32 | `0xC02064B5` | primary 报在扫出的 fb + 2 个 fourcc |
+
+**两个必须记住的对齐陷阱**：`drm_mode_fb_cmd2`（`modifier[4]` → 8 字节对齐）和
+`drm_mode_get_plane_res`（`u64+u32`）**不能 packed**，否则 sizeof 变成 100 / 12，ioctl 号跟着错。
+
+**对象模型**：fb id 从 `0x100` 起，与 dumb handle（1..4）是两套号；fb 是 dumb 的薄包装（不复制像素），
+dumb 被销毁/回收时引用它的 fb 一起消失。
+
+**进程回收**：`proc64` 在 exit 与 destroy 两处按弱符号调 `drm64_proc_release64(pid)` →
+`[DRM] release pid=<n> fbs=<n> pages=<n> free_pages=<n>`。原来进程异常退出不 DESTROY_DUMB 会永久占页
+（4 槽 × <=8 MiB），A.3 第 5 条欠账清了。
+
+**判据**：`drm64_test` 45 条（①b 的号表 16 个、双头文件比对 17 个 struct、NV12 反例、
+`release` 必须晚于 `[DRMDEMO] done` 的顺序断言）。
+
+**这一步之后 wlroots 还差什么**（下一步顺序不变）：
+① dma-buf 跨进程（`PRIME_HANDLE_TO_FD` 等价物）与真双缓冲交替；
+② atomic commit（`MODE_ATOMIC` + 属性 id/取值系统）—— 到这一步 wlroots 的 DRM 后端才真正有戏；
+③ libinput 的 udev/libevdev 层（`/sys` 枚举、`EVIOCGRAB`/`EVIOCSABS`）；
+④ GBM + EGL/GLES（要 Mesa）。

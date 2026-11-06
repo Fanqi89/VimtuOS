@@ -61,8 +61,13 @@
 #define DRM64_NR_CRTC_GET_SEQUENCE 0x3bu
 #define DRM64_NR_MODE_GETRESOURCES 0xA0u
 #define DRM64_NR_MODE_GETCRTC      0xA1u
+#define DRM64_NR_MODE_SETCRTC      0xA2u
 #define DRM64_NR_MODE_GETCONNECTOR 0xA7u
+#define DRM64_NR_MODE_ADDFB        0xADu
+#define DRM64_NR_MODE_ADDFB2       0xAEu
 #define DRM64_NR_MODE_PAGE_FLIP    0xB0u
+#define DRM64_NR_MODE_GETPLANE     0xB5u
+#define DRM64_NR_MODE_GETPLANERES  0xB6u
 #define DRM64_NR_MODE_CREATE_DUMB  0xB2u
 #define DRM64_NR_MODE_MAP_DUMB     0xB3u
 #define DRM64_NR_MODE_DESTROY_DUMB 0xB4u
@@ -84,6 +89,14 @@
 #define DRM64_CRTC_ID64        1u
 #define DRM64_CONNECTOR_ID64   1u
 #define DRM64_ENCODER_ID64     1u
+/* v0.9.15：fb 对象（ADDFB/ADDFB2）与 plane。fb id 与 dumb handle 不是同一套号（Linux 也是）。 */
+#define DRM64_MAX_FB64         8u
+#define DRM64_FB_ID_BASE64     0x100u
+#define DRM64_PLANE_PRIMARY_ID64 1u          /* primary plane（真能上屏） */
+#define DRM64_PLANE_CURSOR_ID64  2u          /* cursor plane（只报告，不改） */
+/* 只支持这两个 fourcc（= Linux DRM_FORMAT_XRGB8888 / DRM_FORMAT_ARGB8888） */
+#define DRM64_FORMAT_XRGB8888  0x34325258u
+#define DRM64_FORMAT_ARGB8888  0x34325241u
 /* 用户映射窗（见内核侧头文件）：A1 的 FB 区后半段，4 槽 × 8 MiB */
 #define DRM64_UVA_BASE_OFFSET64 (8ull * 1024ull * 1024ull)  /* USER64_FB_VA64 + 8 MiB */
 #define DRM64_UVA_SLOT_BYTES64  (8ull * 1024ull * 1024ull)
@@ -250,6 +263,51 @@ struct __attribute__((packed)) Drm64CrtcSeq {
     uint64_t sequence_ns;  /* +16  out：sequence 对应的纳秒（tick 粒度，如实） */
 };                         /* = 24 B（= Linux drm_crtc_get_sequence） */
 DRM64_STATIC_ASSERT(sizeof(struct Drm64CrtcSeq) == 24, "Drm64CrtcSeq 必须是 24 B（= Linux drm_crtc_get_sequence）");
+
+/* ⑫ ADDFB2（= Linux struct drm_mode_fb_cmd2，104 B）：modifier[4] 要对齐到 8，不能 packed */
+struct Drm64ModeFbCmd2 {
+    uint32_t fb_id;              /* +0   out = 0x100..0x107 */
+    uint32_t width;              /* +4   in */
+    uint32_t height;             /* +8   in */
+    uint32_t pixel_format;       /* +12  in：只认 XRGB8888 / ARGB8888 */
+    uint32_t flags;              /* +16  必须 0 */
+    uint32_t handles[4];         /* +20  in：handles[0] = dumb handle（其余必须 0） */
+    uint32_t pitches[4];         /* +36  in：pitches[0] 必须等于该 dumb 的 stride */
+    uint32_t offsets[4];         /* +52  in：offsets[0] 必须 0 */
+    uint64_t modifier[4];        /* +72  in：必须全 0（没有 tiling/modifier） */
+};                               /* = 104 B（= Linux drm_mode_fb_cmd2） */
+DRM64_STATIC_ASSERT(sizeof(struct Drm64ModeFbCmd2) == 104, "Drm64ModeFbCmd2 必须是 104 B（= Linux drm_mode_fb_cmd2）");
+
+/* ⑬ ADDFB（legacy；= Linux struct drm_mode_fb_cmd，28 B） */
+struct __attribute__((packed)) Drm64ModeFbCmd {
+    uint32_t fb_id;              /* +0   out */
+    uint32_t width;              /* +4   in */
+    uint32_t height;             /* +8   in */
+    uint32_t pitch;              /* +12  in（必须等于 dumb 的 stride） */
+    uint32_t bpp;                /* +16  in（必须是 32） */
+    uint32_t depth;              /* +20  in（24 或 32） */
+    uint32_t handle;             /* +24  in（dumb handle） */
+};                               /* = 28 B（= Linux drm_mode_fb_cmd） */
+DRM64_STATIC_ASSERT(sizeof(struct Drm64ModeFbCmd) == 28, "Drm64ModeFbCmd 必须是 28 B（= Linux drm_mode_fb_cmd）");
+
+/* ⑭ GETPLANERESOURCES（= Linux struct drm_mode_get_plane_res，16 B）：u64 + u32，不能 packed */
+struct Drm64ModeGetPlaneRes {
+    uint64_t plane_id_ptr;       /* +0   用户 u32 数组 */
+    uint32_t count_planes;       /* +8   in/out（本内核恒 2） */
+};                               /* = 16 B（= Linux drm_mode_get_plane_res） */
+DRM64_STATIC_ASSERT(sizeof(struct Drm64ModeGetPlaneRes) == 16, "Drm64ModeGetPlaneRes 必须是 16 B（= Linux drm_mode_get_plane_res）");
+
+/* ⑮ GETPLANE（= Linux struct drm_mode_get_plane，32 B） */
+struct Drm64ModeGetPlane {
+    uint32_t plane_id;           /* +0   in（1 = primary / 2 = cursor） */
+    uint32_t crtc_id;            /* +4   out */
+    uint32_t fb_id;              /* +8   out = 该 plane 正在扫出的 fb（0 = 没有） */
+    uint32_t possible_crtcs;     /* +12  out = 位掩码（本内核恒 1） */
+    uint32_t gamma_size;         /* +16  out = 0（没有 gamma LUT） */
+    uint32_t count_format_types; /* +20  in/out（本内核恒 2） */
+    uint64_t format_type_ptr;    /* +24  用户 u32 数组（fourcc） */
+};                               /* = 32 B（= Linux drm_mode_get_plane） */
+DRM64_STATIC_ASSERT(sizeof(struct Drm64ModeGetPlane) == 32, "Drm64ModeGetPlane 必须是 32 B（= Linux drm_mode_get_plane）");
 
 /* ==================== evdev ABI ==================== */
 /* 24 B，与 Linux x86_64 的 struct input_event 同尺寸（时间戳 2×u64 + 2×u16 + i32）。 */
