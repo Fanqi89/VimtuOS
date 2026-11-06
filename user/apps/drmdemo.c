@@ -42,6 +42,17 @@ static const uint32_t BARS[8] = {
 
 #define DRMDEMO_BARW 64u
 
+/* ★ v0.9.20：有界 poll(POLLIN) —— 用户态没有 <poll.h>，这里直接用 Linux 号段 7（poll）。
+ * 返回 >0 = 就绪（bit0 = POLLIN）/ 0 = 超时 / 负数 = 内核的 -errno。 */
+struct DrmDemoPollFd { int fd; short events; short revents; };
+static int drmdemo_poll_in(int fd, int ms) {
+    struct DrmDemoPollFd p;
+    p.fd = fd; p.events = 1; p.revents = 0;
+    const long r = __v64_syscall(7, (long)(uintptr_t)&p, 1, (long)ms, 0, 0);
+    return (r > 0) ? (int)p.revents : (int)r;
+}
+static void drmdemo_zero(void* p, unsigned n) { for (unsigned i = 0; i < n; i++) ((char*)p)[i] = 0; }
+
 int main(int argc, char** argv, char** envp) {
     (void)argc; (void)argv; (void)envp;
     (void)argc; (void)argv; (void)envp;
@@ -445,6 +456,89 @@ int main(int argc, char** argv, char** envp) {
         long lrc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_CREATE_DUMB, struct Drm64ModeCreateDumb), &leak);
         printf("[DRMDEMO] leak_dumb handle=%u pages_hint=%lu rc=%d\n",
                (unsigned)leak.handle, (unsigned long)(leak.size / 4096u), (int)lrc);
+    }
+
+    /* ---- ⑬ ★ v0.9.20：PRIME 跨进程 —— A 导出，子进程导入并读回 A 写进去的像素 ----
+     *   证据：内核两条 [DRM] map 行 **phys 相同、pid 不同**（同一批物理页挂进两个进程）。 ---- */
+    {
+        struct Drm64PrimeHandle ph;
+        drmdemo_zero(&ph, (unsigned)sizeof(ph));
+        ph.handle = cd.handle;
+        const long exrc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_PRIME_HANDLE_TO_FD, struct Drm64PrimeHandle), &ph);
+        printf("[DRMDEMO] prime export handle=%u id=0x%x rc=%ld\n",
+               (unsigned)cd.handle, (unsigned)ph.fd, (long)exrc);
+        /* 反例：不存在的 handle 必须 -EINVAL */
+        struct Drm64PrimeHandle bx;
+        drmdemo_zero(&bx, (unsigned)sizeof(bx));
+        bx.handle = 999;
+        const long bxrc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_PRIME_HANDLE_TO_FD, struct Drm64PrimeHandle), &bx);
+        printf("[DRMDEMO] prime export bad-handle rc=%ld\n", (long)bxrc);
+        /* 反例：负数 id 不是 prime id（更不是 fd）—— 必须 -EINVAL */
+        struct Drm64PrimeHandle bn;
+        drmdemo_zero(&bn, (unsigned)sizeof(bn));
+        bn.fd = -1;
+        const long bnrc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_PRIME_FD_TO_HANDLE, struct Drm64PrimeHandle), &bn);
+        printf("[DRMDEMO] prime import bad-id rc=%ld\n", (long)bnrc);
+        if (exrc == 0) {
+            const int kid = fork();
+            if (kid == 0) {
+                /* 子进程：自己的 DRM fd -> FD_TO_HANDLE -> MAP_DUMB -> 读 A 写进去的白色条 */
+                const int cfd = drm64_open();
+                struct Drm64PrimeHandle ih;
+                drmdemo_zero(&ih, (unsigned)sizeof(ih));
+                ih.fd = ph.fd;
+                const long irc = (cfd >= 0)
+                    ? drm64_ioctl(cfd, DRM64_IOWR(DRM64_NR_PRIME_FD_TO_HANDLE, struct Drm64PrimeHandle), &ih) : -1;
+                struct Drm64ModeMapDumb imd;
+                drmdemo_zero(&imd, (unsigned)sizeof(imd));
+                imd.handle = ih.handle;
+                const long mrc = (irc == 0)
+                    ? drm64_ioctl(cfd, DRM64_IOWR(DRM64_NR_MODE_MAP_DUMB, struct Drm64ModeMapDumb), &imd) : -1;
+                uint32_t probe = 0;
+                if (mrc == 0 && imd.offset != 0) probe = *(volatile uint32_t*)(uintptr_t)imd.offset;
+                /* 收工：把自己那份引用还掉（refs 2 -> 1，页**不能**被释放 —— 导出方还在用） */
+                struct Drm64ModeDestroyDumb idb;
+                drmdemo_zero(&idb, (unsigned)sizeof(idb));
+                idb.handle = ih.handle;
+                const long drc = (irc == 0)
+                    ? drm64_ioctl(cfd, DRM64_IOWR(DRM64_NR_MODE_DESTROY_DUMB, struct Drm64ModeDestroyDumb), &idb) : -1;
+                printf("[DRMDEMO] prime import id=0x%x handle=%u rc=%ld/%ld probe=0x%x release=%ld\n",
+                       (unsigned)ph.fd, (unsigned)ih.handle, (long)irc, (long)mrc,
+                       (unsigned)probe, (long)drc);
+                _exit((mrc == 0 && probe == BARS[0] && drc == 0) ? 0 : 1);
+            }
+            int st = 0;
+            const int wr = wait4(kid, &st, 0, 0);
+            printf("[DRMDEMO] prime child pid=%d wait=%d status=%d\n", kid, wr, st);
+        }
+    }
+
+    /* ---- ⑭ ★ v0.9.20：事件投递 —— PAGE_FLIP(EVENT) 立即返回 -> poll(POLLIN) -> read 32 B 事件 ---- */
+    {
+        struct Drm64ModePageFlip pe;
+        drmdemo_zero(&pe, (unsigned)sizeof(pe));
+        pe.crtc_id = DRM64_CRTC_ID64; pe.fb_id = cd.handle;
+        pe.flags = DRM64_PAGE_FLIP_EVENT64; pe.user_data = 0xAB12CD34ull;
+        const long erc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_PAGE_FLIP, struct Drm64ModePageFlip), &pe);
+        const int pin = drmdemo_poll_in(fd, 500);
+        struct Drm64EventVblank evb;
+        drmdemo_zero(&evb, (unsigned)sizeof(evb));
+        const long rd = drm64_read(fd, &evb, (long)sizeof(evb));
+        printf("[DRMDEMO] event flip_rc=%ld poll=%d read=%ld type=%u len=%u seq=%u crtc=%u user_data=0x%lx\n",
+               (long)erc, pin, (long)rd, (unsigned)evb.type, (unsigned)evb.length,
+               (unsigned)evb.sequence, (unsigned)evb.crtc_id, (unsigned long)evb.user_data);
+        /* 反例：不认识的 flag 位（不是 PAGE_FLIP_EVENT）必须 -EINVAL */
+        struct Drm64ModePageFlip px;
+        drmdemo_zero(&px, (unsigned)sizeof(px));
+        px.crtc_id = DRM64_CRTC_ID64; px.fb_id = cd.handle; px.flags = 0x80u;
+        const long pxrc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_PAGE_FLIP, struct Drm64ModePageFlip), &px);
+        printf("[DRMDEMO] event badflag rc=%ld\n", (long)pxrc);
+        /* 同步语义没退化：不带 flag 的 flip 仍然返回 0 且内核仍打 [DRM] page_flip 行 */
+        struct Drm64ModePageFlip ps;
+        drmdemo_zero(&ps, (unsigned)sizeof(ps));
+        ps.crtc_id = DRM64_CRTC_ID64; ps.fb_id = cd.handle; ps.flags = 0;
+        const long psrc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_PAGE_FLIP, struct Drm64ModePageFlip), &ps);
+        printf("[DRMDEMO] event sync_flip rc=%ld\n", (long)psrc);
     }
 
     /* ---- ⑩ 反例：未知 ioctl 必须 -ENOTTY(-25)（不假装成功）---- */

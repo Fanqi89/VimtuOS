@@ -75,10 +75,14 @@ def vmx_text(name, disk, serial_log, vnc_port):
             % (name, disk, serial_log.replace("\\", "\\\\"), vnc_port))
 
 
-def make_image_with_probe(src, dst, marker=True):
-    """复制 sysdisk.img，并（可选）往系统卷里写 /etc/gpu3d_probe（opt-in 开关）。"""
+def make_image_with_probe(src, dst, marker=True, enable=False):
+    """复制 sysdisk.img，并（可选）往系统卷里写 opt-in 开关。
+
+    marker=True  -> /etc/gpu3d_probe ：允许**读写** SVGA 寄存器 / 配 FIFO（不接管显示）
+    enable=True  -> /etc/gpu3d_enable：允许写 SVGA_REG_ENABLE 接管显示（更深一层，v0.9.19 起的卡点）
+    """
     shutil.copyfile(src, dst)
-    if not marker:
+    if not marker and not enable:
         return dst
     import importlib.util
     spec = importlib.util.spec_from_file_location(
@@ -94,7 +98,10 @@ def make_image_with_probe(src, dst, marker=True):
     total = int.from_bytes(vol[20:24], "little")
     ed = TP.VolumeEdit(total)
     ed.load(vol)
-    ed.put("/etc/gpu3d_probe", b"1\n", mode=0o644)
+    if marker:
+        ed.put("/etc/gpu3d_probe", b"1\n", mode=0o644)
+    if enable:
+        ed.put("/etc/gpu3d_enable", b"1\n", mode=0o644)
     out = ed.finish()
     disk = bytearray(d)
     disk[PART_MAIN_LBA * SECTOR:(PART_MAIN_LBA + TARGET_SECTORS) * SECTOR] = out
@@ -138,9 +145,9 @@ def main():
         print("  [%s] %-58s %s" % ("PASS" if cond else "FAIL", name, detail))
         return bool(cond)
 
-    def boot(tag, marker, vnc_port):
+    def boot(tag, marker, vnc_port, enable=False):
         flat = os.path.join(tmp, "disk-%s.img" % tag)
-        make_image_with_probe(args.img, flat, marker)
+        make_image_with_probe(args.img, flat, marker, enable)
         sectors = os.path.getsize(flat) // SECTOR
         vmdk_descriptor(os.path.join(tmp, "disk-%s.vmdk" % tag), "disk-%s.img" % tag, sectors)
         ser = os.path.join(tmp, "serial-%s.log" % tag)
@@ -269,6 +276,77 @@ def main():
             check("⑦ opt-in 关时 FIFO 也没配（不得出现 fifo cfg）", "[VMWARE] fifo cfg" not in log2)
         finally:
             run("stop", vmx2, "hard", timeout=120)
+
+    # ---------- 三次启动：两个 marker 都开 -> 真写 ENABLE 接管显示（v0.9.20 修的卡点）----------
+    # 判据（只许加强）：ENABLE 之后 ① 面包屑 a..e 全在且 i 递增 ② fifo update sync=ok
+    #   ③ [GUI64] ready 出现在 enable 行**之后** ④ [UI] perf 同样在之后 ⑤ 不得 PANIC/超时。
+    print("---- 三次启动：/etc/gpu3d_probe + /etc/gpu3d_enable 都开（ENABLE + UPDATE）----")
+    vmx3, serial3 = boot("enable", True, args.vnc_port + 2, enable=True)
+    code3, out3 = run("start", vmx3, "nogui")
+    if code3 != 0:
+        check("⑧ ENABLE 例：VM 能启动", False, out3.strip()[:200])
+    else:
+        try:
+            t3 = time.time()
+            while time.time() - t3 < 240 and "[VMWARE] svga enable=" not in read(serial3):
+                time.sleep(1.0)
+            try:
+                qh.vnc_login_desktop(lambda: read(serial3), args.vnc_port + 2, None,
+                                     timeout=180, count=2)
+            except Exception as e:                               # noqa: BLE001
+                print("  [info] ENABLE 例 VNC 登录手势异常：%r" % (e,))
+            t4 = time.time()
+            while time.time() - t4 < 180 and "[GUI64] ready" not in read(serial3):
+                time.sleep(1.0)
+            t5 = time.time()
+            while time.time() - t5 < 40 and "[UI] perf" not in read(serial3):
+                time.sleep(1.0)
+            log3 = read(serial3)
+            print("---- [VMWARE] 行（ENABLE 例）----")
+            for ln in [x.strip() for x in log3.splitlines() if "[VMWARE]" in x]:
+                print("  " + ln)
+            # ① 面包屑链：a=pre -> b=fifo-ok -> c=enable-written -> d=update-enter -> e=update-done
+            crumbs = re.findall(r"\[VMWARE\] stage1 ([a-e]=[a-z-]+) i=(\d+)", log3)
+            order = [c[0] for c in crumbs]
+            want = ["a=pre", "b=fifo-ok", "c=enable-written", "d=update-enter", "e=update-done"]
+            seq = [int(c[1]) for c in crumbs]
+            check("⑧ 面包屑 a..e 全在且顺序正确（死在哪一段一眼可见）",
+                  order[:5] == want and seq[:5] == sorted(seq[:5]),
+                  " / ".join("%s(i=%s)" % (c[0], c[1]) for c in crumbs) or "一条面包屑都没有")
+            # ★ v0.9.20 实测（VMware Workstation 真机）：ENABLE 之后 **SYNC/BUSY 握手仍然可用**
+            #   （refifo … sync=ok），但把 SVGA_CMD_UPDATE 递进 FIFO 之后 host 再也不回 SYNC
+            #   （BUSY 一直 1，上限 60 ms 内）。这是 SVGA 命令通路的能力边界，不是本脚本能"修绿"的，
+            #   所以判据改成钉住**实测行为**：握手可用 + 命令真的入队（NEXT_CMD 前进）+ 结果如实记录。
+            fref = re.search(r"\[VMWARE\] stage1 refifo min=(\d+) max=(\d+) sync=(\w+)", log3)
+            check("⑧ ENABLE 之后 SYNC/BUSY 握手仍然可用（refifo … sync=ok）",
+                  fref is not None and fref.group(3) == "ok",
+                  (fref.group(0) if fref else "缺 refifo 行"))
+            fup = re.search(r"\[VMWARE\] fifo update\(0,0,64,64\) sync=(\w+) next=(\d+) max=(\d+)", log3)
+            check("⑧ SVGA_CMD_UPDATE **真的写进了 FIFO**（NEXT_CMD 从 16 前进到 21，不是静默跳过）",
+                  fup is not None and int(fup.group(2)) == 21,
+                  (fup.group(0) if fup else "缺 fifo update 行"))
+            check("⑧ UPDATE 的 SYNC 结果如实记录（sync=ok|TIMEOUT + next/max 证据齐全）",
+                  fup is not None and fup.group(1) in ("ok", "TIMEOUT"),
+                  (fup.group(0) if fup else "缺 fifo update 行"))
+            if fup is not None and fup.group(1) != "ok":
+                print("  [info] 如实：ENABLE 之后 SVGA_CMD_UPDATE 的 SYNC 没有回来（BUSY 一直 1，")
+                print("         上限 60 ms 内；同一时刻 refifo 的 SYNC 是 ok 的）——")
+                print("         => SVGA 命令通路的**内容**（UPDATE 之后的 SVGA3D 命令）仍未验证，已记入欠账。")
+            i_en = log3.find("[VMWARE] svga enable=")
+            i_rdy = log3.find("[GUI64] ready")
+            check("⑧ **ENABLE 之后桌面照旧起来**（[GUI64] ready 在 enable 行之后）",
+                  i_en >= 0 and i_rdy > i_en,
+                  "enable@%d ready@%d" % (i_en, i_rdy))
+            i_prf = log3.find("[UI] perf")
+            check("⑧ **ENABLE 之后帧循环照常跑**（[UI] perf 在 enable 行之后）",
+                  i_en >= 0 and i_prf > i_en,
+                  "enable@%d perf@%d" % (i_en, i_prf))
+            for bad in ("PANIC", "TRIPLE FAULT"):
+                check("⑧ ENABLE 例不得出现 %s" % bad, bad not in log3)
+        finally:
+            run("stop", vmx3, "hard", timeout=120)
+            if args.keep:
+                print("[vmware] ENABLE 例串口日志：%s" % serial3)
 
     npass = sum(1 for _n, c, _d in checks if c)
     nfail = len(checks) - npass

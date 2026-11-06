@@ -28,6 +28,10 @@ static const char* const D64_HEXL = "0123456789abcdef";
 __attribute__((noinline)) static void d64_puts(const char* s) { dbg64_str(s); }
 __attribute__((noinline)) static void d64_ch(char c) { dbg64_putc(c); }
 __attribute__((noinline)) static void d64_num(uint64_t v) { dbg64_dec(v); }
+// ★ v0.9.20：有符号打印（prime 的 fd 字段是 int32_t，-1 必须打成 -1 而不是 2^64-1）
+__attribute__((noinline)) static void d64_snum(int64_t v) {
+    if (v < 0) { d64_ch('-'); d64_num((uint64_t)(-v)); } else d64_num((uint64_t)v);
+}
 __attribute__((noinline)) static void d64_hex(uint64_t v) {      // "0x" + 最短十六进制
     d64_puts("0x");
     if (!v) { d64_ch('0'); return; }
@@ -253,6 +257,62 @@ static void d64_drop_fb_of_handle64(uint32_t handle) {
     }
 }
 
+// ==================== ★ v0.9.20：PRIME 表（跨进程共享同一批物理页）====================
+// 为什么需要它：dumb buffer 的页是**内核页池的物理页**，另一个进程要拿到同一批页，
+// 只能走"内核记着这块 buffer"这条路。PRIME 表就是这张登记表：
+//   导出方 HANDLE_TO_FD(dumb handle) -> 全局 prime id（0x400 + 槽号），refs = 1
+//   导入方 FD_TO_HANDLE(prime id)    -> 同上那块 dumb 的 handle，refs += 1
+//   任何一方 DESTROY_DUMB            -> refs -= 1；只有归零才真的把页还回页池
+// 语义差异见 kernel/drm64.h 那段注释（我们返回的不是真 fd，也不做 fd 传递）。
+struct D64Prime {
+    uint32_t used;
+    uint32_t id;        // = DRM64_PRIME_ID_BASE64 + 槽号
+    uint32_t handle;    // 被引用的 dumb handle（本内核的 handle 是全局的 1..4）
+    uint32_t refs;      // 1 = 导出方的引用；每多一个导入 +1
+};
+static D64Prime g_prime[DRM64_MAX_PRIME64];
+
+static D64Prime* d64_prime_by_handle64(uint32_t handle) {
+    for (uint32_t i = 0; i < DRM64_MAX_PRIME64; i++)
+        if (g_prime[i].used && g_prime[i].handle == handle) return &g_prime[i];
+    return nullptr;
+}
+static uint32_t d64_prime_refs64(uint32_t handle) {
+    D64Prime* p = d64_prime_by_handle64(handle);
+    return p ? p->refs : 0u;
+}
+static void d64_prime_clear64(uint32_t handle) {
+    D64Prime* p = d64_prime_by_handle64(handle);
+    if (p) for (uint32_t k = 0; k < sizeof(D64Prime); k++) ((uint8_t*)p)[k] = 0;
+}
+// 导出：已有就复用（refs 至少 1），否则占一个空槽。满了返回 nullptr（调用方报 -ENOMEM）。
+static D64Prime* d64_prime_export64(uint32_t handle) {
+    D64Prime* p = d64_prime_by_handle64(handle);
+    if (p) { if (p->refs == 0u) p->refs = 1u; return p; }
+    for (uint32_t i = 0; i < DRM64_MAX_PRIME64; i++) {
+        if (g_prime[i].used) continue;
+        D64Prime* q = &g_prime[i];
+        for (uint32_t k = 0; k < sizeof(D64Prime); k++) ((uint8_t*)q)[k] = 0;
+        q->used = 1u; q->id = DRM64_PRIME_ID_BASE64 + i; q->handle = handle; q->refs = 1u;
+        return q;
+    }
+    return nullptr;
+}
+static D64Prime* d64_prime_by_id64(uint32_t id) {
+    if (id < DRM64_PRIME_ID_BASE64) return nullptr;
+    const uint32_t s = id - DRM64_PRIME_ID_BASE64;
+    if (s >= DRM64_MAX_PRIME64) return nullptr;
+    return g_prime[s].used ? &g_prime[s] : nullptr;
+}
+// 释放一个引用。返回 1 = 还有别的进程在用（**页必须留着**）；0 = 没人用了（可以还页）。
+static int d64_prime_release64(uint32_t handle) {
+    D64Prime* p = d64_prime_by_handle64(handle);
+    if (!p) return 0;
+    if (p->refs > 1u) { p->refs--; return 1; }
+    for (uint32_t k = 0; k < sizeof(D64Prime); k++) ((uint8_t*)p)[k] = 0;
+    return 0;
+}
+
 // 真正释放（**无日志**）：返回还回页池的页数。ioctl DESTROY_DUMB 与进程回收 hook 共用。
 static uint32_t d64_free_slot64(uint32_t handle) {
     Drm64Dumb* d = d64_find64(handle);
@@ -262,12 +322,20 @@ static uint32_t d64_free_slot64(uint32_t handle) {
     for (uint32_t k = 0; k < sizeof(Drm64Dumb); k++) ((uint8_t*)d)[k] = 0;
     if (g_handle_on_screen == handle) { g_handle_on_screen = 0; g_fb_on_screen = 0; }
     d64_drop_fb_of_handle64(handle);
+    d64_prime_clear64(handle);              // ★ v0.9.20：页真的还了，PRIME 登记也必须一起消失
     return pages;
 }
 
 static int d64_destroy64(uint32_t handle) {
     Drm64Dumb* d = d64_find64(handle);
     if (!d) return -DRM64_EINVAL64;
+    // ★ v0.9.20：还有别的进程通过 PRIME 引用这块 buffer -> 只减引用，**不还页**
+    if (d64_prime_release64(handle)) {
+        d64_begin(); d64_puts("[DRM] prime release handle="); d64_num(handle);
+        d64_puts(" refs="); d64_num(d64_prime_refs64(handle));
+        d64_puts(" pages_kept=1"); d64_end();
+        return 0;
+    }
     const uint32_t pages = d64_free_slot64(handle);
     d64_begin();
     d64_puts("[DRM] destroy handle="); d64_num(handle);
@@ -608,15 +676,92 @@ static int d64_ioctl_map_dumb64(uint64_t arg) {
     d64_puts(" pages="); d64_num(d->pages);
     d64_puts(" phys="); d64_hex(d->phys[0]);
     d64_puts(" u=1");
+    // ★ v0.9.20：行尾补 pid= —— PRIME 跨进程的宿主侧证据就是"同一 phys、不同 pid"两条 map 行
+    d64_puts(" pid="); d64_num((uint64_t)(proc64_current_pid64() < 0 ? 0 : proc64_current_pid64()));
     d64_end();
     return 0;
 }
 
-static int d64_ioctl_page_flip64(uint64_t arg) {
+// ==================== ★ v0.9.20：DRM 事件队列（内核 -> ring3）====================
+// 为什么每 pid 一份：事件是"发给请求 flip 的那个进程"的，不是发给 fd 的；read() 在
+// /dev/dri/card0 上取自己那份。2 个槽（够桌面 + 一个演示程序），8 条/队列。
+// 入队时机：PAGE_FLIP 带 DRM_MODE_PAGE_FLIP_EVENT 时只**登记**，下一次 PIT tick
+// （drm64_tick64，x86_64.cpp 的 IRQ0 弱符号调用）才真正入队 —— 这就是"提交后立即返回、
+// 帧边界再投递"。如实：本内核没有独立的 vblank 中断源，tick 是 4 ms 粒度的帧边界代理。
+struct D64Evq {
+    uint32_t used;
+    int      pid;
+    uint32_t n, head;
+    Drm64EventVblank q[DRM64_EVQ_MAX64];
+};
+static D64Evq g_evq[DRM64_EV_OWNERS64];
+static uint32_t g_ev_armed = 0;                 // 1 = 有一个 flip 事件等着入队
+static int      g_ev_pid = 0;
+static Drm64EventVblank g_ev_next;
+
+static D64Evq* d64_evq_get64(int pid, int create) {
+    for (uint32_t i = 0; i < DRM64_EV_OWNERS64; i++)
+        if (g_evq[i].used && g_evq[i].pid == pid) return &g_evq[i];
+    if (!create) return nullptr;
+    for (uint32_t i = 0; i < DRM64_EV_OWNERS64; i++) {
+        if (g_evq[i].used) continue;
+        D64Evq* e = &g_evq[i];
+        for (uint32_t k = 0; k < sizeof(D64Evq); k++) ((uint8_t*)e)[k] = 0;
+        e->used = 1u; e->pid = pid;
+        return e;
+    }
+    return nullptr;
+}
+// IRQ0 钩子（弱符号，安装介质内核不链 drm64.cpp -> 指针为 0，什么都不做）
+extern "C" void drm64_tick64(void) {
+    if (!g_ev_armed) return;
+    g_ev_armed = 0u;                            // 先清标记：入队失败也不重复投递
+    D64Evq* q = d64_evq_get64(g_ev_pid, 1);
+    if (!q) return;
+    if (q->n >= DRM64_EVQ_MAX64) {              // 满了丢最老的一条（不静默堆积）
+        q->head = (q->head + 1u) % DRM64_EVQ_MAX64; q->n--;
+    }
+    q->q[(q->head + q->n) % DRM64_EVQ_MAX64] = g_ev_next;
+    q->n++;
+}
+// poll 的就绪判据：有事件才算 POLLIN（不是"永远就绪"）
+int drm64_events_pending64(int pid) {
+    const uint64_t fl = dbg64_irq_save64();
+    D64Evq* q = d64_evq_get64(pid, 0);
+    const int n = q ? (int)q->n : 0;
+    dbg64_irq_restore64(fl);
+    return n;
+}
+// read() 从 /dev/dri/card0 取事件：返回字节数 / -EAGAIN（队列空）
+int64_t drm64_events_read64(int pid, void* buf, uint64_t len) {
+    if (!buf) return -DRM64_EFAULT64;
+    const uint64_t fl = dbg64_irq_save64();
+    D64Evq* q = d64_evq_get64(pid, 0);
+    if (!q || q->n == 0u) { dbg64_irq_restore64(fl); return -11; }     // -EAGAIN
+    uint32_t cnt = (uint32_t)(len / (uint64_t)sizeof(Drm64EventVblank));
+    if (cnt > q->n) cnt = q->n;
+    if (cnt == 0u) { dbg64_irq_restore64(fl); return -DRM64_EINVAL64; }
+    Drm64EventVblank* out = (Drm64EventVblank*)buf;
+    for (uint32_t i = 0; i < cnt; i++)
+        out[i] = q->q[(q->head + i) % DRM64_EVQ_MAX64];
+    q->head = (q->head + cnt) % DRM64_EVQ_MAX64;
+    q->n -= cnt;
+    const uint32_t seq = out[cnt - 1u].sequence;
+    const uint64_t ud = out[cnt - 1u].user_data;
+    const uint32_t typ = out[cnt - 1u].type;
+    dbg64_irq_restore64(fl);
+    d64_begin(); d64_puts("[DRM] event read n="); d64_num(cnt);
+    d64_puts(" type="); d64_num(typ); d64_puts(" seq="); d64_num(seq);
+    d64_puts(" user_data="); d64_hex(ud); d64_end();      // d64_hex 自带 0x，别再手写
+    return (int64_t)cnt * (int64_t)sizeof(Drm64EventVblank);
+}
+
+static int d64_ioctl_page_flip64(uint64_t arg, uint64_t pid) {
     if (!user64_range_ok64(arg, sizeof(Drm64ModePageFlip))) return -DRM64_EFAULT64;
     Drm64ModePageFlip f;
     d64_urd64(arg, &f, sizeof(Drm64ModePageFlip));
-    if (f.crtc_id != DRM64_CRTC_ID64 || f.flags != 0u) {
+    // ★ v0.9.20：flags 只接受 DRM_MODE_PAGE_FLIP_EVENT(0x1)；其余位（ASYNC/TARGET…）如实 -EINVAL
+    if (f.crtc_id != DRM64_CRTC_ID64 || (f.flags & ~DRM64_PAGE_FLIP_EVENT64) != 0u) {
         d64_begin(); d64_puts("[DRM] page_flip FAILED reason=crtc/flags crtc=");
         d64_num(f.crtc_id); d64_puts(" err="); d64_num(DRM64_EINVAL64); d64_end();
         return -DRM64_EINVAL64;
@@ -632,13 +777,42 @@ static int d64_ioctl_page_flip64(uint64_t arg) {
     }
     g_handle_on_screen = d->id;
     g_fb_on_screen = fb ? fb->id : 0u;
-    (void)d64_vblank_wait64();                                       // "翻转后等一次 vblank"（同步语义）
-    d64_begin();
-    d64_puts("[DRM] page_flip crtc="); d64_num(DRM64_CRTC_ID64);
-    d64_puts(" fb="); d64_num(d->id);
-    d64_puts(" seq="); d64_num(g_seq);
-    d64_puts(" path="); d64_puts(path ? "gpu" : "cpu");
-    d64_end();
+    if (f.flags & DRM64_PAGE_FLIP_EVENT64) {
+        // ---- 异步语义（v0.9.20）：提交完**立即返回**，事件由下一次 PIT tick 入队 ----
+        if (g_ev_armed) {                                            // 同一时刻只允许一个未投递的 flip
+            d64_begin(); d64_puts("[DRM] page_flip FAILED reason=event-busy err=");
+            d64_num(DRM64_EBUSY64); d64_end();
+            return -DRM64_EBUSY64;
+        }
+        g_seq++;                                                     // 这一帧的序列号
+        Drm64EventVblank ev;
+        for (uint32_t k = 0; k < sizeof(Drm64EventVblank); k++) ((uint8_t*)&ev)[k] = 0;
+        ev.type = DRM64_EVENT_VBLANK;
+        ev.length = (uint32_t)sizeof(Drm64EventVblank);
+        ev.user_data = f.user_data;
+        { uint64_t s = 0, u = 0; d64_time64(&s, &u);
+          ev.tv_sec = (uint32_t)s; ev.tv_usec = (uint32_t)u; }
+        ev.sequence = (uint32_t)g_seq;
+        ev.crtc_id = DRM64_CRTC_ID64;
+        const uint64_t ifl = dbg64_irq_save64();
+        g_ev_next = ev; g_ev_pid = (int)pid; g_ev_armed = 1u;
+        dbg64_irq_restore64(ifl);
+        d64_begin();
+        d64_puts("[DRM] page_flip_event crtc="); d64_num(DRM64_CRTC_ID64);
+        d64_puts(" fb="); d64_num(d->id);
+        d64_puts(" seq="); d64_num(g_seq);
+        d64_puts(" user_data="); d64_hex(f.user_data);
+        d64_puts(" path="); d64_puts(path ? "gpu" : "cpu");
+        d64_puts(" mode=async"); d64_end();
+    } else {
+        (void)d64_vblank_wait64();                                   // "翻转后等一次 vblank"（同步语义）
+        d64_begin();
+        d64_puts("[DRM] page_flip crtc="); d64_num(DRM64_CRTC_ID64);
+        d64_puts(" fb="); d64_num(d->id);
+        d64_puts(" seq="); d64_num(g_seq);
+        d64_puts(" path="); d64_puts(path ? "gpu" : "cpu");
+        d64_end();
+    }
     // ★ v0.9.17：双缓冲交替的证据（两块 dumb 轮换时 alt=1，连续同一块 alt=0）
     {
         const uint32_t prev = g_flip_last;
@@ -854,18 +1028,21 @@ static int d64_ioctl_getplane64(uint64_t arg) {
 // 原来：进程异常退出且没 DESTROY_DUMB，那块页会永久占着（有界但会耗光 4 个槽）。
 extern "C" void drm64_proc_release64(int pid) {
     if (pid <= 0) return;
-    uint32_t fbs = 0, pages = 0;
+    uint32_t fbs = 0, pages = 0, kept = 0;
     for (uint32_t i = 0; i < DRM64_MAX_DUMB64; i++) {
         Drm64Dumb* d = &g_dumb[i];
         if (!d->used || d->owner != (uint32_t)pid) continue;
         const uint32_t id = d->id;
+        // ★ v0.9.20：别的进程还通过 PRIME 用着 -> 只减引用并交还所有权（页留着）
+        if (d64_prime_release64(id)) { d->owner = 0u; kept++; continue; }
         pages += d64_free_slot64(id);
         fbs++;
     }
-    if (fbs == 0u) return;
+    if (fbs == 0u && kept == 0u) return;
     d64_begin(); d64_puts("[DRM] release pid="); d64_num((uint64_t)pid);
     d64_puts(" fbs="); d64_num(fbs); d64_puts(" pages="); d64_num(pages);
-    d64_puts(" free_pages="); d64_num(page_count_free_64()); d64_end();
+    d64_puts(" free_pages="); d64_num(page_count_free_64());
+    d64_puts(" kept="); d64_num(kept); d64_end();          // ★ v0.9.20：新字段一律放**行尾**
 }
 
 // ==================== v0.9.16：属性系统 / blob / atomic commit ====================
@@ -1336,6 +1513,64 @@ static int d64_ioctl_atomic64(uint64_t arg) {
     return 0;
 }
 
+// ==================== ★ v0.9.20：PRIME 的两个 ioctl ====================
+static int d64_ioctl_prime_handle_to_fd64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64PrimeHandle))) return -DRM64_EFAULT64;
+    Drm64PrimeHandle h;
+    d64_urd64(arg, &h, sizeof(Drm64PrimeHandle));
+    if (h.flags != 0u) {
+        d64_begin(); d64_puts("[DRM] prime export FAILED reason=flags err=");
+        d64_num(DRM64_EINVAL64); d64_end();
+        return -DRM64_EINVAL64;
+    }
+    if (!d64_find64(h.handle)) {
+        d64_begin(); d64_puts("[DRM] prime export FAILED reason=no-such-handle handle=");
+        d64_num(h.handle); d64_puts(" err="); d64_num(DRM64_EINVAL64); d64_end();
+        return -DRM64_EINVAL64;
+    }
+    const uint64_t fl = dbg64_irq_save64();
+    D64Prime* p = d64_prime_export64(h.handle);
+    const uint32_t id = p ? p->id : 0u;
+    const uint32_t refs = p ? p->refs : 0u;
+    dbg64_irq_restore64(fl);
+    if (!p) {
+        d64_begin(); d64_puts("[DRM] prime export FAILED reason=no-free-slot cap=");
+        d64_num(DRM64_MAX_PRIME64); d64_puts(" err="); d64_num(DRM64_ENOMEM64); d64_end();
+        return -DRM64_ENOMEM64;
+    }
+    h.fd = (int32_t)id;
+    d64_uwr64(arg, &h, sizeof(Drm64PrimeHandle));
+    d64_begin(); d64_puts("[DRM] prime export handle="); d64_num(h.handle);
+    d64_puts(" id="); d64_hex(id); d64_puts(" refs="); d64_num(refs); d64_end();
+    return 0;
+}
+
+static int d64_ioctl_prime_fd_to_handle64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64PrimeHandle))) return -DRM64_EFAULT64;
+    Drm64PrimeHandle h;
+    d64_urd64(arg, &h, sizeof(Drm64PrimeHandle));
+    if (h.fd < 0 || (uint32_t)h.fd < DRM64_PRIME_ID_BASE64) {      // 负数/小于基址：不是我们的 id
+        d64_begin(); d64_puts("[DRM] prime import FAILED reason=bad-id fd=");
+        d64_snum((int64_t)h.fd); d64_puts(" err="); d64_num(DRM64_EINVAL64); d64_end();
+        return -DRM64_EINVAL64;
+    }
+    const uint64_t fl = dbg64_irq_save64();
+    D64Prime* p = d64_prime_by_id64((uint32_t)h.fd);
+    uint32_t handle = 0, refs = 0;
+    if (p) { p->refs++; handle = p->handle; refs = p->refs; }
+    dbg64_irq_restore64(fl);
+    if (!p) {
+        d64_begin(); d64_puts("[DRM] prime import FAILED reason=no-such-id id=");
+        d64_hex((uint64_t)(uint32_t)h.fd); d64_puts(" err="); d64_num(DRM64_EINVAL64); d64_end();
+        return -DRM64_EINVAL64;
+    }
+    h.handle = handle;
+    d64_uwr64(arg, &h, sizeof(Drm64PrimeHandle));
+    d64_begin(); d64_puts("[DRM] prime import id="); d64_hex((uint64_t)(uint32_t)h.fd);
+    d64_puts(" handle="); d64_num(handle); d64_puts(" refs="); d64_num(refs); d64_end();
+    return 0;
+}
+
 int drm64_ioctl64(uint64_t cmd, uint64_t arg, uint64_t pid) {
     switch (cmd) {
     case DRM64_IOWR(DRM64_NR_VERSION, Drm64Version):               return d64_ioctl_version64(arg);
@@ -1365,7 +1600,9 @@ int drm64_ioctl64(uint64_t cmd, uint64_t arg, uint64_t pid) {
     case DRM64_IOWR(DRM64_NR_MODE_DIRTYFB, Drm64ModeFbDirty):      return d64_ioctl_dirtyfb64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_GETPLANERES, Drm64ModeGetPlaneRes): return d64_ioctl_getplaneres64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_GETPLANE, Drm64ModeGetPlane):    return d64_ioctl_getplane64(arg);
-    case DRM64_IOWR(DRM64_NR_MODE_PAGE_FLIP, Drm64ModePageFlip):   return d64_ioctl_page_flip64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_PAGE_FLIP, Drm64ModePageFlip):   return d64_ioctl_page_flip64(arg, pid);
+    case DRM64_IOWR(DRM64_NR_PRIME_HANDLE_TO_FD, Drm64PrimeHandle): return d64_ioctl_prime_handle_to_fd64(arg);
+    case DRM64_IOWR(DRM64_NR_PRIME_FD_TO_HANDLE, Drm64PrimeHandle): return d64_ioctl_prime_fd_to_handle64(arg);
     case DRM64_IOWR(DRM64_NR_WAIT_VBLANK, Drm64WaitVblank):        return d64_ioctl_wait_vblank64(arg);
     case DRM64_IOWR(DRM64_NR_CRTC_GET_SEQUENCE, Drm64CrtcSeq):     return d64_ioctl_crtc_seq64(arg);
     default:

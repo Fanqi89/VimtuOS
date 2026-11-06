@@ -457,6 +457,48 @@ struct Drm64ClipRect {
 DRM64_STATIC_ASSERT(sizeof(struct Drm64ClipRect) == 8, "Drm64ClipRect 必须是 8 B（= Linux drm_clip_rect）");
 #define DRM64_MAX_CLIPS64 8u
 
+// ==================== ★ v0.9.20：PRIME（跨进程共享同一批物理页）====================
+// Linux ABI：DRM_IOCTL_PRIME_HANDLE_TO_FD(0x2D) / DRM_IOCTL_PRIME_FD_TO_HANDLE(0x2E)，
+// 结构体 struct drm_prime_handle { __u32 handle; __u32 flags; __s32 fd; } = 12 B。
+// **语义差异（如实写在这里，别在别处猜）**：Linux 用 UDS + SCM_RIGHTS 把真 fd 传给另一个进程；
+// 本内核没有"传 fd"这条路，所以：
+//   * HANDLE_TO_FD 返回的 fd 字段是一个**全局 prime id**（0x400 + 槽号），不是文件描述符；
+//   * 任何进程都能拿这个 id 调 FD_TO_HANDLE 换回 handle（本内核的 dumb handle 本来就是全局的
+//     1..4，所以换回来的号跟导出方相同 —— Linux 那边是每个 fd 一套号，这是第二处差异）；
+//   * 真正的价值是**页共享 + 引用计数**：两个进程 MAP_DUMB 同一个 handle 拿到的是同一批物理页，
+//     DESTROY_DUMB 只减引用，引用归零才把页还回页池（[DRM] map 行尾的 pid= 是宿主侧的证据）。
+#define DRM64_NR_PRIME_HANDLE_TO_FD 0x2Du
+#define DRM64_NR_PRIME_FD_TO_HANDLE 0x2Eu
+#define DRM64_MAX_PRIME64     4u
+#define DRM64_PRIME_ID_BASE64 0x400u
+struct __attribute__((packed)) Drm64PrimeHandle {
+    uint32_t handle;   // +0  in：dumb handle（导出方填）
+    uint32_t flags;    // +4  in：必须 0（不支持 DRM_CLOEXEC）
+    int32_t  fd;       // +8  out：全局 prime id（**不是 fd**，见上）
+};                     // = 12 B（= Linux struct drm_prime_handle）
+DRM64_STATIC_ASSERT(sizeof(struct Drm64PrimeHandle) == 12, "Drm64PrimeHandle 必须是 12 B（= Linux drm_prime_handle）");
+
+// ==================== ★ v0.9.20：事件投递（vblank 事件 + read/poll）====================
+// Linux：struct drm_event { u32 type; u32 length; } 后跟 struct drm_event_vblank 的其余字段，
+// 合计 32 B，type = DRM_EVENT_VBLANK(0x02)。PAGE_FLIP 带 DRM_MODE_PAGE_FLIP_EVENT(0x1) 时
+// 提交后**立即返回**，事件由 PIT tick（4 ms 粒度）入队，read() 从 /dev/dri/card0 取出来。
+// 如实边界：本内核没有独立的 vblank 中断源，所以"入队时刻"是 tick 而不是硬件回扫边沿；
+// 同一时刻只允许一个未入队的 flip（第二个返回 -EBUSY），队列满则丢最老的一条。
+#define DRM64_EVENT_VBLANK      0x02u
+#define DRM64_PAGE_FLIP_EVENT64 0x01u
+#define DRM64_EVQ_MAX64         8u
+#define DRM64_EV_OWNERS64       2u
+struct Drm64EventVblank {
+    uint32_t type;      // +0   = 0x02（DRM_EVENT_VBLANK）
+    uint32_t length;    // +4   = 32
+    uint64_t user_data; // +8   原样带回（PAGE_FLIP 的 user_data）
+    uint32_t tv_sec;    // +16
+    uint32_t tv_usec;   // +20  （4 ms 粒度，如实）
+    uint32_t sequence;  // +24  单调递增
+    uint32_t crtc_id;   // +28  = 1
+};                      // = 32 B（= Linux struct drm_event_vblank）
+DRM64_STATIC_ASSERT(sizeof(struct Drm64EventVblank) == 32, "Drm64EventVblank 必须是 32 B（= Linux drm_event_vblank）");
+
 /* ==================== evdev ABI ==================== */
 /* 24 B，与 Linux x86_64 的 struct input_event 同尺寸（时间戳 2×u64 + 2×u16 + i32）。 */
 struct __attribute__((packed)) InputEvent64 {
@@ -498,5 +540,6 @@ int  drm64_open(void);
 long drm64_ioctl(int fd, unsigned long cmd, void* arg);
 int  evdev64_open(int which);
 long evdev64_read(int fd, void* buf, long len);
+long drm64_read(int fd, void* buf, long len);      /* ★ v0.9.20：读 DRM 事件（32 B/条，空队列 -EAGAIN） */
 
 #endif /* VIMTU64_DRM64_H */

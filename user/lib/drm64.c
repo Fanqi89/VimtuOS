@@ -55,3 +55,9 @@ int evdev64_open(int which) {
 long evdev64_read(int fd, void* buf, long len) {
     return __v64_syscall(DRM64_LX_READ64, (long)fd, (long)(uintptr_t)buf, len, 0, 0);
 }
+
+/* ★ v0.9.20：从 /dev/dri/card0 读事件（struct Drm64EventVblank，32 B/条）。
+ * 队列空时内核如实返回 -EAGAIN（-11）—— 调用方应该先 poll(POLLIN) 再读。 */
+long drm64_read(int fd, void* buf, long len) {
+    return __v64_syscall(DRM64_LX_READ64, (long)fd, (long)(uintptr_t)buf, len, 0, 0);
+}

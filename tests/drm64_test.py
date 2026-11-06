@@ -20,6 +20,8 @@
   ⑤ 桌面照旧：`[GUI64] ready`（登录后），screendump 上部非黑像素比例 > 0.3（照 gpu64_test 的
      nonblack_frac）。
   ⑥ 禁止项：PANIC / TRIPLE FAULT / `[DRM] selftest FAIL` / `[DRMDEMO] done ok=0`。
+  ⑦ ★ v0.9.20：PRIME 跨进程（另一个进程读到 A 写进去的像素；两条 map 行 phys 相同、pid 不同）
+     + 事件投递（PAGE_FLIP(EVENT) 立即返回 -> poll(POLLIN) -> read 32 B 事件，user_data 原样回来）。
 
 夹具：build64/sysdisk.img 副本 + 卷里写 /bin/drmdemo.elf（build64/user_drmdemo.elf）+
       /etc/drm64_probe（演示开关，与 /etc/wl64_probe、/etc/wm_probe 同一套约定）。
@@ -106,6 +108,8 @@ STRUCT_NAMES = [
     "Drm64ModeCreateBlob", "Drm64ModeDestroyBlob",
     # ★ v0.9.17：2D 加速（脏矩形）
     "Drm64ModeFbDirty", "Drm64ClipRect",
+    # ★ v0.9.20：PRIME 跨进程 + 事件投递
+    "Drm64PrimeHandle", "Drm64EventVblank",
 ]
 
 
@@ -207,6 +211,9 @@ LINUX_DRM_ABI = [
     ("DRM64_NR_MODE_DESTROYBLOB",  "Drm64ModeDestroyBlob", 0xBE,   4, 0xC00464BE),
     # ★ v0.9.17：2D 加速（脏矩形）
     ("DRM64_NR_MODE_DIRTYFB",      "Drm64ModeFbDirty",     0xB1,  24, 0xC01864B1),
+    # ★ v0.9.20：PRIME 跨进程（Linux struct drm_prime_handle = 12 B）
+    ("DRM64_NR_PRIME_HANDLE_TO_FD", "Drm64PrimeHandle",    0x2D,  12, 0xC00C642D),
+    ("DRM64_NR_PRIME_FD_TO_HANDLE", "Drm64PrimeHandle",    0x2E,  12, 0xC00C642E),
 ]
 
 
@@ -625,6 +632,64 @@ def main():
                if re.search(r"\[DRM\] flip[^\r\n]*", log) else "缺 flip 行"))
         check("④ 反例：DIRTYFB 的 flags 非 0 -> [DRM] dirty FAILED reason=flags err=22",
               re.search(r"\[DRM\] dirty FAILED reason=flags err=22", log) is not None)
+
+        # ---------- ④-e ★ v0.9.20：PRIME 跨进程（同一批物理页）+ 事件投递 ----------
+        pex = re.search(r"\[DRM\] prime export handle=(\d+) id=0x([0-9a-f]+) refs=(\d+)", log)
+        check("④ PRIME 导出：HANDLE_TO_FD 给出全局 prime id（0x400+槽号）且 refs=1",
+              pex is not None and pex.group(2).startswith("40") and pex.group(3) == "1",
+              (pex.group(0) if pex else "缺 [DRM] prime export 行"))
+        pim = re.search(r"\[DRM\] prime import id=0x([0-9a-f]+) handle=(\d+) refs=(\d+)", log)
+        check("④ PRIME 导入：另一个进程把 id 换回 handle，refs 涨到 2",
+              pim is not None and pim.group(3) == "2",
+              (pim.group(0) if pim else "缺 [DRM] prime import 行"))
+        maps = re.findall(r"\[DRM\] map handle=(\d+) va=0x[0-9a-f]+ pages=\d+ phys=0x([0-9a-f]+) u=1 pid=(\d+)", log)
+        shared = [(a, b) for i, a in enumerate(maps) for b in maps[i + 1:]
+                  if a[0] == b[0] and a[1] == b[1] and a[2] != b[2]]
+        check("④ **两个进程真共享同一批物理页**（同一 handle/phys、两个不同 pid 的 [DRM] map 行）",
+              len(shared) >= 1,
+              ("handle=%s phys=0x%s pid=%s/%s" % (shared[0][0][0], shared[0][0][1],
+                                                 shared[0][0][2], shared[0][1][2])) if shared
+              else "map 行=%s" % (maps[:4],))
+        pimp = re.search(r"\[DRMDEMO\] prime import id=0x[0-9a-f]+ handle=\d+ rc=0/0 probe=0x([0-9a-f]+) release=0", log)
+        check("④ 子进程读到 A 写进去的像素（probe=0xffffffff）+ 还掉自己那份引用（release=0）",
+              pimp is not None and pimp.group(1) == "ffffffff",
+              (pimp.group(0) if pimp else "缺 [DRMDEMO] prime import 行"))
+        prel = re.search(r"\[DRM\] prime release handle=\d+ refs=1 pages_kept=1", log)
+        check("④ 引用计数生效：一方销毁只减引用、**页不释放**（pages_kept=1）",
+              prel is not None, (prel.group(0) if prel else "缺 [DRM] prime release 行"))
+        pch = re.search(r"\[DRMDEMO\] prime child pid=(-?\d+) wait=(-?\d+) status=0", log)
+        check("④ 子进程正常收工（wait4 看到 status=0 —— 像素核对通过才退 0）",
+              pch is not None, (pch.group(0) if pch else "缺 prime child 行"))
+        check("④ 反例：PRIME 导出不存在的 handle -> -EINVAL(-22)",
+              "[DRMDEMO] prime export bad-handle rc=-22" in log, "")
+        check("④ 反例：PRIME 导入负数 id -> -EINVAL(-22)，内核如实拒绝（不伪造句柄）",
+              "[DRMDEMO] prime import bad-id rc=-22" in log and
+              re.search(r"\[DRM\] prime import FAILED reason=bad-id fd=-1", log) is not None,
+              (re.search(r"\[DRM\] prime import FAILED[^\r\n]*", log).group(0)
+               if re.search(r"\[DRM\] prime import FAILED[^\r\n]*", log) else "缺 bad-id 行"))
+        # ---- 事件投递 ----
+        pev = re.search(r"\[DRM\] page_flip_event crtc=1 fb=\d+ seq=(\d+) user_data=0xab12cd34 path=(gpu|cpu) mode=async", log)
+        check("④ PAGE_FLIP(EVENT) 走异步路径（内核 [DRM] page_flip_event … mode=async）",
+              pev is not None, (pev.group(0) if pev else "缺 page_flip_event 行"))
+        evr = re.match(r"\[DRMDEMO\] event flip_rc=0 poll=1 read=32 type=2 len=32 seq=(\d+) crtc=1 user_data=0xab12cd34$",
+                       (re.search(r"\[DRMDEMO\] event flip_rc=[^\r\n]*", log).group(0)
+                        if re.search(r"\[DRMDEMO\] event flip_rc=[^\r\n]*", log) else ""))
+        check("④ poll(POLLIN) 等到事件 + read 拿到 32 B（type=2 len=32 user_data 原样回来）",
+              evr is not None,
+              (evr.group(0) if evr else
+               (re.search(r"\[DRMDEMO\] event flip_rc=[^\r\n]*", log).group(0)
+                if re.search(r"\[DRMDEMO\] event flip_rc=[^\r\n]*", log) else "缺 event 行")))
+        check("④ sequence 是正整数（单调递增的序列号真的填了）",
+              evr is not None and int(evr.group(1)) >= 1,
+              ("seq=%s" % evr.group(1)) if evr else "")
+        check("④ 事件的内核侧证据（[DRM] event read n=1 type=2 seq=… user_data=0xab12cd34）",
+              re.search(r"\[DRM\] event read n=1 type=2 seq=\d+ user_data=0xab12cd34", log) is not None,
+              (re.search(r"\[DRM\] event read[^\r\n]*", log).group(0)
+               if re.search(r"\[DRM\] event read[^\r\n]*", log) else "缺 event read 行"))
+        check("④ 反例：PAGE_FLIP 带未知 flag 位 -> -EINVAL(-22)",
+              "[DRMDEMO] event badflag rc=-22" in log, "")
+        check("④ 同步语义没退化：不带 flag 的 PAGE_FLIP 仍然 rc=0",
+              "[DRMDEMO] event sync_flip rc=0" in log, "")
 
         # ---------- ⑤ 桌面照旧 + 屏幕取证 ----------
         try:

@@ -32,6 +32,11 @@ extern "C" void syscall64_console_write64(const char* buf, int len) __attribute_
 // ★ v0.9.12：/dev/input/event0|1 的 read 走它（DRM/evdev 的实现在 kernel/drm64.cpp）。
 //   弱引用：安装介质内核不链 drm64.cpp -> 这里为 0 -> read 返回 -ENOSYS（不假装有输入）。
 int64_t evdev64_read64(int which, void* ubuf, uint64_t len) __attribute__((weak));
+// ★ v0.9.20：/dev/dri/card0 的 read 现在有语义了 —— 读 DRM 事件队列（struct Drm64EventVblank）。
+//   同样弱引用：安装介质内核不链 drm64.cpp -> 为 0 -> read/poll 如实 -ENOSYS / 永不就绪。
+int64_t drm64_events_read64(int pid, void* buf, uint64_t len) __attribute__((weak));
+int     drm64_events_pending64(int pid) __attribute__((weak));
+int     proc64_current_pid64() __attribute__((weak));
 
 // ==================== 对象 ====================
 #define FD64_KIND_FREE 0
@@ -219,6 +224,12 @@ int fd64_ready64(int fd) {
         if (p->n < FD64_PIPE_BYTES) r |= FD64_READY_OUT;
         if (p->readers == 0) r |= FD64_READY_OUT | FD64_READY_HUP;   // 没人读：写会 -EPIPE
         return r;
+    }
+    if (of->kind == FD64_KIND_DRM) {
+        // ★ v0.9.20：DRM fd 的 POLLIN 只在**有事件**时成立（以前是"永远就绪"，那是假话）
+        const int pid = proc64_current_pid64 ? proc64_current_pid64() : 0;
+        const int n = drm64_events_pending64 ? drm64_events_pending64(pid) : 0;
+        return (n > 0) ? FD64_READY_IN : 0;
     }
     return FD64_READY_IN | FD64_READY_OUT;      // 文件 / 目录 / tty
 }
@@ -834,7 +845,13 @@ int fd64_read64(int fd, void* buf, int len) {
     if (of->kind == FD64_KIND_TTY) return 0;                    // ★ A4-2a：控制台 tty 没有输入流（如实 EOF）
     // ★ v0.9.12：DRM 只走 ioctl（没有任何 read 语义）；evdev 的 read 出 struct input_event。
     //   两者都在这里分派，**不改**文件/pipe/tty 的既有分支。
-    if (of->kind == FD64_KIND_DRM) return -FD64_EINVAL;
+    if (of->kind == FD64_KIND_DRM) {
+        // ★ v0.9.20：DRM 的 read = 取事件（PAGE_FLIP_EVENT 投递出来的 vblank 事件）。
+        if (!buf || len < 0) return -FD64_EFAULT;
+        if (!drm64_events_read64) return -FD64_ENOSYS;
+        return (int)drm64_events_read64(proc64_current_pid64 ? proc64_current_pid64() : 0,
+                                        buf, (uint64_t)len);
+    }
     if (of->kind == FD64_KIND_EVDEV) {
         if (!buf || len < 0) return -FD64_EFAULT;
         if (!evdev64_read64) return -FD64_ENOSYS;               // 安装介质内核：没有这条通道（不假装有）

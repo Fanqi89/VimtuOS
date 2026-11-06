@@ -167,13 +167,26 @@ int vmware64_svga_probe64(uint32_t bdf, int bar0_is_io, uint64_t bar0_base) {
 
 #define VMW_CMD_UPDATE       1u           // SVGA_CMD_UPDATE { x, y, w, h }
 
-// 有界等待 SVGA_REG_BUSY 变 0（单位：spin 次数；tick 只是兜底）
-static int vw_wait_idle(const VmwBus* b, uint32_t spins) {
-    for (uint32_t i = 0; i < spins; i++) {
+// 有界等待 SVGA_REG_BUSY 变 0。max_reads = **最多读几次 BUSY**（不是 spin 次数）。
+// ★ v0.9.20 修：v0.9.19 这里是"2,000,000 次 spin、每次都 outl+inl"——
+//   在 VMware 上**每一次端口 I/O 都是一次 VM-exit**（真机上 1~10 us），
+//   2,000,000 次就是几十秒到几分钟的"假卡死"，ENABLE 之后启动停住就是这个。
+//   现在：两次端口读之间插 65536 次 pause（纯 CPU，不触发 VM-exit），
+//   并把上限收到 max_reads 次读（2000 次 × 约 30 us ≈ 60 ms 封顶）。
+static int vw_wait_idle(const VmwBus* b, uint32_t max_reads) {
+    for (uint32_t r = 0; r < max_reads; r++) {
         if (vw_reg_rd(b, VMW_REG_BUSY) == 0u) return 1;
-        __asm__ volatile("pause");
+        for (uint32_t k = 0; k < 65536u; k++) __asm__ volatile("pause");
     }
     return 0;
+}
+
+// 逐段面包屑：`[VMWARE] stage1 <tag> i=<n>`。死在哪一段，下一次串口里一眼可见
+// （i= 自增序号，跨三段连续；既有断言只看行尾字段，不受影响）。
+static uint32_t g_vw_crumb_i = 0;
+__attribute__((noinline)) static void vw_crumb(const char* tag) {
+    vw_begin(); vw_puts("[VMWARE] stage1 "); vw_puts(tag);
+    vw_puts(" i="); vw_num(++g_vw_crumb_i); vw_end();
 }
 
 // 配 FIFO 并做一次 SYNC 往返。max_words: 1 = MAX 用 word 数，0 = 用字节数（两种口径都试一次）。
@@ -193,7 +206,7 @@ static int vw_fifo_config(const VmwBus* b, uint32_t mem_start, uint32_t mem_size
     vw_reg_wr(b, VMW_REG_CONFIG_DONE, 1u);
     // SYNC：让 host 处理 FIFO 里已有的命令并回到空闲
     vw_reg_wr(b, VMW_REG_SYNC, 1u);
-    const int idle = vw_wait_idle(b, 2000000u);
+    const int idle = vw_wait_idle(b, 2000u);
     *out_min = fifo[VMW_FIFO_MIN];
     *out_max = fifo[VMW_FIFO_MAX];
     return idle;
@@ -201,17 +214,22 @@ static int vw_fifo_config(const VmwBus* b, uint32_t mem_start, uint32_t mem_size
 
 // 提交一条 SVGA_CMD_UPDATE（4 个参数），返回 1 = host 处理完（BUSY 回 0）
 static int vw_fifo_update(const VmwBus* b, uint32_t mem_start, uint32_t maxv, uint32_t x, uint32_t y,
-                          uint32_t w, uint32_t h) {
+                          uint32_t w, uint32_t h, uint32_t* out_next) {
     volatile uint32_t* fifo = (volatile uint32_t*)(uintptr_t)mem_start;
     uint32_t next = fifo[VMW_FIFO_NEXT_CMD];
-    if (next < VMW_FIFO_MIN_WORDS || next >= maxv) return 0;
-    if (next + 5u > maxv) return 0;                       // 简化：不做环绕（一次探针够用）
+    // ★ v0.9.20 修（实测定位）：ENABLE / CONFIG_DONE 之后 host 会把 FIFO[NEXT_CMD] 复位成 0（落在
+    //   头部保留区 [0, MIN) 里）。原来的 `if (next < MIN) return 0;` 会让 UPDATE **根本不提交**、却
+    //   只打一行 sync=TIMEOUT（看起来像 host 不回 SYNC，其实是自己提前退了）。
+    //   FIFO 只有我们一个写者，NEXT_CMD 就该归我们维护 —— 越界就从 MIN 重新开始。
+    if (next < VMW_FIFO_MIN_WORDS || next >= maxv) next = VMW_FIFO_MIN_WORDS;
+    if (next + 5u > maxv) next = VMW_FIFO_MIN_WORDS;      // 不做环绕（一次探针够用）
+    if (out_next) *out_next = next + 5u;
     fifo[next + 0u] = VMW_CMD_UPDATE;
     fifo[next + 1u] = x; fifo[next + 2u] = y; fifo[next + 3u] = w; fifo[next + 4u] = h;
     __asm__ volatile("mfence" ::: "memory");
     fifo[VMW_FIFO_NEXT_CMD] = next + 5u;
     vw_reg_wr(b, VMW_REG_SYNC, 1u);
-    return vw_wait_idle(b, 2000000u);
+    return vw_wait_idle(b, 2000u);
 }
 
 int vmware64_svga_stage1_64(void) {
@@ -245,6 +263,7 @@ int vmware64_svga_stage1_64(void) {
     vw_puts(" memlen="); vw_num(meml);
     vw_puts(" fb_start=0x"); vw_hex(fbs);
     vw_puts(" lfb=0x"); vw_hex(lfb); vw_end();
+    vw_crumb("a=pre");
     // ② FB_START 必须就是我们正在写的 LFB —— 否则 ENABLE 会换屏
     if ((uint64_t)fbs != lfb) {
         vw_begin(); vw_puts("[VMWARE] stage1 skipped reason=fb-mismatch (ENABLE would switch display)"); vw_end();
@@ -263,6 +282,7 @@ int vmware64_svga_stage1_64(void) {
     vw_puts(units ? " units=words" : " units=bytes");
     vw_puts(sync_ok ? " sync=ok" : " sync=TIMEOUT"); vw_end();
     if (!sync_ok) return 0;                                // 配不上就别动 ENABLE
+    vw_crumb("b=fifo-ok");
 
     // ★ 实测（v0.9.19）：ENABLE 之后启动会在桌面之前停住（没有 [GUI64] ready / [UI] perf）——
     //   "接管显示"这一步还有别的东西要一起配（模式/位深/scanout 或 VGA 回扫探针的兼容）。
@@ -296,11 +316,28 @@ int vmware64_svga_stage1_64(void) {
     const uint32_t h2 = vw_reg_rd(&bus, VMW_REG_HEIGHT);
     vw_begin(); vw_puts("[VMWARE] svga enable="); vw_num(en);
     vw_puts(" w="); vw_num(w2); vw_puts(" h="); vw_num(h2); vw_end();
+    vw_crumb("c=enable-written");
     if (en != 1u) return 0;
 
+    // ★ v0.9.20：实测（v0.9.20 第一轮）ENABLE 之后第一个 UPDATE 的 SYNC 不回来（BUSY 一直 1）。
+    //   真驱动的顺序是"接管显示之后再把 FIFO 的 CONFIG_DONE 打一次"——host 在 ENABLE 时会重置
+    //   FIFO 的簿记（NEXT_CMD/STOP 由 host 侧维护），所以这里按原口径（同一个 MEM 区）**再配一次**，
+    //   成功才提交 UPDATE。失败也不影响显示（LFB 仍在扫出），如实记录、不假装。
+    {
+        uint32_t m2 = 0, x2 = 0;
+        const int re = vw_fifo_config(&bus, mems, meml, units, &m2, &x2);
+        vw_begin(); vw_puts("[VMWARE] stage1 refifo min="); vw_num(m2);
+        vw_puts(" max="); vw_num(x2);
+        vw_puts(re ? " sync=ok" : " sync=TIMEOUT"); vw_end();
+    }
+
     // ⑤ 提交一条 SVGA_CMD_UPDATE（64x64）—— 这一步通了就说明 FIFO 命令通路真的活着
-    const int upd = vw_fifo_update(&bus, mems, fmax, 0u, 0u, 64u, 64u);
+    vw_crumb("d=update-enter");
+    uint32_t unext = 0;
+    const int upd = vw_fifo_update(&bus, mems, fmax, 0u, 0u, 64u, 64u, &unext);
+    vw_crumb("e=update-done");
     vw_begin(); vw_puts("[VMWARE] fifo update(0,0,64,64) ");
-    vw_puts(upd ? "sync=ok" : "sync=TIMEOUT"); vw_end();
+    vw_puts(upd ? "sync=ok" : "sync=TIMEOUT");
+    vw_puts(" next="); vw_num(unext); vw_puts(" max="); vw_num(fmax); vw_end();
     return upd;
 }

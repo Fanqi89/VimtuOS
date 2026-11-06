@@ -336,6 +336,10 @@ extern "C" void panic64_cpu_exception64(uint64_t int_no, void* frame) __attribut
 //   用户 handler、要么这个进程按"默认动作"死掉 —— **内核继续跑**，不再 PANIC 整机）。
 //   weak：保持"没链接这个模块 = 老行为（PANIC）"的既有性质；只有 ring3 的异常才会走它。
 extern "C" int sig64_user_fault64(uint64_t int_no, pt_regs64* r) __attribute__((weak));
+// ★ v0.9.20：DRM 事件投递的 tick 钩子（kernel/drm64.cpp）。PAGE_FLIP 带 EVENT 时事件登记在
+//   内核里，由这里在下一个 4 ms tick 真正入队 —— 这就是"提交后立即返回、帧边界再投递"。
+//   weak：安装介质内核不链 drm64.cpp —— 那时指针为 0，一个字节的行为都不变。
+extern "C" void drm64_tick64(void) __attribute__((weak));
 
 extern "C" void isr_handler64(pt_regs64* r) {
     const uint64_t no = r->int_no;
@@ -343,6 +347,7 @@ extern "C" void isr_handler64(pt_regs64* r) {
 
     if (no == 32) {
         g_ticks64++;
+        if (drm64_tick64) drm64_tick64();       // ★ v0.9.20：DRM 事件投递（无事件时只读一个 int）
         pic_eoi(0);
         schedule64(r);
         return;
