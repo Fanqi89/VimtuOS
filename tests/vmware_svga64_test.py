@@ -15,7 +15,12 @@ SVGA3D 协议 —— 所以"3D 加速"这件事必须**换一个真实厂商设�
   ③ 几何/显存/FIFO 自洽：`max=WxH` 不小于 1024x768、`bpp=32`、`vram`/`memlen` 合理。
   ④ **DRM 2D 路径在 VMware 上也成立**：`[DRM] selftest dum=ok … ok=1`（同一个内核自检）。
   ⑤ 桌面照旧 `[GUI64] ready`；全程无 PANIC / TRIPLE FAULT。
-  ⑥ 如实说明：SVGA3D **命令协议**尚未实现 —— 所以即使 `3d=1`，也**不**声称"3D 出图已验证"。
+  ⑥ **v0.9.19 阶段 1（真驱动设备）**：卷里有 `/etc/gpu3d_probe` 时，内核会
+     **配 FIFO -> CONFIG_DONE -> SYNC/BUSY 往返 -> ENABLE -> 提交 SVGA_CMD_UPDATE**：
+     `[VMWARE] fifo cfg … sync=ok` / `[VMWARE] svga enable=1 w=… h=…` / `[VMWARE] fifo update(0,0,64,64) sync=ok`。
+     没有这个探针时**一个寄存器都不写**（`stage1 skipped reason=probe=0`）。
+  ⑦ 如实说明：SVGA3D 的**3D 命令协议**（SURFACE_DEFINE/SETRENDERTARGET/CLEAR/SURFACE_DMA）尚未实现 ——
+     所以即使 `3d=1` 且 FIFO 通了，也**不**声称"3D 出图已验证"。
 
 用法：py -3 tests\\vmware_svga64_test.py [--img build64\\sysdisk.img] [--vnc-port 5907] [--keep]
 退出码：0 = 全过；1 = 有断言失败；2 = 环境问题（没有 vmrun / VM 起不来）。
@@ -70,6 +75,34 @@ def vmx_text(name, disk, serial_log, vnc_port):
             % (name, disk, serial_log.replace("\\", "\\\\"), vnc_port))
 
 
+def make_image_with_probe(src, dst, marker=True):
+    """复制 sysdisk.img，并（可选）往系统卷里写 /etc/gpu3d_probe（opt-in 开关）。"""
+    shutil.copyfile(src, dst)
+    if not marker:
+        return dst
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "tcc_pack_win", os.path.join(ROOT, "tools", "tcc_pack_win.py"))
+    TP = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(TP)
+    PART_MAIN_LBA = 8009
+    TARGET_SECTORS = 32768
+    d = open(dst, "rb").read()
+    vol = bytearray(d[PART_MAIN_LBA * SECTOR:(PART_MAIN_LBA + TARGET_SECTORS) * SECTOR])
+    if bytes(vol[0:8]) != b"VIMTUFS2":
+        raise SystemExit("sysdisk.img 里没有 VIMTUFS2 卷")
+    total = int.from_bytes(vol[20:24], "little")
+    ed = TP.VolumeEdit(total)
+    ed.load(vol)
+    ed.put("/etc/gpu3d_probe", b"1\n", mode=0o644)
+    out = ed.finish()
+    disk = bytearray(d)
+    disk[PART_MAIN_LBA * SECTOR:(PART_MAIN_LBA + TARGET_SECTORS) * SECTOR] = out
+    with open(dst, "wb") as f:
+        f.write(disk)
+    return dst
+
+
 def read(path):
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -98,16 +131,6 @@ def main():
         return r.returncode, (r.stdout + r.stderr).decode("utf-8", "replace")
 
     tmp = tempfile.mkdtemp(prefix="vmware_svga_")
-    flat = os.path.join(tmp, "disk-flat.img")
-    shutil.copyfile(args.img, flat)
-    sectors = os.path.getsize(flat) // SECTOR
-    vmdk_descriptor(os.path.join(tmp, "disk.vmdk"), "disk-flat.img", sectors)
-    serial = os.path.join(tmp, "serial.log")
-    vmx = os.path.join(tmp, "svga0918.vmx")
-    with open(vmx, "w", encoding="utf-8", newline="\n") as f:
-        f.write(vmx_text("vimtu64-svga0918", "disk.vmdk", serial, args.vnc_port))
-    print("VMX = %s" % vmx)
-
     checks = []
 
     def check(name, cond, detail=""):
@@ -115,7 +138,20 @@ def main():
         print("  [%s] %-58s %s" % ("PASS" if cond else "FAIL", name, detail))
         return bool(cond)
 
-    print("=== VimtuOS VMware SVGA acceptance（VMware 虚拟机上的 GPU 取证）===")
+    def boot(tag, marker, vnc_port):
+        flat = os.path.join(tmp, "disk-%s.img" % tag)
+        make_image_with_probe(args.img, flat, marker)
+        sectors = os.path.getsize(flat) // SECTOR
+        vmdk_descriptor(os.path.join(tmp, "disk-%s.vmdk" % tag), "disk-%s.img" % tag, sectors)
+        ser = os.path.join(tmp, "serial-%s.log" % tag)
+        vmxp = os.path.join(tmp, "svga-%s.vmx" % tag)
+        with open(vmxp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(vmx_text("vimtu64-svga-%s" % tag, "disk-%s.vmdk" % tag, ser, vnc_port))
+        return vmxp, ser
+
+    print("=== VimtuOS VMware SVGA acceptance（VMware 取证 + stage1 真驱动）===")
+    vmx, serial = boot("probe", True, args.vnc_port)
+    print("VMX = %s" % vmx)
     code, out = run("start", vmx, "nogui")
     if code != 0:
         print("环境问题：vmrun start 失败 rc=%d %s" % (code, out.strip()[:300]))
@@ -141,6 +177,10 @@ def main():
         while time.time() - t1 < 180:
             if "[GUI64] ready" in read(serial):
                 break
+            time.sleep(1.0)
+        # 帧循环证据：[UI] perf 每几秒才打一条，等一小会儿（有界）
+        t2 = time.time()
+        while time.time() - t2 < 40 and "[UI] perf" not in read(serial):
             time.sleep(1.0)
         log = read(serial)
 
@@ -172,14 +212,33 @@ def main():
         check("④ DRM 2D 路径在 VMware 上也成立（[DRM] selftest … ok=1）", drm_self is not None,
               (drm_self.group(0) if drm_self else "缺 [DRM] selftest ok=1"))
         check("⑤ 桌面照旧起来（[GUI64] ready）", "[GUI64] ready" in log)
+        # ⑥ ★ v0.9.19 阶段 1：真驱动设备（FIFO + SYNC + ENABLE + UPDATE）
+        check("⑥ stage1 真的动了设备（[VMWARE] stage1 pre 行）", "[VMWARE] stage1 pre" in log,
+              (re.search(r"\[VMWARE\] stage1 pre[^\r\n]*", log).group(0)
+               if re.search(r"\[VMWARE\] stage1 pre[^\r\n]*", log) else "缺 stage1 pre 行"))
+        fcfg = re.search(r"\[VMWARE\] fifo cfg min=(\d+) max=(\d+) units=(\w+) sync=(\w+)", log)
+        check("⑥ FIFO 配上且 SYNC/BUSY 往返成功（fifo cfg … sync=ok）",
+              fcfg is not None and fcfg.group(4) == "ok",
+              (fcfg.group(0) if fcfg else "缺 fifo cfg 行"))
+        # 默认只验证 FIFO 通路、**不接管显示**（ENABLE 需要更深一层的 /etc/gpu3d_enable）
+        check("⑥ 默认不接管显示（enable skipped reason=no-marker）",
+              "stage1 fifo sync=ok enable skipped reason=no-marker" in log,
+              (re.search(r"\[VMWARE\] stage1 fifo[^\r\n]*", log).group(0)
+               if re.search(r"\[VMWARE\] stage1 fifo[^\r\n]*", log) else "缺 enable skipped 行"))
+        check("⑥ 默认情况下一个 ENABLE 都没写（不得出现 svga enable=）", "[VMWARE] svga enable=" not in log)
+        check("⑥ 桌面帧循环照常跑（[UI] perf 行出现）", "[UI] perf" in log)
         for bad in ("PANIC", "TRIPLE FAULT"):
             check("⑤ 不得出现 %s" % bad, bad not in log)
 
         # ⑥ 如实结论
         three_d = (m3.group(1) == "1") if m3 else False
         print("")
+        stage1_ok = (fcfg is not None and fcfg.group(4) == "ok")
         if three_d:
-            print("  ⑥ 结论：VMware SVGA3D **能力位 = 1**（宿主提供 3D）。")
+            print("  ⑦ 结论：VMware SVGA3D **能力位 = 1**（宿主提供 3D）；FIFO/SYNC 通路 %s。"
+                  % ("已验证（阶段 1 的一半：命令通路活了，但还没接管显示）" if stage1_ok else "未验证"))
+            print("     下一步：ENABLE 之后启动会停在桌面之前（实测），要先查清 SVGA 模式与 VGA 回扫/scanout 的兼容，"
+                  "再接 SVGA3D 的 SURFACE_DEFINE/SETRENDERTARGET/CLEAR/SURFACE_DMA。")
             print("     但 SVGA3D **命令协议尚未实现** —— 所以本脚本**不**声称\"3D 出图已验证\"；")
             print("     这是下一步（SVGA3D 的 FIFO 命令 + OT 表 + 着色器）的工作。")
         else:
@@ -188,6 +247,28 @@ def main():
         run("stop", vmx, "hard", timeout=120)
         if args.keep:
             print("[vmware] 串口日志：%s" % serial)
+
+    # ---------- 二次启动：没有 /etc/gpu3d_probe 时，stage1 必须"一个寄存器都不写" ----------
+    print("---- 二次启动：opt-in 关（无 /etc/gpu3d_probe）----")
+    vmx2, serial2 = boot("noprobe", False, args.vnc_port + 1)
+    code2, out2 = run("start", vmx2, "nogui")
+    if code2 != 0:
+        check("⑦ opt-in 关时 VM 能启动", False, out2.strip()[:200])
+    else:
+        try:
+            t2 = time.time()
+            while time.time() - t2 < 180 and "[VMWARE] stage1" not in read(serial2):
+                time.sleep(1.0)
+            log2 = read(serial2)
+            check("⑦ opt-in 关时如实跳过（stage1 skipped reason=probe=0）",
+                  "stage1 skipped reason=probe=0" in log2,
+                  (re.search(r"\[VMWARE\] stage1[^\r\n]*", log2).group(0)
+                   if re.search(r"\[VMWARE\] stage1[^\r\n]*", log2) else "缺 stage1 行"))
+            check("⑦ opt-in 关时**没有**写 ENABLE（不得出现 svga enable=）",
+                  "[VMWARE] svga enable=" not in log2)
+            check("⑦ opt-in 关时 FIFO 也没配（不得出现 fifo cfg）", "[VMWARE] fifo cfg" not in log2)
+        finally:
+            run("stop", vmx2, "hard", timeout=120)
 
     npass = sum(1 for _n, c, _d in checks if c)
     nfail = len(checks) - npass

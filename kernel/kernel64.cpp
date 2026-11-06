@@ -18,7 +18,8 @@
 // ★ 驱动线 3：virtio-gpu 2D 驱动（显示后端；两份内核都链 —— 安装程序的向导画面也走同一条上屏路径）
 #include "virtio_gpu64.h"
 #include "gpu64.h"          // ★ v0.9.4：通用 GPU 层（P1）—— 枚举/厂商识别/BAR/命令寄存器/只读探测
-#include "drm64.h"          // ★ v0.9.12：DRM/KMS + evdev 门面（只进系统内核；安装介质核心里是 weak 兜底）
+#include "drm64.h"
+#include "vmware64.h"        // ★ v0.9.19：VMware SVGA 阶段 1（FIFO/ENABLE/UPDATE）          // ★ v0.9.12：DRM/KMS + evdev 门面（只进系统内核；安装介质核心里是 weak 兜底）
 #include "font.h"
 #include "input.h"
 // ---- 硬件清单 / ACPI 平台表 / VimtuFS2 文件系统：两份内核都链接（只读探测 + 内存假盘自检）----
@@ -1235,6 +1236,10 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
                 //   不多建一个进程。位置：整段 ring3 演示的**最后**（多建/多收一个进程的演示排
                 //   最后最不容易搅动前面那些脚本的断言）。
                 (void)drm64_demo64("/bin/drmdemo.elf");
+    // ★ v0.9.19：VMware SVGA 阶段 1（真驱动设备：FIFO + SYNC + ENABLE + UPDATE）。
+    //   放在这里而不是 GPU 枚举里：探针开关 /etc/gpu3d_probe 在卷上，得等 VFS 挂好；
+    //   而且桌面已经起来，ENABLE 之后立刻能看出"显示有没有被弄坏"。
+    (void)vmware64_svga_stage1_64();
 
             } else {
                 proc64_init64();                                 // 仍然打点：mode=shared（如实）

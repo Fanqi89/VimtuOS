@@ -19,6 +19,7 @@
 #include "vmware64.h"
 #include "debug64.h"
 #include "port.h"          // inl / outl
+#include "pci64.h"         // pci64_cfg_rd32（stage1 重新读 BAR0）
 
 static const char* const VMW_HEXL = "0123456789abcdef";
 __attribute__((noinline)) static void vw_puts(const char* s) { dbg64_str(s); }
@@ -78,6 +79,10 @@ static void vw_reg_wr(const VmwBus* b, uint32_t idx, uint32_t v) {
     *(volatile uint32_t*)(uintptr_t)(b->base + (uint64_t)idx * 4ull) = v;
 }
 
+// stage1 需要用探测阶段记下的 bdf（避免再扫一遍 PCI）
+static uint32_t g_vmw_bdf = 0xFFFFFFFFu;
+static int      g_vmw_ok = 0;
+
 int vmware64_svga_probe64(uint32_t bdf, int bar0_is_io, uint64_t bar0_base) {
     (void)bdf;
     if (bar0_base == 0ull) {
@@ -132,5 +137,170 @@ int vmware64_svga_probe64(uint32_t bdf, int bar0_is_io, uint64_t bar0_base) {
     vw_puts(" mem="); vw_hex(mems); vw_puts(" memlen="); vw_num(meml);
     vw_puts(bar0_is_io ? " port=io" : " port=mmio");
     vw_end();
+    g_vmw_bdf = bdf;
+    g_vmw_ok = 1;
     return 1;
+}
+
+// ==================== 阶段 1（v0.9.19）：真正把设备驱动起来 ====================
+// 为什么分阶段：读寄存器只是"看"，`SVGA3D` 要先把 **FIFO** 配好并把命令递进去。
+// 这一步做的是：配 FIFO -> CONFIG_DONE -> SYNC/BUSY 往返 -> ENABLE -> UPDATE 提交。
+// 两个前提（缺一就不做，绝不拿显示去赌）：
+//   ① 卷里有 `/etc/gpu3d_probe`（opt-in：默认启动一个寄存器都不写）
+//   ② `SVGA_REG_FB_START` == 我们当前正在用的帧缓冲物理地址（否则 ENABLE 会换屏，可能直接黑屏）
+#include "fb.h"            // fb64_lfb_phys64 / fb_phys_width / fb_phys_height
+#include "vfs64.h"         // vfs64_stat（opt-in 探针）
+#include "x86_64.h"        // g_ticks64（有界等待）
+
+#define VMW_REG_ENABLE       1u
+#define VMW_REG_CONFIG_DONE  20u
+#define VMW_REG_SYNC         21u
+#define VMW_REG_BUSY         22u
+
+// FIFO 寄存器（在 MEM 区的 uint32 数组里）
+#define VMW_FIFO_MIN         0u
+#define VMW_FIFO_MAX         1u
+#define VMW_FIFO_NEXT_CMD    2u
+#define VMW_FIFO_STOP        3u
+#define VMW_FIFO_CAPABILITIES 4u
+#define VMW_FIFO_MIN_WORDS   16u          // 头部保留 16 word（寄存器 + capabilities）
+
+#define VMW_CMD_UPDATE       1u           // SVGA_CMD_UPDATE { x, y, w, h }
+
+// 有界等待 SVGA_REG_BUSY 变 0（单位：spin 次数；tick 只是兜底）
+static int vw_wait_idle(const VmwBus* b, uint32_t spins) {
+    for (uint32_t i = 0; i < spins; i++) {
+        if (vw_reg_rd(b, VMW_REG_BUSY) == 0u) return 1;
+        __asm__ volatile("pause");
+    }
+    return 0;
+}
+
+// 配 FIFO 并做一次 SYNC 往返。max_words: 1 = MAX 用 word 数，0 = 用字节数（两种口径都试一次）。
+static int vw_fifo_config(const VmwBus* b, uint32_t mem_start, uint32_t mem_size, int max_words,
+                          uint32_t* out_min, uint32_t* out_max) {
+    if (mem_size < 4096u || mem_start == 0u) return 0;
+    if ((uint64_t)mem_start + (uint64_t)mem_size > 0x100000000ull) return 0;   // 必须在恒等直映区
+    volatile uint32_t* fifo = (volatile uint32_t*)(uintptr_t)mem_start;
+    vw_reg_wr(b, VMW_REG_CONFIG_DONE, 0u);
+    const uint32_t maxv = max_words ? (mem_size / 4u) : mem_size;
+    fifo[VMW_FIFO_MIN]  = VMW_FIFO_MIN_WORDS;
+    fifo[VMW_FIFO_MAX]  = maxv;
+    fifo[VMW_FIFO_NEXT_CMD] = VMW_FIFO_MIN_WORDS;
+    fifo[VMW_FIFO_STOP] = VMW_FIFO_MIN_WORDS;
+    fifo[VMW_FIFO_CAPABILITIES] = 0u;
+    __asm__ volatile("mfence" ::: "memory");
+    vw_reg_wr(b, VMW_REG_CONFIG_DONE, 1u);
+    // SYNC：让 host 处理 FIFO 里已有的命令并回到空闲
+    vw_reg_wr(b, VMW_REG_SYNC, 1u);
+    const int idle = vw_wait_idle(b, 2000000u);
+    *out_min = fifo[VMW_FIFO_MIN];
+    *out_max = fifo[VMW_FIFO_MAX];
+    return idle;
+}
+
+// 提交一条 SVGA_CMD_UPDATE（4 个参数），返回 1 = host 处理完（BUSY 回 0）
+static int vw_fifo_update(const VmwBus* b, uint32_t mem_start, uint32_t maxv, uint32_t x, uint32_t y,
+                          uint32_t w, uint32_t h) {
+    volatile uint32_t* fifo = (volatile uint32_t*)(uintptr_t)mem_start;
+    uint32_t next = fifo[VMW_FIFO_NEXT_CMD];
+    if (next < VMW_FIFO_MIN_WORDS || next >= maxv) return 0;
+    if (next + 5u > maxv) return 0;                       // 简化：不做环绕（一次探针够用）
+    fifo[next + 0u] = VMW_CMD_UPDATE;
+    fifo[next + 1u] = x; fifo[next + 2u] = y; fifo[next + 3u] = w; fifo[next + 4u] = h;
+    __asm__ volatile("mfence" ::: "memory");
+    fifo[VMW_FIFO_NEXT_CMD] = next + 5u;
+    vw_reg_wr(b, VMW_REG_SYNC, 1u);
+    return vw_wait_idle(b, 2000000u);
+}
+
+int vmware64_svga_stage1_64(void) {
+    // ① opt-in
+    uint32_t t = 0, sz = 0;
+    static const char PROBE[] = "/etc/gpu3d_probe";
+    if (vfs64_stat(PROBE, &t, &sz) != 0) {
+        vw_begin(); vw_puts("[VMWARE] stage1 skipped reason=probe=0 (no /etc/gpu3d_probe)"); vw_end();
+        return 0;
+    }
+    // 找 SVGA（复用探测里那份总线信息：这里重新从 PCI 配置读一遍，保持独立）
+    const uint32_t bdf = g_vmw_bdf;
+    if (!g_vmw_ok || bdf == 0xFFFFFFFFu) {
+        vw_begin(); vw_puts("[VMWARE] stage1 skipped reason=no-probe"); vw_end();
+        return 0;
+    }
+    const uint32_t b0 = pci64_cfg_rd32(bdf, 0x10u);
+    if (!(b0 & 1u)) {
+        vw_begin(); vw_puts("[VMWARE] stage1 skipped reason=bar0-not-io"); vw_end();
+        return 0;
+    }
+    VmwBus bus;
+    bus.is_io = 1;
+    bus.base = (uint64_t)(b0 & ~0x3u);
+
+    const uint32_t mems = vw_reg_rd(&bus, VMW_REG_MEM_START);
+    const uint32_t meml = vw_reg_rd(&bus, VMW_REG_MEM_SIZE);
+    const uint32_t fbs  = vw_reg_rd(&bus, VMW_REG_FB_START);
+    const uint64_t lfb  = fb64_lfb_phys64();
+    vw_begin(); vw_puts("[VMWARE] stage1 pre fifo=0x"); vw_hex(mems);
+    vw_puts(" memlen="); vw_num(meml);
+    vw_puts(" fb_start=0x"); vw_hex(fbs);
+    vw_puts(" lfb=0x"); vw_hex(lfb); vw_end();
+    // ② FB_START 必须就是我们正在写的 LFB —— 否则 ENABLE 会换屏
+    if ((uint64_t)fbs != lfb) {
+        vw_begin(); vw_puts("[VMWARE] stage1 skipped reason=fb-mismatch (ENABLE would switch display)"); vw_end();
+        return 0;
+    }
+    // ③ 配 FIFO：先按 word 口径，失败再按字节口径（两种历史写法都试，最多两次）
+    uint32_t fmin = 0, fmax = 0;
+    int sync_ok = vw_fifo_config(&bus, mems, meml, 1, &fmin, &fmax);
+    int units = 1;
+    if (!sync_ok) {
+        sync_ok = vw_fifo_config(&bus, mems, meml, 0, &fmin, &fmax);
+        units = 0;
+    }
+    vw_begin(); vw_puts("[VMWARE] fifo cfg min="); vw_num(fmin);
+    vw_puts(" max="); vw_num(fmax);
+    vw_puts(units ? " units=words" : " units=bytes");
+    vw_puts(sync_ok ? " sync=ok" : " sync=TIMEOUT"); vw_end();
+    if (!sync_ok) return 0;                                // 配不上就别动 ENABLE
+
+    // ★ 实测（v0.9.19）：ENABLE 之后启动会在桌面之前停住（没有 [GUI64] ready / [UI] perf）——
+    //   "接管显示"这一步还有别的东西要一起配（模式/位深/scanout 或 VGA 回扫探针的兼容）。
+    //   所以 ENABLE + UPDATE 要再开一层（/etc/gpu3d_enable）：默认只验证 FIFO 通路，
+    //   绝不因为一个探针把默认启动弄坏。
+    {
+        uint32_t et = 0, esz = 0;
+        if (vfs64_stat("/etc/gpu3d_enable", &et, &esz) != 0) {
+            vw_begin(); vw_puts("[VMWARE] stage1 fifo sync=ok enable skipped reason=no-marker"); vw_end();
+            return 1;                                      // FIFO 通路已验证（不改变显示）
+        }
+    }
+
+    // ④ ENABLE：几何必须与我们的 LFB 完全一致，否则就是"换模式"——跳过（不拿显示赌）
+    const uint32_t w = vw_reg_rd(&bus, VMW_REG_WIDTH);
+    const uint32_t h = vw_reg_rd(&bus, VMW_REG_HEIGHT);
+    const uint32_t bpp = vw_reg_rd(&bus, VMW_REG_BPP);
+    if (w != (uint32_t)fb_phys_width() || h != (uint32_t)fb_phys_height()) {
+        vw_begin(); vw_puts("[VMWARE] stage1 skipped reason=geom-mismatch svga=");
+        vw_num(w); vw_puts("x"); vw_num(h);
+        vw_puts(" lfb="); vw_num((uint64_t)fb_phys_width()); vw_puts("x");
+        vw_num((uint64_t)fb_phys_height()); vw_end();
+        return 0;
+    }
+    vw_reg_wr(&bus, VMW_REG_WIDTH, w ? w : (uint32_t)fb_phys_width());
+    vw_reg_wr(&bus, VMW_REG_HEIGHT, h ? h : (uint32_t)fb_phys_height());
+    if (!bpp) vw_reg_wr(&bus, VMW_REG_BPP, 32u);
+    vw_reg_wr(&bus, VMW_REG_ENABLE, 1u);
+    const uint32_t en = vw_reg_rd(&bus, VMW_REG_ENABLE);
+    const uint32_t w2 = vw_reg_rd(&bus, VMW_REG_WIDTH);
+    const uint32_t h2 = vw_reg_rd(&bus, VMW_REG_HEIGHT);
+    vw_begin(); vw_puts("[VMWARE] svga enable="); vw_num(en);
+    vw_puts(" w="); vw_num(w2); vw_puts(" h="); vw_num(h2); vw_end();
+    if (en != 1u) return 0;
+
+    // ⑤ 提交一条 SVGA_CMD_UPDATE（64x64）—— 这一步通了就说明 FIFO 命令通路真的活着
+    const int upd = vw_fifo_update(&bus, mems, fmax, 0u, 0u, 64u, 64u);
+    vw_begin(); vw_puts("[VMWARE] fifo update(0,0,64,64) ");
+    vw_puts(upd ? "sync=ok" : "sync=TIMEOUT"); vw_end();
+    return upd;
 }

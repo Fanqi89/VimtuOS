@@ -11,3 +11,7 @@
 
 // 读 SVGA 寄存器并打一行 [VMWARE] svga …。返回 1 = 读成功（id 可识别），0 = 读不到/不认识。
 int vmware64_svga_probe64(uint32_t bdf, int bar0_is_io, uint64_t bar0_base);
+// ★ v0.9.19 阶段 1：真正驱动设备（配 FIFO -> CONFIG_DONE -> SYNC/BUSY 往返 -> ENABLE -> UPDATE）。
+//   opt-in：只有卷里有 /etc/gpu3d_probe 才动；且要求 SVGA_REG_FB_START == 当前 LFB 且几何一致，
+//   否则一律跳过（绝不拿显示去赌）。返回 1 = FIFO 命令通路已验证。
+int vmware64_svga_stage1_64(void);

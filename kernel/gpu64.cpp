@@ -203,6 +203,7 @@ static void ga_probe64(Gpu64Dev64* p) {
         const uint64_t base = (uint64_t)(is_io ? (b0 & ~0x3u) : (b0 & ~0x0Fu));
         p->probe_ok = vmware64_svga_probe64(p->bdf, is_io, base) ? 1 : 0;
         if (!p->probe_ok) g_skip[p->index] = GS_NOPROBE;
+        // 阶段 1（FIFO/ENABLE/UPDATE）不在这里做：探针开关在卷上，得等 VFS 挂好 -> kernel64.cpp 里调。
         return;
     }
 
