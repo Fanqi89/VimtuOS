@@ -2300,12 +2300,14 @@ def cap_drm_kms():
               "`/dev/console` 同一套做法，命中 %d）；`ioctl(16)` 在 tty 分支**之后**按 fd 类型分派 —— "
               "既有 ABI 号（wl64 15–21/22–26、fb 9/10/11、pci 48）一个都没动"
               % grep_count(r"FD64_DRM_PATH|FD64_EVDEV0_PATH|FD64_EVDEV1_PATH", ["kernel/fd64.h"]))
-    ev.append("**16 个 ioctl 号与 Linux `include/uapi/drm/drm.h` 逐值相等**：VERSION `0xC0406400` / "
+    ev.append("**24 个 ioctl 号与 Linux `include/uapi/drm/drm.h` 逐值相等**：VERSION `0xC0406400` / "
               "GET_CAP `0xC010640C` / GETRESOURCES `0xC04064A0` / GETCRTC `0xC06864A1` / SETCRTC `0xC06864A2` / "
-              "GETCONNECTOR `0xC05064A7` / ADDFB `0xC01C64AD` / ADDFB2 `0xC06864AE` / PAGE_FLIP `0xC01864B0` / "
-              "CREATE_DUMB `0xC02064B2` / MAP_DUMB `0xC01064B3` / DESTROY_DUMB `0xC00464B4` / GETPLANE `0xC02064B5` / "
-              "GETPLANERES `0xC01064B6` / WAIT_VBLANK `0xC018643A` / CRTC_GET_SEQUENCE `0xC018643B`；"
-              "对应 struct 的 sizeof 也逐字节相同（64/16/64/104/104/80/28/104/24/32/16/4/32/16/24/24）。"
+              "GETENCODER `0xC01464A6` / GETCONNECTOR `0xC05064A7` / GETPROPERTY `0xC04064AA` / GETPROPBLOB `0xC01064AC` / "
+              "ADDFB `0xC01C64AD` / ADDFB2 `0xC06864AE` / PAGE_FLIP `0xC01864B0` / CREATE_DUMB `0xC02064B2` / "
+              "MAP_DUMB `0xC01064B3` / DESTROY_DUMB `0xC00464B4` / GETPLANE `0xC02064B5` / GETPLANERES `0xC01064B6` / "
+              "OBJ_GETPROPERTIES `0xC02064B9` / OBJ_SETPROPERTY `0xC01864BA` / ATOMIC `0xC03864BC` / "
+              "CREATEPROPBLOB `0xC01064BD` / DESTROYPROPBLOB `0xC00464BE` / WAIT_VBLANK `0xC018643A` / "
+              "CRTC_GET_SEQUENCE `0xC018643B`；对应 25 个 struct 的 sizeof 也逐字节相同。"
               "**判据不是硬编码表**：tests/drm64_test.py 的 ①b 用两份头文件里的 sizeof 断言反算 ioctl 号 —— "
               "改 sizeof 就等于改号，漂一个就红（另有反例控制：故意写回 VERSION=56 会报 3 条）")
     ev.append("dumb buffer 怎么让 ring3 **真能写**：`CREATE_DUMB` 用 `page_alloc_64()` 逐页分配（不要求物理连续），"
@@ -2320,6 +2322,12 @@ def cap_drm_kms():
               "是两套号）+ `SETCRTC`（fb_id=0 = 真清屏；换分辨率如实 -EINVAL）+ `GETPLANERESOURCES`/`GETPLANE`"
               "（primary 1 / cursor 2，format 表 = XRGB8888/ARGB8888）；dumb 被销毁时引用它的 fb **一起消失**"
               "（否则 fb id 会指向已还给池的物理页）")
+    ev.append("**属性系统 + atomic commit（v0.9.16）**：14 个固定属性（CRTC 的 ACTIVE/MODE_ID、plane 的 "
+              "type/FB_ID/CRTC_ID/SRC_*/CRTC_*/IN_FORMATS、connector 的 CRTC_ID），`OBJ_GETPROPERTIES` 两阶段枚举 + "
+              "`GETPROPERTY` 报名字与标志（FB_ID = RANGE|OBJECT = 0x12）+ `GETPROPBLOB`/`CREATEPROPBLOB`/"
+              "`DESTROYPROPBLOB`（两个固定 blob：模式 68 B、IN_FORMATS 56 B 按 Linux `drm_format_modifier_blob` 布局）"
+              "+ `MODE_ATOMIC`：一次请求校验一批对象的 26 个属性字段再统一应用；**TEST_ONLY 只校验不落一个像素**"
+              "（判据 = present 计数差 == 1）；禁缩放/禁源偏移/换分辨率/事件位一律如实 `-EINVAL`")
     ev.append("**进程回收 hook（v0.9.15）**：`proc64` 的 exit/destroy 两处按弱符号调 "
               "`drm64_proc_release64(pid)`，把该 pid 名下没 DESTROY 的 dumb 全部收走 —— 原来进程异常退出会"
               "永久占页（4 槽 × <=8 MiB）；弱引用保证安装介质内核（不链 drm64.cpp）判空跳过")
@@ -2330,11 +2338,12 @@ def cap_drm_kms():
               "\"[DRM] release pid=… fbs=1 pages=4 free_pages=…\"、"
               "\"[DRMDEMO] version major=1 minor=0 patch=0 name=vimtu-drm\"、\"[DRMDEMO] paint … probe=0xffffffff\"、"
               "\"[DRMDEMO] addfb2 badfmt rc=-22\"（反例）、\"[DRMDEMO] badcmd rc=-25\"（未知 ioctl）")
-    ev.append("验收脚本 tests/drm64_test.py：%s（**45 条断言**：两份头文件逐值 + 16 个号与 Linux 逐个相等 + 内核自检 "
-              "+ 混合呈现 + ring3 真能写 + fb 对象/SETCRTC/plane + 回收 hook 顺序 + 桌面照旧 + 禁止项）"
+    ev.append("验收脚本 tests/drm64_test.py：%s（**65 条断言**：两份头文件逐值 + 24 个号与 Linux 逐个相等 + 内核自检 "
+              "+ 混合呈现 + ring3 真能写 + fb 对象/SETCRTC/plane + 属性/blob/atomic（含 TEST_ONLY 与两个反例）"
+              "+ 回收 hook 顺序 + 桌面照旧 + 禁止项）"
               % ("有" if exists("tests/drm64_test.py") else "★ 缺"))
-    ev.append("边界（如实）：**没有** dma-buf/fence 跨进程传递、**没有** atomic commit（`MODE_ATOMIC`）、"
-              "**没有** GBM + EGL/GLES（要 Mesa）、**没有** gamma/EDID/多 CRTC、"
+    ev.append("边界（如实）：**没有** dma-buf/fence 跨进程传递、**没有** GBM + EGL/GLES（要 Mesa）、"
+              "**没有** gamma/EDID/多 CRTC、atomic 不支持缩放/源偏移/光标 plane 接管、"
               "`MAP_DUMB` 返回用户 VA 而不是 mmap 偏移（语义差异）、光标 plane 只报告不接管硬件、"
               "vblank 在无回扫硬件时是**软兜底**（如实打 `mode=soft`）")
     return ("DONE" if ok else "MISSING"), ev
@@ -3386,9 +3395,10 @@ CAPS = [
              "6*7=42；tar 与宿主 Python tarfile 双向互操作", cap_make_tar),
     ("应用层", "★ A5 Wayland 基础骨架：wl_surface_create/attach/commit/damage/destroy + wl_seat + "
              "wl_display_dispatch + 最小合成器（未提交不上屏 / 多 surface z 序 / damage 局部提交）", cap_wayland_skeleton),
-    ("应用层", "★ DRM/KMS 内核门面 + evdev 设备面：16 个 ioctl 号与 Linux `drm.h` 逐值相等（VERSION 0xC0406400 … "
-             "GETPLANERES 0xC01064B6）+ ring3 可写 dumb buffer（MAP_DUMB 挂同一批物理页）+ 混合呈现 "
-             "（path=gpu 走 virtio-gpu 2D / path=cpu 写 LFB）+ ADDFB/ADDFB2/SETCRTC/GETPLANE + 进程回收 hook",
+    ("应用层", "★ DRM/KMS 内核门面 + evdev 设备面：24 个 ioctl 号与 Linux `drm.h` 逐值相等（VERSION 0xC0406400 … "
+             "DESTROYPROPBLOB 0xC00464BE）+ ring3 可写 dumb buffer + 混合呈现（path=gpu 走 virtio-gpu 2D / path=cpu 写 LFB）"
+             "+ ADDFB/ADDFB2/SETCRTC/GETPLANE + 14 个属性的属性系统与 blob + MODE_ATOMIC（TEST_ONLY 不落像素）"
+             "+ 进程回收 hook",
      cap_drm_kms),
     ("驱动", "★ 驱动线 3 virtio-gpu（2D）：PCI 0x1AF4:0x1050 + 2D 命令集 + 响应 0x1101 + 整行宽传输语义 + "
              "后端切换 [FB64] backend=… + 整屏 982->116 µs（8.5x）/512² 247->18 µs（13.7x）", cap_virtio_gpu),
@@ -3555,8 +3565,9 @@ TESTS = [
                        "编出静态 ELF 并跑通 6*7=42；`sh -c` 语义子集（43 条断言）"),
     ("tar64_test.py", "★ B5 Ring 3 里的用户态 tar：产物被宿主 Python tarfile 逐成员读出 + 解宿主的 USTAR 包（含子目录）"
                       "+ -tf 列表（32 条断言）"),
-    ("drm64_test.py", "★ DRM/KMS 内核门面 + evdev：16 个 ioctl 号与 Linux drm.h 逐值相等 + ring3 可写 dumb buffer "
-                       "+ 混合呈现 path=gpu|cpu + ADDFB2/SETCRTC/GETPLANE + 进程回收 hook + 桌面照旧（45 条断言）"),
+    ("drm64_test.py", "★ DRM/KMS 内核门面 + evdev：24 个 ioctl 号与 Linux drm.h 逐值相等 + ring3 可写 dumb buffer "
+                       "+ 混合呈现 path=gpu|cpu + ADDFB2/SETCRTC/GETPLANE + 属性/blob/MODE_ATOMIC（TEST_ONLY 不落像素）"
+                       "+ 进程回收 hook + 桌面照旧（65 条断言）"),
     ("wl64_test.py", "★ A5 Wayland 基础骨架：surface create/attach/commit/damage/destroy + wl_seat + wl_display_dispatch；"
                      "最小合成器（未提交不上屏 / 多 surface z 序 / damage 局部提交 / 退出兜底回收）（91 条断言）"),
     ("virtiogpu64_test.py", "★ 驱动线 3 virtio-gpu 2D：PCI/capability/VERSION_1/2D 命令集/响应 0x1101 + 设备与软件路径"

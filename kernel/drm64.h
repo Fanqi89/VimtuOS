@@ -70,6 +70,12 @@
 //   [DRM] setcrtc FAILED reason=<reason> err=<n>
 //   [DRM] plane id=<n> crtc=<n> fb=<n> formats=<n>
 //   [DRM] release pid=<n> fbs=<n> pages=<n> free_pages=<n>  （进程回收 hook 收走的 dumb）
+//   [DRM] encoder id=<n> type=<n> crtc=<n> possible_crtcs=0x<hex>
+//   [DRM] prop obj=<n> type=0x<hex> count=<n>              （OBJ_GETPROPERTIES）
+//   [DRM] prop get id=<n> name=<s> flags=0x<hex> values=<n>
+//   [DRM] blob create id=<n> len=<n> / blob read id=<n> len=<n>
+//   [DRM] atomic objs=<n> props=<n> flags=0x<hex> test=<0|1> path=<gpu|cpu|none> active=<0|1>
+//   [DRM] atomic FAILED reason=<reason> err=<n>
 //   [DRM] verify bars=<n> ok=<0|1>                        （自检：buffer 内容 = 写进去的图案）
 //   [DRM] selftest dumb=ok flip=ok vblank=<n> mode=<hw|soft> ok=1
 //   [DRM] selftest FAIL reason=<reason> ok=0
@@ -108,9 +114,18 @@
 #define DRM64_NR_MODE_GETRESOURCES 0xA0u
 #define DRM64_NR_MODE_GETCRTC      0xA1u
 #define DRM64_NR_MODE_SETCRTC      0xA2u
+#define DRM64_NR_MODE_GETENCODER   0xA6u
 #define DRM64_NR_MODE_GETCONNECTOR 0xA7u
+#define DRM64_NR_MODE_GETPROPERTY  0xAAu
+#define DRM64_NR_MODE_SETPROPERTY  0xABu
+#define DRM64_NR_MODE_GETPROPBLOB  0xACu
 #define DRM64_NR_MODE_ADDFB        0xADu
 #define DRM64_NR_MODE_ADDFB2       0xAEu
+#define DRM64_NR_MODE_OBJ_GETPROPS 0xB9u
+#define DRM64_NR_MODE_OBJ_SETPROP  0xBAu
+#define DRM64_NR_MODE_ATOMIC       0xBCu
+#define DRM64_NR_MODE_CREATEBLOB   0xBDu
+#define DRM64_NR_MODE_DESTROYBLOB  0xBEu
 #define DRM64_NR_MODE_PAGE_FLIP    0xB0u
 #define DRM64_NR_MODE_GETPLANE     0xB5u
 #define DRM64_NR_MODE_GETPLANERES  0xB6u
@@ -144,6 +159,60 @@
 // 只支持这两个 fourcc（= Linux DRM_FORMAT_XRGB8888 / DRM_FORMAT_ARGB8888），其余如实 -EINVAL
 #define DRM64_FORMAT_XRGB8888  0x34325258u
 #define DRM64_FORMAT_ARGB8888  0x34325241u
+
+// ==================== ★ v0.9.16：属性系统（atomic commit 的地基）====================
+// 对象类型：与 Linux drm_mode_object_type 同一套魔数（libdrm 会把它们原样传进来）
+#define DRM64_OBJ_CRTC      0xccccccccu
+#define DRM64_OBJ_CONNECTOR 0xc0c0c0c0u
+#define DRM64_OBJ_ENCODER   0xe0e0e0e0u
+#define DRM64_OBJ_PLANE     0xeeeeeeeeu
+#define DRM64_OBJ_FB        0xfbfbfbfbu
+// 属性 id：本内核是**固定表**（14 个），名字/类型/是否可写在 drm64.cpp 的 D64_PROPS 里
+#define DRM64_PROP_ACTIVE     1u
+#define DRM64_PROP_MODE_ID    2u
+#define DRM64_PROP_TYPE       3u
+#define DRM64_PROP_FB_ID      4u
+#define DRM64_PROP_CRTC_ID    5u
+#define DRM64_PROP_SRC_X      6u
+#define DRM64_PROP_SRC_Y      7u
+#define DRM64_PROP_SRC_W      8u
+#define DRM64_PROP_SRC_H      9u
+#define DRM64_PROP_CRTC_X     10u
+#define DRM64_PROP_CRTC_Y     11u
+#define DRM64_PROP_CRTC_W     12u
+#define DRM64_PROP_CRTC_H     13u
+#define DRM64_PROP_IN_FORMATS 14u
+#define DRM64_PROP_COUNT64    14u
+// 属性标志（取 Linux 的位值，libdrm 靠它们判断怎么解析）
+#define DRM64_PROP_RANGE64     0x02u
+#define DRM64_PROP_ENUM64      0x08u
+#define DRM64_PROP_OBJECT64    0x10u
+#define DRM64_PROP_IMMUTABLE64 0x20u
+#define DRM64_PROP_BLOB64      0x40u
+// blob：两个**固定** blob（模式 / IN_FORMATS）+ 4 个用户 blob 槽（CREATEBLOB 分配）
+#define DRM64_BLOB_NONE        0u
+#define DRM64_BLOB_MODE        0x200u
+#define DRM64_BLOB_FMT_PRIMARY 0x201u
+#define DRM64_BLOB_FMT_CURSOR  0x202u
+#define DRM64_BLOB_USER_BASE64 0x300u
+#define DRM64_MAX_USERBLOB64   4u
+#define DRM64_USERBLOB_BYTES64 128u
+#define DRM64_IN_FORMATS_VERSION64 1u
+// plane 类型（Linux DRM_PLANE_TYPE_* 同值）
+#define DRM64_PLANE_TYPE_OVERLAY 0u
+#define DRM64_PLANE_TYPE_PRIMARY 1u
+#define DRM64_PLANE_TYPE_CURSOR  2u
+// encoder 类型（高清口按 TMDS 报，Linux DRM_MODE_ENCODER_TMDS = 2）
+#define DRM64_ENCODER_TYPE_TMDS64 2u
+// atomic flags（Linux 同值）：只接受 TEST_ONLY / NONBLOCK / ALLOW_MODESET，
+// 其余（尤其 PAGE_FLIP_EVENT 0x1）一律 -EINVAL —— 本内核不投递事件，不假装能投。
+#define DRM64_ATOMIC_TEST_ONLY64     0x0100u
+#define DRM64_ATOMIC_NONBLOCK64      0x0200u
+#define DRM64_ATOMIC_ALLOW_MODESET64 0x0400u
+#define DRM64_ATOMIC_FLAGS_OK64 \
+    (DRM64_ATOMIC_TEST_ONLY64 | DRM64_ATOMIC_NONBLOCK64 | DRM64_ATOMIC_ALLOW_MODESET64)
+#define DRM64_ATOMIC_MAX_OBJS64   8u
+#define DRM64_ATOMIC_MAX_PROPS64  32u
 // 用户映射窗（见文件头）：A1 的 FB 区后半段，4 槽 × 8 MiB
 #define DRM64_UVA_BASE_OFFSET64 (8ull * 1024ull * 1024ull)  // USER64_FB_VA64 + 8 MiB
 #define DRM64_UVA_SLOT_BYTES64  (8ull * 1024ull * 1024ull)
@@ -359,6 +428,82 @@ struct Drm64ModeGetPlane {
     uint64_t format_type_ptr;    // +24  用户 u32 数组（fourcc）
 };                               // = 32 B（= Linux drm_mode_get_plane）
 static_assert(sizeof(Drm64ModeGetPlane) == 32, "Drm64ModeGetPlane 必须是 32 B（= Linux drm_mode_get_plane）");
+
+// ⑯ GETENCODER（= Linux struct drm_mode_get_encoder，20 B）
+struct Drm64ModeGetEncoder {
+    uint32_t encoder_id;       // +0   in
+    uint32_t encoder_type;     // +4   out（2 = TMDS）
+    uint32_t crtc_id;          // +8   out
+    uint32_t possible_crtcs;   // +12  out（位掩码，恒 1）
+    uint32_t possible_clones;  // +16  out（恒 0）
+};                             // = 20 B（= Linux drm_mode_get_encoder）
+static_assert(sizeof(Drm64ModeGetEncoder) == 20, "Drm64ModeGetEncoder 必须是 20 B（= Linux drm_mode_get_encoder）");
+
+// ⑰ GETPROPERTY（= Linux struct drm_mode_get_property，64 B）
+struct Drm64ModeGetProperty {
+    uint64_t values_ptr;       // +0   用户 u64 数组（枚举值 / 位掩码）
+    uint64_t enum_blob_ptr;    // +8   用户 u32 数组（枚举 blob id）
+    uint32_t prop_id;          // +16  in
+    uint32_t flags;            // +20  out（RANGE/OBJECT/IMMUTABLE/BLOB…）
+    char     name[32];         // +24  out（NUL 结尾）
+    uint32_t count_values;     // +56  out
+    uint32_t count_enum_blobs; // +60  out（本内核恒 0）
+};                             // = 64 B（= Linux drm_mode_get_property）
+static_assert(sizeof(Drm64ModeGetProperty) == 64, "Drm64ModeGetProperty 必须是 64 B（= Linux drm_mode_get_property）");
+
+// ⑱ GETPROPBLOB（= Linux struct drm_mode_get_blob，16 B）
+struct Drm64ModeGetBlob {
+    uint32_t blob_id;          // +0   in
+    uint32_t length;           // +4   in/out（in = 缓冲字节数；out = 实际长度）
+    uint64_t data;             // +8   用户缓冲
+};                             // = 16 B（= Linux drm_mode_get_blob）
+static_assert(sizeof(Drm64ModeGetBlob) == 16, "Drm64ModeGetBlob 必须是 16 B（= Linux drm_mode_get_blob）");
+
+// ⑲ OBJ_GETPROPERTIES（= Linux struct drm_mode_obj_get_properties，32 B；u64 要 8 对齐，不能 packed）
+struct Drm64ModeObjGetProps {
+    uint64_t props_ptr;        // +0   用户 u32 数组（属性 id）
+    uint64_t prop_values_ptr;  // +8   用户 u64 数组（属性值）
+    uint32_t count_props;      // +16  in/out
+    uint32_t obj_id;           // +20  in
+    uint32_t obj_type;         // +24  in（DRM64_OBJ_*）
+};                             // = 32 B（= Linux drm_mode_obj_get_properties）
+static_assert(sizeof(Drm64ModeObjGetProps) == 32, "Drm64ModeObjGetProps 必须是 32 B（= Linux drm_mode_obj_get_properties）");
+
+// ⑳ OBJ_SETPROPERTY（= Linux struct drm_mode_obj_set_property，24 B）
+struct Drm64ModeObjSetProp {
+    uint64_t value;            // +0   in
+    uint32_t prop_id;          // +8   in
+    uint32_t obj_id;           // +12  in
+    uint32_t obj_type;         // +16  in
+};                             // = 24 B（= Linux drm_mode_obj_set_property）
+static_assert(sizeof(Drm64ModeObjSetProp) == 24, "Drm64ModeObjSetProp 必须是 24 B（= Linux drm_mode_obj_set_property）");
+
+// ㉑ ATOMIC（= Linux struct drm_mode_atomic，56 B）
+struct Drm64ModeAtomic {
+    uint32_t flags;               // +0   in（TEST_ONLY / NONBLOCK / ALLOW_MODESET）
+    uint32_t count_objs;          // +4   in
+    uint64_t objs_ptr;            // +8   用户 u32 数组（对象 id）
+    uint64_t count_props_ptr;     // +16  用户 u32 数组（每个对象几个属性）
+    uint64_t props_ptr;           // +24  用户 u32 数组（属性 id，按对象顺序拼在一起）
+    uint64_t prop_values_ptr;     // +32  用户 u64 数组（值，与 props 一一对应）
+    uint64_t reserved;            // +40  必须 0
+    uint64_t user_data;           // +48  原样带回（本内核不投递事件，仅日志）
+};                                // = 56 B（= Linux drm_mode_atomic）
+static_assert(sizeof(Drm64ModeAtomic) == 56, "Drm64ModeAtomic 必须是 56 B（= Linux drm_mode_atomic）");
+
+// ㉒ CREATEBLOB（= Linux struct drm_mode_create_blob，16 B）
+struct Drm64ModeCreateBlob {
+    uint64_t data;             // +0   用户缓冲
+    uint32_t length;           // +8   in（<= 128）
+    uint32_t blob_id;          // +12  out（0x300..0x303）
+};                             // = 16 B（= Linux drm_mode_create_blob）
+static_assert(sizeof(Drm64ModeCreateBlob) == 16, "Drm64ModeCreateBlob 必须是 16 B（= Linux drm_mode_create_blob）");
+
+// ㉓ DESTROYBLOB（= Linux struct drm_mode_destroy_blob，4 B）
+struct Drm64ModeDestroyBlob {
+    uint32_t blob_id;          // +0   in（只对用户 blob 有效；固定 blob 拒绝）
+};                             // = 4 B（= Linux drm_mode_destroy_blob）
+static_assert(sizeof(Drm64ModeDestroyBlob) == 4, "Drm64ModeDestroyBlob 必须是 4 B（= Linux drm_mode_destroy_blob）");
 
 // ==================== evdev ABI ====================
 // 24 B，与 Linux x86_64 的 struct input_event 同尺寸（时间戳 2×u64 + 2×u16 + i32）。

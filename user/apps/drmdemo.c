@@ -44,7 +44,8 @@ static const uint32_t BARS[8] = {
 
 int main(int argc, char** argv, char** envp) {
     (void)argc; (void)argv; (void)envp;
-
+    (void)argc; (void)argv; (void)envp;
+    uint32_t fb_ok = 0;          /* ⑨-d 建的 fb id，⑨-f 的 atomic 请求要用 */
     /* ---- ① open /dev/dri/card0 ---- */
     const int fd = drm64_open();
     if (fd < 0) {
@@ -226,6 +227,7 @@ int main(int argc, char** argv, char** envp) {
         long arc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_ADDFB2, struct Drm64ModeFbCmd2), &fb2);
         printf("[DRMDEMO] addfb2 fb=%u handle=%u rc=%d\n",
                (unsigned)fb2.fb_id, (unsigned)fb2.handles[0], (int)arc);
+        if (arc == 0) fb_ok = fb2.fb_id;
 
         /* 反例：NV12（0x3231564E）本内核不支持 -> 必须 -EINVAL(-22)，不假装成功 */
         struct Drm64ModeFbCmd2 bad;
@@ -249,6 +251,137 @@ int main(int argc, char** argv, char** envp) {
         }
     }
 
+    /* ---- ⑨-f ★ v0.9.16：属性系统 + atomic commit（wlroots 的 DRM 后端走的就是这条路）---- */
+    {
+        struct Drm64ModeGetEncoder en;
+        for (unsigned i = 0; i < sizeof(en); i++) ((char*)&en)[i] = 0;
+        en.encoder_id = DRM64_ENCODER_ID64;
+        long erc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_GETENCODER, struct Drm64ModeGetEncoder), &en);
+        printf("[DRMDEMO] encoder id=%u type=%u crtc=%u possible_crtcs=0x%x rc=%d\n",
+               (unsigned)en.encoder_id, (unsigned)en.encoder_type, (unsigned)en.crtc_id,
+               (unsigned)en.possible_crtcs, (int)erc);
+    }
+    {
+        /* ① OBJ_GETPROPERTIES：两阶段（先问个数，再取 props/values 数组） */
+        struct Drm64ModeObjGetProps og;
+        for (unsigned i = 0; i < sizeof(og); i++) ((char*)&og)[i] = 0;
+        og.obj_id = DRM64_PLANE_PRIMARY_ID64; og.obj_type = DRM64_OBJ_PLANE;
+        long orc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_OBJ_GETPROPS, struct Drm64ModeObjGetProps), &og);
+        uint32_t pids[16], pend = og.count_props;
+        uint64_t pvals[16];
+        for (unsigned i = 0; i < 16; i++) { pids[i] = 0; pvals[i] = 0; }
+        og.props_ptr = (uint64_t)(uintptr_t)pids;
+        og.prop_values_ptr = (uint64_t)(uintptr_t)pvals;
+        og.count_props = 16;
+        orc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_OBJ_GETPROPS, struct Drm64ModeObjGetProps), &og);
+        printf("[DRMDEMO] obj_props plane n=%u counted=%u first=%u fbval=%llu rc=%d\n",
+               (unsigned)og.count_props, (unsigned)pend, (unsigned)pids[0],
+               (unsigned long long)pvals[1], (int)orc);
+
+        /* ② GETPROPERTY：FB_ID 的名字/标志 */
+        struct Drm64ModeGetProperty gp;
+        for (unsigned i = 0; i < sizeof(gp); i++) ((char*)&gp)[i] = 0;
+        gp.prop_id = DRM64_PROP_FB_ID;
+        long grc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_GETPROPERTY, struct Drm64ModeGetProperty), &gp);
+        printf("[DRMDEMO] prop id=%u name=%s flags=0x%x rc=%d\n",
+               (unsigned)gp.prop_id, gp.name, (unsigned)gp.flags, (int)grc);
+
+        /* ③ GETPROPBLOB：IN_FORMATS（按 Linux 的 drm_format_modifier_blob 解析） */
+        struct Drm64ModeGetBlob gb;
+        for (unsigned i = 0; i < sizeof(gb); i++) ((char*)&gb)[i] = 0;
+        gb.blob_id = DRM64_BLOB_FMT_PRIMARY;
+        long brc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_GETPROPBLOB, struct Drm64ModeGetBlob), &gb);
+        uint32_t bloblen = gb.length;
+        uint8_t fmtblob[64];
+        for (unsigned i = 0; i < sizeof(fmtblob); i++) fmtblob[i] = 0;
+        gb.data = (uint64_t)(uintptr_t)fmtblob;
+        gb.length = (uint32_t)sizeof(fmtblob);
+        brc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_GETPROPBLOB, struct Drm64ModeGetBlob), &gb);
+        const uint32_t* ih = (const uint32_t*)fmtblob;
+        printf("[DRMDEMO] blob_informats len=%u version=%u formats=%u mods=%u fmt0=0x%x rc=%d\n",
+               (unsigned)bloblen, (unsigned)ih[0], (unsigned)ih[2], (unsigned)ih[4],
+               (unsigned)((const uint32_t*)(fmtblob + 24))[0], (int)brc);
+
+        /* ④ CREATEBLOB：把当前模式做成 MODE_ID blob（libdrm 的 drmModeCreatePropertyBlob 就是这条） */
+        struct Drm64ModeCreateBlob cb;
+        for (unsigned i = 0; i < sizeof(cb); i++) ((char*)&cb)[i] = 0;
+        cb.data = (uint64_t)(uintptr_t)&mode;
+        cb.length = (uint32_t)sizeof(mode);
+        long crc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_CREATEBLOB, struct Drm64ModeCreateBlob), &cb);
+        printf("[DRMDEMO] blob_mode id=%u len=%u rc=%d\n",
+               (unsigned)cb.blob_id, (unsigned)cb.length, (int)crc);
+
+        /* ⑤ atomic 请求：plane(FB_ID/CRTC_ID/SRC/CRTC) + crtc(ACTIVE/MODE_ID) + connector(CRTC_ID) */
+        uint32_t aobjs[3] = { DRM64_PLANE_PRIMARY_ID64, DRM64_CRTC_ID64, DRM64_CONNECTOR_ID64 };
+        uint32_t acnts[3] = { 7u, 2u, 1u };
+        uint32_t aprops[10] = {
+            DRM64_PROP_FB_ID, DRM64_PROP_CRTC_ID, DRM64_PROP_SRC_X, DRM64_PROP_SRC_Y,
+            DRM64_PROP_SRC_W, DRM64_PROP_SRC_H, DRM64_PROP_CRTC_W,
+            DRM64_PROP_ACTIVE, DRM64_PROP_MODE_ID,
+            DRM64_PROP_CRTC_ID,
+        };
+        uint64_t avals[10];
+        avals[0] = fb_ok;
+        avals[1] = DRM64_CRTC_ID64;
+        avals[2] = 0;
+        avals[3] = 0;
+        avals[4] = (uint64_t)dw << 16;
+        avals[5] = (uint64_t)dh << 16;
+        avals[6] = dw;
+        avals[7] = 1;
+        avals[8] = cb.blob_id;
+        avals[9] = DRM64_CRTC_ID64;
+        struct Drm64ModeAtomic at;
+        for (unsigned i = 0; i < sizeof(at); i++) ((char*)&at)[i] = 0;
+        at.count_objs = 3;
+        at.objs_ptr = (uint64_t)(uintptr_t)aobjs;
+        at.count_props_ptr = (uint64_t)(uintptr_t)acnts;
+        at.props_ptr = (uint64_t)(uintptr_t)aprops;
+        at.prop_values_ptr = (uint64_t)(uintptr_t)avals;
+        at.user_data = 0x5150u;
+
+        /* 反例一：缩放（SRC_W = dw/2 而 CRTC_W = dw）-> 必须 -EINVAL(-22) */
+        uint64_t save = avals[4];
+        avals[4] = (uint64_t)(dw / 2u) << 16;
+        at.flags = DRM64_ATOMIC_TEST_ONLY64 | DRM64_ATOMIC_ALLOW_MODESET64;
+        long a1 = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_ATOMIC, struct Drm64ModeAtomic), &at);
+        printf("[DRMDEMO] atomic badscale rc=%d\n", (int)a1);
+        avals[4] = save;
+
+        /* 反例二：PAGE_FLIP_EVENT 位（本内核不投递事件）-> 必须 -EINVAL */
+        at.flags = 0x01u;
+        long a2 = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_ATOMIC, struct Drm64ModeAtomic), &at);
+        printf("[DRMDEMO] atomic badevent rc=%d\n", (int)a2);
+
+        /* 正例一：TEST_ONLY（全量校验，**一个像素都不动**） */
+        at.flags = DRM64_ATOMIC_TEST_ONLY64 | DRM64_ATOMIC_ALLOW_MODESET64;
+        long a3 = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_ATOMIC, struct Drm64ModeAtomic), &at);
+        printf("[DRMDEMO] atomic test_only rc=%d\n", (int)a3);
+
+        /* 正例二：真提交 */
+        at.flags = DRM64_ATOMIC_ALLOW_MODESET64;
+        long a4 = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_ATOMIC, struct Drm64ModeAtomic), &at);
+        printf("[DRMDEMO] atomic commit rc=%d user_data=0x%lx\n", (int)a4, (unsigned long)at.user_data);
+
+        /* 复核：GETPLANE 必须报"刚提交的那个 fb"，GETCRTC 也一样 */
+        struct Drm64ModeGetPlane pl2;
+        for (unsigned i = 0; i < sizeof(pl2); i++) ((char*)&pl2)[i] = 0;
+        pl2.plane_id = DRM64_PLANE_PRIMARY_ID64;
+        long p2 = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_GETPLANE, struct Drm64ModeGetPlane), &pl2);
+        struct Drm64ModeCrtc gc;
+        for (unsigned i = 0; i < sizeof(gc); i++) ((char*)&gc)[i] = 0;
+        long g2 = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_GETCRTC, struct Drm64ModeCrtc), &gc);
+        printf("[DRMDEMO] after_atomic plane_fb=%u crtc_fb=%u valid=%u rc=%d/%d\n",
+               (unsigned)pl2.fb_id, (unsigned)gc.fb_id, (unsigned)gc.mode_valid, (int)p2, (int)g2);
+
+        /* 收尾：把 MODE_ID blob 还回去（固定 blob 不能删，用户 blob 可以） */
+        if (crc == 0) {
+            struct Drm64ModeDestroyBlob db;
+            db.blob_id = cb.blob_id;
+            long drc = drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_DESTROYBLOB, struct Drm64ModeDestroyBlob), &db);
+            printf("[DRMDEMO] blob_destroy id=%u rc=%d\n", (unsigned)db.blob_id, (int)drc);
+        }
+    }
     /* ---- ⑨-e ★ v0.9.15：**故意不销毁**的一块 dumb（64x64，占 4 页）----
      *   它不 DESTROY_DUMB 就退出，靠内核的进程回收 hook 收走 ——
      *   串口应出现 [DRM] release pid=<本进程> fbs=1 pages=4，页池水位回原位。 ---- */

@@ -86,6 +86,50 @@ struct Drm64Fb {
 static Drm64Fb  g_fb[DRM64_MAX_FB64];
 static uint32_t g_fb_on_screen = 0;         // 在屏的 fb id（0 = 没有；legacy 直接翻 dumb 时也是 0）
 
+// ==================== v0.9.16：属性系统 / blob / atomic 的状态 ====================
+// CRTC 的 ACTIVE 属性（0 = 关屏 / 1 = 开）。它跟"屏幕上有没有内容"是两件事：
+// ACTIVE=1 也可以一个 plane 都没接（Linux 就是这样），所以单独记。
+static uint32_t g_crtc_active = 0;
+// 上一次呈现用的矩形（plane 的 SRC_/CRTC_ 属性就以它为当前值）
+static uint32_t g_last_x = 0, g_last_y = 0, g_last_w = 0, g_last_h = 0;
+// IN_FORMATS blob（自己在 init 里按 Linux 的 drm_format_modifier_blob 拼出来）
+static uint8_t  g_informats_primary[64];
+static uint32_t g_informats_primary_len = 0;
+static uint8_t  g_informats_cursor[32];
+static uint32_t g_informats_cursor_len = 0;
+// 用户 blob（CREATEBLOB 分配；MODE_ID 就用它）——固定 4 槽，不进堆
+static uint8_t  g_userblob[DRM64_MAX_USERBLOB64][DRM64_USERBLOB_BYTES64];
+static uint32_t g_userblob_len[DRM64_MAX_USERBLOB64];
+
+// 属性表：名字 / 标志（Linux 位值）/ 允许挂在哪些对象上。
+// 为什么是固定表：本内核的驱动面是固定的（1 CRTC / 1 connector / 2 plane），
+//   属性 id 一览无余地写死比动态分配更可验证 —— libdrm 只把它们当成不透明 id 用。
+#define D64_PT_CRTC  0x1u
+#define D64_PT_CONN  0x2u
+#define D64_PT_ENC   0x4u
+#define D64_PT_PLANE 0x8u
+struct D64Prop { const char* name; uint32_t flags; uint32_t types; };
+static const D64Prop D64_PROPS[DRM64_PROP_COUNT64] = {
+    { "ACTIVE",     DRM64_PROP_RANGE64,                          D64_PT_CRTC },
+    { "MODE_ID",    DRM64_PROP_BLOB64,                           D64_PT_CRTC },
+    { "type",       DRM64_PROP_ENUM64 | DRM64_PROP_IMMUTABLE64,   D64_PT_PLANE },
+    { "FB_ID",      DRM64_PROP_OBJECT64 | DRM64_PROP_RANGE64,     D64_PT_PLANE },
+    { "CRTC_ID",    DRM64_PROP_OBJECT64 | DRM64_PROP_RANGE64,     D64_PT_PLANE | D64_PT_CONN },
+    { "SRC_X",      DRM64_PROP_RANGE64,                          D64_PT_PLANE },
+    { "SRC_Y",      DRM64_PROP_RANGE64,                          D64_PT_PLANE },
+    { "SRC_W",      DRM64_PROP_RANGE64,                          D64_PT_PLANE },
+    { "SRC_H",      DRM64_PROP_RANGE64,                          D64_PT_PLANE },
+    { "CRTC_X",     DRM64_PROP_RANGE64,                          D64_PT_PLANE },
+    { "CRTC_Y",     DRM64_PROP_RANGE64,                          D64_PT_PLANE },
+    { "CRTC_W",     DRM64_PROP_RANGE64,                          D64_PT_PLANE },
+    { "CRTC_H",     DRM64_PROP_RANGE64,                          D64_PT_PLANE },
+    { "IN_FORMATS", DRM64_PROP_BLOB64 | DRM64_PROP_IMMUTABLE64,   D64_PT_PLANE },
+};
+
+// 前向声明：GETCONNECTOR / GETPROPERTY 与 atomic 共用同一套属性读写路径（定义在 v0.9.16 段）
+static uint32_t d64_obj_props64(uint32_t obj_type, uint32_t obj_id, uint32_t* out, uint32_t cap);
+static uint64_t d64_prop_get64(uint32_t prop_id, uint32_t obj_id, uint32_t obj_type);
+
 // ==================== 跨页安全的拷贝（dumb buffer <-> 连续内存）====================
 // to_buf=1：连续内存 -> dumb buffer（ring3 之后会读到的就是这份内容）
 // to_buf=0：dumb buffer -> 连续内存（呈现时拷进内核后备缓冲）
@@ -261,12 +305,16 @@ static int d64_present_backbuf64(int x, int y, int w, int h);
 // 把 dumb buffer 贴到 CRTC 的 (x,y)：返回 1 = 走了 virtio-gpu 2D（path=gpu）/
 // 0 = CPU 写 LFB（path=cpu）/ -1 = 没有可用的屏（或完全落在屏外）。
 // ★ v0.9.15：加了 (x,y) —— Linux 的 SETCRTC 有 x/y 两个字段（wlroots 虽传 0,0，但语义要真）。
-static int d64_present_at64(Drm64Dumb* d, uint32_t x, uint32_t y) {
+// 把 dumb buffer 的左上 [0,0,w,h) 贴到 CRTC 的 (x,y)（w/h = 0 表示用整块）——
+// atomic 的 CRTC_W/CRTC_H 走这里：只显示请求的矩形，不是永远整块。
+static int d64_present_rect64(Drm64Dumb* d, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     int bw = 0, bh = 0;
     uint32_t* bb = fb_surface64(&bw, &bh);
     if (!bb || bw <= 0 || bh <= 0) return -1;
     if (x >= (uint32_t)bw || y >= (uint32_t)bh) return -1;
-    uint32_t cw = d->w, ch = d->h;
+    uint32_t cw = w ? w : d->w, ch = h ? h : d->h;
+    if (cw > d->w) cw = d->w;
+    if (ch > d->h) ch = d->h;
     if (cw > (uint32_t)bw - x) cw = (uint32_t)bw - x;
     if (ch > (uint32_t)bh - y) ch = (uint32_t)bh - y;
     if (cw == 0u || ch == 0u) return -1;
@@ -282,10 +330,17 @@ static int d64_present_at64(Drm64Dumb* d, uint32_t x, uint32_t y) {
     d64_num((uint64_t)cw * 4ull * (uint64_t)ch);
     d64_puts(" seq="); d64_num(g_seq);
     d64_puts(" x="); d64_num(x); d64_puts(" y="); d64_num(y);
+    d64_puts(" w="); d64_num(cw); d64_puts(" h="); d64_num(ch);
     d64_end();
+    // 属性面的"当前值"跟着刷新（plane 的 SRC_/CRTC_ 就报这些）
+    g_last_x = x; g_last_y = y; g_last_w = cw; g_last_h = ch;
+    g_crtc_active = 1u;
     return dev ? 1 : 0;
 }
-// (0,0) 那条老路径（page_flip / 自检共用）
+// 整块贴到 (x,y)：page_flip / SETCRTC / 自检共用
+static int d64_present_at64(Drm64Dumb* d, uint32_t x, uint32_t y) {
+    return d64_present_rect64(d, x, y, 0u, 0u);
+}
 static int d64_present_dumb64(Drm64Dumb* d) { return d64_present_at64(d, 0u, 0u); }
 
 // ==================== vblank（硬件回扫优先，软兜底）====================
@@ -475,7 +530,21 @@ static int d64_ioctl_getconnector64(uint64_t arg) {
     c.connector_type_id = 1u;
     c.connection = 1u;                                               // connected（本内核只有"有屏"这一种）
     c.encoder_id = DRM64_ENCODER_ID64;
-    c.count_modes = 1u; c.count_encoders = 1u; c.count_props = 0u;
+    // ★ v0.9.16：连接器也有属性（CRTC_ID）—— 按 Linux 的两阶段语义填：
+    //   调用方给的 count_props 够就写数组，不够只回真实个数。
+    {
+        uint32_t ids[4];
+        const uint32_t np = d64_obj_props64(DRM64_OBJ_CONNECTOR, DRM64_CONNECTOR_ID64, ids, 4u);
+        if (c.props_ptr && c.prop_values_ptr && c.count_props >= np) {
+            for (uint32_t i = 0; i < np; i++) {
+                d64_uwr32(c.props_ptr + (uint64_t)i * 4ull, ids[i]);
+                const uint64_t v = d64_prop_get64(ids[i], DRM64_CONNECTOR_ID64, DRM64_OBJ_CONNECTOR);
+                d64_uwr64(c.prop_values_ptr + (uint64_t)i * 8ull, &v, 8u);
+            }
+        }
+        c.count_props = np;
+    }
+    c.count_modes = 1u; c.count_encoders = 1u;
     c.mm_width = 0u; c.mm_height = 0u; c.subpixel = 0u;              // 没有 EDID：如实 0
     d64_uwr64(arg, &c, sizeof(Drm64ModeConnector));
     d64_begin(); d64_puts("[DRM] getconnector id="); d64_num(c.connector_id);
@@ -771,6 +840,426 @@ extern "C" void drm64_proc_release64(int pid) {
     d64_puts(" free_pages="); d64_num(page_count_free_64()); d64_end();
 }
 
+// ==================== v0.9.16：属性系统 / blob / atomic commit ====================
+// 这一层的定位（先读）：Linux 的 KMS 属性系统 = "对象 + 属性 id → 值"，atomic commit 就是
+// "一个请求里改一批对象的一批属性，要么全成要么全不成"。本内核的驱动面是固定的
+// （1 CRTC / 1 connector / 1 encoder / 2 plane），所以属性表是**固定 14 项**（D64_PROPS），
+// 对象 id 也就是 1..2。数值语义全部按 Linux：SRC_* 是 16.16 定点，CRTC_* 是像素。
+
+static uint32_t d64_plane_count64(void) { return 2u; }
+
+// 某个对象上挂着的属性 id 列表；返回个数（<= cap）
+static uint32_t d64_obj_props64(uint32_t obj_type, uint32_t obj_id, uint32_t* out, uint32_t cap) {
+    uint32_t mask = 0, n = 0;
+    if (obj_type == DRM64_OBJ_CRTC) mask = D64_PT_CRTC;
+    else if (obj_type == DRM64_OBJ_CONNECTOR) mask = D64_PT_CONN;
+    else if (obj_type == DRM64_OBJ_ENCODER) mask = D64_PT_ENC;
+    else if (obj_type == DRM64_OBJ_PLANE) mask = D64_PT_PLANE;
+    if (obj_id == 0u || obj_id > d64_plane_count64()) {                   // 对象 id 只在 plane 上有 2 个
+        if (obj_type == DRM64_OBJ_PLANE) return 0u;
+        if (obj_id != 1u) return 0u;
+    }
+    if (mask == 0u) return 0u;
+    for (uint32_t i = 0; i < DRM64_PROP_COUNT64 && n < cap; i++)
+        if (D64_PROPS[i].types & mask) out[n++] = (uint32_t)(i + 1u);
+    return n;
+}
+
+static uint32_t d64_plane_fb64(uint32_t plane_id) {
+    if (plane_id != DRM64_PLANE_PRIMARY_ID64) return 0u;                  // cursor plane 没接过东西
+    return g_fb_on_screen ? g_fb_on_screen : g_handle_on_screen;
+}
+
+// 属性的**当前值**（读路径；libdrm 的 drmModeObjectGetProperties 用它）
+static uint64_t d64_prop_get64(uint32_t prop_id, uint32_t obj_id, uint32_t obj_type) {
+    if (obj_type == DRM64_OBJ_CRTC) {
+        if (prop_id == DRM64_PROP_ACTIVE)  return g_crtc_active ? 1ull : 0ull;
+        if (prop_id == DRM64_PROP_MODE_ID) return g_crtc_active ? DRM64_BLOB_MODE : 0ull;
+        return 0ull;
+    }
+    if (obj_type == DRM64_OBJ_CONNECTOR) {
+        if (prop_id == DRM64_PROP_CRTC_ID) return g_crtc_active ? DRM64_CRTC_ID64 : 0ull;
+        return 0ull;
+    }
+    if (obj_type == DRM64_OBJ_PLANE) {
+        const int primary = (obj_id == DRM64_PLANE_PRIMARY_ID64);
+        if (prop_id == DRM64_PROP_TYPE)
+            return primary ? DRM64_PLANE_TYPE_PRIMARY : DRM64_PLANE_TYPE_CURSOR;
+        if (prop_id == DRM64_PROP_IN_FORMATS)
+            return primary ? DRM64_BLOB_FMT_PRIMARY : DRM64_BLOB_FMT_CURSOR;
+        if (!primary) return 0ull;                                       // cursor plane 只有 type/IN_FORMATS 有用
+        if (prop_id == DRM64_PROP_FB_ID)   return d64_plane_fb64(obj_id);
+        if (prop_id == DRM64_PROP_CRTC_ID) return g_crtc_active ? DRM64_CRTC_ID64 : 0ull;
+        if (prop_id == DRM64_PROP_SRC_X)   return 0ull;
+        if (prop_id == DRM64_PROP_SRC_Y)   return 0ull;
+        if (prop_id == DRM64_PROP_SRC_W)   return (uint64_t)g_last_w << 16;
+        if (prop_id == DRM64_PROP_SRC_H)   return (uint64_t)g_last_h << 16;
+        if (prop_id == DRM64_PROP_CRTC_X)  return (uint64_t)g_last_x;
+        if (prop_id == DRM64_PROP_CRTC_Y)  return (uint64_t)g_last_y;
+        if (prop_id == DRM64_PROP_CRTC_W)  return (uint64_t)g_last_w;
+        if (prop_id == DRM64_PROP_CRTC_H)  return (uint64_t)g_last_h;
+    }
+    return 0ull;
+}
+
+// ---- blob：两个固定 blob（模式 / IN_FORMATS）+ 4 个用户槽 ----
+static int d64_blob_info64(uint32_t blob_id, const uint8_t** ptr, uint32_t* len) {
+    if (blob_id == DRM64_BLOB_MODE) {
+        *ptr = (const uint8_t*)&g_mode64; *len = (uint32_t)sizeof(Drm64ModeMode); return 0;
+    }
+    if (blob_id == DRM64_BLOB_FMT_PRIMARY) {
+        *ptr = g_informats_primary; *len = g_informats_primary_len; return 0;
+    }
+    if (blob_id == DRM64_BLOB_FMT_CURSOR) {
+        *ptr = g_informats_cursor; *len = g_informats_cursor_len; return 0;
+    }
+    if (blob_id >= DRM64_BLOB_USER_BASE64 && blob_id < DRM64_BLOB_USER_BASE64 + DRM64_MAX_USERBLOB64) {
+        const uint32_t s = blob_id - DRM64_BLOB_USER_BASE64;
+        if (g_userblob_len[s] == 0u) return -DRM64_EINVAL64;
+        *ptr = g_userblob[s]; *len = g_userblob_len[s]; return 0;
+    }
+    return -DRM64_EINVAL64;
+}
+
+// IN_FORMATS 按 Linux 的 drm_format_modifier_blob 拼（wlroots 就是按这个解析格式表的）：
+//   u32 version, flags, count_formats, formats_offset, count_modifiers, modifiers_offset
+//   u32 formats[count_formats]
+//   { u64 formats_bitmask, u32 offset, u32 pad, u64 modifier }[count_modifiers]
+static void d64_build_informats64(void) {
+    uint32_t* h = (uint32_t*)g_informats_primary;
+    h[0] = DRM64_IN_FORMATS_VERSION64;
+    h[1] = 0u;
+    h[2] = 2u;                                            // 两个格式
+    h[3] = 24u;                                           // formats_offset
+    h[4] = 1u;                                            // 一条 modifier 记录
+    h[5] = 32u;                                           // modifiers_offset = 24 + 2*4
+    uint32_t* f = (uint32_t*)(g_informats_primary + 24);
+    f[0] = DRM64_FORMAT_ARGB8888;
+    f[1] = DRM64_FORMAT_XRGB8888;
+    uint8_t* m = g_informats_primary + 32;
+    for (uint32_t i = 0; i < 24; i++) m[i] = 0;           // modifier = 0（DRM_FORMAT_MOD_LINEAR）
+    *(uint64_t*)(m + 0) = 0x3ull;                         // 两个格式都支持这个 modifier
+    g_informats_primary_len = 56u;
+    uint32_t* ch = (uint32_t*)g_informats_cursor;         // cursor plane：0 格式（诚实：不接管光标硬件）
+    ch[0] = DRM64_IN_FORMATS_VERSION64; ch[1] = 0u; ch[2] = 0u; ch[3] = 24u; ch[4] = 0u; ch[5] = 24u;
+    g_informats_cursor_len = 24u;
+}
+
+// ---- atomic 的"计划"：把请求里的属性收集成一份可校验、可应用的状态 ----
+#define D64_HAVE(p)  ((pl.mask & (1u << (p))) != 0u)
+struct D64AtomicPlan {
+    uint32_t mask;          // bit(prop_id) = 这个属性在请求里出现过
+    uint32_t fb_id;
+    uint64_t mode_blob;
+    uint32_t sx, sy, sw, sh;      // 16.16
+    uint32_t dx, dy, dw, dh;
+    uint32_t active;
+    uint32_t conn_crtc;
+    uint32_t plane_id;
+};
+
+static int d64_atomic_apply64(const uint32_t* objs, const uint32_t* cnts,
+                              const uint32_t* props, const uint64_t* vals,
+                              uint32_t n_objs, uint32_t total, uint32_t flags,
+                              const char** why, int* path_out) {
+    D64AtomicPlan pl;
+    for (uint32_t i = 0; i < sizeof(pl); i++) ((uint8_t*)&pl)[i] = 0;
+    pl.plane_id = DRM64_PLANE_PRIMARY_ID64;
+    uint32_t k = 0;
+    for (uint32_t oi = 0; oi < n_objs; oi++) {
+        const uint32_t obj_id = objs[oi];
+        const uint32_t n = cnts[oi];
+        if (n == 0u) { *why = "obj-no-props"; return -DRM64_EINVAL64; }
+        if (obj_id == 0u) { *why = "obj-id"; return -DRM64_EINVAL64; }
+        // 一个请求里只说对象 id、不说类型（Linux 的 atomic 就是这样），所以按 id 猜类型：
+        //   1 = CRTC 与 CONNECTOR 都是 1、plane 也是 1 —— 用属性表反推更靠谱：
+        //   把属性按 id 归属去校验，谁都不认识就报错。
+        for (uint32_t pi = 0; pi < n; pi++, k++) {
+            const uint32_t pid = props[k];
+            const uint64_t val = vals[k];
+            if (pid == 0u || pid > DRM64_PROP_COUNT64) { *why = "prop-id"; return -DRM64_EINVAL64; }
+            const D64Prop& P = D64_PROPS[pid - 1u];
+            if (P.flags & DRM64_PROP_IMMUTABLE64) { *why = "immutable"; return -DRM64_EINVAL64; }
+            // 对象归属：属性表里的 types 位 + 对象 id 必须对得上
+            const int is_plane = (P.types & D64_PT_PLANE) != 0u;
+            const int is_crtc  = (P.types & D64_PT_CRTC) != 0u;
+            const int is_conn  = (P.types & D64_PT_CONN) != 0u;
+            if (is_crtc && obj_id != DRM64_CRTC_ID64) { *why = "crtc-id"; return -DRM64_EINVAL64; }
+            if (is_conn && obj_id != DRM64_CONNECTOR_ID64) { *why = "conn-id"; return -DRM64_EINVAL64; }
+            if (is_plane && (obj_id == 0u || obj_id > d64_plane_count64())) { *why = "plane-id"; return -DRM64_EINVAL64; }
+            if (!is_plane && !is_crtc && !is_conn) { *why = "obj-type"; return -DRM64_EINVAL64; }
+            pl.mask |= (1u << pid);
+            if (is_plane) pl.plane_id = obj_id;
+            switch (pid) {
+            case DRM64_PROP_ACTIVE:   pl.active = (uint32_t)val; break;
+            case DRM64_PROP_MODE_ID:  pl.mode_blob = val; break;
+            case DRM64_PROP_FB_ID:    pl.fb_id = (uint32_t)val; break;
+            case DRM64_PROP_CRTC_ID:
+                if (is_conn) pl.conn_crtc = (uint32_t)val; break;
+            case DRM64_PROP_SRC_X:    pl.sx = (uint32_t)val; break;
+            case DRM64_PROP_SRC_Y:    pl.sy = (uint32_t)val; break;
+            case DRM64_PROP_SRC_W:    pl.sw = (uint32_t)val; break;
+            case DRM64_PROP_SRC_H:    pl.sh = (uint32_t)val; break;
+            case DRM64_PROP_CRTC_X:   pl.dx = (uint32_t)val; break;
+            case DRM64_PROP_CRTC_Y:   pl.dy = (uint32_t)val; break;
+            case DRM64_PROP_CRTC_W:   pl.dw = (uint32_t)val; break;
+            case DRM64_PROP_CRTC_H:   pl.dh = (uint32_t)val; break;
+            default: break;                                  // type / IN_FORMATS 是 immutable，上面已拒
+            }
+        }
+    }
+    if (k != total) { *why = "count-mismatch"; return -DRM64_EINVAL64; }
+    if (D64_HAVE(DRM64_PROP_ACTIVE) && pl.active > 1u) { *why = "active"; return -DRM64_EINVAL64; }
+    if (D64_HAVE(DRM64_PROP_CRTC_ID) && pl.conn_crtc != 0u && pl.conn_crtc != DRM64_CRTC_ID64) {
+        *why = "conn-crtc"; return -DRM64_EINVAL64;
+    }
+    // MODE_ID：只认本内核那一个模式（内容 = 68 B 的 drm_mode_modeinfo）
+    if (D64_HAVE(DRM64_PROP_MODE_ID) && pl.mode_blob != 0ull) {
+        const uint8_t* bp = nullptr; uint32_t bl = 0;
+        if (d64_blob_info64((uint32_t)pl.mode_blob, &bp, &bl) != 0) { *why = "mode-blob"; return -DRM64_EINVAL64; }
+        if (bl < sizeof(Drm64ModeMode)) { *why = "mode-blob-len"; return -DRM64_EINVAL64; }
+        const Drm64ModeMode* m = (const Drm64ModeMode*)bp;
+        if (m->hdisplay != g_mode64.hdisplay || m->vdisplay != g_mode64.vdisplay) {
+            *why = "mode-unsupported"; return -DRM64_EINVAL64;      // 换分辨率：如实拒绝
+        }
+    }
+    // plane 侧：只支持 primary、整块贴、不允许缩放/源偏移（做不到就如实报，不假装）
+    Drm64Dumb* d = nullptr;
+    int want_present = 0;
+    if (D64_HAVE(DRM64_PROP_FB_ID) || D64_HAVE(DRM64_PROP_CRTC_W)) {
+        if (pl.plane_id != DRM64_PLANE_PRIMARY_ID64) { *why = "cursor-plane"; return -DRM64_EINVAL64; }
+        if (pl.fb_id != 0u) {
+            Drm64Fb* fb = nullptr;
+            d = d64_fb_resolve64(pl.fb_id, &fb);
+            if (!d) { *why = "no-such-fb"; return -DRM64_EINVAL64; }
+            if (D64_HAVE(DRM64_PROP_CRTC_ID) && pl.conn_crtc == 0u) { *why = "plane-crtc"; return -DRM64_EINVAL64; }
+            if (D64_HAVE(DRM64_PROP_SRC_X) && pl.sx != 0u) { *why = "src-offset"; return -DRM64_EINVAL64; }
+            if (D64_HAVE(DRM64_PROP_SRC_Y) && pl.sy != 0u) { *why = "src-offset"; return -DRM64_EINVAL64; }
+            const uint32_t sw = pl.sw >> 16, sh = pl.sh >> 16;
+            const uint32_t dw = D64_HAVE(DRM64_PROP_CRTC_W) ? pl.dw : (D64_HAVE(DRM64_PROP_SRC_W) ? sw : d->w);
+            const uint32_t dh = D64_HAVE(DRM64_PROP_CRTC_H) ? pl.dh : (D64_HAVE(DRM64_PROP_SRC_H) ? sh : d->h);
+            if (dw == 0u || dh == 0u) { *why = "rect-zero"; return -DRM64_EINVAL64; }
+            if (sw != 0u && sw != dw) { *why = "no-scaling"; return -DRM64_EINVAL64; }
+            if (sh != 0u && sh != dh) { *why = "no-scaling"; return -DRM64_EINVAL64; }
+            if (dw > d->w || dh > d->h) { *why = "rect-too-big"; return -DRM64_EINVAL64; }
+            int bw = 0, bh = 0;
+            (void)fb_surface64(&bw, &bh);
+            if (bw > 0 && (pl.dx + dw > (uint32_t)bw)) { *why = "rect-x"; return -DRM64_EINVAL64; }
+            if (bh > 0 && (pl.dy + dh > (uint32_t)bh)) { *why = "rect-y"; return -DRM64_EINVAL64; }
+            want_present = 1;
+        }
+    }
+    if (flags & DRM64_ATOMIC_TEST_ONLY64) {                 // 只校验，**一个像素都不动**
+        if (path_out) *path_out = 2;
+        return 0;
+    }
+    // ---- 真正落盘：关屏 / 贴图 / 什么都不动 ----
+    if (D64_HAVE(DRM64_PROP_ACTIVE) && pl.active == 0u) {
+        if (d64_blank64() != 0) { *why = "no-framebuffer"; return -DRM64_ENODEV64; }
+        g_handle_on_screen = 0; g_fb_on_screen = 0; g_crtc_active = 0;
+        if (path_out) *path_out = 2;
+        return 0;
+    }
+    if (D64_HAVE(DRM64_PROP_FB_ID) && pl.fb_id == 0u) {     // 摘掉 plane = 清屏（Linux 同义）
+        if (d64_blank64() != 0) { *why = "no-framebuffer"; return -DRM64_ENODEV64; }
+        g_handle_on_screen = 0; g_fb_on_screen = 0;
+        if (path_out) *path_out = 2;
+        return 0;
+    }
+    if (want_present) {
+        const int p = d64_present_at64(d, pl.dx, pl.dy);
+        if (p < 0) { *why = "no-framebuffer"; return -DRM64_ENODEV64; }
+        Drm64Fb* fb = d64_find_fb64(pl.fb_id);
+        g_handle_on_screen = d->id;
+        g_fb_on_screen = fb ? fb->id : 0u;
+        if (path_out) *path_out = p;
+        return 0;
+    }
+    if (D64_HAVE(DRM64_PROP_ACTIVE) && pl.active == 1u) g_crtc_active = 1u;
+    if (path_out) *path_out = 2;
+    return 0;
+}
+
+__attribute__((noinline)) static int d64_atomic_fail64(const char* why, int err) {
+    d64_begin(); d64_puts("[DRM] atomic FAILED reason="); d64_puts(why);
+    d64_puts(" err="); d64_num((uint64_t)(err < 0 ? -err : err)); d64_end();
+    return err;
+}
+
+// ---- GETENCODER ----
+static int d64_ioctl_getencoder64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeGetEncoder))) return -DRM64_EFAULT64;
+    Drm64ModeGetEncoder e;
+    d64_urd64(arg, &e, sizeof(Drm64ModeGetEncoder));
+    if (e.encoder_id != 0u && e.encoder_id != DRM64_ENCODER_ID64)
+        return d64_fail64("[DRM] getencoder", "no-such-encoder", -DRM64_EINVAL64);
+    e.encoder_id = DRM64_ENCODER_ID64;
+    e.encoder_type = DRM64_ENCODER_TYPE_TMDS64;
+    e.crtc_id = g_crtc_active ? DRM64_CRTC_ID64 : 0u;
+    e.possible_crtcs = 1u;
+    e.possible_clones = 0u;
+    d64_uwr64(arg, &e, sizeof(Drm64ModeGetEncoder));
+    d64_begin(); d64_puts("[DRM] encoder id="); d64_num(e.encoder_id);
+    d64_puts(" type="); d64_num(e.encoder_type); d64_puts(" crtc="); d64_num(e.crtc_id);
+    d64_puts(" possible_crtcs="); d64_hex(e.possible_crtcs); d64_end();
+    return 0;
+}
+
+// ---- GETPROPERTY ----
+static int d64_ioctl_getproperty64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeGetProperty))) return -DRM64_EFAULT64;
+    Drm64ModeGetProperty p;
+    d64_urd64(arg, &p, sizeof(Drm64ModeGetProperty));
+    if (p.prop_id == 0u || p.prop_id > DRM64_PROP_COUNT64)
+        return d64_fail64("[DRM] getproperty", "no-such-prop", -DRM64_EINVAL64);
+    const D64Prop& P = D64_PROPS[p.prop_id - 1u];
+    uint32_t n = 0;
+    while (P.name[n] && n + 1u < sizeof(p.name)) { p.name[n] = P.name[n]; n++; }
+    p.name[n] = 0;
+    p.flags = P.flags;
+    p.count_values = 0u;                                   // 本内核没有枚举值表（ENUM 只报 type）
+    p.count_enum_blobs = 0u;
+    if (p.values_ptr && p.count_values >= 1u) { /* 不会进来 */ }
+    d64_uwr64(arg, &p, sizeof(Drm64ModeGetProperty));
+    d64_begin(); d64_puts("[DRM] prop get id="); d64_num(p.prop_id);
+    d64_puts(" name="); d64_puts(p.name); d64_puts(" flags="); d64_hex(p.flags);
+    d64_puts(" values="); d64_num(p.count_values); d64_end();
+    return 0;
+}
+
+// ---- GETPROPBLOB ----
+static int d64_ioctl_getblob64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeGetBlob))) return -DRM64_EFAULT64;
+    Drm64ModeGetBlob g;
+    d64_urd64(arg, &g, sizeof(Drm64ModeGetBlob));
+    const uint8_t* bp = nullptr;
+    uint32_t bl = 0;
+    const int rc = d64_blob_info64(g.blob_id, &bp, &bl);
+    if (rc != 0) return d64_fail64("[DRM] getblob", "no-such-blob", rc);
+    const uint32_t cap = g.length;
+    g.length = bl;
+    if (g.data && cap >= bl) d64_uwr64(g.data, bp, bl);     // 缓冲够才拷（Linux 同语义）
+    d64_uwr64(arg, &g, sizeof(Drm64ModeGetBlob));
+    d64_begin(); d64_puts("[DRM] blob read id="); d64_num(g.blob_id);
+    d64_puts(" len="); d64_num((uint64_t)bl); d64_end();
+    return 0;
+}
+
+// ---- CREATEBLOB / DESTROYBLOB ----
+static int d64_ioctl_createblob64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeCreateBlob))) return -DRM64_EFAULT64;
+    Drm64ModeCreateBlob b;
+    d64_urd64(arg, &b, sizeof(Drm64ModeCreateBlob));
+    if (b.length == 0u || b.length > DRM64_USERBLOB_BYTES64)
+        return d64_fail64("[DRM] createblob", "length", -DRM64_EINVAL64);
+    if (!b.data || !user64_range_ok64(b.data, b.length))
+        return d64_fail64("[DRM] createblob", "data", -DRM64_EFAULT64);
+    int slot = -1;
+    for (uint32_t i = 0; i < DRM64_MAX_USERBLOB64; i++) if (g_userblob_len[i] == 0u) { slot = (int)i; break; }
+    if (slot < 0) return d64_fail64("[DRM] createblob", "no-free-slot", -DRM64_ENOMEM64);
+    d64_urd64(b.data, g_userblob[slot], b.length);
+    g_userblob_len[slot] = b.length;
+    b.blob_id = DRM64_BLOB_USER_BASE64 + (uint32_t)slot;
+    d64_uwr64(arg, &b, sizeof(Drm64ModeCreateBlob));
+    d64_begin(); d64_puts("[DRM] blob create id="); d64_num(b.blob_id);
+    d64_puts(" len="); d64_num(b.length); d64_end();
+    return 0;
+}
+
+static int d64_ioctl_destroyblob64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeDestroyBlob))) return -DRM64_EFAULT64;
+    Drm64ModeDestroyBlob b;
+    d64_urd64(arg, &b, sizeof(Drm64ModeDestroyBlob));
+    if (b.blob_id < DRM64_BLOB_USER_BASE64 || b.blob_id >= DRM64_BLOB_USER_BASE64 + DRM64_MAX_USERBLOB64)
+        return d64_fail64("[DRM] destroyblob", "fixed-blob", -DRM64_EINVAL64);
+    const uint32_t s = b.blob_id - DRM64_BLOB_USER_BASE64;
+    if (g_userblob_len[s] == 0u) return d64_fail64("[DRM] destroyblob", "no-such-blob", -DRM64_EINVAL64);
+    g_userblob_len[s] = 0u;
+    for (uint32_t i = 0; i < DRM64_USERBLOB_BYTES64; i++) g_userblob[s][i] = 0;
+    return 0;
+}
+
+// ---- OBJ_GETPROPERTIES ----
+static int d64_ioctl_objgetprops64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeObjGetProps))) return -DRM64_EFAULT64;
+    Drm64ModeObjGetProps r;
+    d64_urd64(arg, &r, sizeof(Drm64ModeObjGetProps));
+    uint32_t ids[DRM64_PROP_COUNT64];
+    const uint32_t n = d64_obj_props64(r.obj_type, r.obj_id, ids, DRM64_PROP_COUNT64);
+    if (n == 0u) return d64_fail64("[DRM] objgetprops", "no-such-object", -DRM64_EINVAL64);
+    if (r.props_ptr && r.prop_values_ptr && r.count_props >= n) {
+        if (!user64_range_ok64(r.props_ptr, n * 4u) || !user64_range_ok64(r.prop_values_ptr, n * 8u))
+            return -DRM64_EFAULT64;
+        for (uint32_t i = 0; i < n; i++) {
+            d64_uwr32(r.props_ptr + (uint64_t)i * 4ull, ids[i]);
+            const uint64_t v = d64_prop_get64(ids[i], r.obj_id, r.obj_type);
+            d64_uwr64(r.prop_values_ptr + (uint64_t)i * 8ull, &v, 8u);
+        }
+    }
+    r.count_props = n;
+    d64_uwr64(arg, &r, sizeof(Drm64ModeObjGetProps));
+    d64_begin(); d64_puts("[DRM] prop obj="); d64_num(r.obj_id);
+    d64_puts(" type="); d64_hex(r.obj_type); d64_puts(" count="); d64_num(n); d64_end();
+    return 0;
+}
+
+// ---- OBJ_SETPROPERTY（单个属性的即时版本；语义与 atomic 一致）----
+static int d64_ioctl_objsetprop64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeObjSetProp))) return -DRM64_EFAULT64;
+    Drm64ModeObjSetProp s;
+    d64_urd64(arg, &s, sizeof(Drm64ModeObjSetProp));
+    uint32_t objs[1] = { s.obj_id };
+    uint32_t cnts[1] = { 1u };
+    uint32_t props[1] = { s.prop_id };
+    uint64_t vals[1] = { s.value };
+    const char* why = "?";
+    int path = 2;
+    const int rc = d64_atomic_apply64(objs, cnts, props, vals, 1u, 1u, 0u, &why, &path);
+    if (rc != 0) return d64_atomic_fail64(why, rc);
+    return 0;
+}
+
+// ---- ATOMIC ----
+static int d64_ioctl_atomic64(uint64_t arg) {
+    if (!user64_range_ok64(arg, sizeof(Drm64ModeAtomic))) return -DRM64_EFAULT64;
+    Drm64ModeAtomic a;
+    d64_urd64(arg, &a, sizeof(Drm64ModeAtomic));
+    if (a.reserved != 0ull) return d64_atomic_fail64("reserved", -DRM64_EINVAL64);
+    if (a.flags & ~DRM64_ATOMIC_FLAGS_OK64) return d64_atomic_fail64("flags", -DRM64_EINVAL64);
+    if (a.count_objs == 0u || a.count_objs > DRM64_ATOMIC_MAX_OBJS64)
+        return d64_atomic_fail64("count-objs", -DRM64_EINVAL64);
+    if (!a.objs_ptr || !a.count_props_ptr || !a.props_ptr || !a.prop_values_ptr)
+        return d64_atomic_fail64("null-array", -DRM64_EINVAL64);
+    uint32_t objs[DRM64_ATOMIC_MAX_OBJS64];
+    uint32_t cnts[DRM64_ATOMIC_MAX_OBJS64];
+    if (!user64_range_ok64(a.objs_ptr, a.count_objs * 4u)) return -DRM64_EFAULT64;
+    if (!user64_range_ok64(a.count_props_ptr, a.count_objs * 4u)) return -DRM64_EFAULT64;
+    d64_urd64(a.objs_ptr, objs, a.count_objs * 4u);
+    d64_urd64(a.count_props_ptr, cnts, a.count_objs * 4u);
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < a.count_objs; i++) total += cnts[i];
+    if (total == 0u || total > DRM64_ATOMIC_MAX_PROPS64) return d64_atomic_fail64("count-props", -DRM64_EINVAL64);
+    if (!user64_range_ok64(a.props_ptr, total * 4u)) return -DRM64_EFAULT64;
+    if (!user64_range_ok64(a.prop_values_ptr, total * 8u)) return -DRM64_EFAULT64;
+    uint32_t props[DRM64_ATOMIC_MAX_PROPS64];
+    uint64_t vals[DRM64_ATOMIC_MAX_PROPS64];
+    d64_urd64(a.props_ptr, props, total * 4u);
+    d64_urd64(a.prop_values_ptr, vals, total * 8u);
+    const char* why = "?";
+    int path = 2;
+    const int rc = d64_atomic_apply64(objs, cnts, props, vals, a.count_objs, total, a.flags, &why, &path);
+    if (rc != 0) return d64_atomic_fail64(why, rc);
+    const int test = (a.flags & DRM64_ATOMIC_TEST_ONLY64) ? 1 : 0;
+    d64_begin(); d64_puts("[DRM] atomic objs="); d64_num(a.count_objs);
+    d64_puts(" props="); d64_num(total); d64_puts(" flags="); d64_hex(a.flags);
+    d64_puts(test ? " test=1" : " test=0");
+    d64_puts(path == 2 ? " path=none" : (path ? " path=gpu" : " path=cpu"));
+    d64_puts(" active="); d64_num(g_crtc_active ? 1ull : 0ull);
+    d64_puts(" user_data="); d64_hex(a.user_data);
+    d64_end();
+    return 0;
+}
+
 int drm64_ioctl64(uint64_t cmd, uint64_t arg, uint64_t pid) {
     switch (cmd) {
     case DRM64_IOWR(DRM64_NR_VERSION, Drm64Version):               return d64_ioctl_version64(arg);
@@ -789,6 +1278,14 @@ int drm64_ioctl64(uint64_t cmd, uint64_t arg, uint64_t pid) {
     case DRM64_IOWR(DRM64_NR_MODE_SETCRTC, Drm64ModeCrtc):        return d64_ioctl_setcrtc64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_ADDFB, Drm64ModeFbCmd):          return d64_ioctl_addfb_64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_ADDFB2, Drm64ModeFbCmd2):        return d64_ioctl_addfb2_64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_GETENCODER, Drm64ModeGetEncoder): return d64_ioctl_getencoder64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_GETPROPERTY, Drm64ModeGetProperty): return d64_ioctl_getproperty64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_GETPROPBLOB, Drm64ModeGetBlob):  return d64_ioctl_getblob64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_CREATEBLOB, Drm64ModeCreateBlob): return d64_ioctl_createblob64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_DESTROYBLOB, Drm64ModeDestroyBlob): return d64_ioctl_destroyblob64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_OBJ_GETPROPS, Drm64ModeObjGetProps): return d64_ioctl_objgetprops64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_OBJ_SETPROP, Drm64ModeObjSetProp): return d64_ioctl_objsetprop64(arg);
+    case DRM64_IOWR(DRM64_NR_MODE_ATOMIC, Drm64ModeAtomic):        return d64_ioctl_atomic64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_GETPLANERES, Drm64ModeGetPlaneRes): return d64_ioctl_getplaneres64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_GETPLANE, Drm64ModeGetPlane):    return d64_ioctl_getplane64(arg);
     case DRM64_IOWR(DRM64_NR_MODE_PAGE_FLIP, Drm64ModePageFlip):   return d64_ioctl_page_flip64(arg);
@@ -964,6 +1461,10 @@ void drm64_init64(void) {
         for (uint32_t k = 0; k < sizeof(Drm64Fb); k++) ((uint8_t*)&g_fb[i])[k] = 0;
     g_seq = 0;
     g_presents = 0;
+    g_crtc_active = 0;
+    g_last_x = g_last_y = g_last_w = g_last_h = 0;
+    for (uint32_t i = 0; i < DRM64_MAX_USERBLOB64; i++) g_userblob_len[i] = 0u;
+    d64_build_informats64();                     // IN_FORMATS blob（Linux 的 drm_format_modifier_blob 布局）
     g_ev_pending_n = 0;
     g_ev_reads = 0;
     // 模式的唯一计算点（几何此后不会变；GETCRTC / GETCONNECTOR 直接拷 g_mode64）

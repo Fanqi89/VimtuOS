@@ -100,6 +100,10 @@ STRUCT_NAMES = [
     "Drm64WaitVblank", "Drm64CrtcSeq", "InputEvent64",
     # ★ v0.9.15：fb 对象 / plane
     "Drm64ModeFbCmd2", "Drm64ModeFbCmd", "Drm64ModeGetPlaneRes", "Drm64ModeGetPlane",
+    # ★ v0.9.16：属性系统 / blob / atomic
+    "Drm64ModeGetEncoder", "Drm64ModeGetProperty", "Drm64ModeGetBlob",
+    "Drm64ModeObjGetProps", "Drm64ModeObjSetProp", "Drm64ModeAtomic",
+    "Drm64ModeCreateBlob", "Drm64ModeDestroyBlob",
 ]
 
 
@@ -190,6 +194,15 @@ LINUX_DRM_ABI = [
     ("DRM64_NR_MODE_GETPLANERES",  "Drm64ModeGetPlaneRes", 0xB6, 16, 0xC01064B6),
     ("DRM64_NR_WAIT_VBLANK",       "Drm64WaitVblank",     0x3A,  24, 0xC018643A),
     ("DRM64_NR_CRTC_GET_SEQUENCE", "Drm64CrtcSeq",        0x3B,  24, 0xC018643B),
+    # ★ v0.9.16：属性系统 / blob / atomic（8 个）
+    ("DRM64_NR_MODE_GETENCODER",   "Drm64ModeGetEncoder",  0xA6,  20, 0xC01464A6),
+    ("DRM64_NR_MODE_GETPROPERTY",  "Drm64ModeGetProperty", 0xAA,  64, 0xC04064AA),
+    ("DRM64_NR_MODE_GETPROPBLOB",  "Drm64ModeGetBlob",     0xAC,  16, 0xC01064AC),
+    ("DRM64_NR_MODE_OBJ_GETPROPS", "Drm64ModeObjGetProps", 0xB9,  32, 0xC02064B9),
+    ("DRM64_NR_MODE_OBJ_SETPROP",  "Drm64ModeObjSetProp",  0xBA,  24, 0xC01864BA),
+    ("DRM64_NR_MODE_ATOMIC",       "Drm64ModeAtomic",      0xBC,  56, 0xC03864BC),
+    ("DRM64_NR_MODE_CREATEBLOB",   "Drm64ModeCreateBlob",  0xBD,  16, 0xC01064BD),
+    ("DRM64_NR_MODE_DESTROYBLOB",  "Drm64ModeDestroyBlob", 0xBE,   4, 0xC00464BE),
 ]
 
 
@@ -485,6 +498,19 @@ def main():
             (r"\[DRMDEMO\] addfb2 fb=\d+ handle=\d+ rc=0", "addfb2 rc=0"),
             (r"\[DRMDEMO\] setcrtc crtc=1 fb=\d+ rc=0", "setcrtc rc=0"),
             (r"\[DRMDEMO\] leak_dumb handle=\d+ pages_hint=4 rc=0", "leak_dumb（故意不销毁）"),
+            (r"\[DRMDEMO\] encoder id=1 type=2 crtc=1 possible_crtcs=0x1 rc=0", "encoder"),
+            (r"\[DRMDEMO\] obj_props plane n=12 counted=12 first=3 fbval=\d+ rc=0", "obj_props n=12"),
+            (r"\[DRMDEMO\] prop id=4 name=FB_ID flags=0x12 rc=0", "prop FB_ID flags=0x12"),
+            (r"\[DRMDEMO\] blob_informats len=56 version=1 formats=2 mods=1 fmt0=0x34325241 rc=0",
+             "IN_FORMATS blob（version/formats/mods）"),
+            (r"\[DRMDEMO\] blob_mode id=768 len=68 rc=0", "CREATEBLOB mode 68 B -> id 768"),
+            (r"\[DRMDEMO\] atomic badscale rc=-22", "atomic 反例：缩放 -> -22"),
+            (r"\[DRMDEMO\] atomic badevent rc=-22", "atomic 反例：PAGE_FLIP_EVENT -> -22"),
+            (r"\[DRMDEMO\] atomic test_only rc=0", "atomic TEST_ONLY rc=0"),
+            (r"\[DRMDEMO\] atomic commit rc=0 user_data=0x5150", "atomic commit rc=0"),
+            (r"\[DRMDEMO\] after_atomic plane_fb=256 crtc_fb=256 valid=1 rc=0/0",
+             "提交后 GETPLANE/GETCRTC 报同一个 fb"),
+            (r"\[DRMDEMO\] blob_destroy id=768 rc=0", "DESTROYBLOB rc=0"),
         ]
         stage_ok = vm.wait("[DRMDEMO] done", args.timeout)
         log = vm.log()
@@ -535,6 +561,45 @@ def main():
                   i_done >= 0 and i_rel > i_done, "done@%d release@%d" % (i_done, i_rel))
         else:
             check("④ release 发生在 [DRMDEMO] done **之后**（= 退出 hook，不是显式 destroy）", False, "缺 release 行")
+
+        # ---------- ④-c ★ v0.9.16：属性系统 + atomic commit ----------
+        check("④ [DRM] encoder 报 TMDS + possible_crtcs=0x1",
+              re.search(r"\[DRM\] encoder id=1 type=2 crtc=\d+ possible_crtcs=0x1", log) is not None,
+              (re.search(r"\[DRM\] encoder[^\r\n]*", log).group(0)
+               if re.search(r"\[DRM\] encoder[^\r\n]*", log) else "缺 encoder 行"))
+        check("④ [DRM] prop get 把名字/标志回给用户态（FB_ID, flags=0x12）",
+              re.search(r"\[DRM\] prop get id=4 name=FB_ID flags=0x12", log) is not None)
+        check("④ IN_FORMATS blob 可读回（56 B，version=1 / 2 个格式 / 1 条 linear modifier）",
+              re.search(r"\[DRM\] blob read id=513 len=56", log) is not None,
+              (re.search(r"\[DRM\] blob read[^\r\n]*", log).group(0)
+               if re.search(r"\[DRM\] blob read[^\r\n]*", log) else "缺 blob read 行"))
+        check("④ CREATEBLOB 把模式做成 MODE_ID blob（68 B -> id 768）",
+              re.search(r"\[DRM\] blob create id=768 len=68", log) is not None)
+        check("④ 反例：atomic 不支持缩放 -> [DRM] atomic FAILED reason=no-scaling err=22",
+              re.search(r"\[DRM\] atomic FAILED reason=no-scaling err=22", log) is not None)
+        check("④ 反例：atomic 的 PAGE_FLIP_EVENT 位被拒 -> reason=flags err=22",
+              re.search(r"\[DRM\] atomic FAILED reason=flags err=22", log) is not None)
+        check("④ TEST_ONLY 只校验不落像素（[DRM] atomic … test=1 path=none）",
+              re.search(r"\[DRM\] atomic objs=3 props=10 flags=0x500 test=1 path=none", log) is not None,
+              (re.search(r"\[DRM\] atomic[^\r\n]*test=1[^\r\n]*", log).group(0)
+               if re.search(r"\[DRM\] atomic[^\r\n]*test=1[^\r\n]*", log) else "缺 test=1 行"))
+        check("④ 真提交走通（[DRM] atomic … test=0 path=cpu active=1）",
+              re.search(r"\[DRM\] atomic objs=3 props=10 flags=0x400 test=0 path=(gpu|cpu) active=1", log) is not None,
+              (re.search(r"\[DRM\] atomic[^\r\n]*test=0[^\r\n]*", log).group(0)
+               if re.search(r"\[DRM\] atomic[^\r\n]*test=0[^\r\n]*", log) else "缺 test=0 行"))
+        # 顺序证据：TEST_ONLY 自己**不落像素**。判据用"present 计数差"：
+        #   从 test=1 那行到 commit 那行之间，presnet 只该多 1 次（commit 自己那次）。
+        #   如果 TEST_ONLY 也上屏了，差就是 2 —— 那样就红。
+        i_t1 = log.find("test=1 path=none")
+        i_t0 = log.find("test=0 path=")
+        if i_t1 >= 0 and i_t0 > i_t1:
+            n_before = log[:i_t1].count("[DRM] present")
+            n_after = log[:i_t0].count("[DRM] present")
+            check("④ TEST_ONLY 没落像素（它之后到真提交之间只多 1 次 present = 提交自己那次）",
+                  n_after - n_before == 1, "before=%d after=%d" % (n_before, n_after))
+        else:
+            check("④ TEST_ONLY 没落像素（它之后到真提交之间只多 1 次 present = 提交自己那次）", False,
+                  "找不到 test=1/test=0 两行")
 
         # ---------- ⑤ 桌面照旧 + 屏幕取证 ----------
         try:

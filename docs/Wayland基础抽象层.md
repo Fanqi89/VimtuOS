@@ -154,7 +154,8 @@ py -3 tests\drm64_test.py            # 串口断言 + 头文件逐值比对 + �
 ### A.3 还完全没做的（按"跑 wlroots"的依赖顺序）
 
 > ★ v0.9.14 把 A.2 的 4 处 struct 差值清零；★ **v0.9.15 把下面的第 1 条（ADDFB2/SETCRTC/GETPLANE）
-> 与第 5 条（dumb 的 fd 生命周期 / 进程回收）做完了** —— 详见 A.6。剩下的是 2/3/4/6。
+> 与第 5 条（dumb 的 fd 生命周期 / 进程回收）做完了**（详见 A.6）；★ **v0.9.16 把第 1 条里剩下的
+> atomic commit（属性系统 + MODE_ATOMIC）也做完了**（详见 A.7）。剩下的是 2/3/4/6。
 
 1. **`MODE_ADDFB2` / `MODE_SETCRTC` / `MODE_ATOMIC` + `MODE_GETPLANE` 的属性系统** —— wlroots 的
    DRM 后端走 atomic commit；我们现在只有 `PAGE_FLIP` + dumb buffer，**没有 fb 对象与属性**。
@@ -251,5 +252,40 @@ dumb 被销毁/回收时引用它的 fb 一起消失。
 **这一步之后 wlroots 还差什么**（下一步顺序不变）：
 ① dma-buf 跨进程（`PRIME_HANDLE_TO_FD` 等价物）与真双缓冲交替；
 ② atomic commit（`MODE_ATOMIC` + 属性 id/取值系统）—— 到这一步 wlroots 的 DRM 后端才真正有戏；
+③ libinput 的 udev/libevdev 层（`/sys` 枚举、`EVIOCGRAB`/`EVIOCSABS`）；
+④ GBM + EGL/GLES（要 Mesa）。
+
+### A.7 v0.9.16 的落地记录（属性系统 + atomic commit，已做）
+
+**8 个新 ioctl（累计 24 个，号与 Linux `drm.h` 逐个相等）**
+
+| ioctl | sizeof | 号 |
+| --- | --- | --- |
+| `MODE_GETENCODER` | 20 | `0xC01464A6` |
+| `MODE_GETPROPERTY` | 64 | `0xC04064AA` |
+| `MODE_GETPROPBLOB` | 16 | `0xC01064AC` |
+| `MODE_OBJ_GETPROPERTIES` | 32 | `0xC02064B9` |
+| `MODE_OBJ_SETPROPERTY` | 24 | `0xC01864BA` |
+| `MODE_ATOMIC` | 56 | `0xC03864BC` |
+| `MODE_CREATEPROPBLOB` | 16 | `0xC01064BD` |
+| `MODE_DESTROYPROPBLOB` | 4 | `0xC00464BE` |
+
+**属性模型**（14 个固定属性，名字/标志/可挂对象见 `kernel/drm64.cpp` 的 `D64_PROPS`）
+
+* CRTC：`ACTIVE`、`MODE_ID`（blob）
+* plane：`type`（immutable，1=primary / 2=cursor）、`FB_ID`、`CRTC_ID`、`SRC_X/SRC_Y/SRC_W/SRC_H`（16.16 定点）、
+  `CRTC_X/CRTC_Y/CRTC_W/CRTC_H`（像素）、`IN_FORMATS`（immutable blob）
+* connector：`CRTC_ID`
+
+**blob**：模式（68 B，`CREATEPROPBLOB` 建）与 `IN_FORMATS`（56 B，按 Linux `drm_format_modifier_blob` 拼：
+24 B header + 2 个 fourcc + 1 条 linear modifier）。
+
+**atomic commit 的口径**：一次请求校验一批对象的批属性（归属 / immutable / 模式 / 矩形 / 缩放 / 偏移），
+任何一条不满足就整包 `-EINVAL`（**不部分应用**）；`TEST_ONLY` 校验通过后**一个像素都不动**；
+真提交才清屏或按 `CRTC_X/Y` 贴图上屏。
+
+**这一步之后 wlroots 还差什么**（下一步顺序）：
+① dma-buf/fence 跨进程（`PRIME_HANDLE_TO_FD` 等价物）与真双缓冲交替；
+② 事件投递（page flip event / vblank 事件）—— wlroots 的帧回调要靠它；
 ③ libinput 的 udev/libevdev 层（`/sys` 枚举、`EVIOCGRAB`/`EVIOCSABS`）；
 ④ GBM + EGL/GLES（要 Mesa）。
