@@ -122,7 +122,7 @@ py -3 tests\drm64_test.py            # 串口断言 + 头文件逐值比对 + �
 
 | ioctl | 我们现在 | Linux `drm.h` | 差 | 要做的事 |
 | --- | --- | --- | --- | --- |
-| `DRM_IOCTL_VERSION` | sizeof=60 → `0xC03C6400` | sizeof=**56** → `0xC0386400` | -4 | 把 `name/date/desc` 改成 Linux 的 `size_t len + char* ptr` 形式（含拷出到用户指针） |
+| `DRM_IOCTL_VERSION` | sizeof=60 → `0xC03C6400` | sizeof=**64** → `0xC0406400` | **+4** | ★ 订正：上一版本附录写成 56，**错的**。Linux `struct drm_version` = `int major,minor,patch(12) + pad(4) + size_t name_len + char* name + size_t date_len + char* date + size_t desc_len + char* desc` = 12+4+8*6 = **64**。改法：去掉 `packed`、按这个顺序重排字段，`name/date/desc` 改成用户指针 + 长度（内核侧先 `user64_range_ok64` 再拷出） |
 | `MODE_GETCRTC` | 108 → `0xC06C64A1` | **104** → `0xC06864A1` | -4 | `drm_mode_modeinfo` 的 `hskew/vscan` 位置与 `clock` 类型对齐 |
 | `WAIT_VBLANK` | 40 → `0xC028643A` | **24** → `0xC018643A` | -16 | 改成 `u64 type; u64 sequence; union{u64 tval; struct{u32 sec,usec;} }`（去掉我们多出来的字段） |
 | `CRTC_GET_SEQUENCE` | 40 → `0xC028643B` | **24** → `0xC018643B` | -16 | 改成 `u32 crtc_id; u32 active; u64 sequence; u64 ns` |
@@ -146,6 +146,38 @@ py -3 tests\drm64_test.py            # 串口断言 + 头文件逐值比对 + �
 5. **`done` 语义**：`dumb buffer` 的 fd 生命周期（进程异常退出未 DESTROY 会占页）—— 需要在
    `proc64` 的进程回收里加一个 hook（本批未做，风险点在"动 proc64 会牵动全部进程测试"）。
 6. **真双缓冲交替**：演示目前是"同一帧缓冲连续两次 flip + 两次 wait_vblank"，两块 dumb 交替还没做。
+
+### A.4.1 ★ 下一批的完整动手清单（ABI 逐字节对齐）
+
+四个 struct 必须**一次改完、一次构建**（改一半会让 `kernel/drm64.cpp` 编译不过）：
+
+| 文件 | 改什么 |
+| --- | --- |
+| `kernel/drm64.h` | 四个 struct 重排 + 去 `packed`（`drm_version` 64）；`Drm64ModeMode` 68（`clock` 在前、`name[32]` 在后）；`Drm64ModeCrtc` 104；`Drm64WaitVblank` 24（`type/sequence/tval_sec/tval_usec`）；`Drm64CrtcSeq` 24（`crtc_id/active/sequence/sequence_ns`）；每个都加一条 `static_assert` |
+| `kernel/drm64.cpp` | `d64_ioctl_version64()` 改成指针版（三个 `len`+`ptr` 对，先 `user64_range_ok64` 再拷）；`wait_vblank` 的 `request→type`、`flags` 去掉（改 `tval_sec/usec`）；`crtc_seq` 的 `flags→active`、`ns→sequence_ns`；`getconnector` 里写 `mode.name` 的代码不变（字段名没改） |
+| `user/lib/drm64.h` | 与 `kernel/drm64.h` 逐值一致（双头文件比对会报漂移） |
+| `user/apps/drmdemo.c` | `version` 段改传缓冲区 + 长度；`wv.request` → `wv.type = 1`（两处） |
+| `user/lib/libdrm_compat.h` | `libdrm_wait_vblank()` 里 `wv.request` → `wv.type` |
+| `tests/drm64_test.py` | 把硬编码的 11 个 ioctl 号改成 Linux 值（见下表），并加一条"与 Linux 参考值逐个相等"的断言 |
+
+**Linux 参考值（`_IOWR('d',nr,size)` = `(3<<30)|(size<<16)|(0x64<<8)|nr`）：**
+
+```
+VERSION            0xC0406400   (64)
+GET_CAP            0xC010640C   (16)
+MODE_GETRESOURCES  0xC04064A0   (64)
+MODE_GETCRTC       0xC06864A1   (104)
+MODE_GETCONNECTOR  0xC05064A7   (80)
+MODE_CREATE_DUMB   0xC02064B2   (32)
+MODE_MAP_DUMB      0xC01064B3   (16)
+MODE_DESTROY_DUMB  0xC00464B4   (4)
+MODE_PAGE_FLIP     0xC01864B0   (24)
+WAIT_VBLANK        0xC018643A   (24)
+CRTC_GET_SEQUENCE  0xC018643B   (24)
+```
+
+改完后的验收：`drm64_test` 双头文件逐值比对 + Linux 参考值断言全绿，`/bin/drmdemo` 输出不变（
+`version name=vimtu-drm`、`wait_vblank seq=N`）。
 
 ### A.4 建议的下一批顺序
 
