@@ -52,6 +52,7 @@
 //     [GPU] driver vendor=<amd|nvidia|unknown> idx=<n> status=none fallback=no-touch reason=<...>
 //     [INTEL] …（见 kernel/intel_gpu64.cpp 文件头）
 #include "gpu64.h"
+#include "vmware64.h"          // ★ v0.9.18：VMware SVGA 只读能力探测
 #include "pci64.h"
 #include "intel_gpu64.h"   // ★ v0.9.8：P3 Intel 初步驱动（本文件只负责"分派"，不搬它的实现）
 #include "debug64.h"
@@ -191,6 +192,18 @@ static void ga_probe64(Gpu64Dev64* p) {
         if (want != cmd0) ga_cfg_wr16(p->bdf, 0x04u, want);
         p->cmd_word = pci64_cfg_rd16(p->bdf, 0x04u);                   // 回读确认（不信"写成功了"）
         p->cmd_ok   = ((p->cmd_word & 0x0006u) == 0x0006u) ? 1 : 0;
+    }
+
+    // ★ v0.9.18：VMware SVGA II（vendor 0x15AD）—— 它的寄存器常在 **I/O 端口**（BAR0 = I/O BAR），
+    //   所以这条分支必须放在"没有 MMIO 窗口就 return"**之前**。探测只读（唯一一次写是 SVGA_REG_ID
+    //   的版本协商，不影响显示），并在串口打一行 [VMWARE] svga …（含 3D 能力位）。
+    if (p->vendor == 0x15ADu) {
+        const uint32_t b0 = pci64_cfg_rd32(p->bdf, 0x10u);
+        const int is_io = (b0 & 1u) ? 1 : 0;
+        const uint64_t base = (uint64_t)(is_io ? (b0 & ~0x3u) : (b0 & ~0x0Fu));
+        p->probe_ok = vmware64_svga_probe64(p->bdf, is_io, base) ? 1 : 0;
+        if (!p->probe_ok) g_skip[p->index] = GS_NOPROBE;
+        return;
     }
 
     // ---- 厂商专用只读探测 ----
