@@ -1034,7 +1034,13 @@ static void k64_run_raw_demo64(const char* path, const char* name, int kind) {
     // 位置：fb_init() 已经在 kmain 里跑过（本函数只读 fb 的物理分辨率兜底），g_ticks64 已在走；
     // 放在 task_start64() 之前 —— 探测本身不需要调度器，跑完再上线。
     // 边界：运行期 DDC 再探测**不做**（理由见 display64.h），打点里如实写 skipped。
-    display64_init64();
+    // ★ v0.9.22 修（实测缺陷）：EDID 解析必须**早于**显示层 —— 原来 display64_init64() 在这里跑，
+    //   而 edid64_init64() 在 fb_init 之前的那一段（更靠后）才跑，于是显示层读到的永远是
+    //   "g_edid.valid = false"：硬件检查报告里就是 `edid=n/a` / `src=none` —— 用户看到的
+    //   "EDID none、只能盲猜分辨率" 有一半是这条**顺序**造成的（另一半是 UEFI 路径没读 EDID）。
+    //   edid64_init64() 只读 BootInfo + 恒等映射里的 0x7600，不碰 fb / 不写硬件，这里调用是安全的。
+    edid64_init64();
+display64_init64();
     (void)display64_selftest64();
 #ifndef VIMTU_INSTALLER_MEDIA
     // ★ v0.4.7（用户要求）：**不再显示硬件检查报告页**。启动时直接进"滚动的英文 Kernel Boot Log"
@@ -1516,7 +1522,7 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     //             ★ 两份内核都跑（安装介质也打这两行日志，便于同一份验收脚本核对）。
     hwinfo_init64();  (void)hwinfo_selftest64();
     acpi_init64();    (void)acpi_selftest64();
-    edid64_init64();  (void)edid64_selftest64();   // 只读：EDID 解析 + 自检（合成样本离线自证）
+    (void)edid64_selftest64();   // 解析已在 display64_init64 之前做过（幂等；这里只跑自检、不重复打点）   // 只读：EDID 解析 + 自检（合成样本离线自证）
     (void)vfs64_selftest64();
     // 6c) 任务系统：把当前执行流登记为任务 0（内核主流程 -> 最终进入桌面消息循环）。
     //     必须在 mem_init_64 之后（任务栈来自内核堆），且在进入桌面之前。

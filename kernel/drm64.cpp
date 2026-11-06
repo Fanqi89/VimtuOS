@@ -21,6 +21,7 @@
 #include "input64.h"       // Ev64Event / ev64_current_queue64 / ev64_pop64（evdev 的数据源）
 #include "task64.h"        // task_sleep64（演示的有界等待）
 #include "vfs64.h"         // 卷里有没有 /bin/drmdemo.elf、/etc/drm64_probe
+#include "edid64.h"        // ★ v0.9.22：EDID 解析结果（真实模式列表 / 物理尺寸 / 刷新率）
 #include "proc64.h"        // 启动期 ring3 验收程序（真进程：proc64_create64/start_elf64）
 
 // ==================== 打点小工具（noinline，见文件头的体积纪律）====================
@@ -480,6 +481,17 @@ static void d64_mode_name64(char* out, uint32_t cap, uint32_t w, uint32_t h) {
 // 模式只算**一次**（init 里），之后 GETCRTC / GETCONNECTOR 直接拷这份静态结构 ——
 // 省掉每次调用的清零 + 拼名字（名字依赖几何，而几何在一次启动里不会变）。
 static Drm64ModeMode g_mode64;
+// ★ v0.9.22：按 EDID 里的一条模式造 drm_mode_modeinfo（名称仍是 "WxH"，与既有口径一致）
+static void d64_mode_wh64(Drm64ModeMode* out, uint32_t w, uint32_t h, uint32_t refresh) {
+    for (uint32_t i = 0; i < sizeof(Drm64ModeMode); i++) ((uint8_t*)out)[i] = 0;
+    out->hdisplay = (uint16_t)w;
+    out->hskew = 0; out->hsync_start = (uint16_t)w; out->hsync_end = (uint16_t)w; out->htotal = (uint16_t)w;
+    out->vdisplay = (uint16_t)h;
+    out->vscan = 0; out->vsync_start = (uint16_t)h; out->vsync_end = (uint16_t)h; out->vtotal = (uint16_t)h;
+    out->clock = (uint32_t)(((uint64_t)w * (uint64_t)h * (uint64_t)(refresh ? refresh : 60u)) / 1000ull);
+    out->vrefresh = refresh ? refresh : 60u;
+    d64_mode_name64(out->name, (int)sizeof(out->name), w, h);
+}
 static void d64_fill_mode64(uint32_t w, uint32_t h) {
     uint8_t* p = (uint8_t*)&g_mode64;
     for (uint32_t i = 0; i < sizeof(Drm64ModeMode); i++) p[i] = 0;
@@ -630,12 +642,39 @@ static int d64_ioctl_getconnector64(uint64_t arg) {
         }
         c.count_props = np;
     }
-    c.count_modes = 1u; c.count_encoders = 1u;
-    c.mm_width = 0u; c.mm_height = 0u; c.subpixel = 0u;              // 没有 EDID：如实 0
-    d64_uwr64(arg, &c, sizeof(Drm64ModeConnector));
-    d64_begin(); d64_puts("[DRM] getconnector id="); d64_num(c.connector_id);
-    d64_puts(" connected=1 mode="); d64_puts(m.name); d64_end();
-    return 0;
+    c.count_encoders = 1u;
+    // ★ v0.9.22：把 EDID 的**真实模式列表**与物理尺寸上报给用户态（原来只有 1 个模式、mm 全 0）。
+    //   两阶段语义照 Linux：调用方的 count_modes 够就写整个数组，不够就只回真实个数。
+    {
+        const int en = edid64_mode_count64();
+        const uint32_t nmodes = 1u + (uint32_t)en;        // [0] = 当前模式（与 GETCRTC 一致）
+        if (c.modes_ptr && c.count_modes >= nmodes &&
+            user64_range_ok64(c.modes_ptr, (uint64_t)sizeof(Drm64ModeMode) * (uint64_t)nmodes)) {
+            d64_uwr64(c.modes_ptr, &m, sizeof(Drm64ModeMode));
+            for (int i = 0; i < en; i++) {
+                const Edid64Mode* em = edid64_mode_at64(i);
+                if (!em) continue;
+                Drm64ModeMode x;
+                d64_mode_wh64(&x, em->w, em->h, (em->refresh_x10 + 5u) / 10u);
+                d64_uwr64(c.modes_ptr + (uint64_t)(i + 1) * (uint64_t)sizeof(Drm64ModeMode),
+                          &x, sizeof(Drm64ModeMode));
+            }
+        }
+        c.count_modes = nmodes;
+        const Edid64* ed = edid64_get();
+        c.mm_width  = (ed->valid && ed->size_cm_w) ? (uint32_t)ed->size_cm_w * 10u : 0u;
+        c.mm_height = (ed->valid && ed->size_cm_h) ? (uint32_t)ed->size_cm_h * 10u : 0u;
+        c.subpixel  = 0u;                                  // 没有 EDID 的 subpixel 位：如实 0
+        d64_uwr64(arg, &c, sizeof(Drm64ModeConnector));
+        d64_begin(); d64_puts("[DRM] getconnector id="); d64_num(c.connector_id);
+        d64_puts(" connected=1 mode="); d64_puts(m.name);
+        d64_puts(" modes="); d64_num((uint64_t)c.count_modes);
+        d64_puts(" mm="); d64_num((uint64_t)c.mm_width); d64_puts("x"); d64_num((uint64_t)c.mm_height);
+        d64_puts(" edid="); d64_num(ed->valid ? 1u : 0u);
+        d64_puts(" refresh="); d64_num((uint64_t)m.vrefresh);
+        d64_end();
+        return 0;
+    }
 }
 
 static int d64_ioctl_create_dumb64(uint64_t arg, uint64_t pid) {
@@ -1865,6 +1904,27 @@ void drm64_init64(void) {
     }
     // 模式的唯一计算点（几何此后不会变；GETCRTC / GETCONNECTOR 直接拷 g_mode64）
     d64_fill_mode64((uint32_t)fb_phys_width(), (uint32_t)fb_phys_height());
+    // ★ v0.9.22：EDID 里有与当前几何完全相同的模式 -> 用它的**真实刷新率**（不再固定 60 估计值）
+    {
+        const uint32_t fw = (uint32_t)fb_phys_width(), fh = (uint32_t)fb_phys_height();
+        const int n = edid64_mode_count64();
+        uint32_t matched = 0;
+        for (int i = 0; i < n; i++) {
+            const Edid64Mode* m = edid64_mode_at64(i);
+            if (m && (uint32_t)m->w == fw && (uint32_t)m->h == fh) { matched = m->refresh_x10; break; }
+        }
+        if (matched) g_mode64.vrefresh = (matched + 5u) / 10u;
+        // 这里同时把 GETCONNECTOR 将要回给用户态的**模式数与物理尺寸**打出来（同一份数据，便于串口核对）
+        const Edid64* ed0 = edid64_get();
+        d64_begin(); d64_puts("[DRM] edid modes="); d64_num((uint64_t)n);
+        d64_puts(" cur="); d64_num((uint64_t)fw); d64_puts("x"); d64_num((uint64_t)fh);
+        d64_puts(" refresh="); d64_num((uint64_t)g_mode64.vrefresh);
+        d64_puts(" matched="); d64_num(matched ? 1u : 0u);
+        d64_puts(" conn_modes="); d64_num((uint64_t)n + 1u);
+        d64_puts(" mm="); d64_num((ed0->valid && ed0->size_cm_w) ? (uint64_t)ed0->size_cm_w * 10ull : 0ull);
+        d64_puts("x"); d64_num((ed0->valid && ed0->size_cm_h) ? (uint64_t)ed0->size_cm_h * 10ull : 0ull);
+        d64_end();
+    }
     // 垂直回扫：复用 fb.cpp 的既有探针（200 ms 实测一轮；25..300 Hz 才算可信）
     uint64_t edges = 0, ms = 0;
     g_vblank_hw = fb64_vblank_probe_export64(&edges, &ms) ? 1 : 0;

@@ -79,8 +79,24 @@ void edid64_init64();
 // 内部打印 "[EDID64] selftest PASS" 或 "[EDID64] selftest FAIL mask=<n>"。
 int edid64_selftest64();
 
+// ==================== ★ v0.9.22：显示器支持的**模式列表** ====================
+// 来源（全部来自 EDID 文本，不猜）：首选 + 其余 3 个详细时序（DTD）、建立时序（0x23/0x24 位图）、
+// 标准时序（0x26..0x35，8 项）。**扩展块（CEA-861）仍不解码** —— 见边界 1)。
+// kind：0 = DTD（含首选）/ 1 = 建立时序 / 2 = 标准时序
+#define EDID64_MODE_MAX 24u
+struct Edid64Mode {
+    uint16_t w, h;
+    uint32_t refresh_x10;      // Hz * 10（建立的固定时序用标称值；标准的用 (b2&0x3F)+60）
+    uint8_t  kind;
+    uint8_t  pad;
+};
+
 // 只读访问解析结果（静态存储，永不为空；从未初始化过时 valid = false）。
 const Edid64* edid64_get();
+
+// 模式列表（按"首选在前"排；没有 EDID 时返回 0 条）
+int                edid64_mode_count64();
+const Edid64Mode*  edid64_mode_at64(int i);
 
 // 把刷新率写成 "60.0"（无单位，一位小数）。返回 1 = 有值；0 = 未知（此时写 "unknown"）。
 // 想显示成 "60.0 Hz" 的调用方自己在后面补单位。

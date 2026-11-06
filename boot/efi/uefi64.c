@@ -54,6 +54,14 @@ static inline u8  inb(u16 port) { u8 v; __asm__ volatile("inb %1, %0" : "=a"(v) 
 EFI_GUID gEfiGraphicsOutputProtocolGuid = { 0x9042A9DE, 0x23DC, 0x4A38, { 0x96,0xFB,0x7A,0xDE,0xD0,0x80,0x51,0x6A } };
 EFI_GUID gEfiSimpleFileSystemProtocolGuid = { 0x964E5B22, 0x6459, 0x11D2, { 0x8E,0x39,0x00,0xA0,0xC9,0x69,0x72,0x3B } };
 EFI_GUID gEfiLoadedImageProtocolGuid     = { 0x5B1B31A1, 0x9562, 0x11D2, { 0x8E,0x3F,0x00,0xA0,0xC9,0x69,0x72,0x3B } };
+// ★ v0.9.22：EDID 的两个 UEFI 协议（UEFI 2.x 规范原文的 GUID，不是猜的）
+//   EFI_EDID_DISCOVERED_PROTOCOL_GUID = 1C0C34F6-D380-41FA-A049-8AD06C1A66AA
+//   EFI_EDID_ACTIVE_PROTOCOL_GUID     = BDED4436-756C-4E21-8011-4755002FA5AF
+//   两者结构相同：{ UINT32 SizeOfEdid; UINT8 *Edid; }。这是 UEFI 下拿显示器 EDID 的**规范内**通道
+//   （GOP 本身不提供 EDID；Windows/Linux 在 UEFI 机器上通常就是先用它、再靠 GPU 驱动的 GMBUS 兜底）。
+EFI_GUID gEfiEdidDiscoveredProtocolGuid   = { 0x1C0C34F6, 0xD380, 0x41FA, { 0xA0,0x49,0x8A,0xD0,0x6C,0x1A,0x66,0xAA } };
+EFI_GUID gEfiEdidActiveProtocolGuid       = { 0xBDED4436, 0x756C, 0x4E21, { 0x80,0x11,0x47,0x55,0x00,0x2F,0xA5,0xAF } };
+typedef struct { u32 SizeOfEdid; u8* Edid; } EFI_EDID_PROTOCOL;
 
 static void ser_init(void) {
     outb(SERIAL_PORT + 1, 0x00); outb(SERIAL_PORT + 3, 0x80);
@@ -185,6 +193,108 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
     bi->mode_list   = 0x7400;
     bi->edid_addr   = 0x7600;
     bi->edid_size   = 128;
+
+    // ==================== ★ v0.9.22：GOP 模式表 + UEFI EDID ====================
+    // 为什么必须补：UEFI 路径原来**只**把"当前 GOP 模式"写进 BootInfo —— mode_count = 0、
+    //   0x7600 里一个字节都没有、edid_ok 从来不置 1。于是内核只能按当前分辨率或 1024x768 兜底，
+    //   用户看到的"EDID none / 只能盲猜分辨率"就是这条路径（真机走的是 UEFI，不是 VBE）。
+    // 这里做两件**规范内**的事，不猜任何硬件寄存器：
+    //   ① QueryMode 枚举 GOP 全部模式 -> 写成 BootInfo 的模式表（每项 8 字节，与 BIOS 路径同格式）
+    //   ② LocateProtocol(EDID_DISCOVERED)（拿不到再试 EDID_ACTIVE）-> EDID 原样拷到 0x7600，
+    //      验头部 + 128 字节校验和 -> edid_ok = 1；若首选分辨率在模式表里且与当前不同 -> SetMode
+    {
+        const u32 cap = 16u;                          // = bootinfo.h 的 BOOT_MODE_MAX
+        u8* ml = (u8*)(u64)bi->mode_list;
+        const u32 gmax = gop->Mode->MaxMode;
+        u32 cnt = 0;
+        for (u32 i = 0; i < gmax && cnt < cap; i++) {
+            u64 sz = 0;
+            EFI_GOP_MODE_INFO* inf = 0;
+            EFI_STATUS qs = ((EFI_STATUS(*)(EFI_GRAPHICS_OUTPUT_PROTOCOL*, u32, u64*, void**))gop->QueryMode)(
+                gop, i, &sz, (void**)&inf);
+            if (EFI_ERROR(qs) || !inf) continue;
+            if (inf->PixelFormat != 0u && inf->PixelFormat != 1u) continue;   // 只要 32bpp 线性
+            if (inf->HorizontalResolution < 320u || inf->VerticalResolution < 200u) continue;
+            u8* p = ml + cnt * 8;
+            *(u16*)(p + 0) = (u16)i;
+            *(u16*)(p + 2) = (u16)inf->HorizontalResolution;
+            *(u16*)(p + 4) = (u16)inf->VerticalResolution;
+            p[6] = 32; p[7] = 0;
+            cnt++;
+        }
+        bi->mode_count = (u16)cnt;
+        ser_str("U:modes="); ser_dec(cnt); ser_str(" max="); ser_dec(gmax); ser_str("\n");
+
+        // ---- EDID：Discovered 优先，其次 Active ----
+        EFI_EDID_PROTOCOL* ep = 0;
+        EFI_STATUS es = ((EFI_STATUS(*)(EFI_GUID*, void*, void**))bs->LocateProtocol)(
+            &gEfiEdidDiscoveredProtocolGuid, 0, (void**)&ep);
+        const char* esrc = "discovered";
+        if (EFI_ERROR(es) || !ep) {
+            es = ((EFI_STATUS(*)(EFI_GUID*, void*, void**))bs->LocateProtocol)(
+                &gEfiEdidActiveProtocolGuid, 0, (void**)&ep);
+            esrc = "active";
+        }
+        u32 edid_w = 0, edid_h = 0;
+        if (!EFI_ERROR(es) && ep && ep->Edid && ep->SizeOfEdid >= 128u) {
+            u8* dst = (u8*)(u64)bi->edid_addr;
+            u32 n = ep->SizeOfEdid; if (n > 128u) n = 128u;
+            for (u32 i = 0; i < n; i++) dst[i] = ep->Edid[i];
+            for (u32 i = n; i < 128u; i++) dst[i] = 0;
+            const int hdr = (dst[0] == 0x00 && dst[1] == 0xFF && dst[2] == 0xFF && dst[3] == 0xFF &&
+                             dst[4] == 0xFF && dst[5] == 0xFF && dst[6] == 0xFF && dst[7] == 0x00);
+            u32 sum = 0;
+            for (u32 i = 0; i < 128u; i++) sum += dst[i];
+            if (hdr && (sum & 0xFFu) == 0u) {
+                bi->edid_size = 128;
+                bi->edid_ok = 1;
+                // 首选 DTD（偏移 54）：HACTIVE/VACTIVE 的低 8 位 + 高 4 位（与 loader64.asm 同一口径）
+                edid_w = (u32)dst[56] | (((u32)dst[58] & 0xF0u) << 4);
+                edid_h = (u32)dst[59] | (((u32)dst[61] & 0xF0u) << 4);
+                ser_str("U:edid ok=1 src="); ser_str(esrc);
+                ser_str(" size="); ser_dec(ep->SizeOfEdid);
+                ser_str(" preferred="); ser_dec(edid_w); ser_str("x"); ser_dec(edid_h); ser_str("\n");
+            } else {
+                ser_str("U:edid bad header/checksum (firmware EDID ignored)\n");
+                bi->edid_ok = 0;
+            }
+        } else {
+            ser_str("U:edid none (firmware has no EDID protocol)\n");
+        }
+
+        // ---- 首选分辨率在模式表里且与当前不同 -> SetMode 切过去（失败就留在原模式，如实记录）----
+        if (bi->edid_ok && edid_w >= 640u && edid_h >= 480u) {
+            u32 want = 0xFFFFFFFFu;
+            for (u32 i = 0; i < cnt; i++) {
+                u8* p = ml + i * 8;
+                if (*(u16*)(p + 2) == edid_w && *(u16*)(p + 4) == edid_h) { want = *(u16*)p; break; }
+            }
+            if (want == 0xFFFFFFFFu) {
+                ser_str("U:setmode no matching gop mode (keep current)\n");
+            } else if (want == gop->Mode->Mode) {
+                ser_str("U:setmode skipped (already native) mode="); ser_dec(want);
+                ser_str(" res="); ser_dec(bi->width); ser_str("x"); ser_dec(bi->height); ser_str("\n");
+            } else {
+                EFI_STATUS ss = ((EFI_STATUS(*)(EFI_GRAPHICS_OUTPUT_PROTOCOL*, u32))gop->SetMode)(gop, want);
+                if (!EFI_ERROR(ss) && gop->Mode && gop->Mode->Info) {
+                    mi = gop->Mode->Info;
+                    const u64 fbb2 = gop->Mode->FrameBufferBase;
+                    bi->lfb_addr    = (u32)(fbb2 & 0xFFFFFFFFull);
+                    bi->lfb_addr_hi = (u32)(fbb2 >> 32);
+                    bi->fb_flags    = (fbb2 > 0xFFFFFFFFull) ? 1 : 0;
+                    bi->width       = (u16)mi->HorizontalResolution;
+                    bi->height      = (u16)mi->VerticalResolution;
+                    bi->pitch       = (u16)(mi->PixelsPerScanLine * 4);
+                    bi->mode_num    = (u16)gop->Mode->Mode;
+                    ser_str("U:setmode ok mode="); ser_dec(want);
+                    ser_str(" res="); ser_dec(bi->width); ser_str("x"); ser_dec(bi->height);
+                    ser_str(" pitch="); ser_dec(bi->pitch); ser_str("\n");
+                } else {
+                    ser_str("U:setmode failed (keep current)\n");
+                }
+            }
+        }
+    }
 
     // UEFI 内存映射 -> E820 风格
     u64 map_size = sizeof(g_map_buf), map_key = 0, desc_size = 0;

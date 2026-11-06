@@ -42,6 +42,9 @@ static Edid64  g_edid;          // 解析结果（静态存储；valid = false �
 static uint8_t g_raw[EDID64_BLOCK_BYTES];  // 第一块原始字节（仅有效时保留，供独立复核）
 static bool    g_have_raw = false;
 static bool    g_inited   = false;
+// ★ v0.9.22：显示器支持的模式列表（首选在前；全部来自 EDID 文本）
+static Edid64Mode g_modes[EDID64_MODE_MAX];
+static int        g_mode_n = 0;
 static bool    g_fw_flag  = false;         // BootInfo.edid_ok（固件是否给了 EDID）
 
 // ==================== 无 libc 的最小字符串工具 ====================
@@ -129,6 +132,67 @@ static void e64_parse_text(const uint8_t* d, char* out, int cap) {
     }
     while (n > 0 && out[n - 1] == ' ') n--;                       // 去尾空格
     out[n] = 0;
+}
+
+// 往模式表里加一条（按 w/h 去重，满就丢——有上限，绝不越界）
+static void e64_mode_add(uint16_t w, uint16_t h, uint32_t refresh_x10, uint8_t kind) {
+    if (w < 320u || h < 200u) return;
+    for (int i = 0; i < g_mode_n; i++)
+        if (g_modes[i].w == w && g_modes[i].h == h) return;      // 去重：同一分辨率只留第一条（优先 DTD）
+    if (g_mode_n >= (int)EDID64_MODE_MAX) return;
+    Edid64Mode* m = &g_modes[g_mode_n++];
+    m->w = w; m->h = h; m->refresh_x10 = refresh_x10; m->kind = kind; m->pad = 0;
+}
+
+// 模式列表解析：4 个 DTD + 建立时序（0x23/0x24）+ 标准时序（0x26..0x35）
+// 说明：建立时序按 VESA E-EDID 的表逐位展开（byte 0x25 只有 bit7 = 1152x870@75，其余保留位不解码）；
+//      1024x768@87i 是隔行，本内核不报隔行模式，跳过并留注释。
+static void e64_parse_modes(const uint8_t* d) {
+    g_mode_n = 0;
+    // ① 4 个详细时序描述符（像素时钟 != 0）。第一个就是首选（EDID 1.4 §3.10.3）
+    for (uint32_t k = 0; k < 4; k++) {
+        const uint8_t* dd = d + EDID64_DESC_OFF + k * EDID64_DESC_SIZE;
+        if (dd[0] == 0x00 && dd[1] == 0x00) continue;             // 显示器描述符，不是时序
+        Edid64 one;
+        e64_reset(&one);
+        e64_parse_dtd(dd, &one);
+        if (one.pclk_khz == 0u || one.h_active == 0u || one.v_active == 0u) continue;
+        e64_mode_add(one.h_active, one.v_active, one.refresh_x10, 0u);
+    }
+    // ② 建立时序：byte 0x23
+    {
+        static const uint16_t EW[8] = { 720, 720, 640, 640, 640, 640, 800, 800 };
+        static const uint16_t EH[8] = { 400, 400, 480, 480, 480, 480, 600, 600 };
+        static const uint16_t ER[8] = { 700, 880, 600, 670, 720, 750, 560, 600 };
+        const uint8_t b = d[0x23];
+        for (uint32_t i = 0; i < 8; i++)
+            if (b & (uint8_t)(0x80u >> i)) e64_mode_add(EW[i], EH[i], (uint32_t)ER[i], 1u);
+    }
+    // ③ 建立时序：byte 0x24（bit4 = 1024x768@87i 隔行 -> 跳过）
+    {
+        static const uint16_t EW[8] = { 800, 800, 832, 0, 1024, 1024, 1024, 1280 };
+        static const uint16_t EH[8] = { 600, 600, 624, 0, 768,  768,  768,  1024 };
+        static const uint16_t ER[8] = { 720, 750, 750, 0, 600,  700,  750,  750 };
+        const uint8_t b = d[0x24];
+        for (uint32_t i = 0; i < 8; i++)
+            if (b & (uint8_t)(0x80u >> i)) e64_mode_add(EW[i], EH[i], (uint32_t)ER[i], 1u);
+    }
+    // ④ byte 0x25：只有 bit7 = 1152x870@75（其余保留位，不解码）
+    if (d[0x25] & 0x80u) e64_mode_add(1152, 870, 750u, 1u);
+    // ⑤ 标准时序：8 项 × 2 字节（0x26..0x35）
+    //    h = (b1 + 31) * 8；宽高比 0b00=16:10 / 0b01=4:3 / 0b10=5:4 / 0b11=16:9；刷新 = (b2 & 0x3F) + 60
+    for (uint32_t i = 0; i < 8; i++) {
+        const uint8_t b1 = d[0x26 + i * 2], b2 = d[0x27 + i * 2];
+        if ((b1 == 0x01 && b2 == 0x01) || b1 == 0x00) continue;   // 0x0101 / 0x00 = 未用
+        const uint32_t hpx = ((uint32_t)b1 + 31u) * 8u;
+        const uint32_t asp = (uint32_t)(b2 >> 6);
+        uint32_t vpx;
+        if (asp == 0u)      vpx = hpx * 10u / 16u;                // 16:10
+        else if (asp == 1u) vpx = hpx * 3u / 4u;                  // 4:3
+        else if (asp == 2u) vpx = hpx * 4u / 5u;                  // 5:4
+        else                vpx = hpx * 9u / 16u;                 // 16:9
+        e64_mode_add((uint16_t)hpx, (uint16_t)vpx, (uint32_t)(b2 & 0x3Fu) * 10u + 600u, 2u);
+    }
 }
 
 static void e64_parse_block(const uint8_t* d, Edid64* o) {
@@ -220,6 +284,9 @@ static int e64_verify_and_parse(const uint8_t* d, Edid64* o, int quiet) {
         }
         return 0;
     }
+    if (!quiet) e64_parse_modes(d);   // ★ v0.9.22：真实模式列表（首选在前）。
+                                      //   quiet = 1（自检的合成样本）时**绝不**碰全局表 ——
+                                      //   否则 boot 期 selftest 会把真实 EDID 的模式列表冲掉。
     o->valid = true;
     return 1;
 }
@@ -227,6 +294,7 @@ static int e64_verify_and_parse(const uint8_t* d, Edid64* o, int quiet) {
 // ==================== 对外：初始化 ====================
 void edid64_init64() {
     e64_reset(&g_edid);
+    g_mode_n = 0;
     g_have_raw = false;
     g_inited   = true;
     g_fw_flag  = false;
@@ -326,6 +394,59 @@ void edid64_init64() {
     dbg64_str("..");
     dbg64_dec((uint64_t)tmp.range_h_max);
     dbg64_nl();
+
+    // ---- ★ v0.9.22：[EDID] 汇总行（控制台直接可读：厂商 + 型号 + 产品码 + 物理尺寸 + 首选 + 模式数）----
+    dbg64_str("[EDID] mfg=");
+    dbg64_str(tmp.mfg);
+    dbg64_str(" name=");
+    dbg64_str(tmp.name);
+    dbg64_str(" product=");
+    dbg64_dec((uint64_t)tmp.product_code);
+    dbg64_str(" serial=");
+    dbg64_dec((uint64_t)tmp.product_serial);
+    dbg64_str(" year=");
+    dbg64_dec((uint64_t)tmp.mfg_year);
+    dbg64_str(" cm=");
+    if (tmp.size_cm_w && tmp.size_cm_h) {
+        dbg64_dec((uint64_t)tmp.size_cm_w); dbg64_str("x"); dbg64_dec((uint64_t)tmp.size_cm_h);
+    } else {
+        dbg64_str("unknown");
+    }
+    dbg64_str(" preferred=");
+    dbg64_dec((uint64_t)tmp.h_active);
+    dbg64_str("x");
+    dbg64_dec((uint64_t)tmp.v_active);
+    dbg64_str("@");
+    e64_print_refresh(tmp.refresh_x10);
+    dbg64_str("Hz modes=");
+    dbg64_dec((uint64_t)g_mode_n);
+    dbg64_str(" src=");
+    dbg64_str(tmp.source);
+    dbg64_nl();
+
+    // 逐条模式（有上限：模式表本身 <= EDID64_MODE_MAX，防刷屏）
+    for (int i = 0; i < g_mode_n; i++) {
+        dbg64_str("[EDID] mode i=");
+        dbg64_dec((uint64_t)i);
+        dbg64_str(" ");
+        dbg64_dec((uint64_t)g_modes[i].w);
+        dbg64_str("x");
+        dbg64_dec((uint64_t)g_modes[i].h);
+        dbg64_str("@");
+        e64_print_refresh(g_modes[i].refresh_x10);
+        dbg64_str("Hz kind=");
+        dbg64_dec((uint64_t)g_modes[i].kind);
+        dbg64_nl();
+    }
+}
+
+// ==================== 对外：模式列表 ====================
+int edid64_mode_count64() {
+    return g_edid.valid ? g_mode_n : 0;
+}
+const Edid64Mode* edid64_mode_at64(int i) {
+    if (i < 0 || i >= g_mode_n) return nullptr;
+    return &g_modes[i];
 }
 
 // ==================== 对外：getter ====================
@@ -425,6 +546,17 @@ int edid64_selftest64() {
     for (uint32_t i = 0; i < EDID64_BLOCK_BYTES; i++) { bad_sum[i] = syn[i]; bad_hdr[i] = syn[i]; }
     bad_sum[127] ^= 0xFF;   // 校验和故意写坏
     bad_hdr[3] = 0x00;      // 头部里的 0xFF 破坏一个
+
+    // ★ v0.9.22：模式列表的自证（保存 / 恢复全局表 —— 自检只验证逻辑，绝不改真实结果）
+    {
+        Edid64Mode sv[EDID64_MODE_MAX];
+        const int svn = g_mode_n;
+        for (int i = 0; i < svn; i++) sv[i] = g_modes[i];
+        e64_parse_modes(syn);
+        if (g_mode_n < 1) mask |= 1 << 10;              // 新位：模式列表一条都没解析出来
+        for (int i = 0; i < svn; i++) g_modes[i] = sv[i];
+        g_mode_n = svn;
+    }
 
     Edid64 t;
     e64_reset(&t);

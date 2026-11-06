@@ -75,7 +75,10 @@ MUST1 = [
     "[SYS64] health ok modules=",
     "[SYS64] health module mem64 state=READY",
     "[SESS64] policy=VOLATILE",
-    "[WD64] watchdog armed timeout=5000ms",
+    # ★ v0.9.22：原来这里写死 timeout=5000ms —— 超时阈值后来被调成 20000ms（内核 WD64_TIMEOUT_MS），
+    #   字面量就再也匹配不上（典型"跨版本断言失效"）。改成只认前缀，并由下面一条**一致性**断言
+    #   把"armed 的阈值 == watchdog 任务的阈值"钉住（比原来的字面量更严）。
+    "[WD64] watchdog armed timeout=",
     "[WD64] watchdog task up id=",
     "[CONF64] apply lang=",
     "[GUI64] ready",
@@ -536,6 +539,14 @@ def main():
     check("桌面就绪 [GUI64] ready", up1)
     for needle in MUST1:
         check("必须出现 %s" % needle, needle in log1)
+
+    # ★ v0.9.22：看门狗的**阈值一致性**（武装时打的 timeout 必须等于任务创建时的参数）
+    _a = re.search(r"\[WD64\] watchdog armed timeout=(\d+)ms", log1)
+    _t = re.search(r"\[WD64\] watchdog task up id=(\d+) period=(\d+)ms timeout=(\d+)ms", log1)
+    check("看门狗 armed 的阈值 == 任务创建的阈值（%s vs %s）"
+          % (_a.group(1) if _a else "?", _t.group(3) if _t else "?"),
+          _a is not None and _t is not None and _a.group(1) == _t.group(3),
+          (_a.group(0) if _a else "") + " / " + (_t.group(0) if _t else ""))
 
     mods = re.findall(r"\[SYS64\] module (\S+) registered", log1)
     check("模块注册行数量 >= 12", len(mods) >= 12,
