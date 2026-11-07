@@ -628,6 +628,15 @@ int evdev64_ioctl64(int which, uint64_t cmd, uint64_t arg);
 //   Linux read 路径传的是用户 VA，自有 ABI 7 号传的是内核 staging 缓冲 —— 两种都是
 //   "当前 CR3 下可写的指针"，所以这里不再做用户范围校验，校验在 syscall64/fd64 那层）。
 int64_t evdev64_read64(int which, void* ubuf, uint64_t len);
+
+// ==================== ★ v0.9.24：evdev 的只读快照（/sys/class/input 合成树的数据源）====================
+// 铁律：这几个函数读的必须是 EVIOCGNAME / EVIOCGBIT / EVIOCGABS **同一份状态**（drm64.cpp 里的
+//   那一套），不许另存一份 —— 否则 /sys 与 ioctl 会各说一套，而"哪一套是真的"就无法证明了。
+int         drm64_evdev_count64();                    // 真实存在的 evdev 路数（本内核 = 2）
+const char* drm64_evdev_name64(int which);            // == EVIOCGNAME 的内容（不含 '\n'）
+uint32_t    drm64_evdev_evbits64(int which);          // == EVIOCGBIT(0) 的 bits[0]
+uint32_t    drm64_evdev_relbits64(int which);         // EV_REL 的位图（REL_X = bit0）
+uint32_t    drm64_evdev_absbits64(int which);         // EV_ABS 的位图（ABS_X/Y = bit0/1；按 EVIOCGABS 的区间存在性）
 // ★ v0.9.15：进程回收 hook（proc64 的 p64_exit64 / proc64_destroy64 里以**弱符号**方式调用，
 //   与 wl64_proc_release64 同一套纪律：安装介质内核不链 drm64.cpp，那边判空跳过）。
 //   作用：把该 pid 名下的 dumb buffer 全部收走（原来进程异常退出不 DESTROY_DUMB 就永久占页）。

@@ -289,3 +289,82 @@ dumb 被销毁/回收时引用它的 fb 一起消失。
 ② 事件投递（page flip event / vblank 事件）—— wlroots 的帧回调要靠它；
 ③ libinput 的 udev/libevdev 层（`/sys` 枚举、`EVIOCGRAB`/`EVIOCSABS`）；
 ④ GBM + EGL/GLES（要 Mesa）。
+
+---
+
+### A.8 v0.9.24 的落地记录：`/sys/class/input` 合成节点树（已做）
+
+上一节列的第 ③ 项是"libinput 的 udev/libevdev 层（`/sys` 枚举）"。v0.9.24 把"`/sys` 枚举"这一半做了。
+
+**为什么要它**：libinput/udev 认识一个输入设备，靠的是
+`/sys/class/input/eventN/` 下的 `name`、`dev`（major:minor）、`capabilities/{ev,key,rel,abs}`。
+在这之前本内核只有 `/dev/input/event0|1` 两个设备节点，**没有任何目录能表示"运行时合成、不在盘上"的节点**，
+所以上层拿不到设备属性 —— 这就是"跑 wlroots 还差哪一步"里缺的那块。
+
+**做法（有意做小、不改磁盘格式）**：
+
+* 新增 `kernel/sysfs64.{h,cpp}`：一棵**只读合成树**，内容全部由 `drm64` 里 evdev 的**同一份状态**生成
+  （`drm64_evdev_name64 / evbits64 / relbits64 / absbits64` 与 `EVIOCGNAME / EVIOCGBIT / EVIOCGABS`
+  读的是同一组变量），所以 `/sys` 与 `ioctl` 不可能各说一套。
+* 接在 `kernel/fs64.cpp` 的**统一分派层**（`fs64_stat64 / read64 / read_range64 / list64 / ls64 / access64`）：
+  路径命中 `sys` 前缀就直接返回，**在 `resolve_vol()` 之前**判 ——
+  所以"没有卷/卷坏了"的机器上 `/sys` 照样能列能读（与 Linux sysfs 语义一致）。
+* 写一律拒绝：`fs64_write64 / write_at64` 对 `/sys` 返回 `-EROFS`；`access(W_OK)` 返回 `-EACCES`。
+* 不占 inode、不落盘、不新增任何 ABI 号。
+
+**树（每个 `eventN` 下 8 个文件）**：
+
+```
+/sys/class/input/eventN/name                  "vimtu-keyboard
+" / "vimtu-mouse
+"
+/sys/class/input/eventN/dev                   "13:64
+" / "13:65
+"     （Linux input 主设备号 13）
+/sys/class/input/eventN/subsystem             "input
+"
+/sys/class/input/eventN/uevent                "MAJOR=13
+MINOR=<n>
+DEVNAME=input/event<N>
+"
+/sys/class/input/eventN/capabilities/ev       "3
+"（SYN|KEY）/ "7
+"（+REL）
+/sys/class/input/eventN/capabilities/rel      "0
+" / "1
+"
+/sys/class/input/eventN/capabilities/abs      "0
+" / "3
+"（ABS_X|ABS_Y）
+/sys/class/input/eventN/capabilities/key      "0
+"（**如实**：本内核不维护键位图）
+```
+
+**边界（如实）**：
+
+1. `capabilities/key` 恒为 0 —— 本内核没有维护键位图（`EVIOCGBIT(EV_KEY)` 也回 0），不编造。
+2. 没有符号链接（`subsystem` 是普通文件而不是 symlink；VFS 的 link 只对磁盘节点有意义），
+   `device/…` 这一层也没做（libinput 主要读 udev 的数据库，不是直接读 sysfs）。
+3. 只有一类设备（`input`），没有 `/sys/class/drm`、`/sys/bus`、`/sys/devices` 的层次。
+4. 目录项类型：`fs64_list64` 给的 `type` 统一是 FILE（真实类型由随后的 `stat` 决定，与 udev 的做法一致）。
+
+**证据（本批实测原文）**：
+
+```
+[SYSFS64] tree entries=2 ev0=vimtu-keyboard ev1=vimtu-mouse
+[SYSFS64] selftest PASS
+[FD64] open path=/sys/class/input/event1/name fd=6 flags=0 vol=0
+[DRMDEMO] sysfs name=vimtu-mouse
+[DRMDEMO] sysfs dev=13:65
+[DRMDEMO] sysfs ev=7
+[DRMDEMO] sysfs abs=3
+[DRMDEMO] sysfs readonly rc=-13
+```
+
+自检（`sysfs64_selftest64()`，10 个位）覆盖：`/sys` 是目录、`event1/name` 是文件且非空、
+读回 `vimtu-mouse
+`、列 `/sys/class/input` 得到 event0/event1、列 `capabilities` 得到四条、
+`ev` 读回 `7`、`/sys/nope` 如实不存在、越界读 0 字节、列 `/sys` 得到 class、键盘 `ev` 读回 `3`。
+
+**还没做的**：真正的 udev 数据库（`/run/udev/data`）、`/sys/class/drm`、热插拔事件
+（`uevent` 只是静态文本，没有 netlink 通知）、以及 libinput 本体。

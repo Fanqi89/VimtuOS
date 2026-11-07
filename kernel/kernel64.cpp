@@ -25,7 +25,8 @@
 // ---- 硬件清单 / ACPI 平台表 / VimtuFS2 文件系统：两份内核都链接（只读探测 + 内存假盘自检）----
 #include "hwinfo64.h"   // CPUID + PCI 只读枚举
 #include "acpi64.h"     // RSDP -> RSDT/XSDT -> FADT/MADT 只读解析
-#include "edid64.h"     // 显示器 EDID（引导层已落在 0x7600）只读解析：厂商/名字/首选时序/刷新率
+#include "edid64.h"
+#include "sysfs64.h"       // ★ v0.9.24：/sys 合成节点树（只读）     // 显示器 EDID（引导层已落在 0x7600）只读解析：厂商/名字/首选时序/刷新率
 #include "vfs64.h"      // 真文件系统 VimtuFS2（v3 目录树；安装程序格式化分区要用）
 #include "drive64.h"    // 盘符/驱动器枚举层（C: = 系统卷；只读扫描，见 os_boot_path）
 #include "fs64.h"       // ★ 批次 K：统一文件系统分派层（VimtuFS2 读写 / FAT32 只读）
@@ -1523,6 +1524,8 @@ extern "C" [[noreturn]] void kmain64(void* arg0, void* arg1) {
     hwinfo_init64();  (void)hwinfo_selftest64();
     acpi_init64();    (void)acpi_selftest64();
     (void)edid64_selftest64();   // 解析已在 display64_init64 之前做过（幂等；这里只跑自检、不重复打点）   // 只读：EDID 解析 + 自检（合成样本离线自证）
+    // ★ v0.9.24：/sys 合成节点树自检（stat/read/list 全走 fs64 的同一批入口；打 [SYSFS64] 行）
+    (void)sysfs64_selftest64();
     (void)vfs64_selftest64();
     // 6c) 任务系统：把当前执行流登记为任务 0（内核主流程 -> 最终进入桌面消息循环）。
     //     必须在 mem_init_64 之后（任务栈来自内核堆），且在进入桌面之前。

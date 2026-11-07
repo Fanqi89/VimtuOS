@@ -1836,6 +1836,33 @@ int64_t evdev64_read64(int which, void* ubuf, uint64_t len) {
     return (int64_t)bytes;
 }
 
+// ==================== ★ v0.9.24：evdev 只读快照（/sys/class/input 的数据源）====================
+// 与 EVIOCGNAME / EVIOCGBIT / EVIOCGABS **同源**：名字就是 evdev64_ioctl64 里那个常量，
+// EV 位图用的是同一组 EV64_*，ABS 位图看的是同一张 g_ev_abs/g_ev_abs_n 表。
+int drm64_evdev_count64() { return 2; }
+
+const char* drm64_evdev_name64(int which) {
+    return (which == 1) ? "vimtu-mouse" : "vimtu-keyboard";
+}
+
+uint32_t drm64_evdev_evbits64(int which) {
+    uint32_t b = (1u << EV64_SYN) | (1u << EV64_KEY);
+    if (which == 1) b |= (1u << EV64_REL);
+    return b;
+}
+
+uint32_t drm64_evdev_relbits64(int which) {
+    return (which == 1) ? 1u : 0u;                    // REL_X = 0（本内核鼠标只有相对 X/Y 这一个来源）
+}
+
+uint32_t drm64_evdev_absbits64(int which) {
+    if (which != 1) return 0;                         // 键盘没有绝对轴（EVIOCGABS 对它 -EINVAL）
+    uint32_t b = 0;
+    if (g_ev_abs_n[1] > EVDEV64_ABS_X64) b |= 1u << EVDEV64_ABS_X64;
+    if (g_ev_abs_n[1] > EVDEV64_ABS_Y64) b |= 1u << EVDEV64_ABS_Y64;
+    return b;
+}
+
 int evdev64_ioctl64(int which, uint64_t cmd, uint64_t arg) {
     const char* name = (which == 1) ? "vimtu-mouse" : "vimtu-keyboard";
     // ★ 基值掩码必须把**整个 size 字段**（bit14..29）掩掉：只掩 bit16..23 会在不同 len 下算出

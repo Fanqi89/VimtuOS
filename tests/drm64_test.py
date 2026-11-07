@@ -63,6 +63,7 @@ FORBIDDEN = [
     "TRIPLE FAULT",
     "[DRM] selftest FAIL",
     "[DRMDEMO] done ok=0",
+    "[SYSFS64] selftest FAIL",          # ★ v0.9.24：/sys 合成树自检不许红
 ]
 
 
@@ -538,6 +539,12 @@ def main():
             (r"\[DRMDEMO\] setcrtc mode=\d+x\d+ rc=0", "SETCRTC 真切分辨率 rc=0"),
             (r"\[DRMDEMO\] setcrtc restore=\d+x\d+ rc=0", "SETCRTC 切回原模式 rc=0"),
             (r"\[DRMDEMO\] modeswitch reflip rc=0", "换回原模式后还能上屏"),
+            # ★ v0.9.24：/sys/class/input 合成树（ring3 真 open+read 的证据）
+            (r"\[DRMDEMO\] sysfs name=vimtu-mouse", "/sys 合成树：设备名（与 EVIOCGNAME 同源）"),
+            (r"\[DRMDEMO\] sysfs dev=13:65", "/sys 合成树：dev（Linux input 主设备号 13）"),
+            (r"\[DRMDEMO\] sysfs ev=7", "/sys 合成树：capabilities/ev（SYN|KEY|REL）"),
+            (r"\[DRMDEMO\] sysfs abs=3", "/sys 合成树：capabilities/abs（ABS_X|ABS_Y）"),
+            (r"\[DRMDEMO\] sysfs readonly rc=-1 errno=13", "/sys 合成树只读（写打开 -> errno=EACCES）"),
         ]
         stage_ok = vm.wait("[DRMDEMO] done", args.timeout)
         log = vm.log()
@@ -600,6 +607,27 @@ def main():
               re.search(r"\[DRM\] setcrtc mode-switch w=1111 h=777 ok=0 path=not-in-edid", log) is not None,
               (re.search(r"\[DRMDEMO\] setcrtc badmode[^\r\n]*", log).group(0)
                if re.search(r"\[DRMDEMO\] setcrtc badmode", log) else "缺 badmode 行（反例没跑）"))
+
+        # ---------- ④c ★ v0.9.24：/sys/class/input 合成节点树 ----------
+        # 注意：QEMU 的 `-serial file:` 是**带行缓冲**的字符设备，早读会读不到最后不到 4 KiB。
+        #   判据不变，只是把"读日志"这一步放到这里再做一次（实测漏读恰好卡在某条行边界上）。
+        log = vm.log()
+        check("④c /sys 合成树自检通过（stat / read / list 三入口 + 越界读 0 字节 + 不存在返回 ENOENT）",
+              "[SYSFS64] selftest PASS" in log,
+              ("[SYSFS64] selftest FAIL" if "[SYSFS64] selftest FAIL" in log else "缺 [SYSFS64] selftest PASS"))
+        check("④c /sys 树里就是这两路真实 evdev（event0=键盘 / event1=鼠标，名字来自同一份状态）",
+              re.search(r"\[SYSFS64\] tree entries=2 ev0=vimtu-keyboard ev1=vimtu-mouse", log) is not None,
+              (re.search(r"\[SYSFS64\] tree[^\r\n]*", log).group(0)
+               if re.search(r"\[SYSFS64\] tree", log) else "缺 [SYSFS64] tree 行"))
+        check("④c 合成节点的打开真的走了 fd64/VFS 分派层（[FD64] open path=/sys/class/input/event1/name）",
+              re.search(r"\[FD64\] open path=/sys/class/input/event1/name fd=\d+", log) is not None,
+              (re.search(r"\[FD64\] open path=/sys[^\r\n]*", log).group(0)
+               if re.search(r"\[FD64\] open path=/sys", log) else "缺 [FD64] open path=/sys 行"))
+        check("④c /sys 与 ioctl 同源：sysfs 的 name/ev 读回的就是 EVIOCGNAME/EVIOCGBIT 那份状态",
+              re.search(r"\[DRMDEMO\] sysfs name=vimtu-mouse", log) is not None and
+              re.search(r"\[DRMDEMO\] libevdev name=vimtu-mouse", log) is not None and
+              re.search(r"\[DRMDEMO\] sysfs ev=7", log) is not None and
+              re.search(r"\[DRMDEMO\] libevdev name=vimtu-mouse absx=24 min=0 max=\d+ grab=0/0 types=0x7", log) is not None)
         check("④ 验收程序跑完：[DRMDEMO] done ok=1", "[DRMDEMO] done ok=1" in log, "")
 
         # ---------- ④-b ★ v0.9.15：fb 对象 / SETCRTC / plane / 进程回收 hook ----------

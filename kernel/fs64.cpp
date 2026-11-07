@@ -7,6 +7,7 @@
 #include "debug64.h"
 #include "ata64.h"          // ★ P8b：驱动器号 >= ATA64_USB_BASE（U 盘）的 FAT32 卷才按可写挂载
 #include "drive64.h"        // ★ P8b：[FAT64] rw mount 行要报盘符（fat64 那边查盘符表用）
+#include "sysfs64.h"        // ★ v0.9.24：/sys 合成节点树（只读、无盘）
 
 // ==================== 卷表 ====================
 static Fs64Vol64 g_vols[FS64_VOL_MAX];
@@ -281,8 +282,35 @@ struct Fs64VfsScope64 {
 
 // ==================== 统一操作 ====================
 int fs64_list64(int vol, const char* path, Fs64Dirent64* out, int max, uint32_t* cursor) {
+    if (!out || max <= 0) return -1;
+    // ★ v0.9.24：/sys 合成树用**游标**语义（cursor = 已取条数），与 vfs64_list64 一样逐个返回
+    if (sysfs64_match64(path) == 1) {
+        char names[32][VFS64_LS_NAME_BUF];
+        uint32_t sizes[32];
+        const int n = sysfs64_list64(path, names, 32, sizes);
+        if (n < 0) return -1;
+        const uint32_t cur = cursor ? *cursor : 0u;
+        if (cur >= (uint32_t)n) return 0;
+        int k = 0;
+        for (uint32_t i = cur; i < (uint32_t)n && k < max; i++, k++) {
+            int j = 0;
+            for (; names[i][j] && j < (int)FS64_NAME_MAX - 1; j++) out[k].name[j] = names[i][j];
+            out[k].name[j] = 0;
+            out[k].index = i;
+            out[k].type  = VFS64_TYPE_FILE;                        // 子节点类型由下行 stat 决定（这里只给名字）
+            out[k].size  = 0;
+            out[k].mtime = 0;
+            out[k].kind  = VFS64_KIND_NONE;
+            out[k].attr  = 0;
+            out[k].uid   = 0;
+            out[k].gid   = 0;
+            out[k].mode  = VFS64_DEF_FILE_MODE;
+        }
+        if (cursor) *cursor = cur + (uint32_t)k;
+        return k;
+    }
     const int v = resolve_vol(vol);
-    if (v < 0 || !out || max <= 0) return -1;
+    if (v < 0) return -1;
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
         Fs64VfsScope64 sc(g_vols[v].vfs_slot);
         if (!sc.ok) return -1;
@@ -303,8 +331,10 @@ int fs64_list64(int vol, const char* path, Fs64Dirent64* out, int max, uint32_t*
 }
 
 int fs64_ls64(int vol, const char* path, char names[][VFS64_LS_NAME_BUF], int max, uint32_t* sizes) {
+    if (!names || max <= 0) return -1;
+    if (sysfs64_match64(path) == 1) return sysfs64_list64(path, (char (*)[32])names, max, sizes);
     const int v = resolve_vol(vol);
-    if (v < 0 || !names || max <= 0) return -1;
+    if (v < 0) return -1;
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
         Fs64VfsScope64 sc(g_vols[v].vfs_slot);
         if (!sc.ok) return -1;
@@ -332,8 +362,27 @@ int fs64_ls64(int vol, const char* path, char names[][VFS64_LS_NAME_BUF], int ma
 }
 
 int fs64_stat64(int vol, const char* path, Fs64Stat64* out) {
+    // ★ v0.9.24：/sys 是**合成**节点（不在任何卷上）—— 必须放在 resolve_vol 之前判，
+    //   这样"没有卷/卷坏了"的机器上 /sys 照样能列能读（与 Linux 的 sysfs 语义一致）。
+    if (!out) return -1;
+    {
+        uint32_t st = 0, ss = 0;
+        const int sr = sysfs64_stat64(path, &st, &ss);
+        if (sr == 1) {
+            out->type  = st;
+            out->size  = ss;
+            out->mtime = 0;                                        // 合成节点没有时间戳（如实 0）
+            out->kind  = (st == VFS64_TYPE_DIR) ? VFS64_KIND_DIR : VFS64_KIND_TEXT;
+            out->attr  = 0;
+            out->uid   = 0;                                        // root 属主
+            out->gid   = 0;
+            out->mode  = (st == VFS64_TYPE_DIR) ? VFS64_DEF_DIR_MODE : VFS64_DEF_FILE_MODE;
+            return 0;
+        }
+        if (sr < 0) return -2;                                     // -ENOENT（fs64 口径：<0 即失败）
+    }
     const int v = resolve_vol(vol);
-    if (v < 0 || !out) return -1;
+    if (v < 0) return -1;
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
         Fs64VfsScope64 sc(g_vols[v].vfs_slot);
         if (!sc.ok) return -1;
@@ -366,6 +415,8 @@ int fs64_stat64(int vol, const char* path, Fs64Stat64* out) {
 }
 // ★ P4：access(2) 的按卷变体（fd64 在 open 时用它做 r/w 判定；FAT 卷没有权限模型 -> 恒 0）
 int fs64_access64(int vol, const char* path, uint32_t mask) {
+    // ★ v0.9.24：/sys 只读（root 属主、R_OK 可、W_OK 不可）
+    if (sysfs64_match64(path) == 1) return (mask & 2u) ? -13 : 0;
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return 0;
@@ -393,8 +444,16 @@ int fs64_chown64(int vol, const char* path, uint32_t uid, uint32_t gid) {
     return vfs64_chown64(path, uid, gid);
 }
 int fs64_read64(int vol, const char* path, void* buf, int max) {
+    if (!buf || max <= 0) return -1;
+    {
+        uint32_t got = 0;
+        const int sr = sysfs64_read64(path, 0u, buf, (uint32_t)max, &got);
+        if (sr == 1) return (int)got;
+        if (sr == -1) return -1;
+        if (sr == -2) return -21;                                  // -EISDIR（合成目录）
+    }
     const int v = resolve_vol(vol);
-    if (v < 0 || !buf || max <= 0) return -1;
+    if (v < 0) return -1;
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
         Fs64VfsScope64 sc(g_vols[v].vfs_slot);
         if (!sc.ok) return -1;
@@ -405,9 +464,17 @@ int fs64_read64(int vol, const char* path, void* buf, int max) {
     return (int)got;
 }
 int fs64_read_range64(int vol, const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got) {
-    const int v = resolve_vol(vol);
-    if (v < 0 || !buf || !out_got) return -1;
+    if (!buf || !out_got) return -1;
     *out_got = 0;
+    {
+        uint32_t got = 0;
+        const int sr = sysfs64_read64(path, off, buf, len, &got);
+        if (sr == 1) { *out_got = got; return 0; }
+        if (sr == -1) return -1;
+        if (sr == -2) return -21;                                  // -EISDIR
+    }
+    const int v = resolve_vol(vol);
+    if (v < 0) return -1;
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
         Fs64VfsScope64 sc(g_vols[v].vfs_slot);
         if (!sc.ok) return -1;
@@ -419,6 +486,8 @@ int fs64_read_range64(int vol, const char* path, uint32_t off, void* buf, uint32
 // ★ 批次 M：分块写（按偏移，保留原有字节；off > 当前大小 = 空洞补零）。只读卷一律 -FS64_EROFS。
 // ★ P4：写权限判定在 vfs64 内部（已有文件 w / 新建父目录 w+x）；越权 -> -EACCES。
 int fs64_write_at64(int vol, const char* path, uint32_t off, const void* buf, uint32_t len) {
+    // ★ v0.9.24：/sys 只读 —— 合成节点不接受任何写入（比"写到不存在的 inode"更确切）
+    if (sysfs64_match64(path) == 1) return -FS64_EROFS;
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "write_at", path); return -FS64_EROFS; }
@@ -433,6 +502,7 @@ int fs64_write_at64(int vol, const char* path, uint32_t off, const void* buf, ui
 }
 // 写操作：FAT 一律拒绝（只读卷），VimtuFS2 按当前身份调用（权限判定在 vfs64 内）
 int fs64_write64(int vol, const char* path, const void* buf, int len) {
+    if (sysfs64_match64(path) == 1) return -FS64_EROFS;
     const int v = resolve_vol(vol);
     if (v < 0) return -1;
     if (g_vols[v].readonly) { log_reject_ro(v, "write", path); return -FS64_EROFS; }

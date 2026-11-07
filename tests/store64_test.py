@@ -580,8 +580,24 @@ def main():
         check("第二遍不得出现 %s" % needle, needle not in log2)
 
     # ---------------- 第三遍：无卷降级（对照）----------------
-    print("[store64] 第三遍启动（build64/system.img，没有分区表/没有卷）：验证降级警告")
-    vm = Vm(qemu, SYSTEM_IMG, tmp, "boot3", args.port + 2, args.timeout)
+    print("[store64] 第三遍启动（build64/system.img 的**副本**，构造「没有分区表/没有卷」）：验证降级警告")
+    # ★ v0.9.24：不能直接引导 build64/system.img —— 它是**共享构建产物**，别的测试
+    #   （desktop64 / cursor64 / apic64 …）会以可写方式引导它，客人机把 /etc、store 槽甚至
+    #   LBA 8009 处的卷写回镜像。实测：跑过一轮之后 system.img 的 LBA 8009 就出现了 VIMTUFS2 卷，
+    #   于是这条"无卷降级"对照路线变成 vfs 路径、判据变红（红的是**夹具**，不是内核）。
+    #   修法：拷副本 + 把 LBA 8009 起的 128 KiB 清零 -> "没有卷"这个前提由夹具自己保证，可复现。
+    noimg = os.path.join(tmp, "boot3_novol.img")
+    with open(SYSTEM_IMG, "rb") as f:
+        data = bytearray(f.read())
+    vol_off = 8009 * SECTOR
+    had_vol = bytes(data[vol_off:vol_off + 8]) == b"VIMTUFS2"
+    for i in range(vol_off, min(len(data), vol_off + 128 * 1024)):
+        data[i] = 0
+    with open(noimg, "wb") as f:
+        f.write(data)
+    print("[store64] 第三遍夹具：%s（源镜像 LBA 8009 处**原先有卷**=%s；已清零 128 KiB）"
+          % (noimg, had_vol))
+    vm = Vm(qemu, noimg, tmp, "boot3", args.port + 2, args.timeout)
     vm.start()
     qh.login_desktop(vm.monitor(), vm.log, vm.proc, timeout=min(args.timeout, 180))  # ★ 登录手势
     up3 = vm.wait_for("[GUI64] ready", args.timeout)

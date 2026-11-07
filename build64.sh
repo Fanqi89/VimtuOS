@@ -67,7 +67,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.9.23"    # ★ v0.9.23：EDID 读 256B（块 1 CEA-861）+ 隔行模式 + 运行时真切分辨率
+VIMTUOS_VERSION="0.9.24"    # ★ v0.9.24：/sys/class/input 合成树（VFS 虚拟层）+ 测试卫生/竞态修复
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
@@ -98,7 +98,7 @@ CXXFLAGS_INSTALLER="$CXXFLAGS -DVIMTU_INSTALLER_MEDIA=1 -DVIMTU_PAYLOAD_LBA=$PAY
 #     （屏幕硬件检查报告）也进 CORE —— 两份内核都要：安装程序要能看见 SATA/NVMe 盘，
 #     系统内核的 VFS/store 也要能（驱动器号 8.. / 16.. 分派），
 #     而硬件检查报告在安装介质与装好的系统里都是"没有串口时唯一的诊断画面"。
-SRCS_CORE="kernel/kernel64.cpp kernel/console64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp kernel/input.cpp kernel/input64.cpp kernel/mem64.cpp kernel/hwinfo64.cpp kernel/acpi64.cpp kernel/edid64.cpp kernel/display64.cpp kernel/fd64.cpp kernel/usermode64.cpp kernel/syscall64.cpp kernel/ahci64.cpp kernel/nvme64.cpp kernel/hwui64.cpp kernel/drive64.cpp kernel/fat64.cpp kernel/fs64.cpp kernel/sig64.cpp kernel/virtio_gpu64.cpp"
+SRCS_CORE="kernel/kernel64.cpp kernel/console64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp kernel/input.cpp kernel/input64.cpp kernel/mem64.cpp kernel/hwinfo64.cpp kernel/acpi64.cpp kernel/edid64.cpp kernel/sysfs64.cpp kernel/display64.cpp kernel/fd64.cpp kernel/usermode64.cpp kernel/syscall64.cpp kernel/ahci64.cpp kernel/nvme64.cpp kernel/hwui64.cpp kernel/drive64.cpp kernel/fat64.cpp kernel/fs64.cpp kernel/sig64.cpp kernel/virtio_gpu64.cpp"
 # ★ 本批（用户态设备映射）：kernel/pci64.cpp = PCI 配置空间 + BAR 解码（pci_map_bar(48) 的底层）。
 #   进 **SRCS_CORE** 的理由：kernel/syscall64.cpp（也在 CORE 里）对它的是**强引用**，
 #   两份内核都必须在链接行里能解析到它；它只有"配置空间读写 + BAR 解码"这一小块，
@@ -844,7 +844,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
     "$BUILD"/fb.o "$BUILD"/font.o "$BUILD"/input.o "$BUILD"/input64.o "$BUILD"/mem64.o "$BUILD"/ata64.o "$BUILD"/part64.o "$BUILD"/setup64.o \
     "$BUILD"/fat64.o "$BUILD"/fs64.o "$BUILD"/drive64.o \
     "$BUILD"/bootx64_efi.o "$BUILD"/uefi64_bin.o \
-    "$BUILD"/hwinfo64.o "$BUILD"/acpi64.o "$BUILD"/edid64.o "$BUILD"/vfs64.o "$BUILD"/fd64.o "$BUILD"/usermode64.o "$BUILD"/syscall64.o "$BUILD"/sig64.o "$BUILD"/pci64.o \
+    "$BUILD"/hwinfo64.o "$BUILD"/acpi64.o "$BUILD"/edid64.o "$BUILD"/sysfs64.o "$BUILD"/vfs64.o "$BUILD"/fd64.o "$BUILD"/usermode64.o "$BUILD"/syscall64.o "$BUILD"/sig64.o "$BUILD"/pci64.o \
     "$BUILD"/ahci64.o "$BUILD"/nvme64.o "$BUILD"/hwui64.o "$BUILD"/hda64_stub64.o "$BUILD"/gpu64_stub64.o \
     "$BUILD"/virtio_gpu64.o \
     "$BUILD"/display64.o \
@@ -855,7 +855,7 @@ $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
     gui_rs/gui_rs.o \
     "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/fontcfg64.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
-    "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o "$BUILD/os"/gpu64.o "$BUILD/os"/vmware64.o "$BUILD/os"/intel_gpu64.o \
+    "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/sysfs64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o "$BUILD/os"/gpu64.o "$BUILD/os"/vmware64.o "$BUILD/os"/intel_gpu64.o \
     "$BUILD/os"/sock64.o \
     "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
     "$BUILD/os"/virtio_gpu64.o "$BUILD/os"/vgpu3d64.o \
@@ -906,7 +906,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/cr3exp/kernel64.o" "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
         gui_rs/gui_rs.o \
         "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/fontcfg64.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
-        "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o "$BUILD/os"/gpu64.o "$BUILD/os"/vmware64.o "$BUILD/os"/intel_gpu64.o \
+        "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/sysfs64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o "$BUILD/os"/gpu64.o "$BUILD/os"/vmware64.o "$BUILD/os"/intel_gpu64.o \
         "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
         "$BUILD/os"/virtio_gpu64.o "$BUILD/os"/vgpu3d64.o \
         "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \

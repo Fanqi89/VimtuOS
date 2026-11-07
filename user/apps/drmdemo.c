@@ -19,6 +19,7 @@
  *   [DRMDEMO] gbm bo handle=<n> <w>x<h> stride=<n> probe=0x<hex>
  *   [DRMDEMO] gbm surface n=2 front=<i>/<j> stride=<n> rc=0
  *   [DRMDEMO] modeswitch list=<n> pick=<w>x<h> cur=<w>x<h> ilace=0   ← ★ v0.9.23 运行时切模式
+ *   [DRMDEMO] sysfs name=vimtu-mouse / dev=13:65 / ev=7 / abs=3 / readonly rc=-13  ← ★ v0.9.24 /sys 合成树
  *   [DRMDEMO] setcrtc mode=<w>x<h> rc=0 / setcrtc restore=<w>x<h> rc=0 / modeswitch reflip rc=0
  *   [DRMDEMO] destroy_dumb handle=<n> rc=0
  *   [DRMDEMO] done ok=1
@@ -36,6 +37,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>          /* ★ v0.9.24：O_RDONLY / O_WRONLY（/sys 只读反例） */
 #include "vimtu64.h"
 #include "drm64.h"
 #include "libevdev_compat.h"   /* ★ v0.9.21：libevdev 精简适配（grab / 绝对轴 / 事件流） */
@@ -701,6 +703,40 @@ int main(int argc, char** argv, char** envp) {
                                                            struct Drm64ModeCrtc), &sc);
             printf("[DRMDEMO] setcrtc badmode=1111x777 rc=%d\n", r4);
         }
+    }
+
+    /* ---- ⑱ ★ v0.9.24：/sys/class/input 合成树（只读、无盘；libinput/udev 认设备靠它）----
+     *   为什么要走 ring3 这一步：这棵树的四个入口（stat / 列目录 / open / read）都在 VFS 分派层，
+     *   只有真进程 open+read 才能证明"用户态真的看得到设备属性"，而不是内核里自己读自己。
+     *   证据 = 下面 4 行（内容来自 drm64 里 evdev 的同一份状态）+ 一条只读反例。 ---- */
+    {
+        static const char* kPath[] = {
+            "/sys/class/input/event1/name",
+            "/sys/class/input/event1/dev",
+            "/sys/class/input/event1/capabilities/ev",
+            "/sys/class/input/event1/capabilities/abs",
+        };
+        static const char* kLab[] = { "name", "dev", "ev", "abs" };
+        for (unsigned i = 0; i < 4; i++) {
+            const int sfd = open(kPath[i], O_RDONLY);
+            if (sfd < 0) {
+                printf("[DRMDEMO] sysfs %s open FAILED rc=%d\n", kLab[i], sfd);
+                continue;
+            }
+            char b[64];
+            const long n = (long)read(sfd, b, sizeof(b) - 1);
+            close(sfd);
+            if (n < 0) { printf("[DRMDEMO] sysfs %s read FAILED rc=%ld\n", kLab[i], n); continue; }
+            b[n] = 0;
+            for (long k = 0; k < n; k++) if (b[k] == '\n') b[k] = 0;
+            printf("[DRMDEMO] sysfs %s=%s\n", kLab[i], b);
+        }
+        /* 反例：合成节点必须只读（打开写 -> -EACCES = -13） */
+        errno = 0;
+        const int wfd = open("/sys/class/input/event1/name", O_WRONLY);
+        const int werr = (wfd < 0) ? errno : 0;      /* POSIX：失败 -1 + errno（内核给的是 -EACCES=13） */
+        printf("[DRMDEMO] sysfs readonly rc=%d errno=%d\n", wfd, werr);
+        if (wfd >= 0) close(wfd);
     }
 
     /* ---- ⑫ DESTROY_DUMB ---- */
