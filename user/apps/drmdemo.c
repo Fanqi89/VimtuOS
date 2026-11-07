@@ -18,6 +18,8 @@
  *   [DRMDEMO] libevdev name=<s> absx=<rc> min=<n> max=<n> grab=<rc>/<rc> types=0x<hex>
  *   [DRMDEMO] gbm bo handle=<n> <w>x<h> stride=<n> probe=0x<hex>
  *   [DRMDEMO] gbm surface n=2 front=<i>/<j> stride=<n> rc=0
+ *   [DRMDEMO] modeswitch list=<n> pick=<w>x<h> cur=<w>x<h> ilace=0   ← ★ v0.9.23 运行时切模式
+ *   [DRMDEMO] setcrtc mode=<w>x<h> rc=0 / setcrtc restore=<w>x<h> rc=0 / modeswitch reflip rc=0
  *   [DRMDEMO] destroy_dumb handle=<n> rc=0
  *   [DRMDEMO] done ok=1
  *
@@ -627,6 +629,77 @@ int main(int argc, char** argv, char** envp) {
                 printf("[DRMDEMO] gbm surface FAILED\n");
             }
             gbm_device_destroy(gdev);
+        }
+    }
+
+    /* ---- ⑰ ★ v0.9.23：运行时真切分辨率（SETCRTC -> Bochs DISPI）----
+     *   为什么要这一步：v0.9.22 之前 SETCRTC 只接受"当前几何"，换了就 -EINVAL，
+     *   也就是"用户态根本没法改模式"。这里真切一次、再切回来：
+     *   证据 = 内核 [DRM] setcrtc mode-switch … ok=1 path=dispi（换成功）
+     *        + 换回原模式也 ok=1 + 换回后 ring3 还能上屏（下面的 present 行）。
+     *   切不过去就如实 ok=0（内核会给 path=not-in-edid / path=unsupported 的原因，
+     *   比如 VMware SVGA / virtio-gpu / GOP 没有改模式的命令通道）。 ---- */
+    {
+        static struct Drm64ModeMode ms_modes[16];
+        struct Drm64ModeConnector q;
+        for (unsigned i = 0; i < sizeof(q); i++) ((char*)&q)[i] = 0;
+        q.connector_id = DRM64_CONNECTOR_ID64;
+        q.modes_ptr = (uint64_t)(uintptr_t)ms_modes;
+        q.count_modes = 16;
+        q.count_props = 0; q.count_encoders = 0;
+        const int qrc = (int)drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_GETCONNECTOR,
+                                                        struct Drm64ModeConnector), &q);
+        unsigned tw = 0, th = 0, n_il = 0, iflags = 0;
+        if (qrc == 0) {
+            const unsigned nm = (q.count_modes > 16u) ? 16u : (unsigned)q.count_modes;
+            for (unsigned i = 1; i < nm; i++) {
+                const struct Drm64ModeMode* m = &ms_modes[i];
+                if (!m->hdisplay || !m->vdisplay) continue;
+                if (m->flags & 0x10u) {                                /* 隔行：DRM_MODE_FLAG_INTERLACE */
+                    n_il++;
+                    if (!iflags) iflags = m->flags;
+                    continue;                                          /* 隔行模式 DISPI 切不过去 */
+                }
+                if (m->hdisplay > dw || m->vdisplay > dh) continue;     /* 比演示 dumb 大：跳过 */
+                if (m->hdisplay < 640u || m->vdisplay < 480u) continue;
+                if (m->hdisplay == mode.hdisplay && m->vdisplay == mode.vdisplay) continue;
+                if (m->hdisplay > tw) { tw = m->hdisplay; th = m->vdisplay; }  /* 取最大的那个 */
+            }
+        }
+        printf("[DRMDEMO] modeswitch list=%u ilace=%u iflags=0x%x pick=%ux%u cur=%ux%u\n",
+               (unsigned)q.count_modes, n_il, iflags, tw, th,
+               (unsigned)mode.hdisplay, (unsigned)mode.vdisplay);
+        if (qrc != 0 || tw == 0u) {
+            printf("[DRMDEMO] modeswitch skipped (no usable EDID mode smaller than dumb)\n");
+        } else {
+            struct Drm64ModeCrtc sc;
+            for (unsigned i = 0; i < sizeof(sc); i++) ((char*)&sc)[i] = 0;
+            sc.crtc_id = DRM64_CRTC_ID64; sc.fb_id = cd.handle;
+            sc.x = 0; sc.y = 0; sc.mode_valid = 1;
+            sc.mode = mode;                                            /* 先拷当前模式结构 */
+            sc.mode.hdisplay = (uint16_t)tw; sc.mode.vdisplay = (uint16_t)th;
+            const int r1 = (int)drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_SETCRTC,
+                                                           struct Drm64ModeCrtc), &sc);
+            printf("[DRMDEMO] setcrtc mode=%ux%u rc=%d\n", tw, th, r1);
+            /* 换回原模式：绝不把"屏幕被演示程序改小"这种副作用留在系统里 */
+            sc.mode = mode;
+            const int r2 = (int)drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_SETCRTC,
+                                                           struct Drm64ModeCrtc), &sc);
+            printf("[DRMDEMO] setcrtc restore=%ux%u rc=%d\n",
+                   (unsigned)mode.hdisplay, (unsigned)mode.vdisplay, r2);
+            /* 换回来之后再画一帧：证明往返之后 ring3 仍然能上屏 */
+            struct Drm64ModePageFlip pf3;
+            pf3.crtc_id = DRM64_CRTC_ID64; pf3.fb_id = cd.handle;
+            pf3.flags = 0; pf3.reserved = 0; pf3.user_data = 0x5678u;
+            const int r3 = (int)drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_PAGE_FLIP,
+                                                           struct Drm64ModePageFlip), &pf3);
+            printf("[DRMDEMO] modeswitch reflip rc=%d\n", r3);
+            /* 反例：EDID 模式表里**没有**的分辨率必须被拒绝（内核 path=not-in-edid，不假装切成功） */
+            sc.mode = mode;
+            sc.mode.hdisplay = 1111; sc.mode.vdisplay = 777;
+            const int r4 = (int)drm64_ioctl(fd, DRM64_IOWR(DRM64_NR_MODE_SETCRTC,
+                                                           struct Drm64ModeCrtc), &sc);
+            printf("[DRMDEMO] setcrtc badmode=1111x777 rc=%d\n", r4);
         }
     }
 

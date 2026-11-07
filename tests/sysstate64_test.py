@@ -772,6 +772,9 @@ def main():
     check("软重启场景：终端已打开", typed4)
     if typed4:
         run_cmd(vm4, mon4, "restart --soft", "[SYS64] soft restart requested", tries=2)
+        # ★ [RESET] sys_reboot64 是复位前的**最后一行**：必须等它真的写出来再取日志，
+        #   否则会读到"还没写到"的旧内容（实测：串口文件末尾其实有这行，判据却先读了）。
+        vm4.wait_log("[RESET] sys_reboot64", 40)
     log4 = vm4.log()
     check("串口 [SYS64] soft restart requested", "[SYS64] soft restart requested" in log4)
     check("软重启先走 STOPPING（[SYS64] state=STOPPING reason=soft-restart）",

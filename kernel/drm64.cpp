@@ -482,7 +482,8 @@ static void d64_mode_name64(char* out, uint32_t cap, uint32_t w, uint32_t h) {
 // 省掉每次调用的清零 + 拼名字（名字依赖几何，而几何在一次启动里不会变）。
 static Drm64ModeMode g_mode64;
 // ★ v0.9.22：按 EDID 里的一条模式造 drm_mode_modeinfo（名称仍是 "WxH"，与既有口径一致）
-static void d64_mode_wh64(Drm64ModeMode* out, uint32_t w, uint32_t h, uint32_t refresh) {
+// ★ v0.9.23：ilace != 0 时置 DRM_MODE_FLAG_INTERLACE（0x10）—— 用户态据此知道这条是隔行
+static void d64_mode_wh64(Drm64ModeMode* out, uint32_t w, uint32_t h, uint32_t refresh, uint32_t ilace) {
     for (uint32_t i = 0; i < sizeof(Drm64ModeMode); i++) ((uint8_t*)out)[i] = 0;
     out->hdisplay = (uint16_t)w;
     out->hskew = 0; out->hsync_start = (uint16_t)w; out->hsync_end = (uint16_t)w; out->htotal = (uint16_t)w;
@@ -490,6 +491,7 @@ static void d64_mode_wh64(Drm64ModeMode* out, uint32_t w, uint32_t h, uint32_t r
     out->vscan = 0; out->vsync_start = (uint16_t)h; out->vsync_end = (uint16_t)h; out->vtotal = (uint16_t)h;
     out->clock = (uint32_t)(((uint64_t)w * (uint64_t)h * (uint64_t)(refresh ? refresh : 60u)) / 1000ull);
     out->vrefresh = refresh ? refresh : 60u;
+    out->flags = ilace ? 0x10u : 0u;                     // DRM_MODE_FLAG_INTERLACE
     d64_mode_name64(out->name, (int)sizeof(out->name), w, h);
 }
 static void d64_fill_mode64(uint32_t w, uint32_t h) {
@@ -655,7 +657,8 @@ static int d64_ioctl_getconnector64(uint64_t arg) {
                 const Edid64Mode* em = edid64_mode_at64(i);
                 if (!em) continue;
                 Drm64ModeMode x;
-                d64_mode_wh64(&x, em->w, em->h, (em->refresh_x10 + 5u) / 10u);
+                d64_mode_wh64(&x, em->w, em->h, (em->refresh_x10 + 5u) / 10u,
+                              (uint32_t)em->interlaced);
                 d64_uwr64(c.modes_ptr + (uint64_t)(i + 1) * (uint64_t)sizeof(Drm64ModeMode),
                           &x, sizeof(Drm64ModeMode));
             }
@@ -987,7 +990,12 @@ __attribute__((noinline)) static int d64_blank64(void) {
     return 0;
 }
 
-// SETCRTC（= drmModeSetCrtc）：fb_id = 0 关屏；mode_valid = 1 时校验模式（只有一种，换分辨率 -EINVAL）。
+// ★ v0.9.23：运行时真切分辨率（定义在 evdev 绝对轴表之后，因为要一起更新轴区间）
+static int d64_modeswitch64(uint32_t w, uint32_t h);
+
+// SETCRTC（= drmModeSetCrtc）：fb_id = 0 关屏；mode_valid = 1 时校验模式。
+// ★ v0.9.23：**换分辨率不再是 -EINVAL** —— 只要该模式在 EDID 模式表里、且后端是 Bochs DISPI
+//   （fb_set_mode 真能改扫描模式），就真切过去并更新 g_mode64；做不到就如实 -EINVAL。
 static int d64_ioctl_setcrtc64(uint64_t arg) {
     if (!user64_range_ok64(arg, sizeof(Drm64ModeCrtc))) return -DRM64_EFAULT64;
     Drm64ModeCrtc c;
@@ -1005,9 +1013,11 @@ static int d64_ioctl_setcrtc64(uint64_t arg) {
     if (!d || (fb && (fb->w > d->w || fb->h > d->h)))
         return d64_fail64("[DRM] setcrtc", "no-such-fb", -DRM64_EINVAL64);
     if (c.mode_valid) {
-        // 本内核只有 1 块屏 1 个模式：要求换分辨率就如实拒绝（不假装 modeset 成功）
-        if (c.mode.hdisplay != g_mode64.hdisplay || c.mode.vdisplay != g_mode64.vdisplay)
-            return d64_fail64("[DRM] setcrtc", "mode-unsupported", -DRM64_EINVAL64);
+        if (c.mode.hdisplay != g_mode64.hdisplay || c.mode.vdisplay != g_mode64.vdisplay) {
+            // 换分辨率：真去改扫描模式（EDID 模式表 + Bochs DISPI）；改不了如实拒绝
+            if (d64_modeswitch64((uint32_t)c.mode.hdisplay, (uint32_t)c.mode.vdisplay) != 0)
+                return d64_fail64("[DRM] setcrtc", "mode-unsupported", -DRM64_EINVAL64);
+        }
     }
     const int path = d64_present_at64(d, c.x, c.y);
     if (path < 0) return d64_fail64("[DRM] setcrtc", "no-framebuffer", -DRM64_ENODEV64);
@@ -1661,6 +1671,58 @@ int drm64_ioctl64(uint64_t cmd, uint64_t arg, uint64_t pid) {
 static int32_t          g_ev_grab_pid[2] = { 0, 0 };
 static InputAbsInfo64   g_ev_abs[2][EVDEV64_MAX_ABS64];
 static uint32_t         g_ev_abs_n[2] = { 0u, 0u };
+
+// ==================== ★ v0.9.23：运行时真切分辨率（SETCRTC -> Bochs DISPI）====================
+// 为什么只走 DISPI：本内核里真正能改扫描模式的唯一实现是 fb.cpp 的 fb_set_mode（Bochs VBE
+//   DISPI 端口 0x1CE/0x1CF + 回读校验）。VMware SVGA / virtio-gpu / UEFI GOP 都没有"改模式"
+//   的命令通道（它们只能画，模式由固件或 host 定死），所以这里**不假装**能切：回读不一致就
+//   如实 path=unsupported，让 SETCRTC 返回 -EINVAL。
+// 允许的模式 = EDID 模式表里**有**的（逐条核对，不猜）+ 非隔行（DISPI 不能隔行扫描）。
+// 返回 0 = 已切换（g_mode64 / evdev 绝对轴区间一起更新）；-1 = 没切（已打点，为什么没切）。
+__attribute__((noinline)) static int d64_modeswitch64(uint32_t w, uint32_t h) {
+    const int n = edid64_mode_count64();
+    int in_edid = 0, only_ilace = 0;
+    for (int i = 0; i < n; i++) {
+        const Edid64Mode* m = edid64_mode_at64(i);
+        if (!m || (uint32_t)m->w != w || (uint32_t)m->h != h) continue;
+        if (m->interlaced) only_ilace = 1; else in_edid = 1;
+    }
+    if (!in_edid) {
+        d64_begin(); d64_puts("[DRM] setcrtc mode-switch w="); d64_num(w);
+        d64_puts(" h="); d64_num(h); d64_puts(" ok=0 path=not-in-edid");
+        if (only_ilace) d64_puts(" ilace=1");
+        d64_end();
+        return -1;
+    }
+    const int ok = fb_set_mode((int)w, (int)h) ? 1 : 0;
+    if (!ok || (uint32_t)fb_phys_width() != w || (uint32_t)fb_phys_height() != h) {
+        d64_begin(); d64_puts("[DRM] setcrtc mode-switch w="); d64_num(w);
+        d64_puts(" h="); d64_num(h); d64_puts(" ok=0 path=unsupported got=");
+        d64_num((uint64_t)fb_phys_width()); d64_puts("x"); d64_num((uint64_t)fb_phys_height());
+        d64_end();
+        return -1;
+    }
+    // 几何变了：模式结构（GETCRTC / GETCONNECTOR 的唯一来源）与 evdev 绝对轴区间一起重建
+    d64_fill_mode64(w, h);
+    for (int i = 0; i < n; i++) {
+        const Edid64Mode* m = edid64_mode_at64(i);
+        if (m && (uint32_t)m->w == w && (uint32_t)m->h == h && !m->interlaced) {
+            g_mode64.vrefresh = (m->refresh_x10 + 5u) / 10u;      // EDID 的真实刷新率
+            break;
+        }
+    }
+    if (g_ev_abs_n[1] > EVDEV64_ABS_Y64) {
+        g_ev_abs[1][EVDEV64_ABS_X64].maximum = (int32_t)(w ? w - 1u : 0u);
+        g_ev_abs[1][EVDEV64_ABS_Y64].maximum = (int32_t)(h ? h - 1u : 0u);
+    }
+    d64_begin(); d64_puts("[DRM] setcrtc mode-switch w="); d64_num(w);
+    d64_puts(" h="); d64_num(h); d64_puts(" ok=1 path=dispi refresh=");
+    d64_num((uint64_t)g_mode64.vrefresh);
+    d64_puts(" kms="); d64_num((uint64_t)g_mode64.hdisplay); d64_puts("x");
+    d64_num((uint64_t)g_mode64.vdisplay);
+    d64_end();
+    return 0;
+}
 static Ev64Event g_ev_pending[8];
 static uint32_t  g_ev_pending_n = 0;
 static uint32_t  g_ev_reads = 0;              // 打点预算（前 8 条 + 每 64 条一条）
@@ -1908,10 +1970,14 @@ void drm64_init64(void) {
     {
         const uint32_t fw = (uint32_t)fb_phys_width(), fh = (uint32_t)fb_phys_height();
         const int n = edid64_mode_count64();
-        uint32_t matched = 0;
+        uint32_t matched = 0, nil = 0;
         for (int i = 0; i < n; i++) {
             const Edid64Mode* m = edid64_mode_at64(i);
-            if (m && (uint32_t)m->w == fw && (uint32_t)m->h == fh) { matched = m->refresh_x10; break; }
+            if (!m) continue;
+            if (m->interlaced) nil++;                     // ★ v0.9.23：隔行模式条数（DRM 报 flags=0x10）
+            // 注意：**不能在这 break** —— 当前几何那条通常排在 i=0，一旦提前退出就数不到后面的
+            // 隔行模式，[DRM] edid … ilace=N 会恒为 0（v0.9.23 第一版就是这个错）。
+            if (!matched && (uint32_t)m->w == fw && (uint32_t)m->h == fh) matched = m->refresh_x10;
         }
         if (matched) g_mode64.vrefresh = (matched + 5u) / 10u;
         // 这里同时把 GETCONNECTOR 将要回给用户态的**模式数与物理尺寸**打出来（同一份数据，便于串口核对）
@@ -1923,6 +1989,7 @@ void drm64_init64(void) {
         d64_puts(" conn_modes="); d64_num((uint64_t)n + 1u);
         d64_puts(" mm="); d64_num((ed0->valid && ed0->size_cm_w) ? (uint64_t)ed0->size_cm_w * 10ull : 0ull);
         d64_puts("x"); d64_num((ed0->valid && ed0->size_cm_h) ? (uint64_t)ed0->size_cm_h * 10ull : 0ull);
+        d64_puts(" ilace="); d64_num((uint64_t)nil);
         d64_end();
     }
     // 垂直回扫：复用 fb.cpp 的既有探针（200 ms 实测一轮；25..300 Hz 才算可信）

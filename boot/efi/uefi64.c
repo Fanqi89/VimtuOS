@@ -237,23 +237,31 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
         }
         u32 edid_w = 0, edid_h = 0;
         if (!EFI_ERROR(es) && ep && ep->Edid && ep->SizeOfEdid >= 128u) {
+            // ★ v0.9.23：最多拷 256 B（块 0 + 块 1 = CEA-861 扩展块）；块 1 校验不过就退回 128
             u8* dst = (u8*)(u64)bi->edid_addr;
-            u32 n = ep->SizeOfEdid; if (n > 128u) n = 128u;
+            u32 n = ep->SizeOfEdid; if (n > 256u) n = 256u;
             for (u32 i = 0; i < n; i++) dst[i] = ep->Edid[i];
-            for (u32 i = n; i < 128u; i++) dst[i] = 0;
+            for (u32 i = n; i < 256u; i++) dst[i] = 0;
             const int hdr = (dst[0] == 0x00 && dst[1] == 0xFF && dst[2] == 0xFF && dst[3] == 0xFF &&
                              dst[4] == 0xFF && dst[5] == 0xFF && dst[6] == 0xFF && dst[7] == 0x00);
             u32 sum = 0;
             for (u32 i = 0; i < 128u; i++) sum += dst[i];
             if (hdr && (sum & 0xFFu) == 0u) {
+                u32 blocks = 0;
                 bi->edid_size = 128;
                 bi->edid_ok = 1;
+                if (ep->SizeOfEdid >= 256u) {
+                    u32 s2 = 0;
+                    for (u32 i = 128u; i < 256u; i++) s2 += dst[i];
+                    if ((s2 & 0xFFu) == 0u) { bi->edid_size = 256; blocks = 1; }
+                }
                 // 首选 DTD（偏移 54）：HACTIVE/VACTIVE 的低 8 位 + 高 4 位（与 loader64.asm 同一口径）
                 edid_w = (u32)dst[56] | (((u32)dst[58] & 0xF0u) << 4);
                 edid_h = (u32)dst[59] | (((u32)dst[61] & 0xF0u) << 4);
                 ser_str("U:edid ok=1 src="); ser_str(esrc);
                 ser_str(" size="); ser_dec(ep->SizeOfEdid);
-                ser_str(" preferred="); ser_dec(edid_w); ser_str("x"); ser_dec(edid_h); ser_str("\n");
+                ser_str(" preferred="); ser_dec(edid_w); ser_str("x"); ser_dec(edid_h);
+                ser_str(" blocks="); ser_dec(1u + blocks); ser_str("\n");
             } else {
                 ser_str("U:edid bad header/checksum (firmware EDID ignored)\n");
                 bi->edid_ok = 0;

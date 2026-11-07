@@ -1,4 +1,4 @@
-# 显示器 EDID 与 DDC 通道（v0.9.22）
+# 显示器 EDID 与 DDC 通道（v0.9.22 打通读取与上报；v0.9.23 补块 1 / 隔行 / 运行时切模式）
 
 > 用户报告："硬件检查报告里显示模块还是 EDID none，系统只能盲猜分辨率"。
 > 本篇是这件事的**现状评估 + 本批做了什么 + 还缺什么**。
@@ -105,29 +105,133 @@ U:edid none (firmware has no EDID protocol)
 
 ---
 
-## 3. 验收（`tests/edid64_test.py`，21/21）
+### 2.6 ★ v0.9.23：把 EDID 读到 256 B（块 1 = CEA-861 扩展块）
+
+- `boot/loader64.asm` 的 `read_edid`：块 0 读成功后**再发一次**规范内的 `INT10 4F15 BL=01`
+  （`CX = 1` 块号，`ES:DI = 0x7680`），**只读固件通道、不碰任何硬件寄存器**；
+  只有块 1 首字节是 `0x02`（CEA-861）才把 `BootInfo.edid_size` 记成 **256**，否则如实退回 128。
+- `boot/efi/uefi64.c`：EDID 协议的 `SizeOfEdid` 允许拷到 **256 B**，块 1 的 128 字节校验和
+  通过才置 `edid_size = 256`，串口行追加 `blocks=<1|2>`。
+- `kernel/edid64.cpp`：**对"上层说它好"不信任**，自己再验一遍块 1 的校验和
+  （`e64_sum_ok(d + 128)`）；新增对外只读接口 `edid64_raw64()` / `edid64_raw_len64()`。
+
+**实测（本机 QEMU + SeaBIOS vgabios）—— 这条路径拿不到块 1，如实记录：**
+
+| 证据 | 含义 |
+| --- | --- |
+| loader 诊断 `L:b1=00FF`（`AX=004F`） | 固件**报成功**，但 `0x7680` 处写的是 `00 FF`（块 0 的头）——即无视 `CX`，又把块 0 写了一遍 |
+| `[EDID] ext=1 cea=0 vic=0 dtd=0 hdmi=0 skip=0 blocks=1 b1hdr=0000000000000000` | 内核如实报"EDID 声称有 1 个扩展块，但实读只有块 0"；`b1hdr=` 就是 `0x7680` 的首字节 |
+| 结论 | **BIOS/VBE 路径在 QEMU/SeaBIOS 上只能拿到块 0** —— 这是固件实现的上限，不是内核不读 |
+
+所以块 1 的**解析**能力由内核自检（合成块）证明，见 2.7；真机上走 UEFI 的
+`EFI_EDID_DISCOVERED/ACTIVE`（`SizeOfEdid = 256`）时才可能拿到真块 1；OVMF 不实现该协议。
+
+### 2.7 ★ v0.9.23：CEA-861 扩展块解析（不再是"只记个数"）
+
+块 1 布局：`[0]=0x02`、`[1]=revision`、`[2]=DTD 偏移 d`、`[3]=flags`、
+`[4..d-1]` = data block 集合（每块 `tag=(b>>5)&7` / `len=b&0x1F`）、
+`d..126` = 扩展块自己的 18 B DTD、`[127]` = 校验和。本批解码三类：
+
+1. **tag 2 = Video Data Block**：每字节是 VIC（bit7 = "native"，先清掉）。VIC 表**只放能逐条核对**的
+   `1..16` 与 `31..34`（CEA-861-F Table 3 的标清/高清常用段）；表外的 VIC **如实跳过并计数**
+   （`[EDID] ext=… skip=<n>`），绝不编造分辨率。
+2. **tag 3 = Vendor Specific**：OUI 小端 `0x000C03` → `hdmi=1`（只做识别，不解析物理尺寸/音频）。
+3. **扩展块自己的 18 B DTD**：复用同一个 `e64_parse_dtd()`，进同一张模式表（去重、上限 32 条）。
+
+自检把这三条合成一块假块 1（VIC 4/16 + HDMI OUI + 1920x1080**隔行**扩展 DTD），
+串口给可见证据：
+
+```
+[EDID64] selftest ext synthetic cea=1 vic=2 dtd=1 hdmi=1 ilace=1
+```
+
+### 2.8 ★ v0.9.23：隔行模式不再被丢掉
+
+- `e64_parse_dtd()` 读 DTD flags（`dd[17]`）**bit7 = 隔行**，存进 `Edid64Mode.interlaced` /
+  `Edid64.interlaced`。结构体只在模块内部用，**不进 ioctl ABI**。
+- 模式表去重键从 `(w,h)` 改成 `(w,h,隔行)` —— 1920x1080p 与 1920x1080i 是**两个**模式。
+- 顺手修了建立时序 byte `0x24` 的**表错位**：旧表把 `1024x768@60` 写成 700、`@70` 写成 750；
+  现在按 E-EDID 顺序（bit7 起）：800x600@72 / @75 / 832x624@75 / 保留 / **1024x768@87i** /
+  1024x768@60 / @70 / @75。
+- DRM 上报：`Drm64ModeMode.flags` 对隔行模式置 **`0x10`（`DRM_MODE_FLAG_INTERLACE`）**，
+  非隔行仍 0；`[DRM] edid … ilace=<n>` 报条数（与 `[EDID] mode … ilace=1` 必须一致）。
+
+**刷新率口径（必须说清楚）**：EDID 的 `Vtotal` 对隔行模式是**每场行数**，所以算出来的是**场频**
+（1024x768@87i 显示成 `87.0Hz`）。要帧频就除以 2，本模块不擅自改口径。
+
+实测原文（QEMU 的内置 EDID 里真的有这一条：建立时序 byte 0x24 bit3）：
+
+```
+[EDID] mode i=3 1024x768@87.0Hz kind=1 ilace=1
+[DRM]  edid modes=12 cur=1280x800 refresh=75 matched=1 conn_modes=13 mm=320x200 ilace=1
+[DRMDEMO] modeswitch list=13 ilace=1 iflags=0x10 pick=800x600 cur=1280x800
+```
+
+### 2.9 ★ v0.9.23：运行时真能切分辨率（SETCRTC → Bochs DISPI）
+
+原来 `SETCRTC` 只接受"当前几何"，换分辨率一律 `-EINVAL` —— 也就是**用户态根本没法改模式**。
+本批把这条路打通，但只走**真有实现**的那条：
+
+- `d64_modeswitch64(w,h)`：请求的模式必须**在 EDID 模式表里**（逐条核对，不猜）且**非隔行**
+  （DISPI 不能隔行扫描），然后调 `fb_set_mode(w,h)`（Bochs VBE DISPI `0x1CE/0x1CF` + **回读校验**）。
+  成功后重建 `g_mode64`（`GETCRTC`/`GETCONNECTOR` 的唯一来源）与 evdev 绝对轴区间
+  （`ABS_X/Y.maximum = w-1 / h-1`）。
+- 做不到就**如实拒绝**：`path=not-in-edid`（模式不在 EDID 表里）或 `path=unsupported`
+  （回读与请求不一致：VMware SVGA / virtio-gpu / GOP 都没有"改模式"的命令通道），
+  `SETCRTC` 返回 `-EINVAL`。
+- ring3 侧（`user/apps/drmdemo.c`）走完整往返：**切过去 → 切回来 → 再上一帧 → 反例**。
+
+实测原文：
+
+```
+[DRMDEMO] modeswitch list=13 ilace=1 iflags=0x10 pick=800x600 cur=1280x800
+[DRM] setcrtc mode-switch w=800 h=600 ok=1 path=dispi refresh=60 kms=800x600
+[DRMDEMO] setcrtc mode=800x600 rc=0
+[DRM] setcrtc mode-switch w=1280 h=800 ok=1 path=dispi refresh=75 kms=1280x800
+[DRMDEMO] setcrtc restore=1280x800 rc=0
+[DRMDEMO] modeswitch reflip rc=0
+[DRM] present id=1 path=cpu bytes=…            ← 往返之后 ring3 仍然能上屏
+[DRM] setcrtc mode-switch w=1111 h=777 ok=0 path=not-in-edid
+[DRMDEMO] setcrtc badmode=1111x777 rc=-22      ← 反例：EDID 表外如实拒绝
+```
+
+---
+
+## 3. 验收
+
+### 3.1 `tests/edid64_test.py` —— **31/31**（v0.9.22 是 21/21）
 
 | 判据 | 证据 |
 | --- | --- |
 | 引导层 EDID 被解析 | `[EDID64] present=1 ver=1.4 mfg=RHT name=QEMU Monitor size=32x20cm` |
-| 控制台汇总行 | `[EDID] mfg=… product=4660 … cm=32x20 preferred=1280x800@75.0Hz modes=12 src=vbios` |
-| 模式列表（首选在 i=0，无 0x0 垃圾） | `[EDID] mode i=0 1280x800@75.0Hz kind=0` + 12 条 |
+| 控制台汇总行 | `[EDID] mfg=… preferred=1280x800@75.0Hz modes=12 src=vbios` |
+| 模式列表（首选在 i=0，无 0x0 垃圾，每条带 `ilace=`） | `[EDID] mode i=0 1280x800@75.0Hz kind=0 ilace=0` + 11 条 |
 | 显示层顺序修复 | `[DISP64] init modes=16 cur=1280x800@75.0 src=edid` |
-| DRM 上报真实模式数/尺寸/刷新率 | `[DRM] edid modes=12 cur=1280x800 refresh=75 matched=1 conn_modes=13 mm=320x200` |
-| UEFI 模式表非空 | `U:modes=16 max=30` |
-| UEFI EDID 结论如实 | `U:edid none (firmware has no EDID protocol)`（OVMF 未实现该协议） |
+| DRM 上报（真实模式数 / 尺寸 / 刷新率 / 隔行条数） | `[DRM] edid modes=12 cur=1280x800 refresh=75 matched=1 conn_modes=13 mm=320x200 ilace=1` |
+| **块 1 解析器**（合成块自证） | `[EDID64] selftest ext synthetic cea=1 vic=2 dtd=1 hdmi=1 ilace=1` |
+| **块 1 诚实性**：没拿到就必须报 0 | `[EDID] ext=1 cea=0 vic=0 dtd=0 hdmi=0 skip=0 blocks=1 b1hdr=0000000000000000` |
+| **隔行模式**被保留并标注 | `[EDID] mode i=3 1024x768@87.0Hz kind=1 ilace=1`，且 `[DRM] edid … ilace=1` 与之一致 |
+| UEFI 模式表非空 / EDID 结论如实 | `U:modes=16 max=30`、`U:edid none (firmware has no EDID protocol)` |
 | 禁止项 | 无 PANIC / TRIPLE FAULT / `[EDID64] selftest FAIL` |
 
-回归：`drm64_test` **96/96**、`display64_test` **22/22**、`display_runtime_test` **19/19**、
-`sysstate64_test` **101/101**、`status_report` **95/0/0**。
+### 3.2 回归（同一批产物）
+
+| 测试 | 结果 |
+| --- | --- |
+| `tests/drm64_test.py` | **108/108**（v0.9.22 是 96；新增 12 条 = 隔行 flags + 运行时切分辨率 + 反例 + 切回后上屏） |
+| `tests/display64_test.py` | 22/22 |
+| `tests/display_runtime_test.py` | 19/19 |
+| `tests/sysstate64_test.py` | 101/101（本机串口抓取偶发**行尾截断**，3 次里 2 次红 1 次绿；红的那两次都是"某行少了尾巴"，不是行为回归） |
+| `tests/status_report.py` | 95 / 0 / 0 |
 
 ---
 
 ## 4. 还缺什么（欠账，如实）
 
 1. **运行期 DDC 位翻转**（Intel GMBUS / VGA bit-bang）—— 需要 Intel PRM 的寄存器表才能不猜地写。
-2. **EDID 扩展块（CEA-861）**：`ext_count > 0` 时仍只记数字，扩展块里的 HDMI 详细时序/音频不解析。
-3. **隔行模式**（如 1024x768@87i）不报。
-4. **运行时切分辨率**：`U:setmode` 是**引导期**在 UEFI 里做的；内核侧仍只"报告"，不主动改模式
-   （改模式涉及各家 GPU 的显示管线，不在本批）。
+2. **块 1 的真数据**：本机 QEMU/SeaBIOS 的 `4F15 BL=01` 无视 `CX` 只回块 0（见 2.6 的证据），
+   所以 CEA-861 解析目前只有**合成块**证据；真机 UEFI 固件给出 `SizeOfEdid = 256` 时才会拿到真块 1。
+3. **运行时切分辨率只对 Bochs DISPI（QEMU `-vga std`）保证**；VMware SVGA / virtio-gpu / GOP
+   如实 `path=unsupported`（这些设备没有改模式的命令通道，写寄存器属于"猜"）。
+4. **隔行模式只上报、不扫描**：DISPI 不能隔行输出，`SETCRTC` 对隔行目标一律拒绝。
 5. **多显示器**：只有 1 个 connector（HDMI-A-1），EDID 也只读第一条通道。

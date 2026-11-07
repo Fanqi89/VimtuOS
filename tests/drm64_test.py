@@ -532,6 +532,12 @@ def main():
             (r"\[DRMDEMO\] libevdev name=vimtu-mouse absx=24 min=0 max=\d+ grab=0/0 types=0x7",
              "libevdev 适配层（名字/绝对轴/独占）"),
             (r"\[DRMDEMO\] gbm bo handle=\d+ 64x64 stride=256 probe=0x5afe1234", "GBM 建出真 BO 并读写像素"),
+            # ★ v0.9.23：运行时真切分辨率（SETCRTC -> Bochs DISPI）
+            (r"\[DRMDEMO\] modeswitch list=\d+ ilace=\d+ iflags=0x[0-9a-f]+ pick=\d+x\d+ cur=\d+x\d+",
+             "modeswitch 模式清单（隔行条数 + flags）"),
+            (r"\[DRMDEMO\] setcrtc mode=\d+x\d+ rc=0", "SETCRTC 真切分辨率 rc=0"),
+            (r"\[DRMDEMO\] setcrtc restore=\d+x\d+ rc=0", "SETCRTC 切回原模式 rc=0"),
+            (r"\[DRMDEMO\] modeswitch reflip rc=0", "换回原模式后还能上屏"),
         ]
         stage_ok = vm.wait("[DRMDEMO] done", args.timeout)
         log = vm.log()
@@ -554,6 +560,46 @@ def main():
         check("④ evdev read 有结论（读到事件 或 如实 skipped）",
               re.search(r"\[DRMDEMO\] evdev read (n=\d+|skipped rc=-?\d+)", log) is not None)
         check("④ [DRMDEMO] destroy_dumb rc=0", re.search(r"\[DRMDEMO\] destroy_dumb handle=\d+ rc=0", log) is not None)
+
+        # ---------- ④-b ★ v0.9.23：运行时真切分辨率（不是"假装切了"）----------
+        ms = re.search(r"\[DRMDEMO\] modeswitch list=(\d+) ilace=(\d+) iflags=0x([0-9a-f]+) "
+                       r"pick=(\d+)x(\d+) cur=(\d+)x(\d+)", log)
+        check("④b 该机器有可用于切换的 EDID 模式（pick != 0x0，且 pick != cur）",
+              ms is not None and ms.group(4) != "0" and
+              (ms.group(4), ms.group(5)) != (ms.group(6), ms.group(7)),
+              ms.group(0) if ms else "缺 modeswitch 行")
+        check("④b 隔行模式的 DRM flags 是 0x10（DRM_MODE_FLAG_INTERLACE）—— 有隔行模式时必成立",
+              ms is not None and (ms.group(2) == "0" or ms.group(3) == "10"),
+              ("ilace=%s iflags=0x%s" % (ms.group(2), ms.group(3))) if ms else "")
+        sw = re.findall(r"\[DRM\] setcrtc mode-switch w=(\d+) h=(\d+) ok=(\d) path=(\w+) refresh=(\d+) "
+                        r"kms=(\d+)x(\d+)", log)
+        check("④b 内核真的切了扫描模式：mode-switch ok=1 path=dispi（至少切过去 + 切回来两次）",
+              len(sw) >= 2 and all(s2[2] == "1" and s2[3] == "dispi" for s2 in sw),
+              str(sw[:4]))
+        if ms is not None and sw:
+            check("④b 切过去的尺寸就是 ring3 请求的那条 EDID 模式（w/h 与 pick 一致）",
+                  (sw[0][0], sw[0][1]) == (ms.group(4), ms.group(5)),
+                  "请求 %sx%s / 内核 %sx%s" % (ms.group(4), ms.group(5), sw[0][0], sw[0][1]))
+            check("④b 已经切回原分辨率（最后一次 mode-switch 的 w/h == cur，屏幕没被改小）",
+                  (sw[-1][0], sw[-1][1]) == (ms.group(6), ms.group(7)),
+                  "cur=%sx%s / 最后 %sx%s" % (ms.group(6), ms.group(7), sw[-1][0], sw[-1][1]))
+            check("④b 切模式后 KMS 几何同步更新（kms=WxH == 请求值）",
+                  (sw[0][5], sw[0][6]) == (ms.group(4), ms.group(5)),
+                  "kms=%sx%s" % (sw[0][5], sw[0][6]))
+        # 往返之后 ring3 仍然能上屏：最后一次**成功**的 mode-switch（ok=1）之后必须有 present 行
+        # 注意不能取"最后一条 mode-switch" —— 反例那条（1111x777 ok=0）本来就该什么都不做。
+        pos = -1
+        for mm2 in re.finditer(r"\[DRM\] setcrtc mode-switch[^\r\n]*ok=1[^\r\n]*", log):
+            pos = mm2.end()
+        after = log[pos:] if pos >= 0 else ""
+        check("④b 换回原模式之后 ring3 仍能上屏（最后一次成功 mode-switch 之后还有 [DRM] present 行）",
+              pos >= 0 and re.search(r"\[DRM\] present id=\d+ path=(gpu|cpu) bytes=\d+", after) is not None,
+              "" if pos >= 0 else "没有成功的 mode-switch 行")
+        check("④b 反例：不在 EDID 模式表里的分辨率被如实拒绝（ok=0 path=not-in-edid + ring3 rc=-22）",
+              re.search(r"\[DRMDEMO\] setcrtc badmode=1111x777 rc=-22", log) is not None and
+              re.search(r"\[DRM\] setcrtc mode-switch w=1111 h=777 ok=0 path=not-in-edid", log) is not None,
+              (re.search(r"\[DRMDEMO\] setcrtc badmode[^\r\n]*", log).group(0)
+               if re.search(r"\[DRMDEMO\] setcrtc badmode", log) else "缺 badmode 行（反例没跑）"))
         check("④ 验收程序跑完：[DRMDEMO] done ok=1", "[DRMDEMO] done ok=1" in log, "")
 
         # ---------- ④-b ★ v0.9.15：fb 对象 / SETCRTC / plane / 进程回收 hook ----------

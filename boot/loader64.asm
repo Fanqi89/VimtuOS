@@ -525,19 +525,19 @@ mode_score:
 ; 结果：edid_ok = 1/0；edid_w/edid_h = 显示器原生分辨率（无 EDID 时为 0）
 read_edid:
     push cx
+    push es
     mov byte [edid_ok], 0
     mov word [edid_w], 0
     mov word [edid_h], 0
-    push es
+    mov word [edid_size], 128
     xor ax, ax
-    mov es, ax
+    mov es, ax                      ; ES = 0（低内存缓冲；块 0 与块 1 共用，最后才 pop）
     mov di, 0x7600
     mov ax, 0x4F15
     mov bx, 0x0001
     xor cx, cx
     xor dx, dx
     int 0x10
-    pop es
     cmp ax, 0x004F
     jne .none
     cmp byte [0x7600], 0x00          ; EDID 头 00 FF FF FF FF FF FF 00
@@ -566,6 +566,22 @@ read_edid:
     jb .none
     cmp word [edid_h], 480
     jb .none
+    ; ---- ★ v0.9.23：再读一次块 1（CEA-861 扩展块）到 0x7680 ----
+    ;   只用固件规范通道（VBE/DDC 4F15 BL=01，CX = 块号），不碰任何硬件寄存器。
+    ;   这里只查"头字节 = 0x02"，把 edid_size 记成 256；**校验和由内核复验**
+    ;   （kernel/edid64.cpp 的 e64_sum_ok，验不过就退回只读块 0）——
+    ;   loader 只有 4 KB 预算，同一件事不在这里重复算一遍。
+    mov di, 0x7680
+    mov ax, 0x4F15
+    mov bx, 0x0001
+    mov cx, 1                       ; 块号 1（块 0 已经在 0x7600）
+    xor dx, dx
+    int 0x10
+    cmp byte [0x7680], 0x02
+    jne .ok
+    mov word [edid_size], 256
+.ok:
+    pop es
     mov byte [edid_ok], 1
     mov si, msg_edid_ok
     call dbg_str
@@ -577,6 +593,7 @@ read_edid:
     pop cx
     ret
 .none:
+    pop es
     mov si, msg_edid_no
     call dbg_str
     pop cx
@@ -607,7 +624,8 @@ write_bootinfo:
     mov [0x101E], ax               ; 可用模式数
     mov dword [0x1020], 0x7400     ; 模式表地址
     mov dword [0x1024], 0x7600     ; EDID 缓冲地址
-    mov word [0x1028], 128         ; EDID 长度
+    mov ax, [edid_size]            ; EDID 长度（块 1 校验通过 = 256，否则 128）
+    mov [0x1028], ax
     mov al, [edid_ok]
     mov ah, 0
     mov [0x102A], ax               ; EDID 有效标志
@@ -1047,6 +1065,7 @@ ml_count: dw 0
 edid_ok:  db 0
 edid_w:   dw 0
 edid_h:   dw 0
+edid_size: dw 128                   ; ★ v0.9.23：EDID 实读字节数（128 / 256）
 m_width: dw 0
 m_height: dw 0
 m_bpp: db 0

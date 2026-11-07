@@ -10,8 +10,11 @@
 //   在 kernel64.cpp 的 hwinfo/acpi 那一段（fb_init 之前）就能安全调用。
 //
 // ★ 边界（如实写清，别把没做的说成做了）：
-//   1) **只解析第一块（128 字节）**。EDID 扩展块计数 > 0 时只把数字记下来
-//      （Edid64::ext_count），扩展块内容（块 1 的 CEA-861 时序表等）一律不解析。
+//   1) 块 0（128 字节）全解析；块 1 **只当它是 CEA-861 扩展块**时才解析（[0]=0x02），
+//      且只解码三类东西：Video Data Block 的 VIC、Vendor Specific 的 HDMI OUI、
+//      扩展块自己的 18B 详细时序。块号 >= 2 的扩展块（块映射 / DisplayID / 厂商扩展）
+//      **一律不解析**，只保留 ext_count 这个数字。VIC 表也只放能逐条核对的 1..16 + 31..34，
+//      表外 VIC 如实跳过并计数（[EDID] ext=… skip=<n>），绝不编造分辨率。
 //   2) 首选时序 = 第一个"详细时序描述符"（像素时钟 != 0）。EDID 规定第一个 DTD
 //      就是要首选的那个（EDID 1.3/1.4 §3.10.3），所以不做"按 flag 挑"的额外逻辑。
 //   3) 刷新率只用 pclk / (Htotal * Vtotal) 算（整数、保留一位小数）。不含时序
@@ -40,7 +43,14 @@ struct Edid64 {
     uint32_t product_serial;     // 序列号（offset 12..15，小端；0 = 厂商没写）
     uint8_t  mfg_week;           // 制造周（0 = 未写；1.4 里 0xFF = "model year" 标记）
     uint16_t mfg_year;           // 制造年（四位年：1990 + offset 17，见 .cpp 的版本口径说明）
-    uint8_t  ext_count;          // EDID 扩展块个数（>0 时本模块**不解析**扩展块）
+    uint8_t  ext_count;          // EDID 扩展块个数（>=1 时本模块只解析块 1，见边界 1)）
+    // ---- ★ v0.9.23：块 1（CEA-861）的结论 ----
+    uint8_t  interlaced;         // 首选 DTD 是否隔行（DTD flags bit7）
+    uint8_t  cea_ok;             // 1 = 块 1 头字节是 0x02（CEA-861），且已解析
+    uint8_t  hdmi;               // 1 = 找到 tag 3 且 OUI = 0x000C03（HDMI Licensing）
+    uint8_t  vic_used;           // 采纳进模式表的 VIC 条数
+    uint8_t  vic_skip;           // VIC 表里没有、如实跳过的条数
+    uint8_t  ext_dtd_n;          // 扩展块里解析出的 18B 详细时序条数
     char     name[EDID64_NAME_MAX];   // 显示器名字（tag 0xFC），去尾空格/换行；取不到 = "unknown"
 
     // ---- 屏幕尺寸（basic display parameters，0 = 未写）----
@@ -82,13 +92,17 @@ int edid64_selftest64();
 // ==================== ★ v0.9.22：显示器支持的**模式列表** ====================
 // 来源（全部来自 EDID 文本，不猜）：首选 + 其余 3 个详细时序（DTD）、建立时序（0x23/0x24 位图）、
 // 标准时序（0x26..0x35，8 项）。**扩展块（CEA-861）仍不解码** —— 见边界 1)。
-// kind：0 = DTD（含首选）/ 1 = 建立时序 / 2 = 标准时序
-#define EDID64_MODE_MAX 24u
+// kind：0 = DTD（含首选；块 0 与块 1 的都算）/ 1 = 建立时序 / 2 = 标准时序 / 3 = CEA-861 VIC
+// interlaced：1 = 隔行（DTD flags bit7 / 已知的 1024x768@87i 建立时序）。
+//   注意：**Drm64ModeMode.flags 报 0x10（DRM_MODE_FLAG_INTERLACE）**，但刷新率仍按
+//   pclk/(Htotal*Vtotal) 算 —— 隔行模式下 Vtotal 是"每场行数"，所以这个数字是**场频**
+//   （1024x768@87i 会显示成 87.0Hz）。要帧频就除以 2，本模块不擅自改口径。
+#define EDID64_MODE_MAX 32u
 struct Edid64Mode {
     uint16_t w, h;
     uint32_t refresh_x10;      // Hz * 10（建立的固定时序用标称值；标准的用 (b2&0x3F)+60）
     uint8_t  kind;
-    uint8_t  pad;
+    uint8_t  interlaced;
 };
 
 // 只读访问解析结果（静态存储，永不为空；从未初始化过时 valid = false）。
@@ -97,6 +111,11 @@ const Edid64* edid64_get();
 // 模式列表（按"首选在前"排；没有 EDID 时返回 0 条）
 int                edid64_mode_count64();
 const Edid64Mode*  edid64_mode_at64(int i);
+
+// ★ v0.9.23：原始字节（块 0，块 1 校验通过时含块 1）。返回 nullptr = 没有有效 EDID。
+//   len 如实反映实读字节数：128 = 只有块 0；256 = 块 1 也在（且校验和通过）。
+const uint8_t*     edid64_raw64();
+int                edid64_raw_len64();
 
 // 把刷新率写成 "60.0"（无单位，一位小数）。返回 1 = 有值；0 = 未知（此时写 "unknown"）。
 // 想显示成 "60.0 Hz" 的调用方自己在后面补单位。

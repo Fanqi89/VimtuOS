@@ -26,6 +26,8 @@
 //   bit 8  坏样本：篡改头部的块没有被拒绝
 //   bit 9  固件给了 EDID（BootInfo.edid_ok = 1）但本模块验证不过（头部/校验和/首选时序缺）
 //   bit 10 与固件缓冲的独立复核不一致（hact/vact 用"简单偏移读法"复算的结果不同）
+//   bit 11 ★v0.9.23 CEA-861 扩展块解析错（cea/hdmi/vic 计数/扩展 DTD/VIC 分辨率）
+//   bit 12 ★v0.9.23 隔行位解析错（1920x1080i 与 1920x1080p 没有各自留一条）
 #include "edid64.h"
 #include "../bootinfo.h"
 #include "debug64.h"
@@ -35,17 +37,21 @@
 // 正常路径用 BootInfo.edid_addr（引导层填的），只有 BootInfo 本身不可用（magic 不对）时才回退。
 static const uint32_t EDID64_FALLBACK_ADDR = 0x7600;
 static const uint32_t EDID64_BLOCK_BYTES   = 128;
+static const uint32_t EDID64_RAW_BYTES     = 256;   // ★ v0.9.23：块 0 + 块 1（CEA-861）
 static const uint32_t EDID64_DESC_OFF      = 54;    // 4 个 18 字节描述符的起点
 static const uint32_t EDID64_DESC_SIZE     = 18;
 
 static Edid64  g_edid;          // 解析结果（静态存储；valid = false 表示"不知道"）
-static uint8_t g_raw[EDID64_BLOCK_BYTES];  // 第一块原始字节（仅有效时保留，供独立复核）
+static uint8_t g_raw[EDID64_RAW_BYTES];    // 块 0(+块 1) 原始字节（仅有效时保留，供独立复核/扩展块解析）
+static uint32_t g_raw_len = 0;             // 实读字节数：128 = 只有块 0；256 = 块 1 校验也过
 static bool    g_have_raw = false;
 static bool    g_inited   = false;
 // ★ v0.9.22：显示器支持的模式列表（首选在前；全部来自 EDID 文本）
 static Edid64Mode g_modes[EDID64_MODE_MAX];
 static int        g_mode_n = 0;
 static bool    g_fw_flag  = false;         // BootInfo.edid_ok（固件是否给了 EDID）
+// ★ v0.9.23：自检里合成 CEA-861 块（块 1）的解析结论 —— 只用于把"解析器真的工作"打成可见证据
+static uint8_t g_st_cea, g_st_vic, g_st_dtd, g_st_hdmi, g_st_il;
 
 // ==================== 无 libc 的最小字符串工具 ====================
 static void e64_strcpy(char* dst, const char* src, int cap) {
@@ -107,6 +113,10 @@ static void e64_parse_dtd(const uint8_t* d, Edid64* o) {
     o->h_sync  = (uint16_t)(d[9] | ((d[11] & 0x30) << 4));
     o->v_front = (uint16_t)((d[10] >> 4) | ((d[11] & 0x0C) << 2));
     o->v_sync  = (uint16_t)((d[10] & 0x0F) | ((d[11] & 0x03) << 4));
+    // ★ v0.9.23：DTD flags（dd[17]）bit7 = 隔行（EDID 1.4 §3.10.2 的 bit7 定义）。
+    //   只记这个位，**不改**下面的算术口径：EDID 的 Vtotal 是"每场行数"，
+    //   所以算出来的刷新率是**场频**（1024x768@87i -> 87.0），不是帧频。
+    o->interlaced = (uint8_t)((d[17] >> 7) & 1u);
 
     uint32_t ht = (uint32_t)o->h_active + o->h_blank;
     uint32_t vt = (uint32_t)o->v_active + o->v_blank;
@@ -135,20 +145,95 @@ static void e64_parse_text(const uint8_t* d, char* out, int cap) {
 }
 
 // 往模式表里加一条（按 w/h 去重，满就丢——有上限，绝不越界）
-static void e64_mode_add(uint16_t w, uint16_t h, uint32_t refresh_x10, uint8_t kind) {
+// 去重键 = (w, h, 隔行)：1920x1080p 与 1920x1080i 是**两个**模式，不能互相顶掉。
+static void e64_mode_add(uint16_t w, uint16_t h, uint32_t refresh_x10, uint8_t kind, uint8_t ilace) {
     if (w < 320u || h < 200u) return;
     for (int i = 0; i < g_mode_n; i++)
-        if (g_modes[i].w == w && g_modes[i].h == h) return;      // 去重：同一分辨率只留第一条（优先 DTD）
+        if (g_modes[i].w == w && g_modes[i].h == h && g_modes[i].interlaced == ilace) return;
     if (g_mode_n >= (int)EDID64_MODE_MAX) return;
     Edid64Mode* m = &g_modes[g_mode_n++];
-    m->w = w; m->h = h; m->refresh_x10 = refresh_x10; m->kind = kind; m->pad = 0;
+    m->w = w; m->h = h; m->refresh_x10 = refresh_x10; m->kind = kind; m->interlaced = ilace;
 }
 
-// 模式列表解析：4 个 DTD + 建立时序（0x23/0x24）+ 标准时序（0x26..0x35）
+// ★ v0.9.23：CEA-861 的 VIC（Video Identification Code）表。
+//   只放**能逐条核对**的 VIC 1..16 与 31..34（CEA-861-F Table 3 的标清/高清常用段）。
+//   表里没有的 VIC 一律不猜分辨率：跳过并计数（[EDID] ext=… skip=<n>）。
+//   注意 1..15 里有一半是隔行/半帧（240p/480i），ilace 位如实标注。
+struct E64Vic { uint8_t vic; uint16_t w, h; uint8_t hz; uint8_t ilace; };
+static const E64Vic E64_VIC[] = {
+    {  1,  640,  480,  60, 0 }, {  2,  720,  480,  60, 0 },
+    {  3,  720,  480,  60, 0 }, {  4, 1280,  720,  60, 0 },
+    {  5, 1920, 1080,  60, 1 }, {  6,  720,  480,  60, 1 },
+    {  7,  720,  480,  60, 1 }, {  8,  720,  240,  60, 0 },
+    {  9,  720,  240,  60, 0 }, { 10, 2880,  480,  60, 1 },
+    { 11, 2880,  480,  60, 1 }, { 12, 2880,  240,  60, 0 },
+    { 13, 2880,  240,  60, 0 }, { 14, 1440,  480,  60, 0 },
+    { 15, 1440,  480,  60, 0 }, { 16, 1920, 1080,  60, 0 },
+    { 31, 1920, 1080,  50, 0 }, { 32, 1920, 1080,  24, 0 },
+    { 33, 1920, 1080,  25, 0 }, { 34, 1920, 1080,  30, 0 },
+};
+#define E64_VIC_N ((int)(sizeof(E64_VIC) / sizeof(E64_VIC[0])))
+
+// CEA-861 扩展块（块 1）。块 1 布局（CEA-861-B 起稳定）：
+//   [0] = 0x02（CEA-861 扩展块标识） [1] = revision [2] = DTD 偏移 d [3] = flags
+//   [4 .. d-1] = data block collection（每块：tag = (b>>5)&7 / len = b&0x1F，随后 len 字节）
+//   [d .. 126] = 扩展块自己的 18B 详细时序（格式与块 0 相同），全 0 填充即止
+//   [127] = 校验和
+// 只解码两件事：tag 2 = Video Data Block（VIC）、tag 3 = Vendor Specific（HDMI OUI）。
+// 其它 tag（音频 / 扬声器分配 / 视频能力 / 颜色深度 …）如实跳过 —— 它们不是"模式"。
+static void e64_parse_cea(const uint8_t* b, Edid64* o) {
+    if (b[0] != 0x02u) return;                       // 不是 CEA-861 扩展块：不猜，直接不认
+    if (o) o->cea_ok = 1;
+    const uint32_t d = b[2];
+    const uint32_t dend = (d >= 4u && d <= 127u) ? d : 4u;
+    uint32_t i = 4u;
+    while (i < dend) {
+        const uint8_t hdr = b[i];
+        const uint32_t tag = ((uint32_t)hdr >> 5) & 7u, len = (uint32_t)hdr & 0x1Fu;
+        i++;
+        if (i + len > 128u) break;                   // 越过块尾：这块坏了，不再往下读
+        if (tag == 2u) {
+            for (uint32_t k = 0; k < len; k++) {
+                const uint8_t vic = (uint8_t)(b[i + k] & 0x7Fu);   // bit7 = "native"，先清掉
+                int f = 0;
+                for (; f < E64_VIC_N; f++) if (E64_VIC[f].vic == vic) break;
+                if (f < E64_VIC_N) {
+                    e64_mode_add(E64_VIC[f].w, E64_VIC[f].h,
+                                 (uint32_t)E64_VIC[f].hz * 10u, 3u, E64_VIC[f].ilace);
+                    if (o && o->vic_used < 255u) o->vic_used++;
+                } else if (o && o->vic_skip < 255u) {
+                    o->vic_skip++;                   // 表里没有：如实计数，不编造分辨率
+                }
+            }
+        } else if (tag == 3u && len >= 3u) {
+            // OUI 是 24 位小端：0x000C03 = HDMI Licensing, LLC
+            if (b[i] == 0x03u && b[i + 1] == 0x0Cu && b[i + 2] == 0x00u && o) o->hdmi = 1;
+        }
+        i += len;
+    }
+    // 扩展块自己的 18B DTD（d 之后）。像素时钟 = 0 或全 0 填充即止。
+    uint32_t k = dend;
+    while (k + EDID64_DESC_SIZE <= 127u) {
+        const uint8_t* dd = b + k;
+        if (dd[0] == 0x00u && dd[1] == 0x00u) break;
+        Edid64 one;
+        e64_reset(&one);
+        e64_parse_dtd(dd, &one);
+        if (one.pclk_khz != 0u && one.h_active != 0u && one.v_active != 0u) {
+            e64_mode_add(one.h_active, one.v_active, one.refresh_x10, 0u, one.interlaced);
+            if (o && o->ext_dtd_n < 255u) o->ext_dtd_n++;
+        }
+        k += EDID64_DESC_SIZE;
+    }
+}
+
+// 模式列表解析：4 个 DTD + 建立时序（0x23/0x24）+ 标准时序（0x26..0x35）+ 块 1（CEA-861）
 // 说明：建立时序按 VESA E-EDID 的表逐位展开（byte 0x25 只有 bit7 = 1152x870@75，其余保留位不解码）；
-//      1024x768@87i 是隔行，本内核不报隔行模式，跳过并留注释。
-static void e64_parse_modes(const uint8_t* d) {
+//      byte 0x24 的 bit3 = 1024x768@87i 是**隔行**，v0.9.23 起保留并标 ilace=1（原来是直接跳过）。
+//      b1 = 块 1 的指针（128B），没有就传 nullptr —— 这条路径绝不去读 0x7680 之外的东西。
+static void e64_parse_modes(const uint8_t* d, const uint8_t* b1, Edid64* o) {
     g_mode_n = 0;
+    if (o) { o->cea_ok = 0; o->hdmi = 0; o->vic_used = 0; o->vic_skip = 0; o->ext_dtd_n = 0; }
     // ① 4 个详细时序描述符（像素时钟 != 0）。第一个就是首选（EDID 1.4 §3.10.3）
     for (uint32_t k = 0; k < 4; k++) {
         const uint8_t* dd = d + EDID64_DESC_OFF + k * EDID64_DESC_SIZE;
@@ -157,7 +242,7 @@ static void e64_parse_modes(const uint8_t* d) {
         e64_reset(&one);
         e64_parse_dtd(dd, &one);
         if (one.pclk_khz == 0u || one.h_active == 0u || one.v_active == 0u) continue;
-        e64_mode_add(one.h_active, one.v_active, one.refresh_x10, 0u);
+        e64_mode_add(one.h_active, one.v_active, one.refresh_x10, 0u, one.interlaced);
     }
     // ② 建立时序：byte 0x23
     {
@@ -166,33 +251,39 @@ static void e64_parse_modes(const uint8_t* d) {
         static const uint16_t ER[8] = { 700, 880, 600, 670, 720, 750, 560, 600 };
         const uint8_t b = d[0x23];
         for (uint32_t i = 0; i < 8; i++)
-            if (b & (uint8_t)(0x80u >> i)) e64_mode_add(EW[i], EH[i], (uint32_t)ER[i], 1u);
+            if (b & (uint8_t)(0x80u >> i)) e64_mode_add(EW[i], EH[i], (uint32_t)ER[i], 1u, 0u);
     }
-    // ③ 建立时序：byte 0x24（bit4 = 1024x768@87i 隔行 -> 跳过）
+    // ③ 建立时序：byte 0x24
+    //    顺序按 E-EDID 的表（bit7 起）：800x600@72 / @75 / 832x624@75 / 保留 /
+    //    1024x768@87i / 1024x768@60 / @70 / @75
+    //    ★ v0.9.23 顺手修了旧表的错位（旧表把 @60 写成 700、@70 写成 750）
     {
-        static const uint16_t EW[8] = { 800, 800, 832, 0, 1024, 1024, 1024, 1280 };
-        static const uint16_t EH[8] = { 600, 600, 624, 0, 768,  768,  768,  1024 };
-        static const uint16_t ER[8] = { 720, 750, 750, 0, 600,  700,  750,  750 };
+        static const uint16_t EW[8] = { 800, 800, 832, 0, 1024, 1024, 1024, 1024 };
+        static const uint16_t EH[8] = { 600, 600, 624, 0, 768,  768,  768,  768  };
+        static const uint16_t ER[8] = { 720, 750, 750, 0, 870,  600,  700,  750  };
+        static const uint8_t  EI[8] = { 0,   0,   0,   0, 1,    0,    0,    0    };
         const uint8_t b = d[0x24];
         for (uint32_t i = 0; i < 8; i++)
-            if (b & (uint8_t)(0x80u >> i)) e64_mode_add(EW[i], EH[i], (uint32_t)ER[i], 1u);
+            if (b & (uint8_t)(0x80u >> i)) e64_mode_add(EW[i], EH[i], (uint32_t)ER[i], 1u, EI[i]);
     }
     // ④ byte 0x25：只有 bit7 = 1152x870@75（其余保留位，不解码）
-    if (d[0x25] & 0x80u) e64_mode_add(1152, 870, 750u, 1u);
+    if (d[0x25] & 0x80u) e64_mode_add(1152, 870, 750u, 1u, 0u);
     // ⑤ 标准时序：8 项 × 2 字节（0x26..0x35）
     //    h = (b1 + 31) * 8；宽高比 0b00=16:10 / 0b01=4:3 / 0b10=5:4 / 0b11=16:9；刷新 = (b2 & 0x3F) + 60
     for (uint32_t i = 0; i < 8; i++) {
-        const uint8_t b1 = d[0x26 + i * 2], b2 = d[0x27 + i * 2];
-        if ((b1 == 0x01 && b2 == 0x01) || b1 == 0x00) continue;   // 0x0101 / 0x00 = 未用
-        const uint32_t hpx = ((uint32_t)b1 + 31u) * 8u;
+        const uint8_t b1x = d[0x26 + i * 2], b2 = d[0x27 + i * 2];
+        if ((b1x == 0x01 && b2 == 0x01) || b1x == 0x00) continue;  // 0x0101 / 0x00 = 未用
+        const uint32_t hpx = ((uint32_t)b1x + 31u) * 8u;
         const uint32_t asp = (uint32_t)(b2 >> 6);
         uint32_t vpx;
         if (asp == 0u)      vpx = hpx * 10u / 16u;                // 16:10
-        else if (asp == 1u) vpx = hpx * 3u / 4u;                  // 4:3
-        else if (asp == 2u) vpx = hpx * 4u / 5u;                  // 5:4
-        else                vpx = hpx * 9u / 16u;                 // 16:9
-        e64_mode_add((uint16_t)hpx, (uint16_t)vpx, (uint32_t)(b2 & 0x3Fu) * 10u + 600u, 2u);
+        else if (asp == 1u) vpx = hpx * 3u / 4u;                   // 4:3
+        else if (asp == 2u) vpx = hpx * 4u / 5u;                   // 5:4
+        else                vpx = hpx * 9u / 16u;                  // 16:9
+        e64_mode_add((uint16_t)hpx, (uint16_t)vpx, (uint32_t)(b2 & 0x3Fu) * 10u + 600u, 2u, 0u);
     }
+    // ⑥ ★ v0.9.23：块 1（CEA-861）—— VIC / HDMI OUI / 扩展 DTD 进同一张模式表
+    if (b1) e64_parse_cea(b1, o);
 }
 
 static void e64_parse_block(const uint8_t* d, Edid64* o) {
@@ -261,7 +352,7 @@ static void e64_parse_block(const uint8_t* d, Edid64* o) {
 
 // 校验 + 解析。返回 1 = 可用（valid = true）；0 = 头部/校验和错，或没有首选时序。
 // quiet = 1 时不打 "bad header/checksum"（自检的**故意坏样本**用例，那行日志留给真数据）。
-static int e64_verify_and_parse(const uint8_t* d, Edid64* o, int quiet) {
+static int e64_verify_and_parse(const uint8_t* d, const uint8_t* b1, Edid64* o, int quiet) {
     int hdr = e64_hdr_ok(d);
     int sum = e64_sum_ok(d);
     if (!hdr || !sum) {
@@ -284,7 +375,7 @@ static int e64_verify_and_parse(const uint8_t* d, Edid64* o, int quiet) {
         }
         return 0;
     }
-    if (!quiet) e64_parse_modes(d);   // ★ v0.9.22：真实模式列表（首选在前）。
+    if (!quiet) e64_parse_modes(d, b1, o);   // ★ v0.9.22/23：真实模式列表（首选在前 + 块 1）。
                                       //   quiet = 1（自检的合成样本）时**绝不**碰全局表 ——
                                       //   否则 boot 期 selftest 会把真实 EDID 的模式列表冲掉。
     o->valid = true;
@@ -307,7 +398,6 @@ void edid64_init64() {
         if (bi->edid_size >= EDID64_BLOCK_BYTES) size = bi->edid_size;
         g_fw_flag = (bi->edid_ok != 0);
     }
-    (void)size;   // 只读前 128 字节（第一块）；扩展块不解析，见 edid64.h 边界 1)
 
     if (!g_fw_flag) {
         // 固件没给 EDID（引导层 edid_ok = 0）：如实降级，一个字都不猜
@@ -317,15 +407,22 @@ void edid64_init64() {
     }
 
     const uint8_t* d = (const uint8_t*)(uintptr_t)addr;
+    // ★ v0.9.23：块 1 只在**引导层写了 256 且校验和通过**时才用（引导层两条路径都会先验校验和，
+    //   这里再独立验一遍：不信任"上层说它好"）。
+    uint32_t raw_len = EDID64_BLOCK_BYTES;
+    if ((uint32_t)size >= EDID64_RAW_BYTES && e64_sum_ok(d + EDID64_BLOCK_BYTES))
+        raw_len = EDID64_RAW_BYTES;
     Edid64 tmp;
     e64_reset(&tmp);
-    if (!e64_verify_and_parse(d, &tmp, 0)) {
+    if (!e64_verify_and_parse(d, (raw_len == EDID64_RAW_BYTES) ? (d + EDID64_BLOCK_BYTES) : nullptr, &tmp, 0)) {
         dbg64_str("[EDID64] present=0 (EDID from firmware unusable)");
         dbg64_nl();
         return;   // g_edid 保持 valid = false；selftest 的 bit 9 会如实报出来
     }
 
-    for (uint32_t i = 0; i < EDID64_BLOCK_BYTES; i++) g_raw[i] = d[i];
+    for (uint32_t i = 0; i < raw_len; i++) g_raw[i] = d[i];
+    for (uint32_t i = raw_len; i < EDID64_RAW_BYTES; i++) g_raw[i] = 0;
+    g_raw_len = raw_len;
     g_have_raw = true;
     tmp.present = true;
     e64_strcpy(tmp.source, "vbios", EDID64_SRC_MAX);
@@ -424,6 +521,32 @@ void edid64_init64() {
     dbg64_str(tmp.source);
     dbg64_nl();
 
+    // ---- ★ v0.9.23：块 1（CEA-861 扩展块）结论 ----
+    //   ext  = EDID 自己报的扩展块个数（d[126]）
+    //   cea  = 1 表示块 1 头字节是 0x02 且已被解析
+    //   vic  = 采纳进模式表的 VIC 条数 / dtd = 扩展块里的详细时序条数
+    //   skip = VIC 表里没有、如实跳过的条数 / blocks = 实读块数（1 或 2）
+    dbg64_str("[EDID] ext=");
+    dbg64_dec((uint64_t)tmp.ext_count);
+    dbg64_str(" cea=");
+    dbg64_dec((uint64_t)tmp.cea_ok);
+    dbg64_str(" vic=");
+    dbg64_dec((uint64_t)tmp.vic_used);
+    dbg64_str(" dtd=");
+    dbg64_dec((uint64_t)tmp.ext_dtd_n);
+    dbg64_str(" hdmi=");
+    dbg64_dec((uint64_t)tmp.hdmi);
+    dbg64_str(" skip=");
+    dbg64_dec((uint64_t)tmp.vic_skip);
+    dbg64_str(" blocks=");
+    dbg64_dec((uint64_t)(g_raw_len / EDID64_BLOCK_BYTES));
+    // b1hdr = 固件实际写在"块 1 缓冲"（addr+128）首字节的内容：0x02 = 真给了 CEA-861 块 1；
+    // 0x00 = 固件没给（或者像 QEMU 的 SeaBIOS vgabios 那样无视 CX 又把块 0 写了一遍，
+    // 那样 addr+128 会变成 00 FF = 块 0 的头）。这是**实测证据**，不是推测。
+    dbg64_str(" b1hdr=");
+    dbg64_hex64((uint64_t)((const uint8_t*)(uintptr_t)addr)[EDID64_BLOCK_BYTES]);
+    dbg64_nl();
+
     // 逐条模式（有上限：模式表本身 <= EDID64_MODE_MAX，防刷屏）
     for (int i = 0; i < g_mode_n; i++) {
         dbg64_str("[EDID] mode i=");
@@ -436,6 +559,8 @@ void edid64_init64() {
         e64_print_refresh(g_modes[i].refresh_x10);
         dbg64_str("Hz kind=");
         dbg64_dec((uint64_t)g_modes[i].kind);
+        dbg64_str(" ilace=");
+        dbg64_dec((uint64_t)g_modes[i].interlaced);
         dbg64_nl();
     }
 }
@@ -448,6 +573,9 @@ const Edid64Mode* edid64_mode_at64(int i) {
     if (i < 0 || i >= g_mode_n) return nullptr;
     return &g_modes[i];
 }
+// ★ v0.9.23：原始字节（块 0，块 1 校验通过时含块 1）。没有有效 EDID 时返回 nullptr。
+const uint8_t* edid64_raw64() { return g_have_raw ? g_raw : nullptr; }
+int edid64_raw_len64() { return g_have_raw ? (int)g_raw_len : 0; }
 
 // ==================== 对外：getter ====================
 const Edid64* edid64_get() {
@@ -530,11 +658,37 @@ static void e64_make_sample(uint8_t* d) {
     uint8_t* u = d + EDID64_DESC_OFF + 3 * EDID64_DESC_SIZE;   // 描述符 3：dummy（必须被忽略）
     u[3] = 0x10;
 
-    d[126] = 1;                                        // 扩展块计数 = 1（只记数字，不解析）
+    d[126] = 1;                                        // 扩展块计数 = 1（块 1 = 下面的合成 CEA-861）
 
     uint32_t s = 0;
     for (uint32_t i = 0; i < EDID64_BLOCK_BYTES - 1; i++) s += d[i];
     d[127] = (uint8_t)((0x100u - (s & 0xFFu)) & 0xFFu);   // 校验和：和 == 0 mod 256
+}
+
+// ★ v0.9.23：合成的 CEA-861 扩展块（128B）。用来离线自证块 1 的解析：
+//   [0]=0x02 / [2]=13（DTD 偏移）/ data block: tag2 len2 {VIC 4, 16} + tag3 len5 {HDMI OUI}
+//   扩展 DTD（偏移 13）= 1920x1080@60 **隔行**（flags bit7 = 1）。
+static void e64_make_cea(uint8_t* b) {
+    for (uint32_t i = 0; i < EDID64_BLOCK_BYTES; i++) b[i] = 0x00;
+    b[0] = 0x02;                                   // CEA-861 扩展块标识
+    b[1] = 3;                                      // revision 3
+    b[2] = 13;                                     // DTD offset = 4 + 9（两个 data block 共 9 字节）
+    b[3] = 0x00;
+    b[4] = 0x42; b[5] = 4;  b[6] = 16;             // Video Data Block：VIC 4（720p60）/ 16（1080p60）
+    b[7] = 0x65;                                   // Vendor Specific，len 5
+    b[8] = 0x03; b[9] = 0x0C; b[10] = 0x00;        // OUI = 0x000C03（HDMI Licensing）
+    b[11] = 0x00; b[12] = 0x00;
+    uint8_t* t = b + 13;                           // 扩展 DTD：1920x1080@60 隔行
+    t[0] = 0x25; t[1] = 0x1D;                      // 7425 * 10 kHz = 74.25 MHz
+    t[2] = (uint8_t)(1920 & 0xFF); t[3] = (uint8_t)(280 & 0xFF);
+    t[4] = (uint8_t)((((1920 >> 8) & 0x0F) << 4) | ((280 >> 8) & 0x0F));
+    t[5] = (uint8_t)(1080 & 0xFF); t[6] = (uint8_t)(45 & 0xFF);
+    t[7] = (uint8_t)((((1080 >> 8) & 0x0F) << 4) | ((45 >> 8) & 0x0F));
+    t[8] = 88; t[9] = 44; t[10] = (uint8_t)((3 << 4) | 5); t[11] = 0;
+    t[17] = 0x9E;                                  // bit7 = 隔行（+ 数字分离同步，与块 0 样本同口径）
+    uint32_t s = 0;
+    for (uint32_t i = 0; i < EDID64_BLOCK_BYTES - 1; i++) s += b[i];
+    b[127] = (uint8_t)((0x100u - (s & 0xFFu)) & 0xFFu);
 }
 
 int edid64_selftest64() {
@@ -552,15 +706,40 @@ int edid64_selftest64() {
         Edid64Mode sv[EDID64_MODE_MAX];
         const int svn = g_mode_n;
         for (int i = 0; i < svn; i++) sv[i] = g_modes[i];
-        e64_parse_modes(syn);
-        if (g_mode_n < 1) mask |= 1 << 10;              // 新位：模式列表一条都没解析出来
+        uint8_t ext[EDID64_BLOCK_BYTES];
+        e64_make_cea(ext);
+        Edid64 ce;
+        e64_reset(&ce);
+        e64_parse_modes(syn, ext, &ce);
+        if (g_mode_n < 1) mask |= 1 << 10;              // 模式列表一条都没解析出来
+        // bit 11：块 1（CEA-861）解析 —— cea 标识 / HDMI OUI / 两个 VIC / 一条扩展 DTD / VIC 4 = 720p
+        if (ce.cea_ok != 1 || ce.hdmi != 1 || ce.vic_used != 2 || ce.ext_dtd_n != 1) {
+            mask |= 1 << 11;
+        } else {
+            int have720 = 0;
+            for (int i = 0; i < g_mode_n; i++)
+                if (g_modes[i].w == 1280u && g_modes[i].h == 720u && g_modes[i].kind == 3u) have720 = 1;
+            if (!have720) mask |= 1 << 11;
+        }
+        // bit 12：隔行位 —— 1920x1080i（扩展 DTD）与 1920x1080p（块 0 首选）必须各自留一条
+        {
+            int have_p = 0, have_i = 0;
+            for (int i = 0; i < g_mode_n; i++) {
+                if (g_modes[i].w != 1920u || g_modes[i].h != 1080u) continue;
+                if (g_modes[i].interlaced) have_i = 1; else have_p = 1;
+            }
+            if (!have_p || !have_i) mask |= 1 << 12;
+        }
+        g_st_cea = ce.cea_ok; g_st_vic = ce.vic_used; g_st_dtd = ce.ext_dtd_n; g_st_hdmi = ce.hdmi;
+        g_st_il = 0;
+        for (int i = 0; i < g_mode_n; i++) if (g_modes[i].interlaced) g_st_il = 1;
         for (int i = 0; i < svn; i++) g_modes[i] = sv[i];
         g_mode_n = svn;
     }
 
     Edid64 t;
     e64_reset(&t);
-    if (!e64_verify_and_parse(syn, &t, 1)) {
+    if (!e64_verify_and_parse(syn, nullptr, &t, 1)) {
         mask |= 1 << 0;
     } else {
         if (e64_strcmp(t.mfg, "VMT") != 0) mask |= 1 << 1;
@@ -579,10 +758,10 @@ int edid64_selftest64() {
 
     Edid64 b1;
     e64_reset(&b1);
-    if (e64_verify_and_parse(bad_sum, &b1, 1)) mask |= 1 << 7;   // 坏校验和必须被拒
+    if (e64_verify_and_parse(bad_sum, nullptr, &b1, 1)) mask |= 1 << 7;   // 坏校验和必须被拒
     Edid64 b2;
     e64_reset(&b2);
-    if (e64_verify_and_parse(bad_hdr, &b2, 1)) mask |= 1 << 8;   // 坏头部必须被拒
+    if (e64_verify_and_parse(bad_hdr, nullptr, &b2, 1)) mask |= 1 << 8;   // 坏头部必须被拒
 
     if (g_fw_flag && !g_edid.valid) mask |= 1 << 9;              // 固件给了 EDID 但我们验证不过
 
@@ -595,6 +774,18 @@ int edid64_selftest64() {
     }
     // 没有 EDID（present = 0）**不算失败**：解析逻辑由上面的合成样本自证。
 
+    // 合成块 1（CEA-861）的解析结论 —— 块 1 解析器是否真的工作，看这行
+    dbg64_str("[EDID64] selftest ext synthetic cea=");
+    dbg64_dec((uint64_t)g_st_cea);
+    dbg64_str(" vic=");
+    dbg64_dec((uint64_t)g_st_vic);
+    dbg64_str(" dtd=");
+    dbg64_dec((uint64_t)g_st_dtd);
+    dbg64_str(" hdmi=");
+    dbg64_dec((uint64_t)g_st_hdmi);
+    dbg64_str(" ilace=");
+    dbg64_dec((uint64_t)g_st_il);
+    dbg64_nl();
     if (mask == 0) {
         dbg64_str("[EDID64] selftest PASS");
         dbg64_nl();
