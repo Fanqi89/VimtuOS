@@ -1631,6 +1631,225 @@ static int decode_bmp_fit64(const uint8_t* d, int len, int max_side, Img64* out)
     return 0;
 }
 
+
+// ==================== ★ v0.9.27：GIF（**首帧静态**解码）====================
+// 边界（如实，别误会成"动图支持"）：
+//   * **只解首帧**并静态显示；后续帧不解（`[IMG64] selftest gif` 里如实写 frames=1(first)），
+//     不做动画播放、不做 disposal 合成。
+//   * 支持：GIF87a/GIF89a、全局色表、局部色表、透明色索引、隔行（interlace）、
+//     LZW 数据跨子块连续读、Clear 码重置码表。
+//   * 不支持：动画、交错帧合成、超大图（逻辑屏 > 4096x4096 直接拒）。
+// 为什么值得加：设置页原来对 .gif **明确拒绝**（"GIF 未实现（支持 PNG/JPEG/BMP）"），
+//   而用户自带的头像/壁纸里 GIF 很常见；这里补上"能显示第一帧"这个真实需求。
+static int g_gif_frames = 0;      // 已解帧数（本实现恒 1，打点如实标注）
+static int g_gif_transp = -1;     // 透明色索引（-1 = 无）
+
+struct GifRd64 { const uint8_t* d; int n; int p; };
+static int gif_u8(GifRd64* r) { return (r->p < r->n) ? (int)r->d[r->p++] : -1; }
+static int gif_u16(GifRd64* r) {
+    const int a = gif_u8(r), b = gif_u8(r);
+    return (a < 0 || b < 0) ? -1 : (a | (b << 8));
+}
+// 跳过一个"子块链"（[size][data]... [0]）
+static int gif_skip_sub(GifRd64* r) {
+    for (;;) {
+        const int n = gif_u8(r);
+        if (n < 0) return -1;
+        if (n == 0) return 0;
+        if (r->p + n > r->n) return -1;
+        r->p += n;
+    }
+}
+// LZW 数据是"跨子块"的连续字节流：GifSub64 负责在子块之间自动接续
+struct GifSub64 { GifRd64* r; int left; };
+static int gsub_init(GifSub64* s, GifRd64* r) {
+    s->r = r;
+    s->left = gif_u8(r);
+    return (s->left < 0) ? -1 : 0;
+}
+static int gsub_next(GifSub64* s) {
+    while (s->left == 0) {
+        const int n = gif_u8(s->r);
+        if (n <= 0) return -1;
+        s->left = n;
+    }
+    if (s->r->p >= s->r->n) return -1;
+    s->left--;
+    return (int)s->r->d[s->r->p++];
+}
+// GIF 变体 LZW：码长从 min_code+1 起，clear = 1<<min_code，eoi = clear+1；
+// 码表满 4096 就不再增长；遇到 clear 重置。输出是**索引流**（不是颜色）。
+static int gif_lzw64(GifSub64* s, int min_code, uint8_t* out, int out_max, int* out_len) {
+    static uint16_t prefix[4096];
+    static uint8_t  suffix[4096];
+    static uint8_t  stack[4096];
+    *out_len = 0;
+    if (min_code < 2 || min_code > 11) return -3;
+    const int clear = 1 << min_code, eoi = clear + 1;
+    int avail = eoi + 1, code_size = min_code + 1;
+    int old = -1, first = 0, oi = 0;
+    uint32_t buf = 0;
+    int bits = 0;
+    for (int i = 0; i < clear; i++) { prefix[i] = 0xFFFFu; suffix[i] = (uint8_t)i; }
+    for (;;) {
+        while (bits < code_size) {
+            const int b = gsub_next(s);
+            if (b < 0) { *out_len = oi; return 0; }        // 数据提前结束：按已解的算（宽进）
+            buf |= (uint32_t)b << bits;
+            bits += 8;
+        }
+        const int code = (int)(buf & (uint32_t)((1 << code_size) - 1));
+        buf >>= code_size;
+        bits -= code_size;
+        if (code == clear) { avail = eoi + 1; code_size = min_code + 1; old = -1; continue; }
+        if (code == eoi) break;
+        int sp = 0;
+        if (old < 0) {
+            if (code >= clear) return -3;
+            stack[sp++] = suffix[code];
+            first = code;
+        } else {
+            int c = code;
+            if (code >= avail) {
+                if (code != avail) return -3;               // 比"下一个可用"还大 = 坏码
+                stack[sp++] = (uint8_t)first;               // KwKwK 情形
+                c = old;
+            }
+            int guard = 0;
+            while (c >= clear) {
+                stack[sp++] = suffix[c];
+                c = prefix[c];
+                if (sp >= 4095 || ++guard > 4096) return -3;
+            }
+            first = suffix[c];
+            stack[sp++] = (uint8_t)first;
+            if (avail < 4096) {
+                prefix[avail] = (uint16_t)old;
+                suffix[avail] = (uint8_t)first;
+                avail++;
+                if (avail == (1 << code_size) && code_size < 12) code_size++;
+            }
+        }
+        old = code;
+        while (sp > 0) {
+            if (oi >= out_max) return -3;
+            out[oi++] = stack[--sp];
+        }
+    }
+    *out_len = oi;
+    return 0;
+}
+// 色表索引 -> 0xAARRGGBB。透明索引给 0（alpha = 0）；壁纸铺图会丢 alpha（掩码 0x00FFFFFF），
+// 所以"透明区在壁纸里显示成黑"是如实结果，不是 bug。
+static uint32_t gif_rgb64(const uint8_t* pal, int n, int idx) {
+    if (!pal || idx < 0 || idx >= n) return 0xFF000000u;
+    return 0xFF000000u | ((uint32_t)pal[idx * 3] << 16) | ((uint32_t)pal[idx * 3 + 1] << 8) |
+           (uint32_t)pal[idx * 3 + 2];
+}
+static int decode_gif64(const uint8_t* d, int len, Img64* out) {
+    g_fmt = "gif";
+    g_gif_frames = 0;
+    g_gif_transp = -1;
+    if (len < 14) return -3;
+    if (!(d[0] == 'G' && d[1] == 'I' && d[2] == 'F' && d[3] == '8' &&
+          (d[4] == '7' || d[4] == '9') && d[5] == 'a')) return -3;
+    const int sw = d[6] | (d[7] << 8);
+    const int sh = d[8] | (d[9] << 8);
+    if (sw <= 0 || sh <= 0 || sw > 4096 || sh > 4096) { g_err = "gif size"; return -3; }
+    const int packed = d[10];
+    GifRd64 r{d, len, 13};
+    const uint8_t* gct = nullptr;
+    int gct_n = 0;
+    if (packed & 0x80) {
+        gct_n = 1 << ((packed & 0x07) + 1);
+        if (r.p + gct_n * 3 > len) return -3;
+        gct = d + r.p;
+        r.p += gct_n * 3;
+    }
+    uint32_t* px = (uint32_t*)kmalloc_64((uint64_t)sw * (uint64_t)sh * 4u);
+    if (!px) { g_err = "oom"; return -4; }
+    const uint32_t bgc = gct ? gif_rgb64(gct, gct_n, d[11]) : 0xFF000000u;
+    for (int64_t i = 0; i < (int64_t)sw * (int64_t)sh; i++) px[i] = bgc;
+
+    while (r.p < len) {
+        const int blk = gif_u8(&r);
+        if (blk < 0 || blk == 0x3B) break;                       // trailer / 结束
+        if (blk == 0x21) {                                       // ---- 扩展块 ----
+            const int label = gif_u8(&r);
+            if (label < 0) break;
+            if (label == 0xF9) {                                 // 图形控制：透明索引
+                const int bs = gif_u8(&r);
+                if (bs < 4 || r.p + bs + 1 > len) break;
+                const int fl = d[r.p];
+                g_gif_transp = (fl & 0x01) ? (int)d[r.p + 3] : -1;
+                r.p += bs;
+                (void)gif_u8(&r);                                // 终止符 0
+            } else if (gif_skip_sub(&r) != 0) break;
+            continue;
+        }
+        if (blk != 0x2C) break;                                  // ---- 图像描述符 ----
+        const int ix = gif_u16(&r), iy = gif_u16(&r);
+        const int iw = gif_u16(&r), ih = gif_u16(&r);
+        const int ip = gif_u8(&r);
+        if (ix < 0 || iy < 0 || iw <= 0 || ih <= 0 || ip < 0) break;
+        const uint8_t* pal = gct;
+        int pal_n = gct_n;
+        if (ip & 0x80) {                                         // 局部色表覆盖全局
+            const int ln = 1 << ((ip & 0x07) + 1);
+            if (r.p + ln * 3 > len) break;
+            pal = d + r.p;
+            pal_n = ln;
+            r.p += ln * 3;
+        }
+        const int minc = gif_u8(&r);
+        if (minc < 0) break;
+        // 单帧索引缓冲**按需分配**（最初写成静态数组是错的：只够 512x512，壁纸一进来就拒）。
+        // 上限 4M 像素（1920x1080 = 2.07M，够桌面用）：此时索引 need B + 像素 4*need B ≈ 20 MB，
+        // 内核堆 48 MiB 放得下；超限或 OOM 一律如实失败（不假装成功）。
+        const int64_t need = (int64_t)iw * (int64_t)ih;
+        if (need <= 0 || need > 4LL * 1024 * 1024) {
+            img64_free64(out); g_err = "gif frame too big"; return -3;
+        }
+        uint8_t* idx = (uint8_t*)kmalloc_64((uint64_t)need);
+        if (!idx) { img64_free64(out); g_err = "oom idx"; return -4; }
+        GifSub64 sub;
+        int got = 0;
+        if (gsub_init(&sub, &r) != 0) { kfree_64(idx); img64_free64(out); g_err = "gif sub"; return -3; }
+        const int lrc = gif_lzw64(&sub, minc, idx, (int)need, &got);
+        if (lrc != 0) { kfree_64(idx); img64_free64(out); g_err = "gif lzw"; return -3; }
+        // ---- 把索引流铺进像素缓冲（隔行：行序 0,8.. -> 4,12.. -> 2,6.. -> 1,3..）----
+        static const int kIlStep[4] = { 8, 8, 4, 2 };
+        static const int kIlStart[4] = { 0, 4, 2, 1 };
+        int pass = 0, yrow = 0, si = 0;
+        const bool ilace = (ip & 0x40) != 0;
+        for (int y = 0; y < ih && si < got; y++) {
+            if (ilace && pass >= 4) break;
+            const int ty = ilace ? yrow : y;
+            for (int x = 0; x < iw; x++) {
+                if (si >= got) break;
+                const int v = idx[si++];
+                const int64_t gx = (int64_t)ix + x, gy = (int64_t)ty + iy;
+                if (gx >= 0 && gy >= 0 && gx < sw && gy < sh) {
+                    px[gy * sw + gx] = (v == g_gif_transp) ? 0u : gif_rgb64(pal, pal_n, v);
+                }
+            }
+            if (ilace) {
+                yrow += kIlStep[pass];
+                while (pass < 4 && yrow >= ih) { pass++; if (pass < 4) yrow = kIlStart[pass]; }
+            }
+        }
+        kfree_64(idx);
+        g_gif_frames = 1;                                        // 首帧已解；后续帧不再解（如实）
+        break;                                                   // ★ 只取首帧
+    }
+    if (g_gif_frames == 0) { img64_free64(out); g_err = "gif no frame"; return -3; }
+    out->px = px;
+    out->w = sw;
+    out->h = sh;
+    out->owned = 1;
+    return 0;
+}
+
 // ==================== ★ v0.5.17：任意分辨率解码入口 ====================
 // max_side > 0：结果的最长边 <= max_side（用**解码期抽样**，内存只跟目标尺寸有关）。
 // max_side == 0：等价于 img64_decode64（全尺寸，仍守各格式原有上限）。
@@ -1642,6 +1861,26 @@ int img64_decode_fit64(const void* data, int len, int max_side, Img64* out) {
         return decode_png_fit64(d, len, max_side, out);
     if (d[0] == 'B' && d[1] == 'M')
         return decode_bmp_fit64(d, len, max_side, out);
+    if (d[0] == 'G' && d[1] == 'I' && d[2] == 'F') {
+        // GIF 没有"解码期抽样"（LZW 必须整帧解开），所以先全解再收尾缩放 —— 与 JPEG 的
+        // 收尾那条同一个套路；尺寸上限在 decode_gif64 里（4096x4096 逻辑屏）。
+        const int grc = decode_gif64(d, len, out);
+        if (grc != 0) return grc;
+        if (max_side > 0 && (out->w > max_side || out->h > max_side)) {
+            const int mx = (out->w > out->h) ? out->w : out->h;
+            const int tw = (int)((int64_t)out->w * max_side / mx);
+            const int th = (int)((int64_t)out->h * max_side / mx);
+            uint32_t* dst = (uint32_t*)kmalloc_64((uint64_t)tw * (uint64_t)th * 4);
+            if (!dst) { img64_free64(out); g_err = "oom scale"; return -4; }
+            img64_scale64(out, dst, tw, th);
+            img64_free64(out);
+            out->px = dst;
+            out->w = tw;
+            out->h = th;
+            out->owned = 1;
+        }
+        return 0;
+    }
     if (d[0] == 0xFF && d[1] == 0xD8) {
         int w = 0, h = 0;
         int decim = 1;
@@ -1744,6 +1983,7 @@ int img64_decode64(const void* data, int len, Img64* out) {
     if (d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G') rc = decode_png64(d, len, out);
     else if (d[0] == 'B' && d[1] == 'M') rc = decode_bmp64(d, len, out);
     else if (d[0] == 0xFF && d[1] == 0xD8) rc = decode_jpeg64(d, len, out, 1);
+    else if (d[0] == 'G' && d[1] == 'I' && d[2] == 'F') rc = decode_gif64(d, len, out);   // ★ v0.9.27
     else {
         g_err = "unknown format";
         rc = -2;
@@ -2014,6 +2254,44 @@ static const uint8_t kTestPng[112] = {
 };
 // 期望像素（RGB 顺序，row-major）：红 绿 蓝 黄 / 青 品 白 黑 / (128,64,32) (32,64,128) (200,200,200) (10,20,30)
 //                              / (255,128,0) (0,128,255) (90,90,90) (240,240,240)
+static const uint8_t kTestGif1[] = {
+    0x47, 0x49, 0x46, 0x38, 0x37, 0x61, 0x04, 0x00, 0x04, 0x00, 0x81, 0x00,
+    0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+    0xFF, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0x00, 0x08,
+    0x0F, 0x00, 0x01, 0x04, 0x10, 0x30, 0x60, 0xE0, 0x00, 0x00, 0x04, 0x05,
+    0x1E, 0x1C, 0x18, 0x10, 0x00, 0x3B,
+};
+
+static const uint8_t kTestGif2[] = {
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x10, 0x00, 0x10, 0x00, 0x81, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xFF, 0x80, 0x00, 0x00, 0x80, 0xFF, 0x00, 0x00,
+    0x00, 0x21, 0xFF, 0x0B, 0x4E, 0x45, 0x54, 0x53, 0x43, 0x41, 0x50, 0x45,
+    0x32, 0x2E, 0x30, 0x03, 0x01, 0x00, 0x00, 0x00, 0x21, 0xF9, 0x04, 0x01,
+    0x0A, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10,
+    0x00, 0x00, 0x08, 0x45, 0x00, 0x01, 0x08, 0x04, 0x10, 0xA0, 0xA0, 0xC1,
+    0x82, 0x03, 0x13, 0x12, 0x3C, 0x68, 0x50, 0xE1, 0x40, 0x86, 0x0D, 0x1D,
+    0x2E, 0x84, 0x98, 0x10, 0x22, 0xC2, 0x87, 0x16, 0x0F, 0x56, 0xCC, 0x18,
+    0x51, 0x20, 0xC7, 0x8E, 0x13, 0x03, 0x08, 0x18, 0x29, 0x20, 0x21, 0xC9,
+    0x93, 0x28, 0x4D, 0xA2, 0x5C, 0xA9, 0x72, 0xE5, 0xC9, 0x96, 0x29, 0x07,
+    0xBA, 0x2C, 0x29, 0x71, 0xA6, 0x44, 0x00, 0x36, 0x6B, 0xBA, 0x4C, 0x18,
+    0x10, 0x00, 0x21, 0xF9, 0x04, 0x01, 0x0A, 0x00, 0x01, 0x00, 0x2C, 0x00,
+    0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00, 0x81, 0xFF, 0x80, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x34, 0x00, 0x01,
+    0x08, 0x04, 0x10, 0xA0, 0xA0, 0xC1, 0x82, 0x03, 0x13, 0x12, 0x3C, 0x68,
+    0x50, 0xE1, 0x40, 0x86, 0x0D, 0x1D, 0x2E, 0x84, 0x98, 0x10, 0x22, 0xC2,
+    0x87, 0x16, 0x0F, 0x56, 0xCC, 0x18, 0x51, 0x20, 0xC7, 0x8E, 0x13, 0x03,
+    0x48, 0x1C, 0x49, 0xB2, 0xA4, 0xC9, 0x93, 0x28, 0x53, 0xAA, 0x5C, 0x89,
+    0x32, 0x20, 0x00, 0x3B,
+};
+
+// 宿主真值（Pillow 读同一份文件得到的首帧像素，0xRRGGBB）
+static const uint32_t kTestGif1Pix[16] = {
+    0xFF0000, 0x00FF00, 0x0000FF, 0xFFFFFF,
+    0x00FF00, 0x0000FF, 0xFFFFFF, 0xFF0000,
+    0x0000FF, 0xFFFFFF, 0xFF0000, 0x00FF00,
+    0xFFFFFF, 0xFF0000, 0x00FF00, 0x0000FF,
+};
+
 static const uint32_t kTestPix[16] = {
     0x00FF0000, 0x0000FF00, 0x000000FF, 0x00FFFF00,
     0x0000FFFF, 0x00FF00FF, 0x00FFFFFF, 0x00000000,
@@ -2106,6 +2384,52 @@ int img64_selftest64() {
     dbg64_line_end64();
     img64_free64(&real);
     img64_free64(&im);
+    // ---- ★ v0.9.27：GIF 自检（bit8 = 256）----
+    //   两个**真 GIF**（宿主 Pillow 编码，本文件里的字节数组就是那两份文件的原样字节）：
+    //   ① g1 = 4x4 四色单帧：逐像素必须等于 kTestGif1Pix（宿主 Pillow 读同一份文件得到的真值）；
+    //   ② g2 = 16x16 带**透明色索引** + **隔行** + 两帧：首帧尺寸必须 16x16，
+    //      且透明格必须是 alpha=0（本实现的透明标记），不透明格必须是色表里的两种颜色之一。
+    {
+        int gfails = 0;
+        Img64 g1{};
+        const int rc1 = img64_decode64(kTestGif1, (int)sizeof(kTestGif1), &g1);
+        if (rc1 != 0 || g1.w != 4 || g1.h != 4) gfails |= 1;
+        else for (int i = 0; i < 16; i++) {
+            if ((g1.px[i] & 0x00FFFFFFu) != kTestGif1Pix[i]) { gfails |= 2; break; }
+        }
+        Img64 g2{};
+        const int rc2 = img64_decode64(kTestGif2, (int)sizeof(kTestGif2), &g2);
+        if (rc2 != 0 || g2.w != 16 || g2.h != 16) gfails |= 4;
+        else {
+            int transp = 0, opaque = 0;
+            for (int i = 0; i < 256; i++) {
+                if (g2.px[i] == 0u) transp++;
+                else if (g2.px[i] == 0xFFFF8000u || g2.px[i] == 0xFF0080FFu) opaque++;
+                else { gfails |= 8; break; }                 // 既不是透明也不是两种色表色 = 解码错
+            }
+            if (transp == 0 || opaque == 0) gfails |= 16;     // 透明与不透明都必须真的出现过
+        }
+        if (gfails) fails |= 256;
+        dbg64_line_begin64();
+        dbg64_str("[IMG64] selftest gif ok=");
+        dbg64_dec((uint64_t)(gfails == 0 ? 1 : 0));
+        dbg64_str(" g1=");
+        dbg64_dec((uint64_t)g1.w);
+        dbg64_str("x");
+        dbg64_dec((uint64_t)g1.h);
+        dbg64_str(" g2=");
+        dbg64_dec((uint64_t)g2.w);
+        dbg64_str("x");
+        dbg64_dec((uint64_t)g2.h);
+        dbg64_str(" frames=1(first-only) transp=");
+        dbg64_dec((uint64_t)(g_gif_transp < 0 ? 0 : g_gif_transp));
+        dbg64_str(" mask=");
+        dbg64_dec((uint64_t)gfails);
+        dbg64_nl();
+        dbg64_line_end64();
+        img64_free64(&g1);
+        img64_free64(&g2);
+    }
     // ★ 本批新增：卷内 JPEG 验收自检（/jpegtest/jNN.jpg；没有这些文件时只打一行 skip，不影响普通启动）
     {
         const int jfail = jpg64_selftest_volume64();

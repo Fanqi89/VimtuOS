@@ -1018,21 +1018,10 @@ static int avatar_apply(const char* src, bool from_file) {
     path[i] = 0;
     const User64Entry* cu = cur_user();
     const char* name = cu ? cu->name : "-";
-    // ★ v0.5.8：JPEG **放行** —— img64 的 decode_jpeg64 早已实现（渐进式/420/422/444 子采样，
-    //   有 tests/jpeg64_test.py 守着），这条"jpeg/gif not implemented (png/bmp only)"是**过时**的
-    //   拒绝分支：用户自己提供头像/壁纸绝大多数是 jpg，被它挡在门外。只留 GIF 明确拒绝。
-    if (from_file && s_ends_ci(path, ".gif")) {
-        dbg64_line_begin64();
-        dbg64_str("[USER64] avatar FAIL user="); dbg64_str(name);
-        dbg64_str(" src="); dbg64_str(path);
-        dbg64_str(" reason=gif not implemented");
-        dbg64_nl();
-        dbg64_line_end64();
-        msg_set(gui64_lang_zh() ? "GIF 未实现（支持 PNG/JPEG/BMP）"
-                                : "GIF not implemented (PNG/JPEG/BMP supported)",
-                tk64()->accent2);
-        return 0;
-    }
+    // ★ v0.5.8：JPEG **放行**（img64 的 decode_jpeg64 早已实现）。
+    // ★ v0.9.27：**GIF 也放行** —— img64 新增 decode_gif64（GIF87a/89a、全局/局部色表、透明色、
+    //   隔行都支持，但**只解首帧**：动图取第一帧静态显示，不做动画）。原来这里对 .gif 一律拒绝，
+    //   而用户自带的头像里 GIF 很常见；现在交给 img64 按真实内容判（解码失败仍会如实报錯）。
     int w = 0, h = 0;
     if (from_file) {
         Img64 im{};
@@ -1276,7 +1265,8 @@ static void wall_grad_toggle(int on) {
 }
 // 返回 1 = 真的换了壁纸并持久化；0 = 没换（原因已打点 + 界面给提示）。
 // ★ v0.5.16 修复：这里原来有 `if (s_ends_ci(p,".jpg")||".jpeg"||".gif") -> ok=0
-//   reason=jpeg/gif not implemented (img64: png/bmp only)` —— 那是 **v0.5.8 之前的过时闸门**：
+//   reason=jpeg/gif not implemented (img64: png/bmp only)` —— 那是 **v0.5.8 之前的过时闸门**
+//   （★ v0.9.27：GIF 也已支持 —— img64 的 decode_gif64 取首帧；此处只是历史记录）：
 //   img64 的 decode_jpeg64 早就实现了（baseline SOF0/SOF1，4:4:4/4:2:2/4:2:0），头像那条路
 //   （avatar_apply）当初已经放开，**唯独壁纸这条路把它留下了**。后果：/Wallpapers 里只要
 //   有一张 jpg，点"预设壁纸"就永远失败（而且失败后不前进 -> 按钮看着像死的）。
@@ -1294,23 +1284,16 @@ static int wall_set_path(const char* path) {
         gui64_invalidate();
         return 1;
     }
-    // 只留 GIF 明确拒绝（img64 没有 GIF 解码器）；PNG/JPEG/BMP 一律交给 img64 判。
-    if (s_ends_ci(p, ".gif")) {
-        dbg64_str("[SET64] wall path="); dbg64_str(p);
-        dbg64_str(" ok=0 reason=gif not implemented (img64: png/jpeg/bmp)\n");
-        msg_set(gui64_lang_zh() ? "GIF 未实现（支持 PNG/JPEG/BMP）"
-                                : "GIF not implemented (PNG/JPEG/BMP)",
-                tk64()->accent2);
-        return 0;
-    }
+    // ★ v0.9.27：PNG/JPEG/BMP/**GIF** 一律交给 img64 判（GIF 取首帧静态显示，不做动画）。
+    //   到 v0.9.26 为止这里对 .gif 直接拒绝，理由（"img64 没有 GIF 解码器"）已经不成立了。
     Img64 im{};
     // ★ v0.5.17：解码期缩放到 2048（桌面只用到屏幕尺寸）——任意分辨率都能当壁纸
     if (img64_load_vfs_fit64(p, 2048, &im) != 0) {
         dbg64_str("[SET64] wall path="); dbg64_str(p);
         dbg64_str(" ok=0 reason="); dbg64_str(img64_last_err64());
         dbg64_nl();
-        msg_set(gui64_lang_zh() ? "壁纸读取失败：路径不存在 / 格式不支持（支持 PNG/JPEG/BMP；上限 16384px、32MP、单文件 24MB）"
-                                : "wallpaper load failed (png/jpeg/bmp; max 16384px / 32MP / 24MB)", tk64()->accent2);
+        msg_set(gui64_lang_zh() ? "壁纸读取失败：路径不存在 / 格式不支持（支持 PNG/JPEG/BMP/GIF；上限 16384px、32MP、单文件 24MB）"
+                                : "wallpaper load failed (png/jpeg/bmp/gif; max 16384px / 32MP / 24MB)", tk64()->accent2);
         return 0;
     }
     const int w = im.w, h = im.h;
@@ -1902,8 +1885,8 @@ static void page_wall(const Lay* L, int x0, int y0) {
         // 路径输入框 + 应用
         int rx = 0;
         row_label(L, ry, zh ? "图片路径" : "Image path",
-                  zh ? "PNG / JPEG / BMP（VimtuFS2 路径；GIF 未实现）"
-                     : "PNG / JPEG / BMP (GIF not implemented)", &rx);
+                  zh ? "PNG / JPEG / BMP / GIF（VimtuFS2 路径；GIF 取首帧）"
+                     : "PNG / JPEG / BMP / GIF (GIF: first frame only)", &rx);
         const int fh = 32, fw = 300;
         const int fx = rx - 120 - 10 - fw;
         const int fy = ry + (L->row_h - fh) / 2;
@@ -2426,8 +2409,8 @@ static void page_avatar(const Lay* L, int x0, int y0) {
     {
         int rx = 0;
         row_label(L, ry, zh ? "本地图片路径" : "Local image path",
-                  zh ? "PNG / JPEG / BMP（VimtuFS2 路径；GIF 未实现）"
-                     : "PNG / JPEG / BMP (GIF not implemented)", &rx);
+                  zh ? "PNG / JPEG / BMP / GIF（VimtuFS2 路径；GIF 取首帧）"
+                     : "PNG / JPEG / BMP / GIF (GIF: first frame only)", &rx);
         const int fh = 32, fw = 300;
         const int fx = rx - 240 - 10 - fw;
         const int fy = ry + (L->row_h - fh) / 2;

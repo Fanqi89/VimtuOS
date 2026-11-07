@@ -3343,6 +3343,37 @@ def cap_cdrom_iso9660():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_gif_decode():
+    """★ v0.9.27「GIF 解码（首帧静态）」：文件系统能力清单里明确列出的"GIF 不支持"。
+
+    到 v0.9.26：img64 只有 PNG/JPEG/BMP，且 settings64 的头像与壁纸两条路**明确拒绝** .gif
+    （`reason=gif not implemented`）。本批补 decode_gif64 并放开设置页两条路。
+    """
+    need = ["kernel/img64.cpp", "tests/gif64_test.py", "res/giftest/g1.gif", "res/giftest/g2.gif"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    dec = grep_count(r"decode_gif64", ["kernel/img64.cpp"])
+    lzw = grep_count(r"gif_lzw64", ["kernel/img64.cpp"])
+    tst = grep_count(r"\[IMG64\] selftest gif", ["kernel/img64.cpp"])
+    open_ok = grep_count(r"v0.9.27", ["kernel/settings64.cpp"])
+    ev = [
+        "解码器（kernel/img64.cpp 命中 %d）：GIF87a/89a 头、全局/局部色表、透明色索引、隔行、"
+        "LZW 跨子块（`gif_lzw64` 命中 %d）+ Clear 重置码表；输出统一 0xAARRGGBB（透明 = alpha 0）" % (dec, lzw),
+        "入口接线：`img64_decode64` 与 `img64_decode_fit64` 都认 GIF（fit = 全解 + 收尾缩放）",
+        "设置页放开（kernel/settings64.cpp 命中 %d）：头像 `avatar_apply` 与壁纸 `wall_set_path` "
+        "两处**删除** `.gif` 拒绝分支，文案改成 \"…/GIF（取首帧）\"" % open_ok,
+        "自检（kernel/img64.cpp 命中 %d，bit8）：4x4 四色 GIF 逐像素 vs 宿主真值表；16x16 透明+隔行+两帧 "
+        "GIF 必须解出 16x16 且像素只能是透明或色表两色之一" % tst,
+        "★ 边界（如实）：**只解首帧** —— 动图取第一帧静态显示，不做动画播放 / 不做 disposal 合成，"
+        "打点里写 `frames=1(first-only)`；上限 4096x4096 与单帧 4M 像素",
+        "验收：tests/gif64_test.py（三层独立判据：内核自检 / 嵌入字节 == res/giftest 里的真文件 / "
+        "真值像素 == 宿主 Pillow 读同一份文件的像素）",
+    ]
+    done = dec > 0 and lzw > 0 and tst > 0 and open_ok > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 CAPS = [
     ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
      cap_boot_console),
@@ -3500,6 +3531,8 @@ CAPS = [
      cap_deb_chain),
     ("内核", "★ 光驱驱动补全（PATA/AHCI ATAPI 枚举 + READ CAPACITY + 2048B 块读）+ ISO9660 只读卷"
              "（PVD/目录记录/路径解析/文件读，fs64 + 盘符接线）", cap_cdrom_iso9660),
+    ("内核", "★ GIF 解码（首帧静态：GIF87a/89a + 透明色 + 隔行 + LZW 跨子块；设置页头像/壁纸放开 .gif）",
+     cap_gif_decode),
 ]
 
 
@@ -3521,6 +3554,8 @@ TESTS = [
                           "ESP 拒格式化、删后抹首扇区）"),
     ("screen64_probe.py", "安装界面像素验收"),
     ("iso64_install_test.py", "ISO 光盘引导端到端"),
+    ("gif64_test.py", "★ v0.9.27：GIF（首帧）解码 —— 内嵌字节 == res/giftest 真文件、真值像素 == 宿主 Pillow、"
+                      "真 QEMU 里 [IMG64] selftest gif ok=1 mask=0"),
     ("iso9660_64_test.py", "★ v0.9.26：光驱驱动（PATA/AHCI ATAPI + READ CAPACITY）+ ISO9660 只读卷 "
                           "（宿主侧独立解析同一张 ISO 逐项比对 PVD/根目录/读取长度；i440fx 与 q35 两种机器）"),
     ("iso64_usb_test.py", "U 盘 hybrid 端到端"),
