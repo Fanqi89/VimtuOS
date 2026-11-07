@@ -37,6 +37,7 @@
 #include "theme64.h"   // ★ P5：文件管理器地址栏的文本指针命中区用 Token 高度
 #include "elf64.h"
 #include "gfx64.h"      // ★ P8：选择应用打开对话框的圆角/半透明/双层阴影（Token 图形原语）
+#include "startmenu64.h"  // ★ v0.9.25：p2ui_text_w64（预览按 UI 字体实测列宽换行）
 #include "session64.h"  // ★ P8：应用清单（外壳按 APP_ID_* 登记的那一份 = 开始菜单/设置同一来源）
 
 // ==================== 几何常量（与脚本共享，勿乱改）====================
@@ -225,8 +226,14 @@ static int  g_last_item = -1;         // 双击判定：上一次按下的条目
 static uint32_t g_last_tick = 0;
 
 static char g_prev_name[40] = {0};
-static char g_prev_buf[1025] = {0};
+// ★ v0.9.25：预览缓冲 1 KiB -> 16 KiB（滚轮要"有东西可滚"；超过 16 KiB 的如实截断，
+//   标题行与 [UI] explorer preview bytes= 打点里给的就是**实际读入字节数**，不谎报全文）。
+#define PREV_BUF_BYTES 16384
+static char g_prev_buf[PREV_BUF_BYTES + 1] = {0};
 static int  g_prev_len = 0;
+static int  g_prev_off = 0;      // ★ v0.9.25：视口第一行的行号（0 = 文件头）
+static int  g_prev_total = 0;    // 总行数（按当前窗口宽度换行后算；每帧重算）
+static int  g_prev_vis = 0;      // 可见行数（每帧重算；滚轮用它算上限）
 
 // ==================== ★ 批次 J：文件操作状态（多选 / 剪贴板 / 右键菜单 / 内联编辑 / 属性 / 框选）====================
 // 多选：位图（下标 < EXP_MAX_ITEMS）；g_sel 仍然是"焦点条目"（状态栏/回车/双击都看它），向后兼容旧逻辑。
@@ -1236,7 +1243,32 @@ static const char* exp_assoc_name(int a) {
 // 绘制用的客户区原点偏移（每个窗口的 draw 回调开始时设置；预览窗口自己用绝对坐标 -> 置 0）
 static int g_ox = 0, g_oy = 0;
 
-// 只读文本预览窗口（前 1KB / 20 行）
+// ★ v0.9.25：预览的行宽 = 客户区放得下的 ASCII 列数（用 UI 字体实测推进宽度，不写死 100 列）。
+//   换行口径与改造前一致：遇 '\n' 断行；一行超过列数就**折行续画**（不丢字符）。
+static int prev_cpl(const Window* w) {
+    int adv = p2ui_text_w64("MMMMMMMMMM") / 10;
+    if (adv < 4) adv = 8;
+    int cpl = (w->client_w - 20) / adv;
+    if (cpl < 20) cpl = 20;
+    if (cpl > 400) cpl = 400;
+    return cpl;
+}
+// 走一行：i = 行起点（相对 g_prev_buf），返回该行长度，*next = 下一行起点（>= g_prev_len = 到头）。
+// ★ 这是行切分的**唯一实现**：行数统计、绘制、内核自检都走它 —— 自检通过 = 绘制用的同一段逻辑正确。
+static int prev_line_step(int i, int cpl, int* next) {
+    int j = i;
+    while (j < g_prev_len && g_prev_buf[j] != '\n' && (j - i) < cpl) j++;
+    const int len = j - i;
+    *next = (j < g_prev_len && g_prev_buf[j] == '\n') ? j + 1 : j;
+    if (*next <= i) *next = i + 1;                  // 防御：绝不原地踏步（cpl<=0 时也不会死循环）
+    return len;
+}
+static int prev_count_lines(int cpl) {
+    int line = 0, i = 0;
+    while (i < g_prev_len) { int nx = 0; (void)prev_line_step(i, cpl, &nx); line++; i = nx; }
+    return line;
+}
+// 只读文本预览窗口（可滚：滚轮 / 视口行偏移；一行 16px）
 static void prev_draw(Window* w) {
     const int x = w->client_x + 10;
     int y = w->client_y + 8;
@@ -1247,25 +1279,56 @@ static void prev_draw(Window* w) {
     text(x, y, hdr, rgb(0, 60, 120));
     y += 20;
     const int lh = 16;
+    const int cpl = prev_cpl(w);
+    int vis = (w->client_y + w->client_h - y) / lh;
+    if (vis < 1) vis = 1;
+    g_prev_vis = vis;
+    g_prev_total = prev_count_lines(cpl);
+    g_prev_off = clamp_scroll_pure(g_prev_off, g_prev_total, vis);   // 与列表滚动同一口径
     int line = 0, i = 0;
-    while (i <= g_prev_len && line < 20) {
-        int j = i;
-        while (j < g_prev_len && g_prev_buf[j] != '\n' && (j - i) < 100) j++;
-        char tmp[104];
-        int k = 0;
-        for (int p = i; p < j && k < 100; p++) tmp[k++] = g_prev_buf[p];
-        tmp[k] = 0;
-        text(x, y, tmp, rgb(40, 40, 40));
-        y += lh;
+    while (i < g_prev_len && line < g_prev_off + vis) {
+        int j = 0;
+        const int len = prev_line_step(i, cpl, &j);
+        if (line >= g_prev_off) {                       // 视口外的行只数不画（大文件才不卡）
+            char tmp[420];
+            int k = 0;
+            for (int p = i; p < i + len && k < (int)sizeof(tmp) - 1; p++) tmp[k++] = g_prev_buf[p];
+            tmp[k] = 0;
+            text(x, y, tmp, rgb(40, 40, 40));
+            y += lh;
+        }
         line++;
-        i = (j < g_prev_len && g_prev_buf[j] == '\n') ? j + 1 : j;
-        if (i >= g_prev_len) break;
+        i = j;
     }
     if (g_prev_len == 0) text(x, y, gui64_tr("(empty file)", "（空文件）"), rgb(120, 120, 120));
+}
+// ★ v0.9.25：滚轮（外壳只在"弹窗 / 开始菜单都没消费"时才送来）
+//   dz > 0 = 上滚（看更早的行）；dz < 0 = 下滚。一格 = 3 行。
+//   判据行：[UI] explorer preview scroll off=<n> lines=<n> vis=<n> dz=<±n>
+static void prev_wheel(Window* w, int dz) {
+    const int vis = (g_prev_vis > 0) ? g_prev_vis : 1;
+    const int k = clamp_scroll_pure(g_prev_off - dz * 3, g_prev_total, vis);   // dz>0 = 上滚
+    if (g_prev_total <= vis) return;                       // 一屏放得下：不消费
+    if (k == g_prev_off) return;
+    g_prev_off = k;
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer preview scroll off=");
+    dbg64_dec((uint64_t)k);
+    dbg64_str(" lines=");
+    dbg64_dec((uint64_t)g_prev_total);
+    dbg64_str(" vis=");
+    dbg64_dec((uint64_t)vis);
+    dbg64_str(" dz=");
+    dbg64_dec((uint64_t)(dz < 0 ? -dz : dz));
+    dbg64_str(dz < 0 ? " (down)" : " (up)");
+    dbg64_nl();
+    dbg64_line_end64();
+    gui64_invalidate_window(w);
 }
 static void prev_close(Window* w) { (void)w; g_prev_win = nullptr; }
 static void exp_open_preview(const char* full, const char* name) {
     g_prev_len = fs64_read64(-1, full, g_prev_buf, (int)sizeof(g_prev_buf) - 1);   // ★ 统一接口（FAT 文本也能预览）
+    g_prev_off = 0;                       // ★ v0.9.25：换文件回文件头
     if (g_prev_len < 0) g_prev_len = 0;
     g_prev_buf[g_prev_len] = 0;
     e_strcpy(g_prev_name, name, (int)sizeof(g_prev_name));
@@ -1280,6 +1343,7 @@ static void exp_open_preview(const char* full, const char* name) {
     } else {
         gui64_set_active(g_prev_win);
     }
+    if (gui64_window_alive(g_prev_win)) gui64_set_wheel(g_prev_win, prev_wheel);   // ★ v0.9.25
     dbg64_line_begin64();
     dbg64_str("[UI] explorer preview name=");
     dbg64_str(name);
@@ -3310,6 +3374,36 @@ int explorer64_selftest64() {
         if (sel_has(70)) extra |= 262144;
         sel_clear();
         if (sel_count() != 0) extra |= 524288;
+    }
+    // 9) ★ v0.9.25：文本预览的行切分 + 视口夹取（滚轮滚的就是它）
+    //    合成串：3 行短行 + 1 行 250 字符（要在 90 列处折成 3 行）+ 末尾无换行的一行。
+    {
+        int save_len = g_prev_len;
+        int n = 0;
+        const char* head = "ab\ncd\n\n";
+        for (int i = 0; head[i] && n < (int)sizeof(g_prev_buf) - 400; i++) g_prev_buf[n++] = head[i];
+        for (int i = 0; i < 250 && n < (int)sizeof(g_prev_buf) - 40; i++) g_prev_buf[n++] = 'x';
+        g_prev_buf[n++] = '\n';
+        g_prev_buf[n++] = 'z';
+        g_prev_len = n;
+        // 行数：ab / cd / (空) / 250x 折 3 行（90+90+70）/ z = 7 行
+        if (prev_count_lines(90) != 7) extra |= 1048576;
+        if (prev_count_lines(250) != 5) extra |= 2097152;        // 250 列：长行不再折（1 行）+ 其余 4
+        // 第 4 行（长行第一段）起点与长度：走 prev_line_step 逐行推进
+        {
+            int i = 0, line = 0, seg = 0, start = 0;
+            while (i < g_prev_len && line < 4) { int nx = 0; (void)prev_line_step(i, 90, &nx); i = nx; line++; }
+            start = i;
+            int nx2 = 0;
+            seg = prev_line_step(start, 90, &nx2);
+            if (line != 4 || seg != 90) extra |= 4194304;        // 长行第一段必须正好 90 列
+            // 夹取（与列表滚动同一函数）：总数 7、可见 3 -> 最大 4；负数回 0
+            if (clamp_scroll_pure(999, 7, 3) != 4) extra |= 8388608;
+            if (clamp_scroll_pure(-3, 7, 3) != 0) extra |= (1 << 24);
+            if (clamp_scroll_pure(7, 5, 20) != 0) extra |= (1 << 25);   // 一屏放得下：恒 0（滚轮不消费）
+        }
+        g_prev_len = save_len;
+        g_prev_buf[g_prev_len] = 0;
     }
     if (extra != 0) {
         fails |= (1 << 30);                                     // 旧位图满了，用 bit30 表示"批次 J 的检查有失败"

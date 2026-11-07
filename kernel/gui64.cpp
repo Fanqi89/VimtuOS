@@ -560,6 +560,7 @@ Window* gui64_create_window(const char* title, int x, int y, int w, int h,
     win->norm_x = x; win->norm_y = y; win->norm_w = w; win->norm_h = h;
     win->draw = draw; win->on_key = on_key; win->on_click = on_click;
     win->on_click2 = nullptr; win->on_tick = nullptr; win->on_close = nullptr;
+    win->on_wheel = nullptr;
     win->userdata = nullptr;
     win->app_id = (uint8_t)app_id;
     win->mem_owner = MEM_OWNER_APPS_64;
@@ -687,6 +688,7 @@ void gui64_set_min_size(Window* w, int mw, int mh) {
 
 void gui64_set_click2(Window* w, WindowClick2Fn fn) { if (gui64_window_alive(w)) w->on_click2 = fn; }
 void gui64_set_tick(Window* w, WindowTickFn fn)     { if (gui64_window_alive(w)) w->on_tick = fn; }
+void gui64_set_wheel(Window* w, WindowWheelFn fn)   { if (gui64_window_alive(w)) w->on_wheel = fn; }
 
 void gui64_set_geom(Window* w, int x, int y, int cw, int ch) {
     if (!gui64_window_alive(w)) return;
@@ -3450,11 +3452,16 @@ static void handle_mouse(void) {
     dockmenu64_move64(mx, my);          // ★ v0.8.0：上下文菜单悬停高亮
     // ★ P5：桌面右键菜单的悬停高亮（菜单开着时鼠标移动换行；模块内部去重 + 只脏菜单矩形）
     if (desktopops64_menu_is_open64()) desktopops64_menu_move64(mx, my);
-    // ★ P2：滚轮（PS/2 4 字节包的 Z；弹窗优先，其次开始菜单搜索列表）
+    // ★ P2：滚轮（PS/2 4 字节包的 Z；弹窗优先 -> 开始菜单 -> 光标下最前的窗口）
+    //   v0.9.25：前两档（弹窗 / 开始菜单）保持原样；两档都不吃时把 dz 交给窗口自己的
+    //   on_wheel（终端滚历史 / 设置滚内容 / 文本预览滚行）。窗口没挂 on_wheel = 不消费。
     {
         const int dz = mouse_pop_wheel64();
         if (dz != 0) {
-            if (!panels64_wheel64(dz)) (void)startmenu64_wheel64(dz);
+            if (!panels64_wheel64(dz) && !startmenu64_wheel64(dz)) {
+                Window* ww = win_at(g_cur_x, g_cur_y);
+                if (ww && ww->on_wheel) ww->on_wheel(ww, dz);
+            }
         }
     }
     // ---- Dock：悬停命中 + 动效推进（悬停放大/邻位让位/点击回弹）----

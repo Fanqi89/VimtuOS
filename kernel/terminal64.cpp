@@ -155,6 +155,13 @@ static void term_cell_h_init(void) {
 #define TERM_ZH_DY       (-2)       // TrueType 中文字形相对格顶的微调（em 盒 vs 位图字形对齐）
 #define TERM_PEND_MAX    8          // 待释放队列长度
 #define TERM_PEND_DELAY  4          // 延迟释放的 tick 数（约 16ms，足够外壳销毁窗口）
+// ★ v0.9.25：滚轮历史缓冲（Scrollback）。每实例一段环形行缓冲，行距固定 TERM_COLS_MAX
+//   （与活网格同一套码点/属性网格；滚动只是换"读哪一行"，不复制、不重排、不影响输出路径）。
+//   128 行 × 256 列 × 3B = 98,304 B/实例（4 实例 ≈ 384 KiB，内核堆 48 MiB，见 mem64.cpp）。
+//   语义（与 Windows Terminal 一致）：上滚 = 看更早的内容；**来新输出或开始打字 -> 自动回底部**，
+//   不会把画面钉在旧内容上。
+#define TERM_SB_LINES    128        // 历史行数（环形缓冲容量）
+#define TERM_WHEEL_LINES 3          // 一格滚轮滚几行
 
 // 配色照 32 位：黑底 + 浅灰字 + 绿色块状光标（绿底黑字）
 #define TERM_BG      rgb(0x00, 0x00, 0x00)
@@ -196,6 +203,12 @@ struct TerminalState {
     Window* win;                     // 所属窗口
     int   inst;                      // 实例序号（1 起，日志用）
     bool  used;                      // 已初始化（有效实例）
+    // ★ v0.9.25：滚轮历史（环形行缓冲 + 视口偏移；三块缓冲在同一次 kmalloc 里）
+    uint16_t* sb;                    // 历史行码点（TERM_SB_LINES × TERM_COLS_MAX）
+    uint8_t*  sba;                   // 历史行颜色属性（同尺寸）
+    int       sb_head;               // 下一行写入位置（环形下标）
+    int       sb_count;              // 已存历史行数（<= TERM_SB_LINES）
+    int       sb_off;                // 视口上滚行数（0 = 跟到底部 = 最新内容）
 };
 
 // 实例注册表：紧凑排列，只存指针；存活判断用"指针比较 + 活窗口 userdata 回指"，不解引用可能已释放的状态
@@ -464,6 +477,9 @@ static void ts_clear(TerminalState* ts) {
     ts->attr = 0;                    // 清屏同时复位 SGR（与 xterm 一致）
     ts->cur_r = 0;
     ts->cur_c = 0;
+    ts->sb_head = 0;                 // ★ v0.9.25：clear 也丢历史（与 xterm 的 RIS 一致）
+    ts->sb_count = 0;
+    ts->sb_off = 0;
 }
 
 // 脏矩形（只用 gui64_dirty，不整屏重绘）
@@ -553,8 +569,20 @@ static void ts_sync_layout(TerminalState* ts, Window* w) {
     }
 }
 
-// 内容整体上滚一行（底行清空）
+// 内容整体上滚一行（底行清空；★ v0.9.25：被滚掉的顶层行先进历史环）
 static void ts_scroll(TerminalState* ts) {
+    if (ts->sb && ts->sba && ts->cols > 0) {
+        uint16_t* dst  = ts->sb  + ts->sb_head * TERM_COLS_MAX;
+        uint8_t*  dsta = ts->sba + ts->sb_head * TERM_COLS_MAX;
+        const uint16_t* src  = ts->cells;              // 活网格第 0 行 = 视口最上一行
+        const uint8_t*  srca = ts->attrs;
+        for (int c = 0; c < TERM_COLS_MAX; c++) {
+            dst[c]  = (c < ts->cols) ? src[c]  : 0;    // 列外补空：历史行与活网格共用同一步长
+            dsta[c] = (c < ts->cols) ? srca[c] : 0;
+        }
+        ts->sb_head = (ts->sb_head + 1) % TERM_SB_LINES;
+        if (ts->sb_count < TERM_SB_LINES) ts->sb_count++;
+    }
     for (int r = 1; r < ts->rows; r++) {
         uint16_t* dst = ts->cells + (r - 1) * TERM_COLS_MAX;
         const uint16_t* src = ts->cells + r * TERM_COLS_MAX;
@@ -616,6 +644,8 @@ static int ts_row_px(TerminalState* ts, int r, int c) {
 // 写一个码点：按该实例当前 cols/rows 与**像素宽度**裁剪与滚动，并只标脏受影响的区域
 static void ts_putc(TerminalState* ts, uint32_t cp) {
     if (!ts || !ts->used || ts->cols < 1 || ts->rows < 1) return;
+    // ★ v0.9.25：有新输出 -> 视口立刻回底部（滚轮看历史期间来输出，不把画面钉在旧内容上）
+    if (ts->sb_off) { ts->sb_off = 0; ts_dirty_client(ts); }
     // ★ v0.4.7：ANSI 转义（只认 CSI … m）。终端输出里出现的 ESC 序列必须被**吃掉**，
     //   绝不能当普通字符画到屏幕上（否则彩色输出会变成乱码方块）。
     if (cp == 0x1B) { ts->esc = 1; ts->sgr = 0; return; }
@@ -741,8 +771,26 @@ static void term_draw(Window* w) {
     if (dc < 0) dc = 0;
     if (dr < 0) dr = 0;
     int right = x0 + cw;                                  // 右侧像素裁剪（变宽网格：整行宽度按推进累加）
+    // ★ v0.9.25：视口来源 = 历史环 + 活网格拼成的一维行流。逻辑行号 li 的基准：
+    //   li < sb_count = 历史行（环形最老的那一行起算），li >= sb_count = 活网格第 li-sb_count 行。
+    //   sb_off = 0 时 li 从 sb_count 起算 -> 与滚动改造前**逐像素一致**（只是多算一次下标）。
+    const int base_li = ts->sb_count - ts->sb_off;
     for (int r = 0; r < dr; r++) {
-        const uint16_t* row = ts->cells + r * TERM_COLS_MAX;
+        const int li = base_li + r;
+        const uint16_t* row;
+        const uint8_t*  rowa;
+        if (li >= ts->sb_count) {
+            const int lr = li - ts->sb_count;
+            if (lr >= ts->rows) continue;
+            row  = ts->cells + lr * TERM_COLS_MAX;
+            rowa = ts->attrs + lr * TERM_COLS_MAX;
+        } else {
+            int idx = ts->sb_head - ts->sb_count + li;     // 历史环里最老的那一行 = sb_head - sb_count
+            while (idx < 0) idx += TERM_SB_LINES;
+            idx %= TERM_SB_LINES;
+            row  = ts->sb  + idx * TERM_COLS_MAX;
+            rowa = ts->sba + idx * TERM_COLS_MAX;
+        }
         int ty = y0 + TERM_PAD_Y + r * term_ch();
         int tx = x0 + TERM_PAD_X;
         for (int c = 0; c < dc; c++) {
@@ -750,13 +798,13 @@ static void term_draw(Window* w) {
             int adv = (cp >= 0x20) ? term_adv((uint32_t)cp) : term_unit();
             if (tx >= right) break;
             if (cp >= 0x20)
-                term_draw_cell(tx, ty, adv, cp,
-                               term_attr_fg(ts->attrs[r * TERM_COLS_MAX + c]), TERM_BG);
+                term_draw_cell(tx, ty, adv, cp, term_attr_fg(rowa[c]), TERM_BG);
             tx += adv;
         }
     }
     // 光标：块状光标（绿底黑字），宽度 = 该格码点的推进宽度（ASCII 半格 / 汉字整格），不依赖 '_' 字形
-    if (w->active && ts->cur_r >= 0 && ts->cur_r < dr && ts->cur_c >= 0 && ts->cur_c < dc) {
+    // ★ v0.9.25：看历史时没有"当前行"可言 -> 不画光标块（与 xterm/Windows Terminal 一致）
+    if (w->active && ts->sb_off == 0 && ts->cur_r >= 0 && ts->cur_r < dr && ts->cur_c >= 0 && ts->cur_c < dc) {
         int cx = x0 + TERM_PAD_X + ts_row_px(ts, ts->cur_r, ts->cur_c);
         int cy = y0 + TERM_PAD_Y + ts->cur_r * term_ch();
         uint16_t cp = ts->cells[ts->cur_r * TERM_COLS_MAX + ts->cur_c];
@@ -766,6 +814,34 @@ static void term_draw(Window* w) {
             if (cp >= 0x20) term_draw_cell(cx, cy, adv, cp, TERM_CURFG, TERM_CUR);
         }
     }
+}
+
+// ★ v0.9.25：滚轮。外壳只在"弹窗 / 开始菜单都没消费"时才把 dz 送到窗口（见 gui64.cpp）。
+//   dz > 0 = 上滚（看更早的历史行）；dz < 0 = 下滚（回最新）。
+//   视口偏移的单位是**行**而不是像素：终端是字符网格，按行滚不会把半行卡在顶边。
+//   打到串口的判据行：[TERM] scroll off=<n> hist=<n> rows=<n> dz=<±n>
+static void term_wheel(Window* w, int dz) {
+    TerminalState* ts = ts_of(w);
+    if (!ts || !ts->used) return;
+    int k = ts->sb_off + dz * TERM_WHEEL_LINES;
+    if (k < 0) k = 0;
+    if (k > ts->sb_count) k = ts->sb_count;
+    if (k == ts->sb_off) return;
+    ts->sb_off = k;
+    dbg64_line_begin64();
+    dbg64_str("[TERM] scroll off=");
+    dbg64_dec((uint64_t)k);
+    dbg64_str(" hist=");
+    dbg64_dec((uint64_t)ts->sb_count);
+    dbg64_str(" rows=");
+    dbg64_dec((uint64_t)ts->rows);
+    dbg64_str(" dz=");
+    dbg64_dec((uint64_t)(dz < 0 ? -dz : dz));
+    dbg64_str(dz < 0 ? " (down)" : " (up)");
+    dbg64_nl();
+    dbg64_line_end64();
+    ts_dirty_client(ts);
+    gui64_invalidate_window(w);
 }
 
 // ==================== Shell：输出与命令 ====================
@@ -5330,8 +5406,11 @@ static void term_tick(Window* w) {
 static TerminalState* ts_new(Window* win) {
     int off = (int)((sizeof(TerminalState) + 1) & ~(size_t)1);      // cells 的起点（2 字节对齐）
     // ★ v0.4.7：一次分配里放两块缓冲 —— cells（2B/格）后面接 attrs（1B/格，颜色）
+    // ★ v0.9.25：同一次 kmalloc 里再放历史环（码点 + 属性）
     uint64_t bytes = (uint64_t)off + (uint64_t)TERM_BUF_MAX * sizeof(uint16_t)
-                    + (uint64_t)TERM_BUF_MAX;
+                    + (uint64_t)TERM_BUF_MAX
+                    + (uint64_t)TERM_SB_LINES * TERM_COLS_MAX * sizeof(uint16_t)
+                    + (uint64_t)TERM_SB_LINES * TERM_COLS_MAX;
     int prev = mem_owner_get_64();
     mem_owner_set_64(MEM_OWNER_TERMINAL_64);      // 归属记账：任务管理器/内存归属统计
     TerminalState* ts = (TerminalState*)kmalloc_64(bytes);
@@ -5339,6 +5418,12 @@ static TerminalState* ts_new(Window* win) {
     if (!ts) return nullptr;
     ts->cells = (uint16_t*)((char*)ts + off);
     ts->attrs = (uint8_t*)((char*)ts + off + (size_t)TERM_BUF_MAX * sizeof(uint16_t));
+    ts->sb  = (uint16_t*)((char*)ts + off + (size_t)TERM_BUF_MAX * (sizeof(uint16_t) + 1));
+    ts->sba = (uint8_t*)((char*)ts + off + (size_t)TERM_BUF_MAX * (sizeof(uint16_t) + 1)
+                                       + (size_t)TERM_SB_LINES * TERM_COLS_MAX * sizeof(uint16_t));
+    ts->sb_head = 0;
+    ts->sb_count = 0;
+    ts->sb_off = 0;
     ts->attr = 0;
     ts->esc = 0;
     ts->sgr = 0;
@@ -5461,6 +5546,7 @@ void app_term_open64() {
     g_win[g_count] = win;
     g_count++;
     gui64_set_tick(win, term_tick);
+    gui64_set_wheel(win, term_wheel);              // ★ v0.9.25：滚轮看历史
 
     ts_sync_layout(ts, win);                       // 推导 cols/rows（并打 [UI] term layout）
     ts->cmdlen = 0;

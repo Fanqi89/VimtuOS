@@ -247,6 +247,15 @@ static char g_msg[MSG_LEN];
 static uint32_t g_msg_t0 = 0;
 static uint32_t g_msg_col = 0;
 static int  g_prev_cw = -1, g_prev_ch = -1;
+// ★ v0.9.25：内容区滚动（滚轮）。g_scroll_y = 内容整体上移的像素（0 = 顶部）。
+//   滚动上限不能写死：每页内容高度不同、窗口还能拉大拉小 —— 所以**边画边量**：
+//   页面绘制期间由 trk() 登记"已画到的最下沿"（局部坐标），下一帧就有本页真实内容高度。
+//   g_cmax_page 记住这份高度属于哪一页/哪次绘制，换页不会拿旧页的高度设上限。
+static int  g_scroll_y  = 0;
+static int  g_cmax_y    = 0;        // 上一帧本页内容下沿（局部坐标）
+static int  g_cmax_page = -1;       // g_cmax_y 属于哪一页（-1 = 还没有测量结果）
+static bool g_trk       = false;    // 只有"画页面内容"期间才登记（导航/消息行不参与）
+static inline void trk(int y_bottom) { if (g_trk && y_bottom > g_cmax_y) g_cmax_y = y_bottom; }
 static bool g_close_logged = false;
 static bool g_boot_logged = false;      // 首帧的 hz/specs 行只打一次
 static bool g_ctl_logged_once = false;  // [SET64] nav 几何行只打一次
@@ -318,19 +327,26 @@ static const Theme64Tokens* tk64() { return theme64_tokens64(); }
 static int g_po_x = 0, g_po_y = 0;               // 页面/导航局部坐标 -> 屏幕坐标的原点
 static inline int UIX(int x) { return x + g_po_x; }
 static inline int UIY(int y) { return y + g_po_y; }
-static void ui_text(int x, int y, const char* s, uint32_t c) { p2ui_text64(UIX(x), UIY(y), s, c); }
+static int  ui_h();                                  // 前向（trk 在 ui_text 里用它）
+static void ui_text(int x, int y, const char* s, uint32_t c) {
+    p2ui_text64(UIX(x), UIY(y), s, c);
+    trk(y + ui_h());                 // ★ v0.9.25：供滚轮算上限
+}
 static int  ui_w(const char* s) { return p2ui_text_w64(s); }
 static int  ui_h() { return p2ui_line_h64(); }
 static int  centered_x(int w, const char* s) { int tx = (w - ui_w(s)) / 2; return tx < 0 ? 0 : tx; }
 static void fill_r(int x, int y, int w, int h, int r, uint32_t c, int a) {
     gfx64_fill_round64(UIX(x), UIY(y), w, h, r, c, a);
+    trk(y + h);
 }
 static void stroke_r(int x, int y, int w, int h, int r, uint32_t c, int a) {
     gfx64_stroke_round64(UIX(x), UIY(y), w, h, r, c, a);
+    trk(y + h);
 }
 static void divider(int x, int y, int w) {
     const Theme64Tokens* t = tk64();
     for (int i = 0; i < w; i++) gfx64_blend64(UIX(x + i), UIY(y), t->text_dim, 70);
+    trk(y + 1);
 }
 // 卡片：双层浅阴影（Token）+ 卡片透明度（Token A_CARD）+ 圆角（Token R_CARD）+ 1px 玻璃高光边。
 // ★ 性能硬约束（实测）：这里**不能**用 gfx64_glass64(layer=1) 那种"内容层逐像素毛玻璃"——
@@ -339,6 +355,7 @@ static void divider(int x, int y, int w) {
 //   所以卡片 = Token 的半透明填充 + 阴影 + 高光边（视觉上就是 Win11 的卡片；透明度/圆角/阴影全部走 Token）。
 static void card_rect(int x, int y, int w, int h) {
     const Theme64Tokens* t = tk64();
+    trk(y + h);
     p2ui_shadow64(UIX(x), UIY(y), w, h, THEME64_R_CARD, t);
     gfx64_fill_round64(UIX(x), UIY(y), w, h, THEME64_R_CARD, t->dark ? t->title_bg : 0xFFFFFFu, THEME64_A_CARD);
     p2ui_stroke_mixed64(UIX(x), UIY(y), w, h, THEME64_R_CARD, THEME64_R_CARD,
@@ -397,7 +414,14 @@ static void lay_calc(int cw, int ch, Lay* L) {
 static int win_cw(Window* w) { int v = (w->client_w > 0) ? w->client_w : (w->w - 2); return (v < 80) ? 80 : v; }
 static int win_ch(Window* w) { int v = (w->client_h > 0) ? w->client_h : (w->h - 26); return (v < 80) ? 80 : v; }
 
-// ==================== 控件登记 + 几何打点（自动化按 [SET64] ctl 行点击） ====================
+// 滚动上限：内容下沿 + 8px 余量 - 客户区高（还按页校验，换页/首次绘制时不做假上限）
+static int set_max_scroll(const Lay* L) {
+    if (g_cmax_page != g_page) return 0;
+    const int m = g_cmax_y + 8 - L->ch;
+    return (m > 0) ? m : 0;
+}
+
+// ==================== 控件登记 + 几何打点（自动化按 [SET64] ctl 行点击）====================
 struct Ctl { unsigned char page; unsigned char kind; int id; int x, y, w, h; };
 static Ctl g_ctl[CTL_MAX];
 static int g_ctl_n = 0;
@@ -2785,6 +2809,8 @@ static void page_go(int p, const char* how) {
     if (p < 0 || p >= P_COUNT) return;
     if (p == g_page) return;
     g_page = p;
+    g_scroll_y = 0;                 // ★ v0.9.25：换页回顶部（每页自己的内容高度不同）
+    g_cmax_page = -1;               //   本页还没量过 -> 上限先按 0 处理，画完一帧再放开
     g_drop = DROP_NONE;
     g_focus = -1;
     g_hw_view = 0;
@@ -2848,8 +2874,14 @@ static void set_draw(Window* w) {
     //   页面/导航条目用的是**客户区局部坐标**，由 ui_text/fill_r/stroke_r/card_rect/divider
     //   等绘制入口加上原点。窗口移动（尺寸不变）时 x0/y0 变、内容因此和窗框同步；
     //   客户区底/导航亚克力底/1px 分隔线本来就用绝对坐标，不受影响。
+    // ★ v0.9.25：先把滚动偏移夹进本页真实范围（窗口拉大/内容变短 -> 自动回夹，不留空档）
+    {
+        const int m = set_max_scroll(&L);
+        if (g_scroll_y > m) g_scroll_y = m;
+        if (g_scroll_y < 0) g_scroll_y = 0;
+    }
     g_po_x = x0;
-    g_po_y = y0;
+    g_po_y = y0;                    // ★ 导航**不参与滚动**：导航条目的局部原点就是客户区原点
     fb_fill_rect(x0, y0, cw, ch, t->client_bg);
     draw_nav(&L, x0, y0);
     // 右侧内容（带切页动效：位移 + 淡入）
@@ -2861,7 +2893,16 @@ static void set_draw(Window* w) {
     {
         // 裁剪在动效期间只允许内容区重绘（避免位移画到导航上）
         fb_set_clip(ax, y0, aw, ch);
-        draw_page(&L, x0, y0 + dy);
+        // ★ v0.9.25：内容整体上移 g_scroll_y；[SET64] ctl 行的绝对 y 也要跟着滚 ——
+        //   g_cl_y 只被那行打点用（见 ctl_reg 注释），画完立刻复原。
+        g_cl_y = y0 - g_scroll_y;
+        g_po_y = y0 - g_scroll_y;     // ★ 只有页面内容的局部原点随滚动上移
+        g_cmax_y = 0;                 // 本帧重新量内容高度
+        g_cmax_page = g_page;
+        g_trk = true;
+        draw_page(&L, x0, y0 + dy - g_scroll_y);
+        g_trk = false;
+        g_cl_y = y0;
         g_po_x = 0;                  // ★ 回到绝对坐标（取样打点/消息行/淡入都用绝对坐标）
         g_po_y = 0;
         fb_set_clip(x0, y0, cw, ch);
@@ -2887,6 +2928,17 @@ static void set_draw(Window* w) {
             // 淡入：用客户区底色按剩余进度盖一层（Token 透明度的整数混合）
             const int a = 255 - prog * 255 / 256;
             if (a > 0) fb_fill_rect_alpha(ax, y0, aw, ch, t->client_bg, a);
+        }
+        // ★ v0.9.25：可滚动时在内容区右缘画一条 4px 滚动条（Win11 风格细条；不可滚 = 不画）
+        {
+            const int m = set_max_scroll(&L);
+            if (m > 0 && prog >= 256) {
+                const int th = (ch * ch) / (ch + m);
+                const int tt = (th < 24) ? 24 : th;
+                const int ty = y0 + ((ch - tt) * g_scroll_y) / m;
+                gfx64_fill_round64(ax + aw - 5, y0 + 2, 4, ch - 4, 2, t->text_dim, 40);
+                gfx64_fill_round64(ax + aw - 5, ty, 4, tt, 2, t->text_dim, 190);
+            }
         }
     // 消息行（全局最后画，覆盖内容）
     if (msg_fresh()) {
@@ -3012,6 +3064,9 @@ static void set_click(Window* w, int cx, int cy0) {
     lay_calc(win_cw(w), win_ch(w), &L);
     // 内容坐标要减掉切页动效的位移（与 set_tick 一致：控件登记的是"到位后"的矩形）
     const int cy = cy0 - (256 - anim_prog()) * 14 / 256;
+    // ★ v0.9.25：内容区控件登记的是**未滚动**的局部坐标，鼠标命中的要加回滚动偏移；
+    //   左导航不参与滚动，所以下面 nav 分支仍用 cy。
+    const int cyc = cy + g_scroll_y;
     // ---- 左导航（条目 + 分组标题：条目点击切页）----
     if (cx < L.nav_w) {
         for (int p = 0; p < P_COUNT; p++) {
@@ -3027,7 +3082,7 @@ static void set_click(Window* w, int cx, int cy0) {
     }
     // ---- 下拉列表项优先（展开时覆盖内容）----
     if (g_drop == DROP_RES) {
-        const Ctl* c = ctl_at(g_page, cx, cy);
+        const Ctl* c = ctl_at(g_page, cx, cyc);
         if (c && c->id >= CID_RES_LIST && c->id < CID_RES_LIST + SET_RES_N) {
             apply_res(w, c->id - CID_RES_LIST);
             g_press = -1;
@@ -3037,7 +3092,7 @@ static void set_click(Window* w, int cx, int cy0) {
         g_drop = DROP_NONE;
     }
     // ---- 普通控件 ----
-    const Ctl* c = ctl_at(g_page, cx, cy);
+    const Ctl* c = ctl_at(g_page, cx, cyc);
     if (!c) {
         g_focus = -1;
         gui64_invalidate();
@@ -3414,6 +3469,37 @@ static void set_key(Window* w, char c) {
 }
 
 // ==================== 交互：tick（悬停 / 拖动 / 按下态清除 / 动效重绘） ====================
+// ★ v0.9.25：滚轮。外壳只在"弹窗 / 开始菜单都没消费"时才把 dz 送到窗口（见 gui64.cpp）。
+//   dz > 0 = 上滚（内容往下走）；dz < 0 = 下滚（看被截断的下半部分）。
+//   一步 = 一行高（L.row_h，44/52px 随窗口高度自适应），按行滚手感稳定。
+//   判据行：[SET64] scroll off=<n> max=<n> ch=<n> dz=<±n>
+static void set_wheel(Window* w, int dz) {
+    Lay L;
+    lay_calc(win_cw(w), win_ch(w), &L);
+    const int m = set_max_scroll(&L);
+    int k = g_scroll_y - dz * L.row_h;
+    if (k < 0) k = 0;
+    if (k > m) k = m;
+    if (k == g_scroll_y) return;
+    g_scroll_y = k;
+    dbg64_line_begin64();
+    dbg64_str("[SET64] scroll off=");
+    dbg64_dec((uint64_t)k);
+    dbg64_str(" max=");
+    dbg64_dec((uint64_t)m);
+    dbg64_str(" ch=");
+    dbg64_dec((uint64_t)L.ch);
+    dbg64_str(" dz=");
+    {
+        const int neg = (dz < 0);
+        dbg64_dec((uint64_t)(neg ? -dz : dz));
+        dbg64_str(neg ? " (-)" : " (+)");
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+    gui64_invalidate_window(w);
+}
+
 static void set_tick(Window* w) {
     if (w->closing && !g_close_logged) {
         logln("[APP] settings closed");
@@ -3441,7 +3527,7 @@ static void set_tick(Window* w) {
         }
     } else if (mx > L.nav_w) {
         // 内容区：命中的控件（控件表是上一帧登记的，够用；每帧都会刷新）
-        const int ly = my - (256 - anim_prog()) * 14 / 256;
+        const int ly = my - (256 - anim_prog()) * 14 / 256 + g_scroll_y;   // ★ v0.9.25：加回滚动偏移
         const Ctl* c = ctl_at(g_page, mx, ly);
         if (c) h = c->id;
     }
@@ -3508,6 +3594,7 @@ void app_settings_open64() {
     }
     gui64_set_min_size(g_win, SET_MIN_W, SET_MIN_H);
     gui64_set_tick(g_win, set_tick);
+    gui64_set_wheel(g_win, set_wheel);      // ★ v0.9.25：滚轮滚内容
     gui64_set_active(g_win);
 
     dbg64_line_begin64();

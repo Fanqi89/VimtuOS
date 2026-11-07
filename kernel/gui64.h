@@ -45,7 +45,11 @@ typedef void (*WindowKeyFn)(Window*, char c);
 typedef void (*WindowClickFn)(Window*, int cx, int cy);              // 客户区坐标
 typedef void (*WindowClick2Fn)(Window*, int cx, int cy, int button); // 0=左 1=右 2=中
 typedef void (*WindowTickFn)(Window*);                               // 每个外壳 tick（约 60Hz）
+// ★ 滚轮（v0.9.25）：dz > 0 = 上滚（看更早的内容）、dz < 0 = 下滚。外壳把滚轮事件只发给
+//   **光标下最前的窗口**（弹窗/开始菜单优先，见 gui64.cpp 的 handle_mouse），应用自己决定
+//   滚动语义（终端 = 滚历史、设置 = 滚内容、文本预览 = 滚行）。
 typedef void (*WindowCloseFn)(Window*);                              // 窗口即将销毁（释放 userdata 用）
+typedef void (*WindowWheelFn)(Window*, int dz);
 
 // ==================== 窗口 ====================
 // 注意：应用**只读**几何字段（x/y/w/h/client_*），改动一律走 gui64_* 接口，
@@ -67,6 +71,7 @@ struct Window {
     WindowClickFn  on_click;    // 左键（可空）
     WindowClick2Fn on_click2;   // 任意键（可空；扫雷右键标旗用这个）
     WindowTickFn   on_tick;     // 定时回调（可空；计时器用这个）
+    WindowWheelFn  on_wheel;    // 滚轮（可空）
     WindowCloseFn  on_close;    // 外壳销毁窗口前调用（可空）；在此释放 userdata
                                 // 注：带该字段前，应用靠 gui64_window_alive() 轮询发现关窗，
                                 // 两种方式并存都安全（外壳不会替你释放 userdata）
@@ -96,6 +101,7 @@ void    gui64_set_title(Window* w, const char* utf8);
 void    gui64_set_min_size(Window* w, int min_w, int min_h);
 void    gui64_set_click2(Window* w, WindowClick2Fn fn);     // 补挂右键回调
 void    gui64_set_tick(Window* w, WindowTickFn fn);         // 补挂定时回调
+void    gui64_set_wheel(Window* w, WindowWheelFn fn);       // 补挂滚轮回调
 void    gui64_set_geom(Window* w, int x, int y, int cw, int ch);  // 按客户区尺寸重排窗口
 int     gui64_fit_window_to_client(Window* w, int cw, int ch);    // 只在不小于最小尺寸时改
 
