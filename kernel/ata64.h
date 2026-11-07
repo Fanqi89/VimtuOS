@@ -97,8 +97,31 @@ bool ata64_atapi_selftest(int* out_drive);
 extern volatile uint8_t  ata64_cd_stage;
 extern volatile uint8_t  ata64_cd_err;
 extern volatile uint8_t  ata64_cd_st;
-// 便捷：读/写一个扇区
+// 便捷：读/写一个扇区（**512B 硬盘扇区**语义；光盘请用下面的 ata64_cd_*）
 bool ata64_read_sector (int drive, uint32_t lba, void* buf);
+
+// ==================== ★ v0.9.26：光驱（CD-ROM）当块设备用 —— 2048B 光盘块语义 ====================
+// 为什么单开一段接口而不是复用 ata64_read：光盘"扇区"是 2048 字节，硬盘是 512。
+// 两者混在同一个 count/LBA 语义里一定会差 4 倍（kernel/part64.cpp 的 ISO 探测就踩过这坑，
+// 那里靠 ISO_PVD_LBA512 = 16*4 硬换算绕过去的）。所以：
+//   * **本段所有 lba / sectors 都是 2048B 光盘块**，函数名一律带 cd；
+//   * 驱动器号沿用 ata64 那套编号：0..3 = PATA 侧 ATAPI（secondary 通道上的光驱就在 2/3），
+//     32..32+N-1 = ★ 本批新增的 **AHCI(SATA) 侧 ATAPI** 段（见 ATA64_CD_AHCI_BASE）；
+//   * 上层不要自己拼号，用 ata64_cd_count64()/ata64_cd_drive64(i) 枚举。
+static const int ATA64_CD_AHCI_BASE = 32;   // AHCI 光驱段基址（32..）；与 ATA 盘段 8.. 不重叠
+#define ATA64_CD_MAX 6                      // 同时支持的光驱数上限（枚举表大小）
+
+// 探测到的光驱数（**首次调用做一次探测并缓存**；探测只读端口，不向设备发命令）
+int ata64_cd_count64();
+// idx（0..count-1）-> 驱动器号；越界返回 -1
+int ata64_cd_drive64(int idx);
+// idx -> 型号（空串表示没探测到）；指针有效期为整个运行期
+const char* ata64_cd_model64(int idx);
+// 读光盘：lba/sectors 单位 = **2048B**。返回 false = 读失败（绝不假装成功）
+bool ata64_cd_read64(int drive, uint32_t lba, uint32_t sectors, void* buf);
+// READ CAPACITY(10)：*out_sectors = 2048B 块数，*out_bytes = 每块字节数（通常 2048）。
+// 设备不支持/命令失败返回 false 并写 0（如实"未知"，不编一个容量）
+bool ata64_cd_capacity64(int drive, uint32_t* out_sectors, uint32_t* out_bytes);
 
 // 诊断（排障用）：打印 4 个驱动器的原始寄存器值，识别失败时用它定位
 void ata64_diag();

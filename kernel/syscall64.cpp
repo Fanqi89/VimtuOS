@@ -2358,6 +2358,45 @@ static int64_t lx64_fsync64(uint64_t fd) {
     if (fd <= 2) return 0;                               // 标准流是虚拟的：无脏页
     return (int64_t)fd64_fsync64((int)fd);               // 写路径即时落盘 -> 无脏页
 }
+// ---- ★ v0.9.26：76）truncate / 77）ftruncate ----
+// 到 v0.9.25 为止这两个号落在 ENOSYS 兜底里（[SYSCALL] enosys nr=76/77），
+// 所以 log 轮转、`truncate -s`、写临时文件后收缩这类工具都会失败。
+// 本批把"真正能改文件大小"的原语接上来：VimtuFS2 = vfs64_truncate64（缩小回收块/扩展补零）、
+// FAT32 = fat64_vol_truncate64；只读卷（FAT 固定盘 / 光盘）如实 -EROFS。
+static int64_t lx64_truncate64(uint64_t nr, uint64_t path_va, uint64_t len) {
+    char path[LX64_PATHR_MAX];
+    const int rr = lx64_resolve_path64(path_va, path, (uint32_t)sizeof(path));
+    if (rr != 0) { syscall64_deny64(nr, path_va); return rr; }
+    if (len > 0xFFFFFFFFull) return -LX64_EINVAL;
+    Fs64Stat64 st;
+    if (fs64_stat64(-1, path, &st) != 0) return -LX64_ENOENT;   // Linux：不存在 = ENOENT
+    if (st.type == VFS64_TYPE_DIR) return -LX64_EISDIR;
+    if (fs64_is_readonly64(-1)) return -LX64_EROFS;
+    if (g_lx_vfs_busy64) return -LX64_EBUSY;
+    g_lx_vfs_busy64 = 1;
+    __asm__ volatile("sti" ::: "memory");
+    const int rc = fs64_truncate64(-1, path, (uint32_t)len);
+    __asm__ volatile("cli" ::: "memory");
+    g_lx_vfs_busy64 = 0;
+    if (rc == 0) return 0;
+    if (rc == -LX64_EACCES) return -LX64_EACCES;                // 写权限不足（vfs64 已打 [PERM64] deny）
+    if (rc == -LX64_EROFS) return -LX64_EROFS;
+    if (rc == -LX64_EISDIR) return -LX64_EISDIR;
+    return -LX64_EIO;                                           // 空间不足/超上限/写盘失败（本内核不细分 ENOSPC）
+}
+static int64_t lx64_ftruncate64(uint64_t fd, uint64_t len) {
+    if (fd >= (uint64_t)FD64_MAX) return -LX64_EBADF;
+    if (len > 0xFFFFFFFFull) return -LX64_EINVAL;
+    const int rc = fd64_truncate64((int)fd, (uint32_t)len);
+    if (rc == 0) return 0;
+    if (rc == -FD64_EBADF) return -LX64_EBADF;
+    if (rc == -FD64_EISDIR) return -LX64_EISDIR;
+    if (rc == -FD64_ESPIPE) return -LX64_ESPIPE;
+    if (rc == -FD64_EROFS) return -LX64_EROFS;
+    if (rc == -FD64_EACCES) return -LX64_EACCES;
+    if (rc == -FD64_EFBIG) return -LX64_EIO;
+    return -LX64_EIO;
+}
 // ★ 批次 C 起不再只是"存进内核变量"：glibc 的 TLS 完全依赖 FS.base 真的生效
 //   （__thread / errno / stack canary 都从 FS 取）。写入策略：
 //     * 记进进程结构（proc64）—— 进程切换时由 task_apply_ctx64 保存/恢复这个 MSR；
@@ -2910,6 +2949,8 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 63:  return lx64_uname64(nr, a1);
     case 72:  return lx64_fcntl64(nr, a1, a2, a3);                   // ★ 本批：F_GETFL/F_SETFL（初始 fd 标志）
     case 74:  return lx64_fsync64(a1);
+    case 76:  return lx64_truncate64(nr, a1, a2);                    // ★ v0.9.26：truncate(path, len)
+    case 77:  return lx64_ftruncate64(a1, a2);                       // ★ v0.9.26：ftruncate(fd, len)
     case 137: return lx64_statfs64(nr, a1, a2);                       // ★ 本批：statfs(path, struct statfs)
     case 138: return lx64_fstatfs64(nr, a1, a2);                      // ★ 本批：fstatfs(fd, struct statfs)
     case 79:  return lx64_getcwd64(nr, a1, a2);                       // 真：当前进程 cwd（★ A4-2a）

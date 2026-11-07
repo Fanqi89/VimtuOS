@@ -3302,6 +3302,47 @@ def cap_deb_chain():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_cdrom_iso9660():
+    """★ v0.9.26「光驱驱动补全 + ISO9660 只读卷」：光盘能当文件系统读。
+
+    到 v0.9.25：ATAPI 只有"安装程序把载荷从光盘拷到硬盘"这一条用途（光驱没有驱动器号、
+    没有 READ CAPACITY、不进文件系统）；AHCI 侧对 PxSIG=0xEB140101 的端口只识别不读；
+    内核里 0 处 ISO9660 解析 —— 光盘插进去文件管理器里看不见任何东西。
+    """
+    need = ["kernel/iso9660_64.cpp", "kernel/iso9660_64.h", "tests/iso9660_64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    pvd = grep_count(r"CD001", ["kernel/iso9660_64.cpp"])
+    both = grep_count(r"rd32_both", ["kernel/iso9660_64.cpp"])
+    cdapi = grep_count(r"ata64_cd_(count|drive|read|capacity|model)64", ["kernel/ata64.h", "kernel/ata64.cpp"])
+    cap25 = grep_count(r"0x25", ["kernel/ata64.cpp", "kernel/ahci64.cpp"])
+    pkt = grep_count(r"AHCI64_CMD_PACKET|g_pkt_cdb", ["kernel/ahci64.cpp"])
+    kind = grep_count(r"FS64_KIND_ISO9660", ["kernel/fs64.h", "kernel/fs64.cpp"])
+    drv = grep_count(r"DRV64_FS_ISO9660", ["kernel/drive64.h", "kernel/drive64.cpp"])
+    ev = [
+        "光驱接口（kernel/ata64.h/.cpp 命中 %d）：ata64_cd_count64/drive64/model64/read64/capacity64 —— "
+        "**单位一律 2048B 光盘块**（与 512B 硬盘扇区严格分开）；驱动器号 0..3 = PATA ATAPI、"
+        "32.. = AHCI ATAPI；探测只读端口（LBA mid/high 的 0x14/0xEB 签名），没有光驱时一行日志都不打" % cdapi,
+        "READ CAPACITY(10)（CDB 0x25，命中 %d）：PATA 走 PACKET PIO、AHCI 走 PACKET DMA；容量如实上报，"
+        "失败返回 false 并写 0（不编一个容量）" % cap25,
+        "AHCI 侧 ATAPI 读（kernel/ahci64.cpp 命中 %d）：此前只打 \"kind=atapi（只识别）\"，本批补 "
+        "PACKET(0xA0) + 12 字节 CDB（ACMD 区 + features bit0=DMA + sector count=0），数据走 PRDT/DMA 暂存页池" % pkt,
+        "ISO9660（kernel/iso9660_64.cpp：PVD 魔数命中 %d、LE/BE 交叉校验命中 %d）：PVD@LBA16 -> 根目录记录 -> "
+        "逐级路径解析（名字大小写不敏感、\";1\" 版本后缀忽略、跳过 . / ..）-> 按字节读文件；"
+        "每个 32 位字段的**两个字节序副本都读并交叉校验**，不一致就如实失败（不猜）" % (pvd, both),
+        "接线（fs64 命中 %d / drive64 命中 %d）：FS64_KIND_ISO9660 只读卷（FS64_VOL_ISO_BASE=8），"
+        "list/stat/read/read_range 走 ISO9660，写入口一律 -FS64_EROFS；盘符层登记成一张 \"光盘\"（ro=1）" % (kind, drv),
+        "验收：tests/iso9660_64_test.py（真 QEMU + `-cdrom vimtu64-64.iso`，两种机器：i440fx=PATA / q35=AHCI）—— "
+        "宿主侧 Python 独立解析同一张 ISO 的 PVD/根目录，与客人串口报的 blocks/root extent/root size/条目数/名字集合/"
+        "读取长度**逐项比对**（不是自己证明自己）",
+        "（边界，如实：只解析主卷 —— **不做 Joliet(SVD) 与 Rock Ridge**，光盘上的名字按主卷 8.3 大写形式给；"
+        "不做多段/UDF；光盘只读，写操作在 fs64 入口就 -EROFS；多光驱同时挂载只支持一个 ISO 卷号）",
+    ]
+    done = pvd > 0 and both > 0 and cdapi > 0 and pkt > 0 and kind > 0 and drv > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 CAPS = [
     ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
      cap_boot_console),
@@ -3457,6 +3498,8 @@ CAPS = [
     ("内核", "★ VSync + 交换链（2/3 块）+ 混合渲染（GPU 主 / CPU 次；blitpolicy 按面积选路）", cap_vsync_swap),
     ("应用层", "★ 包管理器 .deb 完整链路（ar + control.tar.{gz,xz} + data.tar.{gz,xz} + 依赖模型 + 反例）",
      cap_deb_chain),
+    ("内核", "★ 光驱驱动补全（PATA/AHCI ATAPI 枚举 + READ CAPACITY + 2048B 块读）+ ISO9660 只读卷"
+             "（PVD/目录记录/路径解析/文件读，fs64 + 盘符接线）", cap_cdrom_iso9660),
 ]
 
 
@@ -3478,6 +3521,8 @@ TESTS = [
                           "ESP 拒格式化、删后抹首扇区）"),
     ("screen64_probe.py", "安装界面像素验收"),
     ("iso64_install_test.py", "ISO 光盘引导端到端"),
+    ("iso9660_64_test.py", "★ v0.9.26：光驱驱动（PATA/AHCI ATAPI + READ CAPACITY）+ ISO9660 只读卷 "
+                          "（宿主侧独立解析同一张 ISO 逐项比对 PVD/根目录/读取长度；i440fx 与 q35 两种机器）"),
     ("iso64_usb_test.py", "U 盘 hybrid 端到端"),
     ("vmware_install_test.py", "VMware(BIOS) 端到端真实安装 + 目标盘字节验收"),
     ("uefi64_install_test.py", "VMware EFI(UEFI) 端到端安装 + 目标盘字节验收"),

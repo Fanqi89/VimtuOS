@@ -285,6 +285,40 @@ int drive64_scan64() {
             if (idx >= 0 && p[i].type == 0x07 && main_idx < 0) main_idx = idx;
         }
         if (main_idx >= 0 && g_entry_main_count < 32) g_entry_main[g_entry_main_count++] = main_idx;
+
+    // ---- ★ v0.9.26：光驱（ISO9660 只读卷）登记成一条盘符 ----
+    // 前提：内核已经在启动时把光盘挂起来了（fs64_mount_iso64，见 kernel64.cpp 的系统内核路径）。
+    // 为什么用"已挂载"当条件而不是自己去探测光驱：安装介质内核也链本文件，但它不挂光盘，
+    // 这样安装向导里的磁盘表**不会**凭空多出一条"光盘"（那会改掉既有的目标盘选择逻辑）。
+    {
+        const int isov = fs64_iso_vol64();
+        if (isov >= 0) {
+            Fs64Vol64 fv;
+            if (fs64_vol_info64(isov, &fv) == 0) {
+                DriveInfo64 e;
+                zero_bytes(&e, (uint32_t)sizeof(e));
+                e.slot = DRV64_SLOT_NONE;
+                e.fatvol = DRV64_SLOT_NONE;
+                e.vol = isov;
+                e.present = true;
+                e.disk = fv.disk;                       // 光驱的驱动器号（ATA64_CD_AHCI_BASE+ 或 0..3）
+                e.part = 0;                             // 光盘没有分区表
+                e.start_lba = 0;
+                e.sectors = 0;                          // 2048B 块数见 total_kb（口径不同，不混填）
+                e.fskind = DRV64_FS_ISO9660;
+                copy_str(e.fs, DRV64_FS_MAX, "ISO9660");
+                copy_str(e.name, DRV64_NAME_MAX, "光盘");
+                e.browsable = true;
+                e.readonly = true;                      // 只读介质：写操作一律被 fs64 拒绝
+                e.total_known = fv.total_known ? true : false;
+                e.total_kb = fv.total_kb;
+                e.free_known = false;                   // 只读介质没有"可用空间"
+                e.free_kb = 0;
+                e.skip = DRV64_SKIP_NONE;
+                add_entry(e, nullptr);
+            }
+        }
+    }
     }
 
     // ---- ★ 多卷：给每个可浏览卷分配/复用一个 vfs64 卷槽（只读挂载：不改盘上内容）----

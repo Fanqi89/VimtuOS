@@ -2854,6 +2854,307 @@ int vfs64_write_at64(const char* path, uint32_t off, const void* buf, uint32_t l
     if (is_new) touch_dir(parent, 0);
     return 0;
 }
+// ==================== ★ 本批：截断 / 改变文件大小（POSIX truncate 语义）====================
+// 为什么另开一段函数而不是复用 write_at64 / write_stream64：
+//   * 整体重写（write_stream64）要调用方提供 len 字节的**内容**，扩展时内容全是 0 也得整份缓冲；
+//   * write_at64(off == size) 只会把 size 变大，没有"回收尾部块"这一支；
+//   * 所以这里只做两件事：缩小 = 摘掉尾部映射 + **真回收**块；扩展 = **补零** + size 变大。
+// 两个方向都遵守本文件的写纪律：**先断指针、后放块** —— 盘上的 inode 在任何时刻都不会指向已释放的块
+// （与 write_stream64 的"建新链 -> 提交 inode -> 释放旧块"同一个顺序）。
+
+// 成功打点：[VFS64] truncate ok path=<p> size=<n> from=<old>（路径按其它打点的口径截到 40 字节）
+static void log_truncate_ok64(const char* path, uint32_t size, uint32_t from) {
+    char b[41];
+    uint32_t i = 0;
+    if (path) { for (; path[i] && i < 40u; i++) b[i] = path[i]; }
+    b[i] = 0;
+    dbg64_line_begin64();                       // ★ 行原子
+    dbg64_str("[VFS64] truncate ok path=");
+    dbg64_str(b);
+    dbg64_str(" size=");
+    dbg64_dec(size);
+    dbg64_str(" from=");
+    dbg64_dec(from);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// 释放一个块号数组 [k0, k1) 里的数据块（0 = 空条目跳过；越界只打点，绝不越界读写）
+static bool free_ptr_range64(const uint32_t* p, uint32_t k0, uint32_t k1) {
+    bool ok = true;
+    for (uint32_t k = k0; k < k1; k++) {
+        const uint32_t b = p[k];
+        if (b == 0) continue;
+        if (!blk_ok_data(b)) { log_bad_block(b); ok = false; continue; }
+        if (!bitmap_set(b, false)) ok = false;
+    }
+    return ok;
+}
+
+// 缩小的第一步（**提交 inode 之前**）：只决定"哪些整块引用要摘掉"，不碰位图。
+//   * 直接块（fs 块 0..3）：指针就在 inode 里 -> 清 ino 镜像、块号记进 out_tail；
+//   * 一级/二级间接块：只有"整块都用不到"时才连块一起摘（部分保留的留给第二步就地清条目）。
+// out_tail 是一个**只装待回收引用**的 inode 镜像（其余字段全 0），交给 free_file_blocks 回收 ——
+// 这样"整块摘掉"的那部分走的就是与 unlink 完全相同的一段回收代码，不会漏层级。
+static bool shrink_detach64(uint8_t* ino, uint32_t new_blocks, uint32_t old_blocks, uint8_t* out_tail) {
+    bool ok = true;
+    // ★ v0.9.26 上机补强：把"这次摘链到底摘了什么"打一行 —— 块回收记账对不上时，
+    //   这是唯一能看清 inode 链形状（d0..d3 / ind / dind 是否非 0）与新旧块数的现场证据。
+    {
+        dbg64_line_begin64();
+        dbg64_str("[VFS64] truncate detach nb=");
+        dbg64_dec(new_blocks);
+        dbg64_str(" ob=");
+        dbg64_dec(old_blocks);
+        dbg64_str(" d=");
+        dbg64_dec((uint64_t)(rd32(ino + VFS_I_D0) != 0) + (rd32(ino + VFS_I_D0 + 4) != 0) +
+                  (rd32(ino + VFS_I_D0 + 8) != 0) + (rd32(ino + VFS_I_D0 + 12) != 0));
+        dbg64_str(" ind=");
+        dbg64_dec((rd32(ino + VFS_I_IND) != 0) ? 1u : 0u);
+        dbg64_str(" dind=");
+        dbg64_dec((g_lay->dind_off != 0 && rd32(ino + g_lay->dind_off) != 0) ? 1u : 0u);
+        dbg64_str(" direct_limit=");
+        dbg64_dec(VFS64_DIRECT_BLOCKS);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    // ---- 直接块 ----
+    for (uint32_t i = new_blocks; i < old_blocks && i < VFS64_DIRECT_BLOCKS; i++) {
+        wr32(out_tail + VFS_I_D0 + 4u * i, rd32(ino + VFS_I_D0 + 4u * i));
+        wr32(ino + VFS_I_D0 + 4u * i, 0);
+    }
+    // ---- 一级间接块（fs 块 4..131）----
+    if (old_blocks > VFS64_DIRECT_BLOCKS && new_blocks <= VFS64_DIRECT_BLOCKS) {
+        const uint32_t ind = rd32(ino + VFS_I_IND);
+        if (ind == 0) { log_op_fail("truncate", "missing indirect block (corrupt chain)"); ok = false; }
+        else if (!blk_ok_data(ind)) { log_bad_block(ind); ok = false; }
+        else { wr32(out_tail + VFS_I_IND, ind); wr32(ino + VFS_I_IND, 0); }
+    }
+    // ---- 二级间接块（fs 块 >= 132）----
+    if (g_lay->dind_off != 0 && old_blocks > VFS64_L2_FIRST_BLOCK && new_blocks <= VFS64_L2_FIRST_BLOCK) {
+        const uint32_t dind = rd32(ino + g_lay->dind_off);
+        if (dind == 0) { log_op_fail("truncate", "missing double-indirect block (corrupt chain)"); ok = false; }
+        else if (!blk_ok_data(dind)) { log_bad_block(dind); ok = false; }
+        else {
+            wr32(out_tail + g_lay->dind_off, dind);
+            wr32(ino + g_lay->dind_off, 0);
+        }
+    }
+    return ok;
+}
+
+// 缩小的第二步（**提交 inode 之后**）：回收"部分保留"的间接块尾巴。
+// **为什么缩小要从高位块开始回收**：三层链（直接 -> 一级 -> 二级）的形状决定"块号越大 = 越晚被用到"，
+//   要丢掉的那些块必然落在链的**尾巴**上（二级间接的最后几个子块 -> 一级间接的最后几个条目 -> 直接块的末几个）。
+//   从高位往低位摘，每摘一刀之后链上活着的部分仍然是"从头开始、连续"的一张合法映射 —— 正是 size 缩小后
+//   应有的形状；反过来从低位往高位摘，中途每个状态都会出现"低编号块已释放、高编号块还指着"的空洞，
+//   读路径（read_at_inode）会把它当损坏。另外位图上高编号区域更晚被分配，从高位回收更容易把自由区连成一片。
+// 每个容器块（一级间接块 / 二级间接块的子块）都是一个"512B 的块号数组"，处理顺序固定为：
+//   把越界条目在 RAM 里清零 -> **先把容器块写回盘**（断指针）-> 再按 RAM 里的原值释放那些数据块。
+//   于是中途掉电最坏是"块还标着已用"（泄漏），绝不会出现"指针还指着已释放的块"。
+static bool shrink_reclaim64(const uint8_t* ino, uint32_t new_blocks, uint32_t old_blocks) {
+    bool ok = true;
+    const bool whole_ind  = (old_blocks > VFS64_DIRECT_BLOCKS && new_blocks <= VFS64_DIRECT_BLOCKS);
+    const bool whole_dind = (old_blocks > VFS64_L2_FIRST_BLOCK && new_blocks <= VFS64_L2_FIRST_BLOCK);
+    // ---- 一级间接块：部分保留 -> 清尾部条目 + 回收那些数据块 ----
+    if (!whole_ind && old_blocks > VFS64_DIRECT_BLOCKS && new_blocks < VFS64_L2_FIRST_BLOCK) {
+        const uint32_t ind = rd32(ino + VFS_I_IND);
+        const uint32_t k0 = new_blocks - VFS64_DIRECT_BLOCKS;
+        const uint32_t k1 = (old_blocks < VFS64_L2_FIRST_BLOCK) ? (old_blocks - VFS64_DIRECT_BLOCKS)
+                                                                : VFS64_INDIRECT_PTRS;
+        if (ind == 0) { log_op_fail("truncate", "missing indirect block (corrupt chain)"); ok = false; }
+        else if (!load_indirect(ind, g_ptrs)) ok = false;
+        else {
+            copy_bytes(g_sec, (const uint8_t*)g_ptrs, VFS64_SECTOR_BYTES);   // 原值留在 g_ptrs 里
+            for (uint32_t k = k0; k < k1; k++) wr32(g_sec + 4u * k, 0);
+            if (!blk_write(ind, g_sec)) { log_op_fail("truncate", "indirect rewrite failed"); ok = false; }
+            else if (!free_ptr_range64(g_ptrs, k0, k1)) ok = false;
+        }
+    }
+    // ---- 二级间接块：部分保留 -> 先摘掉"整块都用不到"的子块，再清还活着的那个子块的尾巴 ----
+    if (!whole_dind && old_blocks > VFS64_L2_FIRST_BLOCK && new_blocks > VFS64_L2_FIRST_BLOCK &&
+        g_lay->dind_off != 0) {
+        const uint32_t dind = rd32(ino + g_lay->dind_off);
+        // 子块 c 覆盖 fs 块 [132 + 128c, 132 + 128(c+1))；整块都 >= new_blocks 的第一个 c：
+        const uint32_t c_dead = (new_blocks - VFS64_L2_FIRST_BLOCK + VFS64_INDIRECT_PTRS - 1u) /
+                                VFS64_INDIRECT_PTRS;
+        if (dind == 0) { log_op_fail("truncate", "missing double-indirect block (corrupt chain)"); ok = false; }
+        else if (!load_indirect(dind, g_ptrs)) ok = false;
+        else {
+            bool any_dead = false;
+            copy_bytes(g_sec, (const uint8_t*)g_ptrs, VFS64_SECTOR_BYTES);   // 原值留在 g_ptrs 里
+            for (uint32_t c = c_dead; c < VFS64_DIND_CHILDREN; c++) {
+                if (g_ptrs[c] == 0) continue;
+                wr32(g_sec + 4u * c, 0);
+                any_dead = true;
+            }
+            if (any_dead) {
+                if (!blk_write(dind, g_sec)) {
+                    log_op_fail("truncate", "double-indirect rewrite failed");
+                    ok = false;
+                } else {
+                    // 断指针之后才回收这些子块（子块自己 + 它指着的 128 个数据块）
+                    for (uint32_t c = c_dead; c < VFS64_DIND_CHILDREN; c++) {
+                        const uint32_t child = g_ptrs[c];
+                        if (child == 0) continue;
+                        if (!blk_ok_data(child)) { log_bad_block(child); ok = false; continue; }
+                        if (!load_indirect(child, g_rm_child)) { ok = false; continue; }
+                        if (!free_ptr_range64(g_rm_child, 0, VFS64_INDIRECT_PTRS)) ok = false;
+                        if (!bitmap_set(child, false)) ok = false;
+                    }
+                }
+            }
+            // 还活着的那个子块（下标 c_dead - 1）：只清它里面的尾巴条目
+            if (c_dead > 0) {
+                const uint32_t live = g_ptrs[c_dead - 1];
+                const uint32_t k1 = new_blocks - VFS64_L2_FIRST_BLOCK -
+                                    (c_dead - 1u) * VFS64_INDIRECT_PTRS;   // 该子块里前多少条还活着
+                if (live != 0 && k1 < VFS64_INDIRECT_PTRS) {
+                    if (!blk_ok_data(live)) { log_bad_block(live); ok = false; }
+                    else if (!load_indirect(live, g_rm_child)) ok = false;
+                    else {
+                        copy_bytes(g_sec, (const uint8_t*)g_rm_child, VFS64_SECTOR_BYTES);
+                        for (uint32_t k = k1; k < VFS64_INDIRECT_PTRS; k++) wr32(g_sec + 4u * k, 0);
+                        if (!blk_write(live, g_sec)) {
+                            log_op_fail("truncate", "child block rewrite failed");
+                            ok = false;
+                        } else if (!free_ptr_range64(g_rm_child, k1, VFS64_INDIRECT_PTRS)) ok = false;
+                    }
+                }
+            }
+        }
+    }
+    return ok;
+}
+// 缩小：摘指针 -> 提交 inode -> 回收 -> **自核对**（空闲块数必须正好多出"旧链块数 - 新链块数"）。
+// 为什么"回收整块"要等 inode 提交之后：提交前 inode 还引用着那些块（见 shrink_detach64 的注释）；
+// 提交后它们已经是"无人引用的块"，用 free_file_blocks 一次回收干净（直接 + 一级 + 二级 + 128 子块）。
+static bool truncate_shrink64(uint8_t* ino, uint32_t idx, uint32_t new_size, uint32_t old_size) {
+    uint32_t fb_before = 0;
+    const bool have_before = (vfs64_free64(&fb_before, nullptr, nullptr) == 0);
+    const uint32_t new_blocks = (new_size + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
+    const uint32_t old_blocks = (old_size + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
+    uint8_t tail[VFS64_INODE_BYTES_MAX];            // 只装"整块被摘掉"的引用（交给 free_file_blocks）
+    zero_bytes(tail, VFS64_INODE_BYTES_MAX);
+    if (!shrink_detach64(ino, new_blocks, old_blocks, tail)) {
+        log_line("truncate: WARN tail pointers not fully detached");   // 摘不掉的引用原样留着（宁可泄漏，不乱猜）
+    }
+    wr32(ino + VFS_I_SIZE, new_size);                               // ② 提交 inode：size + mtime + CRC
+    if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
+    wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
+    if (!inode_store(idx, ino)) { log_op_fail("truncate", "inode commit failed"); return false; }
+    // ③ 回收：先收"整块摘掉"的链（与 unlink 同一段代码），再收部分保留的间接块尾巴
+    if (!free_file_blocks(tail)) log_line("truncate: WARN block reclaim incomplete (leaked)");
+    if (!shrink_reclaim64(ino, new_blocks, old_blocks)) {
+        log_line("truncate: WARN tail reclaim incomplete (leaked)");
+    }
+    // ④ 自核对（模仿自检里的"回到基线"断言，只打点、**不新增自检位**）：
+    //    旧链占 blocks_for(old_size) 块、新链占 blocks_for(len) 块，位图回收量必须正好等于两者之差。
+    //    对不上就说明回收半途丢了一部分（或链本来就与 size 不自洽）—— 如实打出来，绝不静默。
+    {
+        uint32_t fb_after = 0;
+        if (have_before && vfs64_free64(&fb_after, nullptr, nullptr) == 0) {
+            const uint32_t expect = vfs64_blocks_for_bytes64(old_size) - vfs64_blocks_for_bytes64(new_size);
+            const uint32_t got = (fb_after > fb_before) ? (fb_after - fb_before) : 0u;
+            if (got != expect) {
+                dbg64_line_begin64();               // ★ 行原子
+                dbg64_str("[VFS64] truncate: block reclaim mismatch freed=");
+                dbg64_dec(got);
+                dbg64_str(" expect=");
+                dbg64_dec(expect);
+                // ★ 上机补强：把"交给 free_file_blocks 的那份 tail 镜像里到底有什么"也打出来 ——
+                //   记账对不上时，能立刻区分"指针没摘进 tail"与"tail 里的块没被真正释放"。
+                dbg64_str(" tail_d=");
+                dbg64_dec((uint64_t)(rd32(tail + VFS_I_D0) != 0) + (rd32(tail + VFS_I_D0 + 4) != 0) +
+                          (rd32(tail + VFS_I_D0 + 8) != 0) + (rd32(tail + VFS_I_D0 + 12) != 0));
+                dbg64_str(" tail_ind=");
+                dbg64_dec((rd32(tail + VFS_I_IND) != 0) ? 1u : 0u);
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+        }
+    }
+    return true;                                    // 泄漏只打点：size 已改对，用户可见的结果是成功
+}
+
+// 扩展：把 [old_size, new_size) **补零**（本文件系统不做稀疏文件：这段字节必须能从盘上读回 0）。
+// 为什么按 512B 一块、传一个真实的 0 缓冲，而不是直接用 write_range_ctx 的 src == nullptr 捷径：
+//   那条捷径按"新块本来就是 0"处理，可分配器只保证把位图置位，盘上残留的是上一任主人的字节；
+//   truncate 的语义要求这段区间读到 0，所以这里老老实实把 0 写下去（首尾的"半块"仍走读-改-写，不动别的字节）。
+// 失败：返回 false 且**盘上 inode 一字不改**（ino 只是 RAM 镜像、没提交），本次新分配的块全部回滚
+//   （map_flush 之前的失败都能回滚；之后只剩"块泄漏"，与 write_at 同口径，size/块链仍是调用前的样子）。
+static bool truncate_grow64(uint8_t* ino, uint32_t idx, uint32_t new_size) {
+    const uint32_t old_size = rd32(ino + VFS_I_SIZE);
+    // 空预检（与 write_at_inode 同口径）：扩展需要的新块（数据块 + 间接块）超过空闲块就**先失败**
+    {
+        uint32_t fb = 0;
+        if (vfs64_free64(&fb, nullptr, nullptr) != 0) { log_op_fail("truncate", "free space unknown"); return false; }
+        const uint32_t need = vfs64_blocks_for_bytes64(new_size) - vfs64_blocks_for_bytes64(old_size);
+        if (fb < need + 1u) { log_op_fail("truncate", "no space (pre-flight)"); return false; }
+    }
+    static const uint8_t zero_blk[VFS64_BLOCK_BYTES] = { 0 };   // 补零的数据源（只读、全 0）
+    Vfs64MapCtx m;
+    ctx_init(&m, ino);
+    m.max_fs_blocks = (new_size + VFS64_BLOCK_BYTES - 1u) / VFS64_BLOCK_BYTES;
+    uint32_t off = old_size;
+    while (off < new_size) {
+        uint32_t n = new_size - off;
+        if (n > VFS64_BLOCK_BYTES) n = VFS64_BLOCK_BYTES;
+        if (!write_range_ctx(&m, off, zero_blk, n)) { alloc_rollback(); return false; }
+        off += n;
+    }
+    if (!map_flush(&m)) return false;               // 指针可能已落盘：不再回滚（只泄漏块，inode 没提交）
+    alloc_forget();
+    wr32(ino + VFS_I_SIZE, new_size);
+    if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
+    wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
+    if (!inode_store(idx, ino)) { log_op_fail("truncate", "inode commit failed"); return false; }
+    return true;
+}
+// 截断 / 改变文件大小（POSIX truncate(2) 语义；**不创建文件**）。语义与打点见 vfs64.h 的声明注释。
+int vfs64_truncate64(const char* path, uint32_t len) {
+    if (!g_mounted) { log_op_fail("truncate", "not mounted"); return -1; }
+    if (!path) { log_op_fail("truncate", "bad args"); return -1; }
+    // 上限：与 write_at / write_stream 同一口径（v2 卷 67584，v3/v4 = 8 MiB）；**先查上限再动盘**
+    const uint32_t lim = (g_lay->dind_off != 0) ? VFS64_MAX_FILE_BYTES : VFS64_MAX_FILE_BYTES_V2;
+    if (len > lim) { log_op_fail("truncate", "too large (over the single-file limit)"); return -1; }
+    // 解析路径：**跟随**符号链接（POSIX truncate(2)）；不存在 -> -1；某一级目录缺 x -> -EACCES
+    uint32_t idx = 0;
+    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr != 0) {
+        if (pr == -VFS64_EACCES) { log_op_fail("truncate", "permission denied (traverse)"); return -VFS64_EACCES; }
+        log_op_fail("truncate", "not found");
+        return -1;
+    }
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    if (inode_load_ok(idx, ino, "truncate") != 0) return -1;
+    if (ino[VFS_I_TYPE] == VFS64_TYPE_DIR) {
+        log_op_fail("truncate", "path is a directory (EISDIR)");
+        return -VFS64_EISDIR;
+    }
+    if (ino[VFS_I_TYPE] != VFS64_TYPE_FILE) { log_op_fail("truncate", "not a file"); return -1; }
+    // 权限：与 write_resolve64 的"已有文件"分支同一口径 —— 改大小就是写，要文件 w（v2/v3 旧卷不拦）
+    const int pc = perm_check_ino64(ino, "truncate", path, VFS64_NEED_W);
+    if (pc != 0) { log_op_fail("truncate", "permission denied (w)"); return pc; }
+    const uint32_t old_size = rd32(ino + VFS_I_SIZE);
+    if (len == old_size) {                          // 幂等：一个字节都不动（也不刷新 mtime）
+        log_truncate_ok64(path, len, old_size);
+        return 0;
+    }
+    if (len > old_size) {
+        if (!truncate_grow64(ino, idx, len)) return -1;
+    } else {
+        if (!truncate_shrink64(ino, idx, len, old_size)) return -1;
+    }
+    log_truncate_ok64(path, len, old_size);
+    return 0;
+}
+// 按槽变体：期间"卷"= slot、"身份"= root（与其它 *_on64 完全同形，见 Vfs64SlotGuard）
+int vfs64_truncate_on64(int slot, const char* path, uint32_t len) {
+    Vfs64SlotGuard g(slot, true);
+    if (!g.active) return on64_slot_unavailable("truncate", slot);
+    return vfs64_truncate64(path, len);
+}
 // 建空文件（父目录必须存在；已存在且是文件 = 0 幂等；是目录 = -1）。
 // ★ P4：新建走 write 的权限判定（父目录 w+x），已存在则要 w（覆盖提交一次空内容 = 截断语义）。
 int vfs64_create64(const char* path) {
@@ -4851,6 +5152,62 @@ int vfs64_selftest64() {
             dbg64_str(" over_rejected=2 rewrite_shrink=1 truncate_free=1");
             dbg64_nl();
             if (!lim) fails |= 32768;
+        }
+
+        // ---- bit17（131072）：★ v0.9.26 —— truncate（缩小真回收 / 扩零加长 / 目录拒绝 / 幂等）----
+        //   为什么必须单独一段：truncate 是本批**新加**的原语（vfs64_truncate64），
+        //   光"编译过"不算证据。这里用真实卷证明三件事：
+        //     ① 缩小真的把块还给位图（不是只改 size 字段）；② 扩展写的是**真实的 0**
+        //     （本文件系统没有稀疏文件）；③ 目录 -> -EISDIR、同大小 -> 幂等、收到 0 后块归零。
+        //   每个判据都带编号（step）：失败时打印**第一条**红的编号，排障不用猜（这是上机后的补强）。
+        //   几何与 bit13..15 同：假盘后半段那个 2MB 卷。
+        {
+            uint32_t step = 0;                                   // 0 = 全过；!=0 = 第一条失败判据的编号
+            bool tr = true;
+            #define TR_FAIL(k) do { tr = false; if (step == 0) step = (k); } while (0)
+            uint32_t fbT = 0;
+            if (vfs64_free64(&fbT, nullptr, nullptr) != 0) TR_FAIL(1);
+            const uint32_t need4 = vfs64_blocks_for_bytes64(4096u);
+            const uint32_t need1 = vfs64_blocks_for_bytes64(1024u);
+            if (vfs64_write_stream64("/tr.bin", 4096u, sel_src64, nullptr) != 4096) TR_FAIL(2);
+            uint32_t fb4 = 0;
+            if (vfs64_free64(&fb4, nullptr, nullptr) != 0 || fbT < fb4 || (fbT - fb4) != need4) TR_FAIL(3);
+            // ① 缩小到 1024：多出来的块（数据块 + 一级间接块）必须真的回到位图
+            if (vfs64_truncate64("/tr.bin", 1024u) != 0) TR_FAIL(4);
+            uint32_t f1024 = 0;
+            if (vfs64_free64(&f1024, nullptr, nullptr) != 0) TR_FAIL(5);
+            else if (f1024 < fb4 || (f1024 - fb4) != (need4 - need1)) TR_FAIL(6);
+            uint32_t ty2 = 0, sz2 = 0;
+            if (vfs64_stat("/tr.bin", &ty2, &sz2) != 0 || sz2 != 1024u || ty2 != VFS64_TYPE_FILE) TR_FAIL(7);
+            // 保留区必须原样（truncate 不许动前面那段字节）
+            uint32_t got3 = 0;
+            if (vfs64_read_at64("/tr.bin", 0, chunk, 1024u, &got3) != 0 || got3 != 1024u) TR_FAIL(8);
+            else for (uint32_t i = 0; i < got3; i++) if (chunk[i] != pat64(i)) { TR_FAIL(9); break; }
+            // ② 扩展回 4096：1024..4095 必须是**真实 0**（旧数据残留会在这里现形）
+            if (vfs64_truncate64("/tr.bin", 4096u) != 0) TR_FAIL(10);
+            if (vfs64_stat("/tr.bin", &ty2, &sz2) != 0 || sz2 != 4096u) TR_FAIL(11);
+            uint32_t got4 = 0;
+            if (vfs64_read_at64("/tr.bin", 1024u, chunk, 3072u, &got4) != 0 || got4 != 3072u) TR_FAIL(12);
+            else for (uint32_t i = 0; i < got4; i++) if (chunk[i] != 0) { TR_FAIL(13); break; }
+            // ③ 目录 -> -EISDIR；④ 同大小 -> 幂等 0
+            if (vfs64_mkdir64("/trdir") != 0) TR_FAIL(14);
+            else if (vfs64_truncate64("/trdir", 0) != -VFS64_EISDIR) TR_FAIL(15);
+            if (vfs64_truncate64("/tr.bin", 4096u) != 0) TR_FAIL(16);
+            // ⑤ 收到 0 再删：块必须全部回收、回到本轮基线
+            if (vfs64_truncate64("/tr.bin", 0) != 0) TR_FAIL(17);
+            if (vfs64_unlink64("/tr.bin") != 0) TR_FAIL(18);
+            if (vfs64_rmdir64("/trdir") != 0) TR_FAIL(19);
+            uint32_t fbEnd = 0;
+            if (vfs64_free64(&fbEnd, nullptr, nullptr) != 0 || fbEnd != fbT) TR_FAIL(20);
+            #undef TR_FAIL
+            dbg64_str("[VFS64] truncate ok shrink_pages=");
+            dbg64_dec(need4 - need1);
+            dbg64_str(" grow_zero=1 eisdir=1 idem=1 free_back_to_base=");
+            dbg64_dec((fbEnd == fbT) ? 1u : 0u);
+            dbg64_str(" step=");
+            dbg64_dec(step);
+            dbg64_nl();
+            if (!tr) fails |= 131072;
         }
 
         g_fake_active = false;

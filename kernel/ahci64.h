@@ -87,3 +87,15 @@ bool ahci64_selftest64();
 
 // 控制器/端口摘要（报告页只读；永远非空）
 const Ahci64CtrlInfo* ahci64_ctrl64();
+
+// ==================== ★ v0.9.26：AHCI 侧 ATAPI（SATA 光驱）读 ====================
+// 到 v0.9.25 为止，本驱动对 PxSIG = 0xEB140101 的端口**只识别不读**（打点里也这么写）。
+// 本批补上 PACKET(0xA0) + 12 字节 CDB 的读路径：数据走 DMA（一条命令一个 2048B 光盘块），
+// 传输长度由 CDB 决定（H2D FIS 的 count 写 0、features bit0 = 1 = DMA）。
+//   语义与 ata64 的光驱段**完全一致**：idx 是"第几个 AHCI 光驱"（0 起），
+//   lba/sectors 单位 = 2048B 光盘块；上层拿到的驱动器号 = ATA64_CD_AHCI_BASE + idx。
+//   没控制器 / 没 ATAPI 端口时 count = 0（调用方按"没有光驱"处理，不崩）。
+int  ahci64_cd_count64();
+bool ahci64_cd_info64(int idx, DiskInfo* out);
+bool ahci64_cd_read64(int idx, uint32_t cd_lba, uint32_t sectors, void* buf);
+bool ahci64_cd_capacity64(int idx, uint32_t* out_sectors, uint32_t* out_bytes);

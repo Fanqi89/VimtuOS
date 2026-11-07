@@ -172,6 +172,10 @@ int fd64_write64(int fd, const void* buf, int len);
 int fd64_lseek64(int fd, int64_t off, int whence);
 int fd64_stat64(int fd, uint32_t* type_out, uint32_t* size_out);
 int fd64_fsync64(int fd);
+// ★ v0.9.26：ftruncate(77) 的底座 —— 按 fd 对应路径截断/加长（不改文件游标，但刷新 of->size）。
+//   目录 -> -EISDIR；管道 -> -ESPIPE；只读打开的 fd -> -EBADF；只读卷 -> -EROFS；
+//   空间不足/超上限 -> -ENOSPC / -EFBIG（与 write 同一套口径）。
+int fd64_truncate64(int fd, uint32_t len);
 // dup：newfd >= 0 时占用该槽（**含 0/1/2 = 换标准流**）；newfd < 0 时自动分配一个新槽（>= 3）。
 // 返回新 fd 或负错误码（-EBADF：oldfd 无效 / newfd 越界 0..31）。
 // ★ Linux 语义：新旧 fd 指向**同一个 OpenFile64**（共享偏移/目录游标），引用计数 +1。

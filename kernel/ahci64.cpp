@@ -353,6 +353,11 @@ static void ahci_dump_hdr64(uint8_t p, const volatile uint32_t* hdr, const uint8
 // 命令头/PRDT/寄存器诊断只打一次（第一条命令），之后不再刷屏
 static uint8_t g_hdr_dumped = 0;
 
+// ★ v0.9.26：非空 = 本次 ahci_cmd 是 PACKET(ATAPI) 命令，指向 12 字节 CDB。
+// 为什么用文件级指针而不是给 ahci_cmd 加参数：它已有 6 个调用点（读/写/识别/重试），
+// 加参数会把改动面放大；这里只在 ATAPI 传输期间置位、命令返回即清零。
+static const uint8_t* g_pkt_cdb = 0;
+
 // 下发一条命令并轮询完成。返回 true = 成功（PxCI 清零 + 无错误位）。
 static bool ahci_cmd(int di, uint8_t cmd, uint64_t lba, uint32_t count,
                      const Ahci64Prd* prds, int nprd, bool write, bool atapi_cmd) {
@@ -367,7 +372,15 @@ static bool ahci_cmd(int di, uint8_t cmd, uint64_t lba, uint32_t count,
     // ---- 命令表（CFIS/ACMD/PRDT）----
     uint8_t* ct = d.ct;
     ahci_build_cfis(ct, cmd, lba, count);
-    for (int i = 0x40; i < 0x80; i++) ct[i] = 0;                 // ACMD（本驱动不用 PACKET 命令）
+    for (int i = 0x40; i < 0x80; i++) ct[i] = 0;                 // ACMD（默认不用 PACKET；见 g_pkt_cdb）
+    // ★ v0.9.26：ATAPI 读走 PACKET(0xA0)，12 字节 CDB 放在 ACMD 区；数据用 DMA
+    //   （features low 的 bit0 = 1），传输长度由 CDB 决定，所以 sector count 必须写 0。
+    if (g_pkt_cdb) {
+        ct[3]  = 0x01;                                           // features low：bit0=1 -> DMA
+        ct[12] = 0;                                              // sector count low  = 0
+        ct[13] = 0;                                              // sector count high = 0
+        for (int i = 0; i < 12; i++) ct[0x40 + i] = g_pkt_cdb[i];
+    }
     for (int i = 0; i < nprd; i++) {
         uint8_t* pe = ct + 0x80 + i * 16;
         // PRDT 项（16B）：+0x00 DBA、+0x04 DBAU、+0x08 **保留**、+0x0C DBC（bits[21:0] = 字节数-1，
@@ -973,4 +986,127 @@ bool ahci64_selftest64() {
     dbg64_nl();
     dbg64_line_end64();
     return false;
+}
+
+// ==================== ★ v0.9.26：AHCI 侧 ATAPI（SATA 光驱）读 ====================
+// 全流程：PACKET(0xA0) + 12 字节 CDB；数据一条命令搬一个 2048B 光盘块（DMA 暂存页池）。
+// 为什么一条命令只搬一个块：与 ata64 侧 PIO 路径同口径（那侧踩过"字节计数与设备实际
+// 给的数据量不一致 -> ABRT"，一块一条命令最稳）；光盘读本来就是顺序流，多一条命令的
+// 开销在毫秒量级。
+#define AHCI64_CMD_PACKET 0xA0u
+
+// idx（第几个 AHCI ATAPI 设备）-> g_devs[] 下标
+static int ahci_cd_index(int idx) {
+    if (idx < 0) return -1;
+    int k = 0;
+    for (int i = 0; i < g_dev_count; i++) {
+        if (!g_devs[i].used || g_devs[i].kind != AHCI64_KIND_ATAPI) continue;
+        if (k == idx) return i;
+        k++;
+    }
+    return -1;
+}
+
+int ahci64_cd_count64() {
+    int n = 0;
+    for (int i = 0; i < g_dev_count; i++)
+        if (g_devs[i].used && g_devs[i].kind == AHCI64_KIND_ATAPI) n++;
+    return n;
+}
+
+bool ahci64_cd_info64(int idx, DiskInfo* out) {
+    if (!out) return false;
+    out->present = false;
+    out->atapi = false;
+    out->sectors = 0;
+    out->model[0] = 0;
+    const int di = ahci_cd_index(idx);
+    if (di < 0) return false;
+    out->present = true;
+    out->atapi = true;                                   // 光驱：容量走 READ CAPACITY，不在这里编
+    for (int i = 0; i < 41; i++) out->model[i] = g_devs[di].model[i];
+    return true;
+}
+
+// 发一条 CDB 并从设备 DMA 收 bytes 字节。走暂存页池（不依赖调用方缓冲的物理连续性）。
+static bool ahci_atapi_xfer(int di, const uint8_t* cdb, void* buf, uint32_t bytes) {
+    if (bytes == 0) return true;
+    if (!g_dma[0]) return false;                          // 页池没拿到缓冲：如实失败
+    Ahci64Prd prds[AHCI64_DMA_PAGES];
+    int nprd = 0;
+    uint32_t left = bytes;
+    for (int i = 0; i < AHCI64_DMA_PAGES && left > 0; i++) {
+        prds[nprd].pa = (uint64_t)(uintptr_t)g_dma[i];
+        prds[nprd].bytes = (left > 4096u) ? 4096u : left;
+        left -= prds[nprd].bytes;
+        nprd++;
+    }
+    if (left != 0) return false;
+    g_pkt_cdb = cdb;                                      // ahci_cmd 里据此填 ACMD + 置 DMA 位
+    const bool ok = ahci_cmd_retry(di, AHCI64_CMD_PACKET, 0, 0, prds, nprd, false, true);
+    g_pkt_cdb = 0;
+    if (!ok) return false;
+    uint8_t* o = (uint8_t*)buf;
+    uint32_t off = 0;
+    for (int i = 0; i < nprd; i++) {
+        for (uint32_t k = 0; k < prds[i].bytes; k++) o[off + k] = g_dma[i][k];
+        off += prds[i].bytes;
+    }
+    return true;
+}
+
+// READ(10) 一个 2048B 块
+static bool ahci_atapi_read1(int di, uint32_t lba, void* buf) {
+    uint8_t cdb[12];
+    for (int i = 0; i < 12; i++) cdb[i] = 0;
+    cdb[0] = 0x28;                                        // READ(10)
+    cdb[2] = (uint8_t)((lba >> 24) & 0xFF);
+    cdb[3] = (uint8_t)((lba >> 16) & 0xFF);
+    cdb[4] = (uint8_t)((lba >> 8) & 0xFF);
+    cdb[5] = (uint8_t)(lba & 0xFF);
+    cdb[8] = 1;                                           // 传输长度 1 块（高字节在 [7] = 0）
+    return ahci_atapi_xfer(di, cdb, buf, 2048u);
+}
+
+bool ahci64_cd_read64(int idx, uint32_t cd_lba, uint32_t sectors, void* buf) {
+    const int di = ahci_cd_index(idx);
+    if (di < 0) return false;
+    uint8_t* o = (uint8_t*)buf;
+    for (uint32_t s = 0; s < sectors; s++) {
+        if (!ahci_atapi_read1(di, cd_lba + s, o)) {
+            dbg64_line_begin64();
+            dbg64_str("[AHCI64] atapi read FAILED port=");
+            dbg64_dec((uint64_t)g_devs[di].port);
+            dbg64_str(" lba=");
+            dbg64_dec(cd_lba + s);
+            dbg64_str(" tfd=0x");
+            dbg64_hex64(prd(g_devs[di].port, P_TFD));
+            dbg64_str(" is=0x");
+            dbg64_hex64(prd(g_devs[di].port, P_IS));
+            dbg64_nl();
+            dbg64_line_end64();
+            return false;
+        }
+        o += 2048;
+    }
+    return true;
+}
+
+bool ahci64_cd_capacity64(int idx, uint32_t* out_sectors, uint32_t* out_bytes) {
+    if (out_sectors) *out_sectors = 0;
+    if (out_bytes) *out_bytes = 0;
+    const int di = ahci_cd_index(idx);
+    if (di < 0) return false;
+    uint8_t rb[8];
+    uint8_t cdb[12];
+    for (int i = 0; i < 12; i++) cdb[i] = 0;
+    cdb[0] = 0x25;                                        // READ CAPACITY(10)
+    if (!ahci_atapi_xfer(di, cdb, rb, 8)) return false;
+    const uint32_t last = ((uint32_t)rb[0] << 24) | ((uint32_t)rb[1] << 16) |
+                          ((uint32_t)rb[2] << 8) | (uint32_t)rb[3];
+    const uint32_t blk  = ((uint32_t)rb[4] << 24) | ((uint32_t)rb[5] << 16) |
+                          ((uint32_t)rb[6] << 8) | (uint32_t)rb[7];
+    if (out_bytes) *out_bytes = blk ? blk : 2048u;
+    if (out_sectors) *out_sectors = last + 1u;
+    return true;
 }

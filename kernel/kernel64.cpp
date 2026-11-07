@@ -30,6 +30,7 @@
 #include "vfs64.h"      // 真文件系统 VimtuFS2（v3 目录树；安装程序格式化分区要用）
 #include "drive64.h"    // 盘符/驱动器枚举层（C: = 系统卷；只读扫描，见 os_boot_path）
 #include "fs64.h"       // ★ 批次 K：统一文件系统分派层（VimtuFS2 读写 / FAT32 只读）
+#include "iso9660_64.h" // ★ v0.9.26：光盘 ISO9660 只读卷（PVD/目录记录/文件读）
 #include "ata64.h"      // ATA：IRQ14 中断驱动等待（超时回退 PIO 轮询），系统内核也要初始化
 #ifndef VIMTU_INSTALLER_MEDIA
 #include "store64.h"    // 设置持久化 store：只有系统内核链接它（安装程序不链 store64.cpp）
@@ -1122,6 +1123,56 @@ display64_init64();
     //   app64_main_part_lba64() 先按同一条规则读 MBR 找 0x07 项（真盘换了布局也能跟上），
     //   读不到才退回上述常量。挂载失败/读不到时优雅降级：只打原因，install/launch 不跑、不崩，
     //   桌面起来后终端里仍可手动 `run`（VFS 若随后可用则命令可再试）。
+    // ★ v0.9.26：光驱（ATAPI）-> ISO9660 只读卷：挂载 + 列根目录 + 自检。
+    // 位置讲究（这是第二次上机后才改对的）：本段**不能**放在"系统卷挂载成功"的分支里 ——
+    // 实测 q35（AHCI 控制器）上第一次 vfs64_mount_system64(drive 0) 会失败（那块盘不在 PATA 上），
+    // 于是整段被跳过，日志里连 [CD64] scan 都没有。光盘能不能读与"系统卷挂没挂上"无关，
+    // 所以放在挂载之前独立执行；后面的 drive64_scan64 会看到"ISO 卷已登记"再给它分配盘符。
+    // 没有光驱的机器上 ata64_cd_count64() = 0，只多一行 [CD64] scan cds=0，零副作用。
+        // ---- ★ v0.9.26：光驱（ATAPI）-> ISO9660 只读卷：挂载 + 列根目录 + 自检 ----
+        // 位置讲究：必须在 drive64_scan64 **之前** —— 盘符层只在"ISO 卷已登记"时
+        // 才给光盘分配字母（见 drive64.cpp 的光驱条目）。
+        // 没有光驱的机器上 ata64_cd_count64() = 0，这一段一行日志都不打、零副作用。
+        {
+            const int cds = ata64_cd_count64();
+            int isov = -1;
+            for (int i = 0; i < cds && isov < 0; i++) {
+                const int drv = ata64_cd_drive64(i);
+                uint32_t cblocks = 0, cbytes = 0;
+                const bool cap_ok = ata64_cd_capacity64(drv, &cblocks, &cbytes);
+                dbg64_line_begin64();
+                dbg64_str("[CD64] capacity idx=");
+                dbg64_dec((uint64_t)i);
+                dbg64_str(" drive=");
+                dbg64_dec((uint64_t)(drv < 0 ? 0 : drv));
+                dbg64_str(" blocks=");
+                dbg64_dec(cap_ok ? cblocks : 0);
+                dbg64_str(" bytes=");
+                dbg64_dec(cap_ok ? cbytes : 0);
+                dbg64_str(cap_ok ? " ok" : " unknown");
+                dbg64_nl();
+                dbg64_line_end64();
+                Fs64Vol64 iv;
+                isov = fs64_mount_iso64(i, &iv);
+            }
+            if (isov >= 0) {
+                static Iso64Dirent64 ents[32];
+                uint32_t cur = 0;
+                const int n = iso966064_list64("/", ents, 32, &cur);
+                for (int k = 0; k < n && k < 8; k++) {          // 只打前 8 条，避免刷屏
+                    dbg64_line_begin64();
+                    dbg64_str("[CD64] root name=");
+                    dbg64_str(ents[k].name);
+                    dbg64_str(" size=");
+                    dbg64_dec(ents[k].size);
+                    dbg64_str(ents[k].is_dir ? " dir=1" : " dir=0");
+                    dbg64_nl();
+                    dbg64_line_end64();
+                }
+                (void)iso966064_selftest64();
+            }
+        }
+
     {
         const int app_drive = 0;
         const uint32_t app_lba = app64_main_part_lba64(app_drive);

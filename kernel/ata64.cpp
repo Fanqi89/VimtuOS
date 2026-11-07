@@ -915,3 +915,138 @@ bool ata64_irq_selftest64() {
     dbg64_nl();
     return false;
 }
+
+// ==================== ★ v0.9.26：光驱（CD-ROM）枚举 / 读 / 容量 ====================
+// 设计与边界（先读，避免误期待）：
+//   * 本段一切 LBA/sector 计数都是 **2048B 光盘块**（见 ata64.h 的说明），
+//     与上面的 ata64_read（512B 硬盘扇区）严格分开，绝不共用一个 count 语义。
+//   * 枚举覆盖两条通路：PATA 侧 ATAPI（驱动器号 0..3，QEMU `-cdrom` 默认就挂这里）
+//     与 AHCI 侧 ATAPI（驱动器号 = ATA64_CD_AHCI_BASE + idx，q35/真机 SATA 光驱）。
+//   * 探测**只读端口**：PATA 侧先看 LBA mid/high 的 0x14/0xEB 签名，命中才发 0xA1。
+//     为什么不做成"对 0..3 全发 IDENTIFY"：绝大多数验收夹具没有光驱，那样每次启动都
+//     要多花 4 条完整 IDENTIFY 命令的时间，还会改设备状态（0xEC 对光驱是非法命令）。
+static int  g_cd_n = -1;                          // -1 = 还没探测过
+static int  g_cd_drv[ATA64_CD_MAX];
+static char g_cd_mdl[ATA64_CD_MAX][41];
+static uint32_t g_cd_blocks[ATA64_CD_MAX];        // READ CAPACITY 缓存（0 = 没查到，如实）
+
+// PATA 侧"这里是不是 ATAPI"的判断。
+// ★ 实测教训（v0.9.26 第一次上机）：最初写的是"只读端口看 LBA mid/high = 0x14/0xEB"的
+//   廉价签名探测 —— 在 QEMU 的 IDE 光驱上**读不到签名**（扫描结果 0 台，日志里连
+//   [CD64] cdrom 行都不出现）。原因不需要猜：ata64_identify() 本来就是"发 0xEC -> 看
+//   0x14/0xEB 签名 -> 转 0xA1 拿型号并清干净设备状态"这一条已经过安装程序验证的路径，
+//   而裸读端口少了选盘后的状态同步。所以这里**直接复用 ata64_identify**。
+static bool cd_probe_pata64(int drive, char* model_out, int cap, DiskInfo* out_di) {
+    DiskInfo di;
+    if (!ata64_identify(drive, &di)) return false;
+    if (!di.present || !di.atapi) return false;
+    for (int i = 0; i < cap && i < 41; i++) model_out[i] = di.model[i];
+    if (out_di) *out_di = di;
+    return true;
+}
+
+static void cd_scan64(void) {
+    if (g_cd_n >= 0) return;
+    g_cd_n = 0;
+    // ① PATA 侧 ATAPI
+    for (int d = 0; d < 4 && g_cd_n < (int)ATA64_CD_MAX; d++) {
+        char mdl[41];
+        if (!cd_probe_pata64(d, mdl, 41, nullptr)) continue;
+        g_cd_drv[g_cd_n] = d;
+        for (int i = 0; i < 41; i++) g_cd_mdl[g_cd_n][i] = mdl[i];
+        g_cd_blocks[g_cd_n] = 0;
+        g_cd_n++;
+    }
+    // ② AHCI 侧 ATAPI（SATA 光驱）
+    const int n = ahci64_cd_count64();
+    for (int i = 0; i < n && g_cd_n < (int)ATA64_CD_MAX; i++) {
+        DiskInfo di;
+        if (!ahci64_cd_info64(i, &di) || !di.present || !di.atapi) continue;
+        g_cd_drv[g_cd_n] = ATA64_CD_AHCI_BASE + i;
+        for (int k = 0; k < 41; k++) g_cd_mdl[g_cd_n][k] = di.model[k];
+        g_cd_blocks[g_cd_n] = 0;
+        g_cd_n++;
+    }
+    // 汇总行：**无论找到几台都打**（验收要能区分"这台机器没有光驱"与"探测失败"；
+    // 前面那次 v0.9.26 首轮上机就是因为扫描静默返回 0 台，日志里没有任何 [CD64] 行）
+    dbg64_line_begin64();
+    dbg64_str("[CD64] scan cds=");
+    dbg64_dec((uint64_t)g_cd_n);
+    dbg64_str(" pata_probed=4 ahci_atapi=");
+    dbg64_dec((uint64_t)n);
+    dbg64_nl();
+    dbg64_line_end64();
+    // 每台光驱一行（验收按行 grep）
+    for (int i = 0; i < g_cd_n; i++) {
+        dbg64_line_begin64();
+        dbg64_str("[CD64] cdrom idx=");
+        dbg64_dec((uint64_t)i);
+        dbg64_str(" drive=");
+        dbg64_dec((uint64_t)g_cd_drv[i]);
+        dbg64_str(" bus=");
+        dbg64_str((g_cd_drv[i] >= ATA64_CD_AHCI_BASE) ? "ahci" : "pata");
+        dbg64_str(" model=");
+        dbg64_str(g_cd_mdl[i]);
+        dbg64_str(" atapi=1");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+}
+
+int ata64_cd_count64() {
+    cd_scan64();
+    return (g_cd_n < 0) ? 0 : g_cd_n;
+}
+int ata64_cd_drive64(int idx) {
+    cd_scan64();
+    if (idx < 0 || idx >= g_cd_n) return -1;
+    return g_cd_drv[idx];
+}
+const char* ata64_cd_model64(int idx) {
+    cd_scan64();
+    if (idx < 0 || idx >= g_cd_n) return "";
+    return g_cd_mdl[idx];
+}
+
+bool ata64_cd_read64(int drive, uint32_t lba, uint32_t sectors, void* buf) {
+    if (drive >= ATA64_CD_AHCI_BASE)
+        return ahci64_cd_read64(drive - ATA64_CD_AHCI_BASE, lba, sectors, buf);
+    if (drive < 0 || drive > 3) return false;                  // 4..7 空洞 / 越界：如实失败
+    return ata64_atapi_read(drive, lba, sectors, buf);
+}
+
+bool ata64_cd_capacity64(int drive, uint32_t* out_sectors, uint32_t* out_bytes) {
+    if (out_sectors) *out_sectors = 0;
+    if (out_bytes) *out_bytes = 0;
+    if (drive >= ATA64_CD_AHCI_BASE)
+        return ahci64_cd_capacity64(drive - ATA64_CD_AHCI_BASE, out_sectors, out_bytes);
+    if (drive < 0 || drive > 3) return false;
+    // 缓存命中就直接给（READ CAPACITY 每次都要发一条 PACKET，没必要反复问）
+    for (int i = 0; i < g_cd_n; i++) {
+        if (g_cd_drv[i] != drive) continue;
+        if (g_cd_blocks[i] != 0) {
+            if (out_sectors) *out_sectors = g_cd_blocks[i];
+            if (out_bytes) *out_bytes = 2048u;
+            return true;
+        }
+        break;
+    }
+    const uint16_t io = base_port(drive);
+    outb((uint16_t)(io + 6), atapi_drive_select(drive));
+    ata_delay(drive);
+    if (!ata_wait_ready(drive)) return false;
+    uint8_t cdb[12];
+    for (int i = 0; i < 12; i++) cdb[i] = 0;
+    cdb[0] = 0x25;                                             // READ CAPACITY(10)
+    uint8_t rb[8];
+    if (!atapi_packet(drive, cdb, rb, 8)) return false;
+    const uint32_t last = ((uint32_t)rb[0] << 24) | ((uint32_t)rb[1] << 16) |
+                          ((uint32_t)rb[2] << 8) | (uint32_t)rb[3];
+    const uint32_t blk  = ((uint32_t)rb[4] << 24) | ((uint32_t)rb[5] << 16) |
+                          ((uint32_t)rb[6] << 8) | (uint32_t)rb[7];
+    const uint32_t blocks = last + 1u;
+    for (int i = 0; i < g_cd_n; i++) if (g_cd_drv[i] == drive) g_cd_blocks[i] = blocks;
+    if (out_sectors) *out_sectors = blocks;
+    if (out_bytes) *out_bytes = blk ? blk : 2048u;
+    return true;
+}

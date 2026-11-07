@@ -8,6 +8,7 @@
 #include "ata64.h"          // ★ P8b：驱动器号 >= ATA64_USB_BASE（U 盘）的 FAT32 卷才按可写挂载
 #include "drive64.h"        // ★ P8b：[FAT64] rw mount 行要报盘符（fat64 那边查盘符表用）
 #include "sysfs64.h"        // ★ v0.9.24：/sys 合成节点树（只读、无盘）
+#include "iso9660_64.h"      // ★ v0.9.26：光盘 ISO9660 只读卷（PVD/目录记录/文件读）
 
 // ==================== 卷表 ====================
 static Fs64Vol64 g_vols[FS64_VOL_MAX];
@@ -106,6 +107,8 @@ int fs64_vol_info64(int vol, Fs64Vol64* out) {
     if (v.kind == FS64_KIND_FAT32 && !v.readonly) (void)fat64_rw_announce64(v.fat_slot);
     if (v.kind == FS64_KIND_VIMTUFS2) {
         (void)ensure_vfs64(v.vfs_slot);                       // 刷新容量（数据盘写盘后可用空间会变）
+    } else if (v.kind == FS64_KIND_ISO9660) {
+        // 光盘是只读介质：容量在挂载时定死，没有"可用空间"这回事（free_known 保持 0 = 未知）
     } else {
         Fat64Info64 fi;
         if (fat64_vol_info64(v.fat_slot, &fi) == 0) {
@@ -171,6 +174,55 @@ int fs64_mount_fat64(int disk, uint32_t lba, Fs64Vol64* out) {
     }
     if (out) *out = v;
     return vol;
+}
+// ==================== ★ v0.9.26：ISO9660（光盘）卷 ====================
+// 卷号固定 FS64_VOL_ISO_BASE（9 个卷号里最后一个）。只读：所有写入口在 resolve 之后
+// 先看 g_vols[v].readonly，ISO 卷恒 1 -> 一律 -FS64_EROFS 并打 [FS64] reject 行。
+int fs64_mount_iso64(int cd_idx, Fs64Vol64* out) {
+    const int vol = FS64_VOL_ISO_BASE;
+    Fs64Vol64& v = g_vols[vol];
+    if (v.kind == FS64_KIND_ISO9660 && iso966064_cd_drive64() >= 0) {
+        if (out) *out = v;                                        // 幂等：已经挂着
+        return vol;
+    }
+    if (iso966064_mount64(cd_idx) != 0) return -1;
+    for (uint32_t i = 0; i < sizeof(v); i++) ((uint8_t*)&v)[i] = 0;
+    v.kind = FS64_KIND_ISO9660;
+    v.readonly = 1;                                               // 光盘只读（写入口一律 EROFS）
+    v.disk = iso966064_cd_drive64();
+    v.start_lba = 0;                                              // 光盘没有分区起点（如实 0）
+    v.vfs_slot = -1;
+    v.fat_slot = -1;
+    uint32_t blocks = 0, bytes = 0;
+    if (iso966064_volume64(&blocks, &bytes) == 0) {
+        v.total_known = 1;
+        v.total_kb = (uint64_t)bytes / 1024u;
+    }
+    v.free_known = 0;                                             // 只读介质：没有"可用空间"
+    { const char* nm = "ISO9660"; for (int i = 0; i < 15 && nm[i]; i++) v.fs[i] = nm[i]; }
+    if (out) *out = v;
+    dbg64_line_begin64();
+    dbg64_str("[FS64] mount iso vol=");
+    dbg64_dec((uint64_t)vol);
+    dbg64_str(" cd=");
+    dbg64_dec((uint64_t)v.disk);
+    dbg64_str(" volid=");
+    dbg64_str(iso966064_volid64()[0] ? iso966064_volid64() : "-");
+    dbg64_str(" total_kb=");
+    dbg64_dec(v.total_kb);
+    dbg64_str(" ro=1");
+    dbg64_nl();
+    dbg64_line_end64();
+    return vol;
+}
+int fs64_iso_vol64() {
+    return (g_vols[FS64_VOL_ISO_BASE].kind == FS64_KIND_ISO9660) ? FS64_VOL_ISO_BASE : -1;
+}
+int fs64_umount_iso64() {
+    Fs64Vol64& v = g_vols[FS64_VOL_ISO_BASE];
+    for (uint32_t i = 0; i < sizeof(v); i++) ((uint8_t*)&v)[i] = 0;
+    if (g_cur == FS64_VOL_ISO_BASE) g_cur = FS64_VOL_NONE;
+    return 0;
 }
 int fs64_activate64(int vol) {
     if (vol < 0 || vol >= FS64_VOL_MAX || g_vols[vol].kind == FS64_KIND_NONE) {
@@ -242,6 +294,25 @@ static int fat_name_len(const char* s) {
     if (!s) return 0;
     while (s[n]) n++;
     return n;
+}
+// ★ v0.9.26：ISO9660 目录项 -> 统一目录项。
+// 光盘没有 inode 号，index 给 extent（起始光盘块号）—— 它是可解释的、稳定的一手字段。
+// mode 按只读给（目录 0555 / 文件 0444）：光盘本来就写不了，权限位如实反映这一点。
+static void fill_from_iso(Fs64Dirent64* out, const Iso64Dirent64* e) {
+    for (uint32_t i = 0; i < sizeof(*out); i++) ((uint8_t*)out)[i] = 0;
+    int i = 0;
+    for (; e->name[i] && i < (int)sizeof(out->name) - 1; i++) out->name[i] = e->name[i];
+    out->name[i] = 0;
+    out->index = e->extent;
+    out->type = e->is_dir ? VFS64_TYPE_DIR : VFS64_TYPE_FILE;
+    out->size = e->size;
+    out->mtime = e->mtime;
+    out->kind = e->is_dir ? VFS64_KIND_DIR
+                          : vfs64_kind_by_name64(VFS64_TYPE_FILE, e->name, (uint32_t)i);
+    out->attr = 0;
+    out->uid = 0;                                             // 光盘没有属主（恒 0 = root）
+    out->gid = 0;
+    out->mode = e->is_dir ? (VFS64_S_IFDIR | 0555u) : (VFS64_S_IFREG | 0444u);
 }
 static void fill_from_vfs(Fs64Dirent64* out, const Vfs64Dirent64* e) {
     for (uint32_t i = 0; i < sizeof(*out); i++) ((uint8_t*)out)[i] = 0;
@@ -321,6 +392,15 @@ int fs64_list64(int vol, const char* path, Fs64Dirent64* out, int max, uint32_t*
         fill_from_vfs(out, &tmp);
         return 1;
     }
+    if (g_vols[v].kind == FS64_KIND_ISO9660) {
+        static Iso64Dirent64 tmp[32];                         // ISO：一次最多转 32 条（游标 = 目录字节偏移）
+        int want = max;
+        if (want > 32) want = 32;
+        const int n = iso966064_list64(path, tmp, want, cursor);
+        if (n <= 0) return n;
+        for (int i = 0; i < n; i++) fill_from_iso(&out[i], &tmp[i]);
+        return n;
+    }
     static Fat64Entry64 tmp[32];                              // FAT：一次最多转 32 条（游标透传）
     int want = max;
     if (want > 32) want = 32;
@@ -341,6 +421,26 @@ int fs64_ls64(int vol, const char* path, char names[][VFS64_LS_NAME_BUF], int ma
         return vfs64_ls(path, names, max, sizes);
     }
 
+    if (g_vols[v].kind == FS64_KIND_ISO9660) {
+        static Iso64Dirent64 itmp[8];
+        int got = 0;
+        uint32_t cursor = 0;
+        for (;;) {
+            const int n = iso966064_list64(path, itmp, 8, &cursor);
+            if (n < 0) return -1;
+            if (n == 0) break;
+            for (int i = 0; i < n && got < max; i++) {
+                int k = 0;
+                for (; itmp[i].name[k] && k < (int)VFS64_LS_NAME_BUF - 1; k++) names[got][k] = itmp[i].name[k];
+                names[got][k] = 0;
+                if (sizes) sizes[got] = itmp[i].is_dir ? 0u : itmp[i].size;
+                got++;
+            }
+            if (got >= max) break;
+            if (n < 8) break;
+        }
+        return got;
+    }
     static Fat64Entry64 tmp[8];
     int got = 0;
     uint32_t cursor = 0;
@@ -397,6 +497,21 @@ int fs64_stat64(int vol, const char* path, Fs64Stat64* out) {
         out->uid = vi.uid;                                    // ★ P4
         out->gid = vi.gid;
         out->mode = vi.mode;
+        return 0;
+    }
+    if (g_vols[v].kind == FS64_KIND_ISO9660) {
+        Iso64Stat64 is;
+        if (iso966064_stat64(path, &is) != 0) return -1;
+        out->type  = is.type;
+        out->size  = is.size;
+        out->mtime = is.mtime;
+        out->kind  = (is.type == VFS64_TYPE_DIR)
+                     ? VFS64_KIND_DIR
+                     : vfs64_kind_by_name64(VFS64_TYPE_FILE, path, (uint32_t)fat_name_len(path));
+        out->attr  = 0;
+        out->uid   = 0;
+        out->gid   = 0;
+        out->mode  = (is.type == VFS64_TYPE_DIR) ? (VFS64_S_IFDIR | 0555u) : (VFS64_S_IFREG | 0444u);
         return 0;
     }
     Fat64Entry64 fe;
@@ -459,6 +574,12 @@ int fs64_read64(int vol, const char* path, void* buf, int max) {
         if (!sc.ok) return -1;
         return vfs64_read64(path, buf, max);
     }
+    if (g_vols[v].kind == FS64_KIND_ISO9660) {
+        uint32_t igot = 0;
+        const int rc = iso966064_read64(path, 0, buf, (uint32_t)max, &igot);
+        if (rc != 0) return rc;                                   // -21 = 目录（与 fs64 口径一致）
+        return (int)igot;
+    }
     uint32_t got = 0;
     if (fat64_read64(g_vols[v].fat_slot, path, buf, (uint32_t)max, &got) != 0) return -1;
     return (int)got;
@@ -481,6 +602,8 @@ int fs64_read_range64(int vol, const char* path, uint32_t off, void* buf, uint32
         // ★ 批次 M：VimtuFS2 有**按偏移分块读**（二级间接块也支持）——缓冲区直接用调用方的。
         return vfs64_read_at64(path, off, buf, len, out_got);
     }
+    if (g_vols[v].kind == FS64_KIND_ISO9660)
+        return iso966064_read64(path, off, buf, len, out_got);
     return fat64_read_range64(g_vols[v].fat_slot, path, off, buf, len, out_got);
 }
 // ★ 批次 M：分块写（按偏移，保留原有字节；off > 当前大小 = 空洞补零）。只读卷一律 -FS64_EROFS。
@@ -499,6 +622,21 @@ int fs64_write_at64(int vol, const char* path, uint32_t off, const void* buf, ui
     Fs64VfsScope64 sc(g_vols[v].vfs_slot);
     if (!sc.ok) return -1;
     return vfs64_write_at64(path, off, buf, len);
+}
+// ★ v0.9.26：截断/加长。只读卷先拦（ISO 的 readonly 恒 1），再按卷类型分派：
+//   VimtuFS2 -> vfs64_truncate64（缩小真回收块、扩展补零，见 kernel/vfs64.cpp 的实现说明）；
+//   FAT32    -> fat64_vol_truncate64（本批之前它已存在但**零调用者**，这里第一次接上来）。
+int fs64_truncate64(int vol, const char* path, uint32_t len) {
+    if (sysfs64_match64(path) == 1) return -FS64_EROFS;
+    const int v = resolve_vol(vol);
+    if (v < 0) return -1;
+    if (g_vols[v].readonly) { log_reject_ro(v, "truncate", path); return -FS64_EROFS; }
+    if (g_vols[v].kind == FS64_KIND_FAT32)
+        return fat64_vol_truncate64(g_vols[v].fat_slot, path, len);
+    if (g_vols[v].kind != FS64_KIND_VIMTUFS2) return -1;
+    Fs64VfsScope64 sc(g_vols[v].vfs_slot);
+    if (!sc.ok) return -1;
+    return vfs64_truncate64(path, len);
 }
 // 写操作：FAT 一律拒绝（只读卷），VimtuFS2 按当前身份调用（权限判定在 vfs64 内）
 int fs64_write64(int vol, const char* path, const void* buf, int len) {
@@ -587,6 +725,14 @@ int fs64_free64(int vol, uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* 
     if (g_vols[v].kind == FS64_KIND_VIMTUFS2) {
         return vfs64_free_on64(g_vols[v].vfs_slot, free_blocks, free_bytes, total_blocks);   // 无路径：不涉权限
     }
+    if (g_vols[v].kind == FS64_KIND_ISO9660) {
+        uint32_t blocks = 0, bytes = 0;
+        if (iso966064_volume64(&blocks, &bytes) != 0) return -1;
+        if (total_blocks) *total_blocks = (uint32_t)(bytes / 512u);
+        if (free_blocks) *free_blocks = 0;
+        if (free_bytes) *free_bytes = 0;
+        return -1;                                                // 光盘没有空闲空间概念（如实"未知"）
+    }
     Fat64Info64 fi;
     if (fat64_vol_info64(g_vols[v].fat_slot, &fi) != 0) return -1;
     const uint64_t total_bytes = (uint64_t)fi.clusters * fi.cluster_bytes;
@@ -641,6 +787,7 @@ int fs64_selftest64() {
         if (g_vols[v].fs[0] == 0 || g_vols[v].total_known == 0) fails |= 1;
         if (g_vols[v].kind == FS64_KIND_FAT32 && g_vols[v].readonly != 1) fails |= 1;
         if (g_vols[v].kind == FS64_KIND_VIMTUFS2 && g_vols[v].readonly != 0) fails |= 1;
+        if (g_vols[v].kind == FS64_KIND_ISO9660 && g_vols[v].readonly != 1) fails |= 1;   // ★ v0.9.26
     }
     const int cur = fs64_current_vol64();
     if (cur >= 0) {
@@ -690,7 +837,8 @@ int fs64_selftest64() {
     else {
         dbg64_dec((uint64_t)cur);
         dbg64_str(" kind=");
-        dbg64_str(g_vols[cur].kind == FS64_KIND_FAT32 ? "FAT32" : "VimtuFS2");
+        dbg64_str(g_vols[cur].kind == FS64_KIND_FAT32 ? "FAT32"
+                  : (g_vols[cur].kind == FS64_KIND_ISO9660 ? "ISO9660" : "VimtuFS2"));
     }
     dbg64_nl();
     dbg64_line_end64();

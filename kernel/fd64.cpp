@@ -1013,6 +1013,41 @@ int fd64_fsync64(int fd) {
     return 0;                                                // 写路径已即时落盘（无脏页）
 }
 
+// ★ v0.9.26：ftruncate(77)。为什么不直接改 of->size 了事：文件真实长度在卷上，
+//   必须先让文件系统把块链改对（缩小要回收块、扩展要补零），再刷新本层缓存的 size，
+//   否则同一个 fd 上的 stat / lseek(SEEK_END) 会抱着旧值。
+//   POSIX：ftruncate **不改**文件游标（of->off 原样保留）—— 偏移超过新大小时后续 read 返回 0，
+//   那是读路径按 size 夹取的事（见 fd64_read64）。
+int fd64_truncate64(int fd, uint32_t len) {
+    FdTable64* t = fd64_current_table64();
+    OpenFile64* of = fd64_slot_obj64(t, fd);
+    if (!of) return -FD64_EBADF;
+    if (of->kind == FD64_KIND_DIR) return -FD64_EISDIR;
+    if (of->kind != FD64_KIND_FILE) return -FD64_ESPIPE;
+    if (!of->writable) return -FD64_EBADF;                    // 以只读方式打开的 fd 不能截断
+    if (len > FD64_FILE_MAX) return -FD64_EFBIG;
+    const uint64_t if_save = dbg64_irq_save64();
+    const int rc = fs64_truncate64(of->vol, of->path, len);
+    if (rc == 0) of->size = len;
+    dbg64_irq_restore64(if_save);
+    if (rc != 0) {
+        if (rc == -FS64_EROFS) return -FD64_EROFS;
+        if (rc == -13) return -FD64_EACCES;
+        if (rc == -21) return -FD64_EISDIR;
+        return -FD64_ENOSPC;                                  // 空间不足 / 超上限 / 写盘失败（与 write 同口径）
+    }
+    dbg64_line_begin64();
+    dbg64_str("[FD64] truncate fd=");
+    dbg64_dec((uint64_t)fd);
+    dbg64_str(" len=");
+    dbg64_dec((uint64_t)len);
+    dbg64_str(" path=");
+    dbg64_str(of->path);
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+
 // ★ A4-2a：newfd 现在接受 0..31（0/1/2 = 换标准流；Linux dup2 语义），newfd < 0 = 自动分配（>= 3）。
 static int fd64_bind_slot64(FdTable64* t, OpenFile64* src, int dst) {
     if (t->slot[dst] == src) return dst;                      // 同一个槽：直接返回（Linux 同）

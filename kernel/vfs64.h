@@ -205,6 +205,7 @@ int vfs64_perm_fields64();
 #define VFS64_LEGACY_FILE_MODE (VFS64_S_IFREG | 0644u)
 #define VFS64_UMASK_DEFAULT    022u
 #define VFS64_EACCES           13            // -EACCES：权限不足（VFS 层的"权限错"）
+#define VFS64_EISDIR           21            // -EISDIR：拿目录当文件（truncate 用）
 #define VFS64_EPERM            1             // -EPERM：chown 等"只有 root 能做"的操作
 
 // 一次调用期间"调用方身份"（不落盘；只影响 DAC 判定）
@@ -488,6 +489,19 @@ int vfs64_write_stream64(const char* path, uint32_t len, Vfs64Src64 src, void* c
 int vfs64_read_at_on64(int slot, const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got);
 int vfs64_write_at_on64(int slot, const char* path, uint32_t off, const void* buf, uint32_t len);
 int vfs64_write_stream_on64(int slot, const char* path, uint32_t len, Vfs64Src64 src, void* ctx);
+
+// ★ 本批：截断 / 改变文件大小（POSIX truncate(2) 语义；**不创建文件** —— 不存在返回 -1）。
+//   len < size：释放覆盖不到的块（直接 / 一级间接 / 二级间接三层都要回收，位图不能泄漏），size 改为 len；
+//   len > size：把 [size, len) **补零**（本文件系统没有稀疏文件，与 write_at 的"空洞补零"一致），
+//               size 改为 len；空间不足时**先失败**（[VFS64] truncate: no space (pre-flight)），
+//               返回前盘上的 size 与块链保持调用前的样子（本次新分配的块全部回滚）；
+//   len == size：什么都不做，返回 0（幂等）。
+// 返回 0 = 成功（成功后 mtime = 现在、inode CRC 重算落盘）；
+//      -1 = 未挂载 / 不存在 / 非普通文件 / 超过单文件上限 / 空间不足 / 写盘失败；
+//      -VFS64_EISDIR(-21) = path 是目录；-VFS64_EACCES(-13) = 文件不可写（要 w）或路径某一级目录缺 x。
+// 打点：[VFS64] truncate ok path=<p> size=<n> from=<old> / [VFS64] truncate: <why>
+int vfs64_truncate64(const char* path, uint32_t len);
+int vfs64_truncate_on64(int slot, const char* path, uint32_t len);   // 按槽变体（fs64 固定卷用）
 
 // 删除**普通文件**（目录一律拒绝并打点：用 vfs64_rmdir64）。
 // ★ 批次 M：**回收全部间接块**（一级 + 二级 + 二级的 128 个子块 + 所有数据块）—— 写-删循环不泄漏块。
