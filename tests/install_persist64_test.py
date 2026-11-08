@@ -11,7 +11,7 @@
   修法：tools/payload_embed_win.py 把卷并入载荷 -> 装好的盘自带卷。
 
 判据（每条都带实测数字）：
-  ① 装好的盘 LBA8009 = "VIMTUFS2" 卷头（magic + version=4）
+  ① 装好的盘 LBA8009 = "VIMTUFS2" 卷头（magic + version=5）
   ② 第一次启动：`[VFS64] mount ok` 且**没有** `mount_system FAILED` / `NOT-PERSISTENT`
   ③ 在系统里真做三件事：`mkdir /home/vimtu/pdata`、`cfg set ui.theme 3`、`cfg save`
      并要求 `[CONF64] flush ok via=vfs`（落盘到卷，不是内存）
@@ -180,8 +180,8 @@ def main():
     with open(TARGET, "rb") as f:
         f.seek(8009 * 512)
         head = f.read(16)
-    check("装好的盘 LBA8009 = VimtuFS2 卷头（magic + version=4）",
-          head[:8] == MAGIC and int.from_bytes(head[8:12], "little") == 4,
+    check("装好的盘 LBA8009 = VimtuFS2 卷头（magic + version=5）",
+          head[:8] == MAGIC and int.from_bytes(head[8:12], "little") == 5,
           "%r version=%d" % (head[:8], int.from_bytes(head[8:12], "little")))
 
     # ---- 3) 第一次启动：改设置 + 建目录 ----

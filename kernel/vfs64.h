@@ -14,9 +14,15 @@
 //   其中 bmn = ceil(总块数/4096)、ibn = ceil(inode 数/每块 inode 数)、bp = 1+bmn、dp = bp+ibn；
 //   这些数字都写在超级块里，挂载时**逐项重算校验**（不信任盘上数字，见 sb_verify）。
 //
-// ==================== 卷版本（**唯一定义点就是本节 + vfs64.cpp 的 LAY_V2/LAY_V3/LAY_V4**）====================
+// ==================== 卷版本（**唯一定义点就是本节 + vfs64.cpp 的 LAY_V2/V3/V4/V5**）====================
 //   版本字段：超级块偏移 8（u32）；inode 记录大小：超级块偏移 44（u32）。
-//   * **v4（当前，vfs64_format 产出）= 本文档描述的格式 + 权限字段**：
+//   * **v5（★ v0.9.28 起 vfs64_format 的产出）= v4 + 特性扩展头 + inode 的 xattr/快照字段**：
+//       超级块 [64,88) = 特性扩展头（feature_bits / journal_start / journal_blocks / quota_blk /
+//       snap_blk / feature_crc；主 CRC 仍只覆盖 [0,60)，所以扩展头不影响主 CRC 口径）；
+//       inode 保留区前 8 字节 = xattr_blk(81) + snap_flags(85)，其余 [89,124) 仍必须全 0。
+//       **feature_bits == 0（默认）= 行为与 v4 逐字节相同**；四个特性由 vfs64_feature_enable64 打开。
+//       与 v4 的 inode 前 81 字节/位图/几何/主 CRC 全同 -> v4 卷**不需要搬数据**就能 vfs64_migrate64 就地升 v5。
+//   * **v4（旧卷，仍可挂载读写；可用 vfs64_migrate64 升到 v5）= 本文档描述的格式 + 权限字段**：
 //       超级块：块 0，偏移见 vfs64.cpp 的 VFS_O_*（CRC32 覆盖 [0,60)，签名 0xAA55）**与 v3 逐字节相同**
 //       inode ：**128 B/个**（每块 4 个），布局见下（v3 的保留区首 6 字节变成 uid/gid/mode）
 //       名字上限 31 B；inode 上限 512；单文件上限 8 MiB（二级间接块）；目录树多级路径
@@ -51,6 +57,7 @@
 //   79  u16 mode      **Linux 风格模式**：类型位 + 权限位（S_IFDIR|0755 / S_IFREG|0644）；
 //                     权限位只有 0777（不实现 setuid/setgid/sticky —— 如实标注）
 //   81  ..  123       保留区，必须全 0
+//                     （★ v5 且 ACL/快照特性打开时：81 = u32 xattr_blk、85 = u32 snap_flags，其余 [89,124) 仍全 0）
 //   124 u32 crc32     inode CRC32（覆盖 [0,124)）
 //   **mtime 打包编码**：(年-2000)<<26 | 月<<22 | 日<<17 | 时<<12 | 分<<6 | 秒
 //     （6+4+5+5+6+6 = 32 位；年 2000..2063、月 1..12、日 1..31、时 0..23、分/秒 0..59；
@@ -102,9 +109,10 @@
 //     **只有 v3/v4 卷有二级间接块与权限字段**；v2 卷的 inode 只有 64 B → 单文件上限仍是 67584 B。
 //     空间语义：**没有稀疏文件**（size 以内的每个 fs 块必须有映射块；read 碰到未映射块 = 损坏 -> -1 打点）。
 //     写空洞由上层（fd64 的"seek 过末尾再写"）**补零**，FS 层只负责把块写满。
-//   * 名字上限 31 B（v3/v4）/ 27 B（v2）；inode 总数上限 512；目录深度上限 16 层；
-//     无 ACL/xattr、无硬链接/符号链接（因此**没有符号链接的权限跟随**）、无日志/崩溃一致性
-//     （只有"先数据后 inode"的提交顺序）。权限模型见"★ P4 权限"一节。
+//   * 名字上限 31 B（v3/v4/v5）/ 27 B（v2）；inode 总数上限 512（格式化上限 2048）；目录深度上限 16 层；
+//     **没有硬链接**（符号链接从 v0.7.0 起支持）；**v5 起有 ACL/xattr 与元数据日志/配额/快照**
+//     （见"★ v5 特性"一节），v4 及更旧卷没有这四样（写纪律仍只有"先数据后 inode"的提交顺序）。
+//     权限模型见"★ P4 权限"一节。
 //   * 删除：文件可以删（vfs64_unlink64）；**空目录**可以删（vfs64_rmdir64）；非空目录必须自己先清空。
 //   * 兼容 API vfs64_ls 的名字缓冲是 [32]，实现里把超过 31 B 的名字截断（v3 上限就是 31，所以
 //     实际不会截断）；新代码请用 vfs64_list64 / opendir+readdir（报告完整名字 + 类型 + 时间）。
@@ -121,6 +129,19 @@
 //   vfs64_tree_dump64("/", 32, 4)             // 串口打目录树（验收 grep；有界）
 //   vfs64_dump64()                            // 串口打当前状态
 //   vfs64_selftest64()                        // 64 扇区假盘自检 + 真盘只读探测
+//
+// ==================== ★ v5 特性（v0.9.28：日志 / 配额 / ACL / 快照）====================
+// 四个特性都是**格式级**能力（要能在盘上表达出来），所以升到 v5；但它们默认**全部关闭**
+// （feature_bits == 0 -> 与 v4 逐字节相同），由 vfs64_feature_enable64 逐个打开：
+//   * JOURNAL（bit0）：元数据写前日志。一次操作里"位图 + 指针块 + inode"被做成一个原子事务
+//     （日志头 state=COMMITTED 是提交点）；挂载时 jx_replay64() 把崩溃遗留的已提交事务补做完。
+//     **只管元数据**：文件数据块仍是"先写数据后写指针"，掉电不会产生悬空指针，只是这次内容可能没落地。
+//   * QUOTA（bit1）：per-uid 块数上限。记账粒度 = 一次写操作的块数增量，超限在**动手之前**失败
+//     （返回 -1，不产生半截文件）；删除/变小永远放行。打点 [QUOTA] deny uid=.. want=.. limit=..
+//   * ACL（bit2）：`system.posix_acl_access`（Linux 二进制 posix_acl 数组）存在 inode 的 xattr 块里；
+//     有 ACL 时权限判定**完全按 ACL**（含 MASK），没有才退回 mode 三段位。root 一律绕过。
+//   * SNAPSHOT（bit3）：只读快照 = 在卷内预留一段连续区，把当前树**全量克隆**成一个独立 v5 卷
+//     并挂成只读槽。**不是 COW**（空间与时间代价如实标注：拍一次 = 全量读 + 全量写）。
 //
 // ==================== ★ P4：权限（Linux 语义的裁剪版）====================
 // 调用方身份 = 一份**凭证**（credentials）：uid/gid/euid/egid。
@@ -143,7 +164,8 @@
 
 // ---- 卷头/几何常量（与 vfs64.cpp 的偏移注释一一对应）----
 #define VFS64_MAGIC            "VIMTUFS2"   // 8B；老占位超级块是 "VIMTUFS1"，故意区分
-#define VFS64_VERSION          4u           // 新格式化产出（v4 = 权限字段）
+#define VFS64_VERSION          5u           // ★ v0.9.28：新格式化产出（v5 = v4 + 特性扩展头 + xattr/快照指针）
+#define VFS64_VERSION_V4       4u           // 旧卷（P4 的 v4：有权限字段、无特性扩展头；仍可挂载读写，可迁移到 v5）
 #define VFS64_VERSION_V3       3u           // 旧卷（批次 M 的 v3：有 dind、无权限字段；仍可挂载）
 #define VFS64_VERSION_V2       2u           // 旧卷（仍可挂载）
 #define VFS64_SECTOR_BYTES     512u
@@ -169,6 +191,9 @@
 //   为什么不取 4096：inode 表大小 = inodes/4 扇区（512 -> 128、2048 -> 512、4096 -> 1024），
 //   列目录要扫全表，按 ATA PIO 实测 0.72 MB/s 折算 64KB≈89ms / 256KB≈356ms / 512KB≈730ms。
 //   2048 已留 3 倍余量（现用 404 + 图标 280 + 目录 10 ≈ 700）。
+// ★ v0.9.28：**密度也一起改了** —— vfs64_format 从 total/64 提到 **total/16**（每 8 KiB 数据一个 inode）。
+//   为什么：total/64 对 24,759 块的分区只给 386 个 inode，而装完整系统要用 525 个 —— 越界后果不是
+//   "报错"，而是写失败 + 每次失败泄漏一个 inode，整机启动退化成写失败风暴（实测）。
 //   旧卷（inon=512）仍然能挂：挂载只校验 inon <= VFS64_MAX_INODES。
 #define VFS64_MAX_INODES       2048u        // inode 总数上限（v3/v4 格式化上限；v2 卷历史上最多 256）
 #define VFS64_BITMAP_BLK_BITS  4096u        // 512B * 8
@@ -180,6 +205,76 @@
 // 当前卷是否有权限字段（v4 = 1）。旧卷（v2/v3）没有字段 -> chmod/chown 无意义（属主显示 root、模式默认）。
 int vfs64_perm_fields64();
 #define VFS64_SLOT_MAX         4u           // ★ 多卷：卷槽数（0 = 系统卷，另外最多 3 个数据卷 -> D:/E:/F:）
+
+// ==================== ★ v0.9.28：VimtuFS2 **v5** 与四个特性位 ====================
+// 为什么升 v5（而不是往 v4 里塞）：日志/配额/ACL/快照是**格式级**能力，必须能在盘上表达出来；
+// 但 v5 与 v4 的 inode 前 81 字节、位图、几何、主 CRC 口径**完全同形**，差别只有两处：
+//   ① 超级块 [64,88) 的**特性扩展头**（v4 这些字节必须全 0）：
+//        +64 u32 feature_bits / +68 u32 journal_start_blk / +72 u32 journal_blocks
+//        +76 u32 quota_blk    / +80 u32 snap_blk / +84 u32 feature_crc（覆盖 [64,84)）
+//   ② inode 保留区前 8 字节：+81 u32 xattr_blk、+85 u32 snap_flags（其余 [89,124) 仍必须全 0）
+// 因此 **v4 卷不需要搬一个字节就能迁移到 v5**（vfs64_migrate64 只改版本号 + 扩展头 + 主 CRC）。
+// v2/v3/v4 旧卷继续能挂载：v2/v3 没有权限字段与特性；v4 有权限字段但不能开特性。
+// 铁律：feature_bits == 0 时行为与 v4 逐字节相同（这是所有既有夹具/回归的前提）。
+#define VFS64_VERSION_V5       5u
+#define VFS64_FEAT_JOURNAL     1u           // 元数据写前日志（崩溃一致性）
+#define VFS64_FEAT_QUOTA       2u           // per-uid 块数配额
+#define VFS64_FEAT_ACL         4u           // POSIX ACL 子集（xattr：system.posix_acl_access）
+#define VFS64_FEAT_SNAPSHOT    8u           // 只读快照（全量克隆，**非** COW）
+#define VFS64_FEAT_ALL         (VFS64_FEAT_JOURNAL | VFS64_FEAT_QUOTA | VFS64_FEAT_ACL | VFS64_FEAT_SNAPSHOT)
+#define VFS64_INO_XATTR_OFF    81u          // ★ v5：u32 xattr 块号（ACL 特性打开时才允许非 0）
+#define VFS64_INO_SNAPF_OFF    85u          // ★ v5：u32 快照标记
+#define VFS64_JX_MAX_BLOCKS    16u          // 单个日志事务最多携带的元数据块数
+
+// 当前挂载卷的特性位（未挂载 = 0）。
+uint32_t vfs64_features64();
+// 打开一个特性（只对**当前卷**；需要 root；v5 卷）。返回 0 = 已生效/本来就是开的，-1 = 失败（已打点）。
+//   JOURNAL : 在数据区找一段**连续**空闲块当日志区（1 + VFS64_JX_MAX_BLOCKS 块）
+//   QUOTA   : 分配 1 块配额表（16 项 × {uid,limit,used,flags}）
+//   ACL     : 只置位（xattr 块按需分配）
+//   SNAPSHOT: 分配 1 块快照表（8 项 × {id,start,blocks,taken}）
+// 打点：[VFS64] feature on bit=<n> name=<...> ...（失败 reason=...）
+int vfs64_feature_enable64(uint32_t bit);
+// 串口打一行当前卷的特性状态（终端 `vol` / 自动验收 grep）。
+void vfs64_features_dump64();
+// ★ 旧卷迁移：v4 -> v5 **就地**（只改版本号 + 清扩展头 + 重算主 CRC；inode/数据一个字节都不动）。
+// 返回 0 = 成功（或本来就是 v5）；-1 = 未挂载/是 v2/v3（如实拒绝，要求重新格式化）。打点 [VFS64] migrate。
+int vfs64_migrate64();
+// ★ v0.9.28：xattr / ACL（名字取 POSIX 风格；值就是 Linux 的二进制 posix_acl 数组）。
+//   setxattr：vlen == 0 = 删除该项；只有 root 或属主能改；返回 0 / -1 / -EACCES。
+//   getxattr：返回值的字节数（缓冲不够就只返回长度，不拷）；-1 = 没有这个 xattr / 没开 ACL。
+//   acl_grant：便捷入口 —— 造一份 {USER_OBJ, USER(uid), GROUP_OBJ, MASK, OTHER} 的 ACL 并写入，
+//   其余项按文件当前 mode 补齐（这样"只改一个 uid 的权限"不会顺带放宽别人）。
+int vfs64_setxattr64(const char* path, const char* name, const void* val, uint32_t vlen);
+int vfs64_getxattr64(const char* path, const char* name, void* buf, uint32_t cap);
+int vfs64_acl_grant64(const char* path, uint32_t uid, uint32_t perm3);
+#define VFS64_XATTR_ACL_ACCESS "system.posix_acl_access"
+// 配额设置/查询（root 才能设；limit == 0xFFFFFFFF = 不限）。打点 [QUOTA] set ok uid=.. limit=.. used=.. / [QUOTA] deny。
+//   ★ used **在设置时按 inode 表重算一次**（不是只信"本 uid 自己的写"的历史记账）：
+//     否则 root 建好再 chown 过来的文件、以及配额打开之前就存在的文件都不会被算进去。
+int vfs64_quota_set64(uint32_t uid, uint32_t limit_blocks);
+int vfs64_quota_get64(uint32_t uid, uint32_t* limit_blocks, uint32_t* used_blocks);
+#define VFS64_QUOTA_UNLIMITED  0xFFFFFFFFu
+
+// ==================== ★ v0.9.28：只读快照（**全量克隆，不是 COW**）====================
+// 快照表 = 1 块：头 {u32 magic "SNP1"; u32 max=8; u32 next_id; u32 used}
+//   项 8 × 24B：{id; start_blk; blocks; taken; state(0=拷贝中 1=就绪); slot}
+// take：在数据区预留一段**连续**空闲块 -> 在预留区里格式化一个**独立的 v5 卷** ->
+//       把当前目录树整棵拷进去 -> 该卷以**只读**方式挂在一个独立卷槽上。
+// 语义边界（如实写清）：拍完之后的写不影响已拍好的快照；符号链接不进快照（没有 readlink_on64）。
+// 空间代价 = 预留区大小；时间代价 = 全部数据读一遍 + 写一遍（ATA PIO 上很慢，这是非 COW 的代价）。
+struct Vfs64SnapInfo64 {
+    uint32_t id;
+    uint32_t start_blk;      // 卷内相对块号（快照卷起始）
+    uint32_t blocks;         // 快照卷块数
+    uint32_t taken;          // 打包 mtime
+    uint32_t state;          // 0 = 拷贝中 / 1 = 就绪
+    uint32_t slot;           // 挂载在哪个卷槽（0xFFFFFFFF = 未挂）
+};
+// 返回快照 id（>= 1）；-1 = 失败（已打点）。want_blocks == 0 = 自动估（已用数据块 × 2，64..4096 块）。
+int vfs64_snapshot_take64(uint32_t want_blocks);
+int vfs64_snapshot_list64(Vfs64SnapInfo64* out, int max);
+int vfs64_snapshot_mount64(uint32_t id);      // 返回卷槽号（只读）；-1 = 失败
 
 // ---- ★ P4：inode 权限字段偏移（唯一权威定义；vfs64.cpp 有 static_assert 钉住）----
 #define VFS64_INO_UID_OFF      75u          // u16 属主 uid（v4 才有；v3 该处必须为 0）
@@ -334,7 +429,7 @@ const char* vfs64_kind_str64(uint32_t kind);
 // 格式化：写超级块 + 空闲块位图 + 清零 inode 区 + 根目录 inode（**v4**：root/root、目录 0755）。
 // 成功返回 0（并且卷已挂载），失败返回 -1（已打印原因）。start_lba = 分区起始绝对 LBA；
 // total_sectors = 分区扇区数。
-// 打点：[VFS64] format ok blocks=<n> version=4 inode=<128> root=<绝对 LBA>
+// 打点：[VFS64] format ok blocks=<n> version=5 inode=<128> root=<绝对 LBA>（v0.9.28 起产出 v5）
 int  vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors);
 
 // 挂载：读扇区 0，校验 magic / CRC32 / 版本（2 / 3 / 4）/ 几何自洽（位图与 inode 区必须严丝合缝地接在数据区前）。
@@ -580,5 +675,15 @@ int  vfs64_stat(const char* path, uint32_t* type, uint32_t* size);
 //              目录写要 w+x、root 绕过、chmod（root/属主）与 chown（仅 root）、umask 影响新文件；
 //              v3 旧卷 -> 拦截关闭（[PERM64] legacy 打点）
 int  vfs64_selftest64();
+// ★ v0.9.28 自检位（bit18..bit21，假盘 2MB v5 卷上真跑，见 .cpp 的 selftest）
+//   bit18(262144) **日志**：开启 -> 元数据事务提交后可见 -> 造"崩溃"（已提交但未 checkpoint）
+//                 -> 重挂载重放 -> 目标块被改回 -> 日志清空；事务 CRC 被破坏时必须拒放（不猜）
+//   bit19(524288) **配额**：uid 限额 8 块 -> 超限写被拒且无半截文件 -> 释放后可写 -> 只有 root 能设
+//   bit20(1048576)**ACL**：u:<uid>:r-- -> 该 uid 读可以、写被拒（-EACCES）；别的 uid 按 mode；
+//                 getxattr 读回原始 POSIX ACL 字节；去掉 ACL 后退回 mode
+//   bit21(2097152)**快照**：拍快照 -> 改文件 -> 快照卷读到旧内容、当前卷是新内容；
+//                 快照卷只读（写被拒）；快照表项可见
+//   bit22(4194304)**v4 旧卷兼容 + 迁移**：v4 卷照常挂载（无特性）-> 开特性被拒 -> migrate 到 v5
+//                 -> 特性可开 -> 数据一个字节没变
 // 串口打印当前挂载状态 + 根目录条目（供自动验收 grep）。
 void vfs64_dump64();

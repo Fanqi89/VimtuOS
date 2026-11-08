@@ -67,7 +67,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.9.27"    # ★ v0.9.25：滚轮（终端历史/设置内容/文本预览）+ 窗口 on_wheel 合约
+VIMTUOS_VERSION="0.9.28"    # ★ v0.9.28：VimtuFS2 **v5**（日志 / 配额 / ACL / 快照 + v4 旧卷兼容与迁移）
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
@@ -287,11 +287,20 @@ cp logo/kaisi.png "$BUILD/kaisi.png"
 echo "    嵌入 logo/kaisi.png = $(stat -c%s logo/kaisi.png) 字节"
 
 echo "==> 编译 64 位内核对象（两套：OS 与 安装程序）"
-# --- 系统内核（装进硬盘后运行）---
+# ★ v0.9.28（体积闸门）：**vfs64.cpp 单独用 -Os**。
+#   原因：它是全内核功能最多的翻译单元（v5 四个特性 + 旧卷兼容/迁移 + 五段自检），
+#         实测 .text  -O2 = 184,692 B / -Os = 129,885 B（省 54,807 B），而内核体积是**硬**闸门
+#         （内核实打实要装进原始区起点之前那段 LBA 里）。
+#   为什么这个交换划算：vfs64 的每条热路径都被 ATA PIO 事务支配（QEMU TCG 下每次十几毫秒），
+#         指令条数不是瓶颈；而多出来的 55 KB 是必须从别处（演示 blob / 中文字体）硬挤的。
+#   两套内核用同一个开关（同一个翻译单元，体积口径保持一致）。
+VFS64_OPTFLAGS="-Os"
 echo "    [OS 内核]"
 for src in $SRCS_OS; do
     base="$(basename "${src%.cpp}")"
-    $CXX -c "$src" -o "$BUILD/os/$base.o" $CXXFLAGS
+    opt="$CXXFLAGS"
+    if [ "$base" = "vfs64" ]; then opt="$CXXFLAGS $VFS64_OPTFLAGS"; fi
+    $CXX -c "$src" -o "$BUILD/os/$base.o" $opt
     echo "      $src -> $BUILD/os/$base.o"
 done
 # --- 安装介质内核（跑安装程序）---
@@ -301,7 +310,9 @@ done
 echo "    [安装程序内核]"
 for src in $SRCS_CORE kernel/ata64.cpp kernel/part64.cpp kernel/setup64.cpp kernel/vfs64.cpp kernel/hda64_stub64.cpp kernel/gpu64_stub64.cpp; do
     base="$(basename "${src%.cpp}")"
-    $CXX -c "$src" -o "$BUILD/$base.o" $CXXFLAGS_INSTALLER
+    opt="$CXXFLAGS_INSTALLER"
+    if [ "$base" = "vfs64" ]; then opt="$CXXFLAGS_INSTALLER $VFS64_OPTFLAGS"; fi
+    $CXX -c "$src" -o "$BUILD/$base.o" $opt
     echo "      $src -> $BUILD/$base.o"
 done
 
@@ -938,11 +949,12 @@ dd if="$BUILD/kernel64_os.bin" of="$BUILD/system.img" seek="$KERNEL_LBA" conv=no
 #   所以 kernel/demo64.cpp 是**按 LBA 用 ata64_read 现读**（读一次缓存），不依赖"loader
 #   平铺进内存的那份"。内核二进制里只有路径/偏移/长度表（0 字节 blob 本体）。
 #   两道断言：内核二进制末尾不许压到原始区起点；原始区不许越出内核区尾。
-# ★ v0.9.26（内核预算）：原始区起点从 6096 **后移到 6192** —— 原始区实际内容只有 920,911 B
-#   （1,799 扇区），旧起点给它留了 1,912 扇区（113 扇区 = 57,856 B 是空的）；本批要把这段空余
-#   让给内核（光驱 + ISO9660 只读卷 + truncate）。新上限 = 8008-6192 = 1,816 扇区（仍余 8,881 B）。
-#   内核预算随之从 (6096-9) 扇区 = 3,116,544 B 抬到 (6192-9) 扇区 = 3,165,696 B。
-DEMO64_RAW_LBA=6192
+# ★ v0.9.26：原始区起点从 6096 **后移到 6192**（把空余让给内核：光驱 + ISO9660 + truncate）。
+# ★ v0.9.28：再后移到 **6208** —— 本批要给内核腾出"VimtuFS2 v5 四个特性（日志/配额/ACL/快照）
+#   + v4 旧卷兼容与迁移"的体积。原始区实际内容仍是 920,911 B（1,799 扇区），
+#   新上限 = (8008-6208) = 1,800 扇区 = 921,600 B（仍余 689 B）。
+#   内核预算随之从 (6192-9) = 3,165,696 B 抬到 (6208-9) = 3,173,888 B（+8,192 B）。
+DEMO64_RAW_LBA=6208
 DEMO64_RAW_BYTES=$(stat -c%s "$BUILD/demo64_raw.bin")
 KERNEL_OS_SECTORS=$(( (OSSZ + 511) / 512 ))
 DEMO64_RAW_SECTORS=$(( (DEMO64_RAW_BYTES + 511) / 512 ))

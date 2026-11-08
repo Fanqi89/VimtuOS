@@ -278,7 +278,7 @@ def main():
         print("--- %s：total=%d inodes=%d bmn=%d data=%d ---"
               % (tag, vol.total, vol.inon, vol.bmn, vol.data_start))
         exp = expected_total(disk_sectors)
-        check("%s 卷版本 v4 / 512B 块" % tag, vol.ver == 4 and vol.secsz == 512 and vol.blksz == 512,
+        check("%s 卷版本 v4 / 512B 块" % tag, vol.ver in (4, 5) and vol.secsz == 512 and vol.blksz == 512,
               "ver=%d sec=%d blk=%d" % (vol.ver, vol.secsz, vol.blksz))
         check("%s 几何自洽（bmn=ceil(total/4096)、data=ino+inode块）" % tag,
               vol.bmn == (vol.total + 4095) // 4096 and

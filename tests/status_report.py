@@ -645,7 +645,7 @@ def cap_fs_tree():
     if not (exists("kernel/vfs64.cpp") and exists("kernel/vfs64.h")):
         return "MISSING", ["kernel/vfs64.cpp/.h 不存在（无 VFS 实现）"]
     n = lines("kernel/vfs64.cpp")
-    ver = grep_count(r"VFS64_VERSION\s+4u", ["kernel/vfs64.h"])
+    ver = grep_count(r"VFS64_VERSION\s+5u", ["kernel/vfs64.h"])
     v2 = grep_count(r"VFS64_VERSION_V3|VFS64_VERSION_V2|VFS_LAY_V3|VFS_LAY_V2",
                     ["kernel/vfs64.h", "kernel/vfs64.cpp"])
     tree = grep_count(r"path_resolve|vfs64_mkdir64|vfs64_rmdir64|vfs64_tree_dump64",
@@ -656,7 +656,8 @@ def cap_fs_tree():
     boot = grep_count(r"vfs64_tree_dump64\(", ["kernel/kernel64.cpp"])
     test = exists("tests/fs_tree_test.py")
     ev = ["vfs64.cpp %d 行（多级路径解析 + 目录树遍历 + 时间戳/类型判定；v4 为新格式化产出，v3/v2 旧卷仍可挂载）" % n,
-          "卷版本 v4（VFS64_VERSION 4u，P4 起含 uid/gid/mode）：命中 %d；旧卷布局兼容 V3/V2"
+          "卷版本 v5（VFS64_VERSION 5u，= v4 + 特性扩展头 + xattr/快照字段；feature_bits=0 时行为同 v4）：命中 %d；"
+          "旧卷布局兼容 V4/V3/V2"
           "（VFS64_VERSION_V3/V2 + VFS_LAY_V3/V2）：命中 %d" % (ver, v2),
           "多级路径/建目录/删空目录/目录树打印：命中 %d" % tree,
           "游标式遍历（opendir/readdir/closedir + 路径版 list 分页）：命中 %d" % iter64,
@@ -664,7 +665,8 @@ def cap_fs_tree():
           "类型判定（VAP64/ELF64/文本/二进制，写盘时存进 inode.kind）：命中 %d" % kind,
           "启动期打印目录树 vfs64_tree_dump64()（kernel64.cpp）：命中 %d" % boot,
           "实测串口：\"[VFS64] selftest PASS\"（bit8 多级目录树 / bit9 路径语义 / bit10 mtime+类型 / "
-          "bit11 代际几何+重挂载）、\"[VFS64] format ok blocks=24759 version=4 inode=128 root=8017\"（P4 起新卷一律 v4）",
+          "bit11 代际几何+重挂载/bit18 日志/bit19 配额/bit20 ACL/bit21 快照/bit22 v4 兼容+迁移）、"
+          "\"[VFS64] format ok blocks=24759 version=5 inode=128 root=8017\"（v0.9.28 起新卷一律 v5）",
           "端到端脚本 tests/fs_tree_test.py：%s（多级 mkdir -> 子目录写文件 -> 冷启动 stat/mtime/遍历 -> 删除）"
           % ("存在" if test else "缺失")]
     done = ver and tree and iter64 and mtime and kind and boot and test
@@ -1709,16 +1711,16 @@ def cap_perm_v4():
     miss = [x for x in need if not exists(x)]
     if miss:
         return "MISSING", ["缺文件：%s" % ", ".join(miss)]
-    ver = grep_count(r"VFS64_VERSION\s+4u", ["kernel/vfs64.h"])
+    ver = grep_count(r"VFS64_VERSION\s+5u", ["kernel/vfs64.h"])
     perm = grep_count(r"perm_can64|perm_check_ino64|perm_deny64",
                       ["kernel/vfs64.h", "kernel/vfs64.cpp", "kernel/fd64.cpp"])
     cred = grep_count(r"\[PERM64\] cred", ["kernel/userdb64.cpp"])
     sysc = grep_count(r"geteuid|chmod|chown|umask", ["kernel/syscall64.cpp"])
     tst = exists("tests/perm64_test.py")
-    ev = ["卷格式：\"[VFS64] format ok blocks=24759 version=4 inode=128 root=8017 perm=uid/gid/mode@75/77/79 "
+    ev = ["卷格式：\"[VFS64] format ok blocks=24759 version=5 inode=128 root=8017 perm=uid/gid/mode@75/77/79 "
           "rootmode=0755\"（inode 128B：type@0/namelen@1/size@4/d0..d3@8,12,16,20/ind@24/parent@28/mtime@32/"
           "nlink@36/kind@38/name@40..71/dind@71/uid@75,gid@77,mode@79/保留@81..124/CRC@124 覆盖 [0,124)）",
-          "版本宏 VFS64_VERSION=4u（kernel/vfs64.h）：命中 %d；权限判定符号 perm_can64|perm_check_ino64|perm_deny64："
+          "版本宏 VFS64_VERSION=5u（kernel/vfs64.h）：命中 %d；权限判定符号 perm_can64|perm_check_ino64|perm_deny64："
           "命中 %d；凭证发布打点 [PERM64] cred（userdb64.cpp）：命中 %d；系统调用 "
           "geteuid|chmod|chown|umask（syscall64.cpp）：命中 %d" % (ver, perm, cred, sysc),
           "拒绝路径：\"[PERM64] deny op=traverse path=/home/alice/private.txt uid=1002 gid=1002 mode=0700 need=x "
@@ -1728,12 +1730,13 @@ def cap_perm_v4():
           "\"[PERM64] cred uid=1001 gid=1001 euid=1001 egid=1001 user=alice via=su-dash\"、"
           "\"[VFS64] chmod ok path=/home/alice/private.txt mode=0600\"、\"[VFS64] chown ok path=/shared/f.txt "
           "uid=1001 gid=1001\"",
-          "挂载自检：\"[VFS64] mount ok blocks=24759 inodes=386 free=24654 version=4 inode=128B perm=on\"、"
+          "挂载自检：\"[VFS64] mount ok blocks=24759 inodes=386 free=24654 version=5 inode=128B perm=on\"、"
           "\"[VFS64] perm selftest ok owner/mode/other/root/chmod/chown/umask=1\"",
           "终端：ls -l（uid/gid/mode 列）/ chmod / chown / umask / tree / su / id 全部走真值（uid/gid/euid/egid "
           "随 fork/execve 继承）",
           "验收脚本 tests/perm64_test.py：%s（95 条断言，含 v3 旧卷兼容）" % ("有" if tst else "★ 缺"),
-          "边界（如实）：无 ACL/xattr、无 setuid 可执行文件提权、无附加组（gid=uid）；**v2/v3 旧卷不拦截**"
+          "边界（如实）：ACL/xattr 属于 **v5 特性层**（feature_bits bit2 打开才生效，默认关闭；"
+          "判定见 [PERM64] deny ... via=acl）；无 setuid 可执行文件提权、无附加组（gid=uid）；**v2/v3 旧卷不拦截**"
           "（uid 显示 root、mode 默认 0755/0644，chmod 明确回 \"volume v3 has no mode field\"）；root 完全绕过 DAC；"
           "无 sticky/setgid 目录位；FAT32 卷无权限字段；su 对空口令目标免密"]
     done = ver and perm and cred and sysc and tst
@@ -3374,6 +3377,129 @@ def cap_gif_decode():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_vfs_v5_journal():
+    """★ v0.9.28「VimtuFS2 **v5** + 元数据写前日志（journaling）」：文件系统能力清单里"无日志/崩溃一致性"。
+
+    v0.9.27 及以前 vfs64 只有"先数据、后指针、最后 inode"的提交顺序（最坏是块泄漏）；
+    但一次操作里"位图 + 指针块 + inode"是多块独立写。本批把这几块做成一个原子事务：
+    写载荷 → 写日志头 state=COMMITTED（提交点）→ checkpoint → 清头；挂载时重放。
+    """
+    need = ["kernel/vfs64.cpp", "kernel/vfs64.h", "tests/journal64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    jx = grep_count(r"jx_commit_inner64|jx_replay64|JX_O_MAGIC|JX_STATE_COMMIT", ["kernel/vfs64.cpp"])
+    hook = grep_count(r"meta_write64", ["kernel/vfs64.cpp"])
+    feat = grep_count(r"VFS64_FEAT_JOURNAL|VFS64_FEAT_ALL", ["kernel/vfs64.h"])
+    mig = grep_count(r"vfs64_migrate64", ["kernel/vfs64.cpp", "kernel/vfs64.h"])
+    ev = [
+        "日志记录（kernel/vfs64.cpp 命中 %d）：`[u32 magic JX64][txid][nblk][state][crc]` + "
+        "`target[nblk]` 头块 + n 个 512B 载荷块；crc 用增量 CRC32 覆盖头 + 目标表 + 全部载荷" % jx,
+        "提交协议：① 载荷块 → ② 写头 state=COMMITTED（**提交点**）→ ③ checkpoint 写回目标块 → ④ 清头；"
+        "挂载 `jx_replay64()` 把崩溃遗留的已提交事务补做完（重放幂等），记录 CRC 坏则**拒放**（不猜）",
+        "元数据写唯一入口 `meta_write64`（kernel/vfs64.cpp 命中 %d）：位图 / inode 提交 / "
+        "一级+二级+子块三种指针块全部走它（少一处就是'只做一半'）" % hook,
+        "日志区 = 卷内一段**连续**空闲块（启用时一次性分配并置位）：1 头块 + 16 载荷块 = 17 块 = 8.5 KiB",
+        "★ v5 格式（特性位命中 %d）：v5 = v4 + 超级块 [64,88) 特性扩展头 + inode [81,85) xattr_blk / "
+        "[85,89) snap_flags；主 CRC 仍只覆盖 [0,60)，feature_bits=0 时行为与 v4 逐字节相同" % feat,
+        "旧卷兼容与迁移（命中 %d）：v4 照常挂载读写（特性拒绝开启），`vfs64_migrate64()` 就地改版本号 + "
+        "清扩展头 + 重算主 CRC（inode/数据一个字节不动）；v3/v2 仍可挂载（如实拒绝迁移，要求重新格式化）" % mig,
+        "自检 bit18：开启 → 事务提交后可见 → 造'只提交不 checkpoint'的掉电现场 → 重挂载重放 → "
+        "mtime 被改回 → 日志清空 → 坏 CRC 必须拒放（step 编号定位）",
+        "验收：tests/journal64_test.py（代码结构 / `[VFS64] journal ok ... step=0` / "
+        "`[JX64] replay ok ... journal_cleared=1` / `[VFS64] migrate ok from=4 to=5`）",
+    ]
+    done = jx > 0 and hook >= 6 and feat > 0 and mig > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_vfs_quota():
+    """★ v0.9.28「per-uid 块数配额」：文件系统能力清单里"无配额"。"""
+    need = ["kernel/vfs64.cpp", "kernel/vfs64.h", "tests/quota64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    tbl = grep_count(r"QT_MAGIC|QT_ENTRIES|QT_ENT_BYTES", ["kernel/vfs64.cpp"])
+    chk = grep_count(r"qt_allow64", ["kernel/vfs64.cpp"])
+    chg = grep_count(r"qt_charge64", ["kernel/vfs64.cpp"])
+    deny = grep_count(r"\[QUOTA\] deny", ["kernel/vfs64.cpp"])
+    ev = [
+        "配额表（kernel/vfs64.cpp 命中 %d）：1 块 = 头 {magic JQT1, count=16} + 16 × "
+        "{u32 uid; u32 limit; u32 used; u32 flags}（limit = 0xFFFFFFFF 表示不限）" % tbl,
+        "预检 `qt_allow64`（命中 %d）：write_stream / write_at / truncate 三条增长路径都在**动盘之前**判定，"
+        "超限直接返回 -1（不产生半截文件）" % chk,
+        "记账 `qt_charge64`（命中 %d）：按**文件属主**结算块数增量；删除/变小永远放行（配额满了也得能删东西）" % chg,
+        "拒绝路径打点 `[QUOTA] deny uid=.. want=.. used=.. limit=.. reason=over-limit`（命中 %d）" % deny,
+        "接口：`vfs64_quota_set64`（只有 root）/ `vfs64_quota_get64`；启用 `vfs64_feature_enable64(VFS64_FEAT_QUOTA)`",
+        "★ 边界（如实）：记账粒度 = 一次写操作的块数增量（不是每块查一次表）；并发写不精确；"
+        "没有 grace period / 没有 inode 数配额 / 没有任何用户态 `quota` 命令",
+        "自检 bit19：uid=1234 限额 4 块 → 长到 8 块被拒且**没有半截文件** → 新建 4 块被拒 → "
+        "非 root 设配额被拒 → 删掉 3 块后可再写 → used 正好 4",
+        "验收：tests/quota64_test.py",
+    ]
+    done = tbl > 0 and chk >= 4 and chg >= 5 and deny > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_vfs_acl():
+    """★ v0.9.28「POSIX ACL 子集（xattr）」：文件系统能力清单里"无 ACL/xattr"。"""
+    need = ["kernel/vfs64.cpp", "kernel/vfs64.h", "tests/acl64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    xa = grep_count(r"XA_MAGIC|xattr_put64|xattr_find64", ["kernel/vfs64.cpp"])
+    ev64 = grep_count(r"XA_TAG_USER_OBJ|XA_TAG_MASK|XA_TAG_OTHER", ["kernel/vfs64.cpp"])
+    hook = grep_count(r"acl_perm64|via=acl", ["kernel/vfs64.cpp"])
+    api = grep_count(r"vfs64_setxattr64|vfs64_getxattr64|VFS64_XATTR_ACL_ACCESS", ["kernel/vfs64.h"])
+    ev = [
+        "xattr 块（kernel/vfs64.cpp 命中 %d）：inode 的 xattr_blk（v5 偏移 81）指向 1 块，"
+        "块内 = {magic XAT1, count} + 链式 `[u8 nlen][name][u16 vlen][val]`" % xa,
+        "ACL 取值 = **Linux 二进制 posix_acl 数组**（每项 8B {u16 tag; u16 perm; u32 id}），"
+        "tag 覆盖 USER_OBJ/USER/GROUP_OBJ/GROUP/MASK/OTHER（命中 %d）" % ev64,
+        "判定接入（命中 %d）：`system.posix_acl_access` 存在时**完全按 ACL** 判（含 MASK 相与），"
+        "没有才退回 mode 三段位；拒绝打 `[PERM64] deny ... via=acl need=w`" % hook,
+        "接口（头文件命中 %d）：`vfs64_setxattr64` / `vfs64_getxattr64` / `vfs64_acl_grant64`"
+        "（vlen=0 删除该项；只有 root 或属主能改）" % api,
+        "★ 边界（如实）：只做 access ACL（不做 default ACL / 不做继承 / 无附加组）、"
+        "没有 setxattr/getxattr 系统调用（目前由内核 API + 自检 + 未来 syscall 使用）",
+        "自检 bit20：u:1234:r-- → 该 uid 读可以、写 -EACCES；另一个 uid 按 other；getxattr 读回 40B；"
+        "去掉 ACL 后退回 mode（属主能写、1234 不能）",
+        "验收：tests/acl64_test.py",
+    ]
+    done = xa > 0 and ev64 > 0 and hook > 0 and api > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_vfs_snapshot():
+    """★ v0.9.28「只读快照（全量克隆，非 COW）」：文件系统能力清单里"无快照"。"""
+    need = ["kernel/vfs64.cpp", "kernel/vfs64.h", "tests/snapshot64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    tbl = grep_count(r"SN_MAGIC|SN_ENT|SN_ST_READY", ["kernel/vfs64.cpp"])
+    take = grep_count(r"vfs64_snapshot_take64|snap_copy_dir64|snap_copy_file64", ["kernel/vfs64.cpp"])
+    ro = grep_count(r"volume-read-only\(snapshot\)|g_vol\[cs\]\.ro = true", ["kernel/vfs64.cpp"])
+    api = grep_count(r"vfs64_snapshot_take64|vfs64_snapshot_list64|vfs64_snapshot_mount64|Vfs64SnapInfo64",
+                     ["kernel/vfs64.h"])
+    ev = [
+        "快照表（kernel/vfs64.cpp 命中 %d）：1 块 = 头 {magic SNP1, max=8, next_id, used} + 8 × "
+        "{id, start_blk, blocks, taken, state(0=拷贝中 1=就绪), slot}" % tbl,
+        "拍快照（命中 %d）：预留一段**连续**空闲块 → 在预留区格式化一个**独立 v5 卷** → "
+        "递归把整棵目录树拷进去（源用 *_on64(base) 读、目标用 *_on64(dst) 写，不依赖'当前卷'是谁）" % take,
+        "只读（命中 %d）：快照卷挂成独立卷槽并置 ro=1；写盘出口 dev_write_at 直接拒，"
+        "打点 `[VFS64] write denied reason=volume-read-only(snapshot)`" % ro,
+        "接口（头文件命中 %d）：`vfs64_snapshot_take64(want_blocks)` / `vfs64_snapshot_list64` / "
+        "`vfs64_snapshot_mount64(id)`（返回只读卷槽号）" % api,
+        "★ 边界（如实）：**不是 COW** —— 空间代价 = 快照区大小（已用数据 × 2 自动估，64..4096 块），"
+        "时间代价 = 全量读 + 全量写；符号链接不进快照（打 links_skipped=..）；拍完之后的写不影响已拍好的快照",
+        "自检 bit21：写 /s1.txt=旧 → 拍快照（128 块）→ 改成新 → 快照卷读到**旧**、当前卷读到**新** → "
+        "往快照卷写必须失败且内容不变 → 快照卷里能看到别的文件",
+        "验收：tests/snapshot64_test.py",
+    ]
+    done = tbl > 0 and take > 0 and ro > 0 and api > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 CAPS = [
     ("内核", "★ 开机滚屏引导控制台（boot console + dmesg；进桌面前回放启动日志、可按键跳过、boot.verbose 持久化开关）",
      cap_boot_console),
@@ -3533,6 +3659,13 @@ CAPS = [
              "（PVD/目录记录/路径解析/文件读，fs64 + 盘符接线）", cap_cdrom_iso9660),
     ("内核", "★ GIF 解码（首帧静态：GIF87a/89a + 透明色 + 隔行 + LZW 跨子块；设置页头像/壁纸放开 .gif）",
      cap_gif_decode),
+    ("内核", "★ VimtuFS2 **v5 格式** + 元数据写前日志（journaling）：原子事务 / 挂载重放 / 坏记录拒放 / "
+             "v4 旧卷兼容与就地迁移", cap_vfs_v5_journal),
+    ("内核", "★ 文件系统配额（per-uid 块数上限；预检拒绝不产生半截文件 + 属主记账 + root 才能设）",
+     cap_vfs_quota),
+    ("内核", "★ 文件系统 ACL（POSIX ACL 子集走 xattr：system.posix_acl_access + MASK，判定接入 perm_check_ino64）",
+     cap_vfs_acl),
+    ("内核", "★ 只读快照（全量克隆成独立 v5 卷 + 只读卷槽；如实标注**非** COW）", cap_vfs_snapshot),
 ]
 
 
@@ -3556,6 +3689,12 @@ TESTS = [
     ("iso64_install_test.py", "ISO 光盘引导端到端"),
     ("gif64_test.py", "★ v0.9.27：GIF（首帧）解码 —— 内嵌字节 == res/giftest 真文件、真值像素 == 宿主 Pillow、"
                       "真 QEMU 里 [IMG64] selftest gif ok=1 mask=0"),
+    ("journal64_test.py", "★ v0.9.28：VimtuFS2 v5 元数据日志 —— 记录/提交/checkpoint/挂载重放/坏 CRC 拒放，"
+    "另含 v5 格式 + v4 旧卷兼容与就地迁移的硬判据"),
+    ("quota64_test.py", "★ v0.9.28：per-uid 块数配额 —— 超限预检拒绝、无半截文件、删除后放行、只有 root 能设"),
+    ("acl64_test.py", "★ v0.9.28：POSIX ACL 子集（xattr）—— 命名用户 r--、写 -EACCES、别的 uid 按 mode、"
+    "去掉 ACL 退回 mode（拒绝走 via=acl 分支）"),
+    ("snapshot64_test.py", "★ v0.9.28：只读快照（全量克隆，非 COW）—— 时间点隔离 + 只读卷真拒写 + 整树被拷"),
     ("iso9660_64_test.py", "★ v0.9.26：光驱驱动（PATA/AHCI ATAPI + READ CAPACITY）+ ISO9660 只读卷 "
                           "（宿主侧独立解析同一张 ISO 逐项比对 PVD/根目录/读取长度；i440fx 与 q35 两种机器）"),
     ("iso64_usb_test.py", "U 盘 hybrid 端到端"),
@@ -3703,7 +3842,7 @@ TESTS = [
                                   "VIMTUFS2 卷头 -> mount_system ok 且无 NOT-PERSISTENT -> mkdir+cfg save 落盘"
                                   "（flush ok via=vfs）-> 正常关机重启 -> ui.theme=3 读回 + 宿主侧解析卷仍有 "
                                   "/home/vimtu/pdata（10 条断言）"),
-    ("install_flow_test.py", "★ 端到端安装（含 v0.5.11 新增硬判据：目标盘带 VimtuFS2 卷/version=4、主分区前 "
+    ("install_flow_test.py", "★ 端到端安装（含 v0.5.11 新增硬判据：目标盘带 VimtuFS2 卷/version=5、主分区前 "
                              "64 KiB 与 sysdisk 逐字节一致、装好启动 mount_system ok 且非 NOT-PERSISTENT）"),
     ("imgfit64_test.py", "★ v0.5.17 任意分辨率壁纸/头像（解码期抽样）：6000x4000 PNG 当壁纸 -> decim=4 得 1500x1000；5000x3333 JPEG 当头像 -> 256x170、当壁纸 -> 1250x833；重启后仍按缩小尺寸加载，无 OOM / PANIC"),
     ("presets_audit64_test.py", "★ 预设资源「源目录 -> 卷内路径」逐文件核对（秒级、不跑 QEMU）："

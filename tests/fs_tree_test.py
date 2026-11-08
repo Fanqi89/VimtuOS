@@ -437,8 +437,8 @@ def main():
     #   `[VFS64] mount ok ...` / `[VFS64] format ok ...`（数据卷的块数不同，取"最后一条"会拿到别的卷）。
     #   所以这里明确按**系统卷的块数**去找那一行 —— 断言强度不变（仍要求 v3 + 128B inode + 155798 块）。
     mf = last_match(r"\[VFS64\] format ok blocks=%d version=(\d+) inode=(\d+) root=(\d+)" % TARGET_MAIN_BLOCKS, log2)
-    check("格式化产出 v4（[VFS64] format ok blocks=%d ... version=4 inode=128；P4 起新格式化 = v4）" % TARGET_MAIN_BLOCKS,
-          bool(mf) and mf.group(1) == "4" and mf.group(2) == "128",
+    check("格式化产出 v5（[VFS64] format ok blocks=%d ... version=5 inode=128；v0.9.28 起新格式化 = v5）" % TARGET_MAIN_BLOCKS,
+          bool(mf) and mf.group(1) == "5" and mf.group(2) == "128",
           mf.group(0) if mf else "（缺 [VFS64] format ok blocks=%d 行）" % TARGET_MAIN_BLOCKS)
     check("格式化块数 = 主分区扇区数（155798）", bool(mf), "blocks=%d" % TARGET_MAIN_BLOCKS)
     check("自检全过（[VFS64] selftest PASS）", "[VFS64] selftest PASS" in log2)
@@ -458,8 +458,8 @@ def main():
         # ★ 多卷：按系统卷的块数定位系统卷的挂载行（数据卷也会打 mount ok，块数=24576）
         mv = last_match(r"\[VFS64\] mount ok blocks=%d inodes=(\d+) free=(\d+) version=(\d+) inode=(\d+)B"
                         % TARGET_MAIN_BLOCKS, slog(s3))
-        check("系统卷按 v4 挂载（mount ok blocks=%d ... version=4 inode=128B perm=on）" % TARGET_MAIN_BLOCKS,
-              bool(mv) and mv.group(3) == "4" and mv.group(4) == "128",
+        check("系统卷按 v5 挂载（mount ok blocks=%d ... version=5 inode=128B perm=on）" % TARGET_MAIN_BLOCKS,
+              bool(mv) and mv.group(3) == "5" and mv.group(4) == "128",
               mv.group(0) if mv else "（缺 mount ok 行）")
         check("挂载块数 = 主分区扇区数", bool(mv), "blocks=%d" % TARGET_MAIN_BLOCKS)
 

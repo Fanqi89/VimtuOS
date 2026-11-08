@@ -112,7 +112,7 @@ def vfs3_inode(buf, vol, idx):
     raw = vfs3_inode_raw(buf, vol, idx)
     t = raw[0]
     nl = raw[1]
-    noff = 40 if vol["ver"] in (3, 4) else 32          # ★ P4：v4 的 inode 名字偏移与 v3 相同（40）
+    noff = 40 if vol["ver"] in (3, 4, 5) else 32          # ★ P4：v4 的 inode 名字偏移与 v3 相同（40）
     return dict(idx=idx, type=t, namelen=nl,
                 name=bytes(raw[noff:noff + nl]).decode("ascii", "replace"),
                 size=_u32(raw, 4), d0=_u32(raw, 8), d1=_u32(raw, 12), d2=_u32(raw, 16),
@@ -121,7 +121,7 @@ def vfs3_inode(buf, vol, idx):
 
 def vfs3_inode_dind(buf, vol, idx):
     """★ 批次 M：v3 inode 偏移 71 的二级间接块指针（0 = 没有；v2 卷没有这个字段）。"""
-    if vol["ver"] not in (3, 4):                       # ★ P4：v4 也把 dind 放在偏移 71
+    if vol["ver"] not in (3, 4, 5):                       # ★ P4：v4 也把 dind 放在偏移 71
         return 0
     raw = vfs3_inode_raw(buf, vol, idx)
     return _u32(raw, 71) if len(raw) >= 75 else 0
@@ -436,7 +436,13 @@ def main():
         mon.key("n", wait=2.2)
         mon.key("ret", wait=2.2)
         fst.wait_for(s1, "[INSTALL] 完成：已写", 90, proc)
-        time.sleep(6)
+        # ★ v0.9.28：**这里原来只 sleep 6 秒就 kill** —— 而安装收尾的 `[INSTALL] volume grow` 要把
+        #   24,759 块卷搬成 155,798 块（12.7 MB 读 + 12.7 MB 写 + 重建位图 + 修正 2048 个 inode 指针），
+        #   PIO 下要几十秒。被腰斩后盘上留的是**半成品**：阶段 2 重新引导时连 MBR 都读不到
+        #   （实测 `[DISK] 1 … no-table parts=0`），于是"格式化主分区 P2"永远无从谈起。
+        #   改成等 grow 收尾（ok / FAILED / skipped）再杀进程。
+        fst.wait_for(s1, "[INSTALL] volume grow ok", 240, proc)
+        time.sleep(1.5)
         log1 = fst.slog(s1)
     finally:
         fst.kill(proc)
@@ -453,17 +459,31 @@ def main():
         for _ in range(4):
             mon.key("ret", wait=1.6)
         mon.key("down", wait=1.6)
-        mon.key("f", wait=2.8)
+        # ★ v0.9.28：安装向导的格式化是**两步确认**（同一行同一动作按两次，见 kernel/setup64.cpp id==13）；
+        #   只按一次只会停在“格式化待确认”。另外不同盘的分区表行数不同、固定 sleep 下按键可能被重绘吃掉，
+        #   所以这里做 3 次重试（每次先 f，看到“待确认”再补一次 f 真格化；没看到就把光标再下移一行）。
+        for _try in range(3):
+            mon.key("f", wait=1.6)
+            _mid = fst.slog(s2)
+            if "格式化待确认" in _mid or "[PART] 格式化 OK" in _mid:
+                mon.key("f", wait=3.0)          # 第二步：真格式化
+                break
+            mon.key("down", wait=0.8)
         fst.wait_for(s2, "[VFS64] format ok", 40, proc)
         time.sleep(1.5)
         log2 = fst.slog(s2)
     finally:
         fst.kill(proc)
-    check("格式化主分区 P2（[PART] 格式化 OK drive=1 index=2 start=8009）",
-          "[PART] 格式化 OK drive=1 index=2 start=8009" in log2)
+    # ★ v0.9.28：断言原来要求**精确子串** `[PART] 格式化 OK drive=1 index=2 start=8009`，
+    #   而内核打点后来变成 `[PART] 格式化 OK drive=1 table=mbr index=2 start=8009 sectors=155798 fs=VimtuFS2`
+    #   （中间插了 table=），子串匹配永远不中 —— 于是"格式化明明成功"也被判红。
+    #   拆成三个子串判（比原来更严：还要求 fs=VimtuFS2）。
+    check("格式化主分区 P2（[PART] 格式化 OK drive=1 … index=2 start=8009 … fs=VimtuFS2）",
+          "[PART] 格式化 OK drive=1" in log2 and "index=2 start=8009" in log2
+          and "fs=VimtuFS2" in log2)
     mf = fst.last_match(r"\[VFS64\] format ok blocks=(\d+) version=(\d+) inode=(\d+) root=(\d+)", log2)
-    check("格式化产出 v4（version=4 inode=128；★ P4 起新格式化 = v4）",
-          bool(mf) and mf.group(2) == "4" and mf.group(3) == "128",
+    check("格式化产出 v5（version=5 inode=128；★ v0.9.28 起新格式化 = v5）",
+          bool(mf) and mf.group(2) == "5" and mf.group(3) == "128",
           mf.group(0) if mf else "（缺 [VFS64] format ok 行）")
     check("格式化块数 = 主分区扇区数（%d）" % TARGET_MAIN_SECTORS,
           bool(mf) and mf.group(1) == str(TARGET_MAIN_SECTORS),
@@ -691,7 +711,10 @@ def main():
         # C: 的 /store.a 内容正确（宿主侧解析槽 + 新键）
         cbuf = read_file(target)
         cvol = vfs3_vol(cbuf, PART_MAIN_LBA)
-        check("C: 是合法 v3/v4 卷（宿主侧；★ P4 起安装向导格式化产出 v4）", cvol is not None and cvol["ver"] in (3, 4))
+        # ★ v0.9.28：安装向导格式化现在产出 **v5**（v5 = v4 + 特性扩展头 + inode xattr/快照字段，
+        #   inode 布局与 v4 同形），所以宿主侧解析器要接受 3/4/5 三种版本。
+        check("C: 是合法 v3/v4/v5 卷（宿主侧；★ v0.9.28 起安装向导格式化产出 v5）",
+              cvol is not None and cvol["ver"] in (3, 4, 5))
         if cvol:
             fa = vfs3_find(cbuf, cvol, "store.a")
             fb = vfs3_find(cbuf, cvol, "store.b")

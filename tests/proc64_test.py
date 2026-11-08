@@ -166,7 +166,10 @@ def _crc32(b):
 # ---------------------------------------------------------------------------
 def _vimtufs2_format(buf, start_lba, total_sectors):
     bmn = (total_sectors + 4095) // 4096
-    inodes = max(16, min(256, total_sectors // 64))
+    # ★ v0.9.28：与内核 vfs64_format 的密度对齐（total/16，上限 2048）。
+    #   total/64 对 24,759 块只给 386 个 inode，而“空卷 + 启动装系统”要 500+ 个；
+    #   夹具用旧公式会在写到第 386 个文件时耗尽（写失败风暴）。
+    inodes = max(16, min(2048, total_sectors // 16))
     ino_blocks = (inodes + 7) // 8
     bm_start = 1
     ino_start = bm_start + bmn

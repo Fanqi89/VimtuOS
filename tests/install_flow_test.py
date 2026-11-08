@@ -276,10 +276,10 @@ def main():
     # ★ v0.5.11：装好的目标盘**必须带 VimtuFS2 卷**（否则系统卷 mount 失败 -> 一切修改重启即丢）
     MAGIC = b"VIMTUFS2"
     vol_head = read_at(args.target, 8009, 64)
-    check("目标盘 LBA8009 = VimtuFS2 卷头（magic + version 4）",
+    check("目标盘 LBA8009 = VimtuFS2 卷头（magic + version 5）",
           vol_head[:8] == MAGIC, repr(vol_head[:8]))
-    check("卷头 version 字段 = 4（与 sysdisk 一致）",
-          len(vol_head) >= 12 and int.from_bytes(vol_head[8:12], "little") == 4,
+    check("卷头 version 字段 = 5（与 sysdisk 一致；v0.9.28 起 = v5）",
+          len(vol_head) >= 12 and int.from_bytes(vol_head[8:12], "little") == 5,
           "version=%d" % (int.from_bytes(vol_head[8:12], "little") if len(vol_head) >= 12 else -1))
     src_disk = os.path.join(ROOT, "build64", "sysdisk.img")
     if os.path.exists(src_disk):
@@ -363,7 +363,10 @@ def main():
     check("装好后图标包可用（[ICON64] init pack … src=vfs|raw，bad=0 ok=1）",
           mi is not None and mi.group(4) == "0" and mi.group(5) == "1" and mi.group(6) in ("vfs", "raw"),
           mi.group(0) if mi else (re.search(r"\[ICON64\] init pack[^\r\n]*", boot) or ["（无）"])[0])
-    nload = len(re.findall(r"\[ICON64\] load kind=\S+ path=pack:\S+ size=\d+ src=\S+ ok=1", boot))
+    # ★ v0.9.28：断言原来把 path 写死成 `pack:…`（从图标包按条目取）。v0.6 起图标已拆成**单个 PNG 文件**，
+    #   实测路径是 `path=/icons/system/globe@24.png src=vfs`，于是旧正则永远数到 0 条（而实际真图标是 27+ 条）。
+    #   改成按“成功加载条数”判：不再限定来源（pack 条目 / vfs 单文件 / raw 都算），条数阈值不变。
+    nload = len(re.findall(r"\[ICON64\] load kind=\S+ path=\S+ size=\d+ src=\S+ ok=1", boot))
     check("装好后逐 kind 真图标（[ICON64] load … ok=1 >= 25 条）", nload >= 25, "%d 条" % nload)
     print("--- 装好的系统串口尾部 ---")
     for l in [x for x in boot.splitlines() if x.strip()][-8:]:

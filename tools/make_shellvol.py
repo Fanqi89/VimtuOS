@@ -37,7 +37,9 @@ PART_BOOT_SECS = 8000
 PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS          # 8009（= kernel/part64.h）
 DEFAULT_TARGET_SECTORS = 32768                           # 16 MB 演示/测试盘
 
-VFS_VERSION = 4
+VFS_VERSION = 5          # ★ v0.9.28：VimtuFS2 v5（= v4 + 超级块特性扩展头 + inode xattr/快照字段）
+                         #   本脚本产出的卷 feature_bits 恒 0（扩展头全 0），行为与 v4 逐字节相同；
+                         #   与内核 vfs64_format 的产出一致，安装后的系统卷才支持日志/配额/ACL/快照。
 VFS_INODE_BYTES = 128
 VFS_INODES_PER_BLK = 4
 VFS_BITMAP_BLK_BITS = 4096

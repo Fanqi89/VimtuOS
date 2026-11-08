@@ -966,7 +966,9 @@ static int part_volume_grow64(int drive, uint32_t base_lba, uint32_t main_sector
     for (int i = 0; i < 8; i++) if (g_sec[PG_O_MAGIC + i] != (uint8_t)magic[i]) return 0;   // 没有卷：不动
     if (pg_crc32(g_sec, PG_SB_CRC_LEN) != rd32(g_sec + PG_O_CRC)) return -1;
     const uint32_t ver = rd32(g_sec + PG_O_VERSION);
-    if (ver != 4u && ver != 3u) return 0;                       // 只处理 v3/v4（v2 太老，不动）
+    // ★ v0.9.28：**必须认 v5** —— 本批起新格式化/payload 卷都是 v5；不认就会静默跳过 grow，
+    //   装好的系统卷会停在 12 MB（实测会少掉 76 MB 的空间）。v2 仍然不动（太老）。
+    if (ver != 5u && ver != 4u && ver != 3u) return 0;          // 只处理 v3/v4/v5（v2 太老，不动）
     const uint32_t old_total = rd32(g_sec + PG_O_TOTAL);
     const uint32_t old_bmn = rd32(g_sec + PG_O_BITMAPN);
     const uint32_t old_ino = rd32(g_sec + PG_O_INODE);   // inode 区起点（随 bmn 变）

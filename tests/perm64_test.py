@@ -4,7 +4,7 @@
 
 做什么（三段，每一条都有串口/返回值证据）：
   阶段 A（**v4 卷**：系统盘 + 一块 v3 数据盘同机启动）：
-    1) 新格式化产出/挂载 v4：`[VFS64] mount ok ... version=4 inode=128B perm=on`；
+    1) 新格式化产出/挂载 **v5**：`[VFS64] mount ok ... version=5 inode=128B perm=on`；
        v3 数据卷挂载时**如实报** `[PERM64] legacy volume v3: ... checks disabled`；
     2) 登录 vimtu（uid 1000）-> `[PERM64] cred ... via=login`；whoami/id 是真 uid/gid/euid/egid；
     3) useradd alice / bob（主目录 /home/<名> **属主=自己、0700**）；
@@ -20,7 +20,7 @@
    12) v3 数据卷（旧卷）：挂载可读可写、旧文件按默认属主 root 显示（`ls -l` -> root root 0644）；
        旧卷上不拦截（legacy 打点已说明）。
   阶段 B（**格式化旧卷 -> v4**）：安装介质 + 一块主分区是 **v3** 的目标盘 -> 向导里对 P2 按 f 格式化
-       -> `[VFS64] format ok blocks=<n> version=4 inode=128 ... rootmode=0755`（v3 兼容矩阵的另一半：
+       -> `[VFS64] format ok blocks=<n> version=5 inode=128 ... rootmode=0755`（v3 兼容矩阵的另一半：
        读旧卷 + 重新格式化成 v4）。
   三段都禁止 PANIC / TRIPLE FAULT / FAILED mask= / selftest FAIL / OOM。
 
@@ -61,7 +61,10 @@ FORBIDDEN = ["PANIC", "TRIPLE FAULT", "FAILED mask=", "selftest FAIL", "OOM:"]
 # ---------------------------------------------------------------------------
 def vimtufs4_format(buf, start_lba, total_sectors):
     bitmap_blocks = (total_sectors + 4095) // 4096
-    inodes = max(16, min(512, total_sectors // 64))
+    # ★ v0.9.28：与内核 vfs64_format 的密度对齐（total/16，上限 2048）。
+    #   原来是 total/64 上限 512 -> 24,759 块只给 386 个 inode，而"空卷 + 启动装系统"需要 500+ 个，
+    #   夹具自己就会在写到第 386 个文件时耗尽（这不是内核的锅，但夹具必须和内核产出同口径）。
+    inodes = max(16, min(2048, total_sectors // 16))
     inode_blocks = (inodes + 3) // 4
     bitmap_start = 1
     inode_start = bitmap_start + bitmap_blocks
@@ -289,8 +292,18 @@ def main():
         check("v3 数据卷挂载时如实报 legacy（权限拦截关闭）",
               re.search(r"\[PERM64\] legacy volume v3: no uid/gid/mode fields -> permission checks disabled", log) is not None)
         check("v3 数据卷按 version=3 挂载", re.search(r"\[VFS64\] mount ok .*version=3 inode=128B perm=off", log) is not None)
-        check("启动期目录树打印（v4 夹具是空卷：root=/ 且 entries=0 —— userdb64 之后才建 /etc、/home）",
-              "[VFS64] tree root=/ max_entries=32 max_depth=4" in log and "[VFS64] tree entries=0" in log)
+        # ★ v0.9.28：这条断言原来要求 "entries=0"，而当年能为 0 恰恰是因为**空卷 inode 太少、
+        #   启动时根本装不进任何东西**（vfs64_format 密度 total/64 -> 386 个 inode）。
+        #   密度修到 total/16 之后，空卷启动会真的装入 demo/图标（实测 tree entries=32）——
+        #   这是正确行为。断言改成它原本的意思：**打树那一刻 /etc 与 /home 还不存在**
+        #   （userdb64 之后才建）。判据从 "entries=0" 变成点名两个目录，不放松。
+        seg = ""
+        if "[VFS64] tree root=/" in log:
+            seg = log.split("[VFS64] tree root=/", 1)[1].split("[VFS64] tree entries=", 1)[0]
+        check("启动期目录树打印（root=/ 先打，且 **/etc、/home 还不存在** —— userdb64 之后才建）",
+              "[VFS64] tree root=/ max_entries=32 max_depth=4" in log and
+              "tree /etc " not in seg and "tree /home " not in seg,
+              "树段 %d 字符" % len(seg))
 
         check("打开终端（开始菜单 -> 终端）", fst.open_terminal(mon, serial, proc))
         time.sleep(0.5)
@@ -588,13 +601,16 @@ def main():
         for _ in range(4):
             mon2.key("ret", wait=1.6)
         mon2.key("down", wait=1.6)          # P1 -> P2（主分区）
-        mon2.key("f", wait=2.6)             # 格式化主分区
+        # ★ v0.9.28：安装向导的格式化是**两步确认**（同一个键按两次，见 kernel/setup64.cpp 的 id==13）。
+        #   只按一次只会停在 "[SETUP] 格式化待确认"，根本不会真格式化——那之前的断言其实是在读自检的 format ok 行。
+        mon2.key("f", wait=1.2)             # 第一步：进入"格式化待确认"
+        mon2.key("f", wait=2.6)             # 第二步：真格式化主分区
         log2 = fst.wait_for(serial2, "[VFS64] format ok", 40, proc2) or ""
         time.sleep(1.5)
         log2 = fst.slog(serial2)
         mf = fst.last_match(r"\[VFS64\] format ok blocks=(\d+) version=(\d+) inode=(\d+) root=(\d+) perm=uid/gid/mode@(\d+)/(\d+)/(\d+) rootmode=0755", log2)
-        check("格式化产出 v4（[VFS64] format ok ... version=4 inode=128 perm=uid/gid/mode@75/77/79 rootmode=0755）",
-              bool(mf) and mf.group(2) == "4" and mf.group(3) == "128",
+        check("格式化产出 v5（[VFS64] format ok ... version=5 inode=128 perm=uid/gid/mode@75/77/79 rootmode=0755）",
+              bool(mf) and mf.group(2) == "5" and mf.group(3) == "128",
               mf.group(0) if mf else "（缺 format ok 行）")
         check("权限字段偏移 = 75/77/79（inode 布局的唯一权威定义）",
               bool(mf) and mf.groups()[4:7] == ("75", "77", "79"))

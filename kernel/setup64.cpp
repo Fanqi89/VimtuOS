@@ -750,6 +750,20 @@ static void on_button(int id) {
             }
             if (id == 13) {                       // 格式化分区（两步确认）
                 const int row = g_row_sel;
+                // ★ 诊断打点（v0.9.28 追 multivol 阶段 2 的"光标没落对行"）：把当前行完整打出来，
+                //   不可选时也打 —— 只靠日志里"没有待确认行"是猜不出光标停在哪一行的。
+                dbg64_str("[SETUP] fmt attempt sel=");
+                dbg64_dec((uint64_t)row);
+                dbg64_str(" rows=");
+                dbg64_dec((uint64_t)g_row_count);
+                if (row >= 0 && row < g_row_count) {
+                    dbg64_str(" drive=");
+                    dbg64_dec((uint64_t)g_rows[row].drive);
+                    dbg64_str(" part=");
+                    dbg64_dec((uint64_t)(g_rows[row].part + 1));
+                    dbg64_str(g_rows[row].selectable ? " selectable=1" : " selectable=0");
+                }
+                dbg64_nl();
                 if (row < 0 || row >= g_row_count || !g_rows[row].selectable) {
                     g_st.dirty = true;
                     break;
@@ -1111,6 +1125,31 @@ static void progress_tick() {
     for (int i = 0; i < g_row_count; i++) {
         if (g_rows[i].drive >= ATA64_USB_BASE) continue;                  // 可移动盘：跳过
         if (g_rows[i].selectable && g_rows[i].drive != g_medium_drive) { g_row_sel = i; break; }
+    }
+    // ★ 诊断打点（v0.9.28）：把磁盘页的行清单与默认选中行摊开打出来。
+    //   为什么必须打：自动化按键是"4 次回车翻页 -> 下移 -> f"，而光标停在哪一行
+    //   在串口里**完全看不出来**（UI 只画屏幕）—— 出问题时只能猜。
+    {
+        const int show = (g_row_count < 8) ? g_row_count : 8;
+        dbg64_str("[SETUP] disk rows=");
+        dbg64_dec((uint64_t)g_row_count);
+        dbg64_str(" default_sel=");
+        dbg64_dec((uint64_t)g_row_sel);
+        dbg64_str(" medium=");
+        dbg64_dec((uint64_t)g_medium_drive);
+        dbg64_nl();
+        for (int i = 0; i < show; i++) {
+            dbg64_str("[SETUP]   row=");
+            dbg64_dec((uint64_t)i);
+            dbg64_str(" drive=");
+            dbg64_dec((uint64_t)g_rows[i].drive);
+            dbg64_str(" part=");
+            dbg64_dec((uint64_t)(g_rows[i].part + 1));
+            dbg64_str(g_rows[i].selectable ? " sel" : " -");
+            dbg64_str(" text=");
+            dbg64_str(g_rows[i].text);
+            dbg64_nl();
+        }
     }
 
     // 鼠标初始位置放屏幕中间，避免"光标在角落看不见"

@@ -53,6 +53,16 @@ static const uint32_t VFS_O_FLAGS    = 56;   // u32 保留（0；改它就等于
 static const uint32_t VFS_O_CRC      = 60;   // u32 超级块 CRC32（覆盖 [0,60)）
 static const uint32_t VFS_O_SIG      = 510;  // u16 0xAA55
 static const uint32_t VFS_SB_CRC_LEN = 60;
+// ★ v0.9.28（VimtuFS2 **v5**）：超级块**特性扩展头**。
+//   为什么放在 [64,510)：主 CRC 只覆盖 [0,60)、[60,64) 是主 CRC 自己 —— 于是扩展头
+//   **不需要改主 CRC 口径**（v2/v3/v4 旧卷这些字节本来就是 0，行为逐字节不变）。
+static const uint32_t VFS_O_FEATBITS = 64;   // u32 特性位（0 = 未启用任何特性；v4 旧卷恒 0）
+static const uint32_t VFS_O_JX_START  = 68;  // u32 日志区起始块（0 = 没有日志）
+static const uint32_t VFS_O_JX_NBLK   = 72;  // u32 日志区块数
+static const uint32_t VFS_O_QUOTA     = 76;  // u32 配额表块号（0 = 没有配额表）
+static const uint32_t VFS_O_SNAP      = 80;  // u32 快照表块号（0 = 没有快照表）
+static const uint32_t VFS_O_FEATCRC   = 84;  // u32 覆盖 [VFS_O_FEATBITS, VFS_O_FEATCRC) = [64,84)
+static const uint32_t VFS_FEAT_CRC_LEN = 20; // = VFS_O_FEATCRC - VFS_O_FEATBITS
 
 // ==================== inode 字段偏移 ====================
 // **两个版本共用的前缀**（0..31 字节完全同布局）：
@@ -77,7 +87,11 @@ static const uint32_t VFS_I3_DIND   = 71;    // u32 二级间接块（0 = 没有
 static const uint32_t VFS_I4_UID    = 75;    // u16 属主 uid
 static const uint32_t VFS_I4_GID    = 77;    // u16 属主 gid
 static const uint32_t VFS_I4_MODE   = 79;    // u16 类型位 + 权限位（S_IF*|0777）
-static const uint32_t VFS_I4_RSVD3  = 81;    // 保留区起点 [81,124) 必须全 0
+// ★ v0.9.28（v5）：v4 保留区 [81,124) 的**前 8 字节**变成两个 u32：
+//   xattr_blk（ACL/xattr 块号；0 = 没有）与 snap_flags（快照标记）。其余 [89,124) 仍必须全 0。
+static const uint32_t VFS_I5_XATTR  = 81;    // u32 xattr 块号（仅 v5 + ACL 特性时可非 0）
+static const uint32_t VFS_I5_SNAPF  = 85;    // u32 快照标记（仅 v5 + SNAPSHOT 特性时可非 0）
+static const uint32_t VFS_I4_RSVD3  = 81;    // v4 的保留区起点 [81,124) 必须全 0（旧卷口径不变）
 // v2 的名字/CRC：
 static const uint32_t VFS_I2_NAME   = 32;    // 28B 名字（只用前 27）
 static const uint32_t VFS_I2_CRC    = 60;    // u32 inode CRC32（覆盖 [0,60)）
@@ -99,20 +113,28 @@ struct Vfs64Layout {
     uint32_t uid_off;          // ★ P4：uid 偏移（0 = 该版本没有权限字段 -> 拦截关闭）
     uint32_t gid_off;          // ★ P4：gid 偏移（0 = 没有）
     uint32_t mode_off;         // ★ P4：mode 偏移（0 = 没有）
+    uint32_t xattr_off;        // ★ v0.9.28（v5）：xattr 块号偏移（0 = 该版本没有这两个字段）
+    uint32_t snapf_off;        // ★ v0.9.28（v5）：快照标记偏移（0 = 没有）
 };
 static constexpr Vfs64Layout VFS_LAY_V2 = { VFS64_VERSION_V2, 64u,  8u,
                                             VFS_I2_NAME, VFS64_NAME_MAX_V2, 0u, 0u, 0u, VFS_I2_CRC, 0u,
-                                            0u, 0u, 0u };
+                                            0u, 0u, 0u, 0u, 0u };
 // v3：与 v4 **inode 大小/每块个数/名字/CRC 全同**，只有权限三字段缺失（保留区是 [75,124)）
 static constexpr Vfs64Layout VFS_LAY_V3 = { VFS64_VERSION_V3, 128u, 4u,
                                             VFS_I3_NAME, VFS64_NAME_MAX, VFS_I3_MTIME, VFS_I3_NLINK,
                                             VFS_I3_KIND, 124u, VFS_I3_DIND,
-                                            0u, 0u, 0u };
-// v4：当前格式化产出（权限字段在 75/77/79；保留区 [81,124)）
-static constexpr Vfs64Layout VFS_LAY_V4 = { VFS64_VERSION,    128u, 4u,
+                                            0u, 0u, 0u, 0u, 0u };
+// v4：**旧卷**（仍可挂载读写；权限字段在 75/77/79；保留区 [81,124) 必须全 0；没有特性扩展头）
+static constexpr Vfs64Layout VFS_LAY_V4 = { VFS64_VERSION_V4, 128u, 4u,
                                             VFS_I3_NAME, VFS64_NAME_MAX, VFS_I3_MTIME, VFS_I3_NLINK,
                                             VFS_I3_KIND, 124u, VFS_I3_DIND,
-                                            VFS_I4_UID, VFS_I4_GID, VFS_I4_MODE };
+                                            VFS_I4_UID, VFS_I4_GID, VFS_I4_MODE, 0u, 0u };
+// v5：**当前格式化产出**。与 v4 的唯一差别 = 保留区前 8 字节变成 xattr_blk + snap_flags
+//     （只在对应特性位打开时才允许非 0）→ 所以 v4 卷**不需要搬数据**就能迁到 v5（见 vfs64_migrate64）。
+static constexpr Vfs64Layout VFS_LAY_V5 = { VFS64_VERSION,    128u, 4u,
+                                            VFS_I3_NAME, VFS64_NAME_MAX, VFS_I3_MTIME, VFS_I3_NLINK,
+                                            VFS_I3_KIND, 124u, VFS_I3_DIND,
+                                            VFS_I4_UID, VFS_I4_GID, VFS_I4_MODE, VFS_I5_XATTR, VFS_I5_SNAPF };
 
 static_assert(VFS64_BLOCK_BYTES == VFS64_SECTOR_BYTES, "块就是扇区（vfs64_format 也按这个算几何）");
 static_assert(VFS64_INODES_PER_BLK * VFS64_INODE_BYTES == VFS64_BLOCK_BYTES, "v3/v4：每块必须正好 4 个 inode");
@@ -122,6 +144,9 @@ static_assert(VFS_I3_DIND + 4u <= VFS_I4_UID, "v4 的 dind 必须在 uid 之前�
 static_assert(VFS_I4_MODE + 2u <= VFS_I4_RSVD3, "v4 的 mode 必须在保留区之前");
 static_assert(VFS_I4_RSVD3 < 124u, "v4 inode 保留区必须在 CRC 之前");
 static_assert(VFS_LAY_V4.crc_off + 4u == 128u, "v4 inode 字段必须正好铺满 128B");
+static_assert(VFS_LAY_V5.crc_off + 4u == 128u, "v5 inode 字段必须正好铺满 128B");
+static_assert(VFS_LAY_V5.xattr_off == VFS_I5_XATTR && VFS_LAY_V4.xattr_off == 0u,
+              "★ v5 的 xattr_blk 在 81；v4 旧卷没有这两个字段");
 static_assert(VFS_LAY_V3.crc_off + 4u == 128u, "v3 inode 字段必须正好铺满 128B");
 static_assert(VFS_LAY_V2.crc_off + 4u == 64u, "v2 inode 字段必须正好铺满 64B");
 static_assert(VFS_LAY_V3.dind_off == VFS_I3_DIND && VFS_LAY_V4.dind_off == VFS_I3_DIND, "dind 在 v3/v4 都存在");
@@ -130,6 +155,8 @@ static_assert(VFS_LAY_V3.uid_off == 0u && VFS_LAY_V3.mode_off == 0u, "★ v3 没
 static_assert(VFS_LAY_V4.uid_off == VFS64_INO_UID_OFF && VFS_LAY_V4.gid_off == VFS64_INO_GID_OFF &&
               VFS_LAY_V4.mode_off == VFS64_INO_MODE_OFF && VFS_LAY_V4.uid_off == VFS_I4_UID,
               "v4 权限字段偏移必须与 vfs64.h 逐字节一致");
+static_assert(VFS_LAY_V5.mode_off == VFS_LAY_V4.mode_off && VFS_LAY_V5.crc_off == VFS_LAY_V4.crc_off,
+              "★ v5 与 v4 的 inode 前 81 字节必须完全同形（这是 v4->v5 免搬数据迁移的前提）");
 static_assert(VFS64_L2_FIRST_BLOCK == 132u, "第一个走二级间接的 fs 块必须是 132（4 直接 + 128 一级）");
 static_assert(VFS64_MAX_MAP_BLOCKS == 16516u, "映射能力 = 4 + 128 + 128*128");
 static_assert(VFS64_MAX_FILE_BYTES == 8388608u, "★ 单文件上限 = 8 MiB（16384 块）");
@@ -184,6 +211,15 @@ static uint32_t crc32_64(const uint8_t* p, uint32_t n) {
     }
     return c ^ 0xFFFFFFFFu;
 }
+// ★ v0.9.28：CRC 的**增量**形态（日志记录的 CRC 要跨"头块 + 若干载荷块"算，不能要求它们在内存连续）。
+//   st 是内部寄存器：初值 0xFFFFFFFF，末异或 0xFFFFFFFF 才是结果。
+static uint32_t crc32_upd64(uint32_t st, const uint8_t* p, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        st ^= p[i];
+        for (int b = 0; b < 8; b++) st = (st & 1u) ? ((st >> 1) ^ 0xEDB88320u) : (st >> 1);
+    }
+    return st;
+}
 
 // ==================== ★ 多卷：卷槽表 + "当前卷"====================
 // 为什么长这样（设计取舍写清）：
@@ -208,6 +244,12 @@ struct Vfs64Geom {
     uint32_t start, blocks, bitmap_start, bitmap_blocks;
     uint32_t inode_start, inode_count, data_start, data_blocks;
     const Vfs64Layout* lay;
+    // ★ v0.9.28：特性扩展头（全部来自超级块 [64,88)；feat == 0 时其余字段恒 0）
+    uint32_t feat;                                  // VFS64_FEAT_* 位或
+    uint32_t jx_start, jx_blocks;                    // 日志区（连续块）
+    uint32_t quota_blk;                              // 配额表块
+    uint32_t snap_blk;                               // 快照表块
+    bool     ro;                                     // 只读挂载（快照卷）
 };
 
 static uint8_t  g_sec[VFS64_SECTOR_BYTES];            // 唯一工作扇区（先读进来再解析）
@@ -234,8 +276,11 @@ static uint32_t g_rm_child[VFS64_INDIRECT_PTRS];      // 只读路径：当前�
 // 一次调用最多把整个文件链建起来（write_stream 整文件重写），所以按最坏情况开表。
 static uint32_t g_newblk[VFS64_MAX_MAP_BLOCKS + VFS64_DIND_CHILDREN + 16u];
 static uint32_t g_newn = 0;
-static int      g_ino_cache_slot  = -1;               // ★ 缓存键 = (slot, drive) + 窗口区间
+static int      g_ino_cache_slot  = -1;               // ★ 缓存键 = (slot, drive, **卷起始 LBA**) + 窗口区间
 static int      g_ino_cache_drive = -1;
+static uint32_t g_ino_cache_start = 0xFFFFFFFFu;      // ★ v0.9.28：同一个槽可以先后挂不同 start 的卷
+                                                      //   （自检把假卷格式化进 0 号槽就是这个情形），
+                                                      //   键里不带 start 会把上一个卷的 inode 字节当本卷的用
 static uint32_t g_ino_win_base    = 0xFFFFFFFFu;      // 窗口首扇区（inode 表内相对块号）
 static uint32_t g_ino_win_count   = 0;                // 窗口里有效扇区数（表尾不足一窗时更少）
 static inline uint64_t vfs_rdtsc64(void) {
@@ -263,17 +308,26 @@ static int       g_vol_switch_depth = 0;              // 临时切卷守卫的�
 #define g_data_start   (g_vol[g_cur_slot].data_start)
 #define g_data_blocks  (g_vol[g_cur_slot].data_blocks)
 #define g_lay          (g_vol[g_cur_slot].lay)
+// ★ v0.9.28：特性层（同上，都是"当前卷"的字段别名）
+#define g_feat         (g_vol[g_cur_slot].feat)
+#define g_jx_start     (g_vol[g_cur_slot].jx_start)
+#define g_jx_blocks    (g_vol[g_cur_slot].jx_blocks)
+#define g_quota_blk    (g_vol[g_cur_slot].quota_blk)
+#define g_snap_blk     (g_vol[g_cur_slot].snap_blk)
+#define g_ro           (g_vol[g_cur_slot].ro)
 
 // inode 缓存失效（写盘、重挂载时调用；宁可多读，绝不给旧字节）
 static void ino_cache_invalidate() {
     g_ino_cache_valid = false;
     g_ino_cache_slot = -1;
+    g_ino_cache_start = 0xFFFFFFFFu;
     g_ino_cache_drive = -1;
     g_ino_win_base = 0xFFFFFFFFu;
     g_ino_win_count = 0;
 }
 // 缓存命中判定：**卷身份**（slot/drive）两项全对 + 目标扇区落在窗口内，才算命中
 static bool ino_cache_hit(int drive, uint32_t rel_blk) {
+    if (g_ino_cache_start != g_start) return false;   // ★ 卷换了（start 不同）= 一定不命中
     return g_ino_cache_valid && g_ino_cache_slot == g_cur_slot &&
            g_ino_cache_drive == drive && rel_blk >= g_ino_win_base &&
            rel_blk < g_ino_win_base + g_ino_win_count;
@@ -313,6 +367,8 @@ static bool ino_cache_fill(int drive, uint32_t rel_blk) {
     g_ino_win_count = n;
     g_ino_cache_slot  = g_cur_slot;                      // 记下**卷身份**，不只是 LBA
     g_ino_cache_drive = drive;
+    g_ino_cache_start = g_start;                         // ★ v0.9.28：键里的卷起始 LBA 必须在填充时写上
+                                                         //   （忘记写 -> 永远 miss -> 每次 inode 访问重读整张表，实测慢到 20 s/次）
     g_ino_cache_valid = true;
     g_ino_fill64++;
     return true;
@@ -466,6 +522,22 @@ static uint32_t perm_need3(uint32_t need) {
     if (need & VFS64_S_IXUSR) n |= 1u;
     return n;
 }
+
+// ==================== ★ v0.9.28：特性层前置声明（实现在文件后半段"特性层"一节）====================
+// 为什么必须提前声明：日志/配额/ACL 的钩子要插在**早于**它们实现的位置（位图、inode、指针块、权限判定）。
+static bool meta_write64(uint32_t blk, const uint8_t* pay, bool keep_ino = false);
+static bool jx_end64();                                        // 提交当前事务 + 清日志头
+static bool jx_replay64();                                     // 挂载时重放（mount 调）
+static bool acl_on64();                                        // 当前卷 ACL 特性是否打开
+static int  acl_perm64(const uint8_t* ino, uint32_t need3);    // 1 允许 / 0 拒绝 / -1 没有 ACL
+static bool qt_on64();
+static int  qt_allow64(uint32_t uid, uint32_t extra_blocks);   // 1 允许 / 0 超额 / -1 无配额表
+static void qt_charge64(uint32_t uid, int32_t delta_blocks);
+// 特性层的 xattr/ACL 实现位于文件后半段，但它们要用这几个更底层的原语（都定义在后面）：
+static bool inode_store(uint32_t idx, const uint8_t* in);
+static int  inode_load_ok(uint32_t idx, uint8_t* buf, const char* op);
+static int  path_resolve(const char* path, bool want_parent,
+                         uint32_t* out_ino, uint32_t* out_parent, char* out_name, uint32_t* out_nlen);
 static bool perm_can64(uint32_t iuid, uint32_t igid, uint32_t mode, uint32_t need) {
     if (g_cred.euid == 0) return true;
     const uint32_t n = perm_need3(need);
@@ -528,6 +600,30 @@ static int perm_check_ino64(const uint8_t* ino, const char* op, const char* path
     const uint32_t iuid = ino_uid_of64(ino);
     const uint32_t igid = ino_gid_of64(ino);
     const uint32_t mode = ino_mode_of64(ino, type);
+    const uint32_t n3 = perm_need3(need);
+    if (g_cred.euid == 0) return 0;                 // root 绕过一切 DAC（含 ACL）
+    if (n3 == 0) return 0;
+    // ★ v0.9.28：这个 inode 有 `system.posix_acl_access` 就**完全按 ACL** 判；
+    //   没有（-1）才退回 mode 的三段位 —— 与 POSIX/Linux 的口径一致。
+    const int ar = acl_perm64(ino, n3);
+    if (ar == 1) return 0;
+    if (ar == 0) {
+        if (g_perm_denies < VFS64_PERM_LOG_MAX) {
+            g_perm_denies++;
+            dbg64_str("[PERM64] deny op=");
+            dbg64_str(op);
+            dbg64_str(" path=");
+            dbg64_str(path ? path : "-");
+            dbg64_str(" uid=");
+            dbg64_dec(g_cred.euid);
+            dbg64_str(" via=acl need=");
+            if (need & VFS64_S_IRUSR) dbg64_str("r");
+            if (need & VFS64_S_IWUSR) dbg64_str("w");
+            if (need & VFS64_S_IXUSR) dbg64_str("x");
+            dbg64_nl();
+        }
+        return -VFS64_EACCES;
+    }
     if (perm_can64(iuid, igid, mode, need)) return 0;
     return perm_deny64(op, path, iuid, igid, mode, need);
 }
@@ -614,6 +710,17 @@ static void ino_cache_invalidate_on_overlap64(uint32_t abs_lba, uint32_t count) 
 static bool dev_write_at(int drive, uint32_t abs_lba, uint32_t count, const void* buf,
                          bool keep_ino_cache = false) {
     if (count == 0) return true;
+    // ★ v0.9.28：只读卷（快照）**一个字节都不许写** —— 拦在唯一的写盘出口上，不靠每个入口自觉。
+    if (g_vol[g_cur_slot].ro) {
+        static uint32_t ro_denies = 0;
+        if (ro_denies < 4u) {
+            ro_denies++;
+            dbg64_str("[VFS64] write denied reason=volume-read-only(snapshot) lba=");
+            dbg64_dec(abs_lba);
+            dbg64_nl();
+        }
+        return false;
+    }
     if (!keep_ino_cache) ino_cache_invalidate_on_overlap64(abs_lba, count);
     if (g_fake_active) {
         if ((uint64_t)abs_lba + count > VFS64_FAKE_SECTORS) {
@@ -655,7 +762,8 @@ enum {
     SB_ERR_MAGIC,
     SB_ERR_VERSION,
     SB_ERR_CRC,
-    SB_ERR_LAYOUT
+    SB_ERR_LAYOUT,
+    SB_ERR_FEATURE          // ★ v0.9.28：特性扩展头（CRC 对不上 / 字段越界 / 与版本不匹配）
 };
 static const char* sb_reason_str(int r) {
     if (r == SB_ERR_READ)    return "read";
@@ -663,6 +771,7 @@ static const char* sb_reason_str(int r) {
     if (r == SB_ERR_VERSION) return "version";
     if (r == SB_ERR_CRC)     return "crc";
     if (r == SB_ERR_LAYOUT)  return "layout";
+    if (r == SB_ERR_FEATURE) return "feature";
     return "?";
 }
 
@@ -671,6 +780,8 @@ struct Vfs64SbGeo {
     uint32_t version;
     uint32_t blocks, root, bitmap_start, bitmap_blocks;
     uint32_t inode_start, inode_count, data_start, data_blocks;
+    // ★ v0.9.28：特性扩展头（feat == 0 时其余全 0）
+    uint32_t feat, jx_start, jx_blocks, quota_blk, snap_blk;
 };
 
 // 读盘内容来自调用方给的缓冲。magic -> CRC -> 版本 -> 几何重算，逐项都要过。
@@ -681,7 +792,8 @@ static int sb_verify(const uint8_t* sb, Vfs64SbGeo* geo) {
     if (rd32(sb + VFS_O_CRC) != crc32_64(sb, VFS_SB_CRC_LEN)) return SB_ERR_CRC;
     const uint32_t ver = rd32(sb + VFS_O_VERSION);
     const Vfs64Layout* lay = nullptr;
-    if (ver == VFS64_VERSION)             lay = &VFS_LAY_V4;
+    if (ver == VFS64_VERSION)             lay = &VFS_LAY_V5;    // ★ 当前格式化产出
+    else if (ver == VFS64_VERSION_V4)     lay = &VFS_LAY_V4;    // 旧卷（仍可挂载读写，可迁移到 v5）
     else if (ver == VFS64_VERSION_V3)     lay = &VFS_LAY_V3;
     else if (ver == VFS64_VERSION_V2)     lay = &VFS_LAY_V2;
     else                                  return SB_ERR_VERSION;
@@ -716,12 +828,48 @@ static int sb_verify(const uint8_t* sb, Vfs64SbGeo* geo) {
     if (data >= total) return SB_ERR_LAYOUT;
     if (datan != total - data) return SB_ERR_LAYOUT;
 
+    // ★ v0.9.28：特性扩展头。feat == 0（v2/v3/v4 旧卷 + 新 v5 卷的默认）-> 其余字段必须全 0，
+    //   且**不看 feature_crc** —— 这就是"旧卷行为逐字节不变"的落地点。
+    //   feat != 0 -> 只允许出现在 **v5**；扩展头自己的 CRC 必须对得上（否则是"半写"的扩展头，绝不能当真）；
+    //   日志/配额/快照的块号必须落在**数据区**内（结构自洽），否则拒绝挂载并如实打 reason=feature。
+    const uint32_t feat = rd32(sb + VFS_O_FEATBITS);
+    uint32_t jxs = 0, jxn = 0, qb = 0, snb = 0;
+    if (feat != 0) {
+        if (ver != VFS64_VERSION) return SB_ERR_FEATURE;         // 特性只定义在 v5 上
+        if ((feat & ~VFS64_FEAT_ALL) != 0) return SB_ERR_FEATURE;
+        if (rd32(sb + VFS_O_FEATCRC) != crc32_64(sb + VFS_O_FEATBITS, VFS_FEAT_CRC_LEN))
+            return SB_ERR_FEATURE;
+        jxs = rd32(sb + VFS_O_JX_START);
+        jxn = rd32(sb + VFS_O_JX_NBLK);
+        qb  = rd32(sb + VFS_O_QUOTA);
+        snb = rd32(sb + VFS_O_SNAP);
+        if ((feat & VFS64_FEAT_JOURNAL) != 0) {
+            if (jxn < 2u || jxs < data || jxs >= total || jxn > total - jxs) return SB_ERR_FEATURE;
+        } else if (jxs != 0 || jxn != 0) {
+            return SB_ERR_FEATURE;
+        }
+        if ((feat & VFS64_FEAT_QUOTA) != 0) {
+            if (qb < data || qb >= total) return SB_ERR_FEATURE;
+        } else if (qb != 0) {
+            return SB_ERR_FEATURE;
+        }
+        if ((feat & VFS64_FEAT_SNAPSHOT) != 0) {
+            if (snb < data || snb >= total) return SB_ERR_FEATURE;
+        } else if (snb != 0) {
+            return SB_ERR_FEATURE;
+        }
+    } else if (jxs != 0 || jxn != 0 || qb != 0 || snb != 0) {
+        return SB_ERR_FEATURE;
+    }
+
     if (geo) {
         geo->lay = lay;              geo->version = ver;
         geo->blocks = total;         geo->root = root;
         geo->bitmap_start = bm;      geo->bitmap_blocks = bmn;
         geo->inode_start = ino;      geo->inode_count = inon;
         geo->data_start = data;      geo->data_blocks = datan;
+        geo->feat = feat;            geo->jx_start = jxs;
+        geo->jx_blocks = jxn;        geo->quota_blk = qb;   geo->snap_blk = snb;
     }
     return SB_OK;
 }
@@ -908,6 +1056,985 @@ static bool blk_write(uint32_t blk, const uint8_t* buf) {
     return dev_write(g_start + blk, 1, buf);
 }
 
+// ==================== ★ v0.9.28 特性层 A：元数据写前日志（journaling）====================
+// 要解决的问题：vfs64 写入的既有纪律只有"先数据、后指针、最后 inode"，中途掉电最坏是**块泄漏**；
+//   但一次操作里"位图 + 指针块 + inode"是**多块独立写**，掉电落在中间会让盘上出现"只做了一半"的
+//   状态（例如位图已经把块回收了、inode 还指着它）。日志把这几个元数据块做成**一个原子事务**：
+//     ① 载荷块写进日志区 → ② 写日志头（state=COMMITTED，**这就是提交点**）→
+//     ③ checkpoint（把载荷逐块写回目标块）→ ④ 清日志头（state=0）。
+//   掉电在 ②之后：挂载时重放把 ③ 补完（重放幂等）；掉电在 ②之前：日志头不是 COMMITTED，什么都不做。
+// 日志区 = 卷内一段**连续**空闲块（启用时一次性分配并置位，见 vfs64_feature_enable64）：
+//   块 0 = 头（512B 描述），块 1..n = 载荷（每块一个目标块的完整 512B 内容）。
+// 头布局（小端）：0 magic "JX64" / 4 txid / 8 nblk / 12 state / 16 crc / 20 target[nblk]（u32）
+//   crc 覆盖 [0,16) + target[] + 全部载荷块（用增量 CRC32 算）。
+// 前置声明：本段用到**后面才定义**的两个底层函数（位图置位 / 分配一块）。
+static bool bitmap_set(uint32_t blk, bool used);
+static uint32_t alloc_block();
+// 如实标注：日志只管**元数据块**（位图 / inode / 间接块）。文件数据块仍然是"先写后指"，
+//   掉电时不会产生"指针指向坏数据"，只是这次写的内容可能没落地（与先前的语义一致）。
+static const uint32_t JX_MAGIC        = 0x3436584Au;   // 'J','X','6','4' 小端
+static const uint32_t JX_O_MAGIC      = 0;
+static const uint32_t JX_O_TXID       = 4;
+static const uint32_t JX_O_NBLK       = 8;
+static const uint32_t JX_O_STATE      = 12;
+static const uint32_t JX_O_CRC        = 16;
+static const uint32_t JX_O_TGT        = 20;
+static const uint32_t JX_STATE_COMMIT = 1;
+
+static uint8_t  g_jx_pay[VFS64_JX_MAX_BLOCKS * VFS64_SECTOR_BYTES];   // 事务里的 512B 载荷（RAM）
+static uint32_t g_jx_tgt[VFS64_JX_MAX_BLOCKS];                         // 每个载荷的目标块（卷内相对块号）
+static uint32_t g_jx_n = 0;                                            // 当前事务里攒了几块
+static uint32_t g_jx_txid = 0;                                         // 最近一次提交的事务号
+static uint32_t g_jx_commits = 0;                                      // 累计提交次数（诊断/自主检）
+
+// 当前卷是否开着日志（只读卷不开 —— 快照卷一个字节都不许写）
+static bool jx_on64() {
+    return g_mounted && !g_ro && (g_feat & VFS64_FEAT_JOURNAL) != 0 && g_jx_blocks >= 2u;
+}
+// 把特性扩展头写回超级块。**只改 [64,88)**：主 CRC 覆盖的 [0,60) 一个字节不动，
+// 所以超级块主 CRC 不需要重算（这就是把扩展头放在 CRC 之后的好处）。
+static bool sb_feat_store64() {
+    uint8_t sb[VFS64_SECTOR_BYTES];
+    if (!dev_read(g_start, 1, sb)) return false;
+    wr32(sb + VFS_O_FEATBITS, g_feat);
+    wr32(sb + VFS_O_JX_START, g_jx_start);
+    wr32(sb + VFS_O_JX_NBLK, g_jx_blocks);
+    wr32(sb + VFS_O_QUOTA, g_quota_blk);
+    wr32(sb + VFS_O_SNAP, g_snap_blk);
+    wr32(sb + VFS_O_FEATCRC, crc32_64(sb + VFS_O_FEATBITS, VFS_FEAT_CRC_LEN));
+    return dev_write(g_start, 1, sb);
+}
+
+// 元数据块写（**唯一入口**）：日志开着就攒进事务，否则直接写盘。
+// keep_ino = 调用方已经自己把新字节放进 inode 窗口，不需要失效缓存（inode_store 的既有语义）。
+static bool meta_write64(uint32_t blk, const uint8_t* pay, bool keep_ino) {
+    if (blk >= g_blocks) { log_bad_block(blk); return false; }
+    if (!jx_on64()) return dev_write_at(g_drive, g_start + blk, 1, pay, keep_ino);
+    if (g_jx_n >= VFS64_JX_MAX_BLOCKS) {                     // 攒满了先提交一批（不是丢数据）
+        if (!jx_end64()) return false;
+    }
+    copy_bytes(g_jx_pay + g_jx_n * VFS64_SECTOR_BYTES, pay, VFS64_SECTOR_BYTES);
+    g_jx_tgt[g_jx_n++] = blk;
+    return true;
+}
+
+// 提交 + checkpoint + 清头。checkpoint = false 只给自检用（造"已提交但没写回目标块"的掉电现场）。
+static bool jx_commit_inner64(bool checkpoint) {
+    if (g_jx_n == 0) return true;
+    const uint32_t n = g_jx_n;
+    g_jx_txid++;
+    uint8_t hdr[VFS64_SECTOR_BYTES];
+    zero_bytes(hdr, VFS64_SECTOR_BYTES);
+    wr32(hdr + JX_O_MAGIC, JX_MAGIC);
+    wr32(hdr + JX_O_TXID, g_jx_txid);
+    wr32(hdr + JX_O_NBLK, n);
+    wr32(hdr + JX_O_STATE, JX_STATE_COMMIT);
+    for (uint32_t i = 0; i < n; i++) wr32(hdr + JX_O_TGT + 4u * i, g_jx_tgt[i]);
+    uint32_t st = crc32_upd64(0xFFFFFFFFu, hdr, JX_O_CRC);            // [0,16)：crc 字段本身按 0 算
+    st = crc32_upd64(st, hdr + JX_O_TGT, 4u * n);
+    for (uint32_t i = 0; i < n; i++)
+        st = crc32_upd64(st, g_jx_pay + i * VFS64_SECTOR_BYTES, VFS64_SECTOR_BYTES);
+    wr32(hdr + JX_O_CRC, st ^ 0xFFFFFFFFu);
+
+    bool ok = true;
+    for (uint32_t i = 0; i < n && ok; i++) {                          // ① 载荷块
+        if (!dev_write(g_start + g_jx_start + 1u + i, 1, g_jx_pay + i * VFS64_SECTOR_BYTES))
+            ok = false;
+    }
+    if (ok && !dev_write(g_start + g_jx_start, 1, hdr)) ok = false;   // ② **提交点**
+    if (ok && checkpoint) {
+        for (uint32_t i = 0; i < n && ok; i++) {                      // ③ checkpoint
+            const uint32_t t = g_jx_tgt[i];
+            if (t == 0 || t >= g_blocks) { ok = false; break; }
+            if (!dev_write(g_start + t, 1, g_jx_pay + i * VFS64_SECTOR_BYTES)) ok = false;
+        }
+    }
+    if (ok && checkpoint) {                                          // ④ 清头
+        zero_bytes(hdr, VFS64_SECTOR_BYTES);
+        if (!dev_write(g_start + g_jx_start, 1, hdr)) ok = false;
+    }
+    g_jx_n = 0;
+    if (ok) g_jx_commits++;
+    return ok;
+}
+static bool jx_end64() { return jx_commit_inner64(true); }
+
+// 挂载时重放：日志头有 COMMITTED 事务且 CRC 对 -> 逐块写回目标块 -> 清头。
+// 任何一步不对就**如实失败**（挂载拒绝，reason=journal），绝不"猜着写"。
+static bool jx_replay64() {
+    if ((g_feat & VFS64_FEAT_JOURNAL) == 0 || g_jx_blocks < 2u) return true;
+    uint8_t hdr[VFS64_SECTOR_BYTES];
+    if (!dev_read(g_start + g_jx_start, 1, hdr)) return false;
+    if (rd32(hdr + JX_O_MAGIC) != JX_MAGIC) return true;               // 空日志（格式化后就是全 0）
+    const uint32_t state = rd32(hdr + JX_O_STATE);
+    const uint32_t n     = rd32(hdr + JX_O_NBLK);
+    const uint32_t txid  = rd32(hdr + JX_O_TXID);
+    if (state != JX_STATE_COMMIT) {                                    // 未提交事务：没提交过，什么都不做
+        g_jx_txid = txid;
+        return true;
+    }
+    if (n == 0 || n > VFS64_JX_MAX_BLOCKS || n > g_jx_blocks - 1u) {
+        log_line("[JX64] replay rejected reason=nblk");
+        return false;
+    }
+    static uint8_t pay[VFS64_JX_MAX_BLOCKS * VFS64_SECTOR_BYTES];
+    uint32_t st = crc32_upd64(0xFFFFFFFFu, hdr, JX_O_CRC);
+    st = crc32_upd64(st, hdr + JX_O_TGT, 4u * n);
+    for (uint32_t i = 0; i < n; i++) {
+        if (!dev_read(g_start + g_jx_start + 1u + i, 1, pay + i * VFS64_SECTOR_BYTES)) {
+            log_line("[JX64] replay FAILED reason=read");
+            return false;
+        }
+        st = crc32_upd64(st, pay + i * VFS64_SECTOR_BYTES, VFS64_SECTOR_BYTES);
+    }
+    if ((st ^ 0xFFFFFFFFu) != rd32(hdr + JX_O_CRC)) {
+        log_line("[JX64] replay rejected reason=crc");                  // 记录坏了：不猜、不写
+        return false;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t t = rd32(hdr + JX_O_TGT + 4u * i);
+        if (t == 0 || t >= g_blocks) { log_line("[JX64] replay rejected reason=target"); return false; }
+        if (!dev_write(g_start + t, 1, pay + i * VFS64_SECTOR_BYTES)) {
+            log_line("[JX64] replay FAILED reason=write");
+            return false;
+        }
+    }
+    zero_bytes(hdr, VFS64_SECTOR_BYTES);
+    if (!dev_write(g_start + g_jx_start, 1, hdr)) return false;        // 清头
+    g_jx_txid = txid;
+    dbg64_line_begin64();
+    dbg64_str("[JX64] replay ok txid=");
+    dbg64_dec(txid);
+    dbg64_str(" nblk=");
+    dbg64_dec(n);
+    dbg64_str(" applied=");
+    dbg64_dec(n);
+    dbg64_str(" journal_cleared=1");
+    dbg64_nl();
+    dbg64_line_end64();
+    return true;
+}
+
+// 找一段**连续** n 个空闲数据块并全部置位（日志区要求连续：一块一次 ATA 事务的扩展开销太大）。
+// 返回起始块号；0 = 找不到（调用方如实失败，不退回"不连续也行"）。
+static int blk_bit_get64(uint32_t blk, uint8_t* sec, uint32_t* cached_m) {
+    const uint32_t m = blk / VFS64_BITMAP_BLK_BITS;
+    if (m >= g_bitmap_blocks) return -1;
+    if (m != *cached_m) {
+        if (!dev_read(g_start + g_bitmap_start + m, 1, sec)) return -1;
+        *cached_m = m;
+    }
+    const uint32_t k = blk % VFS64_BITMAP_BLK_BITS;
+    return (sec[k >> 3] & (uint8_t)(1u << (k & 7u))) ? 1 : 0;
+}
+static uint32_t alloc_run64(uint32_t n) {
+    if (n == 0) return 0;
+    static uint8_t sec[VFS64_SECTOR_BYTES];
+    uint32_t cached_m = 0xFFFFFFFFu, run = 0, start = 0;
+    for (uint32_t b = g_data_start; b < g_blocks; b++) {
+        const int u = blk_bit_get64(b, sec, &cached_m);
+        if (u < 0) return 0;
+        if (u != 0) { run = 0; continue; }
+        if (run == 0) start = b;
+        if (++run == n) break;
+    }
+    if (run != n) return 0;
+    for (uint32_t b = start; b < start + n; b++)
+        if (!bitmap_set(b, true)) return 0;
+    return start;
+}
+
+// 配额表的格式常量（放在这里是因为 vfs64_feature_enable64 要给新表写"空项哨兵"）
+static const uint32_t QT_MAGIC     = 0x3154514Au;    // "JQT1"
+static const uint32_t QT_ENTRIES   = 16u;
+static const uint32_t QT_ENT_BYTES = 16u;
+static const uint32_t QT_FLAG_ON   = 1u;
+static const uint32_t QT_UNLIMITED = 0xFFFFFFFFu;
+
+// 打开某个特性（四个特性共用这一个入口；各自的区域分配见下）。
+int vfs64_feature_enable64(uint32_t bit) {
+    if (!g_mounted) { log_op_fail("feature", "not mounted"); return -1; }
+    if (g_lay->xattr_off == 0) {                       // v4/v3/v2：没有特性扩展头
+        log_line("[VFS64] feature FAILED reason=volume-not-v5 (run migrate)");
+        return -1;
+    }
+    if (g_cred.euid != 0) { log_line("[VFS64] feature FAILED reason=need-root"); return -1; }
+    if ((bit & VFS64_FEAT_ALL) == 0) { log_line("[VFS64] feature FAILED reason=bad-bit"); return -1; }
+    if ((g_feat & bit) != 0) return 0;                 // 幂等
+    bool ok = true;
+    if (bit == VFS64_FEAT_JOURNAL) {
+        if (g_jx_blocks != 0) return 0;
+        const uint32_t nb = 1u + VFS64_JX_MAX_BLOCKS;
+        const uint32_t s = alloc_run64(nb);
+        if (s == 0) { log_line("[JX64] enable FAILED reason=no contiguous run"); return -1; }
+        uint8_t z[VFS64_SECTOR_BYTES];
+        zero_bytes(z, VFS64_SECTOR_BYTES);
+        for (uint32_t i = 0; i < nb && ok; i++)        // 先把整段清 0（旧垃圾会被当记录）
+            if (!blk_write(s + i, z)) ok = false;
+        if (ok) { g_jx_start = s; g_jx_blocks = nb; g_jx_txid = 0; g_jx_n = 0; }
+    } else if (bit == VFS64_FEAT_QUOTA) {
+        if (g_quota_blk != 0) return 0;
+        const uint32_t b = alloc_block();
+        if (b == 0) { log_line("[QUOTA] enable FAILED reason=no free block"); return -1; }
+        uint8_t t[VFS64_SECTOR_BYTES];
+        zero_bytes(t, VFS64_SECTOR_BYTES);
+        wr32(t, 0x3154514Au);                          // "JQT1"
+        wr32(t + 4, QT_ENTRIES);                       // 表项数
+        // ★ 空表项的 uid 必须写成 0xFFFFFFFF（哨兵）—— 全 0 会被当成"uid 0 的额度"，
+        //   于是"找空项"永远找不到，第一次设置就报 table-full（自检 step=4 抓到的真实缺陷）。
+        for (uint32_t k = 0; k < QT_ENTRIES; k++) wr32(t + 8u + QT_ENT_BYTES * k, QT_UNLIMITED);
+        if (!blk_write(b, t)) ok = false;
+        if (ok) g_quota_blk = b;
+    } else if (bit == VFS64_FEAT_SNAPSHOT) {
+        if (g_snap_blk != 0) return 0;
+        const uint32_t b = alloc_block();
+        if (b == 0) { log_line("[SNAP] enable FAILED reason=no free block"); return -1; }
+        uint8_t t[VFS64_SECTOR_BYTES];
+        zero_bytes(t, VFS64_SECTOR_BYTES);
+        wr32(t, 0x31504E53u);                          // "SNP1"
+        wr32(t + 4, 8u);                               // 表项数
+        wr32(t + 8, 1u);                               // 下一个快照 id
+        if (!blk_write(b, t)) ok = false;
+        if (ok) g_snap_blk = b;
+    } else if (bit == VFS64_FEAT_ACL) {
+        ok = true;                                     // 只置位：xattr 块按需分配
+    }
+    if (!ok) { log_line("[VFS64] feature FAILED reason=alloc/write"); return -1; }
+    g_feat |= bit;
+    if (!sb_feat_store64()) { g_feat &= ~bit; log_line("[VFS64] feature FAILED reason=sb-write"); return -1; }
+    dbg64_line_begin64();
+    dbg64_str("[VFS64] feature on bit=");
+    dbg64_dec(bit);
+    dbg64_str(bit == VFS64_FEAT_JOURNAL ? " name=journal jx_start=" : bit == VFS64_FEAT_QUOTA ? " name=quota quota_blk="
+            : bit == VFS64_FEAT_ACL ? " name=acl xattr_off=81" : " name=snapshot snap_blk=");
+    if (bit == VFS64_FEAT_JOURNAL) dbg64_dec(g_jx_start);
+    else if (bit == VFS64_FEAT_QUOTA) dbg64_dec(g_quota_blk);
+    else if (bit == VFS64_FEAT_SNAPSHOT) dbg64_dec(g_snap_blk);
+    else dbg64_dec(0);
+    dbg64_str(" bits=");
+    dbg64_dec(g_feat);
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+uint32_t vfs64_features64() { return g_mounted ? g_feat : 0u; }
+void vfs64_features_dump64() {
+    dbg64_line_begin64();
+    dbg64_str("[VFS64] features bits=");
+    dbg64_dec(g_mounted ? g_feat : 0u);
+    dbg64_str(" journal=");
+    dbg64_dec((g_feat & VFS64_FEAT_JOURNAL) ? 1u : 0u);
+    dbg64_str(" quota=");
+    dbg64_dec((g_feat & VFS64_FEAT_QUOTA) ? 1u : 0u);
+    dbg64_str(" acl=");
+    dbg64_dec((g_feat & VFS64_FEAT_ACL) ? 1u : 0u);
+    dbg64_str(" snapshot=");
+    dbg64_dec((g_feat & VFS64_FEAT_SNAPSHOT) ? 1u : 0u);
+    dbg64_str(" version=");
+    dbg64_dec(g_mounted ? g_lay->version : 0u);
+    dbg64_str(" ro=");
+    dbg64_dec(g_ro ? 1u : 0u);
+    dbg64_str(" commits=");
+    dbg64_dec(g_jx_commits);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+// 旧卷迁移：v4 -> v5 就地（inode/数据一个字节都不动；只改版本号 + 清扩展头 + 重算主 CRC）。
+int vfs64_migrate64() {
+    if (!g_mounted) { log_op_fail("migrate", "not mounted"); return -1; }
+    if (g_cred.euid != 0) { log_line("[VFS64] migrate FAILED reason=need-root"); return -1; }
+    const uint32_t from = g_lay->version;
+    if (from == VFS64_VERSION) {                       // 已经是 v5：幂等
+        dbg64_line_begin64();
+        dbg64_str("[VFS64] migrate ok from=5 to=5 blocks=");
+        dbg64_dec(g_blocks);
+        dbg64_str(" noop=1");
+        dbg64_nl();
+        dbg64_line_end64();
+        return 0;
+    }
+    if (from < VFS64_VERSION_V4) {
+        dbg64_line_begin64();
+        dbg64_str("[VFS64] migrate FAILED reason=v");
+        dbg64_dec(from);
+        dbg64_str("-needs-reformat");
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+    if (g_ro) { log_line("[VFS64] migrate FAILED reason=read-only"); return -1; }
+    if (g_feat != 0) { log_line("[VFS64] migrate FAILED reason=feature-bits-on-v4"); return -1; }
+    uint8_t sb[VFS64_SECTOR_BYTES];
+    if (!dev_read(g_start, 1, sb)) return -1;
+    if (rd32(sb + VFS_O_VERSION) != from) return -1;
+    wr32(sb + VFS_O_VERSION, VFS64_VERSION);           // 5
+    wr32(sb + VFS_O_FEATBITS, 0);
+    wr32(sb + VFS_O_JX_START, 0);
+    wr32(sb + VFS_O_JX_NBLK, 0);
+    wr32(sb + VFS_O_QUOTA, 0);
+    wr32(sb + VFS_O_SNAP, 0);
+    wr32(sb + VFS_O_FEATCRC, 0);
+    wr32(sb + VFS_O_CRC, crc32_64(sb, VFS_SB_CRC_LEN));   // 主 CRC 覆盖 [0,60)，版本号在里面
+    if (sb[VFS_O_SIG] != 0x55 || sb[VFS_O_SIG + 1] != 0xAA) return -1;
+    if (!dev_write(g_start, 1, sb)) return -1;
+    g_lay = &VFS_LAY_V5;
+    g_feat = 0; g_jx_start = 0; g_jx_blocks = 0; g_quota_blk = 0; g_snap_blk = 0;
+    ino_cache_invalidate();
+    dbg64_line_begin64();
+    dbg64_str("[VFS64] migrate ok from=");
+    dbg64_dec(from);
+    dbg64_str(" to=");
+    dbg64_dec(VFS64_VERSION);
+    dbg64_str(" blocks=");
+    dbg64_dec(g_blocks);
+    dbg64_str(" inode_untouched=1");
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+
+// ==================== ★ v0.9.28 特性层 B：per-uid 块数配额（quota）====================
+// 表 = 1 块（启用时分配）：头 {u32 magic "JQT1"; u32 count=16} + 16 × {u32 uid; u32 limit; u32 used; u32 flags}
+//   uid == 0xFFFFFFFF 表示空表项；flags bit0 = 生效；limit == 0xFFFFFFFF = 不限。
+// 语义（如实写清，别当 POSIX quota 的等价物）：
+//   * 记账粒度 = **一次写操作的块数增量**（不是每分配一块就查一次表）：
+//     好处是超限能在**动手之前**判定（返回 -1，盘上一个字节都不写，不产生半截文件）；
+//     代价是 used 是"按操作结算"的近似值（新建/覆盖/截断/删除都会调整，但并发写不精确）。
+//   * 记在**文件属主**名下：root 写别人的文件仍然算那个 uid 的用量。
+//   * 只拦"变大"：删除、截断变小、覆盖变小一律放行（否则配额满了就永远删不掉东西）。
+static uint32_t g_quota_denies = 0;
+
+static bool qt_on64() {
+    return g_mounted && !g_ro && (g_feat & VFS64_FEAT_QUOTA) != 0 && g_quota_blk != 0;
+}
+// 1 = 已载入；0 = 这个卷没配额表（全部放行）；-1 = 读失败/表损坏（按"没开"处理，但打点）
+static int qt_load64(uint8_t* blk) {
+    if (!qt_on64()) return 0;
+    if (!blk_read(g_quota_blk, blk)) return -1;
+    if (rd32(blk + 0) != QT_MAGIC) { log_line("[QUOTA] table bad magic"); return -1; }
+    return 1;
+}
+// ★ 真缺陷（v0.9.28 自检 bit19 step9 抓到）：日志开着时 meta_write64 只是把块**攒进事务缓冲**，
+//   真正的盘上内容要等 jx_end64() 才生效；而紧接着的 qt_load64 是直接读盘的 →
+//   读回旧 used（记账看起来"丢了"）。配额表就这么一块、改一次收口一次，代价可忽略，
+//   换来"写完立刻读得到"这个更重要的性质。
+static bool qt_store64(const uint8_t* blk) {
+    if (!meta_write64(g_quota_blk, blk)) return false;
+    return jx_end64();
+}
+// 找 uid 的表项下标；没有返回 0xFFFFFFFF
+static uint32_t qt_find64(const uint8_t* blk, uint32_t uid) {
+    uint32_t cnt = rd32(blk + 4);
+    if (cnt > QT_ENTRIES) cnt = QT_ENTRIES;
+    for (uint32_t i = 0; i < cnt; i++)
+        if (rd32(blk + 8u + QT_ENT_BYTES * i) == uid) return i;
+    return 0xFFFFFFFFu;
+}
+// 预检：uid 再要 extra 块会不会超额。1 允许 / 0 拒绝（已打点）/ -1 没有配额表（放行）
+static int qt_allow64(uint32_t uid, uint32_t extra) {
+    if (extra == 0) return 1;
+    uint8_t t[VFS64_SECTOR_BYTES];
+    const int ld = qt_load64(t);
+    if (ld <= 0) return -1;
+    const uint32_t i = qt_find64(t, uid);
+    if (i == 0xFFFFFFFFu) return 1;                            // 没给这个 uid 设过额度 = 不限
+    const uint32_t lim = rd32(t + 8u + QT_ENT_BYTES * i + 4u);
+    const uint32_t used = rd32(t + 8u + QT_ENT_BYTES * i + 8u);
+    const uint32_t fl = rd32(t + 8u + QT_ENT_BYTES * i + 12u);
+    if ((fl & QT_FLAG_ON) == 0 || lim == QT_UNLIMITED) return 1;
+    if (used + extra <= lim) return 1;
+    if (g_quota_denies < 16u) {
+        g_quota_denies++;
+        dbg64_line_begin64();
+        dbg64_str("[QUOTA] deny uid=");
+        dbg64_dec(uid);
+        dbg64_str(" want=");
+        dbg64_dec(extra);
+        dbg64_str(" used=");
+        dbg64_dec(used);
+        dbg64_str(" limit=");
+        dbg64_dec(lim);
+        dbg64_str(" reason=over-limit");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    return 0;
+}
+// 记账（delta 可负；不会把 used 减到 0 以下）
+static void qt_charge64(uint32_t uid, int32_t delta) {
+    if (delta == 0) return;
+    uint8_t t[VFS64_SECTOR_BYTES];
+    if (qt_load64(t) != 1) return;
+    const uint32_t i = qt_find64(t, uid);
+    if (i == 0xFFFFFFFFu) {                                   // 没设过额度：不建表项（省一块写）
+        return;
+    }
+    uint8_t* e = t + 8u + QT_ENT_BYTES * i;
+    const uint32_t used = rd32(e + 8u);
+    uint32_t nu = used;
+    if (delta >= 0) {
+        nu = used + (uint32_t)delta;
+        if (nu < used) nu = 0xFFFFFFFFu;                       // 溢出保护
+    } else {
+        const uint32_t d = (uint32_t)(-delta);
+        nu = (used > d) ? (used - d) : 0u;
+    }
+    wr32(e + 8u, nu);
+    if (!qt_store64(t)) log_line("[QUOTA] WARN usage write-back failed");
+}
+// 按 inode 表**重算**某个 uid 的已用块数（一次全表扫描）。
+// 为什么必须重算：记账只跟"本 uid 自己的写"结算 —— 由 root 建好再 chown 过来的文件、以及配额
+//   打开之前就存在的文件，块数都不会出现在 used 里。不重算就会出现"限额 4 块、实际已占 100 块还放行"。
+static uint32_t qt_measure64(uint32_t uid) {
+    uint32_t used = 0;
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    for (uint32_t i = 1; i < g_inode_count; i++) {
+        if (!inode_load(i, ino)) break;
+        const uint32_t t = ino[VFS_I_TYPE];
+        if (t != VFS64_TYPE_FILE && t != VFS64_TYPE_LINK) continue;
+        if (ino_uid_of64(ino) != uid) continue;
+        used += vfs64_blocks_for_bytes64(rd32(ino + VFS_I_SIZE));
+    }
+    return used;
+}
+// 设置/查询额度（root 才能设；used 在设置时重算一次）
+int vfs64_quota_set64(uint32_t uid, uint32_t limit_blocks) {
+    if (!g_mounted) return -1;
+    if ((g_feat & VFS64_FEAT_QUOTA) == 0 || g_quota_blk == 0) {
+        log_line("[QUOTA] set FAILED reason=quota-not-enabled");
+        return -1;
+    }
+    if (g_cred.euid != 0) { log_line("[QUOTA] set FAILED reason=need-root"); return -1; }
+    if (g_ro) return -1;
+    uint8_t t[VFS64_SECTOR_BYTES];
+    if (qt_load64(t) != 1) return -1;
+    uint32_t i = qt_find64(t, uid);
+    if (i == 0xFFFFFFFFu) {                                   // 找空表项
+        uint32_t cnt = rd32(t + 4);
+        if (cnt > QT_ENTRIES) cnt = QT_ENTRIES;
+        for (uint32_t k = 0; k < QT_ENTRIES; k++) {
+            const uint32_t uid_k = (k < cnt) ? rd32(t + 8u + QT_ENT_BYTES * k) : QT_UNLIMITED;
+            const uint32_t lim_k = (k < cnt) ? rd32(t + 8u + QT_ENT_BYTES * k + 4u) : 0u;
+            const uint32_t fl_k  = (k < cnt) ? rd32(t + 8u + QT_ENT_BYTES * k + 12u) : 0u;
+            // 空项 = uid 哨兵，或者整项全 0（早期表没写哨兵的情况也放行）
+            if (uid_k == QT_UNLIMITED || (uid_k == 0u && lim_k == 0u && fl_k == 0u && k >= cnt)) {
+                i = k;
+                if (k >= cnt) wr32(t + 4, k + 1u);
+                break;
+            }
+        }
+        if (i == 0xFFFFFFFFu) { log_line("[QUOTA] set FAILED reason=table-full"); return -1; }
+        wr32(t + 8u + QT_ENT_BYTES * i, uid);
+        wr32(t + 8u + QT_ENT_BYTES * i + 4u, limit_blocks);
+        wr32(t + 8u + QT_ENT_BYTES * i + 8u, qt_measure64(uid));       // 重算（不信历史记账）
+        wr32(t + 8u + QT_ENT_BYTES * i + 12u, QT_FLAG_ON);
+    } else {
+        wr32(t + 8u + QT_ENT_BYTES * i + 4u, limit_blocks);
+        wr32(t + 8u + QT_ENT_BYTES * i + 8u, qt_measure64(uid));
+        wr32(t + 8u + QT_ENT_BYTES * i + 12u, QT_FLAG_ON);
+    }
+    if (!qt_store64(t)) return -1;
+    dbg64_line_begin64();
+    dbg64_str("[QUOTA] set ok uid=");
+    dbg64_dec(uid);
+    dbg64_str(" limit=");
+    dbg64_dec(limit_blocks);
+    dbg64_str(" used=");
+    dbg64_dec(rd32(t + 8u + QT_ENT_BYTES * i + 8u));
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+int vfs64_quota_get64(uint32_t uid, uint32_t* limit_blocks, uint32_t* used_blocks) {
+    if (limit_blocks) *limit_blocks = 0;
+    if (used_blocks) *used_blocks = 0;
+    if (!g_mounted) return -1;
+    uint8_t t[VFS64_SECTOR_BYTES];
+    if (qt_load64(t) != 1) return -1;
+    const uint32_t i = qt_find64(t, uid);
+    if (i == 0xFFFFFFFFu) {
+        if (limit_blocks) *limit_blocks = QT_UNLIMITED;
+        return 0;
+    }
+    if (limit_blocks) *limit_blocks = rd32(t + 8u + QT_ENT_BYTES * i + 4u);
+    if (used_blocks) *used_blocks = rd32(t + 8u + QT_ENT_BYTES * i + 8u);
+    return 0;
+}
+
+// ==================== ★ v0.9.28 特性层 C：xattr + POSIX ACL 子集 ====================
+// 存储：每个 inode 一个 **xattr 块**（按需分配，块号写在 inode 的 xattr_blk 字段，v5 专有）。
+// 块布局（小端）：{u32 magic "XAT1"; u32 count} 然后 count 条紧排的
+//   [u8 nlen][name…][u16 vlen][val…]（不填充、不排序；链尾之后必须是 0）。
+// ACL 的取值 = Linux 的 **二进制 posix_acl 数组**（`system.posix_acl_access`）：
+//   每项 8 B = {u16 e_tag; u16 e_perm; u32 e_id}，tag：
+//     0x01 USER_OBJ / 0x02 USER / 0x04 GROUP_OBJ / 0x08 GROUP / 0x10 MASK / 0x20 OTHER
+//   （与 Linux 的 posix_acl_xattr_entry 逐字节一致，所以宿主 Python/工具可以直接造这份字节）
+// 判定（有 ACL 时**完全按 ACL**，不再看 mode 的三段位；没有 ACL 才退回 mode）：
+//   euid == 属主 -> USER_OBJ；
+//   否则有同 uid 的 USER 项 -> 该项 & MASK；
+//   else 命中组（egid == 属主组，或有同 gid 的 GROUP 项）-> 该项 & MASK；
+//   else -> OTHER（**不与 MASK 相与**，与 POSIX 一致）。
+//   root（euid==0）绕过一切 DAC（与 P4 既有口径一致）。
+static const uint32_t XA_MAGIC = 0x31544158u;      // "XAT1"
+static const uint32_t XA_HDR   = 8u;
+static const char     kAclName[] = "system.posix_acl_access";
+#define XA_TAG_USER_OBJ   0x01u
+#define XA_TAG_USER       0x02u
+#define XA_TAG_GROUP_OBJ  0x04u
+#define XA_TAG_GROUP      0x08u
+#define XA_TAG_MASK       0x10u
+#define XA_TAG_OTHER      0x20u
+
+static bool acl_on64() {
+    return g_mounted && (g_feat & VFS64_FEAT_ACL) != 0 && g_lay->xattr_off != 0;
+}
+static uint32_t str_len64(const char* s) { uint32_t n = 0; while (s && s[n]) n++; return n; }
+static bool name_eq64(const uint8_t* p, uint32_t n, const char* s) {
+    const uint32_t m = str_len64(s);
+    if (n != m) return false;
+    for (uint32_t i = 0; i < n; i++) if (p[i] != (uint8_t)s[i]) return false;
+    return true;
+}
+// ACL 求值：返回 1 允许 / 0 拒绝 / -1 这份值不是合法 ACL（-> 退回 mode）
+static int acl_eval64(const uint8_t* v, uint32_t vlen, const uint8_t* ino, uint32_t need3) {
+    if (vlen < 32u || (vlen % 8u) != 0) return -1;                 // 至少 4 项（obj/user_obj/group_obj/other 或含 mask）
+    const uint32_t iuid = ino_uid_of64(ino);
+    const uint32_t igid = ino_gid_of64(ino);
+    const uint32_t mode = ino_mode_of64(ino, ino[VFS_I_TYPE]);
+    uint32_t own = (mode >> 6) & 7u, grp = (mode >> 3) & 7u, oth = mode & 7u;
+    uint32_t mask = 7u, nuser = 0xFFFFFFFFu, ngrp = 0xFFFFFFFFu;
+    bool have_mask = false, have = false;
+    for (uint32_t o = 0; o + 8u <= vlen; o += 8u) {
+        const uint32_t tag  = (uint32_t)v[o] | ((uint32_t)v[o + 1] << 8);
+        const uint32_t perm = (uint32_t)v[o + 2] | ((uint32_t)v[o + 3] << 8);
+        const uint32_t id   = (uint32_t)v[o + 4] | ((uint32_t)v[o + 5] << 8) |
+                              ((uint32_t)v[o + 6] << 16) | ((uint32_t)v[o + 7] << 24);
+        if (perm > 7u) return -1;
+        switch (tag) {
+            case XA_TAG_USER_OBJ:  own = perm; have = true; break;
+            case XA_TAG_USER:      if (id == g_cred.euid) nuser = perm; have = true; break;
+            case XA_TAG_GROUP_OBJ: grp = perm; have = true; break;
+            case XA_TAG_GROUP:     if (id == g_cred.egid) ngrp = perm; have = true; break;
+            case XA_TAG_MASK:      mask = perm; have_mask = true; have = true; break;
+            case XA_TAG_OTHER:     oth = perm; have = true; break;
+            default: return -1;
+        }
+    }
+    if (!have) return -1;
+    uint32_t bits;
+    if (g_cred.euid == iuid)             bits = own;
+    else if (nuser != 0xFFFFFFFFu)       bits = have_mask ? (nuser & mask) : nuser;
+    else if (g_cred.egid == igid || ngrp != 0xFFFFFFFFu)
+                                         bits = have_mask ? ((ngrp != 0xFFFFFFFFu ? ngrp : grp) & mask)
+                                                          : (ngrp != 0xFFFFFFFFu ? ngrp : grp);
+    else                                 bits = oth;
+    return ((bits & need3) == need3) ? 1 : 0;
+}
+// 在 xattr 块里找一项；1 = 找到（*out_val/*out_len）；0 = 没有；-1 = 块损坏/读失败
+static int xattr_find64(const uint8_t* ino, const char* name, const uint8_t** out_val, uint32_t* out_len) {
+    if (g_lay->xattr_off == 0) return 0;
+    const uint32_t blk = rd32(ino + g_lay->xattr_off);
+    if (blk == 0) return 0;
+    if (!blk_ok_data(blk)) { log_bad_block(blk); return -1; }
+    static uint8_t b[VFS64_SECTOR_BYTES];
+    if (!blk_read(blk, b)) return -1;
+    if (rd32(b) != XA_MAGIC) { log_line("[XATTR] bad block magic"); return -1; }
+    uint32_t off = XA_HDR;
+    const uint32_t cnt = rd32(b + 4);
+    for (uint32_t i = 0; i < cnt; i++) {
+        if (off >= VFS64_SECTOR_BYTES) return -1;
+        const uint32_t nl = b[off];
+        if (off + 1u + nl + 2u > VFS64_SECTOR_BYTES) return -1;
+        const uint32_t vl = (uint32_t)b[off + 1u + nl] | ((uint32_t)b[off + 2u + nl] << 8);
+        const uint32_t vp = off + 3u + nl;
+        if (vp + vl > VFS64_SECTOR_BYTES) return -1;
+        if (name_eq64(b + off + 1u, nl, name)) {
+            if (out_val) *out_val = b + vp;
+            if (out_len) *out_len = vl;
+            return 1;
+        }
+        off = vp + vl;
+    }
+    return 0;
+}
+// 权限判定里的 ACL 分支：1 允许 / 0 拒绝 / -1 没有 ACL（调用方退回 mode）
+static int acl_perm64(const uint8_t* ino, uint32_t need3) {
+    if (!acl_on64() || need3 == 0) return -1;
+    const uint8_t* v = nullptr;
+    uint32_t vl = 0;
+    if (xattr_find64(ino, kAclName, &v, &vl) != 1) return -1;
+    static uint8_t copy[VFS64_SECTOR_BYTES];                       // 拷贝一份：xattr_find64 的缓冲是共用的
+    if (vl > VFS64_SECTOR_BYTES) return -1;
+    copy_bytes(copy, v, vl);
+    return acl_eval64(copy, vl, ino, need3);
+}
+// 写入/替换一个 xattr（vlen == 0 = 删除该项）。成功返回 true（**不改 inode**，调用方负责 inode_store）。
+static bool xattr_put64(uint8_t* ino, const char* name, const void* val, uint32_t vlen) {
+    if (g_lay->xattr_off == 0) return false;
+    const uint32_t nlen = str_len64(name);
+    if (nlen == 0 || nlen > 64u || 1u + nlen + 2u + vlen + XA_HDR > VFS64_SECTOR_BYTES) {
+        log_line("[XATTR] put FAILED reason=name/value too large");
+        return false;
+    }
+    uint8_t old[VFS64_SECTOR_BYTES];
+    uint32_t blk = rd32(ino + g_lay->xattr_off);
+    if (blk == 0) {
+        zero_bytes(old, VFS64_SECTOR_BYTES);
+        wr32(old, XA_MAGIC);
+        wr32(old + 4, 0u);
+    } else {
+        if (!blk_ok_data(blk)) { log_bad_block(blk); return false; }
+        if (!blk_read(blk, old)) return false;
+        if (rd32(old) != XA_MAGIC) { log_line("[XATTR] bad block magic"); return false; }
+    }
+    uint8_t nb[VFS64_SECTOR_BYTES];
+    zero_bytes(nb, VFS64_SECTOR_BYTES);
+    wr32(nb, XA_MAGIC);
+    uint32_t out = XA_HDR, cnt = 0;
+    uint32_t off = XA_HDR;
+    const uint32_t count = rd32(old + 4);
+    for (uint32_t i = 0; i < count; i++) {                         // 拷贝除同名项以外的全部项
+        if (off >= VFS64_SECTOR_BYTES) break;
+        const uint32_t nl = old[off];
+        if (off + 1u + nl + 2u > VFS64_SECTOR_BYTES) break;
+        const uint32_t vl = (uint32_t)old[off + 1u + nl] | ((uint32_t)old[off + 2u + nl] << 8);
+        const uint32_t vp = off + 3u + nl;
+        if (vp + vl > VFS64_SECTOR_BYTES) break;
+        const bool same = name_eq64(old + off + 1u, nl, name);
+        if (!same) {
+            const uint32_t elen = 1u + nl + 2u + vl;
+            if (out + elen > VFS64_SECTOR_BYTES) { log_line("[XATTR] put FAILED reason=no room"); return false; }
+            copy_bytes(nb + out, old + off, elen);
+            out += elen;
+            cnt++;
+        }
+        off = vp + vl;
+    }
+    if (vlen > 0) {                                                // 追加新值
+        const uint32_t elen = 1u + nlen + 2u + vlen;
+        if (out + elen > VFS64_SECTOR_BYTES) { log_line("[XATTR] put FAILED reason=no room"); return false; }
+        nb[out] = (uint8_t)nlen;
+        copy_bytes(nb + out + 1u, name, nlen);
+        nb[out + 1u + nlen] = (uint8_t)(vlen & 0xFFu);
+        nb[out + 2u + nlen] = (uint8_t)((vlen >> 8) & 0xFFu);
+        copy_bytes(nb + out + 3u + nlen, val, vlen);
+        out += elen;
+        cnt++;
+    }
+    wr32(nb + 4, cnt);
+    if (blk == 0) {
+        blk = alloc_block();
+        if (blk == 0) { log_line("[XATTR] put FAILED reason=no space"); return false; }
+        wr32(ino + g_lay->xattr_off, blk);
+    }
+    if (!meta_write64(blk, nb)) return false;
+    return true;
+}
+
+// ---- 对外：setxattr / getxattr（POSIX 名字，"system." 前缀的只能 root 或属主改）----
+int vfs64_setxattr64(const char* path, const char* name, const void* val, uint32_t vlen) {
+    if (!g_mounted) { log_op_fail("setxattr", "not mounted"); return -1; }
+    if (!path || !name) { log_op_fail("setxattr", "bad args"); return -1; }
+    if (!acl_on64()) { log_line("[XATTR] setxattr FAILED reason=acl-feature-off"); return -1; }
+    if (g_ro) { log_line("[XATTR] setxattr FAILED reason=read-only"); return -1; }
+    uint32_t idx = 0;
+    const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
+    if (pr != 0) { log_op_fail("setxattr", pr == -VFS64_EACCES ? "permission denied (traverse)" : "not found"); return pr; }
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    if (inode_load_ok(idx, ino, "setxattr") != 0) return -1;
+    // 谁能改：root 或属主（Linux 对 system.* 的口径；这里不实现 CAP_SYS_ADMIN 的细分）
+    if (g_cred.euid != 0 && g_cred.euid != ino_uid_of64(ino)) {
+        log_line("[XATTR] setxattr FAILED reason=need-root-or-owner");
+        return -VFS64_EACCES;
+    }
+    if (!xattr_put64(ino, name, val, vlen)) return -1;
+    if (g_lay->mtime_off != 0) wr32(ino + g_lay->mtime_off, vfs64_now64());
+    wr32(ino + g_lay->crc_off, crc32_64(ino, g_lay->crc_off));
+    if (!inode_store(idx, ino)) return -1;
+    dbg64_line_begin64();
+    dbg64_str("[XATTR] setxattr ok path=");
+    dbg64_str(path);
+    dbg64_str(" name=");
+    dbg64_str(name);
+    dbg64_str(" len=");
+    dbg64_dec(vlen);
+    dbg64_nl();
+    dbg64_line_end64();
+    return 0;
+}
+int vfs64_getxattr64(const char* path, const char* name, void* buf, uint32_t cap) {
+    if (!g_mounted || !path || !name) return -1;
+    uint32_t idx = 0;
+    if (path_resolve(path, false, &idx, nullptr, nullptr, nullptr) != 0) return -1;
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    if (inode_load_ok(idx, ino, "getxattr") != 0) return -1;
+    const uint8_t* v = nullptr;
+    uint32_t vl = 0;
+    const int r = xattr_find64(ino, name, &v, &vl);
+    if (r <= 0) return -1;
+    if (buf && cap >= vl) copy_bytes(buf, v, vl);                  // 缓冲不够就不拷（返回长度，与 getxattr(2) 同口径）
+    return (int)vl;
+}
+// 便捷入口：给 uid 授 perm3（rwx 三位）的访问权，并把其余项按当前 mode 补齐（含 MASK）。
+int vfs64_acl_grant64(const char* path, uint32_t uid, uint32_t perm3) {
+    if (!g_mounted || !path) return -1;
+    if (!acl_on64()) { log_line("[ACL] grant FAILED reason=acl-feature-off"); return -1; }
+    if (perm3 > 7u) return -1;
+    uint32_t idx = 0;
+    if (path_resolve(path, false, &idx, nullptr, nullptr, nullptr) != 0) return -1;
+    uint8_t ino[VFS64_INODE_BYTES_MAX];
+    if (inode_load_ok(idx, ino, "acl_grant") != 0) return -1;
+    const uint32_t mode = ino_mode_of64(ino, ino[VFS_I_TYPE]);
+    uint8_t v[6 * 8];
+    uint32_t n = 0;
+    const uint32_t own = (mode >> 6) & 7u, grp = (mode >> 3) & 7u, oth = mode & 7u;
+    // USER_OBJ / USER(uid) / GROUP_OBJ / MASK / OTHER —— 顺序与 Linux 一致
+    uint8_t* p = v;
+    //   非"命名项"的 e_id 一律写 ACL_UNDEFINED_ID(0xFFFFFFFF)（与 Linux 逐字节同口径）
+    wr16(p + 0, (uint16_t)XA_TAG_USER_OBJ);  wr16(p + 2, (uint16_t)own); wr32(p + 4, 0xFFFFFFFFu); p += 8; n++;
+    wr16(p + 0, (uint16_t)XA_TAG_USER);      wr16(p + 2, (uint16_t)perm3); wr32(p + 4, uid);        p += 8; n++;
+    wr16(p + 0, (uint16_t)XA_TAG_GROUP_OBJ); wr16(p + 2, (uint16_t)grp); wr32(p + 4, 0xFFFFFFFFu); p += 8; n++;
+    wr16(p + 0, (uint16_t)XA_TAG_MASK);      wr16(p + 2, (uint16_t)perm3); wr32(p + 4, 0xFFFFFFFFu); p += 8; n++;
+    wr16(p + 0, (uint16_t)XA_TAG_OTHER);     wr16(p + 2, (uint16_t)oth); wr32(p + 4, 0xFFFFFFFFu); p += 8; n++;
+    return vfs64_setxattr64(path, kAclName, v, n * 8u);
+}
+
+// ==================== ★ v0.9.28 特性层 D：只读快照（full copy，**不是 COW**）====================
+// 诚实定义（写在最前面，免得被误解）：
+//   * 快照 = 在卷内预留一段**连续**空闲块，把当前目录树**整棵拷进去**（格式化成一个新的 v5 卷），
+//     然后把它以**只读**方式挂在一个独立卷槽上。它不是写时复制：拷贝的时候占满 CPU 与磁盘带宽，
+//     空间代价 = 快照区大小（与源卷已用数据量同量级），拍完之后的写**不会**影响已拍好的快照。
+//   * 为什么不做 COW：COW 要求每次落盘都多一次"先把旧块搬到影子区"并维护重定向表，
+//     在 ATA PIO（实测 ~0.7 MB/s）上会把每次普通写都拖成两倍，且重定向表本身需要持久化
+//     —— 那是另一个量级的工程。这里宁可慢一拍、把语义做实。
+// 表 = 1 块（启用时分配）：头 {u32 magic "SNP1"; u32 max=8; u32 next_id; u32 used}
+//   项 8 × 24B：{u32 id; u32 start_blk（卷内相对块号）; u32 blocks; u32 taken（打包 mtime）;
+//                u32 state（0=拷贝中 1=就绪）; u32 slot（挂载在哪个卷槽，0xFFFFFFFF = 未挂）}
+static const uint32_t SN_MAGIC   = 0x31504E53u;    // "SNP1"
+static const uint32_t SN_MAX     = 8u;
+static const uint32_t SN_HDR     = 16u;
+static const uint32_t SN_ENT     = 24u;
+static const uint32_t SN_ST_COPY = 0u;
+static const uint32_t SN_ST_READY = 1u;
+
+static bool sn_on64() {
+    return g_mounted && !g_ro && (g_feat & VFS64_FEAT_SNAPSHOT) != 0 && g_snap_blk != 0;
+}
+static bool sn_load64(uint8_t* b) {
+    if (!sn_on64()) return false;
+    if (!blk_read(g_snap_blk, b)) return false;
+    if (rd32(b) != SN_MAGIC) { log_line("[SNAP] table bad magic"); return false; }
+    return true;
+}
+// "/a" + "b" -> "/a/b"（父目录是 "/" 时不重复斜杠）
+static bool snap_join64(const char* dir, const char* name, char* out, uint32_t cap) {
+    uint32_t i = 0;
+    for (; dir[i]; i++) { if (i + 1u >= cap) return false; out[i] = dir[i]; }
+    if (i == 0 || out[i - 1] != '/') { if (i + 1u >= cap) return false; out[i++] = '/'; }
+    for (uint32_t k = 0; name[k]; k++) { if (i + 1u >= cap) return false; out[i++] = name[k]; }
+    out[i] = 0;
+    return true;
+}
+
+struct SnapCtx64 { int base, dst; uint32_t files, dirs, links, bytes; };
+
+static bool snap_copy_file64(SnapCtx64* c, const char* path, uint32_t size) {
+    static uint8_t buf[4096];
+    if (size == 0) return vfs64_create_on64(c->dst, path) == 0;      // 空文件也要在快照里存在
+    uint32_t off = 0;
+    while (off < size) {
+        uint32_t want = size - off;
+        if (want > sizeof(buf)) want = (uint32_t)sizeof(buf);
+        uint32_t got = 0;
+        if (vfs64_read_at_on64(c->base, path, off, buf, want, &got) != 0 || got == 0) return false;
+        if (vfs64_write_at_on64(c->dst, path, off, buf, got) != 0) return false;
+        off += got;
+        c->bytes += got;
+    }
+    return true;
+}
+// 递归拷贝（源卷用 *_on64(base) 显式读、目标卷用 *_on64(dst) 显式写 ——
+// **不依赖"当前卷"是谁**，所以拷贝过程中无论谁在切卷都不会写错地方）
+static bool snap_copy_dir64(SnapCtx64* c, const char* path, uint32_t depth) {
+    if (depth > 12u) { log_line("[SNAP] copy FAILED reason=too-deep"); return false; }
+    Vfs64Dirent64 ents[4];
+    uint32_t cursor = 0;
+    for (;;) {
+        const int n = vfs64_list64_on64(c->base, path, ents, 4, &cursor);
+        if (n < 0) { log_line("[SNAP] copy FAILED reason=list"); return false; }
+        if (n == 0) break;
+        for (int i = 0; i < n; i++) {
+            char child[VFS64_PATH_MAX + 1];
+            if (!snap_join64(path, ents[i].name, child, (uint32_t)sizeof(child))) return false;
+            if (ents[i].type == VFS64_TYPE_DIR) {
+                if (vfs64_mkdir_on64(c->dst, child) != 0) {
+                    log_line("[SNAP] copy FAILED reason=mkdir");
+                    return false;
+                }
+                c->dirs++;
+                if (!snap_copy_dir64(c, child, depth + 1)) return false;
+            } else if (ents[i].type == VFS64_TYPE_LINK) {
+                c->links++;                 // 如实标注：符号链接**不进快照**（没有 readlink_on64 可用）
+            } else {
+                if (!snap_copy_file64(c, child, ents[i].size)) {
+                    log_line("[SNAP] copy FAILED reason=file");
+                    return false;
+                }
+                c->files++;
+            }
+        }
+    }
+    return true;
+}
+
+// 拍快照。want_blocks == 0 = 自动按"当前已用数据块 × 2"估（至少 64 块）。
+// 返回快照 id（>= 1）；-1 = 失败（已打点，基卷数据不变；预留区若已分配就如实留在表里 state=0）。
+int vfs64_snapshot_take64(uint32_t want_blocks) {
+    if (!g_mounted) { log_op_fail("snapshot", "not mounted"); return -1; }
+    if (!sn_on64()) { log_line("[SNAP] take FAILED reason=snapshot-not-enabled"); return -1; }
+    if (g_cred.euid != 0) { log_line("[SNAP] take FAILED reason=need-root"); return -1; }
+    if (g_lay->version != VFS64_VERSION) { log_line("[SNAP] take FAILED reason=volume-not-v5"); return -1; }
+    uint8_t t[VFS64_SECTOR_BYTES];
+    if (!sn_load64(t)) return -1;
+    const uint32_t used = rd32(t + 12);
+    if (used >= SN_MAX) { log_line("[SNAP] take FAILED reason=table-full"); return -1; }
+    uint32_t fb = 0;
+    if (vfs64_free64(&fb, nullptr, nullptr) != 0) return -1;
+    uint32_t n = want_blocks;
+    if (n == 0) {
+        const uint32_t used_data = g_data_blocks - fb;
+        n = used_data * 2u;
+        if (n < 64u) n = 64u;
+        if (n > 4096u) n = 4096u;                 // 自动档上限（避免一次性占满整卷）
+    }
+    if (n < 32u) { log_line("[SNAP] take FAILED reason=too-small"); return -1; }
+    if (n > fb) {
+        dbg64_line_begin64();
+        dbg64_str("[SNAP] take FAILED reason=no-space want=");
+        dbg64_dec(n);
+        dbg64_str(" free=");
+        dbg64_dec(fb);
+        dbg64_nl();
+        dbg64_line_end64();
+        return -1;
+    }
+    const uint32_t S = alloc_run64(n);                       // 预留连续区（基卷位图里置位）
+    if (S == 0) { log_line("[SNAP] take FAILED reason=no-contiguous-run"); return -1; }
+    const int cs = vfs64_slot_alloc64();                     // 给快照卷找一个**空槽**
+    if (cs < 0) { log_line("[SNAP] take FAILED reason=no-free-slot"); return -1; }
+    const uint32_t id = rd32(t + 8);
+    uint8_t* e = t + SN_HDR + SN_ENT * used;
+    wr32(e + 0, id);
+    wr32(e + 4, S);
+    wr32(e + 8, n);
+    wr32(e + 12, vfs64_now64());
+    wr32(e + 16, SN_ST_COPY);
+    wr32(e + 20, (uint32_t)cs);
+    wr32(t + 8, id + 1u);
+    wr32(t + 12, used + 1u);
+    if (!meta_write64(g_snap_blk, t) || !jx_end64()) {       // 先把"预留"落盘（崩了也只是留一个 state=0）
+        log_line("[SNAP] take FAILED reason=table-write");
+        return -1;
+    }
+    const int base_slot = g_cur_slot;
+    const int drive = g_drive;
+    const uint32_t abs_start = g_start + S;                  // 快照卷的绝对起始 LBA
+
+    const int saved_cur = g_cur_slot;
+    g_cur_slot = cs;                                         // "当前卷"临时切成快照卷（格式化它）
+    g_vol[cs].mounted = false;
+    const int frc = vfs64_format(drive, abs_start, n);
+    g_cur_slot = saved_cur;
+    if (frc != 0) { log_line("[SNAP] take FAILED reason=format"); return -1; }
+
+    SnapCtx64 ctx;
+    ctx.base = base_slot; ctx.dst = cs;
+    ctx.files = 0; ctx.dirs = 0; ctx.links = 0; ctx.bytes = 0;
+    if (!snap_copy_dir64(&ctx, "/", 0)) {
+        log_line("[SNAP] take FAILED reason=copy (snapshot left as state=0)");
+        return -1;
+    }
+    // 收尾：快照卷置只读 + 表项置就绪
+    g_vol[cs].ro = true;
+    if (!sn_load64(t)) return -1;
+    uint8_t* e2 = t + SN_HDR + SN_ENT * used;
+    if (rd32(e2 + 0) != id) return -1;
+    wr32(e2 + 16, SN_ST_READY);
+    if (!meta_write64(g_snap_blk, t) || !jx_end64()) return -1;
+    dbg64_line_begin64();
+    dbg64_str("[SNAP] take ok id=");
+    dbg64_dec(id);
+    dbg64_str(" start_blk=");
+    dbg64_dec(S);
+    dbg64_str(" blocks=");
+    dbg64_dec(n);
+    dbg64_str(" slot=");
+    dbg64_dec((uint64_t)cs);
+    dbg64_str(" files=");
+    dbg64_dec(ctx.files);
+    dbg64_str(" dirs=");
+    dbg64_dec(ctx.dirs);
+    dbg64_str(" links_skipped=");
+    dbg64_dec(ctx.links);
+    dbg64_str(" bytes=");
+    dbg64_dec(ctx.bytes);
+    dbg64_str(" cow=0 ro=1");
+    dbg64_nl();
+    dbg64_line_end64();
+    return (int)id;
+}
+// 列快照表：返回条目数（-1 = 没开/读失败）；out 里 state 0=拷贝中 1=就绪
+int vfs64_snapshot_list64(Vfs64SnapInfo64* out, int max) {
+    if (!g_mounted) return -1;
+    uint8_t t[VFS64_SECTOR_BYTES];
+    if (!sn_load64(t)) return -1;
+    uint32_t used = rd32(t + 12);
+    if (used > SN_MAX) used = SN_MAX;
+    int k = 0;
+    for (uint32_t i = 0; i < used && k < max; i++) {
+        const uint8_t* e = t + SN_HDR + SN_ENT * i;
+        if (out) {
+            out[k].id = rd32(e + 0);
+            out[k].start_blk = rd32(e + 4);
+            out[k].blocks = rd32(e + 8);
+            out[k].taken = rd32(e + 12);
+            out[k].state = rd32(e + 16);
+            out[k].slot = rd32(e + 20);
+        }
+        k++;
+    }
+    return k;
+}
+// 把某个快照只读挂到一个卷槽上（已挂着就直接返回那个槽）。返回槽号；-1 = 失败（已打点）。
+int vfs64_snapshot_mount64(uint32_t id) {
+    if (!g_mounted) return -1;
+    uint8_t t[VFS64_SECTOR_BYTES];
+    if (!sn_load64(t)) return -1;
+    const uint32_t used = rd32(t + 12);
+    for (uint32_t i = 0; i < used && i < SN_MAX; i++) {
+        const uint8_t* e = t + SN_HDR + SN_ENT * i;
+        if (rd32(e + 0) != id) continue;
+        if (rd32(e + 16) != SN_ST_READY) { log_line("[SNAP] mount FAILED reason=not-ready"); return -1; }
+        const int cs = (int)rd32(e + 20);
+        if (cs < 0 || cs >= (int)VFS64_SLOT_MAX) return -1;
+        if (g_vol[cs].mounted) { g_vol[cs].ro = true; return cs; }
+        if (vfs64_mount_slot64(cs, g_drive, g_start + rd32(e + 4)) != 0) return -1;
+        g_vol[cs].ro = true;
+        dbg64_line_begin64();
+        dbg64_str("[SNAP] mount ok id=");
+        dbg64_dec(id);
+        dbg64_str(" slot=");
+        dbg64_dec((uint64_t)cs);
+        dbg64_str(" ro=1");
+        dbg64_nl();
+        dbg64_line_end64();
+        return cs;
+    }
+    log_line("[SNAP] mount FAILED reason=no-such-snapshot");
+    return -1;
+}
+
 // 位图置位/清位（读-改-写一个位图扇区）。blk 是分区相对块号。
 static bool bitmap_set(uint32_t blk, bool used) {
     if (blk >= g_blocks) { log_bad_block(blk); return false; }
@@ -919,7 +2046,7 @@ static bool bitmap_set(uint32_t blk, bool used) {
     const bool was = (g_sec[k >> 3] & mask) != 0;
     if (used) g_sec[k >> 3] |= mask;
     else      g_sec[k >> 3] &= (uint8_t)~mask;
-    if (!dev_write(g_start + g_bitmap_start + m, 1, g_sec)) return false;
+    if (!meta_write64(g_bitmap_start + m, g_sec)) return false;   // ★ 日志：位图是元数据
     if (was != used) free_cache_adjust(used ? -1 : +1);   // 就地 ±1（不再作废缓存）
     return true;
 }
@@ -1008,7 +2135,9 @@ static bool inode_store(uint32_t idx, const uint8_t* in) {
     // 只写这一扇区（窗口里别的 inode 字节原样不动）；写完全表失效：以后要用就重读
     // ★ v0.7.9：成功写盘后**不再失效**——新字节已经在窗口里了（上一步 copy_bytes），
     //   RAM 副本与磁盘一致；失效只会把 256 KB 重读一遍（写密集场景实测多花 12 s）。
-    if (!dev_write_at(g_drive, g_start + blk, 1, sec, true)) { ino_cache_invalidate(); return false; }
+    if (!meta_write64(blk, sec, true)) { ino_cache_invalidate(); return false; }
+    // ★ v0.9.28：inode 提交 = 一次操作的**事务边界**（位图/指针块/inode 在这一刻整体生效）。
+    if (!jx_end64()) { ino_cache_invalidate(); return false; }
     return true;
 }
 // 结构合法性：类型/名字长度/保留字段/CRC/大小/（v3/v4）时间与保留区/（v4）权限字段。
@@ -1024,13 +2153,24 @@ static bool inode_ok(const uint8_t* b, const char** why) {
     const uint32_t lim = (g_lay->dind_off != 0) ? VFS64_MAX_FILE_BYTES : VFS64_MAX_FILE_BYTES_V2;
     if (t == VFS64_TYPE_FILE && rd32(b + VFS_I_SIZE) > lim) { *why = "size"; return false; }
     if (t == VFS64_TYPE_LINK && rd32(b + VFS_I_SIZE) > 511u) { *why = "link-size"; return false; }
-    if (g_lay->version == VFS64_VERSION || g_lay->version == VFS64_VERSION_V3) {
+    // ★ v0.9.28：v3/v4/v5 都是"128B + mtime/nlink/kind + 保留区"这一族 —— 判定改成**看布局字段**
+    //   （原来写死 version == VFS64_VERSION，升到 v5 后那条分支会把 v5 卷自己排除掉）。
+    if (g_lay->mtime_off != 0) {
         if (b[VFS_I3_RSVD2] != 0) { *why = "rsvd2"; return false; }
-        // 保留区起点：v3 从 75 起（权限字段的位置也是保留区，必须全 0）；v4 从 81 起
-        const uint32_t rsvd_from = (g_lay->uid_off != 0) ? VFS_I4_RSVD3 : VFS_I3_DIND + 4u;
+        // 保留区起点：v3 从 75 起（权限字段的位置也是保留区，必须全 0）；v4 从 81 起；
+        //   ★ v5 从 89 起（[81,85) = xattr_blk、[85,89) = snap_flags，两者都要按特性位放行）。
+        if (g_lay->xattr_off != 0) {
+            const uint32_t xb = rd32(b + g_lay->xattr_off);
+            if (xb != 0) {
+                if (!acl_on64()) { *why = "xattr without acl feature"; return false; }
+                if (!blk_ok_data(xb)) { *why = "xattr range"; return false; }
+            }
+        }
+        const uint32_t rsvd_from = (g_lay->snapf_off != 0) ? (g_lay->snapf_off + 4u)
+                                 : (g_lay->uid_off != 0) ? VFS_I4_RSVD3 : VFS_I3_DIND + 4u;
         for (uint32_t i = rsvd_from; i < g_lay->crc_off; i++)
             if (b[i] != 0) { *why = "rsvd3"; return false; }
-        if (g_lay->version == VFS64_VERSION) {
+        if (g_lay->mode_off != 0) {
             // ★ P4：v4 的权限三字段必须自洽（uid/gid 任意；mode 的类型位必须与 type 对得上、权限位 ≤ 0777）
             const uint32_t um = (uint32_t)rd16(b + VFS_I4_MODE);
             // ★ v0.7.0：type=3（符号链接）对应 S_IFLNK
@@ -1080,10 +2220,35 @@ static bool inode_ok(const uint8_t* b, const char** why) {
 }
 // 找一个空 inode 槽（跳过 0 号根目录）
 static bool alloc_inode(uint32_t* out_idx) {
+    static uint32_t s_diag = 0;                       // 诊断只打前 4 次，不刷屏
     uint8_t ino[VFS64_INODE_BYTES_MAX];
     for (uint32_t i = 1; i < g_inode_count; i++) {
-        if (!inode_load(i, ino)) return false;
+        if (!inode_load(i, ino)) {
+            if (s_diag < 4u) {
+                s_diag++;
+                dbg64_str("[VFS64] alloc_inode: inode_load FAIL idx=");
+                dbg64_dec(i);
+                dbg64_str(" count=");
+                dbg64_dec(g_inode_count);
+                dbg64_str(" start=");
+                dbg64_dec(g_start);
+                dbg64_str(" drive=");
+                dbg64_dec((uint64_t)g_drive);
+                dbg64_str(" slot=");
+                dbg64_dec((uint64_t)g_cur_slot);
+                dbg64_nl();
+            }
+            return false;
+        }
         if (ino[VFS_I_TYPE] == VFS64_TYPE_FREE) { *out_idx = i; return true; }
+    }
+    if (s_diag < 4u) {
+        s_diag++;
+        dbg64_str("[VFS64] alloc_inode: no FREE slot count=");
+        dbg64_dec(g_inode_count);
+        dbg64_str(" slot=");
+        dbg64_dec((uint64_t)g_cur_slot);
+        dbg64_nl();
     }
     return false;
 }
@@ -1241,7 +2406,7 @@ static bool ctx_l2_ensure(Vfs64MapCtx* m) {
 // 把"当前子块"的镜像写盘（切换子块 / 收尾时调用）
 static bool ctx_l3_flush(Vfs64MapCtx* m) {
     if (!m->l3_loaded || !m->l3_dirty) return true;
-    if (!blk_write(m->l3_blk, g_l3)) return false;
+    if (!meta_write64(m->l3_blk, g_l3)) return false;    // ★ 日志：二级间接的子块（指针块）
     m->l3_dirty = false;
     return true;
 }
@@ -1318,12 +2483,12 @@ static bool map_flush(Vfs64MapCtx* m) {
     if (!ctx_l3_flush(m)) { log_op_fail("map", "child block write failed"); return false; }
     if (m->l2_dirty) {
         const uint32_t b = rd32(m->ino + g_lay->dind_off);
-        if (b == 0 || !blk_write(b, g_l2)) { log_op_fail("map", "double-indirect write failed"); return false; }
+        if (b == 0 || !meta_write64(b, g_l2)) { log_op_fail("map", "double-indirect write failed"); return false; }
         m->l2_dirty = false;
     }
     if (m->l1_dirty) {
         const uint32_t b = rd32(m->ino + VFS_I_IND);
-        if (b == 0 || !blk_write(b, g_l1)) { log_op_fail("map", "indirect write failed"); return false; }
+        if (b == 0 || !meta_write64(b, g_l1)) { log_op_fail("map", "indirect write failed"); return false; }
         m->l1_dirty = false;
     }
     return true;
@@ -1997,10 +3162,17 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
 
     // 几何：位图在最前，inode 区居中，数据区占剩下的全部（inode 记录大小按 v4 = 128B）
     const uint32_t bitmap_blocks = (total_sectors + VFS64_BITMAP_BLK_BITS - 1u) / VFS64_BITMAP_BLK_BITS;
-    uint32_t inodes = total_sectors / 64u;
+    // ★ v0.9.28（**真缺陷修复**）：inode 密度原来按 total/64（每 32 KiB 数据一个 inode）——
+    //   对"装系统"完全不够：实测一个 24,759 块的分区装完整系统要用 **525 个** inode（33 目录 + 492 文件），
+    //   而 total/64 只给 **386 个** → 写到第 386 个文件就 `alloc_inode: no FREE slot`，
+    //   之后每个写都失败并**泄漏一个 inode**，整机启动退化成"写失败风暴"（[VFS64] write_stream64: no free inode）。
+    //   改成 total/16（每 8 KiB 数据一个 inode）：24,759 块 -> 1,547 个（inode 区 387 块 = 1.6%）；
+    //   155,798 块 -> 上限 2,048（inode 区 512 块 = 0.3%）。**小卷仍被下限抬到 16**
+    //   （64/32 块的夹具卷几何一个字节都不变，既有自检 bit0..bit12 不受影响）。
+    uint32_t inodes = total_sectors / 16u;
     if (inodes < 16u) inodes = 16u;
     if (inodes > VFS64_MAX_INODES) inodes = VFS64_MAX_INODES;
-    const uint32_t inode_blocks = (inodes + VFS_LAY_V4.inodes_per_blk - 1u) / VFS_LAY_V4.inodes_per_blk;
+    const uint32_t inode_blocks = (inodes + VFS_LAY_V5.inodes_per_blk - 1u) / VFS_LAY_V5.inodes_per_blk;
     const uint32_t bitmap_start = 1u;
     const uint32_t inode_start  = bitmap_start + bitmap_blocks;
     const uint32_t data_start   = inode_start + inode_blocks;
@@ -2029,7 +3201,10 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
     g_inode_count = inodes;
     g_data_start = data_start;
     g_data_blocks = data_blocks;
-    g_lay = &VFS_LAY_V4;                                // ★ P4：新格式化一律产出 v4（带权限字段）
+    g_lay = &VFS_LAY_V5;                                // ★ v0.9.28：新格式化一律产出 **v5**
+    // ★ v0.9.28：新 v5 卷 feature_bits = 0（= v4 的全部行为），扩展头全 0。
+    //   日志/配额/ACL/快照由管理动作按需打开（vfs64_feature_enable64）。
+    g_feat = 0; g_jx_start = 0; g_jx_blocks = 0; g_quota_blk = 0; g_snap_blk = 0; g_ro = false;
     ino_cache_invalidate();
 
     // 1) 超级块（先把 CRC 覆盖区清零，再填字段，最后算 CRC）
@@ -2094,7 +3269,7 @@ int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
     wr16(root + VFS_I4_UID, 0);
     wr16(root + VFS_I4_GID, 0);
     wr16(root + VFS_I4_MODE, (uint16_t)(VFS64_S_IFDIR | 0755u));
-    wr32(root + VFS_LAY_V4.crc_off, crc32_64(root, VFS_LAY_V4.crc_off));
+    wr32(root + VFS_LAY_V5.crc_off, crc32_64(root, VFS_LAY_V5.crc_off));
     if (!inode_store(0, root)) {
         log_line("format FAILED step=root-inode");
         g_mounted = false;
@@ -2136,6 +3311,12 @@ static void geom_apply(const Vfs64SbGeo& g) {
     g_data_start    = g.data_start;
     g_data_blocks   = g.data_blocks;
     g_lay           = g.lay;
+    g_feat          = g.feat;
+    g_jx_start      = g.jx_start;
+    g_jx_blocks     = g.jx_blocks;
+    g_quota_blk     = g.quota_blk;
+    g_snap_blk      = g.snap_blk;
+    g_ro            = false;                    // 只读是"挂载动作"的属性，不是超级块的属性（快照挂载时单独置位）
     ino_cache_invalidate();
 }
 int vfs64_mount(int drive, uint32_t start_lba) {
@@ -2167,6 +3348,16 @@ int vfs64_mount(int drive, uint32_t start_lba) {
     geom_apply(geo);
     g_mounted = true;
 
+    // ★ v0.9.28：日志重放（mount 就在这一步把"崩溃遗留的已提交事务"做完）。
+    //   必须在统计空闲块 / 任何读取之前 —— 重放会改位图与 inode。
+    if ((g_feat & VFS64_FEAT_JOURNAL) != 0) {
+        if (!jx_replay64()) {
+            log_mount_fail("journal");
+            geom_restore(&saved);
+            return -1;
+        }
+    }
+
     free_cache_drop(g_drive, g_start);      // 只有**这个卷**的缓存作废（别的卷不受影响）
     g_alloc_hint = 0;                      // 分配起点归零（换卷后不能沿用旧 hint）
     uint32_t free_blocks = 0;
@@ -2197,6 +3388,29 @@ int vfs64_mount(int drive, uint32_t start_lba) {
         dbg64_dec(g_lay->version);
         dbg64_str(": no uid/gid/mode fields -> permission checks disabled");
         dbg64_str(" (owner shows as root, mode = default 0755/0644)\n");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    // ★ v0.9.28：特性扩展头有内容时打一行（feat == 0 = 旧卷 / 新 v5 卷的默认：**一个字节都不多打**，
+    //   既有回归的"禁止行"断言因此完全不受影响）
+    if (g_feat != 0) {
+        dbg64_line_begin64();
+        dbg64_str("[VFS64] features bits=");
+        dbg64_dec(g_feat);
+        dbg64_str(" journal=");
+        dbg64_dec((g_feat & VFS64_FEAT_JOURNAL) ? 1u : 0u);
+        dbg64_str(" quota=");
+        dbg64_dec((g_feat & VFS64_FEAT_QUOTA) ? 1u : 0u);
+        dbg64_str(" acl=");
+        dbg64_dec((g_feat & VFS64_FEAT_ACL) ? 1u : 0u);
+        dbg64_str(" snapshot=");
+        dbg64_dec((g_feat & VFS64_FEAT_SNAPSHOT) ? 1u : 0u);
+        dbg64_str(" jx_blocks=");
+        dbg64_dec(g_jx_blocks);
+        dbg64_str(" quota_blk=");
+        dbg64_dec(g_quota_blk);
+        dbg64_str(" snap_blk=");
+        dbg64_dec(g_snap_blk);
         dbg64_nl();
         dbg64_line_end64();
     }
@@ -2788,6 +4002,11 @@ int vfs64_write_stream64(const char* path, uint32_t len, Vfs64Src64 src, void* c
     if (!is_new && g_lay->uid_off != 0) {                       // ★ P4：覆盖已有文件**保留属主/模式/组**
         copy_bytes(ino_new + g_lay->uid_off, old_ino + g_lay->uid_off, 6);   // uid(2)+gid(2)+mode(2)（Linux 语义：
     }                                                          //  重写不改属主、不改 mode；只有新建才按 euid/umask）
+    // ★ v0.9.28 配额：按"这次操作会多占多少块"在**动手之前**判定（超限直接失败，盘上一个字节都不写）
+    const uint32_t q_uid = is_new ? g_cred.euid : ino_uid_of64(old_ino);
+    const uint32_t q_old = is_new ? 0u : vfs64_blocks_for_bytes64(rd32(old_ino + VFS_I_SIZE));
+    const uint32_t q_new = vfs64_blocks_for_bytes64(len);
+    if (q_new > q_old && qt_allow64(q_uid, q_new - q_old) == 0) return -1;
     if (build_chain_stream64(ino_new, len, src, ctx) != 0) {
         if (is_new) alloc_forget();
         return -1;
@@ -2812,6 +4031,7 @@ int vfs64_write_stream64(const char* path, uint32_t len, Vfs64Src64 src, void* c
     } else {
         touch_dir(parent, 0);                                   // 新建：刷新父目录 mtime（尽力而为）
     }
+    if (q_new != q_old) qt_charge64(q_uid, (int32_t)q_new - (int32_t)q_old);   // ★ 配额结算
     return (int)len;
 }
 // 兼容旧 API：整文件重写（buf 必须装得下 len 字节）
@@ -2849,9 +4069,17 @@ int vfs64_write_at64(const char* path, uint32_t off, const void* buf, uint32_t l
         }
         return 0;
     }
+    // ★ v0.9.28 配额：先算这次写会把文件长到多少块，超额就在动盘之前失败
+    const uint32_t q_uid = is_new ? g_cred.euid : ino_uid_of64(old_ino);
+    const uint32_t q_size0 = rd32(old_ino + VFS_I_SIZE);
+    const uint32_t q_size1 = (off + len > q_size0) ? (off + len) : q_size0;
+    const uint32_t q_old = vfs64_blocks_for_bytes64(q_size0);
+    const uint32_t q_new = vfs64_blocks_for_bytes64(q_size1);
+    if (q_new > q_old && qt_allow64(q_uid, q_new - q_old) == 0) return -1;
     if (write_at_inode(old_ino, off, buf, len, nullptr) != 0) return -1;
     if (!inode_store(idx, old_ino)) { log_op_fail("write_at64", "inode commit failed"); return -1; }
     if (is_new) touch_dir(parent, 0);
+    if (q_new != q_old) qt_charge64(q_uid, (int32_t)q_new - (int32_t)q_old);   // ★ 配额结算
     return 0;
 }
 // ==================== ★ 本批：截断 / 改变文件大小（POSIX truncate 语义）====================
@@ -2967,7 +4195,7 @@ static bool shrink_reclaim64(const uint8_t* ino, uint32_t new_blocks, uint32_t o
         else {
             copy_bytes(g_sec, (const uint8_t*)g_ptrs, VFS64_SECTOR_BYTES);   // 原值留在 g_ptrs 里
             for (uint32_t k = k0; k < k1; k++) wr32(g_sec + 4u * k, 0);
-            if (!blk_write(ind, g_sec)) { log_op_fail("truncate", "indirect rewrite failed"); ok = false; }
+            if (!meta_write64(ind, g_sec)) { log_op_fail("truncate", "indirect rewrite failed"); ok = false; }
             else if (!free_ptr_range64(g_ptrs, k0, k1)) ok = false;
         }
     }
@@ -2989,7 +4217,7 @@ static bool shrink_reclaim64(const uint8_t* ino, uint32_t new_blocks, uint32_t o
                 any_dead = true;
             }
             if (any_dead) {
-                if (!blk_write(dind, g_sec)) {
+                if (!meta_write64(dind, g_sec)) {
                     log_op_fail("truncate", "double-indirect rewrite failed");
                     ok = false;
                 } else {
@@ -3015,7 +4243,7 @@ static bool shrink_reclaim64(const uint8_t* ino, uint32_t new_blocks, uint32_t o
                     else {
                         copy_bytes(g_sec, (const uint8_t*)g_rm_child, VFS64_SECTOR_BYTES);
                         for (uint32_t k = k1; k < VFS64_INDIRECT_PTRS; k++) wr32(g_sec + 4u * k, 0);
-                        if (!blk_write(live, g_sec)) {
+                        if (!meta_write64(live, g_sec)) {
                             log_op_fail("truncate", "child block rewrite failed");
                             ok = false;
                         } else if (!free_ptr_range64(g_rm_child, k1, VFS64_INDIRECT_PTRS)) ok = false;
@@ -3141,11 +4369,17 @@ int vfs64_truncate64(const char* path, uint32_t len) {
         log_truncate_ok64(path, len, old_size);
         return 0;
     }
+    // ★ v0.9.28 配额：变大要预检（超额直接失败、盘上不变），变小把块还给属主
+    const uint32_t q_uid = ino_uid_of64(ino);
+    const uint32_t q_old = vfs64_blocks_for_bytes64(old_size);
+    const uint32_t q_new = vfs64_blocks_for_bytes64(len);
+    if (len > old_size && q_new > q_old && qt_allow64(q_uid, q_new - q_old) == 0) return -1;
     if (len > old_size) {
         if (!truncate_grow64(ino, idx, len)) return -1;
     } else {
         if (!truncate_shrink64(ino, idx, len, old_size)) return -1;
     }
+    if (q_new != q_old) qt_charge64(q_uid, (int32_t)q_new - (int32_t)q_old);
     log_truncate_ok64(path, len, old_size);
     return 0;
 }
@@ -3154,6 +4388,12 @@ int vfs64_truncate_on64(int slot, const char* path, uint32_t len) {
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("truncate", slot);
     return vfs64_truncate64(path, len);
+}
+// ★ v0.9.28：按槽迁移（系统组件固定写系统卷时用；与其它 *_on64 同形）
+int vfs64_migrate_on64(int slot) {
+    Vfs64SlotGuard g(slot, true);
+    if (!g.active) return on64_slot_unavailable("migrate", slot);
+    return vfs64_migrate64();
 }
 // 建空文件（父目录必须存在；已存在且是文件 = 0 幂等；是目录 = -1）。
 // ★ P4：新建走 write 的权限判定（父目录 w+x），已存在则要 w（覆盖提交一次空内容 = 截断语义）。
@@ -3396,6 +4636,9 @@ int vfs64_unlink64(const char* path) {
     // ★ P4：父目录 w+x（先判权限再动块：被拒时盘上什么都不变）
     const int pc = perm_check_idx64(rd32(ino + VFS_I_PARENT), "unlink", path, VFS64_NEED_WX);
     if (pc != 0) { log_op_fail("unlink64", "permission denied (dir w+x)"); return pc; }
+    // ★ v0.9.28 配额：先把"这个文件占了多少块"记下来，删成功后还给属主（删除永远不被配额拦）
+    const uint32_t q_uid = ino_uid_of64(ino);
+    const uint32_t q_blk = vfs64_blocks_for_bytes64(rd32(ino + VFS_I_SIZE));
     // inode 里有越界块号时拒绝删除（保持"能删掉的一定是结构自洽的项"）
     if (!free_file_blocks(ino)) { log_op_fail("unlink64", "corrupt inode (not removed)"); return -1; }
 
@@ -3407,6 +4650,7 @@ int vfs64_unlink64(const char* path) {
     //   清零后该槽 = 干净的"已释放"记录（type=FREE(0)、namelen=0、保留字段全 0，见 inode_ok()）。
     zero_bytes(empty, VFS64_INODE_BYTES_MAX);
     if (!inode_store(idx, empty)) { log_op_fail("unlink64", "inode clear failed"); return -1; }
+    if (q_blk != 0) qt_charge64(q_uid, -(int32_t)q_blk);        // ★ 配额结算（释放）
     touch_dir(parent, 0);
     return 0;
 }
@@ -5210,10 +6454,310 @@ int vfs64_selftest64() {
             if (!tr) fails |= 131072;
         }
 
+
+        // ==================== ★ v0.9.28：v5 四个特性（日志 / 配额 / ACL / 快照）+ v4 兼容迁移 ====================
+        // 全部在**同一个 2MB 假卷**上真跑（真实读写路径 / 真实位图 / 真实 inode），每条判据带编号。
+        // 日志/配额/ACL 依次打开（不清卷）：这样后面的判据是在"日志开着"的情况下继续跑的，
+        // 等于顺带验证了日志不会破坏正常语义。bit22 最后做（它会把卷伪造成 v4 再迁移回 v5）。
+
+        // ---- bit18（262144）：★ 元数据写前日志（提交 / checkpoint / 崩溃重放 / 坏记录拒放）----
+        {
+            uint32_t step = 0;
+            bool jx = true;
+            #define JX_FAIL(k) do { jx = false; if (step == 0) step = (k); } while (0)
+            uint32_t fbJ0 = 0;
+            if (vfs64_free64(&fbJ0, nullptr, nullptr) != 0) JX_FAIL(1);
+            if (vfs64_feature_enable64(VFS64_FEAT_JOURNAL) != 0) JX_FAIL(2);
+            else if ((vfs64_features64() & VFS64_FEAT_JOURNAL) == 0) JX_FAIL(3);
+            // ① 正常路径：写完读回一致（顺带证明日志不会把普通写弄坏）
+            if (vfs64_write_stream64("/jx.bin", 2048u, sel_src64, nullptr) != 2048) JX_FAIL(4);
+            uint32_t gotJ = 0;
+            if (vfs64_read_at64("/jx.bin", 0, chunk, 2048u, &gotJ) != 0 || gotJ != 2048u) JX_FAIL(5);
+            else for (uint32_t i = 0; i < gotJ; i++) if (chunk[i] != pat64(i)) { JX_FAIL(6); break; }
+            // ② 造"掉电现场"：攒一个只改 mtime 的事务 -> **只提交不 checkpoint**
+            uint32_t jidx = 0;
+            uint8_t jino[VFS64_INODE_BYTES_MAX];
+            if (lookup_file64("/jx.bin", "selftest.jx", &jidx, jino) != 0) JX_FAIL(7);
+            const uint32_t jold_mtime = rd32(jino + VFS_I3_MTIME);
+            const uint32_t jnew_mtime = vfs64_pack_time64(2021, 2, 3, 4, 5, 6);
+            if (jnew_mtime == 0 || jnew_mtime == jold_mtime) JX_FAIL(8);
+            uint32_t jblkno = 0, jblkoff = 0;
+            if (!inode_slot(jidx, &jblkno, &jblkoff)) JX_FAIL(9);
+            else {
+                uint8_t sec[VFS64_SECTOR_BYTES];
+                uint8_t jino2[VFS64_INODE_BYTES_MAX];
+                copy_bytes(jino2, jino, VFS64_INODE_BYTES_MAX);
+                wr32(jino2 + VFS_I3_MTIME, jnew_mtime);
+                wr32(jino2 + g_lay->crc_off, crc32_64(jino2, g_lay->crc_off));
+                if (!blk_read(jblkno, sec)) JX_FAIL(10);
+                copy_bytes(sec + jblkoff, jino2, g_lay->inode_bytes);
+                if (!meta_write64(jblkno, sec)) JX_FAIL(11);
+                else if (!jx_commit_inner64(false)) JX_FAIL(12);    // ← 提交点写了，目标块**没**写
+            }
+            // 此刻盘上还是旧 mtime（checkpoint 没做）
+            uint8_t jchk[VFS64_INODE_BYTES_MAX];
+            if (!inode_load(jidx, jchk)) JX_FAIL(13);
+            else if (rd32(jchk + VFS_I3_MTIME) == jnew_mtime) JX_FAIL(14);
+            // ③ 重挂载 = 重放：必须把事务补做完（mtime 变成新值）
+            const int jdrv = g_drive;
+            const uint32_t jstart = g_start;
+            if (vfs64_mount(jdrv, jstart) != 0) JX_FAIL(15);
+            else if (!inode_load(jidx, jchk)) JX_FAIL(16);
+            else if (rd32(jchk + VFS_I3_MTIME) != jnew_mtime) JX_FAIL(17);
+            // ④ 日志头必须已被清空（state != COMMITTED）
+            uint8_t jhdr[VFS64_SECTOR_BYTES];
+            if (!blk_read(g_jx_start, jhdr)) JX_FAIL(18);
+            else if (rd32(jhdr + JX_O_STATE) == JX_STATE_COMMIT) JX_FAIL(19);
+            // ⑤ 坏记录必须**拒放**（不猜）：把 CRC 改一位 -> 直接调重放 -> 必须 false
+            if (!blk_read(jblkno, jhdr)) JX_FAIL(20);                // 复用缓冲：读回 inode 所在扇区
+            else {
+                if (!meta_write64(jblkno, jhdr)) JX_FAIL(21);
+                else if (!jx_commit_inner64(false)) JX_FAIL(22);
+                else if (!blk_read(g_jx_start, jhdr)) JX_FAIL(23);
+                else {
+                    wr32(jhdr + JX_O_CRC, rd32(jhdr + JX_O_CRC) ^ 1u);
+                    if (!blk_write(g_jx_start, jhdr)) JX_FAIL(24);
+                    else if (jx_replay64()) JX_FAIL(25);             // 必须拒绝
+                    else {
+                        zero_bytes(jhdr, VFS64_SECTOR_BYTES);        // 清坏记录，恢复可用
+                        if (!blk_write(g_jx_start, jhdr)) JX_FAIL(26);
+                    }
+                }
+            }
+            if (vfs64_write_stream64("/jx2.bin", 512u, sel_src64, nullptr) != 512) JX_FAIL(27);
+            dbg64_str("[VFS64] journal ok commits=");
+            dbg64_dec(g_jx_commits);
+            dbg64_str(" jx_blocks=");
+            dbg64_dec(g_jx_blocks);
+            dbg64_str(" replay=1 bad_crc_rejected=");
+            dbg64_dec(jx ? 1u : 0u);
+            dbg64_str(" step=");
+            dbg64_dec(step);
+            dbg64_nl();
+            #undef JX_FAIL
+            if (!jx) fails |= 262144;
+        }
+
+        // ---- bit19（524288）：★ per-uid 块数配额（预检拒绝 / 无半截文件 / 释放后可写 / 只有 root 能设）----
+        {
+            uint32_t step = 0;
+            bool q = true;
+            #define Q_FAIL(k) do { q = false; if (step == 0) step = (k); } while (0)
+            Vfs64Cred64 save_cred;
+            vfs64_get_cred64(&save_cred);
+            if (vfs64_feature_enable64(VFS64_FEAT_QUOTA) != 0) Q_FAIL(1);
+            // 为什么都要"先 root 建、再 chown"：根目录是 0755/root，普通用户在里面建文件本来就会被
+            //   权限检查正确拒掉（那验证的是 PERM 不是 QUOTA）。配额要测的是**已有文件变大**。
+            if (vfs64_write_stream64("/q2.bin", 512u, sel_src64, nullptr) != 512) Q_FAIL(2);
+            else if (vfs64_chown64("/q2.bin", 1234u, 1234u) != 0) Q_FAIL(3);
+            else if (vfs64_create64("/q3.bin") != 0) Q_FAIL(4);
+            else if (vfs64_chown64("/q3.bin", 1234u, 1234u) != 0) Q_FAIL(5);
+            else if (vfs64_quota_set64(1234u, 4u) != 0) Q_FAIL(6);
+            uint32_t qlim = 0, qused = 0;
+            // q2.bin 已由 root 建好 512B（= 1 块）并 chown 给 1234 -> set 时**按 inode 表重算**得到 used=1
+            if (vfs64_quota_get64(1234u, &qlim, &qused) != 0 || qlim != 4u || qused != 1u) Q_FAIL(7);
+            // 以 1234 身份：2048B = 4 块 -> 允许（正好到限额；属主 1234 有 w）
+            vfs64_set_cred64(1234u, 1234u, 1234u, 1234u);
+            if (vfs64_write_stream64("/q2.bin", 2048u, sel_src64, nullptr) != 2048) Q_FAIL(8);
+            if (vfs64_quota_get64(1234u, &qlim, &qused) != 0 || qused != 4u) Q_FAIL(9);
+            // 同一个文件长到 4096B = 8 块（还要 +1 个一级间接块 = 9）：4 + 5 > 4 -> **必须被拒**
+            if (vfs64_write_stream64("/q2.bin", 4096u, sel_src64, nullptr) != -1) Q_FAIL(10);
+            uint32_t qty = 0, qsz = 0;
+            if (vfs64_stat("/q2.bin", &qty, &qsz) != 0 || qsz != 2048u) Q_FAIL(11);   // **没有半截文件**
+            // 另一个空文件写到 2048B（4 块）：已用 4 + 4 > 4 -> 拒绝，文件仍是 0 字节
+            else if (vfs64_write_stream64("/q3.bin", 2048u, sel_src64, nullptr) != -1) Q_FAIL(12);
+            else if (vfs64_stat("/q3.bin", &qty, &qsz) != 0 || qsz != 0u) Q_FAIL(13);
+            // 非 root 不许改配额
+            if (vfs64_quota_set64(1234u, 1u) != -1) Q_FAIL(14);
+            // 删掉 q2（4 块还给 1234）：**删除要父目录 w+x**，而 / 是 0755/root ——
+            //   所以这里切回 root 删（那验证的是目录权限，不是配额）；删完切回 1234 继续验"还块后能再写"。
+            vfs64_set_cred64(save_cred.uid, save_cred.gid, save_cred.euid, save_cred.egid);
+            if (vfs64_unlink64("/q2.bin") != 0) Q_FAIL(15);
+            vfs64_set_cred64(1234u, 1234u, 1234u, 1234u);
+            if (vfs64_quota_get64(1234u, &qlim, &qused) != 0 || qused != 0u) Q_FAIL(16);
+            if (vfs64_write_stream64("/q3.bin", 2048u, sel_src64, nullptr) != 2048) Q_FAIL(17);
+            if (vfs64_quota_get64(1234u, &qlim, &qused) != 0 || qused != 4u) Q_FAIL(18);
+            vfs64_set_cred64(save_cred.uid, save_cred.gid, save_cred.euid, save_cred.egid);
+            // 清理（root）
+            if (vfs64_unlink64("/q3.bin") != 0) Q_FAIL(19);
+            if (vfs64_stat("/q2.bin", &qty, &qsz) == 0) Q_FAIL(20);                   // q2 已经被删掉
+            dbg64_str("[VFS64] quota ok uid=1234 limit=4 deny_write=1 no_partial=1 deny_create=1 after_free=1 used=");
+            dbg64_dec(qused);
+            dbg64_str(" step=");
+            dbg64_dec(step);
+            dbg64_nl();
+            #undef Q_FAIL
+            if (!q) {
+                vfs64_set_cred64(save_cred.uid, save_cred.gid, save_cred.euid, save_cred.egid);
+                fails |= 524288;
+            }
+        }
+
+        // ---- bit20（1048576）：★ ACL（system.posix_acl_access：读放行 / 写拒绝 / 别的 uid 按 mode / 去掉后退回 mode）----
+        {
+            uint32_t step = 0;
+            bool a = true;
+            #define A_FAIL(k) do { a = false; if (step == 0) step = (k); } while (0)
+            Vfs64Cred64 save_cred;
+            vfs64_get_cred64(&save_cred);
+            if (vfs64_feature_enable64(VFS64_FEAT_ACL) != 0) A_FAIL(1);
+            if (vfs64_write_stream64("/a1.txt", 600u, sel_src64, nullptr) != 600) A_FAIL(2);
+            else if (vfs64_chown64("/a1.txt", 4321u, 4321u) != 0) A_FAIL(3);
+            else if (vfs64_chmod64("/a1.txt", VFS64_S_IFREG | 0644u) != 0) A_FAIL(4);
+            // 给 uid=1234 授 r--（4）：ACL = {USER_OBJ rw-, USER 1234 r--, GROUP_OBJ r--, MASK r--, OTHER r--}
+            else if (vfs64_acl_grant64("/a1.txt", 1234u, 4u) != 0) A_FAIL(5);
+            // xattr 必须能原样读回（5 项 × 8B = 40B，tag 顺序 USER_OBJ/USER/GROUP_OBJ/MASK/OTHER）
+            uint8_t av[64];
+            const int alen = vfs64_getxattr64("/a1.txt", VFS64_XATTR_ACL_ACCESS, av, sizeof av);
+            if (alen != 40) A_FAIL(6);
+            else if (rd16(av + 0) != XA_TAG_USER_OBJ || rd16(av + 8) != XA_TAG_USER ||
+                     rd32(av + 12) != 1234u || rd16(av + 10) != 4u) A_FAIL(7);
+            // 以 1234 身份：读可以、写必须 -EACCES
+            vfs64_set_cred64(1234u, 1234u, 1234u, 1234u);
+            uint32_t agot = 0;
+            if (vfs64_read_at64("/a1.txt", 0, chunk, 64, &agot) != 0 || agot != 64) A_FAIL(8);
+            else if (vfs64_write_at64("/a1.txt", 0, chunk, 16) != -VFS64_EACCES) A_FAIL(9);
+            // 以 5678 身份（ACL 里没有它）：other = r-- -> 读可以、写拒绝
+            vfs64_set_cred64(5678u, 5678u, 5678u, 5678u);
+            if (vfs64_read_at64("/a1.txt", 0, chunk, 64, &agot) != 0 || agot != 64) A_FAIL(10);
+            else if (vfs64_write_at64("/a1.txt", 0, chunk, 16) != -VFS64_EACCES) A_FAIL(11);
+            // 属性里的属主/模式没被 ACL 改掉
+            Vfs64Info64 ai;
+            vfs64_set_cred64(0, 0, 0, 0);
+            if (vfs64_stat64("/a1.txt", &ai) != 0 || ai.uid != 4321u || (ai.mode & 0777u) != 0644u) A_FAIL(12);
+            // 去掉 ACL（vlen == 0）-> 退回 mode：属主 4321 能写、1234 不能
+            else if (vfs64_setxattr64("/a1.txt", VFS64_XATTR_ACL_ACCESS, nullptr, 0) != 0) A_FAIL(13);
+            else if (vfs64_getxattr64("/a1.txt", VFS64_XATTR_ACL_ACCESS, av, sizeof av) != -1) A_FAIL(14);
+            else {
+                vfs64_set_cred64(4321u, 4321u, 4321u, 4321u);
+                if (vfs64_write_at64("/a1.txt", 0, chunk, 16) != 0) A_FAIL(15);
+                vfs64_set_cred64(1234u, 1234u, 1234u, 1234u);
+                if (vfs64_write_at64("/a1.txt", 0, chunk, 16) != -VFS64_EACCES) A_FAIL(16);
+            }
+            vfs64_set_cred64(save_cred.uid, save_cred.gid, save_cred.euid, save_cred.egid);
+            if (vfs64_unlink64("/a1.txt") != 0) A_FAIL(17);
+            dbg64_str("[VFS64] acl ok acl_bytes=");
+            dbg64_dec(alen > 0 ? (uint32_t)alen : 0u);
+            dbg64_str(" named_uid=1234 r_ok=1 w_denied=1 other_by_mode=1 cleared_back_to_mode=1 step=");
+            dbg64_dec(step);
+            dbg64_nl();
+            #undef A_FAIL
+            if (!a) {
+                vfs64_set_cred64(save_cred.uid, save_cred.gid, save_cred.euid, save_cred.egid);
+                fails |= 1048576;
+            }
+        }
+
+        // ---- bit21（2097152）：★ 快照（全量克隆 / 只读 / 时间点隔离）----
+        {
+            uint32_t step = 0;
+            bool s = true;
+            #define S_FAIL(k) do { s = false; if (step == 0) step = (k); } while (0)
+            if (vfs64_feature_enable64(VFS64_FEAT_SNAPSHOT) != 0) S_FAIL(1);
+            static const uint8_t kOld[8] = { 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8 };
+            static const uint8_t kNew[8] = { 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8 };
+            if (vfs64_write64("/s1.txt", kOld, 8) != 8) S_FAIL(2);
+            const int sid = vfs64_snapshot_take64(128u);
+            if (sid <= 0) S_FAIL(3);
+            Vfs64SnapInfo64 si[8];
+            const int sn = vfs64_snapshot_list64(si, 8);
+            if (sn < 1 || si[0].id != (uint32_t)sid || si[0].state != 1u) S_FAIL(4);
+            const int sslot = vfs64_snapshot_mount64((uint32_t)sid);
+            if (sslot < 0) S_FAIL(5);
+            // 改当前卷 -> 快照里必须仍是旧内容
+            if (vfs64_write64("/s1.txt", kNew, 8) != 8) S_FAIL(6);
+            uint8_t sob[8];
+            uint32_t sgot = 0;
+            if (vfs64_read_at_on64(sslot, "/s1.txt", 0, sob, 8, &sgot) != 0 || sgot != 8) S_FAIL(7);
+            else if (cmp_bytes(sob, kOld, 8) != 0) S_FAIL(8);        // 快照 = 旧
+            uint8_t cur[8];
+            if (vfs64_read64("/s1.txt", cur, 8) != 8) S_FAIL(9);
+            else if (cmp_bytes(cur, kNew, 8) != 0) S_FAIL(10);       // 当前卷 = 新
+            // 快照卷只读：写必须失败
+            if (vfs64_write_at_on64(sslot, "/s1.txt", 0, kNew, 8) == 0) S_FAIL(11);
+            else if (vfs64_read_at_on64(sslot, "/s1.txt", 0, sob, 8, &sgot) != 0 || cmp_bytes(sob, kOld, 8) != 0) S_FAIL(12);
+            // 快照卷里也能看到树（目录/其它文件都在）
+            uint32_t ty = 0, sz = 0;
+            if (vfs64_stat_on64(sslot, "/jx.bin", &ty, &sz) != 0 || sz != 2048u) S_FAIL(13);
+            if (vfs64_unlink64("/s1.txt") != 0) S_FAIL(14);
+            dbg64_str("[VFS64] snapshot ok id=");
+            dbg64_dec((uint32_t)sid);
+            dbg64_str(" slot=");
+            dbg64_dec((uint64_t)sslot);
+            dbg64_str(" blocks=");
+            dbg64_dec(si[0].blocks);
+            dbg64_str(" ro_enforced=1 timepoint_isolated=1 tree_copied=1 cow=0 step=");
+            dbg64_dec(step);
+            dbg64_nl();
+            #undef S_FAIL
+            if (!s) fails |= 2097152;
+        }
+
+        // ---- bit22（4194304）：★ v4 旧卷兼容 + 就地迁移（只改版本号，inode/数据一个字节不动）----
+        {
+            uint32_t step = 0;
+            bool m = true;
+            #define M_FAIL(k) do { m = false; if (step == 0) step = (k); } while (0)
+            const int mdrv = g_drive;
+            const uint32_t mstart = g_start;
+            if (vfs64_write64("/m1.txt", "middle", 6) != 6) M_FAIL(1);   // 迁移前后要比对的内容
+            // 把 v5 卷伪装成 v4：版本号 4 + 清扩展头 + 重算主 CRC
+            uint8_t sb[VFS64_SECTOR_BYTES];
+            if (!dev_read(mstart, 1, sb)) M_FAIL(2);
+            else {
+                wr32(sb + VFS_O_VERSION, VFS64_VERSION_V4);
+                wr32(sb + VFS_O_FEATBITS, 0);
+                wr32(sb + VFS_O_JX_START, 0);
+                wr32(sb + VFS_O_JX_NBLK, 0);
+                wr32(sb + VFS_O_QUOTA, 0);
+                wr32(sb + VFS_O_SNAP, 0);
+                wr32(sb + VFS_O_FEATCRC, 0);
+                wr32(sb + VFS_O_CRC, crc32_64(sb, VFS_SB_CRC_LEN));
+                if (!dev_write(mstart, 1, sb)) M_FAIL(3);
+            }
+            if (vfs64_mount(mdrv, mstart) != 0) M_FAIL(4);
+            else if (g_lay->version != VFS64_VERSION_V4) M_FAIL(5);      // 认成 v4 旧卷
+            else if ((vfs64_features64() & VFS64_FEAT_ALL) != 0) M_FAIL(6);
+            // v4 卷上开特性必须**如实拒绝**
+            else if (vfs64_feature_enable64(VFS64_FEAT_ACL) == 0) M_FAIL(7);
+            // 旧卷上数据照常可读
+            uint8_t mv[8];
+            if (vfs64_read64("/m1.txt", mv, 6) != 6) M_FAIL(8);
+            else if (cmp_bytes(mv, "middle", 6) != 0) M_FAIL(9);
+            // 迁移 -> v5（只改版本号 + 清扩展头 + 主 CRC）
+            else if (vfs64_migrate64() != 0) M_FAIL(10);
+            else if (g_lay->version != VFS64_VERSION) M_FAIL(11);
+            else if (vfs64_read64("/m1.txt", mv, 6) != 6 || cmp_bytes(mv, "middle", 6) != 0) M_FAIL(12);
+            // 迁移之后特性可开，且再迁移是幂等
+            else if (vfs64_feature_enable64(VFS64_FEAT_ACL) != 0) M_FAIL(13);
+            else if (vfs64_migrate64() != 0) M_FAIL(14);
+            dbg64_str("[VFS64] migrate ok v4_compat=1 v4_refused_features=1 data_intact=1 now=");
+            dbg64_dec(g_lay->version);
+            dbg64_str(" features=");
+            dbg64_dec(vfs64_features64());
+            dbg64_str(" idempotent=1 step=");
+            dbg64_dec(step);
+            dbg64_nl();
+            #undef M_FAIL
+            if (!m) fails |= 4194304;
+        }
+
+        // ★ v0.9.28 收尾（真缺陷）：假卷期间用过的**额外卷槽**必须全部清空。
+        //   为什么：快照会把克隆卷挂在独立槽上（vfs64_snapshot_take64 的 by-design 行为），
+        //   假盘一关，那个槽就指向"真实磁盘上一段垃圾 LBA"—— 它既会挤掉后面真正的数据卷槽位，
+        //   又可能被 *_on64 走到（写坏真盘）。这里只保留进入本段时的那一个槽。
+        for (int sl = 0; sl < (int)VFS64_SLOT_MAX; sl++) {
+            if (sl == save_cur_b) continue;
+            zero_bytes(&g_vol[sl], (uint32_t)sizeof(Vfs64Geom));
+            g_vol[sl].mounted = false;
+            g_vol[sl].ro = false;
+        }
         g_fake_active = false;
         geom_restore(&saved_big);
         g_cur_slot = save_cur_b;
         g_system_slot = save_sys_b;
+        ino_cache_invalidate();
+        g_alloc_hint = 0;
     }
     vfs64_set_cred64(sel_cred.uid, sel_cred.gid, sel_cred.euid, sel_cred.egid);
     dbg64_str("[VFS64] selftest ");
