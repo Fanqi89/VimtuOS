@@ -126,7 +126,7 @@
 //   vfs64_list64 / read64 / write64 / mkdir64 / unlink64 / rmdir64 / stat64 / create64
 //   vfs64_chmod64 / vfs64_chown64             // ★ P4：改模式/属主（Linux 语义的裁剪版）
 //   vfs64_opendir64 / readdir64 / closedir64  // 游标式遍历（适合长列表，不一次读爆缓冲）
-//   vfs64_tree_dump64("/", 32, 4)             // 串口打目录树（验收 grep；有界）
+//   vfs64_tree_dump64("/", 64, 4)             // 串口打目录树（验收 grep；有界，超出打 truncated）
 //   vfs64_dump64()                            // 串口打当前状态
 //   vfs64_selftest64()                        // 64 扇区假盘自检 + 真盘只读探测
 //

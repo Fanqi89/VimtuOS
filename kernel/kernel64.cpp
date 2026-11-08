@@ -1192,7 +1192,10 @@ display64_init64();
             vfs64_slots_dump64();                                // ★ 多卷：卷槽表（每槽 drive/起始 LBA/容量）
             drive64_dump64();
             (void)drive64_selftest64();
-            (void)vfs64_tree_dump64("/", 32, 4);
+            // ★ v0.9.29：预算 32 -> 64（实测缺陷：装好的盘根下多了 /efi、/apps 之后，32 项会在
+            //   kaisi.png 处截断，fs_tree_test 阶段 4 就看不到 /apps 及其子文件 —— 判据要看的是
+            //   **目录树本身**，不是打印预算。64 项覆盖整树；超出仍会打 truncated 标记，不静默丢）。
+            (void)vfs64_tree_dump64("/", 64, 4);
             (void)explorer64_selftest64();                       // 文件管理器纯逻辑自检（单位换算/路径/滚动/历史栈）
             (void)app64_selftest64();
             (void)app64_install_builtin64(app_drive, app_lba);   // 幂等：已装过则 skipped (exists)

@@ -393,7 +393,13 @@ def main():
         mon.key("n", wait=2.2)          # 新建分区（引导分区 + 主分区）
         mon.key("ret", wait=2.2)        # 选中分区 -> 安装系统
         log1 = wait_for(s1, "[INSTALL] 完成：已写", 90, proc)
-        time.sleep(6)                   # 收尾：ESP（48MB FAT32）+ GPT 写入
+        # ★ v0.9.28：这里原来只 `sleep 6` 就 kill，而安装收尾的 `[INSTALL] volume grow` 要把 24,759 块
+        #   的卷搬成 155,798 块（读+写 12.7 MB、重建位图、修正 487 个 inode 的 264 个间接块指针），
+        #   PIO 下几十秒 —— 被腰斩后盘上连 MBR/GPT 都没写（实测阶段 2 `[DISK] 1 … no-table parts=0`），
+        #   于是格式化 / 盘符表 / 目录树三个阶段全被连坐成红。改成等 grow 收尾 + 盘尾 GPT 写完再杀。
+        wait_for(s1, "[INSTALL] volume grow ok", 240, proc)
+        wait_for(s1, "[INSTALL] gpt written", 60, proc)
+        time.sleep(1.5)
         log1 = slog(s1)
     finally:
         kill(proc)
@@ -425,14 +431,26 @@ def main():
         for _ in range(4):
             mon.key("ret", wait=1.6)
         mon.key("down", wait=1.6)       # P1 -> P2（主分区）
-        mon.key("f", wait=2.6)          # 格式化主分区 -> vfs64_format（v3）
+        # ★ v0.9.28：向导的格式化是**两步确认**（同一行同一动作按两次，见 kernel/setup64.cpp id==13）；
+        #   只按一次只会停在"格式化待确认"。沿用 multivol64_test 已验证的写法做 3 次重试：
+        #   按 f 看到"待确认"就补第二次 f 真格式化；没看到就把光标再下移一行。
+        for _try in range(3):
+            mon.key("f", wait=1.6)
+            _mid = slog(s2)
+            if "格式化待确认" in _mid or "[PART] 格式化 OK" in _mid:
+                mon.key("f", wait=3.0)          # 第二步：真格式化
+                break
+            mon.key("down", wait=0.8)
         log2 = wait_for(s2, "[VFS64] format ok", 40, proc)
         time.sleep(1.5)
         log2 = slog(s2)
     finally:
         kill(proc)
-    check("格式化主分区 P2（[PART] 格式化 OK drive=1 index=2 start=8009）",
-          "[PART] 格式化 OK drive=1 index=2 start=8009" in log2)
+    # ★ v0.9.28：内核打点已变成 `[PART] 格式化 OK drive=1 table=mbr index=2 start=8009 … fs=VimtuFS2`
+    #   （中间插了 table=），原先的整串精确子串永远不中。拆三段判（比原来更严：还要求 fs=VimtuFS2）。
+    check("格式化主分区 P2（[PART] 格式化 OK drive=1 … index=2 start=8009 … fs=VimtuFS2）",
+          "[PART] 格式化 OK drive=1" in log2 and "index=2 start=8009" in log2
+          and "fs=VimtuFS2" in log2)
     # ★ 多卷说明：系统启动盘一启动就会把**所有可浏览卷**挂进卷槽（D:/E:…），串口里因此有不止一条
     #   `[VFS64] mount ok ...` / `[VFS64] format ok ...`（数据卷的块数不同，取"最后一条"会拿到别的卷）。
     #   所以这里明确按**系统卷的块数**去找那一行 —— 断言强度不变（仍要求 v3 + 128B inode + 155798 块）。

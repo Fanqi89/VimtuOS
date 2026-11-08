@@ -137,6 +137,7 @@
 #include "sock64.h"         // ★ v0.7.4（P2 第三批）：Linux socket 层（AF_INET）
 #include "input64.h"        // ★ A5 前置：自有 ABI 12 的落点 ev64_poll64（事件队列/焦点/背压）
 #include "fs64.h"           // ★ P4：统一卷分派（stat/access/chmod/chown 按当前卷 + 权限判定）
+#include "drive64.h"        // ★ v0.9.29：合成 /proc/mounts 要盘符/分区号（设备名 /dev/sda2）
 
 // ---- 批次 C：proc64（进程/地址空间）的**弱引用** ----
 // proc64.cpp 只在系统内核里链接（安装介质内核没有进程/地址空间、没有 task64/elf64）。
@@ -748,6 +749,68 @@ static int lx64_proc_streq64(const char* a, const char* b) {
     while (a[i] && a[i] == b[i]) i++;
     return a[i] == b[i];
 }
+// ★ v0.9.29：/proc/mounts —— 合成一张**真**的挂载表（Linux 格式 `设备 挂载点 类型 选项 dump pass`）。
+// 为什么必须做（实测缺陷，证据见 tests/statfs64_test.py 的串口日志）：busybox 的 `df`（以及 `mount`）
+//   不是问内核要卷列表，而是**先读 /proc/mounts**，再对每条挂载点调 statvfs -> statfs(137)。
+//   本内核的 /proc 是合成层，原来只认 version / self/status / self/cmdline / self/exe 四条，其它
+//   /proc/<name> 一律直接回 -ENOENT —— 于是连**盘上放着的** /proc/mounts 也被挡死：实测
+//   `df: /proc/mounts: No such file or directory`，statfs(137) 虽然实现了却永远等不到调用者。
+// 口径（全部既有、只读，不编数字）：
+//   * 设备名 = /dev/sd<盘字母><分区项号>：disk 0/1/2 -> a/b/c；part = MBR 分区项号 1..4；
+//     part=0（整盘、没有分区表）时不带数字（与 Linux 的 sdX 一致）。
+//   * 类型 = vimtufs2 / vfat（FAT32/FAT16 在 Linux 上就是 vfat 驱动名）。
+//   * 选项 = ro（只读卷）/ rw。
+//   * 挂载点 = "/"：本内核的命名空间里**只有当前卷**真的挂在 /（其它盘符靠
+//     drive64_activate_letter64 切换，不是挂载点）。不给别的卷编造 /mnt/d 之类不存在的目录 ——
+//     df 会对每条挂载点 stat，编出来的路径只会得到 ENOENT 垃圾行。
+//   * dump/pass = 0 0（Linux 惯用值）。
+// 边界（如实）：没有 /proc/self/mountinfo（busybox df 不读它）；没有真正的挂载树，所以只有一行。
+static int lx64_proc_put64(char* t, int i, int cap, const char* s) {
+    while (*s && i < cap - 1) t[i++] = *s++;
+    if (i < cap) t[i] = 0;
+    return i;
+}
+static int lx64_proc_putu64(char* t, int i, int cap, uint64_t v) {
+    char num[24];
+    lx64_proc_u64(num, v);
+    return lx64_proc_put64(t, i, cap, num);
+}
+// 系统卷（system=true 且可浏览）；没有就退到第一块可浏览的卷（两趟扫描，语义清楚）。
+static int lx64_proc_root_drive64(DriveInfo64* out) {
+    const int n = drive64_count64();
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < n; i++) {
+            DriveInfo64 d;
+            if (drive64_info64(i, &d) != 0) continue;
+            if (!d.present || !d.browsable) continue;
+            if (pass == 0 && !d.system) continue;
+            if (out) *out = d;
+            return 1;
+        }
+    }
+    return 0;
+}
+static int lx64_proc_mounts64(char* t, int cap) {
+    if (!t || cap < 8) return 0;
+    t[0] = 0;
+    if (drive64_count64() == 0) (void)drive64_scan64();
+    DriveInfo64 d;
+    if (!lx64_proc_root_drive64(&d)) return 0;                  // 没有可浏览的卷：空表（如实）
+    int i = 0;
+    i = lx64_proc_put64(t, i, cap, "/dev/sd");
+    {
+        char dl[2];
+        dl[0] = (char)('a' + (d.disk & 0x1F));
+        dl[1] = 0;
+        i = lx64_proc_put64(t, i, cap, dl);
+    }
+    if (d.part > 0) i = lx64_proc_putu64(t, i, cap, (uint64_t)d.part);
+    i = lx64_proc_put64(t, i, cap, " / ");
+    i = lx64_proc_put64(t, i, cap, (d.fskind == DRV64_FS_FAT32 || d.fskind == DRV64_FS_FAT12_16)
+                                       ? "vfat" : "vimtufs2");
+    i = lx64_proc_put64(t, i, cap, d.readonly ? " ro 0 0\n" : " rw 0 0\n");
+    return i;
+}
 static int64_t lx64_proc_open64(const char* path, int flags) {
     if (!lx64_proc_is64(path)) return -9999;                    // 不是 /proc：交回原路径
     if (flags & (0x1 | 0x40 | 0x200 | 0x400)) return -13;       // 只读：O_WRONLY/O_CREAT/O_TRUNC -> EACCES
@@ -805,9 +868,17 @@ static int64_t lx64_proc_open64(const char* path, int flags) {
         exe[0] = 0;
         if (proc64_exe_path64) (void)proc64_exe_path64(exe, (uint32_t)sizeof(exe));
         lx64_proc_fill64(f, exe[0] ? exe : "/");
+    } else if (lx64_proc_streq64(f->name, "mounts") ||
+               lx64_proc_streq64(f->name, "self/mounts")) {
+        char t[LX64_PROC_MAX];
+        lx64_proc_mounts64(t, (int)sizeof(t));
+        lx64_proc_fill64(f, t);
     } else {
         f->used = 0;
-        return -LX64_ENOENT;                                    // 未提供的条目：如实 ENOENT
+        // ★ v0.9.29：**未知 /proc 条目交回盘上的真实 VFS**（原来一律 -ENOENT）。实测缺陷：盘上
+        //   的 /proc/mounts 被这层合成树挡住，busybox df 读不到挂载表就不再调 statfs(137)。
+        //   -9999 = "本层没接这个路径，交给 fd64 走真文件系统"（下面的 open 调用点就是这么判的）。
+        return -9999;
     }
     dbg64_line_begin64();
     dbg64_str("[LX64] proc open ");

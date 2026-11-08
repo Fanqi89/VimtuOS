@@ -300,10 +300,14 @@ def main():
         seg = ""
         if "[VFS64] tree root=/" in log:
             seg = log.split("[VFS64] tree root=/", 1)[1].split("[VFS64] tree entries=", 1)[0]
-        check("启动期目录树打印（root=/ 先打，且 **/etc、/home 还不存在** —— userdb64 之后才建）",
-              "[VFS64] tree root=/ max_entries=32 max_depth=4" in log and
+        # ★ v0.9.29：预算从 32 提到 64（启动期 dump 要能覆盖 fs_tree 的 /apps 子树），所以
+        #   "max_entries=32" 这个**字面**过期了。断言按它的本意收紧成三条：深度仍是 4、
+        #   预算仍**有界**（>=32 且 <=256，不许变成无界全量刷屏）、且那一刻 /etc、/home 不存在。
+        _tb = re.search(r"\[VFS64\] tree root=/ max_entries=(\d+) max_depth=(\d+)", log)
+        check("启动期目录树打印（root=/ 先打，预算有界且深度 4；**/etc、/home 还不存在** —— userdb64 之后才建）",
+              bool(_tb) and _tb.group(2) == "4" and 32 <= int(_tb.group(1)) <= 256 and
               "tree /etc " not in seg and "tree /home " not in seg,
-              "树段 %d 字符" % len(seg))
+              "header=%s 树段 %d 字符" % (_tb.group(0) if _tb else "(缺 header)", len(seg)))
 
         check("打开终端（开始菜单 -> 终端）", fst.open_terminal(mon, serial, proc))
         time.sleep(0.5)

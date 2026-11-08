@@ -4553,10 +4553,17 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
     // 这两行都是自动验收的断言行：
     //   "[GUI64] ready"      —— 桌面验收（tests/desktop64_test.py）
     //   "[OS] ready (idle)"  —— 历史断言（install_flow_test / vmware_install_test 依赖，勿删）
+    // ★ v0.9.29：这两行**必须**包在行级原子里。实测缺陷（fs_tree_test 阶段 3 偶发红）：
+    //   没包的时候，本流程写完 "[GUI64] ready" 的 `[` 就被 PIT 抢占切到 kheart 线程，那边写完
+    //   一整行 "[TASK64] kheart beat=..." 再把控制权还回来 —— 串口里变成
+    //   `[[TASK64] kheart beat=62 ...` + `GUI64] ready` 两行，"[GUI64] ready" 从此搜不到，
+    //   桌面明明起来了却判 FAIL（证据见 fstree 日志第 2846/2847 行）。行级锁在 debug64.h。
+    dbg64_line_begin64();
     dbg64_str("[GUI64] ready");
     dbg64_nl();
     dbg64_str("[OS] ready (idle)");
     dbg64_nl();
+    dbg64_line_end64();
     // ---- 启动项（config64 的 startup.*）+ 会话恢复（session64 的策略）----
     // 放在 "[GUI64] ready" 之后：既有验收看到的启动顺序不变，多出来的只有"按配置自动开窗"。
     if (cfg64_startup64("terminal")) app_term_open64();

@@ -2979,6 +2979,52 @@ def cap_dirabi():
     ]
     done = bool(sysc and case and hdr and cache and ino and bb)
     return ("DONE" if done else "PARTIAL"), ev
+def cap_proc_mounts():
+    """★ v0.9.29「合成 /proc 挂载表」：busybox `df` / `mount` 的**真**数据来源（原来被合成层挡死）。
+
+    实测缺陷链（证据在 tests/statfs64_test.py 的串口日志里）：
+      busybox 的 `df` 不问内核要卷列表，而是**先读 /proc/mounts**，再对每条挂载点调
+      statvfs -> statfs(137)。本内核的 /proc 是合成层，原来只认 version / self/status /
+      self/cmdline / self/exe 四条，其它 /proc/<name> 一律 `-ENOENT` —— 连**盘上放着的**
+      /proc/mounts 也被挡死，于是 `df: /proc/mounts: No such file or directory`，
+      statfs(137) 虽然实现了却永远等不到调用者（“有接口、没用户”）。
+    做法（kernel/syscall64.cpp）：
+      · `lx64_proc_mounts64` 按 Linux 格式合成 `设备 挂载点 类型 选项 dump pass`：
+        设备名 = /dev/sd<盘字母><分区项号>（disk 0/1/2 -> a/b/c；part = MBR 项号；整盘不带数字）、
+        类型 = vimtufs2 / vfat、选项 = ro/rw、dump/pass = 0 0；
+      · `/proc/mounts` 与 `/proc/self/mounts` 都指向它；
+      · **未知 /proc 条目回落**到盘上的真实 VFS（`-9999` 交给 fd64），不再硬 ENOENT。
+    证据（真跑）：
+      · `[LX64] proc open /proc/mounts fd=900 bytes=28`（28 B = 标准一行的长度）；
+      · `[FS64] statfs path=/ bsize=512 blocks=24758 bfree=8648 files=2048 ffree=1509`；
+      · busybox 表 `/dev/sda2 12379 8055 4324 65% /` == blocks/2、bfree/2 == df 的 1K 块/Available；
+        `df -h` = `/dev/sda2 12.1M 7.9M 4.2M 65% /`。
+    边界（如实）：只有**一行**（本内核没有真正的挂载树，其它盘符是 drive64 的当前卷切换，
+      不是挂载点）；没有 /proc/self/mountinfo（busybox df 不读它）。
+    验收：tests/statfs64_test.py（**13 条断言** 13/13；夹具**不再**注入 /proc/mounts）。
+    """
+    need = ["kernel/syscall64.cpp", "kernel/drive64.h", "tests/statfs64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    mp = grep_count(r"lx64_proc_mounts64|lx64_proc_root_drive64|lx64_proc_put64", ["kernel/syscall64.cpp"])
+    fb = grep_count(r"self/mounts", ["kernel/syscall64.cpp"])
+    fl = grep_count(r"return -9999;", ["kernel/syscall64.cpp"])
+    ev = [
+        "内核合成挂载表（kernel/syscall64.cpp 命中 %d）：设备=/dev/sd<盘字母><分区项号>、"
+        "类型 vimtufs2|vfat、选项 ro|rw、dump/pass=0 0" % mp,
+        "/proc/mounts 与 /proc/self/mounts 同源（命中 %d）；未知 /proc 条目回落真 VFS（-9999 出口命中 %d）" % (fb, fl),
+        "实测：`[LX64] proc open /proc/mounts fd=900 bytes=28` + `[FS64] statfs path=/ bsize=512 blocks=24758 "
+        "bfree=8648 files=2048 ffree=1509` + busybox `/dev/sda2 12379 8055 4324 65% /`、df -h "
+        "`/dev/sda2 12.1M 7.9M 4.2M 65% /`",
+        "验收：tests/statfs64_test.py（**13 条断言** 13/13；夹具不再注入 /proc/mounts —— "
+        "由“没有夹具也能跑通”反证内核提供）",
+        "边界（如实）：只有一行（没有真正的挂载树，其它盘符靠 drive64_activate_letter64 切换）；"
+        "无 /proc/self/mountinfo",
+    ]
+    return ("DONE" if (mp and fb and fl) else "PARTIAL"), ev
+
+
 def cap_pipe_statfs():
     """★ 本批：pipe 默认阻塞（POSIX）+ fcntl(72) + statfs(137)/fstatfs(138)（Linux 号段）。
 
@@ -3000,14 +3046,15 @@ def cap_pipe_statfs():
         `cat big64.txt | wc -c` == **b\"300\\n\"**（300 B 过 64 B 环：分次写完不丢字节 + EOF）。
       · 阻塞等待打点 [FD64] pipe wait（pid/why/ticks/writers/readers 齐全）waits=12、whys 含 empty/full，
         最长 max_ticks=1412（≈5.6 s）**未撞 30 s 上限**；正常管线里不出现 busybox 的 EAGAIN/EPIPE 文本。
-      · busybox df 表：`/dev/sda2 12379 6829 5550 55% /`（1K 块/Used/Available/Use%/挂载点）；`df -h` 行为
-        `/dev/sda2 12.1M 6.7M 5.4M 55% /`。
-      · statfs(137)：`blocks=24758 bfree=11100 files=512 ffree=126` == 同刻 `[DRV64] total_kb×2=24758 /
-        free_kb×2=11100` == 宿主侧独立解析卷 inode 表 512/126。
-    验收：tests/pipe64_test.py（**21 条断言** 21/21）、tests/statfs64_test.py（**12 条断言** 12/12）。
+      · busybox df 表（★ v0.9.29 起挂载表由**内核合成**的 /proc/mounts 提供）：
+        `/dev/sda2 12379 8055 4324 65% /`；`df -h` = `/dev/sda2 12.1M 7.9M 4.2M 65% /`。
+      · statfs(137)：`blocks=24758 bfree=8648 files=2048 ffree=1509` == 同刻 `[DRV64] total_kb×2=24758 /
+        free_kb×2=8648` == 宿主侧独立解析卷 inode 表 2048/1509。
+    验收：tests/pipe64_test.py（**21 条断言** 21/21）、tests/statfs64_test.py（**13 条断言** 13/13）。
     边界（如实）：**不投递 SIGPIPE**（读端全关的 write 只回 -EPIPE）；ring3 端到端 **F_SETFL 证据缺位**
       （本轮 F_SETFL/F_GETFL 走内核 fdtest 直证；busybox 侧走用户态垫片）；statfs 的错误码没有 ring3 触发路径；
-      `/proc/mounts` 是夹具提供的（内核**没有 mount 表 ABI**）。
+      `/proc/mounts` 由内核合成（`lx64_proc_mounts64`）但**只有一个挂载点 `/`** —— 本内核没有真正的挂载树，
+      其它盘符靠 `drive64_activate_letter64` 切换，不是挂载点；没有 `/proc/self/mountinfo`。
     """
     need = ["kernel/fd64.cpp", "kernel/fd64.h", "kernel/syscall64.cpp", "kernel/syscall64.h",
             "tests/pipe64_test.py", "tests/statfs64_test.py"]
@@ -3033,13 +3080,21 @@ def cap_pipe_statfs():
         "实测（宿主侧逐字节）：`ls -l /tcc/demo | grep hello | wc -l` == b\"2\\n\"（真值：hello.c + hello.lua）；"
         "`echo hi | cat` == b\"hi\\n\"；`cat lines.txt | sed s/beta/BETA/` 五行逐字节；`cat big64.txt | wc -c` == "
         "b\"300\\n\"（300 B 过 64 B 环，分次写完不丢字节 + EOF）",
-        "实测（同刻对照）：busybox df `/dev/sda2 12379 6829 5550 55% /`、df -h `/dev/sda2 12.1M 6.7M 5.4M 55% /`；"
-        "statfs blocks=24758 bfree=11100 files=512 ffree=126 == [DRV64] total_kb×2 / free_kb×2 == 宿主解析 inode 表 512/126",
+        "实测（同刻对照，★ v0.9.29 起挂载表由**内核合成**的 /proc/mounts 提供）："
+        "busybox df `/dev/sda2 12379 8055 4324 65% /`、df -h `/dev/sda2 12.1M 7.9M 4.2M 65% /`。",
+        "statfs blocks=24758 bfree=8648 files=2048 ffree=1509 == [DRV64] total_kb×2 / free_kb×2 == "
+        "宿主侧解析 inode 表 2048/1509，"
+
+        "`[LX64] proc open /proc/mounts fd=900 bytes=28` = 内核合成的标准挂载行 "
+        "`/dev/sda2 / vimtufs2 rw 0 0`（夹具**不再**注入这个文件），"
         "实测：阻塞等待 12 次（pid 真值 / why=empty|full / ticks 齐全），最长 1412 ticks≈5.6 s 未撞 30 s 上限；"
         "正常管线里无 busybox EAGAIN/EPIPE 文本",
         "验收：tests/pipe64_test.py（**21 条断言**，21/21）+ tests/statfs64_test.py（**12 条断言**，12/12）",
         "（边界，如实：**不投 SIGPIPE**；ring3 端到端 F_SETFL 证据缺位（走内核 fdtest 直证）；statfs 错误码无 "
-        "ring3 触发路径；/proc/mounts 由夹具提供 —— 内核没有 mount 表 ABI）",
+        "边界，如实：**不投递 SIGPIPE**；ring3 端到端 F_SETFL 证据缺位（走内核 fdtest 直证）：statfs 的错误码没有 "
+        "ring3 触发路径；/proc/mounts 虽由内核合成（lx64_proc_mounts64）但**只有一个挂载点 /** "
+        "—— 本内核没有真正的挂载树（其它盘符是 drive64 的当前卷切换，不是挂载点），"
+        "也没有 /proc/self/mountinfo。",
     ]
     done = bool(wr and refs and fcntl and sysc and log)
     return ("DONE" if done else "PARTIAL"), ev
@@ -3642,6 +3697,8 @@ CAPS = [
     ("内核", "★ 本批：pipe 默认阻塞（POSIX，有界 + 可被对端关闭打断）+ fcntl(72) + statfs(137)/fstatfs(138)；"
              "顺带修 pipe 池/引用计数两处真缺陷（wc -l 真值 2、300B 过 64B 环、df 12379/6829/5550 55%）",
      cap_pipe_statfs),
+    ("内核", "★ v0.9.29：合成 /proc/mounts（/proc/self/mounts 同源）+ 未知 /proc 条目回落真 VFS —— "
+             "busybox `df` 这才真跑通 statfs(137)（`df: /proc/mounts: No such file` 已修）", cap_proc_mounts),
     ("工具链", "★ 本批：VimtuOS 软件开发模板（sdk/software-template/ 25 文件 + 桌面拷贝：hello-cli/hello-gui/"
                "打包/装卷/图标外置工具；14/14 + 16/16 真跑；Rust 用户态未打通）", cap_sdk_template),
     ("应用", "★ 本批：图标集扩充（39 新 SVG = system 34 + apps 5；光栅化 156 PNG；装卷 276 PNG + "

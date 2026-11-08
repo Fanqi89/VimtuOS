@@ -3,8 +3,11 @@
 """tests/statfs64_test.py - ★ 本批：statfs(137) / fstatfs(138) 端到端验收（让 busybox `df` 能用）
 
 要证明的事：
-  ① 夹具 = build64/sysdisk.img 副本 + /proc/mounts（Linux 上由内核提供；本内核**没有 mount 表 ABI**，
-     所以夹具放一份标准 mtab 供 busybox df 枚举 —— df 的容量数字全部来自 statfs(137) 的 statvfs）。
+  ① 夹具 = build64/sysdisk.img 副本（**不再**往卷里塞 /proc/mounts）。★ v0.9.29 起
+     /proc/mounts 由**内核合成**（syscall64.cpp 的 lx64_proc_mounts64）—— 这才叫"内核提供挂载表"；
+     原来靠夹具塞一个盘上文件，而合成 /proc 树把未知条目一律 -ENOENT，于是 df 打
+     `df: /proc/mounts: No such file or directory` 后根本不调 statfs(137)。本测试现在反过来
+     用"没有夹具 mtab 也能跑通"来证明内核真的提供了它。
   ② 内核终端 `df` 在同一时刻给出 blocks/free（与 [DRV64] letter= 同源：drive64->fs64->vfs64 现数位图）。
   ③ ring3 `run /bin/df` -> statvfs -> statfs(137)：[FS64] statfs 行的 blocks/bfree 必须与 ② 逐值相等，
      且 == [DRV64] total_kb×2 / free_kb×2（同一来源）；busybox 表格的 1K 块数 = blocks/2、
@@ -98,7 +101,7 @@ def build_fixture(tmp):
     total = int.from_bytes(vol[20:24], "little")
     ed = TP.VolumeEdit(total)
     ed.load(vol)
-    ed.put("/proc/mounts", MTAB, mode=0o644)     # 夹具 mtab（内核没有 mount 表 ABI，见文件头）
+    # ★ v0.9.29：**不再**注入 /proc/mounts（内核合成；注入盘上文件会被合成层挡住，反而测不到内核）
     out = ed.finish()
     system = open(SYSTEM_IMG, "rb").read()
     disk = TP.SV.build_disk(system, out, TARGET_SECTORS)
@@ -243,7 +246,12 @@ def main():
         msf = re.findall(r"\[FS64\] statfs path=/ bsize=(\d+) blocks=(\d+) bfree=(\d+) files=(\d+) ffree=(\d+)", t1)
         check("statfs(137) 被真调用：bsize=512 + blocks/bfree/files/ffree 齐全",
               bool(msf) and msf[-1][0] == "512", "line=%s" % (msf[-1] if msf else None,))
-
+        # ★ v0.9.29：再证明这条挂载表是**内核合成**的（不是盘上碰巧有个文件）：
+        #   MTAB 的标准化一行 = "/dev/sda2 / vimtufs2 rw 0 0\n" = 恰好 28 字节。
+        _mp = re.search(r"\[LX64\] proc open /proc/mounts fd=\d+ bytes=(\d+)", t1)
+        check("内核合成 /proc/mounts（[LX64] proc open … bytes=%d = 标准挂载行）" % len(MTAB),
+              bool(_mp) and _mp.group(1) == str(len(MTAB)),
+              _mp.group(0) if _mp else "（缺 [LX64] proc open /proc/mounts 行）")
         if mdf and mdrv and msf:
             T, F = int(mdf[-1][0]), int(mdf[-1][1])
             tk, fk = int(mdrv[-1][0]), int(mdrv[-1][1])
