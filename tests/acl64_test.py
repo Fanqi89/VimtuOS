@@ -133,6 +133,10 @@ def main():
               "[VFS64] feature on bit=4 name=acl" in slog(serial), "")
         # ★ 注意：QEMU 的 `-serial file:` 带缓冲，而且这里的正则别再写双反斜杠（会匹配字面反斜杠）。
         #   做法：这里只记标记，最终判定放到进程退出后（finally 里回读一次串口）。
+        # ★ v0.9.30：**先等总自检收尾**（PASS 或 FAIL）再判。实测踩到：批量连跑时进程被过早杀掉，
+        #   后面几段（bit21 快照拷贝最慢）还没跑完，串口里就永远没有 "selftest PASS" → 误判红。
+        #   判据不变（仍然要求 PASS，且不能有 FAIL mask），只是把"等到"这件事做对。
+        wait_re(serial, r"\[VFS64\] selftest (PASS|FAIL)", 180, proc)
         _selft_ok = ("[VFS64] selftest PASS" in slog(serial))
         txt = slog(serial)
         bad = [w for w in FORBIDDEN if w in txt]

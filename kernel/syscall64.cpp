@@ -98,6 +98,9 @@
 //   138  fstatfs           ★ 本批：fd 版（fd64_where64 取卷+路径后与 137 同一份填充）；pipe/tty
 //                           没有卷 -> -ENOENT（如实）；fd 非法 -> -EBADF。
 //
+//   ★ v0.9.30：188 setxattr / 191 getxattr  **真实现**（Linux 号段；值字节按 posix_acl_xattr 规范）
+//   ★ v0.9.30：1024 vmtu_snapshot_take / 1025 vmtu_snapshot_mount / 1026 vmtu_quota_set /
+//               1027 vmtu_quota_get / 1028 vmtu_feature_enable  **VimtuOS 私有号**（Linux 没有对应调用，别谎称兼容）
 //   其它所有号：**-ENOSYS(-38)** 并且同一个号只打一次 `[SYSCALL] enosys nr=<n>`（防刷屏）。
 //   已实现号里做不到的分支一律返回**具体负 errno**（-EBADF/-EFAULT/-EINVAL/-ENOMEM/...），
 //   绝不返回 0 假装成功。
@@ -245,6 +248,7 @@ static const int64_t  LX64_ERANGE = 34;
 static const int64_t  LX64_EINVAL = 22;
 static const int64_t  LX64_EMFILE = 24;
 static const int64_t  LX64_ENOTTY = 25;
+static const int64_t  LX64_ENOSPC = 28;    // ★ v0.9.30：配额表满 / 写不进去
 static const int64_t  LX64_ESPIPE = 29;
 static const int64_t  LX64_ENOSYS = 38;
 static const int64_t  LX64_ENOTEMPTY = 39;
@@ -811,6 +815,10 @@ static int lx64_proc_mounts64(char* t, int cap) {
     i = lx64_proc_put64(t, i, cap, d.readonly ? " ro 0 0\n" : " rw 0 0\n");
     return i;
 }
+// ★ v0.9.30：/proc/vimtu/* 的三个渲染函数（定义在文件后部的 ring-3 入口小节；proc 层在它前面）。
+static int lx64_vmtu_features64(char* t, uint32_t cap);
+static int lx64_vmtu_journal64(char* t, uint32_t cap);
+static int lx64_vmtu_snaps64(char* t, uint32_t cap);
 static int64_t lx64_proc_open64(const char* path, int flags) {
     if (!lx64_proc_is64(path)) return -9999;                    // 不是 /proc：交回原路径
     if (flags & (0x1 | 0x40 | 0x200 | 0x400)) return -13;       // 只读：O_WRONLY/O_CREAT/O_TRUNC -> EACCES
@@ -872,6 +880,22 @@ static int64_t lx64_proc_open64(const char* path, int flags) {
                lx64_proc_streq64(f->name, "self/mounts")) {
         char t[LX64_PROC_MAX];
         lx64_proc_mounts64(t, (int)sizeof(t));
+        lx64_proc_fill64(f, t);
+    } else if (lx64_proc_streq64(f->name, "vimtu/features")) {
+        char t[LX64_PROC_MAX];
+        if (lx64_vmtu_features64(t, (uint32_t)sizeof(t)) < 0) t[0] = 0;
+        lx64_proc_fill64(f, t);
+    } else if (lx64_proc_streq64(f->name, "vimtu/journal")) {
+        char t[LX64_PROC_MAX];
+        if (lx64_vmtu_journal64(t, (uint32_t)sizeof(t)) < 0) t[0] = 0;
+        lx64_proc_fill64(f, t);
+    } else if (lx64_proc_streq64(f->name, "vimtu/snapshots")) {
+        char t[LX64_PROC_MAX];
+        if (lx64_vmtu_snaps64(t, (uint32_t)sizeof(t)) < 0) t[0] = 0;
+        lx64_proc_fill64(f, t);
+    } else if (lx64_proc_streq64(f->name, "vimtu/quota")) {
+        char t[LX64_PROC_MAX];
+        if (vfs64_quota_dump64(t, (uint32_t)sizeof(t)) < 0) t[0] = 0;
         lx64_proc_fill64(f, t);
     } else {
         f->used = 0;
@@ -2954,6 +2978,231 @@ static int64_t sc64_dir_close64(uint64_t fd_va) {
 //   exit   -> 改写帧把控制权交回内核（入口看 g_syscall64_exit_to_kernel64）
 //   execve -> 成功时帧已被改写成"回到新入口"，这里直接返回（调用方立刻返回，让 sysret 落地）
 // 每个号的状态见文件头大表（真实现 / 部分 / -ENOSYS），未列出的号一律 -ENOSYS 且只打一次日志。
+// ==================== ★ v0.9.30：ACL / 配额 / 日志 / 快照 的 ring-3 入口 ====================
+// 背景（用户的判断是对的）：v0.9.28 把这四项做进了内核与 VimtuFS2 v5，但**没有系统调用、没有终端命令**
+//   —— 对用户而言等于不存在（"有实现、没用户"）。本批把入口补上，并且按"能证明"的方式补。
+// 号段策略（如实，绝不混口径）：
+//   * 188 setxattr / 191 getxattr —— **Linux x86_64 的真号**，参数/返回/错误码按 Linux。
+//     值的字节格式按 Linux 的 posix_acl_xattr（`{u32 a_version = 2}` + 8N 字节条目）；
+//     vfs64 侧把 4 B 版本头剥掉再落盘（盘上仍是裸条目数组，v0.9.28 的 40 B 断言不变）。
+//   * 1024..1027 —— **VimtuOS 私有号**（Linux 没有对应调用），只做本内核独有的四件事：
+//       1024 vmtu_snapshot_take(want_blocks)     -> id(>=1) / -EIO
+//       1025 vmtu_snapshot_mount(id)             -> 卷槽号 / -ENOENT
+//       1026 vmtu_quota_set(uid, limit)          -> 0 / -ENOSPC|-EACCES|-EIO（limit = 0xFFFFFFFF = 不限）
+//       1027 vmtu_quota_get(uid, *limit, *used)  -> 0 / -EIO
+//     为什么不实现 quotactl(179)：Linux 的 if_dqblk/qc_dqblk 两套结构 + 1K 块/字节两种单位口径都有歧义，
+//     照抄一半反而会骗人；私有号能如实表达本内核的"512B 块数"口径。**判据/文档必须写"私有号"**。
+// 打点：`[VMTU] <op> pid=<n> uid=<n> [path=..] [name=..] len=<n> rc=<n> ok|fail`
+//   —— pid 非 0 就能证明这条调用真来自 ring 3（内核自检走的是 vfs64_* 直调，不经过这里）。
+static const uint32_t LX64_XATTR_MAX64 = 4096u;      // xattr 值上限（xattr 块本身 512 B，这里先挡异常大请求）
+static int64_t lx64_vmtu_err64(int rc) {
+    if (rc == 0) return 0;
+    if (rc == -13) return -LX64_EACCES;
+    if (rc == -2) return -LX64_ENOENT;
+    return -LX64_EIO;                                 // vfs64 的 -1：失败已打点（写盘失败/没开特性/表满）
+}
+// ★ v0.9.30：显式传 `ok`，不能用 `rc == 0` 当成功判据 —— getxattr 的返回值是**字节数**，
+//   rc=32 是成功（实测抓到：原来打成 `rc=32 fail`，把成功读取写成了失败）。
+static void lx64_vmtu_log64(const char* op, const char* path, const char* name,
+                            uint32_t len, int rc, int ok) {
+    dbg64_line_begin64();
+    dbg64_str("[VMTU] ");
+    dbg64_str(op);
+    dbg64_str(" pid=");
+    dbg64_dec((uint64_t)(proc64_current_pid64 ? proc64_current_pid64() : 0));
+    dbg64_str(" uid=");
+    dbg64_dec((uint64_t)lx64_geteuid64());
+    if (path && path[0]) { dbg64_str(" path="); dbg64_str(path); }
+    if (name && name[0]) { dbg64_str(" name="); dbg64_str(name); }
+    dbg64_str(" len=");
+    dbg64_dec((uint64_t)len);
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)(rc < 0 ? -rc : rc));
+    dbg64_str(ok ? " ok" : " fail");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+static int64_t lx64_setxattr64(uint64_t nr, uint64_t path_va, uint64_t name_va,
+                               uint64_t val_va, uint64_t size) {
+    char path[LX64_PATH_MAX];
+    if (lx64_user_str64(path_va, path, (uint32_t)sizeof(path)) != 0) {
+        syscall64_deny64(nr, path_va);
+        return -LX64_EFAULT;
+    }
+    char name[96];
+    if (lx64_user_str64(name_va, name, (uint32_t)sizeof(name)) != 0) {
+        syscall64_deny64(nr, name_va);
+        return -LX64_EFAULT;
+    }
+    if (size > (uint64_t)LX64_XATTR_MAX64) {
+        lx64_vmtu_log64("setxattr", path, name, (uint32_t)size, -(int)LX64_EINVAL, 0);
+        return -LX64_EINVAL;
+    }
+    if (size != 0 && !user64_range_ok64(val_va, size)) {
+        syscall64_deny64(nr, val_va);
+        return -LX64_EFAULT;
+    }
+    const int rc = vfs64_setxattr64(path, name,
+                                    (size != 0) ? (const void*)(uintptr_t)val_va : nullptr,
+                                    (uint32_t)size);
+    lx64_vmtu_log64("setxattr", path, name, (uint32_t)size, rc, rc == 0);
+    return lx64_vmtu_err64(rc);
+}
+static int64_t lx64_getxattr64(uint64_t nr, uint64_t path_va, uint64_t name_va,
+                               uint64_t buf_va, uint64_t size) {
+    char path[LX64_PATH_MAX];
+    if (lx64_user_str64(path_va, path, (uint32_t)sizeof(path)) != 0) {
+        syscall64_deny64(nr, path_va);
+        return -LX64_EFAULT;
+    }
+    char name[96];
+    if (lx64_user_str64(name_va, name, (uint32_t)sizeof(name)) != 0) {
+        syscall64_deny64(nr, name_va);
+        return -LX64_EFAULT;
+    }
+    if (size != 0 && !user64_range_ok64(buf_va, size)) {
+        syscall64_deny64(nr, buf_va);
+        return -LX64_EFAULT;
+    }
+    const int rc = vfs64_getxattr64(path, name,
+                                    (size != 0) ? (void*)(uintptr_t)buf_va : nullptr,
+                                    (uint32_t)size);
+    lx64_vmtu_log64("getxattr", path, name, (uint32_t)size, rc, rc >= 0);
+    if (rc < 0) return -LX64_ENOENT;                  // 没有这个 xattr / 没开 ACL（Linux 同样 eNOENT）
+    return (int64_t)rc;                               // Linux 语义：缓冲不够也只回长度，不拷
+}
+static int64_t lx64_vmtu_quota_set64(uint64_t nr, uint64_t uid, uint64_t limit) {
+    if (uid > 0xFFFFFFFFull || limit > 0xFFFFFFFFull) {
+        syscall64_deny64(nr, uid);
+        return -LX64_EINVAL;
+    }
+    const int rc = vfs64_quota_set64((uint32_t)uid, (uint32_t)limit);
+    lx64_vmtu_log64("quota_set", nullptr, nullptr, (uint32_t)uid, rc, rc == 0);
+    if (rc != 0) return (rc == -13) ? -LX64_EACCES : -LX64_ENOSPC;   // 表满/没开特性 -> 空间类错误
+    return 0;
+}
+static int64_t lx64_vmtu_quota_get64(uint64_t nr, uint64_t uid,
+                                     uint64_t lim_va, uint64_t used_va) {
+    if (!user64_range_ok64(lim_va, 4) || !user64_range_ok64(used_va, 4)) {
+        syscall64_deny64(nr, lim_va);
+        return -LX64_EFAULT;
+    }
+    uint32_t lim = 0, used = 0;
+    const int rc = vfs64_quota_get64((uint32_t)uid, &lim, &used);
+    if (rc == 0) {
+        lx64_copy_to_user64(lim_va, &lim, 4);
+        lx64_copy_to_user64(used_va, &used, 4);
+    }
+    lx64_vmtu_log64("quota_get", nullptr, nullptr, (uint32_t)uid, rc, rc == 0);
+    return lx64_vmtu_err64(rc);
+}
+static int64_t lx64_vmtu_snap_take64(uint64_t nr, uint64_t want) {
+    (void)nr;
+    const int rc = vfs64_snapshot_take64((uint32_t)(want > 0xFFFFFFFFull ? 0u : want));
+    lx64_vmtu_log64("snap_take", nullptr, nullptr, (uint32_t)(want > 0xFFFFFFFFull ? 0u : want),
+                    rc >= 1 ? 0 : -1, rc >= 1);
+    return (rc >= 1) ? (int64_t)rc : -LX64_EIO;
+}
+static int64_t lx64_vmtu_snap_mount64(uint64_t nr, uint64_t id) {
+    (void)nr;
+    const int rc = vfs64_snapshot_mount64((uint32_t)id);
+    lx64_vmtu_log64("snap_mount", nullptr, nullptr, (uint32_t)id, rc >= 0 ? 0 : -1, rc >= 0);
+    return (rc >= 0) ? (int64_t)rc : -LX64_ENOENT;
+}
+// 1028 vmtu_feature_enable(bits)：打开 VimtuFS2 的四个特性（**root only**）。
+//   为什么必须有这个号（实测缺口）：v0.9.28 的四项特性只会被**内核自检在假盘上**打开，
+//   真实安装好的系统卷 feature_bits 一直是 0 —— 于是 ACL/配额/日志/快照在真机上**全是关闭的**，
+//   连"有实现、没用户"都算不上，是"没入口、也没开"。这里给 root 一个显式开关（幂等：已开的位直接算成功）。
+static int64_t lx64_vmtu_feat_enable64(uint64_t nr, uint64_t bits) {
+    if (lx64_geteuid64() != 0) {
+        syscall64_deny64(nr, bits);
+        lx64_vmtu_log64("feat_enable", nullptr, nullptr, (uint32_t)bits, -(int)LX64_EPERM, 0);
+        return -LX64_EPERM;
+    }
+    if (bits == 0 || (bits & ~(uint64_t)VFS64_FEAT_ALL) != 0) {
+        lx64_vmtu_log64("feat_enable", nullptr, nullptr, (uint32_t)bits, -(int)LX64_EINVAL, 0);
+        return -LX64_EINVAL;                              // 不认识的位：如实拒绝，不猜
+    }
+    uint32_t want = 0, done = 0;
+    for (int b = 0; b < 4; b++) {
+        const uint32_t bit = 1u << b;
+        if ((uint32_t)bits & bit) want++;
+    }
+    for (int b = 0; b < 4; b++) {
+        const uint32_t bit = 1u << b;
+        if (((uint32_t)bits & bit) == 0) continue;
+        if ((vfs64_features64() & bit) != 0) { done++; continue; }   // 幂等
+        if (vfs64_feature_enable64(bit) == 0) done++;
+    }
+    lx64_vmtu_log64("feat_enable", nullptr, nullptr, (uint32_t)bits, (done == want) ? 0 : -1,
+                    done == want);
+    return (done == want) ? 0 : -LX64_EIO;
+}
+// /proc/vimtu/* : 把内核里的四张表渲染成**只读合成文件**，让用户态 cat 就能看（不需要任何工具）。
+//   为什么放 /proc 而不是新 syscall：读文本是 Linux 世界最通用的"看状态"方式，零 ABI 成本。
+static int lx64_vmtu_features64(char* t, uint32_t cap) {
+    if (cap < 16u) return -1;
+    const uint32_t bits = vfs64_features64();
+    int n = 0;
+    n = lx64_proc_put64(t, n, (int)cap, "features bits=");
+    n = lx64_proc_putu64(t, n, (int)cap, bits);
+    n = lx64_proc_put64(t, n, (int)cap, " journal=");
+    n = lx64_proc_putu64(t, n, (int)cap, (bits & VFS64_FEAT_JOURNAL) ? 1u : 0u);
+    n = lx64_proc_put64(t, n, (int)cap, " quota=");
+    n = lx64_proc_putu64(t, n, (int)cap, (bits & VFS64_FEAT_QUOTA) ? 1u : 0u);
+    n = lx64_proc_put64(t, n, (int)cap, " acl=");
+    n = lx64_proc_putu64(t, n, (int)cap, (bits & VFS64_FEAT_ACL) ? 1u : 0u);
+    n = lx64_proc_put64(t, n, (int)cap, " snapshot=");
+    n = lx64_proc_putu64(t, n, (int)cap, (bits & VFS64_FEAT_SNAPSHOT) ? 1u : 0u);
+    n = lx64_proc_put64(t, n, (int)cap, "\n");
+    return n;
+}
+static int lx64_vmtu_journal64(char* t, uint32_t cap) {
+    if (cap < 16u) return -1;
+    uint32_t st = 0, nb = 0, cm = 0, tx = 0;
+    const int rc = vfs64_journal_info64(&st, &nb, &cm, &tx);
+    int n = 0;
+    if (rc != 0) return lx64_proc_put64(t, 0, (int)cap, "journal off (not mounted)\n");
+    n = lx64_proc_put64(t, n, (int)cap, "journal start_blk=");
+    n = lx64_proc_putu64(t, n, (int)cap, st);
+    n = lx64_proc_put64(t, n, (int)cap, " blocks=");
+    n = lx64_proc_putu64(t, n, (int)cap, nb);
+    n = lx64_proc_put64(t, n, (int)cap, " commits=");
+    n = lx64_proc_putu64(t, n, (int)cap, cm);
+    n = lx64_proc_put64(t, n, (int)cap, " txid=");
+    n = lx64_proc_putu64(t, n, (int)cap, tx);
+    n = lx64_proc_put64(t, n, (int)cap, " state=");
+    n = lx64_proc_put64(t, n, (int)cap, nb ? "on" : "off");
+    n = lx64_proc_put64(t, n, (int)cap, "\n");
+    return n;
+}
+static int lx64_vmtu_snaps64(char* t, uint32_t cap) {
+    if (cap < 16u) return -1;
+    Vfs64SnapInfo64 sn[8];
+    const int cnt = vfs64_snapshot_list64(sn, 8);
+    if (cnt <= 0) return lx64_proc_put64(t, 0, (int)cap, "snapshots 0\n");
+    int n = 0;
+    n = lx64_proc_put64(t, n, (int)cap, "snapshots ");
+    n = lx64_proc_putu64(t, n, (int)cap, (uint32_t)cnt);
+    n = lx64_proc_put64(t, n, (int)cap, "\n");
+    for (int i = 0; i < cnt; i++) {
+        n = lx64_proc_put64(t, n, (int)cap, "id=");
+        n = lx64_proc_putu64(t, n, (int)cap, sn[i].id);
+        n = lx64_proc_put64(t, n, (int)cap, " start=");
+        n = lx64_proc_putu64(t, n, (int)cap, sn[i].start_blk);
+        n = lx64_proc_put64(t, n, (int)cap, " blocks=");
+        n = lx64_proc_putu64(t, n, (int)cap, sn[i].blocks);
+        n = lx64_proc_put64(t, n, (int)cap, " taken=");
+        n = lx64_proc_putu64(t, n, (int)cap, sn[i].taken);
+        n = lx64_proc_put64(t, n, (int)cap, " state=");
+        n = lx64_proc_putu64(t, n, (int)cap, sn[i].state);
+        n = lx64_proc_put64(t, n, (int)cap, sn[i].slot == 0xFFFFFFFFu ? " ro=unmounted" : " ro=mounted");
+        n = lx64_proc_put64(t, n, (int)cap, "\n");
+        if ((uint32_t)n + 96u >= cap) break;
+    }
+    return n;
+}
+
 static int64_t syscall64_linux64(pt_regs64* r) {
     const uint64_t nr = r->rax;
     const uint64_t a1 = r->rdi, a2 = r->rsi, a3 = r->rdx;
@@ -3063,6 +3312,13 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 228: return lx64_clock_gettime64(nr, a1, a2);
     case 257: return lx64_open64(nr, a2, a3);                       // openat(dirfd, path, flags, mode)
     case 318: return lx64_getrandom64(nr, a1, a2, a3);               // 伪随机（非密码学安全，如实标注）
+    case 188: return lx64_setxattr64(nr, a1, a2, a3, a4);            // ★ v0.9.30：Linux setxattr
+    case 191: return lx64_getxattr64(nr, a1, a2, a3, a4);            // ★ v0.9.30：Linux getxattr
+    case 1024: return lx64_vmtu_snap_take64(nr, a1);                 // ★ v0.9.30：私有号 拍快照
+    case 1025: return lx64_vmtu_snap_mount64(nr, a1);                 // ★ v0.9.30：私有号 挂载快照
+    case 1026: return lx64_vmtu_quota_set64(nr, a1, a2);              // ★ v0.9.30：私有号 设配额
+    case 1027: return lx64_vmtu_quota_get64(nr, a1, a2, a3);          // ★ v0.9.30：私有号 查配额
+    case 1028: return lx64_vmtu_feat_enable64(nr, a1);               // ★ v0.9.30：私有号 开特性（root）
     default:
         break;
     }

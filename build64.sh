@@ -67,7 +67,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.9.29"    # ★ v0.9.29：合成 /proc/mounts（busybox df 打通 statfs(137)）+ 目录树 dump 预算 64
+VIMTUOS_VERSION="0.9.30"    # ★ v0.9.30：ACL / 配额 / 日志 / 快照 的 ring-3 入口（setxattr/getxattr + 私有号 + /proc/vimtu/* + vmtool）
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
@@ -489,6 +489,8 @@ echo "==> ★ A4-4c：用户态 gzip/gunzip（**交付 = 系统卷里的 /bin/gz
 bash tools/gzip_build_win.sh "$BUILD"
 #   ★ v0.7.5：用户态 dpkg/apt（.deb 安装）——静态 ELF64，< 64 KiB 主程序窗口
 bash tools/dpkg_build_win.sh "$BUILD"
+#   ★ v0.9.30：用户态 vmtool（ACL / 配额 / 日志 / 快照 的 ring-3 入口）——静态 ELF64，< 64 KiB 主程序窗口
+bash tools/vmtool_build_win.sh "$BUILD"
 
 echo "==> ★ A3 下半：FPU/xmm 上下文回归程序（user/xmmsse.asm；两个进程同时跑）"
 # 见 user/xmmsse.asm 顶部说明：同一份 ELF 起两个真进程、各自核对 16 个 xmm 是否被对方污染。
@@ -1556,6 +1558,11 @@ echo "==> ★ v0.6.1：图标拆成逐张 PNG 装进 /System/icons（内核里 0
 echo "==> ★ v0.7.5：dpkg/apt 装进 /usr/bin（+ /usr/share/dpkg/test-vimtu_1.0.deb）"
 "$PY" tools/dpkg_pack_win.py \
       --vol-in "$BUILD/iconsvol.img" --vol-out "$BUILD/dpkgvol.img" \
+      --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+# ★ v0.9.30：vmtool 装进 /usr/bin（ACL/配额/日志/快照 的用户态入口；上一步的 dpkgvol 当输入卷）
+echo "==> ★ v0.9.30：vmtool（ring-3 ACL/配额/日志/快照 入口）装进 /usr/bin"
+"$PY" tools/vmtool_pack_win.py \
+      --vol-in "$BUILD/dpkgvol.img" --vol-out "$BUILD/vmtoolvol.img" \
       --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 echo "==> ★ v0.5.11：把数据分区（VimtuFS2 卷）**并入安装载荷** system.img"
 # ★ 真缺陷（本批修）：system.img 原来只切了前 8073 扇区（MBR+引导+内核+64 扇区裸槽），

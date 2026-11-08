@@ -2979,6 +2979,70 @@ def cap_dirabi():
     ]
     done = bool(sysc and case and hdr and cache and ino and bb)
     return ("DONE" if done else "PARTIAL"), ev
+def cap_vmtu_ring3():
+    """★ v0.9.30「ACL / 配额 / 日志 / 快照 的 ring-3 入口」。
+
+    开工时的真实状态（不好看但必须说）：v0.9.28 把这四项做进了内核与 VimtuFS2 v5，
+    但 **没有系统调用、没有终端命令**；而且真实安装好的系统卷 `feature_bits` 一直是 0
+    （只有内核自检在假盘上打开）—— 对用户而言这四项等于不存在。本批把入口补齐：
+      · **Linux 真号**：`setxattr(188)` / `getxattr(191)`。ACL 的值按 Linux 的 `posix_acl_xattr`
+        规范（`{u32 a_version = 2}` + 8N 字节条目）；内核剥掉 4 B 版本头后落盘（盘上仍是
+        v0.9.28 的裸条目数组，40 B 断言不变）。
+      · **VimtuOS 私有号**（Linux 无对应）：1024 snap_take / 1025 snap_mount /
+        1026 quota_set / 1027 quota_get / 1028 feature_enable（root）。
+      · **`/proc/vimtu/*` 合成只读节点**：features / journal / snapshots / quota。
+      · **`/usr/bin/vmtool`**（静态 ELF64，17,272 B）：acl grant|deny|get|clear、quota set|get、
+        feature on、snap-take|snap-mount、write、features|journal|snapshots|quota-all。
+    证据（tests/vmtool64_test.py 真 QEMU，**45 条断言 45/45**）：
+      · `[VMTU] feat_enable pid=26 uid=0 len=15 rc=0 ok` + `[VFS64] feature on bit=1/2/4/8 name=journal/quota/acl/snapshot`
+      · `[VMTU] setxattr pid=27 uid=1000 path=/home/vimtu/q1.bin … len=36 rc=0 ok` +
+        `[XATTR] setxattr ok … len=32 hdr=1`（用户态发 Linux 36 B，内核剥头存 32 B）
+      · `[VMTU] getxattr … len=64 rc=32 ok`（读回 4 项 × 8 B）
+      · `[PERM64] deny op=access path=/home/vimtu/q1.bin uid=1000 via=acl need=w` + `[FD64] open FAILED rc=13`
+        → 工具退出码 1；`acl clear` 之后又能写（**双向**）
+      · `[QUOTA] deny uid=1000`（limit=4 块时写 10 块被拒），且不产生半截文件
+      · `[LX64] proc open /proc/vimtu/features|journal|snapshots|quota`（四个合成文件都能被 ring-3 打开）
+      · `[VMTU] snap_take … fail` + `[SNAP] take FAILED reason=no-space want=16088 free=…`
+        （小试卷 12 MB、已用 65%，全量克隆物理上放不下 → 如实拒绝，卷不受损）
+    边界（如实）：
+      · `listxattr(192)`、`fsetxattr`、`quotactl(179)` **未实现**：前两者内核没有枚举接口，后者
+        Linux 的 if_dqblk/qc_dqblk 两套结构与 1K 块/字节两种单位口径都有歧义 —— 宁可用私有号，
+        也不假装 Linux 兼容。
+      · `getxattr` 返回的是**裸条目数组**（Linux 的 4 B 版本头在写入时已剥）—— 读写不对称，如实标注。
+      · 全量克隆快照需要“已用空间那么多”的空闲空间，在 65% 满的 12 MB 卷上拍不成；
+        **真卷上的正向路径未取证（UNVERIFIED）**，正向已由内核自检 bit21 与
+        `tests/snapshot64_test.py`（假盘）覆盖。
+    验收：tests/vmtool64_test.py（**45/45**）。
+    """
+    need = ["kernel/syscall64.cpp", "kernel/vfs64.cpp", "kernel/vfs64.h",
+            "user/vmtool/vmtool.c", "tools/vmtool_build_win.sh", "tools/vmtool_pack_win.py",
+            "tests/vmtool64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    nr = grep_count(r"case 188|case 191|case 1024|case 1025|case 1026|case 1027|case 1028",
+                    ["kernel/syscall64.cpp"])
+    proc = grep_count(r"vimtu/features|vimtu/journal|vimtu/snapshots|vimtu/quota",
+                      ["kernel/syscall64.cpp"])
+    tool = grep_count(r"NR_SETXATTR|NR_GETXATTR|NR_QUOTA_SET|NR_FEAT_ENABLE|acl_build_grant",
+                      ["user/vmtool/vmtool.c"])
+    ev = [
+        "系统调用：Linux 真号 188/191 + VimtuOS 私有号 1024..1028（分派命中 %d）" % nr,
+        "合成只读节点 /proc/vimtu/{features,journal,snapshots,quota}（命中 %d）" % proc,
+        "用户态 /usr/bin/vmtool（静态 ELF64 17,272 B：acl grant|deny|get|clear、quota set|get、"
+        "feature on、snap-take|snap-mount、write；命中 %d）" % tool,
+        "实测：`[VMTU] feat_enable uid=0 len=15 rc=0 ok` + `[VFS64] feature on bit=1/2/4/8`；"
+        "`[VMTU] setxattr len=36 rc=0 ok` + `[XATTR] setxattr ok len=32 hdr=1`；`[VMTU] getxattr rc=32 ok`",
+        "实测：`[PERM64] deny op=access … via=acl need=w`（ACL 真生效）、`[QUOTA] deny uid=1000`"
+        "（配额真生效）、`[SNAP] take FAILED reason=no-space`（空间不够时如实拒绝）",
+        "验收：tests/vmtool64_test.py（**45 条断言 45/45**；两段开机：root 开特性/设配额，"
+        "重启后以 uid 1000 验 ACL/配额拒绝 —— 顺带证明特性持久化）",
+        "边界：listxattr / fsetxattr / quotactl 未实现；getxattr 返回裸条目数组（读写不对称）；"
+        "真卷上的快照正向路径未取证（UNVERIFIED，需 76 MB 安装卷）",
+    ]
+    return ("DONE" if (nr >= 7 and proc >= 4 and tool >= 4) else "PARTIAL"), ev
+
+
 def cap_proc_mounts():
     """★ v0.9.29「合成 /proc 挂载表」：busybox `df` / `mount` 的**真**数据来源（原来被合成层挡死）。
 
@@ -3699,6 +3763,8 @@ CAPS = [
      cap_pipe_statfs),
     ("内核", "★ v0.9.29：合成 /proc/mounts（/proc/self/mounts 同源）+ 未知 /proc 条目回落真 VFS —— "
              "busybox `df` 这才真跑通 statfs(137)（`df: /proc/mounts: No such file` 已修）", cap_proc_mounts),
+    ("内核", "★ v0.9.30：ACL / 配额 / 日志 / 快照 的 **ring-3 入口**（Linux setxattr/getxattr 188/191 + "
+             "私有号 1024..1028 + /proc/vimtu/* + /usr/bin/vmtool；ACL 拒写与配额 deny 真生效）", cap_vmtu_ring3),
     ("工具链", "★ 本批：VimtuOS 软件开发模板（sdk/software-template/ 25 文件 + 桌面拷贝：hello-cli/hello-gui/"
                "打包/装卷/图标外置工具；14/14 + 16/16 真跑；Rust 用户态未打通）", cap_sdk_template),
     ("应用", "★ 本批：图标集扩充（39 新 SVG = system 34 + apps 5；光栅化 156 PNG；装卷 276 PNG + "

@@ -1562,6 +1562,69 @@ int vfs64_quota_get64(uint32_t uid, uint32_t* limit_blocks, uint32_t* used_block
     return 0;
 }
 
+// ★ v0.9.30：整张配额表 -> 文本（/proc/vimtu/quota 的数据源；用户态 cat 就能看）。
+// 为什么放在内核：配额表在盘上的私有块里（v5 的 quota_blk），用户态没有别的一致读法；
+//   而 ring-3 需要一个"能看见"的入口，否则配额对用户而言不存在。
+static int qt_put64(char* o, uint32_t cap, uint32_t n, const char* s) {
+    while (*s && n + 1u < cap) o[n++] = *s++;
+    if (n < cap) o[n] = 0;
+    return (int)n;
+}
+static int qt_putd64(char* o, uint32_t cap, uint32_t n, uint32_t v) {
+    char t[16];
+    int k = 0;
+    if (!v) t[k++] = '0';
+    while (v && k < (int)sizeof(t)) { t[k++] = (char)('0' + (int)(v % 10u)); v /= 10u; }
+    while (k > 0 && n + 1u < cap) o[n++] = t[--k];
+    if (n < cap) o[n] = 0;
+    return (int)n;
+}
+int vfs64_quota_dump64(char* out, uint32_t cap) {
+    if (!out || cap < 8u) return -1;
+    out[0] = 0;
+    if (!g_mounted) return -1;
+    uint8_t t[VFS64_SECTOR_BYTES];
+    if (qt_load64(t) != 1) return -1;
+    uint32_t cnt = rd32(t + 4);
+    if (cnt > QT_ENTRIES) cnt = QT_ENTRIES;
+    int n = 0;
+    uint32_t rows = 0;
+    for (uint32_t k = 0; k < QT_ENTRIES; k++) {
+        const uint32_t uid  = (k < cnt) ? rd32(t + 8u + QT_ENT_BYTES * k) : QT_UNLIMITED;
+        const uint32_t lim  = (k < cnt) ? rd32(t + 8u + QT_ENT_BYTES * k + 4u) : 0u;
+        const uint32_t used = (k < cnt) ? rd32(t + 8u + QT_ENT_BYTES * k + 8u) : 0u;
+        const uint32_t fl   = (k < cnt) ? rd32(t + 8u + QT_ENT_BYTES * k + 12u) : 0u;
+        if (uid == QT_UNLIMITED) continue;                       // 空项（哨兵）跳过
+        n = qt_put64(out, cap, (uint32_t)n, "uid=");
+        n = qt_putd64(out, cap, (uint32_t)n, uid);
+        n = qt_put64(out, cap, (uint32_t)n, " limit=");
+        if (lim == QT_UNLIMITED) n = qt_put64(out, cap, (uint32_t)n, "unlimited");
+        else n = qt_putd64(out, cap, (uint32_t)n, lim);
+        n = qt_put64(out, cap, (uint32_t)n, " used=");
+        n = qt_putd64(out, cap, (uint32_t)n, used);
+        n = qt_put64(out, cap, (uint32_t)n, " flags=");
+        n = qt_putd64(out, cap, (uint32_t)n, fl);
+        n = qt_put64(out, cap, (uint32_t)n, "\n");
+        rows++;
+        if ((uint32_t)n + 64u >= cap) break;
+    }
+    if (rows == 0) (void)qt_put64(out, cap, (uint32_t)n, "empty\n");
+    return n;
+}
+
+int vfs64_journal_info64(uint32_t* start_blk, uint32_t* blocks, uint32_t* commits, uint32_t* txid) {
+    if (start_blk) *start_blk = 0;
+    if (blocks) *blocks = 0;
+    if (commits) *commits = 0;
+    if (txid) *txid = 0;
+    if (!g_mounted) return -1;
+    if (start_blk) *start_blk = g_jx_start;
+    if (blocks) *blocks = g_jx_blocks;
+    if (commits) *commits = g_jx_commits;
+    if (txid) *txid = g_jx_txid;
+    return 0;
+}
+
 // ==================== ★ v0.9.28 特性层 C：xattr + POSIX ACL 子集 ====================
 // 存储：每个 inode 一个 **xattr 块**（按需分配，块号写在 inode 的 xattr_blk 字段，v5 专有）。
 // 块布局（小端）：{u32 magic "XAT1"; u32 count} 然后 count 条紧排的
@@ -1738,6 +1801,20 @@ int vfs64_setxattr64(const char* path, const char* name, const void* val, uint32
     if (!path || !name) { log_op_fail("setxattr", "bad args"); return -1; }
     if (!acl_on64()) { log_line("[XATTR] setxattr FAILED reason=acl-feature-off"); return -1; }
     if (g_ro) { log_line("[XATTR] setxattr FAILED reason=read-only"); return -1; }
+    // ★ v0.9.30：**接受 Linux 规范的 ACL 字节**（值 = {u32 a_version = 2} + 8N 字节条目）。
+    //   为什么必须做：ACL 这一版要交给 ring-3 用，用户态工具照 Linux 拼字节才是"真 ABI"；
+    //   逼用户态自己去掉 4 字节头就等于自定义私有格式（而 Linux 的 setfacl/posix_acl 都带头）。
+    //   盘上格式不变：命中版本头就把 4 字节**剥掉再存**，仍是 v0.9.28 起的裸条目数组（selftest 断言 40 B）。
+    uint32_t acl_hdr = 0;
+    if (val && vlen >= 4u && ((vlen - 4u) % 8u) == 0u) {
+        const uint32_t nlen = str_len64(name);
+        if (name_eq64((const uint8_t*)name, nlen, kAclName)) {
+            const uint8_t* hp = (const uint8_t*)val;
+            const uint32_t ver = (uint32_t)hp[0] | ((uint32_t)hp[1] << 8) |
+                                 ((uint32_t)hp[2] << 16) | ((uint32_t)hp[3] << 24);
+            if (ver == 2u) { val = (const void*)(hp + 4); vlen -= 4u; acl_hdr = 1; }
+        }
+    }
     uint32_t idx = 0;
     const int pr = path_resolve(path, false, &idx, nullptr, nullptr, nullptr);
     if (pr != 0) { log_op_fail("setxattr", pr == -VFS64_EACCES ? "permission denied (traverse)" : "not found"); return pr; }
@@ -1759,6 +1836,8 @@ int vfs64_setxattr64(const char* path, const char* name, const void* val, uint32
     dbg64_str(name);
     dbg64_str(" len=");
     dbg64_dec(vlen);
+    dbg64_str(" hdr=");                       // ★ v0.9.30：1 = 值是 Linux 规范（带 4 B 版本头，已剥离）
+    dbg64_dec(acl_hdr);
     dbg64_nl();
     dbg64_line_end64();
     return 0;
@@ -1903,10 +1982,14 @@ int vfs64_snapshot_take64(uint32_t want_blocks) {
     if (vfs64_free64(&fb, nullptr, nullptr) != 0) return -1;
     uint32_t n = want_blocks;
     if (n == 0) {
+        // ★ v0.9.30（真缺陷，实测抓到）：自动尺寸原来是 `已用数据块 × 2` 再**钳到 4096 块**（= 2 MB）。
+        //   而装好的系统卷已用数据块 ≈ 16,000，全量克隆至少需要同样多的空间 —— 4096 块必然装不下，
+        //   于是拍快照走到一半才失败（实测 `[VFS64] write_at64: no space (pre-flight)` →
+        //   `[SNAP] copy FAILED reason=file`）。现在按**实际需要**申请（已用数据块 + 64 块元数据余量）；
+        //   装不下就走下面的 `no-space` **如实拒绝**，不编造上限、也不把卷写坏。
         const uint32_t used_data = g_data_blocks - fb;
-        n = used_data * 2u;
+        n = used_data + 64u;
         if (n < 64u) n = 64u;
-        if (n > 4096u) n = 4096u;                 // 自动档上限（避免一次性占满整卷）
     }
     if (n < 32u) { log_line("[SNAP] take FAILED reason=too-small"); return -1; }
     if (n > fb) {

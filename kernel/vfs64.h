@@ -255,6 +255,13 @@ int vfs64_acl_grant64(const char* path, uint32_t uid, uint32_t perm3);
 int vfs64_quota_set64(uint32_t uid, uint32_t limit_blocks);
 int vfs64_quota_get64(uint32_t uid, uint32_t* limit_blocks, uint32_t* used_blocks);
 #define VFS64_QUOTA_UNLIMITED  0xFFFFFFFFu
+// ★ v0.9.30：把整张配额表渲染成文本（给合成文件 /proc/vimtu/quota 用）。
+//   每行 `uid=<n> limit=<n|unlimited> used=<n> flags=<n>`；空项（哨兵 uid=0xFFFFFFFF）跳过。
+//   返回写入字节数（不含结尾 0）；表没开/读失败 -> -1。
+int vfs64_quota_dump64(char* out, uint32_t cap);
+// ★ v0.9.30：日志区只读信息（给 /proc/vimtu/journal 用）。
+//   返回 0；-1 = 没挂载。commits/txid 是**运行时**视图（commits 从挂载起累计）。
+int vfs64_journal_info64(uint32_t* start_blk, uint32_t* blocks, uint32_t* commits, uint32_t* txid);
 
 // ==================== ★ v0.9.28：只读快照（**全量克隆，不是 COW**）====================
 // 快照表 = 1 块：头 {u32 magic "SNP1"; u32 max=8; u32 next_id; u32 used}
