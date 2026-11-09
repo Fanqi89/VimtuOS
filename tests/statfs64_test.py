@@ -42,8 +42,8 @@ QEMU_CANDIDATES = [
     r"C:\Program Files (x86)\qemu\qemu-system-x86_64.exe",
     "qemu-system-x86_64",
 ]
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343
 SECTOR = 512
 INODE_BYTES = 128
 

@@ -65,7 +65,7 @@ GEN = _load("jpeg_make_testset", os.path.join(ROOT, "tools", "jpeg_make_testset.
 
 SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "jpeg64_test.img")
-TARGET_SECTORS = 32768
+TARGET_SECTORS = 57343
 IGNORE = ["PANIC", "TRIPLE FAULT", "FAILED mask=", "selftest FAIL"]
 
 # ---- 对照阈值（口径见文件头）----

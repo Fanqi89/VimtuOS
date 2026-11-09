@@ -474,12 +474,12 @@ def main():
         log2 = fst.slog(s2)
     finally:
         fst.kill(proc)
-    # ★ v0.9.28：断言原来要求**精确子串** `[PART] 格式化 OK drive=1 index=2 start=8009`，
-    #   而内核打点后来变成 `[PART] 格式化 OK drive=1 table=mbr index=2 start=8009 sectors=155798 fs=VimtuFS2`
+    # ★ v0.9.28：断言原来要求**精确子串** `[PART] 格式化 OK drive=1 index=2 start=32584`，
+    #   而内核打点后来变成 `[PART] 格式化 OK drive=1 table=mbr index=2 start=32584 sectors=155798 fs=VimtuFS2`
     #   （中间插了 table=），子串匹配永远不中 —— 于是"格式化明明成功"也被判红。
     #   拆成三个子串判（比原来更严：还要求 fs=VimtuFS2）。
-    check("格式化主分区 P2（[PART] 格式化 OK drive=1 … index=2 start=8009 … fs=VimtuFS2）",
-          "[PART] 格式化 OK drive=1" in log2 and "index=2 start=8009" in log2
+    check("格式化主分区 P2（[PART] 格式化 OK drive=1 … index=2 start=32584 … fs=VimtuFS2）",
+          "[PART] 格式化 OK drive=1" in log2 and "index=2 start=32584" in log2
           and "fs=VimtuFS2" in log2)
     mf = fst.last_match(r"\[VFS64\] format ok blocks=(\d+) version=(\d+) inode=(\d+) root=(\d+)", log2)
     check("格式化产出 v5（version=5 inode=128；★ v0.9.28 起新格式化 = v5）",

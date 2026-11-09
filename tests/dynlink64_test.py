@@ -84,10 +84,10 @@ SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "dynlink64_test.img")
 
 SECTOR = 512
-PART_BOOT_LBA = 9
-PART_BOOT_SECS = 8000
-PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS     # 8009（与 kernel/part64.h 一致）
-TARGET_SECTORS = 32768                             # 16MB
+PART_BOOT_LBA = 65
+PART_BOOT_SECS = 32519
+PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS     # 32584（与 kernel/part64.h 一致）
+TARGET_SECTORS = 57343                             # 28MB（= 原 16MB + 主分区起点后移的 24,519）
 
 # 用户窗口常量（kernel/usermode64.h 的唯一定义点；测试侧只用来判"落在窗口里"）
 CODE_VA = 0x100000000

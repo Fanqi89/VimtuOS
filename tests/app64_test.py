@@ -4,7 +4,7 @@
 
 做什么：
   1) 造一块"已装好系统、主分区已格式化"的 16MB 测试盘（= build64/system.img 的字节
-     + 标准 MBR 分区表 + 在 LBA 8009 上用 Python 复刻 kernel/vfs64.cpp 的空 VimtuFS2 卷；
+     + 标准 MBR 分区表 + 在 LBA 32584 上用 Python 复刻 kernel/vfs64.cpp 的空 VimtuFS2 卷；
      这是纯测试夹具，等价于安装向导里"格式化主分区"后的盘，不依赖交互式安装）；
   2) 无头启动它两遍，读串口日志断言：
      第一遍：内核挂载 VimtuFS2 -> [APP64] 自检 -> 把内嵌 hello.vap 装成 /hello.vap
@@ -54,10 +54,10 @@ SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "app64_test.img")
 
 SECTOR = 512
-PART_BOOT_LBA = 9
-PART_BOOT_SECS = 8000
-PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS     # 8009（与 kernel/part64.h 一致）
-TARGET_SECTORS = 32768                              # 16MB
+PART_BOOT_LBA = 65
+PART_BOOT_SECS = 32519
+PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS     # 32584（与 kernel/part64.h 一致）
+TARGET_SECTORS = 57343                              # 28MB（= 原 16MB + 主分区起点后移的 24,519）
 
 # 第一遍启动必须出现（顺序即输出顺序）
 MUST = [
@@ -121,9 +121,9 @@ def _crc32(b):
 # 测试夹具：一块"已装好系统 + 主分区已格式化"的盘
 #   * 0..8072 扇区 = build64/system.img 原样（boot + loader + 系统内核 + store 保留区）
 #   * LBA0 的分区表按 kernel/part64.cpp 的 build_standard_table 写：
-#       P1 type 0xEF 活动 start=9  sectors=8000
-#       P2 type 0x07       start=8009 sectors=盘尾
-#   * LBA 8009 起用 Python 复刻 kernel/vfs64.cpp 的 vfs64_format（空卷：超级块 + 位图 +
+#       P1 type 0xEF 活动 start=65  sectors=32519
+#       P2 type 0x07       start=32584 sectors=盘尾
+#   * LBA 32584 起用 Python 复刻 kernel/vfs64.cpp 的 vfs64_format（空卷：超级块 + 位图 +
 #     全零 inode 区 + 根目录 inode；CRC32 = zlib 口径）
 # ---------------------------------------------------------------------------
 def _vimtufs2_format(buf, start_lba, total_sectors):

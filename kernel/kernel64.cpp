@@ -106,6 +106,9 @@ uint32_t sig64_suppressed64();          // 打点预算节流统计（收尾打�
 #include "console64.h"   // ★ 批次 N：开机滚屏引导控制台（启动日志环形缓冲 + 回放 + dmesg）
 #include "rust64.h"      // ★ 项目路线（C + C++ + Rust）：Rust 模块 gui_rs 的 C 链接声明
                          //   （设计 Token + 主题配色；只有**系统内核**链接它，见 build64.sh）
+#ifndef VIMTU_INSTALLER_MEDIA
+#include "r3drv64.h"     // ★ v0.9.33：ring3 驱动框架（安装介质内核不带 proc64，整段不编）
+#endif
 #include "hwui64.h"      // ★ item 5a：屏幕硬件检查报告（**两份内核都编**：安装介质与系统内核共用）
 // ---- 平台层（64 位）：PIC/PIT/IDT/TSS/RTC，实现在 kernel/x86_64.cpp ----
 #include "x86_64.h"
@@ -746,9 +749,21 @@ static int sig64_install64(const char* path) {
 //   把 handler 装好再打，否则默认动作会把它打死（那是另一条语义）。
 // 进程"是否已退出"怎么判：proc64_sig_state_of64(pid) 在 EXITED/FREE 时返回 nullptr —— 这就是
 //   信号模块给的可见性（内核这侧不需要动进程表内部）。
+// ★ v0.9.33：**系统盘**的解析结果（drive + 主分区起始 LBA）。
+//   为什么要有它：旧代码在好几处写死 `drive 0`，而 AHCI-only / NVMe-only 的机器上
+//   系统盘在 8/16 号槽，drive 0 上是空的 —— 那些路径会全部失败（详见 os_boot_path 里的挂载逻辑）。
+//   由 os_boot_path 在挂载成功后填好；-1 = 还没解析出来。
+static int      g_sys_drive64 = -1;
+static uint32_t g_sys_lba64   = 0;
+// 调这一层的通用入口：解析过就用解析结果，没解析过就退老行为（drive 0 + 常量 LBA）。
+static int      sys_drive_or0_64(void) { return (g_sys_drive64 >= 0) ? g_sys_drive64 : 0; }
+static uint32_t sys_lba_or_main_64(int drive) {
+    return (g_sys_drive64 >= 0 && g_sys_lba64) ? g_sys_lba64 : app64_main_part_lba64(drive);
+}
+
 static void sig64_demo64(const char* path) {
     if (!user64_available64()) return;
-    if (vfs64_mount_system64(0, app64_main_part_lba64(0)) != 0) {
+    if (vfs64_mount_system64(sys_drive_or0_64(), sys_lba_or_main_64(sys_drive_or0_64())) != 0) {
         dbg64_str("[SIG64] demo skipped (no system volume)\n");
         return;
     }
@@ -870,7 +885,7 @@ static void edit64_one64(const char* bin, const char* file, const char* tag, uin
 }
 static void edit64_demo64(const char* bin) {
     if (!user64_available64()) return;
-    if (vfs64_mount_system64(0, app64_main_part_lba64(0)) != 0) {
+    if (vfs64_mount_system64(sys_drive_or0_64(), sys_lba_or_main_64(sys_drive_or0_64())) != 0) {
         dbg64_str("[EDIT64] demo skipped (no system volume)\n");
         return;
     }
@@ -1115,9 +1130,9 @@ display64_init64();
     // 挂载参数 (drive, LBA) 的依据：
     //   drive = 0：primary master，与 store64_init64(0)/task 路径用的是同一块系统盘；
     //   LBA   = kernel/part64.h 定义的主分区起始 —— PART_MAIN_LBA = PART_BOOT_LBA(9) + PART_BOOT_SECS(8000)
-    //           = 8009。安装引擎 part_create_standard()/part_install_step() 写进目标盘 MBR 的第 2 个
+    //           = 32528。安装引擎 part_create_standard()/part_install_step() 写进目标盘 MBR 的第 2 个
     //           分区项（type 0x07）起点就是这个值 —— 也就是说 kernel/memlayout64.h 的 store 裸盘
-    //           保留区（ML64_STORE_LBA = 8009）与主分区起点**完全重叠**。所以下面的 store 初始化
+    //           保留区（ML64_STORE_LBA = 32528）与主分区起点**完全重叠**。所以下面的 store 初始化
     //           必须排在挂载之后：它先探测这个卷，优先把槽放进文件系统（/store.a、/store.b），
     //           没有卷才降级到裸盘槽区并打 WARN（见 kernel/store64.cpp 的载体说明）。
     //   app64_main_part_lba64() 先按同一条规则读 MBR 找 0x07 项（真盘换了布局也能跟上），
@@ -1173,12 +1188,52 @@ display64_init64();
             }
         }
 
+    // ★ v0.9.33（**真缺陷修复**）：系统卷不再写死 drive 0。
+    //   旧代码是 `vfs64_mount_system64(0, app64_main_part_lba64(0))`，而这个文件里早就写着
+    //   "实测 q35（AHCI 控制器）上第一次 vfs64_mount_system64(drive 0) 会失败（那块盘不在 PATA 上）"
+    //   —— 也就是说**知道有这个问题，但没修**：AHCI-only / NVMe-only 的机器上，系统盘在 8/16 号槽，
+    //   drive 0 上什么都没有，于是挂载失败 -> 盘符表/目录树/应用安装/桌面上的卷全都被跳过。
+    //   实测证据（iconboot64_test ④：装到 AHCI 盘后只挂该盘）：串口 `[VFS64] mount_system FAILED (mount)`，
+    //   而同一块盘用宿主侧解析器读出来是**完好的卷**（total=24,759、499 个文件）—— 卷没坏，是找错了盘。
+    //   现在的顺序（既修 bug 又不改变老行为/不变慢）：
+    //     ① drive 0（PATA 主盘）—— 既有夹具与日常盘都走这条，行为与日志一字不变；
+    //     ② 仍失败则**遍历所有存在的盘**（PATA 0..3 / AHCI 8.. / NVMe 16..），
+    //        按**每块盘自己的** MBR 0x07 项起始 LBA 试挂，并在成功时多打一段
+    //        ` ... scanned=1`，让"换了控制器"这件事在日志里看得见（不静默降级）。
     {
         const int app_drive = 0;
         const uint32_t app_lba = app64_main_part_lba64(app_drive);
         // ★ 多卷：系统卷挂进 **0 号槽**并登记成"系统卷槽"（store64/config64/update64 固定写卷的依据），
         //   同时激活它 —— 之后 drive64_scan64 会给其余可浏览卷分配 1..3 号槽，D:/E: 就能真点进去。
-        if (vfs64_mount_system64(app_drive, app_lba) == 0) {
+        int sys_drive = app_drive;
+        uint32_t sys_lba = app_lba;
+        bool mounted = (vfs64_mount_system64(app_drive, app_lba) == 0);
+        if (!mounted) {
+            // ---- 兜底：按盘遍历（AHCI/NVMe-only 的机器靠这条活）----
+            const int slots = ata64_drive_count64();
+            for (int s = 0; s < slots && !mounted; s++) {
+                const int d = ata64_slot_to_drive64(s);
+                if (d <= 0) continue;                       // 0 号已经试过了
+                const uint32_t lba = app64_main_part_lba64(d);
+                if (lba == 0) continue;
+                if (vfs64_mount_system64(d, lba) == 0) {
+                    sys_drive = d;
+                    sys_lba   = lba;
+                    mounted   = true;
+                    dbg64_line_begin64();
+                    dbg64_str("[VFS64] mount_system drive=");
+                    dbg64_dec((uint64_t)d);
+                    dbg64_str(" scanned=1 (drive 0 had no VimtuFS2 volume; this disk is not on PATA)");
+                    dbg64_nl();
+                    dbg64_line_end64();
+                }
+            }
+        }
+        if (mounted) {
+            g_sys_drive64 = sys_drive;
+            g_sys_lba64   = sys_lba;
+            // ---- 盘符/驱动器枚举 + 目录树打印（"此电脑"的数据来源；只读，不写盘）----
+            // 位置讲究：必须在**挂载成功之后** —— C: 的判定依据就是"当前真正挂载的那个卷"
             // ---- 盘符/驱动器枚举 + 目录树打印（"此电脑"的数据来源；只读，不写盘）----
             // 位置讲究：必须在**挂载成功之后** —— C: 的判定依据就是"当前真正挂载的那个卷"
             // （见 kernel/drive64.h 的盘符规则）；再早调用只能退化成"按 MBR 0x07 猜"。
@@ -1198,9 +1253,9 @@ display64_init64();
             (void)vfs64_tree_dump64("/", 64, 4);
             (void)explorer64_selftest64();                       // 文件管理器纯逻辑自检（单位换算/路径/滚动/历史栈）
             (void)app64_selftest64();
-            (void)app64_install_builtin64(app_drive, app_lba);   // 幂等：已装过则 skipped (exists)
+(void)app64_install_builtin64(sys_drive, sys_lba);   // 幂等：已装过则 skipped (exists)
             (void)elf64_selftest64();                            // 合法映像/坏样本自检（坏样本带 selftest 前缀）
-            (void)elf64_install_builtin64(app_drive, app_lba);   // 幂等：已装过则 skipped (exists)
+(void)elf64_install_builtin64(sys_drive, sys_lba);   // 幂等：已装过则 skipped (exists)
             // ---- ring3 相关的一切都必须在"用户窗口可用"时才跑 ----
             // UEFI 路径下用户窗口建不起来（固件页表只读），VAP64/ELF64 启动器与多进程演示
             // 都会在第一次映射用户页时失败；所以这里统一跳过并留一行说明（os_boot_path 上面
@@ -1218,7 +1273,7 @@ display64_init64();
                 //      内核这侧只做有界等待 + 收尾。UEFI（固件页表）下会打一行诚实跳过。
                 proc64_init64();
                 (void)proc64_selftest64();
-                (void)proc64_install_builtin64(app_drive, app_lba);
+(void)proc64_install_builtin64(sys_drive, sys_lba);
                 (void)proc64_demo64("/proc64.elf");
                 // ---- 批次 D：ring3 pipe 演示（fork 后父子各持一端通信）----
                 // 为什么单开一个程序：proc64_test 断言了上面那次 fork 的 pages=8，往 /proc64.elf 里
@@ -1241,7 +1296,7 @@ display64_init64();
                     }
                     dbg64_line_end64();
                 }
-                (void)proc64_evshm_install64(app_drive, app_lba);   // 幂等：把 /evshm.elf 装进系统卷
+(void)proc64_evshm_install64(sys_drive, sys_lba);   // 幂等：把 /evshm.elf 装进系统卷
                 // ★ v0.9.2：这个演示会往屏上画一个矩形再 fb_flip（ipc64/userlib64 的像素证据）-> opt-in
                 if (boot_probe64()) {
                     (void)proc64_evshm_demo64("/evshm.elf");        // shm_create/map + fb_flip + input_poll
@@ -1301,6 +1356,11 @@ display64_init64();
     //   放在这里而不是 GPU 枚举里：探针开关 /etc/gpu3d_probe 在卷上，得等 VFS 挂好；
     //   而且桌面已经起来，ENABLE 之后立刻能看出"显示有没有被弄坏"。
     (void)vmware64_svga_stage1_64();
+    // ★ v0.9.34：呈现通路（脏矩形 SVGA_CMD_UPDATE）。**默认就配**（只配 FIFO，不写 ENABLE）：
+    //   实测 VMware 在 RegisterMode 下靠影子屏呈现，不发 UPDATE 的话客人画什么屏上都没有
+    //   （VNC 取证：整屏 99.8% 纯黑，把 LFB 改成不缓存之后仍然 99% —— 说明不是缓存问题）。
+    //   非 VMware 机器上它直接返回 0 并打一行 skipped，行为一字不变。
+    (void)vmware64_present_init64();
 
             } else {
                 proc64_init64();                                 // 仍然打点：mode=shared（如实）
@@ -1331,11 +1391,11 @@ display64_init64();
     // ---- 设置持久化 store：**必须放在 VFS 挂载之后** ----
     // 槽优先放在文件系统里（VimtuFS2 的 /store.a、/store.b，各 16KB = 一个槽）；
     // store64_init64 先探"卷挂没挂"（vfs64_stat("/")），挂上了就走 VFS 载体。放在挂载之前的话
-    // 它探不到卷，只能降级到裸盘槽区 LBA 8009..8072（ML64_STORE_LBA，正好是主分区起点，
+    // 它探不到卷，只能降级到裸盘槽区 LBA 32528..32591（ML64_STORE_LBA，正好是主分区起点，
     // 会把 VimtuFS2 超级块/inode 覆盖掉）——那是本模块只留给"无卷"的兜底路径。
     // 这里只 init + 自检 + dump —— **不要 flush**：flush 会写盘且不可重入，启动早期不做。
     // 0 = primary master，与上面 app64/vfs64 挂载用的是同一块系统盘。
-    store64_init64(0);
+    store64_init64(sys_drive_or0_64());
     {
         const int sst = store64_selftest64();
         if (sst) {
@@ -1470,6 +1530,20 @@ display64_init64();
     //   为什么：它之前只在安装介质那条启动路径调（kernel64.cpp:1203 的分支），
     //   于是"装好的盘"上 poll/select 的 fd 就绪判断没有任何运行时证据。
     (void)fd64_selftest64();
+#ifndef VIMTU_INSTALLER_MEDIA
+    // ==================== ★ v0.9.33：ring3 驱动框架（混合驱动架构的第一次真正落地）====================
+    // 顺序要点：
+    //   1) r3drv64_init64()：分配"拷贝对照"暂存页 + 读 /etc/r3drv.conf + 打 [R3DRV] init；
+    //      **必须在系统卷挂载之后**（配置文件在卷里），也必须在 store/config 之后（口径一致）。
+    //   2) r3drv64_autostart64()：按"分区上的文件系统类型"找目标卷（这里找 ext4），
+    //      把 /usr/bin/ext4svc 作为**独立 ring3 进程**拉起；没有目标卷就只打一行 skipped。
+    //      —— 这一点很关键：**绝大多数回归夹具里没有 ext4 卷**，所以它们的行为一个字节不变。
+    //   服务注册/心跳/零拷贝都在调度器上线之后异步发生；监督器在 kheart 线程里每秒推进一次
+    //   （见 kernel/task64.cpp 的 kheart_entry），所以本函数**不等待**服务就绪。
+    r3drv64_init64();
+    (void)r3drv64_autostart64();
+    con64_live_pump64();
+#endif  // VIMTU_INSTALLER_MEDIA
     // ---- UEFI 运行期 CR3 实验（编译期开关，默认关；见 docs/UEFI地址空间实验报告.md）----
     // 位置：gui64_run 之前建一个**延迟 5 秒**的内核任务 —— 它跑的时候 [GUI64] ready 已经打出来了，
     //   所以即使 VMware EFI 下 mov cr3 真的触发复位，"桌面起来了"这条证据也已经留在串口里。

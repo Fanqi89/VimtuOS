@@ -56,8 +56,8 @@ TCC_STAGE = os.path.join(BUILD, "tcc_stage")
 HELLO = os.path.join(BUILD, "tcc_demo_hello")
 FIXTURE = os.path.join(BUILD, "tcc_test.img")
 
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343
 SECTOR = 512
 
 MMAP_VA = 0x100000000 + 0x90000          # USER64_MMAP_VA64：tcc 的链接/装载地址
@@ -148,7 +148,7 @@ def elf_phdrs(path):
 # 为什么要这一步（A4-2b-2）：用户态产生的 .o / 可执行文件写在 VimtuFS2 卷里，而串口只剩
 # 可打印字符（内核控制台会滤掉非打印字节）—— 光靠 `cat` 拿不到 e_type/e_machine/e_shnum。
 # 夹具盘是本脚本自己造的（prepare_fixture，strict=True），卷格式已知：盘 = system.img +
-# MBR + 主分区卷（LBA 8009..TARGET_SECTORS）。直接按 tools/tcc_pack_win.py 的读取器解析。
+# MBR + 主分区卷（LBA 32584..TARGET_SECTORS）。直接按 tools/tcc_pack_win.py 的读取器解析。
 def load_packmod():
     import importlib.util
     path = os.path.join(ROOT, "tools", "tcc_pack_win.py")

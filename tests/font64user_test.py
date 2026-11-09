@@ -74,8 +74,8 @@ KERNEL_OS = os.path.join(ROOT, "build64", "kernel64_os.bin")
 FONTDEMO_ELF = os.path.join(ROOT, "build64", "fontdemo.elf")
 WM_ELF = os.path.join(ROOT, "build64", "wm.elf")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "font64user_test.img")
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768                   # 16 MB（与 wm64/wl64 同一夹具口径）
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343                   # 28MB（= 原 16MB + 主分区起点后移的 24,519）（与 wm64/wl64 同一夹具口径）
 
 # 卷内路径 -> 宿主构建产物（与 tools/fontdemo_pack_win.py 的 FONT_MAP 一致）
 FONT_MAP = (

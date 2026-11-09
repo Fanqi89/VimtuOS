@@ -67,9 +67,9 @@ GUID_BASIC = bytes.fromhex("a2a0d0ebe5b9334487c068b6b72699c7")
 GUID_ESP = bytes.fromhex("28732ac11ff8d211ba4b00a0c93ec93b")
 DISK_GUID = bytes.fromhex("112233445566778899aabbccddeeff00")
 
-PART_BOOT_LBA = 9
-PART_BOOT_SECS = 8000
-PART_MAIN_LBA = 8009
+PART_BOOT_LBA = 65
+PART_BOOT_SECS = 32519
+PART_MAIN_LBA = 32584
 PART_ESP_SECTORS = 98304
 PART_GPT_BACKUP_SECTORS = 33
 
@@ -183,7 +183,7 @@ def build_own_disk(path):
         mbr[511] = 0xAA
         f.seek(0)
         f.write(mbr)
-        # LBA1..8 = loader（不是 GPT 头）
+        # LBA1..64 = loader（不是 GPT 头）
         f.seek(1 * SECT)
         f.write(b"\xAA" * (8 * SECT))
         # 盘尾备份 GPT
@@ -401,13 +401,13 @@ def main():
         if "[PART]" in l or "待确认" in l:
             print("   | " + l.strip()[:160])
 
-    check("删除主分区（table=mbr index=2 start=8009 wiped=1）",
+    check("删除主分区（table=mbr index=2 start=32584 wiped=1）",
           "[PART] 删除分区 OK drive=1 table=mbr index=2 start=%d sectors=%d wiped=1"
           % (PART_MAIN_LBA, main_secs) in log2)
-    check("盘尾 GPT 里同段的那一项也被清掉（start=8009）",
-          "[PART] GPT 删除项 index=0 start=8009" in log2)
-    check("格式化引导分区（table=mbr index=1 start=9 fs=blank）",
-          "[PART] 格式化 OK drive=1 table=mbr index=1 start=9 sectors=8000 fs=blank" in log2)
+    check("盘尾 GPT 里同段的那一项也被清掉（start=32584）",
+          "[PART] GPT 删除项 index=0 start=32584" in log2)
+    check("格式化引导分区（table=mbr index=1 start=65 fs=blank）",
+          "[PART] 格式化 OK drive=1 table=mbr index=1 start=65 sectors=32519 fs=blank" in log2)
 
     mbr2 = at(raw2, 0)
     e_p1 = mbr2[446:462]

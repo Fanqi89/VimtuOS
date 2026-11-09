@@ -49,8 +49,8 @@ BB_DRV = os.path.join(BUILD, "busybox")
 BB_WRAP = os.path.join(BUILD, "bbwrap")
 KERNEL_OS = os.path.join(BUILD, "kernel64_os.bin")
 
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343
 SECTOR = 512
 
 TYPED_NAMES = {

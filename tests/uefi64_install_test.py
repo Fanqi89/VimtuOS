@@ -15,8 +15,8 @@
   1) 串口有 "U:" 前缀的 UEFI 引导标记（证明走的是 UEFI 而不是 BIOS 桩）
   2) **没有** BIOS 引导桩的 "I:boot dl=" 标记（证明没走 MBR 那条路）
   3) 安装程序读到介质描述符 kind=2，走完向导：新建分区 → 安装 100% → 自动重启
-  4) 目标盘字节级：MBR 55AA + P1(0xEF,活动,9+8000) + P2(0x07,8009..尾)
-     LBA1..8 = loader64.bin、LBA9.. = kernel64_os.bin 逐字节一致
+  4) 目标盘字节级：MBR 55AA + P1(0xEF,活动,65+32519) + P2(0x07,32584..尾)
+     LBA1..64 = loader64.bin、LBA65.. = kernel64_os.bin 逐字节一致
 用法：python tests/uefi64_install_test.py
 """
 import argparse
@@ -43,7 +43,7 @@ SERIAL = os.path.join(TESTDIR, "serial-install.log")
 TARGET = os.path.join(TESTDIR, "target.img")
 VMRUN = r"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe"
 KEY_TCP_PORT = 4557
-TARGET_SECTORS = 32768
+TARGET_SECTORS = 57343
 
 
 def vmrun(*args, timeout=240):
@@ -210,16 +210,16 @@ def main():
     p1, p2 = check_mbr(TARGET)
     check("MBR 55AA 且分区1 存在", p1 is not None, "%s" % (p1,))
     if p1:
-        check("P1 = 引导分区 0xEF 活动，9 + 8000", p1["type"] == 0xEF and p1["boot"]
-              and p1["start"] == 9 and p1["sectors"] == 8000, "%s" % (p1,))
-    check("P2 = 主分区 0x07，8009..盘尾", p2 is not None and p2["type"] == 0x07
-          and p2["start"] == 8009 and p2["sectors"] == TARGET_SECTORS - 8009, "%s" % (p2,))
+        check("P1 = 引导分区 0xEF 活动，65 + 32519", p1["type"] == 0xEF and p1["boot"]
+              and p1["start"] == 65 and p1["sectors"] == 32519, "%s" % (p1,))
+    check("P2 = 主分区 0x07，32584..盘尾", p2 is not None and p2["type"] == 0x07
+          and p2["start"] == 32584 and p2["sectors"] == TARGET_SECTORS - 32584, "%s" % (p2,))
     loader_ref = open(os.path.join(ROOT, "build64", "loader64.bin"), "rb").read()
     os_ref = open(os.path.join(ROOT, "build64", "kernel64_os.bin"), "rb").read()
-    check("LBA1..8 = loader64.bin 逐字节一致",
+    check("LBA1..64 = loader64.bin 逐字节一致",
           read_at(TARGET, 1, len(loader_ref)) == loader_ref, "%d 字节" % len(loader_ref))
-    check("LBA9.. = kernel64_os.bin 逐字节一致",
-          read_at(TARGET, 9, len(os_ref)) == os_ref, "%d 字节" % len(os_ref))
+    check("LBA65.. = kernel64_os.bin 逐字节一致",
+          read_at(TARGET, 65, len(os_ref)) == os_ref, "%d 字节" % len(os_ref))
 
     print("=== UEFI RESULT: %s ===" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1

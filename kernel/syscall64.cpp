@@ -141,6 +141,9 @@
 #include "input64.h"        // ★ A5 前置：自有 ABI 12 的落点 ev64_poll64（事件队列/焦点/背压）
 #include "fs64.h"           // ★ P4：统一卷分派（stat/access/chmod/chown 按当前卷 + 权限判定）
 #include "drive64.h"        // ★ v0.9.29：合成 /proc/mounts 要盘符/分区号（设备名 /dev/sda2）
+#ifndef VIMTU_INSTALLER_MEDIA
+#include "r3drv64.h"        // ★ v0.9.33：ring3 驱动框架（安装介质内核不带 proc64，整段不编）
+#endif
 
 // ---- 批次 C：proc64（进程/地址空间）的**弱引用** ----
 // proc64.cpp 只在系统内核里链接（安装介质内核没有进程/地址空间、没有 task64/elf64）。
@@ -257,6 +260,9 @@ static const int64_t  LX64_ENOTEMPTY = 39;
 static const int64_t  LX64_EIO   = 5;    // 写盘失败 / 旧卷没有 mtime 字段
 static const int64_t  LX64_EROFS = 30;   // 只读卷（fs64 在 FAT 卷上返回 -FS64_EROFS）
 
+// ★ v0.9.33：ring3 驱动框架用的错误码（Linux 同号）
+static const int64_t  LX64_ENODEV = 19;  // 没有这个驱动槽 / 没有这个共享对象
+
 // 这些 errno 目前没有调用点，但它们是**对外承诺的错误码表**（文档/测试按这个口径读）；
 // 这里用 static_assert 钉住取值 —— 顺带消掉 -Wextra 的"未被引用"告警（本文件要求零告警）。
 static_assert(LX64_ESRCH == 3 && LX64_ECHILD == 10 && LX64_EAGAIN == 11 && LX64_EMFILE == 24 &&
@@ -310,6 +316,14 @@ static void syscall64_log64(uint64_t nr, uint64_t rdi, uint64_t rsi, uint64_t rd
 }
 
 // syscall 指令路径的打点：格式与上面不同（多一个 insn 标记），自动验收靠它区分两条路径。
+
+// ★ v0.9.34：私有号 1029..1035（ring3 驱动框架的 register/beat/kick/dma/copy/status/route）
+//   是**服务每拍都要调**的控制面调用。逐条打 trace 会把串口撑爆（实测 40 ms 心跳 ->
+//   约 25 行/秒、单次运行 1 MB 串口）；它们是框架内部心跳，不是"用户态看见了内核什么"，
+//   所以**不进 trace**。Linux 真号与本框架之外的号一律照旧逐条打印。
+static bool syscall64_trace_skip64(uint64_t nr) {
+    return (nr >= 1029ull && nr <= 1035ull);
+}
 static void syscall64_log_insn64(uint64_t nr, uint64_t rdi, uint64_t rsi, uint64_t rdx, int64_t ret) {
     dbg64_line_begin64();
     dbg64_str("[SYSCALL] insn nr=");
@@ -897,7 +911,19 @@ static int64_t lx64_proc_open64(const char* path, int flags) {
         char t[LX64_PROC_MAX];
         if (vfs64_quota_dump64(t, (uint32_t)sizeof(t)) < 0) t[0] = 0;
         lx64_proc_fill64(f, t);
-    } else {
+    }
+#ifndef VIMTU_INSTALLER_MEDIA
+    else if (lx64_proc_streq64(f->name, "vimtu/drivers")) {
+        // ★ v0.9.33：ring3 驱动框架的状态表（只读合成文件）。
+        //   为什么放 /proc 而不是加 syscall：ring3 的看门狗进程（/usr/bin/drvwatch）与
+        //   任何人用 `cat /proc/vimtu/drivers` 都要能看到"服务在不在、重启过几次、
+        //   零拷贝搬了多少字节" —— 一条 open/read 就够，零 ABI 成本。
+        char t[LX64_PROC_MAX];
+        if (r3drv64_render64(t, (uint32_t)sizeof(t)) < 0) t[0] = 0;
+        lx64_proc_fill64(f, t);
+    }
+#endif
+    else {
         f->used = 0;
         // ★ v0.9.29：**未知 /proc 条目交回盘上的真实 VFS**（原来一律 -ENOENT）。实测缺陷：盘上
         //   的 /proc/mounts 被这层合成树挡住，busybox df 读不到挂载表就不再调 statfs(137)。
@@ -3319,6 +3345,40 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 1026: return lx64_vmtu_quota_set64(nr, a1, a2);              // ★ v0.9.30：私有号 设配额
     case 1027: return lx64_vmtu_quota_get64(nr, a1, a2, a3);          // ★ v0.9.30：私有号 查配额
     case 1028: return lx64_vmtu_feat_enable64(nr, a1);               // ★ v0.9.30：私有号 开特性（root）
+#ifndef VIMTU_INSTALLER_MEDIA
+    // ==================== ★ v0.9.33：ring3 驱动框架（私有号，只许追加）====================
+    // 为什么在 syscall 层做字符串/指针校验、而不是塞进 r3drv64.cpp：
+    //   `lx64_user_str64` / `user64_range_ok64` / `lx64_copy_to_user64` 这套用户指针校验
+    //   全都只在本文件里（static）。框架层拿到的是**已校验的内核值**，它不碰用户指针 ——
+    //   这样"某个驱动占用了错误指针"永远只会在这一层被拒，不会在机制层里到处补检查。
+    case R3DRV_NR_REGISTER: {                       // (name, proto, disk, shm_id, bytes)
+        char nm[24];
+        if (lx64_user_str64(a1, nm, (uint32_t)sizeof(nm)) != 0) {
+            syscall64_deny64(nr, a1);
+            return -LX64_EFAULT;
+        }
+        const int64_t rc = r3drv64_register64(nm, (uint32_t)a2, (uint32_t)a3, (int32_t)a4, a5);
+        return (rc >= 0) ? rc : -((rc == -1) ? LX64_EPERM : (rc == -3) ? LX64_EINVAL
+                                  : (rc == -13) ? LX64_EACCES : LX64_ENOMEM);
+    }
+    case R3DRV_NR_BEAT:   return r3drv64_beat64();               // 心跳（监督器据此判活）
+    case R3DRV_NR_KICK:   return r3drv64_kick64((int32_t)a1);    // 门铃：消费共享环
+    case R3DRV_NR_DMA:    return r3drv64_dma_read64((int32_t)a1, a2, a3, (uint32_t)a4);   // 单发零拷贝
+    case R3DRV_NR_COPY:   return r3drv64_copy_read64((int32_t)a1, a2, a3, (uint32_t)a4);  // 单发对照
+    case R3DRV_NR_STATUS: {                         // (slot, out R3drvInfo, len)
+        if (!user64_range_ok64(a2, a3) || a3 < (uint64_t)sizeof(R3drvInfo)) {
+            syscall64_deny64(nr, a2);
+            return -LX64_EINVAL;
+        }
+        R3drvInfo info;
+        const int ok = r3drv64_info64((uint32_t)a1, &info);
+        if (!ok) return -LX64_ENODEV;
+        lx64_copy_to_user64(a2, &info, (uint64_t)sizeof(info));
+        return 0;
+    }
+    case R3DRV_NR_ROUTE:                            // (disk, lba) -> R3DRV_ROUTE_*
+        return (int64_t)r3drv64_route64((uint32_t)a1, (uint32_t)a2, nullptr);
+#endif  // VIMTU_INSTALLER_MEDIA
     default:
         break;
     }
@@ -3344,7 +3404,7 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
             ret = 0;                                       // 不在 ring3：当普通调用返回 0
         } else {
             ret = syscall64_linux64(r);
-            syscall64_log_insn64(nr, a1, a2, a3, ret);
+            if (!syscall64_trace_skip64(nr)) syscall64_log_insn64(nr, a1, a2, a3, ret);
         }
         // ---- 出口前自检：sysret 只能回"用户窗口内的地址 + CS=0x2B/SS=0x23" ----
         // 帧一旦被谁改坏（本模块踩过：syscall 帧与中断帧共用栈顶导致 rip/cs 槽被覆盖），

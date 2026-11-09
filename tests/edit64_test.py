@@ -60,7 +60,7 @@ EDIT_BIN = os.path.join(ROOT, "build64", "edit")
 KERNEL_OS = os.path.join(ROOT, "build64", "kernel64_os.bin")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "edit64_test.img")
 SECTOR = 512
-PART_MAIN_LBA = 8009                      # = kernel/part64.h 的主分区起点
+PART_MAIN_LBA = 32584                      # = kernel/part64.h 的主分区起点
 TEST_PATH = "/etc/edit64_test.txt"
 BIG_PATH = "/tcc/demo/edit1m.txt"
 BIG_BYTES = 1 << 20

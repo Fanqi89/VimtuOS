@@ -52,9 +52,9 @@ OS_KERNEL = os.path.join(BUILD, "kernel64_os.bin")
 LOADER = os.path.join(BUILD, "loader64.bin")
 
 SECTOR = 512
-TARGET_SECTORS = 131072          # 64MB（与 esp_install_test 同口径：要放得下 4MB 引导区 + 主分区
+TARGET_SECTORS = 155647          # 64MB（与 esp_install_test 同口径：要放得下 15MiB 引导区 + 主分区
                                  #  + 48MB 真 FAT32 ESP + 盘尾备份 GPT）
-PART_BOOT_LBA, PART_BOOT_SECS = 9, 8000
+PART_BOOT_LBA, PART_BOOT_SECS = 65, 32519
 NVME_SERIAL = "deadbeef"
 FORBIDDEN = ["PANIC", "TRIPLE FAULT", "三重故障"]
 
@@ -302,14 +302,14 @@ def main():
     kern_ref = open(OS_KERNEL, "rb").read()
     check("目标盘大小 = %d 扇区" % TARGET_SECTORS, len(disk) == TARGET_SECTORS * SECTOR)
     check("MBR 签名 55AA", disk[510] == 0x55 and disk[511] == 0xAA)
-    check("P1 = 引导分区 0xEF 活动 9+8000",
+    check("P1 = 引导分区 0xEF 活动 65+32519",
           disk[446 + 4] == 0xEF and disk[446] == 0x80
           and int.from_bytes(disk[446 + 8:446 + 12], "little") == PART_BOOT_LBA
           and int.from_bytes(disk[446 + 12:446 + 16], "little") == PART_BOOT_SECS)
-    check("LBA 1..8 = loader64.bin（逐字节）",
+    check("LBA 1..64 = loader64.bin（逐字节）",
           disk[SECTOR:SECTOR + len(loader_ref)] == loader_ref)
-    check("LBA 9 起 = 系统内核（kernel64_os.bin 前缀逐字节）",
-          disk[9 * SECTOR:9 * SECTOR + len(kern_ref)] == kern_ref)
+    check("LBA 65 起 = 系统内核（kernel64_os.bin 前缀逐字节）",
+          disk[65 * SECTOR:65 * SECTOR + len(kern_ref)] == kern_ref)
 
     # ★ ESP 内容交叉验证（宿主侧独立 FAT32 解析器；这一档就是本次抓到 PRP 两页 bug 的那一档：
     #   之前 BOOTX64.EFI 只写对前 848 字节、后面全错，UEFI 直接 Load Error）。
@@ -340,13 +340,13 @@ def main():
     if k:
         data, size = fat.read_file(k)
         # ★ 自 P6 起内核区**尾部**（LBA 7497..8008）有外置图标包（build64.sh 把它写进 system.img
-        #   的内核区尾部），安装器写的 KERNEL64.BIN 是**内核区整块**（LBA 9..8008 = 4,096,000 B），
+        #   的内核区尾部），安装器写的 KERNEL64.BIN 是**内核区整块**（LBA 65..30784 = 4,096,000 B），
         #   不是"kernel64_os.bin + 补零"。逐字节比对用 build64/system.img 的同一区间当独立来源
         #   （大小必须等于内核区大小，不做弱判据）。
         with open(os.path.join(BUILD, "system.img"), "rb") as f:
             f.seek(PART_BOOT_LBA * SECTOR)
             kreg = f.read(PART_BOOT_SECS * SECTOR)
-        check("ESP 里 KERNEL64.BIN = 内核区整块（system.img LBA 9..8008 的 %d 字节，逐字节）"
+        check("ESP 里 KERNEL64.BIN = 内核区整块（system.img LBA 65..30784 的 %d 字节，逐字节）"
               % len(kreg),
               size == len(kreg) and data == kreg, "盘上 %d 字节" % size)
     else:

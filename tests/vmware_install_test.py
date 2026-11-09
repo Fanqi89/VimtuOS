@@ -7,8 +7,8 @@
   2) 启动安装 VM（BIOS 固件、IDE0:0=安装介质、IDE0:1=目标盘）
   3) 等向导就绪 -> 通过 \\\\.\\pipe\\v64keys 送按键：回车×4、n（新建）、回车（安装系统）
   4) 串口断言：[PART] 新建、[INSTALL] 开始/完成、[SETUP] 安装完成、[SETUP] 自动重启
-  5) 解析目标盘：MBR 55AA + P1(0xEF,活动,9+8000) + P2(0x07,8009..盘尾)、
-     LBA1..8 = loader64.bin、LBA9.. = kernel64_os.bin（逐字节）
+  5) 解析目标盘：MBR 55AA + P1(0xEF,活动,65+32519) + P2(0x07,32584..盘尾)、
+     LBA1..64 = loader64.bin、LBA65.. = kernel64_os.bin（逐字节）
   6) 单独启动目标盘：断言走 [OS] 路径（不是安装程序）
 """
 import argparse
@@ -44,7 +44,7 @@ sys.path.insert(0, HERE)
 import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.login.auto 默认 0）
 VNC_BOOT_PORT = 5904            # 与 vmware_make_vm.py 的 VNC_BOOT_PORT 一致（启动 VM 的 VNC）
 INS_KERNEL = os.path.join(ROOT, "build64", "kernel64.bin")
-TARGET_SECTORS = 32768
+TARGET_SECTORS = 57343
 
 
 def vmrun(*args, timeout=180):
@@ -223,21 +223,21 @@ def main():
     if p1:
         check("分区1 = 引导分区 0xEF 且活动", p1["type"] == 0xEF and p1["boot"],
               "type=0x%02X boot=%s" % (p1["type"], p1["boot"]))
-        check("分区1 = LBA 9 + 8000 扇区", p1["start"] == 9 and p1["sectors"] == 8000,
+        check("分区1 = LBA 65 + 32519 扇区", p1["start"] == 65 and p1["sectors"] == 32519,
               "start=%d sectors=%d" % (p1["start"], p1["sectors"]))
     check("分区2 = 主分区 0x07", p2 is not None and p2["type"] == 0x07, "%s" % (p2,))
     if p2:
-        check("分区2 起点 8009 覆盖到盘尾",
-              p2["start"] == 8009 and p2["sectors"] == TARGET_SECTORS - 8009,
+        check("分区2 起点 32584 覆盖到盘尾",
+              p2["start"] == 32584 and p2["sectors"] == TARGET_SECTORS - 32584,
               "start=%d sectors=%d" % (p2["start"], p2["sectors"]))
 
     loader_ref = open(LOADER, "rb").read()
     os_ref = open(OS_KERNEL, "rb").read()
     ins_ref = open(INS_KERNEL, "rb").read()
-    check("目标盘 LBA1..8 = loader64.bin（逐字节）",
+    check("目标盘 LBA1..64 = loader64.bin（逐字节）",
           read_at(TARGET, 1, len(loader_ref)) == loader_ref, "长度 %d" % len(loader_ref))
-    kern = read_at(TARGET, 9, len(os_ref))
-    check("目标盘 LBA9.. = kernel64_os.bin（逐字节）", kern == os_ref, "长度 %d" % len(os_ref))
+    kern = read_at(TARGET, 65, len(os_ref))
+    check("目标盘 LBA65.. = kernel64_os.bin（逐字节）", kern == os_ref, "长度 %d" % len(os_ref))
     check("目标盘内核不是安装程序内核", kern != ins_ref[:len(kern)])
 
     print("=== 7) 单独启动装好的硬盘（VMware 里验证真能开机）===")

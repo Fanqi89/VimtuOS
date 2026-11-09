@@ -42,7 +42,7 @@ except Exception:
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build64")
 SYS_DISK = os.path.join(BUILD, "sysdisk.img")        # 带 VimtuFS2 卷的完整演示盘（夹具底座）
-PART_MAIN_LBA = 8009
+PART_MAIN_LBA = 32584
 SECTOR = 512
 outdir = os.path.join(os.environ.get("PI_SCRATCH_DIR", ROOT), "fontq")
 os.makedirs(outdir, exist_ok=True)
@@ -89,7 +89,7 @@ def load_mod(name, fname):
 def make_fixture(base_img, out_img, stem):
     """底座盘副本 + 卷里 /etc/fonts.conf 换成指定 ui.stem（就地替换卷，长度不变）。
 
-    为什么要就地改卷而不是用 build_disk 重拼：本仓库的 sysdisk.img = system.img 前 8009 扇区
+    为什么要就地改卷而不是用 build_disk 重拼：本仓库的 sysdisk.img = system.img 前 32584 扇区
     + 主分区卷，重拼要保证两边字节对齐；就地替换卷字节（长度取自超级块）改动面最小。
     """
     TP = load_mod("tcc_pack_win", "tcc_pack_win.py")

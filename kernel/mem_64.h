@@ -234,8 +234,10 @@ int strcmp_64(const char* s1, const char* s2);
 int strncmp_64(const char* s1, const char* s2, uint64_t n);
 // ==================== 64 位实现补充声明（kernel/mem64.cpp）====================
 // 布局（见 mem64.cpp 顶部说明）：
-//   内核堆   = [80MB, 128MB)   固定 48MB，避开内核 .bss（到 ~36.4MB）与载荷（64MB）
-//   物理页池 = [128MB, mem_high)  bitmap 在 .bss，不占页池
+//   内核堆   = [112MB, 160MB)  固定 48MB —— ★ v0.9.31 起这是**下限**：运行期取
+//              max(112MB, ALIGN_UP(__bss_end))，内核长得再大也不会被自己的堆覆盖
+//              （载荷窗口 [64MB,96MB) 与 UEFI 引导器 96MB 都在下限之下）
+//   物理页池 = [堆顶, mem_high)  bitmap 在 .bss，不占页池（512MB 机上约 160MB 起）
 void heap_self_init64();                    // 由 mem_init_64 内部调用；也可单独重置堆
 
 // 真实内存规模（系统监视器/任务管理器显示用，与 mem_info_64 的"页池"语义区分开）

@@ -176,6 +176,11 @@ const char* fb64_source_name64(void) { return fb_source == 1 ? "gop" : "vbe"; }
 uint64_t fb64_lfb_phys64(void) { return fb_addr; }
 int fb64_lfb_usable64(void) { return fb_usable; }
 
+// ★ v0.9.34：VMware SVGA 的"这块脏了"通知（弱符号：安装介质内核不编 vmware64.cpp，这里为空）。
+//   为什么必须由 fb 层调：只有 fb 知道"哪一块刚被画完并写进了 LFB"。
+//   非 VMware 机器上 vmware64_update64 是空操作（内部 g_upd_ok=0），一个字节的代价。
+void vmware64_update64(int x, int y, int w, int h) __attribute__((weak));
+
 // ==================== ★ v0.9.9：帧缓冲页表**自补** ====================
 // 为什么需要：UEFI 下帧缓冲的映射是**固件**建的。v0.9.8 的只读走查发现"没映射/只读"时只会
 // 让 fb_usable=0（不黑屏，但也没画面）。本批升一级：**缺的映射我们自己补**，补完**重新走查
@@ -297,6 +302,90 @@ static int fb64_upgrade_ro64(uint64_t pa, uint64_t bytes) {
         }
     }
     return up;
+}
+
+// ==================== LFB 的缓存属性（WC / UC）====================
+// ★ 为什么单独有这一层（v0.9.34 实测定位的真缺陷）：
+//   帧缓冲是**设备内存**，不是普通 RAM。固件把 LFB 映射成可写之后，页表项里没有 PCD/PWT、
+//   MTRR 也没为它建项 —— 这块地址就按默认类型 **WB（可缓存）** 走。QEMU 上感觉不到
+//   （std vga 的 LFB 就是普通 RAM，扫出电路直接读那块内存）；VMware SVGA 上**致命**：
+//   宿主用 `SVGA-ScreenMgr: RegisterMode` + 影子屏 + 脏页跟踪刷新，客人写只停在 CPU cache 里、
+//   从不落到客人物理地址 -> 脏页位不置位 -> 宿主看到的是没被改过的黑屏（只有极少数被
+//   挤出 cache 的像素偶尔可见）。实测：VMware 上电全过程（含开机 logo/进度条）VNC 抓到
+//   99.8% 纯黑、768 行里 760 行整行全黑；同一份内核在 QEMU@1024x768 上纯黑像素只有 42 个。
+//   修法：把 LFB 的映射标成**不缓存（PWT|PCD）**，写直达内存，脏页跟踪立刻看见。
+//   为什么不顺便上 MTRR WC（更快）：写 MTRR 需要 WRMSR，而固件可以把 MTRR 锁死
+//   （锁了就 WRMSR #GP -> ring0 异常 -> 开机 PANIC）。一次"图快"换来真机可能起不来，
+//   不值。这里只改**我们自己的页表位**（和 fb64_upgrade_ro64 同一套手法，proven），
+//   代价是 LFB 写变成非缓存写（比 WB/WC 慢），换来的是"写下去一定被设备/宿主看见"。
+//   要 WC 的加速，得先有可靠的 MTRR 锁定探测 —— 那是单独一批的事，不在本批夹带。
+// 页表回退：给 [pa, pa+bytes) 覆盖到的**已存在**映射项加 PWT|PCD（= 不缓存）。
+// 只动缓存位，不动地址/页大小/RW；非恒等映射一律跳过（不猜）。返回改过的项数。
+// 缓存属性改完之后必须把旧的缓存行/写合并缓冲丢掉：否则新属性要等"下一次访问"才生效，
+// 而我们紧接着就要往 LFB 里画第一帧。
+static inline void fb64_sfence64(void) { __asm__ volatile("sfence" : : : "memory"); }
+static inline void fb64_wbinvd64(void) { __asm__ volatile("wbinvd" : : : "memory"); }
+
+static int fb64_set_uc_pages64(uint64_t pa, uint64_t bytes) {
+    if (!pa || !bytes) return 0;
+    uint64_t cr3 = 0;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t* l4 = (uint64_t*)(uintptr_t)(cr3 & FB64_PA_MASK);
+    const uint64_t first = pa & ~(FB64_2MB - 1ull);
+    const uint64_t last  = (pa + bytes + FB64_2MB - 1ull) & ~(FB64_2MB - 1ull);
+    const uint64_t cr0 = fb64_cr0_get64();
+    const uint64_t cr0_nw = cr0 & ~0x10000ull;
+    int n = 0;
+    for (uint64_t chunk = first; chunk < last; chunk += FB64_2MB) {
+        const uint64_t e4 = l4[(chunk >> 39) & 511u];
+        if (!(e4 & 1u)) continue;
+        const uint64_t* l3 = (const uint64_t*)(uintptr_t)(e4 & FB64_PA_MASK);
+        const uint64_t e3 = l3[(chunk >> 30) & 511u];
+        if (!(e3 & 1u) || (e3 & 0x80u)) continue;                 // 1 GiB 大页：不拆
+        uint64_t* l2 = (uint64_t*)(uintptr_t)(e3 & FB64_PA_MASK);
+        const uint64_t i2 = (chunk >> 21) & 511u;
+        const uint64_t e2 = l2[i2];
+        if (!(e2 & 1u)) continue;
+        if (e2 & 0x80u) {                                         // 2 MiB 大页
+            if ((e2 & FB64_PA_MASK) != chunk) continue;            // 非恒等：跳过
+            if ((e2 & 0x18u) == 0x18u) { n++; continue; }           // 已经 UC
+            fb64_cr0_set64(cr0_nw); l2[i2] = e2 | 0x18u; fb64_cr0_set64(cr0);
+            __asm__ volatile("invlpg (%0)" : : "r"((void*)(uintptr_t)chunk) : "memory");
+            n++;
+        } else {
+            uint64_t* l1 = (uint64_t*)(uintptr_t)(e2 & FB64_PA_MASK);
+            for (uint32_t k = 0; k < 512u; k++) {
+                const uint64_t e1 = l1[k];
+                if (!(e1 & 1u)) continue;
+                const uint64_t va = chunk + (uint64_t)k * 4096ull;
+                if ((e1 & FB64_PA_MASK) != va) continue;           // 非恒等：跳过
+                if ((e1 & 0x18u) == 0x18u) { n++; continue; }
+                fb64_cr0_set64(cr0_nw); l1[k] = e1 | 0x18u; fb64_cr0_set64(cr0);
+                __asm__ volatile("invlpg (%0)" : : "r"((void*)(uintptr_t)va) : "memory");
+                n++;
+            }
+        }
+    }
+    if (n) fb64_wbinvd64();
+    return n;
+}
+
+// 一行结果打点（新行；老行一律没动）：
+//   [FB64] lfb cache=uc pages=2 ok=1                       （页表改成了不缓存）
+//   [FB64] lfb cache=wb reason=no-page-found ok=0          （如实失败，不假装）
+static void fb64_lfb_cache64(uint64_t pa, uint64_t bytes) {
+    const int np = fb64_set_uc_pages64(pa, bytes);
+    dbg64_line_begin64();
+    dbg64_str("[FB64] lfb ");
+    if (np) {
+        dbg64_str("cache=uc pages="); dbg64_dec((uint64_t)np);
+        dbg64_str(" base=0x");        dbg64_hex64(pa);
+        dbg64_str(" ok=1");
+    } else {
+        dbg64_str("cache=wb reason=no-page-found ok=0");
+    }
+    dbg64_nl();
+    dbg64_line_end64();
 }
 
 // 自检：在**一段确定未映射**的地址上真走一遍"补映射 -> 走查确认 -> 原样抹掉并还页"，
@@ -453,6 +542,10 @@ void fb_init(const BootInfo* bi) {
     g_render_h = fb_h;
     g_zoom = 100;
     fb64_log_source64(s0, s1, remapped, upgraded);
+    // ★ v0.9.34：LFB 是设备内存，必须带 WC/UC 缓存属性才可能被宿主/真机看见。
+    //   放在 log_source 之后：几何/可用性都已定论，属性只影响"写下去多久被看见"。
+    if (fb_usable && fb_addr)
+        fb64_lfb_cache64(fb_addr, (uint64_t)fb_h * (uint64_t)(fb_pitch ? fb_pitch : fb_w * 4));
     // 夹具/取证开关：opt/vimtu/gpu 的 fbtest=remap -> 真跑一遍页表自补自检
     if (fb64_fbtest_remap64()) fb64_remap_selftest64();
 }
@@ -506,6 +599,8 @@ static void fb_flip_all64() {
                 }
             }
         }
+        fb64_sfence64();   // ★ WC 写合并缓冲落地：sfence 之后这些写对设备全局可见
+        if (vmware64_update64) vmware64_update64(0, 0, fb_w, fb_h);   // VMware：整屏脏
         return;
     }
     // 缩放路径：最近邻放大渲染区域到整个 LFB
@@ -520,6 +615,8 @@ static void fb_flip_all64() {
             drow[x] = srow[x * rw / pw];
         }
     }
+    fb64_sfence64();   // ★ 缩放路径同样要把 WC 缓冲刷出去
+    if (vmware64_update64) vmware64_update64(0, 0, fb_w, fb_h);       // VMware：整屏脏
 }
 
 // 后备缓冲 -> LFB（整帧提交）：**内核侧**提交入口（A1 演示期间被开关挡住）
@@ -567,6 +664,8 @@ static void fb_blit_region64(int x, int y, int w, int h) {
             }
         }
     }
+    fb64_sfence64();   // ★ WC 写合并缓冲落地（局部提交同理）
+    if (vmware64_update64) vmware64_update64(x, y, w, h);             // VMware：这块脏了
 }
 
 // 后备缓冲 -> LFB（仅提交指定区域；用于光标等局部更新，避免整帧 3MB 拷贝拖慢跟手）
@@ -623,6 +722,8 @@ void fb_soft_flip_region64(int x, int y, int w, int h) {
             }
         }
     }
+    fb64_sfence64();   // ★ WC 写合并缓冲落地
+    if (vmware64_update64) vmware64_update64(x, y, w, h);             // VMware：这块脏了
     vgpu64_note_soft_blit64(x, y, w, h);
 }
 

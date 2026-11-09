@@ -38,7 +38,7 @@ SRC_DISK = os.path.join(ROOT, "build64", "sysdisk.img")
 BUILD = os.path.join(ROOT, "build64")
 WORK = os.path.join(os.environ.get("PI_SCRATCH_DIR", ROOT), "presets")
 os.makedirs(WORK, exist_ok=True)
-PART_MAIN_LBA = 8009
+PART_MAIN_LBA = 32584
 SECTOR = 512
 checks = []
 

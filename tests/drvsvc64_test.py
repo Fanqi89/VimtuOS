@@ -67,8 +67,8 @@ KERNEL_OS = os.path.join(ART_DIR, "kernel64_os.bin")
 DRVDEMO_ELF = os.path.join(ART_DIR, "drvdemo.elf")
 FIXTURE_IMG = os.path.join(ART_DIR, "drvsvc64_test.img")
 
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343
 DRVDEMO_PATH = "/bin/drvdemo"
 
 # ---- 与内核常量逐位一致（kernel/proc64.h / usermode64.h）----

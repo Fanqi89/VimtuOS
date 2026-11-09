@@ -22,7 +22,7 @@ BASE = r"C:\Users\fanqi\Desktop\新建文件夹"
 TESTDIR = os.path.join(BASE, "v64-install-test")
 
 MEDIUM = os.path.join(ROOT, "vimtu64-64.img")
-TARGET_SECTORS = 32768          # 16 MB
+TARGET_SECTORS = 57343          # 28MB（= 原 16MB + 主分区起点后移的 24,519）
 VNC_PORT = 5903                 # 安装 VM 的 VNC（只读看屏 + 可用 RFB KeyEvent 送按键）
 VNC_BOOT_PORT = 5904            # ★ "装好的盘启动" VM 的 VNC：登录界面必须显式回车，按键从这里送
 KEY_TCP_PORT = 4557          # COM2（串口按键通道）走 TCP，VMware 当服务端、我们连上去写按键

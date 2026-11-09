@@ -454,7 +454,7 @@ def main():
         stub_ref = open(os.path.join(BUILD, "BOOTX64.EFI"), "rb").read()
         uefi_ref = open(os.path.join(BUILD, "UEFI64.BIN"), "rb").read()
         kern_ref = open(os.path.join(BUILD, "kernel64_os.bin"), "rb").read()
-        kern_region = kern_ref + b"\0" * (8000 * 512 - len(kern_ref))
+        kern_region = kern_ref + b"\0" * (32519 * 512 - len(kern_ref))
         for p, ref in (("/EFI/BOOT/BOOTX64.EFI", stub_ref), ("/UEFI64.BIN", uefi_ref),
                        ("/KERNEL64.BIN", kern_region)):
             got = crc32_line(clog, p)

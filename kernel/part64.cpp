@@ -94,7 +94,7 @@ static void set_signature(uint8_t* sec512) {
 }
 
 // ==================== ESP 几何（盘尾、GPT 备份表之前）====================
-// 目标盘最小尺寸 = 主分区起点 8009 + 主分区至少 8MB（16384）+ ESP 48MB（98304）+ 备份 GPT 33
+// 目标盘最小尺寸 = 主分区起点 32528 + 主分区至少 8MB（16384）+ ESP 48MB（98304）+ 备份 GPT 33
 //                 = 122730 扇区 ≈ 59.9MiB（ESP 必须放得下**真 FAT32**：簇数 >= 65525）。
 // 不满足（例如 16MB 的回归目标盘）就**不建 ESP**，只写老的 MBR 布局 ——
 // 那种盘本来也放不下 ESP 里的文件（4MB 内核块 + 引导器），而且 FAT32 的卷下限就 ~33.5MB。
@@ -106,12 +106,12 @@ bool part_esp_geometry64(uint32_t disk_sectors, uint32_t* out_start, uint32_t* o
     const uint32_t start       = last_usable - PART_ESP_SECTORS;
     if (out_start)        *out_start = start;
     if (out_sectors)      *out_sectors = PART_ESP_SECTORS;
-    if (out_main_sectors) *out_main_sectors = start - PART_MAIN_LBA;          // 主分区：8009 .. esp-1
+    if (out_main_sectors) *out_main_sectors = start - PART_MAIN_LBA;          // 主分区：32528 .. esp-1
     return true;
 }
 
 // ==================== 混合 MBR ====================
-// 老布局（无 ESP）：P1 引导分区（0xEF，活动，9+8000）+ P2 主分区（0x07，8009..盘尾）
+// 老布局（无 ESP）：P1 引导分区（0xEF，活动，9+32519）+ P2 主分区（0x07，32528..盘尾）
 // 新布局（有 ESP）：上面两项 + P3 EFI 系统分区（0xEF，盘尾 ESP）；P2 收缩到 ESP 之前
 // 说明：这里**不写 0xEE 保护项** —— EDK2 的 PartitionValidMbr 见到 0xEE 会直接放弃
 //   MBR 解析路径（EFI_PROTECTED_PARTITION），而我们要同时保留"MBR 里找 0xEF 分区"
@@ -218,7 +218,7 @@ bool part_delete_entry(int drive, int index) {
 bool part_format_partition(int drive, const PartInfo& p, int index) {
     if (!p.used || p.sectors == 0) return false;
     // ★ 保护 ESP：EFI 系统分区（盘尾那个 0xEF 项）里是 FAT32 引导卷，
-    //   抹掉它 UEFI 就再也起不来该盘。P1（LBA 9 起的"引导分区"，也是 0xEF 类型）
+    //   抹掉它 UEFI 就再也起不来该盘。P1（LBA 65 起的"引导分区"，也是 0xEF 类型）
     //   保持可格式化 —— 老行为/既有测试都依赖它。
     if (p.type == 0xEF && p.start > PART_BOOT_LBA + PART_BOOT_SECS - 1) {
         dbg64_str("[PART] 拒绝格式化 EFI 系统分区（UEFI 引导卷）start=");
@@ -718,8 +718,8 @@ static bool part_write_backup_gpt64(int drive, uint32_t disk_sectors, uint32_t e
 }
 
 // ESP：格式化 **FAT32** + 写 EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN
-// KERNEL64.BIN 的内容 = 目标盘 LBA 9..8008 的 4MB 内核区（**从目标盘自己读**）：
-//   安装程序内核装不下这份 4MB 副本（内核区上限 4MB），而载荷已经把系统内核拷到了那里。
+// KERNEL64.BIN 的内容 = 目标盘引导区**整块**（LBA 65..32583 = 32,519 扇区，见 part64.h）：
+//   安装程序内核装不下这份 15MiB 副本（它自己有 4MiB 介质上限），而载荷已经把系统内核拷到了那里。
 static int part_install_esp64(int drive, uint32_t esp_start, uint32_t esp_sectors) {
     if (fat64_format64(drive, esp_start, esp_sectors) != 0) {
         dbg64_str("[INSTALL] esp: lba=");
@@ -1238,7 +1238,7 @@ int part_install_step(InstallJob* job) {
         dbg64_nl();
         // ★ 目标盘 UEFI 可启动的最后一块拼图：
         //   1) ESP（FAT32，48MB）：EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN
-        //      （KERNEL64.BIN 直接读目标盘 LBA 9..8008 —— 载荷已经把系统内核拷到那里）
+        //      （KERNEL64.BIN 直接读目标盘引导区整块 LBA 65..32583 —— 载荷已把系统内核拷到那里）
         //   2) 混合 MBR（0xEF 引导区 + 0x07 主分区 + 0xEF ESP）+ 盘尾备份 GPT
         uint32_t esp_start = 0, esp_sectors = 0, esp_main_secs = 0;
         if (part_esp_geometry64(job->write_table_at, &esp_start, &esp_sectors, &esp_main_secs)) {

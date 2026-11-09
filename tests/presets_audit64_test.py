@@ -31,7 +31,7 @@ from volreloc64_test import Vol  # noqa: E402
 PRESETS = os.path.join(ROOT, "build64", "presets")
 USERWALL = os.path.join(ROOT, "res", "wallpapers")
 VOL = os.path.join(ROOT, "build64", "sysdisk.img")
-MAIN_LBA = 8009
+MAIN_LBA = 32584
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
 MAX_PX = 16384          # ★ v0.5.17：内核改解码期抽样后，卷里可以放原始分辨率的图
                         #   （打包期不再缩图；16384 是内核的边长硬上限）

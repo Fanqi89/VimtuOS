@@ -32,7 +32,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SECTOR = 512
-PART_MAIN_LBA = 8009                      # = kernel/part64.h / make_shellvol.py
+PART_MAIN_LBA = 32584                      # = kernel/part64.h / make_shellvol.py
 SOUNDS = ("startup", "notify", "click", "error")
 SOUND_DIR = "/usr/share/sounds"
 

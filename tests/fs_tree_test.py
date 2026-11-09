@@ -7,7 +7,7 @@
           -> 断言安装完成 + 目标盘建了 ESP/GPT（[INSTALL] gpt written (main + esp)）
   阶段 2  **同一个目标盘**再起一次安装介质：光标下移到 P2（主分区）-> f 格式化
           -> 断言 [VFS64] format ok ... version=3（新格式化产出 **v3**）
-             + [PART] 格式化 OK drive=1 index=2 start=8009
+             + [PART] 格式化 OK drive=1 index=2 start=32584
              + [VFS64] selftest PASS（假盘上跑完整目录树/路径/mtime/重挂载自检）
   阶段 3  启动装好的系统盘（drive 0）+ 一块 Python 造的 v3 数据盘（drive 1）：
           -> 断言 C: 指向系统分区（disk=0 part=2）、D: 是第二块盘（disk=1 part=1）、
@@ -55,13 +55,13 @@ import qemuhelp as qh            # noqa: E402  （★ 公共登录手势：ui.lo
 MEDIUM = os.path.join(ROOT, "vimtu64-64.img")
 SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")   # 系统盘映像（boot+loader+内核）
 SECTOR = 512
-PART_BOOT_LBA = 9
-PART_BOOT_SECS = 8000
-PART_MAIN_LBA = 8009
+PART_BOOT_LBA = 65
+PART_BOOT_SECS = 32519
+PART_MAIN_LBA = 32584
 
-TARGET_SECTORS = 262144        # 128MB 目标盘（> ~60MB 才会建 48MB ESP）
+TARGET_SECTORS = 286719        # 128MB 目标盘（> ~60MB 才会建 48MB ESP）
 TARGET_MAIN_SECTORS = 155798   # 128MB 盘的主分区扇区数（见 part_esp_geometry64 的算法）
-TARGET_ESP_LBA = 163807        # 盘尾 ESP 起始 LBA
+TARGET_ESP_LBA = 188382        # 盘尾 ESP 起始 LBA
 TARGET_MAIN_BLOCKS = TARGET_MAIN_SECTORS                    # VimtuFS2 总块数 = 扇区数
 TARGET_MAIN_TOTAL_KB = TARGET_MAIN_BLOCKS // 2              # 77899
 
@@ -69,7 +69,7 @@ DATA_SECTORS = 32768           # 16MB 数据盘（drive 1）
 DATA_PART_LBA = 8192
 DATA_PART_SECTORS = 24576
 
-SMALL_SECTORS = 32768          # 16MB 小系统盘（Python 造 v3 卷：位图 7 块，df 可用）
+SMALL_SECTORS = 57343          # 28MB（= 原 16MB + 主分区起点后移的 24,519） 小系统盘（Python 造 v3 卷：位图 7 块，df 可用）
 SMALL_MAIN_SECTORS = SMALL_SECTORS - PART_MAIN_LBA          # 24759
 SMALL_MAIN_TOTAL_KB = SMALL_MAIN_SECTORS // 2               # 12379
 
@@ -184,7 +184,7 @@ def make_data_disk(path):
 
 
 def make_small_system_disk(path):
-    """16MB 小系统盘：build64/system.img 的字节 + MBR + @8009 的 v3 卷（df 可用的位图规模）。"""
+    """16MB 小系统盘：build64/system.img 的字节 + MBR + @32584 的 v3 卷（df 可用的位图规模）。"""
     with open(SYSTEM_IMG, "rb") as f:
         sys_bytes = f.read()
     if len(sys_bytes) == 0 or len(sys_bytes) % SECTOR:
@@ -413,7 +413,7 @@ def main():
     with open(target, "rb") as f:
         mbr = f.read(512)
     e2 = mbr[462:478]
-    check("MBR 第 2 项 = type 0x07 主分区 @8009", e2[4] == 0x07 and
+    check("MBR 第 2 项 = type 0x07 主分区 @32584", e2[4] == 0x07 and
           struct.unpack_from("<I", e2, 8)[0] == PART_MAIN_LBA,
           "type=0x%02X start=%d" % (e2[4], struct.unpack_from("<I", e2, 8)[0]))
     e3 = mbr[478:494]
@@ -446,10 +446,10 @@ def main():
         log2 = slog(s2)
     finally:
         kill(proc)
-    # ★ v0.9.28：内核打点已变成 `[PART] 格式化 OK drive=1 table=mbr index=2 start=8009 … fs=VimtuFS2`
+    # ★ v0.9.28：内核打点已变成 `[PART] 格式化 OK drive=1 table=mbr index=2 start=32584 … fs=VimtuFS2`
     #   （中间插了 table=），原先的整串精确子串永远不中。拆三段判（比原来更严：还要求 fs=VimtuFS2）。
-    check("格式化主分区 P2（[PART] 格式化 OK drive=1 … index=2 start=8009 … fs=VimtuFS2）",
-          "[PART] 格式化 OK drive=1" in log2 and "index=2 start=8009" in log2
+    check("格式化主分区 P2（[PART] 格式化 OK drive=1 … index=2 start=32584 … fs=VimtuFS2）",
+          "[PART] 格式化 OK drive=1" in log2 and "index=2 start=32584" in log2
           and "fs=VimtuFS2" in log2)
     # ★ 多卷说明：系统启动盘一启动就会把**所有可浏览卷**挂进卷槽（D:/E:…），串口里因此有不止一条
     #   `[VFS64] mount ok ...` / `[VFS64] format ok ...`（数据卷的块数不同，取"最后一条"会拿到别的卷）。
@@ -515,8 +515,8 @@ def main():
               me.group(0) if me else "")
         check("FAT 读取器挂载了 ESP（[FAT64] mount … lba=%d … fat_ok=1 … spc=1 ro=1）" % TARGET_ESP_LBA,
               re.search(r"\[FAT64\] mount vol=\d+ lba=%d clusters=\d+ free=(unknown|\d+) fat_ok=1 spc=1 ro=1" % TARGET_ESP_LBA, log3) is not None)
-        check("引导分区（lba=9 type=0xEF 无 BPB）仍然 skip、不占盘符",
-              "[DRV64] skip lba=9 type=0xEF reason=esp" in log3)
+        check("引导分区（lba=65 type=0xEF 无 BPB）仍然 skip、不占盘符",
+              "[DRV64] skip lba=65 type=0xEF reason=esp" in log3)
         check("盘符自检通过（[DRV64] selftest PASS）", "[DRV64] selftest PASS" in log3)
         check("启动期目录树打印（[VFS64] tree root=/）", "[VFS64] tree root=/" in log3)
 

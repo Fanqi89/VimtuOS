@@ -8,7 +8,8 @@
   1) 造 64MB 空目标盘（挂在 **AHCI** 上，驱动器号 8）+ 安装介质（vimtu64-64.iso 当 IDE 盘）
   2) QEMU monitor 注入按键走完整安装（语言→现在安装→许可→类型→新建→安装）
   3) 目标盘字节断言：
-       * MBR：P1 引导分区 0xEF 活动 9+8000 / P2 主分区 0x07 / P3 ESP 0xEF（盘尾）
+       * MBR：P1 引导分区 0xEF 活动 65+32519（内核容量 15MiB + 原始区 1,799）/ P2 主分区 0x07 / P3 ESP 0xEF（盘尾）
+ * ESP 里的 KERNEL64.BIN = **内核容量 30,720 扇区 = 15,728,640 B**（LBA 65..30784，不含原始区）
        * 盘尾**备份 GPT**："EFI PART" + 头 CRC 正确 + 项数组 CRC 正确 +
          项1 主分区（基本数据 GUID）+ 项2 ESP（C12A7328-… GUID）
          （LBA 1 是 loader64.bin，主 GPT 头按规范应在那里 —— 冲突，所以只有备份头）
@@ -19,7 +20,7 @@
        * ESP 里三个文件与本地构建产物**逐字节一致**：
          EFI/BOOT/BOOTX64.EFI == build64/BOOTX64.EFI
          UEFI64.BIN           == build64/UEFI64.BIN
-         KERNEL64.BIN         == build64/system.img 的**内核区整块** LBA 9..8008（含尾部的图标包，
+         KERNEL64.BIN         == build64/system.img 的**内核区整块** LBA 65..30784（含尾部的图标包，
                                 4,096,000 B；不是 "kernel64_os.bin + 补零"）
   4) **UEFI（OVMF）从这块装好的盘启动** -> "[OS] booted from installed disk" + "[GUI64] ready"
   5) **BIOS（SeaBIOS）从同一块盘启动** -> 同样进系统（这就是"新老设备都能启动"的直接证据）
@@ -58,13 +59,13 @@ UEFI64 = os.path.join(BUILD, "UEFI64.BIN")
 LOADER = os.path.join(BUILD, "loader64.bin")
 
 SECTOR = 512
-TARGET_SECTORS = 131072          # 64MB（要放得下 4MB 引导区 + 主分区 8MB 起 + 48MB FAT32 ESP
+TARGET_SECTORS = 155647          # 64MB（要放得下 15MiB 引导区 + 主分区 8MB 起 + 48MB FAT32 ESP
                                 #  + 盘尾备份 GPT；真 FAT32 的簇数硬下限让最小目标盘 ~60MB）
-PART_BOOT_LBA, PART_BOOT_SECS = 9, 8000
-PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS        # 8009
+PART_BOOT_LBA, PART_BOOT_SECS = 65, 32519
+PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS        # 32584
 ESP_SECTORS_EXPECT = 98304                            # kernel/part64.h 的 PART_ESP_SECTORS（48MB）
 GPT_BACKUP = 33
-PATA_TARGET_SECTORS = 262144     # 128MB（小盘 PATA 回归：同样放 4MB 引导区 + 48MB ESP）
+PATA_TARGET_SECTORS = 286719     # 128MB（小盘 PATA 回归：同样放 15MiB 引导区 + 48MB ESP）
 PATA_ESP_START_EXPECT = PATA_TARGET_SECTORS - GPT_BACKUP - ESP_SECTORS_EXPECT   # 163807
 PATA_FATSZ_EXPECT = 768          # 98304 扇区的 FAT32 卷：FATSz32 = 768（PATA 8 位计数的受害者）
 PATA_CLUSTERS_EXPECT = 96736
@@ -430,10 +431,10 @@ def main():
 
     mbr = mbr_entries(disk[0:SECTOR])
     check("MBR 签名 55AA", disk[510] == 0x55 and disk[511] == 0xAA)
-    check("P1 = 引导分区 0xEF 活动 9+8000",
+    check("P1 = 引导分区 0xEF 活动 65+32519",
           mbr[0]["type"] == 0xEF and mbr[0]["boot"] and mbr[0]["start"] == PART_BOOT_LBA
           and mbr[0]["sectors"] == PART_BOOT_SECS, "%s" % (mbr[0],))
-    check("P2 = 主分区 0x07，起点 8009",
+    check("P2 = 主分区 0x07，起点 32584",
           mbr[1]["type"] == 0x07 and mbr[1]["start"] == PART_MAIN_LBA, "%s" % (mbr[1],))
     check("P3 = ESP 0xEF（盘尾、GPT 备份表之前，%d 扇区）" % ESP_SECTORS_EXPECT,
           mbr[2]["type"] == 0xEF and mbr[2]["sectors"] == ESP_SECTORS_EXPECT
@@ -442,7 +443,7 @@ def main():
     check("P2 主分区与 ESP 不重叠",
           mbr[1]["start"] + mbr[1]["sectors"] <= mbr[2]["start"],
           "main_end=%d esp_start=%d" % (mbr[1]["start"] + mbr[1]["sectors"], mbr[2]["start"]))
-    check("LBA 1..8 仍是 loader64.bin（主 GPT 头的规范位置与 loader 冲突 -> 只写备份头）",
+    check("LBA 1..64 仍是 loader64.bin（主 GPT 头的规范位置与 loader 冲突 -> 只写备份头）",
           disk[SECTOR:SECTOR + len(loader_ref)] == loader_ref)
 
     gpt, err = parse_gpt_backup(disk)
@@ -452,7 +453,7 @@ def main():
               gpt["my_lba"] == gpt["total"] - 1 and gpt["alt_lba"] == 1,
               "my=%d alt=%d total=%d" % (gpt["my_lba"], gpt["alt_lba"], gpt["total"]))
         types = [p["type"] for p in gpt["parts"]]
-        check("GPT 项1 = 主分区（基本数据 GUID，8009 起）",
+        check("GPT 项1 = 主分区（基本数据 GUID，32584 起）",
               len(types) >= 1 and types[0] == GPT_TYPE_BASIC
               and gpt["parts"][0]["first"] == PART_MAIN_LBA, "%s" % (gpt["parts"][:1],))
         check("GPT 项2 = ESP（C12A7328-… GUID，盘尾 %d 扇区）" % ESP_SECTORS_EXPECT,
@@ -541,11 +542,11 @@ def main():
     # ★ 自 3d1ff31 起内核区**尾部**（LBA 6096.. 的"原始区"）装的是外置 blob：中文面字体
     #   /etc/font_simhei.z + 18 份演示程序 + 图标包（原来 LBA 7497 起的单独图标包位置已作废；
     #   build64.sh 把 build64/demo64_raw.bin dd 进 system.img，位置/大小见 build64/demo64_blobtab.h）。
-    #   安装器写入 ESP 的 KERNEL64.BIN 是**内核区整块**（LBA 9..8008 = 4,096,000 B），不是
+    #   安装器写入 ESP 的 KERNEL64.BIN 是**内核区整块**（LBA 65..30784 = 4,096,000 B），不是
     #   "kernel64_os.bin + 补零"。独立来源 = build64/system.img 的同一区间（大小 + 逐字节）。
     with open(os.path.join(BUILD, "system.img"), "rb") as f:
         f.seek(PART_BOOT_LBA * 512)
-        kregion = f.read(8000 * 512)
+        kregion = f.read(30720 * 512)   # KERNEL64.BIN = 内核容量 15MiB（不含原始区，见 part64.cpp 的 kern_len）
     if efi is not None:
         data, size = fat.read_file(efi)
         check("EFI/BOOT/BOOTX64.EFI = build64/BOOTX64.EFI（%d 字节）" % len(stub_ref),
@@ -560,11 +561,11 @@ def main():
     check("KERNEL64.BIN 存在", k is not None)
     if k:
         data, size = fat.read_file(k)
-        check("KERNEL64.BIN = 内核区整块（system.img LBA 9..8008 的 %d 字节，大小 + 逐字节）"
+        check("KERNEL64.BIN = 内核区整块（system.img LBA 65..30784 的 %d 字节，大小 + 逐字节）"
               % len(kregion),
               size == len(kregion) and data == kregion, "盘上 %d 字节" % size)
-        check("KERNEL64.BIN 与目标盘 LBA 9.. 的内核区逐字节一致",
-              data == disk[PART_BOOT_LBA * SECTOR: (PART_BOOT_LBA + 8000) * SECTOR])
+        check("KERNEL64.BIN 与目标盘 LBA 65.. 的内核区逐字节一致",
+              data == disk[PART_BOOT_LBA * SECTOR: (PART_BOOT_LBA + 30720) * SECTOR])
 
     print("=== 5) ★ UEFI（OVMF）从这块**装好的盘**启动 ===")
     uefi_log = boot_disk(qemu, args.target, os.path.join(ROOT, "esp_installed_uefi.log"),
@@ -580,7 +581,7 @@ def main():
     check("UEFI 启动无 PANIC/三重故障", not any(x in uefi_log for x in FORBIDDEN))
     with open(args.target, "rb") as f:
         after = f.read()
-    check("UEFI 启动后 LBA 1..8 的 loader 字节没被固件改写（没有 GPT 修复式回写）",
+    check("UEFI 启动后 LBA 1..64 的 loader 字节没被固件改写（没有 GPT 修复式回写）",
           after[SECTOR:SECTOR + len(loader_ref)] == loader_ref)
 
     print("=== 6) ★ BIOS 从**同一块**装好的盘启动 ===")

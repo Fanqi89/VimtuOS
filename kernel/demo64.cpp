@@ -41,10 +41,23 @@ static int g_demo64_raw_src64 = -1;       // ★ 本批：当前缓冲**来自�
 // 为什么不是 0/8/16/24 全探：0 之外的盘"读成功"并不等于"这块盘上有原始区"，猜错会拿到
 // 别的盘 LBA 7497 的随机字节（老代码只读 0 时没有这个问题）。所以只信 drive64 的
 // "系统盘"判定，判不出来就退回原来的 drive 0；剩下的交给失败重试机制。
+// 候选盘：**系统盘优先，然后 PATA 0（老行为）**。
+//   ★ v0.9.33：这里**不**枚举所有盘 —— 实测（iconboot64 ③ 档：无包 + 原始区清零、只有 PATA 盘）
+//   一旦把"所有槽位"也塞进候选，早期 demo 会去读一块不存在的盘、拿到"成功"的垃圾字节，
+//   最后 ring3 在 0x100000000 上 #PF 崩掉。**读盘候选宁少不滥**：
+//     * 系统盘（盘符表认出来的，AHCI/NVMe 机器靠它）—— 但必须先验 present && !atapi，
+//       盘符表在启动早期可能给出一个过时的号（③ 档就返回过 8，而那台机器上只有 PATA 盘）；
+//     * 0（PATA 主盘）—— 所有既有夹具与日常盘都走这条，日志一字不变。
+//   剩下的交给失败重试机制（[DEMO64] raw blob region read FAILED … attempt/retry）。
 static int d64_candidates64(int* out, int cap) {
     int n = 0;
+    auto usable = [](int d) {
+        if (d < 0) return false;
+        DiskInfo di;
+        return ata64_identify(d, &di) && di.present && !di.atapi;
+    };
     const int sys = drive64_system_disk64();
-    if (sys >= 0 && n < cap) out[n++] = sys;
+    if (usable(sys) && n < cap) out[n++] = sys;
     if (n < cap && (n == 0 || out[0] != 0)) out[n++] = 0;
     return n;
 }
@@ -66,8 +79,8 @@ static int d64_ensure_raw64(void) {
         g_demo64_raw_state64 = -1;
         return 0;
     }
-    int cand[2];
-    const int nc = d64_candidates64(cand, 2);
+    int cand[8];
+    const int nc = d64_candidates64(cand, 8);
     if (g_demo64_raw_tries64 < 0xFFu) g_demo64_raw_tries64++;
     g_demo64_raw_syskey64 = syskey;
     int used = -1;

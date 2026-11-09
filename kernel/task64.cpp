@@ -23,6 +23,7 @@
 #include "usb64.h"      // USB 主机（UHCI）：kusb 内核线程只调 usb64_poll64()
 #include "syscall64.h"  // g_syscall64_kstack64：SYSCALL 入口专用栈顶（每任务一份，见 task_apply_ctx64）
 #include "sig64.h"      // ★ A4-5：信号投递钩子（IRQ0 出口 —— 纯用户态死循环也能收到信号）
+#include "r3drv64.h"    // ★ v0.9.33：ring3 驱动服务监督器（kheart 线程里推进状态机）
 
 // ==================== ring3 槽位状态清理钩子（批次 B：缺陷根治）====================
 // usermode64.cpp 的 in_ring3 是**按任务槽位**的位图；ring3 进程被 kill 时不会从
@@ -661,9 +662,23 @@ int task_create64(const char* name, void (*entry)(void*), void* arg) {
 // kheart：心跳线程。证明"别的任务真的在跑"（桌面外壳闲置时也在被抢占）。
 static void kheart_entry(void* arg) {
     (void)arg;
+    // ★ v0.9.34：监督器原来只在"1 秒一次的 beat"里跑 -> 服务崩了最坏要等 1 s 才被发现，
+    //   "1 秒内拉起"这件事根本不可证。现在把循环切片到 PIT_HZ/16（250Hz -> 15 tick = 60ms）
+    //   跑监督 tick；**心跳打点仍然 1 秒一次**（日志格式与既有断言一字不变）。
+    const uint64_t slice = (PIT_HZ_64 / 16u) ? (PIT_HZ_64 / 16u) : 1u;
+    uint64_t t_sup  = g_ticks64;
+    uint64_t t_beat = g_ticks64;
     for (;;) {
-        const uint64_t t0 = g_ticks64;
-        while (g_ticks64 - t0 < PIT_HZ_64) task_yield64();   // 约 1 秒
+        task_yield64();
+        if (g_ticks64 - t_sup >= slice) {        // ~16 次/秒：推进服务状态机（不做磁盘 I/O 分支）
+            t_sup = g_ticks64;
+            r3drv64_tick64();
+        }
+        if (g_ticks64 - t_beat < PIT_HZ_64) continue;   // 打点仍约 1 秒一次
+        t_beat = g_ticks64;
+        // ★ v0.9.33：ring3 驱动服务监督器。放在心跳线程而不是 GUI 帧循环：
+        //   它可能**拉起进程**（要读 ELF = 磁盘 I/O），放进帧循环会撞看门狗
+        //   （见 kernel-gui-frame-disk-io-safety 那条规矩）；而心跳线程本来就是空闲线程。
         g_heart_beats++;
         dbg64_line_begin64();
         dbg64_str("[TASK64] kheart beat=");

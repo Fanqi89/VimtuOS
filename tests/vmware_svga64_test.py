@@ -89,8 +89,8 @@ def make_image_with_probe(src, dst, marker=True, enable=False):
         "tcc_pack_win", os.path.join(ROOT, "tools", "tcc_pack_win.py"))
     TP = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(TP)
-    PART_MAIN_LBA = 8009
-    TARGET_SECTORS = 32768
+    PART_MAIN_LBA = 32584
+    TARGET_SECTORS = 57343
     d = open(dst, "rb").read()
     vol = bytearray(d[PART_MAIN_LBA * SECTOR:(PART_MAIN_LBA + TARGET_SECTORS) * SECTOR])
     if bytes(vol[0:8]) != b"VIMTUFS2":

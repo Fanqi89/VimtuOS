@@ -138,6 +138,10 @@ extern "C" void wl64_proc_release64(int pid) __attribute__((weak));
 // ★ v0.9.15：DRM 的 dumb buffer 回收（同一套弱引用纪律：安装介质内核不链 drm64.cpp）。
 //   不加这个 hook 的话，进程异常退出且没 DESTROY_DUMB，那块页会永久占着（4 槽 × <=8 MiB）。
 extern "C" void drm64_proc_release64(int pid) __attribute__((weak));
+// ★ v0.9.34：ring3 驱动服务死亡**即时**通知（不等监督器下一拍轮询）。
+//   只做"打时间戳 + 标记已死"，真正拉起仍在心跳线程里（那里可以读 ELF/碰磁盘）。
+//   安装介质内核不编 r3drv64.cpp —— 弱符号为空，这里自然跳过。
+extern "C" void r3drv64_on_die64(int pid) __attribute__((weak));
 // 引导期状态（proc64_init64 探测一次）
 static uint64_t g_boot_cr364   = 0;      // 内核地址空间（引导期页表根）
 static void p64_publish_cred64(Proc64* p);           // ★ P4：凭证发布（定义在 create 之后）
@@ -1084,6 +1088,7 @@ static void p64_exit64(Proc64* p, uint32_t code, uint32_t sig) {
     p->exit_code = code & 0xFFu;
     p->term_sig  = sig;
     p->state     = PROC64_EXITED;
+    if (r3drv64_on_die64) r3drv64_on_die64((int)p->pid);   // ★ 同一拍把死亡时间戳打给监督器
     p->frame     = 0;
     p->mmap_next = 0;
     p->brk_start = p->brk_end = p->brk_limit = 0;

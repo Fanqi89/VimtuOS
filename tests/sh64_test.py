@@ -49,8 +49,8 @@ SHELL_BIN = os.path.join(ROOT, "build64", "shell.bin")
 KERNEL_OS = os.path.join(ROOT, "build64", "kernel64_os.bin")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "sh64_test.img")
 
-PART_MAIN_LBA = 8009               # = kernel/part64.h 的主分区起点
-TARGET_SECTORS = 32768             # 16 MB
+PART_MAIN_LBA = 32584               # = kernel/part64.h 的主分区起点
+TARGET_SECTORS = 57343             # 28MB（= 原 16MB + 主分区起点后移的 24,519）
 SECTOR = 512
 
 # ★ v0.9.5：这个常量用于**宿主侧卷内路径核对**（tools/make_shellvol.py 的 verify），必须写**卷里真实的路径**。

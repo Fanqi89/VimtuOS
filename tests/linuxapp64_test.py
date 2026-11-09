@@ -80,7 +80,7 @@ VPKG_ELF = os.path.join(ROOT, "build64", "store", "vpkg.elf")
 FIXTURE_REPO = os.path.join(CORPUS, "repo_fixture")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "lxcorpus_test.img")
 FRESH_VOL_SECTORS = 16384               # 8 MiB 卷（语料 ~3.7 MB 的库 + 装出来的东西都放得下）
-PART_MAIN_LBA = 8009
+PART_MAIN_LBA = 32584
 
 # 内核打点里"这一类的失败原因"的原文（用于把缺口钉死；都是今天**应当出现**的）
 REASON_SIZE = "[ELF64] exec reject reason=size"

@@ -203,7 +203,7 @@ def wait_repaint64(vm, since, timeout=30):
 
 
 def make_vfs_fixture(dst, sys_img):
-    """16MB 夹具盘：build64/system.img 的字节 + 标准 MBR + @8009 的空 v3 卷。
+    """16MB 夹具盘：build64/system.img 的字节 + 标准 MBR + @32584 的空 v3 卷。
     规则与 tests/fs_tree_test.py 的 make_small_system_disk 同一套（直接复用它的 _mbr_entry/vimtufs3_format），
     差别只是源镜像可以指定（--img）。返回 dict（多一个 bytes 字段）或 None。"""
     try:
@@ -1013,7 +1013,7 @@ def main():
                                             sum(1 for c in render if c[3] >= 252) if render else "?"))
         fixture = os.path.join(tmp, "small_system.img")
         finfo = make_vfs_fixture(fixture, args.img)
-        check("造夹具盘（system.img 字节 + MBR + @8009 的空 v3 卷）", finfo is not None,
+        check("造夹具盘（system.img 字节 + MBR + @32584 的空 v3 卷）", finfo is not None,
               fixture if finfo else "（fs_tree_test 不可用 / 镜像不合法）")
         if finfo and render is not None:
             # ---- 8a) 第一遍：空卷 -> 启动期安装 -> 从盘上读真图 -> 像素比对 ----

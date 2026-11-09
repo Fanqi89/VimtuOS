@@ -1322,7 +1322,7 @@ static int tm_fields_detail(Window* w, TmField* out, int max) {
     }
     if (n < max) {
         tm_bytes_str(b, heap_total_64());
-        tm_stpcat(b, T(" fixed kernel heap [80MB,128MB)", " 固定内核堆 [80MB,128MB)"));
+        tm_stpcat(b, T(" kernel heap (base>=__bss_end)", " 内核堆（起点在内核结束之上）"));
         tm_field_set(&out[n], T("Kernel heap", "内核堆"), b);
         n++;
     }
@@ -1351,8 +1351,8 @@ static int tm_fields_detail(Window* w, TmField* out, int max) {
     }
     if (n < max) {
         tm_field_set(&out[n], T("Store area", "持久化保留区"),
-                     T("reserved LBA 8009+64; store64 uses VFS /store.a,/store.b when mounted",
-                       "已保留 LBA 8009+64；store64 有卷时用 VFS /store.a、/store.b"));
+                     T("reserved LBA 32528+64; store64 uses VFS /store.a,/store.b when mounted",
+                       "已保留 LBA 32528+64；store64 有卷时用 VFS /store.a、/store.b"));
         n++;
     }
     if (n < max) {

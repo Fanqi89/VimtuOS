@@ -9,10 +9,10 @@
   3) 安装过程中读串口日志，核对每一步都真的写盘了（[PART]/[INSTALL]/[SETUP] 行）
   4) 直接解析目标盘镜像，核对：
         · MBR 签名 55 AA
-        · 分区1 = 引导分区（type 0xEF，活动，LBA 9 + 8000）
-        · 分区2 = 主分区（type 0x07，起点 8009）
-        · LBA 1..8 = loader64.bin
-        · LBA 9..  = kernel64_os.bin（**系统**内核，不是安装程序内核）
+        · 分区1 = 引导分区（type 0xEF，活动，LBA 65 + 32519）
+        · 分区2 = 主分区（type 0x07，起点 32584）
+        · LBA 1..64 = loader64.bin
+        · LBA 65..  = kernel64_os.bin（**系统**内核，不是安装程序内核）
   5) 把目标盘单独启动一次，断言它进的是"系统启动路径"（[OS] ...）而不是安装程序（[SETUP] ...）
 
 退出码：0 全部通过 / 1 有断言失败 / 2 环境问题
@@ -42,7 +42,11 @@ LOADER = os.path.join(ROOT, "build64", "loader64.bin")
 OS_KERNEL = os.path.join(ROOT, "build64", "kernel64_os.bin")
 INS_KERNEL = os.path.join(ROOT, "build64", "kernel64.bin")
 
-TARGET_SECTORS = 32768          # 16 MB 目标盘
+TARGET_SECTORS = 57343          # 28MB（= 原 16MB + 主分区起点后移的 24,519） 目标盘
+# ★ v0.9.31：载荷扇区数从介质文件本身量出来（安装器就是拷这么多），不再写死 8,073。
+#   介质布局：LBA 8192 = 载荷头，LBA 8193 起 = 载荷本体（= build64/system.img 的副本）。
+PAYLOAD_LBA = 8192
+PAYLOAD_SECTORS = (os.path.getsize(MEDIUM) // 512) - (PAYLOAD_LBA + 1) if os.path.exists(MEDIUM) else 0
 
 
 def find_qemu(explicit=None):
@@ -149,10 +153,26 @@ def run_install(qemu, target_path, serial_log, port, dwell=2.0):
             print("[flow] sendkey %-4s  (%s)" % (key, what))
             mon.key(key, wait=dwell)
 
-        print("[flow] 等待复制完成（载荷 8073 扇区，每帧 128 扇区）...")
-        time.sleep(20)
-        # 安装完成后会自动重启（-no-reboot 下 QEMU 会退出），这里再等一会收日志
-        time.sleep(3)
+        # ★ v0.9.31：**等收尾行，不再睡固定 20 秒**。
+        #   payload 从 8,073 扇区长到 57,287 扇区（引导区 4MB -> 15MiB），固定睡眠必然截断，
+        #   而"截断"只会让断言看运气 —— 判据要等真事件（[SETUP] 自动重启）。
+        print("[flow] 等待复制完成 + 自动重启（载荷 %d 扇区，每帧 128 扇区；最多等 240 秒）..."
+              % PAYLOAD_SECTORS)
+        _t0 = time.time()
+        _done = False
+        while time.time() - _t0 < 240:
+            time.sleep(1)
+            try:
+                with open(serial_log, "r", encoding="utf-8", errors="replace") as f:
+                    if "[SETUP] 自动重启" in f.read():
+                        _done = True
+                        break
+            except FileNotFoundError:
+                pass
+            if proc.poll() is not None:      # -no-reboot 下重启 = QEMU 退出
+                _done = True
+                break
+        print("[flow] 收尾行到达：%s（%.0f s）" % ("是" if _done else "否（超时）", time.time() - _t0))
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -252,12 +272,12 @@ def main():
     if p1:
         check("分区1 = 引导分区 type 0xEF 且活动", p1["type"] == 0xEF and p1["boot"],
               "type=0x%02X boot=%s" % (p1["type"], p1["boot"]))
-        check("分区1 位置 = LBA 9 + 8000 扇区", p1["start"] == 9 and p1["sectors"] == 8000,
+        check("分区1 位置 = LBA 65 + 32519 扇区", p1["start"] == 65 and p1["sectors"] == 32519,
               "start=%d sectors=%d" % (p1["start"], p1["sectors"]))
     check("分区2 = 主分区 type 0x07", p2 is not None and p2["type"] == 0x07, "%s" % (p2,))
     if p2:
-        expect_main = TARGET_SECTORS - 8009
-        check("分区2 起点 8009 且覆盖到盘尾", p2["start"] == 8009 and p2["sectors"] == expect_main,
+        expect_main = TARGET_SECTORS - 32584
+        check("分区2 起点 32584 且覆盖到盘尾", p2["start"] == 32584 and p2["sectors"] == expect_main,
               "start=%d sectors=%d（期望 %d）" % (p2["start"], p2["sectors"], expect_main))
 
     loader_ref = open(LOADER, "rb").read()
@@ -265,29 +285,33 @@ def main():
     ins_ref = open(INS_KERNEL, "rb").read()
 
     loader_disk = read_at(args.target, 1, len(loader_ref))
-    check("目标盘 LBA1..8 = loader64.bin（逐字节一致）", loader_disk == loader_ref,
+    check("目标盘 LBA1..64 = loader64.bin（逐字节一致）", loader_disk == loader_ref,
           "长度 %d" % len(loader_ref))
 
-    kern_disk = read_at(args.target, 9, len(os_ref))
+    kern_disk = read_at(args.target, 65, len(os_ref))
     check("目标盘 LBA9.. = 系统内核 kernel64_os.bin（逐字节一致）", kern_disk == os_ref,
           "长度 %d" % len(os_ref))
     check("目标盘上的内核**不是**安装程序内核", kern_disk != ins_ref[:len(kern_disk)])
 
     # ★ v0.5.11：装好的目标盘**必须带 VimtuFS2 卷**（否则系统卷 mount 失败 -> 一切修改重启即丢）
     MAGIC = b"VIMTUFS2"
-    vol_head = read_at(args.target, 8009, 64)
-    check("目标盘 LBA8009 = VimtuFS2 卷头（magic + version 5）",
+    vol_head = read_at(args.target, 32584, 64)
+    check("目标盘 LBA32584 = VimtuFS2 卷头（magic + version 5）",
           vol_head[:8] == MAGIC, repr(vol_head[:8]))
     check("卷头 version 字段 = 5（与 sysdisk 一致；v0.9.28 起 = v5）",
           len(vol_head) >= 12 and int.from_bytes(vol_head[8:12], "little") == 5,
           "version=%d" % (int.from_bytes(vol_head[8:12], "little") if len(vol_head) >= 12 else -1))
-    src_disk = os.path.join(ROOT, "build64", "sysdisk.img")
-    if os.path.exists(src_disk):
-        with open(src_disk, "rb") as f:
-            f.seek(8009 * 512)
-            ref = f.read(64 * 1024)
-        got = read_at(args.target, 8009, len(ref))
-        check("目标盘主分区前 64 KiB 与 build64/sysdisk.img 逐字节一致（卷真的装进去了）",
+    # ★ v0.9.31：参考物改成**介质里的载荷本体**，不再是 build64/sysdisk.img。
+    #   为什么：sysdisk.img 是"可写构建产物"——任何人拿它开一次机（哪怕只是烟测），
+    #   系统就会往里写 config/store/journal（实测：我自己的开机烟测把它写脏，这条断言当场假红）。
+    #   而**安装器真正拷的字节**就是介质 LBA 8193 起的那份载荷，跟它比才是"装进去的到底是不是它"。
+    #   顺带把比较范围从 64 KiB 扩到**整卷**（判据只许加强）。
+    if PAYLOAD_SECTORS:
+        with open(MEDIUM, "rb") as f:
+            f.seek((PAYLOAD_LBA + 1) * 512 + 32584 * 512)
+            ref = f.read(TARGET_SECTORS * 512 - 32584 * 512)
+        got = read_at(args.target, 32584, len(ref))
+        check("目标盘主分区**整卷**与介质里的载荷逐字节一致（卷真的装进去了）",
               got == ref, "%d B" % len(ref))
 
     print("=== 5) 单独启动装好的硬盘（验证真的能开机）===")
@@ -352,7 +376,7 @@ def main():
           (re.search(r"\[CONF64\][^\r\n]*PERSISTENT[^\r\n]*", boot) or ["（无，正确）"])[0])
     # ★ 本批（图标"有时有有时没有"修复）：装好的系统盘第一次启动，图标必须真的在。
     #   如实口径（本批实测）：安装只写 8073 扇区载荷，**主分区还没有 VimtuFS2 卷**
-    #   （离线读目标盘 LBA 8009 是 0）—— 此时图标包的来源只能是**原始区**（内核区尾部 LBA
+    #   （离线读目标盘 LBA 32584 是 0）—— 此时图标包的来源只能是**原始区**（内核区尾部 LBA
     #   7497 起，包在偏移 144144）：`[ICON64] init pack … src=raw`，逐 kind 的 load 打点
     #   src=pack（包里的字节，不是程序化回落）；有卷的盘（演示/验收盘）才是 src=vfs。
     #   修前：这一步在 PATA 上也被"假系统卷槽"挡住（原 code 判 vfs64_system_slot64()>=0

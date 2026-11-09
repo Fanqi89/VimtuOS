@@ -201,7 +201,7 @@ def cap_boot_int13():
     ev = []
     ah42 = src.count("mov ah, 0x42")
     dap = grep_count(r"dap_count|dap_seg|dap_off|dap_lba", ["boot/loader64.asm"])
-    kseg = grep_count(r"KERNEL_LBA\s+equ\s+9|KERNEL_SECTORS\s+equ\s+8000", ["boot/loader64.asm"])
+    kseg = grep_count(r"KERNEL_LBA\s+equ\s+65|KERNEL_SECTORS\s+equ\s+30720", ["boot/loader64.asm"])
     chunks = grep_count(r"CHUNK_SECS\s+equ\s+64|CHUNKS_MAX\s+equ\s+13|SEG_STEP\s+equ\s+0x800",
                         ["boot/loader64.asm"])
     reset = grep_count(r"AL=0x00|AH=0x00", ["boot/loader64.asm"])
@@ -211,7 +211,7 @@ def cap_boot_int13():
     cdtag = grep_count(r"\[LM\] cd boot via ATAPI", ["boot/loader64.asm"])
     dlpass = grep_count(r"mov dl, \[BOOT_DRIVE\]", ["boot/boot.asm", "boot/loader64.asm"])
     ev.append("AH=0x42（扩展读）出现在 loader64.asm：%d 处；DAP 字段（count/seg/off/lba）：%d 处" % (ah42, dap))
-    ev.append("LBA 布局常量未被改动（KERNEL_LBA=9 / KERNEL_SECTORS=8000）：%s" % ("是" if kseg >= 2 else "★ 否"))
+    ev.append("LBA 布局常量未被改动（KERNEL_LBA=65 / KERNEL_SECTORS=30720）：%s" % ("是" if kseg >= 2 else "★ 否"))
     ev.append("分块参数（64 扇区 = 32KB 不跨 64KB 边界 / 每批 13 块 / 段步进 0x800）：%d 处；"
               "失败复位磁盘（AH=0x00 重试）：%d 处；暂存区→高内存保护模式搬运（a32 rep movsd）：%d 处"
               % (chunks, reset, pmcopy))
@@ -293,7 +293,7 @@ def cap_gpt_part():
 
     为什么安装侧是关键：装好的盘以前只有 MBR + 固定 LBA 引导区，UEFI 固件在盘上
     找不到任何 FAT 卷 -> UEFI 机器装完起不来。现在安装收尾会写
-      · 混合 MBR：P1 0xEF 引导区(活动,9+8000) + P2 0x07 主分区 + P3 0xEF ESP(盘尾)
+      · 混合 MBR：P1 0xEF 引导区(活动,65+32519) + P2 0x07 主分区 + P3 0xEF ESP(盘尾)
       · 盘尾备份 GPT（主 GPT 头按规范应在 LBA 1 —— 那里是 loader64.bin，冲突；
         EDK2 在主头无效时用备份头，OVMF 实测）
       · ESP(FAT32, 48MB, SPC=1)：EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN
@@ -601,7 +601,7 @@ def cap_filesystem():
     kern = os.path.join(ROOT, "build64", "kernel64_os.bin")
     if os.path.exists(art) and os.path.exists(kern) and os.path.getmtime(art) >= os.path.getmtime(kern):
         raw = open(art, "rb").read()
-        off = 8009 * 512                                   # 夹具盘的主分区 LBA（与 kernel/part64.h 一致）
+        off = 32584 * 512                                   # 夹具盘的主分区 LBA（与 kernel/part64.h 一致）
         sb = raw[off:off + 512] if len(raw) > off + 512 else b""
         if sb[0:8] == b"VIMTUFS2":
             ver = struct.unpack_from("<I", sb, 8)[0]
@@ -629,7 +629,7 @@ def cap_filesystem():
                       % (os.path.basename(art), ver, inodes, live, free_bad, name_bad))
             fix = fix and (free_bad == 0) and (name_bad == 0)
         else:
-            ev.append("宿主侧解析卷：跳过（%s 的 LBA 8009 不是 VIMTUFS2 卷）" % os.path.basename(art))
+            ev.append("宿主侧解析卷：跳过（%s 的 LBA 32584 不是 VIMTUFS2 卷）" % os.path.basename(art))
             fix = False
     else:
         ev.append("宿主侧解析卷：**跳过**（build64/proc64_test.img 不存在或比当前内核旧 —— "
@@ -3560,6 +3560,46 @@ def cap_vfs_quota():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_r3drv_framework():
+    """★ v0.9.33「ring3 驱动框架 + 零拷贝通道 + 内核监督重启」：架构能力清单里
+    \"文件系统协议只能在 ring0\"、\"用户态进程拿不到 DMA 落点\"、\"驱动崩了只能整机重启\"。
+
+    这一项不是\"多了一个驱动\"，而是**多了一条架构通道**：
+      * 注册机制：服务向内核声明\"我处理哪种文件系统、我服务哪块盘\"；
+      * 按分区类型路由：内核查盘上的字节认文件系统，认得出就交给对应服务，认不出/没驱动 -> 只读安全态；
+      * 零拷贝：AHCI 的 DMA 按\"一帧一项 PRDT\"直接写进**服务映射着的共享页**（0 次 memcpy）；
+      * 监督重启：服务崩了内核同一拍发现并拉起（最多 3 次），超限如实置 FAILED 并退回只读。
+    """
+    need = ["kernel/r3drv_abi.h", "kernel/r3drv64.cpp", "kernel/r3drv64.h",
+            "user/drivers/ext4svc.c", "user/drivers/drvwatch.c", "tests/drv64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    reg = grep_count(r"r3drv64_register64", ["kernel/r3drv64.cpp"])
+    ring = grep_count(r"R3DRV_RING_MAGIC|r3drv64_kick64", ["kernel/r3drv64.cpp", "kernel/r3drv_abi.h"])
+    zc = grep_count(r"ahci64_read_frames64", ["kernel/r3drv64.cpp", "kernel/ahci64.cpp"])
+    sup = grep_count(r"r3drv64_tick64|r3_proc_alive64", ["kernel/r3drv64.cpp", "kernel/task64.cpp"])
+    proc = grep_count(r"vimtu/drivers", ["kernel/syscall64.cpp"])
+    ev = [
+        "ABI 单一定义：`kernel/r3drv_abi.h`（POD + 宏，**内核 C++ 与用户态 C 共用**；环控制块 56 B / "
+        "SQE 32 B / 数据区从 4096 起，自检里有 sizeof 断言）",
+        "注册表：`kernel/r3drv64.cpp` 命中 %d 处；8 槽（名字/协议/盘号/shm_id/pid/心跳/重启次数/统计），"
+        "同名重复注册 = 更新（`mode=new|update`）" % reg,
+        "共享环 + 门铃：命中 %d 处；服务填 SQE → 调一次 `kick` → 内核消费并把 `state` **就地**改成 DONE/FAILED" % ring,
+        "零拷贝：`ahci64_read_frames64()` 一帧一项 PRDT（一条命令 ≤16 帧 = 64 KiB = 128 扇区），"
+        "DMA 直接落在 `proc64_shm_view64` 给出的**服务帧**上；命中 %d 处" % zc,
+        "监督重启：`r3drv64_tick64()` 挂在 kheart 线程（约 1 秒一拍），僵尸进程（PROC64_EXITED）**同一拍**即判死，"
+        "收尸 `proc64_destroy64` 后重启，上限 3 次；命中 %d 处" % sup,
+        "/proc/vimtu/drivers：合成只读节点，ring3 的 `/usr/bin/drvwatch` 周期读取取证（命中 %d 处）" % proc,
+        "★ 边界（如实）：**完全只读**（无写路径）；零拷贝**只在 AHCI**（其它总线退到拷贝路径并打点）；"
+        "没有设备归属仲裁（能注册就能读该盘任意 LBA）；ext4 只支持 extents 且 depth ≤ 1；"
+        "「每 GB 的 CPU 周期数」这一项**没有测**，吞吐证据只有 QEMU 上的 2%~10%",
+        "验收：`tests/drv64_test.py` **48/48**（注册/路由两态/零拷贝 CRC 与宿主逐位相等/64 MiB 对比/崩溃重启/只读回退，★v0.9.34 加监督器极限：crash=2 真除零 #DE + 内核自报 lat_ms≤1000）",
+    ]
+    done = reg > 0 and ring > 0 and zc > 0 and sup > 0 and proc > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 def cap_vfs_acl():
     """★ v0.9.28「POSIX ACL 子集（xattr）」：文件系统能力清单里"无 ACL/xattr"。"""
     need = ["kernel/vfs64.cpp", "kernel/vfs64.h", "tests/acl64_test.py"]
@@ -3789,6 +3829,9 @@ CAPS = [
     ("内核", "★ 文件系统 ACL（POSIX ACL 子集走 xattr：system.posix_acl_access + MASK，判定接入 perm_check_ino64）",
      cap_vfs_acl),
     ("内核", "★ 只读快照（全量克隆成独立 v5 卷 + 只读卷槽；如实标注**非** COW）", cap_vfs_snapshot),
+    ("架构", "★ ring3 驱动框架（注册 + 按分区类型路由 + 只读安全态回退）+ **零拷贝通道**"
+             "（AHCI DMA 一帧一项 PRDT 直接写进服务映射的共享页，0 次 memcpy）+ "
+             "内核监督重启（服务崩了同一拍发现并拉起，超限退回只读）", cap_r3drv_framework),
 ]
 
 
@@ -3961,7 +4004,7 @@ TESTS = [
     ("termcjk64_test.py", "★ v0.5.12 终端汉字缺字修复：单色阈值按码点切换（ASCII 128 / 汉字 96）—— "
                            "banner 6 个汉字墨点 312->423、笔画断裂 4-连通分量 80->53，并守 中英 1:2 / "
                            "[FONT64] selftest PASS / 无 PANIC（17 条断言）"),
-    ("install_persist64_test.py", "★ v0.5.11 装到硬盘后真能持久化：ISO/安装介质装到 8G 盘 -> 目标盘 LBA8009 是 "
+    ("install_persist64_test.py", "★ v0.5.11 装到硬盘后真能持久化：ISO/安装介质装到 8G 盘 -> 目标盘 LBA32584 是 "
                                   "VIMTUFS2 卷头 -> mount_system ok 且无 NOT-PERSISTENT -> mkdir+cfg save 落盘"
                                   "（flush ok via=vfs）-> 正常关机重启 -> ui.theme=3 读回 + 宿主侧解析卷仍有 "
                                   "/home/vimtu/pdata（10 条断言）"),

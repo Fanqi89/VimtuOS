@@ -26,8 +26,8 @@ sys.path.insert(0, HERE)
 
 SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 OUT_IMG = os.path.join(ROOT, "build64", "wm_test.img")
-PART_MAIN_LBA = 8009                      # = kernel/part64.h 的主分区起点
-TARGET_SECTORS = 32768                    # 16 MB（与其它夹具同一口径）
+PART_MAIN_LBA = 32584                      # = kernel/part64.h 的主分区起点
+TARGET_SECTORS = 57343                    # 28MB（= 原 16MB + 主分区起点后移的 24,519）（与其它夹具同一口径）
 
 # 交付路径 -> build64/ 里的产物（合成器必须叫 /bin/wm.elf：kernel/wl64.cpp 就按这个路径找）
 FILES = [

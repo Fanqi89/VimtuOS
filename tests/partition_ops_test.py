@@ -18,7 +18,7 @@
   4) 直接解析目标盘字节断言：
        * P1 首 64 扇区被清零（垃圾 0xA5 没了）
        * P2 首扇区 = VimtuFS2 真超级块（magic "VIMTUFS2" + 版本/几何 + CRC32 + 55AA）
-       * 删除后 MBR 里第 1 项 16 字节全 0（只删了 P1），第 2 项仍是 0x07/8009，
+       * 删除后 MBR 里第 1 项 16 字节全 0（只删了 P1），第 2 项仍是 0x07/32584，
          签名仍是 55AA —— "删一个不该动另一个"是一条硬判据
 
 退出码：0 全过 / 1 有断言失败 / 2 环境问题
@@ -42,9 +42,9 @@ QEMU_CANDIDATES = [
 ]
 
 MEDIUM = os.path.join(ROOT, "vimtu64-64.img")
-TARGET_SECTORS = 32768
-PART_BOOT_LBA = 9
-PART_MAIN_LBA = 8009
+TARGET_SECTORS = 57343
+PART_BOOT_LBA = 65
+PART_MAIN_LBA = 32584
 
 
 def find_qemu(explicit=None):
@@ -213,13 +213,13 @@ def main():
     log = run_wizard(qemu, args.target, serial_log, args.port)
 
     print("=== 3) 串口断言 ===")
-    check("新建分区表 OK", "[PART] 新建分区表 OK drive=1 boot=9+8000" in log)
-    check("格式化引导分区 P1（table=mbr index=1 start=9 fs=blank）",
-          "[PART] 格式化 OK drive=1 table=mbr index=1 start=9 sectors=8000 fs=blank" in log)
-    check("格式化主分区 P2（table=mbr index=2 start=8009 fs=VimtuFS2）",
-          "[PART] 格式化 OK drive=1 table=mbr index=2 start=8009 sectors=24759 fs=VimtuFS2" in log)
+    check("新建分区表 OK", "[PART] 新建分区表 OK drive=1 boot=65+32519" in log)
+    check("格式化引导分区 P1（table=mbr index=1 start=65 fs=blank）",
+          "[PART] 格式化 OK drive=1 table=mbr index=1 start=65 sectors=32519 fs=blank" in log)
+    check("格式化主分区 P2（table=mbr index=2 start=32584 fs=VimtuFS2）",
+          "[PART] 格式化 OK drive=1 table=mbr index=2 start=32584 sectors=24759 fs=VimtuFS2" in log)
     check("删除分区项 index=1（P1，含首扇区抹除 wiped=1）",
-          "[PART] 删除分区 OK drive=1 table=mbr index=1 start=9 sectors=8000 wiped=1" in log)
+          "[PART] 删除分区 OK drive=1 table=mbr index=1 start=65 sectors=32519 wiped=1" in log)
     # 两步确认的"武装"打点：格式化两次、删除一次
     check("两步确认：格式化武装过 2 次",
           log.count("[SETUP] 格式化待确认") == 2,
@@ -249,20 +249,24 @@ def main():
     # 注意：格式化写的是**真文件系统 VimtuFS2** 的超级块（不再是占位串 "VIMTUFS1"）。
     # 字段偏移见 kernel/vfs64.cpp 的 VFS_O_*：8=版本、12=扇区大小、16=块大小、20=总块数、
     # 24=根 inode、28/32=位图起点/块数、36/40/44=inode 起点/个数/大小、48/52=数据区起点/块数、
-    # 60=CRC32([0,60))、510=0x55AA。下面期望的几何数字按 vfs64_format 的规则算：
-    # ★ v0.9.28 起新格式化的卷一律 v5（VFS64_VERSION=5u；v4/v3 旧卷仍可挂载）——
-    #   inode 仍是 128B/个（每块 4 个）：24759 块 -> 位图 ceil(24759/4096)=7 块；
-    #   inode min(24759/64,512)=386 个=ceil(386/4)=97 块；数据区 = 24759 - (1+7+97) = 24654 块。
+    # 60=CRC32([0,60))、510=0x55AA。下面期望的几何数字按 vfs64_format 的**现行**规则算：
+    #   ★ v0.9.28 起新格式化的卷一律 v5（VFS64_VERSION=5u；v4/v3 旧卷仍可挂载）；
+    #   ★ inode 密度 = 每 16 块一个 inode（v0.9.28 修的真缺陷：原来 total/64，24759 块
+    #     只给 386 个 inode，装不下 500 个文件的系统卷），inode 128B/个（每块 4 个）：
+    #       位图 = ceil(24759/4096) = 7 块
+    #       inode 个数 = 24759/16 = 1547 个 -> ceil(1547/4) = 387 块
+    #       数据区起点 = 1 + 7 + 387 = 395；数据区块数 = 24759 - 395 = 24364
+    #   （旧断言写的是 v4 + total/64 的 386@97/24654，v0.9.28 之后就一直是假红，本批修正。）
     check("P2 首扇区 = VimtuFS2 真超级块 magic VIMTUFS2", p2[:8] == b"VIMTUFS2", "%r" % p2[:8])
     gf = struct.unpack_from("<13I", p2, 8)
-    check("VimtuFS2 超级块版本 = 4（P4 起新卷 v4）且扇区/块 = 512B、inode = 128B",
-          gf[0] == 4 and gf[1] == 512 and gf[2] == 512 and gf[9] == 128,
+    check("VimtuFS2 超级块版本 = 5（v0.9.28 起新卷 v5）且扇区/块 = 512B、inode = 128B",
+          gf[0] == 5 and gf[1] == 512 and gf[2] == 512 and gf[9] == 128,
           "version=%d sector=%d block=%d inode=%d" % (gf[0], gf[1], gf[2], gf[9]))
     check("VimtuFS2 超级块记录总块数 = 24759",
           gf[3] == TARGET_SECTORS - PART_MAIN_LBA, "total=%d" % gf[3])
-    check("VimtuFS2 超级块几何自洽（根 inode 0 / 位图 7 块 / inode 386 个 97 块 / 数据区 24654 块）",
-          gf[4] == 0 and gf[5] == 1 and gf[6] == 7 and gf[7] == 8 and gf[8] == 386 and
-          gf[10] == 105 and gf[11] == 24654,
+    check("VimtuFS2 超级块几何自洽（根 inode 0 / 位图 7 块 / inode 1547 个 387 块 / 数据区 24364 块）",
+          gf[4] == 0 and gf[5] == 1 and gf[6] == 7 and gf[7] == 8 and gf[8] == 1547 and
+          gf[10] == 395 and gf[11] == 24364,
           "root=%d bitmap=%d@%d inodes=%d@%d data=%d@%d" %
           (gf[4], gf[6], gf[5], gf[8], gf[7], gf[11], gf[10]))
     check("VimtuFS2 超级块 CRC32([0,60)) 正确",
@@ -275,7 +279,7 @@ def main():
     e1 = mbr[446:462]
     e2 = mbr[462:478]
     check("MBR 第 1 项（引导分区）已被删除（16 字节全 0）", e1 == b"\0" * 16, e1.hex())
-    check("MBR 第 2 项（主分区）保留：type=0x07 start=8009（删一个不动另一个）",
+    check("MBR 第 2 项（主分区）保留：type=0x07 start=32584（删一个不动另一个）",
           e2[4] == 0x07 and struct.unpack_from("<I", e2, 8)[0] == PART_MAIN_LBA,
           "type=0x%02X start=%d" % (e2[4], struct.unpack_from("<I", e2, 8)[0]))
 

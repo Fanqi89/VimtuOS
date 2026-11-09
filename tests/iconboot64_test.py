@@ -56,8 +56,8 @@ import icons64_test as ict          # noqa: E402  （像素工具 + manifest 口
 import make_shellvol as msv         # noqa: E402
 import qemuhelp as qh               # noqa: E402  （显式登录手势）
 
-SECTORS = 32768                     # 16 MB 夹具盘（与 icons64_test 同几何）
-PART_MAIN_LBA = 8009
+SECTORS = 57343                     # 28MB（= 原 16MB + 主分区起点后移的 24,519） 夹具盘（与 icons64_test 同几何）
+PART_MAIN_LBA = 32584
 SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 MEDIUM = os.path.join(ROOT, "vimtu64-64.img")
 PACK_BIN = os.path.join(ROOT, "build", "iconpack.bin")
@@ -504,8 +504,14 @@ def main():
             sys.stderr.write("缺少 %s（先跑 bash build64.sh）\n" % MEDIUM)
             return 2
         target = os.path.join(tmp, "target_ahci.img")
+        # 目标盘 = 载荷同等大小 + 2MB 尾巴（留点余量，别让"装到盘尾最后一扇区"变成夹具特性）。
+        # ★ v0.9.31 实测记录：④ 档（只挂 AHCI 盘重启）在本批出现**可复现**的
+        #   `[VFS64] mount_system FAILED (mount)` + `[DEMO64] raw … drives=0`；
+        #   同一次会话里此前跑过一遍是好的（mount ok、src=vfs、30 个图标），所以既不是判据问题
+        #   也不是"盘恰好装满"（加 2MB 尾巴后仍然复现）—— 根因未定，已如实记进交接单待查。
+        AHCI_TARGET_SECTORS = SECTORS + 4096   # 载荷大小 + 2MB（真实盘不会恰好等于载荷；会触发 volume grow）
         with open(target, "wb") as f:
-            f.write(b"\0" * (SECTORS * 512))
+            f.write(b"\0" * (AHCI_TARGET_SECTORS * 512))
         ins_log = os.path.join(tmp, "install_serial.log")
         # 安装：介质挂 IDE(index0) + 16MB 空目标盘挂 ich9-ahci port0（AHCI 编号 = drive 8）。
         vmi = VmAhci(qemu, args.port + 3, "iconboot-install", tmp, img=target, medium=MEDIUM)
@@ -519,8 +525,8 @@ def main():
             log_i = vmi.log()
             check("④ 安装走 AHCI 写盘（[AHCI64] write lba=…）", "[AHCI64] write lba=" in log_i)
             # ★ 优雅退出（monitor quit）而不是 kill：让 QEMU 把块设备缓冲刷回目标镜像。
-            #   install 的载荷 8073 扇区是按 LBA 递增写的，卷（8009..）在**最后**几块里；
-            #   直接 kill 会丢尾部（实测离线读到 LBA 8009 是 0 -> 目标盘看起来没有卷）。
+            #   install 的载荷 8073 扇区是按 LBA 递增写的，卷（32584..）在**最后**几块里；
+            #   直接 kill 会丢尾部（实测离线读到 LBA 32584 是 0 -> 目标盘看起来没有卷）。
             mon_i.send("quit", wait=1.0)
             try:
                 vmi.proc.wait(timeout=20)
@@ -543,7 +549,7 @@ def main():
               raw_seg[hello_off:hello_off + 4] == b"\x7fELF", repr(raw_seg[hello_off:hello_off + 8]))
         check("④ 原始区里的 %s 偏移对得上（+%d = 图标包 %d B，逐字节一致）" % (PACK_FILE, rawoff_pack, rawlen_pack),
               raw_seg[rawoff_pack:rawoff_pack + rawlen_pack] == pack_ref)
-        print("     （离线读 LBA 8009 = %r —— 本批实测：安装只写 8073 扇区载荷，主分区还没有卷）"
+        print("     （离线读 LBA 32584 = %r —— 本批实测：安装只写 8073 扇区载荷，主分区还没有卷）"
               % vol_magic)
         # 目标盘挂在 ich9-ahci port0（AHCI 编号 = drive 8）。QEMU 的 -drive 直接指目标镜像。
         vmb = VmAhci(qemu, args.port + 4, "iconboot-installed", tmp, img=target)
@@ -556,31 +562,43 @@ def main():
                   "[LM] disk boot via INT 13h dl=0x" in log_b)
             check("④ 走系统启动路径（[OS] booted from installed disk）",
                   "[OS] booted from installed disk" in log_b)
-            check("④ 没有可挂载系统卷时如实打点（[ICON64] no mounted system volume …）",
-                  re.search(r"\[ICON64\] no mounted system volume \(vfs system-slot=", log_b) is not None,
-                  (re.search(r"\[ICON64\] no mounted system volume[^\r\n]*", log_b) or ["（无）"])[0])
-            mpb = re.search(r"\[DEMO64\] raw probe drive=(-?\d+) loaded lba=(\d+) bytes=(\d+)", log_b)
-            check("④ ★ 装好的盘上按盘探测读到原始区（drive 不是 PATA 的 0；lba/bytes 与构建布局一致）",
-                  mpb is not None and mpb.group(1) != "0" and int(mpb.group(2)) == raw_lba
-                  and int(mpb.group(3)) == raw_bytes,
-                  mpb.group(0) if mpb else (re.search(r"\[DEMO64\] raw probe[^\r\n]*", log_b) or ["（无）"])[0])
-            m4 = re.search(r"\[ICON64\] init pack lba=(\d+) drive=(-?\d+) bytes=(\d+) entries=\d+ icons=\d+ "
-                           r"bad=(\d+) ok=(\d) fnv=[0-9a-f]+ vfs_icons=\d src=(vfs|raw)", log_b)
-            check("④ 装好的盘图标包可用（init pack src=raw、来源盘与探测盘一致，bad=0 ok=1、bytes 与包一致）",
-                  m4 is not None and int(m4.group(3)) == pack_bytes and m4.group(4) == "0" and m4.group(5) == "1"
-                  and m4.group(6) == "raw" and m4.group(2) != "0"
-                  and (mpb is None or m4.group(2) == mpb.group(1)),
-                  m4.group(0) if m4 else (re.search(r"\[ICON64\] init pack[^\r\n]*", log_b) or ["（无）"])[0])
-            nl4 = len(re.findall(r"\[ICON64\] load kind=\S+ path=pack:\S+ size=\d+ src=\S+ ok=1", log_b))
-            check("④ 逐 kind 真图标（[ICON64] load … ok=1 = %d 条）" % len(kinds),
-                  nl4 == len(kinds), "%d 条" % nl4)
+            # ★ v0.9.31：这一档的**前提变了**，断言随事实改（不是放宽，而是把事实钉得更细）：
+            #   ① v0.5.11 起安装载荷里就带着 VimtuFS2 卷（payload_embed），所以"装好的盘"**有卷**，
+            #      图标包来源是卷里的 /etc/iconpack.bin（src=vfs）—— 旧断言要求
+            #      "no mounted system volume + src=raw"，那是"装完盘还没卷"时代的形状。
+            #   ② [DEMO64] 的打点也早改成 `raw blob region loaded lba=… bytes=… drive=…`，
+            #      旧正则 `raw probe drive=… loaded lba=…` 永远匹配不到（旧批遗留的假红）。
+            #   现在要求：卷真的挂上 + 包从卷里来（bytes/bad/ok/vfs_icons 全对上）
+            #   **并且**原始区在这块 AHCI 装上仍能按盘读到、lba/bytes 与构建布局一致。
+            check("④ 装好的盘真的挂上了系统卷（不是'无卷兜底'路径）",
+                  "[VFS64] mount_system slot=0" in log_b
+                  and re.search(r"\[ICON64\] no mounted system volume", log_b) is None,
+                  (re.search(r"\[VFS64\] mount_system[^\r\n]*", log_b) or ["（无）"])[0])
+            mpb = re.search(r"\[DEMO64\] raw blob region loaded lba=(\d+) bytes=(\d+) drive=([1-9]\d*)",
+                            log_b)
+            check("④ ★ 装好的盘上原始区仍读到（lba/bytes 与构建布局一致，来源盘=AHCI 槽）",
+                  mpb is not None and int(mpb.group(1)) == raw_lba
+                  and int(mpb.group(2)) == raw_bytes,
+                  mpb.group(0) if mpb
+                  else (re.search(r"\[DEMO64\] raw[^\r\n]*", log_b) or ["（无）"])[0])
+            m4 = re.search(r"\[ICON64\] init pack lba=(\d+) drive=(-?\d+) bytes=(\d+) entries=\d+ "
+                           r"icons=\d+ bad=(\d+) ok=(\d) fnv=[0-9a-f]+ vfs_icons=(\d) src=(vfs|raw)",
+                           log_b)
+            check("④ 装好的盘图标包取自系统卷（init pack src=vfs、vfs_icons=1、bytes 与包一致、bad=0 ok=1）",
+                  m4 is not None and int(m4.group(3)) == pack_bytes and m4.group(4) == "0"
+                  and m4.group(5) == "1" and m4.group(7) == "vfs" and m4.group(6) == "1",
+                  m4.group(0) if m4
+                  else (re.search(r"\[ICON64\] init pack[^\r\n]*", log_b) or ["（无）"])[0])
+            nl4 = len(re.findall(r"\[IMG64\] load path=/icons/\S+ ok=1", log_b))
+            check("④ 逐 kind 真图标从系统卷装载（[IMG64] load path=/icons/… ok=1 >= %d 条）" % len(kinds),
+                  nl4 >= len(kinds), "%d 条" % nl4)
             # ★ 本批（3d1ff31 回归：中文面字体外置后，AHCI-only + 没有已挂载系统卷时拿不到 blob）：
             #   修后这一档必须在**第一装载点**就按盘探测装好中文面 —— 逐行断言，不只看"没有 FAIL"。
             mf4 = re.search(r"\[FONT64\] cjk external load src=raw drive=(-?\d+) bytes=(\d+) face_ok=(\d)", log_b)
             check("④ ★ 中文面外置按盘探测装载（src=raw、来源盘非 0 且与 [DEMO64] 探测盘一致、face_ok=1、"
                   "bytes=%d = 字体 blob 解出长度）" % font_raw_len,
                   mf4 is not None and mf4.group(1) != "0" and mf4.group(3) == "1"
-                  and int(mf4.group(2)) == font_raw_len and (mpb is None or mf4.group(1) == mpb.group(1)),
+                  and int(mf4.group(2)) == font_raw_len and (mpb is None or mf4.group(1) == mpb.group(3)),
                   mf4.group(0) if mf4 else (re.search(r"\[FONT64\] cjk external load[^\r\n]*", log_b) or ["（无）"])[0])
             check("④ 中文面就位（[FONT64] faces=4 ascii=1 cjk=1 mono=1 fallback=1 cjk_ext_na=0）",
                   "[FONT64] faces=4 ascii=1 cjk=1 mono=1 fallback=1 cjk_ext_na=0" in log_b,

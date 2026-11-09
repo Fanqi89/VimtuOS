@@ -919,6 +919,67 @@ bool ahci64_read64(int idx, uint32_t lba, uint32_t count, void* buf) {
     if (di < 0 || !buf) return false;
     return ahci_xfer(di, ATA_CMD_READ_DMA_EXT, lba, count, buf, false);
 }
+// ==================== ★ v0.9.33：零拷贝散列读（DMA 直接落到调用方给的物理帧）====================
+// 为什么要单独一条路径（不能复用 ahci_xfer）：
+//   * ahci_xfer 的"直传路径"要求目标 **物理地址连续**（只发一个 PRDT 项）；而 ring3 驱动服务的
+//     共享对象是 page_alloc_64 出来的**离散帧**，只能"一帧一项 PRDT"；
+//   * 这里 **一个字节都不 memcpy**：DMA 引擎把盘上的数据直接写进这些帧，而这些帧已经映射进
+//     ring3 驱动的地址空间（proc64_shm_create64 / proc64_shm_map64）——这就是"零拷贝通道"的
+//     物理落点。x86 上 CPU 与 DMA 缓存一致（无 IOMMU 也一致），落地后不需要任何刷新。
+// 分块：一条命令最多 AHCI64_DMA_PAGES(16) 个 PRDT 项 = 16 帧 = 64 KiB = 128 扇区。
+// 语义：frames[] 是**物理帧号数组**（由 proc64_shm_view64 取到），count 是扇区数；
+//       目标容量不够 / 帧号非法 -> 如实返回 false（不猜、不截断）。
+bool ahci64_read_frames64(int idx, uint32_t lba, uint32_t count,
+                          const uint64_t* frames, uint32_t nframes,
+                          uint64_t* out_bytes) {
+    if (out_bytes) *out_bytes = 0;
+    if (count == 0) return true;
+    const int di = ahci_drive_index(idx);
+    if (di < 0 || !frames || nframes == 0) return false;
+    if ((uint64_t)count * 512ull > (uint64_t)nframes * 4096ull) return false;
+
+    uint32_t done_sec = 0;
+    uint32_t used_fr  = 0;
+    while (done_sec < count) {
+        const uint32_t left = count - done_sec;
+        uint32_t fr = nframes - used_fr;
+        if (fr > (uint32_t)AHCI64_DMA_PAGES) fr = (uint32_t)AHCI64_DMA_PAGES;
+        uint32_t sec = fr * 8u;                    // 每帧 8 个 512B 扇区
+        if (sec > left) sec = left;
+        fr = (sec + 7u) / 8u;                      // 末块可能不满一帧
+        if (fr == 0) return false;
+
+        Ahci64Prd prds[AHCI64_DMA_PAGES];
+        uint32_t sec_left = sec;
+        for (uint32_t i = 0; i < fr; i++) {
+            const uint64_t pa = frames[used_fr + i];
+            if (pa == 0 || (pa & 1ull) != 0) return false;   // 非法物理帧：如实拒绝
+            prds[i].pa = pa;
+            const uint32_t b = (sec_left > 8u) ? 4096u : sec_left * 512u;
+            prds[i].bytes = b;
+            sec_left -= (b / 512u);
+        }
+        if (sec_left != 0) return false;
+
+        if (!ahci_cmd_retry(di, ATA_CMD_READ_DMA_EXT, (uint64_t)lba + done_sec, sec,
+                            prds, (int)fr, false, false)) {
+            const uint8_t p = g_devs[di].port;
+            dbg64_line_begin64();
+            dbg64_str("[AHCI64] zerocopy read FAILED lba="); dbg64_dec((uint64_t)lba + done_sec);
+            dbg64_str(" secs=");   dbg64_dec(sec);
+            dbg64_str(" frames="); dbg64_dec(fr);
+            dbg64_str(" tfd=0x");  dbg64_hex64(prd(p, P_TFD));
+            dbg64_str(" is=0x");   dbg64_hex64(prd(p, P_IS));
+            dbg64_nl();
+            dbg64_line_end64();
+            return false;
+        }
+        done_sec += sec;
+        used_fr  += fr;
+        if (out_bytes) *out_bytes += (uint64_t)sec * 512ull;
+    }
+    return true;
+}
 
 bool ahci64_write64(int idx, uint32_t lba, uint32_t count, const void* buf) {
     const int di = ahci_drive_index(idx);

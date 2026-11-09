@@ -11,8 +11,8 @@
 验收：
   1) 串口：I:cdboot → I:jump loader64 → L:media=cd → ... → K
   2) 向导：介质描述符 OK kind=1 → 新建分区 → 安装完成 100% → 自动重启
-  3) 目标盘字节：MBR 55AA + P1(0xEF,活动,9+8000) + P2(0x07,8009..尾)
-     LBA1..8 = loader64.bin、LBA9.. = kernel64_os.bin 逐字节一致
+  3) 目标盘字节：MBR 55AA + P1(0xEF,活动,65+32519) + P2(0x07,32584..尾)
+     LBA1..64 = loader64.bin、LBA65.. = kernel64_os.bin 逐字节一致
 """
 import argparse
 import os
@@ -35,7 +35,7 @@ ISO = os.path.join(ROOT, "vimtu64-64.iso")
 LOADER = os.path.join(ROOT, "build64", "loader64.bin")
 OS_KERNEL = os.path.join(ROOT, "build64", "kernel64_os.bin")
 INS_KERNEL = os.path.join(ROOT, "build64", "kernel64.bin")
-TARGET_SECTORS = 32768
+TARGET_SECTORS = 57343
 
 
 def find_qemu(explicit=None):
@@ -236,17 +236,17 @@ def main():
     p1, p2 = check_mbr(args.target)
     check("MBR 55AA 且分区1 存在", p1 is not None, "%s" % (p1,))
     if p1:
-        check("P1 = 引导分区 0xEF 活动，9 + 8000", p1["type"] == 0xEF and p1["boot"]
-              and p1["start"] == 9 and p1["sectors"] == 8000, "%s" % (p1,))
-    check("P2 = 主分区 0x07，8009..盘尾", p2 is not None and p2["type"] == 0x07
-          and p2["start"] == 8009 and p2["sectors"] == TARGET_SECTORS - 8009, "%s" % (p2,))
+        check("P1 = 引导分区 0xEF 活动，65 + 32519", p1["type"] == 0xEF and p1["boot"]
+              and p1["start"] == 65 and p1["sectors"] == 32519, "%s" % (p1,))
+    check("P2 = 主分区 0x07，32584..盘尾", p2 is not None and p2["type"] == 0x07
+          and p2["start"] == 32584 and p2["sectors"] == TARGET_SECTORS - 32584, "%s" % (p2,))
     loader_ref = open(LOADER, "rb").read()
     os_ref = open(OS_KERNEL, "rb").read()
     ins_ref = open(INS_KERNEL, "rb").read()
-    check("LBA1..8 = loader64.bin 逐字节一致",
+    check("LBA1..64 = loader64.bin 逐字节一致",
           read_at(args.target, 1, len(loader_ref)) == loader_ref, "%d 字节" % len(loader_ref))
-    kern = read_at(args.target, 9, len(os_ref))
-    check("LBA9.. = kernel64_os.bin 逐字节一致", kern == os_ref, "%d 字节" % len(os_ref))
+    kern = read_at(args.target, 65, len(os_ref))
+    check("LBA65.. = kernel64_os.bin 逐字节一致", kern == os_ref, "%d 字节" % len(os_ref))
     check("目标盘内核不是安装程序内核", kern != ins_ref[:len(kern)])
 
     print("=== ISO RESULT: %s ===" % ("PASS" if ok else "FAIL"))

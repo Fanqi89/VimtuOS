@@ -19,7 +19,7 @@
    把 `/bin/vpkg`、`/bin/store`、`/opt/vpkg/index.json`、`/opt/vpkg/repo/*` 以及 `--src` 里
    额外指定的文件写进 VimtuFS2 v4 卷（复用 `tools/tcc_pack_win.VolumeEdit`），写完
    **逐字节回读自检**（再用一个独立解析器 `vol_read` 复读一遍），需要时拼成可引导盘
-   （`tools/make_shellvol.build_disk`：MBR + 主分区 @ LBA 8009）。
+   （`tools/make_shellvol.build_disk`：MBR + 主分区 @ LBA 32584）。
 
 用法（仓库里 build64.sh 的那一步）：
     py -3 tools/store_pack_win.py --make-repo build64/store/repo_spec.json \\
@@ -50,7 +50,7 @@ import tarfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SECTOR = 512
-PART_MAIN_LBA = 8009
+PART_MAIN_LBA = 32584
 VPKG_VOL = "/bin/vpkg"
 STORE_VOL = "/bin/store"
 REPO_VOL = "/opt/vpkg/repo"

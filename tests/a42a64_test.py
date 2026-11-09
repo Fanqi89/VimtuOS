@@ -56,8 +56,8 @@ SHELL_BIN = os.path.join(ROOT, "build64", "shell.bin")
 PROBE_ELF = os.path.join(ROOT, "build64", "a42a_sys.elf")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "a42a64_test.img")
 
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343
 SECTOR = 512
 SHELL_PATH = "/bin/shell.bin"
 PROBE_PATH = "/bin/a42a_sys.elf"
@@ -66,7 +66,7 @@ HELLO_BYTES = b"VimtuOS A4-1 ring3 shell: /etc/sh64hello.txt byte test\n"
 
 # 改动前后的"内核区硬上限"（扇区）：改动前 = 图标包预留区间 LBA 7497..8008 之前
 OLD_LIMIT_SECTORS = 7497 - 9          # 7488
-NEW_LIMIT_SECTORS = 8000              # LBA 9..8008 = 4 MiB
+NEW_LIMIT_SECTORS = 30720             # ★ v0.9.31：LBA 65..30784 = 15 MiB（内核容量）
 OLD_LIMIT_BYTES = OLD_LIMIT_SECTORS * SECTOR
 NEW_LIMIT_BYTES = NEW_LIMIT_SECTORS * SECTOR
 # 改动前的系统内核实测字节数（本批开工时构建产物 build64/kernel64_os.bin 的大小；
@@ -221,8 +221,8 @@ def main():
         return 2
     ossz = os.path.getsize(KERNEL_OS)
     # ★ 预算策略（B5 + 驱动线 3 合流后的**重钉**；R 的来历写在下面，不许再凭感觉改数字）
-    #   内核区硬上限 = 4,096,000 B（LBA 9..8008 = 8,000 扇区 = NEW_LIMIT_BYTES；memlayout64.h /
-    #   loader64.asm / build64.sh 的 KERNEL_SECTORS=8000 三处一致）。
+    #   内核区硬上限 = 4,096,000 B（LBA 65..30784 = 8,000 扇区 = NEW_LIMIT_BYTES；memlayout64.h /
+    #   loader64.asm / build64.sh 的 KERNEL_SECTORS=30720 三处一致）。
     #   本批实测（合流后的 dev 版）：系统内核 **3,418,352 B** -> 余量 **677,648 B**。
     #   旧阈值 700,000 B 是上一批（内核 3,395,936 B）钉的；本批 virtio-gpu 驱动线实测 +22,490 B，
     #   加上 make/tar/Wayland 合流后余量落到 677,648 B -> 旧阈值红（差 22,352 B）。重钉三层口径：
@@ -253,7 +253,7 @@ def main():
     RESERVE_BYTES = 640 * 1024                                             # ② 预留下限 = 655,360 B
     BATCH_BASELINE_BYTES = 3418352                                         # ③ 本批实测（合流后 dev 版）
     ALLOW_BYTES = NEW_LIMIT_BYTES - BATCH_BASELINE_BYTES - RESERVE_BYTES   # = 22,288
-    check("① 系统内核在内核区硬上限内（<='%d' B = LBA 9..8008 = %d 扇区）" % (NEW_LIMIT_BYTES, NEW_LIMIT_SECTORS),
+    check("① 系统内核在内核区硬上限内（<='%d' B = LBA 65..30784 = %d 扇区）" % (NEW_LIMIT_BYTES, NEW_LIMIT_SECTORS),
           # 顺带钉住"内核区确实从 7,488 扇区扩到 8,000 扇区"（= 旧上限 + 256 KiB；常量自洽检查）
           ossz <= NEW_LIMIT_BYTES and (NEW_LIMIT_BYTES - OLD_LIMIT_BYTES) == 262144,
           "kernel64_os.bin=%d B；余量 %d B" % (ossz, NEW_LIMIT_BYTES - ossz))

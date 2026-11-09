@@ -4,7 +4,7 @@
 
 做什么（骨架与 tests/elf64_test.py / app64_test.py 同一套，为了证据链可比）：
   1) 用 build64/system.img 造一块"已装好系统、主分区已格式化"的 16MB 测试盘
-     （= system.img 的字节 + 标准 MBR 分区表 + 在 LBA 8009 上复刻 kernel/vfs64.cpp 的空 VimtuFS2 卷）；
+     （= system.img 的字节 + 标准 MBR 分区表 + 在 LBA 32584 上复刻 kernel/vfs64.cpp 的空 VimtuFS2 卷）；
   2) 无头启动两遍，读串口日志逐条断言：
      第一遍：内核把**内嵌的 musl 静态 ELF** 幂等装进 VimtuFS2（/musl_hello.elf）→
              建**真进程**（proc64）→ 由 elf64 加载器从**文件系统**读出来 → 建初始栈/auxv →
@@ -70,10 +70,10 @@ SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "musl64_test.img")
 
 SECTOR = 512
-PART_BOOT_LBA = 9
-PART_BOOT_SECS = 8000
-PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS     # 8009（与 kernel/part64.h 一致）
-TARGET_SECTORS = 32768                             # 16MB
+PART_BOOT_LBA = 65
+PART_BOOT_SECS = 32519
+PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS     # 32584（与 kernel/part64.h 一致）
+TARGET_SECTORS = 57343                             # 28MB（= 原 16MB + 主分区起点后移的 24,519）
 
 MUSL_PATH = "/musl_hello.elf"
 

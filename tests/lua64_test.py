@@ -71,8 +71,8 @@ def use_build_dir(path):
     FIXTURE = os.path.join(BUILD, "lua_test.img")
     PROBE = os.path.join(BUILD, "a44probe")
 
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343
 SECTOR = 512
 MMAP_VA = 0x100000000 + 0x90000
 BASE64 = 0x100000000

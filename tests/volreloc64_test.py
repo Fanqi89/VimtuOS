@@ -25,7 +25,7 @@ v0.5.13 引入"安装时把系统卷扩到主分区大小"，判据只看了 `[V
   * 逐文件把「安装介质载荷里的系统卷」与「装好的盘上的系统卷」按 sha256 比对，必须全部一致；
   * 每个文件用到的块都必须在位图里标"已用"；
   * 所有在用 inode 的 CRC32([0,124)) 必须自洽；
-  * 卷的 total 必须**等于主分区扇区数**（= 磁盘扇区数 - 33(GPT 备份) - 98304(ESP) - 8009）；
+  * 卷的 total 必须**等于主分区扇区数**（= 磁盘扇区数 - 33(GPT 备份) - 98304(ESP) - 32584）；
   * 装好启动后不许出现 `skip corrupt inode` / `BAD block=` / `NOT-PERSISTENT`，且要进桌面。
 
 两个场景：
@@ -50,6 +50,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 MEDIUM = os.path.join(ROOT, "vimtu64-64.img")
 PAYLOAD = os.path.join(ROOT, "build64", "sysdisk.img")
+# ★ v0.9.31：载荷在安装介质里的起始 LBA（LBA 8192 = 载荷头，8193 起 = 载荷本体）。
+PAYLOAD_LBA = 8193
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",
     r"C:\Program Files (x86)\qemu\qemu-system-x86_64.exe",
@@ -57,7 +59,7 @@ QEMU_CANDIDATES = [
 ]
 QEMU_IMG = r"C:\Program Files\qemu\qemu-img.exe"
 
-MAIN_LBA = 8009
+MAIN_LBA = 32584
 ESP_SECTORS = 98304
 GPT_BACKUP = 33
 SECT = 512
@@ -266,12 +268,26 @@ def main():
         ok = ok and bool(cond)
         print("  [%s] %s %s" % ("PASS" if cond else "FAIL", name, detail))
 
-    # 载荷里的系统卷（安装器就是把它拷到目标盘的 8009）
-    payload_vol = Vol(PAYLOAD, MAIN_LBA)
+    # ★ v0.9.31：参考物改成**介质里的载荷本体**（安装器真正拷的那一份），不再直接读
+    #   build64/sysdisk.img。理由：sysdisk.img 是**可写构建产物** —— 任何人拿它开一次机，
+    #   系统就会往里写 /etc/users.db、/etc/apps.json、/etc/dock.conf、/kaisi.png…
+    #   于是"参考集合"比载荷多出几个文件，这条断言当场假红（本批实测：缺 6 个，全是开机写的）。
+    #   介质布局：LBA 8192 = 载荷头，8193 起 = 载荷本体（= build64/system.img）。
+    payload_copy = os.path.join(args.work, "payload_from_media.img")
+    if (not os.path.exists(payload_copy)) or os.path.getmtime(payload_copy) < os.path.getmtime(MEDIUM):
+        with open(MEDIUM, "rb") as f:
+            f.seek(PAYLOAD_LBA * 512)
+            n = (os.path.getsize(MEDIUM) // 512 - PAYLOAD_LBA) * 512
+            with open(payload_copy, "wb") as g:
+                g.write(f.read(n))
+    # 载荷里的系统卷（安装器就是把它拷到目标盘的 32584）
+    payload_vol = Vol(payload_copy, MAIN_LBA)
+    print("载荷系统卷（取自介质 %s，%d B）：total=%d bmn=%d inodes=%d data=%d 文件 %d 个"
+          % (os.path.basename(MEDIUM), os.path.getsize(payload_copy), payload_vol.total,
+             payload_vol.bmn, payload_vol.inon, payload_vol.data_start,
+             len(payload_vol.files())))
     payload_files = payload_vol.files()
-    print("载荷系统卷：total=%d bmn=%d inodes=%d data=%d 文件 %d 个"
-          % (payload_vol.total, payload_vol.bmn, payload_vol.inon, payload_vol.data_start,
-             len(payload_files)))
+    print("载荷文件集合：%d 个（作为后续每块盘'一个文件都不许丢'的基准）" % len(payload_files))
 
     def compare_volume(tag, path, disk_sectors):
         vol = Vol(path, MAIN_LBA)

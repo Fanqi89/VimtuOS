@@ -46,8 +46,8 @@ import qemuhelp as qh             # noqa: E402  （★ 公共登录手势：ui.l
 import proc64_test as p64         # noqa: E402  （find_qemu / prepare_fixture 的 SYSTEM_IMG 路径）
 
 SECTOR = 512
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768                    # 16MB 系统盘
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343                    # 28MB（= 原 16MB + 主分区起点后移的 24,519） 系统盘
 DATA_SECTORS = 32768                      # 16MB 数据盘
 DATA_PART_LBA = 8192
 DATA_PART_SECTORS = 24576

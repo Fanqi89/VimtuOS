@@ -51,7 +51,7 @@ QEMU_CANDIDATES = [
 ]
 
 MEDIUM = os.path.join(ROOT, "vimtu64-64.img")
-TARGET_SECTORS = 32768                 # 16MB 目标 SATA 盘（与 ahci64_test 同口径）
+TARGET_SECTORS = 57343                 # 28MB（= 原 16MB + 主分区起点后移的 24,519） 目标 SATA 盘（与 ahci64_test 同口径）
 LOADER = os.path.join(ROOT, "build64", "loader64.bin")
 BOOTBIN = os.path.join(ROOT, "build64", "boot.bin")
 
@@ -240,7 +240,7 @@ def phase3_truncated(qemu, src_img, img, log, seconds=90):
     """失败路径：造一块"内核区被截断"的盘（MBR + loader 在，内核不在）-> 必须打点停机。"""
     if os.path.exists(log):
         os.remove(log)
-    # 取装好的盘的前 1000 扇区：MBR(LBA0) + loader(LBA1..8) 都在，LBA 9..8008 的内核区没了
+    # 取装好的盘的前 1000 扇区：MBR(LBA0) + loader(LBA1..64) 都在，LBA 65..30784 的内核区没了
     with open(src_img, "rb") as f:
         head = f.read(1000 * 512)
     with open(img, "wb") as f:

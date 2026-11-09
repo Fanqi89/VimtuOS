@@ -87,9 +87,14 @@
     pop eax
 %endmacro
 
-KERNEL_SECTORS equ 8000             ; 内核区总扇区数（4MB）。与 build64.sh 的 KERNEL_SECTORS、
-                                    ; kernel/memlayout64.h 三方一致，启动时**读满**这个数
-KERNEL_LBA     equ 9                ; 内核起始 LBA（= build64.sh 的 KERNEL_LBA；LBA 布局不许改）
+; ★ v0.9.32：本文件是 **Stage 2**，容量 **64 扇区（32 KB）**（boot/boot.asm 负责把整个 Stage 2
+;   从 LBA 1..64 读进 0x9000 再跳过来）—— 4 KB 的老限制已经不存在，加几百行代码都不用担心。
+; ★ v0.9.31：内核容量 4MB -> **15MB**（= 30,720 扇区）。这是**容量上限**，不是每次要读的长度：
+;   真实长度由构建期回填进下面的 kern_read_secs（'KSNT' 签名 + 2 字节小端扇区数），
+;   loader 只读那么多。读满 15MB 也能跑，但每次白读 ~12MB（BIOS 下约 1 秒），没有理由这么干。
+KERNEL_SECTORS equ 30720            ; 内核区总扇区数（15MiB）。与 build64.sh 的 KERNEL_SECTORS、
+                                    ; kernel/memlayout64.h 三方一致（要改就三处一起改）
+KERNEL_LBA equ 65                ; 内核起始 LBA（= build64.sh 的 KERNEL_LBA；LBA 布局不许改）
 
 ; ---- INT 13h 磁盘读的暂存区分块（见 int13_load_kernel 的长注释）----
 STAGE_PHYS     equ 0x20000          ; 暂存区物理地址（低内存，实模式可达；loader 在 0x9000，
@@ -615,7 +620,10 @@ write_bootinfo:
     mov eax, [mem_count]
     mov [0x1010], eax
     mov dword [0x1014], 0x2000
-    mov eax, KERNEL_SECTORS        ; 始终读满 KERNEL_SECTORS 个扇区（与旧行为一致）
+    ; ★ v0.9.31：BootInfo.kernel_size = **真实读进来的字节数**（不再是"容量"）。
+    ;   回填槽的默认值就是容量，所以"没回填"= 读满容量，不需要任何分支（省 loader 字节：
+    ;   loader 只有 8 扇区 = 4096 B，本批已经用到 4,08x，每一条分支都要算账）。
+    movzx eax, word [kern_read_secs]
     shl eax, 9
     mov [0x1018], eax              ; BootInfo.kernel_size
     mov ax, [best_mode]
@@ -688,10 +696,14 @@ int13_load_kernel:
     call dbg_hex8
     call dbg_nl
 .dl_done:
-    ; ---- 起点：LBA 9（KERNEL_LBA）、目标物理 0x100000、共 8000 扇区（KERNEL_SECTORS）----
+    ; ---- 起点：LBA 65（KERNEL_LBA）、目标物理 0x100000、长度 = 回填的真实扇区数 ----
+    ;   ★ v0.9.31：容量是 15MB，但**只读内核真实大小**（构建期回填的 kern_read_secs）。
+    ;   槽的默认值就是容量（= 读满），所以这里没有"未回填"分支；写坏的值由构建期工具
+    ;   tools/loader_patch64.py 拦在 1..KERNEL_SECTORS 之间（loader 体积太小，装不下第二道检查）。
     mov dword [l13_lba], KERNEL_LBA
     mov dword [l13_dst], 0x00100000
-    mov word [l13_left], KERNEL_SECTORS
+    mov ax, [kern_read_secs]
+    mov [l13_left], ax
 .batch:
     mov word [l13_n], 0             ; 本批从暂存区头开始
     mov word [l13_seg], STAGE_SEG0
@@ -718,7 +730,7 @@ int13_load_kernel:
     int 0x13
     call rm_flat                    ; BIOS 可能踩坏段寄存器（不改 FLAGS，可在 jc 前调用）
     jc .fail
-    ; ---- 打点：只打整个加载的首尾各一条（4000 次读全打会刷屏，且拖慢 TCG）----
+    ; ---- 打点：只打整个加载的首尾各一条（15MB 容量下最多 480 次读，全打会刷屏且拖慢 TCG）----
     mov ax, [l13_left]
     cmp ax, [dap_count]             ; 剩余 == 本次读：这次就是最后一块
     je .log
@@ -728,7 +740,7 @@ int13_load_kernel:
     mov si, msg_i13_ok
     call dbg_str
     mov ax, word [dap_lba]
-    call dbg_hex16                  ; LBA（9..8009，16 位足够；已按低 16 位打印）
+    call dbg_hex16                  ; LBA（65..32584，低 16 位打印；调试够用）
     mov si, msg_i13_cnt
     call dbg_str
     mov ax, [dap_count]
@@ -1013,7 +1025,7 @@ dap_seg:
     dw STAGE_SEG0
 dap_lba:
     dd KERNEL_LBA                   ; 起始 LBA（= build64.sh 的 KERNEL_LBA / memlayout64.h 一致）
-    dd 0                            ; LBA 高 32 位（内核在 9..8009，恒 0）
+    dd 0                            ; LBA 高 32 位（内核在 65..32584，恒 0）
 
 align 4
 gdt_start:
@@ -1046,13 +1058,22 @@ gdt_descriptor:
     dd gdt_start
 
 BOOT_DRIVE: db 0                ; BIOS 传进来的 DL（boot/boot.asm 保存后透传）—— 磁盘启动读盘用
-l13_lba:   dd KERNEL_LBA        ; INT 13h 读内核：当前 LBA（32 位足够：9..8009）
+l13_lba:   dd KERNEL_LBA        ; INT 13h 读内核：当前 LBA（32 位足够：65..32584）
 l13_dst:   dd 0x00100000        ; 目标物理地址（高内存；实模式写不到，见 int13_load_kernel）
-l13_left:  dw KERNEL_SECTORS    ; 还差多少扇区（8000 < 65536，16 位够）
+l13_left:  dw KERNEL_SECTORS    ; 还差多少扇区（启动时按 kern_read_secs 覆盖；30720 < 65536，16 位够）
 l13_n:     dw 0                 ; 本批已读进暂存区的块数（每块 64 扇区 = 32KB）
 l13_seg:   dw STAGE_SEG0        ; 本块暂存窗口的段值（0x2000 + n*0x800 = 物理 0x20000 + n*32KB）
 l13_retry: db 3                 ; 本块剩余重试次数
 l13_ah:    db 0                 ; 失败时 BIOS 返回的 AH 错误码（打点用）
+; ★ v0.9.31：内核读盘长度**回填槽**（构建期 tools/loader_patch64.py 按 'KSNT' 签名找它，
+;   紧跟签名写 4 字节：512B 扇区数 + 2048B 光盘扇区数）。默认值 = 容量 -> 未回填即读满。
+;   loader 只有 8 扇区（4096 B），本批已用到 4,0xx，所以**不做**第二道钳位：
+;   越界值由构建期工具拦在 1..KERNEL_SECTORS（loader_patch64.py 直接报错退出）。
+kern_sect_sig:   db 'KSNT'
+kern_read_secs:  dw KERNEL_SECTORS            ; 512B 扇区数（默认读满容量）
+kern_read_atapi: dw KERNEL_SECTORS / 4        ; 2048B 光盘扇区数（默认读满容量）
+edid_size: dw 128                   ; ★ v0.9.23：EDID 实读字节数（128 / 256）
+m_width:   dw 0
 mem_count: dd 0
 best_mode: dw 0
 best_score: dw 0
@@ -1065,8 +1086,6 @@ ml_count: dw 0
 edid_ok:  db 0
 edid_w:   dw 0
 edid_h:   dw 0
-edid_size: dw 128                   ; ★ v0.9.23：EDID 实读字节数（128 / 256）
-m_width: dw 0
 m_height: dw 0
 m_bpp: db 0
 sc_tmp: dw 0
@@ -1125,7 +1144,7 @@ msg_i13_dead:  db "[LM] int13 read FAILED: kernel not loaded, halted", 13, 10, 0
 ;       * CR0.PG = 1 并远跳到 64 位代码段
 ;   [bits 64] 其余全部在 64 位长模式里做：
 ;       * 初始化串口、打印阶段标记
-;       * 用 ATA PIO 把内核从 LBA 9 读进 0x100000（原来这段是 32 位的，现已搬到 64 位）
+;       * 把内核从 LBA 65 读进 0x100000（原来这段是 32 位的，现已搬到 64 位）
 ;       * 跳转到内核入口 0x100000
 ;
 ; 结论：引导链里**没有 32 位业务代码**（读盘与输出都是 64 位）。
@@ -1301,7 +1320,7 @@ lm64_build_paging:
 
     ; ---- 高半区映射（内核搬高半区，为将来用户态让出低地址）----
     ;   PDPT_hi[510] **直接复用已有的 PD0(0x42000)** —— PD0 覆盖物理 0..1GB，
-    ;   而内核镜像在 0x100000、堆在 0x05000000、页池起点 0x08000000，全在里面。
+    ;   而内核镜像在 0x100000、载荷窗口 64..96MB、堆 112MB 起、页池 160MB 起，全在里面。
     ;   这样一条存储就够，省掉"再建一张 PD + 填 24 项"的代码（loader64 有 4096 字节
     ;   上限，实测多出来的代码会把镜像顶到 4106 字节而被构建脚本拒绝）。
     ;   公式：VA = 0xFFFFFFFF80000000 + PA（因为 PD0 从物理 0 开始）
@@ -1406,7 +1425,10 @@ lm64_in64:
     movzx r15d, byte [r14]
     mov esi, dword [0x0F08]         ; 内核在光盘上的起始扇区（每次都要复位）
     mov rdi, 0x100000
-    mov ebx, KERNEL_SECTORS / 4     ; 2000 个光盘扇区 = 4MB
+    ; ★ v0.9.31：容量 15MB 但只读内核实长（回填槽；512B -> 2048B 光盘扇区，向上取整）
+    ; ★ v0.9.31：只读内核实长（回填槽的默认值 = 容量/4，构建期回填成 ceil(真实/4)）。
+    ;   两个槽都放在 'KSNT' 签名之后（4 字节：512B 扇区数 + 2048B 光盘扇区数）。
+    movzx ebx, word [kern_read_atapi]
     call atapi64_read
     jnc .cd_ok
     mov al, 'x'
@@ -1437,7 +1459,7 @@ lm64_in64:
     mov dword [0x0F0C], 0x04000000  ; ★ 载荷地址改成 **RAM 物理地址**（原来是光盘扇区号 2037）。
                                     ;   漏了这一行的话：安装程序按 kind=2 + payload=2037 去读
                                     ;   "0x000007F5 + 偏移" 那片低内存 → 拷过去全是 0/垃圾，
-                                    ;   表现为"安装报告写了 8073 扇区，但目标盘内容区全 0"。
+                                    ;   表现为"安装报告写了整份载荷扇区数，但目标盘内容区全 0"。
                                     ;   （搬高半区时误删过，靠对比目标盘字节才发现）
     ; 光盘路径：内核已经由上面的 atapi64_read 读进 0x100000，载荷也读好了，直接进 .kernel_ready。
     ; （磁盘启动那条路的内核读取**不在这里**：实模式阶段已经用 BIOS INT 13h 扩展读完成，

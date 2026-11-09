@@ -3,12 +3,12 @@
 // 槽的**载体**（存在哪里）由 store64_init64 按"有没有可用卷"决定，槽格式与载体无关：
 //   1) VFS 文件（**首选，正常运行**）：VimtuFS2 卷里的 /store.a、/store.b，各 16KB = 一个槽
 //      （整槽 = vfs64_read / vfs64_write 的 16384 字节）。init 用 vfs64_stat("/") 探"卷挂没挂"。
-//   2) 裸盘槽区（**仅降级路径**）：kernel/memlayout64.h 的 ML64_STORE_LBA(8009) 起 64 扇区 = 32KB，
+//   2) 裸盘槽区（**仅降级路径**）：kernel/memlayout64.h 的 ML64_STORE_LBA(32528) 起 64 扇区 = 32KB，
 //      对半切成两个槽：
-//        槽 A = LBA 8009..8040（32 扇区 / 16KB）
+//        槽 A = LBA 32528..32559（32 扇区 / 16KB）
 //        槽 B = LBA 8041..8072（32 扇区 / 16KB）
-//      ★ 这块区域与安装程序创建的主分区起点（LBA 8009）**完全重叠**，只在"没有可用卷"时使用，
-//        init 必定打印 [STORE64] WARN raw slot area LBA 8009 overlaps the data partition;
+//      ★ 这块区域与安装程序创建的主分区起点（LBA 32528）**完全重叠**，只在"没有可用卷"时使用，
+//        init 必定打印 [STORE64] WARN raw slot area LBA 32528 overlaps the data partition;
 //        use VFS-backed store。
 //   每槽 = 头部（64B，含 magic/版本/世代号/payload 长度/payload CRC/头部 CRC）+ 一串 KV 记录。
 //   一次 flush 只走一条路径（VFS 或裸盘），绝不同时写两处。

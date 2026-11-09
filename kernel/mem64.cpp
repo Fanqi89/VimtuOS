@@ -1,26 +1,36 @@
 // mem64.cpp - 64 位内存管理：物理页池 + 内核堆 + 归属记账 + 编译器辅助例程
 //
 // 为什么单独一个文件（而不是照抄 32 位 mem.cpp）：
-//   64 位内核里同时存在三处**固定占用**，堆和页池必须一个都不碰：
+//   64 位内核里同时存在几处**固定占用**，堆和页池必须一个都不碰：
 //     0x0007C000                内核栈（entry64.asm: mov rsp, 0x7C000）
-//     0x00100000..~0x02460000   内核映像 + .bss（含 fb 的 33MB 后备缓冲）
-//     0x04000000..0x043F1200    安装载荷（仅"安装介质"内核用；系统内核不用）
+//     0x00100000..__bss_end     内核映像 + .bss（含 fb 的 33MB 后备缓冲）—— **大小随内核变**
+//     0x04000000..0x06000000    安装载荷暂存区（仅"安装介质"内核用；系统内核不用）
+//     0x06000000..0x06040000    UEFI64.BIN（UEFI 长模式引导器；跳进内核之后已死）
 //   32 位版把堆起点设为 ALIGN(_end)，把页 bitmap 也写在 _end 处，两者同址 ——
 //   结果第一次 kmalloc 就把 FreeBlock 头写进了 bitmap，页分配器元数据被静默破坏。
-//   64 位版直接把 bitmap 放进 .bss，从结构上消除这个缺陷：
-//     * 堆   = [80MB, 128MB)  固定 48MB，落在载荷之上、页池之下，两个内核行为一致
-//     * 页池 = [128MB, mem_high)  bitmap 在 .bss，不消耗任何页池地址
+//   64 位版直接把 bitmap 放进 .bss，从结构上消除这个缺陷。
 //
-// 另一个必须放在这里的东西：**编译器辅助例程**。
-//   64 位树里 memcpy/memset/memmove/memcmp 从来没被实现过（mem_64.h 只有 _64 后缀的
-//   声明，且无实现）。现在能链接只是因为还没有代码触发编译器生成这些调用；一旦有
-//   结构体赋值/数组清零，clang 就会发出外部引用，链接当场失败。所以在这里一并提供。
+// ★ v0.9.31（内核容量 15MB 那一批）把堆/页池彻底改成"跟着内核走"：
+//   * 旧布局是**写死**的 [80MB,128MB) 堆 + 128MB 起的页池，而载荷暂存区固定 64MB 起。
+//     内核容量升到 15MB 之后载荷也变长（system.img 16MB -> ~28MB），"载荷 64..93MB"
+//     会直接顶穿写死的 80MB 堆。写死的地址在容量变大的那天一定会出事。
+//   * 现在的规则：**堆起点 = max(堆下限 112MB, ALIGN_UP(__bss_end, 2MB))**，
+//     即"内核长到哪儿，堆就从那之上开始，绝不会与自己映像重叠"；堆长度仍固定 48MB；
+//     页池从堆顶开始，一直到 E820 认定的内存上界。
+//   * 并且运行期把这条关系当**断言**打出来（[MEM64] layout ... guard=ok/fail），
+//     构建期再有一条 nm 断言（build64.sh：__bss_end < 载荷暂存区 0x04000000）。
+//     两头夹住之后，"内核把堆踩了"或"载荷把内核踩了"这类事故不可能再静默发生。
 
+// ★ 包含顺序是硬约定：memlayout64.h 必须**先于** mem_64.h —— 后者把 PAGE_SIZE_64 / PAGE_SIZE_2M
+//   定义成宏，先出现会让 memlayout64.h 里的同名 `static const` 变成非法声明
+//   （别的文件里也有同样的注释，见 ahci64.cpp / ehci64.cpp / taskmgr64.cpp 的说明）。
+#include "memlayout64.h"        // 磁盘/内存布局唯一定义点（堆下限 / 载荷窗口 / 页池下限）
 #include "mem_64.h"
 #include "port.h"
 #include "debug64.h"
 #include "../bootinfo.h"
 
+extern "C" char __bss_end[];    // 内核映像高半区上界（= 高半区 VA；物理 = VA - ML64_KERNEL_VA_BASE）
 
 // ==================== 中断屏蔽（保存 / 恢复 IF）====================
 // 为什么不用裸 cli()/sti()：这几个函数会在两种危险场景被调用 ——
@@ -37,19 +47,23 @@ static inline uint64_t irq_save64() {
 static inline void irq_restore64(uint64_t if_bit) {
     if (if_bit) sti();
 }
-// ==================== 布局常量 ====================
-#define MEM64_PAGE        4096ull
-#define MEM64_HEAP_BASE   0x05000000ull      // 80MB
-#define MEM64_HEAP_LIMIT  0x08000000ull      // 128MB
-#define MEM64_POOL_BASE   0x08000000ull      // 128MB（= 堆上界，紧邻）
 
+// ==================== 布局常量与运行期布局 ====================
+#define MEM64_PAGE        4096ull
 // bitmap 放 .bss：64KB 覆盖 64K*8 = 524288 页 = 2GB 页池上限。
 // 512MB 的虚拟机实测只用 12KB，留足余量且永不与任何区域重叠。
 #define MEM64_BITMAP_BYTES (64u * 1024u)
-#define MEM64_POOL_MAX     (MEM64_POOL_BASE + (uint64_t)MEM64_BITMAP_BYTES * 8ull * MEM64_PAGE)
+// ★ 页池上界 = 下限 + bitmap 能记的最大页数（2GB）
+#define MEM64_POOL_MAX     ((uint64_t)ML64_POOL_PHYS_FLOOR + (uint64_t)MEM64_BITMAP_BYTES * 8ull * MEM64_PAGE)
+
+// ★★ 运行期布局（v0.9.31）：堆起点跟着内核结束地址走，页池跟着堆顶走。
+//   在 mem_init_64() 里一次性算好，之后所有地方（含自检）只读这两个全局量。
+static uint64_t g_heap_base  = ML64_HEAP_PHYS_FLOOR;
+static uint64_t g_heap_limit = (uint64_t)ML64_HEAP_PHYS_FLOOR + ML64_HEAP_BYTES;
+static inline uint64_t align_up64(uint64_t v, uint64_t a) { return (v + a - 1ull) & ~(a - 1ull); }
 
 static uint8_t  g_page_bitmap[MEM64_BITMAP_BYTES];
-static uint64_t g_pool_base   = MEM64_POOL_BASE;
+static uint64_t g_pool_base   = ML64_POOL_PHYS_FLOOR;   // 运行期由 mem64_layout64() 重算
 static uint64_t g_pool_end    = 0;      // 由 E820 决定
 static uint64_t g_page_total  = 0;
 static uint64_t g_page_free   = 0;
@@ -84,9 +98,56 @@ static uint64_t e820_mem_high64(const BootInfo* bi) {
     return highest;
 }
 
+// 计算运行期堆/页池布局（★ 与 memlayout64.h 的四段边界一起读）
+//   规则（顺序即断言）：
+//     ① 内核映像上界 = __bss_end 的**物理**形式（VA - ML64_KERNEL_VA_BASE），向上取 2MB；
+//     ② 堆底 = max(堆下限 112MB, ①) —— 内核长得再大也不会被自己的堆覆盖；
+//     ③ 堆顶 = 堆底 + 48MB；页池 = [堆顶, E820 上界)。
+//   为什么②要用 max 而不是"直接用 __bss_end"：堆下限之下是载荷暂存窗口(64..96MB)，
+//   载荷是引导层写进去的、内核无权覆盖，所以堆绝不能落进那个窗口。
+static void mem64_layout64(void) {
+    const uint64_t bss_pa = (uint64_t)(uintptr_t)__bss_end - ML64_KERNEL_VA_BASE;
+    // ★ 用字面量 0x200000 而不是 memlayout64.h 的 PAGE_SIZE_2M：mem_64.h 把 PAGE_SIZE_64/2M
+    //   定义成宏，两个头一起进同一个编译单元会撞成"expected unqualified-id"（踩过）。
+    uint64_t hb = align_up64(bss_pa, 0x200000ull);          // 2MiB 对齐（大页边界）
+    if (hb < (uint64_t)ML64_HEAP_PHYS_FLOOR) hb = ML64_HEAP_PHYS_FLOOR;
+    g_heap_base  = hb;
+    g_heap_limit = hb + ML64_HEAP_BYTES;
+    g_pool_base  = g_heap_limit;
+}
+
 void mem_init_64(const BootInfo* bi) {
-    g_pool_base = MEM64_POOL_BASE;
+    mem64_layout64();
     const uint64_t high = e820_mem_high64(bi);
+
+    // ★ 布局断言（运行期）：四段不许有任何重叠。任一条不成立都是真事故，
+    //   必须大声打出来 —— 静默继续跑只会变成"随机时刻的野写"。
+    {
+        const uint64_t bss_pa = (uint64_t)(uintptr_t)__bss_end - ML64_KERNEL_VA_BASE;
+        const bool guard = (bss_pa <= (uint64_t)ML64_PAYLOAD_PHYS) &&
+                           (g_heap_base >= (uint64_t)ML64_PAYLOAD_PHYS + ML64_PAYLOAD_MAX_BYTES) &&
+                           (g_heap_base >= bss_pa) &&
+                           (g_heap_limit > g_heap_base) &&
+                           (g_pool_base == g_heap_limit);
+        dbg64_line_begin64();
+        dbg64_str("[MEM64] layout bss_end=");
+        dbg64_hex64(bss_pa);
+        dbg64_str(" payload=[");
+        dbg64_hex64(ML64_PAYLOAD_PHYS);
+        dbg64_str(",");
+        dbg64_hex64((uint64_t)ML64_PAYLOAD_PHYS + ML64_PAYLOAD_MAX_BYTES);
+        dbg64_str(") heap=[");
+        dbg64_hex64(g_heap_base);
+        dbg64_str(",");
+        dbg64_hex64(g_heap_limit);
+        dbg64_str(") pool=[");
+        dbg64_hex64(g_pool_base);
+        dbg64_str(",");
+        dbg64_hex64(high);
+        dbg64_str(guard ? ") guard=ok" : ") guard=FAIL");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
 
     if (high <= g_pool_base + MEM64_PAGE) {         // 内存小到没有可用页池
         g_pool_end = g_pool_base;
@@ -108,7 +169,7 @@ void mem_init_64(const BootInfo* bi) {
     g_page_free = g_page_total;   // bitmap 在 .bss，不占页池，所以全部页一开始都空闲
     g_pool_rover = 0;
 
-    // 堆：固定 [80MB,128MB)，一次性交给空闲链表
+    // 堆：[g_heap_base, g_heap_limit) 一次性交给空闲链表
     heap_self_init64();
 
     dbg64_str("[MEM64] pool=[");
@@ -120,9 +181,9 @@ void mem_init_64(const BootInfo* bi) {
     dbg64_str(" free=");
     dbg64_dec(g_page_free);
     dbg64_str(" heap=[");
-    dbg64_hex64(MEM64_HEAP_BASE);
+    dbg64_hex64(g_heap_base);
     dbg64_str(",");
-    dbg64_hex64(MEM64_HEAP_LIMIT);
+    dbg64_hex64(g_heap_limit);
     dbg64_str(")");
     dbg64_nl();
 }
@@ -207,8 +268,8 @@ static uint32_t g_kfree_rejected = 0;
 static inline uint64_t align16_64(uint64_t v) { return (v + 15ull) & ~15ull; }
 
 void heap_self_init64() {                            // 由 mem_init_64 调用
-    g_heap_head = (Blk64*)(uintptr_t)MEM64_HEAP_BASE;
-    g_heap_head->size   = MEM64_HEAP_LIMIT - MEM64_HEAP_BASE;
+    g_heap_head = (Blk64*)(uintptr_t)g_heap_base;
+    g_heap_head->size   = g_heap_limit - g_heap_base;
     g_heap_head->owner  = MEM_OWNER_KERNEL_64;
     g_heap_head->magic  = BLK_FREE_64;       // 空闲链表成员：kfree 会拒绝释放它（防自环）
     g_heap_head->next   = nullptr;
@@ -269,7 +330,7 @@ void kfree_64(void* p) {
     if (!p) return;
     const uint64_t addr = (uint64_t)(uintptr_t)p;
     // 越界/未对齐/块头 magic 不符 -> 拒绝释放并如实报告，而不是把堆写烂
-    if (addr < MEM64_HEAP_BASE + BLK_HEAD || addr >= MEM64_HEAP_LIMIT) {
+    if (addr < g_heap_base + BLK_HEAD || addr >= g_heap_limit) {
         g_kfree_rejected++;
         if (!g_kfree_quiet) {
             dbg64_str("[MEM64] kfree: bad pointer ");
@@ -496,7 +557,7 @@ int mem_selftest_64() {
     g_kfree_quiet = true;                            // 故意喂坏指针：静音，只数拒绝次数
     kfree_64(nullptr);                               // 空指针：静默返回（不算拒绝）
     kfree_64((void*)0x10ull);                        // 越界 -> 必须被拒
-    kfree_64((void*)(MEM64_HEAP_BASE + BLK_HEAD));   // 空闲链表成员 -> 必须被拒（曾在此自环挂死）
+    kfree_64((void*)(g_heap_base + BLK_HEAD));       // 空闲链表成员 -> 必须被拒（曾在此自环挂死）
     g_kfree_quiet = false;
     if (g_kfree_rejected - rej0 != 2) fails |= 32768;   // 守卫必须恰好拦下 2 次
     if (g_heap_used > used_before + 64) fails |= 8192;

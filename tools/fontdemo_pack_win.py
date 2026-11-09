@@ -35,8 +35,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SECTOR = 512
-PART_MAIN_LBA = 8009                      # = kernel/part64.h / make_shellvol.py
-DEFAULT_TARGET_SECTORS = 32768            # 16 MB（与其它卷链步骤同一口径）
+PART_MAIN_LBA = 32584                      # = kernel/part64.h / make_shellvol.py
+DEFAULT_TARGET_SECTORS = 57343            # 28MB（= 原 16MB + 主分区起点后移的 24,519）（与其它卷链步骤同一口径）
 
 # 卷内路径 -> 构建产物文件名（四个面与 kernel/font.cpp 的 face 0..3 一一对应）
 FONT_MAP = (

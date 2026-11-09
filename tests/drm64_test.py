@@ -49,8 +49,8 @@ import qemuhelp as qh              # noqa: E402
 BUILD = os.path.join(ROOT, "build64")
 DISK = os.path.join(BUILD, "sysdisk.img")            # 完整演示盘（夹具底座）
 DRMDEMO_ELF = os.path.join(BUILD, "user_drmdemo.elf")  # user/build_user.sh 的产物
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343
 SECTOR = 512
 QEMU_CANDIDATES = [
     r"C:\Program Files\qemu\qemu-system-x86_64.exe",

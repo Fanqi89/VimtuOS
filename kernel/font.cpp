@@ -36,7 +36,7 @@
 //   构建期（build64.sh）：build/font_*.ttf -> zlib -9 raw deflate（wbits=-15）+ 8B 未压缩长度头
 //   = build64/font_*.z -> objcopy -> _binary_font_*_z_start/_end。
 //   体积账（实测）：1,164,272 B -> 755,944 B，**省 408,328 B**（内核 4,037,328 -> 3,629,000 B）。
-//   解压缓冲放 .bss：objcopy -O binary 只收 PROGBITS，.bss **不进 kernel64_os.bin**；页池从 128MB
+//   解压缓冲放 .bss：objcopy -O binary 只收 PROGBITS，.bss **不进 kernel64_os.bin**；页池从 160MB 起
 //   起（见 kernel/mem64.cpp 顶部），内核 .bss 本来就含 33MB 后备缓冲，这 ~1.3MB 不影响内存账。
 // ★ 本批（内核预算）：**中文面（face 1）改成"可外置"** —— 系统内核不再链 font_simhei_z.o，
 //   它的符号是 **weak**：没链进来时地址读回 0，font_init() 就把它标成"外置待装载"

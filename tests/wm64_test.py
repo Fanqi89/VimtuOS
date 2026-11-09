@@ -61,8 +61,8 @@ WMCLOCK_ELF = os.path.join(ROOT, "build64", "wmclock.elf")
 WMPANEL_ELF = os.path.join(ROOT, "build64", "wmpanel.elf")
 WLCLIENT_ELF = os.path.join(ROOT, "build64", "wlclient.elf")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "wm64_test.img")
-PART_MAIN_LBA = 8009                    # = kernel/part64.h 的主分区起点
-TARGET_SECTORS = 32768                  # 16 MB（与 wl64/sh64 同一夹具口径）
+PART_MAIN_LBA = 32584                    # = kernel/part64.h 的主分区起点
+TARGET_SECTORS = 57343                  # 28MB（= 原 16MB + 主分区起点后移的 24,519）（与 wl64/sh64 同一夹具口径）
 
 MOUSE_X0, MOUSE_Y0 = 512, 384           # kernel/input.cpp 的 mouse_init 默认位置
 PIX_TOL = 8                             # 逐像素"变/不变"的容差

@@ -74,7 +74,7 @@ uint32_t fat64_last_clusters64();
 int fat64_write_file64(int drive, const char* path8_3, const uint8_t* data, uint32_t len);
 
 // 同 fat64_write_file64，但文件数据**从另一块盘的 LBA 流式拷进来**（数据不占内核内存）。
-// 用途：KERNEL64.BIN 要写目标盘 LBA 9..8008 的 4MB 系统内核区，而安装程序内核
+// 用途：KERNEL64.BIN 要写目标盘 LBA 65..32583 的引导区整块（15MiB 内核容量 + 原始区），而安装程序内核
 // 装不下这 4MB 的副本（体积硬约束）。
 int fat64_write_file_from_disk64(int drive, const char* path8_3, int src_drive,
                                  uint32_t src_lba, uint32_t len);

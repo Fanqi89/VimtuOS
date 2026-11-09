@@ -53,8 +53,8 @@ QEMU_CANDIDATES = [
 SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 SHELL_BIN = os.path.join(ROOT, "build64", "shell.bin")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "ipc64_test.img")
-PART_MAIN_LBA = 8009                 # = kernel/part64.h 的主分区起点
-TARGET_SECTORS = 32768
+PART_MAIN_LBA = 32584                 # = kernel/part64.h 的主分区起点
+TARGET_SECTORS = 57343
 # ★ v0.9.2：夹具卷自检的期望路径修正 —— tools/make_shellvol.build_volume() 从 v0.6.0
 #   （b7439d7）起把 /bin 改成 /usr/bin（目录重排），而这里一直拿 /bin/shell.bin 去对——
 #   于是四个版本这条都是假红。内核侧路径别名（/bin -> /usr/bin）不变，

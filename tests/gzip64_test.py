@@ -63,8 +63,8 @@ def use_build_dir(path):
     GZIP_BIN = os.path.join(BUILD, "gzip")
     FIXTURE = os.path.join(BUILD, "gzip_test.img")
 
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343
 SECTOR = 512
 BASE64 = 0x100000000
 STACK64 = 0x100000000 + 0x10000

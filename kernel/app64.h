@@ -56,8 +56,8 @@
 // 主分区起始 LBA 解析（挂载 VimtuFS2 用）：
 //   先按**安装器写盘的同一条规则**读 drive 的 MBR：找第 2 个标准分区项（type 0x07 = 主数据分区），
 //   用它的起始 LBA；MBR 读不到 / 没有 0x07 项时退回 kernel/part64.h 的常量
-//   PART_MAIN_LBA = PART_BOOT_LBA(9) + PART_BOOT_SECS(8000) = 8009 —— part_create_standard()
-//   写进目标盘 MBR 的正是这个值，系统镜像的 store 保留区（ML64_STORE_LBA = 8009）也在同一位置。
+//   PART_MAIN_LBA = PART_BOOT_LBA(65) + PART_BOOT_SECS(32519) = 32584 —— part_create_standard()
+//   写进目标盘 MBR 的正是这个值，系统镜像的 store 保留区（ML64_STORE_LBA = 32528）也在同一位置。
 uint32_t app64_main_part_lba64(int drive);
 
 // 安装器：把内嵌的 hello.vap（build64/hello.vap，objcopy 嵌进内核）装进文件系统的 "/hello.vap"。

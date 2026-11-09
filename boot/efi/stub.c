@@ -25,9 +25,10 @@
 //   内核启动时会把这段**清零**。早期把引导器放在 0x800000（8MB，正好在 BSS 里），
 //   结果：内核清 BSS 时把引导器建的**高半区页表**（在引导器 .bss 里）一起清零 ->
 //   下一次页表遍历失败 -> 三重故障 -> 复位（VMware EFI 实测；OVMF 只是恰好命中 TLB 才幸免）。
-//   现在放 0x04800000（72MB）：在载荷末尾（64MB+4.1MB）之后、内核堆（80MB）之前，
-//   三段互不重叠。改这里必须同步改 build_uefi.sh 的 -base。
-#define LOADER_ADDR 0x04800000ULL
+//   现在放 0x06000000（96MB）：★ v0.9.31 载荷窗口扩到 64..96MB（system.img ~28MB），
+//   所以这里从 72MB 上移到 96MB —— 仍在载荷之后、内核堆下限（112MB）之前，三段互不重叠。
+//   改这里必须同步改 build_uefi.sh 的 -base。
+#define LOADER_ADDR 0x06000000ULL
 #define LOADER_MAX  (256 * 1024ULL)
 
 EFI_GUID gEfiSimpleFileSystemProtocolGuid = { 0x964E5B22, 0x6459, 0x11D2, { 0x8E,0x39,0x00,0xA0,0xC9,0x69,0x72,0x3B } };

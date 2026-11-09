@@ -29,7 +29,7 @@
 //   * **C: = 运行中的系统所在分区**。判定依据（按优先级）：
 //       1) vfs64 当前**真正挂载**的那个卷的 (drive, start_lba)：
 //          系统内核 os_boot_path 用 app64_main_part_lba64(0)（= 读 drive 0 的 MBR、
-//          取 type 0x07 的主数据分区项，读不到才退回常量 PART_MAIN_LBA = 8009）
+//          取 type 0x07 的主数据分区项，读不到才退回常量 PART_MAIN_LBA = 32528）
 //          作为挂载参数调用 vfs64_mount_system64 -> 挂载成功即"这就是系统盘/系统分区"；
 //       2) 还没挂载时（例如枚举被更早调用）：drive 0 的 MBR 里第一个 type = 0x07 的项；
 //       3) 都没有：枚举顺序里第一个可浏览的 VimtuFS2 卷。

@@ -19,7 +19,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-PART_MAIN_LBA = 8009
+PART_MAIN_LBA = 32584
 SECTOR = 512
 
 

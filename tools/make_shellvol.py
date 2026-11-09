@@ -5,7 +5,7 @@
 为什么需要这个工具（本批次的核心交付方式）：
   shell **不内嵌内核**（内核镜像只剩 6 个扇区的余量，且要求"内核只负责装载 shell.bin"）。
   于是 shell 的交付 = 系统卷里的一个文件 /bin/shell.bin —— 卷是 VimtuFS2（v4），由本脚本
-  在构建期"造好一块带文件的卷镜像"，再放进 16 MB 的测试/演示盘的主分区（LBA 8009）。
+  在构建期"造好一块带文件的卷镜像"，再放进 16 MB 的测试/演示盘的主分区（LBA 32584）。
 
   卷格式的唯一定义点是 kernel/vfs64.h / kernel/vfs64.cpp（本脚本只是那份格式的一个**离线
   写入器**，逐字段照抄；任何一处改动都要同步三边）：
@@ -32,10 +32,10 @@ import sys
 import zlib
 
 SECTOR = 512
-PART_BOOT_LBA = 9
-PART_BOOT_SECS = 8000
-PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS          # 8009（= kernel/part64.h）
-DEFAULT_TARGET_SECTORS = 32768                           # 16 MB 演示/测试盘
+PART_BOOT_LBA = 65
+PART_BOOT_SECS = 32519
+PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS          # 32584（= kernel/part64.h）
+DEFAULT_TARGET_SECTORS = 57343                           # 28MB（= 原 16MB + 主分区起点后移的 24,519） 演示/测试盘
 
 VFS_VERSION = 5          # ★ v0.9.28：VimtuFS2 v5（= v4 + 超级块特性扩展头 + inode xattr/快照字段）
                          #   本脚本产出的卷 feature_bits 恒 0（扩展头全 0），行为与 v4 逐字节相同；
@@ -501,7 +501,7 @@ def main():
         print("    卷镜像：%s（%d B）" % (args.vol, len(vol_bytes)))
     if args.disk:
         system_bytes = open(args.system, "rb").read()
-        # system.img = 8073 扇区：尾部的 8009..8072 是 store64 的"裸盘降级槽"（与数据分区起点重叠，
+        # system.img = 8073 扇区：尾部的 32584..8072 是 store64 的"裸盘降级槽"（与数据分区起点重叠，
         # 见 kernel/memlayout64.h 的 ★★ 段）。上限放宽到**整块盘**即可 —— 卷写在同一位置会原样
         # 盖掉那 64 个扇区（正常运行时用的是卷里的 /store.a|b，降级槽本来就不该有内容）。
         if len(system_bytes) > args.target_sectors * SECTOR:

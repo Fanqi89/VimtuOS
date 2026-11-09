@@ -1,41 +1,47 @@
 // part64.h - VimtuOS 安装程序的分区表与安装引擎
 //
-// 职责：
 //   * 把"标准布局"写进目标硬盘的主引导记录（MBR 分区表）：
-//       P1 引导分区（type 0xEF，活动）  LBA 9 .. 8008      ← 放 loader + 内核
-//       P2 主分区  （type 0x07）        LBA 8009 .. ESP 之前（无 ESP 时到盘尾）
+//       P1 引导分区（type 0xEF，活动）  LBA 65 .. 32583    ← 放内核(15MB) + 原始区（loader 在 LBA 1..64）
+//       P2 主分区  （type 0x07）        LBA 32584 .. ESP 之前（无 ESP 时到盘尾）
 //       P3 EFI 系统分区（type 0xEF）    盘尾、GPT 备份表之前（只有"够大的盘"才有）
 //   * 删除 / 格式化指定分区
 //   * 把安装介质上的载荷（system.img）整盘复制到目标硬盘，并汇报真实进度
 //   * 复制完成后写 **GPT（盘尾备份头 + 项数组）+ 混合 MBR + FAT32 ESP**
 //     （EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN），让装好的盘 UEFI/BIOS 双启动
 //
-// 为什么主 GPT 头不在 LBA 1：引导链是"MBR + 固定 LBA"（boot.bin 读 LBA 1..8 的 loader，
-//   loader 读 LBA 9 起的内核），**LBA 1 被 loader 占着**。所以只写盘尾的备份 GPT：
+// 为什么主 GPT 头不在 LBA 1：引导链是"MBR + 固定 LBA"（boot.bin 读 LBA 1..64 的 loader，
+//   loader 读 LBA 65 起的内核），**LBA 1..64 被 loader 占着**。所以只写盘尾的备份 GPT：
 //   UEFI 规范要求"主头无效时应使用备份头"，EDK2（OVMF / VMware EFI 都是它）实测在
 //   主头不是 "EFI PART" 时会回退到备份头 —— tests/esp_install_test.py 用 OVMF 实测验证。
 #pragma once
 #include <stdint.h>
 
+#include "memlayout64.h"   // ★ 唯一真源：内核容量 / 原始区 / store 区 / 镜像扇区数
+
 // 标准布局（必须与 boot/loader64.asm、kernel/memlayout64.h 的三方约定一致）
-static const uint32_t PART_BOOT_LBA  = 9;        // 引导分区起点
-static const uint32_t PART_BOOT_SECS = 8000;     // 引导分区扇区数（loader 读盘上限）
-static const uint32_t PART_MAIN_LBA  = PART_BOOT_LBA + PART_BOOT_SECS;   // 8009
+//   引导分区 = 内核容量(15 MiB = 30,720) + 原始区(1,799) = 32,519 扇区；
+//   主分区起点随之从 8,009 后移到 32,528 —— 这是 v0.9.31"内核空间扩容"的必然后果，
+//   LBA 65 起的内核区装不下 15MB 内核时，主分区只能往后让。
+static const uint32_t PART_BOOT_LBA  = ML64_KERNEL_LBA;                              // 9
+static const uint32_t PART_BOOT_SECS = ML64_KERNEL_SECTORS + ML64_RAW_SECTORS;       // 32519
+static const uint32_t PART_MAIN_LBA  = PART_BOOT_LBA + PART_BOOT_SECS;               // 32584
 static const uint32_t PART_MAIN_MIN_SECS = 1024; // 主分区至少留 512KB，否则视为"磁盘太小"
 
 // ★ ESP / GPT（安装完成时写：让**装好的盘**在 UEFI 固件下也能启动）
 //   为什么 ESP 在**盘尾**：引导链三处硬约定占住了盘头 ——
-//     LBA 0 MBR、LBA 1..8 loader（**主 GPT 头必须放 LBA 1，与 loader 冲突，所以只写盘尾的
-//     备份 GPT**，EDK2 在主头无效时会用备份头，见 part64.cpp 的说明）、LBA 9..8008 内核。
+//     LBA 0 MBR、LBA 1..64 loader（**主 GPT 头必须放 LBA 1，与 loader 冲突，所以只写盘尾的
+//     备份 GPT**，EDK2 在主头无效时会用备份头，见 part64.cpp 的说明）、LBA 65..32583 引导区。
 //   ESP 尺寸 = **48MB**（98304 扇区）：FAT32 有**簇数硬下限 65525**（少于这个数就应被当作
 //     FAT16），SPC=1/512B 扇区时数据区至少 65525 扇区（32MB），加上 32 个保留扇区与两份
 //     32 位 FAT，最小合法卷 ≈ 33.5MB。这里取 48MB 留余量（解出 96736 簇）；
-//     ESP 里只放 3 个文件（4MB 内核块 + 30KB 引导器；构建期那份还含 8MB 载荷），
-//     48MB 的卷完全装得下。
-//   为什么目标盘要 >= ~60MB：ESP 要在主分区**之外**（不与 VimtuFS2 重叠），
-//     最小盘 = 8009（引导区起点）+ 16384（主分区至少 8MB）+ 98304（ESP）+ 33（备份 GPT）
-//            = 122730 扇区 ≈ 59.9MiB。更小的盘（例如 16MB 的回归目标盘）放不下 ESP
+//     ESP 里只放 3 个文件（**15MB 引导区整块** + 30KB 引导器；构建期那份还含 ~28MiB 载荷），
+//     48MB 的卷装得下（实测三个文件合计 ~15.3MB）。
+//   为什么目标盘要 >= ~72MB：ESP 要在主分区**之外**（不与 VimtuFS2 重叠），
+//     最小盘 = 32584（主分区起点）+ 16384（主分区至少 8MB）+ 98304（ESP）+ 33（备份 GPT）
+//            = 147249 扇区 ≈ 71.9MiB。更小的盘（例如 16MB 的回归目标盘）放不下 ESP
 //     -> 只写老 MBR 布局（BIOS-only），串口打 "[INSTALL] esp skipped (disk too small)"。
+//     ★ v0.9.31：这个门槛从 ~60MB 抬到 ~72MB（引导区 4MB -> 15MB）；16MB 的旧回归目标盘
+//       现在连主分区都放不下（32584 + 1024 > 32768），测试夹具一律改用 >= 64MB 的盘。
 static const uint32_t PART_ESP_SECTORS       = 98304;   // ESP 大小 = 48MB（真 FAT32 的容量下限 ~33.5MB）
 static const uint32_t PART_ESP_MIN_MAIN_SECS = 16384;   // 建 ESP 时主分区至少保留 8MB
 static const uint32_t PART_GPT_BACKUP_SECTORS = 33;     // 盘尾备份 GPT：32 扇区项数组 + 1 扇区头

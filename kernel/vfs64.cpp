@@ -384,6 +384,9 @@ static void geom_restore(const Vfs64Geom* g) {
 }
 
 // ==================== 串口打点（统一 [VFS64] 前缀）====================
+// ★ 本函数自己会打 "[VFS64] " 前缀 —— 传进来的 s **不许**再带前缀。
+//   实测踩过（v0.9.30 的 feature/migrate 分支）：串口里出现 "[VFS64] [VFS64] feature FAILED …"，
+//   被 tests/sh64_test.py 的"日志前缀不许重复"lint 抓了个正着。
 static void log_line(const char* s) {
     dbg64_line_begin64();                       // ★ A4-2 收口：整行原子（实测 [TASK64] 插过 stat/mount 行）
     dbg64_str("[VFS64] ");
@@ -1255,11 +1258,11 @@ static const uint32_t QT_UNLIMITED = 0xFFFFFFFFu;
 int vfs64_feature_enable64(uint32_t bit) {
     if (!g_mounted) { log_op_fail("feature", "not mounted"); return -1; }
     if (g_lay->xattr_off == 0) {                       // v4/v3/v2：没有特性扩展头
-        log_line("[VFS64] feature FAILED reason=volume-not-v5 (run migrate)");
+        log_line("feature FAILED reason=volume-not-v5 (run migrate)");
         return -1;
     }
-    if (g_cred.euid != 0) { log_line("[VFS64] feature FAILED reason=need-root"); return -1; }
-    if ((bit & VFS64_FEAT_ALL) == 0) { log_line("[VFS64] feature FAILED reason=bad-bit"); return -1; }
+    if (g_cred.euid != 0) { log_line("feature FAILED reason=need-root"); return -1; }
+    if ((bit & VFS64_FEAT_ALL) == 0) { log_line("feature FAILED reason=bad-bit"); return -1; }
     if ((g_feat & bit) != 0) return 0;                 // 幂等
     bool ok = true;
     if (bit == VFS64_FEAT_JOURNAL) {
@@ -1299,9 +1302,9 @@ int vfs64_feature_enable64(uint32_t bit) {
     } else if (bit == VFS64_FEAT_ACL) {
         ok = true;                                     // 只置位：xattr 块按需分配
     }
-    if (!ok) { log_line("[VFS64] feature FAILED reason=alloc/write"); return -1; }
+    if (!ok) { log_line("feature FAILED reason=alloc/write"); return -1; }
     g_feat |= bit;
-    if (!sb_feat_store64()) { g_feat &= ~bit; log_line("[VFS64] feature FAILED reason=sb-write"); return -1; }
+    if (!sb_feat_store64()) { g_feat &= ~bit; log_line("feature FAILED reason=sb-write"); return -1; }
     dbg64_line_begin64();
     dbg64_str("[VFS64] feature on bit=");
     dbg64_dec(bit);
@@ -1343,7 +1346,7 @@ void vfs64_features_dump64() {
 // 旧卷迁移：v4 -> v5 就地（inode/数据一个字节都不动；只改版本号 + 清扩展头 + 重算主 CRC）。
 int vfs64_migrate64() {
     if (!g_mounted) { log_op_fail("migrate", "not mounted"); return -1; }
-    if (g_cred.euid != 0) { log_line("[VFS64] migrate FAILED reason=need-root"); return -1; }
+    if (g_cred.euid != 0) { log_line("migrate FAILED reason=need-root"); return -1; }
     const uint32_t from = g_lay->version;
     if (from == VFS64_VERSION) {                       // 已经是 v5：幂等
         dbg64_line_begin64();
@@ -1363,8 +1366,8 @@ int vfs64_migrate64() {
         dbg64_line_end64();
         return -1;
     }
-    if (g_ro) { log_line("[VFS64] migrate FAILED reason=read-only"); return -1; }
-    if (g_feat != 0) { log_line("[VFS64] migrate FAILED reason=feature-bits-on-v4"); return -1; }
+    if (g_ro) { log_line("migrate FAILED reason=read-only"); return -1; }
+    if (g_feat != 0) { log_line("migrate FAILED reason=feature-bits-on-v4"); return -1; }
     uint8_t sb[VFS64_SECTOR_BYTES];
     if (!dev_read(g_start, 1, sb)) return -1;
     if (rd32(sb + VFS_O_VERSION) != from) return -1;

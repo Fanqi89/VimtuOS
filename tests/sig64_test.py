@@ -58,10 +58,10 @@ QEMU_CANDIDATES = [
 SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "sig64_test.img")
 SECTOR = 512
-PART_BOOT_LBA = 9
-PART_BOOT_SECS = 8000
-PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS        # 8009（与 kernel/part64.h 一致）
-TARGET_SECTORS = 32768                                # 16 MB
+PART_BOOT_LBA = 65
+PART_BOOT_SECS = 32519
+PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS        # 32584（与 kernel/part64.h 一致）
+TARGET_SECTORS = 57343                                # 28MB（= 原 16MB + 主分区起点后移的 24,519）
 
 FORBIDDEN = [
     "[PANIC]",

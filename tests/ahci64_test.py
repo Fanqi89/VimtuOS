@@ -46,7 +46,7 @@ QEMU_CANDIDATES = [
 ]
 
 MEDIUM = os.path.join(ROOT, "vimtu64-64.img")
-TARGET_SECTORS = 32768          # 16 MB 目标 SATA 盘
+TARGET_SECTORS = 57343          # 28MB（= 原 16MB + 主分区起点后移的 24,519） 目标 SATA 盘
 
 
 def find_qemu(explicit=None):

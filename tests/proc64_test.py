@@ -4,7 +4,7 @@
 
 做什么（与 tests/elf64_test.py 同一套骨架，只是断言换了对象）：
   1) 造一块"已装好系统、主分区已格式化"的 16MB 测试盘（build64/system.img 的字节
-     + 标准 MBR 分区表 + 在 LBA 8009 上复刻 kernel/vfs64.cpp 的空 VimtuFS2 卷）；
+     + 标准 MBR 分区表 + 在 LBA 32584 上复刻 kernel/vfs64.cpp 的空 VimtuFS2 卷）；
   2) 无头启动它，读串口断言（BIOS/SeaBIOS 路径 -> 每进程 CR3 必须生效）：
        [PROC64] init mode=isolated       引导期页表是我们自己建的 -> 每进程 CR3 打开
        [PROC64] selftest PASS            进程表/地址空间布局自检
@@ -73,10 +73,10 @@ UEFI_IMG = os.path.join(ROOT, "build64", "proc64_uefi_test.img")
 OS_KERNEL = os.path.join(ROOT, "build64", "kernel64_os.bin")
 
 SECTOR = 512
-PART_BOOT_LBA = 9
-PART_BOOT_SECS = 8000
-PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS     # 8009（与 kernel/part64.h 一致）
-TARGET_SECTORS = 32768                              # 16MB
+PART_BOOT_LBA = 65
+PART_BOOT_SECS = 32519
+PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS     # 32584（与 kernel/part64.h 一致）
+TARGET_SECTORS = 57343                              # 28MB（= 原 16MB + 主分区起点后移的 24,519）
 
 # 第一遍启动必须出现（顺序即输出顺序）
 MUST = [

@@ -35,7 +35,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 SECTOR = 512
-PART_MAIN_LBA = 8009
+PART_MAIN_LBA = 32584
 
 
 def load_mod(name, fname):

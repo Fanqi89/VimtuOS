@@ -4,7 +4,7 @@
 
 做什么（与 tests/app64_test.py 同一套骨架）：
   1) 造一块"已装好系统、主分区已格式化"的 16MB 测试盘（= build64/system.img 的字节
-     + 标准 MBR 分区表 + 在 LBA 8009 上用 Python 复刻 kernel/vfs64.cpp 的空 VimtuFS2 卷）；
+     + 标准 MBR 分区表 + 在 LBA 32584 上用 Python 复刻 kernel/vfs64.cpp 的空 VimtuFS2 卷）；
   2) 无头启动它两遍，读串口日志断言：
      第一遍：MSR 初始化（EFER.SCE/STAR/LSTAR/FMASK）-> [ELF64] 自检 ->
              幂等把内嵌 hello.elf 装成 /hello.elf -> 从盘上 vfs64_read 读出来 ->
@@ -60,10 +60,10 @@ SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "elf64_test.img")
 
 SECTOR = 512
-PART_BOOT_LBA = 9
-PART_BOOT_SECS = 8000
-PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS     # 8009（与 kernel/part64.h 一致）
-TARGET_SECTORS = 32768                              # 16MB
+PART_BOOT_LBA = 65
+PART_BOOT_SECS = 32519
+PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS     # 32584（与 kernel/part64.h 一致）
+TARGET_SECTORS = 57343                              # 28MB（= 原 16MB + 主分区起点后移的 24,519）
 
 # 第一遍启动必须出现（顺序即输出顺序）
 MUST = [

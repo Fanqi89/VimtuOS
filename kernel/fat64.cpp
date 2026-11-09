@@ -37,7 +37,7 @@ static int        g_ndirs   = 0;
 // 自检用：把卷建在内存里（不碰真盘）。
 // ★ 为什么按 4KB 页拼而不是一个 static 数组：内存卷要 34MB（FAT32 的簇数硬下限决定的），
 //   而内核 .bss 已经到 ~40MB，再加 34MB 就撞上物理 0x04000000（64MB）的载荷缓冲
-//   （安装介质的 SYSTEM.IMG 就放那儿）—— 会把载荷覆盖掉。改成运行时从页池（>=128MB）
+//   （安装介质的 SYSTEM.IMG 就放那儿）—— 会把载荷覆盖掉。改成运行时从页池（运行期起点 >=160MB）
 //   取页 + 一张页指针表，既不占 .bss 也不撞载荷。
 static bool       g_ram      = false;
 static uint8_t*   g_ram_page[FAT64_RAM_MAX_PAGES];

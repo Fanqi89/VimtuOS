@@ -17,7 +17,7 @@
 （[TERM] cmd <name> ok + 具体打点；update 打 [UPDATE64] cmd status，preload 打 [PRELOAD64] cmd report）。
 
 夹具：与 tests/store64_test.py 同一套 —— build64/system.img 的字节 + 标准 MBR + Python 复刻的
-VimtuFS2 空卷（@LBA 8009）。只有"有卷"时才可能拿到 carrier=vfs 的 config64（这是正常安装盘的形态）。
+VimtuFS2 空卷（@LBA 32584）。只有"有卷"时才可能拿到 carrier=vfs 的 config64（这是正常安装盘的形态）。
 
 用法（必须用 Windows 原生 Python，MSYS2 的 python 会让 QEMU 检测失败）：
     py -3 tests\\sysstate64_test.py
@@ -52,10 +52,10 @@ FIXTURE_IMG = os.path.join(ROOT, "build64", "sysstate64_test.img")
 BSOD_PNG = os.path.join(ROOT, "docs", "screenshots", "bsod64.png")
 
 SECTOR = 512
-PART_BOOT_LBA = 9
-PART_BOOT_SECS = 8000
-PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS      # 8009
-TARGET_SECTORS = 32768                              # 16MB
+PART_BOOT_LBA = 65
+PART_BOOT_SECS = 32519
+PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS      # 32584
+TARGET_SECTORS = 57343                              # 28MB（= 原 16MB + 主分区起点后移的 24,519）
 
 STORE_SLOT_BYTES = 16384
 STORE_MAGIC = b"VSTORE64"

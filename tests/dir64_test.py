@@ -45,8 +45,8 @@ DISK = os.path.join(BUILD, "sysdisk.img")
 KERNEL_OS = os.path.join(BUILD, "kernel64_os.bin")
 BB_BIN = os.path.join(BUILD, "busybox.bin")
 
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343
 SECTOR = 512
 
 FORBIDDEN = ["PANIC", "TRIPLE FAULT"]

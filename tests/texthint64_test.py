@@ -66,8 +66,8 @@ SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 KERNEL_OS = os.path.join(ROOT, "build64", "kernel64_os.bin")
 WM_ELF = os.path.join(ROOT, "build64", "wm.elf")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "texthint64_test.img")
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768                   # 16 MB（与 font64user / wm64 同一夹具口径）
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343                   # 28MB（= 原 16MB + 主分区起点后移的 24,519）（与 font64user / wm64 同一夹具口径）
 
 FONT_MAP = (
     ("/Fonts/NotoSans-Regular.ttf", os.path.join(ROOT, "build", "font_bahnschrift.ttf")),

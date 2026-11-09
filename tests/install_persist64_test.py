@@ -4,14 +4,14 @@
 系统中的数据就不会保存（桌面图标位置、壁纸、主题、用户名、用户密码、桌面上的新建文件夹）"）：
 
   安装器只把**载荷 8073 扇区**（MBR+引导+内核+64 扇区裸槽）写到目标盘，
-  而 12 MiB 的 VimtuFS2 卷留在 sysdisk.img 的 LBA 8009 起 —— 装好的盘根本没有文件系统：
+  而 12 MiB 的 VimtuFS2 卷留在 sysdisk.img 的 LBA 32584 起 —— 装好的盘根本没有文件系统：
       [VFS64] mount FAILED reason=magic -> mount_system FAILED
       [CONF64] WARN NOT-PERSISTENT carrier=raw reason=no-vimtufs2-volume
   于是所有写入都失败（`[VFS64] mkdir_on64: slot=0 not mounted`），重启当然全丢。
   修法：tools/payload_embed_win.py 把卷并入载荷 -> 装好的盘自带卷。
 
 判据（每条都带实测数字）：
-  ① 装好的盘 LBA8009 = "VIMTUFS2" 卷头（magic + version=5）
+  ① 装好的盘 LBA32584 = "VIMTUFS2" 卷头（magic + version=5）
   ② 第一次启动：`[VFS64] mount ok` 且**没有** `mount_system FAILED` / `NOT-PERSISTENT`
   ③ 在系统里真做三件事：`mkdir /home/vimtu/pdata`、`cfg set ui.theme 3`、`cfg save`
      并要求 `[CONF64] flush ok via=vfs`（落盘到卷，不是内存）
@@ -178,9 +178,9 @@ def main():
 
     # ---- 2) 装好的盘：卷必须在 ----
     with open(TARGET, "rb") as f:
-        f.seek(8009 * 512)
+        f.seek(32584 * 512)
         head = f.read(16)
-    check("装好的盘 LBA8009 = VimtuFS2 卷头（magic + version=5）",
+    check("装好的盘 LBA32584 = VimtuFS2 卷头（magic + version=5）",
           head[:8] == MAGIC and int.from_bytes(head[8:12], "little") == 5,
           "%r version=%d" % (head[:8], int.from_bytes(head[8:12], "little")))
 
@@ -272,7 +272,7 @@ def main():
     try:
         TP = load_mod("tcc_pack_win", "tools/tcc_pack_win.py")
         d = open(TARGET, "rb").read()
-        vol = d[8009 * 512:]
+        vol = d[32584 * 512:]
         inodes = int.from_bytes(vol[40:44], "little")
         cur_inode = 0
         found = None

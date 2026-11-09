@@ -35,7 +35,7 @@ except Exception:
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SYS_DISK = os.path.join(ROOT, "build64", "sysdisk.img")
-PART_MAIN_LBA = 8009
+PART_MAIN_LBA = 32584
 SECTOR = 512
 outdir = os.path.join(os.environ.get("PI_SCRATCH_DIR", ROOT), "office")
 os.makedirs(outdir, exist_ok=True)

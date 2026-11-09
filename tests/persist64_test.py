@@ -31,7 +31,7 @@ except Exception:
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_DISK = os.path.join(ROOT, "build64", "sysdisk.img")
-PART_MAIN_LBA = 8009
+PART_MAIN_LBA = 32584
 SECTOR = 512
 WORK = os.path.join(os.environ.get("PI_SCRATCH_DIR", ROOT), "persist")
 os.makedirs(WORK, exist_ok=True)

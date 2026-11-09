@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 """tests/store64_test.py - 设置持久化 store 端到端验收（终端命令 -> VimtuFS2 /store.a|b -> 冷启动读回）
 
-被验的缺陷：kernel/memlayout64.h 的裸盘 store 保留区 LBA 8009..8072 与安装程序建的数据分区
-（起点 LBA 8009）**完全重叠**。修完之后：store 的槽优先放在文件系统里（/store.a、/store.b，
+被验的缺陷：kernel/memlayout64.h 的裸盘 store 保留区 LBA 32584..8072 与安装程序建的数据分区
+（起点 LBA 32584）**完全重叠**。修完之后：store 的槽优先放在文件系统里（/store.a、/store.b，
 各 16KB = 一个槽），裸盘槽只作为"没有可用卷"时的降级路径并打醒目 WARN。
 
 做什么（三段，全部无头 QEMU + -serial file: + [PASS]/[FAIL] + === RESULT: ===）：
   1) 造一块"已装好系统 + 主分区已格式化"的 16MB 测试盘（与 tests/app64_test.py 同款夹具：
-     build64/system.img 字节 + 标准 MBR + Python 复刻的 VimtuFS2 空卷 @LBA 8009）；
+     build64/system.img 字节 + 标准 MBR + Python 复刻的 VimtuFS2 空卷 @LBA 32584）；
   2) 第一遍启动：QEMU monitor 注入按键（Win 键 -> 开始菜单 -> 数字 1 = 终端）打开终端，
      敲 `store set theme dark` / `store flush` / `store dump`，断言串口出现
      [STORE64] cmd set/flush/dump、[STORE64] flush via=vfs -> slot=... ok、[STORE64] selftest PASS；
@@ -20,7 +20,7 @@
      （keys >= 2：1 条登录 cfg.* 键 + 1 条 theme）与 dump 里的 theme=dark / cfg.*
      —— 这就证明"设置真的跨重启存下来了"；
   4) 第三遍（只读对照）：启动**没有分区表/没有卷**的 build64/system.img，断言降级路径打印
-     [STORE64] WARN raw slot area LBA 8009 overlaps the data partition; use VFS-backed store
+     [STORE64] WARN raw slot area LBA 32584 overlaps the data partition; use VFS-backed store
      且 init via=raw —— 证明这条警告只在"无卷降级"时出现（正常路径两遍都不许出现）。
 禁止出现：PANIC / TRIPLE FAULT / FAILED mask=。
 
@@ -56,10 +56,10 @@ SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "store64_test.img")
 
 SECTOR = 512
-PART_BOOT_LBA = 9
-PART_BOOT_SECS = 8000
-PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS     # 8009（与 kernel/part64.h 一致）
-TARGET_SECTORS = 32768                              # 16MB
+PART_BOOT_LBA = 65
+PART_BOOT_SECS = 32519
+PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS     # 32584（与 kernel/part64.h 一致）
+TARGET_SECTORS = 57343                              # 28MB（= 原 16MB + 主分区起点后移的 24,519）
 
 STORE_SLOT_BYTES = 16384
 STORE_MAGIC = b"VSTORE64"
@@ -87,13 +87,13 @@ MUST2 = [
 
 # 第三遍（无卷）必须出现：降级警告
 MUST3 = [
-    ("[STORE64] WARN raw slot area LBA 8009 overlaps the data partition; use VFS-backed store",
+    ("[STORE64] WARN raw slot area LBA 32584 overlaps the data partition; use VFS-backed store",
      "无卷时大声报警（裸盘槽区与数据分区重叠）"),
     ("[STORE64] init via=raw slot=none gen=0 keys=0",       "无卷时降级到裸盘槽区（空 store）"),
     ("[GUI64] ready",                                       "桌面照常起来"),
 ]
 
-WARN_RAW = "[STORE64] WARN raw slot area LBA 8009 overlaps the data partition; use VFS-backed store"
+WARN_RAW = "[STORE64] WARN raw slot area LBA 32584 overlaps the data partition; use VFS-backed store"
 
 FORBIDDEN = ["PANIC", "TRIPLE FAULT", "FAILED mask=", "[STORE64] flush FAILED"]
 
@@ -583,19 +583,19 @@ def main():
     print("[store64] 第三遍启动（build64/system.img 的**副本**，构造「没有分区表/没有卷」）：验证降级警告")
     # ★ v0.9.24：不能直接引导 build64/system.img —— 它是**共享构建产物**，别的测试
     #   （desktop64 / cursor64 / apic64 …）会以可写方式引导它，客人机把 /etc、store 槽甚至
-    #   LBA 8009 处的卷写回镜像。实测：跑过一轮之后 system.img 的 LBA 8009 就出现了 VIMTUFS2 卷，
+    #   LBA 32584 处的卷写回镜像。实测：跑过一轮之后 system.img 的 LBA 32584 就出现了 VIMTUFS2 卷，
     #   于是这条"无卷降级"对照路线变成 vfs 路径、判据变红（红的是**夹具**，不是内核）。
-    #   修法：拷副本 + 把 LBA 8009 起的 128 KiB 清零 -> "没有卷"这个前提由夹具自己保证，可复现。
+    #   修法：拷副本 + 把 LBA 32584 起的 128 KiB 清零 -> "没有卷"这个前提由夹具自己保证，可复现。
     noimg = os.path.join(tmp, "boot3_novol.img")
     with open(SYSTEM_IMG, "rb") as f:
         data = bytearray(f.read())
-    vol_off = 8009 * SECTOR
+    vol_off = 32584 * SECTOR
     had_vol = bytes(data[vol_off:vol_off + 8]) == b"VIMTUFS2"
     for i in range(vol_off, min(len(data), vol_off + 128 * 1024)):
         data[i] = 0
     with open(noimg, "wb") as f:
         f.write(data)
-    print("[store64] 第三遍夹具：%s（源镜像 LBA 8009 处**原先有卷**=%s；已清零 128 KiB）"
+    print("[store64] 第三遍夹具：%s（源镜像 LBA 32584 处**原先有卷**=%s；已清零 128 KiB）"
           % (noimg, had_vol))
     vm = Vm(qemu, noimg, tmp, "boot3", args.port + 2, args.timeout)
     vm.start()

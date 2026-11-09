@@ -4,8 +4,8 @@
 
 修的是这条真缺陷（v0.5.11）：
   build64.sh 头注释写着 system.img = "一份完整的系统磁盘映像（8073 扇区）"，但实现只切了
-  前 8073 扇区（MBR+引导+内核+64 扇区裸槽），**卷留在 sysdisk.img 的 8009 起**。
-  于是用 ISO / 安装介质装到硬盘后，目标盘 LBA 8009 处是空字节：
+  前 8073 扇区（MBR+引导+内核+64 扇区裸槽），**卷留在 sysdisk.img 的 32584 起**。
+  于是用 ISO / 安装介质装到硬盘后，目标盘 LBA 32584 处是空字节：
       [VFS64] mount FAILED reason=magic -> mount_system FAILED
       [CONF64] WARN NOT-PERSISTENT carrier=raw reason=no-vimtufs2-volume
   之后所有写入（桌面图标位置/壁纸/主题/用户名/密码/新建文件夹）**全部失败**，重启即丢。
@@ -20,7 +20,7 @@
 
 用法：
   py -3 tools/payload_embed_win.py --disk build64/sysdisk.img --system build64/system.img \
-        --parts-lba 8009 --out-sectors build64/sys_sectors.txt
+        --parts-lba 32584 --out-sectors build64/sys_sectors.txt
 退出码：0 成功 / 1 失败（MBR/卷/magic 不符）
 """
 import argparse
@@ -35,7 +35,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--disk", required=True, help="构建好的 sysdisk.img（含 MBR + 主分区卷）")
     ap.add_argument("--system", required=True, help="安装载荷 system.img（本工具会扩容并写入卷）")
-    ap.add_argument("--parts-lba", type=int, default=8009, help="主分区起始 LBA（默认 8009）")
+    ap.add_argument("--parts-lba", type=int, default=32584, help="主分区起始 LBA（默认 32584）")
     ap.add_argument("--out-sectors", default="", help="把新的载荷总扇区数写到这个文件")
     args = ap.parse_args()
 

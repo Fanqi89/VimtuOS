@@ -6,7 +6,7 @@
 
   ① 素材与卷内字节：
      * 4 段素材由 tools/sounds_gen.py 自合成（可复现），宿主侧量出 采样率/帧数/时长/峰值/sha256；
-     * **从真实系统卷（build64/sysdisk.img 主分区 LBA 8009 的 VimtuFS2 卷）读回** /usr/share/sounds/*.wav
+     * **从真实系统卷（build64/sysdisk.img 主分区 LBA 32584 的 VimtuFS2 卷）读回** /usr/share/sounds/*.wav
        与 /bin/sounder，逐字节与宿主生成物对照（sha256 相同）；
      * /bin/sounder <= 64 KiB（用户窗口装载区上限）；内核二进制里搜不到它们的字节（高熵 64B 探针）。
   ② 真的出声了（客观证据）：`-audiodev wav` 抓到的录音**按实际播放的音频增长** ——
@@ -62,7 +62,7 @@ for _s in (sys.stdout, sys.stderr):
 FORBIDDEN = ["PANIC", "TRIPLE FAULT", "三重故障", "[SYSCALL] enosys nr=49"]
 SOUNDS = ("startup", "notify", "click", "error")
 SOUND_DIR = "/usr/share/sounds"
-PART_MAIN_LBA = 8009
+PART_MAIN_LBA = 32584
 SECTOR = 512
 # 基线（本批开工前的系统内核体积；报告里的"净增字节" = 现在 - 这个数）
 KERNEL_BASELINE_BYTES = 3344448
@@ -514,7 +514,7 @@ def main():
 
     # ---------------- ① 卷内读回：逐字节一致 ----------------
     # 两处都要证：
-    #   (a) **真实系统卷**（build64/sysdisk.img 主分区 LBA 8009）—— 构建期装进去的那一份；
+    #   (a) **真实系统卷**（build64/sysdisk.img 主分区 LBA 32584）—— 构建期装进去的那一份；
     #   (b) **验收夹具盘**（本测试自己用 tools/sounder_pack_win.py 从零造，供 QEMU 起机）——
     #       为什么不直接起 sysdisk.img：那份卷里还装着 /bin/edit 等演示程序，内核启动期的
     #       EDIT64 演示会跑很久（实测卡在 demo phase=a），桌面起不来；夹具卷只放本批要验的东西。

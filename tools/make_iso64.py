@@ -38,12 +38,16 @@ XORRISO_CANDIDATES = [
     "xorriso",
 ]
 
-KERNEL_CD_BYTES = 8000 * 512          # loader 固定读 4MB（KERNEL_SECTORS 个 512B 扇区）
+# ★ v0.9.31：这是**安装程序内核**在介质里的补零上限（4 MiB），**不是**系统内核的 15 MiB 容量。
+#   两回事：系统内核在硬盘引导区（LBA 65..30784，15MiB 容量，loader 只读真实大小）；
+#   介质里的 KERNEL64.BIN 是安装程序内核（build64/kernel64.bin），cdiso 的硬盘/U 盘路径
+#   按这个字节数把它搬进 0x100000，所以必须先补零到定长。build64.sh 有断言拦住它超长。
+KERNEL_CD_BYTES = 4 * 1024 * 1024      # 安装程序内核在介质里的定长槽（4 MiB）
 PAYLOAD_SECTORS = 8073                # ★ 仅历史默认值，**不再作为回填值**：
 #   真值一律按 /SYSTEM/SYSTEM.IMG 的实际字节数推导（见下面 vmss 那处）。
 #   踩过的坑（v0.5.18 修）：v0.5.11 把数据分区并进 system.img 后，载荷从 8073 扇区长到
 #   32768 扇区，但这个常量没跟着改 -> 回填进引导桩的 VMSS 仍是 8073 -> loader64 只从光盘
-#   读 4.13MB -> 安装器也只拷 4.13MB -> 目标盘卷从 LBA 8009 起只有 64 扇区有效，
+#   读 4.13MB -> 安装器也只拷 4.13MB -> 目标盘卷从 LBA 32584 起只有 64 扇区有效，
 #   inode 表后段全丢（/Wallpapers、/Avatars、链尾打包的一切）。
 #   为什么一直没被发现：hybrid 硬盘介质（vimtu64-64.img）走的是 payload_embed_win.py 写的
 #   VIMTUPAY 头（扇区数正确），只有 ISO 光盘引导这条路读 VMSS。

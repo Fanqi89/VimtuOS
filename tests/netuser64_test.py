@@ -68,7 +68,7 @@ NETVOL = os.path.join(BUILD, "netvol.img")
 NETD_ELF = os.path.join(BUILD, "netd.elf")
 KERNEL_OS = os.path.join(BUILD, "kernel64_os.bin")
 FIXTURE = os.path.join(BUILD, "netuser64_test.img")
-PART_MAIN_LBA = 8009
+PART_MAIN_LBA = 32584
 SECTOR = 512
 
 PATTERN = bytes(((i * 7 + 3) & 0xFF) for i in range(64))          # 与 user/net/netd.c 同一份 64 B

@@ -12,7 +12,7 @@
     * make_iso64.py 回填引导桩 `VMSS` 用的仍是这个硬编码常量；
     * loader64.asm 按 [0x0F10]（=VMSS）决定从光盘读多少字节到 0x04000000；
     * 安装器按 MediumDesc.payload_secs（=VMSS）决定往目标盘拷多少扇区。
-  结果 ISO 装盘只写了 4.13 MB，而系统卷从 LBA 8009 开始 -> 只有前 64 扇区有效：
+  结果 ISO 装盘只写了 4.13 MB，而系统卷从 LBA 32584 开始 -> 只有前 64 扇区有效：
   卷超级块/位图/inode 表前段在，**inode 号靠后的条目全丢** —— 链尾打包的 /Wallpapers、
   /Avatars（以及 inode 8 之后的绝大多数文件）就都不见了。
   实测对照（同一台 QEMU、同一份 system.img）：
@@ -43,7 +43,7 @@ from volreloc64_test import Vol  # noqa: E402
 
 ISO = os.path.join(ROOT, "vimtu64-64.iso")
 IMG = os.path.join(ROOT, "vimtu64-64.img")
-MAIN_LBA = 8009
+MAIN_LBA = 32584
 SECT = 2048
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
 

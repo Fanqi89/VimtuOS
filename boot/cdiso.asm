@@ -22,7 +22,7 @@
 ;   0x0F06  u16 rsv
 ;   0x0F08  u32 kernel_lba 光盘：内核起始扇区（2048B）；RAM：内核物理地址
 ;   0x0F0C  u32 payload_lba 光盘：载荷起始扇区；RAM：载荷物理地址
-;   0x0F10  u32 payload_secs 载荷扇区数（512B 单位，8073）
+;   0x0F10  u32 payload_secs 载荷扇区数（512B 单位；构建期按 SYSTEM.IMG 真实大小回填）
 ;   0x0F14  u32 image_bytes 备用
 ;
 ; 构建期回填（tools/make_iso64.py 按魔数写 dword）：
@@ -422,7 +422,7 @@ vmsy_lba:   db "VMSY"               ; 光盘：载荷起始扇区
 vmsy_val:   dd 0
 vmss_secs:  db "VMSS"               ; 载荷扇区数（512B 单位）
 vmss_val:   dd 8073                 ; ★ 只是默认值：构建期由 make_iso64.py 按 SYSTEM.IMG 真实大小回填
-                                    ;   （v0.5.18 起是 32768，不是 8073 —— 详见 make_iso64.py 的注释）
+                                    ;   （v0.5.18 起按真实大小；v0.9.31 起载荷 ~57,287 扇区 —— 详见 make_iso64.py 的注释）
 vml9_lba:   db "VML9"               ; 硬盘：loader 起始扇区（512B 单位）
 vml9_val:   dd 0
 vmk9_lba:   db "VMK9"               ; 硬盘：内核起始扇区（512B 单位）
@@ -432,7 +432,7 @@ vmkb_val:   dd 8000 * 512
 vms9_lba:   db "VMS9"               ; 硬盘：载荷起始扇区（512B 单位）
 vms9_val:   dd 0
 vmyb_bytes: db "VMYB"               ; 载荷字节数
-vmyb_val:   dd 8073 * 512
+vmyb_val:   dd 32648 * 512
 
 align 4
 big_src:    dd 0

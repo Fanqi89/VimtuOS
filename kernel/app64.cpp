@@ -11,7 +11,7 @@
 #include "app64.h"
 #include "vfs64.h"
 #include "usermode64.h"
-#include "part64.h"     // PART_MAIN_LBA：主分区起始 LBA 的唯一定义点（= 9 + 8000 = 8009）
+#include "part64.h"     // PART_MAIN_LBA：主分区起始 LBA 的唯一定义点（= 65 + 32519 = 32584）
 #include "elf64.h"      // ELF64 加载器（app64_run_any64 按魔数分派到这里）
 #include "ata64.h"      // 挂载前读 MBR，按安装器同一条规则找 type=0x07 分区
 #include "debug64.h"

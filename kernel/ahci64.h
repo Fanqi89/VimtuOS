@@ -99,3 +99,16 @@ int  ahci64_cd_count64();
 bool ahci64_cd_info64(int idx, DiskInfo* out);
 bool ahci64_cd_read64(int idx, uint32_t cd_lba, uint32_t sectors, void* buf);
 bool ahci64_cd_capacity64(int idx, uint32_t* out_sectors, uint32_t* out_bytes);
+
+// ==================== ★ v0.9.33：零拷贝散列读（给 ring3 驱动框架用）====================
+// 把盘上数据**直接 DMA 到调用方给的物理帧**，全程不做 memcpy。这些帧通常来自
+// proc64_shm_create64 建的共享对象（proc64_shm_view64 能取到帧号数组），
+// 并已 proc64_shm_map64 映射进 ring3 驱动服务的地址空间 —— 这就是第 3 条通道的落点。
+//   * idx   = AHCI 盘序号（0 起；驱动器号 = ATA64_AHCI_BASE + idx）
+//   * lba   = 绝对 LBA；count = 扇区数（≤ nframes*8）
+//   * frames[] = 物理帧号数组；一帧一项 PRDT，一条命令最多 16 帧（64 KiB = 128 扇区）
+//   * out_bytes = 实际落地的字节数（失败时是已完成的部分，调用方据此判"半截"）
+// 返回 true = 全部落地；false = 参数非法 / 目标帧不够 / 控制器报错（已打点）。
+bool ahci64_read_frames64(int idx, uint32_t lba, uint32_t count,
+                          const uint64_t* frames, uint32_t nframes,
+                          uint64_t* out_bytes);

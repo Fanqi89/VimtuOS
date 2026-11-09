@@ -65,7 +65,7 @@ FONT_LATIN = os.path.join(ROOT, "build", "font_bahnschrift.ttf")
 FIXTURE_IMG = os.path.join(ROOT, "build64", "store64_test.img")
 FIXTURE_REPO = os.path.join(ROOT, "build64", "store", "repo_test")
 FRESH_VOL_SECTORS = 3200                       # 1.6 MB 卷（故意小：让"空间不足"能触发）
-PART_MAIN_LBA = 8009
+PART_MAIN_LBA = 32584
 
 # ---- store.c 的布局常量的**镜像**（改 store.c 时这里要一起改；测试按它算点击坐标）----
 STORE_W, STORE_H = 256, 60

@@ -57,8 +57,8 @@ TCC_BIN = os.path.join(BUILD, "tcc.bin")
 TCC_STAGE = os.path.join(BUILD, "tcc_stage")
 FIXTURE = os.path.join(BUILD, "make_test.img")
 
-PART_MAIN_LBA = 8009
-TARGET_SECTORS = 32768
+PART_MAIN_LBA = 32584
+TARGET_SECTORS = 57343
 SECTOR = 512
 HELLO_TXT = b"VimtuOS A4-1 ring3 shell: /etc/sh64hello.txt byte test\n"
 

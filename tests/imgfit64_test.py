@@ -47,7 +47,7 @@ PAYLOAD = os.path.join(ROOT, "build64", "sysdisk.img")
 WORK = os.path.join(ROOT, "build64", "imgfit64")
 TGT = os.path.join(WORK, "target2g.img")
 PORT = 5598
-MAIN_LBA = 8009
+MAIN_LBA = 32584
 GIB = 1024 ** 3
 
 P_WALL, P_AVATAR = 5, 12

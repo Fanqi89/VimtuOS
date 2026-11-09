@@ -7,7 +7,7 @@
 //   * **单播放流**：SD0（偏移 0x80），48 kHz / 16-bit / 2ch（stream format 0x0011）。
 //   * **DMA 缓冲必须用物理地址**：控制器按 BDL 里的**物理地址**取数据。内核镜像链接在高半区
 //     （VA = PA + 0xFFFFFFFF80000000，见 memlayout64.h），所以 CORB/RIRB/BDL/周期缓冲全部
-//     来自 page_alloc_64()（页池 [128MB, mem_high) 恒等映射，PA == VA）—— 不把
+//     来自 page_alloc_64()（页池 [>=160MB, mem_high) 恒等映射，PA == VA）—— 不把
 //     这些结构放进 .bss，省掉一层 VA->PA 换算与页跨越风险。
 //   * Get Parameter 的参数号用 Intel HDA spec 1.0a 的定义（任务书里的 "F0004=节点数 /
 //     F0005=功能组类型 / F000C=引脚能力" 与 spec 一致；Revision ID 是 0x02 而不是 0x04，

@@ -8,11 +8,11 @@
   * build/iconpack.bin                            **图标包**：头 + 32B 条目表 + PNG 块
 
 图标包落盘位置（由 build64.sh 用 dd 写进系统镜像，见 kernel/icons64.h 的 ICON64_PACK_LBA）：
-  **内核区（LBA 9..8008）的尾部空闲扇区** —— 内核二进制 3.7MB 之后到 LBA 8009 之间的空档。
+  **内核区（LBA 65..30784）的尾部空闲扇区** —— 内核二进制 3.7MB 之后到 LBA 32584 之间的空档。
   为什么不去 VimtuFS2：本工程 system.img 的 8073 扇区里**没有** VimtuFS2 卷（卷在安装器建的数据
-  分区上，起点 LBA 8009 = kernel/memlayout64.h 的 ML64_STORE_LBA，两者重叠是已知约束）；
-  装到硬盘上以后，这段内核区字节**原样保留**（loader 就是从 LBA 9 读内核的），所以：
-  裸 system.img 启动、安装出来的盘、测试夹具盘（system.img 字节 + MBR + @8009 卷）三种情形
+  分区上，起点 LBA 32584 = kernel/memlayout64.h 的 ML64_STORE_LBA，两者重叠是已知约束）；
+  装到硬盘上以后，这段内核区字节**原样保留**（loader 就是从 LBA 65 读内核的），所以：
+  裸 system.img 启动、安装出来的盘、测试夹具盘（system.img 字节 + MBR + @32584 卷）三种情形
   都能读到同一份图标包。
 
 图标包格式（小端；与 kernel/icons64.h 的 ICON64_PACK_* 一致）：

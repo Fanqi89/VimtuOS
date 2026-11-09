@@ -19,7 +19,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import tcc_pack_win as TP  # noqa: E402
 
-PART_MAIN_LBA = 8009
+PART_MAIN_LBA = 32584
 SZ_SECTOR = 512
 
 

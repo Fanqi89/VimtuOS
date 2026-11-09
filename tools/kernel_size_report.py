@@ -52,7 +52,7 @@ ROOT = os.path.dirname(HERE)
 
 # 内核预算三层（与 tests/a42a64_test.py 的三个常量**同一口径**；这里只做展示，
 # 真正的断言在测试脚本里 —— 统计脚本不改任何阈值）
-LIMIT_BYTES = 8000 * 512            # 内核区硬上限 LBA 9..8008 = 4,096,000 B
+LIMIT_BYTES = 30720 * 512            # 内核区硬上限 LBA 65..30784 = 30,720 扇区 = 15,728,640 B
 RESERVE_BYTES = 640 * 1024          # 预留下限 R = 640 KiB
 BATCH_BASELINE_BYTES = 3418352      # 本批基线（写死的回归锚点）
 

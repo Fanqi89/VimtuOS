@@ -45,8 +45,8 @@ QEMU_CANDIDATES = smt.QEMU_CANDIDATES
 PORT = 5677
 PACK_FILE = "/etc/iconpack.bin"   # ★ A4-2a 起：图标包 = 系统卷里的文件（不再是内核区尾部 LBA 7497）
 PACK_BIN = os.path.join(ROOT, "build", "iconpack.bin")
-SMALL_SECTORS = 32768             # 16 MB 夹具盘（与 fs_tree_test.make_small_system_disk 同几何）
-PART_MAIN_LBA = 8009
+SMALL_SECTORS = 57343             # 28MB（= 原 16MB + 主分区起点后移的 24,519） 夹具盘（与 fs_tree_test.make_small_system_disk 同几何）
+PART_MAIN_LBA = 32584
 SYSTEM_IMG = os.path.join(ROOT, "build64", "system.img")
 MANIFEST = os.path.join(ROOT, "build", "icons", "manifest.json")
 ICON_DIR = os.path.join(ROOT, "build", "icons")
@@ -163,7 +163,7 @@ def fnv1a32(b):
 
 
 def make_fixture(tmp, name, corrupt=None):
-    """夹具盘：16MB 系统盘（system.img 字节 + MBR + @8009 的 VimtuFS2 **v4** 卷）。
+    """夹具盘：16MB 系统盘（system.img 字节 + MBR + @32584 的 VimtuFS2 **v4** 卷）。
     卷存在时开始按钮才会从 VimtuFS2 读 /logo/kaisi.png（\"src=vfs:/logo/kaisi.png\"这条验收靠它）。
     ★ A4-2a 起图标包在**卷里**（/etc/iconpack.bin），不再是内核区尾部 LBA 7497 —— 夹具直接把
       （可能已改坏的）包写进卷：ok 走 src=vfs 正常读回；坏法在卷内文件上做，离线可复现。

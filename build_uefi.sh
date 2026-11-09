@@ -1,5 +1,5 @@
 #!/bin/bash
-# 两段式 UEFI 引导：BOOTX64.EFI（极小 PE 桩） + UEFI64.BIN（平铺长模式引导器 @0x04800000）
+# 两段式 UEFI 引导：BOOTX64.EFI（极小 PE 桩） + UEFI64.BIN（平铺长模式引导器 @0x06000000）
 #   ★ 引导器地址必须与 boot/efi/stub.c 的 LOADER_ADDR 一致，且**在内核 BSS 之外**
 #     （内核 BSS 覆盖物理 0x28E810..0x22E9000，启动时会清零；放 8MB 会把页表清掉）
 # 用法：bash build_uefi.sh [outdir]   默认 outdir=build64
@@ -32,10 +32,10 @@ lld-link -subsystem:efi_application -entry:efi_main -nodefaultlib -machine:x64 \
          -out:"$B/BOOTX64.EFI" "$B/stub.o" "$B/jump64.o"
 echo "    BOOTX64.EFI = $(stat -c%s "$B/BOOTX64.EFI") bytes"
 
-echo "==> 2) 编译平铺长模式引导器 UEFI64.BIN（链接到 0x04800000 = 72MB，避开内核 BSS）"
+echo "==> 2) 编译平铺长模式引导器 UEFI64.BIN（链接到 0x06000000 = 96MB：载荷窗口之外、内核堆之下）"
 clang -x c $CFLAGS_WIN -c boot/efi/uefi64.c -o "$B/uefi64.o"
 lld-link -subsystem:native -entry:uefi_main -nodefaultlib -machine:x64 \
-         -base:0x4800000 -align:0x1000 \
+         -base:0x6000000 -align:0x1000 \
          -out:"$B/uefi64.efi" "$B/uefi64.o" "$B/jump64.o"
 "$PY" tools/make_flat.py "$B/uefi64.efi" "$B/UEFI64.BIN"
 echo "    UEFI64.BIN  = $(stat -c%s "$B/UEFI64.BIN") bytes"

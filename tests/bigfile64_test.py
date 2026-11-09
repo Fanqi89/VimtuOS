@@ -4,7 +4,7 @@
 
 它做什么（全自动：宿主机造盘 -> QEMU 启动 -> 终端敲命令 -> 宿主侧解析 raw 镜像）：
   阶段 1  宿主侧造两块盘（不需要跑安装向导，秒级）：
-            C: = 128MB 盘：build64/system.img 平铺 + MBR（ESP@9 + 主分区 0x07@8009）+ Python 侧 v3 卷
+            C: = 128MB 盘：build64/system.img 平铺 + MBR（ESP@9 + 主分区 0x07@32584）+ Python 侧 v3 卷
             D: = 32MB 数据盘：mv 的 v3 夹具（/readme.txt + /docs/notes.txt）
   阶段 2  终端跑 `bigtest`：
             `bigtest 1mb`     -> 经 fd64/fs64/vfs64 写 1 MiB（模式化字节）再分块读回逐字节 + CRC 一致
@@ -52,11 +52,11 @@ import qemuhelp as qh              # noqa: E402  （★ 公共登录手势：ui.
 
 SECTOR = 512
 SYSTEM_IMG = fst.SYSTEM_IMG
-PART_BOOT_LBA = 9
-PART_BOOT_SECS = 8000
-PART_MAIN_LBA = fst.PART_MAIN_LBA                     # 8009
+PART_BOOT_LBA = 65
+PART_BOOT_SECS = 32519
+PART_MAIN_LBA = fst.PART_MAIN_LBA                     # 32584
 
-C_SECTORS = 262144                                    # 128MB 系统盘
+C_SECTORS = 286719                                    # 128MB 系统盘
 C_MAIN_SECTORS = C_SECTORS - PART_MAIN_LBA            # 254135
 D_SECTORS = 65536                                     # 32MB 数据盘（够 8MiB 复制）
 D_PART_LBA = mv.DATA_PART_LBA                         # 8192
@@ -131,7 +131,7 @@ def read_via_chain(buf, vol, ino):
 
 # ---------------------------------------------------------------------------
 def make_system_disk(path):
-    """128MB 系统盘：system.img + MBR（ESP + 主分区）+ Python 侧 v3 卷（@8009）。"""
+    """128MB 系统盘：system.img + MBR（ESP + 主分区）+ Python 侧 v3 卷（@32584）。"""
     with open(SYSTEM_IMG, "rb") as f:
         sys_bytes = f.read()
     if not sys_bytes or len(sys_bytes) % SECTOR or len(sys_bytes) > C_SECTORS * SECTOR:

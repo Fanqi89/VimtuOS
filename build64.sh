@@ -4,7 +4,7 @@
 # 产出三样东西：
 #   1) build64/kernel64.bin     安装介质的**安装程序**内核（-DVIMTU_INSTALLER_MEDIA）
 #   2) build64/kernel64_os.bin  装进硬盘的**系统**内核（不带该宏 -> 走系统启动路径）
-#   3) build64/system.img       系统镜像载荷（= 装进硬盘的完整磁盘映像，8073 扇区）
+#   3) build64/system.img       系统镜像载荷（= 装进硬盘的完整磁盘映像；引导区 32,592 扇区 + 卷）
 #      以及 vimtu64-64.img      安装介质：引导链 + 安装程序 + 载荷（system.img）
 #      以及 vimtu64-64.iso      安装光盘（层级式目录，v0.5.6 起）：
 #        /BOOT/CDISO.BIN（BIOS El Torito 桩）+ LOADER64.BIN + KERNEL64.BIN
@@ -15,21 +15,21 @@
 #
 # 镜像布局（必须与 kernel/memlayout64.h、boot/loader64.asm 三方一致）：
 #   LBA 0            : boot.bin        （512B MBR）
-#   LBA 1..8         : loader64.bin    （实模式准备 + 进长模式 + 64 位 ATA 读内核）
-#   LBA 9..8008      : kernel*.bin     （最多 4MB）
-#   LBA 8009..8072   : 设置持久化保留区（64 扇区）
-#   ---- 以上 8073 扇区就是"一份完整的系统磁盘映像"（system.img 的内容）----
-#   LBA 7497..8008   : ★ 本批：**图标包**（build/iconpack.bin，上限 512 扇区 = 256KB）——
-#                      外置图标资源（真图标）就放这里：内核区尾部、内核二进制之后、数据分区之前。
-#                      为什么不用文件系统：system.img 里没有 VimtuFS2 卷（卷在安装器建的数据分区上，
-#                      起点 LBA 8009 与 store 的裸盘降级槽重叠，见 kernel/memlayout64.h 的 ★★ 段），
-#                      而这段字节装到硬盘后原样保留（loader 就从 LBA 9 读内核）。
+#   LBA 1..64         : loader64.bin    （实模式准备 + 进长模式 + 64 位 ATA 读内核）
+#   LBA 65..30784     : kernel*.bin     （★ v0.9.31：内核容量 **15MiB** = 30,720 扇区）
+#   LBA 30785..32583 : 原始区（演示程序 / 中文字体 / 图标包 blob，1,799 扇区 = 920,911 B）
+#   LBA 32584..32647 : 设置持久化保留区（64 扇区 = 32KB，裸盘降级槽）
+#   ---- 以上 32,592 扇区 = "引导区整块 + 裸槽"；system.img = 这 32,592 扇区 + 卷 ----
+#   ★ 原始区为什么在**内核容量之外**：老布局把它塞在内核区里（LBA 6208 起），于是
+#     内核预算 = (原始区起点 - 9) * 512 —— blob 一多就把内核挤小。15MiB 是对用户的
+#     整数承诺，不能拿去养 blob；现在内核对原始区只认一个 LBA（DEMO64_RAW_LBA 现读）。
 #   ★ 安装程序把这个映像写到目标盘后，还会在目标盘**盘尾**再建一个 48MB 的 FAT32 ESP
 #     （EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN）与盘尾备份 GPT ——
 #     这样"装好的盘"在 UEFI 与 BIOS 下都能启动（见 kernel/fat64.cpp、kernel/part64.cpp）。
-#     KERNEL64.BIN 的字节**直接读目标盘 LBA 9..8008**（不内嵌进安装程序内核，省它的 4MB 预算）。
+#     KERNEL64.BIN 的字节**直接读目标盘引导区整块（LBA 65..32583，15MB）**，
+#     不内嵌进安装程序内核（省它的体积预算；安装程序内核另有 4MiB 上限，见下）。
 #   LBA 8192         : 载荷头（magic "VIMTUPAY" + 载荷扇区数 + 载荷 LBA）
-#   LBA 8193..16265  : 载荷本体（system.img 的副本）
+#   LBA 8193..       : 载荷本体（system.img 的副本，长度按真实文件大小回填）
 set -e
 
 cd "$(dirname "$0")"
@@ -46,12 +46,24 @@ NASM=nasm
 BUILD=build64                  # 64 位构建对象目录
 RES=build                      # 资源中间产物目录（字体/图标/logo 由 _*.py 生成到这里）
 IMG=vimtu64-64.img
-KERNEL_LBA=9
-KERNEL_SECTORS=8000            # 与 kernel/memlayout64.h、boot/loader64.asm 一致（4MB）
+# ★ v0.9.32：Stage 1（MBR）现在读 **64 扇区（32 KB）** 的 Stage 2，所以内核起点 = 1 + 64 = 65。
+#   三处必须一致：本行、boot/boot.asm 的 LOADER_SECTORS、kernel/memlayout64.h 的 ML64_LOADER_SECTORS。
+LOADER_SECTORS=64
+KERNEL_LBA=$((1 + LOADER_SECTORS))                       # 65
+# ★ v0.9.31：内核容量 4MB -> **15MiB（30,720 扇区）**。三处必须一致：本行、
+#   boot/loader64.asm 的 KERNEL_SECTORS、kernel/memlayout64.h 的 ML64_KERNEL_SECTORS。
+#   注意这是**容量闸门**，loader 实际只读内核真实大小（构建期回填，见下面 loader_patch）。
+KERNEL_SECTORS=30720
+RAW_LBA=$((KERNEL_LBA + KERNEL_SECTORS))                 # 30,729 = 原始区起点
+RAW_SECTORS=1799                                         # 原始区预留（= memlayout64.h 的 ML64_RAW_SECTORS）
 STORE_SECTORS=64
 PAYLOAD_LBA=8192               # 载荷头所在 LBA（安装程序按这个值找载荷）
-SYS_SECTORS=$((KERNEL_LBA + KERNEL_SECTORS + STORE_SECTORS))          # 8073 = 系统镜像大小
-IMAGE_SECTORS=$((PAYLOAD_LBA + 1 + SYS_SECTORS))                     # 16266 = 安装介质大小
+SYS_SECTORS=$((RAW_LBA + RAW_SECTORS + STORE_SECTORS))   # 32,592 = 引导区整块 + 裸槽
+IMAGE_SECTORS=$((PAYLOAD_LBA + 1 + SYS_SECTORS))         # 安装介质大小（载荷并入后会再算一次）
+# 安装介质里 /BOOT/KERNEL64.BIN（= 安装程序内核 kernel64.bin）的补零上限：
+#   cdiso 的硬盘/U 盘路径按这个字节数把内核搬进 0x100000，ISO 也按它补零。
+#   ★ 这是**安装程序内核**的上限，与系统内核的 15MiB 容量无关，别混。
+KERNEL_MEDIA_MAX_BYTES=$((4 * 1024 * 1024))
 
 # 安装程序内核的编译标志（多两个宏：它要跑安装界面，并知道载荷在哪）
 CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-pic -fno-pie \
@@ -67,7 +79,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.9.30"    # ★ v0.9.30：ACL / 配额 / 日志 / 快照 的 ring-3 入口（setxattr/getxattr + 私有号 + /proc/vimtu/* + vmtool）
+VIMTUOS_VERSION="0.9.34"    # ★ v0.9.34：监督器极限（真除零 #DE + 内核自报 lat_ms）+ 串口欠账 + LFB 不缓存映射；VMware 显示仍 UNVERIFIED
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
@@ -150,6 +162,11 @@ SRCS_SYS="kernel/sysstate64.cpp kernel/config64.cpp kernel/session64.cpp kernel/
 #   既有的收发；安装介质内核没有网卡路径也不跑 ring3，syscall64.cpp 对它用弱引用（那里返回 -1
 #   并打 [SYSCALL] deny）。netraw64.cpp 与 net64.cpp 一样排在这里（不进 SRCS_CORE）。
 SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/fontcfg64.cpp kernel/task64.cpp kernel/vfs64.cpp kernel/store64.cpp kernel/ata64.cpp kernel/app64.cpp kernel/elf64.cpp kernel/proc64.cpp kernel/e1000_64.cpp kernel/net64.cpp kernel/netraw64.cpp kernel/apic64.cpp kernel/smp64.cpp kernel/usb64.cpp kernel/xhci64.cpp kernel/ehci64.cpp kernel/hda64.cpp kernel/wl64.cpp"
+# ★ v0.9.33：kernel/r3drv64.cpp = **ring3 驱动框架**（注册表 / 零拷贝共享环 / 监督重启 / 按类型路由）。
+#   为什么只进 SRCS_OS 而不进 SRCS_CORE：它用 proc64（进程/共享内存）—— 安装介质内核没有进程与
+#   地址空间隔离，链接它会缺符号（同 hda64/net64 的理由）。syscall64.cpp 里对应 case 也有
+#   `#ifndef VIMTU_INSTALLER_MEDIA` 守着，两套内核各编各的。
+SRCS_OS="$SRCS_OS kernel/r3drv64.cpp"
 # ★ v0.9.4：kernel/gpu64.cpp = 通用 GPU 层（P1：显示类 PCI 枚举 + 厂商识别 + BAR 窗口 + 命令寄存器
 #   + 三家只读身份探测 + [GPU] 报告）。**只进系统内核** —— 安装介质只是一块装盘向导界面，
 #   不需要 GPU 报告；加在 SRCS_OS 而不是 SRCS_CORE，省它那 4MB 预算里的几百字节。
@@ -428,7 +445,7 @@ echo "==> ★ A4-1：ring3 shell（**交付 = 系统卷里的 /bin/shell.bin**�
 #      -> $BUILD/shell.elf / shell.bin；
 #   2) tools/make_shellvol.py 把 shell.bin 写进一块 VimtuFS2 **v4** 卷（/bin/shell.bin +
 #      /etc/sh64hello.txt + /tmp(0777)）-> $BUILD/shellvol.img（写完会逐字节回读自检）；
-#   3) 系统镜像装完之后，同一条命令再把它放进演示/验收盘的主分区（LBA 8009）
+#   3) 系统镜像装完之后，同一条命令再把它放进演示/验收盘的主分区（LBA 32584）
 #      -> $BUILD/sysdisk.img；内核二进制里**不含** shell 的字节（后面有一条断言）。
 # ★ v0.5.8：先生成"预设头像 + 内置示例壁纸"（build64/presets/），再由 make_shellvol 打进卷内的
 #   /Wallpapers（壁纸）与 /Avatars（头像）——**两个目录分开**，这是用户点名的根目录规范。
@@ -491,6 +508,10 @@ bash tools/gzip_build_win.sh "$BUILD"
 bash tools/dpkg_build_win.sh "$BUILD"
 #   ★ v0.9.30：用户态 vmtool（ACL / 配额 / 日志 / 快照 的 ring-3 入口）——静态 ELF64，< 64 KiB 主程序窗口
 bash tools/vmtool_build_win.sh "$BUILD"
+#   ★ v0.9.33：ring3 驱动框架的两个用户态程序（ext4svc 驱动服务 + drvwatch 看门狗观察者）
+#   同一套静态 ELF64 / < 64 KiB 主程序窗口约束；它们靠内核 proc64_start_elf64_argv64 拉起，
+#   argv 里带 "驱动器号" 与 "卷起始 LBA"，所以服务不需要猜自己该服务哪块盘。
+bash tools/drivers_build_win.sh "$BUILD"
 
 echo "==> ★ A3 下半：FPU/xmm 上下文回归程序（user/xmmsse.asm；两个进程同时跑）"
 # 见 user/xmmsse.asm 顶部说明：同一份 ELF 起两个真进程、各自核对 16 个 xmm 是否被对方污染。
@@ -883,6 +904,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
+    "$BUILD/os"/r3drv64.o \
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/netraw64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/ehci64.o "$BUILD/os"/hda64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD"/demo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \
@@ -894,9 +916,42 @@ OSSZ=$(stat -c%s "$BUILD/kernel64_os.bin")
 LDSZ=$(stat -c%s "$BUILD/loader64.bin")
 echo "Build OK. 安装程序内核 = ${KBSZ} bytes, 系统内核 = ${OSSZ} bytes, loader = ${LDSZ} bytes"
 
-if [ "$LDSZ" -gt 4096 ]; then echo "ERROR: loader64.bin > 4096" >&2; exit 1; fi
+if [ "$LDSZ" -gt $((LOADER_SECTORS * 512)) ]; then
+    echo "ERROR: loader64.bin = $LDSZ B 超过 Stage 2 容量 $((LOADER_SECTORS * 512)) B（$LOADER_SECTORS 扇区 = 32KB）" >&2
+    exit 1
+fi
+if [ "$KBSZ" -gt "$KERNEL_MEDIA_MAX_BYTES" ]; then
+    echo "ERROR: 安装程序内核 $KBSZ B 超过介质内核上限 $KERNEL_MEDIA_MAX_BYTES B（/BOOT/KERNEL64.BIN 补零上限）" >&2
+    exit 1
+fi
 if [ "$KBSZ" -gt $((KERNEL_SECTORS * 512)) ]; then echo "ERROR: 安装程序内核超出内核区" >&2; exit 1; fi
-if [ "$OSSZ" -gt $((KERNEL_SECTORS * 512)) ]; then echo "ERROR: 系统内核超出内核区" >&2; exit 1; fi
+if [ "$OSSZ" -gt $((KERNEL_SECTORS * 512)) ]; then
+    echo "ERROR: 系统内核 $OSSZ B 超出 15MiB 内核容量（$((KERNEL_SECTORS * 512)) B）" >&2
+    exit 1
+fi
+
+# ---- ★ v0.9.31 断言 A：内核映像（含 .bss，fb 的 33MB 后备缓冲在里面）不许顶到载荷暂存区 ----
+#   为什么必须在构建期查：__bss_end 只会随内核变大而上移，载荷暂存区固定 0x04000000；
+#   一旦越线，安装介质内核清 BSS 时会把载荷抹成 0（表现为"装完的盘内容全 0"），
+#   而这类事故在内核日志里一个字都不会留。所以用 nm 读出 __bss_end 当闸门。
+BSSEND=$(nm "$BUILD/kernel64_os.elf" | awk '$3=="__bss_end"{print $1}' | head -1)
+if [ -z "$BSSEND" ]; then echo "ERROR: 读不到 __bss_end（nm 输出异常）" >&2; exit 1; fi
+BSSEND_PA=$(( 0x$BSSEND - 0xFFFFFFFF80000000 ))
+PAYLOAD_PHYS=$((0x04000000))
+if [ "$BSSEND_PA" -gt "$PAYLOAD_PHYS" ]; then
+    echo "ERROR: 内核映像上界 $BSSEND_PA B 越过载荷暂存区 $PAYLOAD_PHYS（安装介质会踩载荷）" >&2
+    exit 1
+fi
+echo "    内核映像上界（__bss_end 物理） = $BSSEND_PA B；载荷暂存区 $PAYLOAD_PHYS B；余量 $((PAYLOAD_PHYS - BSSEND_PA)) B"
+
+# ---- ★ v0.9.31 断言 B：loader 只读内核真实大小（回填 'KSNT' 槽，两个内核里取大的）----
+#   为什么要回填：容量 15MiB 但系统内核实际只有 ~3MB，读满会白读 12MB（BIOS 下约 1 秒）。
+#   为什么取 max(KBSZ, OSSZ)：同一份 loader64.bin 既装进 system.img 的 LBA 1..64（读的是
+#   系统内核），也装进 ISO（读的是安装程序内核）。读多几扇区无害（落到内核 .bss 会被清），
+#   读少会截断内核 -> 拿着小的那个去回填就是随机崩溃。
+KERN_READ_SECTORS=$(( (KBSZ > OSSZ ? KBSZ : OSSZ) + 511 ))
+KERN_READ_SECTORS=$(( KERN_READ_SECTORS / 512 ))
+"$PY" tools/loader_patch64.py "$BUILD/loader64.bin" "$KERN_READ_SECTORS"
 
 # ==================== ★ 可选目标：UEFI 运行期 CR3 实验内核 ====================
 # 只在显式要求时编（默认构建的两个内核 / 安装介质 / ISO 字节都不受影响）：
@@ -946,30 +1001,30 @@ dd if="$BUILD/boot.bin"        of="$BUILD/system.img" conv=notrunc status=none
 dd if="$BUILD/loader64.bin"    of="$BUILD/system.img" seek=1 conv=notrunc status=none
 dd if="$BUILD/kernel64_os.bin" of="$BUILD/system.img" seek="$KERNEL_LBA" conv=notrunc status=none
 
-# ---- ★ 本批：演示程序 blob 的"原始区"（见 kernel/demo64.h / tools/demo_pack_win.py）----
-#   写进内核区尾部（LBA 7497 起）—— 内核 .bss（fb 的 33MB 后备缓冲）盖住了这段物理地址，
-#   所以 kernel/demo64.cpp 是**按 LBA 用 ata64_read 现读**（读一次缓存），不依赖"loader
-#   平铺进内存的那份"。内核二进制里只有路径/偏移/长度表（0 字节 blob 本体）。
-#   两道断言：内核二进制末尾不许压到原始区起点；原始区不许越出内核区尾。
-# ★ v0.9.26：原始区起点从 6096 **后移到 6192**（把空余让给内核：光驱 + ISO9660 + truncate）。
-# ★ v0.9.28：再后移到 **6208** —— 本批要给内核腾出"VimtuFS2 v5 四个特性（日志/配额/ACL/快照）
-#   + v4 旧卷兼容与迁移"的体积。原始区实际内容仍是 920,911 B（1,799 扇区），
-#   新上限 = (8008-6208) = 1,800 扇区 = 921,600 B（仍余 689 B）。
-#   内核预算随之从 (6192-9) = 3,165,696 B 抬到 (6208-9) = 3,173,888 B（+8,192 B）。
-DEMO64_RAW_LBA=6208
+# ---- 演示程序 blob 的"原始区"（见 kernel/demo64.h / tools/demo_pack_win.py）----
+#   ★ v0.9.31 起原始区**离开内核容量的范围**：内核拿满 15MiB（LBA 65..30784），
+#     原始区紧跟其后（LBA 30785..32583，1,799 扇区 = 920,911 B）。这解决了一个老矛盾：
+#     以前"内核预算 = (原始区起点-9)*512"，blob 一多就把内核挤小，每批都得先搬原始区。
+#   内核 .bss（fb 的 33MB 后备缓冲）盖住了这段物理地址，所以 kernel/demo64.cpp 是
+#   **按 LBA 用 ata64_read 现读**（读一次缓存），不依赖"loader 平铺进内存的那份"。
+#   内核二进制里只有路径/偏移/长度表（0 字节 blob 本体）。
+#   两道断言：内核二进制不许压到原始区起点（= 容量闸门）；原始区不许越出预留扇区数。
+DEMO64_RAW_LBA=$RAW_LBA
 DEMO64_RAW_BYTES=$(stat -c%s "$BUILD/demo64_raw.bin")
 KERNEL_OS_SECTORS=$(( (OSSZ + 511) / 512 ))
 DEMO64_RAW_SECTORS=$(( (DEMO64_RAW_BYTES + 511) / 512 ))
 if [ "$(( KERNEL_LBA + KERNEL_OS_SECTORS ))" -gt "$DEMO64_RAW_LBA" ]; then
-    echo "ERROR: 系统内核（$OSSZ B = $KERNEL_OS_SECTORS 扇区）压到演示程序原始区起点（LBA $DEMO64_RAW_LBA）" >&2
+    echo "ERROR: 系统内核（$OSSZ B = $KERNEL_OS_SECTORS 扇区）压到原始区起点（LBA $DEMO64_RAW_LBA）—— 15MiB 容量已用满" >&2
     exit 1
 fi
-if [ "$DEMO64_RAW_SECTORS" -gt "$(( KERNEL_LBA + KERNEL_SECTORS - DEMO64_RAW_LBA ))" ]; then
-    echo "ERROR: 演示程序原始区 $DEMO64_RAW_BYTES B（$DEMO64_RAW_SECTORS 扇区）超出内核区尾部" >&2
+if [ "$DEMO64_RAW_SECTORS" -gt "$RAW_SECTORS" ]; then
+    echo "ERROR: 原始区 $DEMO64_RAW_BYTES B（$DEMO64_RAW_SECTORS 扇区）超出预留 $RAW_SECTORS 扇区" >&2
+    echo "       修法：同时改 kernel/memlayout64.h 的 ML64_RAW_SECTORS 与本脚本的 RAW_SECTORS（PART_BOOT_SECS 会跟着动）" >&2
     exit 1
 fi
 dd if="$BUILD/demo64_raw.bin" of="$BUILD/system.img" seek="$DEMO64_RAW_LBA" conv=notrunc status=none
-echo "    演示程序原始区：$DEMO64_RAW_BYTES B -> system.img LBA $DEMO64_RAW_LBA 起（内核区尾部；内核侧按 LBA 用 ata64_read 现读）"
+echo "    原始区：$DEMO64_RAW_BYTES B（$DEMO64_RAW_SECTORS/$RAW_SECTORS 扇区）-> system.img LBA $DEMO64_RAW_LBA 起"
+echo "    内核容量：$((KERNEL_SECTORS * 512)) B，实用 $OSSZ B（余量 $((KERNEL_SECTORS * 512 - OSSZ)) B）"
 
 # ---- ★ 本批（预算收口）：图标包的**字节一个都不在内核里**（原始区 blob + 系统卷文件两条来源）。----
 #      改动史：① 最早放"内核区尾部 LBA 7497..8008"-> ② A4-2a 改成内嵌系统内核（49,192 B，换来内核区
@@ -977,7 +1032,7 @@ echo "    演示程序原始区：$DEMO64_RAW_BYTES B -> system.img LBA $DEMO64_
 #      < R=655,360 B），于是改成"原始区 blob + 系统卷 /etc/iconpack.bin"，内核净减 49,192 B。
 #      两道断言仍然保留（把"内核不许越界"钉死）：
 #        ① 包字节不能超过 icons64.h 的 ICON64_PACK_MAX_SECTORS 上限（卷里那份的大小上限）；
-#        ② 系统内核不能长过内核区（LBA 9..8008）。
+#        ② 系统内核不能长过内核容量（LBA 65..30784 = 15MiB）。
 ICONPACK_BYTES=$(stat -c%s "$RES/iconpack.bin")
 ICONPACK_SECTORS=$(( (ICONPACK_BYTES + 511) / 512 ))
 KERNEL_OS_SECTORS=$(( (OSSZ + 511) / 512 ))
@@ -1564,15 +1619,24 @@ echo "==> ★ v0.9.30：vmtool（ring-3 ACL/配额/日志/快照 入口）装进
 "$PY" tools/vmtool_pack_win.py \
       --vol-in "$BUILD/dpkgvol.img" --vol-out "$BUILD/vmtoolvol.img" \
       --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+# ★ v0.9.33：ring3 驱动框架三件套（ext4svc / drvwatch / etc/r3drv.conf）装进系统卷
+#   为什么接在 vmtool 之后：打包链是"卷进卷出"，上一步的 vmtoolvol.img 就是本步的输入卷。
+#   为什么 /etc/r3drv.conf 必须构建期落盘：验收要用**等长字节替换**切换 autostart/bench/crash，
+#   文件不存在就无可替换（详见 tools/drivers_pack_win.py 头部）。
+echo "==> ★ v0.9.33：ext4svc / drvwatch / /etc/r3drv.conf 装进系统卷"
+"$PY" tools/drivers_pack_win.py \
+      --dir "$BUILD" \
+      --vol-in "$BUILD/vmtoolvol.img" --vol-out "$BUILD/drvvol.img" \
+      --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 echo "==> ★ v0.5.11：把数据分区（VimtuFS2 卷）**并入安装载荷** system.img"
-# ★ 真缺陷（本批修）：system.img 原来只切了前 8073 扇区（MBR+引导+内核+64 扇区裸槽），
-#   卷留在 sysdisk.img 的 8009 起 —— 于是用 ISO/安装介质**装到硬盘后目标盘 LBA 8009 是空字节**：
+# ★ 真缺陷（旧批修）：system.img 原来只切了前 8073 扇区（MBR+引导+内核+64 扇区裸槽），
+#   卷留在 sysdisk.img 的主分区起点 —— 于是用 ISO/安装介质**装到硬盘后目标盘该处是空字节**：
 #     [VFS64] mount FAILED reason=magic -> mount_system FAILED
 #     [CONF64] WARN NOT-PERSISTENT carrier=raw reason=no-vimtufs2-volume
 #   结果装好的系统一切修改（图标位置/壁纸/主题/用户名/密码/新建文件夹）重启即丢。
-#   修法：载荷 = 完整磁盘映像（8009 + 卷扇区），安装器原样写盘 -> 目标盘自带卷。
+#   修法：载荷 = 完整磁盘映像（主分区起点 + 卷扇区），安装器原样写盘 -> 目标盘自带卷。
 "$PY" tools/payload_embed_win.py --disk "$BUILD/sysdisk.img" --system "$BUILD/system.img" \
-      --parts-lba 8009 --out-sectors "$BUILD/sys_sectors.txt"
+--parts-lba "$((RAW_LBA + RAW_SECTORS))" --out-sectors "$BUILD/sys_sectors.txt"
 SYS_SECTORS=$(cat "$BUILD/sys_sectors.txt")
 IMAGE_SECTORS=$((PAYLOAD_LBA + 1 + SYS_SECTORS))
 echo "==> 生成载荷头（magic VIMTUPAY + 扇区数 + 载荷 LBA）"

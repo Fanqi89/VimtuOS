@@ -341,3 +341,104 @@ int vmware64_svga_stage1_64(void) {
     vw_puts(" next="); vw_num(unext); vw_puts(" max="); vw_num(fmax); vw_end();
     return upd;
 }
+
+// ==================== v0.9.34：呈现通路（脏矩形 UPDATE）====================
+// 为什么需要这一步，见 vmware64.h 的说明（RegisterMode + 影子屏，宿主只认 UPDATE）。
+// 与 stage1 的区别（别把两者混起来）：
+//   * stage1 是 opt-in 的**探针**（有 /etc/gpu3d_probe 才跑），且会写 ENABLE（接管显示）；
+//   * 这里默认就跑（只配 FIFO + 发 UPDATE，不碰 ENABLE），因为不这么做屏上什么都没有。
+static VmwBus   g_upd_bus;
+static uint32_t g_upd_mem = 0;          // FIFO 起始（客人物理地址）
+static uint32_t g_upd_max = 0;          // FIFO 容量（word）
+static uint32_t g_upd_next = 0;         // 我们自己维护的 NEXT_CMD
+static int      g_upd_ok = 0;
+static uint32_t g_upd_n = 0;            // 累计提交条数（打点/取证）
+
+int vmware64_present_init64(void) {
+    g_upd_ok = 0;
+    if (!g_vmw_ok || g_vmw_bdf == 0xFFFFFFFFu) return 0;
+    const uint32_t b0 = pci64_cfg_rd32(g_vmw_bdf, 0x10u);
+    if (!(b0 & 1u)) {                                   // BAR0 必须是 I/O（VMware 的常态）
+        vw_begin(); vw_puts("[VMWARE] present skipped reason=bar0-not-io"); vw_end();
+        return 0;
+    }
+    VmwBus bus;
+    bus.is_io = 1;
+    bus.base = (uint64_t)(b0 & ~0x3u);
+    const uint32_t mems = vw_reg_rd(&bus, VMW_REG_MEM_START);
+    const uint32_t meml = vw_reg_rd(&bus, VMW_REG_MEM_SIZE);
+    const uint32_t fbs  = vw_reg_rd(&bus, VMW_REG_FB_START);
+    const uint64_t lfb  = fb64_lfb_phys64();
+    const uint32_t w = vw_reg_rd(&bus, VMW_REG_WIDTH);
+    const uint32_t h = vw_reg_rd(&bus, VMW_REG_HEIGHT);
+    if (!mems || !meml || !fbs) {
+        vw_begin(); vw_puts("[VMWARE] present skipped reason=no-fifo-regs"); vw_end();
+        return 0;
+    }
+    // 只有"SVGA 的 FB 就是我们正在写的 LFB、且几何一致"才发 UPDATE —— 否则宿主会去搬一块
+    // 不是我们画的内存（画面直接错乱）。这是 stage1 早就定下的同一条安全闸门。
+    if ((uint64_t)fbs != lfb || w != (uint32_t)fb_phys_width() || h != (uint32_t)fb_phys_height()) {
+        vw_begin(); vw_puts("[VMWARE] present skipped reason=fb-or-geom-mismatch fb=0x");
+        vw_hex(fbs); vw_puts(" lfb=0x"); vw_hex(lfb);
+        vw_puts(" svga="); vw_num(w); vw_puts("x"); vw_num(h);
+        vw_puts(" lfbgeom="); vw_num((uint64_t)fb_phys_width()); vw_puts("x");
+        vw_num((uint64_t)fb_phys_height()); vw_end();
+        return 0;
+    }
+    uint32_t fmin = 0, fmax = 0;
+    int sync_ok = vw_fifo_config(&bus, mems, meml, 1, &fmin, &fmax);
+    int units = 1;
+    if (!sync_ok) { sync_ok = vw_fifo_config(&bus, mems, meml, 0, &fmin, &fmax); units = 0; }
+    if (!sync_ok || fmax < (VMW_FIFO_MIN_WORDS + 16u)) {
+        vw_begin(); vw_puts("[VMWARE] present skipped reason=fifo-sync-failed min=");
+        vw_num(fmin); vw_puts(" max="); vw_num(fmax);
+        vw_puts(" sync="); vw_puts(sync_ok ? "ok" : "TIMEOUT"); vw_end();
+        return 0;
+    }
+    g_upd_bus  = bus;
+    g_upd_mem  = mems;
+    g_upd_max  = fmax;
+    g_upd_next = (uint32_t)VMW_FIFO_MIN_WORDS;   // 不从 host 的 NEXT_CMD 起（ENABLE 后会被复位）
+    g_upd_n    = 0;
+    g_upd_ok   = 1;
+    vw_begin(); vw_puts("[VMWARE] present fifo min="); vw_num(fmin);
+    vw_puts(" max="); vw_num(fmax);
+    vw_puts(units ? " units=words" : " units=bytes");
+    vw_puts(" enable=skipped updates=on"); vw_end();
+    return 1;
+}
+
+// 追加一条 SVGA_CMD_UPDATE。**不阻塞**（真驱动也不逐条等 BUSY）：写 5 个字 + 推进 NEXT_CMD；
+// 每 64 条做一次有界 BUSY 等待（排掉积压，也让"宿主没在消费"这点可观测）。
+void vmware64_update64(int x, int y, int w, int h) {
+    if (!g_upd_ok) return;
+    if (w <= 0 || h <= 0) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > fb_phys_width())  w = fb_phys_width()  - x;
+    // 前 8 次一律提升为整屏：初始化之前已经画进 LFB 的内容（开机屏 / 锁屏 / 壁纸）都在里面，
+    // 它们当时没有 UPDATE 通道，靠这几次整屏提交补发出去；之后才走逐脏矩形。
+    if (g_upd_n < 8u) { x = 0; y = 0; w = fb_phys_width(); h = fb_phys_height(); }
+    if (y + h > fb_phys_height()) h = fb_phys_height() - y;
+    if (w <= 0 || h <= 0) return;
+    volatile uint32_t* fifo = (volatile uint32_t*)(uintptr_t)g_upd_mem;
+    uint32_t next = g_upd_next;
+    if (next < VMW_FIFO_MIN_WORDS || next + 5u > g_upd_max) {
+        (void)vw_wait_idle(&g_upd_bus, 2000u);
+        next = VMW_FIFO_MIN_WORDS;
+    }
+    fifo[next + 0u] = VMW_CMD_UPDATE;
+    fifo[next + 1u] = (uint32_t)x; fifo[next + 2u] = (uint32_t)y;
+    fifo[next + 3u] = (uint32_t)w; fifo[next + 4u] = (uint32_t)h;
+    __asm__ volatile("mfence" ::: "memory");
+    fifo[VMW_FIFO_NEXT_CMD] = next + 5u;
+    g_upd_next = next + 5u;
+    g_upd_n++;
+    if ((g_upd_n & 63u) == 0u) {
+        const int idle = vw_wait_idle(&g_upd_bus, 400u);
+        if (g_upd_n == 64u || !idle) {
+            vw_begin(); vw_puts("[VMWARE] updates n="); vw_num(g_upd_n);
+            vw_puts(" busy="); vw_num(idle ? 0u : 1u); vw_end();
+        }
+    }
+}
