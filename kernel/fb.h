@@ -48,6 +48,7 @@ int fb64_fwcfg_str64(const char* file, const char* key, char* out, int cap);
 const char* fb64_source_name64(void);
 uint64_t fb64_lfb_phys64(void);
 int fb64_lfb_usable64(void);
+void fb64_mixprobe_arm64(int n);     // ★ v0.9.35：诊断用（bb vs lfb 逐点比对，n 次后自动停）
 uint32_t fb_get_pixel(int x, int y);
 // ★ 驱动线 3：直接读 **LFB**（物理显存）里的像素 —— 软件路径的产物在这里，设备路径的产物在
 //   resource 里。自检里的"设备 vs 软件逐字节等价"拿这一份和 TRANSFER_FROM_HOST_2D 回读的那份比。

@@ -179,6 +179,45 @@ int fb64_lfb_usable64(void) { return fb_usable; }
 // ★ v0.9.34：VMware SVGA 的"这块脏了"通知（弱符号：安装介质内核不编 vmware64.cpp，这里为空）。
 //   为什么必须由 fb 层调：只有 fb 知道"哪一块刚被画完并写进了 LFB"。
 //   非 VMware 机器上 vmware64_update64 是空操作（内部 g_upd_ok=0），一个字节的代价。
+// ★ v0.9.35：LFB 可见性探针（弱符号：默认启动不存在，只有内存里有 /etc/gpu3d_probe 时才是活的）
+void vmware64_lfbprobe_tick64(void) __attribute__((weak));
+
+// ★ v0.9.35：**后备缓冲 vs LFB 逐点比对**（同一像素两处取值，诊断用）。
+//   为什么要它：VNC 侧已经证明"宿主确实读我们写的显存"（直接往 LFB 刷的 8 条饱和彩条上屏了），
+//   所以"黑"只可能出在我们自己这条链上。这一行把链断在哪儿一次说清：
+//     bb 与 lfb 都黑   -> 合成阶段就是黑的（画的时候没画上）
+//     bb 有内容、lfb 黑 -> 后备缓冲 -> LFB 的拷贝没落地
+//   默认不采样（fb64_mixprobe_arm64(0)），只有带 /etc/gpu3d_probe 的取证启动才打开。
+static int g_mix_left64 = 0;
+static uint32_t g_mix_skip64 = 0;
+void fb64_mixprobe_arm64(int n) { g_mix_left64 = n > 0 ? n : 0; g_mix_skip64 = 0; }
+static void fb64_mixsample64(void) {
+    if (g_mix_left64 <= 0 || !backbuf || !fb_addr) return;
+    // 抽样：每 64 次提交采一次（逐帧采会把串口刷爆 —— 实测一次溢出刷了 2,365 行）。
+    if (g_mix_skip64) { g_mix_skip64--; return; }
+    g_mix_skip64 = 63;
+    g_mix_left64--;
+    static const int PX[3] = {20, 512, 512};
+    static const int PY[3] = {20, 384, 700};
+    volatile uint32_t* lf = (volatile uint32_t*)(uintptr_t)fb_addr;
+    dbg64_line_begin64();
+    dbg64_str("[FB64] mix n="); dbg64_dec((uint64_t)g_mix_left64);
+    dbg64_str(" geom="); dbg64_dec((uint64_t)g_render_w); dbg64_str("x");
+    dbg64_dec((uint64_t)g_render_h); dbg64_str(" pitch="); dbg64_dec((uint64_t)fb_pitch);
+    for (int i = 0; i < 3; i++) {
+        int x = PX[i] < g_render_w ? PX[i] : g_render_w - 1;
+        int y = PY[i] < g_render_h ? PY[i] : g_render_h - 1;
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        const uint32_t bb = backbuf[y * g_render_w + x] & 0x00FFFFFFu;
+        const uint32_t lfv = lf[(uint64_t)y * (uint64_t)fb_w + (uint64_t)x] & 0x00FFFFFFu;
+        dbg64_str(" p"); dbg64_dec((uint64_t)i);
+        dbg64_str("=");  dbg64_hex64((uint64_t)bb);
+        dbg64_str("/");  dbg64_hex64((uint64_t)lfv);
+    }
+    dbg64_nl();
+    dbg64_line_end64();
+}
 void vmware64_update64(int x, int y, int w, int h) __attribute__((weak));
 
 // ==================== ★ v0.9.9：帧缓冲页表**自补** ====================
@@ -601,6 +640,8 @@ static void fb_flip_all64() {
         }
         fb64_sfence64();   // ★ WC 写合并缓冲落地：sfence 之后这些写对设备全局可见
         if (vmware64_update64) vmware64_update64(0, 0, fb_w, fb_h);   // VMware：整屏脏
+        fb64_mixsample64();                                            // 诊断：bb vs lfb 逐点比对
+        if (vmware64_lfbprobe_tick64) vmware64_lfbprobe_tick64();      // 诊断：直接刷 LFB 彩条
         return;
     }
     // 缩放路径：最近邻放大渲染区域到整个 LFB
@@ -666,6 +707,8 @@ static void fb_blit_region64(int x, int y, int w, int h) {
     }
     fb64_sfence64();   // ★ WC 写合并缓冲落地（局部提交同理）
     if (vmware64_update64) vmware64_update64(x, y, w, h);             // VMware：这块脏了
+    fb64_mixsample64();                                                // 诊断：bb vs lfb 逐点比对
+    if (vmware64_lfbprobe_tick64) vmware64_lfbprobe_tick64();          // 诊断：直接刷 LFB 彩条
 }
 
 // 后备缓冲 -> LFB（仅提交指定区域；用于光标等局部更新，避免整帧 3MB 拷贝拖慢跟手）
@@ -724,6 +767,8 @@ void fb_soft_flip_region64(int x, int y, int w, int h) {
     }
     fb64_sfence64();   // ★ WC 写合并缓冲落地
     if (vmware64_update64) vmware64_update64(x, y, w, h);             // VMware：这块脏了
+    fb64_mixsample64();                                                // 诊断：bb vs lfb 逐点比对
+    if (vmware64_lfbprobe_tick64) vmware64_lfbprobe_tick64();          // 诊断：直接刷 LFB 彩条
     vgpu64_note_soft_blit64(x, y, w, h);
 }
 

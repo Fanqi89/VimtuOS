@@ -24,6 +24,7 @@
 #include "syscall64.h"  // g_syscall64_kstack64：SYSCALL 入口专用栈顶（每任务一份，见 task_apply_ctx64）
 #include "sig64.h"      // ★ A4-5：信号投递钩子（IRQ0 出口 —— 纯用户态死循环也能收到信号）
 #include "r3drv64.h"    // ★ v0.9.33：ring3 驱动服务监督器（kheart 线程里推进状态机）
+#include "vmware64.h"   // ★ v0.9.37：VMware 呈现心跳（kheart 线程按时把整屏标脏）
 
 // ==================== ring3 槽位状态清理钩子（批次 B：缺陷根治）====================
 // usermode64.cpp 的 in_ring3 是**按任务槽位**的位图；ring3 进程被 kill 时不会从
@@ -673,6 +674,9 @@ static void kheart_entry(void* arg) {
         if (g_ticks64 - t_sup >= slice) {        // ~16 次/秒：推进服务状态机（不做磁盘 I/O 分支）
             t_sup = g_ticks64;
             r3drv64_tick64();
+            // ★ v0.9.37：VMware 呈现心跳（内部自己限到 4 Hz）。放在定时器线程而不是帧循环：
+            //   静止桌面时帧循环不会提交任何东西，而宿主只认 UPDATE 声明的矩形 —— 必须有人按时敲。
+            vmware64_present_tick64();
         }
         if (g_ticks64 - t_beat < PIT_HZ_64) continue;   // 打点仍约 1 秒一次
         t_beat = g_ticks64;

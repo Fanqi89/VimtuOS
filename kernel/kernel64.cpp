@@ -1361,6 +1361,12 @@ display64_init64();
     //   （VNC 取证：整屏 99.8% 纯黑，把 LFB 改成不缓存之后仍然 99% —— 说明不是缓存问题）。
     //   非 VMware 机器上它直接返回 0 并打一行 skipped，行为一字不变。
     (void)vmware64_present_init64();
+    // ★ v0.9.35：LFB 可见性二分探针（只有卷上有 /etc/gpu3d_probe 才亮；默认一个像素都不多画）
+    (void)vmware64_lfbprobe_begin64();
+    {
+        uint32_t mt = 0, msz = 0;
+        if (vfs64_stat("/etc/gpu3d_probe", &mt, &msz) == 0) fb64_mixprobe_arm64(6);
+    }
 
             } else {
                 proc64_init64();                                 // 仍然打点：mode=shared（如实）

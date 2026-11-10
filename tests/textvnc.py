@@ -803,6 +803,148 @@ class HostMouse:
         self.up()
         time.sleep(settle)
         return True, tr
+# ------------------------------------------------------------------ 宿主窗口像素（显示判据）
+class _BIH(ctypes.Structure):
+    _fields_ = [("biSize", _wt.DWORD), ("biWidth", _wt.LONG), ("biHeight", _wt.LONG),
+                ("biPlanes", _wt.WORD), ("biBitCount", _wt.WORD), ("biCompression", _wt.DWORD),
+                ("biSizeImage", _wt.DWORD), ("biXPelsPerMeter", _wt.LONG),
+                ("biYPelsPerMeter", _wt.LONG), ("biClrUsed", _wt.DWORD),
+                ("biClrImportant", _wt.DWORD)]
+
+
+class _BI(ctypes.Structure):
+    _fields_ = [("bmiHeader", _BIH), ("bmiColors", _wt.DWORD * 3)]
+
+
+_gdi32 = ctypes.windll.gdi32
+
+
+def _dib(mdc, bmp, w, h):
+    bi = _BI()
+    bi.bmiHeader.biSize = ctypes.sizeof(_BIH)
+    bi.bmiHeader.biWidth = w
+    bi.bmiHeader.biHeight = -h
+    bi.bmiHeader.biPlanes = 1
+    bi.bmiHeader.biBitCount = 32
+    bi.bmiHeader.biCompression = 0
+    buf = ctypes.create_string_buffer(w * h * 4)
+    _gdi32.GetDIBits(mdc, bmp, 0, h, buf, ctypes.byref(bi), 0)
+    a = np.frombuffer(buf.raw, dtype=np.uint8).reshape(h, w, 4)
+    return np.ascontiguousarray(a[:, :, [2, 1, 0]])          # BGRA -> RGB
+
+
+def win_printwindow(hwnd, w, h):
+    dc = _user32.GetWindowDC(hwnd)
+    mdc = _gdi32.CreateCompatibleDC(dc)
+    bmp = _gdi32.CreateCompatibleBitmap(dc, w, h)
+    old = _gdi32.SelectObject(mdc, bmp)
+    ok = _user32.PrintWindow(hwnd, mdc, 2)                   # PW_RENDERFULLCONTENT
+    a = _dib(mdc, bmp, w, h)
+    _gdi32.SelectObject(mdc, old)
+    _gdi32.DeleteObject(bmp)
+    _gdi32.DeleteDC(mdc)
+    _user32.ReleaseDC(hwnd, dc)
+    return ok, a
+
+
+def win_screen_rect(x, y, w, h):
+    dc = _user32.GetDC(0)
+    try:
+        mdc = _gdi32.CreateCompatibleDC(dc)
+        bmp = _gdi32.CreateCompatibleBitmap(dc, w, h)
+        old = _gdi32.SelectObject(mdc, bmp)
+        _gdi32.BitBlt(mdc, 0, 0, w, h, dc, x, y, 0x00CC0020)  # SRCCOPY
+        a = _dib(mdc, bmp, w, h)
+        _gdi32.SelectObject(mdc, old)
+        _gdi32.DeleteObject(bmp)
+        _gdi32.DeleteDC(mdc)
+        return a
+    finally:
+        _user32.ReleaseDC(0, dc)
+
+
+def _nn_resize(a, w, h):
+    sh, sw = a.shape[0], a.shape[1]
+    yi = (np.arange(h) * sh // h).clip(0, sh - 1)
+    xi = (np.arange(w) * sw // w).clip(0, sw - 1)
+    return a[yi][:, xi]
+
+
+class WinView:
+    """★ v0.9.37：**显示判据只认这里** —— VMware 窗口的像素（= 别人打开 VMware 看到的画面）。
+
+    为什么必须换掉 VNC 抓帧（实测，同一次开机、同一时刻）：
+      * VMware 窗口：纯黑 5.7~6.3%、近白 82~84%、Dock 强调蓝在 —— 桌面正常；
+      * VNC 抓帧：纯黑 **99.3%**。
+    也就是说 VNC 在本机上是**不可信的观察者**。从此 `TextVNC` 只用来发输入（键/指针）
+    与光标闭环，`VMSession.cap()` 一律走本类，不再参与任何显示判定。
+
+    客人画面在窗口里的位置用**自动标定**得到：抓窗口 -> 找近白壁纸的包围盒 ->
+    按客人分辨率（`guest_wh`，默认从串口 `[FB64] fb … w=W h=H` 读）扩成同长宽比 ->
+    裁切并最近邻缩放到客人尺寸。返回的 `Frame` 与 VNC 的 `Frame` **同接口**。
+    """
+
+    def __init__(self, title_part="VMware Workstation", guest_wh=None):
+        self.title_part = title_part
+        self.guest_wh = tuple(guest_wh) if guest_wh else None
+        self.box = None
+
+    def hwnd(self):
+        h, t = find_window(self.title_part)
+        return h, t
+
+    def shot(self):
+        """返回 (窗口图, 标题)。PrintWindow 优先（无遮挡），失败回退屏幕 BitBlt。"""
+        hwnd, title = self.hwnd()
+        if not hwnd:
+            raise OSError("找不到窗口（标题含 %r）" % self.title_part)
+        r = _wt.RECT()
+        _user32.GetWindowRect(hwnd, ctypes.byref(r))
+        w, h = r.right - r.left, r.bottom - r.top
+        if w <= 0 or h <= 0:
+            raise OSError("窗口尺寸异常 %dx%d" % (w, h))
+        ok, img = win_printwindow(hwnd, w, h)
+        if not ok or not img.any():
+            img = win_screen_rect(r.left, r.top, w, h)
+        return img, title
+
+    def measure(self, img):
+        """客人画面的包围盒 (x,y,w,h)。近白壁纸先定行/列范围，再按客人长宽比补齐。"""
+        h, w, _ = img.shape
+        light = img.max(axis=2) >= 230
+        rows = light.mean(axis=1) > 0.30
+        cols = light.mean(axis=0) > 0.30
+        if not rows.any() or not cols.any():
+            return (0, 0, w, h)
+        y0 = int(np.argmax(rows)); y1 = int(len(rows) - np.argmax(rows[::-1]))
+        x0 = int(np.argmax(cols)); x1 = int(len(cols) - np.argmax(cols[::-1]))
+        bw, bh = x1 - x0, y1 - y0
+        if self.guest_wh and bw > 0 and bh > 0:
+            gw, gh = self.guest_wh
+            ar = gw / float(gh)
+            if bw / float(bh) > ar:                       # 太宽：按宽度补高
+                nh = int(round(bw / ar)); cy = (y0 + y1) // 2
+                y0 = cy - nh // 2; y1 = y0 + nh
+                y0 = max(0, min(y0, h - nh)); y1 = y0 + nh
+            else:                                          # 太高：按高度补宽
+                nw = int(round(bh * ar)); cx = (x0 + x1) // 2
+                x0 = cx - nw // 2; x1 = x0 + nw
+                x0 = max(0, min(x0, w - nw)); x1 = x0 + nw
+        return (x0, y0, x1 - x0, y1 - y0)
+
+    def capture(self, recalibrate=False):
+        img, title = self.shot()
+        if self.box is None or recalibrate:
+            self.box = self.measure(img)
+        x0, y0, bw, bh = self.box
+        if bw <= 8 or bh <= 8:
+            raise OSError("窗口里没找到客人画面（box=%r，标题=%r）" % (self.box, title))
+        sub = img[y0:y0 + bh, x0:x0 + bw]
+        if self.guest_wh and (bw, bh) != tuple(self.guest_wh):
+            sub = _nn_resize(sub, self.guest_wh[0], self.guest_wh[1])
+        return Frame(np.ascontiguousarray(sub[:, :, ::-1]))   # 传入 BGR，Frame.rgb 才是 RGB
+
+
 # ------------------------------------------------------------------ 会话
 class VMSession:
     """起来 -> 等锁屏 -> VNC 登录 -> 等桌面；退出一定 `vmrun stop hard`。"""
@@ -814,6 +956,7 @@ class VMSession:
             fresh_serial, boot_timeout, keep, mode
         self.vnc = None
         self.mouse = None
+        self._win = None                 # ★ v0.9.37：宿主窗口像素（显示判据，替代 VNC 抓帧）
         self.t0 = 0
         self.boot_secs = 0.0
 
@@ -943,8 +1086,42 @@ class VMSession:
     def mark(self):
         return len(self.log())
 
+    def guest_res(self):
+        """客人分辨率：从串口 `[FB64] fb source=… addr=… w=W h=H` 读；读不到按 1024x768。"""
+        last = None
+        for last in re.finditer(r"\[FB64\] fb source=\S+ addr=\S+ w=(\d+) h=(\d+)", self.log()):
+            pass
+        return (int(last.group(1)), int(last.group(2))) if last else (1024, 768)
+
+    def win_title(self):
+        """窗口标题子串：优先 .vmx 的 displayName（夹具里是 vimtu64-…），否则 VMware Workstation。"""
+        try:
+            txt = read_text(self.vmx)
+            m = re.search(r'displayName\s*=\s*"([^"]+)"', txt)
+            if m:
+                return m.group(1)
+        except OSError:
+            pass
+        return "VMware Workstation"
+
     def cap(self, name=None):
-        f = self.vnc.cap()
+        """★ v0.9.37：**显示判据改走宿主窗口像素**（= 人眼看到的画面）。
+
+        为什么：实测同一次开机、同一时刻，VMware 窗口里是正常桌面（纯黑 6%），
+        VNC 抓帧却是 99.3% 纯黑 —— VNC 在本机上不可信。`TextVNC` 从此只发输入
+        （键/指针）与做光标闭环；**任何显示判定都不再采信 VNC**。
+        """
+        if self._win is None:
+            self._win = WinView(self.win_title(), guest_wh=self.guest_res())
+        f = None
+        for attempt in range(3):
+            try:
+                f = self._win.capture(recalibrate=(attempt > 0))
+                break
+            except OSError:
+                if attempt == 2:
+                    raise
+                time.sleep(1.0)
         if name:
             save_png(f.rgb, name)
         return f

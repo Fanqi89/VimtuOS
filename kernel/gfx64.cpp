@@ -1180,6 +1180,27 @@ void gfx64_wall_draw64(int x, int y, int w, int h) {
         uint32_t* dst = px + (uint64_t)yy * g_fw + x0;
         for (int i = 0; i < ww; i++) dst[i] = src[i];
     }
+    // ★ v0.9.35 诊断（前 3 次）：把这次**真正写进去**的像素打出来 —— 用来在 QEMU/VMware 之间
+    //   对比"壁纸到底有没有落进后备缓冲"。只在有 /etc/gpu3d_probe 的取证启动里才会被读到（见 fb.h）。
+    {
+        static int wp_dbg_n = 0;
+        if (wp_dbg_n < 3) {
+            wp_dbg_n++;
+            const uint32_t sv = g_surface[(uint64_t)y0 * g_sw + x0] & 0x00FFFFFFu;
+            const uint32_t dv = px[(uint64_t)y0 * g_fw + x0] & 0x00FFFFFFu;
+            dbg64_line_begin64();
+            dbg64_str("[GFX64] wall draw n="); dbg64_dec((uint64_t)wp_dbg_n);
+            dbg64_str(" req=");  dbg64_dec((uint64_t)x);   dbg64_str(","); dbg64_dec((uint64_t)y);
+            dbg64_str(" ");      dbg64_dec((uint64_t)w);   dbg64_str("x"); dbg64_dec((uint64_t)h);
+            dbg64_str(" -> ");   dbg64_dec((uint64_t)x0);  dbg64_str(","); dbg64_dec((uint64_t)y0);
+            dbg64_str(" ");      dbg64_dec((uint64_t)ww);  dbg64_str("x"); dbg64_dec((uint64_t)hh);
+            dbg64_str(" sw=");   dbg64_dec((uint64_t)g_sw);
+            dbg64_str(" src_px=");  dbg64_hex64((uint64_t)sv);
+            dbg64_str(" dst_px=");  dbg64_hex64((uint64_t)dv);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
 }
 
 void gfx64_wall_set_mode64(int mode, const char* why) {

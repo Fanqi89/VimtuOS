@@ -4564,6 +4564,12 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
     dbg64_str("[OS] ready (idle)");
     dbg64_nl();
     dbg64_line_end64();
+    // ★ v0.9.35 诊断（默认关）：`/etc/gpu3d_probe` 的取证启动会在桌面就绪这一刻再武装一次
+    //   后备缓冲/LFB 采样（6 次、每 64 帧一次）。留下一份可复用的取证钩子，不写死常量。
+    {
+        uint32_t mt = 0, msz = 0;
+        if (vfs64_stat("/etc/gpu3d_probe", &mt, &msz) == 0) fb64_mixprobe_arm64(6);
+    }
     // ---- 启动项（config64 的 startup.*）+ 会话恢复（session64 的策略）----
     // 放在 "[GUI64] ready" 之后：既有验收看到的启动顺序不变，多出来的只有"按配置自动开窗"。
     if (cfg64_startup64("terminal")) app_term_open64();
