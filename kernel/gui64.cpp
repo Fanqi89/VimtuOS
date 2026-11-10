@@ -35,6 +35,7 @@ static int g_hold_flip_anim = 0;
 #include "mem_64.h"
 #include "x86_64.h"
 #include "port.h"
+#include "acpi64.h"      // ★ 本批：关机/重启走固件（FADT PM1a_CNT_BLK + DSDT \_S5 + RESET_REG）
 // ---- 本轮接线：config64（配置）/ session64（会话策略）/ sysstate64（状态机+ring log）/ panic64（看门狗）----
 #include "config64.h"
 #include "session64.h"
@@ -809,12 +810,34 @@ uint8_t     gui64_cpu_busy_pct() { return g_busy_pct; }
 
 // 关机/重启画面（实现放在后面的"绘制区"：要用那里的 blit_rgba/text_ttf/text_w）
 static void power_anim_screen(const char* txt, const char* log_tag);
-// ==================== 重启 / 关机（照抄 32 位回退链）====================
+// ==================== 重启 / 关机（★ 本批：走固件，不再硬编码 QEMU 端口）====================
+// 等待工具：进了这里中断可能已经停，不能用 sleep；只要"足够长"的忙等。
+static void power_wait_ms(int ms) {
+    for (int i = 0; i < ms; i++)
+        for (volatile int j = 0; j < 200000; j++) { }
+}
 void sys_reboot64() {
     // 优雅停止：状态机 STOPPING -> 逆序停模块（含关窗）-> 会话快照 + 配置落盘 flush（store64）。
     // 看门狗在这里被挂起（sysstate64_stop_all64 内部调 panic64_watchdog_suspend64）。
     (void)sysstate64_stop_all64("reboot");
     power_anim_screen(gui64_tr("Restarting...", "正在重启..."), "[UI] reboot anim start");
+    // ★ 本批：先走 ACPI 2.0+ 规定的复位寄存器（FADT RESET_REG + RESET_VALUE）。
+    //   它比 8042 脉冲 / 0xCF9 更通用 —— 不少真机只认这一条，而 0xCF9 只有芯片组认。
+    {
+        const uint64_t rr = acpi_reset_reg_addr64();
+        if (rr != 0 && rr <= 0xFFFFu) {
+            dbg64_str("[RESET] sys_reboot64: FADT reset_reg port=0x");
+            dbg64_hex64(rr);
+            dbg64_str(" val=0x");
+            dbg64_hex64((uint64_t)acpi_reset_reg_value64());
+            dbg64_nl();
+            outb((uint16_t)rr, acpi_reset_reg_value64());
+            power_wait_ms(1000);
+        } else {
+            dbg64_str("[RESET] sys_reboot64: 无 FADT reset_reg（表里没给合法 IO 端口）");
+            dbg64_nl();
+        }
+    }
     dbg64_str("[RESET] sys_reboot64: 8042 pulse");
     dbg64_nl();
     while (inb(0x64) & 1) (void)inb(0x60);     // 排空
@@ -839,15 +862,45 @@ void sys_reboot64() {
 void sys_shutdown64() {
     (void)sysstate64_stop_all64("shutdown");
     power_anim_screen(gui64_tr("Shutting down...", "正在关机..."), "[UI] shutdown anim start");
-    dbg64_str("[SHUTDOWN] sys_shutdown64: ACPI 0x604");
+    // ★ 本批：真 ACPI S5 —— 端口和睡眠类型都来自固件（FADT PM1a_CNT_BLK + DSDT \_S5），
+    //   不再是"硬编码 QEMU 的 0x604"。阶梯（每一级都打点，只有没断电才往下走）：
+    //     ① S5，SLP_TYPa = \_S5（拿不到就是 5）
+    //     ② S5，SLP_TYPa = 0（QEMU / 一部分固件的 \_S5 就是 0，① 在它们上面会被忽略）
+    //     ③ 0x604 = 0x2000：QEMU piix4 的历史兼容口（FADT 没给端口时兜底）
+    //     ④ halt —— ★ 绝不写 8042 0xFE：那是**复位**，会把"关机"变成"重启"（本批修掉的缺陷）
+    const uint32_t pm_port = acpi_pm1a_cnt_blk64();
+    const int      typ     = acpi_s5_slp_typa64();
+    dbg64_str("[SHUTDOWN] acpi s5 pm1a_cnt=");
+    if (pm_port != 0) { dbg64_str("0x"); dbg64_hex64(pm_port); } else dbg64_str("none");
+    dbg64_str(" slp_typa=");
+    dbg64_dec((uint64_t)typ);
+    dbg64_str(" src=");
+    dbg64_str(acpi_s5_source64());
     dbg64_nl();
-    outw(0x604, 0x2000);                        // QEMU/VMware 的 ACPI 断电
-    for (volatile int i = 0; i < 3000000; i++) { }
-    dbg64_str("[SHUTDOWN] 0x604 failed -> 8042 0xFE");
-    dbg64_nl();
-    outb(0x64, 0xFE);
-    for (volatile int i = 0; i < 3000000; i++) { }
-    dbg64_str("[SHUTDOWN] FAILED -> halt");
+
+    if (acpi_poweroff64()) {                    // ①
+        power_wait_ms(1500);
+        dbg64_str("[SHUTDOWN] s5 slp_typa=");
+        dbg64_dec((uint64_t)typ);
+        dbg64_str(" ignored (still running) -> next");
+        dbg64_nl();
+        if (typ != 0 && acpi_poweroff_typ64(0)) {   // ②
+            power_wait_ms(1500);
+            dbg64_str("[SHUTDOWN] s5 slp_typa=0 ignored (still running) -> next");
+            dbg64_nl();
+        }
+    } else {
+        dbg64_str("[SHUTDOWN] acpi s5 unavailable (no FADT / illegal port) -> next");
+        dbg64_nl();
+    }
+
+    if (pm_port != 0x604u) {                    // ③
+        dbg64_str("[SHUTDOWN] legacy compat port 0x604 val=0x2000");
+        dbg64_nl();
+        outw(0x604, 0x2000);
+        power_wait_ms(1500);
+    }
+    dbg64_str("[SHUTDOWN] FAILED -> halt (deliberately NOT 8042 0xFE: that is a RESET)");
     dbg64_nl();
     for (;;) __asm__ volatile("cli; hlt");
 }

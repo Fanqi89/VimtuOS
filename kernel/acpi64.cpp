@@ -3,7 +3,9 @@
 // 这一版只做"读表"，不做"用表"：
 //   * 读：找 RSDP，校验合法性，挑 XSDT 或 RSDT，遍历表项，把 FADT / MADT(MADT="APIC") /
 //         HPET / MCFG 里跟电源、CPU 个数、APIC、PCIe 配置空间有关的字段记进静态状态。
-//   * 不读：DSDT/SSDT 里的 AML 一律不解释（没有 AML 解释器，也就不去算 _S5/_PTS）。
+//   * 不读 AML 语义：DSDT/SSDT **不解释**（没有 AML 解释器）。唯一例外是 \_S5 ——
+//         acpi64_parse_s5() 在 DSDT 原始字节里找 "_S5" + Package 取第一个整数
+//         （S5 的 SLP_TYPa，固件说了算，猜错就关不了机）。不求值、不建名字空间。
 //   * 不写：除了 acpi_poweroff64() 那一次 PM1a_CNT 写，全程不写端口、不写表内存，
 //          因此可以在中断都没开、堆都没初始化的阶段安全调用。
 //
@@ -42,7 +44,7 @@
 static const int ACPI64_MAX_IOAPIC = 8;
 
 // PM1_CNT 控制寄存器位（ACPI 规范：bit12..10 = SLP_TYPa，bit13 = SLP_EN）
-static const uint16_t ACPI64_SLP_TYPa5 = (uint16_t)(5u << 10);  // 5 = S5（软关机）
+// ★ 睡眠类型（SLP_TYPa）**不再硬编码 5**：运行时从 DSDT 的 \_S5 读（acpi64_parse_s5）
 static const uint16_t ACPI64_SLP_EN    = (uint16_t)(1u << 13);  // 写 1 触发睡眠状态迁移
 
 // 通用地址结构（GAS）的地址空间编号
@@ -292,6 +294,11 @@ static uint32_t g_pm1a_cnt_blk  = 0;      // 0x40（rev>=2 且表够长时会被
 static uint8_t  g_pm1_cnt_len   = 0;      // 0x59
 static uint64_t g_reset_reg_addr= 0;      // 0x78（仅 IO 空间时记录，0 = 不可用）
 static uint8_t  g_reset_value   = 0;      // 0x80
+// DSDT（只为了从 AML 里抠出 \_S5 的 SLP_TYPa —— 仍然**不是** AML 解释器，见 acpi64_parse_s5）
+static uint64_t g_dsdt_addr     = 0;
+static uint32_t g_dsdt_len      = 0;
+static int      g_slp_typa5     = 5;      // 默认 = 规范里最常见的 S5 睡眠类型
+static int      g_slp_src       = 0;      // 0 = 上面那个默认值；1 = 真从 DSDT 的 \_S5 读到
 
 // MADT
 static bool     g_madt_ok       = false;
@@ -394,6 +401,11 @@ static void acpi64_parse_fadt(const AcpiSdtHeader64* h, uint32_t len) {
             g_reset_value    = f->reset_value;
         }
     }
+
+    // DSDT：这里**只记地址**，AML 由 acpi64_parse_s5() 去抠 \_S5 的第一个元素（不建解释器）。
+    // rev >= 2 且表够长时规范要求用 64 位的 X_DSDT（0x8C），否则用 32 位的 DSDT（0x28）。
+    if (h->revision >= 2 && len >= 0x90u && f->x_dsdt != 0) g_dsdt_addr = f->x_dsdt;
+    else if (len >= 0x2Cu && f->dsdt != 0)                  g_dsdt_addr = f->dsdt;
 
     // FADT rev >= 2：规范要求优先用 64 位的 X_PM1a_CNT_BLK（0xAC），
     // 因为 32 位字段在 64 位端口地址下会被截断。表不够长就沿用 32 位值。
@@ -612,6 +624,76 @@ static void acpi64_print_summary() {
     dbg64_str(" mcfg=");
     if (g_mcfg_base != 0) acpi64_phex(g_mcfg_base); else dbg64_str("无");
     dbg64_nl();
+
+    // ④ 电源管理：S5 的睡眠类型（来源要标清楚）/ 复位寄存器 / DSDT 地址
+    //    —— 这一行是"关机到底走哪条路"的唯一现场证据，自动验收 grep 它。
+    dbg64_str("[ACPI64] power s5_slp_typa=");
+    dbg64_dec((uint64_t)g_slp_typa5);
+    dbg64_str(g_slp_src ? " src=dsdt" : " src=default");
+    dbg64_str(" pm1a_cnt=");
+    acpi64_phex(g_pm1a_cnt_blk);
+    dbg64_str(" pm1_cnt_len=");
+    dbg64_dec(g_pm1_cnt_len);
+    dbg64_str(" reset_reg=");
+    if (g_reset_reg_addr != 0) acpi64_phex(g_reset_reg_addr); else dbg64_str("无");
+    dbg64_str(" reset_val=");
+    acpi64_phex(g_reset_value);
+    dbg64_str(" dsdt=");
+    if (g_dsdt_addr != 0) acpi64_phex(g_dsdt_addr); else dbg64_str("无");
+    dbg64_str(" dsdt_len=");
+    dbg64_dec(g_dsdt_len);
+    dbg64_nl();
+}
+
+// ==================== DSDT \_S5：只抠一个整数，不做 AML 解释 ====================
+// 为什么需要它：S5 的 SLP_TYPa 是**固件说了算**的（QEMU 的 _S5 第一个元素是 0、
+// 多数真机是 5），写错这一档，PM1a_CNT 那次写会被固件直接忽略 —— 表面"关机成功"，
+// 实际没断电，然后才轮到回退阶梯去试别的类型。
+// 做法（刻意保持极窄）：在 DSDT 原始字节里找名字 "_S5"（0x5F 0x53 0x35），
+// 紧跟 PackageOp(0x12) 就按 AML 的编码取**第一个元素**（Zero/One/Byte/Word/DWord 常数）。
+// ★ 踩坑（实测）：AML 的 NameSeg 固定 **4 字节**，不足的补 '_'(0x5F) —— QEMU 的 DSDT 里
+//   编码是 "_S5_"（5F 53 35 **5F** 12 06 04 00 00 …），少认那个填充字节就会永远 src=default。
+//   实测字节：_S5_ @0x1279 = 5F 53 35 5F | 12 06 (=Package, len 6) | 04 (=4 个元素) | 00 00 00 00
+// 不做的事：不解析 NameString 作用域、不求值表达式、不跟 SSDT、不建名字空间。
+// 找不到 / 不像 Package / 第一个元素不是常数 -> 返回 -1（调用方保留默认值 5 并打 src=default）。
+static int acpi64_parse_s5() {
+    if (g_dsdt_addr == 0) return -1;
+    if (!acpi64_pa_ok(g_dsdt_addr, 8u)) return -1;
+    const AcpiSdtHeader64* dh = (const AcpiSdtHeader64*)(uintptr_t)g_dsdt_addr;
+    const uint32_t len = dh->length;
+    if (len < (uint32_t)sizeof(AcpiSdtHeader64) || !acpi64_pa_ok(g_dsdt_addr, len)) return -1;
+    g_dsdt_len = len;
+
+    const uint8_t* b = (const uint8_t*)(const void*)dh;      // 恒等映射下物理地址 == 指针
+    const uint32_t hdr = (uint32_t)sizeof(AcpiSdtHeader64);
+    // 留 8 字节余量：最长的 "\_S5" + Package 头 + NumElements + DWord 也在这个范围里
+    for (uint32_t i = hdr; i + 8u < len; i++) {
+        if (b[i] != 0x5F || b[i + 1] != 0x53 || b[i + 2] != 0x35) continue;   // "_S5"
+        uint32_t p = i + 3u;
+        // ★ NameSeg 是 4 字节：名字不足 4 个字符时用 '_'(0x5F) 补齐 —— 实测 QEMU 的 DSDT
+        //   里 "_S5" 后面还有一个 0x5F，然后才是 Package。漏掉这一步就永远解析失败。
+        if (b[p] == 0x5F && p + 1u < len) p++;
+        if (b[p] != 0x12) continue;                            // 后面必须是 Package，否则不是 \_S5 定义
+        p++;
+        const uint8_t lead = b[p];
+        const uint32_t nb  = (uint32_t)(lead >> 6);            // PkgLength 后面还有几个字节
+        if (p + nb >= len) continue;
+        p += 1u + nb;                                          // 跳过 PkgLength 本身
+        p++;                                                   // 跳过 NumElements（元素个数，_S5 常见 2 或 4）
+        if (p >= len) continue;
+        switch (b[p]) {
+        case 0x00: return 0;                                   // Zero
+        case 0x01: return 1;                                   // One
+        case 0x0A: return (p + 1u < len) ? (int)b[p + 1u] : -1;                       // BytePrefix
+        case 0x0B: return (p + 2u < len) ? (int)(b[p + 1u] | ((uint16_t)b[p + 2u] << 8)) : -1;
+        case 0x0C: return (p + 4u < len) ? (int)(b[p + 1u] | ((uint32_t)b[p + 2u] << 8) |
+                                                ((uint32_t)b[p + 3u] << 16) |
+                                                ((uint32_t)b[p + 4u] << 24)) : -1;
+        default: break;
+        }
+        return -1;      // 第一个元素不是常数（可能是个名字引用）：放弃，别瞎猜
+    }
+    return -1;
 }
 
 // ==================== 初始化 ====================
@@ -688,6 +770,13 @@ void acpi_init64() {
         }
     }
 
+    // \_S5 的 SLP_TYPa（软关机的睡眠类型）：DSDT 里有就用，没有就保持规范常见值 5。
+    // 放在所有表都解析完之后：g_dsdt_addr 是 FADT 那一步填的，与根表遍历顺序无关。
+    {
+        const int typ = acpi64_parse_s5();
+        if (typ >= 0 && typ <= 7) { g_slp_typa5 = typ; g_slp_src = 1; }
+    }
+
     acpi64_print_summary();
 }
 
@@ -711,12 +800,15 @@ int      acpi_pcat_compat64()       { return (g_madt_flags & 1u) ? 1 : 0; }
 int      acpi_sci_irq64()           { return g_fadt_ok ? (int)g_sci_int : 0; }
 uint64_t acpi_reset_reg_addr64()    { return g_reset_reg_addr; }
 uint8_t  acpi_reset_reg_value64()   { return g_reset_value; }
+uint32_t acpi_pm1a_cnt_blk64()      { return g_pm1a_cnt_blk; }
+int      acpi_s5_slp_typa64()       { return g_slp_typa5; }
+const char* acpi_s5_source64()      { return g_slp_src ? "dsdt" : "default"; }
 uint64_t acpi_hpet_addr64()         { return g_hpet_addr; }
 uint64_t acpi_mcfg_base64()         { return g_mcfg_base; }
 uint32_t acpi_mcfg_segment_count64(){ return g_mcfg_segments; }
 
 // 软关机（S5）：唯一一处写硬件的地方
-bool acpi_poweroff64() {
+bool acpi_poweroff_typ64(uint16_t slp_typ) {
     // 前置条件缺一个就返回 false，**一个端口都不写**：
     //   还没 init / 没有 FADT / PM1a_CNT_BLK 为 0（规范里 0 = 不存在）/ 端口号超过 16 位
     if (!g_inited || !g_fadt_ok) return false;
@@ -724,18 +816,25 @@ bool acpi_poweroff64() {
     if (port == 0 || port > 0xFFFFu) return false;
 
     // PM1_CNT：SLP_TYPa（bit12..10）选睡眠状态，SLP_EN（bit13）写 1 才真的开始迁移。
-    // 只写 SLP_TYPa 不会断电，必须带上 SLP_EN。5 = S5（软关机）。
-    const uint32_t val = (uint32_t)(ACPI64_SLP_TYPa5 | ACPI64_SLP_EN);
+    // 只写 SLP_TYPa 不会断电，必须带上 SLP_EN。
+    const uint32_t val = (uint32_t)(((uint32_t)slp_typ & 0x7u) << 10) | (uint32_t)ACPI64_SLP_EN;
     dbg64_str("[ACPI64] poweroff pm1a_cnt=");
     acpi64_phex(port);
     dbg64_str(" val=");
     acpi64_phex(val);
+    dbg64_str(" slp_typa=");
+    dbg64_dec((uint64_t)(slp_typ & 0x7u));
+    dbg64_str(" len=");
+    dbg64_dec(g_pm1_cnt_len);
     dbg64_nl();
     if (g_pm1_cnt_len >= 4) outl((uint16_t)port, val);                  // 寄存器是 4 字节宽
     else                    outw((uint16_t)port, (uint16_t)val);        // 2 字节（绝大多数机器）
     io_wait();
-    return true;                        // 写成功不等于一定断电，上层照旧保留回退链
+    return true;                        // 写下去 ≠ 一定断电：上层照旧保留回退阶梯
 }
+
+// 默认档 = DSDT \_S5 解析到的 SLP_TYPa（拿不到就是 5），与旧行为兼容
+bool acpi_poweroff64() { return acpi_poweroff_typ64((uint16_t)g_slp_typa5); }
 
 // ==================== 自检 ====================
 // 位定义（0 = 全通过）：

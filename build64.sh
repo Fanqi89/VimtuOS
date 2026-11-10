@@ -79,7 +79,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.9.37"    # ★ v0.9.37：真 SVGA 呈现通路（screen object + GMRFB + FIFO_BUSY 敲门）；VMware 显示宿主侧验收见 tests/vmware_svga64_test.py
+VIMTUOS_VERSION="0.9.38"    # ★ v0.9.38：ACPI 电源管理收口（关机走 FADT PM1a_CNT_BLK + DSDT _S5 的 SLP_TYPa、删掉会把关机变重启的 8042 复位脉冲、重启用 FADT RESET_REG）；验收见 tests/power64_test.py
 #     小版本 +1（0.4.3 -> 0.4.4），大版本进位（0.4.3 -> 0.5.0）。历史 `-betaN` 标签保留不动（不发新包）。
 # ★ 本批（演示程序搬进系统卷）：内嵌的演示程序 blob（约 145 KB）全部搬出内核二进制 ——
 #   交付 = 系统卷里的文件（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；

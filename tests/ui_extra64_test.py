@@ -289,6 +289,29 @@ def aim_axis(mon, axis, d):
     _move_axis(mon, axis, d, -20)
 
 
+def icon0_pos(vm):
+    """从串口读**桌面图标 0 的当前位置**（返回 (x, y)，拿不到返回 (None, None)）。
+
+    为什么必须读、不能硬编码：拖动之后内核会把新位置**持久化**进配置存储
+    （串口里能看到 `[STORE64] dump cfg.icon.x0=112`），下一次开机就是
+    `[CONF64] load icon.x0=112 type=int`。所以用固定的 ICON0_HIT 当命中框，
+    同一镜像上**第二次跑必然红** —— 这一点已用未改动的基线内核证伪过
+    （run1 51/51 PASS、run2 44/47，红的正是同样 3 项）。
+    """
+    log = vm.log()
+    out = {}
+    for axis in ("x", "y"):
+        v = None
+        # 真实打点（实测）：`[CONF64] load icon.x0=112 type=int` / `[CONF64] default icon.x1=24 type=int`
+        for m in re.finditer(r"\[CONF64\] load icon\.%s0=(\d+)" % axis, log):
+            v = int(m.group(1))            # 持久化过的值优先（它就是本次生效的值）
+        if v is None:
+            for m in re.finditer(r"\[CONF64\] default icon\.%s0=(\d+)" % axis, log):
+                v = int(m.group(1))        # 没有持久化值 = 用默认值
+        out[axis] = v
+    return out["x"], out["y"]
+
+
 def press_on_icon(vm, mon, tx, ty, tries=8):
     """把光标闭环挪到 (tx,ty) 附近（每包 24px）并按下；True = 已按下且命中桌面图标。"""
     for _ in range(tries):
@@ -406,23 +429,38 @@ def main():
             check("选择框内图标被选中（sel>=1）", sel >= 1, "sel=%d" % sel)
 
         print("=== 3) 桌面图标拖动（真实鼠标拖动 >5px）+ 双击仍可打开 ===")
-        tx = (ICON0_HIT[0] + ICON0_HIT[1]) // 2
-        ty = (ICON0_HIT[2] + ICON0_HIT[3]) // 2
+        # ★ 幂等性修复（真缺陷，见 icon0_pos 的说明）：目标坐标从串口读，不写死。
+        #   拖动方向按剩余空间选（右边不够就往左拖），于是同一镜像可以反复跑。
+        ix, iy = icon0_pos(vm)
+        check("从串口读到桌面图标 0 的当前位置（不靠硬编码命中框）",
+              ix is not None and iy is not None,
+              "icon0=(%s,%s)" % (ix, iy) if ix is not None else "没有 [CONFN] icon.x0=")
+        if ix is None or iy is None:
+            ix, iy = ICON0_HIT[0], ICON0_HIT[2]
+        to_left = ix > 400                      # 右边放不下就往左拖，避免把图标推出屏幕
+        tx = ix + 28
+        ty = iy + 35
         pressed = press_on_icon(vm, mon, tx, ty)
         check("光标落到桌面图标上（按下有 select 打点）", pressed)
         dragged = False
         opened_by_dbl = False
         fx = fy = None
         if pressed:
+            step = -100 if to_left else 100
             for _ in range(3):
-                mon.move(100, 0, wait=0.3)          # 向右拖 3 包 = 72px（>5px 阈值）
+                mon.move(step, 0, wait=0.3)     # 3 包 = 72px（>5px 阈值）
             mid = len(vm.log())
             mon.button(0, wait=0.6)                 # 松开 -> 拖动结束打点
             dragged = vm.wait_log("[UI] icon drag idx=", 3, since=mid)
             m = re.search(r"\[UI\] icon drag idx=(\d+) x=(\d+) y=(\d+)", vm.log()[mid:])
             if m:
                 fx, fy = int(m.group(2)), int(m.group(3))
-                check("拖动结束后图标 x 右移（初始 24）", fx > 24, "final x=%d y=%d" % (fx, fy))
+                if to_left:
+                    check("拖动结束后图标 x 左移（起点 %d）" % ix, fx < ix - 20,
+                          "final x=%d y=%d" % (fx, fy))
+                else:
+                    check("拖动结束后图标 x 右移（起点 %d）" % ix, fx > ix + 20,
+                          "final x=%d y=%d" % (fx, fy))
             time.sleep(0.8)
             shot_drag = os.path.join(tmp, "drag.ppm")
             mon.shot(shot_drag)

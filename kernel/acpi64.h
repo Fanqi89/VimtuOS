@@ -42,8 +42,19 @@ uint8_t  acpi_reset_reg_value64();// 写 RESET_REG 的值（硬复位备用）
 uint64_t acpi_hpet_addr64();     // HPET 寄存器块物理地址；无 HPET 表时 0
 uint64_t acpi_mcfg_base64();     // 首个 MCFG ECAM 基址；无 MCFG 或无条目时 0
 uint32_t acpi_mcfg_segment_count64(); // MCFG 里的段组数量（每项 16 字节）；无 MCFG 时 0
+// PM1a_CNT_BLK 端口（软关机写这里）：FADT 0x40 / rev>=2 时的 0xAC；0 = 不可用。
+uint32_t acpi_pm1a_cnt_blk64();
+// S5 的 SLP_TYPa（bit12..10 那个值）。**不是硬编码 5 了**：能从 DSDT 的 \_S5 里读出来就用它，
+// 读不到才回退到规范常见值 5。见 acpi_s5_source64() 区分来源。
+int      acpi_s5_slp_typa64();
+const char* acpi_s5_source64();   // "dsdt"（\ _S5 解析成功）/ "default"（回退值 5）
 
-// 尝试软关机（S5）：往 FADT 的 PM1a_CNT_BLK 写 SLP_TYPa=5 | SLP_EN。
-// 拿不到 FADT / PM1a_CNT_BLK 不是合法端口时**一个端口都不写**并返回 false，
-// 调用方可以安全地继续走 8042 / 0x604 的回退链（见 kernel/gui64.cpp 的 sys_shutdown64）。
+// 尝试软关机（S5）：往 FADT 的 PM1a_CNT_BLK 写 SLP_TYPa | SLP_EN。
+// 拿不到 FADT / PM1a_CNT_BLK 不是合法端口时**一个端口都不写**并返回 false。
+// 返回 true 只代表"寄存器写下去了"，**不代表真的断电**（有的固件会忽略 S5）——
+// 调用方必须保留回退阶梯，见 kernel/gui64.cpp 的 sys_shutdown64()。
 bool acpi_poweroff64();
+
+// 用指定的 SLP_TYPa 试软关机（0..7）。给"\_S5 猜错时再试别的类型"这条阶梯用：
+// QEMU 的 \_S5 是 0、多数真机是 5，两档都试一遍就能覆盖绝大多数平台。
+bool acpi_poweroff_typ64(uint16_t slp_typ);

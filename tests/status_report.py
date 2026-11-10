@@ -3560,6 +3560,54 @@ def cap_vfs_quota():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_power_mgmt():
+    """★ 本批「ACPI 电源管理收口」：能力清单里 "点关机真能断电 / 重启用固件复位寄存器"。
+
+    修的真缺陷（有现场证据，见 tests/power64_test.py 头注释）：
+      kernel/gui64.cpp 的 sys_shutdown64() **从不调用** acpi_poweroff64()，而是硬编码
+      `outw(0x604, 0x2000)`（QEMU piix4 专有口）；失败后又写 8042 的 0xFE ——
+      那是 **CPU 复位**，关机于是会变成重启；而 settings64.cpp 的日志却写着
+      `via=spec (ACPI S5 -> acpi_poweroff64)`，打点与事实不符。
+
+    本批做的：
+      * 端口来自 FADT（PM1a_CNT_BLK / rev>=2 的 0xAC），睡眠类型来自 DSDT 的 _S5
+        （acpi64_parse_s5：只在原始字节里找 "_S5"+Package 取第一个整数，**不是 AML 解释器**）；
+      * 断电阶梯 ① _S5 的类型 → ② 类型 0（QEMU/部分固件）→ ③ 0x604 兼容口 → ④ halt；
+      * ★ 关机链里**删掉** 8042 0xFE（复位 ≠ 断电）；
+      * 重启先走 FADT 的 RESET_REG + RESET_VALUE（比 8042 / 0xCF9 通用）。
+    """
+    need = ["kernel/acpi64.cpp", "kernel/acpi64.h", "kernel/gui64.cpp", "tests/power64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    s5   = grep_count(r"acpi64_parse_s5", ["kernel/acpi64.cpp"])
+    typ  = grep_count(r"acpi_poweroff_typ64", ["kernel/acpi64.cpp", "kernel/acpi64.h"])
+    wire = grep_count(r"acpi_poweroff64\(\)", ["kernel/gui64.cpp"])
+    rst  = grep_count(r"acpi_reset_reg_addr64", ["kernel/gui64.cpp"])
+    # 反向判据：8042 复位脉冲（0xFE）只允许出现在 sys_reboot64 里 —— 关机绝不能借用它
+    pulse  = grep_count(r"outb\(0x64, 0xFE\)", ["kernel/gui64.cpp"])
+    legacy = grep_count(r"outw\(0x604", ["kernel/gui64.cpp"])
+    ev = [
+        "★ 关机接线：`acpi_poweroff64()` 在 `kernel/gui64.cpp` 命中 %d 处"
+        "（**修复前是 0** —— 这就是本批修的缺陷）" % wire,
+        "睡眠类型：`acpi64_parse_s5()` 命中 %d 处；DSDT 原始字节里找 \"_S5\" + Package 取第一个整数"
+        "（Zero/One/Byte/Word/DWord），不做 AML 解释、不求值、不建名字空间" % s5,
+        "参数化断电：`acpi_poweroff_typ64()` 命中 %d 处（.cpp/.h）；"
+        "val = (SLP_TYPa<<10) | SLP_EN，长度按 FADT 的 PM1_CNT_LEN 选 outl/outw" % typ,
+        "重启：`acpi_reset_reg_addr64()` 在 gui64 命中 %d 处 —— FADT RESET_REG（IO 空间）优先，"
+        "再退 8042 → 0xCF9 → 三重故障" % rst,
+        "★ 反向判据：`outb(0x64, 0xFE)`（8042 复位脉冲）在 gui64 里只剩 %d 处"
+        "（必须在 sys_reboot64 内；关机链里已删）" % pulse,
+        "兼容口 `outw(0x604` 命中 %d 处（只作 FADT 端口 != 0x604 时的第三级兜底）" % legacy,
+        "★ 边界（如实）：只做到 S5（软关机）+ 硬复位；**没有** S3/S4、没有 thermal zone / EC 温度读取、"
+        "没有电池/电源状态监控、没有 SMI_CMD 切 ACPI 模式（只记录不写）",
+        "验收：`tests/power64_test.py`（开机 ACPI 电源行 / 关机端口 == FADT / SLP_EN=1 / "
+        "QEMU 进程真退出 / 串口里 [ACPI64] rsdp= 只有 1 次 = 不是重启）",
+    ]
+    done = s5 > 0 and typ > 0 and wire > 0 and rst > 0 and pulse == 1
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 def cap_r3drv_framework():
     """★ v0.9.33「ring3 驱动框架 + 零拷贝通道 + 内核监督重启」：架构能力清单里
     \"文件系统协议只能在 ring0\"、\"用户态进程拿不到 DMA 落点\"、\"驱动崩了只能整机重启\"。
@@ -3832,10 +3880,15 @@ CAPS = [
     ("架构", "★ ring3 驱动框架（注册 + 按分区类型路由 + 只读安全态回退）+ **零拷贝通道**"
              "（AHCI DMA 一帧一项 PRDT 直接写进服务映射的共享页，0 次 memcpy）+ "
              "内核监督重启（服务崩了同一拍发现并拉起，超限退回只读）", cap_r3drv_framework),
+    ("内核", "★ ACPI 电源管理收口（关机走 FADT PM1a_CNT_BLK + DSDT _S5 的 SLP_TYPa、"
+             "断电阶梯、删除会把关机变重启的 8042 复位脉冲；重启用 FADT RESET_REG）",
+     cap_power_mgmt),
 ]
 
 
 TESTS = [
+    ("power64_test.py", "★ 本批 ACPI 电源管理：开机 ACPI 电源行 / 关机端口 == FADT / SLP_EN=1 / "
+                        "QEMU 进程真退出 / 串口里 [ACPI64] rsdp= 只有 1 次（= 不是重启）"),
     ("boot64_assert.py", "M0/M1：长模式/IDT/PIT/BootInfo"),
     ("bootlog64_test.py", "★ 批次 N 开机滚屏引导控制台：[CON64] 打点 / 黑底+等宽文本像素 / 行间距 / "
                           "vram 直读滚动证据 / 按键跳过 / dmesg 早期行 / 冷启动 verbose=0 不回放（30 条断言）"),
