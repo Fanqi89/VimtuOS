@@ -9,6 +9,16 @@
 #include "drive64.h"        // ★ P8b：[FAT64] rw mount 行要报盘符（fat64 那边查盘符表用）
 #include "sysfs64.h"        // ★ v0.9.24：/sys 合成节点树（只读、无盘）
 #include "iso9660_64.h"      // ★ v0.9.26：光盘 ISO9660 只读卷（PVD/目录记录/文件读）
+#include "r3drv_abi.h"       // ★ v0.9.40：R3drvDirent64（ext4 服务卷的目录项格式）
+#include "ext4vol64.h"       // ★ v0.9.40：EXT4VOL_MAX_ENTRIES（只用到常量，弱引用仍照旧）
+
+// ★ v0.9.40：ext4 只读客户端在系统内核里（kernel/ext4vol64.cpp）；安装介质内核不链它。
+//   这里用**弱引用**：符号不存在时下面的分派直接返回 -1，fs64 的行为与之前逐字节一致。
+extern int ext4vol64_stat64(const char* path, uint32_t* out_type, uint32_t* out_size) __attribute__((weak));
+extern int ext4vol64_list64(const char* path, R3drvDirent64* out, int max,
+                            int* out_count, int* out_more) __attribute__((weak));
+extern int ext4vol64_read64(const char* path, uint64_t off, void* buf, uint32_t len,
+                            uint32_t* out_got) __attribute__((weak));
 
 // ==================== 卷表 ====================
 static Fs64Vol64 g_vols[FS64_VOL_MAX];
@@ -107,6 +117,9 @@ int fs64_vol_info64(int vol, Fs64Vol64* out) {
     if (v.kind == FS64_KIND_FAT32 && !v.readonly) (void)fat64_rw_announce64(v.fat_slot);
     if (v.kind == FS64_KIND_VIMTUFS2) {
         (void)ensure_vfs64(v.vfs_slot);                       // 刷新容量（数据盘写盘后可用空间会变）
+    } else if (v.kind == FS64_KIND_EXT4R) {
+        // ★ v0.9.40：服务卷的容量要由 ring3 服务自报（STATFS），本版还没做 -> **如实标未知**，
+        //   绝不拿分区扇区数冒充"ext4 的容量"。
     } else if (v.kind == FS64_KIND_ISO9660) {
         // 光盘是只读介质：容量在挂载时定死，没有"可用空间"这回事（free_known 保持 0 = 未知）
     } else {
@@ -215,6 +228,38 @@ int fs64_mount_iso64(int cd_idx, Fs64Vol64* out) {
     dbg64_line_end64();
     return vol;
 }
+// ★ v0.9.40：登记 ext4 只读服务卷（解析在 ring3；内核只持有卷号 + 盘/起始 LBA）。
+int fs64_register_ext4r64(int disk, uint32_t lba, Fs64Vol64* out) {
+    Fs64Vol64& v = g_vols[FS64_VOL_EXT4_BASE];
+    v.kind        = FS64_KIND_EXT4R;
+    v.readonly    = 1;                       // ★ 只读：所有写入口自动 -FS64_EROFS
+    v.total_known = 0;                       // 容量未知（等服务侧 STATFS；绝不谎报）
+    v.free_known  = 0;
+    v.disk        = disk;
+    v.start_lba   = lba;
+    v.vfs_slot    = -1;
+    v.fat_slot    = -1;
+    v.total_kb    = 0;
+    v.free_kb     = 0;
+    {
+        const char* s = "ext4";
+        int i = 0;
+        for (; s[i] && i < (int)sizeof(v.fs) - 1; i++) v.fs[i] = s[i];
+        v.fs[i] = 0;
+    }
+    if (out) *out = v;
+    dbg64_line_begin64();
+    dbg64_str("[FS64] mount ext4r vol="); dbg64_dec((uint64_t)FS64_VOL_EXT4_BASE);
+    dbg64_str(" disk=");                  dbg64_dec((uint64_t)disk);
+    dbg64_str(" lba=");                   dbg64_dec((uint64_t)lba);
+    dbg64_str(" ro=1 via=ring3-svc\n");
+    dbg64_line_end64();
+    return FS64_VOL_EXT4_BASE;
+}
+int fs64_ext4r_vol64() {
+    return (g_vols[FS64_VOL_EXT4_BASE].kind == FS64_KIND_EXT4R) ? FS64_VOL_EXT4_BASE : -1;
+}
+
 int fs64_iso_vol64() {
     return (g_vols[FS64_VOL_ISO_BASE].kind == FS64_KIND_ISO9660) ? FS64_VOL_ISO_BASE : -1;
 }
@@ -401,6 +446,34 @@ int fs64_list64(int vol, const char* path, Fs64Dirent64* out, int max, uint32_t*
         for (int i = 0; i < n; i++) fill_from_iso(&out[i], &tmp[i]);
         return n;
     }
+    if (g_vols[v].kind == FS64_KIND_EXT4R) {
+        // ★ v0.9.40：一次 RPC 拿回整目录（≤64 条），再按游标切片 —— 与 vfs 的"逐个返回"语义对齐。
+        if (!ext4vol64_list64) return -1;
+        static R3drvDirent64 etmp[EXT4VOL_MAX_ENTRIES];
+        int en = 0, emore = 0;
+        if (ext4vol64_list64(path, etmp, EXT4VOL_MAX_ENTRIES, &en, &emore) != 0) return -1;
+        const uint32_t cur = cursor ? *cursor : 0u;
+        if (cur >= (uint32_t)en) return 0;
+        int k = 0;
+        for (uint32_t i = cur; i < (uint32_t)en && k < max; i++, k++) {
+            int j = 0;
+            for (; etmp[i].name[j] && j < (int)FS64_NAME_MAX - 1; j++) out[k].name[j] = etmp[i].name[j];
+            out[k].name[j] = 0;
+            out[k].index = etmp[i].ino;
+            out[k].type  = (etmp[i].type == 2u) ? VFS64_TYPE_DIR : VFS64_TYPE_FILE;
+            out[k].size  = etmp[i].size;
+            out[k].mtime = 0;                                  // ext4 服务暂不上报时间
+            out[k].kind  = (etmp[i].type == 2u) ? VFS64_KIND_DIR
+                         : vfs64_kind_by_name64(VFS64_TYPE_FILE, etmp[i].name,
+                                                (uint32_t)fat_name_len(etmp[i].name));
+            out[k].attr  = 0;
+            out[k].uid   = 0;
+            out[k].gid   = 0;
+            out[k].mode  = (etmp[i].type == 2u) ? (VFS64_S_IFDIR | 0555u) : (VFS64_S_IFREG | 0444u);
+        }
+        if (cursor) *cursor = cur + (uint32_t)k;
+        return k;
+    }
     static Fat64Entry64 tmp[32];                              // FAT：一次最多转 32 条（游标透传）
     int want = max;
     if (want > 32) want = 32;
@@ -514,6 +587,21 @@ int fs64_stat64(int vol, const char* path, Fs64Stat64* out) {
         out->mode  = (is.type == VFS64_TYPE_DIR) ? (VFS64_S_IFDIR | 0555u) : (VFS64_S_IFREG | 0444u);
         return 0;
     }
+    if (g_vols[v].kind == FS64_KIND_EXT4R) {
+        if (!ext4vol64_stat64) return -1;
+        uint32_t etype = 0, esize = 0;
+        if (ext4vol64_stat64(path, &etype, &esize) != 0) return -1;
+        out->type  = (etype == 2u) ? VFS64_TYPE_DIR : VFS64_TYPE_FILE;
+        out->size  = esize;
+        out->mtime = 0;
+        out->kind  = (etype == 2u) ? VFS64_KIND_DIR
+                   : vfs64_kind_by_name64(VFS64_TYPE_FILE, path, (uint32_t)fat_name_len(path));
+        out->attr  = 0;
+        out->uid   = 0;
+        out->gid   = 0;
+        out->mode  = (etype == 2u) ? (VFS64_S_IFDIR | 0555u) : (VFS64_S_IFREG | 0444u);
+        return 0;
+    }
     Fat64Entry64 fe;
     if (fat64_stat64(g_vols[v].fat_slot, path, &fe) != 0) return -1;
     out->type = (fe.attr & 0x10u) ? VFS64_TYPE_DIR : VFS64_TYPE_FILE;
@@ -579,6 +667,13 @@ int fs64_read64(int vol, const char* path, void* buf, int max) {
         const int rc = iso966064_read64(path, 0, buf, (uint32_t)max, &igot);
         if (rc != 0) return rc;                                   // -21 = 目录（与 fs64 口径一致）
         return (int)igot;
+    }
+    if (g_vols[v].kind == FS64_KIND_EXT4R) {
+        if (!ext4vol64_read64) return -1;
+        uint32_t egot = 0;
+        const int rc = ext4vol64_read64(path, 0, buf, (uint32_t)max, &egot);
+        if (rc != 0) return rc;
+        return (int)egot;
     }
     uint32_t got = 0;
     if (fat64_read64(g_vols[v].fat_slot, path, buf, (uint32_t)max, &got) != 0) return -1;
@@ -784,7 +879,9 @@ int fs64_selftest64() {
     // bit0：卷表自洽 + 当前卷 stat("/")
     for (int v = 0; v < FS64_VOL_MAX; v++) {
         if (g_vols[v].kind == FS64_KIND_NONE) continue;
-        if (g_vols[v].fs[0] == 0 || g_vols[v].total_known == 0) fails |= 1;
+        // ★ v0.9.40：EXT4R 的容量由 ring3 服务自报（STATFS 还没做）-> 如实未知，不算不自洽。
+        if (g_vols[v].kind != FS64_KIND_EXT4R && g_vols[v].total_known == 0) fails |= 1;
+        if (g_vols[v].fs[0] == 0) fails |= 1;
         if (g_vols[v].kind == FS64_KIND_FAT32 && g_vols[v].readonly != 1) fails |= 1;
         if (g_vols[v].kind == FS64_KIND_VIMTUFS2 && g_vols[v].readonly != 0) fails |= 1;
         if (g_vols[v].kind == FS64_KIND_ISO9660 && g_vols[v].readonly != 1) fails |= 1;   // ★ v0.9.26

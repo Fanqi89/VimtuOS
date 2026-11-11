@@ -24,6 +24,7 @@
 #include "proc64.h"        // proc64_shm_view64
 #include "vfs64.h"         // 读 /etc/r3drv.conf
 #include "task64.h"        // task_yield64
+#include "fs64.h"          // ★ 自检要走"文件管理器那条分派"（fs64_list64 / fs64_read64）
 
 #define EXT4VOL_CONF_PATH "/etc/r3drv.conf"
 
@@ -316,7 +317,7 @@ static int ev_stat_retry(const char* path, uint32_t* type, uint32_t* size) {
 
 void ext4vol64_selftest64() {
     // 1) 等服务发布请求块（有界：最多 3000 ms；期间每圈都让出 CPU）
-    const uint32_t dl = ticks64() + ms_to_ticks64(3000u);
+    const uint32_t dl = ticks64() + ms_to_ticks64(15000u);   // 15 s：服务首次解析可能较久（仍然有界）
     int ready = 0;
     while ((int32_t)(ticks64() - dl) < 0) {
         if (ext4vol64_ready64()) { ready = 1; break; }
@@ -383,6 +384,46 @@ void ext4vol64_selftest64() {
         dbg64_str("[EXT4VOL] selftest read=\"/big.bin\" bytes="); dbg64_dec((uint64_t)total);
         dbg64_str(" crc=0x"); dbg64_hex64((uint64_t)crc);
         dbg64_str(ok && total == 100000u ? " ok" : " FAILED");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+
+
+    // 6) ★ 走 **fs64 的分派**（文件管理器用的就是这条路径，不是 ext4vol64 的私有接口）
+    {
+        static Fs64Dirent64 ents[8];
+        uint32_t cursor = 0;
+        const int n = fs64_list64(FS64_VOL_EXT4_BASE, "/", ents, 8, &cursor);
+        dbg64_line_begin64();
+        dbg64_str("[EXT4VOL] selftest fs64-list count="); dbg64_dec((uint64_t)(n < 0 ? 0u : (uint64_t)n));
+        dbg64_str(" names=");
+        for (int i = 0; i < n && i < 6; i++) {
+            if (i) dbg64_str(",");
+            dbg64_str(ents[i].name);
+        }
+        dbg64_str(n >= 3 ? " ok" : " FAILED");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+
+    // 7) ★ 同一条分派上的**读文件**（hello.txt 是 13 B 文本）
+    {
+        static uint8_t tbuf[128];
+        const int got = fs64_read64(FS64_VOL_EXT4_BASE, "/hello.txt", tbuf, (int)sizeof(tbuf) - 1);
+        if (got > 0) tbuf[got] = 0;
+        dbg64_line_begin64();
+        dbg64_str("[EXT4VOL] selftest fs64-read path=/hello.txt bytes=");
+        dbg64_dec((uint64_t)(got < 0 ? 0 : got));
+        dbg64_str(" text=");
+        if (got > 0) {
+            for (int i = 0; i < got && i < 32; i++) {
+                const char c = (char)tbuf[i];
+                if (c == '\n') { dbg64_str("\\n"); continue; }
+                if (c < 32 || c > 126) { dbg64_str("."); continue; }
+                char one[2]; one[0] = c; one[1] = 0; dbg64_str(one);
+            }
+        }
+        dbg64_str(got > 0 ? " ok" : " FAILED");
         dbg64_nl();
         dbg64_line_end64();
     }

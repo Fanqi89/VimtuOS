@@ -13,6 +13,11 @@
 #include "ata64.h"
 #include "vfs64.h"
 #include "fat64.h"
+// ★ v0.9.40：ext4 只在"系统内核 + ring3 服务活着"时才有意义。两个符号都按**弱引用**取：
+//   安装介质内核不链 r3drv64/ext4vol64，那边条件直接不成立（行为与之前逐字节一致）。
+extern uint32_t r3drv64_probe_proto64(uint32_t disk, uint32_t lba) __attribute__((weak));
+extern int      ext4vol64_ready64() __attribute__((weak));
+#include "r3drv_abi.h"   // R3DRV_PROTO_EXT4
 #include "fs64.h"          // ★ 批次 K：统一卷表/只读语义（FAT32 的挂载与写拒绝都在这一层）
 #include "part64.h"        // 只为常量/struct（PART_MAIN_LBA / PartInfo）；**不调用** part64 的函数
 
@@ -170,6 +175,32 @@ int drive64_scan64() {
         for (int i = 0; i < 4; i++) if (mbr_ok && p[i].used && p[i].sectors > 0) used_entries++;
 
         if (used_entries == 0) {
+            // ★ v0.9.40：**整盘没有分区表，但认得出 ext4**（夹具 / 裸盘就是这种形态）
+            //   -> 与分区分支同样处理：登记只读服务卷 + 给盘符。解析仍然在 ring3 服务里。
+            if (r3drv64_probe_proto64 && r3drv64_probe_proto64((uint32_t)d, 0u) == R3DRV_PROTO_EXT4
+                && fs64_ext4r_vol64() < 0) {
+                DriveInfo64 x;
+                zero_bytes(&x, (uint32_t)sizeof(x));
+                x.slot = DRV64_SLOT_NONE;
+                x.fatvol = DRV64_SLOT_NONE;
+                x.vol = fs64_register_ext4r64(d, 0u, nullptr);
+                x.present = true;
+                x.disk = d;
+                x.part = 0;
+                x.start_lba = 0;
+                x.sectors = (di.sectors > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)di.sectors;
+                x.fskind = DRV64_FS_EXT4;
+                copy_str(x.fs, DRV64_FS_MAX, "ext4");
+                copy_str(x.name, DRV64_NAME_MAX, "ext4 卷（ring3 只读服务，整盘）");
+                x.browsable = true;
+                x.readonly = true;                  // ★ 只读
+                x.total_known = false;              // 容量由服务自报（STATFS 未做）
+                x.free_known = false;
+                x.skip = DRV64_SKIP_NONE;
+                fs_recognized++;
+                add_entry(x, nullptr);
+                continue;
+            }
             // 未分区 / 不是有效 MBR：仍列出（不占盘符），打点 reason=no-fs
             DriveInfo64 e;
             zero_bytes(&e, (uint32_t)sizeof(e));
@@ -273,6 +304,35 @@ int drive64_scan64() {
                 copy_str(e.name, DRV64_NAME_MAX, "EFI 系统分区");
                 e.browsable = false;
                 e.skip = DRV64_SKIP_ESP;
+            } else if (r3drv64_probe_proto64
+                       && r3drv64_probe_proto64((uint32_t)d, p[i].start) == R3DRV_PROTO_EXT4) {
+                // ★ v0.9.40：认得出 ext4 -> 登记成"只读服务卷"并给它一个盘符。解析永远在服务里，
+                //   内核只走 RPC。
+                // ★ 为什么**不**在这里要求"服务已就绪"：盘符扫描发生在开机很早的时候（服务由
+                //   autostart 拉起、还没 register），拿它当条件会让 ext4 盘符**永久漏掉**（实测踩过）。
+                //   探测只读分区字节，不依赖服务；服务没就绪时读操作会如实返回超时/EAGAIN ——
+                //   绝不假装成功（界面显示空目录，而不是假文件）。
+                fs_recognized++;
+                if (fs64_ext4r_vol64() < 0) {
+                    Fs64Vol64 xv;
+                    const int xvol = fs64_register_ext4r64(d, p[i].start, &xv);
+                    e.fskind = DRV64_FS_EXT4;
+                    copy_str(e.fs, DRV64_FS_MAX, "ext4");
+                    copy_str(e.name, DRV64_NAME_MAX, "ext4 卷（ring3 只读服务）");
+                    e.browsable = true;
+                    e.readonly = true;                  // ★ 只读：写入口自动 -FS64_EROFS
+                    e.vol = xvol;
+                    e.total_known = false;              // 容量由服务自报（STATFS 未做，如实未知）
+                    e.free_known = false;
+                    e.skip = DRV64_SKIP_NONE;
+                } else {
+                    // 卷号只有一个：第二个 ext4 分区如实标出来但不给盘符（绝不覆盖已挂的卷）。
+                    e.fskind = DRV64_FS_EXT4;
+                    copy_str(e.fs, DRV64_FS_MAX, "ext4(未挂载)");
+                    copy_str(e.name, DRV64_NAME_MAX, "ext4 卷（服务卷号已占用）");
+                    e.browsable = false;
+                    e.skip = DRV64_SKIP_NOFS;
+                }
             } else {
                 copy_str(e.fs, DRV64_FS_MAX, magic ? "VimtuFS2(坏卷)" : "unknown");
                 copy_str(e.name, DRV64_NAME_MAX, magic ? "VimtuFS2 卷（超级块校验未通过）" : "未识别分区");

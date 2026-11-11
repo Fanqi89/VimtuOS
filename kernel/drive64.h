@@ -62,6 +62,7 @@
 #define DRV64_FS_FAT32       2u
 #define DRV64_FS_FAT12_16    3u
 #define DRV64_FS_ISO9660     4u     // ★ v0.9.26：光盘（ISO9660 只读卷，盘符 = "光盘"）
+#define DRV64_FS_EXT4        5u     // ★ v0.9.40：ext4 只读服务卷（解析在 ring3，内核走 RPC）
 
 // 跳过原因（DriveInfo64.skip）—— 被跳过的条目不分配盘符
 #define DRV64_SKIP_NONE  0u

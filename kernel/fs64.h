@@ -32,7 +32,10 @@
 //   而且要保证 FS64_VOL_MAX 只涨 1 —— 卷表的每个成员都会被 fs64_vol_count64/自检逐个遍历，
 //   号段涨太多会让 fs64 的自检与盘符分配多做无用功。
 #define FS64_VOL_ISO_BASE (FS64_VOL_FAT_BASE + FAT64_VOL_MAX)    // 8：ISO9660 卷号
-#define FS64_VOL_MAX      (FS64_VOL_ISO_BASE + 1)                // 9
+// ★ v0.9.40：ext4 只读服务卷占**一个**号（同 ISO 的理由：一台机器一个 ext4 卷够用，
+//   而且卷表每个成员都会被自检/盘符分配遍历，号段涨太多会做无用功）。
+#define FS64_VOL_EXT4_BASE (FS64_VOL_ISO_BASE + 1)               // 9：ext4 只读服务卷号
+#define FS64_VOL_MAX      (FS64_VOL_EXT4_BASE + 1)               // 10
 #define FS64_VOL_NONE     (-1)
 #define FS64_NAME_MAX     FAT64_NAME_MAX                         // 名字缓冲（UTF-8；FAT 长名也够）
 #define FS64_EROFS        30                                     // -errno：只读文件系统
@@ -42,6 +45,7 @@
 #define FS64_KIND_VIMTUFS2 1u
 #define FS64_KIND_FAT32    2u
 #define FS64_KIND_ISO9660  3u     // ★ v0.9.26：光盘（只读；见 kernel/iso9660_64.h）
+#define FS64_KIND_EXT4R    4u     // ★ v0.9.40：ext4 **只读服务卷**（解析在 ring3，内核走反向 RPC）
 
 // 统一的 stat / 目录项（字段与 vfs64 的对应结构对齐，外加 FAT 的属性位）
 // ★ P4：uid/gid/mode 与 vfs64 的 Vfs64Info64/Vfs64Dirent64 同一口径；FAT 卷没有属主 -> 恒 0 = root、
@@ -97,6 +101,11 @@ int fs64_find_vfs64(int slot);
 int fs64_find_fat64(int disk, uint32_t lba);
 // 探测 + 挂载 + 登记一个 FAT32 卷（幂等）。成功返回统一卷号（>= FS64_VOL_FAT_BASE），失败 -1。
 int fs64_mount_fat64(int disk, uint32_t lba, Fs64Vol64* out);
+// ★ v0.9.40：登记"ext4 只读服务卷"（**不**在这里做解析 —— 解析永远在 ring3 服务里）。
+//   幂等：同一 (disk,lba) 重复登记只刷新字段。成功返回 FS64_VOL_EXT4_BASE，失败 -1。
+int fs64_register_ext4r64(int disk, uint32_t lba, Fs64Vol64* out);
+// 当前是否登记了 ext4 服务卷（-1 = 没有）。
+int fs64_ext4r_vol64();
 // ★ v0.9.26：挂载第 cd_idx 个光驱上的 ISO9660 卷（只读）。成功返回统一卷号（= FS64_VOL_ISO_BASE），失败 -1。
 //   幂等：同一台光驱已经挂过就直接返回同一个卷号；换盘请先 fs64_umount_iso64()。
 int fs64_mount_iso64(int cd_idx, Fs64Vol64* out);
