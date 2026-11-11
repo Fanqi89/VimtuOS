@@ -376,6 +376,10 @@ static void n64_handle_ip(const uint8_t* p, int len, const uint8_t* src_mac) {
         dbg64_dec(g_rx_frames);
         dbg64_str(")");
         n64_line_end();
+        // ★ v0.9.39：把 echo reply 也交给 socket 层（raw ICMP socket = busybox `ping` 的落点）。
+        //   为什么只交 type 0：SOCK_RAW/IPPROTO_ICMP 的 Linux 语义是"ICMP 报文（含 8 字节头）"，
+        //   ping 只关心回复；请求/不可达等类型留给将来，不在这里假装支持。
+        if (sock64_rx64) sock64_rx64(1, ip.src, icmp, ip.payload_len);
         return;
     }
     g_dropped++;                                      // 其它 ICMP 类型先不处理

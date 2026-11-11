@@ -184,7 +184,15 @@ int  proc64_pgid_of64(int pid);                                 // 进程组 id�
 int  proc64_proc_pid_at64(int idx);                             // 按进程表槽位取 pid；-1 = 空槽
 int  proc64_setpgid64(int pid, int pgid);                       // setpgid(109)：0 = 成功；负数 = -errno
 int   proc64_sig_pending64(int sig);          // 记录型查询（不投递）
-int   proc64_alarm_set64(int sec);            // 只记录（无投递）；返回上一次的秒数
+// ★ v0.9.39：alarm() 现在**真的投递** SIGALRM（一次性）—— 与 setitimer(ITIMER_REAL) 同一条路。
+//   返回上一次的秒数（Linux 语义：剩余秒数；本实现按"上次设定的秒数"给，如实）。
+int   proc64_alarm_set64(int sec);
+// ★ v0.9.39：setitimer(ITIMER_REAL)（which=0）。val_ms=首次到期、iv_ms=重装间隔（0=一次性）。
+//   out_old 非空时写回 {剩余毫秒, 间隔毫秒}（每项 8 字节，共 16 字节）。成功 0；不支持 -EINVAL(22)。
+int64_t proc64_setitimer64(int which, uint64_t val_ms, uint64_t iv_ms, uint64_t* out_old);
+// ★ v0.9.39：到期扫描（由 kheart 的 16 Hz 切片调用）—— 到期即投递 SIGALRM 并重装/解除。
+//   为什么在这里遍历：Proc64 是**本文件私有结构**，定时器状态必须和它同生命周期。
+void  proc64_itimer_tick64();
 // ★ P4：每进程凭证（uid/gid/euid/egid；root = 0）。fork/execve 继承；setuid/setgid/seteuid 改它。
 //   * proc64_get_cred64：0 = 已填入（当前进程）；-1 = 没有进程上下文（调用方退化为会话身份）。
 //   * proc64_set_cred64：改当前进程凭证并**立刻发布**给 VFS；-1 = 没有进程上下文（不改）。

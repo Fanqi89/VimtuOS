@@ -13,6 +13,9 @@
 #include "debug64.h"
 #include "panic64.h"
 
+// ★ v0.9.39：raw ICMP 的 recv 需要在"被 SIGALRM 打断"时返回 -EINTR（Linux 语义）。
+//   用弱声明而不是 include proc64.h：安装介质内核不链 proc64 的这部分时不能让链接失败。
+int proc64_sig_pending64(int sig) __attribute__((weak));
 extern volatile uint64_t g_ticks64;
 #ifndef PIT_HZ_64
 #define PIT_HZ_64 250u
@@ -120,7 +123,7 @@ static int s64_tcp_send(Sock64* s, uint8_t flags, const uint8_t* payload, int le
 }
 
 int sock64_create64(int type) {
-    if (type != SOCK64_T_TCP && type != SOCK64_T_UDP) return -1;
+    if (type != SOCK64_T_TCP && type != SOCK64_T_UDP && type != SOCK64_T_ICMP) return -1;
     for (int i = 0; i < SOCK64_MAX; i++) {
         if (g_socks[i].used) continue;
         Sock64* s = &g_socks[i];
@@ -128,10 +131,37 @@ int sock64_create64(int type) {
         s->used = 1;
         s->type = (uint8_t)type;
         s->state = S_CREATED;
-        s->lport = (uint16_t)(40000 + (g_ticks64 & 0x3FFu) + (uint16_t)i);   // 临时端口
+        // ★ raw ICMP 没有"端口"概念（Linux 里 rport 恒 0）——给 0，别造一个假端口出来
+        s->lport = (type == SOCK64_T_ICMP) ? 0
+                 : (uint16_t)(40000 + (g_ticks64 & 0x3FFu) + (uint16_t)i);   // 临时端口
+        s->laddr = 0;
         return SOCK64_FD_BASE + i;
     }
     return -1;
+}
+
+// ★ v0.9.39：handle 是否本层 socket（bind/close 的类型判别用；不碰 fd 表）
+int sock64_is_socket64(int h) {
+    const int i = h - SOCK64_FD_BASE;
+    return (i >= 0 && i < SOCK64_MAX && g_socks[i].used) ? 1 : 0;
+}
+
+// ★ v0.9.39：bind(49)。raw ICMP 必须能 bind 成功 —— busybox 的 `xbind()` 一失败就整个退出。
+//   如实边界：本内核只有一个本地 IP（net64 的 NET64_IP_LOCAL64），所以"绑地址"只做记录与校验；
+//   端口对 ICMP 无意义（内核按 ICMP id 匹配，Linux 同）；TCP 的 bind 仍不支持（那是服务端语义）。
+int sock64_bind64(int h, uint32_t ip, uint16_t port) {
+    Sock64* s = s64_of(h);
+    if (!s) return -88;                                        // -ENOTSOCK
+    if (s->type == SOCK64_T_TCP) return -95;                   // -EOPNOTSUPP（服务端未实现）
+    if (ip != 0) s->laddr = ip;                                // 0.0.0.0 = 不指定
+    if (s->type == SOCK64_T_UDP && port != 0) s->lport = port;
+    dbg64_str("[SOCK64] bind h=");
+    dbg64_dec((uint64_t)h);
+    dbg64_str(" type=");
+    dbg64_dec((uint64_t)s->type);
+    dbg64_str(" ok=1");
+    dbg64_nl();
+    return 0;
 }
 
 int sock64_close64(int h) {
@@ -185,6 +215,13 @@ void sock64_sendto_target64(int h, uint32_t ip, uint16_t port) {
 int sock64_send64(int h, const void* buf, int len) {
     Sock64* s = s64_of(h);
     if (!s || !buf || len < 0) return -1;
+    if (len > 0 && s->type == SOCK64_T_ICMP) {                 // ★ v0.9.39：raw ICMP（不做任何改写）
+        // Linux 的 SOCK_RAW/IPPROTO_ICMP 语义：用户缓冲区 = **完整 ICMP 报文**（8 字节头 + 数据），
+        // 内核只补 IPv4 头、ICMP 校验和由用户算。net64_send_ipv4 正是这个口径（内部含 ARP）。
+        const int rc = net64_send_ipv4(s->raddr, 1, (const uint8_t*)buf, len);
+        if (rc == 0) g_tx_seg++;
+        return rc == 0 ? len : -1;
+    }
     if (s->type == SOCK64_T_UDP) {
         const int rc = net64_send_ipv4(s->raddr, 17, (const uint8_t*)buf, len);
         if (rc == 0) g_tx_seg++;
@@ -214,6 +251,9 @@ int sock64_recv64(int h, void* buf, int max, uint32_t timeout_ms) {
             s->rxlen -= n;
             return n;
         }
+        // ★ v0.9.39：raw ICMP 被 SIGALRM 打断 -> -EINTR（4）。busybox `ping` 的 recvfrom 见到
+        //   EINTR 只 continue（不刷错误），下一次循环就能等到新回复；不会把 1 秒节拍拖成 3 秒超时。
+        if (s->type == SOCK64_T_ICMP && proc64_sig_pending64 && proc64_sig_pending64(14)) return -4;
         if (s->type == SOCK64_T_TCP && (s->state == S_CLOSED || s->state == S_FIN_SENT)) return 0;   // EOF
         if ((g_ticks64 - t0) >= lim) return 0;               // 超时（0 字节，不假装有数据）
         net64_poll64();
@@ -244,6 +284,19 @@ void sock64_rx64(uint8_t proto, uint32_t src_ip, const uint8_t* p, int len) {
             s->rport = s64_htons(s64_rd16(p + 0));
             const int dlen = len - 8;
             for (int k = 0; k < dlen && s->rxlen < SOCK64_RXBUF; k++) s->rx[s->rxlen++] = p[8 + k];
+            return;
+        }
+        return;
+    }
+    if (proto == 1) {                                         // ★ v0.9.39：raw ICMP（echo reply）
+        // Linux 的 SOCK_RAW/IPPROTO_ICMP 收到的就是**ICMP 报文本身**（含 8 字节头，不含 IPv4 头）。
+        // 这里只投递 type=0（echo reply）—— 由 net64 的收包路径筛选后才会进到这里。
+        for (int i = 0; i < SOCK64_MAX; i++) {
+            Sock64* s = &g_socks[i];
+            if (!s->used || s->type != SOCK64_T_ICMP) continue;
+            s->raddr = src_ip;
+            for (int k = 0; k < len && s->rxlen < SOCK64_RXBUF; k++) s->rx[s->rxlen++] = p[k];
+            s->state = S_ESTAB;
             return;
         }
         return;

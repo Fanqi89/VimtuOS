@@ -239,6 +239,18 @@ int fd64_slot_used64(int fd);
 int fd64_slot_dev_kind64(int fd, int* which_out);
 // 1 = 当前表的槽 fd 绑的是"控制台 tty"对象（ioctl 认 TIOCGWINSZ/TCGETS/TCSETS）。
 int fd64_slot_is_tty64(int fd);
+
+// ★ v0.9.39：socket 别名（每进程每槽）。为什么要它：busybox 的 `ping` 是
+//   `enum { pingsock = 0 }` + `xmove_fd(sock, pingsock)` —— 它把 raw socket **挪到 fd 0** 再用。
+//   而本内核的 socket handle 不进 fd 表（= SOCK64_FD_BASE + idx），所以这里给每个槽
+//   留一个“这个 fd 其实是哪个 socket”的别名：dup2 建立 / close 清除 / fork 随表复制。
+//   如实边界：**不做引用计数** —— 同一 socket 若被挪进多个槽，任一槽 close 都会关掉它。
+int  fd64_sock_alias_set64(int fd, int handle);      // 0 = 成功；-FD64_EBADF = fd 越界
+int  fd64_sock_alias_get64(int fd);                  // >= 0 = socket handle；-1 = 没有
+void fd64_sock_alias_clear64(int fd);
+// 这个 socket handle 有没有被挪进某个槽（有则返回槽号，否则 -1）。
+// ★ xmove_fd(dup2 + close 原 handle) 的语义要靠它：原号码可以被放掉，socket 不能死。
+int  fd64_sock_alias_find64(int handle);
 // 把 fd 的"是谁"写成一行串口证据（仅当槽已绑对象；用于 dup2 重定向的证据链）。
 void fd64_log_slot64(int fd, const char* tag);
 

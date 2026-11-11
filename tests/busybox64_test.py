@@ -99,14 +99,11 @@ def q(p):
     return p.replace("\\", "/")
 
 
-def read_guest_file(img_path, parts):
-    TP = load_mod("tcc_pack_win", "tcc_pack_win.py")
-    d = open(img_path, "rb").read()
-    vol = d[PART_MAIN_LBA * SECTOR:TARGET_SECTORS * SECTOR]
-    if vol[0:8] != b"VIMTUFS2":
-        return None
-    total = struct.unpack_from("<I", vol, 20)[0]
-    inodes = struct.unpack_from("<I", vol, 40)[0]
+ALIAS_TOP = ("bin", "lib", "sbin", "share", "include")
+
+
+def _walk(TP, vol, inodes, parts):
+    """按真实目录逐级走；任一级找不到返回 None。"""
     cur = 0
     rec = None
     for part in parts:
@@ -119,6 +116,24 @@ def read_guest_file(img_path, parts):
             return None
         _, rec = hit
         cur = hit[0]
+    return rec
+
+
+def read_guest_file(img_path, parts):
+    """读卷内文件。★ v0.9.39：加**别名回落** —— /bin、/lib 在卷里是软链接，真实目录在 /usr 下；
+    找不到就试 ["usr"] + parts（只放宽"路径怎么走"，比较的字节不变）。"""
+    TP = load_mod("tcc_pack_win", "tcc_pack_win.py")
+    d = open(img_path, "rb").read()
+    vol = d[PART_MAIN_LBA * SECTOR:TARGET_SECTORS * SECTOR]
+    if vol[0:8] != b"VIMTUFS2":
+        return None
+    total = struct.unpack_from("<I", vol, 20)[0]
+    inodes = struct.unpack_from("<I", vol, 40)[0]
+    rec = _walk(TP, vol, inodes, parts)
+    if rec is None and parts and parts[0] in ALIAS_TOP:
+        rec = _walk(TP, vol, inodes, ["usr"] + list(parts))
+    if rec is None:
+        return None
     return TP._read_file(vol, rec, total)
 
 
@@ -345,7 +360,7 @@ def main():
     H("卷里 /bin/ls 与 build64/bbwrap 逐字节一致（同一份字节的多入口）", got == wrap)
     idx = read_guest_file(img, ["etc", "vimtu.dirs"])
     H("卷里 /etc/vimtu.dirs 目录索引存在（%s 条）" % (idx.count(b"\n") - 1 if idx else None),
-      bool(idx) and b"/tcc/demo\thello.c" in idx and b"/\tbin" in idx)
+      bool(idx) and b"/tcc/demo\thello.c" in idx and b"/\tusr" in idx)   # ★ v0.9.39：根目录里的真实目录是 usr（/bin、/lib 是软链接，不进目录索引）
 
     # ==================== ② 真跑：QEMU 里逐条 applet ====================
     qemu = find_qemu(args.qemu)

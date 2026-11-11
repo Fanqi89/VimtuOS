@@ -114,6 +114,12 @@ struct FdTable64 {
     uint8_t     pad[2];
     OpenFile64* slot[FD64_MAX];      // nullptr = 空槽
     uint32_t    cloexec;             // ★ 本批：每个**槽**的 FD_CLOEXEC 位（bit i = 槽 i 是 close-on-exec）
+    // ★ v0.9.39：每槽的 "这个 fd 其实是哪个 socket handle"（0 = 不是 socket）。
+    //   为什么需要：socket handle 不进 fd 表（= SOCK64_FD_BASE + idx），而 busybox 的 `ping`
+    //   会把 raw socket **挪到 fd 0**（`enum { pingsock = 0 }` + `xmove_fd(sock, pingsock)`），
+    //   之后一律用 fd 0 收发。所以这里给槽留一个别名，dup2 建立 / close 清除 / fork 随表复制。
+    //   如实边界：**不做引用计数** —— 同一 socket 若被挪进多个槽，任一槽 close 都会关掉它。
+    int32_t     sock_alias[FD64_MAX];
 };
 
 static FdTable64   g_tables[FD64_TABLE_MAX];
@@ -141,7 +147,7 @@ FdTable64* fd64_table_alloc64() {
     for (uint32_t i = 1; i < FD64_TABLE_MAX; i++) {
         if (!g_tables[i].used) {
             FdTable64* t = &g_tables[i];
-            for (uint32_t k = 0; k < FD64_MAX; k++) t->slot[k] = nullptr;
+            for (uint32_t k = 0; k < FD64_MAX; k++) { t->slot[k] = nullptr; t->sock_alias[k] = 0; }
             t->used = 1; t->is_kernel = 0; t->cloexec = 0;
             return t;
         }
@@ -157,6 +163,42 @@ uint32_t fd64_table_used64(const FdTable64* t) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < FD64_MAX; i++) if (t->slot[i]) n++;
     return n;
+}
+
+// ==================== ★ v0.9.39：socket 别名（每进程每槽）====================
+// 语义：`fd64_sock_alias_set64(fd, handle)` 之后，`fd` 这个号码**就是这个 socket**。
+//   为什么不是引用计数：socket handle 是全局池下标（SOCK64_FD_BASE + idx），本来就不复制；
+//   别名只是"号码 → 句柄"的翻译，close 时按句柄释放。如实边界写在 fd64.h。
+int fd64_sock_alias_set64(int fd, int handle) {
+    if (fd < 0 || fd >= (int)FD64_MAX) return -FD64_EBADF;
+    FdTable64* t = fd64_current_table64();
+    if (!t) return -FD64_EBADF;
+    t->sock_alias[fd] = (int32_t)handle;
+    dbg64_str("[FD64] sock alias fd=");
+    dbg64_dec((uint64_t)fd);
+    dbg64_str(" h=");
+    dbg64_dec((uint64_t)handle);
+    dbg64_nl();
+    return 0;
+}
+int fd64_sock_alias_get64(int fd) {
+    if (fd < 0 || fd >= (int)FD64_MAX) return -1;
+    FdTable64* t = fd64_current_table64();
+    if (!t || !t->used) return -1;
+    return (int)t->sock_alias[fd];
+}
+void fd64_sock_alias_clear64(int fd) {
+    if (fd < 0 || fd >= (int)FD64_MAX) return;
+    FdTable64* t = fd64_current_table64();
+    if (t) t->sock_alias[fd] = 0;
+}
+int fd64_sock_alias_find64(int handle) {
+    if (handle <= 0) return -1;
+    FdTable64* t = fd64_current_table64();
+    if (!t || !t->used) return -1;
+    for (int i = 0; i < (int)FD64_MAX; i++)
+        if (t->sock_alias[i] == (int32_t)handle) return i;
+    return -1;
 }
 
 // ==================== 对象分配 / 释放 ====================
@@ -253,6 +295,7 @@ int fd64_table_clone64(FdTable64* dst, const FdTable64* src) {
     dst->cloexec = src->cloexec;                       // ★ fork：FD_CLOEXEC 位随 fd 表一起继承（Linux 同）
     for (uint32_t i = 0; i < FD64_MAX; i++) {
         dst->slot[i] = src->slot[i];
+        dst->sock_alias[i] = src->sock_alias[i];      // ★ v0.9.39：socket 别名随表继承（fork）
         if (dst->slot[i]) {
             dst->slot[i]->refs++;                       // ★ fork：父子共享同一个 OpenFile64
             Pipe64* p = dst->slot[i]->pipe;
@@ -575,6 +618,7 @@ int fd64_where64(int fd, int* out_vol, char* path_out, int cap) {
 }
 
 int fd64_close64(int fd) {
+    fd64_sock_alias_clear64(fd);            // ★ v0.9.39：socket 别名随槽位一起清（真实释放由 syscall 层做）
     FdTable64* t = fd64_current_table64();
     OpenFile64* of = fd64_slot_obj64(t, fd);
     if (!of) return -FD64_EBADF;

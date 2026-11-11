@@ -79,6 +79,10 @@ struct Proc64 {
     uint32_t sigchld;           // 有子可收（子进程退出时置位；SIGCHLD 交给既有 wait4，不投递）
     int32_t  pgid;              // ★ A4-5：进程组 id（fork 继承；create 时 = 自己的 pid；setpgid(109) 改）
     uint32_t alarm_sec;         // alarm() 记录的秒数（无投递；SIGALRM 不产生信号 —— 如实）
+    // ★ v0.9.39：ITIMER_REAL / alarm()（SIGALRM 的**真**来源）。以前 alarm 只记录、不投递，
+    //   于是 busybox `ping` 的 setitimer 节拍根本不会发生（只发 1 个包就卡在 recvfrom）。
+    uint32_t itimer_iv_ms;      // 重装间隔（0 = 一次性）
+    uint64_t itimer_next_tick;  // 下次到期的 tick（0 = 未装）
     uint64_t fs_base;           // IA32_FS_BASE（TLS；glibc 的 arch_prctl(ARCH_SET_FS)）
     uint64_t cr3;               // 该进程的页表根（物理地址）——切任务时装载
     uint64_t pml4_phys;         // 我们自己分配的 PML4 页（释放用）
@@ -1857,7 +1861,71 @@ int proc64_alarm_set64(int sec) {
     if (!p) return -P64_EINVAL;
     const int prev = (int)p->alarm_sec;
     p->alarm_sec = (sec > 0) ? (uint32_t)sec : 0u;
+    // ★ v0.9.39：alarm() 现在是**真定时器** —— 到期由 proc64_itimer_tick64() 投递 SIGALRM
+    //   （一次性；与 setitimer(ITIMER_REAL) 用同一套状态）。sec<=0 等于取消。
+    if (sec > 0) {
+        p->itimer_iv_ms     = 0;
+        p->itimer_next_tick = g_ticks64 + (uint64_t)sec * (uint64_t)PIT_HZ_64;
+    } else {
+        p->itimer_iv_ms     = 0;
+        p->itimer_next_tick = 0;
+    }
     return prev;
+}
+
+// ★ v0.9.39：setitimer(ITIMER_REAL) —— Linux 形状，本层收"毫秒"。
+//   为什么只做 ITIMER_REAL：它就是 SIGALRM 的那一路（busybox `ping` 的节拍来源）；
+//   ITIMER_VIRTUAL/PROF 需要 CPU 时间记账，本内核没有，**如实**返回 -EINVAL 而不是假装成功。
+int64_t proc64_setitimer64(int which, uint64_t val_ms, uint64_t iv_ms, uint64_t* out_old) {
+    Proc64* p = p64_current64();
+    if (!p) return -P64_EINVAL;
+    if (which != 0) return -22;                                    // -EINVAL
+    const uint64_t prev_left = (p->itimer_next_tick > g_ticks64)
+        ? (p->itimer_next_tick - g_ticks64) * 1000u / (uint64_t)PIT_HZ_64 : 0u;
+    if (out_old) { out_old[0] = prev_left; out_old[1] = (uint64_t)p->itimer_iv_ms; }
+    if (val_ms == 0 && iv_ms == 0) {                               // 解除
+        p->itimer_iv_ms = 0;
+        p->itimer_next_tick = 0;
+        dbg64_str("[PROC64] setitimer pid=");
+        dbg64_dec((uint64_t)p->pid);
+        dbg64_str(" disarmed");
+        dbg64_nl();
+        return 0;
+    }
+    const uint64_t first = val_ms ? val_ms : iv_ms;
+    uint64_t ticks = (first * (uint64_t)PIT_HZ_64 + 999u) / 1000u;
+    if (ticks == 0) ticks = 1;                                     // 0ms 也要能"立刻"触发一次
+    p->itimer_iv_ms     = (uint32_t)iv_ms;
+    p->itimer_next_tick = g_ticks64 + ticks;
+    dbg64_str("[PROC64] setitimer pid=");
+    dbg64_dec((uint64_t)p->pid);
+    dbg64_str(" first_ms=");
+    dbg64_dec(first);
+    dbg64_str(" iv_ms=");
+    dbg64_dec(iv_ms);
+    dbg64_str(" next_tick=");
+    dbg64_dec(p->itimer_next_tick);
+    dbg64_nl();
+    return 0;
+}
+
+// ★ v0.9.39：到期扫描（kheart 的 16 Hz 切片调用）。到期 -> 投递 SIGALRM -> 重装或解除。
+void proc64_itimer_tick64() {
+    for (int i = 0; i < PROC64_MAX; i++) {
+        Proc64* p = &g_procs[i];
+        if (p->state == PROC64_FREE) continue;
+        if (!p->itimer_next_tick || g_ticks64 < p->itimer_next_tick) continue;
+        const int pid = (int)p->pid;
+        if (p->itimer_iv_ms) {
+            uint64_t d = (uint64_t)p->itimer_iv_ms * (uint64_t)PIT_HZ_64 / 1000u;
+            if (d == 0) d = 1;
+            p->itimer_next_tick = g_ticks64 + d;
+        } else {
+            p->itimer_next_tick = 0;
+            p->alarm_sec = 0;
+        }
+        if (pid > 0) (void)sig64_send_itimer64(pid);
+    }
 }
 
 // ==================== /proc64.elf 的幂等安装（字节在系统卷/原始区，不在内核里）====================

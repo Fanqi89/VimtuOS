@@ -138,6 +138,11 @@
 #include "vfs64.h"          // Linux open/read 走真实文件系统
 #include "fd64.h"           // 批次 B：FD 层（open/read/write/close/lseek/fstat/dup 的公共底座）
 #include "sock64.h"         // ★ v0.7.4（P2 第三批）：Linux socket 层（AF_INET）
+
+// ★ v0.9.39：fd -> socket handle 的翻译（定义在 socket 段，使用点在 close/dup2 等更前面）
+#ifndef VIMTU_INSTALLER_MEDIA
+static int sc64_sock_handle_of_fd(uint64_t fd);
+#endif
 #include "input64.h"        // ★ A5 前置：自有 ABI 12 的落点 ev64_poll64（事件队列/焦点/背压）
 #include "fs64.h"           // ★ P4：统一卷分派（stat/access/chmod/chown 按当前卷 + 权限判定）
 #include "drive64.h"        // ★ v0.9.29：合成 /proc/mounts 要盘符/分区号（设备名 /dev/sda2）
@@ -1019,6 +1024,23 @@ static int64_t lx64_close64(uint64_t nr, uint64_t fd) {
         const int64_t pc = lx64_proc_close64((int)fd);
         if (pc != -9999) return pc;
     }
+#ifndef VIMTU_INSTALLER_MEDIA
+    {   // ★ v0.9.39：socket（或它的别名槽）关闭。
+        //   两种形态要分开（这是 xmove_fd = dup2 + close(原 handle) 的关键）：
+        //     ① 关的是**别名槽**（fd 0..31）：真释放 socket；
+        //     ② 关的是**原始 handle**：如果这个 socket 已经被挪进某个槽，只放掉号码，
+        //        绝不释放 —— 否则 busybox 的 `ping` 一 xmove_fd 就把自己的 socket 关死了。
+        const int sh = sc64_sock_handle_of_fd(fd);
+        if (sh > 0) {
+            if (fd < (uint64_t)FD64_MAX) {
+                fd64_sock_alias_clear64((int)fd);
+                return sock64_close64(sh) == 0 ? 0 : -LX64_EBADF;
+            }
+            if (fd64_sock_alias_find64(sh) >= 0) return 0;      // 号码放掉，socket 活着
+            return sock64_close64(sh) == 0 ? 0 : -LX64_EBADF;
+        }
+    }
+#endif
     if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     if (fd <= 2 && !fd64_slot_used64((int)fd)) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     const int r = fd64_close64((int)fd);
@@ -2214,12 +2236,45 @@ static int64_t lx64_select64(uint64_t nr, uint64_t nfds, uint64_t rd_va, uint64_
 // \u5b9e\u5982\u8fb9\u754c\uff1asocket handle \u4e0d\u80fd\u76f4\u63a5\u4e22\u7ed9 poll/select\uff08\u90a3\u91cc\u6309 fd \u8868\u67e5\uff09\u3002
 #ifndef VIMTU_INSTALLER_MEDIA      // 安装程序内核不带 socket 层（无网络）：实现与 case 都不编
 static int64_t lx64_socket64(uint64_t nr, uint64_t dom, uint64_t type, uint64_t proto) {
-    (void)nr; (void)proto;
-    if (dom != 2u) return -97;                                // -EAFNOSUPPORT\uff08\u53ea\u652f\u6301 AF_INET\uff09
-    const int t = (int)(type & 0xFu);                          // \u53bb\u6389 SOCK_NONBLOCK/CLOEXEC \u4f4d
-    const int h = sock64_create64(t == 1 ? SOCK64_T_TCP : (t == 2 ? SOCK64_T_UDP : 0));
-    if (h < 0) return -24;                                    // -EMFILE\uff08\u5b9e\u4f8b\u7528\u5c3d\uff09
+    (void)nr;
+    if (dom != 2u) return -97;                                // -EAFNOSUPPORT（只支持 AF_INET）
+    const int t = (int)(type & 0xFu);                          // 去掉 SOCK_NONBLOCK/CLOEXEC 位
+    int k = 0;
+    if (t == 1) k = SOCK64_T_TCP;
+    else if (t == 2) k = SOCK64_T_UDP;
+    // ★ v0.9.39：SOCK_RAW(3) + IPPROTO_ICMP(1) = busybox `ping` 要的那种 socket。
+    //   只放行 ICMP 这一种原始协议（其它 raw 协议一律 -EPROTONOSUPPORT，不假装支持）。
+    else if (t == 3 && proto == 1u) k = SOCK64_T_ICMP;
+    else if (t == 3) return -93;                              // -EPROTONOSUPPORT
+    const int h = sock64_create64(k);
+    if (h < 0) return -24;                                    // -EMFILE（实例用尽）
+    dbg64_str("[SOCK64] create dom=2 type=");
+    dbg64_dec((uint64_t)t);
+    dbg64_str(" proto=");
+    dbg64_dec(proto);
+    dbg64_str(" h=");
+    dbg64_dec((uint64_t)h);
+    dbg64_str(" ok=1");
+    dbg64_nl();
     return (int64_t)h;
+}
+
+// ★ v0.9.39：bind(49)。raw ICMP 必须能成功（busybox 的 xbind 失败即整个退出）。
+//   非 socket 的 fd 仍保留既有 -EOPNOTSUPP 语义，不改变别人的行为。
+// 前向声明：lx64_bind_s64 要用它，而它的定义在这个文件更下面（sockaddr_in 解析）
+static int lx64_sockaddr_in64(uint64_t nr, uint64_t va, uint32_t* ip_out, uint16_t* port_out);
+
+static int64_t lx64_bind_s64(uint64_t nr, uint64_t fd, uint64_t va, uint64_t len) {
+    (void)len;
+    const int sh = sc64_sock_handle_of_fd(fd);
+    if (sh < 0) return -95;                                   // -EOPNOTSUPP（不是 socket）
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    const int rc = lx64_sockaddr_in64(nr, va, &ip, &port);
+    if (rc != 0) return rc;
+    const int b = sock64_bind64(sh, ip, port);
+    if (b == 0) return 0;
+    return (b == -88) ? -88 : -22;
 }
 
 // sockaddr_in\uff1afamily(2) port(2, \u7f51\u7edc\u5e8f) addr(4, \u7f51\u7edc\u5e8f)
@@ -2243,7 +2298,9 @@ static int64_t lx64_connect_s64(uint64_t nr, uint64_t fd, uint64_t va, uint64_t 
     uint16_t port = 0;
     const int rc = lx64_sockaddr_in64(nr, va, &ip, &port);
     if (rc != 0) return rc;
-    const int c = sock64_connect64((int)fd, ip, port, 3000);
+    const int sh = sc64_sock_handle_of_fd(fd);
+    if (sh < 0) return -88;
+    const int c = sock64_connect64(sh, ip, port, 3000);
     if (c == 0) return 0;
     return (c == -2) ? -110 : -111;                           // ETIMEDOUT / ECONNREFUSED
 }
@@ -2257,9 +2314,11 @@ static int64_t lx64_sendto_s64(uint64_t nr, uint64_t fd, uint64_t buf_va, uint64
         uint16_t port = 0;
         const int rc = lx64_sockaddr_in64(nr, addr_va, &ip, &port);
         if (rc != 0) return rc;
-        sock64_sendto_target64((int)fd, ip, port);
+        sock64_sendto_target64(sc64_sock_handle_of_fd(fd), ip, port);
     }
-    const int n = sock64_send64((int)fd, (const void*)(uintptr_t)buf_va, (int)len);
+    const int sh = sc64_sock_handle_of_fd(fd);
+    if (sh < 0) return -LX64_EBADF;
+    const int n = sock64_send64(sh, (const void*)(uintptr_t)buf_va, (int)len);
     return n < 0 ? -32 : (int64_t)n;                          // -EPIPE
 }
 
@@ -2267,12 +2326,17 @@ static int64_t lx64_recvfrom_s64(uint64_t nr, uint64_t fd, uint64_t buf_va, uint
                                  uint64_t flags, uint64_t addr_va, uint64_t addr_len_va) {
     (void)flags;
     if (!user64_range_ok64(buf_va, len)) { syscall64_deny64(nr, buf_va); return -LX64_EFAULT; }
-    const int n = sock64_recv64((int)fd, (void*)(uintptr_t)buf_va, (int)len, 3000);
+    // ★ v0.9.39：-EINTR 要原样透出（busybox `ping` 的 recvfrom 只在 errno==EINTR 时安静重试；
+    //   被包成 -ECONNRESET 就会每被打断一次刷一行错误）。
+    const int sh = sc64_sock_handle_of_fd(fd);
+    if (sh < 0) return -LX64_EBADF;
+    const int n = sock64_recv64(sh, (void*)(uintptr_t)buf_va, (int)len, 3000);
+    if (n == -4) return -4;                                   // ★ v0.9.39：-EINTR 原样透出
     if (n < 0) return -104;                                   // -ECONNRESET
-    if (addr_va) {                                            // \u56de\u586b\u6e90\u5730\u5740\uff08UDP\uff09
+    if (addr_va) {                                            // 回填源地址（UDP / ICMP 都回）
         uint32_t ip = 0;
         uint16_t port = 0;
-        if (sock64_getname64((int)fd, &ip, &port, 1) == 0 && user64_range_ok64(addr_va, 16)) {
+        if (sock64_getname64(sh, &ip, &port, 1) == 0 && user64_range_ok64(addr_va, 16)) {
             uint8_t* q = (uint8_t*)(uintptr_t)addr_va;
             q[0] = 2; q[1] = 0;
             q[2] = (uint8_t)(port >> 8); q[3] = (uint8_t)port;
@@ -2288,7 +2352,9 @@ static int64_t lx64_recvfrom_s64(uint64_t nr, uint64_t fd, uint64_t buf_va, uint
 static int64_t lx64_sockname_s64(uint64_t nr, uint64_t fd, uint64_t va, uint64_t len_va, int peer) {
     uint32_t ip = 0;
     uint16_t port = 0;
-    if (sock64_getname64((int)fd, &ip, &port, peer) != 0) return -88;   // -ENOTSOCK
+    const int sh = sc64_sock_handle_of_fd(fd);
+    if (sh < 0) return -88;                                   // -ENOTSOCK
+    if (sock64_getname64(sh, &ip, &port, peer) != 0) return -88;
     if (va) {
         if (!user64_range_ok64(va, 16)) { syscall64_deny64(nr, va); return -LX64_EFAULT; }
         uint8_t* q = (uint8_t*)(uintptr_t)va;
@@ -2387,15 +2453,46 @@ static int64_t lx64_futex64(uint64_t nr, uint64_t uaddr, uint64_t op, uint64_t v
     return -LX64_ENOSYS;
 }
 
+// 安装介质内核不链 proc64.cpp（没有进程表），这里用**弱引用**：缺了就当不支持，
+// 绝不制造未定义符号（本仓既有规矩，同 netraw64_* 的弱引用）。
+int64_t proc64_setitimer64(int which, uint64_t val_ms, uint64_t iv_ms, uint64_t* out_old)
+    __attribute__((weak));
+
+// ★ v0.9.39：setitimer(38)。Linux 的 struct itimerval =
+//   { struct timeval it_interval; struct timeval it_value; }，每项 { long tv_sec; long tv_usec; }
+//   => 4 × 8 字节 = 32 字节。只有 ITIMER_REAL(0) 有真实现（SIGALRM）。
+//   ★ 放在 socket 的 #ifndef VIMTU_INSTALLER_MEDIA 之外：定时器不需要网络，
+//     安装介质内核也该有它。
+static int64_t lx64_setitimer64(uint64_t nr, uint64_t which, uint64_t new_va, uint64_t old_va) {
+    if (!proc64_setitimer64) return -LX64_ENOSYS;              // 没有进程表的内核：如实不支持
+    uint64_t val_ms = 0, iv_ms = 0;
+    if (new_va) {
+        if (!user64_range_ok64(new_va, 32)) { syscall64_deny64(nr, new_va); return -LX64_EFAULT; }
+        const int64_t* q = (const int64_t*)(uintptr_t)new_va;
+        if (q[0] > 0 || q[1] > 0) iv_ms  = (uint64_t)((q[0] > 0 ? q[0] : 0) * 1000 + (q[1] > 0 ? q[1] : 0) / 1000);
+        if (q[2] > 0 || q[3] > 0) val_ms = (uint64_t)((q[2] > 0 ? q[2] : 0) * 1000 + (q[3] > 0 ? q[3] : 0) / 1000);
+    }
+    uint64_t old[2] = {0, 0};
+    const int64_t r = proc64_setitimer64((int)which, val_ms, iv_ms, old_va ? old : nullptr);
+    if (r != 0) return r;
+    if (old_va) {
+        if (!user64_range_ok64(old_va, 32)) return -LX64_EFAULT;
+        int64_t* o = (int64_t*)(uintptr_t)old_va;
+        o[0] = (int64_t)(old[1] / 1000u); o[1] = (int64_t)((old[1] % 1000u) * 1000u);
+        o[2] = (int64_t)(old[0] / 1000u); o[3] = (int64_t)((old[0] % 1000u) * 1000u);
+    }
+    return 0;
+}
+
 static int64_t lx64_pause64() {
-    // pause(2) 在 Linux 上是"睡到收到信号"。本内核不投递信号，所以永远等不到 ——
-    // 有界等待 1 秒后如实返回 -EINTR（"被信号打断"），绝不死等。
+    // pause(2) 在 Linux 上是"睡到收到信号"。本内核的 SIGALRM 只有 ITIMER 到期才会来，
+    // 所以这里做**有界等待**并如实返回 -EINTR，绝不死等（与 alarm/setitimer 的语义一致）。
     if (task_sleep_ms64) task_sleep_ms64(1000);
     return -LX64_EINTR;
 }
 static int64_t lx64_alarm64(uint64_t sec) {
     const int prev = lx64_have_proc64() ? proc64_alarm_set64((int)sec) : 0;
-    return prev < 0 ? 0 : (int64_t)prev;                 // 只记录，不投递 SIGALRM
+    return prev < 0 ? 0 : (int64_t)prev;                 // ★ v0.9.39：到期真投递 SIGALRM（proc64_itimer_tick64）
 }
 
 // ---- 96）gettimeofday / 97）getrlimit / 160）setrlimit / 318）getrandom ----
@@ -2465,11 +2562,36 @@ static int64_t lx64_getrandom64(uint64_t nr, uint64_t buf, uint64_t len, uint64_
 //   外部用户程序重定向自己的 stdout/stderr、把某个 fd 作为 0/1/2 传给子进程都靠它）。
 //   newfd == oldfd：Linux 语义 = 不动、直接返回（但 oldfd 必须有效）。
 // 32）dup 与 33）dup2 共用下面这一条路径（newfd >= 0 = 指定槽位，newfd < 0 = 自动分配）
+// ★ v0.9.39：把"用户给的 fd"翻译成 socket handle。两种写法都要认：
+//   ① 直接用 handle（>= SOCK64_FD_BASE，curl/apk 那批就是这么用的）；
+//   ② dup2(sock, 0..31) 之后的**别名槽**（busybox `ping` 的 xmove_fd(sock, 0) 走这条）。
+//   安装介质内核没有 socket 层：整段被 #ifndef VIMTU_INSTALLER_MEDIA 圈住，不会引到未定义符号。
+#ifndef VIMTU_INSTALLER_MEDIA
+static int sc64_sock_handle_of_fd(uint64_t fd) {
+    if (fd >= SOCK64_FD_BASE && sock64_is_socket64((int)fd)) return (int)fd;
+    if (fd < (uint64_t)FD64_MAX) {
+        const int alias = fd64_sock_alias_get64((int)fd);
+        if (alias > 0 && sock64_is_socket64(alias)) return alias;
+    }
+    return -1;
+}
+#endif
+
 static int64_t lx64_dup64(uint64_t fd) {
     const int nf = fd64_dup64((int)fd, -1);              // -1 = 自动分配新槽（>= 3）
     return (int64_t)nf;
 }
 static int64_t lx64_dup2_64(uint64_t oldfd, uint64_t newfd) {
+#ifndef VIMTU_INSTALLER_MEDIA
+    {   // ★ v0.9.39：dup2(socket, 0..31) —— busybox `ping` 的 xmove_fd(sock, 0) 正是这一条
+        const int sh = sc64_sock_handle_of_fd(oldfd);
+        if (sh > 0) {
+            if (newfd >= (uint64_t)FD64_MAX) return -LX64_EBADF;
+            if (oldfd != newfd && fd64_sock_alias_set64((int)newfd, sh) != 0) return -LX64_EBADF;
+            return (int64_t)newfd;
+        }
+    }
+#endif
     if (newfd >= (uint64_t)FD64_MAX) return -LX64_EBADF;
     if (oldfd == newfd) return fd64_slot_used64((int)oldfd) ? (int64_t)newfd : -LX64_EBADF;
     const int nf = fd64_dup64((int)oldfd, (int)newfd);   // 0..31（含换标准流）；负错误码原样上报
@@ -3275,7 +3397,7 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 44:  return lx64_sendto_s64(nr, a1, a2, a3, a4, a5, a6); // ★ v0.7.4：sendto / send
     case 45:  return lx64_recvfrom_s64(nr, a1, a2, a3, a4, a5, a6); // ★ v0.7.4：recvfrom / recv
     case 48:  return lx64_sock_close64(a1);                       // ★ v0.7.4：shutdown ≈ close
-    case 49:  return -95;                                        // ★ v0.7.4：bind 暂不支持
+    case 49:  return lx64_bind_s64(nr, a1, a2, a3);              // ★ v0.9.39：bind（raw ICMP/UDP 真支持；TCP 仍 -EOPNOTSUPP）
     case 50:  return -95;                                        // ★ v0.7.4：listen 不支持
     case 51:  return lx64_sockname_s64(nr, a1, a2, a3, 0);        // ★ v0.7.4：getsockname
     case 52:  return lx64_sockname_s64(nr, a1, a2, a3, 1);        // ★ v0.7.4：getpeername
@@ -3285,6 +3407,7 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 270: return lx64_ppoll64(nr, a1, a2, a3, a4, a5);         // ★ v0.7.1：pselect6 ≈ ppoll（忽略 sigmask）
     case 271: return lx64_ppoll64(nr, a1, a2, a3, a4, a5);         // ★ v0.7.1：ppoll
     case 37:  return lx64_alarm64(a1);                              // 只记录，不投递 SIGALRM
+    case 38:  return lx64_setitimer64(nr, a1, a2, a3);           // ★ v0.9.39：setitimer(ITIMER_REAL) -> SIGALRM
     case 39:  return lx64_getpid64();
     case 56:  return lx64_clone64(nr, r, a1);                        // 只支持 flags=0/SIGCHLD
     case 57:  return lx64_fork64(nr, r);

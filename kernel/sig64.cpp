@@ -452,6 +452,14 @@ static int64_t sig64_send_one64(int tpid, int sig, const char* src, int group) {
     }
     return 0;
 }
+// ★ v0.9.39：ITIMER_REAL / alarm() 到期 -> SIGALRM（src=itimer）
+// 为什么走 sig64_send_one64 而不是自己置位：投递时机（syscall 出口 / IRQ 抢占出口）、
+// SIG_IGN、屏蔽字、默认动作（终止 128+14）全在那一条路径上，不能另开一套。
+int64_t sig64_send_itimer64(int pid) {
+    if (pid <= 0) return -SIG64_ESRCH;
+    return sig64_send_one64(pid, SIG64_ALRM, "itimer", 0);
+}
+
 int64_t sig64_sys_kill64(int pid, int sig) {
     if (sig < 0 || sig >= 64) return -SIG64_EINVAL;
     if (sig == 0) return 0;                               // kill(pid, 0)：存在性检查（不投递）

@@ -3560,6 +3560,58 @@ def cap_vfs_quota():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_busybox_ping():
+    """★ v0.9.39「BusyBox `ping` 真跑通」：能力清单里“终端里 ping 得通”。
+
+    本批前为什么不可能（三条都有实测证据）：
+      1. `kernel/sock64.cpp` 明确「没有做的：SOCK_RAW」，而 busybox 的 ping 必须
+         `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)`（networking/ping.c:225）；
+      2. socket handle 不进 fd 表，而 busybox 是 `enum { pingsock = 0 }` + `xmove_fd(sock, 0)`
+         —— 它把 raw socket **挪到 fd 0** 再用（实测 `ping: can't duplicate file descriptor`）；
+      3. `alarm(37)` 只记录不投递、`setitimer(38)` 根本没实现 —— ping 的 1 秒节拍
+         正是 `setitimer(ITIMER_REAL)` + SIGALRM 驱动的；另外 busybox 当时是
+         `CONFIG_FEATURE_FANCY_PING=n` 的“精简 ping”，**完全不解析选项**（`-c` 被当主机名）。
+
+    本批做的：
+      * sock64 新增 `SOCK64_T_ICMP`：create / bind / sendto / recvfrom / rx 分发（ICMP 报文含 8 字节头）；
+      * fd64 新增**每进程每槽 socket 别名**（dup2 建立 / close 清除 / fork 随表复制），
+        并修正 close 语义：关原始 handle 时若已被挪进槽，只放号码不释放；
+      * proc64 新增 ITIMER_REAL 状态 + 到期扫描（kheart 16 Hz），sig64 新增 `sig64_send_itimer64`；
+        `alarm()` 从“只记录”变成真投递 SIGALRM；recvfrom 被信号打断时透出 -EINTR；
+      * net64 把 ICMP echo reply 交给 socket 层（只交 type=0，不假装支持其它类型）；
+      * busybox 构建配置打开 `CONFIG_FEATURE_FANCY_PING=y` 并加入构建期断言。
+
+    如实边界：只做 ICMPv4 echo（不做 ICMPv6 / 其它原始协议 / 广播 ping / -I 绑接口）；
+      socket 别名不做引用计数（同一 socket 挪进多槽时，任一槽 close 都会关掉它）。
+    """
+    need = ["kernel/sock64.cpp", "kernel/sock64.h", "kernel/fd64.cpp", "kernel/fd64.h",
+            "kernel/proc64.cpp", "kernel/net64.cpp", "tests/netping64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    icmp = grep_count(r"SOCK64_T_ICMP", ["kernel/sock64.h", "kernel/sock64.cpp"])
+    alias = grep_count(r"fd64_sock_alias_(set|get|find)64", ["kernel/fd64.cpp", "kernel/fd64.h"])
+    timer = grep_count(r"proc64_itimer_tick64|proc64_setitimer64", ["kernel/proc64.cpp"])
+    alarm = grep_count(r"sig64_send_itimer64", ["kernel/sig64.cpp", "kernel/sig64.h"])
+    route = grep_count(r"sock64_rx64\(1,", ["kernel/net64.cpp"])
+    fancy = grep_count(r"CONFIG_FEATURE_FANCY_PING", ["user/busybox/bb_config.py"])
+    ev = [
+        "raw ICMP socket：`SOCK64_T_ICMP` 命中 %d 处（create/bind/sendto/recvfrom/rx）" % icmp,
+        "fd 别名：`fd64_sock_alias_*` 命中 %d 处（序列 dup2 建立、close 清除、fork 随表复制）" % alias,
+        "ITIMER_REAL：`proc64_setitimer64`/`proc64_itimer_tick64` 命中 %d 处（kheart 16 Hz 扫描）" % timer,
+        "SIGALRM：`sig64_send_itimer64` 命中 %d 处（src=itimer，走既有投递路径）" % alarm,
+        "收包路由：`net64.cpp` 把 echo reply 交给 socket 层（命中 %d）" % route,
+        "busybox：`CONFIG_FEATURE_FANCY_PING` 命中 %d 处（开着的时候才会解析 -c）" % fancy,
+        "验收：`tests/netping64_test.py` **13/13 PASS**（raw ICMP 建的出来 / fd 别名生效 / "
+        "1 秒节拍 / 3 个不同 seq / SIGALRM ≥2 次 / "
+        "`3 packets transmitted, 3 packets received` / `0% packet loss` / 3 行 64 bytes from）",
+        "★ 如实边界：只做 ICMPv4 echo；没有 ICMPv6、广播 ping、`-I` 绑接口（bind 路径已通，"
+        "busybox 不带 -I 时不调）；socket 别名不做引用计数",
+    ]
+    done = icmp > 0 and alias > 0 and timer > 0 and alarm > 0 and route > 0 and fancy > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 def cap_power_mgmt():
     """★ 本批「ACPI 电源管理收口」：能力清单里 "点关机真能断电 / 重启用固件复位寄存器"。
 
@@ -3883,10 +3935,14 @@ CAPS = [
     ("内核", "★ ACPI 电源管理收口（关机走 FADT PM1a_CNT_BLK + DSDT _S5 的 SLP_TYPa、"
              "断电阶梯、删除会把关机变重启的 8042 复位脉冲；重启用 FADT RESET_REG）",
      cap_power_mgmt),
+    ("网络", "★ BusyBox `ping` 真跑通（SOCK_RAW/IPPROTO_ICMP + fd 0 别名 + ITIMER_REAL/SIGALRM；"
+             "busybox 开启 FEATURE_FANCY_PING）", cap_busybox_ping),
 ]
 
 
 TESTS = [
+    ("netping64_test.py", "★ v0.9.39 busybox `ping -c 3`：raw ICMP socket / fd 0 别名 / "
+                          "ITIMER_REAL 1 秒节拐 / 3 个不同 seq / 3 发 3 收 0 丢包 / 3 行 64 bytes from"),
     ("power64_test.py", "★ 本批 ACPI 电源管理：开机 ACPI 电源行 / 关机端口 == FADT / SLP_EN=1 / "
                         "QEMU 进程真退出 / 串口里 [ACPI64] rsdp= 只有 1 次（= 不是重启）"),
     ("boot64_assert.py", "M0/M1：长模式/IDT/PIT/BootInfo"),

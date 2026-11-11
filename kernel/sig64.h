@@ -140,6 +140,10 @@ void sig64_deliver64(pt_regs64* r, const char* where);
 //   写端发现读端全关时，write 返回 -EPIPE **并**投递 SIGPIPE；默认动作 = 终止，退出码 128+13=141）。
 //   没有进程上下文（任务 0 / 安装介质内核）时什么都不做；handler 是 SIG_IGN 时不置位（Linux 同）。
 void sig64_raise64(int sig);
+// ★ v0.9.39：ITIMER_REAL / alarm() 到期投递 SIGALRM（供 busybox `ping` 的 setitimer 节拍）。
+//   语义 = Linux 的 ITIMER_REAL -> SIGALRM（src 打点标 itimer，不是 kill）。
+//   目标进程不存在返回 -ESRCH；成功 0。
+int64_t sig64_send_itimer64(int pid);
 // ★ 必须是 extern "C"：x86_64.cpp 的异常路径用**弱引用**取它（安装介质内核不链 sig64.cpp），
 //   弱符号按 C 名解析 —— 若这里是 C++ 名字（_Z19sig64_user_fault64mP9pt_regs64），弱引用永远
 //   解析不到、静默变成 0（症状：用户态 #PF/#GP 照旧 [PANIC]，本模块一行都进不来 —— 实测踩过）。

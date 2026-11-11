@@ -212,7 +212,10 @@ SETTINGS = {
     "CONFIG_FEATURE_WGET_FTP": "n",
     "CONFIG_FEATURE_WGET_OPENSSL": "n",
     "CONFIG_FEATURE_WGET_HTTPS": "n",
-    "CONFIG_FEATURE_FANCY_PING": "n",
+    # ★ v0.9.39：必须开。关着时是“精简 ping”（ping.c 的 #else 分支）：
+    #   `G.hostname = *argv`根本不解析选项 -> `ping -c 3 host` 把 "-c" 当主机名
+    #   （实测 `ping: bad address '-c'`），且没有 1 秒间隔与统计行。
+    "CONFIG_FEATURE_FANCY_PING": "y",
     "CONFIG_FEATURE_NTPD_SERVER": "n",
     "CONFIG_FEATURE_NTPD_CONF": "n",
     "CONFIG_FEATURE_TFTP_GET": "n",
@@ -271,7 +274,7 @@ REQUIRED = [
     "CONFIG_OD", "CONFIG_HEXDUMP", "CONFIG_CHMOD", "CONFIG_VI", "CONFIG_ED",
     "CONFIG_PS", "CONFIG_KILL", "CONFIG_DF", "CONFIG_UNAME", "CONFIG_ID",
     "CONFIG_WHOAMI", "CONFIG_TAR", "CONFIG_GZIP", "CONFIG_GUNZIP",
-    "CONFIG_WGET", "CONFIG_PING",
+    "CONFIG_WGET", "CONFIG_PING", "CONFIG_FEATURE_FANCY_PING",
 ]
 
 # /bin/<name> 包装程序（= 用 execve 把自己换成 /bin/busybox，
