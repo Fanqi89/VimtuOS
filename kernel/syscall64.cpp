@@ -327,7 +327,7 @@ static void syscall64_log64(uint64_t nr, uint64_t rdi, uint64_t rsi, uint64_t rd
 //   约 25 行/秒、单次运行 1 MB 串口）；它们是框架内部心跳，不是"用户态看见了内核什么"，
 //   所以**不进 trace**。Linux 真号与本框架之外的号一律照旧逐条打印。
 static bool syscall64_trace_skip64(uint64_t nr) {
-    return (nr >= 1029ull && nr <= 1035ull);
+    return (nr >= 1029ull && nr <= 1036ull);      // ★ v0.9.40：+ WRITE(1036)
 }
 static void syscall64_log_insn64(uint64_t nr, uint64_t rdi, uint64_t rsi, uint64_t rdx, int64_t ret) {
     dbg64_line_begin64();
@@ -3488,6 +3488,7 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case R3DRV_NR_KICK:   return r3drv64_kick64((int32_t)a1);    // 门铃：消费共享环
     case R3DRV_NR_DMA:    return r3drv64_dma_read64((int32_t)a1, a2, a3, (uint32_t)a4);   // 单发零拷贝
     case R3DRV_NR_COPY:   return r3drv64_copy_read64((int32_t)a1, a2, a3, (uint32_t)a4);  // 单发对照
+    case R3DRV_NR_WRITE:  return r3drv64_write64((int32_t)a1, a2, a3, (uint32_t)a4);      // ★ v0.9.40 单发零拷贝写
     case R3DRV_NR_STATUS: {                         // (slot, out R3drvInfo, len)
         if (!user64_range_ok64(a2, a3) || a3 < (uint64_t)sizeof(R3drvInfo)) {
             syscall64_deny64(nr, a2);

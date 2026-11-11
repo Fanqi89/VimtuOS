@@ -42,6 +42,13 @@
 // 正常驱动一个字节都不该置这位。
 #define R3DRV_F_COPY       1u
 
+// ★ v0.9.40：bit1 = 1 -> **方向反过来**：把对象帧里的字节写到盘上（lba 起、secs 扇区），
+//   DMA 从共享对象的帧流向盘。**只许追加**：bit0 的语义一个字都不改，老服务不置这一位
+//   -> 行为与 v0.9.33 的只读通道完全一致。
+// 如实边界：写路径同样要求 obj_off 4 KiB 对齐；内核**不做** FLUSH CACHE，也不做任何
+//   卷级事务 —— 落盘顺序（数据 -> 元数据）由 ring3 服务自己负责。
+#define R3DRV_F_WRITE      2u
+
 // ---------- 协议（= 分区上的文件系统类型）----------
 #define R3DRV_PROTO_NONE   0u
 #define R3DRV_PROTO_EXT4   1u
@@ -69,6 +76,7 @@
 #define R3DRV_NR_COPY      1033          // r3drv_copy(shm_id, obj_off, lba, secs)  单发对照
 #define R3DRV_NR_STATUS    1034          // r3drv_status(slot, out R3drvInfo, len)
 #define R3DRV_NR_ROUTE     1035          // r3drv_route(disk, lba)  -> R3DRV_ROUTE_*
+#define R3DRV_NR_WRITE     1036          // ★ v0.9.40 r3drv_write(shm_id, obj_off, lba, secs) 单发零拷贝写
 
 // ---------- 环控制块（56 B，必须落在对象 [0,64)）----------
 struct R3drvRing {

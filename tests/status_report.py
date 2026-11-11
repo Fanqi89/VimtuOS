@@ -3698,6 +3698,51 @@ def cap_r3drv_framework():
     ]
     done = reg > 0 and ring > 0 and zc > 0 and sup > 0 and proc > 0
     return ("DONE" if done else "PARTIAL"), ev
+def cap_r3drv_write():
+    """★ v0.9.40「ring3 零拷贝**写**通道」：v0.9.33 的通道只有"盘 -> 服务页"一个方向 ——
+    文件系统真要写盘时只能退回内核缓冲再 memcpy，零拷贝的收益全吐回去。
+
+    这一项把方向补全（**只追加** ABI，老语义一个字不改）：
+      * `R3DRV_F_WRITE`(bit1)：SQE 置这一位 = 把对象帧里的字节写到盘上；
+      * `ahci64_write_frames64()`：与读逐条对称（一帧一项 PRDT + WRITE DMA EXT 0x35）；
+      * 内核暂存/拷贝路径也按方向分流（非 AHCI 盘走 `ata64_write`，打点仍区分）；
+      * 私有号 `r3drv_write(1036)`（**只许追加**），槽位统计加 `wr_bytes/wr_ops`。
+
+    如实边界：**没有 FLUSH CACHE**（写断电会丢）、没有设备归属仲裁、写方向同样要求
+    obj_off 4 KiB 对齐、内核不做任何卷级事务（落盘顺序由 ring3 服务负责）。
+    """
+    need = ["kernel/r3drv_abi.h", "kernel/ahci64.h", "kernel/ahci64.cpp",
+            "kernel/r3drv64.cpp", "kernel/syscall64.cpp", "user/drivers/ext4svc.c",
+            "tests/ext4write64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    flg = grep_count(r"R3DRV_F_WRITE",
+                     ["kernel/r3drv_abi.h", "kernel/r3drv64.cpp", "user/drivers/ext4svc.c"])
+    wfn = grep_count(r"ahci64_write_frames64",
+                     ["kernel/ahci64.h", "kernel/ahci64.cpp", "kernel/r3drv64.cpp"])
+    nr = grep_count(r"R3DRV_NR_WRITE|r3drv64_write64",
+                    ["kernel/r3drv_abi.h", "kernel/syscall64.cpp", "kernel/r3drv64.cpp"])
+    wt = grep_count(r"wtest", ["user/drivers/ext4svc.c"])
+    ev = [
+        "ABI **只追加**：`R3DRV_F_WRITE`(bit1) + 私有号 `r3drv_write(1036)`；bit0 的拷贝对照语义未动"
+        "（命中 %d 处）" % flg,
+        "AHCI 写方向与读逐条对称：`ahci64_write_frames64()` 一帧一项 PRDT、WRITE DMA EXT(0x35)、"
+        "自报失败现场（tfd/is）；命中 %d 处" % wfn,
+        "内核按 SQE 的 flag 分流：`zerocopy WRITE` / `zerocopy`(读) / `copy-write` / `copy`，"
+        "并累计 `wr_bytes/wr_ops`；私有号命中 %d 处" % nr,
+        "现场自检（服务侧，配置 `wtest=1` 才跑）：确定性 LCG 图案 -> 零拷贝写到夹具空闲块 -> "
+        "零拷贝读回到另一块区域 -> 逐字节 diff + CRC32（命中 %d 处）" % wt,
+        "★ 验收：`tests/ext4write64_test.py` **16/16**（串口 `zerocopy WRITE … copied=0` + "
+        "`[AHCI64] zerocopy write … ok` + `wtest verify … diff=0 match=1`；宿主侧用同一套 LCG + "
+        "zlib.crc32 独立算一遍并**逐字节比对镜像**；变化块集合**恰好** {16000..16007}；既有文件 "
+        "/big.bin、/data.bin 的 size+CRC32 仍 ok）",
+        "★ 回归：`tests/drv64_test.py` 48/48（连跑 3 次；另有 1 次重启失败未能复现，见 docs 记录）",
+        "★ 边界（如实）：没有 FLUSH CACHE（写断电会丢）；非 AHCI 盘走拷贝路径；"
+        "**还没有文件系统写路径**（P1）——本项只证明\"通道能写、写到的是共享页里的字节\"",
+    ]
+    done = flg > 0 and wfn > 0 and nr > 0 and wt > 0
+    return ("DONE" if done else "PARTIAL"), ev
 
 
 def cap_vfs_acl():
@@ -3937,6 +3982,8 @@ CAPS = [
      cap_power_mgmt),
     ("网络", "★ BusyBox `ping` 真跑通（SOCK_RAW/IPPROTO_ICMP + fd 0 别名 + ITIMER_REAL/SIGALRM；"
              "busybox 开启 FEATURE_FANCY_PING）", cap_busybox_ping),
+    ("架构", "★ ring3 驱动通道的**写方向**（R3DRV_F_WRITE + ahci64_write_frames64 + 私有号 "
+             "write(1036)；宿主逐字节核对 + 变化块集合最小）", cap_r3drv_write),
 ]
 
 

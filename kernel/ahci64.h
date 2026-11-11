@@ -112,3 +112,11 @@ bool ahci64_cd_capacity64(int idx, uint32_t* out_sectors, uint32_t* out_bytes);
 bool ahci64_read_frames64(int idx, uint32_t lba, uint32_t count,
                           const uint64_t* frames, uint32_t nframes,
                           uint64_t* out_bytes);
+
+// ★ v0.9.40：零拷贝散列**写**（方向反过来：共享对象的帧 -> 盘）。
+// 与读逐条对称，只换命令码（WRITE DMA EXT 0x35）与 DMA 方向位。
+// 如实边界：**不做 FLUSH CACHE EXT** —— 落盘时机交给控制器缓存；要"写断电也不丢"，
+//   上层必须自己发 flush（本版还没有 flush 语义，写在 ext4svc.c 的注释里）。
+bool ahci64_write_frames64(int idx, uint32_t lba, uint32_t count,
+                           const uint64_t* frames, uint32_t nframes,
+                           uint64_t* out_bytes);

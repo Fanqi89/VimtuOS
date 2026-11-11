@@ -60,6 +60,8 @@ struct R3drvSlotT {
     uint64_t dma_bytes;
     uint64_t dma_ops;
     uint64_t copy_bytes;
+    uint64_t wr_bytes;         // ★ v0.9.40：零拷贝**写**累计字节（方向 = 帧 -> 盘）
+    uint64_t wr_ops;           // ★ v0.9.40：零拷贝**写**累计条数
     uint64_t last_beat;        // 最近一次心跳的 tick
     uint32_t restarts;
     uint32_t fails;
@@ -154,7 +156,8 @@ static const char kR3drvDefaultConf[] =
     "disk=auto\n"
     "beat_ticks=250\n"
     "bench=0\n"
-    "crash=0\n";
+    "crash=0\n"
+    "wtest=0\n";        // ★ v0.9.40：wtest=1 让服务做一次"零拷贝写 + 回读校验"（P0 验收用）
 
 static void r3_cfg_apply_line(const char* line, int len) {
     if (len <= 0 || line[0] == '#') return;
@@ -438,7 +441,7 @@ static int r3_frames_of64(int32_t shm_id, uint32_t* out_pages, uint32_t* out_ref
 // 一条请求的核心：把 [lba, lba+secs) 搬到对象内 [obj_off, obj_off+secs*512)。
 // copy_path=0：DMA 直达对象帧（零拷贝）；copy_path=1：内核暂存 + memcpy（对照）。
 static int r3_do_io64(const R3drvSlotT* s, uint64_t obj_off, uint64_t lba,
-                      uint32_t secs, int copy_path, uint32_t* out_bytes) {
+                      uint32_t secs, int copy_path, int is_write, uint32_t* out_bytes) {
     if (out_bytes) *out_bytes = 0;
     if (secs == 0) return 0;
     if (obj_off < (uint64_t)R3DRV_DATA_OFF || (obj_off & 4095ull) != 0) return -3;   // EINVAL
@@ -450,10 +453,15 @@ static int r3_do_io64(const R3drvSlotT* s, uint64_t obj_off, uint64_t lba,
     if (need > ((uint64_t)(pages - fi0) * 4096ull)) return -3;
 
     if (!copy_path && s->disk >= (uint32_t)ATA64_AHCI_BASE) {
-        // ---- 零拷贝：一帧一项 PRDT，DMA 直接写进服务的页 ----
+        // ---- 零拷贝：一帧一项 PRDT，DMA 直接在服务页与盘之间搬 ----
+        // ★ v0.9.40：is_write=1 时方向反过来（帧 -> 盘），除命令码外与读路径逐条对称。
         uint64_t bytes = 0;
-        if (!ahci64_read_frames64((int)s->disk - ATA64_AHCI_BASE, (uint32_t)lba, secs,
-                                  &g_frames[fi0], pages - fi0, &bytes)) {
+        const bool ok = is_write
+            ? ahci64_write_frames64((int)s->disk - ATA64_AHCI_BASE, (uint32_t)lba, secs,
+                                    &g_frames[fi0], pages - fi0, &bytes)
+            : ahci64_read_frames64((int)s->disk - ATA64_AHCI_BASE, (uint32_t)lba, secs,
+                                   &g_frames[fi0], pages - fi0, &bytes);
+        if (!ok) {
             if (out_bytes) *out_bytes = (uint32_t)bytes;
             return -5;                                                               // EIO
         }
@@ -461,7 +469,8 @@ static int r3_do_io64(const R3drvSlotT* s, uint64_t obj_off, uint64_t lba,
         if (g_zc_logs < 4 || (g_zc_logs % 64) == 0) {
             g_zc_logs++;
             dbg64_line_begin64();
-            dbg64_str("[R3DRV] zerocopy disk="); dbg64_dec((uint64_t)s->disk);
+            dbg64_str(is_write ? "[R3DRV] zerocopy WRITE disk=" : "[R3DRV] zerocopy disk=");
+            dbg64_dec((uint64_t)s->disk);
             dbg64_str(" lba=");                  dbg64_dec(lba);
             dbg64_str(" secs=");                 dbg64_dec((uint64_t)secs);
             dbg64_str(" bytes=");                dbg64_dec(bytes);
@@ -484,29 +493,34 @@ static int r3_do_io64(const R3drvSlotT* s, uint64_t obj_off, uint64_t lba,
     const uint32_t max_sec = g_kbuf_run * 8u;                      // 4 KiB/页 = 8 扇区
     while (done_sec < secs) {
         uint32_t n = secs - done_sec;
-        if (n > max_sec) n = max_sec;                              // 只读"确实连续"的那一段
-        if (!ata64_read((int)s->disk, (uint32_t)(lba + done_sec), n, g_kbuf_pg[0])) return -5;
-        // 拷进对象帧：段首帧对齐（obj_off 已校验 4 KiB 对齐），所以帧内偏移恒为 0
+        if (n > max_sec) n = max_sec;                              // 只动"确实连续"的那一段
+        // 读：盘 -> 暂存页；写：暂存页 -> 盘（所以这里只对读发命令）
+        if (!is_write && !ata64_read((int)s->disk, (uint32_t)(lba + done_sec), n, g_kbuf_pg[0])) return -5;
+        // 帧 <-> 暂存页：段首帧对齐（obj_off 已校验 4 KiB 对齐），所以帧内偏移恒为 0
         uint32_t left = n * 512u;
-        uint32_t src_off = 0;
+        uint32_t off_in_buf = 0;
         uint32_t fi = fi0 + (done_sec / 8u);
         while (left > 0) {
             if (fi >= pages) return -5;
             uint32_t take = left > 4096u ? 4096u : left;
-            uint8_t* dst = (uint8_t*)(uintptr_t)g_frames[fi];
-            const uint8_t* src = g_kbuf_pg[0] + src_off;
+            uint8_t* frame = (uint8_t*)(uintptr_t)g_frames[fi];
+            uint8_t* buf   = g_kbuf_pg[0] + off_in_buf;
+            const uint8_t* src = is_write ? frame : buf;           // ★ 方向在这里体现
+            uint8_t*       dst = is_write ? buf   : frame;
             for (uint32_t k = 0; k < take; k++) dst[k] = src[k];
             copied += take;
-            src_off += take;
+            off_in_buf += take;
             left -= take;
             fi++;
         }
+        if (is_write && !ata64_write((int)s->disk, (uint32_t)(lba + done_sec), n, g_kbuf_pg[0])) return -5;
         done_sec += n;
     }
     if (out_bytes) *out_bytes = copied;
     if (g_cp_logs < 4 || (g_cp_logs % 64) == 0) {
         dbg64_line_begin64();
-        dbg64_str("[R3DRV] copy disk="); dbg64_dec((uint64_t)s->disk);
+        dbg64_str(is_write ? "[R3DRV] copy-write disk=" : "[R3DRV] copy disk=");
+        dbg64_dec((uint64_t)s->disk);
         dbg64_str(" lba=");              dbg64_dec(lba);
         dbg64_str(" secs=");             dbg64_dec((uint64_t)secs);
         dbg64_str(" bytes=");            dbg64_dec((uint64_t)copied);
@@ -649,7 +663,7 @@ int64_t r3drv64_kick64(int32_t shm_id) {
     if (ring->magic != R3DRV_RING_MAGIC) return -3;
     if (ring->ver != R3DRV_ABI_VER)      return -3;
 
-    uint64_t dma_b = 0, copy_b = 0;
+    uint64_t dma_b = 0, copy_b = 0, wr_b = 0;
     uint32_t n = 0;
     uint32_t errs = 0;
     // 就地完成的 SQE：索引 = 生产/消费位置的模
@@ -659,13 +673,15 @@ int64_t r3drv64_kick64(int32_t shm_id) {
         volatile R3drvSqe* q = &sq[pos];
         if (q->state != R3DRV_SQ_PENDING) { ring->tail++; continue; }
         uint32_t bytes = 0;
+        const int is_wr = (q->flags & R3DRV_F_WRITE) ? 1 : 0;
         const int rc = r3_do_io64(s, q->obj_off, q->lba, q->secs,
-                                  (q->flags & R3DRV_F_COPY) ? 1 : 0, &bytes);
+                                  (q->flags & R3DRV_F_COPY) ? 1 : 0, is_wr, &bytes);
         q->bytes = bytes;
         q->state = (rc == 0) ? R3DRV_SQ_DONE : R3DRV_SQ_FAILED;
         if (rc == 0) {
-            if (q->flags & R3DRV_F_COPY) { copy_b += bytes; s->copy_bytes += bytes; }
-            else                         { dma_b  += bytes; s->dma_bytes  += bytes; s->dma_ops++; }
+            if (q->flags & R3DRV_F_COPY)  { copy_b += bytes; s->copy_bytes += bytes; }
+            else if (is_wr)               { wr_b   += bytes; s->wr_bytes   += bytes; s->wr_ops++; }
+            else                          { dma_b  += bytes; s->dma_bytes  += bytes; s->dma_ops++; }
         } else {
             errs++;
             s->fails++;
@@ -685,6 +701,7 @@ int64_t r3drv64_kick64(int32_t shm_id) {
         dbg64_str(" n=");                 dbg64_dec((uint64_t)n);
         dbg64_str(" dma_bytes=");         dbg64_dec(dma_b);
         dbg64_str(" copy_bytes=");        dbg64_dec(copy_b);
+        dbg64_str(" wr_bytes=");          dbg64_dec(wr_b);
         dbg64_str(" errs=");              dbg64_dec((uint64_t)errs);
         dbg64_nl();
         dbg64_line_end64();
@@ -698,10 +715,24 @@ int64_t r3drv64_dma_read64(int32_t shm_id, uint64_t obj_off, uint64_t lba, uint3
     R3drvSlotT* s = r3_slot_by_shm64(shm_id);
     if (!s) return -19;
     uint32_t bytes = 0;
-    const int rc = r3_do_io64(s, obj_off, lba, secs, 0, &bytes);
+    const int rc = r3_do_io64(s, obj_off, lba, secs, 0, 0, &bytes);   // 读：盘 -> 帧
     if (rc != 0) { s->fails++; return rc; }
     s->dma_bytes += bytes;
     s->dma_ops++;
+    return (int64_t)bytes;
+}
+
+// ★ v0.9.40：单发**零拷贝写**（方向 = 共享对象的帧 -> 盘）。与 dma_read64 对称，只差方向。
+// 成功返回落地字节数；不做 flush（见 ahci64.h 的边界说明）。
+int64_t r3drv64_write64(int32_t shm_id, uint64_t obj_off, uint64_t lba, uint32_t secs) {
+    if (!g_init) r3drv64_init64();
+    R3drvSlotT* s = r3_slot_by_shm64(shm_id);
+    if (!s) return -19;
+    uint32_t bytes = 0;
+    const int rc = r3_do_io64(s, obj_off, lba, secs, 0, 1, &bytes);
+    if (rc != 0) { s->fails++; return rc; }
+    s->wr_bytes += bytes;
+    s->wr_ops++;
     return (int64_t)bytes;
 }
 
@@ -710,7 +741,7 @@ int64_t r3drv64_copy_read64(int32_t shm_id, uint64_t obj_off, uint64_t lba, uint
     R3drvSlotT* s = r3_slot_by_shm64(shm_id);
     if (!s) return -19;
     uint32_t bytes = 0;
-    const int rc = r3_do_io64(s, obj_off, lba, secs, 1, &bytes);
+    const int rc = r3_do_io64(s, obj_off, lba, secs, 1, 0, &bytes);   // 对照读：盘 -> 内核暂存 -> 帧
     if (rc != 0) { s->fails++; return rc; }
     s->copy_bytes += bytes;
     return (int64_t)bytes;
@@ -743,7 +774,16 @@ int r3drv64_start_service64(const char* path, const char* name, uint32_t proto,
     if (out_slot) *out_slot = -1;
     if (out_pid) *out_pid = -1;
     if (!g_init) r3drv64_init64();
-    if (!path || !path[0]) return 0;
+    if (!path || !path[0]) {                        // ★ v0.9.40：原来这里**静默** return 0，
+        //   实测有一次重启失败只知道 reason=start、串口里没有内层原因 —— 无法定性。
+        //   补一行现场：路径为空必须能看见。
+        dbg64_line_begin64();
+        dbg64_str("[R3DRV] start FAILED reason=no-path name=");
+        dbg64_str(name ? name : "(null)");
+        dbg64_nl();
+        dbg64_line_end64();
+        return 0;
+    }
     if (!proc64_isolate64()) {                       // 共享地址空间模式：fork/execve 不可用
         dbg64_line_begin64();
         dbg64_str("[R3DRV] start FAILED reason=no-isolation path="); dbg64_str(path);

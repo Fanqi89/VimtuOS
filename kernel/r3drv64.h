@@ -52,6 +52,8 @@ int64_t r3drv64_beat64();                                     // 心跳：0 = ok
 int64_t r3drv64_kick64(int32_t shm_id);                       // 门铃：消费 SQ 环，返回处理条数
 int64_t r3drv64_dma_read64(int32_t shm_id, uint64_t obj_off, uint64_t lba, uint32_t secs);
 int64_t r3drv64_copy_read64(int32_t shm_id, uint64_t obj_off, uint64_t lba, uint32_t secs);
+// ★ v0.9.40：单发零拷贝**写**（共享对象的帧 -> 盘）；返回落地字节数，<0 = 错误码。
+int64_t r3drv64_write64(int32_t shm_id, uint64_t obj_off, uint64_t lba, uint32_t secs);
 int     r3drv64_info64(uint32_t slot, R3drvInfo* out);         // 1 = 已填；0 = 槽空/越界
 
 // ==================== 内核侧 ====================

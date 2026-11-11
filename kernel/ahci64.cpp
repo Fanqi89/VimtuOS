@@ -151,6 +151,7 @@ static int       g_drive_count = 0;   // 其中 ATA 盘数（= ahci64_count64()�
 
 static uint8_t*  g_dma[AHCI64_DMA_PAGES];   // DMA 暂存池（每页 4KB，页池分配，**不保证连续**）
 static uint8_t   g_first_write_logged = 0;  // 首次写盘打一行证据（避免刷屏）
+static uint8_t   g_first_zcwrite_logged = 0; // ★ v0.9.40：首次**零拷贝**写盘打一行证据
 
 static bool ahci_port_start(Ahci64Dev& d);   // 前向声明（ahci_port_restart 会用）
 
@@ -977,6 +978,72 @@ bool ahci64_read_frames64(int idx, uint32_t lba, uint32_t count,
         done_sec += sec;
         used_fr  += fr;
         if (out_bytes) *out_bytes += (uint64_t)sec * 512ull;
+    }
+    return true;
+}
+
+// ==================== ★ v0.9.40：零拷贝散列写（帧 -> 盘）====================
+// 与 ahci64_read_frames64 逐条对称：同一套分块（一条命令最多 16 帧 = 128 扇区）、
+// 同一套 PRDT 组装、同一套重试；差别只有命令码（WRITE DMA EXT）和 write=true。
+// 为什么要单独一条路径：ahci_xfer 的直传要求目标物理连续，而共享对象的帧是离散的。
+bool ahci64_write_frames64(int idx, uint32_t lba, uint32_t count,
+                           const uint64_t* frames, uint32_t nframes,
+                           uint64_t* out_bytes) {
+    if (out_bytes) *out_bytes = 0;
+    if (count == 0) return true;
+    const int di = ahci_drive_index(idx);
+    if (di < 0 || !frames || nframes == 0) return false;
+    if ((uint64_t)count * 512ull > (uint64_t)nframes * 4096ull) return false;
+
+    uint32_t done_sec = 0;
+    uint32_t used_fr  = 0;
+    while (done_sec < count) {
+        const uint32_t left = count - done_sec;
+        uint32_t fr = nframes - used_fr;
+        if (fr > (uint32_t)AHCI64_DMA_PAGES) fr = (uint32_t)AHCI64_DMA_PAGES;
+        uint32_t sec = fr * 8u;                    // 每帧 8 个 512B 扇区
+        if (sec > left) sec = left;
+        fr = (sec + 7u) / 8u;                      // 末块可能不满一帧
+        if (fr == 0) return false;
+
+        Ahci64Prd prds[AHCI64_DMA_PAGES];
+        uint32_t sec_left = sec;
+        for (uint32_t i = 0; i < fr; i++) {
+            const uint64_t pa = frames[used_fr + i];
+            if (pa == 0 || (pa & 1ull) != 0) return false;   // 非法物理帧：如实拒绝
+            prds[i].pa = pa;
+            const uint32_t b = (sec_left > 8u) ? 4096u : sec_left * 512u;
+            prds[i].bytes = b;
+            sec_left -= (b / 512u);
+        }
+        if (sec_left != 0) return false;
+
+        if (!ahci_cmd_retry(di, ATA_CMD_WRITE_DMA_EXT, (uint64_t)lba + done_sec, sec,
+                            prds, (int)fr, true, false)) {
+            const uint8_t p = g_devs[di].port;
+            dbg64_line_begin64();
+            dbg64_str("[AHCI64] zerocopy write FAILED lba="); dbg64_dec((uint64_t)lba + done_sec);
+            dbg64_str(" secs=");   dbg64_dec(sec);
+            dbg64_str(" frames="); dbg64_dec(fr);
+            dbg64_str(" tfd=0x");  dbg64_hex64(prd(p, P_TFD));
+            dbg64_str(" is=0x");   dbg64_hex64(prd(p, P_IS));
+            dbg64_nl();
+            dbg64_line_end64();
+            return false;
+        }
+        done_sec += sec;
+        used_fr  += fr;
+        if (out_bytes) *out_bytes += (uint64_t)sec * 512ull;
+    }
+    if (!g_first_zcwrite_logged) {
+        g_first_zcwrite_logged = 1;
+        dbg64_line_begin64();
+        dbg64_str("[AHCI64] zerocopy write lba="); dbg64_dec(lba);
+        dbg64_str(" secs=");  dbg64_dec(count);
+        dbg64_str(" bytes="); dbg64_dec((uint64_t)count * 512ull);
+        dbg64_str(" ok (first zc write since init)");
+        dbg64_nl();
+        dbg64_line_end64();
     }
     return true;
 }

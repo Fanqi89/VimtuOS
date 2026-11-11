@@ -140,6 +140,10 @@ static inline i64 lx_dma(int id, u64 off, u64 lba, u32 secs) {
 static inline i64 lx_copy(int id, u64 off, u64 lba, u32 secs) {
     return lx_4(R3DRV_NR_COPY, (i64)id, (i64)off, (i64)lba, (i64)secs);
 }
+/* ★ v0.9.40：单发零拷贝**写**（方向 = 共享对象的帧 -> 盘）。不做 flush。 */
+static inline i64 lx_write(int id, u64 off, u64 lba, u32 secs) {
+    return lx_4(R3DRV_NR_WRITE, (i64)id, (i64)off, (i64)lba, (i64)secs);
+}
 static inline i64 lx_status(u32 slot, struct R3drvInfo* out) {
     return lx_3(R3DRV_NR_STATUS, (i64)slot, (i64)(unsigned long)out, (i64)sizeof(struct R3drvInfo));
 }

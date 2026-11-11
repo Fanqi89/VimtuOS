@@ -15,7 +15,11 @@
  *   * 不支持间接块映射（老 ext3 风格 i_block[15]）、不支持 64bit 块号、不支持 metadata_csum
  *     校验（夹具不置这些位；真卷上遇到就如实报原因）；
  *   * 不做日志（journal）重放 —— 只读挂载本来就不该碰日志；
- *   * **完全没有写路径**（框架本身就是只读的）。
+ *   * **文件系统层仍然没有写路径**（目录项/位图/extent 都不改）；但**通道**在 v0.9.40 起
+ *     支持写方向（R3DRV_F_WRITE，DMA 从本进程的帧流向盘）。本文件里的 `wtest` 就是这条
+ *     写通道的现场自检：只用**夹具的空闲块**，写完立刻回读比对 CRC。
+ *   * 内核**不做 FLUSH CACHE**：写完要"断电也不丢"必须由上层显式 flush —— 本版还没有
+ *     这条语义，所以 P1 的写路径必须自己保证"数据块先落、元数据后落"。
  *
  * argv（内核 proc64_start_elf64_argv64 传）：argv[0]=路径 argv[1]=驱动器号 argv[2]=卷起始 LBA
  * 串口行（tests/r3drv64_test.py 按这些断言）：
@@ -63,6 +67,7 @@ static u32      g_restarts = 0;
 static u32      g_beats = 0;
 static int      g_crash_cfg = 0;
 static int      g_bench_cfg = 0;
+static int      g_wtest_cfg = 0;   /* ★ v0.9.40：wtest=1 -> 做一次零拷贝写 + 回读校验 */
 
 /* ---------------- 小工具 ---------------- */
 static u32 le16(const u8* p) { return (u32)p[0] | ((u32)p[1] << 8); }
@@ -141,6 +146,7 @@ static void read_cfg(void) {
             val[v] = 0;
             if (streq(key, "bench")) g_bench_cfg = atoi_s(val);
             else if (streq(key, "crash")) g_crash_cfg = atoi_s(val);
+            else if (streq(key, "wtest")) g_wtest_cfg = atoi_s(val);
         }
         if (!*e) break;
         p = e + 1;
@@ -385,6 +391,87 @@ static int walk_dir(const u8* iblock, u64 dir_size, int depth, u8* blk) {
     return files;
 }
 
+/* ---------------- ★ v0.9.40：零拷贝**写**通道 + 现场自检 ---------------- */
+/* 与 zc_read 对称：只把 flags 换成 R3DRV_F_WRITE，方向就是"本进程的帧 -> 盘"。 */
+static i64 zc_write(u64 lba, u32 secs) {
+    if (secs == 0) return 0;
+    if (secs > SVC_DATA_SECS) secs = SVC_DATA_SECS;
+    const u32 pos = r3_submit(g_va, lba, secs, R3DRV_DATA_OFF, R3DRV_F_WRITE);
+    const i64 k = lx_kick(g_shm);
+    if (k < 0) return -3;
+    return r3_wait(g_va, pos);
+}
+/* 回读到**另一个**区域（obj_off 可指定），这样写完的源数据还在，能直接逐字节比对。 */
+static i64 zc_read_at(u64 lba, u32 secs, u64 obj_off) {
+    if (secs == 0) return 0;
+    if (secs > SVC_DATA_SECS) secs = SVC_DATA_SECS;
+    const u32 pos = r3_submit(g_va, lba, secs, obj_off, 0);
+    const i64 k = lx_kick(g_shm);
+    if (k < 0) return -3;
+    return r3_wait(g_va, pos);
+}
+static void hex32(u32 v, char o[9]) {
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 0; i < 8; i++) o[i] = hx[(v >> ((7 - i) * 4)) & 0xF];
+    o[8] = 0;
+}
+
+#define WTEST_BLOCK    16000u        /* 夹具（--blocks 16384）里明确空闲的块起 */
+#define WTEST_SECTORS  64u           /* 32 KiB = 8 个 4 KiB 块 */
+#define WTEST_BYTES    (WTEST_SECTORS * 512u)
+#define WTEST_RD_OFF   (R3DRV_DATA_OFF + 32768u)   /* 回读落点：与写入源区隔开 32 KiB */
+
+/* 自检做三件事，缺一件都不算过：
+ *   ① 把确定性图案写进数据区 -> 零拷贝**写**到夹具的空闲块；
+ *   ② 立刻零拷贝**读**回到另一块区域，逐字节比对 + CRC32；
+ *   ③ 把"写/读"两行打出来（宿主侧还会独立算图案的 CRC32 与镜像字节做二次核对）。 */
+static void wtest_run(void) {
+    const u64 lba = (u64)g_lba + (u64)WTEST_BLOCK * (g_fs.bs / 512u);
+    u8* w = (u8*)(g_va + R3DRV_DATA_OFF);
+    u8* r = (u8*)(g_va + WTEST_RD_OFF);
+
+    u32 x = 0x12345678u;
+    for (u32 i = 0; i < WTEST_BYTES; i++) {
+        x = x * 1103515245u + 12345u;
+        w[i] = (u8)(x >> 16);
+    }
+    const u32 cw = crc32(0, w, WTEST_BYTES);
+
+    (void)lx_beat();
+    const i64 nb = zc_write(lba, WTEST_SECTORS);
+    {
+        char o[9]; hex32(cw, o);
+        R3_LINE_BEGIN
+        R3_ADD("[EXT4SVC] wtest write lba=");  R3_ADDU(lba);
+        R3_ADD(" secs=");                      R3_ADDU(WTEST_SECTORS);
+        R3_ADD(" bytes=");                     R3_ADDU(nb < 0 ? 0u : (u64)nb);
+        R3_ADD(" crc=0x");                     R3_ADD(o);
+        R3_ADD(nb == (i64)WTEST_BYTES ? " ok" : " FAILED");
+        R3_ADD("\n");                          R3_FLUSH();
+    }
+    if (nb != (i64)WTEST_BYTES) return;
+
+    (void)lx_beat();
+    const i64 nr = zc_read_at(lba, WTEST_SECTORS, WTEST_RD_OFF);
+    u32 cr = 0;
+    u32 diff = 0;
+    if (nr == (i64)WTEST_BYTES) {
+        cr = crc32(0, r, WTEST_BYTES);
+        for (u32 i = 0; i < WTEST_BYTES; i++) if (r[i] != w[i]) diff++;
+    }
+    {
+        char o[9]; hex32(cr, o);
+        R3_LINE_BEGIN
+        R3_ADD("[EXT4SVC] wtest verify lba="); R3_ADDU(lba);
+        R3_ADD(" bytes=");                     R3_ADDU(nr < 0 ? 0u : (u64)nr);
+        R3_ADD(" crc=0x");                     R3_ADD(o);
+        R3_ADD(" diff=");                      R3_ADDU(diff);
+        R3_ADD(" match=");                     R3_ADDU(cr == cw && diff == 0 && nr == (i64)WTEST_BYTES ? 1u : 0u);
+        R3_ADD((cr == cw && diff == 0 && nr == (i64)WTEST_BYTES) ? " ok" : " MISMATCH");
+        R3_ADD("\n");                          R3_FLUSH();
+    }
+}
+
 /* ---------------- 64 MiB 顺序读吞吐（零拷贝 vs 拷贝对照）---------------- */
 static u32 ticks_ms(void) {
     return (u32)v80_1(V80_NR_TICKS, 0) * 4u;      /* PIT 250Hz -> 每 tick 4ms */
@@ -503,6 +590,7 @@ int main(int argc, char** argv) {
         R3_ADD("\n"); R3_FLUSH();
     }
     if (rc == 0) {
+        if (g_wtest_cfg) wtest_run();        /* ★ v0.9.40：P0 的写通道现场自检 */
         (void)lx_beat();
         const u8* ib = 0;
         const i64 rsz = inode_read(2, &ib);          /* inode 2 = 根目录 */

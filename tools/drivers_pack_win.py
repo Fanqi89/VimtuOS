@@ -31,7 +31,7 @@ import tcc_pack_win as TP  # noqa: E402
 PART_MAIN_LBA = 32584          # 打印用（真正写盘位置由 SV.build_disk 决定）
 
 # 这份内容必须与 kernel/r3drv64.cpp 的 kR3drvDefaultConf 逐行一致（字段一样、值一样）。
-# 最后一行 crash=0 只在测试里被替换成 crash=1（等长），所以别改长度。
+# 最后一行 wtest=0 只在测试里被替换成 wtest=1（等长），所以别改长度。
 CONF_TEXT = (
     "# /etc/r3drv.conf - VimtuOS ring3 driver framework (v0.9.33)\n"
     "autostart=1\n"
@@ -42,6 +42,7 @@ CONF_TEXT = (
     "beat_ticks=250\n"
     "bench=0\n"
     "crash=0\n"
+    "wtest=0\n"
 ).encode("ascii")
 
 
