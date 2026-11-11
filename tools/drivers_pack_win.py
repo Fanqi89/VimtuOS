@@ -43,6 +43,7 @@ CONF_TEXT = (
     "bench=0\n"
     "crash=0\n"
     "wtest=0\n"
+    "rpc=0\n"
 ).encode("ascii")
 
 

@@ -46,10 +46,10 @@
 #define SVC_DATA_BYTES   (SVC_SHM_BYTES - R3DRV_DATA_OFF)      /* 2,093,056 B */
 #define SVC_DATA_SECS    (SVC_DATA_BYTES / 512u)                /* 4,088 扇区/次 */
 #define SVC_BENCH_BYTES  (64u * 1024u * 1024u)                 /* 64 MiB 顺序读 */
-#define SVC_SERVE_ROUNDS 300                                   /* 每轮 200ms ≈ 60s 常驻 */
 /* ★ v0.9.34：心跳 40ms -> 200ms。原值让串口每秒 ~25 行（sycall trace + serve 打点），
  *   单次运行能到 1MB；200ms 仍然远小于内核 beat_ticks=250（1s）的判活窗口。 */
-#define SVC_BEAT_MS      200
+#define SVC_BEAT_MS      5      /* ★ v0.9.40：RPC 上限 150 ms，睡 200 ms 会把每条请求都睡超时 */
+#define SVC_SERVE_ROUNDS 12000  /* 5 ms × 12000 ≈ 60 s 常驻（与原来 200 ms × 300 同量级） */
 
 typedef unsigned long long u64;
 typedef long long          i64;
@@ -68,6 +68,7 @@ static u32      g_beats = 0;
 static int      g_crash_cfg = 0;
 static int      g_bench_cfg = 0;
 static int      g_wtest_cfg = 0;   /* ★ v0.9.40：wtest=1 -> 做一次零拷贝写 + 回读校验 */
+static u32      g_rpc_logs = 0;    /* ★ v0.9.40：RPC 只打前 12 行，避免刷屏 */
 
 /* ---------------- 小工具 ---------------- */
 static u32 le16(const u8* p) { return (u32)p[0] | ((u32)p[1] << 8); }
@@ -505,6 +506,304 @@ static void bench(u32 copy_flag, const char* tag) {
     R3_ADD("\n");                      R3_FLUSH();
 }
 
+/* ---------------- ★ v0.9.40：内核 -> 服务的反向请求（R3drvReq）---------------- */
+/* 这条路的意义：文件管理器要"挂载" ext4，必须能问服务"目录里有什么""把文件读给我"。
+ * 分工不变 —— 盘上字节只由**这个进程**解析；内核只拿结果，不碰 ext4 的元数据格式。 */
+
+/* 一个 extent 的扁平化描述（depth 0 直接用；depth 1 把索引块里的叶子摊平） */
+struct Ext4Ext { u64 log_start; u64 phys_start; u32 len_blocks; };
+static u32 strlen_of(const char* s);   /* 前向声明：dir_lookup 先用到它 */
+
+/* 把 i_block 里的 extent 树摊平成表。只支持 depth 0/1（如实：更深返回 -2）。 */
+static int ext_build(const u8* ib, u32* out_n, struct Ext4Ext* tab, u32 cap) {
+    const u32 magic = le16(ib + 0x00);
+    if (magic != EXT_MAGIC) return -1;
+    const u32 entries = le16(ib + 0x02);
+    const u32 depth   = le16(ib + 0x06);
+    u32 n = 0;
+    if (depth == 0) {
+        for (u32 i = 0; i < entries && i < 4u && n < cap; i++) {
+            const u8* e = ib + 12 + i * 12;
+            tab[n].log_start  = le32(e + 0);
+            tab[n].len_blocks = le16(e + 4) & 0x7FFFu;
+            tab[n].phys_start = ((u64)le16(e + 6) << 32) | le32(e + 8);
+            n++;
+        }
+    } else if (depth == 1) {
+        for (u32 i = 0; i < entries && i < 4u; i++) {
+            const u8* e = ib + 12 + i * 12;
+            const u64 idx_blk = ((u64)le16(e + 6) << 32) | le32(e + 8);
+            if (block_read(idx_blk, g_blk, g_fs.bs) != 0) return -3;
+            if (le16(g_blk + 0x00) != EXT_MAGIC) return -4;
+            const u32 le_cnt = le16(g_blk + 0x02);
+            for (u32 j = 0; j < le_cnt && j < 4u && n < cap; j++) {
+                const u8* l = g_blk + 12 + j * 12;
+                tab[n].log_start  = le32(l + 0);
+                tab[n].len_blocks = le16(l + 4) & 0x7FFFu;
+                tab[n].phys_start = ((u64)le16(l + 6) << 32) | le32(l + 8);
+                n++;
+            }
+        }
+    } else {
+        return -2;
+    }
+    *out_n = n;
+    return 0;
+}
+
+/* 在目录 dir_ino 里找 name（不含 '.'/'..'）。返回子 inode 号，0 = 没找到，0xFFFFFFFF = 出错。 */
+static u32 dir_lookup(u32 dir_ino, const char* name) {
+    const u8* ib = 0;
+    const i64 dsz = inode_read(dir_ino, &ib);
+    if (dsz < 0) return 0xFFFFFFFFu;
+    u8 ex[60];
+    mem_copy(ex, ib, sizeof(ex));                 /* ★ 先拷出来：下面 inode_read 会覆盖 g_ino */
+    struct Ext4Ext tab[16];
+    u32 n = 0;
+    if (ext_build(ex, &n, tab, 16) != 0) return 0xFFFFFFFFu;
+    for (u32 k = 0; k < n; k++) {
+        for (u32 b = 0; b < tab[k].len_blocks; b++) {
+            if (block_read(tab[k].phys_start + b, g_blk, g_fs.bs) != 0) return 0xFFFFFFFFu;
+            u32 p = 0;
+            while (p + 8 <= g_fs.bs) {
+                const u32 ino = le32(g_blk + p);
+                const u32 reclen = le16(g_blk + p + 4);
+                const u32 nlen = g_blk[p + 6];
+                if (reclen < 8 || p + reclen > g_fs.bs) break;
+                if (ino != 0 && nlen > 0 && nlen < 256 && nlen == strlen_of(name)) {
+                    int same = 1;
+                    for (u32 q = 0; q < nlen; q++) if (g_blk[p + 8 + q] != (u8)name[q]) { same = 0; break; }
+                    if (same) return ino;
+                }
+                p += reclen;
+            }
+        }
+    }
+    return 0;
+}
+
+
+/* 定义（放在 dir_lookup 之后无所谓，声明在上面就够） */
+static u32 strlen_of(const char* s) { u32 n = 0; while (s[n]) n++; return n; }
+
+/* 卷内绝对路径（"/", "/big.bin", "/sub/data.bin"）-> inode 号；0 = 不存在。 */
+static u32 path_to_ino(const char* path) {
+    if (!path || path[0] != '/') return 0;
+    u32 ino = 2;                                   /* ext4 根目录固定是 2 */
+    u32 i = 1;
+    while (path[i]) {
+        char comp[64];
+        u32 k = 0;
+        while (path[i] && path[i] != '/') {
+            if (k + 1 < sizeof(comp)) comp[k++] = path[i];
+            i++;
+        }
+        comp[k] = 0;
+        if (k > 0) {
+            ino = dir_lookup(ino, comp);
+            if (ino == 0 || ino == 0xFFFFFFFFu) return 0;
+        }
+        if (path[i] == '/') i++;
+    }
+    return ino;
+}
+
+/* 取 inode 的大小与类型（1 文件 / 2 目录）。返回 0 = ok。 */
+static int ino_stat(u32 ino, u32* out_type, u64* out_size) {
+    const u8* ib = 0;
+    const i64 sz = inode_read(ino, &ib);
+    if (sz < 0) return -1;
+    const u32 mode = le16(g_ino + 0x00) & 0xF000u;
+    *out_type = (mode == 0x4000u) ? 2u : (mode == 0x8000u) ? 1u : 0u;
+    *out_size = (u64)sz;
+    return 0;
+}
+
+/* 把文件的 [off, off+len) 读进**应答区**（数据区第一页），返回实际字节数。
+ * 为什么要一块 scratch（数据区第二页）：文件偏移通常不是 512 对齐的，
+ * DMA 只能整扇区落地，所以先整扇区读进 scratch，再把需要的那一段切进应答区。 */
+#define RPC_REPLY_OFF   (R3DRV_DATA_OFF)
+#define RPC_SCRATCH_OFF (R3DRV_DATA_OFF + 4096u)
+static u32 file_read_into_reply(const u8* ib_ex60, u64 size, u64 off, u32 len, u32 max_len) {
+    if (len > max_len) len = max_len;
+    struct Ext4Ext tab[16];
+    u32 n = 0;
+    if (ext_build(ib_ex60, &n, tab, 16) != 0) return 0;
+    u8* dst = (u8*)(g_va + RPC_REPLY_OFF);
+    const u8* scr = (const u8*)(g_va + RPC_SCRATCH_OFF);
+    u32 done = 0;
+    while (done < len && off + done < size) {
+        const u64 cur = off + done;
+        int found = -1;
+        for (u32 i = 0; i < n; i++) {
+            const u64 s = tab[i].log_start * (u64)g_fs.bs;
+            const u64 e = s + (u64)tab[i].len_blocks * (u64)g_fs.bs;
+            if (cur >= s && cur < e) { found = (int)i; break; }
+        }
+        if (found < 0) break;                         /* 空洞/未映射：如实停 */
+        const u64 ext_s = tab[found].log_start * (u64)g_fs.bs;
+        const u64 in_ext = cur - ext_s;
+        const u64 phys = tab[found].phys_start * (u64)g_fs.bs + in_ext;
+        u64 room = (u64)tab[found].len_blocks * (u64)g_fs.bs - in_ext;
+        u64 left = size - cur; if (room > left) room = left;
+        u64 want = (u64)len - done; if (room < want) want = room;
+        if (want == 0) break;
+
+        const u64 al = phys & ~511ull;                 /* 512 对齐起点 */
+        const u32 in_off = (u32)(phys - al);
+        u32 secs = (u32)((in_off + want + 511u) / 512u);
+        const u32 sec_cap = SVC_DATA_SECS - 8u;        /* 留一页给应答区 */
+        if (secs > sec_cap) secs = sec_cap;
+        if (secs == 0) break;
+        const u64 lba = (u64)g_lba + al / 512u;
+        const i64 got = zc_read_at(lba, secs, RPC_SCRATCH_OFF);
+        if (got <= 0) break;
+        u32 avail = (u32)got;
+        if (avail < in_off) break;
+        avail -= in_off;
+        u32 take = (u32)want;
+        if (take > avail) take = avail;
+        for (u32 i = 0; i < take; i++) dst[done + i] = scr[in_off + i];
+        done += take;
+    }
+    return done;
+}
+
+/* 处理一条请求（对象里的 req 块）。调用方保证此时 state == REQ。 */
+static void rpc_handle(void) {
+    volatile struct R3drvReq* rq = (volatile struct R3drvReq*)(g_va + R3DRV_REQ_OFF);
+    const u64 seq = rq->seq;
+    u32 err = 0;
+    u32 result = 0, aux = 0;
+
+    char path[256];
+    {
+        u32 i = 0;
+        for (; i + 1u < sizeof(path); i++) { path[i] = rq->path[i]; if (!path[i]) break; }
+        path[sizeof(path) - 1] = 0;
+    }
+    const u32 op = rq->op;
+    const u32 ino = path_to_ino(path);
+    if (ino == 0) {
+        err = 2;                                   /* ENOENT */
+    } else if (op == R3DRV_OP_STAT) {
+        u32 type = 0; u64 sz = 0;
+        if (ino_stat(ino, &type, &sz) != 0) err = 5;
+        else { aux = type; result = (u32)(sz > 0xFFFFFFFFull ? 0xFFFFFFFFull : sz); }
+    } else if (op == R3DRV_OP_LIST) {
+        u32 type = 0; u64 dsz = 0;
+        if (ino_stat(ino, &type, &dsz) != 0 || type != 2) { err = 4; }
+        else {
+            const u8* ib = 0;
+            (void)inode_read(ino, &ib);
+            u8 ex[60];
+            mem_copy(ex, ib, sizeof(ex));          /* 同一条纪律：先拷出来 */
+            struct Ext4Ext tab[16];
+            u32 n = 0;
+            if (ext_build(ex, &n, tab, 16) != 0) err = 5;
+            else {
+                /* ★ 关键：**先攒在本地暂存区**，循环结束后再整体拷进应答区。
+                 * 为什么：服务每一次 zc_read（超级块/inode）都把数据 DMA 到数据区偏移 0，
+                 * 而应答区也在那里 —— 边建边写会让先写好的条目被后续读覆盖
+                 * （实测 `names=,,sub`：前两条名字被冲掉）。 */
+                static struct R3drvDirent64 stage[64];
+                const u32 cap = (rq->data_secs * 512u) / (u32)sizeof(struct R3drvDirent64);
+                u32 cnt = 0;
+                int overflow = 0;
+                for (u32 k = 0; k < n && !err; k++) {
+                    for (u32 b = 0; b < tab[k].len_blocks; b++) {
+                        if (block_read(tab[k].phys_start + b, g_blk, g_fs.bs) != 0) { err = 5; break; }
+                        u32 p = 0;
+                        while (p + 8 <= g_fs.bs) {
+                            const u32 cino = le32(g_blk + p);
+                            const u32 reclen = le16(g_blk + p + 4);
+                            const u32 nlen = g_blk[p + 6];
+                            const u32 ftype = g_blk[p + 7];
+                            if (reclen < 8 || p + reclen > g_fs.bs) break;
+                            if (cino != 0 && nlen > 0 && nlen < 60) {
+                                const int is_dot = (g_blk[p + 8] == '.' &&
+                                                    (nlen == 1 || (nlen == 2 && g_blk[p + 9] == '.')));
+                                if (!is_dot) {
+                                    if (cnt >= cap) { overflow = 1; break; }
+                                    /* 名字先拷出来：下面 ino_stat 会读盘，别指望 g_blk 还在 */
+                                    char nm[64];
+                                    for (u32 q = 0; q < nlen && q < sizeof(nm) - 1; q++)
+                                        nm[q] = (char)g_blk[p + 8 + q];
+                                    nm[nlen < sizeof(nm) ? nlen : sizeof(nm) - 1] = 0;
+                                    u32 ctype = 0; u64 csz = 0;
+                                    (void)ino_stat(cino, &ctype, &csz);   /* 失败就当 0/文件 */
+                                    struct R3drvDirent64* e = &stage[cnt];
+                                    e->ino = cino;
+                                    e->size = (u32)(csz > 0xFFFFFFFFull ? 0xFFFFFFFFull : csz);
+                                    e->type = (u8)(ctype ? ctype : (ftype == 2 ? 2u : 1u));
+                                    e->namelen = (u8)nlen;
+                                    for (u32 q = 0; q < sizeof(e->name); q++) e->name[q] = 0;
+                                    for (u32 q = 0; q < nlen && q < sizeof(e->name) - 1; q++)
+                                        e->name[q] = nm[q];
+                                    cnt++;
+                                }
+                            }
+                            p += reclen;
+                        }
+                        if (overflow) break;
+                    }
+                }
+                /* 攒完了：一次性落到应答区（这里之后不会再读盘，所以不会被覆盖） */
+                {
+                    u8* dst = (u8*)(g_va + RPC_REPLY_OFF);
+                    for (u32 i = 0; i < cnt; i++) {
+                        const u8* src = (const u8*)&stage[i];
+                        for (u32 k = 0; k < sizeof(struct R3drvDirent64); k++)
+                            dst[i * sizeof(struct R3drvDirent64) + k] = src[k];
+                    }
+                }
+                result = cnt;
+                aux = (u32)(overflow ? 1u : 0u);
+            }
+        }
+    } else if (op == R3DRV_OP_READ) {
+        u32 type = 0; u64 sz = 0;
+        if (ino_stat(ino, &type, &sz) != 0 || type != 1) { err = 4; }
+        else {
+            const u8* ib = 0;
+            (void)inode_read(ino, &ib);
+            u8 ex[60];
+            mem_copy(ex, ib, sizeof(ex));
+            const u32 max_len = rq->data_secs * 512u;
+            result = file_read_into_reply(ex, sz, rq->off, (u32)rq->size, max_len);
+        }
+    } else {
+        err = 22;                                  /* EINVAL：不认识的 op 如实拒绝 */
+    }
+
+    rq->result = result;
+    rq->aux    = aux;
+    rq->err    = err;
+    rq->seq    = seq;                              /* 原样回写（内核据此防串号） */
+    rq->state  = err ? R3DRV_REQ_ST_FAIL : R3DRV_REQ_ST_DONE;
+    if (g_rpc_logs < 12) {
+        static const char hx[] = "0123456789abcdef";
+        (void)hx;
+        g_rpc_logs++;
+        R3_LINE_BEGIN
+        R3_ADD("[EXT4SVC] rpc op=");
+        R3_ADD(op == R3DRV_OP_STAT ? "stat" : op == R3DRV_OP_LIST ? "list" : "read");
+        R3_ADD(" path=");   R3_ADD(path);
+        R3_ADD(" result="); R3_ADDU((u64)result);
+        R3_ADD(err ? " FAILED err=" : " ok");
+        if (err) R3_ADDU((u64)err);
+        R3_ADD("\n");       R3_FLUSH();
+    }
+}
+
+/* 轮询：只有 state==REQ 才干活（内核写完 state 才会被看见）。 */
+static void rpc_poll(void) {
+    volatile struct R3drvReq* rq = (volatile struct R3drvReq*)(g_va + R3DRV_REQ_OFF);
+    if (rq->magic != R3DRV_REQ_MAGIC) return;
+    if (rq->state != R3DRV_REQ_ST_REQ) return;
+    rpc_handle();
+}
+
 /* ---------------- 主流程 ---------------- */
 int main(int argc, char** argv) {
     crc_init();
@@ -526,6 +825,21 @@ int main(int argc, char** argv) {
         return 1;
     }
     r3_ring_init(g_va);
+    /* ★ v0.9.40：发布"请求块已就绪"——内核看到 magic 才会发 RPC。
+     * 顺序要紧：先把字段清干净，**最后**写 magic（内核以它为唯一就绪判据）。 */
+    {
+        volatile struct R3drvReq* rq = (volatile struct R3drvReq*)(g_va + R3DRV_REQ_OFF);
+        rq->state = R3DRV_REQ_ST_IDLE;
+        rq->op = 0;
+        rq->err = 0;
+        rq->seq = 0;
+        rq->result = 0;
+        rq->aux = 0;
+        rq->data_off = R3DRV_DATA_OFF;
+        rq->data_secs = 8u;
+        rq->path[0] = 0;
+        rq->magic = 0;          /* ★ 先不发布：等服务循环就绪再说（见下面的说明） */
+    }
     {
         R3_LINE_BEGIN
         R3_ADD("[EXT4SVC] start disk="); R3_ADDU(g_disk);
@@ -628,11 +942,17 @@ int main(int argc, char** argv) {
         bench(R3DRV_F_COPY, "copy");
     }
 
+    /* ★ v0.9.40：**就绪判据放在这里**。
+     * 语义："我已经把超级块/inode/文件都解析完，马上就要进服务循环" —— 只有这时内核才该发 RPC。
+     * 第一版把 magic 写在环初始化之后（解析之前），结果内核在服务启动解析期间发请求，
+     * 150 ms 一到就超时（实测 `[EXT4VOL] rpc TIMEOUT state=1`，随后服务才打出 rpc op=list）。*/
+    ((volatile struct R3drvReq*)(g_va + R3DRV_REQ_OFF))->magic = R3DRV_REQ_MAGIC;
+
     /* (6) 常驻：按心跳活着（内核监督器据此判活）*/
     for (u32 round = 0; round < SVC_SERVE_ROUNDS; round++) {
         (void)lx_beat();
         g_beats++;
-        if ((round % 125u) == 0) {
+        if ((round % 1000u) == 0) {
             struct R3drvInfo info;
             R3_LINE_BEGIN
             R3_ADD("[EXT4SVC] serve round=");  R3_ADDU((u64)round);
@@ -645,6 +965,7 @@ int main(int argc, char** argv) {
             }
             R3_ADD("\n"); R3_FLUSH();
         }
+        rpc_poll();                                    /* ★ v0.9.40：处理"内核 -> 服务"的请求 */
         (void)v80_2(V80_NR_SLEEP_MS, SVC_BEAT_MS, 0);
     }
     R3_LINE_BEGIN R3_ADD("[EXT4SVC] serve rounds="); R3_ADDU((u64)SVC_SERVE_ROUNDS);

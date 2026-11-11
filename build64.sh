@@ -167,6 +167,9 @@ SRCS_OS="$SRCS_CORE $SRCS_DESKTOP $SRCS_SYS kernel/fontcfg64.cpp kernel/task64.c
 #   地址空间隔离，链接它会缺符号（同 hda64/net64 的理由）。syscall64.cpp 里对应 case 也有
 #   `#ifndef VIMTU_INSTALLER_MEDIA` 守着，两套内核各编各的。
 SRCS_OS="$SRCS_OS kernel/r3drv64.cpp"
+# ★ v0.9.40：kernel/ext4vol64.cpp = 内核侧的 ext4 **只读客户端**（走 ring3 服务的反向 RPC）。
+#   同样只进 SRCS_OS：它用 proc64 的 shm_view / task64 的 yield，安装介质内核没有这些。
+SRCS_OS="$SRCS_OS kernel/ext4vol64.cpp"
 # ★ v0.9.4：kernel/gpu64.cpp = 通用 GPU 层（P1：显示类 PCI 枚举 + 厂商识别 + BAR 窗口 + 命令寄存器
 #   + 三家只读身份探测 + [GPU] 报告）。**只进系统内核** —— 安装介质只是一块装盘向导界面，
 #   不需要 GPU 报告；加在 SRCS_OS 而不是 SRCS_CORE，省它那 4MB 预算里的几百字节。
@@ -905,6 +908,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
     "$BUILD/os"/r3drv64.o \
+    "$BUILD/os"/ext4vol64.o \
     "$BUILD/os"/e1000_64.o "$BUILD/os"/net64.o "$BUILD/os"/netraw64.o "$BUILD/os"/usb64.o "$BUILD/os"/xhci64.o "$BUILD/os"/ehci64.o "$BUILD/os"/hda64.o \
     "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
     "$BUILD"/demo64.o "$BUILD/os"/font_*_z.o "$BUILD/os"/icon_start_mini.o \

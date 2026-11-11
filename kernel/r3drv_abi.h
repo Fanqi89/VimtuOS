@@ -78,6 +78,63 @@
 #define R3DRV_NR_ROUTE     1035          // r3drv_route(disk, lba)  -> R3DRV_ROUTE_*
 #define R3DRV_NR_WRITE     1036          // ★ v0.9.40 r3drv_write(shm_id, obj_off, lba, secs) 单发零拷贝写
 
+// ==================== ★ v0.9.40：反向请求/应答（内核 -> 服务）====================
+// 为什么需要它：v0.9.33 的环只有"服务 -> 内核"一个方向（服务提交读/写请求）。
+// 文件管理器要**挂载** ext4，就必须能问服务"这个目录里有什么""把这个文件读给我"——
+// 也就是内核要能发起请求。于是追加这一块（**只追加**：旧偏移一个都没动）。
+//
+// 内存布局（对象内）：
+//   [0    , 56)                  R3drvRing
+//   [64   , 64+32*R3DRV_SLOTS)   SQE 数组（服务 -> 内核）
+//   [512  , 4096)                ★ R3drvReq（内核 -> 服务；本批新增）
+//   [4096 , 对象大小)             数据区（DMA 落点；应答数据也放这里）
+//
+// 握手与所有权（关键，写进注释防止以后乱用）：
+//   * 服务启动后把 req.magic = R3DRV_REQ_MAGIC 写进块里 —— 这是"我准备好接请求"的判据；
+//   * 内核发起请求：填 path/op/off/size/data_secs，seq+1，**最后**写 state = REQ；
+//   * 服务处理完：写应答数据到数据区，填 result/err，把 state 改成 DONE/FAIL
+//     （并把 seq 原样回写 —— 内核据此确认"这条应答是我要的那条"，避免串号）；
+//   * 内核**有界等待**（默认 150 ms，每圈 task_yield64() 让 ring3 服务真的能跑），
+//     超时返回 -ETIMEDOUT 并**不重试**（GUI 线程绝不能在这里卡死）。
+#define R3DRV_REQ_OFF      512u
+#define R3DRV_REQ_MAGIC    0x52335652u   // 'RV3R'（小端）；服务写进 req.magic
+#define R3DRV_REQ_ST_IDLE  0u            // 空闲（服务处理完会回到 DONE，空闲只用于初值）
+#define R3DRV_REQ_ST_REQ   1u            // 内核已投递
+#define R3DRV_REQ_ST_DONE  2u            // 服务已完成（result/err 有效）
+#define R3DRV_REQ_ST_FAIL  3u            // 服务处理失败（err 有效）
+
+// ---------- 请求 op ----------
+#define R3DRV_OP_STAT      1u            // 取 path 的属性 -> R3drvReq.aux/result = size、size = type
+#define R3DRV_OP_LIST      2u            // 列 path 目录 -> 数据区里放 R3drvDirent64 数组，result = 条数
+#define R3DRV_OP_READ      3u            // 读 path 的 [off, off+size) -> 数据区，result = 实际字节
+
+// ---------- 一条请求（512 B 上限内的 POD；内核 C++ 与用户态 C 共用）----------
+struct R3drvReq {
+    unsigned int       magic;       // +0   服务写 R3DRV_REQ_MAGIC
+    unsigned int       state;       // +4   R3DRV_REQ_ST_*
+    unsigned int       op;          // +8   R3DRV_OP_*
+    unsigned int       err;         // +12  0 = 成功；否则为**正的**错误号（服务侧定义）
+    unsigned long long seq;         // +16  内核每发一条 +1；服务原样回写
+    unsigned long long off;         // +24  READ 的文件偏移
+    unsigned long long size;        // +32  READ 的最大字节数
+    unsigned int       result;      // +40  DONE 时的有效字节数 / 条数 / 大小
+    unsigned int       aux;         // +44  STAT: 1=文件 2=目录；LIST: 溢出标志（1=还有更多）
+    unsigned int       data_off;    // +48  应答数据落在对象内的偏移（内核填，>= R3DRV_DATA_OFF）
+    unsigned int       data_secs;   // +52  内核允许的最大扇区数（服务不许越界）
+    char               path[448];   // +56  NUL 结尾的**卷内绝对路径**（如 "/sub/data.bin"）
+};
+
+// ---------- 目录项应答格式（64 B/条，紧排在数据区）----------
+// 为什么自带名字而不是让内核按 inode 查：服务是唯一的 ext4 解析者，内核不该再有一份解析器。
+struct R3drvDirent64 {
+    unsigned int  ino;              // +0   inode 号
+    unsigned int  size;             // +4   文件字节数（目录 = 目录项字节数）
+    unsigned char type;             // +8   1 = 普通文件，2 = 目录
+    unsigned char namelen;          // +9   名字长度（1..51）
+    unsigned char pad[2];           // +10
+    char          name[52];         // +12  NUL 结尾（可能不满）
+};
+
 // ---------- 环控制块（56 B，必须落在对象 [0,64)）----------
 struct R3drvRing {
     unsigned int       magic;       // +0  R3DRV_RING_MAGIC（服务写；内核只校验）

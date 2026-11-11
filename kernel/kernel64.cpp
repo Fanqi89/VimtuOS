@@ -107,7 +107,8 @@ uint32_t sig64_suppressed64();          // 打点预算节流统计（收尾打�
 #include "rust64.h"      // ★ 项目路线（C + C++ + Rust）：Rust 模块 gui_rs 的 C 链接声明
                          //   （设计 Token + 主题配色；只有**系统内核**链接它，见 build64.sh）
 #ifndef VIMTU_INSTALLER_MEDIA
-#include "r3drv64.h"     // ★ v0.9.33：ring3 驱动框架（安装介质内核不带 proc64，整段不编）
+#include "r3drv64.h"
+#include "ext4vol64.h"   // ★ v0.9.40：内核 -> 服务 的反向 RPC（ext4 只读挂载底座）     // ★ v0.9.33：ring3 驱动框架（安装介质内核不带 proc64，整段不编）
 #endif
 #include "hwui64.h"      // ★ item 5a：屏幕硬件检查报告（**两份内核都编**：安装介质与系统内核共用）
 // ---- 平台层（64 位）：PIC/PIT/IDT/TSS/RTC，实现在 kernel/x86_64.cpp ----
@@ -1548,6 +1549,9 @@ display64_init64();
     //   （见 kernel/task64.cpp 的 kheart_entry），所以本函数**不等待**服务就绪。
     r3drv64_init64();
     (void)r3drv64_autostart64();
+    // ★ v0.9.40：内核 -> ring3 服务的**反向 RPC** 自检（/etc/r3drv.conf 的 rpc=1 才跑）。
+    //   默认关，所以既有夹具行为一个字节不变；它证明"内核能通过服务列 ext4 目录、读文件"。
+    ext4vol64_boot64();
     con64_live_pump64();
 #endif  // VIMTU_INSTALLER_MEDIA
     // ---- UEFI 运行期 CR3 实验（编译期开关，默认关；见 docs/UEFI地址空间实验报告.md）----

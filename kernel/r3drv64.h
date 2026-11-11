@@ -54,6 +54,10 @@ int64_t r3drv64_dma_read64(int32_t shm_id, uint64_t obj_off, uint64_t lba, uint3
 int64_t r3drv64_copy_read64(int32_t shm_id, uint64_t obj_off, uint64_t lba, uint32_t secs);
 // ★ v0.9.40：单发零拷贝**写**（共享对象的帧 -> 盘）；返回落地字节数，<0 = 错误码。
 int64_t r3drv64_write64(int32_t shm_id, uint64_t obj_off, uint64_t lba, uint32_t secs);
+// ★ v0.9.40：按协议找"活着的"服务（给内核 -> 服务的反向 RPC 用）。
+//   proto=0 表示不挑协议；返回 1 = 找到（out_* 已填），0 = 没有。
+int     r3drv64_lookup64(uint32_t proto, uint32_t* out_slot, int32_t* out_shm,
+                         uint32_t* out_disk, uint64_t* out_lba);
 int     r3drv64_info64(uint32_t slot, R3drvInfo* out);         // 1 = 已填；0 = 槽空/越界
 
 // ==================== 内核侧 ====================

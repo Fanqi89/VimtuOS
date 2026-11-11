@@ -157,7 +157,8 @@ static const char kR3drvDefaultConf[] =
     "beat_ticks=250\n"
     "bench=0\n"
     "crash=0\n"
-    "wtest=0\n";        // ★ v0.9.40：wtest=1 让服务做一次"零拷贝写 + 回读校验"（P0 验收用）
+    "wtest=0\n"         // ★ v0.9.40：wtest=1 让服务做一次"零拷贝写 + 回读校验"（P0 验收用）
+    "rpc=0\n";          // ★ v0.9.40：rpc=1 让内核开机跑一遍"内核 -> 服务"的 RPC 自检
 
 static void r3_cfg_apply_line(const char* line, int len) {
     if (len <= 0 || line[0] == '#') return;
@@ -745,6 +746,24 @@ int64_t r3drv64_copy_read64(int32_t shm_id, uint64_t obj_off, uint64_t lba, uint
     if (rc != 0) { s->fails++; return rc; }
     s->copy_bytes += bytes;
     return (int64_t)bytes;
+}
+
+// ★ v0.9.40：给"内核 -> ring3 服务"的反向 RPC 用 —— 按协议找**活着的**服务。
+// 为什么只认 RUN：DYING/STALE 的槽里 shm 可能已随进程释放，拿它的帧发请求会踩空。
+int r3drv64_lookup64(uint32_t proto, uint32_t* out_slot, int32_t* out_shm,
+                     uint32_t* out_disk, uint64_t* out_lba) {
+    if (!g_init) r3drv64_init64();
+    for (uint32_t i = 0; i < R3DRV64_MAX; i++) {
+        const R3drvSlotT& s = g_slot[i];
+        if (!s.used || s.state != R3DRV_ST_RUN || s.shm_id <= 0) continue;
+        if (proto != 0 && s.proto != proto) continue;
+        if (out_slot) *out_slot = i;
+        if (out_shm)  *out_shm  = s.shm_id;
+        if (out_disk) *out_disk = s.disk;
+        if (out_lba)  *out_lba  = s.lba;
+        return 1;
+    }
+    return 0;
 }
 
 int r3drv64_info64(uint32_t slot, R3drvInfo* out) {

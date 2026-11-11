@@ -3745,6 +3745,48 @@ def cap_r3drv_write():
     return ("DONE" if done else "PARTIAL"), ev
 
 
+def cap_r3drv_rpc():
+    """★ v0.9.40「内核 -> ring3 服务的反向请求通道（RPC）」：v0.9.33 的环只有"服务 -> 内核"一个方向，
+    所以内核能**让**服务读盘，却没法**问**服务"这个目录里有什么"。文件管理器要真挂载 ext4 就必须双向。
+
+    这一项补的是**请求/应答方向**（只追加：新块落在对象 [512,4096)，旧偏移一个没动）：
+      * `R3drvReq`（504 B）+ `R3drvDirent64`（64 B/条）：op / path / off / size / result / seq；
+      * 内核侧 `kernel/ext4vol64.cpp`：`bind`（找活着的服务 + 取帧 + 验 magic）/ `stat` / `list` / `read`；
+      * **有界等待 150 ms**，每圈 `task_yield64()` 让出 CPU（内核忙等会让 ring3 服务永远排不上来 = 死锁）；
+      * 服务侧 `rpc_poll()` 每 5 ms 一次：`path -> inode` 逐级解析、extent 扁平化、**每次 4 KiB 流式回数据**。
+
+    如实边界：单通道单请求（一次只有一条在飞）、每请求 ≤ 4 KiB（大文件靠多次 RPC 流式取）、
+    无并发/无缓存、**没有写路径**；还没接进 fs64/drive64/explorer（下一步）。
+    """
+    need = ["kernel/r3drv_abi.h", "kernel/ext4vol64.h", "kernel/ext4vol64.cpp",
+            "kernel/r3drv64.cpp", "user/drivers/ext4svc.c", "tests/ext4rpc64_test.py"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    req = grep_count(r"R3drvReq|R3DRV_REQ_OFF|R3DRV_OP_LIST",
+                     ["kernel/r3drv_abi.h", "kernel/ext4vol64.cpp", "user/drivers/ext4svc.c"])
+    yld = grep_count(r"task_yield64", ["kernel/ext4vol64.cpp"])
+    pol = grep_count(r"rpc_poll|rpc_handle", ["user/drivers/ext4svc.c"])
+    ev = [
+        "ABI 只追加：`R3drvReq` + `R3drvDirent64` 落在对象 [512,4096)（环 56 B / SQE 320 B / 数据区 4096 都不动）；"
+        "命中 %d 处" % req,
+        "内核侧：`ext4vol64_bind/stat/list/read`；**150 ms 有界等待**，每圈 `task_yield64()`；"
+        "命中 %d 处" % yld,
+        "服务侧：`rpc_poll()` 每 5 ms 轮询；`path_to_ino` 逐级解析、`ext_build` 摊平 depth 0/1 extent、"
+        "READ 每次 4 KiB 流式回；命中 %d 处" % pol,
+        "★ 验收：`tests/ext4rpc64_test.py` **12/12**（bind ok / 根目录列出 hello.txt,big.bin,sub / "
+        "STAT /big.bin 100000 type=1 / READ 100000 B 且 **CRC32 与宿主独立算的逐位相等** / "
+        "每条 RPC ms ≤ 150（实测 40~84）/ 超时探针必超时 / 服务侧成对打点 / 之后系统仍活着）",
+        "★ 两个真 bug（都实测抓到）：① `proc64_shm_view64` 成功返回 0，第一版写成 `if (!view(...))` —— "
+        "成功当失败，ready 永远为 0；② 服务每次 `zc_read` 的 DMA 落点就是应答区，LIST 边建边写把前几条冲掉"
+        "（`names=,,sub`）→ 改成先攒本地再整体落。",
+        "★ 时序坑：`magic` 必须**服务就绪后**才发布（进服务循环前），否则内核在服务启动解析期间发请求，150 ms 必超时。",
+        "★ 边界（如实）：单通道单请求、每请求 ≤ 4 KiB、无缓存；**还没接进文件管理器**（下一步 fs64/drive64/explorer）",
+    ]
+    done = req > 0 and yld > 0 and pol > 0
+    return ("DONE" if done else "PARTIAL"), ev
+
+
 def cap_vfs_acl():
     """★ v0.9.28「POSIX ACL 子集（xattr）」：文件系统能力清单里"无 ACL/xattr"。"""
     need = ["kernel/vfs64.cpp", "kernel/vfs64.h", "tests/acl64_test.py"]
@@ -3984,6 +4026,7 @@ CAPS = [
              "busybox 开启 FEATURE_FANCY_PING）", cap_busybox_ping),
     ("架构", "★ ring3 驱动通道的**写方向**（R3DRV_F_WRITE + ahci64_write_frames64 + 私有号 "
              "write(1036)；宿主逐字节核对 + 变化块集合最小）", cap_r3drv_write),
+    ("架构", "★ 内核 -> ring3 服务的**反向请求通道**（R3drvReq + 150 ms 有界等待 + 每圈让出 CPU；LIST/STAT/READ，4 KiB 流式）", cap_r3drv_rpc),
 ]
 
 
