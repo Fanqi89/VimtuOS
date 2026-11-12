@@ -197,6 +197,14 @@ def host_frame(wv, guest, tv, settle=1.2):
     except Exception as e:                        # noqa: BLE001
         cands.append(("screen", None))
         print("      [info] screen BitBlt 异常：%r" % (e,))
+    # ★ 环境判据：窗口矩形是否超出宿主屏（超出 = 客人画面下沿根本不在屏幕里，
+    #   两条截帧通道在那里都是纯黑）。只有"窗口完整在屏内"时，画面不匹配才可能是**产品问题**。
+    scr_w = tv._user32.GetSystemMetrics(0)
+    scr_h = tv._user32.GetSystemMetrics(1)
+    env_cut = (r.left < 0 or r.top < 0 or r.right > scr_w or r.bottom > scr_h)
+    if env_cut:
+        print("      [info] 窗口矩形 (%d,%d)-(%d,%d) 超出宿主屏 %dx%d -> 客人画面被裁"
+              % (r.left, r.top, r.right, r.bottom, scr_w, scr_h))
     best = (0.0, None, None, "-", None, title)
     first_img = None
     dbg = []
@@ -213,7 +221,7 @@ def host_frame(wv, guest, tv, settle=1.2):
     if best[4] is None:
         best = (best[0], best[1], best[2], best[3] if best[3] != "-" else "captured",
                 first_img, title)
-    return best[:6] + (" | ".join(dbg),)
+    return best[:6] + (("env_cut=%d | " % (1 if env_cut else 0)) + " | ".join(dbg),)
 
 
 # ==================== QEMU 会话（系统盘 + ext4 数据盘）====================
@@ -504,10 +512,15 @@ def main():
                 host_detail = ("match=%.2f%% off=%s MAD=%.2f 通道=%s"
                                % (100.0 * sc, (off[0], off[1]) if off else None,
                                   off[2] if off else -1, src))
+                env_cut = "env_cut=1" in fdbg
                 if host is not None:
                     check("★ 宿主窗口里就是客人画面（1/4 色块匹配 >=90%%）", sc >= 0.90, host_detail)
+                elif env_cut:
+                    # 窗口超出宿主屏 -> 客人画面被裁，截帧必然对不上：这是**环境**拿不到证据
+                    check_env("★ 宿主窗口里就是客人画面（窗口超出宿主屏，客人下沿不可见）", host_detail)
                 else:
-                    check_env("★ 宿主窗口里就是客人画面", host_detail)
+                    # 窗口完整显示却对不上：这是**产品问题**，必须红
+                    check("★ 宿主窗口里就是客人画面（窗口完整却对不上 = 产品问题）", False, host_detail)
                 if host is not None:
                     hs = host
                     if hs.shape[:2] != rgb_g.shape[:2]:
