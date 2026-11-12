@@ -1091,6 +1091,93 @@ static void e64_log_reject64(const char* tag, int rc) {
     dbg64_line_end64();
 }
 
+// ==================== ★ v0.9.41：ELF 装载串行化（第三层）====================
+// 为什么必须（实测证据，AHCI + VFS 两把锁都上了之后仍出现）：
+//     [R3DRV] service died name=ext4svc pid=25 … lat_ms=16
+//     [ELF64] exec reject reason=read
+//     [PROC64] start FAILED reason=load path=/usr/bin/drvwatch
+//   —— 同一时刻**两件事在装载 ELF**：kheart 监督器重启 ext4svc、引导线程拉起 drvwatch。
+// 本文件里有一堆**全局**装载状态：g_loaded64（当前镜像的区间表）、g_e64_hdr64 / g_e64_ph64 /
+// g_e64_chunk64 读缓冲；另外装载期间还开着 vfs64 的**全局**路径查找缓存
+// （vfs64_lookup_cache_begin64/end64）。两个装载一起跑就会互相收掉缓存、覆盖缓冲 ->
+// 段读取失败 -> E64_READ（`exec reject reason=read`）。它是**静默降级**（靠第二次拉起兜住），
+// 很容易被误当成环境抖动。
+// 做法：与 ahci/vfs 同构的锁（让出式 `sti; hlt` + 可重入 + 双上限 + IF 关回去），
+//   粒度 = 一次完整装载（毫秒级）；拿不到就如实拒绝（`[ELF64] load busy`），绝不并发跑。
+static const uint32_t E64_LOAD_LOCK_TICKS = 1000;      // 4 s 有界等锁上限
+static volatile int      g_e64_load_lock  = 0;
+static volatile uint32_t g_e64_load_owner = 0xFFFFFFFFu;
+static volatile uint32_t g_e64_load_depth = 0;
+static volatile int      g_e64_load_busy_logged = 0;
+
+extern "C" uint32_t task_current_id_64() __attribute__((weak));   // 安装介质内核不链 task64.cpp
+static inline uint32_t e64_load_tag64() {
+    uint32_t (*fn)() = &task_current_id_64;
+    if (fn) return fn();
+    return 0xFFFFFFFFu;
+}
+
+static bool e64_load_enter64() {
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0" : "=r"(fl));
+    const bool     was_on = (fl & 0x200ULL) != 0;
+    const uint32_t me     = e64_load_tag64();
+    if (g_e64_load_lock && g_e64_load_owner == me && g_e64_load_depth > 0) {   // 同一执行流嵌套
+        g_e64_load_depth++;
+        return true;
+    }
+    const uint64_t t0 = g_ticks64;
+    uint32_t spin = 0;
+    uint64_t guard = 0;
+    for (;;) {
+        __asm__ volatile("cli" ::: "memory");                  // 只在 test-and-set 这一小段关中断
+        const bool got = (__sync_lock_test_and_set(&g_e64_load_lock, 1) == 0);
+        if (was_on) __asm__ volatile("sti");                   // 回到进来时的 IF
+        if (got) {
+            g_e64_load_owner = me;
+            g_e64_load_depth = 1;
+            return true;
+        }
+        if ((g_ticks64 - t0) > (uint64_t)E64_LOAD_LOCK_TICKS ||
+            ++guard > (uint64_t)400000000ull) {
+            if (!g_e64_load_busy_logged) {
+                g_e64_load_busy_logged = 1;
+                dbg64_line_begin64();
+                dbg64_str("[ELF64] load busy ticks="); dbg64_dec(g_ticks64 - t0);
+                dbg64_str(" owner=");                  dbg64_dec(g_e64_load_owner);
+                dbg64_str(" -> reject (如实拒绝，绝不并发装载)");
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+            return false;
+        }
+        if (++spin < 64u) __asm__ volatile("pause");
+        else {
+            spin = 0;
+            // 等锁必须**临时开中断**再 hlt（syscall 分发全程 cli，单核下持有者要靠 PIT 回来），
+            // 而且**关回去**（dbg64_irq_restore64 只会 sti、不会 cli）。
+            const uint64_t f3 = dbg64_irq_save64();
+            const bool was2 = (f3 & 0x200ULL) != 0;
+            __asm__ volatile("sti; hlt");
+            if (was2) __asm__ volatile("sti"); else __asm__ volatile("cli");
+        }
+    }
+}
+
+static void e64_load_leave64() {
+    if (!g_e64_load_lock) return;
+    if (g_e64_load_depth > 1) { g_e64_load_depth--; return; }
+    g_e64_load_depth = 0;
+    g_e64_load_owner = 0xFFFFFFFFu;
+    __sync_lock_release(&g_e64_load_lock);
+}
+
+struct E64LoadSpan {
+    bool held;
+    E64LoadSpan() : held(e64_load_enter64()) {}
+    ~E64LoadSpan() { if (held) e64_load_leave64(); }
+};
+
 // ==================== execve 复用入口（批次 C）====================
 void elf64_forget64() {
     g_loaded64.used    = 0;
@@ -1116,6 +1203,8 @@ int elf64_blob_ok64(const uint8_t* p, uint32_t n) {
 //   elf64_load_image64(path, nullptr, 0, …)：它按段分块读、并按程序头布局选 load bias。
 int elf64_load_for_exec64(const char* path, const char* const* argv, uint32_t argc,
                           uint64_t* out_entry, uint64_t* out_rsp) {
+    E64LoadSpan _load;                     // ★ v0.9.41：装载期间独占（见上面"ELF 装载串行化"）
+    if (!_load.held) return -1;
     // ★ v0.5.7：装载期间打开"路径 -> inode 查找缓存"（见 kernel/vfs64.cpp 的说明）。
     //   实测：/bin/browser 60 KB 装载原来要 load_ms≈10500，其中 >90% 是**每读一块都重做一次
     //   完整 path_resolve**（扫 512 个 inode 槽 + 4 个 32 扇区窗口的 ATA 读）。
@@ -1167,6 +1256,8 @@ int elf64_load_for_exec64(const char* path, const char* const* argv, uint32_t ar
 }
 
 int elf64_load64(const char* path, uint64_t* out_entry) {
+    E64LoadSpan _load;                     // ★ v0.9.41：装载期间独占
+    if (!_load.held) return -1;
     if (!path || path[0] == 0) { e64_log_reject64("[ELF64] reject", E64_ARG); return -1; }
     if (g_loaded64.used) { e64_log_reject64("[ELF64] reject", E64_BUSY); return -1; }
 

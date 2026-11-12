@@ -443,6 +443,47 @@ def main():
           len(re.findall(r"\[EXT4SVC\] file path=/hello\.txt", log5)) >= 1)
     check("整机存活：之后仍有心跳/serve 打点", re.search(r"\[R3DRV\] beat slot=0", log5) is not None)
     check("阶段 5 无 PANIC", "PANIC" not in log5)
+
+    # ==================== 阶段 6：坏读/超时零容忍（v0.9.41 加的硬判据）====================
+    # 背景：v0.9.40 的偶发红全是"同一块盘上两条命令重叠"造成的**静默坏读**
+    #   （[ELF64] transient read retry / [VFS64] BAD block / /etc/r3drv.conf 读错导致
+    #   bench 或 crash 模式没进入）。ahci64 里已加"设备级 IO 串行化"，这里把
+    #   "一次坏读都不许出现"变成硬判据 —— 判据只许加强。
+    print("=== 6) 坏读/命令超时零容忍（五个阶段的串口日志一起查）===")
+    phases = [("阶段 1 正常启动", log1), ("阶段 2 64 MiB 基准", log2),
+              ("阶段 3 崩溃重启", log3), ("阶段 4 autostart=0", log4),
+              ("阶段 5 主动崩溃", log5)]
+    bad_patterns = [
+        (r"\[AHCI64\] cmd timeout", "AHCI 命令超时"),
+        (r"\[AHCI64\] cmd error", "AHCI 命令错误位"),
+        (r"\[AHCI64\] dev error", "AHCI 设备错误"),
+        (r"\[AHCI64\] WARN cmd issued WITHOUT io lock", "漏锁自检"),
+        (r"\[ELF64\] transient read retry", "ELF 坏读重试"),
+        (r"\[VFS64\] transient read retry", "VFS 坏读重试"),
+        (r"\[VFS64\] BAD block=4294967295", "块号非法的坏读"),
+        # ★ v0.9.41 再加严：装载器把失败降级成“重试一次成功”也不行。
+        #   实测遇到过一次 exec reject reason=read + drvwatch 装载失败（靠重试兜住），
+        #   而当时的判据只看 AHCI 打点，**没抓到** —— 这类红不能靠幸运。
+        (r"\[ELF64\] exec reject", "ELF 装载被拒"),
+        (r"\[PROC64\] start FAILED", "proc 装载/启动失败"),
+        (r"\[R3DRV\] watchdog[^\r\n]*FAILED", "看门狗拉起失败"),
+        (r"\[VFS64\] io lock BUSY", "VFS 大锁饿死"),
+        (r"\[AHCI64\] io lock BUSY", "AHCI 锁饿死"),
+    ]
+    for pname, plog in phases:
+        hits = []
+        for pat, label in bad_patterns:
+            n = len(re.findall(pat, plog))
+            if n:
+                hits.append("%s×%d" % (label, n))
+        check("%s：全程无命令超时/坏读重试" % pname,
+              not hits, "；".join(hits) if hits else "clean")
+    # 串行化真的在起作用：内核应当报过至少一次"等锁"（说明确实有两个执行流在读盘，
+    # 而它们被正确排队了）。这条是**正向证据**，不是要求等待发生。
+    contended = sum(len(re.findall(r"\[AHCI64\] io lock contended", pl)) for _n, pl in phases)
+    print("      证据：五个阶段共出现 %d 次 [AHCI64] io lock contended（有并发、已排队）" % contended)
+    busy = sum(len(re.findall(r"\[AHCI64\] io lock BUSY", pl)) for _n, pl in phases)
+    check("锁没有被饿死（无 [AHCI64] io lock BUSY）", busy == 0, "BUSY×%d" % busy)
     # ==================== 汇总 ====================
     passed = sum(1 for _n, c in checks if c)
     total = len(checks)

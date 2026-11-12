@@ -271,8 +271,15 @@ def main():
     # 宿主侧独立解析卷：/home/vimtu/pdata 必须存在（不依赖屏幕文本）
     try:
         TP = load_mod("tcc_pack_win", "tools/tcc_pack_win.py")
-        d = open(TARGET, "rb").read()
-        vol = d[32584 * 512:]
+        # ★ v0.9.41：**不要**把整盘读进内存再切片。靶盘是 8 GiB（TARGET_SECTORS），
+        #   整盘 read() + 切片副本 = 16 GiB -> MemoryError，而 MemoryError 的 str() 是空串，
+        #   于是这条判据只会打出一句没有原因的 FAIL（实测踩过）。这里只读卷起点起的有界窗口。
+        VOL_WINDOW = 32 * 1024 * 1024
+        with open(TARGET, "rb") as fh:
+            fh.seek(32584 * 512)
+            vol = fh.read(VOL_WINDOW)
+        if len(vol) < 64 or vol[:8] != MAGIC:
+            raise ValueError("卷区不像 VimtuFS2：read=%d head=%r" % (len(vol), vol[:8]))
         inodes = int.from_bytes(vol[40:44], "little")
         cur_inode = 0
         found = None
@@ -288,7 +295,9 @@ def main():
         check("宿主侧独立解析卷：/home/vimtu/pdata 存在（重启后仍在盘上）",
               found is not None, "inodes=%d" % inodes)
     except Exception as exc:                          # noqa: BLE001
-        check("宿主侧独立解析卷（解析器可用）", False, str(exc)[:120])
+        # MemoryError 之类 str() 为空的异常也要说清是什么，否则 FAIL 无原因可查
+        check("宿主侧独立解析卷（解析器可用）", False,
+              ("%s: %s" % (type(exc).__name__, exc))[:160])
 
     check("全程无 PANIC", "PANIC64] stop" not in (log_a2 + log_b))
 

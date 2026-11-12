@@ -55,6 +55,19 @@
 //       （bits[21:0] = 字节数-1，bit31 = I）。DBC 写到 +0x08 是错的（那是保留 DWORD）：
 //       QEMU 在 ahci_populate_sglist 里读的是 `lea 0xc(%rax),%rcx` + `and $0x3fffff,%edx`，
 //       写错位置等于 DMA 长度 0，命令即使被受理也搬不动数据。
+//   L) ★★ **同一块盘上的两条命令绝对不能重叠**（v0.9.40 遗留“4.9 s 延迟毒瘤”的根因）：
+//      命令列表 slot 0 / 命令表 / DMA 暂存页池 g_dma[16] 都是**全驱动共享**的，而内核里
+//      kheart 监督器装载 ring3 服务、引导线程建桌面（读图标 / 写 /etc/apps.json）、
+//      ring3 的 fd64 read 会同时读同一块盘。重叠的后果是**静默坏数据**而不是报错：
+//        * `[ELF64] diag magic … same=0 magic2=1` —— 第一次“读 ELF 头”读回来的其实是
+//          /etc/r3drv.conf 的内容（DMA 落进别人刚用过的暂存页）；
+//        * `[VFS64] BAD block=… not in data area` —— 元数据块被别的命令覆盖；
+//        * `[SIG64] fault … #UD` 刚装好就崩 —— 装进内存的段代码本身是坏的。
+//      更糟的是 ahci_cmd 开头那句 `ahci_wait(p, P_CI, 1, 0, 10)`：见到“端口还挂着别人
+//      的命令”就返回 false，接着 ahci_cmd_retry 直接 `ahci_port_restart`（把别人正在飞的
+//      那条掐死），两边互相重启、各自吃满 1 s 命令超时 —— 4.9 s / 7.2 s 就是这么攒出来的。
+//      → 现在所有发命令的 entry point 都在 `Ahci64IoSpan` 临界区里跑（见 ahci_wait 之后
+//        的锁实现与注释；`ahci_cmd` 里还有一道“漏锁自检”打点）。
 #include "ahci64.h"
 #include "debug64.h"
 #include "hwinfo64.h"      // 识别结果填进 hwinfo64 的磁盘表（任务管理器/设置页读它）
@@ -248,6 +261,128 @@ static bool ahci_wait(uint8_t p, uint32_t reg, uint32_t mask, uint32_t want, uin
     }
 }
 
+// ==================== ★ v0.9.41：设备级 IO 串行化 ====================
+// 为什么必须有这把锁（见顶部踩坑 L，证据在 v0.9.40 的串口日志里）：
+//   * 命令列表 slot 0（d.cl）、命令表（d.ct）、DMA 暂存页池 g_dma[16] 是**全驱动共享**的；
+//   * 一条命令的生命周期 = 组 PRDT -> 写命令头 -> 写 PxCI -> 等 PxCI 清零 -> 把数据复制出暂存页。
+//     这段中间**不能有第二个执行流**插进来；否则后到的命令会改掉在飞命令的头、
+//     把 DMA 数据写进同一批暂存页，先到的那条拿到的是别人的内容。
+// 为什么是“让出式”而不是关中断自旋：持有者跑 DMA 命令时，超时判据与 hlt 都靠 PIT 推进
+//   （g_ticks64），所以等待方必须 `sti; hlt` 让出；单核下关中断死等会让持有者永远拿不到 CPU。
+// 粒度与有界：一个分块（≤128 扇区 / 一条命令）一把锁，64 MiB 基准读也不会把别人饿死；
+//   抢不到（超过 AHCI64_IO_LOCK_TICKS）就**如实失败** —— 绝不抢锁（抢就等于又回到坏数据）。
+static const uint32_t AHCI64_IO_LOCK_TICKS = 1000;   // 1000 tick = 4 s：有界等锁上限
+
+static volatile int      g_io_lock     = 0;            // 0 = 空闲；1 = 被占用
+static volatile uint32_t g_io_owner    = 0xFFFFFFFFu;  // 持有者的任务 id（可重入判定）
+static volatile uint32_t g_io_depth    = 0;            // 同一执行流的重入深度
+static volatile uint64_t g_io_waits    = 0;            // 累计“真等过锁”的次数（证据）
+static volatile uint64_t g_io_wait_max = 0;            // 最坏等待（tick，1 tick = 4 ms）
+static volatile int      g_io_wait_logged   = 0;       // 第一次真等锁的打点（只一条）
+static volatile int      g_io_busy_logged   = 0;       // 抢不到锁的打点（只一条）
+static volatile int      g_io_unlocked_warn = 0;       // ahci_cmd 漏锁自检（只一条）
+
+// 任务 id 只用于“同一执行流重入”判定。安装介质内核不链 task64.cpp，所以用 weak 引用：
+// 取不到就统一当“无任务上下文”（那时还没调度，本来也没人抢）。
+extern "C" uint32_t task_current_id_64() __attribute__((weak));
+static inline uint32_t ahci_io_tag64() {
+    uint32_t (*fn)() = &task_current_id_64;             // weak：链不到就是 0
+    if (fn) return fn();
+    return 0xFFFFFFFFu;
+}
+
+static bool ahci_io_enter64() {
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0" : "=r"(fl));
+    (void)fl;                                   // 只在"等锁让出"那一小段临时开中断
+    const uint32_t me = ahci_io_tag64();
+    if (g_io_lock && g_io_owner == me && g_io_depth > 0) {   // 同一执行流嵌套：只加深度
+        g_io_depth++;
+        return true;
+    }
+    const uint64_t t0 = g_ticks64;
+    uint32_t spin = 0;
+    uint64_t guard = 0;                       // 自旋兜底：IF=0 时 g_ticks64 不前进（双保险）
+    for (;;) {
+        const uint64_t f2 = dbg64_irq_save64();
+        if (__sync_lock_test_and_set(&g_io_lock, 1) == 0) {
+            dbg64_irq_restore64(f2);
+            const uint64_t w = g_ticks64 - t0;
+            if (w) {                                        // 真的等过：留证据
+                g_io_waits++;
+                if (w > g_io_wait_max) g_io_wait_max = w;
+                if (!g_io_wait_logged && w >= 2) {
+                    g_io_wait_logged = 1;
+                    dbg64_line_begin64();
+                    dbg64_str("[AHCI64] io lock contended wait_ticks="); dbg64_dec(w);
+                    dbg64_str(" (说明确实有第二个执行流在读盘)");
+                    dbg64_nl();
+                    dbg64_line_end64();
+                }
+            }
+            g_io_owner = me;
+            g_io_depth = 1;
+            return true;
+        }
+        dbg64_irq_restore64(f2);
+        if ((g_ticks64 - t0) > (uint64_t)AHCI64_IO_LOCK_TICKS) {   // 有界：如实失败
+            if (!g_io_busy_logged) {
+                g_io_busy_logged = 1;
+                dbg64_line_begin64();
+                dbg64_str("[AHCI64] io lock BUSY ticks="); dbg64_dec(g_ticks64 - t0);
+                dbg64_str(" owner=");                      dbg64_dec(g_io_owner);
+                dbg64_str(" -> fail (如实失败，绝不抢锁)");
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+            return false;
+        }
+        if (++spin < 64u) __asm__ volatile("pause");
+        else {
+            spin = 0;
+            // ★ 必须**临时开中断**再 hlt（不能"IF=0 就纯自旋"）：syscall 分发全程 cli
+            //   （syscall_entry64.asm），单核下持有者要靠 PIT 被调度回来才能放锁。
+            //   实测过一次 `io lock BUSY ticks=0`（ticks 一动不动就是 IF=0 的铁证）。
+            const uint64_t f3 = dbg64_irq_save64();      // 记住 IF 并关中断
+            const bool was_on = (f3 & 0x200ULL) != 0;
+            __asm__ volatile("sti; hlt");
+            // ★ 必须**关回去**：dbg64_irq_restore64 只会在原本开着时 sti，永远不 cli；
+            //   而 syscall 分发全程 IF=0（syscall_entry64.asm），漏回去就等于让 syscall
+            //   变成可抢占的 —— 别的任务会在内核里看到半更新状态（实测：
+            //   `[ELF64] exec reject reason=read` + drvwatch 装载失败）。
+            if (was_on) __asm__ volatile("sti"); else __asm__ volatile("cli");
+        }
+        if (++guard > (uint64_t)AHCI64_SPIN_GUARD) {               // 有界：如实失败
+            if (!g_io_busy_logged) {
+                g_io_busy_logged = 1;
+                dbg64_line_begin64();
+                dbg64_str("[AHCI64] io lock BUSY spins="); dbg64_dec(guard);
+                dbg64_str(" ticks=");                      dbg64_dec(g_ticks64 - t0);
+                dbg64_str(" owner=");                      dbg64_dec(g_io_owner);
+                dbg64_str(" -> fail (自旋兜底)");
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+            return false;
+        }
+    }
+}
+
+static void ahci_io_leave64() {
+    if (!g_io_lock) return;                                 // 没拿着（理论上不会）：不动状态
+    if (g_io_depth > 1) { g_io_depth--; return; }
+    g_io_depth = 0;
+    g_io_owner = 0xFFFFFFFFu;
+    __sync_lock_release(&g_io_lock);
+}
+
+// 作用域守卫：任何 return 都会自动放锁（entry point 里提前 return 的路径很多，手写必漏）。
+struct Ahci64IoSpan {
+    bool held;
+    Ahci64IoSpan() : held(ahci_io_enter64()) {}
+    ~Ahci64IoSpan() { if (held) ahci_io_leave64(); }
+};
+
 // GHC.HR 自清等待（定义放在 init 之后也行；这里紧跟 ahci_wait）
 static bool ahci_wait_ghc_hr() {
     const uint64_t t0 = g_ticks64;
@@ -365,9 +500,22 @@ static bool ahci_cmd(int di, uint8_t cmd, uint64_t lba, uint32_t count,
     Ahci64Dev& d = g_devs[di];
     const uint8_t p = d.port;
 
+    // ★ v0.9.41：“发命令时必须持有 IO 锁”是本模块的硬不变式（见踩坑 L）。
+    //   五个 entry point 都套了 Ahci64IoSpan；将来若加了新路径忘记套，这里自检一次打点，
+    //   而不是默默发出一个可能和别人重叠的命令。
+    if (!g_io_lock && !g_io_unlocked_warn) {
+        g_io_unlocked_warn = 1;
+        dbg64_line_begin64();
+        dbg64_str("[AHCI64] WARN cmd issued WITHOUT io lock cmd=0x"); dbg64_hex64(cmd);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+
     // 端口必须在跑（ST=1 才能收命令）
     if (!(prd(p, P_CMD) & CMD_ST)) return false;
-    // 上一条命令必须已经结束（PxCI slot0 清零）；给 10 tick 的宽限
+    // 上一条命令必须已经结束（PxCI slot0 清零）；给 10 tick（40 ms）的宽限。
+    // ★ v0.9.41：有了 IO 锁之后，这里看到的只能是**我们自己**上一条的残留；
+    //   在锁之前这里会看到别的执行流在飞的命令，然后下一步 port_restart 把它掐死。
     if (!ahci_wait(p, P_CI, 1u, 0u, 10)) return false;
     const bool dump_first = (g_hdr_dumped == 0);                 // 只给第一条命令做逐字段打点
     // ---- 命令表（CFIS/ACMD/PRDT）----
@@ -505,66 +653,74 @@ static bool ahci_xfer(int di, uint8_t cmd, uint32_t lba, uint32_t count, void* b
     uint8_t* p8 = (uint8_t*)buf;
 
     for (uint32_t done = 0; done < count; ) {
-        const uint32_t nsec = (count - done > AHCI64_CHUNK_SECTORS)
-                            ? AHCI64_CHUNK_SECTORS : (count - done);
-        const uint32_t bytes = nsec * 512u;
-        uint8_t* p = p8 + (uint64_t)done * 512u;
+        // ★ v0.9.41：一个分块（≤128 扇区 / 一条命令）一把锁：从组 PRDT、写命令头、
+        //   写 PxCI、等 PxCI 清零，到把暂存页里的数据复制回调用方缓冲，中间不允许第二个
+        //   执行流插进来（否则 g_dma[] 与命令表会被覆盖）。
+        {
+            Ahci64IoSpan io;
+            if (!io.held) return false;
 
-        // ---- 直传路径：PA 连续且 2 字节对齐（一个 PRDT 项）----
-        const uint64_t pa = ahci_pa64(p);
-        Ahci64Prd prds[AHCI64_DMA_PAGES];
-        int nprd = 0;
-        bool bounce = false;
-        if (pa != 0 && (pa & 1u) == 0) {
-            prds[0].pa = pa;
-            prds[0].bytes = bytes;
-            nprd = 1;
-        } else {
-            // ---- 暂存路径：DMA 只碰页池里那 16 页，数据再逐页 memcpy ----
-            bounce = true;
-            if (!g_dma[0]) return false;              // 页池没拿到缓冲：如实失败
-            uint32_t left = bytes;
-            for (int i = 0; i < AHCI64_DMA_PAGES && left > 0; i++) {
-                prds[i].pa = (uint64_t)(uintptr_t)g_dma[i];
-                prds[i].bytes = (left > 4096u) ? 4096u : left;
-                left -= prds[i].bytes;
-                nprd++;
+            const uint32_t nsec = (count - done > AHCI64_CHUNK_SECTORS)
+                                ? AHCI64_CHUNK_SECTORS : (count - done);
+            const uint32_t bytes = nsec * 512u;
+            uint8_t* p = p8 + (uint64_t)done * 512u;
+
+            // ---- 直传路径：PA 连续且 2 字节对齐（一个 PRDT 项）----
+            const uint64_t pa = ahci_pa64(p);
+            Ahci64Prd prds[AHCI64_DMA_PAGES];
+            int nprd = 0;
+            bool bounce = false;
+            if (pa != 0 && (pa & 1u) == 0) {
+                prds[0].pa = pa;
+                prds[0].bytes = bytes;
+                nprd = 1;
+            } else {
+                // ---- 暂存路径：DMA 只碰页池里那 16 页，数据再逐页 memcpy ----
+                bounce = true;
+                if (!g_dma[0]) return false;              // 页池没拿到缓冲：如实失败
+                uint32_t left = bytes;
+                for (int i = 0; i < AHCI64_DMA_PAGES && left > 0; i++) {
+                    prds[i].pa = (uint64_t)(uintptr_t)g_dma[i];
+                    prds[i].bytes = (left > 4096u) ? 4096u : left;
+                    left -= prds[i].bytes;
+                    nprd++;
+                }
+                if (left != 0) return false;
+                if (write) {
+                    uint32_t off = 0;
+                    for (int i = 0; i < nprd; i++) {
+                        for (uint32_t k = 0; k < prds[i].bytes; k++) g_dma[i][k] = p[off + k];
+                        off += prds[i].bytes;
+                    }
+                }
             }
-            if (left != 0) return false;
-            if (write) {
+
+            if (!ahci_cmd_retry(di, cmd, (uint64_t)lba + done, nsec, prds, nprd, write, false)) {
+                dbg64_line_begin64();
+                dbg64_str(write ? "[AHCI64] write lba=" : "[AHCI64] read lba=");
+                dbg64_dec((uint64_t)lba + done);
+                dbg64_str(" count=");
+                dbg64_dec(nsec);
+                dbg64_str(" failed tfd=0x");
+                dbg64_hex64(prd(d.port, P_TFD));
+                dbg64_str(" is=0x");
+                dbg64_hex64(prd(d.port, P_IS));
+                dbg64_str(" serr=0x");
+                dbg64_hex64(prd(d.port, P_SERR));
+                dbg64_nl();
+                dbg64_line_end64();
+                return false;
+            }
+
+            if (bounce && !write) {
                 uint32_t off = 0;
                 for (int i = 0; i < nprd; i++) {
-                    for (uint32_t k = 0; k < prds[i].bytes; k++) g_dma[i][k] = p[off + k];
+                    for (uint32_t k = 0; k < prds[i].bytes; k++) p[off + k] = g_dma[i][k];
                     off += prds[i].bytes;
                 }
             }
+            done += nsec;
         }
-
-        if (!ahci_cmd_retry(di, cmd, (uint64_t)lba + done, nsec, prds, nprd, write, false)) {
-            dbg64_line_begin64();
-            dbg64_str(write ? "[AHCI64] write lba=" : "[AHCI64] read lba=");
-            dbg64_dec((uint64_t)lba + done);
-            dbg64_str(" count=");
-            dbg64_dec(nsec);
-            dbg64_str(" failed tfd=0x");
-            dbg64_hex64(prd(d.port, P_TFD));
-            dbg64_str(" is=0x");
-            dbg64_hex64(prd(d.port, P_IS));
-            dbg64_str(" serr=0x");
-            dbg64_hex64(prd(d.port, P_SERR));
-            dbg64_nl();
-            dbg64_line_end64();
-            return false;
-        }
-
-        if (bounce && !write) {
-            uint32_t off = 0;
-            for (int i = 0; i < nprd; i++) {
-                for (uint32_t k = 0; k < prds[i].bytes; k++) p[off + k] = g_dma[i][k];
-                off += prds[i].bytes;
-            }
-        }
-        done += nsec;
     }
     return true;
 }
@@ -574,6 +730,8 @@ static bool ahci_xfer(int di, uint8_t cmd, uint32_t lba, uint32_t count, void* b
 // 否则退回 LBA28（words 60/61）。ATAPI 只取型号（0xA1），容量记 0。
 // 签名只是提示（见踩坑 A）：0xEC 失败就换 0xA1 重试一次，并把 kind 改成与成功那条一致。
 static bool ahci_identify_try(int di, uint8_t cmd) {
+    Ahci64IoSpan io;                       // ★ v0.9.41：IDENTIFY 用 g_dma[0]，必须在锁里
+    if (!io.held) return false;
     Ahci64Dev& d = g_devs[di];
     uint8_t* tmp = g_dma[0];
     for (int i = 0; i < 512; i++) tmp[i] = 0;
@@ -942,42 +1100,47 @@ bool ahci64_read_frames64(int idx, uint32_t lba, uint32_t count,
     uint32_t done_sec = 0;
     uint32_t used_fr  = 0;
     while (done_sec < count) {
-        const uint32_t left = count - done_sec;
-        uint32_t fr = nframes - used_fr;
-        if (fr > (uint32_t)AHCI64_DMA_PAGES) fr = (uint32_t)AHCI64_DMA_PAGES;
-        uint32_t sec = fr * 8u;                    // 每帧 8 个 512B 扇区
-        if (sec > left) sec = left;
-        fr = (sec + 7u) / 8u;                      // 末块可能不满一帧
-        if (fr == 0) return false;
+        {
+            Ahci64IoSpan io;                       // ★ v0.9.41：零拷贝也要串行化（命令表每设备一份）
+            if (!io.held) return false;
 
-        Ahci64Prd prds[AHCI64_DMA_PAGES];
-        uint32_t sec_left = sec;
-        for (uint32_t i = 0; i < fr; i++) {
-            const uint64_t pa = frames[used_fr + i];
-            if (pa == 0 || (pa & 1ull) != 0) return false;   // 非法物理帧：如实拒绝
-            prds[i].pa = pa;
-            const uint32_t b = (sec_left > 8u) ? 4096u : sec_left * 512u;
-            prds[i].bytes = b;
-            sec_left -= (b / 512u);
-        }
-        if (sec_left != 0) return false;
+            const uint32_t left = count - done_sec;
+            uint32_t fr = nframes - used_fr;
+            if (fr > (uint32_t)AHCI64_DMA_PAGES) fr = (uint32_t)AHCI64_DMA_PAGES;
+            uint32_t sec = fr * 8u;                    // 每帧 8 个 512B 扇区
+            if (sec > left) sec = left;
+            fr = (sec + 7u) / 8u;                      // 末块可能不满一帧
+            if (fr == 0) return false;
 
-        if (!ahci_cmd_retry(di, ATA_CMD_READ_DMA_EXT, (uint64_t)lba + done_sec, sec,
-                            prds, (int)fr, false, false)) {
-            const uint8_t p = g_devs[di].port;
-            dbg64_line_begin64();
-            dbg64_str("[AHCI64] zerocopy read FAILED lba="); dbg64_dec((uint64_t)lba + done_sec);
-            dbg64_str(" secs=");   dbg64_dec(sec);
-            dbg64_str(" frames="); dbg64_dec(fr);
-            dbg64_str(" tfd=0x");  dbg64_hex64(prd(p, P_TFD));
-            dbg64_str(" is=0x");   dbg64_hex64(prd(p, P_IS));
-            dbg64_nl();
-            dbg64_line_end64();
-            return false;
+            Ahci64Prd prds[AHCI64_DMA_PAGES];
+            uint32_t sec_left = sec;
+            for (uint32_t i = 0; i < fr; i++) {
+                const uint64_t pa = frames[used_fr + i];
+                if (pa == 0 || (pa & 1ull) != 0) return false;   // 非法物理帧：如实拒绝
+                prds[i].pa = pa;
+                const uint32_t b = (sec_left > 8u) ? 4096u : sec_left * 512u;
+                prds[i].bytes = b;
+                sec_left -= (b / 512u);
+            }
+            if (sec_left != 0) return false;
+
+            if (!ahci_cmd_retry(di, ATA_CMD_READ_DMA_EXT, (uint64_t)lba + done_sec, sec,
+                                prds, (int)fr, false, false)) {
+                const uint8_t p = g_devs[di].port;
+                dbg64_line_begin64();
+                dbg64_str("[AHCI64] zerocopy read FAILED lba="); dbg64_dec((uint64_t)lba + done_sec);
+                dbg64_str(" secs=");   dbg64_dec(sec);
+                dbg64_str(" frames="); dbg64_dec(fr);
+                dbg64_str(" tfd=0x");  dbg64_hex64(prd(p, P_TFD));
+                dbg64_str(" is=0x");   dbg64_hex64(prd(p, P_IS));
+                dbg64_nl();
+                dbg64_line_end64();
+                return false;
+            }
+            done_sec += sec;
+            used_fr  += fr;
+            if (out_bytes) *out_bytes += (uint64_t)sec * 512ull;
         }
-        done_sec += sec;
-        used_fr  += fr;
-        if (out_bytes) *out_bytes += (uint64_t)sec * 512ull;
     }
     return true;
 }
@@ -998,42 +1161,47 @@ bool ahci64_write_frames64(int idx, uint32_t lba, uint32_t count,
     uint32_t done_sec = 0;
     uint32_t used_fr  = 0;
     while (done_sec < count) {
-        const uint32_t left = count - done_sec;
-        uint32_t fr = nframes - used_fr;
-        if (fr > (uint32_t)AHCI64_DMA_PAGES) fr = (uint32_t)AHCI64_DMA_PAGES;
-        uint32_t sec = fr * 8u;                    // 每帧 8 个 512B 扇区
-        if (sec > left) sec = left;
-        fr = (sec + 7u) / 8u;                      // 末块可能不满一帧
-        if (fr == 0) return false;
+        {
+            Ahci64IoSpan io;                       // ★ v0.9.41：零拷贝也要串行化（命令表每设备一份）
+            if (!io.held) return false;
 
-        Ahci64Prd prds[AHCI64_DMA_PAGES];
-        uint32_t sec_left = sec;
-        for (uint32_t i = 0; i < fr; i++) {
-            const uint64_t pa = frames[used_fr + i];
-            if (pa == 0 || (pa & 1ull) != 0) return false;   // 非法物理帧：如实拒绝
-            prds[i].pa = pa;
-            const uint32_t b = (sec_left > 8u) ? 4096u : sec_left * 512u;
-            prds[i].bytes = b;
-            sec_left -= (b / 512u);
-        }
-        if (sec_left != 0) return false;
+            const uint32_t left = count - done_sec;
+            uint32_t fr = nframes - used_fr;
+            if (fr > (uint32_t)AHCI64_DMA_PAGES) fr = (uint32_t)AHCI64_DMA_PAGES;
+            uint32_t sec = fr * 8u;                    // 每帧 8 个 512B 扇区
+            if (sec > left) sec = left;
+            fr = (sec + 7u) / 8u;                      // 末块可能不满一帧
+            if (fr == 0) return false;
 
-        if (!ahci_cmd_retry(di, ATA_CMD_WRITE_DMA_EXT, (uint64_t)lba + done_sec, sec,
-                            prds, (int)fr, true, false)) {
-            const uint8_t p = g_devs[di].port;
-            dbg64_line_begin64();
-            dbg64_str("[AHCI64] zerocopy write FAILED lba="); dbg64_dec((uint64_t)lba + done_sec);
-            dbg64_str(" secs=");   dbg64_dec(sec);
-            dbg64_str(" frames="); dbg64_dec(fr);
-            dbg64_str(" tfd=0x");  dbg64_hex64(prd(p, P_TFD));
-            dbg64_str(" is=0x");   dbg64_hex64(prd(p, P_IS));
-            dbg64_nl();
-            dbg64_line_end64();
-            return false;
+            Ahci64Prd prds[AHCI64_DMA_PAGES];
+            uint32_t sec_left = sec;
+            for (uint32_t i = 0; i < fr; i++) {
+                const uint64_t pa = frames[used_fr + i];
+                if (pa == 0 || (pa & 1ull) != 0) return false;   // 非法物理帧：如实拒绝
+                prds[i].pa = pa;
+                const uint32_t b = (sec_left > 8u) ? 4096u : sec_left * 512u;
+                prds[i].bytes = b;
+                sec_left -= (b / 512u);
+            }
+            if (sec_left != 0) return false;
+
+            if (!ahci_cmd_retry(di, ATA_CMD_WRITE_DMA_EXT, (uint64_t)lba + done_sec, sec,
+                                prds, (int)fr, true, false)) {
+                const uint8_t p = g_devs[di].port;
+                dbg64_line_begin64();
+                dbg64_str("[AHCI64] zerocopy write FAILED lba="); dbg64_dec((uint64_t)lba + done_sec);
+                dbg64_str(" secs=");   dbg64_dec(sec);
+                dbg64_str(" frames="); dbg64_dec(fr);
+                dbg64_str(" tfd=0x");  dbg64_hex64(prd(p, P_TFD));
+                dbg64_str(" is=0x");   dbg64_hex64(prd(p, P_IS));
+                dbg64_nl();
+                dbg64_line_end64();
+                return false;
+            }
+            done_sec += sec;
+            used_fr  += fr;
+            if (out_bytes) *out_bytes += (uint64_t)sec * 512ull;
         }
-        done_sec += sec;
-        used_fr  += fr;
-        if (out_bytes) *out_bytes += (uint64_t)sec * 512ull;
     }
     if (!g_first_zcwrite_logged) {
         g_first_zcwrite_logged = 1;
@@ -1159,6 +1327,9 @@ bool ahci64_cd_info64(int idx, DiskInfo* out) {
 // 发一条 CDB 并从设备 DMA 收 bytes 字节。走暂存页池（不依赖调用方缓冲的物理连续性）。
 static bool ahci_atapi_xfer(int di, const uint8_t* cdb, void* buf, uint32_t bytes) {
     if (bytes == 0) return true;
+    // ★ v0.9.41：暂存页池与 g_pkt_cdb 都是全驱动共享的，一条 CDB 必须独占
+    Ahci64IoSpan io;
+    if (!io.held) return false;
     if (!g_dma[0]) return false;                          // 页池没拿到缓冲：如实失败
     Ahci64Prd prds[AHCI64_DMA_PAGES];
     int nprd = 0;

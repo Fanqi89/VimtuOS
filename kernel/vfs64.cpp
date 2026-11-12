@@ -252,6 +252,112 @@ struct Vfs64Geom {
     bool     ro;                                     // 只读挂载（快照卷）
 };
 
+// ==================== ★ v0.9.41：VFS 大锁（第二层串行化）====================
+// 为什么 ahci 的锁不够（实测证据）：AHCI 串行化之后复跑仍偶发
+//   `[VFS64] BAD block=64/1572358150/3338665984 not in data area [520,24759)`
+//   `[ELF64] transient read retry attempt=1 ok`
+// —— 磁盘命令确实不重叠了，但**本文件这一大堆文件级 scratch 仍在被两个执行流互踩**：
+//   g_sec / g_l1..g_l3 / g_rm_* / inode 窗口缓存（g_ino_win + g_ino_cache_*）/ g_newblk …
+// A（kheart 装载 ring3 服务）刚把间接块读进 g_l1，B（引导线程读图标 / ring3 的 fd64 read）
+// 又把它覆盖成自己的，A 解析出来的块号就是垃圾（上面那串天文数字）。
+// 做法：与 ahci 同一套“让出式 + 可重入 + 有界”的锁，但作用在 **公开 API（逻辑操作）** 粒度：
+//   一次 lookup/stat/read/write/mkdir/list 从进到出一气呵成，中间不会被别的执行流插进来。
+// 代价与边界：VFS 操作因此串行（老的“大内核锁”思路）—— 这些都是毫秒级短操作，且 ahci 侧的
+//   分块锁保证单条 DMA 命令不会长时间占着盘；加锁顺序固定为 **VFS -> AHCI**（没有反向路径），
+//   不会成环。抢不到（4 s 或 4 亿次自旋）就**如实失败**，绝不抢锁。
+static const uint32_t VFS64_IO_LOCK_TICKS = 1000;      // 4 s：有界等锁上限
+
+static volatile int      g_vfs_io_lock  = 0;
+static volatile uint32_t g_vfs_io_owner = 0xFFFFFFFFu;
+static volatile uint32_t g_vfs_io_depth = 0;
+static volatile int      g_vfs_io_wait_logged = 0;
+static volatile int      g_vfs_io_busy_logged = 0;
+
+extern "C" uint32_t task_current_id_64() __attribute__((weak));   // 安装介质内核不链 task64.cpp
+static inline uint32_t vfs_io_tag64() {
+    uint32_t (*fn)() = &task_current_id_64;
+    if (fn) return fn();
+    return 0xFFFFFFFFu;
+}
+
+static bool vfs_io_enter64() {
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0" : "=r"(fl));
+    (void)fl;                                   // 只在"等锁让出"那一小段临时开中断
+    const uint32_t me = vfs_io_tag64();
+    if (g_vfs_io_lock && g_vfs_io_owner == me && g_vfs_io_depth > 0) {   // 同一执行流嵌套
+        g_vfs_io_depth++;
+        return true;
+    }
+    const uint64_t t0 = g_ticks64;
+    uint32_t spin = 0;
+    uint64_t guard = 0;
+    for (;;) {
+        const uint64_t f2 = dbg64_irq_save64();
+        if (__sync_lock_test_and_set(&g_vfs_io_lock, 1) == 0) {
+            dbg64_irq_restore64(f2);
+            const uint64_t w = g_ticks64 - t0;
+            if (w >= 2 && !g_vfs_io_wait_logged) {
+                g_vfs_io_wait_logged = 1;
+                dbg64_line_begin64();
+                dbg64_str("[VFS64] io lock contended wait_ticks="); dbg64_dec(w);
+                dbg64_str(" (有第二个执行流同时在用 VFS)");
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+            g_vfs_io_owner = me;
+            g_vfs_io_depth = 1;
+            return true;
+        }
+        dbg64_irq_restore64(f2);
+        if ((g_ticks64 - t0) > (uint64_t)VFS64_IO_LOCK_TICKS ||
+            ++guard > (uint64_t)400000000ull) {
+            if (!g_vfs_io_busy_logged) {
+                g_vfs_io_busy_logged = 1;
+                dbg64_line_begin64();
+                dbg64_str("[VFS64] io lock BUSY ticks="); dbg64_dec(g_ticks64 - t0);
+                dbg64_str(" owner=");                      dbg64_dec(g_vfs_io_owner);
+                dbg64_str(" -> fail (如实失败)");
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+            return false;
+        }
+        if (++spin < 64u) __asm__ volatile("pause");
+        else {
+            spin = 0;
+            // ★ 必须**临时开中断**再 hlt（不能"IF=0 就纯自旋"）：syscall 分发全程 cli
+            //   （syscall_entry64.asm），单核下持有者要靠 PIT 被调度回来才能放锁 ——
+            //   我们关着中断死转就永远等不到它。实测过一次 `io lock BUSY ticks=0`（ticks
+            //   一动不动就是 IF=0 的铁证），结果服务的 open(/etc/r3drv.conf) 直接失败、
+            //   退回默认配置。开完立刻按进来时的 IF 恢复。
+            const uint64_t f3 = dbg64_irq_save64();      // 记住 IF 并关中断
+            const bool was_on = (f3 & 0x200ULL) != 0;
+            __asm__ volatile("sti; hlt");
+            // ★ 必须**关回去**：dbg64_irq_restore64 只会在原本开着时 sti，永远不 cli；
+            //   而 syscall 分发全程 IF=0（syscall_entry64.asm），漏回去就等于让 syscall
+            //   变成可抢占的 —— 别的任务会在内核里看到半更新状态（实测：
+            //   `[ELF64] exec reject reason=read` + drvwatch 装载失败）。
+            if (was_on) __asm__ volatile("sti"); else __asm__ volatile("cli");
+        }
+    }
+}
+
+static void vfs_io_leave64() {
+    if (!g_vfs_io_lock) return;
+    if (g_vfs_io_depth > 1) { g_vfs_io_depth--; return; }
+    g_vfs_io_depth = 0;
+    g_vfs_io_owner = 0xFFFFFFFFu;
+    __sync_lock_release(&g_vfs_io_lock);
+}
+
+// 作用域守卫：任何 return 都会自动放锁
+struct Vfs64IoSpan {
+    bool held;
+    Vfs64IoSpan() : held(vfs_io_enter64()) {}
+    ~Vfs64IoSpan() { if (held) vfs_io_leave64(); }
+};
+
 static uint8_t  g_sec[VFS64_SECTOR_BYTES];            // 唯一工作扇区（先读进来再解析）
 static uint32_t g_ptrs[VFS64_INDIRECT_PTRS];          // 释放/搬运时用的 128 个块号
 // ★ 本轮（性能修复）：inode 表窗口缓存 —— 一窗 32 扇区 = 128 个 128B inode（表尾按实际块数裁剪）。
@@ -1256,6 +1362,8 @@ static const uint32_t QT_UNLIMITED = 0xFFFFFFFFu;
 
 // 打开某个特性（四个特性共用这一个入口；各自的区域分配见下）。
 int vfs64_feature_enable64(uint32_t bit) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("feature", "not mounted"); return -1; }
     if (g_lay->xattr_off == 0) {                       // v4/v3/v2：没有特性扩展头
         log_line("feature FAILED reason=volume-not-v5 (run migrate)");
@@ -1345,6 +1453,8 @@ void vfs64_features_dump64() {
 
 // 旧卷迁移：v4 -> v5 就地（inode/数据一个字节都不动；只改版本号 + 清扩展头 + 重算主 CRC）。
 int vfs64_migrate64() {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("migrate", "not mounted"); return -1; }
     if (g_cred.euid != 0) { log_line("migrate FAILED reason=need-root"); return -1; }
     const uint32_t from = g_lay->version;
@@ -1503,6 +1613,8 @@ static uint32_t qt_measure64(uint32_t uid) {
 }
 // 设置/查询额度（root 才能设；used 在设置时重算一次）
 int vfs64_quota_set64(uint32_t uid, uint32_t limit_blocks) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) return -1;
     if ((g_feat & VFS64_FEAT_QUOTA) == 0 || g_quota_blk == 0) {
         log_line("[QUOTA] set FAILED reason=quota-not-enabled");
@@ -1550,6 +1662,8 @@ int vfs64_quota_set64(uint32_t uid, uint32_t limit_blocks) {
     return 0;
 }
 int vfs64_quota_get64(uint32_t uid, uint32_t* limit_blocks, uint32_t* used_blocks) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (limit_blocks) *limit_blocks = 0;
     if (used_blocks) *used_blocks = 0;
     if (!g_mounted) return -1;
@@ -1583,6 +1697,8 @@ static int qt_putd64(char* o, uint32_t cap, uint32_t n, uint32_t v) {
     return (int)n;
 }
 int vfs64_quota_dump64(char* out, uint32_t cap) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!out || cap < 8u) return -1;
     out[0] = 0;
     if (!g_mounted) return -1;
@@ -1800,6 +1916,8 @@ static bool xattr_put64(uint8_t* ino, const char* name, const void* val, uint32_
 
 // ---- 对外：setxattr / getxattr（POSIX 名字，"system." 前缀的只能 root 或属主改）----
 int vfs64_setxattr64(const char* path, const char* name, const void* val, uint32_t vlen) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("setxattr", "not mounted"); return -1; }
     if (!path || !name) { log_op_fail("setxattr", "bad args"); return -1; }
     if (!acl_on64()) { log_line("[XATTR] setxattr FAILED reason=acl-feature-off"); return -1; }
@@ -1846,6 +1964,8 @@ int vfs64_setxattr64(const char* path, const char* name, const void* val, uint32
     return 0;
 }
 int vfs64_getxattr64(const char* path, const char* name, void* buf, uint32_t cap) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted || !path || !name) return -1;
     uint32_t idx = 0;
     if (path_resolve(path, false, &idx, nullptr, nullptr, nullptr) != 0) return -1;
@@ -1860,6 +1980,8 @@ int vfs64_getxattr64(const char* path, const char* name, void* buf, uint32_t cap
 }
 // 便捷入口：给 uid 授 perm3（rwx 三位）的访问权，并把其余项按当前 mode 补齐（含 MASK）。
 int vfs64_acl_grant64(const char* path, uint32_t uid, uint32_t perm3) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted || !path) return -1;
     if (!acl_on64()) { log_line("[ACL] grant FAILED reason=acl-feature-off"); return -1; }
     if (perm3 > 7u) return -1;
@@ -1973,6 +2095,8 @@ static bool snap_copy_dir64(SnapCtx64* c, const char* path, uint32_t depth) {
 // 拍快照。want_blocks == 0 = 自动按"当前已用数据块 × 2"估（至少 64 块）。
 // 返回快照 id（>= 1）；-1 = 失败（已打点，基卷数据不变；预留区若已分配就如实留在表里 state=0）。
 int vfs64_snapshot_take64(uint32_t want_blocks) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("snapshot", "not mounted"); return -1; }
     if (!sn_on64()) { log_line("[SNAP] take FAILED reason=snapshot-not-enabled"); return -1; }
     if (g_cred.euid != 0) { log_line("[SNAP] take FAILED reason=need-root"); return -1; }
@@ -2072,6 +2196,8 @@ int vfs64_snapshot_take64(uint32_t want_blocks) {
 }
 // 列快照表：返回条目数（-1 = 没开/读失败）；out 里 state 0=拷贝中 1=就绪
 int vfs64_snapshot_list64(Vfs64SnapInfo64* out, int max) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) return -1;
     uint8_t t[VFS64_SECTOR_BYTES];
     if (!sn_load64(t)) return -1;
@@ -2094,6 +2220,8 @@ int vfs64_snapshot_list64(Vfs64SnapInfo64* out, int max) {
 }
 // 把某个快照只读挂到一个卷槽上（已挂着就直接返回那个槽）。返回槽号；-1 = 失败（已打点）。
 int vfs64_snapshot_mount64(uint32_t id) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) return -1;
     uint8_t t[VFS64_SECTOR_BYTES];
     if (!sn_load64(t)) return -1;
@@ -3232,6 +3360,8 @@ static void touch_dir(uint32_t idx, int nlink_delta) {
 
 // ==================== 格式化（产出 v3）====================
 int vfs64_format(int drive, uint32_t start_lba, uint32_t total_sectors) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     // 参数先校验：不合法绝不碰任何状态（也就不会破坏当前已挂载的卷）
     if (total_sectors < VFS64_MIN_BLOCKS) {
         dbg64_str("[VFS64] format FAILED reason=too-small sectors=");
@@ -3406,6 +3536,8 @@ static void geom_apply(const Vfs64SbGeo& g) {
     ino_cache_invalidate();
 }
 int vfs64_mount(int drive, uint32_t start_lba) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64Geom saved;
     geom_save(&saved);
     g_mounted = false;
@@ -3503,6 +3635,8 @@ int vfs64_mount(int drive, uint32_t start_lba) {
     return 0;
 }
 int vfs64_probe_volume64(int drive, uint32_t start_lba, Vfs64VolInfo64* out) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     static uint8_t sec[VFS64_SECTOR_BYTES];               // 专用缓冲：不动 g_sec / 不动挂载状态
     if (!g_fake_active && !ata_linked()) {
         log_line("probe: no ATA driver linked");
@@ -3609,6 +3743,8 @@ int vfs64_slot_info64(int slot, int* drive, uint32_t* start_lba, Vfs64VolInfo64*
 
 // ---- 把一个卷挂进指定槽（不改变当前卷）----
 int vfs64_mount_slot64(int slot, int drive, uint32_t start_lba) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (slot < 0 || slot >= (int)VFS64_SLOT_MAX) { log_slot_bad("mount_slot64", slot); return -1; }
     const int saved_cur = g_cur_slot;
     if (slot == saved_cur) {                                // 挂进当前槽：mount 内部自己 save/restore
@@ -3668,6 +3804,8 @@ int vfs64_activate_slot64(int slot) {
 
 // ---- 挂系统卷：0 号槽 + 记成系统卷槽 + 激活 ----
 int vfs64_mount_system64(int drive, uint32_t start_lba) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     const int slot = 0;                                     // 约定：系统卷固定 0 号槽（盘符 C:）
     const int existed = vfs64_slot_find64(drive, start_lba);
     if (existed >= 0) {
@@ -3808,72 +3946,100 @@ void vfs64_scope_leave64(int saved_slot) {
 
 // ---- 按槽别名（系统组件固定写系统卷用的入口；期间身份 = root，见 Vfs64SlotGuard）----
 int vfs64_stat_on64(int slot, const char* path, uint32_t* type, uint32_t* size) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("stat", slot);
     return vfs64_stat(path, type, size);
 }
 int vfs64_stat64_on64(int slot, const char* path, Vfs64Info64* out) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("stat64", slot);
     return vfs64_stat64(path, out);
 }
 int vfs64_read_on64(int slot, const char* path, void* buf, int max) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("read", slot);
     return vfs64_read(path, buf, max);
 }
 int vfs64_write_on64(int slot, const char* path, const void* buf, int len) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("write", slot);
     return vfs64_write(path, buf, len);
 }
 // ★ 批次 M：大文件读写/流式写的按槽变体（fs64 固定卷读写用）
 int vfs64_read_at_on64(int slot, const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) { if (out_got) *out_got = 0; return on64_slot_unavailable("read_at", slot); }
     return vfs64_read_at64(path, off, buf, len, out_got);
 }
 int vfs64_write_at_on64(int slot, const char* path, uint32_t off, const void* buf, uint32_t len) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("write_at", slot);
     return vfs64_write_at64(path, off, buf, len);
 }
 int vfs64_write_stream_on64(int slot, const char* path, uint32_t len, Vfs64Src64 src, void* ctx) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("write_stream", slot);
     return vfs64_write_stream64(path, len, src, ctx);
 }
 int vfs64_mkdir_on64(int slot, const char* path) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("mkdir", slot);
     return vfs64_mkdir(path);
 }
 int vfs64_create_on64(int slot, const char* path) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("create", slot);
     return vfs64_create64(path);
 }
 int vfs64_unlink_on64(int slot, const char* path) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("unlink", slot);
     return vfs64_unlink(path);
 }
 int vfs64_rmdir_on64(int slot, const char* path) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("rmdir", slot);
     return vfs64_rmdir64(path);
 }
 int vfs64_ls_on64(int slot, const char* path, char names[][VFS64_LS_NAME_BUF], int max, uint32_t* sizes) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("ls", slot);
     return vfs64_ls(path, names, max, sizes);
 }
 int vfs64_list64_on64(int slot, const char* path, Vfs64Dirent64* out, int max, uint32_t* cursor) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("list64", slot);
     return vfs64_list64(path, out, max, cursor);
 }
 int vfs64_tree_dump64_on64(int slot, const char* path, int max_entries, int max_depth) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("tree_dump64", slot);
     return vfs64_tree_dump64(path, max_entries, max_depth);
@@ -3881,6 +4047,8 @@ int vfs64_tree_dump64_on64(int slot, const char* path, int max_entries, int max_
 
 // ★ 批次 J：同目录改名 / 空间查询 的按槽入口（explorer 复制/剪切/粘贴时按显式卷操作）
 int vfs64_rename_on64(int slot, const char* old_path, const char* new_name) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("rename", slot);
     return vfs64_rename64(old_path, new_name);
@@ -3892,17 +4060,23 @@ int vfs64_free_on64(int slot, uint32_t* free_blocks, uint32_t* free_bytes, uint3
 }
 // ★ 本批：inode 统计的按槽入口（statfs 用；只读、不改挂载状态，返回语义同上）。
 int vfs64_inode_stats_on64(int slot, uint32_t* files, uint32_t* ffree) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("inode_stats", slot);
     return vfs64_inode_stats64(files, ffree);
 }
 // ★ P4：chmod/chown 的按槽入口（userdb64 给 /home/<user> 设属主/模式用；期间身份 = root）
 int vfs64_chmod_on64(int slot, const char* path, uint32_t mode) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("chmod", slot);
     return vfs64_chmod64(path, mode);
 }
 int vfs64_chown_on64(int slot, const char* path, uint32_t uid, uint32_t gid) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("chown", slot);
     return vfs64_chown64(path, uid, gid);
@@ -4011,6 +4185,8 @@ static int read_at_retry64(const char* path, const char* op, const uint8_t* ino0
 
 // 路径版：读 [off, off+len)（**缓冲区由调用方给**；*out_got = 实际读到的字节数）。
 int vfs64_read_at64(const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (out_got) *out_got = 0;
     if (!g_mounted) { log_op_fail("read_at64", "not mounted"); return -1; }
     uint8_t ino[VFS64_INODE_BYTES_MAX];
@@ -4022,6 +4198,8 @@ int vfs64_read_at64(const char* path, uint32_t off, void* buf, uint32_t len, uin
 }
 // 兼容旧 API：整读前 max 字节（= read_at64(path, 0, buf, max)）。
 int vfs64_read64(const char* path, void* buf, int max) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("read64", "not mounted"); return -1; }
     uint8_t ino[VFS64_INODE_BYTES_MAX];
     const int lk = lookup_or_cache64(path, "read64", ino);      // ★ v0.5.7：同上
@@ -4032,7 +4210,11 @@ int vfs64_read64(const char* path, void* buf, int max) {
     if (read_at_retry64(path, "read64", ino, 0, buf, (uint32_t)max, &got) != 0) return -1;
     return (int)got;
 }
-int vfs64_read(const char* path, void* buf, int max) { return vfs64_read64(path, buf, max); }
+int vfs64_read(const char* path, void* buf, int max) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
+    return vfs64_read64(path, buf, max);
+}
 
 // ==================== 写文件（★ 批次 M：流式建链 + 部分写）====================
 // 数据源：内存缓冲（vfs64_write64 用）
@@ -4103,6 +4285,8 @@ static void fill_new_file_ino64(uint8_t* ino, const char* nm, uint32_t nlen, uin
 // 语义与旧 vfs64_write64 逐条一致（中途失败只泄漏块，绝不让 inode 指向已释放的块）。
 // ★ P4：写权限判定在 write_resolve64 里（已有文件 w / 新建父目录 w+x），这里只透传错误码。
 int vfs64_write_stream64(const char* path, uint32_t len, Vfs64Src64 src, void* ctx) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("write_stream64", "not mounted"); return -1; }
     if (!path) { log_op_fail("write_stream64", "bad args"); return -1; }
     uint32_t idx = 0, parent = 0, nlen = 0;
@@ -4154,6 +4338,8 @@ int vfs64_write_stream64(const char* path, uint32_t len, Vfs64Src64 src, void* c
 }
 // 兼容旧 API：整文件重写（buf 必须装得下 len 字节）
 int vfs64_write64(const char* path, const void* buf, int len) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("write64", "not mounted"); return -1; }
     if (!path || (!buf && len > 0) || len < 0) { log_op_fail("write64", "bad args"); return -1; }
     const uint32_t lim = (g_lay->dind_off != 0) ? VFS64_MAX_FILE_BYTES : VFS64_MAX_FILE_BYTES_V2;
@@ -4162,11 +4348,17 @@ int vfs64_write64(const char* path, const void* buf, int len) {
     s.p = (const uint8_t*)buf;
     return vfs64_write_stream64(path, (uint32_t)len, (len > 0) ? mem_src64 : nullptr, &s);
 }
-int vfs64_write(const char* path, const void* buf, int len) { return vfs64_write64(path, buf, len); }
+int vfs64_write(const char* path, const void* buf, int len) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
+    return vfs64_write64(path, buf, len);
+}
 
 // ★ 部分写 / 追加（不存在则创建）：保留原有字节，缺块按需分配，off > size 的空洞补零。
 // 返回 0 = 成功；-1 = 失败（**盘上 inode 不变**）；-EACCES = 权限不足（write_resolve 已打点）。
 int vfs64_write_at64(const char* path, uint32_t off, const void* buf, uint32_t len) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("write_at64", "not mounted"); return -1; }
     if (!path || (!buf && len > 0)) { log_op_fail("write_at64", "bad args"); return -1; }
     uint32_t idx = 0, parent = 0, nlen = 0;
@@ -4459,6 +4651,8 @@ static bool truncate_grow64(uint8_t* ino, uint32_t idx, uint32_t new_size) {
 }
 // 截断 / 改变文件大小（POSIX truncate(2) 语义；**不创建文件**）。语义与打点见 vfs64.h 的声明注释。
 int vfs64_truncate64(const char* path, uint32_t len) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("truncate", "not mounted"); return -1; }
     if (!path) { log_op_fail("truncate", "bad args"); return -1; }
     // 上限：与 write_at / write_stream 同一口径（v2 卷 67584，v3/v4 = 8 MiB）；**先查上限再动盘**
@@ -4503,6 +4697,8 @@ int vfs64_truncate64(const char* path, uint32_t len) {
 }
 // 按槽变体：期间"卷"= slot、"身份"= root（与其它 *_on64 完全同形，见 Vfs64SlotGuard）
 int vfs64_truncate_on64(int slot, const char* path, uint32_t len) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("truncate", slot);
     return vfs64_truncate64(path, len);
@@ -4516,6 +4712,8 @@ int vfs64_migrate_on64(int slot) {
 // 建空文件（父目录必须存在；已存在且是文件 = 0 幂等；是目录 = -1）。
 // ★ P4：新建走 write 的权限判定（父目录 w+x），已存在则要 w（覆盖提交一次空内容 = 截断语义）。
 int vfs64_create64(const char* path) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("create64", "not mounted"); return -1; }
     if (!path) { log_op_fail("create64", "bad args"); return -1; }
     uint32_t idx = 0;
@@ -4537,6 +4735,8 @@ int vfs64_create64(const char* path) {
 // ==================== ★ v0.7.0：符号链接 ====================
 // 目标字符串放第一个数据块（<= 511 B），inode.size = 目标长度；不解析、不跟随。
 int vfs64_symlink64(const char* target, const char* linkpath) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("symlink", "not mounted"); return -1; }
     if (!target || !linkpath || !target[0]) { log_op_fail("symlink", "bad args"); return -1; }
     const uint32_t tlen = alias_slen64(target);
@@ -4603,6 +4803,8 @@ int vfs64_symlink64(const char* target, const char* linkpath) {
 
 // 读符号链接目标（**不跟随**）；返回字节数（不补 NUL），不是链接/失败返回 -1
 int vfs64_readlink64(const char* path, char* buf, int cap) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted || !path || !buf || cap <= 0) return -1;
     char abuf[VFS64_PATH_MAX + 1];
     const char* p = vfs64_alias_path64(path, abuf, (uint32_t)sizeof(abuf));
@@ -4620,6 +4822,8 @@ int vfs64_readlink64(const char* path, char* buf, int cap) {
 }
 
 int vfs64_mkdir64(const char* path) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("mkdir64", "not mounted"); return -1; }
     if (!path) { log_op_fail("mkdir64", "bad args"); return -1; }
 
@@ -4659,7 +4863,11 @@ int vfs64_mkdir64(const char* path) {
     touch_dir(parent, (g_lay->nlink_off != 0) ? 1 : 0);   // 父目录：mtime 刷新 + nlink+1（子目录数）
     return 0;
 }
-int vfs64_mkdir(const char* path) { return vfs64_mkdir64(path); }
+int vfs64_mkdir(const char* path) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
+    return vfs64_mkdir64(path);
+}
 
 // ★ v0.7.9 诊断用：inode 窗口累计重填次数（只读，不改任何状态）。
 uint32_t vfs64_ino_fill_count64(void) { return g_ino_fill64; }
@@ -4710,10 +4918,14 @@ static int mkdirs_core64(const char* path) {
     return 0;
 }
 int vfs64_mkdirs64(const char* path) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("mkdirs64", "not mounted"); return -1; }
     return mkdirs_core64(path);
 }
 int vfs64_mkdirs_on64(int slot, const char* path) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64SlotGuard g(slot, true);
     if (!g.active) return on64_slot_unavailable("mkdirs", slot);
     return mkdirs_core64(path);
@@ -4721,6 +4933,8 @@ int vfs64_mkdirs_on64(int slot, const char* path) {
 
 // 删除普通文件。★ P4：删除只要**父目录 w+x**（Linux 不在删的时候看文件本身的权限）。
 int vfs64_unlink64(const char* path) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("unlink64", "not mounted"); return -1; }
     if (!path) { log_op_fail("unlink64", "bad args"); return -1; }
 
@@ -4772,10 +4986,16 @@ int vfs64_unlink64(const char* path) {
     touch_dir(parent, 0);
     return 0;
 }
-int vfs64_unlink(const char* path) { return vfs64_unlink64(path); }
+int vfs64_unlink(const char* path) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
+    return vfs64_unlink64(path);
+}
 
 // 删除空目录。★ P4：父目录 w+x（并且目标目录本身会被删掉，不需要目标自己的权限 —— Linux 语义）。
 int vfs64_rmdir64(const char* path) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("rmdir64", "not mounted"); return -1; }
     if (!path) { log_op_fail("rmdir64", "bad args"); return -1; }
 
@@ -4825,6 +5045,8 @@ int vfs64_rmdir64(const char* path) {
 // 跨目录移动要改 parent 并且维护两个目录的 nlink，属于另一档复杂度，本批**明说不做**。
 // 改名（同目录）。★ P4：所在目录需要 w+x。
 int vfs64_rename64(const char* old_path, const char* new_name) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("rename64", "not mounted"); return -1; }
     if (!old_path || !new_name) { log_op_fail("rename64", "bad args"); return -1; }
 
@@ -5016,6 +5238,8 @@ int vfs64_free64(uint32_t* free_blocks, uint32_t* free_bytes, uint32_t* total_bl
 // ★ 本批：inode 统计（只读；statfs(137) 的 f_files/f_ffree 用）。判定与 alloc_inode 同一口径。
 // 为什么放在这里（而不是各自数一遍）：分配器找空槽的逻辑在 alloc_inode；这里只**数**，不改状态。
 int vfs64_inode_stats64(uint32_t* files, uint32_t* ffree) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("inode_stats64", "not mounted"); return -1; }
     uint32_t used = 0;                                            // 1..count-1 里已用的 inode 数
     uint8_t ino[VFS64_INODE_BYTES_MAX];
@@ -5088,7 +5312,11 @@ static int chmod64_common(const char* path, uint32_t mode) {
     dbg64_line_end64();
     return 0;
 }
-int vfs64_chmod64(const char* path, uint32_t mode) { return chmod64_common(path, mode); }
+int vfs64_chmod64(const char* path, uint32_t mode) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
+    return chmod64_common(path, mode);
+}
 
 static int chown64_common(const char* path, uint32_t uid, uint32_t gid) {
     if (!g_mounted) { log_op_fail("chown64", "not mounted"); return -1; }
@@ -5138,10 +5366,16 @@ static int chown64_common(const char* path, uint32_t uid, uint32_t gid) {
     dbg64_line_end64();
     return 0;
 }
-int vfs64_chown64(const char* path, uint32_t uid, uint32_t gid) { return chown64_common(path, uid, gid); }
+int vfs64_chown64(const char* path, uint32_t uid, uint32_t gid) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
+    return chown64_common(path, uid, gid);
+}
 
 // access(2)：mask 用 Linux 低 3 位（4=r / 2=w / 1=x；0 = 只查存在）。
 int vfs64_access64(const char* path, uint32_t mask) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("access64", "not mounted"); return -1; }
     if (!path) { log_op_fail("access64", "bad args"); return -1; }
     uint32_t idx = 0;
@@ -5203,6 +5437,8 @@ static int list_inode64(uint32_t dir, Vfs64Dirent64* out, int max, uint32_t* cur
 }
 // 列目录（路径版）。★ P4：需要 r（**列目录不要求目录有 x** —— 与 Linux 一致：x 只用于遍历路径）。
 int vfs64_list64(const char* path, Vfs64Dirent64* out, int max, uint32_t* cursor) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("list64", "not mounted"); return -1; }
     if (!path) { log_op_fail("list64", "bad args"); return -1; }
     uint32_t idx = 0;
@@ -5223,6 +5459,8 @@ int vfs64_list64(const char* path, Vfs64Dirent64* out, int max, uint32_t* cursor
 // 查属性。★ P4：stat 只看路径遍历（父目录 x）—— 不需要目标自己的 r（Linux 语义），
 //   uid/gid/mode 一并给出（旧卷：uid=gid=0、mode = 默认 0755/0644）。
 int vfs64_stat64(const char* path, Vfs64Info64* out) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("stat64", "not mounted"); return -1; }
     if (!path || !out) { log_op_fail("stat64", "bad args"); return -1; }
     uint32_t idx = 0;
@@ -5257,6 +5495,8 @@ int vfs64_stat64(const char* path, Vfs64Info64* out) {
     return 0;
 }
 int vfs64_stat(const char* path, uint32_t* type, uint32_t* size) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     Vfs64Info64 in;
     if (vfs64_stat64(path, &in) != 0) return -1;
     if (type) *type = in.type;
@@ -5284,6 +5524,8 @@ static bool stream_vol_ok(const Vfs64DirStream* st) {
 }
 
 int vfs64_opendir64(const char* path, int* out_handle) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("opendir64", "not mounted"); return -1; }
     if (!path || !out_handle) { log_op_fail("opendir64", "bad args"); return -1; }
     uint32_t idx = 0;
@@ -5313,6 +5555,8 @@ int vfs64_opendir64(const char* path, int* out_handle) {
     return -1;
 }
 int vfs64_readdir64(int handle, Vfs64Dirent64* out) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (handle < 0 || handle >= (int)VFS64_DIRSTREAM_MAX) { log_op_fail("readdir64", "bad handle"); return -1; }
     Vfs64DirStream* st = &g_streams[handle];
     if (!st->used) { log_op_fail("readdir64", "handle not open"); return -1; }
@@ -5338,6 +5582,8 @@ int vfs64_closedir64(int handle) {
 
 // ---- 兼容 API：vfs64_ls（[32] 名字缓冲）----
 int vfs64_ls(const char* path, char names[][VFS64_LS_NAME_BUF], int max, uint32_t* sizes) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("ls", "not mounted"); return -1; }
     if (!path || !names || !sizes || max <= 0) { log_op_fail("ls", "bad args"); return -1; }
     uint32_t cursor = 0;
@@ -5426,6 +5672,8 @@ static void tree_walk(uint32_t dir, const char* prefix, int depth, TreeDumpCtx* 
     }
 }
 int vfs64_tree_dump64(const char* path, int max_entries, int max_depth) {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     if (!g_mounted) { log_op_fail("tree", "not mounted"); return -1; }
     if (!path || max_entries <= 0 || max_depth < 0) { log_op_fail("tree", "bad args"); return -1; }
     uint32_t idx = 0;
@@ -5468,6 +5716,8 @@ int vfs64_tree_dump64(const char* path, int max_entries, int max_depth) {
 
 // ==================== 状态打印（验收 grep）====================
 void vfs64_dump64() {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return;
     dbg64_line_begin64();                       // ★ 行原子（dump 行很长，且中段有 return）
     dbg64_str("[VFS64] dump mounted=");
     dbg64_str(g_mounted ? "yes" : "no");
@@ -5588,6 +5838,8 @@ static int sel_find(char names[][VFS64_LS_NAME_BUF], int n, const char* want) {
     return -1;
 }
 int vfs64_selftest64() {
+    Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
+    if (!_vfs_io.held) return -5;
     int fails = 0;
     Vfs64Geom saved;
     geom_save(&saved);
