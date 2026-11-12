@@ -319,8 +319,68 @@ static int e64_read_at64(const char* path, uint64_t off, uint8_t* buf, uint32_t 
 static int e64_read_meta64(const char* path, uint64_t file_len, uint16_t* out_phnum) {
     if (file_len < ELF64_EHDR_SIZE) return E64_SIZE;
     if (e64_read_at64(path, 0, g_e64_hdr64, ELF64_EHDR_SIZE) != 0) return E64_VFS;
+    // ★ v0.9.40 修复（drv64 "崩溃后立刻重启" 场景的间歇性 flake）：
+    //   现场证据（`[ELF64] diag magic` 那一行，见下面的诊断块）：第一次读到的头**不是**这个文件
+    //   的内容 —— 实测拿到过 `/etc/r3drv.conf` 的头几个字节（b0=0x23202F6574632F72）和全 0xFF，
+    //   而**紧接着重读同一段就完全正确**（same=0 magic2=1）。也就是说这是一次"偶发坏读"（读到
+    //   的不是目标扇区），不是文件坏了、更不是装载逻辑错。
+    //   处理：在**能自验证**的地方（ELF 魔数）做有界重试（最多 2 次），成功就如实打点
+    //   `[ELF64] transient read retry attempt=N ok`（不静默、不假装一次就成）。
+    //   如实边界：底层 AHCI/ATA 完成语义仍待专项排查 —— 这条重试只覆盖"能验证"的读，
+    //   不能让任意坏读都变得不可见。
     if (!(g_e64_hdr64[0] == 0x7F && g_e64_hdr64[1] == 'E' &&
-          g_e64_hdr64[2] == 'L' && g_e64_hdr64[3] == 'F')) return E64_MAGIC;
+          g_e64_hdr64[2] == 'L' && g_e64_hdr64[3] == 'F')) {
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            if (e64_read_at64(path, 0, g_e64_hdr64, ELF64_EHDR_SIZE) != 0) break;
+            if (g_e64_hdr64[0] == 0x7F && g_e64_hdr64[1] == 'E' &&
+                g_e64_hdr64[2] == 'L' && g_e64_hdr64[3] == 'F') {
+                dbg64_line_begin64();
+                dbg64_str("[ELF64] transient read retry attempt=");
+                dbg64_dec((uint64_t)attempt);
+                dbg64_str(" ok path=");
+                dbg64_str(path ? path : "-");
+                dbg64_nl();
+                dbg64_line_end64();
+                break;
+            }
+        }
+    }
+    if (!(g_e64_hdr64[0] == 0x7F && g_e64_hdr64[1] == 'E' &&
+          g_e64_hdr64[2] == 'L' && g_e64_hdr64[3] == 'F')) {
+        // ★ 诊断（**不改判据**，只加证据）：drv64 的"崩溃后立刻重启"场景偶发
+        //   `exec reject reason=magic`（服务二进制读到的头不是 ELF）。要分清三种可能：
+        //   (a) 读到全 0（数据没落盘）(b) 读到**别的扇区**（IO/缓存串号）(c) 文件真坏了。
+        //   做法：打出前 16 字节，并**紧接着重读同一段**——两次不一致 = 时序/缓存问题，
+        //   两次一致但不是 ELF = 文件内容真的不对。判据一条没动（仍然 return E64_MAGIC）。
+        dbg64_line_begin64();
+        dbg64_str("[ELF64] diag magic path=");
+        dbg64_str(path ? path : "-");
+        dbg64_str(" b0=");
+        uint64_t dw0 = 0;
+        for (int i = 0; i < 8; i++) dw0 = (dw0 << 8) | g_e64_hdr64[i];
+        dbg64_hex64(dw0);
+        dbg64_str(" b8=");
+        uint64_t dw1 = 0;
+        for (int i = 8; i < 16; i++) dw1 = (dw1 << 8) | g_e64_hdr64[i];
+        dbg64_hex64(dw1);
+        {
+            uint8_t again[ELF64_EHDR_SIZE];
+            const int r2 = e64_read_at64(path, 0, again, ELF64_EHDR_SIZE);
+            int same = 1;
+            for (int i = 0; i < 16; i++) if (again[i] != g_e64_hdr64[i]) same = 0;
+            const int ok2 = (again[0] == 0x7F && again[1] == 'E' &&
+                             again[2] == 'L' && again[3] == 'F') ? 1 : 0;
+            dbg64_str(" reread=");
+            dbg64_dec((uint64_t)(r2 == 0 ? 1 : 0));
+            dbg64_str(" same=");
+            dbg64_dec((uint64_t)same);
+            dbg64_str(" magic2=");
+            dbg64_dec((uint64_t)ok2);
+        }
+        dbg64_nl();
+        dbg64_line_end64();
+        return E64_MAGIC;
+    }
     const uint64_t phoff = e_rd64(g_e64_hdr64 + 32);
     const uint16_t phentsize = e_rd16(g_e64_hdr64 + 54);
     const uint16_t phnum = e_rd16(g_e64_hdr64 + 56);

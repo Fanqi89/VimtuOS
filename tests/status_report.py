@@ -3781,7 +3781,10 @@ def cap_r3drv_rpc():
         "成功当失败，ready 永远为 0；② 服务每次 `zc_read` 的 DMA 落点就是应答区，LIST 边建边写把前几条冲掉"
         "（`names=,,sub`）→ 改成先攒本地再整体落。",
         "★ 时序坑：`magic` 必须**服务就绪后**才发布（进服务循环前），否则内核在服务启动解析期间发请求，150 ms 必超时。",
-        "★ 边界（如实）：单通道单请求、每请求 ≤ 4 KiB、无缓存；**还没接进文件管理器**（下一步 fs64/drive64/explorer）",
+        "★ v0.9.40 起：**文件管理器点击级**已经通了（tests/ext4gui64_test.py 34/34），"
+        "终端的 `ls/cat` 也通了（tests/ext4term64_test.py 17/17）—— 原来那条"
+        "「还没接进文件管理器」的边界已消除。",
+        "★ 边界（如实）：单通道单请求、每请求 ≤ 4 KiB、无缓存；**没有 STATFS**（ext4 容量如实未知）。",
     ]
     done = req > 0 and yld > 0 and pol > 0
     return ("DONE" if done else "PARTIAL"), ev
@@ -3844,6 +3847,46 @@ def cap_vfs_snapshot():
     ]
     done = tbl > 0 and take > 0 and ro > 0 and api > 0
     return ("DONE" if done else "PARTIAL"), ev
+
+
+def cap_ext4_gui():
+    """★ v0.9.40「GUI 里真能双击 ext4 盘并看文件」：从 fs64 分派通 升级到 像素+点击级。"""
+    need = ["tests/ext4gui64_test.py", "kernel/explorer64.cpp", "kernel/drive64.cpp", "kernel/fs64.cpp"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    t = grep_count(r"ext4r_mounted_at64|DRV64_FS_EXT4", ["kernel/drive64.cpp"])
+    v = grep_count(r"FS64_KIND_EXT4R", ["kernel/fs64.cpp"])
+    ev = [
+        "盘符链（drive64 命中 %d）：ext4 认成 FS64_KIND_EXT4R 只读服务卷 -> 盘符 D: + ro=1" % t,
+        "★ 修掉的两个真缺陷：① 重复扫描时「卷号已被占用」把 D: 降级成「未识别磁盘」-> 盘符消失；"
+        "② fs64_current_vol64() 只放行 FAT32/vfs 槽，ext4 激活后又退回 C:（explorer 报 vol-mismatch）",
+        "fs64 五处按卷种类分派到 ring3 服务（命中 %d）：list64/stat64/read64/read_range64/ls64" % v,
+        "验收 tests/ext4gui64_test.py **34/34**：真 PS/2 双击 D: 卡片 -> enter letter=D: slot=255 ok items=3；"
+        "列表 hello.txt(kind=text)/big.bin/sub(dir)；双击 hello.txt -> preview name=hello.txt bytes=13；"
+        "预览窗标题行/正文行文字像素 190 / 181；全程 kheart 心跳、无 PANIC",
+        "★ 边界（如实）：宿主窗口通道本机 **UNVERIFIED** —— 宿主屏 1366x768 装不下 1280x800 的 1:1 窗口，"
+        "整窗截帧只能对上 84%（脚本记 SKIP(env)，不谎报通过）；客人 screendump 与 PNG 已留档",
+    ]
+    return ("DONE", ev)
+
+
+def cap_ext4_term():
+    """★ v0.9.40「终端 / fd64 接上 ext4 服务卷」：终端里 ls/cat 能看 ext4 的文件。"""
+    need = ["tests/ext4term64_test.py", "kernel/fs64.cpp", "kernel/fd64.cpp"]
+    miss = [x for x in need if not exists(x)]
+    if miss:
+        return "MISSING", ["缺文件：%s" % ", ".join(miss)]
+    n = grep_count(r"FS64_KIND_EXT4R", ["kernel/fs64.cpp"])
+    ev = [
+        "终端整条链：vol d（slot=255）-> ls -> fd64 目录句柄 -> fs64_ls64 的 ext4 分支（命中 %d）-> 反向 RPC" % n,
+        "cat 走 fd64 read -> fs64_read_range64 的 ext4 分支（同一处分派）",
+        "验收 tests/ext4term64_test.py **17/17**：cmd ls entries=3 bytes=100013（= 夹具 100000+13）、"
+        "[FD64] open path=/hello.txt vol=9、cmd cat bytes=13、只读卷写被拒（cmd write fail 且目录仍 3 条）、"
+        "切回 C: 后 ls entries=10 不受影响、服务侧 DMA 396800 -> 435200",
+        "★ 边界（如实）：ext4 卷只读（写入口统一 -EROFS）；RPC 仍单通道单请求",
+    ]
+    return ("DONE", ev)
 
 
 CAPS = [
@@ -4027,6 +4070,10 @@ CAPS = [
     ("架构", "★ ring3 驱动通道的**写方向**（R3DRV_F_WRITE + ahci64_write_frames64 + 私有号 "
              "write(1036)；宿主逐字节核对 + 变化块集合最小）", cap_r3drv_write),
     ("架构", "★ 内核 -> ring3 服务的**反向请求通道**（R3drvReq + 150 ms 有界等待 + 每圈让出 CPU；LIST/STAT/READ，4 KiB 流式）", cap_r3drv_rpc),
+    ("存储", "★ v0.9.40 GUI 点击级：文件管理器里双击 D:（ext4 只读服务卷）能列目录、双击 hello.txt 弹只读预览",
+     cap_ext4_gui),
+    ("应用", "★ v0.9.40 终端/fd64 接上 ext4 服务卷：内核终端 vol D + ls/cat 走 fd64 -> fs64 -> 反向 RPC",
+     cap_ext4_term),
 ]
 
 

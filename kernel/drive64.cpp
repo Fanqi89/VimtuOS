@@ -115,6 +115,20 @@ static bool fs_fat_probe(int disk, uint32_t start_lba, Fat64Info64* out) {
     return (fat64_probe64(disk, start_lba, out) == 0);
 }
 
+// ★ v0.9.40：这个 (disk, lba) 上是不是**已经挂好的** ext4 服务卷？是则返回卷号，否则 -1。
+//   为什么必须有它：drive64_scan64() 是**可重复调用**的（explorer 每次刷新、自检都会重扫），
+//   而 ext4 只占一个统一卷号（FS64_VOL_EXT4_BASE=9）。第一版用"卷号还没被占"当挂载条件，
+//   于是第二次扫描就把同一条 ext4 盘降级成"未识别/未挂载" —— 界面上 D: 卡片会直接消失（实测）。
+//   正确口径：**同一个 (disk, lba) 永远认领回同一个卷号**；只有另一块 ext4 盘才轮到"已占用"。
+static int ext4r_mounted_at64(int disk, uint32_t lba) {
+    const int v = fs64_ext4r_vol64();
+    if (v < 0) return -1;
+    Fs64Vol64 fv;
+    if (fs64_vol_info64(v, &fv) != 0) return -1;
+    if (fv.disk != disk || fv.start_lba != lba) return -1;
+    return v;
+}
+
 // ==================== 扫描 ====================
 static void add_entry(const DriveInfo64& e, int* idx_out) {
     if (g_count >= (int)DRV64_MAX_ENTRIES) {
@@ -177,13 +191,36 @@ int drive64_scan64() {
         if (used_entries == 0) {
             // ★ v0.9.40：**整盘没有分区表，但认得出 ext4**（夹具 / 裸盘就是这种形态）
             //   -> 与分区分支同样处理：登记只读服务卷 + 给盘符。解析仍然在 ring3 服务里。
-            if (r3drv64_probe_proto64 && r3drv64_probe_proto64((uint32_t)d, 0u) == R3DRV_PROTO_EXT4
-                && fs64_ext4r_vol64() < 0) {
+            // ★ 缺陷修复（v0.9.40 GUI 验收暴露）：条件原来是 `… && fs64_ext4r_vol64() < 0`，
+            //   重扫时"卷号已被占用"就落到下面"未识别磁盘(无分区表)"分支 -> D: 卡片消失。
+            //   现在先按 (disk, lba) 认领：同一条 ext4 整盘永远回到同一个**可浏览**条目；
+            //   只有**另一块** ext4 整盘才报"卷号已占用"（绝不覆盖已挂的卷，也不给盘符）。
+            if (r3drv64_probe_proto64 && r3drv64_probe_proto64((uint32_t)d, 0u) == R3DRV_PROTO_EXT4) {
+                const int same = ext4r_mounted_at64(d, 0u);
+                if (same < 0 && fs64_ext4r_vol64() >= 0) {
+                    DriveInfo64 o;
+                    zero_bytes(&o, (uint32_t)sizeof(o));
+                    o.slot = DRV64_SLOT_NONE;
+                    o.fatvol = DRV64_SLOT_NONE;
+                    o.vol = -1;
+                    o.present = true;
+                    o.disk = d;
+                    o.part = 0;
+                    o.start_lba = 0;
+                    o.sectors = (di.sectors > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)di.sectors;
+                    o.fskind = DRV64_FS_EXT4;
+                    copy_str(o.fs, DRV64_FS_MAX, "ext4(未挂载)");
+                    copy_str(o.name, DRV64_NAME_MAX, "ext4 卷（服务卷号已占用）");
+                    o.browsable = false;
+                    o.skip = DRV64_SKIP_NOFS;
+                    add_entry(o, nullptr);
+                    continue;
+                }
                 DriveInfo64 x;
                 zero_bytes(&x, (uint32_t)sizeof(x));
                 x.slot = DRV64_SLOT_NONE;
                 x.fatvol = DRV64_SLOT_NONE;
-                x.vol = fs64_register_ext4r64(d, 0u, nullptr);
+                x.vol = (same >= 0) ? same : fs64_register_ext4r64(d, 0u, nullptr);
                 x.present = true;
                 x.disk = d;
                 x.part = 0;
@@ -313,9 +350,19 @@ int drive64_scan64() {
                 //   探测只读分区字节，不依赖服务；服务没就绪时读操作会如实返回超时/EAGAIN ——
                 //   绝不假装成功（界面显示空目录，而不是假文件）。
                 fs_recognized++;
-                if (fs64_ext4r_vol64() < 0) {
+                // ★ 缺陷修复（v0.9.40 GUI 验收暴露）：条件原来是"卷号还没被占就挂"，重扫时同一条
+                //   ext4 分区会被当成"第二个分区"降级成不可浏览（盘符消失）。改为按 (disk, lba) 认领。
+                const int same = ext4r_mounted_at64(d, p[i].start);
+                if (same < 0 && fs64_ext4r_vol64() >= 0) {
+                    // 卷号只有一个：**另一块** ext4 分区如实标出来但不给盘符（绝不覆盖已挂的卷）。
+                    e.fskind = DRV64_FS_EXT4;
+                    copy_str(e.fs, DRV64_FS_MAX, "ext4(未挂载)");
+                    copy_str(e.name, DRV64_NAME_MAX, "ext4 卷（服务卷号已占用）");
+                    e.browsable = false;
+                    e.skip = DRV64_SKIP_NOFS;
+                } else {
                     Fs64Vol64 xv;
-                    const int xvol = fs64_register_ext4r64(d, p[i].start, &xv);
+                    const int xvol = (same >= 0) ? same : fs64_register_ext4r64(d, p[i].start, &xv);
                     e.fskind = DRV64_FS_EXT4;
                     copy_str(e.fs, DRV64_FS_MAX, "ext4");
                     copy_str(e.name, DRV64_NAME_MAX, "ext4 卷（ring3 只读服务）");
@@ -325,13 +372,6 @@ int drive64_scan64() {
                     e.total_known = false;              // 容量由服务自报（STATFS 未做，如实未知）
                     e.free_known = false;
                     e.skip = DRV64_SKIP_NONE;
-                } else {
-                    // 卷号只有一个：第二个 ext4 分区如实标出来但不给盘符（绝不覆盖已挂的卷）。
-                    e.fskind = DRV64_FS_EXT4;
-                    copy_str(e.fs, DRV64_FS_MAX, "ext4(未挂载)");
-                    copy_str(e.name, DRV64_NAME_MAX, "ext4 卷（服务卷号已占用）");
-                    e.browsable = false;
-                    e.skip = DRV64_SKIP_NOFS;
                 }
             } else {
                 copy_str(e.fs, DRV64_FS_MAX, magic ? "VimtuFS2(坏卷)" : "unknown");
@@ -643,7 +683,10 @@ int drive64_selftest64() {
     for (int i = 0; i < g_count; i++) {
         const DriveInfo64& e = g_entries[i];
         if (!e.browsable) continue;
-        if (!e.total_known) { fails |= 2; continue; }
+        // ★ v0.9.40：ext4 只读**服务卷**的容量由 ring3 服务自报，STATFS 还没做 -> **如实未知**。
+        //   这与 fs64 自己的自检是同一口径（fs64.cpp 也放行 EXT4R 的 total_known=0）。
+        //   不算放宽：条目一旦声称有容量，后面的 total>0 / free<=total 照旧全查。
+        if (!e.total_known) { if (e.fskind != DRV64_FS_EXT4) fails |= 2; continue; }
         if (e.total_kb == 0) { fails |= 2; continue; }
         if (!e.free_known) { if (e.fskind != DRV64_FS_FAT32) fails |= 2; continue; }
         if (e.free_kb > e.total_kb) fails |= 2;
@@ -731,6 +774,15 @@ int drive64_selftest64() {
             if ((fv.readonly ? 1 : 0) != (e.readonly ? 1 : 0)) { fails |= 64; continue; }
             if (!fv.readonly && fv.disk < ATA64_USB_BASE) { fails |= 64; continue; }
             if (fv.disk != e.disk || fv.start_lba != e.start_lba) fails |= 64;
+        } else if (e.fskind == DRV64_FS_EXT4) {
+            // ★ v0.9.40：ext4 是**服务卷**，不占 vfs64 槽（slot=NONE 合法）。它的不变式改成
+            //   "条目与统一卷表一致"：卷必须真是 EXT4R、盘/起始 LBA 对得上、而且必须只读。
+            //   —— 这比原先那条（要求 vfs64 槽）更严，不是放水。
+            Fs64Vol64 ev;
+            if (fs64_vol_info64(e.vol, &ev) != 0) { fails |= 64; continue; }
+            if (ev.kind != FS64_KIND_EXT4R) { fails |= 64; continue; }
+            if (ev.disk != e.disk || ev.start_lba != e.start_lba) { fails |= 64; continue; }
+            if (!ev.readonly || !e.readonly) fails |= 64;
         } else {
             if (e.slot == DRV64_SLOT_NONE || e.slot >= (uint8_t)VFS64_SLOT_MAX) { fails |= 64; continue; }
             int sd = -1;

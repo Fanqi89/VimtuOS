@@ -945,7 +945,14 @@ void r3drv64_tick64() {
         if (s.state == R3DRV_ST_DYING) {
             if (s.pid > 0 && !alive) {
                 why = "exit";
-            } else if ((g_ticks64 - s.started_tick) > (uint64_t)(g_beat_ticks * 5u)) {
+            } else if ((g_ticks64 - s.started_tick) > (uint64_t)(g_beat_ticks * 20u)) {
+                // ★ v0.9.40：窗口从 5 个 beat 放宽到 20 个（250*20 tick * 4ms = 20 s），仍然**有界**。
+                //   为什么：这个窗口限的是**装载 + 初始化**这一段，它的耗时由盘速/装载器决定，与
+                //   "服务是否还活着"无关。实测崩溃重启场景里装载一次要 5024 ms（偶发坏读触发
+                //   AHCI 命令超时 + 端口重启重试，见 kernel/vfs64.cpp 与 elf64.cpp 的重试注释），
+                //   紧卡 5 s 窗口时会先把**正在正常装载**的新实例 kill 掉（日志：
+                //   `service died … reason=register-timeout lat_ms=0` 紧跟 `restart attempt=2 ok`）。
+                //   进程"建了又没了"仍然走上面那条立即判死，不受影响。
                 why = "register-timeout";            // 拉起后迟迟不注册：当失败处理
             }
         } else if (!alive) {

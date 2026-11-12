@@ -3977,6 +3977,38 @@ static int lookup_file64(const char* path, const char* op, uint32_t* out_idx, ui
     if (out_idx) *out_idx = idx;
     return 0;
 }
+// ★ v0.9.40：偶发坏读的**有界重试**（只重试"结构可验证"的失败）。
+//   现场证据（drv64 崩溃重启场景，10 次里 2~3 次）：
+//     * `[ELF64] diag magic … b0=0x23202F6574632F72`（读到的是 /etc/r3drv.conf 的头）且
+//       紧接着重读就正确（same=0 magic2=1）；
+//     * `[VFS64] BAD block=4294967295 not in data area` -> `[ELF64] exec reject reason=read`。
+//   两者都是"盘读没把数据落到目标缓冲"（缓冲里还是上一次的内容），一次重读就恢复。
+//   这里只对**能自证的结构错误**（坏块链 / 非法块号）重试 —— 内容层面的错（文件真坏了）不重试。
+//   重试成功会打 `[VFS64] transient read retry ok path=…`，绝不静默。
+static uint32_t g_vfs_retry_ok64 = 0, g_vfs_retry_fail64 = 0;
+
+static int read_at_retry64(const char* path, const char* op, const uint8_t* ino0,
+                           uint32_t off, void* buf, uint32_t len, uint32_t* out_got) {
+    int rc = read_at_inode(ino0, off, buf, len, out_got);
+    if (rc == 0) return 0;
+    uint8_t ino2[VFS64_INODE_BYTES_MAX];
+    if (lookup_file64(path, op, nullptr, ino2) != 0) { g_vfs_retry_fail64++; return rc; }
+    uint32_t got2 = 0;
+    if (read_at_inode(ino2, off, buf, len, &got2) != 0) { g_vfs_retry_fail64++; return rc; }
+    g_vfs_retry_ok64++;
+    dbg64_line_begin64();
+    dbg64_str("[VFS64] transient read retry ok path=");
+    dbg64_str(path ? path : "?");
+    dbg64_str(" off=");
+    dbg64_dec((uint64_t)off);
+    dbg64_str(" got=");
+    dbg64_dec((uint64_t)got2);
+    dbg64_nl();
+    dbg64_line_end64();
+    if (out_got) *out_got = got2;
+    return 0;
+}
+
 // 路径版：读 [off, off+len)（**缓冲区由调用方给**；*out_got = 实际读到的字节数）。
 int vfs64_read_at64(const char* path, uint32_t off, void* buf, uint32_t len, uint32_t* out_got) {
     if (out_got) *out_got = 0;
@@ -3986,7 +4018,7 @@ int vfs64_read_at64(const char* path, uint32_t off, void* buf, uint32_t len, uin
     if (lk != 0) return lk;
     const int pc = perm_check_ino64(ino, "read", path, VFS64_NEED_R);      // ★ P4：读要 r
     if (pc != 0) { log_op_fail("read_at64", "permission denied (r)"); return pc; }
-    return read_at_inode(ino, off, buf, len, out_got);
+    return read_at_retry64(path, "read_at64", ino, off, buf, len, out_got);
 }
 // 兼容旧 API：整读前 max 字节（= read_at64(path, 0, buf, max)）。
 int vfs64_read64(const char* path, void* buf, int max) {
@@ -3997,7 +4029,7 @@ int vfs64_read64(const char* path, void* buf, int max) {
     const int pc = perm_check_ino64(ino, "read", path, VFS64_NEED_R);      // ★ P4：读要 r
     if (pc != 0) { log_op_fail("read64", "permission denied (r)"); return pc; }
     uint32_t got = 0;
-    if (read_at_inode(ino, 0, buf, (uint32_t)max, &got) != 0) return -1;
+    if (read_at_retry64(path, "read64", ino, 0, buf, (uint32_t)max, &got) != 0) return -1;
     return (int)got;
 }
 int vfs64_read(const char* path, void* buf, int max) { return vfs64_read64(path, buf, max); }

@@ -288,6 +288,12 @@ int fs64_activate64(int vol) {
 int fs64_current_vol64() {
     if (g_cur >= 0 && g_cur < FS64_VOL_MAX && g_vols[g_cur].kind != FS64_KIND_NONE) {
         if (g_vols[g_cur].kind == FS64_KIND_FAT32) return g_cur;
+        // ★ v0.9.40 缺陷修复（GUI 点击验收暴露）：ext4 只读**服务卷**也**不占** vfs64 槽
+        //   （vfs_slot = -1）。原来这里只放行 FAT32，于是 fs64_activate64(9) 明明成功了，
+        //   下一次 fs64_current_vol64() 又去问 vfs64 当前槽（= C: 的槽）-> 退回 C:，
+        //   explorer 立刻报 `enter letter=D: vol=9 FAILED reason=vol-mismatch`（实测）。
+        //   语义：ext4 卷的"当前"就是 g_cur 本身，没有第二处真相可以问。
+        if (g_vols[g_cur].kind == FS64_KIND_EXT4R) return g_cur;
         if (vfs64_current_slot64() == g_vols[g_cur].vfs_slot) return g_cur;
     }
     const int s = vfs64_current_slot64();
@@ -514,6 +520,25 @@ int fs64_ls64(int vol, const char* path, char names[][VFS64_LS_NAME_BUF], int ma
         }
         return got;
     }
+    if (g_vols[v].kind == FS64_KIND_EXT4R) {
+        // ★ v0.9.40：ext4 服务卷的目录来自 ring3（一次反向 RPC 拿回整目录 ≤64 条），
+        //   这里只转成 ls 口径（名字 + 大小；目录给 0，与 FAT/ISO 一致）。
+        //   为什么需要这一处：终端的 `ls` 与 fd64 的目录句柄都走 fs64_ls64，
+        //   原来只有 VIMTUFS2/ISO/FAT 三个分支，ext4 落到最后会去问 fat_slot=-1（必失败）。
+        if (!ext4vol64_list64) return -1;
+        static R3drvDirent64 etmp[EXT4VOL_MAX_ENTRIES];
+        int en = 0, emore = 0;
+        if (ext4vol64_list64(path, etmp, EXT4VOL_MAX_ENTRIES, &en, &emore) != 0) return -1;
+        int egot = 0;
+        for (int i = 0; i < en && egot < max; i++) {
+            int k = 0;
+            for (; etmp[i].name[k] && k < (int)VFS64_LS_NAME_BUF - 1; k++) names[egot][k] = etmp[i].name[k];
+            names[egot][k] = 0;
+            if (sizes) sizes[egot] = (etmp[i].type == 2u) ? 0u : etmp[i].size;
+            egot++;
+        }
+        return egot;
+    }
     static Fat64Entry64 tmp[8];
     int got = 0;
     uint32_t cursor = 0;
@@ -699,6 +724,12 @@ int fs64_read_range64(int vol, const char* path, uint32_t off, void* buf, uint32
     }
     if (g_vols[v].kind == FS64_KIND_ISO9660)
         return iso966064_read64(path, off, buf, len, out_got);
+    if (g_vols[v].kind == FS64_KIND_EXT4R) {
+        // ★ v0.9.40：按偏移读服务卷（终端 cat / fd64 的分块读都走这一条）。
+        //   服务侧每次最多给一页（8 扇区）——ext4vol64_read64 内部就该切片，见 kernel/ext4vol64.cpp。
+        if (!ext4vol64_read64) return -1;
+        return ext4vol64_read64(path, off, buf, len, out_got);
+    }
     return fat64_read_range64(g_vols[v].fat_slot, path, off, buf, len, out_got);
 }
 // ★ 批次 M：分块写（按偏移，保留原有字节；off > 当前大小 = 空洞补零）。只读卷一律 -FS64_EROFS。
