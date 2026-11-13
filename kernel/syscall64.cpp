@@ -209,6 +209,7 @@ int64_t wl64_surface_export64(uint64_t, uint64_t)                 __attribute__(
 int64_t wl64_surface_map64(uint64_t, uint64_t)                    __attribute__((weak));
 int64_t wl64_surface_ack64(uint64_t)                              __attribute__((weak));
 int64_t wl64_seat_post64(uint64_t)                                __attribute__((weak));
+int64_t wl64_surface_move64(uint64_t, uint64_t)                   __attribute__((weak));   // ★ W3 第二批：27
 // ★ A4-5：信号投递（kernel/sig64.cpp）**两份内核都链**它，所以这里是强引用（不是弱引用）；
 //   它内部对 proc64 的访问才是弱引用（安装内核没有进程表 -> 只做参数校验，如实不投递）。
 static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
@@ -3766,6 +3767,13 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
         ret = wl64_seat_post64 ? wl64_seat_post64(a1) : -1;
         if (!wl64_seat_post64) syscall64_deny64(nr, a1);
         break;                                              // ★ 这条 case 的 break 不能少：少了会掉进 48 号（pci_map_bar）
+
+    // ★ W3 第二批：27 = wl_surface_move(surf, xy) —— 窗口重定位（拖动）。语义/权限/夹取：kernel/wl64.h。
+    //   xy = (x 低 32 位) | (y 高 32 位)，与 17 号 damage 的打包口径一致。
+    case 27:                                                    // wl_surface_move(surf, xy)
+        ret = wl64_surface_move64 ? wl64_surface_move64(a1, a2) : -1;
+        if (!wl64_surface_move64) syscall64_deny64(nr, a1);
+        break;
     // ★ 本批：用户态设备映射（48 pci_map_bar）。语义/权限/错误码：kernel/syscall64.h 的那一段。
     //   第 4 个参数（out_len）在 r10 —— 与 fb_flip(10) 同款（自有 ABI 只有 rdi/rsi/rdx + r10）。
     //   安装介质内核不链 proc64.cpp -> proc64_devmap64 为 0 -> 返回 -1 并 deny（不假装成功）。

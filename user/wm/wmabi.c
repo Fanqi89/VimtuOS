@@ -23,3 +23,10 @@ int wl_surface_ack(int surf) {
 int wl_seat_post(struct Wl64SeatEvent* ev) {
     return (int)__v64_int80(V64_NR_WL_SEAT_POST, (long)(unsigned long)ev, 0, 0, 0);
 }
+
+/* ★ W3 第二批：27 号。xy 打包口径与 17 号 damage 一致：低 32 位 = x，高 32 位 = y（都按有符号解释）。 */
+int wl_surface_move(int surf, int x, int y) {
+    const unsigned long xy = (unsigned long)(unsigned int)x |
+                             ((unsigned long)(unsigned int)y << 32);
+    return (int)__v64_int80(V64_NR_WL_SURFACE_MOVE, (long)surf, (long)xy, 0, 0);
+}

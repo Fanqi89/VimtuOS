@@ -77,23 +77,44 @@ static void ev64_log_drop64(Ev64Queue* q, int pid, uint32_t type) {
     }
 }
 
+// ==================== ★ W3 第二批：队列锁 ====================
+// 拿锁：cli + 置位。单核下 cli 已经保证伊不会被 IRQ 打断；SMP 下自旋等持有者放锁
+//   （持有者抖锁期间 IF=0，所以单核下永远不会真的碰到 spin）。
+static inline uint64_t ev64_lock64(Ev64Queue* q) {
+    uint64_t fl;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
+    while (q->lock) __asm__ volatile("pause" ::: "memory");
+    q->lock = 1u;
+    return fl;
+}
+static inline void ev64_unlock64(Ev64Queue* q, uint64_t fl) {
+    q->lock = 0u;
+    if (fl & 0x200ULL) __asm__ volatile("sti" ::: "memory");
+}
+
 void ev64_push64(Ev64Queue* q, int pid, const Ev64Event* e) {
     if (!q || !e) return;
-    if (q->count >= EV64_MAX_EVENTS64) {         // 满：丢**最旧**（不静默：计数 + 打点）
+    int dropped = 0;
+    const uint64_t fl = ev64_lock64(q);
+    if (q->count >= EV64_MAX_EVENTS64) {          /* 满：丢**最旧** */
         q->head = (q->head + 1u) % EV64_MAX_EVENTS64;
         q->count--;
         q->drops++;
-        ev64_log_drop64(q, pid, e->type);
+        dropped = 1;
     }
-    const uint32_t idx = (q->head + q->count) % EV64_MAX_EVENTS64;
-    q->ev[idx] = *e;
-    q->count++;
+    {
+        const uint32_t idx = (q->head + q->count) % EV64_MAX_EVENTS64;
+        q->ev[idx] = *e;
+        q->count++;
+    }
+    ev64_unlock64(q, fl);
+    /* ★ drop 落账放到锁外：它会写串口（长操作），绝不能占着队列锁。 */
+    if (dropped) ev64_log_drop64(q, pid, e->type);
 }
 
 uint32_t ev64_pop64(Ev64Queue* q, Ev64Event* out, uint32_t max) {
     if (!q || !out || max == 0) return 0;
-    uint64_t fl = 0;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
+    const uint64_t fl = ev64_lock64(q);
     uint32_t n = 0;
     while (n < max && q->count > 0) {
         out[n] = q->ev[q->head];
@@ -101,7 +122,7 @@ uint32_t ev64_pop64(Ev64Queue* q, Ev64Event* out, uint32_t max) {
         q->count--;
         n++;
     }
-    __asm__ volatile("pushq %0; popfq" :: "r"(fl) : "memory", "cc");
+    ev64_unlock64(q, fl);
     return n;
 }
 

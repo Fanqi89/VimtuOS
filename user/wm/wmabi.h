@@ -26,6 +26,7 @@
 #define V64_NR_WL_SURFACE_MAP     24
 #define V64_NR_WL_SURFACE_ACK     25
 #define V64_NR_WL_SEAT_POST       26
+#define V64_NR_WL_SURFACE_MOVE    27   /* ★ W3 第二批：窗口重定位（拖动）*/
 
 /* 22 号的返回值：低 8 位 = seat id，bit8 = 显示后端是 virtio-gpu 2D 设备（0 = soft-lfb） */
 #define V64_WM_GPU_BIT            0x100u
@@ -76,6 +77,9 @@ int wl_surface_export(int idx, struct Wm64SurfaceInfo* out);
 int wl_surface_map(int surf, struct Wm64SurfaceMap* out);
 int wl_surface_ack(int surf);
 int wl_seat_post(struct Wl64SeatEvent* ev);
+/* ★ W3 第二批：27 号 —— 把 surface 的屏幕位置改成 (x,y)。拥有者自己可调；注册合成器可挪任何窗口。
+ * 语义/夹取/权限的唯一定义点在 kernel/wl64.h 的 27 号说明。 */
+int wl_surface_move(int surf, int x, int y);
 
 /* ---- rdtsc（用户态计时）----
  * 内核从不设 CR4.TSD（见 kernel/usermode64.cpp 的 CR4 只开 OSFXSR/OSXMMEXCPT），所以 ring3 的

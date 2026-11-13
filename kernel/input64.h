@@ -106,6 +106,7 @@ struct Ev64Queue {
     uint32_t  drops;         // 因满而丢弃的最旧事件数
     uint32_t  drop_logged;   // 已经打过的 drop 行数（节流用）
     uint32_t  suppressed;    // 被节流掉的 drop 行数（补打在 [EV64] drops 行里）
+    volatile uint32_t lock;  // ★ W3 第二批：每队列锁（0 = 空闲）。push/pop 都要拿它；push 会被 IRQ 与任务两个上下文调用。
 };
 
 void     ev64_reset64(Ev64Queue* q);

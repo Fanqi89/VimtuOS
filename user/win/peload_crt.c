@@ -534,11 +534,14 @@ static i64 pack2(int lo, int hi) {
 #define MB_H      150
 #define MB_BYTES  (MB_W * MB_H * 4u)
 /* 超时：它只是**测试与无人值守**的兜底（不是 Windows 的行为；真 Windows 会一直等）。
- * 为什么是 8 s（而不是更久）：实测把超时放到 20 s 时，**对话框停在那里约 16 s 后进程会被
- *   内核侧某处 `[PROC64] kill pid=<n> sig=9` 干掉**（串口里 close 行根本没出现，退出码 137）。
- *   8 s 之内收尾是干净的：`msgboxA close reason=timeout` -> `[PROC64] exit code=0`。
- *   这个 SIGKILL 的**来源还没查清**（不在 W3 的产品路径上：它发生在"对话框一直开着"时），
- *   如实记在这里，等 W3 收尾/合成器升级时一起查。 */
+ * 为什么是 8 s：实测**超过 ~16 s 之后进程会被内核侧某处 `[PROC64] kill pid=<n> sig=9` 干掉**
+ *   （串口里 close 行不出现、退出码 137）。8 s 之内收尾是干净的：
+ *   `msgboxA close reason=timeout` -> `[PROC64] exit code=0`。
+ *   ★ W3 第二批实测复核：把超时抬到 45 s 之后，tests/peload64_test.py 的 ⑩ 段立刻从
+ *   "close reason=timeout + exit 0" 变成 "无 close 行 + exit=137" —— **这条 SIGKILL 是真的、
+ *   可复现的**，而且和合成器无关（那时还没有合成器）。所以这里**保持 8 s**，
+ *   不去踩那条还没查清的 kill 路径。拖动/点击这类需要长寿命对话框的验收另想办法
+ *   （见 tests/wmfull64_test.py 顶部说明）。 */
 #define MB_TIMEOUT_MS 8000u
 
 /* 配色（XRGB8888，高字节忽略） */

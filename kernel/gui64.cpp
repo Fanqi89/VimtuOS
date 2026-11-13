@@ -4760,7 +4760,9 @@ static int deskpos_y64(int i) { int x = 0, y = 0; desktopops64_pos64(i, &x, &y);
             const uint64_t tsc_dt = (g_perf_tsc && tsc_now > g_perf_tsc) ? (tsc_now - g_perf_tsc) : 0;
             g_perf_tsc = tsc_now;
             g_perf_sec++;
-            if (g_perf_sec >= 2 && g_perf_sec <= 180) {   // 前 180 秒每秒一行，之后停（日志有界）
+            if (g_perf_sec >= 2 && g_perf_sec <= 1800) {   // 前 1800 秒每秒一行，之后停（日志有界）
+            // ★ W3 第二批：180 -> 1800。perf 行是夹具拿光标绝对坐标的唯一实时手段（cur=x,y），
+            //   TCG 下开机到桌面就要 ~150 s，180 s 的预算根本不够拖拽/点击用。
                 const uint32_t rn = g_perf_rn ? g_perf_rn : 1;
                 const uint64_t cyc_per_frame = g_perf_rcyc / rn;
                 // µs = 周期 / (周期每秒) * 1e6；TSC 频率就用本秒实测值（不写死任何机器常数）

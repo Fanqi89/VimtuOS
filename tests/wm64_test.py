@@ -6,23 +6,42 @@
   ① `wm` 进程起来并 **fb_map 成功**（`[WM] map .. u=1 bytes=..`）+ 注册成合成器
      （`[WL64] composer pid=.. gpu=..`），并且**内核从此不再合成**（注册之后一行 [WL64] composite
      都没有 —— 合成真的搬到用户态了）；
-  ② 两个客户端（wmclock / wmpanel）的 shm surface 被 wm 合成上屏（像素：外置面板区里出现
-     时钟的色带色 + 交互面板的底色/标题色）；
-  ③ **damage 语义**：时钟只改一个小块（几个字形）-> 面板区里、damage 矩形之外的像素**逐字节不变**
-     （给出差异计数与包围盒）；区域之外也给出逐字节差异计数；
-  ④ **z 序**：两块 surface 故意重叠 -> 重叠区像素 = 上层（id 大）的内容色，且 != 下层的色；
+  ② 两个客户端（wmclock / wmpanel）的 shm surface 被 wm 用 27 号挪到**屏幕正中**（级联偏移 28px）
+     后合成上屏（像素：窗口里出现时钟的色带色 + 交互面板的底色/标题色）；
+  ③ **damage 语义**：时钟只改一个小块（几个字形）-> 窗口里、damage 矩形之外的像素**逐字节不变**
+     （给出差异计数与包围盒）；**窗口之外**也给出逐字节差异计数；
+  ④ **z 序**：两块 surface 级联后**仍然**故意重叠 -> 重叠区像素 = 上层（id 大）的内容色，且 != 下层的色；
   ⑤ **seat 事件路由**：注入鼠标点到 wmpanel 上 -> 它切换（像素变化），事件是 **wm 在用户态命中
      测试后用 wl_seat_post 投过去的**（内核只搬运：`[WL64] seatpost surf=.. pid=<wmpanel>`），
      且**没有**送给内核外壳（外壳的 ring0 点击处理路径没有任何新行）；
   ⑥ 客户端退出 -> surface 资源回收（`[WL64] surface destroy .. why=client` + `[SHM64] release .. refs=0
      freed_pages=15/8` + 页池回基线）；
   ⑦ `wm` 退出 -> 把地盘交回（`[WM] exit handback` + `[WL64] composer release .. mode=internal`）：
-     外置面板区被桌面底色回填（不是花屏），**区域之外逐字节不变**、无 PANIC（不变砖）；
+     wm 画过的那些**窗口矩形**被启动时的桌面快照回填（不是花屏；`px` = 窗口面积和），
+     **窗口之外逐字节不变**、无 PANIC（不变砖）；
   ⑧ 无 PANIC / 无 [SYSCALL] enosys（22..26 号）/ 客户端与合成器都没有 FAILED；
   ⑨ **性能**：wm 每帧合成耗时的 rdtsc 数字（`[WM] frame .. us=..`），并与**同一台机器、同一分辨率、
      同一图案**的内核内合成器（`[WL64] composite n=2 bytes=.. us=..`，由 /wlclient.elf 的短模式在
      wm 启动**之前**跑出）对比；设备 blit 阈值（>=64x64=4096 px）的决策也在打点里（`[WM] blitpolicy
      gpu=.. min_px=4096 rect_px=.. path=soft|dev`）——本测试台没有 virtio-gpu，path 恒为 soft。
+
+★ 版本口径（v0.9.47 / W3 第二批）：wm 从**右下角 320x200 面板**升级成**全屏 Ring 3 窗口层**。
+  这一批改了三条契约，本文件的判据同步**加强**（不是放宽）：
+    (a) 22 号 wl_composer_get 交的是**整屏**：日志 `[WL64] composer .. rect=` 现在是整屏，
+        行尾**新增** `panel=<x>,<y>,<w>,<h>`（= `[WL64] init` 的面板几何，内核默认槽位策略没变）。
+        判据：rect == (0,0,fb_w,fb_h) **且** 行尾 panel == init 的 panel（两条都比旧的一条强）。
+    (b) wm 把每个新 surface 用 27 号 `wl_surface_move` 挪到"屏幕正中 + k*28 级联"：
+        内核侧 `[WL64] move id=<n> pid=<p> pos=<x>,<y> from=<ox>,<oy> by=composer`，
+        wm 侧 `[WM] place id=<n> pos=<x>,<y> mode=center|cascade`。
+        ★ 于是 `[WL64] surface create .. slot=<n> pos=<x>,<y>` 里的 pos **仍是面板槽位、已经过期**，
+        本文件一律用 move 行（同 id 取**最后一跳**）修正 rect 原点，没有 move 行才回退 create pos；
+        同时新增判据"每个 surface 都必须有一次 by=composer 的 move"。
+    (c) wm 不再涂地盘底色，改成**只画窗口矩形**：启动时拍**整屏背景快照**
+        （`[WM] bg shm=<a>,<b> bytes=<fb_w*fb_h*4> u=1`，旧的 `[WM] shadow .. bytes=65536` 已删除），
+        每帧先回填快照再按 id 升序 blit。于是：
+          * `[WM] frame ..` 行尾由 `resync=<0|1>` 变成 `full=<0|1> foreign=<n>`；
+          * `[WM] exit handback .. px=` = wm 画过的**窗口矩形面积和**（不再是 320*200）；
+          * 口径从"面板区之外逐字节不变"升级成"**窗口之外**逐字节不变"（skip = 两个窗口矩形）。
 
 用法（必须 Windows 原生 Python）：
     py -3 tests\\wm64_test.py             # QEMU：monitor 注入 + screendump 取样（像素断言全在这条路上）
@@ -64,7 +83,9 @@ FIXTURE_IMG = os.path.join(ROOT, "build64", "wm64_test.img")
 PART_MAIN_LBA = 32584                    # = kernel/part64.h 的主分区起点
 TARGET_SECTORS = 57343                  # 28MB（= 原 16MB + 主分区起点后移的 24,519）（与 wl64/sh64 同一夹具口径）
 
-MOUSE_X0, MOUSE_Y0 = 512, 384           # kernel/input.cpp 的 mouse_init 默认位置
+MOUSE_X0, MOUSE_Y0 = 512, 384           # kernel/input.cpp 的 mouse_init 默认位置（★ W3 第二批：窗口被 wm
+                                        # 挪到屏幕正中后，这个起点已经在窗口区附近 —— ⑤ 的注入计划仍从它起算，
+                                        # 但按下前会先 settle，不再假定"起点一定在窗口外、路上不会碰窗口"）
 PIX_TOL = 8                             # 逐像素"变/不变"的容差
 OUTSIDE_TOL = 64                        # 区域之外允许的差异像素数（内核外壳的时钟/动画；打印实测值）
 
@@ -233,6 +254,63 @@ def hexc(c):
 
 def in_rect(x, y, r):
     return r[0] <= x < r[0] + r[2] and r[1] <= y < r[1] + r[3]
+
+
+def first_spot(rect, cands, others=()):
+    """在 rect 内按 cands（相对左上角的 (dx,dy) 顺序）找第一个**不被 others 覆盖**的取样点。
+    ★ W3 第二批：窗口挪到屏幕正中后会互相遮挡（级联 28px 不够把 160x96 / 128x64 错开），
+      取样点必须先避开**上层窗口**，否则量到的是别人的像素（判据不打折，只换点）。
+    返回 (x, y, dx, dy) 或 None（全部候选都被挡 / 不在矩形内）。"""
+    for dx, dy in cands:
+        x, y = rect[0] + dx, rect[1] + dy
+        if not in_rect(x, y, rect):
+            continue
+        if any(in_rect(x, y, o) for o in others if o):
+            continue
+        return x, y, dx, dy
+    return None
+
+
+# ---- 两个客户端的**局部坐标**纯色模型（依据 user/wm/wmclock.c 与 user/wm/wmpanel.c 的绘制表）。
+#      只回答"这块局部像素的**确定**颜色"，不确定（数字笔画/开关内部/半透明条）就返回 None ——
+#      所以取样点只会在"两块客户端都保证纯色"的地方落地，判据不降级。
+CLOCK_W, CLOCK_H = 160, 96
+PANEL_W, PANEL_H = 128, 64
+CLOCK_TOP = 0x283040                    # wmclock 顶部条
+CLOCK_BG = 0x101820                     # wmclock 底
+PANEL_EDGE = 0xF0F0F0                   # wmpanel 开关的 2px 边框
+
+
+def clock_px(lx, ly):
+    """wmclock 局部 (lx,ly) 的确定纯色；落在数字笔画区（秒数会变）就返回 None。"""
+    if lx < 0 or ly < 0 or lx >= CLOCK_W or ly >= CLOCK_H:
+        return None
+    if 6 <= lx <= 126 and 28 <= ly <= 58:          # 数字区（INK_X=8 / INK_Y=30 / 5 字形 * 24 步进）
+        return None
+    if ly < 14:
+        return CLOCK_TOP
+    if ly >= CLOCK_H - 14:
+        return CLOCK_BAR
+    return CLOCK_BG
+
+
+def panel_px(lx, ly, state=None):
+    """wmpanel 局部 (lx,ly) 的确定纯色；开关内部/状态条随状态变（state 未知返回 None），
+    半透明覆盖条是混合结果（返回 None）。"""
+    if lx < 0 or ly < 0 or lx >= PANEL_W or ly >= PANEL_H:
+        return None
+    if 4 <= lx < PANEL_W - 4 and 50 <= ly < PANEL_H - 4:      # 半透明条 y∈[50,60) x∈[4,124)
+        return None
+    sx0, sy0, sw, sh = 16, 22, 48, 30                         # 开关矩形（P_SW_X/Y/W/H）
+    if sx0 <= lx < sx0 + sw and sy0 <= ly < sy0 + sh:
+        if lx < sx0 + 2 or lx >= sx0 + sw - 2 or ly < sy0 + 2 or ly >= sy0 + sh - 2:
+            return PANEL_EDGE
+        return None if state is None else (PANEL_ON if state else PANEL_OFF)
+    if 74 <= lx < 86 and 26 <= ly < 42:                        # 开关右边的状态条
+        return None if state is None else (PANEL_ON if state else PANEL_OFF)
+    if ly < 14:
+        return PANEL_TITLE
+    return PANEL_BG
 
 
 def diff_region(shot_a, shot_b, rect, skip=None):
@@ -424,11 +502,14 @@ def main():
         if m is None:
             raise RuntimeError("没等到 [WL64] init")
         fbw, fbh = int(m.group(1)), int(m.group(2))
-        panel = (int(m.group(3)), int(m.group(4)), int(m.group(5)), int(m.group(6)))
+        # pgeo = 内核**默认槽位策略**的面板几何（W3 第二批没变；22 号 composer 行尾也如实打它）
+        pgeo = (int(m.group(3)), int(m.group(4)), int(m.group(5)), int(m.group(6)))
+        FB_RECT = (0, 0, fbw, fbh)                       # 22 号现在交给 wm 的"整屏"矩形
+        SHELL_BAND = (0, 0, fbw, 24)                     # 内核外壳自己的顶部刷新带（③/⑦ 的"窗口之外"口径）
         ch("外部面板区完整落在屏幕内（比屏幕小）",
-           panel[0] >= 0 and panel[1] >= 0 and panel[2] < fbw and panel[3] < fbh and
-           panel[0] + panel[2] <= fbw and panel[1] + panel[3] <= fbh,
-           "panel=%s fb=%dx%d" % (panel, fbw, fbh))
+           pgeo[0] >= 0 and pgeo[1] >= 0 and pgeo[2] < fbw and pgeo[3] < fbh and
+           pgeo[0] + pgeo[2] <= fbw and pgeo[1] + pgeo[3] <= fbh,
+           "pgeo=%s fb=%dx%d" % (pgeo, fbw, fbh))
 
         ch("内核内合成器的基线（/wlclient.elf 短模式：合成发生在 wm 注册之前）",
            vm.wait_re(r"\[WL64\] composite n=(\d+) bytes=(\d+) us=(\d+)", args.timeout) is not None)
@@ -447,21 +528,31 @@ def main():
            mpad is not None and int(mpad.group(3)) == fbw and int(mpad.group(4)) == fbh,
            ("w=%s h=%s vs fb=%dx%d" % (mpad.group(3), mpad.group(4), fbw, fbh)) if mpad else "")
         mcomp = vm.wait_re(r"\[WL64\] composer pid=(\d+) seat=(\d+) gpu=(\d) backend=(\S+) surfs=(\d+) re=(\d) "
-                           r"rect=(-?\d+),(-?\d+),(\d+),(\d+)", args.timeout)
-        ch("① wm 注册成合成器（[WL64] composer .. seat=1 .. rect=外部面板区）", mcomp is not None,
+                           r"rect=(-?\d+),(-?\d+),(\d+),(\d+) panel=(-?\d+),(-?\d+),(\d+),(\d+)", args.timeout)
+        ch("① wm 注册成合成器（[WL64] composer .. seat=1 .. rect=整屏 + 行尾 panel=..）", mcomp is not None,
            (mcomp.group(0) if mcomp else "没等到"))
         if mcomp:
-            ch("① 内核租给 wm 的区域 == 内核自己的面板几何",
-               (int(mcomp.group(7)), int(mcomp.group(8)), int(mcomp.group(9)), int(mcomp.group(10))) == panel,
-               "composer rect=%s panel=%s" % ((mcomp.group(7), mcomp.group(8), mcomp.group(9),
-                                               mcomp.group(10)), panel))
+            crect = (int(mcomp.group(7)), int(mcomp.group(8)), int(mcomp.group(9)), int(mcomp.group(10)))
+            cpanel = (int(mcomp.group(11)), int(mcomp.group(12)), int(mcomp.group(13)), int(mcomp.group(14)))
+            ch("① 内核交给 wm 的区域是**整屏** rect=(0,0,fb_w,fb_h)（22 号不再是右下角面板区）",
+               crect == FB_RECT, "composer rect=%s want=%s" % (crect, FB_RECT))
+            ch("① composer 行尾仍如实打面板几何（panel= == [WL64] init 的 panel=）",
+               cpanel == pgeo, "composer panel=%s init pgeo=%s" % (cpanel, pgeo))
         ch("① 显示后端如实报为 soft-lfb（无 virtio-gpu 设备 -> gpu=0）",
            mcomp is not None and mcomp.group(4) == "soft-lfb" and mcomp.group(3) == "0",
            (mcomp.group(0) if mcomp else ""))
         ch("① wm 的输出走 input_poll 的焦点/捕获（[EV64] attach pid=<wm> flags=...3 focus/capture=<wm>）",
            vm.wait_re(r"\[EV64\] attach pid=(\d+) flags=0*3 focus=(\d+) capture=(\d+)", 60) is not None)
-        ch("① 双缓冲影副本也走 shm（[WM] shadow shm=.. va=.. bytes=65536）",
-           vm.wait_re(r"\[WM\] shadow shm=(\d+) va=0x([0-9a-f]+) bytes=65536", 60) is not None)
+        mbg = vm.wait_re(r"\[WM\] bg shm=(\d+),(\d+) bytes=(\d+) va=0x([0-9a-f]+),0x([0-9a-f]+) u=1", 60)
+        bg_need = fbw * fbh * 4                      # 整屏快照字节数（1280*800*4 = 4096000）
+        ch("① 整屏背景快照也走 shm（[WM] bg shm=<a>,<b> bytes=fb_w*fb_h*4 u=1）",
+           mbg is not None and int(mbg.group(3)) == bg_need and
+           int(mbg.group(1)) >= 1 and int(mbg.group(2)) >= 1 and int(mbg.group(1)) != int(mbg.group(2)),
+           ("bytes=%s want=%d shm=%s,%s" % (mbg.group(3), bg_need, mbg.group(1), mbg.group(2)))
+           if mbg else "没等到")
+        ch("① wm 自述全屏窗口层策略（[WM] policy region=full drag_bar=22 place=center+cascade bg=1）",
+           vm.wait_re(r"\[WM\] policy region=full drag_bar=22 place=center\+cascade repair_ms=\d+ bg=1",
+                      60) is not None)
         ch("① wm 报出设备 blit 阈值决策（[WM] blitpolicy gpu=0 min_px=4096）",
            vm.wait_re(r"\[WM\] blitpolicy gpu=0 min_px=4096", 60) is not None)
         ch("① wm 用 ticks() 标定 rdtsc（[WM] calib tsc_per_ms=..）",
@@ -506,17 +597,64 @@ def main():
             ch("两块 surface 由两个不同的进程持有（wmclock / wmpanel）",
                surfs[lo]["pid"] != surfs[hi]["pid"], "pids=%s names=%s" % (
                    (surfs[lo]["pid"], surfs[hi]["pid"]), (names[surfs[lo]["pid"]], names[surfs[hi]["pid"]])))
-            ch("两块 surface 都在外部面板区内",
-               all(surfs[i]["rect"][0] >= panel[0] and surfs[i]["rect"][1] >= panel[1] and
-                   surfs[i]["rect"][0] + surfs[i]["rect"][2] <= panel[0] + panel[2] and
-                   surfs[i]["rect"][1] + surfs[i]["rect"][3] <= panel[1] + panel[3] for i in ids),
-               "rects=%s panel=%s" % ([surfs[i]["rect"] for i in ids], panel))
-            ch("两块 surface **故意重叠**（z 序有可观测的遮挡区）",
+            # ★ W3 第二批：create 行里的 pos= 是**面板槽位**（内核默认策略没变），wm 随后就用 27 号把它挪到
+            #   "屏幕正中 + k*28" -> create 行的 pos **已经过期**，不能当屏幕坐标用。这里一律用
+            #   [WL64] move 行（同一个 id 取**最后一跳**）覆盖 rect 原点；没有 move 行才回退 create pos。
+            slot_pos = {i: (surfs[i]["rect"][0], surfs[i]["rect"][1]) for i in ids}
+            t_pl = time.time()
+            while time.time() - t_pl < 60:               # 等 wm 把两块都摆完（每块一次 move）
+                done = set(int(x) for x in re.findall(
+                    r"\[WL64\] move id=(\d+) pid=-?\d+ pos=-?\d+,-?\d+ from=-?\d+,-?\d+ by=composer", vm.log()))
+                if set(ids) <= done:
+                    break
+                time.sleep(0.15)
+            moves = {}
+            for r in re.findall(r"\[WL64\] move id=(\d+) pid=-?\d+ pos=(-?\d+),(-?\d+) "
+                                r"from=(-?\d+),(-?\d+) by=(\w+)", vm.log()):
+                moves[int(r[0])] = dict(pos=(int(r[1]), int(r[2])), frm=(int(r[3]), int(r[4])), by=r[5])
+            for i in ids:
+                mv = moves.get(i)
+                if mv:                                        # 没有 move 行 -> 保持 create pos（回退）
+                    surfs[i]["rect"] = (mv["pos"][0], mv["pos"][1], surfs[i]["w"], surfs[i]["h"])
+            places = {int(a): (int(b), int(c), d) for a, b, c, d in re.findall(
+                r"\[WM\] place id=(\d+) pos=(-?\d+),(-?\d+) mode=(center|cascade)", vm.log())}
+            wmsurf = {int(a): (int(b), int(c)) for a, b, c in re.findall(
+                r"\[WM\] surf id=(\d+) pid=-?\d+ rect=(-?\d+),(-?\d+),\d+,\d+ ", vm.log())}
+            ch("② wm 用 27 号把**每个**新 surface 都挪过一次（每个 id 都有 [WL64] move .. by=composer）",
+               all(i in moves and moves[i]["by"] == "composer" for i in ids),
+               "by=%s" % {i: moves.get(i, {}).get("by") for i in ids})
+            ch("② 屏幕坐标以 move 行为准，且与 wm 自己的两份打点对得上（[WM] place pos / [WM] surf rect）",
+               all(i in moves and i in places and (places[i][0], places[i][1]) == moves[i]["pos"] and
+                   (i not in wmsurf or wmsurf[i] == moves[i]["pos"]) for i in ids),
+               "move=%s place=%s wmsurf=%s" % ({i: moves.get(i, {}).get("pos") for i in ids},
+                                               {i: places[i][:2] for i in ids if i in places}, wmsurf))
+            ch("② 两块 surface 都在**整屏**内（rect ⊆ 屏幕）",
+               all(surfs[i]["rect"][0] >= 0 and surfs[i]["rect"][1] >= 0 and
+                   surfs[i]["rect"][0] + surfs[i]["rect"][2] <= fbw and
+                   surfs[i]["rect"][1] + surfs[i]["rect"][3] <= fbh for i in ids),
+               "rects=%s fb=%dx%d" % ([surfs[i]["rect"] for i in ids], fbw, fbh))
+            ch("② 屏幕坐标 != create 行的面板槽位 pos（= 真的被 wm 挪过，旧坐标不再成立）",
+               all(i in moves and (surfs[i]["rect"][0], surfs[i]["rect"][1]) != slot_pos[i] for i in ids),
+               "pos=%s slot_pos=%s" % ({i: (surfs[i]["rect"][0], surfs[i]["rect"][1]) for i in ids}, slot_pos))
+            # 摆位策略：pos = ((fb_w-w)/2, (fb_h-h)/2) + k*28（两轴同偏移，k = 全局创建序号 % 6 ∈ [0,5]）
+            pol_bad = []
+            for i in ids:
+                if i not in moves:
+                    pol_bad.append((i, "no-move"))
+                    continue
+                cx, cy = (fbw - surfs[i]["w"]) // 2, (fbh - surfs[i]["h"]) // 2
+                ddx, ddy = surfs[i]["rect"][0] - cx, surfs[i]["rect"][1] - cy
+                if ddx != ddy or ddx < 0 or ddx % 28 != 0 or ddx // 28 > 5:
+                    pol_bad.append((i, (ddx, ddy)))
+            ch("② 摆位符合 wm 的 policy：pos = ((fb_w-w)/2,(fb_h-h)/2) + k*28（k = 创建序号 % 6）",
+               not pol_bad, "bad=%s rects=%s fb=%dx%d" % (pol_bad, [surfs[i]["rect"] for i in ids], fbw, fbh))
+            ch("② 两块 surface **故意重叠**（z 序有可观测的遮挡区）",
                surfs[hi]["rect"][0] < surfs[lo]["rect"][0] + surfs[lo]["rect"][2] and
                surfs[hi]["rect"][1] < surfs[lo]["rect"][1] + surfs[lo]["rect"][3] and
                surfs[lo]["rect"][0] < surfs[hi]["rect"][0] + surfs[hi]["rect"][2] and
                surfs[lo]["rect"][1] < surfs[hi]["rect"][1] + surfs[hi]["rect"][3],
-               "rects=%s" % [surfs[i]["rect"] for i in ids])
+               "rects=%s（靠级联偏移 28px 产生：28 < 窗口高 %d/%d -> 必然重叠，不重叠就是级联没生效）"
+               % ([surfs[i]["rect"] for i in ids], surfs[lo]["rect"][3], surfs[hi]["rect"][3]))
             ch("wm 把两块都映射进自己地址空间并合成（[WM] surfmap / [WM] frame surfs=2）",
                vm.wait_re(r"\[WM\] frame n=(\d+) surfs=2 pending=\d+ ", 60) is not None)
 
@@ -538,26 +676,35 @@ def main():
         if mon.shot(ppm):
             shots["p1"] = read_ppm(ppm)
         if clock_id is not None and panel_id is not None and "p1" in shots and shots["p1"]:
-            cr = surfs[clock_id]["rect"]
+            cr = surfs[clock_id]["rect"]                  # ★ 已用 [WL64] move 修正的**屏幕**坐标
             pr = surfs[panel_id]["rect"]
-            got_bar = px_at(shots["p1"], cr[0] + 80, cr[1] + cr[3] - 8)     # 时钟底部色带
-            got_ink = px_at(shots["p1"], cr[0] + 60, cr[1] + 48)            # 时钟数字区（可能落在笔画上）
-            got_ptt = px_at(shots["p1"], pr[0] + 60, pr[1] + 6)             # 面板标题条
+            # z 序 = id 升序（wm 从下到上 blit）：id 大的在上层。取样必须避开上层窗口，
+            # 否则那块像素根本不是这一块画的（换点不换判据）。
+            above_cr = [pr] if panel_id > clock_id else []
+            above_pr = [cr] if clock_id > panel_id else []
+            bar_pt = first_spot(cr, [(80, cr[3] - 8), (40, cr[3] - 8), (20, cr[3] - 8), (8, cr[3] - 8),
+                                     (108, cr[3] - 8)], above_cr)          # 时钟底部固定色带
+            ink_pt = first_spot(cr, [(60, 48), (40, 48), (20, 48), (8, 48), (96, 48)], above_cr)
+            ptt_pt = first_spot(pr, [(60, 6), (40, 6), (90, 6), (20, 6)], above_pr)       # 面板标题条
+            sw_pt = first_spot(pr, [(40, 36), (30, 36), (48, 36), (24, 40)], above_pr)    # 开关体内（关=橙）
+            veil_pt = first_spot(pr, [(64, 54), (50, 54), (90, 54), (64, 56)], above_pr)  # 半透明条（局部 y=54）
+            got_bar = px_at(shots["p1"], bar_pt[0], bar_pt[1]) if bar_pt else None
+            got_ink = px_at(shots["p1"], ink_pt[0], ink_pt[1]) if ink_pt else None
+            got_ptt = px_at(shots["p1"], ptt_pt[0], ptt_pt[1]) if ptt_pt else None
+            got_sw = px_at(shots["p1"], sw_pt[0], sw_pt[1]) if sw_pt else None
+            got_veil = px_at(shots["p1"], veil_pt[0], veil_pt[1]) if veil_pt else None
             ch("② wmclock 区域出现内容（底部色带 = 0x40c0ff）", near(got_bar, CLOCK_BAR),
-               "got=%s want=%s rect=%s" % (hexc(got_bar), hexc(CLOCK_BAR), cr))
+               "got=%s want=%s rect=%s spot=%s" % (hexc(got_bar), hexc(CLOCK_BAR), cr, bar_pt))
             ch("② wmclock 数字区有内容（笔画色或底色，两种都算）",
                near(got_ink, CLOCK_INK) or near(got_ink, 0x101820),
-               "got=%s (ink=%s bg=0x101820)" % (hexc(got_ink), hexc(CLOCK_INK)))
+               "got=%s (ink=%s bg=0x101820) spot=%s" % (hexc(got_ink), hexc(CLOCK_INK), ink_pt))
             ch("② wmpanel 区域出现内容（标题条 = 0x303a48）", near(got_ptt, PANEL_TITLE),
-               "got=%s want=%s rect=%s" % (hexc(got_ptt), hexc(PANEL_TITLE), pr))
-            # 开关（关 = 橙）与半透明覆盖条（与底色混合，不再是纯白）
-            got_sw = px_at(shots["p1"], pr[0] + 40, pr[1] + 36)
-            got_veil = px_at(shots["p1"], pr[0] + 64, pr[1] + 54)      # 半透明条（局部 y=54）
+               "got=%s want=%s rect=%s spot=%s" % (hexc(got_ptt), hexc(PANEL_TITLE), pr, ptt_pt))
             ch("② wmpanel 开关初始为关态（橙色 0xe0a020）", near(got_sw, PANEL_OFF),
-               "got=%s want=%s" % (hexc(got_sw), hexc(PANEL_OFF)))
+               "got=%s want=%s spot=%s" % (hexc(got_sw), hexc(PANEL_OFF), sw_pt))
             ch("② 半透明覆盖条真的被 alpha 混合了（既不是纯白也不是纯底色）",
                got_veil is not None and not near(got_veil, 0xFFFFFF) and not near(got_veil, PANEL_BG),
-               "got=%s" % hexc(got_veil))
+               "got=%s spot=%s" % (hexc(got_veil), veil_pt))
         # 合成器的混合计数：**任一帧** blend>0 即可（第一帧可能只合成一块面）
         blends = [int(x) for x in re.findall(r"\[WM\] frame n=\d+ surfs=\d+ pending=\d+ .*? blend=(\d+) ", vm.log())]
         ch("② 合成器统计到混合像素（[WM] frame .. blend>0，alpha 路径真的走过）",
@@ -583,29 +730,33 @@ def main():
             clkframes[int(r[0])] = dict(sec=int(r[1]), dmg=(int(r[2]), int(r[3]), int(r[4]), int(r[5])))
         if len(shots_seq) == 2 and clock_id is not None:
             cr = surfs[clock_id]["rect"]
+            pr = surfs[panel_id]["rect"] if panel_id is not None else None
+            win_rects = [cr] + ([pr] if pr else [])      # ★ 口径：两个**窗口矩形**（不再是 320x200 面板区）
             dmg = clkframes[2]["dmg"]
             want = (cr[0] + dmg[0], cr[1] + dmg[1], dmg[2], dmg[3])
             n_in, bbox_in = diff_region(shots_seq[1], shots_seq[2], cr)
-            # 面板区之外：内核外壳有自己的刷新区（顶部状态条的时钟/通知），把最上面 24 行的
-            # "外壳自己那一带"单独统计 —— 面板区之外、且**不在**那一带里的像素必须逐字节不变。
-            SHELL_BAND = (0, 0, fbw, 24)
-            n_out, bbox_out = diff_region(shots_seq[1], shots_seq[2], (0, 0, fbw, fbh), skip=[panel])
-            n_band, _ = diff_region(shots_seq[1], shots_seq[2], SHELL_BAND, skip=[])
-            n_out_strict = n_out - n_band
-            n_rest, _ = diff_region(shots_seq[1], shots_seq[2], panel, skip=[want])
+            # 窗口之外：内核外壳有自己的刷新区（顶部状态条的时钟/通知），把最上面 24 行的
+            # "外壳自己那一带"单独统计 —— 窗口之外、且**不在**那一带里的像素必须逐字节不变。
+            # （SHELL_BAND 在 ① 那一节里按 fb 几何定义好了：顶部 24 行）
+            n_out, bbox_out = diff_region(shots_seq[1], shots_seq[2], (0, 0, fbw, fbh), skip=win_rects)
+            n_band, _ = diff_region(shots_seq[1], shots_seq[2], SHELL_BAND, skip=win_rects)
+            n_out_strict, _ = diff_region(shots_seq[1], shots_seq[2], (0, 0, fbw, fbh),
+                                          skip=win_rects + [SHELL_BAND])
+            n_rest, _ = diff_region(shots_seq[1], shots_seq[2], cr, skip=[want])
             ch("③ 时钟面内的帧差包围盒 ⊆ 客户端上报的 damage 矩形 %s" % (want,),
                bbox_inside(bbox_in, want), "bbox=%s n=%d" % (bbox_in, n_in))
-            ch("③ 面板区内、damage 框之外**逐字节不变**（差异像素 = 0）", n_rest == 0,
+            ch("③ 时钟窗口内、damage 框之外**逐字节不变**（差异像素 = 0）", n_rest == 0,
                "outside_damage_diff=%d" % n_rest)
-            ch("③ 外部面板区之外、且不在内核外壳自带刷新带（顶部 24 行）里的像素**逐字节不变**",
+            ch("③ **窗口之外**逐字节不变（口径从 320x200 面板区升级成两个窗口矩形；不计外壳顶部刷新带）",
                n_out_strict == 0,
-               "outside_panel_diff=%d（其中外壳顶部带 %d 像素）bbox=%s" % (n_out, n_band, bbox_out))
-            ch("③ 面板区外的差异全部落在内核外壳自己那一带（顶部 24 行）里",
+               "outside_window_diff=%d（其中外壳顶部带 %d 像素）bbox=%s windows=%s"
+               % (n_out, n_band, bbox_out, win_rects))
+            ch("③ 窗口之外的差异**全部**落在内核外壳自己的刷新带（顶部 24 行）里",
                bbox_out is None or (bbox_out[1] >= 0 and bbox_out[1] + bbox_out[3] <= 24),
                "bbox=%s band=%d" % (bbox_out, n_band))
             print("   [数字] 时钟 f=1->f=2：damage=%s（屏幕坐标=%s）；面内差异=%d；"
-                  "面板内 damage 外差异=%d；面板外差异=%d（外壳顶部带 %d / 带外 %d）"
-                  % (dmg, want, n_in, n_rest, n_out, n_band, n_out_strict))
+                  "窗口内 damage 外差异=%d；窗口外差异=%d（外壳顶部带 %d / 带外 %d）；windows=%s"
+                  % (dmg, want, n_in, n_rest, n_out, n_band, n_out_strict, win_rects))
 
         print("=== 4) ④ z 序：重叠区显示上层（id 大）的内容 ===")
         if clock_id is not None and panel_id is not None and "p1" in shots and shots["p1"]:
@@ -618,16 +769,42 @@ def main():
             ch("④ 两块 surface 的重叠区非空", ix1 > ix0 and iy1 > iy0,
                "overlap=(%d,%d)-(%d,%d)" % (ix0, iy0, ix1, iy1))
             if ix1 > ix0 and iy1 > iy0:
-                # 重叠区中心：时钟显示底部色带（0x40c0ff）、面板显示标题条（0x303a48）
-                sx, sy = (ix0 + ix1) // 2, (iy0 + iy1) // 2
-                got = px_at(shots["p1"], sx, sy)
-                upper = max(surfs)
-                exp_up = CLOCK_BAR if upper == clock_id else PANEL_TITLE
-                exp_lo = PANEL_TITLE if upper == clock_id else CLOCK_BAR
-                ch("④ 重叠区像素 = 上层（id=%d，%s）的内容色 %s" % (upper, "wmclock" if upper == clock_id else "wmpanel", hexc(exp_up)),
-                   near(got, exp_up), "got=%s at (%d,%d)" % (hexc(got), sx, sy))
-                ch("④ 重叠区像素**不是**下层的内容色（确实被遮挡）", not near(got, exp_lo),
-                   "got=%s lower=%s" % (hexc(got), hexc(exp_lo)))
+                # ★ 窗口挪到屏幕正中后重叠区也变了，"交集中心"未必还落在标题条/色带上，而且两块窗口
+                #   互相遮挡。改成：在交集里找**上下两层都是已知纯色**的点（模型见 clock_px/panel_px），
+                #   优先挑"下层正好是时钟固定色带"的点；一个都找不到就 FAIL（不跳过、不降级）。
+                pst = re.findall(r"\[WMPANEL\] frame f=\d+ state=(\d) col=0x\w+", vm.log())
+                pnl_state = int(pst[-1]) if pst else 0
+                upper = max(clock_id, panel_id)                # z 序 = id 升序（wm 从下到上 blit）
+                lo_id = min(clock_id, panel_id)
+                up_r = surfs[upper]["rect"]
+                lo_r = surfs[lo_id]["rect"]
+                pick = None
+                for sy in range(iy0, iy1):
+                    for sx in range(ix0, ix1):
+                        c_up = (panel_px(sx - up_r[0], sy - up_r[1], pnl_state) if upper == panel_id
+                                else clock_px(sx - up_r[0], sy - up_r[1]))
+                        c_lo = (clock_px(sx - lo_r[0], sy - lo_r[1]) if lo_id == clock_id
+                                else panel_px(sx - lo_r[0], sy - lo_r[1], pnl_state))
+                        if c_up is None or c_lo is None or c_up == c_lo:
+                            continue
+                        pick = (sx, sy, c_up, c_lo)
+                        if c_lo == CLOCK_BAR:                     # 下层是时钟的固定色带：最有说服力
+                            break
+                    if pick and pick[3] == CLOCK_BAR:
+                        break
+                ch("④ 重叠区里存在\"上下两层都是已知纯色\"的取样点（不靠猜交集中心）", pick is not None,
+                   "overlap=(%d,%d)-(%d,%d) upper=%d lower=%d" % (ix0, iy0, ix1, iy1, upper, lo_id))
+                if pick:
+                    sx, sy, c_up, c_lo = pick
+                    got = px_at(shots["p1"], sx, sy)
+                    up_name = "wmclock" if upper == clock_id else "wmpanel"
+                    lo_name = "wmclock" if lo_id == clock_id else "wmpanel"
+                    ch("④ 重叠区像素 = 上层（id=%d，%s）的内容色 %s" % (upper, up_name, hexc(c_up)),
+                       near(got, c_up), "got=%s at (%d,%d) upper_local=(%d,%d)"
+                       % (hexc(got), sx, sy, sx - up_r[0], sy - up_r[1]))
+                    ch("④ 重叠区像素**不是**下层（id=%d，%s）的内容色（确实被遮挡）" % (lo_id, lo_name),
+                       not near(got, c_lo), "got=%s lower=%s（下层该点局部 (%d,%d)）"
+                       % (hexc(got), hexc(c_lo), sx - lo_r[0], sy - lo_r[1]))
 
         print("=== 5) ⑤ seat：注入鼠标点到 wmpanel 上（用户态命中测试 + 投递）===")
         # 事件统计的基线（用于证明"没有送给内核外壳"）
@@ -636,13 +813,26 @@ def main():
         base_seatpost = vm.n_match(r"\[WL64\] seatpost surf=")
         click_ok = False
         if panel_id is not None:
-            pr = surfs[panel_id]["rect"]
-            tx, ty = pr[0] + 40, pr[1] + 36          # 开关中心（局部 40,36）
+            pr = surfs[panel_id]["rect"]                 # ★ 已用 [WL64] move 修正的**屏幕**坐标
+            tx, ty = pr[0] + 40, pr[1] + 36              # 开关中心（局部 40,36）
+            # 起点说明：MOUSE_X0/Y0=512,384 仍是 kernel/input.cpp 的 mouse_init 默认位置；窗口现在被
+            # wm 挪到屏幕正中（1280x800 下 wmclock=(560,352) / wmpanel=(604,396)），起点刚好落在窗口
+            # **外**（512 < 560），但注入路径会穿过窗口 —— 所以按下之前先 settle（等 wm 把"收到输入后
+            # 整窗重画"的那一帧落地），否则可能按在旧像素/半画状态的窗口上。
+            ch("⑤ 点击点上层就是 wmpanel（z 序 = id 升序：panel id > clock id，否则点击会被时钟吃掉）",
+               clock_id is None or panel_id > clock_id,
+               "panel_id=%s clock_id=%s rect=%s" % (panel_id, clock_id, pr))
             steps, (sim_x, sim_y) = plan_move(MOUSE_X0, MOUSE_Y0, tx, ty)
             print("   注入计划：起点 (%d,%d) -> (%d,%d) via %d 步（模拟落点 (%d,%d)）"
                   % (MOUSE_X0, MOUSE_Y0, tx, ty, len(steps), sim_x, sim_y))
+            base_frames = vm.n_match(r"\[WM\] frame n=")
             for dx, dy in steps:
                 mon.mouse_move(dx, dy)
+            t_st = time.time()                           # settle：等 wm 因为这次输入再合成一帧
+            while time.time() - t_st < 5:
+                if vm.n_match(r"\[WM\] frame n=") > base_frames:
+                    break
+                time.sleep(0.1)
             time.sleep(0.5)
             mon.mouse_button(1)
             time.sleep(0.4)
@@ -733,25 +923,43 @@ def main():
             mon.mouse_move(dx, dy)
         time.sleep(0.8)
         p4 = os.path.join(tmp, "after_exit.ppm")
-        # ⑦-a：wm 的交回动作**当场**落地了吗（紧接着抓一张：面板区应当是我们回填的那块底色）
-        # ⑦-a：wm 的交回动作在日志里是"整块回填"（px = 320*200），并且**退出后这块地不再有
-        #       合成器自己的内容**（时钟色带色 / 面板标题色 / 开关色都不该再出现在原位置上）：
-        #       内核外壳会在这块地上重画自己的东西（本批的共存策略），所以比"等于回填色"更稳的
-        #       判据是"我们的像素没留下"。
+        # ⑦-a：wm 的交回动作在日志里是"**把我们画过的那些窗口矩形**还给桌面"（px = Σ窗口面积；
+        #       W3 第二批起**不再是 320*200**），并且退出后那块地**不再有合成器自己的内容**
+        #       （时钟色带色 / 数字笔画色 / 面板标题色 / 开关色都不该再出现在原位置上）：
+        #       内核外壳会在这块地上重画自己的东西（本批的共存策略），所以比"等于某个回填色"更稳的
+        #       判据是"我们的像素没留下"。取样点从**handback 前最后一次 [WM] frame 的 dirty 矩形**里取。
+        win_rects2 = [surfs[i]["rect"] for i in sorted(surfs)]
+        exp_px = sum(r2[2] * r2[3] for r2 in win_rects2)      # Σ(窗口面积)（两块都完整在屏内）
+        last_dirty = None
+        for r in re.findall(r"\[WM\] frame n=\d+ surfs=\d+ pending=\d+ dirty=(-?\d+),(-?\d+),(\d+),(\d+)",
+                            vm.log()):
+            if int(r[2]) > 0 and int(r[3]) > 0:
+                last_dirty = (int(r[0]), int(r[1]), int(r[2]), int(r[3]))
+        ch("⑦ handback 的 px = wm 画过的**窗口矩形面积和**（Σ w*h ±1%；不再是 320*200）",
+           mhb is not None and len(win_rects2) == 2 and abs(hb_px - exp_px) <= max(1, exp_px // 100),
+           "px=%d want=%d(±1%%) windows=%s" % (hb_px, exp_px, win_rects2))
         if "exit1" in shots and shots["exit1"]:
-            hb_ok = all(not near(px_at(shots["exit1"], panel[0] + dx, panel[1] + dy), c)
-                        for (dx, dy, c) in ((30, 30, 0x40C0FF), (60, 60, 0x303A48), (150, 130, 0x30B070)))
-            ch("⑦ wm 交回地盘时把整块回填了（日志 px=%d = 320*200），且退出后原位置不再有合成器内容"
-               % hb_px, hb_px == panel[2] * panel[3] and hb_ok,
-               "px=%d colors_ok=%s" % (hb_px, hb_ok))
+            probes = []
+            if last_dirty:                                  # wm 刚用快照回填过这个脏矩形
+                probes.append((last_dirty[0] + last_dirty[2] // 2, last_dirty[1] + last_dirty[3] // 2))
+                probes.append((last_dirty[0] + 1, last_dirty[1] + 1))
+            for r2 in win_rects2:                           # 每个窗口：中心 + 左上角
+                probes.append((r2[0] + r2[2] // 2, r2[1] + r2[3] // 2))
+                probes.append((r2[0] + 1, r2[1] + 1))
+            bad = [(x, y, px_at(shots["exit1"], x, y)) for (x, y) in probes
+                   if any(near(px_at(shots["exit1"], x, y), c)
+                          for c in (CLOCK_BAR, CLOCK_INK, PANEL_TITLE, PANEL_ON, PANEL_OFF))]
+            ch("⑦ 交回后 wm 的像素一个都不留（取样点 = handback 前最后一次 [WM] frame 的 dirty 矩形 + 两个窗口矩形）",
+               bool(probes) and not bad,
+               "probes=%s leftover=%s hb_color=%s dirty=%s" % (probes, bad, hexc(hb_col), last_dirty))
         if mon.shot(p4):
             shots["after"] = read_ppm(p4)
         if "after" in shots and shots["after"]:
             if shot_before_exit:
                 n_out, bbox_out = diff_region(shot_before_exit, shots["after"], (0, 0, fbw, fbh),
-                                              skip=[panel])
-                ch("⑦ wm 退出后**外部面板区之外逐字节不变**（差异像素 = 0）", n_out == 0,
-                   "outside_diff=%d bbox=%s" % (n_out, bbox_out))
+                                              skip=win_rects2 + [SHELL_BAND])
+                ch("⑦ wm 退出后**窗口之外**逐字节不变（口径升级：两个窗口矩形而不是 320x200 面板区）",
+                   n_out == 0, "outside_diff=%d bbox=%s windows=%s" % (n_out, bbox_out, win_rects2))
             ch("⑦ 没有 PANIC / 三重故障（内核没砖）",
                "PANIC" not in vm.log() and "TRIPLE FAULT" not in vm.log())
 

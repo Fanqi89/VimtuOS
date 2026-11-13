@@ -4839,16 +4839,23 @@ static void shell_exec(TerminalState* ts, const char* line) {
             }
         }
     } else if (st_eq(g_cmd, "elfrun")) {
+        // ★ W3 第二批：`elfrun bg <path>` = 后台起、不等待。为什么必须加：等待模式有 120 s 上限
+        //   （下面那条 v0.7.7 的注释），而**长驻进程**（Ring 3 合成器 /lib/wm.elf、服务类）本来
+        //   就不该被上限杀掉 —— 实测 `elfrun /lib/wm.elf` 跑到 119 s 就被
+        //   `[PROC64] kill pid=.. sig=9` 干掉，紧接着 `[WL64] composer release .. mode=internal`，
+        //   合成器凭空消失（桌面回到内核自合成）。
+        const bool bg = st_eq(g_arg1, "bg");
+        const char* elf_a1 = bg ? g_arg2 : g_arg1;
         // elfrun 显式走 ELF64 加载器（不做魔数分派），用来把 ELF 路径单独验证出来。
-        if (g_arg1[0] == 0) {
+        if (elf_a1[0] == 0) {
             ts_puts(ts, gui64_tr("elfrun: usage: elfrun <name|/path>   (e.g. elfrun hello.elf)\\n",
                                  "elfrun: 用法: elfrun <名字|/路径>   （例如 elfrun hello.elf）\\n"));
             ok = false;
         } else {
             char path[64];
             int plen = 0;
-            if (g_arg1[0] != '/') path[plen++] = '/';
-            for (int i = 0; g_arg1[i] && plen < (int)sizeof(path) - 1; i++) path[plen++] = g_arg1[i];
+            if (elf_a1[0] != '/') path[plen++] = '/';
+            for (int i = 0; elf_a1[i] && plen < (int)sizeof(path) - 1; i++) path[plen++] = elf_a1[i];
             path[plen] = 0;
             // ★ A3 下半：优先走**真进程**（proc64）那条路 —— musl / 动态程序都要写
             //   IA32_FS_BASE（arch_prctl 的 TLS），只有真进程路径才会真写 MSR（见 proc64.h 第 3 条）；
@@ -4863,9 +4870,10 @@ static void shell_exec(TerminalState* ts, const char* line) {
                 pid = proc64_create64("elfrun", 0);
                 if (pid > 0 && proc64_start_elf64(pid, path) == 0) {
                     via_proc = 1;
+                    if (bg) { rc = 0; code = 0; }   // 后台：不进入等待循环
                     const uint64_t t0 = g_ticks64;
                     int exited = 0;
-                    for (;;) {                                    // 有界等待：20 秒
+                    for (; !bg; ) {                                    // 有界等待：20 秒
                         int st = -1;
                         for (int i = 0; i < PROC64_MAX; i++) {
                             Proc64Info in;
@@ -4877,8 +4885,8 @@ static void shell_exec(TerminalState* ts, const char* line) {
                         if (g_ticks64 - t0 >= (uint64_t)PIT_HZ_64 * 120u) break;   /* ★ v0.7.7：20s -> 120s（实测 dpkg -i 要 ~20-30s；期间看门狗已 pause） */
                         task_sleep64(2);
                     }
-                    if (!exited) { (void)proc64_kill64(pid, 9); rc = -1; }
-                    if (proc64_find64(pid)) proc64_destroy64(pid);
+                    if (!exited && !bg) { (void)proc64_kill64(pid, 9); rc = -1; }
+                    if (!bg && proc64_find64(pid)) proc64_destroy64(pid);
                 } else {
                     if (pid > 0 && proc64_find64(pid)) proc64_destroy64(pid);
                 }

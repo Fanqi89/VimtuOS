@@ -712,14 +712,22 @@ int64_t wl64_surface_destroy64(uint64_t surf) {
 int64_t wl64_seat_get64() {
     const int64_t pid = wl64_pid64();
     if (pid <= 0) return WL64_EPERM64;
-    const int64_t rc = ev64_poll64(0, 0, EV64_FLAG_FOCUS64 | EV64_FLAG_CAPTURE64);
+    // ★ W3 第二批：**指针捕获归合成器**。合成器已经在跑时，客户端只申请键盘焦点 ——
+    //   否则客户端一调 20 号就把全局捕获从合成器手里抢走（合成器收不到鼠标 -> 拖不动窗口，
+    //   也没法把事件路由回客户端，界面看起来"卡死"）。
+    //   没有合成器时行为逐条不变（焦点 + 捕获）：A5/tests/wl64_test.py 的既有验收照旧。
+    const bool wm_holds = (g_wl64_wm_pid64 != 0 && g_wl64_wm_pid64 != (int)pid);
+    const uint64_t evflags = EV64_FLAG_FOCUS64 | (wm_holds ? 0ULL : EV64_FLAG_CAPTURE64);
+    const int64_t rc = ev64_poll64(0, 0, evflags);
     if (rc < 0) return rc;
     g_wl64_seat_users64++;
     *wl64_focus_slot64((int)pid) = 0;
     wl64_begin64();
     wl64_puts64("[WL64] seat get id="); wl64_udec64((uint64_t)WL64_SEAT_ID64);
     wl64_puts64(" pid=");               wl64_dec64(pid);
-    wl64_puts64(" flags=3 (focus+capture) users=");
+    wl64_puts64(" flags=");               wl64_udec64(evflags);
+    wl64_puts64(wm_holds ? " (focus-only: composer holds capture) users="
+                         : " (focus+capture) users=");
     wl64_udec64(g_wl64_seat_users64);
     wl64_nl64();
     wl64_end64();
@@ -870,14 +878,21 @@ int64_t wl64_composer_get64(uint64_t out_rect_uptr) {
     wl64_puts64(" backend=");             wl64_puts64(backend ? backend : "?");
     wl64_puts64(" surfs=");               wl64_udec64((uint64_t)g_wl64_live64);
     wl64_puts64(" re=");                  wl64_udec64(re ? 1u : 0u);
-    wl64_puts64(" rect=");                wl64_dec64(g_wl64_px64); wl64_puts64(",");
+    // ★ W3 第二批：合成器是**全屏窗口层**，22 号把整屏交给它（原来是右下角 320x200 面板区）。
+    //   面板几何仍然打出来（panel=），既有验收按它反推"外壳的地盘"不受影响。
+    const int sfw = fb_width(), sfh = fb_height();
+    wl64_puts64(" rect=0,0,");            wl64_udec64((uint64_t)(sfw > 0 ? sfw : 0));
+    wl64_puts64(",");                     wl64_udec64((uint64_t)(sfh > 0 ? sfh : 0));
+    wl64_puts64(" panel=");               wl64_dec64(g_wl64_px64); wl64_puts64(",");
     wl64_dec64(g_wl64_py64);              wl64_puts64(",");
     wl64_dec64(g_wl64_pw64);              wl64_puts64(","); wl64_dec64(g_wl64_ph64);
     wl64_nl64();
     wl64_end64();
     if (out_rect_uptr) {
         Wl64Rect r;
-        r.x = g_wl64_px64; r.y = g_wl64_py64; r.w = g_wl64_pw64; r.h = g_wl64_ph64;
+        r.x = 0; r.y = 0;
+        r.w = (sfw > 0) ? sfw : 0;
+        r.h = (sfh > 0) ? sfh : 0;
         *(Wl64Rect*)(uintptr_t)out_rect_uptr = r;
     }
     return (int64_t)WL64_SEAT_ID64 | ((int64_t)gpu << 8);
@@ -1046,6 +1061,46 @@ int64_t wl64_seat_post64(uint64_t out_ev_uptr) {
     return (int64_t)s->pid;
 }
 
+// 27 wl_surface_move(surf, xy)：把 surface 的屏幕位置改成 (x|y<<32)。★ W3 第二批（窗口拖动）
+//   权限：**拥有者进程**（客户端自己要求"我要在哪"）或**注册合成器**（窗口管理器拖动窗口），
+//         别的进程一律 EPERM（不许把别人的窗口挪走）。
+//   夹取：允许部分出屏（可以拖到边上），但至少留 WL64_MOVE_KEEP64 像素在屏内 —— 否则窗口会变成
+//         "在屏外、看不见也点不到"的死窗口，而内核这边没有任何办法把它拿回来。
+//   注意：**不改 z 序**（层级仍按 id 升序，最小实现的老口径），也不改尺寸。
+static const int WL64_MOVE_KEEP64 = 32;
+int64_t wl64_surface_move64(uint64_t surf, uint64_t xy) {
+    const int64_t pid = wl64_pid64();
+    if (pid <= 0) return WL64_EPERM64;
+    Wl64Surface* s = wl64_find64((uint32_t)surf);
+    if (!s) return WL64_ENOENT64;
+    const bool owner = (s->pid == (int32_t)pid);
+    if (!owner && !wl64_is_wm64(pid)) return WL64_EPERM64;
+    int32_t x = (int32_t)(uint32_t)(xy & 0xFFFFFFFFu);
+    int32_t y = (int32_t)(uint32_t)(xy >> 32);
+    const int fw = fb_width(), fh = fb_height();
+    const int w = (int)s->w, h = (int)s->h;
+    if (fw > 0) {
+        if (x > fw - WL64_MOVE_KEEP64) x = fw - WL64_MOVE_KEEP64;
+        if (x < -(w - WL64_MOVE_KEEP64)) x = -(w - WL64_MOVE_KEEP64);
+    }
+    if (fh > 0) {
+        if (y > fh - WL64_MOVE_KEEP64) y = fh - WL64_MOVE_KEEP64;
+        if (y < -(h - WL64_MOVE_KEEP64)) y = -(h - WL64_MOVE_KEEP64);
+    }
+    const int32_t ox = s->x, oy = s->y;
+    s->x = x;
+    s->y = y;
+    wl64_begin64();
+    wl64_puts64("[WL64] move id=");  wl64_udec64(s->id);
+    wl64_puts64(" pid=");            wl64_dec64(pid);
+    wl64_puts64(" pos=");            wl64_dec64(x); wl64_puts64(","); wl64_dec64(y);
+    wl64_puts64(" from=");           wl64_dec64(ox); wl64_puts64(","); wl64_dec64(oy);
+    wl64_puts64(" by=");             wl64_puts64(owner ? "owner" : "composer");
+    wl64_nl64();
+    wl64_end64();
+    return 0;
+}
+
 // 诊断：当前注册的合成器 pid（0 = 没有）
 int wl64_composer_pid64() { return g_wl64_wm_pid64; }
 
@@ -1118,6 +1173,7 @@ int wl64_selftest64() {
         if (wl64_surface_ack64(1) != WL64_EPERM64) fail |= 4;
         if (wl64_seat_post64(0) != WL64_EPERM64) fail |= 4;
         if (wl64_composer_get64(0) != WL64_EPERM64) fail |= 4;   // 没有进程上下文：不许注册成功
+        if (wl64_surface_move64(1, 0) != WL64_EPERM64) fail |= 4; // ★ 27 号同样不许凭空挪窗口
     }
 
     // ---- bit3：面板/槽位几何在屏内（放得下才检查）----
@@ -1144,6 +1200,8 @@ int wl64_selftest64() {
     if (offsetof(Wl64SurfaceMap, va) != 0 || offsetof(Wl64SurfaceMap, bytes) != 8 ||
         offsetof(Wl64SurfaceMap, pages) != 12) fail |= 16;
     if (WL64_SURF_WIN_BYTES64 != (uint64_t)WL64_MAX_SURFACES64 * 65536ULL) fail |= 16;
+    if (WL64_ABI_SURFACE_MOVE64 != 27) fail |= 16;      // ★ W3 第二批：27 = wl_surface_move
+    if (WL64_MOVE_KEEP64 < 1 || WL64_MOVE_KEEP64 > 128) fail |= 16;   // 夹取余量必须"小但非零"
     {
         // 映射窗必须在 FB 映射区内，且**不压到后备缓冲**（否则合成器会把自己映射进显存里）
         int bb_bytes = 0;
@@ -1175,7 +1233,7 @@ void wl64_init64() {
     wl64_end64();
     wl64_begin64();
     if (sf == 0) {
-        wl64_puts64("[WL64] selftest PASS (abi 15..21 + composer 22..26 / events 64B / info 64B / rect clip / no-proc EPERM)\n");
+        wl64_puts64("[WL64] selftest PASS (abi 15..21 + composer 22..26 + move 27 / events 64B / info 64B / rect clip / no-proc EPERM)\n");
     } else {
         wl64_puts64("[WL64] selftest FAIL mask=");
         wl64_udec64((uint64_t)sf);

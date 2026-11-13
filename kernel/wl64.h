@@ -12,7 +12,8 @@
 //   * 没有 memfd/wl_shm 池、没有 wl_buffer 对象与 release 事件 —— 缓冲 = shm_create(13) 的对象；
 //   * 没有 wl_surface 状态机（attach/damage/commit 之外的状态、帧回调、subsurface、输入区域）；
 //   * 没有 DRM/KMS 原子提交、没有 epoll 事件循环、没有客户端库 libwayland-client；
-//   * surface 的**位置/尺寸/层级由这个最小组合器定**（固定面板 + 槽位 + id 升序 z 序），
+//   * surface 的**位置/尺寸/层级由这个最小组合器定**（默认面板 + 槽位 + id 升序 z 序；
+//     ★ W3 第二批起，拥有者或注册合成器可以用 27 号 wl_surface_move 改屏幕位置 = 窗口拖动），
 //     真 Wayland 里这些由 shell/合成器策略与 xdg-shell 决定。
 //
 // ============================ 调用号（int 0x80 自有 ABI）============================
@@ -199,6 +200,9 @@ int wl64_demo64(const char* path);
 //   24 wl_surface_map(surf, out)    -> 0 = 缓冲页已映射（*(Wl64SurfaceMap*)out 填 VA/bytes/pages）
 //   25 wl_surface_ack(surf)         -> 0；合成器声明"这条我合成完了"（清 pending/damage、content=1）
 //   26 wl_seat_post(out_ev)         -> 投递到的 pid（>=1）/ 0 = 目标 surface 没了 / 负错误
+//   27 wl_surface_move(surf, xy)    -> 0；把 surface 的屏幕位置改成 (x | y<<32)（两个 32 位半区按有符号解释）
+//      ★ W3 第二批（全屏合成器）：**拥有者进程**或**注册合成器**可调；坐标夹到"至少 32 px 仍可见"，
+//      这样窗口可以拖到屏幕边缘之外但绝不会变成"再也点不到"。层级仍是 id 升序（内核不改 z 序）。
 // 权限模型（最小、如实）：22..26 **只有注册过的合成器进程**能调（别的进程一律 WL64_EPERM64）；
 //   没有合成器时也是一律 EPERM（不假装有合成器）。注册幂等（同一进程再调只重打一行）；换进程
 //   注册会把旧的那个顶掉（旧的再调用就 EPERM）。
@@ -207,6 +211,7 @@ static const uint32_t WL64_ABI_SURFACE_EXPORT64 = 23;
 static const uint32_t WL64_ABI_SURFACE_MAP64    = 24;
 static const uint32_t WL64_ABI_SURFACE_ACK64    = 25;
 static const uint32_t WL64_ABI_SEAT_POST64      = 26;
+static const uint32_t WL64_ABI_SURFACE_MOVE64   = 27;   // ★ W3 第二批：窗口重定位（拖动）
 
 // 合成器的缓冲映射窗：FB 映射区（5GiB..+40MiB）的**顶部 512 KiB** = 8 个 surface 槽 × 64 KiB
 // （= 单 shm 对象上限）。为什么放这里而不是新开一段 VA：① 5GiB 起那一段已经在
@@ -218,7 +223,9 @@ static inline uint64_t wl64_surf_win_base64() { return USER64_FB_VA64 + USER64_F
 static inline uint64_t wl64_surf_win_va64(uint32_t slot) { return wl64_surf_win_base64() + (uint64_t)slot * 65536ULL; }
 
 // ---- 23 的出参：一条 surface 的只读快照（64 B POD，字段顺序固定）----
-// ---- Wl64Rect：一个屏幕矩形（16 B POD；22 号给出"外部面板区"，合成器据此划自己的地盘）----
+// ---- Wl64Rect：一个屏幕矩形（16 B POD）。★ W3 第二批：22 号给出的是**整屏**（0,0,fb_w,fb_h）——
+//      合成器据此知道"可画范围"（它现在是全屏窗口层，不再是租一角地盘）。原来的"外部面板区"
+//      几何仍在 [WL64] init 的 panel= 与 22 号行尾的 panel= 里（既有验收照旧可对账）。----
 struct Wl64Rect { int32_t x, y, w, h; };
 static const uint32_t WL64_RECT_SIZE64 = 16;
 
@@ -255,6 +262,7 @@ int64_t wl64_surface_export64(uint64_t idx, uint64_t out_uptr);  // 23
 int64_t wl64_surface_map64(uint64_t surf, uint64_t out_uptr);    // 24
 int64_t wl64_surface_ack64(uint64_t surf);                       // 25
 int64_t wl64_seat_post64(uint64_t out_ev_uptr);                  // 26
+int64_t wl64_surface_move64(uint64_t surf, uint64_t xy);          // 27（★ W3 第二批）
 int     wl64_composer_pid64();                                   // 当前注册的合成器（0 = 没有）
 
 // ==================== ★ B-wm：启动期驱动（/bin/wm + 两个客户端：卷交付）====================
