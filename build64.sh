@@ -512,8 +512,19 @@ echo "==> ★ A4-4c：用户态 gzip/gunzip（**交付 = 系统卷里的 /bin/gz
 # tools/gzip_build_win.sh：自足（不引 user/lib / musl）的 < 64 KiB 静态 ELF64 —— 直接走内核的
 # 主程序装载器（`run /bin/gzip ...`），deflate = fixed-Huffman + stored，inflate = 完整实现。
 bash tools/gzip_build_win.sh "$BUILD"
+# ★ v0.9.43（W0）：**用户态 PE 只读体检器 /bin/peinfo**（交付 = 系统卷里的文件，不进内核镜像）。
+#   它是 W1/W2/W3 的前置：在写任何一个 Win32 API 之前，先用它把真实 exe 的**导入表**读出来，
+#   否则就是照猜写一遍、再发现清单不对。产物只落 build64/peinfo（静态 ELF64，< 64 KiB）。
+bash tools/peinfo_build_win.sh "$BUILD"
+#   ★ W0 语料：三份**真 PE**（mingw-w64 现场编，不手搓）—— 极小无导入 / 控制台+CRT / GUI+MessageBoxA。
+#     没装 mingw 的机器上**不该让整个构建失败**：只 WARN 跳过（tests/peinfo64_test.py 会把
+#     语料相关的断言记 SKIP，而不是假装通过）。
+"$PY" tools/pex_corpus_build.py || echo "    WARN: pexcorpus 未建成（缺 mingw-w64？）—— /bin/peinfo 仍会装进卷"
 #   ★ v0.7.5：用户态 dpkg/apt（.deb 安装）——静态 ELF64，< 64 KiB 主程序窗口
-bash tools/dpkg_build_win.sh "$BUILD"
+# ★ v0.9.42（L1）：不再编译 user/dpkg/dpkg.c —— dpkg/apt 现在由 /bin/vpkg 的**同一个二进制**
+#   按 argv[0] 的 basename 提供前端（见 user/store/vpkg.c 文件头）。旧的那套独立 .deb 引擎
+#   （只认 gzip、靠外部 tar 解包、不处理依赖、卸载只删记录）已废弃，不再进卷。
+#   下面的 tools/dpkg_pack_win.py 装的是 build64/store/vpkg.elf。
 #   ★ v0.9.30：用户态 vmtool（ACL / 配额 / 日志 / 快照 的 ring-3 入口）——静态 ELF64，< 64 KiB 主程序窗口
 bash tools/vmtool_build_win.sh "$BUILD"
 #   ★ v0.9.33：ring3 驱动框架的两个用户态程序（ext4svc 驱动服务 + drvwatch 看门狗观察者）
@@ -1619,7 +1630,7 @@ echo "==> ★ v0.6.1：图标拆成逐张 PNG 装进 /System/icons（内核里 0
       --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 
 # ★ v0.7.5：用户态 dpkg/apt + 一个自包含测试 .deb 写进系统卷
-echo "==> ★ v0.7.5：dpkg/apt 装进 /usr/bin（+ /usr/share/dpkg/test-vimtu_1.0.deb）"
+echo "==> v0.9.42 (L1): dpkg/apt front-end = /bin/vpkg bytes (argv[0] decides) -> /usr/bin (+ test .deb)"
 "$PY" tools/dpkg_pack_win.py \
       --vol-in "$BUILD/iconsvol.img" --vol-out "$BUILD/dpkgvol.img" \
       --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
@@ -1636,6 +1647,15 @@ echo "==> ★ v0.9.33：ext4svc / drvwatch / /etc/r3drv.conf 装进系统卷"
 "$PY" tools/drivers_pack_win.py \
       --dir "$BUILD" \
       --vol-in "$BUILD/vmtoolvol.img" --vol-out "$BUILD/drvvol.img" \
+      --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+# ★ v0.9.43（W0）：/bin/peinfo + 三份真 exe 语料装进系统卷。
+#   为什么插在这里：卷链是"卷进卷出"，drivers_pack 是**最后一环**（它的 --disk 重拼了 sysdisk.img）；
+#   本步用 drvvol.img 当输入、再重拼一次 sysdisk.img —— 于是**后面所有步骤（payload_embed 等）
+#   什么都不用改**，自动就拿到带 peinfo 的卷。这是这条链上最不容易出错的插入点。
+echo "==> v0.9.43 (W0): /bin/peinfo + real PE corpus -> system volume"
+"$PY" tools/peinfo_pack_win.py \
+      --vol-in "$BUILD/drvvol.img" --vol-out "$BUILD/peinfovol.img" \
+      --peinfo "$BUILD/peinfo" --corpus "$BUILD/pexcorpus" \
       --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 echo "==> ★ v0.5.11：把数据分区（VimtuFS2 卷）**并入安装载荷** system.img"
 # ★ 真缺陷（旧批修）：system.img 原来只切了前 8073 扇区（MBR+引导+内核+64 扇区裸槽），

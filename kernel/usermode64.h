@@ -38,7 +38,22 @@
 static const uint64_t USER64_CODE_VA64      = 0x0000000100000000ULL;  // 4GiB：用户代码/入口
 static const uint64_t USER64_STACK_VA64     = 0x0000000100010000ULL;  // 4GiB+64KiB：用户栈底
 static const uint64_t USER64_TEST_VA64      = 0x0000000100080000ULL;  // 自检用测试页（窗口内）
-static const uint64_t USER64_WINDOW_BYTES64 = 16ULL * 1024ULL * 1024ULL; // ★ A4-2b-2：4GiB..4GiB+16MiB（原 1 MiB）
+// ★ v0.9.42（P0.1）：从 16 MiB 放大到 **1008 MiB = 1GiB - 16MiB**。
+//   为什么必须放大（两个实测红项的同一个根因，见 docs/多生态加载盘点与路线图.md §5）：
+//     ① 425 KB 的静态 musl 自己的 PT_LOAD 落在 4GiB+8MiB，而旧装载区顶只有 4GiB+6MiB
+//        （16MiB - 8MiB(SHM) - 2MiB(DEV)）-> `[ELF64] exec reject reason=outside-user-window`；
+//     ② vpkg 装 .deb 时 file_pool() 一次要 1 MiB 的 mmap，而旧 mmap 区只有 ~5.4 MiB，
+//        已被 xz 的 8 MiB 字典等 bump 掉 -> `[VPKG] installed files pool full used=0`。
+//   为什么是 1008 而不是 1024（= 1GiB）：PDPT[4] 覆盖 4GiB..5GiB 恰好 1 GiB，而
+//     USER64_FB_VA64 = 5GiB 就落在这条 PDPT 的正上方边界上；proc64/syscall64 两处自检都要求
+//     `USER64_FB_VA64 > USER64_CODE_VA64 + USER64_WINDOW_BYTES64`（严格大于），所以窗口顶必须
+//     比 5GiB 低至少一页。取 16 MiB 间隙（数字好记、且远大于任何单页需求）。
+//   为什么不会撑爆页池：页表与物理页都是**惰性**分配（user64_map_page64 / user64_map_phys_page64
+//     被调用时才建），全文件没有任何"按窗口尺寸预扫"的循环；进程回收 p64_release_area64 只走
+//     512 个 PDE 且对空表立刻 continue，与窗口大小无关。
+//   窗口内各分区（装载区/栈/brk/终端邮箱/自检页/mmap 起点）**一个地址都没动**，只有 mmap 区
+//     的上界跟着抬到 USER64_LOADER_BIG_TOP_VA64。
+static const uint64_t USER64_WINDOW_BYTES64 = 1008ULL * 1024ULL * 1024ULL; // 1GiB - 16MiB
 static const uint64_t USER64_STACK_BYTES64  = 16ULL * 1024ULL;        // 用户栈 16KiB = 4 页
 static const uint64_t USER64_BRK_VA64       = 0x0000000100040000ULL;  // 4GiB+256KiB：brk 固定区
 static const uint64_t USER64_BRK_BYTES64    = 64ULL * 1024ULL;        // 64KiB
@@ -59,9 +74,11 @@ static const uint64_t USER64_INTERP_TOP_VA64 = 0x0000000100100000ULL; // 4GiB+1M
 //     算，于是本值比真正的 DEV 窗下沿**高 7.75 MiB**：映像/mmap 的上界越过了设备窗与 shm 窗。
 //     proc64 的自检 bit3（`selftest FAIL mask=8`）一直抓得到，但只有跑 tests/explorer64_test.py
 //     这一类会读自检结果的用例才看得见 —— 属于"红灯挂着没人看"。修法 = 按 8 MiB 重算。
+// ★ v0.9.42：式子改用 USER64_WINDOW_BYTES64（原先把 16 MiB 写死成字面量，改窗口就会静默错位，
+//   而 proc64.h 的 static_assert 只核对"它等于 DEV64_WINDOW_VA64"，不核对"它由窗口推导"）。
 static const uint64_t USER64_LOADER_BIG_TOP_VA64 =
-    0x0000000100000000ULL + 16ULL * 1024ULL * 1024ULL
-    - (8ULL * 1024ULL * 1024ULL + 2ULL * 1024ULL * 1024ULL); // = 4GiB+0x600000 = DEV64_WINDOW_VA64
+    USER64_CODE_VA64 + USER64_WINDOW_BYTES64
+    - (8ULL * 1024ULL * 1024ULL + 2ULL * 1024ULL * 1024ULL); // = DEV64_WINDOW_VA64
 
 // ★ A1：用户态**帧缓冲映射区**（5GiB 起，上限 40MiB —— 4K 后备缓冲 3840x2160x4 = 33MiB）。
 //   为什么单开一块、而不是放进上面那个用户窗口：
@@ -73,6 +90,15 @@ static const uint64_t USER64_LOADER_BIG_TOP_VA64 =
 //   逐页映射由 user64_map_phys_page64() 做（内核把物理页挂到用户页表，用户直接读写）。
 static const uint64_t USER64_FB_VA64       = 0x0000000140000000ULL;    // 5GiB
 static const uint64_t USER64_FB_BYTES64    = 40ULL * 1024ULL * 1024ULL;
+// ★ v0.9.42：编译期把"窗口顶严格低于 FB 底、且窗口不越出 PDPT[4] 的 1 GiB"钉死。
+//   两条都是硬约束：前者两条自检（proc64 selftest bit3 / syscall64 selftest bit0）只看运行时，
+//   改常量时若写错就变成开机蓝屏；后者是 PDPT[4] 只覆盖 1 GiB，越过去就踩到 FB 的 PDPT[5]。
+static_assert(USER64_CODE_VA64 + USER64_WINDOW_BYTES64 < USER64_FB_VA64,
+              "用户窗口顶必须严格低于 USER64_FB_VA64（5GiB）");
+static_assert(USER64_WINDOW_BYTES64 <= (1ULL << 30),
+              "用户窗口不能超过 1 GiB（PDPT[4] 的覆盖范围）");
+static_assert((USER64_WINDOW_BYTES64 & 0xFFFULL) == 0,
+              "用户窗口必须是 4KiB 的整数倍");
 // 自检（位掩码，0 = 全过）：用户页映射/权限位、iretq 帧字段、选择子/GDT 现场、范围校验
 int user64_selftest64();
 

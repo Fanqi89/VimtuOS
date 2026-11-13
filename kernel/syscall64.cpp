@@ -1042,7 +1042,26 @@ static int64_t lx64_close64(uint64_t nr, uint64_t fd) {
     }
 #endif
     if (fd > 2 && fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
-    if (fd <= 2 && !fd64_slot_used64((int)fd)) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
+    // ★ v0.9.42（P0.3）：fd 0..2 的**空槽** = 内核控制台虚拟标准流 —— 它一直是"打开"的，
+    //   所以 close 必须**成功返回 0**，不能返回 -EBADF。这不是放宽，是把一处内部矛盾修掉。
+    //
+    //   矛盾是什么（旧行为）：槽空时 `read`/`write` 一律落到内核控制台并**成功**
+    //   （fd64 层对 0..2 的空槽直接放行，见 fd64.h 的"虚拟标准流"段），但 close 却说
+    //   "没有对象可关 -> -EBADF"。于是一个**能写的 fd 说自己不存在**。
+    //
+    //   实测后果（本轮真证据，完整链路见 docs/多生态加载盘点与路线图.md §5）：
+    //     [SYSCALL] insn nr=1  rdi=1 … ret=14          <- write(1,"Hello, world!\n") 成功
+    //     [SYSCALL] deny nr=3  arg=1                   <- close(1) 拿 -EBADF
+    //     /lxcorpus/gnuhello: write error: Bad file descriptor   <- glibc 的 _IO_cleanup 抱怨
+    //     [SYSCALL] insn nr=231 rdi=1                  <- exit_group(1)
+    //   即 Debian 的 hello **打印成功了却退出码 1**，linuxapp64_test 的 ③ 因此只能验输出、
+    //   不能验退出码。修掉之后它 `exited code=0`。
+    //
+    //   取舍（如实写清，别当成"关掉了"）：本内核的 0..2 是**不可关闭的内核控制台流** ——
+    //   close 返回 0 之后 write 仍然落到控制台（a42a64 探针的 `write1_after_close=34` 钉的就是
+    //   这条，本批不改它）。所以这里等价于"关一个不可关的特殊流"= 幂等成功。
+    //   同时**不再打 deny**：deny 是"安全闸门拒绝"的打点，正常语义不该污染日志。
+    if (fd <= 2 && !fd64_slot_used64((int)fd)) return 0;
     const int r = fd64_close64((int)fd);
     if (r != 0) { syscall64_deny64(nr, fd); return r; }
     return 0;

@@ -208,6 +208,13 @@ const char* vs_inst_file(const struct VsInstalled* p, int k);   /* NULL = 越界
 int  vs_inst_file_add(struct VsInstalled* p, const char* path); /* 0 = 成功；VS_E_NOMEM = 池满 */
 void vs_inst_files_reset(void);                                 /* 读库前清池（vs_db_load 自己会调） */
 int  vs_inst_files_used(void);                                  /* 池里已用几条（日志/诊断） */
+/* ★ v0.9.42（P0.2）：池改成按块增量分配后的两项诊断（只追加，既有声明一个不动）：
+ *   chunks   = 已成功 mmap 的块数（每块 VS_POOL_CHUNK=256 条 = 32 KiB）
+ *   fail_req = 最近一次 mmap 失败的请求字节数（0 = 从没失败过）
+ *   为什么要暴露它们：旧实现把"mmap 失败"和"格数用尽"都报成 pool full，日志里 `used=0` 却
+ *   说"满" —— 靠这两个数字才能当场区分"空间不够"与"真的用了 8192 格"。 */
+int  vs_inst_files_chunks(void);                                /* 已建块数 */
+int  vs_inst_files_fail_req(void);                              /* 最近失败的 mmap 字节数 */
 /* 已装库的微内存缓存（GUI 每次重画要用；避免每帧读盘） */
 int  vs_cached_installed(struct VsInstalled* out, int cap, int* n);
 int  vs_cached_repo(struct VsPkg* out, int cap, int* n);

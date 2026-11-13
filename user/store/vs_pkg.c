@@ -270,8 +270,9 @@ static int parse_inst_object(struct Js* j, struct VsInstalled* p) {
                 char f[VS_FILE_MAX];
                 if (js_str(j, f, (int)sizeof(f)) < 0) return VS_E_FORMAT;
                 if (vs_inst_file_add(p, f) != 0) {
-                    vs_log(VS_TAG, "installed json files pool full used=%d cap=%d\n",
-                           vs_inst_files_used(), VS_FILE_POOL_MAX);
+                    vs_log(VS_TAG, "installed json files pool EXHAUSTED used=%d cap=%d chunks=%d req=%d\n",
+                           vs_inst_files_used(), VS_FILE_POOL_MAX,
+                           vs_inst_files_chunks(), vs_inst_files_fail_req());
                     return VS_E_NOMEM;                  /* 池满：如实报，不静默截断 */
                 }
             }
@@ -339,6 +340,25 @@ int vs_db_write(const char* path, const struct VsInstalled* in, int n, int* out_
         if (o > bufsz - 512) return VS_E_NOMEM;              /* 有界：超了就如实失败 */
     }
     o += vs_fmt(buf + o, bufsz - o, "\n]}\n");
+    /* ★ v0.9.42（L1）：写库之前**确保它的父目录存在**。
+     *   真缺陷（dpkg64_test 实测抓到的）：演示盘的卷里没有 /var/lib/vpkg 这个目录，
+     *   于是 vs_write_file 直接失败，install 走完所有落盘步骤却整体报
+     *     [DPKG] ERROR code=io msg="cannot write installed database"  -> rc=12
+     *   串口原文：`[VFS64] path component not found path=/var/lib/vpkg/installed.json`
+     *            `[FD64] open FAILED path=/var/lib/vpkg/installed.json rc=2`
+     *   为什么必须由包管理器自己建：/var/lib/vpkg 是**它的**数据库目录，装在用户选的任意
+     *   卷上都该能用；靠构建期造卷预建目录，换个盘/换个根就又会坏（而且这不是"包错误"，
+     *   是环境准备，不该让用户看到 rc=12）。
+     *   放在 vs_db_write 里而不是调用点：install / remove / GUI 三处都会重写库，一处覆盖全部。
+     *   vs_mkdir_p 对"已经存在"算成功（见 vs_io.c 的说明）。 */
+    {
+        char dir[VS_FILE_MAX];
+        vs_strcpy(dir, (int)sizeof(dir), path);
+        for (int k = (int)vs_strlen(dir) - 1; k > 0; k--) {
+            if (dir[k] == '/') { dir[k] = 0; break; }
+        }
+        if (dir[0] == '/') (void)vs_mkdir_p(dir);      /* 失败就让下面的 write 如实报 IO */
+    }
     const int rc = vs_write_file(path, (const unsigned char*)buf, o);
     if (rc != 0) return VS_E_IO;
     if (out_bytes) *out_bytes = o;
@@ -834,32 +854,63 @@ static struct VsInstalled* scratch_inst(void) {
  *   —— 用户栈只有 16 KiB（本文件上面那段注释里记着第一轮 26 条红就是撞的这个）。
  * 池是**全局共用**的：vs_db_load() 从头重建（先 reset），装新包时往后追加。
  * 池满 = 如实 VS_E_NOMEM（**不静默截断**：截断的 files[] 会让卸载漏文件）。 */
-static char (*g_file_pool)[VS_FILE_MAX];        /* 指针版：不放 .data（-fno-zero-initialized-in-bss） */
-static int g_file_used;
+/* ★ v0.9.42（P0.2）：**按块增量**分配，不再一次要 1 MiB。
+ *   真缺陷（实测串口原文，见 docs/多生态加载盘点与路线图.md §5 根因②）：
+ *     [VPKG] install file path=/usr/bin/hello bytes=31360 …      ← 第一个文件已落盘
+ *     [VPKG] installed files pool full used=0 cap=8192 files=0    ← 池是空的却报"满"
+ *     [VPKG] ERROR code=nomem
+ *   原因：旧 file_pool() 在第一次用到时一次 vs_mmap(128 × 8192 = **1 MiB**)；而 vs_mmap 走内核
+ *   mmap(9)，用户 mmap 区当时只有 ~5.4 MiB 且是 bump 分配**不回收**，装一个包已经把包缓冲 +
+ *   xz 输出 + xz 声明的 8 MiB 字典吃掉 → 这 1 MiB 申请必然失败，返回 NULL，而调用点把 NULL
+ *   笼统当成"池满"，于是 used=0 也报满，连"到底缺多少"都看不出来。
+ *   修法两条（都必要）：
+ *     ① 每块 VS_POOL_CHUNK 条（= 32 KiB）按需 mmap：装 49 个文件的包只建 1 块；
+ *     ② 失败时**如实报出请求字节数与已建块数**（g_file_fail_req / g_file_chunks），
+ *        不再把"mmap 失败"伪装成"池满"。
+ *   为什么块大小取 256：一个真包几十~几百个文件（hello=49、libc6=285），256 条 = 32 KiB
+ *   足以覆盖绝大多数包一次搞定；最坏 8192 条 = 32 次 mmap，仍远小于旧的单次 1 MiB。 */
+#define VS_POOL_CHUNK   256
+#define VS_POOL_CHUNKS  ((int)(VS_FILE_POOL_MAX / VS_POOL_CHUNK))
+static char (*g_file_chunk[VS_POOL_CHUNKS])[VS_FILE_MAX];   /* 指针数组：不占 .data */
+static int  g_file_used;
+static int  g_file_chunks;          /* 已成功 mmap 的块数（诊断） */
+static int  g_file_fail_req;        /* 最近一次失败的 mmap 请求字节数（0 = 没失败过） */
 
-static char (*file_pool(void))[VS_FILE_MAX] {
-    if (!g_file_pool)
-        g_file_pool = (char (*)[VS_FILE_MAX])vs_mmap((int)sizeof(char[VS_FILE_MAX]) * VS_FILE_POOL_MAX);
-    return g_file_pool;
+/* 第 idx 格的地址；需要那一块时才 mmap 它。返回 0 = 该块 mmap 失败（已记 g_file_fail_req）。 */
+static char* file_slot(int idx) {
+    if (idx < 0 || idx >= (int)VS_FILE_POOL_MAX) return (char*)0;
+    const int c = idx / VS_POOL_CHUNK;
+    if (c < 0 || c >= VS_POOL_CHUNKS) return (char*)0;
+    if (!g_file_chunk[c]) {
+        const int req = (int)sizeof(char[VS_FILE_MAX]) * VS_POOL_CHUNK;
+        g_file_chunk[c] = (char (*)[VS_FILE_MAX])vs_mmap(req);
+        if (!g_file_chunk[c]) { g_file_fail_req = req; return (char*)0; }
+        g_file_chunks++;
+    }
+    return g_file_chunk[c][idx % VS_POOL_CHUNK];
 }
+
+int vs_inst_files_chunks(void)    { return g_file_chunks; }
+int vs_inst_files_fail_req(void)  { return g_file_fail_req; }
 
 void vs_inst_files_reset(void) { g_file_used = 0; }
 int  vs_inst_files_used(void)  { return g_file_used; }
 
 const char* vs_inst_file(const struct VsInstalled* p, int k) {
-    if (!p || !g_file_pool || k < 0 || k >= p->nfiles) return (const char*)0;
+    if (!p || k < 0 || k >= p->nfiles) return (const char*)0;
     const int idx = p->files_off + k;
-    if (idx < 0 || idx >= VS_FILE_POOL_MAX) return (const char*)0;
-    return g_file_pool[idx];
+    if (idx < 0 || idx >= (int)VS_FILE_POOL_MAX) return (const char*)0;
+    return file_slot(idx);                       /* 用到哪块才建哪块 */
 }
 
 int vs_inst_file_add(struct VsInstalled* p, const char* path) {
     if (!p || !path || !path[0]) return VS_E_PATH;
     if (p->nfiles == 0) p->files_off = g_file_used;      /* 这条记录从池里第几格开始 */
     if (p->nfiles >= VS_FILES_MAX) return VS_E_NOMEM;    /* 单包上限（VS_FILES_MAX） */
-    if (g_file_used >= VS_FILE_POOL_MAX) return VS_E_NOMEM;
-    if (!file_pool()) return VS_E_NOMEM;
-    vs_strcpy(g_file_pool[g_file_used], VS_FILE_MAX, path);
+    if (g_file_used >= (int)VS_FILE_POOL_MAX) return VS_E_NOMEM;   /* 格数用尽（≠ mmap 失败） */
+    char* dst = file_slot(g_file_used);
+    if (!dst) return VS_E_NOMEM;                        /* mmap 失败：g_file_fail_req 有真数字 */
+    vs_strcpy(dst, VS_FILE_MAX, path);
     g_file_used++;
     p->nfiles++;
     return VS_OK;
@@ -1016,8 +1067,9 @@ static int install_vap64(const char* tag, const struct VsPkg* p, const unsigned 
             vs_strcpy(icon_vfs, VS_FILE_MAX, dsticon);
             vs_log(tag, "manifest icon path=%s bytes=%d src=%s\n", dsticon, il, srcicon);
             if (vs_inst_file_add(rec, dsticon) != 0) {
-                vs_log(tag, "installed files pool full used=%d cap=%d\n",
-                       vs_inst_files_used(), VS_FILE_POOL_MAX);
+                vs_log(tag, "installed files pool EXHAUSTED used=%d cap=%d chunks=%d req=%d\n",
+                       vs_inst_files_used(), VS_FILE_POOL_MAX,
+                       vs_inst_files_chunks(), vs_inst_files_fail_req());
                 return VS_E_NOMEM;
             }
         } else {
@@ -1043,8 +1095,9 @@ static int install_vap64(const char* tag, const struct VsPkg* p, const unsigned 
     rec->bytes = v.code_size;
     vs_strcpy(rec->sha256, 65, p->sha256);
     if (vs_inst_file_add(rec, target) != 0 || vs_inst_file_add(rec, share) != 0) {
-        vs_log(tag, "installed files pool full used=%d cap=%d\n",
-               vs_inst_files_used(), VS_FILE_POOL_MAX);
+        vs_log(tag, "installed files pool EXHAUSTED used=%d cap=%d chunks=%d req=%d\n",
+               vs_inst_files_used(), VS_FILE_POOL_MAX,
+               vs_inst_files_chunks(), vs_inst_files_fail_req());
         return VS_E_NOMEM;
     }
     return VS_OK;
@@ -1200,8 +1253,9 @@ static int install_deb(const char* tag, const struct VsPkg* p, const unsigned ch
         sha256_of(dbuf + off, e.size, h);
         vs_log(tag, "install file path=%s bytes=%d sha256=%s\n", full, e.size, h);
         if (vs_inst_file_add(rec, full) != 0) {              /* 池满/单包超 4096：如实报，不截断 */
-            vs_log(tag, "installed files pool full used=%d cap=%d files=%d\n",
-                   vs_inst_files_used(), VS_FILE_POOL_MAX, rec->nfiles);
+            vs_log(tag, "installed files pool EXHAUSTED used=%d cap=%d files=%d chunks=%d req=%d\n",
+                   vs_inst_files_used(), VS_FILE_POOL_MAX, rec->nfiles,
+                   vs_inst_files_chunks(), vs_inst_files_fail_req());
             return VS_E_NOMEM;
         }
         tar_skip(&off, e.size);

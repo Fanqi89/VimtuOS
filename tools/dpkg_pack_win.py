@@ -1,10 +1,18 @@
 ﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""tools/dpkg_pack_win.py - ★ v0.7.5：把用户态 dpkg/apt 装进系统卷 + 造一个自包含测试 .deb
+"""tools/dpkg_pack_win.py - ★ v0.9.42（L1）：把 **dpkg/apt 前端** 装进系统卷 + 造一个自包含测试 .deb
+
+★ L1 变了什么：本脚本原来装的是 build64/dpkg（user/dpkg/dpkg.c 编出来的**第二套** .deb 引擎）。
+  v0.9.42 起那套已废弃、不再编译 —— 现在装的是 **build64/store/vpkg.elf 这同一份字节**，
+  由 user/store/vpkg.c 按 argv[0] 的 basename 决定前端（busybox 模式）：
+    basename == "vpkg" -> vpkg 前端（原行为，一个字节都没变）
+    basename == "dpkg" -> dpkg 前端（-i / -l / -r / -s / --version，文案与旧 mini-dpkg 逐字节一致）
+    basename == "apt"  -> apt  前端（install ./X.deb / update / list / remove）
+  于是全系统只有**一份** ar/tar/gzip/xz/依赖/文件清单实现（user/store/vs_*.c）。
 
 落点：
-  /usr/bin/dpkg        build64/dpkg 的字节（v0.7.5 起 /bin 由内核映射到 /usr/bin）
-  /usr/bin/apt         同一份字节（argv[0] 里含 "apt" 时走 apt 前端）
+  /usr/bin/dpkg        build64/store/vpkg.elf 的字节（v0.7.5 起 /bin 由内核映射到 /usr/bin）
+  /usr/bin/apt         同一份字节（argv[0] 的 basename 是 "apt" 时走 apt 前端）
   /usr/share/dpkg/test-vimtu-1.0.deb
                        构建期现场生成的**真 .deb**（ar + control.tar.gz + data.tar.gz），
                        内容是 /usr/share/vimtu-dpkg-test/hello.txt —— 用来验收 `dpkg -i` 真能装。
@@ -107,7 +115,9 @@ def make_deb():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dpkg", default=os.path.join(ROOT, "build64", "dpkg"))
+    # ★ v0.9.42（L1）：默认源从 build64/dpkg（已废弃的独立引擎）改成 build64/store/vpkg.elf。
+    #   参数名保持 --dpkg（构建脚本与文档里都这么叫），但装进去的**是 vpkg 的字节**。
+    ap.add_argument("--dpkg", default=os.path.join(ROOT, "build64", "store", "vpkg.elf"))
     ap.add_argument("--vol-in", default=None)
     ap.add_argument("--vol-out", default=None)
     ap.add_argument("--system", default=None)
@@ -116,21 +126,26 @@ def main():
     args = ap.parse_args()
 
     if not os.path.exists(args.dpkg):
-        sys.stderr.write("缺 %s（先跑 tools/dpkg_build_win.sh）\n" % args.dpkg)
+        sys.stderr.write("缺 %s（先跑 user/store/build_store.sh 编出 /bin/vpkg）\n" % args.dpkg)
         return 2
     exe = open(args.dpkg, "rb").read()
     if exe[:4] != b"\x7fELF":
         sys.stderr.write("%s 不是 ELF\n" % args.dpkg)
         return 2
-    # ★ v0.7.6（真缺陷门禁）：主程序映像必须能进 execve 的 **64 KiB 主程序窗口**。
-    #   上界 = 4 GiB + 64 KiB = 0x100010000（= 用户栈起点 USER64_STACK_VA64）。
+    # ★ v0.9.42（P0.1 之后）：主程序映像的上界不再是"64 KiB 窗口"。
+    #   旧门禁写的是 0x100010000（= 4 GiB + 64 KiB，v0.4 时代的窗口顶），而
+    #   kernel/usermode64.h 的 USER64_LOADER_BIG_TOP_VA64 现在是
+    #   **4 GiB + 998 MiB**（= 窗口 1008 MiB − 8 MiB SHM − 2 MiB DEV）。用它才是真约束：
+    #   映像越过它，内核会 `[ELF64] exec reject reason=outside-user-window`。
+    #   为什么必须放宽：/bin/vpkg 现在同时要当 dpkg/apt 前端，映像从 4 GiB+60 KiB 涨到
+    #   64 KiB 上下 —— 旧的 64 KiB 门禁会误报，而**产品侧本来是允许的**。
     top = image_top(exe)
-    limit = 0x100010000
+    limit = 0x100000000 + 998 * 1024 * 1024
     print("    映像最高地址 = 0x%X（PT_LOAD vaddr+memsz 页对齐）；窗口上界 = 0x%X，余量 %d B"
           % (top, limit, limit - top))
     if top > limit:
-        sys.stderr.write("ERROR: dpkg 映像越过 64 KiB 主程序窗口（0x%X > 0x%X），"
-                         "execve 会拒载（overlaps-user-region）\n" % (top, limit))
+        sys.stderr.write("ERROR: dpkg/apt 前端映像越过主程序装载区顶（0x%X > 0x%X），"
+                         "execve 会拒载（outside-user-window）\n" % (top, limit))
         return 1
     deb, body = make_deb()
     files = {
@@ -140,7 +155,8 @@ def main():
     #   在终端里会变成 `test-vimtu1.0.deb`（下划线被吞）-> dpkg -i 找不到文件。
     "/usr/share/dpkg/test-vimtu-1.0.deb": (deb, 0o644),
     }
-    print("    dpkg=%d B（同一份字节也装成 apt）；测试 .deb=%d B（内容 %d B 落到 %s）"
+    print("    vpkg.elf=%d B（同一份字节装成 /usr/bin/dpkg 与 /usr/bin/apt，argv[0] 决定前端）；"
+          "测试 .deb=%d B（内容 %d B 落到 %s）"
           % (len(exe), len(deb), len(body), CTRL_PATH))
 
     vol_sectors = args.target_sectors - PART_MAIN_LBA

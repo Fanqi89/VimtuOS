@@ -1,4 +1,29 @@
-﻿/* dpkg.c - ★ v0.7.5：最小 dpkg / apt（Ring 3，静态 ELF64，走内核主程序装载器）
+﻿/* dpkg.c - ⚠️ **已废弃（v0.9.42 / L1），不再编译、不再进卷** —— 保留仅供参考与回溯。
+ *
+ * ============================ 为什么废弃 ============================
+ * L1 的目标是"全系统只留**一份** .deb 引擎"。本文件是 v0.7.5 的第二套独立实现：
+ *   * 只认 `control.tar.gz` / `data.tar.gz`（Debian 原样的 `control.tar.xz` 当场拒绝）；
+ *   * 解包**靠外部 `/usr/bin/tar` 子进程**（多一层依赖、多一处失败点）；
+ *   * 完全不处理 `Depends`/`Provides`；
+ *   * `-r` 只删 `/var/lib/dpkg/status` 里那条记录，**不删文件**（没有 files[] 清单）；
+ *   * 没有已装文件清单、没有 sha256 校验、没有空间预检。
+ * 现在 `/usr/bin/dpkg` 与 `/usr/bin/apt` 都是 **`/bin/vpkg` 那同一份字节**
+ * （造卷时把同一份 ELF 写到三个路径），由 `user/store/vpkg.c` 按 `argv[0]` 的 basename
+ * 决定前端（busybox 模式）。于是 ar / tar / gzip / **xz** / 依赖 / 文件清单 / 卸载真删
+ * 全部只有 `user/store/vs_*.c` 一份实现。
+ *
+ * 谁替代了本文件的哪一部分：
+ *   `-i` / `apt install ./X.deb`  -> vs_install()（user/store/vs_pkg.c：ar/tar/gz/xz/依赖/清单）
+ *   `-l` / `apt list`             -> vs_list()
+ *   `-r` / `apt remove|purge`     -> vs_remove()（按 installed.json 的 files[] **真删文件**）
+ *   `-s`                          -> vs_info()
+ *   `--version`                   -> vpkg.c 的 dpkg 前端（**文案与本文件逐字节一致**，
+ *                                    所以 tests/dpkg64_test.py 的 A 条断言不需要改）
+ *
+ * 想找回旧行为：`git log -- user/dpkg/dpkg.c`，或 `git show v0.9.41:user/dpkg/dpkg.c`。
+ *
+ * ============================ 原始说明（保留）============================
+ * dpkg.c - ★ v0.7.5：最小 dpkg / apt（Ring 3，静态 ELF64，走内核主程序装载器）
  *
  * 为什么**不移植 Debian 的 dpkg/apt 二进制**（如实说明技术门槛，有依据）：
  *   * apt 依赖 libapt-pkg(C++) + libstdc++ + gnutls + lz4/zstd/xz + libgcrypt …，

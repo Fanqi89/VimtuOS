@@ -4,7 +4,7 @@
 目标是"能当日常系统用"，而不是教学玩具。
 
 - 语言：C / C++（内核）+ Rust（设计 Token 表）+ 汇编（引导与入口）+ Python（构建与验收）
-- 版本：**0.9.41**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0…）
+- 版本：**0.9.43**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0…）
 - 许可：GPL-3.0
 - 验收方式：**77 个自动化验收脚本**，每条断言都有串口打点或像素证据（见 [验收](#五验收与工程质量)）
 
@@ -267,9 +267,18 @@ shm + wl_surface + `wl_seat_get()` + font64 排版）：
 - ✅ **符号链接**（v0.7.0）：`symlink(88)`/`readlink(89)` 可用（`VFS64_TYPE_LINK`，只跟随**最后一级**、
   最多 8 层，目标 <=511 B），实测 `[VFS64] symlink: create/readlink/follow PASS`；
   **`link(86)` 硬链接仍 `-EPERM`**（VimtuFS2 的目录项内嵌在 inode 里，要支持得升卷格式）。
-- ⚠️ **dpkg / apt**（v0.7.5 起，用户态兼容工具，**不是** Debian 二进制）：同命令、同 `.deb` 容器、同
-  `/var/lib/dpkg/status`。容器解析 = `ar` + `control.tar.gz` + `data.tar.gz`（**xz / zstd 成员如实拒绝**，
-  这条链上没有解码器；带 `preinst/postinst` 的包整包拒绝）。
+- ✅ **dpkg / apt / vpkg —— 全系统只有**一份** `.deb` 引擎**（★ v0.9.42 / L1）：
+  `/usr/bin/dpkg` 与 `/usr/bin/apt` 就是 **`/bin/vpkg` 的同一份字节**（造卷时把同一个 ELF 写到三个路径），
+  程序按 `argv[0]` 的 basename 决定前端（busybox 模式）。`dpkg -i/-l/-r/-s/--version`、
+  `apt install ./X.deb|update|list|remove` 全部翻译成 `vs_install/vs_list/vs_remove/vs_info`。
+  **vpkg 模式的所有日志行逐字节不变**（测试契约不破）。
+  引擎能力：`ar` + `control.tar.{gz,**xz**}` + `data.tar.{gz,**xz**}`（xz 是**真 LZMA2 解码**，
+  单块 + CRC32/none）、sha256 校验、空间预检、一层依赖 + `/etc/vpkg/provides`（每行必须带见证路径）、
+  每包 `files[]` 清单（卸载**真删文件**）。
+  如实边界：带 `preinst/postinst` 的包**整包拒绝**（`VS_E_SCRIPTS`）；deb 里的**符号链接条目**拒绝；
+  多块 xz / BCJ / Delta 过滤器拒绝；依赖只比名字、不递归、无版本区间。
+  旧的那套独立实现（`user/dpkg/dpkg.c`，只认 gzip、靠外部 `tar` 解包、不管依赖、卸载只删记录）
+  已废弃、不再编译、不进卷。
   ★ **v0.7.7 实测状态（如实，逐条）**：`tests/dpkg64_test.py` **6/6 PASS** —— `dpkg --version`、
   **`dpkg -i <真 .deb>` 装成功**（ar 解包 + control.tar.gz 解出 -> 读 `./control` -> data.tar.gz 解到 `/`
   -> 追写 `/var/lib/dpkg/status`）、payload 真落地（终端 `cat` 读到 **47 B**）、`dpkg -l` 从状态文件读回记录、
@@ -278,9 +287,29 @@ shm + wl_surface + `wl_seat_get()` + font64 排版）：
   ★ 性能边界（如实，v0.7.9 实测）：pipe 容量 4096 B（POSIX PIPE_BUF）；v0.7.9 把“磁盘读写变快”
   后，`dpkg -i` 从 v0.7.7 的 25-30 s、v0.7.8 的 20.5 s 降到 **~1 s**（同一份夹具、同一台宿主；整段
   `dpkg -i` 区间里只有 2 个 `kheart beat`）。原因见下面“磁盘 I/O”一节。
-- ⚠️ **glibc / 发行版二进制**：动态映像（`PT_INTERP` + 独立地址空间 `execve`）已实现，
-  验收脚本 `tests/dynlink64_test.py` / `tests/musl64_test.py` 覆盖；但 `/proc`、`/sys`、pty、
-  完整 TLS/vDSO 仍缺 -> **常见发行版二进制整体跑不起来**，别当成"能跑 Debian 程序"。
+- ✅ **真发行版二进制能跑**（★ v0.9.42 / P0）：`PT_INTERP` 动态映像 + **PIE / load bias** +
+  **按段分块读盘（16 KiB/次）** 都通了。实测 Debian bookworm 的 `/usr/bin/hello`（PIE + glibc）
+  `run` 起来**打印 `Hello, world!` 且退出码 0**；musl 的 `ld-musl-x86_64.so.1`（873,792 B）与
+  glibc 的 `ld-linux-x86-64.so.2`（215,000 B）都能被内核装载。
+  验收：`tests/linuxapp64_test.py` **36/36**（静态/动态 musl、真 glibc、39 字符长路径、4 个真 .deb）。
+  ⚠️ 仍缺（如实）：`/proc` 内容不完整、无 pty、无 vDSO、TLS 只到能启动 glibc 的程度 ——
+  所以**不是**"随便哪个发行版程序都能跑"，实测覆盖面见上面那 36 条。
+- ✅ **Windows PE：只读体检器 `/bin/peinfo`**（★ v0.9.43 / W0）—— **Windows 生态的第一步，但还不是加载器**。
+  ring3 静态 ELF64（22,016 B，自足不链 libc，文件缓冲走 `mmap(9)`），打印 DOS/NT/可选头
+  （**PE32 与 PE32+ 两版**）/节表/**导入表逐条**/导出/重定位/TLS/资源目录/CLR/Subsystem，
+  并输出一行 **`union` 导入并集**。**不映射节、不做重定位、不填 IAT、不执行任何字节**。
+  用法：`run /bin/peinfo /pexcorpus/gui.exe`
+  验收：`tests/peinfo64_test.py` **27/27** —— 三份 **mingw-w64 现场编的真 PE**
+  （`/pexcorpus/{tiny,cui,gui}.exe`）的头字段/每个节/每条导入/summary/`union`
+  与宿主侧独立实现 `tools/pe_crosscheck.py` **逐项一致**；反例（对 ELF）`reject reason=dos` 且退出码 1。
+  ★ **它量出来的"Windows API 极简真相"**（推翻了先前凭印象列的清单）：
+  * 一个 GUI 程序（`MessageBoxA` + `-mwindows`）**只导入 `USER32.dll` 的 1 个函数**，**没有 gdi32**；
+  * CRT 走**老式 `msvcrt.dll`**（`__getmainargs`/`_initterm`/`_iob_func`/`__set_app_type` 那套），**不是 UCRT**；
+  * `KERNEL32` 只要 **5~7 个**函数（`GetLastError`/`SetUnhandledExceptionFilter`/`Sleep`/
+    `VirtualProtect`/`VirtualQuery`，GUI 再加 `GetStartupInfoA`/`IsDBCSLeadByte`），
+    不是三十多个 A/W 双份 —— 且这一批图形 exe **只用 A 版**。
+  ❌ **还没有 PE 加载器**：不能执行任何 `.exe`（W1 才是"映射节 + DIR64 重定位 + 跳到 EntryPoint"）。
+  资源管理器双击 `.exe` 仍如实报"无法运行 Windows 可执行文件"。
 - ❌ 部分：`lstat`、`getrlimit/setrlimit`（无配额）
 
 ### 文件系统

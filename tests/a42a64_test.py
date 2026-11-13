@@ -253,10 +253,17 @@ def main():
     RESERVE_BYTES = 640 * 1024                                             # ② 预留下限 = 655,360 B
     BATCH_BASELINE_BYTES = 3418352                                         # ③ 本批实测（合流后 dev 版）
     ALLOW_BYTES = NEW_LIMIT_BYTES - BATCH_BASELINE_BYTES - RESERVE_BYTES   # = 22,288
-    check("① 系统内核在内核区硬上限内（<='%d' B = LBA 65..30784 = %d 扇区）" % (NEW_LIMIT_BYTES, NEW_LIMIT_SECTORS),
-          # 顺带钉住"内核区确实从 7,488 扇区扩到 8,000 扇区"（= 旧上限 + 256 KiB；常量自洽检查）
-          ossz <= NEW_LIMIT_BYTES and (NEW_LIMIT_BYTES - OLD_LIMIT_BYTES) == 262144,
-          "kernel64_os.bin=%d B；余量 %d B" % (ossz, NEW_LIMIT_BYTES - ossz))
+    check("① 系统内核在内核区硬上限内（<='%d' B = LBA 65..30784 = %d 扇区）"
+          % (NEW_LIMIT_BYTES, NEW_LIMIT_SECTORS),
+          # ★ v0.9.42：这条“常量自洽”原来是 `(NEW - OLD) == 262144`（v0.9.31 把内核区
+          #   7,488 -> 8,000 扇区时成立）。之后 NEW_LIMIT_SECTORS 又改成了 30,720（15 MiB），
+          #   差值变成 11,894,784 B —— 等式**恒假**，于是这条断言从那时起一直是红的，
+          #   而它“想验的”那件事（内核区确实扩过容）反而一直没被验到。
+          #   改成 `>` 才是真在验，且不再绑死某一批的具体增量（下次再扩容量不会又误报）。
+          ossz <= NEW_LIMIT_BYTES and NEW_LIMIT_BYTES > OLD_LIMIT_BYTES,
+          "kernel64_os.bin=%d B；余量 %d B；内核区 %d B > 旧上限 %d B（扩了 %d B）"
+          % (ossz, NEW_LIMIT_BYTES - ossz, NEW_LIMIT_BYTES, OLD_LIMIT_BYTES,
+             NEW_LIMIT_BYTES - OLD_LIMIT_BYTES))
     check("② 余量 >= 预留下限 R = 640 KiB（%d B；R 的来历见上面注释）" % RESERVE_BYTES,
           (NEW_LIMIT_BYTES - ossz) >= RESERVE_BYTES,
           "系统内核 %d B；余量 %d B = %d KiB（本批基线 %d B / 余量 %d B；预留 R 后还剩 %d B）"
@@ -468,7 +475,10 @@ def main():
         ("dup2_bad_old", "-9", "dup2 oldfd 无效 -> -EBADF"),
         ("dup2_bad_new", "-9", "dup2 newfd 越界 -> -EBADF"),
         ("dup2_same", "1", "dup2(1,1) 幂等返回 1"),
-        ("close_stdin_unbound", "-9", "close(0) 空槽 -> -EBADF"),
+        ("close_stdin_unbound", "0", "★ v0.9.42：close(0) 空槽 = **内核控制台虚拟标准流**"
+                                   "（能 read/write 的 fd 必须能 close 成功）；旧期望 -EBADF 是"
+                                   "「能写却说 fd 不存在」的内部矛盾 —— 实测让 glibc 程序"
+                                   "（Debian hello）打印成功却退出码 1"),
         ("close_tty1", "0", "close(fd 1 = tty) 成功"),
         ("write1_after_close", "34", "close(1) 之后 write(1) 回到内核控制台"),
     ]

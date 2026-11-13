@@ -1,4 +1,13 @@
 #!/bin/bash
+# L1-DEPRECATED (v0.9.42): build64.sh no longer calls this script.
+#
+# Why: L1 makes /usr/bin/dpkg and /usr/bin/apt the SAME BYTES as /bin/vpkg
+# (see tools/dpkg_pack_win.py + the header of user/store/vpkg.c, which picks
+# the front-end from basename(argv[0])).  user/dpkg/dpkg.c is a SECOND .deb
+# engine (gzip only, shells out to /usr/bin/tar, no Depends, remove keeps files)
+# and is no longer compiled or shipped.  Kept for reference / archaeology.
+# Running it still works but build64/dpkg is unused: dpkg_pack_win.py now
+# defaults to build64/store/vpkg.elf.
 # tools/dpkg_build_win.sh - ? v0.7.5?????? dpkg / apt?Ring 3??? ELF64?< 64 KiB ????
 set -e
 export PATH="/c/msys64/mingw64/bin:/c/msys64/usr/bin:$PATH"
