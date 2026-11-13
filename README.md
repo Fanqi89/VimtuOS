@@ -308,6 +308,24 @@ shm + wl_surface + `wl_seat_get()` + font64 排版）：
   * `KERNEL32` 只要 **5~7 个**函数（`GetLastError`/`SetUnhandledExceptionFilter`/`Sleep`/
     `VirtualProtect`/`VirtualQuery`，GUI 再加 `GetStartupInfoA`/`IsDBCSLeadByte`），
     不是三十多个 A/W 双份 —— 且这一批图形 exe **只用 A 版**。
+- ✅ **Windows PE：装载器 `/bin/peload`**（★ v0.9.44 / W1）—— **VimtuOS 现在真的会执行原生 Windows PE 机器码**。
+  ring3 静态 ELF64（26,768 B），做的事：解析 PE32+ → `mmap` 映像 → 逐节拷贝 → **`IMAGE_REL_BASED_DIR64` 重定位**
+  → **填 IAT**（`ExitProcess`/`GetProcAddress`/`LoadLibraryA` 三条桩，经 **Win64→SysV 汇编跳板**：PE 的参数在
+  `rcx/rdx` + 32 B 影子空间，我们的 C 在 `rdi/rsi`，直接填 C 函数地址会「看起来生效但退出码随机」）
+  → 按节 `mprotect`（先 RW 写内容、再 `r-x` 收紧，**W^X 不做例外**）→ **直接 `call` `AddressOfEntryPoint`** 并拿回返回值。
+  **内核 0 行改动**（`kernel64_os.bin` 3,298,432 B 逐字节不变）—— PE 装载纯粹是用户态的事。
+  用法：`run /bin/peload /pexcorpus/reloc.exe`
+  验收：`tests/peload64_test.py` **23/23 PASS** ——
+  * `tiny.exe`（无导入无重定位）→ `[PELOAD] ok … entry_ret=0`；
+  * **`reloc.exe` → `entry_ret=42`** —— `.data` 里存着一个绝对指针 `g_self = &g_self`（一条 DIR64），
+    装载器没做重定位它会返回 1，做对了才 42（`delta=0xffffffffc0890000` / `applied=1` / `types=0xa`）；
+  * `exit.exe`（只导入 `kernel32!ExitProcess`）→ IAT 里填进我们的假桩，`ExitProcess(7)` 让进程**真以 7 退出**；
+  * `cui.exe` → **如实失败**：打印 28 条 `[PELOAD] import MISSING`（kernel32 5 + msvcrt 23），退出码 1，
+    **绝不带着空 IAT 跳进去**（那是 W2 的输入清单）；
+  * 对 ELF 反例 → `reject reason=dos`；全程零 PANIC/零 TRUNC。
+  证据截图（QEMU `screendump` 读客人帧缓冲，非宿主窗口）：`docs/w1_peload_reloc.png`、`docs/w1_peload_exitstub.png`。
+  ⚠️ 仍缺（如实）：**W1 只跑无 API（或只有 ExitProcess 桩）的 exe** —— `cui/gui` 要的 28/31 个导入是 **W2** 的活；
+  TEB/PEB + `GS.base`、SEH、TLS 回调、资源段、延迟导入、PE32(32 位) 映像都还没做。
   ❌ **还没有 PE 加载器**：不能执行任何 `.exe`（W1 才是"映射节 + DIR64 重定位 + 跳到 EntryPoint"）。
   资源管理器双击 `.exe` 仍如实报"无法运行 Windows 可执行文件"。
 - ❌ 部分：`lstat`、`getrlimit/setrlimit`（无配额）

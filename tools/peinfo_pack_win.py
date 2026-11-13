@@ -4,6 +4,7 @@
 
 落点：
     /bin/peinfo            build64/peinfo（静态 ELF64，`run /bin/peinfo <file.exe>` 直接跑）
+    /bin/peload            build64/peload（★ W1：PE 装载器，`run /bin/peload <file.exe>` 直接跑）
     /pexcorpus/tiny.exe    ① 极小 PE，**无导入**（验"导入表为空"分支）
     /pexcorpus/cui.exe     ② 控制台 exe（subsystem=3）+ CRT
     /pexcorpus/gui.exe     ③ 图形 exe（subsystem=2）+ MessageBoxA
@@ -48,6 +49,8 @@ def main():
     ap.add_argument("--vol-in", required=True, help="输入卷镜像（drivers_pack_win.py 的 drvvol.img）")
     ap.add_argument("--vol-out", required=True, help="输出卷镜像")
     ap.add_argument("--peinfo", required=True, help="build64/peinfo -> /bin/peinfo")
+    ap.add_argument("--peload", default=None,
+                    help="build64/peload -> /bin/peload（可选：W1 的 PE 装载器；缺省则跳过并 WARN）")
     ap.add_argument("--corpus", default=None, help="build64/pexcorpus（缺省则按 --peinfo 推）")
     ap.add_argument("--system", default=None, help="build64/system.img（重拼演示盘时给）")
     ap.add_argument("--disk", default=None, help="输出完整演示盘")
@@ -73,6 +76,20 @@ def main():
     expect = {}
     vol.put("/bin/peinfo", pi, mode=0o755)
     expect["/bin/peinfo"] = pi
+
+    # ---- W1：PE 装载器（可选）----
+    pl = b""
+    if args.peload and os.path.exists(args.peload):
+        pl = open(args.peload, "rb").read()
+        if pl[:4] != b"\x7fELF":
+            sys.stderr.write("/bin/peload 不是 ELF：%d B\n" % len(pl))
+            return 2
+        vol.put("/bin/peload", pl, mode=0o755)
+        expect["/bin/peload"] = pl
+    else:
+        # 缺它不该让整个构建失败（tests/peload64_test.py 会把断言记 SKIP 而不是假装通过），
+        # 但也不能静默 —— 必须留一条 WARN 在现场。
+        sys.stderr.write("WARN: 没给 --peload（或文件不存在）—— 卷里不会有 /bin/peload\n")
 
     # ---- 真 exe 语料（可选）----
     corpus = args.corpus or os.path.join(os.path.dirname(args.peinfo), "pexcorpus")
@@ -103,8 +120,10 @@ def main():
         sys.stderr.write("卷自检失败：%s\n" % bad)
         return 1
     open(args.vol_out, "wb").write(out)
-    print("    peinfo 卷自检 OK：%d 个文件、%d B 逐字节回读一致（/bin/peinfo = %d B；exe 语料 %d 个）-> %s"
-          % (len(expect), sum(len(v) for v in expect.values()), len(pi), n_exe, args.vol_out))
+    print("    peinfo 卷自检 OK：%d 个文件、%d B 逐字节回读一致"
+          "（/bin/peinfo = %d B；/bin/peload = %d B；exe 语料 %d 个）-> %s"
+          % (len(expect), sum(len(v) for v in expect.values()), len(pi), len(pl), n_exe,
+             args.vol_out))
 
     if args.disk:
         if not args.system:

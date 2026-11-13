@@ -516,6 +516,11 @@ bash tools/gzip_build_win.sh "$BUILD"
 #   它是 W1/W2/W3 的前置：在写任何一个 Win32 API 之前，先用它把真实 exe 的**导入表**读出来，
 #   否则就是照猜写一遍、再发现清单不对。产物只落 build64/peinfo（静态 ELF64，< 64 KiB）。
 bash tools/peinfo_build_win.sh "$BUILD"
+# ★ v0.9.44（W1）：**用户态 PE 装载器 /bin/peload**（交付 = 系统卷里的文件，不进内核镜像）。
+#   做的是：解析 PE32+ -> mmap 映像 -> 逐节拷贝 -> DIR64 重定位 -> 填 IAT（Win64 桩跳板）
+#   -> 按节 mprotect（先 RW 写、再 R|X 收紧）-> **直接 call AddressOfEntryPoint** 并拿回返回值。
+#   ★ 内核 0 行改动：ring3 已有 mmap(9)/mprotect(10)，PE 装载纯粹是用户态的事。
+bash tools/peload_build_win.sh "$BUILD"
 #   ★ W0 语料：三份**真 PE**（mingw-w64 现场编，不手搓）—— 极小无导入 / 控制台+CRT / GUI+MessageBoxA。
 #     没装 mingw 的机器上**不该让整个构建失败**：只 WARN 跳过（tests/peinfo64_test.py 会把
 #     语料相关的断言记 SKIP，而不是假装通过）。
@@ -1655,7 +1660,7 @@ echo "==> ★ v0.9.33：ext4svc / drvwatch / /etc/r3drv.conf 装进系统卷"
 echo "==> v0.9.43 (W0): /bin/peinfo + real PE corpus -> system volume"
 "$PY" tools/peinfo_pack_win.py \
       --vol-in "$BUILD/drvvol.img" --vol-out "$BUILD/peinfovol.img" \
-      --peinfo "$BUILD/peinfo" --corpus "$BUILD/pexcorpus" \
+      --peinfo "$BUILD/peinfo" --peload "$BUILD/peload" --corpus "$BUILD/pexcorpus" \
       --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 echo "==> ★ v0.5.11：把数据分区（VimtuFS2 卷）**并入安装载荷** system.img"
 # ★ 真缺陷（旧批修）：system.img 原来只切了前 8073 扇区（MBR+引导+内核+64 扇区裸槽），
