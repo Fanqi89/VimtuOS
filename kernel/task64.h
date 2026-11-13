@@ -131,6 +131,7 @@ uint32_t task64_proc_cpu_permille64(uint32_t main_task_id);   // 这些任务的
 //   装载点与 TSS.rsp0 完全同一处（task_apply_ctx64）：schedule64 / task_exit64 / task_start64。
 int  task_bind_proc64(uint32_t task_id, void* proc, uint64_t cr3, uint64_t fs_base);
 void task_update_mm64(uint32_t task_id, uint64_t cr3, uint64_t fs_base);
+void task_update_gs64(uint32_t task_id, uint64_t gs_base);     // ★ v0.9.45（W2）TEB 基址
 void* task_proc_of_current64();
 // ★ 必须是 extern "C"：usermode64.cpp 用**弱引用**取它（安装介质内核不链 task64.cpp），
 //   弱符号按 C 名解析；若这里用 C++ 名字（_Z20task_slot_current64v），弱引用就永远解析不到、
@@ -142,6 +143,7 @@ extern "C" uint64_t task_syscall_stack_top64();
 // 两个装载原语：与调度器共用同一份"值相同就跳过"的缓存，避免出现两套缓存各自漂移
 void     task64_load_cr364(uint64_t cr3);
 void     task64_load_fs_base64(uint64_t v);
+void     task64_load_gs_base64(uint64_t v);                    // ★ v0.9.45（W2）IA32_GS_BASE
 uint64_t task64_kernel_cr364();                   // 内核地址空间（task_init64 时读到的 CR3）
 // ---- 任务退出压力路径（kstress，只进系统内核；安装介质内核没有这些符号）----
 // 系统内核启动时自动跑一小轮（反复创建/退出短命任务，压"创建→退出→回收"这条路），

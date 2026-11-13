@@ -324,8 +324,24 @@ shm + wl_surface + `wl_seat_get()` + font64 排版）：
     **绝不带着空 IAT 跳进去**（那是 W2 的输入清单）；
   * 对 ELF 反例 → `reject reason=dos`；全程零 PANIC/零 TRUNC。
   证据截图（QEMU `screendump` 读客人帧缓冲，非宿主窗口）：`docs/w1_peload_reloc.png`、`docs/w1_peload_exitstub.png`。
-  ⚠️ 仍缺（如实）：**W1 只跑无 API（或只有 ExitProcess 桩）的 exe** —— `cui/gui` 要的 28/31 个导入是 **W2** 的活；
-  TEB/PEB + `GS.base`、SEH、TLS 回调、资源段、延迟导入、PE32(32 位) 映像都还没做。
+- ✅ **Windows PE：控制台 exe 真的跑起来了**（★ v0.9.45 / W2）—— `run /bin/peload /pexcorpus/cui.exe`
+  在 VimtuOS 终端里打印出它自己 `printf` 的 **"hello from a real Windows console exe"**，退出码 **0**。
+  新增 ring3 文件 `user/win/peload_crt.c`（Windows 运行期）：**TEB/PEB**（`%gs:0x30` / `%gs:0x60`，
+  TEB 0x400 B + PEB 0x400 B，PEB+0x10 = ImageBaseAddress）+ `kernel32` **10 条** +
+  **老式 `msvcrt` 20 个函数 + 4 个数据导入**（共 34 条桩：`__getmainargs`/`_initterm`/`__iob_func` 这套 1998 版 ABI，
+  不是 UCRT），外加一个最小的 `vfprintf` 格式化引擎（`%s %c %d %u %x %X %p %%` + 宽度/补零）。
+  **内核只 +480 B**：新增私有 syscall **1037/1038 = `IA32_GS_BASE`**（与 158/`ARCH_SET_FS` 同构；
+  本内核不用 `swapgs`、没有 per-CPU gs，所以这个 MSR 空闲）。
+  ★ **踩到并修掉两个 ABI 陷阱**（都属"看起来正常"型）：① Win64 参数在 `rcx/rdx/r8/r9` + 32 B 影子空间；
+  ② **Win64 的 `rdi`/`rsi` 是 callee-saved，SysV 的是 volatile** —— 第一次跑就崩在 mingw `__tmainCRTStartup`
+  的 argv 复制循环（`call strlen` 回来后 `rsi` 被踩成 0x100200 → 写到 `0x10109BFF8` → `#PF` → 139）。
+  修法：每条跳板 `push/pop %rsi,%rdi` + 构建期**字节级门禁**（`56 57 48 89 cf` 计数 ≥ 28）。
+  验收：`tests/peload64_test.py` **34/34** —— 另加**自证语料** `gsprobe.exe`（纯汇编读 `%gs:0x30`/`[0x60]`，
+  检查 TEB+0x30 指回自己、`PEB+0x10` 处是 'MZ'、`ImageBase+0x1000` == 入口地址，四条全对才返回 42）；
+  `gui.exe` 仍**如实失败**（只缺 `USER32.dll!MessageBoxA`）。
+  证据截图：`docs/w2_cui_printf.png`、`docs/w2_gsprobe.png`（QEMU `screendump` 读客人显存）。
+  ⚠️ 仍缺（如实）：**`user32`/`gdi32` 一个函数都没有**（`MessageBoxA` 与开窗口那批是 **W3**）；
+  SEH 真展开、TLS 回调、资源段、延迟导入、PE32(32 位) 映像、真 DLL 加载都还没做。
   ❌ **还没有 PE 加载器**：不能执行任何 `.exe`（W1 才是"映射节 + DIR64 重定位 + 跳到 EntryPoint"）。
   资源管理器双击 `.exe` 仍如实报"无法运行 Windows 可执行文件"。
 - ❌ 部分：`lstat`、`getrlimit/setrlimit`（无配额）

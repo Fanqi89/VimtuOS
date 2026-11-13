@@ -168,6 +168,9 @@ int64_t  proc64_wait4(int, int*, uint32_t)                __attribute__((weak));
 int64_t  proc64_kill64(int, int)                          __attribute__((weak));
 int64_t  proc64_set_fs_base64(uint64_t)                   __attribute__((weak));
 uint64_t proc64_get_fs_base64()                           __attribute__((weak));
+// ★ v0.9.45（W2）：IA32_GS_BASE（TEB/PEB 的地基，私有号 1037/1038）
+int64_t  proc64_set_gs_base64(uint64_t)                   __attribute__((weak));
+uint64_t proc64_get_gs_base64()                           __attribute__((weak));
 // ★ A4-5：进程组（setpgid(109)；sig64 的"终端前台进程组"靠它登记）
 int  proc64_setpgid64(int, int)                            __attribute__((weak));
 int  proc64_alarm_set64(int)                              __attribute__((weak));
@@ -3487,6 +3490,23 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 1026: return lx64_vmtu_quota_set64(nr, a1, a2);              // ★ v0.9.30：私有号 设配额
     case 1027: return lx64_vmtu_quota_get64(nr, a1, a2, a3);          // ★ v0.9.30：私有号 查配额
     case 1028: return lx64_vmtu_feat_enable64(nr, a1);               // ★ v0.9.30：私有号 开特性（root）
+    // ==================== ★ v0.9.45（W2）：TEB/PEB 的 GS.base ====================
+    // 为什么需要：Windows PE 的 TEB 是经 `%gs:0x30`（TEB 自身）/ `%gs:0x60`（PEB 指针）
+    //   访问的。Linux 生态的 glibc 用 FS.base（158/ARCH_SET_FS），Windows 生态用 GS.base ——
+    //   两条路互不干扰，所以各给一个私有号。
+    // 为什么不用 WRGSBASE 指令：那要 CR4.FSGSBASE(bit16) 且要在每个 CPU 上开；
+    //   私有 syscall 与既有 158 完全同构，且不依赖 CPU 特性位。
+    case 1037: {                                    // set_gs_base(addr) -> 0 / -EINVAL
+        if (!proc64_set_gs_base64) return -LX64_ENOSYS;
+        return proc64_set_gs_base64(a1);
+    }
+    case 1038: {                                    // get_gs_base(out_u64) -> 0 / -EFAULT
+        if (!proc64_get_gs_base64) return -LX64_ENOSYS;
+        if (!user64_range_ok64(a1, 8)) { syscall64_deny64(nr, a1); return -LX64_EFAULT; }
+        const uint64_t v = proc64_get_gs_base64();
+        lx64_copy_to_user64(a1, &v, 8);
+        return 0;
+    }
 #ifndef VIMTU_INSTALLER_MEDIA
     // ==================== ★ v0.9.33：ring3 驱动框架（私有号，只许追加）====================
     // 为什么在 syscall 层做字符串/指针校验、而不是塞进 r3drv64.cpp：

@@ -64,6 +64,7 @@ struct Task64 {
     void*    proc;           // 拥有本任务的进程（0 = 纯内核线程；批次 C 新增）
     uint64_t mm_cr3;         // 切到这个任务时要装载的 CR3（0 = 内核地址空间；proc64 算好）
     uint64_t mm_fs_base;     // IA32_FS_BASE（TLS）：进程私有的 FS 基址（0 = 内核默认）
+    uint64_t mm_gs_base;     // ★ v0.9.45（W2）IA32_GS_BASE：Windows PE 的 TEB 基址
     uint64_t syscall_kstack; // SYSCALL 入口专用栈顶（= stack_top - 4KB；任务 0 / 无则 0）
     // ★ A3 下半：FPU/xmm 上下文（fxsave64 区，512 字节，必须 16 字节对齐 —— 见文件里
     //   task64_fpu_* 那一整段：为什么必须做、在哪两处保存/恢复、怎么证明互不污染）
@@ -147,6 +148,7 @@ static inline uint64_t task_rsp0_of(const Task64* t) {
 static uint64_t g_task64_kernel_cr364 = 0;   // 内核地址空间（task_init64 时读到的 CR3）
 static uint64_t g_task64_cr3_active64 = 0;   // 当前装在 CR3 里的值（"相同就跳过"的缓存）
 static uint64_t g_task64_fs_active64  = 0;   // 当前 IA32_FS_BASE（同一份缓存）
+static uint64_t g_task64_gs_active64  = 0;   // ★ v0.9.45（W2）当前 IA32_GS_BASE
 
 static inline uint64_t t64_rd_cr364() {
     uint64_t v; __asm__ volatile("mov %%cr3, %0" : "=r"(v)); return v;
@@ -163,6 +165,15 @@ void task64_load_fs_base64(uint64_t v) {
     // IA32_FS_BASE(0xC0000100)：glibc 的 arch_prctl(ARCH_SET_FS) 写的就是它。
     __asm__ volatile("wrmsr" : : "c"(0xC0000100u), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
     g_task64_fs_active64 = v;
+}
+// ★ v0.9.45（W2）：IA32_GS_BASE(0xC0000101) —— Windows PE 的 TEB 基址。
+//   为什么可以安全地按进程设置：本内核**不用 swapgs**、也**没有 per-CPU gs**
+//   （见 kernel/syscall_entry64.asm 文件头第 37 行与 syscall64.cpp 第 134 行的说明），
+//   所以 GS.base 在这套内核里完全是"用户态的空寄存器"，内核从不读它。
+void task64_load_gs_base64(uint64_t v) {
+    if (v == g_task64_gs_active64) return;
+    __asm__ volatile("wrmsr" : : "c"(0xC0000101u), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+    g_task64_gs_active64 = v;
 }
 uint64_t task64_kernel_cr364() { return g_task64_kernel_cr364; }
 
@@ -181,6 +192,7 @@ static void task_apply_ctx64(Task64* n) {
     }
     task64_load_cr364(n->mm_cr3 ? n->mm_cr3 : g_task64_kernel_cr364);
     task64_load_fs_base64(n->proc ? n->mm_fs_base : 0);
+    task64_load_gs_base64(n->proc ? n->mm_gs_base : 0);      // ★ v0.9.45（W2）
     if (task64_cred_hook64) task64_cred_hook64(n->proc);        // ★ P4：proc=nullptr -> 恢复会话身份
 }
 
@@ -1107,6 +1119,13 @@ void task_update_mm64(uint32_t task_id, uint64_t cr3, uint64_t fs_base) {
     if (slot < 0) return;
     if (cr3) g_tasks[slot].mm_cr3 = cr3;
     g_tasks[slot].mm_fs_base = fs_base;
+}
+// ★ v0.9.45（W2）：只改 TEB 基址（proc64_set_gs_base64 调；与 task_update_mm64 分开，
+//   因为 CR3/FS 在 execve 后会整批换，而 GS.base 只在进程自己请求时变）。
+void task_update_gs64(uint32_t task_id, uint64_t gs_base) {
+    const int slot = task_slot_of_id64(task_id);
+    if (slot < 0) return;
+    g_tasks[slot].mm_gs_base = gs_base;
 }
 // 临时把当前任务的地址空间换成 cr3（0 = 恢复内核地址空间）；见 task64.h 的说明。
 void task_set_current_mm64(uint64_t cr3, uint64_t fs_base) {

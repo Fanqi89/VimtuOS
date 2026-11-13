@@ -172,6 +172,9 @@ uint64_t proc64_user_pages64(int pid);
 // 返回 0 = 成功；-EINVAL(-22) = 值不是规范地址或当前不在进程上下文。
 int64_t  proc64_set_fs_base64(uint64_t v);
 uint64_t proc64_get_fs_base64();
+// ★ v0.9.45（W2）：IA32_GS_BASE —— Windows PE 的 TEB/PEB 基址（私有 syscall 1037/1038）
+int64_t  proc64_set_gs_base64(uint64_t v);
+uint64_t proc64_get_gs_base64();
 
 // ==================== ★ A4-5：信号（真投递；语义/打点见 kernel/sig64.h）====================
 // sig64.cpp 通过下面这组访问器拿进程表（它是弱引用它们：安装介质内核不链 proc64.cpp）。

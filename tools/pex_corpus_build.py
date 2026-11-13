@@ -4,7 +4,7 @@
 
 为什么要有这个脚本：体内工具（W0 的 /bin/peinfo、W1 的 /bin/peload）必须拿**真 exe** 验，
 不能用我们手搓的字节 —— 手搓的只能证明"解析器/装载器认得我自己写的东西"。
-这里用 MSYS2 的**标准工具链**（`x86_64-w64-mingw32-gcc`）编出五份 PE，覆盖五种形态：
+这里用 MSYS2 的**标准工具链**（`x86_64-w64-mingw32-gcc`）编出六份 PE，覆盖六种形态：
 
   ① tiny.exe   PE32+ / **无导入、无重定位**（`-nostdlib` + 汇编入口 `xor eax,eax; ret`）
                —— W0 验"导入表为空"这条分支；W1 验"无重定位也能跳进入口并拿回返回值"
@@ -18,13 +18,19 @@
                入口调 `ExitProcess(7)`。W1 的装载器会给这个导入填一个**自己的桩**
                （真做 exit_group(7)），于是进程以 7 退出 —— 这就是"Ring 3 填了一个假的
                ExitProcess 导入"的端到端证据。
+  ⑥ gsprobe.exe PE32+ / **无导入、无重定位**，纯汇编（★ W2 新增：GS.base/TEB/PEB 自证器）
+               读 `%gs:0x30`（TEB 自身）与 `%gs:0x60`（PEB），检查：
+                 (a) TEB+0x30 指回 TEB 自己；(b) PEB 非 0；
+                 (c) PEB+0x10（ImageBaseAddress）处的 2 字节是 'M' 'Z'（真的是 PE 头）；
+                 (d) ImageBaseAddress + 0x1000 == 本 exe 入口的运行时地址。
+               **四条全对才返回 42**（1/2/3 分别是哪一步错）。这是"GS.base 写对了"的硬证据。
 
 为什么 ④ 必须新造：`tiny.exe` 的 `summary` 是 `relocs=0` —— **它验不了重定位**。
 而 `cui/gui` 有 reloc 但有导入，W1 不填 IAT 就跑不了。
 
 产物（**不提交**，build64/ 已 gitignore）：
     build64/pexcorpus/src/*.c|*.S      本次用到的源码（构建可复现）
-    build64/pexcorpus/*.exe            五份真 PE
+    build64/pexcorpus/*.exe            六份真 PE
     build64/pexcorpus/PEX.json         清单：路径、size、sha256、期望 subsys、导入 DLL 集合
 
 用法：py -3 tools/pex_corpus_build.py
@@ -34,6 +40,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 
@@ -107,6 +114,51 @@ long pe_entry(void) {
 }
 '''
 
+# ---- ⑥ GS.base / TEB / PEB 自证器（★ W2）：纯汇编 ----
+GSPROBE_S = r'''
+/* gsprobe.S - 证明 IA32_GS_BASE 真的指到我们建的 TEB，且 TEB->PEB->ImageBaseAddress
+ * 真的指回**本 exe 自己的映像**。四条检查任一失败就返回不同的码，便于定位：
+ *   1 = gs:[0x30] 为 0，或 TEB+0x30 没指回自己（TEB 没建对 / GS.base 没设）
+ *   2 = gs:[0x60]（PEB）为 0
+ *   3 = PEB->ImageBaseAddress 处不是 'MZ'，或 +0x1000 不等于本 exe 入口的运行时地址
+ *   42 = 全对
+ *
+ * ★ 0x1000 是**本语料的 AddressOfEntryPoint RVA**（mingw 默认节对齐 0x1000）；
+ *   tools/pex_corpus_build.py 会断言它真的是 0x1000 —— 否则这个语料会给出假结论。 */
+    .text
+    .globl pe_entry
+pe_entry:
+    movq    %gs:0x30, %rax          /* TEB 自身 */
+    testq   %rax, %rax
+    je      ret1
+    movq    0x30(%rax), %rcx        /* TEB+0x30 应当指回 TEB */
+    cmpq    %rax, %rcx
+    jne     ret1
+    movq    %gs:0x60, %rdx          /* PEB */
+    testq   %rdx, %rdx
+    je      ret2
+    movq    0x10(%rdx), %r8         /* PEB->ImageBaseAddress */
+    testq   %r8, %r8
+    je      ret3
+    cmpw    $0x5A4D, (%r8)          /* 'MZ' */
+    jne     ret3
+    leaq    pe_entry(%rip), %r9     /* 本入口的运行时地址 */
+    leaq    0x1000(%r8), %r10       /* ImageBase + entry RVA */
+    cmpq    %r9, %r10
+    jne     ret3
+    movl    $42, %eax
+    ret
+ret1:
+    movl    $1, %eax
+    ret
+ret2:
+    movl    $2, %eax
+    ret
+ret3:
+    movl    $3, %eax
+    ret
+'''
+
 # ---- ⑤ ExitProcess IAT 桩自证器（★ W1）----
 EXIT_C = r'''
 /* exit.c - ★ W1 的 IAT 桩自证器：**只导入一个函数** kernel32!ExitProcess。
@@ -153,7 +205,8 @@ def main():
     os.makedirs(SRC, exist_ok=True)
 
     for name, text in (("tiny.S", TINY_S), ("cui.c", CUI_C), ("gui.c", GUI_C),
-                       ("reloc.c", RELOC_C), ("exit.c", EXIT_C)):
+                       ("reloc.c", RELOC_C), ("exit.c", EXIT_C),
+                       ("gsprobe.S", GSPROBE_S)):
         with open(os.path.join(SRC, name), "w", encoding="utf-8", newline="\n") as f:
             f.write(text.lstrip("\n"))
 
@@ -203,6 +256,23 @@ def main():
         return 1
     items.append(("exit", exe_exit, "(5) imports ONLY kernel32!ExitProcess (IAT stub proof)",
                   3, ["KERNEL32.DLL"]))
+
+    # ⑥ gsprobe.exe：GS.base / TEB / PEB 自证（★ W2）
+    gsprobe = os.path.join(OUT, "gsprobe.exe")
+    ok = run([GCC, "-nostdlib", "-Wl,-e,pe_entry", "-Wl,--subsystem,console",
+              "-o", gsprobe, os.path.join(SRC, "gsprobe.S")], "gsprobe.exe")
+    if not ok:
+        return 1
+    # ★ 自证逻辑里写死了 entry RVA = 0x1000（leaq 0x1000(%r8),%r10）：
+    #   这里当场核对，别让一个"入口跑到别处"的语料给出假结论。
+    _d = open(gsprobe, "rb").read()
+    _lfa = struct.unpack_from("<I", _d, 0x3C)[0]
+    _entry = struct.unpack_from("<I", _d, _lfa + 4 + 20 + 16)[0]
+    if _entry != 0x1000:
+        sys.stderr.write("gsprobe.exe 的 AddressOfEntryPoint=%#x，但自证器假设 0x1000\n" % _entry)
+        return 1
+    items.append(("gsprobe", gsprobe, "(6) GS.base/TEB/PEB self-probe (returns 42 iff all four checks pass)",
+                  3, []))
 
     manifest = []
     print()

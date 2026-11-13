@@ -84,6 +84,9 @@ struct Proc64 {
     uint32_t itimer_iv_ms;      // 重装间隔（0 = 一次性）
     uint64_t itimer_next_tick;  // 下次到期的 tick（0 = 未装）
     uint64_t fs_base;           // IA32_FS_BASE（TLS；glibc 的 arch_prctl(ARCH_SET_FS)）
+    uint64_t gs_base;           // ★ v0.9.45（W2）IA32_GS_BASE：Windows PE 的 TEB 基址
+                                //   （TEB+0x30 = 自身，TEB+0x60 = PEB）。本内核不用
+                                //   swapgs、没有 per-CPU gs，所以这个 MSR 是空闲的。
     uint64_t cr3;               // 该进程的页表根（物理地址）——切任务时装载
     uint64_t pml4_phys;         // 我们自己分配的 PML4 页（释放用）
     uint64_t pdpt_phys;         // 我们自己分配的 PDPT 页（用户窗口 PDPT[4] 的父表）
@@ -954,6 +957,7 @@ int proc64_create64(const char* name, int ppid) {
     p->state   = PROC64_READY;
     p->cr3     = p->pml4_phys;
     p->fs_base = 0;
+    p->gs_base = 0;                                  // ★ v0.9.45（W2）：TEB 基址清零
     p64_strcpy_n(p->name, name ? name : "proc", PROC64_NAME_MAX);
     p->pgid = (int32_t)p->pid;                          // ★ A4-5：新进程自成一个进程组（fork 会继承）
     sig64_state_init64(&p->sig);                        // ★ A4-5：信号状态清零（handler 全 SIG_DFL）
@@ -1324,6 +1328,7 @@ int64_t proc64_fork64(pt_regs64* r) {
     (void)sig64_state_copy64(&c->sig, &par->sig);
     c->pgid      = par->pgid;
     c->fs_base   = par->fs_base;                        // TLS 基址继承（切换时装载）
+    c->gs_base   = par->gs_base;                        // ★ v0.9.45（W2）：TEB 基址继承
     p64_strcpy_n(c->cwd, par->cwd[0] ? par->cwd : "/", PROC64_CWD_MAX);   // ★ A4-2a：cwd 继承
     c->fs_base   = par->fs_base;                        // TLS 基址继承（切换时装载）
 
@@ -1752,6 +1757,23 @@ int64_t proc64_set_fs_base64(uint64_t v) {
 uint64_t proc64_get_fs_base64() {
     Proc64* p = p64_current64();
     return p ? p->fs_base : 0;
+}
+
+// ★ v0.9.45（W2）：IA32_GS_BASE。与上面 fs_base 完全同构 —— 进程记账 + 当前任务 + MSR
+//   三处一起更新（proc64_set 会同时改 task 的 mm_gs_base，任务切换时 task_apply_ctx64
+//   会重新装载，所以切走再切回来不会丢）。非规范地址返回 -EINVAL（wrmsr 会 #GP）。
+int64_t proc64_set_gs_base64(uint64_t v) {
+    Proc64* p = p64_current64();
+    if (!p) return -P64_EINVAL;
+    if (v != 0 && !p64_canonical64(v)) return -P64_EINVAL;
+    p->gs_base = v;
+    task_update_gs64(task_current_id_64(), v);
+    task64_load_gs_base64(v);
+    return 0;
+}
+uint64_t proc64_get_gs_base64() {
+    Proc64* p = p64_current64();
+    return p ? p->gs_base : 0;
 }
 
 // ==================== ★ A4-5：信号（真投递）====================

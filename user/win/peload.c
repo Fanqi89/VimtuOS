@@ -8,7 +8,10 @@
  *     run /bin/peload /pexcorpus/tiny.exe    -> entry_ret=0   （无导入、无重定位）
  *     run /bin/peload /pexcorpus/reloc.exe   -> entry_ret=42  （重定位真的做对了，自证）
  *     run /bin/peload /pexcorpus/exit.exe    -> exit-stub code=7，进程以 7 退出（IAT 桩自证）
- *     run /bin/peload /pexcorpus/cui.exe     -> import MISSING …，非 0 退出（**如实失败**）
+ *     run /bin/peload /pexcorpus/cui.exe     -> ★ W2 起：CRT 真的跑起来，打印它自己那一行
+ *                                               "hello from a real Windows console exe" 并退出 0
+ *                                               （W1 时这里还是 import MISSING 如实失败）
+ *     run /bin/peload /pexcorpus/gsprobe.exe -> entry_ret=42（GS.base/TEB/PEB 自证）
  *
  * ============================ 步骤 0：开工前查证的 3 条内核事实 ============================
  * 交接单要求"读代码，别猜"。三条都查了，**其中一条推翻了交接单的风险假设**：
@@ -70,12 +73,9 @@
  * （W0 的 peinfo 第一版 17 条红全是这一个原因）。这里照抄同一套 4 KiB 行缓冲。
  */
 
-typedef unsigned long long u64;
-typedef long long          i64;
-typedef unsigned int       u32;
-typedef int                i32;
-typedef unsigned short     u16;
-typedef unsigned char      u8;
+/* ★ v0.9.45（W2）：类型与输出函数、桩表结构统一由 peload.h 提供
+ *   （peload_crt.c 也要用同一套，所以不能各写一份 typedef）。 */
+#include "peload.h"
 
 /* ==================== 系统调用（Linux x86_64 号段） ==================== */
 #define NR_READ      0
@@ -170,6 +170,14 @@ static void outhex(int fd, u64 v) {          /* 0x 前缀 + 不补零的小写�
     while (n) outn(fd, &t[--n], 1);
 }
 
+/* ★ v0.9.45（W2）：把上面这套行级缓冲暴露给 peload_crt.c（PE 的 printf 也走这里，
+ *   所以"一次 write 一整行"的纪律在 CRT 输出上同样成立）。 */
+void pl_out(int fd, const char *s, u32 n) { outn(fd, s, n); }
+void pl_outs(int fd, const char *s) { outs(fd, s); }
+void pl_dec(int fd, u64 v) { outdec(fd, v); }
+void pl_hex(int fd, u64 v) { outhex(fd, v); }
+void pl_flush(void) { ob_flush(); }
+
 /* 小端偏移读（**不定义 PE 结构体**：避免对齐/填充在不同编译器下漂） */
 static u16 rd16(const u8 *p) { return (u16)((u32)p[0] | ((u32)p[1] << 8)); }
 static u32 rd32(const u8 *p) {
@@ -199,6 +207,18 @@ static int ci_eq(const char *a, const char *b) {          /* 大小写不敏感�
     }
 }
 
+/* ★ v0.9.45（W2）：桩表在 peload_crt.c（kernel32 + 老式 msvcrt，共 34 条）。
+ *   这里只按 (dll, name) 大小写不敏感地查 —— 数据导入与函数导入在**填 IAT 这点上完全一样**：
+ *   槽里放的都是"那个东西的地址"（函数 = 跳板地址，变量 = 变量地址）。
+ *   `is_data` 只在 GetProcAddress 里用（数据不能当函数返回）。 */
+static void *stub_lookup(const char *dll, const char *fn) {
+    for (u32 i = 0; i < g_pl_stubs.n; i++) {
+        const PlStubEntry *e = &g_pl_stubs.tab[i];
+        if (ci_eq(e->dll, dll) && ci_eq(e->name, fn)) return e->addr;
+    }
+    return 0;
+}
+
 /* ==================== 规模上限（都如实报，不静默截断） ==================== */
 #define MAX_PE_BYTES  (8u * 1024u * 1024u)   /* = VFS 单文件上限 */
 #define MAX_SEC       96u
@@ -206,66 +226,9 @@ static int ci_eq(const char *a, const char *b) {          /* 大小写不敏感�
 #define MAX_THUNKS    4096u                  /* 单个 DLL 的槽数上限 */
 #define MAX_MISS_LIST 48u                    /* 明细最多打这么多条，计数照实 */
 
-/* ==================== ★ IAT 桩表（W1 的极小集合） ====================
- * 纪律：**只放 W1 需要证明的那几个**，不为了"看起来能跑"塞一大堆。
- * `cui.exe` 要的 28 个函数里我们故意只给 0 个 —— 判据 ④ 要求它**如实失败**并
- * 打出一张缺口的清单，那是 W2 的输入。
- *
- * ★ 表里的地址是 `peload_stubs.S` 里的**汇编跳板**，不是 C 函数：
- *   PE 用 Win64 约定（参数走 rcx/rdx），我们的 C 是 SysV（rdi/rsi）。
- *   直接把 C 函数地址写进 IAT = 参数串位 = 退出码随机却"看起来生效"。
- *   跳板做的事：`movq %rcx, %rdi` 把参数搬到 SysV 位置再 call。详见 peload_stubs.S 文件头。 */
-extern void pl_stub_ExitProcess(void);
-extern void pl_stub_GetProcAddress(void);
-extern void pl_stub_LoadLibraryA(void);
-
-typedef struct {
-    const char *dll;      /* 判等大小写不敏感 */
-    const char *fn;
-    void       *addr;
-} PeloadStub;
-
-static const PeloadStub g_stubs[] = {
-    { "kernel32.dll", "ExitProcess",    (void *)pl_stub_ExitProcess    },
-    { "kernel32.dll", "GetProcAddress", (void *)pl_stub_GetProcAddress },
-    { "kernel32.dll", "LoadLibraryA",   (void *)pl_stub_LoadLibraryA   },
-};
-#define N_STUBS (sizeof(g_stubs) / sizeof(g_stubs[0]))
-
-/* 按名字查表（忽略模块句柄：W1 只有 kernel32 一张表，GetProcAddress 的语义够用） */
-static void *stub_lookup_any(const char *fn) {
-    for (u32 i = 0; i < N_STUBS; i++)
-        if (ci_eq(g_stubs[i].fn, fn)) return g_stubs[i].addr;
-    return 0;
-}
-static void *stub_lookup(const char *dll, const char *fn) {
-    for (u32 i = 0; i < N_STUBS; i++)
-        if (ci_eq(g_stubs[i].dll, dll) && ci_eq(g_stubs[i].fn, fn)) return g_stubs[i].addr;
-    return 0;
-}
-
-/* ---- 桩的 C 实现（被 peload_stubs.S 的跳板以 SysV 约定调用） ---- */
-long pl_do_exit_process(u64 code) {
-    outs(1, "[PELOAD] exit-stub code=");
-    outdec(1, code);
-    outn(1, "\n", 1);
-    ob_flush();
-    x_exit((int)(code & 0xFFu));       /* 真做 exit_group：进程退出码就是 PE 请求的那个 */
-    return 0;                          /* 走不到 */
-}
-void *pl_do_get_proc_address(void *h, const char *name) {
-    (void)h;
-    if (!name) return 0;
-    return stub_lookup_any(name);
-}
-void *pl_do_load_library_a(const char *name) {
-    /* W1 没有真 DLL：只认三个名字，返回一个**非 0 的假句柄**（PE 拿它喂 GetProcAddress）。
-     * 认不出的返回 0 —— PE 里标准的 `if (!h) 报错` 分支会走真路径，不假装加载成功。 */
-    static const char *const known[] = { "kernel32.dll", "msvcrt.dll", "user32.dll" };
-    if (!name) return 0;
-    for (u32 i = 0; i < 3u; i++) if (ci_eq(known[i], name)) return (void *)(u64)(0x1000u + i);
-    return 0;
-}
+/* ★ v0.9.45（W2）：W1 的那张"极小桩表"（ExitProcess / GetProcAddress / LoadLibraryA）
+ *   与它们的 C 实现已经**整体迁到 peload_crt.c**，并扩到 34 条（kernel32 10 + msvcrt 20 函数
+ *   + msvcrt 4 个**数据**导入）。这里不再保留第二份 —— 两份桩表必然会漂。 */
 
 /* ==================== 装载状态 ==================== */
 static u8  *g_file;        /* 文件内容（mmap 8 MiB） */
@@ -618,6 +581,15 @@ int peload_main(u64 *sp) {
     if (g_delta) do_reloc();
     else outs(1, "[PELOAD] reloc blocks=0 entries=0 applied=0 types=- skipped=0 (delta==0)\n");
 
+    /* ---- 7.5) ★ v0.9.45（W2）：TEB/PEB + GS.base ----
+     * 必须在填 IAT 之前：CRT 状态（iob / argv / 堆）先就位，桩实现才敢被调；
+     * 而且这一步会**验证** GS.base 真的写进去了（读写回比）。失败就如实失败，
+     * 不能带着"%gs 是 0"跳进一个会读 TEB 的 exe —— 那会在 PE 的第一条 gs 指令上 #GP。 */
+    if (!pl_crt_setup(g_base, g_sizeimage, path)) {
+        outs(2, "[PELOAD] fail reason=crt-setup (teb/peb/gs)\n");
+        return 1;
+    }
+
     /* ---- 8) IAT 填充（★ 填充完再收紧权限：IAT 在 .rdata/.idata 里，那时还得可写） ---- */
     do_imports();
 
@@ -643,6 +615,7 @@ int peload_main(u64 *sp) {
     typedef long (*PeloadEntry)(void);
     PeloadEntry const fn = (PeloadEntry)(u64)entry_va;
     const long ret = fn();
+    pl_crt_run_exit_chain();        /* PE 若用 ret 回来的（无 CRT 的语料），atexit 也要跑完 */
 
     /* ---- 12) 成功 ---- */
     outs(1, "[PELOAD] ok path="); outs(1, path);
