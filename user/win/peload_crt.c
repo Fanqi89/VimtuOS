@@ -478,9 +478,268 @@ u64 pl_do_memcpy(u64 d, u64 s, u64 n) {
 }
 u64 pl_do_strlen(u64 s) { return s ? (u64)slen((const char *)(u64)s) : 0; }
 
+/* ==================== ★ W3：MessageBoxA —— 在 VimtuOS 桌面上真的弹一个窗口 ====================
+ * 链路（全部走**本系统自己的**窗口抽象，不是"假装弹了个框"）：
+ *   MessageBoxA -> shm_create(13) + shm_map(14) 拿一块画布  ← 自家 ABI：**int 0x80**
+ *               -> wl_surface_create(15) 建 surface（<= 320x200，内核面板上限）
+ *               -> 直接往 shm 里画：标题栏 / 正文 / OK 按钮（8x8 位图字体，见 peload_font8.h）
+ *               -> wl_surface_attach(16) + damage(17) + commit(18)  <- 上屏
+ *               -> wl_display_dispatch(21) 循环收 seat 事件，等 OK 被点
+ *               -> wl_surface_destroy(19)，返回 IDOK(1)
+ * 内核侧不需要认识 PE：它只看到"一个普通 ring3 进程建了一个 wl_surface"，与 /bin/store、
+ * /bin/office 走的是同一条路径（这就是"原生弹窗"的意思）。
+ *
+ * 如实边界：
+ *   * 面板只有 **320x200**（wl64.h 的 WL64_PANEL_*，且 wl64.cpp 会拒绝更大的 surface），
+ *     所以对话框做 300x150 —— W3 的"全屏多窗口合成器"（把 /bin/wm 升级）还没做，
+ *     在它之前，任何 wl 客户端（包括我们）都只能落在这块面板里。
+ *   * 没有键盘焦点协商：Enter/Esc 当 OK 只是因为事件里带了键码，不保证一定收得到。
+ *   * 超时（默认 8 s）自动关：那是**测试与无人值守**的兜底，不是 Windows 的行为；
+ *     日志里会如实写 reason=timeout 还是 reason=clicked。
+ */
+
+#include "peload_font8.h"
+
+#define MB_NR_SLEEP_MS    5
+#define MB_NR_SHM_CREATE  13
+#define MB_NR_SHM_MAP     14
+#define MB_NR_WL_CREATE   15
+#define MB_NR_WL_ATTACH   16
+#define MB_NR_WL_DAMAGE   17
+#define MB_NR_WL_COMMIT   18
+#define MB_NR_WL_DESTROY  19
+#define MB_NR_WL_DISPATCH 21
+#define MB_NR_WL_SEAT_GET 20
+#define MB_NR_INPUT_POLL  12
+
+/* ★ 关键：自有 ABI 走 **int 0x80**（不是 syscall 指令）！
+ *   第一次实现时我用 `syscall` 发 nr=13，以为那是 shm_create —— 实际 13 是 Linux 的
+ *   rt_sigaction，于是 shm_create(180000) 返回 -EINVAL，MessageBoxA 连框都建不出来。
+ *   见 user/lib/syscall.S 文件头：自有 ABI = `int 0x80`，`rax=nr; rdi/rsi/rdx/r10 = a1..a4`；
+ *   Linux 号段才走 `syscall` 指令。两套并存，绝对不能混。 */
+static inline i64 i80(long nr, i64 a1, i64 a2, i64 a3, i64 a4) {
+    register i64 r10 __asm__("r10") = a4;
+    i64 r;
+    __asm__ volatile("int $0x80" : "=a"(r)
+                     : "a"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10)
+                     : "rcx", "r11", "memory");
+    return r;
+}
+/* wl_surface_damage 把 (x,y) 与 (w,h) 各打包进一个 64 位参数：lo | hi<<32（见 user/lib/wl.c） */
+static i64 pack2(int lo, int hi) {
+    return (i64)((u32)lo | ((u64)(u32)hi << 32));
+}
+
+#define MB_W      300
+#define MB_H      150
+#define MB_BYTES  (MB_W * MB_H * 4u)
+/* 超时：它只是**测试与无人值守**的兜底（不是 Windows 的行为；真 Windows 会一直等）。
+ * 为什么是 8 s（而不是更久）：实测把超时放到 20 s 时，**对话框停在那里约 16 s 后进程会被
+ *   内核侧某处 `[PROC64] kill pid=<n> sig=9` 干掉**（串口里 close 行根本没出现，退出码 137）。
+ *   8 s 之内收尾是干净的：`msgboxA close reason=timeout` -> `[PROC64] exit code=0`。
+ *   这个 SIGKILL 的**来源还没查清**（不在 W3 的产品路径上：它发生在"对话框一直开着"时），
+ *   如实记在这里，等 W3 收尾/合成器升级时一起查。 */
+#define MB_TIMEOUT_MS 8000u
+
+/* 配色（XRGB8888，高字节忽略） */
+#define MB_C_BORDER  0xFF202020u
+#define MB_C_TITLE   0xFF3465A4u
+#define MB_C_FACE    0xFFF2F2F2u
+#define MB_C_TEXT    0xFF101010u
+#define MB_C_WHITE   0xFFFFFFFFu
+#define MB_C_BTN     0xFFDCDCDCu
+#define MB_C_BTNBAR  0xFF808080u
+
+/* 布局常量（surface 局部坐标；测试按下 OK 时就是点这个矩形） */
+#define MB_TB_H     22                       /* 标题栏高度 */
+#define MB_PAD      12
+#define MB_LINE_H   12
+#define MB_BTN_W    76
+#define MB_BTN_H    24
+#define MB_BTN_X    ((MB_W - MB_BTN_W) / 2)
+#define MB_BTN_Y    (MB_H - MB_BTN_H - 10)
+
+static unsigned *g_mb_px;
+
+static void mb_fill(int x, int y, int w, int h, unsigned c) {
+    for (int yy = y; yy < y + h; yy++) {
+        if (yy < 0 || yy >= MB_H) continue;
+        unsigned *row = g_mb_px + (u32)yy * MB_W;
+        for (int xx = x; xx < x + w; xx++) {
+            if (xx < 0 || xx >= MB_W) continue;
+            row[xx] = c;
+        }
+    }
+}
+
+/* 8x8 位图字体：一个字 = [PL_FONT8_W] 个像素列宽，[PL_FONT8_ADV] 前进 */
+static void mb_text(int x, int y, const char *s, unsigned c, int max_x) {
+    if (!s) return;
+    int cx = x;
+    for (u32 i = 0; s[i]; i++) {
+        const unsigned char ch = (unsigned char)s[i];
+        if (ch == '\n') { cx = x; y += MB_LINE_H; continue; }
+        if (ch < PL_FONT8_FIRST || ch > PL_FONT8_LAST) { cx += PL_FONT8_ADV; continue; }
+        if (cx + (int)PL_FONT8_W > max_x) return;
+        const unsigned char *g = g_pl_font8[ch - PL_FONT8_FIRST];
+        for (u32 gy = 0; gy < PL_FONT8_H; gy++) {
+            const unsigned char bits = g[gy];
+            if (!bits) continue;
+            for (u32 gx = 0; gx < PL_FONT8_W; gx++) {
+                if (!(bits & (unsigned char)(0x80u >> gx))) continue;
+                const int px = cx + (int)gx, py = y + (int)gy;
+                if (px < 0 || px >= MB_W || py < 0 || py >= MB_H) continue;
+                g_mb_px[(u32)py * MB_W + (u32)px] = c;
+            }
+        }
+        cx += PL_FONT8_ADV;
+    }
+}
+
+/* 正文自动换行（按 8 像素字宽的保守估算：每行 (MB_W-2*MB_PAD)/ADV 个字符） */
+static void mb_text_wrapped(int x, int y, const char *s, unsigned c, int max_x) {
+    if (!s) return;
+    const int cols = (max_x - x) / (int)PL_FONT8_ADV;
+    int cx = x, cy = y, n = 0;
+    for (u32 i = 0; s[i]; i++) {
+        if (s[i] == '\n') { cx = x; cy += MB_LINE_H; n = 0; continue; }
+        if (n >= cols) { cx = x; cy += MB_LINE_H; n = 0; }
+        char one[2] = { s[i], 0 };
+        mb_text(cx, cy, one, c, max_x);
+        cx += (int)PL_FONT8_ADV;
+        n++;
+    }
+}
+
+static void mb_draw(const char *caption, const char *text) {
+    /* 外框（1px 深色）+ 内白边，看起来像个真窗口 */
+    mb_fill(0, 0, MB_W, MB_H, MB_C_WHITE);
+    mb_fill(0, 0, MB_W, 1, MB_C_BORDER);
+    mb_fill(0, MB_H - 1, MB_W, 1, MB_C_BORDER);
+    mb_fill(0, 0, 1, MB_H, MB_C_BORDER);
+    mb_fill(MB_W - 1, 0, 1, MB_H, MB_C_BORDER);
+    /* 标题栏 */
+    mb_fill(1, 1, MB_W - 2, MB_TB_H - 1, MB_C_TITLE);
+    mb_text(MB_PAD - 4, 7, caption && caption[0] ? caption : "Message", MB_C_WHITE, MB_W - MB_PAD);
+    /* 正文 */
+    mb_fill(1, MB_TB_H, MB_W - 2, MB_H - MB_TB_H - 1, MB_C_FACE);
+    mb_text_wrapped(MB_PAD, MB_TB_H + MB_PAD, text, MB_C_TEXT, MB_W - MB_PAD);
+    /* OK 按钮（3D 边：左上白、右下灰） */
+    mb_fill(MB_BTN_X, MB_BTN_Y, MB_BTN_W, MB_BTN_H, MB_C_BTN);
+    mb_fill(MB_BTN_X, MB_BTN_Y, MB_BTN_W, 1, MB_C_WHITE);
+    mb_fill(MB_BTN_X, MB_BTN_Y, 1, MB_BTN_H, MB_C_WHITE);
+    mb_fill(MB_BTN_X, MB_BTN_Y + MB_BTN_H - 1, MB_BTN_W, 1, MB_C_BTNBAR);
+    mb_fill(MB_BTN_X + MB_BTN_W - 1, MB_BTN_Y, 1, MB_BTN_H, MB_C_BTNBAR);
+    mb_text(MB_BTN_X + (MB_BTN_W - 2 * (int)PL_FONT8_ADV) / 2, MB_BTN_Y + 8, "OK", MB_C_TEXT,
+            MB_BTN_X + MB_BTN_W);
+}
+
+/* 收 seat 事件，等到 OK 被点（或超时）。返回 1 = 点到了，0 = 超时
+ * seat 事件是 64 字节 POD（与 user/lib/wl.h 的 Wl64SeatEvent 逐字节一致）：
+ *   +0 type  +4 code  +8 x  +12 y  +16 dx +20 dy +24 buttons +28 mods +32 t_ms
+ *   +40 seat +44 surf +48 sx(int32) +52 sy(int32) +56 inside
+ */
+static int mb_pump(int bx, int by, int bw, int bh, u32 timeout_ms) {
+    u8 ev[8 * 64];
+    u32 waited = 0;
+    for (;;) {
+        bzero_(ev, (u32)sizeof(ev));
+        const i64 n = i80(MB_NR_WL_DISPATCH, 40, (i64)(u64)ev, 8, 0);
+        for (i64 i = 0; i < n; i++) {
+            const u8 *e = ev + (u32)i * 64u;
+            const u32 type = *(const u32 *)(e + 0);
+            const u32 code = *(const u32 *)(e + 4);
+            const i32 sx = *(const i32 *)(e + 48);
+            const i32 sy = *(const i32 *)(e + 52);
+            const u32 inside = *(const u32 *)(e + 56);
+            if (type == 5u && inside && sx >= bx && sx < bx + bw && sy >= by && sy < by + bh) {
+                pl_outs(1, "[PELOAD] msgboxA hit sx="); pl_dec(1, (u64)(i64)sx);
+                pl_outs(1, " sy="); pl_dec(1, (u64)(i64)sy);
+                pl_out(1, "\n", 1);
+                return 1;
+            }
+            /* 键盘兜底：Enter(28) / Esc(1) / 空格(57) 当 OK */
+            /* EV64_TYPE_KEY_DOWN == 1（见 kernel/input64.h）；code 是 PS/2 扫描码：28=Enter 1=Esc 57=空格 */
+            if (type == 1u && inside && (code == 28u || code == 1u || code == 57u)) {
+                pl_outs(1, "[PELOAD] msgboxA hit key code="); pl_dec(1, code);
+                pl_out(1, "\n", 1);
+                return 1;
+            }
+        }
+        if (waited >= timeout_ms) return 0;
+        (void)i80(MB_NR_SLEEP_MS, 8, 0, 0, 0);
+        waited += 8;
+    }
+}
+
+/* int MessageBoxA(HWND, LPCSTR text, LPCSTR caption, UINT type) -> IDOK(1) */
+u64 pl_do_MessageBoxA(u64 hwnd, u64 text, u64 caption, u64 type) {
+    (void)hwnd;
+    const char *cap = caption ? (const char *)(u64)caption : "vimtu";
+    const char *msg = text ? (const char *)(u64)text : "";
+
+    const i64 shm = i80(MB_NR_SHM_CREATE, (i64)MB_BYTES, 0, 0, 0);
+    if (shm <= 0) {
+        pl_outs(2, "[PELOAD] msgboxA FAILED shm_create rc="); pl_dec(2, (u64)shm); pl_out(2, "\n", 1);
+        return 0;
+    }
+    u64 va = 0;
+    const i64 mrc = i80(MB_NR_SHM_MAP, (i64)shm, 0, (i64)MB_BYTES, (i64)(u64)&va);
+    if (mrc != 0 || !va) {
+        pl_outs(2, "[PELOAD] msgboxA FAILED shm_map rc="); pl_dec(2, (u64)mrc); pl_out(2, "\n", 1);
+        return 0;
+    }
+    g_mb_px = (unsigned *)(u64)va;
+
+    const i64 surf = i80(MB_NR_WL_CREATE, MB_W, MB_H, 0 /* XRGB8888 */, 0);
+    if (surf <= 0) {
+        pl_outs(2, "[PELOAD] msgboxA FAILED wl_surface_create rc="); pl_dec(2, (u64)surf);
+        pl_out(2, "\n", 1);
+        return 0;
+    }
+
+    pl_outs(1, "[PELOAD] msgboxA show surf=");  pl_dec(1, (u64)surf);
+    pl_outs(1, " shm=");  pl_dec(1, (u64)shm);
+    pl_outs(1, " w=");    pl_dec(1, MB_W);
+    pl_outs(1, " h=");    pl_dec(1, MB_H);
+    pl_outs(1, " type="); pl_dec(1, type);
+    pl_outs(1, " caption=\""); pl_outs(1, cap);
+    pl_outs(1, "\" text=\""); pl_outs(1, msg);
+    pl_out(1, "\"\n", 2);
+    pl_outs(1, "[PELOAD] msgboxA btn x="); pl_dec(1, MB_BTN_X);
+    pl_outs(1, " y="); pl_dec(1, MB_BTN_Y);
+    pl_outs(1, " w="); pl_dec(1, MB_BTN_W);
+    pl_outs(1, " h="); pl_dec(1, MB_BTN_H);
+    pl_out(1, "\n", 1);
+
+    mb_draw(cap, msg);
+    (void)i80(MB_NR_WL_ATTACH, (i64)surf, (i64)shm, 0, 0);
+    (void)i80(MB_NR_WL_DAMAGE, (i64)surf, pack2(0, 0), pack2(MB_W, MB_H), 0);
+    const i64 crc = i80(MB_NR_WL_COMMIT, (i64)surf, 0, 0, 0);
+    pl_outs(1, "[PELOAD] msgboxA commit rc="); pl_dec(1, (u64)crc); pl_out(1, "\n", 1);
+
+    /* ★ 必须先申请"座位"（wl_seat_get = 20）：内核的 wl64_seat_get64 会调
+     *   ev64_poll64(0, 0, EV64_FLAG_FOCUS | EV64_FLAG_CAPTURE) —— 也就是**申请指针捕获**。
+     *   不申请的话，鼠标事件根本不会进本进程的事件队列，wl_display_dispatch 永远返回 0，
+     *   对话框就只能靠超时关掉（第一次跑就是这样：reason=timeout，日志里一条 seat event 都没有）。 */
+    const i64 seat = i80(MB_NR_WL_SEAT_GET, 0, 0, 0, 0);
+    pl_outs(1, "[PELOAD] msgboxA seat="); pl_dec(1, (u64)seat); pl_out(1, "\n", 1);
+
+    const int hit = mb_pump(MB_BTN_X, MB_BTN_Y, MB_BTN_W, MB_BTN_H, MB_TIMEOUT_MS);
+    pl_outs(1, "[PELOAD] msgboxA close reason=");
+    pl_outs(1, hit ? "clicked" : "timeout");
+    pl_out(1, "\n", 1);
+
+    (void)i80(MB_NR_WL_DESTROY, (i64)surf, 0, 0, 0);
+    (void)i80(MB_NR_INPUT_POLL, 0, 0, 4 /* EV64_FLAG_RELEASE */, 0);
+    g_mb_px = 0;
+    return 1;                                  /* IDOK */
+}
+
 /* ==================== 8) 桩表 ====================
  * 表里存的是 **peload_stubs.S 的汇编跳板地址**（Win64 -> SysV）。数据导入直接给变量地址。 */
 extern void pl_stub_ExitProcess(void);
+extern void pl_stub_MessageBoxA(void);
 extern void pl_stub_GetProcAddress(void);
 extern void pl_stub_LoadLibraryA(void);
 extern void pl_stub_GetLastError(void);
@@ -529,6 +788,9 @@ static const PlStubEntry g_stub_tab[] = {
     { "kernel32.dll", "VirtualQuery",               (void *)pl_stub_VirtualQuery, 0 },
     { "kernel32.dll", "GetStartupInfoA",            (void *)pl_stub_GetStartupInfoA, 0 },
     { "kernel32.dll", "IsDBCSLeadByte",             (void *)pl_stub_IsDBCSLeadByte, 0 },
+
+    /* ---- ★ W3：user32 —— 只做 MessageBoxA 一个（W0 实测 gui.exe 只导入这一个 user32 函数） ---- */
+    { "user32.dll", "MessageBoxA", (void *)pl_stub_MessageBoxA, 0 },
 
     /* ---- msvcrt（★ 老式 1998 版 ABI，不是 UCRT：__getmainargs/_initterm/_iob_func 这套） ---- */
     { "msvcrt.dll", "_XcptFilter",       (void *)pl_stub__XcptFilter,       0 },

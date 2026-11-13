@@ -340,8 +340,22 @@ shm + wl_surface + `wl_seat_get()` + font64 排版）：
   检查 TEB+0x30 指回自己、`PEB+0x10` 处是 'MZ'、`ImageBase+0x1000` == 入口地址，四条全对才返回 42）；
   `gui.exe` 仍**如实失败**（只缺 `USER32.dll!MessageBoxA`）。
   证据截图：`docs/w2_cui_printf.png`、`docs/w2_gsprobe.png`（QEMU `screendump` 读客人显存）。
-  ⚠️ 仍缺（如实）：**`user32`/`gdi32` 一个函数都没有**（`MessageBoxA` 与开窗口那批是 **W3**）；
-  SEH 真展开、TLS 回调、资源段、延迟导入、PE32(32 位) 映像、真 DLL 加载都还没做。
+- ✅ **Windows PE：GUI 程序弹出真对话框**（★ v0.9.46 / W3 第一批）—— `run /bin/peload /pexcorpus/gui.exe`
+  在 VimtuOS 桌面上弹出一个 **300×150 的原生对话框**：蓝色标题栏写 `vimtu-peinfo`、正文是
+  `hello from a real Windows GUI exe`、下面一个 `OK` 按钮。
+  `MessageBoxA` 走的是**本系统自己的窗口抽象**：`shm_create(13)`+`shm_map(14)` 拿画布 →
+  `wl_surface_create(15)` → 直接画像素（8×8 位图字体，`tools/gen_font8.py` 生成 760 B 表）→
+  `attach(16)`+`damage(17)`+`commit(18)` → `wl_display_dispatch(21)` 收 seat 事件 → `destroy(19)`。
+  **`gdi32` 一个函数都没用上** —— 这正是 W0 用真 exe 量出来的结论（一个 GUI 程序只导入 `USER32!MessageBoxA`）。
+  ★ 两个坑：私有 syscall 走 **`int 0x80`**（不是 `syscall` 指令，混了会静默错）；
+  必须先 `wl_seat_get`(20) **申请指针捕获**，否则鼠标事件根本不进本进程的队列。
+  验收：`tests/peload64_test.py` **38/38 + 1 SKIP(env)** —— caption/text 与 PE 里的字符串逐字符一致、
+  `commit rc=0`、**内核日志 `[WL64] blit … dst=964,532 bytes=180000 clip=ok`**、关闭后 `exit code=0`。
+  截图：`docs/w3_msgbox.png`（客人显存）+ `docs/w3_msgbox_window.png`（1:1 裁剪），并做了**逐像素核验**
+  （外框 300/300 与 150/150、标题栏 6,119/6,258、正文黑字 349 px、OK 按钮 1,601/1,824 且含 27 px 黑字）。
+  ⚠️ 仍缺（如实）：对话框只能落在 **320×200 的内核面板**里（`wl64.cpp:323` 拒绝更大的 surface），
+  **`/bin/wm` 升级成全屏多窗口合成器还没做**；`gdi32`、标准控件、`DialogBox`、真 `CreateWindowExA` 那批全部未做；
+  「鼠标点 OK」这条判据记 `SKIP(env)`（宿主 1366×768 + 1.7× 相对指针无法把光标可靠送到按钮上）。
   ❌ **还没有 PE 加载器**：不能执行任何 `.exe`（W1 才是"映射节 + DIR64 重定位 + 跳到 EntryPoint"）。
   资源管理器双击 `.exe` 仍如实报"无法运行 Windows 可执行文件"。
 - ❌ 部分：`lstat`、`getrlimit/setrlimit`（无配额）

@@ -97,8 +97,9 @@ assert len(d) <= 64 * 1024, "peload exceeds 64 KiB"
 #   缺一条就说明 peload_stubs.S 的宏没展开、或 peload_crt.o 没链进来。
 for sym in (b"pl_stub_ExitProcess", b"pl_stub_GetProcAddress", b"pl_stub_LoadLibraryA",
             b"pl_stub___getmainargs", b"pl_stub_vfprintf", b"pl_stub___iob_func",
-            b"pl_stub_VirtualProtect", b"pl_stub__initterm",
-            b"pl_do_getmainargs", b"pl_do_vfprintf", b"pl_crt_setup"):
+            b"pl_stub_VirtualProtect", b"pl_stub__initterm", b"pl_stub_MessageBoxA",
+            b"pl_do_getmainargs", b"pl_do_vfprintf", b"pl_crt_setup",
+            b"pl_do_MessageBoxA", b"g_pl_font8"):
     assert sym in d, "missing symbol %r (peload_crt.o / peload_stubs.S not linked?)" % sym
 
 # ★ W2 血泪门禁：**每条通用跳板都必须 push %rsi / push %rdi**。
@@ -107,7 +108,7 @@ for sym in (b"pl_stub_ExitProcess", b"pl_stub_GetProcAddress", b"pl_stub_LoadLib
 #     mingw __tmainCRTStartup 用 rsi 当 argv 下标，call strlen 回来后 rsi 变成 0x100200，
 #     于是 `mov %rax,-0x8(%r13,%rsi,8)` 写到 0x10109BFF8 -> #PF -> exit 139。
 #   字节序列 56 57 48 89 cf = push %rsi; push %rdi; mov %rcx,%rdi（宏展开的开头）。
-N_THUNKS = 28          # W2S 宏展开的条数（kernel32 10 + msvcrt 18）
+N_THUNKS = 29          # W2S 宏展开的条数（kernel32 10 + user32 1 + msvcrt 18）
 guard = d.count(b"\x56\x57\x48\x89\xcf")
 assert guard >= N_THUNKS, \
     ("only %d/%d thunks save rsi/rdi (missing push %rsi/%rdi?) —— "

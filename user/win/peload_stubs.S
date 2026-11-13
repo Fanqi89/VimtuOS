@@ -81,6 +81,9 @@ pl_stub_\name:
     W2S GetStartupInfoA,            GetStartupInfoA
     W2S IsDBCSLeadByte,             IsDBCSLeadByte
 
+/* ---- ★ W3：user32（只有 MessageBoxA 一个 —— W0 实测 gui.exe 的 user32 导入面就这么大）---- */
+    W2S MessageBoxA,                MessageBoxA
+
 /* ---- msvcrt（老式 1998 版 ABI）---- */
     W2S _XcptFilter,                XcptFilter
     W2S __iob_func,                 iob_func
