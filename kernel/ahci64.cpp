@@ -494,6 +494,35 @@ static uint8_t g_hdr_dumped = 0;
 // 加参数会把改动面放大；这里只在 ATAPI 传输期间置位、命令返回即清零。
 static const uint8_t* g_pkt_cdb = 0;
 
+int ahci64_count64();
+
+
+// ★ 诊断（W3 第四批）：读/写路径上原来有几处**静默** return false，VMware 实测
+//   "selftest 读 LBA 0 成功、之后所有读都失败且日志里一个字都没有"，根本没法定位。
+//   这里给它们统一加一行带 reason 的打点（总预算 24 行，不会刷屏）。
+static uint32_t nsec0(uint32_t count, uint32_t done) {
+    const uint32_t left = count - done;
+    return left > AHCI64_CHUNK_SECTORS ? AHCI64_CHUNK_SECTORS : left;
+}
+static int g_ahci_fail_logged = 0;
+static void ahci_fail_note64(const char* why, int di, uint32_t lba, uint32_t count) {
+    if (g_ahci_fail_logged >= 24) return;
+    g_ahci_fail_logged++;
+    dbg64_line_begin64();
+    dbg64_str("[AHCI64] xfer SKIP reason=");
+    dbg64_str(why);
+    dbg64_str(" di=");
+    dbg64_dec((uint64_t)(uint32_t)(di < 0 ? -1 : di));
+    dbg64_str(" drives=");
+    dbg64_dec((uint64_t)(uint32_t)(ahci64_count64() < 0 ? -1 : ahci64_count64()));
+    dbg64_str(" lba=");
+    dbg64_dec(lba);
+    dbg64_str(" count=");
+    dbg64_dec(count);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
 // 下发一条命令并轮询完成。返回 true = 成功（PxCI 清零 + 无错误位）。
 static bool ahci_cmd(int di, uint8_t cmd, uint64_t lba, uint32_t count,
                      const Ahci64Prd* prds, int nprd, bool write, bool atapi_cmd) {
@@ -512,11 +541,11 @@ static bool ahci_cmd(int di, uint8_t cmd, uint64_t lba, uint32_t count,
     }
 
     // 端口必须在跑（ST=1 才能收命令）
-    if (!(prd(p, P_CMD) & CMD_ST)) return false;
+    if (!(prd(p, P_CMD) & CMD_ST)) { ahci_fail_note64("cmd-port-stopped", di, (uint32_t)lba, count); return false; }
     // 上一条命令必须已经结束（PxCI slot0 清零）；给 10 tick（40 ms）的宽限。
     // ★ v0.9.41：有了 IO 锁之后，这里看到的只能是**我们自己**上一条的残留；
     //   在锁之前这里会看到别的执行流在飞的命令，然后下一步 port_restart 把它掐死。
-    if (!ahci_wait(p, P_CI, 1u, 0u, 10)) return false;
+    if (!ahci_wait(p, P_CI, 1u, 0u, 10)) { ahci_fail_note64("cmd-slot-busy", di, (uint32_t)lba, count); return false; }
     const bool dump_first = (g_hdr_dumped == 0);                 // 只给第一条命令做逐字段打点
     // ---- 命令表（CFIS/ACMD/PRDT）----
     uint8_t* ct = d.ct;
@@ -658,7 +687,7 @@ static bool ahci_xfer(int di, uint8_t cmd, uint32_t lba, uint32_t count, void* b
         //   执行流插进来（否则 g_dma[] 与命令表会被覆盖）。
         {
             Ahci64IoSpan io;
-            if (!io.held) return false;
+            if (!io.held) { ahci_fail_note64("io-lock", di, lba + done, nsec0(count, done)); return false; }
 
             const uint32_t nsec = (count - done > AHCI64_CHUNK_SECTORS)
                                 ? AHCI64_CHUNK_SECTORS : (count - done);
@@ -677,7 +706,7 @@ static bool ahci_xfer(int di, uint8_t cmd, uint32_t lba, uint32_t count, void* b
             } else {
                 // ---- 暂存路径：DMA 只碰页池里那 16 页，数据再逐页 memcpy ----
                 bounce = true;
-                if (!g_dma[0]) return false;              // 页池没拿到缓冲：如实失败
+                if (!g_dma[0]) { ahci_fail_note64("no-bounce-page", di, lba + done, count - done); return false; }   // 页池没拿到缓冲
                 uint32_t left = bytes;
                 for (int i = 0; i < AHCI64_DMA_PAGES && left > 0; i++) {
                     prds[i].pa = (uint64_t)(uintptr_t)g_dma[i];
@@ -685,7 +714,7 @@ static bool ahci_xfer(int di, uint8_t cmd, uint32_t lba, uint32_t count, void* b
                     left -= prds[i].bytes;
                     nprd++;
                 }
-                if (left != 0) return false;
+                if (left != 0) { ahci_fail_note64("bounce-too-small", di, lba + done, count - done); return false; }
                 if (write) {
                     uint32_t off = 0;
                     for (int i = 0; i < nprd; i++) {
@@ -1075,7 +1104,7 @@ bool ahci64_info64(int idx, DiskInfo* out) {
 
 bool ahci64_read64(int idx, uint32_t lba, uint32_t count, void* buf) {
     const int di = ahci_drive_index(idx);
-    if (di < 0 || !buf) return false;
+    if (di < 0 || !buf) { ahci_fail_note64(di < 0 ? "read-no-dev" : "read-no-buf", di, lba, count); return false; }
     return ahci_xfer(di, ATA_CMD_READ_DMA_EXT, lba, count, buf, false);
 }
 // ==================== ★ v0.9.33：零拷贝散列读（DMA 直接落到调用方给的物理帧）====================
@@ -1218,7 +1247,7 @@ bool ahci64_write_frames64(int idx, uint32_t lba, uint32_t count,
 
 bool ahci64_write64(int idx, uint32_t lba, uint32_t count, const void* buf) {
     const int di = ahci_drive_index(idx);
-    if (di < 0 || !buf) return false;
+    if (di < 0 || !buf) { ahci_fail_note64(di < 0 ? "write-no-dev" : "write-no-buf", di, lba, count); return false; }
     const bool ok = ahci_xfer(di, ATA_CMD_WRITE_DMA_EXT, lba, count, (void*)buf, true);
     if (ok && !g_first_write_logged) {
         g_first_write_logged = 1;              // 首次写盘留一行证据，之后不再打（避免刷屏）
