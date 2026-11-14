@@ -450,6 +450,7 @@ static void do_prot(void) {
 }
 
 /* ==================== 主流程 ==================== */
+extern void pl_set_mb_idle_ms(unsigned ms);   /* user/win/peload_crt.c */
 int peload_main(u64 *sp) {
     const int argc = (int)sp[0];
     const char **argv = (const char **)(sp + 1);
@@ -458,6 +459,16 @@ int peload_main(u64 *sp) {
         return 2;
     }
     const char *path = argv[1];
+
+    /* 可选第 2 个参数：MessageBoxA 的**空闲**超时毫秒（默认 8000，见 peload_crt.c）。
+     * 需要"对话框活得够久"的验收（拖动 / 真点 OK）用 `run /bin/peload <exe> 90000`。
+     * 不会传给被装载的 exe：__getmainargs 只报 argc=1（见 peload_crt.c）。 */
+    if (argc >= 3 && argv[2] && argv[2][0]) {
+        unsigned ms = 0;
+        for (const char *q = argv[2]; *q >= '0' && *q <= '9'; q++)
+            ms = ms * 10u + (unsigned)(*q - '0');
+        if (ms) pl_set_mb_idle_ms(ms);
+    }
 
     /* ---- 1) 读文件（整份读进 mmap；上限 = VFS 单文件上限） ---- */
     g_file = (u8 *)x_mmap(MAX_PE_BYTES, PROT_R | PROT_W);

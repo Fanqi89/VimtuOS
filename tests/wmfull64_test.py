@@ -269,8 +269,33 @@ def plan_moves(dx, dy):
     return cmds
 
 
+def home_cursor(mon, log_fn, passes=6, verbose=True):
+    """把光标顶到 (0,0)：客人侧会钳在左上角，QEMU 的**宿主**光标也被一起推到左上角。
+
+    为什么必须归零（实测，别删）：QEMU monitor 的 `mouse_move` 改的是宿主光标，
+    PS/2 只报它的**相对位移**；而客人侧灵敏度是 ×1.7，所以客人走得比宿主快。
+    宿主屏只有 1366x768，一旦宿主光标先撞边，客人就再也收不到位移包
+    （现场表现：`[UI] perf` 的 cur 卡死在 (582,753) 一动不动，但**按键包照样到**，
+      因为按键不看位移）——E/F 就此全红。归零后两边都在 (0,0)，
+    整屏 1280x800 只对应宿主 753x470，永远撞不到边。
+    """
+    cur = None
+    for p in range(passes):
+        n0 = n_perf(log_fn())
+        mon.raw(["mouse_move -40 -40"] * 10, wait_between=0.02, wait_end=0.15)
+        cur, _ = wait_perf_after(log_fn, n0, timeout=20.0)
+        if cur == (0, 0):
+            if verbose:
+                print("    [home] pass %d 光标已归零 (0,0)" % (p + 1))
+            return cur
+    if verbose:
+        print("    [home] 归零未达（cur=%s），继续按现状闭环" % (cur,))
+    return cur
+
+
 def goto_exact(mon, log_fn, tx, ty, tol=3, passes=7, verbose=True):
     """把光标送到 (tx,ty) 并**确认到位**（判据 = 客户机自报的 cur=x,y）。"""
+    home_cursor(mon, log_fn, verbose=verbose)
     cur = None
     for p in range(passes):
         n0 = n_perf(log_fn())
@@ -285,10 +310,17 @@ def goto_exact(mon, log_fn, tx, ty, tol=3, passes=7, verbose=True):
                 print("    [goto] pass %d 到位 cur=%d,%d (目标 %d,%d)" % (p + 1, cur[0], cur[1], tx, ty))
             return cur
         if n1 <= n0:
+            # ★ 5 s 抓不到新 perf ≠ 死：弹窗刚上屏 / 整屏重绘时外壳会掉到 ~1 fps，
+            #   实测最长 ~10 s 不出 perf。再给 25 s，仍没有才如实失败。
             if verbose:
-                print("    [goto] pass %d 没有新的 [UI] perf（客户机很慢），停在 cur=%d,%d"
+                print("    [goto] pass %d 5 s 内没有新 perf，再等最多 25 s…（cur=%d,%d）"
                       % (p + 1, cur[0], cur[1]))
-            return cur
+            cur, n1 = wait_perf_after(log_fn, n0, timeout=25.0)
+            if cur is None or n1 <= n0:
+                if verbose:
+                    print("    [goto] pass %d 仍没有新的 [UI] perf（客户机很慢），停在 cur=%s"
+                          % (p + 1, cur))
+                return cur
         cmds = plan_moves(dx, dy)
         if verbose:
             print("    [goto] pass %d cur=%d,%d -> 目标 %d,%d（%d 步）"
@@ -446,9 +478,15 @@ def main():
             return check.summary()
         check("A. 起桌面（qemuhelp.wait_desktop 含登录手势）", True)
         time.sleep(1.0)
+        # ★ `[UI] perf` 每秒一行，且窗口刚起来时外壳会被拖到 ~1 fps —— sleep 1 s 就取 cur
+        #   会假红（实测 cur=None）。这里等，不猜。
         c0 = cur_pos(log_fn())
+        t_a = time.time()
+        while c0 is None and time.time() - t_a < 40.0:
+            time.sleep(0.5)
+            c0 = cur_pos(log_fn())
         check("A. 拿到客户机自报的光标位置（[UI] perf … cur=x,y，零延迟串口）",
-              c0 is not None, "cur=%s" % (c0,))
+              c0 is not None, "cur=%s（等了 %.0f s）" % (c0, time.time() - t_a))
 
         # ---------- B. 开终端 ----------
         try:
@@ -488,7 +526,10 @@ def main():
         # ---------- D. Windows GUI 程序：对话框必须落在屏幕正中 ----------
         print()
         print("=== D. run /bin/peload /pexcorpus/gui.exe（MessageBoxA 弹窗）===")
-        type_line(mon, "run /bin/peload %s" % GUI_EXE_VOL, per=0.08)
+        # ★ W3 第三批：带上空闲超时 90 s —— 拖动 + 闭环定位 + 两次 screendump 远超 8 s，
+        #   默认的 8 s 会让对话框在夹具手底下先自己关掉（E/F 就此假红）。
+        #   有 seat 事件还会继续续命（见 user/win/peload_crt.c 的 g_mb_idle_ms）。
+        type_line(mon, "run /bin/peload %s 90000" % GUI_EXE_VOL, per=0.08)
         mshow = wait_re(log_fn, MSG_SHOW_RE, args.timeout, proc)
         check("D. 对话框建起来了（[PELOAD] msgboxA show surf=.. shm=.. w=300 h=150）",
               mshow is not None, mshow.group(0) if mshow else "没等到")

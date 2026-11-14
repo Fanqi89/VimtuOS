@@ -4517,6 +4517,8 @@ static bool term_run_redir64(TerminalState* ts, const char* path, const char* ou
         return false;
     }
     int ofd = -1, ifd = -1;
+    int detached = 0;   // ★ 等待超时后"只撒手、不杀进程"（见下面的 detach 分支）
+    int gone = 0;       // ★ 等的时候进程已经没了（pid 可能已被复用）
     if (out_file && out_file[0]) {
         ofd = fd64_open64(out_file, FD64_O_WRONLY | FD64_O_CREAT | (append ? FD64_O_APPEND : FD64_O_TRUNC));
         if (ofd < 0) {
@@ -4572,16 +4574,38 @@ static bool term_run_redir64(TerminalState* ts, const char* path, const char* ou
                     if ((int)in.pid == pid) { st = (int)in.state; code = in.exit_code; break; }
                 }
                 if (st == (int)PROC64_EXITED) { rc = 0; break; }   // 退出即"跑完了"；退出码在 code=
-                if (st < 0) break;
+                if (st < 0) { gone = 1; break; }
                 if (g_ticks64 - t0 >= (uint64_t)PIT_HZ_64 * 120u) break;   /* ★ v0.7.7：20s -> 120s（实测 dpkg -i 要 ~20-30s；期间看门狗已 pause） */         // 有界等待
                 task_sleep64(2);
             }
-            if (rc == -2) { (void)proc64_kill64(pid, 9); }                      // 超时：杀掉
+            if (rc == -2 && !gone) {
+                /* ★ W3 第三批（真缺陷，靠 [PROC64] kill 的 caller= 打点抓到调用者）：
+                 *   原来这里无条件 SIGKILL，于是**任何跑得久一点的前台程序都被拦腰砍掉**。
+                 *   实测证据链：
+                 *     [PROC64] kill pid=26 sig=9 caller=FFFFFFFF80248FEE
+                 *     addr2line -> term_run_redir64()
+                 *     [PROC64] exit pid=26 code=137（= 128+9）
+                 *   而 pid=26 正是 MessageBoxA 的 peload：对话框刚上屏、鼠标还没送到就被杀了，
+                 *   所以 wmfull64_test 的"拖动 / 真点 OK"两段必红（还留下一条查了很久的
+                 *   "~16 s 的 SIGKILL"疑案 —— 真身是这里的 120 tick-秒等待上限，
+                 *   TCG 下 tick 比墙钟快好几倍，于是墙钟十几秒就到点了）。
+                 *   现在的语义与 `elfrun bg` 一致：**停止等待、进程留着继续跑、控制权还给 shell**；
+                 *   真要停它用 `proc kill <pid>`。长驻程序跑久一点是正常行为，不是错误。 */
+                detached = 1;
+                rc = 0;                                  // 命令本身成功了（程序已起来并在跑）
+                dbg64_line_begin64();
+                dbg64_str("[TERM] run detach pid=");
+                dbg64_dec((uint64_t)(uint32_t)pid);
+                dbg64_str(" (wait limit reached; still running, NOT killed -- `proc kill ");
+                dbg64_dec((uint64_t)(uint32_t)pid);
+                dbg64_str("` to stop it)\n");
+                dbg64_line_end64();
+            }                      // 超时：杀掉
         }
         if (kout == 1) (void)fd64_close64(1);                                   // 内核表槽 1 还给终端
         if (kin == 0) (void)fd64_close64(0);
     }
-    if (pid > 0 && proc64_find64(pid)) proc64_destroy64(pid);
+    if (pid > 0 && !detached && proc64_find64(pid)) proc64_destroy64(pid);
     panic64_watchdog_unpause64();
     if (ofd >= 0) (void)fd64_close64(ofd);
     if (ifd >= 0) (void)fd64_close64(ifd);

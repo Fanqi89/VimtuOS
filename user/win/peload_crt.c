@@ -542,7 +542,24 @@ static i64 pack2(int lo, int hi) {
  *   可复现的**，而且和合成器无关（那时还没有合成器）。所以这里**保持 8 s**，
  *   不去踩那条还没查清的 kill 路径。拖动/点击这类需要长寿命对话框的验收另想办法
  *   （见 tests/wmfull64_test.py 顶部说明）。 */
+/* ★ W3 第三批：8 s 改成**空闲**超时（有交互就续命），并允许调用方覆盖。
+ *   旧实现是一刀切的总时长，于是"拖动 + 真点 OK"这类验收必然撞上它：
+ *   夹具把光标闭环挪过去、再取 screendump，早超过 8 s，对话框在手里先自己关了。
+ *   现在语义：
+ *     g_mb_idle_ms  = **多久没有任何 seat 事件**才超时（默认仍是 8000 -> peload64_test ⑩ 不变）
+ *     MB_HARD_MS    = 硬上限，无论怎么交互都不超过（进程寿命有界，不挂死）
+ *     `peload <exe> <idle_ms>` = 覆盖 g_mb_idle_ms（夹到 1000..120000）
+ *   ★ 那条"~16 s 后进程被 SIGKILL（exit=137、无 close 行）"现在由 [PROC64] kill 行的
+ *     caller= 打点盯着（见 kernel/proc64.cpp）；没查清之前默认值不动。 */
 #define MB_TIMEOUT_MS 8000u
+#define MB_HARD_MS    180000u
+static u32 g_mb_idle_ms = MB_TIMEOUT_MS;
+
+void pl_set_mb_idle_ms(u32 ms) {
+    if (ms < 1000u) ms = 1000u;
+    if (ms > 120000u) ms = 120000u;
+    g_mb_idle_ms = ms;
+}
 
 /* 配色（XRGB8888，高字节忽略） */
 #define MB_C_BORDER  0xFF202020u
@@ -644,10 +661,11 @@ static void mb_draw(const char *caption, const char *text) {
  */
 static int mb_pump(int bx, int by, int bw, int bh, u32 timeout_ms) {
     u8 ev[8 * 64];
-    u32 waited = 0;
+    u32 waited = 0, total = 0;
     for (;;) {
         bzero_(ev, (u32)sizeof(ev));
         const i64 n = i80(MB_NR_WL_DISPATCH, 40, (i64)(u64)ev, 8, 0);
+        if (n > 0) waited = 0;     /* ★ 有事件 = 用户还在操作 -> 空闲计时归零（续命） */
         for (i64 i = 0; i < n; i++) {
             const u8 *e = ev + (u32)i * 64u;
             const u32 type = *(const u32 *)(e + 0);
@@ -669,9 +687,10 @@ static int mb_pump(int bx, int by, int bw, int bh, u32 timeout_ms) {
                 return 1;
             }
         }
-        if (waited >= timeout_ms) return 0;
+        if (waited >= timeout_ms || total >= MB_HARD_MS) return 0;
         (void)i80(MB_NR_SLEEP_MS, 8, 0, 0, 0);
         waited += 8;
+        total += 8;
     }
 }
 
@@ -728,7 +747,7 @@ u64 pl_do_MessageBoxA(u64 hwnd, u64 text, u64 caption, u64 type) {
     const i64 seat = i80(MB_NR_WL_SEAT_GET, 0, 0, 0, 0);
     pl_outs(1, "[PELOAD] msgboxA seat="); pl_dec(1, (u64)seat); pl_out(1, "\n", 1);
 
-    const int hit = mb_pump(MB_BTN_X, MB_BTN_Y, MB_BTN_W, MB_BTN_H, MB_TIMEOUT_MS);
+    const int hit = mb_pump(MB_BTN_X, MB_BTN_Y, MB_BTN_W, MB_BTN_H, g_mb_idle_ms);
     pl_outs(1, "[PELOAD] msgboxA close reason=");
     pl_outs(1, hit ? "clicked" : "timeout");
     pl_out(1, "\n", 1);

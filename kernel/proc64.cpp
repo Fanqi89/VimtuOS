@@ -1593,6 +1593,11 @@ int64_t proc64_kill64(int pid, int sig) {
         dbg64_dec((uint64_t)(uint32_t)pid);
         dbg64_str(" sig=");
         dbg64_dec((uint64_t)(uint32_t)(sig > 0 ? sig : 0));
+        // ★ W3 第三批：钉死"谁在杀我" —— 这条打点过去只有 pid/sig，导致 peload 那条
+        //   ~16 s 的 SIGKILL（退出码 137、没有 close 行）查了几轮都指不出调用者。
+        //   caller = 直接调用点的返回地址；用 kernel ELF 的符号表一查就能指名函数。
+        dbg64_str(" caller=");
+        dbg64_hex64((uint64_t)(uintptr_t)__builtin_return_address(0));
         dbg64_nl();
         dbg64_line_end64();
     }

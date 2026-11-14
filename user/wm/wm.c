@@ -63,7 +63,12 @@
 #define WM_DEV_MIN_PX   4096u        /* 设备提交路径的阈值：64x64（本台都没有 virtio-gpu -> 恒 soft） */
 #define WM_FULL_MS      45000u       /* full 模式最长运行时间 */
 #define WM_SHORT_MS     180000u      /* short 模式：**一个 surface 都没见过**时的等待窗口（见文件头） */
-#define WM_SEEN_MS      60000u       /* short 模式：已经见过 surface 之后的最长寿命 */
+#define WM_SEEN_MS      1800000u     /* ★ W3 第三批：short 模式"见过 surface 之后的最长寿命"。
+                                      *   原来是 60000 —— 实测 `[WM] exit reason=timeout elapsed_ms=60032`
+                                      *   会在**窗口还在屏上**时把合成器自己收掉：拖动/点击验收跑不到
+                                      *   60 s 就没有合成器了（E 段全红、capture 被释放、事件改由内核
+                                      *   直接投给焦点进程）。合成器是**长驻服务**，不该有 60 s 自裁；
+                                      *   真正的收工判据是上面那条 `no-surfaces`（见过的 surface 全退光）。 */
 #define WM_REPAIR_MS    150u         /* 周期性把窗口矩形重画一遍（盖掉外壳的光标/脏区重绘） */
 #define WM_EV_MAX       32u
 #define WM_DRAG_BAR     22           /* 拖动把手 = 窗口顶部这么多行（= MessageBoxA 的自绘标题栏） */
@@ -88,6 +93,9 @@ static struct Wm64Rect  g_rect;                 /* 22 号写回：整屏（本�
 static int g_rx, g_ry, g_rw, g_rh;
 static unsigned long long g_tsc_per_ms = 0;
 static unsigned long long g_route_logged = 0;
+// ★ 单独给"路由到窗口"一份预算：早期从 (0,0) 走向控件的一大堆 route none
+//   会把共用预算吃光，真按到窗口上时反而打不出来（E/F 的取证就靠这一行）。
+static unsigned long long g_route_surf_logged = 0;
 static unsigned g_place_seq = 0;
 static int      g_seat = 1;                      /* 22 号给的座位 id（事件投递用） */
 static uint32_t g_frame_log = 0;                 /* [WM] frame 行的预算（纯修复帧不打，见下） */
@@ -618,8 +626,8 @@ int main(void) {
                         const int tpid = wl_seat_post(&se);
                         g_drag_posts++;
                         /* 只给**指针**事件留证（键盘是外壳的事，打出来只会把串口刷爆、拖死终端重绘） */
-                        if (!is_key && g_route_logged < 32) {
-                            g_route_logged++;
+                        if (!is_key && g_route_surf_logged < 240) {
+                            g_route_surf_logged++;
                             printf("[WM] route surf=%d pid=%d type=%d x=%d y=%d sx=%d sy=%d\n",
                                    (int)se.surf, tpid, (int)raw[i].type, (int)raw[i].x, (int)raw[i].y,
                                    (int)se.sx, (int)se.sy);
