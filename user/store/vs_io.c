@@ -399,6 +399,7 @@ const char* vs_err_name(int code) {
         case VS_E_IO:        return "io";
         case VS_E_NOMEM:     return "nomem";
         case VS_E_PERM:      return "perm";
+        case VS_E_ZSTD:      return "zstd";
         default:             return "unknown";
     }
 }

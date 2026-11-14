@@ -474,8 +474,8 @@ static int vap_parse(const unsigned char* b, int n, struct Vap* out) {
 #ifndef VS_STORE_GUI
 /* 扫一遍 ar，找出 control/data 的压缩格式与是否有维护者脚本 */
 struct DebInfo {
-    int control_off, control_size, control_gz, control_xz, control_bz2;
-    int data_off, data_size, data_gz, data_xz, data_bz2;
+    int control_off, control_size, control_gz, control_xz, control_bz2, control_zst;
+    int data_off, data_size, data_gz, data_xz, data_bz2, data_zst;
     int has_preinst, has_postinst, has_prerm, has_postrm;
     char pkg[VS_NAME_MAX];
     char ver[VS_VER_MAX];
@@ -503,14 +503,15 @@ static int ar_scan_all(const unsigned char* b, int n, struct DebInfo* di, int* n
         const int data = off + 60;
         if (data + size > n) return VS_E_FORMAT;
         const int is_ctl = vs_streq(name, "control.tar.gz") || vs_streq(name, "control.tar.xz") ||
-                           vs_streq(name, "control.tar.bz2");
+                           vs_streq(name, "control.tar.bz2") || vs_streq(name, "control.tar.zst");
         const int is_dat = vs_streq(name, "data.tar.gz") || vs_streq(name, "data.tar.xz") ||
-                           vs_streq(name, "data.tar.bz2");
+                           vs_streq(name, "data.tar.bz2") || vs_streq(name, "data.tar.zst");
         if (is_ctl) {
             di->control_off = data; di->control_size = size;
             di->control_gz  = vs_streq(name, "control.tar.gz");
             di->control_xz  = vs_streq(name, "control.tar.xz");
             di->control_bz2 = vs_streq(name, "control.tar.bz2");
+            di->control_zst = vs_streq(name, "control.tar.zst");
             ctl++;
         }
         if (is_dat) {
@@ -518,6 +519,7 @@ static int ar_scan_all(const unsigned char* b, int n, struct DebInfo* di, int* n
             di->data_gz  = vs_streq(name, "data.tar.gz");
             di->data_xz  = vs_streq(name, "data.tar.xz");
             di->data_bz2 = vs_streq(name, "data.tar.bz2");
+            di->data_zst = vs_streq(name, "data.tar.zst");
             dat++;
         }
         off = data + size + (size & 1);
@@ -532,7 +534,9 @@ static int ar_scan_all(const unsigned char* b, int n, struct DebInfo* di, int* n
 struct TarEnt {
     const char* name;
     int size;
-    int type;          /* 0 = 文件，5 = 目录，其它 = 不支持 */
+    int type;          /* 0 = 文件，5 = 目录，2 = 符号链接 */
+    const char* link;  /* type == 2 时：tar 的 linkname 字段（直接指向 512B 头） */
+    int linklen;
 };
 
 static int octal_of(const char* p, int n) {
@@ -577,6 +581,10 @@ static int tar_next(const unsigned char* b, int n, int* off, struct TarEnt* e, c
         e->name = namebuf;
         e->size = size;
         e->type = (tf == '5') ? 5 : ((tf == '0' || tf == 0) ? 0 : (tf == '2' ? 2 : 9));
+        e->link = h + 157;                       /* ustar linkname：100 字节 */
+        {   int ln = 0;
+            while (ln < 100 && e->link[ln]) ln++;
+            e->linklen = ln; }
         return 1;
     }
     return 0;
@@ -1104,6 +1112,34 @@ static int install_vap64(const char* tag, const struct VsPkg* p, const unsigned 
 }
 
 #ifndef VS_STORE_GUI
+/* ==================== ★ v0.10.3：.deb 成员的压缩外壳 ====================
+ * gzip / xz 走既有实现，zstd 走 vs_zstd.c。失败一律打出具体原因
+ * （`[VPKG] deb zstd member=… at=… reason=…`），不假装成功。 */
+static int deb_unzstd(const char* tag, const char* member,
+                      const unsigned char* in, int n,
+                      unsigned char* out, int outcap, int* out_len) {
+    void* work = vs_mmap(VS_ZSTD_WORK_BYTES);
+    unsigned char* lit = (unsigned char*)vs_mmap(VS_ZSTD_LIT_BYTES);
+    const char* why = "none";
+    int at = 0;
+    if (!work || !lit) { vs_log(tag, "deb zstd member=%s reason=nomem\n", member); return VS_E_NOMEM; }
+    if (vs_zstd_decode(in, n, out, outcap, lit, VS_ZSTD_LIT_BYTES,
+                       work, out_len, &why, &at) != 0) {
+        vs_log(tag, "deb zstd member=%s in=%d at=%d reason=%s\n", member, n, at, why);
+        return VS_E_ZSTD;
+    }
+    vs_log(tag, "deb zstd member=%s in=%d out=%d\n", member, n, *out_len);
+    return VS_OK;
+}
+
+/* 建符号链接：内核自有号段的 symlink（kernel/syscall64.cpp case 88）。
+ *   为什么直接发号而不加 user/lib 包装：user/lib 是全体程序共用的，
+ *   加一个函数会同时撑大 shell/store/busybox 的映像（而只有 vpkg 用得到）。 */
+static int vs_symlink_at(const char* target, const char* path) {
+    return (int)__v64_syscall(88L, (long)(unsigned long)(size_t)target,
+                              (long)(unsigned long)(size_t)path, 0, 0, 0);
+}
+
 /* ==================== 安装：.deb 分支 ==================== */
 static int install_deb(const char* tag, const struct VsPkg* p, const unsigned char* file, int flen,
                        const struct VsCtx* cx, struct VsInstalled* rec) {
@@ -1116,25 +1152,30 @@ static int install_deb(const char* tag, const struct VsPkg* p, const unsigned ch
         vs_log(tag, "deb members control=%d data=%d\n", nctl, ndata);
         return VS_E_FORMAT;
     }
-    /* 只认 gzip / xz：bzip2 不在本批范围内（zstd 同理）——如实拒绝，不假装成功 */
+    /* ★ v0.10.3：gzip / xz / **zstd** 三条路；bzip2 仍如实拒绝 */
     if (di.control_bz2 || di.data_bz2) {
         vs_log(tag, "deb compression control=%s data=%s (bzip2 is not supported)\n",
-               di.control_bz2 ? "bz2" : (di.control_xz ? "xz" : "gz"),
-               di.data_bz2 ? "bz2" : (di.data_xz ? "xz" : "gz"));
+               di.control_bz2 ? "bz2" : (di.control_zst ? "zst" : (di.control_xz ? "xz" : "gz")),
+               di.data_bz2 ? "bz2" : (di.data_zst ? "zst" : (di.data_xz ? "xz" : "gz")));
         return VS_E_XZ;
     }
     vs_log(tag, "deb compression control=%s data=%s\n",
-           di.control_xz ? "xz" : "gz", di.data_xz ? "xz" : "gz");
+           di.control_zst ? "zst" : (di.control_xz ? "xz" : "gz"),
+           di.data_zst ? "zst" : (di.data_xz ? "xz" : "gz"));
 
-    const int cbufsz = 256 * 1024;
-    const int dbufsz = 4 * 1024 * 1024;        /* 与 gzip 路同口径：control/data.tar 各自上限 */
+    const int cbufsz = 1024 * 1024;            /* control.tar 解出来上限（真包 ~20 KiB） */
+    const int dbufsz = 16 * 1024 * 1024;       /* data.tar 解出来上限（与 gzip/xz 同口径） */
     unsigned char* cbuf = (unsigned char*)vs_mmap(cbufsz);
     unsigned char* dbuf = (unsigned char*)vs_mmap(dbufsz);
     if (!cbuf || !dbuf) return VS_E_NOMEM;
 
     /* ① control.tar.{gz,xz}：xz 走 vs_xz.c（LZMA2），gzip 还是 vs_gunzip */
     int clen = 0;
-    if (di.control_xz) {
+    if (di.control_zst) {
+        rc = deb_unzstd(tag, "control.tar.zst", file + di.control_off, di.control_size,
+                        cbuf, cbufsz, &clen);
+        if (rc != VS_OK) return rc;
+    } else if (di.control_xz) {
         rc = vs_unxz(tag, "control.tar.xz", file + di.control_off, di.control_size, cbuf, cbufsz, &clen);
         if (rc != VS_OK) return rc;
     } else if (vs_gunzip(file + di.control_off, di.control_size, cbuf, cbufsz, &clen) != 0) {
@@ -1180,7 +1221,11 @@ static int install_deb(const char* tag, const struct VsPkg* p, const unsigned ch
     vs_log(tag, "progress pct=35\n");
     /* ② data.tar.{gz,xz} */
     int dlen = 0;
-    if (di.data_xz) {
+    if (di.data_zst) {
+        rc = deb_unzstd(tag, "data.tar.zst", file + di.data_off, di.data_size,
+                        dbuf, dbufsz, &dlen);
+        if (rc != VS_OK) return rc;
+    } else if (di.data_xz) {
         rc = vs_unxz(tag, "data.tar.xz", file + di.data_off, di.data_size, dbuf, dbufsz, &dlen);
         if (rc != VS_OK) return rc;
     } else if (vs_gunzip(file + di.data_off, di.data_size, dbuf, dbufsz, &dlen) != 0) {
@@ -1189,12 +1234,27 @@ static int install_deb(const char* tag, const struct VsPkg* p, const unsigned ch
     }
     /* ②.5 预扫：总字节数（空间检查的依据）+ 路径合法性 + 不支持的类型 + **文件数统计** */
     long long total = 0;
-    int nfiles = 0, ndirs = 0;
+    int nfiles = 0, ndirs = 0, nlinks = 0;
     off = 0;
     while (tar_next(dbuf, dlen, &off, &e, nm, (int)sizeof(nm)) == 1) {
         if (e.type == 5) { ndirs++; tar_skip(&off, e.size); continue; }
+        if (e.type == 2) {                       /* ★ v0.10.3：符号链接 */
+            if (e.linklen <= 0 || e.linklen > 511) {
+                vs_log(tag, "deb symlink name=%s targetlen=%d (bad)\n", nm, e.linklen);
+                return VS_E_FORMAT;
+            }
+            if (!rel_path_ok(tar_strip(nm))) {
+                vs_log(tag, "deb symlink name=%s (unsafe path)\n", nm);
+                return VS_E_PATH;
+            }
+            nlinks++;
+            nfiles++;
+            total += 512;                        /* 一个链接 = 1 inode + 1 数据块（按 512 B 计位） */
+            tar_skip(&off, e.size);
+            continue;
+        }
         if (e.type != 0) {
-            vs_log(tag, "deb tar entry type=%d name=%s (only files/dirs supported)\n", e.type, nm);
+            vs_log(tag, "deb tar entry type=%d name=%s (only files/dirs/symlinks supported)\n", e.type, nm);
             return VS_E_FORMAT;
         }
         if (!rel_path_ok(tar_strip(nm))) {
@@ -1206,8 +1266,8 @@ static int install_deb(const char* tag, const struct VsPkg* p, const unsigned ch
         tar_skip(&off, e.size);
     }
     /* ★ 文件数/字节统计（"装得下真包"的证据；老版本在 12 条上把真包全拒了） */
-    vs_log(tag, "deb stats files=%d dirs=%d payload=%d archive=%d cap=%d\n",
-           nfiles, ndirs, (int)total, flen, VS_FILES_MAX);
+    vs_log(tag, "deb stats files=%d dirs=%d links=%d payload=%d archive=%d cap=%d\n",
+           nfiles, ndirs, nlinks, (int)total, flen, VS_FILES_MAX);
     if (nfiles > VS_FILES_MAX) {
         vs_log(tag, "deb files=%d cap=%d\n", nfiles, VS_FILES_MAX);
         return VS_E_FORMAT;
@@ -1235,6 +1295,38 @@ static int install_deb(const char* tag, const struct VsPkg* p, const unsigned ch
                 return io_code_of(mr);
             }
             tar_skip(&off, e.size);
+            continue;
+        }
+        if (e.type == 2) {                           /* ★ v0.10.3：建真符号链接 */
+            char tgt[520];
+            char dir2[VS_FILE_MAX];
+            int mr, lr;
+            for (int q = 0; q < e.linklen && q < 511; q++) tgt[q] = e.link[q];
+            tgt[e.linklen > 511 ? 511 : e.linklen] = 0;
+            vs_strcpy(dir2, (int)sizeof(dir2), full);
+            for (int q2 = (int)vs_strlen(dir2) - 1; q2 > 0; q2--) {
+                if (dir2[q2] == '/') { dir2[q2] = 0; break; }
+            }
+            if (dir2[0]) (void)vs_mkdir_p(dir2);
+            lr = vs_symlink_at(tgt, full);
+            if (lr != 0) {
+                /* 重装/覆盖：先删后建（dpkg 语义） */
+                (void)vs_unlink(full);
+                lr = vs_symlink_at(tgt, full);
+            }
+            if (lr != 0) {
+                vs_log(tag, "symlink FAILED path=%s target=%s rc=%d\n", full, tgt, lr);
+                return io_code_of(lr);
+            }
+            vs_log(tag, "install link path=%s target=%s\n", full, tgt);
+            if (vs_inst_file_add(rec, full) != 0) {
+                vs_log(tag, "installed files pool EXHAUSTED used=%d cap=%d\n",
+                       vs_inst_files_used(), VS_FILE_POOL_MAX);
+                return VS_E_NOMEM;
+            }
+            (void)mr;
+            tar_skip(&off, e.size);
+            wf++;
             continue;
         }
         /* 目录先建好（tar 里目录条目不一定在前面） */
@@ -1342,8 +1434,8 @@ int vs_install(const char* tag, const char* arg, int do_progress, int force_depe
         log_err(tag, VS_E_NOTFOUND, "package file missing");
         return VS_E_NOTFOUND;
     }
-    if (fsz0 <= 0 || fsz0 > 8 * 1024 * 1024) {
-        vs_log(tag, "package bytes=%d (cap 8 MiB)\n", fsz0);
+    if (fsz0 <= 0 || fsz0 > 16 * 1024 * 1024) {
+        vs_log(tag, "package bytes=%d (cap 16 MiB)\n", fsz0);
         log_err(tag, VS_E_SIZE, "package size out of range");
         return VS_E_SIZE;
     }

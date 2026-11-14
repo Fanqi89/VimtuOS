@@ -43,6 +43,7 @@
 #define VS_E_NOTFOUND 11    /* 仓库/已装库里没有这个名字 */
 #define VS_E_IO       12    /* 读写失败 */
 #define VS_E_NOMEM    13    /* mmap/缓冲不够 */
+#define VS_E_ZSTD     15    /* zstd 解不开（不支持的特征 / 容器坏 / 校验不符） */
 #define VS_E_PERM     14    /* 目标目录本会话不可写（P4 权限真拦截：-EACCES；装系统目录要 root） */
 
 const char* vs_err_name(int code);      /* "hash" / "depends" / ...（日志与退出码都用它） */
@@ -170,6 +171,16 @@ unsigned int vs_crc32(const unsigned char* p, int n);
 /* 解一个 **单块** xz 流到 out（outcap 上限）；成功写 *out_len 并返回 VS_OK。
  * 失败：VS_E_XZ（不支持的 xz 特性）/ VS_E_FORMAT（容器或数据坏）/
  *       VS_E_NOMEM（产物超 outcap、概率表 mmap 失败）。原因都按 member/at/reason 打点。 */
+/* ★ v0.10.3：zstd 帧解码（user/store/vs_zstd.c）。
+ *   work 必须是 vs_mmap(VS_ZSTD_WORK_BYTES) 的内存；lit 至少 128 KiB。
+ *   成功返回 0；失败 <0，*why 给出静态 ASCII 原因。 */
+int  vs_zstd_decode(const unsigned char* src, int src_len,
+                    unsigned char* dst, int dst_cap,
+                    unsigned char* lit, int lit_cap,
+                    void* work, int* out_len, const char** why, int* at_off);
+#define VS_ZSTD_LIT_BYTES  (128 * 1024)
+#define VS_ZSTD_WORK_BYTES (16 * 1024)
+
 int  vs_unxz(const char* tag, const char* member, const unsigned char* in, int n,
              unsigned char* out, int outcap, int* out_len);
 

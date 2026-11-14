@@ -84,13 +84,29 @@ painted2=30151`）。v0.10.1 的 ⑦ 判据已按此收口（erased=0 / painted>
 2. 外壳提供"桌面重绘"接口，wm 交回时请求外壳重画一块矩形并等它完成。
 判据：`before_exit` 与 `after_exit` 在窗口之外逐字节相同（旧口径重新成立），且 `erased=0`。
 
-## 8. dpkg 装 `.deb`：还差什么（v0.10.2 审计，**未做**）
+## 8. dpkg 装 `.deb`：还差什么（v0.10.3 更新）
+
+> **★ v0.10.3 已关闭下表前三条**（表格本身保留为当时的审计记录）：
+> * **zstd 解码** → `user/store/vs_zstd.c`（自写 RFC 8878 帧解码器，**零依赖**），
+>   `.deb` 压缩壳变成 gz / xz / **zst** 三条路；
+>   验收 `tools/zstd_selftest.py`：**344/344 PASS**（真 zstd 造的样本逐字节比对 + 截断负向对照），
+>   细节与踩坑记录见 `docs/zstd解码器.md`。
+> * **符号链接** → tar `type=2` 不再整包拒绝，按内核 syscall 88 建**真链接**
+>   （相对目标由内核按“链接所在目录 + 目标”解析），并记进已装文件清单（卸载时删除）；
+>   验收 `tests/dpkg64_test.py` 的 **G / H** 两条判据（相对链接 / 绝对链接各一条，都要能 `cat` 出内容）。
+> * **上限** → 包 ≤ **16 MiB**、`control.tar` 解出 ≤ **1 MiB**、`data.tar` 解出 ≤ **16 MiB**
+>   （上限由系统卷 ~12.6 MiB 决定，不是拍的）。
+>
+> 下表里**仍然成立**的是：维护者脚本、`/var/lib/dpkg/status` 格式、
+> 依赖版本区间、落盘权限 0644、已装库 ≤ 8 个包、只能装到系统卷根。
 
 线上唯一引擎是 `user/store/vs_pkg.c`（`/bin/vpkg` = `/usr/bin/dpkg` = `/usr/bin/apt` 同一份字节，
 按 `argv[0]` 分前端；`user/dpkg/dpkg.c` 已废弃不编译）。**已能装**的边界：
 
-`.deb` = ar + `control.tar.{gz,xz}` + `data.tar.{gz,xz}`；包 ≤ 8 MiB；解压后 payload ≤ 4 MiB；
-无符号链接；无维护者脚本；装到系统卷根；已装库 ≤ 8 个包。`tests/dpkg64_test.py` 6/6 已证。
+`.deb` = ar + `control.tar.{gz,xz,zst}` + `data.tar.{gz,xz,zst}`；包 ≤ **16 MiB**；解压后 payload ≤ **16 MiB**；
+**带符号链接**（type=2，相对/绝对都行）；无维护者脚本；装到系统卷根；已装库 ≤ 8 个包。
+`tests/dpkg64_test.py` **A–I 九条**已证（A0 sudo / A --version / B 安装 / C payload / D 状态 / E apt 拒绝 /
+F zstd+symlink 安装 / G 相对链接可读 / H 绝对链接可读 / I 两包共存）。
 
 挡住"真 Debian 包"的（按优先级）：
 

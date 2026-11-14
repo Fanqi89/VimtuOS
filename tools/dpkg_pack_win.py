@@ -24,6 +24,7 @@ import argparse
 import gzip
 import io
 import os
+import subprocess
 import sys
 import tarfile
 import time
@@ -113,6 +114,103 @@ def make_deb():
     return out, body
 
 
+ZSTD_EXE = None
+
+
+def find_zstd():
+    """找 zstd CLI。找不到就**如实失败**（绝不悄悄跳过这个测试载荷）。"""
+    import shutil
+    global ZSTD_EXE
+    if ZSTD_EXE:
+        return ZSTD_EXE
+    for name in ("zstd", "zstd.exe"):
+        p = shutil.which(name)
+        if p:
+            ZSTD_EXE = p
+            return p
+    for d in (r"C:\msys64\mingw64\bin", r"C:\msys64\usr\bin"):
+        p = os.path.join(d, "zstd.exe")
+        if os.path.exists(p):
+            ZSTD_EXE = p
+            return p
+    return None
+
+
+def zstd_member(entries, level=19):
+    """tar（无压缩）-> data.tar.zst / control.tar.zst。"""
+    zstd = find_zstd()
+    assert zstd, "找不到 zstd CLI：无法造 zstd 载荷（测试判据需要真 zstd 字节流）"
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.USTAR_FORMAT) as t:
+        for ent in entries:
+            name, kind, payload, mode = ent[0], ent[1], ent[2], ent[3]
+            ti = tarfile.TarInfo(name)
+            ti.mtime = 1700000000
+            ti.uid = ti.gid = 0
+            ti.uname = ti.gname = "root"
+            ti.mode = mode
+            if kind == "sym":
+                ti.type = tarfile.SYMTYPE
+                ti.linkname = payload
+                ti.size = 0
+                t.addfile(ti)
+            elif kind == "dir":
+                ti.type = tarfile.DIRTYPE          # ★ 目录必须是 type 5
+                ti.size = 0
+                t.addfile(ti)
+            else:
+                ti.size = len(payload)
+                t.addfile(ti, io.BytesIO(payload))
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_tar.bin")
+    dst = src + ".zst"
+    with open(src, "wb") as f:
+        f.write(raw.getvalue())
+    r = subprocess.run([zstd, "--check", "-%d" % level, "-q", "-f", "-o", dst, src],
+                       capture_output=True)
+    os.remove(src)
+    assert r.returncode == 0, "zstd 压缩失败：%s" % r.stderr.decode("utf-8", "replace")
+    out = open(dst, "rb").read()
+    os.remove(dst)
+    return out
+
+
+def make_deb_zst():
+    """造一个 control.tar.zst + data.tar.zst、且**带符号链接**的真 .deb。
+
+    判据锚点（tests/dpkg64_test.py 按这些串 grep）：
+      /usr/share/vimtu-zstd-test/hello.txt  内容 "hello from a zstd .deb"
+      /usr/bin/vimtu-zstd-link              相对链接 -> ../share/vimtu-zstd-test/hello.txt
+      /usr/share/vimtu-zstd-test/abs-link   绝对链接 -> /usr/share/vimtu-zstd-test/hello.txt
+    """
+    control = (
+        "Package: vimtu-zstd-test\n"
+        "Version: 2.0\n"
+        "Architecture: amd64\n"
+        "Maintainer: VimtuOS <dev@vimtu.local>\n"
+        "Section: misc\n"
+        "Priority: optional\n"
+        "Description: zstd + symlink install self-test\n"
+    ).encode()
+    body = b"hello from a zstd .deb\n"
+    ctl = zstd_member([("./control", "file", control, 0o644)])
+    data = zstd_member([
+        ("./", "dir", b"", 0o755),
+        ("./usr/", "dir", b"", 0o755),
+        ("./usr/share/", "dir", b"", 0o755),
+        ("./usr/share/vimtu-zstd-test/", "dir", b"", 0o755),
+        ("./usr/share/vimtu-zstd-test/hello.txt", "file", body, 0o644),
+        ("./usr/bin/", "dir", b"", 0o755),
+        ("./usr/bin/vimtu-zstd-link", "sym", "../share/vimtu-zstd-test/hello.txt", 0o777),
+        ("./usr/share/vimtu-zstd-test/abs-link", "sym",
+         "/usr/share/vimtu-zstd-test/hello.txt", 0o777),
+    ])
+    out = b"!<arch>\n"
+    out += ar_member("debian-binary", b"2.0\n")
+    out += ar_member("control.tar.zst", ctl)
+    out += ar_member("data.tar.zst", data)
+    return out, body
+
+
 def main():
     ap = argparse.ArgumentParser()
     # ★ v0.9.42（L1）：默认源从 build64/dpkg（已废弃的独立引擎）改成 build64/store/vpkg.elf。
@@ -148,16 +246,20 @@ def main():
                          "execve 会拒载（outside-user-window）\n" % (top, limit))
         return 1
     deb, body = make_deb()
+    deb_z, body_z = make_deb_zst()
     files = {
         "/usr/bin/dpkg": (exe, 0o755),
         "/usr/bin/apt": (exe, 0o755),                     # 同一份字节：argv[0] 决定前端
         # ★ v0.7.6：名字仅用 `-` / `.`。QEMU sendkey 没有下划线，实测 `test-vimtu_1.0.deb`
     #   在终端里会变成 `test-vimtu1.0.deb`（下划线被吞）-> dpkg -i 找不到文件。
     "/usr/share/dpkg/test-vimtu-1.0.deb": (deb, 0o644),
+    # ★ v0.10.3：data/control 都是 .zst，且带两条符号链接（相对 + 绝对）
+    "/usr/share/dpkg/test-zstd-2.0.deb": (deb_z, 0o644),
     }
     print("    vpkg.elf=%d B（同一份字节装成 /usr/bin/dpkg 与 /usr/bin/apt，argv[0] 决定前端）；"
-          "测试 .deb=%d B（内容 %d B 落到 %s）"
-          % (len(exe), len(deb), len(body), CTRL_PATH))
+          "测试 .deb=%d B（内容 %d B 落到 %s）； "
+          "zstd .deb=%d B（内容 %d B，两条符号链接）"
+          % (len(exe), len(deb), len(body), CTRL_PATH, len(deb_z), len(body_z)))
 
     vol_sectors = args.target_sectors - PART_MAIN_LBA
     if args.vol_in:

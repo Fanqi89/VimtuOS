@@ -10,6 +10,13 @@
      → 出现 "hello from a real .deb installed by vimtu-dpkg"（**payload 真的落到文件系统**）
   D. `run /usr/bin/dpkg -l` → 出现 "vimtu-dpkg-test"（状态文件读回）
   E. `run /usr/bin/apt update` → 出现 "当前未启用"（远程仓库如实拒绝，不假装成功）
+  ★ v0.10.3 新增（zstd + 符号链接）：
+  F. `dpkg -i /usr/share/dpkg/test-zstd-2.0.deb`（data/control 都是 .zst）
+     → run ok + exit 0，且串口有 `deb compression control=zst data=zst` /
+       `deb zstd member=data.tar.zst` / `links=2` / `install link path=/usr/bin/vimtu-zstd-link`
+  G. `cat /usr/bin/vimtu-zstd-link`（相对链接）→ 终端读到 >0 字节
+  H. `cat /usr/share/vimtu-zstd-test/abs-link`（绝对链接）→ 终端读到 >0 字节
+  I. `dpkg -l` 里同时出现第二个包（状态文件读回）
 
 用法：py -3 tests/dpkg64_test.py
 退出码：0 全过 / 1 断言失败 / 2 环境问题
@@ -26,8 +33,9 @@ import startmenu64_test as SM      # noqa: E402
 import qemuhelp as qh              # noqa: E402
 
 QEMU = P.T.find_qemu()
-DISK = os.path.join(ROOT, "build64", "sysdisk.img")      # 演示盘（带完整系统卷）
+DISK_SRC = os.path.join(ROOT, "build64", "sysdisk.img")   # 演示盘（带完整系统卷；**只读**）
 WORK = os.path.join(ROOT, "build64", "dpkg64_test")
+DISK = os.path.join(WORK, "disk.img")                     # ★ 每次运行从 DISK_SRC 复制的副本
 PORT = 5661
 ok = True
 
@@ -106,10 +114,17 @@ def start(args, serial, port):
 
 def main():
     import time
-    if not QEMU or not os.path.exists(DISK):
-        print("跳过：缺 qemu 或 %s" % DISK)
+    if not QEMU or not os.path.exists(DISK_SRC):
+        print("跳过：缺 qemu 或 %s" % DISK_SRC)
         return 2
     os.makedirs(WORK, exist_ok=True)
+    # ★ 永远不直接启动构建产物：装包会写回盘，第二遍就变“已安装”
+    if os.path.exists(DISK):
+        os.remove(DISK)
+    import shutil
+    shutil.copyfile(DISK_SRC, DISK)
+    print("    演示盘副本：%s -> %s（%d B）"
+          % (DISK_SRC, DISK, os.path.getsize(DISK)))
     serial = os.path.join(WORK, "run.log")
     if os.path.exists(serial):
         os.remove(serial)
@@ -204,6 +219,73 @@ def main():
         time.sleep(4.0)
         log = log_of(serial)
         check("E. apt update 如实报未启用（不假装成功）", "当前未启用" in log)
+
+        # ==================== ★ v0.10.3：zstd + symlink ====================
+        # F. 装"真 zstd"的 .deb（control.tar.zst + data.tar.zst，且带两条符号链接）
+        #    判据绑在**这次** run 的切片上：run ok + 进程 exit 0 + 四条串口硬证据。
+        before_ok2 = log.count("[TERM] cmd run ok")
+        seg_i2 = len(log_of(serial))
+        P.type_line(mon, "run /usr/bin/dpkg -i /usr/share/dpkg/test-zstd-2.0.deb")
+        pid2 = None
+        code0b = False
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            lg = log_of(serial)
+            seg = lg.find("[TERM] run argv path=/usr/bin/dpkg argc=3", seg_i2 - 1)
+            ps = re.findall(r"\[PROC64\] create pid=(\d+) name=run", lg[seg:]) if seg >= 0 else []
+            pid2 = pid2 or (ps[0] if ps else None)
+            code0b = pid2 is not None and ("[PROC64] exit pid=%s code=0" % pid2) in lg
+            if code0b and lg.count("[TERM] cmd run ok") > before_ok2:
+                break
+            time.sleep(3.0)
+        lg2 = log_of(serial)
+        segz = lg2[seg_i2:]
+        want = [
+            "deb compression control=zst data=zst",
+            "deb zstd member=control.tar.zst",
+            "deb zstd member=data.tar.zst",
+            "deb stats files=3 dirs=5 links=2",
+            "install link path=/usr/bin/vimtu-zstd-link target=../share/vimtu-zstd-test/hello.txt",
+            "install link path=/usr/share/vimtu-zstd-test/abs-link target=/usr/share/vimtu-zstd-test/hello.txt",
+        ]
+        miss = [w for w in want if w not in segz]
+        check("F. zstd .deb 装成功（run ok + exit 0 + zstd/symlink 硬证据齐）",
+              lg2.count("[TERM] cmd run ok") > before_ok2 and code0b and not miss,
+              "run_ok %d->%d  pid=%s exit0=%s  缺=%s"
+              % (before_ok2, lg2.count("[TERM] cmd run ok"), pid2, code0b, miss))
+
+        # G/H. 两条符号链接都要能读到内容（相对 / 绝对两种解析路径）
+        for tag, path in (("G. 相对符号链接 /usr/bin/vimtu-zstd-link 可读",
+                           "/usr/bin/vimtu-zstd-link"),
+                          ("H. 绝对符号链接 /usr/share/vimtu-zstd-test/abs-link 可读",
+                           "/usr/share/vimtu-zstd-test/abs-link")):
+            P.type_line(mon, "cat %s" % path)
+            mc2 = None
+            deadline = time.time() + 30
+            pat = re.compile(r"\[TERM\] cmd cat path=%s bytes=(\d+)" % re.escape(path))
+            while time.time() < deadline and mc2 is None:
+                mc2 = pat.search(log_of(serial))
+                if mc2 is None:
+                    time.sleep(1.0)
+            check(tag, mc2 is not None and int(mc2.group(1)) > 0,
+                  "bytes=%s" % (mc2.group(1) if mc2 else "缺证据行"))
+
+        # I. 状态文件里现在有两个包
+        P.type_line(mon, "run /usr/bin/dpkg -l")
+        dl2 = None
+        deadline = time.time() + 60
+        while time.time() < deadline and dl2 is None:
+            lg = log_of(serial)
+            seg_l = lg.find("[TERM] run argv path=/usr/bin/dpkg argc=2 a1=-l", seg_i2)
+            if seg_l >= 0:
+                ps = re.findall(r"\[PROC64\] create pid=(\d+) name=run", lg[seg_l:])
+                if ps and ("[PROC64] exit pid=%s code=0" % ps[0]) in lg and \
+                   "vimtu-zstd-test" in lg[seg_l:]:
+                    dl2 = ps[0]
+            if dl2 is None:
+                time.sleep(1.5)
+        check("I. dpkg -l 同时列出两个包（zust 包也进了状态文件）", dl2 is not None,
+              "pid=%s" % dl2)
 
         print("===== RESULT: %s =====" % ("PASS" if ok else "FAIL"))
     finally:

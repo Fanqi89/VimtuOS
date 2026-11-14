@@ -57,13 +57,14 @@ VSFLAGS="$CFLAGS_COMMON $CFLAGS_NOSSE -Os -I third_party/lzma"
 $CC $VSFLAGS -c user/store/vs_io.c   -o "$OBJ/vs_io.c.o"
 $CC $VSFLAGS -c user/store/vs_gzip.c -o "$OBJ/vs_gzip.c.o"
 $CC $VSFLAGS -c user/store/vs_xz.c   -o "$OBJ/vs_xz.c.o"
+$CC $VSFLAGS -c user/store/vs_zstd.c -o "$OBJ/vs_zstd.c.o"
 $CC $VSFLAGS -c user/store/vs_pkg.c  -o "$OBJ/vs_pkg.c.o"
 # ★ vendored 解码核（third_party/lzma：Igor Pavlov，public domain；见那里的 README/LICENSE）：
 #   编进 /bin/vpkg，用 -w 关掉上游代码的风格告警（本仓库自己的文件仍然 -Wall -Wextra -Werror）。
 VWFLAGS="$VSFLAGS -w"
 $CC $VWFLAGS -c third_party/lzma/LzmaDec.c  -o "$OBJ/lzma-LzmaDec.c.o"
 $CC $VWFLAGS -c third_party/lzma/Lzma2Dec.c -o "$OBJ/lzma-Lzma2Dec.c.o"
-VS_OBJS="$OBJ/vs_io.c.o $OBJ/vs_gzip.c.o $OBJ/vs_xz.c.o $OBJ/vs_pkg.c.o \
+VS_OBJS="$OBJ/vs_io.c.o $OBJ/vs_gzip.c.o $OBJ/vs_xz.c.o $OBJ/vs_zstd.c.o $OBJ/vs_pkg.c.o \
  $OBJ/lzma-LzmaDec.c.o $OBJ/lzma-Lzma2Dec.c.o"
 # ---- GUI 版（-DVS_STORE_GUI **不编** deb 的 inflate/ar/tar/xz）——★ 全部用 -Os：
 #   256x60 窗口 + stb_truetype（font64）已经把 64 KiB 主程序装载区吃满，只能靠体积换功能。
@@ -76,7 +77,7 @@ VS_OBJS_GUI="$OBJ/gui-vs_io.c.o $OBJ/gui-vs_gzip.c.o $OBJ/gui-vs_pkg.c.o"
 
 # ---- ① /bin/vpkg（命令行）----
 $CC $CFLAGS_COMMON $CFLAGS_NOSSE -Os -c user/store/vpkg.c -o "$OBJ/vpkg.o"
-$LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/store/store64.ld \
+$LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/store/vpkg64.ld \
     -o "$BUILD/vpkg.elf" $OBJ/vpkg.o $VS_OBJS $LIB_OBJS
 
 # ---- ② /bin/store（GUI：合成器客户端 + font64；-Os 换体积）----
@@ -96,8 +97,11 @@ $LD -m elf_x86_64 -static --gc-sections -z noexecstack -T user/apps/evshm_demo.l
 PYBIN="${PY:-py -3}"
 # ---- 自检：静态 ELF64 + PT_LOAD 落在 4GiB..4GiB+64KiB + 入口在段内 ----
 $PYBIN - "$BUILD/vpkg.elf" "$BUILD/store.elf" "$BUILD/demo_cli.elf" "$BUILD/demo_gui.elf" <<'PYEOF'
-import struct, sys
+import os, struct, sys
 lo, hi = 0x100000000, 0x100000000 + 0x10000
+# ★ v0.10.3: /bin/vpkg 走大映像基址（user/store/vpkg64.ld, 4GiB+576KiB）。
+#   两个窗口都是 kernel/elf64.cpp 真实支持的边界，按产物名分档断言。
+BIGLO, BIGHI = 0x100090000, 0x100000000 + 998 * 1024 * 1024
 for path in sys.argv[1:]:
     d = open(path, "rb").read()
     assert d[:4] == b"\x7fELF" and d[4] == 2 and d[5] == 1, "%s 不是 ELF64 小端" % path
@@ -114,7 +118,11 @@ for path in sys.argv[1:]:
         msz = struct.unpack_from("<Q", d, o + 40)[0]
         assert t not in (2, 3), "%s 出现 PT_DYNAMIC/PT_INTERP" % path
         if t == 1:
-            assert lo <= va and va + msz <= hi, \
+            if os.path.basename(path).startswith("vpkg"):
+                wlo, whi = BIGLO, BIGHI
+            else:
+                wlo, whi = lo, hi
+            assert wlo <= va and va + msz <= whi, \
                 "%s PT_LOAD 越出主程序装载区（va=%#x msz=%#x <= %#x）" % (path, va, msz, hi - lo)
             segs.append((va, msz, fl))
     ent = struct.unpack_from("<Q", d, 24)[0]
@@ -133,9 +141,10 @@ for path in sys.argv[1:]:
     bad = sorted(wp & xp)
     assert not bad, "%s 有页同时 W 与 X（W^X 被破坏）page=%#x" % (path, bad[0] * 4096)
     assert len(d) <= 96 * 1024, "%s 超过内核读盘缓冲 96 KiB" % path
-    print("    %-42s %7d B  PT_LOAD=%d memsz=%d B（装载区 <= 65536）"
+    print("    %-42s %7d B  PT_LOAD=%d memsz=%d B（窗口见上）"
           % (path.replace("\\", "/"), len(d), len(segs), sum(s[1] for s in segs)))
-    assert sum(s[1] for s in segs) <= 0x10000, "%s PT_LOAD memsz 超过 64 KiB" % path
+    _cap = (BIGHI - BIGLO) if os.path.basename(path).startswith("vpkg") else 0x10000
+    assert sum(s[1] for s in segs) <= _cap, "%s PT_LOAD memsz 超过 64 KiB" % path
 PYEOF
 
 echo "==> ★ 应用商店/包管理器：四个产物都在 build64/store/（不内嵌内核；由 tools/store_pack_win.py 装卷）"
