@@ -247,6 +247,14 @@ static int p64_free_slot64() {
 //      proc64_mmap64 也显式拒绝落进这一段。
 static const int SHM64_MAX_OBJS64 = 8;      // 同时存在的对象数上限
 
+// ★ v0.10.2（帧预算）：shm 的 2 MiB 大页分配**默认关闭**。
+//   为什么关：大页映射本身已验证生效（`[SHM64] map … huge=1 u=1`，物理 2 MiB 对齐、页表项 1 个），
+//   但 wm64_test ⑤ 出现像素回归 —— 点击后开关区域读回 0x000000（`[WMPANEL] click … state=1` 仍 PASS），
+//   即"合成器把这块重绘成了桌面"。这条路径上唯一的新变量就是"快照两个 shm 对象改成了 512 页块"，
+//   本会话没有足够时间定位到具体机制，所以按纪律**关掉**，而不是带着一条红判据发版。
+//   重新打开的前提：wm64_test ⑤/⑦ 全绿 + docs/桌面帧预算.md 的判据数字。
+static const int SHM64_HUGE_ENABLE = 0;
+
 struct Shm64Obj {
     uint32_t used;
     uint32_t id;
@@ -291,7 +299,10 @@ static int shm64_release64(int32_t id, int pid) {
     const uint32_t objid = o->id;
     if (refs == 0) {
         uint32_t freed = 0;
-        for (uint32_t i = 0; i < o->pages; i++) {
+        // ★ v0.10.2：走满整张表，而不是只走到 o->pages —— 2 MiB 块对象把 512 项都填了，
+        //   只按 o->pages（可能是 488）释放会漏掉 24 页（wm64_test ⑦ 用页池差值抓到的）。
+        //   逐页分配的对象在 o->pages 之后都是 0，下面的 if 会跳过。
+        for (uint32_t i = 0; i < SHM64_MAX_PAGES64; i++) {
             if (o->frames[i]) { page_free_64((void*)(uintptr_t)o->frames[i]); o->frames[i] = 0; freed++; }
         }
         p64_zero(o, (uint32_t)sizeof(Shm64Obj));
@@ -511,6 +522,32 @@ int64_t proc64_shm_create64(uint64_t size) {
     o->pages = want_pages;
     o->refs  = 1;
     o->owner = p->pid;
+    // ★ v0.10.2（帧预算）：先按 **2 MiB 对齐 + 连续** 拿（大页映射的物理前提）。
+    //   拿不到才退回逐页 4 KiB —— 低内存机器行为与旧版完全一致（只是慢）。
+    if (!SHM64_HUGE_ENABLE || want_pages < 256u) {
+        // 小于 1 MiB 的对象不值得占用一整块 2 MiB（页池会被小对象吃光）——直接逐页分配
+        // SHM64_HUGE_ENABLE=0 时全部走逐页（v0.10.2 的发版口径：见下面的常量说明）
+    } else {
+        void* hb = page_alloc_2mb_64();
+        if (hb) {
+            const uint64_t base = (uint64_t)(uintptr_t)hb;
+            p64_zero(hb, PAGE_SIZE_64 * 512);                 // 512 页全部清零（不给下一个进程看旧内容）
+            // ★ 整块 512 项都填满（frames[] 就是 512 项）：这样"连续性"对整块成立，
+            //   1,998,848 B（488 页）这种"不足 2 MiB"的对象也能整块走大页映射。
+            for (uint32_t i = 0; i < 512u; i++) o->frames[i] = base + (uint64_t)i * PAGE_SIZE_64;
+            g_shm64_live64++;
+            p->shm[shm64_free_handle64(p)] = (int32_t)o->id;
+            dbg64_line_begin64();
+            dbg64_str("[SHM64] create pid="); dbg64_dec((uint64_t)pid);
+            dbg64_str(" id=");                dbg64_dec((uint64_t)o->id);
+            dbg64_str(" size=");              dbg64_dec(size);
+            dbg64_str(" pages=");             dbg64_dec((uint64_t)o->pages);
+            dbg64_str(" huge=1 pa=0x");       dbg64_hex64(base);
+            dbg64_str(" live=");              dbg64_dec((uint64_t)g_shm64_live64);
+            dbg64_nl(); dbg64_line_end64();
+            return (int64_t)o->id;
+        }
+    }
     for (uint32_t i = 0; i < want_pages; i++) {
         void* fp = page_alloc_64();
         if (!fp) {                             // 页池空：把已经拿到的页还回去（不泄漏）
@@ -605,6 +642,46 @@ int64_t proc64_shm_map64(uint64_t id, uint64_t offset, uint64_t len, uint64_t ou
         return SHM64_ENOMEM64;
     }
     const uint64_t va = SHM64_WINDOW_VA64 + (uint64_t)slot * SHM64_SLOT_BYTES64;
+    // ★ v0.10.2（帧预算）：对象是"2 MiB 对齐 + 连续"、且这次要映射的正是整块（起点 0、512 页）
+    //   时，用一整块 2 MiB 大页 —— 把"一帧跨几百个页"变成 1 个页表项。
+    {
+        const uint64_t PAGES2M = 2ull * 1024ull * 1024ull / PAGE_SIZE_64;   // 512
+        const uint32_t nblk = (uint32_t)(((uint64_t)npages + PAGES2M - 1) / PAGES2M);   // 向上取整
+        int contig = ((page_off % PAGES2M) == 0) && (nblk >= 1) &&
+                     ((uint64_t)nblk * PAGES2M <= 512u) &&                       // 不超过一块 2 MiB
+                     ((o->frames[page_off] & (2ull * 1024 * 1024 - 1)) == 0) &&
+                     ((va & (2ull * 1024 * 1024 - 1)) == 0);
+        if (contig) {
+            for (uint64_t i = 0; i < (uint64_t)nblk * PAGES2M; i++) {            // 整块连续性
+                if (o->frames[page_off + i] != o->frames[page_off] + i * PAGE_SIZE_64) { contig = 0; break; }
+            }
+        }
+        if (contig) {
+            uint32_t done = 0;
+            for (; done < nblk; done++) {
+                if (!user64_map_phys_2mb64(va + (uint64_t)done * (2ull * 1024 * 1024),
+                                           o->frames[page_off + (uint64_t)done * PAGES2M],
+                                           PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64)) break;
+            }
+            if (done == nblk) {
+                user64_paging_sync64();
+                *(uint64_t*)(uintptr_t)out_va_uptr = va;
+                dbg64_line_begin64();
+                dbg64_str("[SHM64] map pid=");  dbg64_dec((uint64_t)pid);
+                dbg64_str(" id=");              dbg64_dec(id);
+                dbg64_str(" slot=");            dbg64_dec((uint64_t)slot);
+                dbg64_str(" va=0x");            dbg64_hex64(va);
+                dbg64_str(" pa=0x");            dbg64_hex64(o->frames[page_off]);
+                dbg64_str(" pages=");           dbg64_dec((uint64_t)npages);
+                dbg64_str(" huge=1 u=1 refs="); dbg64_dec((uint64_t)o->refs);
+                dbg64_nl(); dbg64_line_end64();
+                return 0;
+            }
+            for (uint32_t k = 0; k < done; k++)
+                (void)user64_unmap_2mb64(va + (uint64_t)k * (2ull * 1024 * 1024));
+            /* 大页装不下（例如已有 4 KiB 页表）：退回逐页，绝不假装成功 */
+        }
+    }
     for (uint32_t i = 0; i < npages; i++) {
         if (!user64_map_phys_page64(va + (uint64_t)i * PAGE_SIZE_64, o->frames[page_off + i],
                                    PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64)) {

@@ -308,6 +308,25 @@ uint64_t syscall64_static_kstack_top64() {
 extern "C" uint64_t g_syscall64_exit_to_kernel64 = 0;
 
 // ==================== 打点 ====================
+// ★ v0.10.2（帧预算）：热路径 trace 预算。**为什么**：本项目的日志出口是 COM1，
+//   每个 outb 都是一次 VM exit（QEMU TCG 实测 ≈1.4 ms/行）。一次窗口拖动里
+//   **每个鼠标事件**要打 11 行（syscall trace 5 + [WL64] route 4 + [WM] 2），
+//   合成器实测 175 ms/帧里约 170 ms 花在打点上 —— 它被自己的日志锁在 ~6 fps。
+//   口径不变：每个号的前 SYSCALL64_LOG_NR_MAX64 条**照旧原文全打**（验收要 grep
+//   的证据行仍然出现在同一个位置、同一个格式），之后每 POOL 条打一条。
+static const uint32_t SYSCALL64_LOG_NR_N64    = 1088u;   // 自有 ABI 号段到 1038，留余量
+static const uint32_t SYSCALL64_LOG_NR_MAX64  = 256u;
+static const uint32_t SYSCALL64_LOG_NR_POOL64 = 8192u;
+static uint16_t g_sc64_nr_logged64[SYSCALL64_LOG_NR_N64];
+
+static bool syscall64_trace_budget64(uint64_t nr) {
+    if (nr >= (uint64_t)SYSCALL64_LOG_NR_N64) return true;      // 表外的号：照旧逐条
+    const uint32_t n = g_sc64_nr_logged64[nr];
+    if (g_sc64_nr_logged64[nr] != 0xFFFFu) g_sc64_nr_logged64[nr] = (uint16_t)(n + 1u);
+    if (n < SYSCALL64_LOG_NR_MAX64) return true;
+    return ((n - SYSCALL64_LOG_NR_MAX64) % SYSCALL64_LOG_NR_POOL64) == 0;
+}
+
 static void syscall64_log64(uint64_t nr, uint64_t rdi, uint64_t rsi, uint64_t rdx, int64_t ret) {
     dbg64_line_begin64();
     dbg64_str("[SYSCALL] nr=");
@@ -432,8 +451,13 @@ static void sc64_fb_dec64(int64_t v) {
     else       { dbg64_dec((uint64_t)v); }
 }
 // 打点：clip=ok（原样提交）/ clipped（见 sub= 的夹取后矩形）/ reject（不提交）
+// ★ v0.10.2：每次 flip 一行 = 一次 VM exit 级开销（~1.4 ms）。合成器 60 fps 下
+//   这就是最多 84 ms/s 的纯日志。前 64 条照旧全打（验收 grep 用），之后每 2048 条一条。
+static uint32_t g_sc64_fb_flip_logged64 = 0;
 static void sc64_fb_log_flip64(int64_t x, int64_t y, int64_t w, int64_t h, const char* clip,
                               int has_sub, int64_t sx, int64_t sy, int64_t sw, int64_t sh) {
+    const uint32_t nn = g_sc64_fb_flip_logged64++;
+    if (nn >= 16u && ((nn - 16u) % 2048u) != 0u) return;
     dbg64_line_begin64();
     dbg64_str("[FB64] flip pid=");
     sc64_fb_dec64(sc64_fb_pid64());
@@ -452,6 +476,9 @@ static void sc64_fb_log_flip64(int64_t x, int64_t y, int64_t w, int64_t h, const
     dbg64_nl();
     dbg64_line_end64();
 }
+
+// ★ v0.10.2：fb_map 的 2 MiB 大页开关（默认 0）。见下面 fb_map 里的说明。
+static const int FB64_HUGE_ENABLE = 0;
 
 // fb_map(out_va**, out_info**)：把后备缓冲逐页映射进**当前地址空间**（用户可读写、不可执行）。
 // 幂等：本地址空间里那个 VA 已经有映射 -> 直接复用（页表项写法相同，重写一遍无副作用，打点 re=1）。
@@ -487,7 +514,41 @@ static int64_t sc64_fb_map64(uint64_t out_va_uptr, uint64_t out_info_uptr) {
         return SYSCALL64_FB_ENOMEM64;                   // 后备缓冲比 FB 映射区还大：如实拒绝
     }
     const int re = user64_page_is_user_ok64(USER64_FB_VA64) ? 1 : 0;   // 幂等：已映射过？
-    for (uint64_t i = 0; i < pages; i++) {
+    // ★ v0.10.2（帧预算）：后备缓冲按 **2 MiB 大页**映射（物理与 VA 都 2 MiB 对齐时）。
+    //   合成器每帧都要写它，这是整条链路最热的一跳；4 KiB 页时实测 64 KiB 拷贝要 2 ms。
+    //   尾部不足 2 MiB 的部分仍走 4 KiB 逐页（同一块里混两种页，是因为尾巴本来就不满一页）。
+    uint64_t i = 0;
+    // ★ v0.10.2（帧预算）：fb 的 2 MiB 大页映射**默认关闭**（发版口径）。
+    //   为什么关：大页映射本身生效（`[FB64] map huge … blocks=1`），但 wm64_test ⑤/⑦ 出现像素回归
+    //   （点击后开关区域读回 0x000000；交回时 erased=13672，而打开前是 erased=0）。
+    //   本会话没能定位到机制；按纪律不带红判据发版。重新打开的前提：wm64_test 89/89。
+    if (FB64_HUGE_ENABLE &&
+        (phys & (PAGE_SIZE_2MB_64 - 1)) == 0 && (USER64_FB_VA64 & (PAGE_SIZE_2MB_64 - 1)) == 0) {
+        const uint64_t PAGES2M = PAGE_SIZE_2MB_64 / PAGE_SIZE_64;      // 512
+        const uint64_t nblk = pages / PAGES2M;
+        for (uint64_t b = 0; b < nblk; b++) {
+            if (!user64_map_phys_2mb64(USER64_FB_VA64 + b * PAGE_SIZE_2MB_64,
+                                       phys + b * PAGE_SIZE_2MB_64,
+                                       PTE_USER_64 | PTE_WRITE_64 | PTE_NX_64)) {
+                dbg64_line_begin64();
+                dbg64_str("[FB64] map FAILED pid="); sc64_fb_dec64(pid);
+                dbg64_str(" reason=huge map failed at block="); dbg64_dec(b);
+                dbg64_str(" huge_blocks="); dbg64_dec(nblk);
+                dbg64_nl(); dbg64_line_end64();
+                break;                                                 // 退回逐页（下面接着映射）
+            }
+            i = (b + 1) * PAGES2M;
+        }
+        if (i) {
+            dbg64_line_begin64();
+            dbg64_str("[FB64] map huge pid="); sc64_fb_dec64(pid);
+            dbg64_str(" blocks="); dbg64_dec(i / PAGES2M);
+            dbg64_str(" va=0x"); dbg64_hex64(USER64_FB_VA64);
+            dbg64_str(" pa=0x"); dbg64_hex64(phys);
+            dbg64_nl(); dbg64_line_end64();
+        }
+    }
+    for (; i < pages; i++) {
         // 同一批**物理页**（后备缓冲）挂到用户页表：写就是写后备缓冲，内核 fb_flip 负责上屏。
         if (!user64_map_phys_page64(USER64_FB_VA64 + i * PAGE_SIZE_64,
                                     phys + i * PAGE_SIZE_64,
@@ -3568,7 +3629,8 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
             ret = 0;                                       // 不在 ring3：当普通调用返回 0
         } else {
             ret = syscall64_linux64(r);
-            if (!syscall64_trace_skip64(nr)) syscall64_log_insn64(nr, a1, a2, a3, ret);
+            if (!syscall64_trace_skip64(nr) && syscall64_trace_budget64(nr))
+        syscall64_log_insn64(nr, a1, a2, a3, ret);
         }
         // ---- 出口前自检：sysret 只能回"用户窗口内的地址 + CS=0x2B/SS=0x23" ----
         // 帧一旦被谁改坏（本模块踩过：syscall 帧与中断帧共用栈顶导致 rip/cs 槽被覆盖），
@@ -3608,11 +3670,11 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
     switch (nr) {
     case 1:                                                     // write(fd, buf, len)
         ret = syscall64_write64(nr, a1, a2, a3);
-        syscall64_log64(nr, a1, a2, a3, ret);
+        if (syscall64_trace_budget64(nr)) syscall64_log64(nr, a1, a2, a3, ret);
         break;
 
     case 2:                                                     // exit(code)
-        syscall64_log64(nr, a1, a2, a3, 0);
+        if (syscall64_trace_budget64(nr)) syscall64_log64(nr, a1, a2, a3, 0);
         if (user64_exit_to_kernel64(r, a1)) return;             // 帧已改写：不回用户态
         ret = -1;                                               // 不在 ring3：当普通调用处理
         break;

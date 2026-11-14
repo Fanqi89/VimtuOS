@@ -9,6 +9,10 @@ struct BootInfo;
 // 物理页管理（4KB）
 void mem_init_64(const struct BootInfo* bi);
 void* page_alloc_64();
+// ★ v0.10.2（帧预算）：2 MiB **对齐且连续**的物理块（512 页），大页映射的硬件前提。
+//   拿不到就返回 nullptr（调用方退回逐页 4 KiB，行为与旧版一致）。
+void* page_alloc_2mb_64();
+void  page_free_2mb_64(void* base);
 void page_free_64(void* p);
 uint64_t page_count_total_64();
 uint64_t page_count_free_64();

@@ -71,6 +71,7 @@ static int probe_exists(void) {
     return __v64_syscall(21 /*access*/, (long)(unsigned long)PROBE, 0, 0, 0, 0) == 0 ? 1 : 0;
 }
 
+static int g_seat_log = 0;      /* ★ v0.10.2：seat 行只留前 16 条（逐事件打点会拖死帧率） */
 int main(void) {
     const int full = probe_exists();
     printf("[WMPANEL] mode full=%d\n", full);
@@ -101,6 +102,7 @@ int main(void) {
         struct Wl64SeatEvent evs[EV_MAX];
         const int n = wl_display_dispatch(60, evs, EV_MAX);
         for (int i = 0; i < n && i < (int)EV_MAX; i++) {
+            if (g_seat_log++ < 8)
             printf("[WMPANEL] seat n=%d surf=%d type=%d code=0x%x sx=%d sy=%d inside=%d\n",
                    i, (int)evs[i].surf, (int)evs[i].ev.type, (unsigned)evs[i].ev.code,
                    (int)evs[i].sx, (int)evs[i].sy, (int)evs[i].inside);

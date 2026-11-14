@@ -28,8 +28,14 @@
 #define BOOT_INFO_ADDR   0x1000ULL
 #define BOOT_MEM_MAP     0x2000ULL
 #define MEDIUM_DESC_ADDR 0x0F00ULL
-#define KERNEL_BYTES     (8000ULL * 512ULL)        // 4MB（KERNEL_SECTORS）
-#define PAYLOAD_BYTES    (8073ULL * 512ULL)        // system.img 大小
+// ★ v0.10.2（真机阻断修复）：这里原来写死 KERNEL_BYTES = 8000*512（4MB）、
+//   PAYLOAD_BYTES = 8073*512（4.13MB，v0.5.18 时代的 system.img 大小）。现在
+//   build64/system.img 是 57,343 扇区（29.3MB）、kernel64_os.bin 已经 3.3MB ——
+//   写死值会让 load_file **只读前 4.13MB**，介质描述符又只报 8073 扇区，
+//   于是 UEFI 装出来的盘主分区（LBA 32584 起）整块是零 -> "装完重启黑屏"。
+//   现在一律按文件真实大小读（SetPosition(END)/GetPosition），下面两个只是**上限**：
+#define KERNEL_MAX_BYTES   (46ULL * 1024 * 1024)   // 直映 PA 0..48MB 之内（内核在 1MB 起）
+#define PAYLOAD_MAX_BYTES  (32ULL * 1024 * 1024)   // 载荷暂存区 [0x04000000, 0x06000000)
 // ★ 内核搬高半区（与 kernel/linker64.ld 的链接基址一致）：
 //   虚拟 0xFFFFFFFF80000000 = 物理 0x100000（平铺装载地址），
 //   即 VA = KERNEL_VA_BASE + (PA - HIGH_KERNEL)。
@@ -89,6 +95,23 @@ static void ser_dec(u32 v) {
 }
 static void mem_zero(void* dst, u64 n) { u8* p = (u8*)dst; while (n--) *p++ = 0; }
 
+// ★ v0.10.2（真机）：屏幕输出。为什么必须加：本文件所有失败路径以前只打串口，
+//   而真机（U 盘 + 主板）上**没有串口**，于是"GOP 拿不到 / 载荷太大 / 内核打不开"
+//   在用户眼里就是纯黑屏、连一句提示都没有。这里用固件 ConOut 写一行字，
+//   再停机前让用户看得见原因（串口照旧同时写一份）。
+static EFI_SYSTEM_TABLE* g_st = 0;
+static void scr_str(const char* s) {
+    if (!g_st) return;
+    void* conout = g_st->ConOut;
+    if (!conout) return;
+    u16 buf[128];
+    int n = 0;
+    for (; s[n] && n < 120; n++) buf[n] = (u16)(unsigned char)s[n];
+    buf[n++] = '\r'; buf[n++] = '\n'; buf[n] = 0;
+    ((EFI_STATUS(EFIAPI*)(void*, u16*))(*(void**)((u8*)conout + 8)))(conout, buf);
+}
+static void scr_both(const char* s) { ser_str(s); ser_str("\n"); scr_str(s); }
+
 // BootInfo（与 bootinfo.h 布局一致）
 typedef struct {
     u32 magic; u32 lfb_addr; u16 width; u16 height; u8 bpp; u8 pad; u16 pitch;
@@ -115,7 +138,10 @@ static u8 g_map_buf[8192] __attribute__((aligned(8)));
 extern void efi_enter_kernel(u64 entry, u64 cr3) __attribute__((noreturn));
 // 把文件读满 want 字节到物理地址 dst（读不到的尾部清零）。
 // required=1：打不开/读失败就当错误（返回 0 且打点）；required=0：文件不存在属正常（返回 0，打一行提示）。
-static int load_file(EFI_FILE_PROTOCOL* root, const char* path, u64 dst, u64 want_bytes, int required) {
+// ★ v0.10.2：want_bytes 现在是**上限**，读多长由文件真实大小决定；
+//   返回实际读到的字节数（0 = 打不开/读失败/超过上限）。超过上限时打点 + 屏幕提示，
+//   绝不"静默截断"（截断 = 用户看到的是一块装不全的盘）。
+static u64 load_file(EFI_FILE_PROTOCOL* root, const char* path, u64 dst, u64 max_bytes, int required) {
     // ★ 文件名必须是 UTF-16（CHAR16）！EFI_FILE_PROTOCOL::Open 的 FileName 参数是 CHAR16*，
     //   早先这里直接传 ASCII 的 char[]，固件按 UTF-16 解释成乱码 -> EFI_NOT_FOUND
     //   （串口上表现为 "U:open fail KERNEL64.BIN"）。桩 boot/efi/stub.c 里踩过同一个坑，
@@ -132,38 +158,61 @@ static int load_file(EFI_FILE_PROTOCOL* root, const char* path, u64 dst, u64 wan
         else          { ser_str("U:missing "); ser_str(path); ser_str(" (optional, skipped)\n"); }
         return 0;
     }
+    // ---- 文件真实大小：SetPosition(END_OF_FILE) + GetPosition（UEFI 规范口径）----
+    u64 size = 0;
+    ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*, u64))f->SetPosition)(f, ~0ULL);
+    ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*, u64*))f->GetPosition)(f, &size);
+    ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*, u64))f->SetPosition)(f, 0);
+    ser_str("U:size "); ser_str(path); ser_str(" = "); ser_dec((u32)size); ser_str("\n");
+    if (size == 0) { scr_both("U:empty file"); ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*))f->Close)(f); return 0; }
+    if (size > max_bytes) {
+        ser_str("U:TOO BIG "); ser_str(path); ser_str(" need="); ser_dec((u32)size);
+        ser_str(" cap="); ser_dec((u32)max_bytes); ser_str("\n");
+        scr_both("U:image too big for the boot staging window");
+        ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*))f->Close)(f);
+        return 0;
+    }
     u64 off = 0;
-    while (off < want_bytes) {
-        u64 chunk = want_bytes - off;
+    while (off < size) {
+        u64 chunk = size - off;
         if (chunk > 0x100000) chunk = 0x100000;
         u64 got = chunk;
         s = ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*, u64*, void*))f->Read)(f, &got, (void*)(dst + off));
-        if (EFI_ERROR(s)) { ser_str("U:read err\n"); return 0; }
+        if (EFI_ERROR(s)) { scr_both("U:read error"); return 0; }
         if (got == 0) break;
         off += got;
         if (got < chunk) break;
     }
-    if (off < want_bytes) mem_zero((void*)(dst + off), want_bytes - off);
+    // 只把最后一个扇区的尾巴清零（介质描述符按扇区报数，尾部可能是脏字节）
+    const u64 tail = off & 511ULL;
+    if (tail) mem_zero((void*)(dst + off), 512ULL - tail);
     ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*))f->Close)(f);
     ser_str("U:loaded "); ser_str(path); ser_str(" bytes="); ser_dec((u32)off); ser_str("\n");
-    return 1;
+    return off;
 }
 
 EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* root) {
     ser_init();
+    g_st = st;                     // ★ v0.10.2：屏幕输出通道（真机无串口时的唯一提示）
     ser_str("\nU:==== Vimtu64 UEFI 引导（自研 BOOTX64.EFI + 平铺长模式引导器）====\n");
     EFI_BOOT_SERVICES* bs = st->BootServices;
 
     // KERNEL64.BIN 必须有（它是"这次要跑的内核"：安装介质上=安装程序内核，装好的盘上=系统内核）；
     // SYSTEM.IMG（安装载荷）只有安装介质才有 —— 装好的盘上没有它，此时跳过（系统内核不用载荷）。
-    if (!load_file(root, "KERNEL64.BIN", HIGH_KERNEL, KERNEL_BYTES, 1)) return 1;
-    const int have_payload = load_file(root, "SYSTEM.IMG", HIGH_PAYLOAD, PAYLOAD_BYTES, 0);
+    const u64 kernel_bytes = load_file(root, "KERNEL64.BIN", HIGH_KERNEL, KERNEL_MAX_BYTES, 1);
+    if (!kernel_bytes) { scr_both("U:KERNEL64.BIN missing or unreadable"); return 1; }
+    // SYSTEM.IMG 只有安装介质才有；装好的盘上没有它（返回 0 属正常，行为与 BIOS 裸盘一致）
+    const u64 payload_bytes = load_file(root, "SYSTEM.IMG", HIGH_PAYLOAD, PAYLOAD_MAX_BYTES, 0);
+    const int have_payload = (payload_bytes > 0);
 
     // GOP
     EFI_GRAPHICS_OUTPUT_PROTOCOL* gop = 0;
     EFI_STATUS s = ((EFI_STATUS(*)(EFI_GUID*, void*, void**))bs->LocateProtocol)(
         &gEfiGraphicsOutputProtocolGuid, 0, (void**)&gop);
-    if (EFI_ERROR(s) || !gop || !gop->Mode || !gop->Mode->Info) { ser_str("U:no GOP\n"); return 1; }
+    if (EFI_ERROR(s) || !gop || !gop->Mode || !gop->Mode->Info) {
+        scr_both("U:no GOP (this machine has no usable linear framebuffer)");
+        return 1;
+    }
     EFI_GOP_MODE_INFO* mi = gop->Mode->Info;
     ser_str("U:gop "); ser_dec(mi->HorizontalResolution); ser_str("x"); ser_dec(mi->VerticalResolution);
     ser_str(" fmt="); ser_dec(mi->PixelFormat);
@@ -188,7 +237,7 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
     bi->height      = (u16)mi->VerticalResolution;
     bi->bpp         = 32;
     bi->pitch       = (u16)(mi->PixelsPerScanLine * 4);
-    bi->kernel_size = (u32)KERNEL_BYTES;
+    bi->kernel_size = (u32)kernel_bytes;      // ★ v0.10.2：真实字节数（原来写死 4MB）
     bi->mode_num    = (u16)gop->Mode->Mode;
     bi->mode_list   = 0x7400;
     bi->edid_addr   = 0x7600;
@@ -344,7 +393,10 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
         if (have_payload) {
             *(u32*)(md + 8)  = (u32)HIGH_KERNEL;
             *(u32*)(md + 12) = (u32)HIGH_PAYLOAD;
-            *(u32*)(md + 16) = (u32)(PAYLOAD_BYTES / 512);
+            // ★ v0.10.2：按**真实字节数**换算扇区（向上取整）。原来写死 8073 扇区，
+            //   安装程序只拷 4.13MB —— 主分区整块丢失，装完重启黑屏。
+            *(u32*)(md + 16) = (u32)((payload_bytes + 511ULL) / 512ULL);
+            ser_str("U:payload sectors="); ser_dec((u32)((payload_bytes + 511ULL) / 512ULL)); ser_str("\n");
         } else {
             ser_str("U:medium desc kind=0 (no payload: installed disk)\n");
         }

@@ -216,6 +216,40 @@ void page_free_64(void* p) {
     irq_restore64(_if);
 }
 
+// ★ v0.10.2（帧预算）：2 MiB 对齐 + 512 页连续的物理块。
+//   为什么需要它：用户态 shm / 帧缓冲原来用 4 KiB 页映射，合成器一帧要跨几百个页
+//   （实测 4 KiB = 2 µs、64 KiB = 2.1 ms、4 MiB 整屏 = 519~565 ms）。2 MiB 大页把一个
+//   4 MiB 缓冲区压成 2 个页表项。硬件前提有两条：**物理地址 2 MiB 对齐**、**512 页连续**，
+//   所以这里专门按对齐扫描位图，而不是拿 page_alloc_64 拼。
+void* page_alloc_2mb_64() {
+    const uint64_t PAGES = 0x200000ull / MEM64_PAGE;              // 512
+    if (g_page_total < PAGES) return nullptr;
+    const uint64_t _if = irq_save64();
+    const uint64_t pad_bytes = (0x200000ull - (g_pool_base & 0x1FFFFFull)) & 0x1FFFFFull;
+    const uint64_t idx0 = pad_bytes / MEM64_PAGE;                  // 池内第一个 2 MiB 对齐页
+    for (uint64_t idx = idx0; idx + PAGES <= g_page_total; idx += PAGES) {
+        uint64_t k = 0;
+        while (k < PAGES && !bitmap_get64(idx + k)) k++;
+        if (k == PAGES) {
+            for (uint64_t j = 0; j < PAGES; j++) bitmap_set64(idx + j, true);
+            g_page_free -= PAGES;
+            irq_restore64(_if);
+            return (void*)(uintptr_t)(g_pool_base + idx * MEM64_PAGE);
+        }
+    }
+    irq_restore64(_if);
+    return nullptr;
+}
+
+void page_free_2mb_64(void* base) {
+    if (!base) return;
+    const uint64_t PAGES = 0x200000ull / MEM64_PAGE;
+    const uint64_t addr = (uint64_t)(uintptr_t)base;
+    if (addr & 0x1FFFFFull) return;                               // 不是 2 MiB 块首：不猜
+    for (uint64_t j = 0; j < PAGES; j++)
+        page_free_64((void*)(uintptr_t)(addr + j * MEM64_PAGE));
+}
+
 uint64_t page_count_total_64() { return g_page_total; }
 uint64_t page_count_free_64()  { return g_page_free; }
 

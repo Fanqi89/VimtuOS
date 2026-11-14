@@ -58,7 +58,10 @@
 #include "wmabi.h"
 
 #define WM_MAX_SURF     8
-#define WM_FRAME_MS     40u          /* 空闲轮询间隔（TCG 下每轮 8 次 export + poll，别太密） */
+#define WM_FRAME_MS     16u          /* ★ v0.10.2：空闲轮询 = 一帧预算（原来是 40 ms，
+                                      *   空闲时光标/窗口修复要等 40 ms 才跟得上） */
+#define WM_PACE_MS      16           /* 帧节拍目标：16 ms ≈ 62.5 Hz（PIT 250 Hz = 4 ms 粒度，
+                                      *   16 是最接近 60 Hz 的整数倍；每帧画完还早就把余量睡掉） */
 #define WM_PROBE        "/etc/wm_probe"   /* 与 kernel/wl64.cpp 的 WL64_WM_PROBE64 同一个文件 */
 #define WM_DEV_MIN_PX   4096u        /* 设备提交路径的阈值：64x64（本台都没有 virtio-gpu -> 恒 soft） */
 #define WM_FULL_MS      45000u       /* full 模式最长运行时间 */
@@ -100,6 +103,13 @@ static unsigned g_place_seq = 0;
 static int      g_seat = 1;                      /* 22 号给的座位 id（事件投递用） */
 static uint32_t g_frame_log = 0;                 /* [WM] frame 行的预算（纯修复帧不打，见下） */
 static const uint32_t WM_FRAME_LOG_MAX = 64u;
+/* ★ v0.10.2（帧预算）：拖动/路由/确认三处的逐事件打点预算。
+ *   为什么：本机日志出口是内核终端的 COM1，每行 ≈1.4 ms（QEMU TCG 实测），而拖动时
+ *   每个鼠标事件曾经要打 3 行（drag move / route / ack）+ 内核侧 8 行 —— 单帧 175 ms
+ *   里约 170 ms 是打点，合成器被自己的日志锁在 ~6 fps。证据口径不变：前 N 条原文照打。 */
+static uint32_t g_dragmove_log = 0;              /* [WM] drag move：前 12 条 */
+static uint32_t g_ack_log = 0;                   /* [WM] ack：前 16 条 */
+static const uint32_t WM_ROUTE_LOG_MAX = 16u;    /* 指针路由行（原来 240） */
 
 /* 背景快照（整屏像素）：2 个 shm 对象接力，0 = 没拿到（如实降级：不回填背景） */
 static unsigned char* g_bg[2];
@@ -155,6 +165,13 @@ static unsigned long long wm_us(unsigned long long tsc) {
 static int wm_min(int a, int b) { return a < b ? a : b; }
 static int wm_max(int a, int b) { return a > b ? a : b; }
 
+#define WM_BENCH "/etc/wm_bench"   /* ★ v0.10.2：验收基准只在有这个文件时跑（发版路径零副作用） */
+
+/* 探针：任意路径的 access(21) 探测（Linux 兼容路径）。 */
+static int wm_probe_named(const char* p) {
+    return __v64_syscall(21 /*access*/, (long)(unsigned long)p, 0, 0, 0, 0) == 0 ? 1 : 0;
+}
+
 /* 探针：/etc/wm_probe 存在 = full 模式（走 Linux 兼容路径的 access(21)）。 */
 static int wm_probe_exists(void) {
     return __v64_syscall(21 /*access*/, (long)(unsigned long)WM_PROBE, 0, 0, 0, 0) == 0 ? 1 : 0;
@@ -167,6 +184,19 @@ static void wm_union(int* x, int* y, int* w, int* h, int x2, int y2, int w2, int
     const int x0 = wm_min(*x, x2), y0 = wm_min(*y, y2);
     const int x1 = wm_max(*x + *w, x2 + w2), y1 = wm_max(*y + *h, y2 + h2);
     *x = x0; *y = y0; *w = x1 - x0; *h = y1 - y0;
+}
+
+/* ★ v0.10.2（帧预算）：本文件专用的 8 字节字拷贝。
+ *   为什么不改 user/lib/string.c：那份 libc 也会链进"原始 blob 区"里的 12 份演示程序，
+ *   而原始区是 1,799 扇区、**零扇区余量**（实测 921,536 B > 上限 921,088 B 会让整条构建
+ *   在 demo_pack 那一关口失败）。合成器的拷贝只影响 /lib/wm.elf（卷交付，不受该预算约束）。
+ *   也不用 rep movsb：QEMU TCG 对 REP 串操作是"每字节回一次 helper"，实测慢约 100 倍。 */
+static void* wm_copy(void* dst, const void* src, size_t n) {
+    unsigned char* d = (unsigned char*)dst;
+    const unsigned char* s = (const unsigned char*)src;
+    while (n >= 8) { *(unsigned long long*)d = *(const unsigned long long*)s; d += 8; s += 8; n -= 8; }
+    while (n--) *d++ = *s++;
+    return dst;
 }
 
 /* ---------------- 背景快照：整屏像素的读写（跨 2 个 shm 对象） ---------------- */
@@ -191,18 +221,33 @@ static int wm_bg_capture(void) {
     return n;
 }
 /* 用快照把一块矩形还原成"启动那一刻的桌面" */
+/* ★ v0.10.2（帧预算）：按行整段 memcpy，不再逐像素走 wm_bg_at()。
+ *   为什么：wm_bg_at 每像素要算一遍字节偏移、判一次"跨没跨 2 个 shm 对象"、再取一次基址；
+ *   一帧回填上万像素时这部分和真正的搬运一样贵。现在只在**对象边界**切一次段。 */
 static int wm_bg_restore(int x0, int y0, int x1, int y1) {
     if (!g_have_bg) return 0;
     int n = 0;
+    int cx0 = x0 < 0 ? 0 : x0;
+    int cx1 = x1 > (int)g_fb.width ? (int)g_fb.width : x1;
+    if (cx0 >= cx1) return 0;
     for (int sy = y0; sy < y1; sy++) {
         if (sy < 0 || sy >= (int)g_fb.height) continue;
         uint32_t* drow = (uint32_t*)((unsigned char*)g_fbpx + (unsigned long)sy * g_fb.pitch);
-        for (int sx = x0; sx < x1; sx++) {
-            if (sx < 0 || sx >= (int)g_fb.width) continue;
-            const uint32_t* s = wm_bg_at(sx, sy);
-            if (!s) continue;
-            drow[sx] = *s;
-            n++;
+        int sx = cx0;
+        while (sx < cx1) {
+            const unsigned off = ((unsigned)sy * (unsigned)g_fb.width + (unsigned)sx) * 4u;
+            const int h = (off < WM_BG_OBJ_BYTES) ? 0 : 1;
+            const unsigned base = h ? WM_BG_OBJ_BYTES : 0u;
+            const unsigned seg = h ? (g_bg_need - base) : WM_BG_OBJ_BYTES;
+            if (off < base || off >= seg + base) break;        /* 偏移越界：如实放弃这一行 */
+            unsigned room = seg - (off - base);
+            unsigned want = (unsigned)(cx1 - sx) * 4u;
+            if (want > room) want = room;
+            if (want == 0) break;
+            wm_copy(drow + sx, g_bg[h] + (off - base), want);
+            const unsigned cnt = want / 4u;
+            n += (int)cnt;
+            sx += (int)cnt;
         }
     }
     return n;
@@ -245,12 +290,13 @@ static int wm_blit_slot(const struct WmSlot* self, int x0, int y0, int x1, int y
     int ax1 = wm_min(si->x + (int)si->w, x1), ay1 = wm_min(si->y + (int)si->h, y1);
     if (ax1 <= ax0 || ay1 <= ay0) return 0;
     const unsigned pitch_px = si->w;
+    const uint32_t* spx = (const uint32_t*)self->px;      /* ★ v0.10.2：uint32 下标代替逐像素指针算术 */
     int written = 0;
     for (int sy = ay0; sy < ay1; sy++) {
         uint32_t* drow = (uint32_t*)((unsigned char*)g_fbpx + (unsigned long)sy * g_fb.pitch);
-        const unsigned char* srow = self->px + (unsigned long)(sy - si->y) * (unsigned long)pitch_px * 4u;
+        const uint32_t* srow = spx + (unsigned long)(sy - si->y) * (unsigned long)pitch_px;
         for (int sx = ax0; sx < ax1; sx++) {
-            const uint32_t v = *(const uint32_t*)(srow + (unsigned long)(sx - si->x) * 4u);
+            const uint32_t v = srow[sx - si->x];
             const uint32_t a = (v >> 24) & 0xFFu;
             if (a == 0xFFu) {
                 drow[sx] = v;
@@ -259,9 +305,10 @@ static int wm_blit_slot(const struct WmSlot* self, int x0, int y0, int x1, int y
             } else {
                 const uint32_t d = drow[sx];
                 const uint32_t ia = 255u - a;
-                const uint32_t r = (((v >> 16) & 0xFFu) * a + ((d >> 16) & 0xFFu) * ia) / 255u;
-                const uint32_t gg = (((v >> 8) & 0xFFu) * a + ((d >> 8) & 0xFFu) * ia) / 255u;
-                const uint32_t b = ((v & 0xFFu) * a + (d & 0xFFu) * ia) / 255u;
+                /* /255 -> ((t * 257) + 257) >> 16：t <= 255*255 时与原式逐值相等，省 3 次除法 */
+                const uint32_t r = (((((v >> 16) & 0xFFu) * a + ((d >> 16) & 0xFFu) * ia) * 257u) + 257u) >> 16;
+                const uint32_t gg = (((((v >> 8) & 0xFFu) * a + ((d >> 8) & 0xFFu) * ia) * 257u) + 257u) >> 16;
+                const uint32_t b = ((((v & 0xFFu) * a + (d & 0xFFu) * ia) * 257u) + 257u) >> 16;
                 drow[sx] = 0xFF000000u | (r << 16) | (gg << 8) | b;
                 (*blended)++;
             }
@@ -271,10 +318,10 @@ static int wm_blit_slot(const struct WmSlot* self, int x0, int y0, int x1, int y
     return written;
 }
 
-/* 把一个脏矩形重新合成：① 用快照回填桌面 ② 按 id 升序（从下到上）重画所有窗口 */
-static int wm_paint_rect(struct WmSlot* slots, int x0, int y0, int x1, int y1, int* blended) {
+/* 把一个脏矩形重新合成：② 按 id 升序（从下到上）重画所有窗口（① 的快照回填在外面做，
+ * 这样可以分别计时：`[WM] frame .. bg_us=`）*/
+static int wm_blit_rect(struct WmSlot* slots, int x0, int y0, int x1, int y1, int* blended) {
     if (x1 <= x0 || y1 <= y0) return 0;
-    wm_bg_restore(x0, y0, x1, y1);
     int px = 0;
     int order[WM_MAX_SURF], n = 0;
     for (int i = 0; i < WM_MAX_SURF; i++) if (slots[i].used) order[n++] = i;
@@ -285,6 +332,11 @@ static int wm_paint_rect(struct WmSlot* slots, int x0, int y0, int x1, int y1, i
             }
     for (int a = 0; a < n; a++) px += wm_blit_slot(&slots[order[a]], x0, y0, x1, y1, blended);
     return px;
+}
+static int wm_paint_rect(struct WmSlot* slots, int x0, int y0, int x1, int y1, int* blended) {
+    if (x1 <= x0 || y1 <= y0) return 0;
+    wm_bg_restore(x0, y0, x1, y1);
+    return wm_blit_rect(slots, x0, y0, x1, y1, blended);
 }
 
 int main(void) {
@@ -353,6 +405,52 @@ int main(void) {
                 printf("[WM] bg FAILED reason=shm need=%d cap=%d\n", (int)g_bg_need, (int)cap);
             }
         }
+        /* ★ v0.10.2（帧预算）：验收基准（每次启动一行）。
+           判据：整屏 4 MiB 快照回填 bgfull_us < 20,000 µs。
+           4 KiB 页时实测 519,000~565,000 µs（跨 1000 个页），2 MiB 大页后应为个位数毫秒。 */
+        if (g_have_bg && wm_probe_named(WM_BENCH)) {
+            static unsigned char b4k[4096];
+            unsigned long long c4k_min = ~0ULL, c4k_max = 0, bf_min = ~0ULL, bf_max = 0;
+            unsigned cks = 0;
+            int npx = 0;
+            for (int rep = 0; rep < 8; rep++) {
+                unsigned long long t0 = wm_rdtsc();
+                wm_copy(b4k, g_bg[0], sizeof(b4k));
+                const unsigned long long d = wm_us(wm_rdtsc() - t0);
+                if (d < c4k_min) c4k_min = d;
+                if (d > c4k_max) c4k_max = d;
+                cks += b4k[rep];
+                t0 = wm_rdtsc();
+                npx = wm_bg_restore(0, 0, (int)g_fb.width, (int)g_fb.height);
+                const unsigned long long d2 = wm_us(wm_rdtsc() - t0);
+                if (d2 < bf_min) bf_min = d2;
+                if (d2 > bf_max) bf_max = d2;
+            }
+            printf("[WM] bench bgfull_px=%d bgfull_us_min=%lu bgfull_us_max=%lu "
+                   "copy4k_us_min=%lu copy4k_us_max=%lu cks=%u\n",
+                   npx, (unsigned long)bf_min, (unsigned long)bf_max,
+                   (unsigned long)c4k_min, (unsigned long)c4k_max, cks);
+            /* ★ 足迹扫描（每档 6 次取最小）：4 KiB / 64 KiB / 256 KiB / 1 MiB / 3 MiB。
+               目的：把"每 MB 成本随足迹超线性"这件事钉在证据上（见 docs/桌面帧预算.md）。 */
+            {
+                static const unsigned kSz[5] = { 4096u, 65536u, 262144u, 1048576u, 3145728u };
+                unsigned c4[5];
+                unsigned sum = 0;
+                for (int k = 0; k < 5; k++) {
+                    unsigned long long best = ~0ULL;
+                    for (int rep = 0; rep < 6; rep++) {
+                        const unsigned long long s0 = wm_rdtsc();
+                        wm_copy(g_fbpx, g_bg[0], kSz[k]);      /* 快照 -> 帧缓冲（真实路径的方向） */
+                        const unsigned long long d = wm_us(wm_rdtsc() - s0);
+                        if (d < best) best = d;
+                        sum += g_fbpx[rep];
+                    }
+                    c4[k] = (unsigned)best;
+                }
+                printf("[WM] bench scale us_4k=%u us_64k=%u us_256k=%u us_1m=%u us_3m=%u cks=%u\n",
+                       c4[0], c4[1], c4[2], c4[3], c4[4], sum);
+            }
+        }
         printf("[WM] policy region=full drag_bar=%d place=center+cascade repair_ms=%d bg=%d\n",
                WM_DRAG_BAR, (int)WM_REPAIR_MS, g_have_bg);
     }
@@ -372,6 +470,7 @@ int main(void) {
         int n_used = 0, n_pending = 0;
         int dmg_x = 0, dmg_y = 0, dmg_w = 0, dmg_h = 0;
         int layout = 0;
+        int painted_this_iter = 0;      /* ★ v0.10.2：本轮的 ⑨ 是否已经画过一帧 */
 
         /* ---- ⑤ 拉 surface 表（23 号）：谁有缓冲、谁提交了、damage 多大 ---- */
         for (int i = 0; i < WM_MAX_SURF; i++) {
@@ -503,9 +602,12 @@ int main(void) {
 
         if (dmg_w > 0 && dmg_h > 0) {
             /* ---- ⑨ 用户态合成：快照回填 + 从下到上 blit ---- */
+            const unsigned long long t_bg = wm_rdtsc();
+            const int bgpx = wm_bg_restore(dmg_x, dmg_y, dmg_x + dmg_w, dmg_y + dmg_h);
+            const unsigned long long bg_us = wm_us(wm_rdtsc() - t_bg);
             const unsigned long long t_c0 = wm_rdtsc();
             int blend = 0;
-            const int px = wm_paint_rect(slots, dmg_x, dmg_y, dmg_x + dmg_w, dmg_y + dmg_h, &blend);
+            const int px = wm_blit_rect(slots, dmg_x, dmg_y, dmg_x + dmg_w, dmg_y + dmg_h, &blend);
             const unsigned long long us = wm_us(wm_rdtsc() - t_c0);
 
             const int use_dev = 0;      /* 22 号的 gpu 位为 0 -> 恒 soft，如实写 */
@@ -514,15 +616,24 @@ int main(void) {
             const unsigned long long flip_us = wm_us(wm_rdtsc() - t_f0);
             n_frame++;
             painted_any = 1;
+            painted_this_iter = 1;
             last_repair_ms = now_ms;
             /* ★ 只给"有内容变化"的帧留证：纯修复帧（每 150 ms 一次，没有任何客户端提交）不打 ——
              *   每一行都会让 ring0 终端滚动重绘一次，几百行就把客户机拖到 1 fps，进而把夹具的
              *   光标闭环反馈拖死（实测）。layout / pending / 拖动中 / 第一帧 仍然照打。 */
-            if ((n_frame == 1 || layout || n_pending || g_drag_id) && g_frame_log < WM_FRAME_LOG_MAX) {
-                g_frame_log++;
-                printf("[WM] frame n=%lu surfs=%d pending=%d dirty=%d,%d,%d,%d px=%d blend=%d us=%lu flip_us=%lu path=%s full=%d foreign=0\n",
+            const int want_frame_log = (n_frame == 1 || layout || n_pending || g_drag_id);
+            g_frame_log++;
+            /* 前 WM_FRAME_LOG_MAX 帧逐帧留证；之后每 16 帧一条（60 fps 下 ~4 行/秒） */
+            const int do_frame_log = want_frame_log &&
+                (g_frame_log <= WM_FRAME_LOG_MAX || (g_frame_log & 15u) == 0u);
+            if (do_frame_log) {
+                printf("[WM] frame n=%lu surfs=%d pending=%d dirty=%d,%d,%d,%d px=%d blend=%d us=%lu flip_us=%lu path=%s full=%d foreign=0 bg_us=%lu t_ms=%lu\n",
                        n_frame, n_used, n_pending, dmg_x, dmg_y, dmg_w, dmg_h, px, blend,
-                       (unsigned long)us, (unsigned long)flip_us, use_dev ? "dev" : "soft", layout ? 1 : 0);
+                       (unsigned long)us, (unsigned long)flip_us, use_dev ? "dev" : "soft", layout ? 1 : 0,
+                       (unsigned long)bg_us, (unsigned long)(vimtu64_ticks() * 4));
+                if (g_frame_log <= WM_FRAME_LOG_MAX)
+                    printf("[WM] bg px=%d bg_us=%lu us=%lu flip_us=%lu\n",
+                           bgpx, (unsigned long)bg_us, (unsigned long)us, (unsigned long)flip_us);
             }
             if (frc != 0) printf("[WM] frame flip rc=%d\n", frc);
             if (n_frame == 1)
@@ -532,7 +643,7 @@ int main(void) {
             for (int i = 0; i < WM_MAX_SURF; i++) {
                 if (!slots[i].used) continue;
                 if (!(slots[i].info.flags & V64_WM_PENDING)) continue;
-                if (wl_surface_ack(slots[i].info.id) == 0)
+                if (wl_surface_ack(slots[i].info.id) == 0 && g_ack_log++ < 16u)
                     printf("[WM] ack id=%d dmg=%d,%d,%d,%d\n", slots[i].info.id,
                            slots[i].info.dmg_x, slots[i].info.dmg_y,
                            slots[i].info.dmg_w, slots[i].info.dmg_h);
@@ -603,8 +714,9 @@ int main(void) {
                                     ds->info.x = nx;
                                     ds->info.y = ny;
                                     g_drag_moved++;
-                                    printf("[WM] drag move id=%d pos=%d,%d dx=%d dy=%d\n",
-                                           g_drag_id, nx, ny, nx - ox, ny - oy);
+                                    if (g_dragmove_log++ < 12u)
+                                      printf("[WM] drag move id=%d pos=%d,%d dx=%d dy=%d\n",
+                                             g_drag_id, nx, ny, nx - ox, ny - oy);
                                     /* 旧位置还给桌面 + 新位置重画 */
                                     wm_union(&dmg_x, &dmg_y, &dmg_w, &dmg_h,
                                              ox, oy, (int)ds->info.w, (int)ds->info.h);
@@ -646,7 +758,7 @@ int main(void) {
                         const int tpid = wl_seat_post(&se);
                         g_drag_posts++;
                         /* 只给**指针**事件留证（键盘是外壳的事，打出来只会把串口刷爆、拖死终端重绘） */
-                        if (!is_key && g_route_surf_logged < 240) {
+                        if (!is_key && g_route_surf_logged < WM_ROUTE_LOG_MAX) {
                             g_route_surf_logged++;
                             printf("[WM] route surf=%d pid=%d type=%d x=%d y=%d sx=%d sy=%d\n",
                                    (int)se.surf, tpid, (int)raw[i].type, (int)raw[i].x, (int)raw[i].y,
@@ -659,7 +771,7 @@ int main(void) {
                 }
             }
             /* 收到输入：外壳很可能刚把光标画进我们的窗口里 -> 立刻整窗重画一遍 */
-            if (got_any) {
+            if (got_any && !painted_this_iter) {
                 for (int i = 0; i < WM_MAX_SURF; i++) {
                     if (!slots[i].used) continue;
                     wm_union(&dmg_x, &dmg_y, &dmg_w, &dmg_h,
@@ -674,14 +786,26 @@ int main(void) {
                         (void)fb_flip(x0, y0, x1 - x0, y1 - y0);
                         n_frame++;
                         last_repair_ms = now_ms;
-                        printf("[WM] frame n=%lu surfs=%d pending=0 dirty=%d,%d,%d,%d px=%d blend=%d us=0 flip_us=0 path=soft full=0 foreign=0\n",
-                               n_frame, n_used, x0, y0, x1 - x0, y1 - y0, px2, blend2);
+                        printf("[WM] frame n=%lu surfs=%d pending=0 dirty=%d,%d,%d,%d px=%d blend=%d us=0 flip_us=0 path=soft full=0 foreign=0 input=1 t_ms=%lu\n",
+                               n_frame, n_used, x0, y0, x1 - x0, y1 - y0, px2, blend2,
+                               (unsigned long)(vimtu64_ticks() * 4));
                         wm_remember(slots);
                     }
                 }
             }
         }
-        if (!dmg_w && n_pending == 0) vimtu64_sleep_ms(WM_FRAME_MS);
+        /* ---- ⑬ 帧节拍：一帧画完还早 -> 把余量睡掉（4 ms 粒度）。
+         *   不做这件事的话，合成器会把 100% CPU 烧在轮询上（实测拖动时每 6 ms 就刷一帧），
+         *   既抢掉客户端的时间片，也让输入事件无法聚合到同一帧。 */
+        if (painted_this_iter && WM_PACE_MS > 0) {
+            const int spend_ms = (int)(vimtu64_ticks() * 4) - now_ms;
+            if (spend_ms >= 0 && spend_ms < WM_PACE_MS) {
+                const int left = (WM_PACE_MS - spend_ms) & ~3;
+                if (left > 0) vimtu64_sleep_ms((unsigned long)left);
+            }
+        } else if (!dmg_w && n_pending == 0) {
+            vimtu64_sleep_ms(WM_FRAME_MS);
+        }
     }
 
     /* ---- ⑫ 收工：把**我们画过的那些窗口矩形**用快照还原（不是整屏回填）。

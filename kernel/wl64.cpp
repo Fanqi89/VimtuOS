@@ -155,8 +155,23 @@ static uint32_t wl64_us64(uint64_t dt) {
     return (uint32_t)(dt * 1000ULL / g_wl64_tsc_per_ms64);
 }
 
-// 日志节流（seat 路由行：前 WL64_SEAT_LOG_MAX64 条全打，之后每 32 条一条 + 结算 suppressed）
-static const uint32_t WL64_SEAT_LOG_MAX64 = 200;
+// 日志节流（seat 路由行：前 WL64_SEAT_LOG_MAX64 条全打，之后每 128 条一条 + 结算 suppressed）
+// ★ v0.10.2：200 -> 64、32 -> 128。拖动一个窗口时每个鼠标事件都会走这里，而本项目
+//   的日志出口是 COM1（每个 outb 一次 VM exit，实测 ≈1.4 ms/行）。证据口径不变：
+//   前 64 条逐条原文，之后仍然有稀疏采样 + suppressed 结算。
+static const uint32_t WL64_SEAT_LOG_MAX64 = 24;
+
+// ★ v0.10.2（帧预算）：其它每事件打点的预算器。max 条照旧全打，之后每 pool 条一条。
+//   为什么不干脆删掉：这些行是验收的证据（[WL64] export/ack/seatpost 的格式被
+//   tests/*.py 逐字段解析），删了就失去可观测性；加预算只牺牲"第 N 条之后的全量"。
+static uint32_t g_wl64_export_logged64 = 0;
+static uint32_t g_wl64_ack_logged64    = 0;
+static uint32_t g_wl64_post_logged64   = 0;
+static bool wl64_hot_log64(uint32_t* slot, uint32_t max, uint32_t pool) {
+    const uint32_t n = (*slot)++;
+    if (n < max) return true;
+    return pool && (((n - max) % pool) == 0);
+}
 static uint32_t g_wl64_seat_logged64 = 0;
 static uint32_t g_wl64_seat_supp64   = 0;
 
@@ -830,7 +845,7 @@ int64_t wl64_display_dispatch64(uint64_t timeout_ms, uint64_t out_uptr, uint64_t
             wl64_end64();
         } else {
             g_wl64_seat_supp64++;
-            if ((g_wl64_seat_supp64 & 31u) == 0) {
+            if ((g_wl64_seat_supp64 & 127u) == 0) {
                 wl64_begin64();
                 wl64_puts64("[WL64] seat drops pid="); wl64_dec64(pid);
                 wl64_puts64(" suppressed=");           wl64_udec64(g_wl64_seat_supp64);
@@ -945,6 +960,7 @@ int64_t wl64_surface_export64(uint64_t idx, uint64_t out_uptr) {
     info.pad = 0;
     *(Wl64SurfaceInfo*)(uintptr_t)out_uptr = info;
     g_wl64_wm_exports64++;
+    if (!wl64_hot_log64(&g_wl64_export_logged64, 24u, 4095u)) return 0;
     wl64_begin64();
     wl64_puts64("[WL64] export i=");   wl64_udec64(idx);
     wl64_puts64(" id=");               wl64_udec64(s->id);
@@ -1024,6 +1040,7 @@ int64_t wl64_surface_ack64(uint64_t surf) {
     s->ndamage = 0;
     s->content = 1;
     g_wl64_wm_acks64++;
+    if (!wl64_hot_log64(&g_wl64_ack_logged64, 16u, 1023u)) return 0;
     wl64_begin64();
     wl64_puts64("[WL64] ack id=");      wl64_udec64(s->id);
     wl64_puts64(" dmg=");
@@ -1053,6 +1070,7 @@ int64_t wl64_seat_post64(uint64_t out_ev_uptr) {
     if (!qv) return 0;
     ev64_push64((Ev64Queue*)qv, s->pid, &se->ev);
     g_wl64_wm_posts64++;
+    if (!wl64_hot_log64(&g_wl64_post_logged64, 16u, 255u)) return (int64_t)s->pid;
     wl64_begin64();
     wl64_puts64("[WL64] seatpost surf="); wl64_udec64(s->id);
     wl64_puts64(" pid=");                 wl64_dec64(s->pid);

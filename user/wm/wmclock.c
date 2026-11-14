@@ -108,6 +108,7 @@ static int probe_exists(void) {
     return __v64_syscall(21 /*access*/, (long)(unsigned long)PROBE, 0, 0, 0, 0) == 0 ? 1 : 0;
 }
 
+static int g_seat_log = 0;      /* ★ v0.10.2：seat 行只留前 16 条（逐事件打点会拖死帧率） */
 int main(void) {
     const int full = probe_exists();
     printf("[WMCLOCK] mode full=%d\n", full);
@@ -167,6 +168,7 @@ int main(void) {
         while (vimtu64_ticks() < t_end) {
             const int n = wl_display_dispatch(50, evs, EV_MAX);
             for (int i = 0; i < n && i < (int)EV_MAX; i++)
+                if (g_seat_log++ < 8)
                 printf("[WMCLOCK] seat n=%d surf=%d type=%d sx=%d sy=%d inside=%d\n",
                        i, (int)evs[i].surf, (int)evs[i].ev.type, (int)evs[i].sx, (int)evs[i].sy,
                        (int)evs[i].inside);

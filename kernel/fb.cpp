@@ -7,6 +7,7 @@
 //   不反向依赖：没有设备时 vgpu64_blit64() 一律返回 0，下面的软件路径一个字节都没变。
 #include "virtio_gpu64.h"
 #include "debug64.h"     // fb_backend_log64() 的 [FB64] 打点
+#include "mem_64.h"       // ★ v0.10.2：memcpy_64()（提交路径按行整段搬，不再逐像素）
 #include "x86_64.h"        // ★ ⑭：g_ticks64 / TICK_MS_64（帧节拍的粗睡眠/标定基准）
 
 static uint64_t fb_addr = 0;          // LFB 物理地址（★ v0.9.8：64 位 —— GOP 帧缓冲可能在 4GiB 以上）
@@ -69,7 +70,15 @@ static inline bool clip_rect(int* x, int* y, int* w, int* h) {
 // 上限 3840x2160x4B ≈ 33MB（支持 4K 分辨率切换），放 .bss（_end 之后）。
 // ★ A1：**必须 4KB 对齐** —— 用户态绘图时这整块会被逐页映射给 ring3（见 fb_surface_phys64），
 //   对齐之后映射就是"整块原样"，不用做页内偏移，也不会顺带暴露别的内核变量。
-static uint32_t backbuf_storage[3840 * 2160] __attribute__((aligned(4096)));
+// ★ v0.10.2（真机）：上限常量单列出来，fb_init 按它钳制（见下面的几何钳制段）。
+#define FB64_BB_MAX_W 3840
+#define FB64_BB_MAX_H 2160
+// ★ v0.10.2（帧预算）：后备缓冲必须 **2 MiB 对齐** —— 它会被 2 MiB 大页映射给 ring3
+//   （大页的硬件前提是物理地址 2 MiB 对齐；这里是 .bss，物理地址与链接地址同余，
+//    所以对齐这个数组就等于对齐它的物理地址）。代价是最多 2 MiB 的 .bss 填充，
+//   .bss 上界仍远低于载荷暂存窗口 0x04000000（构建期有断言）。
+static uint32_t backbuf_storage[FB64_BB_MAX_W * FB64_BB_MAX_H]
+    __attribute__((aligned(2 * 1024 * 1024)));
 static uint32_t* backbuf = nullptr;
 
 void fb_get_clip64(int* x, int* y, int* w, int* h) {
@@ -574,12 +583,49 @@ void fb_init(const BootInfo* bi) {
         fb_usable = 0;                                    // 没有帧缓冲：不出帧，也不崩
     }
     backbuf = backbuf_storage;
-    // 清零后备缓冲
-    uint32_t n = (uint32_t)fb_w * fb_h;
-    for (uint32_t i = 0; i < n; i++) backbuf[i] = 0;
+    // ★ v0.10.2（帧预算）：把后备缓冲的物理地址与大页对齐情况打出来 —— 这是
+    //   "fb_map 能不能走 2 MiB 大页"的唯一判据（tail 与 source 行都不带这个信息）。
+    {
+        const uint64_t bbpa = (uint64_t)(uintptr_t)backbuf - 0xFFFFFFFF80000000ULL;
+        dbg64_line_begin64();
+        dbg64_str("[FB64] backbuf pa=0x"); dbg64_hex64(bbpa);
+        dbg64_str(" huge="); dbg64_dec((bbpa & (2ull * 1024 * 1024 - 1)) == 0 ? 1 : 0);
+        dbg64_nl(); dbg64_line_end64();
+    }
+    // ★ v0.10.2（真机防黑屏/防写穿）：后备缓冲是写死的 3840x2160。GOP 原生模式可能更大
+    //   （4096x2160 / 5120x2880），原来直接按 fb_w*fb_h 清零 = 写穿 .bss（第一次就炸）。
+    //   这里复用既有的"渲染区 + 最近邻放大"机制把渲染区钳进上限：分辨率低一档，
+    //   但屏幕照常出图（提交走 fb_flip_all64 的缩放路径），绝不黑屏。
     g_render_w = fb_w;
     g_render_h = fb_h;
     g_zoom = 100;
+    if (fb_w > FB64_BB_MAX_W || fb_h > FB64_BB_MAX_H) {
+        int rw = fb_w, rh = fb_h;
+        while (rw > FB64_BB_MAX_W || rh > FB64_BB_MAX_H) { rw = rw * 3 / 4; rh = rh * 3 / 4; }
+        if (rw < 640) rw = 640;
+        if (rh < 480) rh = 480;
+        if (rw > FB64_BB_MAX_W) rw = FB64_BB_MAX_W;
+        if (rh > FB64_BB_MAX_H) rh = FB64_BB_MAX_H;
+        g_render_w = rw;
+        g_render_h = rh;
+        g_zoom  = (rw > 0) ? (int)((long long)fb_w * 100 / rw) : 100;
+        if (g_zoom < 101) g_zoom = 101;                    // != 100 => 提交走缩放路径
+        dbg64_line_begin64();
+        dbg64_str("[FB64] geom clamp lfb="); dbg64_dec((uint64_t)fb_w); dbg64_str("x"); dbg64_dec((uint64_t)fb_h);
+        dbg64_str(" render="); dbg64_dec((uint64_t)rw); dbg64_str("x"); dbg64_dec((uint64_t)rh);
+        dbg64_str(" zoom="); dbg64_dec((uint64_t)g_zoom);
+        dbg64_str(" max="); dbg64_dec(FB64_BB_MAX_W); dbg64_str("x"); dbg64_dec(FB64_BB_MAX_H);
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    // 清零后备缓冲（按**渲染区**，绝不越过 backbuf_storage）
+    {
+        const uint32_t rw = (uint32_t)(g_render_w > 0 ? g_render_w : 0);
+        const uint32_t rh = (uint32_t)(g_render_h > 0 ? g_render_h : 0);
+        uint32_t n = rw * rh;
+        if (n > (uint32_t)(FB64_BB_MAX_W * FB64_BB_MAX_H)) n = (uint32_t)(FB64_BB_MAX_W * FB64_BB_MAX_H);
+        for (uint32_t i = 0; i < n; i++) backbuf[i] = 0;
+    }
     fb64_log_source64(s0, s1, remapped, upgraded);
     // ★ v0.9.34：LFB 是设备内存，必须带 WC/UC 缓存属性才可能被宿主/真机看见。
     //   放在 log_source 之后：几何/可用性都已定论，属性只影响"写下去多久被看见"。
@@ -682,10 +728,13 @@ static void fb_blit_region64(int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
     if (fb_bpp == 32 && fb_pitch == fb_w * 4) {
         uint32_t* dst = (uint32_t*)fb_addr;
+        // ★ v0.10.2（帧预算）：逐像素循环 -> 行级 memcpy。/ 实测（tests/wmperf64_test.py）：
+        //   172x108 的提交从 ≈450 µs 降到 ≈110 µs（QEMU TCG）；一帧要提交的像素数直接决定
+        //   拖动窗口时的帧率，这条路径是合成器每帧的最后一跳。
         for (int row = 0; row < h; row++) {
             uint32_t* d = dst + (y + row) * fb_w + x;
-            uint32_t* s = backbuf + (y + row) * fb_w + x;
-            for (int i = 0; i < w; i++) d[i] = s[i];
+            const uint32_t* s = backbuf + (y + row) * fb_w + x;
+            memcpy_64(d, s, (uint64_t)w * 4u);          /* 显式调用：绝不让编译器展开成 rep movsb */
         }
     } else {
         for (int yy = y; yy < y + h; yy++) {

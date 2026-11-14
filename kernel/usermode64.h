@@ -197,6 +197,9 @@ int user64_run_fbdemo64(const void* blob, uint32_t size);
 int user64_run_fbdemo_capp64(const void* blob, uint32_t size);
 // 返回 1 = 成功；0 = 参数非法（未页对齐/越出用户区/撞大页）或页表页不足。
 int user64_map_phys_page64(uint64_t va, uint64_t phys, uint64_t leaf_flags);
+// ★ v0.10.2（帧预算）：2 MiB 大页（PD 项 PS=1，不建 PT）。va/phys 都必须 2 MiB 对齐。
+int user64_map_phys_2mb64(uint64_t va, uint64_t phys, uint64_t leaf_flags);
+int user64_unmap_2mb64(uint64_t va);
 // 跑"用户态绘图"演示（A1）：blob = user/fbdemo.asm 的平铺二进制（见 build64.sh）。
 //   演示期间 fb_kernel_paint64(0)：**内核侧不再绘制/提交**（屏幕只由用户程序画），
 //   无论用户程序是正常 exit 还是被 kill（回收路径）都会恢复。返回 user64_run_blob64 的值。

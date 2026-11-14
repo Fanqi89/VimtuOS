@@ -21,6 +21,7 @@
 """
 import argparse
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -172,6 +173,20 @@ def main():
           "U:loaded KERNEL64.BIN" in log and "U:high half check ok" in log)
     check("从 ESP 读出内核", "U:loaded KERNEL64.BIN" in log)
     check("从 ESP 读出载荷", "U:loaded SYSTEM.IMG" in log)
+    # ★ v0.10.2：按**文件真实大小**读，并把真实扇区数写进介质描述符。
+    #   旧代码把 PAYLOAD_BYTES 写死成 8073 扇区（4.13MB），装出来的盘主分区整块是零，
+    #   而当时的断言只比 LBA1..64 / LBA65..（都在前 4MB 内）——全是绿的。
+    _sysimg = os.path.join(ROOT, "build64", "system.img")
+    _sysbytes = os.path.getsize(_sysimg)
+    _msize = re.search(r"U:size SYSTEM\.IMG = (\d+)", log)
+    check("引导器报出 SYSTEM.IMG 的真实字节数（U:size SYSTEM.IMG = %d）" % _sysbytes,
+          _msize is not None and int(_msize.group(1)) == _sysbytes,
+          ("%s" % (_msize.group(0) if _msize else "缺")) if _msize else "缺")
+    _mpsec = re.search(r"U:payload sectors=(\d+)", log)
+    check("介质描述符报出真实扇区数（U:payload sectors=%d = ceil(bytes/512)）"
+          % ((_sysbytes + 511) // 512),
+          _mpsec is not None and int(_mpsec.group(1)) == (_sysbytes + 511) // 512,
+          ("%s" % (_mpsec.group(0) if _mpsec else "缺")) if _mpsec else "缺")
     check("GOP 拿到线性帧缓冲", "U:gop " in log and "lfb=" in log)
     check("ExitBootServices 成功", "U:ExitBootServices ok" in log)
     check("高半区直映（内核搬高半区后固件仍能启动它）",
@@ -212,6 +227,10 @@ def main():
     if p1:
         check("P1 = 引导分区 0xEF 活动，65 + 32519", p1["type"] == 0xEF and p1["boot"]
               and p1["start"] == 65 and p1["sectors"] == 32519, "%s" % (p1,))
+    check("目标盘大小 = system.img 大小（%d 字节）" % os.path.getsize(os.path.join(ROOT, "build64", "system.img")),
+          os.path.getsize(TARGET) == os.path.getsize(os.path.join(ROOT, "build64", "system.img")),
+          "%d vs %d" % (os.path.getsize(TARGET),
+                        os.path.getsize(os.path.join(ROOT, "build64", "system.img"))))
     check("P2 = 主分区 0x07，32584..盘尾", p2 is not None and p2["type"] == 0x07
           and p2["start"] == 32584 and p2["sectors"] == TARGET_SECTORS - 32584, "%s" % (p2,))
     loader_ref = open(os.path.join(ROOT, "build64", "loader64.bin"), "rb").read()
@@ -220,6 +239,15 @@ def main():
           read_at(TARGET, 1, len(loader_ref)) == loader_ref, "%d 字节" % len(loader_ref))
     check("LBA65.. = kernel64_os.bin 逐字节一致",
           read_at(TARGET, 65, len(os_ref)) == os_ref, "%d 字节" % len(os_ref))
+    # ★ v0.10.2：**载荷真的整块写进去了吗**。上面两条都在前 4.13 MB 内，看不出截断。
+    #   这里拿 build64/system.img 当参照，比到主分区起点（LBA 32584，VimtuFS2 超级块）和盘尾。
+    sys_ref = open(os.path.join(ROOT, "build64", "system.img"), "rb").read()
+    mid_lba = (32584 + TARGET_SECTORS) // 2
+    for lba, name in ((32584, "主分区起点"), (mid_lba, "主分区中段"), (TARGET_SECTORS - 2, "盘尾")):
+        want = sys_ref[lba * 512:(lba + 1) * 512]
+        got = read_at(TARGET, lba, 512)
+        check("LBA%d（%s）= system.img 同偏移逐字节一致（载荷没有被截断）" % (lba, name),
+              got == want, "got[:8]=%s want[:8]=%s" % (got[:8].hex(), want[:8].hex()))
 
     print("=== UEFI RESULT: %s ===" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1

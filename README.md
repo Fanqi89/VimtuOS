@@ -4,13 +4,13 @@
 目标是"能当日常系统用"，而不是教学玩具。
 
 - 语言：C / C++（内核）+ Rust（设计 Token 表）+ 汇编（引导与入口）+ Python（构建与验收）
-- 版本：**0.10.1**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0… / **v0.10.0 = 三生态里程碑 / v0.10.1 = 查漏补缺**）
+- 版本：**0.10.2**（版本号不带 `-beta`；小版本 v0.4.x、大版本 v0.5.0… / **v0.10.0 = 三生态里程碑 / v0.10.1 = 查漏补缺 / v0.10.2 = 真机加固 + 桌面帧预算**）
   > **v0.10.0 三生态里程碑**：① AHCI 挂载"写死盘号"彻底根除（VMware/真机级，三处：分区起点 / 挂系统卷 /
   > 合成器路径）；② UEFI+BIOS 双引导底座加固（BIOS 路径与 ESP/GPT 写入实测，UEFI 固件引导本身 UNVERIFIED）；
   > ③ Windows PE GUI 弹窗鼠标交互落地（居中 → 拖动 → 真点击 OK，`wmfull64_test` 41/0）。
   > 详见 [docs/RELEASE_v0.10.0.md](docs/RELEASE_v0.10.0.md)。
 >
-> **v0.10.1（查漏补缺）**：[docs/RELEASE_v0.10.1.md](docs/RELEASE_v0.10.1.md) —— `[VFS64] BAD block=71` 结案（自检负向对照）、
+> **v0.10.2（真机加固 + 帧预算）**：[docs/RELEASE_v0.10.2.md](docs/RELEASE_v0.10.2.md) —— UEFI 只拷 4.13 MB 载荷的阻断级缺陷、屏幕报错、MMIO BAR≥4GiB 闸门、2 MiB 大页映射（shm/帧缓冲）。上一版 v0.10.1（查漏补缺）：[docs/RELEASE_v0.10.1.md](docs/RELEASE_v0.10.1.md) —— `[VFS64] BAD block=71` 结案（自检负向对照）、
 > 越界 LBA 通路从源头封死（ata64 容量闸门 + r3drv MBR 缓冲区别名修复）、桌面交回 `px`/擦除判据全绿（wm64_test 88/88）、
 > UEFI 引导链复验 PASS。
 - 许可：GPL-3.0

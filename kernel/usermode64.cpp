@@ -372,6 +372,75 @@ static inline bool u64_va_in_user_area64(uint64_t va) {
     return false;
 }
 
+// ★ v0.10.2（帧预算）：只走到 **PD** 那一级，返回 PD 项本身的指针。
+//   为什么单独一个走查：2 MiB 大页要写的是 **PD 项**（PS=1），而 u64_walk64 会继续建 PT。
+//   语义（与 u64_walk64 保持一致，只是少一层）：
+//     * PML4 项必须已存在（用户窗口由 proc64 挂好），缺 U/S 就补；
+//     * PDPT 项缺就分配 PD 表（alloc=1 时），否则返回 nullptr；
+//     * **PD 项不在这里判断**——已存在 4 KiB 页表还是空的，由调用方决定写什么。
+static uint64_t* u64_pd_slot64(uint64_t va, int alloc) {
+    uint64_t* pml4 = u64_tbl64(u64_rd_cr364() & ~0xFFFULL);
+    const uint64_t i4 = (va >> 39) & 0x1FF, i3 = (va >> 30) & 0x1FF, i2 = (va >> 21) & 0x1FF;
+    uint64_t e = pml4[i4];
+    if (!(e & PTE_PRESENT_64)) return nullptr;
+    if ((e & (PTE_WRITE_64 | PTE_USER_64)) != (PTE_WRITE_64 | PTE_USER_64)) {
+        const uint64_t c0 = u64_wp_enter64();
+        pml4[i4] = e | PTE_WRITE_64 | PTE_USER_64;
+        u64_wp_leave64(c0);
+        u64_flush_tlb64();
+    }
+    uint64_t* pdpt = u64_tbl64(pml4[i4] & ~0xFFFULL);
+    e = pdpt[i3];
+    if (e & PTE_PRESENT_64) {
+        if (e & U64_PS) return nullptr;                           // 1 GiB 大页：用户窗口不该出现
+        if ((e & (PTE_WRITE_64 | PTE_USER_64)) != (PTE_WRITE_64 | PTE_USER_64)) {
+            const uint64_t c0 = u64_wp_enter64();
+            pdpt[i3] = e | PTE_WRITE_64 | PTE_USER_64;
+            u64_wp_leave64(c0);
+        }
+    } else {
+        if (!alloc) return nullptr;
+        void* np = page_alloc_64();
+        if (!np) return nullptr;
+        u64_zero_page64(np);
+        const uint64_t c0 = u64_wp_enter64();
+        pdpt[i3] = (uint64_t)(uintptr_t)np | U64_TBL_FLAGS;
+        u64_wp_leave64(c0);
+    }
+    uint64_t* pd = u64_tbl64(pdpt[i3] & ~0xFFFULL);
+    return &pd[i2];
+}
+
+// ★ v0.10.2（帧预算）：2 MiB 大页映射。两条硬件前提，任一不满足就如实拒绝：
+//   ① va 与 phys 都 2 MiB 对齐；② 整块落在 4 GiB 恒等直映区内（内核只直映 0..4 GiB）。
+//   若该 VA 已经有 4 KiB 页表（PS=0），**不覆盖**、如实失败——把两种页混在同一 2 MiB 里
+//   会得到"一半新一半旧"的映射，比失败更难查。
+int user64_map_phys_2mb64(uint64_t va, uint64_t phys, uint64_t leaf_flags) {
+    if (va & (PAGE_SIZE_2MB_64 - 1)) return 0;
+    if (phys & (PAGE_SIZE_2MB_64 - 1)) return 0;
+    if (!u64_va_in_user_area64(va)) return 0;
+    if (phys + PAGE_SIZE_2MB_64 > 0x100000000ULL) return 0;
+    uint64_t* pde = u64_pd_slot64(va, 1);
+    if (!pde) return 0;
+    if ((*pde & PTE_PRESENT_64) && !(*pde & PTE_2MB_64)) return 0;
+    const uint64_t c0 = u64_wp_enter64();
+    *pde = phys | u64_leaf_keep64(leaf_flags) | PTE_PRESENT_64 | PTE_2MB_64;
+    u64_wp_leave64(c0);
+    u64_invlpg64(va);
+    return 1;
+}
+
+int user64_unmap_2mb64(uint64_t va) {
+    if (va & (PAGE_SIZE_2MB_64 - 1)) return 0;
+    uint64_t* pde = u64_pd_slot64(va, 0);
+    if (!pde || !(*pde & PTE_PRESENT_64) || !(*pde & PTE_2MB_64)) return 0;
+    const uint64_t c0 = u64_wp_enter64();
+    *pde = 0;
+    u64_wp_leave64(c0);
+    u64_invlpg64(va);
+    return 1;
+}
+
 int user64_map_page64(uint64_t va, uint64_t leaf_flags, int alloc, uint64_t* out_phys) {
     if (va & 0xFFFULL) return 0;                                          // 必须页对齐
     if (!u64_va_in_user_area64(va)) return 0;                             // 用户窗口 或 A1 的 FB 映射区
@@ -417,6 +486,11 @@ int user64_remap_flags64(uint64_t va, uint64_t leaf_flags) {
 }
 
 uint64_t user64_unmap_page64(uint64_t va) {
+    // ★ v0.10.2：2 MiB 大页不能按 4 KiB 拆 —— 如实拒绝（否则会把 PTE 写进大页的物理页里）
+    {
+        uint64_t* pde = u64_pd_slot64(va, 0);
+        if (pde && (*pde & PTE_PRESENT_64) && (*pde & PTE_2MB_64)) return 0;
+    }
     uint64_t* pte = u64_walk64(va, 0);
     if (!pte || !(*pte & PTE_PRESENT_64)) return 0;
     // ★ 只取物理地址位（bit12..51）：不能用 ~0xFFFULL —— 它会留下 bit63(NX)，
@@ -468,7 +542,8 @@ static bool u64_page_is_user64(uint64_t va) {
     if (!(e & PTE_PRESENT_64) || !(e & PTE_USER_64) || (e & U64_PS)) return false;
     const uint64_t* pd = u64_tbl64(e & ~0xFFFULL);
     e = pd[(va >> 21) & 0x1FF];
-    if (!(e & PTE_PRESENT_64) || !(e & PTE_USER_64) || (e & U64_PS)) return false;
+    if (!(e & PTE_PRESENT_64) || !(e & PTE_USER_64)) return false;
+    if (e & PTE_2MB_64) return true;                 // ★ v0.10.2：PS=1 的 PD 项**就是叶子**（2 MiB 大页）
     const uint64_t* pt = u64_tbl64(e & ~0xFFFULL);
     e = pt[(va >> 12) & 0x1FF];
     if (!(e & PTE_PRESENT_64) || !(e & PTE_USER_64)) return false;
@@ -476,6 +551,11 @@ static bool u64_page_is_user64(uint64_t va) {
 }
 
 uint64_t user64_page_flags64(uint64_t va) {
+    // ★ v0.10.2：大页要单独取（否则 u64_walk64 会把大页的物理地址当成 PT 去读）
+    {
+        uint64_t* pde = u64_pd_slot64(va, 0);
+        if (pde && (*pde & PTE_PRESENT_64) && (*pde & PTE_2MB_64)) return u64_leaf_keep64(*pde);
+    }
     uint64_t* pte = u64_walk64(va, 0);
     if (!pte) return 0;
     // ★ 低 12 位就是权限位（P/W/U/...），bit63 是 NX；中间是物理地址位（不外泄）。

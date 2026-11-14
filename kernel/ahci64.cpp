@@ -926,6 +926,16 @@ void ahci64_init64() {
         const uint32_t bar_hi = apci_rd32(g_bus, g_dev_id, g_fn, 0x28);
         abar |= (uint64_t)bar_hi << 32;
     }
+    // ★ v0.10.2（真机）：与 NVMe 同一条闸门 —— 内核只恒等映射 0..4GiB，
+    //   ABAR 在 4GiB 之上时第一条 ahci_rd() 就是野地址。真机 PCH 的 AHCI 一般都在 4G 内，
+    //   但显式拒掉比 #PF 好：拒的是这块控制器，PATA 与服务卷照常。
+    if (abar >= 0x100000000ULL) {
+        dbg64_line_begin64();
+        dbg64_str("[AHCI64] skip reason=abar-above-4g abar=0x"); dbg64_hex64(abar);
+        dbg64_nl();
+        dbg64_line_end64();
+        return;
+    }
     if (abar == 0 || abar == 0xFFFFFFF0ULL) {
         dbg64_line_begin64();
         dbg64_str("[AHCI64] not found (BAR5 unassigned)");

@@ -551,6 +551,16 @@ void nvme64_init64() {
     }
     g_ctrl.bus = g_bus; g_ctrl.dev = g_dev; g_ctrl.fn = g_fn;
     g_ctrl.bar0 = bar0;
+    // ★ v0.10.2（真机）：内核只恒等映射 0..4GiB。真机 M.2 NVMe 的 BAR0 常被放到
+    //   Above-4G（BIOS 的 Above 4G Decoding），下面紧跟的 nvme_rd64(NVME_CAP) 就是裸解引用
+    //   -> #PF/黑屏。这里拒掉这块设备（不是拒整机：PATA/AHCI 盘照常可用）。
+    if (bar0 >= 0x100000000ULL) {
+        dbg64_line_begin64();
+        dbg64_str("[NVME64] skip reason=bar0-above-4g bar0=0x"); dbg64_hex64(bar0);
+        dbg64_nl();
+        dbg64_line_end64();
+        return;
+    }
     if (bar0 == 0 || bar0 == 0xFFFFFFF0ULL) {
         dbg64_line_begin64();
         dbg64_str("[NVME64] not found (BAR0 unassigned)");

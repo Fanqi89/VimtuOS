@@ -1049,8 +1049,13 @@ def main():
 
         print("=== 9) ⑨ 性能：用户态合成 vs 内核内合成（同一台机、同一分辨率、同一图案）===")
         kcomp = re.findall(r"\[WL64\] composite n=(\d+) bytes=(\d+) us=(\d+)", log)
+        # ★ v0.10.2：一帧成本 = us(窗口 blit) + bg_us(快照回填)；输入修复帧（input=1）不计时，排除
+        wcomp_all = re.findall(r"\[WM\] frame n=\d+ surfs=(\d+) pending=(\d+) dirty=-?\d+,-?\d+,\d+,\d+ px=(\d+) "
+                               r"blend=(\d+) us=(\d+) flip_us=(\d+)[^\n]*?(?:bg_us=(\d+))?[^\n]*?$",
+                               log, re.M)
+        wkeep = [r for r in re.finditer(r"\[WM\] frame n=\d+ .*", log) if "input=1" not in r.group(0)]
         wcomp = re.findall(r"\[WM\] frame n=\d+ surfs=(\d+) pending=(\d+) dirty=-?\d+,-?\d+,\d+,\d+ px=(\d+) "
-                           r"blend=(\d+) us=(\d+) flip_us=(\d+)", log)
+                           r"blend=(\d+) us=(\d+) flip_us=(\d+)", "\n".join(m.group(0) for m in wkeep))
         ch("⑨ 内核内合成器的数字存在（[WL64] composite n=2 bytes=.. us=..）",
            len(kcomp) >= 1, "n=%d %s" % (len(kcomp), kcomp[:2]))
         ch("⑨ 用户态合成器的数字存在（[WM] frame .. us=.. flip_us=..）", len(wcomp) >= 3,
@@ -1064,8 +1069,20 @@ def main():
                   % (len(k_us), k_us[:4], min(k_us), sorted(k_us)[len(k_us) // 2],
                      len(w_us), w_us[:4], min(w_us), sorted(w_us)[len(w_us) // 2],
                      sorted(w_fl)[len(w_fl) // 2]))
-            ch("⑨ 用户态合成的每帧耗时是**真实的 rdtsc 数字**（>0 且 <10ms）",
-               0 < sorted(w_us)[len(w_us) // 2] < 10000, "median_us=%d" % sorted(w_us)[len(w_us) // 2])
+            # ★ v0.10.2：把背景回填（bg_us）算进一帧成本，并按"非 input 帧"取中位数
+            _cost = {}
+            for _m in re.finditer(r"\[WM\] frame n=(\d+) .*?us=(\d+) flip_us=(\d+)(.*)$", log, re.M):
+                if "input=1" in _m.group(4):
+                    continue
+                _bg = re.search(r"bg_us=(\d+)", _m.group(4))
+                _cost[int(_m.group(1))] = int(_m.group(2)) + (int(_bg.group(1)) if _bg else 0)
+            _cv = sorted(_cost.values())
+            ch("⑨ 一帧合成成本（us + bg_us，非 input 帧）是**真实的 rdtsc 数字**（>0 且 <10ms）",
+               len(_cv) >= 3 and 0 < _cv[len(_cv) // 2] < 10000,
+               "frames=%d median_us=%d all=%s" % (len(_cv), _cv[len(_cv) // 2] if _cv else -1, _cv[:6]))
+            ch("⑨ 客人侧帧时间戳存在（[WM] frame .. t_ms=..）—— 帧预算的取证通道",
+               len(re.findall(r"\[WM\] frame n=\d+ .*?t_ms=\d+", log)) >= 3,
+               "n=%d" % len(re.findall(r"\[WM\] frame n=\d+ .*?t_ms=\d+", log)))
             ch("⑨ 设备 blit 阈值决策留了证据（min_px=4096 / path=soft，本台无 virtio-gpu）",
                vm.n_match(r"\[WM\] blitpolicy gpu=0 min_px=4096 rect_px=\d+ path=soft") >= 1)
     finally:

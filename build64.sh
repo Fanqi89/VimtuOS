@@ -79,7 +79,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.10.1"    # ★ v0.10.0：三生态里程碑 —— AHCI 挂载"写死盘号"彻底根除（VMware/真机级） + Windows PE GUI 鼠标交互落地 + 桌面合成器全绿
+VIMTUOS_VERSION="0.10.2"    # ★ v0.10.2：真机加固（UEFI 载荷按真实大小读 + 屏幕报错 + MMIO BAR>=4GiB 闸门） + 桌面帧预算（热路径打点预算 + 2 MiB 大页映射 / shm 与帧缓冲 + 60 Hz 帧节拍）
 #   根因：同一块盘上的两条命令会重叠（命令列表 slot0 / 命令表 / DMA 暂存页池 g_dma[16] 全驱动共享），
 #   后果是**静默坏读**（ELF 魔数坏读、VFS BAD block、/etc/r3drv.conf 读错）与端口互相重启，
 #   重启延迟 4860~4896 ms（crash=1）/ 7244 ms（崩溃探针）。修法：让出式可重入有界锁 Ahci64IoSpan，
