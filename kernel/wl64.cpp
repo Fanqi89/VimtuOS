@@ -1379,6 +1379,9 @@ int wl64_demo64(const char* path) {
 // 模式判据与客户端**同一个文件**（/etc/wm_probe）：有 = full（再起 wmclock/wmpanel 两个真客户端，
 // 有界等待 90 s）；没有 = short（只起 wm 一个，它自己映射 fb + 注册合成器 + 合成约 1 s 就退出）。
 static const char WL64_WM_PATH64[]      = "/bin/wm.elf";
+// ★ 修：构建实际把合成器写在 /lib/wm.elf（build64.sh），契约路径是 /bin/wm.elf；
+//   两个都认，卷里谁在就用谁（否则打包路径一变，合成器就被整个跳过）。
+static const char WL64_WM_LIB64[]       = "/lib/wm.elf";
 static const char WL64_WMCLOCK_PATH64[] = "/wmclock.elf";
 static const char WL64_WMPANEL_PATH64[] = "/wmpanel.elf";
 static const char WL64_WM_PROBE64[]     = "/etc/wm_probe";
@@ -1440,7 +1443,15 @@ int wl64_wm64(const char* wm_path) {
     }
     uint32_t t = 0, sz = 0, vol_bytes = 0;
     const bool full = (vfs64_stat(WL64_WM_PROBE64, &t, &sz) == 0);
-    if (!wl64_client_probe64(p, &vol_bytes)) {         // 复用既有的"卷里有这个文件吗"打点函数
+    bool wl_wm_found = wl64_client_probe64(p, &vol_bytes);
+    if (!wl_wm_found && wl64_client_probe64(WL64_WM_LIB64, &vol_bytes)) {
+        p = WL64_WM_LIB64;
+        wl_wm_found = true;
+        wl64_begin64();
+        wl64_puts64("[WL64] wm path fallback=/lib/wm.elf (/bin/wm.elf not in volume)\n");
+        wl64_end64();
+    }
+    if (!wl_wm_found) {         // 复用既有的"卷里有这个文件吗"打点函数
         wl64_begin64();
         wl64_puts64("[WL64] wm skipped (no elf on vfs) path="); wl64_puts64(p);
         wl64_nl64();
