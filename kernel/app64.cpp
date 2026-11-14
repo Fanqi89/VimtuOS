@@ -135,7 +135,20 @@ static int vap64_parse(const uint8_t* p, uint32_t n, Vap64FileInfo* out) {
 
 // ==================== 主分区起始 LBA（挂载参数）====================
 uint32_t app64_main_part_lba64(int drive) {
-    if (drive >= 0 && drive < 4) {
+    /* ★ 阻断性回归修复：这里原来是 `drive >= 0 && drive < 4` —— **只认 PATA 的 0..3**。
+     *   AHCI(8..15) / NVMe(16..) / USB(24..) 一律掉进下面的 else，打一句 "bad drive" 然后
+     *   直接返回编译期常量 PART_MAIN_LBA。于是"系统装在 AHCI 盘上、主分区起点 != PART_MAIN_LBA"
+     *   的机器，会拿一个**错的 LBA** 去读超级块：
+     *     [APP64] main partition: bad drive, fallback PART_MAIN_LBA=32584
+     *     [VFS64] mount FAILED reason=magic
+     *     [VFS64] mount_system FAILED (mount)          <- 用户看到的阻断报错
+     *     [WL64] wm skipped (no system volume)         <- 于是没有壁纸/开始菜单
+     *   实测复现（q35/AHCI + 把卷整体搬到 LBA 40960 的镜像，卷本身完好）：
+     *     上面三行逐字出现；而 [DRV64] 用 MBR 里的 40960 去探测，能读到那一扇区。
+     *   根因：ata64_read_sector 早就按 drive 号路由到 AHCI/NVMe/USB（见 ata64_read 的分派），
+     *   这个函数**不该再自己拦一道 "只认 PATA"**。现在任何 drive 都读它自己的 MBR 0x07 项，
+     *   读不到才退回常量（保留原来的两级日志：读失败 / 无 0x07 项）。 */
+    if (drive >= 0) {
         static uint8_t sec[512];                                  // 512B 静态缓冲（不进镜像）
         if (ata64_read_sector(drive, 0, sec)) {
             for (int i = 0; i < 4; i++) {
