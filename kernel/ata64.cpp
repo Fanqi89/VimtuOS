@@ -400,7 +400,31 @@ static bool ata_pio_read_once(int drive, uint32_t lba, uint32_t count, void* buf
 }
 
 // READ 对外入口：分派 + 分块 + 每块重试（语义与改动前一致；>128 扇区不再被 8 位寄存器截断）
+// ★ W3 第四批诊断：读入口一次性打点（前 8 条）+ "drive 4..7 空洞" 分支打点。
+//   `rprobe=1` 这个串同时充当"新内核确实在跑"的标记 —— 上一轮因为打点只在失败时打，
+//   结果既证明不了失败点、也证明不了内核版本，白跑一轮。
+static int g_ata_read_note64 = 0;
+static void ata_read_note64(const char* why, int drive, uint32_t lba, uint32_t count) {
+    if (g_ata_read_note64 >= 8) return;
+    g_ata_read_note64++;
+    dbg64_line_begin64();
+    dbg64_str("[ATA64] read ");
+    dbg64_str(why);
+    dbg64_str(" drive=");
+    dbg64_dec((uint64_t)(uint32_t)drive);
+    dbg64_str(" lba=");
+    dbg64_dec(lba);
+    dbg64_str(" cnt=");
+    dbg64_dec(count);
+    dbg64_str(" drives=");
+    dbg64_dec((uint64_t)(uint32_t)ata64_drive_count64());
+    dbg64_str(" ahci_base=8 rprobe=1");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
 bool ata64_read(int drive, uint32_t lba, uint32_t count, void* buf) {
+    ata_read_note64("enter", drive, lba, count);
     // ★ 分派：驱动器号 24.. -> USB 存储（★ 批次 O：BOT + READ(10)，内部按 ≤8 扇区分块）；
     //          16.. -> NVMe 命名空间读（内部按 128 扇区分块）；
     //          8..15 -> AHCI(SATA) DMA 读（LBA48）
@@ -409,7 +433,7 @@ bool ata64_read(int drive, uint32_t lba, uint32_t count, void* buf) {
 #endif
     if (drive >= ATA64_NVME_BASE) return nvme64_read64(drive - ATA64_NVME_BASE, lba, count, buf);
     if (drive >= ATA64_AHCI_BASE) return ahci64_read64(drive - ATA64_AHCI_BASE, lba, count, buf);
-    if (drive < 0 || drive > 3) return false;   // 4..7 保留空洞
+    if (drive < 0 || drive > 3) { ata_read_note64("SKIP-drive-gap", drive, lba, count); return false; }
     if (count == 0) return true;
     uint8_t* p = (uint8_t*)buf;
     for (uint32_t done = 0; done < count; ) {
