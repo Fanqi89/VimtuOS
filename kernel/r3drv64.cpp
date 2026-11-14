@@ -341,6 +341,16 @@ static int r3_drive_present64(int drive, uint64_t* out_sectors) {
 
 // 在一块盘的所有 MBR 分区项（以及整盘）上找某协议
 static int r3_find_on_drive64(int drive, uint32_t want, uint32_t* out_lba) {
+    // ★ v0.10.1 真缺陷（容量闸门抓到的）：这里原来是**边读 MBR 边探测**，而
+    //   r3drv64_probe_proto64() 内部也用 g_sec 读被探测的扇区 —— 于是第二轮循环里
+    //   `g_sec + 446 + p*16` 已经不是 MBR 分区项，而是刚读回来的那个扇区的内容，
+    //   随机 4 字节被当成 start LBA 送进 ata64_read：
+    //     [ATA64] range REFUSED (out of disk) op=read drive=0 lba=3993237690 ... caller=r3drv64_probe_proto64
+    //   在 AHCI 上这条非法 LBA 会把设备打进错误态（v0.10.0 前整盘卡死的原因之一）。
+    //   修法：进循环前把 4 个分区项**拷到局部变量**，彻底断开别名；顺便用盘容量做边界检查。
+    uint32_t cand_start[4] = {0, 0, 0, 0};
+    uint32_t cand_secs[4]  = {0, 0, 0, 0};
+    int      cand_n        = 0;
     if (r3_rd64((uint32_t)drive, 0, 1, g_sec) && g_sec[510] == 0x55 && g_sec[511] == 0xAA) {
         for (int p = 0; p < 4; p++) {
             const uint8_t* e = g_sec + 446 + p * 16;
@@ -348,10 +358,34 @@ static int r3_find_on_drive64(int drive, uint32_t want, uint32_t* out_lba) {
             const uint32_t start = r3_le32(e + 8);
             const uint32_t secs = r3_le32(e + 12);
             if (type == 0 || start == 0 || secs == 0) continue;
-            if (r3drv64_probe_proto64((uint32_t)drive, start) == want) {
-                if (out_lba) *out_lba = start;
-                return 1;
-            }
+            cand_start[cand_n] = start;
+            cand_secs[cand_n] = secs;
+            cand_n++;
+        }
+    }
+    uint64_t disk_secs = 0;
+    const int have_disk = r3_drive_present64(drive, &disk_secs);
+    for (int i = 0; i < cand_n; i++) {
+        // 分区项必须整个落在盘内：越界的项一个字节都不碰（打一行 skip 留证据）
+        if (have_disk && disk_secs != 0 &&
+            (uint64_t)cand_start[i] + (uint64_t)cand_secs[i] > disk_secs) {
+            dbg64_line_begin64();
+            dbg64_str("[R3DRV] probe skip drive=");
+            dbg64_dec((uint64_t)(uint32_t)drive);
+            dbg64_str(" start=");
+            dbg64_dec(cand_start[i]);
+            dbg64_str(" secs=");
+            dbg64_dec(cand_secs[i]);
+            dbg64_str(" disk_secs=");
+            dbg64_dec(disk_secs);
+            dbg64_str(" reason=partition-out-of-disk");
+            dbg64_nl();
+            dbg64_line_end64();
+            continue;
+        }
+        if (r3drv64_probe_proto64((uint32_t)drive, cand_start[i]) == want) {
+            if (out_lba) *out_lba = cand_start[i];
+            return 1;
         }
     }
     // 整盘当卷（没有分区表的 ext4 夹具很常见）

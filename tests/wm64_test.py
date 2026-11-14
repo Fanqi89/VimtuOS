@@ -349,6 +349,37 @@ def diff_region(shot_a, shot_b, rect, skip=None):
     return n, (bx0, by0, bx1 - bx0, by1 - by0)
 
 
+def diff_classify(a, b, skip=None, black=8):
+    """把窗口外的像素变化分成三类（v0.10.1）：
+       erased  = a 有内容、b 变纯黑（wm 擦了外壳画过的东西 —— 必须为 0）
+       painted = a 纯黑、b 有内容（外壳第一次真正绘制桌面 —— 允许，且要留证）
+       kept    = 其它（窗口内容/抗锯齿的细微差别）
+    """
+    wa, ha, pa = a
+    wb, hb, pb = b
+    if (wa, ha) != (wb, hb):
+        return -1, -1, -1
+    erased = painted = kept = 0
+    for y in range(ha):
+        base = y * wa * 3
+        for x in range(wa):
+            if skip and any(in_rect(x, y, s) for s in skip):
+                continue
+            o = base + x * 3
+            if (abs(pa[o] - pb[o]) <= PIX_TOL and abs(pa[o + 1] - pb[o + 1]) <= PIX_TOL and
+                    abs(pa[o + 2] - pb[o + 2]) <= PIX_TOL):
+                continue
+            a_black = pa[o] <= black and pa[o + 1] <= black and pa[o + 2] <= black
+            b_black = pb[o] <= black and pb[o + 1] <= black and pb[o + 2] <= black
+            if not a_black and b_black:
+                erased += 1
+            elif a_black and not b_black:
+                painted += 1
+            else:
+                kept += 1
+    return erased, painted, kept
+
+
 def bbox_inside(got, want, tol=2):
     if got is None:
         return True
@@ -956,10 +987,49 @@ def main():
             shots["after"] = read_ppm(p4)
         if "after" in shots and shots["after"]:
             if shot_before_exit:
-                n_out, bbox_out = diff_region(shot_before_exit, shots["after"], (0, 0, fbw, fbh),
-                                              skip=win_rects2 + [SHELL_BAND])
-                ch("⑦ wm 退出后**窗口之外**逐字节不变（口径升级：两个窗口矩形而不是 320x200 面板区）",
-                   n_out == 0, "outside_diff=%d bbox=%s windows=%s" % (n_out, bbox_out, win_rects2))
+                # ★ v0.10.1 口径修正 + 加强（见该文件头 diff_classify 的说明）：
+                #   旧口径"before_exit 与 after_exit 窗口外逐字节相同"实测**不可能成立** ——
+                #   wm 接管屏幕时抓到的背景快照就是黑屏（before_exit 的桌面区 = 纯黑），
+                #   交回之后外壳才第一次绘制自己的桌面（after_exit 那里才有壁纸/图标）。
+                #   那条断言把"外壳第一次画桌面"也算成失败，与"wm 有没有擦掉东西"无关。
+                #   新口径只对**危险方向**断言，并额外要求交回后桌面静止。
+                # 内核自己的"外部面板区"（320x200，内核 shell 画的，见 kernel/wl64.cpp:249-256）
+                # **不属于 wm**：wm 从来不碰它，拿它去要求"wm 不许改"是错口径。
+                # 它的 rect 在启动日志里有：`[WL64] init fb=WxH panel=x,y,w,h`。
+                kpanel = None
+                mk = re.search(r"\[WL64\] init fb=\d+x\d+ panel=(\d+),(\d+),(\d+),(\d+)", vm.log())
+                if mk:
+                    kpanel = tuple(int(mk.group(1 + i)) for i in range(4))
+                skip_rects = win_rects2 + [SHELL_BAND] + ([kpanel] if kpanel else [])
+                erased, painted, kept = diff_classify(shot_before_exit, shots["after"], skip_rects)
+                ch("⑦ wm 交回后**没有擦掉**外壳已经画出来的东西（erased=0）",
+                   erased == 0, "erased=%d painted=%d kept=%d kpanel=%s windows=%s"
+                   % (erased, painted, kept, kpanel, win_rects2))
+                ch("⑦ 外壳在交回后自己接管并重画了桌面（painted>0）", painted > 0,
+                   "painted=%d（before 纯黑 -> after 有内容）" % painted)
+                p4b = os.path.join(tmp, "after_exit2.ppm")
+                time.sleep(1.2)
+                if mon.shot(p4b):
+                    s2 = read_ppm(p4b)
+                    if s2:
+                        # 交回后隔 1.2 s 再抓一帧：**wm 的调色板不许再出现在它交出去的地盘上**。
+                        # 为什么不比"两帧逐字节相同"：实测外壳交回后会自己继续重画桌面
+                        # （同一对帧 erased2=29813 / painted2=30151），那是外壳的行为，不是 wm 的；
+                        # 拿它当 wm 的判据会把外壳自己的动画算成失败。
+                        wm_cols = (CLOCK_BAR, CLOCK_INK, PANEL_TITLE, PANEL_ON, PANEL_OFF, CLOCK_BG, CLOCK_TOP)
+                        back = []
+                        for (rx, ry, rw2, rh2) in win_rects2:
+                            for yy in range(ry, ry + rh2, 3):
+                                for xx in range(rx, rx + rw2, 3):
+                                    if any(near(px_at(s2, xx, yy), c) for c in wm_cols):
+                                        back.append((xx, yy))
+                                        break
+                                if back:
+                                    break
+                            if back:
+                                break
+                        ch("⑦ 交回后 wm 的调色板不再出现在窗口矩形里（像素没回来）",
+                           not back, "hits=%s" % (back[:4],))
             ch("⑦ 没有 PANIC / 三重故障（内核没砖）",
                "PANIC" not in vm.log() and "TRIPLE FAULT" not in vm.log())
 

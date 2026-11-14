@@ -267,6 +267,63 @@ int ata64_slot_to_drive64(int slot) {
     return -1;                                  // 越界（槽数比实际盘多时）
 }
 
+// ==================== ★ v0.10.1：设备容量闸门（越界 LBA 不许发给设备）====================
+// 为什么要在**这一层**拦：越界 LBA 打给磁盘只会得到一条错误命令，而某些 HBA（实测 QEMU
+//   ich9-ahci）在设备报错后**不清 PxCI**，整块盘会卡死到重启（ahci64 已有端口恢复兜底，
+//   但更正确的做法是**根本别发出这条命令**）。
+// 容量按盘缓存（第一次用到某盘时 IDENTIFY 一次，之后零成本）；盘不存在 / 容量未知时
+//   不设限，保持既有行为（绝不因为闸门引入新的假失败）。
+static uint64_t g_cap64[ATA64_MAX_DRIVE64];
+static uint8_t  g_cap_known64[ATA64_MAX_DRIVE64];
+static uint8_t  g_cap_warned64 = 0;
+
+static bool ata64_range_ok64(int drive, uint32_t lba, uint32_t count, const char* what,
+                             uint64_t caller) {
+    if (drive < 0 || drive >= ATA64_MAX_DRIVE64) {
+        if (g_cap_warned64 < 16) {
+            g_cap_warned64++;
+            dbg64_line_begin64();
+            dbg64_str("[ATA64] range REFUSED (bad drive) op=");
+            dbg64_str(what);
+            dbg64_str(" drive=");
+            dbg64_dec((uint64_t)(uint32_t)drive);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        return false;
+    }
+    if (!g_cap_known64[drive]) {
+        g_cap_known64[drive] = 1;
+        DiskInfo di;
+        if (ata64_identify(drive, &di) && di.present && !di.atapi) g_cap64[drive] = di.sectors;
+        else g_cap64[drive] = 0;                       // 没盘/光驱：不设限，让下游按原样失败
+    }
+    const uint64_t cap = g_cap64[drive];
+    if (cap == 0) return true;
+    if ((uint64_t)lba + (uint64_t)count > cap) {
+        if (g_cap_warned64 < 16) {
+            g_cap_warned64++;
+            dbg64_line_begin64();
+            dbg64_str("[ATA64] range REFUSED (out of disk) op=");
+            dbg64_str(what);
+            dbg64_str(" drive=");
+            dbg64_dec((uint64_t)(uint32_t)drive);
+            dbg64_str(" lba=");
+            dbg64_dec(lba);
+            dbg64_str(" count=");
+            dbg64_dec(count);
+            dbg64_str(" cap=");
+            dbg64_dec(cap);
+            dbg64_str(" caller=0x");
+            dbg64_hex64(caller);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        return false;
+    }
+    return true;
+}
+
 // ---------------- IDENTIFY ----------------
 // 分派：≥ ATA64_USB_BASE 走 USB 存储（★ 批次 O，型号来自 INQUIRY、容量来自 READ CAPACITY(10)）、
 //       ≥ ATA64_NVME_BASE 走 NVMe、≥ ATA64_AHCI_BASE 走 AHCI（三者都复用同一份 DiskInfo）。
@@ -424,6 +481,9 @@ static void ata_read_note64(const char* why, int drive, uint32_t lba, uint32_t c
 }
 
 bool ata64_read(int drive, uint32_t lba, uint32_t count, void* buf) {
+    if (count != 0 &&
+        !ata64_range_ok64(drive, lba, count, "read",
+                          (uint64_t)(uintptr_t)__builtin_return_address(0))) return false;
     ata_read_note64("enter", drive, lba, count);
     // ★ 分派：驱动器号 24.. -> USB 存储（★ 批次 O：BOT + READ(10)，内部按 ≤8 扇区分块）；
     //          16.. -> NVMe 命名空间读（内部按 128 扇区分块）；
@@ -486,6 +546,9 @@ static bool ata_pio_write_once(int drive, uint32_t lba, uint32_t count, const vo
 //   * xHCI 段（k >= usb64_msc_count64()）-> 本批仍只读：直接返回 false 并打点（绝不假装成功）。
 //   非 USB 驱动器号：**原样**走 NVMe/AHCI/PATA 三条既有写路径（一行都没改）。
 bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf) {
+    if (count != 0 &&
+        !ata64_range_ok64(drive, lba, count, "write",
+                          (uint64_t)(uintptr_t)__builtin_return_address(0))) return false;
 #ifdef ATA64_HAVE_USB64
 static uint32_t g_ata_usb_wlogs = 0;                 // [USBST] write drive=.. 成功行的打点上限（防刷屏）
     if (drive >= ATA64_USB_BASE) {

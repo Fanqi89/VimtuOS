@@ -514,7 +514,18 @@ static void log_mount_fail(const char* why) {
     dbg64_nl();
     dbg64_line_end64();
 }
+// ★ v0.10.1：越界块号**必须连带调用者一起打**。
+//   为什么：以前只有一行 "BAD block=71 not in data area [6,64)"，既不知道谁送进来的，
+//   也不知道是读还是写；在 AHCI 上这条越界块号会变成一条**非法 LBA 命令**，把设备打进
+//   错误态（本批已在 ahci64 加了端口恢复兜底，但源头必须钉死）。
+//   noinline 是必须的：被内联进调用方之后 return_address(0) 拿到的是**调用方的调用方**，
+//   会把排查带偏（本仓库 vfs64.cpp 编 -O2，默认会内联小函数）。
+// ★ v0.10.1：自检会**故意**注入"数据块指针越界但 CRC 合法"的 inode，用来证明读路径会拒绝它。
+//   那种命中不是 bug —— 这个标记让打点多一个 expect=inject，免得被误当成内存踩踏。
+static uint8_t  g_sel_inject = 0;
+__attribute__((noinline))
 static void log_bad_block(uint32_t blk) {
+    const uint64_t caller = (uint64_t)(uintptr_t)__builtin_return_address(0);
     dbg64_line_begin64();                       // ★ 行原子
     dbg64_str("[VFS64] BAD block=");
     dbg64_dec(blk);
@@ -522,9 +533,30 @@ static void log_bad_block(uint32_t blk) {
     dbg64_dec(g_data_start);
     dbg64_str(",");
     dbg64_dec(g_blocks);
-    dbg64_str(")");
+    dbg64_str(") slot=");
+    dbg64_dec((uint64_t)(uint32_t)g_cur_slot);
+    dbg64_str(" inodes=");
+    dbg64_dec(g_inode_count);
+    dbg64_str(" caller=0x");
+    dbg64_hex64(caller);
+    if (g_sel_inject) dbg64_str(" expect=inject");       // 自检故意注入：拒绝即正确
     dbg64_nl();
     dbg64_line_end64();
+}
+// ★ v0.10.1 排查面包屑：越界块号出现时，还需要知道**是谁在读哪个文件、用的是哪个 inode、
+//   当前挂的是哪个卷**。否则只有一句 "BAD block=71" 根本判不出是"分配器给了越界块"还是
+//   "inode 装载位置错位（卷身份串了）"。
+static char     g_dbg_path[96];
+static uint32_t g_dbg_idx       = 0xFFFFFFFFu;
+static uint32_t g_dbg_ino_blk   = 0xFFFFFFFFu;
+static uint32_t g_dbg_ino_start = 0xFFFFFFFFu;
+static uint32_t g_dbg_vol_start = 0xFFFFFFFFu;
+static uint64_t g_dbg_ino_caller = 0;
+static void dbg_note_path(const char* path) {
+    if (!path) { g_dbg_path[0] = 0; return; }
+    int i = 0;
+    for (; path[i] && i < 95; i++) g_dbg_path[i] = path[i];
+    g_dbg_path[i] = 0;
 }
 static void log_bad_inode(uint32_t idx) {
     dbg64_line_begin64();                       // ★ 行原子
@@ -793,6 +825,19 @@ static bool dev_read_at(int drive, uint32_t abs_lba, uint32_t count, void* buf) 
         if (!ata64_read(drive, abs_lba, c, d)) {
             dbg64_str("[VFS64] ATA read fail lba=");
             dbg64_dec(abs_lba);
+            dbg64_str(" count=");
+            dbg64_dec(c);
+            dbg64_str(" drive=");
+            dbg64_dec((uint64_t)(uint32_t)drive);
+            // ★ v0.10.1：越界 LBA 会先被 ata64 的容量闸门拦下（[ATA64] range REFUSED），
+            //   这里再补一份"谁算出来的"：调用者 + 当前卷几何。两者一对照就能判出
+            //   是"卷几何过期"还是"某个结构的块号是垃圾"。
+            dbg64_str(" vol_start=");
+            dbg64_dec(g_start);
+            dbg64_str(" vol_blocks=");
+            dbg64_dec(g_blocks);
+            dbg64_str(" caller=0x");
+            dbg64_hex64((uint64_t)(uintptr_t)__builtin_return_address(0));
             dbg64_nl();
             return false;
         }
@@ -848,6 +893,16 @@ static bool dev_write_at(int drive, uint32_t abs_lba, uint32_t count, const void
         if (!ata64_write(drive, abs_lba, c, s)) {
             dbg64_str("[VFS64] ATA write fail lba=");
             dbg64_dec(abs_lba);
+            dbg64_str(" count=");
+            dbg64_dec(c);
+            dbg64_str(" drive=");
+            dbg64_dec((uint64_t)(uint32_t)drive);
+            dbg64_str(" vol_start=");
+            dbg64_dec(g_start);
+            dbg64_str(" vol_blocks=");
+            dbg64_dec(g_blocks);
+            dbg64_str(" caller=0x");
+            dbg64_hex64((uint64_t)(uintptr_t)__builtin_return_address(0));
             dbg64_nl();
             return false;
         }
@@ -2329,6 +2384,11 @@ static bool inode_slot(uint32_t idx, uint32_t* out_blk, uint32_t* out_off) {
 static bool inode_load(uint32_t idx, uint8_t* out) {
     uint32_t blk = 0, off = 0;
     if (!inode_slot(idx, &blk, &off)) return false;
+    g_dbg_idx       = idx;
+    g_dbg_ino_blk   = blk;
+    g_dbg_ino_start = g_inode_start;
+    g_dbg_vol_start = g_start;
+    g_dbg_ino_caller = (uint64_t)(uintptr_t)__builtin_return_address(0);
     const uint32_t rel = blk - g_inode_start;            // inode 表内的**相对块号**（窗口按它对齐）
     if (!ino_cache_hit(g_drive, rel)) {
         if (!ino_cache_fill(g_drive, rel)) { ino_cache_invalidate(); return false; }
@@ -2916,7 +2976,54 @@ static int read_at_inode(const uint8_t* ino, uint32_t off, void* buf, uint32_t l
         uint32_t blk = 0;
         if (!rmap_get(&r, ino, i, &blk)) { log_op_fail("read_at64", "bad block chain"); return -1; }
         if (blk == 0) { log_op_fail("read_at64", "hole in file (corrupt chain)"); return -1; }
-        if (!blk_ok_data(blk)) { log_bad_block(blk); return -1; }
+        if (!blk_ok_data(blk)) {
+            // ★ v0.10.1：越界块号要连"是 inode 的哪一个指针"一起留下现场 ——
+            //   只打一个 BAD block=<n> 根本判不出是直接块/一级间接里的脏指针，
+            //   还是 size 比实际块数大导致的"读到不存在的块"。
+            dbg64_line_begin64();
+            dbg64_str("[VFS64] read bad i=");
+            dbg64_dec(i);
+            dbg64_str(" off=");
+            dbg64_dec(off);
+            dbg64_str(" want=");
+            dbg64_dec(want);
+            dbg64_str(" size=");
+            dbg64_dec(size);
+            dbg64_str(" blk=");
+            dbg64_dec(blk);
+            dbg64_str(" d0=");
+            dbg64_dec(rd32(ino + VFS_I_D0));
+            dbg64_str(" d1=");
+            dbg64_dec(rd32(ino + VFS_I_D0 + 4));
+            dbg64_str(" d2=");
+            dbg64_dec(rd32(ino + VFS_I_D0 + 8));
+            dbg64_str(" d3=");
+            dbg64_dec(rd32(ino + VFS_I_D0 + 12));
+            dbg64_str(" ind=");
+            dbg64_dec(rd32(ino + VFS_I_IND));
+            dbg64_str(" type=");
+            dbg64_dec((uint64_t)(uint32_t)ino[VFS_I_TYPE]);
+            dbg64_str(" fake=");
+            dbg64_dec((uint64_t)(uint32_t)(g_fake_active ? 1 : 0));
+            dbg64_str(" path=");
+            dbg64_str(g_dbg_path[0] ? g_dbg_path : "?");
+            dbg64_str(" idx=");
+            dbg64_dec((uint64_t)g_dbg_idx);
+            dbg64_str(" ino_blk=");
+            dbg64_dec((uint64_t)g_dbg_ino_blk);
+            dbg64_str(" ino_start=");
+            dbg64_dec((uint64_t)g_dbg_ino_start);
+            dbg64_str(" vol_start=");
+            dbg64_dec((uint64_t)g_dbg_vol_start);
+            dbg64_str(" load_caller=0x");
+            dbg64_hex64(g_dbg_ino_caller);
+            dbg64_str(" caller=0x");
+            dbg64_hex64((uint64_t)(uintptr_t)__builtin_return_address(0));
+            dbg64_nl();
+            dbg64_line_end64();
+            log_bad_block(blk);
+            return -1;
+        }
         if (!blk_read(blk, g_sec)) return -1;
         const uint32_t blk_off = i * VFS64_BLOCK_BYTES;
         const uint32_t c0 = (off > blk_off) ? (off - blk_off) : 0u;
@@ -4148,6 +4255,7 @@ static int lookup_file64(const char* path, const char* op, uint32_t* out_idx, ui
     }
     if (inode_load_ok(idx, ino, op) != 0) return -1;
     if (ino[VFS_I_TYPE] != VFS64_TYPE_FILE) { log_op_fail(op, "not a file"); return -1; }
+    dbg_note_path(path);
     if (out_idx) *out_idx = idx;
     return 0;
 }
@@ -6212,6 +6320,7 @@ int vfs64_selftest64() {
         if (!have_ino_backup) ok = false;
 
         // 伪造"数据块指针越界"的 inode（槽 1，CRC 是对的）：read 必须拒绝，绝不越界读
+        g_sel_inject = 1;                                      // 打点里标 expect=inject
         if (dev_read(g_start + g_inode_start, 1, g_sel_b)) {
             uint8_t* bad = g_sel_b + VFS64_INODE_BYTES;        // v3：槽 1 在扇区内偏移 128
             zero_bytes(bad, VFS64_INODE_BYTES);
@@ -6234,6 +6343,14 @@ int vfs64_selftest64() {
                 if (!dev_write(g_start + g_inode_start, 1, g_sel_b)) ok = false;   // 清掉伪造项
             } else ok = false;
         } else ok = false;
+        g_sel_inject = 0;
+        // 正向证据：这条负向对照确实跑过（越界块号 = g_blocks + 7，被读路径拒绝）
+        dbg64_line_begin64();
+        dbg64_str("[VFS64] inject probe ok name=hack block=");
+        dbg64_dec((uint64_t)(g_blocks + 7u));
+        dbg64_str(" refused=1 (out-of-range data pointer, CRC valid)");
+        dbg64_nl();
+        dbg64_line_end64();
 
         // 伪造"inode CRC 不对"：stat/read 必须拒绝
         if (dev_read(g_start + g_inode_start, 1, g_sel_b)) {

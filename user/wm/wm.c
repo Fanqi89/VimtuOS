@@ -112,13 +112,33 @@ static int            g_have_bg = 0;
 static int g_lastx[WM_LAST_MAX], g_lasty[WM_LAST_MAX];
 static int g_lastw[WM_LAST_MAX], g_lasth[WM_LAST_MAX], g_lastn = 0;
 static void wm_remember(struct WmSlot* slots) {
-    g_lastn = 0;
-    for (int i = 0; i < WM_MAX_SURF && g_lastn < WM_LAST_MAX; i++) {
+    // ★ v0.10.1：**全部客户端刚销毁时不清备忘录**。
+    //   现场证据（tests/wm64_test.py ⑦ 红）：
+    //     [WM] exit handback color=0xff202020 px=0 frames=139 bg=1 area=0 wins=0
+    //   wins=0 说明 g_lastn 被清成了 0：最后一个客户端销毁后还会再画一帧（surfs=0），
+    //   那一帧的 wm_remember() 把"我们画过的窗口矩形"抹掉了 —— 于是收工回填时
+    //   手里一个矩形都没有，px/area 只能是 0，"把地还回去"这句就成了假话。
+    //   语义：备忘录记录的是**最近一次真正画上屏的窗口矩形**，空列表不是新状态，
+    //   不覆盖上一次。
+    // ★ v0.10.1：这里的语义是**并集**，不是"最后一帧的活窗口集合"。
+    //   现场（tests/wm64_test.py ⑦ 的 px=8192 want=23552）：两个客户端先后退出，
+    //   先退的那个的矩形被后一帧的"活窗口只有 1 个"覆盖掉 —— 于是收工回填只还了
+    //   wmpanel 的 128x64 = 8192 px，而 wm 实际画过 160x96 + 128x64 = 23552 px。
+    //   并集才对：wm 画过的每一块地，收工时都要还回去（窗口挪过就两块都还）。
+    for (int i = 0; i < WM_MAX_SURF; i++) {
         if (!slots[i].used) continue;
-        g_lastx[g_lastn] = (int)slots[i].info.x;
-        g_lasty[g_lastn] = (int)slots[i].info.y;
-        g_lastw[g_lastn] = (int)slots[i].info.w;
-        g_lasth[g_lastn] = (int)slots[i].info.h;
+        const int x = (int)slots[i].info.x, y = (int)slots[i].info.y;
+        const int w = (int)slots[i].info.w, h = (int)slots[i].info.h;
+        if (w <= 0 || h <= 0) continue;
+        int dup = 0;
+        for (int k = 0; k < g_lastn; k++) {
+            if (g_lastx[k] == x && g_lasty[k] == y && g_lastw[k] == w && g_lasth[k] == h) { dup = 1; break; }
+        }
+        if (dup || g_lastn >= WM_LAST_MAX) continue;
+        g_lastx[g_lastn] = x;
+        g_lasty[g_lastn] = y;
+        g_lastw[g_lastn] = w;
+        g_lasth[g_lastn] = h;
         g_lastn++;
     }
 }
