@@ -72,6 +72,11 @@ bool nvme64_info64(int idx, DiskInfo* out);
 bool nvme64_read64 (int idx, uint32_t lba, uint32_t count, void* buf);
 bool nvme64_write64(int idx, uint32_t lba, uint32_t count, const void* buf);
 
+// ==================== v0.10.1: NVM Flush(0x00) ====================
+// 把该命名空间（第 idx 个，驱动号 = ATA64_NVME_BASE + idx）的控制器缓存刷到介质。
+// 打点：[NVME64] flush nsid=<n> ok | FAILED。
+bool nvme64_flush64(int idx);
+
 // 只读自检：对第一个命名空间读 LBA 0（**不写盘**）+ 校验型号/容量。打 [NVME64] 行。
 // 没控制器/没就绪/没命名空间时返回 true 但打 "skipped (...)"（与 ahci64/usb/e1000 的 skipped 口径一致）。
 bool nvme64_selftest64();

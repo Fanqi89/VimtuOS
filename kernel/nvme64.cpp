@@ -64,6 +64,7 @@ static const uint32_t CSTS_CFS   = 1u << 1;
 // 命令码（只列用到的）
 static const uint8_t  NVME_OP_CREATE_SQ   = 0x01;   // Admin：Create I/O Submission Queue
 static const uint8_t  NVME_OP_WRITE       = 0x01;   // NVM：Write
+static const uint8_t  NVME_OP_FLUSH       = 0x00;   // NVM：Flush（v0.10.1：刷控制器缓存到介质）   // NVM：Write
 static const uint8_t  NVME_OP_READ        = 0x02;   // NVM：Read
 static const uint8_t  NVME_OP_CREATE_CQ   = 0x05;   // Admin：Create I/O Completion Queue
 static const uint8_t  NVME_OP_IDENTIFY    = 0x06;   // Admin：Identify
@@ -813,6 +814,26 @@ bool nvme64_write64(int idx, uint32_t lba, uint32_t count, const void* buf) {
 }
 
 // ==================== 只读自检 ====================
+// ==================== v0.10.1: NVM Flush(0x00) ====================
+// 与 nvme_xfer 同一条 I/O 队列（qid=1）、同一套门铃/完成相；无 PRP（不带数据）。
+// 注意：控制器可以不实现 Flush（那时返回 Invalid Field 之类的 SC）—— 这里如实返回 false，
+// 由上层把 fail 计数打出来，绝不假装刷新成功。
+bool nvme64_flush64(int idx) {
+    if (idx < 0 || idx >= g_ns_count) return false;
+    if (!g_io.used) return false;
+    uint32_t cmd[16] = {0};
+    cmd[0] = (uint32_t)NVME_OP_FLUSH | ((g_io.cid++ & 0xFFFFu) << 16);
+    cmd[1] = g_ns_nsid[idx];                                    // NSID：Flush 是按命名空间刷的
+    const bool ok = nvme_submit(g_io, cmd, nullptr, "io_flush");
+    dbg64_line_begin64();
+    dbg64_str("[NVME64] flush nsid=");
+    dbg64_dec((uint64_t)g_ns_nsid[idx]);
+    dbg64_str(ok ? " ok (cache synced)" : " FAILED");
+    dbg64_nl();
+    dbg64_line_end64();
+    return ok;
+}
+
 bool nvme64_selftest64() {
     nvme64_init64();                                // 幂等
     if (!g_ctrl.found) {

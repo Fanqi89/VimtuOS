@@ -1268,6 +1268,19 @@ int part_install_step(InstallJob* job) {
             }
         }
         if (!part_write_gpt64(job->dst_drive, job->write_table_at)) { job->failed = true; return -1; }
+        // ★ v0.10.1：宣布"装好了"之前先把目标盘的写缓存刷到介质。
+        //   理由：安装最后写下的就是卷超级块（part_volume_grow64 的收尾）与 GPT 备份头 ——
+        //   不带 FLUSH 时这两处可能还躺在设备缓存里，掉电 / 宿主强杀 VM 之后就是"装完却挂不上卷"。
+        {
+            const bool fok = ata64_flush64(job->dst_drive);
+            dbg64_line_begin64();
+            dbg64_str("[INSTALL] flush drive=");
+            dbg64_dec((uint64_t)job->dst_drive);
+            dbg64_str(fok ? " ok (cache synced to media)"
+                          : " FAILED (data may still sit in device cache)");
+            dbg64_nl();
+            dbg64_line_end64();
+        }
         job->active = false;
         job->done   = true;
         return 1;

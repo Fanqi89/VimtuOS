@@ -35,6 +35,7 @@ static int g_hold_flip_anim = 0;
 #include "mem_64.h"
 #include "x86_64.h"
 #include "port.h"
+#include "ata64.h"      // ★ v0.10.1：关机/重启前把每条盘的写缓存刷到介质（ata64_flush_all64）
 #include "acpi64.h"      // ★ 本批：关机/重启走固件（FADT PM1a_CNT_BLK + DSDT \_S5 + RESET_REG）
 // ---- 本轮接线：config64（配置）/ session64（会话策略）/ sysstate64（状态机+ring log）/ panic64（看门狗）----
 #include "config64.h"
@@ -817,6 +818,8 @@ static void power_wait_ms(int ms) {
         for (volatile int j = 0; j < 200000; j++) { }
 }
 void sys_reboot64() {
+    // ★ v0.10.1：复位同样会丢设备缓存 —— 与关机同一条刷盘路径（打点里 why=reboot）。
+    ata64_flush_all64("reboot");
     // 优雅停止：状态机 STOPPING -> 逆序停模块（含关窗）-> 会话快照 + 配置落盘 flush（store64）。
     // 看门狗在这里被挂起（sysstate64_stop_all64 内部调 panic64_watchdog_suspend64）。
     (void)sysstate64_stop_all64("reboot");
@@ -860,7 +863,10 @@ void sys_reboot64() {
 }
 
 void sys_shutdown64() {
+    // ★ v0.10.1：先停服务（不再有新写进来），再刷盘，最后才断电。
+    //   顺序不能反：刷完还有人写，等于白刷。
     (void)sysstate64_stop_all64("shutdown");
+    ata64_flush_all64("shutdown");
     power_anim_screen(gui64_tr("Shutting down...", "正在关机..."), "[UI] shutdown anim start");
     // ★ 本批：真 ACPI S5 —— 端口和睡眠类型都来自固件（FADT PM1a_CNT_BLK + DSDT \_S5），
     //   不再是"硬编码 QEMU 的 0x604"。阶梯（每一级都打点，只有没断电才往下走）：

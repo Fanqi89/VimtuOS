@@ -124,6 +124,8 @@ static const uint8_t ATA_CMD_IDENTIFY       = 0xEC;   // IDENTIFY DEVICE
 static const uint8_t ATA_CMD_IDENTIFY_PKT   = 0xA1;   // IDENTIFY PACKET DEVICE（ATAPI）
 static const uint8_t ATA_CMD_READ_DMA_EXT   = 0x25;   // READ DMA EXT（LBA48）
 static const uint8_t ATA_CMD_WRITE_DMA_EXT  = 0x35;   // WRITE DMA EXT（LBA48）
+static const uint8_t ATA_CMD_FLUSH_CACHE     = 0xE7;   // FLUSH CACHE（老盘只有这条）
+static const uint8_t ATA_CMD_FLUSH_CACHE_EXT = 0xEA;   // FLUSH CACHE EXT（v0.10.1 用这条）   // WRITE DMA EXT（LBA48）
 
 // PxSIG
 static const uint32_t SIG_ATA   = 0x00000101u;
@@ -167,6 +169,7 @@ static uint8_t   g_first_write_logged = 0;  // 首次写盘打一行证据（避
 static uint8_t   g_first_zcwrite_logged = 0; // ★ v0.9.40：首次**零拷贝**写盘打一行证据
 
 static bool ahci_port_start(Ahci64Dev& d);   // 前向声明（ahci_port_restart 会用）
+static bool ahci_port_recover(Ahci64Dev& d, uint8_t p);   // ★ v0.10.1：卡死 PxCI 的完整端口重建
 
 // ==================== PCI 配置空间（0xCF8/0xCFC）====================
 // 读：只写地址端口、读数据端口；写：只在**本驱动自己找到的设备**上开 MEM/BUS MASTER。
@@ -658,11 +661,18 @@ static bool ahci_cmd_retry(int di, uint8_t cmd, uint64_t lba, uint32_t count,
                            const Ahci64Prd* prds, int nprd, bool write, bool atapi_cmd) {
     if (ahci_cmd(di, cmd, lba, count, prds, nprd, write, atapi_cmd)) return true;
     Ahci64Dev& d = g_devs[di];
-    ahci_port_restart(d);
+    // ★ v0.10.1：先分辨"普通失败"还是"PxCI 卡死"。
+    //   设备拒了一条非法 LBA（越界 / 未初始化块指针）之后，有的 HBA 不会清 PxCI 的 slot 位；
+    //   这时 ST 位翻转（ahci_port_restart）**清不掉**它 -> 之后每条命令都在 ahci_cmd 开头
+    //   的 cmd-slot-busy 检查上失败，整块盘直到重启都不可用。卡死就必须走完整端口重建。
+    const bool stuck = (prd(d.port, P_CI) & 1u) != 0;
+    if (stuck) (void)ahci_port_recover(d, d.port);
+    else       ahci_port_restart(d);
     const bool ok = ahci_cmd(di, cmd, lba, count, prds, nprd, write, atapi_cmd);
     dbg64_line_begin64();
     dbg64_str("[AHCI64] port restart retry port="); dbg64_dec(d.port);
     dbg64_str(" cmd=0x"); dbg64_hex64(cmd);
+    dbg64_str(stuck ? " via=recover" : " via=restart");
     dbg64_str(" result="); dbg64_str(ok ? "ok" : "fail");
     dbg64_nl();
     dbg64_line_end64();
@@ -845,6 +855,48 @@ static bool ahci_port_start(Ahci64Dev& d) {
     prw(d.port, P_CMD, cmd | CMD_ST);
     // 注：CR(bit15)/FR(bit14) 是只读镜像位，回写无害；ST=1 之后硬件会置 CR。
     return ahci_wait(d.port, P_CMD, CMD_ST, CMD_ST, AHCI64_INIT_TICKS);
+}
+
+// ==================== ★ v0.10.1：端口恢复（stuck PxCI 只能靠重建清）====================
+// 现场（实测 QEMU ich9-ahci，见 tests/flush64_test.py 的证据链）：
+//   [AHCI64] cmd timeout port=0 cmd=0x25 ci=0x1 is=0x40000002 tfd=0x441   <- 设备拒了一条非法 LBA
+//   [AHCI64] port restart retry port=0 cmd=0x25 result=fail               <- ST 位翻转**清不掉** CI
+//   [AHCI64] xfer SKIP reason=cmd-slot-busy ...                           <- 之后整块盘不可用
+// 为什么 ST 翻转不够：卡住的 PxCI slot 位由硬件在命令完成时清；设备侧已经报错放弃，
+//   硬件就再也不会去清它。唯一可靠的办法是把端口整个重建一遍（停引擎 -> 清状态 ->
+//   COMRESET 让链路重新建立 -> 重挂命令表/FIS 区 -> FRE/ST=1）。
+// 这条路径只在"上一条命令留下 stuck CI"时才走，正常 I/O 一次都不会进来。
+static bool ahci_port_recover(Ahci64Dev& d, uint8_t p) {
+    const uint32_t ci0 = prd(p, P_CI);
+    const uint32_t is0 = prd(p, P_IS);
+    uint32_t cmd = prd(p, P_CMD);
+    if (cmd & CMD_ST) {
+        prw(p, P_CMD, cmd & ~CMD_ST);
+        (void)ahci_wait(p, P_CMD, CMD_CLO | CMD_CR, 0, AHCI64_INIT_TICKS);
+    }
+    cmd = prd(p, P_CMD);
+    if (cmd & CMD_FRE) prw(p, P_CMD, cmd & ~CMD_FRE);
+    // PxIS / PxSERR 都是 write-1-to-clear：这里按**已定义的位**清（不写全 1，避免踩到保留位）。
+    prw(p, P_IS, (is0 & 0xFC4000FFu) | 0u);
+    prw(p, P_SERR, 0xFFFFFFFFu);
+    // COMRESET：DET=0 拆链，硬件会自己重新建链并回到 DET=3（这一步同时把 stuck CI 归零）。
+    prw(p, P_SCTL, 0);
+    const bool up = ahci_wait(p, P_SSTS, 0xFu, 3u, AHCI64_INIT_TICKS * 4);
+    const bool started = ahci_port_start(d);
+    dbg64_line_begin64();
+    dbg64_str("[AHCI64] port recover port=");
+    dbg64_dec(p);
+    dbg64_str(" ci0=0x");
+    dbg64_hex64(ci0);
+    dbg64_str(" ci_now=0x");
+    dbg64_hex64(prd(p, P_CI));
+    dbg64_str(" link=");
+    dbg64_str(up ? "up" : "down");
+    dbg64_str(" start=");
+    dbg64_str(started ? "ok" : "fail");
+    dbg64_nl();
+    dbg64_line_end64();
+    return started && ((prd(p, P_CI) & 1u) == 0);
 }
 
 // ==================== 初始化 ====================
@@ -1260,6 +1312,29 @@ bool ahci64_write64(int idx, uint32_t lba, uint32_t count, const void* buf) {
         dbg64_nl();
         dbg64_line_end64();
     }
+    return ok;
+}
+
+// ==================== v0.10.1: FLUSH CACHE EXT ====================
+// 为什么单独一条函数而不是塞进 ahci_xfer：ahci_xfer 是"搬数据"的（要 PRDT、要暂存页），
+// 而 FLUSH 是**无数据命令** —— PRDTL=0、没有 PRDT 项、完成靠一条 DHRS FIS。硬塞进去会让
+// ahci_xfer 的 count==0 早退（那条早退是给"零长度写"用的），命令根本发不出去。
+// 坑位与读写完全一致：必须持 IO 锁（ahci_cmd 会自检）、端口必须 ST=1、上一条必须已收尾。
+bool ahci64_flush64(int idx) {
+    const int di = ahci_drive_index(idx);
+    if (di < 0) { ahci_fail_note64("flush-no-dev", di, 0, 0); return false; }
+    Ahci64IoSpan io;
+    if (!io.held) { ahci_fail_note64("flush-io-lock", di, 0, 0); return false; }
+    // LBA/sector-count 全 0：FLUSH 命令不使用这两个字段，写 0 才是规范形态。
+    const bool ok = ahci_cmd_retry(di, ATA_CMD_FLUSH_CACHE_EXT, 0, 0, nullptr, 0, false, false);
+    dbg64_line_begin64();
+    dbg64_str("[AHCI64] flush dev=");
+    dbg64_dec((uint64_t)(uint32_t)idx);
+    dbg64_str(" port=");
+    dbg64_dec((uint64_t)g_devs[di].port);
+    dbg64_str(ok ? " ok (cache synced)" : " FAILED (cmd error/timeout line above)");
+    dbg64_nl();
+    dbg64_line_end64();
     return ok;
 }
 

@@ -551,6 +551,83 @@ static uint32_t g_ata_usb_wlogs = 0;                 // [USBST] write drive=.. �
     return true;
 }
 
+// ==================== v0.10.1: FLUSH CACHE（PATA 侧）====================
+// 命令本身没有扇区数、没有数据：选盘 -> 等 BSY=0 -> 发命令 -> 等 BSY=0 且 DRQ=0。
+// 等待与读写同一条路径（IRQ14 优先 + 160ms 有界超时回退轮询），所以既不会漏掉"只来中断不置 DRQ"
+// 的完成方式，也不会挂死。ERR 位（0x01）一律当失败（老盘收 0xEA 会回 ABRT，由调用方回退 0xE7）。
+static bool ata_pio_flush_once(int drive, uint8_t cmd) {
+    const uint16_t io = base_port(drive);
+    outb((uint16_t)(io + 6), (uint8_t)drive_select(drive));
+    ata_delay(drive);
+    if (!ata_wait_ready(drive)) { ata64_dbg_reason = 1; return false; }
+    ata64_irq_arm(drive);                       // 清完成标志（别把上一条命令的 IRQ 当自己）
+    outb((uint16_t)(io + 7), cmd);
+    return ata_wait_done_irq(drive);
+}
+
+static int g_ata64_flush_logs = 0;               // [ATA64] flush 行预算（防刷屏）
+bool ata64_flush64(int drive) {
+    bool ok = false;
+    const char* path = "pata";
+    const char* why  = "";
+    if (drive >= ATA64_USB_BASE) {
+        path = "usb"; why = "no-sync-cache-command-in-this-build";
+    } else if (drive >= ATA64_NVME_BASE) {
+        path = "nvme";
+        ok = nvme64_flush64(drive - ATA64_NVME_BASE);
+        if (!ok) why = "nvme-failed";
+    } else if (drive >= ATA64_AHCI_BASE) {
+        path = "ahci";
+        ok = ahci64_flush64(drive - ATA64_AHCI_BASE);
+        if (!ok) why = "ahci-failed";
+    } else if (drive >= 0 && drive < 4) {
+        path = "pata";
+        ok = ata_pio_flush_once(drive, 0xEA);            // FLUSH CACHE EXT 先试
+        if (!ok) ok = ata_pio_flush_once(drive, 0xE7);   // 老盘回退 FLUSH CACHE
+        if (!ok) why = "pata-flush-failed";
+    } else {
+        path = "none"; why = "nodrive";                   // 4..7 是保留空洞（负向对照走这里）
+    }
+    if (g_ata64_flush_logs < 40) {
+        g_ata64_flush_logs++;
+        dbg64_line_begin64();
+        dbg64_str("[ATA64] flush drive=");
+        dbg64_dec((uint64_t)(uint32_t)drive);
+        dbg64_str(ok ? " ok path=" : " failed path=");
+        dbg64_str(path);
+        if (!ok) { dbg64_str(" reason="); dbg64_str(why); }
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    return ok;
+}
+
+void ata64_flush_all64(const char* why) {
+    const int n = ata64_drive_count64();
+    int present = 0, okc = 0, failc = 0;
+    for (int i = 0; i < n; i++) {
+        const int d = ata64_slot_to_drive64(i);
+        if (d < 0) continue;
+        // 只刷"确实有盘"的槽：PATA 的 0..3 是**恒定枚举**的四个位置，真机上常常一个都没有，
+        // 拿它们去刷只会得到 4 条"失败"噪音。identify 是只读的，关机/重启前做一次很便宜。
+        DiskInfo di;
+        if (!ata64_identify(d, &di) || !di.present || di.atapi) continue;
+        present++;
+        if (ata64_flush64(d)) okc++; else failc++;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[ATA64] flush all why=");
+    dbg64_str(why ? why : "?");
+    dbg64_str(" drives=");
+    dbg64_dec((uint64_t)(uint32_t)present);
+    dbg64_str(" ok=");
+    dbg64_dec((uint64_t)(uint32_t)okc);
+    dbg64_str(" fail=");
+    dbg64_dec((uint64_t)(uint32_t)failc);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
 bool ata64_read_sector (int drive, uint32_t lba, void* buf)             { return ata64_read(drive, lba, 1, buf); }
 
 // ==================== 读路径诊断记录 ====================
@@ -890,7 +967,10 @@ void ata64_init64() {
     g_ata64_irq_enabled = 1;
     dbg64_str("[ATA64] irq14 enabled (irq-driven waits, polling fallback)");
     dbg64_nl();
-    (void)ata64_irq_selftest64();                       // 只读：读 LBA0，验证中断确实到达
+    (void)ata64_irq_selftest64();                       // 只读主通道 LBA0，验证中断确实到达
+    // ★ v0.10.1：负向对照 —— 驱动器号 4..7 是保留空洞（没有任何设备）。flush 必须**如实报失败**，
+    //   这一行同时证明 ata64_flush64 的 "ok" 不是无条件打印的（正向在安装收尾 / 关机路径）。
+    (void)ata64_flush64(4);                       // 只读：读 LBA0，验证中断确实到达
 }
 
 // 自检：主通道第一个 ATA 硬盘读 LBA 0（**只读，不写盘**）。

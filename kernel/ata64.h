@@ -69,6 +69,22 @@ bool ata64_read (int drive, uint32_t lba, uint32_t count, void* buf);
 //   非 USB 驱动器号走原来的 PATA/AHCI/NVMe 写路径（**一行都没改**，见函数体）。
 bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf);
 
+// ==================== v0.10.1: FLUSH CACHE (sync device cache to media) ====================
+// 为什么需要：READ/WRITE 返回成功只表示"数据进了设备（或它自己的缓存）"。没有 FLUSH 时，
+//   掉电 / 宿主强杀 VM 会丢掉最后一段写 —— 安装收尾刚写下的卷超级块和 GPT 备份头就在这一段里，
+//   丢掉的表现就是"装完重启挂载失败"。本批把三个驱动都补上，并接到真实调用点。
+// 分派与 ata64_write 完全一致（>=24 USB / >=16 NVMe / >=8 AHCI / 0..3 PATA）：
+//   * PATA：先发 FLUSH CACHE EXT(0xEA)，设备 ABRT 再回退 FLUSH CACHE(0xE7)（老盘只有后者）；
+//   * AHCI：H2D FIS 发 0xEA，一条命令、无 PRDT 项；
+//   * NVMe：NVM Flush(0x00) 打到该命名空间的 I/O 队列；
+//   * USB ：本版**没有** SCSI SYNCHRONIZE CACHE(10)，如实返回 false 并打点（绝不假装刷新成功）。
+// 返回 true 只代表"设备确认刷新完成"；驱动器自己的 FUA/缓存策略仍在其固件里。
+bool ata64_flush64(int drive);
+
+// 把手边所有盘刷一遍（关机/重启前调用）。why 只用于打点（"shutdown" / "reboot"）。
+// 打一行汇总：[ATA64] flush all why=<why> drives=<n> ok=<k> fail=<m>
+void ata64_flush_all64(const char* why);
+
 
 // ---------------- ATAPI（光驱）：PACKET 命令 + PIO 读 ----------------
 // 为什么需要它：64 位安装介质的正确形态是 **ISO**（光盘/U 盘/虚拟机光驱），

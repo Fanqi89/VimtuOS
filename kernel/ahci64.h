@@ -81,6 +81,12 @@ bool ahci64_info64(int idx, DiskInfo* out);
 bool ahci64_read64 (int idx, uint32_t lba, uint32_t count, void* buf);
 bool ahci64_write64(int idx, uint32_t lba, uint32_t count, const void* buf);
 
+// ==================== v0.10.1: FLUSH CACHE EXT(0xEA) ====================
+// 把该盘（AHCI 侧第 idx 块 ATA 盘，驱动号 = ATA64_AHCI_BASE + idx）的写缓存刷到介质。
+// 与读写用同一把 IO 锁、同一套"轮询 PxCI + 自报失败现场"；无数据、无 PRDT 项。
+// 打点：[AHCI64] flush dev=<idx> port=<p> ok | FAILED（失败时上面紧邻一行是 cmd error/timeout）。
+bool ahci64_flush64(int idx);
+
 // 只读自检：对每块 ATA 盘读 LBA 0（**不写盘**）+ 校验 IDENTIFY 结果；打 [AHCI64] 行。
 // 没有控制器时返回 true 但打 "skipped (no controller)"（与 e1000/usb 的 skipped 口径一致）。
 bool ahci64_selftest64();
