@@ -22,6 +22,9 @@
 #include "mem_64.h"       // page_count_free_64（演示的页池基线核对）
 #include "vfs64.h"        // 在系统卷里按路径找 /wlclient.elf（**不内嵌**，见下）
 #include "app64.h"        // app64_main_part_lba64（挂系统卷时的分区起点）
+// ★ W3 第四批：挂系统卷要能按盘遍历（AHCI-only 机器上 drive 0 是空的 PATA 槽）
+extern int ata64_drive_count64();
+extern int ata64_slot_to_drive64(int slot);
 
 // 需要调度器提供的有界睡眠（安装介质内核不链 task64 -> 这个弱引用为 0，退化为 PIT 忙等）
 extern "C" void task_sleep_ms64(uint32_t ms) __attribute__((weak));
@@ -1268,7 +1271,24 @@ int wl64_demo64(const char* path) {
         wl64_end64();
         return 0;
     }
-    if (vfs64_mount_system64(0, app64_main_part_lba64(0)) != 0) {
+    bool wl_sys_ok = (vfs64_mount_system64(0, app64_main_part_lba64(0)) == 0);
+    if (!wl_sys_ok) {
+        for (int wsd = 1; wsd < ata64_drive_count64(); wsd++) {
+            const int wdd = ata64_slot_to_drive64(wsd);
+            if (wdd <= 0) continue;
+            const uint32_t wdl = app64_main_part_lba64(wdd);
+            if (wdl == 0) continue;
+            if (vfs64_mount_system64(wdd, wdl) == 0) {
+                wl64_begin64();
+                wl64_puts64("[WL64] system volume drive="); wl64_udec64((uint64_t)wdd);
+                wl64_puts64(" scanned=1 (drive 0 has no VimtuFS2 volume; this disk is not on PATA)\n");
+                wl64_end64();
+                wl_sys_ok = true;
+                break;
+            }
+        }
+    }
+    if (!wl_sys_ok) {
         wl64_begin64();
         wl64_puts64("[WL64] demo skipped (no system volume)\n");
         wl64_end64();
@@ -1395,7 +1415,24 @@ int wl64_wm64(const char* wm_path) {
         wl64_end64();
         return 0;
     }
-    if (vfs64_mount_system64(0, app64_main_part_lba64(0)) != 0) {
+    bool wl_sys_ok = (vfs64_mount_system64(0, app64_main_part_lba64(0)) == 0);
+    if (!wl_sys_ok) {
+        for (int wsd = 1; wsd < ata64_drive_count64(); wsd++) {
+            const int wdd = ata64_slot_to_drive64(wsd);
+            if (wdd <= 0) continue;
+            const uint32_t wdl = app64_main_part_lba64(wdd);
+            if (wdl == 0) continue;
+            if (vfs64_mount_system64(wdd, wdl) == 0) {
+                wl64_begin64();
+                wl64_puts64("[WL64] system volume drive="); wl64_udec64((uint64_t)wdd);
+                wl64_puts64(" scanned=1 (drive 0 has no VimtuFS2 volume; this disk is not on PATA)\n");
+                wl64_end64();
+                wl_sys_ok = true;
+                break;
+            }
+        }
+    }
+    if (!wl_sys_ok) {
         wl64_begin64();
         wl64_puts64("[WL64] wm skipped (no system volume)\n");
         wl64_end64();
