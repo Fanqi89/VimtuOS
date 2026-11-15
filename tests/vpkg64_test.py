@@ -73,6 +73,7 @@ ROW0_Y, ROW_H = 14, 12
 BTN_Y, BTN_H = 48, 12
 BTN_INSTALL_X, BTN_INSTALL_W = 4, 60
 BTN_LAUNCH_X, BTN_LAUNCH_W = 132, 58
+CO_BG = (0x14, 0x18, 0x1F)                    # store.c 的 CO_BG（窗口底色，用来自证矩形找对了）
 CO_OK = (0x3F, 0xB5, 0x5F)                    # store.c 的 CO_OK（"装了"的绿图标/进度条）
 CO_ROWSEL = (0x2E, 0x4A, 0x6C)                # store.c 的 CO_ROWSEL（选中行底色）
 
@@ -322,12 +323,17 @@ class Pad:
         self.x, self.y = abs_x, abs_y
 
 
-def last_store_mouse(vm, panel):
-    """返回最近一条 [STORE] mouse 的**屏幕绝对坐标**（window 在 panel 原点）。"""
-    ms = re.findall(r"\[STORE\] mouse sx=(-?\d+) sy=(-?\d+) x=(-?\d+) y=(-?\d+)", vm.log())
+def last_store_mouse(vm, panel=None, since=0):
+    """返回最近一条 [STORE] mouse 的**屏幕绝对坐标**。
+
+    `since=`：只看这个日志位置之后的（闭环纠偏必须用**新鲜**真值，见 pointer_to）。
+    内核只在位移非 0 时发 MOUSE_MOVE，store 又只在指针**落在自己窗口里**时打点，
+    所以"这段里最后一条"就是"最后一次指在窗口内的真实位置"。"""
+    ms = re.findall(r"\[STORE\] mouse sx=(-?\d+) sy=(-?\d+) x=(-?\d+) y=(-?\d+)",
+                    vm.log()[since:])
     if not ms:
         return None
-    sx, sy, ex, ey = (int(v) for v in ms[-1])
+    _sx, _sy, ex, ey = (int(v) for v in ms[-1])
     return (ex, ey)
 
 
@@ -447,7 +453,59 @@ def vol_bytes(img):
         return f.read(FRESH_VOL_SECTORS * 512)
 
 
+# ---- 内核别名表的**镜像**（kernel/vfs64.cpp 的 kPathAlias，顺序与规则一并对齐）----
+# 卷上根本没有 bin / lib 这些目录：`/bin -> /usr/bin`、`/lib -> /usr/lib` 是**内核**
+# vfs64_alias_path64() 在路径入口做的重写。宿主侧要读同一份字节就必须过同一张表，
+# 否则 vol_read("/bin/hello-cli") 会去读一个不存在的目录（实测 -> None），
+# 而客户机里 `run /bin/hello-cli` 是好的 —— 判据本意成立，只是读错路径。
+VOL_ALIAS = [
+    ("/musl_hello.elf", "/usr/share/demo/musl_hello.elf"),
+    ("/dynhello.elf",   "/usr/share/demo/dynhello.elf"),
+    ("/filedemo.elf",   "/usr/share/demo/filedemo.elf"),
+    ("/proc64.elf",     "/usr/share/demo/proc64.elf"),
+    ("/pipe64.elf",     "/usr/share/demo/pipe64.elf"),
+    ("/xmmsse.elf",     "/usr/share/demo/xmmsse.elf"),
+    ("/evshm.elf",      "/usr/share/demo/evshm.elf"),
+    ("/sig64.elf",      "/usr/share/demo/sig64.elf"),
+    ("/epipe.elf",      "/usr/share/demo/epipe.elf"),
+    ("/hello.vap",      "/usr/share/demo/hello.vap"),
+    ("/hello.elf",      "/usr/share/demo/hello.elf"),
+    ("/spin.elf",       "/usr/share/demo/spin.elf"),
+    ("/hello",          "/usr/share/demo/hello"),
+    ("/etc/iconpack.bin",     "/System/icons/iconpack.bin"),
+    ("/etc/icon_mypc.bin",    "/System/icons/icon_mypc.bin"),
+    ("/etc/icon_term.bin",    "/System/icons/icon_term.bin"),
+    ("/etc/icon_start.bin",   "/System/icons/icon_start.bin"),
+    ("/etc/icon_recycle.bin", "/System/icons/icon_recycle.bin"),
+    ("/etc/logo.bin",         "/System/icons/logo.bin"),
+    ("/Fonts-open/", "/System/fonts/"),
+    ("/make-demo/",  "/usr/share/demo/make-demo/"),
+    ("/opt/vpkg/",   "/var/vpkg/"),
+    ("/Fonts/",      "/System/fonts/"),
+    ("/icons/",      "/System/icons/"),
+    ("/www/",        "/usr/share/www/"),
+    ("/tcc/",        "/usr/lib/tcc/"),
+    ("/bin/",        "/usr/bin/"),
+    ("/lib/",        "/usr/lib/"),
+]
+
+
+def vol_alias(path):
+    """按内核 kPathAlias 重写路径（整段匹配：/lib 不命中 /libfoo）；不命中原样返回。"""
+    if not path or not path.startswith("/"):
+        return path
+    for frm, to in VOL_ALIAS:
+        cn = len(frm.rstrip("/"))
+        if cn == 0 or path[:cn] != frm[:cn]:
+            continue
+        if len(path) > cn and path[cn] != "/":
+            continue
+        return to.rstrip("/") + path[cn:]
+    return path
+
+
 def vol_read(tp, vol, path):
+    path = vol_alias(path)               # ★ 与内核同一把尺子（见上面 VOL_ALIAS）
     total = struct.unpack_from("<I", vol, 20)[0]
     inodes = struct.unpack_from("<I", vol, 40)[0]
     parts = [p for p in path.split("/") if p]
@@ -708,8 +766,14 @@ def main():
 
         want_hello_payload = vap_payload(repo_host[by_name["hello-cli"]["file"]])
         got_bin = vol_read(tp, vol, "/bin/hello-cli")
-        check("⑩ /bin/hello-cli 存在且 == .vap64 的 payload 段（逐字节 %d B）"
-              % len(want_hello_payload), got_bin == want_hello_payload)
+        # ★ 判据加强：卷上必须**没有** bin 目录（别名真被用上），且归一后与 /usr/bin/... 读到
+        #   的字节完全一致 —— 否则"读错路径返回 None"也能满足 == None 型的假绿。
+        check("⑩ /bin/hello-cli 存在且 == .vap64 的 payload 段（逐字节 %d B，"
+              "经内核别名 -> %s，卷上无 bin 目录）"
+              % (len(want_hello_payload), vol_alias("/bin/hello-cli")),
+              got_bin is not None and got_bin == want_hello_payload
+              and vol_read(tp, vol, "/usr/bin/hello-cli") == got_bin
+              and vol_read(tp, vol, "bin/hello-cli") is None)
         got_share = vol_read(tp, vol, "/usr/share/hello-cli/hello-cli.vap64")
         check("⑩ /usr/share/hello-cli/hello-cli.vap64 == 仓库里的包本体（逐字节 %d B）"
               % len(repo_host[by_name["hello-cli"]["file"]]),
@@ -800,14 +864,35 @@ def main():
                             r"row2=vpkg-debdemo state0=installed", 60)
             check("[STORE] 列表渲染打点（row0=hello-cli(installed) row1=gui-demo row2=vpkg-debdemo）",
                   mr is not None, mr.group(0) if mr else "")
-            # 窗口在屏上的位置（内核打点）+ 指针闭环用的 surface 原点
+            # ---- 窗口在屏上的**真实**原点（★ v0.10.4 修的就是这里）----
+            # 老写法用 `[WL64] surface create … pos=x,y` = 内核创建 surface 时的**默认槽位**
+            # （右下角面板区 964,532）。但 Ring 3 合成器 user/wm/wm.c 会先用 27 号把新窗口
+            # 挪到屏幕正中并在那里合成（`[WM] place id=1 pos=512,370 mode=center`），
+            # 于是像素矩形与点击坐标全落在桌面壁纸上：
+            #   rect=(964,532) -> CO_OK=0 px / CO_ROWSEL=0 px，而"亮像素>=300"被壁纸
+            #                     顶过去（该区 14340 px）=> 假绿；点击也全打空。
+            #   rect=(512,370) -> CO_OK=114 px / CO_ROWSEL=2440 px，图标区 64 px 全绿。
+            # 所以原点只能取**合成器自己报的那一份**。
             mw = vm.wait_re(r"\[WL64\] surface create id=(\d+) w=256 h=60 shm=\d+ pid=%d px=\d+ "
                             r"fmt=\d+ slot=\d+ pos=(-?\d+),(-?\d+)" % (store_pid, ), 60)
-            check("内核 surface 表里有商店的窗口（带屏上坐标 pos=x,y）", mw is not None,
+            check("内核 surface 表里有商店的窗口（创建时的默认 pos=x,y）", mw is not None,
                   mw.group(0) if mw else "")
-            panel_x = int(mw.group(2)) if mw else 964
-            panel_y = int(mw.group(3)) if mw else 532
-            print("[vpkg64] 商店窗口屏上原点 = (%d, %d)" % (panel_x, panel_y))
+            create_x = int(mw.group(2)) if mw else -1
+            create_y = int(mw.group(3)) if mw else -1
+            mrect = vm.wait_re(r"\[WM\] surf id=\d+ pid=%d "
+                               r"rect=(-?\d+),(-?\d+),(\d+),(\d+)" % (store_pid, ), 60)
+            check("合成器给出窗口的**屏上真实矩形**（[WM] surf … rect=x,y,w,h）",
+                  mrect is not None, mrect.group(0) if mrect else "")
+            if mrect:
+                panel_x, panel_y = int(mrect.group(1)), int(mrect.group(2))
+                panel_w, panel_h = int(mrect.group(3)), int(mrect.group(4))
+            else:                                   # 兜底：退回 [WM] place 的落点
+                mpl = vm.wait_re(r"\[WM\] place id=\d+ pos=(-?\d+),(-?\d+) mode=", 1)
+                panel_x = int(mpl.group(1)) if mpl else create_x
+                panel_y = int(mpl.group(2)) if mpl else create_y
+                panel_w, panel_h = STORE_W, STORE_H
+            print("[vpkg64] 商店窗口屏上原点 = (%d, %d) %dx%d（创建时默认 %d,%d）"
+                  % (panel_x, panel_y, panel_w, panel_h, create_x, create_y))
             time.sleep(1.0)
 
             # ---- 像素/墨迹断言：列表渲染 ----
@@ -819,28 +904,55 @@ def main():
                 w, h, px = shot
                 rect = (panel_x, panel_y, panel_x + STORE_W, panel_y + STORE_H)
                 bright = count_bright(px, w, h, rect, 120)
-                check("列表渲染有墨迹（窗口里亮像素 >= 300：标题 + 三行文字）", bright >= 300,
-                      "bright=%d" % bright)
+                bg = count_color(px, w, h, CO_BG, 6, rect)
+                # ★ 判据加强：光"亮像素多"不算数（壁纸区 14340 px 也亮）。必须同时
+                #   看到**商店自己的背景色**，才证明这个矩形真的是那个窗口。
+                check("列表渲染有墨迹（窗口里亮像素 >= 300 且窗口底色 CO_BG >= 500 px）",
+                      bright >= 300 and bg >= 500, "bright=%d bg=%d" % (bright, bg))
+                check("窗口矩形在屏内（原点来自合成器，不是默认槽位）",
+                      panel_x >= 0 and panel_y >= 0
+                      and panel_x + STORE_W <= w and panel_y + STORE_H <= h,
+                      "rect=%d,%d %dx%d screen=%dx%d"
+                      % (panel_x, panel_y, STORE_W, STORE_H, w, h))
                 green = count_color(px, w, h, CO_OK, 20, rect)
                 check("第 1 行（hello-cli 已装）的**绿图标**在屏上（>= 40 px）", green >= 40,
                       "green=%d" % green)
                 sel = count_color(px, w, h, CO_ROWSEL, 12, rect)
                 check("选中行底色在屏上（>= 200 px）", sel >= 200, "sel=%d" % sel)
 
+            # kernel/input.cpp 把光标初始化在 (512,384)（mouse_x = 512; mouse_y = 384;），
+            # 登录手势只用键盘，所以指针还在那儿 —— 模型起点用它最省事也最准。
             pad = Pad(mon, vm, start=(512, 384))
 
+            def pointer_to(tx, ty, tol=2, rounds=4):
+                """把指针走到 (tx,ty)：模型预估 + **每轮拿 store 自报的真值重置模型**。
+
+                ★ v0.10.4：qemu monitor 的 mouse_move 会被 PS/2 设备**并包**（两条指令合成
+                  一个包），客人按 `dx*17/10` 对**整包**取整，模型按**单包**取整 -> 逐步
+                  累计 1 px 级漂移。所以必须"走 -> 读真值 -> 重置 -> 再走"。
+                  旧写法拿整段日志的最后一条来校：指针一旦离开窗口 store 就不再打点，
+                  模型会被反复重置到**很久以前**的位置，越纠越偏。
+                  `since=` 保证了只用这一轮之后的新鲜真值。"""
+                for _ in range(rounds):
+                    n_ = vm.n()
+                    pad.move_to(tx, ty, tol=tol)
+                    time.sleep(0.30)             # 让 store 的帧循环吃掉最后几包
+                    fresh = last_store_mouse(vm, since=n_)
+                    if not fresh:                # 指针不在窗口里：store 不报，只能用模型
+                        return abs(pad.x - tx) <= tol and abs(pad.y - ty) <= tol
+                    pad.resync(fresh[0], fresh[1])
+                    if abs(fresh[0] - tx) <= tol and abs(fresh[1] - ty) <= tol:
+                        return True
+                return False
+
             def click_panel(local_x, local_y, want, tries=3, wait=1.4):
-                """点窗口内的 (local_x, local_y)：先用模型走过去，再用 store 报的坐标闭环校正。"""
+                """点窗口内的 (local_x, local_y)：闭环走到位，再落键。"""
                 tx, ty = panel_x + local_x, panel_y + local_y
-                n1 = vm.n()
                 for k in range(tries):
-                    pad.move_to(tx, ty, tol=3)
-                    # 用 store 自报的鼠标坐标校正（它只在指针**落在窗口里**时才报）
-                    last = last_store_mouse(vm, None)
-                    if last:
-                        pad.resync(last[0], last[1])
+                    n1 = vm.n()
+                    pointer_to(tx, ty)
                     mon.move(0, 0, wait=0.05)
-                    mon.click(wait=0.8)
+                    mon.click(wait=0.9)
                     if vm.wait_mark(want, wait, since=n1):
                         return True
                     tx += (4 if k % 2 == 0 else -8)

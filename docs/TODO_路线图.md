@@ -170,3 +170,22 @@ U:bootinfo lfb=… lfb64=… src=gop hi=0|1
 [G64] … bar0=… mmio=ok|absent
 [AHCI64] pci … abar=…            [NVME64] pci … bar0=…（或 skip reason=bar0-above-4g）
 ```
+
+## 11. 商店验收（`tests/vpkg64_test.py`）—— **v0.10.4 结案（保留记录）**
+
+v0.10.3 封存时这里的门禁是 82/82、实测 61 PASS / 20 FAIL。v0.10.4 全部关掉，
+`vpkg64_test` 回到 **84/84 PASS**（判据条数只增不减：82 → 84）。细节见
+`docs/RELEASE_v0.10.4.md`。留三条**下次别再踩**的：
+
+1. **不要用内核 `[WL64] surface create … pos=` 当窗口原点**：那是**创建时的默认槽位**
+   （右下角面板区 964,532）；Ring 3 合成器 `user/wm/wm.c` 会用 27 号把窗口挪到
+   屏幕正中/级联位，并在那里合成。真实矩形只能取 `[WM] surf id=… pid=… rect=x,y,w,h`
+   （兜底 `[WM] place … pos=`）。
+2. **"亮像素多"这种间接判据会漂移**：壁纸区实测 14340 亮像素，能顶过 `>= 300`。
+   必须配一条"只有这个窗口才有的东西"（`CO_BG` 窗口底色 >= 500 px）才叫闭环。
+3. **宿主侧解析卷要过内核别名表**：卷上没有 `bin`/`lib` 目录，
+   `/bin → /usr/bin`、`/lib → /usr/lib`、`/Fonts → /System/fonts` 等都是
+   `kernel/vfs64.cpp` 的 `kPathAlias[]`。`tests/vpkg64_test.py` 里的 `VOL_ALIAS`
+   是它的镜像 —— **内核改表时这里要一起改**。
+4. **指针闭环只能用新鲜真值**：`last_store_mouse(vm, since=…)`，别拿整段日志的最后一条
+   （store 只在指针落在窗口里时打点，指针一出窗口那"最后一条"就是很久以前的）。

@@ -1150,7 +1150,7 @@ def cap_app_store():
         "打包装卷：tools/store_pack_win.py（.vap64 复用 SDK vap64_pack；真 .deb 由宿主 Python 造；索引 "
         "index.json）命中 %d；build64.sh 只加『装进系统卷』那一段（命中 %d），VIMTUOS_VERSION 与预算阈值未动"
         % (pack, boot),
-        "验收 tests/vpkg64_test.py **82/82 PASS**：CLI install ok + `[HELLO-CLI] summary … rc=0` 真跑起来；"
+        "验收 tests/vpkg64_test.py **84/84 PASS**：CLI install ok + `[HELLO-CLI] summary … rc=0` 真跑起来；"
         "deb `deb control package=vpkg-debdemo` 装成功、维护者脚本 `maintainer scripts not supported`(rc=9)、"
         "xz `only gzip is supported`(rc=10) 整包拒绝且零残留；GUI：像素断言 -> `hit=row sel=1` -> `hit=install` ->"
         " `progress pct=100` -> `install ok` -> 第 2 行图标变绿 -> `hit=launch` -> `[DEMO-GUI] pid=29 done "
@@ -3300,7 +3300,7 @@ def cap_appreg():
         "包管理器安装时追加/卸载时删掉自己那条（user/store/vs_pkg.c 命中 %d）；manifest 取 display/exec/icon/icon_file" % pkg,
         "★ 变化通知**由写者触发**（kernel/fd64.cpp 的 fd64_close64 挂钩命中 %d）：写者关掉可写的 "
         "/etc/apps.json 时，内核在**它自己的上下文里**重读；桌面帧/开始菜单只比内存世代号 -> 帧里零磁盘 I/O" % hook,
-        "实测（本批真跑 tests/vpkg64_test.py **82/82**）：`[DESK64] app item idx=3 app=12 name=hello-cli … desktop=1 "
+        "实测（本批真跑 tests/vpkg64_test.py **84/84**）：`[DESK64] app item idx=3 app=12 name=hello-cli … desktop=1 "
         "x=112 y=24 total=4` / gui-demo total=5、`[START64] list idx=0 name=hello-cli … visible=1`、"
         "商店「安装 -> 启动」全通（[STORE] launch + [DEMO-GUI] frame + [WL64] surface create w=160 h=40）",
         "（边界，如实：① 快捷方式位置只在**用户拖动**时落盘（帧不写卷），没拖过的应用位置不跨重启；"
@@ -3416,7 +3416,7 @@ def cap_deb_chain():
         "--force-depends 会打 state=forced" % dep,
         "反例全部**整包拒绝**而不是假装成功（命中 %d）：bzip2/zstd 如实拒绝、带 preinst/postinst 的包整包拒绝、"
         "坏 sha256、空间不足" % ref,
-        "实测（本批真跑 tests/vpkg64_test.py **82/82**）：CLI + GUI 商店 + .deb（control.tar.gz/xz + data.tar.gz/xz）"
+        "实测（本批真跑 tests/vpkg64_test.py **84/84**）：CLI + GUI 商店 + .deb（control.tar.gz/xz + data.tar.gz/xz）"
         "+ 依赖满足/缺失/强制 + 6 条反例 + 宿主侧独立解析卷字节；配套 tests/store64_test.py",
         "（边界，如实：bzip2/zstd 不支持；Depends 的**版本区间不解析**（只比名字）；维护者脚本一律不执行）",
     ]
