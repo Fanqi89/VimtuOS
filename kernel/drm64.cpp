@@ -16,6 +16,15 @@
 #include "fb.h"            // fb_surface64 / fb_phys_* / fb_soft_flip_region64 / vblank 复用入口
 #include "virtio_gpu64.h"  // vgpu64_blit64（GPU 传输路径；没有设备时返回 0）
 #include "usermode64.h"    // user64_range_ok64 / user64_map_phys_page64 / USER64_FB_VA64 / PTE_*
+
+// ★ 编译期不变量：DRM 映射窗必须整个落在 [FB_VA + 8MiB, FB_VA + USER64_FB_DRM_END64) 之内。
+//   以前只靠 drm64.h 头注释里"4 个槽"这句话，常量却是 8 —— 于是 wl 合成器的映射窗
+//   （从 USER64_FB_DRM_END64 起）压在 slot 4/5 上，症状是拖动后留一块小拖影，极难查。
+static_assert(DRM64_MAX_FB64 * DRM64_UVA_SLOT_BYTES64 + DRM64_UVA_BASE_OFFSET64
+              <= USER64_FB_DRM_END64,
+              "DRM 映射窗（8 MiB + 槽数*槽长）必须落在 USER64_FB_DRM_END64 之内");
+static_assert(USER64_FB_BYTES64 >= USER64_FB_DRM_END64 + 16ULL * 1024ULL * 1024ULL,
+              "FB 映射区必须给 wl 的 surface 映射窗（16 MiB）留出位置");
 #include "mem_64.h"        // page_alloc_64 / page_free_64 / PAGE_SIZE_64 / PTE_*
 #include "x86_64.h"        // g_ticks64 / PIT_HZ_64 / TICK_MS_64 / ms_to_ticks64
 #include "input64.h"       // Ev64Event / ev64_current_queue64 / ev64_pop64（evdev 的数据源）

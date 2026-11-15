@@ -5376,7 +5376,16 @@ static bool term_release_state(Window* w) {
 static void term_key(Window* w, char c) {
     TerminalState* ts = ts_of(w);
     if (!ts || !ts->used) return;
-    if (c == 0x1B) {                       // Esc 关闭本窗口（与计算器/扫雷/设置一致）
+    // ★ v0.10.5：**shell 模式下的 ESC 归 shell**，不再当成"关闭本窗口"。
+    //   真因：一次 ESC 会被两条通道同时投递 —— (a) EV64 捕获者（/lib/wm.elf）转发给
+    //   wl 客户端；(b) gui64 的 kbd 环 -> 最前窗口的 on_key 就是这里。旧实现让 (b) 把
+    //   终端窗口关掉，而关窗 = term_release_state() = sh64_stop64() 杀掉 ring3 外壳。
+    //   实测症状：看完图按 ESC 回终端，终端/shell 已被杀，之后敲什么都没人执行
+    //   （[SH64] exit pid=26 + [APP] term closed）。
+    //   真终端语义：ESC(0x1B) 是给前台程序的普通字节。只有**非 shell 会话**的终端
+    //   才保持"Esc 关闭本窗口"（与计算器/扫雷/设置一致，sysstate64_test 依赖）。
+    if (c == 0x1B) {
+        if (sh64_owns64(ts)) { sh64_in64(0x1B); return; }
         term_release_state(w);             // 先接管状态（避免外壳释放 / 本文件释放撞车）
         gui64_destroy_window(w);
         return;

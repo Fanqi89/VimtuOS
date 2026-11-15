@@ -78,15 +78,85 @@ def main():
         sys.stderr.write("输入卷只有 %d 扇区 < 需要的 %d 扇区\n" % (total, vol_sectors))
         return 2
 
+    # ★ 先算空间：装不下的单个文件跳过并【大声告警】，绝不让一个 6.8 MB 的壁纸
+    #   把整条构建链打断（res/wallpapers 是用户投放目录，内容不受版本控制）。
+    #   注意：必须在 put **之前**判断 —— put 撞墙时已经把块占掉一半，后面小文件会被饿死。
+    def free_bytes():
+        n = 0
+        for blk in range(vol.data_start, vol.total):
+            if blk not in vol.used:
+                n += 1
+        return n * SECTOR
+
+    # ★ 尺寸守卫：kernel/img64.cpp 的 JPEG 解码上限是 JPG64_MAXDIM = 2048（任一边超了就返回 -2），
+    #   壁纸超限时内核只会**静默回落内置壁纸** —— 用户选了没反应，是最难查的一类"假正常"。
+    #   所以装卷阶段就挡掉，并在构建日志里大声说清楚。
+    JPG_MAXDIM = 2048
+
+    def img_dims(b):
+        """返回 (w, h)；PNG 读 IHDR，JPEG 扫 SOF0/SOF1/SOF2，其它返回 None。"""
+        import struct as _st
+        if b[:8] == b"\x89PNG\r\n\x1a\n" and b[12:16] == b"IHDR":
+            return _st.unpack_from(">II", b, 16)
+        if b[:2] == b"\xff\xd8":
+            i = 2
+            while i < len(b) - 3:
+                if b[i] != 0xFF:
+                    i += 1
+                    continue
+                m = b[i + 1]
+                if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7:
+                    i += 2
+                    continue
+                ln = _st.unpack_from(">H", b, i + 2)[0]
+                if m in (0xC0, 0xC1, 0xC2, 0xC3):
+                    h, w = _st.unpack_from(">HH", b, i + 5)
+                    return (w, h)
+                i += 2 + ln
+        return None
+
+    written = {}
+    skipped = []
     for path in sorted(files):
-        vol.put(path, files[path][0], mode=files[path][1])
+        data = files[path][0]
+        if path.startswith("/Wallpapers/"):
+            dims = img_dims(data)
+            if not dims:
+                skipped.append((path, len(data), -1))
+                continue
+            if dims[0] > JPG_MAXDIM or dims[1] > JPG_MAXDIM:
+                skipped.append((path, len(data), -2))
+                continue
+        # 余量：间接块（每 2048 B 一个）+ 目录项/元数据，统一留 64 KiB
+        need = len(data) + 65536
+        if free_bytes() < need:
+            skipped.append((path, len(data), free_bytes()))
+            continue
+        vol.put(path, data, mode=files[path][1])
+        written[path] = data
     out = vol.finish()
-    bad = TP.verify(out, {p: files[p][0] for p in files})
+    if skipped:
+        sys.stderr.write("    [WARN] 系统卷放不下这 %d 个预设文件，已跳过（用户投放目录太大）：\n"
+                         % len(skipped))
+        for p, sz, fr in skipped:
+            if fr == -1:
+                sys.stderr.write("    [WARN]   跳过 %-30s = %8d B（不是 PNG/JPEG，内核解不出来）\n"
+                                 % (p, sz))
+            elif fr == -2:
+                sys.stderr.write("    [WARN]   跳过 %-30s = %8d B（尺寸超过内核 JPEG 解码上限 %d）\n"
+                                 % (p, sz, JPG_MAXDIM))
+            else:
+                sys.stderr.write("    [WARN]   跳过 %-30s = %8d B（卷空间不足，跳过时剩余 %d B）\n"
+                                 % (p, sz, fr))
+        sys.stderr.write("    [WARN] 想全装进去：把 res/wallpapers/ 里的大图删掉/换小图，"
+                         "或加大卷容量（make_shellvol.DEFAULT_TARGET_SECTORS）\n")
+    bad = TP.verify(out, written)
     if bad:
         sys.stderr.write("卷回读自检失败：%s\n" % ", ".join(str(x) for x in bad[:5]))
         return 1
-    print("    预设卷自检 OK：%d 个文件逐字节回读一致（/Wallpapers %d 张 / /Avatars %d 张）"
-          % (len(files), len(walls), len(avas)))
+    print("    预设卷自检 OK：%d 个文件逐字节回读一致（/Wallpapers %d 张 / /Avatars %d 张，跳过 %d）"
+          % (len(written), len([p for p in written if p.startswith("/Wallpapers/")]),
+             len([p for p in written if p.startswith("/Avatars/")]), len(skipped)))
 
     if args.vol_out:
         with open(args.vol_out, "wb") as f:

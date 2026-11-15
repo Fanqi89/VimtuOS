@@ -979,7 +979,7 @@ int64_t wl64_surface_export64(uint64_t idx, uint64_t out_uptr) {
 }
 
 // 24 wl_surface_map(surf, out)：把该 surface attach 的缓冲页映射进**合成器**的地址空间。
-// 映射窗 = FB 映射区顶部 512 KiB 里的第 slot 个 64 KiB（见 wl64.h 的说明）。
+// 映射窗 = FB 映射区顶部 16 MiB 里的第 slot 个 2 MiB（见 wl64.h 的 WL64_SURF_WIN_STRIDE64）。
 // 幂等：同一个 surface 重复调用只重打一行 re=1（页表项写法相同，重写无副作用）。
 int64_t wl64_surface_map64(uint64_t surf, uint64_t out_uptr) {
     const int64_t pid = wl64_pid64();
@@ -1220,7 +1220,9 @@ int wl64_selftest64() {
         offsetof(Wl64SurfaceInfo, dmg_x) != 40 || offsetof(Wl64SurfaceInfo, flags) != 56) fail |= 16;
     if (offsetof(Wl64SurfaceMap, va) != 0 || offsetof(Wl64SurfaceMap, bytes) != 8 ||
         offsetof(Wl64SurfaceMap, pages) != 12) fail |= 16;
-    if (WL64_SURF_WIN_BYTES64 != (uint64_t)WL64_MAX_SURFACES64 * 65536ULL) fail |= 16;
+    if (WL64_SURF_WIN_BYTES64 != (uint64_t)WL64_MAX_SURFACES64 * WL64_SURF_WIN_STRIDE64) fail |= 16;
+    // ★ 不变量：映射窗步长必须装得下单 surface 的最大缓冲（像素上限 * 4B）
+    if (WL64_SURF_WIN_STRIDE64 < (uint64_t)WL64_MAX_PIXELS64 * 4ULL) fail |= 16;
     if (WL64_ABI_SURFACE_MOVE64 != 27) fail |= 16;      // ★ W3 第二批：27 = wl_surface_move
     if (WL64_MOVE_KEEP64 < 1 || WL64_MOVE_KEEP64 > 128) fail |= 16;   // 夹取余量必须"小但非零"
     {
@@ -1228,9 +1230,11 @@ int wl64_selftest64() {
         int bb_bytes = 0;
         (void)fb_surface_phys64(&bb_bytes);
         if (wl64_surf_win_base64() < USER64_FB_VA64) fail |= 16;
+        // ★ 不许压在 DRM 映射窗上（drm64.h：+8MiB .. +40MiB，4 槽 × 8 MiB）
+        if (wl64_surf_win_base64() < USER64_FB_VA64 + USER64_FB_DRM_END64) fail |= 16;
         if (wl64_surf_win_base64() + WL64_SURF_WIN_BYTES64 > USER64_FB_VA64 + USER64_FB_BYTES64) fail |= 16;
         if (bb_bytes > 0 && (uint64_t)bb_bytes > wl64_surf_win_base64() - USER64_FB_VA64) fail |= 16;
-        if (wl64_surf_win_va64((uint32_t)WL64_MAX_SURFACES64 - 1u) + 65536ULL >
+        if (wl64_surf_win_va64((uint32_t)WL64_MAX_SURFACES64 - 1u) + WL64_SURF_WIN_STRIDE64 >
             USER64_FB_VA64 + USER64_FB_BYTES64) fail |= 16;
     }
     if (g_wl64_wm_pid64 != 0) fail |= 16;        // 自检时不该有合成器（注册只走 22 号）

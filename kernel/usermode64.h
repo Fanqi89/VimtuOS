@@ -89,7 +89,19 @@ static const uint64_t USER64_LOADER_BIG_TOP_VA64 =
 //        绝不能被当成"进程自己的页"回收（那是双重释放，症状极难查）。
 //   逐页映射由 user64_map_phys_page64() 做（内核把物理页挂到用户页表，用户直接读写）。
 static const uint64_t USER64_FB_VA64       = 0x0000000140000000ULL;    // 5GiB
-static const uint64_t USER64_FB_BYTES64    = 40ULL * 1024ULL * 1024ULL;
+// ★ v0.10.5：这块映射区是**三段首尾相接**的（谁都不能压在别人身上）：
+//     [0, 8 MiB)           framebuffer（fb_map 把 fb_surface_phys64 的页挂上来）
+//     [+8 MiB, +72 MiB)    DRM 映射窗（kernel/drm64.h：DRM64_MAX_FB64=8 槽 × 8 MiB）
+//     [+72 MiB, +88 MiB)   wl 合成器 surface 映射窗（kernel/wl64.h：8 槽 × 2 MiB）
+//   40 -> 56 MiB 就是为了给 wl 的映射窗腾出**不重叠**的一段：v0.10.5 曾经把它塞在
+//   +24..+40 MiB（DRM 槽 2/3 上；后来又在 +40..+56 撞 slot 4/5），实测 wmfull64_test 红：拖动残留拖影、
+//   还原出来的背景里有纯黑像素 —— 合成器读到了别人的缓冲。
+//  ★ DRM 窗的**最坏情况**：kernel/drm64.h 的 DRM64_UVA_BASE_OFFSET64(8 MiB) +
+//  DRM64_MAX_FB64(8 槽) * DRM64_UVA_SLOT_BYTES64(8 MiB) = 72 MiB。
+//  （drm64.h 的头注释写着"4 个槽"，但常量是 8 —— 按常量算，不然 wl 窗会压在 slot 4/5 上，
+//    实测 wmfull64_test 会剩一块稳定的 24x14 px 拖影。）
+static const uint64_t USER64_FB_DRM_END64  = 72ULL * 1024ULL * 1024ULL;  // DRM 窗结束偏移
+static const uint64_t USER64_FB_BYTES64    = 88ULL * 1024ULL * 1024ULL;  // = 72 + wl 窗 16 MiB
 // ★ v0.9.42：编译期把"窗口顶严格低于 FB 底、且窗口不越出 PDPT[4] 的 1 GiB"钉死。
 //   两条都是硬约束：前者两条自检（proc64 selftest bit3 / syscall64 selftest bit0）只看运行时，
 //   改常量时若写错就变成开机蓝屏；后者是 PDPT[4] 只覆盖 1 GiB，越过去就踩到 FB 的 PDPT[5]。

@@ -332,6 +332,37 @@ def goto_exact(mon, log_fn, tx, ty, tol=3, passes=7, verbose=True):
 
 
 # ==================== PPM（screendump）：只存不解析，解析放到 quit 之后 ====================
+
+def shot_settled(mon, path, pred, log_fn, proc, tries=4, label=""):
+    """等合成器真的出一帧再截图，最多重截 tries 次；pred(Shot) 为 True 就早停。
+
+    为什么要它（实测）：合成器 2 fps，`drag end` / 进程退出之后只 sleep 0.6~0.8 s 就截，
+    很容易截到"还没 flip"的那一帧 —— 同一份构建三次跑出 n=1088 / 704 / 0，全是抖动。
+    判据本身没放松：pred 仍然是"旧位置标题栏色 == 0""整屏标题栏色 == 0"。
+    """
+    FRAME_RE = r"\[WM\] frame n=\d+ surfs=\d+"
+    ok_shot = False
+    for _ in range(tries):
+        since_f = len(log_fn())
+        wait_re(lambda: log_fn()[since_f:], FRAME_RE, 12, proc)
+        time.sleep(0.35)
+        mon.shot(path, wait=1.0)
+        if not os.path.exists(path):
+            continue
+        ok_shot = True
+        try:
+            S = Shot(path)
+            ok = pred(S)
+            print("      [settle] %s try=%d -> %s" % (label, _ + 1, "clean" if ok else "dirty"),
+                  flush=True)
+            if ok:
+                break
+        except Exception as e:                                   # noqa: BLE001
+            print("      [settle] %s try=%d -> pred error %s" % (label, _ + 1, e), flush=True)
+            break
+    return ok_shot
+
+
 class Shot(object):
     """P6 PPM 的只读视图：**不预先把 100 万像素摊成 list**（那要几秒并一直握着 GIL）。"""
 
@@ -613,10 +644,16 @@ def main():
         else:
             check("E. ② 拖动后拿到新的 [WL64] move pos", False, "缺")
 
-        time.sleep(0.6)
+        # ★ 别只 sleep 0.6 s 就截图：合成器 2 fps，"把旧位置从背景快照贴回去"那一帧
+        #   可能还没 flip（实测残留 1088 / 320 px 标题栏色，旧位置里还混着纯黑像素）。
+        #   做法：每次重截前等一条**新的** `[WM] frame`，最多 3 次；判据不变（旧位置 == 0）。
         shots["s2"] = os.path.join(work, "s2.ppm")
-        mon.shot(shots["s2"], wait=1.0)
-        check("E. screendump #2 取到了", os.path.exists(shots["s2"]), "")
+        got_s2 = shot_settled(mon, shots["s2"],
+                              lambda S: (rect is None) or S.count_near(
+                                  C_TITLE, rect[0] + 4, rect[1] + 4,
+                                  rect[0] + w - 4, rect[1] + 20) == 0,
+                              log_fn, proc, label="s2")
+        check("E. screendump #2 取到了", got_s2, "")
 
         # ---------- F. 真鼠标点掉 OK ----------
         print()
@@ -652,10 +689,11 @@ def main():
             check("F. GUI 进程正常退出（最后一条 [PROC64] exit code=0）",
                   mexit is not None and mexit.group(1) == "0", mexit.group(0) if mexit else "缺")
 
-            time.sleep(0.8)
             shots["s3"] = os.path.join(work, "s3.ppm")
-            mon.shot(shots["s3"], wait=1.0)
-            check("F. screendump #3 取到了", os.path.exists(shots["s3"]), "")
+            got_s3 = shot_settled(mon, shots["s3"],
+                                  lambda S: S.count_near(C_TITLE, 0, 0, S.w, S.h, step=2) == 0,
+                                  log_fn, proc, label="s3")
+            check("F. screendump #3 取到了", got_s3, "")
 
         check("G. 全程没有 PANIC / TRIPLE FAULT / selftest FAIL / composer 被 kill",
               not re.search(r"PANIC|TRIPLE FAULT|selftest FAIL|FAILED mask=", log_fn())

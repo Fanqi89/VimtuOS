@@ -41,6 +41,8 @@ os.makedirs(WORK, exist_ok=True)
 PART_MAIN_LBA = 32584
 SECTOR = 512
 checks = []
+WALL_DIR = "/System/themes/wallpapers"    # ★ 由 static_checks 填成实际命中的落点
+AVATAR_DIR = "/System/themes/avatars"
 
 
 def check(name, cond, detail=""):
@@ -64,6 +66,31 @@ def png_size(b):
     return struct.unpack_from(">II", b, 16)
 
 
+def jpeg_size(b):
+    """JPEG 尺寸：扫 SOF0/SOF1/SOF2 取 (w, h, kind)；非 JPEG 返回 None。
+
+    为什么要它：内核 kernel/img64.cpp 也实现了 baseline/ext JPEG 解码，用户投放的壁纸
+    就是 JPEG（1.jpeg … 7.jpg），判据只认 PNG 会把真绿判成红。
+    """
+    if len(b) < 4 or b[:2] != b"\xff\xd8":
+        return None
+    i = 2
+    while i < len(b) - 3:
+        if b[i] != 0xFF:
+            i += 1
+            continue
+        m = b[i + 1]
+        if m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7:
+            i += 2
+            continue
+        ln = struct.unpack_from(">H", b, i + 2)[0]
+        if m in (0xC0, 0xC1, 0xC2, 0xC3):
+            h, w = struct.unpack_from(">HH", b, i + 5)
+            return (w, h, {0xC0: "sof0", 0xC1: "sof1", 0xC2: "sof2", 0xC3: "sof3"}[m])
+        i += 2 + ln
+    return None
+
+
 def png_alpha_ok(b, w, h):
     """头像必须是圆形：四角透明 + 中心区域有实体像素。"""
     from PIL import Image
@@ -84,17 +111,45 @@ def read_vol(img_path):
     return TP, vol, inodes, total
 
 
+def _subdir(TP, vol, inodes, path):
+    """按路径逐级找目录 inode；找不到返回 None。path 形如 '/System/themes/wallpapers'。"""
+    ino = 0
+    for seg in [s for s in path.split("/") if s]:
+        hit = None
+        for i, nm, rec in TP._entries(vol, ino, inodes):
+            if nm == seg:
+                hit = i
+                break
+        if hit is None:
+            return None
+        ino = hit
+    return ino
+
+
 def static_checks(img_path):
     TP, vol, inodes, total = read_vol(img_path)
     roots = {nm: (i, rec) for i, nm, rec in TP._entries(vol, 0, inodes)}
-    check("根目录里有 /Wallpapers（预设壁纸）", "Wallpapers" in roots)
-    check("根目录里有 /Avatars（预设头像）", "Avatars" in roots)
-    if "Wallpapers" not in roots or "Avatars" not in roots:
+    # ★ v0.6.0 目录重排：预设壁纸/头像搬到 /System/themes/{wallpapers,avatars}，
+    #   旧根目录 /Wallpapers、/Avatars 由内核 vfs64 的别名表继续解析（运行时测试仍用旧路径）。
+    #   这里优先查新位置，旧位置保留兼容 —— 两边都不存在才算真红。
+    wi = _subdir(TP, vol, inodes, "/System/themes/wallpapers")
+    ai = _subdir(TP, vol, inodes, "/System/themes/avatars")
+    global WALL_DIR, AVATAR_DIR
+    loc_w = "/System/themes/wallpapers"
+    loc_a = "/System/themes/avatars"
+    if wi is None and "Wallpapers" in roots:
+        wi, loc_w = roots["Wallpapers"][0], "/Wallpapers"
+    if ai is None and "Avatars" in roots:
+        ai, loc_a = roots["Avatars"][0], "/Avatars"
+    WALL_DIR, AVATAR_DIR = loc_w, loc_a
+    check("预设壁纸目录在（新落点 /System/themes/wallpapers 或旧 /Wallpapers）",
+          wi is not None, "命中 %s" % loc_w)
+    check("预设头像目录在（新落点 /System/themes/avatars 或旧 /Avatars）",
+          ai is not None, "命中 %s" % loc_a)
+    if wi is None or ai is None:
         return None, None
-    wi = roots["Wallpapers"][0]
-    ai = roots["Avatars"][0]
     check("两个目录是**两个不同的 inode**（壁纸与头像分开、不混放）", wi != ai,
-          "Wallpapers inode=%d / Avatars inode=%d" % (wi, ai))
+          "%s inode=%d / %s inode=%d" % (loc_w, wi, loc_a, ai))
 
     walls = TP._entries(vol, wi, inodes)
     avas = TP._entries(vol, ai, inodes)
@@ -106,14 +161,21 @@ def static_checks(img_path):
     bad = []
     for i, nm, rec in walls:
         blob = TP._read_file(vol, rec, total)
+        # 壁纸允许 PNG 或 **baseline/ext JPEG**（内核 kernel/img64.cpp 两条都实现了；
+        # 渐进式 SOF2 明确不支持，装卷阶段已被尺寸/格式守卫挡掉）。
         sz = png_size(blob)
+        kind = "png"
+        if not sz:
+            js = jpeg_size(blob)
+            if js:
+                sz, kind = js[:2], "jpeg(%s)" % js[2]
         if not sz or sz[0] < 640 or sz[1] < 480:
-            bad.append("%s(png=%s)" % (nm, sz))
+            bad.append("%s(%s=%s)" % (nm, kind, sz))
             continue
         p = os.path.join(BUILD, "presets", nm)
         if os.path.exists(p) and open(p, "rb").read() != blob:
             bad.append("%s(卷里字节 != build64/presets)" % nm)
-    check("每张壁纸：合法 PNG、>=640x480、与 build64/presets 逐字节一致", not bad,
+    check("每张壁纸：合法 PNG/JPEG、>=640x480、与 build64/presets 逐字节一致", not bad,
           ("问题：%s" % bad) if bad else "ok")
 
     bad = []
@@ -225,14 +287,17 @@ def main():
     img = os.path.join(WORK, "sys_p.img")
     shutil.copyfile(SRC_DISK, img)
 
-    # ④ 运行时：把壁纸指到 /Wallpapers 里的第一张
+    # ④ 运行时：把壁纸指到**真落点**（v0.6.0 重排后的 /System/themes/wallpapers）里的第一张。
+    #    ★ 不能用 /Wallpapers/…：那是重排前的路径，卷里没有、内核也没有别名 →
+    #      [VFS64] path component not found + [IMG64] load fit skip reason=not-found。
     wall_name = walls[0][1]
-    wall_path = "/Wallpapers/" + wall_name
+    wall_path = WALL_DIR.rstrip("/") + "/" + wall_name
     TP, vol, inodes, total = read_vol(img)
     expect_sz = None
     for i, nm, rec in TP._entries(vol, ids[0], inodes):
         if nm == wall_name:
-            expect_sz = png_size(TP._read_file(vol, rec, total))
+            _b = TP._read_file(vol, rec, total)
+            expect_sz = png_size(_b) or (jpeg_size(_b)[:2] if jpeg_size(_b) else None)
             break
     ok_set = set_wall_path(qemu, img, 5695, "setwall", wall_path)
     check("把 ui.wall.path 设成 %s 并落盘（cfg save ok）" % wall_path, ok_set)
@@ -241,14 +306,16 @@ def main():
     #     [IMG64] load path=/Wallpapers/xxx ok=1 bytes=… fmt=png 1024x768 (from VimtuFS2 system volume)
     #   而 `[GFX64] init … src=…` 只在**回落到内置壁纸**的分支打。所以正向断言 IMG64 那条，
     #   并断言**没有** builtin 回落（两条合起来才说明"用户选的图真的上屏了"）。
-    m_img = re.search(r"\[IMG64\] load path=%s ok=1 bytes=(\d+) fmt=png (\d+)x(\d+)"
+    # 壁纸走 fit 解码（gui64：img64_load_vfs_fit64(wpath, 2048, &wim)），打点是
+    #   `[IMG64] load fit path=… max=N ok=1 bytes=N fmt=png WxH` —— 所以 `fit ` 必须可选。
+    m_img = re.search(r"\[IMG64\] load (?:fit )?path=%s(?: max=\d+)? ok=1 bytes=(\d+) fmt=(png|jpeg) (\d+)x(\d+)"
                       % re.escape(wall_path), log2)
     check("重启后内核真的解码并加载了这张壁纸（[IMG64] load … ok=1）",
           m_img is not None, m_img.group(0)[:120] if m_img else "（缺 [IMG64] load 行）")
     if expect_sz and m_img:
         check("解码尺寸 = 壁纸真实尺寸（%dx%d）" % (expect_sz[0], expect_sz[1]),
-              int(m_img.group(2)) == expect_sz[0] and int(m_img.group(3)) == expect_sz[1],
-              "%sx%s" % (m_img.group(2), m_img.group(3)))
+              int(m_img.group(3)) == expect_sz[0] and int(m_img.group(4)) == expect_sz[1],
+              "%sx%s fmt=%s" % (m_img.group(3), m_img.group(4), m_img.group(2)))
     else:
         check("解码尺寸 = 壁纸真实尺寸", False)
     m_fb = re.search(r"\[GFX64\] init surface=\d+x\d+ wall=(\d+)x(\d+) src=(\S+)", log2)
@@ -259,7 +326,8 @@ def main():
         check("壁纸用例：无 %s" % b, b not in log2)
 
     # ⑤ 反向：不存在的路径 -> 回落内置壁纸
-    ok_set2 = set_wall_path(qemu, img, 5697, "setbad", "/Wallpapers/does-not-exist.png")
+    ok_set2 = set_wall_path(qemu, img, 5697, "setbad",
+                            WALL_DIR.rstrip("/") + "/does-not-exist.png")
     check("把 ui.wall.path 设成不存在的路径也能落盘（配置层不校验存在性）", ok_set2)
     log3 = run_boot(qemu, img, 5698, "bootbad")
     m_bad = re.search(r"\[GFX64\] init surface=\d+x\d+ wall=(\d+)x(\d+) src=(\S+)", log3)

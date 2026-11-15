@@ -79,7 +79,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.10.4"    # ★ v0.10.4：商店验收判据修正（窗口原点取合成器真实矩形 + 宿主走内核 /bin 别名），vpkg64_test 84/84。
+VIMTUOS_VERSION="0.10.5"    # ★ v0.10.5：图片查看器（移植 stb_image）+ 全量文件关联路由；viewer64_test 113/113。
 #   沿用自 v0.10.2 的启动加固（仅作说明）：真机加固（UEFI 载荷按真实大小读 + 屏幕报错 + MMIO BAR>=4GiB 闸门） + 桌面帧预算（热路径打点预算 + 2 MiB 大页映射 / shm 与帧缓冲 + 60 Hz 帧节拍）
 #   根因：同一块盘上的两条命令会重叠（命令列表 slot0 / 命令表 / DMA 暂存页池 g_dma[16] 全驱动共享），
 #   后果是**静默坏读**（ELF 魔数坏读、VFS BAD block、/etc/r3drv.conf 读错）与端口互相重启，
@@ -1663,6 +1663,30 @@ echo "==> v0.9.43 (W0): /bin/peinfo + real PE corpus -> system volume"
       --vol-in "$BUILD/drvvol.img" --vol-out "$BUILD/peinfovol.img" \
       --peinfo "$BUILD/peinfo" --peload "$BUILD/peload" --corpus "$BUILD/pexcorpus" \
       --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+# ============================================================================
+# ★ v0.10.5：图片查看器 /bin/viewer + 图册 /Pictures/*（全用户态，内核 0 字节）
+#   1) tools/mk_pics_win.ps1 用 .NET System.Drawing 现场造 PNG/JPG/BMP 三份验收图
+#      （JPEG 编码器没有标准库可用；不想为此引第三方依赖）；
+#   2) user/viewer/build_viewer.sh 编 /bin/viewer（vendored stb_image + wl_surface 窗口壳），
+#      脚本内自检"静态 ELF64 / 无 PT_INTERP / PT_LOAD 落在大映像窗口 / 没有一页同时 W 与 X"；
+#   3) tools/viewer_pack_win.py 把两样都写进系统卷并**逐字节回读**，再重拼 sysdisk.img；
+#   4) probe64 断言内核二进制里搜不到 /bin/viewer 的字节（交付 = 卷里的文件）。
+#   端到端验收：python tests/viewer64_test.py
+# ============================================================================
+echo "==> ★ v0.10.5：图片查看器 /bin/viewer + 图册 /Pictures（全用户态，内核 0 字节）"
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/mk_pics_win.ps1
+bash user/viewer/build_viewer.sh
+"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid "$BUILD/viewer.elf"
+echo "==> 图片查看器装卷"
+if [ -f "$BUILD/peinfovol.img" ] && [ -f "$BUILD/viewer.elf" ]; then
+    "$PY" tools/viewer_pack_win.py \
+          --vol-in "$BUILD/peinfovol.img" --vol-out "$BUILD/viewervol.img" \
+          --viewer "$BUILD/viewer.elf" --pics "$BUILD/pics" \
+          --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+else
+    echo "ERROR: 缺少 $BUILD/peinfovol.img 或 build64/viewer.elf —— 图片查看器没装进系统卷" >&2
+    exit 1
+fi
 echo "==> ★ v0.5.11：把数据分区（VimtuFS2 卷）**并入安装载荷** system.img"
 # ★ 真缺陷（旧批修）：system.img 原来只切了前 8073 扇区（MBR+引导+内核+64 扇区裸槽），
 #   卷留在 sysdisk.img 的主分区起点 —— 于是用 ISO/安装介质**装到硬盘后目标盘该处是空字节**：

@@ -39,6 +39,7 @@
 #include "gfx64.h"      // ★ P8：选择应用打开对话框的圆角/半透明/双层阴影（Token 图形原语）
 #include "startmenu64.h"  // ★ v0.9.25：p2ui_text_w64（预览按 UI 字体实测列宽换行）
 #include "session64.h"  // ★ P8：应用清单（外壳按 APP_ID_* 登记的那一份 = 开始菜单/设置同一来源）
+#include "proc64.h"     // ★ v0.10.5：文件关联路由要**后台拉起** ring3 程序（proc64_start_elf64_argv64）
 
 // ==================== 几何常量（与脚本共享，勿乱改）====================
 #define EXP_WIN_X 120
@@ -1240,6 +1241,143 @@ static const char* exp_assoc_name(int a) {
     }
 }
 
+// ==================== ★ v0.10.5：全量文件关联路由表 ====================
+// 为什么要有它（用户实测的痛点）：以前双击**任何**非原生文件都走"只读文本预览"，
+// 一张 .png / 一个 .deb / 一个 .mp3 都被当文本打开 —— 满屏乱码，而且系统里没有
+// 独立的图片查看器。现在判据是**扩展名优先**（不再靠内容嗅探猜），逐条对应：
+//
+//   ① .exe                                     -> /bin/peload <path>（PE 装载器）
+//   ② .deb                                     -> /bin/store（包管理器 GUI）
+//   ③ .png .jpg .jpeg .bmp                      -> /bin/viewer <path>（图片查看器）
+//   ④ .txt .md .c .cpp .py .sh .json .log       -> 只读文本预览（本系统的文本编辑器）
+//   ⑤ .o .obj .a .so .bin .elf .dll .sys .img .iso .ttf .ttc
+//                                              -> **禁止**打开，弹窗"二进制文件不可预览"
+//   ⑥ 其余（.mp3 之类）                          -> **禁止**打开，弹窗"未找到关联应用"
+//
+// 两条保底（都不放宽，只是不丢 v0.5 起就有的能力）：
+//   * 扩展名不在表里、但**文件内容**是 VAP64/ELF 的（例如没有扩展名的可执行文件）仍然跑；
+//   * 目录仍然双击进入。
+//
+// 打点（tests/viewer64_test.py / tests/explorer64_test.py grep，格式勿改）：
+//   [UI] explorer route name=<n> ext=<e> route=<text|image|pe|deb|binary|unknown>
+//   [UI] explorer route spawn app=<p> pid=<n> arg=<a>         拉起成功（不等它退出）
+//   [UI] explorer route spawn FAILED app=<p> reason=<r>       如实失败，不假装跑过
+enum {
+    EXP_RT_UNKNOWN = 0,
+    EXP_RT_TEXT,
+    EXP_RT_IMAGE,
+    EXP_RT_PE,
+    EXP_RT_DEB,
+    EXP_RT_BINARY,
+};
+
+// 表项 = {扩展名（不含 '.'，全小写）, 路由}。查表是**精确匹配**，所以顺序无关。
+static const struct { const char* ext; int route; } kExpRoute[] = {
+    // ⑤ 二进制拦截（放最前只是可读性；精确匹配不受顺序影响）
+    { "o",   EXP_RT_BINARY }, { "obj", EXP_RT_BINARY }, { "a",   EXP_RT_BINARY },
+    { "so",  EXP_RT_BINARY }, { "bin", EXP_RT_BINARY }, { "elf", EXP_RT_BINARY },
+    { "dll", EXP_RT_BINARY }, { "sys", EXP_RT_BINARY }, { "img", EXP_RT_BINARY },
+    { "iso", EXP_RT_BINARY }, { "ttf", EXP_RT_BINARY }, { "ttc", EXP_RT_BINARY },
+    // ① 运行
+    { "exe", EXP_RT_PE },
+    // ② 安装包
+    { "deb", EXP_RT_DEB },
+    // ③ 图片
+    { "png", EXP_RT_IMAGE }, { "jpg", EXP_RT_IMAGE }, { "jpeg", EXP_RT_IMAGE },
+    { "bmp", EXP_RT_IMAGE },
+    // ④ 文本 / 代码（用户点名的 8 个）
+    { "txt", EXP_RT_TEXT }, { "md",  EXP_RT_TEXT }, { "c",    EXP_RT_TEXT },
+    { "cpp", EXP_RT_TEXT }, { "py",  EXP_RT_TEXT }, { "sh",   EXP_RT_TEXT },
+    { "json", EXP_RT_TEXT }, { "log", EXP_RT_TEXT },
+};
+#define EXP_ROUTE_N ((int)(sizeof(kExpRoute) / sizeof(kExpRoute[0])))
+
+// 取扩展名（小写，无 '.'）到 out；没有/太长/隐藏文件（".bashrc"）返回 0。
+// 只看**最后一段路径**上的最后一个 '.'，所以 "/a.b/c" 这种目录名里的点不会误判。
+static int exp_ext_of(const char* name, char* out, int cap) {
+    if (!name || cap < 2) return 0;
+    int last = -1;
+    for (int i = 0; name[i]; i++) if (name[i] == '.') last = i;
+    if (last <= 0 || !name[last + 1]) return 0;          // 没有扩展名 / 隐藏文件
+    int k = 0;
+    for (int i = last + 1; name[i] && k < cap - 1; i++) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        out[k++] = c;
+    }
+    out[k] = 0;
+    if (k == 0 || k > 8) return 0;                       // ".tar.gz" 只认最后一段；超长不算
+    for (int i = 0; i < k; i++) {                        // 只允许字母数字（".tar.gz." 之类不算）
+        const char c = out[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) return 0;
+    }
+    return 1;
+}
+
+static int exp_route_of(const char* name, char* ext_out, int cap) {
+    if (!exp_ext_of(name, ext_out, cap)) { ext_out[0] = 0; return EXP_RT_UNKNOWN; }
+    for (int i = 0; i < EXP_ROUTE_N; i++) {
+        if (e_streq(kExpRoute[i].ext, ext_out)) return kExpRoute[i].route;
+    }
+    return EXP_RT_UNKNOWN;
+}
+
+static const char* exp_route_name(int r) {
+    switch (r) {
+        case EXP_RT_TEXT:   return "text";
+        case EXP_RT_IMAGE:  return "image";
+        case EXP_RT_PE:     return "pe";
+        case EXP_RT_DEB:    return "deb";
+        case EXP_RT_BINARY: return "binary";
+        default:            return "unknown";
+    }
+}
+
+// 后台拉起一个 ring3 程序（带 argv），**不等它退出**（GUI 程序要一直开着）。
+// 走真进程路径（proc64），与 kernel/terminal64.cpp 的 `elfrun bg` 完全同一条；
+// 共享地址空间模式（UEFI 固件页表那套）下 proc64_isolate64()=0，这里如实返回
+// EXP_SPAWN_NOPROC，由调用方打印 reason=no-proc —— 绝不当成"已经跑起来了"。
+#define EXP_SPAWN_NOPROC (-2)
+static int exp_spawn64(const char* path, const char* arg1) {
+    if (!proc64_isolate64()) return EXP_SPAWN_NOPROC;
+    const char* av[2];
+    av[0] = path;
+    av[1] = arg1;
+    const uint32_t argc = (arg1 && arg1[0]) ? 2u : 1u;
+    const int pid = proc64_create64("explorer-open", 0);
+    if (pid <= 0) return -1;
+    if (proc64_start_elf64_argv64(pid, path, av, argc) != 0) {
+        if (proc64_find64(pid)) proc64_destroy64(pid);
+        return -1;
+    }
+    return pid;
+}
+
+// 拉起 + 打点（统一一行，验收只认这一种格式）
+static int exp_route_spawn64(const char* tag, const char* app, const char* arg) {
+    const int pid = exp_spawn64(app, arg);
+    dbg64_line_begin64();
+    if (pid > 0) {
+        dbg64_str("[UI] explorer route spawn app=");
+        dbg64_str(app);
+        dbg64_str(" pid=");
+        dbg64_dec((uint64_t)pid);
+        dbg64_str(" arg=");
+        dbg64_str(arg ? arg : "-");
+        dbg64_nl();
+    } else {
+        dbg64_str("[UI] explorer route spawn FAILED app=");
+        dbg64_str(app);
+        dbg64_str(" reason=");
+        dbg64_str(pid == EXP_SPAWN_NOPROC ? "no-proc" : "start-failed");
+        dbg64_str(" tag=");
+        dbg64_str(tag);
+        dbg64_nl();
+    }
+    dbg64_line_end64();
+    return pid;
+}
+
 // 绘制用的客户区原点偏移（每个窗口的 draw 回调开始时设置；预览窗口自己用绝对坐标 -> 置 0）
 static int g_ox = 0, g_oy = 0;
 
@@ -2132,32 +2270,108 @@ static void exp_open_item(int i) {
         return;
     }
     if (a == ASSOC_ELF) {
-        const int rc = elf64_run64(full);
+        // ★ v0.10.5 修：以前这里是 `elf64_run64(full)` —— 内核上下文的**单例装载器**
+        //   （elf64.cpp: `if (g_loaded64.used) return E64_BUSY;`）。只要有一份镜像没 unload
+        //   就永久 busy：实测引导期自检跑过 /hello.elf 之后，双击得到
+        //   `[ELF64] reject reason=busy` + `rc=4294967295` —— "双击运行 ELF" 整条路是死的。
+        //   改成真进程（proc64_create64 + proc64_start_elf64_argv64），
+        //   与终端 `elfrun bg` 以及本文件的 image/pe/deb 路由**完全同一条**。
+        //   打点兼容：rc=0 现在表示"已受理，真进程已经起来了"（不再是"跑完返回 0"）。
+        const int pid = exp_route_spawn64("elf", full, (const char*)0);
         dbg64_line_begin64();
         dbg64_str("[UI] explorer run name=");
         dbg64_str(d->name);
         dbg64_str(" kind=elf rc=");
-        dbg64_dec((uint64_t)(rc < 0 ? 0xFFFFFFFFu : (uint32_t)rc));
+        dbg64_dec((uint64_t)(pid > 0 ? 0u : 0xFFFFFFFFu));
         dbg64_nl();
         dbg64_line_end64();
-        exp_msg(gui64_tr("Ran ELF64 program", "已运行 ELF64 程序"));
+        exp_msg(pid > 0 ? gui64_tr("Ran ELF64 program", "已运行 ELF64 程序")
+                        : gui64_tr("ELF64 program is not runnable", "ELF64 程序无法运行"));
         return;
     }
-    if (a == ASSOC_TEXT) {
-        exp_open_preview(full, d->name);
+    // ==================== ★ v0.10.5：文件关联路由（扩展名优先）====================
+    // 以前这里只有一个 `a == ASSOC_TEXT -> 文本预览` 的分支：任何"内容不像 ELF/VAP 的
+    // 文件"都被当文本打开（一张 png 就是满屏乱码）。现在按扩展名走全量表，
+    // **未知后缀与二进制一律不打开**，只弹窗说明 —— 逐条见 kExpRoute 上方的大注释。
+    {
+        char ext[16];
+        const int rt = exp_route_of(d->name, ext, (int)sizeof(ext));
+        int pid = -1;
+        dbg64_line_begin64();
+        dbg64_str("[UI] explorer route name=");
+        dbg64_str(d->name);
+        dbg64_str(" ext=");
+        dbg64_str(ext[0] ? ext : "-");
+        dbg64_str(" route=");
+        dbg64_str(exp_route_name(rt));
+        dbg64_nl();
+        dbg64_line_end64();
+
+        switch (rt) {
+            case EXP_RT_IMAGE:
+                pid = exp_route_spawn64("image", "/bin/viewer", full);
+                if (pid > 0) { exp_msg(gui64_tr("Opened in Image Viewer", "已用图片查看器打开")); return; }
+                exp_msg(gui64_tr("Image Viewer is not available", "图片查看器不可用"));
+                return;
+            case EXP_RT_PE:
+                pid = exp_route_spawn64("pe", "/bin/peload", full);
+                if (pid > 0) { exp_msg(gui64_tr("Opened with the PE loader", "已用 PE 装载器打开")); return; }
+                exp_msg(gui64_tr("PE loader is not available", "PE 装载器不可用"));
+                return;
+            case EXP_RT_DEB:
+                // 包管理器 = 商店 GUI（/bin/store）。它不接 argv（安装走
+                // `dpkg -i <路径>` 或商店里的仓库条目），所以这里如实把路径打在串口上，
+                // 提示里也把命令写清楚 —— 不假装"已经装上了"。
+                pid = exp_route_spawn64("deb", "/bin/store", (const char*)0);
+                if (pid > 0) {
+                    exp_msg(gui64_tr("Package manager opened (use dpkg -i for a local .deb)",
+                                     "已打开包管理器（本地 .deb 用 dpkg -i 安装）"));
+                    return;
+                }
+                exp_msg(gui64_tr("Package manager is not available", "包管理器不可用"));
+                return;
+            case EXP_RT_TEXT:
+                exp_open_preview(full, d->name);       // 文本/代码：允许用文本编辑器打开
+                return;
+            case EXP_RT_BINARY:
+                // ⑤ 绝对禁止文本打开
+                exp_msg(gui64_tr("Binary file cannot be previewed (Ctrl+O to choose an app)",
+                                 "二进制文件不可预览（Ctrl+O 可选择程序打开）"));
+                return;
+            default:
+                break;                                  // ⑥ 未知：落到下面统一兜底
+        }
+    }
+
+    // ---- 保底①：扩展名不认识，但内容是 VAP64/ELF -> 仍然按可执行跑（v0.5 起的老能力）----
+    if (a == ASSOC_VAP || a == ASSOC_ELF) {
+        const int rc = app64_run_any64(full);
+        dbg64_line_begin64();
+        dbg64_str("[UI] explorer run name=");
+        dbg64_str(d->name);
+        dbg64_str(" kind=");
+        dbg64_str(a == ASSOC_VAP ? "vap" : "elf");
+        dbg64_str(" rc=");
+        dbg64_dec((uint64_t)(rc < 0 ? 0xFFFFFFFFu : (uint32_t)rc));
+        dbg64_str(" by=no-ext-exec");
+        dbg64_nl();
+        dbg64_line_end64();
         return;
     }
+
+    // ---- ⑥ 未知后缀：绝对禁止文本打开，弹窗"未找到关联应用" ----
+    //   注意这行 `noassoc` 打点**必须保留原格式**：tests/fatread64_test.py 断言
+    //   双击 BOOTX64.EFI 会出现 `[UI] explorer noassoc name=BOOTX64.EFI kind=…`。
     dbg64_line_begin64();
     dbg64_str("[UI] explorer noassoc name=");
     dbg64_str(d->name);
     dbg64_str(" kind=");
     dbg64_str(kstr);
-    dbg64_str(" -> open-with dialog (choose an application)");
+    dbg64_str(" -> no application associated (refused, not opened as text)");
     dbg64_nl();
     dbg64_line_end64();
-    // ★ P8：无关联类型 -> **不再只弹一句提示**，而是打开"选择应用打开"对话框
-    //   （清单来自 session64 应用表；失败/不支持在面板里明确报"打开失败"，见 exp_openwith_commit）。
-    exp_openwith_begin(i);
+    exp_msg(gui64_tr("No application is associated with this file (Ctrl+O to choose one)",
+                     "未找到关联应用（Ctrl+O 可选择程序打开）"));
 }
 
 // ---- 绘制坐标约定（重要）：应用回调里一律用**窗口客户区相对坐标**画，这里统一加客户区原点偏移再落到屏幕
@@ -3087,6 +3301,17 @@ static void exp_key(Window* w, char c) {
         case 0x18: exp_clip_set(2); break;                     // Ctrl+X = 剪切
         case 0x16: exp_paste(); break;                         // Ctrl+V = 粘贴
         case 0x01: exp_select_all(); break;                    // Ctrl+A = 全选
+        // ★ v0.10.5：Ctrl+O = "用其它程序打开"（P8 的选择应用面板）。
+        //   为什么放在键盘上而不是右键菜单：EXP_CTX_ITEM_N = 6 的菜单几何已经被
+        //   tests/explorer64_test.py 断言，加一项会把绿的测试改红；而双击的默认路由
+        //   已经由 kExpRoute 决定（二进制/未知后缀直接拒绝），这里给用户一条
+        //   显式的逃生口。Ctrl+字母按老口径折成控制字符：'o' 是第 15 个字母 -> 0x0F。
+        case 0x0F:
+            if (g_mode == 1 && g_sel >= 0 && g_sel < g_items) {
+                exp_openwith_begin(g_sel);
+                if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+            }
+            break;
         case 0x1B:                                             // Esc = 关菜单/属性，其次取消选择
             if (g_ctx_open) { exp_ctx_close(); break; }
             if (g_props_open) { g_props_open = 0; if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win); break; }
@@ -3203,8 +3428,13 @@ static void exp_close(Window* w) {
     g_ow_dlg = 0;                                        // ★ P8：关窗时收掉"选择应用"对话框
     g_del_confirm = 0;
     sel_clear();
+    // ★ 行级原子（line_begin/end）：这行是十几个验收脚本的 grep 目标。不拿行锁时，
+    //   PIT 的 kheartbeat 会插在 '[' 与其余字节之间，日志里变成
+    //   "[[TASK64] kheart …\nAPP] mypc opened" —— 真绿被判成假红（实测抓过原文）。
+    dbg64_line_begin64();
     dbg64_str("[APP] mypc closed");
     dbg64_nl();
+    dbg64_line_end64();
 }
 
 // ==================== 公共 API ====================
@@ -3239,8 +3469,13 @@ void explorer64_open64() {
     gui64_set_tick(g_win, exp_tick);                     // ★ 批次 J：框选跟踪
     gui64_set_min_size(g_win, 420, 300);
     exp_enter_thispc();
+    // ★ 行级原子（line_begin/end）：这行是十几个验收脚本的 grep 目标。不拿行锁时，
+    //   PIT 的 kheartbeat 会插在 '[' 与其余字节之间，日志里变成
+    //   "[[TASK64] kheart …\nAPP] mypc opened" —— 真绿被判成假红（实测抓过原文）。
+    dbg64_line_begin64();
     dbg64_str("[APP] mypc opened");
     dbg64_nl();
+    dbg64_line_end64();
 }
 
 void explorer64_reset64() {
@@ -3251,8 +3486,13 @@ void explorer64_reset64() {
     g_items = 0;
     g_sel = -1;
     g_scroll = 0;
+    // ★ 行级原子（line_begin/end）：这行是十几个验收脚本的 grep 目标。不拿行锁时，
+    //   PIT 的 kheartbeat 会插在 '[' 与其余字节之间，日志里变成
+    //   "[[TASK64] kheart …\nAPP] mypc opened" —— 真绿被判成假红（实测抓过原文）。
+    dbg64_line_begin64();
     dbg64_str("[APP] mypc reset");
     dbg64_nl();
+    dbg64_line_end64();
 }
 
 // ==================== 自检（纯逻辑，不建窗口、不碰盘）====================

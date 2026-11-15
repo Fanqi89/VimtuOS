@@ -851,10 +851,16 @@ def main():
             hit_ok, det = aim_click(vm, mon, r[0], r[1], "item:%d" % idx_elf, label="hello.elf")
             check("双击 hello.elf（精确移动 + 双击）", hit_ok, det)
             xlog = fst.wait_for(serial, "[UI] explorer run name=hello.elf", 40, vm.proc)
-            check("运行 .elf 打点（explorer run name=hello.elf kind=elf rc=0）",
+            check("运行 .elf 打点（explorer run name=hello.elf kind=elf rc=0，rc=0 = 已受理/真进程已起）",
                   re.search(r"\[UI\] explorer run name=hello\.elf kind=elf rc=0", xlog) is not None)
-            check("ELF64 加载器真的跑起来（[ELF64] launch ok rc=0）",
-                  re.search(r"\[ELF64\] launch ok rc=0 path=/hello\.elf", xlog) is not None)
+            check("拉起走的是真进程路由（[UI] explorer route spawn app=/hello.elf pid=N）",
+                  re.search(r"\[UI\] explorer route spawn app=/hello\.elf pid=\d+", xlog) is not None)
+            # ★ 旧判据是 `[ELF64] launch ok rc=0 path=/hello.elf` —— 那行是**引导期自检**打的，
+            #   双击那次根本没走到它（陈旧断言 = 假绿）。真证据：只有真进程启动才会打
+            #   `[PROC64] execve path=/hello.elf pid=<n>`。
+            xlog2 = fst.wait_for(serial, "[PROC64] execve path=/hello.elf", 40, vm.proc)
+            check("ELF64 真的作为独立进程跑起来（[PROC64] execve path=/hello.elf pid=N）",
+                  re.search(r"\[PROC64\] execve path=/hello\.elf pid=\d+", xlog2) is not None)
         else:
             check("双击 hello.elf", False, "根目录里没有找到 hello.elf 条目行")
 

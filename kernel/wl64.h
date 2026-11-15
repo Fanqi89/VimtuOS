@@ -218,9 +218,15 @@ static const uint32_t WL64_ABI_SURFACE_MOVE64   = 27;   // ★ W3 第二批：�
 //   usermode64.cpp 的 u64_va_in_user_area64() 白名单里（页级原语的唯一范围判据，不去动它）；
 //   ② 后备缓冲 <= 3840x2160x4 约 33 MiB < 40MiB-512KiB —— 自检里断言两者不重叠；
 //   ③ 建页表项走的就是 fb_map 用的 user64_map_phys_page64()。
-static const uint64_t WL64_SURF_WIN_BYTES64 = 512ULL * 1024ULL;
-static inline uint64_t wl64_surf_win_base64() { return USER64_FB_VA64 + USER64_FB_BYTES64 - WL64_SURF_WIN_BYTES64; }
-static inline uint64_t wl64_surf_win_va64(uint32_t slot) { return wl64_surf_win_base64() + (uint64_t)slot * 65536ULL; }
+// ★ v0.10.5：每个 surface 的映射窗 = WL64_SURF_WIN_STRIDE64，必须 >= 单 surface 缓冲上限
+//   （WL64_MAX_PIXELS64 * 4 = 2 MiB），否则合成器 map 到一半就 ENOSPC —— 实测 695x541 的
+//   图片窗口（368 页）在旧 64 KiB/槽 的窗口里 page=112 就失败，窗口在那儿但内容全黑。
+static const uint64_t WL64_SURF_WIN_STRIDE64 = 2048ULL * 1024ULL;
+static const uint64_t WL64_SURF_WIN_BYTES64 =
+    (uint64_t)WL64_MAX_SURFACES64 * WL64_SURF_WIN_STRIDE64;      // 8 * 2 MiB = 16 MiB
+// ★ 窗底 = DRM 映射窗的结束处（不是"FB 区顶端减去窗长"—— 那样会压在 DRM 窗上）。
+static inline uint64_t wl64_surf_win_base64() { return USER64_FB_VA64 + USER64_FB_DRM_END64; }
+static inline uint64_t wl64_surf_win_va64(uint32_t slot) { return wl64_surf_win_base64() + (uint64_t)slot * WL64_SURF_WIN_STRIDE64; }
 
 // ---- 23 的出参：一条 surface 的只读快照（64 B POD，字段顺序固定）----
 // ---- Wl64Rect：一个屏幕矩形（16 B POD）。★ W3 第二批：22 号给出的是**整屏**（0,0,fb_w,fb_h）——
