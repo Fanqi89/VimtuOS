@@ -1026,6 +1026,22 @@ uint32_t fb_lfb_pixel64(int x, int y) {
     return ((volatile uint32_t*)(uintptr_t)fb_addr)[y * (fb_pitch / 4) + x];
 }
 
+uint32_t* fb_row64(int x0, int y, int x1, int* out_x0, int* out_x1) {
+    if (!g_kernel_paint64 || !backbuf) return nullptr;
+    if (y < 0 || y >= g_render_h) return nullptr;
+    if (x0 < 0) x0 = 0;
+    if (x1 > g_render_w) x1 = g_render_w;
+    if (g_clip_on) {
+        if (y < g_clip_y0 || y >= g_clip_y1) return nullptr;
+        if (x0 < g_clip_x0) x0 = g_clip_x0;
+        if (x1 > g_clip_x1) x1 = g_clip_x1;
+    }
+    if (x1 <= x0) return nullptr;
+    if (out_x0) *out_x0 = x0;
+    if (out_x1) *out_x1 = x1;
+    return backbuf + (size_t)y * (size_t)g_render_w + (size_t)x0;
+}
+
 uint32_t fb_get_pixel(int x, int y) {
     if (x < 0 || y < 0 || x >= g_render_w || y >= g_render_h) return 0;
     if (backbuf) return backbuf[y * g_render_w + x];

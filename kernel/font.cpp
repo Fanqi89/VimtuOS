@@ -1218,26 +1218,27 @@ int  font_stem64() { return g_stem_pct; }
 void font_set_ui_aa64(int on) { g_ui_aa = on ? 1 : 0; }
 int  font_ui_aa64() { return g_ui_aa; }
 
-// 抗锯齿混合：fg 按 alpha(0-255) 与后备缓冲背景混合（g_mono_noaa=1 时退化为纯色阈值）
-static inline void draw_blend(int x, int y, uint32_t fg, int a) {
-    if (a <= 0) return;
-    if (g_mono_noaa || !g_ui_aa) {           // 终端（三无）/ 或 fontconfig 让 UI 也走单色
-        if (a >= g_mono_thresh) fb_putpixel(x, y, fg);      // 阈值按码点切换（ASCII 128 / CJK 96）
-        return;
-    }
-    if (g_stem_pct != 100) {                 // ★ v0.4.8 笔画加厚：覆盖率放大（边缘更实、笔画更厚）
+// ★ v0.10.7：行内直写版混合（不再跨文件调用 fb_get_pixel/fb_putpixel，也不再逐像素判裁剪）。
+//   p 指向**已被 fb_row64() 裁剪过**的像素；数学与 draw_blend 的 AA 分支完全相同。
+static inline void blend_px(uint32_t* p, uint32_t fg, int a) {
+    if (a >= 255) { *p = fg; return; }
+    if (g_stem_pct != 100) {
         a = a * g_stem_pct / 100;
         if (a > 255) a = 255;
+        if (a >= 255) { *p = fg; return; }
     }
-    if (a >= 255) { fb_putpixel(x, y, fg); return; }
-    uint32_t bg = fb_get_pixel(x, y);
-    uint8_t fr = (fg >> 16) & 0xFF, fgc = (fg >> 8) & 0xFF, fgb = fg & 0xFF;
-    uint8_t br = (bg >> 16) & 0xFF, bgc = (bg >> 8) & 0xFF, bgb = bg & 0xFF;
-    uint8_t r = (uint8_t)((fr * a + br * (255 - a)) / 255);
-    uint8_t g = (uint8_t)((fgc * a + bgc * (255 - a)) / 255);
-    uint8_t b = (uint8_t)((fgb * a + bgb * (255 - a)) / 255);
-    fb_putpixel(x, y, 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b);
+    const uint32_t bg = *p;
+    const uint32_t ia = 255u - (uint32_t)a;
+    const uint32_t r = (((((fg >> 16) & 0xFFu) * (uint32_t)a + ((bg >> 16) & 0xFFu) * ia) * 257u) + 257u) >> 16;
+    const uint32_t g = (((((fg >> 8) & 0xFFu) * (uint32_t)a + ((bg >> 8) & 0xFFu) * ia) * 257u) + 257u) >> 16;
+    const uint32_t b = ((((fg & 0xFFu) * (uint32_t)a + (bg & 0xFFu) * ia) * 257u) + 257u) >> 16;
+    *p = 0xFF000000u | (r << 16) | (g << 8) | b;
 }
+
+// 抗锯齿混合：fg 按 alpha(0-255) 与后备缓冲背景混合（g_mono_noaa=1 时退化为纯色阈值）
+// ★ v0.10.7：原 draw_blend() 已删除 —— 两条字形贴图路径都改成"按行取指针 + blend_px 直写"
+//   （见上面 blend_px 与两个贴图循环）。保留 font_set_mono64()/font_set_mono_thresh64() 这两个
+//   API（外部仍可调用，行为=给 UI 强制单色），但字形贴图本身不再读 mono 状态。
 
 // 单元格高度：取当前面 (ascender - descender) 的实测像素高度（不裁切的唯一正确做法）。
 int font_cell_height64() {
@@ -1271,8 +1272,14 @@ bool font_draw_glyph(int x, int y, char c, uint32_t fg) {
     // 绘制必须把 bbox 放到 y + cacheOY，否则所有字形顶部对齐、基线错乱。
     for (int yy = 0; yy < cur->cacheH[idx]; yy++) {
         const uint8_t* row = &cur->cache[idx][(cur->cacheOY[idx] + yy) * FONT_PX + cur->cacheOX[idx]];
-        for (int xx = 0; xx < cur->cacheW[idx]; xx++) {
-            if (row[xx]) draw_blend(x + xx, y + cur->cacheOY[idx] + yy, fg, row[xx]);
+        // ★ v0.10.7：每行取一次可写指针（已裁剪），行内直写 —— 不再逐像素跨文件调用。
+        int rx0 = 0, rx1 = 0;
+        const int ry = y + cur->cacheOY[idx] + yy;
+        uint32_t* dst = fb_row64(x, ry, x + cur->cacheW[idx], &rx0, &rx1);
+        if (!dst) continue;
+        for (int px = rx0; px < rx1; px++) {
+            const int a = row[px - x];
+            if (a) blend_px(dst + (px - rx0), fg, a);
         }
     }
     return true;
@@ -1333,8 +1340,14 @@ bool font_draw_glyph_cp(int x, int y, uint32_t cp, uint32_t fg) {
     if (fc->lruW[slot] <= 0) return true;   // 空白字形
     for (int yy = 0; yy < fc->lruH[slot]; yy++) {
         const uint8_t* row = &fc->lru_bm[slot][(fc->lruOY[slot] + yy) * FONT_PX + fc->lruOX[slot]];
-        for (int xx = 0; xx < fc->lruW[slot]; xx++) {
-            if (row[xx]) draw_blend(x + xx, y + fc->lruOY[slot] + yy, fg, row[xx]);
+        // ★ v0.10.7：同 cache 路径，按行取指针后直写。
+        int rx0 = 0, rx1 = 0;
+        const int ry = y + fc->lruOY[slot] + yy;
+        uint32_t* dst = fb_row64(x, ry, x + fc->lruW[slot], &rx0, &rx1);
+        if (!dst) continue;
+        for (int px = rx0; px < rx1; px++) {
+            const int a = row[px - x];
+            if (a) blend_px(dst + (px - rx0), fg, a);
         }
     }
     return true;

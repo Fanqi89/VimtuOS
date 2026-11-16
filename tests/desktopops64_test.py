@@ -956,6 +956,11 @@ def main():
             got_as = vm.wait_log("[CONF64] autosave ok", 30, since=locals().get("n_as", 0))
             check("配置自动落盘（[CONF64] autosave ok，且必须是**重置之后**那一次）", got_as,
                   (re.search(r"\[CONF64\] autosave[^\r\n]*", vm.log()) or [""])[0])
+            # ★ v0.10.7：**重启之前**把"最后一次 set 的值"记下来 —— `vm.close()` 之后串口日志文件
+            #   会被重建，boot1 的 `[STORE64] set cfg.ui.desktop.icons=…` 行就不在了（实测取成空串）。
+            _sets_pre = re.findall(r"\[STORE64\] set cfg\.ui\.desktop\.icons=([^\r\n]*)", vm.log())
+            want_set_pre = _sets_pre[-1].strip() if _sets_pre else ""
+            print("  [info] 重启前最后一次 set：%r（共 %d 次）" % (want_set_pre, len(_sets_pre)))
             time.sleep(3)
             vm.close()
             time.sleep(2)
@@ -969,9 +974,23 @@ def main():
             check("重启后桌面再次就绪", up2)
             if up2:
                 L2 = vm.log()
-                check("重启后 [CONF64] load ui.desktop.icons=0,1,2|（桌面图标集合持久化）",
-                      re.search(r"\[CONF64\] load ui\.desktop\.icons=0,1,2\|", L2) is not None,
-                      (re.search(r"\[CONF64\] load ui\.desktop\.icons[^\r\n]*", L2) or [""])[0])
+                # ★ v0.10.7：§6 把「终端」图标拖进了回收站（合法用户动作），之后的集合是 `0,1|2`，
+                #   不是 §3 复位时的 `0,1,2|`。期望改成**重启前最后一次 set 的那个值**（自证、不写死），
+                #   并额外要求重启后的 [DESK64] init 的 items/recycle 与它一致 —— 比原来更严。
+                want_set = want_set_pre          # 重启前抓的（见上）
+                _d, _, _b = want_set.partition("|")
+                want_items = len([t for t in _d.split(",") if t])
+                want_bin = len([t for t in _b.split(",") if t])
+                mload = re.search(r"\[CONF64\] load ui\.desktop\.icons=(\S+) type=str", L2)
+                check("重启后 [CONF64] load ui.desktop.icons == 重启前最后一次 set 的值（%s）" % want_set,
+                      bool(want_set) and mload is not None and mload.group(1) == want_set,
+                      (mload.group(0) if mload else "缺"))
+                minit = re.search(r"\[DESK64\] init items=(\d+) set=(\S+) recycle=(\d+)", L2)
+                check("重启后 [DESK64] init 与最后一次 set 一致（items=%d recycle=%d）"
+                      % (want_items, want_bin),
+                      minit is not None and int(minit.group(1)) == want_items
+                      and minit.group(2) == want_set and int(minit.group(3)) == want_bin,
+                      minit.group(0) if minit else "缺")
                 check("重启后 [CONF64] load ui.explorer.show_system=0（隐藏分区开关持久化）",
                       re.search(r"\[CONF64\] load ui\.explorer\.show_system=0", L2) is not None,
                       (re.search(r"\[CONF64\] load ui\.explorer\.show_system[^\r\n]*", L2) or [""])[0])

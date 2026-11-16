@@ -734,23 +734,20 @@ static void ts_puts_pad(TerminalState* ts, const char* s, int width) {
 static void term_draw_cell(int x, int y, int w, uint16_t cp, uint32_t fg, uint32_t bg) {
     if (bg != TERM_BG || w != term_cellw()) fb_fill_rect(x, y, w, term_ch(), bg);
     if (cp < 0x20) return;
-    // ★ 三无：单色掩码（无抗锯齿 / 无次像素）；字号固定 16px（无缩放，不跟随 UI 字号档）。
-    //   规范："19. 终端文字非黑即白"、"整格当单色掩码贴屏"。
-    font_set_mono64(1);
+    // ★ v0.10.7（方案 B）：终端**改回抗锯齿**（灰阶覆盖率），不再走"三无"单色阈值。
+    //   为什么改：单色是"覆盖率过阈值才点亮"，1px 细笔画（'H' 左边那一竖、CJK 的细撇）在
+    //   16px 下覆盖率只有 30~45%，阈值 96/128 会把它整条判死 —— 实测 'H' 左边竖笔直接消失，
+    //   看起来像 'N'，终端日志无法阅读。
+    //   现在的语义：覆盖率按 alpha 与底色**混合**（font.cpp draw_blend），细笔画显示为**浅色**
+    //   而不是消失；字体面 / 字号 / 基线补偿一律不变（等宽面 16px、中英 1:2 不受影响）。
+    //   性能：混合已改成无除法（(t*257+257)>>16），且字形覆盖率仍走 LRU 位图缓存，
+    //   每像素只多一次读底色 + 一次写。
     font_select(FONT_FACE_MONO);                 // 终端字符格的字体面
-    // ★ v0.5.12 终端缺字修法：ASCII 用 128（覆盖率 50%），**汉字用 96（37.5%）**。
-    //   中文面是 Noto Sans SC（笔画细），16px 下 1px 笔画覆盖率常只 30~45%，阈值 128 会整条判死 ——
-    //   屏幕上看就是"缺笔画/缺字"（修前 banner 6 个汉字：墨点 312、4-连通分量 80）。
-    //   仍是纯黑/纯白二值（不产生中间灰），符合终端"三无"规范。
     if (cp < 0x7F) {
-        font_set_mono_thresh64(TERM_MONO_THRESHOLD_ASCII);
         font_draw_glyph(x, y + TERM_MONO_DY, (char)cp, fg);
     } else {
-        font_set_mono_thresh64(TERM_MONO_THRESHOLD_CJK);
         font_draw_glyph_cp(x, y + TERM_ZH_DY, (uint32_t)cp, fg);
     }
-    font_set_mono_thresh64(TERM_MONO_THRESHOLD_ASCII);   // 复位（下一位可能是 ASCII）
-    font_set_mono64(0);                          // 立刻交还 UI 的抗锯齿路径
 }
 
 static void term_draw(Window* w) {

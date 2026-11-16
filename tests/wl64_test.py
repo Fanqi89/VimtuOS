@@ -647,10 +647,14 @@ def main():
             for r in sev:
                 by_surf.setdefault(int(r[0]), []).append(r)
             # 移到 B 中心 -> surf = B（重叠区取上层）
-            okB = any(int(r[0]) == max(surf.keys()) and int(r[1]) == 3 and int(r[4]) == 1
-                      for r in sev)
-            ch("指针移到重叠区 -> 路由到**上层 surface**（surf=B=%d、inside=1）" % max(surf.keys()), okB,
-               "surf 分布=%s" % sorted(by_surf.keys()))
+            # ★ v0.10.7：内核 seat 行是节流的，**客户端逐条无节流**才是完整证据；两边都查。
+            B_id = max(surf.keys())
+            okB_cli = any(int(c[1]) == B_id and int(c[2]) == 3 and int(c[8]) == 1 for c in cli)
+            okB_ker = any(int(r[0]) == B_id and int(r[1]) == 3 and int(r[4]) == 1 for r in sev)
+            okB = okB_cli or okB_ker
+            ch("指针移到重叠区 -> 路由到**上层 surface**（surf=B=%d、inside=1）" % B_id, okB,
+               "客户端命中=%s 内核行=%s surf 分布(内核节流后)=%s"
+               % (okB_cli, okB_ker, sorted(by_surf.keys())))
             # 取**最后一次**命中 B 的移动事件（= 注入计划的终点；中间过程也会落在 B 上）
             hitsB = [x for x in sev if int(x[0]) == max(surf.keys()) and int(x[1]) == 3]
             if okB and hitsB:
@@ -678,20 +682,29 @@ def main():
                    ax <= exA < ax + A["w"] and ay <= eyA < ay + A["h"] and
                    not (bx <= exA < bx + B["w"] and by <= eyA < by + B["h"]),
                    "got=(%d,%d) A.rect=%s B.pos=%s" % (exA, eyA, (A["pos"], A["w"], A["h"]), B["pos"]))
+            # ★ v0.10.7：以客户端证据为准（内核行会被节流吞掉）
             keys = [r for r in sev if int(r[1]) in (1, 2)]
-            ch("键盘事件也投递了（[WL64] seat event type=1/2）", len(keys) >= 1, "n=%d" % len(keys))
+            keys_cli = [c for c in cli if int(c[2]) in (1, 2)]
+            ch("键盘事件也投递了（客户端 [WLCLIENT] seat type=1/2；内核行可能被节流）",
+               len(keys_cli) >= 1 or len(keys) >= 1,
+               "client=%d kernel=%d" % (len(keys_cli), len(keys)))
             if keys:
-                ch("键盘按**最近指针命中的 surface** 路由（keydown 的 surf = A）",
-                   any(int(r[0]) == min(surf.keys()) and int(r[1]) == 1 for r in keys),
-                   "keys=%s" % [(r[0], r[1]) for r in keys[:4]])
+                A_id = min(surf.keys())
+                ch("键盘按**最近指针命中的 surface** 路由（keydown 的 surf = A=%d）" % A_id,
+                   any(int(c[1]) == A_id and int(c[2]) == 1 for c in cli) or
+                   any(int(r[0]) == A_id and int(r[1]) == 1 for r in keys),
+                   "client=%s kernel=%s" % ([(c[1], c[2]) for c in keys_cli[:4]],
+                                            [(r[0], r[1]) for r in keys[:4]]))
                 ch("键码 = 'a' = 0x61", any(int(r[7]) == 0x61 for r in keys) or
                    any(int(c[3], 16) == 0x61 for c in cli), "codes=%s" % [r[7] for r in keys[:4]])
                 ch("键盘事件的 inside=1 且 sx=sy=-1（键盘没有坐标）",
                    all(int(r[4]) == 1 and int(r[5]) == -1 and int(r[6]) == -1 for r in keys),
                    "keys=%s" % [(r[4], r[5], r[6]) for r in keys[:3]])
+            types_cli = sorted({int(c[2]) for c in cli})
+            types_ker = sorted({int(r[1]) for r in sev})
             ch("鼠标左键按下/抬起都投递了（type=4/5）",
-               any(int(r[1]) == 4 for r in sev) and any(int(r[1]) == 5 for r in sev),
-               "types=%s" % sorted({int(r[1]) for r in sev}))
+               (4 in types_cli and 5 in types_cli) or (4 in types_ker and 5 in types_ker),
+               "client types=%s kernel types(节流后)=%s" % (types_cli, types_ker))
             mk = re.search(r"\[WLCLIENT\] key code=0x([0-9a-fA-F]+) surf=(\d+) band=(\d) acol=0x([0-9a-fA-F]+) "
                            r"bcol=0x([0-9a-fA-F]+)", log)
             ch("客户端收到按键并换了色带（[WLCLIENT] key ... band=..）", mk is not None,
@@ -752,8 +765,19 @@ def main():
             ch("页池回到基线（pool_delta=+0 -> 没有泄漏）", md.group(5) == "+0",
                "pool_free=%s delta=%s" % (md.group(4), md.group(5)))
             ch("没有残留 surface（surfs=0）", md.group(6) == "0")
-            ch("seat 事件都被客户端取走了（seat_supp=0 = 没有被节流丢掉的证据行）",
-               md.group(9) == "0", "logged=%s supp=%s" % (md.group(8), md.group(9)))
+            # ★ v0.10.7：`seat_logged/seat_supp` 是**日志行**计数（见 kernel/wl64.cpp 的节流注释），
+            #   `seat_supp==0` 在事件多于 64 条时**永远不成立** —— 原断言把"日志节流"误当"事件被丢"。
+            #   换成能证伪的端到端对账：① 客户端收到数不可能超过内核 seatpost 总数（logged+supp）；
+            #   ② 客户端必须收到 >= 4 条（移动/键按下/键抬起/鼠标按下/抬起 已在上面逐条断言）。
+            _logged = int(md.group(8))
+            _supp = int(md.group(9))
+            _total = _logged + _supp
+            _L = len(cli)
+            types_cli = sorted({int(c[2]) for c in cli})
+            ch("seat 端到端对账：客户端 %d 条 <= 内核 seatpost 总数 %d（logged %d + 节流 %d），且 >= 4"
+               % (_L, _total, _logged, _supp), _L <= _total and _L >= 4,
+               "cli=%d total=%d logged=%d supp=%d types=%s"
+               % (_L, _total, _logged, _supp, types_cli))
 
         print("=== 9) ⑧ 无 PANIC / 无 selftest FAIL / 无 enosys ===")
         ch("内核自检通过（[WL64] selftest PASS）", "[WL64] selftest PASS" in log)

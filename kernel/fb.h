@@ -33,6 +33,10 @@ void fb_set_clip(int x, int y, int w, int h);
 void fb_reset_clip();
 void fb_get_clip64(int* x, int* y, int* w, int* h);   // 读当前裁剪矩形（gfx64 的图元必须遵守它）
 uint32_t* fb_surface64(int* w, int* h);               // 后备缓冲基址（32bpp，stride = fb_width()）
+// ★ v0.10.7（终端抗锯齿的性能底线）：取一行里**可写的连续区间**起始指针。
+//   边界 + 裁剪 + `y*stride` 乘法**每行只做一次**，字形贴图的行内循环直接读写指针，
+//   不再逐像素跨文件调 fb_get_pixel/fb_putpixel。返回 nullptr = 这一行整行不可写。
+uint32_t* fb_row64(int x0, int y, int x1, int* out_x0, int* out_x1);
 // ★ v0.9.2：通用 fw_cfg 开关（不碰 vsync 通道）。找文件 <file>（如 "opt/vimtu/probe"），把它当
 //   "k=v;k=v" 串解析，返回 key 的整数值；文件不存在/键不存在 -> 返回 def。
 //   用途：把"启动期屏上测试图/演示"做成 opt-in（默认关），验收脚本显式打开。

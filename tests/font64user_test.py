@@ -455,10 +455,13 @@ def main():
         vm = QemuVm(qemu, img, port, serial)
         mon = Monitor(port)
         print("=== 1) 启动：内核在 /bin/wm.elf 缺失时如实跳过（合成器不该在桌面之前起）===")
-        check("内核如实打 [WL64] wm skipped（卷里没有 /bin/wm.elf，启动期不起合成器）",
-              vm.wait("[WL64] wm skipped", 120),
-              (re.search(r"\[WL64\] wm skipped[^\n]*", vm.log()).group(0)
-               if re.search(r"\[WL64\] wm skipped[^\n]*", vm.log()) else "（缺行）"))
+        # ★ v0.10.7：v0.5.x 起内核在 /bin/wm.elf 缺席时会**回落到 /lib/wm.elf** 并打
+        #   `[WL64] wm path fallback=/lib/wm.elf (/bin/wm.elf not in volume)`（kernel/wl64.cpp:1469），
+        #   不再打 "wm skipped"。夹具里正好没有 /bin/wm.elf —— 判据改成核对**回落**这个真行为。
+        check("内核如实打 [WL64] wm path fallback=/lib/wm.elf（卷里没有 /bin/wm.elf -> 回落）",
+              vm.wait("[WL64] wm path fallback=/lib/wm.elf", 120),
+              (re.search(r"\[WL64\] wm path fallback=[^\r\n]*", vm.log()).group(0)
+               if re.search(r"\[WL64\] wm path fallback=", vm.log()) else "（缺行）"))
         check("内核里的 ring3 演示照常（[WL64] selftest PASS）", vm.wait("[WL64] selftest PASS", 120))
 
         print("=== 2) 登录 + 开终端（开始菜单）===")
@@ -682,11 +685,24 @@ def main():
         check("[FONTDEMO] done frames=3（跑 N 帧后自己退出）", mdone is not None,
               mdone.group(0) if mdone else "没等到")
         # 我方 surface 在屏上的位置（内核打点）+ 我方帧
+        # ★ v0.10.7：屏幕位置必须读**合成器的真实矩形** `[WM] surf … rect=`。
+        #   `[WL64] surface create … pos=` 是**内核默认槽位**（实测 448,380），合成器随后用 27 号
+        #   把它挪到 (476,408)（`[WM] place id=2 pos=476,408 mode=cascade`）—— 拿默认槽位去裁像素，
+        #   裁到的是终端文本，于是出现"kernel_w=340 vs user_w=133"这类假红。
+        #   顺序：create 的 pos 先兜底（没有合成器时），再用 [WM] surf 覆盖成真实矩形。
         for mm in re.finditer(r"\[WL64\] surface create id=(\d+) w=(\d+) h=(\d+) shm=\d+ pid=(\d+) px=\d+ "
                               r"fmt=\d+ slot=\d+ pos=(-?\d+),(-?\d+)", log):
             if demo_pid is not None and int(mm.group(4)) == demo_pid:
                 surfs[(int(mm.group(2)), int(mm.group(3)))] = (
                     int(mm.group(1)), int(mm.group(5)), int(mm.group(6)))
+        n_wm_rect = 0
+        for mm in re.finditer(r"\[WM\] surf id=(\d+) pid=(\d+) rect=(-?\d+),(-?\d+),(\d+),(\d+) ", log):
+            if demo_pid is not None and int(mm.group(2)) == demo_pid:
+                surfs[(int(mm.group(5)), int(mm.group(6)))] = (
+                    int(mm.group(1)), int(mm.group(3)), int(mm.group(4)))
+                n_wm_rect += 1
+        check("surface 屏上位置取自合成器真实矩形（[WM] surf … rect=，>=2 块）", n_wm_rect >= 2,
+              "n=%d surfs=%s" % (n_wm_rect, {k: v for k, v in sorted(surfs.items())}))
         check("内核侧 surface 表里有 fontdemo 的两块面（256x48 与 384x40，带屏上坐标）",
               (256, 48) in surfs and (384, 40) in surfs, "surfs=%s" % sorted(surfs))
         check("[FONTDEMO] frame f=0/1/2 都提交了（ink_a/ink_b 非空）",
@@ -772,18 +788,23 @@ def main():
                   "kernel_full_w=%s demo_b_w=%s（%d 字符）"
                   % (kfull[2] if kfull else None, md.group(3) if md else None, len(banner)))
             # 屏幕像素 vs 程序自报的墨迹数（"字形可辨"的独立复核）
-            mm = re.search(r"\[FONTDEMO\] frame f=0 rc=\d+ ink_a=(\d+) ink_b=(\d+)", log)
-            if mm and (256, 48) in surfs:
+            # ★ v0.10.7：只比 **A 面 row 0 带（y 0..22）**，且用与程序**完全相同的口径**。
+            #   原做法有两个干扰：① A(512,376,256,48) 与 B(476,408,384,40) 重叠 16 行，
+            #   整块数到的是"A 可见部分 + B 的字"（实测 2354 vs 自报 1311）；② 程序用
+            #   `font64_ink_stats(bg=0x000000, tol=16)`（逐通道差 > 16），测试用 lum>12。
+            mrow = re.search(r"\[FONTDEMO\] ink size=18 row=0 n=(\d+) bbox=(-?\d+),(-?\d+),(-?\d+),(-?\d+)", log)
+            if mrow and (256, 48) in surfs:
                 _aid, ax, ay = surfs[(256, 48)]
+                claim_row0 = int(mrow.group(1))
                 onscreen = 0
-                for y in range(ay, ay + 48):
+                for y in range(ay, ay + 22):              # row 0 带：B 从 ay+32 起，不被遮挡
                     for x in range(ax, ax + 256):
-                        if lum(px2, w2, x, y) > 12:
+                        r_, g_, b_ = px2[3 * (y * w2 + x)], px2[3 * (y * w2 + x) + 1], px2[3 * (y * w2 + x) + 2]
+                        if r_ > 16 or g_ > 16 or b_ > 16:  # 与 CO_BG=0x000000 同口径（tol=16/通道）
                             onscreen += 1
-                claim_a = int(mm.group(1))
-                check("③/⑤ 屏幕上的 A 面墨迹像素与程序自报数吻合（>=70% 且 <=130%）",
-                      claim_a > 0 and 0.7 <= onscreen / claim_a <= 1.3,
-                      "屏幕=%d 自报=%d" % (onscreen, claim_a))
+                check("③/⑤ 屏幕 A 面 row0 带墨迹 == 程序自报（同口径 tol=16，±8%%）",
+                      claim_row0 > 0 and abs(onscreen - claim_row0) <= max(8, int(claim_row0 * 0.08)),
+                      "屏幕=%d 自报=%d（%.1f%%）" % (onscreen, claim_row0, 100.0 * onscreen / max(1, claim_row0)))
             # 合成器收工（客户端全退）
             check("⑤ 客户端退出后合成器自己收工（[WM] exit reason=no-surfaces 或 handback）",
                   ("[WM] exit reason=no-surfaces" in vm.log()) or ("[WM] exit handback" in vm.log()))
