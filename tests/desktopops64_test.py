@@ -393,6 +393,9 @@ def main():
             check("集合键确实落到 store64 覆盖表（[STORE64] set cfg.ui.desktop.icons=0,1,2|）",
                   re.search(r"\[STORE64\] set cfg\.ui\.desktop\.icons=0,1,2\|", vm.log()[n1:]) is not None,
                   (re.search(r"\[STORE64\] set cfg\.ui\.desktop\.icons[^\r\n]*", vm.log()[n1:]) or [""])[0])
+            # ★ v0.10.6：记下落盘前沿 —— 重启复验必须等**这次重置之后**的新 autosave，
+            #   否则会撞上更早那份值（实测：重启后 load 出来是 `0,1|2` 而不是 `0,1,2|`）。
+            n_as = vm.n()
 
         print("=== 4) 终端等价开关：cfg set ui.explorer.show_system 0 ===")
         n0 = vm.n()
@@ -950,8 +953,8 @@ def main():
             print("  [skip] store 载体 = raw（裸镜像没有 VimtuFS2 卷）-> flush 被跳过，跳过重启持久化复验")
         if not args.no_reboot and carrier_vfs:
             print("=== 11) 重启复验：两个键都还在（[CONF64] load）===")
-            vm.wait_log("[CONF64] autosave ok", 12)
-            check("配置自动落盘（[CONF64] autosave ok）", "[CONF64] autosave ok" in vm.log(),
+            got_as = vm.wait_log("[CONF64] autosave ok", 30, since=locals().get("n_as", 0))
+            check("配置自动落盘（[CONF64] autosave ok，且必须是**重置之后**那一次）", got_as,
                   (re.search(r"\[CONF64\] autosave[^\r\n]*", vm.log()) or [""])[0])
             time.sleep(3)
             vm.close()

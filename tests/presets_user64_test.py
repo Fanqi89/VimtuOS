@@ -218,10 +218,13 @@ def main():
               str(walls[0] if walls else ""))
         check("壁纸应用打点带 applied=1（成功路径）",
               re.search(r"\[SET64\] wall preset idx=\d+ n=\d+ name=\S+ applied=1", log1) is not None)
-        # ★ 用户自己的 JPEG 壁纸（/Wallpapers/1.jpeg）也必须能用：修前被一条过时的
+        # ★ 用户自己的 JPEG 壁纸也必须能用：修前被一条过时的
         #   "jpeg/gif not implemented (img64: png/bmp only)" 闸门挡住，而 img64 其实早就能解 JPEG。
-        check("JPEG 壁纸也能应用（[SET64] wall path=…/1.jpeg ok=1）",
-              re.search(r"\[SET64\] wall path=" + PRESET_ROOT_RE_WALL + r"/1\.jpeg ok=1", log1) is not None,
+        # ★ v0.10.6：不再点名 1.jpeg（2649x1600 超过装卷闸门 2048，按设计不在卷里）；
+        #   判据改成"卷里任意一张 JPEG(.jpg/.jpeg) 壁纸能被应用"—— 判据反而更宽到全量 JPEG。
+        m_jpg = re.search(r"\[SET64\] wall path=" + PRESET_ROOT_RE_WALL + r"/([^\s]+\.jpe?g) ok=1", log1)
+        check("JPEG 壁纸也能应用（[SET64] wall path=…/*.jpg|*.jpeg ok=1）",
+              m_jpg is not None,
               "已应用：%s" % [w for w in walls if w])
 
         # ---- B. 预设头像 ----

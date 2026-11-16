@@ -988,9 +988,15 @@ def main():
         mg1 = dirs[-1] if dirs else None
         win0 = (int(mg0[0]), int(mg0[1])) if mg0 else (WIN_X, WIN_Y)
         win1 = (int(mg1[0]), int(mg1[1])) if mg1 else win0
+        # ★ v0.10.6：原来只打 win0/win1；两者在"日志缺行"时会**退化成脚本常量 (120,60)**，
+        #   和"真的取到了"长得一模一样（实测偶发红一次，看日志误以为是几何错了）。
+        #   现在把 begin/dir 两行各自有没有取到也打出来 —— 判据不变，证据自明。
         check("★ 缩放参照系：拖动前后的外框原点都取到（且都 == 脚本常量 (120,60)，resize 只改宽高）",
               mg0 is not None and mg1 is not None and win0 == (WIN_X, WIN_Y) and win1 == win0,
-              "win0=%s win1=%s" % (win0, win1))
+              "win0=%s win1=%s（resize begin 行=%s / dir|end 行=%s）" % (
+                  win0, win1,
+                  "有" if mg0 is not None else "缺(已退化为常量)",
+                  "有" if mg1 is not None else "缺(已退化为常量)"))
         check("缩放帧打点含右边缘方向（dir=r）",
               re.search(r"\[UI\] win resize dir=r x=\d+ y=\d+ w=\d+ h=\d+ client=\d+x\d+", rlog) is not None,
               (re.search(r"\[UI\] win resize (begin|end|dir)[^\r\n]*", rlog).group(0)

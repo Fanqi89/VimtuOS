@@ -417,13 +417,28 @@ def main():
         if "notif" in icons:
             bx = icons["notif"][0] + 22 - 7 - 2          # 角标方块左上角（与内核 badge_pos 一致）
             by = icons["notif"][1] - 3
+            # ★ v0.10.6：顶栏是**脏矩形驱动**重绘的 —— `[PANEL64] notif add` 与 toast 同一时刻，
+            #   `toast.ppm` 那一帧顶栏还没重画（实测整屏红像素 0 个），而同一构建后面那张
+            #   `net.ppm` 在 (814,305)-(830,321) 有 **264** 个 #E81123 像素 —— 角标本身是对的。
+            #   判据不变（红像素 > 40），只是先动一下指针制造重绘、取一张自己的 badge.ppm，最多 3 次。
             redn = 0
-            for yy in range(by, by + 15):
-                for xx in range(bx, bx + 15):
-                    c = sample(px, w, xx, yy)
-                    if c[0] > 150 and c[1] < 120 and c[2] < 120:
-                        redn += 1
-            check("未读角标是**红底**（15x15 方块里红色像素计数）", redn > 40, "红色像素=%d" % redn)
+            for _att in range(3):
+                cur.goto(mon, bx + 6, by + 6)            # 悬停到消息图标 -> 顶栏状态区重绘
+                time.sleep(0.45)
+                mon.shot(os.path.join(tmp, "badge.ppm"))
+                bw, bh, bpx = read_ppm(os.path.join(tmp, "badge.ppm"))
+                redn = 0
+                for yy in range(by, by + 15):
+                    for xx in range(bx, bx + 15):
+                        c = sample(bpx, bw, xx, yy)
+                        if c[0] > 150 and c[1] < 120 and c[2] < 120:
+                            redn += 1
+                if redn > 40:
+                    break
+                cur.goto(mon, bx + 120, by + 160)        # 移开再重绘一次
+                time.sleep(0.35)
+            check("未读角标是**红底**（15x15 方块里红色像素计数；取 badge.ppm）", redn > 40,
+                  "红色像素=%d" % redn)
         check("有未读 -> 消息图标数字角标（status icon notif unread=1 badge=digit）",
               re.search(r"\[START64\] status icon notif x=\d+ y=\d+ unread=1 badge=digit badge_color=#E81123", vm.log()[before:]) is not None,
               (re.search(r"\[START64\] status icon notif[^\r\n]*", vm.log()[before:]) or [""])[0])

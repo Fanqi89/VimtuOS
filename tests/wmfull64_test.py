@@ -581,8 +581,13 @@ def main():
         mwl = last_of(log_fn(), WL_MOVE_RE)
         check("D. ② 位置是**内核**改的（[WL64] move .. by=composer，不是 wm 自己的影子坐标）",
               mwl is not None and mwl.group(7) == "composer", mwl.group(0) if mwl else "缺")
+        # ★ v0.10.6：这行是**内核在客户端下一次提交时**才打的，原来用一次性快照读 ——
+        #   日志还没刷到那一条就会假红（同一构建连跑 6 次的实测：有时红有时绿）。
+        #   判据不变（必须出现 `[WL64] dispatch … composite=external`），只是"等它出现"。
+        mdsp = wait_re(log_fn, r"\[WL64\] dispatch pid=\d+ composite=external pending=\d+ owner=\d+",
+                       30.0, proc)
         check("D. ③ 合成器注册后内核不再自己合成（[WL64] dispatch … composite=external）",
-              "composite=external" in log_fn(), "")
+              mdsp is not None, mdsp.group(0) if mdsp else "缺（30s 内没等到）")
 
         fbw, fbh = 1280, 800
         mfb = re.search(r"\[WM\] map pid=\d+ va=\S+ w=(\d+) h=(\d+) ", log_fn())

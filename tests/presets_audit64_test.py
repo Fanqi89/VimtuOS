@@ -10,10 +10,11 @@
 
 判据（每条都能独立证伪）：
   ① 卷里 `/Avatars/` 正好等于 `build64/presets/avatar-*.png`：文件数、字节、尺寸一致；
-  ② 卷里 `/Wallpapers/` 正好等于 `build64/presets/wall-*.png` + `res/wallpapers/*`：
-     文件数一致、没有多余项；未超限的图**逐字节一致**；
-  ③ 任何进卷的图，最长边必须 **<= 16384**（内核边长硬上限）。v0.5.17 起内核在**解码期抽样**，
-     所以打包期**不再缩图**（`res/wallpapers/1.jpeg` 2649x1600 原样进卷，运行时抽到 2048）；
+  ② 卷里 `/Wallpapers/` 正好等于 `build64/presets/wall-*.png` + `res/wallpapers/*` 中
+     **边长 <= MAX_PX** 的那些；进卷的图**逐字节一致**（打包期不缩图）；
+  ③ ★ 负向对照：`res/wallpapers/` 里**超限**的图必须**不在卷里** —— 装卷闸门
+     (`tools/presets_pack_win.py: JPG_MAXDIM`) 与内核解码上限
+     (`kernel/img64.cpp: JPG64_MAXDIM`) 必须同步，装了也只会让运行时静默回落内置壁纸；
   ④ 非图片文件（如 res/wallpapers/README.md）**不得**进卷。
 
 用法：py -3 tests/presets_audit64_test.py
@@ -33,8 +34,10 @@ USERWALL = os.path.join(ROOT, "res", "wallpapers")
 VOL = os.path.join(ROOT, "build64", "sysdisk.img")
 MAIN_LBA = 32584
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp")
-MAX_PX = 16384          # ★ v0.5.17：内核改解码期抽样后，卷里可以放原始分辨率的图
-                        #   （打包期不再缩图；16384 是内核的边长硬上限）
+MAX_PX = 2048           # ★ v0.10.5：装卷闸门的边长上限 = 内核 JPEG 解码上限
+                        #   （tools/presets_pack_win.py: JPG_MAXDIM 必须与
+                        #    kernel/img64.cpp: JPG64_MAXDIM 保持一致）
+                        #   改一边就必须改另一边，这条断言就是那个"另一边"。
 
 ok = True
 
@@ -131,17 +134,34 @@ def main():
     bad = [n for n in avatars if n in got_av and got_av[n] != avatars[n]]
     check("头像逐字节一致（%d 张）" % len(avatars), not bad, "不一致：%s" % bad)
 
-    # ② 壁纸（内置 + 用户）
-    want_wp = set(walls_builtin) | set(walls_user)
-    check("卷内 /System/themes/wallpapers 文件集合 = 内置 wall-*.png + res/wallpapers/*",
+    # ② 壁纸（内置 + 用户）——★ v0.10.6：用户壁纸按**装卷闸门**分两组
+    walls_user_ok, walls_user_over = {}, {}
+    for n, data in sorted(walls_user.items()):
+        d = dims(n, data)
+        if d and max(d) <= MAX_PX:
+            walls_user_ok[n] = data
+        else:
+            walls_user_over[n] = data
+    print("    闸门分组：res/wallpapers 应进卷 %d 张 %s；应被挡 %d 张 %s"
+          % (len(walls_user_ok), sorted(walls_user_ok),
+             len(walls_user_over), sorted(walls_user_over)))
+
+    want_wp = set(walls_builtin) | set(walls_user_ok)
+    check("卷内 /System/themes/wallpapers 文件集合 = 内置 wall-*.png + res/wallpapers/* 中边长 <= %d 的"
+          % MAX_PX,
           set(got_wp) == want_wp,
           "缺=%s 多=%s" % (sorted(want_wp - set(got_wp)), sorted(set(got_wp) - want_wp)))
-    same = [n for n in want_wp if n in got_wp and n in walls_builtin and got_wp[n] == walls_builtin[n]]
+    same = [n for n in walls_builtin if n in got_wp and got_wp[n] == walls_builtin[n]]
     check("内置壁纸逐字节一致（%d 张）" % len(walls_builtin), len(same) == len(walls_builtin),
           "一致 %d/%d" % (len(same), len(walls_builtin)))
-    same_u = [n for n in walls_user if n in got_wp and got_wp[n] == walls_user[n]]
-    check("用户壁纸也逐字节一致（v0.5.17 起打包期不再缩图；%d 张）" % len(walls_user),
-          len(same_u) == len(walls_user), "一致 %d/%d" % (len(same_u), len(walls_user)))
+    same_u = [n for n in walls_user_ok if n in got_wp and got_wp[n] == walls_user_ok[n]]
+    check("能进卷的用户壁纸逐字节一致（打包期不缩图；%d 张）" % len(walls_user_ok),
+          len(same_u) == len(walls_user_ok), "一致 %d/%d" % (len(same_u), len(walls_user_ok)))
+    # ★ 负向对照：超限壁纸必须被闸门挡住（漏进卷 = 用户选了壁纸却静默回落内置壁纸）
+    leaked = [n for n in sorted(walls_user_over) if n in got_wp]
+    check("超限用户壁纸被装卷闸门挡在卷外（%d 张%s）"
+          % (len(walls_user_over), ("：" + ", ".join(sorted(walls_user_over))) if walls_user_over else ""),
+          not leaked, "漏进卷：%s" % leaked)
 
     # ③ 尺寸上限 + 来源记录
     over = []
@@ -156,9 +176,13 @@ def main():
     for n, data in sorted(walls_user.items()):
         gd = dims(n, got_wp.get(n, b"")) if n in got_wp else None
         sd = dims(n, data)
+        if n in walls_user_over and n not in got_wp:
+            where = "按闸门跳过（>%d）" % MAX_PX
+        else:
+            where = "%dx%d" % gd if gd else "缺失"
         print("    · 用户壁纸 %-16s 源 %sx%s -> 卷内 %s（%d B -> %d B）"
               % (n, sd[0] if sd else "?", sd[1] if sd else "?",
-                 "%dx%d" % gd if gd else "缺失", len(data), len(got_wp.get(n, b""))))
+                 where, len(data), len(got_wp.get(n, b""))))
 
     # ④ 非图片不得进卷
     junk = [n for n in got_wp if not n.lower().endswith(IMG_EXTS)]

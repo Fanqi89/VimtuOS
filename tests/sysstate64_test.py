@@ -535,10 +535,15 @@ def main():
     vm = Vm(qemu, img, args.port, "boot1", args.timeout)
     vm.start()
     up1 = vm.wait_ready()
-    log1 = vm.log()
     check("桌面就绪 [GUI64] ready", up1)
+    # ★ v0.10.6：`[GUI64] ready` 与 `[SYS64] state=RUNNING` / `health ok` / `health module …` /
+    #   `[WD64] watchdog armed` 是**同一帧附近**打的。原来在这里取**一次**快照就逐条判 ——
+    #   快照偶尔落在"ready 已写、RUNNING 还没写"的缝里，MUST1 里 3~4 条就假红
+    #   （实测 3 跑 1 红；失败那次的原始串口第 2471 行其实有 `[WD64] watchdog armed timeout=20000ms`）。
+    #   改法：逐条 `wait_log`（有界 30s）；判据不变（仍然"必须出现"）。
     for needle in MUST1:
-        check("必须出现 %s" % needle, needle in log1)
+        check("必须出现 %s" % needle, vm.wait_log(needle, 30.0))
+    log1 = vm.log()          # 等完之后重新取快照，后面的解析都用它
 
     # ★ v0.9.22：看门狗的**阈值一致性**（武装时打的 timeout 必须等于任务创建时的参数）
     _a = re.search(r"\[WD64\] watchdog armed timeout=(\d+)ms", log1)
@@ -561,8 +566,16 @@ def main():
     mh = re.search(r"\[SYS64\] health ok modules=(\d+) failed=0", log1)
     check("健康报告 [SYS64] health ok modules=N failed=0", bool(mh),
           mh.group(0) if mh else "未出现（vfs64 在无卷镜像上会 FAILED，本夹具应有卷）")
+    # ★ v0.10.6：逐模块状态行同样是 RUNNING 那一帧附近才写完的 —— 有界等它凑齐 >= 12 条
+    #   （判据不变：仍然要求 >= 12 条，只是不再用"可能早于它"的快照去数）。
+    _t_end = time.time() + 30.0
+    _mod_pat = r"\[SYS64\] health module \S+ state=\S+ health=\S+"
+    while time.time() < _t_end and len(re.findall(_mod_pat, log1)) < 12:
+        time.sleep(0.3)
+        log1 = vm.log()
     check("健康报告里有各模块状态（[SYS64] health module ...）",
-          len(re.findall(r"\[SYS64\] health module \S+ state=\S+ health=\S+", log1)) >= 12)
+          len(re.findall(_mod_pat, log1)) >= 12,
+          "count=%d" % len(re.findall(_mod_pat, log1)))
     mp = re.search(r"\[CONF64\] init carrier=(\S+) slot=(\S+) keys=(\d+)", log1)
     check("config64 初始化行（载体/槽/键数）", bool(mp), mp.group(0) if mp else "未出现")
     check("config64 载体 = vfs（夹具盘有 VimtuFS2 卷）", bool(mp) and mp.group(1) == "vfs")

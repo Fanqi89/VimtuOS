@@ -462,15 +462,24 @@ int main(void) {
     const int t0_ms = (int)vimtu64_ticks() * 4;
     int last_repair_ms = 0;
     int painted_any = 0;
+    /* ★ v0.10.6（拖拽残影根治）：⑪（输入）阶段算出的脏矩形发生在 ⑨（合成）之后，而 dmg_*
+     *   是**本轮局部变量**。只要本轮 ⑨ 已经画过一帧（客户端刚好提交了），这批脏矩形就会被
+     *   静默丢掉 —— 拖动时"旧位置还给桌面"那一步永远回不来，屏幕上留下一条 **24 px**
+     *   （= 一次鼠标步长）宽的旧标题栏拖影（wmfull64_test H② 的 1/6 概率残留）。
+     *   所以 ⑪ 的脏矩形走独立的 odmg_*；本轮画不掉就存进 carry_*，下一轮 ⑨ 必定画掉。 */
+    int carry_x = 0, carry_y = 0, carry_w = 0, carry_h = 0;
 
     for (;;) {
         const int now_ms = (int)vimtu64_ticks() * 4;
         const int elapsed = now_ms - t0_ms;
 
         int n_used = 0, n_pending = 0;
-        int dmg_x = 0, dmg_y = 0, dmg_w = 0, dmg_h = 0;
+        int dmg_x = carry_x, dmg_y = carry_y, dmg_w = carry_w, dmg_h = carry_h;
+        const int from_carry = (carry_w > 0 && carry_h > 0);
+        carry_x = carry_y = carry_w = carry_h = 0;
         int layout = 0;
         int painted_this_iter = 0;      /* ★ v0.10.2：本轮的 ⑨ 是否已经画过一帧 */
+        int odmg_x = 0, odmg_y = 0, odmg_w = 0, odmg_h = 0;   /* ★ v0.10.6：⑪ 输入阶段算出的脏矩形 */
 
         /* ---- ⑤ 拉 surface 表（23 号）：谁有缓冲、谁提交了、damage 多大 ---- */
         for (int i = 0; i < WM_MAX_SURF; i++) {
@@ -621,11 +630,14 @@ int main(void) {
             /* ★ 只给"有内容变化"的帧留证：纯修复帧（每 150 ms 一次，没有任何客户端提交）不打 ——
              *   每一行都会让 ring0 终端滚动重绘一次，几百行就把客户机拖到 1 fps，进而把夹具的
              *   光标闭环反馈拖死（实测）。layout / pending / 拖动中 / 第一帧 仍然照打。 */
-            const int want_frame_log = (n_frame == 1 || layout || n_pending || g_drag_id);
+            const int want_frame_log = (n_frame == 1 || layout || n_pending || g_drag_id
+                                        || from_carry);   /* ★ v0.10.6：补画 carry 的帧必须留证 */
             g_frame_log++;
             /* 前 WM_FRAME_LOG_MAX 帧逐帧留证；之后每 16 帧一条（60 fps 下 ~4 行/秒） */
-            const int do_frame_log = want_frame_log &&
-                (g_frame_log <= WM_FRAME_LOG_MAX || (g_frame_log & 15u) == 0u);
+            const int do_frame_log = from_carry || (want_frame_log &&
+                (g_frame_log <= WM_FRAME_LOG_MAX || (g_frame_log & 15u) == 0u));
+            /* ★ v0.10.6：from_carry 的帧**不采样**（一轮最多 1~2 条）—— 它正是"旧位置被补画
+             *   回去"的唯一日志证据，被采样吞掉的话未来回归无法自证。 */
             if (do_frame_log) {
                 printf("[WM] frame n=%lu surfs=%d pending=%d dirty=%d,%d,%d,%d px=%d blend=%d us=%lu flip_us=%lu path=%s full=%d foreign=0 bg_us=%lu t_ms=%lu\n",
                        n_frame, n_used, n_pending, dmg_x, dmg_y, dmg_w, dmg_h, px, blend,
@@ -717,10 +729,11 @@ int main(void) {
                                     if (g_dragmove_log++ < 12u)
                                       printf("[WM] drag move id=%d pos=%d,%d dx=%d dy=%d\n",
                                              g_drag_id, nx, ny, nx - ox, ny - oy);
-                                    /* 旧位置还给桌面 + 新位置重画 */
-                                    wm_union(&dmg_x, &dmg_y, &dmg_w, &dmg_h,
+                                    /* 旧位置还给桌面 + 新位置重画（★ v0.10.6 -> odmg_*，
+                                     *   本轮 ⑨ 已画过就交给 carry_*，绝不丢） */
+                                    wm_union(&odmg_x, &odmg_y, &odmg_w, &odmg_h,
                                              ox, oy, (int)ds->info.w, (int)ds->info.h);
-                                    wm_union(&dmg_x, &dmg_y, &dmg_w, &dmg_h,
+                                    wm_union(&odmg_x, &odmg_y, &odmg_w, &odmg_h,
                                              nx, ny, (int)ds->info.w, (int)ds->info.h);
                                 }
                             }
@@ -770,27 +783,37 @@ int main(void) {
                     }
                 }
             }
-            /* 收到输入：外壳很可能刚把光标画进我们的窗口里 -> 立刻整窗重画一遍 */
-            if (got_any && !painted_this_iter) {
-                for (int i = 0; i < WM_MAX_SURF; i++) {
-                    if (!slots[i].used) continue;
-                    wm_union(&dmg_x, &dmg_y, &dmg_w, &dmg_h,
-                             slots[i].info.x, slots[i].info.y, (int)slots[i].info.w, (int)slots[i].info.h);
-                }
-                if (dmg_w > 0 && dmg_h > 0) {
-                    int x0 = wm_max(dmg_x, 0), y0 = wm_max(dmg_y, 0);
-                    int x1 = wm_min(dmg_x + dmg_w, (int)g_fb.width), y1 = wm_min(dmg_y + dmg_h, (int)g_fb.height);
-                    if (x1 > x0 && y1 > y0) {
-                        int blend2 = 0;
-                        const int px2 = wm_paint_rect(slots, x0, y0, x1, y1, &blend2);
-                        (void)fb_flip(x0, y0, x1 - x0, y1 - y0);
-                        n_frame++;
-                        last_repair_ms = now_ms;
-                        printf("[WM] frame n=%lu surfs=%d pending=0 dirty=%d,%d,%d,%d px=%d blend=%d us=0 flip_us=0 path=soft full=0 foreign=0 input=1 t_ms=%lu\n",
-                               n_frame, n_used, x0, y0, x1 - x0, y1 - y0, px2, blend2,
-                               (unsigned long)(vimtu64_ticks() * 4));
-                        wm_remember(slots);
+            /* 收到输入：外壳很可能刚把光标画进我们的窗口里 -> 立刻整窗重画一遍。
+             * ★ v0.10.6：本轮 ⑨ 已经画过一帧时**不能再画**（会把这一轮的帧预算翻倍），
+             *   但 odmg_* 也**绝不能丢** —— 交给 carry_*，下一轮 ⑨ 一定画掉。 */
+            if (got_any) {
+                if (!painted_this_iter) {
+                    for (int i = 0; i < WM_MAX_SURF; i++) {
+                        if (!slots[i].used) continue;
+                        wm_union(&odmg_x, &odmg_y, &odmg_w, &odmg_h,
+                                 slots[i].info.x, slots[i].info.y, (int)slots[i].info.w, (int)slots[i].info.h);
                     }
+                    if (odmg_w > 0 && odmg_h > 0) {
+                        int x0 = wm_max(odmg_x, 0), y0 = wm_max(odmg_y, 0);
+                        int x1 = wm_min(odmg_x + odmg_w, (int)g_fb.width), y1 = wm_min(odmg_y + odmg_h, (int)g_fb.height);
+                        if (x1 > x0 && y1 > y0) {
+                            int blend2 = 0;
+                            const int px2 = wm_paint_rect(slots, x0, y0, x1, y1, &blend2);
+                            (void)fb_flip(x0, y0, x1 - x0, y1 - y0);
+                            n_frame++;
+                            painted_this_iter = 1;
+                            last_repair_ms = now_ms;
+                            printf("[WM] frame n=%lu surfs=%d pending=0 dirty=%d,%d,%d,%d px=%d blend=%d us=0 flip_us=0 path=soft full=0 foreign=0 input=1 t_ms=%lu\n",
+                                   n_frame, n_used, x0, y0, x1 - x0, y1 - y0, px2, blend2,
+                                   (unsigned long)(vimtu64_ticks() * 4));
+                            wm_remember(slots);
+                            odmg_x = odmg_y = odmg_w = odmg_h = 0;   /* 已经画掉了，别再 carry */
+                        }
+                    }
+                }
+                if (odmg_w > 0 && odmg_h > 0) {                 /* 本轮画不掉 -> 下一轮必画 */
+                    carry_x = odmg_x; carry_y = odmg_y;
+                    carry_w = odmg_w; carry_h = odmg_h;
                 }
             }
         }

@@ -598,11 +598,16 @@ def main():
             n_login = vm.log().count("[LOGIN64] login screen shown")
             vm.wait_new("[LOGIN64] login screen shown", 25, n_login - 1 if n_login else 0)
             log = vm.wait("[LOGIN64] userlist", 20)
-            check("登录界面只列普通用户（[LOGIN64] userlist n=3 names=... root=hidden=1）",
-                  bool(log) and bool(re.search(r"\[LOGIN64\] userlist n=3 names=[^ ]* root=hidden=1", log)),
-                  (re.search(r"\[LOGIN64\] userlist[^\r\n]*", vm.log()) or re.search(r"$^", vm.log())).group(0))
+            # ★ v0.10.6：`vm.wait()` 返回**整篇日志**，`re.search` 命中的是**开机那次**登录的
+            #   userlist（n=1，那时 alice/bob 还没建）。这里要判的是**当前这次**登录界面的列表，
+            #   所以取最后一条（判据不变：仍要求 n=3 且 root=hidden=1）。实测同一次运行里
+            #   开机那次 n=1、重启复验那次 n=3 names=vimtu,alice,bob。
+            _ul = re.findall(r"\[LOGIN64\] userlist[^\r\n]*", vm.log())
+            _ul_last = _ul[-1] if _ul else ""
+            check("登录界面只列普通用户（[LOGIN64] userlist n=3 names=... root=hidden=1；取最后一条）",
+                  bool(re.search(r"n=3 names=[^ ]* root=hidden=1", _ul_last)), _ul_last)
             check("登录界面的用户列表里没有 root",
-                  bool(log) and not re.search(r"userlist n=\d+ names=([^\s]*)\broot\b", log))
+                  bool(_ul_last) and not re.search(r"names=([^\s]*)\broot\b", _ul_last), _ul_last)
             # 反向动画：先按 ESC 回锁屏（20 -> 0，250–350ms），再回来点/选用户
             n_anim = vm.log().count("[LOGIN64] blur anim dir=out")
             vm.key("esc", wait=0.8)
