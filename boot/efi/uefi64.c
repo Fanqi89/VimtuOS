@@ -34,13 +34,22 @@
 //   写死值会让 load_file **只读前 4.13MB**，介质描述符又只报 8073 扇区，
 //   于是 UEFI 装出来的盘主分区（LBA 32584 起）整块是零 -> "装完重启黑屏"。
 //   现在一律按文件真实大小读（SetPosition(END)/GetPosition），下面两个只是**上限**：
-#define KERNEL_MAX_BYTES   (46ULL * 1024 * 1024)   // 直映 PA 0..48MB 之内（内核在 1MB 起）
+// ★ v0.10.8 真 Bug：这条上限原来是 46MB，而本引导器（UEFI64.BIN）自身链接在 0x800000，
+//   内核镜像从 0x100000 起铺 —— 只要 KERNEL64.BIN 超过 7MB 就会把引导器连同页表踩掉，
+//   表现为 U:entry=… 之后**立刻复位、串口零内核输出、反复重启**（真机 UEFI 也是这个症状）。
+//   现在收紧到 6MB（留 1MB 余量）并给出明确报错；同时安装器只写内核**真实长度**
+//   （kernel/part64.cpp 的 part_kernel_real_bytes64），两条一起保证不再自我覆盖。
+#define KERNEL_MAX_BYTES   (6ULL * 1024 * 1024)    // < 0x800000 - 0x100000，绝不能踩到引导器自身
 #define PAYLOAD_MAX_BYTES  (32ULL * 1024 * 1024)   // 载荷暂存区 [0x04000000, 0x06000000)
 // ★ 内核搬高半区（与 kernel/linker64.ld 的链接基址一致）：
 //   虚拟 0xFFFFFFFF80000000 = 物理 0x100000（平铺装载地址），
 //   即 VA = KERNEL_VA_BASE + (PA - HIGH_KERNEL)。
 #define KERNEL_VA_BASE   0xFFFFFFFF80100000ULL
-#define KERNEL_MAP_BYTES (48ULL * 1024 * 1024)      // 直映 PA 0..48MB（内核镜像+BSS 约 36MB）
+// ★ v0.10.8 真 Bug：系统内核 .bss 末端在物理 ~51.5MB（.bss 47,755,569 B），
+//   而这里原来只直映 0..48MB —— kmain64 第一步清 .bss 就写到窗口外，
+//   UEFI 下没有 IDT -> 三重故障 -> 立刻复位（串口只剩 E/s/K 三个打点）。
+//   窗口给到 128MB（内核镜像+BSS ~56MB 的 2.3 倍余量）。
+#define KERNEL_MAP_BYTES (128ULL * 1024 * 1024)     // 直映 PA 0..128MB（内核 .bss 约 56MB）
 
 // ★ RSDP 传递槽（物理地址，8 字节 u64）：UEFI 按规范通过 EFI 配置表交付 RSDP，不放
 //   legacy EBDA/0xE0000 窗口。命中项的 VendorTable 写进这里；0 = 没找到。
@@ -430,11 +439,11 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
         mem_zero(g_pd_hi, 4096);
         g_pdpt_hi[510] = (u64)(unsigned long)g_pd_hi | 3;     // VA 0xFFFFFFFF80000000 -> PDPT[510]
         {
-            const u32 pages = (u32)(KERNEL_MAP_BYTES / 0x200000ULL);   // 24
+            const u32 pages = (u32)(KERNEL_MAP_BYTES / 0x200000ULL);   // 2MB/页
             for (u32 i = 0; i < pages; i++) {
                 g_pd_hi[i] = ((u64)i * 0x200000ULL) | 0x83;   // P|RW|PS，从 PA 0 起（直映）
             }
-            ser_str("U:direct map VA 0xFFFFFFFF80000000+PA, bytes=");
+            ser_str("U:direct map VA 0xFFFFFFFF80000000+PA, mb=");
             ser_dec(pages);
             ser_str("\n");
         }

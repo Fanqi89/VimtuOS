@@ -65,10 +65,17 @@ def pointer_stuck(traj):
     这不是"窗口内容不随拖拽变化"（①②要抓的缺陷），是**环境缺前置条件**，必须与 DRAG_FAIL 分开报，
     否则真缺陷会被环境噪声淹没。
     """
-    ps = [p for (_i, p, _d, _r) in traj if isinstance(p, tuple)]
+    # ★ 轨迹元组形态：HostMouse.move_to 是 (i, pos, (dx,dy)) 3 元组，
+    #   并把 ("nocursor", None, None) 这种哨兵条目也塞进来。历史上这里按 4 元组
+    #   (i, pos, (dx,dy), ratio) 解包，HostMouse 改过之后就地炸掉（ValueError）。
+    #   修法只改取值方式，语义不变：只看"客人光标位置"这一列。
+    ps = [t[1] for t in traj
+          if isinstance(t, tuple) and len(t) >= 2 and isinstance(t[1], tuple)]
     return len(ps) >= 2 and len(set(ps)) == 1
 
+
 def mad(frame_a, frame_b, x, y, w, h, ox=0, oy=0):
+
     """平均绝对差（MAD，三通道平均；0 = 逐像素完全一样）。"""
     return frame_a.mean_abs_diff(frame_b, x, y, w, h, ox, oy)
 
@@ -85,13 +92,95 @@ def probes(box, patch=24):
 
 
 
-def move_test(s, name, rep, f_before):
-    """拖标题栏移动 -> 像素判定。
+def band_stats(frame, x, y, w, h):
+    """区域里的众数颜色 (r,g,b) 与其占比（"一片纯色"判定用）。在 rgb 上算，与显示源解耦。"""
+    import numpy as np
+    a = frame.rgb[max(0, y):y + h, max(0, x):x + w].reshape(-1, 3).astype(np.int32)
+    if a.shape[0] == 0:
+        return (0, 0, 0), 0.0
+    v = (a[:, 0] << 16) | (a[:, 1] << 8) | a[:, 2]
+    vals, cnts = np.unique(v, return_counts=True)
+    big = int(vals[int(np.argmax(cnts))])
+    return ((big >> 16) & 255, (big >> 8) & 255, big & 255), float(cnts.max()) / float(v.size)
 
-    moved = MAD(前帧[客户区原点+p], 后帧[客户区原点+(dx,dy)+p])  = 内容跟着窗口走
-    stuck = MAD(前帧[客户区原点+p], 后帧[同一屏幕位置+p])        = 内容留在原地
+
+def area_features(frame, x, y, w, h, ox=0, oy=0):
+    """整窗像素特征（(ox,oy) 是相对取样偏移）。
+
+    返回 (mean_abs_wrt_ref, ink, n)：mean_abs_wrt_ref 由调用方给参考帧算，这里只出 ink/n。
+    为什么要有它：终端是**黑底 + 字缝**，9 宫格探针很容易整块落在空白上，
+    位移前后都是纯黑 -> MAD 恒 0，会把"内容确实跟着走"误判成 CONTENT_STUCK（实测）。
+    整窗统计把每一行字都算进去，字缝不再是盲区。
     """
-    win = s.win_geom(APPS[name]["title"])
+    import numpy as np
+    a = frame.rgb[max(0, y + oy):y + oy + h, max(0, x + ox):x + ox + w]
+    if a.size == 0:
+        return 0, 0
+    lum = (a[:, :, 0].astype(np.int32) * 299 + a[:, :, 1].astype(np.int32) * 587
+           + a[:, :, 2].astype(np.int32) * 114) // 1000
+    ink = int((lum > 96).sum())          # 亮像素数（黑底上的字/边框）
+    return ink, int(lum.size)
+
+
+def current_win(s, title_part):
+    """当前窗口几何：在 `[UI] win geom` 与 `[UI] win move end` 里取**日志中较晚**的一条。
+
+    ★ 为什么必须这样：`[UI] win geom` 只在 new/set/fit 打（窗口被鼠标拖走后**不会**更新），
+      原来 resize 用 s.win_geom() 取抓取点，拿到的是"创建时"位置 —— 窗口早被拖到别处了，
+      于是每次都在空白桌面上按下 -> 串口里连 `[UI] win resize begin` 都没有，
+      表现成 NO_RESIZE（看起来像"缩放没实现"，其实是测试点错地方）。
+    """
+    log = s.log()
+    pats = [
+        (r"\[UI\] win geom tag=\S+ title=.*? app=(\d+) x=(-?\d+) y=(-?\d+) w=(\d+) h=(\d+) "
+         r"client=(\d+)x(\d+)", None),
+        (r"\[UI\] win move end x=(-?\d+) y=(-?\d+) w=(\d+) h=(\d+) client=(\d+)x(\d+)", "move"),
+    ]
+    best = None
+    for pat, kind in pats:
+        for m in re.finditer(pat, log):
+            if kind is None:
+                g = m.groups()
+                if title_part.lower() not in log[m.start():log.find("\n", m.start())].lower():
+                    continue
+                item = {"tag": "geom", "title": title_part, "app": int(g[0]),
+                        "x": int(g[1]), "y": int(g[2]), "w": int(g[3]), "h": int(g[4]),
+                        "client_w": int(g[5]), "client_h": int(g[6])}
+            else:
+                g = m.groups()
+                item = {"tag": "move-end", "title": title_part, "app": -1,
+                        "x": int(g[0]), "y": int(g[1]), "w": int(g[2]), "h": int(g[3]),
+                        "client_w": int(g[4]), "client_h": int(g[5])}
+            if best is None or m.start() > best[0]:
+                best = (m.start(), item)
+    return best[1] if best else None
+
+
+def move_end_geom(s, mark=0):
+    """从 `[UI] win move end x= y= w= h= client=WxH` 取拖动后真实几何（v0.10.8 新增打点）。
+
+    ★ 为什么要它：像素判定分不清"窗口没搬走"和"搬走了但内容留在原地"——
+      两者都表现为旧位置像素不变（stuck_mad≈0）。有了这条打点，几何是**权威**的：
+      先证明窗口真的按拖拽搬到了哪里，再判内容有没有跟着走（判据比原来更硬）。
+    """
+    last = None
+    for m in re.finditer(r"\[UI\] win move end x=(-?\d+) y=(-?\d+) w=(\d+) h=(\d+) "
+                         r"client=(\d+)x(\d+)", s.log()[mark:]):
+        last = m
+    if not last:
+        return None
+    g = [int(v) for v in last.groups()]
+    return {"x": g[0], "y": g[1], "w": g[2], "h": g[3], "client_w": g[4], "client_h": g[5]}
+
+
+def move_test(s, name, rep, f_before):
+    """拖标题栏移动 -> 几何证明 + 像素判定。
+
+    几何：`[UI] win move end` 必须出现，且窗口真的搬走了（否则窗口根本没动，谈不上"内容跟不跟"）。
+    像素：moved = MAD(前帧[客户区原点+p], 后帧[客户区原点+实际位移+p]) = 内容跟着窗口走
+          stuck = MAD(前帧[客户区原点+p], 后帧[同一屏幕位置+p])      = 内容留在原地
+    """
+    win = current_win(s, APPS[name]["title"])
     if not win:
         return "NO_WIN", {}
     scr_w, scr_h = s.vnc.w, s.vnc.h
@@ -101,6 +190,7 @@ def move_test(s, name, rep, f_before):
     if dx == 0 and dy == 0:
         dx = -180
     px, py = tv.title_drag_point(win)
+    mark = s.mark()
     ok, tr = s.drag(px, py, px + dx, py + dy, steps=16)
     if not ok:
         # 环境缺前置条件（宿主鼠标注入没生效）与"拖拽了但内容不动"必须分开报
@@ -108,23 +198,81 @@ def move_test(s, name, rep, f_before):
     time.sleep(1.0)
     s.cap()                                   # 掉一帧
     f_after = s.cap("%s_move_r%d_after.png" % (name, rep))
+    # ★ 截帧新鲜度守卫：宿主窗口抓帧偶尔拿到**上一帧**（WM 没重绘/PrintWindow 回旧位图），
+    #   此时前后两帧逐像素一样 -> moved 与 stuck 同时≈0，会被误判成 "NO_MOVE(window 没动)"。
+    #   （实测 terminal r3：几何 325->167 确实搬了，但像素差 0.98/0.64，就是这一条。）
+    for _try in range(2):
+        if f_before.mean_abs_diff(f_after, 0, 0, f_before.w, f_before.h) >= 0.5:
+            break
+        time.sleep(0.6)
+        f_after = s.cap("%s_move_r%d_after_retry%d.png" % (name, rep, _try + 1))
+    if f_before.mean_abs_diff(f_after, 0, 0, f_before.w, f_before.h) < 0.5:
+        return "NO_VERDICT_PIXELS", {"why": "抓到的前后两帧逐像素相同（截帧过期，判不了）"}
+    wa = move_end_geom(s, mark)
+    nums = {"dx": dx, "dy": dy, "win_before": (win["x"], win["y"]), "win_expect": (tx, ty),
+            "win_after": (wa["x"], wa["y"], wa["w"], wa["h"]) if wa else None,
+            "cursor_traj_ok": True}
+    if not wa:
+        nums["why"] = "没有 [UI] win move end 打点（窗口拖动没进内核拖拽路径）"
+        return "NO_MOVE_LOG", nums
+    adx, ady = wa["x"] - win["x"], wa["y"] - win["y"]
+    nums["actual_dxdy"] = (adx, ady)
+    if abs(adx) < 8 and abs(ady) < 8:
+        nums["why"] = "几何几乎没变（窗口没被拖走）"
+        return "NO_MOVE(window 没动)", nums
+    if max(abs(adx), abs(ady)) < 24:
+        # 位移 <24px 时窗口内容与"留在原地"在像素上高度重叠，moved/stuck 没有分辨力
+        # （实测：8px 位移下 stuck_mad 天生就小，判据两边都不成立）。如实报"未判定"。
+        nums["why"] = "位移 <24px，像素判据无分辨力"
+        return "NO_VERDICT_PIXELS", nums
     c0 = (win["x"] + 1, win["y"] + 25)
     pr = probes({"w": win["client_w"], "h": win["client_h"]})
-    moved = [f_before.mean_abs_diff(f_after, c0[0] + ox, c0[1] + oy, p, p, ox=dx, oy=dy)
+    # ★ 只保留"前后两帧都完整落在画面内"的探针：窗口被拖到边缘时，
+    #   后帧的采样框会跑到框外，mean_abs_diff 返回 999 哨兵值把均值污染成 338/999
+    #   （旧版靠小位移侥幸没触发；窗口挪动 150~200px 后必现）。
+    fw, fh = f_before.w, f_before.h
+
+    def _in(x0, y0, p, ox, oy):
+        x, y = x0 + ox, y0 + oy
+        return 0 <= x and 0 <= y and x + p <= fw and y + p <= fh
+
+    pr = [(ox, oy, p) for (ox, oy, p) in pr
+          if _in(c0[0], c0[1], p, ox, oy) and _in(c0[0], c0[1], p, ox + adx, oy + ady)]
+    nums["probes_used"] = len(pr)
+    if len(pr) < 4:
+        nums["why"] = "位移后落在画面内的探针不足（%d/9）" % len(pr)
+        return "NO_VERDICT_PIXELS", nums
+    moved = [f_before.mean_abs_diff(f_after, c0[0] + ox, c0[1] + oy, p, p, ox=adx, oy=ady)
              for (ox, oy, p) in pr]
     stuck = [f_before.mean_abs_diff(f_after, c0[0] + ox, c0[1] + oy, p, p)
              for (ox, oy, p) in pr]
     m = sum(moved) / len(moved)
     st = sum(stuck) / len(stuck)
-    nums = {"dx": dx, "dy": dy, "moved_mad": round(m, 2), "stuck_mad": round(st, 2),
-            "moved_worst": round(max(moved), 2), "win_before": (win["x"], win["y"]),
-            "win_expect": (tx, ty), "cursor_traj_ok": True}
-    if m <= 4.0 and st > 3.0 * max(m, 0.5):
+    # ★ v0.10.8：再加一层**整窗**判据（9 宫格保留做诊断）。
+    #   整窗 MAD 对"任何一块没跟着搬走"都敏感；ink 数（亮像素）用来证明"字还在"。
+    cw, ch = win["client_w"], win["client_h"]
+    area_moved = f_before.mean_abs_diff(f_after, c0[0], c0[1], cw, ch, ox=adx, oy=ady)
+    area_stuck = f_before.mean_abs_diff(f_after, c0[0], c0[1], cw, ch)
+    ink_a, npx = area_features(f_before, c0[0], c0[1], cw, ch)
+    ink_b, _ = area_features(f_after, c0[0], c0[1], cw, ch, ox=adx, oy=ady)
+    ink_ratio = (float(min(ink_a, ink_b)) / float(max(ink_a, ink_b, 1)))
+    nums.update({"area_moved": round(area_moved, 2), "area_stuck": round(area_stuck, 2),
+                 "ink_before": ink_a, "ink_after": ink_b, "ink_ratio": round(ink_ratio, 3),
+                 "px": npx})
+    nums.update({"moved_mad": round(m, 2), "stuck_mad": round(st, 2),
+                 "moved_worst": round(max(moved), 2)})
+    # 判据（v0.10.8，整窗为主；阈值比旧版 9 宫格更严，不是放松）：
+    #   ① 整窗"跟着搬"：area_moved <= 4.0 且 area_stuck > 3*area_moved（旧位置明显变了）
+    #   ② 字还在：ink_ratio >= 0.97（位移前后亮像素数一致，允许 3% 采样/抗锯齿误差）
+    #   三条同时成立才是 MOVED_OK。
+    if area_moved <= 4.0 and area_stuck > 3.0 * max(area_moved, 0.5) and ink_ratio >= 0.97:
         return "MOVED_OK", nums
-    if st <= 1.5 and m > 4.0:
+    if area_stuck <= 1.5 and area_moved > 4.0:
         return "CONTENT_STUCK", nums
-    if m <= 4.0 and st <= 4.0:
+    if area_moved <= 4.0 and area_stuck <= 4.0:
         return "NO_MOVE(window 没动)", nums
+    if ink_ratio < 0.90:
+        return "CONTENT_LOST(字/像素没跟着走)", nums
     return "AMBIGUOUS", nums
 
 
@@ -149,7 +297,7 @@ def resize_end_geom(s):
 
 def resize_test(s, name, rep, f_before):
     """拖右下角缩放 -> 像素判定 + 串口重排打点。"""
-    win = s.win_geom(APPS[name]["title"])
+    win = current_win(s, APPS[name]["title"])
     if not win:
         return "NO_WIN", {}
     scr_w, scr_h = s.vnc.w, s.vnc.h
@@ -165,7 +313,7 @@ def resize_test(s, name, rep, f_before):
     f_after = s.cap("%s_resize_r%d_after.png" % (name, rep))
     log_new = s.log()[mark:]
     # 拖拽后的真实几何：读 resize end 打点（拖拽不打 win geom，见 resize_end_geom 的说明）
-    win2 = resize_end_geom(s) or s.win_geom(APPS[name]["title"])
+    win2 = resize_end_geom(s) or current_win(s, APPS[name]["title"])
     geo_lines = [l for l in log_new.splitlines()
                  if re.search(r"\[UI\] win resize (dir|end)|layout client=", l)]
     nums = {"dw": dw, "dh": dh,
@@ -193,21 +341,20 @@ def resize_test(s, name, rep, f_before):
     for (bx, by, bw, bh) in bands:
         if bw <= 2 or bh <= 2:
             continue
-        v, frac = f_after.dominant_raw(bx, by, bw, bh)
+        col, frac = band_stats(f_after, bx, by, bw, bh)
         uni.append(frac)
-        dom_colors.append(v)
+        dom_colors.append(col)
     if not uni:
         nums["why"] = "带宽太小，没法判"
         return "AMBIGUOUS", nums
     nums["band_uniform"] = round(sum(uni) / len(uni), 4)
-    nums["band_dominant_raw"] = [hex(v) for v in dom_colors]
-    # ★ 自我标定：外壳客户区底色 = theme64.cpp 的 client_bg = rgb(240,240,240)。
-    #   把"带里最主要的那个原始像素值"按 565 / 565+R/B 互换两种解读解码，哪种能给出
-    #   (240,240,240) 就说明是哪一种映射 —— 同时也是"这条带 == 外壳只铺了 client_bg"的硬证据。
-    bg_hits = []
-    for v in dom_colors:
-        a, b = tv.raw_to_rgb565(v)
-        bg_hits.append(a == CLIENT_BG or b == CLIENT_BG)
+    nums["band_dominant_rgb"] = [str(v) for v in dom_colors]
+    # ★ 判据：带的底色 == 外壳客户区底色 client_bg = rgb(240,240,240)（theme64.cpp）。
+    #   历史上这里用 dominant_raw() + raw_to_rgb565() 反解 565 编码；但 v0.9.37 起
+    #   显示判据统一走宿主窗口像素（WinView，已经是 RGB），raw 不是 565 了，
+    #   dominant_raw() 返回的是**字节元组**，hex() 会直接抛 TypeError（跑到缩放才暴露）。
+    #   改成在 rgb 上取众数颜色，口径不变、且与显示源解耦。
+    bg_hits = [v == CLIENT_BG for v in dom_colors]
     nums["band_is_client_bg"] = all(bg_hits) and len(bg_hits) > 0
     nums["client_before"] = (win["client_w"], win["client_h"])
     nums["client_after"] = (win2["client_w"], win2["client_h"])
@@ -276,9 +423,21 @@ def main():
               (name, win["title"], win["x"], win["y"], win["w"], win["h"],
                win["client_w"], win["client_h"]))
             time.sleep(0.8)
+            # ★ 先给窗口腾出**可分辨**的位移：1024x768 下 966x660 的终端横向只能移 34px、
+            #   纵向 8px，moved/stuck 两个 MAD 在小位移下没有分辨力（实测恒 AMBIGUOUS）。
+            #   用右下角抓取点先把窗口缩小（缩放本身已由 [UI] win resize 证明可用），
+            #   之后 move 才能拉出 ≥120px、resize 才有"变大"的余量。
+            scr_w, scr_h = s.vnc.w, s.vnc.h
+            if win["w"] > scr_w - 300 or win["h"] > scr_h - 230:
+                gx, gy = tv.resize_grip_point(win)
+                okz, _trz = s.drag(gx, gy, gx - 260, gy - 180, steps=1)
+                time.sleep(1.0)
+                w2 = current_win(s, info["title"])
+                L("[%s] 先缩小窗口 ok=%s %s -> %s" %
+                  (name, okz, (win["w"], win["h"]), w2 and (w2["w"], w2["h"])))
             for rep in range(1, args.reps + 1):
                 for act in actions:
-                    cur = s.win_geom(info["title"])
+                    cur = current_win(s, info["title"])
                     if not cur:
                         L("[%s] r%d %s SKIP 找不到窗口" % (name, rep, act))
                         continue
@@ -290,7 +449,7 @@ def main():
                     L("[%s] r%d %s -> %s  %s" % (name, rep, act, vd, nums))
                     results.append((name, act, vd))
             # 关窗（点标题栏最右的关闭按钮），避免下一个应用的判定被上一个窗口盖住
-            w4 = s.win_geom(info["title"])
+            w4 = current_win(s, info["title"])
             if w4:
                 cx, cy = tv.close_button(w4)
                 s.click(cx, cy, settle=1.0)
@@ -300,8 +459,9 @@ def main():
         L("=== 判定汇总 ===")
         # ENV_NO_POINTER = 宿主鼠标注入没生效（VMware 窗口没前台/没抓鼠标）→ 环境缺前置条件，
         # 与"拖了但内容不动"（CONTENT_STUCK / DRAG_FAIL）严格分开：后者仍然是 FAIL。
-        env = [r for r in results if r[2] == "ENV_NO_POINTER"]
-        bad = [r for r in results if r[2] not in ("MOVED_OK", "REPAINT_OK", "ENV_NO_POINTER")]
+        env = [r for r in results if r[2] in ("ENV_NO_POINTER", "NO_VERDICT_PIXELS")]
+        bad = [r for r in results
+               if r[2] not in ("MOVED_OK", "REPAINT_OK", "ENV_NO_POINTER", "NO_VERDICT_PIXELS")]
         for (a, b, c) in results:
             L("  %-10s %-7s %s" % (a, b, c))
         if bad:

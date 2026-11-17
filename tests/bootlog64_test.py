@@ -287,12 +287,15 @@ def main():
             #   v0.5.10 起控制台**底边对齐**（top_y = screen_h - rows*line_h = 20，原来固定 4），
             #   所以采样行不能再写死成第 7 行 —— 这里按打点算出的顶边往下取几个像素行，
             #   只要其中出现时间戳色 / 正文色就说明"字真的写进帧缓冲"。
-            if lfb and pitch and len(vram_samples) < 12:
-                rows_scan = [cons_top + k for k in (0, 1, 10, 11)]
+            if lfb and pitch and len(vram_samples) < 24:
+                # ★ v0.10.8：每次样本只读 2 行 × 12 字（xp_words 每调用一次都新建 TCP 连接，
+                #   原来 4 行 × 24 字 = 4 次往返，16s 只够 5 个样本 -> 落在同一滚动相位就误判"静止"）。
+                #   判据不变：同一行像素在不同时刻必须出现不同内容。
+                rows_scan = [cons_top + 10, cons_top + 11]
                 vals = []
                 for ry in rows_scan:
                     if ry >= 0:
-                        vals += xp_words(port1, lfb + ry * pitch, 24)
+                        vals += xp_words(port1, lfb + ry * pitch, 12)
                 if vals:
                     vram_samples.append([v.lower() for v in vals])
             if len(shots) >= 24:

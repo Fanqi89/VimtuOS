@@ -3779,6 +3779,30 @@ static void handle_mouse(void) {
                 dbg64_nl();
                 dbg64_line_end64();
             }
+            if (g_drag == DRAG_MOVE) {
+                // ★ 拖动**完成**时打一条几何（拖动中不打，避免刷屏）：验收要能自证
+                //   "窗口真的按拖拽距离搬走了"，而不是只看像素猜。
+                //   格式：[UI] win move end x= y= w= h= client=WxH
+                //   ★ x/y 用**有符号**打印：窗口可以被拖到屏幕左侧（x<0），
+                //     直接 dbg64_dec((uint64_t)-100) 会打印成 18446744073709551516，
+                //     验收脚本按整数解析会炸（本版踩过）。
+                const Window* w = g_drag_w;
+                dbg64_line_begin64();
+                dbg64_str("[UI] win move end x=");
+                dbg64_sdec64(w->x);
+                dbg64_str(" y=");
+                dbg64_sdec64(w->y);
+                dbg64_str(" w=");
+                dbg64_dec((uint64_t)w->w);
+                dbg64_str(" h=");
+                dbg64_dec((uint64_t)w->h);
+                dbg64_str(" client=");
+                dbg64_dec((uint64_t)w->client_w);
+                dbg64_str("x");
+                dbg64_dec((uint64_t)w->client_h);
+                dbg64_nl();
+                dbg64_line_end64();
+            }
             g_drag = DRAG_NONE;
             g_resize_dir = 0;
             g_drag_w = nullptr;

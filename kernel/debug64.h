@@ -57,6 +57,13 @@ static inline void dbg64_dec(uint64_t v) {
 
 static inline void dbg64_nl() { dbg64_str("\r\n"); }
 
+// ★ 有符号十进制：dbg64_dec 只吃 uint64，窗口 x/y 可以是负数（拖到屏幕左侧），
+//   直接强转会打印 18446744073709551516 这种值，验收脚本按整数解析会崩。
+static inline void dbg64_sdec64(int64_t v) {
+    if (v < 0) { dbg64_str("-"); dbg64_dec((uint64_t)(-v)); }
+    else dbg64_dec((uint64_t)v);
+}
+
 // ==================== 行级原子（多任务/中断里打日志不互相插行）====================
 // 背景：任务会被 PIT 抢占；两条日志同时写 COM1/debugcon 时，一行的中间会被另一行
 //   插进去（实测：user64 验收偶发缺 "[USER64] map code="，日志里前导 '[' 被相邻

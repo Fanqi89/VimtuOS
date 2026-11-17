@@ -717,6 +717,25 @@ static bool part_write_backup_gpt64(int drive, uint32_t disk_sectors, uint32_t e
     return true;
 }
 
+// ★ v0.10.8：从目标盘 loader（LBA 1..64）里解出**真实内核字节数**。
+//   回填槽格式见 tools/loader_patch64.py：'K','S','N','T', <u16 LE 512B 扇区数>, <u16 LE 2048B>。
+//   为什么必须只写真实长度：UEFI 引导器把 KERNEL64.BIN 整份读到 0x100000，而它自身链接在
+//   0x800000 —— 写整块 15MiB 就会把引导器和页表覆盖掉，一跳进内核立刻复位（实测反复重启）。
+static uint32_t part_kernel_real_bytes64(int drive) {
+    static uint8_t lbuf[512];
+    for (uint32_t lba = 1; lba <= 64; lba++) {
+        if (!ata64_read_sector(drive, lba, lbuf)) return 0;
+        for (uint32_t i = 0; i + 8 <= 512; i++) {
+            if (lbuf[i] == 'K' && lbuf[i + 1] == 'S' && lbuf[i + 2] == 'N' && lbuf[i + 3] == 'T') {
+                const uint32_t secs = (uint32_t)lbuf[i + 4] | ((uint32_t)lbuf[i + 5] << 8);
+                if (secs == 0 || secs > ML64_KERNEL_SECTORS) return 0;
+                return secs * 512u;
+            }
+        }
+    }
+    return 0;
+}
+
 // ESP：格式化 **FAT32** + 写 EFI/BOOT/BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN
 // KERNEL64.BIN 的内容 = 目标盘引导区**整块**（LBA 65..32583 = 32,519 扇区，见 part64.h）：
 //   安装程序内核装不下这份 15MiB 副本（它自己有 4MiB 介质上限），而载荷已经把系统内核拷到了那里。
@@ -741,7 +760,15 @@ static int part_install_esp64(int drive, uint32_t esp_start, uint32_t esp_sector
 
     const uint32_t stub_len  = embedded_stub_len64();
     const uint32_t uefi_len  = embedded_loader_len64();
-    const uint32_t kern_len  = ML64_KERNEL_SECTORS * 512;      // 4,096,000（内核区整块）
+    // ★ v0.10.8：只写**真实内核长度**（不是 15MiB 整块）—— 见 part_kernel_real_bytes64 的说明。
+    uint32_t kern_len = part_kernel_real_bytes64(drive);
+    if (kern_len == 0) {
+        kern_len = ML64_KERNEL_SECTORS * 512;      // 兜底：解不到 'KSNT' 就退回整块
+        dbg64_str("[INSTALL] esp: KSNT missing, fallback block=");
+        dbg64_dec(kern_len);
+        dbg64_str("B");
+        dbg64_nl();
+    }
     bool ok = true;
     if (fat64_mkdir64(drive, "EFI") != 0) ok = false;
     if (ok && fat64_mkdir64(drive, "EFI/BOOT") != 0) ok = false;
@@ -757,7 +784,9 @@ static int part_install_esp64(int drive, uint32_t esp_start, uint32_t esp_sector
     dbg64_dec(uefi_len);
     dbg64_str("B KERNEL64.BIN=");
     dbg64_dec(kern_len);
-    dbg64_str(ok ? "B" : "B (FAIL)");
+    dbg64_str("B (block=");
+    dbg64_dec(ML64_KERNEL_SECTORS * 512);
+    dbg64_str(ok ? "B)" : "B) (FAIL)");
     dbg64_nl();
     return ok ? 0 : -1;
 }

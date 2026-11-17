@@ -559,13 +559,20 @@ def main():
               data == uefi_ref, "盘上 %d 字节" % size)
     k = fat.find(["KERNEL64.BIN"])
     check("KERNEL64.BIN 存在", k is not None)
+    # ★ v0.10.8：新契约 —— ESP 里只放**内核真实长度**（不是 15MiB 整块）。
+    #   旧契约（整块 15,728,640 B）正是"UEFI 从装好的盘起不来"的根因：
+    #   引导器把文件整份读到 0x100000，15MB 会铺到 16MB，踩掉链接在 0x800000 的 UEFI64.BIN。
+    kreal = ((len(kern_ref) + SECTOR - 1) // SECTOR) * SECTOR
     if k:
         data, size = fat.read_file(k)
-        check("KERNEL64.BIN = 内核区整块（system.img LBA 65..30784 的 %d 字节，大小 + 逐字节）"
-              % len(kregion),
-              size == len(kregion) and data == kregion, "盘上 %d 字节" % size)
-        check("KERNEL64.BIN 与目标盘 LBA 65.. 的内核区逐字节一致",
-              data == disk[PART_BOOT_LBA * SECTOR: (PART_BOOT_LBA + 30720) * SECTOR])
+        check("KERNEL64.BIN = 内核**真实**长度 %d B（= kernel64_os.bin 按扇区取整）" % kreal,
+              size == kreal, "盘上 %d 字节" % size)
+        check("KERNEL64.BIN 开头 %d 字节 == build64/kernel64_os.bin" % len(kern_ref),
+              data[:len(kern_ref)] == kern_ref)
+        check("KERNEL64.BIN 与目标盘 LBA 65.. 的内核区前 %d 字节逐字节一致" % kreal,
+              data == disk[PART_BOOT_LBA * SECTOR: PART_BOOT_LBA * SECTOR + kreal])
+        check("KERNEL64.BIN < 6 MiB（UEFI 引导器自我覆盖闸门：必须 < 0x800000-0x100000）",
+              size < 6 * 1024 * 1024, "盘上 %d 字节" % size)
 
     print("=== 5) ★ UEFI（OVMF）从这块**装好的盘**启动 ===")
     uefi_log = boot_disk(qemu, args.target, os.path.join(ROOT, "esp_installed_uefi.log"),
@@ -660,11 +667,14 @@ def main():
     pefi = pfat.find(["EFI", "BOOT", "BOOTX64.EFI"])
     pu = pfat.find(["UEFI64.BIN"])
     pk = pfat.find(["KERNEL64.BIN"])
-    check("★ 128MB PATA：ESP 三个文件与构建产物逐字节一致",
+    check("★ 128MB PATA：ESP 三个文件与构建产物逐字节一致（KERNEL64.BIN = 内核真实长度）",
           pefi is not None and pu is not None and pk is not None
           and pfat.read_file(pefi)[0] == stub_ref
           and pfat.read_file(pu)[0] == uefi_ref
-          and pfat.read_file(pk)[0] == kregion)
+          and pfat.read_file(pk)[0] == pdisk[PART_BOOT_LBA * SECTOR:
+                                              PART_BOOT_LBA * SECTOR + kreal]
+          and pfat.read_file(pk)[0][:len(kern_ref)] == kern_ref
+          and len(pfat.read_file(pk)[0]) < 6 * 1024 * 1024)
     with tempfile.TemporaryDirectory(prefix="vimtu_pata_esp_") as td:
         pimg = os.path.join(td, "esp.img")
         with open(pimg, "wb") as f:

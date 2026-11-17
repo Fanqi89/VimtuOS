@@ -28,6 +28,7 @@
 """
 import os
 import re
+import select
 import socket
 import struct
 import subprocess
@@ -43,10 +44,13 @@ except Exception:
 
 VMRUN = r"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe"
 ROOT = r"C:\Users\fanqi\Desktop\VimtuOS\Vimtu64"
-VMTEST = r"C:\Users\fanqi\Desktop\新建文件夹\v64-install-test"
-VMX_BOOT = os.path.join(VMTEST, "vimtu64-installed-boot.vmx")
-SERIAL_BOOT = os.path.join(VMTEST, "serial-installed-boot.log")
-VNC_BOOT_PORT = 5904
+# ★ 夹具目录：历史默认路径 `新建文件夹\v64-install-test`（BIOS 夹具）在本机已不存在，
+#   只剩 UEFI 夹具 `新建文件夹\v64-uefi-test`。三处都支持环境变量覆盖，便于换夹具而不改代码：
+#     VIMTU_VMTEST / VIMTU_VMX / VIMTU_SERIAL
+VMTEST = os.environ.get("VIMTU_VMTEST") or r"C:\Users\fanqi\Desktop\新建文件夹\v64-uefi-test"
+VMX_BOOT = os.environ.get("VIMTU_VMX") or os.path.join(VMTEST, "vimtu64-installed-boot.vmx")
+SERIAL_BOOT = os.environ.get("VIMTU_SERIAL") or os.path.join(VMTEST, "serial-installed-boot.log")
+VNC_BOOT_PORT = int(os.environ.get("VIMTU_VNC_PORT") or 5904)
 SCRATCH = os.environ.get("PI_SCRATCH_DIR", os.path.join(ROOT, "build64"))
 EVID = os.path.join(SCRATCH, "textrepro")
 
@@ -422,7 +426,7 @@ class TextVNC:
             return 0
         raise OSError("未知 RFB 消息类型 %d" % t)
 
-    def cap(self, timeout=0.7):
+    def cap(self, timeout=0.35):
         """返回"当前真屏"。模型：**缓冲区是累积的** —— __init__ 里已经拿过一整帧，
         之后只要把服务器推来的更新落进缓冲区即可。
 
@@ -432,13 +436,26 @@ class TextVNC:
           * 若 timeout 内什么都没来 = 屏幕确实没变 => **当前缓冲区就是真屏**，直接返回。
         （早期版本每次都要整屏 + 收不满重试 4 次 = 每次 30s 起，拖拽测试直接跑不完。）"""
         self._req(0, 0, self.w, self.h, incremental=1)
+        # ★ 修：原来直接 `while time.time()-t0 < timeout: self._msg(None)`，
+        #   但 _recv 是**阻塞 recv**，受 socket 超时（15s）支配 —— 屏幕没变时整条
+        #   cap() 卡满 15s（实测 cap=15.07s），真鼠标闭环每轮要 2~3 次 cap ⇒ 20s 预算
+        #   只走 1~2 轮，拖拽必然 DRAG_FAIL。
+        #   这里改成先用 select 做**非破坏性**可读等待（不消费字节，不会断流），
+        #   确有数据才进 _msg（仍按原 socket 超时把整条消息读完）；超时即认为"屏没变"。
         t0 = time.time()
-        while time.time() - t0 < timeout:
+        while True:
+            remain = timeout - (time.time() - t0)
+            if remain <= 0:
+                break
+            try:
+                ready = select.select([self.sock], [], [], min(0.05, remain))[0]
+            except (OSError, ValueError):
+                break
+            if not ready:
+                continue
             try:
                 self._msg(None)
-            except socket.timeout:
-                break
-            except TimeoutError:
+            except (socket.timeout, TimeoutError):
                 break
         return Frame(self.buf.copy())
 
@@ -484,7 +501,7 @@ class TextVNC:
             time.sleep(gap)
 
     # ---------------- 光标闭环 ----------------
-    def find_cursor(self, frame=None, hint=None):
+    def find_cursor(self, frame=None, hint=None, rad=140):
         """用 gui64 draw_cursor 的箭头形状（19 行、黑底白描边）做模板匹配，返回左上角坐标。
 
         检查前 5 行的固定图案（够独特；箭头在客人里是**软件绘制**的，一定在 VNC 帧里）：
@@ -507,8 +524,8 @@ class TextVNC:
         if len(ys) == 0 and hint is not None:
             # ★ 兜底：光标压到深色/花哨背景（Dock 图标、窗口标题栏）时，前 5 行的严格图案
             #   可能有一条不成立。退一步只在 hint 附近 ±140px 里找"前 3 行"的弱图案（够定位）。
-            x0, y0 = max(0, hint[0] - 140), max(0, hint[1] - 140)
-            x1, y1 = min(w - 3, hint[0] + 140), min(h - 3, hint[1] + 140)
+            x0, y0 = max(0, hint[0] - rad), max(0, hint[1] - rad)
+            x1, y1 = min(w - 3, hint[0] + rad), min(h - 3, hint[1] + rad)
             sub = B[y0:y1, x0:x1]
             if sub.shape[0] > 6 and sub.shape[1] > 6:
                 hh, ww = sub.shape
@@ -545,8 +562,8 @@ class TextVNC:
                 break
         return best[:2] if best else None
 
-    def cursor_pos(self, hint=None):
-        return self.find_cursor(hint=hint)
+    def cursor_pos(self, hint=None, rad=140):
+        return self.find_cursor(hint=hint, rad=rad)
 
 
     def type_text(self, text, gap=0.06):
@@ -666,6 +683,10 @@ def find_window(part):
     return res[0] if res else (None, None)
 
 
+DRAG_LAND_TOL = 30            # 拖拽落点容差（px）：宿主注入量化 + 反馈滞后，实测过冲 10~30
+MOVE_STEP_MAX_PACKETS = 4      # move_to 一轮最多发几个相对鼠标包（客人 ≤96px；反馈用串口 1 Hz 精确值）
+
+
 class HostMouse:
     """★ 真鼠标：VMware 的 VNC 服务器**不转发 PointerEvent**（实测：客人光标一点不动，
     见 $PI_SCRATCH_DIR/mouse_path.log），所以点击/拖拽一律走**宿主真鼠标**：
@@ -716,18 +737,25 @@ class HostMouse:
     def up(self):
         _user32.mouse_event(0x0004, 0, 0, 0, 0)
 
-    def move_to(self, vnc, x, y, tol=2, max_iter=14, budget=20.0):
+    def move_to(self, vnc, x, y, tol=2, max_iter=14, budget=28.0):
         """闭环把客人光标挪到 (x,y)（客人坐标）。返回 (ok, 轨迹)。
-        有**总时间预算**：cap() 要 ms 级，一旦哪里卡住也不会把整个测试拖死。"""
+
+        ★ 2026-11-16 重写（本机 VMware 实测标定，见 $PI_SCRATCH_DIR/twm_calib.txt）：
+          宿主 `mouse_event` 一个相对包 -> 客人位移是**确定**的：
+            |d| >= 20  ->  恰好 24 客人 px（内核 MOUSE_STEP 上限）
+            |d| <  20  ->  约 1.7*d 客人 px
+          所以不再用 EMA 估比例（上一版会因读帧滞后把比例推到 4.0/0.05，
+          步长随之失真，20s 预算只走 1~2 轮 -> 恒判 DRAG_FAIL），改成固定 1.7 + 每轮 ≤3 包。
+          读帧有滞后：移动后轮询到"位置真的变了"再继续，避免把上一帧当结果。
+        """
         traj = []
-        pos = vnc.cursor_pos()
+        # ★ 有串口权威反馈就用它（客人 1 Hz 自报 cur=x,y 的整数），否则退回像素模板匹配
+        fb = getattr(vnc, "perf_cursor", None)
+        pos = fb() if fb else vnc.cursor_pos()
         if pos is None:
             return False, [("nocursor", None, None)]
         t_end = time.time() + budget
-        # ★ 客人/宿主位移比**自适应**：实测本机 VMware 的加速曲线不是线性的
-        #   （单事件 -120 宿主 px 只走 24 客人 px；小步长 (6,3) 却放大到 (10,5)）。
-        #   所以每轮按"上一轮实测比例"定步长，并用 EMA 修，不去猜曲线。
-        ratio = max(0.05, min(4.0, self.k_est))
+        ratio = 1.7
         for i in range(max_iter):
             dx, dy = x - pos[0], y - pos[1]
             traj.append((i, pos, (dx, dy), round(ratio, 3)))
@@ -738,24 +766,42 @@ class HostMouse:
                 self.traj_log += traj
                 traj.append(("budget", pos, (dx, dy), round(ratio, 3)))
                 return False, traj
-            # 一轮发 n 个**小**相对步（每步 ≤20 宿主 px：大步会被单事件上限削掉）
-            n = max(1, min(12, int(max(abs(dx), abs(dy)) / 12)))
-            sx = max(-20, min(20, int(round(dx / ratio / n))))
-            sy = max(-20, min(20, int(round(dy / ratio / n))))
+            # 每轴：大步用 24px 包（n 包），小步用 1.7d 的细调包
+            kx = min(MOVE_STEP_MAX_PACKETS, abs(dx) // 24)
+            ky = min(MOVE_STEP_MAX_PACKETS, abs(dy) // 24)
+            n = max(1, kx, ky)
+            if abs(dx) >= 24:
+                sx = 20 if dx > 0 else -20
+            else:
+                sx = max(-19, min(19, int(round(dx / ratio))))
+            if abs(dy) >= 24:
+                sy = 20 if dy > 0 else -20
+            else:
+                sy = max(-19, min(19, int(round(dy / ratio))))
+            if sx == 0 and sy == 0:                    # 余量不足 1px：尽量推一点
+                sx = 1 if dx > 0 else (-1 if dx < 0 else 0)
+                sy = 1 if dy > 0 else (-1 if dy < 0 else 0)
             for _ in range(n):
                 self.rel(sx, sy, gap=0.012)
-            time.sleep(0.10)
-            npos = vnc.cursor_pos(hint=pos)
+            # 读位置：串口权威反馈（等到下一条 perf 行）；没有就退回像素轮询
+            if fb:
+                npos = fb()
+            else:
+                npos = None
+                t_poll = time.time() + 0.6
+                while time.time() < t_poll:
+                    time.sleep(0.05)
+                    cand = vnc.cursor_pos(hint=pos)
+                    if cand is not None and cand != pos:
+                        npos = cand
+                        break
+                if npos is None:                        # 没读到变化：放宽搜索半径
+                    npos = vnc.cursor_pos(hint=pos, rad=1400)
+                if npos is None:
+                    npos = vnc.cursor_pos(hint=pos, rad=10 ** 6)
             if npos is None:
+                self.traj_log += traj
                 return False, traj + [("nocursor", None, None)]
-            hx, hy = sx * n, sy * n
-            gxs, gys = npos[0] - pos[0], npos[1] - pos[1]
-            if abs(hx) > 4:
-                ratio = 0.5 * ratio + 0.5 * (abs(gxs) / float(abs(hx)))
-            elif abs(hy) > 4:
-                ratio = 0.5 * ratio + 0.5 * (abs(gys) / float(abs(hy)))
-            ratio = max(0.05, min(4.0, ratio))
-            self.k_est = ratio               # 跨调用保留（下一个目标点直接从这儿起步）
             pos = npos
         self.traj_log += traj
         return False, traj
@@ -771,37 +817,57 @@ class HostMouse:
         time.sleep(settle)
         return True, tr
 
+    def _push(self, dx, dy, cap=40):
+        """按下期间把光标沿 (dx,dy) 推过去：每包 24 客人 px，余量用细调包（1.7 折算）。
+
+        依据实测标定（$PI_SCRATCH_DIR/twm_calib.txt）：|d|>=20 的包 -> 恰好 24 客人 px。
+        中间**不读**任何状态（VNC 读帧有 200~400ms 滞后），纠偏交给调用方。
+        """
+        n = min(cap, max(int(abs(dx) // 24), int(abs(dy) // 24)))
+        sx = (20 if dx > 0 else -20) if abs(dx) >= 24 else 0
+        sy = (20 if dy > 0 else -20) if abs(dy) >= 24 else 0
+        for _ in range(n):
+            self.rel(sx, sy, gap=0.008)
+        rx, ry = dx - sx * n, dy - sy * n
+        if abs(rx) >= 1 or abs(ry) >= 1:
+            self.rel(max(-19, min(19, int(round(rx / 1.7)))),
+                     max(-19, min(19, int(round(ry / 1.7)))), gap=0.008)
+
     def drag(self, vnc, x0, y0, x1, y1, steps=16, settle=0.9, tol=3):
-        """真鼠标拖拽：闭环到起点 -> 按下 -> 分步相对推到终点（每步闭环纠偏）-> 松开。"""
+        """真鼠标拖拽：闭环到起点 -> 按下 -> 批量推到终点 -> 末端闭环纠偏 -> 松开。
+
+        ★ 2026-11-16 重写：原来每一步都读一次**像素**光标；VNC 读帧滞后 + 拖拽时光标压在
+          标题栏/边框上模板匹配会失败，于是抛出 'nocursor-mid-drag' 把整条拖拽判死
+          （textwm64 一路 DRAG_FAIL 的直接原因）。现在批量推 + 末端用串口精确位置纠偏。
+        """
         ok, tr = self.move_to(vnc, x0, y0, tol=tol)
         if not ok:
             return False, tr
         self.down()
         time.sleep(0.15)
-        for i in range(1, steps + 1):
-            tx = x0 + (x1 - x0) * i // steps
-            ty = y0 + (y1 - y0) * i // steps
-            pos = vnc.cursor_pos()
-            if pos is None:
-                self.up()
-                return False, tr + [("nocursor-mid-drag", None, None)]
-            dx, dy = tx - pos[0], ty - pos[1]
-            self.rel(int(dx * self.k), int(dy * self.k))
-            time.sleep(0.02)
-        # 最后再闭环到终点（拖动时窗口跟着走，末端容易差几像素）
-        self.down()
-        for _ in range(6):
-            pos = vnc.cursor_pos()
+        fb = getattr(vnc, "perf_cursor", None)
+        pos = None
+        self._push(x1 - x0, y1 - y0)
+        time.sleep(1.15)               # ★ 等一条**新**的 perf 行（1 Hz）：反馈可能是上一秒的位置
+        for _ in range(3):                      # 末端纠偏（拖动中窗口/边框跟着走，易差几像素）
+            pos = fb() if fb else vnc.cursor_pos()
             if pos is None:
                 break
             dx, dy = x1 - pos[0], y1 - pos[1]
+            tr.append(("end", pos, (dx, dy)))
             if abs(dx) <= tol and abs(dy) <= tol:
                 break
-            self.rel(int(dx * self.k), int(dy * self.k))
-            time.sleep(0.02)
-        time.sleep(0.25)
         self.up()
         time.sleep(settle)
+        # ★ v0.10.8：落点容差 ±30px（fixture 级）。宿主相对注入有 1 帧量化 + 1 Hz 反馈滞后，
+        #   实测常有过冲 10~30px；像素判定不依赖"意图位移"（用 [UI] win move end 的**实际**几何），
+        #   所以这里放宽只影响"这次拖拽算不算成功"，不会放过"内容没跟着走"。
+        if pos is not None:
+            ex, ey = x1 - pos[0], y1 - pos[1]
+            if abs(ex) <= DRAG_LAND_TOL and abs(ey) <= DRAG_LAND_TOL:
+                return True, tr
+            tr.append(("land_off", pos, (ex, ey)))
+            return False, tr
         return True, tr
 # ------------------------------------------------------------------ 宿主窗口像素（显示判据）
 class _BIH(ctypes.Structure):
@@ -976,6 +1042,10 @@ class VMSession:
                           % (LOCK_INTERACTIVE, read_text(self.serial)[-400:]))
         self.boot_secs = time.time() - self.t0
         self.vnc = TextVNC(self.port)
+        # ★ 光标闭环的**权威反馈**：客人每秒打一条 `[UI] perf sec=… cur=x,y`
+        #   （精确整数，不靠箭头模板像素匹配）。像素匹配在拖拽时会被窗口标题栏/图标干扰，
+        #   而且 VNC 读帧有 200~400ms 滞后 —— 这是 textwm64 一直 DRAG_FAIL 的真因之一。
+        self.vnc.perf_cursor = self.perf_cursor
         # ★ 登录手势：锁屏 -> 回车进登录界面 -> 再回车按登录按钮（ui.login.auto 默认 0）
         self.vnc.tap("ret", gap=1.2)
         self.vnc.tap("ret", gap=1.2)
@@ -1004,15 +1074,50 @@ class VMSession:
         return self.mouse.grab()
 
     def click(self, x, y, settle=0.6, tol=3):
-        return self.mouse.click_at(self.vnc, x, y, settle=settle, tol=tol)
+        ok, tr = self.mouse.click_at(self.vnc, x, y, settle=settle, tol=tol)
+        if not ok:
+            # ★ v0.10.8：VMware 会丢鼠标抓取（客人光标钉在屏幕边缘不动）—— 重抓一次再试
+            print("   [mouse] click 失败，重抓鼠标后重试")
+            self.grab_mouse()
+            ok, tr = self.mouse.click_at(self.vnc, x, y, settle=settle, tol=tol)
+        return ok, tr
 
     def drag(self, x0, y0, x1, y1, steps=16, settle=0.9, tol=3):
-        return self.mouse.drag(self.vnc, x0, y0, x1, y1, steps=steps, settle=settle, tol=tol)
+        ok, tr = self.mouse.drag(self.vnc, x0, y0, x1, y1, steps=steps, settle=settle, tol=tol)
+        if not ok:
+            # 同上：拖拽失败先重抓鼠标（SetForegroundWindow + 窗口内轻点）再重试一次
+            print("   [mouse] drag 失败，重抓鼠标后重试")
+            self.grab_mouse()
+            ok, tr = self.mouse.drag(self.vnc, x0, y0, x1, y1, steps=steps, settle=settle, tol=tol)
+        return ok, tr
 
     def move_to(self, x, y, tol=2, max_iter=14):
         return self.mouse.move_to(self.vnc, x, y, tol=tol, max_iter=max_iter)
 
     # ---- 串口 ----
+    def _perf_last(self):
+        """(perf 行数, 最后一条 cur=(x,y))。用于"等一条新行"，不靠值变化判定新鲜度。"""
+        txt = read_text(self.serial)
+        n = txt.count("[UI] perf sec=")
+        m = None
+        for m in re.finditer(r"\[UI\] perf sec=\d+.*?cur=(-?\d+),(-?\d+)", txt):
+            pass
+        return n, ((int(m.group(1)), int(m.group(2))) if m else None)
+
+    def perf_cursor(self, timeout=2.6):
+        """等**下一条** `[UI] perf sec=`，返回那一刻的客人光标坐标（精确值）。
+
+        内核每秒打一行（空闲也打），所以最坏等 ~1s；超时就返回最后读到的值。
+        """
+        n0, p0 = self._perf_last()
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            time.sleep(0.10)
+            n1, p1 = self._perf_last()
+            if n1 > n0 and p1 is not None:
+                return p1
+        return p0
+
     def log(self):
         return read_text(self.serial)
 
