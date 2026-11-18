@@ -30,7 +30,7 @@ make_shellvol 产出的 /Wallpapers、/Avatars 在链上不会传下去（实测
      命名：`3.jpg` -> `3-hd.jpg`（用户自己已经有同名文件时不派生，只 WARN）。
 
 用法（构建期；vol-in = 卷链上一步的产物）：
-  py -3 tools/presets_pack_win.py --vol-in build64/officevol.img --vol-out build64/presetsvol.img \\
+  py -3 tools/presets_pack_win.py --vol-in build64/storevol.img --vol-out build64/presetsvol.img \\
       --system build64/system.img --disk build64/sysdisk.img
 """
 import argparse

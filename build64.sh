@@ -1582,53 +1582,11 @@ else
     exit 1
 fi
 
-# ============================================================================
-# ★ v0.5.0：/bin/browser（浏览器）—— 全用户态，内核 0 字节
-#   1) user/browser/build_browser.sh 编 html.c + browser.c + user/lib（font64 必须开 SSE），
-#      并自检 PT_LOAD 落在 4GiB..4GiB+64KiB、没有 PT_INTERP（kernel/elf64.cpp 的硬门槛）；
-#   2) tools/browser_pack_win.py 把 /bin/browser 与 /www/index.html 写进卷、**逐字节回读**，
-#      再拼出新的 build64/sysdisk.img（卷链继续往下走）。
-#   端到端验收：python tests/browser64_test.py
-# ============================================================================
-echo "==> ★ 浏览器：/bin/browser + /www/index.html（全用户态，内核 0 字节）"
-bash user/browser/build_browser.sh "$BUILD"
-"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid "$BUILD/browser.elf"
-echo "==> 浏览器装卷"
-BROWSER_VOL_IN="$BUILD/storevol.img"
-[ -f "$BROWSER_VOL_IN" ] || BROWSER_VOL_IN="$BUILD/fontvol.img"
-if [ -f "$BROWSER_VOL_IN" ] && [ -f "$BUILD/browser.elf" ]; then
-    "$PY" tools/browser_pack_win.py --vol-in "$BROWSER_VOL_IN" --vol-out "$BUILD/browservol.img" \
-          --browser "$BUILD/browser.elf" --htdocs user/browser/www \
-          --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
-else
-    echo "ERROR: 缺少 $BROWSER_VOL_IN 或 build64/browser.elf —— 浏览器没装进系统卷" >&2
-    exit 1
-fi
-
-# ============================================================================
-# ★ v0.5.3：/bin/office（办公套件：文档/表格/演示）—— 全用户态，内核 0 字节
-#   1) user/office/build_office.sh 编 office.c + calc.c + user/lib，自检 PT_LOAD / 无 PT_INTERP；
-#   2) tools/office_pack_win.py 把 /bin/office 写进卷并逐字节回读，再拼 sysdisk.img。
-#   端到端验收：python tests/office64_test.py
-# ============================================================================
-echo "==> ★ 办公套件：/bin/office（全用户态，内核 0 字节）"
-bash user/office/build_office.sh "$BUILD"
-"$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" --mode mid "$BUILD/office.elf"
-echo "==> 办公套件装卷"
-OFFICE_VOL_IN="$BUILD/browservol.img"
-[ -f "$OFFICE_VOL_IN" ] || OFFICE_VOL_IN="$BUILD/storevol.img"
-if [ -f "$OFFICE_VOL_IN" ] && [ -f "$BUILD/office.elf" ]; then
-    "$PY" tools/office_pack_win.py --vol-in "$OFFICE_VOL_IN" --vol-out "$BUILD/officevol.img" \
-          --office "$BUILD/office.elf" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
-else
-    echo "ERROR: 缺少 $OFFICE_VOL_IN 或 build64/office.elf —— 办公套件没装进系统卷" >&2
-    exit 1
-fi
 echo "==> ★ v0.5.8：系统预设头像 / 预设壁纸写进卷（/Avatars + /Wallpapers，两个独立目录）"
 # 为什么放在**链尾**：卷链上第一个 pack 步骤是从"原始区"重建卷的，make_shellvol 里加的
 # /Wallpapers、/Avatars 传不下来（实测：shellvol.img 有、所有后续 *vol.img 都没有）。
 # 所以预设必须在最后一步单独追加一次；这一步的产物直接就是 sysdisk.img。
-"$PY" tools/presets_pack_win.py --vol-in "$BUILD/officevol.img" \
+"$PY" tools/presets_pack_win.py --vol-in "$BUILD/storevol.img" \
       --vol-out "$BUILD/presetsvol.img" \
       --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
 # ★ v0.6.1：图标**逐张 PNG** 写进系统卷的 /System/icons/（原因：v0.6.0 把 inode 上限放到 2048，

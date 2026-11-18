@@ -37,8 +37,6 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 IMG = os.path.join(ROOT, "build64", "sysdisk.img")
 PORT = 5694
 # (开始菜单里的名字, 卷内路径, 必须建窗口?)
-TARGETS = [("浏览器", "/bin/browser", True),
-           ("办公套件", "/bin/office", True),
            ("文本编辑器", "/bin/edit", False)]
 
 checks = []
