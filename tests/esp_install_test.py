@@ -150,7 +150,8 @@ def run_install(qemu, target, serial, port, dwell=1.2, bus="ahci"):
             return slog(serial), False
         # 向导默认光标已经落在"不是安装介质的盘"（8 号 AHCI 盘）上 —— 与 ahci64_test 同口径
         for name, what in (("ret", "语言->现在安装"), ("ret", "现在安装->许可"),
-                           ("ret", "许可->安装类型"), ("ret", "类型->磁盘与分区"),
+                           ("ret", "许可->安装类型"), ("ret", "类型->用户与时区"),
+                           ("ret", "用户与时区（默认）->磁盘与分区"),
                            ("n", "新建（写 MBR 引导区+主分区+ESP 项）"), ("ret", "安装系统")):
             print("     sendkey %-4s (%s)" % (name, what))
             mon.key(name, wait=dwell)

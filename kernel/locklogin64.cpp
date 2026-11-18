@@ -12,6 +12,7 @@
 #include "locklogin64.h"
 #include "trans64.h"      // ★ v0.9.3：统一状态机 + delta_time 时间轴（两段过渡共用）
 #include "userdb64.h"
+#include "userconf64.h"   // /etc/user.conf（安装向导写的用户名/口令策略/时区）
 #include "theme64.h"
 #include "gfx64.h"
 #include "img64.h"
@@ -840,9 +841,11 @@ static void refresh_time64(int force) {
     const uint32_t now = ticks64();
     if (!force && (uint32_t)(now - g_sec_tick) < PIT_HZ_64) return;
     g_sec_tick = now;
-    rtc_get_time64(&g_time_h, &g_time_mi, &g_time_s);
+    // ★ 时区：/etc/user.conf 的 tz_offset 在这里生效（RTC 是 UTC；本地时间/日期由 userdb64 统一换算，
+    //   跨零点连日期一起进位）。没有 user.conf 时偏移默认 = +480（Asia/Shanghai）。
+    userdb64_local_time64(&g_time_h, &g_time_mi, &g_time_s);
     int rtc_wd = 0;
-    rtc_get_date64(&g_time_y, &g_time_mo, &g_time_d, &rtc_wd);
+    userdb64_local_date64(&g_time_y, &g_time_mo, &g_time_d, &rtc_wd);
     if (g_time_y < 2000 || g_time_y > 2063 || g_time_mo < 1 || g_time_mo > 12 || g_time_d < 1 || g_time_d > 31) {
         g_time_y = 2000; g_time_mo = 1; g_time_d = 1;      // RTC 读坏了也不要画 0000-00-00
     }
@@ -1290,6 +1293,8 @@ static void enter_lock64(const char* why) {
     }
 }
 
+// ★ 口令策略判定（定义在下方；这里先声明，因为 enter_login64 的 login screen 打点要用）
+static int lk_need_pw64(const User64Entry* u);
 static void enter_login64(const char* why) {
     g_state = LOCKLOGIN_STATE_LOGIN;
     g_pw_active = 0;
@@ -1311,7 +1316,7 @@ static void enter_login64(const char* why) {
         dbg64_str("ms user=");
         dbg64_str(u ? u->name : "-");
         dbg64_str(" password=");
-        dbg64_str((u && u->hash[0]) ? "required" : "none");
+        dbg64_str(lk_need_pw64(u) ? "required" : "none");
         dbg64_str(" avatar=");
         dbg64_str((u && u->avatar[0]) ? u->avatar : "builtin");
         dbg64_str(" why=");
@@ -1382,11 +1387,27 @@ static void do_login64(const char* how) {
     (void)hda64_play_named64("startup", "login-ok");
 }
 
+// ★ /etc/user.conf（安装向导写入）决定的"这台机器的用户名与口令策略"：
+//   * 只对"配置里那个用户"生效 —— 别的账户仍按 /etc/users.db 自己的 hash 走（多用户语义不变）
+//   * pass_set=0（安装时密码留空）-> 不需要口令，直接进桌面（需求原文）
+static int lk_uc_applies64(const User64Entry* u) {
+    if (!u) return 0;
+    const char* cu = userdb64_userconf_user64();
+    if (!cu || !cu[0]) return 0;
+    int i = 0;
+    for (; cu[i] && u->name[i]; i++) if (cu[i] != u->name[i]) return 0;
+    return cu[i] == 0 && u->name[i] == 0;
+}
+static int lk_need_pw64(const User64Entry* u) {
+    if (!u) return 0;
+    if (lk_uc_applies64(u)) return userdb64_userconf_pass_set64() ? 1 : 0;
+    return u->hash[0] ? 1 : 0;
+}
 // 尝试提交登录（按需弹密码框）
 static void submit_login64(const char* how) {
     const User64Entry* u = sel_user64();
     if (!u) return;
-    if (!u->hash[0]) {                     // 没设密码：直接进桌面
+    if (!lk_need_pw64(u)) {                // 没设密码（或安装时留空）：直接进桌面
         do_login64(how);
         return;
     }
@@ -1415,8 +1436,12 @@ static void submit_login64(const char* how) {
         return;
     }
     // 已有密码输入：校验
+    //   安装配置里那个用户 -> 按 /etc/user.conf 的 salt+hash 算；其他用户仍按 /etc/users.db
     const int idx = userdb64_find64(u->name);
-    if (idx >= 0 && userdb64_check_password64(idx, g_pw) == 1) {
+    int pw_ok = 0;
+    if (lk_uc_applies64(u)) pw_ok = (userdb64_userconf_check_pw64(g_pw) == 1) ? 1 : 0;
+    else if (idx >= 0)      pw_ok = (userdb64_check_password64(idx, g_pw) == 1) ? 1 : 0;
+    if (pw_ok) {
         do_login64(how);
         return;
     }
@@ -1773,6 +1798,24 @@ void locklogin64_init64() {
     }
     clamp_sel64();
     g_lock_t0 = ticks64();
+    // ★ 读取安装向导写下的 /etc/user.conf（名字/口令策略/时区）；幂等，读不到就用默认值
+    (void)userdb64_userconf_load64();
+    // ★ 默认选中项**保持原契约**：优先"上次登录的用户"（上面的 last）。
+    //    只有在**没有任何历史记录**时，才拿安装时填的用户名当兜底。
+    //    （踩过：直接让 user.conf 覆盖默认选中项，会把 locklogin64_test 的
+    //      "默认选中上次登录用户 alice" 那条判据弄红 —— 那是既有可用性契约，不该改。）
+    if (!(last && last[0])) {
+        const char* cu = userdb64_userconf_user64();
+        if (cu && cu[0]) {
+            const int n = userdb64_normal_count64();
+            for (int i = 0; i < n; i++) {
+                const User64Entry* u = userdb64_visible64(i);
+                if (u && s_eq(u->name, cu)) { g_sel = i; break; }
+            }
+        }
+    }
+    clamp_sel64();
+    refresh_time64(1);      // ★ 时区一进来就生效（否则首帧先画 UTC 一秒再跳）
 }
 
 int locklogin64_state64() { return g_state; }

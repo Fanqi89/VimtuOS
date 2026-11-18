@@ -26,6 +26,7 @@
 // ★ 本批：Intel HDA 声卡驱动（声音面板/设置页共用的真音量/静音/输出源）
 #include "hda64.h"
 #include "userdb64.h"
+#include "userconf64.h"   // 任务栏时钟要按时区显示（安装向导写的 tz_offset）
 
 // ==================== 小工具 ====================
 // 追加一段 UTF-8（汉字是多字节，不能写成 char 字面量）
@@ -84,7 +85,7 @@ static void ymd64(char* out, int y, int m, int d) {
 // "HH:MM"
 static void hm64(char* out) {
     int hh = 0, mm = 0, ss = 0;
-    rtc_get_time64(&hh, &mm, &ss);
+    userdb64_local_time64(&hh, &mm, &ss);
     char b[4];
     u_dec2(b, hh); out[0] = b[0]; out[1] = b[1]; out[2] = ':';
     u_dec2(b, mm); out[3] = b[0]; out[4] = b[1]; out[5] = 0;
@@ -953,8 +954,8 @@ void panels64_toggle64(int which, const char* why) {
     g_wifi_drag = 0;
     if (which == PANEL64_CAL) {
         int hh = 0, mm = 0, ss = 0, yy = 0, mo = 0, dd = 0, rwd = 0;
-        rtc_get_time64(&hh, &mm, &ss);
-        rtc_get_date64(&yy, &mo, &dd, &rwd);
+        userdb64_local_time64(&hh, &mm, &ss);
+        userdb64_local_date64(&yy, &mo, &dd, &rwd);
         g_today_y = yy; g_today_m = mo; g_today_d = dd;
         g_cal_y = yy; g_cal_m = mo;
         g_cal_sy = yy; g_cal_sm = mo; g_cal_sd = dd;
@@ -1676,8 +1677,8 @@ static void panel_press64(int item, int mx, int my, int button) {
     }
     if (item == 510) {                                   // 今天
         int hh = 0, mm = 0, ss = 0, yy = 0, mo = 0, dd = 0, rwd = 0;
-        rtc_get_time64(&hh, &mm, &ss);
-        rtc_get_date64(&yy, &mo, &dd, &rwd);
+        userdb64_local_time64(&hh, &mm, &ss);
+        userdb64_local_date64(&yy, &mo, &dd, &rwd);
         g_today_y = yy; g_today_m = mo; g_today_d = dd;
         g_cal_y = yy; g_cal_m = mo;
         g_cal_sy = yy; g_cal_sm = mo; g_cal_sd = dd;
@@ -1873,8 +1874,8 @@ int panels64_handle_key64(uint8_t c) {
         // 键盘补充：T = 今天（与右上角「今天」按钮同一条路径）；年份面板里方向键 + 回车选年
         if (c == 't' || c == 'T') {
             int hh = 0, mm = 0, ss = 0, yy = 0, mo = 0, dd = 0, rwd = 0;
-            rtc_get_time64(&hh, &mm, &ss);
-            rtc_get_date64(&yy, &mo, &dd, &rwd);
+            userdb64_local_time64(&hh, &mm, &ss);
+            userdb64_local_date64(&yy, &mo, &dd, &rwd);
             g_today_y = yy; g_today_m = mo; g_today_d = dd;
             g_cal_y = yy; g_cal_m = mo;
             g_cal_sy = yy; g_cal_sm = mo; g_cal_sd = dd;
@@ -1970,8 +1971,8 @@ void panels64_init64() {
     g_usb_dev_seen = -1;
     g_poll_next = ticks64();
     int hh = 0, mm = 0, ss = 0, yy = 0, mo = 0, dd = 0, rwd = 0;
-    rtc_get_time64(&hh, &mm, &ss);
-    rtc_get_date64(&yy, &mo, &dd, &rwd);
+    userdb64_local_time64(&hh, &mm, &ss);
+    userdb64_local_date64(&yy, &mo, &dd, &rwd);
     g_today_y = yy; g_today_m = mo; g_today_d = dd;
     g_cal_y = yy; g_cal_m = mo;
     g_cal_sy = yy; g_cal_sm = mo; g_cal_sd = dd;

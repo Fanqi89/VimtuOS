@@ -188,6 +188,7 @@ def main():
     try:
         # 回车×4：语言 -> 现在安装 -> 许可 -> 安装类型 -> 磁盘与分区
         send_keys(sock, [0x0D, 0x0D, 0x0D, 0x0D], dwell=1.2)
+        send_keys(sock, [0x0D], dwell=1.2)                     # ★ v0.10.10：用户与时区（默认值）
         # 'n' = 新建（写引导分区 + 主分区）
         send_keys(sock, [ord('n')], dwell=2.0)
         # 回车 = 安装系统

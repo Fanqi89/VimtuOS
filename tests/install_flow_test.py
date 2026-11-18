@@ -154,7 +154,8 @@ def run_install(qemu, target_path, serial_log, port, dwell=2.0):
             ("ret", "语言页 -> 现在安装"),
             ("ret", "现在安装 -> 许可条款"),
             ("ret", "许可条款（回车=接受）-> 安装类型"),
-            ("ret", "安装类型（升级）-> 磁盘与分区"),
+            ("ret", "安装类型（升级）-> 用户与时区"),
+            ("ret", "用户与时区（默认 vimtu / 密码留空 / China）-> 磁盘与分区"),
             ("n",   "磁盘与分区：新建（写引导分区 + 主分区）"),
             ("ret", "选中已创建的分区 -> 安装系统"),
         ]
@@ -266,6 +267,17 @@ def main():
     check("安装开始：找到介质载荷", "[INSTALL] 开始安装" in log)
     check("安装完成：写出扇区数", "[INSTALL] 完成：已写" in log)
     check("界面侧确认安装完成", "[SETUP] 安装完成" in log)
+    # ★ v0.10.10：用户与时区页收集到的配置必须真的写进目标盘 /etc/user.conf
+    check("向导收集到用户名/时区（[SETUP] userconf user=）",
+          "[SETUP] userconf user=" in log, "（新增页的打点）")
+    check("安装收尾写入目标盘 /etc/user.conf",
+          ("[SETUP] user.conf write" in log and "path=/etc/user.conf" in log),
+          "（挂临时卷槽 + mkdirs + write_on）")
+    check("user.conf 写入无失败（rc=0 / 无 SKIP）",
+          ("[SETUP] user.conf write" in log and "[SETUP] user.conf SKIP" not in log
+           and "user.conf BUILD FAILED" not in log))
+    check("安装默认值：用户名 vimtu + 时区 Asia/Shanghai",
+          ("user=vimtu" in log and "tz=Asia/Shanghai" in log))
     check("完成后自动重启", "[SETUP] 自动重启" in log)
     check("全程无失败标记", ("失败" not in log) or ("[INSTALL] 完成" in log))
     check("没用安装程序内核之外的路径", "[SETUP] install_begin" in log)
@@ -315,13 +327,50 @@ def main():
     #   系统就会往里写 config/store/journal（实测：我自己的开机烟测把它写脏，这条断言当场假红）。
     #   而**安装器真正拷的字节**就是介质 LBA 8193 起的那份载荷，跟它比才是"装进去的到底是不是它"。
     #   顺带把比较范围从 64 KiB 扩到**整卷**（判据只许加强）。
+    # ★ v0.10.10：安装收尾会往**目标卷**里新增 /etc/user.conf（用户名/时区/口令哈希），
+    #   所以"整卷与载荷逐字节一致"这个老判据连同它的前提一起作废 —— 本特性就是要改动目标卷。
+    #   判据改成**更强**的逐文件比对（不是放宽）：
+    #     ① 卷几何与载荷卷逐字段相同（只加文件，绝不允许 relayout）；
+    #     ② 目标卷文件集合 = 载荷文件集合 ∪ {/etc/user.conf}（新增的**只有**这一个）；
+    #     ③ 其余每个文件的 size+crc32 与载荷**逐个相同**（等价于"除这一个新文件，整卷一致"）；
+    #     ④ /etc/user.conf 真的有 inode（size>0）且内容带 user=vimtu / timezone=Asia/Shanghai /
+    #        tz_offset=480 / pass_set=0，并且**不含** pass_hash（安装时密码留空 -> 不许有哈希行）。
     if PAYLOAD_VOL_SECTORS:
         with open(MEDIUM, "rb") as f:
             f.seek((PAYLOAD_LBA + 1) * 512 + 32584 * 512)
             ref = f.read(PAYLOAD_VOL_SECTORS * 512)
         got = read_at(args.target, 32584, len(ref))
-        check("目标盘主分区**整卷**与介质里的载荷逐字节一致（卷真的装进去了）",
-              got == ref, "%d B" % len(ref))
+
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import make_shellvol as MS
+
+        def _geo(b):
+            return dict((k, struct.unpack_from("<I", b, off)[0]) for k, off in
+                        (("total", 20), ("bmn", 24), ("inode_start", 36), ("inodes", 40),
+                         ("inode_blk", 44), ("data_start", 48)))
+
+        check("目标卷几何与载荷卷逐字段相同（只加文件，不 relayout）",
+              _geo(got) == _geo(ref), str(_geo(got)))
+
+        m_ref = MS._vol_file_map(ref)
+        m_got = MS._vol_file_map(got)
+        extra = sorted(set(m_got) - set(m_ref))
+        missing = sorted(set(m_ref) - set(m_got))
+        diff = sorted(k for k in (set(m_ref) & set(m_got)) if m_ref[k] != m_got[k])
+        check("目标卷文件集合 = 载荷 + 恰好新增 /etc/user.conf",
+              extra == ["/etc/user.conf"] and not missing,
+              "extra=%s missing=%s" % (extra, missing))
+        check("其余 %d 个文件 size+crc32 与载荷逐个一致" % len(m_ref),
+              not diff, "diff=%s" % diff[:5])
+
+        conf = m_got.get("/etc/user.conf")
+        okc = bool(conf) and conf[0] > 0
+        for kw in (b"user=vimtu", b"timezone=Asia/Shanghai", b"tz_offset=480",
+                   b"pass_set=0", b"pass_algo=sha256-iter1000"):
+            okc = okc and (kw in got)
+        okc = okc and (b"pass_hash=" not in got) and (b"pass_salt=" not in got)
+        check("目标卷 /etc/user.conf 内容正确（vimtu / Asia/Shanghai / 密码留空无哈希）",
+              okc, "size=%s" % (conf[0] if conf else None))
 
     print("=== 5) 单独启动装好的硬盘（验证真的能开机）===")
     boot_log = os.path.join(os.path.dirname(args.target) or ".", "installed_boot.log")

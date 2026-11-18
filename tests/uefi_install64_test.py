@@ -272,6 +272,7 @@ def main():
             return 1
         try:
             send_keys(sock, [0x0D, 0x0D, 0x0D, 0x0D], dwell=1.3)   # 语言/现在安装/许可/类型
+            send_keys(sock, [0x0D], dwell=1.3)                      # 用户与时区（默认值）
             send_keys(sock, [ord("n")], dwell=2.0)                  # 新建分区表
             send_keys(sock, [0x0D], dwell=1.2)                      # 开始安装
         finally:
@@ -280,6 +281,15 @@ def main():
         print("=== 3) 等安装完成 ===")
         done = wait_mark(SER_INSTALL, "[INSTALL] 完成：已写", 300, "安装完成")
         chk("安装写出扇区", done)
+        # ★ 顺序：user.conf 在"[SETUP] 安装完成 100%"之后才写（挂卷槽 + mkdir + write），
+        #   所以在"[INSTALL] 完成：已写"这个时点立刻读日志会**太早**（踩过：UEFI 路径假红）。
+        #   这里改成等事件，再断言写入行本身带 write=NNN 且没有 SKIP/BUILD FAILED。
+        uc_ok = wait_mark(SER_INSTALL, "[SETUP] user.conf write", 120, "写入 /etc/user.conf")
+        uc_log = read_text(SER_INSTALL)
+        chk("安装收尾写入 /etc/user.conf（新增页收集的用户名/时区）", uc_ok and ("path=/etc/user.conf" in uc_log),
+            "write 行见串口")
+        chk("user.conf 写入无失败（无 SKIP / 无 BUILD FAILED）",
+            ("[SETUP] user.conf SKIP" not in uc_log) and ("user.conf BUILD FAILED" not in uc_log))
         wait_mark(SER_INSTALL, "[SETUP] 自动重启", 90, "完成后自动重启")
         if not a.keep:
             stop_all()

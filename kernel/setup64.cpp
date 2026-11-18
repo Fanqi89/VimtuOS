@@ -20,6 +20,8 @@
 #include "x86_64.h"
 #include "fat64.h"      // ★ ESP：安装时在目标盘写 FAT32 卷（自检也在安装程序启动时跑一次）
 #include "debug64.h"
+#include "vfs64.h"      // 安装收尾：把 /etc/user.conf 写进**目标盘的卷**（挂临时卷槽再写，不动分区逻辑）
+#include "userconf64.h"  // /etc/user.conf 的文本生成 + 口令加盐哈希（与登录侧共用同一份实现）
 // ==================== 调色板（对齐 Win10 安装程序）====================
 static const uint32_t C_BG      = 0xFF00549E;   // 深蓝背景 rgb(0,84,158)
 static const uint32_t C_BAR     = 0xFF003E78;   // 顶部标题条 rgb(0,62,120)
@@ -449,6 +451,7 @@ enum SetupPage {
     PAGE_NOW,
     PAGE_LICENSE,
     PAGE_TYPE,
+    PAGE_USER,          // ★ 新增：用户与时区（在"安装类型"之后、"磁盘与分区"之前）
     PAGE_DISK,
     PAGE_PROGRESS,
     PAGE_DONE,
@@ -464,6 +467,14 @@ struct SetupState {
     int  stage;             // 进度阶段索引
     uint32_t t_start;
     bool dirty;
+    // ---- ★ 新增：用户与时区页 ----
+    char user_name[USERCONF64_USER_MAX + 1];   // 默认 "vimtu"
+    char user_pw[24];                          // 明文只存内存；写盘前算哈希，随后立即清零
+    int  user_focus;                           // 0 = 用户名, 1 = 密码, 2 = 时区, 3 = 只走按钮
+    int  tz_idx;                               // kTz[] 下标；默认 0 = China / Asia/Shanghai
+    int  tz_open;                              // 1 = 下拉框展开
+    int  tz_top;                               // 下拉框滚动窗口的首行
+    int  uc_written;                           // 1 = /etc/user.conf 已写进目标卷（幂等）
 };
 
 static SetupState g_st;
@@ -528,6 +539,131 @@ static void draw_type_page() {
     push_button(fb_width() - 440, fb_height() - 92, 180, 56, "上一步", 3, false, true);
 }
 
+// ==================== ★ 新增页：用户与时区 ====================
+// 需求（用户 V1 终版）：
+//   1) 用户名（默认 vimtu）+ 密码（留空 = 无密码，必须明说）
+//   2) 时区**下拉框**（无地图）；默认 China / Asia/Shanghai
+//   3) 下拉框文案随**第一步选的语言**切换：中文 -> "中国 (Asia/Shanghai)"，英文 -> "China (Asia/Shanghai)"；
+//      但写到底层的**永远是标准时区串**（如 Asia/Shanghai），显示语言不影响配置。
+//   4) 位置：第 2 步（安装类型）之后、第 3 步（磁盘与分区）之前；不改整体 UI 风格。
+//
+// 为什么时区表里带 off_min：内核没有 tzdata，也没有时区库；安装期把"标准串 + 该串对应偏移"
+// 一起写进 /etc/user.conf，登录/时钟直接读偏移即可（标准串仍然保留，作为语义与将来的 tzdata 接口）。
+struct SetupTz64 {
+    const char* en;      // 英文标签（lang=1 时显示）
+    const char* zh;      // 中文标签（lang=0 时显示）
+    const char* zone;    // ★ 标准时区串（唯一写盘的东西）
+    int         off_min; // 相对 UTC 的分钟数
+};
+static const SetupTz64 kTz[] = {
+    { "China",               "中国",           "Asia/Shanghai",      480 },
+    { "China (Hong Kong)",   "中国香港",       "Asia/Hong_Kong",     480 },
+    { "China (Taipei)",      "中国台湾",       "Asia/Taipei",        480 },
+    { "Japan",               "日本",           "Asia/Tokyo",         540 },
+    { "Korea",               "韩国",           "Asia/Seoul",         540 },
+    { "Singapore",           "新加坡",         "Asia/Singapore",     480 },
+    { "India",               "印度",           "Asia/Kolkata",       330 },
+    { "United Arab Emirates","阿联酋",         "Asia/Dubai",         240 },
+    { "Russia (Moscow)",     "俄罗斯（莫斯科）","Europe/Moscow",      180 },
+    { "Germany",             "德国",           "Europe/Berlin",       60 },
+    { "France",              "法国",           "Europe/Paris",        60 },
+    { "United Kingdom",      "英国",           "Europe/London",        0 },
+    { "United States (East)","美国（东部）",   "America/New_York",  -300 },
+    { "United States (West)","美国（西部）",   "America/Los_Angeles",-480 },
+    { "Brazil",              "巴西",           "America/Sao_Paulo", -180 },
+    { "Australia (Sydney)",  "澳大利亚（悉尼）","Australia/Sydney",   600 },
+    { "New Zealand",         "新西兰",         "Pacific/Auckland",   720 },
+};
+#define TZ64_N ((int)(sizeof(kTz) / sizeof(kTz[0])))
+
+// 页面几何：绘制与鼠标命中共用同一组常量（避免"看到的"和"点到的"不一致）
+static const int UC_FX       = 200;   // 输入框左边界
+static const int UC_FW       = 420;   // 输入框宽
+static const int UC_FH       = 40;    // 输入框高
+static const int UC_NAME_Y   = 170;
+static const int UC_PW_Y     = 236;
+static const int UC_HINT_DY  = 52;    // "留空代表无密码"提示相对密码框的纵向偏移
+static const int UC_TZ_Y     = 336;
+static const int UC_TZ_W     = 520;
+static const int UC_TZ_ROW_H = 28;
+static const int UC_TZ_ROWS  = 7;     // 下拉框可见行数（其余靠滚动）
+
+static const char* uc_tz_label(int idx) {
+    if (idx < 0 || idx >= TZ64_N) idx = 0;
+    return (g_st.lang == 0) ? kTz[idx].zh : kTz[idx].en;
+}
+// 下拉框展开时，把选中项保持在可见窗口里
+static void uc_tz_ensure_visible() {
+    if (g_st.tz_idx < g_st.tz_top) g_st.tz_top = g_st.tz_idx;
+    if (g_st.tz_idx >= g_st.tz_top + UC_TZ_ROWS) g_st.tz_top = g_st.tz_idx - UC_TZ_ROWS + 1;
+    if (g_st.tz_top < 0) g_st.tz_top = 0;
+    if (g_st.tz_top > TZ64_N - UC_TZ_ROWS) g_st.tz_top = (TZ64_N > UC_TZ_ROWS) ? TZ64_N - UC_TZ_ROWS : 0;
+}
+
+static void uc_draw_field(int y, const char* text, bool focused, bool is_pw) {
+    fb_draw_rect(UC_FX, y - 10, UC_FW, UC_FH, focused ? C_WHITE : C_DIM);
+    if (focused) fb_fill_rect(UC_FX + 2, y - 8, UC_FW - 4, UC_FH - 4, C_LIST);
+    char shown[40];
+    int n = 0;
+    if (is_pw) {
+        // 密码不回显明文，只回显位数（内核日志同样从不打印明文）
+        const int len = (int)sizeof(g_st.user_pw) - 1;
+        int l = 0;
+        while (l < len && g_st.user_pw[l]) l++;
+        for (int i = 0; i < l && n < (int)sizeof(shown) - 1; i++) shown[n++] = '*';
+        shown[n] = 0;
+        if (l == 0) { ui_text(UC_FX + 12, y, "（留空）", C_DIM); return; }
+    } else {
+        while (text && text[n] && n < (int)sizeof(shown) - 1) { shown[n] = text[n]; n++; }
+        shown[n] = 0;
+    }
+    ui_text(UC_FX + 12, y, shown, C_TEXT);
+    if (focused) {
+        // 光标：按字符宽度粗算（等宽字体，16px 下每字符约 8px）
+        const int cx = UC_FX + 12 + n * 8 + 1;
+        fb_fill_rect(cx, y - 2, 2, 18, C_WHITE);
+    }
+}
+
+static void draw_user_page() {
+    page_header("用户与时区设置");
+
+    int y = UC_NAME_Y;
+    ui_text(80, y, "用户名：", C_TEXT);
+    uc_draw_field(y, g_st.user_name, g_st.user_focus == 0, false);
+
+    y = UC_PW_Y;
+    ui_text(80, y, "密码：", C_TEXT);
+    uc_draw_field(y, g_st.user_pw, g_st.user_focus == 1, true);
+    ui_text(80, y + UC_HINT_DY, "提示：密码留空代表【无密码】—— 开机将跳过密码校验直接进入桌面。", C_DIM);
+
+    y = UC_TZ_Y;
+    ui_text(80, y, "时区：", C_TEXT);
+    const bool tz_focus = (g_st.user_focus == 2);
+    fb_draw_rect(UC_FX, y - 10, UC_TZ_W, UC_FH, (tz_focus || g_st.tz_open) ? C_WHITE : C_DIM);
+    if (tz_focus || g_st.tz_open) fb_fill_rect(UC_FX + 2, y - 8, UC_TZ_W - 4, UC_FH - 4, C_LIST);
+    ui_text(UC_FX + 12, y, uc_tz_label(g_st.tz_idx), C_TEXT);
+    ui_text(UC_FX + UC_TZ_W - 28, y, g_st.tz_open ? "^" : "v", C_TEXT);
+
+    if (g_st.tz_open) {
+        uc_tz_ensure_visible();
+        const int ly = y + UC_FH + 6;
+        const int lh = UC_TZ_ROWS * UC_TZ_ROW_H;
+        fb_fill_rect(UC_FX, ly, UC_TZ_W, lh, C_LIST);
+        fb_draw_rect(UC_FX, ly, UC_TZ_W, lh, C_DIM);
+        for (int i = 0; i < UC_TZ_ROWS; i++) {
+            const int idx = g_st.tz_top + i;
+            if (idx >= TZ64_N) break;
+            const int ry = ly + i * UC_TZ_ROW_H;
+            if (idx == g_st.tz_idx) fb_fill_rect(UC_FX + 2, ry + 1, UC_TZ_W - 4, UC_TZ_ROW_H - 2, C_SEL);
+            ui_text(UC_FX + 12, ry + 6, uc_tz_label(idx), C_TEXT);
+            ui_text(UC_FX + 260, ry + 6, kTz[idx].zone, C_DIM);   // 标准串一起显示（写盘的就是它）
+        }
+    }
+
+    push_button(fb_width() - 440, fb_height() - 92, 180, 56, "上一步", 2, false, true);
+    push_button(fb_width() - 240, fb_height() - 92, 180, 56, "下一步", 1, true, true);
+}
 static void draw_disk_page() {
     page_header("你想将 VimtuOS 安装到哪里？");
 
@@ -640,6 +776,7 @@ static void draw_page() {
         case PAGE_NOW:      draw_now_page();      break;
         case PAGE_LICENSE:  draw_license_page();  break;
         case PAGE_TYPE:     draw_type_page();     break;
+        case PAGE_USER:     draw_user_page();     break;
         case PAGE_DISK:     draw_disk_page();     break;
         case PAGE_PROGRESS: draw_progress_page(); break;
         case PAGE_DONE:     draw_done_page();     break;
@@ -685,17 +822,41 @@ static void on_button(int id) {
             if (id == 2) go_page(PAGE_NOW);
             break;
         case PAGE_TYPE:
-            if (id == 1) { g_st.install_type = 0; go_page(PAGE_DISK); }   // 升级（本系统等价于自定义）
-            if (id == 2) { g_st.install_type = 1; go_page(PAGE_DISK); }
+            if (id == 1) { g_st.install_type = 0; go_page(PAGE_USER); }   // 升级（本系统等价于自定义）
+            if (id == 2) { g_st.install_type = 1; go_page(PAGE_USER); }
             if (id == 3) go_page(PAGE_LICENSE);
             break;
-        case PAGE_DISK:
+        case PAGE_USER:
+            // ★ 新增页：只有"上一步/下一步"，输入与下拉框在 handle_key / handle_mouse_click 里处理
             if (id == 1) {
+                g_st.tz_open = 0;
+                g_st.user_focus = 3;
+                dbg64_line_begin64();
+                dbg64_str("[SETUP] userconf user=");
+                dbg64_str(g_st.user_name);
+                dbg64_str(" tz=");
+                dbg64_str(kTz[g_st.tz_idx].zone);
+                dbg64_str(" off=");
+                dbg64_dec((uint64_t)(kTz[g_st.tz_idx].off_min < 0 ? 0 : kTz[g_st.tz_idx].off_min));
+                if (kTz[g_st.tz_idx].off_min < 0) dbg64_str("-");
+                dbg64_str(" pass=");
+                dbg64_dec((uint64_t)(g_st.user_pw[0] ? 1 : 0));
+                dbg64_str(" lang=");
+                dbg64_dec((uint64_t)g_st.lang);
+                dbg64_str(" (collected; written to target /etc/user.conf at install end)");
+                dbg64_nl();
+                dbg64_line_end64();
+                go_page(PAGE_DISK);
+            }
+            if (id == 2) { g_st.tz_open = 0; go_page(PAGE_TYPE); }
+            break;
+        case PAGE_DISK:
+            if (id == 1) {                       // 安装系统
                 if (g_row_sel >= 0 && g_row_sel < g_row_count && g_rows[g_row_sel].selectable) {
                     install_begin(g_rows[g_row_sel].drive, g_rows[g_row_sel].part);
                 }
             }
-            if (id == 2) go_page(PAGE_TYPE);
+            if (id == 2) go_page(PAGE_USER);     // ★ 上一页现在是"用户与时区"
             if (id == 10) { part_refresh(); status_clear(); g_st.dirty = true; }
             if (id == 11) {                       // 新建：写引导分区 + 主分区
                 const int d = (g_row_sel >= 0 && g_row_sel < g_row_count) ? g_rows[g_row_sel].drive : -1;
@@ -836,6 +997,60 @@ static void handle_key(uint8_t ch) {
         if (g_st.page > PAGE_LANG) go_page((SetupPage)(g_st.page - 1));
         return;
     }
+    // ★ 新增页：用户名 / 密码 / 时区下拉（纯键盘也能走完：Tab 换焦点、上下改时区、回车下一步）
+    if (g_st.page == PAGE_USER) {
+        if (ch == 0x09) {                                  // Tab：用户名 -> 密码 -> 时区 -> 用户名
+            g_st.tz_open = 0;
+            g_st.user_focus = (g_st.user_focus >= 2) ? 0 : g_st.user_focus + 1;
+            g_st.dirty = true;
+            return;
+        }
+        if (ch == 0xFD || ch == 0xFE) {                    // 上/下：展开时移动下拉选中项
+            if (g_st.tz_open) {
+                int v = g_st.tz_idx + (ch == 0xFE ? 1 : -1);
+                if (v < 0) v = TZ64_N - 1;
+                if (v >= TZ64_N) v = 0;
+                g_st.tz_idx = v;
+                uc_tz_ensure_visible();
+                g_st.dirty = true;
+            } else {
+                g_st.user_focus = 2;                        // 未展开：方向键把焦点交给时区
+                g_st.dirty = true;
+            }
+            return;
+        }
+        if (ch == '\r' || ch == '\n') {                     // 回车：展开时先收起；否则 = 下一步（全用默认值）
+            if (g_st.tz_open) { g_st.tz_open = 0; g_st.dirty = true; return; }
+            on_button(1);
+            return;
+        }
+        if (ch == 0x08 || ch == 0x7F) {                     // 退格
+            if (g_st.user_focus == 0) {
+                int n = 0; while (n < USERCONF64_USER_MAX && g_st.user_name[n]) n++;
+                if (n > 0) g_st.user_name[n - 1] = 0;
+            } else if (g_st.user_focus == 1) {
+                int n = 0; while (n < (int)sizeof(g_st.user_pw) - 1 && g_st.user_pw[n]) n++;
+                if (n > 0) g_st.user_pw[n - 1] = 0;
+            }
+            g_st.dirty = true;
+            return;
+        }
+        if (ch >= 0x20 && ch < 0x7F) {                      // 可打印 ASCII
+            if (g_st.user_focus == 0) {
+                int n = 0; while (n < USERCONF64_USER_MAX && g_st.user_name[n]) n++;
+                if (n < USERCONF64_USER_MAX) { g_st.user_name[n] = (char)ch; g_st.user_name[n + 1] = 0; }
+            } else if (g_st.user_focus == 1) {
+                int n = 0; while (n < (int)sizeof(g_st.user_pw) - 1 && g_st.user_pw[n]) n++;
+                if (n < (int)sizeof(g_st.user_pw) - 1) { g_st.user_pw[n] = (char)ch; g_st.user_pw[n + 1] = 0; }
+                // 密码永远不进串口：这里不打印任何内容
+            } else if (g_st.user_focus == 2) {
+                g_st.tz_open = 1;                            // 时区上有按键 = 展开下拉
+            }
+            g_st.dirty = true;
+            return;
+        }
+        return;
+    }
     if (ch == 0xFD) {                                  // 上
         if (g_st.page == PAGE_LANG) { g_st.lang = 0; g_st.dirty = true; }
         else if (g_st.page == PAGE_DISK && g_row_count > 0) {
@@ -881,6 +1096,49 @@ static void handle_mouse_click(int mx, int my) {
     for (int i = 0; i < g_btn_count; i++) {
         if (ui_button_hit(g_btns[i], mx, my)) { on_button(g_btns[i].id); return; }
     }
+    // ★ 新增页：输入框 / 时区下拉框（命中区与 draw_user_page 用同一组常量）
+    if (g_st.page == PAGE_USER) {
+        // 用户名输入框
+        if (mx >= UC_FX && mx < UC_FX + UC_FW && my >= UC_NAME_Y - 10 && my < UC_NAME_Y - 10 + UC_FH) {
+            g_st.user_focus = 0;
+            g_st.tz_open = 0;
+            g_st.dirty = true;
+            return;
+        }
+        // 密码输入框
+        if (mx >= UC_FX && mx < UC_FX + UC_FW && my >= UC_PW_Y - 10 && my < UC_PW_Y - 10 + UC_FH) {
+            g_st.user_focus = 1;
+            g_st.tz_open = 0;
+            g_st.dirty = true;
+            return;
+        }
+        // 时区框本体：点击 = 展开/收起
+        if (mx >= UC_FX && mx < UC_FX + UC_TZ_W && my >= UC_TZ_Y - 10 && my < UC_TZ_Y - 10 + UC_FH) {
+            g_st.user_focus = 2;
+            g_st.tz_open = !g_st.tz_open;
+            uc_tz_ensure_visible();
+            g_st.dirty = true;
+            return;
+        }
+        // 展开的列表：点某一行 = 选中（写盘的永远是那一行的标准时区串）
+        if (g_st.tz_open) {
+            const int ly = UC_TZ_Y + UC_FH + 6;
+            if (mx >= UC_FX && mx < UC_FX + UC_TZ_W && my >= ly && my < ly + UC_TZ_ROWS * UC_TZ_ROW_H) {
+                const int row = (my - ly) / UC_TZ_ROW_H;
+                const int idx = g_st.tz_top + row;
+                if (idx >= 0 && idx < TZ64_N) {
+                    g_st.tz_idx = idx;
+                    g_st.tz_open = 0;
+                    g_st.user_focus = 2;
+                    g_st.dirty = true;
+                }
+                return;
+            }
+            // 点到别处：收起下拉（不吞掉这次点击以外的动作）
+            g_st.tz_open = 0;
+            g_st.dirty = true;
+        }
+    }
     // 许可页：点文本也能勾选
     if (g_st.page == PAGE_LICENSE && my >= 520 && my <= 570 && mx >= 70 && mx <= 520) {
         g_st.license_ok = !g_st.license_ok;
@@ -910,6 +1168,12 @@ static void handle_mouse_click(int mx, int my) {
 // 每个动作都真的走 ATA PIO 读/写目标硬盘，并在串口留下可核对的行（供自动验收）。
 static int  g_install_drive = -1;
 static int  g_install_part  = -1;
+// ★ 目标卷的起始 LBA。安装器**恒把系统卷写在主分区**（part_install_begin* 与
+//   part_volume_grow64 用的都是 PART_MAIN_LBA），界面选中的"那一行"只决定**哪块盘**。
+//   实测踩过：拿 row_part_target() 的 t.start 当目标，得到的是引导分区 LBA 65，
+//   mount 必然 reason=magic —— 所以这里用安装器自己的常量，另存一个行起点做兜底。
+static uint32_t g_install_start = PART_MAIN_LBA;
+static uint32_t g_install_alt_start = 0;   // 界面所选分区起点（GPT/MBR 布局差异时兜底）
 static InstallJob g_job;
 static uint32_t   g_reboot_at = 0;      // 安装完成后自动重启的时间点（tick）
 static bool       g_reboot_armed = false;
@@ -975,6 +1239,14 @@ static void install_begin(int drive, int part_index) {
     const bool ok_begin = has_md
         ? part_install_begin_medium(&g_job, md, drive, row_disk_sectors(drive))
         : part_install_begin(&g_job, VIMTU_PAYLOAD_LBA, drive, row_disk_sectors(drive));
+    // ★ 目标卷在**主分区**（安装器与 part_volume_grow64 都用 PART_MAIN_LBA）。
+    //   另存"界面所选分区起点"做兜底（布局与预期不同时再试一次）。
+    g_install_start = PART_MAIN_LBA;
+    g_install_alt_start = 0;
+    {
+        PartTarget t;
+        if (row_part_target(drive, part_index, &t) && t.start != g_install_start) g_install_alt_start = t.start;
+    }
     if (!ok_begin) {
         dbg64_str("[SETUP] 安装无法开始（未找到安装介质载荷）");
         dbg64_nl();
@@ -993,6 +1265,122 @@ static void install_begin(int drive, int part_index) {
 }
 
 // 进度推进：由**真实写入的扇区数**驱动（不是按时间假装）
+// ★ 安装收尾：把向导收集到的 用户名 / 密码哈希 / 时区 写进**目标盘**的 /etc/user.conf
+//
+// 为什么挂临时卷槽再写，而不是直接改扇区：
+//   目标盘上那块卷就是标准 VimtuFS2；vfs64 已经有经过验收的 mount_slot + mkdirs_on + write_on
+//   三件套（宏内核里"按槽操作"的那一族：调用期间临时切到该槽、返回前切回、身份按 root）。
+//   自己再写一套"分配块 + 更新位图 + 写 inode + 算 CRC"的离线写入器属于重复实现、且极易与
+//   内核侧口径漂移 —— 这里坚决复用，也不碰任何分区/克隆逻辑。
+static void install_write_user_conf() {
+    if (g_st.uc_written) return;
+    g_st.uc_written = 1;                       // 只写一次（进度条每帧都会走到收尾分支）
+    if (g_install_drive < 0 || g_install_start == 0) {
+        dbg64_line_begin64();
+        dbg64_str("[SETUP] user.conf SKIP reason=no-target drive=");
+        dbg64_dec((uint64_t)(g_install_drive < 0 ? 0 : g_install_drive));
+        if (g_install_drive < 0) dbg64_str("-");
+        dbg64_str(" start=");
+        dbg64_dec(g_install_start);
+        dbg64_nl();
+        dbg64_line_end64();
+        return;
+    }
+    char txt[USERCONF64_FILE_MAX];
+    const SetupTz64& tz = kTz[(g_st.tz_idx >= 0 && g_st.tz_idx < TZ64_N) ? g_st.tz_idx : 0];
+    const int n = userdb64_userconf_build64(txt, (int)sizeof(txt), g_st.user_name, g_st.user_pw,
+                                            tz.zone, tz.off_min, g_st.lang);
+    const int pass_set = (g_st.user_pw[0] != 0) ? 1 : 0;   // 抹掉明文前先记下"是否设了口令"
+    // 明文口令用完立刻从内存里抹掉（它不进日志、不进镜像，只在这里变成哈希）
+    for (int i = 0; i < (int)sizeof(g_st.user_pw); i++) g_st.user_pw[i] = 0;
+    if (n <= 0) {
+        dbg64_line_begin64();
+        dbg64_str("[SETUP] user.conf BUILD FAILED rc=");
+        dbg64_dec((uint64_t)(n < 0 ? 1 : n));
+        dbg64_nl();
+        dbg64_line_end64();
+        return;
+    }
+    const int slot = vfs64_slot_alloc64();
+    if (slot < 0) {
+        dbg64_str("[SETUP] user.conf SKIP reason=no-free-slot (VFS64_SLOT_MAX reached)\n");
+        return;
+    }
+    uint32_t used_start = g_install_start;
+    int mrc = vfs64_mount_slot64(slot, g_install_drive, used_start);
+    if (mrc != 0 && g_install_alt_start != 0) {
+        // 兜底：万一某天布局变成"系统卷落在界面选中的那个分区"，再试一次并如实记下用了哪个
+        used_start = g_install_alt_start;
+        mrc = vfs64_mount_slot64(slot, g_install_drive, used_start);
+        dbg64_str("[SETUP] user.conf retry at alt start lba=");
+        dbg64_dec(used_start);
+        dbg64_str(" rc=");
+        dbg64_dec((uint64_t)(mrc == 0 ? 0 : 1));
+        dbg64_nl();
+    }
+    if (mrc != 0) {
+        dbg64_line_begin64();
+        dbg64_str("[SETUP] user.conf SKIP reason=mount-failed slot=");
+        dbg64_dec((uint64_t)slot);
+        dbg64_str(" drive=");
+        dbg64_dec((uint64_t)g_install_drive);
+        dbg64_str(" lba=");
+        dbg64_dec(g_install_start);
+        dbg64_nl();
+        dbg64_line_end64();
+        return;
+    }
+    // ★ 建父目录：必须**显式** mkdir("/etc")。实测 vfs64_mkdirs_on64() 传"文件路径"时
+    //   并不会把最后一级的父目录建出来（打点 `path component not found path=/etc/user.conf`），
+    //   所以这里先 mkdir 目录本身（已存在返回错误，忽略），再补一次逐级建。
+    const int mkd = vfs64_mkdir_on64(slot, "/etc");
+    (void)vfs64_mkdirs_on64(slot, "/etc");
+    // 先显式建一个空文件（已存在返回错误，忽略）：write 的语义是"写到已解析的 inode"，
+    // 不先 create 的话"目标卷上还没有这个文件"会被当成失败（实测过同类调用点）。
+    const int crc = vfs64_create_on64(slot, USERCONF64_PATH);
+    const int wrc = vfs64_write_on64(slot, USERCONF64_PATH, txt, n);
+    dbg64_line_begin64();
+    dbg64_str("[SETUP] user.conf write slot=");
+    dbg64_dec((uint64_t)slot);
+    dbg64_str(" drive=");
+    dbg64_dec((uint64_t)g_install_drive);
+    dbg64_str(" lba=");
+    dbg64_dec(used_start);
+    dbg64_str(" path=");
+    dbg64_str(USERCONF64_PATH);
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)n);
+    dbg64_str(" user=");
+    dbg64_str(g_st.user_name);
+    dbg64_str(" tz=");
+    dbg64_str(tz.zone);
+    dbg64_str(" pass=");
+    dbg64_dec((uint64_t)pass_set);
+    dbg64_str(" mkdir=");
+    dbg64_dec((uint64_t)mkd);
+    dbg64_str(" create=");
+    dbg64_dec((uint64_t)crc);
+    dbg64_str(" write=");
+    dbg64_dec((uint64_t)wrc);
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)((wrc >= 0) ? 0 : 1));
+    dbg64_nl();
+    dbg64_line_end64();
+    dbg64_line_begin64();
+    dbg64_str("[SETUP] userconf applied user=");
+    dbg64_str(g_st.user_name);
+    dbg64_str(" tz=");
+    dbg64_str(tz.zone);
+    dbg64_str(" off=");
+    if (tz.off_min < 0) dbg64_str("-");
+    dbg64_dec((uint64_t)(tz.off_min < 0 ? -tz.off_min : tz.off_min));
+    dbg64_str(" pass_set=");
+    dbg64_dec((uint64_t)pass_set);
+    dbg64_str(" lang=");
+    dbg64_dec((uint64_t)g_st.lang);
+    dbg64_str(" (login reads this file at boot)\n");
+    dbg64_line_end64();
+}
 static void progress_tick() {
     // 复制阶段：进度由**真实写入的扇区数**驱动（不是按时间假装）
     // ★ 踩坑记录：这里以前写成 `if (g_st.page != PAGE_PROGRESS) return;`，于是
@@ -1012,6 +1400,9 @@ static void progress_tick() {
             dbg64_dec(g_job.copied);
             dbg64_str(" 扇区）");
             dbg64_nl();
+            // ★ 复制已经全部落盘（part_install_step 返回 1 = 收尾 CRC/超级块都写完了）——
+            //   这时才把 /etc/user.conf 写进目标卷：挂临时卷槽、建 /etc、写文件，再自动重启。
+            install_write_user_conf();
             // 按需求：安装完成后自动重启
             g_reboot_at = ticks64() + ms_to_ticks64(2500);
             g_reboot_armed = true;
@@ -1060,6 +1451,19 @@ static void progress_tick() {
     g_st.install_type = 1;
     g_st.progress = 0;
     g_st.stage = 0;
+    // ★ 新增页默认值（用户 V1 需求）：用户名 vimtu、密码留空、时区 China / Asia/Shanghai
+    {
+        static const char kDefUser[] = "vimtu";
+        int i = 0;
+        for (; kDefUser[i] && i < USERCONF64_USER_MAX; i++) g_st.user_name[i] = kDefUser[i];
+        g_st.user_name[i] = 0;
+    }
+    for (int i = 0; i < (int)sizeof(g_st.user_pw); i++) g_st.user_pw[i] = 0;
+    g_st.user_focus = 0;
+    g_st.tz_idx = 0;                 // kTz[0] = China / Asia/Shanghai / +480
+    g_st.tz_open = 0;
+    g_st.tz_top = 0;
+    g_st.uc_written = 0;
     g_st.dirty = true;
     // 注意：这里不要调用 ata64_diag()（它发 IDENTIFY 但不读走那 256 字数据，
     // 会把设备留在"命令被中止"的状态，导致随后的 sector0 读取失败——已实测确认）。
