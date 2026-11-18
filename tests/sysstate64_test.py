@@ -226,8 +226,11 @@ def prepare_fixture():
         sys_bytes = f.read()
     if len(sys_bytes) == 0 or len(sys_bytes) % SECTOR:
         return None
-    if len(sys_bytes) > TARGET_SECTORS * SECTOR:
-        return None
+    # ★ v0.10.9：build64/system.img 现在是**完整盘映像**（32,584 + 真实卷扇区，随内容伸缩），
+    #   本夹具只要引导区 —— 截取前 TARGET_SECTORS 扇区（其余会被下面的卷写入/格式化覆盖）。
+    sys_bytes = sys_bytes[:TARGET_SECTORS * SECTOR]
+    if len(sys_bytes) < PART_BOOT_LBA * SECTOR:
+        return None                      # 连引导区都不完整：夹具不合法
     buf = bytearray(TARGET_SECTORS * SECTOR)
     buf[0:len(sys_bytes)] = sys_bytes
     buf[446:462] = _mbr_entry(True, 0xEF, PART_BOOT_LBA, PART_BOOT_SECS)

@@ -42,11 +42,20 @@ LOADER = os.path.join(ROOT, "build64", "loader64.bin")
 OS_KERNEL = os.path.join(ROOT, "build64", "kernel64_os.bin")
 INS_KERNEL = os.path.join(ROOT, "build64", "kernel64.bin")
 
-TARGET_SECTORS = 57343          # 28MB（= 原 16MB + 主分区起点后移的 24,519） 目标盘
 # ★ v0.9.31：载荷扇区数从介质文件本身量出来（安装器就是拷这么多），不再写死 8,073。
 #   介质布局：LBA 8192 = 载荷头，LBA 8193 起 = 载荷本体（= build64/system.img 的副本）。
 PAYLOAD_LBA = 8192
 PAYLOAD_SECTORS = (os.path.getsize(MEDIUM) // 512) - (PAYLOAD_LBA + 1) if os.path.exists(MEDIUM) else 0
+# ★ v0.10.9：载荷里"卷"的扇区数（= 盘扇区 - 主分区起点）。整卷比较按它算，
+#   不要用 TARGET_SECTORS：那是目标盘大小，会读到介质尾部的零填充。
+PAYLOAD_VOL_SECTORS = (PAYLOAD_SECTORS - 32584) if PAYLOAD_SECTORS > 32584 else 0
+# ★ v0.10.9：目标盘**正好等于载荷盘大小**（= 32,584 + 载荷卷扇区数）。
+#   为什么必须"正好相等"：安装器装完会 part_volume_grow64()；若目标主分区比载荷卷大，
+#   grow 会重排卷（搬数据块 + 改超级块），"整卷与载荷逐字节一致"就不再成立（实测踩过）。
+#   正好相等 -> grow 的 delta=0（no-op）-> 逐字节可比；
+#   同时 74,771 < ESP 门槛(约 122,730) -> 不写 ESP -> "主分区覆盖到盘尾" 也成立。
+#   载荷以后再变大，这个值自动跟随。
+TARGET_SECTORS = PAYLOAD_SECTORS if PAYLOAD_SECTORS > (32584 + 1024) else 57343
 
 
 def find_qemu(explicit=None):
@@ -306,10 +315,10 @@ def main():
     #   系统就会往里写 config/store/journal（实测：我自己的开机烟测把它写脏，这条断言当场假红）。
     #   而**安装器真正拷的字节**就是介质 LBA 8193 起的那份载荷，跟它比才是"装进去的到底是不是它"。
     #   顺带把比较范围从 64 KiB 扩到**整卷**（判据只许加强）。
-    if PAYLOAD_SECTORS:
+    if PAYLOAD_VOL_SECTORS:
         with open(MEDIUM, "rb") as f:
             f.seek((PAYLOAD_LBA + 1) * 512 + 32584 * 512)
-            ref = f.read(TARGET_SECTORS * 512 - 32584 * 512)
+            ref = f.read(PAYLOAD_VOL_SECTORS * 512)
         got = read_at(args.target, 32584, len(ref))
         check("目标盘主分区**整卷**与介质里的载荷逐字节一致（卷真的装进去了）",
               got == ref, "%d B" % len(ref))

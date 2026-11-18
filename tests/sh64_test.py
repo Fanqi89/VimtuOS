@@ -177,6 +177,10 @@ def prepare_fixture():
     import make_shellvol as msv           # tools/make_shellvol.py（同一份离线写入器）
     shell_bytes = open(SHELL_BIN, "rb").read()
     system_bytes = open(SYSTEM_IMG, "rb").read()
+    # ★ v0.10.9：system.img 现在是**完整盘映像**（32,584 + 真实卷扇区，随内容伸缩）。
+    #   本夹具只要引导区；build_disk() 会拿 len(system_bytes) 当"盘至少这么大"，
+    #   不截断的话盘会被撑到 74,771 扇区而卷只有几 MiB -> 系统起不来（实测踩过）。
+    system_bytes = system_bytes[:msv.PART_MAIN_LBA * msv.SECTOR]
     if shell_bytes[:4] != b"\x7fELF" or not system_bytes:
         return None
     vol = msv.build_volume(shell_bytes, HELLO_BYTES, TARGET_SECTORS - PART_MAIN_LBA)

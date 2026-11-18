@@ -215,7 +215,12 @@ def make_vfs_fixture(dst, sys_img):
             sysb = f.read()
     except OSError:
         return None
-    if not sysb or len(sysb) % SECTOR or len(sysb) > fst.SMALL_SECTORS * SECTOR:
+    if not sysb or len(sysb) % SECTOR:
+        return None
+    # ★ v0.10.9：system.img 现在是完整盘映像（大小随内容变化），本夹具只要引导区 ——
+    #   截取前 SMALL_SECTORS 扇区（后面会被 vimtufs3_format 重写成空卷）。
+    sysb = sysb[:fst.SMALL_SECTORS * SECTOR]
+    if len(sysb) < fst.PART_BOOT_LBA * SECTOR:
         return None
     buf = bytearray(fst.SMALL_SECTORS * SECTOR)
     buf[0:len(sysb)] = sysb

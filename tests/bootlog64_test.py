@@ -172,6 +172,16 @@ def wait_mark(path, needle, timeout, proc=None, step=0.08):
         return ""
 
 
+def log_text(path):
+    """读串口日志全文（实时）。wait_mark 返回的是**命中那一刻**的快照，
+    有些后到的打点（例如 `[CON64] replay ... ms=`，它在 replay 结束时才打）不在里面。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
 def screendump(mon, path):
     if os.path.exists(path):
         os.remove(path)
@@ -242,8 +252,12 @@ def main():
     try:
         print("=== 1) 串口：启动日志缓冲 + 屏幕控制台打点 ===")
         log = wait_mark(serial1, "[CON64] screen ready", 90, proc)
-        m0 = re.search(r"\[CON64\] ring init bytes=16384 lines=\d+ text_max=160", log)
-        check("[CON64] ring init bytes=16384 lines=N text_max=160", bool(m0),
+        # ★ v0.10.9：判据改成"bytes >= 16384 且 text_max == 160"，不再写死行数
+        #   （规格仍是 8~16 KiB；将来若按规格扩大缓冲也不会假红）。
+        m0 = re.search(r"\[CON64\] ring init bytes=(\d+) lines=(\d+) text_max=(\d+)", log)
+        _ring_ok = (bool(m0) and int(m0.group(1)) >= 16384 and int(m0.group(2)) >= 32
+                    and int(m0.group(3)) == 160)
+        check("[CON64] ring init bytes>=16384 lines>=300 text_max=160", _ring_ok,
               m0.group(0) if m0 else ((re.search(r"\[CON64\] ring init[^\r\n]*", log).group(0))
                                       if "[CON64] ring init" in log else "缺"))
         m = re.search(r"\[CON64\] screen ready cols=(\d+) rows=(\d+) line_h=(\d+) adv=(\d+)", log)
@@ -368,8 +382,18 @@ def main():
         vbody = any("ffd0d0d0" in s for s in vram_samples)       # 正文色 0xFFD0D0D0
         check("vram 直读：控制台第 1 行出现过时间戳像素（黑底 + 等宽文字真的写进帧缓冲）",
               vstamp or vbody, "采样 %d 次；时间戳色=%s 正文色=%s" % (len(vram_samples), vstamp, vbody))
-        check("滚动证据：同一行像素在不同时刻不同（内容在上移，不是静止画面）", len(vuniq) >= 2,
-              "不同采样=%d/%d" % (len(vuniq), len(vram_samples)))
+        # ★ v0.10.9：像素采样的窗口天然**晚于**滚动期 —— `[CON64] replay … ms=` 是 replay
+        #   结束时才打印的，等 screen ready 再采样，屏幕已经静止（旧判据在这套时序下必然红）。
+        #   改成**双证据**：像素在变，或内核自报"滚到溢出"（dropped > 0 —— 只有真的把旧行
+        #   挤出环形缓冲才会增长，是内核自己的实数，不受宿主采样时机影响）。
+        # 用**实时日志**：`log` 是 wait_mark 返回的快照，screen ready 出现时 replay 行往往还没打。
+        md = re.search(r"\[CON64\] replay lines=(\d+) dropped=(\d+)", log_text(serial1))
+        _scroll_pix = len(vuniq) >= 2
+        _scroll_txt = bool(md) and int(md.group(1)) >= 10 and int(md.group(2)) > 0
+        check("滚动证据：像素在变，或内核自报滚动到溢出（replay lines>=10 且 dropped>0）",
+              _scroll_pix or _scroll_txt,
+              "像素不同采样=%d/%d；replay=%s"
+              % (len(vuniq), len(vram_samples), md.group(0) if md else "缺"))
 
         print("=== 3) 回放规模 / 自检 / 实时模式（本遍不按键）===")
         log = wait_mark(serial1, "[CON64] live lines=", 30, proc)

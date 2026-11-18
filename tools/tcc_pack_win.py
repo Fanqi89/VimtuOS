@@ -83,6 +83,7 @@ class Volume2(SV.Volume):
             return SV.Volume.write_file(self, name, data, parent, uid, gid, mode, kind)
         if nblk > VFS_L2_FIRST_BLOCK + VFS_DIND_CHILDREN * VFS_INDIRECT_PTRS:
             raise ValueError("文件超过 VimtuFS2 单文件上限（%d 块）" % nblk)
+        self._reserve_for_file(nblk)      # ★ v0.10.9：一次预留，避免写一半被重排打乱块号
 
         blocks = []
         for i in range(nblk):
@@ -202,7 +203,9 @@ class VolumeEdit(Volume2):
             blk = self.buf[off:off + SECTOR]
             for k in range(SV.VFS_BITMAP_BLK_BITS):
                 if (blk[k >> 3] >> (k & 7)) & 1:
-                    self.used.add(m * SV.VFS_BITMAP_BLK_BITS + k)
+                    b = m * SV.VFS_BITMAP_BLK_BITS + k
+                    if b < self.total:          # ★ v0.10.9：夹掉"分区外"的位（同 make_shellvol）
+                        self.used.add(b)
 
     def inode_rec(self, i):
         off = self.inode_start * SECTOR + i * VFS_INODE_BYTES
@@ -311,12 +314,15 @@ def used_blocks(vol):
     bitmap_start = struct.unpack_from("<I", vol, 28)[0]
     bmn = struct.unpack_from("<I", vol, 32)[0]
     used = set()
+    total_blocks = struct.unpack_from("<I", vol, 20)[0]
     for m in range(bmn):
         off = (bitmap_start + m) * SECTOR
         blk = vol[off:off + SECTOR]
         for k in range(SV.VFS_BITMAP_BLK_BITS):
             if (blk[k >> 3] >> (k & 7)) & 1:
-                used.add(m * SV.VFS_BITMAP_BLK_BITS + k)
+                b = m * SV.VFS_BITMAP_BLK_BITS + k
+                if b < total_blocks:        # ★ v0.10.9：夹掉"分区外"的位
+                    used.add(b)
     return used
 
 

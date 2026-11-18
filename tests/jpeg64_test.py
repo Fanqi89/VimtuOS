@@ -89,8 +89,11 @@ def build_fixture(files, out_img):
     sys_bytes = open(SYSTEM_IMG, "rb").read()
     if len(sys_bytes) == 0 or len(sys_bytes) % MSV.SECTOR:
         return None, "%s 不是扇区对齐的内核镜像" % SYSTEM_IMG
-    if len(sys_bytes) > TARGET_SECTORS * MSV.SECTOR:
-        return None, "%s 比目标盘还大" % SYSTEM_IMG
+    # ★ v0.10.9：build64/system.img 现在是**完整盘映像**（32,584 + 真实卷扇区，随内容伸缩），
+    #   本夹具只要引导区 —— 截取前 TARGET_SECTORS 扇区（其余会被下面的卷写入覆盖）。
+    sys_bytes = sys_bytes[:TARGET_SECTORS * MSV.SECTOR]
+    if len(sys_bytes) < MSV.PART_MAIN_LBA * MSV.SECTOR:
+        return None, "%s 引导区不完整" % SYSTEM_IMG
     vol = MSV.Volume(TARGET_SECTORS - MSV.PART_MAIN_LBA)
     d = vol.mkdir("jpegtest", parent=0, mode=0o755)
     expect = {}

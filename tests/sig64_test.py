@@ -159,7 +159,11 @@ def prepare_fixture():
         return None
     with open(SYSTEM_IMG, "rb") as f:
         sys_bytes = f.read()
-    if len(sys_bytes) == 0 or len(sys_bytes) % SECTOR or len(sys_bytes) > TARGET_SECTORS * SECTOR:
+    if len(sys_bytes) == 0 or len(sys_bytes) % SECTOR:
+        return None
+    # ★ v0.10.9：system.img 现在是完整盘映像（大小随内容变化），夹具只要引导区
+    sys_bytes = sys_bytes[:TARGET_SECTORS * SECTOR]
+    if len(sys_bytes) < PART_BOOT_LBA * SECTOR:
         return None
     buf = bytearray(TARGET_SECTORS * SECTOR)
     buf[0:len(sys_bytes)] = sys_bytes

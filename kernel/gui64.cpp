@@ -1311,10 +1311,15 @@ static void icon_draw_prog64(int x, int y, int size, int kind) {
     font_draw_text(x + (size - tw) / 2, y + (size - lh) / 2, s, rgb(255, 255, 255));
     if (!g_icon_fb_logged[kind]) {
         g_icon_fb_logged[kind] = 1;
+        // ★ v0.10.9：这一行原先用 4 次 dbg64_* 直接拼，没进行锁 —— 心跳
+        //   `[TASK64] kheart` 会插到中间，串口上出现"一行两个 TAG"（实测被
+        //   tests/sh64_test.py 的行原子性自检抓到）。改用 line_begin/line_end。
+        dbg64_line_begin64();
         dbg64_str("[GUI64] icon fallback kind=");
         dbg64_dec((uint64_t)kind);
         dbg64_str(" reason=no-asset (programmatic glyph kept)");
         dbg64_nl();
+        dbg64_line_end64();
     }
 }
 

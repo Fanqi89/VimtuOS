@@ -59,6 +59,12 @@ RAW_SECTORS=1799                                         # 原始区预留（= m
 STORE_SECTORS=64
 PAYLOAD_LBA=8192               # 载荷头所在 LBA（安装程序按这个值找载荷）
 SYS_SECTORS=$((RAW_LBA + RAW_SECTORS + STORE_SECTORS))   # 32,592 = 引导区整块 + 裸槽
+# ★ v0.10.9【动态智能镜像】上面这个 SYS_SECTORS 只是"引导区整块 + 裸槽"的**初始**尺寸。
+#   卷的最终容量不再固定：tools/make_shellvol.py 的 Volume 在装不下时自动扩容（_grow），
+#   build_disk() 写完再按真实内容收口（compact_volume/trim，1 MiB 对齐）。
+#   于是 sysdisk.img / system.img / ISO 的大小 = 32,584 + 真实卷扇区数 ——
+#   "打进去了多少文件，镜像就自动生成多大"（旧实现恒定 24,759 扇区 = 12.09 MiB）。
+#   收口带逐文件 CRC 自证（前后字节不一致直接抛错，绝不让静默损坏过关）。
 IMAGE_SECTORS=$((PAYLOAD_LBA + 1 + SYS_SECTORS))         # 安装介质大小（载荷并入后会再算一次）
 # 安装介质里 /BOOT/KERNEL64.BIN（= 安装程序内核 kernel64.bin）的补零上限：
 #   cdiso 的硬盘/U 盘路径按这个字节数把内核搬进 0x100000，ISO 也按它补零。
@@ -79,7 +85,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.10.8"    # ★ v0.10.8：UEFI 从装好的盘引导修复（.bss 直映窗口 48MB->128MB + ESP 只写内核真实长度）
+VIMTUOS_VERSION="0.10.9"    # ★ v0.10.9：动态智能镜像机制（卷容量按内容自动伸缩，废除 12.09 MiB 固定上限 + 大壁纸入库并派生 1920 宽副本）
 #   沿用自 v0.10.2 的启动加固（仅作说明）：真机加固（UEFI 载荷按真实大小读 + 屏幕报错 + MMIO BAR>=4GiB 闸门） + 桌面帧预算（热路径打点预算 + 2 MiB 大页映射 / shm 与帧缓冲 + 60 Hz 帧节拍）
 #   根因：同一块盘上的两条命令会重叠（命令列表 slot0 / 命令表 / DMA 暂存页池 g_dma[16] 全驱动共享），
 #   后果是**静默坏读**（ELF 魔数坏读、VFS BAD block、/etc/r3drv.conf 读错）与端口互相重启，
@@ -1687,6 +1693,9 @@ else
     echo "ERROR: 缺少 $BUILD/peinfovol.img 或 build64/viewer.elf —— 图片查看器没装进系统卷" >&2
     exit 1
 fi
+# ★ v0.10.9：下面的 payload_embed 读的是"盘大小 = 引导区 + 真实卷"的 sysdisk.img，
+#   它把新的总扇区数写进 build64/sys_sectors.txt，于是 IMAGE_SECTORS（安装介质大小）
+#   与 ISO 大小都自动跟着卷内容走，不需要在这里另加参数。
 echo "==> ★ v0.5.11：把数据分区（VimtuFS2 卷）**并入安装载荷** system.img"
 # ★ 真缺陷（旧批修）：system.img 原来只切了前 8073 扇区（MBR+引导+内核+64 扇区裸槽），
 #   卷留在 sysdisk.img 的主分区起点 —— 于是用 ISO/安装介质**装到硬盘后目标盘该处是空字节**：

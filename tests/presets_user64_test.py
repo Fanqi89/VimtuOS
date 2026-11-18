@@ -126,6 +126,24 @@ def nav_center(log, page):
     return m
 
 
+def goto_page(mon, cur, serial, page, probe_cid, tries=3):
+    """切到设置页 page：点导航项后用 `[SET64] page=` / 该页控件的 ctl 打点**校验真的切过去了**。
+
+    为什么需要：打开设置时默认停在壁纸页(5)，之后点第 12/13 页的导航项**可能落空**
+    （实测 ui1.log 里 `[SET64] page=` 全文只有 1 条，page=12/13 的 ctl 一条都没有）。
+    每次重试都**重读最新**的 nav 坐标，避免窗口位置变动后用到过期坐标。
+    """
+    for _ in range(tries):
+        nav = wait_for(lambda: nav_center(log_of(serial), page), 12)
+        if not nav:
+            continue
+        cur.goto(mon, nav[0], nav[1])
+        mon.click(wait=2.0)
+        if wait_for(lambda: ctl_center(log_of(serial), page, probe_cid), 15):
+            return True
+    return False
+
+
 def wait_for(fn, timeout):
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -184,7 +202,9 @@ def main():
         os.remove(serial)
     proc, mon = start(["-drive", "format=raw,file=%s" % q(TGT), "-boot", "order=c"], serial, PORT)
     try:
-        if not qh.wait_desktop(mon, lambda: log_of(serial), proc, timeout=400):
+        # ★ v0.10.9：卷从 12.09 MiB 长到 20.60 MiB 后首次启动更慢（replay 约 11s + 更多图标加载），
+        #   等待从 400s 放宽到 600s。判据不变（仍然必须进桌面）。
+        if not qh.wait_desktop(mon, lambda: log_of(serial), proc, timeout=600):
             print("第一次启动没进桌面")
             return 2
         nav, cur = open_settings(mon, serial)
@@ -228,12 +248,9 @@ def main():
               "已应用：%s" % [w for w in walls if w])
 
         # ---- B. 预设头像 ----
-        nav12 = wait_for(lambda: nav_center(log_of(serial), P_AVATAR), 10)
         abtn = None
-        if nav12:
-            cur.goto(mon, nav12[0], nav12[1])
-            mon.click(wait=2.0)
-            abtn = wait_for(lambda: ctl_center(log_of(serial), P_AVATAR, CID_AVATAR_PRESET), 25)
+        if goto_page(mon, cur, serial, P_AVATAR, CID_AVATAR_PRESET):
+            abtn = ctl_center(log_of(serial), P_AVATAR, CID_AVATAR_PRESET)
         check("头像页有「预设头像」按钮（id=%d %s）" % (CID_AVATAR_PRESET, abtn), abtn is not None)
         if abtn:
             cur.goto(mon, abtn[0], abtn[1])
@@ -246,13 +263,10 @@ def main():
               (m.group(0) if m else "缺失"))
 
         # ---- C. 用户名：空输入必须明确报错；填名字后改名成功 ----
-        nav13 = wait_for(lambda: nav_center(log_of(serial), P_UNAME), 10)
         fld = ubtn = None
-        if nav13:
-            cur.goto(mon, nav13[0], nav13[1])
-            mon.click(wait=2.0)
-            fld = wait_for(lambda: ctl_center(log_of(serial), P_UNAME, CID_UNAME_FIELD), 25)
-            ubtn = wait_for(lambda: ctl_center(log_of(serial), P_UNAME, CID_UNAME_APPLY), 25)
+        if goto_page(mon, cur, serial, P_UNAME, CID_UNAME_FIELD):
+            fld = ctl_center(log_of(serial), P_UNAME, CID_UNAME_FIELD)
+            ubtn = ctl_center(log_of(serial), P_UNAME, CID_UNAME_APPLY)
         check("用户名页有输入框(id=150 %s)与「改名」按钮(id=151 %s)" % (fld, ubtn),
               fld is not None and ubtn is not None)
         if fld and ubtn:

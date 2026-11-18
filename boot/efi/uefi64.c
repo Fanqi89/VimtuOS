@@ -40,7 +40,16 @@
 //   现在收紧到 6MB（留 1MB 余量）并给出明确报错；同时安装器只写内核**真实长度**
 //   （kernel/part64.cpp 的 part_kernel_real_bytes64），两条一起保证不再自我覆盖。
 #define KERNEL_MAX_BYTES   (6ULL * 1024 * 1024)    // < 0x800000 - 0x100000，绝不能踩到引导器自身
-#define PAYLOAD_MAX_BYTES  (32ULL * 1024 * 1024)   // 载荷暂存区 [0x04000000, 0x06000000)
+#define PAYLOAD_MAX_BYTES  (64ULL * 1024 * 1024)   // ★ v0.10.9：载荷暂存区 [0x04000000, 0x08000000)
+//   硬约束：HIGH_PAYLOAD(64MB) + PAYLOAD_MAX_BYTES <= KERNEL_MAP_BYTES(128MB)
+//   => 64 + 64 = 128，正好用满直映窗口，不能再大。
+//   （曾经试过把两者都放大到 128/256MB：VMware EFI 固件直接崩 —— 直映把 128..256MB 的
+//    固件保留区/PCIe MMIO 也标成普通 RAM，ExitBootServices 后固件仍会被调用，一访问就炸。）
+//   载荷超过 64MB 时应当把 HIGH_PAYLOAD 往上挪，而不是放大直映窗口。
+//   为什么从 32 MiB 提到 128 MiB：动态智能镜像让 build64/system.img 从 28 MiB 长到 36.51 MiB，
+//   超了旧的 32 MiB 上限 -> load_file 拒绝（required=0 只打 U:TOO BIG 然后返回 0）->
+//   介质描述符 kind=0 -> 安装器回落到"在硬盘上找 VIMTUPAY 头"的老路径 -> 光盘/ESP 里没有那个头
+//   -> 实测 "[INSTALL] 找不到安装介质载荷（magic VIMTUPAY）"，UEFI 装机彻底走不通。
 // ★ 内核搬高半区（与 kernel/linker64.ld 的链接基址一致）：
 //   虚拟 0xFFFFFFFF80000000 = 物理 0x100000（平铺装载地址），
 //   即 VA = KERNEL_VA_BASE + (PA - HIGH_KERNEL)。
@@ -49,7 +58,10 @@
 //   而这里原来只直映 0..48MB —— kmain64 第一步清 .bss 就写到窗口外，
 //   UEFI 下没有 IDT -> 三重故障 -> 立刻复位（串口只剩 E/s/K 三个打点）。
 //   窗口给到 128MB（内核镜像+BSS ~56MB 的 2.3 倍余量）。
-#define KERNEL_MAP_BYTES (128ULL * 1024 * 1024)     // 直映 PA 0..128MB（内核 .bss 约 56MB）
+// ★ v0.10.9：直映窗口改成**变量**（不再是宏）。载荷由固件分配（见 load_file_alloc），
+//   分配到的地址可能高于 128MB，窗口必须按"载荷末尾"扩展，否则读载荷就 #PF。
+//   默认 128MB（内核 .bss 约 56MB）；PD 表 g_pd_hi 共 512 项 × 2MB = 1GB 上限。
+static u64 g_map_bytes = 128ULL * 1024 * 1024;
 
 // ★ RSDP 传递槽（物理地址，8 字节 u64）：UEFI 按规范通过 EFI 配置表交付 RSDP，不放
 //   legacy EBDA/0xE0000 窗口。命中项的 VendorTable 写进这里；0 = 没找到。
@@ -200,6 +212,91 @@ static u64 load_file(EFI_FILE_PROTOCOL* root, const char* path, u64 dst, u64 max
     return off;
 }
 
+// ★ v0.10.9：让**固件**分配载荷暂存区（不再硬编码 HIGH_PAYLOAD）。
+//   为什么：v0.10.8 载荷 28MB 恰好落在 64..92MB 还没事；本版 36.51MB 写到 64..100.28MB
+//   会踩掉固件保留数据 -> ExitBootServices 之后固件仍被调用 -> VMware EFI 直接崩
+//   （转储 "Can't find image information"，CR3=0x3FF97000）。
+//   策略：先试 AllocateAddress @0x10000000(256MB)（避开固件常用低 128MB），
+//         失败再 AllocateAnyPages；都失败才回退旧 HIGH_PAYLOAD 并如实打点。
+// ★ v0.10.9：UEFI 的 EFI_ALLOCATE_TYPE 是
+//   typedef enum { AllocateAnyPages = 0, AllocateMaxAddress = 1, AllocateAddress = 2 };
+//   （曾经把 ADDRESS 写成 0、ANY 写成 1：第一次实际是 AnyPages、地址对不上就判失败；
+//     第二次实际是 MaxAddress 且上界给了 0 -> 必然失败 -> 回退 64MB -> 踩坏固件 -> VMware EFI 崩。）
+#define EFI_ALLOCATE_ANY_PAGES  0u
+#define EFI_ALLOCATE_MAX_ADDR   1u
+#define EFI_ALLOCATE_ADDRESS    2u
+#define EFI_LOADER_DATA         9u
+#define PREFERRED_PAYLOAD_PA    0x10000000ULL
+
+static u64 load_file_alloc(EFI_BOOT_SERVICES* bs, EFI_FILE_PROTOCOL* root, const char* path,
+                           u64 max_bytes, int required, u64* out_pa) {
+    *out_pa = HIGH_PAYLOAD;
+    u16 nm[64];
+    int n = 0;
+    for (; n < 63 && path[n]; n++) nm[n] = (u16)(unsigned char)path[n];
+    nm[n] = 0;
+    EFI_FILE_PROTOCOL* f = 0;
+    EFI_STATUS s = ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*, EFI_FILE_PROTOCOL**, const u16*, u64, u64))root->Open)(
+        root, &f, nm, 1, 0);
+    if (EFI_ERROR(s) || !f) {
+        if (required) { ser_str("U:open fail "); ser_str(path); ser_str("\n"); }
+        else          { ser_str("U:missing "); ser_str(path); ser_str(" (optional, skipped)\n"); }
+        return 0;
+    }
+    u64 size = 0;
+    ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*, u64))f->SetPosition)(f, ~0ULL);
+    ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*, u64*))f->GetPosition)(f, &size);
+    ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*, u64))f->SetPosition)(f, 0);
+    ser_str("U:size "); ser_str(path); ser_str(" = "); ser_dec((u32)size); ser_str("\n");
+    if (size == 0) {
+        scr_both("U:empty file");
+        ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*))f->Close)(f);
+        return 0;
+    }
+    if (size > max_bytes) {
+        ser_str("U:TOO BIG "); ser_str(path); ser_str(" need="); ser_dec((u32)size);
+        ser_str(" cap="); ser_dec((u32)max_bytes); ser_str("\n");
+        scr_both("U:image too big for the boot staging window");
+        ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*))f->Close)(f);
+        return 0;
+    }
+    const u64 pages = (size + 4095ULL) / 4096ULL;
+    u64 pa = PREFERRED_PAYLOAD_PA;
+    s = ((EFI_STATUS(*)(u32, u32, u64, u64*))bs->AllocatePages)(
+        EFI_ALLOCATE_ADDRESS, EFI_LOADER_DATA, pages, &pa);
+    if (EFI_ERROR(s) || pa != PREFERRED_PAYLOAD_PA) {
+        pa = 0;
+        s = ((EFI_STATUS(*)(u32, u32, u64, u64*))bs->AllocatePages)(
+            EFI_ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages, &pa);
+        if (EFI_ERROR(s) || pa == 0) {
+            ser_str("U:alloc payload FAILED, fallback HIGH_PAYLOAD(64MB)\n");
+            pa = HIGH_PAYLOAD;
+        }
+    }
+    ser_str("U:payload pa=0x"); ser_hex(pa); ser_str(" pages="); ser_dec((u32)pages); ser_str("\n");
+    u64 off = 0;
+    while (off < size) {
+        u64 chunk = size - off;
+        if (chunk > 0x100000) chunk = 0x100000;
+        u64 got = chunk;
+        s = ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*, u64*, void*))f->Read)(f, &got, (void*)(pa + off));
+        if (EFI_ERROR(s)) {
+            scr_both("U:read error");
+            ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*))f->Close)(f);
+            return 0;
+        }
+        if (got == 0) break;
+        off += got;
+    }
+    const u64 tail = off & 511ULL;
+    if (tail) mem_zero((void*)(pa + off), 512ULL - tail);
+    ((EFI_STATUS(*)(EFI_FILE_PROTOCOL*))f->Close)(f);
+    ser_str("U:loaded "); ser_str(path); ser_str(" bytes="); ser_dec((u32)off);
+    ser_str(" pa=0x"); ser_hex(pa); ser_str("\n");
+    *out_pa = pa;
+    return off;
+}
+
 EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* root) {
     ser_init();
     g_st = st;                     // ★ v0.10.2：屏幕输出通道（真机无串口时的唯一提示）
@@ -211,8 +308,18 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
     const u64 kernel_bytes = load_file(root, "KERNEL64.BIN", HIGH_KERNEL, KERNEL_MAX_BYTES, 1);
     if (!kernel_bytes) { scr_both("U:KERNEL64.BIN missing or unreadable"); return 1; }
     // SYSTEM.IMG 只有安装介质才有；装好的盘上没有它（返回 0 属正常，行为与 BIOS 裸盘一致）
-    const u64 payload_bytes = load_file(root, "SYSTEM.IMG", HIGH_PAYLOAD, PAYLOAD_MAX_BYTES, 0);
+    u64 payload_pa = HIGH_PAYLOAD;
+    const u64 payload_bytes = load_file_alloc(bs, root, "SYSTEM.IMG", PAYLOAD_MAX_BYTES, 0, &payload_pa);
     const int have_payload = (payload_bytes > 0);
+    if (have_payload) {
+        // 直映窗口必须覆盖载荷末尾（固件可能把它分到 >128MB 的地方）
+        u64 need = payload_pa + payload_bytes;
+        need = (need + 0x1FFFFFULL) & ~0x1FFFFFULL;                 // 2MB 对齐
+        if (need < 128ULL * 1024 * 1024) need = 128ULL * 1024 * 1024;
+        if (need > 512ULL * 1024 * 1024) need = 512ULL * 1024 * 1024;   // PD 512 项上限
+        g_map_bytes = need;
+        ser_str("U:direct map window="); ser_dec((u32)(need >> 20)); ser_str(" MiB\n");
+    }
 
     // GOP
     EFI_GRAPHICS_OUTPUT_PROTOCOL* gop = 0;
@@ -401,7 +508,7 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
         md[4] = have_payload ? 2 : 0;
         if (have_payload) {
             *(u32*)(md + 8)  = (u32)HIGH_KERNEL;
-            *(u32*)(md + 12) = (u32)HIGH_PAYLOAD;
+            *(u32*)(md + 12) = (u32)payload_pa;      // ★ v0.10.9：实际分配到的地址
             // ★ v0.10.2：按**真实字节数**换算扇区（向上取整）。原来写死 8073 扇区，
             //   安装程序只拷 4.13MB —— 主分区整块丢失，装完重启黑屏。
             *(u32*)(md + 16) = (u32)((payload_bytes + 511ULL) / 512ULL);
@@ -439,7 +546,7 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
         mem_zero(g_pd_hi, 4096);
         g_pdpt_hi[510] = (u64)(unsigned long)g_pd_hi | 3;     // VA 0xFFFFFFFF80000000 -> PDPT[510]
         {
-            const u32 pages = (u32)(KERNEL_MAP_BYTES / 0x200000ULL);   // 2MB/页
+            const u32 pages = (u32)(g_map_bytes / 0x200000ULL);        // 2MB/页
             for (u32 i = 0; i < pages; i++) {
                 g_pd_hi[i] = ((u64)i * 0x200000ULL) | 0x83;   // P|RW|PS，从 PA 0 起（直映）
             }
@@ -529,7 +636,7 @@ EFI_STATUS uefi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE* st, EFI_FILE_PROTOCOL* 
         u64 ent = pml4[511];
         u32 bad = 0;
         if (!(ent & 1) || (ent & ~0xFFFULL) != (u64)(unsigned long)g_pdpt_hi) bad++;
-        for (u32 i = 0; i < (u32)(KERNEL_MAP_BYTES / 0x200000ULL); i++) {
+        for (u32 i = 0; i < (u32)(g_map_bytes / 0x200000ULL); i++) {
             if (g_pd_hi[i] != (((u64)i * 0x200000ULL) | 0x83)) { bad++; break; }
         }
         ser_str(bad ? "U:high half check BAD\n" : "U:high half check ok\n");

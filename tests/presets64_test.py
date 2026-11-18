@@ -290,9 +290,19 @@ def main():
     # ④ 运行时：把壁纸指到**真落点**（v0.6.0 重排后的 /System/themes/wallpapers）里的第一张。
     #    ★ 不能用 /Wallpapers/…：那是重排前的路径，卷里没有、内核也没有别名 →
     #      [VFS64] path component not found + [IMG64] load fit skip reason=not-found。
-    wall_name = walls[0][1]
-    wall_path = WALL_DIR.rstrip("/") + "/" + wall_name
     TP, vol, inodes, total = read_vol(img)
+    # ★ v0.10.9：卷里现在同时有"超限原图"（>2048px，内核走 img64_load_vfs_fit64 的 DCT
+    #   降采样，返回尺寸 != 原图尺寸）。本测试的判据是"返回尺寸 == 壁纸真实尺寸"，那只在
+    #   decim=1（全尺寸解码）时成立 —— 所以选图**明确挑一张最长边 <= 2048 的**。
+    #   判据本身没变，只是不再靠 inode 顺序碰运气。
+    wall_name = walls[0][1]
+    for _i, _nm, _rec in walls:
+        _b = TP._read_file(vol, _rec, total)
+        _d = png_size(_b) or (jpeg_size(_b)[:2] if jpeg_size(_b) else None)
+        if _d and max(_d) <= 2048:
+            wall_name = _nm
+            break
+    wall_path = WALL_DIR.rstrip("/") + "/" + wall_name
     expect_sz = None
     for i, nm, rec in TP._entries(vol, ids[0], inodes):
         if nm == wall_name:

@@ -35,7 +35,57 @@ SECTOR = 512
 PART_BOOT_LBA = 65
 PART_BOOT_SECS = 32519
 PART_MAIN_LBA = PART_BOOT_LBA + PART_BOOT_SECS          # 32584（= kernel/part64.h）
-DEFAULT_TARGET_SECTORS = 57343                           # 28MB（= 原 16MB + 主分区起点后移的 24,519） 演示/测试盘
+DEFAULT_TARGET_SECTORS = 57343                           # ★ v0.10.9：**不再是上限**，只是"卷的起始容量"。
+                                                         #   卷装不下时自动增长（Volume._grow），
+                                                         #   写完由 build_disk() 按真实内容收口（trim）。
+                                                         #   于是 sysdisk.img / system.img / ISO 的大小 = 32,584 + 真实卷扇区。
+
+# ===========================================================================
+# ★ v0.10.9【动态智能镜像机制】几何规划
+#   卷布局：块 0 = 超级块；块 1..bmn = 位图；inode 表 inode_blocks 块；其后为数据区。
+#   为什么"改 total"必须整体重排，而不能只改超级块里的那一行：
+#   kernel/vfs64.cpp 挂载时**强制校验** bmn == ceil(total/4096)（不符即 SB_ERR_LAYOUT），
+#   而 total 一变 data_start 就变，于是所有数据块号与 inode 表位置全部失效。
+#   这就是 _remap_to() 存在的原因（压实 + 块号重写 + inode CRC 重算）。
+# ===========================================================================
+VOL_ALIGN_SECTORS = 2048          # 收口对齐粒度 = 1 MiB（"按块对齐即可"）
+VOL_TRIM_SLACK = 4096             # ★ v0.10.9：**运行时**预留的空闲数据块 = 2 MiB。
+                                  #   为什么必须这么大：收口只留 512 块（256 KiB）时，链尾最后一步
+                                  #   把卷填到只剩 129 块，运行时第一次 `cfg save` 就
+                                  #   `[CONF64] flush failed rc=1 via=vfs`（ENOSPC，实测刷屏）；
+                                  #   第二次启动甚至只剩 8 块。首启还要新建 /etc、/home、日志块重写。
+VOL_GROW_STEP = 4096              # 单次增长下限 2 MiB（避免逐块重排）
+
+
+def vol_layout(total_sectors):
+    """返回 (bmn, inode_start, data_start)：与 Volume.__init__ 同一口径。"""
+    bmn = (total_sectors + VFS_BITMAP_BLK_BITS - 1) // VFS_BITMAP_BLK_BITS
+    inode_start = 1 + bmn
+    data_start = inode_start + VFS_INODE_BLOCKS
+    return bmn, inode_start, data_start
+
+
+def plan_total_sectors(need_data_blocks, min_total=0):
+    """给定"需要多少个数据块"，解出满足布局的最小 total_sectors（迭代收敛）。
+
+    不变量：total - data_start(total) >= need_data_blocks。
+    data_start 随 total 增大而增大（bmn 涨），所以必须迭代，不能一步算完。
+    """
+    need = max(0, int(need_data_blocks))
+    t = max(int(min_total), need + 1024)     # 初猜只留布局余量；"长一截"由 _grow 自己加
+    for _ in range(16):
+        _, _, ds = vol_layout(t)
+        want = ds + need
+        if want <= t:
+            break
+        t = want
+    return max(t, int(min_total))
+
+
+def align_up_sectors(n, align):
+    a = max(1, int(align))
+    return ((int(n) + a - 1) // a) * a
+
 
 VFS_VERSION = 5          # ★ v0.9.28：VimtuFS2 v5（= v4 + 超级块特性扩展头 + inode xattr/快照字段）
                          #   本脚本产出的卷 feature_bits 恒 0（扩展头全 0），行为与 v4 逐字节相同；
@@ -49,6 +99,7 @@ VFS_INDIRECT_PTRS = 128
 VFS_DIND_CHILDREN = 128                                  # 二级间接块里的一级间接块个数（v4；见 kernel/vfs64.h）
 VFS_MAX_FILE_BLOCKS = 16384                              # 8 MiB 上限（v4）
 VFS_MAX_FILE_BLOCKS_L1 = VFS_DIRECT_BLOCKS + VFS_INDIRECT_PTRS   # 132：再往上需要二级间接块
+VFS_INODE_BLOCKS = (VFS_MAX_INODES + VFS_INODES_PER_BLK - 1) // VFS_INODES_PER_BLK  # 512
 
 S_IFDIR = 0o040000
 S_IFREG = 0o100000
@@ -107,11 +158,156 @@ class Volume:
         return blk * SECTOR
 
     def _alloc_blk(self):
+        # ★ v0.10.9：数据区用尽时**自动扩容**（不再有固定体积上限）。
+        #   这条路径被卷链上所有工具共享（它们都继承本类），所以"加一张 6.8 MB 壁纸
+        #   就把整条构建链打断"再也不会发生 —— 卷按内容长大，末了统一收口。
         for blk in range(self.data_start, self.total):
             if blk not in self.used:
                 self.used.add(blk)
                 return blk
-        raise ValueError("卷空间不足（数据块用尽）")
+        self._grow()
+        for blk in range(self.data_start, self.total):
+            if blk not in self.used:
+                self.used.add(blk)
+                return blk
+        raise ValueError("卷空间不足（扩容后仍无空闲块，total=%d）" % self.total)
+
+    # ================= v0.10.9 动态容量原语 =================
+    def load(self, img):
+        """把一块已存在的卷装进来（几何沿用**本对象**的 total；只重建分配器状态）。"""
+        want = self.total * SECTOR
+        self.buf = bytearray(want)
+        n = min(len(img), want)
+        self.buf[0:n] = img[0:n]
+        self.used = set()
+        for m in range(self.bmn):
+            off = (self.bitmap_start + m) * SECTOR
+            blk = self.buf[off:off + SECTOR]
+            for k in range(VFS_BITMAP_BLK_BITS):
+                if (blk[k >> 3] >> (k & 7)) & 1:
+                    b = m * VFS_BITMAP_BLK_BITS + k
+                    # ★ v0.10.9：finish() 会把 blk >= total 的位也标 1（"分区外，永不发放"），
+                    #   从位图重建时**必须夹掉**，否则越界块号会污染分配器与重排（真踩过：
+                    #   24,576 扇区的卷被拷出短切片压成 21,330 扇区）。
+                    if b < self.total:
+                        self.used.add(b)
+
+    def _used_data_blocks(self):
+        return sorted(b for b in self.used if self.data_start <= b < self.total)
+
+    def _remap_to(self, new_total):
+        """把整块卷重排到 new_total 扇区：数据块**压实**后重新分配块号，并重写所有块指针。
+
+        为什么必须整体重排：内核挂载校验 bmn == ceil(total/4096)；total 一变，
+        inode 表起点与数据区起点都移动，旧块号全部失效。
+        """
+        new_total = int(new_total)
+        if new_total == self.total:
+            return self.total
+        kept = self._used_data_blocks()
+        bmn2, is2, ds2 = vol_layout(new_total)
+        if len(kept) + ds2 > new_total:
+            raise ValueError("卷收得过小：需要 %d 个数据块，total=%d 只有 %d 块"
+                             % (len(kept), new_total, new_total - ds2))
+        nmap = {}
+        nxt = ds2
+        for b in kept:
+            nmap[b] = nxt
+            nxt += 1
+        new = bytearray(new_total * SECTOR)
+        inode_bytes = self.inodes * VFS_INODE_BYTES
+        new[is2 * SECTOR:is2 * SECTOR + inode_bytes] = \
+            self.buf[self.inode_start * SECTOR:self.inode_start * SECTOR + inode_bytes]
+        for b in kept:
+            new[nmap[b] * SECTOR:(nmap[b] + 1) * SECTOR] = self.buf[b * SECTOR:(b + 1) * SECTOR]
+        # ① inode 里的块指针（direct[0..3] / ind / dind）+ CRC 重算
+        for i in range(self.inodes):
+            o = is2 * SECTOR + i * VFS_INODE_BYTES
+            if new[o] == 0:
+                continue
+            for d in range(VFS_DIRECT_BLOCKS):
+                p = o + 8 + 4 * d
+                v = struct.unpack_from("<I", new, p)[0]
+                if v:
+                    struct.pack_into("<I", new, p, nmap[v])
+            for p in (o + 24, o + 71):
+                v = struct.unpack_from("<I", new, p)[0]
+                if v:
+                    struct.pack_into("<I", new, p, nmap[v])
+            struct.pack_into("<I", new, o + 124, _crc32(bytes(new[o:o + 124])))
+        # ② 间接块容器里的块号（ind / dind / dind 的 child）也要跟着改
+        cont = set()
+        for i in range(self.inodes):
+            o = self.inode_start * SECTOR + i * VFS_INODE_BYTES
+            if self.buf[o] == 0:
+                continue
+            ind = struct.unpack_from("<I", self.buf, o + 24)[0]
+            dind = struct.unpack_from("<I", self.buf, o + 71)[0]
+            if ind:
+                cont.add(ind)
+            if dind:
+                cont.add(dind)
+                for c in range(VFS_DIND_CHILDREN):
+                    ch = struct.unpack_from("<I", self.buf, dind * SECTOR + 4 * c)[0]
+                    if ch:
+                        cont.add(ch)
+        for b in cont:
+            dst = nmap[b] * SECTOR
+            for k in range(VFS_INDIRECT_PTRS):
+                v = struct.unpack_from("<I", new, dst + 4 * k)[0]
+                if v:
+                    struct.pack_into("<I", new, dst + 4 * k, nmap[v])
+        self.buf = new
+        self.total = new_total
+        self.bmn = bmn2
+        self.inode_start = is2
+        self.data_start = ds2
+        self.data_blocks = new_total - ds2
+        self.used = set(range(ds2)) | set(nmap.values())
+        return new_total
+
+    def _reserve(self, nblocks):
+        """确保数据区至少还有 nblocks 个空闲块；不够就**一次性**扩容到这里。
+
+        为什么必须"一次性预留"而不是"用完了再长"：write_file 是先收集块号、
+        最后才写 inode 的；中途重排会让已收集的块号失效（真踩过：6.8 MB 壁纸 crc 不对）。
+        """
+        nblocks = int(nblocks)
+        if nblocks <= 0:
+            return
+        free = (self.total - self.data_start) - len(self._used_data_blocks())
+        # ★ v0.10.9：不仅是"够写这个文件"，还要留出运行时余量（否则链尾会把卷填死）
+        if free >= nblocks + VOL_TRIM_SLACK:
+            return
+        need = len(self._used_data_blocks()) + nblocks + VOL_TRIM_SLACK
+        self._remap_to(plan_total_sectors(need, min_total=self.total))
+
+    def _reserve_for_file(self, nblk):
+        """按"数据块 + 一级间接 + 二级间接 + child"预留一个文件的全部块。"""
+        meta = 0
+        rest = max(0, int(nblk) - VFS_DIRECT_BLOCKS)
+        if rest:
+            meta += 1                                            # 一级间接块
+        if rest > VFS_INDIRECT_PTRS:
+            extra = rest - VFS_INDIRECT_PTRS
+            meta += 1                                            # 二级间接块
+            meta += (extra + VFS_INDIRECT_PTRS - 1) // VFS_INDIRECT_PTRS
+        self._reserve(int(nblk) + meta + 4)
+
+    def _grow(self, extra_blocks=0):
+        need = len(self._used_data_blocks()) + max(0, int(extra_blocks)) + VOL_GROW_STEP
+        t = plan_total_sectors(need, min_total=self.total)
+        if t <= self.total:
+            t = self.total + VOL_GROW_STEP
+        return self._remap_to(t)
+
+    def trim(self, align=VOL_ALIGN_SECTORS, slack_blocks=VOL_TRIM_SLACK):
+        """按真实内容收口（"打进去多少文件，镜像就多大"），按 align 扇区对齐。"""
+        need = len(self._used_data_blocks()) + max(0, int(slack_blocks))
+        t = align_up_sectors(plan_total_sectors(need), align)
+        if t < self.total:
+            self._remap_to(t)
+        return self.total
 
     def _rd32(self, blk, off):
         return struct.unpack_from("<I", self.buf, self._blk_off(blk) + off)[0]
@@ -159,6 +355,7 @@ class Volume:
         nblk = (len(data) + SECTOR - 1) // SECTOR
         if nblk > VFS_MAX_FILE_BLOCKS:
             raise ValueError("文件超过 VimtuFS2 上限（%d > %d 块）" % (nblk, VFS_MAX_FILE_BLOCKS))
+        self._reserve_for_file(nblk)      # ★ v0.10.9：一次预留，避免写一半被重排打乱块号
         # ★ v0.5.8：**补上二级间接块（dind）**。原来这里只做"直接块 + 一级间接"（<= 132 块
         #   = 67,584 B），于是用户提供的大壁纸 / 大图直接 ValueError 报错 —— 而"预设壁纸由用户
         #   提供"必然是大图（1920x1080 的 jpg 常见 200~800 KB）。v4 卷的 inode 早在 rec[71] 就有
@@ -448,16 +645,129 @@ def build_volume(shell_bytes, hello_text, total_sectors):
     return vol.finish()
 
 
-def build_disk(system_bytes, vol_bytes, target_sectors):
-    buf = bytearray(target_sectors * SECTOR)
+def _vol_file_map(vol_bytes):
+    """把整卷解析成 {路径: (size, crc32)} —— 收口自证用（前后必须逐项一致）。"""
+    total = struct.unpack_from("<I", vol_bytes, 20)[0]
+    ino = struct.unpack_from("<I", vol_bytes, 36)[0]
+    inodes = struct.unpack_from("<I", vol_bytes, 40)[0]
+    ib = struct.unpack_from("<I", vol_bytes, 44)[0]
+
+    def rec(i):
+        o = ino * SECTOR + i * ib
+        return vol_bytes[o:o + ib]
+
+    def name_of(r):
+        n = r[1]
+        try:
+            return r[40:40 + n].decode("ascii")
+        except UnicodeDecodeError:
+            return None
+
+    def read_file(r):
+        size = struct.unpack_from("<I", r, 4)[0]
+        blocks = [struct.unpack_from("<I", r, 8 + 4 * d)[0] for d in range(VFS_DIRECT_BLOCKS)]
+        ind = struct.unpack_from("<I", r, 24)[0]
+        if ind:
+            for k in range(VFS_INDIRECT_PTRS):
+                blocks.append(struct.unpack_from("<I", vol_bytes, ind * SECTOR + 4 * k)[0])
+        dind = struct.unpack_from("<I", r, 71)[0]
+        if dind:
+            for c in range(VFS_DIND_CHILDREN):
+                child = struct.unpack_from("<I", vol_bytes, dind * SECTOR + 4 * c)[0]
+                if not child:
+                    continue
+                for k in range(VFS_INDIRECT_PTRS):
+                    blocks.append(struct.unpack_from("<I", vol_bytes, child * SECTOR + 4 * k)[0])
+        data = bytearray()
+        for b in blocks:
+            if len(data) >= size:
+                break
+            if b == 0 or b >= total:
+                continue
+            data += vol_bytes[b * SECTOR:(b + 1) * SECTOR]
+        return bytes(data[:size])
+
+    out = {}
+    for i in range(inodes):
+        r = rec(i)
+        if r[0] != 1:
+            continue
+        chain = []
+        cur = i
+        ok = True
+        while True:
+            rr = rec(cur)
+            nm = name_of(rr)
+            if nm is None:
+                ok = False
+                break
+            chain.append(nm)
+            cur = struct.unpack_from("<I", rr, 28)[0]
+            if cur == 0:
+                break
+        if not ok:
+            continue
+        body = read_file(r)
+        out["/" + "/".join(reversed(chain))] = (len(body), _crc32(body))
+    return out
+
+
+def compact_volume(vol_bytes, align=VOL_ALIGN_SECTORS, verify=True):
+    """把卷收口到"真实内容 + 对齐 slack"（★ 动态智能镜像的核心）。
+
+    返回 (新卷字节, 收口前扇区数, 收口后扇区数)。verify=True 时做**逐文件 CRC 自证**：
+    收口前后每个文件的字节必须完全一致，否则抛错（绝不让静默损坏过关）。
+    """
+    total = struct.unpack_from("<I", vol_bytes, 20)[0]
+    v = Volume(total)
+    v.load(vol_bytes)
+    before = _vol_file_map(vol_bytes) if verify else None
+    v.trim(align)
+    out = v.finish()
+    if verify:
+        after = _vol_file_map(out)
+        if before != after:
+            diff = sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+            raise ValueError("卷收口自证失败：%d 个文件的字节不再一致（例：%s）"
+                             % (len(diff), diff[:5]))
+    return out, total, v.total
+
+
+def build_disk(system_bytes, vol_bytes, target_sectors, compact=True):
+    """拼出完整盘：引导区（system_bytes）+ 主分区卷。
+
+    ★ v0.10.9：盘大小 = PART_MAIN_LBA + **真实卷扇区数**，不再是固定的 target_sectors。
+      卷先按内容收口（compact_volume），所以"打进去多少文件，镜像就多大"。
+      target_sectors 退化为"起始容量/日志参考"：卷比它大时照样生成（**上限已废除**）。
+    """
+    note = None
+    if compact:
+        vol_bytes, vol_before, vol_after = compact_volume(vol_bytes)
+        note = (vol_before, vol_after)
+    used = (len(vol_bytes) + SECTOR - 1) // SECTOR
+    total = PART_MAIN_LBA + used
+    need_sys = (len(system_bytes) + SECTOR - 1) // SECTOR
+    if total < need_sys:                       # 引导区比"主分区起点"还长（裸槽 8 扇区）
+        total = need_sys
+        used = total - PART_MAIN_LBA
+    buf = bytearray(total * SECTOR)
     buf[0:len(system_bytes)] = system_bytes
     buf[446:462] = _mbr_entry(True, 0xEF, PART_BOOT_LBA, PART_BOOT_SECS)      # 引导区（内核）
-    buf[462:478] = _mbr_entry(False, 0x07, PART_MAIN_LBA, target_sectors - PART_MAIN_LBA)
+    buf[462:478] = _mbr_entry(False, 0x07, PART_MAIN_LBA, used)
     buf[478:510] = b"\0" * 32
     buf[510], buf[511] = 0x55, 0xAA
     base = PART_MAIN_LBA * SECTOR
     buf[base:base + len(vol_bytes)] = vol_bytes
+    build_disk.last = {"total": total, "vol": used, "compact": note,
+                       "target": int(target_sectors)}
+    if note and note[0] != note[1]:
+        print("    [VOL64] 动态镜像：卷 %d -> %d 扇区（%.2f MiB），盘 %d 扇区（%.2f MiB）"
+              % (note[0], note[1], note[1] * SECTOR / 1048576.0,
+                 total, total * SECTOR / 1048576.0))
     return bytes(buf)
+
+
+build_disk.last = {}
 
 
 def main():
@@ -504,13 +814,12 @@ def main():
         # system.img = 8073 扇区：尾部的 32584..8072 是 store64 的"裸盘降级槽"（与数据分区起点重叠，
         # 见 kernel/memlayout64.h 的 ★★ 段）。上限放宽到**整块盘**即可 —— 卷写在同一位置会原样
         # 盖掉那 64 个扇区（正常运行时用的是卷里的 /store.a|b，降级槽本来就不该有内容）。
-        if len(system_bytes) > args.target_sectors * SECTOR:
-            sys.stderr.write("system.img 比整块盘还大（%d B > %d B）\n" % (len(system_bytes), args.target_sectors * SECTOR))
-            return 2
+        # ★ v0.10.9：不再用 target_sectors 当盘大小（上限已废除，改由真实卷内容决定）。
         img = build_disk(system_bytes, vol_bytes, args.target_sectors)
         open(args.disk, "wb").write(img)
-        print("    演示盘：%s（%d B = %d 扇区；主分区 LBA %d 起）"
-              % (args.disk, len(img), args.target_sectors, PART_MAIN_LBA))
+        print("    演示盘：%s（%d B = %d 扇区；主分区 LBA %d 起，卷 %d 扇区）"
+              % (args.disk, len(img), len(img) // SECTOR, PART_MAIN_LBA,
+                 build_disk.last.get("vol", 0)))
     return 0
 
 
