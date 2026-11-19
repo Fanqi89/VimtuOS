@@ -149,6 +149,11 @@ static void term_cell_h_init(void) {
 #define TERM_DEF_COLS    120        // 新建窗口默认排版（120 半格 = 60 汉字格 = 960px，与旧版像素尺寸一致）
 #define TERM_DEF_ROWS    40
 #define TERM_BUF_MAX     (TERM_COLS_MAX * TERM_ROWS_MAX)
+// ★★ v0.11.0：终端前台 ring3 的 stdin 环容量（按键字节，含 '\n' / '\b' 原样）。
+//   512 B 的依据：前台程序是逐字符消费的 REPL，一次按键 1~2 字节；512 B 相当于一次
+//   最多积压两行多的输入。环满时**丢最新键并打点**（不静默覆盖 —— 覆盖会让整行输入
+//   错位，比丢一行更难查）。
+#define TERM_STDIN_BYTES 512
 #define TERM_PAD_X       4          // 排版可用宽 = client_w - PAD_X
 #define TERM_PAD_Y       4          // 排版可用高 = client_h - PAD_Y
 #define TERM_MONO_DY     (-2)       // 等宽面 ASCII 字形相对格顶的微调（与 TERM_ZH_DY 同一基线补偿）
@@ -209,6 +214,13 @@ struct TerminalState {
     int       sb_head;               // 下一行写入位置（环形下标）
     int       sb_count;              // 已存历史行数（<= TERM_SB_LINES）
     int       sb_off;                // 视口上滚行数（0 = 跟到底部 = 最新内容）
+    // ★★ v0.11.0：终端**前台 ring3** 的 stdin 环（见下方 sh64 段之前的说明）
+    //   为什么放在 TerminalState 里而不是全局：多终端同时存在时，谁的前台读谁的键；
+    //   混在一起会让 A 窗口敲的字跑进 B 窗口的程序里。
+    int       r3_pid;                // >0 = 本终端有一个异步运行的 ring3 前台进程
+    uint32_t  sin_r;                 // 环读索引
+    uint32_t  sin_w;                 // 环写索引
+    char      sinb[TERM_STDIN_BYTES];// 按键字节环（含 '\n' / '\b' 原样）
 };
 
 // 实例注册表：紧凑排列，只存指针；存活判断用"指针比较 + 活窗口 userdata 回指"，不解引用可能已释放的状态
@@ -871,6 +883,7 @@ static const char* HELP_EN =
     "                        VAP64 -> int 0x80 path, ELF64 -> syscall path; e.g. run hello.elf)\n"
     "  elfrun NAME|/PATH     force the ELF64 loader (syscall insn ABI), e.g. elfrun hello.elf\n"
     "  shell | sh [status|kill]  run the ring3 shell from the system volume (/bin/shell.bin):\\n"
+"  micropython | python | mp  run the ring3 MicroPython REPL from /bin/micropython.bin\\n"
     "                        keys go to the ring3 shell, its output comes back to this window\\n"
     "  echo TEXT             print text (echo TEXT > FILE writes a real file)\n"
     "  write FILE TEXT       write a real file (overwrite; text is limited by the command line; "
@@ -952,6 +965,7 @@ static const char* HELP_ZH =
     "                        VAP64 走 int 0x80、ELF64 走 syscall 指令；例如 run hello.elf）\n"
     "  elfrun 名字|/路径     强制走 ELF64 加载器（syscall 指令 ABI），例如 elfrun hello.elf\n"
     "  shell | sh [status|kill]  运行**系统卷里**的 ring3 shell（/bin/shell.bin）：\\n"
+"  micropython | python | mp  运行系统卷里的 ring3 MicroPython（/bin/micropython.bin）\\n"
     "                        按键转给 ring3 shell，它的输出回到这个窗口\\n"
     "  echo TEXT             回显（echo TEXT > FILE 写**真文件**）\n"
     "  write FILE TEXT       写**真文件**（整体覆盖；文本受**命令行长度**限制，文件本身可到 8 MiB；多级路径）\\\\n"
@@ -4628,6 +4642,90 @@ static bool term_run_redir64(TerminalState* ts, const char* path, const char* ou
 }
 
 // 命令分发：cmd / arg1 / args（原文，供 echo / write 用）
+// ==================== ★★ v0.11.0：`micropython`（别名 mp / python）====================
+// 语义：**异步**把系统卷里的 /bin/micropython.bin 装进一个 ring3 进程，并登记为本终端的前台。
+//   装载成功立刻返回（不像 term_run_redir64 那样同步等），这样 GUI 主循环能继续跑，
+//   term_key 才有机会把按键投进 stdin 环 —— 交互式解释器只有这样才活得了。
+// 边界（如实）：
+//   * /bin/micropython.bin 不在卷里（旧卷 / 构建没带）-> 明说"未安装"，绝不假装在跑；
+//   * 本终端已经有前台 r3 / ring3 shell 会话 -> 拒绝并存，提示先退出。
+// 前置声明：本终端是否被 ring3 shell 会话占着（定义在下方 sh64 段）
+static bool sh64_owns64(TerminalState* ts);
+// ★★ v0.11.0：前台终端登记（stdin 通道与"前台是否存活"都读它）。
+//   定义必须放在这里 —— cmd_micropython（本函数的上方几行之后）在装载成功时要写它，
+//   而真正消费它的 term64_stdin_read64() 在下方 sh64 段。
+static TerminalState* g_r3_ts64 = nullptr;
+
+// ★ 路径约定（与 tools/micropython_build_win.sh 一致，改一处必须同步另一处）：
+//   /bin/mp                 装载驱动（< 64 KiB，走内核主程序装载器；与 /bin/lua 同构）
+//   /lib/micropython.bin    真解释器（静态 ELF，钉在 4GiB+0x90000，由驱动 mmap 后搬进去）
+//   为什么不直接装解释器：内核 ELF 装载器只装"主程序"，其 PT_LOAD 必须完整落在用户窗口
+//   **低 64 KiB**（kernel/elf64.cpp 的 e64_parse_ex64 会拒掉越界段，reason=outside-user-window）。
+//   267 KiB 的 MicroPython 直接 `run` 只会得到一条装载拒绝 —— 与 /bin/lua 同一个理由。
+static const char MP64_PATH64[] = "/bin/mp";
+static bool cmd_micropython(TerminalState* ts) {
+    if (ts->r3_pid > 0) {
+        ts_puts(ts, "micropython: this terminal is already running a ring3 program\n");
+        return false;
+    }
+    if (sh64_owns64(ts)) {
+        ts_puts(ts, "micropython: a ring3 shell owns this terminal (type exit there first)\n");
+        return false;
+    }
+    if (!proc64_isolate64()) {
+        ts_puts(ts, "micropython: shared address space mode -> no per-process fds\n");
+        return false;
+    }
+    panic64_watchdog_pause64();
+    const int pid = proc64_create64("mpy", 0);
+    int rc = -1;
+    if (pid > 0) {
+        // ★★ 必须**先登记前台、再启动进程**（防竞态）：
+        //   proc64_start_elf64 之后进程可能立刻被调度并跑到第一次 read(0)；若那时
+        //   g_r3_ts64/ts->r3_pid 还没设好，term64_stdin_read64 会返回 -1（= 无前台 r3），
+        //   fd 层就按旧语义回 EOF —— 解释器一闪就 exit_group(231)。
+        ts->r3_pid = pid;
+        ts->sin_r = 0;
+        ts->sin_w = 0;
+        g_r3_ts64 = ts;
+        // ★★ 子进程的 fd 0/1/2 必须**显式**绑到控制台 tty：
+        //   内核建新进程的 fd 表时**不继承任何槽**（见 proc64_fdtab_of64 的说明）。旧路径下
+        //   stdout 只是靠"fd 层回落内核表"碰巧能打（内核表的 1 是控制台），stdin 没有这条退路
+        //   —— 实测症状正是 `>>> ` 之后紧跟 `[SYSCALL] insn nr=0 ... ret=0` 和 `nr=231`。
+        const int tfd = fd64_open64("/dev/tty", FD64_O_RDWR);
+        FdTable64* ct = proc64_fdtab_of64(pid);
+        if (tfd >= 0 && ct) {
+            (void)fd64_dup_into64(ct, tfd, 0);
+            (void)fd64_dup_into64(ct, tfd, 1);
+            (void)fd64_dup_into64(ct, tfd, 2);
+        }
+        if (proc64_start_elf64(pid, MP64_PATH64) == 0) {
+            rc = 0;
+        } else {
+            ts->r3_pid = 0;                    // 装载失败：解绑，别留一个死前台
+            g_r3_ts64 = nullptr;
+            proc64_destroy64(pid);
+        }
+        if (tfd >= 0) (void)fd64_close64(tfd);
+    }
+    panic64_watchdog_unpause64();
+    dbg64_line_begin64();
+    dbg64_str("[TERM] micropython path=");
+    dbg64_str(MP64_PATH64);
+    dbg64_str(" pid=");
+    dbg64_dec((uint64_t)(uint32_t)(pid > 0 ? pid : 0));
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)(rc == 0 ? 0u : 1u));
+    dbg64_str(rc == 0 ? " (async; keys go to fd 0)" : " (not installed? see volume)");
+    dbg64_nl();
+    dbg64_line_end64();
+    if (rc != 0) {
+        ts_puts(ts, "micropython: cannot load /bin/mp (build it into the system volume)\n");
+        return false;
+    }
+    return true;
+}
+
 static void shell_exec(TerminalState* ts, const char* line) {
     const char* p = skip_ws(line);
     p = grab_token(p, g_cmd, (int)sizeof(g_cmd));
@@ -4686,6 +4784,8 @@ static void shell_exec(TerminalState* ts, const char* line) {
     } else if (st_eq(g_cmd, "mkdir") || st_eq(g_cmd, "md")) {
         // 真：vfs64_mkdir（阶段一：父目录固定为根，单层）
         ok = cmd_mkdir(ts, g_arg1);
+    } else if (st_eq(g_cmd, "micropython") || st_eq(g_cmd, "mp") || st_eq(g_cmd, "python")) {
+        ok = cmd_micropython(ts);
     } else if (st_eq(g_cmd, "df")) {
         // 真：VimtuFS2 卷几何（总块/空闲块/已用）+ 实时文件统计 + **所有卷**清单
         ok = cmd_df(ts);
@@ -5107,6 +5207,41 @@ static int       g_sh_line64 = 1;         // 1 = 下一个输出字节处于"行
 static char      g_sh_req64[160];
 static int       g_sh_req_n64 = 0;
 
+// ==================== ★★ v0.11.0：终端前台 ring3 的 stdin 通道 ====================
+// 为什么需要它（这是"终端里跑交互式解释器"的前提）：
+//   旧语义下 fd 0 是 /dev/console 的 tty 对象，read 一律返回 0（EOF，见 fd64.cpp 的
+//   `if (of->kind == FD64_KIND_TTY) return 0;`）。于是 ring3 程序**只能读文件、不能读键盘**
+//   —— 把 micropython 装进卷里也只会立刻 EOF 退出，`>>>` 一个字符都出不来。
+// 通道语义：
+//   term_key()    -> 本终端有前台 r3 -> 字节进 ts->sinb 环（内核**不回显**，前台程序自己回显）
+//   fd64 TTY read -> 有前台 r3 -> 从环取；环空则 task_sleep_ms64 让出等待
+//                    无前台 r3 -> 返回 -1（fd64 保持旧语义：EOF，如实）
+// fd64.cpp 用（弱引用：安装介质内核不链 terminal64.cpp -> 符号为 0 -> 那里保持 EOF）
+extern "C" int term64_stdin_read64(char* buf, uint32_t len) {
+    TerminalState* ts = g_r3_ts64;
+    if (!ts || !ts->used || ts->r3_pid <= 0) return -1;   // 没有前台 r3：调用方按旧语义 EOF
+    if (!buf || len == 0) return 0;
+    uint32_t n = 0;
+    const uint64_t if_save = dbg64_irq_save64();
+    while (n < len && ts->sin_r != ts->sin_w) {
+        buf[n++] = ts->sinb[ts->sin_r];
+        ts->sin_r = (ts->sin_r + 1u) % (uint32_t)TERM_STDIN_BYTES;
+    }
+    dbg64_irq_restore64(if_save);
+    return (int)n;                                        // 0 = 通道在、暂无按键（调用方等）
+}
+
+// 前台 r3 是否还活着（term_tick 每帧问一次；退出即解绑，把键盘还给内核 shell）
+static bool r3_front_alive64(const TerminalState* ts) {
+    if (!ts || ts->r3_pid <= 0) return false;
+    for (int i = 0; i < PROC64_MAX; i++) {
+        Proc64Info in;
+        if (proc64_info64(i, &in) == 0) continue;
+        if ((int)in.pid == ts->r3_pid) return (int)in.state != (int)PROC64_EXITED;
+    }
+    return false;
+}
+
 static bool sh64_owns64(TerminalState* ts) {
     return (g_sh_inst64 != 0 && ts && ts->used && ts->inst == g_sh_inst64 && g_sh_pid64 > 0);
 }
@@ -5381,6 +5516,31 @@ static void term_key(Window* w, char c) {
     //   （[SH64] exit pid=26 + [APP] term closed）。
     //   真终端语义：ESC(0x1B) 是给前台程序的普通字节。只有**非 shell 会话**的终端
     //   才保持"Esc 关闭本窗口"（与计算器/扫雷/设置一致，sysstate64_test 依赖）。
+    // ★★ v0.11.0：本终端有**前台 ring3**（micropython 这类交互程序）-> 按键全部进 stdin 环。
+    //   为什么排在最前面（在 ESC 关窗之前）：对交互式程序来说 0x1B(ESC) 是**普通字节**
+    //   （REPL 里用来取消当前行），绝不能顺手把窗口关掉。
+    //   为什么内核不回显：前台程序（MicroPython REPL）自己回显；两边都回显会变成双字符。
+    if (ts->r3_pid > 0) {
+        if ((unsigned char)c == 0x03) { (void)sig64_tty_int64(); return; }   // Ctrl+C 仍是打断
+        if (c == '\r') c = '\n';
+        // ★ Ctrl+C（0x03）已在上面单独处理；其余控制字符**必须放行**：
+        //   Ctrl-D(0x04) 是交互程序的 EOF / REPL 退出键，Ctrl-L/Ctrl-A 是刷新/行首。
+        //   第一版只放行 `>=0x20 || \n || \b || 0x7F`，实测症状是"按 Ctrl-D 终端纹丝不动、
+        //   MicroPython 永远退不出来"—— 过滤掉一个字节就能让交互程序变成不可退出。
+        if ((unsigned char)c != 0x03) {
+            const uint32_t nw = (ts->sin_w + 1u) % (uint32_t)TERM_STDIN_BYTES;
+            if (nw != ts->sin_r) { ts->sinb[ts->sin_w] = c; ts->sin_w = nw; }
+            else {
+                dbg64_line_begin64();
+                dbg64_str("[TERM] stdin ring full pid=");
+                dbg64_dec((uint64_t)(uint32_t)ts->r3_pid);
+                dbg64_str(" (key dropped)");
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+        }
+        return;
+    }
     if (c == 0x1B) {
         if (sh64_owns64(ts)) { sh64_in64(0x1B); return; }
         term_release_state(w);             // 先接管状态（避免外壳释放 / 本文件释放撞车）
@@ -5433,6 +5593,18 @@ static void term_tick(Window* w) {
     {
         TerminalState* ts = ts_of(w);
         if (sh64_owns64(ts)) sh64_poll64(ts);
+        // ★★ v0.11.0：前台 ring3 已退出 -> 解绑，键盘还给内核 shell，并把提示符补回来
+        if (ts && ts->used && ts->r3_pid > 0 && !r3_front_alive64(ts)) {
+            dbg64_line_begin64();
+            dbg64_str("[TERM] ring3 front exit pid=");
+            dbg64_dec((uint64_t)(uint32_t)ts->r3_pid);
+            dbg64_nl();
+            dbg64_line_end64();
+            ts->r3_pid = 0;
+            ts->sin_r = ts->sin_w = 0;
+            if (g_r3_ts64 == ts) g_r3_ts64 = nullptr;
+            shell_prompt(ts);
+        }
     }
     // 2) 外壳一步到位销毁的实例（没给 closing 机会）：只摘除引用，不冒险释放
     ts_prune();
@@ -5464,6 +5636,9 @@ static TerminalState* ts_new(Window* win) {
     ts->sb_off = 0;
     ts->attr = 0;
     ts->esc = 0;
+    ts->r3_pid = 0;
+    ts->sin_r = 0;
+    ts->sin_w = 0;
     ts->sgr = 0;
     ts->cols = 0;
     ts->rows = 0;

@@ -726,6 +726,8 @@ static Pipe64* fd64_pipe_alloc64() {
 // 有界：单次等待 <= FD64_PIPE_WAIT_MS；超时后读 -EAGAIN、写返回已写字节（>0）或 -EAGAIN。
 // 可被打断：每一轮醒来重新检查管道条件 —— 写端全关（读 -> 0）、读端全关（写 -> -EPIPE）立即退出。
 extern "C" void task_sleep_ms64(uint32_t ms) __attribute__((weak));
+// ★★ v0.11.0：终端前台 ring3 的 stdin 环（kernel/terminal64.cpp 提供；安装介质内核没有 -> 0）
+extern "C" int term64_stdin_read64(char* buf, uint32_t len) __attribute__((weak));
 int proc64_current_pid64() __attribute__((weak));      // 等待打点里的 pid（proc64.h 里是 C++ 链接名）
 static void fd64_pipe_wait_log64(int fd, const char* why, uint64_t ticks, const Pipe64* p) {
     int pid = 0;
@@ -886,7 +888,28 @@ int fd64_read64(int fd, void* buf, int len) {
     if (!of) return -FD64_EBADF;
     if (of->kind == FD64_KIND_DIR) return -FD64_EISDIR;
     if (of->kind == FD64_KIND_PIPE_W) return -FD64_EBADF;       // 写端不能读
-    if (of->kind == FD64_KIND_TTY) return 0;                    // ★ A4-2a：控制台 tty 没有输入流（如实 EOF）
+    // ★★ v0.11.0：控制台 tty 的 read 现在**有真实语义** —— 从"终端前台 ring3"的 stdin 环取字节。
+    //   为什么必须改（旧行为是无条件 `return 0;` = 永远 EOF）：任何 ring3 交互程序（micropython）
+    //   第一次读 fd 0 就拿到 EOF 直接退出，`>>>` 一个字符都出不来。
+    //   三态返回值（term64_stdin_read64）：
+    //     >0 读到的字节数；0 = 通道在但暂无按键（这里让出 CPU 等）；-1 = 本终端没有前台 r3
+    //     -> 退回**旧语义 EOF**（绝不假装有输入：`cat` 这类程序必须立刻看到 EOF）。
+    //   弱引用：安装介质内核不链 terminal64.cpp -> 符号为 0 -> 保持 EOF。
+    if (of->kind == FD64_KIND_TTY) {
+        if (!buf || len < 0) return -FD64_EFAULT;
+        if (len == 0) return 0;
+        for (;;) {
+            const int got = term64_stdin_read64
+                            ? term64_stdin_read64((char*)buf, (uint32_t)(len > 512 ? 512 : len))
+                            : -1;
+            if (got > 0) return got;
+            if (got < 0) return 0;                              // 无前台 r3：EOF（如实）
+            if (of->flags & FD64_O_NONBLOCK) return -FD64_EAGAIN;
+            // 有通道但暂无按键：让出 CPU 等（task_sleep_ms64 是 weak 引用，安装介质内核为 0）
+            if (!task_sleep_ms64) return -FD64_EAGAIN;
+            task_sleep_ms64(20);
+        }
+    }
     // ★ v0.9.12：DRM 只走 ioctl（没有任何 read 语义）；evdev 的 read 出 struct input_event。
     //   两者都在这里分派，**不改**文件/pipe/tty 的既有分支。
     if (of->kind == FD64_KIND_DRM) {

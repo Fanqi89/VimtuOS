@@ -241,13 +241,18 @@ int strncmp_64(const char* s1, const char* s2, uint64_t n);
 //   内核堆   = [112MB, 160MB)  固定 48MB —— ★ v0.9.31 起这是**下限**：运行期取
 //              max(112MB, ALIGN_UP(__bss_end))，内核长得再大也不会被自己的堆覆盖
 //              （载荷窗口 [64MB,96MB) 与 UEFI 引导器 96MB 都在下限之下）
-//   物理页池 = [堆顶, mem_high)  bitmap 在 .bss，不占页池（512MB 机上约 160MB 起）
+//   物理页池 = [堆顶, min(E820 上界, 4GiB 恒等映射边界)) 里**E820 usable** 的页；
+//              bitmap 在 .bss（v0.11.0 起 256KiB），不占页池（512MB 机上约 160MB 起）
 void heap_self_init64();                    // 由 mem_init_64 内部调用；也可单独重置堆
 
 // 真实内存规模（系统监视器/任务管理器显示用，与 mem_info_64 的"页池"语义区分开）
-uint64_t mem_total_ram_64();                // E820 认定的可用内存上界
-uint64_t mem_pool_base_64();
-uint64_t mem_pool_end_64();
+// ★ v0.11.0 口径变更：从"页池上界地址"改成 **E820 usable 总量**（>=1MB 段求和）。
+//   旧口径在 4GB 机器上错两次：位图封顶 2GiB（报 2.16GB）、3GB 处 1GiB PCI 空洞（上界地址≠可用量）。
+//   新口径与启动日志 `[LM64] E820 usable_above_1M_kb=` 完全同口径，可直接对账。
+uint64_t mem_total_ram_64();                // E820 usable 总量（不是地址上界）
+uint64_t mem_pool_base_64();                // 页池物理起点
+uint64_t mem_pool_end_64();                 // 页池物理上界
+uint64_t mem_pool_span_pages_64();          // 页池**地址跨度**页数（含 PCI 空洞等不可用页）
 
 // 启动期自检：分配/释放/重分配/对齐/归属记账/合并/坏指针防护。返回 0 = 全通过
 // （返回的位图掩码指出失败项，便于定位；启动日志打印 "[MEM64] selftest PASS"）

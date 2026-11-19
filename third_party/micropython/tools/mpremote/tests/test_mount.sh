@@ -1,0 +1,54 @@
+#!/bin/bash
+set -e
+
+TEST_DIR=$(dirname $0)
+
+# Create a local directory structure and mount the parent directory on the device.
+echo -----
+mkdir -p "${TMP}/mount_package"
+mkdir -p "${TMP}/mount_package/subpackage"
+cat << EOF > "${TMP}/mount_package/__init__.py"
+from .x import x
+from .subpackage import y
+EOF
+cat << EOF > "${TMP}/mount_package/x.py"
+def x():
+  print("x")
+EOF
+cat << EOF > "${TMP}/mount_package/subpackage/__init__.py"
+from .y import y
+EOF
+cat << EOF > "${TMP}/mount_package/subpackage/y.py"
+def y():
+  print("y")
+EOF
+
+output=$($MPREMOTE soft-reset mount ${TMP} eval "'mounted successfully'" 2>&1) || true
+if [[ "$output" == *"MemoryError"* ]]; then
+    echo "SKIP ('MemoryError' insufficient memory)"
+    exit 0
+fi
+
+$MPREMOTE soft-reset mount ${TMP} exec "import mount_package; mount_package.x(); mount_package.y()"
+
+# Write to a file on the device and see that it's written locally.
+echo -----
+$MPREMOTE mount ${TMP} exec "open('test.txt', 'w').write('hello world\n')"
+cat "${TMP}/test.txt"
+
+# Test RemoteFile.readline and RemoteFile.readlines methods.
+echo -----
+$MPREMOTE mount ${TMP} exec "print(open('test.txt').readlines())"
+
+echo -----
+# Test write() with array returns byte count, not item count.
+# See https://github.com/micropython/micropython/issues/17665
+$MPREMOTE mount ${TMP} run "${TEST_DIR}/_test_mount_write_array.py"
+
+# Test readinto() with array returns byte count and fills correctly.
+echo -----
+$MPREMOTE mount ${TMP} run "${TEST_DIR}/_test_mount_readinto_array.py"
+
+# Test seek() and tell() on a remote file.
+echo -----
+$MPREMOTE mount ${TMP} exec "f = open('test.txt', 'rb'); print(f.tell(), f.seek(4), f.tell(), f.seek(0, 2), f.tell(), f.seek(8), f.tell(), f.seek(-2, 1), f.tell())"

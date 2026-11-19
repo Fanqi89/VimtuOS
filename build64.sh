@@ -85,7 +85,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.10.10"   # ★ v0.10.10：安装向导新增【用户与时区】页（用户名/密码/时区下拉，中英文联动，默认 China Asia/Shanghai）+ 收尾写目标盘 /etc/user.conf（加盐 SHA-256）+ 登录/时钟读它（空密码直接进桌面、时区生效）
+VIMTUOS_VERSION="0.11.0"   # ★ v0.11.0：内存扩容 —— 页位图 64KiB->256KiB（页池上限 2GiB->8GiB 跨度）、页池按 E820 usable 段填充（跳过 3GB 处 1GiB PCI 空洞）、总内存口径改为 E820 usable 求和（4GB 机器报 4094MiB 而不是 2.16GB）+ 自检新增"池顶页读写 + >2GiB 地址"硬判据
 #   沿用自 v0.10.2 的启动加固（仅作说明）：真机加固（UEFI 载荷按真实大小读 + 屏幕报错 + MMIO BAR>=4GiB 闸门） + 桌面帧预算（热路径打点预算 + 2 MiB 大页映射 / shm 与帧缓冲 + 60 Hz 帧节拍）
 #   根因：同一块盘上的两条命令会重叠（命令列表 slot0 / 命令表 / DMA 暂存页池 g_dma[16] 全驱动共享），
 #   后果是**静默坏读**（ELF 魔数坏读、VFS BAD block、/etc/r3drv.conf 读错）与端口互相重启，
@@ -519,6 +519,18 @@ echo "==> ★ A4-4c：用户态 gzip/gunzip（**交付 = 系统卷里的 /bin/gz
 # tools/gzip_build_win.sh：自足（不引 user/lib / musl）的 < 64 KiB 静态 ELF64 —— 直接走内核的
 # 主程序装载器（`run /bin/gzip ...`），deflate = fixed-Huffman + stored，inflate = 完整实现。
 bash tools/gzip_build_win.sh "$BUILD"
+
+# ★★ v0.11.0：MicroPython（交付 = 系统卷 /bin/mp + /lib/micropython.bin，内核映像里一个字节都不加）
+#   1) tools/micropython_build_win.sh 手写构建（不走 upstream Makefile：qstr/genhdr 自己串，
+#      **不用 mpy-cross**；静态非 PIC、按 4GiB+0x90000 定址、链我们自己的 musl libc.a）：
+#        build64/micropython.bin —— 真解释器（静态 ELF64，267,904 B），由驱动 mmap 后 jmp 进去；
+#        build64/mp              —— 装载驱动（< 64 KiB，17,112 B），走内核主程序装载器
+#                                   （与 /bin/lua 同构：内核只装"主程序"，PT_LOAD 必须在用户窗口低 64 KiB）。
+#   2) 构建期硬断言：两个 ELF 的段/入口/装载窗口逐条检查（tools/micropython_check_elf.py），
+#      不过就 set -e 直接中断 —— 绝不让一个装不进窗口的映像进卷。
+#   3) 交付只落 build64/，由 tools/micropython_pack_win.py 写进系统卷（逐字节回读自检）。
+echo "==> ★ v0.11.0：MicroPython（/bin/mp 驱动 + /lib/micropython.bin 解释器）"
+bash tools/micropython_build_win.sh "$BUILD"
 # ★ v0.9.43（W0）：**用户态 PE 只读体检器 /bin/peinfo**（交付 = 系统卷里的文件，不进内核镜像）。
 #   它是 W1/W2/W3 的前置：在写任何一个 Win32 API 之前，先用它把真实 exe 的**导入表**读出来，
 #   否则就是照猜写一遍、再发现清单不对。产物只落 build64/peinfo（静态 ELF64，< 64 KiB）。
@@ -1136,6 +1148,14 @@ echo "==> ★ A4-1：带 /bin/shell.bin 的演示盘 + \"内核里没有 shell �
       --drv "$BUILD/lua" --bin "$BUILD/lua.bin" --demo-dir user/lua/demo --probe "$BUILD/a44probe"
 "$PY" tools/gzip_pack_win.py --vol-in "$BUILD/luavol.img" --vol-out "$BUILD/sysvol.img" \
       --gzip "$BUILD/gzip" --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+# ★★ v0.11.0：MicroPython（/bin/mp 驱动 + /lib/micropython.bin 解释器，逐字节回读自检）
+#   为什么接在 sysvol.img 之后：lua/tcc/gzip 已经在那块卷里，MicroPython 只是再"加两个文件"，
+#   与 tcc/lua/gzip 的链式写法完全一致。内核命令 `micropython`/`python`/`mp` 只认
+#   proc64_start_elf64("/bin/mp")，不关心它是第几步装进卷的。
+#   ★ 原地更新（--vol-in == --vol-out）是安全的：packer 先把整卷读进内存、自检通过后才落盘。
+#     这样下游 edit_pack_win.py 仍然读 sysvol.img，一个字都不用改。
+"$PY" tools/micropython_pack_win.py --vol-in "$BUILD/sysvol.img" --vol-out "$BUILD/sysvol.img" \
+      --drv "$BUILD/mp" --bin "$BUILD/micropython.bin"
 # ★ A4-5：**第四步**——把 Ring 3 编辑器装进同一块卷（/bin/edit + 验收夹具 + 1 MiB 大文件），
 #   并用编辑后的卷重拼演示盘（sysdisk.img 覆盖为含 /bin/edit 的那份；这一步之前的产物一个字节不动）。
 bash user/apps/edit/build_edit.sh "$BUILD"

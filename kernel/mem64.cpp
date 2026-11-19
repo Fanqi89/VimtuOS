@@ -50,11 +50,26 @@ static inline void irq_restore64(uint64_t if_bit) {
 
 // ==================== 布局常量与运行期布局 ====================
 #define MEM64_PAGE        4096ull
-// bitmap 放 .bss：64KB 覆盖 64K*8 = 524288 页 = 2GB 页池上限。
-// 512MB 的虚拟机实测只用 12KB，留足余量且永不与任何区域重叠。
-#define MEM64_BITMAP_BYTES (64u * 1024u)
-// ★ 页池上界 = 下限 + bitmap 能记的最大页数（2GB）
+// ★★ v0.11.0 内存扩容：bitmap 64 KiB -> **256 KiB**。
+//   旧值 64KiB 只能记 64K*8 = 524,288 页 = 2 GiB 页池，于是 e820_mem_high64() 里的
+//   `if (highest > MEM64_POOL_MAX) highest = MEM64_POOL_MAX;` 把 4GB 机器的 E820 上界
+//   夹到 2.16 GiB —— "分配了 4GB、系统只认 2GB"的根因就是这两行。
+//   （实测 -m 4096：`[LM64] E820 usable_above_1M_kb=4193152`（4.0 GiB）而
+//     `[MEM64] pool=[0x0A000000,0x8A000000) pages=524288`（2.0 GiB）。）
+//   256 KiB 覆盖 2,097,152 页 = 8 GiB 地址跨度（4GB/8GB 机器都够）。
+//   位图仍在 .bss（+192 KiB）：__bss_end 约 50.9 MB，离 64 MiB 载荷窗口还有 13 MB 余量，
+//   build64.sh 的 nm 闸门（__bss_end < 0x04000000）仍然成立 —— 再放大必须重核那条断言。
+#define MEM64_BITMAP_BYTES (256u * 1024u)
+// 位图能覆盖的最大地址跨度 = 下限 + 位图位数 * 4KiB（**不再是**"机器内存上限"，见下一条）
 #define MEM64_POOL_MAX     ((uint64_t)ML64_POOL_PHYS_FLOOR + (uint64_t)MEM64_BITMAP_BYTES * 8ull * MEM64_PAGE)
+// ★★ 直映硬边界：内核靠 **0..4GB 恒等映射**直接访问物理地址
+//   （boot/loader64.asm 的 lm64_build_paging 建 PML4[0] -> PDPT 4 项 -> 4 张 PD，
+//    每项 2MiB 大页；UEFI 路径沿用固件自己的映射）。
+//   4GB 机器的 E820 第二段可用区在 **4GB 以上**（above-4G remap，实测
+//   `E820[6] base=0x100000000 len=0x40000000 type=1`），内核**没有那段映射**，
+//   把它划进页池等于第一次触碰就 #PF。所以页池上界必须再被这一条夹一次，
+//   把"可用但内核够不着"的部分单独记账、如实打进串口，而不是假装用上了。
+#define MEM64_DIRECT_MAP_BYTES ((uint64_t)ML64_IDENTITY_BYTES)   // 0x1_0000_0000 = 4 GiB
 
 // ★★ 运行期布局（v0.9.31）：堆起点跟着内核结束地址走，页池跟着堆顶走。
 //   在 mem_init_64() 里一次性算好，之后所有地方（含自检）只读这两个全局量。
@@ -64,10 +79,14 @@ static inline uint64_t align_up64(uint64_t v, uint64_t a) { return (v + a - 1ull
 
 static uint8_t  g_page_bitmap[MEM64_BITMAP_BYTES];
 static uint64_t g_pool_base   = ML64_POOL_PHYS_FLOOR;   // 运行期由 mem64_layout64() 重算
-static uint64_t g_pool_end    = 0;      // 由 E820 决定
-static uint64_t g_page_total  = 0;
+static uint64_t g_pool_end    = 0;      // 由 E820 决定（再被位图跨度与直映边界夹住）
+static uint64_t g_page_span   = 0;      // ★ v0.11.0：池**跨度**页数（含 PCI 空洞等不可用页）
+static uint64_t g_page_total  = 0;      // ★ v0.11.0：真可用页数（= E820 usable 段落在池内的部分）
 static uint64_t g_page_free   = 0;
 static uint64_t g_pool_rover  = 0;      // 分配游标（避免每次都从 0 扫）
+// ★ v0.11.0：总内存的两个新口径（旧口径"页池上界地址"在有空洞的机器上是错的）
+static uint64_t g_ram_usable   = 0;     // E820 usable 总量（>=1MB 段），与 dump_e820 同口径
+static uint64_t g_ram_above4g  = 0;     // 其中 4GB 以上（可用但无直映，不进页池）
 
 // ==================== 物理页池 ====================
 static inline void bitmap_set64(uint64_t idx, bool used) {
@@ -94,8 +113,54 @@ static uint64_t e820_mem_high64(const BootInfo* bi) {
         }
     }
     if (highest == 0) highest = 0x10000000ull;      // 保底：按 256MB 算
-    if (highest > MEM64_POOL_MAX) highest = MEM64_POOL_MAX;
+    if (highest > MEM64_POOL_MAX)        highest = MEM64_POOL_MAX;         // ① 位图跨度够不够
+    if (highest > MEM64_DIRECT_MAP_BYTES) highest = MEM64_DIRECT_MAP_BYTES; // ② 恒等映射够不够
     return highest;
+}
+
+
+// ★★ v0.11.0：按 E820 **usable 段**收集区间，并给出两个统计口径。
+//   为什么必须按段（而不是像旧实现那样把 [pool_base, high) 当成一整段连续 RAM）：
+//     4GB 机器的 E820 是 `[1MiB, 3.0GiB) usable` + `[3.0GiB, 4GiB) PCI 空洞(MMIO)` +
+//     `[4GiB, 5GiB) usable`。中间那 1 GiB 是**设备地址空间**，当成 RAM 分配出去就是
+//     写设备寄存器 / 写坏数据。旧实现因为页池被封顶在 2.16 GiB，恰好没跨到空洞，
+//     所以这个缺陷一直没暴露 —— 放开上限的同一次改动必须把它一起修掉。
+//   total_bytes ：E820 usable 总量（只算 1MB 以上，与 kernel64.cpp dump_e820() 的
+//                 `usable_above_1M_kb` 完全同口径，便于两边对账）。
+//   above4g     ：其中落在直映边界以上的部分（可用、但内核够不着）。
+struct Mem64Range64 { uint64_t base; uint64_t end; };
+
+static uint32_t e820_usable_ranges64(const BootInfo* bi, Mem64Range64* out, uint32_t max_n,
+                                     uint64_t* total_bytes, uint64_t* above4g_bytes) {
+    uint64_t total = 0, above = 0;
+    uint32_t cnt = 0;
+    if (bi && bi->magic == BOOT_INFO_MAGIC && bi->mem_map_addr) {
+        const E820Entry* e = (const E820Entry*)(uintptr_t)bi->mem_map_addr;
+        const uint32_t n = (bi->mem_entries < 64) ? bi->mem_entries : 64;
+        for (uint32_t i = 0; i < n; i++) {
+            if (e[i].type != 1) continue;
+            uint64_t b = ((uint64_t)e[i].base_high << 32) | e[i].base_low;
+            const uint64_t len = ((uint64_t)e[i].len_high << 32) | e[i].len_low;
+            if (len == 0) continue;
+            uint64_t top = b + len;
+            if (b < 0x100000ull) b = 0x100000ull;      // 低端 640KB 归引导链/BIOS，不算
+            if (top <= b) continue;
+            total += (top - b);
+            if (top > MEM64_DIRECT_MAP_BYTES) {
+                const uint64_t lo = (b > MEM64_DIRECT_MAP_BYTES) ? b : MEM64_DIRECT_MAP_BYTES;
+                if (top > lo) above += (top - lo);
+            }
+            if (out && cnt < max_n) {
+                // 只收"能交给页池"的那一段，且夹在直映边界之内
+                const uint64_t rb = b;
+                const uint64_t rt = (top < MEM64_DIRECT_MAP_BYTES) ? top : MEM64_DIRECT_MAP_BYTES;
+                if (rt > rb) { out[cnt].base = rb; out[cnt].end = rt; cnt++; }
+            }
+        }
+    }
+    if (total_bytes) *total_bytes = total;
+    if (above4g_bytes) *above4g_bytes = above;
+    return cnt;
 }
 
 // 计算运行期堆/页池布局（★ 与 memlayout64.h 的四段边界一起读）
@@ -160,13 +225,44 @@ void mem_init_64(const BootInfo* bi) {
         return;
     }
 
-    g_pool_end  = high;
-    g_page_total = (g_pool_end - g_pool_base) / MEM64_PAGE;
-    if (g_page_total > (uint64_t)MEM64_BITMAP_BYTES * 8ull)
-        g_page_total = (uint64_t)MEM64_BITMAP_BYTES * 8ull;
+    g_pool_end = high;
+    // ★★ 页池 = [pool_base, pool_end) 里**真正 usable** 的那些页。
+    //   旧实现 `g_page_total = (g_pool_end - g_pool_base) / MEM64_PAGE` 把整段当连续 RAM，
+    //   在 3GB 处有 PCI 空洞的机器上会把空洞页也算成"可用"——缺位图扩容时它恰好没跨到
+    //   空洞，所以一直没出事；放开上限的同一版必须把它改成按段填充：
+    //   先把整个跨度标成**已用**，再只把 E820 usable 段内的页清成空闲。
+    const uint64_t span_pages = (g_pool_end - g_pool_base) / MEM64_PAGE;
+    g_page_span  = span_pages;
+    g_page_total = 0;
+    for (uint64_t i = 0; i < MEM64_BITMAP_BYTES; i++) g_page_bitmap[i] = 0xFF;
 
-    for (uint64_t i = 0; i < MEM64_BITMAP_BYTES; i++) g_page_bitmap[i] = 0;
-    g_page_free = g_page_total;   // bitmap 在 .bss，不占页池，所以全部页一开始都空闲
+    Mem64Range64 ranges[16];
+    const uint32_t nr = e820_usable_ranges64(bi, ranges, 16, &g_ram_usable, &g_ram_above4g);
+    if (nr == 0) {
+        // E820 缺失（引导层没给内存图）：退回旧行为把整段当 RAM，但必须大声说清楚，
+        // 因为这种机器上页池可能包含 MMIO 空洞 —— 宁可日志刺眼，也不要静默野写。
+        dbg64_str("[MEM64] WARN E820 missing -> pool assumed contiguous");
+        dbg64_nl();
+        for (uint64_t i = 0; i < span_pages; i++) { bitmap_set64(i, false); g_page_total++; }
+        g_ram_usable  = g_pool_end;
+        g_ram_above4g = 0;
+    } else {
+        for (uint32_t r = 0; r < nr; r++) {
+            uint64_t lo = ranges[r].base;
+            uint64_t hi = ranges[r].end;
+            if (lo < g_pool_base) lo = g_pool_base;
+            if (hi > g_pool_end)  hi = g_pool_end;
+            lo = (lo + MEM64_PAGE - 1ull) & ~(MEM64_PAGE - 1ull);   // 页对齐（向上取）
+            hi = hi & ~(MEM64_PAGE - 1ull);                          // 页对齐（向下取）
+            if (hi <= lo) continue;
+            const uint64_t i0 = (lo - g_pool_base) / MEM64_PAGE;
+            const uint64_t i1 = (hi - g_pool_base) / MEM64_PAGE;
+            for (uint64_t i = i0; i < i1 && i < span_pages; i++) {
+                if (bitmap_get64(i)) { bitmap_set64(i, false); g_page_total++; }
+            }
+        }
+    }
+    g_page_free  = g_page_total;   // bitmap 在 .bss，不占页池，所以可用页一开始全空闲
     g_pool_rover = 0;
 
     // 堆：[g_heap_base, g_heap_limit) 一次性交给空闲链表
@@ -178,6 +274,8 @@ void mem_init_64(const BootInfo* bi) {
     dbg64_hex64(g_pool_end);
     dbg64_str(") pages=");
     dbg64_dec(g_page_total);
+    dbg64_str("/");
+    dbg64_dec(g_page_span);                 // 跨度（含 PCI 空洞等不可用页）
     dbg64_str(" free=");
     dbg64_dec(g_page_free);
     dbg64_str(" heap=[");
@@ -186,17 +284,34 @@ void mem_init_64(const BootInfo* bi) {
     dbg64_hex64(g_heap_limit);
     dbg64_str(")");
     dbg64_nl();
+    // ★ v0.11.0 用户明确要求"串口打印出总内存大小"：这里给三个口径，互相对得上账 ——
+    //   ram total = E820 usable 总量（"这台机器到底有多少内存"，已验证与 dump_e820 一致）
+    //   above4g   = 其中 4GB 以上的部分（可用，但内核没有直映，不进页池）
+    //   pool      = 真正交给页分配器的容量（= 直映内的 usable 页）
+    dbg64_str("[MEM64] ram total=");
+    dbg64_dec(g_ram_usable / (1024ull * 1024ull));
+    dbg64_str("MiB (=E820 usable, hole excluded)");
+    dbg64_str("MiB above4g=");
+    dbg64_dec(g_ram_above4g / (1024ull * 1024ull));
+    dbg64_str("MiB pool=");
+    dbg64_dec((g_page_total * MEM64_PAGE) / (1024ull * 1024ull));
+    dbg64_str("MiB direct_limit=");
+    dbg64_dec(MEM64_DIRECT_MAP_BYTES / (1024ull * 1024ull));
+    dbg64_str("MiB");
+    dbg64_nl();
 }
 
 void* page_alloc_64() {
-    if (g_page_total == 0) return nullptr;
+    if (g_page_total == 0 || g_page_span == 0) return nullptr;
     const uint64_t _if = irq_save64();
-    for (uint64_t n = 0; n < g_page_total; n++) {
-        const uint64_t idx = (g_pool_rover + n) % g_page_total;
+    // ★ v0.11.0：扫描范围是**跨度**（g_page_span）而不是可用页数 —— 位图按地址索引，
+    //   空洞页被标成占用，所以扫跨度才能覆盖到空洞之后的那部分可用页。
+    for (uint64_t n = 0; n < g_page_span; n++) {
+        const uint64_t idx = (g_pool_rover + n) % g_page_span;
         if (!bitmap_get64(idx)) {
             bitmap_set64(idx, true);
             g_page_free--;
-            g_pool_rover = (idx + 1) % g_page_total;
+            g_pool_rover = (idx + 1) % g_page_span;
             irq_restore64(_if);
             return (void*)(uintptr_t)(g_pool_base + idx * MEM64_PAGE);
         }
@@ -223,11 +338,12 @@ void page_free_64(void* p) {
 //   所以这里专门按对齐扫描位图，而不是拿 page_alloc_64 拼。
 void* page_alloc_2mb_64() {
     const uint64_t PAGES = 0x200000ull / MEM64_PAGE;              // 512
-    if (g_page_total < PAGES) return nullptr;
+    // ★ v0.11.0：跨度与可用页数都要够（空洞页在位图里是占用态，扫到会自然跳过）
+    if (g_page_total < PAGES || g_page_span < PAGES) return nullptr;
     const uint64_t _if = irq_save64();
     const uint64_t pad_bytes = (0x200000ull - (g_pool_base & 0x1FFFFFull)) & 0x1FFFFFull;
     const uint64_t idx0 = pad_bytes / MEM64_PAGE;                  // 池内第一个 2 MiB 对齐页
-    for (uint64_t idx = idx0; idx + PAGES <= g_page_total; idx += PAGES) {
+    for (uint64_t idx = idx0; idx + PAGES <= g_page_span; idx += PAGES) {
         uint64_t k = 0;
         while (k < PAGES && !bitmap_get64(idx + k)) k++;
         if (k == PAGES) {
@@ -249,6 +365,26 @@ void page_free_2mb_64(void* base) {
     for (uint64_t j = 0; j < PAGES; j++)
         page_free_64((void*)(uintptr_t)(addr + j * MEM64_PAGE));
 }
+
+// ★ v0.11.0：取**地址最高**的一个空闲页。只给 mem_selftest 用。
+//   它的意义不是"能分配"，而是"能分配出 2 GiB 以上的**真实**物理页"：
+//   旧版页池被封顶在 2.16 GiB，池顶永远取不到 > 2 GiB 的页 ——
+//   "分配成功"和"用上了物理内存的高半区"根本是两件事，别拿前者冒充后者。
+static void* page_alloc_highest64() {
+    if (g_page_total == 0 || g_page_span == 0) return nullptr;
+    const uint64_t _if = irq_save64();
+    for (uint64_t i = g_page_span; i-- > 0; ) {
+        if (!bitmap_get64(i)) {
+            bitmap_set64(i, true);
+            g_page_free--;
+            irq_restore64(_if);
+            return (void*)(uintptr_t)(g_pool_base + i * MEM64_PAGE);
+        }
+    }
+    irq_restore64(_if);
+    return nullptr;
+}
+
 
 uint64_t page_count_total_64() { return g_page_total; }
 uint64_t page_count_free_64()  { return g_page_free; }
@@ -469,14 +605,25 @@ void heap_audit_64(const char* tag) {
 }
 
 void mem_info_64(uint64_t* total_kb, uint64_t* free_kb, uint64_t* heap_kb) {
-    if (total_kb) *total_kb = (g_pool_end > g_pool_base) ? (g_pool_end - g_pool_base) / 1024 : 0;
+    // ★ v0.11.0：total 从"池跨度"改成"可用页的字节和" —— 跨度里含 PCI 空洞，
+    //   拿跨度当容量会在 4GB 机器上虚报约 1 GiB（空洞那一段）。
+    if (total_kb) *total_kb = (g_page_total * MEM64_PAGE) / 1024;
     if (free_kb)  *free_kb  = (g_page_free * MEM64_PAGE) / 1024;
     if (heap_kb)  *heap_kb  = g_heap_total / 1024;
 }
 
-uint64_t mem_total_ram_64()  { return g_pool_end; }     // E820 认定的可用内存上界
+// ★★ v0.11.0：口径从"页池上界地址"改成 **E820 usable 总量**。
+//   旧口径（`return g_pool_end;`）有两个隐含前提，4GB 机器上两条都不成立：
+//     ① 页池没被位图封顶 —— 旧版封在 2.16 GiB，于是 4GB 被报成 2.16 GB（用户看到的就是
+//        "分配了 4GB 只认 2GB"）；
+//     ② 内存连续 —— 4GB 机器在 3GB 处有 1 GiB PCI 空洞，"上界地址"根本代表不了可用量。
+//   新口径 = 1MB 以上 E820 usable 段求和，与启动日志 dump_e820() 的
+//   `[LM64] E820 usable_above_1M_kb=` **完全同口径**，两边可以直接对账。
+uint64_t mem_total_ram_64()  { return g_ram_usable; }
 uint64_t mem_pool_base_64()  { return g_pool_base; }
 uint64_t mem_pool_end_64()   { return g_pool_end; }
+// 池跨度页数（含不可用页）/ 可用页数（page_count_total_64）：区分"地址跨度"与"真可用"
+uint64_t mem_pool_span_pages_64() { return g_page_span; }
 
 void mem_dump_64() {
     dbg64_str("[MEM64] free list:");
@@ -595,6 +742,40 @@ int mem_selftest_64() {
     g_kfree_quiet = false;
     if (g_kfree_rejected - rej0 != 2) fails |= 32768;   // 守卫必须恰好拦下 2 次
     if (g_heap_used > used_before + 64) fails |= 8192;
+
+
+    // 8) ★ v0.11.0 内存扩容的核心证据：页池**最高地址**的页必须真实可读写，
+    //    且在大内存机器上必须落在 2 GiB 以上。
+    //    旧版页池被封顶在 2.16 GiB（64 KiB 位图），4GB 机器上"分配一个页"永远只拿到
+    //    低 2 GiB 的页 —— 分配成功完全不能证明用满了物理内存。所以这里不查账面，查**地址**。
+    //    分档判据（512MB 机器行为完全不变）：
+    //      * 任何机器：池顶页读写往返一致、释放后账面归零；
+    //      * ram_usable >= 3 GiB：池顶页物理地址必须 > 0x80000000（2 GiB）。
+    {
+        void* hp = page_alloc_highest64();
+        if (!hp) {
+            fails |= 65536;                                   // 池顶取不到页 = 页池记账坏了
+        } else {
+            const uint64_t pa = (uint64_t)(uintptr_t)hp;
+            volatile uint64_t* w = (volatile uint64_t*)(uintptr_t)pa;
+            const uint64_t pat = 0xA5A5C0DE12345678ull;
+            w[0] = pat; w[511] = ~pat;
+            const bool rw_ok = (w[0] == pat) && (w[511] == ~pat);
+            page_free_64(hp);
+            if (!rw_ok) fails |= 131072;                      // 高地址页读写不通
+            const bool big = (g_ram_usable >= 3ull * 1024ull * 1024ull * 1024ull);
+            if (big && pa <= 0x80000000ull) fails |= 262144;   // 大机器上池顶必须 > 2 GiB
+            dbg64_str("[MEM64] selftest high_page pa=0x");
+            dbg64_hex64(pa);
+            dbg64_str(" rw=");
+            dbg64_str(rw_ok ? "1" : "0");
+            dbg64_str(" gt2g=");
+            dbg64_str(pa > 0x80000000ull ? "1" : "0");
+            dbg64_str(" req=");
+            dbg64_str(big ? "1" : "0");
+            dbg64_nl();
+        }
+    }
 
     dbg64_str("[MEM64] selftest ");
     dbg64_str(fails == 0 ? "PASS" : "FAIL");
