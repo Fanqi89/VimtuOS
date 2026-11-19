@@ -120,9 +120,13 @@
 #define C_EXP_MENU      rgb(255, 255, 255)
 #define C_EXP_MENU_HOV  rgb(229, 243, 255)
 // ★ 批次 J（文件操作）配色
-#define C_EXP_CTX_BG    rgb(255, 255, 255)     // 右键菜单底
-#define C_EXP_CTX_HOV   rgb(229, 243, 255)     // 菜单项 hover
-#define C_EXP_CTX_LINE  rgb(130, 130, 130)     // 菜单边框
+// ★★ v0.11.1：以下三个宏**已废弃**（不再用于任何绘制）。
+//   它们正是"资源管理器右键菜单不跟主题"的根源：直角白底 + 灰边 + 硬编码 hover 色。
+//   现在统一走 p2ui_popup64 + Theme64Tokens（同桌面右键菜单/开始菜单/停靠栏）。
+//   保留定义只为不动别处的历史引用；新代码**禁止**再用它们画菜单。
+#define C_EXP_CTX_BG    rgb(255, 255, 255)     // [DEPRECATED] 仅供历史引用
+#define C_EXP_CTX_HOV   rgb(229, 243, 255)     // [DEPRECATED] 仅供历史引用
+#define C_EXP_CTX_LINE  rgb(130, 130, 130)     // [DEPRECATED] 仅供历史引用
 #define C_EXP_DIS       rgb(160, 160, 160)     // 置灰（不可用按钮 / 不可用菜单项）
 #define C_EXP_BOX_IN    rgb(214, 232, 248)     // 框选填充（内核没有 alpha 混合 -> 用浅蓝近似"半透明"）
 #define C_EXP_BOX_LINE  rgb(0, 120, 215)       // 框选边框
@@ -139,7 +143,8 @@
 #define EXP_CTX_W      176
 #define EXP_CTX_ITEM_H 26
 #define EXP_CTX_ITEM_N 6                       // 条目标 6 项：打开/复制/剪切/重命名/删除/属性
-#define EXP_CTX_BLANK_N 4                      // 空白处 4 项：新建文件夹/粘贴/刷新/属性
+// ★★ v0.11.1：空白处 5 项（新增「新建文本文件」）：新建文件夹/新建文本文件/粘贴/刷新/属性
+#define EXP_CTX_BLANK_N 5
 // ★ 批次 J：剪贴板与复制上限（如实写清：内核内剪贴板、最多 8 个源、递归复制有界）
 #define EXP_CLIP_MAX   8
 #define EXP_COPY_DEPTH 4                       // 目录递归复制深度上限（含根）
@@ -256,7 +261,8 @@ static int  g_ctx_hover = -1;              // hover 的菜单项下标
 static int  g_ctx_n = 0;                    // 本菜单项数
 
 // 内联编辑（重命名 / 新建文件夹）
-enum { EXP_EDIT_NONE = 0, EXP_EDIT_RENAME, EXP_EDIT_MKDIR };
+// ★★ v0.11.1：EXP_EDIT_MKFILE = 新建**文本文件**（0 字节落盘，走 fs64_create64）
+enum { EXP_EDIT_NONE = 0, EXP_EDIT_RENAME, EXP_EDIT_MKDIR, EXP_EDIT_MKFILE };
 static int  g_edit_mode = EXP_EDIT_NONE;
 static int  g_edit_item = -1;              // 重命名：g_ents 下标
 static char g_edit_buf[VFS64_NAME_MAX + 1] = {0};
@@ -1754,8 +1760,11 @@ static void exp_edit_begin(int mode, int item) {   // 进入内联编辑（重�
     g_edit_mode = mode;
     exp_msg(mode == EXP_EDIT_RENAME ? gui64_tr("Type a new name, Enter = OK, Esc = cancel",
                                               "输入新名字，回车确认，Esc 取消")
-                                    : gui64_tr("Type a folder name, Enter = OK, Esc = cancel",
-                                              "输入文件夹名字，回车确认，Esc 取消"));
+                     : (mode == EXP_EDIT_MKFILE
+                        ? gui64_tr("Type a file name (e.g. note.txt), Enter = OK, Esc = cancel",
+                                   "输入文件名（例如 note.txt），回车确认，Esc 取消")
+                        : gui64_tr("Type a folder name, Enter = OK, Esc = cancel",
+                                   "输入文件夹名字，回车确认，Esc 取消")));
     if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
 }
 static void exp_edit_cancel() {
@@ -1798,10 +1807,25 @@ static void exp_edit_commit() {                    // 回车：按模式落到�
         }
         char full[VFS64_PATH_MAX];
         exp_build_path(full, (int)sizeof(full), g_path, uniq);
-        const int rc = fs64_mkdir64(vol, full);
-        exp_log_mkdir(full, rc == 0 ? 0 : 1);
-        exp_msg(rc == 0 ? gui64_tr("Folder created", "已新建文件夹")
-                        : gui64_tr("Cannot create folder", "无法新建文件夹"));
+        if (mode == EXP_EDIT_MKFILE) {
+            // ★★ v0.11.1：新建**文本文件** —— 真调 VimtuFS2 的 create（0 字节文件），
+            //   不是只改内存。打点与 mkdir 分开（[UI] explorer mkfile），验收可以据此断言"真落盘"。
+            const int rc = fs64_create64(vol, full);
+            dbg64_line_begin64();
+            dbg64_str("[UI] explorer mkfile path=");
+            dbg64_str(full);
+            dbg64_str(" rc=");
+            dbg64_dec((uint64_t)(uint32_t)rc);
+            dbg64_nl();
+            dbg64_line_end64();
+            exp_msg(rc == 0 ? gui64_tr("File created", "已新建文本文件")
+                            : gui64_tr("Cannot create file", "无法新建文件"));
+        } else {
+            const int rc = fs64_mkdir64(vol, full);
+            exp_log_mkdir(full, rc == 0 ? 0 : 1);
+            exp_msg(rc == 0 ? gui64_tr("Folder created", "已新建文件夹")
+                            : gui64_tr("Cannot create folder", "无法新建文件夹"));
+        }
     }
     exp_refresh_dir();
 }
@@ -1912,8 +1936,9 @@ static int exp_ctx_height() { return exp_ctx_count() * EXP_CTX_ITEM_H + 4; }
 static const char* exp_ctx_label(int k) {
     if (g_ctx_blank) {
         if (k == 0) return gui64_tr("New folder", "新建文件夹");
-        if (k == 1) return gui64_tr("Paste", "粘贴");
-        if (k == 2) return gui64_tr("Refresh", "刷新");
+        if (k == 1) return gui64_tr("New text file", "新建文本文件");
+        if (k == 2) return gui64_tr("Paste", "粘贴");
+        if (k == 3) return gui64_tr("Refresh", "刷新");
         return gui64_tr("Properties", "属性");
     }
     if (k == 0) return gui64_tr("Open", "打开");
@@ -1926,11 +1951,12 @@ static const char* exp_ctx_label(int k) {
 static bool exp_ctx_enabled(int k) {              // 与工具栏按钮同一套置灰规则
     if (g_ctx_blank) {
         if (g_ro) {                                  // ★ 只读卷：空白菜单只有"刷新/属性"可用
-            if (k == 1) return false;                // 粘贴
+            if (k == 2) return false;                // 粘贴
             if (k == 0) return false;                // 新建文件夹
+            if (k == 1) return false;                // 新建文本文件
             return true;
         }
-        if (k == 1) return g_clip_op != 0 && g_clip_n > 0;
+        if (k == 2) return g_clip_op != 0 && g_clip_n > 0;   // 粘贴
         return true;
     }
     if (g_ro) return (k == 1) && sel_count() > 0;    // ★ 只读卷：条目菜单里只有"复制"可用
@@ -1979,8 +2005,9 @@ static void exp_ctx_activate(int k) {              // 菜单项动作（k = 下�
     exp_ctx_close();
     if (blank) {
         if (k == 0) exp_edit_begin(EXP_EDIT_MKDIR, -1);
-        else if (k == 1) exp_paste();
-        else if (k == 2) { exp_refresh_dir(); exp_msg(gui64_tr("Refreshed", "已刷新")); }
+        else if (k == 1) exp_edit_begin(EXP_EDIT_MKFILE, -1);
+        else if (k == 2) exp_paste();
+        else if (k == 3) { exp_refresh_dir(); exp_msg(gui64_tr("Refreshed", "已刷新")); }
         else exp_props_show(-1);
         return;
     }
@@ -2825,30 +2852,49 @@ static void draw_status(void) {
 }
 static void draw_filemenu(void) {
     if (!g_menu_open) return;
-    const int x = 8, y = EXP_TOOLBAR_H;
+    // ★★ v0.11.1 统一 UI：旧版是 `frect` 直角白底 + `drect` 灰边 + 硬编码颜色 ——
+    //   与桌面右键菜单/开始菜单/停靠栏菜单**完全不是一套**（用户实测的"样式脱节"）。
+    //   现在走全系统同一个弹层组件：p2ui_popup64 = 亚克力 + 圆角（THEME64_POP_R_SMALL）
+    //   + 双层浅阴影 + 1px 高光边，颜色全部来自 Theme64Tokens（暗色主题自动跟随）。
+    //   几何一字不改（170x56 / 行高 26）：命中与既有验收坐标保持不变，只改"怎么画"。
+    const Theme64Tokens* t = theme64_tokens64();
+    const int x = 8, y = EXP_TOOLBAR_H, w = 170, h = 56;
     const char* items[2];
     items[0] = gui64_tr("Open Terminal", "打开终端");
     items[1] = gui64_tr("Close window", "关闭窗口");
-    frect(x, y, 170, 56, C_EXP_MENU);
-    drect(x, y, 170, 56, C_EXP_LINE);
+    p2ui_popup64(x, y, w, h, THEME64_POP_R_SMALL, THEME64_POP_R_SMALL,
+                 t, t->client_bg, t->dark ? THEME64_A_POP_DARK : THEME64_A_POP);
     for (int i = 0; i < 2; i++) {
         const int iy = y + 2 + i * 26;
-        if (g_hover_id == IDC_FILE + 10 + i) frect(x + 2, iy, 166, 24, C_EXP_MENU_HOV);
-        txt(x + 10, iy + 5, items[i], C_EXP_TEXT);
+        if (g_hover_id == IDC_FILE + 10 + i)
+            gfx64_fill_round64(x + 4, iy, w - 8, 24, THEME64_R_BUTTON, t->sel_bg, 110);
+        p2ui_text64(x + 12, iy + (24 - p2ui_line_h64()) / 2, items[i], t->text);
     }
 }
 // ==================== ★ 批次 J：右键菜单 / 内联编辑 / 属性面板 / 框选 的绘制 ====================
 static void draw_ctxmenu(void) {
     if (!g_ctx_open) return;
+    // ★★ v0.11.1 统一 UI：右键菜单是用户点名的那条"视觉毒瘤"。
+    //   旧版 `frect(255,255,255)` 直角白底 + `drect` 灰边，与桌面右键菜单（desktopops64.cpp
+    //   的 p2ui_popup64 + THEME64_POP_R=14）不是一套。现在统一：
+    //     * 底：p2ui_popup64（亚克力 + 圆角 + 双层阴影 + 1px 高光边）
+    //     * hover：gfx64_fill_round64(..., THEME64_R_BUTTON, t->sel_bg, 110) —— 与桌面菜单同一个圆角高亮
+    //     * 文字颜色：t->text / t->text_dim（不再硬编码 C_EXP_TEXT/C_EXP_DIS）
+    //   几何（EXP_CTX_W / EXP_CTX_ITEM_H / 偏移 2）保持不变 —— 命中测试与既有验收坐标不受影响。
+    const Theme64Tokens* t = theme64_tokens64();
     const int x = g_ctx_x, y = g_ctx_y, h = exp_ctx_height();
-    frect(x, y, EXP_CTX_W, h, C_EXP_CTX_BG);
-    drect(x, y, EXP_CTX_W, h, C_EXP_CTX_LINE);
+    p2ui_popup64(x, y, EXP_CTX_W, h, THEME64_POP_R_SMALL, THEME64_POP_R_SMALL,
+                 t, t->client_bg, t->dark ? THEME64_A_POP_DARK : THEME64_A_POP);
     for (int k = 0; k < exp_ctx_count(); k++) {
         const int iy = y + 2 + k * EXP_CTX_ITEM_H;
         const bool en = exp_ctx_enabled(k);
         if (en && g_hover_id == IDC_CTX_BASE + k)
-            frect(x + 2, iy, EXP_CTX_W - 4, EXP_CTX_ITEM_H - 2, C_EXP_CTX_HOV);
-        txt_clip(x + 10, iy + 5, exp_ctx_label(k), en ? C_EXP_TEXT : C_EXP_DIS, EXP_CTX_W - 16);
+            gfx64_fill_round64(x + 4, iy, EXP_CTX_W - 8, EXP_CTX_ITEM_H - 2,
+                               THEME64_R_BUTTON, t->sel_bg, 110);
+        const uint32_t fg = en ? t->text : t->text_dim;
+        txt_clip(x + 12, iy + 5, exp_ctx_label(k), fg, EXP_CTX_W - 20);
+        // 置灰项与桌面菜单一致地给一个小圆点标记（"做不到的项如实可见"）
+        if (!en) p2ui_fill_circle64(x + EXP_CTX_W - 12, iy + EXP_CTX_ITEM_H / 2, 2, fg, 160);
     }
 }
 // 内联编辑框（重命名：画在条目自己的名字行上；新建文件夹：画在"下一个空位"）
@@ -2866,24 +2912,26 @@ static void draw_edit(void) {
 static void draw_props(void) {
     if (!g_props_open) return;
     const int x = EXP_CONTENT_X + 20, y = EXP_CONTENT_Y + 18, w = 330, h = 132;
-    frect(x, y, w, h, C_EXP_PROPS_BG);
-    drect(x, y, w, h, C_EXP_CTX_LINE);
-    frect(x + 1, y + 1, w - 2, 18, rgb(240, 240, 240));
-    frect(x + 1, y + 19, w - 2, 1, C_EXP_SEP);
-    txt(x + 8, y + 6, gui64_tr("Properties", "属性"), rgb(0, 60, 120));
+    // ★★ v0.11.1 统一 UI：属性面板原来也是直角白底 + 硬编码 rgb(240,240,240)/rgb(0,60,120)。
+    //   现在与菜单同一套：圆角弹窗底 + 主题标题色 + 主题分隔线。
+    const Theme64Tokens* t = theme64_tokens64();
+    p2ui_popup64(x, y, w, h, THEME64_POP_R_SMALL, THEME64_POP_R_SMALL,
+                 t, t->client_bg, t->dark ? THEME64_A_POP_DARK : THEME64_A_POP);
+    p2ui_text64(x + 12, y + 6, gui64_tr("Properties", "属性"), t->accent);
+    frect(x + 8, y + 24, w - 16, 1, t->sel_border);   // 主题分隔线（Theme64Tokens 没有 line 字段）
     int ly = y + 24;
     const int lh = 19;
-    txt(x + 10, ly, gui64_tr("Name:", "名称："), C_EXP_DIM);
-    txt_clip(x + 82, ly, g_props_name, C_EXP_TEXT, w - 94); ly += lh;
-    txt(x + 10, ly, gui64_tr("Type:", "类型："), C_EXP_DIM);
-    txt_clip(x + 82, ly, g_props_kind, C_EXP_TEXT, w - 94); ly += lh;
-    txt(x + 10, ly, gui64_tr("Size:", "大小："), C_EXP_DIM);
-    txt_clip(x + 82, ly, g_props_size, C_EXP_TEXT, w - 94); ly += lh;
-    txt(x + 10, ly, gui64_tr("Modified:", "修改日期："), C_EXP_DIM);
-    txt_clip(x + 82, ly, g_props_mtime[0] ? g_props_mtime : "-", C_EXP_TEXT, w - 94); ly += lh;
-    txt(x + 10, ly, gui64_tr("Volume:", "所在卷："), C_EXP_DIM);
-    txt_clip(x + 82, ly, g_props_vol, C_EXP_TEXT, w - 94);
-    txt_clip(x + 10, y + h - 16, g_props_path, C_EXP_DIM, w - 20);
+    txt(x + 12, ly, gui64_tr("Name:", "名称："), t->text_dim);
+    txt_clip(x + 84, ly, g_props_name, t->text, w - 96); ly += lh;
+    txt(x + 12, ly, gui64_tr("Type:", "类型："), t->text_dim);
+    txt_clip(x + 84, ly, g_props_kind, t->text, w - 96); ly += lh;
+    txt(x + 12, ly, gui64_tr("Size:", "大小："), t->text_dim);
+    txt_clip(x + 84, ly, g_props_size, t->text, w - 96); ly += lh;
+    txt(x + 12, ly, gui64_tr("Modified:", "修改日期："), t->text_dim);
+    txt_clip(x + 84, ly, g_props_mtime[0] ? g_props_mtime : "-", t->text, w - 96); ly += lh;
+    txt(x + 12, ly, gui64_tr("Volume:", "所在卷："), t->text_dim);
+    txt_clip(x + 84, ly, g_props_vol, t->text, w - 96);
+    txt_clip(x + 12, y + h - 16, g_props_path, t->text_dim, w - 24);
 }
 // 框选矩形（内核没有 alpha 混合：用浅蓝填充 + 蓝边框近似 Win10 的半透明选择框）
 static void draw_selbox(void) {
