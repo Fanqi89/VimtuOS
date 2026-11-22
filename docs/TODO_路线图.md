@@ -68,8 +68,9 @@ ISO9660 主卷描述符读回、`tests/ahci64_test.py --strict-dma` 不退化。
 
 ## 6. UEFI 固件引导 —— v0.10.1 已复验 PASS，之后每版都要跑
 
-安装器已写 ESP（`BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN`）与盘尾备份 GPT，但**固件引导本身**
-一直是 `UNVERIFIED(env)`（本机没有 OVMF 夹具时无法复验）。判据见 `docs/UEFI引导说明.md`。
+安装器已写 ESP（`BOOTX64.EFI + UEFI64.BIN + KERNEL64.BIN`）与盘尾备份 GPT。**v0.10.1 复验 PASS 之后
+每一次构建都要跑这一条**（`py -3 tests/uefi_install64_test.py`，按 OVMF 引导判据）；本机**没有 OVMF 夹具**
+时它如实记 `UNVERIFIED(env)`，不是"没过"。判据见 `docs/UEFI引导说明.md`。
 
 ---
 

@@ -4092,7 +4092,6 @@ TESTS = [
     ("nvme64_test.py", "★ item 6：NVMe 驱动（识别/自检/打点）+ 完整安装到 NVMe 盘（drive=16/ESP FAT32/GPT）"
                        " + UEFI(OVMF) 从该盘启动进桌面 + BIOS 如实测"),
     ("disk_boot_test.py", "★ 引导层改 BIOS INT 13h 读盘：只挂 AHCI 的装好盘直启进桌面 + 截断盘失败路径打点停机"),
-    ("install_flow_test.py", "端到端安装 + 装完单独启动（引导层走 BIOS INT 13h）"),
     ("partition_ops_test.py", "新建/格式化/删除 真实写盘（两步确认；MBR 盘）"),
     ("partmgr64_test.py", "★ v0.5.14 GPT 盘与双份分区表盘的 删除/格式化：删除必须打在用户选的"
                           "那张表的那个项上（GPT 项清零+两份头 CRC 重算、LBA1/0xEE 保护项完好、"
@@ -4161,6 +4160,10 @@ TESTS = [
     ("dragdrop64_test.py", "★ v0.11.1 跨层拖拽：资源管理器条目按下 -> 越 8px 阈值出拖拽幽灵 -> 松手在桌面空白 "
                            "= 建文件快捷方式（[DESK64] file add kind=9）+ **真落盘 /etc/desktop.links**（rc==bytes）；"
                            "反例（松手在窗口上）target=none 且不新增；同一块盘重启后 links load n=1 + 图标仍在"),
+    ("deco64_test.py", "★ v0.11.1 第二步 wl_surface → Window：28 号 wl_surface_set_decor 把 PE 窗口声明成窗口 -> "
+                       "装饰（24px 标题栏 + 三按钮 + 1px 玻璃边框 + 大圆角 + 阴影）由**合成器**画、客户端不再自绘；"
+                       "判据 = 串口 `[WL64] decor … mode=window` + `[WL64] deco paint … btns=3 corner=14 hdr=25` + "
+                       "**screendump 像素**（标题带实心、旧自绘色 0x3465A4 命中 0 次、close 红底可见、四角被圆角裁掉）"),
     ("locklogin64_test.py", "★ P1c 锁屏/登录/多用户：时间 72px/年月日 18px、背景清晰→登录后模糊 20px(250-350ms)、"
                             "头像与密码框/确认按钮像素、ESC 返回、重启仍锁屏、两用户桌面隔离、su/sudo/exit + ★ v0.9.5 两段过渡的专用断言（104 条断言）"),
     ("startmenu64_test.py", "★ P2 开始菜单：居中/离 Dock 11px/上圆角 24 下 10/搜索启动/2×4 固定网格/状态区线性图标/电源菜单/ESC 两级退出（58 条断言）"),
@@ -4253,8 +4256,8 @@ TESTS = [
                                   "VIMTUFS2 卷头 -> mount_system ok 且无 NOT-PERSISTENT -> mkdir+cfg save 落盘"
                                   "（flush ok via=vfs）-> 正常关机重启 -> ui.theme=3 读回 + 宿主侧解析卷仍有 "
                                   "/home/vimtu/pdata（10 条断言）"),
-    ("install_flow_test.py", "★ 端到端安装（含 v0.5.11 新增硬判据：目标盘带 VimtuFS2 卷/version=5、主分区前 "
-                             "64 KiB 与 sysdisk 逐字节一致、装好启动 mount_system ok 且非 NOT-PERSISTENT）"),
+    ("install_flow_test.py", "★ 端到端安装 + 装完单独启动（引导层走 BIOS INT 13h）—— 含 v0.5.11 新增硬判据：目标盘带 VimtuFS2 卷/version=5、主分区前 "
+                             "64 KiB 与 sysdisk 逐字节一致、装好启动 mount_system ok 且非 NOT-PERSISTENT"),
     ("imgfit64_test.py", "★ v0.5.17 任意分辨率壁纸/头像（解码期抽样）：6000x4000 PNG 当壁纸 -> decim=4 得 1500x1000；5000x3333 JPEG 当头像 -> 256x170、当壁纸 -> 1250x833；重启后仍按缩小尺寸加载，无 OOM / PANIC"),
     ("presets_audit64_test.py", "★ 预设资源「源目录 -> 卷内路径」逐文件核对（秒级、不跑 QEMU）："
                                  "build64/presets/avatar-*.png -> /Avatars、（build64/presets/wall-*.png + "

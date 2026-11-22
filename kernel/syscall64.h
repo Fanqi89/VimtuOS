@@ -82,6 +82,13 @@
 //   26 wl_seat_post(out_ev)         -> 投递到的 pid；合成器把事件投回目标 surface 的拥有者队列
 //   22..26 只有注册过的合成器能调（其它进程 EPERM）；没有合成器时内核继续走 15..21 的老路
 //   （dispatch 里合成、打 [WL64] composite），两条路互不影响。安装介质内核不链 wl64.cpp -> deny。
+//   27 wl_surface_move(surf, xy)    -> 0；改 surface 屏幕位置（拥有者或合成器；xy = x|y<<32）
+//   28 wl_surface_set_decor(surf, flags, title)  ★ v0.11.1
+//      -> 0；把 surface 声明成**窗口**：flags bit0=1 时装饰（24px 标题栏 + 三按钮 + 1px 玻璃边框 +
+//      四角圆角 + 阴影）由**合成器**画（gui64 的装饰器，与内核窗口同一份实现），客户端只画客户区
+//      内容（顶部 25 行归合成器）。title = 用户态 C 串（最多 31 B，0 = 保留原标题）。
+//      **不改几何**（x/y/w/h 仍由 27 号/槽位决定），所以几何类老判据全部不变；
+//      打点 `[WL64] decor … mode=window` + `[WL64] deco paint … btns=3 corner=.. hdr=25`。
 //   ==================== ★ 本批：用户态设备映射（号 48 pci_map_bar）====================
 //   目标：让 ring3 的**驱动服务**能直接读自己那块设备的寄存器（用户态驱动的第一块地基）。
 //   48 pci_map_bar(bdf, bar_index, out_va, out_len)

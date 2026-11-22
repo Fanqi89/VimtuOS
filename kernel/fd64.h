@@ -40,7 +40,9 @@
 //
 // 边界（如实写在文档里，别把没做的说成做了）：
 //   * 没有文件权限/属主；fcntl 只做 F_GETFL/F_SETFL/F_GETFD/F_SETFD（没有 F_DUPFD；F_SETFD 只认 FD_CLOEXEC）；
-//   * 没有 select/poll/epoll、没有文件的 mmap、没有硬链接/符号链接；
+//   * select/poll/epoll **已实现**（v0.7.1 就绪查询 + v0.7.3 epoll_create1/epoll_ctl/epoll_wait，
+//     边界见 fd64.cpp:1581 起：epoll handle 不进 fd 表、不能再塞进 poll/select）；仍没有文件的 mmap、
+//     没有硬链接/符号链接；
 //   * pipe 容量固定 64 B，最多 8 条同时在用；等待**有界**（超时 -> 读 -EAGAIN / 写返回已写字节或
 //     -EAGAIN，绝不无限挂死）；没有 select/poll、**不投递 SIGPIPE**（读端全关的 write 只回 -EPIPE）；
 //   * 单文件上限 8 MiB（v2 卷 67584 B）：单次 read/write 的长度受调用方缓冲限制（推荐 ≤64KB/次）；

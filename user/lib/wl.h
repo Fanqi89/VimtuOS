@@ -34,6 +34,12 @@
 #define V64_NR_WL_SURFACE_DESTROY 19
 #define V64_NR_WL_SEAT_GET        20
 #define V64_NR_WL_DISPATCH        21
+/* ★ v0.11.1（第二步 wl_surface → Window）：28 = wl_surface_set_decor(surf, flags, title)
+ *   语义见 kernel/wl64.h 的 WL64_ABI_SURFACE_DECOR64 段：flags bit0 = 1 -> 这条 surface 是
+ *   "窗口"，标题栏（含三按钮）/ 圆角 / 1px 玻璃边框 / 阴影全部由**合成器**画，
+ *   客户端只画客户区内容（顶部 WL64_DECOR_H64 = 25 行归合成器）。 */
+#define V64_NR_WL_SURFACE_DECOR   28
+#define V64_WL_DECOR_WINDOW       0x1u
 
 /* 错误码（与 kernel/wl64.h 的 WL64_* 逐值一致） */
 #define V64_WL_EPERM    (-1)   /* 没有进程上下文 / surface 不属于本进程 */
@@ -70,5 +76,6 @@ int wl_surface_commit(int surf);
 int wl_surface_destroy(int surf);
 int wl_seat_get(void);
 int wl_display_dispatch(unsigned timeout_ms, struct Wl64SeatEvent* out, unsigned max);
+int wl_surface_set_decor(int surf, unsigned flags, const char* title);   /* ★ v0.11.1：28 */
 
 #endif /* VIMTU64_WL_H */

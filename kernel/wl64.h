@@ -212,6 +212,20 @@ static const uint32_t WL64_ABI_SURFACE_MAP64    = 24;
 static const uint32_t WL64_ABI_SURFACE_ACK64    = 25;
 static const uint32_t WL64_ABI_SEAT_POST64      = 26;
 static const uint32_t WL64_ABI_SURFACE_MOVE64   = 27;   // ★ W3 第二批：窗口重定位（拖动）
+// ★ v0.11.1（第二步 wl_surface → Window）：28 = wl_surface_set_decor(surf, flags, title)
+//   语义：把这条 surface 声明成**窗口** —— 装饰（24px 标题栏 + 三个按钮 + 1px 玻璃边框 +
+//   四角圆角 + 阴影）由**合成器**画，客户端不再自己画标题栏（否则一人一个样，这正是本刀
+//   之前的现状：PE 对话框自绘 1px 直角边 + 22px 蓝条，与内核窗口完全两套外观）。
+//   flags：bit0 = 1 有装饰（0 = 取消，退回"裸 surface"的旧口径）；其余位保留必须为 0（否则 EINVAL）。
+//   title：用户态 NUL 结尾 UTF-8 指针（0 = 保留原标题），拷进内核最多 31 字节 + 结尾 0。
+//   权限与 27 号一致：**拥有者进程**或**注册合成器**；别的进程 EPERM。
+//   与 27 号的关系：装饰只是"合成器怎么画"，**不改几何**（surface 的 x/y/w/h 仍是 27 号/槽位
+//   给的那个矩形），所以老验收的几何判据（居中/槽位/拖动位移）一个字都不变。
+//   打点：[WL64] decor id=<n> pid=<n> flags=<n> title="<s>"（状态真的变了才打，防刷屏）
+//         [WL64] deco paint surf=<n> rect=<x>,<y>,<w>,<h> title="<s>" btns=3 corner=<r> parts=<n>
+static const uint32_t WL64_ABI_SURFACE_DECOR64  = 28;
+static const uint32_t WL64_DECOR_F_WINDOW64     = 0x1u;   // 有装饰（合成器画标题栏/圆角/三按钮）
+static const uint32_t WL64_DECOR_H64            = 25;     // 装饰占掉的高度（标题栏 24 + 上边框 1）
 
 // 合成器的缓冲映射窗：FB 映射区（5GiB..+40MiB）的**顶部 512 KiB** = 8 个 surface 槽 × 64 KiB
 // （= 单 shm 对象上限）。为什么放这里而不是新开一段 VA：① 5GiB 起那一段已经在
@@ -269,6 +283,8 @@ int64_t wl64_surface_map64(uint64_t surf, uint64_t out_uptr);    // 24
 int64_t wl64_surface_ack64(uint64_t surf);                       // 25
 int64_t wl64_seat_post64(uint64_t out_ev_uptr);                  // 26
 int64_t wl64_surface_move64(uint64_t surf, uint64_t xy);          // 27（★ W3 第二批）
+// 28（★ v0.11.1）：把 surface 声明成窗口 —— 装饰由合成器画（语义见上面 WL64_ABI_SURFACE_DECOR64）
+int64_t wl64_surface_set_decor64(uint64_t surf, uint64_t flags, uint64_t title_uptr);
 int     wl64_composer_pid64();                                   // 当前注册的合成器（0 = 没有）
 
 // ==================== ★ B-wm：启动期驱动（/bin/wm + 两个客户端：卷交付）====================

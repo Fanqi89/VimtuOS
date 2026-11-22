@@ -510,6 +510,12 @@ u64 pl_do_strlen(u64 s) { return s ? (u64)slen((const char *)(u64)s) : 0; }
 #define MB_NR_WL_DESTROY  19
 #define MB_NR_WL_DISPATCH 21
 #define MB_NR_WL_SEAT_GET 20
+/* ★ v0.11.1（第二步 wl_surface → Window）：28 = wl_surface_set_decor(surf, flags, title)。
+ *   调了它，这一条 surface 就是"窗口"：标题栏（含三个按钮）/ 圆角 / 1px 玻璃边框 / 阴影
+ *   全部由**合成器**画（kernel/wl64.cpp 的 wl64_deco_paint64 -> gui64 的装饰器）。
+ *   客户端**不再自绘标题栏** —— 这正是本刀之前 PE 窗口四角是直角、与内核窗口两套外观的根因。 */
+#define MB_NR_WL_DECOR    28
+#define MB_DECOR_WINDOW   1u
 #define MB_NR_INPUT_POLL  12
 
 /* ★ 关键：自有 ABI 走 **int 0x80**（不是 syscall 指令）！
@@ -632,17 +638,13 @@ static void mb_text_wrapped(int x, int y, const char *s, unsigned c, int max_x) 
 }
 
 static void mb_draw(const char *caption, const char *text) {
-    /* 外框（1px 深色）+ 内白边，看起来像个真窗口 */
-    mb_fill(0, 0, MB_W, MB_H, MB_C_WHITE);
-    mb_fill(0, 0, MB_W, 1, MB_C_BORDER);
-    mb_fill(0, MB_H - 1, MB_W, 1, MB_C_BORDER);
-    mb_fill(0, 0, 1, MB_H, MB_C_BORDER);
-    mb_fill(MB_W - 1, 0, 1, MB_H, MB_C_BORDER);
-    /* 标题栏 */
-    mb_fill(1, 1, MB_W - 2, MB_TB_H - 1, MB_C_TITLE);
-    mb_text(MB_PAD - 4, 7, caption && caption[0] ? caption : "Message", MB_C_WHITE, MB_W - MB_PAD);
+    /* ★ v0.11.1：**客户端不再自绘标题栏/边框**（那是四角直角的根因）。
+     *   点 28 号声明成窗口之后，装饰由合成器画：顶部 25 行（1px 边框 + 24px 标题栏）归它，
+     *   这里只负责"客户区内容"，并把整面先铺成内容底色 —— 铺的目的是**不留未初始化的 shm 像素**
+     *   （万一跑在不支持 28 号的内核上，看到的是一块干净的内容面板，而不是花屏）。 */
+    (void)caption;
+    mb_fill(0, 0, MB_W, MB_H, MB_C_FACE);
     /* 正文 */
-    mb_fill(1, MB_TB_H, MB_W - 2, MB_H - MB_TB_H - 1, MB_C_FACE);
     mb_text_wrapped(MB_PAD, MB_TB_H + MB_PAD, text, MB_C_TEXT, MB_W - MB_PAD);
     /* OK 按钮（3D 边：左上白、右下灰） */
     mb_fill(MB_BTN_X, MB_BTN_Y, MB_BTN_W, MB_BTN_H, MB_C_BTN);
@@ -719,6 +721,13 @@ u64 pl_do_MessageBoxA(u64 hwnd, u64 text, u64 caption, u64 type) {
         pl_out(2, "\n", 1);
         return 0;
     }
+
+    /* ★ v0.11.1：把它声明成**窗口** -> 装饰（标题栏 + 三按钮 + 圆角 + 1px 玻璃边框 + 阴影）
+     *   由合成器统一画，客户端不再自绘（见 mb_draw 的注释）。必须在 commit 之前调：
+     *   合成器是在合成这一帧时才按 decor 位画标题带的。
+     *   失败不致命（不支持 28 号的内核返回 -1）：如实打一行，对话框照旧出得来。 */
+    const i64 drc = i80(MB_NR_WL_DECOR, (i64)surf, (i64)MB_DECOR_WINDOW, (i64)(u64)cap, 0);
+    pl_outs(1, "[PELOAD] msgboxA decor rc="); pl_dec(1, (u64)drc); pl_out(1, "\n", 1);
 
     pl_outs(1, "[PELOAD] msgboxA show surf=");  pl_dec(1, (u64)surf);
     pl_outs(1, " shm=");  pl_dec(1, (u64)shm);

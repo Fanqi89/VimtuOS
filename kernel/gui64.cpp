@@ -2521,18 +2521,22 @@ static void draw_desktop_bg(int x0, int y0, int x1, int y1) {
 static void draw_icons(void) {
     desktopops64_draw_icons64(g_icon_sel);
 }
-static void draw_title_buttons(Window* w) {
+// ★ v0.11.1（第二步 wl_surface→Window）：改成**按矩形**画，而不是按 Window*。
+//   为什么：内核窗口（gui64 的 Window）与 ring3 的 wl_surface 窗口必须长成同一个样子，
+//   而装饰只能有**一份实现**（见本文件下方的 gui64_deco_frame64 / gui64_deco_edge64，
+//   wl_surface 那条路由 kernel/wl64.cpp 直接调用它们）。窗口对象只负责把几何传进来。
+static void draw_title_buttons_rect64(int x, int y, int w) {
     // 三个按钮必须**肉眼可区分**：最小化=短横线、最大化=方框、关闭=红底 ✕；hover 高亮。
-    // 几何与 handle_mouse_press 的点击判定一致（bx = 窗口右缘 - 3*BTN_W，点击 y ∈ [w->y+2, w->y+24)）。
+    // 几何与 handle_mouse_press 的点击判定一致（bx = 窗口右缘 - 3*BTN_W，点击 y ∈ [y+2, y+24)）。
     // 颜色本批改为从 Token 取（theme64）：浅色主题用浅灰按钮 + 白字，暗色主题用深灰按钮 + 白字。
     const Theme64Tokens* t = theme64_tokens64();
-    const int bx = w->x + w->w - BORDER - BTN_W * 3;
-    const int by = w->y + BORDER + 4;
+    const int bx = x + w - BORDER - BTN_W * 3;
+    const int by = y + BORDER + 4;
     for (int b = 0; b < 3; b++) {
         const int x = bx + b * BTN_W + 3;
         const int bw = BTN_W - 6, bh = 16;
         const bool hov = (g_cur_x >= bx + b * BTN_W) && (g_cur_x < bx + (b + 1) * BTN_W) &&
-                         (g_cur_y >= w->y + BORDER + 1) && (g_cur_y < w->y + TITLE_H);
+                         (g_cur_y >= y + BORDER + 1) && (g_cur_y < y + TITLE_H);
         uint32_t bg;
         if (b == 2) bg = hov ? t->btn_close_hover : t->btn_close;
         else        bg = hov ? t->btn_bg_hover : t->btn_bg;
@@ -2556,6 +2560,40 @@ static void draw_title_buttons(Window* w) {
         dbg64_nl();
     }
 }
+// （旧的 Window* 版本 draw_title_buttons 已删：装饰统一走下面的 rect 版，
+//   避免"两份按钮绘制"漂移；handle_mouse_press 的点击判定几何没变。）
+
+// ==================== ★ v0.11.1：窗口装饰的**单一真源** ====================
+// 同一份装饰同时服务两条合成路：
+//   ① 内核窗口：本文件的 draw_window() 调它（几何 = Window::x/y/w/h）；
+//   ② ring3 的 wl_surface 窗口：kernel/wl64.cpp 在合成时调它（几何 = surface 的屏幕矩形）。
+// 拆成"前半 / 后半"是因为客户区内容必须画在两者之间（前半画标题栏与阴影，客户区内容，
+// 后半描 1px 玻璃边框 + 四角圆角裁切）。
+// ★ 两个函数都是**逐像素确定**的（同一像素画两次结果相同），所以 wl64 那条路可以按遮挡
+//   把窗口切成若干子矩形、逐块设 clip 反复调用它们 —— 不会出现叠色。
+void gui64_deco_frame64(int x, int y, int w, int h, const char* title, int active) {
+    const Theme64Tokens* t = theme64_tokens64();
+    // 1) 双层浅阴影（预生成 alpha mask，按 w/h/r 缓存复用）
+    gfx64_shadow64(x, y, w, h, THEME64_R_WINDOW, t);
+    // 2) 标题栏玻璃：**只铺标题栏那条**（内容层区域模糊 r=12；整窗面积铺会把每帧开销拉到卡住
+    //    看门狗的程度 —— 实测 7 个窗口时 5s 超时 PANIC）。
+    const uint32_t tb = active ? t->title_bg : t->title_bg_ina;
+    gfx64_glass64(x, y, w, DECO_H + 2, THEME64_R_WINDOW, 1, tb, THEME64_A_TITLE, 0, 0, t);
+    // 3) 标题文字（居中偏左）
+    const int ty = y + BORDER + (TITLE_H - 14) / 2;
+    text_ttf(x + 8, ty, (title && title[0]) ? title : "", t->title_txt);
+    // 4) 三个按钮（简化绘制：三条横线/方块；关闭按钮红底）
+    draw_title_buttons_rect64(x, y, w);
+}
+void gui64_deco_edge64(int x, int y, int w, int h) {
+    const Theme64Tokens* t = theme64_tokens64();
+    // 1) 整窗 1px 玻璃边框（1px 半透明白/黑 = 玻璃厚度与高光边缘）
+    gfx64_stroke_round64(x, y, w, h, THEME64_R_WINDOW, t->win_frame, THEME64_A_BORDER);
+    // 2) 圆角裁切：客户区是方形，把 4 个角"圆角外"的像素用模糊壁纸采样补回（= 玻璃圆角）
+    gfx64_corner_cut64(x, y, w, h, THEME64_R_WINDOW, 0);
+}
+// 装饰占掉的高度（标题栏 24 + 上边框 1）：客户区内容从这一行往下才有意义。
+int gui64_deco_h64() { return DECO_H; }
 
 // ★ P5 防回归断言（内核侧）：应用自绘**之后**，客户区不能是一片 client_bg（= 应用什么都没画）。
 //   两个成因（详见交付报告）：
@@ -2593,20 +2631,11 @@ static void check_app_painted64(const Window* w) {
 // 1px 玻璃边框。**几何完全不变**：边框 1px、标题栏 24、客户区偏移与老实现逐像素一致，
 // 所以所有应用布局与老验收（标题栏三按钮/客户区几何）都不受影响。
 static void draw_window(Window* w) {
+    // ★ v0.11.1：装饰全部走共享真源（gui64_deco_frame64 / gui64_deco_edge64），
+    //   这样 ring3 的 wl_surface 窗口（kernel/wl64.cpp）与内核窗口**逐像素同一套外观**。
     const Theme64Tokens* t = theme64_tokens64();
-    // 1) 双层浅阴影（预生成 alpha mask，按 w/h/r 缓存复用）
-    gfx64_shadow64(w->x, w->y, w->w, w->h, THEME64_R_WINDOW, t);
-    // 2) 标题栏玻璃：**只铺标题栏那条**（内容层区域模糊 r=12；整窗面积铺会把每帧开销拉到卡住
-    //    看门狗的程度 —— 实测 7 个窗口时 5s 超时 PANIC）。底边/侧边的 1px 玻璃边框在第 4 步统一描。
-    const uint32_t tb = w->active ? t->title_bg : t->title_bg_ina;
-    gfx64_glass64(w->x, w->y, w->w, DECO_H + 2, THEME64_R_WINDOW, 1, tb, THEME64_A_TITLE,
-                  0, 0, t);
-    // 3) 标题文字（居中偏左）
-    const int ty = w->y + BORDER + (TITLE_H - 14) / 2;
-    text_ttf(w->x + 8, ty, w->title, t->title_txt);
-    // 4) 三个按钮（简化绘制：三条横线/方块；关闭按钮红底）
-    draw_title_buttons(w);
-    // 5) 客户区底色 + 应用内容（内容卡片：不透明底，老验收依赖 240,240,240）
+    gui64_deco_frame64(w->x, w->y, w->w, w->h, w->title, w->active);
+    // 客户区底色 + 应用内容（内容卡片：不透明底，老验收依赖 240,240,240）
     fb_fill_rect(w->client_x, w->client_y, w->client_w, w->client_h, t->client_bg);
     if (w->draw) {
         fb_set_clip(w->client_x, w->client_y, w->client_w, w->client_h);
@@ -2616,10 +2645,8 @@ static void draw_window(Window* w) {
         w->cpu_cycles += rdtsc64() - t0;
         fb_reset_clip();
     }
-    // 6) 整窗 1px 玻璃边框（1px 半透明白/黑 = 玻璃厚度与高光边缘）+ 圆角裁切
-    gfx64_stroke_round64(w->x, w->y, w->w, w->h, THEME64_R_WINDOW, t->win_frame, THEME64_A_BORDER);
-    // 圆角裁切：客户区是方形，把 4 个角"圆角外"的像素用模糊壁纸采样补回（= 玻璃圆角）
-    gfx64_corner_cut64(w->x, w->y, w->w, w->h, THEME64_R_WINDOW, 0);
+    // 整窗 1px 玻璃边框 + 圆角裁切（后半段装饰）
+    gui64_deco_edge64(w->x, w->y, w->w, w->h);
 }
 // 老 32px 任务栏已在批次"Windows 11 现代外观"里被 draw_dock()（Dock 栏 + 右下时钟玻璃片）取代；
 // 这里保留这条注释作为考古标记：时钟 [UI] clock text= 打点与窗口按钮语义都迁到了 draw_dock/dock_press64。

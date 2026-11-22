@@ -17,6 +17,10 @@
 #include "debug64.h"
 #include "x86_64.h"       // g_ticks64 / PIT_HZ_64 / pt_regs64 无关
 #include "fb.h"           // fb_width/fb_height/fb_surface64/fb_user_flip64（**只调用**）
+// ★ v0.11.1（第二步 wl_surface → Window）：装饰的**单一真源**在 gui64（内核窗口也用它）。
+#include "gui64.h"        // gui64_deco_frame64 / gui64_deco_edge64 / gui64_deco_h64
+#include "theme64.h"      // theme64_tokens64()（标题栏底色）
+#include "gfx64.h"        // gfx64_fill_round64（标题栏不透明底色）
 #include "proc64.h"       // 进程上下文 + shm 对象的只读视图/hold/release
 #include "usermode64.h"   // user64_range_ok64（seat 事件出参校验）
 #include "mem_64.h"       // page_count_free_64（演示的页池基线核对）
@@ -122,6 +126,11 @@ struct Wl64Surface {
     uint32_t have_damage;          // 本提交周期里有 damage 调用
     uint32_t ndamage;              // damage 调用次数（打点用）
     int32_t  dmg_x, dmg_y, dmg_w, dmg_h;   // damage 包围盒（surface 局部坐标；未裁剪）
+    // ---- ★ v0.11.1（第二步 wl_surface → Window）：装饰（合成器画，客户端不自绘）----
+    uint32_t decor;                // WL64_DECOR_F_WINDOW64 位；0 = 裸 surface（老口径，一个像素不变）
+    char     title[32];            // 标题栏文字（UTF-8，31 B + 结尾 0；空 = 不画标题）
+    uint32_t deco_logged;          // "deco paint" 打点是否已经打过（防刷屏）
+    int32_t  deco_log_x, deco_log_y;   // 上次打点时的位置（挪动后要重打一行）
 };
 static Wl64Surface g_wl64_surfs[WL64_MAX_SURFACES64];
 static uint32_t    g_wl64_next_id64 = 1;
@@ -323,6 +332,117 @@ static void wl64_paint_chrome64(uint32_t* dst, int dw, int dh) {
     wl64_nl64();
     wl64_end64();
 }
+// ==================== ★ v0.11.1：合成期窗口装饰（wl_surface → Window）====================
+// 设计（为什么这么切，逐条都是本仓库踩过的坑）：
+//   1) **装饰只有一份实现** —— gui64_deco_frame64 / gui64_deco_edge64（kernel/gui64.cpp）。
+//      内核窗口（Window）与 wl_surface 窗口因此逐像素同一套外观：阴影 + 24px 标题栏玻璃 +
+//      标题文字 + 三个按钮 + 1px 玻璃边框 + 大圆角裁切。**客户端不再自绘标题栏**。
+//   2) **装饰不改几何**：surface 的 x/y/w/h 一个字都不动（27 号/槽位的那套判据全部保留），
+//      装饰只占掉顶部 WL64_DECOR_H64 行 —— 像素来源的客户区从第 25 行开始，
+//      wl64_blit64 的内容循环**跳过**这 25 行（否则客户端的旧标题栏会和合成器的重叠）。
+//   3) **遮挡与内容同一把尺子**：更高层 surface 盖住的部分装饰也不落笔。做法是把窗口矩形
+//      按遮挡切成最多 WL64_DECO_RECTS64 块、逐块 fb_set_clip 再画。装饰器是逐像素确定的
+//      （同一像素画两次结果相同），而每块互不重叠 -> 不会叠色、也不会漏画。
+//   4) 只有 `decor` 位为 1 的 surface 走这条路；**裸 surface 的合成路径一个像素都不变**
+//      （tests/wl64_test.py 的 91 项、wm64_test 的整屏合成断言因此不受影响）。
+static const int WL64_DECO_RECTS64 = 8;
+
+struct Wl64DecoRect { int x, y, w, h; };
+
+// 用 cut 把列表里的矩形切开（原地替换）；返回新的矩形数（顺序无关，互不重叠）。
+// 0 面积片段丢弃；列表满（WL64_DECO_RECTS64）时后面的片段直接丢 —— 只有 8 个 surface 的
+// 极端重叠才可能发生，丢了最多是"那一小块没重画"，不会画错别人的像素。
+static int wl64_deco_sub64(Wl64DecoRect* rs, int n, int cx, int cy, int cw, int ch) {
+    Wl64DecoRect out[WL64_DECO_RECTS64];
+    int m = 0;
+    const int cx1 = cx + cw, cy1 = cy + ch;
+    for (int i = 0; i < n; i++) {
+        const Wl64DecoRect r = rs[i];
+        const int rx1 = r.x + r.w, ry1 = r.y + r.h;
+        const int ix0 = (r.x > cx) ? r.x : cx, iy0 = (r.y > cy) ? r.y : cy;
+        const int ix1 = (rx1 < cx1) ? rx1 : cx1, iy1 = (ry1 < cy1) ? ry1 : cy1;
+        if (ix0 >= ix1 || iy0 >= iy1) { if (m < WL64_DECO_RECTS64) out[m++] = r; continue; }
+        const Wl64DecoRect sub[4] = {
+            { r.x, r.y, r.w, iy0 - r.y },              // 上
+            { r.x, iy1, r.w, ry1 - iy1 },              // 下
+            { r.x, iy0, ix0 - r.x, iy1 - iy0 },        // 左
+            { ix1, iy0, rx1 - ix1, iy1 - iy0 }         // 右
+        };
+        for (int k = 0; k < 4 && m < WL64_DECO_RECTS64; k++) {
+            if (sub[k].w > 0 && sub[k].h > 0) out[m++] = sub[k];
+        }
+    }
+    for (int i = 0; i < m; i++) rs[i] = out[i];
+    return m;
+}
+
+// 在 surface 矩形里画窗口装饰；phase 0 = 前半（阴影 + 标题带底 + 玻璃 + 标题文字 + 三按钮），
+// phase 1 = 后半（1px 玻璃边框 + 四角圆角裁切）。
+// **为什么必须分两相**（本批实测踩到）：阴影的蒙版在窗口内侧也有一圈淡淡的暗边，
+// 若把整份装饰都画在客户区内容**之后**，那圈暗边会盖在内容上（实测标题带下面两行被压暗
+// 242 -> 201）；而圆角裁切又必须画在内容**之后**，否则底部两个圆角会被内容糊掉。
+// 两相顺序 = 内核窗口 draw_window 的同一顺序（阴影/标题栏 -> 客户区内容 -> 边框/圆角）。
+// 返回落笔的像素数（0 = 没画：没有装饰位 / 太小 / 全被裁掉）。
+static uint32_t wl64_deco_paint64(Wl64Surface* s, int vis_x, int vis_y, int vis_w, int vis_h, int phase) {
+    if (!(s->decor & WL64_DECOR_F_WINDOW64)) return 0;
+    const int W = (int)s->w, H = (int)s->h;
+    // 太小的 surface 画装饰没意义（标题栏就把它盖完了）：按"裸 surface"处理，如实不打点。
+    if (W < 48 || H < (int)WL64_DECOR_H64 + 16) return 0;
+    Wl64DecoRect rs[WL64_DECO_RECTS64];
+    int n = 0;
+    {
+        int rx = s->x, ry = s->y, rw = W, rh = H;
+        if (wl64_rect_isect64(&rx, &ry, &rw, &rh, vis_x, vis_y, vis_w, vis_h) &&
+            wl64_rect_isect64(&rx, &ry, &rw, &rh, 0, 0, fb_width(), fb_height())) {
+            rs[0].x = rx; rs[0].y = ry; rs[0].w = rw; rs[0].h = rh;
+            n = 1;
+        }
+    }
+    if (n <= 0) return 0;
+    // 减去更高层 surface 的可见矩形（与 wl64_blit64 第 5 步"被覆盖就不落笔"同一判据）
+    for (uint32_t i = 0; i < WL64_MAX_SURFACES64 && n > 0; i++) {
+        const Wl64Surface* h = &g_wl64_surfs[i];
+        if (!h->used || !h->content || h->id <= s->id) continue;
+        int hx = h->x, hy = h->y, hw = (int)h->w, hh = (int)h->h;
+        if (!wl64_rect_isect64(&hx, &hy, &hw, &hh, vis_x, vis_y, vis_w, vis_h)) continue;
+        n = wl64_deco_sub64(rs, n, hx, hy, hw, hh);
+    }
+    if (n <= 0) return 0;
+    const Theme64Tokens* t = theme64_tokens64();
+    uint32_t area = 0;
+    for (int i = 0; i < n; i++) {
+        fb_set_clip(rs[i].x, rs[i].y, rs[i].w, rs[i].h);
+        if (phase == 0) {
+            // 标题栏底色先**不透明**铺一遍：这条合成路上没有"整屏重绘"保证，玻璃若直接叠在
+            // 上一帧自己的像素上，会一帧比一帧暗（alpha 累积）。铺完再叠玻璃 = 每帧确定。
+            gfx64_fill_round64(s->x, s->y, W, (int)WL64_DECOR_H64 + 1, THEME64_R_WINDOW,
+                               t->title_bg, 255);
+            gui64_deco_frame64(s->x, s->y, W, H, s->title, 1);
+        } else {
+            gui64_deco_edge64(s->x, s->y, W, H);
+        }
+        area += (uint32_t)(rs[i].w * rs[i].h);
+    }
+    fb_reset_clip();
+    // 打点：只在"第一次/位置变了"时打（dispatch 每 8ms 一次，逐帧打会刷爆串口）
+    if (phase == 0 && (!s->deco_logged || s->deco_log_x != s->x || s->deco_log_y != s->y)) {
+        s->deco_logged = 1;
+        s->deco_log_x = s->x;
+        s->deco_log_y = s->y;
+        wl64_begin64();
+        wl64_puts64("[WL64] deco paint surf="); wl64_udec64(s->id);
+        wl64_puts64(" rect=");  wl64_dec64(s->x); wl64_puts64(","); wl64_dec64(s->y);
+        wl64_puts64(",");       wl64_udec64(s->w); wl64_puts64(","); wl64_udec64(s->h);
+        wl64_puts64(" title=\""); wl64_puts64(s->title); wl64_puts64("\"");
+        wl64_puts64(" btns=3 corner="); wl64_udec64((uint64_t)THEME64_R_WINDOW);
+        wl64_puts64(" hdr=");           wl64_udec64((uint64_t)WL64_DECOR_H64);
+        wl64_puts64(" parts=");         wl64_udec64((uint64_t)n);
+        wl64_nl64();
+        wl64_end64();
+    }
+    return area;
+}
+
 // 把 surface 的（已裁剪的）矩形拷进后备缓冲并提交上屏。
 // 返回实际写入的像素字节数（0 = 完全被裁掉）。
 static uint32_t wl64_blit64(Wl64Surface* s, uint32_t* dst, int dw, int dh) {
@@ -348,6 +468,12 @@ static uint32_t wl64_blit64(Wl64Surface* s, uint32_t* dst, int dw, int dh) {
     rx += dxr - (rx + s->x);
     ry += dyr - (ry + s->y);
     const uint32_t pitch = s->w * 4u;
+    // ★ v0.11.1：有装饰的 surface，顶部 WL64_DECOR_H64 行**归合成器**（内容不写进去，
+    //   否则客户端的旧标题栏会和合成器的标题栏混在一起）。裸 surface 这条判据恒假 —— 老路径不变。
+    const bool deco = (s->decor & WL64_DECOR_F_WINDOW64) != 0;
+    // ★ 装饰分两相（顺序 = 内核窗口 draw_window）：前半（阴影 + 标题带）画在内容**之前**，
+    //   后半（边框 + 圆角裁切）画在内容**之后** —— 见 wl64_deco_paint64 的注释。
+    const uint32_t deco_px = deco ? wl64_deco_paint64(s, vis_x, vis_y, vis_w, vis_h, 0) : 0;
     // ---- 5) 逐行：再减去"更高层 surface 的可见矩形"盖住的部分 ----
     const uint32_t id_self = s->id;
     int cov[4][2];
@@ -355,6 +481,8 @@ static uint32_t wl64_blit64(Wl64Surface* s, uint32_t* dst, int dw, int dh) {
     int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
     for (int yy = 0; yy < dhr; yy++) {
         const int sy = dyr + yy;
+        // ★ v0.11.1：装饰带（顶部 25 行）不走内容 blit
+        if (deco && (ry + yy) < (int)WL64_DECOR_H64) continue;
         int ncov = 0;
         for (uint32_t i = 0; i < WL64_MAX_SURFACES64 && ncov < 4; i++) {
             Wl64Surface* h = &g_wl64_surfs[i];
@@ -387,7 +515,10 @@ static uint32_t wl64_blit64(Wl64Surface* s, uint32_t* dst, int dw, int dh) {
             written += 4;
         }
     }
-    if (written == 0) {
+    // ★ v0.11.1：装饰后半（边框 + 圆角裁切）在内容之后；即使内容一个字节都没写
+    //   （damage 只在标题带里）也要画。
+    uint32_t deco_px2 = deco ? wl64_deco_paint64(s, vis_x, vis_y, vis_w, vis_h, 1) : 0;
+    if (written == 0 && deco_px == 0 && deco_px2 == 0) {
         wl64_begin64();
         wl64_puts64("[WL64] blit surf="); wl64_udec64(s->id);
         wl64_puts64(" shm=");             wl64_dec64(s->shm_id);
@@ -400,7 +531,22 @@ static uint32_t wl64_blit64(Wl64Surface* s, uint32_t* dst, int dw, int dh) {
         wl64_end64();
         return 0;
     }
-    fb_user_flip64(bx0, by0, bx1 - bx0, by1 - by0);   // 组合器自己的提交（不受内核绘制开关影响）
+    // ---- 上屏矩形：内容 bbox ∪ 装饰矩形（装饰范围是**整个窗口**，可能远大于这次 damage）----
+    int fx0 = bx0, fy0 = by0, fx1 = bx1, fy1 = by1;
+    if (deco_px || deco_px2) {
+        int wx = s->x, wy = s->y, ww = (int)s->w, wh = (int)s->h;
+        if (wl64_rect_isect64(&wx, &wy, &ww, &wh, vis_x, vis_y, vis_w, vis_h) &&
+            wl64_rect_isect64(&wx, &wy, &ww, &wh, 0, 0, dw, dh)) {
+            if (written == 0) { fx0 = wx; fy0 = wy; fx1 = wx + ww; fy1 = wy + wh; }
+            else {
+                if (wx < fx0) fx0 = wx;
+                if (wy < fy0) fy0 = wy;
+                if (wx + ww > fx1) fx1 = wx + ww;
+                if (wy + wh > fy1) fy1 = wy + wh;
+            }
+        }
+    }
+    fb_user_flip64(fx0, fy0, fx1 - fx0, fy1 - fy0);   // 组合器自己的提交（不受内核绘制开关影响）
     wl64_begin64();
     wl64_puts64("[WL64] blit surf="); wl64_udec64(s->id);
     wl64_puts64(" shm=");             wl64_dec64(s->shm_id);
@@ -1122,9 +1268,63 @@ int64_t wl64_surface_move64(uint64_t surf, uint64_t xy) {
     return 0;
 }
 
+// 28 wl_surface_set_decor(surf, flags, title_uptr)：把 surface 声明成**窗口**（★ v0.11.1）
+//   语义见 kernel/wl64.h 的 WL64_ABI_SURFACE_DECOR64 段。要点：
+//   ① 权限与 27 号一致（拥有者 / 注册合成器），别的进程 EPERM；
+//   ② flags 只认 bit0（1 = 有装饰），其余位必须为 0 —— 不猜未知语义，直接 EINVAL；
+//   ③ title 是用户态 C 串，**逐字节过 user64_range_ok64** 再拷（最多 31 B + 结尾 0），
+//      指针 0 = 保留原标题；串没有结尾 0 也不会越过上限（第 31 字节处强制截断）；
+//   ④ 装饰不改几何/不改 z 序，只是"合成器怎么画"。已经 attach 过缓冲的 surface 立刻
+//      重新入队合成一次 —— 否则设置完要等下一次 commit 才看得见效果（验收会读不到
+//      `[WL64] deco paint` 那一行）。
+int64_t wl64_surface_set_decor64(uint64_t surf, uint64_t flags, uint64_t title_uptr) {
+    const int64_t pid = wl64_pid64();
+    if (pid <= 0) return WL64_EPERM64;
+    Wl64Surface* s = wl64_find64((uint32_t)surf);
+    if (!s) return WL64_ENOENT64;
+    const bool owner = (s->pid == (int32_t)pid);
+    if (!owner && !wl64_is_wm64(pid)) return WL64_EPERM64;
+    if ((flags & ~(uint64_t)WL64_DECOR_F_WINDOW64) != 0) return WL64_EINVAL64;
+    char tb[32];
+    for (uint32_t i = 0; i < (uint32_t)sizeof(tb); i++) tb[i] = 0;
+    if (title_uptr) {
+        uint32_t n = 0;
+        for (; n + 1u < (uint32_t)sizeof(tb); n++) {
+            if (!user64_range_ok64(title_uptr + (uint64_t)n, 1)) return WL64_EFAULT64;
+            const char c = *(const char*)(uintptr_t)(title_uptr + (uint64_t)n);
+            tb[n] = c;
+            if (!c) break;
+        }
+        tb[sizeof(tb) - 1u] = 0;
+    }
+    bool changed = (s->decor != (uint32_t)flags);
+    if (title_uptr) {
+        for (uint32_t i = 0; i < (uint32_t)sizeof(tb); i++) {
+            if (s->title[i] != tb[i]) { changed = true; break; }
+        }
+    }
+    s->decor = (uint32_t)flags;
+    if (title_uptr) {
+        for (uint32_t i = 0; i < (uint32_t)sizeof(s->title); i++) s->title[i] = tb[i];
+    }
+    s->deco_logged = 0;                       // 状态变了：下一次合成重新打一行 deco paint
+    if (s->shm_id) s->pending = 1;            // 已 attach 过缓冲 -> 立刻重新合成一遍
+    if (changed) {
+        wl64_begin64();
+        wl64_puts64("[WL64] decor id=");  wl64_udec64(s->id);
+        wl64_puts64(" pid=");             wl64_dec64(pid);
+        wl64_puts64(" flags=");           wl64_udec64(flags);
+        wl64_puts64(" mode=");            wl64_puts64((flags & WL64_DECOR_F_WINDOW64) ? "window" : "bare");
+        wl64_puts64(" hdr=");             wl64_udec64((uint64_t)WL64_DECOR_H64);
+        wl64_puts64(" title=\"");         wl64_puts64(s->title); wl64_puts64("\"");
+        wl64_nl64();
+        wl64_end64();
+    }
+    return 0;
+}
+
 // 诊断：当前注册的合成器 pid（0 = 没有）
 int wl64_composer_pid64() { return g_wl64_wm_pid64; }
-
 // ==================== 初始化 / 标定 / 自检 ====================
 // rdtsc -> us 标定：用 PIT tick（250Hz）量一小段时间的周期数。为了不浪费启动时间只量 ~20ms。
 // 标定失败（dt=0 / tsc 不动）时 g_wl64_tsc_per_ms64 = 0 -> us 打 0（如实，不编数）。
@@ -1195,6 +1395,7 @@ int wl64_selftest64() {
         if (wl64_seat_post64(0) != WL64_EPERM64) fail |= 4;
         if (wl64_composer_get64(0) != WL64_EPERM64) fail |= 4;   // 没有进程上下文：不许注册成功
         if (wl64_surface_move64(1, 0) != WL64_EPERM64) fail |= 4; // ★ 27 号同样不许凭空挪窗口
+        if (wl64_surface_set_decor64(1, 1, 0) != WL64_EPERM64) fail |= 4;  // ★ 28 号：不许凭空设装饰
     }
 
     // ---- bit3：面板/槽位几何在屏内（放得下才检查）----
@@ -1224,6 +1425,9 @@ int wl64_selftest64() {
     // ★ 不变量：映射窗步长必须装得下单 surface 的最大缓冲（像素上限 * 4B）
     if (WL64_SURF_WIN_STRIDE64 < (uint64_t)WL64_MAX_PIXELS64 * 4ULL) fail |= 16;
     if (WL64_ABI_SURFACE_MOVE64 != 27) fail |= 16;      // ★ W3 第二批：27 = wl_surface_move
+    if (WL64_ABI_SURFACE_DECOR64 != 28) fail |= 16;     // ★ v0.11.1：28 = wl_surface_set_decor
+    if (WL64_DECOR_H64 != 25) fail |= 16;               // 装饰占高必须 == gui64 的 TITLE_H + BORDER
+    if ((uint32_t)gui64_deco_h64() != WL64_DECOR_H64) fail |= 16;   // 同一把尺子（两边不许漂）
     if (WL64_MOVE_KEEP64 < 1 || WL64_MOVE_KEEP64 > 128) fail |= 16;   // 夹取余量必须"小但非零"
     {
         // 映射窗必须在 FB 映射区内，且**不压到后备缓冲**（否则合成器会把自己映射进显存里）
@@ -1258,7 +1462,7 @@ void wl64_init64() {
     wl64_end64();
     wl64_begin64();
     if (sf == 0) {
-        wl64_puts64("[WL64] selftest PASS (abi 15..21 + composer 22..26 + move 27 / events 64B / info 64B / rect clip / no-proc EPERM)\n");
+        wl64_puts64("[WL64] selftest PASS (abi 15..21 + composer 22..26 + move 27 + decor 28 / events 64B / info 64B / rect clip / no-proc EPERM)\n");
     } else {
         wl64_puts64("[WL64] selftest FAIL mask=");
         wl64_udec64((uint64_t)sf);

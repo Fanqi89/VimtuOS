@@ -111,6 +111,17 @@ void    gui64_invalidate_window(Window* w);  // 只重绘某个窗口
 void    gui64_flip_window(Window* w);        // 立即把该窗口区域提交上屏
 void    gui64_dirty(int x, int y, int w, int h);
 
+// --- ★ v0.11.1：窗口装饰的单一真源（内核窗口与 ring3 的 wl_surface 窗口共用）---
+// 为什么导出：ring3 的 wl_surface 没有"标题栏/圆角"概念（客户端自绘会一人一个样），
+// 所以**合成器接管装饰**：gui64 的 draw_window() 与 kernel/wl64.cpp 的合成路径调同一对函数。
+//   前半（画在客户区内容**之前**）：阴影 + 标题栏玻璃 + 标题文字 + 三个按钮；
+//   后半（画在客户区内容**之后**）：1px 玻璃边框 + 四角圆角裁切。
+// 两个函数都是逐像素确定的（同一像素重复画结果相同），所以可以按遮挡切子矩形、设 clip 反复调用。
+// 它们**不设 clip**（调用方负责）—— wl_surface 那条路必须先 fb_set_clip 再调。
+void    gui64_deco_frame64(int x, int y, int w, int h, const char* title, int active);
+void    gui64_deco_edge64(int x, int y, int w, int h);
+int     gui64_deco_h64();                    // 装饰占掉的高度（标题栏 24 + 上边框 1 = 25）
+
 // --- 查询 ---
 int     gui64_screen_w();
 int     gui64_screen_h();

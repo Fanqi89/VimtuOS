@@ -37,3 +37,9 @@ int wl_seat_get(void) {
 int wl_display_dispatch(unsigned timeout_ms, struct Wl64SeatEvent* out, unsigned max) {
     return (int)__v64_int80(V64_NR_WL_DISPATCH, (long)timeout_ms, (long)(unsigned long)out, (long)max, 0);
 }
+
+/* ★ v0.11.1：把 surface 声明成窗口（装饰归合成器画）。title 可为 0 = 保留原标题。 */
+int wl_surface_set_decor(int surf, unsigned flags, const char* title) {
+    return (int)__v64_int80(V64_NR_WL_SURFACE_DECOR, (long)surf, (long)flags,
+                            (long)(unsigned long)title, 0);
+}
