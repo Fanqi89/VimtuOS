@@ -2807,6 +2807,9 @@ static void render(void) {
     // ★ 缺陷 P7a-11：指针必须画在**所有**面板之上（二级菜单/通知/音量/网络弹层原本盖住指针）。
     //   旧顺序是 startmenu -> draw_cursor -> panels，弹层覆盖光标区域时就把指针吞了。
     panels64_draw64();
+    // ★ v0.11.1：拖拽幽灵（explorer -> 桌面）。画在**所有窗口/面板之上、指针之下**：
+    //   用户把文件从资源管理器拖到桌面上时，幽灵必须压过窗口与 Dock 才看得见。
+    explorer64_drag_paint64();
     draw_cursor();               // ★ P5：按形状画指针（箭头/文本/转圈/缩放）
     rseg64(5, &ts);
     fb_reset_clip();
@@ -3308,6 +3311,10 @@ int app_launch_exec64(const char* exec, const char* via) {
     dbg64_line_end64();
     return rc;
 }
+// ★ v0.11.1：拖拽落点判定要问"光标下有没有窗口"（桌面 = 没有）。win_at 是本文件的静态命中测试，
+//   这里只做一次薄封装（不改变任何既有分发逻辑）。
+int gui64_hit_window64(int x, int y) { return win_at(x, y) ? 1 : 0; }
+
 
 // ★ 缺陷 1：老开始菜单的**动作分派**（menu_activate）与**开关**（menu_toggle）整体删除。
 //   新开始菜单的应用启动 / 关机·重启·锁定都在 kernel/startmenu64.cpp（固定网格 / 搜索 / 电源菜单），
@@ -3655,6 +3662,18 @@ static void handle_mouse(void) {
                             dbg64_str(app64_reg_exec64(reg));
                             dbg64_nl();
                             (void)app_launch_exec64(app64_reg_exec64(reg), "desktop-dblclick");
+                        }
+                    }
+                    else if (kind == DESKOPS_KIND_FILE) {
+                        // ★ v0.11.1：拖到桌面上的文件快捷方式：双击 -> 资源管理器打开它所在目录并选中它
+                        char fpath[DESKOPS_LINK_PATH_MAX];
+                        if (desktopops64_file_path64(i, fpath, (int)sizeof(fpath)) >= 0) {
+                            dbg64_line_begin64();
+                            dbg64_str("[DESK64] dblclick file path=");
+                            dbg64_str(fpath);
+                            dbg64_nl();
+                            dbg64_line_end64();
+                            explorer64_open_path64(fpath, desktopops64_file_letter64(i));
                         }
                     }
                     else app_term_open64();

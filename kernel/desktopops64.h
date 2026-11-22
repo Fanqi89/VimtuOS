@@ -49,9 +49,16 @@
                                      //   注意：它不写进 ui.desktop.icons 的集合字符串（那是 0..7 的
                                      //   内置项）；快捷方式的有无由注册表的 desktop 标志决定，
                                      //   位置写回注册表（跨重启持久化）。
+#define DESKOPS_KIND_FILE      9     // ★ v0.11.1：从资源管理器**拖到桌面**的文件/文件夹快捷方式。
+                                     //   与 KIND_APP 的差别：它指向**卷内的一个真实路径**（不是注册表条目），
+                                     //   名字 = 路径的 basename，双击 = 打开所在目录（explorer64）。
+                                     //   **不进** ui.desktop.icons（那个串只编码 0..7 的 kind），
+                                     //   持久化走独立文件 /etc/desktop.links（见下）。
 
-#define DESKOPS_MAX_ITEMS      8     // 桌面项上限（3 内置 + 5 文件夹）
+#define DESKOPS_MAX_ITEMS      16    // 桌面项上限（3 内置 + 5 文件夹 + 应用快捷方式 + 文件快捷方式）
 #define DESKOPS_RECYCLE_MAX    8     // 回收站内容上限
+#define DESKOPS_LINK_MAX       8     // ★ v0.11.1：文件快捷方式条数上限（= /etc/desktop.links 行数上限）
+#define DESKOPS_LINK_PATH_MAX  128   // 单条路径上限（与 VFS64_PATH_MAX 同口径）
 
 // ---- 生命周期 ----
 void desktopops64_init64();      // gui64_run 里（dock 几何就绪之后、首帧之前）调一次
@@ -70,12 +77,30 @@ void desktopops64_clamp64(int x, int y);                 // 屏幕尺寸变化�
 void desktopops64_draw_icons64(int selected);            // 画全部桌面项（选中底 + 圆角正方形底板 + 位图/文件夹）
 int  desktopops64_is_recycle_hit64(int mx, int my);       // 命中"回收站"那一项
 void desktopops64_restore_defaults64(const char* why);   // 恢复默认桌面图标（设置页/终端）
+// ---- ★ v0.11.1：文件快捷方式（资源管理器 -> 桌面拖拽的落点）----
+//   存储：/etc/desktop.links（系统卷，纯文本，一行一条：`<dir>|<x>|<y>|<letter>|<path>`）。
+//   为什么不用 config64：CFG64_STR_MAX = 64 B，放不下多条路径；而这个集合是"用户放的东西"，
+//   与 ui.desktop.icons（0..7 的 kind 串）本来就是两套语义，混进同一个键会互相截断。
+//   **letter 必须存**：路径是"卷内的绝对路径"，D:（FAT 只读）上拖出来的同一个 `/a.txt`
+//   与 C: 上的是两个文件 —— 不带卷字母就等于重启后指错文件（这是设计时就钉住的）。
+//   add：落点吸附网格 + 占用避让 + **真落盘**（写失败如实返回 0 并打 rc=）；返回 1 = 真的加上了。
+int  desktopops64_add_file64(const char* path, int is_dir, int sx, int sy, char letter, const char* why);
+int  desktopops64_file_path64(int i, char* out, int cap);   // 第 i 项是文件快捷方式 -> 路径；否则 -1
+char desktopops64_file_letter64(int i);                      // 卷字母（'A'..'Z'；非文件项 = 0）
+int  desktopops64_is_file64(int i);                          // 1 = 该项是文件快捷方式
+int  desktopops64_file_count64();                            // 当前文件快捷方式条数
+int  desktopops64_remove_file64(int i, const char* why);     // 删一条（回收站/右键删除走这里）
+void desktopops64_links_reload64(const char* why);           // 从 /etc/desktop.links 重读（自检/终端）
+const char* desktopops64_links_path64();                     // "/etc/desktop.links"（验收脚本/日志共用）
 
 // ---- 回收站 ----
 int  desktopops64_recycle_count64();
 int  desktopops64_recycle_add64(int icon_idx);           // 桌面项 -> 回收站（1 = 成功）
 void desktopops64_recycle_open64();                      // 打开回收站窗口（无则建）
 void desktopops64_recycle_reset64();                     // 会话重置（关窗清状态）
+// ★ v0.11.1：按路径打开资源管理器（文件快捷方式双击/右键"打开"走这里；实现在 explorer64.cpp）
+// 按路径 + 卷字母打开资源管理器（文件快捷方式双击/右键"打开"走这里；实现在 explorer64.cpp）
+void explorer64_open_path64(const char* path, char letter);
 
 // ---- 桌面右键菜单 ----
 int  desktopops64_menu_is_open64();

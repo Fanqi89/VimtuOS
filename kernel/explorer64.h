@@ -90,5 +90,17 @@ void explorer64_reset64();
 // 当前窗口（没有 = nullptr）；外壳每秒刷新时钟时用它做局部重绘。
 Window* explorer64_window64();
 
+// ==================== ★ v0.11.1：跨层拖拽 + 按路径打开 ====================
+// 拖拽（资源管理器条目 -> 桌面）：状态机全在本模块，外壳只做两件事：
+//   ① render() 里调 explorer64_drag_paint64() 把幽灵画在**所有窗口之上、光标之下**；
+//   ② 提供 gui64_hit_window64()（落点判定：光标下有没有窗口）。
+// 打点：[UI] explorer drag begin idx=.. name=.. dir=.. sx=.. sy=.. min=8
+//       [UI] explorer drag drop path=.. dir=.. x=.. y=.. target=desktop|none ok=0|1
+void explorer64_drag_paint64(void);          // 画幽灵（没在拖 = 空操作）
+int  explorer64_drag_active64(void);         // 1 = 正在拖（验收/调试用）
+void explorer64_drag_rect64(int* x, int* y, int* w, int* h);   // 幽灵屏幕矩形（脏矩形用）
+// 按路径打开（桌面文件快捷方式双击/右键"打开"）；窗口不存在就先建一个。
+void explorer64_open_path64(const char* path);
+
 // 纯逻辑自检：单位换算 / 路径与面包屑切分 / 滚动钳制 / 历史栈（不建窗口、不碰盘）。
 int explorer64_selftest64();

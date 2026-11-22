@@ -126,6 +126,8 @@ Window* gui64_window_by_id64(int id);        // ★ v0.8.0：按**窗口槽**取
 int     gui64_window_count();
 int     gui64_app_windows(int app_id);
 bool    gui64_click_is_right();
+// ★ v0.11.1：光标下有没有窗口（1 = 有）。拖拽落点判定用：桌面 = 没有窗口的地方。
+int     gui64_hit_window64(int x, int y);
 bool    gui64_window_alive(Window* w);       // 指针是否仍是活动窗口（防重复打开时用悬空指针）
 void    gui64_close_all_windows();
 int     gui64_close_app(int app_id);         // 关掉某应用的全部窗口（任务管理器"结束任务"用）

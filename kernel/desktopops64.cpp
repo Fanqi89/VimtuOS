@@ -20,7 +20,9 @@
 #include "debug64.h"
 #include "x86_64.h"
 #include "icons64.h"          // ★ 应用快捷方式的图标：包里的系统图标 / 注册表里的 PNG 文件
+#include "panic64.h"          // ★ v0.11.1：帧内写 /etc/desktop.links 时临时停看门狗
 #include "app64.h"            // ★ 应用注册表（/etc/apps.json）：桌面快捷方式的单一真源
+#include "vfs64.h"            // ★ v0.11.1：/etc/desktop.links 的读写（系统卷按槽操作，见 vfs64_write_on64）
 // ---- 桌面图标单元格（与 gui64.cpp 的 ICON_W/ICON_CELL_W/ICON_CELL_H 一致）----
 #define DOPS_ICON_W      48
 #define DOPS_CELL_W      88
@@ -35,7 +37,14 @@
 #define DOPS_GRID_Y0  DOPS_ICON_Y0
 
 // ==================== 状态 ====================
-struct DeskItem { int kind; int app; int x, y; };   // app = 注册表下标（kind == DESKOPS_KIND_APP 时有效）
+struct DeskItem {
+    int  kind;
+    int  app;                              // kind == DESKOPS_KIND_APP 时有效（注册表下标）
+    int  x, y;
+    int  dir;                              // ★ v0.11.1：kind == DESKOPS_KIND_FILE 时有效（1 = 文件夹）
+    char letter;                           // ★ v0.11.1：文件快捷方式所在卷字母（'C' 等；0 = 未知）
+    char path[DESKOPS_LINK_PATH_MAX];      // ★ v0.11.1：文件快捷方式指向的卷内绝对路径
+};
 static DeskItem g_items[DESKOPS_MAX_ITEMS];
 static int      g_n = 0;
 static int      g_recycle[DESKOPS_RECYCLE_MAX];
@@ -117,6 +126,17 @@ static void icon_menu_action(int idx) {
                         (void)app_launch_exec64(app64_reg_exec64(g_items[target].app), "desktop-menu");
                     }
                 }
+                else if (kind == DESKOPS_KIND_FILE) {
+                    // ★ v0.11.1：文件快捷方式 —— 打开它所在的目录（explorer 里选中该条目）
+                    if (target >= 0) {
+                        dbg64_line_begin64();
+                        dbg64_str("[DESK64] icon menu open file path=");
+                        dbg64_str(g_items[target].path);
+                        dbg64_nl();
+                        dbg64_line_end64();
+                        explorer64_open_path64(g_items[target].path, desktopops64_file_letter64(target));
+                    }
+                }
                 else app_term_open64();
                 why = "opened";
                 break;
@@ -180,14 +200,28 @@ static const char* item_name(int kind) {
     if (kind == DESKOPS_KIND_MYPC)    return gui64_tr("My Computer", "我的电脑");
     if (kind == DESKOPS_KIND_RECYCLE) return gui64_tr("Recycle Bin", "回收站");
     if (kind == DESKOPS_KIND_TERM)    return gui64_tr("Terminal", "终端");
+    if (kind == DESKOPS_KIND_FILE)    return gui64_tr("File", "文件");
     return gui64_tr("New folder", "新建文件夹");
 }
 
+// 路径的 basename（不含目录；结尾是 '/' 时返回空串 —— 桌面不显示这种路径）
+static const char* base_name64(const char* path) {
+    if (!path) return "";
+    const char* b = path;
+    for (const char* p = path; *p; p++) if (*p == '/') b = p + 1;
+    return b;
+}
+
 // ★ 应用快捷方式的名字：注册表里那条（用户应用显示名）；内置项仍按 kind 翻译
+// ★ v0.11.1：文件快捷方式的名字 = 路径 basename（**不读盘**，纯字符串切分）
 static const char* item_name_of(const DeskItem& it) {
     if (it.kind == DESKOPS_KIND_APP) {
         const char* n = app64_reg_name64(it.app);
         return (n && n[0]) ? n : gui64_tr("Application", "应用");
+    }
+    if (it.kind == DESKOPS_KIND_FILE) {
+        const char* b = base_name64(it.path);
+        return b[0] ? b : gui64_tr("File", "文件");
     }
     return item_name(it.kind);
 }
@@ -223,29 +257,34 @@ static void draw_app_shortcut_icon64(int reg, int x, int y, int size) {
 }
 
 // ==================== 持久化（ui.desktop.icons = "桌面集合|回收站集合"）====================
-static void set_cache_sync(void) {
-    char buf[CFG64_STR_MAX];
-    int n = 0;
-    for (int i = 0; i < g_n && n < (int)sizeof(buf) - 3; i++) {
-        if (i) buf[n++] = ',';
-        buf[n++] = (char)('0' + (g_items[i].kind % 10));
+// ★ v0.11.1：**文件快捷方式（kind 9）不进这个串** —— 只编码 0..7 的内置项，
+//   它们自己的持久化在 /etc/desktop.links（见下面的 links_*）。这里统一跳过，
+//   于是既有键的字节与 v0.11.0 完全一致（既有验收对 ui.desktop.icons 的断言不受影响）。
+static void build_set_str64(char* buf, int cap) {
+    int n = 0, k = 0;
+    for (int i = 0; i < g_n && n < cap - 3; i++) {
+        const int kind = g_items[i].kind;
+        if (kind < 0 || kind > 7) continue;          // 应用(8)/文件(9) 都有各自的真源
+        if (k++) buf[n++] = ',';
+        buf[n++] = (char)('0' + (kind % 10));
     }
-    buf[n++] = '|';
-    for (int i = 0; i < g_rec_n && n < (int)sizeof(buf) - 3; i++) {
+    if (n < cap - 1) buf[n++] = '|';
+    for (int i = 0; i < g_rec_n && n < cap - 3; i++) {
         if (i) buf[n++] = ',';
         buf[n++] = (char)('0' + (g_recycle[i] % 10));
     }
+    if (n >= cap) n = cap - 1;
     buf[n] = 0;
+}
+static void set_cache_sync(void) {
+    char buf[CFG64_STR_MAX];
+    build_set_str64(buf, (int)sizeof(buf));
     s_cpy(g_set_cache, buf, (int)sizeof(g_set_cache));
     cfg64_set_desktop_icons64(buf);
 }
 static void set_cache_only(void) {
     char buf[CFG64_STR_MAX];
-    int n = 0;
-    for (int i = 0; i < g_n && n < (int)sizeof(buf) - 3; i++) { if (i) buf[n++] = ','; buf[n++] = (char)('0' + (g_items[i].kind % 10)); }
-    buf[n++] = '|';
-    for (int i = 0; i < g_rec_n && n < (int)sizeof(buf) - 3; i++) { if (i) buf[n++] = ','; buf[n++] = (char)('0' + (g_recycle[i] % 10)); }
-    buf[n] = 0;
+    build_set_str64(buf, (int)sizeof(buf));
     s_cpy(g_set_cache, buf, (int)sizeof(g_set_cache));
 }
 
@@ -277,6 +316,12 @@ static void apply_set(const char* s) {
         if (in_bin) { if (nr < DESKOPS_RECYCLE_MAX) wr[nr++] = k; }
         else         { if (nd < DESKOPS_MAX_ITEMS) wd[nd++] = k; }
     }
+    // ★ v0.11.1：**这里保持纯净** —— 只按 kind 串重建内置项（0..7）与回收站。
+    //   文件快捷方式（kind 9）不在这条串里，所以它的保留必须由**调用方**做
+    //   （desktopops64_tick64 / restore_defaults 用 items_keep_files64/items_restore_files64）。
+    //   为什么不在本函数里顺手保住：`desktopops64_selftest64` 的两条判据就是
+    //   "apply_set(\"0,1,2|\") 之后必须正好 3 项"—— 把保留逻辑塞进来会直接把 selftest 判红
+    //   （v0.11.1 实测 `[DESK64] selftest FAIL mask=28`，正是本批自己踩的坑）。
     g_n = 0;
     for (int a = 0; a < nd; a++) {
         if (wd[a] > 7) continue;
@@ -292,6 +337,17 @@ static void apply_set(const char* s) {
     }
     g_sel_n = 0; g_sel_anchor = -1;             // ★ P7a-9：集合重建 -> 选择集合作废
     set_cache_only();
+}
+
+// ★ v0.11.1：把文件快捷方式从"重建前"搬到"重建后"（apply_set 只认 kind 串，不含 kind 9）
+static int items_keep_files64(DeskItem* keep) {
+    int n = 0;
+    for (int a = 0; a < g_n && n < DESKOPS_LINK_MAX; a++)
+        if (g_items[a].kind == DESKOPS_KIND_FILE) keep[n++] = g_items[a];
+    return n;
+}
+static void items_restore_files64(const DeskItem* keep, int n) {
+    for (int a = 0; a < n && g_n < DESKOPS_MAX_ITEMS; a++) g_items[g_n++] = keep[a];
 }
 
 static void log_items(void) {
@@ -332,6 +388,9 @@ static void log_set_line(const char* tag) {
     dbg64_nl();
     dbg64_line_end64();
 }
+// ★ v0.11.1：文件快捷方式（/etc/desktop.links）—— 实现在下面（依赖网格吸附/避让，故前置声明）
+static void links_load64(const char* why);
+static int links_save64(const char* why);      // 1 = 真写成功（rc == bytes）
 
 void desktopops64_init64() {
     char buf[CFG64_STR_MAX];
@@ -339,6 +398,7 @@ void desktopops64_init64() {
     apply_set(buf);
     (void)app_items_sync64();          // ★ 用户安装的应用（注册表 desktop=1）-> 桌面快捷方式
     g_reg_gen_seen = app64_registry_gen64();   // 启动期这一遍已经消化过了（见 desktopops64_tick64）
+    links_load64("init");              // ★ v0.11.1：用户拖到桌面的文件图标（/etc/desktop.links）
     log_set_line("[DESK64] init");
     log_items();
 }
@@ -366,7 +426,11 @@ int desktopops64_tick64() {
     char buf[CFG64_STR_MAX];
     cfg64_desktop_icons64(buf, (int)sizeof(buf));
     if (!s_eq(buf, g_set_cache)) {
+        // ★ v0.11.1：文件快捷方式（kind 9）不在 kind 串里 —— 重建前后要**自己接住**
+        DeskItem keep[DESKOPS_LINK_MAX];
+        const int keep_n = items_keep_files64(keep);
         apply_set(buf);
+        items_restore_files64(keep, keep_n);
         log_set_line("[DESK64] set changed");
         changed = 1;
     }
@@ -394,6 +458,7 @@ void desktopops64_set_pos64(int i, int x, int y) {
     if (g_items[i].kind <= 2) cfg64_set_icon64(g_items[i].kind, x, y);   // 既有键（跨重启）
     else if (g_items[i].kind == DESKOPS_KIND_APP)                        // ★ 应用快捷方式：位置写注册表
         (void)app64_reg_set_pos64(g_items[i].app, x, y);
+    else if (g_items[i].kind == DESKOPS_KIND_FILE) links_save64("setpos");  // ★ v0.11.1：位置写 /etc/desktop.links
 }
 int desktopops64_app64(int i) {
     return (i >= 0 && i < g_n && g_items[i].kind == DESKOPS_KIND_APP) ? g_items[i].app : -1;
@@ -481,6 +546,329 @@ void desktopops64_drop64(int i, int x, int y) {
     dbg64_dec((uint64_t)(avoid > 0 ? 1 : 0));
     dbg64_nl();
     dbg64_line_end64();
+}
+
+// ==================== ★ v0.11.1：文件快捷方式（/etc/desktop.links）====================
+// 为什么是文件而不是 config 键：CFG64_STR_MAX = 64 B，连两条路径都放不下；而这个集合是
+// "用户在桌面上放的东西"，与 ui.desktop.icons（0..7 的 kind 串）是两套语义。
+// 格式（纯文本，一行一条，UTF-8）：`<dir>|<x>|<y>|<path>\n`   （dir: 0 = 文件，1 = 文件夹）
+//   * 写：**整体重写**（vfs64_write_on64 走系统卷槽，与 app64 写 /etc/apps.json 同一套）；
+//   * 读：坏行整行跳过（不猜、不修），并在 [DESK64] links load 行里如实报 skipped=；
+//   * /etc 目录由构建期造卷建好；万一不在就 mkdir 一次（失败如实打 rc=）。
+#define DOPS_LINKS_PATH "/etc/desktop.links"
+const char* desktopops64_links_path64() { return DOPS_LINKS_PATH; }
+// 十进制（本地小工具：本文件原本只靠 dbg64_dec 打印数字，不需要通用转换）
+static void dops_u2s(char* out, int cap, uint64_t v) {
+    char t[24];
+    int n = 0;
+    if (v == 0) t[n++] = '0';
+    while (v && n < (int)sizeof(t)) { t[n++] = (char)('0' + (int)(v % 10)); v /= 10; }
+    int k = 0;
+    while (n > 0 && k < cap - 1) out[k++] = t[--n];
+    out[k] = 0;
+}
+
+// 同一条快捷方式 = (卷字母, 路径) 都相同。只看路径会把 C:/a.txt 与 D:/a.txt 当成同一个。
+static int file_item_at64(const char* path, char letter) {
+    if (!path || !path[0]) return -1;
+    const char vol = (letter >= 'A' && letter <= 'Z') ? letter : 'C';
+    for (int i = 0; i < g_n; i++) {
+        if (g_items[i].kind != DESKOPS_KIND_FILE) continue;
+        const char iv = (g_items[i].letter >= 'A' && g_items[i].letter <= 'Z') ? g_items[i].letter : 'C';
+        if (iv == vol && s_eq(g_items[i].path, path)) return i;
+    }
+    return -1;
+}
+
+// 把当前所有文件快捷方式整体写回 /etc/desktop.links（**真落盘**；失败如实打 rc=，不假装成功）
+static int links_save64(const char* why) {
+    char buf[DESKOPS_LINK_MAX * (DESKOPS_LINK_PATH_MAX + 24) + 8];
+    int n = 0, cnt = 0;
+    for (int i = 0; i < g_n; i++) {
+        if (g_items[i].kind != DESKOPS_KIND_FILE) continue;
+        if (!g_items[i].path[0]) continue;
+        if (n > (int)sizeof(buf) - (DESKOPS_LINK_PATH_MAX + 24)) break;
+        // dir | letter
+        buf[n++] = g_items[i].dir ? '1' : '0';
+        buf[n++] = '|';
+        buf[n++] = (g_items[i].letter >= 'A' && g_items[i].letter <= 'Z') ? g_items[i].letter : 'C';
+        buf[n++] = '|';
+        // x
+        {
+            char t[12]; dops_u2s(t, (int)sizeof(t), (uint64_t)(g_items[i].x < 0 ? 0 : g_items[i].x));
+            for (int k = 0; t[k] && n < (int)sizeof(buf) - 1; k++) buf[n++] = t[k];
+        }
+        buf[n++] = '|';
+        {
+            char t[12]; dops_u2s(t, (int)sizeof(t), (uint64_t)(g_items[i].y < 0 ? 0 : g_items[i].y));
+            for (int k = 0; t[k] && n < (int)sizeof(buf) - 1; k++) buf[n++] = t[k];
+        }
+        buf[n++] = '|';
+        for (int k = 0; g_items[i].path[k] && n < (int)sizeof(buf) - 2; k++) buf[n++] = g_items[i].path[k];
+        buf[n++] = '\n';
+        cnt++;
+    }
+    const int32_t sys = vfs64_system_slot64();
+    int rc = -1;
+    // ★ 帧内写盘：临时停看门狗（与 app64 写 /etc/apps.json、terminal 装 blob 同款做法）。
+    //   写的是**用户动作那一下**（拖放/删除），不是每帧，所以不会把帧预算吃掉。
+    if (sys >= 0) {
+        panic64_watchdog_pause64();
+        rc = vfs64_write_on64(sys, DOPS_LINKS_PATH, buf, n);
+        panic64_watchdog_unpause64();
+    }
+    dbg64_line_begin64();
+    dbg64_str("[DESK64] links save why=");
+    dbg64_str(why ? why : "-");
+    dbg64_str(" n=");
+    dbg64_dec((uint64_t)cnt);
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)n);
+    dbg64_str(" rc=");
+    dbg64_dec((uint64_t)(uint32_t)rc);
+    dbg64_str(rc == n ? " ok=1" : " ok=0");
+    dbg64_str(" path=");
+    dbg64_str(DOPS_LINKS_PATH);
+    dbg64_nl();
+    dbg64_line_end64();
+    return (rc == n) ? 1 : 0;
+}
+
+// 从 /etc/desktop.links 读回文件快捷方式（幂等：先清掉内存里的那一批，再按文件重建）
+static void links_load64(const char* why) {
+    // 先把内存里的文件项摘掉（其余项保持原序，既有验收看的 index 不受影响以外的顺序变化：
+    // 文件项永远排在最后，这里是"摘掉再追加"，所以 builtin/app 项的下标一位都不动）
+    for (int i = 0; i < g_n;) {
+        if (g_items[i].kind != DESKOPS_KIND_FILE) { i++; continue; }
+        for (int k = i; k + 1 < g_n; k++) g_items[k] = g_items[k + 1];
+        g_n--;
+    }
+    g_sel_n = 0; g_sel_anchor = -1;
+
+    const int32_t sys = vfs64_system_slot64();
+    static char rd[(DESKOPS_LINK_MAX + 2) * (DESKOPS_LINK_PATH_MAX + 24) + 8];
+    int len = -1;
+    if (sys >= 0) len = vfs64_read_on64(sys, DOPS_LINKS_PATH, rd, (int)sizeof(rd) - 1);
+    int added = 0, skipped = 0;
+    if (len > 0) {
+        rd[len] = 0;
+        int i = 0;
+        while (i < len) {
+            // 取一行
+            char line[DESKOPS_LINK_PATH_MAX + 32];
+            int ln = 0;
+            while (i < len && rd[i] != '\n' && ln < (int)sizeof(line) - 1) line[ln++] = rd[i++];
+            while (i < len && rd[i] != '\n') i++;      // 超长行：整行丢弃（下面的解析会判坏）
+            if (i < len && rd[i] == '\n') i++;
+            line[ln] = 0;
+            if (ln < 7) continue;                       // 空行 / 太短
+            // 先按 '|' 切段（最多 5 段），再按段数决定格式：
+            //   5 段 = `dir|letter|x|y|path`（v0.11.1）；4 段 = 旧格式 `dir|x|y|path`（卷字母按 'C'）
+            //   逐字符状态机比"边扫边猜"好读，也不容易把字母字段吃进数字里（第一版就是那么错的）。
+            char fld[5][DESKOPS_LINK_PATH_MAX];
+            int fld_n = 0, fld_pos = 0, nf = 0;
+            for (int k = 0; k < 5; k++) fld[k][0] = 0;
+            for (int k = 0; ; k++) {
+                const char c = line[k];
+                if (c == '|' || c == 0) {
+                    if (nf < 5) { fld[nf][fld_pos] = 0; nf++; }
+                    fld_n = nf;
+                    fld_pos = 0;
+                    if (c == 0) break;
+                    continue;
+                }
+                if (nf < 5 && fld_pos < DESKOPS_LINK_PATH_MAX - 1) fld[nf][fld_pos++] = c;
+            }
+            if (fld_n != 4 && fld_n != 5) { skipped++; continue; }
+            // 数字段只接受十进制（非法就不认这一行）
+            int dir = -1, x = 0, y = 0;
+            char letter = 'C';
+            const char* fpath = nullptr;
+            bool ok = true;
+            {
+                const int i0 = 0;                       // dir
+                if (fld[i0][0] && fld[i0][1] == 0 && fld[i0][0] >= '0' && fld[i0][0] <= '1') dir = fld[i0][0] - '0';
+                else ok = false;
+            }
+            int ix = 0;                                 // x/y 字段下标随格式移动
+            if (ok && fld_n == 5) {
+                const char c0 = fld[1][0];
+                if (!c0 || fld[1][1] || c0 < 'A' || c0 > 'Z') ok = false;
+                else letter = c0;
+                ix = 2;
+            }
+            if (ok) {
+                for (int k = 0; fld[ix][k]; k++) {
+                    if (fld[ix][k] < '0' || fld[ix][k] > '9') { ok = false; break; }
+                    x = x * 10 + (fld[ix][k] - '0');
+                    if (x > 100000) { ok = false; break; }
+                }
+                for (int k = 0; fld[ix + 1][k]; k++) {
+                    if (fld[ix + 1][k] < '0' || fld[ix + 1][k] > '9') { ok = false; break; }
+                    y = y * 10 + (fld[ix + 1][k] - '0');
+                    if (y > 100000) { ok = false; break; }
+                }
+                fpath = fld[ix + 2];
+                if (!fpath[0] || fpath[0] != '/') ok = false;
+            }
+            if (!ok || dir < 0) { skipped++; continue; }
+            if (added >= DESKOPS_LINK_MAX || g_n >= DESKOPS_MAX_ITEMS) { skipped++; continue; }   // 上限：不越界
+            DeskItem it{};
+            it.kind = DESKOPS_KIND_FILE;
+            it.dir = dir;
+            it.letter = letter;                     // 5 段格式里读到的卷字母；4 段旧格式 = 'C'
+            it.x = x;
+            it.y = y;
+            s_cpy(it.path, fpath, (int)sizeof(it.path));
+            g_items[g_n++] = it;
+            added++;
+        }
+    }
+    dbg64_line_begin64();
+    dbg64_str("[DESK64] links load why=");
+    dbg64_str(why ? why : "-");
+    dbg64_str(" bytes=");
+    dbg64_dec((uint64_t)(len > 0 ? len : 0));
+    dbg64_str(" n=");
+    dbg64_dec((uint64_t)added);
+    dbg64_str(" skipped=");
+    dbg64_dec((uint64_t)skipped);
+    dbg64_str(len >= 0 ? " ok=1" : " ok=0");
+    dbg64_str(" items=");
+    dbg64_dec((uint64_t)g_n);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+void desktopops64_links_reload64(const char* why) { links_load64(why ? why : "reload"); gui64_invalidate(); }
+
+int desktopops64_is_file64(int i) {
+    return (i >= 0 && i < g_n && g_items[i].kind == DESKOPS_KIND_FILE) ? 1 : 0;
+}
+int desktopops64_file_path64(int i, char* out, int cap) {
+    if (i < 0 || i >= g_n || g_items[i].kind != DESKOPS_KIND_FILE || !out || cap <= 0) return -1;
+    int k = 0;
+    for (; g_items[i].path[k] && k < cap - 1; k++) out[k] = g_items[i].path[k];
+    out[k] = 0;
+    return k;
+}
+char desktopops64_file_letter64(int i) {
+    if (i < 0 || i >= g_n || g_items[i].kind != DESKOPS_KIND_FILE) return 0;
+    return (g_items[i].letter >= 'A' && g_items[i].letter <= 'Z') ? g_items[i].letter : 'C';
+}
+int desktopops64_file_count64() {
+    int n = 0;
+    for (int i = 0; i < g_n; i++) if (g_items[i].kind == DESKOPS_KIND_FILE) n++;
+    return n;
+}
+
+// 落点：吸附网格 + 占用避让 + 追加 + **真落盘**。
+//   顺序 = 先上屏再写盘；写失败**把图标撤掉**（宁可看不到，也不留一个"看得见但重启就没"的假图标）。
+//   幂等：同一条 (卷, 路径) 已在桌面上 = 只挪位置（不产生重复图标）。
+int desktopops64_add_file64(const char* path, int is_dir, int sx, int sy, char letter, const char* why) {
+    if (!path || path[0] != '/') {
+        dbg64_str("[DESK64] file add reject reason=bad-path\n");
+        return 0;
+    }
+    const char vol = (letter >= 'A' && letter <= 'Z') ? letter : 'C';
+    const int dup = file_item_at64(path, vol);
+    if (dup >= 0) {                                    // 已经在桌面上：只挪位置（幂等）
+        g_items[dup].dir = is_dir ? 1 : 0;
+        g_items[dup].letter = vol;
+        desktopops64_drop64(dup, sx, sy);
+        dbg64_line_begin64();
+        dbg64_str("[DESK64] file move idx=");
+        dbg64_dec((uint64_t)dup);
+        dbg64_str(" path=");
+        dbg64_str(path);
+        dbg64_str(" vol=");
+        dbg64_str(vol == 'C' ? "C:" : "?");
+        dbg64_str(" x="); dbg64_dec((uint64_t)g_items[dup].x);
+        dbg64_str(" y="); dbg64_dec((uint64_t)g_items[dup].y);
+        dbg64_str(" why=");
+        dbg64_str(why ? why : "-");
+        dbg64_nl();
+        dbg64_line_end64();
+        links_save64("move");
+        gui64_invalidate();
+        return 1;
+    }
+    if (desktopops64_file_count64() >= DESKOPS_LINK_MAX || g_n >= DESKOPS_MAX_ITEMS) {
+        dbg64_line_begin64();
+        dbg64_str("[DESK64] file add skip reason=desktop-full links=");
+        dbg64_dec((uint64_t)desktopops64_file_count64());
+        dbg64_str(" items=");
+        dbg64_dec((uint64_t)g_n);
+        dbg64_str(" cap=");
+        dbg64_dec((uint64_t)DESKOPS_LINK_MAX);
+        dbg64_nl();
+        dbg64_line_end64();
+        return 0;
+    }
+    DeskItem it{};
+    it.kind = DESKOPS_KIND_FILE;
+    it.dir = is_dir ? 1 : 0;
+    it.letter = vol;
+    it.x = sx;
+    it.y = sy;
+    s_cpy(it.path, path, (int)sizeof(it.path));
+    g_items[g_n++] = it;
+    const int idx = g_n - 1;
+    // 复用既有落点路径：place64 的 except 参数要一个**已存在的下标**，所以先追加再落点
+    //   （它内部做 snap + 占用避让，并打 [DESK64] snap idx=.. avoid=..）
+    desktopops64_drop64(idx, sx, sy);
+    const int nx = g_items[idx].x, ny = g_items[idx].y;
+    // ★ 写盘失败就撤掉：文件里存不下 = 重启就没了，那这个图标就是假的（宁可看不到）
+    if (!links_save64("add")) {
+        for (int k = idx; k + 1 < g_n; k++) g_items[k] = g_items[k + 1];
+        g_n--;
+        dbg64_line_begin64();
+        dbg64_str("[DESK64] file add rollback reason=links-write-failed path=");
+        dbg64_str(path);
+        dbg64_nl();
+        dbg64_line_end64();
+        gui64_invalidate();
+        return 0;
+    }
+    dbg64_line_begin64();
+    dbg64_str("[DESK64] file add idx=");
+    dbg64_dec((uint64_t)idx);
+    dbg64_str(" kind=");
+    dbg64_dec((uint64_t)DESKOPS_KIND_FILE);
+    dbg64_str(" dir=");
+    dbg64_dec((uint64_t)(is_dir ? 1 : 0));
+    dbg64_str(" vol=");
+    dbg64_dec((uint64_t)(uint8_t)vol);
+    dbg64_str(" path=");
+    dbg64_str(path);
+    dbg64_str(" x="); dbg64_dec((uint64_t)nx);
+    dbg64_str(" y="); dbg64_dec((uint64_t)ny);
+    dbg64_str(" total="); dbg64_dec((uint64_t)g_n);
+    dbg64_str(" why=");
+    dbg64_str(why ? why : "-");
+    dbg64_nl();
+    dbg64_line_end64();
+    gui64_invalidate();
+    return 1;
+}
+
+int desktopops64_remove_file64(int i, const char* why) {
+    if (i < 0 || i >= g_n || g_items[i].kind != DESKOPS_KIND_FILE) return 0;
+    dbg64_line_begin64();
+    dbg64_str("[DESK64] file remove idx=");
+    dbg64_dec((uint64_t)i);
+    dbg64_str(" path=");
+    dbg64_str(g_items[i].path);
+    dbg64_str(" why=");
+    dbg64_str(why ? why : "-");
+    dbg64_nl();
+    dbg64_line_end64();
+    for (int k = i; k + 1 < g_n; k++) g_items[k] = g_items[k + 1];
+    g_n--;
+    g_sel_n = 0; g_sel_anchor = -1;
+    links_save64("remove");
+    gui64_invalidate();
+    return 1;
 }
 
 // ==================== ★ 应用快捷方式（注册表 desktop=1）====================
@@ -686,6 +1074,12 @@ void desktopops64_drag_commit64(void) {
         dbg64_nl();
         dbg64_line_end64();
     }
+    // ★ v0.11.1：这一组里只要有文件快捷方式，位置就**真落盘**（一次写，不是每项一次）
+    for (int k = 0; k < g_sel_n; k++) {
+        const int i = g_sel[k];
+        if (i < 0 || i >= g_n) continue;
+        if (g_items[i].kind == DESKOPS_KIND_FILE) { links_save64("drag"); break; }
+    }
 }
 
 void desktopops64_clamp64(int x, int y) {
@@ -733,6 +1127,25 @@ static void draw_folder_glyph64(int x, int y, int size, const Theme64Tokens* t) 
     gfx64_fill_round64(fx, fy, fw, fh, THEME64_R_ICON / 2, t->accent2, 235);
     gfx64_stroke_round64(fx, fy, fw, fh, THEME64_R_ICON / 2, rgb(255, 255, 255), THEME64_A_EDGE);
 }
+// ★ v0.11.1：文件/文件夹快捷方式的图标（白纸 + 折角 + 行；文件夹复用上面的琥珀文件夹）
+//   与 explorer64 的条目图标同一套"自绘几何"口径（无位图资源），只是搬进 48px 圆角底板里。
+static void draw_file_glyph64(int x, int y, int size, const Theme64Tokens* t, int is_dir) {
+    if (is_dir) { draw_folder_glyph64(x, y, size, t); return; }
+    gfx64_grad_round64(x, y, size, size, THEME64_R_ICON, t->grad_a, t->grad_b, 1, 255);
+    gfx64_stroke_round64(x, y, size, size, THEME64_R_ICON, rgb(255, 255, 255), THEME64_A_EDGE);
+    const int inset = size / 6;
+    const int px0 = x + inset, py0 = y + inset - size / 24;
+    const int pw = size - inset * 2, ph = size - inset * 2 + size / 12;
+    const int fold = pw / 4;
+    gfx64_fill_round64(px0, py0, pw, ph, 3, rgb(255, 255, 255), 244);
+    gfx64_stroke_round64(px0, py0, pw, ph, 3, t->accent, THEME64_A_EDGE);
+    // 折角
+    for (int j = 0; j < fold; j++)
+        gfx64_fill_round64(px0 + pw - fold + j, py0, fold - j, 1, 0, t->accent, 120);
+    // 正文行
+    for (int r = 0; r < 4; r++)
+        gfx64_fill_round64(px0 + 4, py0 + fold + 3 + r * 4, pw - 8 - (r == 3 ? pw / 3 : 0), 1, 0, t->accent, 150);
+}
 
 void desktopops64_draw_icons64(int selected) {
     const Theme64Tokens* t = theme64_tokens64();
@@ -752,6 +1165,9 @@ void desktopops64_draw_icons64(int selected) {
             gfx64_grad_round64(x, y, DOPS_ICON_W, DOPS_ICON_W, THEME64_R_ICON, t->grad_a, t->grad_b, 1, 255);
             draw_app_shortcut_icon64(g_items[i].app, x + 4, y + 4, DOPS_ICON_W - 8);
             gfx64_stroke_round64(x, y, DOPS_ICON_W, DOPS_ICON_W, THEME64_R_ICON, rgb(255, 255, 255), THEME64_A_EDGE);
+        } else if (k == DESKOPS_KIND_FILE) {
+            // ★ v0.11.1：文件/文件夹快捷方式（拖拽落点）—— 同一块圆角底板 + 自绘纸张/文件夹
+            draw_file_glyph64(x, y, DOPS_ICON_W, t, g_items[i].dir);
         } else {
             draw_folder_glyph64(x, y, DOPS_ICON_W, t);
         }
@@ -768,6 +1184,9 @@ void desktopops64_draw_icons64(int selected) {
 
 // ==================== 恢复默认桌面图标 ====================
 void desktopops64_restore_defaults64(const char* why) {
+    // ★ v0.11.1：恢复默认只重置**内置 3 项 + 回收站**；用户拖到桌面的文件快捷方式不动
+    DeskItem keep[DESKOPS_LINK_MAX];
+    const int keep_n = items_keep_files64(keep);
     g_n = 0;
     g_sel_n = 0; g_sel_anchor = -1;             // ★ P7a-9：图标集合变化 -> 选择集合作废
     for (int k = 0; k <= 2; k++) {
@@ -778,6 +1197,7 @@ void desktopops64_restore_defaults64(const char* why) {
         g_items[g_n++] = it;
         cfg64_set_icon64(k, it.x, it.y);            // 位置键也回到默认
     }
+    items_restore_files64(keep, keep_n);        // ★ v0.11.1：文件快捷方式原样接回来
     g_rec_n = 0;
     g_rec_confirm = -1;
     g_rec_empty_logged = 0;
@@ -837,6 +1257,26 @@ int desktopops64_recycle_add64(int icon_idx) {
         dbg64_line_end64();
         gui64_invalidate();
         return done;
+    }
+    // ★ v0.11.1：文件快捷方式 —— 回收站收的是**快捷方式本身**（/etc/desktop.links 里那一条），
+    //   不是被指向的文件（文件还在原处；这是"桌面图标"语义，如实写在这里，不假装删了文件）。
+    if (kind == DESKOPS_KIND_FILE) {
+        for (int i = icon_idx; i + 1 < g_n; i++) g_items[i] = g_items[i + 1];
+        g_n--;
+        g_rec_confirm = -1;
+        links_save64("recycle");
+        dbg64_line_begin64();
+        dbg64_str("[RECYCLE64] add kind=");
+        dbg64_dec((uint64_t)kind);
+        dbg64_str(" n=");
+        dbg64_dec((uint64_t)g_rec_n);
+        dbg64_str(" desktop=");
+        dbg64_dec((uint64_t)g_n);
+        dbg64_str(" shortcut-removed=1 (file kept on volume)");
+        dbg64_nl();
+        dbg64_line_end64();
+        gui64_invalidate();
+        return 1;
     }
     if (g_rec_n >= DESKOPS_RECYCLE_MAX) return 0;
     g_recycle[g_rec_n++] = kind;

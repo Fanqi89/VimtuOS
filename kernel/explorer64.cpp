@@ -40,6 +40,7 @@
 #include "startmenu64.h"  // ★ v0.9.25：p2ui_text_w64（预览按 UI 字体实测列宽换行）
 #include "session64.h"  // ★ P8：应用清单（外壳按 APP_ID_* 登记的那一份 = 开始菜单/设置同一来源）
 #include "proc64.h"     // ★ v0.10.5：文件关联路由要**后台拉起** ring3 程序（proc64_start_elf64_argv64）
+#include "desktopops64.h"   // ★ v0.11.1：拖到桌面的落点（desktopops64_add_file64）
 
 // ==================== 几何常量（与脚本共享，勿乱改）====================
 #define EXP_WIN_X 120
@@ -284,6 +285,24 @@ static char g_props_path[VFS64_PATH_MAX] = {0};
 // 框选（空白处按下拖动；由 on_tick 跟踪鼠标，因为窗口 API 没有"移动/释放"回调）
 static int  g_box_active = 0;
 static int  g_box_x0 = 0, g_box_y0 = 0, g_box_x1 = 0, g_box_y1 = 0;
+
+// ==================== ★ v0.11.1：跨层拖拽（资源管理器 -> 桌面）====================
+// 为什么也挂 on_tick：窗口 API 没有"移动/释放"回调（与上面的框选同一个理由），而拖拽必须
+//   在**光标离开窗口之后**继续跟（用户要把文件拖到桌面上）。on_tick 每帧都跑，且
+//   mouse_get_x/y() 是**屏幕坐标**，所以出了客户区照样跟得住。
+// 状态机：arm（按下命中条目）-> active（位移 > EXP_DRAG_MIN）-> drop（左键松开）
+//   * 双击仍然优先：exp_click 里判到 dbl 就把 arm 清掉（不会一拖就双击、也不会双击就拖）；
+//   * 落点判定：不在任何窗口上 + 不在 Dock/任务栏上 = 桌面空白 -> 通知 desktopops 建快捷方式；
+//   * 幽灵：本文件画（draw 走 gfx64，受外壳的脏矩形裁剪），外壳在 render 里调到它。
+#define EXP_DRAG_MIN 8          // 位移阈值（px；平方比较）
+#define EXP_DRAG_GW  124        // 幽灵底板宽
+#define EXP_DRAG_GH  66         // 幽灵底板高（图标 40 + 名字一行 + 边距）
+static int  g_drag_arm = -1;        // 按下时命中的条目下标（-1 = 没按在条目上）
+static int  g_drag_active = 0;      // 1 = 已越过阈值，真的在拖
+static int  g_drag_sx = 0, g_drag_sy = 0;   // 按下点（屏幕坐标）
+static int  g_drag_x = 0, g_drag_y = 0;     // 当前指针（屏幕坐标）
+static int  g_drag_drop = 0;        // 1 = 当前落点是桌面空白（可以放）
+static Fs64Dirent64 g_drag_ent;     // arm 时的条目快照（列表刷新也不会画错图标/画空指针）
 
 // 复制缓冲（**分块**复制用的 64 KiB 主缓冲；单文件上限已经是 8 MiB，不可能再"整文件读进内存"）
 // ★ 批次 M：粘贴 = 逐块 fs64_read_range64(源) -> fs64_write_at64(目标)，缓冲区由这里给；
@@ -3270,13 +3289,20 @@ static void exp_click(Window* w, int cx, int cy) {
         if (kbd_ctrl_pressed())       { sel_toggle(ii); exp_log_sel(sel_count(), "click"); }
         else if (kbd_shift_pressed()) { sel_range(ii);  exp_log_sel(sel_count(), "click"); }
         else                          { sel_pick(ii, false); exp_log_sel(sel_count(), "click"); }
+        // ★ v0.11.1：**装填拖拽源**（按下在条目上且不是双击）。只是"待命"，位移越过阈值才真拖，
+        //   所以单击/双击/多选的行为一位都不变。
         if (dbl_ok && g_last_item == ii) {
+            g_drag_arm = -1;                           // 双击成立 -> 拖拽源作废
             g_last_item = -1;
             exp_log_dbl("item", ii, pt_gap);           // ★ 批次 L：双击成立（gap = 包到达间隔）
             exp_open_item(ii);
             gui64_invalidate_window(w);
             return;
         }
+        g_drag_arm = ii;                               // 待命（屏幕坐标：按下点）
+        g_drag_active = 0;
+        g_drag_sx = sx;
+        g_drag_sy = sy;
         g_last_item = ii;
         g_last_tick = pt;                              // ★ 批次 L：存**包到达**时刻（双击窗口的基准）
         exp_msg("");                                   // 单击条目 = 清掉上一条提示
@@ -3420,9 +3446,153 @@ static void exp_box_finish(Window* w) {
     exp_msg(m);
     if (gui64_window_alive(w)) gui64_invalidate_window(w);
 }
+// ==================== ★ v0.11.1：跨层拖拽实现（起草/跟踪/落点/幽灵）====================
+// 幽灵矩形（屏幕坐标）：跟着指针右下偏移 14/12，出屏时贴边钳回来（与桌面右键菜单同一口径）。
+static void exp_drag_ghost_rect(int* x, int* y, int* w, int* h) {
+    int gx = g_drag_x + 14, gy = g_drag_y + 12;
+    const int sw = gui64_screen_w(), sh = gui64_screen_h();
+    if (gx + EXP_DRAG_GW > sw) gx = sw - EXP_DRAG_GW;
+    if (gy + EXP_DRAG_GH > sh) gy = sh - EXP_DRAG_GH;
+    if (gx < 0) gx = 0;
+    if (gy < 0) gy = 0;
+    if (x) *x = gx;
+    if (y) *y = gy;
+    if (w) *w = EXP_DRAG_GW;
+    if (h) *h = EXP_DRAG_GH;
+}
+static void exp_drag_dirty(void) {
+    int x = 0, y = 0, w = 0, h = 0;
+    exp_drag_ghost_rect(&x, &y, &w, &h);
+    gui64_dirty(x - 2, y - 2, w + 4, h + 4);
+}
+// 落点是不是"桌面空白"：不在任何窗口上、不在 Dock/任务栏行内、开始菜单开着时不算。
+//   （保守：判不准就当不能放 —— 宁可这一下没落成，也不往奇怪的地方放图标）
+static int exp_desktop_target(int mx, int my) {
+    if (mx < 0 || my < 0 || mx >= gui64_screen_w() || my >= gui64_screen_h()) return 0;
+    if (gui64_hit_window64(mx, my)) return 0;
+    const int dock_top = gui64_dock_top64();
+    if (dock_top > 0 && my >= dock_top) return 0;
+    if (my >= gui64_screen_h() - gui64_taskbar_h()) return 0;
+    if (startmenu64_is_open64()) return 0;
+    return 1;
+}
+// 条目 -> 绝对路径（VimtuFS2 语义：根目录不要再补一个 '/'）
+static void exp_item_path64(int idx, char* out, int cap) {
+    if (!out || cap <= 0) return;
+    out[0] = 0;
+    if (idx < 0 || idx >= g_items) return;
+    exp_build_path(out, cap, g_path, g_ents[idx].name);
+}
+static void exp_drag_begin(void) {
+    if (g_drag_arm < 0 || g_drag_arm >= g_items) { g_drag_arm = -1; return; }
+    g_drag_ent = g_ents[g_drag_arm];
+    g_drag_active = 1;
+    g_drag_x = mouse_get_x();
+    g_drag_y = mouse_get_y();
+    g_drag_drop = exp_desktop_target(g_drag_x, g_drag_y);
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer drag begin idx=");
+    dbg64_dec((uint64_t)g_drag_arm);
+    dbg64_str(" name=");
+    dbg64_str(g_drag_ent.name);
+    dbg64_str(" dir=");
+    dbg64_dec((uint64_t)(g_drag_ent.type == VFS64_TYPE_DIR ? 1 : 0));
+    dbg64_str(" sx=");
+    dbg64_dec((uint64_t)g_drag_sx);
+    dbg64_str(" sy=");
+    dbg64_dec((uint64_t)g_drag_sy);
+    dbg64_str(" min=");
+    dbg64_dec((uint64_t)EXP_DRAG_MIN);
+    dbg64_nl();
+    dbg64_line_end64();
+    exp_drag_dirty();
+}
+// 松开：能放就打点 + 真的通知桌面（desktopops64 负责吸附/避让/落盘）；不能放就如实记 target=none
+static void exp_drag_finish(Window* w) {
+    const int idx = g_drag_arm;
+    const int mx = g_drag_x, my = g_drag_y;
+    const int was_active = g_drag_active;
+    const int drop = was_active ? exp_desktop_target(mx, my) : 0;
+    g_drag_active = 0;
+    g_drag_arm = -1;
+    if (was_active) exp_drag_dirty();           // 擦掉幽灵（它可能落在桌面上，也可能落在窗口上）
+    if (!was_active || idx < 0 || idx >= g_items) {
+        if (gui64_window_alive(w)) gui64_invalidate_window(w);
+        return;
+    }
+    char full[VFS64_PATH_MAX];
+    exp_item_path64(idx, full, (int)sizeof(full));
+    const int is_dir = (g_ents[idx].type == VFS64_TYPE_DIR) ? 1 : 0;
+    int ok = 0;
+    if (drop) ok = desktopops64_add_file64(full, is_dir, mx, my, g_letter, "explorer-drag");
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer drag drop path=");
+    dbg64_str(full);
+    dbg64_str(" dir=");
+    dbg64_dec((uint64_t)is_dir);
+    dbg64_str(" x=");
+    dbg64_dec((uint64_t)mx);
+    dbg64_str(" y=");
+    dbg64_dec((uint64_t)my);
+    dbg64_str(drop ? " target=desktop" : " target=none");
+    dbg64_str(ok ? " ok=1" : " ok=0");
+    dbg64_nl();
+    dbg64_line_end64();
+    if (drop && g_ro) exp_roact("drag");        // 只读卷：拖出来也只能是"看得见放不下"
+    if (gui64_window_alive(w)) gui64_invalidate_window(w);
+}
+// 外壳 render() 调它：把一个"半透明圆角底板 + 条目图标 + 文件名"的幽灵画在指针右下；
+//   能放 = 强调色描边（更实），不能放 = 更淡、无描边。裁剪由外壳的脏矩形负责。
+void explorer64_drag_paint64(void) {
+    if (!g_drag_active) return;
+    int gx = 0, gy = 0, gw = 0, gh = 0;
+    exp_drag_ghost_rect(&gx, &gy, &gw, &gh);
+    const Theme64Tokens* t = theme64_tokens64();
+    const int can = g_drag_drop ? 1 : 0;
+    const int plate_a = can ? 226 : 150;
+    const uint32_t plate = t->client_bg;
+    // 底板 + 1px 高光边 + 圆角
+    gfx64_fill_round64(gx, gy, gw, gh, THEME64_R_BUTTON, plate, plate_a);
+    gfx64_stroke_round64(gx, gy, gw, gh, THEME64_R_BUTTON, rgb(255, 255, 255), can ? THEME64_A_EDGE : 90);
+    if (can) gfx64_stroke_round64(gx - 1, gy - 1, gw + 2, gh + 2, THEME64_R_BUTTON + 1, t->accent2, 200);
+    // 图标（与列表同一套自绘几何，32px：底板 40，居中）
+    draw_item_icon(gx + 6, gy + 6, &g_drag_ent);
+    // 名字（过长截断；磁盘上真名可能很长，幽灵里只给一行的空间）
+    char nm[24];
+    int n = 0;
+    for (; g_drag_ent.name[n] && n < (int)sizeof(nm) - 1; n++) nm[n] = g_drag_ent.name[n];
+    if (g_drag_ent.name[n]) { if (n >= 3) { nm[n - 3] = '.'; nm[n - 2] = '.'; nm[n - 1] = '.'; } nm[n] = 0; }
+    else nm[n] = 0;
+    p2ui_text64(gx + 44, gy + 10, nm, t->text);
+    p2ui_text64(gx + 44, gy + 30, can ? gui64_tr("Drop on desktop", "放到桌面")
+                                       : gui64_tr("Not a drop target", "这里不能放"),
+                can ? t->accent2 : t->text_dim);
+}
+int explorer64_drag_active64(void) { return g_drag_active; }
+void explorer64_drag_rect64(int* x, int* y, int* w, int* h) { exp_drag_ghost_rect(x, y, w, h); }
+
 static void exp_tick(Window* w) {
+    if (!gui64_window_alive(w)) { g_box_active = 0; g_drag_arm = -1; g_drag_active = 0; return; }
+
+    // ---- ★ v0.11.1：跨层拖拽跟踪（与框选共用这一个 tick；两者互斥：条目上按下 = 拖拽，空白 = 框选）----
+    if (g_drag_arm >= 0) {
+        const int dmx = mouse_get_x(), dmy = mouse_get_y();
+        if (!(mouse_get_buttons() & 1)) {
+            exp_drag_finish(w);                       // 左键已松开 -> 结算落点
+        } else {
+            const int ddx = dmx - g_drag_sx, ddy = dmy - g_drag_sy;
+            if (!g_drag_active && (ddx * ddx + ddy * ddy) > (EXP_DRAG_MIN * EXP_DRAG_MIN)) exp_drag_begin();
+            if (g_drag_active && (dmx != g_drag_x || dmy != g_drag_y)) {
+                exp_drag_dirty();                     // 先擦掉旧位置的幽灵
+                g_drag_x = dmx;
+                g_drag_y = dmy;
+                g_drag_drop = exp_desktop_target(dmx, dmy);
+                exp_drag_dirty();                     // 再标脏新位置（同一帧里只多两块小矩形）
+            }
+        }
+    }
+
     if (!g_box_active) return;
-    if (!gui64_window_alive(w)) { g_box_active = 0; return; }
     if (!(mouse_get_buttons() & 1)) { exp_box_finish(w); return; }     // 左键已松开
     const int mx = mouse_get_x() - w->client_x;
     const int my = mouse_get_y() - w->client_y;
@@ -3472,9 +3642,11 @@ static void exp_close(Window* w) {
     g_edit_mode = EXP_EDIT_NONE;
     g_edit_item = -1;
     g_props_open = 0;
-    g_props_open = 0;
     g_ow_dlg = 0;                                        // ★ P8：关窗时收掉"选择应用"对话框
     g_del_confirm = 0;
+    if (g_drag_active) exp_drag_dirty();                 // ★ v0.11.1：关窗 = 收掉拖拽源 + 擦掉幽灵
+    g_drag_arm = -1;
+    g_drag_active = 0;
     sel_clear();
     // ★ 行级原子（line_begin/end）：这行是十几个验收脚本的 grep 目标。不拿行锁时，
     //   PIT 的 kheartbeat 会插在 '[' 与其余字节之间，日志里变成
@@ -3487,6 +3659,57 @@ static void exp_close(Window* w) {
 
 // ==================== 公共 API ====================
 Window* explorer64_window64() { return gui64_window_alive(g_win) ? g_win : nullptr; }
+// ==================== ★ v0.11.1：按路径打开（桌面文件快捷方式双击/右键"打开"）====================
+// 语义：打开**它所在的目录**并选中它（"用什么程序打开文件"仍由双击条目那条既有路由负责，
+//   这里不另造一套）。边界（如实）：只定位**当前盘/指定盘**上的绝对路径；换盘先切卷再列目录；
+//   路径已不存在或切卷失败就只开窗口 + 打 `ok=0 reason=...`，不假装跳过去了。
+void explorer64_open_path64(const char* path, char letter) {
+    if (!path || path[0] != '/') return;
+    // 换盘：letter 与本窗口当前盘不同 -> 先切卷（失败就如实打 ok=0，窗口照开）
+    const char want = (letter >= 'A' && letter <= 'Z') ? letter : 'C';
+    if (want != g_letter) {
+        const int left = exp_enter_drive_letter(want);
+        dbg64_line_begin64();
+        dbg64_str("[UI] explorer open switch letter=");
+        dbg64_dec((uint64_t)(uint8_t)want);
+        dbg64_str(" ok=");
+        dbg64_dec((uint64_t)(left == 0 ? 1 : 0));
+        dbg64_nl();
+        dbg64_line_end64();
+        if (left != 0) return;
+    }
+    explorer64_open64();                    // 没有窗口就建（已有就激活）
+    char dir[VFS64_PATH_MAX];
+    char name[VFS64_NAME_MAX + 1];
+    int last = -1;
+    for (int i = 0; path[i]; i++) if (path[i] == '/') last = i;
+    if (last <= 0) { e_strcpy(dir, "/", (int)sizeof(dir)); }
+    else { int k = 0; for (int i = 0; i < last && k < (int)sizeof(dir) - 1; i++) dir[k++] = path[i]; dir[k] = 0; }
+    int n = 0;
+    for (int i = last + 1; path[i] && n < (int)sizeof(name) - 1; i++) name[n++] = path[i];
+    name[n] = 0;
+    Fs64Stat64 st;
+    const int vol = fs64_current_vol64();
+    const int ok = (vol >= 0 && fs64_stat64(vol, dir, &st) == 0 && st.type == VFS64_TYPE_DIR) ? 1 : 0;
+    dbg64_line_begin64();
+    dbg64_str("[UI] explorer open path=");
+    dbg64_str(path);
+    dbg64_str(" dir=");
+    dbg64_str(dir);
+    dbg64_str(ok ? " ok=1" : " ok=0");
+    if (!ok) dbg64_str(" reason=not-on-current-volume");
+    dbg64_nl();
+    dbg64_line_end64();
+    if (!ok) return;
+    exp_nav_to(1, g_letter, dir);
+    for (int i = 0; i < g_items; i++) {
+        if (!e_streq(g_ents[i].name, name)) continue;
+        g_sel = i;
+        sel_pick(i, false);
+        break;
+    }
+    if (gui64_window_alive(g_win)) gui64_invalidate_window(g_win);
+}
 
 void explorer64_open64() {
     if (gui64_window_alive(g_win)) { gui64_set_active(g_win); gui64_invalidate_window(g_win); return; }
@@ -3501,6 +3724,8 @@ void explorer64_open64() {
     g_edit_item = -1;
     g_props_open = 0;
     g_box_active = 0;
+    g_drag_arm = -1;                                    // ★ v0.11.1：每次打开从干净状态开始
+    g_drag_active = 0;
     g_del_confirm = 0;
     g_props_open = 0;
     g_ow_dlg = 0;                                        // ★ P8：打开时也从干净状态开始
