@@ -4164,6 +4164,10 @@ TESTS = [
                        "装饰（24px 标题栏 + 三按钮 + 1px 玻璃边框 + 大圆角 + 阴影）由**合成器**画、客户端不再自绘；"
                        "判据 = 串口 `[WL64] decor … mode=window` + `[WL64] deco paint … btns=3 corner=14 hdr=25` + "
                        "**screendump 像素**（标题带实心、旧自绘色 0x3465A4 命中 0 次、close 红底可见、四角被圆角裁掉）"),
+    ("version64_test.py", "★ 发版第 1 条硬门禁（版本串三处一致）：build64.sh 的 VIMTUOS_VERSION == 内核二进制内嵌串 "
+                          "== **客户机串口**自报的 `VimtuOS <ver> x86_64`（ring3 cat 读 /proc/version 写 fd=1）；"
+                          "反例：上一个已发布版本的内嵌串 0 次、无 PANIC。★ 实测踩点：终端自带的 cat/ver/uname 是内核 builtin，"
+                          "只画屏幕不进串口，所以必须走 ring3 程序才拿得到串口证据"),
     ("locklogin64_test.py", "★ P1c 锁屏/登录/多用户：时间 72px/年月日 18px、背景清晰→登录后模糊 20px(250-350ms)、"
                             "头像与密码框/确认按钮像素、ESC 返回、重启仍锁屏、两用户桌面隔离、su/sudo/exit + ★ v0.9.5 两段过渡的专用断言（104 条断言）"),
     ("startmenu64_test.py", "★ P2 开始菜单：居中/离 Dock 11px/上圆角 24 下 10/搜索启动/2×4 固定网格/状态区线性图标/电源菜单/ESC 两级退出（58 条断言）"),

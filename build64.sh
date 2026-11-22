@@ -85,7 +85,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.11.0"   # ★ v0.11.0：内存扩容 —— 页位图 64KiB->256KiB（页池上限 2GiB->8GiB 跨度）、页池按 E820 usable 段填充（跳过 3GB 处 1GiB PCI 空洞）、总内存口径改为 E820 usable 求和（4GB 机器报 4094MiB 而不是 2.16GB）+ 自检新增"池顶页读写 + >2GiB 地址"硬判据
+VIMTUOS_VERSION="0.11.1"   # ★ v0.11.1：第二步 wl_surface -> Window —— 28 号 wl_surface_set_decor，窗口装饰（24px 标题栏 + 三按钮 + 1px 玻璃边框 + 大圆角 + 阴影）归合成器、与内核窗口共用同一份实现；PE 窗口不再自绘直角标题栏（另含第一步跨层拖拽 explorer->桌面）
 #   沿用自 v0.10.2 的启动加固（仅作说明）：真机加固（UEFI 载荷按真实大小读 + 屏幕报错 + MMIO BAR>=4GiB 闸门） + 桌面帧预算（热路径打点预算 + 2 MiB 大页映射 / shm 与帧缓冲 + 60 Hz 帧节拍）
 #   根因：同一块盘上的两条命令会重叠（命令列表 slot0 / 命令表 / DMA 暂存页池 g_dma[16] 全驱动共享），
 #   后果是**静默坏读**（ELF 魔数坏读、VFS BAD block、/etc/r3drv.conf 读错）与端口互相重启，

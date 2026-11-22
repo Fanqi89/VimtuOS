@@ -1584,7 +1584,7 @@ static int64_t lx64_readv64(uint64_t nr, uint64_t fd, uint64_t iov_va, uint64_t 
 // ---- 63）uname ----
 static int64_t lx64_uname64(uint64_t nr, uint64_t buf) {
     if (!user64_range_ok64(buf, 390)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }   // 6 x 65
-    static const char* const F[6] = { "VimtuOS", "vimtu64", "0.1.0-vimtu64",
+    static const char* const F[6] = { "VimtuOS", "vimtu64", VIMTUOS_VERSION_STR,
                                       "#1 ring3+syscall", "x86_64", "(none)" };
     uint8_t out[390];
     for (uint32_t i = 0; i < 390; i++) out[i] = 0;
