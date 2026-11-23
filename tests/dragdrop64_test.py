@@ -196,6 +196,19 @@ def drag_from_to(mon, src, dst):
     mon.send("mouse_button 0", wait=0.9)                  # 松开
 
 
+
+def right_click_at(mon, x, y):
+    """右键单击：park -> 精确移动 -> mouse_button 2/0（一次 HMP 往返，与 fileops64_test 同一写法）。
+    QEMU HMP：`mouse_button state (1=L, 2=R, 4=M)` —— 右键 = 2（实测 4 是左中键）。"""
+    ex.blind_goto(mon, x, y)
+    mon.raw(["mouse_button 2", "mouse_button 0"], wait_between=0.12, wait_end=0.5)
+    time.sleep(0.6)
+
+
+def left_click_at(mon, x, y):
+    ex.blind_goto(mon, x, y)
+    ex.single_click_at(mon)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--qemu", default=None)
@@ -322,12 +335,15 @@ def main():
         adds_before = count(vm, r"\[DESK64\] file add idx=")
         cell2 = ex.icon_cell(2)
         src2 = (cell2[0] + dxe, cell2[1] + dye)
-        dst2 = (ex.sx(ex.CONTENT_X + 200), ex.sy(ex.CONTENT_Y + 200))     # 仍在客户区里
+        # ★ v0.11.5：落点改到**导航窗格**（窗口内、但不在任何条目上）——原来的"客户区 +200,+200"
+        #   在图标视图里可能正好压在某个条目单元格上，而"拖到文件夹上 = 移动"是本版**新语义**，
+        #   那条反例就不再是反例了。判据本身不变：窗口内非条目处 = target=none。
+        dst2 = (ex.sx(60), ex.sy(ex.CONTENT_Y + 200))                     # 左侧导航窗格
         since = len(vm.log())
         drag_from_to(mon, src2, dst2)
         m_drop2 = wait_re(vm, r"\[UI\] explorer drag drop path=(/\S*) dir=\d+ x=\d+ y=\d+ "
                                r"target=(\w+) ok=(\d)", 20, since)
-        check("反例：松手在窗口上 -> target=none ok=0",
+        check("反例：松手在窗口内非条目处（导航窗格）-> target=none ok=0",
               m_drop2 is not None and m_drop2.group(2) == "none" and m_drop2.group(3) == "0",
               m_drop2.group(0) if m_drop2 else "（缺行）")
         time.sleep(1.5)
@@ -335,6 +351,136 @@ def main():
         check("反例：没有新增桌面项（file add 计数不变）", adds_after == adds_before,
               "before=%d after=%d" % (adds_before, adds_after))
         forbid("阶段 4 日志", vm.log())
+
+        # ==================== 阶段 4.5：拖进文件夹 = 真移动（★ v0.11.5 新能力）====================
+        # 为什么要有这一节：v0.11.1 的拖拽**只认桌面空白**，拖到列表里的文件夹上是 target=none ——
+        #   "把文件拖着挪进子目录"根本没有。本版把它补成真移动（fs64_rename_to64 同卷跨目录改名）。
+        # 判据四层：① drag move 打点（from/to/rc=0/why=-/ok=1）；② drag drop target=dir ok=1；
+        #   ③ 移动后内核自己重列（exp_refresh_dir）-> 根目录不再有它；④ 终端 ls /mvdst 有它（宿主侧独立）。
+        print("=== 阶段 4.5：拖条目到文件夹行 -> 真移动 ===")
+
+        def last_items():
+            """最后一次目录列举的条目表。
+            注意顺序：内核是**先逐条打 item 行、最后才打 nav 行**（exp_refresh_dir 的收尾是
+            exp_log_nav），所以不能"从最后一条 nav 行往后切" —— 那样切出来是空的（本轮实测踩到）。
+            正确做法：找到最后一条 item 行，再往上吃掉连续的 item 行 = 这一轮列举的全部条目。"""
+            lines = vm.log().splitlines()
+            last = -1
+            for i, ln in enumerate(lines):
+                if ln.startswith("[UI] explorer item idx="):
+                    last = i
+            if last < 0:
+                return {}
+            j = last
+            while j - 1 >= 0 and lines[j - 1].startswith("[UI] explorer item idx="):
+                j -= 1
+            out = {}
+            for b in lines[j:last + 1]:
+                m = re.search(r"\[UI\] explorer item idx=(\d+) name=(\S+) type=(\w+)", b)
+                if m:
+                    out[m.group(2)] = int(m.group(1))
+            return out
+
+        # ★ 为什么在 /tmp 里做：探针实测 `/` 归 root(0:0) 0755，普通用户（uid=1000）在根上建文件
+        #   会被 `[PERM64] deny op=create … need=wx` 挡下（这不是缺陷，是权限模型）——
+        #   文件操作的交互验收必须落在用户可写的目录里。
+        since_t = len(vm.log())
+        check("打开终端（[APP] term opened）", fst.open_terminal(mon, serial1, vm.proc))
+        mon.type_line("write /tmp/mv_src.txt hi")
+        check("终端造素材 /tmp/mv_src.txt（[TERM] cmd write ok）",
+              wait_re(vm, r"\[TERM\] cmd write ok", 25, since_t) is not None)
+        since_t = len(vm.log())
+        mon.type_line("mkdir /tmp/mvdst")
+        check("终端造目标目录 /tmp/mvdst（[TERM] cmd mkdir ok）",
+              wait_re(vm, r"\[TERM\] cmd mkdir ok", 25, since_t) is not None)
+        time.sleep(1.0)
+        # ★ 顺序要紧：终端刚才在前台，必须**先**把文件管理器点回最前，再双击/右键 ——
+        #   否则这些点击都落在终端上（实测：双击 tmp 毫无反应、右键也不弹菜单）。
+        top_ok2, top_det2 = ex.ensure_window_on_top(vm, mon)
+        check("把文件管理器置顶（后续点击要落在它身上）", top_ok2, top_det2)
+        # 进 /tmp：双击根目录里的 tmp 条目（右键菜单/拖拽都在这层做）
+        cur0 = last_items()
+        check("根目录里有 tmp（用户可写目录）", "tmp" in cur0, "items=%s" % sorted(cur0))
+        if "tmp" in cur0:
+            tc = ex.icon_cell(cur0["tmp"])
+            since = len(vm.log())
+            ex.blind_goto(mon, tc[0] + dxe, tc[1] + dye)
+            ex.double_click(mon)
+            check("双击进 /tmp（nav path=/tmp）",
+                  wait_re(vm, r"\[UI\] explorer nav path=/tmp items=\d+ view=\w+", 25, since) is not None)
+        since = len(vm.log())
+        right_click_at(mon, ex.sx(ex.CONTENT_X + 430) + dxe, ex.sy(ex.CONTENT_Y + 320) + dye)
+        check("右键空白出菜单（items=5 at=blank）",
+              wait_re(vm, r"\[UI\] explorer ctxmenu items=5 at=blank", 20, since) is not None)
+        mrect_f = wait_re(vm, r"\[UI\] explorer ctxmenu rect x=(\d+) y=(\d+) w=(\d+) h=(\d+)", 10, since)
+        since = len(vm.log())
+        if mrect_f:
+            fx, fy = int(mrect_f.group(1)), int(mrect_f.group(2))
+            # 菜单项槽 = 内核 EXP_CTX_ITEM_H = 26；k=3 是第 4 项 =「刷新」
+            MENU_ITEM_H = 26
+            left_click_at(mon, ex.sx(fx + 20) + dxe, ex.sy(fy + 2 + 3 * MENU_ITEM_H + MENU_ITEM_H // 2) + dye)
+        check("右键「刷新」触发了重列（nav path=/tmp items=N）",
+              wait_re(vm, r"\[UI\] explorer nav path=/tmp items=\d+ view=\w+", 20, since) is not None)
+        time.sleep(1.0)
+        cur = last_items()
+        print("    刷新后 /tmp = %s" % sorted(cur))
+        check("右键「刷新」后列表里出现 /mv_src.txt 与 /mvdst",
+              "mv_src.txt" in cur and "mvdst" in cur, "items=%s" % sorted(cur))
+        dname = "mvdst" if "mvdst" in cur else None
+        fname = "mv_src.txt" if "mv_src.txt" in cur else None
+        check("/tmp 里有可拖的文件与目标文件夹", dname is not None and fname is not None,
+              "dir=%s file=%s" % (dname, fname))
+        if dname and fname:
+            src3 = tuple(c + d for c, d in zip(ex.icon_cell(cur[fname]), (dxe, dye)))
+            dst3 = tuple(c + d for c, d in zip(ex.icon_cell(cur[dname]), (dxe, dye)))
+            since = len(vm.log())
+            drag_from_to(mon, src3, dst3)
+            m_mv = wait_re(vm, r"\[UI\] explorer drag move name=(\S+) dir=(\d) from=(\S+) "
+                                r"to=(\S+) rc=(-?\d+) why=(\S+) ok=(\d)", 25, since)
+            check("拖到文件夹 -> drag move 打点（rc=0 why=- ok=1）",
+                  m_mv is not None and m_mv.group(5) == "0" and m_mv.group(6) == "-"
+                  and m_mv.group(7) == "1", m_mv.group(0) if m_mv else "（缺行）")
+            if m_mv:
+                check("移动的 from = /mv_src.txt、to = /mvdst/mv_src.txt（逐字）",
+                      m_mv.group(3) == "/tmp/" + fname and m_mv.group(4) == "/tmp/" + dname + "/" + fname,
+                      "%s -> %s" % (m_mv.group(3), m_mv.group(4)))
+                check("name/dir 标志正确（name=<文件> dir=0）",
+                      m_mv.group(1) == fname and m_mv.group(2) == "0", m_mv.group(0))
+            m_drop3 = wait_re(vm, r"\[UI\] explorer drag drop path=/\S+ dir=0 x=\d+ y=\d+ "
+                                    r"target=dir ok=(\d)", 15, since)
+            check("落点记为文件夹（target=dir ok=1）",
+                  m_drop3 is not None and m_drop3.group(1) == "1",
+                  m_drop3.group(0) if m_drop3 else "（缺行）")
+            # 移动成功后内核自己重列（不需要 F5）：等它把根目录重列一遍再核
+            time.sleep(2.0)
+            after = last_items()
+            check("移动后根目录重列且不再有它（真移动，不是复制）",
+                  fname not in after, "after=%s" % sorted(after))
+            # 宿主侧独立判据：终端 ls /tmp/<目录>（移动后恰好 1 条）
+            #   注意：这里**重新开一次终端**（Win+1）—— 上一次那个终端早被文件管理器压到后面，
+            #   直接打字会喂给开始菜单（实测 entries=-1 就是这么来的）。
+            check("重新开终端做宿主侧核对", fst.open_terminal(mon, serial1, vm.proc))
+            since_ls = len(vm.log())
+            mon.type_line("ls /tmp/" + dname)
+            m_ls = wait_re(vm, r"\[TERM\] cmd ls entries=(\d+)", 25, since_ls)
+            n_ls = int(m_ls.group(1)) if m_ls else -1
+            check("终端 ls /tmp/%s 条目 >= 1（移动过去的文件真在盘上）" % dname, n_ls >= 1,
+                  "entries=%d" % n_ls)
+            # 反例：把文件拖到**另一个文件**的格子上（不是目录）-> 不落（target=none ok=0）
+            two = [n for n in after if "." in n][:2]
+            if len(two) == 2:
+                s4 = tuple(c + d for c, d in zip(ex.icon_cell(after[two[0]]), (dxe, dye)))
+                d4 = tuple(c + d for c, d in zip(ex.icon_cell(after[two[1]]), (dxe, dye)))
+                since = len(vm.log())
+                drag_from_to(mon, s4, d4)
+                m_neg = wait_re(vm, r"\[UI\] explorer drag drop path=\S+ dir=0 x=\d+ y=\d+ "
+                                     r"target=(\w+) ok=(\d)", 15, since)
+                check("反例：拖到文件行上不落（target=none ok=0，不做移动）",
+                      m_neg is not None and m_neg.group(1) == "none" and m_neg.group(2) == "0",
+                      m_neg.group(0) if m_neg else "（缺行）")
+                n_mv = count(vm, r"\[UI\] explorer drag move name=")
+                check("反例：没有多出 drag move 行（没有误移动）", n_mv <= 1, "drag move 行数=%d" % n_mv)
+        forbid("阶段 4.5 日志", vm.log())
         vm.close()
         vm = None
 

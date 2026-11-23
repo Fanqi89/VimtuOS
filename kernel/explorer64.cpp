@@ -3501,6 +3501,38 @@ static int exp_desktop_target(int mx, int my) {
     if (startmenu64_is_open64()) return 0;
     return 1;
 }
+// ==================== ★ v0.11.5：拖拽落点扩成"桌面 / 文件夹"两种 ====================
+// 为什么必须补：v0.11.1 的拖拽**只认桌面空白**这一个落点（exp_desktop_target），拖到列表里的
+//   文件夹上就是 `target=none` —— 文件管理器最基本的一件事"把文件拖着挪进子目录"根本没有。
+// 规则（写死，不留解释空间）：
+//   * 拖到自己身上 -> 不落（既不移动也不打 ok）；
+//   * 目录拖进自己的子孙 -> **拒绝**（打点 why=self；绝不产生环）；
+//   * 撞名 -> **拒绝**（与 F2 重命名同口径；不偷偷改成 "(2)" —— "移动到哪个名字"必须是用户点的那个）；
+//   * 只读卷（FAT32）-> 拦下并 exp_roact（与删除/新建同一条纪律）；
+//   * 同卷移动 = fs64_rename_to64（跨目录改名原语）；**不做跨卷移动**（那不叫 move，叫 copy+delete）。
+static int exp_streq64(const char* a, const char* b) {
+    if (!a || !b) return 0;
+    while (*a && *b) { if (*a != *b) return 0; a++; b++; }
+    return (*a == 0 && *b == 0) ? 1 : 0;
+}
+static int exp_starts_with64(const char* s, const char* pre) {
+    if (!s || !pre) return 0;
+    while (*pre) { if (!*s || *s != *pre) return 0; s++; pre++; }
+    return 1;
+}
+// 落点是不是本窗口里的一个**目录条目**（是 -> *out_idx = 它的下标）
+static int exp_drop_dir64(Window* w, int mx, int my, int* out_idx) {
+    if (out_idx) *out_idx = -1;
+    if (!gui64_window_alive(w)) return 0;
+    if (mx < w->client_x || my < w->client_y) return 0;
+    if (mx >= w->client_x + w->client_w || my >= w->client_y + w->client_h) return 0;
+    const int ii = hit_item(mx - w->client_x, my - w->client_y);
+    if (ii < 0 || ii >= g_items) return 0;
+    if (g_ents[ii].type != VFS64_TYPE_DIR) return 0;
+    if (g_drag_arm >= 0 && ii == g_drag_arm) return 0;      // 拖到自己身上：不落
+    if (out_idx) *out_idx = ii;
+    return 1;
+}
 // 条目 -> 绝对路径（VimtuFS2 语义：根目录不要再补一个 '/'）
 static void exp_item_path64(int idx, char* out, int cap) {
     if (!out || cap <= 0) return;
@@ -3514,6 +3546,7 @@ static void exp_drag_begin(void) {
     g_drag_active = 1;
     g_drag_x = mouse_get_x();
     g_drag_y = mouse_get_y();
+    // 起点在条目行上：只有"桌面空白"能算可放（文件夹落点要等指针真的挪到目录行上，见 exp_tick）
     g_drag_drop = exp_desktop_target(g_drag_x, g_drag_y);
     dbg64_line_begin64();
     dbg64_str("[UI] explorer drag begin idx=");
@@ -3532,12 +3565,17 @@ static void exp_drag_begin(void) {
     dbg64_line_end64();
     exp_drag_dirty();
 }
-// 松开：能放就打点 + 真的通知桌面（desktopops64 负责吸附/避让/落盘）；不能放就如实记 target=none
+// 松开：结算落点。三种目标（★ v0.11.5 起）：
+//   target=dir      拖进本窗口的文件夹 -> **真移动**（fs64_rename_to64，同卷跨目录改名）
+//   target=desktop  桌面空白 -> 交给 desktopops64（吸附/避让/落盘，v0.11.1 的老语义不变）
+//   target=none     哪儿也不是 -> 如实记一行，什么都不做
 static void exp_drag_finish(Window* w) {
     const int idx = g_drag_arm;
     const int mx = g_drag_x, my = g_drag_y;
     const int was_active = g_drag_active;
-    const int drop = was_active ? exp_desktop_target(mx, my) : 0;
+    int drop_dir = -1;
+    const int over_dir = was_active ? exp_drop_dir64(w, mx, my, &drop_dir) : 0;
+    const int drop = (was_active && !over_dir) ? exp_desktop_target(mx, my) : 0;
     g_drag_active = 0;
     g_drag_arm = -1;
     if (was_active) exp_drag_dirty();           // 擦掉幽灵（它可能落在桌面上，也可能落在窗口上）
@@ -3549,7 +3587,51 @@ static void exp_drag_finish(Window* w) {
     exp_item_path64(idx, full, (int)sizeof(full));
     const int is_dir = (g_ents[idx].type == VFS64_TYPE_DIR) ? 1 : 0;
     int ok = 0;
-    if (drop) ok = desktopops64_add_file64(full, is_dir, mx, my, g_letter, "explorer-drag");
+    const char* tgt = over_dir ? "dir" : (drop ? "desktop" : "none");
+    if (over_dir && drop_dir >= 0) {
+        /* ---- 移动进文件夹 ---- */
+        char dirpath[VFS64_PATH_MAX], dest[VFS64_PATH_MAX];
+        exp_build_path(dirpath, (int)sizeof(dirpath), g_path, g_ents[drop_dir].name);
+        exp_build_path(dest, (int)sizeof(dest), dirpath, g_ents[idx].name);
+        const int dest_len = e_strlen(dest);
+        int rc = -1;
+        const char* why = "-";
+        if (g_ro) {
+            why = "readonly";                       // FAT32 只读卷：看得见，动不了（如实）
+        } else if (is_dir && dest_len > e_strlen(full) && exp_starts_with64(dest, full)) {
+            why = "self";                           // 目录拖进自己的子孙 = 环，拒绝
+        } else if (exp_streq64(full, dest)) {
+            why = "same";                           // 同名同路径：什么都不做
+        } else {
+            rc = fs64_rename_to64(-1, full, dest);
+            if (rc == 0) ok = 1;
+            else why = "rc";
+        }
+        dbg64_line_begin64();
+        dbg64_str("[UI] explorer drag move name="); dbg64_str(g_ents[idx].name);
+        dbg64_str(" dir=");   dbg64_dec((uint64_t)is_dir);
+        dbg64_str(" from=");  dbg64_str(full);
+        dbg64_str(" to=");    dbg64_str(dest);
+        dbg64_str(" rc=");    dbg64_dec((uint64_t)(int64_t)rc);
+        dbg64_str(" why=");   dbg64_str(why);
+        dbg64_str(ok ? " ok=1" : " ok=0");
+        dbg64_nl();
+        dbg64_line_end64();
+        if (g_ro) {
+            exp_roact("drag-move");
+        } else if (ok) {
+            exp_refresh_dir();                      // 目录内容变了：重列（选中集会被清，与删除同口径）
+            exp_msg(gui64_tr("Moved", "已移动"));
+        } else if (!exp_streq64(why, "same")) {
+            exp_msg(exp_streq64(why, "self")
+                    ? gui64_tr("Cannot move a folder into itself", "不能把文件夹移进它自己")
+                    : gui64_tr("Move failed (name exists or volume error)",
+                               "移动失败（目标里已有同名项或卷错误）"));
+        }
+    } else if (drop) {
+        /* ---- 拖到桌面：老语义（v0.11.1），一个像素都不改 ---- */
+        ok = desktopops64_add_file64(full, is_dir, mx, my, g_letter, "explorer-drag");
+    }
     dbg64_line_begin64();
     dbg64_str("[UI] explorer drag drop path=");
     dbg64_str(full);
@@ -3559,7 +3641,7 @@ static void exp_drag_finish(Window* w) {
     dbg64_dec((uint64_t)mx);
     dbg64_str(" y=");
     dbg64_dec((uint64_t)my);
-    dbg64_str(drop ? " target=desktop" : " target=none");
+    dbg64_str(" target=");  dbg64_str(tgt);
     dbg64_str(ok ? " ok=1" : " ok=0");
     dbg64_nl();
     dbg64_line_end64();
@@ -3611,7 +3693,8 @@ static void exp_tick(Window* w) {
                 exp_drag_dirty();                     // 先擦掉旧位置的幽灵
                 g_drag_x = dmx;
                 g_drag_y = dmy;
-                g_drag_drop = exp_desktop_target(dmx, dmy);
+                // ★ v0.11.5：落点 = 桌面空白 **或** 本窗口里的文件夹（后者 = 移动进文件夹）
+                g_drag_drop = exp_desktop_target(dmx, dmy) || exp_drop_dir64(w, dmx, dmy, nullptr);
                 exp_drag_dirty();                     // 再标脏新位置（同一帧里只多两块小矩形）
             }
         }

@@ -3,7 +3,8 @@
 """fileops64_test.py - 批次 J：文件管理器**文件操作**端到端验收（像素 + 串口 + 鼠标/键盘注入）
 
 覆盖（每条都走真 UI：右键 / 快捷键 / 工具栏 -> 内核 vfs64，不是只调 API）：
-  1) 右键菜单：条目菜单 items=6 at=sel（像素：白底 + 边框 + 文字）；Esc 关闭；空白菜单 items=4 at=blank；
+1) 右键菜单：条目菜单 items=6 at=sel（像素：**浅色亚克力底 + 圆角 + 文字**，v0.11.1 起不再是白底）；
+   Esc 关闭；空白菜单 items=5 at=blank（v0.11.1 加了"新建文本文件"）；
   2) 复制 / 粘贴（Ctrl+C / Ctrl+V）：/copy_me.txt -> /docs，条目数 +1、预览读回 17 B、paste ok 打点；
   3) 重命名（F2 内联编辑）：/docs/copy_me.txt -> renamed.txt（旧名消失新名出现、内容不变；Esc 取消不落盘）；
   4) 重名策略：再粘贴一次 -> 自动 "renamed(2).txt"（打点 + 列表可见）；
@@ -54,17 +55,63 @@ CTX_ITEM_H = 26
 ICON_CELL_W, ICON_CELL_H = 96, 74
 ICON_COLS = CONTENT_W // ICON_CELL_W   # 5
 
-C_CTX_LINE = (130, 130, 130)
-C_CTX_BG = (255, 255, 255)
+# ★ v0.11.5：右键菜单 / 属性面板自 v0.11.1 起是 **p2ui_popup64 亚克力圆角弹窗**
+#   （底 = 背景模糊后按主题 client_bg 着色 + 1px 白高光边 + 双层阴影），旧的白底/硬编码灰边
+#   常量 (130,130,130)/(255,255,255)/(252,252,252) 已经**不是实现**了，留作"旧实现指纹"用：
+#   判据改成"不是旧白底 + 是浅色亚克力 + 四角是圆角"，旧实现回来会立刻红。
+C_OLD_CTX_BG = (255, 255, 255)        # 旧实现指纹：整片纯白（现在菜单里几乎不存在）
 C_BOX_LINE = (0, 120, 215)
 C_MSG = (160, 60, 60)
-C_PROPS_BG = (252, 252, 252)
 
 COPY_TEXT = "fileops copy test"        # 17 B（QEMU sendkey 只能发小写/数字/点/减号）
 CUT_TEXT = "cut-me"
 LONG31 = "verylongnameverylongnameverylon"      # 31 B（= "verylongname" x 3 截到上限）
 
 
+
+
+def region_stats(px, w, x0, y0, x1, y1):
+    """一块区域的统计（判"浅色亚克力面板"用，不依赖某一个固定 RGB）：
+    lum = 平均亮度；gray = 三通道均值的最大差（越小越灰）；pure_white = 纯白像素数；
+    sat = 彩色像素数（通道极差 > 30，用来分辨"面板"与"底下有条目内容"）。"""
+    n = 0
+    sr = sg = sb = 0
+    white = 0
+    sat = 0
+    for y in range(max(0, y0), y1):
+        for x in range(max(0, x0), x1):
+            r, g, b = exp.sample(px, w, x, y)
+            n += 1
+            sr += r
+            sg += g
+            sb += b
+            if r >= 250 and g >= 250 and b >= 250:
+                white += 1
+            if max(r, g, b) - min(r, g, b) > 30:
+                sat += 1
+    if n == 0:
+        return {"n": 0, "lum": 0, "gray": 0, "pure_white": 0, "sat": 0}
+    mr, mg, mb = sr // n, sg // n, sb // n
+    return {"n": n, "lum": (mr + mg + mb) // 3,
+            "gray": max(mr, mg, mb) - min(mr, mg, mb),
+            "pure_white": white, "sat": sat,
+            "mean": (mr, mg, mb)}
+
+
+def ring_light(px, w, x0, y0, x1, y1, thr=238):
+    """矩形 1px 边环上"接近白"的像素数 —— 亚克力弹窗那条 1px 白高光边就是它。"""
+    n = 0
+    for x in range(max(0, x0), x1):
+        for y in (y0, y1 - 1):
+            r, g, b = exp.sample(px, w, x, y)
+            if min(r, g, b) >= thr:
+                n += 1
+    for y in range(max(0, y0), y1):
+        for x in (x0, x1 - 1):
+            r, g, b = exp.sample(px, w, x, y)
+            if min(r, g, b) >= thr:
+                n += 1
+    return n
 def sx(cx):
     return WIN_CL_X + cx
 
@@ -333,11 +380,28 @@ def main():
         if mrect and os.path.exists(shot):
             w, h, px = exp.read_ppm(shot)
             mx, my, mw, mh = mrect
-            bg = exp.rect_count(px, w, sx(mx) + 3, sy(my) + 3, sx(mx) + mw - 3, sy(my) + mh - 3, C_CTX_BG, tol=4)
-            edge = exp.rect_count(px, w, sx(mx) - 1, sy(my) - 1, sx(mx) + mw + 2, sy(my) + mh + 2, C_CTX_LINE, tol=14)
+            # ★ v0.11.5 判据更新（不是放宽）：菜单底 = p2ui_popup64 的**亚克力**（背景模糊后按主题
+            #   client_bg 着色 + 1px 白高光边 + 双层阴影 + 圆角），没有"一个固定 RGB"可对。
+            #   真正能分辨新旧实现的是：①浅色灰调 ②四角圆角（旧实现直角）③1px 白高光边（旧实现灰边）④有文字。
+            #   ★ 实测修正：亚克力在浅色主题下本来就接近纯白（pure_white=17301/23680），所以
+            #   "纯白像素少"**不能**用来区分新旧 —— 换成高光边判据（ring_light）。
+            st = region_stats(px, w, sx(mx) + 8, sy(my) + 6, sx(mx) + mw - 8, sy(my) + mh - 6)
+            ck("菜单底是浅色亚克力（均值亮度 >= 210、灰度差 <= 12）",
+               st["n"] > 0 and st["lum"] >= 210 and st["gray"] <= 12, str(st))
+            mean_perim = 2 * (mw + mh)
+            r_ring = ring_light(px, w, sx(mx), sy(my), sx(mx) + mw, sy(my) + mh)
+            ck("菜单有 1px 白高光边（边环近白像素 >= 周长一半；旧实现是 (130,130,130) 灰边）",
+               r_ring * 2 >= mean_perim, "ring=%d perim=%d" % (r_ring, mean_perim))
+            mean = st["mean"]
             tpx = exp.rect_dark(px, w, sx(mx) + 6, sy(my) + 4, sx(mx) + mw - 6, sy(my) + mh - 4)
-            ck("菜单是白底面板（像素）", bg > 3000, "白像素=%d" % bg)
-            ck("菜单有边框（像素）", edge > 200, "边框像素=%d" % edge)
+            corners = [exp.sample(px, w, sx(mx) + 2, sy(my) + 2),
+                       exp.sample(px, w, sx(mx) + mw - 3, sy(my) + 2),
+                       exp.sample(px, w, sx(mx) + 2, sy(my) + mh - 3),
+                       exp.sample(px, w, sx(mx) + mw - 3, sy(my) + mh - 3)]
+            cut = sum(1 for c in corners if max(abs(c[i] - mean[i]) for i in range(3)) > 10)
+            ck("菜单四角是圆角（至少 2 个角像素与内部均值差 > 10）", cut >= 2,
+               "corners=%s mean=%s" % (corners, mean))
+            # （Esc 判据不用"白边消失"：浅色主题下菜单下面的内容卡本身也接近白，实测 ring 643->596 不可分辨）
             ck("菜单项有文字（6 项）", tpx > 100, "暗像素=%d" % tpx)
         mon.key("esc", wait=1.2)
         shot2 = os.path.join(tmp, "ctxmenu_closed.ppm")
@@ -345,8 +409,12 @@ def main():
         if mrect and os.path.exists(shot2):
             w, h, px = exp.read_ppm(shot2)
             mx, my, mw, mh = mrect
-            edge = exp.rect_count(px, w, sx(mx) - 1, sy(my) - 1, sx(mx) + mw + 2, sy(my) + mh + 2, C_CTX_LINE, tol=10)
-            ck("Esc 关闭菜单（边框像素消失）", edge < 120, "残留边框像素=%d" % edge)
+            st2 = region_stats(px, w, sx(mx) + 8, sy(my) + 6, sx(mx) + mw - 8, sy(my) + mh - 6)
+            # ★ Esc 判据：菜单开着时这一块是**平滑亚克力**（彩色像素 = 0），关掉后底下的条目图标/文字
+            #   露出来（本轮实测 0 -> 841）。这条与旧实现无关（旧菜单同样是平滑白板），只判"菜单真的没了"。
+            ck("Esc 关闭菜单（同一矩形：彩色条目内容回来）",
+               st2["sat"] >= 300 and st2["sat"] > st["sat"] + 200,
+               "sat %d->%d" % (st["sat"], st2["sat"]))
 
         # ==================== 阶段 5：复制 / 粘贴（Ctrl+C / Ctrl+V）====================
         print("=== 阶段 5：选中 copy_me.txt -> Ctrl+C -> 进 /docs -> Ctrl+V ===")
@@ -506,8 +574,8 @@ def main():
         print("=== 阶段 11：右键空白 -> 新建文件夹 -> 内联编辑 newdir -> 双击进入 ===")
         since = vm.mark()
         mouse.right_click(sx(CONTENT_X + 430), sy(CONTENT_Y + 320))
-        ck("空白处右键菜单（ctxmenu items=4 at=blank）",
-           vm.wait_new(r"\[UI\] explorer ctxmenu items=4 at=blank", 20, since))
+        ck("空白处右键菜单（ctxmenu items=5 at=blank —— 新建文件夹/新建文本文件/粘贴/刷新/属性）",
+           vm.wait_new(r"\[UI\] explorer ctxmenu items=5 at=blank", 20, since))
         mrect = last_rect(vm)
         ck("空白菜单矩形打点", mrect is not None, str(mrect))
         if mrect:
@@ -527,6 +595,34 @@ def main():
             since = vm.mark()
             mouse.click(sx(75), sy(40), want_hit="btn:up")
             vm.wait_new(r"\[UI\] explorer nav path=/ items=\d+ view=\w+", 15, since)
+
+        # ==================== 阶段 11.5：右键 -> 新建**文本文件**（v0.11.1 加的项，之前一条判据都没有）===
+        # 为什么补：本测试原来只覆盖"新建文件夹"，而空白菜单在 v0.11.1 多出的第二项
+        #   （新建文本文件 = 0 字节真落盘，走 fs64_create64）一直没有验收 —— 用户点它坏没坏，
+        #   测试是看不出来的。这里走真 UI：右键空白 -> 点第 2 项 -> 打名字 -> 回车。
+        print("=== 阶段 11.5：右键空白 -> 新建文本文件 -> 内联命名 newfile.txt ===")
+        since = vm.mark()
+        mouse.right_click(sx(CONTENT_X + 430), sy(CONTENT_Y + 320))
+        ck("空白处右键菜单（items=5 at=blank）",
+           vm.wait_new(r"\[UI\] explorer ctxmenu items=5 at=blank", 20, since))
+        mrect = last_rect(vm)
+        if mrect:
+            since = vm.mark()
+            # 第 2 项（k=1 = 新建文本文件）：菜单项槽 26px，y = rect_y + 2 + k*26
+            mouse.click(sx(mrect[0] + 20), sy(mrect[1] + 2 + CTX_ITEM_H + CTX_ITEM_H // 2))
+            for ch in "newfile.txt":
+                mon.key(ch if ch != "." else "dot", wait=0.12)
+            mon.key("ret", wait=1.8)
+            ck("新建文本文件真落盘（[UI] explorer mkfile path=/newfile.txt rc=0）",
+               vm.wait_new(r"\[UI\] explorer mkfile path=/newfile\.txt rc=0", 25, since))
+            ck("列表里出现 newfile.txt（item name=newfile.txt type=file）",
+               vm.wait_new(r"\[UI\] explorer item idx=\d+ name=newfile\.txt type=file", 20, since))
+            # 宿主侧独立判据：终端 ls 能看到它（同一块盘、走 vfs64 的目录枚举）
+            mon.key("meta_l", wait=0.8)
+            mon.type_line("ls")
+            time.sleep(0.8)
+            ck("终端 ls 也能看到 newfile.txt（vfs64 目录枚举一致）",
+               "newfile.txt" in vm.log()[-4000:], "（终端输出里没找到）")
 
         # ==================== 阶段 12：跨卷粘贴 C: -> D: ====================
         print("=== 阶段 12：C: 的 copy_me.txt 粘贴到 D: 根（宿主侧核对 D: 卷字节）===")
@@ -587,9 +683,11 @@ def main():
         if os.path.exists(shot_p):
             w, h, px = exp.read_ppm(shot_p)
             px0, py0 = sx(CONTENT_X + 20), sy(CONTENT_Y + 18)
-            pbg = exp.rect_count(px, w, px0 + 3, py0 + 22, px0 + 320, py0 + 126, C_PROPS_BG, tol=0)
-            ptxt = exp.rect_dark(px, w, px0 + 6, py0 + 22, px0 + 320, py0 + 126)
-            ck("属性面板底色（252,252,252 精确匹配）", pbg > 2000, "面板像素=%d" % pbg)
+            ptxt = exp.rect_dark(px, w, px0 + 8, py0 + 24, px0 + 316, py0 + 124)
+            # ★ v0.11.5：属性面板与菜单同一套 p2ui_popup64 亚克力底（旧实现是 252,252,252 直角白底）。
+            st_p = region_stats(px, w, px0 + 8, py0 + 24, px0 + 316, py0 + 124)
+            ck("属性面板底是浅色亚克力（亮度 >= 210、灰度差 <= 14）",
+               st_p["n"] > 0 and st_p["lum"] >= 210 and st_p["gray"] <= 14, str(st_p))
             ck("属性面板有文字（5 行）", ptxt > 100, "暗像素=%d" % ptxt)
             mon.key("esc", wait=1.0)
 
