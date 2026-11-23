@@ -2,7 +2,8 @@
 
 - 日期：2026-11-23（本地）
 - 版本串：`build64.sh` `VIMTUOS_VERSION="0.11.3"`（bump → 重建 → 串口核对全过）
-- 分支/HEAD：`main` @ `40208a45`
+- 分支/HEAD：`main` —— **功能基线 = `40208a45`（tag `v0.11.3` 指向它，Release 也挂在它上面）**；
+  其后只有 docs 提交（封存单 + 两处口径修正），不改任何产物。当前 HEAD 以 `git log --oneline -1` 为准。
 - tag：**`v0.11.3`**（annotated，tag 对象 `d2968c839c0da8f940d0c584aaf47695de9dfdcd` → commit `40208a45`）
 - Release：**已发布** id **`455130600`**，`draft=false / prerelease=false`，附件 2 个
   - `vimtu64-64.iso` 93,437,952 B sha256 `169014f73652f281c34feb67918f8cd202281b06b4b259d22c3931edbdb20b54`
