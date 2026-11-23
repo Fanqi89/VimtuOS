@@ -88,8 +88,10 @@
 - **启动**：2026-11-23 **16:00:38**（`py` PID 按实际，用 `Get-Process py` 查），命令
   `cmd /c "py -3 tests\status_report.py --full > <scratch>\full_sweep_0113.log 2>&1"`
 - **为什么用 `cmd /c` 而不是 PowerShell 管道**：管道 `| Out-File` 会**攒到进程结束才落盘**
-  （上一轮 09:58 启动的清扫，日志 2 小时只写了开头 124 KB 的能力清单就是这个原因）；
-  `cmd /c` 的重定向是流式的，tail 能实时看到进度。
+  （上一轮 09:58 启动的清扫，日志 2 小时只写了开头 124 KB 的能力清单就是这个原因）；`cmd /c` 的重定向是流式的。
+  **但别把"日志没动"当成卡死**：① Python 自己按 8 KB 块缓冲标准输出；② `status_report.py --full` 是
+  "每个脚本跑完再汇总打印"，所以日志是**阶梯式增长**（本轮 16:00 启动后 3 分钟仍是 124,575 B 的清单，属正常）。
+  真进度看 `Get-Process py` / `qemu-system-x86_64` 的 PID 有没有换、StartTime 有没有更新。
 - **日志**：`$env:PI_SCRATCH_DIR\full_sweep_0113.log`
 - **收尾动作（下个会话）**：先 `Get-Content ...\full_sweep_0113.log -Tail 40`；
   进程不在且没有汇总 → 重跑（**一条链串行，别并行开第二个 QEMU**，宿主 8 GB 会互挤死）。
@@ -154,8 +156,11 @@
 
 ## 9. 环境已知问题（本机特有）
 
-1. `git push` 到 `github.com:443` 时通时不通：本轮 `git push` 通了（`063eaf1c..40208a45`、`* [new tag] v0.11.3`）；
-   不通时用 `$env:PI_SCRATCH_DIR\rel_v0113.py` 那套 Git Data API 回放（blobs→tree→commit→PATCH ref）。
+1. `git push` 到 `github.com:443` 时通时不通：功能提交那次通了（`063eaf1c..40208a45`、`* [new tag] v0.11.3`）；
+   **封存单那次又挂了**（`fatal: unable to access …: Empty reply from server`），最终用
+   `$env:PI_SCRATCH_DIR\push_api_v0113.py` 走 Git Data API 逐位复现推上去
+   （判据：new tree sha == `HEAD^{tree}` = `5c58700b…`、new commit sha == `95a292fb…`、递归树回读 14694 项 bad=0）。
+   本地 `refs/remotes/origin/main` 已用 API 核实过的 sha 对齐（`git fetch` 不通时这么做，别留着过期 tracking）。
 2. 夹具 QEMU 会泄漏：一批跑完用 `Get-Process qemu-system-x86_64` 看一眼再继续。
 3. 宿主 8 GB：两个 QEMU 并行会互挤死（rc=4294967295，串口停在正常 `[TASK64] kheart`）。回归一律串行。
 4. `bash` 必须解析到 msys2（`export PATH=/usr/bin:/bin`）。
