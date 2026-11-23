@@ -10,6 +10,7 @@
 
 | 文件 | 日期 | 版本串 | HEAD | 一句话 |
 |---|---|---|---|---|
+| [HANDOVER_v0112_wmdeco.md](HANDOVER_v0112_wmdeco.md) | 2026-11-23 | 0.11.2（**已发版**） | `34974344` | Ring 3 合成器（/bin/wm）也接管装饰 + 三按钮真实语义（29/30 号）；跨层拖拽/explorer 遗留项复跑确认；v0.11.2 已打 tag、已建 Release |
 | [HANDOVER_v0111_wlsurfwin.md](HANDOVER_v0111_wlsurfwin.md) | 2026-11-22 | 0.11.1（**已发版**） | `94406e93` | 第二步 wl_surface→Window（28 号 set_decor，装饰归合成器）落地 + 跨层拖拽；v0.11.1 已打 tag、已建 Release（ISO+IMG） |
 | [HANDOVER_v0111_dragdrop.md](HANDOVER_v0111_dragdrop.md) | 2026-11-22 | 0.11.0（WIP，未 bump） | `113d37c6` | 跨层拖拽（explorer→桌面）落地并通过验收；PE 窗口统一装饰未做，未发版 |
 
