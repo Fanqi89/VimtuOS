@@ -22,6 +22,8 @@
 #include "dock64.h"       // ★ v0.11.3：Dock × 窗口生命周期（外部窗口运行项 / 最小化收容 / 高亮）
 #include "theme64.h"      // theme64_tokens64()（标题栏底色）
 #include "gfx64.h"        // gfx64_fill_round64（标题栏不透明底色）
+#include "icons64.h"      // ★ v0.11.4：应用图标 kind / 绘制 / 导出 RGBA（标题栏 + Dock 同源）
+#include "font.h"         // ★ v0.11.4：font_raster_text64（标题覆盖率位图，给 Ring 3 合成器）
 #include "proc64.h"       // 进程上下文 + shm 对象的只读视图/hold/release
 #include "usermode64.h"   // user64_range_ok64（seat 事件出参校验）
 #include "mem_64.h"       // page_count_free_64（演示的页池基线核对）
@@ -129,7 +131,8 @@ struct Wl64Surface {
     int32_t  dmg_x, dmg_y, dmg_w, dmg_h;   // damage 包围盒（surface 局部坐标；未裁剪）
     // ---- ★ v0.11.1（第二步 wl_surface → Window）：装饰（合成器画，客户端不自绘）----
     uint32_t decor;                // WL64_DECOR_F_WINDOW64 位；0 = 裸 surface（老口径，一个像素不变）
-    char     title[32];            // 标题栏文字（UTF-8，31 B + 结尾 0；空 = 不画标题）
+    char     title[WL64_TITLE_MAX64];  // 标题栏文字（UTF-8，63 B + 结尾 0；★ v0.11.4：32 -> 64 B，
+                                       //   否则"图片查看器 1280x800"这种中文标题装不下）
     uint32_t deco_logged;          // "deco paint" 打点是否已经打过（防刷屏）
     int32_t  deco_log_x, deco_log_y;   // 上次打点时的位置（挪动后要重打一行）
     // ---- ★ v0.11.2：窗口控制状态（30 号改它；两条合成路都读它）----
@@ -140,6 +143,14 @@ struct Wl64Surface {
     //   minimized = 1：整窗从屏幕摘掉（frame 高度 0 -> 装饰与内容都不合成、命中测试也落空），
     //   Dock 那条运行项画"最小化横杠"；点 Dock 项走 30 号 RESTORE，几何一个像素都不动。
     uint32_t minimized;
+    // ---- ★ v0.11.4：应用身份（图标）----
+    //   app_kind = icons64 的图标包 kind（0 = 没有身份/不认识的图标名）。
+    //   来源：32 号 wl_surface_set_app()；用处：① 标题栏左侧的应用图标（两条合成路同一份 kind）
+    //   ② Dock 运行项的图标 ③ 33 号把图标导出成 RGBA 给 Ring 3 合成器。
+    uint32_t app_kind;
+    char     app_name[WL64_APP_NAME_MAX64];   // 应用身份名（UTF-8，打点/诊断用）
+    uint32_t alpha_logged;         // ★ v0.11.4：31 号打点是否已经打过（防刷屏）
+    uint32_t alpha_log_w;          // 上次打点时的位图宽（标题变了要重打一行）
 };
 static Wl64Surface g_wl64_surfs[WL64_MAX_SURFACES64];
 static uint32_t    g_wl64_next_id64 = 1;
@@ -451,7 +462,8 @@ static uint32_t wl64_deco_paint64(Wl64Surface* s, int vis_x, int vis_y, int vis_
             // 上一帧自己的像素上，会一帧比一帧暗（alpha 累积）。铺完再叠玻璃 = 每帧确定。
             gfx64_fill_round64(FX, FY, FW, (int)WL64_DECOR_H64 + 1, THEME64_R_WINDOW,
                                t->title_bg, 255);
-            gui64_deco_frame64(FX, FY, FW, FH, s->title, 1);
+            // ★ v0.11.4：第 7 个参数 = 应用图标 kind（0 = 老口径，标题文字仍在 +8；有图标时文字右移到 +26）
+            gui64_deco_frame64(FX, FY, FW, FH, s->title, 1, (int)s->app_kind);
             // ★ v0.11.2：最大化时客户区比 surface 大 —— 先把多出来的那块铺成客户区底色
             //   （内容随后按原尺寸贴左上；不缩放，如实标注）。
             if (s->maxed && !s->collapsed) {
@@ -1487,7 +1499,7 @@ int64_t wl64_surface_set_decor64(uint64_t surf, uint64_t flags, uint64_t title_u
     const bool owner = (s->pid == (int32_t)pid);
     if (!owner && !wl64_is_wm64(pid)) return WL64_EPERM64;
     if ((flags & ~(uint64_t)WL64_DECOR_F_WINDOW64) != 0) return WL64_EINVAL64;
-    char tb[32];
+    char tb[WL64_TITLE_MAX64];                 // ★ v0.11.4：32 -> 64 B（中文标题 3 B/字）
     for (uint32_t i = 0; i < (uint32_t)sizeof(tb); i++) tb[i] = 0;
     if (title_uptr) {
         uint32_t n = 0;
@@ -1514,7 +1526,10 @@ int64_t wl64_surface_set_decor64(uint64_t surf, uint64_t flags, uint64_t title_u
     /* ★ v0.11.3：一变成"窗口"就在 Dock 上登记一条运行项（最小化收容/点图标恢复/活动高亮
      *   都要有它）。裸 surface（flags=0）不登记 —— 面板/时钟那些不该出现在任务栏里。 */
     if (s->decor & WL64_DECOR_F_WINDOW64) {
-        if (dock64_ext_add64((int)s->id, s->title) == 1) dock64_ext_title64((int)s->id, s->title);
+        if (dock64_ext_add64((int)s->id, s->title, (int)s->app_kind) == 1) {
+            dock64_ext_title64((int)s->id, s->title);
+            dock64_ext_icon64((int)s->id, (int)s->app_kind);
+        }
     } else {
         dock64_ext_del64((int)s->id);
     }
@@ -1662,6 +1677,124 @@ int64_t wl64_surface_title64(uint64_t surf, uint64_t out_uptr, uint64_t cap) {
     }
     *(char*)(uintptr_t)(out_uptr + n) = 0;
     return (int64_t)(n + 1);
+}
+
+// ==================== ★ v0.11.4：31/32/33（中文标题位图 / 应用身份 / 应用图标）====================
+// 语义与权限见 kernel/wl64.h 的 WL64_ABI_SURFACE_TITLEALPHA64/SETAPP64/APPICON64 段。
+static uint32_t g_wl64_title_logged64 = 0;      // 31 号打点预算（前 16 条全打，之后每 512 条一条）
+static int wl64_title_is_utf8_64(const char* s) {
+    if (!s) return 0;
+    for (int i = 0; s[i]; i++) if ((uint8_t)s[i] >= 0x80) return 1;   // 有非 ASCII 字节 = 需要 CJK 字形
+    return 0;
+}
+// 这一节的**存在理由**：/bin/wm 的装载窗口只有 64 KiB，装不下 stb_truetype（font64.o 94,800 B），
+//   v0.11.3 只能给它一张构建期预光栅化的 ASCII 字模 —— 结果"中文标题在 wm 路下不显示"。
+//   这里把字形/图标的所有权收回到内核（唯一来源），合成器只做 alpha 混合。
+static uint8_t g_wl64_title_bmp64[WL64_TITLE_BMP_W64 * WL64_TITLE_BMP_H64];
+
+int64_t wl64_surface_title_alpha64(uint64_t surf, uint64_t out_uptr, uint64_t cap) {
+    const int64_t pid = wl64_pid64();
+    if (pid <= 0) return WL64_EPERM64;
+    Wl64Surface* s = wl64_find64((uint32_t)surf);
+    if (!s) return WL64_ENOENT64;
+    const bool owner = (s->pid == (int32_t)pid);
+    if (!owner && !wl64_is_wm64(pid)) return WL64_EPERM64;
+    const uint64_t need = (uint64_t)WL64_TITLE_BMP_W64 * (uint64_t)WL64_TITLE_BMP_H64;
+    if (cap < need) return WL64_EINVAL64;
+    if (!user64_range_ok64(out_uptr, need)) return WL64_EFAULT64;
+    const int w = font_raster_text64(s->title, g_wl64_title_bmp64, (int)WL64_TITLE_BMP_W64,
+                                     (int)WL64_TITLE_BMP_W64, (int)WL64_TITLE_BMP_H64);
+    for (uint64_t i = 0; i < need; i++) *(uint8_t*)(uintptr_t)(out_uptr + i) = g_wl64_title_bmp64[i];
+    /* ★ v0.11.4：数一下**真的落了墨**的像素（ink）。为什么要有这个数：宽 w 只说明"推进了几像素"，
+     *   字形缺失时 font_raster_text64 仍然按 em 宽度推进 —— 光看 w 无法区分"画了字"与"全是空白"。
+     *   ink > 0 才是"这套字形真的画得出来"的硬证据（中文标题就靠它，见 tests/viewer64_test.py）。 */
+    uint32_t ink = 0;
+    for (uint64_t i = 0; i < need; i++) if (g_wl64_title_bmp64[i]) ink++;
+    /* 打点：只在"这一条 surface 的位图宽变了"或还没打过时打一行 —— 合成器每帧都会来取，
+     *   逐帧打会刷爆 COM1（每个 outb 一次 VM exit）。 */
+    if (!s->alpha_logged || s->alpha_log_w != (uint32_t)w) {
+        const bool first = !s->alpha_logged;
+        s->alpha_logged = 1;
+        s->alpha_log_w = (uint32_t)w;
+        if (first || wl64_hot_log64(&g_wl64_title_logged64, 16u, 512u)) {
+            wl64_begin64();
+            wl64_puts64("[WL64] title bmp surf="); wl64_udec64(s->id);
+            wl64_puts64(" pid=");                  wl64_dec64(pid);
+            wl64_puts64(" w=");                    wl64_dec64(w);
+            wl64_puts64(" h=");                    wl64_udec64((uint64_t)WL64_TITLE_BMP_H64);
+            wl64_puts64(" bytes=");                wl64_udec64(need);
+            wl64_puts64(" utf8=");                 wl64_udec64((uint64_t)wl64_title_is_utf8_64(s->title));
+            wl64_puts64(" ink=");                  wl64_udec64((uint64_t)ink);
+            wl64_puts64(" title=\"");              wl64_puts64(s->title); wl64_puts64("\"");
+            wl64_nl64();
+            wl64_end64();
+        }
+    }
+    return ((int64_t)w << 16) | (int64_t)WL64_TITLE_BMP_H64;
+}
+
+int64_t wl64_surface_set_app64(uint64_t surf, uint64_t name_uptr) {
+    const int64_t pid = wl64_pid64();
+    if (pid <= 0) return WL64_EPERM64;
+    Wl64Surface* s = wl64_find64((uint32_t)surf);
+    if (!s) return WL64_ENOENT64;
+    const bool owner = (s->pid == (int32_t)pid);
+    if (!owner && !wl64_is_wm64(pid)) return WL64_EPERM64;
+    char nb[WL64_APP_NAME_MAX64];
+    for (uint32_t i = 0; i < (uint32_t)sizeof(nb); i++) nb[i] = 0;
+    if (name_uptr) {
+        for (uint32_t n = 0; n + 1u < (uint32_t)sizeof(nb); n++) {
+            if (!user64_range_ok64(name_uptr + (uint64_t)n, 1)) return WL64_EFAULT64;
+            const char c = *(const char*)(uintptr_t)(name_uptr + (uint64_t)n);
+            nb[n] = c;
+            if (!c) break;
+        }
+        nb[sizeof(nb) - 1u] = 0;
+    }
+    int kind = nb[0] ? icons64_kind_by_name64(nb) : 0;
+    if (kind < 0) kind = 0;                 // 不认识的图标名 = 没有图标（不报错：身份是可选装饰）
+    bool changed = (s->app_kind != (uint32_t)kind);
+    if (changed) for (uint32_t i = 0; i < (uint32_t)sizeof(s->app_name); i++) {
+        if (s->app_name[i] != nb[i]) { changed = true; break; }
+    }
+    s->app_kind = (uint32_t)kind;
+    for (uint32_t i = 0; i < (uint32_t)sizeof(s->app_name); i++) s->app_name[i] = nb[i];
+    s->deco_logged = 0;
+    if (s->shm_id) s->pending = 1;
+    /* Dock 运行项的图标跟着走（外部窗口在 28 号就登记了运行项，那时还不知道应用身份） */
+    if (s->decor & WL64_DECOR_F_WINDOW64) dock64_ext_icon64((int)s->id, kind);
+    if (changed) {
+        wl64_begin64();
+        wl64_puts64("[WL64] app id=");  wl64_udec64(s->id);
+        wl64_puts64(" pid=");           wl64_dec64(pid);
+        wl64_puts64(" name=\"");        wl64_puts64(s->app_name); wl64_puts64("\"");
+        wl64_puts64(" kind=");          wl64_dec64(kind);
+        wl64_puts64(" icon=\"");        wl64_puts64(kind ? icons64_kind_name64(kind) : "-"); wl64_puts64("\"");
+        wl64_nl64();
+        wl64_end64();
+    }
+    return 0;
+}
+
+int64_t wl64_surface_app_icon64(uint64_t surf, uint64_t out_uptr, uint64_t cap) {
+    const int64_t pid = wl64_pid64();
+    if (pid <= 0) return WL64_EPERM64;
+    Wl64Surface* s = wl64_find64((uint32_t)surf);
+    if (!s) return WL64_ENOENT64;
+    const bool owner = (s->pid == (int32_t)pid);
+    if (!owner && !wl64_is_wm64(pid)) return WL64_EPERM64;
+    if (!s->app_kind) return -1;                       // 没有身份 = 没有图标（合成器如实不画）
+    const uint64_t px = (uint64_t)WL64_APP_ICON_PX64;
+    const uint64_t need = px * px * 4u;
+    if (cap < need) return WL64_EINVAL64;
+    if (!user64_range_ok64(out_uptr, need)) return WL64_EFAULT64;
+    static uint8_t g_wl64_icon_rgba64[WL64_APP_ICON_PX64 * WL64_APP_ICON_PX64 * 4];
+    if (icons64_export_rgba64((int)s->app_kind, (int)px, g_wl64_icon_rgba64,
+                              (int)px, (int)px, icons64_app_color64((int)s->app_kind)) != 0) {
+        return -1;                                     // 图标包里没有这张图（如实返回，不画）
+    }
+    for (uint64_t i = 0; i < need; i++) *(uint8_t*)(uintptr_t)(out_uptr + i) = g_wl64_icon_rgba64[i];
+    return (int64_t)s->app_kind;
 }
 
 // 诊断：当前注册的合成器 pid（0 = 没有）

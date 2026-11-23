@@ -59,7 +59,7 @@ struct Window {
     int  client_x, client_y;    // 客户区左上角（屏幕坐标）
     int  client_w, client_h;    // 客户区尺寸
     int  min_w, min_h;          // 最小尺寸（拖拽缩放时钳制）
-    char title[32];             // UTF-8 标题
+    char title[64];             // UTF-8 标题（★ v0.11.4：32 -> 64 B，中文标题 3 B/字）
     bool visible;
     bool active;
     bool minimized;
@@ -118,7 +118,9 @@ void    gui64_dirty(int x, int y, int w, int h);
 //   后半（画在客户区内容**之后**）：1px 玻璃边框 + 四角圆角裁切。
 // 两个函数都是逐像素确定的（同一像素重复画结果相同），所以可以按遮挡切子矩形、设 clip 反复调用。
 // 它们**不设 clip**（调用方负责）—— wl_surface 那条路必须先 fb_set_clip 再调。
-void    gui64_deco_frame64(int x, int y, int w, int h, const char* title, int active);
+// ★ v0.11.4：多做一件事 —— 标题栏左侧画**应用图标**（icon_kind = icons64 的 kind；0 = 不画，
+//   标题文字仍在 x+8，逐像素与 v0.11.3 一致）。有图标时标题文字右移到 x+26。
+void    gui64_deco_frame64(int x, int y, int w, int h, const char* title, int active, int icon_kind);
 void    gui64_deco_edge64(int x, int y, int w, int h);
 int     gui64_deco_h64();                    // 装饰占掉的高度（标题栏 24 + 上边框 1 = 25）
 

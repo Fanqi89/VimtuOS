@@ -68,6 +68,9 @@
 #define ICON64_K_MONITOR     18
 #define ICON64_K_CHECK       19
 #define ICON64_K_BATTERY     20
+// ★ v0.11.4：资源管理器地址栏的"上一级"按钮 —— 以前是纯像素三角（"纯箭头"），
+//   现在与后退/前进一样走图标包（chevron-left/right/up 三个同族 SVG，粗细/圆角一致）。
+#define ICON64_K_CHEV_UP     21
 // 应用图标（Dock/桌面/开始菜单网格；同样存掩码，颜色由 icons64_app_color64 给"品牌感"亮色）
 #define ICON64_A_MYPC        64
 #define ICON64_A_RECYCLE     65
@@ -79,6 +82,9 @@
 #define ICON64_A_FILES       71
 #define ICON64_A_MONITOR     72
 #define ICON64_A_ABOUT       73
+// ★ v0.11.4：Ring 3 图片查看器（apps/image-viewer.svg）。窗口标题栏左侧图标 + Dock 运行项图标
+//   都由 32 号 wl_surface_set_app("image-viewer") 认出来。
+#define ICON64_A_IMAGE       74
 
 // ==================== 生命周期 ====================
 // 启动期调一次（kernel64.cpp 的 os_boot_path 里、gui64_run 之前）：

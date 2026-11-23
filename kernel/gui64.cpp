@@ -1489,7 +1489,7 @@ struct DockItem64 {
     int  win_id;      // RUN：窗口槽（= window_id）；其他 -1
     int  icon_kind;   // 图标包 kind（>=0；-1 = 无）
     int  icon64;      // ICON64_A_*（icons64_draw_kind64 的 kind）
-    char title[32];   // 显示名（RUN 用窗口标题；PIN/START 用注册表名）
+    char title[64];   // 显示名（RUN 用窗口标题；PIN/START 用注册表名）★ v0.11.4：32 -> 64 B（中文标题）
 };
 
 static DockItem64 g_dock[DOCK_MAX];
@@ -1497,7 +1497,7 @@ static int  g_dock_n = 0;
 // 固定列表（顺序 = 显示顺序；持久化到 /etc/dock.conf）与运行列表（按添加顺序；不持久化）
 static int  g_pins[DOCK_MAX];   static int g_pins_n = 0;
 static bool g_pins_loaded = false;
-struct DockRun64 { int win_id; int app_id; char title[32]; };
+struct DockRun64 { int win_id; int app_id; int icon_kind; char title[64]; };   // ★ v0.11.4：带图标 kind
 static DockRun64 g_runs[DOCK_RUN_MAX]; static int g_runs_n = 0;
 
 static int  g_dock_x = 0, g_dock_y = 0, g_dock_w = 0, g_dock_h = DOCK_H;
@@ -1779,7 +1779,9 @@ static void dock_list_build64() {
         if (dock_is_pinned64(g_runs[i].app_id)) { merged++; continue; }
         DockItem64* r = &g_dock[n++];
         r->kind = DOCK_KIND_RUN; r->app_id = g_runs[i].app_id; r->win_id = g_runs[i].win_id;
-        r->icon64 = dock_app_icon_of64(r->app_id, &r->icon_kind);
+        // ★ v0.11.4：运行项自带图标 kind（外部窗口）优先；内核窗口仍按注册表查
+        r->icon_kind = (g_runs[i].icon_kind > 0) ? g_runs[i].icon_kind : -1;
+        r->icon64 = (r->icon_kind > 0) ? r->icon_kind : dock_app_icon_of64(r->app_id, &r->icon_kind);
         int k = 0;
         for (; g_runs[i].title[k] && k < (int)sizeof(r->title) - 1; k++) r->title[k] = g_runs[i].title[k];
         r->title[k] = 0;
@@ -1816,7 +1818,9 @@ static void dock_pin_set64(int app_id, int on) {
     dock_pins_log64(on ? "pin" : "unpin");
     dock_rebuild64();
 }
-static void dock_run_add64(int win_id, int app_id, const char* title) {
+// ★ v0.11.4：多一个 icon_kind —— 外部窗口（ring3）的应用身份由 32 号 set_app 给出，
+//   Dock 运行项要画那个真图标（原来 app_id = APP_ID_NONE -> 默认图标）。
+static void dock_run_add64(int win_id, int app_id, const char* title, int icon_kind) {
     if (dock_run_index64(win_id) >= 0) return;         // 幂等
     if (g_runs_n >= DOCK_RUN_MAX) {
         dbg64_line_begin64();
@@ -1827,7 +1831,7 @@ static void dock_run_add64(int win_id, int app_id, const char* title) {
         return;
     }
     DockRun64* r = &g_runs[g_runs_n++];
-    r->win_id = win_id; r->app_id = app_id;
+    r->win_id = win_id; r->app_id = app_id; r->icon_kind = icon_kind;
     int k = 0;
     if (title) for (; title[k] && k < (int)sizeof(r->title) - 1; k++) r->title[k] = title[k];
     r->title[k] = 0;
@@ -1865,7 +1869,7 @@ static void dock_run_del64(int win_id) {
     dock_rebuild64();
 }
 // 窗口事件入口（gui64_create_window / gui64_destroy_window 调）
-void dock64_on_window_create64(int win_id, int app_id, const char* title) { dock_run_add64(win_id, app_id, title); }
+void dock64_on_window_create64(int win_id, int app_id, const char* title) { dock_run_add64(win_id, app_id, title, -1); }
 // ★ v0.11.3：改某条运行项的标题（外部窗口的标题文字变了 —— 右键菜单/悬停列表要跟着变）
 static void dock_run_title64(int win_id, const char* title) {
     const int at = dock_run_index64(win_id);
@@ -1889,14 +1893,15 @@ static const uint64_t GUI_CTL_RESTORE64  = 5;
 int     wl64_active_surface64() __attribute__((weak));
 
 #define DOCK_EXT_MAX 8
-struct DockExt64 { int used; int surf; char title[40]; int minimized; };
+// ★ v0.11.4：title 40 -> 64 B（中文标题），并记下应用图标 kind（外部窗口的真图标）
+struct DockExt64 { int used; int surf; int icon_kind; char title[64]; int minimized; };
 static DockExt64 g_extw[DOCK_EXT_MAX];
 static int dock_ext_index64(int surf) {
     for (int i = 0; i < DOCK_EXT_MAX; i++)
         if (g_extw[i].used && g_extw[i].surf == surf) return i;
     return -1;
 }
-int dock64_ext_add64(int surf, const char* title) {
+int dock64_ext_add64(int surf, const char* title, int icon_kind) {
     if (surf <= 0) return -2;
     if (dock_ext_index64(surf) >= 0) return 1;
     for (int i = 0; i < DOCK_EXT_MAX; i++) {
@@ -1904,14 +1909,16 @@ int dock64_ext_add64(int surf, const char* title) {
         g_extw[i].used = 1;
         g_extw[i].surf = surf;
         g_extw[i].minimized = 0;
+        g_extw[i].icon_kind = icon_kind;
         int k = 0;
         if (title) for (; title[k] && k < (int)sizeof(g_extw[i].title) - 1; k++) g_extw[i].title[k] = title[k];
         g_extw[i].title[k] = 0;
-        dock_run_add64(DOCK_EXT_WIN_BASE + surf, APP_ID_NONE, g_extw[i].title);
+        dock_run_add64(DOCK_EXT_WIN_BASE + surf, APP_ID_NONE, g_extw[i].title, icon_kind);
         dbg64_line_begin64();
         dbg64_str("[DOCK64] ext-add surf="); dbg64_dec((uint64_t)surf);
         dbg64_str(" win=");                  dbg64_dec((uint64_t)(DOCK_EXT_WIN_BASE + surf));
         dbg64_str(" title=");                dbg64_str(g_extw[i].title[0] ? g_extw[i].title : "-");
+        dbg64_str(" icon=");                 dbg64_dec((uint64_t)icon_kind);
         dbg64_nl();
         dbg64_line_end64();
         gui64_invalidate();
@@ -1950,6 +1957,22 @@ void dock64_ext_title64(int surf, const char* title) {
     g_extw[at].title[k] = 0;
     dock_run_title64(DOCK_EXT_WIN_BASE + surf, g_extw[at].title);   // 运行项标题跟着改（右键菜单/悬停用）
     gui64_invalidate();
+}
+// ★ v0.11.4：外部窗口拿到应用身份后，Dock 运行项的图标跟着换成真图标（32 号 set_app 调）
+void dock64_ext_icon64(int surf, int icon_kind) {
+    const int at = dock_ext_index64(surf);
+    if (at < 0) return;
+    if (g_extw[at].icon_kind == icon_kind) return;      // 幂等：没变就什么都不做（不刷打点）
+    g_extw[at].icon_kind = icon_kind;
+    const int ri = dock_run_index64(DOCK_EXT_WIN_BASE + surf);
+    if (ri >= 0) g_runs[ri].icon_kind = icon_kind;
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] ext-icon surf="); dbg64_dec((uint64_t)surf);
+    dbg64_str(" kind=");                  dbg64_dec((uint64_t)icon_kind);
+    dbg64_str(" name=");                  dbg64_str(icon_kind ? icons64_kind_name64(icon_kind) : "-");
+    dbg64_nl();
+    dbg64_line_end64();
+    dock_rebuild64();
 }
 
 // 第 i 项的**基准**左边界（不含悬停让位）
@@ -2734,7 +2757,7 @@ static void draw_title_buttons_rect64(int x, int y, int w) {
 // 后半描 1px 玻璃边框 + 四角圆角裁切）。
 // ★ 两个函数都是**逐像素确定**的（同一像素画两次结果相同），所以 wl64 那条路可以按遮挡
 //   把窗口切成若干子矩形、逐块设 clip 反复调用它们 —— 不会出现叠色。
-void gui64_deco_frame64(int x, int y, int w, int h, const char* title, int active) {
+void gui64_deco_frame64(int x, int y, int w, int h, const char* title, int active, int icon_kind) {
     const Theme64Tokens* t = theme64_tokens64();
     // 1) 双层浅阴影（预生成 alpha mask，按 w/h/r 缓存复用）
     gfx64_shadow64(x, y, w, h, THEME64_R_WINDOW, t);
@@ -2742,9 +2765,17 @@ void gui64_deco_frame64(int x, int y, int w, int h, const char* title, int activ
     //    看门狗的程度 —— 实测 7 个窗口时 5s 超时 PANIC）。
     const uint32_t tb = active ? t->title_bg : t->title_bg_ina;
     gfx64_glass64(x, y, w, DECO_H + 2, THEME64_R_WINDOW, 1, tb, THEME64_A_TITLE, 0, 0, t);
-    // 3) 标题文字（居中偏左）
+    // 3) 应用图标（★ v0.11.4）：图标包 kind > 0 才画；画成了标题文字才右移。
+    //    槽位与 wm.c 的 wm_deco_frame 逐像素同一把尺子：图标 16x16 @ (x+6, y+BORDER+4)，
+    //    文字左边界 = x+26。没图标时文字仍在 x+8（老口径，验收判据不变）。
     const int ty = y + BORDER + (TITLE_H - 14) / 2;
-    text_ttf(x + 8, ty, (title && title[0]) ? title : "", t->title_txt);
+    int tx = x + 8;
+    if (icon_kind > 0 &&
+        icons64_draw_kind64(icon_kind, x + 6, y + BORDER + 4, 16,
+                            icons64_app_color64(icon_kind), 255) == 0) {
+        tx = x + 26;
+    }
+    text_ttf(tx, ty, (title && title[0]) ? title : "", t->title_txt);
     // 4) 三个按钮（简化绘制：三条横线/方块；关闭按钮红底）
     draw_title_buttons_rect64(x, y, w);
 }
@@ -2797,7 +2828,8 @@ static void draw_window(Window* w) {
     // ★ v0.11.1：装饰全部走共享真源（gui64_deco_frame64 / gui64_deco_edge64），
     //   这样 ring3 的 wl_surface 窗口（kernel/wl64.cpp）与内核窗口**逐像素同一套外观**。
     const Theme64Tokens* t = theme64_tokens64();
-    gui64_deco_frame64(w->x, w->y, w->w, w->h, w->title, w->active);
+    gui64_deco_frame64(w->x, w->y, w->w, w->h, w->title, w->active,
+                       dock_app_icon_of64(w->app_id, nullptr));   // ★ v0.11.4：标题栏应用图标
     // 客户区底色 + 应用内容（内容卡片：不透明底，老验收依赖 240,240,240）
     fb_fill_rect(w->client_x, w->client_y, w->client_w, w->client_h, t->client_bg);
     if (w->draw) {

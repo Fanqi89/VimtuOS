@@ -41,6 +41,7 @@
 #include "session64.h"  // ★ P8：应用清单（外壳按 APP_ID_* 登记的那一份 = 开始菜单/设置同一来源）
 #include "proc64.h"     // ★ v0.10.5：文件关联路由要**后台拉起** ring3 程序（proc64_start_elf64_argv64）
 #include "desktopops64.h"   // ★ v0.11.1：拖到桌面的落点（desktopops64_add_file64）
+#include "icons64.h"   // ★ v0.11.4：地址栏三按钮换成图标包里的 chevron 真图标（回落像素三角）
 
 // ==================== 几何常量（与脚本共享，勿乱改）====================
 #define EXP_WIN_X 120
@@ -2740,6 +2741,8 @@ static void draw_addr(void) {
     const int y0 = EXP_TOOLBAR_H;
     frect(0, y0, EXP_CONTENT_X, EXP_ADDR_H, C_EXP_BG);
     const int ids[3] = { IDC_BACK, IDC_FWD, IDC_UP };
+    static int s_nav_icon_logged = 0;      /* ★ v0.11.4：[EXP] nav icons 打点只打一次 */
+    int nav_pack = 0, nav_fb = 0;
     for (int i = 0; i < 3; i++) {
         const int x = 6 + i * 28;
         uint32_t bg = rgb(232, 232, 232);
@@ -2749,9 +2752,31 @@ static void draw_addr(void) {
         drect(x, y0 + 3, 26, EXP_ADDR_H - 6, C_EXP_LINE);
         const int cx = x + 13, cy = y0 + EXP_ADDR_H / 2;
         const uint32_t gl = (i == 2) ? rgb(0, 90, 160) : ((i == 0 && g_hist_pos <= 0) || (i == 1 && g_hist_pos + 1 >= g_hist_n) ? rgb(170, 170, 170) : rgb(0, 90, 160));
-        if (i == 0) { frect(cx - 4, cy - 5, 2, 11, gl); for (int k = 0; k < 5; k++) frect(cx - 2 + k, cy - 4 + k, 1, 9 - 2 * k, gl); }
-        else if (i == 1) { frect(cx + 2, cy - 5, 2, 11, gl); for (int k = 0; k < 5; k++) frect(cx + 1 - k, cy - 4 + k, 1, 9 - 2 * k, gl); }
-        else { for (int k = 0; k < 6; k++) frect(cx - 5 + k, cy + 4 - k, 11 - 2 * k, 1, gl); }
+        /* ★ v0.11.4：三个按钮从"纯像素三角"换成图标包里的同族真图标
+         *   （chevron-left / chevron-right / chevron-up，Bootstrap Icons 同族 -> 粗细、圆角、
+         *   端点一致）。取不到图标包时**如实回落**原来的像素三角绘制（界面不空、行为不变）。 */
+        const int kind = (i == 0) ? ICON64_K_CHEV_L : (i == 1) ? ICON64_K_CHEV_R : ICON64_K_CHEV_UP;
+        if (icons64_draw_kind64(kind, cx - 8, cy - 8, 16, gl, 255) != 0) {
+            nav_fb++;                      /* 图标包取不到 -> 如实回落像素三角 */
+            if (i == 0) { frect(cx - 4, cy - 5, 2, 11, gl); for (int k = 0; k < 5; k++) frect(cx - 2 + k, cy - 4 + k, 1, 9 - 2 * k, gl); }
+            else if (i == 1) { frect(cx + 2, cy - 5, 2, 11, gl); for (int k = 0; k < 5; k++) frect(cx + 1 - k, cy - 4 + k, 1, 9 - 2 * k, gl); }
+            else { for (int k = 0; k < 6; k++) frect(cx - 5 + k, cy + 4 - k, 11 - 2 * k, 1, gl); }
+        } else {
+            nav_pack++;                    /* 真图标（图标包 chevron 同族）画出来了 */
+        }
+    }
+    /* ★ v0.11.4 取证：三个按钮到底用的是图标包真图标还是回落三角（一次一行，防刷屏） */
+    if (!s_nav_icon_logged) {
+        s_nav_icon_logged = 1;
+        dbg64_line_begin64();
+        dbg64_str("[EXP] nav icons pack="); dbg64_dec((uint64_t)nav_pack);
+        dbg64_str(" fallback=");            dbg64_dec((uint64_t)nav_fb);
+        dbg64_str(" kinds=");               dbg64_dec((uint64_t)ICON64_K_CHEV_L);
+        dbg64_str(",");                     dbg64_dec((uint64_t)ICON64_K_CHEV_R);
+        dbg64_str(",");                     dbg64_dec((uint64_t)ICON64_K_CHEV_UP);
+        dbg64_str(" size=16");
+        dbg64_nl();
+        dbg64_line_end64();
     }
     // 面包屑（白底 + 边框 + 每段一个可点区域）
     const int bx = 96, bw = EXP_CONTENT_X + exp_content_w64() - 96 - 6;

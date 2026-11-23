@@ -1544,3 +1544,78 @@ void font_selftest() {
     dbg64_nl();
     dbg64_line_end64();
 }
+// ==================== ★ v0.11.4：文字 -> 8-bit 覆盖率缓冲（给 Ring 3 合成器）====================
+// 见 kernel/font.h 的声明段（为什么需要 / 语义）。实现要点：
+//   * 字形来源**只走既有缓存**：ASCII 走 cur->cache[]，非 ASCII 走 font_resolve_cp()+lru_get_slot()
+//     —— 与屏幕绘制用的是同一份位图，所以两路（内核窗口 / Ring 3 合成器）画出来的字一模一样；
+//   * 每行按 stride 写，不越界（wmax/h 全做边界判定）；覆盖率叠加用 max（字与字之间不互相加深）；
+//   * stem 加厚（g_stem_pct）在这里也算进去 —— 内核 draw 路径的 blend_px 会算它，
+//     若这条路径不算，合成器标题就会比内核标题"细一档"（同一套字形、两种粗细 = 又一份漂移）。
+static const uint8_t* glyph_coverage64(uint32_t cp, int* ox, int* oy, int* w, int* h) {
+    if (cp < FONT_CACHE_N) {
+        if (!cur->font_ok) return nullptr;
+        if (!cur->cacheOk[cp]) {
+            int gx, gy, gw, gh;
+            if (!rasterize_glyph(cur, cp, cur->cache[cp], &gx, &gy, &gw, &gh)) {
+                cur->cacheOk[cp] = 2;
+            } else {
+                cur->cacheOX[cp] = gx; cur->cacheOY[cp] = gy;
+                cur->cacheW[cp] = gw;  cur->cacheH[cp] = gh;
+                cur->cacheOk[cp] = 1;
+            }
+        }
+        if (cur->cacheOk[cp] != 1) return nullptr;
+        *ox = cur->cacheOX[cp]; *oy = cur->cacheOY[cp];
+        *w = cur->cacheW[cp];   *h = cur->cacheH[cp];
+        return cur->cache[cp];
+    }
+    FontFace* fc = font_resolve_cp(cp);
+    if (!fc) return nullptr;                       // 四个面都没有：合成器侧画空格（不画占位框）
+    const int slot = lru_get_slot(fc, cp);
+    if (slot < 0) return nullptr;
+    *ox = fc->lruOX[slot]; *oy = fc->lruOY[slot];
+    *w = fc->lruW[slot];   *h = fc->lruH[slot];
+    return fc->lru_bm[slot];
+}
+
+int font_raster_text64(const char* s, uint8_t* out, int stride, int wmax, int h) {
+    if (!out || wmax <= 0 || h <= 0) return 0;
+    if (stride < wmax) stride = wmax;               // 防御：stride 太小时按最紧的行宽写（不越界）
+    const int total = stride * h;
+    for (int i = 0; i < total; i++) out[i] = 0;
+    if (!s) return 0;
+    int cx = 0;
+    while (*s) {
+        int adv = 0;
+        const uint32_t cp = utf8_decode(s, &adv);
+        if (adv <= 0) break;
+        if (cp == 0) { s += adv; continue; }        // 非法字节：跳过（与 font_draw_text 一致）
+        const int cadv = (cp < FONT_CACHE_N) ? font_glyph_advance((char)cp) : font_glyph_advance_cp(cp);
+        if (cx > 0 && cx + cadv > wmax) break;      // 整字放不下就停（不留半截字）
+        int ox = 0, oy = 0, gw = 0, gh = 0;
+        const uint8_t* bm = glyph_coverage64(cp, &ox, &oy, &gw, &gh);
+        if (bm && gw > 0 && gh > 0) {
+            for (int yy = 0; yy < gh; yy++) {
+                const int dy = oy + yy;
+                if (dy < 0 || dy >= h) continue;
+                const uint8_t* row = &bm[(oy + yy) * FONT_PX + ox];
+                uint8_t* drow = out + dy * stride;
+                for (int xx = 0; xx < gw; xx++) {
+                    const int dx = cx + xx;
+                    if (dx < 0 || dx >= wmax) continue;
+                    int a = row[xx];
+                    if (!a) continue;
+                    if (g_stem_pct != 100) {         // 与 blend_px 同一把尺子（覆盖率加厚）
+                        a = a * g_stem_pct / 100;
+                        if (a > 255) a = 255;
+                    }
+                    if (a > (int)drow[dx]) drow[dx] = (uint8_t)a;
+                }
+            }
+        }
+        cx += cadv;
+        s += adv;
+        if (cx >= wmax) break;
+    }
+    return (cx < wmax) ? cx : wmax;
+}

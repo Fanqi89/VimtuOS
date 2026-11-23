@@ -256,6 +256,35 @@ static const uint32_t WL64_EV_CLOSE64           = 7u;
 //   out = 用户缓冲（cap 字节，含结尾 0），最多 31 B 有效内容；权限同 23 号（注册合成器 / 拥有者）。
 static const uint32_t WL64_ABI_SURFACE_TITLE64  = 29;
 
+// ==================== ★ v0.11.4：中文标题 + 窗口图标（两条合成路的字形/图标同源）====================
+// 背景（本版要解决的两个"合成器只会画 ASCII 箭头/ASCII 标题"的硬边界）：
+//   ① /bin/wm 的标题字形来自构建期预光栅化的 ASCII 字模（user/wm/wm_ttf.h）——**中文画不出来**；
+//   ② 窗口/任务栏只有"默认图标"（外部窗口 app_id = NONE），没有应用身份。
+// 修法：**内核当唯一来源**（与"装饰单一真源"同一思路）。合成器不再自己光栅化/自己认图标：
+//   31 wl_surface_title_alpha(surf, out, cap) -> (w<<16)|h
+//        把该 surface 的标题文字用**内核自己的字形缓存**（四字体面 / 查询链 / stem 加厚）光栅化成
+//        8-bit 覆盖率缓冲（stride = w，左上角 = em 框顶端，与 gui64_deco_frame64 的 ty 同一把尺子）。
+//        cap 必须 >= WL64_TITLE_BMP_W64*WL64_TITLE_BMP_H64；返回 w(0..320) 与 h(=24)。
+//        **权限同 29 号**（拥有者 / 注册合成器）。中文/日文/符号只要字体面里有就画得出来。
+//   32 wl_surface_set_app(surf, name_uptr) -> 0
+//        给 surface 一个**应用身份名**（UTF-8，最长 31 B；例如 "image-viewer"/"terminal"）。
+//        内核用 icons64_kind_by_name64() 换成图标包 kind，存进 surface 表；标题栏图标、Dock 运行项
+//        图标、23 号导出的 pad 字段（= kind）都从这里出。名字不认识 -> 图标 kind = 0（如实"没有图标"，
+//        不假装成功、也不报错：应用身份是可选装饰，不是窗口功能）。名字 0 = 清掉身份。
+//        权限同 27/28 号（拥有者 / 注册合成器）。
+//   33 wl_surface_app_icon(surf, out, cap) -> 0 / -1
+//        把该 surface 的**应用图标**按 16x16 RGBA 写进调用方缓冲（cap >= 16*16*4），
+//        颜色 = icons64_app_color64(kind)（品牌色），alpha = 覆盖率。没有身份/图标包不可用 -> -1。
+//        为什么给 RGBA 而不是让合成器自己查包：图标包在系统卷 / 原始区，ring3 合成器不该也不会去解析它
+//        （而且 /bin/wm 只有 64 KiB 装载窗口，装不下解码器）。
+static const uint32_t WL64_ABI_SURFACE_TITLEALPHA64 = 31;
+static const uint32_t WL64_ABI_SURFACE_SETAPP64     = 32;
+static const uint32_t WL64_ABI_SURFACE_APPICON64    = 33;
+static const uint32_t WL64_TITLE_BMP_W64            = 320;   // 标题位图上限宽（px）
+static const uint32_t WL64_TITLE_BMP_H64            = 24;    // 标题位图高（px；标题栏 24 行，含降部余量）
+static const uint32_t WL64_APP_ICON_PX64            = 16;    // 标题栏/Dock 图标边长（px）
+static const uint32_t WL64_APP_NAME_MAX64           = 32;    // 应用身份名缓冲（31 B + NUL）
+
 // 合成器的缓冲映射窗：FB 映射区（5GiB..+40MiB）的**顶部 512 KiB** = 8 个 surface 槽 × 64 KiB
 // （= 单 shm 对象上限）。为什么放这里而不是新开一段 VA：① 5GiB 起那一段已经在
 //   usermode64.cpp 的 u64_va_in_user_area64() 白名单里（页级原语的唯一范围判据，不去动它）；
@@ -322,6 +351,13 @@ int64_t wl64_surface_set_decor64(uint64_t surf, uint64_t flags, uint64_t title_u
 int64_t wl64_surface_ctl64(uint64_t surf, uint64_t action);
 // 29（★ v0.11.2）：读标题栏文字（合成器画标题用）。返回写入的字节数（含结尾 0），负 = 错误。
 int64_t wl64_surface_title64(uint64_t surf, uint64_t out_uptr, uint64_t cap);
+// ★ v0.11.4：31 标题覆盖率位图 / 32 应用身份 / 33 应用图标（语义见上面常量段）
+int64_t wl64_surface_title_alpha64(uint64_t surf, uint64_t out_uptr, uint64_t cap);
+int64_t wl64_surface_set_app64(uint64_t surf, uint64_t name_uptr);
+int64_t wl64_surface_app_icon64(uint64_t surf, uint64_t out_uptr, uint64_t cap);
+// 标题文字缓冲（UTF-8，含结尾 0）。v0.11.4 由 32 B 放宽到 64 B：中文 3 B/字，32 B 只够 10 个汉字
+//   （"图片查看器 1280x800" 都放不下）。放宽只动内核表与两条合成路的缓冲，不动对外 ABI 结构体。
+static const uint32_t WL64_TITLE_MAX64 = 64;
 // 装饰框矩形（折叠/最大化会改变它；导出给合成器时也是这一把尺子）：
 //   正常 = (x,y,w,h)；折叠 = (x,y,w,25)；最大化 = (0,0,fb_w,fb_h)
 void wl64_frame_of64(uint32_t surf, int32_t* out_xywh);

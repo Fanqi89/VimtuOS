@@ -59,11 +59,13 @@ static const Icon64Name64 kIcon64Names[] = {
     { ICON64_K_PLUS,        "plus",          "system" }, { ICON64_K_PERSON,     "person",        "system" },
     { ICON64_K_USB,         "usb",           "system" }, { ICON64_K_MONITOR,    "monitor",       "system" },
     { ICON64_K_CHECK,       "check",         "system" }, { ICON64_K_BATTERY,    "battery",       "system" },
+    { ICON64_K_CHEV_UP,     "chevron-up",    "system" },            // ★ v0.11.4：资源管理器"上一级"
     { ICON64_A_MYPC,        "mypc",          "apps"   }, { ICON64_A_RECYCLE,    "recycle",       "apps"   },
     { ICON64_A_TERMINAL,    "terminal",      "apps"   }, { ICON64_A_SETTINGS,   "settings",      "apps"   },
     { ICON64_A_TMGR,        "tmgr",          "apps"   }, { ICON64_A_MINES,      "mines",         "apps"   },
     { ICON64_A_CALC,        "calc",          "apps"   }, { ICON64_A_FILES,      "files",         "apps"   },
     { ICON64_A_MONITOR,     "monitor-app",   "apps"   }, { ICON64_A_ABOUT,      "about",         "apps"   },
+    { ICON64_A_IMAGE,       "image-viewer",  "apps"   },            // ★ v0.11.4：Ring 3 图片查看器
 };
 #define ICON64_NAME_N ((int)(sizeof(kIcon64Names) / sizeof(kIcon64Names[0])))
 
@@ -721,6 +723,7 @@ uint32_t icons64_app_color64(int kind) {
         case ICON64_A_FILES:    return rgb(0xFF, 0xD9, 0x8F);   // 沙金
         case ICON64_A_MONITOR:  return rgb(0x9F, 0xD8, 0xFF);   // 天蓝
         case ICON64_A_ABOUT:    return rgb(0xD6, 0xC4, 0xFF);   // 淡紫
+        case ICON64_A_IMAGE:    return rgb(0x8F, 0xD6, 0xFF);   // 天蓝（图片查看器，★ v0.11.4）
         default:                return 0xFFFFFFu;
     }
 }

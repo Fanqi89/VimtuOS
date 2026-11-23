@@ -105,3 +105,19 @@ int font_lru_capacity();
 //   用来判断"每帧都在重新光栅化 CJK 字形"（＝LRU 没命中，帧时间会爆）。纯计数。
 void font64_perf_stats64(uint32_t* raster, uint32_t* draws, int reset);                   // 每 face 的 CJK LRU 槽数（预加载自检用）
 int font_cache_capacity();                 // 缓存容量上限
+
+// ==================== ★ v0.11.4：文字 -> 8-bit 覆盖率缓冲（给 Ring 3 合成器用）====================
+// 为什么要这个 API：Ring 3 的 /bin/wm 要画窗口标题，但 **wm.elf 的 ELF64 装载窗口只有 64 KiB**
+//   （kernel/usermode64.h 的 USER64_STACK_VA64 - USER64_CODE_VA64），font64.o 一个目标文件 94,800 B，
+//   直接链 stb_truetype 塞不进去。v0.11.3 只好在构建期预光栅化 ASCII 32..126 成字模（wm_ttf.h）——
+//   于是 **中文标题在 wm 路下画不出来**（非 ASCII 按 8px 空白跳过），且预光栅化与运行期光栅化像素
+//   不一致（PIL 无 hinting）。本 API 让**内核当唯一的字形来源**：合成器拿到的覆盖率就是内核自己
+//   画标题用的那一份（同一套字形缓存/同一把尺子/同一份 stem 加厚），中文自动就有。
+// 语义：
+//   * s = UTF-8 串（不要求 NUL 结尾？**要求** NUL 结尾，与 font_draw_text 一致）；
+//   * out = 调用方缓冲，stride 字节/行（>= wmax），高度固定 h 行；函数**先清零整块**；
+//   * 光栅化几何与 font_draw_text(0,0,...) **逐式相同**：左上角 = em 框顶端（y=0 行 = 字的 ascend 顶）；
+//   * 宽度超 wmax 就截断（不画半个字：整字放不下就停）；返回实际宽度（像素，0..wmax）；
+//   * 只写缓存的**覆盖率**（0..255），不写屏幕、不看/不改裁剪框、不改变任何渲染状态。
+//   颜色由调用方混合（合成器用主题色，内核路用 Token 色）—— 覆盖率与颜色解耦，两边像素才一致。
+int font_raster_text64(const char* s, uint8_t* out, int stride, int wmax, int h);

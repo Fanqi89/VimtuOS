@@ -50,7 +50,10 @@ void dockmenu64_draw64();
 //   * 最小化：30 号 ctl MIN2DOCK/RESTORE（wl64 通知）
 //   * 点击：dock_press64 的 RUN 分支 -> 30 号 ctl（RESTORE / MIN2DOCK）
 #define DOCK_EXT_WIN_BASE 10000
-int  dock64_ext_add64(int surf, const char* title);       // 0 = 新建 / 1 = 已存在（幂等）
+// ★ v0.11.4：加 icon_kind（图标包 kind；0 = 还没身份/没有图标）—— 外部窗口的应用身份由
+//   wl64 的 32 号 set_app 给出，Dock 运行项据此画真图标（不再是"默认箭头"）。
+int  dock64_ext_add64(int surf, const char* title, int icon_kind);   // 0 = 新建 / 1 = 已存在（幂等）
 void dock64_ext_del64(int surf);
 void dock64_ext_state64(int surf, int minimized);
 void dock64_ext_title64(int surf, const char* title);
+void dock64_ext_icon64(int surf, int icon_kind);

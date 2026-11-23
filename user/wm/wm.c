@@ -89,7 +89,8 @@ struct WmSlot {
     int                    prev_x, prev_y;   /* 上一帧的屏幕位置（算 dirty 用） */
     int                    prev_w, prev_h;
     /* ★ v0.11.2：装饰用的标题缓存（通过 29 号从内核读回，每个 surface 只读一次） */
-    char                   title[32];
+    /* ★ v0.11.4：32 -> 64 B（中文标题 3 B/字；"图片查看器 1280x800" 才放得下） */
+    char                   title[64];
     int                    title_got;
 };
 
@@ -359,6 +360,85 @@ static void wm_text_ttf(int x, int y, const char* s, uint32_t fg, int max_x) {
     }
 }
 
+/* ==================== ★ v0.11.4：标题字形与图标都向**内核**要 ====================
+ * 来由（本版要解决的两条边界）：
+ *   ① v0.11.3 的 wm 标题用预光栅化 ASCII 字模（wm_ttf.h）—— **中文标题画不出来**
+ *      （非 ASCII 按 8px 空白跳过）。要自己光栅化 CJK 就得链 stb_truetype，而 /lib/wm.elf 的
+ *      ELF64 装载窗口只有 64 KiB（font64.o 94,800 B），塞不进去 —— 这不是"懒得做"，是装不下。
+ *   ② 标题栏/任务栏只有默认图标，没有应用身份。
+ * 结论：字形/图标的**唯一来源是内核**（与"装饰单一真源"同一思路），合成器只做 alpha 混合：
+ *   31 wl_surface_title_alpha() -> 8-bit 覆盖率位图（320x24，stride=320，左上角 = em 框顶）
+ *   33 wl_surface_app_icon()    -> 16x16 RGBA（品牌色 + 覆盖率 alpha）
+ * 这样两条合成路（内核窗口 / Ring 3 合成器）的**像素来自同一套字形缓存与图标包**，
+ * 中文标题不需要在 wm 侧多一个字节的字模，图标也不需要 wm 自己解析 /etc/iconpack.bin。 */
+#define WM_TITLE_BMP_W  V64_WL_TITLE_BMP_W      /* 320；与内核 31 号的 stride 同一口径 */
+#define WM_TITLE_BMP_H  V64_WL_TITLE_BMP_H      /* 24 */
+#define WM_ICON_PX      V64_WL_APP_ICON_PX      /* 16 */
+static unsigned char g_title_bmp[WM_TITLE_BMP_W * WM_TITLE_BMP_H];
+static unsigned char g_icon_rgba[WM_ICON_PX * WM_ICON_PX * 4];
+static int g_title_bmp_calls = 0;               /* 31 号调用次数（[WM] title bmp 打点用） */
+static int g_title_bmp_ok = 0;                  /* 1 = 最近一次标题是用内核位图画出来的 */
+static int g_title_icon_kind = -1;              /* 最近一次拿到的图标 kind（-1 = 没有） */
+static int g_wm_title_log = 0;                  /* [WM] title bmp 行的预算（防刷屏） */
+static void wm_title_log64(const struct WmSlot* s, int w, int h) {
+    if (g_wm_title_log >= 6) return;            /* 每帧都会画标题：前 6 条够取证，之后闭嘴 */
+    g_wm_title_log++;
+    printf("[WM] title bmp surf=%d w=%d h=%d calls=%d ok=%d icon=%d\n",
+           (int)s->info.id, w, h, g_title_bmp_calls, g_title_bmp_ok, g_title_icon_kind);
+}
+
+/* 8-bit 覆盖率的 alpha 混合（0..255）。数学与内核 font.cpp 的 blend_px 同式，
+ * 这样"同一份覆盖率 + 同一个颜色"在两路得到**同一个像素**（不是"看起来差不多"）。 */
+static void wm_blend8(int x, int y, uint32_t fg, int a) {
+    if (a <= 0) return;
+    if (x < g_clip_x0 || x >= g_clip_x1 || y < g_clip_y0 || y >= g_clip_y1) return;
+    uint32_t* p = &wm_rowpx(y)[x];
+    if (a >= 255) { *p = fg; return; }
+    const uint32_t d = *p, ia = (uint32_t)(255 - a);
+    const uint32_t r = ((((fg >> 16) & 0xFFu) * (uint32_t)a + ((d >> 16) & 0xFFu) * ia) + 127u) / 255u;
+    const uint32_t g = ((((fg >> 8) & 0xFFu) * (uint32_t)a + ((d >> 8) & 0xFFu) * ia) + 127u) / 255u;
+    const uint32_t b = (((fg & 0xFFu) * (uint32_t)a + (d & 0xFFu) * ia) + 127u) / 255u;
+    *p = 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+/* 标题文字：内核 31 号给覆盖率，这里只混颜色。返回实际画的宽度（<0 = 内核没给，调用方回落字模） */
+static int wm_title_text(const struct WmSlot* s, int x, int y, int max_x) {
+    const int rc = wl_surface_title_alpha((int)s->info.id, g_title_bmp, (unsigned)sizeof(g_title_bmp));
+    g_title_bmp_calls++;
+    if (rc < 0) { g_title_bmp_ok = 0; return rc; }
+    const int w = (rc >> 16) & 0xFFFF;
+    const int h = rc & 0xFFFF;
+    if (w <= 0 || h <= 0) { g_title_bmp_ok = 1; return 0; }
+    g_title_bmp_ok = 1;
+    wm_title_log64(s, w, h);                    /* 打点：前 6 条（含 icon kind，取证用） */
+    int cw = w;
+    if (max_x > x && cw > max_x - x) cw = max_x - x;
+    for (int yy = 0; yy < h; yy++) {
+        const unsigned char* row = g_title_bmp + yy * WM_TITLE_BMP_W;
+        for (int xx = 0; xx < cw; xx++) {
+            const int a = row[xx];
+            if (a) wm_blend8(x + xx, y + yy, WM_C_GLYPH, a);
+        }
+    }
+    return cw;
+}
+/* 应用图标：内核 33 号给 16x16 RGBA（品牌色 + alpha）。返回 kind（<0 = 没有图标） */
+static int wm_title_icon(const struct WmSlot* s, int x, int y) {
+    const int kind = wl_surface_app_icon((int)s->info.id, g_icon_rgba, (unsigned)sizeof(g_icon_rgba));
+    g_title_icon_kind = kind;
+    if (kind >= 0) wm_title_log64(s, 0, WM_ICON_PX);
+    if (kind < 0) return kind;
+    for (int j = 0; j < WM_ICON_PX; j++) {
+        for (int i = 0; i < WM_ICON_PX; i++) {
+            const unsigned char* p = g_icon_rgba + ((j * WM_ICON_PX) + i) * 4;
+            const int a = (int)p[3];
+            if (!a) continue;
+            const uint32_t fg = 0xFF000000u | ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
+            wm_blend8(x + i, y + j, fg, a);
+        }
+    }
+    return kind;
+}
+
 /* \u88c5\u9970\u6846\uff1a\u6b63\u5e38 = surface \u77e9\u5f62\uff1b\u6298\u53e0 = \u53ea\u7559 25px\uff1b\u6700\u5927\u5316 = \u6574\u5c4f\uff08\u4e0e\u5185\u6838 wl64_frame64 \u540c\u4e00\u628a\u5c3a\u5b50\uff09 */
 static void wm_frame(const struct WmSlot* s, int* fx, int* fy, int* fw, int* fh) {
     if (s->info.flags & V64_WM_MINIMIZED) {         /* ★ v0.11.3：Dock 收容 = 整窗摘掉（高 0） */
@@ -390,9 +470,19 @@ static void wm_deco_frame(const struct WmSlot* s) {
     wm_frame(s, &fx, &fy, &fw, &fh);
     if (fw <= 0 || fh <= 0) return;
     wm_fill(fx, fy, fw, WM_DECO_HDR, WM_C_TITLE);
-    /* ★ v0.11.3：标题走 TTF 字模；y = fy+6 与内核 gui64_deco_frame64 的
-     *   `ty = y + BORDER + (TITLE_H-14)/2`（= +6）同一把尺子，字高 16px（em）。 */
-    if (s->title[0]) wm_text_ttf(fx + 8, fy + 6, s->title, WM_C_GLYPH, fx + fw - 100);
+    /* ★ v0.11.4：标题栏左侧先画**应用图标**（内核 33 号给 16x16 RGBA），再画标题文字。
+     *   几何与内核 gui64_deco_frame64 **逐像素同一把尺子**：
+     *     图标 16x16 @ (fx+6, fy+5)（= 内核的 x+6 / y+BORDER+4）；有图标 -> 文字左移到 fx+26。
+     *   标题字形走内核 31 号（覆盖率位图）——**中文标题终于画得出来**；
+     *   内核 31 号不可用时才回落 v0.11.3 的 ASCII 字模（wm_ttf.h），如实保留降级路径。 */
+    int tx = fx + 8;
+    if (s->info.flags & V64_WM_DECOR) {
+        if (wm_title_icon(s, fx + 6, fy + 5) >= 0) tx = fx + 26;
+    }
+    if (s->title[0]) {
+        if (wm_title_text(s, tx, fy + 6, fx + fw - 100) < 0)
+            wm_text_ttf(tx, fy + 6, s->title, WM_C_GLYPH, fx + fw - 100);
+    }
     const int bx = fx + fw - 1 - WM_BTN_SLOT * 3;
     const int by = fy + (WM_DECO_HDR - WM_BTN_H) / 2;
     for (int b = 0; b < 3; b++) {

@@ -85,7 +85,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.11.3"   # ★ v0.11.3：图片查看器三毒瘤（滚轮缩放 / 合成器标题栏三按钮 / 指针唯一写者）+ 最大化内容按比例缩放 + Dock × 窗口生命周期（30 号 ctl 4=minimize_to_dock、5=restore；Dock 外部窗口运行项 + 活动胶囊高亮）
+VIMTUOS_VERSION="0.11.4"   # ★ v0.11.4：中文标题（31 号内核光栅化覆盖率位图给 Ring 3 合成器）+ 窗口/任务栏真图标（32 号应用身份、33 号图标 RGBA）+ 资源管理器地址栏三个 chevron 真图标（图标包新增 kind 21/74）
 #   沿用自 v0.10.2 的启动加固（仅作说明）：真机加固（UEFI 载荷按真实大小读 + 屏幕报错 + MMIO BAR>=4GiB 闸门） + 桌面帧预算（热路径打点预算 + 2 MiB 大页映射 / shm 与帧缓冲 + 60 Hz 帧节拍）
 #   根因：同一块盘上的两条命令会重叠（命令列表 slot0 / 命令表 / DMA 暂存页池 g_dma[16] 全驱动共享），
 #   后果是**静默坏读**（ELF 魔数坏读、VFS BAD block、/etc/r3drv.conf 读错）与端口互相重启，

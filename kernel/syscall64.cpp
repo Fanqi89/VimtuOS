@@ -213,6 +213,11 @@ int64_t wl64_surface_move64(uint64_t, uint64_t)                   __attribute__(
 int64_t wl64_surface_set_decor64(uint64_t, uint64_t, uint64_t)     __attribute__((weak));   // ★ v0.11.1：28
 int64_t wl64_surface_ctl64(uint64_t, uint64_t)                     __attribute__((weak));   // ★ v0.11.2：30
 int64_t wl64_surface_title64(uint64_t, uint64_t, uint64_t)         __attribute__((weak));   // ★ v0.11.2：29
+// ★ v0.11.4：31/32/33（中文标题位图 / 应用身份 / 应用图标）。同一条纪律：weak + 判空 ——
+//   安装介质内核不链 wl64.cpp，这三个号那时返回 -1 并打 [SYSCALL] deny（不假装成功）。
+int64_t wl64_surface_title_alpha64(uint64_t, uint64_t, uint64_t)       __attribute__((weak));
+int64_t wl64_surface_set_app64(uint64_t, uint64_t)                     __attribute__((weak));
+int64_t wl64_surface_app_icon64(uint64_t, uint64_t, uint64_t)          __attribute__((weak));
 // ★ A4-5：信号投递（kernel/sig64.cpp）**两份内核都链**它，所以这里是强引用（不是弱引用）；
 //   它内部对 proc64 的访问才是弱引用（安装内核没有进程表 -> 只做参数校验，如实不投递）。
 static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
@@ -3860,6 +3865,23 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
     case 30:                                                    // wl_surface_ctl(surf, action)
         ret = wl64_surface_ctl64 ? wl64_surface_ctl64(a1, a2) : -1;
         if (!wl64_surface_ctl64) syscall64_deny64(nr, a1);
+        break;
+    // ★ v0.11.4：31/32/33 —— 中文标题位图 / 应用身份 / 应用图标（合成器不再自己光栅化、自己认图标）。
+    //   语义/权限/错误码：kernel/wl64.h 的 WL64_ABI_SURFACE_TITLEALPHA64/SETAPP64/APPICON64 段。
+    //   31 返回 (宽<<16)|高；32/33 返回 0/kind。安装介质内核不链 wl64.cpp -> weak 为 0 -> deny。
+    case 31:                                                    // wl_surface_title_alpha(surf, out, cap)
+        ret = wl64_surface_title_alpha64 ? wl64_surface_title_alpha64(a1, a2, a3) : -1;
+        if (!wl64_surface_title_alpha64) syscall64_deny64(nr, a1);
+        break;
+
+    case 32:                                                    // wl_surface_set_app(surf, name)
+        ret = wl64_surface_set_app64 ? wl64_surface_set_app64(a1, a2) : -1;
+        if (!wl64_surface_set_app64) syscall64_deny64(nr, a1);
+        break;
+
+    case 33:                                                    // wl_surface_app_icon(surf, out, cap)
+        ret = wl64_surface_app_icon64 ? wl64_surface_app_icon64(a1, a2, a3) : -1;
+        if (!wl64_surface_app_icon64) syscall64_deny64(nr, a1);
         break;
     // ★ 本批：用户态设备映射（48 pci_map_bar）。语义/权限/错误码：kernel/syscall64.h 的那一段。
     //   第 4 个参数（out_len）在 r10 —— 与 fb_flip(10) 同款（自有 ABI 只有 rdi/rsi/rdx + r10）。

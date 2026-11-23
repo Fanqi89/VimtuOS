@@ -713,6 +713,13 @@ def main():
         items_root = int(mn[-1]) if mn else -1
         check("状态栏 N 个项目 = 终端 ls 的条目数（%d）" % ls_entries, items_root == ls_entries,
               "explorer items=%d ls=%d" % (items_root, ls_entries))
+        # ★ v0.11.4：地址栏三个按钮（后退/前进/上一级）从"纯像素三角"换成**图标包里的 chevron 真图标**。
+        #   判据 = 外壳自己那一行：pack=3 / fallback=0（3 个全从图标包画出来，没有一个回落三角）。
+        mnav = re.search(r"\[EXP\] nav icons pack=(\d+) fallback=(\d+) kinds=(\d+),(\d+),(\d+)", nlog)
+        check("地址栏三个导航按钮用图标包真图标（pack=3 fallback=0 kinds=13,14,21）",
+              mnav is not None and mnav.group(1) == "3" and mnav.group(2) == "0" and
+              (mnav.group(3), mnav.group(4), mnav.group(5)) == ("13", "14", "21"),
+              mnav.group(0) if mnav else "（缺 [EXP] nav icons 行）")
         mdir = re.search(r"\[UI\] explorer item idx=(\d+) name=apps type=dir size=0 mtime=\d{4}-\d{2}-\d{2} \d{2}:\d{2} kind=dir", nlog)
         check("根目录条目表里有目录 apps（type=dir）", mdir is not None, mdir.group(0) if mdir else "（缺行）")
         mel = re.search(r"\[UI\] explorer item idx=(\d+) name=hello\.elf type=file size=\d+ mtime=\d{4}-\d{2}-\d{2} \d{2}:\d{2} kind=elf", nlog)

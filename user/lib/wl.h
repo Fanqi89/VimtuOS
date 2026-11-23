@@ -52,6 +52,21 @@
 #define V64_WL_CTL_MIN2DOCK       4   /* ★ v0.11.3：最小化收容到 Dock（整窗从屏幕摘掉） */
 #define V64_WL_CTL_RESTORE        5   /* ★ v0.11.3：从 Dock 恢复（几何逐像素还原） */
 #define V64_WL_EV_CLOSE           7u
+/* ★ v0.11.4：31/32/33 —— 让"中文标题"和"应用图标"成为内核能力，而不是合成器自己的能力。
+ *   为什么：/lib/wm.elf 的 ELF64 装载窗口只有 64 KiB（装不下 stb_truetype），v0.11.3 只能内置
+ *   一张构建期预光栅化的 ASCII 字模 -> 中文标题在 wm 路下画不出来。这里改成向内核要字形/图标：
+ *     31 wl_surface_title_alpha(surf, out, cap)  -> (宽<<16)|高
+ *        把标题文字用**内核自己的字形缓存**光栅化成 8-bit 覆盖率（stride = 宽，左上角 = em 框顶）。
+ *        cap 必须 >= 320*24 = 7680 B。中文/标点只要字体面里有就画得出。
+ *     32 wl_surface_set_app(surf, name)          -> 0
+ *        声明应用身份（UTF-8 名字，如 "image-viewer"），内核换成图标包 kind：标题栏图标 +
+ *        Dock 运行项图标 + 33 号导出的 RGBA 都用它。名字 0 = 清掉。 */
+#define V64_NR_WL_SURFACE_TITLE_ALPHA 31
+#define V64_NR_WL_SURFACE_SET_APP     32
+#define V64_NR_WL_SURFACE_APP_ICON    33
+#define V64_WL_TITLE_BMP_W   320      /* 标题覆盖率位图上限宽（px） */
+#define V64_WL_TITLE_BMP_H   24       /* 标题覆盖率位图高（px） */
+#define V64_WL_APP_ICON_PX   16       /* 标题栏/Dock 图标边长（px） */
 
 /* 错误码（与 kernel/wl64.h 的 WL64_* 逐值一致） */
 #define V64_WL_EPERM    (-1)   /* 没有进程上下文 / surface 不属于本进程 */
@@ -91,5 +106,10 @@ int wl_display_dispatch(unsigned timeout_ms, struct Wl64SeatEvent* out, unsigned
 int wl_surface_set_decor(int surf, unsigned flags, const char* title);   /* ★ v0.11.1：28 */
 int wl_surface_ctl(int surf, int action);                                /* ★ v0.11.2：30 */
 int wl_surface_title(int surf, char* out, unsigned cap);                 /* ★ v0.11.2：29 */
+
+/* ★ v0.11.4：标题覆盖率位图 / 应用身份 / 应用图标（语义见上面 V64_NR_WL_SURFACE_TITLE_ALPHA 段） */
+int wl_surface_title_alpha(int surf, unsigned char* out, unsigned cap);   /* 31；返回 (w<<16)|h */
+int wl_surface_set_app(int surf, const char* name);                       /* 32；0 = 成功 */
+int wl_surface_app_icon(int surf, unsigned char* out, unsigned cap);      /* 33；返回 kind 或 -1 */
 
 #endif /* VIMTU64_WL_H */

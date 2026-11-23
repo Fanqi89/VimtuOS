@@ -319,15 +319,19 @@ int main(int argc, char** argv) {
     }
     g_px = (uint32_t*)va;
 
-    /* ★ v0.11.3：装饰 = 合成器画（25px 标题带 + 三按钮）。标题 = 文件名 + 尺寸 + 格式，
-     *   与上一版自绘标题栏同口径（用户看到的信息不变），只是**画家换了**：
-     *   /lib/wm.elf 在跑就它画（按钮可点、真实语义走 30 号），没有合成器就内核路画。 */
+    /* ★ v0.11.3：装饰 = 合成器画（25px 标题带 + 三按钮）。标题 = "应用名 文件名 尺寸"，
+     *   **画家换了**：/lib/wm.elf 在跑就它画（按钮可点、真实语义走 30 号），没有合成器就内核路画。
+     * ★ v0.11.4：标题带**中文**（"图片查看器 …"）。以前不敢写中文：Ring 3 合成器的标题只有
+     *   构建期预光栅化的 ASCII 字模，中文会整段消失。现在字形由内核 31 号光栅化（覆盖率位图）
+     *   给合成器，中文标题在两条合成路（内核窗口 / wm）下都能画出来。 */
     {
         char tt[64];
         int k = 0;
+        static const char kAppName[] = "图片查看器 ";     /* UTF-8：5 个汉字 + 空格 = 16 B */
+        for (int i = 0; kAppName[i] && k < (int)sizeof(tt) - 30; i++) tt[k++] = kAppName[i];
         const char* base = path;
         for (int i = 0; path[i]; i++) if (path[i] == '/' || path[i] == '\\') base = path + i + 1;
-        for (int i = 0; base[i] && k < (int)sizeof(tt) - 24; i++) tt[k++] = base[i];
+        for (int i = 0; base[i] && k < (int)sizeof(tt) - 14; i++) tt[k++] = base[i];
         tt[k++] = ' ';
         {
             char num[16];
@@ -348,6 +352,13 @@ int main(int argc, char** argv) {
         tt[k] = 0;
         const int drc = wl_surface_set_decor(g_surf, V64_WL_DECOR_WINDOW, tt);
         printf("[VIEWER] decor rc=%d title=%s\n", drc, tt);
+    }
+    /* ★ v0.11.4：声明**应用身份**（32 号）—— 内核据此给标题栏图标 + Dock 运行项图标。
+     *   名字 "image-viewer" 对应图标包里的 apps/image-viewer.svg（kind 74）；
+     *   不认识的图标名不会报错，只是没有图标（身份是可选装饰，不是窗口功能）。 */
+    {
+        const int arc = wl_surface_set_app(g_surf, "image-viewer");
+        printf("[VIEWER] app rc=%d name=image-viewer\n", arc);
     }
 
     /* ---- ⑤.5 绑定 seat：**不做这一步就一条事件也收不到** ----

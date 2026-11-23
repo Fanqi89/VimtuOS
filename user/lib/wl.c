@@ -51,3 +51,19 @@ int wl_surface_ctl(int surf, int action) {
 int wl_surface_title(int surf, char* out, unsigned cap) {
     return (int)__v64_int80(V64_NR_WL_SURFACE_TITLE, (long)surf, (long)(unsigned long)out, (long)cap, 0);
 }
+
+/* ★ v0.11.4：标题覆盖率位图（内核光栅化，中文靠它）/ 应用身份 / 应用图标。
+ *   为什么要走内核：/lib/wm.elf 的装载窗口只有 64 KiB，装不下 stb_truetype ——
+ *   客户端与合成器都不该自己带字体/图标解码器，内核是唯一来源（与装饰单一真源同一思路）。 */
+int wl_surface_title_alpha(int surf, unsigned char* out, unsigned cap) {
+    return (int)__v64_int80(V64_NR_WL_SURFACE_TITLE_ALPHA, (long)surf,
+                            (long)(unsigned long)out, (long)cap, 0);
+}
+int wl_surface_set_app(int surf, const char* name) {
+    return (int)__v64_int80(V64_NR_WL_SURFACE_SET_APP, (long)surf,
+                            (long)(unsigned long)name, 0, 0);
+}
+int wl_surface_app_icon(int surf, unsigned char* out, unsigned cap) {
+    return (int)__v64_int80(V64_NR_WL_SURFACE_APP_ICON, (long)surf,
+                            (long)(unsigned long)out, (long)cap, 0);
+}

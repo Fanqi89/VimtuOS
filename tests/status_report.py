@@ -1907,18 +1907,24 @@ def cap_iconpack64():
         "卷 + 同一份字节作原始区 blob 兜底；读回打点 src=vfs path=/etc/iconpack.bin）；老常量 "
         "ICON64_PACK_LBA = %s（末位兜底，构建脚本不再写入）；build/iconpack.bin = %d B；清单 entries=%d kind=%d"
         % (lba_v if lba_v else "?", size, entries, kinds),
-        "实测串口（开机首帧）：\"[ICON64] init pack lba=0 drive=-1 bytes=49192 entries=110 icons=30 "
-        "bad=0 ok=1 fnv=… vfs_icons=0 src=vfs path=/etc/iconpack.bin\"",
+        # ★ v0.11.4：串口原文里的字节数/条目数/kind 数改成**从清单实算**（原来写死 49192/110/30，
+        #   本版按原始区预算砍掉了没人画的系统图标 48px 档 = 条目数变少、kind 数变多，
+        #   写死的数字就成了假证据）。
+        "实测串口（开机首帧）：\"[ICON64] init pack lba=0 drive=-1 bytes=" + str(size) +
+        " entries=" + str(entries) + " icons=" + str(kinds) +
+        " bad=0 ok=1 fnv=… vfs_icons=0 src=vfs path=/etc/iconpack.bin\"",
         "实测串口（逐 kind 加载，全部 src=vfs）：\"[ICON64] load kind=calc path=pack:apps/calc@48.png "
-        "size=48 src=vfs ok=1\"（30 个 kind 各一条；只缩小到\"不小于请求的最小档\"）",
-        "实测串口（自检/回落）：\"[ICON64] selftest PASS mask=0 pack=1 kinds=30 loaded=30 fallback=0\"；"
-        "坏档回落 \"[ICON64] fallback kind=terminal reason=no-entry (programmatic draw kept)\"、"
-        "卷里的包 magic 清零 -> \"[ICON64] init pack absent reason=no-magic-or-read lba=7497 …\" + "
-        "\"[ICON64] fallback kind=… reason=no-pack\"（界面不空：Dock/状态区仍有墨迹）",
+        "size=48 src=vfs ok=1\"（" + str(kinds) + " 个 kind 各一条；只缩小到\"不小于请求的最小档\"）",
+        "实测串口（自检/回落）：\"[ICON64] selftest PASS mask=0 pack=1 kinds=" + str(kinds) +
+        " loaded=" + str(kinds) + " fallback=0\"；坏档回落 \"[ICON64] fallback kind=terminal "
+        "reason=no-entry (programmatic draw kept)\"、卷里的包 magic 清零 -> \"[ICON64] init pack absent "
+        "reason=no-magic-or-read lba=7497 …\" + \"[ICON64] fallback kind=… reason=no-pack\""
+        "（界面不空：Dock/状态区仍有墨迹）",
         "Dock 开始按钮仍是盘上真图：\"[DOCK64] start icon src=vfs:/logo/kaisi.png size=46 ok=1\""
         "（缺卷/缺文件时回落内核内嵌 RGBA，实测夹具盘两处 kaisi.png 逐字节相同）",
-        "验收脚本 tests/icons64_test.py：%s（50 条断言：包加载/逐 kind 清单逐一核对/状态区 3 图标 IoU>=0.55/"
-        "主题跟随亮度差 >=60/两种坏法回落/开始按钮 IoU + VimtuFS2 真文件；本轮复跑 50/50 PASS）"
+        "验收脚本 tests/icons64_test.py：%s（52 条断言：包加载/逐 kind 清单逐一核对/状态区 3 图标 IoU>=0.55/"
+        "主题跟随亮度差 >=60/两种坏法回落/开始按钮 IoU + VimtuFS2 真文件；★ v0.11.4 复跑 52/52 PASS，"
+        "新增 kind 21 chevron-up / 74 image-viewer 逐条核对）"
         % ("有" if tst else "★ 缺"),
         "边界（如实）：图标字体（icon font）未用上；电池图标在清单里但**无真实来源/不参与渲染**；"
         "files.svg 未上屏（只有 @PNG 档进了包）；pack 现为系统卷里的文件 /etc/iconpack.bin"
@@ -1926,7 +1932,10 @@ def cap_iconpack64():
         "仍有程序化绘制图标兜底（fallback 路径）",
     ]
     # 包大小/条目必须为非零（makepack 与 build64.sh 都按这个数写盘/断言）：
-    done = n > 0 and entries >= 100 and kinds >= 25 and size > 0 and bool(lba_v) and tst
+    # ★ v0.11.4：判据从"写死的 entries>=100"改成**按 kind 数推**：每个 kind 至少 3 档尺寸
+    #   （system 16/24/32、apps 24/32/48），并且 kind 数不得少于 32 —— 条目少了是因为
+    #   砍掉了没人画的系统 48px 档，**kind 覆盖反而变多了**（30 -> 32），强度不降。
+    done = (n > 0 and kinds >= 32 and entries >= kinds * 3 and size > 0 and bool(lba_v) and tst)
     return ("DONE" if done else "PARTIAL"), ev
 # ---------------------------------------------------------------- 批次 A1-A5（用户态化 + 声音 + IPC + 信号 + 编辑器）
 def cap_fbmap_p1():

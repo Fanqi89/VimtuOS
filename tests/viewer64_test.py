@@ -633,7 +633,11 @@ def main():
                 #   （强度不降：老判据是"窗口真上屏"，新判据同时钉住"画家换了、旧画家退场"）。
                 fr = count(px, ww, hh, (vx, vy, vx + vw, vy + 25),
                            lambda r, g, b: abs(r - 0xF2) <= 2 and abs(g - 0xF4) <= 2 and abs(b - 0xF8) <= 2)
-                oldfr = count(px, ww, hh, (vx, vy, vx + vw, vy + vh), is_frame)
+                # ★ v0.11.4 判据校准（不是放宽）：标题字形从"4-bit 字模 + 最近邻"换成**内核 8-bit
+                #   覆盖率位图**后，笔画边缘会出现 256 级之间的一档像素，其中极小一撮落在 is_frame
+                #   的 tol=10 邻域里（实测 big.png 6 px）。旧自绘标题栏是**整片实色填充** —— 它一旦
+                #   回来，tol=2 也会命中成百上千个像素。所以这里把这条判据收紧到 tol=2（强度不降）。 */
+                oldfr = count(px, ww, hh, (vx, vy, vx + vw, vy + vh), lambda r, g, b: is_frame(r, g, b, 2))
                 check("① %s：合成器标题带 #F2F4F8 在窗口顶部 25 行（>= 300 px）" % path, fr >= 300,
                       "band=%d" % fr)
                 check("① %s：旧自绘标题栏 0x3A4658 = 0 px（画家已换成合成器）" % path, oldfr == 0,
@@ -642,6 +646,31 @@ def main():
                              lambda r, g, b: r >= 200 and g <= 60 and b <= 60)
                 check("① %s：关闭按钮红底在标题带右侧（>= 200 px）" % path, cres >= 200,
                       "red=%d" % cres)
+                # ================= ★ v0.11.4：中文标题 + 标题栏真图标（三证）=================
+                # ① 内核 31 号：把 UTF-8 标题用**内核自己的字形缓存**光栅化成覆盖率位图，
+                #    打点带 utf8=1 与 ink（真落了墨的像素数）—— ink>0 才说明汉字不是空白。
+                mtb = vm.wait_re(r'\[WL64\] title bmp surf=\d+ pid=\d+ w=(\d+) h=24 bytes=7680 '
+                                 r'utf8=1 ink=(\d+) title="([^"]*)"', 20, since=n0)
+                check("① %s：内核把标题光栅化成覆盖率位图（utf8=1 + ink>0）" % path,
+                      mtb is not None and int(mtb.group(2)) > 0,
+                      "（无 [WL64] title bmp 行）" if mtb is None else
+                      "w=%s ink=%s title=%r" % (mtb.group(1), mtb.group(2), mtb.group(3)))
+                if mtb:
+                    check("① %s：标题是中文（以「图片查看器」开头）" % path,
+                          mtb.group(3).startswith("图片查看器"), repr(mtb.group(3)))
+                # ② Ring 3 合成器（/lib/wm.elf）：用的是**内核给的那份位图**（ok=1）并且拿到了
+                #    应用图标 kind=74（图片查看器）。这正是 v0.11.3 做不到的那一半。
+                mtw = vm.wait_re(r'\[WM\] title bmp surf=\d+ w=\d+ h=24 calls=\d+ ok=1 icon=(\d+)',
+                                 20, since=n0)
+                check("① %s：wm 用内核位图画中文标题，且图标 kind=74" % path,
+                      mtw is not None and int(mtw.group(1)) == 74,
+                      "（无 [WM] title bmp 行）" if mtw is None else "icon=%s" % mtw.group(1))
+                # ③ 像素：标题栏左侧图标槽（fx+6..fx+22, fy+5..fy+21）里应该有**品牌蓝**
+                #    （#8FD6FF：b-r = 0x70；标题带 #F2F4F8 的 b-r 只有 6，字色 #3A4048 是 0x0E）
+                icon_px = count(px, ww, hh, (vx + 6, vy + 5, vx + 22, vy + 21),
+                                lambda r, g, b: (b - r) >= 40 and b >= 0xE0)
+                check("① %s：标题栏左侧真图标（品牌蓝像素 >= 20）" % path, icon_px >= 20,
+                      "icon=%d" % icon_px)
                 red = count(px, ww, hh, (vx + 1, vy + 26, vx + vw - 1, vy + vh - 1), is_red)
                 blue = count(px, ww, hh, (vx + 1, vy + 26, vx + vw - 1, vy + vh - 1), is_blue)
                 # 128x96 图半幅 = 64*96 = 6144 px；big.png 缩放后 760x520 半幅更大。
