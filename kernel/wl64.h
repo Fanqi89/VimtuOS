@@ -226,6 +226,28 @@ static const uint32_t WL64_ABI_SURFACE_MOVE64   = 27;   // ★ W3 第二批：�
 static const uint32_t WL64_ABI_SURFACE_DECOR64  = 28;
 static const uint32_t WL64_DECOR_F_WINDOW64     = 0x1u;   // 有装饰（合成器画标题栏/圆角/三按钮）
 static const uint32_t WL64_DECOR_H64            = 25;     // 装饰占掉的高度（标题栏 24 + 上边框 1）
+// ★ v0.11.2：30 = wl_surface_ctl(surf, action) —— 三个标题栏按钮的**真实语义**。
+//   为什么把它放进内核而不是各合成器自己记：同一个窗口会被两条合成路画（内核路 = 常态桌面、
+//   Ring 3 的 /bin/wm 路 = 演示/验收），**状态只能有一份**，否则"我在 wm 里点了关闭、回到内核
+//   合成它又回来了"。所以窗口状态（折叠/最大化）由内核的 surface 表持有，两条路都从 23 号导出里读。
+//   action：1 = close（销毁 surface + 给拥有者投一条 type=7 的 CLOSE 事件）
+//           2 = collapse 开关（折叠成只留 25px 标题带；再点一次展开）
+//           3 = maximize 开关（工作区占满：装饰框铺满整屏，客户区内容按原尺寸贴左上；尺寸不缩放，
+//               因为 surface 尺寸是客户端定的 —— 这条限制如实写在这里，不假装能拉伸内容）
+//   权限：拥有者进程 或 注册合成器（与 27/28 号同一条）。
+static const uint32_t WL64_ABI_SURFACE_CTL64    = 30;
+static const uint32_t WL64_CTL_CLOSE64          = 1;
+static const uint32_t WL64_CTL_COLLAPSE64       = 2;
+static const uint32_t WL64_CTL_MAX64            = 3;
+// 23 号导出的 flags 增补（v0.11.2）
+static const uint32_t WL64_SURFINFO_DECOR64     = 0x8u;   // 该 surface 要画窗口装饰（28 号设的）
+static const uint32_t WL64_SURFINFO_COLLAPSED64 = 0x10u;  // 已折叠（只画 25px 标题带）
+static const uint32_t WL64_SURFINFO_MAXED64     = 0x20u;  // 已最大化（装饰框 = 整屏工作区）
+// 合成器/内核通知客户端"窗口被关掉了"的事件类型（Ev64Event.type；与 input64.h 的 1..6 不冲突）
+static const uint32_t WL64_EV_CLOSE64           = 7u;
+// ★ v0.11.2：29 = wl_surface_title(surf, out, cap) —— 合成器要画标题栏文字，得先能读到标题。
+//   out = 用户缓冲（cap 字节，含结尾 0），最多 31 B 有效内容；权限同 23 号（注册合成器 / 拥有者）。
+static const uint32_t WL64_ABI_SURFACE_TITLE64  = 29;
 
 // 合成器的缓冲映射窗：FB 映射区（5GiB..+40MiB）的**顶部 512 KiB** = 8 个 surface 槽 × 64 KiB
 // （= 单 shm 对象上限）。为什么放这里而不是新开一段 VA：① 5GiB 起那一段已经在
@@ -285,6 +307,13 @@ int64_t wl64_seat_post64(uint64_t out_ev_uptr);                  // 26
 int64_t wl64_surface_move64(uint64_t surf, uint64_t xy);          // 27（★ W3 第二批）
 // 28（★ v0.11.1）：把 surface 声明成窗口 —— 装饰由合成器画（语义见上面 WL64_ABI_SURFACE_DECOR64）
 int64_t wl64_surface_set_decor64(uint64_t surf, uint64_t flags, uint64_t title_uptr);
+// 30（★ v0.11.2）：标题栏三按钮的真实语义（close / collapse 开关 / maximize 开关）。见上面常量段。
+int64_t wl64_surface_ctl64(uint64_t surf, uint64_t action);
+// 29（★ v0.11.2）：读标题栏文字（合成器画标题用）。返回写入的字节数（含结尾 0），负 = 错误。
+int64_t wl64_surface_title64(uint64_t surf, uint64_t out_uptr, uint64_t cap);
+// 装饰框矩形（折叠/最大化会改变它；导出给合成器时也是这一把尺子）：
+//   正常 = (x,y,w,h)；折叠 = (x,y,w,25)；最大化 = (0,0,fb_w,fb_h)
+void wl64_frame_of64(uint32_t surf, int32_t* out_xywh);
 int     wl64_composer_pid64();                                   // 当前注册的合成器（0 = 没有）
 
 // ==================== ★ B-wm：启动期驱动（/bin/wm + 两个客户端：卷交付）====================

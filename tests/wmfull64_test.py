@@ -88,7 +88,8 @@ PERF_CUR_RE = r"\[UI\] perf[^\n]*cur=(\d+),(\d+)"
 
 # MessageBoxA 自绘的配色（与 user/win/peload_crt.c 一一对应；改那边要同步改这里）
 C_FRAME = (0x20, 0x20, 0x20)
-C_TITLE = (0x34, 0x65, 0xA4)
+C_TITLE = (0x34, 0x65, 0xA4)      # \u65e7\uff08\u2264v0.11.1\uff09\u5ba2\u6237\u7aef\u81ea\u7ed8\u7684\u84dd\u6761 \u2014\u2014 \u73b0\u5728\u5e94\u8be5 0 \u50cf\u7d20
+C_DECO_TITLE = (0xF2, 0xF4, 0xF8) # \u2605 v0.11.2\uff1a\u5408\u6210\u5668\uff08\u5185\u6838\u8def\u4e0e /bin/wm\uff09\u753b\u7684\u6807\u9898\u5e26\u5e95\u8272
 C_BODY = (0xF2, 0xF2, 0xF2)
 C_TEXT = (0x10, 0x10, 0x10)
 PIX_TOL = 6
@@ -654,9 +655,11 @@ def main():
         #   做法：每次重截前等一条**新的** `[WM] frame`，最多 3 次；判据不变（旧位置 == 0）。
         shots["s2"] = os.path.join(work, "s2.ppm")
         got_s2 = shot_settled(mon, shots["s2"],
+                              # tol=2：标题带 0xF2F4F8 与客户区面 0xF2F2F2 在 tol=6 下会串色
+                              # （窗口拖到旧位置上时正文底会被算成"标题色"），这里收紧到 2。
                               lambda S: (rect is None) or S.count_near(
-                                  C_TITLE, rect[0] + 4, rect[1] + 4,
-                                  rect[0] + w - 4, rect[1] + 20) == 0,
+                                  C_DECO_TITLE, rect[0] + 4, rect[1] + 4,
+                                  rect[0] + w - 4, rect[1] + 20, tol=2) == 0,
                               log_fn, proc, label="s2")
         check("E. screendump #2 取到了", got_s2, "")
 
@@ -736,9 +739,13 @@ def main():
     if os.path.exists(shots.get("s1", "")) and rect:
         S1 = Shot(shots["s1"])
         x0, y0 = rect[0], rect[1]
-        n_title = S1.count_near(C_TITLE, x0 + 4, y0 + 4, x0 + w - 4, y0 + 20)
-        check("H. ① 对话框在屏幕正中：标题栏 #3465A4 实心长条（>=2000 px）", n_title >= 2000,
-              "n=%d rect=%s" % (n_title, rect))
+        # ★ v0.11.2：标题带改由**合成器**画（24px 玻璃带，底色 0xF2F4F8），客户端不再自绘 0x3465A4。
+        #   所以这条判据换色但**强度不降**：新色实心长条 >= 2000 px，且旧色必须 0 像素。
+        n_title = S1.count_near(C_DECO_TITLE, x0 + 4, y0 + 4, x0 + w - 4, y0 + 20)
+        n_old = S1.count_near(C_TITLE, x0 + 4, y0 + 4, x0 + w - 4, y0 + 20)
+        check("H. ① 对话框标题带是合成器画的实心带（#F2F4F8 >= 2000 px，旧自绘色 0 px）",
+              n_title >= 2000 and n_old == 0,
+              "n=%d old=%d rect=%s" % (n_title, n_old, rect))
         n_body = S1.count_near(C_BODY, x0 + 8, y0 + 34, x0 + w - 8, y0 + h - 8)
         check("H. ① 正文底 #F2F2F2（>=15000 px）", n_body >= 15000, "n=%d" % n_body)
         n_text = S1.count_near(C_TEXT, x0 + 10, y0 + 28, x0 + w - 10, y0 + h - 34)
@@ -755,10 +762,12 @@ def main():
     if os.path.exists(shots.get("s2", "")) and rect2 and rect:
         S2 = Shot(shots["s2"])
         x2, y2 = rect2[0], rect2[1]
-        n_new = S2.count_near(C_TITLE, x2 + 4, y2 + 4, x2 + w - 4, y2 + 20)
-        check("H. ② 拖动后：新位置的标题栏是 #3465A4（>=2000 px）", n_new >= 2000,
-              "n=%d rect2=%s" % (n_new, rect2))
-        n_old = S2.count_near(C_TITLE, rect[0] + 4, rect[1] + 4, rect[0] + w - 4, rect[1] + 20)
+        n_new = S2.count_near(C_DECO_TITLE, x2 + 4, y2 + 4, x2 + w - 4, y2 + 20)
+        n_new_old = S2.count_near(C_TITLE, x2 + 4, y2 + 4, x2 + w - 4, y2 + 20)
+        check("H. ② 拖动后：新位置的标题带是合成器画的（#F2F4F8 >= 2000 px，旧自绘色 0 px）",
+              n_new >= 2000 and n_new_old == 0,
+              "n=%d old=%d rect2=%s" % (n_new, n_new_old, rect2))
+        n_old = S2.count_near(C_DECO_TITLE, rect[0] + 4, rect[1] + 4, rect[0] + w - 4, rect[1] + 20, tol=2)
         check("H. ② 旧位置已被背景快照还原（不留拖影：旧标题栏色 = 0）", n_old == 0,
               "n=%d（>0 = 拖影）" % n_old)
         n_body2 = S2.count_near(C_BODY, x2 + 8, y2 + 34, x2 + w - 8, y2 + h - 8)

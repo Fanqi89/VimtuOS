@@ -681,6 +681,14 @@ static int mb_pump(int bx, int by, int bw, int bh, u32 timeout_ms) {
                 pl_out(1, "\n", 1);
                 return 1;
             }
+            /* ★ v0.11.2：合成器/内核把窗口关掉了（30 号 ctl close 会投 type=7 的 CLOSE 事件）：
+             *   与点 OK 同一个退出路径，但要如实打不同的 reason，方便验收区分"谁关的"。 */
+            if (type == 7u) {
+                const u32 evsurf = *(const u32 *)(e + 44);      /* Wl64SeatEvent.surf（+44） */
+                pl_outs(1, "[PELOAD] msgboxA close by=composer surf="); pl_dec(1, (u64)evsurf);
+                pl_out(1, "\n", 1);
+                return 1;
+            }
             /* 键盘兜底：Enter(28) / Esc(1) / 空格(57) 当 OK */
             /* EV64_TYPE_KEY_DOWN == 1（见 kernel/input64.h）；code 是 PS/2 扫描码：28=Enter 1=Esc 57=空格 */
             if (type == 1u && inside && (code == 28u || code == 1u || code == 57u)) {

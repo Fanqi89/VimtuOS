@@ -88,6 +88,9 @@ struct WmSlot {
     int                    placed;  /* 是否已经由 wm 摆过位置 */
     int                    prev_x, prev_y;   /* 上一帧的屏幕位置（算 dirty 用） */
     int                    prev_w, prev_h;
+    /* ★ v0.11.2：装饰用的标题缓存（通过 29 号从内核读回，每个 surface 只读一次） */
+    char                   title[32];
+    int                    title_got;
 };
 
 static struct Fb64Info  g_fb;
@@ -253,14 +256,163 @@ static int wm_bg_restore(int x0, int y0, int x1, int y1) {
     return n;
 }
 
+
+/* ==================== \u2605 v0.11.2\uff1a\u7a97\u53e3\u88c5\u9970\uff08Ring 3 \u5408\u6210\u5668\u63a5\u7ba1\uff09 ====================
+ * \u5efa\u6a21\u53e3\u5f84\u4e0e\u5185\u6838\u8def**\u9010\u9879\u5bf9\u9f50**\uff08kernel/gui64.cpp \u7684 gui64_deco_frame64 / gui64_deco_edge64\uff09\uff1a
+ *   \u6807\u9898\u5e26 24 + \u4e0a\u8fb9\u6846 1 = 25 \u884c\u3001\u5706\u89d2\u534a\u5f84 14\u3001\u4e09\u6309\u94ae\u69fd 30px / \u5757 24x16\u30011px \u73bb\u7483\u8fb9\u6846\u3002
+ * \u548c\u5185\u6838\u8def\u4e0d\u540c\u7684\u4e24\u5904\uff08\u5982\u5b9e\u6807\u6ce8\uff09\uff1a
+ *   \u2460 \u5b57\u4f53\u7528 8x8 \u4f4d\u56fe\uff08wm_font8.h\uff09\uff0c\u5185\u6838\u7a97\u53e3\u7528 TTF \u2014\u2014 \u5b57\u5f62\u4e0d\u540c\uff0c\u5b57\u9ad8/\u4f4d\u7f6e\u4e00\u81f4\uff1b
+ *   \u2461 \u56db\u89d2\u5706\u89d2\u7528**wm \u81ea\u5df1\u7684\u6574\u5c4f\u80cc\u666f\u5feb\u7167**\u8865\u50cf\u7d20\uff08\u5185\u6838\u8def\u662f\u6a21\u7cca\u58c1\u7eb8\u91c7\u6837\uff09\uff0c
+ *      \u6240\u4ee5\u62d6\u52a8\u540e\u5706\u89d2\u91cc\u770b\u5230\u7684\u662f\u771f\u5f53\u65f6\u7684\u684c\u9762\u3002
+ * \u7a97\u53e3\u72b6\u6001\uff08\u6298\u53e0/\u6700\u5927\u5316\uff09\u4e0d\u5b58\u5728\u8fd9\u91cc\uff1a\u5b83\u5c5e\u4e8e\u5185\u6838\u7684 surface \u8868\uff0823 \u53f7\u5bfc\u51fa\u7684 flags\uff09\uff0c
+ * \u4e09\u6309\u94ae\u7684\u52a8\u4f5c\u8d70 30 \u53f7 wl_surface_ctl \u2014\u2014 \u8fd9\u6837\u4e24\u6761\u5408\u6210\u8def\u770b\u5230\u7684\u662f**\u540c\u4e00\u4efd\u72b6\u6001**\u3002 */
+#include "wm_font8.h"
+
+#define WM_DECO_R      14
+#define WM_DECO_HDR    25            /* \u6807\u9898\u680f 24 + \u4e0a\u8fb9\u6846 1\uff08= kernel \u7684 WL64_DECOR_H64\uff09 */
+#define WM_BTN_SLOT    30
+#define WM_BTN_W       24
+#define WM_BTN_H       16
+#define WM_C_TITLE     0xFFF2F4F8u   /* \u4e0e\u4e3b\u9898 light \u7684 title_bg \u540c\u503c\uff08\u5b9e\u6d4b\u5185\u6838\u8def\u50cf\u7d20 242,244,248\uff09 */
+#define WM_C_CLIENT    0xFFF2F2F2u   /* \u62ff\u4e0d\u5230 23 \u53f7 pad \u65f6\u7684\u515c\u5e95\u5ba2\u6237\u533a\u5e95\u8272 */
+#define WM_C_BORDER    0xFFBFC6D0u
+#define WM_C_BTN       0xFFE6E8ECu
+#define WM_C_CLOSE     0xFFE81123u
+#define WM_C_GLYPH     0xFF3A4048u
+
+static int g_clip_x0, g_clip_y0, g_clip_x1, g_clip_y1;
+
+static inline uint32_t* wm_rowpx(int y) {
+    return (uint32_t*)((unsigned char*)g_fbpx + (unsigned long)y * g_fb.pitch);
+}
+static void wm_put(int x, int y, uint32_t c) {
+    if (x < g_clip_x0 || x >= g_clip_x1 || y < g_clip_y0 || y >= g_clip_y1) return;
+    wm_rowpx(y)[x] = c;
+}
+static void wm_fill(int x, int y, int w, int h, uint32_t c) {
+    const int x0 = wm_max(x, g_clip_x0), x1 = wm_min(x + w, g_clip_x1);
+    const int y0 = wm_max(y, g_clip_y0), y1 = wm_min(y + h, g_clip_y1);
+    for (int j = y0; j < y1; j++) {
+        uint32_t* r = wm_rowpx(j);
+        for (int i = x0; i < x1; i++) r[i] = c;
+    }
+}
+/* \u56db\u89d2\u5706\u89d2\u88c1\u5207\uff1a\u628a\u5706\u89d2\u5916\u7684\u50cf\u7d20\u6362\u56de**\u80cc\u666f\u5feb\u7167**\u91cc\u7684\u771f\u50cf\u7d20 */
+static void wm_corner_cut(int x, int y, int w, int h, int r) {
+    if (r <= 0 || w <= 2 * r || h <= 2 * r) return;
+    const int r2 = r * r;
+    for (int k = 0; k < 4; k++) {
+        const int ox = (k & 1) ? (x + w - r) : x;
+        const int oy = (k & 2) ? (y + h - r) : y;
+        for (int j = 0; j < r; j++) {
+            for (int i = 0; i < r; i++) {
+                const int cx = (k & 1) ? (r - 1 - i) : i;
+                const int cy = (k & 2) ? (r - 1 - j) : j;
+                const int dx = r - 1 - cx, dy = r - 1 - cy;
+                if (dx * dx + dy * dy <= r2) continue;          /* \u5706\u5185\uff1a\u4fdd\u7559 */
+                const int px = ox + i, py = oy + j;
+                if (px < g_clip_x0 || px >= g_clip_x1 || py < g_clip_y0 || py >= g_clip_y1) continue;
+                const uint32_t* bp = wm_bg_at(px, py);
+                wm_rowpx(py)[px] = bp ? *bp : 0xFF202020u;
+            }
+        }
+    }
+}
+static void wm_text8(int x, int y, const char* s, uint32_t fg, int max_x) {
+    if (!s) return;
+    int cx = x;
+    for (unsigned i = 0; s[i]; i++) {
+        const unsigned char ch = (unsigned char)s[i];
+        if (ch < PL_FONT8_FIRST || ch > PL_FONT8_LAST) { cx += PL_FONT8_ADV; continue; }
+        if (cx + (int)PL_FONT8_W > max_x) return;
+        const unsigned char* g = g_pl_font8[ch - PL_FONT8_FIRST];
+        for (unsigned gy = 0; gy < PL_FONT8_H; gy++) {
+            const unsigned char bits = g[gy];
+            if (!bits) continue;
+            for (unsigned gx = 0; gx < PL_FONT8_W; gx++)
+                if (bits & (unsigned char)(0x80u >> gx)) wm_put(cx + (int)gx, y + (int)gy, fg);
+        }
+        cx += PL_FONT8_ADV;
+    }
+}
+
+/* \u88c5\u9970\u6846\uff1a\u6b63\u5e38 = surface \u77e9\u5f62\uff1b\u6298\u53e0 = \u53ea\u7559 25px\uff1b\u6700\u5927\u5316 = \u6574\u5c4f\uff08\u4e0e\u5185\u6838 wl64_frame64 \u540c\u4e00\u628a\u5c3a\u5b50\uff09 */
+static void wm_frame(const struct WmSlot* s, int* fx, int* fy, int* fw, int* fh) {
+    if (s->info.flags & V64_WM_COLLAPSED) {
+        *fx = (int)s->info.x; *fy = (int)s->info.y; *fw = (int)s->info.w; *fh = WM_DECO_HDR; return;
+    }
+    if (s->info.flags & V64_WM_MAXED) {
+        *fx = 0; *fy = 0; *fw = (int)g_fb.width; *fh = (int)g_fb.height; return;
+    }
+    *fx = (int)s->info.x; *fy = (int)s->info.y; *fw = (int)s->info.w; *fh = (int)s->info.h;
+}
+/* \u4e09\u6309\u94ae\u547d\u4e2d\uff1a0 = \u6700\u5c0f\u5316 / 1 = \u6700\u5927\u5316 / 2 = \u5173\u95ed / -1 = \u4e0d\u662f\u6309\u94ae */
+static int wm_btn_hit(const struct WmSlot* s, int x, int y) {
+    if (!(s->info.flags & V64_WM_DECOR)) return -1;
+    int fx, fy, fw, fh;
+    wm_frame(s, &fx, &fy, &fw, &fh);
+    const int bx = fx + fw - 1 - WM_BTN_SLOT * 3;
+    for (int b = 0; b < 3; b++) {
+        const int bx0 = bx + b * WM_BTN_SLOT;
+        if (x >= bx0 && x < bx0 + WM_BTN_SLOT && y >= fy + 1 && y < fy + WM_DECO_HDR - 1) return b;
+    }
+    return -1;
+}
+/* \u88c5\u9970\u524d\u534a\uff1a\u6807\u9898\u5e26 + \u6807\u9898\u6587\u5b57 + \u4e09\u6309\u94ae\uff08+\u6700\u5927\u5316\u65f6\u7684\u5ba2\u6237\u533a\u5e95\u8272\uff09 */
+static void wm_deco_frame(const struct WmSlot* s) {
+    int fx, fy, fw, fh;
+    wm_frame(s, &fx, &fy, &fw, &fh);
+    if (fw <= 0 || fh <= 0) return;
+    wm_fill(fx, fy, fw, WM_DECO_HDR, WM_C_TITLE);
+    if (s->title[0]) wm_text8(fx + 8, fy + 8, s->title, WM_C_GLYPH, fx + fw - 100);
+    const int bx = fx + fw - 1 - WM_BTN_SLOT * 3;
+    const int by = fy + (WM_DECO_HDR - WM_BTN_H) / 2;
+    for (int b = 0; b < 3; b++) {
+        const int x = bx + b * WM_BTN_SLOT + (WM_BTN_SLOT - WM_BTN_W) / 2;
+        wm_fill(x, by, WM_BTN_W, WM_BTN_H, (b == 2) ? WM_C_CLOSE : WM_C_BTN);
+        const int mx = x + WM_BTN_W / 2, my = by + WM_BTN_H / 2;
+        if (b == 0) {
+            wm_fill(mx - 5, my + 2, 11, 2, WM_C_GLYPH);                       /* \u6700\u5c0f\u5316\uff1a\u77ed\u6a2a\u7ebf */
+        } else if (b == 1) {
+            wm_fill(mx - 5, my - 5, 11, 1, WM_C_GLYPH);                        /* \u6700\u5927\u5316\uff1a\u7a7a\u5fc3\u65b9\u6846 */
+            wm_fill(mx - 5, my + 5, 11, 1, WM_C_GLYPH);
+            wm_fill(mx - 5, my - 5, 1, 11, WM_C_GLYPH);
+            wm_fill(mx + 5, my - 5, 1, 11, WM_C_GLYPH);
+        } else {
+            for (int i = -4; i <= 4; i++) {                                    /* \u5173\u95ed\uff1a\u767d\u2715 */
+                wm_put(mx + i, my + i, 0xFFFFFFFFu);
+                wm_put(mx - i, my + i, 0xFFFFFFFFu);
+            }
+        }
+    }
+    if ((s->info.flags & V64_WM_MAXED) && !(s->info.flags & V64_WM_COLLAPSED)) {
+        const uint32_t cb = 0xFF000000u | (s->info.pad & 0x00FFFFFFu);
+        wm_fill(fx + 1, fy + WM_DECO_HDR, fw - 2, fh - WM_DECO_HDR - 1, cb);
+    }
+}
+/* \u88c5\u9970\u540e\u534a\uff1a1px \u8fb9\u6846 + \u56db\u89d2\u5706\u89d2\u88c1\u5207\uff08\u5fc5\u987b\u753b\u5728\u5185\u5bb9**\u4e4b\u540e**\uff09 */
+static void wm_deco_edge(const struct WmSlot* s) {
+    int fx, fy, fw, fh;
+    wm_frame(s, &fx, &fy, &fw, &fh);
+    if (fw <= 0 || fh <= 0) return;
+    wm_fill(fx, fy, fw, 1, WM_C_BORDER);
+    wm_fill(fx, fy + fh - 1, fw, 1, WM_C_BORDER);
+    wm_fill(fx, fy, 1, fh, WM_C_BORDER);
+    wm_fill(fx + fw - 1, fy, 1, fh, WM_C_BORDER);
+    wm_corner_cut(fx, fy, fw, fh, WM_DECO_R);
+}
+
 /* 用户态命中测试：最上层的、有内容的、包含 (x,y) 的 surface（与内核 hit64 同一条规则） */
 static struct WmSlot* wm_hit(struct WmSlot* slots, int x, int y) {
     struct WmSlot* best = NULL;
     for (int k = 0; k < WM_MAX_SURF; k++) {
         struct WmSlot* s = &slots[k];
         if (!s->used || !(s->info.flags & V64_WM_CONTENT)) continue;
-        if (x < s->info.x || x >= s->info.x + (int)s->info.w) continue;
-        if (y < s->info.y || y >= s->info.y + (int)s->info.h) continue;
+        /* ★ v0.11.2：命中测试用**装饰框**（折叠后只剩 25px；最大化后是整屏） */
+        int fx, fy, fw, fh;
+        wm_frame(s, &fx, &fy, &fw, &fh);
+        if (x < fx || x >= fx + fw) continue;
+        if (y < fy || y >= fy + fh) continue;
         if (!best || s->info.id > best->info.id) best = s;
     }
     return best;
@@ -286,17 +438,25 @@ static void wm_place(int id, int w, int h, int* out_x, int* out_y, const char** 
 static int wm_blit_slot(const struct WmSlot* self, int x0, int y0, int x1, int y1, int* blended) {
     if (!self->px || !(self->info.flags & V64_WM_HASBUF)) return 0;
     const struct Wm64SurfaceInfo* si = &self->info;
-    int ax0 = wm_max(si->x, x0), ay0 = wm_max(si->y, y0);
-    int ax1 = wm_min(si->x + (int)si->w, x1), ay1 = wm_min(si->y + (int)si->h, y1);
-    if (ax1 <= ax0 || ay1 <= ay0) return 0;
+    /* ★ v0.11.2：装饰窗口的客户区从装饰框的 (0, 25) 开始；折叠时一个像素都不合成。
+     *   正常框（fx,fy = si->x,si->y）下这两个偏移都是 0 -> 裸 surface 老路径一个像素不变。 */
+    int fx, fy, fw, fh;
+    wm_frame(self, &fx, &fy, &fw, &fh);
+    const int deco = (si->flags & V64_WM_DECOR) != 0;
+    if (deco && (si->flags & V64_WM_COLLAPSED)) return 0;
+    const int cy0 = fy + (deco ? WM_DECO_HDR : 0);
+    const int chh = (int)si->h - (deco ? WM_DECO_HDR : 0);
+    int ax0 = wm_max(fx, x0), ay0 = wm_max(cy0, y0);
+    int ax1 = wm_min(fx + (int)si->w, x1), ay1 = wm_min(cy0 + chh, y1);
+    if (ax1 <= ax0 || ay1 <= ay0 || chh <= 0) return 0;
     const unsigned pitch_px = si->w;
     const uint32_t* spx = (const uint32_t*)self->px;      /* ★ v0.10.2：uint32 下标代替逐像素指针算术 */
     int written = 0;
     for (int sy = ay0; sy < ay1; sy++) {
         uint32_t* drow = (uint32_t*)((unsigned char*)g_fbpx + (unsigned long)sy * g_fb.pitch);
-        const uint32_t* srow = spx + (unsigned long)(sy - si->y) * (unsigned long)pitch_px;
+        const uint32_t* srow = spx + (unsigned long)((sy - cy0) + (deco ? WM_DECO_HDR : 0)) * (unsigned long)pitch_px;
         for (int sx = ax0; sx < ax1; sx++) {
-            const uint32_t v = srow[sx - si->x];
+            const uint32_t v = srow[sx - fx];
             const uint32_t a = (v >> 24) & 0xFFu;
             if (a == 0xFFu) {
                 drow[sx] = v;
@@ -333,10 +493,36 @@ static int wm_blit_rect(struct WmSlot* slots, int x0, int y0, int x1, int y1, in
     for (int a = 0; a < n; a++) px += wm_blit_slot(&slots[order[a]], x0, y0, x1, y1, blended);
     return px;
 }
+/* ★ v0.11.2：**合成一段矩形**（不回填背景）—— 装饰前半 -> 客户区内容 -> 装饰后半。
+ *   与内核窗口 draw_window 的顺序一致；层级仍是 id 升序（后创建的在上）。
+ *   为什么单独抽出来：主合成路径（⑨）与"输入后补画"路径必须走同一段代码，
+ *   否则会出现"主路径画了内容、补画路径画了装饰"的半截状态（本批实测踩过：
+ *   第一版只改了 wm_paint_rect，主路径仍直调 wm_blit_rect —— 屏幕上标题带全黑）。 */
+static int wm_compose_rect(struct WmSlot* slots, int x0, int y0, int x1, int y1, int* blended) {
+    if (x1 <= x0 || y1 <= y0) return 0;
+    int order[WM_MAX_SURF], n = 0;
+    for (int i = 0; i < WM_MAX_SURF; i++) if (slots[i].used) order[n++] = i;
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++)
+            if (slots[order[b]].info.id < slots[order[a]].info.id) {
+                const int t = order[a]; order[a] = order[b]; order[b] = t;
+            }
+    g_clip_x0 = wm_max(x0, 0); g_clip_y0 = wm_max(y0, 0);
+    g_clip_x1 = wm_min(x1, (int)g_fb.width); g_clip_y1 = wm_min(y1, (int)g_fb.height);
+    int px = 0;
+    for (int a = 0; a < n; a++) {
+        struct WmSlot* s = &slots[order[a]];
+        const int deco = (s->info.flags & V64_WM_DECOR) != 0;
+        if (deco) wm_deco_frame(s);
+        px += wm_blit_slot(s, x0, y0, x1, y1, blended);
+        if (deco) wm_deco_edge(s);
+    }
+    return px;
+}
 static int wm_paint_rect(struct WmSlot* slots, int x0, int y0, int x1, int y1, int* blended) {
     if (x1 <= x0 || y1 <= y0) return 0;
     wm_bg_restore(x0, y0, x1, y1);
-    return wm_blit_rect(slots, x0, y0, x1, y1, blended);
+    return wm_compose_rect(slots, x0, y0, x1, y1, blended);
 }
 
 int main(void) {
@@ -508,8 +694,17 @@ int main(void) {
             slots[i].info = info;
             slots[i].prev_w = (int)info.w;
             slots[i].prev_h = (int)info.h;
-            if (is_new) { slots[i].placed = 0; slots[i].logged = 0; slots[i].map_shm = -1; }
+            if (is_new) { slots[i].placed = 0; slots[i].logged = 0; slots[i].map_shm = -1;
+                          slots[i].title_got = 0; slots[i].title[0] = 0; }
             n_used++;
+
+            /* ★ v0.11.2：装饰窗口的标题由合成器画 —— 用 29 号从内核读回来（每个 surface 只读一次） */
+            if ((info.flags & V64_WM_DECOR) && !slots[i].title_got) {
+                if (wl_surface_title((int)info.id, slots[i].title, sizeof(slots[i].title)) > 0) {
+                    slots[i].title_got = 1;
+                    printf("[WM] title id=%d text=\"%s\"\n", (int)info.id, slots[i].title);
+                }
+            }
 
             /* 缓冲换对象（或第一次）：映射进自己的地址空间 */
             if (slots[i].map_shm != info.shm_id && (info.flags & V64_WM_HASBUF)) {
@@ -616,7 +811,7 @@ int main(void) {
             const unsigned long long bg_us = wm_us(wm_rdtsc() - t_bg);
             const unsigned long long t_c0 = wm_rdtsc();
             int blend = 0;
-            const int px = wm_blit_rect(slots, dmg_x, dmg_y, dmg_x + dmg_w, dmg_y + dmg_h, &blend);
+            const int px = wm_compose_rect(slots, dmg_x, dmg_y, dmg_x + dmg_w, dmg_y + dmg_h, &blend);
             const unsigned long long us = wm_us(wm_rdtsc() - t_c0);
 
             const int use_dev = 0;      /* 22 号的 gpu 位为 0 -> 恒 soft，如实写 */
@@ -698,10 +893,28 @@ int main(void) {
                     const int is_move = (raw[i].type == V64_EV_MOUSE_MOVE);
                     got_any = 1;
 
+                    int consumed = 0;
                     if (is_down && (raw[i].code & 1u)) {
-                        /* 左键按下：落点在最上层窗口的**顶部拖动条**里 -> 开始拖 */
+                        /* ★ v0.11.2：先判**三按钮**（真实语义走 30 号：关闭 / 折叠 / 最大化），
+                         *   不是按钮才当拖动。两者都**不投给客户端**（否则 PE 的 OK 判定会被
+                         *   标题栏上的一下点击弄困惑）。 */
                         struct WmSlot* hs = wm_hit(slots, raw[i].x, raw[i].y);
-                        if (hs && (raw[i].y - hs->info.y) < WM_DRAG_BAR) {
+                        if (hs) {
+                            const int b = wm_btn_hit(hs, raw[i].x, raw[i].y);
+                            if (b >= 0) {
+                                const int act = (b == 0) ? V64_WL_CTL_COLLAPSE
+                                              : (b == 1) ? V64_WL_CTL_MAX : V64_WL_CTL_CLOSE;
+                                const int rc = wl_surface_ctl((int)hs->info.id, act);
+                                printf("[WM] btn id=%d which=%s action=%s rc=%d\n", (int)hs->info.id,
+                                       (b == 0) ? "min" : (b == 1) ? "max" : "close",
+                                       (b == 0) ? "collapse" : (b == 1) ? "maximize" : "close", rc);
+                                int fx, fy, fw, fh;
+                                wm_frame(hs, &fx, &fy, &fw, &fh);
+                                wm_union(&odmg_x, &odmg_y, &odmg_w, &odmg_h, fx, fy, fw, fh);
+                                consumed = 1;
+                            }
+                        }
+                        if (!consumed && hs && (raw[i].y - (int)hs->info.y) < WM_DRAG_BAR) {
                             g_drag_id = (int)hs->info.id;
                             g_drag_grab_x = raw[i].x - hs->info.x;
                             g_drag_grab_y = raw[i].y - hs->info.y;
@@ -751,8 +964,11 @@ int main(void) {
                         g_drag_id = 0;
                     }
 
-                    /* 事件照旧投回客户端（拖动期间也投：客户端的按钮判定只看 UP 落在哪）*/
-                    if (is_key) {
+                    /* 事件照旧投回客户端（拖动期间也投：客户端的按钮判定只看 UP 落在哪）。
+                     * ★ v0.11.2：标题栏按钮那一下已经被合成器吃掉（consumed），不再投。 */
+                    if (consumed) {
+                        /* 合成器自己处理完了 */
+                    } else if (is_key) {
                         struct WmSlot* best = NULL;
                         for (int k = 0; k < WM_MAX_SURF; k++)
                             if (slots[k].used && (slots[k].info.flags & V64_WM_CONTENT))

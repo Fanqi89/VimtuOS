@@ -89,6 +89,13 @@
 //      内容（顶部 25 行归合成器）。title = 用户态 C 串（最多 31 B，0 = 保留原标题）。
 //      **不改几何**（x/y/w/h 仍由 27 号/槽位决定），所以几何类老判据全部不变；
 //      打点 `[WL64] decor … mode=window` + `[WL64] deco paint … btns=3 corner=.. hdr=25`。
+//   29 wl_surface_title(surf, out, cap)      ★ v0.11.2 -> 合成器读标题（画标题栏文字用）
+//   30 wl_surface_ctl(surf, action)          ★ v0.11.2 -> 标题栏三按钮的真实语义
+//      action 1 = close：给拥有者投一条 type=7 的 CLOSE 事件，然后销毁 surface；
+//             2 = collapse 开关：折叠成 25px 标题带（客户区内容不合成）；
+//             3 = maximize 开关：装饰框铺满整屏（内容按原尺寸贴左上，**不缩放**）。
+//      窗口状态由内核的 surface 表持有，23 号导出的 flags 位（0x8 decor / 0x10 collapsed /
+//      0x20 maxed）让两条合成路（内核路与 Ring 3 的 /bin/wm）看到**同一份状态**。
 //   ==================== ★ 本批：用户态设备映射（号 48 pci_map_bar）====================
 //   目标：让 ring3 的**驱动服务**能直接读自己那块设备的寄存器（用户态驱动的第一块地基）。
 //   48 pci_map_bar(bdf, bar_index, out_va, out_len)

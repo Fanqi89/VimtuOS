@@ -27,6 +27,9 @@
 #define V64_NR_WL_SURFACE_ACK     25
 #define V64_NR_WL_SEAT_POST       26
 #define V64_NR_WL_SURFACE_MOVE    27   /* ★ W3 第二批：窗口重定位（拖动）*/
+/* ★ v0.11.2：装饰与三按钮（29 = 读标题，30 = close/collapse/maximize） */
+#define V64_NR_WL_SURFACE_TITLE   29
+#define V64_NR_WL_SURFACE_CTL     30
 
 /* 22 号的返回值：低 8 位 = seat id，bit8 = 显示后端是 virtio-gpu 2D 设备（0 = soft-lfb） */
 #define V64_WM_GPU_BIT            0x100u
@@ -58,6 +61,10 @@ struct Wm64SurfaceInfo {
 #define V64_WM_PENDING       0x1u
 #define V64_WM_CONTENT       0x2u
 #define V64_WM_HASBUF        0x4u
+/* ★ v0.11.2（窗口装饰与三按钮）：状态由内核持有，合成器只读 */
+#define V64_WM_DECOR         0x8u    /* 该 surface 是窗口（装饰归合成器画） */
+#define V64_WM_COLLAPSED     0x10u   /* 已折叠：只画 25px 标题带，客户区内容不合成 */
+#define V64_WM_MAXED         0x20u   /* 已最大化：装饰框 = 整屏，内容按原尺寸贴左上 */
 
 /* ---- 24 的出参：缓冲页的映射结果（16 B POD）。
  * 像素地址 = va + shm_off + y*(w*4) + x*4（pitch = surface 宽 * 4，格式 XRGB8888）。 ---- */
@@ -80,6 +87,9 @@ int wl_seat_post(struct Wl64SeatEvent* ev);
 /* ★ W3 第二批：27 号 —— 把 surface 的屏幕位置改成 (x,y)。拥有者自己可调；注册合成器可挪任何窗口。
  * 语义/夹取/权限的唯一定义点在 kernel/wl64.h 的 27 号说明。 */
 int wl_surface_move(int surf, int x, int y);
+/* ★ v0.11.2：装饰用的两个内核调用（实现在 user/lib/wl.c） */
+int wl_surface_title(int surf, char* out, unsigned cap);   /* 29：合成器读标题 */
+int wl_surface_ctl(int surf, int action);                  /* 30：close / collapse / maximize */
 
 /* ---- rdtsc（用户态计时）----
  * 内核从不设 CR4.TSD（见 kernel/usermode64.cpp 的 CR4 只开 OSFXSR/OSXMMEXCPT），所以 ring3 的

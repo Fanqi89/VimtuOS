@@ -43,3 +43,11 @@ int wl_surface_set_decor(int surf, unsigned flags, const char* title) {
     return (int)__v64_int80(V64_NR_WL_SURFACE_DECOR, (long)surf, (long)flags,
                             (long)(unsigned long)title, 0);
 }
+
+/* ★ v0.11.2：窗口控制（close / collapse / maximize）与标题读回 */
+int wl_surface_ctl(int surf, int action) {
+    return (int)__v64_int80(V64_NR_WL_SURFACE_CTL, (long)surf, (long)action, 0, 0);
+}
+int wl_surface_title(int surf, char* out, unsigned cap) {
+    return (int)__v64_int80(V64_NR_WL_SURFACE_TITLE, (long)surf, (long)(unsigned long)out, (long)cap, 0);
+}

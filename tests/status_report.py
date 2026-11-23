@@ -4171,6 +4171,10 @@ TESTS = [
     ("locklogin64_test.py", "★ P1c 锁屏/登录/多用户：时间 72px/年月日 18px、背景清晰→登录后模糊 20px(250-350ms)、"
                             "头像与密码框/确认按钮像素、ESC 返回、重启仍锁屏、两用户桌面隔离、su/sudo/exit + ★ v0.9.5 两段过渡的专用断言（104 条断言）"),
     ("startmenu64_test.py", "★ P2 开始菜单：居中/离 Dock 11px/上圆角 24 下 10/搜索启动/2×4 固定网格/状态区线性图标/电源菜单/ESC 两级退出（58 条断言）"),
+    ("wmdeco64_test.py", "★ v0.11.2 Ring 3 合成器接管装饰 + 三按钮真实语义：`elfrun bg /lib/wm.elf` 起常驻合成器 -> "
+                         "PE 对话框在 wm 路下也有标题带/三按钮/圆角（串口 `[WM] title` + screendump 像素）；"
+                         "点最小化 = 折叠成 25px（`[WL64] ctl … collapsed=1`）、再点展开、最大化 = frame=0,0,屏宽,屏高、"
+                         "关闭 = `ctl action=close` + 客户端收到 type=7 CLOSE 事件（`close by=composer`）+ surface 销毁"),
     ("panels64_test.py", "★ P2 四弹窗：通知(角标/空态)+声音(滑块百分比/输出源/如实未接驱动)+网络(WiFi 如实空态+以太网区固定)+日历(7×6/滚轮·方向键·PageUp/PageDown/今天/年份面板)+设备 toast 滑入滑出（78 条断言）"),
     ("perm64_test.py", "★ P4 权限：卷 v4(uid/gid/mode)+owner/group/other rwx 真拦截(root 绕过)+su/sudo 真提权+chmod/chown/umask+ls -l（95 条断言，含 v3 旧卷兼容）"),
     ("settings64_test.py", "★ P3 设置页：左导航 240px + 六组 + 主题/壁纸适应模式(桌面/锁屏分别)/Dock 长度与图标尺寸实时生效/字体大小/默认应用/头像/改名/密码设置与清空/关于页；含软重启后的持久化与\"设密码→重启必须输密码\"（105 条断言）"),

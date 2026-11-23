@@ -211,6 +211,8 @@ int64_t wl64_surface_ack64(uint64_t)                              __attribute__(
 int64_t wl64_seat_post64(uint64_t)                                __attribute__((weak));
 int64_t wl64_surface_move64(uint64_t, uint64_t)                   __attribute__((weak));   // ★ W3 第二批：27
 int64_t wl64_surface_set_decor64(uint64_t, uint64_t, uint64_t)     __attribute__((weak));   // ★ v0.11.1：28
+int64_t wl64_surface_ctl64(uint64_t, uint64_t)                     __attribute__((weak));   // ★ v0.11.2：30
+int64_t wl64_surface_title64(uint64_t, uint64_t, uint64_t)         __attribute__((weak));   // ★ v0.11.2：29
 // ★ A4-5：信号投递（kernel/sig64.cpp）**两份内核都链**它，所以这里是强引用（不是弱引用）；
 //   它内部对 proc64 的访问才是弱引用（安装内核没有进程表 -> 只做参数校验，如实不投递）。
 static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
@@ -3845,6 +3847,19 @@ extern "C" void syscall64_dispatch64(pt_regs64* r) {
     case 28:                                                    // wl_surface_set_decor(surf, flags, title)
         ret = wl64_surface_set_decor64 ? wl64_surface_set_decor64(a1, a2, a3) : -1;
         if (!wl64_surface_set_decor64) syscall64_deny64(nr, a1);
+        break;
+
+    case 29:                                                    // wl_surface_title(surf, out, cap)
+        ret = wl64_surface_title64 ? wl64_surface_title64(a1, a2, a3) : -1;
+        if (!wl64_surface_title64) syscall64_deny64(nr, a1);
+        break;
+
+    // ★ v0.11.2：30 = wl_surface_ctl(surf, action) —— 标题栏三按钮的真实语义。
+    //   action 1=close（销毁 + 给拥有者投 type=7 的 CLOSE 事件）/ 2=collapse 开关 / 3=maximize 开关。
+    //   状态由内核的 surface 表持有（两条合成路共用一份，见 kernel/wl64.h）。
+    case 30:                                                    // wl_surface_ctl(surf, action)
+        ret = wl64_surface_ctl64 ? wl64_surface_ctl64(a1, a2) : -1;
+        if (!wl64_surface_ctl64) syscall64_deny64(nr, a1);
         break;
     // ★ 本批：用户态设备映射（48 pci_map_bar）。语义/权限/错误码：kernel/syscall64.h 的那一段。
     //   第 4 个参数（out_len）在 r10 —— 与 fb_flip(10) 同款（自有 ABI 只有 rdi/rsi/rdx + r10）。

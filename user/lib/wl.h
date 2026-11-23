@@ -40,6 +40,16 @@
  *   客户端只画客户区内容（顶部 WL64_DECOR_H64 = 25 行归合成器）。 */
 #define V64_NR_WL_SURFACE_DECOR   28
 #define V64_WL_DECOR_WINDOW       0x1u
+/* ★ v0.11.2：30 = wl_surface_ctl(surf, action) —— 标题栏三按钮的真实语义（close / collapse / maximize）。
+ *   窗口状态由**内核**持有（两条合成路共用），合成器从 23 号导出的 flags 位读：
+ *     V64_WM_DECOR / V64_WM_COLLAPSED / V64_WM_MAXED（见 user/lib/wmabi.h）。
+ *   close 还会给拥有者投一条 type=V64_WL_EV_CLOSE 的事件（客户端据此关窗）。 */
+#define V64_NR_WL_SURFACE_CTL     30
+#define V64_NR_WL_SURFACE_TITLE   29
+#define V64_WL_CTL_CLOSE          1
+#define V64_WL_CTL_COLLAPSE       2
+#define V64_WL_CTL_MAX            3
+#define V64_WL_EV_CLOSE           7u
 
 /* 错误码（与 kernel/wl64.h 的 WL64_* 逐值一致） */
 #define V64_WL_EPERM    (-1)   /* 没有进程上下文 / surface 不属于本进程 */
@@ -77,5 +87,7 @@ int wl_surface_destroy(int surf);
 int wl_seat_get(void);
 int wl_display_dispatch(unsigned timeout_ms, struct Wl64SeatEvent* out, unsigned max);
 int wl_surface_set_decor(int surf, unsigned flags, const char* title);   /* ★ v0.11.1：28 */
+int wl_surface_ctl(int surf, int action);                                /* ★ v0.11.2：30 */
+int wl_surface_title(int surf, char* out, unsigned cap);                 /* ★ v0.11.2：29 */
 
 #endif /* VIMTU64_WL_H */
