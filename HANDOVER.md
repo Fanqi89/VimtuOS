@@ -10,7 +10,8 @@
 
 | 文件 | 日期 | 版本串 | HEAD | 一句话 |
 |---|---|---|---|---|
-| [HANDOVER_v0113_viewer_dock.md](HANDOVER_v0113_viewer_dock.md) | 2026-11-23 | 0.11.3（本轮） | 见 git log | **本轮**：图片查看器三毒瘤（悬停指针窟窿=两个写者 / 自绘标题栏退场换成 28 号装饰三按钮 / 滚轮缩放）+ 指针唯一写者 + 最大化内容按比例缩放 + Dock × 窗口生命周期（30 号 ctl 4/5 + 外部窗口表 + 活动胶囊）+ WM 标题换 TTF 字模（wm_ttf.h） |
+| [HANDOVER_v0113_ready.md](HANDOVER_v0113_ready.md) | 2026-11-23 | 0.11.3（**已发版**） | `40208a45` | **本轮封存单**：v0.11.3 发布状态（tag `d2968c83…` / Release `455130600` / ISO+IMG sha256 / 旧版未动）+ 17 条剩余边界（ASCII 标题、Dock 上限 8、最近邻缩放…）+ 全量清扫挂起说明 |
+| [HANDOVER_v0113_viewer_dock.md](HANDOVER_v0113_viewer_dock.md) | 2026-11-23 | 0.11.3（**已发版**） | `40208a45` | 功能单：查看器三毒瘤（悬停指针窟窿=两个写者 / 自绘标题栏退场换 28 号装饰三按钮 / 滚轮缩放）+ 指针唯一写者 + 最大化按比例缩放 + Dock × 窗口生命周期（30 号 ctl 4/5 + 外部窗口表 + 活动胶囊）+ WM 标题 TTF 字模 |
 | [HANDOVER_v0112_ready.md](HANDOVER_v0112_ready.md) | 2026-11-23 | 0.11.2（**已发版**） | `c9b43717` | **本轮封存单**：v0.11.2 发布状态（统一装饰/三按钮真语义/拖拽持久化）+ 三条遗留边界 + 下一轮 = Dock × 窗口生命周期 + 布局弹性评估 + 全量清扫进度 |
 | [HANDOVER_v0112_wmdeco.md](HANDOVER_v0112_wmdeco.md) | 2026-11-23 | 0.11.2（**已发版**） | `34974344` | Ring 3 合成器（/bin/wm）也接管装饰 + 三按钮真实语义（29/30 号）；跨层拖拽/explorer 遗留项复跑确认 |
 | [HANDOVER_v0111_wlsurfwin.md](HANDOVER_v0111_wlsurfwin.md) | 2026-11-22 | 0.11.1（**已发版**） | `94406e93` | 第二步 wl_surface→Window（28 号 set_decor，装饰归合成器）落地 + 跨层拖拽；v0.11.1 已打 tag、已建 Release（ISO+IMG） |
