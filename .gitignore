@@ -78,3 +78,6 @@ vimtu64-64-disk.img.bak
 vimtu64-64-disk.img.*.bak
 vimtu64-64-disk.img.ver
 NUL
+
+# v0.11.2：用户本机的桌面/UI 截图（不是构建产物、也不进仓库；文件留在盘上）
+docs/images/
