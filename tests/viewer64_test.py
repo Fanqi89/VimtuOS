@@ -548,7 +548,9 @@ def main():
             # ★ `img=` 是**解码尺寸**；窗口尺寸 = fit_sz 出来的**显示尺寸** + (2*PAD, TITLE_H+PAD)。
             #   fit_sz 是整数口径（user/viewer/viewer.c）：a = IW_MAX*h, b = IH_MAX*w；
             #   a<=b -> (IW_MAX, a/w)，否则 -> (b/h, IH_MAX)。测试按同一式子复算，不写死数字。
-            want_win = (want_img[0] + 2, want_img[1] + 21)
+            #   ★ v0.11.3：surface 尺寸 = **客户区**（28 号装饰的 25px 标题带画在 surface 之外），
+            #   所以窗口尺寸就是 fit 尺寸本身（v0.11.2 是 +2/+21 的自绘标题栏与边框）。
+            want_win = (want_img[0], want_img[1])   # ★ v0.11.3：画布 = 客户区（标题栏由合成器画，不在 surface 里）
             check("① %s：窗口几何 w=%d h=%d mode=%s（显示 %dx%d + 边框/标题栏；解码 %dx%d）"
                   % (path, want_win[0], want_win[1], want_mode,
                      want_img[0], want_img[1], want_w, want_h),
@@ -626,13 +628,22 @@ def main():
                 check("① %s：窗口矩形在屏内" % path,
                       vx >= 0 and vy >= 0 and vx + vw <= ww and vy + vh <= hh,
                       "pos=%d,%d %dx%d screen=%dx%d" % (vx, vy, vw, vh, ww, hh))
-                # 标题栏色 0x3A4658 是**这个窗口才有**的（内核面板底色是 0x20242A，
-                # 拿面板色当判据 = 假绿，v0.10.5 踩过）
-                fr = count(px, ww, hh, (vx, vy, vx + vw, vy + 21), is_frame)
-                check("① %s：窗口真上屏（标题栏 @0x3A4658 >= 300 px）" % path, fr >= 300,
-                      "frame=%d" % fr)
-                red = count(px, ww, hh, (vx + 1, vy + 21, vx + vw - 1, vy + vh - 1), is_red)
-                blue = count(px, ww, hh, (vx + 1, vy + 21, vx + vw - 1, vy + vh - 1), is_blue)
+                # ★ v0.11.3：标题栏改由**合成器**画（28 号装饰）——判据从"查看器自绘的
+                #   0x3A4658"换成"合成器标题带 #F2F4F8 + 三按钮"，并且旧自绘色必须 0 px
+                #   （强度不降：老判据是"窗口真上屏"，新判据同时钉住"画家换了、旧画家退场"）。
+                fr = count(px, ww, hh, (vx, vy, vx + vw, vy + 25),
+                           lambda r, g, b: abs(r - 0xF2) <= 2 and abs(g - 0xF4) <= 2 and abs(b - 0xF8) <= 2)
+                oldfr = count(px, ww, hh, (vx, vy, vx + vw, vy + vh), is_frame)
+                check("① %s：合成器标题带 #F2F4F8 在窗口顶部 25 行（>= 300 px）" % path, fr >= 300,
+                      "band=%d" % fr)
+                check("① %s：旧自绘标题栏 0x3A4658 = 0 px（画家已换成合成器）" % path, oldfr == 0,
+                      "old=%d" % oldfr)
+                cres = count(px, ww, hh, (vx + vw - 100, vy + 1, vx + vw, vy + 25),
+                             lambda r, g, b: r >= 200 and g <= 60 and b <= 60)
+                check("① %s：关闭按钮红底在标题带右侧（>= 200 px）" % path, cres >= 200,
+                      "red=%d" % cres)
+                red = count(px, ww, hh, (vx + 1, vy + 26, vx + vw - 1, vy + vh - 1), is_red)
+                blue = count(px, ww, hh, (vx + 1, vy + 26, vx + vw - 1, vy + vh - 1), is_blue)
                 # 128x96 图半幅 = 64*96 = 6144 px；big.png 缩放后 760x520 半幅更大。
                 # 判据留足余量（JPEG 有损），但"通道搞反 / 解码错 / 当文本开"都会立刻红。
                 check("① %s：左半是纯红（>= 3000 px，解码没把通道搞反）" % path, red >= 3000,

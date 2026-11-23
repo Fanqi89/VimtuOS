@@ -1866,7 +1866,91 @@ static void dock_run_del64(int win_id) {
 }
 // 窗口事件入口（gui64_create_window / gui64_destroy_window 调）
 void dock64_on_window_create64(int win_id, int app_id, const char* title) { dock_run_add64(win_id, app_id, title); }
+// ★ v0.11.3：改某条运行项的标题（外部窗口的标题文字变了 —— 右键菜单/悬停列表要跟着变）
+static void dock_run_title64(int win_id, const char* title) {
+    const int at = dock_run_index64(win_id);
+    if (at < 0 || !title) return;
+    int k = 0;
+    for (; title[k] && k < (int)sizeof(g_runs[at].title) - 1; k++) g_runs[at].title[k] = title[k];
+    g_runs[at].title[k] = 0;
+    dock_rebuild64();
+}
 void dock64_on_window_close64(int win_id) { dock_run_del64(win_id); }
+
+// ==================== ★ v0.11.3：外部窗口（ring3 wl_surface 装饰窗口）====================
+// 语义与数据见 kernel/dock64.h。要点：**状态不复制**——这里只存 {surf, title, minimized}，
+//   几何/内容/命中仍以内核 wl64 的 surface 表为唯一真源；Dock 只是"看得见 + 点得到"。
+int64_t wl64_surface_ctl64(uint64_t surf, uint64_t action) __attribute__((weak));
+// ★ v0.11.3：与 kernel/wl64.h 的 WL64_CTL_* **逐值相同**（本文件不包含 wl64.h：
+//   wl64.h 里那批常量是给 wl64.cpp 用的，gui64 只要动作号；数量少，抄值不改语义）。
+static const uint64_t GUI_CTL_CLOSE64    = 1;
+static const uint64_t GUI_CTL_MIN2DOCK64 = 4;
+static const uint64_t GUI_CTL_RESTORE64  = 5;
+int     wl64_active_surface64() __attribute__((weak));
+
+#define DOCK_EXT_MAX 8
+struct DockExt64 { int used; int surf; char title[40]; int minimized; };
+static DockExt64 g_extw[DOCK_EXT_MAX];
+static int dock_ext_index64(int surf) {
+    for (int i = 0; i < DOCK_EXT_MAX; i++)
+        if (g_extw[i].used && g_extw[i].surf == surf) return i;
+    return -1;
+}
+int dock64_ext_add64(int surf, const char* title) {
+    if (surf <= 0) return -2;
+    if (dock_ext_index64(surf) >= 0) return 1;
+    for (int i = 0; i < DOCK_EXT_MAX; i++) {
+        if (g_extw[i].used) continue;
+        g_extw[i].used = 1;
+        g_extw[i].surf = surf;
+        g_extw[i].minimized = 0;
+        int k = 0;
+        if (title) for (; title[k] && k < (int)sizeof(g_extw[i].title) - 1; k++) g_extw[i].title[k] = title[k];
+        g_extw[i].title[k] = 0;
+        dock_run_add64(DOCK_EXT_WIN_BASE + surf, APP_ID_NONE, g_extw[i].title);
+        dbg64_line_begin64();
+        dbg64_str("[DOCK64] ext-add surf="); dbg64_dec((uint64_t)surf);
+        dbg64_str(" win=");                  dbg64_dec((uint64_t)(DOCK_EXT_WIN_BASE + surf));
+        dbg64_str(" title=");                dbg64_str(g_extw[i].title[0] ? g_extw[i].title : "-");
+        dbg64_nl();
+        dbg64_line_end64();
+        gui64_invalidate();
+        return 0;
+    }
+    return -1;                       // 表满：如实失败（wl64 只打日志，不影响窗口本身）
+}
+void dock64_ext_del64(int surf) {
+    const int at = dock_ext_index64(surf);
+    if (at < 0) return;
+    g_extw[at].used = 0;
+    dock_run_del64(DOCK_EXT_WIN_BASE + surf);
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] ext-del surf="); dbg64_dec((uint64_t)surf);
+    dbg64_str(" running=");              dbg64_dec((uint64_t)dock64_run_count64());
+    dbg64_nl();
+    dbg64_line_end64();
+    gui64_invalidate();
+}
+void dock64_ext_state64(int surf, int minimized) {
+    const int at = dock_ext_index64(surf);
+    if (at < 0) return;
+    g_extw[at].minimized = minimized ? 1 : 0;
+    dbg64_line_begin64();
+    dbg64_str("[DOCK64] ext-state surf="); dbg64_dec((uint64_t)surf);
+    dbg64_str(" minimized=");              dbg64_dec((uint64_t)(minimized ? 1 : 0));
+    dbg64_nl();
+    dbg64_line_end64();
+    gui64_invalidate();
+}
+void dock64_ext_title64(int surf, const char* title) {
+    const int at = dock_ext_index64(surf);
+    if (at < 0 || !title) return;
+    int k = 0;
+    for (; title[k] && k < (int)sizeof(g_extw[at].title) - 1; k++) g_extw[at].title[k] = title[k];
+    g_extw[at].title[k] = 0;
+    dock_run_title64(DOCK_EXT_WIN_BASE + surf, g_extw[at].title);   // 运行项标题跟着改（右键菜单/悬停用）
+    gui64_invalidate();
+}
 
 // 第 i 项的**基准**左边界（不含悬停让位）
 static int dock_item_x64(int i) {
@@ -2136,6 +2220,14 @@ int  dock64_run_count64() { return g_runs_n; }
 void dock64_pin_set64(int app_id, int on) { dock_pin_set64(app_id, on); }
 int  dock64_app_windows64(int app_id) { return gui64_app_windows(app_id); }
 void dock64_close_window64(int win_id) {
+    // ★ v0.11.3：外部窗口（ring3 wl_surface）—— 走 30 号 close（内核先投 CLOSE 事件再销毁
+    //   surface，Dock 项由 destroy 路径 dock64_ext_del64 收掉）。直接 run-del 会把
+    //   "Dock 项没了、窗口还在"这种幽灵状态留下。
+    if (win_id >= DOCK_EXT_WIN_BASE) {
+        if (wl64_surface_ctl64) (void)wl64_surface_ctl64((uint64_t)(win_id - DOCK_EXT_WIN_BASE),
+                                                        (uint64_t)GUI_CTL_CLOSE64);
+        return;
+    }
     Window* w = gui64_window_by_id64(win_id);
     if (w) gui64_destroy_window(w);
 }
@@ -2207,9 +2299,38 @@ static void dock_press64(int idx, int button, int mx, int my) {
     }
     // ★ v0.8.0：RUN 项（一窗口一项）——点它就是点那个窗口；PIN 项保持原来的应用级语义
     if (g_dock[idx].kind == DOCK_KIND_RUN) {
-        Window* rw = gui64_window_by_id64(g_dock[idx].win_id);
+        const int widx = g_dock[idx].win_id;
         const char* ract = "run-gone";
         int rn = 0;
+        if (widx >= DOCK_EXT_WIN_BASE) {
+            /* ★ v0.11.3：外部窗口（ring3 wl_surface）—— 点 Dock 项 = 30 号 ctl。
+             *   最小化 -> RESTORE（几何一个像素不动）；可见但不是活动 -> 也走 RESTORE
+             *   （等价"置前"，几何同样不变，因为内核的唯一状态是 minimized）；
+             *   已经是活动窗口 -> MIN2DOCK（收容）。 */
+            const int surf2 = widx - DOCK_EXT_WIN_BASE;
+            const int ei = dock_ext_index64(surf2);
+            if (ei >= 0) {
+                const int is_act = (wl64_active_surface64 && wl64_active_surface64() == surf2) ? 1 : 0;
+                const uint64_t act2 = (g_extw[ei].minimized || !is_act)
+                                    ? (uint64_t)GUI_CTL_RESTORE64 : (uint64_t)GUI_CTL_MIN2DOCK64;
+                const int rc = wl64_surface_ctl64 ? (int)wl64_surface_ctl64((uint64_t)surf2, act2) : -1;
+                ract = (act2 == (uint64_t)GUI_CTL_RESTORE64) ? "ext-restore" : "ext-minimize";
+                rn = 1;
+                /* Dock 这条自身要重画（横杠/圆点/胶囊换一种），窗口那块由 30 号 pending=1 驱动 */
+                gui64_invalidate();
+                dbg64_line_begin64();
+                dbg64_str("[DOCK64] press idx=");   dbg64_dec((uint64_t)idx);
+                dbg64_str(" app=");                 dbg64_dec((uint64_t)g_dock[idx].app_id);
+                dbg64_str(" action=");              dbg64_str(ract);
+                dbg64_str(" wins=1 win=");          dbg64_dec((uint64_t)widx);
+                dbg64_str(" surf=");                dbg64_dec((uint64_t)surf2);
+                dbg64_str(" rc=");                  dbg64_dec((uint64_t)(int64_t)rc);
+                dbg64_nl();
+                dbg64_line_end64();
+                return;
+            }
+        }
+        Window* rw = gui64_window_by_id64(widx);
         if (rw) {
             if (rw->minimized) { rw->minimized = false; gui64_set_active(rw); pop_begin64(rw, "dock"); ract = "run-restore"; }
             else if (!rw->active) { gui64_set_active(rw); dirty_add(rw->x, rw->y, rw->w, rw->h); ract = "run-activate"; }
@@ -2408,12 +2529,54 @@ static void draw_dock(void) {
         const int icon_px = g_dock_icon * g_dock_scale[i] / 256;
         dock_draw_one64(i, cx, icon_px, g_dock_hover == i, t);
         if (i == 0) continue;
-        int n = 0, vis = 0, mn = 0;
+        int n = 0, vis = 0, mn = 0, ext_act = 0, ext_surf = 0;
         if (g_dock[i].kind == DOCK_KIND_RUN) {
-            Window* rw = gui64_window_by_id64(g_dock[i].win_id);   // 运行项：看这一个窗口
-            if (rw && rw->visible) { n = 1; vis = 1; mn = rw->minimized ? 1 : 0; }
+            const int wid2 = g_dock[i].win_id;
+            if (wid2 >= DOCK_EXT_WIN_BASE) {
+                /* ★ v0.11.3：外部窗口（ring3 wl_surface）—— 存在性/最小化态在外窗口表里取，
+                 *   活动窗口由内核 wl64 的"最高 id 且未最小化"判定（唯一真源，不在这里猜）。 */
+                const int ei = dock_ext_index64(wid2 - DOCK_EXT_WIN_BASE);
+                if (ei >= 0) {
+                    n = 1; vis = 1; mn = g_extw[ei].minimized ? 1 : 0;
+                    ext_surf = g_extw[ei].surf;
+                    if (!mn && wl64_active_surface64 && wl64_active_surface64() == ext_surf) ext_act = 1;
+                }
+            } else {
+                Window* rw = gui64_window_by_id64(wid2);   // 运行项：看这一个窗口
+                if (rw && rw->visible) { n = 1; vis = 1; mn = rw->minimized ? 1 : 0; }
+            }
         } else {
             dock_app_state64(g_dock[i].app_id, &n, &vis, &mn);
+        }
+        (void)vis;
+        if (n > 0 && ext_act) {
+            /* 活动窗口 = 加宽的强调色胶囊（70% 图标宽 × 4px 高）；未活动 = 4px 圆点；
+             * 最小化 = 40% × 3px 横杠。三种几何**互不相同**，像素判据能分开数。 */
+            const int aw = g_dock_icon * THEME64_DOCK_BAR_PCT / 100 * 7 / 4;   // 40% * 1.75 = 70%
+            const int ay = g_dock_y + g_dock_h - 6;
+            gfx64_fill_round64(cx - aw / 2, ay, aw, 4, 2, t->accent, 255);
+            if (g_dock_log_budget > 0) {
+                g_dock_log_budget--;
+                dbg64_line_begin64();
+                dbg64_str("[DOCK64] extactive idx="); dbg64_dec((uint64_t)i);
+                dbg64_str(" surf=");                  dbg64_dec((uint64_t)ext_surf);
+                dbg64_str(" x=");                     dbg64_dec((uint64_t)(cx - aw / 2));
+                dbg64_str(" y=");                     dbg64_dec((uint64_t)ay);
+                dbg64_str(" w=");                     dbg64_dec((uint64_t)aw);
+                dbg64_str(" h=4 color=#");
+                {
+                    static const char* H = "0123456789ABCDEF";
+                    const char hx[7] = {
+                        H[(t->accent >> 20) & 0xF], H[(t->accent >> 16) & 0xF],
+                        H[(t->accent >> 12) & 0xF], H[(t->accent >> 8) & 0xF],
+                        H[(t->accent >> 4) & 0xF], H[t->accent & 0xF], 0
+                    };
+                    dbg64_str(hx);
+                }
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+            continue;                       // 胶囊顶上不再画圆点/横杠
         }
         if (n > 0) {
             const int bw = g_dock_icon * THEME64_DOCK_BAR_PCT / 100;   // 小横杠宽 = 图标宽 40%
@@ -2666,7 +2829,28 @@ static void cur_line64(int x0, int y0, int x1, int y1, uint32_t c) {
         cur_px64(x, y, c);
     }
 }
+// ★ v0.11.3：Ring 3 合成器在跑时**指针归它画**（单一写者）。为什么必须让出：
+//   合成器每收到一个输入事件就会把自己那块窗口重画一遍（user/wm/wm.c ⑪ -> wm_paint_rect），
+//   而软件光标是先画进后备缓冲的 —— 谁后画谁留下。实测（本批取证）：
+//   悬停在图片查看器上时 `perf cur=638,398` 位置**一个指针像素都没有**
+//   （(638,398) 在图片纯蓝里，16x16 箭头被合成器整块抹掉）——
+//   用户看到的就是"鼠标悬停变成透明窟窿"。改由合成器自己画（wm_ptr_paint）之后，
+//   指针永远是它那一帧的最上层；内核这层必须停手，否则两把箭头同时出现。
+//   没有合成器时（内核 GUI 正常桌面）走下面的老路径，一个像素不变。
+extern int wl64_composer_pid64() __attribute__((weak));
 static void draw_cursor(void) {
+    if (wl64_composer_pid64 && wl64_composer_pid64() != 0) {
+        static int skip_logged = 0;
+        if (skip_logged < 2) {
+            skip_logged++;
+            dbg64_line_begin64();
+            dbg64_str("[GUI64] cursor skip (ring3 composer owns pointer) pid=");
+            dbg64_dec((uint64_t)wl64_composer_pid64());
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+        return;
+    }
     // ★ v0.5.5：硬件光标平面接管时**不再画软件光标**（否则两层叠加：设备那层在扫描出画面的
     //   最后一步叠加，软件这层会留在后备缓冲里，两把箭头同时出现）。
     //   这条打点是验收的证据链：`software-skip` 出现 = 屏幕上的光标不可能是软件画的，

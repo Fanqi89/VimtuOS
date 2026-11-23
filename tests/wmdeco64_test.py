@@ -223,25 +223,39 @@ def main():
                 time.sleep(0.4)
             return None
 
-        # ① 最小化 = 折叠（只留 25px 标题带）
+        # ① 最小化 = **收容到 Dock**（★ v0.11.3 起；v0.11.2 是"折叠成 25px 标题带"——
+        #    那是窗口还在占屏幕一行、Dock 上什么都看不见，不是任务栏语义）
         x, y = btn_xy(0)
         click_at(mon, log_fn, x, y)
-        c = wait_ctl("collapse")
-        check("C1. 点最小化 -> [WM] btn which=min + [WL64] ctl action=collapse（collapsed=1）",
-              c is not None and "collapsed=1" in c.group(4),
+        c = wait_ctl("minimize")
+        check("C1. 点最小化 -> [WL64] ctl action=minimize（minimized=1，窗口从屏幕摘掉）",
+              c is not None and "minimized=1" in c.group(4),
               "" if c is None else c.group(0))
+        md = re.search(r"\[DOCK64\] ext-state surf=\d+ minimized=1", log_fn())
+        check("C1b. Dock 运行项收到 minimized=1（任务栏知道它最小化了）", md is not None,
+              md.group(0) if md else "")
         im = shot(mon, os.path.join(work, "min.ppm"))
         if im is not None:
-            below = D.px_at(im, fx + dw // 2, fy + 30)
-            check("C2. 折叠后 y+30 已不是窗口（标题带只剩 25 行）",
-                  not D.near(below, (0xF2, 0xF4, 0xF8), 10), "px=%s" % (below,))
+            # 整个窗口矩形（含标题带）都不再是窗口：标题带底色一个像素都不剩
+            band = D.count_region(im, fx, fy, fx + dw, fy + 25,
+                                  lambda c: D.near(c, (0xF2, 0xF4, 0xF8), 2))
+            check("C2. 最小化后窗口矩形里标题带像素 = 0（整窗摘掉，不是只收成一行）",
+                  band == 0, "band=%d" % band)
 
-        # ② 再点一次 = 展开
-        x, y = btn_xy(0)
-        click_at(mon, log_fn, x, y)
-        c = wait_ctl("collapse")
-        check("C3. 再点最小化 -> collapsed=0（展开）",
-              c is not None and "collapsed=0" in c.group(4), "" if c is None else c.group(0))
+        # ② 点 Dock 项 = 恢复（30 号 ctl action=restore；几何不动，所以恢复一定逐像素回原位）
+        mi = re.search(r"\[DOCK64\] item idx=\d+[^\n]*cx=(\d+) cy=(\d+)[^\n]*win=10001", log_fn())
+        check("C3a. Dock 列表里有这条外部窗口运行项（win=10001）", mi is not None,
+              mi.group(0) if mi else "")
+        if mi:
+            click_at(mon, log_fn, int(mi.group(1)), int(mi.group(2)))
+            c = wait_ctl("restore")
+            check("C3. 点 Dock 项 -> [WL64] ctl action=restore（minimized=0）",
+                  c is not None and "minimized=0" in c.group(4), "" if c is None else c.group(0))
+            im2 = shot(mon, os.path.join(work, "restored.ppm"))
+            if im is not None and im2 is not None:
+                band2 = D.count_region(im2, fx, fy, fx + dw, fy + 25,
+                                       lambda c: D.near(c, (0xF2, 0xF4, 0xF8), 2))
+                check("C3b. 恢复后标题带回来了（像素 > 0）", band2 > 200, "band=%d" % band2)
 
         # ③ 最大化 = 装饰框铺满整屏
         x, y = btn_xy(1)

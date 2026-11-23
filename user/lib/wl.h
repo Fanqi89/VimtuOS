@@ -49,6 +49,8 @@
 #define V64_WL_CTL_CLOSE          1
 #define V64_WL_CTL_COLLAPSE       2
 #define V64_WL_CTL_MAX            3
+#define V64_WL_CTL_MIN2DOCK       4   /* ★ v0.11.3：最小化收容到 Dock（整窗从屏幕摘掉） */
+#define V64_WL_CTL_RESTORE        5   /* ★ v0.11.3：从 Dock 恢复（几何逐像素还原） */
 #define V64_WL_EV_CLOSE           7u
 
 /* 错误码（与 kernel/wl64.h 的 WL64_* 逐值一致） */

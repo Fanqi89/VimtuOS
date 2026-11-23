@@ -38,3 +38,19 @@ int  dockmenu64_press64(int mx, int my, int button);   // 1 = 吃掉了这次点
 void dockmenu64_move64(int mx, int my);
 int  dockmenu64_key64(int c);          // 1 = 吃掉这个键（Up/Down/Enter/ESC）
 void dockmenu64_draw64();
+
+// ==================== ★ v0.11.3：外部窗口（ring3 wl_surface 装饰窗口）接入 Dock 运行项 ====================
+// 为什么需要这一层：Dock 的"运行项"原来只认内核 Window（gui64::gui64_window_by_id64）；
+//   ring3 的 wl_surface 窗口（图片查看器 / PE 程序…）不是内核 Window，于是最小化只能"折叠成
+//   25px 标题带"，Dock 上根本看不到"这个 app 有窗口 / 已最小化 / 当前活动"。这里给它们
+//   一份**外部窗口表**：win_id 用 DOCK_EXT_WIN_BASE + surf 编码，状态只有 {存在, 最小化}，
+//   几何与内容仍然只在内核 wl64 的 surface 表里（单一真源，不在 Dock 里复制一份）。
+//   * 建立：wl64 的 28 号 set_decor（声明成窗口）
+//   * 移除：wl64 的 surface destroy（关窗 / 客户端退出）
+//   * 最小化：30 号 ctl MIN2DOCK/RESTORE（wl64 通知）
+//   * 点击：dock_press64 的 RUN 分支 -> 30 号 ctl（RESTORE / MIN2DOCK）
+#define DOCK_EXT_WIN_BASE 10000
+int  dock64_ext_add64(int surf, const char* title);       // 0 = 新建 / 1 = 已存在（幂等）
+void dock64_ext_del64(int surf);
+void dock64_ext_state64(int surf, int minimized);
+void dock64_ext_title64(int surf, const char* title);

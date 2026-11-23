@@ -4175,6 +4175,11 @@ TESTS = [
                          "PE 对话框在 wm 路下也有标题带/三按钮/圆角（串口 `[WM] title` + screendump 像素）；"
                          "点最小化 = 折叠成 25px（`[WL64] ctl … collapsed=1`）、再点展开、最大化 = frame=0,0,屏宽,屏高、"
                          "关闭 = `ctl action=close` + 客户端收到 type=7 CLOSE 事件（`close by=composer`）+ surface 销毁"),
+    ("docklife64_test.py", "★ v0.11.3 Dock × 窗口生命周期（ring3 wl_surface 窗口）：28 号声明成窗口 -> 内核登记 Dock 运行项"
+                           "（`[DOCK64] ext-add surf=… win=10001` + item cx/cy）；活动窗口画加宽胶囊（`[DOCK64] extactive` + 像素）；"
+                           "点最小按钮 = 收容到 Dock（`[WL64] ctl … action=minimize minimized=1` + `[DOCK64] ext-state/minbar`，"
+                           "窗口矩形里图片像素全 0）；点 Dock 项恢复（`action=restore by=kernel`，矩形**逐字节相同** diff=0）；"
+                           "点关闭 = `ctl action=close` + `[DOCK64] ext-del` + 客户端 reason=close（21 条断言）"),
     ("panels64_test.py", "★ P2 四弹窗：通知(角标/空态)+声音(滑块百分比/输出源/如实未接驱动)+网络(WiFi 如实空态+以太网区固定)+日历(7×6/滚轮·方向键·PageUp/PageDown/今天/年份面板)+设备 toast 滑入滑出（78 条断言）"),
     ("perm64_test.py", "★ P4 权限：卷 v4(uid/gid/mode)+owner/group/other rwx 真拦截(root 绕过)+su/sudo 真提权+chmod/chown/umask+ls -l（95 条断言，含 v3 旧卷兼容）"),
     ("settings64_test.py", "★ P3 设置页：左导航 240px + 六组 + 主题/壁纸适应模式(桌面/锁屏分别)/Dock 长度与图标尺寸实时生效/字体大小/默认应用/头像/改名/密码设置与清空/关于页；含软重启后的持久化与\"设密码→重启必须输密码\"（105 条断言）"),

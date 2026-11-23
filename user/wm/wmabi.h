@@ -64,7 +64,8 @@ struct Wm64SurfaceInfo {
 /* ★ v0.11.2（窗口装饰与三按钮）：状态由内核持有，合成器只读 */
 #define V64_WM_DECOR         0x8u    /* 该 surface 是窗口（装饰归合成器画） */
 #define V64_WM_COLLAPSED     0x10u   /* 已折叠：只画 25px 标题带，客户区内容不合成 */
-#define V64_WM_MAXED         0x20u   /* 已最大化：装饰框 = 整屏，内容按原尺寸贴左上 */
+#define V64_WM_MAXED         0x20u   /* 最大化：装饰框 = 整屏；客户区内容按比例缩放铺满（v0.11.3） */
+#define V64_WM_MINIMIZED     0x40u   /* ★ v0.11.3：最小化收容到 Dock（整窗摘掉；点 Dock 项恢复） */
 
 /* ---- 24 的出参：缓冲页的映射结果（16 B POD）。
  * 像素地址 = va + shm_off + y*(w*4) + x*4（pitch = surface 宽 * 4，格式 XRGB8888）。 ---- */

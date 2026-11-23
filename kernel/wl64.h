@@ -243,6 +243,13 @@ static const uint32_t WL64_CTL_MAX64            = 3;
 static const uint32_t WL64_SURFINFO_DECOR64     = 0x8u;   // 该 surface 要画窗口装饰（28 号设的）
 static const uint32_t WL64_SURFINFO_COLLAPSED64 = 0x10u;  // 已折叠（只画 25px 标题带）
 static const uint32_t WL64_SURFINFO_MAXED64     = 0x20u;  // 已最大化（装饰框 = 整屏工作区）
+// ★ v0.11.3：Dock × 窗口生命周期
+//   为什么不用 collapse 承担"最小化"：collapse 是"收成 25px 标题带"（还占屏幕一行、还能拖），
+//   任务栏语义要求**整窗从屏幕摘掉**（窗口矩形逐像素回到桌面背景），点 Dock 图标才回来。
+//   状态仍在内核 surface 表（两条合成路看到同一份），Dock 项由内核在 28 号注册装饰时建立。
+static const uint32_t WL64_CTL_MIN2DOCK64      = 4;       // 30 号动作：最小化收容到 Dock（frame 高 0）
+static const uint32_t WL64_CTL_RESTORE64       = 5;       // 30 号动作：从 Dock 恢复（几何逐像素还原）
+static const uint32_t WL64_SURFINFO_MINIMIZED64 = 0x40u;  // 已最小化（内容与标题带都不合成；不可命中）
 // 合成器/内核通知客户端"窗口被关掉了"的事件类型（Ev64Event.type；与 input64.h 的 1..6 不冲突）
 static const uint32_t WL64_EV_CLOSE64           = 7u;
 // ★ v0.11.2：29 = wl_surface_title(surf, out, cap) —— 合成器要画标题栏文字，得先能读到标题。
@@ -304,6 +311,10 @@ int64_t wl64_surface_export64(uint64_t idx, uint64_t out_uptr);  // 23
 int64_t wl64_surface_map64(uint64_t surf, uint64_t out_uptr);    // 24
 int64_t wl64_surface_ack64(uint64_t surf);                       // 25
 int64_t wl64_seat_post64(uint64_t out_ev_uptr);                  // 26
+int     wl64_composer_pid64();                                   // 当前注册的合成器（0 = 没有）
+// ★ v0.11.3：Dock × 窗口生命周期 —— 当前"活动窗口"（最高 id 的、有内容且未最小化的 surface；0 = 没有）。
+//   Dock 用它给那条运行项画高亮（活动窗口切换 -> 高亮跟着换，有像素判据）。
+int     wl64_active_surface64();
 int64_t wl64_surface_move64(uint64_t surf, uint64_t xy);          // 27（★ W3 第二批）
 // 28（★ v0.11.1）：把 surface 声明成窗口 —— 装饰由合成器画（语义见上面 WL64_ABI_SURFACE_DECOR64）
 int64_t wl64_surface_set_decor64(uint64_t surf, uint64_t flags, uint64_t title_uptr);

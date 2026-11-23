@@ -19,6 +19,7 @@
 #include "fb.h"           // fb_width/fb_height/fb_surface64/fb_user_flip64（**只调用**）
 // ★ v0.11.1（第二步 wl_surface → Window）：装饰的**单一真源**在 gui64（内核窗口也用它）。
 #include "gui64.h"        // gui64_deco_frame64 / gui64_deco_edge64 / gui64_deco_h64
+#include "dock64.h"       // ★ v0.11.3：Dock × 窗口生命周期（外部窗口运行项 / 最小化收容 / 高亮）
 #include "theme64.h"      // theme64_tokens64()（标题栏底色）
 #include "gfx64.h"        // gfx64_fill_round64（标题栏不透明底色）
 #include "proc64.h"       // 进程上下文 + shm 对象的只读视图/hold/release
@@ -134,7 +135,11 @@ struct Wl64Surface {
     // ---- ★ v0.11.2：窗口控制状态（30 号改它；两条合成路都读它）----
     uint32_t collapsed;            // 1 = 折叠（只留 25px 标题带；客户区内容不合成）
     uint32_t maxed;                // 1 = 最大化（装饰框铺满整屏，客户区内容按原尺寸贴左上）
-    int32_t  pre_max_x, pre_max_y; // 最大化之前的位置（还原用）
+    int32_t  pre_max_x, pre_max_y; // 最大化之前的屏幕位置（还原用）
+    // ---- ★ v0.11.3：Dock × 窗口生命周期 ----
+    //   minimized = 1：整窗从屏幕摘掉（frame 高度 0 -> 装饰与内容都不合成、命中测试也落空），
+    //   Dock 那条运行项画"最小化横杠"；点 Dock 项走 30 号 RESTORE，几何一个像素都不动。
+    uint32_t minimized;
 };
 static Wl64Surface g_wl64_surfs[WL64_MAX_SURFACES64];
 static uint32_t    g_wl64_next_id64 = 1;
@@ -205,6 +210,7 @@ static Wl64Surface* wl64_top_of_pid64(int pid) {
     for (uint32_t i = 0; i < WL64_MAX_SURFACES64; i++) {
         const Wl64Surface* s = &g_wl64_surfs[i];
         if (!s->used || s->pid != pid) continue;
+        if (s->minimized) continue;                 // ★ v0.11.3：最小化的窗口不抢键盘焦点
         if (!best || s->id > best->id) best = &g_wl64_surfs[i];
     }
     return best;
@@ -230,6 +236,7 @@ static Wl64Surface* wl64_hit64(int x, int y) {
         Wl64Surface* s = &g_wl64_surfs[i];
         if (!s->used || !s->content) continue;
         if (!wl64_in_rect64(x, y, s->x, s->y, (int)s->w, (int)s->h)) continue;
+        if (s->minimized) continue;                 // ★ v0.11.3：收容到 Dock 的窗口不可命中/不可拖
         if (!best || s->id > best->id) best = s;
     }
     return best;
@@ -351,12 +358,14 @@ static void wl64_paint_chrome64(uint32_t* dst, int dw, int dh) {
 //      （tests/wl64_test.py 的 91 项、wm64_test 的整屏合成断言因此不受影响）。
 static const int WL64_DECO_RECTS64 = 8;
 
-// ★ v0.11.2：装饰框（窗口矩形）。三条口径：
+// ★ v0.11.2/0.11.3：装饰框（窗口矩形）。四条口径：
 //   正常  = surface 自己那个矩形（x,y,w,h）
 //   折叠  = (x, y, w, 25) —— 只留标题带；客户区内容**不合成**（内核路跳过、wm 也跳过）
-//   最大化 = (0, 0, fb_w, fb_h) —— 装饰框铺满工作区；客户区内容按**原尺寸**贴 (1, 25)，
-//            多出来的区域用主题的 client_bg 补齐（surface 尺寸是客户端定的，不缩放内容）。
+//   最大化 = (0, 0, fb_w, fb_h) —— 装饰框铺满工作区；客户区内容按比例**缩放**铺满客户区
+//            （★ v0.11.3 起；v0.11.2 是原尺寸贴左上，多出来的区域铺 client_bg）
+//   最小化 = (x, y, w, 0) —— 整窗摘掉（Dock 收容）；装饰与内容都不合成，命中测试落空
 static void wl64_frame64(const Wl64Surface* s, int* fx, int* fy, int* fw, int* fh) {
+    if (s->minimized) { *fx = s->x; *fy = s->y; *fw = (int)s->w; *fh = 0; return; }
     if (s->collapsed) { *fx = s->x; *fy = s->y; *fw = (int)s->w; *fh = (int)WL64_DECOR_H64; return; }
     if (s->maxed)     { *fx = 0; *fy = 0; *fw = fb_width(); *fh = fb_height(); return; }
     *fx = s->x; *fy = s->y; *fw = (int)s->w; *fh = (int)s->h;
@@ -479,6 +488,98 @@ static uint32_t wl64_deco_paint64(Wl64Surface* s, int vis_x, int vis_y, int vis_
 
 // 把 surface 的（已裁剪的）矩形拷进后备缓冲并提交上屏。
 // 返回实际写入的像素字节数（0 = 完全被裁掉）。
+/* ★ v0.11.3：最大化时的**缩放合成**（内容按比例铺满客户区）。
+ * 为什么要有：v0.11.2 最大化只是把装饰框铺满，内容按原尺寸贴左上，右边/下边一大片客户区底色 ——
+ *   用户看到的是"窗口变大了但画面没变"。这一版按 **fit（保持宽高比）+ 居中** 拉伸，
+ *   多余的两条边仍然是 client_bg（letterbox），不做非等比拉伸（那样圆形会变椭圆）。
+ * 两条合成路**同一把尺子**：内核这里与 user/wm/wm_blit_slot 的 maxed 分支逐式相同
+ *   （scale = min(cw*1024/sw, ch*1024/sh)；ndw = sw*scale/1024；居中 (cw-ndw)/2）。
+ * 与 1:1 路径同一条覆盖判据：逐行收集更高层 surface 的 x 区间（≤4 段），被盖住的像素不落笔。 */
+static uint32_t wl64_blit_scaled64(Wl64Surface* s, uint32_t* dst, int dw, int dh,
+                                   uint32_t deco_px, int vis_x, int vis_y, int vis_w, int vis_h) {
+    int FX = 0, FY = 0, FW = 0, FH = 0;
+    wl64_frame64(s, &FX, &FY, &FW, &FH);
+    const int cx0 = FX + 1, cy0 = FY + (int)WL64_DECOR_H64;
+    const int cw = FW - 2, ch = FH - (int)WL64_DECOR_H64 - 1;
+    const int sw = (int)s->w, sh = (int)s->h;
+    if (cw <= 2 || ch <= 2 || sw <= 0 || sh <= 0) return deco_px;
+    const int sxs = cw * 1024 / sw, sys = ch * 1024 / sh;
+    const int sc = (sxs < sys) ? sxs : sys;
+    int ndw = sw * sc / 1024, ndh = sh * sc / 1024;
+    if (ndw < 1) ndw = 1;
+    if (ndh < 1) ndh = 1;
+    const int ox = cx0 + (cw - ndw) / 2, oy = cy0 + (ch - ndh) / 2;
+    const uint32_t pitch = s->w * 4u;
+    const uint32_t id_self = s->id;
+    uint32_t written = 0;
+    int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+    for (int yy = 0; yy < ndh; yy++) {
+        const int sy = oy + yy;
+        if (sy < 0 || sy >= dh) continue;
+        if (sy < vis_y || sy >= vis_y + vis_h) continue;
+        /* 覆盖：更高层 surface（有内容）在这一行上的 x 区间 */
+        int cov[4][2], ncov = 0;
+        for (uint32_t i = 0; i < WL64_MAX_SURFACES64 && ncov < 4; i++) {
+            const Wl64Surface* h = &g_wl64_surfs[i];
+            if (!h->used || !h->content || h->id <= id_self || h->minimized) continue;
+            int hx = h->x, hy = h->y, hw = (int)h->w, hh = (int)h->h;
+            if (!wl64_rect_isect64(&hx, &hy, &hw, &hh, vis_x, vis_y, vis_w, vis_h)) continue;
+            if (sy < hy || sy >= hy + hh) continue;
+            cov[ncov][0] = hx;
+            cov[ncov][1] = hx + hw;
+            ncov++;
+        }
+        const int src_row = (yy * sh / ndh) * (int)pitch;                 /* 最近邻：行取样 */
+        uint32_t* drow = dst + (uint32_t)sy * (uint32_t)dw;
+        for (int xx = 0; xx < ndw; xx++) {
+            const int sx = ox + xx;
+            if (sx < 0 || sx >= dw) continue;
+            if (sx < vis_x || sx >= vis_x + vis_w) continue;
+            bool covered = false;
+            for (int c = 0; c < ncov; c++)
+                if (sx >= cov[c][0] && sx < cov[c][1]) { covered = true; break; }
+            if (covered) continue;
+            const int col = (xx * sw / ndw) * 4;                          /* 最近邻：列取样 */
+            drow[sx] = wl64_src_px64(s, s->shm_off + (uint32_t)src_row + (uint32_t)col);
+            if (written == 0) { bx0 = sx; by0 = sy; bx1 = sx + 1; by1 = sy + 1; }
+            else {
+                if (sx < bx0) bx0 = sx;
+                if (sy < by0) by0 = sy;
+                if (sx + 1 > bx1) bx1 = sx + 1;
+                if (sy + 1 > by1) by1 = sy + 1;
+            }
+            written += 4;
+        }
+    }
+    const uint32_t deco_px2 = wl64_deco_paint64(s, vis_x, vis_y, vis_w, vis_h, 1);
+    /* 上屏矩形 = 内容 bbox ∪ 装饰框（缩放后可能一直没落笔：比如整窗都在屏幕外） */
+    int fx0 = bx0, fy0 = by0, fx1 = bx1, fy1 = by1;
+    {
+        int wx = FX, wy = FY, ww = FW, wh = FH;
+        if (wl64_rect_isect64(&wx, &wy, &ww, &wh, vis_x, vis_y, vis_w, vis_h) &&
+            wl64_rect_isect64(&wx, &wy, &ww, &wh, 0, 0, dw, dh)) {
+            if (written == 0) { fx0 = wx; fy0 = wy; fx1 = wx + ww; fy1 = wy + wh; }
+            else {
+                if (wx < fx0) fx0 = wx;
+                if (wy < fy0) fy0 = wy;
+                if (wx + ww > fx1) fx1 = wx + ww;
+                if (wy + wh > fy1) fy1 = wy + wh;
+            }
+        }
+    }
+    if (deco_px || deco_px2 || written)
+        fb_user_flip64(fx0, fy0, fx1 - fx0, fy1 - fy0);
+    wl64_begin64();
+    wl64_puts64("[WL64] blitscale surf="); wl64_udec64(s->id);
+    wl64_puts64(" from=");  wl64_dec64(sw); wl64_puts64("x"); wl64_dec64(sh);
+    wl64_puts64(" to=");    wl64_dec64(ndw); wl64_puts64("x"); wl64_dec64(ndh);
+    wl64_puts64(" at=");    wl64_dec64(ox); wl64_puts64(","); wl64_dec64(oy);
+    wl64_puts64(" client="); wl64_dec64(cw); wl64_puts64("x"); wl64_dec64(ch);
+    wl64_puts64(" bytes="); wl64_udec64(written);
+    wl64_nl64();
+    wl64_end64();
+    return written + deco_px + deco_px2;
+}
 static uint32_t wl64_blit64(Wl64Surface* s, uint32_t* dst, int dw, int dh) {
     // ---- 1) damage 矩形（局部）----
     int rx = 0, ry = 0, rw = (int)s->w, rh = (int)s->h;
@@ -511,6 +612,12 @@ static uint32_t wl64_blit64(Wl64Surface* s, uint32_t* dst, int dw, int dh) {
     const uint32_t deco_px = deco ? wl64_deco_paint64(s, vis_x, vis_y, vis_w, vis_h, 0) : 0;
     // ★ v0.11.2：折叠状态下客户区内容一个像素都不合成（只留标题带）
     if (deco && s->collapsed) { dhr = 0; dwr = 0; }
+    // ★ v0.11.3：Dock 收容（最小化）—— 一个像素都不合成（frame 高 0 已经让装饰停手，
+    //   这里把内容 blit 也关掉；命中测试走 wl64_hit64 的 minimized 判断）。
+    if (s->minimized) { dhr = 0; dwr = 0; }
+    // ★ v0.11.3：最大化 = 内容按比例**缩放**铺满客户区（v0.11.2 只在左上贴原尺寸）。
+    if (s->maxed && deco && !s->collapsed && s->shm_id)
+        return wl64_blit_scaled64(s, dst, dw, dh, deco_px, vis_x, vis_y, vis_w, vis_h);
     // ---- 5) 逐行：再减去"更高层 surface 的可见矩形"盖住的部分 ----
     const uint32_t id_self = s->id;
     int cov[4][2];
@@ -674,6 +781,7 @@ static void wl64_free_surface64(Wl64Surface* s, const char* why) {
     wl64_nl64();
     wl64_end64();
     const int pid = s->pid;
+    dock64_ext_del64((int)s->id);            // ★ v0.11.3：窗口没了 -> Dock 那条运行项退出运行态
     s->used = 0;
     if (g_wl64_live64 > 0) g_wl64_live64--;
     // 键盘焦点指到它就清掉（下一次键盘事件会退回"本进程 id 最大的 surface"）
@@ -1039,7 +1147,8 @@ int64_t wl64_display_dispatch64(uint64_t timeout_ms, uint64_t out_uptr, uint64_t
                     title_band = true;
                     const int b = wl64_btn_hit64(hs, e->x, e->y);
                     if (b >= 0) {
-                        const uint64_t act = (b == 0) ? WL64_CTL_COLLAPSE64
+                        // ★ v0.11.3：内核路的"最小化"按钮 = 收容到 Dock（与 /bin/wm 同一条语义）
+                        const uint64_t act = (b == 0) ? WL64_CTL_MIN2DOCK64
                                            : (b == 1) ? WL64_CTL_MAX64 : WL64_CTL_CLOSE64;
                         (void)wl64_surface_ctl64(hs->id, act);   // 里面有 [WL64] ctl 打点
                     }
@@ -1192,7 +1301,8 @@ int64_t wl64_surface_export64(uint64_t idx, uint64_t out_uptr) {
                  // ★ v0.11.2：装饰/折叠/最大化状态也走 23 号导出 —— 合成器据此画装饰框与客户区
                  ((s->decor & WL64_DECOR_F_WINDOW64) ? WL64_SURFINFO_DECOR64 : 0u) |
                  (s->collapsed ? WL64_SURFINFO_COLLAPSED64 : 0u) |
-                 (s->maxed     ? WL64_SURFINFO_MAXED64     : 0u);
+                 (s->maxed     ? WL64_SURFINFO_MAXED64     : 0u) |
+                 (s->minimized ? WL64_SURFINFO_MINIMIZED64 : 0u);   // ★ v0.11.3：Dock 收容态
     // ★ v0.11.2：pad 位改作"客户区底色"（0x00RRGGBB）：最大化时装饰框比 surface 大，
     //   多出来的那块要铺成客户区底色 —— 颜色由内核（主题）给出，合成器不必自己猜主题。
     info.pad = theme64_tokens64()->client_bg & 0x00FFFFFFu;
@@ -1401,6 +1511,13 @@ int64_t wl64_surface_set_decor64(uint64_t surf, uint64_t flags, uint64_t title_u
     }
     s->deco_logged = 0;                       // 状态变了：下一次合成重新打一行 deco paint
     if (s->shm_id) s->pending = 1;            // 已 attach 过缓冲 -> 立刻重新合成一遍
+    /* ★ v0.11.3：一变成"窗口"就在 Dock 上登记一条运行项（最小化收容/点图标恢复/活动高亮
+     *   都要有它）。裸 surface（flags=0）不登记 —— 面板/时钟那些不该出现在任务栏里。 */
+    if (s->decor & WL64_DECOR_F_WINDOW64) {
+        if (dock64_ext_add64((int)s->id, s->title) == 1) dock64_ext_title64((int)s->id, s->title);
+    } else {
+        dock64_ext_del64((int)s->id);
+    }
     if (changed) {
         wl64_begin64();
         wl64_puts64("[WL64] decor id=");  wl64_udec64(s->id);
@@ -1423,15 +1540,19 @@ int64_t wl64_surface_set_decor64(uint64_t surf, uint64_t flags, uint64_t title_u
 //   3 maximize  ：最大化开关。装饰框铺满整屏，客户区内容按**原尺寸**贴 (0,25)，多出来的区域用客户区底色补
 //                 —— surface 尺寸是客户端定的，内核**不缩放**内容（如实标注，不假装能拉伸）。
 //   三个动作都会让 surface 重新入队合成（pending=1），否则要等下一次客户端提交才看得见效果。
-//   权限：拥有者 或 注册合成器。
+//   权限：拥有者 或 注册合成器 或 **内核自己**（pid <= 0）。
+//   ★ v0.11.3：内核自己这一路是为 Dock 点击开的 —— Dock 在 ring0 的画/点路径里，没有进程上下文，
+//     原来的 `pid <= 0 -> EPERM` 让"点 Dock 项恢复"永远无效（实测 [DOCK64] press action=ext-restore
+//     打了、[WL64] ctl 一行都没有）。用户态拿不到 pid<=0，越权面没有变化。
 int64_t wl64_surface_ctl64(uint64_t surf, uint64_t action) {
     const int64_t pid = wl64_pid64();
-    if (pid <= 0) return WL64_EPERM64;
+    const bool by_kernel = (pid <= 0);
     Wl64Surface* s = wl64_find64((uint32_t)surf);
     if (!s) return WL64_ENOENT64;
-    const bool owner = (s->pid == (int32_t)pid);
-    if (!owner && !wl64_is_wm64(pid)) return WL64_EPERM64;
-    if (action != WL64_CTL_CLOSE64 && action != WL64_CTL_COLLAPSE64 && action != WL64_CTL_MAX64)
+    const bool owner = (!by_kernel && s->pid == (int32_t)pid);
+    if (!by_kernel && !owner && !wl64_is_wm64(pid)) return WL64_EPERM64;
+    if (action != WL64_CTL_CLOSE64 && action != WL64_CTL_COLLAPSE64 && action != WL64_CTL_MAX64 &&
+        action != WL64_CTL_MIN2DOCK64 && action != WL64_CTL_RESTORE64)
         return WL64_EINVAL64;
 
     if (action == WL64_CTL_CLOSE64) {
@@ -1452,17 +1573,28 @@ int64_t wl64_surface_ctl64(uint64_t surf, uint64_t action) {
         wl64_begin64();
         wl64_puts64("[WL64] ctl id=");   wl64_udec64(sid);
         wl64_puts64(" pid=");            wl64_dec64(spid);
-        wl64_puts64(" action=close by="); wl64_puts64(owner ? "owner" : "composer");
+        wl64_puts64(" action=close by="); wl64_puts64(by_kernel ? "kernel" : owner ? "owner" : "composer");
         wl64_puts64(" notify=");         wl64_udec64(qv ? 1u : 0u);
         wl64_puts64(" destroyed=1");
         wl64_nl64();
         wl64_end64();
         return 0;
     }
-    if (action == WL64_CTL_COLLAPSE64) {
+    if (action == WL64_CTL_MIN2DOCK64) {
+        /* ★ v0.11.3：最小化收容到 Dock —— 整窗从屏幕摘掉（frame 高 0），几何**不动**，
+         *   所以 restore 一定逐像素回到原位（不是"重新摆一次"，是"同一个矩形再出现"）。 */
+        s->minimized = 1;
+        s->collapsed = 0;
+    } else if (action == WL64_CTL_RESTORE64) {
+        s->minimized = 0;
+        s->collapsed = 0;
+        s->maxed = 0;
+    } else if (action == WL64_CTL_COLLAPSE64) {
         s->collapsed = s->collapsed ? 0u : 1u;
         if (s->collapsed) s->maxed = 0u;            // 折叠与最大化互斥（折叠时先还原最大化状态）
+        s->minimized = 0;
     } else {                                         // WL64_CTL_MAX64
+        s->minimized = 0;
         if (!s->maxed) {
             s->pre_max_x = s->x;
             s->pre_max_y = s->y;
@@ -1478,15 +1610,32 @@ int64_t wl64_surface_ctl64(uint64_t surf, uint64_t action) {
     }
     s->deco_logged = 0;                              // 状态变了：下一次合成重打一行 deco paint
     if (s->shm_id) s->pending = 1;
+    /* ★ v0.11.3：把"最小化收容"状态同步给 Dock 运行项（横杠/圆点/胶囊的判据）。 */
+    if ((s->decor & WL64_DECOR_F_WINDOW64) && (action == WL64_CTL_MIN2DOCK64 ||
+        action == WL64_CTL_RESTORE64 || action == WL64_CTL_COLLAPSE64 || action == WL64_CTL_MAX64))
+        dock64_ext_state64((int)s->id, (int)(s->minimized ? 1 : 0));
+    /* ★ v0.11.3：内核合成路（没有 ring3 合成器）—— 最小化/恢复后必须让 GUI 把这块地重画一遍，
+     *   否则旧窗口像素会留在屏上（内核路的 blit 只负责"新内容上屏"，不做背景回填）。
+     *   有合成器时由合成器的脏矩形机制处理（它每轮从 23 号读 pending/damage）。 */
+    if (g_wl64_wm_pid64 == 0) {
+        gui64_dirty((int)s->x, (int)s->y, (int)s->w, (int)s->h);
+        int qx = 0, qy = 0, qw = 0, qh = 0;
+        wl64_frame64(s, &qx, &qy, &qw, &qh);
+        if (qw > 0 && qh > 0 && qh != (int)s->h) gui64_dirty(qx, qy, qw, qh);
+    }
     int fx = 0, fy = 0, fw = 0, fh = 0;
     wl64_frame64(s, &fx, &fy, &fw, &fh);
     wl64_begin64();
     wl64_puts64("[WL64] ctl id=");    wl64_udec64(s->id);
     wl64_puts64(" pid=");             wl64_dec64(pid);
-    wl64_puts64(" action=");          wl64_puts64((action == WL64_CTL_COLLAPSE64) ? "collapse" : "maximize");
-    wl64_puts64(" by=");              wl64_puts64(owner ? "owner" : "composer");
+    wl64_puts64(" action=");
+    wl64_puts64((action == WL64_CTL_COLLAPSE64) ? "collapse" :
+                (action == WL64_CTL_MAX64)      ? "maximize" :
+                (action == WL64_CTL_MIN2DOCK64) ? "minimize" : "restore");
+    wl64_puts64(" by=");              wl64_puts64(by_kernel ? "kernel" : owner ? "owner" : "composer");
     wl64_puts64(" collapsed=");       wl64_udec64((uint64_t)(s->collapsed ? 1 : 0));
     wl64_puts64(" maxed=");           wl64_udec64((uint64_t)(s->maxed ? 1 : 0));
+    wl64_puts64(" minimized=");       wl64_udec64((uint64_t)(s->minimized ? 1 : 0));
     wl64_puts64(" frame=");           wl64_dec64(fx); wl64_puts64(","); wl64_dec64(fy);
     wl64_puts64(",");                 wl64_dec64(fw); wl64_puts64(","); wl64_dec64(fh);
     wl64_nl64();
@@ -1517,6 +1666,17 @@ int64_t wl64_surface_title64(uint64_t surf, uint64_t out_uptr, uint64_t cap) {
 
 // 诊断：当前注册的合成器 pid（0 = 没有）
 int wl64_composer_pid64() { return g_wl64_wm_pid64; }
+// ★ v0.11.3：活动窗口 = 最高 id 的、有内容且未最小化的 surface（0 = 没有窗口）。
+//   Dock 用它给"当前活动窗口"那条运行项画高亮；窗口最小化/关闭后自动落回下一个。
+int wl64_active_surface64() {
+    uint32_t best = 0;
+    for (uint32_t i = 0; i < WL64_MAX_SURFACES64; i++) {
+        const Wl64Surface* s = &g_wl64_surfs[i];
+        if (!s->used || !s->content || s->minimized) continue;
+        if (s->id > best) best = s->id;
+    }
+    return (int)best;
+}
 // ==================== 初始化 / 标定 / 自检 ====================
 // rdtsc -> us 标定：用 PIT tick（250Hz）量一小段时间的周期数。为了不浪费启动时间只量 ~20ms。
 // 标定失败（dt=0 / tsc 不动）时 g_wl64_tsc_per_ms64 = 0 -> us 打 0（如实，不编数）。
@@ -1588,7 +1748,9 @@ int wl64_selftest64() {
         if (wl64_composer_get64(0) != WL64_EPERM64) fail |= 4;   // 没有进程上下文：不许注册成功
         if (wl64_surface_move64(1, 0) != WL64_EPERM64) fail |= 4; // ★ 27 号同样不许凭空挪窗口
         if (wl64_surface_set_decor64(1, 1, 0) != WL64_EPERM64) fail |= 4;  // ★ 28 号：不许凭空设装饰
-        if (wl64_surface_ctl64(1, 1) != WL64_EPERM64) fail |= 4;          // ★ 30 号：不许凭空关别人的窗
+        // ★ v0.11.3：权限模型变了 —— **内核上下文（pid<=0）也允许调 30 号**（Dock 点击那条路没有进程）。
+        //   所以这里没有 1 号 surface 时的正确答案是"找不到"（ENOENT），不再是"没权限"。
+        if (wl64_surface_ctl64(1, 1) != WL64_ENOENT64) fail |= 4;
     }
 
     // ---- bit3：面板/槽位几何在屏内（放得下才检查）----

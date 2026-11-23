@@ -42,16 +42,18 @@
 /* ---- 画布上限：单 surface 524288 px（kernel/wl64.h），这里留足余量 ---- */
 #define IW_MAX        760
 #define IH_MAX        520
-#define TITLE_H       20
-#define PAD           1
+/* ★ v0.11.3：查看器不再自绘标题栏 —— 走 28 号 wl_surface_set_decor，由合成器（内核路或
+ *   /lib/wm.elf）按**唯一一份规格**画 25px 标题带 + 三个真按钮（最小化/最大化/关闭）。
+ *   因此画布 = **客户区**：宽 = 显示图宽，高 = 显示图高，不再留 TITLE_H / PAD。
+ *   （上一版自绘 20px 标题栏 + 1px 边框，所以窗口比图大 2x21；这一版 +0。）*/
+#define CO_BG         0xFF14181Fu     /* 客户区底色（图片之外的留白） */
 
-/* ★ 标题栏颜色必须与 kernel/wl64.cpp 的面板底色（0xFF20242A）不同：
- *   否则「窗口真上屏」这条像素判据会量到面板自己的底色，变成假绿（实测踩过）。*/
-#define CO_FRAME      0xFF3A4658u     /* 标题栏 */
-#define CO_BORDER     0xFF55617Au     /* 1px 边框 */
-#define CO_BG         0xFF14181Fu     /* 底色（标题文字底/边框内） */
-#define CO_TEXT       0xFFE8ECF2u
-#define CO_TEXT_D     0xFF9AA6B8u
+/* 缩放：zoom = 千分比，**1000 = 适配画布**（初始态）。滚轮每格 ±125‰，上限 4000（4x）。
+ * 画布尺寸固定（surface 创建后不改），放大 = 在画布内取样一部分图像（裁剪视图），
+ * 缩小下限就是 1000 —— 不做"比适配更小"，否则四周全是底色，等于没内容。 */
+#define ZOOM_MIN      1000
+#define ZOOM_MAX      4000
+#define ZOOM_STEP     125
 
 #define FRAME_MS      50u
 #define MAX_FRAMES    3600            /* ≈ 3 分钟上限（人看够了就 ESC） */
@@ -131,53 +133,74 @@ static const char* magic_of(const unsigned char* p, int n) {
     return "unknown";
 }
 
-/* 画布 -> 内核对这块 shm 的映射（w*h*4）；一次性：整幅重画后 commit 一次。 */
-static void paint(const unsigned char* src, int iw, int ih, const char* name,
-                  const char* fmt, int dw, int dh) {
+/* ---- 缩放状态（★ v0.11.3 滚轮缩放）：zoom 千分比，g_ox/g_oy = 视图在"显示图"里的左上偏移 ---- */
+static int g_zoom = ZOOM_MIN;      /* 1000 = 适配画布 */
+static int g_ox = 0, g_oy = 0;     /* 视图偏移（显示图坐标系），<= 0 会被夹到 0 */
+
+/* 偏移夹取：显示图比画布大才允许偏移（放大后才可能 > 0） */
+static void zoom_clamp(int dw0, int dh0) {
+    const int disp_w = (int)((long long)dw0 * (long long)g_zoom / 1000);
+    const int disp_h = (int)((long long)dh0 * (long long)g_zoom / 1000);
+    const int mx = disp_w - g_w, my = disp_h - g_h;
+    if (g_ox > mx) g_ox = mx;
+    if (g_oy > my) g_oy = my;
+    if (g_ox < 0) g_ox = 0;
+    if (g_oy < 0) g_oy = 0;
+}
+
+/* 以画布内 (cx,cy) 为锚点缩放一格 dir=±1：保住"锚点下的那个图像点"不动。
+ * 整数口径：新偏移 = 锚点对应的显示图坐标 - 锚点左右位置。 */
+static void zoom_at(int dir, int cx, int cy, int iw, int ih, int dw0, int dh0) {
+    int nz = g_zoom + dir * ZOOM_STEP;
+    if (nz < ZOOM_MIN) nz = ZOOM_MIN;
+    if (nz > ZOOM_MAX) nz = ZOOM_MAX;
+    if (nz == g_zoom) return;
+    const int odw = (int)((long long)dw0 * (long long)g_zoom / 1000);
+    const int odh = (int)((long long)dh0 * (long long)g_zoom / 1000);
+    const int ndw = (int)((long long)dw0 * (long long)nz / 1000);
+    const int ndh = (int)((long long)dh0 * (long long)nz / 1000);
+    /* 锚点 -> 图像坐标 -> 新显示图坐标（除法只在 odw/odh >= 1 时发生，zoom >= 1000 恒成立） */
+    const int ix = (int)(((long long)(cx + g_ox) * (long long)iw) / (odw > 0 ? odw : 1));
+    const int iy = (int)(((long long)(cy + g_oy) * (long long)ih) / (odh > 0 ? odh : 1));
+    g_zoom = nz;
+    g_ox = (int)(((long long)ix * (long long)ndw) / (iw > 0 ? iw : 1)) - cx;
+    g_oy = (int)(((long long)iy * (long long)ndh) / (ih > 0 ? ih : 1)) - cy;
+    zoom_clamp(dw0, dh0);
+}
+
+/* 画布 -> 内核对这块 shm 的映射（w*h*4）；整幅重画，调用方随后 commit 一次。
+ * ★ v0.11.3：标题栏不在这里画（合成器画）；这里只画**客户区**（图片 + 留白底色）。 */
+static void paint(const unsigned char* src, int iw, int ih, int dw0, int dh0) {
     fill(0, 0, g_w, g_h, CO_BG);
-    fill(0, 0, g_w, TITLE_H, CO_FRAME);
-    fill(0, TITLE_H - 1, g_w, 1, CO_BORDER);
-    fill(0, 0, g_w, 1, CO_BORDER);
-    fill(0, 0, 1, g_h, CO_BORDER);
-    fill(g_w - 1, 0, 1, g_h, CO_BORDER);
-
-    /* 标题：名字（截断到放得下）+ 尺寸 + 格式 */
-    char title[128];
-    int o = 0;
-    for (int i = 0; name[i] && o < 64; i++) title[o++] = name[i];
-    title[o++] = ' ';
-    title[o++] = ' ';
-    {
-        char num[24];
-        int k = 0, v = iw;
-        char t[12];
-        int tn = 0;
-        if (v == 0) t[tn++] = '0';
-        while (v > 0) { t[tn++] = (char)('0' + v % 10); v /= 10; }
-        while (tn > 0) num[k++] = t[--tn];
-        num[k++] = 'x';
-        v = ih; tn = 0;
-        if (v == 0) t[tn++] = '0';
-        while (v > 0) { t[tn++] = (char)('0' + v % 10); v /= 10; }
-        while (tn > 0) num[k++] = t[--tn];
-        num[k] = 0;
-        for (int i = 0; num[i] && o < 100; i++) title[o++] = num[i];
-    }
-    title[o++] = ' ';
-    for (int i = 0; fmt[i] && o < 120; i++) title[o++] = fmt[i];
-    title[o] = 0;
-    text_at(6, 3, title, 11, CO_TEXT);
-
-    /* 图：最近邻缩放到 (dw, dh)。整数运算，无浮点。 */
-    for (int y = 0; y < dh; y++) {
-        const int sy = (int)(((long long)y * (long long)ih) / (long long)dh);
+    const int disp_w = (int)((long long)dw0 * (long long)g_zoom / 1000);
+    const int disp_h = (int)((long long)dh0 * (long long)g_zoom / 1000);
+    if (disp_w <= 0 || disp_h <= 0 || iw <= 0 || ih <= 0) return;
+    /* 图：最近邻取样（放大 = 裁剪视图；缩小 = 1000‰ 时的适配）。整数运算，无浮点。 */
+    for (int y = 0; y < g_h; y++) {
+        long long sy = ((long long)(y + g_oy) * (long long)ih) / (long long)disp_h;
+        if (sy >= (long long)ih) sy = (long long)ih - 1;
         const unsigned char* srow = src + (unsigned long)sy * (unsigned long)iw * 3u;
-        uint32_t* drow = g_px + (unsigned long)(TITLE_H + y) * (unsigned long)g_w + PAD;
-        for (int x = 0; x < dw; x++) {
-            const int sx = (int)(((long long)x * (long long)iw) / (long long)dw);
+        uint32_t* drow = g_px + (unsigned long)y * (unsigned long)g_w;
+        for (int x = 0; x < g_w; x++) {
+            long long sx = ((long long)(x + g_ox) * (long long)iw) / (long long)disp_w;
+            if (sx >= (long long)iw) sx = (long long)iw - 1;
             const unsigned char* p = srow + (unsigned long)sx * 3u;
             drow[x] = 0xFF000000u | ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
         }
+    }
+    /* 缩放非默认时在左上角标一个百分比（字体栈已在卷里，顺手把它用上 —— 也避免
+     * text_at 变成未使用函数；百分比是用户判断"现在几倍"的唯一线索）。 */
+    if (g_zoom != ZOOM_MIN) {
+        char z[16];
+        int k = 0, v = g_zoom / 10;
+        char t[8];
+        int tn = 0;
+        if (v == 0) t[tn++] = '0';
+        while (v > 0) { t[tn++] = (char)('0' + v % 10); v /= 10; }
+        while (tn > 0) z[k++] = t[--tn];
+        z[k++] = '%';
+        z[k] = 0;
+        text_at(4, 4, z, 11, 0xFFE8ECF2u);
     }
 }
 
@@ -262,11 +285,12 @@ int main(int argc, char** argv) {
     const unsigned char* px = vi_pixels();
     printf("[VIEWER] decode ok w=%d h=%d comp=%d\n", iw, ih, comp);
 
-    /* ---- ③ 窗口几何（按比例塞进 IW_MAX x IH_MAX）---- */
+    /* ---- ③ 窗口几何（按比例塞进 IW_MAX x IH_MAX）----
+     * ★ v0.11.3：画布 = **客户区**（标题栏由合成器画，占 25px 在画布之外），所以 +0/+0。 */
     int dw = 0, dh = 0;
     fit_sz(iw, ih, IW_MAX, IH_MAX, &dw, &dh);
-    g_w = dw + 2 * PAD;
-    g_h = dh + TITLE_H + PAD;
+    g_w = dw;
+    g_h = dh;
     const char* mode = (dw == iw && dh == ih) ? "1:1" : "fit";
     printf("[VIEWER] win w=%d h=%d img=%dx%d mode=%s\n", g_w, g_h, iw, ih, mode);
 
@@ -281,6 +305,7 @@ int main(int argc, char** argv) {
     }
 
     /* ---- ⑤ 画布 + surface ---- */
+    /* ---- ⑤ 画布 + surface + 装饰（28 号）---- */
     const unsigned bytes_needed = (unsigned)g_w * (unsigned)g_h * 4u;
     g_shm = shm_create(bytes_needed);
     g_surf = wl_surface_create(g_w, g_h, V64_WL_FORMAT_XRGB8888);
@@ -293,6 +318,37 @@ int main(int argc, char** argv) {
         VI_FAIL(6);
     }
     g_px = (uint32_t*)va;
+
+    /* ★ v0.11.3：装饰 = 合成器画（25px 标题带 + 三按钮）。标题 = 文件名 + 尺寸 + 格式，
+     *   与上一版自绘标题栏同口径（用户看到的信息不变），只是**画家换了**：
+     *   /lib/wm.elf 在跑就它画（按钮可点、真实语义走 30 号），没有合成器就内核路画。 */
+    {
+        char tt[64];
+        int k = 0;
+        const char* base = path;
+        for (int i = 0; path[i]; i++) if (path[i] == '/' || path[i] == '\\') base = path + i + 1;
+        for (int i = 0; base[i] && k < (int)sizeof(tt) - 24; i++) tt[k++] = base[i];
+        tt[k++] = ' ';
+        {
+            char num[16];
+            int m = 0, v = iw;
+            char t[12];
+            int tn = 0;
+            if (v == 0) t[tn++] = '0';
+            while (v > 0) { t[tn++] = (char)('0' + v % 10); v /= 10; }
+            while (tn > 0) num[m++] = t[--tn];
+            num[m++] = 'x';
+            v = ih; tn = 0;
+            if (v == 0) t[tn++] = '0';
+            while (v > 0) { t[tn++] = (char)('0' + v % 10); v /= 10; }
+            while (tn > 0) num[m++] = t[--tn];
+            num[m] = 0;
+            for (int i = 0; num[i] && k < (int)sizeof(tt) - 6; i++) tt[k++] = num[i];
+        }
+        tt[k] = 0;
+        const int drc = wl_surface_set_decor(g_surf, V64_WL_DECOR_WINDOW, tt);
+        printf("[VIEWER] decor rc=%d title=%s\n", drc, tt);
+    }
 
     /* ---- ⑤.5 绑定 seat：**不做这一步就一条事件也收不到** ----
      * 内核 kernel/wl64.cpp 的 seat 是"先 attach 才有 users"的模型
@@ -311,23 +367,45 @@ int main(int argc, char** argv) {
      *   图一个像素都不会出现（实测踩过：surf/map 都报成功，屏上却是空的）。*/
     const int arc = wl_surface_attach(g_surf, g_shm, 0);
     printf("[VIEWER] attach rc=%d\n", arc);
-    paint(px, iw, ih, path, magic, dw, dh);
+    paint(px, iw, ih, dw, dh);
     (void)wl_surface_damage(g_surf, 0, 0, g_w, g_h);
     (void)wl_surface_commit(g_surf);
 
-    int frame = 0, reason = 0;          /* 0 超时 / 1 esc */
+    int frame = 0, reason = 0;          /* 0 超时 / 1 esc / 2 close(合成器三按钮) */
     for (; frame < MAX_FRAMES; frame++) {
         if (frame == 0) printf("[VIEWER] frame f=%d\n", frame);
         struct Wl64SeatEvent ev[EV_MAX];
         const int got = wl_display_dispatch(FRAME_MS, ev, EV_MAX);
-        int quit = 0;
+        int quit = 0, zdir = 0, zcx = -1, zcy = -1;
         for (int i = 0; i < got; i++) {
             const struct Ev64Event* e = &ev[i].ev;
             if (e->type == V64_EV_KEY_DOWN && e->code == V64_KEY_ESC) quit = 1;
+            /* ★ v0.11.3：合成器的关闭按钮（30 号 ctl=CLOSE）先投 type=7 再销毁 surface */
+            if (e->type == V64_WL_EV_CLOSE) { reason = 2; quit = 2; }
+            /* ★ v0.11.3：滚轮缩放。dy > 0 = 向上（放大）；锚点 = 指针在客户区里的位置 */
+            if (e->type == V64_EV_WHEEL && e->dy != 0) {
+                zdir = (e->dy > 0) ? +1 : -1;
+                zcx = ev[i].sx;
+                zcy = ev[i].sy;
+            }
         }
-        if (quit) { reason = 1; break; }
+        if (quit) { if (quit == 1) reason = 1; break; }
+        if (zdir) {
+            if (zcx < 0 || zcx >= g_w) zcx = g_w / 2;
+            if (zcy < 0 || zcy >= g_h) zcy = g_h / 2;
+            const int before = g_zoom;
+            zoom_at(zdir, zcx, zcy, iw, ih, dw, dh);
+            if (g_zoom != before) {
+                printf("[VIEWER] zoom now=%d before=%d at=%d,%d off=%d,%d\n",
+                       g_zoom, before, zcx, zcy, g_ox, g_oy);
+                paint(px, iw, ih, dw, dh);
+                (void)wl_surface_damage(g_surf, 0, 0, g_w, g_h);
+                (void)wl_surface_commit(g_surf);
+            }
+        }
     }
-    printf("[VIEWER] done frames=%d reason=%s\n", frame, reason ? "esc" : "timeout");
+    printf("[VIEWER] done frames=%d reason=%s\n", frame,
+           reason == 2 ? "close" : (reason ? "esc" : "timeout"));
     (void)wl_surface_destroy(g_surf);
     (void)fflush(0);
     viewer_stop_wm();

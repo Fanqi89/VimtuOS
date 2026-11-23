@@ -261,12 +261,12 @@ static int wm_bg_restore(int x0, int y0, int x1, int y1) {
  * \u5efa\u6a21\u53e3\u5f84\u4e0e\u5185\u6838\u8def**\u9010\u9879\u5bf9\u9f50**\uff08kernel/gui64.cpp \u7684 gui64_deco_frame64 / gui64_deco_edge64\uff09\uff1a
  *   \u6807\u9898\u5e26 24 + \u4e0a\u8fb9\u6846 1 = 25 \u884c\u3001\u5706\u89d2\u534a\u5f84 14\u3001\u4e09\u6309\u94ae\u69fd 30px / \u5757 24x16\u30011px \u73bb\u7483\u8fb9\u6846\u3002
  * \u548c\u5185\u6838\u8def\u4e0d\u540c\u7684\u4e24\u5904\uff08\u5982\u5b9e\u6807\u6ce8\uff09\uff1a
- *   \u2460 \u5b57\u4f53\u7528 8x8 \u4f4d\u56fe\uff08wm_font8.h\uff09\uff0c\u5185\u6838\u7a97\u53e3\u7528 TTF \u2014\u2014 \u5b57\u5f62\u4e0d\u540c\uff0c\u5b57\u9ad8/\u4f4d\u7f6e\u4e00\u81f4\uff1b
+ *   \u2460 \u5b57\u4f53\uff1a\u2605 v0.11.3 \u8d77\u4e5f\u662f TTF \u5b57\u6a21\uff08wm_ttf.h\uff0c\u540c\u4e00\u4efd\u5b57\u5e93 em=16 \u9884\u5149\u6805\u5316\uff09\uff0c\u4e0e\u5185\u6838\u7a97\u53e3\u6807\u9898\u540c\u6e90\uff1b \u5b57\u5f62\u4e0d\u540c\uff0c\u5b57\u9ad8/\u4f4d\u7f6e\u4e00\u81f4\uff1b
  *   \u2461 \u56db\u89d2\u5706\u89d2\u7528**wm \u81ea\u5df1\u7684\u6574\u5c4f\u80cc\u666f\u5feb\u7167**\u8865\u50cf\u7d20\uff08\u5185\u6838\u8def\u662f\u6a21\u7cca\u58c1\u7eb8\u91c7\u6837\uff09\uff0c
  *      \u6240\u4ee5\u62d6\u52a8\u540e\u5706\u89d2\u91cc\u770b\u5230\u7684\u662f\u771f\u5f53\u65f6\u7684\u684c\u9762\u3002
  * \u7a97\u53e3\u72b6\u6001\uff08\u6298\u53e0/\u6700\u5927\u5316\uff09\u4e0d\u5b58\u5728\u8fd9\u91cc\uff1a\u5b83\u5c5e\u4e8e\u5185\u6838\u7684 surface \u8868\uff0823 \u53f7\u5bfc\u51fa\u7684 flags\uff09\uff0c
  * \u4e09\u6309\u94ae\u7684\u52a8\u4f5c\u8d70 30 \u53f7 wl_surface_ctl \u2014\u2014 \u8fd9\u6837\u4e24\u6761\u5408\u6210\u8def\u770b\u5230\u7684\u662f**\u540c\u4e00\u4efd\u72b6\u6001**\u3002 */
-#include "wm_font8.h"
+#include "wm_ttf.h"      /* ★ v0.11.3：TTF 字模（替代 v0.11.2 的 wm_font8.h 8x8 位图） */
 
 #define WM_DECO_R      14
 #define WM_DECO_HDR    25            /* \u6807\u9898\u680f 24 + \u4e0a\u8fb9\u6846 1\uff08= kernel \u7684 WL64_DECOR_H64\uff09 */
@@ -318,26 +318,52 @@ static void wm_corner_cut(int x, int y, int w, int h, int r) {
         }
     }
 }
-static void wm_text8(int x, int y, const char* s, uint32_t fg, int max_x) {
+/* ==================== ★ v0.11.3：标题字形 = TTF 字模（不再用 8x8 位图）====================
+ * 由来：v0.11.2 的 wm 标题用 user/wm/wm_font8.h 的 8x8 位图，而内核窗口标题用 TTF ——
+ *   同一块屏幕上两套字形，"统一装饰"就只统一到边框为止。要把 stb_truetype 直接链进 /lib/wm.elf
+ *   又塞不下（ELF64 装载窗口只有 64 KiB，font64.o 一个文件 94,800 B）。
+ * 做法：tools/wm_titlefont_win.py 用**同一份字库、同一个 em(16px)** 预光栅化 ASCII 32..126，
+ *   生成 4-bit alpha 字模（wm_ttf.h，alpha 4,718 B）。这里按字模做 alpha 混合 ——
+ *   字形来源与内核标题完全同源，字高/基线也用"最高字形顶端 = 0"对齐（见生成器注释）。
+ * 如实边界：预光栅化只有 Regular 一份、只有 ASCII；非 ASCII 字符按 8px 空白跳过。 */
+static void wm_blend(int x, int y, uint32_t fg, int a) {
+    if (a <= 0) return;
+    if (x < g_clip_x0 || x >= g_clip_x1 || y < g_clip_y0 || y >= g_clip_y1) return;
+    uint32_t* p = &wm_rowpx(y)[x];
+    if (a >= 15) { *p = fg; return; }
+    const uint32_t d = *p, ia = (uint32_t)(15 - a), aa = (uint32_t)a;
+    const uint32_t r = ((((fg >> 16) & 0xFFu) * aa + ((d >> 16) & 0xFFu) * ia) + 7u) / 15u;
+    const uint32_t g = ((((fg >> 8) & 0xFFu) * aa + ((d >> 8) & 0xFFu) * ia) + 7u) / 15u;
+    const uint32_t b = (((fg & 0xFFu) * aa + (d & 0xFFu) * ia) + 7u) / 15u;
+    *p = 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+static void wm_text_ttf(int x, int y, const char* s, uint32_t fg, int max_x) {
     if (!s) return;
     int cx = x;
     for (unsigned i = 0; s[i]; i++) {
         const unsigned char ch = (unsigned char)s[i];
-        if (ch < PL_FONT8_FIRST || ch > PL_FONT8_LAST) { cx += PL_FONT8_ADV; continue; }
-        if (cx + (int)PL_FONT8_W > max_x) return;
-        const unsigned char* g = g_pl_font8[ch - PL_FONT8_FIRST];
-        for (unsigned gy = 0; gy < PL_FONT8_H; gy++) {
-            const unsigned char bits = g[gy];
-            if (!bits) continue;
-            for (unsigned gx = 0; gx < PL_FONT8_W; gx++)
-                if (bits & (unsigned char)(0x80u >> gx)) wm_put(cx + (int)gx, y + (int)gy, fg);
+        if (ch < WM_TF_FIRST || ch > WM_TF_LAST) { cx += 8; continue; }
+        const struct WmTfGlyph* gl = &g_wm_tf[ch - WM_TF_FIRST];
+        if (gl->w && gl->h) {
+            if (cx + (int)gl->bx + (int)gl->w > max_x) return;
+            const int rowb = ((int)gl->w + 1) / 2;
+            for (int gy = 0; gy < (int)gl->h; gy++) {
+                for (int gx = 0; gx < (int)gl->w; gx++) {
+                    const unsigned char byte = g_wm_tf_alpha[(int)gl->off + gy * rowb + (gx >> 1)];
+                    const int a = (gx & 1) ? (byte & 0xF) : (byte >> 4);
+                    if (a) wm_blend(cx + (int)gl->bx + gx, y + (int)gl->by + gy, fg, a);
+                }
+            }
         }
-        cx += PL_FONT8_ADV;
+        cx += gl->adv;
     }
 }
 
 /* \u88c5\u9970\u6846\uff1a\u6b63\u5e38 = surface \u77e9\u5f62\uff1b\u6298\u53e0 = \u53ea\u7559 25px\uff1b\u6700\u5927\u5316 = \u6574\u5c4f\uff08\u4e0e\u5185\u6838 wl64_frame64 \u540c\u4e00\u628a\u5c3a\u5b50\uff09 */
 static void wm_frame(const struct WmSlot* s, int* fx, int* fy, int* fw, int* fh) {
+    if (s->info.flags & V64_WM_MINIMIZED) {         /* ★ v0.11.3：Dock 收容 = 整窗摘掉（高 0） */
+        *fx = (int)s->info.x; *fy = (int)s->info.y; *fw = (int)s->info.w; *fh = 0; return;
+    }
     if (s->info.flags & V64_WM_COLLAPSED) {
         *fx = (int)s->info.x; *fy = (int)s->info.y; *fw = (int)s->info.w; *fh = WM_DECO_HDR; return;
     }
@@ -364,7 +390,9 @@ static void wm_deco_frame(const struct WmSlot* s) {
     wm_frame(s, &fx, &fy, &fw, &fh);
     if (fw <= 0 || fh <= 0) return;
     wm_fill(fx, fy, fw, WM_DECO_HDR, WM_C_TITLE);
-    if (s->title[0]) wm_text8(fx + 8, fy + 8, s->title, WM_C_GLYPH, fx + fw - 100);
+    /* ★ v0.11.3：标题走 TTF 字模；y = fy+6 与内核 gui64_deco_frame64 的
+     *   `ty = y + BORDER + (TITLE_H-14)/2`（= +6）同一把尺子，字高 16px（em）。 */
+    if (s->title[0]) wm_text_ttf(fx + 8, fy + 6, s->title, WM_C_GLYPH, fx + fw - 100);
     const int bx = fx + fw - 1 - WM_BTN_SLOT * 3;
     const int by = fy + (WM_DECO_HDR - WM_BTN_H) / 2;
     for (int b = 0; b < 3; b++) {
@@ -379,7 +407,7 @@ static void wm_deco_frame(const struct WmSlot* s) {
             wm_fill(mx - 5, my - 5, 1, 11, WM_C_GLYPH);
             wm_fill(mx + 5, my - 5, 1, 11, WM_C_GLYPH);
         } else {
-            for (int i = -4; i <= 4; i++) {                                    /* \u5173\u95ed\uff1a\u767d\u2715 */
+            for (int i = -4; i <= 4; i++) {                                    /* 关闭：白✕ */
                 wm_put(mx + i, my + i, 0xFFFFFFFFu);
                 wm_put(mx - i, my + i, 0xFFFFFFFFu);
             }
@@ -402,6 +430,43 @@ static void wm_deco_edge(const struct WmSlot* s) {
     wm_corner_cut(fx, fy, fw, fh, WM_DECO_R);
 }
 
+/* ==================== ★ v0.11.3：指针由合成器自己画 ====================
+ * 为什么（取证见 kernel/gui64.cpp 的 draw_cursor 注释）：合成器每收到一个输入事件就把
+ * 窗口矩形重画一遍，而软件光标是后备缓冲里的一层像素 —— 谁后画谁留下。实测悬停在
+ * 图片查看器上时，`perf cur=638,398` 那个位置**一个指针像素都没有**（16x16 箭头被整块抹掉），
+ * 用户看到的就是"鼠标悬停变成一个透明窟窿"。内核那一层在合成器注册后已经停手
+ * （[GUI64] cursor skip …），这里就是指针的**唯一写者**：
+ *   * 位置来自同一个输入事件流（EV64 的 x/y 就是屏幕绝对坐标）；
+ *   * 每一帧画在**所有窗口/装饰之上**（wm_compose_rect 末尾），永远压在最上层；
+ *   * 位置变化的旧矩形 + 新矩形都并进本轮脏区，否则旧箭头会留在屏幕上。
+ * 字形与内核软件光标逐行同一份（14 行箭头 + 描边），所以指针外观不会因为
+ * "换谁画"而变化 —— 变的只是"谁后画"。 */
+#define WM_PTR_W 12
+#define WM_PTR_H 16
+static const char* const g_wm_ptr[WM_PTR_H] = {
+    "X          ", "XX         ", "X.X        ", "X..X       ", "X...X      ",
+    "X....X     ", "X.....X    ", "X......X   ", "X.......X  ", "X........X ",
+    "X.....XXXXX", "X..X..X    ", "X.X.X..X   ", "XX..X..X   ", "X....X..X  ",
+    "X.....X..X "
+};
+static int g_ptr_x = 0, g_ptr_y = 0, g_ptr_ok = 0;
+static void wm_ptr_paint(void) {
+    if (!g_ptr_ok) return;
+    for (int j = 0; j < WM_PTR_H; j++) {
+        const char* r = g_wm_ptr[j];
+        for (int i = 0; r[i]; i++) {
+            if (r[i] == ' ') break;
+            wm_put(g_ptr_x + i, g_ptr_y + j, (r[i] == 'X') ? 0xFF000000u : 0xFFFFFFFFu);
+        }
+    }
+}
+/* 指针挪到 (x,y)：旧位置与新位置的包围盒并进脏矩形（-1/+1 给描边留边） */
+static void wm_ptr_move(int x, int y, int* ox, int* oy, int* ow, int* oh) {
+    if (g_ptr_ok && g_ptr_x == x && g_ptr_y == y) return;
+    if (g_ptr_ok) wm_union(ox, oy, ow, oh, g_ptr_x - 1, g_ptr_y - 1, WM_PTR_W + 2, WM_PTR_H + 2);
+    g_ptr_x = x; g_ptr_y = y; g_ptr_ok = 1;
+    wm_union(ox, oy, ow, oh, g_ptr_x - 1, g_ptr_y - 1, WM_PTR_W + 2, WM_PTR_H + 2);
+}
 /* 用户态命中测试：最上层的、有内容的、包含 (x,y) 的 surface（与内核 hit64 同一条规则） */
 static struct WmSlot* wm_hit(struct WmSlot* slots, int x, int y) {
     struct WmSlot* best = NULL;
@@ -435,6 +500,51 @@ static void wm_place(int id, int w, int h, int* out_x, int* out_y, const char** 
 }
 
 /* 一块 surface 往脏矩形里 blit（clipped）；调用方保证**从下到上**（id 升序）调用 */
+/* ★ v0.11.3：最大化时的缩放合成（与内核 kernel/wl64.cpp 的 wl64_blit_scaled64 **逐式相同**）：
+ *   fit + 居中（letterbox）；源 pitch = si->w；仍然做 alpha 混合（与 1:1 路径同一条规则）。 */
+static int wm_blit_scaled(const struct WmSlot* self, int x0, int y0, int x1, int y1, int* blended) {
+    const struct Wm64SurfaceInfo* si = &self->info;
+    int fx, fy, fw, fh;
+    wm_frame(self, &fx, &fy, &fw, &fh);
+    const int cx0 = fx + 1, cy0 = fy + WM_DECO_HDR;
+    const int cw = fw - 2, ch = fh - WM_DECO_HDR - 1;
+    const int sw = (int)si->w, sh = (int)si->h;
+    if (cw <= 2 || ch <= 2 || sw <= 0 || sh <= 0 || !self->px) return 0;
+    const int sxs = cw * 1024 / sw, sys = ch * 1024 / sh;
+    const int sc = (sxs < sys) ? sxs : sys;
+    int ndw = sw * sc / 1024, ndh = sh * sc / 1024;
+    if (ndw < 1) ndw = 1;
+    if (ndh < 1) ndh = 1;
+    const int ox = cx0 + (cw - ndw) / 2, oy = cy0 + (ch - ndh) / 2;
+    const uint32_t* spx = (const uint32_t*)self->px;
+    const int ax0 = wm_max(ox, x0), ay0 = wm_max(oy, y0);
+    const int ax1 = wm_min(ox + ndw, x1), ay1 = wm_min(oy + ndh, y1);
+    if (ax1 <= ax0 || ay1 <= ay0) return 0;
+    int written = 0;
+    for (int sy = ay0; sy < ay1; sy++) {
+        const int src_y = (sy - oy) * sh / ndh;
+        const uint32_t* srow = spx + (unsigned long)src_y * (unsigned long)sw;
+        uint32_t* drow = (uint32_t*)((unsigned char*)g_fbpx + (unsigned long)sy * g_fb.pitch);
+        for (int sx = ax0; sx < ax1; sx++) {
+            const int src_x = (sx - ox) * sw / ndw;
+            const uint32_t v = srow[src_x];
+            const uint32_t a = (v >> 24) & 0xFFu;
+            if (a == 0xFFu) drow[sx] = v;
+            else if (a == 0u) continue;
+            else {
+                const uint32_t d = drow[sx], ia = 255u - a;
+                const uint32_t r = (((((v >> 16) & 0xFFu) * a + ((d >> 16) & 0xFFu) * ia) * 257u) + 257u) >> 16;
+                const uint32_t gg = (((((v >> 8) & 0xFFu) * a + ((d >> 8) & 0xFFu) * ia) * 257u) + 257u) >> 16;
+                const uint32_t b = ((((v & 0xFFu) * a + (d & 0xFFu) * ia) * 257u) + 257u) >> 16;
+                drow[sx] = 0xFF000000u | (r << 16) | (gg << 8) | b;
+                (*blended)++;
+            }
+            written++;
+        }
+    }
+    return written;
+}
+/* 一块 surface 往脏矩形里 blit（clipped）；调用方保证**从下到上**（id 升序）调用 */
 static int wm_blit_slot(const struct WmSlot* self, int x0, int y0, int x1, int y1, int* blended) {
     if (!self->px || !(self->info.flags & V64_WM_HASBUF)) return 0;
     const struct Wm64SurfaceInfo* si = &self->info;
@@ -444,6 +554,9 @@ static int wm_blit_slot(const struct WmSlot* self, int x0, int y0, int x1, int y
     wm_frame(self, &fx, &fy, &fw, &fh);
     const int deco = (si->flags & V64_WM_DECOR) != 0;
     if (deco && (si->flags & V64_WM_COLLAPSED)) return 0;
+    if (deco && (si->flags & V64_WM_MINIMIZED)) return 0;      // ★ v0.11.3：Dock 收容 -> 不合成
+    if (deco && (si->flags & V64_WM_MAXED))                    // ★ v0.11.3：最大化 = 缩放铺满
+        return wm_blit_scaled(self, x0, y0, x1, y1, blended);
     const int cy0 = fy + (deco ? WM_DECO_HDR : 0);
     const int chh = (int)si->h - (deco ? WM_DECO_HDR : 0);
     int ax0 = wm_max(fx, x0), ay0 = wm_max(cy0, y0);
@@ -517,6 +630,7 @@ static int wm_compose_rect(struct WmSlot* slots, int x0, int y0, int x1, int y1,
         px += wm_blit_slot(s, x0, y0, x1, y1, blended);
         if (deco) wm_deco_edge(s);
     }
+    wm_ptr_paint();          /* ★ v0.11.3：指针永远压在本帧最上层（clipped 到本矩形） */
     return px;
 }
 static int wm_paint_rect(struct WmSlot* slots, int x0, int y0, int x1, int y1, int* blended) {
@@ -795,6 +909,10 @@ int main(void) {
             }
         }
 
+        /* ★ v0.11.3：第一帧整屏重画一次 —— 内核在合成器注册后不再画指针，它留在后备缓冲里的
+         *   最后一把箭头（以及启动期没画过的桌面底色）需要一次整屏合成来清干净。
+         *   只做一次（painted_any 之后不再强制整屏），不改变帧预算的任何稳态数字。 */
+        if (!painted_any) wm_union(&dmg_x, &dmg_y, &dmg_w, &dmg_h, 0, 0, (int)g_fb.width, (int)g_fb.height);
         /* ---- ⑧ 裁剪：脏矩形 ∩ 屏幕（窗口矩形之外绝不多画一个像素）---- */
         if (dmg_w > 0 && dmg_h > 0) {
             int x0 = wm_max(dmg_x, 0), y0 = wm_max(dmg_y, 0);
@@ -892,6 +1010,12 @@ int main(void) {
                     const int is_up   = (raw[i].type == V64_EV_MOUSE_UP);
                     const int is_move = (raw[i].type == V64_EV_MOUSE_MOVE);
                     got_any = 1;
+                    /* ★ v0.11.3：指针位置跟着同一个事件流走。旧/新两个 16x16 矩形都并进
+                     *   odmg_*（否则旧箭头留在屏上、新位置又被窗口重画抹掉 —— 那正是
+                     *   "悬停变透明窟窿"的成因）。滚轮事件也带坐标，一并跟进。 */
+                    if (is_move || is_down || is_up || raw[i].type == V64_EV_WHEEL)
+                        wm_ptr_move((int)raw[i].x, (int)raw[i].y,
+                                    &odmg_x, &odmg_y, &odmg_w, &odmg_h);
 
                     int consumed = 0;
                     if (is_down && (raw[i].code & 1u)) {
@@ -902,12 +1026,14 @@ int main(void) {
                         if (hs) {
                             const int b = wm_btn_hit(hs, raw[i].x, raw[i].y);
                             if (b >= 0) {
-                                const int act = (b == 0) ? V64_WL_CTL_COLLAPSE
+                                /* ★ v0.11.3：最小化按钮 = 收容到 Dock（整窗摘掉；Dock 那条运行项
+                                 *   出现"最小化横杠"，点 Dock 项走 RESTORE 逐像素还原）。 */
+                                const int act = (b == 0) ? V64_WL_CTL_MIN2DOCK
                                               : (b == 1) ? V64_WL_CTL_MAX : V64_WL_CTL_CLOSE;
                                 const int rc = wl_surface_ctl((int)hs->info.id, act);
                                 printf("[WM] btn id=%d which=%s action=%s rc=%d\n", (int)hs->info.id,
                                        (b == 0) ? "min" : (b == 1) ? "max" : "close",
-                                       (b == 0) ? "collapse" : (b == 1) ? "maximize" : "close", rc);
+                                       (b == 0) ? "minimize" : (b == 1) ? "maximize" : "close", rc);
                                 int fx, fy, fw, fh;
                                 wm_frame(hs, &fx, &fy, &fw, &fh);
                                 wm_union(&odmg_x, &odmg_y, &odmg_w, &odmg_h, fx, fy, fw, fh);
