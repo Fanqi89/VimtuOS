@@ -85,7 +85,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.11.6"   # ★ v0.11.5：文件管理器交互收口 —— 拖拽落点扩成"桌面 / 文件夹"两种（拖进文件夹 = 同卷真移动 fs64_rename_to64，撞名/自环/只读卷一律拒绝并打点）；fileops64 判据按 v0.11.1 起的亚克力菜单与 items=5 重写 + 补"右键新建文本文件"验收
+VIMTUOS_VERSION="0.11.7"   # ★ v0.11.7：桌面 = 真实文件夹（<home>/Desktop）—— 桌面项真源 = 列目录，拖拽 = 同卷真移动，删除 = 真进 /Recycle
 #   沿用自 v0.10.2 的启动加固（仅作说明）：真机加固（UEFI 载荷按真实大小读 + 屏幕报错 + MMIO BAR>=4GiB 闸门） + 桌面帧预算（热路径打点预算 + 2 MiB 大页映射 / shm 与帧缓冲 + 60 Hz 帧节拍）
 #   根因：同一块盘上的两条命令会重叠（命令列表 slot0 / 命令表 / DMA 暂存页池 g_dma[16] 全驱动共享），
 #   后果是**静默坏读**（ELF 魔数坏读、VFS BAD block、/etc/r3drv.conf 读错）与端口互相重启，
@@ -161,6 +161,8 @@ SRCS_DESKTOP="$SRCS_DESKTOP kernel/icons64.cpp"
 #  ★ v0.11.6：kernel/trash64.cpp = 文件回收站（/Recycle + 同卷改名 + 元数据；explorer 的删除语义）。
 #   只进系统内核（安装介质没有资源管理器，也就不需要回收站）。
 SRCS_DESKTOP="$SRCS_DESKTOP kernel/trash64.cpp"
+#  ★ v0.11.7：kernel/deskdir64.cpp = 桌面 = 真实文件夹（<home>/Desktop 的列目录 / 真移动 / 真回收站）。
+SRCS_DESKTOP="$SRCS_DESKTOP kernel/deskdir64.cpp"
 #   ★ v0.7.4（P2 第三批）：sock64 = Linux socket 层（AF_INET，TCP 客户端 + UDP），只进系统内核
 SRCS_DESKTOP="$SRCS_DESKTOP kernel/sock64.cpp"
 #  ★ 本批（P5：桌面交互细节）：desktopops64（桌面右键菜单 / 玻璃选择框 / 回收站 / 桌面图标集合，
@@ -946,7 +948,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/locklogin64.o "$BUILD/os"/userdb64.o \
     "$BUILD/os"/wl64.o "$BUILD/os"/drm64.o \
     "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o "$BUILD/os"/dockmenu64.o \
-    "$BUILD/os"/icons64.o "$BUILD/os"/trash64.o \
+    "$BUILD/os"/icons64.o "$BUILD/os"/trash64.o "$BUILD/os"/deskdir64.o \
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
     "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
@@ -1030,7 +1032,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/theme64.o "$BUILD/os"/gfx64.o "$BUILD/os"/img64.o \
         "$BUILD/os"/locklogin64.o "$BUILD/os"/userdb64.o \
         "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o "$BUILD/os"/dockmenu64.o \
-        "$BUILD/os"/icons64.o "$BUILD/os"/trash64.o \
+        "$BUILD/os"/icons64.o "$BUILD/os"/trash64.o "$BUILD/os"/deskdir64.o \
         "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
         "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
         "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/cr3exp/proc64.o" \

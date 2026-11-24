@@ -80,6 +80,7 @@ uint32_t sig64_suppressed64();          // 打点预算节流统计（收尾打�
 // ---- 文件资源管理器 / 此电脑（只进系统内核；外壳 gui64 的 app_mypc_open64 转调它）----
 #include "explorer64.h"  // "此电脑"+盘内浏览：纯逻辑自检在启动期跑一次（[EXPL] selftest PASS）
 #include "trash64.h"     // ★ v0.11.6：回收站自检（[TRASH64] selftest PASS）—— 启动期跑一次 put/restore/purge 往返
+#include "deskdir64.h"    // ★ v0.11.7：桌面 = 真实文件夹——启动期跑一次纯逻辑自检（[DESKDIR] selftest PASS）
 // ★ 本批（演示程序搬进系统卷）：user_demo64.bin / user_fbdemo64.bin / user_hello.bin /
 //   user_libctest.bin / user_fbdemo.bin / evshm.elf / sig64.elf 这些**内嵌 blob 的字节已全部
 //   搬走**（构建期有"内核二进制里搜不到 64B 探针"断言）：
@@ -1257,6 +1258,7 @@ display64_init64();
             // ★ v0.11.6：先以 root 身份把 /Recycle(0777) 建好（普通用户建不了根目录），再跑往返自检
             (void)trash64_boot_ensure64(fs64_current_vol64());
             (void)trash64_selftest64();                          // ★ v0.11.6：回收站往返自检（put/list/restore/purge）
+            (void)deskdir64_selftest64();                        // ★ v0.11.7：桌面文件夹路径拼接/唯一名（不碰盘）
             (void)app64_selftest64();
 (void)app64_install_builtin64(sys_drive, sys_lba);   // 幂等：已装过则 skipped (exists)
             (void)elf64_selftest64();                            // 合法映像/坏样本自检（坏样本带 selftest 前缀）

@@ -626,6 +626,13 @@ int  vfs64_rename64(const char* old_path, const char* new_name);
  // 返回 0 = 成功；-1 = 未挂载/源不存在/目标父目录不是目录/目标已存在/名字非法/移进自己子树/写盘失败；
  // -EACCES = 权限不足（源父目录与目标父目录都要 w+x）。打点：[VFS64] rename_to ok idx=<n> old=<a> new=<b>。
  int  vfs64_rename_to64(const char* old_path, const char* new_path);
+
+// ★ v0.11.7：**变更世代号**（纯内存递增；每次写类操作 +1，读操作一个字节都不动）。
+//   用途：外壳要"实时刷新"某个真实目录（桌面 = <home>/Desktop）时，只比较这一个数字，
+//   变了才去重列目录 —— 于是帧内零 I/O 轮询、又能在终端 `touch` 之后立刻看到图标。
+//   为什么不做成"每帧 stat 目录 mtime"：帧内 I/O 会与 ring3 写者抢 VFS 大锁，
+//   ATA 一旦回退轮询，单次读可达 1 秒（v0.11.1 的 /etc/apps.json 帧内轮询就是这么把输入打死的）。
+uint32_t vfs64_mut_gen64();
  
  // ★ A4-4b：**显式设置 mtime**（utime(132) 的 times != NULL 路径）。packed_time = vfs64_pack_time64()
  // 的打包格式（必须非 0）。只要文件本身可写（w；root 恒通过），父目录要可遍历（x）。

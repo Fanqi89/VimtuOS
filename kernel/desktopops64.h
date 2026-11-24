@@ -49,11 +49,12 @@
                                      //   注意：它不写进 ui.desktop.icons 的集合字符串（那是 0..7 的
                                      //   内置项）；快捷方式的有无由注册表的 desktop 标志决定，
                                      //   位置写回注册表（跨重启持久化）。
-#define DESKOPS_KIND_FILE      9     // ★ v0.11.1：从资源管理器**拖到桌面**的文件/文件夹快捷方式。
-                                     //   与 KIND_APP 的差别：它指向**卷内的一个真实路径**（不是注册表条目），
-                                     //   名字 = 路径的 basename，双击 = 打开所在目录（explorer64）。
-                                     //   **不进** ui.desktop.icons（那个串只编码 0..7 的 kind），
-                                     //   持久化走独立文件 /etc/desktop.links（见下）。
+#define DESKOPS_KIND_FILE      9     // ★ v0.11.7：**桌面上的真实文件/文件夹** —— 真源是 <home>/Desktop 目录本身
+                                     //   （list 出来的每一条就是一个桌面项；name = basename，path = 卷内完整路径）。
+                                     //   与 KIND_APP 的差别：APP 指向注册表条目；FILE 指向卷里真实存在的条目。
+                                     //   拖到桌面 = fs64_rename_to64 真移动；删除 = trash64_put64 真进 /Recycle。
+                                     //   **不进** ui.desktop.icons（那个串只编码 0..7 的 kind）；位置写
+                                     //   /etc/desktop.links（v0.11.7 起退化成**位置缓存**，只供 x/y）。
 
 #define DESKOPS_MAX_ITEMS      16    // 桌面项上限（3 内置 + 5 文件夹 + 应用快捷方式 + 文件快捷方式）
 #define DESKOPS_RECYCLE_MAX    8     // 回收站内容上限
@@ -77,21 +78,22 @@ void desktopops64_clamp64(int x, int y);                 // 屏幕尺寸变化�
 void desktopops64_draw_icons64(int selected);            // 画全部桌面项（选中底 + 圆角正方形底板 + 位图/文件夹）
 int  desktopops64_is_recycle_hit64(int mx, int my);       // 命中"回收站"那一项
 void desktopops64_restore_defaults64(const char* why);   // 恢复默认桌面图标（设置页/终端）
-// ---- ★ v0.11.1：文件快捷方式（资源管理器 -> 桌面拖拽的落点）----
-//   存储：/etc/desktop.links（系统卷，纯文本，一行一条：`<dir>|<x>|<y>|<letter>|<path>`）。
-//   为什么不用 config64：CFG64_STR_MAX = 64 B，放不下多条路径；而这个集合是"用户放的东西"，
-//   与 ui.desktop.icons（0..7 的 kind 串）本来就是两套语义，混进同一个键会互相截断。
-//   **letter 必须存**：路径是"卷内的绝对路径"，D:（FAT 只读）上拖出来的同一个 `/a.txt`
-//   与 C: 上的是两个文件 —— 不带卷字母就等于重启后指错文件（这是设计时就钉住的）。
-//   add：落点吸附网格 + 占用避让 + **真落盘**（写失败如实返回 0 并打 rc=）；返回 1 = 真的加上了。
+// ---- ★ v0.11.7：文件项（桌面 = 真实文件夹的落点）----
+//   真源 = <home>/Desktop 的目录条目（见 kernel/deskdir64.h）；本文件只把它变成"图标项"。
+//   位置缓存：/etc/desktop.links（系统卷，纯文本，一行一条 5 段 `dir|letter|x|y|path`；
+//   4 段旧格式也认）。**只有 path 落在当前桌面目录里的行才算数**，其余计进日志的 skipped=。
+//   为什么位置还要落盘：网格吸附是"用户摆的位置"，重启后要一模一样；
+//   而"哪个条目在桌面上"不再由这个文件决定 —— 目录里有什么，桌面就有什么。
+//   add：落点吸附网格 + 占用避让 + **真移动**（同卷 rename / 跨卷复制+删源）；失败如实返回 0 并打点。
 int  desktopops64_add_file64(const char* path, int is_dir, int sx, int sy, char letter, const char* why);
-int  desktopops64_file_path64(int i, char* out, int cap);   // 第 i 项是文件快捷方式 -> 路径；否则 -1
+int  desktopops64_file_path64(int i, char* out, int cap);   // 第 i 项是文件项 -> 卷内完整路径；否则 -1
 char desktopops64_file_letter64(int i);                      // 卷字母（'A'..'Z'；非文件项 = 0）
-int  desktopops64_is_file64(int i);                          // 1 = 该项是文件快捷方式
-int  desktopops64_file_count64();                            // 当前文件快捷方式条数
-int  desktopops64_remove_file64(int i, const char* why);     // 删一条（回收站/右键删除走这里）
-void desktopops64_links_reload64(const char* why);           // 从 /etc/desktop.links 重读（自检/终端）
-const char* desktopops64_links_path64();                     // "/etc/desktop.links"（验收脚本/日志共用）
+int  desktopops64_is_file64(int i);                          // 1 = 该项是桌面上的真实文件/文件夹
+int  desktopops64_file_count64();                            // 当前文件项条数
+int  desktopops64_remove_file64(int i, const char* why);     // 真删：送进 /Recycle（右键删除走这里）
+void desktopops64_links_reload64(const char* why);           // 重读位置缓存 + 重列桌面目录（自检/终端）
+const char* desktopops64_links_path64();                     // "/etc/desktop.links"（位置缓存；验收脚本/日志共用）
+const char* desktopops64_desk_dir64();                       // 当前桌面目录（未登录退化 /home/vimtu/Desktop）
 
 // ---- 回收站 ----
 int  desktopops64_recycle_count64();

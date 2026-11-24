@@ -32,6 +32,16 @@
 #include "fd64.h"            // ★ v0.7.1（P2）：fd64_ready64（poll/select 的就绪判断）自检用
 int sock64_selftest64(void) __attribute__((weak));   // ★ v0.7.4：socket 层自检（仅系统内核提供）
 
+
+// ==================== ★ v0.11.7：变更世代号（外壳实时刷新用）====================
+// 桌面 = 真实文件夹之后，"终端里 touch 一个文件" 必须让桌面感知到。
+// 这里给每次**写类**操作一个纯内存递增计数（一次整数加法，零磁盘 I/O）：
+// 外壳每 15 tick 只比较这一个数字，变了才去重列桌面目录（desktopops64_tick64）。
+// 为什么不在帧里轮询目录/读 inode：帧内 I/O 会和 ring3 写者抢 VFS 大锁，ATA 一旦走
+// "IRQ 超时 -> 轮询"，一次读能到 1 秒（v0.11.1 的 /etc/apps.json 帧内轮询就是这么炸的）。
+static uint32_t g_mut_gen = 1;
+static void mut_bump64() { g_mut_gen++; }
+uint32_t vfs64_mut_gen64() { return g_mut_gen; }
 __attribute__((weak)) bool ata64_read (int drive, uint32_t lba, uint32_t count, void* buf);
 __attribute__((weak)) bool ata64_write(int drive, uint32_t lba, uint32_t count, const void* buf);
 
@@ -4395,6 +4405,7 @@ static void fill_new_file_ino64(uint8_t* ino, const char* nm, uint32_t nlen, uin
 int vfs64_write_stream64(const char* path, uint32_t len, Vfs64Src64 src, void* ctx) {
     Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
     if (!_vfs_io.held) return -5;
+    mut_bump64();     // ★ v0.11.7：写类操作 -> 推进变更世代号（纯内存）
     if (!g_mounted) { log_op_fail("write_stream64", "not mounted"); return -1; }
     if (!path) { log_op_fail("write_stream64", "bad args"); return -1; }
     uint32_t idx = 0, parent = 0, nlen = 0;
@@ -4467,6 +4478,7 @@ int vfs64_write(const char* path, const void* buf, int len) {
 int vfs64_write_at64(const char* path, uint32_t off, const void* buf, uint32_t len) {
     Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
     if (!_vfs_io.held) return -5;
+    mut_bump64();     // ★ v0.11.7：写类操作 -> 推进变更世代号（纯内存）
     if (!g_mounted) { log_op_fail("write_at64", "not mounted"); return -1; }
     if (!path || (!buf && len > 0)) { log_op_fail("write_at64", "bad args"); return -1; }
     uint32_t idx = 0, parent = 0, nlen = 0;
@@ -4761,6 +4773,7 @@ static bool truncate_grow64(uint8_t* ino, uint32_t idx, uint32_t new_size) {
 int vfs64_truncate64(const char* path, uint32_t len) {
     Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
     if (!_vfs_io.held) return -5;
+    mut_bump64();     // ★ v0.11.7：写类操作 -> 推进变更世代号（纯内存）
     if (!g_mounted) { log_op_fail("truncate", "not mounted"); return -1; }
     if (!path) { log_op_fail("truncate", "bad args"); return -1; }
     // 上限：与 write_at / write_stream 同一口径（v2 卷 67584，v3/v4 = 8 MiB）；**先查上限再动盘**
@@ -4822,6 +4835,7 @@ int vfs64_migrate_on64(int slot) {
 int vfs64_create64(const char* path) {
     Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
     if (!_vfs_io.held) return -5;
+    mut_bump64();     // ★ v0.11.7：写类操作 -> 推进变更世代号（纯内存）
     if (!g_mounted) { log_op_fail("create64", "not mounted"); return -1; }
     if (!path) { log_op_fail("create64", "bad args"); return -1; }
     uint32_t idx = 0;
@@ -4845,6 +4859,7 @@ int vfs64_create64(const char* path) {
 int vfs64_symlink64(const char* target, const char* linkpath) {
     Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
     if (!_vfs_io.held) return -5;
+    mut_bump64();     // ★ v0.11.7：写类操作 -> 推进变更世代号（纯内存）
     if (!g_mounted) { log_op_fail("symlink", "not mounted"); return -1; }
     if (!target || !linkpath || !target[0]) { log_op_fail("symlink", "bad args"); return -1; }
     const uint32_t tlen = alias_slen64(target);
@@ -4932,6 +4947,7 @@ int vfs64_readlink64(const char* path, char* buf, int cap) {
 int vfs64_mkdir64(const char* path) {
     Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
     if (!_vfs_io.held) return -5;
+    mut_bump64();     // ★ v0.11.7：写类操作 -> 推进变更世代号（纯内存）
     if (!g_mounted) { log_op_fail("mkdir64", "not mounted"); return -1; }
     if (!path) { log_op_fail("mkdir64", "bad args"); return -1; }
 
@@ -5043,6 +5059,7 @@ int vfs64_mkdirs_on64(int slot, const char* path) {
 int vfs64_unlink64(const char* path) {
     Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
     if (!_vfs_io.held) return -5;
+    mut_bump64();     // ★ v0.11.7：写类操作 -> 推进变更世代号（纯内存）
     if (!g_mounted) { log_op_fail("unlink64", "not mounted"); return -1; }
     if (!path) { log_op_fail("unlink64", "bad args"); return -1; }
 
@@ -5104,6 +5121,7 @@ int vfs64_unlink(const char* path) {
 int vfs64_rmdir64(const char* path) {
     Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
     if (!_vfs_io.held) return -5;
+    mut_bump64();     // ★ v0.11.7：写类操作 -> 推进变更世代号（纯内存）
     if (!g_mounted) { log_op_fail("rmdir64", "not mounted"); return -1; }
     if (!path) { log_op_fail("rmdir64", "bad args"); return -1; }
 
@@ -5155,6 +5173,7 @@ int vfs64_rmdir64(const char* path) {
 int vfs64_rename64(const char* old_path, const char* new_name) {
     Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
     if (!_vfs_io.held) return -5;
+    mut_bump64();     // ★ v0.11.7：写类操作 -> 推进变更世代号（纯内存）
     if (!g_mounted) { log_op_fail("rename64", "not mounted"); return -1; }
     if (!old_path || !new_name) { log_op_fail("rename64", "bad args"); return -1; }
 
@@ -5269,6 +5288,7 @@ int vfs64_rename64(const char* old_path, const char* new_name) {
  // 返回 0 = 成功；-1 = 未挂载/源不存在/目标父目录不存在或不是目录/目标已存在/名字非法/移进自己子树/
  // 写盘失败；-EACCES = 权限不足（两个目录都要 w+x）。
  int vfs64_rename_to64(const char* old_path, const char* new_path) {
+    mut_bump64();     // ★ v0.11.7：写类操作 -> 推进变更世代号（纯内存）
      if (!g_mounted) { log_op_fail("rename_to64", "not mounted"); return -1; }
      if (!old_path || !new_path) { log_op_fail("rename_to64", "bad args"); return -1; }
  
@@ -5423,6 +5443,7 @@ static int chmod64_common(const char* path, uint32_t mode) {
 int vfs64_chmod64(const char* path, uint32_t mode) {
     Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
     if (!_vfs_io.held) return -5;
+    mut_bump64();     // ★ v0.11.7：写类操作 -> 推进变更世代号（纯内存）
     return chmod64_common(path, mode);
 }
 
@@ -5477,6 +5498,7 @@ static int chown64_common(const char* path, uint32_t uid, uint32_t gid) {
 int vfs64_chown64(const char* path, uint32_t uid, uint32_t gid) {
     Vfs64IoSpan _vfs_io;   // v0.9.41: VFS big lock
     if (!_vfs_io.held) return -5;
+    mut_bump64();     // ★ v0.11.7：写类操作 -> 推进变更世代号（纯内存）
     return chown64_common(path, uid, gid);
 }
 

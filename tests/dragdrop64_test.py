@@ -284,9 +284,13 @@ def main():
               p is not None and p[2] == "item:1", str(p))
 
         # ==================== 阶段 3：拖到桌面空白 ====================
-        print("=== 阶段 3：按住条目 -> 拖到桌面空白 -> 松手 ===")
+        # ★ v0.11.7 判据重写：拖到桌面 = **真移动**。这里拖的是盘根的 /etc（root(0:0) 0755），
+        #   普通用户没有 w+x -> 必须被**权限正确拒绝**，而且桌面项数一个都不许变（不许再登记假快捷方式）。
+        #   正向用例（用户自己的文件真搬过去）在 tests/deskfolder64_test.py 阶段 3。
+        print("=== 阶段 3：按住 root 拥有的条目 -> 拖到桌面空白 -> 必须被拒绝 ===")
         dst = (ex.sx(ex.WIN_W + 320), ex.sy(40))     # 窗口右侧的桌面空白（y 在 Dock 之上）
         check("落点确实在窗口外（几何前置）", dst[0] > ex.WIN_X + ex.WIN_W, "dst=%s" % (dst,))
+        items_before = len(re.findall(r"\[DESK64\] item idx=\d+ kind=9 ", vm.log()))
         since = len(vm.log())
         drag_from_to(mon, src, dst)
         m_begin = wait_re(vm, r"\[UI\] explorer drag begin idx=(\d+) name=(\S+) dir=(\d+) "
@@ -294,34 +298,22 @@ def main():
         check("拖拽成立（[UI] explorer drag begin … min=8：越过阈值才拖）", m_begin is not None,
               m_begin.group(0) if m_begin else "（缺行）")
         name = m_begin.group(2) if m_begin else ""
-        dirflag = m_begin.group(3) if m_begin else ""
         m_drop = wait_re(vm, r"\[UI\] explorer drag drop path=(/\S*) dir=\d+ x=\d+ y=\d+ "
                               r"target=(\w+) ok=(\d)", 20, since)
-        check("松手落点 = 桌面（target=desktop ok=1）",
-              m_drop is not None and m_drop.group(2) == "desktop" and m_drop.group(3) == "1",
+        check("松手落点 = 桌面，但移动被拒绝（target=desktop ok=0）",
+              m_drop is not None and m_drop.group(2) == "desktop" and m_drop.group(3) == "0",
               m_drop.group(0) if m_drop else "（缺行）")
-        path = m_drop.group(1) if m_drop else ""
-        check("落点路径与拖的条目同名（path 尾 = name）",
-              bool(path) and bool(name) and path.rstrip("/").endswith("/" + name),
-              "path=%s name=%s" % (path, name))
-
-        m_add = wait_re(vm, r"\[DESK64\] file add idx=(\d+) kind=9 dir=(\d+) vol=\d+ path=(/\S*) "
-                             r"x=\d+ y=\d+ total=\d+ why=explorer-drag", 20, since)
-        check("桌面项真的追加（[DESK64] file add kind=9）", m_add is not None,
-              m_add.group(0) if m_add else "（缺行）")
-        check("追加的路径与拖拽路径一致", bool(m_add) and m_add.group(3) == path,
-              "add=%s drop=%s" % (m_add.group(3) if m_add else "-", path))
-        check("dir 标志一致（条目类型没被搞反）",
-              bool(m_add) and m_add.group(2) == dirflag,
-              "add_dir=%s drag_dir=%s" % (m_add.group(2) if m_add else "-", dirflag))
-        m_save = wait_re(vm, r"\[DESK64\] links save why=add n=(\d+) bytes=(\d+) rc=(\d+) ok=(\d)",
-                         20, since)
-        check("落到 /etc/desktop.links（links save n=1 ok=1，rc == bytes）",
-              m_save is not None and m_save.group(4) == "1"
-              and int(m_save.group(2)) == int(m_save.group(3)),
-              m_save.group(0) if m_save else "（缺行）")
-        nsnap = count(vm, r"\[DESK64\] snap idx=")
-        check("吸附/避让打点存在（[DESK64] snap idx=…）", nsnap >= 1, "snap 次数=%d" % nsnap)
+        m_mv = wait_re(vm, r"\[DESKDIR\] move in why=explorer-drag from=(/\S+) to=(\S+) vol=\d+ "
+                             r"dir=\d+ via=\w+ name=(\S+) rc=-1 ok=0 why=(\S+)", 20, since)
+        check("真移动如实失败（[DESKDIR] move in … rc=-1 ok=0 why=rename-failed）",
+              m_mv is not None and m_mv.group(4) == "rename-failed",
+              m_mv.group(0)[:130] if m_mv else "（缺行）")
+        m_add = wait_re(vm, r"\[DESK64\] file add idx=\d+ kind=9", 8, since)
+        check("桌面上**没有**新增 kind=9 项（不再登记假快捷方式）", m_add is None,
+              m_add.group(0) if m_add else "（确实没有）")
+        items_after = len(re.findall(r"\[DESK64\] item idx=\d+ kind=9 ", vm.log()))
+        check("桌面文件项计数不变", items_after == items_before,
+              "before=%d after=%d" % (items_before, items_after))
 
         # 拖完之后窗口照常收点击（没有卡在拖拽态）
         since = len(vm.log())
@@ -484,23 +476,27 @@ def main():
         vm.close()
         vm = None
 
-        # ==================== 阶段 5：同一块盘再起一次（跨重启持久化）====================
-        print("=== 阶段 5：重启同一块盘 -> 读回 /etc/desktop.links ===")
+        # ==================== 阶段 5：同一块盘再起一次 ====================
+        # ★ v0.11.7：上一阶段什么都没搬进桌面 -> /etc/desktop.links 里没有文件项，
+        #   于是重启后：① links load 行照常出现（ok 可以为 0：缓存文件根本不存在）
+        #              ② 桌面上**没有** kind=9 残留（真源=列目录，目录里没有就是没有）
+        print("=== 阶段 5：重启同一块盘 -> 桌面上不该有 kind=9 残留 ===")
         vm = Vm(qemu, disk, serial2, "Vimtu64-dragdrop2")
         mon = Mon(vm.port)
         check("第二次启动到桌面", login(vm, mon), "serial=%s" % serial2)
         m_load = wait_re(vm, r"\[DESK64\] links load why=init bytes=(\d+) n=(\d+) "
-                             r"skipped=(\d+) ok=(\d+) items=(\d+)", 25)
-        check("启动期读回 links（links load ok=1 n=1 skipped=0）",
-              m_load is not None and m_load.group(2) == "1"
-              and m_load.group(3) == "0" and m_load.group(4) == "1",
+                             r"skipped=(\d+) ok=(\d) items=(\d+)", 25)
+        check("启动期读位置缓存（[DESK64] links load why=init …）", m_load is not None,
               m_load.group(0) if m_load else "（缺行）")
-        m_item = wait_re(vm, r"\[DESK64\] item idx=(\d+) kind=9 name=(\S+) x=\d+ y=\d+", 15)
-        check("桌面上出现 kind=9 的项（重启后仍在）", m_item is not None,
-              m_item.group(0) if m_item else "（缺行）")
-        check("重启后的图标名与拖拽时的名字一致",
-              bool(m_item) and bool(name) and m_item.group(2) == name,
-              "item=%s drag=%s" % (m_item.group(2) if m_item else "-", name))
+        check("缓存里没有文件项（n=0，且 skipped=0）",
+              bool(m_load) and m_load.group(2) == "0" and m_load.group(3) == "0",
+              m_load.group(0) if m_load else "（缺行）")
+        m_dir = wait_re(vm, r"\[DESKDIR\] scan why=init \S+ entries=(\d+)", 15)
+        check("桌面目录仍是空的（[DESKDIR] scan … entries=0）",
+              bool(m_dir) and m_dir.group(1) == "0", m_dir.group(0) if m_dir else "（缺行）")
+        m_item = wait_re(vm, r"\[DESK64\] item idx=\d+ kind=9 ", 6)
+        check("桌面上没有 kind=9 残留", m_item is None,
+              m_item.group(0) if m_item else "（确实没有）")
         forbid("阶段 5 日志", vm.log())
     except Exception as e:                       # 夹具/注入失败也如实计一条红（不静默通过）
         check("测试流程没有异常中断", False, repr(e))
