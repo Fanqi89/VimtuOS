@@ -81,6 +81,7 @@ uint32_t sig64_suppressed64();          // 打点预算节流统计（收尾打�
 #include "explorer64.h"  // "此电脑"+盘内浏览：纯逻辑自检在启动期跑一次（[EXPL] selftest PASS）
 #include "trash64.h"     // ★ v0.11.6：回收站自检（[TRASH64] selftest PASS）—— 启动期跑一次 put/restore/purge 往返
 #include "deskdir64.h"    // ★ v0.11.7：桌面 = 真实文件夹——启动期跑一次纯逻辑自检（[DESKDIR] selftest PASS）
+#include "iso64.h"        // ★ v0.11.8：ring3 真隔离（CR0.WP / CR4.SMEP / 地址空间审计）
 // ★ 本批（演示程序搬进系统卷）：user_demo64.bin / user_fbdemo64.bin / user_hello.bin /
 //   user_libctest.bin / user_fbdemo.bin / evshm.elf / sig64.elf 这些**内嵌 blob 的字节已全部
 //   搬走**（构建期有"内核二进制里搜不到 64B 探针"断言）：
@@ -1259,6 +1260,7 @@ display64_init64();
             (void)trash64_boot_ensure64(fs64_current_vol64());
             (void)trash64_selftest64();                          // ★ v0.11.6：回收站往返自检（put/list/restore/purge）
             (void)deskdir64_selftest64();                        // ★ v0.11.7：桌面文件夹路径拼接/唯一名（不碰盘）
+            (void)iso64_selftest64();                             // ★ v0.11.8：隔离自检（硬件位 + 地址空间审计，6 位）
             (void)app64_selftest64();
 (void)app64_install_builtin64(sys_drive, sys_lba);   // 幂等：已装过则 skipped (exists)
             (void)elf64_selftest64();                            // 合法映像/坏样本自检（坏样本带 selftest 前缀）
@@ -1279,6 +1281,7 @@ display64_init64();
                 //   4) proc64_demo64()：建 init 进程（自己的 CR3 + 自己的任务）跑完整演示，
                 //      内核这侧只做有界等待 + 收尾。UEFI（固件页表）下会打一行诚实跳过。
                 proc64_init64();
+(void)iso64_init64();                              // ★ v0.11.8：打开 CR0.WP + CR4.SMEP（CPUID 支持才开），并如实打开始化行
                 (void)proc64_selftest64();
 (void)proc64_install_builtin64(sys_drive, sys_lba);
                 (void)proc64_demo64("/proc64.elf");
@@ -1580,6 +1583,8 @@ display64_init64();
     // ★ v0.9.2：控制台的第三段（收尾）—— 补画残留 + 打 follow/live/skip 证据行 + 冻结画面。
     //   挂接早在 os_boot_path 开头就做完了（见上面 con64_boot_screen64 的调用点）。
     con64_boot_screen_done64();
+    // ★ v0.11.8：进图形阶段之前再把 CR0.WP 补一次（启动期有路径会临时清掉，实测见 [ISO64] wp leak）
+    (void)iso64_reassert64();
     gui64_run(bi);          // 不返回：进入桌面消息循环
 }
 #endif

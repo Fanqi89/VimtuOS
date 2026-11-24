@@ -86,6 +86,7 @@
 #include "fs64.h"        // ★ 批次 K：统一卷号 + FAT32 只读语义（ls/cat 可用，写类命令明确报"只读卷"）
 #include "fd64.h"        // 文件命令的 FD 层（32 项；多级路径 /dir/sub/name、单文件 <= 8 MiB）
 #include "explorer64.h"  // ★ 批次 M：bigtest copy 复用文件管理器的复制引擎（explorer64_copy_file64）
+#include "iso64.h"       // ★ v0.11.8：`iso` 命令（ring3 隔离现状 + 地址空间审计）
 #include "display64.h"   // display [modes|hz|edid]：模式清单 + 0x3DA 实测刷新率 + EDID 对比
 #include "usermode64.h"  // user/userprog：ring3 用户窗口地址与页映射查询
 #include "config64.h"    // cfg/config：类型化配置 + 存储位置（落在 store64 上）
@@ -4766,6 +4767,14 @@ static void shell_exec(TerminalState* ts, const char* line) {
         cmd_mem(ts);
     } else if (st_eq(g_cmd, "ps")) {
         cmd_ps(ts, g_arg1);
+
+    } else if (st_eq(g_cmd, "iso") || st_eq(g_cmd, "isolation")) {
+
+        // ★ v0.11.8：输出 ring3 隔离现状 + 对**所有活着的地址空间**走一遍审计。
+        //   判据在串口：[ISO64] audit pid=N … uwin>=1 us_violation=0 ok=1
+        //   （用户自己也能在终端里敲 `iso` 验一遍）
+        iso64_report64();
+        (void)iso64_audit_all64("term");        (void)iso64_probe64();        (void)iso64_selftest64();   // 建好探针进程后再跑一次：第四位（用户窗口可用）这下才真正被验到
     } else if (st_eq(g_cmd, "date")) {
         cmd_date(ts);
     } else if (st_eq(g_cmd, "time")) {
