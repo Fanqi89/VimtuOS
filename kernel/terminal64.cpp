@@ -4663,7 +4663,9 @@ static TerminalState* g_r3_ts64 = nullptr;
 //   **低 64 KiB**（kernel/elf64.cpp 的 e64_parse_ex64 会拒掉越界段，reason=outside-user-window）。
 //   267 KiB 的 MicroPython 直接 `run` 只会得到一条装载拒绝 —— 与 /bin/lua 同一个理由。
 static const char MP64_PATH64[] = "/bin/mp";
-static bool cmd_micropython(TerminalState* ts) {
+// ★ v0.11.6：`mp <脚本>` —— 带参数时把脚本路径经 argv 传给 /bin/mp（端口侧 pyexec_file 执行它）。
+//   不带参数 = 老的 REPL（argv 只有 argv[0]，一条字节都不变）。
+static bool cmd_micropython(TerminalState* ts, const char* script) {
     if (ts->r3_pid > 0) {
         ts_puts(ts, "micropython: this terminal is already running a ring3 program\n");
         return false;
@@ -4699,7 +4701,17 @@ static bool cmd_micropython(TerminalState* ts) {
             (void)fd64_dup_into64(ct, tfd, 1);
             (void)fd64_dup_into64(ct, tfd, 2);
         }
-        if (proc64_start_elf64(pid, MP64_PATH64) == 0) {
+        // ★ v0.11.6：有脚本参数就按 argv 启动（argv[0] 必须是主程序路径；elf64 的初始栈按它摆）
+        int started = -1;
+        if (script && script[0]) {
+            const char* av[2];
+            av[0] = MP64_PATH64;
+            av[1] = script;
+            started = proc64_start_elf64_argv64(pid, MP64_PATH64, av, 2);
+        } else {
+            started = proc64_start_elf64(pid, MP64_PATH64);
+        }
+        if (started == 0) {
             rc = 0;
         } else {
             ts->r3_pid = 0;                    // 装载失败：解绑，别留一个死前台
@@ -4717,6 +4729,10 @@ static bool cmd_micropython(TerminalState* ts) {
     dbg64_str(" rc=");
     dbg64_dec((uint64_t)(rc == 0 ? 0u : 1u));
     dbg64_str(rc == 0 ? " (async; keys go to fd 0)" : " (not installed? see volume)");
+    if (script && script[0]) {
+        dbg64_str(" script=");      // ★ v0.11.6：带上脚本路径（验收据此断言"跑的是哪个文件"）
+        dbg64_str(script);
+    }
     dbg64_nl();
     dbg64_line_end64();
     if (rc != 0) {
@@ -4785,7 +4801,7 @@ static void shell_exec(TerminalState* ts, const char* line) {
         // 真：vfs64_mkdir（阶段一：父目录固定为根，单层）
         ok = cmd_mkdir(ts, g_arg1);
     } else if (st_eq(g_cmd, "micropython") || st_eq(g_cmd, "mp") || st_eq(g_cmd, "python")) {
-        ok = cmd_micropython(ts);
+        ok = cmd_micropython(ts, g_arg1);      // ★ v0.11.6：`mp <脚本>` -> /bin/mp 的 argv[1]
     } else if (st_eq(g_cmd, "df")) {
         // 真：VimtuFS2 卷几何（总块/空闲块/已用）+ 实时文件统计 + **所有卷**清单
         ok = cmd_df(ts);

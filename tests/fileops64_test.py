@@ -558,18 +558,105 @@ def main():
         ck("工具栏粘贴生效（paste ok n=1 dst=/ skipped=0）",
            vm.wait_new(r"\[UI\] explorer paste ok n=1 dst=/ skipped=0", 25, since))
 
-        # ==================== 阶段 10：删除非空目录被拒 ====================
-        print("=== 阶段 10：选中非空目录 nonempty -> Delete 两次 -> 如实被拒 ===")
+        # ==================== 阶段 10：删除非空目录 -> 进回收站（★ v0.11.6 起是真能力）====================
+        print("=== 阶段 10：选中非空目录 nonempty -> Delete 两次 -> 移入回收站 ===")
         idx_ne = last_item_idx(vm, "nonempty")
         ck("根目录能找到 nonempty", idx_ne >= 0, "idx=%d" % idx_ne)
         mouse.click(*cell(idx_ne), want_hit="item:%d" % idx_ne)
         since = vm.mark()
         mon.key("delete", wait=1.2)
         mon.key("delete", wait=1.8)
-        ck("非空目录被拒（delete path=/nonempty kind=dir rc=1 reason=not-empty）",
-           vm.wait_new(r"\[UI\] explorer delete path=/nonempty kind=dir rc=1 reason=not-empty", 25, since))
-        ck("被拒后目录还在（item name=nonempty）", last_item_idx(vm, "nonempty") >= 0)
+        # ★ v0.11.6 判据按实现重写（不是放宽）：旧判据 "delete ... rc=1 reason=not-empty" 描述的是
+        #   旧实现的边界（直接 fs64_rmdir，非空就拒）。现在删除 = 同卷改名进 /Recycle，与内容多少
+        #   无关；真正的递归删除只发生在回收站的"永久删除"上。所以这里断两条**更强**的判据：
+        #     ① 删除本身成功（rc=0，kind=dir）；② 回收站里真有一条 type=dir、orig=/nonempty 的条目。
+        ck("非空目录删除成功（delete path=/nonempty kind=dir rc=0）",
+           vm.wait_new(r"\[UI\] explorer delete path=/nonempty kind=dir rc=0", 25, since))
+        ck("真进了回收站（[TRASH64] put name=nonempty orig=/nonempty type=dir ... rc=0 meta=1）",
+           vm.wait_new(r"\[TRASH64\] put name=nonempty orig=/nonempty type=dir vol=\d+ rc=0 why=- meta=1", 20, since))
+        # 注意：不能再用 last_item_idx()（它扫整份日志 —— 删除**之前**的 item 行会让它一直返回旧下标，
+        #   本轮实测就是这样假红的）。判据改成"本次删除之后，日志里不再出现该条目的 item 行"。
+        ck("删除后根目录里没有 nonempty 了（本次删除之后不再有 name=nonempty 的 item 行）",
+           len(re.findall(r"\[UI\] explorer item idx=\d+ name=nonempty", vm.log()[since:])) == 0)
 
+        # ==================== 阶段 10.5：回收站往返（★ v0.11.6：恢复 / 永久删除 / 清空）====================
+        print("=== 阶段 10.5：进回收站视图 -> 永久删除目录（递归）/ 恢复文件 / 清空 ===")
+        # 导航窗格：节点 0 = 此电脑，1..n = 驱动器，**n+1 = 回收站**（v0.11.6 追加在最后一行，
+        # 驱动器节点号一个都没变）。行几何：y = CONTENT_Y + 30 + i*22（NAV_TOP=30 / NAV_ROW_H=22）。
+        md = re.search(r"\[UI\] explorer thispc drives=(\d+)", vm.log())
+        n_drv = int(md.group(1)) if md else 2
+        nav_i = n_drv + 1
+        trash_y = sy(CONTENT_Y + 30 + nav_i * 22 + 11)
+        since = vm.mark()
+        mouse.click(sx(75), trash_y, want_hit="nav:%d" % nav_i)
+        ck("进回收站视图（[TRASH64] view open ... path=/Recycle）",
+           vm.wait_new(r"\[TRASH64\] view open vol=\d+ items=\d+ path=/Recycle", 25, since))
+        ck("回收站里列得出刚删掉的 nonempty（item name=nonempty type=dir）",
+           vm.wait_new(r"\[UI\] explorer item idx=\d+ name=nonempty type=dir", 20, since))
+
+        # ---- ① 永久删除目录：真正有界递归（nonempty 里的 inner.txt 一起删掉）----
+        idx_ne2 = last_item_idx(vm, "nonempty")
+        ck("回收站里定位到 nonempty 条目", idx_ne2 >= 0, "idx=%d" % idx_ne2)
+        if idx_ne2 >= 0:
+            mouse.click(*cell(idx_ne2), want_hit="item:%d" % idx_ne2)
+        since = vm.mark()
+        mon.key("delete", wait=1.2)
+        ck("回收站里第一次 Delete 只提示（delete confirm n=1 path=nonempty (permanent)）",
+           vm.wait_new(r"\[UI\] explorer delete confirm n=1 path=nonempty \(permanent\)", 20, since))
+        mon.key("delete", wait=1.8)
+        ck("永久删除目录 = 真递归（purge name=nonempty type=dir files=1 dirs=1 rc=0）",
+           vm.wait_new(r"\[TRASH64\] purge name=nonempty type=dir files=1 dirs=1 rc=0 why=-", 25, since))
+        ck("目录条目已从回收站消失（本次删除之后不再有 name=nonempty 的 item 行）",
+           len(re.findall(r"\[UI\] explorer item idx=\d+ name=nonempty", vm.log()[since:])) == 0)
+
+        # ---- ② 恢复文件：renamed(2).txt 要原样搬回 /docs/renamed(2).txt ----
+        idx_r2 = last_item_idx(vm, "renamed(2).txt")
+        ck("回收站里还有阶段 7 删进来的 renamed(2).txt", idx_r2 >= 0, "idx=%d" % idx_r2)
+        if idx_r2 >= 0:
+            mouse.click(*cell(idx_r2), want_hit="item:%d" % idx_r2)
+        since = vm.mark()
+        p = mouse.click(*tb_center(0), want_hit="btn:mkdir")   # 回收站视图里 0 号按钮 = 恢复
+        ck("点工具栏'恢复'（hit=btn:mkdir —— 同一坐标，语义换成恢复）", p is not None and p[2] == "btn:mkdir", str(p))
+        ck("恢复成功（[TRASH64] restore name=renamed(2).txt to=/docs/renamed(2).txt rc=0）",
+           vm.wait_new(r"\[TRASH64\] restore name=renamed\(2\)\.txt to=/docs/renamed\(2\)\.txt rc=0 why=-", 25, since))
+
+        # ---- ③ 清空回收站：工具栏 3 号按钮（回收站视图里 = 清空），两次确认 ----
+        #   为什么改用工具栏而不是右键菜单：菜单二次点击时上一次的菜单已经关掉，再"右键 + 点同一坐标"
+        #   要依赖菜单有没有真的重新打开（本轮实测两次都只打 'empty ask'，清空没执行）；
+        #   工具栏坐标是固定几何（tb_center），而且它和菜单走的是**同一个** exp_trash_empty_request()。
+        since = vm.mark()
+        p = mouse.click(*tb_center(2), want_hit="btn:cut")
+        ck("点工具栏'清空'（hit=btn:cut —— 同坐标，语义换成清空）", p is not None and p[2] == "btn:cut", str(p))
+        ck("清空先要二次确认（[TRASH64] empty ask items=N confirm=1）",
+           vm.wait_new(r"\[TRASH64\] empty ask items=\d+ confirm=1", 20, since))
+        since = vm.mark()
+        # ★ 第二次点击**不再移动鼠标**（`mouse.click` 会先 blind_goto 逐像素挪过去，实测这一步能吃掉
+        #   十几秒 —— 10 秒的确认窗口就是在这里过期的，症状正是"两次都只打 empty ask，清空没执行"）。
+        #   光标此刻已经停在按钮上，直接点一下即可（与用户的手感也更像：同一点连点两下）。
+        exp.single_click_at(mon)
+        ck("第二次点'清空'（鼠标不动，原地再点一次）",
+           vm.wait_new(r"\[TRASH64\] empty n=\d+ files=\d+ dirs=\d+ rc=0 why=-", 25, since) or
+           vm.wait_new(r"\[TRASH64\] empty ask items=\d+ confirm=1", 10, since),
+           repr(vm.log()[since:][-160:]))
+        ck("清空真的执行（[TRASH64] empty n=N files=N dirs=N rc=0）",
+           vm.wait_new(r"\[TRASH64\] empty n=\d+ files=\d+ dirs=\d+ rc=0 why=-", 25, since))
+        ck("回收站已空（nav path=/Recycle items=0）",
+           vm.wait_new(r"\[UI\] explorer nav path=/Recycle items=0", 20, since))
+
+        # ---- ④ 收尾：回 /docs 确认"恢复"是真的把文件搬回了原位（不是只改了内存）----
+        since = vm.mark()
+        mouse.click(sx(75), sy(40), want_hit="btn:up")
+        vm.wait_new(r"\[UI\] explorer up path=/", 20, since)
+        idx_docs2 = last_item_idx(vm, "docs")
+        if idx_docs2 >= 0:
+            mouse.dclick_until(*cell(idx_docs2),
+                               r"\[UI\] explorer nav path=/docs items=1 view=\w+", timeout=20)
+        ck("恢复的文件真的回到 /docs（nav path=/docs items=1）", vm.wait_nav("/docs", 1, 20, since))
+        # ★ 阶段 11 假定当前在**盘根**（它点空白 -> 新建文件夹 -> 断言 mkdir path=/newdir），
+        #   所以这里必须退回盘根 —— 否则 mkdir 落在 /docs 里，后面两条判据就成了假红（本轮实测踩到）。
+        since = vm.mark()
+        mouse.click(sx(75), sy(40), want_hit="btn:up")
+        ck("退回盘根再进阶段 11（up path=/）", vm.wait_new(r"\[UI\] explorer up path=/", 20, since))
         # ==================== 阶段 11：新建文件夹 ====================
         print("=== 阶段 11：右键空白 -> 新建文件夹 -> 内联编辑 newdir -> 双击进入 ===")
         since = vm.mark()

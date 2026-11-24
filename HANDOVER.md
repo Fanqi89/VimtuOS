@@ -10,15 +10,16 @@
 
 | 文件 | 日期 | 版本串 | HEAD | 一句话 |
 |---|---|---|---|---|
-| [HANDOVER_v0115_ready.md](HANDOVER_v0115_ready.md) | 2026-11-24 | 0.11.5（**已发版**） | `2044d59d` | **本轮封存单**：v0.11.5 发布状态（tag `265c8e0a…` / Release `456278688` / ISO+IMG sha256 / 旧版 v0.11.3 附件逐条未动）+ 23 条剩余边界（删除不进回收站、非空目录不能删、拖拽只同卷、最大化最近邻、Dock 上限 8、系统图标无 48px 档、全量清扫未跑完…）+ 8 条新坑（原始区硬预算、亚克力判据、前台窗口、多提交 API 回放、tag message 结尾换行） |
-| [HANDOVER_v0115_explorer_ops.md](HANDOVER_v0115_explorer_ops.md) | 2026-11-23 | 0.11.5（**未发版**） | `65e0b0bd` | 功能单：**拖拽进文件夹 = 真移动**（fs64_rename_to64；撞名/自环/只读卷一律拒绝并打点 `[UI] explorer drag move`）+ `fileops64_test` 三条过期判据按 v0.11.1 起的亚克力菜单重写 + 补"右键新建文本文件"验收 |
-| [HANDOVER_v0114_cjk_icon.md](HANDOVER_v0114_cjk_icon.md) | 2026-11-23 | 0.11.4（**未发版**） | `e3ed8078` | 功能单：**中文标题**（31 号内核光栅化覆盖率位图给 Ring 3 合成器，`ink` 打点）+ **真图标**（32 号应用身份 / 33 号图标 RGBA；窗口标题栏 + Dock 运行项）+ 资源管理器地址栏三按钮换图标包 chevron（kind 21/74）；两条先红后绿的如实定性（Dock 回弹窄竞态 / `system.img` 被测试写脏的 `reduce_motion=1`） |
-| [HANDOVER_v0113_ready.md](HANDOVER_v0113_ready.md) | 2026-11-23 | 0.11.3（**已发版**） | `40208a45` | **本轮封存单**：v0.11.3 发布状态（tag `d2968c83…` / Release `455130600` / ISO+IMG sha256 / 旧版未动）+ 17 条剩余边界（ASCII 标题、Dock 上限 8、最近邻缩放…）+ 全量清扫挂起说明 |
-| [HANDOVER_v0113_viewer_dock.md](HANDOVER_v0113_viewer_dock.md) | 2026-11-23 | 0.11.3（**已发版**） | `40208a45` | 功能单：查看器三毒瘤（悬停指针窟窿=两个写者 / 自绘标题栏退场换 28 号装饰三按钮 / 滚轮缩放）+ 指针唯一写者 + 最大化按比例缩放 + Dock × 窗口生命周期（30 号 ctl 4/5 + 外部窗口表 + 活动胶囊）+ WM 标题 TTF 字模 |
-| [HANDOVER_v0112_ready.md](HANDOVER_v0112_ready.md) | 2026-11-23 | 0.11.2（**已发版**） | `c9b43717` | **本轮封存单**：v0.11.2 发布状态（统一装饰/三按钮真语义/拖拽持久化）+ 三条遗留边界 + 下一轮 = Dock × 窗口生命周期 + 布局弹性评估 + 全量清扫进度 |
-| [HANDOVER_v0112_wmdeco.md](HANDOVER_v0112_wmdeco.md) | 2026-11-23 | 0.11.2（**已发版**） | `34974344` | Ring 3 合成器（/bin/wm）也接管装饰 + 三按钮真实语义（29/30 号）；跨层拖拽/explorer 遗留项复跑确认 |
-| [HANDOVER_v0111_wlsurfwin.md](HANDOVER_v0111_wlsurfwin.md) | 2026-11-22 | 0.11.1（**已发版**） | `94406e93` | 第二步 wl_surface→Window（28 号 set_decor，装饰归合成器）落地 + 跨层拖拽；v0.11.1 已打 tag、已建 Release（ISO+IMG） |
-| [HANDOVER_v0111_dragdrop.md](HANDOVER_v0111_dragdrop.md) | 2026-11-22 | 0.11.0（WIP，未 bump） | `113d37c6` | 跨层拖拽（explorer→桌面）落地并通过验收；PE 窗口统一装饰未做，未发版 |
+| [HANDOVER_v0116_recycle_micropython.md](docs/handover/HANDOVER_v0116_recycle_micropython.md) | 2026-11-25 | 0.11.6（**未发版**） | 工作区未提交 | **回收站**（`/Recycle`：删除=同卷改名进站、恢复、永久删除有界递归、清空；explorer 导航窗格/工具栏/右键菜单按视图换语义）+ **MicroPython 跑脚本**（`/mpy/calc.py`、`snake.py`，端口 `argc>1 → pyexec_file`）+ **程序窗口顶部两角 90° 弧**（`gfx64_glass_top64` / `corner_cut_mask`，系统栏不动）。脚本 E2E **未通过**（参数没进内核命令行），如实记在 §2；桌面=真实文件夹、开始菜单时间块色差未做 |
+| [HANDOVER_v0115_ready.md](docs/handover/HANDOVER_v0115_ready.md) | 2026-11-24 | 0.11.5（**已发版**） | `2044d59d` | **本轮封存单**：v0.11.5 发布状态（tag `265c8e0a…` / Release `456278688` / ISO+IMG sha256 / 旧版 v0.11.3 附件逐条未动）+ 23 条剩余边界（删除不进回收站、非空目录不能删、拖拽只同卷、最大化最近邻、Dock 上限 8、系统图标无 48px 档、全量清扫未跑完…）+ 8 条新坑（原始区硬预算、亚克力判据、前台窗口、多提交 API 回放、tag message 结尾换行） |
+| [HANDOVER_v0115_explorer_ops.md](docs/handover/HANDOVER_v0115_explorer_ops.md) | 2026-11-23 | 0.11.5（**未发版**） | `65e0b0bd` | 功能单：**拖拽进文件夹 = 真移动**（fs64_rename_to64；撞名/自环/只读卷一律拒绝并打点 `[UI] explorer drag move`）+ `fileops64_test` 三条过期判据按 v0.11.1 起的亚克力菜单重写 + 补"右键新建文本文件"验收 |
+| [HANDOVER_v0114_cjk_icon.md](docs/handover/HANDOVER_v0114_cjk_icon.md) | 2026-11-23 | 0.11.4（**未发版**） | `e3ed8078` | 功能单：**中文标题**（31 号内核光栅化覆盖率位图给 Ring 3 合成器，`ink` 打点）+ **真图标**（32 号应用身份 / 33 号图标 RGBA；窗口标题栏 + Dock 运行项）+ 资源管理器地址栏三按钮换图标包 chevron（kind 21/74）；两条先红后绿的如实定性（Dock 回弹窄竞态 / `system.img` 被测试写脏的 `reduce_motion=1`） |
+| [HANDOVER_v0113_ready.md](docs/handover/HANDOVER_v0113_ready.md) | 2026-11-23 | 0.11.3（**已发版**） | `40208a45` | **本轮封存单**：v0.11.3 发布状态（tag `d2968c83…` / Release `455130600` / ISO+IMG sha256 / 旧版未动）+ 17 条剩余边界（ASCII 标题、Dock 上限 8、最近邻缩放…）+ 全量清扫挂起说明 |
+| [HANDOVER_v0113_viewer_dock.md](docs/handover/HANDOVER_v0113_viewer_dock.md) | 2026-11-23 | 0.11.3（**已发版**） | `40208a45` | 功能单：查看器三毒瘤（悬停指针窟窿=两个写者 / 自绘标题栏退场换 28 号装饰三按钮 / 滚轮缩放）+ 指针唯一写者 + 最大化按比例缩放 + Dock × 窗口生命周期（30 号 ctl 4/5 + 外部窗口表 + 活动胶囊）+ WM 标题 TTF 字模 |
+| [HANDOVER_v0112_ready.md](docs/handover/HANDOVER_v0112_ready.md) | 2026-11-23 | 0.11.2（**已发版**） | `c9b43717` | **本轮封存单**：v0.11.2 发布状态（统一装饰/三按钮真语义/拖拽持久化）+ 三条遗留边界 + 下一轮 = Dock × 窗口生命周期 + 布局弹性评估 + 全量清扫进度 |
+| [HANDOVER_v0112_wmdeco.md](docs/handover/HANDOVER_v0112_wmdeco.md) | 2026-11-23 | 0.11.2（**已发版**） | `34974344` | Ring 3 合成器（/bin/wm）也接管装饰 + 三按钮真实语义（29/30 号）；跨层拖拽/explorer 遗留项复跑确认 |
+| [HANDOVER_v0111_wlsurfwin.md](docs/handover/HANDOVER_v0111_wlsurfwin.md) | 2026-11-22 | 0.11.1（**已发版**） | `94406e93` | 第二步 wl_surface→Window（28 号 set_decor，装饰归合成器）落地 + 跨层拖拽；v0.11.1 已打 tag、已建 Release（ISO+IMG） |
+| [HANDOVER_v0111_dragdrop.md](docs/handover/HANDOVER_v0111_dragdrop.md) | 2026-11-22 | 0.11.0（WIP，未 bump） | `113d37c6` | 跨层拖拽（explorer→桌面）落地并通过验收；PE 窗口统一装饰未做，未发版 |
 
 
 > 新单只**追加**到本表顶部；旧单永不覆盖、永不删除（审计链）。

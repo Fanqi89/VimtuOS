@@ -66,6 +66,13 @@ void gfx64_shadow64(int x, int y, int w, int h, int r, const Theme64Tokens* t);
 // 毛玻璃(亚克力)面板：layer 0 = 背景层（预模糊壁纸，r=Token 24）/ 1 = 内容层（按需模糊缓存，r=Token 12）
 void gfx64_glass64(int x, int y, int w, int h, int r, int layer, uint32_t tint, int alpha,
                    uint32_t border_color, int border_alpha, const Theme64Tokens* t);
+// ★ v0.11.6：**只有上面两角是 90° 弧**的标题带玻璃（底部两角直角；r 不夹到 h/2）。
+//   全系统的程序窗口标题栏都走它 —— 一处改动对所有窗口生效（用户点名的"半圆端帽"bug）。
+void gfx64_glass_top64(int x, int y, int w, int h, int r, int layer, uint32_t tint, int alpha,
+                       const Theme64Tokens* t);
+// ★ v0.11.6：按位选角的圆角裁切（bit0 左上 / bit1 右上 / bit2 左下 / bit3 右下）。
+//   程序窗口用 mask=0b0011（只切上面两角，底边保持全宽直线）；系统栏（Dock/任务栏）不调用它。
+void gfx64_corner_cut_mask64(int x, int y, int w, int h, int r, int mask, int layer);
 const uint32_t* gfx64_wall_surface64(int* w, int* h);   // 铺好的整屏壁纸面（只读）
 const uint32_t* gfx64_wall_blur64(int* w, int* h);
 

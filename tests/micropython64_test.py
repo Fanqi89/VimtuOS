@@ -315,7 +315,43 @@ def main():
         check("⑥b 退出后键盘回到内核 shell（再敲 help 有响应）", ok_back,
               repr(vm.log()[base:][-160:]))
 
-        # ---------- ⑦ 全程无 PANIC ----------
+        # ---------- ⑦ ★ v0.11.6：跑一个**脚本文件**（高级语言生态的最小闭环）----------
+        # 判据（缺一条都不算过）：
+        #   ① 内核把脚本路径当 argv 交给 /bin/mp（`script=` 打点 **与** 驱动侧 `argc=2` 都要求）；
+        #   ② 脚本真的被执行：终端出现 calc.py 的标题行 `(MicroPython)`（= 从 VimtuFS2 读进来 +
+        #      UTF-8 中文词法/编译/求值 + 打印，整条链通）；
+        #   ③ 交互可用：敲 `7*6` 回车 -> 终端出现 `7*6 = 42`；
+        #   ④ 敲 `q` 退出 -> 前台解绑、键盘回到内核 shell。
+        # 为什么要重试：终端是行缓冲 + 内核行编辑，注入太快会丢键（本轮实测有过"只到了 mp"）。
+        ok_script = ok_head = ok_calc = ok_quit = False
+        for _try in range(3):
+            base = len(vm.log())
+            type_line(mon, "mp /mpy/calc.py")
+            time.sleep(2.6)
+            seg = vm.log()[base:]
+            if ("script=/mpy/calc.py" in seg) and ("[MPDRV] start path=/bin/mp argc=2" in seg):
+                ok_script = True
+            if "(MicroPython)" in seg:
+                ok_head = True
+            if ok_script and ok_head:
+                break
+        check("⑦ 内核把脚本路径当 argv 传给 /bin/mp（script=/mpy/calc.py + MPDRV argc=2）", ok_script,
+              repr(vm.log()[-220:]))
+        check("⑦b 脚本真的被执行（终端出现 calc.py 的 `(MicroPython)` 标题行）", ok_head)
+
+        base = len(vm.log())
+        type_line(mon, "7*6")
+        ok_calc = qh.wait_mark(vm.log, "7*6 = 42", 30, vm.proc)
+        check("⑦c 交互输入求出结果（7*6 = 42）", ok_calc, repr(vm.log()[base:][-220:]))
+
+        base = len(vm.log())
+        type_line(mon, "q")
+        ok_quit = qh.wait_mark(vm.log, "[TERM] ring3 front exit pid=", 30, vm.proc)
+        check("⑦d 脚本 q 退出（前台解绑 [TERM] ring3 front exit）", ok_quit)
+        base = len(vm.log())
+        type_line(mon, "df")
+        check("⑦e 退出后键盘回到内核 shell（df 有响应）",
+              qh.wait_mark(vm.log, "[TERM] cmd df", 25, vm.proc), repr(vm.log()[base:][-160:]))
         full = vm.log()
         hit = [w for w in FORBIDDEN if w in full]
         check("⑦ 全程无 PANIC / BSOD / selftest FAIL", not hit, str(hit))

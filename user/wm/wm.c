@@ -298,11 +298,15 @@ static void wm_fill(int x, int y, int w, int h, uint32_t c) {
         for (int i = x0; i < x1; i++) r[i] = c;
     }
 }
-/* \u56db\u89d2\u5706\u89d2\u88c1\u5207\uff1a\u628a\u5706\u89d2\u5916\u7684\u50cf\u7d20\u6362\u56de**\u80cc\u666f\u5feb\u7167**\u91cc\u7684\u771f\u50cf\u7d20 */
-static void wm_corner_cut(int x, int y, int w, int h, int r) {
+/* 圆角裁切（按位选角）：mask bit0 左上 / bit1 右上 / bit2 左下 / bit3 右下。
+ * ★ v0.11.6：**程序窗口只切上面两角**（mask=0x3）—— 用户点名的规范原文是"左上右上为 90 度弧、
+ *   底边保持全宽直线"。旧版切四角 + WM_DECO_R=14（比标题栏半高 12.5 还大）→ 左右看着像半圆端帽。
+ *   系统栏（Dock/任务栏）不走这个函数，所以它们的形状一个像素都没动。 */
+static void wm_corner_cut_mask(int x, int y, int w, int h, int r, int mask) {
     if (r <= 0 || w <= 2 * r || h <= 2 * r) return;
     const int r2 = r * r;
     for (int k = 0; k < 4; k++) {
+        if (!(mask & (1 << k))) continue;
         const int ox = (k & 1) ? (x + w - r) : x;
         const int oy = (k & 2) ? (y + h - r) : y;
         for (int j = 0; j < r; j++) {
@@ -517,7 +521,8 @@ static void wm_deco_edge(const struct WmSlot* s) {
     wm_fill(fx, fy + fh - 1, fw, 1, WM_C_BORDER);
     wm_fill(fx, fy, 1, fh, WM_C_BORDER);
     wm_fill(fx + fw - 1, fy, 1, fh, WM_C_BORDER);
-    wm_corner_cut(fx, fy, fw, fh, WM_DECO_R);
+    /* ★ v0.11.6：程序窗口**只切上面两角**（mask=0x3）—— 底边保持全宽直线（用户规范原文）。 */
+    wm_corner_cut_mask(fx, fy, fw, fh, WM_DECO_R, 0x3);
 }
 
 /* ==================== ★ v0.11.3：指针由合成器自己画 ====================

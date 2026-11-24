@@ -2764,7 +2764,9 @@ void gui64_deco_frame64(int x, int y, int w, int h, const char* title, int activ
     // 2) 标题栏玻璃：**只铺标题栏那条**（内容层区域模糊 r=12；整窗面积铺会把每帧开销拉到卡住
     //    看门狗的程度 —— 实测 7 个窗口时 5s 超时 PANIC）。
     const uint32_t tb = active ? t->title_bg : t->title_bg_ina;
-    gfx64_glass64(x, y, w, DECO_H + 2, THEME64_R_WINDOW, 1, tb, THEME64_A_TITLE, 0, 0, t);
+    // ★ v0.11.6：改用"只有上面两角是弧"的版本 —— 旧调用（四角圆角）会把 r 夹到 h/2，
+    //   标题带左右各成一个 180° 半圆端帽（用户点名的渲染 bug）。语义不变：还是一整条玻璃。
+    gfx64_glass_top64(x, y, w, DECO_H + 2, THEME64_R_WINDOW, 1, tb, THEME64_A_TITLE, t);
     // 3) 应用图标（★ v0.11.4）：图标包 kind > 0 才画；画成了标题文字才右移。
     //    槽位与 wm.c 的 wm_deco_frame 逐像素同一把尺子：图标 16x16 @ (x+6, y+BORDER+4)，
     //    文字左边界 = x+26。没图标时文字仍在 x+8（老口径，验收判据不变）。
@@ -2784,7 +2786,8 @@ void gui64_deco_edge64(int x, int y, int w, int h) {
     // 1) 整窗 1px 玻璃边框（1px 半透明白/黑 = 玻璃厚度与高光边缘）
     gfx64_stroke_round64(x, y, w, h, THEME64_R_WINDOW, t->win_frame, THEME64_A_BORDER);
     // 2) 圆角裁切：客户区是方形，把 4 个角"圆角外"的像素用模糊壁纸采样补回（= 玻璃圆角）
-    gfx64_corner_cut64(x, y, w, h, THEME64_R_WINDOW, 0);
+    // ★ v0.11.6：**只切上面两角**（mask=0b0011）—— 底边保持全宽直线（用户点名的规范原文）。
+    gfx64_corner_cut_mask64(x, y, w, h, THEME64_R_WINDOW, 0x3, 0);
 }
 // 装饰占掉的高度（标题栏 24 + 上边框 1）：客户区内容从这一行往下才有意义。
 int gui64_deco_h64() { return DECO_H; }

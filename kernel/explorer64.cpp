@@ -42,6 +42,7 @@
 #include "proc64.h"     // ★ v0.10.5：文件关联路由要**后台拉起** ring3 程序（proc64_start_elf64_argv64）
 #include "desktopops64.h"   // ★ v0.11.1：拖到桌面的落点（desktopops64_add_file64）
 #include "icons64.h"   // ★ v0.11.4：地址栏三按钮换成图标包里的 chevron 真图标（回落像素三角）
+#include "trash64.h"   // ★ v0.11.6：删除 = 移入 /Recycle（回收站）；恢复 / 永久删除 / 清空都在这一层
 
 // ==================== 几何常量（与脚本共享，勿乱改）====================
 #define EXP_WIN_X 120
@@ -205,6 +206,8 @@ static int exp_card_w64(void) {                          // 驱动器卡片宽�
 static Window* g_prev_win = nullptr;
 
 static int  g_mode = 0;
+// ★ v0.11.6：回收站视图标志（= 当前路径就是 /Recycle）。每帧不重算，只在 exp_refresh_dir 里更新一次。
+static int  g_trash = 0;
 static char g_path[VFS64_PATH_MAX] = "/";
 static char g_letter = 'C';
 static DriveInfo64 g_cur_drive;
@@ -270,7 +273,9 @@ static int  g_edit_item = -1;              // 重命名：g_ents 下标
 static char g_edit_buf[VFS64_NAME_MAX + 1] = {0};
 static int  g_edit_len = 0;
 
-// 删除确认（两次 Delete / 两次菜单：第一次只提示，4 秒内第二次才真删）
+// 删除确认（两次 Delete / 两次菜单：第一次只提示，10 秒内第二次才真做）
+// ★ v0.11.6：g_del_confirm 现在装的是**哪一类**删除被"武装"了（EXP_DEL_KIND_*）——
+//   删除进回收站 / 永久删除 / 清空回收站 三件事共用同一个 10 秒窗口，但绝不互相串味。
 static int  g_del_confirm = 0;
 static uint32_t g_del_confirm_tick = 0;
 
@@ -1029,12 +1034,17 @@ static void exp_refresh_dir() {
     int guard = 0;
     g_ro = fs64_is_readonly64(-1) ? true : false;       // 当前卷是否只读（FAT32）—— 置灰/拦截的依据
     exp_refresh_writable_flags();                       // ★ P8：可写的 U 盘 FAT32 卷标记（真源 drive64/fat64）
+    // ★ v0.11.6：回收站视图标志。判据只有一条：**当前路径就是 /Recycle**（不另设"模式位"，
+    //   于是导航/历史栈/后退/前进/刷新都不需要额外同步）。
+    g_trash = ((g_mode == 1) && e_streq(g_path, TRASH64_DIR)) ? 1 : 0;
     for (;;) {
         const int r = fs64_list64(-1, g_path, &one, 1, &cursor);
         if (r <= 0) break;
+        if (++guard > (int)FAT64_CHAIN_MAX) break;       // 护栏：绝不无界循环（FAT 卷的条目上限）
+        // 回收站里的 `.meta`（元数据目录）不列给用户 —— 点开头 = 隐藏，用户只该看到被删的那几项
+        if (g_trash && e_streq(one.name, TRASH64_RO_NAME)) continue;
         if (g_items < EXP_MAX_ITEMS) g_ents[g_items] = one;
         g_items++;
-        if (++guard > (int)FAT64_CHAIN_MAX) break;       // 护栏：绝不无界循环（FAT 卷的条目上限）
     }
     g_scroll = clamp_scroll_pure(g_scroll, g_items, 1);
     // 每个条目一行（自动验收按 idx 定位单元格/行；同时把"详细信息"四列的内容也留成证据）
@@ -1849,21 +1859,133 @@ static void exp_edit_commit() {                    // 回车：按模式落到�
     }
     exp_refresh_dir();
 }
-// 删除确认（本批选**两段式**）：第一次只提示，**10 秒内**再来一次（Delete 或右键菜单）才真删。
-// 为什么不用小确认框：内容区已经在画右键菜单/属性面板，再多一个模态框会挡视线；
-// 状态栏提示 + 打点同样可验收，而且不会误删（手快连按两次也能看出来）。
-// 10 秒窗口：给"看一眼提示再按"留时间（自动验收里截一次图要 2~4 秒，4 秒窗口会被截图吃掉）。
-static void exp_delete_now();
+// ==================== ★ v0.11.6：回收站（删除的第二条真实语义）====================
+// 为什么改：旧版两段式确认之后直接 fs64_unlink64 —— 文件当场就没了，手滑一次无法挽回
+//   （用户 2026-11-25 的原话："右键删除后能进回收站，防止误删"）。现在的语义分成两条：
+//     * 普通文件夹里删除 = **移入回收站**（trash64_put64：同卷改名进 /Recycle，一个字节都没动）；
+//     * 回收站里删除 = **永久删除**（同卷有界递归真删），并且仍然要两段式确认。
+// 视图判据只有一条：**当前路径 == /Recycle**（不另设"模式位"）—— 这样导航/历史栈/后退/刷新
+//   全部自动正确，不用在每个回调里同步一个枚举。
+// 顺带解决的旧边界：**非空目录现在能删了**（进回收站只是一次改名，与内容多少无关）；
+//   真正的"递归删除"只发生在回收站的永久删除上（有界：深度 <= 4、条目 <= 96）。
+#define EXP_DEL_KIND_NONE  0
+#define EXP_DEL_KIND_TRASH 1                     // 删除 -> 回收站
+#define EXP_DEL_KIND_PURGE 2                     // 回收站里永久删除
+#define EXP_DEL_KIND_EMPTY 3                     // 清空回收站
+static bool exp_trash_mode() { return (g_mode == 1) && e_streq(g_path, TRASH64_DIR); }
+static int exp_trash_vol() {
+    const int v = exp_ensure_volume();
+    return (v >= 0) ? v : fs64_current_vol64();
+}
+// 导航到回收站（从"此电脑"页也能进：先落到一个可浏览的卷上）
+static void exp_trash_enter() {
+    char letter = g_letter;
+    if (g_mode != 1 || !letter) {
+        letter = 0;
+        const int di = drive64_by_letter64('C');
+        DriveInfo64 d;
+        if (di >= 0 && drive64_info64(di, &d) == 0 && d.browsable) letter = 'C';
+        if (!letter) {
+            for (int i = 0; i < g_drive_n; i++)
+                if (g_drives[i].browsable && g_drives[i].letter) { letter = g_drives[i].letter; break; }
+        }
+        if (!letter) { exp_msg(gui64_tr("No browsable volume for a Recycle Bin", "没有可用于回收站的卷")); return; }
+        if (exp_enter_drive_letter(letter) != 0) return;
+    }
+    const int vol = exp_trash_vol();
+    if (vol >= 0) (void)trash64_init64(vol);          // 幂等：目录不在就建
+    exp_nav_to(1, letter, TRASH64_DIR);
+    dbg64_line_begin64();
+    dbg64_str("[TRASH64] view open vol=");
+    dbg64_dec((uint64_t)(uint32_t)(vol < 0 ? 0 : vol));
+    dbg64_str(" items=");
+    dbg64_dec((uint64_t)(uint32_t)(g_items > 0 ? g_items : 0));
+    dbg64_str(" path=");
+    dbg64_str(g_path);
+    dbg64_nl();
+    dbg64_line_end64();
+}
+// 恢复选中项：逐条搬回原路径（目标已存在/原父目录没了就如实失败，绝不覆盖）
+static void exp_trash_restore() {
+    const int vol = exp_trash_vol();
+    if (vol < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
+    if (sel_count() <= 0) { exp_msg(gui64_tr("Nothing selected", "没有选中任何项")); return; }
+    int ok = 0, bad = 0;
+    char first_why[24];
+    first_why[0] = 0;
+    for (int i = 0; i < g_items && i < EXP_MAX_ITEMS; i++) {
+        if (!sel_has(i)) continue;
+        const char* why = "";
+        if (trash64_restore64(vol, g_ents[i].name, &why) == 0) ok++;
+        else { bad++; if (!first_why[0]) e_strcpy(first_why, why ? why : "?", (int)sizeof(first_why)); }
+    }
+    char m[80];
+    if (ok > 0) {
+        e_strcpy(m, gui64_tr("Restored ", "已恢复 "), (int)sizeof(m));
+        { char t[8]; u2s(t, (uint64_t)ok); e_strcat(m, t, (int)sizeof(m)); }
+        e_strcat(m, gui64_tr(" item(s)", " 项"), (int)sizeof(m));
+        if (bad > 0) {
+            e_strcat(m, gui64_tr(" (some failed: ", "（有失败："), (int)sizeof(m));
+            e_strcat(m, first_why, (int)sizeof(m));
+            e_strcat(m, ")", (int)sizeof(m));
+        }
+    } else {
+        e_strcpy(m, gui64_tr("Restore failed: ", "恢复失败："), (int)sizeof(m));
+        e_strcat(m, first_why[0] ? first_why : "?", (int)sizeof(m));
+    }
+    exp_msg(m);
+    exp_refresh_dir();
+}
+// 打开原位置（右键"打开原位置"）：把资源管理器开到它原来所在的目录
+static void exp_trash_open_orig(int item) {
+    const int vol = exp_trash_vol();
+    char orig[VFS64_PATH_MAX], dir[VFS64_PATH_MAX];
+    if (vol < 0 || item < 0 || item >= g_items || item >= EXP_MAX_ITEMS) return;
+    if (trash64_orig_of64(vol, g_ents[item].name, orig, (int)sizeof(orig)) != 0) {
+        exp_msg(gui64_tr("Original location unknown", "不知道它原来在哪"));
+        return;
+    }
+    path_parent_pure(orig, dir, (int)sizeof(dir));
+    if (!dir[0]) e_strcpy(dir, "/", (int)sizeof(dir));
+    explorer64_open_path64(dir, g_letter);
+}
+static void exp_delete_now();                     // 前向声明（两段式确认的第二段）
+static void exp_trash_purge_now();
+static void exp_trash_empty_now();
+// 删除请求：普通文件夹 -> 进回收站；回收站里 -> 永久删除（两段式确认，10 秒窗口）
 static void exp_delete_request() {
     if (g_mode != 1) { exp_msg(gui64_tr("Not in a folder", "不在文件夹里")); return; }
     if (g_ro) { exp_roact("delete"); return; }        // ★ 只读卷（FAT32）上不能删除
     if (sel_count() <= 0) { exp_msg(gui64_tr("Nothing selected", "没有选中任何项")); return; }
-    if (g_del_confirm && (int32_t)(ticks64() - g_del_confirm_tick) < 0) {
-        g_del_confirm = 0;
+    if (exp_trash_mode()) {                           // 回收站里按 Delete = 永久删除
+        if (g_del_confirm == EXP_DEL_KIND_PURGE && (int32_t)(ticks64() - g_del_confirm_tick) < 0) {
+            g_del_confirm = EXP_DEL_KIND_NONE;
+            exp_trash_purge_now();
+            return;
+        }
+        g_del_confirm = EXP_DEL_KIND_PURGE;
+        g_del_confirm_tick = ticks64() + ms_to_ticks64(10000);
+        dbg64_line_begin64();
+        dbg64_str("[UI] explorer delete confirm n=");
+        dbg64_dec((uint64_t)sel_count());
+        dbg64_str(" path=");
+        for (int i = 0; i < g_items && i < EXP_MAX_ITEMS; i++) {
+            if (!sel_has(i)) continue;
+            dbg64_str(g_ents[i].name);
+            break;
+        }
+        dbg64_str(" (permanent)");
+        dbg64_nl();
+        dbg64_line_end64();
+        exp_msg(gui64_tr("Press Delete again to delete permanently (10s)", "再按一次 Delete 永久删除（10 秒内有效）"));
+        return;
+    }
+    if (g_del_confirm == EXP_DEL_KIND_TRASH && (int32_t)(ticks64() - g_del_confirm_tick) < 0) {
+        g_del_confirm = EXP_DEL_KIND_NONE;
         exp_delete_now();
         return;
     }
-    g_del_confirm = 1;
+    g_del_confirm = EXP_DEL_KIND_TRASH;
     g_del_confirm_tick = ticks64() + ms_to_ticks64(10000);
     // 打点：两段式的第一段（表明这次按 Delete 只提示、什么都没删；验收据此断言"没假装成功"）
     dbg64_line_begin64();
@@ -1877,9 +1999,10 @@ static void exp_delete_request() {
         dbg64_str(full);
         break;
     }
+    dbg64_str(" (to-recycle)");
     dbg64_nl();
     dbg64_line_end64();
-    exp_msg(gui64_tr("Press Delete again to confirm (10s)", "再按一次 Delete 确认删除（10 秒内有效）"));
+    exp_msg(gui64_tr("Press Delete again to move to Recycle Bin (10s)", "再按一次 Delete 移入回收站（10 秒内有效）"));
 }
 static void exp_delete_now() {
     const int vol = exp_ensure_volume();
@@ -1891,28 +2014,101 @@ static void exp_delete_now() {
         const Fs64Dirent64* d = &g_ents[i];
         char full[VFS64_PATH_MAX];
         exp_build_path(full, (int)sizeof(full), g_path, d->name);
-        if (d->type == VFS64_TYPE_DIR) {
-            Fs64Dirent64 one;
-            uint32_t cur = 0;
-            const int n = fs64_list64(vol, full, &one, 1, &cur);
-            if (n < 0) { exp_log_delete(full, "dir", 1, "stat-failed"); refused++; continue; }
-            if (n > 0) {                                  // 非空目录：**明说暂不支持递归删除**，绝不假装成功
-                exp_log_delete(full, "dir", 1, "not-empty");
-                exp_msg(gui64_tr("Directory is not empty (recursive delete not supported yet)",
-                                 "目录非空，暂不支持递归删除"));
-                refused++;
-                continue;
-            }
-            const int rc = fs64_rmdir64(vol, full);
-            exp_log_delete(full, "dir", rc == 0 ? 0 : 1, rc == 0 ? "" : "rmdir-failed");
-            if (rc == 0) done++; else refused++;
-        } else {
-            const int rc = fs64_unlink64(vol, full);
-            exp_log_delete(full, "file", rc == 0 ? 0 : 1, rc == 0 ? "" : "unlink-failed");
-            if (rc == 0) done++; else refused++;
-        }
+        char moved[TRASH64_NAME_MAX + 1];
+        const int rc = trash64_put64(vol, full, moved, (int)sizeof(moved));
+        exp_log_delete(full, d->type == VFS64_TYPE_DIR ? "dir" : "file",
+                       rc == 0 ? 0 : 1, rc == 0 ? "" : "trash-failed");
+        if (rc == 0) done++; else refused++;
     }
-    if (done > 0 && refused == 0) exp_msg(gui64_tr("Deleted", "已删除"));
+    if (done > 0) {
+        char m[80];
+        e_strcpy(m, gui64_tr("Moved to Recycle Bin: ", "已移入回收站："), (int)sizeof(m));
+        { char t[8]; u2s(t, (uint64_t)done); e_strcat(m, t, (int)sizeof(m)); }
+        e_strcat(m, gui64_tr(" item(s)", " 项"), (int)sizeof(m));
+        if (refused > 0) e_strcat(m, gui64_tr(" (some failed)", "（有失败）"), (int)sizeof(m));
+        exp_msg(m);
+    }
+    exp_refresh_dir();
+}
+// 永久删除（回收站里）：第一段只提示，10 秒内第二次才真删
+static void exp_trash_purge_request() {
+    if (g_ro) { exp_roact("delete"); return; }
+    if (sel_count() <= 0) { exp_msg(gui64_tr("Nothing selected", "没有选中任何项")); return; }
+    if (g_del_confirm == EXP_DEL_KIND_PURGE && (int32_t)(ticks64() - g_del_confirm_tick) < 0) {
+        g_del_confirm = EXP_DEL_KIND_NONE;
+        exp_trash_purge_now();
+        return;
+    }
+    g_del_confirm = EXP_DEL_KIND_PURGE;
+    g_del_confirm_tick = ticks64() + ms_to_ticks64(10000);
+    dbg64_line_begin64();
+    dbg64_str("[TRASH64] purge ask n=");
+    dbg64_dec((uint64_t)sel_count());
+    dbg64_str(" confirm=1");
+    dbg64_nl();
+    dbg64_line_end64();
+    exp_msg(gui64_tr("Press again to delete permanently (10s)", "再按一次永久删除（10 秒内有效）"));
+}
+static void exp_trash_purge_now() {
+    const int vol = exp_trash_vol();
+    if (vol < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
+    int ok = 0, bad = 0;
+    char first_why[24];
+    first_why[0] = 0;
+    for (int i = 0; i < g_items && i < EXP_MAX_ITEMS; i++) {
+        if (!sel_has(i)) continue;
+        int f = 0, d = 0;
+        const char* why = "";
+        if (trash64_purge64(vol, g_ents[i].name, &f, &d, &why) == 0) ok++;
+        else { bad++; if (!first_why[0]) e_strcpy(first_why, why ? why : "?", (int)sizeof(first_why)); }
+    }
+    char m[96];
+    if (ok > 0) {
+        e_strcpy(m, gui64_tr("Permanently deleted ", "已永久删除 "), (int)sizeof(m));
+        { char t[8]; u2s(t, (uint64_t)ok); e_strcat(m, t, (int)sizeof(m)); }
+        e_strcat(m, gui64_tr(" item(s)", " 项"), (int)sizeof(m));
+        if (bad > 0) {
+            e_strcat(m, gui64_tr(" (failed: ", "（失败："), (int)sizeof(m));
+            e_strcat(m, first_why, (int)sizeof(m));
+            e_strcat(m, ")", (int)sizeof(m));
+        }
+    } else {
+        e_strcpy(m, gui64_tr("Permanent delete failed: ", "永久删除失败："), (int)sizeof(m));
+        e_strcat(m, first_why[0] ? first_why : "?", (int)sizeof(m));
+    }
+    exp_msg(m);
+    exp_refresh_dir();
+}
+// 清空回收站：同样两段式（一次删掉所有条目，误点的代价最大）
+static void exp_trash_empty_request() {
+    if (g_ro) { exp_roact("delete"); return; }
+    if (g_items <= 0) { exp_msg(gui64_tr("Recycle Bin is already empty", "回收站已经是空的")); return; }
+    if (g_del_confirm == EXP_DEL_KIND_EMPTY && (int32_t)(ticks64() - g_del_confirm_tick) < 0) {
+        g_del_confirm = EXP_DEL_KIND_NONE;
+        exp_trash_empty_now();
+        return;
+    }
+    g_del_confirm = EXP_DEL_KIND_EMPTY;
+    g_del_confirm_tick = ticks64() + ms_to_ticks64(10000);
+    dbg64_line_begin64();
+    dbg64_str("[TRASH64] empty ask items=");
+    dbg64_dec((uint64_t)(g_items > 0 ? g_items : 0));
+    dbg64_str(" confirm=1");
+    dbg64_nl();
+    dbg64_line_end64();
+    exp_msg(gui64_tr("Press again to empty the Recycle Bin (10s)", "再按一次清空回收站（10 秒内有效）"));
+}
+static void exp_trash_empty_now() {
+    const int vol = exp_trash_vol();
+    if (vol < 0) { exp_msg(gui64_tr("Volume not available", "卷不可用")); return; }
+    int fail = 0;
+    const int n = trash64_empty64(vol, &fail);
+    char m[80];
+    e_strcpy(m, gui64_tr("Recycle Bin emptied: ", "已清空回收站："), (int)sizeof(m));
+    { char t[8]; u2s(t, (uint64_t)(n > 0 ? n : 0)); e_strcat(m, t, (int)sizeof(m)); }
+    e_strcat(m, gui64_tr(" item(s)", " 项"), (int)sizeof(m));
+    if (fail > 0) e_strcat(m, gui64_tr(" (some failed)", "（有失败）"), (int)sizeof(m));
+    exp_msg(m);
     exp_refresh_dir();
 }
 // 属性：数据全从 fs64_stat64 来（名称/类型/大小/修改日期/所在卷；FAT 卷的日期也是同一编码），
@@ -1944,6 +2140,14 @@ static void exp_props_show(int item) {
     g_props_vol[1] = ':';
     g_props_vol[2] = 0;
     e_strcpy(g_props_path, full, (int)sizeof(g_props_path));
+    // ★ v0.11.6：回收站里的条目，属性面板的"路径"给**原位置**（用户最想知道它原来在哪；
+    //   条目自己现在的物理位置 /Recycle/x 反而没有信息量）。
+    if (g_trash && item >= 0) {
+        char orig[VFS64_PATH_MAX];
+        const int tv = exp_ensure_volume();
+        if (tv >= 0 && trash64_orig_of64(tv, g_ents[item].name, orig, (int)sizeof(orig)) == 0)
+            e_strcpy(g_props_path, orig, (int)sizeof(g_props_path));
+    }
     g_props_open = 1;
     exp_log_props(g_props_name, g_props_kind, info.type == VFS64_TYPE_DIR ? 0 : info.size,
                   g_props_mtime, g_props_vol[0]);
@@ -1954,6 +2158,22 @@ static void exp_props_show(int item) {
 static int exp_ctx_count() { return g_ctx_blank ? EXP_CTX_BLANK_N : EXP_CTX_ITEM_N; }
 static int exp_ctx_height() { return exp_ctx_count() * EXP_CTX_ITEM_H + 4; }
 static const char* exp_ctx_label(int k) {
+    // ★ v0.11.6：回收站里的右键菜单 —— 条目菜单 6 项全换成"回收站语言"（几何/行数一字不改，
+    //   既有验收脚本按菜单矩形和行高定位，因此照旧）。
+    if (g_trash) {
+        if (g_ctx_blank) {
+            if (k == 0) return gui64_tr("Empty Recycle Bin", "清空回收站");
+            if (k == 3) return gui64_tr("Refresh", "刷新");
+            if (k == 4) return gui64_tr("Properties", "属性");
+            return gui64_tr("Restore", "恢复");      // k == 1/2：置灰的两个占位（对齐行高）
+        }
+        if (k == 0) return gui64_tr("Restore", "恢复");
+        if (k == 1) return gui64_tr("Delete permanently", "永久删除");
+        if (k == 2) return gui64_tr("Open original location", "打开原位置");
+        if (k == 3) return gui64_tr("Properties", "属性");
+        if (k == 4) return gui64_tr("Refresh", "刷新");
+        return gui64_tr("Empty Recycle Bin", "清空回收站");
+    }
     if (g_ctx_blank) {
         if (k == 0) return gui64_tr("New folder", "新建文件夹");
         if (k == 1) return gui64_tr("New text file", "新建文本文件");
@@ -1969,6 +2189,15 @@ static const char* exp_ctx_label(int k) {
     return gui64_tr("Properties", "属性");
 }
 static bool exp_ctx_enabled(int k) {              // 与工具栏按钮同一套置灰规则
+    // ★ v0.11.6：回收站菜单的可用性（只读卷上恢复/永久删除/清空一律置灰）
+    if (g_trash) {
+        if (g_ctx_blank) return (k == 0) && (g_items > 0) && !g_ro;   // 清空
+        if (g_ro) return false;
+        if (k == 0) return sel_count() > 0;                            // 恢复
+        if (k == 1) return sel_count() > 0;                            // 永久删除
+        if (k == 2) return sel_count() > 0;                            // 打开原位置
+        return true;                                                   // 属性/刷新/清空
+    }
     if (g_ctx_blank) {
         if (g_ro) {                                  // ★ 只读卷：空白菜单只有"刷新/属性"可用
             if (k == 2) return false;                // 粘贴
@@ -2023,6 +2252,22 @@ static void exp_ctx_activate(int k) {              // 菜单项动作（k = 下�
     const int blank = g_ctx_blank;
     const int item = g_ctx_item;
     exp_ctx_close();
+    // ★ v0.11.6：回收站菜单的动作分派（与上面的文案/置灰表一一对应）
+    if (g_trash) {
+        if (blank) {
+            if (k == 0) exp_trash_empty_request();
+            else if (k == 3) { exp_refresh_dir(); exp_msg(gui64_tr("Refreshed", "已刷新")); }
+            else if (k == 4) exp_props_show(-1);
+            return;
+        }
+        if (k == 0) exp_trash_restore();
+        else if (k == 1) exp_trash_purge_request();
+        else if (k == 2) exp_trash_open_orig(item);
+        else if (k == 3) exp_props_show(item);
+        else if (k == 4) { exp_refresh_dir(); exp_msg(gui64_tr("Refreshed", "已刷新")); }
+        else exp_trash_empty_request();
+        return;
+    }
     if (blank) {
         if (k == 0) exp_edit_begin(EXP_EDIT_MKDIR, -1);
         else if (k == 1) exp_edit_begin(EXP_EDIT_MKFILE, -1);
@@ -2697,6 +2942,14 @@ static void draw_content(void) {
 // ★ 批次 J：6 个文件操作按钮的可用状态（与右键菜单同一套规则；置灰就是真的不能点，点了只给提示）
 static bool exp_tb_enabled(int id) {
     if (g_mode != 1) return false;                     // "此电脑"页没有文件操作对象
+    // ★ v0.11.6：回收站视图 —— 同一组按钮 = 恢复 / 永久删除 / 清空（只读卷上这三件事都做不了）
+    if (g_trash) {
+        if (g_ro) return false;
+        if (id == IDC_MKDIR) return sel_count() > 0;   // 恢复
+        if (id == IDC_COPY)  return sel_count() > 0;   // 永久删除
+        if (id == IDC_CUT)   return g_items > 0;       // 清空回收站
+        return false;
+    }
     // ★ 批次 K：只读卷（FAT32）上 新建/粘贴/剪切/重命名/删除 一律置灰；复制（从只读卷读出来）仍可用
     if (g_ro) return (id == IDC_COPY) && sel_count() > 0;
     if (id == IDC_MKDIR) return true;
@@ -2720,9 +2973,14 @@ static void draw_toolbar(void) {
         const int lw = tw(labels[i]);
         txt(x + (EXP_TB_BTN_W - lw) / 2, 6, labels[i], C_EXP_TEXT);
     }
+    static const char* lbl_en_file[EXP_TB2_N] = { "New", "Copy", "Cut", "Paste", "Rename", "Delete" };
+    static const char* lbl_zh_file[EXP_TB2_N] = { "新建", "复制", "剪切", "粘贴", "重命名", "删除" };
     // ★ 批次 J：6 个文件操作按钮（无选中/剪贴板为空 -> 置灰；hover 高亮、按下变深）
-    static const char* lbl_en[EXP_TB2_N] = { "New", "Copy", "Cut", "Paste", "Rename", "Delete" };
-    static const char* lbl_zh[EXP_TB2_N] = { "新建", "复制", "剪切", "粘贴", "重命名", "删除" };
+    // ★ v0.11.6：回收站视图里换成「恢复 / 永久删除 / 清空」（同一组坐标、同一个 id，只换文案与语义）
+    static const char* lb_en_trash[EXP_TB2_N] = { "Restore", "Delete", "Empty", "", "", "" };
+    static const char* lb_zh_trash[EXP_TB2_N] = { "恢复", "永久删除", "清空", "", "", "" };
+    const char* const* lbl_en = g_trash ? lb_en_trash : lbl_en_file;
+    const char* const* lbl_zh = g_trash ? lb_zh_trash : lbl_zh_file;
     const int ids2[EXP_TB2_N] = { IDC_MKDIR, IDC_COPY, IDC_CUT, IDC_PASTE, IDC_RENAME, IDC_DEL };
     for (int i = 0; i < EXP_TB2_N; i++) {
         const int x = EXP_TB2_X + i * (EXP_TB2_W + EXP_TB2_GAP);
@@ -2814,18 +3072,30 @@ static void draw_nav(void) {
     frect(EXP_NAV_W, EXP_CONTENT_Y, 1, nh, C_EXP_LINE);
     txt(8, EXP_CONTENT_Y + 6, gui64_tr("Quick access", "快速访问"), C_EXP_DIM);
     // 节点 0 = 此电脑；节点 1..n = 每个驱动器（可浏览的带盘符，不可浏览的灰字）
-    for (int i = 0; i <= g_drive_n; i++) {
+    // 节点 0 = 此电脑；节点 1..n = 每个驱动器（可浏览的带盘符，不可浏览的灰字）；
+    // ★ v0.11.6：节点 n+1 = **回收站**（永远追加在最后一行 —— 驱动器节点号一个都没变，
+    //   既有验收脚本按行号点的坐标因此照旧；这里不做任何磁盘 I/O，纯内存绘制）。
+    for (int i = 0; i <= g_drive_n + 1; i++) {
         const int y = EXP_CONTENT_Y + EXP_NAV_TOP + i * EXP_NAV_ROW_H;
         if (y + EXP_NAV_ROW_H > EXP_CONTENT_Y + nh) break;
         const bool is_thispc = (i == 0);
-        const DriveInfo64* d = is_thispc ? nullptr : &g_drives[i - 1];
-        const bool sel = is_thispc ? (g_mode == 0)
-                                   : (g_mode == 1 && d && d->letter && d->letter == g_letter);
+        const bool is_trash  = (i == g_drive_n + 1);
+        const DriveInfo64* d = (is_thispc || is_trash) ? nullptr : &g_drives[i - 1];
+        bool sel;
+        if (is_thispc)     sel = (g_mode == 0);
+        else if (is_trash) sel = (g_trash != 0);
+        else               sel = (g_mode == 1 && g_trash == 0 && d && d->letter && d->letter == g_letter);
         if (sel) frect(2, y, EXP_NAV_W - 5, EXP_NAV_ROW_H - 2, C_EXP_NAV_SEL);
-        // 小图标：此电脑 = 蓝灰方块；驱动器 = 盘形
+        // 小图标：此电脑 = 蓝灰方块；驱动器 = 盘形；回收站 = 灰桶（两侧竖纹）
         if (is_thispc) {
             frect(8, y + 4, 12, 9, rgb(120, 144, 176));
             frect(6, y + 12, 16, 2, rgb(90, 110, 140));
+        } else if (is_trash) {
+            frect(8, y + 6, 12, 10, rgb(150, 160, 175));
+            frect(7, y + 4, 14, 2, rgb(110, 120, 135));
+            frect(11, y + 3, 6, 1, rgb(110, 120, 135));
+            frect(10, y + 9, 1, 6, rgb(214, 220, 230));
+            frect(13, y + 9, 1, 6, rgb(214, 220, 230));
         } else {
             frect(8, y + 6, 13, 9, d->browsable ? rgb(120, 144, 176) : rgb(180, 180, 180));
             frect(8, y + 9, 13, 3, rgb(232, 240, 250));
@@ -2833,6 +3103,8 @@ static void draw_nav(void) {
         char lb[64];
         if (is_thispc) {
             e_strcpy(lb, gui64_tr("This PC", "此电脑"), (int)sizeof(lb));
+        } else if (is_trash) {
+            e_strcpy(lb, gui64_tr("Recycle Bin", "回收站"), (int)sizeof(lb));
         } else {
             e_strcpy(lb, d->name, (int)sizeof(lb));
             if (d->letter) {
@@ -2841,7 +3113,8 @@ static void draw_nav(void) {
                 e_strcat(lb, t, (int)sizeof(lb));
             }
         }
-        txt_clip(26, y + 4, lb, d->browsable || is_thispc ? C_EXP_TEXT : C_EXP_DIM, EXP_NAV_W - 30);
+        const bool bright = is_thispc || is_trash || (d && d->browsable);
+        txt_clip(26, y + 4, lb, bright ? C_EXP_TEXT : C_EXP_DIM, EXP_NAV_W - 30);
     }
 }
 static void draw_status(void) {
@@ -2854,7 +3127,9 @@ static void draw_status(void) {
         char t[16];
         u2s(t, (uint64_t)g_items);
         e_strcat(buf, t, (int)sizeof(buf));
-        e_strcat(buf, gui64_tr(" items", " 个项目"), (int)sizeof(buf));
+        // ★ v0.11.6：回收站视图明说是回收站（状态栏是用户唯一一眼能看出"这里不是普通文件夹"的地方）
+        if (g_trash) e_strcat(buf, gui64_tr(" items in Recycle Bin", " 个项目（回收站）"), (int)sizeof(buf));
+        else e_strcat(buf, gui64_tr(" items", " 个项目"), (int)sizeof(buf));
     } else {
         char t[16];
         u2s(t, (uint64_t)g_items);
@@ -2876,6 +3151,15 @@ static void draw_status(void) {
             e_strcat(buf, gui64_tr(" (+", "（共 "), (int)sizeof(buf));
             e_strcat(buf, t, (int)sizeof(buf));
             e_strcat(buf, gui64_tr(")", " 项）"), (int)sizeof(buf));
+        }
+        // ★ v0.11.6：回收站里选中的是"删掉的那一项"，用户最想知道它原来在哪
+        if (g_trash) {
+            char orig[VFS64_PATH_MAX];
+            const int v = exp_trash_vol();
+            if (v >= 0 && trash64_orig_of64(v, g_ents[g_sel].name, orig, (int)sizeof(orig)) == 0) {
+                e_strcat(buf, "  <- ", (int)sizeof(buf));
+                e_strcat(buf, orig, (int)sizeof(buf));
+            }
         }
     }
     txt_clip(8, y + 4, buf, C_EXP_DIM, 300);
@@ -3109,8 +3393,9 @@ static int hit_nav(int cx, int cy, int* out_kind) {
     const int ry = cy - (EXP_CONTENT_Y + EXP_NAV_TOP);
     if (ry < 0) return -1;
     const int i = ry / EXP_NAV_ROW_H;
-    if (i > g_drive_n) return -1;
+    if (i > g_drive_n + 1) return -1;                 // ★ v0.11.6：多一行"回收站"（节点号 g_drive_n+1）
     if (i == 0) return 0;
+    if (i == g_drive_n + 1) { if (out_kind) *out_kind = 1; return i; }
     const int di = i - 1;
     if (out_kind) *out_kind = g_drives[di].browsable ? 1 : 2;
     return i;
@@ -3204,6 +3489,14 @@ static void exp_click(Window* w, int cx, int cy) {
     // ---- ★ 批次 J：文件操作按钮（置灰的点了只给提示，不做事）----
     if (id >= IDC_MKDIR && id <= IDC_DEL) {
         if (!exp_tb_enabled(id)) { if (g_ro) exp_roact("toolbar"); else exp_msg(gui64_tr("That action is not available", "该操作当前不可用")); return; }
+        // ★ v0.11.6：回收站视图里同一组按钮换成「恢复 / 永久删除 / 清空」（几何与 id 一字不改，
+        //   只换语义 —— 既有验收脚本按坐标点按钮的位置因此全部照旧）。
+        if (exp_trash_mode()) {
+            if (id == IDC_MKDIR)      exp_trash_restore();
+            else if (id == IDC_COPY)  exp_trash_purge_request();
+            else                      exp_trash_empty_request();
+            return;
+        }
         if (id == IDC_MKDIR)       exp_edit_begin(EXP_EDIT_MKDIR, -1);
         else if (id == IDC_COPY)   exp_clip_set(1);
         else if (id == IDC_CUT)    exp_clip_set(2);
@@ -3233,6 +3526,8 @@ static void exp_click(Window* w, int cx, int cy) {
         const int ni = hit_nav(cx, cy, &nk);
         if (ni >= 0) {
             if (ni == 0) { exp_nav_to(0, 0, "/"); return; }
+            // ★ v0.11.6：导航窗格最后一行 = 回收站（节点号 = g_drive_n + 1，驱动器节点号不变）
+            if (ni == g_drive_n + 1) { exp_trash_enter(); return; }
             const DriveInfo64* d = &g_drives[ni - 1];
             if (!d->browsable) {
                 exp_msg(gui64_tr("This entry is not browsable", "该条目不可浏览"));
@@ -3767,6 +4062,19 @@ static void exp_close(Window* w) {
 
 // ==================== 公共 API ====================
 Window* explorer64_window64() { return gui64_window_alive(g_win) ? g_win : nullptr; }
+// ★ v0.11.6：打开资源管理器并进回收站（桌面回收站图标 / 终端 recycle 命令 / 验收脚本共用）
+void explorer64_open_trash64() {
+    if (!gui64_window_alive(g_win)) explorer64_open64();     // 没窗口就先开一个（开完在"此电脑"页）
+    if (!gui64_window_alive(g_win)) {
+        dbg64_line_begin64();
+        dbg64_str("[TRASH64] view open FAILED reason=no-window");
+        dbg64_nl();
+        dbg64_line_end64();
+        return;
+    }
+    exp_trash_enter();
+    gui64_invalidate_window(g_win);
+}
 // ==================== ★ v0.11.1：按路径打开（桌面文件快捷方式双击/右键"打开"）====================
 // 语义：打开**它所在的目录**并选中它（"用什么程序打开文件"仍由双击条目那条既有路由负责，
 //   这里不另造一套）。边界（如实）：只定位**当前盘/指定盘**上的绝对路径；换盘先切卷再列目录；

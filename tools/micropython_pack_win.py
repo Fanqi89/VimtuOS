@@ -45,6 +45,28 @@ def _load_tcc_pack():
 TP = _load_tcc_pack()
 
 
+def pack_scripts(vol, script_dir):
+    """★ v0.11.6：把 <script_dir>/*.py 装进 /mpy/<名字>；返回 {卷内路径: 字节}。
+
+    为什么单独一层：MicroPython 的交付形态原来只有 REPL（"敲 mp 就进交互"），而
+    "用 Python 写一个能在系统里直接跑的小程序"要求**脚本本身也在卷里** ——
+    内核命令 `mp /mpy/xxx.py` 由 /bin/mp 交给端口的 pyexec_file() 执行。
+    """
+    expect = {}
+    if not script_dir:
+        return expect
+    if not os.path.isdir(script_dir):
+        raise SystemExit("找不到脚本目录：%s" % script_dir)
+    names = sorted(n for n in os.listdir(script_dir) if n.endswith(".py"))
+    if not names:
+        raise SystemExit("脚本目录里没有 .py：%s" % script_dir)
+    for n in names:
+        data = open(os.path.join(script_dir, n), "rb").read()
+        vol.put("/mpy/" + n, data, mode=0o644)
+        expect["/mpy/" + n] = data
+    return expect
+
+
 def pack_into(vol, drv, mp_bin):
     """把 MicroPython 两件套装进一个 VolumeEdit；返回 {卷内路径: 字节}（回读校验的期望值）。"""
     if len(drv) > DRV_LIMIT:
@@ -63,6 +85,8 @@ def main():
     ap.add_argument("--vol-out", required=True, help="输出卷镜像（= 输入 + /bin/mp + /lib/micropython.bin）")
     ap.add_argument("--drv", required=True, help="build64/mp（装载驱动）-> /bin/mp")
     ap.add_argument("--bin", required=True, help="build64/micropython.bin（解释器）-> /lib/micropython.bin")
+    ap.add_argument("--script-dir", default=None,
+                    help="★ v0.11.6：user/micropython/demo（*.py 装进 /mpy/，供 `mp /mpy/x.py` 运行）")
     args = ap.parse_args()
 
     for p, what in ((args.vol_in, "输入卷"), (args.drv, "装载驱动 build64/mp"),
@@ -85,6 +109,7 @@ def main():
     vol = TP.VolumeEdit(total)
     vol.load(img)
     expect = pack_into(vol, drv, mp_bin)
+    expect.update(pack_scripts(vol, args.script_dir))
     out = vol.finish()
 
     bad = TP.verify(out, expect)

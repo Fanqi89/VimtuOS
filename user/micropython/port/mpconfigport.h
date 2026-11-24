@@ -22,6 +22,13 @@
 // ---------------------------------------------------------------------------
 #define MICROPY_CONFIG_ROM_LEVEL (MICROPY_CONFIG_ROM_LEVEL_CORE_FEATURES)
 
+// ★ v0.11.6：**必须显式打开 `input()`**。ROM 级别是 CORE_FEATURES，
+//   upstream 的默认值 `MICROPY_PY_BUILTINS_INPUT = (ROM >= EXTRA_FEATURES)` 在这里是 **0** ——
+//   于是 `/mpy/calc.py` 第一行 `input("calc> ")` 直接 `NameError: name 'input' isn't defined`，
+//   脚本打印完标题就退出（实测症状：终端只有标题行、没有 `7*6 = 42`，前台随后 exit）。
+//   依赖：shared/readline 的 readline() + mphalport 的 mp_hal_stdin_rx_chr（本端口都已提供）。
+#define MICROPY_PY_BUILTINS_INPUT (1)
+
 // ---------------------------------------------------------------------------
 // 必须打开的
 // ---------------------------------------------------------------------------
@@ -58,9 +65,12 @@
 #define MICROPY_PY_MACHINE (0)
 #define MICROPY_PY_UOS (0)
 
-// sys 模块：跟 minimal 端口一样全关（没有文件系统，路径/argv 没有意义）
+// sys 模块：argv/path 没有意义（本端口不实现 sys.argv），但 **sys.exit 必须有** ——
+//   ★ v0.11.6 实测教训：`/mpy/calc.py` 第一版结尾写 `sys.exit(main(sys.argv))`，
+//   结果脚本一行都没跑完就 `AttributeError: 'module' object has no attribute 'exit'`。
+//   现在打开 EXIT（0 字节额外状态：modsys 只需 mp_sys_exit_obj），ARGV 保持关闭。
 #define MICROPY_PY_SYS_MODULES (0)
-#define MICROPY_PY_SYS_EXIT (0)
+#define MICROPY_PY_SYS_EXIT (1)
 #define MICROPY_PY_SYS_PATH (0)
 #define MICROPY_PY_SYS_ARGV (0)
 #define MICROPY_PY_SYS_PS1_PS2 (0)

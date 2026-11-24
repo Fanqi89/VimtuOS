@@ -11,6 +11,7 @@
 #include "x86_64.h"     // ticks64
 #include "panic64.h"    // panic64_watchdog_pause64/unpause64（整屏重建是长操作，见 wall_ensure64）
 
+
 // ==================== 画布 / 裁剪 ====================
 static uint32_t* g_fb = nullptr;
 static int g_fw = 0, g_fh = 0;
@@ -1371,4 +1372,105 @@ void gfx64_report64(const char* tag) {
     dbg64_dec((uint64_t)fb_height());
     dbg64_nl();
     dbg64_line_end64();
+}
+
+// ==== v0.11.6 append: 顶部两角 90° 弧（标题带玻璃 + 圆角裁切）====
+// 用户点名的渲染 bug（原文）：
+//   "所有程序窗口的左上角和右上角应该为两角圆（只取一个整圆四等分里的第 1 份贴左上角、
+//    第 2 份贴右上角，两段都是 90 度弧，共用同一个半径 r…底边保持全宽直线）。
+//    当前的错：标题栏被当成独立图形单独画圆角，把第 1、第 2 份各自撑成 180 度半圆端帽，
+//    半径吃到标题栏半高。"
+// 根因：gfx64_glass64() 对标题带（高 27px）做**四角**圆角时把 r 夹到 h/2（=13），
+//   于是左右两块各自成半圆端帽、底边两角也被啃掉。
+// 修法：新增"只有上面两角是弧"的两个原语，调用点换成它们，r 一律用 THEME64_R_WINDOW。
+static int gfxtop_cov64(const uint8_t* tab, int r, int w, int dx, int dy) {
+    if (dy >= r) return 255;                        // 弧以下：整行满覆盖（底部两角保持直角）
+    if (dx < r) return tab[dy * r + dx];            // 左上：圆的第 1 个四等分
+    if (dx >= w - r) return tab[dy * r + (r - 1 - (dx - (w - r)))];   // 右上：第 2 个四等分
+    return 255;                                     // 顶边中间的直线段
+}
+
+// 标题带毛玻璃：只有上面两角圆（下面两角直角）。参数与 gfx64_glass64 的 tint/alpha/layer 同义。
+void gfx64_glass_top64(int x, int y, int w, int h, int r, int layer, uint32_t tint, int alpha,
+                       const Theme64Tokens* t) {
+    if (w <= 0 || h <= 0) return;
+    if (r > w / 2) r = w / 2;
+    if (r > h) r = h;                               // ★ 不再夹到 h/2 —— 这正是"半圆端帽"的来源
+    int x0 = x, y0 = y, ww = w, hh = h;
+    if (!rect_clip64(&x0, &y0, &ww, &hh)) return;
+    const uint32_t* back = nullptr;
+    int bw = 0, bh = 0, bx = 0, by = 0;
+    if (layer == 0) {
+        back = gfx64_wall_blur64(&bw, &bh);
+        bx = 0; by = 0;
+    } else {
+        const int br = THEME64_BLUR_CONTENT;
+        back = panel_blur64(x - 2, y - 2, w + 4, h + 4, br);
+        bw = w + 4; bh = h + 4; bx = x - 2; by = y - 2;
+    }
+    const Theme64Tokens* tk = t ? t : theme64_tokens64();
+    uint32_t* px = canvas64();
+    const uint8_t* tab = cov_table64(r);
+    for (int yy = y0; yy < y0 + hh; yy++) {
+        uint32_t* row = px + (uint64_t)yy * g_fw;
+        const int dy = yy - y;
+        for (int xx = x0; xx < x0 + ww; xx++) {
+            const int dx = xx - x;
+            const int cov = tab ? gfxtop_cov64(tab, r, w, dx, dy) : 255;
+            if (cov <= 0) continue;
+            uint32_t src = tk->desktop_base;
+            if (back) {
+                const int sx = xx - bx, sy = yy - by;
+                if (sx >= 0 && sy >= 0 && sx < bw && sy < bh) src = back[(uint64_t)sy * bw + sx];
+            }
+            const uint32_t glass = blend_c64(src, tint, alpha);
+            if (cov >= 255) row[xx] = glass;
+            else row[xx] = blend_c64(row[xx], glass, cov);
+        }
+    }
+}
+
+// 圆角裁切（按位选角）：mask bit0 左上 / bit1 右上 / bit2 左下 / bit3 右下。
+// 与 gfx64_corner_cut64 逐像素同一套覆盖表，只是可以只切上面两角。
+void gfx64_corner_cut_mask64(int x, int y, int w, int h, int r, int mask, int layer) {
+    if (r <= 0 || w <= 2 * r || h <= 2 * r) return;
+    const uint8_t* tab = cov_table64(r);
+    if (!tab) return;
+    int bw = 0, bh = 0;
+    const uint32_t* back = gfx64_wall_blur64(&bw, &bh);
+    if (!back) return;
+    (void)layer;
+    uint32_t* px = canvas64();
+    int cx, cy, cw, ch;
+    clip_get64(&cx, &cy, &cw, &ch);
+    for (int c = 0; c < 4; c++) {
+        if (!(mask & (1 << c))) continue;
+        const int ox = (c & 1) ? (x + w - r) : x;
+        const int oy = (c & 2) ? (y + h - r) : y;
+        for (int j = 0; j < r; j++) {
+            const int sy = oy + j;
+            if (sy < cy || sy >= cy + ch) continue;
+            uint32_t* row = px + (uint64_t)sy * g_fw;
+            for (int i = 0; i < r; i++) {
+                const int sx = ox + i;
+                if (sx < cx || sx >= cx + cw) continue;
+                int cov;
+                if (c == 0)      cov = tab[j * r + i];
+                else if (c == 1) cov = tab[j * r + (r - 1 - i)];
+                else if (c == 2) cov = tab[(r - 1 - j) * r + i];
+                else             cov = tab[(r - 1 - j) * r + (r - 1 - i)];
+                if (cov >= 255) continue;
+                const int covr = 255 - cov;
+                uint32_t out = row[sx];
+                if (sx < bw && sy < bh) {
+                    const uint32_t src = back[(uint64_t)sy * bw + sx];
+                    if (cov <= 0) out = src;
+                    else out = blend_c64(out, src, covr);
+                } else if (cov <= 0) {
+                    out = theme64_tokens64()->desktop_base;
+                }
+                row[sx] = out;
+            }
+        }
+    }
 }

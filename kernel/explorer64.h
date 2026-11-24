@@ -79,6 +79,9 @@ struct Window;
 //   1 源不可读 / 2 源不是文件 / 3 超过单文件上限 / 4 目标写失败 / 5 目标空间不足 / 6 目标只读）。
 int explorer64_copy_file64(int svol, const char* sp, int dvol, const char* dp, int* why_out);
 void explorer64_open64();
+// ★ v0.11.6：打开资源管理器并直接进"回收站"（桌面回收站图标 / 终端 recycle 命令都走这条）。
+//   没有窗口就先开窗口；此电脑页进不来时先落到系统卷再进 /Recycle。失败只打点，不假装进去了。
+void explorer64_open_trash64();
 // ★ 批次 M：把"字节 -> 人读单位"换算（图标视图 / 详细视图 / 属性面板用的**同一个函数**）导出，
 //   供终端 bigtest 做"文件管理器里的大小显示"自动验收（1 MiB -> "1.0 MB"，8 MiB -> "8.0 MB"）。
 //   规则：< 1024 -> "N B"；< 1 MiB -> "N.N KB"；>= 1 MiB -> "N.N MB"（一位小数）。

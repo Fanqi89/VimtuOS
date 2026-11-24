@@ -11,6 +11,7 @@
 
 #include <setjmp.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "py/builtin.h"
@@ -31,11 +32,7 @@ static char heap[MICROPY_HEAP_SIZE];
 #endif
 
 static char *stack_top;
-
 int main(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
-
     int stack_dummy;
     stack_top = (char *)&stack_dummy;
     mp_stack_set_top(stack_top);
@@ -48,6 +45,16 @@ int main(int argc, char **argv) {
     mp_init();
 
     #if MICROPY_ENABLE_COMPILER
+    // ★ v0.11.6：`mp <脚本>` = 跑一个文件（与上游 `micropython foo.py` 同语义）。
+    //   argv 由内核终端经 proc64_start_elf64_argv64 摆好（argv[0] = /bin/mp，argv[1] = 脚本路径）。
+    //   走 shared/runtime/pyexec.c 的 pyexec_file()：它自己管 nlr（脚本抛异常只打到 stderr，
+    //   不会把解释器打死），源文件由本端口的 mp_lexer_new_from_file() 用 fd 2/0/8 读进来。
+    //   没有参数 = 老的 REPL（一条字节都不变）。
+    if (argc > 1 && argv != NULL && argv[1] != NULL && argv[1][0] != 0) {
+        const int rc = pyexec_file(argv[1]);
+        mp_deinit();
+        return rc ? 0 : 1;
+    }
     pyexec_friendly_repl();
     #endif
 
@@ -72,10 +79,33 @@ void gc_collect(void) {
 }
 #endif
 
-// 没有文件系统：这三个桩是 py/builtinimport.c / pyexec.c / py/modbuiltins.c 的链接需求。
+// ==================== 源文件读取（★ v0.11.6：真文件系统，不再是桩）====================
+// pyexec_file() 走的正是这条：mp_lexer_new_from_file(qstr) -> 本函数。
+//   实现方式：musl 的 fopen/fread（-> 内核 open/read/lseek/close，都是已实现的系统调用），
+//   读进一块**GC 管理的**缓冲（m_new），把 free_len 交给 lexer —— mp_reader_mem_close() 会在
+//   lexer 析构时用 m_del(char, buf, free_len) 把它还回堆，不会漏。
+// 边界（如实）：整文件读进内存（没有流式 lexer）—— 脚本按"用户自己写的小工具"定位，
+//   1 MiB 以内没问题；再大就如实报错（EIO），不假装能跑。
+#define MP_SRC_MAX_BYTES (1024 * 1024)
 mp_lexer_t *mp_lexer_new_from_file(qstr filename) {
-    (void)filename;
-    mp_raise_OSError(MP_ENOENT);
+    const char *path = qstr_str(filename);
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        mp_raise_OSError(MP_ENOENT);
+    }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); mp_raise_OSError(MP_EIO); }
+    const long n = ftell(f);
+    if (n < 0 || n > MP_SRC_MAX_BYTES) { fclose(f); mp_raise_OSError(MP_EIO); }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); mp_raise_OSError(MP_EIO); }
+    char *buf = m_new(char, (size_t)n + 1);
+    const size_t got = (n > 0) ? fread(buf, 1, (size_t)n, f) : 0;
+    fclose(f);
+    if (got != (size_t)n) {
+        m_del(char, buf, (size_t)n + 1);
+        mp_raise_OSError(MP_EIO);
+    }
+    buf[n] = 0;
+    return mp_lexer_new_from_str_len(filename, buf, (size_t)n, (size_t)n + 1);
 }
 
 // open() 直接 ENOENT。
