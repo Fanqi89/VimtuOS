@@ -10,6 +10,7 @@
 
 | 文件 | 日期 | 版本串 | HEAD | 一句话 |
 |---|---|---|---|---|
+| [HANDOVER_v0115_ready.md](HANDOVER_v0115_ready.md) | 2026-11-24 | 0.11.5（**已发版**） | `2044d59d` | **本轮封存单**：v0.11.5 发布状态（tag `265c8e0a…` / Release `456278688` / ISO+IMG sha256 / 旧版 v0.11.3 附件逐条未动）+ 23 条剩余边界（删除不进回收站、非空目录不能删、拖拽只同卷、最大化最近邻、Dock 上限 8、系统图标无 48px 档、全量清扫未跑完…）+ 8 条新坑（原始区硬预算、亚克力判据、前台窗口、多提交 API 回放、tag message 结尾换行） |
 | [HANDOVER_v0115_explorer_ops.md](HANDOVER_v0115_explorer_ops.md) | 2026-11-23 | 0.11.5（**未发版**） | `65e0b0bd` | 功能单：**拖拽进文件夹 = 真移动**（fs64_rename_to64；撞名/自环/只读卷一律拒绝并打点 `[UI] explorer drag move`）+ `fileops64_test` 三条过期判据按 v0.11.1 起的亚克力菜单重写 + 补"右键新建文本文件"验收 |
 | [HANDOVER_v0114_cjk_icon.md](HANDOVER_v0114_cjk_icon.md) | 2026-11-23 | 0.11.4（**未发版**） | `e3ed8078` | 功能单：**中文标题**（31 号内核光栅化覆盖率位图给 Ring 3 合成器，`ink` 打点）+ **真图标**（32 号应用身份 / 33 号图标 RGBA；窗口标题栏 + Dock 运行项）+ 资源管理器地址栏三按钮换图标包 chevron（kind 21/74）；两条先红后绿的如实定性（Dock 回弹窄竞态 / `system.img` 被测试写脏的 `reduce_motion=1`） |
 | [HANDOVER_v0113_ready.md](HANDOVER_v0113_ready.md) | 2026-11-23 | 0.11.3（**已发版**） | `40208a45` | **本轮封存单**：v0.11.3 发布状态（tag `d2968c83…` / Release `455130600` / ISO+IMG sha256 / 旧版未动）+ 17 条剩余边界（ASCII 标题、Dock 上限 8、最近邻缩放…）+ 全量清扫挂起说明 |
