@@ -156,6 +156,19 @@ def main():
                   "accent=%d/%d" % (got, aw * ah))
             check("B: 胶囊比『运行小圆点』宽（>=3x 图标宽 40%%）", aw >= 24, "w=%d" % aw)
 
+        # ---- B2. ★ v0.11.5 补：Dock 运行项画的是**应用真图标**（brand #8FD6FF），不是默认箭头 ----
+        # 为什么补这一条：v0.11.4 给外部窗口加了应用身份（32 号 set_app -> kind 74）与 Dock 图标通道
+        #   （dock64_ext_icon64），但验收只钉了"运行项存在/胶囊/最小化/恢复"，**图标本身没有像素判据**——
+        #   "图标全换了吗"这个问题，只有这一条能回答。
+        if icx >= 0 and icy >= 0:
+            bp = V.count(BEFORE, w, h, (icx - 23, icy - 23, icx + 23, icy + 23),
+                         lambda r, g, b: (b - r) >= 40 and b >= 0xE0)          # 品牌蓝：b-r=0x70（Dock 底 b-r≈6）
+            check("B2: Dock 运行项画的是应用真图标（品牌蓝像素 >= 40）", bp >= 40,
+                  "brand=%d（图标中心 %d,%d）" % (bp, icx, icy))
+            mdicon = vm.wait_re(r"\[DOCK64\] ext-icon surf=\d+ kind=74 name=image-viewer", 5, since=n1)
+            check("B2: 外部窗口图标登记（[DOCK64] ext-icon … kind=74 name=image-viewer）",
+                  mdicon is not None, mdicon.group(0) if mdicon else "（缺行）")
+
         # ---- C. 最小化（点最小按钮 = 三槽里的第一槽）----
         nmin = vm.n()
         min_cx, min_cy = wx + fw - 1 - 30 * 3 + 15, wy + 12
