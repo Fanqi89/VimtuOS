@@ -130,17 +130,26 @@ app_id -> 注册表下标 -> exec("/bin/viewer")
 
 ## 7. 本批**没做 / 未验证**的（如实点名）
 
-1. **"从开始菜单固定到 Dock 后图标正确"没有做鼠标自动化**：数据与代码路径已对上
-   （`app=2694` + `icon=image-viewer` + `dock_reg_index64` 命中 + 新增 `icon=` 打点），
-   但**没有**一次"真点击固定 → 读 `[DOCK64] item … icon=74`"的端到端证据 → 记 **UNVERIFIED**。
+> **两条 UNVERIFIED 的统一原因：当前自动化点击环境受限。** 本仓库的鼠标注入只有 QEMU monitor 的
+> **相对移动**（`mouse_move dx dy` + `mouse_button`），要点中一个具体控件必须靠"C 光标打点闭环"把
+> 光标先同步到已知位置再逐步逼近（`tests/dock64_test.py` 的 `sync_cur` / `goto_exact`）；本轮没有把
+> 这套闭环接到"开始菜单 tile / 上下文菜单行"上（tile 坐标还要按 theme Token 现算），所以这两条
+> **只用串口数据 + 代码路径证明，没有端到端点击证据**。判据留着，下一轮补自动化即可。
+
+1. **"从开始菜单固定到 Dock 后图标正确" = UNVERIFIED（自动化点击受限）**：数据与代码路径已对上
+   （`app=2694` + `icon=image-viewer` + `dock_reg_index64` 命中 + 新增 `[DOCK64] item … icon=` 打点），
+   但**没有**一次"真点击固定 → 读 `icon=74`"的端到端证据。
    手工验证一条命令即可：开始菜单里右键"图片查看器"→ 固定到 Dock → 串口搜
    `[DOCK64] item … name=图片查看器 … kind=pinned icon=74`。
-2. **右键"打开文件所在位置"没有做点击验证**（同上：需要 GUI 自动化）→ 记 **UNVERIFIED**。
-3. `tests/viewer64_test.py`（双击启动真实应用）本轮**没跑**。
+2. **右键"打开文件所在位置" = UNVERIFIED（自动化点击受限）**：菜单行、动作、打点
+   `[DOCK64] menu act=reveal exec=/bin/viewer dir=/bin` 都已就位，缺一次真实点击。
+   手工验证：开始菜单或 Dock 上右键"图片查看器"→ 点"打开文件所在位置"→ 串口出现上面那行 +
+   文件管理器停在 `/bin` 且 `viewer` 高亮。
+3. `tests/viewer64_test.py`（双击启动真实应用）本轮**没跑**（既有能力，见 §4）。
 4. 桌面图标右键**没有**加"打开文件所在位置"（本批只做了开始菜单 + Dock 共用的那个菜单）。
 5. `/usr/share/applications`、`/apps/desktop` 两个目录**只扫不建**（存在才扫）；播种只建 `/apps`。
 6. 存量 `dock.conf` 里的 `pinned=-1` 不自动迁移（见 §2.3）。
-7. v0.12.1 **还没发版**（version 串已改、构建已绿）。
+7. 发版状态见 §11（**v0.12.1 已发版**）。
 
 ## 8. 改动文件
 
@@ -169,3 +178,17 @@ app_id -> 注册表下标 -> exec("/bin/viewer")
 - 打点总表：`[APP64] shortcuts seed|scan`、`[APPREG64] app …`、`[START64] grid apps=…`、
   `[DOCK64] item … icon=`、`[DOCK64] menu act=reveal exec=… dir=…`
 - 复现：`py -3 tests/shortcut64_test.py`
+
+## 11. 发版回读（v0.12.1 已发布）
+
+| 项 | 值 |
+|---|---|
+| tag | <!--TAG--> |
+| Release | <!--REL--> |
+| `vimtu64-64.iso` | <!--ISOB--> |
+| `vimtu64-64.img` | <!--IMGB--> |
+| 旧版 v0.12.0 | <!--PREV--> |
+
+发版脚本：`$PI_SCRATCH_DIR\rel_v0121.py`（与 v0.11.9 / v0.12.0 同一套：本地 annotated tag 与远端
+tag 对象**逐位复现 sha**、Release + 两附件上传、本地 `sha256` 与远端 `digest` 双向核对、
+上一版附件 `id/size/digest/updated_at` 逐条回读未动）。
