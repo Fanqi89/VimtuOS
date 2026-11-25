@@ -224,6 +224,7 @@ static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
 #include "mem_64.h"         // PAGE_SIZE_64 / page_free_64 / PTE_*
 #include "debug64.h"
 #include "kpti64.h"        // ★ v0.11.9：KPTI（LSTAR 是否指向共享入口区）
+#include "iso64.h"         // ★ v0.12.0：SMAP（用户访存开窗 iso64_stac64/clac64）
 #include "fb.h"             // 屏幕输出（fb_draw_text / fb_flip_region）
 #include "proc64.h"         // 批次 C：进程/地址空间（fork/execve/wait4/kill/每进程 brk&mmap/FS 基址）
 // ★ 系统音效：音频 ABI（49 audio_play）**只转发**给 hda64 驱动（不新增驱动能力）。
@@ -407,6 +408,9 @@ static void syscall64_enosys_once64(uint64_t nr) {
 //   上方；这里先声明，因为 int 0x80 的 write 路径在它之前）。理由见那份实现的注释：逐字符裸写会被
 //   抢占切成半行、再被内核日志劈开（实测 `… -j2 al[SHM64] …`）。
 static void syscall64_serial_linewise64(const char* p, uint64_t len);
+// ★ v0.12.0（SMAP）：write 的 bounce —— 定义在下面（fd 层那一段），这里先声明，int 0x80 路径要用。
+static uint8_t g_lx_writebuf64[4096];
+static void lx64_copy_from_user64(void* dst, uint64_t uva, uint64_t n);
 // 只画一行（覆盖上一次的内容）：用户态日志很短，够证明"输出到了屏幕"。
 static void syscall64_screen_puts64(const char* s, uint64_t n) {
     if (fb_width() <= 0) return;                     // 还没建帧缓冲（理论上不会）
@@ -430,7 +434,10 @@ static int64_t syscall64_write64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_
     if (len == 0 || len > SYSCALL64_WRITE_MAX) { syscall64_deny64(nr, len); return -1; }
     if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -1; }
 
-    const char* p = (const char*)(uintptr_t)buf;                     // 已校验：是用户页，ring0 可读
+    // ★ v0.12.0（SMAP）：先把用户缓冲拷进内核 bounce，输出这一侧只碰内核内存。
+    //   bounce 同 g_lx_writebuf64（= 4096 B）> SYSCALL64_WRITE_MAX（1024）。
+    lx64_copy_from_user64(g_lx_writebuf64, buf, len);
+    const char* p = (const char*)g_lx_writebuf64;
     syscall64_serial_linewise64(p, len);                             // ★ v0.9.5：按行原子（原来逐字符裸写）
     syscall64_screen_puts64(p, len);
     return (int64_t)len;
@@ -573,6 +580,7 @@ static int64_t sc64_fb_map64(uint64_t out_va_uptr, uint64_t out_info_uptr) {
     user64_paging_sync64();                             // 批量改完页表后投递一次（重载 CR3）
     const int u = user64_page_is_user_ok64(USER64_FB_VA64) ? 1 : 0;
 
+    ISO64_STAC64();                                                    // ★ v0.12.0：两个出参都写用户页
     *(uint64_t*)(uintptr_t)out_va_uptr = USER64_FB_VA64;               // 出参 1：用户 VA
     Fb64Info info;                                                     // 出参 2：几何
     info.width  = (uint32_t)bw;
@@ -582,6 +590,7 @@ static int64_t sc64_fb_map64(uint64_t out_va_uptr, uint64_t out_info_uptr) {
     info.size   = (uint64_t)bytes;
     info.va     = USER64_FB_VA64;
     *(Fb64Info*)(uintptr_t)out_info_uptr = info;
+    ISO64_CLAC64();
 
     dbg64_line_begin64();
     dbg64_str("[FB64] map pid="); sc64_fb_dec64(pid);
@@ -659,10 +668,21 @@ static void lx64_wr64(uint8_t* p, uint64_t v) {
     lx64_wr32(p + 4, (uint32_t)(v >> 32));
 }
 // 拷到用户态（调用方保证已过 user64_range_ok64）
+// 从用户态拷进内核 bounce（★ v0.12.0：SMAP 窗口只包住拷贝，之后的处理全在内核内存上）。
+static void lx64_copy_from_user64(void* dst, uint64_t uva, uint64_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)(uintptr_t)uva;
+    ISO64_STAC64();
+    for (uint64_t i = 0; i < n; i++) d[i] = s[i];
+    ISO64_CLAC64();
+}
+// ★ v0.12.0：SMAP —— 往用户页写必须开窗（AC=1）。窗口只包住这次拷贝，不包调用方。
 static void lx64_copy_to_user64(uint64_t uva, const void* src, uint64_t n) {
     const uint8_t* s = (const uint8_t*)src;
+    ISO64_STAC64();
     uint8_t* d = (uint8_t*)(uintptr_t)uva;
     for (uint64_t i = 0; i < n; i++) d[i] = s[i];
+    ISO64_CLAC64();
 }
 // 从用户态拷一个 NUL 结尾的短字符串（逐字节校验：一旦跨出已映射的用户页立刻拒绝）。
 // 返回 0 = 成功（out 已 NUL 结尾）；-1 = 越界 / 超长 / 没有 NUL。
@@ -670,7 +690,9 @@ static int lx64_user_str64(uint64_t uva, char* out, uint32_t cap) {
     if (cap == 0) return -1;
     for (uint32_t i = 0; i + 1u < cap; i++) {
         if (!user64_range_ok64(uva + i, 1)) return -1;
+        ISO64_STAC64();                                  // ★ v0.12.0：只开这一个字节的窗
         const char c = *(const char*)(uintptr_t)(uva + i);
+        ISO64_CLAC64();
         out[i] = c;
         if (c == 0) return 0;
     }
@@ -705,13 +727,13 @@ static int lx64_resolve_path64(uint64_t path_va, char* out, uint32_t cap) {
     for (uint32_t i = 0; cwd[i] && n + 2u < (uint32_t)sizeof(buf); i++) buf[n++] = cwd[i];
     if (n == 0 || buf[n - 1] != '/') buf[n++] = '/';
     for (uint32_t i = 0; out[i] && n + 1u < (uint32_t)sizeof(buf); i++) buf[n++] = out[i];
-    buf[n] = 0;
     if (n == 0 || n + 1u > cap) return -LX64_EINVAL;
     for (uint32_t i = 0; i <= n; i++) out[i] = buf[i];
     return 0;
 }
 // ring3 read 的内核 bounce（syscall 路径全程 IF=0：单 CPU 上不会被别的任务穿插）
 static uint8_t g_lx_readbuf64[LX64_READ_MAX];
+// （g_lx_writebuf64 的定义在上面的 forward 声明处：int 0x80 的 write 也要用同一个 bounce）
 // ★ A4-2a：控制台输出 = 串口（总是）+ 屏幕（fd 1 才画；fd 2 = 只串口，与旧行为一致）。
 //   fd64 的"控制台 tty"对象通过下面的 extern "C" 钩子复用同一份实现（弱符号，见 fd64.cpp）。
 // ★ v0.9.5 真缺陷修复（make64_test 的 `-j2` 断言抓到）：客人的 stdout 原来是**逐字符**直接
@@ -760,6 +782,9 @@ struct Lx64DirPend { int used; int pid; int fd; uint32_t type; uint32_t size; ch
 static Lx64DirPend g_dir_pend;
 
 static int64_t lx64_getdents64(int fd, void* buf, uint64_t count) {
+    // ★ v0.12.0（SMAP）：这个函数**直接在用户缓冲里拼 dirent**，所以整函数都在用户访存里。
+    //   作用域守卫：任何 return 路径都会 CLAC（窗口 = 一次 getdents，里面只有 fd64 的内存操作）。
+    Iso64UserAccess64 ua;
     if (!buf) return -LX64_EFAULT;
     if (count < 32) return -LX64_EINVAL;
     if (fd < 3) return -LX64_EBADF;
@@ -1064,15 +1089,17 @@ static int64_t lx64_write64(uint64_t nr, uint64_t fd, uint64_t buf, uint64_t len
         if (len == 0) return 0;
         if (len > LX64_WRITE_MAX) { syscall64_deny64(nr, len); return -LX64_EINVAL; }
         if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
-        lx64_console_out64((const char*)(uintptr_t)buf, len, fd == 1);
+        lx64_copy_from_user64(g_lx_writebuf64, buf, len);       // ★ v0.12.0：先落地到内核 bounce
+        lx64_console_out64((const char*)g_lx_writebuf64, len, fd == 1);
         return (int64_t)len;
     }
     if (fd >= (uint64_t)FD64_MAX) { syscall64_deny64(nr, fd); return -LX64_EBADF; }
     if (len == 0) return 0;
     if (len > LX64_WRITE_MAX) { syscall64_deny64(nr, len); return -LX64_EINVAL; }
     if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
-    // 用户指针已经过范围校验、且当前 CR3 就是该进程的地址空间：fd64 直接按内核指针读它是安全的
-    const int n = fd64_write64((int)fd, (const void*)(uintptr_t)buf, (int)len);
+    // 用户指针已经过范围校验；★ v0.12.0：仍然先拷进内核 bounce（SMAP 下内核不能直接读用户页）
+    lx64_copy_from_user64(g_lx_writebuf64, buf, len);
+    const int n = fd64_write64((int)fd, (const void*)g_lx_writebuf64, (int)len);
     return (int64_t)n;
 }
 
@@ -1510,12 +1537,15 @@ static int64_t lx64_tty_ioctl64(uint64_t nr, uint64_t req, uint64_t arg) {
     }
     if (req == 0x5402u || req == 0x5403u || req == 0x5404u) {       // TCSETS*：**存下来**（A4-5）
         if (!user64_range_ok64(arg, 36)) { syscall64_deny64(nr, arg); return -LX64_EFAULT; }
+        // ★ v0.12.0（SMAP）：这 36 字节是用户传进来的 termios，读它必须开窗。
         const uint8_t* p = (const uint8_t*)(uintptr_t)arg;
+        ISO64_STAC64();
         g_tty64_iflag = lx64_rd32(p + 0);
         g_tty64_oflag = lx64_rd32(p + 4);
         g_tty64_cflag = lx64_rd32(p + 8);
         g_tty64_lflag = lx64_rd32(p + 12);
         for (uint32_t i = 0; i < 19; i++) g_tty64_cc[i] = p[17 + i];
+        ISO64_CLAC64();
         return 0;
     }
     return -LX64_ENOTTY;                                           // 其它请求：与 Linux 对 tty 的口径一致
@@ -1701,7 +1731,9 @@ static int64_t lx64_execve64(pt_regs64* r, uint64_t path_va, uint64_t argv_va, u
     if (argv_va) {
         for (; argc < LX64_EXEC_ARGV_MAX; argc++) {
             if (!user64_range_ok64(argv_va + (uint64_t)argc * 8, 8)) { syscall64_deny64(59, argv_va); return -LX64_EFAULT; }
+            ISO64_STAC64();                                  // ★ v0.12.0：读用户 argv[] 里的一个指针
             const uint64_t p = *(const uint64_t*)(uintptr_t)(argv_va + (uint64_t)argc * 8);
+            ISO64_CLAC64();
             if (p == 0) break;
             if (lx64_user_str64(p, argv_buf[argc], LX64_EXEC_ARGV_BYTES) != 0) { syscall64_deny64(59, p); return -LX64_EFAULT; }
             argv[argc] = argv_buf[argc];
@@ -2171,7 +2203,9 @@ static int64_t lx64_nanosleep64(uint64_t nr, uint64_t req_va, uint64_t rem_va) {
     if (!user64_range_ok64(req_va, 16)) { syscall64_deny64(nr, req_va); return -LX64_EFAULT; }
     const uint8_t* p = (const uint8_t*)(uintptr_t)req_va;
     uint64_t sec = 0, nsec = 0;
+    ISO64_STAC64();                                     // ★ v0.12.0：读用户 timespec 的 16 字节
     for (int i = 0; i < 8; i++) { sec |= (uint64_t)p[i] << (8 * i); nsec |= (uint64_t)p[8 + i] << (8 * i); }
+    ISO64_CLAC64();
     uint64_t ms = sec * 1000u + nsec / 1000000u;
     if (ms > 60000u) ms = 60000u;                        // 有界：最多 60 秒（防挂死）
     if (ms == 0 && nsec > 0) ms = 1;
@@ -3624,6 +3658,9 @@ static int64_t syscall64_linux64(pt_regs64* r) {
 // ==================== 分发（两条路径共用一个入口）====================
 extern "C" void syscall64_dispatch64(pt_regs64* r) {
     // syscall 指令路径：int_no = SYSCALL64_INSM_FRAME_MARK64（见 syscall_entry64.asm）
+    // ★ v0.12.0：进内核先 CLAC（AC=0）—— SMAP 下"默认碰不到用户页"，要碰的地方自己 iso64_stac64()。
+    //   int 0x80 那条路径在 isr_handler64 开头已经做过一次，这里管的是 `syscall` 指令那条。
+    ISO64_CLAC_ON_ENTRY();
     if (r->int_no == SYSCALL64_INSM_FRAME_MARK64) {
         const uint64_t nr = r->rax;
         const uint64_t a1 = r->rdi, a2 = r->rsi, a3 = r->rdx;

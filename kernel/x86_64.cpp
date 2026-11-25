@@ -13,6 +13,7 @@
 #include "x86_64.h"
 #include "debug64.h"
 #include "kpti64.h"      // ★ v0.11.9：KPTI（门重定向 / 共享入口栈 / TSS.rsp0 语义）
+#include "iso64.h"       // ★ v0.12.0：SMAP（进内核 CLAC / 违规处置）与 WP 现状
 
 // ==================== 全局状态 ====================
 volatile uint64_t g_ticks64 = 0;
@@ -439,11 +440,14 @@ extern "C" void drm64_tick64(void) __attribute__((weak));
 extern "C" void isr_handler64(pt_regs64* r) {
     const uint64_t no = r->int_no;
     g_irq_total64++;
-
+    g_irq_total64++;
+    // ★ v0.12.0：从 ring3 进来的第一件事 —— AC=0（SMAP 生效）。SMAP 没开时是空操作。
+    ISO64_CLAC_ON_ENTRY();
     if (no == 32) {
         g_ticks64++;
         if (drm64_tick64) drm64_tick64();       // ★ v0.9.20：DRM 事件投递（无事件时只读一个 int）
         pic_eoi(0);
+        ISO64_TICK64();                          // ★ v0.12.0：SMAP 探针模式的"重新武装"钩子（非探针模式为空）
         schedule64(r);
         return;
     }
@@ -473,6 +477,10 @@ extern "C" void isr_handler64(pt_regs64* r) {
         //   SIGFPE），有 handler 就进 handler；不可恢复的（#DF/#TS/#MC）与内核态异常照旧 PANIC。
         //   为什么放在打点之前：这条路径现在是"正常的进程生命周期事件"，不该再喊 [PANIC]。
         if (sig64_user_fault64 && sig64_user_fault64(no, r)) return;
+        // ★ v0.12.0：内核态的 #PF 先问 SMAP 层 —— "内核碰了用户页却没开窗"是一类**可归属**的错，
+        //   处置是只杀当前进程（SIGSEGV），不 PANIC 整机（默认）。探针模式下它会关掉 SMAP 让指令重试，
+        //   一次启动就能把清单收全。不是 SMAP 的 #PF 一律原样落到下面的 PANIC。
+        if (ISO64_SMAP_FAULT(r)) return;
         // 把出错上下文打全：只知道"异常号"没法定位（UEFI 路径下曾只报 exception 13，
         // 靠 RIP 才认出是在哪条指令）。RIP/CS/RFLAGS/ERR 都来自中断帧。
         dbg64_str("[PANIC] cpu exception ");

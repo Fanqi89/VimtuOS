@@ -300,6 +300,12 @@ def qemu_args(qemu, disks, serial, port, name):
     args += ["-boot", "order=c", "-m", "512", "-vga", "std", "-display", "none",
              "-serial", "file:%s" % p64.q(serial),
              "-no-reboot"]
+    # ★ v0.12.0：SMAP/SMEP 的验收必须在**带这些位的 CPU 模型**上跑（默认 qemu64 两个位都没有，
+    #   于是"开没开"这件事在默认 CPU 下根本验不到）。默认行为一个字节不变：
+    #   只有显式给了环境变量 VIMTU_CPU 才追加 -cpu。
+    cpu = os.environ.get("VIMTU_CPU", "").strip()
+    if cpu:
+        args += ["-cpu", cpu]
     if port:
         args += ["-monitor", "telnet:127.0.0.1:%d,server,nowait" % port]
     return args

@@ -10,6 +10,7 @@
 #include "sig64.h"
 #include "usermode64.h"     // user64_range_ok64 / user64_exit_to_kernel64
 #include "debug64.h"        // dbg64_*（串口打点）
+#include "iso64.h"          // ★ v0.12.0：SMAP（往用户页投递信号帧要开窗）
 
 // ==================== proc64 侧的弱引用（安装介质内核里为 0）====================
 // ★ 弱符号：这些函数是 C++ 名字，声明必须与 kernel/proc64.h 逐字一致（否则名字对不上，
@@ -174,8 +175,10 @@ int64_t sig64_state_procmask64(Sig64State64* st, uint32_t how, uint64_t set, uin
 // struct sigaction（x86_64）：handler(+0) flags(+8) restorer(+16) mask(+24) —— 32 字节。
 static int64_t sig64_copy_to_user64(uint64_t va, const void* src, uint64_t n) {
     if (!user64_range_ok64(va, n)) return -SIG64_EFAULT;
+    ISO64_STAC64();                                     // ★ v0.12.0：这一段是**写用户页**，必须开窗
     const uint8_t* s = (const uint8_t*)src;
     for (uint64_t i = 0; i < n; i++) ((uint8_t*)(uintptr_t)va)[i] = s[i];
+    ISO64_CLAC64();
     return 0;
 }
 int64_t sig64_sys_rt_sigaction64(uint64_t sig, uint64_t act_va, uint64_t old_va, uint64_t sigsetsize) {
@@ -187,7 +190,9 @@ int64_t sig64_sys_rt_sigaction64(uint64_t sig, uint64_t act_va, uint64_t old_va,
     if (act_va) {
         if (!user64_range_ok64(act_va, 32)) return -SIG64_EFAULT;
         const uint64_t* a = (const uint64_t*)(uintptr_t)act_va;
+        ISO64_STAC64();                                    // ★ v0.12.0：读用户 struct sigaction（32B）
         handler = a[0]; flags = a[1]; restorer = a[2]; mask = a[3];
+        ISO64_CLAC64();
     }
     if (act_va && (sig == SIG64_KILL || sig == SIG64_STOP)) {       // 不可捕获/忽略
         sig64_log2u_s64("[SIG64] action deny pid=", (uint64_t)(uint32_t)pid, " sig=", sig, " reason=uncatchable");
@@ -216,7 +221,9 @@ int64_t sig64_sys_rt_sigprocmask64(uint64_t how, uint64_t set_va, uint64_t old_v
     uint64_t set = 0;
     if (set_va) {
         if (!user64_range_ok64(set_va, 8)) return -SIG64_EFAULT;
+        ISO64_STAC64();                                  // ★ v0.12.0：读用户 sigset
         set = *(const uint64_t*)(uintptr_t)set_va;
+        ISO64_CLAC64();
     }
     uint64_t old = st ? st->blocked : 0;
     if (st && set_va) {
@@ -265,10 +272,12 @@ static int sig64_push_frame64(Sig64State64* st, int sig, pt_regs64* r, const cha
     f.rip = r->rip; f.rflags = r->rflags; f.rsp = r->rsp;
     f.blocked = st->blocked;
     // 写用户栈：帧 + 返回地址（restorer 桩）
+    ISO64_STAC64();                                        // ★ v0.12.0：往用户栈上写信号帧 + 返回地址
     volatile uint64_t* dst = (volatile uint64_t*)(uintptr_t)fr;
     const uint64_t* src = (const uint64_t*)&f;
     for (uint32_t i = 0; i < (uint32_t)(sizeof(Sig64Frame64) / 8); i++) dst[i] = src[i];
     *(volatile uint64_t*)(uintptr_t)sp = restorer;
+    ISO64_CLAC64();
     // 改写帧：进 handler
     r->rip = handler;
     r->rsp = sp;
@@ -386,7 +395,9 @@ int64_t sig64_sys_rt_sigreturn64(pt_regs64* r) {
     Sig64Frame64 f;
     const uint64_t* src = (const uint64_t*)(uintptr_t)fr;
     uint64_t* dst = (uint64_t*)&f;
+    ISO64_STAC64();                                        // ★ v0.12.0：从用户栈上把信号帧读回来
     for (uint32_t i = 0; i < (uint32_t)(sizeof(Sig64Frame64) / 8); i++) dst[i] = src[i];
+    ISO64_CLAC64();
     if (f.magic != SIG64_FRAME_MAGIC64 || f.sig == 0 || f.sig >= (uint64_t)SIG64_NSIG) {
         sig64_log2u_h64("[SIG64] sigreturn FAILED pid=", (uint64_t)(uint32_t)(proc64_current_pid64 ? proc64_current_pid64() : -1),
                         " magic=0x", f.magic, " reason=bad-frame");

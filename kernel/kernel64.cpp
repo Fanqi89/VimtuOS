@@ -1260,7 +1260,14 @@ display64_init64();
             (void)trash64_boot_ensure64(fs64_current_vol64());
             (void)trash64_selftest64();                          // ★ v0.11.6：回收站往返自检（put/list/restore/purge）
             (void)deskdir64_selftest64();                        // ★ v0.11.7：桌面文件夹路径拼接/唯一名（不碰盘）
-            (void)iso64_selftest64();                             // ★ v0.11.8：隔离自检（硬件位 + 地址空间审计，6 位）
+            // ★ v0.12.0：**先开硬件位，再自检**。v0.11.8/v0.11.9 的顺序反了（自检在前、初化在后），
+            //   于是自检时 CR0.WP 还没被置上 -> 日志里那句 "wp leak detected ... reassert" 其实是
+            //   "自检跑在初化之前"，不是"启动期某条路径把 WP 清了"。证据：那次读到的 cr0=0x80000011
+            //   正好是 boot/loader64.asm 打开分页时写的值（PG|ET|PE，本来就没有 WP 位）。
+            //   顺序修正后这一位才真的在判"有没有泄漏"；而且 WP/SMEP/SMAP 现在**不分启动路径**都开
+            //   （原来那行在 user64_available64() 分支里，UEFI 路径整层都没开）。
+            (void)iso64_init64();                                 // 打开 CR0.WP + CR4.SMEP/SMAP（CPU 支持才开）
+            (void)iso64_selftest64();                             // ★ v0.11.8：隔离自检（硬件位 + 地址审计，6 位）
             (void)app64_selftest64();
 (void)app64_install_builtin64(sys_drive, sys_lba);   // 幂等：已装过则 skipped (exists)
             (void)elf64_selftest64();                            // 合法映像/坏样本自检（坏样本带 selftest 前缀）
@@ -1281,7 +1288,8 @@ display64_init64();
                 //   4) proc64_demo64()：建 init 进程（自己的 CR3 + 自己的任务）跑完整演示，
                 //      内核这侧只做有界等待 + 收尾。UEFI（固件页表）下会打一行诚实跳过。
                 proc64_init64();
-(void)iso64_init64();                              // ★ v0.11.8：打开 CR0.WP + CR4.SMEP（CPUID 支持才开），并如实打开始化行
+                // ★ v0.12.0：这里原来再开一次硬件位 —— 已移到上面（iso64_selftest64 之前）**无条件**跑，
+                //   所以 UEFI 启动路径现在也开 WP/SMEP/SMAP（原来整层只在 user64_available64() 分支里）。
                 (void)proc64_selftest64();
 (void)proc64_install_builtin64(sys_drive, sys_lba);
                 (void)proc64_demo64("/proc64.elf");
@@ -1584,7 +1592,9 @@ display64_init64();
     //   挂接早在 os_boot_path 开头就做完了（见上面 con64_boot_screen64 的调用点）。
     con64_boot_screen_done64();
     // ★ v0.11.8：进图形阶段之前再把 CR0.WP 补一次（启动期有路径会临时清掉，实测见 [ISO64] wp leak）
-    (void)iso64_reassert64();
+    // ★ v0.12.0：这里原来调 iso64_reassert64() 兜底 —— 那等于把"有没有泄漏"这个判据自己抹掉。
+    //   改成**只查不补**的现场检查：判据是三次启动都出现 wp=1，且**没有** `wp leak detected` 行。
+    (void)iso64_check_wp64("gui-entry");
     gui64_run(bi);          // 不返回：进入桌面消息循环
 }
 #endif

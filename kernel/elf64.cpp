@@ -32,6 +32,7 @@
 #include "mem_64.h"         // PAGE_SIZE_64 / PTE_* / page_free_64
 #include "x86_64.h"         // ★ A3：g_ticks64（AT_RANDOM 的随机种子）
 #include "debug64.h"
+#include "iso64.h"          // ★ v0.12.0：SMAP（装载时往用户页写段内容/清 .bss 要开窗）
 
 // ★ 本批（演示程序搬进系统卷）：hello.elf 的字节**不在内核里** ——
 //   交付 = 系统卷里的 /hello.elf（tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；
@@ -600,10 +601,12 @@ static uint64_t e64_rand64() {
 }
 static void e64_fill_random64(uint64_t va) {
     uint8_t* p = (uint8_t*)(uintptr_t)va;                 // 栈页已映射（调用点保证）
+    ISO64_STAC64();                                      // ★ v0.12.0：整函数就是写用户栈上那 16 字节
     for (uint32_t i = 0; i < 16; i += 8) {
         const uint64_t r = e64_rand64();
         for (uint32_t k = 0; k < 8; k++) p[i + k] = (uint8_t)(r >> (8 * k));
     }
+    ISO64_CLAC64();
     g_e64_rand_va64 = va;
 }
 
@@ -638,6 +641,9 @@ static uint64_t e64_build_stack64(const char* argv0) {
     const uint64_t stack_top = USER64_STACK_VA64 + USER64_STACK_BYTES64;
     const uint64_t str_va = stack_top - 32;                       // 字符串区（16 字节对齐）
 
+    // ★ v0.12.0（SMAP）：这一段**整段在写用户栈**（argv 字符串 + 指针数组 + auxv + AT_RANDOM），
+    //   窗口开到这里、函数出口关掉；中间只调 e64_fill_random64（它本来就是往那块用户内存里写随机数）。
+    ISO64_STAC64();
     uint8_t* sp = (uint8_t*)(uintptr_t)str_va;
     uint32_t k = 0;
     if (argv0) { for (; argv0[k] && k < 24; k++) sp[k] = (uint8_t)argv0[k]; }
@@ -672,6 +678,7 @@ static uint64_t e64_build_stack64(const char* argv0) {
     const uint64_t rsp = (str_va - 64u - (uint64_t)n * 8u) & ~((uint64_t)15);   // 16 字节对齐
     uint64_t* d = (uint64_t*)(uintptr_t)rsp;
     for (uint32_t i = 0; i < n; i++) d[i] = w[i];
+    ISO64_CLAC64();
     return rsp;
 }
 
@@ -691,10 +698,12 @@ static uint64_t e64_build_stack_argv64(const char* const* argv, uint32_t argc) {
         uint32_t len = e_strlen(s) + 1;
         if (len > 128) len = 128;                          // 单个参数的硬上限（演示/验收够用）
         sp_va = (sp_va - len) & ~((uint64_t)15);           // 每个字符串 16 字节对齐，便于日志直读
+        ISO64_STAC64();                                    // ★ v0.12.0：往用户栈写一个 argv 字符串
         uint8_t* d = (uint8_t*)(uintptr_t)sp_va;
         uint32_t k = 0;
         for (; k + 1u < len && s[k]; k++) d[k] = (uint8_t)s[k];
         d[k] = 0;
+        ISO64_CLAC64();
         argp[i] = sp_va;
         if (i == 0) ent_va = sp_va;
     }
@@ -702,7 +711,9 @@ static uint64_t e64_build_stack_argv64(const char* const* argv, uint32_t argc) {
     // ★ A3：AT_RANDOM 的 16 字节放在 [sp_va-16, sp_va) —— 字符串在 [sp_va, stack_top)，
     //   指针数组在 rsp..(rsp+8m) 且 rsp ≤ sp_va-128，所以这一段同样恒空且在 rsp 上方。
     const uint64_t rand_va = sp_va - 16;
+    ISO64_STAC64();                                        // ★ v0.12.0：AT_RANDOM 也是写用户栈
     e64_fill_random64(rand_va);
+    ISO64_CLAC64();
 
     uint64_t w[64];
     uint32_t m = 0;
@@ -728,7 +739,9 @@ static uint64_t e64_build_stack_argv64(const char* const* argv, uint32_t argc) {
 
     const uint64_t rsp = (sp_va - 128u - (uint64_t)m * 8u) & ~((uint64_t)15);   // 16 字节对齐
     uint64_t* d = (uint64_t*)(uintptr_t)rsp;
+    ISO64_STAC64();                                        // ★ v0.12.0：指针数组 + auxv 写用户栈
     for (uint32_t i = 0; i < m; i++) d[i] = w[i];
+    ISO64_CLAC64();
     return rsp;
 }
 
@@ -785,15 +798,21 @@ static int e64_seg_map_union64(const Elf64Image64* img, const char* path,
             uint32_t n = (uint32_t)((left > ELF64_READ_CHUNK64) ? ELF64_READ_CHUNK64 : left);
             if (blob) {
                 if (s->off + done + n > blob_len) return E64_SEG_FILE;
+                ISO64_STAC64();                                  // ★ v0.12.0：写用户页
                 for (uint32_t b = 0; b < n; b++) dst[done + b] = blob[s->off + done + b];
+                ISO64_CLAC64();
             } else {
                 if (!path) return E64_READ;
                 if (e64_read_at64(path, s->off + done, g_e64_chunk64, n) != 0) return E64_READ;
+                ISO64_STAC64();                                  // ★ v0.12.0：写用户页
                 for (uint32_t b = 0; b < n; b++) dst[done + b] = g_e64_chunk64[b];
+                ISO64_CLAC64();
             }
             done += n;
         }
+        ISO64_STAC64();                                                  // ★ v0.12.0：清用户页
         for (uint64_t b = s->filesz; b < s->memsz; b++) dst[b] = 0;      // .bss 清零
+        ISO64_CLAC64();
     }
 
     // ---- 2) 权限收紧：按 p_flags 重设各段叶子权限位 ----
@@ -1498,6 +1517,7 @@ int elf64_selftest64() {
         //   16=叶子权限 32=栈页权限
         int d = 0;
         if (entry != tva) d |= 1;
+        ISO64_STAC64();                                   // ★ v0.12.0：下面读的是**用户页里的映像**和用户栈
         const uint8_t* m = (const uint8_t*)(uintptr_t)tva;
         for (uint32_t i = 0; i < E64_ST_CONTENT_LEN; i++) {                                     // 内容拷进去了
             if (m[E64_ST_CONTENT_OFF + i] != (uint8_t)(0xA0u + i)) d |= 2;
@@ -1511,12 +1531,14 @@ int elf64_selftest64() {
         if (st[0] != 1) fail |= 4;                                                                      // argc
         if (st[1] != USER64_STACK_VA64 + USER64_STACK_BYTES64 - 32) fail |= 4;                          // argv[0] 指针
         if (st[2] != 0 || st[3] != 0) fail |= 4;                                                        // argv/envp 终止
+        ISO64_CLAC64();
         // ★ A3：auxv 逐条核对（不止 AT_ENTRY/AT_NULL）—— 号错/缺项在这里立刻暴露。
         //   AT_PHENT 必须是 56、AT_PHNUM 与解析结果一致、AT_RANDOM 必须是可读的 16 字节
         //   （这里真的逐字节读一遍）、AT_SECURE 必须 0、AT_UID==AT_EUID（musl 才不会走降权路径）。
         bool at_entry = false, at_null = false, at_phent = false, at_phnum = false;
         bool at_random = false, at_secure = false, at_uid_eq = false;
         uint64_t at_uid = 1, at_euid = 2;
+        ISO64_STAC64();                                   // ★ v0.12.0：auxv 数组本身就在**用户栈**上
         for (uint32_t i = 4; i < 64; i += 2) {
             if (st[i] == E64_AT_ENTRY && st[i + 1] == tva) at_entry = true;
             if (st[i] == E64_AT_PHENT && st[i + 1] == ELF64_PHDR_SIZE) at_phent = true;
@@ -1524,7 +1546,9 @@ int elf64_selftest64() {
             if (st[i] == E64_AT_RANDOM) {
                 const uint8_t* rp = (const uint8_t*)(uintptr_t)st[i + 1];
                 uint32_t acc = 0;                                        // 逐字节读（不可读这里就 #PF -> 自检失败）
+                ISO64_STAC64();                                   // ★ v0.12.0：读用户栈上的 AT_RANDOM
                 for (uint32_t k = 0; k < 16; k++) acc |= rp[k];
+                ISO64_CLAC64();
                 at_random = user64_page_is_user_ok64(st[i + 1]) && (acc != 0);
             }
             if (st[i] == E64_AT_SECURE && st[i + 1] == 0) at_secure = true;
@@ -1532,10 +1556,13 @@ int elf64_selftest64() {
             if (st[i] == E64_AT_EUID) at_euid = st[i + 1];
             if (st[i] == E64_AT_NULL) { at_null = true; break; }
         }
+        ISO64_CLAC64();
         if (at_uid == at_euid) at_uid_eq = true;
         if (!at_entry || !at_null || !at_phent || !at_phnum || !at_random || !at_secure || !at_uid_eq) fail |= 4;
+        ISO64_STAC64();                                   // ★ v0.12.0：argv[0] 也在用户栈上
         const char* a0 = (const char*)(uintptr_t)st[1];                      // argv[0] 是 NUL 结尾的串
         if (a0[0] != '/' || e_strlen(a0) == 0) fail |= 4;
+        ISO64_CLAC64();
         // 权限位：p_flags = PF_R|PF_X -> P|U、**不可写**、**不加 NX**（可执行）
         const uint64_t sfl = user64_page_flags64(tva);
         if (!(sfl & PTE_PRESENT_64) || !(sfl & PTE_USER_64)) d |= 16;

@@ -15,6 +15,7 @@
 #include <stddef.h>
 
 #include "debug64.h"
+#include "iso64.h"         // ★ v0.12.0：SMAP（把 rect 写回用户指针要开窗）
 #include "x86_64.h"       // g_ticks64 / PIT_HZ_64 / pt_regs64 无关
 #include "fb.h"           // fb_width/fb_height/fb_surface64/fb_user_flip64（**只调用**）
 // ★ v0.11.1（第二步 wl_surface → Window）：装饰的**单一真源**在 gui64（内核窗口也用它）。
@@ -1264,7 +1265,9 @@ int64_t wl64_composer_get64(uint64_t out_rect_uptr) {
         r.x = 0; r.y = 0;
         r.w = (sfw > 0) ? sfw : 0;
         r.h = (sfh > 0) ? sfh : 0;
+        ISO64_STAC64();                                  // ★ v0.12.0：往用户页写 rect
         *(Wl64Rect*)(uintptr_t)out_rect_uptr = r;
+        ISO64_CLAC64();
     }
     return (int64_t)WL64_SEAT_ID64 | ((int64_t)gpu << 8);
 }

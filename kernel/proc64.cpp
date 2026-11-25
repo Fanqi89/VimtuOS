@@ -30,7 +30,8 @@
 #include "memlayout64.h"    // ML64_PML4_PHYS（引导期页表自证用）
 #include "mem_64.h"         // page_alloc_64 / page_free_64 / PTE_*
 #include "kpti64.h"        // ★ v0.11.9：KPTI 的配对/查询（建进程时要给用户表打 [255] 数据槽）
-#include "debug64.h"      // dbg64_* 打点
+#include "debug64.h"
+#include "iso64.h"          // ★ v0.12.0：SMAP（把结果写回用户指针要开窗）      // dbg64_* 打点
 #include "demo64.h"       // ★ 本批：演示程序 blob 的"原始区"查找（只有元数据，没有字节）
 
 // ★ 本批（演示程序搬进系统卷）：/proc64.elf、/pipe64.elf、/evshm.elf 的字节**不在内核里** ——
@@ -407,7 +408,9 @@ int64_t proc64_devmap64(uint32_t bdf, uint32_t bar_index, uint64_t phys, uint64_
     for (uint32_t i = 0; i < DEV64_SLOTS64; i++) {
         if (!p->dev[i].used) continue;
         if (p->dev[i].bdf == bdf && (uint32_t)p->dev[i].bar == bar_index) {
-            *(uint64_t*)(uintptr_t)out_va_uptr = dev64_slot_va64(i);
+            ISO64_STAC64();
+    *(uint64_t*)(uintptr_t)out_va_uptr = dev64_slot_va64(i);
+    ISO64_CLAC64();
             return 1;                                    // 1 = 复用（调用方按 re=1 打点）
         }
     }
@@ -442,7 +445,9 @@ int64_t proc64_devmap64(uint32_t bdf, uint32_t bar_index, uint64_t phys, uint64_
     p->dev[slot].bdf  = bdf;
     p->dev[slot].bar  = (uint8_t)bar_index;
     p->dev[slot].len  = (uint32_t)len;
+    ISO64_STAC64();                               // ★ v0.12.0：写用户指针
     *(uint64_t*)(uintptr_t)out_va_uptr = va;
+    ISO64_CLAC64();
     return 0;
 }
 
@@ -668,7 +673,9 @@ int64_t proc64_shm_map64(uint64_t id, uint64_t offset, uint64_t len, uint64_t ou
             }
             if (done == nblk) {
                 user64_paging_sync64();
+                ISO64_STAC64();                               // ★ v0.12.0：写用户指针
                 *(uint64_t*)(uintptr_t)out_va_uptr = va;
+                ISO64_CLAC64();
                 dbg64_line_begin64();
                 dbg64_str("[SHM64] map pid=");  dbg64_dec((uint64_t)pid);
                 dbg64_str(" id=");              dbg64_dec(id);
@@ -700,7 +707,9 @@ int64_t proc64_shm_map64(uint64_t id, uint64_t offset, uint64_t len, uint64_t ou
         }
     }
     user64_paging_sync64();
+    ISO64_STAC64();                               // ★ v0.12.0：写用户指针
     *(uint64_t*)(uintptr_t)out_va_uptr = va;
+    ISO64_CLAC64();
     const int u = user64_page_is_user_ok64(va) ? 1 : 0;
     dbg64_line_begin64();
     dbg64_str("[SHM64] map pid=");  dbg64_dec((uint64_t)pid);

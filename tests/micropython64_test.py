@@ -118,14 +118,20 @@ class Vm:
         self.proc = None
 
     def start(self):
-        self.proc = subprocess.Popen([
+        _args = [
             self.qemu, "-name", "Vimtu64-mp64",
             "-drive", "format=raw,file=%s" % self.img,
             "-boot", "order=c", "-m", "512", "-vga", "std",
             "-display", "none", "-serial", "file:%s" % self.serial,
             "-monitor", "telnet:127.0.0.1:%d,server,nowait" % self.port,
             "-no-reboot",
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ]
+        # ★ v0.12.0：SMAP/SMEP 的验收要跑在带这些位的 CPU 模型上（默认 qemu64 两个位都没有）。
+        #   默认行为一个字节不变：只有显式给了 VIMTU_CPU 才追加 -cpu。
+        _cpu = os.environ.get("VIMTU_CPU", "").strip()
+        if _cpu:
+            _args += ["-cpu", _cpu]
+        self.proc = subprocess.Popen(_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def log(self):
         try:

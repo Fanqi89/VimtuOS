@@ -113,10 +113,13 @@ def main():
         check("CR4.SMEP 与 CPU 支持一致（支持则必须开）",
               (smep_sup == "0") or (smep_sup == "1" and smep_on == "1"),
               "supported=%s on=%s" % (smep_sup, smep_on))
-        check("SMAP 如实：smap_on=0（本版不开）", bool(m_hw) and m_hw.group(5) == "0",
-              "smap_supported=%s" % (m_hw.group(4) if m_hw else "-"))
+        smap_sup = m_hw.group(4) if m_hw else "0"
+        smap_on  = m_hw.group(5) if m_hw else "0"
+        check("CR4.SMAP 与 CPU 支持一致（v0.12.0：支持就打开）",
+              (smap_sup == "0" and smap_on == "0") or (smap_sup == "1" and smap_on == "1"),
+              "supported=%s on=%s" % (smap_sup, smap_on))
 
-        m_mode = dd.wait_re(vm, r"\[ISO64\] mode kpti=(\d) smap=0 reason=", 20)
+        m_mode = dd.wait_re(vm, r"\[ISO64\] mode kpti=(\d) smap=(\d) reason=\S+", 20)
         check("[ISO64] mode 行存在（如实标注 KPTI/SMAP 现状）", m_mode is not None,
               m_mode.group(0)[:100] if m_mode else "（缺行）")
         # ★ v0.11.9：本测试全程走 BIOS 路径（自有页表）→ KPTI 必须真的启用
@@ -140,6 +143,19 @@ def main():
         m_st = dd.wait_re(vm, r"\[ISO64\] selftest (PASS|FAIL) mask=(\d+)", 25)
         check("隔离自检 PASS mask=63", bool(m_st) and m_st.group(1) == "PASS" and m_st.group(2) == "63",
               m_st.group(0) if m_st else "（缺行）")
+        # ★ v0.12.0：WP 泄漏的**判据**（v0.11.8/v0.11.9 那两版是把 FAIL 掩盖成 PASS 的：
+        #   自检跑在初化之前 -> 读到 wp=0 -> 自己补上再复判）。现在要求 wp_leak=0，且日志里
+        #   一条 `wp leak detected` 都不许有；再要求进桌面之前那次"只查不补"的现场检查也是 wp=1。
+        m_wpl = dd.wait_re(vm, r"\[ISO64\] selftest PASS mask=63 .*wp_leak=(\d) cr0=([0-9A-Fa-f]+)", 20)
+        check("WP 无泄漏（selftest … wp_leak=0，且这是真的判据不是'补完再判'）",
+              bool(m_wpl) and m_wpl.group(1) == "0",
+              m_wpl.group(0)[:90] if m_wpl else "（缺行）")
+        m_wpc = dd.wait_re(vm, r"\[ISO64\] wp check at gui-entry wp=(\d) cr0=([0-9A-Fa-f]+)", 120)
+        check("进桌面之前 CR0.WP 仍是 1（[ISO64] wp check at gui-entry wp=1）",
+              bool(m_wpc) and m_wpc.group(1) == "1",
+              m_wpc.group(0) if m_wpc else "（缺行）")
+        check("日志里没有任何 `[ISO64] wp leak detected` 行",
+              "[ISO64] wp leak detected" not in vm.log())
 
         m_k = dd.wait_re(vm, r"\[ISO64\] audit pid=- space=([0-9A-Fa-f]+) khigh=(\d+) ident=(\d+) "
                               r"uwin=(\d+) outside=(\d+) us_violation=(\d+)", 25)
@@ -169,12 +185,15 @@ def main():
         time.sleep(1.0)
         n0 = len(vm.log())
         type_cmd(mon, "iso")
-        m_s = dd.wait_re(vm, r"\[ISO64\] status wp=(\d) smep=(\d) smap=0\(supported=\d\) kpti=(\d) ",
-                         25, n0)
+        m_s = dd.wait_re(vm, r"\[ISO64\] status wp=(\d) smep=(\d) smap=(\d)\(supported=\d\) "
+                              r"kpti=(\d) .*smap_violations=(\d+)", 25, n0)
         check("`iso` 命令输出状态行（[ISO64] status …）", m_s is not None,
               m_s.group(0) if m_s else "（缺行）")
-        check("`iso` 里 KPTI 状态仍是 1", bool(m_s) and m_s.group(3) == "1",
-              "kpti=%s" % (m_s.group(3) if m_s else "-"))
+        check("`iso` 里 KPTI 状态仍是 1", bool(m_s) and m_s.group(4) == "1",
+              "kpti=%s" % (m_s.group(4) if m_s else "-"))
+        check("`iso` 里 SMAP 违规计数为 0（smap_violations=0）",
+              bool(m_s) and m_s.group(5) == "0",
+              m_s.group(0)[:110] if m_s else "（缺行）")
         m_all = dd.wait_re(vm, r"\[ISO64\] audit all spaces=(\d+) procs=(\d+) slots=\d+ violations=(\d+) ok=(\d)",
                            25, n0)
         check("`iso` 触发一次全地址空间审计（audit all … violations=0 ok=1）",
@@ -221,8 +240,10 @@ def main():
         # ==================== 阶段 6：-cpu max（有 SMEP/SMAP 位的 CPU）====================
         # 默认 qemu64 没有 SMEP/SMAP 位（阶段 1 如实报 smep_supported=0）。
         # 这里换一个**带这些位的 CPU 模型**再启一次：SMEP 必须真的被打开（smep_supported=1 & smep=1），
-        # 而 SMAP 仍然如实保持关闭（本版不开）。跑不起来就如实记 UNVERIFIED，不算产品通过。
-        print("=== 阶段 6：-cpu max 启动 -> SMEP 真的能打开 ===")
+        # 这里换一个**带这些位的 CPU 模型**再启一次：SMEP 与 SMAP 都必须真的被打开，
+        # 而且要能**启动到桌面且零 SMAP 违规** —— 这一条就是 v0.12.0 SMAP 的核心判据
+        # （内核里每一处"碰用户内存"的点都自己开了窗；漏一处就会打 `[SMAP64] violation`）。
+        print("=== 阶段 6：-cpu max 启动 -> SMEP/SMAP 真的打开 + 零 SMAP 违规 ===")
         vm.close()
         disk2 = os.path.join(tmp, "disk_smep.img")
         shutil.copyfile(SYSDISK, disk2)
@@ -246,14 +267,26 @@ def main():
                       m2.group(0) if m2 else "（缺行）")
                 check("-cpu max：CR4.SMEP 真的被打开（smep=1，内核不能执行用户页）",
                       bool(m2) and m2.group(2) == "1", "smep=%s" % (m2.group(2) if m2 else "-"))
-                check("-cpu max：SMAP 仍然如实关闭（smap_on=0）", bool(m2) and m2.group(5) == "0",
-                      "smap_supported=%s" % (m2.group(4) if m2 else "-"))
+                check("-cpu max：CR4.SMAP 真的被打开（smap_on=1，内核读写用户页要显式开窗）",
+                      bool(m2) and m2.group(5) == "1",
+                      "smap_supported=%s smap_on=%s" % (m2.group(4) if m2 else "-", m2.group(5) if m2 else "-"))
                 m2st = dd.wait_re(vm2, r"\[ISO64\] selftest (PASS|FAIL) mask=(\d+)", 25)
                 check("-cpu max：隔离自检仍 PASS mask=63",
                       bool(m2st) and m2st.group(1) == "PASS" and m2st.group(2) == "63",
                       m2st.group(0) if m2st else "（缺行）")
+                # ★ v0.12.0：SMAP 的硬判据 —— 一条 `[SMAP64] violation` 都不许有；WP 也没掉。
+                #   放在"登录成功"分支里：起不到桌面就如实算失败（不给"空日志=零违规"的假通过）。
+                _log2 = vm2.log()
+                check("-cpu max：SMAP 零违规（日志里没有任何 [SMAP64] violation 行）",
+                      "[SMAP64] violation" not in _log2,
+                      "hits=%d" % _log2.count("[SMAP64] violation"))
+                check("-cpu max：WP 也没掉（无 `wp leak detected`、wp check wp=1）",
+                      "[ISO64] wp leak detected" not in _log2 and
+                      re.search(r"\[ISO64\] wp check at gui-entry wp=1", _log2) is not None)
+                check("-cpu max：不得出现 PANIC / TRIPLE FAULT",
+                      "PANIC" not in _log2 and "TRIPLE FAULT" not in _log2)
             else:
-                check("-cpu max 能启动到桌面（否则 SMEP 这项 UNVERIFIED）", False,
+                check("-cpu max 能启动到桌面（否则 SMEP/SMAP 这两项 UNVERIFIED）", False,
                       "serial2=%s（记 UNVERIFIED，不当通过）" % serial2)
             vm2.close()
         except Exception as e2:

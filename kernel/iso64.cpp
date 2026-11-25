@@ -16,6 +16,7 @@
 #include "proc64.h"        // 进程表快照（pid + cr3）
 #include "hwinfo64.h"      // hw_info64()->smep（CPU 支持与否）
 #include "kpti64.h"        // ★ v0.11.9：KPTI 状态（审计要认共享入口区、要判用户表）
+#include "sig64.h"         // ★ v0.12.0：SMAP 违规 = 只杀当前进程（SIG64_SEGV），不 PANIC 整机
 
 // ==================== 小工具 ====================
 static inline uint64_t iso_rd_cr0_64() { uint64_t v; __asm__ volatile("mov %%cr0, %0" : "=r"(v)); return v; }
@@ -32,6 +33,9 @@ static inline int iso_user64(uint64_t e) { return (e & PTE_USER_64) ? 1 : 0; }
 #define ISO_CR4_SMAP (1ULL << 21)
 
 static int g_wp = 0, g_smep = 0, g_smep_ok = 0, g_smap_ok = 0;
+// ★ v0.12.0：SMAP 运行期状态 + 违规计数（计数是判据：0 才叫"清单清零"）
+static int g_smap = 0, g_smap_viol = 0;
+static uint32_t g_smap_rearm = 0;
 static int g_audit_runs = 0, g_audit_violations = 0;
 
 // CPUID 7.0：EBX bit7 = SMEP、bit20 = SMAP（叶不存在时为 0）
@@ -77,12 +81,20 @@ int iso64_init64() {
     }
     g_smep = (cr4 & ISO_CR4_SMEP) ? 1 : 0;
 
+    // ③ ★ v0.12.0：CR4.SMAP —— 内核**读写**用户页也要过闸门（CPU 支持才开；开了立刻回读确认）。
+    //   打开之后内核里每一处"确实要碰用户内存"的点都必须自己开窗（iso64_stac64/clac64），
+    //   漏掉一处就 #PF —— 那正好是判据（见 iso64_smap_fault64：只杀进程，不 PANIC 整机）。
+    if (g_smap_ok && !(cr4 & ISO_CR4_SMAP)) {
+        iso_wr_cr4_64(cr4 | ISO_CR4_SMAP);
+        cr4 = iso_rd_cr4_64();
+    }
+    g_smap = (cr4 & ISO_CR4_SMAP) ? 1 : 0;
     dbg64_line_begin64();
     dbg64_str("[ISO64] hw wp=");      dbg64_dec((uint64_t)g_wp);
     dbg64_str(" smep=");              dbg64_dec((uint64_t)g_smep);
     dbg64_str(" smep_supported=");    dbg64_dec((uint64_t)g_smep_ok);
     dbg64_str(" smap_supported=");    dbg64_dec((uint64_t)g_smap_ok);
-    dbg64_str(" smap_on=0");          // 本版如实：不开（理由见 iso64.h）
+    dbg64_str(" smap_on=");           dbg64_dec((uint64_t)g_smap);
     dbg64_str(" cr0=");               dbg64_hex64(cr0);
     dbg64_str(" cr4=");               dbg64_hex64(cr4);
     dbg64_str(g_wp ? " ok=1" : " ok=0");
@@ -93,7 +105,9 @@ int iso64_init64() {
     dbg64_line_begin64();
     dbg64_str("[ISO64] mode kpti=");
     dbg64_dec((uint64_t)kpti64_on64());
-    dbg64_str(" smap=0 reason=");
+    dbg64_str(" smap=");
+    dbg64_dec((uint64_t)g_smap);
+    dbg64_str(" reason=");
     if (kpti64_on64())
         dbg64_str("user-space-has-no-kernel-half (user table PML4[511]=0; entry trampolines at 6 GiB)");
     else
@@ -116,6 +130,134 @@ int iso64_reassert64() {
     dbg64_nl();
     dbg64_line_end64();
     return g_wp;
+}
+
+// ==================== ★ v0.12.0：WP 现场检查（判据）====================
+int iso64_check_wp64(const char* where) {
+    const uint64_t cr0 = iso_rd_cr0_64();
+    const int on = (cr0 & ISO_CR0_WP) ? 1 : 0;
+    dbg64_line_begin64();
+    dbg64_str("[ISO64] wp check at ");
+    dbg64_str(where ? where : "?");
+    dbg64_str(" wp=");  dbg64_dec((uint64_t)on);
+    dbg64_str(" cr0="); dbg64_hex64(cr0);
+    dbg64_nl();
+    dbg64_line_end64();
+    if (!on) {
+        dbg64_line_begin64();
+        dbg64_str("[ISO64] wp leak detected at ");
+        dbg64_str(where ? where : "?");
+        dbg64_str(" (CR0.WP=0) -> reassert (this line is a FAIL by itself)");
+        dbg64_nl();
+        dbg64_line_end64();
+        (void)iso64_reassert64();          // 先保住防护；"掉了"这件事已经记在日志里，不掩盖
+    }
+    return on;
+}
+
+// ==================== ★ v0.12.0：SMAP（内核访问用户页要开窗）====================
+// 三条口径（改之前先读）：
+//   1) `stac`/`clac` 只有在 CR4.SMAP=1 时才合法（否则 #UD），所以两个包装函数都先看 g_smap；
+//      SMAP 没开时它们**编译成一次读全局 + 分支**，语义上是空操作 —— 同一份代码两种 CPU 都对。
+//   2) 窗口纪律：`iso64_stac64()` 与 `iso64_clac64()` 之间**只放真正的用户访存**。
+//      中间去调内核的其它函数 = 把保护范围扩大到它里面（等于没开）。
+//   3) 违规处置**不 PANIC 整机**（isr_handler64 里调 iso64_smap_fault64）：
+//        * 产品行为：只杀当前进程（SIGSEGV），内核继续跑；
+//        * 探针行为（ISO64_SMAP_PROBE=1，仅开发期）：关掉 SMAP 让那条指令重试，并按 tick 重新打开，
+//          于是一次启动就能把"漏了 STAC 的点"成串收下来（每条带 rip -> objdump 定位到源码行）。
+// 探针模式**不进交付构建**：交付时必须是 0；发版判据 = 探针模式下跑一遍主回归，violations=0。
+static const int      ISO64_SMAP_PROBE         = 0;
+static const uint32_t ISO64_SMAP_REARM_TICKS64 = 64;      // 250 Hz 下约 0.26 s
+
+// ★ 嵌套安全：开窗是**引用计数**，不是布尔。理由（本版踩到过）：e64_build_stack64 开了一个大窗，
+//   里面调 e64_fill_random64（它自己也开窗）—— 内层的 CLAC 会把外层还开着的窗一起关掉，
+//   于是外层剩下的写用户页立刻 #PF（实测 `[SMAP64] violation … e64_build_stack64+0x62`）。
+//   计数进内核时清零（iso64_clac_on_entry64），所以跨 syscall 绝不会累积。
+static int g_smap_ac_depth = 0;
+void iso64_stac64() {
+    if (!g_smap) return;
+    if (g_smap_ac_depth++ == 0) __asm__ volatile("stac" : : : "memory");
+}
+void iso64_clac64() {
+    if (!g_smap) return;
+    if (g_smap_ac_depth > 0 && --g_smap_ac_depth == 0) __asm__ volatile("clac" : : : "memory");
+}
+// 进内核就 CLAC：AC 是 RFLAGS 里的位，ring3 理论上能把它带进来（Linux 同款处理）。
+// 这里不是"防 ring3"（AC 对 ring3 没有 SMAP 含义），而是保证内核侧**永远从 AC=0 开始**、
+// 而且开窗计数从 0 开始（不继承上一次开窗留下的状态）。
+void iso64_clac_on_entry64() {
+    g_smap_ac_depth = 0;
+    if (g_smap) __asm__ volatile("clac" : : : "memory");
+}
+
+int iso64_smap_on64()         { return g_smap; }
+int iso64_smap_violations64() { return g_smap_viol; }
+
+
+// 内核态 #PF 的 SMAP 违规处置。见 iso64.h 的契约。
+int iso64_smap_fault64(void* regs) {
+    if (!g_smap || !regs) return 0;
+    pt_regs64* r = (pt_regs64*)regs;
+    if (r->int_no != 14) return 0;
+    if ((r->cs & 3u) == 3u) return 0;                        // ring3 自己的 #PF：走 sig64 那条路
+    // 判据：**CPL0 的 #PF + AC=0 + 目标地址确实是一张可访问的用户页**（这就是 SMAP 的三要素）。
+    //   ★ 不要用页错误码的 U/S 位来认 SMAP：Intel SDM 与 QEMU 的 TCG 在这里不一致（实测
+    //     `-cpu max` 上 SMAP 拦下的写，PFEC 给的是 err=0x3，U/S=0；按 SDM 的说法会是 U/S=1）。
+    //     靠 U/S 判定 = 在 QEMU 上一条都认不出来、直接掉进 PANIC（本版就是这么踩到的）。
+    //   写访问还要再核一层"这一页本来就可写"：否则那是 CR0.WP 的活（内核写只读页），不是 SMAP 的事。
+    if (!(r->err_code & 1u)) return 0;                       // 页不存在：跟 SMAP 无关
+    if (r->rflags & (1ull << 18)) return 0;                  // AC=1：在开着的窗口里，不是 SMAP 拦的
+    uint64_t cr2 = 0;
+    __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    if (cr2 >= 0x0000800000000000ull) return 0;              // 内核地址：不是 SMAP 的事
+    if (user64_range_ok64(cr2, 1) != 1) return 0;            // 不在用户窗口 / 不可用户访问：不是 SMAP 的事
+    if ((r->err_code & 2u) && !(user64_page_flags64(cr2) & PTE_WRITE_64)) return 0;   // 只读页写：CR0.WP 的活
+
+    g_smap_viol++;
+    const int pid = proc64_current_pid64 ? proc64_current_pid64() : -1;
+    dbg64_line_begin64();
+    dbg64_str("[SMAP64] violation n=");  dbg64_dec((uint64_t)g_smap_viol);
+    dbg64_str(" pid=");                  dbg64_dec((uint64_t)(uint32_t)(pid < 0 ? 0 : pid));
+    dbg64_str(" cr2=");                  dbg64_hex64(cr2);
+    dbg64_str(" rip=");                  dbg64_hex64(r->rip);
+    dbg64_str(" err=");                  dbg64_hex64(r->err_code);
+    dbg64_str(ISO64_SMAP_PROBE ? " -> probe: smap off, retry"
+                               : " -> sig=11 (kernel touched user page without STAC)");
+    dbg64_nl();
+    dbg64_line_end64();
+
+    if (ISO64_SMAP_PROBE) {
+        // 关掉 SMAP：iretq 之后这条指令原地重试就会成功；tick 钩子过一会儿再打开
+        iso_wr_cr4_64(iso_rd_cr4_64() & ~ISO_CR4_SMAP);
+        g_smap = 0;
+        g_smap_rearm = ISO64_SMAP_REARM_TICKS64;
+        return 1;
+    }
+    // 产品行为（v0.12.0 取舍，如实写在 iso64.h）：**只杀当前进程**（与 ring3 缺页同一套语义），
+    //   绝不 PANIC 整机。没有进程上下文时（内核任务 0 上走到的路径，比如自检自己读用户页）
+    //   退化为"关掉 SMAP 让指令重试 + 大声留痕"（降级而不是变砖）—— 判据看 [ISO64] status 的
+    //   smap= 从 1 变 0、以及 `smap degraded` 那行。这条路径是"内核 bug 的兜底"，不是正常运行路径。
+    if (proc64_sig_die_current64 && proc64_sig_state_current64 && proc64_sig_state_current64()) {
+        (void)proc64_sig_die_current64(SIG64_SEGV, r);
+        return 1;
+    }
+    iso_wr_cr4_64(iso_rd_cr4_64() & ~ISO_CR4_SMAP);
+    g_smap = 0;
+    dbg64_line_begin64();
+    dbg64_str("[SMAP64] smap degraded (no process context, CR4.SMAP=0 from now on)");
+    dbg64_nl();
+    dbg64_line_end64();
+    return 1;                                                // iretq 后原地重试
+}
+
+// PIT 钩子（只给探针模式下"重新武装 SMAP"用；非探针模式是空函数）
+void iso64_tick64() {
+    if (!ISO64_SMAP_PROBE || g_smap_rearm == 0) return;
+    if (--g_smap_rearm) return;
+    if (g_smap_ok && !(iso_rd_cr4_64() & ISO_CR4_SMAP)) {
+        iso_wr_cr4_64(iso_rd_cr4_64() | ISO_CR4_SMAP);
+        g_smap = 1;
+    }
 }
 
 // ==================== 地址空间审计 ====================
@@ -299,9 +441,12 @@ int iso64_selftest64() {
     int fails = 0;
 
     // ① CR0.WP 已置位（内核不能偷偷写只读页）
-    //    ★ 实测发现：启动期有路径会把 WP 临时清掉（boot 自检时读到 wp=0，到桌面后又变回 1）。
-    //    这里**先如实判**，掉了就打 `wp leak detected` 并立刻补上再复判 —— 修复进 mask，
-    //    "曾经掉过"这件事留在日志里（不隐瞒）。
+    //    ★ v0.12.0 更正（这是 v0.11.8/v0.11.9 的一处误判，留档）：那两版把这一位读到的 wp=0
+    //    当成"启动期有路径把 WP 清了"。真相是**自检跑在初化之前** —— kernel64.cpp 里
+    //    iso64_selftest64() 排在 iso64_init64() 前面，那时 CR0 还是 boot/loader64.asm 打开分页时
+    //    写的 0x80000011（PG|ET|PE，本来就没有 WP 位），于是自检自己把 WP 补上并打了一句
+    //    "wp leak detected"。顺序修正之后这一位就真的在判"有没有泄漏"了。
+    //    判据口径：**掉了就算失败**（不再靠"补完再复判"把 FAIL 掩盖成 PASS）；补只是先保住防护。
     int wp_leak = 0;
     if (!(iso_rd_cr0_64() & ISO_CR0_WP)) {
         wp_leak = 1;
@@ -310,6 +455,7 @@ int iso64_selftest64() {
         dbg64_nl();
         dbg64_line_end64();
         (void)iso64_reassert64();
+        fails |= 1;                                   // ★ 泄漏本身就是失败
     }
     if (!g_wp || !(iso_rd_cr0_64() & ISO_CR0_WP)) fails |= 1;
     // ② CR4.SMEP：CPU 支持就必须置位；不支持则记通过（如实：这台 CPU 没有）
@@ -404,11 +550,13 @@ void iso64_report64() {
     dbg64_line_begin64();
     dbg64_str("[ISO64] status wp=");   dbg64_dec((uint64_t)g_wp);
     dbg64_str(" smep=");               dbg64_dec((uint64_t)g_smep);
-    dbg64_str(" smap=0(supported=");   dbg64_dec((uint64_t)g_smap_ok);
+    dbg64_str(" smap=");               dbg64_dec((uint64_t)g_smap);
+    dbg64_str("(supported=");          dbg64_dec((uint64_t)g_smap_ok);
     dbg64_str(") kpti=");              dbg64_dec((uint64_t)kpti64_on64());
     dbg64_str(" kpti_reason=");        dbg64_str(kpti64_reason64());
     dbg64_str(" audited=");    dbg64_dec((uint64_t)g_audit_runs);
     dbg64_str(" violations=");         dbg64_dec((uint64_t)g_audit_violations);
+    dbg64_str(" smap_violations=");    dbg64_dec((uint64_t)g_smap_viol);
     dbg64_nl();
     dbg64_line_end64();
 }
