@@ -23,15 +23,21 @@
 #include "gfx64.h"
 #include "startmenu64.h"     // p2ui_*（亚克力弹窗/文本/线性图标）
 #include "debug64.h"
+#include "app64.h"        // ★ v0.12.1：注册表（exec 的真实路径 -> "打开文件所在位置"）
+// ★ v0.12.1：explorer64_open_path64 的**真实签名**是 (path, letter)；
+//   kernel/explorer64.h 里的单参数声明是过期的（按它调用会 undefined symbol）。
+//   这里不 include 那个头，直接按真签名声明（同在内核 SRCS_DESKTOP 里）。
+void explorer64_open_path64(const char* path, char letter);
 
-#define DOCKMENU_ROWS_MAX 4
+#define DOCKMENU_ROWS_MAX 5          // ★ v0.12.1：+1 给"打开文件所在位置"
 
 enum {
     DOCKMENU_ACT_NONE = 0,
     DOCKMENU_ACT_PIN = 1,
     DOCKMENU_ACT_UNPIN = 2,
     DOCKMENU_ACT_CLOSE_WIN = 3,
-    DOCKMENU_ACT_CLOSE_ALL = 4
+    DOCKMENU_ACT_CLOSE_ALL = 4,
+    DOCKMENU_ACT_REVEAL = 5           // ★ v0.12.1：打开文件所在位置
 };
 
 struct DockMenuRow64 { int act; const char* zh; const char* en; };
@@ -89,6 +95,7 @@ static void dm_push_row(int act) {
     if (act == DOCKMENU_ACT_PIN)        { r->zh = "固定到 Dock";    r->en = "Pin to Dock"; }
     else if (act == DOCKMENU_ACT_UNPIN) { r->zh = "取消固定";       r->en = "Unpin from Dock"; }
     else if (act == DOCKMENU_ACT_CLOSE_WIN) { r->zh = "关闭窗口";   r->en = "Close window"; }
+    else if (act == DOCKMENU_ACT_REVEAL) { r->zh = "打开文件所在位置"; r->en = "Open file location"; }
     else                                { r->zh = "关闭所有窗口";   r->en = "Close all windows"; }
 }
 
@@ -112,6 +119,22 @@ static void dm_layout64(int mx, int my) {
     g_last_mx = mx; g_last_my = my;   // ★ 以**打开位置**为基准：指针不动就不抢键盘选中的行
 }
 
+// ★ v0.12.1：app_id -> 注册表下标（-1 = 没有）。Dock 固定项/开始菜单项都带注册表 id。
+static int dm_reg_of_app64(int app_id) {
+    if (app_id < 0) return -1;
+    const int n = app64_registry_count64();
+    for (int i = 0; i < n; i++) if (app64_reg_id64(i) == app_id) return i;
+    return -1;
+}
+// exec 的父目录（"/bin/viewer" -> "/bin"；没有 '/' 就当根）
+static void dm_dir_of_exec64(const char* e, char* out, int cap) {
+    int cut = -1;
+    for (int i = 0; e && e[i]; i++) if (e[i] == '/') cut = i;
+    int o = 0;
+    if (cut <= 0) { out[0] = '/'; out[1] = 0; return; }
+    for (int i = 0; i < cut && o < cap - 1; i++) out[o++] = e[i];
+    out[o] = 0;
+}
 static void dm_build64(int owner, int app_id, int win_id) {
     g_rows = 0;
     g_owner = owner;
@@ -119,6 +142,11 @@ static void dm_build64(int owner, int app_id, int win_id) {
     g_win = win_id;
     // ① 固定状态项（一直有；固定 <-> 取消固定）
     if (app_id >= 0) dm_push_row(dock64_is_pinned64(app_id) ? DOCKMENU_ACT_UNPIN : DOCKMENU_ACT_PIN);
+    // ★ v0.12.1：快捷方式是**指向真实文件的入口** —— 能解析出卷里那个文件就提供"打开文件所在位置"。
+    {
+        const int reg = dm_reg_of_app64(app_id);
+        if (reg >= 0 && app64_reg_exec_is_file64(reg)) dm_push_row(DOCKMENU_ACT_REVEAL);
+    }
     // ② 关闭项（按"运行中"的实际情况决定，可与 ① 同时存在）
     const int nwin = (app_id >= 0) ? dock64_app_windows64(app_id) : 0;
     if (win_id >= 0) {
@@ -184,6 +212,23 @@ static void dm_apply64(int act) {
         }
     } else if (act == DOCKMENU_ACT_CLOSE_ALL) {
         if (app >= 0) dock64_close_app_windows64(app);
+    } else if (act == DOCKMENU_ACT_REVEAL) {
+        // ★ v0.12.1：解析快捷方式指向的真实文件 -> 拉起文件管理器并跳到那个目录
+        const int reg = dm_reg_of_app64(app);
+        if (reg >= 0) {
+            const char* e = app64_reg_exec64(reg);
+            char dir[160];
+            dm_dir_of_exec64(e, dir, (int)sizeof(dir));
+            // 传**完整 exec 路径**：explorer 自己拆目录并把文件名高亮（"打开文件所在位置"的正解）
+            explorer64_open_path64(e, 0);
+            dbg64_line_begin64();
+            dbg64_str("[DOCK64] menu act=reveal exec=");
+            dbg64_str(e ? e : "-");
+            dbg64_str(" dir=");   // 判据用：解析出来的目录（真实跳转用的是完整路径）
+            dbg64_str(dir);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
     }
     if (g_log_budget > 0) {
         g_log_budget--;
@@ -196,7 +241,8 @@ static void dm_apply64(int act) {
         if (win < 0) dbg64_str("-"); else dbg64_dec((uint64_t)win);
         dbg64_str(" act=");
         dbg64_str(act == DOCKMENU_ACT_PIN ? "pin" : (act == DOCKMENU_ACT_UNPIN ? "unpin" :
-                  (act == DOCKMENU_ACT_CLOSE_WIN ? "close-win" : "close-all")));
+                  (act == DOCKMENU_ACT_CLOSE_WIN ? "close-win" :
+                   (act == DOCKMENU_ACT_REVEAL ? "reveal" : "close-all"))));
         dbg64_str(" pinned_after=");
         dbg64_dec((uint64_t)(dock64_is_pinned64(app) ? 1 : 0));
         dbg64_str(" pinned_n=");

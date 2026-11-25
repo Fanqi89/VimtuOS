@@ -2059,6 +2059,11 @@ static void dock_geom_init64() {
                   (g_dock[i].kind == DOCK_KIND_PIN ? "pinned" : "running"));
         dbg64_str(" win=");
         dbg64_dec((uint64_t)(g_dock[i].win_id < 0 ? 0 : g_dock[i].win_id));
+        // ★ v0.12.1：行尾追加图标判据（icons64 kind；-1 = 没有真图标 -> 界面上会画兜底字母）。
+        //   "从开始菜单固定到 Dock 后变成黑底白字 A"这条 bug 的验收就靠它：
+        //   固定项这里必须是 74（image-viewer）之类的真值，不许是 -1。
+        dbg64_str(" icon=");
+        dbg64_dec((uint64_t)g_dock[i].icon64);
         dbg64_nl();
         dbg64_line_end64();
     }

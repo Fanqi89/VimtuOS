@@ -459,6 +459,10 @@ struct AppRegRec64 {
     int  builtin;
     int  desktop;
     int  x, y;
+    // ★ v0.12.1：1 = 这条是从**快捷方式目录**扫进来的（不是 /etc/apps.json 里的行）。
+    //   为什么要这个位：写盘时**跳过它们** —— 否则扫进来的条目会被写进 /etc/apps.json，
+    //   于是"删掉 /apps/x.lnk"之后那条记录还赖在 json 里，永远删不掉。
+    int  scanned;
 };
 
 // 内置应用表：**构建期**编译进内核（唯一真源）。顺序 = 开始菜单固定网格 2x4 的顺序
@@ -604,6 +608,9 @@ static int ar_serialize64() {
     const int cap = (int)sizeof(g_apps_out);
     for (int i = 0; i < g_apps_n; i++) {
         const AppRegRec64& a = g_apps64[i];
+        // ★ v0.12.1：从快捷方式目录扫进来的条目**不写盘** —— 它们的真源是 /apps/*.lnk，
+        //   写进 /etc/apps.json 会让"删掉 .lnk"之后那条记录永远赖着不走。
+        if (a.scanned) continue;
         if (o > cap - 512) return 0;
         g_apps_out[o++] = '{';
         ar_put_kv(g_apps_out, cap, &o, "name", a.name, true);
@@ -683,6 +690,200 @@ static int ar_line64(const char* p, int n, char* out, int cap) {
     return i;
 }
 
+// ==================== ★ v0.12.1：快捷方式目录扫描（开始菜单动态化）====================
+// 目录（按顺序扫；不存在就跳过）：/apps、/usr/share/applications、/apps/desktop
+// 文件：*.lnk / *.desktop。格式 = 纯文本 key=value（键名大小写不敏感；.desktop 的
+//   [Desktop Entry] 段同样适用），认这四个键：
+//     name=图片查看器
+//     en=Image Viewer
+//     exec=/bin/viewer
+//     icon=image-viewer          （系统图标名；或以 '/' 开头的卷内 PNG 路径）
+// 语义：**快捷方式文件是唯一真源** —— 注册表把它投影进来（按 exec 去重），
+//   用户 / vpkg 往目录里丢一个文件，下一次刷新开始菜单就多一项（gen++ 触发视图重建）。
+static const char* const kScDirs64[] = { "/apps", "/usr/share/applications", "/apps/desktop" };
+#define SC64_DIRS_N64 ((int)(sizeof(kScDirs64) / sizeof(kScDirs64[0])))
+static uint32_t g_sc_fnv = 0;      // 上次扫到的内容指纹（变了才算"目录变过"）
+static int      g_sc_added = 0;    // 上次扫描追加的条数
+static int      g_sc_dirty = 0;    // 1 = 刚有快捷方式文件被关闭/写坏，必须无条件重建
+
+// exec -> 稳定 id：**只依赖 exec 串**，所以跨重启恒定（内置 APP_ID_* 都 < 1000；APP_ID_NONE = -1）。
+//   为什么需要它：Dock 的固定列表（/etc/dock.conf）存的是 id，用户应用原来 id 恒为 -1 ->
+//   固定后 dock_reg_index64(-1) 查不到 -> 名字/图标全兜底（用户看到的"黑底白字 A"）。
+static int ar_stable_id64(const char* exec) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; exec && exec[i]; i++) { h ^= (uint8_t)exec[i]; h *= 16777619u; }
+    return 1000 + (int)(h % 15000u);
+}
+
+static bool ar_ends_ci64(const char* s, const char* suf) {
+    const int a = ar_len(s), b = ar_len(suf);
+    if (a < b) return false;
+    for (int i = 0; i < b; i++) {
+        char c = s[a - b + i], d = suf[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (d >= 'A' && d <= 'Z') d = (char)(d - 'A' + 'a');
+        if (c != d) return false;
+    }
+    return true;
+}
+
+// 一行 "key=value"（键名大小写不敏感；'#'/';' 注释与 '[段名]' 行不算）-> 命中就写 out
+static bool ar_kv64(const char* line, const char* key, char* out, int cap) {
+    int i = 0;
+    while (line[i] == ' ' || line[i] == '\t') i++;
+    if (line[i] == '#' || line[i] == ';' || line[i] == '[') return false;
+    const int kl = ar_len(key);
+    for (int k = 0; k < kl; k++) {
+        char c = line[i + k];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != key[k]) return false;
+    }
+    i += kl;
+    while (line[i] == ' ' || line[i] == '\t') i++;
+    if (line[i] != '=') return false;
+    i++;
+    while (line[i] == ' ' || line[i] == '\t') i++;
+    int o = 0;
+    for (; line[i] && line[i] != '\r' && line[i] != '\n' && o < cap - 1; i++) out[o++] = line[i];
+    while (o > 0 && (out[o - 1] == ' ' || out[o - 1] == '\t')) o--;
+    out[o] = 0;
+    return o > 0;
+}
+
+// 扫一遍快捷方式目录，把还没在表里的追加进来（**不 bump gen**，由调用方统一处理）。
+// 返回追加条数。要真读盘 -> 停看门狗（与 ar_reload64 同款；调用者不是桌面帧）。
+static int ar_scan_shortcuts64() {
+    static char fb[2048];
+    static Vfs64Dirent64 ents[16];
+    int added = 0;
+    uint32_t fnv = 2166136261u;
+    panic64_watchdog_pause64();
+    for (int d = 0; d < SC64_DIRS_N64; d++) {
+        const char* dir = kScDirs64[d];
+        uint32_t cur = 0;
+        for (int guard = 0; guard < 64; guard++) {
+            const int got = vfs64_list64(dir, ents, 16, &cur);
+            if (got <= 0) break;
+            for (int i = 0; i < got; i++) {
+                if (ents[i].kind == VFS64_KIND_DIR) continue;
+                if (!ar_ends_ci64(ents[i].name, ".lnk") && !ar_ends_ci64(ents[i].name, ".desktop")) continue;
+                char path[192];
+                int p = 0;
+                for (int k = 0; dir[k] && p < (int)sizeof(path) - 80; k++) path[p++] = dir[k];
+                if (p > 0 && path[p - 1] != '/') path[p++] = '/';
+                for (int k = 0; ents[i].name[k] && p < (int)sizeof(path) - 2; k++) path[p++] = ents[i].name[k];
+                path[p] = 0;
+                const int n = vfs64_read64(path, fb, (int)sizeof(fb) - 1);
+                if (n <= 0) continue;
+                fb[n] = 0;
+                char nm[APPREG64_NAME_MAX] = {0}, en[APPREG64_NAME_MAX] = {0};
+                char ex[APPREG64_EXEC_MAX] = {0}, ic[APPREG64_ICON_MAX] = {0};
+                int i2 = 0;
+                while (i2 < n) {
+                    int j = i2;
+                    while (j < n && fb[j] != '\n') j++;
+                    if (j < n) fb[j] = 0;                       // 就地切行（fb 是本函数的私有缓冲）
+                    (void)ar_kv64(fb + i2, "name", nm, (int)sizeof(nm));
+                    (void)ar_kv64(fb + i2, "en", en, (int)sizeof(en));
+                    (void)ar_kv64(fb + i2, "exec", ex, (int)sizeof(ex));
+                    (void)ar_kv64(fb + i2, "icon", ic, (int)sizeof(ic));
+                    i2 = j + 1;
+                }
+                if (!ex[0]) continue;                            // 没有 exec 的快捷方式不算应用
+                for (const char* q = path; *q; q++) { fnv ^= (uint8_t)*q; fnv *= 16777619u; }
+                for (const char* q = ex;   *q; q++) { fnv ^= (uint8_t)*q; fnv *= 16777619u; }
+                for (const char* q = ic;   *q; q++) { fnv ^= (uint8_t)*q; fnv *= 16777619u; }
+                int dup = 0;
+                for (int k = 0; k < g_apps_n; k++) if (ar_eq(g_apps64[k].exec, ex)) { dup = 1; break; }
+                if (dup) continue;                               // exec 已在表里（内置或 /etc/apps.json）
+                if (g_apps_n >= APPREG64_MAX) break;
+                AppRegRec64& a = g_apps64[g_apps_n];
+                ar_cpy(a.name, nm[0] ? nm : (en[0] ? en : ents[i].name), APPREG64_NAME_MAX);
+                ar_cpy(a.en,   en[0] ? en : (nm[0] ? nm : ents[i].name), APPREG64_NAME_MAX);
+                ar_cpy(a.exec, ex, APPREG64_EXEC_MAX);
+                ar_cpy(a.icon, ic[0] ? ic : "files", APPREG64_ICON_MAX);   // 兜底也不许空（空=画字母）
+                a.alias[0] = 0;
+                a.id = ar_stable_id64(ex);
+                a.builtin = 0;
+                a.scanned = 1;
+                a.desktop = 0;
+                a.x = 0; a.y = 0;
+                g_apps_n++;
+                added++;
+            }
+            if (cur == 0) break;
+        }
+    }
+    panic64_watchdog_unpause64();
+    g_sc_fnv = fnv;
+    g_sc_added = added;
+    dbg64_line_begin64();
+    dbg64_str("[APP64] shortcuts scan dirs=");
+    dbg64_dec((uint64_t)SC64_DIRS_N64);
+    dbg64_str(" added=");
+    dbg64_dec((uint64_t)added);
+    dbg64_str(" entries=");
+    dbg64_dec((uint64_t)g_apps_n);
+    dbg64_str(" fnv=");
+    dbg64_hex64(fnv);
+    dbg64_str(added > 0 ? " ok=1" : " ok=1");
+    dbg64_nl();
+    dbg64_line_end64();
+    return added;
+}
+
+// 公开入口：重新扫一遍（重建 + bump gen，开始菜单下一帧自动刷新）。
+//   实现放在文件末尾（需要调用后面定义的 ar_reload_and_bump64），这里只做前置声明。
+static int ar_reload_and_bump64(const char* why);
+
+// 幂等播种内置快捷方式（启动期在 root 上下文调用一次）：已存在的文件**不覆盖**（用户改过的不动）。
+// 目的：图片查看器 / MicroPython 这类"卷里的用户态程序"从来不在内置表里，靠这份快捷方式进开始菜单。
+int app64_boot_seed_shortcuts64() {
+    const int sys = ar_sys_slot64();
+    if (sys < 0) return 0;
+    (void)vfs64_mkdir64("/apps");                       // 幂等（已存在返回非 0）
+    struct ScSeed64 { const char* path; const char* body; };
+    static const ScSeed64 kSeeds[] = {
+        { "/apps/image-viewer.lnk",
+          "name=图片查看器\nen=Image Viewer\nexec=/bin/viewer\nicon=image-viewer\n" },
+        { "/apps/micropython.lnk",
+          "name=MicroPython\nen=MicroPython\nexec=/bin/mp\nicon=terminal\n" },
+        { "/apps/text-editor.lnk",
+          "name=文本编辑器\nen=Text Editor\nexec=/bin/edit\nicon=files\n" },
+        { "/apps/app-store.lnk",
+          "name=商店\nen=App Store\nexec=/bin/store\nicon=plus\n" },
+    };
+    int wrote = 0, kept = 0;
+    panic64_watchdog_pause64();
+    for (int i = 0; i < (int)(sizeof(kSeeds) / sizeof(kSeeds[0])); i++) {
+        uint32_t t = 0, sz = 0;
+        if (vfs64_stat_on64(sys, kSeeds[i].path, &t, &sz) == 0) { kept++; continue; }
+        const int n = ar_len(kSeeds[i].body);
+        if (vfs64_write_on64(sys, kSeeds[i].path, kSeeds[i].body, n) == n) wrote++;
+    }
+    panic64_watchdog_unpause64();
+    dbg64_line_begin64();
+    dbg64_str("[APP64] shortcuts seed dir=/apps wrote=");
+    dbg64_dec((uint64_t)wrote);
+    dbg64_str(" kept=");
+    dbg64_dec((uint64_t)kept);
+    dbg64_str(" ok=1");
+    dbg64_nl();
+    dbg64_line_end64();
+    return wrote;
+}
+
+// 这个 exec 是不是"卷里一个真实存在的文件"（"打开文件所在位置"只在它能成立时才显示）
+int app64_reg_exec_is_file64(int i) {
+    if (i < 0 || i >= g_apps_n) return 0;
+    const char* e = g_apps64[i].exec;
+    if (!e || e[0] != '/') return 0;
+    const int sys = ar_sys_slot64();
+    if (sys < 0) return 0;
+    uint32_t t = 0, sz = 0;
+    if (vfs64_stat_on64(sys, e, &t, &sz) != 0) return 0;
+    return (t == VFS64_TYPE_FILE) ? 1 : 0;
+}
 // 解析注册表文件。**内存表先=内置表**，文件里：
 //   * builtin=1 的行 -> 只取"可覆盖字段"（desktop/x/y；名字/exec/图标以内核表为准，
 //     vpkg 不会写 builtin 行）；
@@ -738,8 +939,11 @@ static int ar_parse64(const uint8_t* buf, int n, int* ok) {
         ar_cpy(a.exec, exec, APPREG64_EXEC_MAX);
         ar_cpy(a.icon, icon, APPREG64_ICON_MAX);
         ar_cpy(a.alias, alias, APPREG64_ALIAS_MAX);
-        a.id = -1;
+        // ★ v0.12.1：用户应用也要**稳定 id**（Dock 固定列表存的就是它；原来是 -1 ->
+        //   固定后查不到注册表 -> 图标/名字全兜底，用户看到"黑底白字 A"）。
+        a.id = ar_stable_id64(exec);
         a.builtin = 0;
+        a.scanned = 0;
         a.desktop = desktop ? 1 : 0;
         a.x = x; a.y = y;
         g_apps_n++;
@@ -796,6 +1000,8 @@ static int ar_reload64(int force_log) {
         g_apps_fnv = 0;
         ar_seed64();
     }
+    // ★ v0.12.1：把快捷方式目录投影进注册表（/apps、/usr/share/applications、/apps/desktop）
+    (void)ar_scan_shortcuts64();
     if (force_log || !g_apps_logged) {
         g_apps_logged = 1;
         int nd = 0;
@@ -868,9 +1074,13 @@ static int ar_reload_and_bump64(const char* why) {
     }
     panic64_watchdog_unpause64();
     if (full <= 0) return 0;
-    if (fnv == g_apps_fnv) return 0;             // 内容没变（例如只是又写了一遍同样的表）
+    // ★ v0.12.1：/etc/apps.json 没变但**快捷方式目录**刚被动过（g_sc_dirty）也要重建 ——
+    //   否则"删掉 /apps/x.lnk"之后开始菜单里那一项会赖着不走。
+    if (fnv == g_apps_fnv && !g_sc_dirty) return 0;   // 内容没变（例如只是又写了一遍同样的表）
     int ok = 1;
     const int lines = ar_parse64(g_apps_file, full, &ok);
+    (void)ar_scan_shortcuts64();
+    g_sc_dirty = 0;
     g_apps_fnv = fnv;
     g_apps_gen++;
     dbg64_line_begin64();
@@ -891,8 +1101,26 @@ static int ar_reload_and_bump64(const char* why) {
 }
 
 // ★ 挂钩点：fd64_close64 在**写者自己的上下文**里调到它（path = 刚关闭的文件）。
+// ★ v0.12.1：path 是不是落在某个「快捷方式目录」下面（可以带子目录：/apps/desktop/x.lnk）
+static bool ar_in_shortcut_dir64(const char* path) {
+    for (int d = 0; d < SC64_DIRS_N64; d++) {
+        const char* dir = kScDirs64[d];
+        int i = 0;
+        for (; dir[i] && path[i] == dir[i]; i++) { }
+        if (!dir[i] && path[i] == '/') return true;
+    }
+    return false;
+}
 void app64_registry_on_close64(const char* path, int writable) {
     if (!writable || !path) return;
+    // ★ v0.12.1：往快捷方式目录里写/删了一个文件 -> 立刻重扫（"实时同步"的落点）
+    if (ar_in_shortcut_dir64(path)) {
+        if (!g_apps_tried) { (void)app64_registry_init64(); return; }
+        g_sc_dirty = 1;
+        (void)ar_reload_and_bump64("shortcut-close");
+        (void)app64_shortcuts_scan64();
+        return;
+    }
     if (!ar_same64(path, APPREG64_PATH)) return;
     if (!g_apps_tried) { (void)app64_registry_init64(); return; }
     if (g_apps_dirty) return;                    // 内核自己有未落盘的改动：别用盘上版本盖掉
@@ -996,4 +1224,12 @@ int app64_reg_selftest64() {
     dbg64_nl();
     dbg64_line_end64();
     return fail;
+}
+
+// ★ v0.12.1：公开入口 —— 重新扫一遍快捷方式目录并重建注册表（供 fd64 close 钩子 / 自检调用）。
+int app64_shortcuts_scan64() {
+    if (!g_apps_tried) return app64_registry_init64();
+    g_sc_dirty = 1;
+    (void)ar_reload_and_bump64("shortcut-scan");
+    return g_sc_added;
 }

@@ -108,17 +108,18 @@ int app64_selftest64();
 //   icon    = 系统图标名（kIcon64Names 里的名字，见 kernel/icons64.h）或 "/..." 卷内 PNG 路径；
 //             取不到 -> 程序化兜底（绝不空）
 //   alias   = 搜索别名（空格分隔）
-//   id      = 内置窗口应用 id（APP_ID_*）；用户应用写 -1
+//   id      = 内置窗口应用 = APP_ID_*；用户应用 = **稳定哈希 id**（v0.12.1：只依赖 exec 串，
+//             ≥1000；Dock 固定列表 /etc/dock.conf 存的就是它，所以跨重启恒定）
 //   builtin = 1 = 构建期内置；0 = 用户安装
 //   desktop = 1 = 桌面上自动建了快捷方式（用户安装默认 1；内置默认 0，不往桌面塞）
 //   x/y     = 桌面快捷方式位置（网格吸附后的左上角；0,0 = 还没定，由桌面模块挑第一个空格）
 #define APPREG64_PATH        "/etc/apps.json"
-#define APPREG64_MAX         24
+#define APPREG64_MAX         48                             // ★ v0.12.1：24 -> 48（快捷方式目录扫进来的要装得下）
 #define APPREG64_NAME_MAX    32
 #define APPREG64_EXEC_MAX    96
 #define APPREG64_ICON_MAX    96
 #define APPREG64_ALIAS_MAX   48
-#define APPREG64_FILE_MAX    8192
+#define APPREG64_FILE_MAX    16384                          // ★ v0.12.1：8192 -> 16384（48 条 × ~200 B 才装得下）
 
 // 启动期/首次使用时确保注册表就绪（内置表进内存 + 卷里有文件就解析/幂等写出）。
 // 返回注册表里的应用条数（>= 内置条数；没有任何卷时 = 内置条数）。
@@ -139,7 +140,7 @@ const char* app64_reg_en64(int i);
 const char* app64_reg_exec64(int i);
 const char* app64_reg_icon64(int i);
 const char* app64_reg_alias64(int i);
-int  app64_reg_id64(int i);               // APP_ID_*；用户应用 = -1
+int  app64_reg_id64(int i);               // APP_ID_*（内置）/ 稳定哈希 id ≥1000（用户应用）
 int  app64_reg_builtin64(int i);
 int  app64_reg_desktop64(int i);
 void app64_reg_pos64(int i, int* x, int* y);
@@ -147,5 +148,19 @@ void app64_reg_pos64(int i, int* x, int* y);
 int  app64_reg_set_desktop64(int i, int on);
 int  app64_reg_set_pos64(int i, int x, int y);
 // 按 exec 找（-1 = 没有）
+// 按 exec 找（-1 = 没有）
 int  app64_reg_find_exec64(const char* exec);
 int  app64_reg_selftest64();
+
+// ==================== ★ v0.12.1：快捷方式目录（开始菜单动态化的唯一真源）====================
+// 扫描 /apps、/usr/share/applications、/apps/desktop 下的 *.lnk / *.desktop，投影进注册表。
+// 文件格式 = 纯文本 key=value（键名大小写不敏感）：name=/en=/exec=/icon=
+//   icon 可以是系统图标名（icons64 的 kIcon64Names，如 image-viewer/files/terminal/plus），
+//   也可以是以 '/' 开头的卷内 PNG 路径（icons64_draw_file64 直接画）。
+// 意义：往目录里丢一个 .lnk 就开始菜单多一项（gen++ 触发重建）；删掉就消失。
+int  app64_shortcuts_scan64();        // 重新扫一遍（返回追加条数；表变了会 bump gen）
+// 启动期一次性幂等播种（root 上下文）：/apps/{image-viewer,micropython,text-editor,app-store}.lnk
+// 已存在的文件**不覆盖**。返回本次写盘条数。
+int  app64_boot_seed_shortcuts64();
+// 这个 exec 是不是卷里真实存在的普通文件（"打开文件所在位置"只在能成立时才显示）
+int  app64_reg_exec_is_file64(int i);

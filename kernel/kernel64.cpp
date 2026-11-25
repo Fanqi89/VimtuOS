@@ -1258,6 +1258,9 @@ display64_init64();
             (void)explorer64_selftest64();                       // 文件管理器纯逻辑自检（单位换算/路径/滚动/历史栈）
             // ★ v0.11.6：先以 root 身份把 /Recycle(0777) 建好（普通用户建不了根目录），再跑往返自检
             (void)trash64_boot_ensure64(fs64_current_vol64());
+            // ★ v0.12.1：以 root 幂等播种应用快捷方式（/apps/*.lnk）—— 图片查看器/MicroPython 这类
+            //   "卷里的用户态程序"靠这份快捷方式进开始菜单（开始菜单读的是快捷方式目录，不是写死的表）。
+            (void)app64_boot_seed_shortcuts64();
             (void)trash64_selftest64();                          // ★ v0.11.6：回收站往返自检（put/list/restore/purge）
             (void)deskdir64_selftest64();                        // ★ v0.11.7：桌面文件夹路径拼接/唯一名（不碰盘）
             // ★ v0.12.0：**先开硬件位，再自检**。v0.11.8/v0.11.9 的顺序反了（自检在前、初化在后），

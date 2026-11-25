@@ -1664,7 +1664,12 @@ int startmenu64_handle_mouse_press64(int mx, int my, int button) {
     if (button == 1) {
         const int view = sm_view_at64(mx, my);
         if (view >= 0) {
-            dockmenu64_open_for_app64(sm_app_no64(view), -1, mx, my);
+            // ★ v0.12.1：这里原来传 sm_app_no64(view)（用户应用 = 100+下标），而 Dock 的固定
+            //   列表存的是注册表 id -> 固定后 dock_reg_index64 查不到 -> 名字/图标全兜底
+            //   （用户看到的"黑底白字 A"）。改成传**注册表 id**。
+            const int rv = (view >= 0 && view < g_view_n) ? g_view[view].reg : -1;
+            const int aid = (rv >= 0) ? app64_reg_id64(rv) : -1;
+            dockmenu64_open_for_app64(aid, -1, mx, my);
             return 1;
         }
         return inside ? 1 : 0;
