@@ -1,7 +1,7 @@
 # HANDOVER —— v0.11.9（KPTI 双页表：用户地址空间里没有内核高半区）
 
 - 日期：2026-11-25（本地）
-- 版本串：`build64.sh` `VIMTUOS_VERSION="0.11.9"`（**已提交、未发版**）
+- 版本串：`build64.sh` `VIMTUOS_VERSION="0.11.9"`（**已发版**：tag `v0.11.9` / Release `457607672`，见 §9）
 - 基线：v0.11.8（`cca2c043`，ring3 隔离第一层：CR0.WP + CR4.SMEP + 审计 + 探针）
 - 内核：**3,558,464 B**（闸门 15,728,640 B）；构建 `EXIT=0`
 - 起因：用户指令"继续完成做 KPTI 的计划" —— v0.11.8 封存的 KPTI 本轮**正式开工并交付**
@@ -160,4 +160,118 @@ N 由 `kpti64_init64()` 按 `kpti64_offtab64` 的**实际偏移**算（`img_page
 - HEAD = 本提交；`kernel64_os.bin` **3,558,464 B**；`VIMTUOS_VERSION="0.11.9"`
 - 产物：`build64/sysdisk.img`(38,489,600) / `vimtu64-64.iso`(93,458,432) / `vimtu64-64.img`
 - 打点总表：`[KPTI64] init ok|init skipped|mode|selftest|status` + `[ISO64] hw|mode|selftest|audit|audit all|probe|status`
-- 未发版：`tag v0.11.9` + Release + 附件回读 + 旧版 Release 不动 —— 按 `docs/发布流程.md` 走
+- **已发版**（2026-11-25）：tag `v0.11.9`、Release `457607672`、附件 digest 回读、旧版 v0.11.7 一字未动 —— 见 §9
+
+## 8. 遗留安全项（逐项：现状 / 证据 / 影响 / 怎么补 / 判据）
+
+> 这一节是给下一个会话的**安全待办清单**。三项都**没有**在本轮修掉，全部如实留在日志里：
+> `smap_on=0`、`wp leak detected … reassert`、`reason=boot-cr3-not-own`。
+> 每一项都给了"补完之后用什么判据证明补上了"，避免下一个人拿"跑起来了"当通过。
+
+### 8.1 SMAP（CR4.SMAP = bit21）：内核读写用户页的硬件闸门 —— **未开**
+
+- **现状**：`iso64_init64()` 只开 CR0.WP 与 CR4.SMEP；`smap_on=0` 是**写死**的值，不是探测值。
+  `smap_supported=` 才是 CPUID 的结论（`-cpu max` 下为 1，默认 `qemu64` 为 0）。
+- **证据（串口）**：
+  ```
+  [ISO64] hw wp=1 smep=0 smep_supported=0 smap_supported=0 smap_on=0 cr0=… cr4=0000000000000620 ok=1
+  [ISO64] mode kpti=1 smap=0 reason=…        ← smap=0 是如实标注，不是默认值忘了改
+  [ISO64] status wp=1 smep=0 smap=0(supported=…)
+  ```
+- **影响**：SMEP 只挡"内核**执行**用户页"，不挡"内核**读写**用户页"。没有 SMAP，
+  一个被攻陷的 ring3 进程可以把自己的页放到内核会误读的地址上（例如把"用户传入的指针"
+  指向自己构造的假结构体），内核那些"直接解引用用户内存"的路径没有任何硬件保护。
+  KPTI 之后这些路径**仍然合法**（内核表里用户页照样映射），所以 SMAP 是这条链上缺的最后一环。
+- **为什么本轮不做**：本内核里"内核读用户内存"的点非常多（`user64_range_ok64` 之后的每一次访存、
+  路径字符串拷贝、iovec 数组、终端邮箱、ELF 装载、信号帧投递、`/proc` 合成、wl/drm 共享内存），
+  每个点都要成对 `STAC/CLSTAC`。漏一个就是"随机 #PF"，且只在特定 syscall 上复现。
+- **怎么补（建议顺序）**：
+  1. **先列清单**：`grep` 出所有 `user64_range_ok64(` / `u64_walk64(` 之后紧跟着的解引用处；
+     加上 `syscall64.cpp` 里所有 `(const char*)(uintptr_t)va` 之类的强转点。
+  2. 在 `kernel/iso64.h` 加 `iso64_stac64()/iso64_clac64()`（`__asm__ volatile("stac"/"clac")`），
+     逐点包起来；**每包完一批**跑 `micropython64_test` + `deskfolder64_test` + `desktopops64_test`，
+     三绿才继续。
+  3. 清单清零后**才**在 `iso64_init64()` 里 `ISO_CR4_SMAP`（`1ULL<<21`）置位、回读确认，
+     并把日志从 `smap_on=0` 改成真实值。
+- **补完了怎么证明**：`tests/iso64_test.py` 里加一条 —— **开 SMAP 后**跑
+  `[ISO64] selftest PASS mask=63` + 上面三个测试全绿 + `[ISO64] hw … smap_on=1`；
+  再加一条**反向判据**：故意在一处未加 `STAC` 的路径上读用户内存，必须 `#PF`（用 `sig64` 杀掉进程、
+  不打 PANIC），证明闸门确实生效。
+
+### 8.2 启动期 CR0.WP 泄漏 —— **根因未定位**（现有处置是"检测 + 修复 + 留痕"）
+
+- **现状**：`iso64_init64()` 打开 WP 之后，**启动期某条路径会把 CR0.WP 清 0**；到桌面后又回到 1。
+  本轮每次启动串口都能看到：
+  ```
+  [ISO64] wp leak detected at selftest (CR0.WP=0) -> reassert
+  [ISO64] wp reassert was=0 now=1 cr0_was=0000000080000011
+  [ISO64] selftest PASS mask=63 … wp_leak=1
+  ```
+  `cr0_was=0x80000011`（= PG|ET|PE，**没有** WP 位 0x10000）是干净证据：那一次自检跑的时候 WP 真的掉了。
+- **影响**：WP=0 时内核**能写只读页** → 内核 bug 可以顺手改坏用户 `.text`、页表、只读数据；
+  这也是 KPTI 之外"内核自身完整性"的一层。现在靠 `iso64_reassert64()` 兜底，等于
+  **把"泄漏窗口"缩小到"自检之前"而不是消除**。
+- **主要嫌疑**：`kernel/fb.cpp` 的 `fb64_cr0_set64(cr0_nw)`（临时清 WP 去写页表/MMIO 的路径）。
+  另需检查 `usermode64.cpp` 的 `u64_wp_enter64()/u64_wp_leave64()`
+  （它们只在 `g_u64_wp_kludge64` 为 1 时清/还原 WP —— 若某条路径 `enter` 之后提前 return，
+  `leave` 就永远不执行）。
+- **怎么补**：
+  1. 在 `fb64_cr0_set64()` 里加**成对断言**：记录"进入时的 CR0"，若离开时 CR0 != 进入时 -> 打
+     `[FB64] cr0 mismatch`（临时，用于定位）；
+  2. 逐条走 `fb.cpp` 里所有 `fb64_cr0_set64(cr0_nw)` 的早退路径（`return` / `continue` / `goto`），
+     改成"成对 enter/leave"或改用 RAII 小结构；
+  3. 同样处理 `u64_wp_enter64/u64_wp_leave64`；
+  4. **定位成功后**删掉 `iso64_init64()`/`kernel64.cpp` 里 `iso64_reassert64()` 的两处兜底
+     （自检里的 leak 检测**必须保留** —— 那是判据，不是修复手段）。
+- **补完了怎么证明**：连续 3 次启动（冷启动 + 2 次重启）串口里 **`wp_leak=0` 且没有
+  `wp leak detected` 行**，同时 `iso64_test` 41/41、`micropython64_test` PASS。
+
+### 8.3 UEFI 路径没有 KPTI —— **设计性缺口**（`reason=boot-cr3-not-own`）
+
+- **现状**：`kpti64_init64()` 的第一道闸门是"引导期页表是不是我们自己的"：
+  ```
+  if (k_page64(cr3) != 0x40000) { g_reason = "boot-cr3-not-own"; … return -1; }
+  ```
+  BIOS/legacy 路径（`boot/loader64.asm` 建的 0x40000 页表）→ **KPTI 全开**；
+  UEFI 路径（`boot/efi/uefi64.c` 只把高半区映射挂进**固件当前活动的 PML4**）→ **KPTI 整层不启用**。
+- **证据（串口）**：UEFI 启动时
+  `[KPTI64] init skipped reason=boot-cr3-not-own cr3=… expect=0000000000040000 kpti=0`，
+  且 `[ISO64] mode kpti=0`、`iso` 里 `kpti=0`；而 `[PROC64] init mode=shared`（v0.11.8 起就是这样）。
+- **影响**：走 UEFI 启动时，ring3 地址空间里**仍然映射着整个内核高半区**（回到 v0.11.8 的状态）。
+  U/S 位仍然挡着访问（违规会 `#PF` -> `sig64` 杀进程），所以不是"立刻可越权"，
+  但 KPTI 这层纵深在 UEFI 下**不存在** —— 用户要求"极具安全意义"的版本，这条必须写清楚。
+- **为什么不本轮做**：两个硬阻塞（都是实测事实，不是猜测）：
+  1. 固件页表**只读**且格式由固件决定，往上挂 `PDPT[6]` 依赖固件留下的空槽位；
+  2. **VMware EFI 下运行期 `mov cr3` 已知会导致复位**（见 `proc64.cpp` 顶部注释与
+     `tests/uefi_cr3_experiment_test.py` 的 A/B 实验）。**KPTI 的本质就是运行期换 CR3**，
+     所以在那个平台上没有先解决"能不能安全 `mov cr3`"，KPTI 无从谈起。
+- **怎么补（建议顺序）**：
+  1. 先让 UEFI 路径**自己建页表**：`uefi64.c` 里不留用固件 PML4，改为自建 PML4 + 复制固件映射
+     （等价于 BIOS 路径的 `lm64_build_paging`），这样 `kpti64_init64()` 的闸门自然通过；
+  2. 用 `tests/uefi_cr3_experiment_test.py`（A：就地挂载 / B：自带 PML4 + `mov cr3`）在
+     **QEMU OVMF 与 VMware EFI 两个平台**上分别验"运行期 `mov cr3` 存活"；
+  3. 存活才把 UEFI 也纳入 KPTI；不存活的平台继续保持 `kpti=0` 并**在设置页/`iso` 里明示**。
+- **补完了怎么证明**：UEFI 启动串口出现 `[KPTI64] init ok … kpti=1` 且
+  `[ISO64] audit … khigh=0 … kind=user`；两个平台各跑一次 `iso64_test`（41/41）。
+
+### 8.4 其它（不是漏洞，但和"安全"同一批账，如实列出）
+
+| 项 | 现状 | 备注 |
+|---|---|---|
+| 无 PCID | `mov cr3` 每次刷 TLB | 每 IRQ/syscall 各 2 次；开 PCID 能省掉大部分 TLB 重填，但要先有 per-ASID 管理 |
+| 缺页按需分页 / COW | 仍没有 | `proc64.h` §5 已写明取舍 |
+| KPTI 性能账未量 | 只有"量级相同"的观察 | 建议做 v0.11.8 vs v0.11.9 同镜像对照（`[UI] perf … redraw_us`、启动 tick 数） |
+| 共享入口区可写 | `.text.kpti` 三页在共享 VA 上是 **RW** | 因为里面有变量/栈/GDT 副本；若要更严可拆成"代码页 RO + 数据页 RW"（C 侧只改 PTE 位） |
+
+## 9. 发版回读事实（v0.11.9 已发布）
+
+| 项 | 值 |
+|---|---|
+| tag | `v0.11.9` = `1a3e1070f19a687c922b4f38d033fd4d1839f681` → commit `d159d953` |
+| Release | id **`457607672`**（draft=false / prerelease=false，附件 2 个） |
+| `vimtu64-64.iso` | 93,458,432 B — `sha256:df16f7491995538811a32410a76b90d44aa34c3f3615add2a70dd30e1063198b` |
+| `vimtu64-64.img` | 42,684,416 B — `sha256:929bad9c20782f6a0e60113b25a148401efc0feba6ba8190de132e41fc626f84` |
+| 旧版 v0.11.7 | 两个附件的 `id/size/digest/updated_at` **逐条未动**（RESULT: PASS） |
+
+发版脚本 `$PI_SCRATCH_DIR\rel_v0119.py`（Release 正文 `body_v0119.md`；tag 对象与 main ref 走
+Git Data API 逐位复现 —— 本机 `git push` 本轮仍报 `Empty reply from server`）。
