@@ -183,11 +183,13 @@ app_id -> 注册表下标 -> exec("/bin/viewer")
 
 | 项 | 值 |
 |---|---|
-| tag | <!--TAG--> |
-| Release | <!--REL--> |
-| `vimtu64-64.iso` | <!--ISOB--> |
-| `vimtu64-64.img` | <!--IMGB--> |
-| 旧版 v0.12.0 | <!--PREV--> |
+| tag | `v0.12.1` = `27d55cc3471c9d1d09a4894846c7996bddff9a60`（annotated，`git cat-file -t` = `tag`）→ commit `3b36eff8` |
+| Release | id **`457824776`**（draft=false / prerelease=false，附件 2 个 `uploaded`） |
+| `vimtu64-64.iso` | 93,458,432 B — `sha256:33f5ec0f96e558edd94bb945200dd075f7fa0dd2cbee28663c943304f4cc7090` |
+| `vimtu64-64.img` | 42,684,416 B — `sha256:a94521dc0990da6eb6c8c606e9abedd57303cf287096f61ef4eac45fafdef830` |
+| 旧版 v0.12.0 | 两个附件 `id/size/digest/updated_at` **逐条未动**（img id=790496583 / iso id=790495925，RESULT: PASS） |
+
+本地 `Get-FileHash -Algorithm SHA256` 与远端 `digest` **逐位一致**（发版脚本第 ④ 步双向核对，RESULT: PASS）。
 
 发版脚本：`$PI_SCRATCH_DIR\rel_v0121.py`（与 v0.11.9 / v0.12.0 同一套：本地 annotated tag 与远端
 tag 对象**逐位复现 sha**、Release + 两附件上传、本地 `sha256` 与远端 `digest` 双向核对、
