@@ -77,6 +77,20 @@ FONTS_CONF_DEFAULT = (
     "fallback.family = Unifont\n"
 )
 
+# ★ v0.12.2：/etc/resolv.conf 的**发行版默认**（0666）。
+#   为什么必须在构建期就存在（而不是运行期种）：musl 的 getaddrinfo **没有**内置默认 nameserver ——
+#   它只读 /etc/resolv.conf；文件不存在时 `__res_msend_rc` 连一个上游都没有，直接返回失败。
+#   这就是用户报的「ping baidu.com 报错」的**第一个根因**（第二个是 poll() 看不见 socket，
+#   见 kernel/sock64.cpp 的 v0.12.2 注释）。QEMU 用户网络（slirp）的 DNS 固定是 10.0.2.3。
+RESOLV_CONF_VOL = "/etc/resolv.conf"
+RESOLV_CONF_DEFAULT = (
+    "# VimtuOS resolver config (musl libc 读这份文件)\n"
+    "# 每行一个上游；改完立刻生效（musl 每次解析都重读），不需要重启。\n"
+    "#   QEMU 用户网络（-netdev user,id=n0）：DNS 必须是 10.0.2.3\n"
+    "#   VMware / 桥接 / 真机：改成你的网关或公共 DNS（例如 223.5.5.5）\n"
+    "nameserver 10.0.2.3\n"
+)
+
 # provides 表默认内容（**每行必须带一条见证路径**：只有那个文件真在卷上，/bin/vpkg 才认这条声明；
 # 见 user/store/vs_pkg.c 的"依赖模型"）。下面这条 libc6 只有在镜像里真的装了 glibc 共享库
 # （例如 tests/linuxapp64_test.py 的 lxcorpus 夹具盘）时才作数；普通系统卷上它是**惰性**的
@@ -583,6 +597,13 @@ def main():
     files.setdefault(FONTS_CONF_VOL, (FONTS_CONF_DEFAULT.encode("utf-8"), 0o666))
     print("    %-16s = %d B（发行版默认；0666 -> 普通会话可改，内核启动读它 = src=file）"
           % (FONTS_CONF_VOL, len(files[FONTS_CONF_VOL][0])))
+    # ★ v0.12.2：/etc/resolv.conf —— **域名解析的唯一数据源**（musl 的 getaddrinfo 没有内置默认
+    #   nameserver：文件不存在 = 直接 EAI_NONAME，"ping baidu.com" 就是这么报错的）。
+    #   默认值 = QEMU 用户网络（slirp）的 DNS 10.0.2.3；真机/桥接下用户自己改这个文件即可。
+    #   0666：普通会话（uid=1000）改得动，改完不用重启（musl 每次解析都重读）。
+    files.setdefault(RESOLV_CONF_VOL, (RESOLV_CONF_DEFAULT.encode("utf-8"), 0o666))
+    print("    %-16s = %d B（发行版默认；0666 -> 可改；DNS 10.0.2.3 = slirp）"
+          % (RESOLV_CONF_VOL, len(files[RESOLV_CONF_VOL][0])))
     for path in sorted(files):
         vol.put(path, files[path][0], mode=files[path][1])
     out = vol.finish()

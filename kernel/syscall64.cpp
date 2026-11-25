@@ -138,6 +138,10 @@
 #include "vfs64.h"          // Linux open/read 走真实文件系统
 #include "fd64.h"           // 批次 B：FD 层（open/read/write/close/lseek/fstat/dup 的公共底座）
 #include "sock64.h"         // ★ v0.7.4（P2 第三批）：Linux socket 层（AF_INET）
+#ifndef VIMTU_INSTALLER_MEDIA
+#include "net64.h"          // ★ v0.12.2：net64_poll64（poll 等 socket 时要自己泵收包）+ net64_send_ipv4
+                            //   安装程序内核不带网络（net64.cpp 不在 SRCS_INSTALLER 里），整段不编。
+#endif
 
 // ★ v0.9.39：fd -> socket handle 的翻译（定义在 socket 段，使用点在 close/dup2 等更前面）
 #ifndef VIMTU_INSTALLER_MEDIA
@@ -2247,11 +2251,22 @@ static int64_t lx64_poll_core64(Lx64PollFd64* pf, uint32_t nfds, uint64_t timeou
     const uint64_t t0 = g_ticks64;
     for (;;) {
         int ready = 0;
+        bool has_sock = false;
         for (uint32_t i = 0; i < nfds; i++) {
             const int32_t fd = pf[i].fd;
             int32_t rev = 0;
             if (fd >= 0) {
-                const int st = fd64_ready64((int)fd);
+                // ★ v0.12.2：socket handle 不进 fd 表（= 200+idx），原来这里一律 POLLNVAL。
+                //   后果是 musl 的 getaddrinfo 在 `poll()` 上等不到 DNS 回包 ——
+                //   这正是 `ping baidu.com` 报错的第二个根因。现在按 sock64 自己的就绪位判。
+                int st;
+#ifndef VIMTU_INSTALLER_MEDIA
+                const bool is_sock = (fd >= (int32_t)SOCK64_FD_BASE) && sock64_is_socket64((int)fd);
+                st = is_sock ? sock64_ready64((int)fd) : fd64_ready64((int)fd);
+                if (is_sock) has_sock = true;
+#else
+                st = fd64_ready64((int)fd);          // 安装程序内核没有 socket 层
+#endif
                 if (st < 0) rev = (int32_t)LX64_POLLNVAL64;
                 else {
                     if (st & FD64_READY_IN)  rev |= (int32_t)LX64_POLLIN64;
@@ -2269,6 +2284,12 @@ static int64_t lx64_poll_core64(Lx64PollFd64* pf, uint32_t nfds, uint64_t timeou
             const uint64_t el_ms = (g_ticks64 - t0) * 1000u / PIT_HZ_64;
             if (el_ms >= timeout_ms) return 0;
         }
+        // ★ v0.12.2：等 socket 的时候必须**自己驱动收包**（本内核的网卡是轮询式，没有收包中断）
+#ifndef VIMTU_INSTALLER_MEDIA
+        if (has_sock) net64_poll64();
+#else
+        (void)has_sock;                                    // 安装程序内核没有 socket 层
+#endif
         lx64_sleep_1ms64();
     }
 }
@@ -2445,7 +2466,10 @@ static int64_t lx64_sendto_s64(uint64_t nr, uint64_t fd, uint64_t buf_va, uint64
     }
     const int sh = sc64_sock_handle_of_fd(fd);
     if (sh < 0) return -LX64_EBADF;
+    // ★ v0.12.2：socket 层会直接读用户缓冲 —— SMAP 打开时必须开窗（原来这里没有 STAC）。
+    ISO64_STAC64();
     const int n = sock64_send64(sh, (const void*)(uintptr_t)buf_va, (int)len);
+    ISO64_CLAC64();
     return n < 0 ? -32 : (int64_t)n;                          // -EPIPE
 }
 
@@ -2457,13 +2481,19 @@ static int64_t lx64_recvfrom_s64(uint64_t nr, uint64_t fd, uint64_t buf_va, uint
     //   被包成 -ECONNRESET 就会每被打断一次刷一行错误）。
     const int sh = sc64_sock_handle_of_fd(fd);
     if (sh < 0) return -LX64_EBADF;
-    const int n = sock64_recv64(sh, (void*)(uintptr_t)buf_va, (int)len, 3000);
+    // ★ v0.12.2：超时不再被吞成 ECONNRESET —— -EAGAIN 必须原样透出（"这一刻没数据" ≠ "连接断了"）；
+    //   同时 socket 层会直接写用户缓冲，SMAP 下必须开窗（原来这里没有 STAC）。
+    ISO64_STAC64();
+    const int n = sock64_recv64(sh, (void*)(uintptr_t)buf_va, (int)len, 0);
+    ISO64_CLAC64();
     if (n == -4) return -4;                                   // ★ v0.9.39：-EINTR 原样透出
+    if (n == -11) return -11;                                 // ★ v0.12.2：-EAGAIN 原样透出
     if (n < 0) return -104;                                   // -ECONNRESET
     if (addr_va) {                                            // 回填源地址（UDP / ICMP 都回）
         uint32_t ip = 0;
         uint16_t port = 0;
         if (sock64_getname64(sh, &ip, &port, 1) == 0 && user64_range_ok64(addr_va, 16)) {
+            ISO64_STAC64();
             uint8_t* q = (uint8_t*)(uintptr_t)addr_va;
             q[0] = 2; q[1] = 0;
             q[2] = (uint8_t)(port >> 8); q[3] = (uint8_t)port;
@@ -2471,9 +2501,99 @@ static int64_t lx64_recvfrom_s64(uint64_t nr, uint64_t fd, uint64_t buf_va, uint
             for (int i = 8; i < 16; i++) q[i] = 0;
             if (addr_len_va && user64_range_ok64(addr_len_va, 4))
                 *((uint32_t*)(uintptr_t)addr_len_va) = 16u;
+            ISO64_CLAC64();
         }
     }
     return (int64_t)n;
+}
+
+// ==================== ★ v0.12.2：sendmsg(46) / recvmsg(47) ====================
+// 为什么必须有：musl 的 `getaddrinfo` 收 DNS 回包走的是 **recvmsg**（它要靠 msg_name 拿到
+// 回包的源地址来判断是哪个 nameserver 答的）。没有 47 号 → `[SYSCALL] enosys nr=47`，
+// 查询发出去了、poll 也说可读（v0.12.2 修好了 poll 与 UDP 头），但**取不出来**，
+// 最后仍然 `nslookup: can't resolve`。这是 `ping baidu.com` 报错的**第三个代码根因**。
+//
+// 结构体布局（x86_64 Linux，写死字节偏移，不 include 用户头）：
+//   msghdr: 0 msg_name / 8 msg_namelen(4B) / 16 msg_iov / 24 msg_iovlen(8B)
+//           32 msg_control / 40 msg_controllen(8B) / 48 msg_flags(4B)   —— 共 56 B
+//   iovec : 0 iov_base / 8 iov_len(8B)                                 —— 共 16 B
+// 如实边界：**只填 iov[0]**（iovlen>1 时余下的置 0、不报错）。DNS/HTTP 客户端都是单 iov。
+static int64_t lx64_recvmsg64(uint64_t nr, uint64_t fd, uint64_t msg_va, uint64_t flags) {
+    (void)flags;
+    if (!user64_range_ok64(msg_va, 56)) { syscall64_deny64(nr, msg_va); return -LX64_EFAULT; }
+    const uint8_t* mh = (const uint8_t*)(uintptr_t)msg_va;
+    uint64_t name_va = 0, iov_va = 0, iovlen = 0, controllen = 0;
+    uint32_t namelen = 0;
+    ISO64_STAC64();
+    for (int i = 0; i < 8; i++) name_va |= (uint64_t)mh[0 + i] << (8 * i);
+    for (int i = 0; i < 4; i++) namelen |= (uint32_t)mh[8 + i] << (8 * i);
+    for (int i = 0; i < 8; i++) iov_va |= (uint64_t)mh[16 + i] << (8 * i);
+    for (int i = 0; i < 8; i++) iovlen |= (uint64_t)mh[24 + i] << (8 * i);
+    for (int i = 0; i < 8; i++) controllen |= (uint64_t)mh[40 + i] << (8 * i);
+    ISO64_CLAC64();
+    (void)controllen;
+    if (!iov_va || iovlen < 1 || !user64_range_ok64(iov_va, 16)) {
+        syscall64_deny64(nr, iov_va); return -LX64_EFAULT;
+    }
+    uint64_t base = 0, blen = 0;
+    ISO64_STAC64();
+    const uint8_t* iov = (const uint8_t*)(uintptr_t)iov_va;
+    for (int i = 0; i < 8; i++) base |= (uint64_t)iov[0 + i] << (8 * i);
+    for (int i = 0; i < 8; i++) blen |= (uint64_t)iov[8 + i] << (8 * i);
+    ISO64_CLAC64();
+    if (blen > 65536u) blen = 65536u;                       // 有界
+    if (!user64_range_ok64(base, blen)) { syscall64_deny64(nr, base); return -LX64_EFAULT; }
+
+    const int sh = sc64_sock_handle_of_fd(fd);
+    if (sh < 0) return -LX64_EBADF;
+    ISO64_STAC64();                                          // socket 层会直接写用户缓冲
+    const int n = sock64_recv64(sh, (void*)(uintptr_t)base, (int)blen, 0);
+    ISO64_CLAC64();
+    if (n == -4) return -4;                                  // -EINTR
+    if (n == -11) return -11;                                // -EAGAIN
+    if (n < 0) return -104;                                  // -ECONNRESET
+
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    const bool have_peer = (sock64_getname64(sh, &ip, &port, 1) == 0);
+    ISO64_STAC64();
+    if (name_va && namelen >= 16u && user64_range_ok64(name_va, 16)) {
+        uint8_t* q = (uint8_t*)(uintptr_t)name_va;
+        q[0] = 2; q[1] = 0;
+        q[2] = (uint8_t)(port >> 8); q[3] = (uint8_t)port;
+        for (int i = 0; i < 4; i++) q[4 + i] = (uint8_t)(ip >> (8 * i));
+        for (int i = 8; i < 16; i++) q[i] = 0;
+        *((uint32_t*)(uintptr_t)(msg_va + 8)) = 16u;          // msg_namelen = 16
+    } else if (name_va) {
+        *((uint32_t*)(uintptr_t)(msg_va + 8)) = 0u;
+    }
+    *((uint32_t*)(uintptr_t)(msg_va + 48)) = 0u;              // msg_flags = 0
+    ISO64_CLAC64();
+    (void)have_peer;
+    return (int64_t)n;
+}
+
+static int64_t lx64_sendmsg64(uint64_t nr, uint64_t fd, uint64_t msg_va, uint64_t flags) {
+    (void)flags;
+    if (!user64_range_ok64(msg_va, 56)) { syscall64_deny64(nr, msg_va); return -LX64_EFAULT; }
+    const uint8_t* mh = (const uint8_t*)(uintptr_t)msg_va;
+    uint64_t name_va = 0, iov_va = 0, iovlen = 0;
+    ISO64_STAC64();
+    for (int i = 0; i < 8; i++) name_va |= (uint64_t)mh[0 + i] << (8 * i);
+    for (int i = 0; i < 8; i++) iov_va |= (uint64_t)mh[16 + i] << (8 * i);
+    for (int i = 0; i < 8; i++) iovlen |= (uint64_t)mh[24 + i] << (8 * i);
+    ISO64_CLAC64();
+    if (!iov_va || iovlen < 1 || !user64_range_ok64(iov_va, 16)) {
+        syscall64_deny64(nr, iov_va); return -LX64_EFAULT;
+    }
+    uint64_t base = 0, blen = 0;
+    ISO64_STAC64();
+    const uint8_t* iov = (const uint8_t*)(uintptr_t)iov_va;
+    for (int i = 0; i < 8; i++) base |= (uint64_t)iov[0 + i] << (8 * i);
+    for (int i = 0; i < 8; i++) blen |= (uint64_t)iov[8 + i] << (8 * i);
+    ISO64_CLAC64();
+    if (!user64_range_ok64(base, blen)) { syscall64_deny64(nr, base); return -LX64_EFAULT; }
+    return lx64_sendto_s64(nr, fd, base, blen, 0, name_va, 0);
 }
 
 static int64_t lx64_sockname_s64(uint64_t nr, uint64_t fd, uint64_t va, uint64_t len_va, int peer) {
@@ -3523,6 +3643,8 @@ static int64_t syscall64_linux64(pt_regs64* r) {
     case 43:  return -95;                                        // ★ v0.7.4：accept 不支持（仅客户端）
     case 44:  return lx64_sendto_s64(nr, a1, a2, a3, a4, a5, a6); // ★ v0.7.4：sendto / send
     case 45:  return lx64_recvfrom_s64(nr, a1, a2, a3, a4, a5, a6); // ★ v0.7.4：recvfrom / recv
+    case 46:  return lx64_sendmsg64(nr, a1, a2, a3);          // ★ v0.12.2：sendmsg（单 iov）
+    case 47:  return lx64_recvmsg64(nr, a1, a2, a3);          // ★ v0.12.2：recvmsg（musl 的 DNS 用它取回包）
     case 48:  return lx64_sock_close64(a1);                       // ★ v0.7.4：shutdown ≈ close
     case 49:  return lx64_bind_s64(nr, a1, a2, a3);              // ★ v0.9.39：bind（raw ICMP/UDP 真支持；TCP 仍 -EOPNOTSUPP）
     case 50:  return -95;                                        // ★ v0.7.4：listen 不支持
