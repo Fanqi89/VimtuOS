@@ -1,3 +1,5 @@
+> [← 返回主页](../README.md) · VimtuOS 文档体系
+
 # VimtuOS 64 v0.10.8 —— UEFI 从"装好的硬盘"引导修复
 
 > 一句话：**用 ISO 装完系统后，UEFI 模式下终于能从硬盘自己起来了**（真机 / VMware EFI 同一套固件族）。

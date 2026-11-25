@@ -1,3 +1,5 @@
+> [← 返回主页](README.md) · VimtuOS 文档体系
+
 # VimtuOS Fonts Manifest（字体清单：文件名｜来源 URL｜版本｜协议｜SHA256）
 
 内核**四个字体面**（见 `kernel/font.cpp`）与实际使用的源文件：

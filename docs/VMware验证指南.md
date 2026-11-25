@@ -1,3 +1,5 @@
+> [← 返回主页](../README.md) · VimtuOS 文档体系
+
 # 在 VMware 上验证 VimtuOS 64 位（安装 + 启动）
 
 这份文档记录**怎么在 VMware Workstation 里跑完整个安装流程并自动验收**，

@@ -1,3 +1,5 @@
+> [← 返回主页](../README.md) · VimtuOS 文档体系
+
 # zstd 解码器（v0.10.3）
 
 > 为什么要有这一页：`.deb` 从 Ubuntu 21.10 / Debian 12 起默认用 `control.tar.zst` +
