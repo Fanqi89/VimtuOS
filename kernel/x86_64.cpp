@@ -12,6 +12,7 @@
 //     段寄存器槽是占位值，内核里这些选择子恒为 0x10。
 #include "x86_64.h"
 #include "debug64.h"
+#include "kpti64.h"      // ★ v0.11.9：KPTI（门重定向 / 共享入口栈 / TSS.rsp0 语义）
 
 // ==================== 全局状态 ====================
 volatile uint64_t g_ticks64 = 0;
@@ -73,6 +74,10 @@ static IDTEntry64 g_idt[256];
 static IDTR64     g_idtr;
 static TSS64      g_tss;
 static GDTR64     g_gdtr;
+// ★ v0.11.9（KPTI）：这两张表可能被搬到共享入口区（见 x86_64_kpti_enable64）。
+//   之后所有写/读都必须走这两个指针 —— 直接写 g_idt / g_tss 会改到"已经不再生效的副本"。
+static IDTEntry64* g_idtp       = g_idt;
+static TSS64*      g_tss_active = &g_tss;
 // ==================== GDT 布局（8 项；顺序是硬约束，别乱排）====================
 //   index  选择子  DPL  描述
 //     0    ----     0    null
@@ -102,13 +107,20 @@ static GDTEntry64 g_gdt[8];
 
 // ==================== IDT ====================
 void idt_set_gate64(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags, uint8_t ist) {
-    g_idt[num].off_low   = (uint16_t)(base & 0xFFFF);
-    g_idt[num].selector  = sel;
-    g_idt[num].ist       = (uint8_t)(ist & 0x07);
-    g_idt[num].type_attr = flags;
-    g_idt[num].off_mid   = (uint16_t)((base >> 16) & 0xFFFF);
-    g_idt[num].off_high  = (uint32_t)((base >> 32) & 0xFFFFFFFF);
-    g_idt[num].zero      = 0;
+    // ★ v0.11.9（KPTI）：这座门以后可能在 ring3 里被用到，那样的门必须指向**共享入口区**
+    //   里的蹦床 —— 用户地址空间里没有内核高半区，指到 isrN_64 就是取指 #PF。
+    //   没启用 KPTI 时 kpti64_tramp64() 恒返回 0，这里的 base 原样保留（行为不变）。
+    if (base) {
+        const uint64_t t = kpti64_tramp64((int)num);
+        if (t) base = t;
+    }
+    g_idtp[num].off_low   = (uint16_t)(base & 0xFFFF);
+    g_idtp[num].selector  = sel;
+    g_idtp[num].ist       = (uint8_t)(ist & 0x07);
+    g_idtp[num].type_attr = flags;
+    g_idtp[num].off_mid   = (uint16_t)((base >> 16) & 0xFFFF);
+    g_idtp[num].off_high  = (uint32_t)((base >> 32) & 0xFFFFFFFF);
+    g_idtp[num].zero      = 0;
 }
 
 // 中断桩入口表：isr0_64..isr47_64 + isr128_64（int 0x80）
@@ -134,7 +146,7 @@ static void idt_build() {
     for (int n = 0; n < 256; n++) {
         if (n < 48 || n == 128) continue;
         idt_set_gate64((uint8_t)n, 0, 0x08, 0x8E, 0);
-        g_idt[n].type_attr = 0x0E;      // 清 P 位：未安装
+        g_idtp[n].type_attr = 0x0E;      // 清 P 位：未安装
     }
 }
 
@@ -155,7 +167,17 @@ static void tss_write_descriptor() {
     hi->reserved   = 0;
 }
 
-void tss_set_rsp0(uint64_t rsp0) { g_tss.rsp0 = rsp0; }
+void tss_set_rsp0(uint64_t rsp0) {
+    // ★ v0.11.9（KPTI）：KPTI 模式下 TSS.rsp0 **恒为共享入口栈顶** —— 那是 ring3 → ring0
+    //   唯一能落脚的栈（用户表里没有内核高半区）。真实内核栈顶只"镜像"给入口蹦床，
+    //   帧搬过去之后再当栈用（见 kernel/kpti_blob64.asm 的 kpti64_user_entry64）。
+    if (kpti64_on64()) {
+        g_tss_active->rsp0 = kpti64_entry_rsp064();
+        kpti64_set_kstack64(rsp0);
+        return;
+    }
+    g_tss_active->rsp0 = rsp0;
+}
 
 static void tss_init(uint64_t rsp0) {
     uint8_t* p = (uint8_t*)&g_tss;
@@ -195,6 +217,79 @@ uint64_t gdt_entry_raw64(int index) {
     uint64_t v = 0;
     for (int i = 7; i >= 0; i--) v = (v << 8) | b[i];
     return v;
+}
+
+// ==================== ★ v0.11.9：KPTI 的 GDT/TSS/IDT 搬家 + 门重定向 ====================
+// 为什么必须搬：KPTI 打开后用户地址空间里没有内核高半区。而 CPU 处理 "ring3 → ring0"
+// （int / 异常 / IRQ）时要用三样东西，它们必须**在两张表里都映射**：
+//   ① IDTR.base（取门描述符）  ② GDT 里的 TSS 描述符 → TSS.rsp0（取新栈）  ③ 门目标（取指）
+// 所以这三样各拷一份到共享入口区（KPTI64_BASE），之后所有写操作都走 g_idtp / g_tss_active。
+// 打点由 kernel/kpti64.cpp 负责；本文件只保证"拷过去的那份是对的"。
+extern "C" void apic64_spurious_stub64() __attribute__((weak));   // apic64.cpp（只进系统内核）
+
+static void k64_write_tss_desc64(uint8_t* gdt, uint64_t tss_base) {
+    const uint32_t limit = sizeof(TSS64) - 1;
+    GDTEntry64* e = (GDTEntry64*)(gdt + 6 * 8);
+    e->limit_low = (uint16_t)(limit & 0xFFFF);
+    e->base_low  = (uint16_t)(tss_base & 0xFFFF);
+    e->base_mid  = (uint8_t)((tss_base >> 16) & 0xFF);
+    e->access    = 0x89;                                   // P=1 DPL=0 类型 0x9（64 位可用 TSS）
+    e->gran      = (uint8_t)((limit >> 16) & 0x0F);
+    e->base_high = (uint8_t)((tss_base >> 24) & 0xFF);
+    TSSEntry64* hi = (TSSEntry64*)e;
+    hi->base_upper = (uint32_t)(tss_base >> 32);
+    hi->reserved   = 0;
+}
+
+uint64_t x86_64_kpti_idt_base64() { return (uint64_t)(uintptr_t)g_idtp; }
+uint64_t x86_64_kpti_gdt_base64() { return g_gdtr.base; }
+uint64_t x86_64_kpti_gate_target64(int num) {
+    if (num < 0 || num > 255) return 0;
+    const IDTEntry64* e = &g_idtp[num];
+    return (uint64_t)e->off_low | ((uint64_t)e->off_mid << 16) | ((uint64_t)e->off_high << 32);
+}
+
+int x86_64_kpti_enable64(uint64_t idt_va, uint64_t gdt_va, uint64_t tss_va, uint64_t entry_rsp) {
+    if (!idt_va || !gdt_va || !tss_va || !entry_rsp) return -1;
+
+    // ---- ① GDT 副本 + ② TSS 副本（描述符 base 指向副本本身）----
+    uint8_t* dg = (uint8_t*)(uintptr_t)gdt_va;
+    const uint8_t* sg = (const uint8_t*)&g_gdt;
+    for (uint32_t i = 0; i < sizeof(g_gdt); i++) dg[i] = sg[i];
+    TSS64* dt = (TSS64*)(uintptr_t)tss_va;
+    const uint8_t* st = (const uint8_t*)&g_tss;
+    for (uint32_t i = 0; i < sizeof(TSS64); i++) ((uint8_t*)dt)[i] = st[i];
+    dt->rsp0 = entry_rsp;                                  // ring3 → ring0 的落脚栈
+    k64_write_tss_desc64(dg, tss_va);
+    g_tss_active = dt;
+    g_gdtr.base  = gdt_va;
+    __asm__ volatile("lgdt %0" : : "m"(g_gdtr));
+    __asm__ volatile("ltr %0"  : : "r"(SEL64_TSS));
+
+    // ---- ③ IDT 副本 + 门重定向（本来指向内核高半区 isrN_64 的门，改指向共享蹦床）----
+    IDTEntry64* di = (IDTEntry64*)(uintptr_t)idt_va;
+    for (int i = 0; i < 256; i++) di[i] = g_idt[i];
+    g_idtp = di;
+    for (int v = 0; v < 256; v++) {
+        if (!(g_idtp[v].type_attr & 0x80)) continue;        // P=0：未安装的门不动
+        const uint64_t t = kpti64_tramp_raw64(v);
+        if (!t) continue;                                   // 这个向量没有蹦床（本来也装不了）
+        const uint64_t cur = x86_64_kpti_gate_target64(v);
+        int matched = 0;
+        if (v < 48 && cur == (uint64_t)(uintptr_t)kIsrTable[v]) matched = 1;
+        if (v == 128 && cur == (uint64_t)(uintptr_t)isr128_64) matched = 1;
+        if (v == 255 && apic64_spurious_stub64 &&
+            cur == (uint64_t)(uintptr_t)apic64_spurious_stub64) matched = 1;
+        if (!matched) continue;                             // 不是内核高半区的桩：不碰
+        g_idtp[v].off_low  = (uint16_t)(t & 0xFFFF);
+        g_idtp[v].off_mid  = (uint16_t)((t >> 16) & 0xFFFF);
+        g_idtp[v].off_high = (uint32_t)((t >> 32) & 0xFFFFFFFF);
+        g_idtp[v].zero     = 0;
+    }
+    g_idtr.limit = (uint16_t)(sizeof(g_idt) - 1);
+    g_idtr.base  = idt_va;
+    __asm__ volatile("lidt %0" : : "m"(g_idtr));
+    return 0;
 }
 
 // ==================== PIC ====================
@@ -264,7 +359,7 @@ static void idt_diag_dump() {
     dbg64_str(" table[32]=");
     dbg64_hex64((uint64_t)(uintptr_t)kIsrTable[32]);
     dbg64_nl();
-    const uint8_t* e = (const uint8_t*)&g_idt[32];
+    const uint8_t* e = (const uint8_t*)&g_idtp[32];
     dbg64_str("[X64] idt[32]=");
     for (int i = 0; i < 16; i++) { dbg64_hex64(e[i]); dbg64_str(" "); }
     dbg64_nl();
@@ -415,6 +510,13 @@ void x86_init64() {
     __asm__ volatile("lidt %0" : : "m"(g_idtr));
 
     pit_init64(PIT_HZ_64);
+
+    // ★ v0.11.9：KPTI（双页表 + 共享入口区）。位置讲究：
+    //   * 必须在 TSS/IDT 建好之后（要拷它们、要重定向门）；
+    //   * 必须在第一次 sti 之前（kmain64 在本函数返回后立刻 sti）—— 否则第一发 PIT
+    //     可能落在一张"门已重定向但地图还没挂上"的中间态里；
+    //   * 必须在 mem_init_64 之后（要 page_alloc_64）。
+    (void)kpti64_init64();
 
 
 

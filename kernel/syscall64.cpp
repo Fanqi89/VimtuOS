@@ -223,6 +223,7 @@ int64_t wl64_surface_app_icon64(uint64_t, uint64_t, uint64_t)          __attribu
 static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
 #include "mem_64.h"         // PAGE_SIZE_64 / page_free_64 / PTE_*
 #include "debug64.h"
+#include "kpti64.h"        // ★ v0.11.9：KPTI（LSTAR 是否指向共享入口区）
 #include "fb.h"             // 屏幕输出（fb_draw_text / fb_flip_region）
 #include "proc64.h"         // 批次 C：进程/地址空间（fork/execve/wait4/kill/每进程 brk&mmap/FS 基址）
 // ★ 系统音效：音频 ABI（49 audio_play）**只转发**给 hda64 驱动（不新增驱动能力）。
@@ -3953,13 +3954,17 @@ static const uint32_t SC64_FMASK64 = 0x700u;
 static const uint64_t SC64_STAR64  = ((uint64_t)0x1B << 48) | ((uint64_t)0x08 << 32);
 
 // 打开 EFER.SCE + 写 STAR/LSTAR/FMASK。幂等，可重复调用（自检里也调一次，保证测的是配置后的现场）。
+// ★ v0.11.9（KPTI）：LSTAR 的目标在下面定义（KPTI 打开时会指向共享入口区）
+uint64_t syscall64_lstar_target64();
+
+// 打开 EFER.SCE + 写 STAR/LSTAR/FMASK。幂等，可重复调用（自检里也调一次，保证测的是配置后的现场）。
 static void syscall64_init_msr64() {
     uint64_t efer = sc64_rdmsr(MSR64_EFER);
     if (!(efer & 1u)) {
         sc64_wrmsr(MSR64_EFER, efer | 1u);                      // EFER.SCE = bit0
     }
     sc64_wrmsr(MSR64_STAR,  SC64_STAR64);
-    sc64_wrmsr(MSR64_LSTAR, (uint64_t)(uintptr_t)syscall64_insn_entry64);
+    sc64_wrmsr(MSR64_LSTAR, syscall64_lstar_target64());
     sc64_wrmsr(MSR64_FMASK, SC64_FMASK64);
 
     // 留证（自动验收 grep；回读 MSR 确认真的写进去了）
@@ -3977,6 +3982,22 @@ static void syscall64_init_msr64() {
     dbg64_line_begin64();
     dbg64_str("[SYSCALL] syscall insn entry ready (rustar: STAR=0x1B<<48|0x08<<32 -> CS=0x2B SS=0x23)\n");
     dbg64_line_end64();
+}
+
+// ★ v0.11.9（KPTI）：LSTAR 到底指向谁。
+//   默认 = kernel/syscall_entry64.asm 的 syscall64_insn_entry64（内核高半区）；
+//   KPTI 启用后 = 共享入口区里的 kpti64_syscall_entry64 标号（用户表里也能取指，
+//   入口先切栈再切 CR3，出口最后一刻切回用户表 —— 见 kernel/kpti_blob64.asm）。
+//   自检断言也用这个函数，保证"断言的就是真正写进 MSR 的值"。
+uint64_t syscall64_lstar_target64() {
+    const uint64_t t = kpti64_syscall_entry_va64();
+    return t ? t : (uint64_t)(uintptr_t)syscall64_insn_entry64;
+}
+
+// 给 kernel/kpti64.cpp 用：KPTI 启用后把 LSTAR 重新指到共享入口（幂等）。
+void syscall64_kpti_set_lstar64(uint64_t entry) {
+    if (!entry) return;
+    sc64_wrmsr(MSR64_LSTAR, entry);
 }
 
 // ==================== 自检 ====================
@@ -4026,7 +4047,8 @@ int syscall64_selftest64() {
     {
         if (!(sc64_rdmsr(MSR64_EFER) & 1u)) fail |= 8;                              // EFER.SCE
         if (sc64_rdmsr(MSR64_STAR) != SC64_STAR64) fail |= 8;                       // STAR 全 64 位比对
-        if (sc64_rdmsr(MSR64_LSTAR) != (uint64_t)(uintptr_t)syscall64_insn_entry64) fail |= 8;
+        // ★ v0.11.9：KPTI 打开后 LSTAR 指向共享入口区（syscall64_lstar_target64 是唯一真源）
+        if (sc64_rdmsr(MSR64_LSTAR) != syscall64_lstar_target64()) fail |= 8;
         if (sc64_rdmsr(MSR64_FMASK) != (uint64_t)SC64_FMASK64) fail |= 8;
         if ((SC64_STAR64 >> 48) != 0x1Bu) fail |= 8;                                // sysret CS/SS 的来源
         if (SEL64_UCODE != (uint16_t)(((SC64_STAR64 >> 48) + 16) & 0xFFFF)) fail |= 8;

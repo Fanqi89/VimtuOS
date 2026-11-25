@@ -115,6 +115,7 @@ ISR_NOERR64 irq
 ISR_NOERR64 128
 
 ; ============================ 公共入口/出口 ============================
+global isr64_common
 isr64_common:
     ; 保存通用寄存器（顺序必须与帧布局一致：rax 在最低地址）
     push rax
@@ -143,9 +144,28 @@ isr64_common:
     push qword 0x10
 
     ; 第一个参数 = 帧指针（rsp 现在正好指向 frame.gs）
+    ; ★ v0.11.9（KPTI）：这个标签也对外 —— 共享入口区在用户态进来时**自己**把整帧压好
+    ;   （它不能提前 clobber 用户的寄存器），压完直接跳到这里，省掉重复的压栈序列。
+global isr64_common_call64
+isr64_common_call64:
     mov rdi, rsp
     call isr_handler64
 
+    ; ---- 出口：交给函数指针 g_isr64_exit64（默认 = 本节的 isr64_exit_plain64）----
+    ; ★ v0.11.9（KPTI）：KPTI 打开后"内核高半区"在用户地址空间里不存在，而"回 ring3"
+    ;   必须在**两张页表都映射**的代码里完成（切回用户 CR3 是最后一刻的事）。
+    ;   所以出口不写死 iretq，而是走指针：
+    ;     默认               = isr64_exit_plain64（行为与 v0.11.8 逐指令一致）
+    ;     kpti64_init64 后   = 共享入口区的 kpti64_iret_frame64（帧搬到共享返回栈 → 切 CR3 → iretq）
+    ;   两个出口的契约完全一样：**rdi = 帧起点（0xD0 布局）**。
+    mov rdi, rsp
+    mov rax, [rel g_isr64_exit64]
+    jmp rax
+
+; 原位出口：rdi = 帧起点，直接在**当前栈**上 pop + iretq（v0.11.8 的原行为）。
+global isr64_exit_plain64
+isr64_exit_plain64:
+    mov rsp, rdi
     ; ---- 出口：严格逆序还原 ----
     ; 长模式下 POP Sreg 只允许 fs/gs，ds/es 会 #UD；而这四个槽在内核里恒为 0x10
     ; （基址在长模式下对 ds/es 无意义），所以直接丢弃 32 字节、不做段加载。
@@ -173,27 +193,18 @@ isr64_common:
 ; ============================ 上下文切换 ============================
 ; 说明：任务切换不是"另写一套"上下文，而是**复用上面这套中断帧**：
 ;   调度器在 IRQ0 的 C 处理里改帧内容（或换成另一个任务的帧）再 iretq 回去。
-;   下面的 task_switch_iret64 就是"直接换成目标任务的帧并返回用户态/内核态"。
 ;
 ; void task_switch_iret64(uint64_t next_frame)   -> 不返回，切到 next_frame
+;   ★ v0.11.9：改成"走同一个出口指针" —— KPTI 下回 ring3 必须先切 CR3，
+;     那段代码不能在内核高半区（用户表里没有它）。帧布局不变，契约不变。
 global task_switch_iret64
 task_switch_iret64:
-    mov rsp, rdi
-    add rsp, 32                 ; 同上：不加载 ds/es/fs/gs（内核里恒为 0x10）
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rbp
-    pop rbx
-    pop rdx
-    pop rcx
-    pop rax
-    add rsp, 16
-    iretq
+    mov rax, [rel g_isr64_exit64]
+    jmp rax
+
+; ============================ ISR 出口指针 ============================
+; 放在 .data：启动期由 kernel/kpti64.cpp 决定要不要换成共享区的出口。
+; 默认值 = 原位出口，所以"没启用 KPTI"时整条路径与 v0.11.8 完全一致。
+section .data
+global g_isr64_exit64
+g_isr64_exit64: dq isr64_exit_plain64

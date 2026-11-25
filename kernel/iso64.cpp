@@ -15,6 +15,7 @@
 #include "task64.h"        // task64_kernel_cr364
 #include "proc64.h"        // 进程表快照（pid + cr3）
 #include "hwinfo64.h"      // hw_info64()->smep（CPU 支持与否）
+#include "kpti64.h"        // ★ v0.11.9：KPTI 状态（审计要认共享入口区、要判用户表）
 
 // ==================== 小工具 ====================
 static inline uint64_t iso_rd_cr0_64() { uint64_t v; __asm__ volatile("mov %%cr0, %0" : "=r"(v)); return v; }
@@ -88,10 +89,15 @@ int iso64_init64() {
     dbg64_nl();
     dbg64_line_end64();
 
-    // 如实说明"还没做的那层"，免得后来人把审计通过当成 KPTI
+    // ★ v0.11.9：KPTI 到底开没开，如实打（不再是写死的 kpti=0）
     dbg64_line_begin64();
-    dbg64_str("[ISO64] mode kpti=0 smap=0 reason=user-space-still-maps-kernel (PML4[511] shared by design;"
-              " KPTI needs a trampoline + dual tables, next stage)");
+    dbg64_str("[ISO64] mode kpti=");
+    dbg64_dec((uint64_t)kpti64_on64());
+    dbg64_str(" smap=0 reason=");
+    if (kpti64_on64())
+        dbg64_str("user-space-has-no-kernel-half (user table PML4[511]=0; entry trampolines at 6 GiB)");
+    else
+        dbg64_str(kpti64_reason64());
     dbg64_nl();
     dbg64_line_end64();
     return g_wp;
@@ -113,19 +119,28 @@ int iso64_reassert64() {
 }
 
 // ==================== 地址空间审计 ====================
-// 走四级：统计"内核高半区/前 4GB 恒等映射/用户窗口/窗口外"四类 present 项 + 用户可访问位违规数。
-int iso64_audit64(uint64_t cr3, int pid, const char* why) {
+// 走四级：统计五类 present 项 —— 内核高半区 / 前 4GB 恒等映射 / 用户窗口 / 窗口外 / 共享入口区，
+// 并逐项校验 U/S 位，任何一条不符都算 us_violation。审计**只读页表、不改映射**
+// （悄悄"修好"等于把证据擦掉）。
+//
+// expect_kern 决定"内核高半区该不该存在"，这是 KPTI 的核心判据：
+//   1 = 内核表（必须有 PML4[511]，且链上每一项 U/S=0）
+//   0 = 用户表（KPTI 下**必须没有** PML4[511] —— 有一条就说明 KPTI 没做到）
+static int iso_audit_body64(uint64_t cr3, int pid, const char* why, int expect_kern) {
     if (cr3 == 0) {                                   // 0 = "当前 CR3"
         uint64_t v; __asm__ volatile("mov %%cr3, %0" : "=r"(v));
         cr3 = v;
     }
     const uint64_t pml4_pa = iso_page64(cr3);
     uint64_t* pml4 = iso_phys64(pml4_pa);
-    int khigh = 0, ident = 0, uwin = 0, outside = 0, viol = 0;
+    int khigh = 0, ident = 0, uwin = 0, outside = 0, entry = 0, fbwin = 0, viol = 0;
 
     // ---- ① 内核高半区：PML4[511] → PDPT_hi → PD（可能 1GB 大页、2MB 大页或 PT）----
     const uint64_t e511 = pml4[511];
-    if (iso_present64(e511)) {
+    if (!expect_kern) {
+        // 用户表：这条必须为空（KPTI 的全部意义就在这儿）
+        if (iso_present64(e511)) viol++;
+    } else if (iso_present64(e511)) {
         khigh++;
         if (iso_user64(e511)) viol++;                     // 内核半区的顶层不许用户可访问
         uint64_t* pdpt_hi = iso_phys64(iso_page64(e511));
@@ -144,10 +159,14 @@ int iso64_audit64(uint64_t cr3, int pid, const char* why) {
             }
         }
     } else {
-        viol++;                                           // 内核半区没了 = 内核自己在跑什么？
+        viol++;                                           // 内核表里没有内核半区 = 内核自己在跑什么？
     }
 
-    // ---- ② 前 4GB 恒等映射：PML4[0] → PDPT，只允许 0..3（每 1GB）；5..511 必须不存在 ----
+    // ---- ①b PML4[255]：KPTI 的"数据槽"（non-present 里存另一张表的物理地址）。
+    //   它必须非 present —— 真 present 就等于把 128TB 的窗口开出来了，那是越权。
+    if (iso_present64(pml4[255])) viol++;
+
+    // ---- ② 前 4GB 恒等映射：PML4[0] → PDPT，只允许 0..3（每 1GB）----
     const uint64_t e0 = pml4[0];
     if (!iso_present64(e0)) {
         viol++;
@@ -167,9 +186,22 @@ int iso64_audit64(uint64_t cr3, int pid, const char* why) {
                 if (iso_user64(ed)) viol++;
             }
         }
-        // 窗口外的用户地址（PDPT[5..511]）必须不存在
+        // 窗口外的用户地址（PDPT[5..511]）：只允许两处**已知**映射，其余一律算越权。
+        //   ① PDPT[5]（5~6 GiB）= USER64_FB_VA64：framebuffer / DRM / wl surface 窗（v0.9 起的既有设计，
+        //      见 kernel/usermode64.h）→ 单独记 fbwin，且顶层必须 U/S=1（ring3 要能画）
+        //   ② PDPT[6]（6~7 GiB）= ★ v0.11.9 KPTI 共享入口区（两张表都映射；PD 物理地址
+        //      必须等于 kpti64_pd_phys64，且 U/S=0）→ 记 entry
+        // 认不出来的 present 项一律 outside++ / viol++（判据不降强度）。
         for (int i = 5; i < 512; i++) {
-            if (iso_present64(pdpt[i])) { outside++; viol++; }
+            const uint64_t ep = pdpt[i];
+            if (!iso_present64(ep)) continue;
+            if (i == 5 && iso_user64(ep) && !(ep & PTE_1GB_64)) { fbwin++; continue; }
+            if (i == 6 && kpti64_pd_phys64() != 0 &&
+                iso_page64(ep) == kpti64_pd_phys64() && !iso_user64(ep) && !(ep & 0x80ULL)) {
+                entry++;
+                continue;
+            }
+            outside++; viol++;
         }
         // ③ 用户窗口：PDPT[4]（4GiB..5GiB）里的 present 叶子页必须是 U/S=1
         const uint64_t e4 = pdpt[4];
@@ -211,9 +243,22 @@ int iso64_audit64(uint64_t cr3, int pid, const char* why) {
     dbg64_str(" us_violation="); dbg64_dec((uint64_t)viol);
     dbg64_str(" why=");        dbg64_str(why ? why : "-");
     dbg64_str(viol == 0 ? " ok=1" : " ok=0");
+    // ★ v0.11.9：末尾追加两个字段（不动前面的顺序，既有验收的 grep 继续成立）
+    dbg64_str(" entry=");      dbg64_dec((uint64_t)entry);
+    dbg64_str(" fbwin=");      dbg64_dec((uint64_t)fbwin);
+    dbg64_str(" kind=");       dbg64_str(expect_kern ? "kern" : "user");
     dbg64_nl();
     dbg64_line_end64();
     return viol;
+}
+
+// 内核表（必须有内核高半区）。这是外部唯一入口，语义与 v0.11.8 一致。
+int iso64_audit64(uint64_t cr3, int pid, const char* why) {
+    return iso_audit_body64(cr3, pid, why, 1);
+}
+// ★ v0.11.9（KPTI）：用户表（**不许**有内核高半区）。khigh=0 才是对的。
+int iso64_audit_user64(uint64_t cr3, int pid, const char* why) {
+    return iso_audit_body64(cr3, pid, why, 0);
 }
 
 int iso64_audit_all64(const char* why) {
@@ -228,6 +273,13 @@ int iso64_audit_all64(const char* why) {
         if (proc64_info64(i, &info) == 0) continue;
         if (!info.cr3) continue;
         total += iso64_audit64(info.cr3, pid, why ? why : "proc");
+        // ★ v0.11.9（KPTI）：再单独审这张进程的**用户表** —— 判据反过来：
+        //   内核高半区必须**没有**（khigh=0）。这两行合起来才是"ring3 什么都摸不到"的证据。
+        {
+            const uint64_t ucr3 = proc64_user_cr364(pid);
+            if (kpti64_on64() && ucr3 && ucr3 != info.cr3)
+                total += iso64_audit_user64(ucr3, pid, why ? why : "proc-user");
+        }
         seen++;
     }
     dbg64_line_begin64();
@@ -317,16 +369,31 @@ int iso64_probe64() {
     const int mr = user64_map_page64(USER64_CODE_VA64, PTE_USER_64 | PTE_WRITE_64, 1, &pa);
     const int range = user64_range_ok64(USER64_CODE_VA64, 8);
     const int viol = iso64_audit64(0, pid, "probe");
+    // ★ v0.11.9（KPTI）：再单独审用户表（khigh 必须 0）—— 这才是"这套地址空间里
+    //   根本摸不到内核"的直接证据。没有配对时如实跳过（ucr3 == 内核表）。
+    int viol_u = 0;
+    int have_u = 0;
+    {
+        const uint64_t ucr3 = proc64_user_cr364(pid);
+        uint64_t cur; __asm__ volatile("mov %%cr3, %0" : "=r"(cur));
+        if (kpti64_on64() && ucr3 && ucr3 != (cur & 0x000FFFFFFFFFF000ULL)) {
+            viol_u = iso64_audit_user64(ucr3, pid, "probe-user");
+            have_u = 1;
+        }
+    }
     proc64_switch_to_kernel64();
     proc64_destroy64(pid);
 
-    const int ok = (mr == 1 && range == 1 && viol == 0) ? 1 : 0;
+    const int ok = (mr == 1 && range == 1 && viol == 0 && viol_u == 0) ? 1 : 0;
     dbg64_line_begin64();
     dbg64_str("[ISO64] probe pid=");  dbg64_dec((uint64_t)(uint32_t)pid);
     dbg64_str(" map=");               dbg64_dec((uint64_t)(mr == 1 ? 1 : 0));
     dbg64_str(" range=");             dbg64_dec((uint64_t)(range == 1 ? 1 : 0));
     dbg64_str(" us_violation=");      dbg64_dec((uint64_t)viol);
     dbg64_str(" pa=");                dbg64_hex64(pa);
+    // ★ v0.11.9：用户表那一遍（khigh 必须 0）—— kpti_u=1 表示"真的审到了那张表"
+    dbg64_str(" kpti_u=");            dbg64_dec((uint64_t)have_u);
+    dbg64_str(" u_violation=");       dbg64_dec((uint64_t)viol_u);
     dbg64_str(ok ? " ok=1" : " ok=0");
     dbg64_nl();
     dbg64_line_end64();
@@ -338,7 +405,9 @@ void iso64_report64() {
     dbg64_str("[ISO64] status wp=");   dbg64_dec((uint64_t)g_wp);
     dbg64_str(" smep=");               dbg64_dec((uint64_t)g_smep);
     dbg64_str(" smap=0(supported=");   dbg64_dec((uint64_t)g_smap_ok);
-    dbg64_str(") kpti=0 audited=");    dbg64_dec((uint64_t)g_audit_runs);
+    dbg64_str(") kpti=");              dbg64_dec((uint64_t)kpti64_on64());
+    dbg64_str(" kpti_reason=");        dbg64_str(kpti64_reason64());
+    dbg64_str(" audited=");    dbg64_dec((uint64_t)g_audit_runs);
     dbg64_str(" violations=");         dbg64_dec((uint64_t)g_audit_violations);
     dbg64_nl();
     dbg64_line_end64();

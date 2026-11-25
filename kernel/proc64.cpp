@@ -29,6 +29,7 @@
 #include "fs64.h"           // ★ 本批：mmap 的文件映射按偏移读（fs64_read_range64 / 统一卷分派）
 #include "memlayout64.h"    // ML64_PML4_PHYS（引导期页表自证用）
 #include "mem_64.h"         // page_alloc_64 / page_free_64 / PTE_*
+#include "kpti64.h"        // ★ v0.11.9：KPTI 的配对/查询（建进程时要给用户表打 [255] 数据槽）
 #include "debug64.h"      // dbg64_* 打点
 #include "demo64.h"       // ★ 本批：演示程序 blob 的"原始区"查找（只有元数据，没有字节）
 
@@ -90,6 +91,8 @@ struct Proc64 {
     uint64_t cr3;               // 该进程的页表根（物理地址）——切任务时装载
     uint64_t pml4_phys;         // 我们自己分配的 PML4 页（释放用）
     uint64_t pdpt_phys;         // 我们自己分配的 PDPT 页（用户窗口 PDPT[4] 的父表）
+    uint64_t pml4_user_phys;    // ★ v0.11.9（KPTI）：用户表（PML4[511]=0，只在 ring3 时装进 CR3）
+                                //   0 = 这个进程没有配对（页池紧张/配对失败）→ 按老方式跑
     uint64_t brk_start;         // brk 区（每进程独立）
     uint64_t brk_end;
     uint64_t brk_limit;
@@ -746,10 +749,41 @@ static int p64_build_as64(Proc64* p) {
     pdpt[4] = 0;                                        // ★ 用户窗口（4GiB..5GiB）私有
     pml4[0] = (uint64_t)(uintptr_t)pdptp | (e0 & 0xFFFULL);
 
+    // ★ v0.11.9（KPTI）：再给一张"用户表" —— 与内核表**只差两处**：
+    //   PML4[511] = 0（没有内核高半区）+ PML4[255] 数据槽里存内核表的物理地址。
+    //   两张表共用同一张私有 PDPT：所以 map/unmap 用户页立刻在两张表里都生效，
+    //   内核访问用户内存（copy_from_user / 信号帧 / ELF 装载）不受影响。
+    uint64_t pml4u_phys = 0;
+    if (kpti64_on64()) {
+        void* pml4u = page_alloc_64();
+        if (pml4u) {
+            p64_zero(pml4u, PAGE_SIZE_64);
+            uint64_t* u = p64_phys64((uint64_t)(uintptr_t)pml4u);
+            for (int i = 0; i < 512; i++) u[i] = pml4[i];
+            u[0]   = pml4[0];              // 同一个私有 PDPT
+            u[511] = 0;                    // ★ 内核高半区：用户表里没有
+            if (kpti64_link_pair64((uint64_t)(uintptr_t)pml4p, (uint64_t)(uintptr_t)pml4u) == 0 &&
+                kpti64_on64()) {
+                pml4u_phys = (uint64_t)(uintptr_t)pml4u;
+            } else {
+                page_free_64(pml4u);       // 配对失败：退回"只有内核表"（该进程不享受 KPTI，但功能正常）
+            }
+        }
+        // 分不到页（页池紧张）：如实退化 —— 这个进程只有内核表，按老方式跑，不 KPTI
+        // 它一个。不让"建进程"失败（功能优先）。
+    }
+
     p->pml4_phys = (uint64_t)(uintptr_t)pml4p;
+    p->pml4_user_phys = pml4u_phys;
     p->pdpt_phys = (uint64_t)(uintptr_t)pdptp;
-    p->cr3       = p->pml4_phys;
+    p->cr3       = p->pml4_phys;          // ★ 内核态用内核表（用户表只在 ring3 时装）
     return 0;
+}
+// KPTI：某个进程的"用户表"物理地址（0 = 没有，该进程按老方式跑）
+uint64_t proc64_user_cr364(int pid) {
+    Proc64* p = p64_find64(pid);
+    if (!p) return 0;
+    return p->pml4_user_phys ? p->pml4_user_phys : p->cr3;
 }
 
 void proc64_switch_to_kernel64() {                      // 内部/给 task64 兜底用
@@ -767,7 +801,11 @@ void proc64_switch_to64(int pid) {
 // ★ 绝不能无条件切：fork 失败回滚时当前任务是**父进程**（它自己的地址空间正在用），
 //   若此时切到内核地址空间，父进程回 ring3 时用户窗口没映射 -> 取指 #PF。
 static inline bool p64_cr3_is64(const Proc64* p) {
-    return p->cr3 != 0 && p64_page64(p64_rd_cr364()) == p64_page64(p->cr3);
+    if (!p->cr3) return false;
+    const uint64_t cur = p64_page64(p64_rd_cr364());
+    // ★ v0.11.9（KPTI）：ring3 里装着的是**用户表**，内核里装着的是内核表 —— 两张都算"它的"
+    if (cur == p64_page64(p->cr3)) return true;
+    return p->pml4_user_phys != 0 && cur == p64_page64(p->pml4_user_phys);
 }
 // 释放用户区：PDPT[4] 子树里的叶子物理页 + PT/PD 页表页，最后清 PDPT[4]。
 // 返回释放的页数。**不动** PDPT[0..3]（共享的恒等映射）。
@@ -1124,6 +1162,7 @@ void proc64_destroy64(int pid) {
         p64_release_area64(p);
         if (p->pdpt_phys) page_free_64((void*)(uintptr_t)p->pdpt_phys);
         if (p->pml4_phys) page_free_64((void*)(uintptr_t)p->pml4_phys);
+        if (p->pml4_user_phys) page_free_64((void*)(uintptr_t)p->pml4_user_phys);
     }
     const int32_t keep_pid = p->pid;
     p64_zero(p, (uint32_t)sizeof(Proc64));
@@ -1152,6 +1191,7 @@ static void p64_exit64(Proc64* p, uint32_t code, uint32_t sig) {
     p64_release_area64(p);
     if (p->pdpt_phys) { page_free_64((void*)(uintptr_t)p->pdpt_phys); p->pdpt_phys = 0; }
     if (p->pml4_phys) { page_free_64((void*)(uintptr_t)p->pml4_phys); p->pml4_phys = 0; }
+    if (p->pml4_user_phys) { page_free_64((void*)(uintptr_t)p->pml4_user_phys); p->pml4_user_phys = 0; }
     // ★ 批次 D：fd 表随进程退出一起收（close_all = 每个 fd 引用计数 -1；fork 出来的兄弟进程
     //   若还共享着同一个 OpenFile64/pipe，对象会活下来 —— 这就是 POSIX 的语义）
     if (p->fdtab) {
@@ -2396,6 +2436,18 @@ int proc64_selftest64() {
                 for (int i = 0; i < 4; i++) if (pdpt[i] != bpdpt[i]) fail |= 4;  // 前 4GB 恒等映射共享
                 if (pdpt[4] != 0) fail |= 4;                                 // 用户窗口私有（初始为空）
                 if (pa->cr3 != pa->pml4_phys) fail |= 4;
+                // ★ v0.11.9（KPTI）：用户表里**不许**有内核高半区；内核表必须有（且与引导期共享）
+                if (kpti64_on64()) {
+                    if (!pa->pml4_user_phys) fail |= 4;
+                    else {
+                        const uint64_t* up = p64_phys64(pa->pml4_user_phys);
+                        if (up[511] != 0) fail |= 4;                        // 用户表：内核高半区必须为空
+                        if (p64_page64(up[0]) != p64_page64(pml4[0])) fail |= 4;  // 两张表共用同一张私有 PDPT
+                        if (kpti64_peer_cr364(pa->cr3) != p64_page64(pa->pml4_user_phys)) fail |= 4;
+                        if (kpti64_peer_cr364(pa->pml4_user_phys) != p64_page64(pa->cr3)) fail |= 4;
+                        if (up[255] & PTE_PRESENT_64) fail |= 4;            // 数据槽不许 present
+                    }
+                }
             }
             // bit4：地址空间互不相同 + 释放干净
             if (pb && pa && pa->cr3 == pb->cr3) fail |= 2;

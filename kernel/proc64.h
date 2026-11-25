@@ -141,6 +141,8 @@ struct FdTable64;
 FdTable64* proc64_fdtab_of64(int pid);
 int   proc64_count64();                           // 占用的进程槽数
 int   proc64_info64(int idx, Proc64Info* out);    // 按槽位下标取快照（0 = 该槽空）
+// ★ v0.11.9（KPTI）：该进程的"用户表"物理地址（PML4[511]=0 的那张；没配对时返回内核表）
+uint64_t proc64_user_cr364(int pid);
 const char* proc64_current_name64();
 
 // ==================== 给 syscall64 / 调度器用 ====================

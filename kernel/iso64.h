@@ -41,6 +41,8 @@ int iso64_init64();
 // 审计一个地址空间：cr3 = 0 表示"当前 CR3"。pid < 0 时日志打 pid=-。
 // 返回 us_violation（0 = 干净）。
 int iso64_audit64(uint64_t cr3, int pid, const char* why);
+// ★ v0.11.9（KPTI）：审计**用户表** —— 判据反过来：内核高半区必须不存在（khigh=0）。
+int iso64_audit_user64(uint64_t cr3, int pid, const char* why);
 // 审计内核地址空间 + 所有活着的进程地址空间（每个进程一行，外加一行汇总）。返回总违规数。
 int iso64_audit_all64(const char* why);
 

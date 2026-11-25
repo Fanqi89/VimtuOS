@@ -86,6 +86,13 @@ static const uint16_t SEL64_TSS   = 0x30;    // index 6（占用 6/7 两个 8 �
 void x86_init64();                      // PIC 重映射 + PIT + IDT + TSS，最后开中断
 void idt_set_gate64(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags, uint8_t ist);
 void tss_set_rsp0(uint64_t rsp0);
+// ==================== ★ v0.11.9：KPTI（GDT/TSS/IDT 搬到共享入口区）====================
+// 语义：把 GDT/TSS/IDT 各拷一份到 KPTI 共享区并重新加载，同时把"可能被 ring3 用到的门"
+//   指向共享区里的蹦床。返回 0 = 成功（之后所有写操作都走副本，见 g_idtp/g_tss_active）。
+int      x86_64_kpti_enable64(uint64_t idt_va, uint64_t gdt_va, uint64_t tss_va, uint64_t entry_rsp);
+uint64_t x86_64_kpti_idt_base64();       // 当前 IDTR.base
+uint64_t x86_64_kpti_gdt_base64();       // 当前 GDTR.base
+uint64_t x86_64_kpti_gate_target64(int num);   // 第 num 号门的目标地址（0 = 没装）
 uint64_t gdt_entry_raw64(int index);     // 自检/调试用：GDT 第 index 项原始 8 字节（0 = 越界）
 // ==================== PIT 时钟 ====================
 #define PIT_HZ_64    250

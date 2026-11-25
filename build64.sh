@@ -85,7 +85,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.11.8"   # ★ v0.11.8：ring3 真隔离层（CR0.WP + CR4.SMEP + 地址空间审计/自检；KPTI 与 SMAP 留下一阶段）
+VIMTUOS_VERSION="0.11.9"   # ★ v0.11.9：KPTI 双页表（用户表 PML4[511]=0 + 共享入口区蹦床）
 #   沿用自 v0.10.2 的启动加固（仅作说明）：真机加固（UEFI 载荷按真实大小读 + 屏幕报错 + MMIO BAR>=4GiB 闸门） + 桌面帧预算（热路径打点预算 + 2 MiB 大页映射 / shm 与帧缓冲 + 60 Hz 帧节拍）
 #   根因：同一块盘上的两条命令会重叠（命令列表 slot0 / 命令表 / DMA 暂存页池 g_dma[16] 全驱动共享），
 #   后果是**静默坏读**（ELF 魔数坏读、VFS BAD block、/etc/r3drv.conf 读错）与端口互相重启，
@@ -128,6 +128,10 @@ SRCS_CORE="kernel/kernel64.cpp kernel/console64.cpp kernel/x86_64.cpp kernel/fb.
 #   两份内核都必须在链接行里能解析到它；它只有"配置空间读写 + BAR 解码"这一小块，
 #   安装介质内核里不会被调用（那边没有 ring3），代价 ~1.5 KB。
 SRCS_CORE="$SRCS_CORE kernel/pci64.cpp"
+# ★ v0.11.9：kernel/kpti64.cpp = KPTI（共享入口区 + 门重定向 + 双 PML4 配对 + 自检）。
+#   进 SRCS_CORE（两份内核都编）：kernel/x86_64.cpp（也在 CORE）的门安装/出口指针/TSS.rsp0
+#   都要问它；安装介质里它自己按 reason=installer-media 整层不启用（不映射、不改门）。
+SRCS_CORE="$SRCS_CORE kernel/kpti64.cpp"
 #
 #  ★ 驱动线 3：kernel/virtio_gpu64.cpp（现代 virtio-gpu 2D：resource/scanout/TRANSFER_TO_HOST_2D）
 #    进 CORE：**两份内核都要**（kernel/fb.cpp 的"上屏后端选择"引用它 —— 系统内核的桌面与
@@ -273,6 +277,9 @@ $NASM -f elf64 kernel/isr_stubs64.asm -o "$BUILD/isr_stubs64.o"
 $NASM -f elf64 kernel/switch64.asm   -o "$BUILD/switch64.o"
 # syscall 指令入口（LSTAR 指向它）：两份内核都要链（syscall64.cpp 在 SRCS_CORE 里引用它）
 $NASM -f elf64 kernel/syscall_entry64.asm -o "$BUILD/syscall_entry64.o"
+# ★ v0.11.9：KPTI 共享入口区（固定 VA 0x140000000 的蹦床/栈/GDT-TSS 副本/向量偏移表）。
+#   两份内核都链它：isr_stubs64.asm 的公共出口要跳它（默认跳的是本文件里的原位出口）。
+$NASM -f elf64 kernel/kpti_blob64.asm -o "$BUILD/kpti_blob64.o"
 
 echo "==> 准备资源（字体 / logo / 图标；生成脚本产物落在 build/，两份内核都要嵌）"
 "$PY" _otf2ttf.py
@@ -928,18 +935,18 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
     "$BUILD"/fb.o "$BUILD"/font.o "$BUILD"/input.o "$BUILD"/input64.o "$BUILD"/mem64.o "$BUILD"/ata64.o "$BUILD"/part64.o "$BUILD"/setup64.o \
     "$BUILD"/fat64.o "$BUILD"/fs64.o "$BUILD"/iso9660_64.o "$BUILD"/drive64.o \
     "$BUILD"/bootx64_efi.o "$BUILD"/uefi64_bin.o \
-    "$BUILD"/hwinfo64.o "$BUILD"/acpi64.o "$BUILD"/edid64.o "$BUILD"/sysfs64.o "$BUILD"/vfs64.o "$BUILD"/fd64.o "$BUILD"/usermode64.o "$BUILD"/syscall64.o "$BUILD"/sig64.o "$BUILD"/pci64.o \
+    "$BUILD"/hwinfo64.o "$BUILD"/acpi64.o "$BUILD"/edid64.o "$BUILD"/sysfs64.o "$BUILD"/vfs64.o "$BUILD"/fd64.o "$BUILD"/usermode64.o "$BUILD"/syscall64.o "$BUILD"/kpti64.o "$BUILD"/sig64.o "$BUILD"/pci64.o \
     "$BUILD"/ahci64.o "$BUILD"/nvme64.o "$BUILD"/hwui64.o "$BUILD"/hda64_stub64.o "$BUILD"/gpu64_stub64.o \
     "$BUILD"/virtio_gpu64.o \
     "$BUILD"/display64.o \
-    "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o \
+    "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD"/kpti_blob64.o \
     "$BUILD"/demo64.o "$BUILD"/font_*_z.o "$BUILD"/icon_start_mini.o
 $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 
 $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
     gui_rs/gui_rs.o \
     "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/fontcfg64.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
-    "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/sysfs64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o "$BUILD/os"/gpu64.o "$BUILD/os"/vmware64.o "$BUILD/os"/intel_gpu64.o \
+    "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/sysfs64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o "$BUILD/os"/kpti64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o "$BUILD/os"/gpu64.o "$BUILD/os"/vmware64.o "$BUILD/os"/intel_gpu64.o \
     "$BUILD/os"/sock64.o \
     "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/iso9660_64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
     "$BUILD/os"/virtio_gpu64.o "$BUILD/os"/vgpu3d64.o \
@@ -952,7 +959,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/ker
     "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o "$BUILD/os"/dockmenu64.o \
     "$BUILD/os"/icons64.o "$BUILD/os"/trash64.o "$BUILD/os"/deskdir64.o "$BUILD/os"/iso64.o \
     "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
-    "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
+    "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD"/kpti_blob64.o "$BUILD/os"/task64.o \
     "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/os"/proc64.o \
     "$BUILD/os"/r3drv64.o \
     "$BUILD/os"/ext4vol64.o \
@@ -1025,7 +1032,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/cr3exp/kernel64.o" "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
         gui_rs/gui_rs.o \
         "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/fontcfg64.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
-        "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/sysfs64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o "$BUILD/os"/gpu64.o "$BUILD/os"/vmware64.o "$BUILD/os"/intel_gpu64.o \
+        "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/sysfs64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/cr3exp/usermode64.o" "$BUILD/os"/syscall64.o "$BUILD/os"/kpti64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o "$BUILD/os"/gpu64.o "$BUILD/os"/vmware64.o "$BUILD/os"/intel_gpu64.o \
         "$BUILD/os"/fat64.o "$BUILD/os"/fs64.o "$BUILD/os"/iso9660_64.o "$BUILD/os"/ahci64.o "$BUILD/os"/nvme64.o "$BUILD/os"/hwui64.o "$BUILD/os"/drive64.o \
         "$BUILD/os"/virtio_gpu64.o "$BUILD/os"/vgpu3d64.o \
         "$BUILD/os"/gui64.o "$BUILD/os"/calc64.o "$BUILD/os"/mines64.o \
@@ -1036,7 +1043,7 @@ if [ "${VIMTU_BUILD_CR3EXP:-0}" = "1" ] || [ "$1" = "--cr3exp" ]; then
         "$BUILD/os"/startmenu64.o "$BUILD/os"/panels64.o "$BUILD/os"/desktopops64.o "$BUILD/os"/dockmenu64.o \
         "$BUILD/os"/icons64.o "$BUILD/os"/trash64.o "$BUILD/os"/deskdir64.o "$BUILD/os"/iso64.o \
         "$BUILD/os"/preload64.o "$BUILD/os"/update64.o \
-        "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD/os"/task64.o \
+        "$BUILD"/entry64.o "$BUILD"/isr_stubs64.o "$BUILD"/switch64.o "$BUILD"/syscall_entry64.o "$BUILD"/kpti_blob64.o "$BUILD/os"/task64.o \
         "$BUILD/os"/app64.o "$BUILD/os"/elf64.o "$BUILD/cr3exp/proc64.o" \
         "$BUILD/os"/wl64.o "$BUILD/os"/drm64.o \
         "$BUILD/os"/smp64.o "$BUILD/os"/ap_trampoline64.o \
