@@ -293,7 +293,13 @@ void drv_main(u64* sp) {
     const i64 stk = sc6(NR_MMAP, 0, (i64)DRV_STACK_BYTES, 3, 0x22, -1, 0);
     if (stk < 0) die("mmap-stack");
     {
-        const u64 old_top = U64_STACK_VA64 + 0x4000ULL;          /* 内核给的用户栈顶 */
+        /* ★ v0.12.4：内核把**用户栈从 16 KiB 放大到 64 KiB**（TLS 握手要那么多栈）。
+         *   这里原来写死 `+ 0x4000`（16 KiB），栈一变这五个 driver 全都读错初始栈 -> busybox/tcc/lua/
+         *   make/micropython 一进去就 #PF（实测：[BBDRV] exec … 之后
+         *   `[SIG64] fault pid=… #PF cr2=0x10013BE40`，version64_test 的 ring3 cat 因此红）。
+         *   数值必须与 kernel/usermode64.h 的 USER64_STACK_BYTES64 一致；
+         *   构建期由 tools/drv_stack_gate.py 逐文件核对（改一处忘了别处 = 构建直接失败）。 */
+        const u64 old_top = U64_STACK_VA64 + 0x10000ULL;         /* 内核给的用户栈顶（USER64_STACK_BYTES64） */
         const u64 len = old_top - (u64)sp;
         const u64 new_sp = (u64)stk + DRV_STACK_BYTES - len;
         unsigned char* d = (unsigned char*)new_sp;

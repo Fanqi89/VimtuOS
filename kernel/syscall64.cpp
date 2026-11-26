@@ -1653,13 +1653,45 @@ static int64_t lx64_getcwd64(uint64_t nr, uint64_t buf, uint64_t size) {
     return (int64_t)buf;
 }
 
-// ---- 228）clock_gettime：用 PIT tick 造近似值 ----
+// ---- 228）clock_gettime ----
+// ★ v0.12.4：CLOCK_REALTIME(0) 现在给**真墙钟**：RTC 锚点 + tick 增量。
+//   改之前它返回"开机以来的秒数"（≈1970-01-01），于是 mbedTLS 的证书有效期判定会把
+//   **每一个真站点**都判成 not valid yet —— 这类失败极容易被误读成"TLS 没实现对"。
+//   CLOCK_MONOTONIC(1)/PROCESS_CPUTIME(2)/THREAD_CPUTIME(3) 保持原样（单调、不含纪元）。
+//   边界（如实）：RTC 读不出来时**不伪装成 1970**，退回老行为并在串口打点
+//   `[TIME64] rtc UNREADABLE`；那时证书校验必然失败，探针如实报 UNTRUSTED。
+static uint64_t g_rt_base64 = 0;        // RTC 锚点（纪元秒；0 = 不可信）
+static uint64_t g_rt_tick64 = 0;        // 取锚点时的 tick
+static int      g_rt_state64 = 0;       // 0 = 没取过
+static void lx64_rt_anchor64(void) {
+    if (g_rt_state64) return;
+    g_rt_state64 = 1;
+    g_rt_tick64  = g_ticks64;
+    g_rt_base64  = rtc_epoch64();
+    dbg64_line_begin64();
+    if (g_rt_base64) {
+        dbg64_str("[TIME64] clock_gettime realtime anchor=rtc epoch=");
+        dbg64_dec(g_rt_base64);
+    } else {
+        dbg64_str("[TIME64] clock_gettime realtime anchor=NONE rtc UNREADABLE "
+                  "-> cert validity UNTRUSTED (tls probe will report it)");
+    }
+    dbg64_str(" ticks=");
+    dbg64_dec(g_rt_tick64);
+    dbg64_nl();
+    dbg64_line_end64();
+}
 static int64_t lx64_clock_gettime64(uint64_t nr, uint64_t clockid, uint64_t ts_va) {
     if (clockid > 3) return -LX64_EINVAL;                       // CLOCK_REALTIME/MONOTONIC/PROCESS_CPUTIME/THREAD
     if (!user64_range_ok64(ts_va, 16)) { syscall64_deny64(nr, ts_va); return -LX64_EFAULT; }
     const uint64_t t = g_ticks64;
+    uint64_t sec = t / PIT_HZ_64;
+    if (clockid == 0) {                                          // CLOCK_REALTIME：加 RTC 锚点
+        lx64_rt_anchor64();
+        if (g_rt_base64) sec = g_rt_base64 + (t - g_rt_tick64) / PIT_HZ_64;
+    }
     uint8_t ts[16];
-    lx64_wr64(ts + 0, t / PIT_HZ_64);                           // tv_sec
+    lx64_wr64(ts + 0, sec);                                     // tv_sec
     lx64_wr64(ts + 8, (t % PIT_HZ_64) * (1000000000ULL / PIT_HZ_64));  // tv_nsec（250Hz -> 4ms 粒度）
     lx64_copy_to_user64(ts_va, ts, 16);
     return 0;

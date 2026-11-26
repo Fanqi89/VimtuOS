@@ -277,9 +277,13 @@ def main():
                 # ★ v0.12.0：SMAP 的硬判据 —— 一条 `[SMAP64] violation` 都不许有；WP 也没掉。
                 #   放在"登录成功"分支里：起不到桌面就如实算失败（不给"空日志=零违规"的假通过）。
                 _log2 = vm2.log()
+                # ★ v0.12.4：失败时把**第一条 violation 原文**报出来（pid/cr2/rip）。
+                #   原来只报 "hits=1"，等于让下一个人从零开始找（本轮就卡在这上面：
+                #   iso64 报 hits=1，独立复现脚本 0 条，没有 rip 就无法判"回归 vs 偶发"）。
+                _viol = [ln for ln in _log2.splitlines() if "[SMAP64] violation" in ln]
                 check("-cpu max：SMAP 零违规（日志里没有任何 [SMAP64] violation 行）",
-                      "[SMAP64] violation" not in _log2,
-                      "hits=%d" % _log2.count("[SMAP64] violation"))
+                      not _viol,
+                      ("hits=%d 首条=%s" % (len(_viol), _viol[0][:150])) if _viol else "")
                 check("-cpu max：WP 也没掉（无 `wp leak detected`、wp check wp=1）",
                       "[ISO64] wp leak detected" not in _log2 and
                       re.search(r"\[ISO64\] wp check at gui-entry wp=1", _log2) is not None)

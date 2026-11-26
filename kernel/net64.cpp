@@ -476,17 +476,29 @@ int net64_send_ipv4(uint32_t dst_ip, uint8_t proto, const uint8_t* payload, int 
     if (!g_up) return -1;
     if (!payload || len < 0 || (NET64_IP_HDR + len) > NET64_FRAME_MAX) return -1;
 
-    // 目的 MAC 不在缓存里：发 ARP 请求并做有界等待（和 ping64 的第一步同款）
+    // ★ v0.12.4：**默认网关路由**（HTTPS 之前必须补的真空缺）
+    //   老实现直接对**目的 IP** 发 ARP：同网段（10.0.2.0/24）能通，但任何公网地址都 ARP 不到。
+    //   实测现场（tests/https64_test.py 第一次跑）：
+    //     [NET64] arp who-has 172.66.147.243
+    //     [SYSCALL] insn nr=42 … ret=FFFFFFFFFFFFFF91    <- connect() -111
+    //     [TLS] pos tcp FAIL ip=172.66.147.243:443 connect errno=111
+    //   正确做法：目的地址不在本网段时，**以太网目的 MAC 用网关的**（IP 头里的目的地址保持远端不变）。
+    //   这里只改 next_hop，不改 IP 头 —— n64_build_ip 仍然填 dst_ip。
+    uint32_t next_hop = dst_ip;
+    if ((dst_ip & NET64_IP_MASK64) != (NET64_IP_LOCAL64 & NET64_IP_MASK64))
+        next_hop = NET64_IP_GATEWAY64;
+
+    // 下一跳的 MAC 不在缓存里：发 ARP 请求并做有界等待（和 ping64 的第一步同款）
     uint8_t mac[6];
-    if (n64_arp_lookup(dst_ip, mac) != 0) {
-        (void)net64_arp_request64(dst_ip);
+    if (n64_arp_lookup(next_hop, mac) != 0) {
+        (void)net64_arp_request64(next_hop);
         const uint64_t t0 = g_ticks64;
         while ((g_ticks64 - t0) < NET64_ARP_TIMEOUT_TICKS) {
             net64_poll64();
-            if (n64_arp_lookup(dst_ip, mac) == 0) break;
+            if (n64_arp_lookup(next_hop, mac) == 0) break;
             n64_wait_tick();
         }
-        if (n64_arp_lookup(dst_ip, mac) != 0) return -2;    // ARP 超时
+        if (n64_arp_lookup(next_hop, mac) != 0) return -2;    // ARP 超时
     }
 
     const int n = n64_build_ip(g_ip_frame, NET64_FRAME_MAX, NET64_IP_LOCAL64,

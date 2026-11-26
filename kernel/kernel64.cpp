@@ -1478,6 +1478,65 @@ display64_init64();
     //   的定时轮询没挂进 gui64_run；桌面起来后收包靠终端 `ping` 命令内部的有界 poll 循环。
     //   无网卡/ARP/ICMP 超时只打 no link 行并返回负值，系统照常启动、自检不算失败。
     (void)net64_init64();
+    // ---- ★ v0.12.4：HTTPS 探针钩子（**只**在验收夹具盘上触发）----
+    // 为什么用"卷上的标志文件"而不是键盘去启动它：QEMU 的 sendkey 在 1 fps 的 GUI 下会丢字、
+    //   也会吞掉长命令（v0.12.2 的两条下载判据就是因为这个一直是 UNVERIFIED）。验收脚本只要把
+    //   /etc/tls_probe.on + /etc/tlsprobe.conf + /etc/ssl/certs/ca.pem 写进夹具卷，然后读串口即可。
+    // 发行镜像里没有这个标志文件 -> 默认启动一个进程都不多建、一个像素都不多画（与
+    //   /etc/wl64_probe、/etc/drm64_probe、/etc/gpu3d_probe 同一套夹具约定）。
+    // 位置：net64_init64() 之后（探针要能收发）、gui64_run 之前（那之后不再返回）。
+    // ★ v0.12.4（第二版，实测修正）：**必须走"真进程"路径**，不能用 elf64_run64 的同步单例装载器。
+    //   证据：第一版在这里直接 app64_run_any64("/bin/httpsprobe")，串口上是
+    //     [APP64] dispatch path=/bin/httpsprobe magic=elf64 -> elf64_run64
+    //     [ELF64] reject reason=busy           <- 合成器 /lib/wm.elf 还活着，占着那份单例装载状态
+    //     [TLS64] probe done rc=-1
+    //   而终端 `run`/桌面双击走的都是下面这条（terminal64.cpp 的同款做法）：
+    //     proc64_create64 + proc64_start_elf64 -> 每进程 CR3，互不干扰。
+    {
+        uint32_t pty = 0, psz = 0;
+        if (vfs64_stat("/etc/tls_probe.on", &pty, &psz) == 0) {
+            dbg64_line_begin64();
+            dbg64_str("[TLS64] probe on flag=/etc/tls_probe.on -> run /bin/httpsprobe");
+            dbg64_nl();
+            dbg64_line_end64();
+            int trc = -1;
+            int tcode = -1;
+            if (proc64_isolate64()) {
+                panic64_watchdog_pause64();          // 探针最长要几十秒（DNS + TLS + 负向对照），别让看门狗误判
+                const int tpid = proc64_create64("httpsprobe", 0);
+                if (tpid > 0 && proc64_start_elf64(tpid, "/bin/httpsprobe") == 0) {
+                    const uint64_t t0 = g_ticks64;
+                    int exited = 0;
+                    while ((g_ticks64 - t0) < (uint64_t)PIT_HZ_64 * 240u) {   // 有界等待 240 s
+                        int st = -1;
+                        for (int i = 0; i < PROC64_MAX; i++) {
+                            Proc64Info in;
+                            if (proc64_info64(i, &in) == 0) continue;
+                            if ((int)in.pid == tpid) { st = (int)in.state; tcode = in.exit_code; break; }
+                        }
+                        if (st == (int)PROC64_EXITED) { exited = 1; trc = (tcode == 0) ? 0 : -1; break; }
+                        if (st < 0) break;                                    // 进程没了
+                        task_sleep64(2);
+                    }
+                    if (!exited) { (void)proc64_kill64(tpid, 9); trc = -2; }
+                    if (proc64_find64(tpid)) proc64_destroy64(tpid);
+                } else {
+                    if (tpid > 0 && proc64_find64(tpid)) proc64_destroy64(tpid);
+                    trc = -3;
+                }
+                panic64_watchdog_unpause64();
+            } else {
+                trc = -4;                            // 共享地址空间模式（UEFI 固件页表）：建不出进程，如实记录
+            }
+            dbg64_line_begin64();
+            dbg64_str("[TLS64] probe done pid-exit rc=");
+            dbg64_sdec64(trc);
+            dbg64_str(" code=");
+            dbg64_sdec64(tcode);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
     // ---- USB 主机（UHCI）：枚举 HID 引导键盘（只做引导键盘；EHCI/xHCI 未做）----
     // 位置：net64 之后、gui64_run 之前（那之后不再返回）；找不到主控/没插设备/枚举失败都
     //   只打点并返回负值，系统照常启动、桌面照常工作（自检按 skipped 处理，不算失败）。

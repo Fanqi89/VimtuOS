@@ -29,9 +29,21 @@ if [ ! -f "$MUSL/include/stdio.h" ] || [ ! -f "$MUSL/lib/libc.a" ]; then
 fi
 
 MUSLINC="-isystem $MUSL/include -isystem $MUSL/arch/x86_64 -isystem $MUSL/arch/generic -isystem $MUSL/obj/include"
+# ★ v0.12.4：**用户覆盖配置**（熵源换成我们的 CSPRNG、只做客户端、打开 X.509 校验）。
+# 落点单独一个目录：user/lib 里还有我们自己的最小 libc（stdio.h/string.h…），
+#   直接 -I user/lib 会让 musl 的 <stdio.h> 被它遮住 -> `error: unknown type name 'FILE'`
+#   （v0.12.4 实测：ok=38 fail=70，全挂在 bignum.h 的 FILE 上）。所以只拷这一个头。
+# 变量展开 vs 直接写引号：bash 不对变量展开结果再做去引号，所以 $CFG_DEF 里的双引号
+#   会原样传给 clang —— clang 看到的是 "mbedtls_vimtu_user_config.h"。
+#   反例（v0.12.3 踩过）：-DMBEDTLS_CONFIG_FILE='<mbedtls/mbedtls_config.h>' 里的尖括号被吃掉，
+#   直接 error: expected "FILENAME" or <FILENAME>。
+CFGDIR="$OUT/cfginc"
+mkdir -p "$CFGDIR"
+cp "$ROOT/user/lib/mbedtls_vimtu_user_config.h" "$CFGDIR/mbedtls_vimtu_user_config.h"
+CFG_DEF="-DMBEDTLS_USER_CONFIG_FILE=\"mbedtls_vimtu_user_config.h\""
 CFLAGS="-target x86_64-linux-gnu -nostdinc $MUSLINC -mcmodel=large -fno-pic -fno-pie \
  -fno-stack-protector -fno-builtin -O2 \
- -I$SRC/include -I$SRC/library -w"
+ -I$SRC/include -I$SRC/library -I$CFGDIR $CFG_DEF -w"
 
 ok=0
 fail=0

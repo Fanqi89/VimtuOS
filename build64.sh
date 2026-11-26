@@ -85,7 +85,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.12.3"   # ★ v0.12.3：密码学级 CSPRNG（RDRAND/RDSEED + SHA-256 DRBG）接管 getrandom(318)；拉取 mbedTLS/NetSurf 源码
+VIMTUOS_VERSION="0.12.4"   # ★ v0.12.4：真 HTTPS 打通（mbedTLS 3.6.2 + TLS 1.3 + 证书链校验 + 错证书必须失败）；CLOCK_REALTIME 改真墙钟；用户栈 16→64 KiB；内核网关路由 + TCP 校验和根因
 #   沿用自 v0.10.2 的启动加固（仅作说明）：真机加固（UEFI 载荷按真实大小读 + 屏幕报错 + MMIO BAR>=4GiB 闸门） + 桌面帧预算（热路径打点预算 + 2 MiB 大页映射 / shm 与帧缓冲 + 60 Hz 帧节拍）
 #   根因：同一块盘上的两条命令会重叠（命令列表 slot0 / 命令表 / DMA 暂存页池 g_dma[16] 全驱动共享），
 #   后果是**静默坏读**（ELF 魔数坏读、VFS BAD block、/etc/r3drv.conf 读错）与端口互相重启，
@@ -482,6 +482,13 @@ echo "==> ★ A4-1：ring3 shell（**交付 = 系统卷里的 /bin/shell.bin**�
 $PY tools/make_presets.py --out "$BUILD/presets"
 bash user/shell/build_shell.sh "$BUILD"
 $PY tools/make_shellvol.py --shell "$BUILD/shell.bin" --vol "$BUILD/shellvol.img"
+
+# ★ v0.12.4：**用户栈一致性门禁**（放在任何 ring3 驱动被编译之前）
+# 为什么要有它：bbdrv/tccdrv/luadrv/makedrv/mpdrv 都要把内核摆好的初始栈搬到自己的大栈，
+#   各自写死了"内核栈顶 = U64_STACK_VA64 + 0x…"。v0.12.4 把内核用户栈 16 KiB -> 64 KiB 时，
+#   这五处没跟着改 -> busybox/tcc/lua/make/micropython 一进 ring3 就 #PF（真事故，实测见
+#   tools/drv_stack_gate.py 头部）。这里把它变成**构建期失败**，而不是等验收红。
+"$PY" tools/drv_stack_gate.py
 
 echo "==> ★ A3：musl 静态程序（third_party/musl 的 libc.a；编译/链接全在 tools/musl_build_win.sh 里）"
 # 见 tools/musl_build_win.sh 与 docs/应用层与系统调用说明.md 的"musl（A3 第一步）"节：
@@ -1685,6 +1692,53 @@ if [ -f "$BUILD/peinfovol.img" ] && [ -f "$BUILD/viewer.elf" ]; then
 else
     echo "ERROR: 缺少 $BUILD/peinfovol.img 或 build64/viewer.elf —— 图片查看器没装进系统卷" >&2
     exit 1
+fi
+
+# ★ v0.12.4：**ring3 HTTPS 探针**（/bin/httpsprobe = mbedTLS 3.6.2 + musl 静态 ELF64）
+# 交付纪律与 /bin/netd、/bin/viewer 完全同一条：**内核里一个字节都不加**，产物只落 build64/，
+#   由 tools/tls_pack_win.py 写进系统卷（写完逐字节回读自检），再用 probe64.py 确认内核里搜不到。
+# 为什么构建里真的要编它（而不是"留个脚本让人手动跑"）：
+#   ① 它是"HTTPS 能用"的唯一判据载体，装机盘上没有它，验收就只能靠手工；
+#   ② mbedTLS 的编译选项与探针必须**同一份** user config（结构体布局随配置变），
+#      分成两步手动跑迟早会漂。
+# 上游源码不在仓里（.gitignore 排除 third_party/{mbedtls,musl,…}）：没有源码时**不静默跳过**，
+#   大声打一条 WARN 让"这版没有 HTTPS 能力"在构建日志里一眼可见（验收脚本会把它当 FAIL）。
+echo "==> ★ v0.12.4：HTTPS 探针（mbedTLS 静态库 + /bin/httpsprobe）"
+TLS_PROBE_OK=0
+if [ -f third_party/mbedtls/library/ssl_tls.c ] && [ -f third_party/musl/lib/libc.a ]; then
+    bash tools/mbedtls_build_win.sh
+    bash tools/httpsprobe_build_win.sh "$BUILD"
+    if [ -f "$BUILD/httpsprobe.elf" ]; then
+        TLS_PROBE_OK=1
+        # 内核二进制里不许出现探针的字节（它只从系统卷装载）
+        "$PY" tools/probe64.py --kernel "$BUILD/kernel64_os.bin" "$BUILD/httpsprobe.elf"
+    fi
+else
+    echo "WARN: 缺 third_party/mbedtls 或 third_party/musl —— 本版**没有** /bin/httpsprobe"
+    echo "      先跑：py -3 tools/fetch_port_sources.py"
+fi
+
+# CA 根证书包（/etc/ssl/certs/ca.pem）。抓不到就**不写**这个文件（探针会如实报 UNTRUSTED），
+#   但构建不因此失败 —— 离线构建是允许的，只是 HTTPS 判据拿不到。
+echo "==> ★ v0.12.4：CA 根证书包（/etc/ssl/certs/ca.pem）"
+CA_OPT=""
+if "$PY" tools/fetch_ca_bundle.py --out "$BUILD/ca.pem"; then
+    CA_OPT="--ca $BUILD/ca.pem"
+else
+    echo "WARN: 抓不到 CA 包（离线？）—— 系统卷里不会有 /etc/ssl/certs/ca.pem"
+fi
+
+echo "==> ★ v0.12.4：HTTPS 探针装卷"
+TLS_VOL_IN="$BUILD/viewervol.img"
+[ -f "$TLS_VOL_IN" ] || TLS_VOL_IN="$BUILD/peinfovol.img"
+if [ "$TLS_PROBE_OK" = "1" ] && [ -f "$TLS_VOL_IN" ]; then
+    "$PY" tools/tls_pack_win.py --vol-in "$TLS_VOL_IN" --vol-out "$BUILD/tlsvol.img" \
+          --probe "$BUILD/httpsprobe.elf" $CA_OPT \
+          --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+else
+    echo "WARN: 跳过 HTTPS 探针装卷（缺 httpsprobe.elf 或上游卷 $TLS_VOL_IN）"
+    # 卷链不能断：把上一步原样复制成 tlsvol.img，后面的步骤照旧能读
+    if [ -f "$TLS_VOL_IN" ]; then cp "$TLS_VOL_IN" "$BUILD/tlsvol.img"; fi
 fi
 # ★ v0.10.9：下面的 payload_embed 读的是"盘大小 = 引导区 + 真实卷"的 sysdisk.img，
 #   它把新的总扇区数写进 build64/sys_sectors.txt，于是 IMAGE_SECTORS（安装介质大小）

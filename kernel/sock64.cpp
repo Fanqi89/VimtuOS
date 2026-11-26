@@ -246,7 +246,13 @@ int sock64_create64(int type) {
         // ★ raw ICMP 没有"端口"概念（Linux 里 rport 恒 0）——给 0，别造一个假端口出来
         s->lport = (type == SOCK64_T_ICMP) ? 0
                  : (uint16_t)(40000 + (g_ticks64 & 0x3FFu) + (uint16_t)i);   // 临时端口
-        s->laddr = 0;
+        // ★ v0.12.4：**默认就填本机地址**（真 Bug 的根因）。
+        //   原来这里是 0（"等 bind 时再定"），而 connect() 之前的 socket 从不 bind，
+        //   于是 TCP/UDP 的**伪首部里源地址是 0.0.0.0** -> 校验和算错 -> 对端/网关**静默丢包**。
+        //   现场（tests/https64_test.py）：SYN 发出去了（ARP 也通了、帧也上了线），
+        //   但 connect() 一律 -110 超时；DNS 之所以还能用，是因为 UDP 校验和填 0 = "不校验"。
+        //   修法：分配时就按 net64 的口径写本机地址（bind 仍可覆盖）。
+        s->laddr = NET64_IP_LOCAL64;
         return SOCK64_FD_BASE + i;
     }
     return -1;

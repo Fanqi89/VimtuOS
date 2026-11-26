@@ -692,9 +692,19 @@ static int u64_run_blob_ex64(const void* blob, uint32_t size, const char* name, 
 
     u64_enable_nxe64();
 
-    uint64_t phys_pages[16];
+    // ★ v0.12.4：**这个数组以前是写死的 16**（最多 8 代码页 + 4 栈页 = 12，余 4）——
+    //   本轮把用户栈从 16 KiB 放大到 64 KiB（16 页）后，8 + 16 = 24 > 16，**越界写**，
+    //   把旁边几个局部变量（code_pages 等）踩成垃圾值（现场：[USER64] map … code_pages=168468480，
+    //   紧接着第三次 user64 演示在 exit 后卡死）。
+    //   修法不是"把 16 改成 40"这种魔法数，而是**按常量算**：代码页上限 8 + 栈页数。
+    //   于是改 USER64_STACK_BYTES64 时这里自动跟随，不可能再漂。
+    static const uint32_t kPhysPagesMax = 8u + (uint32_t)(USER64_STACK_BYTES64 / PAGE_SIZE_64);
+    uint64_t phys_pages[8u + (USER64_STACK_BYTES64 / PAGE_SIZE_64)];
     uint32_t phys_n = 0;
     const uint8_t* src = (const uint8_t*)blob;
+    // 编译期就把"容量够不够"钉死：代码页最多 8（上面 code_pages > 8 直接拒绝）+ 栈页数。
+    static_assert(kPhysPagesMax == sizeof(phys_pages) / sizeof(phys_pages[0]),
+                  "phys_pages 的容量必须等于 8 代码页 + 栈页数");
 
     // ---- 代码页：拷 blob -> 映射 用户可读可执行（writable=1 时同时可写，见函数头说明）----
     const uint64_t code_leaf = writable ? (PTE_USER_64 | PTE_WRITE_64) : PTE_USER_64;

@@ -1,38 +1,30 @@
-# VimtuOS / Vimtu64 —— 开源用 .gitignore
+# VimtuOS / Vimtu64 鈥斺€?寮€婧愮敤 .gitignore
 #
-# 原则：只提交自己写的源码与文档（约 1.7 MB）。
-#       打包的第三方工具链、第三方字体、构建产物、验收残留全部排除。
-#
-# ★★ 踩坑记录：**.gitignore 不支持行尾注释**！
-#    写成 `tools/i686-elf/   # 849 MB` 时，整行（含 # 与后面的字）都会被当成
-#    一个匹配不到的图案 —— 结果是"看起来排除了，其实一个都没排除"。
-#    所以本文件里所有注释都单独占一行。验证方法：git ls-files --others --exclude-standard
+# 鍘熷垯锛氬彧鎻愪氦鑷繁鍐欑殑婧愮爜涓庢枃妗ｏ紙绾?1.7 MB锛夈€?#       鎵撳寘鐨勭涓夋柟宸ュ叿閾俱€佺涓夋柟瀛椾綋銆佹瀯寤轰骇鐗┿€侀獙鏀舵畫鐣欏叏閮ㄦ帓闄ゃ€?#
+# 鈽呪槄 韪╁潙璁板綍锛?*.gitignore 涓嶆敮鎸佽灏炬敞閲?*锛?#    鍐欐垚 `tools/i686-elf/   # 849 MB` 鏃讹紝鏁磋锛堝惈 # 涓庡悗闈㈢殑瀛楋級閮戒細琚綋鎴?#    涓€涓尮閰嶄笉鍒扮殑鍥炬 鈥斺€?缁撴灉鏄?鐪嬭捣鏉ユ帓闄や簡锛屽叾瀹炰竴涓兘娌℃帓闄?銆?#    鎵€浠ユ湰鏂囦欢閲屾墍鏈夋敞閲婇兘鍗曠嫭鍗犱竴琛屻€傞獙璇佹柟娉曪細git ls-files --others --exclude-standard
 
-# ==================== 第三方工具链（打包进来的，不进仓）====================
-# i686-elf 交叉编译器 849 MB：改为在 README 里给下载/构建方式
+# ==================== 绗笁鏂瑰伐鍏烽摼锛堟墦鍖呰繘鏉ョ殑锛屼笉杩涗粨锛?===================
+# i686-elf 浜ゅ弶缂栬瘧鍣?849 MB锛氭敼涓哄湪 README 閲岀粰涓嬭浇/鏋勫缓鏂瑰紡
 tools/i686-elf/
-# nasm 二进制 2.6 MB：MSYS2 里 pacman -S nasm 即可
+# nasm 浜岃繘鍒?2.6 MB锛歁SYS2 閲?pacman -S nasm 鍗冲彲
 tools/nasm/
 tools/__pycache__/
 
-# ==================== 字体（第三方字体本体都不进仓）====================
-# Fonts/     西文 UI 字重（Noto Sans 五个静态字重）+ 许可
-# Fonts-open/ 中文（Noto Sans SC 五个静态字重 + 官方可变字体）+ 终端等宽（Sarasa Mono SC）
-#            + 缺字兜底（GNU Unifont）+ 三份许可
-#   ★ 用 "/Fonts/*" 而不是 "/Fonts/"：只有父目录**没有**被整体排除，`!` 否定规则才能把许可放行
-#     （gitignore 的否定规则无法重新包含"被排除目录里的文件"）。docs/fonts/ 里另留一份许可全文。
-/Fonts/*
+# ==================== 瀛椾綋锛堢涓夋柟瀛椾綋鏈綋閮戒笉杩涗粨锛?===================
+# Fonts/     瑗挎枃 UI 瀛楅噸锛圢oto Sans 浜斾釜闈欐€佸瓧閲嶏級+ 璁稿彲
+# Fonts-open/ 涓枃锛圢oto Sans SC 浜斾釜闈欐€佸瓧閲?+ 瀹樻柟鍙彉瀛椾綋锛? 缁堢绛夊锛圫arasa Mono SC锛?#            + 缂哄瓧鍏滃簳锛圙NU Unifont锛? 涓変唤璁稿彲
+#   鈽?鐢?"/Fonts/*" 鑰屼笉鏄?"/Fonts/"锛氬彧鏈夌埗鐩綍**娌℃湁**琚暣浣撴帓闄わ紝`!` 鍚﹀畾瑙勫垯鎵嶈兘鎶婅鍙斁琛?#     锛坓itignore 鐨勫惁瀹氳鍒欐棤娉曢噸鏂板寘鍚?琚帓闄ょ洰褰曢噷鐨勬枃浠?锛夈€俤ocs/fonts/ 閲屽彟鐣欎竴浠借鍙叏鏂囥€?/Fonts/*
 !/Fonts/OFL-*.txt
 /Fonts-open/*
 !/Fonts-open/OFL-*.txt
 !/Fonts-open/UNIFONT-LICENSE.txt
 
-# ==================== 已退役的 32 位工程（770 MB）====================
-# 若想公开，建议单独建一个仓库作为"移植参考"
+# ==================== 宸查€€褰圭殑 32 浣嶅伐绋嬶紙770 MB锛?===================
+# 鑻ユ兂鍏紑锛屽缓璁崟鐙缓涓€涓粨搴撲綔涓?绉绘鍙傝€?
 legacy32/
 
 
-# ==================== 构建产物 ====================
+# ==================== 鏋勫缓浜х墿 ====================
 
 build64/
 build/
@@ -40,19 +32,17 @@ build/
 *.o
 vimtu64-64.iso
 vimtu64-64.img
-# v0.5.5：日常数据盘（16 MB，构建产物；只在不存在时初始化，里面是用户数据，绝不进仓）
-vimtu64-64-disk.img
-# 资源中间产物（根目录 _*.py 生成）
-build/*.ttf
+# v0.5.5锛氭棩甯告暟鎹洏锛?6 MB锛屾瀯寤轰骇鐗╋紱鍙湪涓嶅瓨鍦ㄦ椂鍒濆鍖栵紝閲岄潰鏄敤鎴锋暟鎹紝缁濅笉杩涗粨锛?vimtu64-64-disk.img
+# 璧勬簮涓棿浜х墿锛堟牴鐩綍 _*.py 鐢熸垚锛?build/*.ttf
 build/*.bin
 
-# ==================== 验收测试残留与日志 ====================
-# 每次验收各 16 MB
+# ==================== 楠屾敹娴嬭瘯娈嬬暀涓庢棩蹇?====================
+# 姣忔楠屾敹鍚?16 MB
 target-*.img
 *-serial.log
 *_serial.log
 installed_boot.log
-# item 6 起新增的验收残留（同一条原则：测试跑完的日志/截图不进仓）
+# item 6 璧锋柊澧炵殑楠屾敹娈嬬暀锛堝悓涓€鏉″師鍒欙細娴嬭瘯璺戝畬鐨勬棩蹇?鎴浘涓嶈繘浠擄級
 nvme64_uefi.log
 nvme64_bios.log
 ahci_installed_boot.log
@@ -60,7 +50,7 @@ esp_installed_*.log
 usb_bothfw_*.log
 *.ppm
 
-# ==================== 会话 / 编辑器杂项 ====================
+# ==================== 浼氳瘽 / 缂栬緫鍣ㄦ潅椤?====================
 .pisession/
 .pi/
 __pycache__/
@@ -70,16 +60,14 @@ __pycache__/
 Thumbs.db
 desktop.ini
 
-# 验收/调试日志一律不进仓（含 esp_pata_uefi.log 这类）
-*.log
+# 楠屾敹/璋冭瘯鏃ュ織涓€寰嬩笉杩涗粨锛堝惈 esp_pata_uefi.log 杩欑被锛?*.log
 
-# v0.5.11+：日常盘的升级备份与版本 sidecar（本机文件，不进仓库）
-vimtu64-64-disk.img.bak
+# v0.5.11+锛氭棩甯哥洏鐨勫崌绾у浠戒笌鐗堟湰 sidecar锛堟湰鏈烘枃浠讹紝涓嶈繘浠撳簱锛?vimtu64-64-disk.img.bak
 vimtu64-64-disk.img.*.bak
 vimtu64-64-disk.img.ver
 NUL
 
-# v0.11.2���û�����������/UI ��ͼ�����ǹ������Ҳ�����ֿ⣻�ļ��������ϣ�
+# v0.11.2：用户本机的桌面/UI 截图（不是构建产物、也不进仓库；文件留在盘上）
 # docs/images/ used to be fully ignored (local screendump junk lands there).
 # README now references the freshly captured screenshots, so: ignore everything
 # in the dir EXCEPT the 9 README shots named 0X_*.png.
@@ -94,3 +82,6 @@ third_party/mbedtls/
 third_party/netsurf/
 third_party/expat/
 third_party/zlib/
+third_party/ca/
+vimtu64-64-disk.img
+esp_pata_uefi.log

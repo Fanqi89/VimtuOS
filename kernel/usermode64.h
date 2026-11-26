@@ -54,7 +54,15 @@ static const uint64_t USER64_TEST_VA64      = 0x0000000100080000ULL;  // 自检�
 //   窗口内各分区（装载区/栈/brk/终端邮箱/自检页/mmap 起点）**一个地址都没动**，只有 mmap 区
 //     的上界跟着抬到 USER64_LOADER_BIG_TOP_VA64。
 static const uint64_t USER64_WINDOW_BYTES64 = 1008ULL * 1024ULL * 1024ULL; // 1GiB - 16MiB
-static const uint64_t USER64_STACK_BYTES64  = 16ULL * 1024ULL;        // 用户栈 16KiB = 4 页
+// ★ v0.12.4：16 KiB -> **64 KiB**（4 页 -> 16 页）。为什么必须放大：
+//   第一份真 TLS（mbedTLS 3.6，TLS 1.2 客户端 + RSA-2048 链校验 + ECDHE）的握手栈用量
+//   远超 16 KiB —— 握手阶段会叠 record 解析帧、x509 链校验帧、bignum 临时量。
+//   不放大就会在握手深处 ring3 #PF（cr2 正好落在这 16 KiB 的底边外侧），
+//   现场看起来像"TLS 实现不对"，其实是栈不够。
+//   空间够不够：栈紧随 [USER64_STACK_VA64, +64KiB) = 4GiB+64KiB..+128KiB，
+//   而 brk 固定区在 4GiB+256KiB（USER64_BRK_VA64），中间还空着 128 KiB；
+//   syscall64_selftest64 的 bit0 会核对"栈顶 <= 窗口顶、brk 底 > 栈顶"（改常量先跑它）。
+static const uint64_t USER64_STACK_BYTES64  = 64ULL * 1024ULL;        // 用户栈 64KiB = 16 页
 static const uint64_t USER64_BRK_VA64       = 0x0000000100040000ULL;  // 4GiB+256KiB：brk 固定区
 static const uint64_t USER64_BRK_BYTES64    = 64ULL * 1024ULL;        // 64KiB
 static const uint64_t USER64_MMAP_VA64      = 0x0000000100090000ULL;  // 4GiB+576KiB：mmap 起点

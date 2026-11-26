@@ -124,6 +124,10 @@ uint32_t ticks64();                          // 低 32 位（与 32 位接口兼
 void rtc_init64();
 void rtc_get_time64(int* h, int* m, int* s);
 void rtc_get_date64(int* y, int* mo, int* d, int* wd);
+// ★ v0.12.4：RTC -> Unix 纪元秒（UTC）。为什么需要：证书有效期判定走 time()，而本内核原来的
+//   CLOCK_REALTIME 只报"开机以来的秒数"（约等于 1970），任何真站点都会被判 not valid yet。
+//   返回 0 = RTC 不可信（调用方必须如实降级并打点，不许静默当成 1970 去校验证书）。
+uint64_t rtc_epoch64(void);
 
 // ==================== 端口 I/O ====================
 static inline void outb64(uint16_t port, uint8_t v) {

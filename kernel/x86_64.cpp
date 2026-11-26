@@ -558,6 +558,61 @@ void rtc_get_date64(int* y, int* mo, int* d, int* wd) {
     *wd = bcd64(cmos_read64(0x06));
 }
 
+// ==================== ★ v0.12.4：RTC -> Unix 纪元秒（UTC）====================
+// 为什么需要（这是 TLS 前必须先修的真缺陷）：本内核的 clock_gettime(CLOCK_REALTIME) 原来返回的是
+//   **开机以来的秒数**（PIT tick 换算），也就是"1970-01-01 加几十秒"。mbedTLS 判定证书有效期走
+//   mbedtls_time() -> libc time() -> clock_gettime(CLOCK_REALTIME)，于是**任何真站点的证书都会被
+//   判成 not valid yet / has expired**。这类失败很容易被误读成"TLS 实现不对"，所以先把时间基准修对。
+// 做法：CMOS（0x70/0x71）读 年/月/日/时/分/秒 -> 用 Hinnant 的 days_from_civil 换成 Unix 秒，
+//   作为 CLOCK_REALTIME 的锚点（第一次取用时就地取，之后加 tick 增量）。CLOCK_MONOTONIC 不受影响。
+// 边界（如实）：
+//   ① 依赖 RTC 走 UTC（QEMU/VMware 默认 base=utc）。若宿主 RTC 是本地时间，锚点会带时区偏移；
+//      这条由下一步的 SNTP 校时彻底解决，这里只当"粗基准"（几百毫秒~几小时的误差都能让证书过）。
+//   ② RTC 只有 1 秒精度。
+//   ③ 状态寄存器 B 的 BCD/24h 位**真读**（不是硬编码 BCD），12 小时制的 PM 位按 SDM 处理。
+static uint32_t cmos_num64(uint8_t reg, uint8_t stb) {
+    uint32_t v = cmos_read64(reg);
+    if ((stb & 0x04) == 0) v = (v & 0x0F) + ((v >> 4) * 10);    // BCD -> 二进制
+    return v;
+}
+// 公历 -> 1970-01-01 起的天数（Howard Hinnant 算法；纯整数，无浮点、无 libc）
+static int64_t days_from_civil64(int64_t y, uint32_t m, uint32_t d) {
+    y -= (m <= 2) ? 1 : 0;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const uint32_t yoe = (uint32_t)(y - era * 400);                       // [0, 399]
+    const uint32_t doy = (153u * (m + (m > 2 ? (uint32_t)-3 : 9u)) + 2u) / 5u + d - 1u;
+    const uint32_t doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;        // [0, 146096]
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+uint64_t rtc_epoch64(void) {
+    const uint8_t stb = cmos_read64(0x0B);
+    uint32_t s = 0, mi = 0, h = 0, d = 0, mo = 0, y = 0;
+    int stable = 0;
+    for (int tries = 0; tries < 8 && !stable; tries++) {
+        const uint32_t s0 = cmos_num64(0x00, stb);
+        s  = s0;
+        mi = cmos_num64(0x02, stb);
+        h  = cmos_read64(0x04);                                       // PM 位要在 BCD 换算前取
+        const int pm = ((stb & 0x02) == 0) && (h & 0x80) != 0;
+        h &= 0x7Fu;
+        if ((stb & 0x04) == 0) h = (h & 0x0F) + ((h >> 4) * 10);
+        if ((stb & 0x02) == 0) {                                      // 12 小时制
+            if (h == 12) h = 0;
+            if (pm) h += 12;
+        }
+        d  = cmos_num64(0x07, stb);
+        mo = cmos_num64(0x08, stb);
+        y  = cmos_num64(0x09, stb);
+        if (cmos_num64(0x00, stb) == s0) stable = 1;                  // 秒没翻过去 -> 这一年月日时分秒是同一时刻
+    }
+    if (!stable) return 0;
+    if (y > 99 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || s > 59) return 0;
+    const int64_t days = days_from_civil64((int64_t)y + 2000, mo, d);
+    if (days < 0) return 0;                                           // 2000 年之前：RTC 明显没走对
+    return (uint64_t)(days * 86400 + (int64_t)h * 3600 + (int64_t)mi * 60 + (int64_t)s);
+}
+
 // ==================== 调度钩子（弱默认实现）====================
 // kernel/task64.cpp 落地后提供强符号覆盖它。
 extern "C" __attribute__((weak)) void schedule64(pt_regs64* r) { (void)r; }
