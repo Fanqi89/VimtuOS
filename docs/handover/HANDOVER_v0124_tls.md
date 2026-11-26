@@ -327,6 +327,12 @@ py -3 tools/drv_stack_gate.py
 
 ---
 
-## 12. 本单提交（写入时回填）
+## 12. 本单提交（回读值）
 
-- 提交信息见 §12 所在 commit；`HANDOVER.md` 索引顶部已加一行。
+- 提交：**`585b29ab`**（`feat(tls): 真 HTTPS 打通（mbedTLS 3.6.2 → TLS 1.3 + 证书链校验 + 错证书必须失败）（v0.12.4）`）；
+  `origin/main` 回读与本地 HEAD **逐位相同**（`585b29ab96d93e2b9f6d9d59dfeb347407692210`）。
+- 最终验收（就是这么提交的这批二进制）：`version64_test` **8/8**（`VimtuOS 0.12.4 x86_64`）、
+  `https64_test` **22/22 PASS**、`iso64_test` **48/48**、`rand64_test` 17/17、`netping64_test` PASS；
+  内核 **3,597,216 B**；`git status --short` 只剩仓库里本来就未跟踪的 `Fonts/*.ttf`（第三方字体，不是本轮产物）；
+  `Get-Process qemu-system-x86_64` = 0。
+- `HANDOVER.md` 索引顶部已加一行（本单）。
