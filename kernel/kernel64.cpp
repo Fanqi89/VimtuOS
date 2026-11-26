@@ -1537,6 +1537,36 @@ display64_init64();
             dbg64_line_end64();
         }
     }
+    // ---- v0.12.6: [BROWSER64] 浏览器启动钩子（只在验收夹具盘上触发）----
+    // 触发：卷里有 /etc/browser.on（tools/browser_pack_win.py --on 写）。发行镜像没有它 ->
+    //   一个进程都不多建、一个像素都不多画（与 /etc/tls_probe.on 同一套夹具约定）。
+    // 路径：必须是**真进程**（proc64_create64 + proc64_start_elf64）；app64_run_any64 那条同步单例
+    //   装载器在合成器活着时会 [ELF64] reject reason=busy（v0.12.4 的实测血账）。
+    // 与 [TLS64] 唯一的区别：**不等待**。浏览器是常驻 GUI 程序，等它退出就等于卡死在
+    //   gui64_run 之前；这里 create+start 之后立刻返回，浏览器作为独立进程与桌面一起被调度。
+    {
+        uint32_t bty = 0, bsz = 0;
+        if (vfs64_stat("/etc/browser.on", &bty, &bsz) == 0) {
+            int bpid = -1;
+            int brc = -1;
+            if (proc64_isolate64()) {
+                bpid = proc64_create64("browser", 0);
+                if (bpid > 0) {
+                    brc = proc64_start_elf64(bpid, "/bin/browser");
+                }
+            } else {
+                brc = -4;                 /* 共享地址空间模式（UEFI 固件页表）：建不出进程 */
+            }
+            dbg64_line_begin64();
+            dbg64_str("[BROWSER64] launch flag=/etc/browser.on pid=");
+            dbg64_sdec64(bpid);
+            dbg64_str(" start_rc=");
+            dbg64_sdec64(brc);
+            dbg64_str(" wait=0");
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
     // ---- USB 主机（UHCI）：枚举 HID 引导键盘（只做引导键盘；EHCI/xHCI 未做）----
     // 位置：net64 之后、gui64_run 之前（那之后不再返回）；找不到主控/没插设备/枚举失败都
     //   只打点并返回负值，系统照常启动、桌面照常工作（自检按 skipped 处理，不算失败）。
