@@ -118,6 +118,9 @@ def main():
     ap.add_argument("--img", default=os.path.join(ROOT, "build64", "system.img"))
     ap.add_argument("--out", default=os.path.join(ROOT, "docs", "images"))
     ap.add_argument("--port", type=int, default=5693)
+    # ★ v0.12.5：--only 01_lock,02_desktop 只拍指定的那几张（拍 README 头图时用，省时间）。
+    #   取值是产物名（不带 .png）；不给就是 9 张全拍。
+    ap.add_argument("--only", default=None)
     args = ap.parse_args()
 
     qemu = find_qemu()
@@ -156,6 +159,13 @@ def main():
                 return False
             time.sleep(0.25)
         return False
+
+    want = None
+    if args.only:
+        want = set(x.strip() for x in args.only.split(",") if x.strip())
+
+    def need(name):
+        return want is None or name in want
 
     shots = []
     try:
@@ -198,7 +208,8 @@ def main():
         if not wait_for("[LOCK64] bg blur ready", 240):
             print("环境问题：等不到锁屏就绪")
             return 2
-        shot("01_lock", settle=1.5)
+        if need("01_lock"):
+            shot("01_lock", settle=1.5)
 
         print("=== 2) 回车两次进桌面 ===")
         mon.key("ret", wait=1.2)
@@ -206,7 +217,12 @@ def main():
         if not wait_for("[GUI64] ready", 200):
             print("环境问题：进不了桌面")
             return 2
-        shot("02_desktop", settle=2.5)
+        if need("02_desktop"):
+            shot("02_desktop", settle=2.5)
+
+        # --only 只要锁屏/桌面时，到这里就收工（后面的应用窗口一张都不拍）
+        if want is not None and not any(n.startswith(("03", "04", "05", "06", "07", "08", "09")) for n in want):
+            raise SystemExit(0)
 
         print("=== 3) 开始菜单（Win 键）===")
         mon.key("meta_l", wait=1.8)
@@ -272,7 +288,8 @@ def main():
     print("\n共 %d 张 -> %s" % (len(shots), args.out))
     for n, w, h, r in shots:
         print("  %-14s %dx%d ink=%.1f%%" % (n, w, h, r * 100))
-    return 0 if len(shots) >= 9 else 1
+    expected = 9 if want is None else len([n for n in want if n[:2].isdigit()])
+    return 0 if len(shots) >= expected else 1
 
 
 if __name__ == "__main__":
