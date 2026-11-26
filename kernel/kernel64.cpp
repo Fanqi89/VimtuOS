@@ -82,6 +82,7 @@ uint32_t sig64_suppressed64();          // 打点预算节流统计（收尾打�
 #include "trash64.h"     // ★ v0.11.6：回收站自检（[TRASH64] selftest PASS）—— 启动期跑一次 put/restore/purge 往返
 #include "deskdir64.h"    // ★ v0.11.7：桌面 = 真实文件夹——启动期跑一次纯逻辑自检（[DESKDIR] selftest PASS）
 #include "iso64.h"        // ★ v0.11.8：ring3 真隔离（CR0.WP / CR4.SMEP / 地址空间审计）
+#include "rand64.h"       // ★ v0.12.3：密码学级随机数（TLS 的前置）
 // ★ 本批（演示程序搬进系统卷）：user_demo64.bin / user_fbdemo64.bin / user_hello.bin /
 //   user_libctest.bin / user_fbdemo.bin / evshm.elf / sig64.elf 这些**内嵌 blob 的字节已全部
 //   搬走**（构建期有"内核二进制里搜不到 64B 探针"断言）：
@@ -1089,7 +1090,8 @@ display64_init64();
     //   用户窗口（要往 PML4[0]/PDPTE 里打开 U/S）根本建不起来（实测那一写就是 #PF err=3、
     //   cr2=固件 PML4）。所以那种情况下**整段 ring3 演示跳过**并只打一行说明，绝不假装成功。
     if (user64_available64()) {
-        (void)user64_selftest64();              // 用户页/帧/选择子自检 -> [USER64] selftest PASS
+        (void)user64_selftest64();
+    (void)rand64_selftest64();              // ★ v0.12.3：CSPRNG 自检 -> [RAND64] selftest PASS              // 用户页/帧/选择子自检 -> [USER64] selftest PASS
         // ★ 本批（演示程序搬进系统卷）：四份"直接跑"的演示程序（demo64 / hello_c / libctest_c /
         //   fbdemo）的字节**不再内嵌**内核二进制 —— 交付 = 系统卷里的 /bin/*.bin
         //   （tools/demo_pack_win.py 构建期写入 + 逐字节回读自检）；启动期这里按路径从

@@ -229,6 +229,7 @@ static inline bool lx64_have_proc64() { return proc64_isolate64 != nullptr; }
 #include "debug64.h"
 #include "kpti64.h"        // ★ v0.11.9：KPTI（LSTAR 是否指向共享入口区）
 #include "iso64.h"         // ★ v0.12.0：SMAP（用户访存开窗 iso64_stac64/clac64）
+#include "rand64.h"        // ★ v0.12.3：密码学级 CSPRNG（getrandom 318 的真正落点）
 #include "fb.h"             // 屏幕输出（fb_draw_text / fb_flip_region）
 #include "proc64.h"         // 批次 C：进程/地址空间（fork/execve/wait4/kill/每进程 brk&mmap/FS 基址）
 // ★ 系统音效：音频 ABI（49 audio_play）**只转发**给 hda64 驱动（不新增驱动能力）。
@@ -2776,29 +2777,21 @@ static int64_t lx64_setrlimit64(uint64_t nr, uint64_t res, uint64_t rlim_va) {
     (void)res;
     return -LX64_EPERM;                                  // 没有配额可改：如实拒绝（不死循环、不假装成功）
 }
-// getrandom：没有硬件 RNG 可用，用 ticks + TSC + 一个 xorshift 自增状态造"够用的伪随机"。
-// 如实标注：**不是密码学安全随机**（只需满足"每次不同、分布还行"这一类用户态用法）。
-static uint64_t g_lx_rng64 = 0x243F6A8885A308D3ULL;
-static uint64_t lx64_rng_next64() {
-    uint64_t x = g_lx_rng64;
-    uint32_t lo = 0, hi = 0;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    x ^= ((uint64_t)hi << 32) | lo;
-    x ^= g_ticks64 * 0x9E3779B97F4A7C15ULL;
-    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-    g_lx_rng64 = x;
-    return x;
-}
+// getrandom(318)：★ v0.12.3 —— 换成**密码学级** CSPRNG（kernel/rand64.cpp）。
+// 旧实现是 "TSC + ticks + xorshift"，文件头自己都写着"不是密码学安全随机"。
+// TLS 的会话密钥 / client random / ECDHE 私钥全从这里取，弱随机等于没有加密，所以必须先换掉。
+// 新实现：RDRAND（有则直用）或 SHA-256 计数器 DRBG（种子来自 RDSEED / TSC 抖动），
+// 判据见 [RAND64] selftest 一行（分布/去重/两次不同）。
 static int64_t lx64_getrandom64(uint64_t nr, uint64_t buf, uint64_t len, uint64_t flags) {
     (void)flags;
     if (len == 0) return 0;
-    if (len > 256) len = 256;                            // 有界（单次最多 256 字节，够 glibc 初始化用）
+    if (len > 4096) len = 4096;                          // 有界（原来 256 太窄：TLS 一次要 32~64B 没问题，
+                                                         // 但 mbedTLS 的 DRBG 会一次要 384B 以上，放宽到 4 KiB）
     if (!user64_range_ok64(buf, len)) { syscall64_deny64(nr, buf); return -LX64_EFAULT; }
-    uint8_t tmp[256];
-    for (uint64_t i = 0; i < len; i++) {
-        if ((i & 7u) == 0) { const uint64_t r = lx64_rng_next64(); for (uint32_t k = 0; k < 8; k++) tmp[i + k < len ? i + k : i] = (uint8_t)(r >> (8 * k)); }
-    }
-    lx64_copy_to_user64(buf, tmp, len);
+    ISO64_STAC64();                                      // 直接写用户缓冲（SMAP 下必须开窗）
+    rand64_bytes64((void*)(uintptr_t)buf, (uint32_t)len);
+    ISO64_CLAC64();
+    return (int64_t)len;
     return (int64_t)len;
 }
 

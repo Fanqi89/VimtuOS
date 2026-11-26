@@ -81,3 +81,12 @@ NUL
 
 # v0.11.2：用户本机的桌面/UI 截图（不是构建产物、也不进仓库；文件留在盘上）
 docs/images/
+
+# v0.12.3: mbedTLS / NetSurf upstream sources are NOT vendored (~38 MB, and a single
+#   Git Data API tree request with ~4000 files returns 502). Materialise them with:
+#       py -3 tools/fetch_port_sources.py
+#   Versions are pinned in that script (mbedTLS v3.6.2, NetSurf family at fixed SHAs).
+third_party/mbedtls/
+third_party/netsurf/
+third_party/expat/
+third_party/zlib/

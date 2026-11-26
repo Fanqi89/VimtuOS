@@ -85,7 +85,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.12.2"   # ★ v0.12.2：L4 硬化（按序号收 + 真窗口 + 校验和 + 数据段重传 + MSS）+ DNS 打通（/etc/resolv.conf + poll 看得见 socket）
+VIMTUOS_VERSION="0.12.3"   # ★ v0.12.3：密码学级 CSPRNG（RDRAND/RDSEED + SHA-256 DRBG）接管 getrandom(318)；拉取 mbedTLS/NetSurf 源码
 #   沿用自 v0.10.2 的启动加固（仅作说明）：真机加固（UEFI 载荷按真实大小读 + 屏幕报错 + MMIO BAR>=4GiB 闸门） + 桌面帧预算（热路径打点预算 + 2 MiB 大页映射 / shm 与帧缓冲 + 60 Hz 帧节拍）
 #   根因：同一块盘上的两条命令会重叠（命令列表 slot0 / 命令表 / DMA 暂存页池 g_dma[16] 全驱动共享），
 #   后果是**静默坏读**（ELF 魔数坏读、VFS BAD block、/etc/r3drv.conf 读错）与端口互相重启，
@@ -122,7 +122,7 @@ CXXFLAGS_INSTALLER="$CXXFLAGS -DVIMTU_INSTALLER_MEDIA=1 -DVIMTU_PAYLOAD_LBA=$PAY
 #     （屏幕硬件检查报告）也进 CORE —— 两份内核都要：安装程序要能看见 SATA/NVMe 盘，
 #     系统内核的 VFS/store 也要能（驱动器号 8.. / 16.. 分派），
 #     而硬件检查报告在安装介质与装好的系统里都是"没有串口时唯一的诊断画面"。
-SRCS_CORE="kernel/kernel64.cpp kernel/console64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp kernel/input.cpp kernel/input64.cpp kernel/mem64.cpp kernel/hwinfo64.cpp kernel/acpi64.cpp kernel/edid64.cpp kernel/sysfs64.cpp kernel/display64.cpp kernel/fd64.cpp kernel/usermode64.cpp kernel/syscall64.cpp kernel/ahci64.cpp kernel/nvme64.cpp kernel/hwui64.cpp kernel/drive64.cpp kernel/fat64.cpp kernel/fs64.cpp kernel/iso9660_64.cpp kernel/sig64.cpp kernel/virtio_gpu64.cpp"
+SRCS_CORE="kernel/rand64.cpp kernel/kernel64.cpp kernel/console64.cpp kernel/x86_64.cpp kernel/fb.cpp kernel/font.cpp kernel/input.cpp kernel/input64.cpp kernel/mem64.cpp kernel/hwinfo64.cpp kernel/acpi64.cpp kernel/edid64.cpp kernel/sysfs64.cpp kernel/display64.cpp kernel/fd64.cpp kernel/usermode64.cpp kernel/syscall64.cpp kernel/ahci64.cpp kernel/nvme64.cpp kernel/hwui64.cpp kernel/drive64.cpp kernel/fat64.cpp kernel/fs64.cpp kernel/iso9660_64.cpp kernel/sig64.cpp kernel/virtio_gpu64.cpp"
 # ★ 本批（用户态设备映射）：kernel/pci64.cpp = PCI 配置空间 + BAR 解码（pci_map_bar(48) 的底层）。
 #   进 **SRCS_CORE** 的理由：kernel/syscall64.cpp（也在 CORE 里）对它的是**强引用**，
 #   两份内核都必须在链接行里能解析到它；它只有"配置空间读写 + BAR 解码"这一小块，
@@ -931,7 +931,7 @@ $CXX -c kernel/demo64.cpp -o "$BUILD/demo64.o" $CXXFLAGS -I"$BUILD"
 echo "      kernel/demo64.cpp -> $BUILD/demo64.o（路径/偏移/长度表；blob 本体 0 字节）"
 
 echo "==> 链接两个内核"
-$LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel64.o "$BUILD"/console64.o "$BUILD"/x86_64.o \
+$LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/rand64.o "$BUILD"/kernel64.o "$BUILD"/console64.o "$BUILD"/x86_64.o \
     "$BUILD"/fb.o "$BUILD"/font.o "$BUILD"/input.o "$BUILD"/input64.o "$BUILD"/mem64.o "$BUILD"/ata64.o "$BUILD"/part64.o "$BUILD"/setup64.o \
     "$BUILD"/fat64.o "$BUILD"/fs64.o "$BUILD"/iso9660_64.o "$BUILD"/drive64.o \
     "$BUILD"/bootx64_efi.o "$BUILD"/uefi64_bin.o \
@@ -943,7 +943,7 @@ $LD -m elf_x86_64 -o "$BUILD/kernel64.elf"    kernel/linker64.ld "$BUILD"/kernel
     "$BUILD"/demo64.o "$BUILD"/font_*_z.o "$BUILD"/icon_start_mini.o
 $OBJCOPY -O binary "$BUILD/kernel64.elf" "$BUILD/kernel64.bin"
 
-$LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
+$LD -m elf_x86_64 -o "$BUILD/kernel64_os.elf" kernel/linker64.ld "$BUILD/os"/rand64.o "$BUILD/os"/kernel64.o "$BUILD/os"/console64.o "$BUILD/os"/x86_64.o \
     gui_rs/gui_rs.o \
     "$BUILD/os"/fb.o "$BUILD/os"/font.o "$BUILD/os"/fontcfg64.o "$BUILD/os"/input.o "$BUILD/os"/input64.o "$BUILD/os"/mem64.o \
     "$BUILD/os"/hwinfo64.o "$BUILD/os"/acpi64.o "$BUILD/os"/edid64.o "$BUILD/os"/sysfs64.o "$BUILD/os"/vfs64.o "$BUILD/os"/store64.o "$BUILD/os"/ata64.o "$BUILD/os"/apic64.o "$BUILD/os"/display64.o "$BUILD/os"/fd64.o "$BUILD/os"/usermode64.o "$BUILD/os"/syscall64.o "$BUILD/os"/kpti64.o "$BUILD/os"/sig64.o "$BUILD/os"/pci64.o "$BUILD/os"/gpu64.o "$BUILD/os"/vmware64.o "$BUILD/os"/intel_gpu64.o \
