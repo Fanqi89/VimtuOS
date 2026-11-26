@@ -71,6 +71,26 @@ struct vimtu_timer {
 };
 
 static struct vimtu_timer *g_timers;
+static unsigned g_sched_runs;           /* 累计执行过的回调数（诊断用） */
+
+/* 诊断出口：还有多少定时器挂着 / 已经跑过多少回调。
+ * 为什么要暴露这两个数：fetch 的推进完全依赖 "guit->misc->schedule -> fetcher_poll" 这条链。
+ * 页面空白时，"timers=0 runs=0" 说明链子没接上；"runs 暴涨" 说明链子在转、卡的是 fetcher 内部。 */
+unsigned vimtu_schedule_pending(void)
+{
+    unsigned n = 0;
+    struct vimtu_timer *t;
+
+    for (t = g_timers; t != NULL; t = t->next) {
+        n++;
+    }
+    return n;
+}
+
+unsigned vimtu_schedule_runs(void)
+{
+    return g_sched_runs;
+}
 
 static uint64_t mono_ms(void)
 {
@@ -158,6 +178,7 @@ int vimtu_schedule_run(void)
     while (run != NULL) {
         next = run->next;
         run->callback(run->p);
+        g_sched_runs++;
         free(run);
         run = next;
     }
@@ -633,8 +654,43 @@ static const char *vimtu_fetch_filetype(const char *unix_path)
     return mime;
 }
 
+/* 内建资源（resource: 协议）：NetSurf 每载入一页都要读四张内建样式表
+ *   resource:default.css / quirks.css / internal.css / user.css
+ * 前端必须通过 **get_resource_data 交出这些字节**。本前端此前留 NULL（=核心默认
+ * "NOT_FOUND"），实测后果非常隐蔽：每次页面加载都报
+ *   html_convert_css_callback: stylesheet resource:default.css failed: UnacceptableType
+ * 四张全失败之后 html_finish_conversion 走错误路径 → 浏览器被导航到
+ *   about:query/fetcherror → 那张页又触发同样的失败 → 自持循环，窗口永远排不完一次版
+ * （串口表现是 "Completing parse" 每秒一条、地址各不相同，paint 一直 ink=0.0%）。
+ *
+ * 现在给出**合法的空样式表**：空 CSS 完全合法，布局照常进行（只是没有默认字体着色/边距
+ * 微调）。这比"没有样式表就报错"诚实，也是 TLS 修好之前让页面能显示的最小一步。
+ * 后续要把真正的 default.css 打包进来，只需要把这里的字符串换成真实内容即可。 */
+static nserror vimtu_fetch_get_resource_data(const char *path, const uint8_t **data, size_t *data_len)
+{
+    static const char empty_css[] = "/* vimtu: built-in stylesheet placeholder */\n";
+
+    if (path == NULL || data == NULL || data_len == NULL) {
+        return NSERROR_BAD_PARAMETER;
+    }
+    if (strstr(path, ".css") != NULL) {
+        *data = (const uint8_t *)empty_css;
+        *data_len = sizeof(empty_css) - 1;
+        return NSERROR_OK;
+    }
+    return NSERROR_NOT_FOUND;
+}
+
+static nserror vimtu_fetch_release_resource_data(const uint8_t *data)
+{
+    (void)data;
+    return NSERROR_OK;               /* 指向静态字符串，不需要释放 */
+}
+
 static struct gui_fetch_table vimtu_fetch_table = {
     .filetype = vimtu_fetch_filetype,
+    .get_resource_data = vimtu_fetch_get_resource_data,
+    .release_resource_data = vimtu_fetch_release_resource_data,
 };
 
 /* ================================================================= utf8 表

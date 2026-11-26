@@ -53,6 +53,8 @@ nserror vimtu_table_register(void);        /* 填 netsurf_table 并 netsurf_regi
 void vimtu_window_paint(void);             /* 重绘一帧（页面 + Chrome）并 flush */
 void vimtu_window_mark_dirty(void);        /* 核心 invalidate -> 本帧结束前重画 */
 int vimtu_schedule_run(void);              /* 跑一轮到期回调；返回距下一到期 ms（-1 = 无） */
+unsigned vimtu_schedule_pending(void);     /* 诊断：还挂着的定时器个数 */
+unsigned vimtu_schedule_runs(void);        /* 诊断：累计执行过的回调数 */
 void vimtu_window_back(void);
 void vimtu_window_forward(void);
 void vimtu_window_reload(void);

@@ -184,3 +184,47 @@ py -3 tools/browser_pack_win.py --fixture-img build64/browser64_test.img `
 - 长跑/回归一律串行；收尾必须 `Get-Process qemu-system-x86_64` = 0、`git status --short` 只剩 `Fonts/*.ttf`。
 - `PowerShell` 内联 `py -3 -c` 带中文/引号极易挂 → 一律写 `.py` 文件。
 - `Edit` 工具行号极易错位 → 改前必须 fresh `Read`；批量改优先写 python 按**唯一字面串**替换并 `assert count==1`。
+
+---
+
+## 9. 第三轮：**客人里已经画出窗口了**（本节证据全部来自真机串口）
+
+```
+[BROWSER64] launch flag=/etc/browser.on pid=26 start_rc=0 wait=0
+[BROWSER] register rc=0 window_create=1 corewindow=1
+[BROWSER] init ok
+[BROWSER] net dns host=example.com rc=0 ip=104.20.23.154 ms=364
+[BROWSER] net http pollout rc=1 rev=4 (4=POLLOUT)
+[BROWSER] net http connected=1 sent=62/62
+[BROWSER] net http rx=127 head=HTTP/1.1 200 waited=500ms
+[BROWSER] render boxes=29
+[BROWSER] paint frame=1 ink=0.0%
+[BROWSER] paint frame=2 ink=1.4%
+[WL64] decor id=1 pid=26 ... title="VimtuOS browser"
+[DOCK64] item idx=9 app=0 name=VimtuOS browser ... kind=running win=10001
+```
+
+- `netsurf_register` rc=0、window/corewindow 表都装上了；`browser_window_create` 通过；
+  **排版真的跑了（boxes=29）**、**真的画了（paint frame=2, ink=1.4%）**、标题同步进内核标题栏、
+  Dock 里出现"运行中"的应用项。产物 `build64/browser.elf` = **2,774,712 B**。
+- 两个关键真缺陷（已修，别退回）：
+  1. **`js_newheap` 返回值写反**：上游官方桩 `content/handlers/javascript/none/none.c` 里
+     `js_newheap` 返回 `NSERROR_OK`（`*heap=NULL`），只有 `js_newthread` 才是 `NOT_IMPLEMENTED`。
+     手写桩把两者对调 → `browser_window_initialise_common()` 第一步 `return err` →
+     `browser_window_create` 返回 **31 = NSERROR_NOT_IMPLEMENTED**。修法：**直接 `#include` 上游 none.c**。
+  2. **内建样式表没交数据**：`gui_fetch_table.get_resource_data` 留 NULL → 四张 `resource:*.css` 全
+     `UnacceptableType` → 页面被导航到 `about:query/fetcherror` → 那张页又同样失败 → **自持循环**
+     （串口每秒一条 `Completing parse`、`ink` 永远 0.0%）。修法：实现
+     `get_resource_data/release_resource_data`，给 `.css` 返回合法空样式表。
+
+### 仍未通（UNVERIFIED，别当成功）
+
+- **HTTPS/TLS 握手不动**：明文 HTTP 链路已逐层证明（DNS ✅ / connect ✅ / POLLOUT ✅ / send 62/62 ✅ /
+  收到 `HTTP/1.1 200` 127 B ✅），但 `mbedtls_ssl_handshake()` 一直停在 `WANT_READ`，既不成功也不报错。
+  待抓点：`VIMTU_VERBOSE_LOG=1` 打开全部 NSLOG；怀疑 `bio_recv`"先 poll 再 recv"与
+  `mbedtls_ssl_conf_read_timeout(conf, 0)` 的交互。在此之前首页用**内建 `data:text/html` 页**
+  （`net target=https://example.com/` 仍做完整自检）。
+- **QEMU `screendump` 的 PPM 与画布不一致**（同一时刻：浏览器数的页面区是白底 +1.4% 墨迹，PPM 里窗口区 91% 暗）。
+  像素判据以 `[BROWSER] paint ... ink=` 为准（同一把尺子、直接在真实 shm 画布上数），PPM 只作辅助。
+- 内建 CSS 是空占位（合法但无默认边距）；把真正的 `default.css` 打进 `get_resource_data` 即可。
+- 地址栏键盘输入仍未做（`address input UNVERIFIED`）。
