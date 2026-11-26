@@ -170,3 +170,41 @@ py -3 tests\version64_test.py              # 8/8
 py -3 tests\rand64_test.py                 # CSPRNG 17 条
 C:\msys64\usr\bin\bash.exe -lc "bash tools/mbedtls_build_win.sh"   # ok=108 fail=0
 ```
+
+---
+
+## 10. README 截图重拍（同一轮的追加工作）
+
+用户反馈"README 里的系统截图都不是当前系统最新的"。于是新写了
+**[`tools/shots_fresh.py`](../tools/shots_fresh.py)**，从**当前构建**（`build64/system.img`，
+内核 3,592,832 B / v0.12.3）现拍 9 张，替换掉 README 里那批旧图：
+
+| 文件 | 内容 | 这一帧的证据（串口） |
+|---|---|---|
+| `docs/images/01_lock.png` | 锁屏 | `[LOCK64] bg blur ready` |
+| `docs/images/02_desktop.png` | 桌面 | `[GUI64] ready` |
+| `docs/images/03_startmenu.png` | 开始菜单 | `[START64] open why=win-key`（网格 `apps=14 cells=8`） |
+| `docs/images/04_terminal.png` | 终端 | `[APP] term opened cols=120 rows=37` |
+| `docs/images/05_mypc.png` | 我的电脑 | `[START64] search q=mypc hits=1 first=My Computer` + `[APP] mypc opened` |
+| `docs/images/06_settings.png` | 设置 | `… q=settings hits=1 first=Settings` + `[APP] settings opened` |
+| `docs/images/07_tmgr.png` | 任务管理器 | `… q=tmgr hits=1 first=Task Manager` + `[APP] tmgr opened` |
+| `docs/images/08_about.png` | 关于（**页面上就是版本号**） | `… q=about hits=1 first=About VimtuOS` + `[APP] about opened` |
+| `docs/images/09_calc.png` | 计算器 | `… q=calc hits=1 first=Calculator` + `[APP] calc opened` |
+
+全部 1280×800，逐张与 `02_desktop` 做过差异像素统计（4.8% / 66.4% / 21.7% / 11.2% / 40.5% /
+17.7% / 19.3% …），确认**不是同一帧重复截图**；每张的 md5 互不相同。
+
+### 重拍过程踩的两个坑（都已修进脚本注释）
+
+1. **数字快捷键 ≠ 开始菜单网格顺序**。我先按 `[START64] grid` 的顺序按数字（期望 "6"=终端），
+   实际开的是**设置** —— 全拍错了。改成走**搜索框**：串口打
+   `[START64] search q=<词> hits=N first=<App 名> (app=<id>)`，命中唯一时回车才开对。
+2. **键盘在 1 fps 的 GUI 下会丢字**：`calc` 只到 `c`，于是打开了 "App Store"。修法：
+   打完字先**读回 `search q=…`**，只有"读回来的词 == 目标词"才按回车，否则重打（最多 4 次）。
+   这条和 v0.12.2 里 `wget` 长命令被吞是同一个根因，这里用"读回校验 + 重试"绕过去了。
+
+### 没做到的（如实）
+
+想在终端里敲 `ver` / `cat /proc/version` 把版本号也拍进图里，但**键盘打进内核终端 4 次全失败**
+（终端窗口拿不到稳定焦点）。所以版本证据改成：`08_about.png` 这一页本身显示版本号 +
+本节这张"每张图对应哪条串口打点"的表。**没有**把"截图里的版本号像素"做成自动断言（缺 OCR）。

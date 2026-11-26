@@ -80,7 +80,11 @@ vimtu64-64-disk.img.ver
 NUL
 
 # v0.11.2：用户本机的桌面/UI 截图（不是构建产物、也不进仓库；文件留在盘上）
-docs/images/
+# docs/images/ used to be fully ignored (local screendump junk lands there).
+# README now references the freshly captured screenshots, so: ignore everything
+# in the dir EXCEPT the 9 README shots named 0X_*.png.
+docs/images/*
+!docs/images/0[1-9]_*.png
 
 # v0.12.3: mbedTLS / NetSurf upstream sources are NOT vendored (~38 MB, and a single
 #   Git Data API tree request with ~4000 files returns 502). Materialise them with:

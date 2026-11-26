@@ -30,20 +30,25 @@ VimtuOS 的目标不是"教学玩具"，而是一个**能当日常系统用**的
 
 ### 系统截图
 
-> 全部为 **QEMU/VNC 客人帧缓冲真截图**，不是渲染稿。
+> 全部是 **QEMU 客人帧缓冲真截图**（`screendump`），不是渲染稿、不是设计稿。
+> 拍摄脚本：**[`tools/shots_fresh.py`](tools/shots_fresh.py)** —— 起当前构建的 `build64/system.img`，
+> 用键盘驱动到各状态，每张都用**串口自己的打点**确认"这一帧是什么"：
+> `[LOCK64] bg blur ready` / `[GUI64] ready` / `[START64] open` /
+> `[START64] search q=… hits=1 first=<App> (app=<id>)` + `[APP] <x> opened`。
+> 复现：`py -3 tools/shots_fresh.py`
 
 | | |
 |---|---|
-| ![桌面](docs/images/GUI2.png) | ![桌面栈](docs/screenshots/desktop64.png) |
-| **桌面（毛玻璃 + Dock + 任务栏）** | **桌面外壳 · 窗口合成** |
-| ![深色主题](docs/screenshots/modern_dark64.png) | ![文件管理器](docs/screenshots/explorer_details64.png) |
-| **深色主题（设计 Token 全表驱动）** | **文件管理器 · 详细信息视图** |
-| ![设置](docs/screenshots/settings_specs64.png) | ![任务管理器](docs/screenshots/tmgr_perf64.png) |
-| **设置 · 硬件规格页** | **任务管理器 · 性能页** |
-| ![终端](docs/screenshots/terminal_mono64.png) | ![Windows PE](docs/w3_msgbox.png) |
-| **终端（抗锯齿，CJK 一字不断）** | **原生 Windows PE 程序的 `MessageBoxA` 窗口** |
-| ![启动日志](docs/screenshots/bootlog64.png) | ![查找](docs/screenshots/explorer_thispc64.png) |
-| **启动过程 · 真逐行滚屏日志** | **此电脑 · 卷与盘符** |
+| ![锁屏](docs/images/01_lock.png) | ![桌面](docs/images/02_desktop.png) |
+| **锁屏**（Bayer 抖动分 8 步从黑场揭示） | **桌面**（壁纸 + Dock + 任务栏时钟） |
+| ![开始菜单](docs/images/03_startmenu.png) | ![终端](docs/images/04_terminal.png) |
+| **开始菜单**（快捷方式目录投影：14 项 / 8 格） | **终端**（CJK 抗锯齿，一字不断） |
+| ![我的电脑](docs/images/05_mypc.png) | ![设置](docs/images/06_settings.png) |
+| **我的电脑**（卷与盘符） | **设置**（主题 / 壁纸 / 声音 / Dock…约 40 个键） |
+| ![任务管理器](docs/images/07_tmgr.png) | ![关于](docs/images/08_about.png) |
+| **任务管理器**（进程 / 性能 / 启动 / 详细信息） | **关于**（这一页上就是当前版本号） |
+| ![计算器](docs/images/09_calc.png) | |
+| **计算器** | |
 
 ---
 
