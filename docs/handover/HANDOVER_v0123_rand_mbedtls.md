@@ -130,10 +130,30 @@
 
 ---
 
-## 8. 现场
+## 8. 源码**不进仓**（发版流程的真实约束）
+
+mbedTLS / NetSurf 全家桶 / expat / zlib 一共 **~38 MB、约 3,800 个文件**。第一次把它们提交进去后：
+**GitHub 的 Git Data API 创建 tree 直接 502**（`POST /git/trees` 单次几千个条目过网关就挂），
+而本仓的推送通道正是 API 逐提交回放（`git push` 在这台机器上一直被 `Connection was reset` 打断）。
+
+所以按仓里既有的"字体不进仓"惯例：**源码不进仓，脚本按钉死的 SHA 现拉**。
+
+- `.gitignore` 里加了 `third_party/{mbedtls,netsurf,expat,zlib}/`（带注释说明）
+- `tools/fetch_port_sources.py` 的 `TARGETS` 里**版本钉死**：
+  mbedTLS `v3.6.2`；NetSurf 全家桶到具体 commit（`netsurf` `170d89462442`、
+  `libcss` `0c4f51901a15`、`libdom` `e4150b65e4e7`、`libhubbub` `68989e60c786`、
+  `libparserutils` `c9971265064b`、`libwapcaplet` `74e49210e9c5`、`libnsgif` `b9e3b0aadce3`、
+  `libnsbmp` `3406e7e0bfb5`、`libnsutils` `4f0b88241304`、`libnspsl` `fb372b56cc83`、
+  `libnslog` `6c3445f5e78c`、`libsvgtiny` `848424e7328e`、`librosprite` `5a529e37891b`；
+  `expat` `R_2_6_4`、`zlib` `v1.3.1`）—— 不随上游漂。
+- 另：tar 里的**符号链接**在 Windows 上会抛 `OSError(22)`（NetSurf 有 179 个），
+  第一次提交时它们变成 git 的 `120000` 条目、API 通道直接拒收（"删除文件或链接"）——
+  现在抓取时跳过非普通文件，仓里**一个符号链接都没有**。
+
+## 9. 现场
 
 ```
-HEAD            = 见 git log 顶部（feat(rand,tls): …）
+HEAD            = `9ae5ac3738f112fa7f06357fc016dc762a47b44d`（= 远端 main）
 上游基线        = 174de1da（v0.12.2 发版提交）
 内核映像        = 3,592,832 B（闸门 15,728,640 B）
 mbedTLS         = third_party/mbedtls（v3.6.2）/ build64/mbedtls/libmbedtls.a 1,662,810 B
