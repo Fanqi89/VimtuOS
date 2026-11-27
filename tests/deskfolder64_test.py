@@ -354,11 +354,23 @@ def main():
         print("=== 阶段 4：把桌面上的 %s 拖进回收站图标 -> 真进 /Recycle ===" % name_src)
         # ★ 先把窗口全部最小化（Ctrl+Shift+W）：桌面图标在屏幕左侧，被资源管理器盖住时
         #   按下去命中的是窗口而不是图标（实测：一条 [DESKDIR] trash 都不会出现）。
+        # ★ v0.12.9修：`Ctrl+Shift+W` 只最小化**最上面一个**窗口
+        #   （gui64 的 top_visible_win64），而阶段 2 的终端固定在 (16,16) 974x678，
+        #   正好盖住桌面文件图标（112,24）—— 一直只按一次就不可能清场，
+        #   按下被 `win_at()` 吃掉 -> `[UI] desktop icon select kind=9` 从来不出现 ->
+        #   后面 7 条回收站链路全部级联红。现在循环最小化（与 desktopops64_test 同一写法）。
         since_m = len(vm.log())
-        mon.key("ctrl-shift-w", wait=1.2)
-        check("最小化所有窗口（[UI] hotkey ctrl+shift+w minimize）",
-              vm.wait_log("[UI] hotkey ctrl+shift+w", 10, since_m), "")
-        time.sleep(0.8)
+        n_min = 0
+        for _ in range(6):
+            mon.key("ctrl-shift-w", wait=0.9)
+            time.sleep(0.5)
+            n_min += 1
+            if not re.search(r"\[UI\] hotkey ctrl\+shift\+w minimize", vm.log()[since_m:]):
+                break
+        n_hot = len(re.findall(r"\[UI\] hotkey ctrl\+shift\+w minimize", vm.log()[since_m:]))
+        check("最小化所有窗口（[UI] hotkey ctrl+shift+w minimize 至少一次，本轮按了 %d 次 / 命中 %d 次）"
+              % (n_min, n_hot), n_hot >= 1, "n_hot=%d" % n_hot)
+        time.sleep(0.6)
         rec = it3.get("回收站")
         check("桌面回收站图标在（kind=1）", rec is not None and rec[1] == 1, str(rec))
         # 选"最左边的文件图标"当拖拽源（鼠标定位在左侧最稳，见文件头注释）
@@ -380,7 +392,7 @@ def main():
             check("回收站里记录原位置（[TRASH64] put orig=<桌面>/<名字>）",
                   bool(m_put) and bool(deskdir) and m_put.group(2) == deskdir + "/" + name_src,
                   m_put.group(0) if m_put else "（缺行）")
-            m_rm = dd.wait_re(vm, r"\[DESKDIR\] scan why=recycle \S+ added=\d+ removed=(\d+)", 20, since)
+            m_rm = dd.wait_re(vm, r"\[DESKDIR\] scan why=recycle .*?added=\d+ removed=(\d+)", 20, since)
             check("桌面条目消失（[DESKDIR] scan … removed=1）",
                   m_rm is not None and m_rm.group(1) == "1", m_rm.group(0)[:120] if m_rm else "（缺行）")
         else:
@@ -397,10 +409,18 @@ def main():
         check("重启后绑定的还是同一个目录",
               bool(m2) and bool(deskdir) and m2.group(1) == deskdir,
               m2.group(0) if m2 else "（缺行）")
+        # ★ v0.12.9 口径修正：上一代写的是“重启后桌面目录里还有 live.txt”，
+        #   那是「阶段 4 回收站压根没生效」时的口径。现在回收站真生效了：
+        #   桌面**没有**它（已进 /Recycle），而 /Recycle 里**有** 1 项（阶段 6 要恢复的就是它）。
         m3 = dd.wait_re(vm, r"\[DESKDIR\] scan why=init .*names=(\S*)", 20)
-        check("重启后目录里仍有恢复回来的条目（names 含 %s）" % (name_src or "-"),
-              bool(m3) and bool(name_src) and name_src in m3.group(1),
-              m3.group(1) if m3 else "（缺行）")
+        names5 = m3.group(1) if m3 else ""
+        check("桌面目录重启后一致（%s 已不在桌面：%s）" % (name_src or "-", names5),
+              bool(m3) and bool(name_src) and name_src not in names5,
+              names5 if names5 else "（缺行）")
+        m_rc = dd.wait_re(vm, r"\[TRASH64\] init vol=\d+ dir=/Recycle exists=1 created=\d+ items=(\d+)", 20)
+        check("回收站里还有那一项（[TRASH64] init … items>=1）",
+              m_rc is not None and int(m_rc.group(1)) >= 1,
+              m_rc.group(0) if m_rc else "（缺行）")
         check("位置缓存读回（[DESK64] links load why=init … n>=1）",
               dd.wait_re(vm, r"\[DESK64\] links load why=init \S+ n=(\d+)", 20) is not None)
         forbid("阶段 5 日志", vm.log())
@@ -478,11 +498,11 @@ def main():
             by = int(m_btn.group(2)) + int(m_btn.group(4)) // 2
             since2 = len(vm.log())
             click_at(mon, bx, by)
-            m_rs = dd.wait_re(vm, r"\[RECYCLE64\] restore kind=\d+ name=(\S+) to=(\S+) rc=0 why=-\S* real=1",
+            m_rs = dd.wait_re(vm, r"\[RECYCLE64\] restore kind=\d+ name=(\S+) to=(\S+) rc=0 why=\S* real=1",
                               25, since2)
             check("恢复成功（[RECYCLE64] restore … real=1 rc=0 —— 真从 /Recycle 搬回）",
                   m_rs is not None, m_rs.group(0)[:130] if m_rs else "（缺行）")
-            m_bk = dd.wait_re(vm, r"\[DESKDIR\] scan why=restore \S+ added=(\d+)", 20, since2)
+            m_bk = dd.wait_re(vm, r"\[DESKDIR\] scan why=restore .*?added=(\d+)", 20, since2)
             check("恢复后桌面重新列出它（[DESKDIR] scan why=restore … added=1）",
                   m_bk is not None and m_bk.group(1) == "1", m_bk.group(0)[:120] if m_bk else "（缺行）")
         else:

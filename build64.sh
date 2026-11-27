@@ -85,7 +85,7 @@ CXXFLAGS="-target x86_64-elf -ffreestanding -nostdlib -fno-stack-protector -fno-
 # ★ 唯一真源护栏（v0.5.8 实测踩过）：这里**只能有一个** VIMTUOS_VERSION 定义。曾经因为编辑
 #   插行把旧版本号留在下面，后定义的 0.5.6 覆盖了 0.5.8 —— 内核串、设置页"关于"、ISO 的
 #   /VERSION 全都跟着错，而且构建照样 EXIT=0。下面这条断言让"多写一行"立刻构建失败。
-VIMTUOS_VERSION="0.12.4"   # ★ v0.12.4：真 HTTPS 打通（mbedTLS 3.6.2 + TLS 1.3 + 证书链校验 + 错证书必须失败）；CLOCK_REALTIME 改真墙钟；用户栈 16→64 KiB；内核网关路由 + TCP 校验和根因
+VIMTUOS_VERSION="0.12.9"   # ★ v0.12.4：真 HTTPS 打通（mbedTLS 3.6.2 + TLS 1.3 + 证书链校验 + 错证书必须失败）；CLOCK_REALTIME 改真墙钟；用户栈 16→64 KiB；内核网关路由 + TCP 校验和根因
 #   沿用自 v0.10.2 的启动加固（仅作说明）：真机加固（UEFI 载荷按真实大小读 + 屏幕报错 + MMIO BAR>=4GiB 闸门） + 桌面帧预算（热路径打点预算 + 2 MiB 大页映射 / shm 与帧缓冲 + 60 Hz 帧节拍）
 #   根因：同一块盘上的两条命令会重叠（命令列表 slot0 / 命令表 / DMA 暂存页池 g_dma[16] 全驱动共享），
 #   后果是**静默坏读**（ELF 魔数坏读、VFS BAD block、/etc/r3drv.conf 读错）与端口互相重启，
@@ -1750,6 +1750,31 @@ echo "==> ★ v0.5.11：把数据分区（VimtuFS2 卷）**并入安装载荷** 
 #     [CONF64] WARN NOT-PERSISTENT carrier=raw reason=no-vimtufs2-volume
 #   结果装好的系统一切修改（图标位置/壁纸/主题/用户名/密码/新建文件夹）重启即丢。
 #   修法：载荷 = 完整磁盘映像（主分区起点 + 卷扇区），安装器原样写盘 -> 目标盘自带卷。
+# ★ v0.12.9：**浏览器装卷**（NetSurf 核心 + 自研 fetcher + Edge 风格前端 -> /bin/browser）
+#   为什么放在这里：build64.sh 会清掉 build64/ 下的中间产物，所以 netsurf 三件套必须在本脚本里
+#   重新跑；装卷必须接在 TLS 装卷（tlsvol.img）之后、payload_embed 之前 —— 卷链是一条。
+echo "==> ★ v0.12.9：浏览器 /bin/browser（NetSurf 核心 + vimtu fetcher）"
+BROWSER_OK=0
+if [ -f third_party/netsurf/content/fetch.c ]; then
+    bash tools/netsurf_lib_build_win.sh  || echo "WARN: netsurf 依赖库构建失败"
+    bash tools/netsurf_core_build_win.sh || echo "WARN: netsurf 核心构建失败"
+    bash tools/browser_build_win.sh      || echo "WARN: browser.elf 构建失败"
+    [ -f "$BUILD/browser.elf" ] && BROWSER_OK=1
+else
+    echo "WARN: 缺 third_party/netsurf（先跑 py -3 tools/fetch_port_sources.py）—— 本次**没有** /bin/browser"
+fi
+BROWSER_VOL_IN="$BUILD/tlsvol.img"
+[ -f "$BROWSER_VOL_IN" ] || BROWSER_VOL_IN="$BUILD/viewervol.img"
+[ -f "$BROWSER_VOL_IN" ] || BROWSER_VOL_IN="$BUILD/peinfovol.img"
+if [ "$BROWSER_OK" = "1" ] && [ -f "$BROWSER_VOL_IN" ]; then
+    # 注意：**不带 --on**。发行卷里不能有 /etc/browser.on（那是夹具开关，带上会开机就拉起浏览器）。
+    "$PY" tools/browser_pack_win.py --vol-in "$BROWSER_VOL_IN" --vol-out "$BUILD/browservol.img" \
+          --browser "$BUILD/browser.elf" \
+          --system "$BUILD/system.img" --disk "$BUILD/sysdisk.img"
+else
+    echo "WARN: 浏览器装卷跳过（browser.elf 或输入卷缺失）—— 沿用 $BROWSER_VOL_IN"
+    [ -f "$BROWSER_VOL_IN" ] && cp "$BROWSER_VOL_IN" "$BUILD/browservol.img"
+fi
 "$PY" tools/payload_embed_win.py --disk "$BUILD/sysdisk.img" --system "$BUILD/system.img" \
 --parts-lba "$((RAW_LBA + RAW_SECTORS))" --out-sectors "$BUILD/sys_sectors.txt"
 SYS_SECTORS=$(cat "$BUILD/sys_sectors.txt")

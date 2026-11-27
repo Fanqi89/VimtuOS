@@ -296,7 +296,9 @@ static int g_em_px = FONT_SIZE_PX;    // 当前 em 高度（font_set_size64 改�
 #ifdef FONT64_LEGACY_AA
 #define FONT64_AA_SUB 1        // 反向对照：旧的"每行一条像素中心扫描线"
 #else
-#define FONT64_AA_SUB 8
+#define FONT64_AA_SUB 16       // ★ v0.12.9：8 -> 16（y 方向子扫描线翻倍：横笔画/撇捺的
+                               //   覆盖率从 8 档细化到 16 档，"生硬的台阶感"明显减轻；
+                               //   代价只在**光栅化一次**（字形进 LRU 缓存后不再重算）
 #endif
 #define FONT64_GEOM_SH 16      // 几何定点小数位（1/65536 px）
 
@@ -765,8 +767,32 @@ int font_current_face() {
 }
 
 // ---------------- 扁平化 ----------------
+// ★ v0.12.9：**轻量自动 hinting（竖向笔画相位对齐）**。
+//   现场：16px 汉字里 1px 竖笔如果正好骑在像素边界上（x=3.4..4.4），覆盖率会被劈成
+//   60%/40% 两条淡边 —— 屏幕上就是"边缘发虚 + 笔画极细 + 密集字缺笔画"。
+//   FreeType 的 autohinter 是"移动轮廓把笔画贴到网格上"；这里做一个**保守版**：
+//   只对**近竖直**的边（|dx| ≤ 1/12 px）把两个端点的 x 吸附到最近的 **1/4 px** 网格，
+//   位移上界 1/8 px（肉眼不可见），但 3.4/4.4 这种会变成 3.5/4.5 或 3.25/4.25 —— 覆盖率
+//   从 60/40 收敛到 75/25 或 100/0，笔画立刻变实、边缘变脆。
+//   斜边/曲线（|dx| 大）一概不动，所以字形形状不会跑。可用 FONT64_NO_HINT 关掉做对照。
+#define FONT64_HINT_QUARTER  (65536 / 4)      // 1/4 px（几何定点）
+#define FONT64_HINT_MAXDX    (65536 / 12)     // 只吸附 |dx| <= 1/12 px 的边
+#ifdef FONT64_NO_HINT
+static inline int32_t hint_x64(int32_t x) { return x; }
+#else
+static inline int32_t hint_x64(int32_t x) {
+    const int32_t q = FONT64_HINT_QUARTER;
+    return (x >= 0) ? (((x + q / 2) / q) * q) : -((((-x) + q / 2) / q) * q);
+}
+#endif
 static void add_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
-    if (ne < MAX_EDGES) { ex0[ne] = x0; ey0[ne] = y0; ex1[ne] = x1; ey1[ne] = y1; ne++; }
+    if (ne >= MAX_EDGES) return;
+#ifndef FONT64_NO_HINT
+    // 近竖直边：两端各自吸附（同一条边只沿 x 移动，长度/斜率几乎不变）
+    const int32_t dxa = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+    if (dxa <= FONT64_HINT_MAXDX) { x0 = hint_x64(x0); x1 = hint_x64(x1); }
+#endif
+    ex0[ne] = x0; ey0[ne] = y0; ex1[ne] = x1; ey1[ne] = y1; ne++;
 }
 
 static void add_quad(int32_t x0, int32_t y0, int32_t cx, int32_t cy, int32_t x1, int32_t y1) {
@@ -1240,6 +1266,32 @@ static inline int stem_curve64(int a) {
     return 255 - (inv * inv) / 255;
 }
 
+// ==================== ★ v0.12.9：UI 覆盖率 Gamma 校正（中英混排清晰锐利）====================
+// 现场（用户报）：中文笔画生硬、极细，密集字缺笔画，边缘发虚。
+// 根因是"线性覆盖率 + 无 hinting"：16px 汉字里 1px 竖笔骑在像素边界上（x=3.4..4.4）时，
+//   覆盖率被劈成 60%/40% 两条淡边；再乘 ui.stem=120 也只有 72%/48% —— 深色字落在浅底上
+//   就是"两条灰边"，肉眼读成"细 + 糊"；笔更细的（0.6px）直接掉到 30% 以下，密集字里就
+//   "缺胳膊少腿"。线性混合在 sRGB 空间还会把中间档整体压暗（gamma 错觉）。
+//   gamma 校正 = 把**覆盖率**按 a' = 255·(a/255)^(1/1.9) 抬起来（端点不动），
+//   60% -> 76%、40% -> 63%、30% -> 54%：笔画变实、边缘变脆，密集字不再掉笔。
+//   实现为"线性 + 曲线"的可调插值（ui.gamma = 0..100，默认 60）：
+//     a' = a + (curve(a) - a) * pct / 100      // curve(a) 就是上面那条 gamma 0.5 曲线
+//   与 v0.12.8 给终端用的曲线同一份数学（终端在中性灰底上做 100%，这里浅底做 60% ——
+//   再高就会把字压胖、把 AA 灰阶吃光）。
+static int g_gamma_pct = 60;     // 默认 60 = 中等 gamma（即使 /etc/fonts.conf 没读到，开机文字也清晰）；
+void font_set_gamma64(int pct) {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    g_gamma_pct = pct;
+}
+int font_get_gamma64() { return g_gamma_pct; }
+// 覆盖率 -> 校正后覆盖率（terminal 的 curve 与 UI 的 gamma 共用这一步）
+static inline int gamma_cov64(int a) {
+    if (g_gamma_pct <= 0) return a;
+    const int c = stem_curve64(a);
+    return a + (c - a) * g_gamma_pct / 100;
+}
+
 // ★ v0.10.7：行内直写版混合（不再跨文件调用 fb_get_pixel/fb_putpixel，也不再逐像素判裁剪）。
 //   p 指向**已被 fb_row64() 裁剪过**的像素；数学与 draw_blend 的 AA 分支完全相同。
 static inline void blend_px(uint32_t* p, uint32_t fg, int a) {
@@ -1248,7 +1300,8 @@ static inline void blend_px(uint32_t* p, uint32_t fg, int a) {
         a = a * g_stem_pct / 100;
         if (a > 255) a = 255;
     }
-    if (g_stem_curve) a = stem_curve64(a);          // ★ v0.12.8：终端细笔画保真
+    if (g_stem_curve) a = stem_curve64(a);          // ★ v0.12.8：终端细笔画保真（100% 曲线）
+    else a = gamma_cov64(a);                        // ★ v0.12.9：UI 覆盖率 gamma 校正（默认 60%）
     if (a >= 255) { *p = fg; return; }
     if (a <= 0) return;
     const uint32_t bg = *p;
@@ -1694,6 +1747,7 @@ int font_raster_text64(const char* s, uint8_t* out, int stride, int wmax, int h)
                         if (a > 255) a = 255;
                     }
                     if (g_stem_curve) a = stem_curve64(a);     // ★ v0.12.8：与 blend_px 同一曲线
+                    else a = gamma_cov64(a);                   // ★ v0.12.9：与 blend_px 同一 gamma
                     if (a > (int)drow[dx]) drow[dx] = (uint8_t)a;
                 }
             }

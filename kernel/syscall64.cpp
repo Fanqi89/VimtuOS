@@ -417,7 +417,26 @@ static void syscall64_serial_linewise64(const char* p, uint64_t len);
 static uint8_t g_lx_writebuf64[4096];
 static void lx64_copy_from_user64(void* dst, uint64_t uva, uint64_t n);
 // 只画一行（覆盖上一次的内容）：用户态日志很短，够证明"输出到了屏幕"。
+// ★ v0.12.9：**屏幕镜像改成夹具开关，默认关**。
+//   用户点名的“启动图片查看器时左上角弹出的黑底白字调试小窗”就是这里：
+//   每个 ring3 的 write(1) 都会在 (8,8) 画一行白字黑底并 fb_flip_region
+//   直接上屏，**绕过合成器**（所以只能等桌面下一次整体重绘才被盖掉）。
+//   串口一字不改（所有验收都读串口）；要做“用户态输出到屏幕”取证时，
+//   在卷里放 /etc/lxconsole.on 就能把旧行为原样打开。
+static int g_lx_screen_echo = -1;      // -1 = 还没查过
+static int lx_screen_echo64(void) {
+    if (g_lx_screen_echo >= 0) return g_lx_screen_echo;
+    char probe = 0;
+    g_lx_screen_echo = (vfs64_read64("/etc/lxconsole.on", &probe, 1) > 0) ? 1 : 0;
+    dbg64_line_begin64();
+    dbg64_str("[SYSCALL] screen echo=");
+    dbg64_str(g_lx_screen_echo ? "on (/etc/lxconsole.on)" : "off (serial only)");
+    dbg64_nl();
+    dbg64_line_end64();
+    return g_lx_screen_echo;
+}
 static void syscall64_screen_puts64(const char* s, uint64_t n) {
+    if (!lx_screen_echo64()) return;                 // 默认不画屏幕（不再留调试小窗）
     if (fb_width() <= 0) return;                     // 还没建帧缓冲（理论上不会）
     static char line[100];
     uint32_t k = 0;
@@ -765,8 +784,9 @@ static void syscall64_serial_linewise64(const char* p, uint64_t len) {
 // ★ A4-2a：控制台输出 = 串口（总是）+ 屏幕（fd 1 才画；fd 2 = 只串口，与旧行为一致）。
 //   fd64 的"控制台 tty"对象通过下面的 extern "C" 钩子复用同一份实现（弱符号，见 fd64.cpp）。
 static void lx64_console_out64(const char* p, uint64_t len, bool screen) {
-    syscall64_serial_linewise64(p, len);      // ★ v0.9.5：换成按行原子的版本（见上）
-    if (screen) syscall64_screen_puts64(p, len);
+    syscall64_serial_linewise64(p, len);      // ★ v0.9.5：按行原子（见上）
+    // ★ v0.12.9：屏幕镜像受 /etc/lxconsole.on 控制（默认关）—— 见 syscall64_screen_puts64 的说明
+    if (screen && lx_screen_echo64()) syscall64_screen_puts64(p, len);
 }
 extern "C" void syscall64_console_write64(const char* buf, int len) {
     if (buf && len > 0) lx64_console_out64(buf, (uint64_t)len, true);

@@ -2295,7 +2295,34 @@ static void dock_open_app64(int app_id) {
         case APP_ID_SETTINGS: app_settings_open64(); break;
         case APP_ID_TMGR:     app_tmgr_open64();     break;
         case APP_ID_MONITOR:  app_monitor_open64();  break;
-        default: break;
+        default: {
+            // ★ v0.12.9：**卷程序**（app_id 来自注册表的稳定哈希，>=1000）—— 以前这里是
+            //   `default: break;`，点 Dock 上固定的 图片查看器/浏览器 什么都不发生、连日志都没有。
+            //   "除终端外不能多开"的直接原因就在这一行：终端是内核窗口（app_id=3）走得到 case，
+            //   卷程序全是 ring3 进程，只能从这里出发。
+            //   现在按 app_id 反查注册表里的 exec，走**开始菜单同一条**启动链
+            //   （app_launch_exec64 -> appload -> proc64，每按一次 = 一个新进程 = 真多开）。
+            const int rn = app64_registry_count64();
+            const char* ex = nullptr;
+            for (int i = 0; i < rn; i++) {
+                if (app64_reg_id64(i) == app_id) { ex = app64_reg_exec64(i); break; }
+            }
+            dbg64_line_begin64();
+            dbg64_str("[DOCK64] press app=");
+            dbg64_dec((uint64_t)app_id);
+            if (ex && ex[0] == '/') {
+                dbg64_str(" action=open-launch exec=");
+                dbg64_str(ex);
+                dbg64_nl();
+                dbg64_line_end64();
+                (void)app_launch_exec64(ex, "dock");
+            } else {
+                dbg64_str(" action=open-miss (no registry exec)");
+                dbg64_nl();
+                dbg64_line_end64();
+            }
+            break;
+        }
     }
 }
 
@@ -3441,9 +3468,15 @@ static int la_eq64(const char* a, const char* b) {
 int  task_create64(const char* name, void (*entry)(void*), void* arg);   // kernel/task64.h
 void task_sleep64(uint32_t ms);
 #define APPLOAD_VIA_MAX 24
-static char g_aload_exec[PROC64_PATH_MAX];
-static char g_aload_via[APPLOAD_VIA_MAX];
-static volatile int g_aload_pending = 0;
+// ★ v0.12.9：**队列深度 1 -> 4**。原来只有一个槽 + 一份 exec 字符串：
+//   连点两下时第一个请求会被直接覆盖而且**无日志无错码**（多开偶发“没反应”的一个来源）。
+//   现在是环形队列，队满时如实打 DROPPED。
+#define APPLOAD_Q 4
+static char g_aload_exec[APPLOAD_Q][PROC64_PATH_MAX];
+static char g_aload_via[APPLOAD_Q][APPLOAD_VIA_MAX];
+static volatile int g_aload_head = 0;      // 哪一条在等（读）
+static volatile int g_aload_tail = 0;      // 下一个空位（写）
+static volatile int g_aload_pending = 0;   // 队列里的条数（持续跟踪，供诊断）
 static int g_aload_task = -1;
 
 static void appload_copy(char* d, const char* s, int cap) {
@@ -3458,9 +3491,11 @@ static void appload_task(void* arg) {
     for (;;) {
         if (!g_aload_pending) { task_sleep64(2); continue; }
         char exec[PROC64_PATH_MAX], via[APPLOAD_VIA_MAX];
-        appload_copy(exec, g_aload_exec, PROC64_PATH_MAX);
-        appload_copy(via, g_aload_via, APPLOAD_VIA_MAX);
-        g_aload_pending = 0;
+        const int hd = g_aload_head;
+        appload_copy(exec, g_aload_exec[hd], PROC64_PATH_MAX);
+        appload_copy(via, g_aload_via[hd], APPLOAD_VIA_MAX);
+        g_aload_head = (hd + 1) % APPLOAD_Q;
+        g_aload_pending--;
         const uint64_t t0 = ticks64();
         int pid = proc64_create64("app", 0);
         int rc = -1;
@@ -3487,9 +3522,24 @@ static void appload_task(void* arg) {
 }
 
 static void appload_push(const char* exec, const char* via) {
-    appload_copy(g_aload_exec, exec, PROC64_PATH_MAX);
-    appload_copy(g_aload_via, via ? via : "-", APPLOAD_VIA_MAX);
-    g_aload_pending = 1;
+    // 队满（已有 APPLOAD_Q 条在等）：如实打 DROPPED，不假装成功
+    if (g_aload_pending >= APPLOAD_Q) {
+        dbg64_line_begin64();
+        dbg64_str("[APPREG64] launch DROPPED exec=");
+        dbg64_str(exec ? exec : "?");
+        dbg64_str(" via=");
+        dbg64_str(via ? via : "-");
+        dbg64_str(" reason=queue-full depth=");
+        dbg64_dec((uint64_t)g_aload_pending);
+        dbg64_nl();
+        dbg64_line_end64();
+        return;
+    }
+    const int tl = g_aload_tail;
+    appload_copy(g_aload_exec[tl], exec, PROC64_PATH_MAX);
+    appload_copy(g_aload_via[tl], via ? via : "-", APPLOAD_VIA_MAX);
+    g_aload_tail = (tl + 1) % APPLOAD_Q;
+    g_aload_pending++;
     if (g_aload_task < 0) g_aload_task = task_create64("appload", appload_task, nullptr);
 }
 

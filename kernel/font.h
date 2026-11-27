@@ -88,6 +88,12 @@ int  font_ui_aa64();
 // 覆盖率）抬到 60~70%，不再"淡到看不见"（用户报的 'h' 读成 'n'）；纯黑/纯白两端不变，
 // 仍然是无彩色灰阶。只由 kernel/terminal64.cpp 在画一个字符格期间打开。
 void font_set_stem_curve64(int on);
+// ==================== ★ v0.12.9：UI 覆盖率 Gamma 校正 ====================
+// 用户报"中文笔画生硬/极细、密集字缺笔画、边缘发虚"。覆盖率线性混合在浅底深字上会把
+// 1px 竖笔（60%/40% 劈边）显示成两条灰边。gamma 校正把中间覆盖率按
+// a' = a + (curve(a) - a) * pct / 100 抬起来（端点不动），pct = 0..100，默认 60。
+void font_set_gamma64(int pct);
+int  font_get_gamma64();
 int  font_stem_curve64();
 // 返回：0 = 中文面就绪（或本来就在内核里）；1 = 这次没到手（可以再调）；2 = 已确认取不到（不再重试）。
 int  font_external_load64();

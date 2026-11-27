@@ -846,6 +846,9 @@ int app64_boot_seed_shortcuts64() {
     static const ScSeed64 kSeeds[] = {
         { "/apps/image-viewer.lnk",
           "name=图片查看器\nen=Image Viewer\nexec=/bin/viewer\nicon=image-viewer\n" },
+        // ★ v0.12.9：浏览器进开始菜单（与图片查看器同一套：种子 -> 动态扫描 -> 注册表）
+        { "/apps/browser.lnk",
+          "name=浏览器\nen=Web Browser\nexec=/bin/browser\nicon=globe\n" },
         { "/apps/micropython.lnk",
           "name=MicroPython\nen=MicroPython\nexec=/bin/mp\nicon=terminal\n" },
         { "/apps/text-editor.lnk",

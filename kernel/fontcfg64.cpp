@@ -21,6 +21,7 @@
 #define FONTCFG64_PATH  "/etc/fonts.conf"
 #define FONTCFG64_MAX   1024
 
+static int  g_gamma = 60;           // ★ v0.12.9：覆盖率 gamma 校正强度（0..100）
 static int  g_stem = 120;             // 默认：笔画加厚 20%（用户反馈"颜色过浅/不够清晰"）
 static int  g_aa   = 1;
 static int  g_loaded = 0;
@@ -35,6 +36,7 @@ static const char kDefaultConf[] =          // ★ 必须是数组：写成指�
     "# 角色 -> 字体面；字体文件是构建期子集并内嵌的 4 个面，运行期不能换文件\n"
     "ui.family       = Noto Sans\n"
     "ui.stem         = 120\n"
+    "ui.gamma        = 60\n"
     "ui.antialias    = on\n"
     "mono.family     = Sarasa Mono SC\n"
     "mono.mode       = mono\n"
@@ -84,6 +86,17 @@ static int fc_apply_line(const char* line) {
             if (v > 1000) { v = 1000; break; }
         }
         if (any) { g_stem = v; return 1; }
+        return 0;
+    }
+    if (fc_starts(p, "ui.gamma")) {
+        int v = 0, any = 0;
+        for (int i = 0; i < vlen; i++) {
+            if (val[i] < '0' || val[i] > '9') break;
+            v = v * 10 + (val[i] - '0');
+            any = 1;
+            if (v > 100) { v = 100; break; }
+        }
+        if (any) { g_gamma = v; return 1; }
         return 0;
     }
     if (fc_starts(p, "ui.antialias")) {
@@ -171,6 +184,7 @@ int fontcfg64_init64() {
 
     // 落地到字体层：笔画加厚 + UI 抗锯齿开关（终端的 mono 由终端的绘制路径强制，不受这里影响）
     font_set_stem64(g_stem);
+    font_set_gamma64(g_gamma);   // ★ v0.12.9：UI 覆盖率 gamma（中英混排清晰锐利）
     font_set_ui_aa64(g_aa);
     fc_log("load");
     dbg64_line_begin64();
@@ -180,6 +194,8 @@ int fontcfg64_init64() {
     dbg64_dec((uint64_t)applied);
     dbg64_str(" stem=");
     dbg64_dec((uint64_t)font_stem64());
+    dbg64_str(" gamma=");
+    dbg64_dec((uint64_t)font_get_gamma64());
     dbg64_str(" ui_aa=");
     dbg64_dec((uint64_t)font_ui_aa64());
     dbg64_nl();
