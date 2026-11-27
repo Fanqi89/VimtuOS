@@ -237,7 +237,8 @@ bool vimtu_shell_click(struct vimtu_app *app, int x, int y)
         addr_rect(&ax0, &ay0, &ax1, &ay1);
         if (x >= ax0 && x < ax1 && y >= ay0 && y < ay1) {
             app->url_editing = true;
-            vimtu_log("[BROWSER] address input UNVERIFIED\n");
+            app->url_fresh = true;          /* 第一个字符把旧 URL 清掉 */
+            vimtu_log("[BROWSER] address edit start\n");
             return true;
         }
     }

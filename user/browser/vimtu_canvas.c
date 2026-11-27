@@ -316,12 +316,15 @@ void vimtu_canvas_text(struct vimtu_canvas *c, const struct plot_font_style *fst
             if (g.alpha != NULL && ucs4 != (uint32_t)' ') {
                 draw_glyph(c, pen, baseline, &g, scale, fg);
             }
-            pen += g.adv * scale;
+            /* ★ v0.12.6：推进量必须与 layout->width 完全一致（同一个函数），否则
+             *   "量出来 800px、画出来 700px"，行内后缀与后续片段就会错位/重叠。
+             *   原来这里用字模自带的 g.adv（8），而 layout 用 VIMTU_FONT_ADV —— 两个真源。 */
+            pen += vimtu_font_advance(fstyle);
         } else {
             /* 缺字（非 ASCII）：画一个下划线状的替代块。为什么不画"豆腐块"：
              * 中文页面满屏豆腐块会盖住版面判断，只留下一条短横更诚实。 */
             vimtu_canvas_fill(c, pen + scale, baseline - 2 * scale, 6 * scale, scale, fg);
-            pen += VIMTU_FONT_ADV * scale;
+            pen += vimtu_font_advance(fstyle);
         }
         off = nxt;
     }

@@ -40,7 +40,8 @@ struct vimtu_app {
     bool can_reload;
     bool throbber;                       /* 正在加载（↻ 按钮画成高亮） */
 
-    bool url_editing;                    /* 地址栏编辑态：未实现，仅标记 */
+    bool url_editing;                    /* 地址栏编辑态（v0.12.6：已接真键盘输入） */
+    bool url_fresh;                      /* 刚点进地址栏：第一个字符把旧 URL 清掉（像 Edge 的"全选"） */
     bool quit;
 };
 

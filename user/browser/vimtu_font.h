@@ -22,7 +22,10 @@
 
 #define VIMTU_FONT_EM       16   /* em 框高（像素，scale=1） */
 #define VIMTU_FONT_BASELINE 15   /* em 顶 -> 基线（像素，scale=1） */
-#define VIMTU_FONT_ADV      8    /* 单宽 advance（像素，scale=1） */
+/* ★ v0.12.6：单宽 advance = 9（不是 8）。
+ *   字模字身宽 8~9 px（'m' 是 9），按 8 步进时相邻字母**紧贴**、宽字会压到下一个字母，
+ *   屏幕上就是"文字重叠/糊在一起"。9 = 8px 字身 + 1px 字距，且 layout->width 用同一把尺子。 */
+#define VIMTU_FONT_ADV      9    /* 单宽 advance（像素，scale=1） */
 
 struct plot_font_style;
 

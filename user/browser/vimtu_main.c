@@ -173,6 +173,9 @@ static void handle_page_pointer(int x, int y, browser_mouse_state state, bool cl
     }
 }
 
+/* navigate_to 的定义在文件后半（第 ⑤ 段之前），键盘事件处理要用它 */
+static bool navigate_to(struct browser_window *bw, const char *url_str);
+
 static uint32_t map_key(uint32_t code)
 {
     switch (code) {
@@ -290,13 +293,74 @@ static void handle_seat_event(const struct Wl64SeatEvent *se)
         bool handled = false;
         uint32_t code = se->ev.code;
 
+        /* ★ v0.12.6：没有别的键盘消费者，所以**任意可打印键自动聚焦地址栏**
+         *   （像浏览器的"直接打字即搜索/导航"）。这让"启动后直接敲字"可用，
+         *   也免掉"必须先点一下地址栏"那一步 —— 本机还点不准鼠标。 */
+        if (!g_app.url_editing && code >= 0x20u && code < 0x7Fu) {
+            g_app.url_editing = true;
+            g_app.url_fresh = true;
+            vimtu_log("[BROWSER] address implicit focus\n");
+        }
+
         if (g_app.url_editing) {
-            /* 地址栏编辑态：键盘输入**没有接**（见报告里的 UNVERIFIED 清单）。
-             * ESC 先退出这个状态，免得用户被"键盘没反应"困住。 */
-            if (code == 0x1Bu) {
+            /* ★ v0.12.6：地址栏**真输入**。
+             *   code 就是可打印 ASCII（kernel/input64.h：KEY_DOWN 的 code = 键盘缓冲口径的 ASCII）。
+             *   回车 = 真导航（browser_window_navigate + BW_NAVIGATE_HISTORY，进历史，能后退回来）。 */
+            if (code == 0x1Bu) {                      /* ESC：取消编辑 */
                 g_app.url_editing = false;
+                vimtu_log("[BROWSER] address edit cancel\n");
+                g_app.need_paint = true;
+                break;
             }
-            vimtu_log("[BROWSER] address input UNVERIFIED code=0x%x\n", (unsigned)code);
+            if (code == 0x0Du || code == 0x0Au) {     /* 回车：导航 */
+                size_t n = strlen(g_app.url);
+                char target[600];
+
+                g_app.url_editing = false;
+                /* 没写协议就补 https://（真浏览器都这么干；不然 nsurl 会判非法 URL） */
+                if (n > 0 && strstr(g_app.url, "://") == NULL) {
+                    snprintf(target, sizeof(target), "https://%s", g_app.url);
+                } else {
+                    snprintf(target, sizeof(target), "%s", g_app.url);
+                }
+                if (n == 0) {
+                    vimtu_log("[BROWSER] address nav empty ignored\n");
+                } else if (g_app.bw != NULL && navigate_to(g_app.bw, target)) {
+                    snprintf(g_app.url, sizeof(g_app.url), "%s", target);
+                    vimtu_log("[BROWSER] address nav url=%s\n", g_app.url);
+                } else {
+                    vimtu_log("[BROWSER] address nav FAILED url=%s\n", target);
+                }
+                g_app.need_paint = true;
+                break;
+            }
+            if (code == 0x08u || code == 0x7Fu) {     /* 退格 */
+                size_t n = strlen(g_app.url);
+
+                if (n > 0) {
+                    g_app.url[n - 1] = '\0';
+                    vimtu_log("[BROWSER] address key bs len=%u\n", (unsigned)(n - 1));
+                }
+                g_app.need_paint = true;
+                break;
+            }
+            if (code >= 0x20u && code < 0x7Fu) {      /* 可打印 ASCII */
+                size_t n = strlen(g_app.url);
+
+                if (g_app.url_fresh) {                /* 第一个字符：清掉旧 URL */
+                    g_app.url_fresh = false;
+                    g_app.url[0] = '\0';
+                    n = 0;
+                }
+                if (n + 1 < sizeof(g_app.url)) {
+                    g_app.url[n] = (char)code;
+                    g_app.url[n + 1] = '\0';
+                    vimtu_log("[BROWSER] address key '%c' len=%u url=%s\n",
+                              (char)code, (unsigned)(n + 1), g_app.url);
+                }
+                g_app.need_paint = true;
+                break;
+            }
             break;
         }
         if (g_app.bw != NULL && code < 0x100u) {
@@ -695,6 +759,7 @@ static int vimtu_main(int argc, char **argv, char **envp)
     {
     uint64_t next_tick = now_ms() + 2000;
     uint64_t last_keepalive = now_ms();   /* 保活重贴的上一次时间 */
+    uint64_t last_focus_req = 0;          /* 上次申请键盘焦点的时间（0 = 还没申请过） */
     uint64_t watchdog_at = now_ms() + WATCHDOG_MS;
     
 
@@ -713,6 +778,17 @@ static int vimtu_main(int argc, char **argv, char **envp)
         }
         if (timeout > 1000) {
             timeout = 1000;
+        }
+
+        /* ★ v0.12.6：**键盘焦点必须显式申请**（V64_EV_FLAG_FOCUS = 0x1）。
+         *   本内核只在客户端申请后把 PS/2 键事件路由到它的 surface；不申请就一个键都收不到
+         *   （现场：sendkey 敲 11 个字符，串口上一条 [BROWSER] address 都没有）。
+         *   每 2 s 重申一次：窗口被重新聚焦、合成器重建后能自愈。 */
+        if (now_ms() - last_focus_req > 2000) {
+            struct V64Event dummy[1];
+
+            last_focus_req = now_ms();
+            (void)v64_input_poll(dummy, 0, 1u);
         }
 
         /* wl_dispatch 同时做两件事：把已 commit 的帧合成上屏、取 seat 事件。
