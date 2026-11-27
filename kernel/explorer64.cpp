@@ -3206,12 +3206,14 @@ static void draw_filemenu(void) {
     const char* items[2];
     items[0] = gui64_tr("Open Terminal", "打开终端");
     items[1] = gui64_tr("Close window", "关闭窗口");
-    p2ui_popup64(x, y, w, h, THEME64_POP_R_SMALL, THEME64_POP_R_SMALL,
+    // ★ v0.12.8：圆角/行距/高亮与**桌面右键菜单**逐像素同一口径（原来用 POP_R_SMALL=10 且行内
+    //   文字按 +5 硬定位 -> 26px 行高里 22px 字身溢到下一条，看着"崩坏"）。
+    p2ui_popup64(x, y, w, h, THEME64_POP_R, THEME64_POP_R,
                  t, t->client_bg, t->dark ? THEME64_A_POP_DARK : THEME64_A_POP);
     for (int i = 0; i < 2; i++) {
         const int iy = y + 2 + i * 26;
         if (g_hover_id == IDC_FILE + 10 + i)
-            gfx64_fill_round64(x + 4, iy, w - 8, 24, THEME64_R_BUTTON, t->sel_bg, 110);
+            gfx64_fill_round64(x + 4, iy + 2, w - 8, 24 - 4 + 2, THEME64_R_BUTTON, t->sel_bg, 110);
         p2ui_text64(x + 12, iy + (24 - p2ui_line_h64()) / 2, items[i], t->text);
     }
 }
@@ -3227,18 +3229,24 @@ static void draw_ctxmenu(void) {
     //   几何（EXP_CTX_W / EXP_CTX_ITEM_H / 偏移 2）保持不变 —— 命中测试与既有验收坐标不受影响。
     const Theme64Tokens* t = theme64_tokens64();
     const int x = g_ctx_x, y = g_ctx_y, h = exp_ctx_height();
-    p2ui_popup64(x, y, EXP_CTX_W, h, THEME64_POP_R_SMALL, THEME64_POP_R_SMALL,
+    // ★ v0.12.8：与桌面菜单**同一口径**（半径 POP_R、左侧强调圆点、行内垂直居中、圆角 hover 内缩 2px）
+    p2ui_popup64(x, y, EXP_CTX_W, h, THEME64_POP_R, THEME64_POP_R,
                  t, t->client_bg, t->dark ? THEME64_A_POP_DARK : THEME64_A_POP);
+    const int line_h = p2ui_line_h64();
     for (int k = 0; k < exp_ctx_count(); k++) {
         const int iy = y + 2 + k * EXP_CTX_ITEM_H;
         const bool en = exp_ctx_enabled(k);
         if (en && g_hover_id == IDC_CTX_BASE + k)
-            gfx64_fill_round64(x + 4, iy, EXP_CTX_W - 8, EXP_CTX_ITEM_H - 2,
+            gfx64_fill_round64(x + 4, iy + 2, EXP_CTX_W - 8, EXP_CTX_ITEM_H - 4,
                                THEME64_R_BUTTON, t->sel_bg, 110);
         const uint32_t fg = en ? t->text : t->text_dim;
-        txt_clip(x + 12, iy + 5, exp_ctx_label(k), fg, EXP_CTX_W - 20);
-        // 置灰项与桌面菜单一致地给一个小圆点标记（"做不到的项如实可见"）
-        if (!en) p2ui_fill_circle64(x + EXP_CTX_W - 12, iy + EXP_CTX_ITEM_H / 2, 2, fg, 160);
+        // 左侧圆点：可用项 = 强调色（与桌面菜单同一个 3px 圆点），置灰项 = 暗色小点
+        if (en) p2ui_fill_circle64(x + 10, iy + EXP_CTX_ITEM_H / 2, 3, t->accent, 220);
+        else    p2ui_fill_circle64(x + 10, iy + EXP_CTX_ITEM_H / 2, 3, fg, 200);
+        // 文字垂直居中（原来硬编码 +5，26px 行里 22px 字身会溢到下一条 —— 看着像"排版崩了"）
+        int ty = iy + (EXP_CTX_ITEM_H - line_h) / 2;
+        if (ty < iy + 1) ty = iy + 1;
+        txt_clip(x + 22, ty, exp_ctx_label(k), fg, EXP_CTX_W - 30);
     }
 }
 // 内联编辑框（重命名：画在条目自己的名字行上；新建文件夹：画在"下一个空位"）
@@ -3259,7 +3267,7 @@ static void draw_props(void) {
     // ★★ v0.11.1 统一 UI：属性面板原来也是直角白底 + 硬编码 rgb(240,240,240)/rgb(0,60,120)。
     //   现在与菜单同一套：圆角弹窗底 + 主题标题色 + 主题分隔线。
     const Theme64Tokens* t = theme64_tokens64();
-    p2ui_popup64(x, y, w, h, THEME64_POP_R_SMALL, THEME64_POP_R_SMALL,
+    p2ui_popup64(x, y, w, h, THEME64_POP_R, THEME64_POP_R,
                  t, t->client_bg, t->dark ? THEME64_A_POP_DARK : THEME64_A_POP);
     p2ui_text64(x + 12, y + 6, gui64_tr("Properties", "属性"), t->accent);
     frect(x + 8, y + 24, w - 16, 1, t->sel_border);   // 主题分隔线（Theme64Tokens 没有 line 字段）

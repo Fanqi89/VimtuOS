@@ -83,6 +83,12 @@ int  font_stem64();
 // UI 是否抗锯齿：0 = 连 UI 也走单色阈值（fontconfig 里 ui.antialias = off 时）
 void font_set_ui_aa64(int on);
 int  font_ui_aa64();
+// ==================== ★ v0.12.8：终端笔画保真曲线 ====================
+// 打开后，抗锯齿覆盖率走 a' = 255 - (255-a)^2/255（gamma 0.5）：细笔画（1px 竖笔 30~45%
+// 覆盖率）抬到 60~70%，不再"淡到看不见"（用户报的 'h' 读成 'n'）；纯黑/纯白两端不变，
+// 仍然是无彩色灰阶。只由 kernel/terminal64.cpp 在画一个字符格期间打开。
+void font_set_stem_curve64(int on);
+int  font_stem_curve64();
 // 返回：0 = 中文面就绪（或本来就在内核里）；1 = 这次没到手（可以再调）；2 = 已确认取不到（不再重试）。
 int  font_external_load64();
 void font_external_give_up64();

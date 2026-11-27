@@ -646,6 +646,90 @@ int icons64_handle64(int kind) {
     return -1;
 }
 
+// ==================== ★ v0.12.8：图标缩放重采样（Dock/开始菜单/桌面图标边缘抗锯齿）====================
+// 现场（用户报"图标边缘不光滑"）：旧实现是**最近邻点采样**
+//     sy = j * im->h / size;  sx = i * im->w / size;
+// 48/64px 的源图缩到 24/28/40 时，非整数比例会整块丢掉/重复源像素 —— 圆角与斜线全成台阶。
+// 现在：
+//   * **缩小**（源 > 目标）：对目标像素覆盖的源方框做**面积平均**（box filter）。
+//     48→28 这种 1.71 倍缩小，box 是唯一不变形、不抖动的做法（双线性在非整数比例下仍会闪）；
+//   * **放大**（源 < 目标）：双线性（按目标像素中心取 2x2 权重）。
+//   * 颜色一律按 **alpha 预乘**累加，最后再除回 alpha —— 图标是带透明边缘的 PNG，
+//     直接平均非预乘颜色会让边缘发黑（脏边）。
+// 返回的 col 是 0xRRGGBB；aout 是 0..255 覆盖率。aout==0 表示该目标像素全透明。
+static void ic_resample64(const Img64* im, int dx, int dy, int dw, int dh,
+                          uint32_t* col, int* aout) {
+    const int sw = im->w, sh = im->h;
+    *col = 0; *aout = 0;
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+    if (dw >= sw || dh >= sh) {
+        // ---- 放大：双线性（目标像素中心 -> 源坐标）----
+        const int64_t fx2 = ((int64_t)dx * 2 + 1) * sw - dw;      // 2*(dx+0.5)*sw/dw - 1，放大 1 倍精度
+        const int64_t fy2 = ((int64_t)dy * 2 + 1) * sh - dh;
+        int sx0 = (int)(fx2 / (dw * 2)), sy0 = (int)(fy2 / (dh * 2));
+        int wx = (int)((fx2 - (int64_t)sx0 * dw * 2) * 255 / (dw * 2));
+        int wy = (int)((fy2 - (int64_t)sy0 * dh * 2) * 255 / (dh * 2));
+        if (wx < 0) wx = 0;
+        if (wy < 0) wy = 0;
+        if (wx > 255) wx = 255;
+        if (wy > 255) wy = 255;
+        int sx1 = sx0 + 1, sy1 = sy0 + 1;
+        if (sx0 < 0) sx0 = 0;
+        if (sy0 < 0) sy0 = 0;
+        if (sx1 >= sw) sx1 = sw - 1;
+        if (sy1 >= sh) sy1 = sh - 1;
+        uint32_t srr = 0, sgg = 0, sbb = 0, saa = 0;
+        const int xs[2] = { sx0, sx1 };
+        const int ys[2] = { sy0, sy1 };
+        const int wxs[2] = { 255 - wx, wx };
+        const int wys[2] = { 255 - wy, wy };
+        for (int b = 0; b < 2; b++) {
+            for (int a = 0; a < 2; a++) {
+                const uint32_t wgt = (uint32_t)(wxs[a] * wys[b]);
+                if (!wgt) continue;
+                const uint32_t c = im->px[(uint64_t)ys[b] * (uint64_t)sw + (uint64_t)xs[a]];
+                const uint32_t ca = ((c >> 24) & 0xFFu) * wgt / 255u;      // 预乘权重
+                srr += ((c >> 16) & 0xFFu) * ca;
+                sgg += ((c >> 8) & 0xFFu) * ca;
+                sbb += (c & 0xFFu) * ca;
+                saa += ca;
+            }
+        }
+        if (!saa) return;
+        *col = (((srr / saa) & 0xFFu) << 16) | (((sgg / saa) & 0xFFu) << 8) | ((sbb / saa) & 0xFFu);
+        *aout = (int)(saa / 255u);
+        return;
+    }
+    // ---- 缩小：面积平均（box filter）----
+    int sx0 = (int)((int64_t)dx * sw / dw);
+    int sx1 = (int)(((int64_t)dx + 1) * sw / dw);
+    int sy0 = (int)((int64_t)dy * sh / dh);
+    int sy1 = (int)(((int64_t)dy + 1) * sh / dh);
+    if (sx1 <= sx0) sx1 = sx0 + 1;
+    if (sy1 <= sy0) sy1 = sy0 + 1;
+    if (sx0 < 0) sx0 = 0;
+    if (sy0 < 0) sy0 = 0;
+    if (sx1 > sw) sx1 = sw;
+    if (sy1 > sh) sy1 = sh;
+    uint32_t srr = 0, sgg = 0, sbb = 0, saa = 0;
+    int n = 0;
+    for (int yy = sy0; yy < sy1; yy++) {
+        const uint32_t* row = im->px + (uint64_t)yy * (uint64_t)sw;
+        for (int xx = sx0; xx < sx1; xx++) {
+            const uint32_t c = row[xx];
+            const uint32_t ca = (c >> 24) & 0xFFu;
+            srr += ((c >> 16) & 0xFFu) * ca;
+            sgg += ((c >> 8) & 0xFFu) * ca;
+            sbb += (c & 0xFFu) * ca;
+            saa += ca;
+            n++;
+        }
+    }
+    if (!n || !saa) return;
+    *col = (((srr / saa) & 0xFFu) << 16) | (((sgg / saa) & 0xFFu) << 8) | ((sbb / saa) & 0xFFu);
+    *aout = (int)(saa / (uint32_t)n);
+}
+
 int icons64_draw_a64(int h, int x, int y, int size, uint32_t palette, int alpha) {
     int kind = -1;
     if (h >= 1 && h <= g_n) kind = (int)g_e[h - 1].kind;
@@ -654,13 +738,16 @@ int icons64_draw_a64(int h, int x, int y, int size, uint32_t palette, int alpha)
     const Img64* im = ic_bitmap(kind, size, nullptr);
     if (!im) return -1;
     const uint32_t col = palette & 0xFFFFFFu;
+    // ★ v0.12.8：不再点采样 —— 走 ic_resample64（缩小=面积平均 / 放大=双线性，alpha 预乘）
+    //   注意：`col` 仍是**主题 palette 着色**（图标包是单色 alpha 掩膜），
+    //   所以这里只需要重采样 **alpha 覆盖率**，颜色继续用 palette；
+    //   但边缘像素的 alpha 现在是"覆盖率"而不是"最近邻取样值"，圆弧/斜线才会平滑过渡。
     for (int j = 0; j < size; j++) {
-        const int sy = (int)((int64_t)j * im->h / size);
         for (int i = 0; i < size; i++) {
-            const int sx = (int)((int64_t)i * im->w / size);
-            const uint32_t c = im->px[(uint64_t)sy * (uint64_t)im->w + (uint64_t)sx];
-            int a = (int)((c >> 24) & 0xFFu);
-            if (a == 0) continue;
+            uint32_t dummy_col = 0;
+            int a = 0;
+            ic_resample64(im, i, j, size, size, &dummy_col, &a);
+            if (a <= 0) continue;
             if (alpha < 255) a = a * alpha / 255;
             if (a <= 0) continue;
             const int px = x + i, py = y + j;
@@ -692,14 +779,15 @@ int icons64_export_rgba64(int kind, int want, uint8_t* dst, int dw, int dh, uint
     const uint8_t r = (uint8_t)((palette >> 16) & 0xFFu);
     const uint8_t g = (uint8_t)((palette >> 8) & 0xFFu);
     const uint8_t b = (uint8_t)(palette & 0xFFu);
+    // ★ v0.12.8：alpha 走同一套重采样（原来是点采样 -> ring3 合成器里的图标同样有台阶）
     for (int j = 0; j < dh; j++) {
-        const int sy = (int)((int64_t)j * im->h / dh);
         for (int i = 0; i < dw; i++) {
-            const int sx = (int)((int64_t)i * im->w / dw);
-            const uint32_t c = im->px[(uint64_t)sy * (uint64_t)im->w + (uint64_t)sx];
+            uint32_t dummy = 0;
+            int a = 0;
+            ic_resample64(im, i, j, dw, dh, &dummy, &a);
             uint8_t* q = dst + (((size_t)j * (size_t)dw) + (size_t)i) * 4u;
             q[0] = r; q[1] = g; q[2] = b;
-            q[3] = (uint8_t)((c >> 24) & 0xFFu);
+            q[3] = (uint8_t)(a < 0 ? 0 : (a > 255 ? 255 : a));
         }
     }
     return 0;

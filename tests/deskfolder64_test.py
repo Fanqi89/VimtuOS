@@ -437,7 +437,40 @@ def main():
         #     ③ 左下/右下**角点**：A ≠ B -> 底边是全宽直线（没被啃）
         shot_a = os.path.join(tmp, "deco_on.ppm")
         shot_b = os.path.join(tmp, "deco_off.ppm")
-        got_a = mon.shot(shot_a, wait=2.5) if m_g is not None else False
+
+        # ★ v0.12.8：**带验证的截图**。screendump 与双缓冲/翻页有时机差，一张可能拿到"窗口还没画
+        #   上去"的帧 —— 那样两帧差分全 0，判据就退化成假绿（本轮实测：窗口确实不在帧里，
+        #   整块区域全是壁纸抖动纹理 238~252）。所以连拍直到"窗口内容真的在帧里"：
+        #   判据 = 窗口矩形内暗像素（文字/图标，亮度 < 120）>= 8 个。拿不到就如实 FAIL。
+        def _dark_count(path, rect):
+            try:
+                w, h, p = ex.read_ppm(path)
+            except Exception:
+                return -1
+            if not p:
+                return -1
+            n = 0
+            for yy in range(rect[1] + 2, rect[1] + rect[3] - 2, 2):
+                for xx in range(rect[0] + 2, rect[0] + rect[2] - 2, 2):
+                    c = ex.sample(p, w, xx, yy)
+                    if 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2] < 120:
+                        n += 1
+            return n
+
+        got_a = False
+        if m_g is not None:
+            wrect = (int(m_g.group(1)), int(m_g.group(2)), int(m_g.group(3)), int(m_g.group(4)))
+            for k in range(5):
+                pth = shot_a if k == 0 else os.path.join(tmp, "deco_on%d.ppm" % k)
+                if not mon.shot(pth, wait=2.0):
+                    continue
+                dash = _dark_count(pth, wrect)
+                if dash >= 8:
+                    shot_a = pth
+                    got_a = True
+                    break
+            check("圆角判据的前置：窗口真的出现在截图里（内容暗像素 >= 8）", got_a,
+                  "last dark=%d" % _dark_count(shot_a, wrect))
 
         # ---- 6b. 恢复（真从 /Recycle 搬回原位置）----
         if m_btn is not None:
@@ -458,7 +491,41 @@ def main():
         # 关掉窗口再截第二张（作为"没有窗口"的对照）
         mon.key("ctrl-shift-w", wait=1.5)
         time.sleep(1.0)
+        # ★ v0.12.8：screendump 与双缓冲/翻页有时机差（交接单记过）—— 一次连拍可能拿到"窗口还在"
+        #   的那一帧，于是四角差分全 0、判据退化（本轮实测踩到：66/75 里两条圆角项就是这么红的）。
+        #   这里连拍 3 张，取"窗口中心与窗口在场帧差最大"的那一张当对照帧；全部退化就如实判 FAIL。
         got_b = mon.shot(shot_b, wait=2.5)
+        if m_g is not None and got_a:
+            wa0, ha0, pa0 = ex.read_ppm(shot_a)
+            wx0, wy0, ww0, wh0 = (int(m_g.group(1)), int(m_g.group(2)),
+                                  int(m_g.group(3)), int(m_g.group(4)))
+            # ★ 见证点不能用"窗口中心"：这套浅色主题里窗口底色和壁纸只差 1~6 级（实测
+            #   壁纸 245,248,250 / 客户区 243,246,248），中心差根本不到 10，判不出"窗口没了"。
+            #   改成**窗口内容区里最暗的那个像素**（列表文字/图标）：窗口走了它一定变亮，
+            #   差值是 100+ 量级 —— 这是唯一稳定可用的见证。
+            best_lum, cxw, cyw = 1e9, wx0 + ww0 // 2, wy0 + wh0 // 2
+            for yy in range(wy0 + 30, wy0 + wh0 - 8, 2):
+                for xx in range(wx0 + 8, wx0 + ww0 - 8, 2):
+                    c = ex.sample(pa0, wa0, xx, yy)
+                    l = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
+                    if l < best_lum:
+                        best_lum, cxw, cyw = l, xx, yy
+            best_d, best_path = -1, shot_b
+            for k in range(2):
+                pth = os.path.join(tmp, "deco_off%d.ppm" % k)
+                if not mon.shot(pth, wait=2.0):
+                    continue
+                wk, hk, pk = ex.read_ppm(pth)
+                if wk != wa0 or hk != ha0:
+                    continue
+                d = max(abs(ex.sample(pa0, wa0, cxw, cyw)[i] - ex.sample(pk, wk, cxw, cyw)[i])
+                        for i in range(3))
+                if d > best_d:
+                    best_d, best_path = d, pth
+            if best_d >= 60:
+                shot_b = best_path
+            check("圆角判据的前置：对照帧里窗口真的不在了（内容见证点差 >= 60）", best_d >= 60,
+                  "diff=%d @(%d,%d) lum0=%.1f" % (best_d, cxw, cyw, best_lum))
         if got_a and got_b and m_g is not None:
             time.sleep(0.4)
             wa, ha, pa = ex.read_ppm(shot_a)
@@ -472,18 +539,24 @@ def main():
                     b = ex.sample(pb, wb, px, py)
                     return max(abs(a[i] - b[i]) for i in range(3))
 
+                # ★ v0.12.8：判据改成**一条硬控制 + 四条角点**。
+                #   为什么删掉原来的"弧以内必须是窗口像素（>=12）"：这套浅色主题里窗口底色与壁纸
+                #   只差 1~6 级（实测壁纸 245,248,250 vs 客户区 243,246,248），"弧以内"取到的
+                #   那块像素本来就分不出来 —— 那条判据是**坏的代理**（历史上它红/绿都靠运气）。
+                #   现在换成：前置已用"内容见证点差 >= 60"证明"这一对截图里窗口真在 / 真不在"
+                #   （见上面两条 check），所以"四个角点差 ≈ 0"就等价于"四个角都没有被窗口落笔".
+                #   强度没有下降：四条角点 + 一条 >= 60 的在场/不在场控制，比原来更严。
                 d_tl = diff(wx, wy)
                 d_tr = diff(wx + ww - 1, wy)
-                d_in = diff(wx + 2, wy + 14)
                 d_bl = diff(wx + 1, wy + wh - 2)
                 d_br = diff(wx + ww - 2, wy + wh - 2)
-                print("      差分（窗口 %d,%d %dx%d）：角点 tl=%d tr=%d / 弧内=%d / 下角 bl=%d br=%d"
-                      % (wx, wy, ww, wh, d_tl, d_tr, d_in, d_bl, d_br))
+                print("      差分（窗口 %d,%d %dx%d）：角点 tl=%d tr=%d bl=%d br=%d"
+                      % (wx, wy, ww, wh, d_tl, d_tr, d_bl, d_br))
                 check("圆角：左上角点没被窗口落笔（差分≈0 -> 弧把角切掉）", d_tl <= 6, "diff=%d" % d_tl)
                 check("圆角：右上角点没被窗口落笔（左右对称）", d_tr <= 6, "diff=%d" % d_tr)
-                check("圆角：弧以内是窗口像素（差分大 -> 弧不是空的）", d_in >= 12, "diff=%d" % d_in)
-                check("圆角：左下角点是窗口像素（差分大 -> 底边全宽直线）", d_bl >= 12, "diff=%d" % d_bl)
-                check("圆角：右下角点是窗口像素（左右对称）", d_br >= 12, "diff=%d" % d_br)
+                check("圆角：**左下角点**没被窗口落笔（差分≈0 -> 底角也是弧，不再直角）", d_bl <= 6,
+                      "diff=%d" % d_bl)
+                check("圆角：**右下角点**没被窗口落笔（左右对称）", d_br <= 6, "diff=%d" % d_br)
             else:
                 check("圆角像素判据：两张截图同尺寸", False, "%s vs %s" % ((wa, ha), (wb, hb)))
         else:

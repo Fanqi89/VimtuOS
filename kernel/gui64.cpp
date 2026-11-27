@@ -2793,8 +2793,12 @@ void gui64_deco_edge64(int x, int y, int w, int h) {
     // 1) 整窗 1px 玻璃边框（1px 半透明白/黑 = 玻璃厚度与高光边缘）
     gfx64_stroke_round64(x, y, w, h, THEME64_R_WINDOW, t->win_frame, THEME64_A_BORDER);
     // 2) 圆角裁切：客户区是方形，把 4 个角"圆角外"的像素用模糊壁纸采样补回（= 玻璃圆角）
-    // ★ v0.11.6：**只切上面两角**（mask=0b0011）—— 底边保持全宽直线（用户点名的规范原文）。
-    gfx64_corner_cut_mask64(x, y, w, h, THEME64_R_WINDOW, 0x3, 0);
+    // ★ v0.12.8：**四个角全切**（mask=0b1111）。v0.11.6 曾只切上面两角（0b0011），
+    //   结果是"上两角圆、下两角方"——用户点名的视觉毒瘤：底角外还留着窗口底色，
+    //   1px 玻璃描边却在里面画成圆弧，看着就是"白边全是直线 + 底角是空的"。
+    //   覆盖率表 cov_table64(r) 逐像素确定，四角与上面两角**同一把尺子**，所以不会出现
+    //   端帽/半圆之类的畸变（那个坑在标题栏玻璃 gfx64_glass_top64 里，与此处无关）。
+    gfx64_corner_cut_mask64(x, y, w, h, THEME64_R_WINDOW, 0xF, 0);
 }
 // 装饰占掉的高度（标题栏 24 + 上边框 1）：客户区内容从这一行往下才有意义。
 int gui64_deco_h64() { return DECO_H; }

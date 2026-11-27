@@ -1186,6 +1186,17 @@ int font_text_width(const char* s) {
 //   这样终端屏幕上只有两种颜色（前景/背景），不会出现任何中间灰 —— 正是"无抗锯齿"的判据。
 static int g_mono_noaa = 0;
 static int g_stem_pct = 100;      // v0.4.8：UI 抗锯齿的笔画加厚百分比（100 = 原样）
+// ★ v0.12.8：终端"笔画保真曲线"（用户报的 'h' 看着像 'n'）。
+//   现场：终端从 v0.10.7 起改回抗锯齿（blend_px 按覆盖率混色），细笔画不再被判死，
+//   但 16px 等宽面里 1px 竖笔的覆盖率只有 30~45% —— 乘上 ui.stem=120 也只有 40~54%，
+//   在近黑底上就是"一条很淡的灰线"，肉眼直接当成没有：'h' 的竖笔一淡，整字就读成 'n'。
+//   修法不是回退成单色阈值（那会把这个笔画彻底判死，v0.10.7 已经证过），而是给覆盖率
+//   补一条 **gamma 0.5 的保真曲线** a' = 255 - (255-a)^2/255：
+//     45% -> 70%、25% -> 44%、10% -> 19%：细笔画抬到看得清，纯黑/纯白两端不动
+//     （所以仍然是无彩色灰阶，不会出现"发白糊成一片"，也不破坏 255 的满覆盖）。
+//   只在终端字符格那一次 draw 期间打开（term_draw_cell），UI 正文（设置页对比度 16.46:1）
+//   与标题栏完全不受影响。
+static int g_stem_curve = 0;      // 0 = 线性（默认）  1 = 终端笔画保真曲线
 static int g_ui_aa = 1;           // v0.4.8：UI 是否抗锯齿
 #define FONT64_MONO_THRESHOLD 128        // 终端单色阈值（ASCII；覆盖率 >= 50% 就画纯前景色）
 // ★ v0.5.12「终端缺字」修法：CJK 用更低阈值。
@@ -1217,6 +1228,17 @@ void font_set_stem64(int pct) {
 int  font_stem64() { return g_stem_pct; }
 void font_set_ui_aa64(int on) { g_ui_aa = on ? 1 : 0; }
 int  font_ui_aa64() { return g_ui_aa; }
+// ★ v0.12.8：终端笔画保真曲线开关（只在终端画一个字符格的那一瞬间为 1）
+void font_set_stem_curve64(int on) { g_stem_curve = on ? 1 : 0; }
+int  font_stem_curve64() { return g_stem_curve; }
+// 覆盖率 -> 保真曲线（gamma 0.5）：只抬中间段，0 与 255 端点不动。
+//   用整数算：a' = 255 - (255-a)^2 / 255（(255-a) 最大 255，平方 65025，除 255 = 255，不溢出）。
+static inline int stem_curve64(int a) {
+    if (a <= 0) return 0;
+    if (a >= 255) return 255;
+    const int inv = 255 - a;
+    return 255 - (inv * inv) / 255;
+}
 
 // ★ v0.10.7：行内直写版混合（不再跨文件调用 fb_get_pixel/fb_putpixel，也不再逐像素判裁剪）。
 //   p 指向**已被 fb_row64() 裁剪过**的像素；数学与 draw_blend 的 AA 分支完全相同。
@@ -1225,8 +1247,10 @@ static inline void blend_px(uint32_t* p, uint32_t fg, int a) {
     if (g_stem_pct != 100) {
         a = a * g_stem_pct / 100;
         if (a > 255) a = 255;
-        if (a >= 255) { *p = fg; return; }
     }
+    if (g_stem_curve) a = stem_curve64(a);          // ★ v0.12.8：终端细笔画保真
+    if (a >= 255) { *p = fg; return; }
+    if (a <= 0) return;
     const uint32_t bg = *p;
     const uint32_t ia = 255u - (uint32_t)a;
     const uint32_t r = (((((fg >> 16) & 0xFFu) * (uint32_t)a + ((bg >> 16) & 0xFFu) * ia) * 257u) + 257u) >> 16;
@@ -1473,6 +1497,7 @@ static int face_adv_px(FontFace* fc, uint32_t cp) {
     return px < 1 ? 1 : px;
 }
 
+static void font_stemprobe64(void);        // ★ v0.12.8：终端笔画探针（定义在字形缓存之后）
 void font_selftest() {
     // ★ 中文面外置：**还没到装载点**（磁盘/vfs 没起来）—— 推迟这份打点，别把"还没装载"报成 cjk=0/FAIL。
     //   装载点（font_external_load64 / font_external_give_up64）解决之后会回调这里补打点。
@@ -1543,6 +1568,7 @@ void font_selftest() {
     dbg64_hex64((uint64_t)mask);
     dbg64_nl();
     dbg64_line_end64();
+    font_stemprobe64();
 }
 // ==================== ★ v0.11.4：文字 -> 8-bit 覆盖率缓冲（给 Ring 3 合成器）====================
 // 见 kernel/font.h 的声明段（为什么需要 / 语义）。实现要点：
@@ -1578,6 +1604,64 @@ static const uint8_t* glyph_coverage64(uint32_t cp, int* ox, int* oy, int* w, in
     return fc->lru_bm[slot];
 }
 
+// ==================== ★ v0.12.8：终端笔画探针（h / n 最小差异字对）====================
+// 为什么要这个探针：用户报"终端 'h' 看着像 'n'"。h 与 n 的唯一差别就是左边那根**升部竖笔**
+//   有没有被画出来。探针直接量这份覆盖率位图（与屏幕绘制同一份缓存），对**同一个字**分别按
+//   "线性"与"保真曲线"算一遍"按可读阈值 96 点亮"的结果，于是能拿到无成本的 A/B 对照：
+//     [FONT64] stemprobe h linear top=<行> ink=<点亮像素> max=<最大覆盖> | curve top= ink= max=
+//   判据（宿主侧断言）：h.curve.top 必须 <= n.curve.top-3（升部存在且够亮），
+//   并且 h.curve.ink > h.linear.ink（曲线确实补了笔画），两端纯黑/纯白不受影响。
+static void font_stemprobe64(void) {
+    FontFace* save = cur;
+    font_select(FONT_FACE_MONO);                     // 终端字符格用的面
+    const uint32_t cps[2] = { (uint32_t)'h', (uint32_t)'n' };
+    for (int k = 0; k < 2; k++) {
+        int ox = 0, oy = 0, gw = 0, gh = 0;
+        const uint8_t* bm = glyph_coverage64(cps[k], &ox, &oy, &gw, &gh);
+        for (int variant = 0; variant < 2; variant++) {
+            int top = -1, ink = 0, mx = 0;
+            if (bm && gw > 0 && gh > 0) {
+                for (int y = 0; y < gh; y++) {
+                    const uint8_t* row = &bm[(oy + y) * FONT_PX + ox];
+                    for (int x = 0; x < gw; x++) {
+                        int a = row[x];
+                        if (!a) continue;
+                        if (g_stem_pct != 100) {
+                            a = a * g_stem_pct / 100;
+                            if (a > 255) a = 255;
+                        }
+                        if (variant == 1) a = stem_curve64(a);
+                        if (a > mx) mx = a;
+                        if (a >= 96) {                       // 可读阈值（与"看得见"对齐）
+                            ink++;
+                            if (top < 0 || y < top) top = y;
+                        }
+                    }
+                }
+            }
+            dbg64_line_begin64();
+            dbg64_str("[FONT64] stemprobe ");
+            dbg64_str(k == 0 ? "h" : "n");
+            dbg64_str(variant == 0 ? " linear" : " curve");
+            dbg64_str(" top=");
+            dbg64_dec((uint64_t)(top < 0 ? 0xFF : top));
+            dbg64_str(" ink=");
+            dbg64_dec((uint64_t)ink);
+            dbg64_str(" max=");
+            dbg64_dec((uint64_t)mx);
+            dbg64_str(" box=");
+            dbg64_dec((uint64_t)gw);
+            dbg64_str("x");
+            dbg64_dec((uint64_t)gh);
+            dbg64_str(" dy=");
+            dbg64_dec((uint64_t)(oy < 0 ? 0 : oy));
+            dbg64_nl();
+            dbg64_line_end64();
+        }
+    }
+    cur = save;
+}
+
 int font_raster_text64(const char* s, uint8_t* out, int stride, int wmax, int h) {
     if (!out || wmax <= 0 || h <= 0) return 0;
     if (stride < wmax) stride = wmax;               // 防御：stride 太小时按最紧的行宽写（不越界）
@@ -1609,6 +1693,7 @@ int font_raster_text64(const char* s, uint8_t* out, int stride, int wmax, int h)
                         a = a * g_stem_pct / 100;
                         if (a > 255) a = 255;
                     }
+                    if (g_stem_curve) a = stem_curve64(a);     // ★ v0.12.8：与 blend_px 同一曲线
                     if (a > (int)drow[dx]) drow[dx] = (uint8_t)a;
                 }
             }

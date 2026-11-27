@@ -756,11 +756,15 @@ static void term_draw_cell(int x, int y, int w, uint16_t cp, uint32_t fg, uint32
     //   性能：混合已改成无除法（(t*257+257)>>16），且字形覆盖率仍走 LRU 位图缓存，
     //   每像素只多一次读底色 + 一次写。
     font_select(FONT_FACE_MONO);                 // 终端字符格的字体面
+    // ★ v0.12.8：**终端专属笔画保真曲线**（用户报的 'h' 读成 'n'）。
+    //   只在这一个字符格的自绘期间为 1，画完立刻复位 —— UI 正文/标题栏走原线性覆盖率不变。
+    font_set_stem_curve64(1);
     if (cp < 0x7F) {
         font_draw_glyph(x, y + TERM_MONO_DY, (char)cp, fg);
     } else {
         font_draw_glyph_cp(x, y + TERM_ZH_DY, (uint32_t)cp, fg);
     }
+    font_set_stem_curve64(0);
 }
 
 static void term_draw(Window* w) {
@@ -4774,7 +4778,9 @@ static void shell_exec(TerminalState* ts, const char* line) {
         //   判据在串口：[ISO64] audit pid=N … uwin>=1 us_violation=0 ok=1
         //   （用户自己也能在终端里敲 `iso` 验一遍）
         iso64_report64();
-        (void)iso64_audit_all64("term");        (void)iso64_probe64();        (void)iso64_selftest64();   // 建好探针进程后再跑一次：第四位（用户窗口可用）这下才真正被验到
+        (void)iso64_audit_all64("term");
+        (void)iso64_probe64();
+        (void)iso64_selftest64();   // 建好探针进程后再跑一次：第四位（用户窗口可用）这下才真正被验到
     } else if (st_eq(g_cmd, "date")) {
         cmd_date(ts);
     } else if (st_eq(g_cmd, "time")) {
