@@ -6,7 +6,8 @@
  *
  * 关键设计（每一条都是被现场逼出来的）：
  *   ① **绝不阻塞事件循环**：内核的 recv 在没数据时会 sleep 最多 3000 ms（sock64.cpp 的默认限）。
- *      所以本 fetcher 每次先 poll(fd, 0) 探可读/可写，再 recv/send —— 探不到就 return，
+ *      所以本 fetcher 每次先用 poll(fd, 4ms) 探可读/可写（★ 超时不能是 0，见 fd_readable 注释），
+ *      再 recv/send —— 探不到就 return，
  *      等 NetSurf 下一次 fetch_poll（约 10 ms 后）再来。BIO 回调同样遵守这一点。
  *   ② mbedTLS 非阻塞：BIO 回 WANT_READ/WANT_WRITE，握手里靠上层重试，而不是在 BIO 里睡死。
  *   ③ 只有在 establish 阶段（DNS + connect）会短暂阻塞：那一步内核侧是 SYN/ACK 等待，
@@ -147,13 +148,24 @@ static uint64_t now_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
+/* ★ v0.12.6 关键修复：就绪探测必须带**非零超时**。
+ *   本内核的网卡是轮询式的（没有收包中断），kernel/syscall64.cpp 的 lx64_poll_core64() 只在
+ *   "要等待"的分支里才调 net64_poll64() 去收包：
+ *       if (ready) return ready;
+ *       if (timeout_ms == 0) return 0;        // timeout=0 -> 立刻返回，**一个包都不收**
+ *       ... if (has_sock) net64_poll64();     // timeout>0 -> 等的时候顺便收包
+ *   原来这里写 poll(&p, 1, 0)，于是 sock64 的 rxlen 永远是 0、BIO 永远回 WANT_READ、
+ *   mbedtls_ssl_handshake() 既不成功也不报错 —— 现场症状就是"卡在 WANT_READ"。
+ *   4 ms 足够让内核收一轮包，又不会拖住 10 ms 一帧的 fetch_poll。 */
+#define VIMTU_POLL_WAIT_MS 4
+
 static bool fd_readable(int fd)
 {
     struct pollfd p;
     p.fd = fd;
     p.events = POLLIN;
     p.revents = 0;
-    return poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR)) != 0;
+    return poll(&p, 1, VIMTU_POLL_WAIT_MS) > 0 && (p.revents & (POLLIN | POLLHUP | POLLERR)) != 0;
 }
 
 static bool fd_writable(int fd)
@@ -162,7 +174,24 @@ static bool fd_writable(int fd)
     p.fd = fd;
     p.events = POLLOUT;
     p.revents = 0;
-    return poll(&p, 1, 0) > 0 && (p.revents & (POLLOUT | POLLHUP | POLLERR)) != 0;
+    /* 可写是状态量（不受"要不要收包"影响），但同样给 1 ms，避免空转时把 CPU 打满 */
+    return poll(&p, 1, 1) > 0 && (p.revents & (POLLOUT | POLLHUP | POLLERR)) != 0;
+}
+
+/* ★ 直连 fd 1 的判据：NetSurf 的 NSLOG 受 log_filter/缓冲影响，串口上不一定看得到；
+ *   验收只认"串口里真的有这一行"。 */
+static void vimtu_say(const char *fmt, ...)
+{
+    char buf[320];
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        ssize_t w = write(1, buf, (size_t)((n > (int)sizeof(buf) - 2) ? (int)sizeof(buf) - 2 : n));
+        (void)w;
+    }
 }
 
 static void send_cb(const fetch_msg *msg, struct fetch_vimtu_context *c)
@@ -178,6 +207,7 @@ static void send_error(struct fetch_vimtu_context *c, const char *err)
     msg.type = FETCH_ERROR;
     msg.data.error = err;
     send_cb(&msg, c);
+    vimtu_say("[VIMTU] err %s host=%s\n", err, c->host ? c->host : "(null)");
     c->state = VIMTU_FAILED;
 }
 
@@ -604,11 +634,16 @@ static void step(struct fetch_vimtu_context *c)
             mbedtls_strerror(rc, ebuf, sizeof(ebuf));
             NSLOG(netsurf, INFO, "vimtu: TLS handshake FAILED ret=-0x%04X %s",
                   (unsigned)-rc, ebuf);
+            vimtu_say("[VIMTU] tls FAILED ret=-0x%04X %s host=%s\n",
+                      (unsigned)-rc, ebuf, c->host);
             send_error(c, "TLS 握手/证书校验失败");
             return;
         }
         NSLOG(netsurf, INFO, "vimtu: TLS ok %s %s",
               mbedtls_ssl_get_version(c->ssl), mbedtls_ssl_get_ciphersuite(c->ssl));
+        vimtu_say("[VIMTU] tls ok %s %s host=%s\n",
+                  mbedtls_ssl_get_version(c->ssl),
+                  mbedtls_ssl_get_ciphersuite(c->ssl), c->host);
         c->state = VIMTU_SEND_REQ;
         /* 落到 SEND_REQ，同一次 poll 里把请求发出去 */
     }
@@ -715,6 +750,7 @@ static void step(struct fetch_vimtu_context *c)
                 }
                 fetch_set_http_code(c->parent_fetch, (http_response_code)code);
                 NSLOG(netsurf, INFO, "vimtu: HTTP %d %s", code, c->host);
+                vimtu_say("[VIMTU] http code=%d host=%s\n", code, c->host);
 
                 /* 3xx 且有 Location → 让 llcache 去跟（它自己会重定向） */
                 v = find_hdr_value(c->hdr, hlen, "Location", &vlen);
@@ -793,6 +829,8 @@ static void step(struct fetch_vimtu_context *c)
                 send_error(c, "正文不完整（连接提前关闭）");
                 return;
             }
+            vimtu_say("[VIMTU] fin body=%zu content_len=%zu host=%s\n",
+                      c->body_got, c->content_len, c->host);
             msg.type = FETCH_FINISHED;
             send_cb(&msg, c);
             c->finish_sent = true;

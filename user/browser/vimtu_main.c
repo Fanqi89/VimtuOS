@@ -665,36 +665,18 @@ static int vimtu_main(int argc, char **argv, char **envp)
 
     /* ---- ⑤ 打开首页 ----
      *
-     * 首页用**内建 data: 页**，而不是直接开 https://example.com/。这是有证据的决定：
-     *   实测（同一份串口）DNS 通（0.3s 解析出 104.20.23.154）、TCP 通（connect 成功）、
-     *   明文 HTTP 通（GET / 收到 HTTP/1.1 200）、poll(POLLOUT) 也正常，
-     *   但 HTTPS 的 mbedtls_ssl_handshake 一直停在 WANT_READ —— 拿不到一页内容；
-     *   而一旦"中止那个挂着的 https fetch"，NetSurf 就会在稍后把 http 错误回调送达、
-     *   自己导航到 about:query/fetcherror 并把已有内容顶掉（content_remove_user），
-     *   于是窗口在"空白 <-> fetcherror 页"之间反复，永远排不完一次版。
-     * 所以：**不去启动一个注定失败的 fetch**。首页给内建页（一定画得出来），
-     * 目标 URL 仍然做完整自检并把结论打在页面上，TLS 修好后把这里换回 start_url 即可。
+     * ★ v0.12.6：TLS 握手修好了（根因是 BIO 的就绪探测用了 poll(...,0)，而本内核网卡是轮询式的，
+     *   超时为 0 时内核根本不收包 -> 永远 WANT_READ）。现在首页就是**真实站点**。
+     * 内建 data: 页降级为兜底：只有 watchdog 判定"没有内容且什么都没在加载"时才切过去。
      */
     {
-        static char home[4096];
-        char note[64];
-
-        build_builtin_url(home, sizeof(home));
         vimtu_log("[BROWSER] net target=%s\n", start_url);
-
-        /* 自检用 start_url（真实目标），首页用 home */
         err = nsurl_create(start_url, &url);
-        if (err == NSERROR_OK) {
-            net_selftest(url);
-            nsurl_unref(url);
-        }
-        err = nsurl_create(home, &url);
         if (err != NSERROR_OK) {
-            vimtu_log("[BROWSER] fatal nsurl_create(home) err=%d\n", (int)err);
+            vimtu_log("[BROWSER] fatal nsurl_create(start) err=%d\n", (int)err);
             netsurf_exit();
             return 1;
         }
-        (void)note;
     }
 
     err = browser_window_create(BW_CREATE_HISTORY, url, NULL, NULL, &bw);
@@ -706,12 +688,13 @@ static int vimtu_main(int argc, char **argv, char **envp)
     }
 
     g_app.bw = bw;
-    vimtu_log("[BROWSER] open url=data:text/html,<builtin home> (net target=%s)\n", start_url);
+    vimtu_log("[BROWSER] open url=%s\n", start_url);
     g_app.need_paint = true;
 
     /* ---- ⑥ 事件循环 ---- */
     {
     uint64_t next_tick = now_ms() + 2000;
+    uint64_t last_keepalive = now_ms();   /* 保活重贴的上一次时间 */
     uint64_t watchdog_at = now_ms() + WATCHDOG_MS;
     
 
@@ -801,8 +784,17 @@ static int vimtu_main(int argc, char **argv, char **envp)
         if (g_app.need_paint) {
             vimtu_window_paint();
             frames_idle = 0;
+            last_keepalive = now_ms();
         } else {
             frames_idle++;
+            /* ★ v0.12.6：**保活重贴**。登录（锁屏 -> 桌面）时合成器会整屏重绘，把客户端的
+             *   surface 盖掉；而本前端只在 need_paint 时才 commit，于是“登录后浏览器窗口消失”
+             *   （实测截图里只剩桌面图标与 Dock）。这里每 500 ms 无条件再画一帧
+             *   （同一块 shm，成本 = 一次 2 MiB blit，实测 us≈416），保证合成器始终重贴窗口。 */
+            if (now_ms() - last_keepalive > 500) {
+                last_keepalive = now_ms();
+                vimtu_window_paint();
+            }
         }
 
         /* 空转太久也没内容：不做任何事，只是让循环继续（保留 quit 的响应性） */

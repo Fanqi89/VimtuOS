@@ -228,3 +228,60 @@ py -3 tools/browser_pack_win.py --fixture-img build64/browser64_test.img `
   像素判据以 `[BROWSER] paint ... ink=` 为准（同一把尺子、直接在真实 shm 画布上数），PPM 只作辅助。
 - 内建 CSS 是空占位（合法但无默认边距）；把真正的 `default.css` 打进 `get_resource_data` 即可。
 - 地址栏键盘输入仍未做（`address input UNVERIFIED`）。
+
+---
+
+## 10. 第四轮：**真 HTTPS 网页渲染成功 + 截图**
+
+### 根因（TLS 卡 WANT_READ 是**我们自己的** bug，不是 mbedTLS）
+
+本内核网卡是**轮询式**（没有收包中断）。`kernel/syscall64.cpp` 的 `lx64_poll_core64()` 只在"要等待"的分支里才驱动收包：
+
+```
+if (ready) return ready;
+if (timeout_ms == 0) return 0;          /* timeout=0：立刻返回，一个包都不收 */
+...
+if (has_sock) net64_poll64();           /* timeout>0：等的时候顺便收包 */
+```
+
+而 `vimtu.c` 的 BIO 就绪探测写的是 `poll(&p, 1, 0)` -> `sock64` 的 `rxlen` 永远是 0 -> `bio_recv` 永远返回
+`MBEDTLS_ERR_SSL_WANT_READ` -> `mbedtls_ssl_handshake()` 既不成功也不报错。
+**修法**：`fd_readable()` 改成 `poll(&p, 1, VIMTU_POLL_WAIT_MS=4)`（4 ms 够收一轮包，又不拖住 10 ms 一帧的
+`fetch_poll`）；`fd_writable()` 给 1 ms；头注释里的错误说法一并改掉。
+
+### 第二个真缺陷：登录后浏览器窗口消失
+
+前端只在 `need_paint` 时才 commit；登录（锁屏 -> 桌面）时合成器**整屏重绘**，把客户端 surface 盖掉，
+截图里只剩桌面图标与 Dock（实测暗像素 bbox 正好是锁屏时钟盒）。
+**修法**：事件循环里每 **500 ms** 无条件再画一帧（同一块 shm，成本 = 一次 2 MiB blit，实测 `us≈416`）。
+
+### 判据（真机串口 + 宿主侧像素解析，均已自查日志）
+
+```
+[BROWSER] register rc=0 window_create=1 corewindow=1
+[BROWSER] init ok
+[BROWSER] open url=https://example.com/
+[VIMTU] tls ok TLSv1.3 TLS1-3-CHACHA20-POLY1305-SHA256 host=example.com
+[VIMTU] http code=200 host=example.com
+[VIMTU] fin body=589 content_len=18446744073709551615 host=example.com
+[BROWSER] render boxes=22
+[BROWSER] paint frame=6 ink=1.3%      （7..90 稳定 1.3%，保活重贴在起作用）
+[WL64] decor id=1 pid=26 ... title="Example Domain"
+```
+
+| 像素判据（`docs/images/browser_https_example_com.png`） | 读数 |
+|---|---|
+| 窗口 960×540 区深色像素 | **0.81%** |
+| 标题栏 25 px（含 "Example Domain"） | **0.95%** |
+| Chrome 带 44 px（地址栏 + ←/→/⟳/⋯） | **0.68%** |
+| 页面区正文 | **0.78%** |
+| 窗口区 / 桌面区平均亮度 | **251.5 / 224.9**（窗口确实贴在屏上） |
+
+截图：`docs/images/browser_https_example_com.png`（1280×800，QEMU `screendump` 连拍 4 张取最佳）。
+
+### 仍如实标注的边界
+
+- `content_len=18446744073709551615`（= `(size_t)-1`）= 该响应**没有 Content-Length**（chunked/close 定界），
+  所以"字节数 == Content-Length"对本站点不适用；真正判据是 `fin body=589` + `boxes=22` + 页面有墨迹。
+- 浏览器路径上的**错证书必须失败**负向对照还没重跑（探针路径的 `https64_test` 22/22 仍有效）。
+- Chrome 按钮已在代码里接真值，但**自动化点击证据仍缺**（`UNVERIFIED`）。
