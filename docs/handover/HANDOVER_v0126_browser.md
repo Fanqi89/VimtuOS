@@ -285,3 +285,59 @@ if (has_sock) net64_poll64();           /* timeout>0：等的时候顺便收包 
   所以"字节数 == Content-Length"对本站点不适用；真正判据是 `fin body=589` + `boxes=22` + 页面有墨迹。
 - 浏览器路径上的**错证书必须失败**负向对照还没重跑（探针路径的 `https64_test` 22/22 仍有效）。
 - Chrome 按钮已在代码里接真值，但**自动化点击证据仍缺**（`UNVERIFIED`）。
+
+
+---
+
+## 11. 第五轮：文字重叠修复 + 地址栏真交互（已验证）
+
+### ① 文字重叠/错位的真根因：两个度量真源
+
+`vimtu_canvas_text()` 的推进量用的是字模自带的 `g.adv`（8px），而 `vimtu_layout_width/position/split`
+用的是常量 `VIMTU_FONT_ADV`（也是 8px）。两者平时相等，一旦字模里出现更宽字形（'m' 是 9px），
+「量」与「画」就分叉：NetSurf 按 8px/字排版、绘制按 9px 推进 -> 后面的字符整体右移、行尾与后续片段互相压叠；
+而且 8px 步进本身让相邻字母贴在一起（无字距）。
+
+修法（两处，缺一不可）：
+1. `vimtu_canvas_text()` 推进改为 `vimtu_font_advance(fstyle)` —— 与 layout 同一个函数，不再有两个真源。
+2. `VIMTU_FONT_ADV` 8 -> 9（8px 字身 + 1px 字距）。
+
+像素判据（宿主侧独立统计同一行文本的空白列结构）：
+
+| | 1px 空白列（字母贴死） | >=6px 空白（词间距） | 该行墨迹列数 |
+|---|---|---|---|
+| 修复前 `browser_https_example_com.png` | 5 | 6 | 356 |
+| 修复后 `browser_typed_nav.png` | **0** | 6 | 318 |
+
+### ② 地址栏：真键盘输入（同时挖出第三个真缺陷）
+
+- 缺陷：键盘事件一条都到不了应用。根因是**键盘焦点必须显式申请**
+  （`user/lib/vimtu64.h` 的 `V64_EV_FLAG_FOCUS = 0x1`）；不申请，`wl_dispatch` 只有鼠标事件。
+  修法：事件循环里每 2 s `v64_input_poll(dummy, 0, 1u)` 重申一次（窗口重新聚焦/合成器重建后能自愈）。
+- 输入语义（`kernel/input64.h`：KEY_DOWN 的 `code` 就是可打印 ASCII）：
+  可打印 ASCII 追加、`0x08/0x7F` 退格、`0x0D` 回车导航、`0x1B` ESC 取消；
+  非编辑态下**任意可打印键自动聚焦地址栏**，第一个字符清掉旧 URL（等价 Edge 全选）。
+- 回车时没写协议自动补 `https://`（`nsurl_create` 不接受裸主机名）。
+
+真机判据（串口，逐字可见）：
+
+```
+[BROWSER] address implicit focus
+[BROWSER] address key 'e' len=1 url=e
+...（11 个字符逐个回显）
+[BROWSER] address key 'm' len=11 url=example.com
+[BROWSER] address nav url=https://example.com
+[BROWSER] render boxes=23
+```
+
+截图：`docs/images/browser_typed_nav.png`。
+
+### ③ 本轮没做的（如实）
+
+- **下载管理**：`gui_download_table` 仍是 NULL（走核心默认实现），点下载链接不会有文件落地。
+  真跑通要补 `download_context` 四个回调 + 往 `/Downloads` 写文件的 VFS 路径。
+- **没有发版**：发版闸门（`version64` 8/8、`https64` 22/22、`rand64` 17/17、`netping64` PASS、
+  `iso64` 48/48 + 浏览器用例）本轮未跑，按纪律「缺一条就只提交代码 + 交接单，不发版」。
+- 试玩盘（不是 Release）：`build64/sysdisk.img`（42,560,000 B = 77,265 扇区），
+  内含 `/bin/browser` + `/etc/browser.on`（开机自动拉起浏览器），卷内逐字节回读通过
+  （`build64/browservol.img` = 25,876,992 B）。
