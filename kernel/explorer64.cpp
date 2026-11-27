@@ -3785,7 +3785,9 @@ static void exp_box_finish(Window* w) {
 // ==================== ★ v0.11.1：跨层拖拽实现（起草/跟踪/落点/幽灵）====================
 // 幽灵矩形（屏幕坐标）：跟着指针右下偏移 14/12，出屏时贴边钳回来（与桌面右键菜单同一口径）。
 static void exp_drag_ghost_rect(int* x, int* y, int* w, int* h) {
-    int gx = g_drag_x + 14, gy = g_drag_y + 12;
+    // ★ v0.12.7：偏移只读 gui64.h 的单一真源（与 draw_cursor 同一组常量）。以前写死 +14/+12，
+    //   与指针对不上，用户看到的就是"小白框 + 3cm 外的真图标"。
+    int gx = g_drag_x + GUI64_DRAG_OFF_X, gy = g_drag_y + GUI64_DRAG_OFF_Y;
     const int sw = gui64_screen_w(), sh = gui64_screen_h();
     if (gx + EXP_DRAG_GW > sw) gx = sw - EXP_DRAG_GW;
     if (gy + EXP_DRAG_GH > sh) gy = sh - EXP_DRAG_GH;
@@ -3855,6 +3857,10 @@ static void exp_drag_begin(void) {
     if (g_drag_arm < 0 || g_drag_arm >= g_items) { g_drag_arm = -1; return; }
     g_drag_ent = g_ents[g_drag_arm];
     g_drag_active = 1;
+    // ★ v0.12.7：越过阈值 = 真的在拖 -> 立刻申请**鼠标捕获**。此后指针跑到窗口外/桌面上/别的窗口上，
+    //   motion 与 up 也只会投给本窗口（gui64 的命中测试整体旁路）。这是"拖出去仍然跟手、
+    //   松手能结算"的唯一机制；没有它，松手靠 60Hz 采样，一漏边沿就永远不落。
+    gui64_capture_mouse64(g_win ? g_win : nullptr, "explorer-drag");
     g_drag_x = mouse_get_x();
     g_drag_y = mouse_get_y();
     // 起点在条目行上：只有"桌面空白"能算可放（文件夹落点要等指针真的挪到目录行上，见 exp_tick）
@@ -3881,6 +3887,8 @@ static void exp_drag_begin(void) {
 //   target=desktop  桌面空白 -> 交给 desktopops64（吸附/避让/落盘，v0.11.1 的老语义不变）
 //   target=none     哪儿也不是 -> 如实记一行，什么都不做
 static void exp_drag_finish(Window* w) {
+    // ★ v0.12.7：结算前先放掉捕获（无论落点成不成立都必须放，否则整个桌面点不动）
+    gui64_release_mouse64("explorer-drag-drop");
     const int idx = g_drag_arm;
     const int mx = g_drag_x, my = g_drag_y;
     const int was_active = g_drag_active;
@@ -3907,7 +3915,9 @@ static void exp_drag_finish(Window* w) {
         const int dest_len = e_strlen(dest);
         int rc = -1;
         const char* why = "-";
-        if (g_ro) {
+        // ★ v0.12.7：只读位按**目标盘**现算（exp_recompute_ro64），不信缓存的 g_ro ——
+        //   与"新建/粘贴/重命名"同一条纪律（缺陷 #1 的同一个盲区）。
+        if (exp_recompute_ro64()) {
             why = "readonly";                       // FAT32 只读卷：看得见，动不了（如实）
         } else if (is_dir && dest_len > e_strlen(full) && exp_starts_with64(dest, full)) {
             why = "self";                           // 目录拖进自己的子孙 = 环，拒绝
@@ -3989,27 +3999,43 @@ void explorer64_drag_paint64(void) {
 int explorer64_drag_active64(void) { return g_drag_active; }
 void explorer64_drag_rect64(int* x, int* y, int* w, int* h) { exp_drag_ghost_rect(x, y, w, h); }
 
+// ==================== ★ v0.12.7：拖拽跟踪的**唯一实现** ====================
+// 两个入口都走这里：① 捕获期间外壳按事件直投（exp_mouse_move，不漏边沿）；
+//   ② on_tick 60Hz 兜底（万一捕获丢了/被接管，手势仍然能收场）。
+// 为什么必须只有一份：以前只有 tick 一份 60Hz 采样 —— 指针快速拖放时一次 up 都采不到，
+//   于是幽灵定格、落点永不结算（用户报的"拖拽移动失效 + 幽灵跟丢"就是它）。
+static void exp_drag_track(Window* w, int dmx, int dmy, int btn) {
+    if (g_drag_arm < 0) return;
+    if (!(btn & 1)) { exp_drag_finish(w); return; }                 // 左键已松开 -> 结算落点
+    const int ddx = dmx - g_drag_sx, ddy = dmy - g_drag_sy;
+    if (!g_drag_active && (ddx * ddx + ddy * ddy) > (EXP_DRAG_MIN * EXP_DRAG_MIN)) exp_drag_begin();
+    if (g_drag_active && (dmx != g_drag_x || dmy != g_drag_y)) {
+        exp_drag_dirty();                                           // 先擦掉旧位置的幽灵
+        g_drag_x = dmx;
+        g_drag_y = dmy;
+        // 落点 = 桌面空白 **或** 本窗口里的文件夹（后者 = 移动进文件夹）
+        g_drag_drop = exp_desktop_target(dmx, dmy) || exp_drop_dir64(w, dmx, dmy, nullptr);
+        exp_drag_dirty();                                           // 再标脏新位置
+    }
+}
+// ★ v0.12.7：捕获期间的 motion（屏幕坐标 + 按键位）—— 事件级，绝不错过任何一帧位移
+static void exp_mouse_move(Window* w, int mx, int my, int btn) { exp_drag_track(w, mx, my, btn); }
+// ★ v0.12.7：捕获期间的左键松开（事件级）。落点用**松手点**，不是最后一个采样点。
+//   注意：外壳投完这一下就会释放捕获，所以这里不重复做 release（exp_drag_finish 里也会 release，
+//   幂等；两条路都留着，谁先到谁收场）。
+static void exp_mouse_up(Window* w, int mx, int my) {
+    if (g_drag_arm < 0) return;
+    g_drag_x = mx;
+    g_drag_y = my;
+    exp_drag_finish(w);
+}
+
 static void exp_tick(Window* w) {
     if (!gui64_window_alive(w)) { g_box_active = 0; g_drag_arm = -1; g_drag_active = 0; return; }
 
     // ---- ★ v0.11.1：跨层拖拽跟踪（与框选共用这一个 tick；两者互斥：条目上按下 = 拖拽，空白 = 框选）----
-    if (g_drag_arm >= 0) {
-        const int dmx = mouse_get_x(), dmy = mouse_get_y();
-        if (!(mouse_get_buttons() & 1)) {
-            exp_drag_finish(w);                       // 左键已松开 -> 结算落点
-        } else {
-            const int ddx = dmx - g_drag_sx, ddy = dmy - g_drag_sy;
-            if (!g_drag_active && (ddx * ddx + ddy * ddy) > (EXP_DRAG_MIN * EXP_DRAG_MIN)) exp_drag_begin();
-            if (g_drag_active && (dmx != g_drag_x || dmy != g_drag_y)) {
-                exp_drag_dirty();                     // 先擦掉旧位置的幽灵
-                g_drag_x = dmx;
-                g_drag_y = dmy;
-                // ★ v0.11.5：落点 = 桌面空白 **或** 本窗口里的文件夹（后者 = 移动进文件夹）
-                g_drag_drop = exp_desktop_target(dmx, dmy) || exp_drop_dir64(w, dmx, dmy, nullptr);
-                exp_drag_dirty();                     // 再标脏新位置（同一帧里只多两块小矩形）
-            }
-        }
-    }
+    //   ★ v0.12.7：具体逻辑搬到 exp_drag_track（与捕获直投同一份实现），这里只做 60Hz 兜底采样。
+    if (g_drag_arm >= 0) exp_drag_track(w, mouse_get_x(), mouse_get_y(), (int)mouse_get_buttons());
 
     if (!g_box_active) return;
     if (!(mouse_get_buttons() & 1)) { exp_box_finish(w); return; }     // 左键已松开
@@ -4066,6 +4092,8 @@ static void exp_close(Window* w) {
     if (g_drag_active) exp_drag_dirty();                 // ★ v0.11.1：关窗 = 收掉拖拽源 + 擦掉幽灵
     g_drag_arm = -1;
     g_drag_active = 0;
+    // ★ v0.12.7：拖拽源随窗口一起死掉 -> 捕获必须当场放掉（否则整台桌面点不动）
+    if (gui64_mouse_capture64() == (Window*)w) gui64_release_mouse64("explorer-close");
     sel_clear();
     // ★ 行级原子（line_begin/end）：这行是十几个验收脚本的 grep 目标。不拿行锁时，
     //   PIT 的 kheartbeat 会插在 '[' 与其余字节之间，日志里变成
@@ -4172,6 +4200,8 @@ void explorer64_open64() {
     g_win->on_close = exp_close;
     gui64_set_click2(g_win, exp_click2);                 // ★ 批次 J：右键菜单
     gui64_set_tick(g_win, exp_tick);                     // ★ 批次 J：框选跟踪
+    g_win->on_mouse_move = exp_mouse_move;               // ★ v0.12.7：捕获期 motion 事件级直投
+    g_win->on_mouse_up = exp_mouse_up;                   // ★ v0.12.7：捕获期左键松开（事件级，不漏边沿）
     gui64_set_min_size(g_win, 420, 300);
     exp_enter_thispc();
     // ★ 行级原子（line_begin/end）：这行是十几个验收脚本的 grep 目标。不拿行锁时，

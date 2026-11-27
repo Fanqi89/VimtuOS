@@ -562,6 +562,7 @@ Window* gui64_create_window(const char* title, int x, int y, int w, int h,
     win->norm_x = x; win->norm_y = y; win->norm_w = w; win->norm_h = h;
     win->draw = draw; win->on_key = on_key; win->on_click = on_click;
     win->on_click2 = nullptr; win->on_tick = nullptr; win->on_close = nullptr;
+    win->on_mouse_move = nullptr; win->on_mouse_up = nullptr;   // ★ v0.12.7：捕获投递默认不挂
     win->on_wheel = nullptr;
     win->userdata = nullptr;
     win->app_id = (uint8_t)app_id;
@@ -624,6 +625,7 @@ void gui64_destroy_window(Window* w) {
     w->next = nullptr;
     w->draw = nullptr; w->on_key = nullptr; w->on_click = nullptr;
     w->on_click2 = nullptr; w->on_tick = nullptr; w->on_close = nullptr;
+    w->on_mouse_move = nullptr; w->on_mouse_up = nullptr;       // ★ v0.12.7：捕获投递默认不挂
     w->userdata = nullptr;
     w->visible = false;
     g_used[i] = false;
@@ -2925,7 +2927,11 @@ static void draw_cursor(void) {
             const char* r = cur[j];
             for (int i = 0; r[i]; i++) {
                 if (r[i] == ' ') break;
-                cur_px64(g_cur_x + i, g_cur_y + j, (r[i] == 'X') ? black : white);
+                // ★ v0.12.7：光标基准 = GUI64_CURSOR_HOT_X/Y（与拖拽幽灵同一个真源，见 gui64.h）。
+                //   以前这里是裸的 g_cur_x + i / g_cur_y + j，幽灵那边写死 +14/+12 —— 两套基准，
+                //   于是用户看到"小白框和真图标差 3cm"。现在两边只读同一组常量，改一处两边一起动。
+                cur_px64(g_cur_x + GUI64_CURSOR_HOT_X + i, g_cur_y + GUI64_CURSOR_HOT_Y + j,
+                         (r[i] == 'X') ? black : white);
             }
         }
         if (shape == MOUSE_CUR_MOVE) {          // 四向移动：箭头 + 十字
@@ -3574,6 +3580,52 @@ int gui64_hit_window64(int x, int y) { return win_at(x, y) ? 1 : 0; }
 // ==================== 输入处理 ====================
 static int g_prev_btn = 0;      // 上一帧的鼠标按键位
 
+// ==================== ★ v0.12.7：鼠标捕获（drag capture）====================
+// 现场（用户报的"拖拽移动失效 + 幽灵跟丢"）：gui64 的鼠标分发一直是**命中测试路由**
+//   （win_at / 窗口矩形决定事件给谁），指针一离开窗口，motion 与 up 就投给了别人；
+//   explorer 只能靠 on_tick 每 16ms 采样 mouse_get_buttons() 兜底 —— 采样漏一次边沿，
+//   松手就永远结算不了，deskdir64_move_in64 一次也不会被调用。
+// 现在：拖拽模块在越过阈值那一刻申请捕获，此后**所有**鼠标事件无条件只投给它（命中测试旁路），
+//   松手 / 窗口销毁 / 关窗 一律释放，绝不把整台桌面卡成"点不动"。
+static Window* g_mouse_cap = nullptr;      // 捕获者（nullptr = 没有捕获，正常路由）
+static int     g_mouse_cap_win = -1;       // 捕获时窗口槽号（打点用；窗口已销毁也还记得）
+
+Window* gui64_mouse_capture64(void) { return g_mouse_cap; }
+
+void gui64_capture_mouse64(Window* w, const char* why) {
+    if (!w || !gui64_window_alive(w)) return;
+    if (g_mouse_cap == w) return;                       // 幂等：同一窗口重复申请不打点
+    if (g_mouse_cap && g_mouse_cap != w) {
+        // 换捕获者：先如实把旧的收掉（不留两个"我在拖"）
+        dbg64_line_begin64();
+        dbg64_str("[GUI] drag capture off why=takeover");
+        dbg64_nl();
+        dbg64_line_end64();
+    }
+    // ★ 这一行是**真状态**，不是日志装饰：漏了它 = 捕获从未建立，而后面的 "capture on" 日志照样打印
+    //   （本轮就踩过：Log 说 on，行为全是 off —— 靠"松手必须打出 capture off"的断言才抓到）。
+    g_mouse_cap = w;
+    g_mouse_cap_win = win_index(w);
+    dbg64_line_begin64();
+    dbg64_str("[GUI] drag capture on win=");
+    dbg64_dec((uint64_t)(g_mouse_cap_win < 0 ? 0 : g_mouse_cap_win));
+    dbg64_str(" why=");
+    dbg64_str(why ? why : "-");
+    dbg64_nl();
+    dbg64_line_end64();
+}
+
+void gui64_release_mouse64(const char* why) {
+    if (!g_mouse_cap) return;
+    g_mouse_cap = nullptr;
+    dbg64_line_begin64();
+    dbg64_str("[GUI] drag capture off why=");
+    dbg64_str(why ? why : "-");
+    dbg64_nl();
+    dbg64_line_end64();
+    g_mouse_cap_win = -1;
+}
+
 static void press_in_client(Window* w, int mx, int my, int button) {
     const int cx = mx - w->client_x;
     const int cy = my - w->client_y;
@@ -3583,6 +3635,17 @@ static void press_in_client(Window* w, int mx, int my, int button) {
 }
 
 static void handle_mouse_press(int mx, int my, int button) {
+    // ★ v0.12.7：**捕获旁路** —— 有捕获者时，一切命中测试（窗口/Dock/开始菜单/桌面图标）全部跳过，
+    //   事件无条件投给捕获窗口的客户区。这是"拖拽越界后仍然跟手"的唯一正确语义：
+    //   指针此刻在别人身上（桌面/另一个窗口），但**手势的主人**还是发起拖拽的那个窗口。
+    if (g_mouse_cap) {
+        if (!gui64_window_alive(g_mouse_cap)) {          // 捕获者已经没了：立刻放手
+            gui64_release_mouse64("owner-gone");
+        } else {
+            press_in_client(g_mouse_cap, mx, my, button);
+            return;
+        }
+    }
     // ★ 系统音效：按钮/图标点击 -> click（只对左键按下；用已有 hda64 驱动播内置素材，~30ms）
     if (button == 0) (void)hda64_play_named64("click", "mouse-press");
     // ★ P2（最先）：设备 toast 关闭按钮 → 二级弹窗 → 开始菜单（层级栈：弹窗 > 菜单 > Dock/窗口/桌面）
@@ -3768,6 +3831,21 @@ static void handle_mouse(void) {
     if (mouse_button_pressed(0)) { mouse_consume_pressed(0); handle_mouse_press(mx, my, 0); }
     if (mouse_button_pressed(1)) { mouse_consume_pressed(1); handle_mouse_press(mx, my, 1); }
     if (mouse_button_pressed(2)) { mouse_consume_pressed(2); handle_mouse_press(mx, my, 2); }
+    // ★ v0.12.7：捕获期投递 —— motion 直投捕获窗口（屏幕坐标），左键松开再投一次 up 并**立即释放**。
+    //   为什么要在这里做而不是继续靠 on_tick 轮询：60Hz 采样会漏边沿（快速拖放 = 一次 up 都没采到），
+    //   而"拖拽"这个手势的每一帧都必须到达同一个主人。
+    if (g_mouse_cap) {
+        if (!gui64_window_alive(g_mouse_cap)) {
+            gui64_release_mouse64("owner-gone");
+        } else {
+            Window* cw = g_mouse_cap;
+            if (cw->on_mouse_move) cw->on_mouse_move(cw, mx, my, btn);
+            if (rel_left) {
+                if (cw->on_mouse_up) cw->on_mouse_up(cw, mx, my);
+                gui64_release_mouse64("mouse-up");
+            }
+        }
+    }
     // ★ P2：二级弹窗/开始菜单的悬停 + 拖动（音量滑块 / 日历左右拖切月 / WiFi 滚动条）
     panels64_handle_mouse_move64(mx, my, btn);
     startmenu64_handle_mouse_move64(mx, my, btn);

@@ -308,6 +308,13 @@ def main():
         check("真移动如实失败（[DESKDIR] move in … rc=-1 ok=0 why=rename-failed）",
               m_mv is not None and m_mv.group(4) == "rename-failed",
               m_mv.group(0)[:130] if m_mv else "（缺行）")
+        # ★ v0.12.7：鼠标捕获必须**真的**建立并释放（拖拽越界跟手/松手能结算的机制前提）。
+        m_cap_on = wait_re(vm, r"\[GUI\] drag capture on win=\d+ why=explorer-drag", 8, since)
+        check("拖拽越过阈值 -> 申请鼠标捕获（[GUI] drag capture on why=explorer-drag）",
+              m_cap_on is not None, m_cap_on.group(0) if m_cap_on else "（缺行）")
+        m_cap_off = wait_re(vm, r"\[GUI\] drag capture off why=(?:explorer-drag-drop|mouse-up)", 8, since)
+        check("松手 -> 立即释放捕获（[GUI] drag capture off，绝不把桌面卡成点不动）",
+              m_cap_off is not None, m_cap_off.group(0) if m_cap_off else "（缺行）")
         m_add = wait_re(vm, r"\[DESK64\] file add idx=\d+ kind=9", 8, since)
         check("桌面上**没有**新增 kind=9 项（不再登记假快捷方式）", m_add is None,
               m_add.group(0) if m_add else "（确实没有）")

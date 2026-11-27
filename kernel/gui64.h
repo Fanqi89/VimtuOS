@@ -50,6 +50,19 @@ typedef void (*WindowTickFn)(Window*);                               // 每个�
 //   滚动语义（终端 = 滚历史、设置 = 滚内容、文本预览 = 滚行）。
 typedef void (*WindowCloseFn)(Window*);                              // 窗口即将销毁（释放 userdata 用）
 typedef void (*WindowWheelFn)(Window*, int dz);
+// ★ v0.12.7：鼠标捕获期间的 motion / up 投递（屏幕坐标；只有持有捕获的窗口才收得到）。
+//   为什么必须新开这两个钩子：外壳原本**没有**鼠标移动分发（窗口靠 on_tick 自己 poll），
+//   于是"指针出窗口"之后一切靠 60Hz 采样，快速松手会整段丢失。捕获后按事件直投才不丢。
+typedef void (*WindowMouseFn)(Window*, int mx, int my, int btn);      // 屏幕坐标 + 按键位
+typedef void (*WindowMouseUpFn)(Window*, int mx, int my);             // 屏幕坐标
+
+// ==================== ★ v0.12.7：指针热点 / 拖拽幽灵偏移（**单一真源**）====================
+// 用户报的"拖拽幽灵 3cm 错位"= 两个绘制者各写一套基准：draw_cursor() 按 g_cur_x/g_cur_y，
+//   exp_drag_ghost_rect() 按写死的 +14/+12。现在两处都只读下面这几个常量，谁也不许再写字面量。
+#define GUI64_CURSOR_HOT_X  0    // 指针热点 = 箭头尖 = 位图 (0,0)；g_cur_x/g_cur_y 即热点坐标
+#define GUI64_CURSOR_HOT_Y  0
+#define GUI64_DRAG_OFF_X    10   // 幽灵底板左上角相对**热点**的固定偏移（不挡落点，且恒等）
+#define GUI64_DRAG_OFF_Y    8
 
 // ==================== 窗口 ====================
 // 注意：应用**只读**几何字段（x/y/w/h/client_*），改动一律走 gui64_* 接口，
@@ -75,6 +88,10 @@ struct Window {
     WindowCloseFn  on_close;    // 外壳销毁窗口前调用（可空）；在此释放 userdata
                                 // 注：带该字段前，应用靠 gui64_window_alive() 轮询发现关窗，
                                 // 两种方式并存都安全（外壳不会替你释放 userdata）
+    // ★ v0.12.7：捕获期间的鼠标投递（可空）。只有 gui64_capture_mouse64() 的持有者会收到；
+    //   坐标是**屏幕**坐标（不是客户区），因为拖拽语义天然是屏幕级的（落点判定要跨窗口/桌面）。
+    WindowMouseFn on_mouse_move;
+    WindowMouseUpFn on_mouse_up;
 
     void*   userdata;           // 应用私有状态（关窗时外壳不会替你释放，自己 on_close 里放）
     uint8_t app_id;             // APP_ID_*
@@ -142,6 +159,16 @@ bool    gui64_click_is_right();
 // ★ v0.11.1：光标下有没有窗口（1 = 有）。拖拽落点判定用：桌面 = 没有窗口的地方。
 int     gui64_hit_window64(int x, int y);
 bool    gui64_window_alive(Window* w);       // 指针是否仍是活动窗口（防重复打开时用悬空指针）
+
+// ==================== ★ v0.12.7：鼠标捕获（drag capture）====================
+// 语义与 Win32 SetCapture 一致：捕获期间**所有**鼠标事件只投给捕获窗口，命中测试整体旁路。
+// 为什么必须有它：外壳的鼠标分发一直按命中测试（gui64_hit_window64 / 窗口矩形）路由，指针一出
+//   窗口事件就交给了别人 —— 拖拽越界后 motion/up 全丢，幽灵定格在窗口边缘、真移动永远不结算。
+// 纪律：只有"我确实在拖"的模块才允许申请；松手（或窗口销毁）必须释放，否则整个桌面点不动。
+// 打点：[GUI] drag capture on win=<slot> why=<why>   /   [GUI] drag capture off why=<why>
+void    gui64_capture_mouse64(Window* w, const char* why);
+void    gui64_release_mouse64(const char* why);
+Window* gui64_mouse_capture64(void);         // 当前捕获者（nullptr = 没有）
 void    gui64_close_all_windows();
 int     gui64_close_app(int app_id);         // 关掉某应用的全部窗口（任务管理器"结束任务"用）
 
