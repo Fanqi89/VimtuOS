@@ -1775,9 +1775,25 @@ static void exp_paste() {
 }
 
 // ==================== ★ 批次 J：重命名 / 删除 / 新建文件夹 / 属性 ====================
+/* ★ v0.12.7：**每次动作前按目标盘重新取只读位**，不信缓存 g_ro。
+ *   为什么：g_ro 只在 exp_refresh_dir() 里由 fs64_is_readonly64(-1)（= 当前卷）算一次；
+ *   只要"当前卷"和"界面上这个目录所属的卷"曾经不一致（切过盘、终端换过卷、先看了 D:…），
+ *   g_ro 就是上一次的结论 —— 于是新建/粘贴/重命名在 C: 的普通目录里被整体拦死，
+ *   用户看到的就是"随便哪个目录都建不了"。这里改成按 g_letter 直接问 drive64（盘自己的只读位），
+ *   与 fs64 的"当前卷"解耦，并顺手把 g_ro 纠正回真值。 */
+static bool exp_recompute_ro64(void) {
+    if (g_mode != 1) return g_ro;
+    const int di = g_letter ? drive64_by_letter64(g_letter) : -1;
+    if (di < 0) return g_ro;
+    DriveInfo64 d;
+    if (drive64_info64(di, &d) != 0) return g_ro;
+    g_ro = d.readonly ? true : false;
+    return g_ro;
+}
+
 static void exp_edit_begin(int mode, int item) {   // 进入内联编辑（重命名 / 新建文件夹）
     if (g_mode != 1) { exp_msg(gui64_tr("Not in a folder", "不在文件夹里")); return; }
-    if (g_ro) { exp_roact("rename/mkdir"); return; }   // ★ 只读卷（FAT32）上不能改名/新建
+    if (exp_recompute_ro64()) { exp_roact("rename/mkdir"); return; }   // ★ 每次重取，不信缓存
     if (mode == EXP_EDIT_RENAME) {
         if (item < 0 || item >= g_items || item >= EXP_MAX_ITEMS) { exp_msg(gui64_tr("Nothing selected", "没有选中任何项")); return; }
         e_strcpy(g_edit_buf, g_ents[item].name, (int)sizeof(g_edit_buf));
