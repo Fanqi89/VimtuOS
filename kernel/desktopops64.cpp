@@ -2047,35 +2047,52 @@ static void menu_action(int idx) {
                 why = "desktop repainted";
                 break;
             case DOPS_MENU_ID_NEWFOLDER: {
-                if (g_n >= DESKOPS_MAX_ITEMS) { done = "0"; why = "max desktop items"; break; }
-                int slot = DESKOPS_KIND_FOLDER;
-                for (int k = DESKOPS_KIND_FOLDER; k <= 7; k++) {
-                    bool used = false;
-                    for (int i = 0; i < g_n; i++) if (g_items[i].kind == k) used = true;
-                    for (int i = 0; i < g_rec_n; i++) if (g_recycle[i] == k) used = true;
-                    if (!used) { slot = k; break; }
+                /* ★ v0.12.7：**真落盘**。旧实现只往 g_items[] 里塞一条虚拟项，日志自己都写着
+                 *   "no /Desktop volume in this batch" —— 于是"桌面新建的文件夹"在 ~/Desktop 里根本不存在
+                 *   （用户实测缺陷 #1/#2）。现在：在桌面真实目录里 mkdir（撞名自动 (2)(3)…），
+                 *   成功就重扫目录，让图标来自目录而不是内存表。 */
+                char uniq[DESKDIR_NAME_MAX + 1];
+                char full[DESKOPS_LINK_PATH_MAX];
+                const char* base = gui64_tr("New folder", "新建文件夹");
+                const char* dir = deskdir64_dir64();
+                const int slot = deskdir64_slot64();
+                int rc = -1;
+
+                if (deskdir64_unique_name64(base, uniq, (int)sizeof(uniq)) == 0) {
+                    s_cpy(full, dir, (int)sizeof(full));
+                    int n = 0; while (full[n]) n++;
+                    if (n > 0 && full[n - 1] != '/' && n < (int)sizeof(full) - 1) { full[n++] = '/'; full[n] = 0; }
+                    int k = n;
+                    for (int i = 0; uniq[i] && k < (int)sizeof(full) - 1; i++) full[k++] = uniq[i];
+                    full[k] = 0;
+
+                    if (slot >= 0) {
+                        rc = vfs64_mkdir_on64(slot, full);
+                    } else {
+                        rc = vfs64_mkdir64(full);
+                    }
+                    if (rc == 0) {
+                        desk_sync64("newfolder");            /* 目录已变 -> 立刻重建文件项 */
+                    }
                 }
-                DeskItem nit{};
-                nit.kind = slot;
-                item_default_pos(slot, &nit.x, &nit.y);
-                g_items[g_n++] = nit;
-                set_cache_sync();
                 dbg64_line_begin64();
                 dbg64_str("[DESK64] newfolder name=");
-                dbg64_str(item_name(slot));
-                dbg64_str(" kind=");
-                dbg64_dec((uint64_t)slot);
-                dbg64_str(" n=");
-                dbg64_dec((uint64_t)g_n);
-                dbg64_str(" x=");
-                dbg64_dec((uint64_t)nit.x);
-                dbg64_str(" y=");
-                dbg64_dec((uint64_t)nit.y);
-                dbg64_str(" persisted=1 (desktop shortcut entry; no /Desktop volume in this batch)");
+                dbg64_str(uniq);
+                dbg64_str(" path=");
+                dbg64_str(full);
+                dbg64_str(" rc=");
+                dbg64_dec((uint64_t)(uint32_t)(rc < 0 ? 0xFFFFu : (uint32_t)rc));
+                dbg64_str(" persisted=1 real=1 files=");
+                dbg64_dec((uint64_t)deskdir64_count64());
                 dbg64_nl();
                 dbg64_line_end64();
-                gui64_invalidate();
-                why = "folder entry added";
+                if (rc == 0) {
+                    gui64_invalidate();
+                    why = "folder created on volume";
+                } else {
+                    done = "0";
+                    why = "mkdir failed (see rc)";
+                }
                 break;
             }
             case DOPS_MENU_ID_PERSON:
