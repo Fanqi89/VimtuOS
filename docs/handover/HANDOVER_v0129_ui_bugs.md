@@ -152,3 +152,17 @@ Get-Process qemu-system-x86_64 -> 0
 - **`sendkey` 的 `/` 是 `slash`**，否则静默丢失。
 - **`fileops64_test` 的 `selftest FAIL` 可能是日志交织假红**（`[DESK64] selftest PASS mask=` 与
   `[TASK64] kwork` 抢行）→ 重跑一次再判定。
+
+---
+
+## 5. v0.12.10 已修复（本单两个 Bug 收口，2026-11-28 发版）
+
+- tag `v0.12.10` = `282afa80…`（指向 `7bbefb4a`）· Release **`461223250`** · ISO 97,067,008 B `251addfe…` · IMG 46,292,480 B `66c65a30…` · v0.12.4 旧附件逐条未动 · 内核 3,610,192 B。
+- **Bug 1（焦点死锁）根因**：`ev64_route64()` 键盘只投给 `g_ev64_focus64` 一个 pid，而只有 `wl_seat_get()` 会改它 → "谁最后启动谁吃键盘"，点别的窗口没有路径改焦点。
+  修法：**指针按下 = 焦点迁移唯一触发点**。`wl64_pointer_focus64(x,y)`（按装饰框命中、排除合成器自己的层）→ 命中客户窗口 `focus=该 pid`（`reason=pointer-hit`）；未命中 `focus=0`（`reason=kernel-claim`）；`gui64` 键盘目标改"活动窗口优先"并打 `[GUI64] key target title=… active=…`。
+  实机证据：`[EV64] focus pid=0 prev=26 reason=kernel-claim` + `[EV64] focus pid=26 prev=0 reason=pointer-hit`；终端连续两次 `run /bin/viewer` 都起新窗口。
+- **Bug 2（右键菜单坐标系撕裂）根因**：`p2ui_*/gfx64_*` 吃屏幕绝对坐标，`txt_clip/frect` 自己加 `g_ox/g_oy`。`draw_ctxmenu()` 把客户区坐标喂给底板、文字又加一遍原点 → 底板与文字差**整个窗口原点**。
+  修法：弹层内所有绘制只有一个原点 `(px,py)=(g_ox+x,g_oy+y)=底板左上角`，文字改走绝对版 `text_clip()`；文件菜单/属性面板同病一起修。
+- **回归**：`fileops64` **117/117 PASS**（含阶段 4 菜单五条像素判据）· `deskfolder64` **76/76 PASS**。
+- **仍未了（下一轮第一件事）**：`v1210_shot.py` 的菜单像素判据差分会被整屏重绘带污染（`screendump` 与双缓冲时机差，bbox 665×726）→ 改成"**点附近区域 + 连拍稳定后再比**"（`diff_bbox(region=…)` + `stable_shot()` 两帧逐像素一致），改完再补 `[EV64]`/`[GUI64]` 的自动化断言，然后 `version64`/`startmenu64`/`dock64`/`https64`/`rand64`/`netping64`/`iso64` 全量回归。
+- 截图：`docs/images/v01210_ctxmenu.png`、`v01210_ctxmenu_full.png`、`v01210_focus_two_windows.png`。
