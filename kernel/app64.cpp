@@ -308,6 +308,52 @@ int app64_launch64(const char* path) {
     return urc;
 }
 
+// ★ v0.12.11：真进程 ELF 启动（kernel/proc64.cpp）。app64 不 include proc64.h（避免头文件
+//   互相牵扯），这里只按签名取用三个函数；链接期一定能找到（proc64.cpp 永远在核心里）。
+int  proc64_create64(const char* name, int ppid);
+int  proc64_start_elf64(int pid, const char* path);
+void proc64_destroy64(int pid);
+
+// ==================== ★ v0.12.11：ELF 启动走"真进程"路径 ====================
+// 实测（用户实机 + 夹具串口，v0.12.10）：
+//     [APP64] dispatch path=/bin/viewer magic=elf64 -> elf64_run64
+//     [ELF64] reject reason=busy
+//     [ELF64] launch FAILED path=/bin/viewer reason=load
+// 根因：elf64_run64 是**同步单例装载器** —— g_loaded64 全局只有一份，装载完要等子进程退出才回收。
+//   Ring 3 合成器 /lib/wm.elf 一起来就永久占着那份状态 -> 之后任何 ELF 都 `busy` 失败：
+//   开始菜单的"浏览器/图片查看器"、文件管理器里双击 ELF 全部起不来（阻断级，与 NetSurf/KPTI 无关）。
+// 修法：与 kernel64.cpp 的 tlsprobe、terminal64.cpp 的 `run` 完全同一条已验收路径 ——
+//   proc64_create64 + proc64_start_elf64（每进程 CR3，互不干扰），并把真实 pid 打出来当判据。
+//   不带 argv（app_launch_exec64 也只有一个路径参数）；需要 argv 的调用方走 proc64_start_elf64_argv64。
+static int app64_spawn_elf64(const char* path) {
+    const char* base = path;
+    for (const char* q = path; *q; q++) if (*q == '/') base = q + 1;
+    const int pid = proc64_create64((base && base[0]) ? base : "elf", 0);
+    if (pid <= 0) {
+        // 建不出进程 = 安装介质内核 / UEFI 固件页表（共享地址空间模式）：退回老的同步装载器。
+        // 那种场景里没有常驻合成器占着单例槽，elf64_run64 仍是对的（也是它们唯一的路径）。
+        dbg64_line_begin64();
+        dbg64_str("[APP64] elf spawn fallback path=");
+        dbg64_str(path);
+        dbg64_str(" reason=no-proc\n");
+        dbg64_line_end64();
+        return elf64_run64(path);
+    }
+    const int rc = proc64_start_elf64(pid, path);
+    if (rc != 0) {
+        proc64_destroy64(pid);
+        return vap_launch_fail(path, "elf");
+    }
+    dbg64_line_begin64();
+    dbg64_str("[APP64] elf spawn path=");
+    dbg64_str(path);
+    dbg64_str(" pid=");
+    dbg64_dec((uint64_t)pid);
+    dbg64_str(" via=proc64_start_elf64\n");
+    dbg64_line_end64();
+    return 0;
+}
+
 // ==================== 按文件头魔数分派（终端 run）====================
 int app64_run_any64(const char* path) {
     if (!path || path[0] == 0) return vap_launch_fail(path, "arg");
@@ -318,8 +364,8 @@ int app64_run_any64(const char* path) {
     if (elf64_is_elf64(head, (uint32_t)hn)) {
         dbg64_str("[APP64] dispatch path=");
         dbg64_str(path);
-        dbg64_str(" magic=elf64 -> elf64_run64\n");
-        return elf64_run64(path);
+        dbg64_str(" magic=elf64 -> proc64_start_elf64\n");
+        return app64_spawn_elf64(path);
     }
     dbg64_str("[APP64] dispatch path=");
     dbg64_str(path);

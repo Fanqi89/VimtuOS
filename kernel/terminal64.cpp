@@ -861,6 +861,9 @@ static void term_wheel(Window* w, int dz) {
 // ==================== Shell：输出与命令 ====================
 // ★ 本批（P1c）：提示符 = **会话身份**（su - root / su - / sudo -i 之后变 root，提示符变 '#'）
 static void shell_prompt(TerminalState* ts) {
+    // ★ v0.12.11：提示符 = **亮绿**（ANSI 2 + bold -> term_attr_fg 取 idx 10 = #55FF55）。
+    //   只染提示符本身；用户敲的字走默认白色（attr 复位在后）。
+    ts->attr = (uint8_t)(0x40u | 0x10u | 2u);
     const char* u = userdb64_session_name64();
     if (u && u[0] && u[0] != '-') {
         ts_puts(ts, u);
@@ -868,13 +871,19 @@ static void shell_prompt(TerminalState* ts) {
     } else {
         ts_puts(ts, "vimtu64:~$ ");          // 还没登录（理论上到不了这里）：退回旧提示符
     }
+    ts->attr = 0;
 }
 
 // ★ 版本号唯一真源：build64.sh 的 VIMTUOS_VERSION（编译期宏 VIMTUOS_VERSION_STR，
 //   与设置页"关于"同源）。未定义时（裸编译）打 unknown —— 与 settings64.cpp 同一套兜底。
 static void shell_banner(TerminalState* ts) {
+    // ★ v0.12.11：欢迎信息 = **深蓝**（ANSI 4 = kTermAnsi16[4] = #0000AA）。
+    //   颜色是 per-cell 的（ts->attr 在写字符时盖进 attrs[]），所以这里只要在 ts_puts 前后
+    //   设/清 ts->attr 就行；0x40 = "带颜色"，低 4 位 = ANSI 序号。
+    ts->attr = (uint8_t)(0x40u | 4u);
     ts_puts(ts, "VimtuOS Terminal v" VIMTUOS_VERSION_STR " (64-bit long mode)\n");
     ts_puts(ts, gui64_tr("type 'help' for commands\n", "输入 help 查看命令\n"));
+    ts->attr = 0;                                            // 复位：后面都是默认前景色
 }
 
 static const char* HELP_EN =
@@ -5596,6 +5605,10 @@ static void term_key(Window* w, char c) {
     }
     if (c == '\n' || c == '\r') {          // 回车执行
         ts->cmdline[ts->cmdlen] = 0;
+        // ★★ v0.12.11（用户实机报的）：回车后**必须强制换行**，执行结果从下一行开头开始写。
+        //   旧行为：用户敲的命令被回显在同一行，shell_exec 的第一行输出直接接在命令尾巴上
+        //   （"ping ..." 后面紧跟回复）；这里在**任何**输出之前补一个 '\n'，口令/交互行也一起覆盖。
+        ts_putc(ts, (uint32_t)'\n');
         if (g_pw_pending) cmd_passwd_line(ts, ts->cmdline);   // ★ P1c：交互式口令那一行
         else if (g_su_pending) cmd_su_line(ts, ts->cmdline);   // ★ P4：su 的口令行（隐藏输入）
         else shell_exec(ts, ts->cmdline);
