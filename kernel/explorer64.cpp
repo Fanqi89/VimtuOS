@@ -3208,13 +3208,21 @@ static void draw_filemenu(void) {
     items[1] = gui64_tr("Close window", "关闭窗口");
     // ★ v0.12.8：圆角/行距/高亮与**桌面右键菜单**逐像素同一口径（原来用 POP_R_SMALL=10 且行内
     //   文字按 +5 硬定位 -> 26px 行高里 22px 字身溢到下一条，看着"崩坏"）。
-    p2ui_popup64(x, y, w, h, THEME64_POP_R, THEME64_POP_R,
+    // ★★ v0.12.10（Bug 2 坐标系撕裂）：本文件的绘制有**两套坐标空间**，混用就会撕裂：
+    //     * frect/drect/txt/txt_clip  -> 内部加 g_ox/g_oy（客户区原点），吃**客户区坐标**
+    //     * p2ui_*/gfx64_*（以及 text_clip）-> 屏幕**绝对坐标**
+    //   旧代码把客户区坐标直接喂给 p2ui_popup64：底板画在 (x,y) 绝对位置，而文字走
+    //   txt_clip 画在 (client_x+x, client_y+y) —— 两者相差**整个窗口原点**，正是用户看到的
+    //   "底板在左上、文字/圆点飘到右下、角对角叠在一起"。这里统一：弹层里所有 p2ui/gfx 调用
+    //   都从同一个绝对原点 (px,py) 出发，原点 = 底板左上角。
+    const int px = g_ox + x, py = g_oy + y;
+    p2ui_popup64(px, py, w, h, THEME64_POP_R, THEME64_POP_R,
                  t, t->client_bg, t->dark ? THEME64_A_POP_DARK : THEME64_A_POP);
     for (int i = 0; i < 2; i++) {
-        const int iy = y + 2 + i * 26;
+        const int iy = py + 2 + i * 26;
         if (g_hover_id == IDC_FILE + 10 + i)
-            gfx64_fill_round64(x + 4, iy + 2, w - 8, 24 - 4 + 2, THEME64_R_BUTTON, t->sel_bg, 110);
-        p2ui_text64(x + 12, iy + (24 - p2ui_line_h64()) / 2, items[i], t->text);
+            gfx64_fill_round64(px + 4, iy + 2, w - 8, 24 - 4 + 2, THEME64_R_BUTTON, t->sel_bg, 110);
+        p2ui_text64(px + 12, iy + (24 - p2ui_line_h64()) / 2, items[i], t->text);
     }
 }
 // ==================== ★ 批次 J：右键菜单 / 内联编辑 / 属性面板 / 框选 的绘制 ====================
@@ -3230,23 +3238,29 @@ static void draw_ctxmenu(void) {
     const Theme64Tokens* t = theme64_tokens64();
     const int x = g_ctx_x, y = g_ctx_y, h = exp_ctx_height();
     // ★ v0.12.8：与桌面菜单**同一口径**（半径 POP_R、左侧强调圆点、行内垂直居中、圆角 hover 内缩 2px）
-    p2ui_popup64(x, y, EXP_CTX_W, h, THEME64_POP_R, THEME64_POP_R,
+    // ★★ v0.12.10（Bug 2 坐标系撕裂）：底板 + 高亮 + 圆点 + 文字**全部从同一个绝对原点
+    //   (px,py) 出发**（px,py = 底板左上角 = 客户区坐标 + 窗口原点）。原来底板/高亮/圆点吃
+    //   客户区坐标当绝对坐标用，文字走 txt_clip 又加了一遍原点 -> 相差一个窗口原点，用户实测
+    //   就是"底板在左边、文字和图标飞到右下角、角对角叠"。文字改用 text_clip（绝对坐标版本），
+    //   与底板同一个原点，不再有第二套坐标。
+    const int px = g_ox + x, py = g_oy + y;
+    p2ui_popup64(px, py, EXP_CTX_W, h, THEME64_POP_R, THEME64_POP_R,
                  t, t->client_bg, t->dark ? THEME64_A_POP_DARK : THEME64_A_POP);
     const int line_h = p2ui_line_h64();
     for (int k = 0; k < exp_ctx_count(); k++) {
-        const int iy = y + 2 + k * EXP_CTX_ITEM_H;
+        const int iy = py + 2 + k * EXP_CTX_ITEM_H;
         const bool en = exp_ctx_enabled(k);
         if (en && g_hover_id == IDC_CTX_BASE + k)
-            gfx64_fill_round64(x + 4, iy + 2, EXP_CTX_W - 8, EXP_CTX_ITEM_H - 4,
+            gfx64_fill_round64(px + 4, iy + 2, EXP_CTX_W - 8, EXP_CTX_ITEM_H - 4,
                                THEME64_R_BUTTON, t->sel_bg, 110);
         const uint32_t fg = en ? t->text : t->text_dim;
         // 左侧圆点：可用项 = 强调色（与桌面菜单同一个 3px 圆点），置灰项 = 暗色小点
-        if (en) p2ui_fill_circle64(x + 10, iy + EXP_CTX_ITEM_H / 2, 3, t->accent, 220);
-        else    p2ui_fill_circle64(x + 10, iy + EXP_CTX_ITEM_H / 2, 3, fg, 200);
+        if (en) p2ui_fill_circle64(px + 10, iy + EXP_CTX_ITEM_H / 2, 3, t->accent, 220);
+        else    p2ui_fill_circle64(px + 10, iy + EXP_CTX_ITEM_H / 2, 3, fg, 200);
         // 文字垂直居中（原来硬编码 +5，26px 行里 22px 字身会溢到下一条 —— 看着像"排版崩了"）
         int ty = iy + (EXP_CTX_ITEM_H - line_h) / 2;
         if (ty < iy + 1) ty = iy + 1;
-        txt_clip(x + 22, ty, exp_ctx_label(k), fg, EXP_CTX_W - 30);
+        text_clip(px + 22, ty, exp_ctx_label(k), fg, EXP_CTX_W - 30);
     }
 }
 // 内联编辑框（重命名：画在条目自己的名字行上；新建文件夹：画在"下一个空位"）
@@ -3267,9 +3281,13 @@ static void draw_props(void) {
     // ★★ v0.11.1 统一 UI：属性面板原来也是直角白底 + 硬编码 rgb(240,240,240)/rgb(0,60,120)。
     //   现在与菜单同一套：圆角弹窗底 + 主题标题色 + 主题分隔线。
     const Theme64Tokens* t = theme64_tokens64();
-    p2ui_popup64(x, y, w, h, THEME64_POP_R, THEME64_POP_R,
+    // ★ v0.12.10（同 Bug 2）：p2ui_popup64 / p2ui_text64 吃**绝对坐标**，下面的
+    //   txt/txt_clip/frect 自己加 g_ox/g_oy —— 这里给 p2ui 那两处补上窗口原点，
+    //   否则属性面板的底板与标题会相对正文整体错开一个窗口原点。
+    const int px = g_ox + x, py = g_oy + y;
+    p2ui_popup64(px, py, w, h, THEME64_POP_R, THEME64_POP_R,
                  t, t->client_bg, t->dark ? THEME64_A_POP_DARK : THEME64_A_POP);
-    p2ui_text64(x + 12, y + 6, gui64_tr("Properties", "属性"), t->accent);
+    p2ui_text64(px + 12, py + 6, gui64_tr("Properties", "属性"), t->accent);
     frect(x + 8, y + 24, w - 16, 1, t->sel_border);   // 主题分隔线（Theme64Tokens 没有 line 字段）
     int ly = y + 24;
     const int lh = 19;

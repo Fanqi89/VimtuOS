@@ -1804,6 +1804,28 @@ int64_t wl64_surface_app_icon64(uint64_t surf, uint64_t out_uptr, uint64_t cap) 
 int wl64_composer_pid64() { return g_wl64_wm_pid64; }
 // ★ v0.11.3：活动窗口 = 最高 id 的、有内容且未最小化的 surface（0 = 没有窗口）。
 //   Dock 用它给"当前活动窗口"那条运行项画高亮；窗口最小化/关闭后自动落回下一个。
+// ★★ v0.12.10（Bug 1 焦点死锁）：**指针落点决定键盘焦点**的唯一几何真源。
+//   背景：合成器（/bin/wm）用 22 号拿走指针捕获后，客户进程再也收不到鼠标；而键盘只投给
+//   g_ev64_focus64 这**一个**进程 —— 谁最后调 seat_get 谁吃到键盘，点别的窗口不会改变它。
+//   用户实测："多开之后点第二个窗口，键盘还是被旧窗口吃掉"就是这个。
+//   这里给事件层一个纯几何答案：这一点下面是哪个**客户**窗口（0 = 没有客户窗口，即内核
+//   窗口 / 桌面 / Dock / 菜单 -> 键盘该回内核）。合成器自己的 surface 不算（它是整屏窗口层，
+//   算进来焦点永远回不到内核）。装饰窗口按**装饰框**命中（点标题带也算点到这个窗口）。
+int wl64_pointer_focus64(int x, int y) {
+    Wl64Surface* best = nullptr;
+    for (uint32_t i = 0; i < WL64_MAX_SURFACES64; i++) {
+        Wl64Surface* s = &g_wl64_surfs[i];
+        if (!s->used || !s->content) continue;
+        if (s->minimized) continue;
+        if (g_wl64_wm_pid64 != 0 && s->pid == g_wl64_wm_pid64) continue;   // 合成器自己的层
+        int fx = (int)s->x, fy = (int)s->y, fw = (int)s->w, fh = (int)s->h;
+        if (s->decor & WL64_DECOR_F_WINDOW64) wl64_frame64(s, &fx, &fy, &fw, &fh);
+        if (x < fx || x >= fx + fw || y < fy || y >= fy + fh) continue;
+        if (!best || s->id > best->id) best = s;
+    }
+    return best ? best->pid : 0;
+}
+
 int wl64_active_surface64() {
     uint32_t best = 0;
     for (uint32_t i = 0; i < WL64_MAX_SURFACES64; i++) {

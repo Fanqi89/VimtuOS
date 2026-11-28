@@ -127,8 +127,33 @@ uint32_t ev64_pop64(Ev64Queue* q, Ev64Event* out, uint32_t max) {
 }
 
 // ==================== 路由（键盘 -> 焦点；鼠标 -> 捕获 -> 焦点）====================
+// ★★ v0.12.10（Bug 1 焦点死锁）：合成器（/bin/wm）用 wl_composer_get 拿走**指针捕获**之后，
+//   客户进程再也看不到鼠标；而键盘只投给 g_ev64_focus64 这一个进程，只有 seat_get 会改它 ->
+//   "谁最后启动谁吃键盘"，点第二个窗口键盘不跟着走（用户实机报的 Bug 1）。
+//   修法：把"指针按下"当成**焦点迁移**的唯一触发点，落点下面是谁的窗口，键盘就归谁：
+//     ① 命中客户窗口（含标题带）-> focus = 该窗口所属 pid（多开切换）；
+//     ② 没命中任何客户窗口（内核窗口 / 桌面 / Dock / 菜单）-> focus = 0，键盘归内核。
+//   只在 MOUSE_DOWN 迁移：MOUSE_UP / MOVE 不动焦点，否则拖拽/移动路上一路抢焦点。
+//   wl64_pointer_focus64 是弱符号（安装介质/无 wl64 的内核里不存在 -> 退回旧行为）。
+extern int wl64_pointer_focus64(int x, int y) __attribute__((weak));
+
 static void ev64_route64(const Ev64Event* e) {
     if (!proc64_evq_of64) return;                     // 安装介质内核：没有队列，直接丢
+    if (e->type == EV64_TYPE_MOUSE_DOWN) {
+        int hit = 0;
+        if (wl64_pointer_focus64) hit = wl64_pointer_focus64((int)e->x, (int)e->y);
+        if (hit > 0) {
+            if (g_ev64_focus64 != hit) {
+                const int prev = g_ev64_focus64;
+                g_ev64_focus64 = hit;
+                ev64_log_focus64(hit, prev, "pointer-hit");
+            }
+        } else if (g_ev64_focus64 != 0) {
+            const int prev = g_ev64_focus64;
+            g_ev64_focus64 = 0;
+            ev64_log_focus64(0, prev, "kernel-claim");
+        }
+    }
     int pid = 0;
     if (e->type == EV64_TYPE_KEY_DOWN || e->type == EV64_TYPE_KEY_UP) {
         pid = g_ev64_focus64;                        // 只有焦点进程收键盘

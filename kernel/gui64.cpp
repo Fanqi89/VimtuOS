@@ -4225,6 +4225,8 @@ static void handle_mouse(void) {
     g_prev_btn = btn;
 }
 
+// ★ v0.12.10：上一个拿到按键的窗口（只在目标变化时打 [GUI64] key target 一行）
+static const Window* g_key_target_last = nullptr;
 static void handle_keyboard(void) {
     // 热键：Ctrl+Shift+Esc -> 任务管理器
     if (kbd_tm_hotkey()) {
@@ -4305,8 +4307,26 @@ static void handle_keyboard(void) {
         if (startmenu64_handle_key64(c)) continue;
         if (desktopops64_menu_key64(c)) continue;
         // 归一化回车：应用两种都认，但统一成 '\n' 更省心（保留原码给终端也无妨）
-        Window* w = g_z;
-        while (w && (!w->visible || w->minimized)) w = w->next;
+        // ★★ v0.12.10（Bug 1）：键盘目标 = **活动窗口**（最后一次被点中或刚建出来的那个），
+        //   没有活动窗口才退回 z 序最上面。旧代码只看 g_z：外部窗口（ring3 合成器层）最小化/
+        //   恢复、以及“点了 A 却被 z 序插队”都会让键进错窗口。
+        Window* w = nullptr;
+        for (Window* p = g_z; p; p = p->next)
+            if (p->visible && !p->minimized && p->active) { w = p; break; }
+        if (!w) {
+            w = g_z;
+            while (w && (!w->visible || w->minimized)) w = w->next;
+        }
+        if (w && w != g_key_target_last) {           // 目标变了才打点（每键都打会刷屏）
+            g_key_target_last = w;
+            dbg64_line_begin64();
+            dbg64_str("[GUI64] key target title=");
+            dbg64_str(w->title);
+            dbg64_str(" active=");
+            dbg64_dec(w->active ? 1u : 0u);
+            dbg64_nl();
+            dbg64_line_end64();
+        }
         if (w && w->on_key) w->on_key(w, (char)c);
     }
 }
